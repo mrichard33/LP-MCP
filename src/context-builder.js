@@ -450,6 +450,10 @@ async function fetchConversation(contactId, limit = 10) {
       // in an unsubscribe URL's time_stamp, and the generation prompt saw our
       // own "Mark / Reece Windows & Doors" sign-off quoted back at us. Strip
       // email turns only; SMS and live-chat bodies are already the bare text.
+      // 2026-09-11: the channel this turn came in on, carried forward so the
+      // generation prompt can label each history line [inbound/sms] vs
+      // [outbound/email]. Nothing downstream could previously tell them apart.
+      channel: channelOfMessage(m) || null,
       text: channelOfMessage(m) === 'email'
         ? stripQuotedEmail(m.body || m.message || '')
         : (m.body || m.message || ''),

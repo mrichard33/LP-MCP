@@ -40,6 +40,7 @@ import { probeGHLContactTracked } from './services/ghl-contact-probe.js';
 import { LINK_SOURCE } from './services/link-corroboration.js';
 import { createAppointmentFromLpHandler } from './appointments/booking-endpoint.js';
 import { flattenWebhookBody } from './webhook-body.js';
+import { trackImmediate } from './graceful-shutdown.js';
 
 // ═══════════════════════════════════════════════════════════════════
 // WEBHOOK SIGNATURE VERIFICATION (optional but recommended)
@@ -763,7 +764,7 @@ async function lpLeadUpdateGhlContactHandler(req, res) {
   });
 
   // ─── Schedule async work AFTER response sent ─────────────────────
-  setImmediate(async () => {
+  trackImmediate(async () => {
     try {
       const lookup = await _lookupLpLead(src);
 
@@ -966,7 +967,7 @@ async function lpLeadRefreshHandler(req, res) {
   }
 
   // ─── Async work (after response sent) ───────────────────────────
-  setImmediate(async () => {
+  trackImmediate(async () => {
     const t0 = Date.now();
     const forceFetch = String(process.env.LP_INBOUND_REFRESH_FORCE_FETCH || '').toLowerCase() === 'true';
 

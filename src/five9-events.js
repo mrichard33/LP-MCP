@@ -43,6 +43,7 @@
 import crypto from 'crypto';
 import supabase from './supabase.js';
 import { emitEvent } from './event-emitter.js';
+import { trackImmediate } from './graceful-shutdown.js';
 
 // Dedup window: a Five9 retry that re-delivers the same call_id + event_type
 // within this window (after an earlier delivery already processed) is treated
@@ -307,7 +308,7 @@ export async function five9WebhookHandler(req, res) {
   } };
 
   // 4. NORMALIZE after the response (fire-and-forget).
-  setImmediate(() => {
+  trackImmediate(() => {
     normalizeFive9Row(normRow).catch(err =>
       console.error(`[Five9] normalize error raw_id=${row.id}:`, err.message),
     );

@@ -25,6 +25,7 @@ import {
 import { summarizeConversation, stampNoteOrigin } from './summarizer.js';
 import { writeLpNote } from './lp-write.js';
 import { classifyMatch, resolveOrCreateLpLead } from './resolve-or-create.js';
+import { trackBackground } from '../graceful-shutdown.js';
 
 // ─── Config ──────────────────────────────────────────────────────
 const MODE = (process.env.GHL_NOTE_MODE || 'shadow').toLowerCase(); // off | shadow | live
@@ -122,7 +123,7 @@ export function registerGhlInboundRoutes(app) {
 
       // 5. Terminal rows skip the debounce — kick the processor best-effort.
       if (reason && id) {
-        processRow(id).catch((e) => console.error(`[GHLNote] terminal kick failed: ${e.message}`));
+        trackBackground(processRow(id).catch((e) => console.error(`[GHLNote] terminal kick failed: ${e.message}`)));
       }
 
       return res.status(200).json({ ok: true });

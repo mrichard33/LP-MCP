@@ -276,6 +276,10 @@ import {
 } from './services/preferred-time.js';
 import { hasActiveBooking, isPostDemoDecline } from './agentic/lead-state/signals/context-reader.js';
 import { buildNepqBlock } from './agentic/nepq-layer.js';
+// 2026-09-11 (Alfredo Fontan) — what this conversation has already settled,
+// resolved from the CRM fields AND from the lead's own words in the transcript.
+// See src/agentic/established-facts.js for why the second tier had to exist.
+import { buildEstablishedFacts, FACT_LABELS } from './agentic/established-facts.js';
 import { fetchRecentAndUpcomingAppointments, formatAppointmentsForPrompt } from './knowledge/contact-appointments.js';
 import {
   resolveBookingCalendar,
@@ -331,6 +335,20 @@ const PROMPT_TIMEZONE = process.env.REECE_TIMEZONE || 'America/New_York';
 
 // v2.7.4: how many recent edits to inject as in-context learning examples.
 const RECENT_EDITS_LIMIT = parseInt(process.env.RESPONSE_GENERATOR_EDITS_LIMIT || '3', 10);
+
+// ─── Conversation-history depth and truncation (2026-09-11) ──────────────
+//
+// Both were hardcoded: the last 10 turns, each cut at 200 characters. The
+// Alfredo Fontan thread is the case that broke it — his pivotal 91-word
+// inbound (V6UhgTGpcjHKUjGWkkEv, 19:54:44Z) entered the prompt as its first
+// third. All four are optional with working defaults; an unset env is already
+// the intended configuration.
+const RESPONSE_GEN_HISTORY_TURNS = parseInt(process.env.RESPONSE_GEN_HISTORY_TURNS || '20', 10);
+// How many of those turns count as RECENT and render at the larger cap.
+const RESPONSE_GEN_HISTORY_RECENT_TURNS = parseInt(process.env.RESPONSE_GEN_HISTORY_RECENT_TURNS || '8', 10);
+const RESPONSE_GEN_HISTORY_CHARS_RECENT = parseInt(process.env.RESPONSE_GEN_HISTORY_CHARS_RECENT || '1000', 10);
+// The far end of a long thread is context, not content. Unchanged at 200.
+const RESPONSE_GEN_HISTORY_CHARS_OLDER = parseInt(process.env.RESPONSE_GEN_HISTORY_CHARS_OLDER || '200', 10);
 
 // Bound the (only) context-building Supabase read in this file so a slow/locked
 // query degrades to empty context instead of stalling generation for minutes.
@@ -1037,12 +1055,61 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
 
   parts.push(...P.trafficTemperature(trafficTemp.toUpperCase()));
 
+  // ─── ESTABLISHED (2026-09-11 — Alfredo Fontan) ────────────────────────
+  //
+  // UNCONDITIONAL, and deliberately placed here: after the TIME NOW / PHONE
+  // ROOM frame and BEFORE the NEPQ block below, so the questioning discipline
+  // is chosen against facts the model already has rather than against a blank.
+  //
+  // The failure this fixes is not the model forgetting. It is the model never
+  // having been told that a question can be FINISHED. Outbound
+  // yFkfGW3AOmm9M8Myk7W8 re-asked "will it just be you home…" one hour and
+  // thirty-four minutes after the lead answered "Just myself."
+  //
+  // Renders even when nothing is established — the CLOSED QUESTIONS line is
+  // then absent, which is the correct signal, and a turn whose fact-gathering
+  // silently failed still shows up in a Bot Review replay as an empty block
+  // rather than as no block at all.
+  {
+    const est = opts.established || { facts: [], closed_questions: [], offers_made: [], apologies_made: [] };
+    parts.push(...P.ESTABLISHED_HEADER);
+    if (est.facts?.length) {
+      for (const f of est.facts) {
+        parts.push(...P.establishedFact(FACT_LABELS[f.key] || f.key, f.value, f.their_words, f.at_human));
+        if (f.conflict) {
+          parts.push(...P.establishedFactConflict(
+            FACT_LABELS[f.key] || f.key, f.value, f.conflict.value, f.conflict.their_words,
+          ));
+        }
+      }
+    } else {
+      parts.push('(nothing established yet in this conversation)');
+    }
+    if (est.closed_questions?.length) {
+      parts.push(...P.closedQuestions(est.closed_questions.map(k => FACT_LABELS[k] || k)));
+    }
+    if (est.offers_made?.length) {
+      // De-duplicated by kind: the same offer made five times is one fact, and
+      // five lines of it would crowd out the closed-questions rule above.
+      const seen = new Map();
+      for (const o of est.offers_made) if (!seen.has(o.kind)) seen.set(o.kind, o);
+      parts.push(...P.offersAlreadyMade([...seen.values()].map(o => `${o.kind} ("${o.detail}")`)));
+    }
+    if (est.apologies_made?.length) {
+      parts.push(...P.apologiesAlreadyMade(est.apologies_made.map(a => `"${a.for}"`)));
+    }
+    parts.push(...P.ESTABLISHED_FOOTER);
+  }
+
   // 2026-08-29 — NEPQ conversation discipline. Refines the Chatbot channel
   // inside the Antifragile framework; the commitment gate inside turns
   // discovery OFF for booked contacts. Kill switch: NEPQ_LAYER_MODE=off.
   // Placed after the date/time frame and the stage signals above, so the
   // questioning discipline is chosen against a context the model already has.
-  const nepqBlock = buildNepqBlock(context);
+  // v1.2 (2026-09-11): the layer now reads the established facts too, so it can
+  // subtract questions the lead has already answered and render an objection
+  // play. Same object the ESTABLISHED block above was built from.
+  const nepqBlock = buildNepqBlock(context, opts.established);
   if (nepqBlock) parts.push(nepqBlock);
 
   // Acknowledgment-only conduct is decided BEFORE the email opener, because it
@@ -1182,15 +1249,30 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
   // ─── v1.1 KNOWN CONTACT PROFILE (R5 — never re-ask a known field) ───
   // Hydrated from the GHL record + everything extracted from this
   // conversation. The bot only ever asks for fields marked NOT KNOWN.
-  if (opts.bookingGate?.known) {
-    const known = opts.bookingGate.known;
-    const dmState = opts.bookingGate.decision_maker_confirmed;
+  //
+  // 2026-09-11 — UNCONDITIONAL. This block was gated on `opts.bookingGate?.known`,
+  // so on any turn where identity hydration failed or the gate was never built
+  // (a non-booking lane, an identity fetch that threw) the whole profile
+  // vanished and the bot started over on a contact it already knew. The gate
+  // decides what may be ASKED FOR; it was never the right switch for what is
+  // KNOWN. Fields now fall back to the contact record, which is where they came
+  // from in the first place.
+  {
+    const known = opts.bookingGate?.known || {};
+    const dmState = opts.bookingGate?.decision_maker_confirmed;
+    // The transcript tier: what they said, when the CRM field has not caught up.
+    const dmFact = (opts.established?.facts || []).find(f => f.key === 'decision_makers');
     parts.push(...P.KNOWN_CONTACT_PROFILE_HEADER);
-    parts.push(...P.knownName(known.name));
-    parts.push(...P.knownPhone(known.phone));
-    parts.push(...P.knownEmail(known.email));
-    parts.push(...P.knownAddress(known.address));
-    parts.push(...P.knownDecisionMakers(dmState === true, dmState === false));
+    parts.push(...P.knownName(known.name || context.lead?.name || null));
+    parts.push(...P.knownPhone(known.phone || context.lead?.phone || null));
+    parts.push(...P.knownEmail(known.email || context.lead?.email || null));
+    parts.push(...P.knownAddress(known.address || composeAddressOnFile(context)));
+    parts.push(...P.knownDecisionMakers(
+      dmState === true,
+      dmState === false,
+      dmFact?.their_words || null,
+      dmFact?.at_human || null,
+    ));
     parts.push(...P.KNOWN_CONTACT_PROFILE_RULE);
     parts.push(...P.KNOWN_CONTACT_PROFILE_FOOTER);
   }
@@ -1399,9 +1481,28 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
   if (completedTags.length) parts.push(...P.completedWorkflows(completedTags.slice(0, 8).join(', ')));
 
   if (context.conversation_recent?.length) {
+    // ─── History depth + two-tier truncation (2026-09-11) ──────────────
+    //
+    // Was a hardcoded last-10-turns at a flat 200 characters each. On the
+    // Alfredo Fontan thread the pivotal inbound (V6UhgTGpcjHKUjGWkkEv,
+    // 19:54:44Z) is 91 words — the message where he lays out the scope, the
+    // competing quote, and how close he came to signing. At 200 characters the
+    // model read the first third of it and nothing else.
+    //
+    // So: more turns, and the RECENT ones arrive whole. Older turns keep the
+    // 200-character cap, because the far end of a long thread is context, not
+    // content. Both bounds are env-tunable and both defaults are safe.
+    const turns = context.conversation_recent.slice(-RESPONSE_GEN_HISTORY_TURNS);
+    const recentFrom = Math.max(0, turns.length - RESPONSE_GEN_HISTORY_RECENT_TURNS);
     parts.push(...P.CONVERSATION_HISTORY_HEADER);
-    context.conversation_recent.slice(-10).forEach(m => {
-      parts.push(...P.conversationHistoryEntry(m.direction, m.text?.slice(0, 200) || '(empty)'));
+    turns.forEach((m, i) => {
+      const cap = i >= recentFrom ? RESPONSE_GEN_HISTORY_CHARS_RECENT : RESPONSE_GEN_HISTORY_CHARS_OLDER;
+      const body = m.text?.slice(0, cap) || '(empty)';
+      // Channel per turn. Before this the model could not tell an SMS from an
+      // email in its own history — which is how a three-line text and a
+      // quoted-thread email read as the same kind of turn.
+      const label = m.channel ? `${m.direction}/${m.channel}` : m.direction;
+      parts.push(...P.conversationHistoryEntry(label, body));
     });
     // Quality Pass v1.0 Item 1a — anti-repetition + answered-question (hard rules).
     // Evidence: the same escalation line sent verbatim 3×, and a slot question
@@ -2142,6 +2243,148 @@ export function findImmediateCallPromises(message) {
   return hits;
 }
 
+// ─── Repeat-ask and concession guards (2026-09-11 — Alfredo Fontan) ───
+//
+// Outbound yFkfGW3AOmm9M8Myk7W8, 21:11:55Z:
+//
+//   "Fair point, Alfredo — close is close. To get the visit scheduled
+//    correctly, will it just be you home, or is there someone else who'd
+//    want to be there?"
+//
+// Two defects in one sentence: it re-asks a question he answered at 19:37,
+// and it concedes his objection before pivoting off it. The ESTABLISHED block
+// and the NEPQ objection play make the correct reply possible; these make the
+// wrong one non-shippable, in the same spirit as the invented-phone and
+// timeline-promise guards — a prompt is a request, this is the rule.
+
+// Re-ask detection is by INTENT, not wording. The model will not repeat our
+// phrasing verbatim; it will ask the same thing a different way. Each closed
+// question key maps to the shapes that question actually takes.
+const REPEAT_QUESTION_PATTERNS = Object.freeze({
+  decision_makers: [
+    /\b(?:anyone|anybody|someone|somebody)\s+else\b/i,
+    /\bwho\s+else\b/i,
+    /\bjust\s+(?:you|yourself)\b/i,
+    /\bonly\s+you\b/i,
+    /\bboth\s+(?:of\s+you\s+)?(?:be\s+)?(?:home|there|present|available)\b/i,
+    /\bdecision[-\s]?makers?\b/i,
+    /\bis\s+it\s+your\s+call\b/i,
+    /\b(?:wife|husband|spouse|partner)\s+(?:be\s+)?(?:home|there|joining)\b/i,
+  ],
+  window_count: [
+    /\bhow\s+many\b[^?]{0,40}\b(?:windows?|openings?|doors?)\b/i,
+    /\bnumber\s+of\s+(?:windows?|openings?|doors?)\b/i,
+  ],
+  address: [
+    /\b(?:property|home|service|street|full|best)\s+address\b/i,
+    /\bwhat(?:'s|\s+is)\s+the\s+address\b/i,
+    /\bzip\s*code\b/i,
+  ],
+  preferred_time: [
+    /\bwhat\s+(?:day|time)\b/i,
+    /\bmornings?\s+or\s+afternoons?\b/i,
+    /\bwhen\s+(?:works|would\s+work|is\s+good)\b/i,
+  ],
+  prior_quotes: [
+    /\bhad\s+(?:anyone|anybody|someone)\s+out\b/i,
+    /\bhad\s+(?:any\s+)?(?:other\s+)?(?:quotes?|estimates?|bids?)\b/i,
+    /\bother\s+(?:companies|quotes?|estimates?|bids?)\b/i,
+    /\bshopping\s+around\b/i,
+  ],
+  email: [
+    /\bemail\s+address\b/i,
+    /\bwhat(?:'s|\s+is)\s+(?:your|the\s+best)\s+email\b/i,
+  ],
+  timeline: [
+    /\bhow\s+soon\b/i,
+    /\btime\s*frame\b/i,
+    /\bwhen\s+(?:are|were)\s+you\s+(?:looking|hoping|planning)\b/i,
+  ],
+});
+
+// A sentence that REFERENCES an answer rather than asking for it — "since it's
+// just you", "you mentioned it's just you". These carry the same nouns as the
+// question shapes above and are exactly what we WANT the reply to do, so they
+// suppress a match on that sentence.
+const REFERENCES_ANSWER_RX =
+  /\b(?:since|because|now\s+that|given\s+that|as)\s+(?:it'?s|it\s+is|you'?re|you\s+are|there'?s)\b|\byou\s+(?:mentioned|said|told\s+(?:me|us))\b|\bsounds\s+like\b/i;
+
+/**
+ * Closed questions a draft re-asks. Pure; exported for tests.
+ *
+ * Only sentences that are actually QUESTIONS are considered — a statement that
+ * happens to contain "just you" is not a re-ask — and a sentence that
+ * references their prior answer is skipped even when it carries the nouns.
+ *
+ * @param {string} message
+ * @param {object} established  buildEstablishedFacts() output
+ * @returns {string[]} closed question keys the message re-asks; empty is clean
+ */
+export function findRepeatedQuestions(message, established) {
+  const closed = established?.closed_questions || [];
+  if (!closed.length) return [];
+
+  const body = String(message || '');
+  // Sentence-grained: one clause referencing the answer must not excuse a
+  // different clause re-asking it, and vice versa.
+  const sentences = body.split(/(?<=[.!?])\s+/).filter(s => s.includes('?'));
+  const hits = new Set();
+
+  for (const sentence of sentences) {
+    if (REFERENCES_ANSWER_RX.test(sentence)) continue;
+    for (const key of closed) {
+      const patterns = REPEAT_QUESTION_PATTERNS[key];
+      if (patterns?.some(rx => rx.test(sentence))) hits.add(key);
+    }
+  }
+  return [...hits];
+}
+
+// The concede-and-pivot opener. Banned in the NEPQ objection block; detected
+// here. "Fair point, Alfredo — close is close." is the live instance.
+const CONCESSION_OPENER_RX =
+  /^\s*(?:fair\s+(?:point|enough)|you'?re\s+right|that'?s\s+(?:fair|true)|i\s+(?:understand|hear\s+you|get\s+(?:it|that))|that\s+makes\s+sense|totally\s+fair|absolutely|no\s+argument)\b/i;
+
+// A pivot: the concession is followed by a question about something else.
+// "To get the visit scheduled correctly, will it just be you home…" is the
+// live instance — it drops the objection and asks for a qualifier instead.
+const PIVOT_RX =
+  /\b(?:to\s+get|so\s+(?:i|we)\s+can|in\s+order\s+to|before\s+(?:we|i)|meanwhile|that\s+said|anyway)\b/i;
+
+/**
+ * Concession-then-pivot in a draft, while an objection is open. Pure; exported
+ * for tests.
+ *
+ * WARN-level by design, never a hard failure: a genuine apology and a genuine
+ * acknowledgment are legitimate replies, and a guard that threw on every one
+ * of them would cost leads a reply to save them a bad sentence. It sets a
+ * regeneration note instead.
+ *
+ * @param {string} message
+ * @param {object} established
+ * @param {{objectionOpen?: boolean}} [opts]
+ * @returns {string[]} violations; empty is clean
+ */
+export function findConcessionPivots(message, established, { objectionOpen = false } = {}) {
+  const hasObjection = objectionOpen || (established?.objections_raised || []).length > 0;
+  if (!hasObjection) return [];
+
+  const body = String(message || '').trim();
+  const sentences = body.split(/(?<=[.!?])\s+/).map(s => s.trim()).filter(Boolean);
+  const out = [];
+
+  for (let i = 0; i < sentences.length; i += 1) {
+    if (!CONCESSION_OPENER_RX.test(sentences[i])) continue;
+    // A concession that STAYS on the objection is fine. A concession followed
+    // by a pivot phrase or by a question about anything else is the defect.
+    const rest = sentences.slice(i + 1).join(' ');
+    if (PIVOT_RX.test(rest) || (rest.includes('?') && !CONCESSION_OPENER_RX.test(rest))) {
+      out.push(`concession then pivot: "${sentences[i]}"`);
+    }
+  }
+  return out;
+}
+
 /**
  * Timeline commitments found in an acknowledgment body. Pure; exported for
  * tests. Non-empty means the reply promised WHEN a human would respond.
@@ -2434,6 +2677,26 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     includeConversation: true,
     skipCache: true,
   });
+
+  // ─── ESTABLISHED FACTS (2026-09-11 — Alfredo Fontan) ──────────────────
+  // Built immediately after the context and BEFORE the prompt, so every block
+  // that follows can be chosen against what is already settled. Pure and
+  // synchronous — no reads of its own, no writes, and it cannot fail the turn.
+  let established = null;
+  try {
+    established = buildEstablishedFacts({
+      conversation: context.conversation_recent || [],
+      lead: context.lead,
+      lp: context.lp,
+      intelligence: context.intelligence,
+      estimate: context.estimate,
+      timezone: PROMPT_TIMEZONE,
+    });
+  } catch (err) {
+    // A malformed transcript must never cost the lead a reply. The prompt
+    // renders an empty ESTABLISHED block, which is the pre-2026-09-11 behavior.
+    console.warn(`[ResponseGenerator] established-facts build failed for ${contactId}: ${err.message}`);
+  }
 
   // 2026-07-29 (Kelly Callahan incident) — decision-time context. See
   // DECISION-TIME CONTEXT above. When live state and the snapshot disagree
@@ -2805,6 +3068,10 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       escalationCategory: opts.escalationCategory || null,
       identityState,
       bookingGate,
+      // 2026-09-11: what this conversation has already settled. Renders the
+      // ESTABLISHED block and supplies the transcript tier of the
+      // decision-maker line in the KNOWN CONTACT PROFILE.
+      established,
       serviceArea,
       serviceAreaTentative,
       // 2026-08-18 (invented-phone incident): the only phone number the model
@@ -2891,6 +3158,67 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // then-safe-fallback loop in send-message-handler: the lead still gets a
   // reply, and it is never one with raw template syntax in it.
   assertNoUnresolvedTokens(validated.message, contactId);
+
+  // ─── Repeat-ask guard (2026-09-11 — Alfredo Fontan incident) ───
+  //
+  // The ESTABLISHED block tells the model the question is closed. This makes
+  // re-asking it non-shippable. Throwing hands control to the existing
+  // retry-then-safe-fallback loop in send-message-handler, and the
+  // regenerationNote carries THE ANSWER rather than just the prohibition —
+  // a retry told only "don't ask that" has to guess what to say instead,
+  // which is how a repeat-ask becomes an invented question.
+  if (established?.closed_questions?.length) {
+    const repeats = findRepeatedQuestions(validated.message, established);
+    if (repeats.length) {
+      const answers = repeats.map(k => {
+        const f = established.facts.find(x => x.key === k);
+        const said = f?.their_words ? ` They said: "${f.their_words}".` : '';
+        return `${FACT_LABELS[k] || k} = ${f?.value ?? '(answered)'}.${said}`;
+      }).join(' ');
+      console.error(`[ResponseGenerator] ⛔ re-asked closed question(s) for ${contactId}: ${repeats.join(', ')}`);
+      const err = new Error(`repeated_closed_question: ${repeats.join(', ')}`);
+      // Carried on the error, NOT mutated onto opts: send-message-handler
+      // builds a fresh opts literal for each generation attempt, so a mutation
+      // here would be discarded and the retry would run the identical prompt.
+      // The note names the ANSWER, not just the prohibition — a retry told only
+      // "don't ask that" has to guess what to say instead, which is how a
+      // repeat-ask turns into an invented question.
+      err.regenerationNote =
+        `Your previous draft re-asked a question this customer has ALREADY ANSWERED: ${repeats.join(', ')}. ` +
+        `${answers} Do not ask it again. Reference their answer instead, and ask nothing in its place unless ` +
+        `something genuinely unanswered is needed this turn.`;
+      throw err;
+    }
+  }
+
+  // ─── Concession-pivot guard (2026-09-11 — Alfredo Fontan incident) ───
+  //
+  // "Fair point, Alfredo — close is close." followed by a pivot to a
+  // qualifying question is the defect. A genuine apology is a legitimate
+  // reply, and the two are not reliably separable by regex — so this
+  // REGENERATES ONCE and then gives up, rather than hard-failing a lead into
+  // the safe fallback over a sentence.
+  //
+  // `opts.regenerationNote` being set means this IS already a second draft, so
+  // whatever we have now ships. Bounded to one retry by construction.
+  {
+    const pivots = findConcessionPivots(validated.message, established, {
+      objectionOpen: !!context.objection_state?.state_code,
+    });
+    if (pivots.length) {
+      if (opts.regenerationNote) {
+        console.warn(`[ResponseGenerator] ⚠️ concession-then-pivot survived regeneration for ${contactId}: ${pivots.join(', ')} — sending anyway`);
+      } else {
+        console.warn(`[ResponseGenerator] ⚠️ concession-then-pivot for ${contactId}: ${pivots.join(', ')} — regenerating once`);
+        const err = new Error(`concession_pivot: ${pivots.join(', ')}`);
+        err.regenerationNote =
+          `Your previous draft conceded the customer's objection and then changed the subject: ${pivots.join(', ')}. ` +
+          `Do not open by agreeing with an objection and then asking for something else. Ask a question back about ` +
+          `THEIR position instead, using their own words — see the NEPQ objection block.`;
+        throw err;
+      }
+    }
+  }
 
   // ─── Email-direction guard (2026-09-11 — Alfredo Fontan incident) ───
   // The COMPANY INBOX prompt block makes a correct answer possible; this makes
@@ -3097,6 +3425,12 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
           is_regenerate: !!opts.editInstruction,
           booking_calendar: kbPack?.booking_context?.calendar_name || null,
           booking_policy: kbPack?.booking_context?.policy || null,
+          // 2026-09-11: what the bot BELIEVED was already settled when it
+          // drafted. Without this a Bot Review replay of a repeat-ask shows
+          // the question and the answer but not whether the bot could see the
+          // answer — which is the only thing that distinguishes a prompt
+          // failure from a fact-gathering failure.
+          established,
         },
       }),
     },
