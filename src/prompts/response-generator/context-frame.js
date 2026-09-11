@@ -451,9 +451,11 @@ export const classification = (intentClass, confidence, method) => [
 ];
 
 // 2026-08 — never propose or confirm a date already past. Every appointment and proposed slot is compared against TODAY before being called upcoming.
+// 2026-09-11 (zOtz91P604CVWP47DIJx) — TOMORROW IS added: with only TODAY the model offered "tomorrow" and "Saturday" as two different options when they were the same day.
 // Was response-generator.js:929.
-export const todayIs = (today) => [
+export const todayIs = (today, tomorrow) => [
   `TODAY IS: ${today}. NEVER propose or confirm a date that has already passed. Compare every appointment and proposed slot against TODAY before calling it upcoming.`,
+  `TOMORROW IS: ${tomorrow}. "Tomorrow" and this weekday name are THE SAME DAY. Never offer them as two different options. Resolve every relative day word ("tomorrow", "this weekend", "early next week") against these two lines before you write it.`,
 ];
 
 // Opens the date frame, naming the timezone the whole prompt works in.

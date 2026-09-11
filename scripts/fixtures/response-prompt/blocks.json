@@ -894,5 +894,61 @@
     "target": "context-frame",
     "kind": "static",
     "probe": "Return ONLY the JSON object — first character must be {, last must be }, no preamble. Include companion_action"
+  },
+  {
+    "id": "banned:97",
+    "lines": "97",
+    "label": "LEAD-ASKED-QUESTION hard rule",
+    "target": "banned",
+    "kind": "static",
+    "probe": "LEAD-ASKED-QUESTION (HARD RULE): if the newest [inbound] contains a direct question to us, your FIRST sentence answers it plainly."
+  },
+  {
+    "id": "banned:98",
+    "lines": "98",
+    "label": "RULED-OUT WINDOW hard rule",
+    "target": "banned",
+    "kind": "static",
+    "probe": "RULED-OUT WINDOW (HARD RULE): when the lead states they are unavailable for a day, a date, or a part of a day"
+  },
+  {
+    "id": "banned:99",
+    "lines": "99",
+    "label": "DAY-NAMING hard rule",
+    "target": "banned",
+    "kind": "static",
+    "probe": "DAY-NAMING (HARD RULE): each calendar day gets exactly ONE name for the whole thread."
+  },
+  {
+    "id": "banned:65",
+    "lines": "65",
+    "label": "Never propose a ruled-out day",
+    "target": "banned",
+    "kind": "static",
+    "probe": "- Never propose a day, date, or part of a day the lead has said they are unavailable for"
+  },
+  {
+    "id": "banned:68",
+    "lines": "68",
+    "label": "Never switch appointment type mid-thread",
+    "target": "banned",
+    "kind": "static",
+    "probe": "- Never change the appointment type mid-thread. If the thread has been about a call, it stays a call"
+  },
+  {
+    "id": "context-frame:457",
+    "lines": "457",
+    "label": "Tomorrow is date, same day as the weekday name",
+    "target": "context-frame",
+    "kind": "interpolated",
+    "probe": ". \"Tomorrow\" and this weekday name are THE SAME DAY. Never offer them as two different options."
+  },
+  {
+    "id": "playbooks:61-91",
+    "lines": "61-91",
+    "label": "Price-shopper direct answers (Stage #3, Trust L3)",
+    "target": "playbooks",
+    "kind": "static",
+    "probe": "PRICE-SHOPPER DIRECT ANSWERS (Stage #3, Trust L3)"
   }
 ]

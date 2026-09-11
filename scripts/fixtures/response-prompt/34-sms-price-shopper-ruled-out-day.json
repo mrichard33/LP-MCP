@@ -1,0 +1,129 @@
+{
+  "name": "34-sms-price-shopper-ruled-out-day",
+  "covers": "sms · LEAD-ASKED-QUESTION · RULED-OUT WINDOW · DAY-NAMING · TOMORROW IS with a Friday clock so \"tomorrow\" and \"Saturday\" collide · PRICE-SHOPPER DIRECT ANSWERS · appointment-type switching prohibition (zOtz91P604CVWP47DIJx 2026-09-11)",
+  "fixedNow": "2026-09-11T22:56:00Z",
+  "env": {},
+  "channel": "sms",
+  "triggerMessage": "You're able to give me a price over the phone?",
+  "fastTrack": false,
+  "trafficTemp": "hot",
+  "kbPack": null,
+  "availability": null,
+  "classification": {
+    "intent_class": "OBJECTION_PRICE",
+    "confidence": 0.91,
+    "classification_method": "llm",
+    "reasoning": "Comparison shopper pressing for a phone price after ruling out the only day offered."
+  },
+  "context": {
+    "now": {
+      "iso": "2026-09-11T22:56:00Z",
+      "date_human": "Friday, September 11, 2026",
+      "time_human": "6:56 PM",
+      "tz": "America/New_York"
+    },
+    "lead": {
+      "ghl_contact_id": "FIXTURECONTACT000002",
+      "name": "Dana Whitfield",
+      "first_name": "Dana",
+      "lead_score": 71,
+      "date_added": "2026-09-11T22:38:00Z",
+      "entry_source": "Estimate Calculator",
+      "current_tags": [
+        "bj:stage-3-comparing",
+        "concern-expressed:price",
+        "pre-demo-concern:timing"
+      ],
+      "objection_tags": [
+        "objection-price"
+      ],
+      "suppression_tags": [],
+      "contact_notes": [],
+      "rep_display_name": null,
+      "lp_rep_name": null,
+      "trust_level_score": 3,
+      "current_buyer_tag": null,
+      "current_bj_tag": "bj:stage-3-comparing",
+      "current_stage_tag": null,
+      "decision_makers_present": null
+    },
+    "lp": {
+      "matched": false,
+      "notes": [],
+      "recent_calls": []
+    },
+    "intelligence": {
+      "buyer_stage": 3,
+      "buyer_stage_confidence": 0.9
+    },
+    "engagement": {
+      "emails_opened": 0,
+      "links_clicked": 1,
+      "replies_count": 4,
+      "vsl_watched": false
+    },
+    "objection_state": null,
+    "pipeline": null,
+    "estimate": null,
+    "conversation_recent": [
+      {
+        "direction": "inbound",
+        "channel": "sms",
+        "timestamp": "2026-09-11T22:40:00Z",
+        "text": "Just ran your calculator. I'm getting quotes from a few companies right now. Who has the cheapest price?"
+      },
+      {
+        "direction": "outbound",
+        "channel": "sms",
+        "timestamp": "2026-09-11T22:42:00Z",
+        "text": "Code varies by street, so we won't put a number on it without measuring. I have tomorrow at 12 or 12:30 open."
+      },
+      {
+        "direction": "inbound",
+        "channel": "sms",
+        "timestamp": "2026-09-11T22:45:00Z",
+        "text": "My wife and I are busy tomorrow. Can I send you the measurements I have from the other companies?"
+      },
+      {
+        "direction": "outbound",
+        "channel": "sms",
+        "timestamp": "2026-09-11T22:51:00Z",
+        "text": "No problem at all. Would Saturday at 12 or 12:30 work better instead?"
+      },
+      {
+        "direction": "inbound",
+        "channel": "sms",
+        "timestamp": "2026-09-11T22:54:00Z",
+        "text": "Tomorrow is Saturday. Today is Friday. We're busy Saturday, I already said that. And I don't have time to sit through a long presentation."
+      }
+    ]
+  },
+  "opts": {
+    "fromNumber": "9543710083",
+    "established": {
+      "facts": [],
+      "closed_questions": [],
+      "offers_made": [
+        {
+          "kind": "visit",
+          "at": "2026-09-11T22:42:00Z",
+          "detail": "tomorrow at 12 or 12:30"
+        },
+        {
+          "kind": "visit",
+          "at": "2026-09-11T22:51:00Z",
+          "detail": "Saturday at 12 or 12:30"
+        }
+      ],
+      "apologies_made": [],
+      "objections_raised": [
+        {
+          "type": "price",
+          "at": "2026-09-11T22:40:00Z",
+          "their_words": "I'm getting quotes from a few companies right now. Who has the cheapest price?",
+          "how_we_answered": "Code varies by street, so we won't put a number on it without measuring. I have tomorrow at 12 or 12:30 open."
+        }
+      ]
+    }
+  }
+}
