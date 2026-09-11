@@ -276,6 +276,10 @@ import {
 } from './services/preferred-time.js';
 import { hasActiveBooking, isPostDemoDecline } from './agentic/lead-state/signals/context-reader.js';
 import { buildNepqBlock } from './agentic/nepq-layer.js';
+// 2026-09-11 (Alfredo Fontan) — what this conversation has already settled,
+// resolved from the CRM fields AND from the lead's own words in the transcript.
+// See src/agentic/established-facts.js for why the second tier had to exist.
+import { buildEstablishedFacts, FACT_LABELS } from './agentic/established-facts.js';
 import { fetchRecentAndUpcomingAppointments, formatAppointmentsForPrompt } from './knowledge/contact-appointments.js';
 import {
   resolveBookingCalendar,
@@ -331,6 +335,20 @@ const PROMPT_TIMEZONE = process.env.REECE_TIMEZONE || 'America/New_York';
 
 // v2.7.4: how many recent edits to inject as in-context learning examples.
 const RECENT_EDITS_LIMIT = parseInt(process.env.RESPONSE_GENERATOR_EDITS_LIMIT || '3', 10);
+
+// ─── Conversation-history depth and truncation (2026-09-11) ──────────────
+//
+// Both were hardcoded: the last 10 turns, each cut at 200 characters. The
+// Alfredo Fontan thread is the case that broke it — his pivotal 91-word
+// inbound (V6UhgTGpcjHKUjGWkkEv, 19:54:44Z) entered the prompt as its first
+// third. All four are optional with working defaults; an unset env is already
+// the intended configuration.
+const RESPONSE_GEN_HISTORY_TURNS = parseInt(process.env.RESPONSE_GEN_HISTORY_TURNS || '20', 10);
+// How many of those turns count as RECENT and render at the larger cap.
+const RESPONSE_GEN_HISTORY_RECENT_TURNS = parseInt(process.env.RESPONSE_GEN_HISTORY_RECENT_TURNS || '8', 10);
+const RESPONSE_GEN_HISTORY_CHARS_RECENT = parseInt(process.env.RESPONSE_GEN_HISTORY_CHARS_RECENT || '1000', 10);
+// The far end of a long thread is context, not content. Unchanged at 200.
+const RESPONSE_GEN_HISTORY_CHARS_OLDER = parseInt(process.env.RESPONSE_GEN_HISTORY_CHARS_OLDER || '200', 10);
 
 // Bound the (only) context-building Supabase read in this file so a slow/locked
 // query degrades to empty context instead of stalling generation for minutes.
@@ -1037,6 +1055,52 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
 
   parts.push(...P.trafficTemperature(trafficTemp.toUpperCase()));
 
+  // ─── ESTABLISHED (2026-09-11 — Alfredo Fontan) ────────────────────────
+  //
+  // UNCONDITIONAL, and deliberately placed here: after the TIME NOW / PHONE
+  // ROOM frame and BEFORE the NEPQ block below, so the questioning discipline
+  // is chosen against facts the model already has rather than against a blank.
+  //
+  // The failure this fixes is not the model forgetting. It is the model never
+  // having been told that a question can be FINISHED. Outbound
+  // yFkfGW3AOmm9M8Myk7W8 re-asked "will it just be you home…" one hour and
+  // thirty-four minutes after the lead answered "Just myself."
+  //
+  // Renders even when nothing is established — the CLOSED QUESTIONS line is
+  // then absent, which is the correct signal, and a turn whose fact-gathering
+  // silently failed still shows up in a Bot Review replay as an empty block
+  // rather than as no block at all.
+  {
+    const est = opts.established || { facts: [], closed_questions: [], offers_made: [], apologies_made: [] };
+    parts.push(...P.ESTABLISHED_HEADER);
+    if (est.facts?.length) {
+      for (const f of est.facts) {
+        parts.push(...P.establishedFact(FACT_LABELS[f.key] || f.key, f.value, f.their_words, f.at_human));
+        if (f.conflict) {
+          parts.push(...P.establishedFactConflict(
+            FACT_LABELS[f.key] || f.key, f.value, f.conflict.value, f.conflict.their_words,
+          ));
+        }
+      }
+    } else {
+      parts.push('(nothing established yet in this conversation)');
+    }
+    if (est.closed_questions?.length) {
+      parts.push(...P.closedQuestions(est.closed_questions.map(k => FACT_LABELS[k] || k)));
+    }
+    if (est.offers_made?.length) {
+      // De-duplicated by kind: the same offer made five times is one fact, and
+      // five lines of it would crowd out the closed-questions rule above.
+      const seen = new Map();
+      for (const o of est.offers_made) if (!seen.has(o.kind)) seen.set(o.kind, o);
+      parts.push(...P.offersAlreadyMade([...seen.values()].map(o => `${o.kind} ("${o.detail}")`)));
+    }
+    if (est.apologies_made?.length) {
+      parts.push(...P.apologiesAlreadyMade(est.apologies_made.map(a => `"${a.for}"`)));
+    }
+    parts.push(...P.ESTABLISHED_FOOTER);
+  }
+
   // 2026-08-29 — NEPQ conversation discipline. Refines the Chatbot channel
   // inside the Antifragile framework; the commitment gate inside turns
   // discovery OFF for booked contacts. Kill switch: NEPQ_LAYER_MODE=off.
@@ -1182,15 +1246,30 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
   // ─── v1.1 KNOWN CONTACT PROFILE (R5 — never re-ask a known field) ───
   // Hydrated from the GHL record + everything extracted from this
   // conversation. The bot only ever asks for fields marked NOT KNOWN.
-  if (opts.bookingGate?.known) {
-    const known = opts.bookingGate.known;
-    const dmState = opts.bookingGate.decision_maker_confirmed;
+  //
+  // 2026-09-11 — UNCONDITIONAL. This block was gated on `opts.bookingGate?.known`,
+  // so on any turn where identity hydration failed or the gate was never built
+  // (a non-booking lane, an identity fetch that threw) the whole profile
+  // vanished and the bot started over on a contact it already knew. The gate
+  // decides what may be ASKED FOR; it was never the right switch for what is
+  // KNOWN. Fields now fall back to the contact record, which is where they came
+  // from in the first place.
+  {
+    const known = opts.bookingGate?.known || {};
+    const dmState = opts.bookingGate?.decision_maker_confirmed;
+    // The transcript tier: what they said, when the CRM field has not caught up.
+    const dmFact = (opts.established?.facts || []).find(f => f.key === 'decision_makers');
     parts.push(...P.KNOWN_CONTACT_PROFILE_HEADER);
-    parts.push(...P.knownName(known.name));
-    parts.push(...P.knownPhone(known.phone));
-    parts.push(...P.knownEmail(known.email));
-    parts.push(...P.knownAddress(known.address));
-    parts.push(...P.knownDecisionMakers(dmState === true, dmState === false));
+    parts.push(...P.knownName(known.name || context.lead?.name || null));
+    parts.push(...P.knownPhone(known.phone || context.lead?.phone || null));
+    parts.push(...P.knownEmail(known.email || context.lead?.email || null));
+    parts.push(...P.knownAddress(known.address || composeAddressOnFile(context)));
+    parts.push(...P.knownDecisionMakers(
+      dmState === true,
+      dmState === false,
+      dmFact?.their_words || null,
+      dmFact?.at_human || null,
+    ));
     parts.push(...P.KNOWN_CONTACT_PROFILE_RULE);
     parts.push(...P.KNOWN_CONTACT_PROFILE_FOOTER);
   }
@@ -1399,9 +1478,28 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
   if (completedTags.length) parts.push(...P.completedWorkflows(completedTags.slice(0, 8).join(', ')));
 
   if (context.conversation_recent?.length) {
+    // ─── History depth + two-tier truncation (2026-09-11) ──────────────
+    //
+    // Was a hardcoded last-10-turns at a flat 200 characters each. On the
+    // Alfredo Fontan thread the pivotal inbound (V6UhgTGpcjHKUjGWkkEv,
+    // 19:54:44Z) is 91 words — the message where he lays out the scope, the
+    // competing quote, and how close he came to signing. At 200 characters the
+    // model read the first third of it and nothing else.
+    //
+    // So: more turns, and the RECENT ones arrive whole. Older turns keep the
+    // 200-character cap, because the far end of a long thread is context, not
+    // content. Both bounds are env-tunable and both defaults are safe.
+    const turns = context.conversation_recent.slice(-RESPONSE_GEN_HISTORY_TURNS);
+    const recentFrom = Math.max(0, turns.length - RESPONSE_GEN_HISTORY_RECENT_TURNS);
     parts.push(...P.CONVERSATION_HISTORY_HEADER);
-    context.conversation_recent.slice(-10).forEach(m => {
-      parts.push(...P.conversationHistoryEntry(m.direction, m.text?.slice(0, 200) || '(empty)'));
+    turns.forEach((m, i) => {
+      const cap = i >= recentFrom ? RESPONSE_GEN_HISTORY_CHARS_RECENT : RESPONSE_GEN_HISTORY_CHARS_OLDER;
+      const body = m.text?.slice(0, cap) || '(empty)';
+      // Channel per turn. Before this the model could not tell an SMS from an
+      // email in its own history — which is how a three-line text and a
+      // quoted-thread email read as the same kind of turn.
+      const label = m.channel ? `${m.direction}/${m.channel}` : m.direction;
+      parts.push(...P.conversationHistoryEntry(label, body));
     });
     // Quality Pass v1.0 Item 1a — anti-repetition + answered-question (hard rules).
     // Evidence: the same escalation line sent verbatim 3×, and a slot question
@@ -2435,6 +2533,26 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     skipCache: true,
   });
 
+  // ─── ESTABLISHED FACTS (2026-09-11 — Alfredo Fontan) ──────────────────
+  // Built immediately after the context and BEFORE the prompt, so every block
+  // that follows can be chosen against what is already settled. Pure and
+  // synchronous — no reads of its own, no writes, and it cannot fail the turn.
+  let established = null;
+  try {
+    established = buildEstablishedFacts({
+      conversation: context.conversation_recent || [],
+      lead: context.lead,
+      lp: context.lp,
+      intelligence: context.intelligence,
+      estimate: context.estimate,
+      timezone: PROMPT_TIMEZONE,
+    });
+  } catch (err) {
+    // A malformed transcript must never cost the lead a reply. The prompt
+    // renders an empty ESTABLISHED block, which is the pre-2026-09-11 behavior.
+    console.warn(`[ResponseGenerator] established-facts build failed for ${contactId}: ${err.message}`);
+  }
+
   // 2026-07-29 (Kelly Callahan incident) — decision-time context. See
   // DECISION-TIME CONTEXT above. When live state and the snapshot disagree
   // about the funnel stage, a sibling action rewrote the contact between
@@ -2805,6 +2923,10 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       escalationCategory: opts.escalationCategory || null,
       identityState,
       bookingGate,
+      // 2026-09-11: what this conversation has already settled. Renders the
+      // ESTABLISHED block and supplies the transcript tier of the
+      // decision-maker line in the KNOWN CONTACT PROFILE.
+      established,
       serviceArea,
       serviceAreaTentative,
       // 2026-08-18 (invented-phone incident): the only phone number the model
@@ -3097,6 +3219,12 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
           is_regenerate: !!opts.editInstruction,
           booking_calendar: kbPack?.booking_context?.calendar_name || null,
           booking_policy: kbPack?.booking_context?.policy || null,
+          // 2026-09-11: what the bot BELIEVED was already settled when it
+          // drafted. Without this a Bot Review replay of a repeat-ask shows
+          // the question and the answer but not whether the bot could see the
+          // answer — which is the only thing that distinguishes a prompt
+          // failure from a fact-gathering failure.
+          established,
         },
       }),
     },

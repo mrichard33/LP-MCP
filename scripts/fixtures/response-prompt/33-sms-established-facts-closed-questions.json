@@ -1,0 +1,131 @@
+{
+  "name": "33-sms-established-facts-closed-questions",
+  "covers": "sms · ESTABLISHED block with facts · CLOSED QUESTIONS rule · already-offered + already-apologized · decision-maker ANSWERED IN CONVERSATION with the CRM field empty · per-turn channel labels · two-tier history truncation (Alfredo Fontan 2026-09-11)",
+  "env": {},
+  "channel": "sms",
+  "triggerMessage": "Honestly the other guys were close on price.",
+  "fastTrack": false,
+  "trafficTemp": "warm",
+  "kbPack": null,
+  "availability": null,
+  "classification": {
+    "intent_class": "OBJECTION_PRICE",
+    "confidence": 0.88,
+    "classification_method": "llm",
+    "reasoning": "Competitor price comparison raised after a full scope was given."
+  },
+  "context": {
+    "now": {
+      "iso": "2026-09-02T15:30:00Z",
+      "date_human": "Wednesday, September 2, 2026",
+      "time_human": "11:30 AM",
+      "tz": "America/New_York"
+    },
+    "lead": {
+      "ghl_contact_id": "FIXTURECONTACT000001",
+      "name": "Dana Whitfield",
+      "first_name": "Dana",
+      "lead_score": 58,
+      "date_added": "2026-08-30T13:00:00Z",
+      "entry_source": "Facebook Lead Form",
+      "current_tags": [],
+      "objection_tags": [],
+      "suppression_tags": [],
+      "contact_notes": [],
+      "rep_display_name": null,
+      "lp_rep_name": null,
+      "trust_level_score": 3,
+      "current_buyer_tag": null,
+      "current_bj_tag": null,
+      "current_stage_tag": null,
+      "decision_makers_present": null
+    },
+    "lp": {
+      "matched": false,
+      "notes": [],
+      "recent_calls": []
+    },
+    "intelligence": {
+      "buyer_stage": 3,
+      "buyer_stage_confidence": 0.85
+    },
+    "engagement": {
+      "emails_opened": 1,
+      "links_clicked": 0,
+      "replies_count": 2,
+      "vsl_watched": false
+    },
+    "objection_state": null,
+    "pipeline": null,
+    "estimate": null,
+    "conversation_recent": [
+      {
+        "direction": "outbound",
+        "channel": "sms",
+        "timestamp": "2026-09-02T13:05:00Z",
+        "text": "Thanks for those details, Dana. Before we get someone out — will anyone else be part of the decision, or is it just you?"
+      },
+      {
+        "direction": "inbound",
+        "channel": "sms",
+        "timestamp": "2026-09-02T13:07:00Z",
+        "text": "Just myself."
+      },
+      {
+        "direction": "inbound",
+        "channel": "email",
+        "timestamp": "2026-09-02T13:20:00Z",
+        "text": "I have been getting quotes for a while now and I have sat through several presentations already, so I know roughly what this should cost. The last company that came out gave me a number that was very close to what I was expecting and I almost signed with them that same evening, but I wanted to see one more option before I committed to anything. What I need replaced is twenty four windows across the whole house plus the glass sliding door that goes out to the patio, and cost is going to be the deciding factor for me on this one."
+      },
+      {
+        "direction": "outbound",
+        "channel": "sms",
+        "timestamp": "2026-09-02T13:40:00Z",
+        "text": "Sorry for the wait on that. I can have a specialist come out and measure, and you would have exact pricing the same visit."
+      }
+    ]
+  },
+  "opts": {
+    "established": {
+      "facts": [
+        {
+          "key": "decision_makers",
+          "value": "Solo Owner",
+          "source": "transcript",
+          "their_words": "Just myself.",
+          "at": "2026-09-02T13:07:00Z",
+          "at_human": "9:07 AM"
+        }
+      ],
+      "closed_questions": [
+        "decision_makers"
+      ],
+      "offers_made": [
+        {
+          "kind": "visit",
+          "at": "2026-09-02T13:05:00Z",
+          "detail": "get someone out"
+        },
+        {
+          "kind": "visit",
+          "at": "2026-09-02T13:40:00Z",
+          "detail": "specialist"
+        }
+      ],
+      "apologies_made": [
+        {
+          "for": "Sorry for the wait on that.",
+          "at": "2026-09-02T13:40:00Z"
+        }
+      ],
+      "objections_raised": [
+        {
+          "type": "competitor",
+          "at": "2026-09-02T13:20:00Z",
+          "their_words": "I have been getting quotes for a while now and I have sat through several presentations already, so I know roughly what this should cost. The last company that came out gave me a number that was very close to what I was expecting and I almost signed with them that same evening, but I wanted to see one more option before I committed to anything. What I need replaced is twenty four windows across t…",
+          "how_we_answered": "Sorry for the wait on that. I can have a specialist come out and measure, and you would have exact pricing the same visit."
+        }
+      ]
+    }
+  }
+}
