@@ -86,12 +86,17 @@ export function buildApptChangeContext(eventPayload = {}) {
 /**
  * 2026-05-11 — check whether this (rule_applied, target_id) recently
  * fired a completed send_notification inside the cooldown window.
+ *
+ * 2026-09-11 — exported, and the client is injectable, so the dedup that
+ * keeps a HUMAN NEEDED NOW alert to one card per contact per 30 minutes can
+ * be tested against a stub rather than a live Supabase. Production callers
+ * pass nothing and get the real client.
  */
-async function findRecentNotification(ruleApplied, targetId, cooldownMinutes, selfActionId) {
+export async function findRecentNotification(ruleApplied, targetId, cooldownMinutes, selfActionId, client = supabase) {
   if (!ruleApplied || !targetId || !(cooldownMinutes > 0)) return null;
   try {
     const since = new Date(Date.now() - cooldownMinutes * 60 * 1000).toISOString();
-    const { data, error } = await supabase
+    const { data, error } = await client
       .from('agent_actions')
       .select('id, created_at')
       .eq('rule_applied', ruleApplied)
