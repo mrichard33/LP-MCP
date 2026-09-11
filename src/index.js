@@ -8,6 +8,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { registerAllTools } from './tools/index.js';
 import { startSyncScheduler, fullSync, incrementalSync, handleWebhookEvent } from './sync-engine.js';
 import { trackInflight, trackBackground, installGracefulShutdown } from './graceful-shutdown.js';
+import { intakeJournal, startIntakeJournalSweeper, registerIntakeJournalRoutes } from './intake-journal.js';
 import { testConnection, getLeads } from './lp-client.js';
 import { getTokenStatus } from './token-manager.js';
 import supabase from './supabase.js';
@@ -317,6 +318,9 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 // Graceful drain: count in-flight requests so SIGTERM waits for them.
 app.use(trackInflight);
+// Write-ahead journal for lead-carrying routes. Fail-open: a journal error or
+// a slow insert never blocks or delays a lead past its 1.5s ceiling.
+app.use(intakeJournal());
 
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -1726,6 +1730,38 @@ async function runMigrations() {
   } catch (err) {
     console.error('[Migration] capacity ranker dial_priority_log heal_attempted FAILED (the heal flap guard will fail open and POST /n8n/capacity-ranker/heal cannot record its budget until sql/088 is applied manually):', err.message);
   }
+
+  // Intake journal (sql/106 — the file is the source of truth). The write-ahead
+  // row for every lead-carrying request, and the only thing that can prove a
+  // lead was not silently dropped between the ack and the work. The middleware
+  // is fail-open, so a missing table would degrade to "no journal at all"
+  // without erroring — which is exactly the blind spot this table exists to
+  // close. New and empty, so plain CREATE INDEX is fine. Additive.
+  try {
+    const { runSQL } = await import('./admin/supabase-admin.js');
+    await runSQL(`CREATE TABLE IF NOT EXISTS intake_journal (
+              id               bigserial PRIMARY KEY,
+              route            text        NOT NULL,
+              method           text        NOT NULL DEFAULT 'POST',
+              received_at      timestamptz NOT NULL DEFAULT now(),
+              deployment_id    text,
+              headers          jsonb       NOT NULL DEFAULT '{}'::jsonb,
+              query            jsonb       NOT NULL DEFAULT '{}'::jsonb,
+              body             jsonb,
+              body_truncated   boolean     NOT NULL DEFAULT false,
+              status           text        NOT NULL DEFAULT 'received'
+                               CHECK (status IN ('received','done','rejected','failed')),
+              response_status  integer,
+              completed_at     timestamptz,
+              error            text);
+            CREATE INDEX IF NOT EXISTS idx_intake_journal_open
+              ON intake_journal (received_at) WHERE status IN ('received','failed');
+            CREATE INDEX IF NOT EXISTS idx_intake_journal_route
+              ON intake_journal (route, received_at DESC);`);
+    console.log('[Migration] intake journal (sql/106) ready');
+  } catch (err) {
+    console.error('[Migration] intake journal FAILED (the journal middleware fails open, so intake keeps working but records nothing — apply sql/106 manually):', err.message);
+  }
 }
 
 app.get('/', (req, res) => {
@@ -1999,6 +2035,7 @@ registerEntryEventRoutes(app);
 
 // ─── GHL Tag Webhook Bridge ──────────────────────────────────────
 registerGhlTagRoutes(app);
+registerIntakeJournalRoutes(app, authenticate);
 
 // ─── Canvassing Pilot v2 intake (I.CV → LP) ──────────────────────
 registerCanvassingLeadRoutes(app);
@@ -2151,6 +2188,7 @@ const server = app.listen(PORT, async () => {
   // Drains ghl_tag_inbox. /webhooks/ghl-tag only enqueues now, so without
   // this running no tag event ever reaches the Decision Engine.
   startGhlTagProcessor();
+  startIntakeJournalSweeper();
   startDriftDetectorScheduler();
   startLeadStateSweepScheduler();
   startNoteChangeAnalyzerScheduler();
