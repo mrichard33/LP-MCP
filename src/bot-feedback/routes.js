@@ -20,8 +20,10 @@ import supabase from '../supabase.js';
 import { syncOutcomes } from './outcomes.js';
 import { getFingerprintMode, getJudgePersistMode, isMissingRelation } from './fingerprint-core.js';
 // v1.1 (Phase 1) — the human-review write surface.
+// v1.2 (Increment 2) — retraction, dismissals, the Completed list.
 import {
   submitFeedback, undoFeedback, editFeedback, stopBot, calibrationNext,
+  retractFeedback, dismissReview, undoDismissal, listCompleted,
 } from './feedback.js';
 
 /**
@@ -234,10 +236,53 @@ export function registerBotFeedbackRoutes(app, authenticate) {
     }
   });
 
+  // ══ Increment 2 — retraction, dismissals, Completed (handoff §5) ══
+  //
+  // Same contract as everything above it: x-actor-email, a server-side
+  // permission re-check inside the service, a bot_change_log row on every
+  // mutation, and { ok, data | error } on the wire.
+
+  app.post('/api/bot-feedback/feedback/:id/retract', ...guards, async (req, res) => {
+    try {
+      return send(res, await retractFeedback(actorOf(req), req.params.id, req.body || {}));
+    } catch (err) {
+      console.error(`[BotFeedback] POST /feedback/:id/retract threw: ${err.message}`);
+      return res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  app.post('/api/bot-feedback/dismiss', ...guards, async (req, res) => {
+    try {
+      return send(res, await dismissReview(actorOf(req), req.body || {}));
+    } catch (err) {
+      console.error(`[BotFeedback] POST /dismiss threw: ${err.message}`);
+      return res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  app.post('/api/bot-feedback/dismiss/:id/undo', ...guards, async (req, res) => {
+    try {
+      return send(res, await undoDismissal(actorOf(req), req.params.id));
+    } catch (err) {
+      console.error(`[BotFeedback] POST /dismiss/:id/undo threw: ${err.message}`);
+      return res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  app.get('/api/bot-feedback/completed', ...guards, async (req, res) => {
+    try {
+      return send(res, await listCompleted(actorOf(req), req.query || {}));
+    } catch (err) {
+      console.error(`[BotFeedback] GET /completed threw: ${err.message}`);
+      return res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
   console.log(
     '[BotFeedback] Routes: GET /health | POST /jobs/outcomes | POST /feedback | ' +
-    'POST /feedback/:id/undo | POST /feedback/:id/edit | POST /lead/:contactId/stop-bot | ' +
-    'GET /calibration/next' +
+    'POST /feedback/:id/undo | POST /feedback/:id/edit | POST /feedback/:id/retract | ' +
+    'POST /dismiss | POST /dismiss/:id/undo | GET /completed | ' +
+    'POST /lead/:contactId/stop-bot | GET /calibration/next' +
     `${guards.length ? ' (authenticated)' : ' (UNAUTHENTICATED — no middleware passed)'}`,
   );
 }

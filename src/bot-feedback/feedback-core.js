@@ -10,6 +10,28 @@
  *   a sentence a reviewer can act on instead of letting Postgres raise a
  *   constraint error the UI cannot explain.
  *
+ * v1.1 — 2026-09-11. INCREMENT 2 (handoff §5).
+ *   PROBLEM 1: there was no way to remove a review after the 10-second undo
+ *   window. A wrong verdict found a week later was permanent, and it kept
+ *   counting in every rate.
+ *   FIX 1: retraction — validateRetract / canRetract. A retraction stops the
+ *   review counting and takes it out of the queue, but never deletes the row:
+ *   the change log and the agreement history stay honest.
+ *
+ *   PROBLEM 2: a reviewer who opened a lead that needed no judgement had to
+ *   score it anyway or leave it in the queue forever, where it reappeared for
+ *   the next reviewer.
+ *   FIX 2: dismissals — validateDismissal / canDismiss. Persistent for the whole
+ *   team, undoable, and never a verdict.
+ *
+ *   PROBLEM 3: `seen_before` asked a reviewer to remember whether they had met
+ *   this failure before. The nightly Phase 2 grouping counts recurrence itself,
+ *   from more data and without the memory. The toggle was the machine's job
+ *   handed to a person with worse information.
+ *   FIX 3: the field is no longer read from the request. The COLUMN stays (the
+ *   six rows written under Phase 1 keep their history) and every new row is
+ *   written false.
+ *
  * The DB is still the authority — these rules exist in sql/103 as CHECK
  * constraints and stay there. This file is the friendly half of the same rule,
  * not a replacement for it.
@@ -108,10 +130,12 @@ export function validateFeedback(input = {}, knownReasonCodes = null) {
     return { ok: false, field: 'better_text', error: `Keep the rewrite under ${LIMITS.better_text} characters.` };
   }
 
-  // gold — mirrors CHECK bf_gold_good_only.
+  // gold — mirrors CHECK bf_gold_good_only. The COLUMN is still `gold`; the
+  // words a reviewer reads are "teaching example" everywhere (v1.1, handoff
+  // §6B: "gold example" is jargon nobody outside this repo uses).
   const gold = input.gold === true;
   if (gold && verdict !== 'good') {
-    return { ok: false, field: 'gold', error: 'Only a Good message can be saved as a gold example.' };
+    return { ok: false, field: 'gold', error: 'Only a Good message can be used as a teaching example.' };
   }
 
   return {
@@ -123,12 +147,104 @@ export function validateFeedback(input = {}, knownReasonCodes = null) {
       reason_codes: reasonCodes,
       better_text: betterText === '' ? null : betterText,
       note: note === '' ? null : note,
-      seen_before: input.seen_before === true,
+      // v1.1: NOT read from the request any more. Always false on a new row —
+      // the column is kept only so the Phase 1 rows stay readable.
+      seen_before: false,
       gold,
       is_calibration: input.is_calibration === true,
     },
   };
 }
+
+/** Retraction reason cap. Long enough to explain, short enough to bound a row. */
+export const RETRACT_REASON_MAX = 500;
+export const DISMISS_REASON_MAX = 500;
+export const DISMISS_SCOPES = Object.freeze(['message', 'conversation']);
+
+/**
+ * Validate a retraction.
+ *
+ * The reason is REQUIRED, and the DB trigger requires it too. A retraction
+ * without one is indistinguishable from a mistake six months later, and the
+ * whole point of retracting rather than deleting is that someone can read back
+ * why the review stopped counting.
+ */
+export function validateRetract(input = {}) {
+  const reason = str(input.reason).trim();
+  if (!reason) {
+    return { ok: false, field: 'reason', error: 'Tell us why this review is being removed.' };
+  }
+  if (reason.length > RETRACT_REASON_MAX) {
+    return { ok: false, field: 'reason', error: `Keep the reason under ${RETRACT_REASON_MAX} characters.` };
+  }
+  return { ok: true, value: { reason } };
+}
+
+/**
+ * Who may retract: the review's own author, or any admin.
+ *
+ * Deliberately NARROWER than canUndo's shape even though it reads the same —
+ * they are different powers and will drift apart (an operator may one day
+ * retract a team member's review; they may never undo one). Keeping them as two
+ * functions is what makes that change a one-line edit instead of a hunt.
+ */
+export function canRetract(ctx, row) {
+  if (!row) return false;
+  return ctx?.isAdmin === true || str(row.reviewer_email).toLowerCase() === str(ctx?.email).toLowerCase();
+}
+
+/** Dismissing is a queue decision, not a verdict: operators and admins. */
+export function canDismiss(ctx) {
+  return ctx?.role === 'operator' || ctx?.role === 'team' || ctx?.isAdmin === true;
+}
+
+/** Undoing a dismissal is a wider power than making one: operators and admins. */
+export function canUndoDismiss(ctx) {
+  return ctx?.role === 'operator' || ctx?.isAdmin === true;
+}
+
+/**
+ * Validate a dismissal.
+ *
+ * Mirrors CHECK brd_scope_target: a message dismissal needs a context_id, a
+ * conversation dismissal needs a contact. Sending both is a client bug, and the
+ * extra one is dropped rather than stored — a row that claims to be both would
+ * match two different unique indexes.
+ */
+export function validateDismissal(input = {}) {
+  const scope = str(input.scope).trim();
+  if (!DISMISS_SCOPES.includes(scope)) {
+    return { ok: false, field: 'scope', error: `scope must be one of ${DISMISS_SCOPES.join(', ')}.` };
+  }
+
+  const reason = str(input.reason).trim();
+  if (reason.length > DISMISS_REASON_MAX) {
+    return { ok: false, field: 'reason', error: `Keep the reason under ${DISMISS_REASON_MAX} characters.` };
+  }
+
+  if (scope === 'message') {
+    const contextId = Number(input.context_id);
+    if (!Number.isInteger(contextId) || contextId <= 0) {
+      return { ok: false, field: 'context_id', error: 'context_id is required to dismiss one message.' };
+    }
+    return {
+      ok: true,
+      value: { scope, context_id: contextId, ghl_contact_id: null, reason: reason || null },
+    };
+  }
+
+  const contactId = str(input.ghl_contact_id).trim();
+  if (!contactId) {
+    return { ok: false, field: 'ghl_contact_id', error: 'ghl_contact_id is required to dismiss a conversation.' };
+  }
+  return {
+    ok: true,
+    value: { scope, context_id: null, ghl_contact_id: contactId, reason: reason || null },
+  };
+}
+
+/** The three review lanes, in the order the UI shows them. */
+export const REVIEW_LANES = Object.freeze(['must_review', 'spot_check', 'none']);
 
 /**
  * The reviewer's role for a feedback row.
@@ -218,12 +334,21 @@ export default {
   VERDICTS,
   MESSAGE_TYPES,
   REVIEWER_ROLES,
+  REVIEW_LANES,
   LIMITS,
+  RETRACT_REASON_MAX,
+  DISMISS_REASON_MAX,
+  DISMISS_SCOPES,
   validateFeedback,
+  validateRetract,
+  validateDismissal,
   resolveReviewerRole,
   canSubmitFeedback,
   canStopBot,
   canUndo,
+  canRetract,
+  canDismiss,
+  canUndoDismiss,
   alreadyStopped,
   STOP_BOT_TAG,
   reviewDeepLink,

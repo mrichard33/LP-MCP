@@ -17,6 +17,19 @@
  *
  * Degrades on a missing relation (sql/103 / sql/104 not applied) with a clear
  * message rather than a 500 — the dashboard renders "needs migration".
+ *
+ * v1.1 — 2026-09-11. INCREMENT 2 (handoff §5).
+ *   Adds retractFeedback, dismissReview, undoDismissal and listCompleted.
+ *   Drops `seen_before` from the request shape (§6B).
+ *
+ *   FIX, found while building this: editFeedback has NEVER linked a superseding
+ *   row. It inserted the new verdict and then ran
+ *   `UPDATE bot_feedback SET supersedes_id = …`, which the append-only trigger
+ *   from sql/103 refuses — only undone_at was ever mutable. Every edit since
+ *   Phase 1 returned "Saved the new review but could not link it to the old
+ *   one", leaving two live verdicts from the same reviewer on one message.
+ *   supersedes_id is now set on the INSERT, where no trigger objects, and the
+ *   guard stays as tight as it was.
  */
 
 import supabase from '../supabase.js';
@@ -24,10 +37,15 @@ import { sendGroupMeMessage } from '../groupme.js';
 import { isMissingRelation } from './fingerprint-core.js';
 import {
   validateFeedback,
+  validateRetract,
+  validateDismissal,
   resolveReviewerRole,
   canSubmitFeedback,
   canStopBot,
   canUndo,
+  canRetract,
+  canDismiss,
+  canUndoDismiss,
   alreadyStopped,
   reviewDeepLink,
   buildUnsafeAlert,
@@ -107,7 +125,7 @@ async function knownReasonCodes() {
 // ═══════════════════════════════════════════════════════════════════
 // POST /api/bot-feedback/feedback
 // ═══════════════════════════════════════════════════════════════════
-export async function submitFeedback(actorEmail, body) {
+export async function submitFeedback(actorEmail, body, { supersedesId = null } = {}) {
   const who = await resolveActor(actorEmail);
   if (!who.ok) return { ok: false, error: who.error, status: 401 };
   const actor = who.actor;
@@ -160,6 +178,9 @@ export async function submitFeedback(actorEmail, body) {
     reviewer_role: resolveReviewerRole(actor),
     counts,
     ai_score_at_review: ctxRow.ai_score ?? null,
+    // v1.1: set HERE, on the insert. The old code updated it afterwards and the
+    // append-only trigger rejected that every single time — see the file header.
+    ...(supersedesId != null ? { supersedes_id: supersedesId } : {}),
   };
 
   const { data: inserted, error: insertError } = await supabase
@@ -280,7 +301,7 @@ export async function editFeedback(actorEmail, id, body) {
 
   const { data: prior, error } = await supabase
     .from('bot_feedback')
-    .select('id, message_type, message_ref, reviewer_email, undone_at')
+    .select('id, message_type, message_ref, reviewer_email, undone_at, retracted_at')
     .eq('id', id).maybeSingle();
   if (error && isMissingRelation(error)) {
     return { ok: false, error: 'Bot Review is not migrated yet — apply sql/103.', status: 503 };
@@ -290,23 +311,21 @@ export async function editFeedback(actorEmail, id, body) {
     return { ok: false, error: 'You can only edit your own review.', status: 403 };
   }
 
-  // The edit always targets the SAME message as the row it supersedes — a
-  // client cannot repoint a review at a different message.
-  const res = await submitFeedback(actorEmail, {
-    ...body,
-    message_type: prior.message_type,
-    message_ref: prior.message_ref,
-  });
-  if (!res.ok) return res;
-
-  const { error: linkError } = await supabase
-    .from('bot_feedback').update({ supersedes_id: id }).eq('id', res.data.id);
-  if (linkError) {
-    // The new verdict is saved; only the link failed. Say so rather than
-    // implying nothing happened — both rows now exist.
-    console.error(`[BotFeedback] supersedes link failed for ${res.data.id}: ${linkError.message}`);
-    return { ok: false, error: 'Saved the new review but could not link it to the old one. Tell Mark.', status: 500 };
+  // A retracted review is gone; editing it would resurrect a verdict someone
+  // deliberately removed. Re-reviewing the message is the way back.
+  if (prior.retracted_at) {
+    return { ok: false, error: 'That review was removed. Score the message again instead.', status: 409 };
   }
+
+  // The edit always targets the SAME message as the row it supersedes — a
+  // client cannot repoint a review at a different message. The link is written
+  // by the INSERT itself (v1.1); there is no follow-up UPDATE to fail.
+  const res = await submitFeedback(
+    actorEmail,
+    { ...body, message_type: prior.message_type, message_ref: prior.message_ref },
+    { supersedesId: Number(id) },
+  );
+  if (!res.ok) return res;
 
   await logChange({
     actor: actor.email, action: 'feedback_edited',
@@ -430,6 +449,289 @@ export async function calibrationNext(actorEmail) {
   };
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// INCREMENT 2 — retraction, dismissals, the Completed list
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * sql/106 adds columns as well as tables, and PostgREST reports an unknown
+ * COLUMN with the same "does not exist" wording as an unknown table — so
+ * isMissingRelation() catches both. This only decides which file to name.
+ */
+const NEEDS_INC2 = 'Bot Review increment 2 is not migrated yet — apply sql/106_bot_review_inc2.sql.';
+
+// ── POST /api/bot-feedback/feedback/:id/retract ────────────────────
+//
+// Retraction is the answer to "I got that one wrong and the undo window closed
+// three days ago". It is NOT a delete: the row stays, v_bot_current_feedback
+// stops returning it, and every rate built on that view drops it in the same
+// breath. A reason is required by this function AND by the DB trigger — two
+// gates, because a retraction nobody can explain is worse than the bad review.
+export async function retractFeedback(actorEmail, id, body) {
+  const who = await resolveActor(actorEmail);
+  if (!who.ok) return { ok: false, error: who.error, status: 401 };
+  const actor = who.actor;
+
+  const v = validateRetract(body || {});
+  if (!v.ok) return { ok: false, error: v.error, field: v.field, status: 400 };
+
+  const { data: row, error } = await supabase
+    .from('bot_feedback')
+    .select('id, message_type, message_ref, context_id, ghl_contact_id, reviewer_email, reviewer_role, ' +
+            'verdict, reason_codes, better_text, note, gold, counts, is_calibration, ai_score_at_review, ' +
+            'supersedes_id, created_at, undone_at, retracted_at, retracted_by, retract_reason')
+    .eq('id', id)
+    .maybeSingle();
+
+  if (error && isMissingRelation(error)) return { ok: false, error: NEEDS_INC2, status: 503 };
+  if (error) return { ok: false, error: error.message, status: 500 };
+  if (!row) return { ok: false, error: 'That review no longer exists.', status: 404 };
+
+  if (!canRetract(actor, row)) {
+    return { ok: false, error: 'You can only remove your own review.', status: 403 };
+  }
+
+  // Idempotent: a second click (or a retried request) is not an error. The
+  // caller gets the same shape back and the UI can show the same confirmation.
+  if (row.retracted_at) {
+    return {
+      ok: true,
+      data: {
+        id: row.id,
+        already_retracted: true,
+        retracted_at: row.retracted_at,
+        retracted_by: row.retracted_by,
+      },
+    };
+  }
+
+  const retractedAt = new Date().toISOString();
+  const { error: updateError } = await supabase
+    .from('bot_feedback')
+    .update({ retracted_at: retractedAt, retracted_by: actor.email, retract_reason: v.value.reason })
+    .eq('id', id);
+
+  if (updateError) {
+    if (isMissingRelation(updateError)) return { ok: false, error: NEEDS_INC2, status: 503 };
+    // The trigger's own messages are the honest ones — surface them rather than
+    // a generic 500 that hides which rule was hit.
+    const guard = /retraction (cannot be changed|needs a reason)/i.test(updateError.message || '');
+    return { ok: false, error: updateError.message, status: guard ? 409 : 500 };
+  }
+
+  // `before` carries the WHOLE prior row (handoff §5). A retraction that logged
+  // only the id would tell a future reader that something was removed without
+  // telling them what — which is the state this feature exists to prevent.
+  await logChange({
+    actor: actor.email,
+    action: 'feedback_retracted',
+    targetTable: 'bot_feedback',
+    targetId: id,
+    reason: v.value.reason,
+    before: row,
+    after: { retracted_at: retractedAt, retracted_by: actor.email },
+  });
+
+  return {
+    ok: true,
+    data: {
+      id: Number(id),
+      already_retracted: false,
+      retracted_at: retractedAt,
+      retracted_by: actor.email,
+      context_id: row.context_id,
+    },
+  };
+}
+
+// ── POST /api/bot-feedback/dismiss ─────────────────────────────────
+//
+// "Nothing to review here" — a queue decision, never a verdict. It is stored
+// for the whole team rather than per person: a message one reviewer has ruled
+// needs no judgement should not reappear for the next one, or the queue never
+// shrinks no matter how many people work it.
+export async function dismissReview(actorEmail, body) {
+  const who = await resolveActor(actorEmail);
+  if (!who.ok) return { ok: false, error: who.error, status: 401 };
+  const actor = who.actor;
+
+  if (!canDismiss(actor)) {
+    return { ok: false, error: 'You do not have access to review bot messages.', status: 403 };
+  }
+
+  const v = validateDismissal(body || {});
+  if (!v.ok) return { ok: false, error: v.error, field: v.field, status: 400 };
+  const input = v.value;
+
+  // An active dismissal already exists → return IT rather than erroring
+  // (handoff §5). Two reviewers reaching the same conclusion a second apart is
+  // agreement, not a conflict, and the unique index would otherwise 409 the
+  // second one for doing the right thing.
+  const existing = await findActiveDismissal(input);
+  if (existing.error) return existing.error;
+  if (existing.row) {
+    return { ok: true, data: { ...existing.row, already_dismissed: true } };
+  }
+
+  const { data: inserted, error: insertError } = await supabase
+    .from('bot_review_dismissals')
+    .insert({ ...input, dismissed_by: actor.email })
+    .select('id, scope, context_id, ghl_contact_id, reason, dismissed_by, dismissed_at')
+    .single();
+
+  if (insertError) {
+    if (isMissingRelation(insertError)) return { ok: false, error: NEEDS_INC2, status: 503 };
+    // A race with another reviewer lands on the unique index. Re-read and hand
+    // back their row: the outcome the caller wanted is now true either way.
+    if (/duplicate key|unique constraint/i.test(insertError.message || '')) {
+      const again = await findActiveDismissal(input);
+      if (again.row) return { ok: true, data: { ...again.row, already_dismissed: true } };
+    }
+    console.error(`[BotFeedback] dismiss insert failed: ${insertError.message}`);
+    return { ok: false, error: insertError.message, status: 500 };
+  }
+
+  await logChange({
+    actor: actor.email,
+    action: 'review_dismissed',
+    targetTable: 'bot_review_dismissals',
+    targetId: inserted.id,
+    reason: input.reason,
+    after: inserted,
+  });
+
+  return { ok: true, data: { ...inserted, already_dismissed: false } };
+}
+
+/** The live dismissal for this target, if there is one. */
+async function findActiveDismissal(input) {
+  let q = supabase
+    .from('bot_review_dismissals')
+    .select('id, scope, context_id, ghl_contact_id, reason, dismissed_by, dismissed_at')
+    .eq('scope', input.scope)
+    .is('undone_at', null);
+
+  q = input.scope === 'message'
+    ? q.eq('context_id', input.context_id)
+    : q.eq('ghl_contact_id', input.ghl_contact_id);
+
+  const { data, error } = await q.maybeSingle();
+  if (error) {
+    if (isMissingRelation(error)) return { row: null, error: { ok: false, error: NEEDS_INC2, status: 503 } };
+    return { row: null, error: { ok: false, error: error.message, status: 500 } };
+  }
+  return { row: data ?? null, error: null };
+}
+
+// ── POST /api/bot-feedback/dismiss/:id/undo ────────────────────────
+//
+// A wrong dismissal must never be a dead end — it hides a message from every
+// reviewer, so it needs a way back that does not require the SQL editor.
+export async function undoDismissal(actorEmail, id) {
+  const who = await resolveActor(actorEmail);
+  if (!who.ok) return { ok: false, error: who.error, status: 401 };
+  const actor = who.actor;
+
+  if (!canUndoDismiss(actor)) {
+    return { ok: false, error: 'Undoing a dismissal is for operators and admins.', status: 403 };
+  }
+
+  const { data: row, error } = await supabase
+    .from('bot_review_dismissals')
+    .select('id, scope, context_id, ghl_contact_id, reason, dismissed_by, dismissed_at, undone_at')
+    .eq('id', id)
+    .maybeSingle();
+
+  if (error && isMissingRelation(error)) return { ok: false, error: NEEDS_INC2, status: 503 };
+  if (error) return { ok: false, error: error.message, status: 500 };
+  if (!row) return { ok: false, error: 'That dismissal no longer exists.', status: 404 };
+  if (row.undone_at) return { ok: true, data: { id: row.id, already_undone: true } };
+
+  const undoneAt = new Date().toISOString();
+  const { error: updateError } = await supabase
+    .from('bot_review_dismissals')
+    .update({ undone_at: undoneAt, undone_by: actor.email })
+    .eq('id', id);
+
+  if (updateError) {
+    console.error(`[BotFeedback] dismiss undo failed for ${id}: ${updateError.message}`);
+    return { ok: false, error: updateError.message, status: 500 };
+  }
+
+  await logChange({
+    actor: actor.email,
+    action: 'review_dismiss_undone',
+    targetTable: 'bot_review_dismissals',
+    targetId: id,
+    before: row,
+    after: { undone_at: undoneAt, undone_by: actor.email },
+  });
+
+  return { ok: true, data: { id: Number(id), already_undone: false } };
+}
+
+// ── GET /api/bot-feedback/completed ────────────────────────────────
+//
+// Server-side pagination, 25 a page. The dashboard reads v_bot_reviews_completed
+// directly for its own table; this endpoint exists so the same list is available
+// to anything that is not the dashboard (a report, a check, Mark with curl)
+// without handing out a Supabase key.
+export const COMPLETED_PAGE_SIZE = 25;
+
+export async function listCompleted(actorEmail, query = {}) {
+  const who = await resolveActor(actorEmail);
+  if (!who.ok) return { ok: false, error: who.error, status: 401 };
+  const actor = who.actor;
+
+  if (!canSubmitFeedback(actor)) {
+    return { ok: false, error: 'You do not have access to review bot messages.', status: 403 };
+  }
+
+  // A team member may only see their own work; operators and admins may look at
+  // anyone's. The DEFAULT for everyone is "me" — the tab is a record of what you
+  // did, and a wall of someone else's reviews is not that.
+  const wide = actor.role === 'operator' || actor.isAdmin === true;
+  const askedFor = String(query.reviewer || '').trim();
+  const reviewer = wide
+    ? (askedFor && askedFor !== 'everyone' ? askedFor : (askedFor === 'everyone' ? null : actor.email))
+    : actor.email;
+
+  const page = Math.max(1, Number(query.page) || 1);
+  const from = (page - 1) * COMPLETED_PAGE_SIZE;
+
+  let q = supabase
+    .from(query.retracted === true || query.retracted === 'true'
+      ? 'v_bot_reviews_retracted'
+      : 'v_bot_reviews_completed')
+    .select('*', { count: 'exact' })
+    .order('created_at', { ascending: false });
+
+  if (reviewer) q = q.ilike('reviewer_email', reviewer);
+  if (query.verdict && query.verdict !== 'all') q = q.eq('verdict', query.verdict);
+  if (query.lane && query.lane !== 'all') q = q.eq('review_lane', query.lane);
+  if (query.from) q = q.gte('created_at', query.from);
+  if (query.to) q = q.lte('created_at', query.to);
+
+  const { data, error, count } = await q.range(from, from + COMPLETED_PAGE_SIZE - 1);
+
+  if (error) {
+    if (isMissingRelation(error)) return { ok: false, error: NEEDS_INC2, status: 503 };
+    return { ok: false, error: error.message, status: 500 };
+  }
+
+  return {
+    ok: true,
+    data: {
+      rows: data ?? [],
+      total: count ?? 0,
+      page,
+      page_size: COMPLETED_PAGE_SIZE,
+      reviewer: reviewer ?? 'everyone',
+    },
+  };
+}
+
 export default {
   resolveActor, submitFeedback, undoFeedback, editFeedback, stopBot, calibrationNext,
+  retractFeedback, dismissReview, undoDismissal, listCompleted,
 };
