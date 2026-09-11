@@ -90,6 +90,7 @@ call before then to go over the details and finalize the visit."
 
 LEAD: Dana Whitfield
 Entry: Facebook Lead Form | Lead Score: 42 | Date Added: 2026-08-30T13:00:00Z
+COMPANY INBOX: team@getreecewindows.com. This is the ONLY email address a customer may send us files, photos, measurements, or documents. When a customer asks where to email something, give this address. NEVER tell a customer to send anything to their own email address, and never invent any other address.
 Inferred Buyer Stage: 2/5
 
 ⛈️ NAMED-STORM POSTURE ACTIVE (global toggle): a named storm is active or recent. Lead with empathy and service. Drop ALL persuasion framing, urgency plays, and booking pushes — answer questions, offer help, route service needs. No storm-chasing tone of any kind. Booking only if the LEAD asks for it.

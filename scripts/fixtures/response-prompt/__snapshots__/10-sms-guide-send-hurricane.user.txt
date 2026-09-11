@@ -90,6 +90,7 @@ call before then to go over the details and finalize the visit."
 
 LEAD: Dana Whitfield
 Entry: Facebook Lead Form | Lead Score: 42 | Date Added: 2026-08-30T13:00:00Z
+COMPANY INBOX: team@getreecewindows.com. This is the ONLY email address a customer may send us files, photos, measurements, or documents. When a customer asks where to email something, give this address. NEVER tell a customer to send anything to their own email address, and never invent any other address.
 Inferred Buyer Stage: 2/5
 Active Entry: active-entry:E.2-calculator-bridge
 GUIDE OFFER STATUS: OUTSTANDING — already offered, unanswered. Never re-offer. If the lead provides an email now, emit guide_disposition outcome "accepted"; if they decline the guide now, emit outcome "declined".
