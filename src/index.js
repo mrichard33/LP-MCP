@@ -38,6 +38,7 @@ import { registerIntentScorerRoutes } from './intent-scorer.js';
 // ─── Phase 4: KB Vector Ingestion (agentic bot knowledge layer) ──
 import { registerKbIngestionRoutes } from './knowledge/ingest-embeddings.js';
 import { registerMemoryRoutes } from './memory/memory-routes.js';
+import { registerRecommendRoutes } from './memory/recommend-routes.js';
 import { registerOmiRoutes, omiBodyParser } from './memory/omi-routes.js';
 import { registerMemoryNightlyRoutes, startMemoryNightlyScheduler } from './jobs/memory-nightly.js';
 import { registerAdminMemoryRoutes } from './routes/admin-memory.js';
@@ -1899,6 +1900,9 @@ registerKbIngestionRoutes(app);
 // ─── Memory vector tier (sql/094): server-side backfill + hybrid search ──
 // Operator surface only; nothing in the request path calls it. Authenticated.
 registerMemoryRoutes(app, authenticate);
+// sql/102: Command Center recommendation backlog. Does nothing at all until
+// MEMORY_RECOMMEND_MODE is shadow or live.
+registerRecommendRoutes(app, authenticate);
 // sql/101: Omi conversation ingest. Its own Bearer token (OMI_INGEST_TOKEN),
 // NOT MCP_AUTH_TOKEN — the n8n relay must not hold the key to every admin
 // route here. Answers 503 until OMI_INGEST_MODE is set to shadow or live.
