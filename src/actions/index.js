@@ -44,10 +44,11 @@
  * was re-derived from it on 2026-08-21, when it had drifted to a stated 45
  * and was missing all seven Phase G ops plus nine others):
  *
- *   GHL contact + pipeline (12):
+ *   GHL contact + pipeline (13):
  *     add_tag, remove_tag, add_note, set_stage, move_opportunity,
  *     update_opportunity, add_to_workflow, remove_from_workflow,
- *     update_custom_fields, update_contact_email, set_dnd, issue_hold
+ *     update_custom_fields, persist_established_facts, update_contact_email,
+ *     set_dnd, issue_hold
  *   Appointments (5):
  *     book_appointment, cancel_appointment, reschedule_appointment,
  *     update_appointment_status, sync_lp_appointment_to_ghl
@@ -238,6 +239,10 @@ import { executeSetDND } from './handlers/dnd.js';
 import { executeCreateTask } from './handlers/tasks.js';
 import { executeSendNotification } from './handlers/notifications.js';
 import { executeUpdateCustomFields, executeUpdateContactEmail } from './handlers/custom-fields.js';
+// 2026-09-11 (Alfredo Fontan) — persist what the analyzer established from the
+// lead's own words, at the moment it knows. See the handler header for why this
+// is a dedicated action type and not an update_custom_fields template.
+import { executePersistEstablishedFacts } from './handlers/established-facts.js';
 import { executeCalculateTimeLapseTier } from './handlers/time-lapse.js';
 import { executeEmitEvent } from './handlers/system-events.js';
 import { executeComputeRescissionDispatch } from './handlers/rescission.js';
@@ -555,6 +560,7 @@ export const ACTION_HANDLERS = {
   update_lp_dnc_status: executeUpdateLPDNCStatus, // 2026-05-01 — agentic DNC push (Charles Poulos recovery)
   set_dnd: executeSetDND,                        // 2026-07-20 Fix 6b — GHL-side channel DND. Handler landed 2026-07-20, wired 2026-07-22.
   update_custom_fields: executeUpdateCustomFields,
+  persist_established_facts: executePersistEstablishedFacts, // 2026-09-11 — analyzer-time fact persistence
   update_contact_email: executeUpdateContactEmail,
   calculate_time_lapse_tier: executeCalculateTimeLapseTier,
   send_message: executeSendMessageWithLock,      // MVI v2.5 — outbound_locks wrap; 2026-05-13 — + suppression gate
@@ -647,6 +653,7 @@ const CONTEXT_AWARE_HANDLERS = new Set([
   'update_contact_email',
   'send_message',
   'create_lp_lead',          // 2026-05-01 — needs event payload for appointment_date/time
+  'persist_established_facts', // 2026-09-11 — reads established_facts off the ai.analysis_completed payload
 ]);
 // Note: layer3_dispatch doesn't go through CONTEXT_AWARE_HANDLERS because
 // it fetches its own source event row (it needs event.id, not just the
@@ -694,6 +701,7 @@ const MUTATION_GATED_ACTION_TYPES = new Set([
   'remove_from_workflow',
   'set_stage',
   'update_custom_fields',
+  'persist_established_facts',
   'update_contact_email',
   'add_tag',
   'remove_tag',

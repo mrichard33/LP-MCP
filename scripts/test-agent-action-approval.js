@@ -180,7 +180,7 @@ test('D1 — removed action types are absent from ACTION_HANDLERS entirely', asy
   }
 });
 
-test('D1 — the registry holds exactly the 73 documented action types', async () => {
+test('D1 — the registry holds exactly the 74 documented action types', async () => {
   const { ACTION_HANDLERS } = await import('../src/actions/index.js');
   const types = Object.keys(ACTION_HANDLERS);
   // The header comment in src/actions/index.js enumerates these by name. It
@@ -188,7 +188,9 @@ test('D1 — the registry holds exactly the 73 documented action types', async (
   // here is what makes the next drift a test failure instead of a surprise.
   // 2026-08-21 Phase H PR4: 60 → 73, five9_* 24 → 37 (web connector pair +
   // 11 campaign-composition ops).
-  assert.equal(types.length, 73);
+  // 2026-09-11 (Alfredo Fontan): 73 → 74, persist_established_facts — the
+  // analyzer-time write of facts the lead stated in their own words.
+  assert.equal(types.length, 74);
   assert.equal(types.filter(t => t.startsWith('five9_')).length, 37);
   // Every type the coercion loop covers must actually be dispatchable.
   for (const actionType of FIVE9_WRITE_TYPES) {
