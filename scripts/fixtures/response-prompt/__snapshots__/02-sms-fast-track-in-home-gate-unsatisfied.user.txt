@@ -29,6 +29,11 @@ CLASSIFICATION: GENERAL_QUESTION (0.82 confidence, llm)
 Classifier reasoning: Lead asked an open pricing question with no objection language.
 
 TRAFFIC TEMPERATURE: HOT — calibrate hook intensity per Traffic Secrets section.
+
+═══════ ESTABLISHED — ALREADY SETTLED IN THIS CONVERSATION ═══════
+Everything below is already known. It came from the CRM record or from the customer's own words in this thread. Treat it as fact and build on it.
+(nothing established yet in this conversation)
+═══════ END ESTABLISHED ═══════
 === CONVERSATION DISCIPLINE (NEPQ) ===
 
 STAGE: CONNECTION — they are not yet convinced this is a real problem.

@@ -348,10 +348,33 @@ export const KNOWN_CONTACT_PROFILE_RULE = [
   `NON-NEGOTIABLE RULE: Never ask the customer for information already present in this profile — it is on file. Only a field marked NOT KNOWN may ever be asked for, one at a time, and only when the booking-gate rules below call for it.`,
 ];
 
-// Decision-maker state: confirmed, answered but pending, or never asked. Only the last permits asking.
+// Decision-maker state. Only NEVER ASKED permits asking.
 // Was response-generator.js:1128.
-export const knownDecisionMakers = (dmConfirmed, dmAnswered) => [
-  `Decision-maker presence: ${dmConfirmed ? 'CONFIRMED (all decision-makers attending)' : dmAnswered ? 'ANSWERED BUT PENDING/NEGATIVE (do not re-ask this turn unless they volunteer an update)' : 'NEVER ASKED'}`,
+//
+// 2026-09-11 (Alfredo Fontan, outbound yFkfGW3AOmm9M8Myk7W8 at 21:11:55Z).
+// The three states below were driven ONLY by the GHL custom field
+// GH1QGGOseMKmJAMqajiN. Alfredo answered "Just myself." at 19:37; the field
+// was not written until 21:25. For the hour and forty-eight minutes in
+// between, the field was empty, so this line said NEVER ASKED and the model
+// did exactly what NEVER ASKED tells it to do — it asked:
+//
+//   "…will it just be you home, or is there someone else who'd want to be
+//    there?"
+//
+// A fourth state is added: the lead ANSWERED IN CONVERSATION. It is sourced
+// from the transcript (see src/agentic/established-facts.js), it carries their
+// own words and the time they said them, and it outranks NEVER ASKED — which
+// now means what it says, rather than "the field happens to be empty".
+export const knownDecisionMakers = (dmConfirmed, dmAnswered, saidWords = null, saidWhen = null) => [
+  `Decision-maker presence: ${
+    dmConfirmed
+      ? 'CONFIRMED (all decision-makers attending)'
+      : dmAnswered
+        ? 'ANSWERED BUT PENDING/NEGATIVE (do not re-ask this turn unless they volunteer an update)'
+        : saidWords
+          ? `ANSWERED IN CONVERSATION — THEY SAID "${saidWords}"${saidWhen ? ` at ${saidWhen}` : ''}. The CRM field has not caught up yet; their words are the answer. Do NOT ask this again. Reference what they said instead.`
+          : 'NEVER ASKED'
+  }`,
 ];
 
 // Property address on file, or NOT KNOWN.
@@ -592,4 +615,63 @@ export const REGENERATION_NOTE_HEADER = [
 // Was response-generator.js:884.
 export const channelHeader = (channel) => [
   `CHANNEL: ${channel}`,
+];
+
+// ═══════════════════════════════════════════════════════════════════
+// ESTABLISHED — what this conversation has already settled
+// (2026-09-11, Alfredo Fontan — GHL VKMKhd8JQ4wsp3zMn8Lt)
+// ═══════════════════════════════════════════════════════════════════
+//
+// New in this file; no `Was response-generator.js:` line because none of it
+// existed before. Rendered UNCONDITIONALLY and ahead of the NEPQ block, so the
+// questioning discipline is chosen against facts the model already holds
+// rather than against an empty CRM field. Source data:
+// src/agentic/established-facts.js.
+
+export const ESTABLISHED_HEADER = [
+  `\n═══════ ESTABLISHED — ALREADY SETTLED IN THIS CONVERSATION ═══════`,
+  `Everything below is already known. It came from the CRM record or from the customer's own words in this thread. Treat it as fact and build on it.`,
+];
+
+export const ESTABLISHED_FOOTER = [
+  `═══════ END ESTABLISHED ═══════`,
+];
+
+// One settled fact. Their OWN WORDS are the point of this line — a bare value
+// is what got re-asked on 2026-09-11, because a value with no voice behind it
+// reads as a CRM row the model is free to re-verify. "THEY SAID" is
+// deliberately not gendered: nothing in the record tells us a customer's
+// pronouns, and the line renders for every lead.
+export const establishedFact = (key, value, theirWords, when) => {
+  const said = theirWords ? ` — THEY SAID "${theirWords}"${when ? ` at ${when}` : ''}` : '';
+  return [`${key}: ${value ?? '(answered — see their words)'}${said}`];
+};
+
+// A fact where the CRM field and the transcript disagree. The field wins, but
+// the customer still said what they said, and a reply that contradicts their
+// own words reads worse than one that is merely out of date.
+export const establishedFactConflict = (key, fieldValue, saidValue, theirWords) => [
+  `  ⚠ ${key}: the record says "${fieldValue}" but they said "${saidValue}" ("${theirWords}"). The record wins for booking purposes. Do NOT re-litigate this with them and do NOT ask the question again — if it matters this turn, confirm gently against what THEY said, never against the record.`,
+];
+
+// The binding rule. This is the line that had to exist: the model was not
+// re-asking out of confusion, it was re-asking because nothing had ever told
+// it that a question can be finished.
+export const closedQuestions = (list) => [
+  `\nCLOSED QUESTIONS — DO NOT ASK ANY OF THESE AGAIN: ${list.join(', ')}`,
+  `These questions are ANSWERED. Asking any of them again is a defect, not a clarification. If you need to reference one, reference their answer — never re-ask it.`,
+];
+
+// What we have already put on the table. A second offer of the same thing
+// reads as not having heard the answer to the first.
+export const offersAlreadyMade = (list) => [
+  `\nALREADY OFFERED (do not re-offer as though it were new): ${list.join('; ')}`,
+];
+
+// 2026-09-11. A second apology for the same mistake reads as a script, not as
+// contrition — and a thread that opens with an apology every turn teaches the
+// customer that the apology means nothing.
+export const apologiesAlreadyMade = (list) => [
+  `\nALREADY APOLOGIZED FOR: ${list.join('; ')}`,
+  `Do not apologize for any of these a second time. It reads as a script, not as contrition. Acknowledge once, then move to what you are doing about it.`,
 ];
