@@ -13,8 +13,14 @@
  *                      ≥ MEMORY_CONFLICT_THRESHOLD supersession rule.
  *   memory_precheck    "have we already decided this / did Mark reject it?"
  *                      — top active decisions, closed matches, open conflicts.
+ *   memory_rule        apply ONE Command Center ruling (sql/102): approve,
+ *                      reject, pick an option, rule a conflict, snooze, set a
+ *                      rollout stage, or flip a ruling back. The dashboard and
+ *                      chat both come through here, so every ruling — wherever
+ *                      it was made — lands in claude_rulings_log in the same
+ *                      shape, in one transaction.
  *
- * All four touch only the claude_* memory tables and memory_vector_queries.
+ * All five touch only the claude_* memory tables and memory_vector_queries.
  * Nothing in the customer request path calls them.
  */
 import { z } from 'zod';
@@ -22,6 +28,7 @@ import supabase from '../supabase.js';
 import { SOURCES } from '../memory/memory-text.js';
 import { planCheckpoint, applyCheckpoint, CheckpointError } from '../memory/memory-checkpoint.js';
 import { withRetry, isTransientError, CHECKPOINT_RETRY } from '../memory/with-retry.js';
+import { planRule, applyRule, RULE_ACTIONS } from '../memory/memory-rule.js';
 
 const text = (obj) => ({ content: [{ type: 'text', text: JSON.stringify(obj, null, 2) }] });
 const KINDS = Object.keys(SOURCES);
@@ -173,5 +180,40 @@ export function registerMemoryTools(server) {
     },
   );
 
-  console.log(`[Memory] MCP tools registered: memory_context, memory_search, memory_checkpoint, memory_precheck (kinds: ${KINDS.join(', ')}; guard=${process.env.MEMORY_GUARD_MODE || 'shadow'})`);
+  server.tool(
+    'memory_rule',
+    'Apply one Command Center ruling (the same door for the dashboard and for chat): approve / edit_approve / reject / pick_option / own_answer / yes / no on a pending item; keep_left / keep_right / not_a_conflict / new_answer on a conflict; snooze; not_relevant; stage (built | verified | no_build) on a decision; flip (reverses_id) to undo a ruling; recheck to refresh the recommendation. Writes decisions, closes the card, logs to claude_rulings_log in one transaction. Reason required on reject, flip and any ruling that differs from the recommendation. Dry run unless confirm is true.',
+    {
+      action: z.enum(RULE_ACTIONS),
+      target: z.object({
+        table: z.enum(['claude_pending_items', 'claude_memory_conflicts', 'claude_decision_log']),
+        id: z.number().int(),
+      }).optional().describe('the card being ruled. Omit only on a flip — it finds its own card from reverses_id'),
+      card_version: z.string().optional().describe('from v_command_center_queue — rejects the ruling if the card changed since it was loaded'),
+      text: z.string().optional().describe('the decision in your words. Defaults to the card text with its Omi provenance stripped, else the recommended wording'),
+      option_key: z.string().optional().describe('pick_option: the index or text of the option chosen'),
+      category: z.string().optional().describe('one of architecture, routing, messaging, appointments, sync, integration, data, agentic, infrastructure, reporting, compliance, operations'),
+      reason: z.string().optional().describe('required on reject, no, flip, and on any ruling that differs from the recommendation'),
+      snooze_until: z.string().optional().describe('YYYY-MM-DD, must be in the future'),
+      stage: z.enum(['built', 'verified', 'no_build']).optional(),
+      proof: z.string().optional().describe('stage verified: what shows it is actually working'),
+      build: z.object({ description: z.string() }).optional().describe('files a build_needed item against the new decision'),
+      supersedes_id: z.number().int().optional().describe('the active decision this ruling replaces — answers a guard_conflict'),
+      same_as_id: z.number().int().optional().describe('the active decision this ruling merely re-confirms — nothing new is written'),
+      reverses_id: z.number().int().optional().describe('flip: the claude_rulings_log id to undo. A two-sided ruling also applies the opposite side'),
+      ruled_by: z.string().optional().describe('email; defaults to "mark (chat)"'),
+      via: z.enum(['dashboard', 'chat']).optional(),
+      confirm: z.boolean().optional().describe('true to write; otherwise returns the plan'),
+    },
+    async (args = {}) => {
+      try {
+        if (args.confirm !== true) return text(await planRule(args));
+        return text(await applyRule(args));
+      } catch (err) {
+        return text({ ok: false, code: 'error', error: err.message });
+      }
+    },
+  );
+
+  console.log(`[Memory] MCP tools registered: memory_context, memory_search, memory_checkpoint, memory_precheck, memory_rule (kinds: ${KINDS.join(', ')}; guard=${process.env.MEMORY_GUARD_MODE || 'shadow'})`);
 }

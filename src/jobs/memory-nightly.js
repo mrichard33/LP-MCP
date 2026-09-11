@@ -40,6 +40,14 @@
  *                      confirmed (sql/101), what auto-close did this week, open
  *                      conflicts awaiting a ruling, sessions unlinked after
  *                      7 days, and this week's validation failures.
+ *  10. recommend     — memory-recommend.js (sql/102): a verdict, reason,
+ *                      evidence, confidence and risk written onto each open
+ *                      Rulings-lane card, so the Command Center is a
+ *                      ten-second job per item instead of a ten-minute one.
+ *                      Gated by MEMORY_RECOMMEND_MODE (off | shadow | live,
+ *                      default off). Last on purpose: the only step that spends
+ *                      LLM tokens, and the only one whose absence costs
+ *                      nothing — a card with no recommendation is still rulable.
  *
  * Every SQL step runs through withRetry (issue #1627): three attempts with
  * 250 ms / 1 s / 3 s backoff on transient errors. A step that still fails is
@@ -68,6 +76,7 @@ import { withRetry } from '../memory/with-retry.js';
 import { runAutoclose, PROTECTED_LIST_SQL, logSql } from './memory-autoclose.js';
 import { runMemoryValidation, runDraftCheckpoints } from './memory-validate.js';
 import { runConflictScan } from './memory-conflicts.js';
+import { recommendBatch, getMode as getRecommendMode } from './memory-recommend.js';
 
 const TIMEZONE = 'America/New_York';
 const STALE_DAYS = 60;
@@ -324,7 +333,7 @@ export async function runMemoryNightly({ dry_run = false, deps = {} } = {}) {
   const now = deps.now || new Date();
   const env = deps.env || process.env;
   const mode = env.MEMORY_AUTOCLOSE_MODE || 'off';
-  const result = { started_at: now.toISOString(), dry_run, autoclose_mode: mode, stale_flagged: null, autoclose: null, embed: {}, validation: null, conflicts: null, drafts: null, workflow_ref: null, counts: null, digest: null, errors: [] };
+  const result = { started_at: now.toISOString(), dry_run, autoclose_mode: mode, stale_flagged: null, autoclose: null, embed: {}, validation: null, conflicts: null, drafts: null, workflow_ref: null, counts: null, digest: null, recommend: null, errors: [] };
   const rawSql = deps.runSQL || runSQL;
   const sql = (text) => withRetry(() => rawSql(text), {
     ...SQL_RETRY, sleep: deps.sleep,
@@ -391,13 +400,29 @@ export async function runMemoryNightly({ dry_run = false, deps = {} } = {}) {
     result.digest = await runWeeklyDigest({ dry_run, mode, now, deps: { runSQL: sql, postGroupMe: post, env } });
   } catch (err) { result.errors.push(`digest: ${err.message}`); }
 
+  // 10. Command Center recommendations (sql/102). Last on purpose: it is the
+  //     only step that costs LLM tokens, and it is the one step whose absence
+  //     costs nothing — a card with no recommendation is still rulable. Off
+  //     unless MEMORY_RECOMMEND_MODE says otherwise, and isolated like every
+  //     other step so it can never fail the nightly.
+  try {
+    const recMode = deps.recommendMode || getRecommendMode(env);
+    if (recMode === 'off') {
+      result.recommend = { mode: 'off', skipped: true };
+    } else {
+      const r = await (deps.recommend || recommendBatch)({ mode: recMode, dry_run, deps: { db, env } });
+      result.recommend = { mode: r.mode, candidates: r.candidates, attempted: r.attempted, written: r.written, skipped: r.skipped };
+      for (const e of r.errors) result.errors.push(`recommend ${e}`);
+    }
+  } catch (err) { result.errors.push(`recommend: ${err.message}`); }
+
   result.elapsed_ms = Date.now() - startedAt;
   result.ok = result.errors.length === 0;
   lastRun = result;
   const acSummary = result.autoclose && result.autoclose.mode !== 'off'
     ? `${result.autoclose.mode}:${Object.entries(result.autoclose.rules).map(([t, r]) => `${t.split(':')[0]}=${r.affected}`).join(',')}`
     : 'off';
-  console.log(`[MemoryNightly] ${dry_run ? 'DRY-RUN ' : ''}done stale=${result.stale_flagged} autoclose=${acSummary} embed=${JSON.stringify(Object.fromEntries(Object.entries(result.embed).map(([k, v]) => [k, v.written])))} validation_flagged=${result.validation?.flagged_total ?? 'n/a'} conflicts_filed=${result.conflicts?.filed ?? 'n/a'} drafts=${result.drafts?.drafted ?? 'n/a'} ref=${result.workflow_ref} digest=${result.digest?.sent ? 'sent' : (result.digest?.due ? 'due' : 'no')} errors=${result.errors.length} elapsed=${result.elapsed_ms}ms`);
+  console.log(`[MemoryNightly] ${dry_run ? 'DRY-RUN ' : ''}done stale=${result.stale_flagged} autoclose=${acSummary} embed=${JSON.stringify(Object.fromEntries(Object.entries(result.embed).map(([k, v]) => [k, v.written])))} validation_flagged=${result.validation?.flagged_total ?? 'n/a'} conflicts_filed=${result.conflicts?.filed ?? 'n/a'} drafts=${result.drafts?.drafted ?? 'n/a'} ref=${result.workflow_ref} digest=${result.digest?.sent ? 'sent' : (result.digest?.due ? 'due' : 'no')} recommend=${result.recommend?.skipped ? 'off' : `${result.recommend?.mode}:${result.recommend?.attempted ?? 0}`} errors=${result.errors.length} elapsed=${result.elapsed_ms}ms`);
   if (!result.ok && !dry_run) await alertGroupMe(result.errors.join(' | '), post);
   return result;
 }

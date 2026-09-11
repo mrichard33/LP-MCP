@@ -2,7 +2,7 @@
  * Memory schema presence check — src/memory/memory-migrations.js
  *
  * The "mirror in runMigrations()" promised for priority #8 (decision #1673),
- * done as a guarded self-heal: at boot, check that the objects sql/090–101
+ * done as a guarded self-heal: at boot, check that the objects sql/090–102
  * create are present; log one WARN line per missing object. Apply the files
  * ONLY when MEMORY_MIGRATIONS_AUTOAPPLY=true — production already has all of
  * them, and the .sql files stay the single definition (never copied into
@@ -33,6 +33,11 @@ export const MEMORY_MIGRATIONS = [
   // every Omi ingest would fail inside the transaction with a check_violation.
   { file: '101_omi_memory_source.sql',              check: "SELECT 1 FROM pg_proc WHERE proname = 'claude_omi_ingest'" },
   { file: '101_omi_memory_source.sql',              check: "SELECT 1 FROM pg_constraint WHERE conname = 'claude_session_logs_surface_check' AND pg_get_constraintdef(oid) LIKE '%omi%'" },
+  // sql/102 needs the same two-part check for the same reason: with the writer
+  // present but the surface CHECK still on the old list, the first ruling of the
+  // day would fail inside the transaction trying to insert its dashboard session.
+  { file: '102_command_center.sql',                 check: "SELECT 1 FROM pg_proc WHERE proname = 'claude_rule_apply'" },
+  { file: '102_command_center.sql',                 check: "SELECT 1 FROM pg_constraint WHERE conname = 'claude_session_logs_surface_check' AND pg_get_constraintdef(oid) LIKE '%dashboard%'" },
 ];
 
 export async function checkMemorySchema({ sql = runSQL, autoApply = String(process.env.MEMORY_MIGRATIONS_AUTOAPPLY || 'false') === 'true' } = {}) {
@@ -46,7 +51,7 @@ export async function checkMemorySchema({ sql = runSQL, autoApply = String(proce
       missing.push(m);
     }
   }
-  if (!missing.length) { console.log('[MemorySchema] sql/090–101 present'); return { ok: true, missing: [], applied: [] }; }
+  if (!missing.length) { console.log('[MemorySchema] sql/090–102 present'); return { ok: true, missing: [], applied: [] }; }
   // A file can appear more than once above (sql/101 is checked in two parts);
   // report and apply it once.
   const missingFiles = [...new Set(missing.map((m) => m.file))];

@@ -108,6 +108,12 @@ const FUNCTION_GROUPS = {
   // decision-engine group (already pointed at a model on Railway via
   // DECISION_ENGINE_MODEL_ANTHROPIC) rather than customer_facing.
   backstop_insight: 'decision_engine',   // src/services/backstop-insight.js
+  // Command Center recommendations — one JSON verdict per open ruling card.
+  // Analysis, never customer text, so it rides the decision-engine group.
+  // MEMORY_RECOMMEND_MODEL is the legacy-style per-fn var and is read as the
+  // ANTHROPIC model; point it at OpenAI with MEMORY_RECOMMEND_PROVIDER +
+  // MEMORY_RECOMMEND_MODEL_OPENAI. See src/jobs/memory-recommend.js.
+  memory_recommend: 'decision_engine',   // src/jobs/memory-recommend.js
   // customer-facing — text a human reads
   response_generator: 'customer_facing', // src/response-generator.js
   nurture_generator: 'customer_facing',  // src/nurture/nurture-generator.js
