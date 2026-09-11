@@ -16,6 +16,31 @@
  * material is reproduced.
  *
  * HARD GATE: NEPQ discovery is OFF for booked contacts. See stageBlock().
+ *
+ * v1.2 (2026-09-11, Alfredo Fontan — GHL VKMKhd8JQ4wsp3zMn8Lt)
+ * ────────────────────────────────────────────────────────────
+ * The layer was tactically blind in two ways at once, and outbound
+ * yFkfGW3AOmm9M8Myk7W8 is both of them in one message:
+ *
+ *   "Fair point, Alfredo — close is close. To get the visit scheduled
+ *    correctly, will it just be you home, or is there someone else who'd
+ *    want to be there?"
+ *
+ *   1. SUGGESTED QUESTIONS HE HAD ALREADY ANSWERED. He was stage 3, so the
+ *      layer offered the stage-3 discovery play — including "Have you had
+ *      anyone out to look at them before? How did that go?" — to a man who
+ *      had just told us he had sat through several presentations and nearly
+ *      signed with someone else. Stage blocks now SUBTRACT: any example
+ *      question whose underlying fact is closed is removed before render.
+ *
+ *   2. NO OBJECTION PLAY EXISTED. He pushed back on price and the layer had
+ *      nothing to say about it, so the model fell back on the thing models
+ *      fall back on — conceding the objection and changing the subject.
+ *      objectionBlock() is new and it is the piece that did not exist.
+ *
+ * Also: the layer read buyer_stage only. Trust is now read alongside it,
+ * because a discovery play at low trust is the wrong instrument regardless of
+ * which stage the buyer is in.
  */
 
 /**
@@ -33,7 +58,9 @@ TONE (binding):
 - Use their words, not ours. If they said "drafty," write "drafty," not
   "thermal inefficiency."
 - Silence is allowed. If the right move is a one-line acknowledgment with no
-  question, send that.`;
+  question, send that.
+- Never ask a question listed as closed in ESTABLISHED. If you are about to
+  ask something, check that list first.`;
 
 const CLARIFY_AND_PROBE = `
 WHEN THEY ARE VAGUE (do this instead of moving on):
@@ -60,11 +87,45 @@ CONSEQUENCE QUESTIONS — STRICT CAPS:
 - If they answer flatly or brush it off, drop it and move to the visit offer.
   Do not press. Pressing is the old model.`;
 
-/** Stage-specific play. This is where the commitment gate lives. */
-function stageBlock(ctx) {
+/**
+ * Render a stage's example questions, MINUS any whose underlying fact this
+ * conversation has already closed.
+ *
+ * Each example is tagged with the established-facts key it would be asking
+ * for. An untagged example (`key: null`) is a question about how they FEEL or
+ * what they WANT, which no CRM field can close and which is never subtracted.
+ *
+ * @param {{key: string|null, text: string}[]} examples
+ * @param {string[]} closed  established.closed_questions
+ * @returns {{lines: string, empty: boolean}}
+ */
+function renderExamples(examples, closed) {
+  const kept = examples.filter(e => !e.key || !closed.includes(e.key));
+  if (!kept.length) return { lines: '', empty: true };
+  return { lines: kept.map(e => `- "${e.text}"`).join('\n'), empty: false };
+}
+
+// What to say when subtraction has emptied a stage of its questions. Discovery
+// for this stage is genuinely finished, and the failure mode at that point is
+// inventing a new question to fill the turn.
+const DISCOVERY_COMPLETE = `
+DISCOVERY FOR THIS STAGE IS COMPLETE. They have already answered everything
+this stage asks. Do NOT invent a new question to fill the turn — asking
+something else merely to be asking is the same defect as re-asking.
+The move is the TRANSITION: reflect what they already told you, in their own
+words, and offer the next step. One offer, one question mark.`;
+
+/**
+ * Stage-specific play. This is where the commitment gate lives.
+ * @param {object} ctx          buildLeadContext() output
+ * @param {object} established  buildEstablishedFacts() output
+ */
+function stageBlock(ctx, established) {
   const booked = ctx?.lp?.appointment_set === true;
   const phase = ctx?.lp?.appointment_phase || null;
   const stage = Number(ctx?.intelligence?.buyer_stage) || null;
+  const closed = established?.closed_questions || [];
+  const trust = Number(ctx?.lead?.trust_level_score) || null;
 
   // ── COMMITMENT GATE ───────────────────────────────────────────────────
   // A booked homeowner is a customer, not a prospect. Discovery here reads
@@ -90,52 +151,107 @@ are getting someone on the phone, and do it. Do not speculate about where the
 rep is. Do not invent a reason for a delay. One sentence, then the offer.` : ''}`;
   }
 
+  // ── TRUST FLOOR (2026-09-11) ──────────────────────────────────────────
+  // Read BEFORE the stage play. Trust and buyer stage are different axes, and
+  // the layer previously read only the second: a homeowner can be stage 3 or 4
+  // on the product and still not trust the company enough to answer a
+  // discovery question honestly. At trust 1-2 a discovery play reads as an
+  // interrogation and a booking push reads as a close.
+  //
+  // Scored 1-5 by src/context-builder.js; null means unknown and is NOT
+  // treated as low.
+  if (trust !== null && trust <= 2) {
+    return `
+STAGE: REPAIR — trust is ${trust}/5. This outranks the buyer stage.
+
+Something in this relationship is not working, and no amount of discovery
+fixes that. Do NOT run a discovery sequence. Do NOT push for the booking.
+Do NOT restate credentials at them — a company defending itself reads as a
+company with something to defend.
+
+Your job this turn, in order:
+1. Say the one true thing that acknowledges where they actually are. Once.
+2. Ask ONE question about THEIR position — what they want to happen, or what
+   would need to be different. Not about their windows.
+3. If they have raised the same concern twice, stop asking and offer a person.
+
+Give before you ask. If the honest move is an answer with no question
+attached, send that and stop.`;
+  }
+
   // ── ENGAGEMENT ────────────────────────────────────────────────────────
   if (stage === null || stage <= 1) {
+    const ex = renderExamples([
+      { key: null, text: 'What got you looking at the windows now, out of curiosity?' },
+      { key: null, text: "What's going on with them that made you reach out?" },
+    ], closed);
     return `
 STAGE: CONNECTION — they are not yet convinced this is a real problem.
 
 Take the focus off us and put it on them. No pitch, no company history, no
-credentials. One open question about what prompted them to look.
+credentials. One open question about what prompted them to look.${ex.empty ? DISCOVERY_COMPLETE : `
 Reece examples (adapt, do not recite):
-- "What got you looking at the windows now, out of curiosity?"
-- "What's going on with them that made you reach out?"
+${ex.lines}`}
 Do NOT ask about budget, timing, or decision-makers yet. They don't know
 their own answer to those questions this early.`;
   }
 
   if (stage === 2) {
+    const ex = renderExamples([
+      { key: null, text: 'How long have they been doing that?' },
+      { key: null, text: "What's that been like through the summer?" },
+      { key: null, text: 'Which room is the worst one?' },
+      { key: 'window_count', text: 'How many openings are we talking about?' },
+    ], closed);
     return `
 STAGE: SITUATION → PROBLEM AWARENESS.
 
 Situation first — establish what they actually have. Age of the windows, what
 they're made of, whether anything is already impact-rated. One at a time.
 Then open the emotional door. The goal is for THEM to say what it costs them,
-not for us to tell them.
+not for us to tell them.${ex.empty ? DISCOVERY_COMPLETE : `
 Reece examples (adapt, do not recite):
-- "How long have they been doing that?"
-- "What's that been like through the summer?"
-- "Which room is the worst one?"
+${ex.lines}`}
 Never answer the problem for them. Ask, then stop.`;
   }
 
   if (stage === 3) {
+    // The PAST half is tagged prior_quotes. On 2026-09-11 this is the half
+    // that fired at a lead who had already told us he had sat through several
+    // presentations and almost signed with someone else.
+    const past = renderExamples([
+      { key: 'prior_quotes', text: 'Have you had anyone out to look at them before?' },
+      { key: 'prior_quotes', text: 'How did that go?' },
+    ], closed);
+    const future = renderExamples([
+      { key: null, text: 'If they were sorted, what would that change day to day?' },
+      // Hand-wrapped, as the rest of this file's copy is — the prompt is read
+      // by people in Bot Review as often as it is read by the model.
+      { key: null, text: 'Besides the noise and the cooling bill, what else would need to be right\n  for you to feel good about it?' },
+    ], closed);
+
+    if (past.empty && future.empty) return `\nSTAGE: SOLUTION AWARENESS.${DISCOVERY_COMPLETE}`;
+
     return `
 STAGE: SOLUTION AWARENESS.
-
-Two halves, in order.
+${past.empty || future.empty ? '' : '\nTwo halves, in order.'}${past.empty ? `
+PAST: ALREADY COVERED. They have told you what they have already tried and how
+it went — it is in ESTABLISHED above. Reference it; do not ask it again.` : `
 PAST: what have they already tried, and how did it work out? This surfaces
 how long they've lived with it without them feeling accused.
-- "Have you had anyone out to look at them before?"
-- "How did that go?"
+${past.lines}`}
+${future.empty ? '' : `
 FUTURE: what does handled actually look like to them?
-- "If they were sorted, what would that change day to day?"
-- "Besides the noise and the cooling bill, what else would need to be right
-  for you to feel good about it?"
+${future.lines}`}
 Positioning against other companies may begin here — never before.`;
   }
 
   // Stage 4 — negotiating, not yet committed.
+  const qualifying = renderExamples([
+    { key: 'timeline', text: 'How important is it to get this handled this year?' },
+    { key: 'decision_makers', text: 'Would anyone else be looking at this with you, or is it your call?' },
+  ], closed);
+
   return `
 STAGE: CONSEQUENCE → QUALIFYING → TRANSITION.
 
@@ -145,11 +261,11 @@ Do NOT re-educate. Do NOT restate benefits they already accepted.
 Consequence (once, capped — see the caps above), only if they have named a
 problem themselves:
 - "What happens if you leave them another season?"
-
+${qualifying.empty ? `
+QUALIFYING IS DONE. Everything this stage would ask is already answered — see
+ESTABLISHED above. Go straight to the transition.` : `
 Qualifying — confirm it matters, and who is in the room:
-- "How important is it to get this handled this year?"
-- "Would anyone else be looking at this with you, or is it your call?"
-
+${qualifying.lines}`}
 Transition — reflect their own words, then offer the visit:
 "Based on what you said about [their words] — the next step is having our
 specialist measure and leave you exact pricing. Would that help?"
@@ -157,15 +273,120 @@ Confident and direct. Not pushy. One offer, one question mark.`;
 }
 
 /**
- * Build the NEPQ prompt block for a given lead context.
- * @param {object} ctx  the object returned by buildLeadContext()
- * @returns {string}    prompt text, or '' when the layer is disabled
+ * The play when they push back. New in v1.2 — nothing in this layer previously
+ * said anything about an objection, which is why on 2026-09-11 the model fell
+ * back on the default move: agree with the objection, then change the subject.
+ *
+ * Rendered whenever an objection state is open.
+ *
+ * @param {object} ctx          buildLeadContext() output
+ * @param {object} established  buildEstablishedFacts() output
+ * @returns {string}            '' when no objection is open
  */
-export function buildNepqBlock(ctx) {
+export function objectionBlock(ctx, established) {
+  const code = ctx?.objection_state?.state_code || null;
+  if (!code) return '';
+
+  // Same family raised twice. The rules layer detects this across days
+  // (OBJ_FAMILY_REPEAT_BUDGET / _SPOUSE / _TRUST / _TIMING, agent_rules
+  // 319-322); this detects it inside the thread we are answering right now.
+  const raised = established?.objections_raised || [];
+  const counts = new Map();
+  for (const o of raised) counts.set(o.type, (counts.get(o.type) || 0) + 1);
+  const repeated = [...counts.entries()].filter(([, n]) => n >= 2).map(([t]) => t);
+
+  if (repeated.length) {
+    return `
+OBJECTION — RAISED TWICE (${repeated.join(', ')}). STOP ASKING.
+
+They have brought this up more than once. That means our previous answer did
+not land, and asking another question now tells them we still are not
+listening.
+
+Say plainly that we have not answered it well yet. Do not re-explain, do not
+re-frame, do not ask a discovery question. Offer to get a person on the phone
+who can answer it properly, and stop. One or two sentences.
+
+Do not apologize a second time for anything listed as already apologized for
+in ESTABLISHED.`;
+  }
+
+  return `
+OBJECTION IS OPEN (state: ${code}). THE PLAY IS TO ASK BACK.
+
+Never concede. Never explain. Never rebut. When they push back, the move is a
+question that hands the thinking back to them.
+
+BANNED — this is the exact failure this block exists to stop. Do NOT open with
+any of these and then change the subject:
+  "Fair point"  ·  "You're right"  ·  "I understand that"  ·
+  "That makes sense"  ·  "Absolutely"  ·  "Totally fair"  ·  "I hear you"
+Agreeing with the objection and pivoting to a qualifying question is not
+empathy. It concedes the argument and then asks them for a favour in the same
+breath, and it reads as a script. It is a defect.
+
+THE SHAPE: reflect their own words back as a question that makes them price
+their own position.
+
+  They said:  "close is close"
+  You reply:  "Close — how close does it need to be before you'd sign off
+               on it?"
+
+Notice what that does: it uses THEIR word, adds nothing, defends nothing, and
+puts the number back on their side of the table.
+
+More shapes (adapt, never recite):
+  "Too expensive" → "Compared to what you had in mind — where does it need to
+                     land?"
+  "Need to think" → "Fair enough — what's the part you're still turning over?"
+  "Not right now" → "What would need to change for it to be the right time?"
+
+HARD LIMITS on this block — the caps above still bind:
+- ONE question. One question mark.
+- Never invent a deadline, a countdown, or a limited-time anything.
+- Never promise or imply a price reduction, a discount, or that prices rise.
+- Never name an insurance carrier or predict a claim outcome.
+- Never quote a figure that is not in the CUSTOMER'S ACTUAL ESTIMATE block.
+- If they answer flatly or refuse to engage, drop it and offer a person.`;
+}
+
+/**
+ * The facts, restated inside the questioning discipline. The ESTABLISHED block
+ * in the user prompt says what is known; this says what that means for the
+ * question you are about to ask.
+ */
+export function establishedBlock(established) {
+  const closed = established?.closed_questions || [];
+  if (!closed.length) return '';
+  return `
+ALREADY ANSWERED — these are closed: ${closed.join(', ')}.
+Asking any of them again is a defect, not a clarification. The full wording of
+what they said is in the ESTABLISHED block above. Use their answer; never
+re-ask for it.`;
+}
+
+/**
+ * Build the NEPQ prompt block for a given lead context.
+ * @param {object} ctx           the object returned by buildLeadContext()
+ * @param {object} [established] the object returned by buildEstablishedFacts()
+ * @returns {string}             prompt text, or '' when the layer is disabled
+ */
+export function buildNepqBlock(ctx, established = null) {
   if (process.env.NEPQ_LAYER_MODE === 'off') return '';
+
+  // ── THE COMMITMENT GATE STILL WINS (Myron Thorner, 2026-08-28) ────────
+  // A booked homeowner is a customer, not a prospect. stageBlock() already
+  // turns discovery off for them; the two v1.2 blocks are suppressed here for
+  // the same reason. An ask-back play would tell a booked customer to push
+  // back on their own appointment, and a closed-questions list is noise to
+  // someone who has already said yes. Logistics and a human, nothing else.
+  const booked = ctx?.lp?.appointment_set === true;
+
   return [
     '=== CONVERSATION DISCIPLINE (NEPQ) ===',
-    stageBlock(ctx),
+    stageBlock(ctx, established),
+    booked ? '' : establishedBlock(established),
+    booked ? '' : objectionBlock(ctx, established),
     TONALITY,
     CLARIFY_AND_PROBE,
     CONSEQUENCE_GUARDRAILS,
@@ -185,7 +406,10 @@ is a promise we cannot keep.
 
 Example shape: "You're set for [day] at [time]. Someone from our team will
 call before then to go over the details and finalize the visit."`,
-  ].join('\n');
+    // Empty sections (a suppressed v1.2 block, a stage with nothing to add)
+    // are dropped rather than joined as blank lines — the snapshot guard reads
+    // this text byte for byte.
+  ].filter(Boolean).join('\n');
 }
 
-export const NEPQ_LAYER_VERSION = '1.1';
+export const NEPQ_LAYER_VERSION = '1.2';
