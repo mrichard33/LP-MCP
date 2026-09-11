@@ -94,11 +94,12 @@ Entry: Facebook Lead Form | Lead Score: 42 | Date Added: 2026-08-30T13:00:00Z
 ═══════ KNOWN CONTACT PROFILE (CRM record + this conversation) ═══════
 Name: Dana Whitfield
 Phone: 9545551212
-Email: NOT KNOWN
+Email (the CUSTOMER'S OWN address. Never tell them to send anything to it): NOT KNOWN
 Property address: 812 Palm Reach Dr, Coral Springs FL 33071
 Decision-maker presence: CONFIRMED (all decision-makers attending)
 NON-NEGOTIABLE RULE: Never ask the customer for information already present in this profile — it is on file. Only a field marked NOT KNOWN may ever be asked for, one at a time, and only when the booking-gate rules below call for it.
 ═══════ END KNOWN CONTACT PROFILE ═══════
+COMPANY INBOX: team@getreecewindows.com. This is the ONLY email address a customer may send us files, photos, measurements, or documents. When a customer asks where to email something, give this address. NEVER tell a customer to send anything to their own email address, and never invent any other address.
 Inferred Buyer Stage: 2/5
 GUIDE OFFER STATUS: ELIGIBLE — offer ONLY per the GUIDE OFFER — BOOKING FAILURE EXIT rules.
 
