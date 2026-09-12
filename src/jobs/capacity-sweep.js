@@ -42,13 +42,35 @@
 //     3 fast-pass cycles of slack — so three LP timeouts in a row painted DATA
 //     STALE over correct numbers. Unset, the constant reproduces the old
 //     formula exactly.
-//   - The slot sweep's ONE GetSalesSchedule call is timeout-bounded
-//     (CAPACITY_SLOTS_TIMEOUT_MS) and retried (CAPACITY_SLOTS_RETRIES). It is
-//     the sole thing advancing swept_at, and LP 500s ("Execution Timeout
+//   - The slot sweep's GetSalesSchedule calls are timeout-bounded
+//     (CAPACITY_SLOTS_TIMEOUT_MS) and retried (CAPACITY_SLOTS_RETRIES). They
+//     are the sole thing advancing swept_at, and LP 500s ("Execution Timeout
 //     Expired") under our own lead-pass load are routine, not exceptional.
 //     runFastCapacityPass also carries a watchdog (CAPACITY_FAST_WATCHDOG_MS):
 //     a never-settling promise used to wedge fastInProgress permanently and
 //     the board stayed stale until redeploy.
+//
+// FRESHNESS (fix-pass 2026-09-12 — an 80-minute DATA STALE banner over correct
+// numbers, while LP was so slow that even GetLostReasons took >12s):
+//   - The denominator sweep is CHUNKED (CAPACITY_SLOTS_CHUNK_DAYS), near window
+//     first, under a wall-clock budget (CAPACITY_SLOTS_BUDGET_MS). One 14-day
+//     call was all-or-nothing: a slow tail lost the dates the board is actually
+//     FOR. Only a near-window failure now fails the pass.
+//   - swept_at is stamped PER SUCCEEDING CHUNK, and sweepCapacitySlots also
+//     records lastSlotsSuccessAt explicitly — a sweep over a legitimately empty
+//     schedule writes no rows, so max(swept_at) alone reads as "never swept".
+//   - The stale-row delete is scoped to the chunk that succeeded and is SKIPPED
+//     when the response holds less than CAPACITY_SLOTS_DELETE_MIN_RATIO of the
+//     rows already on file. An HTTP 200 carrying [] used to delete the entire
+//     window's denominator and call it a schedule change.
+//   - Failures now page someone: capacity.sweep_failing / capacity.sweep_recovered
+//     in system_events plus one GroupMe ops ping per incident
+//     (CAPACITY_SLOTS_ALERT_STREAK, silenced by FRESHNESS_GROUPME_ALERTS_DISABLED).
+//     Before this, the ONLY signal was the red banner on someone's phone.
+//   - /board/capacity reports freshness SPLIT: capacity_swept_at (this date's
+//     denominator) vs appointments_updated_at (the numerator, which the lead
+//     pass keeps current regardless), plus sweep_state ok|failing|broken. The
+//     dashboard uses it to name which half is behind.
 //   - The lead loop pauses PROPORTIONALLY to the cycle it just finished
 //     (CAPACITY_LEAD_DUTY_RATIO, floored at CAPACITY_LEAD_LOOP_PAUSE_MS,
 //     capped at CAPACITY_LEAD_MAX_PAUSE_MS) and yields to an in-flight fast
@@ -64,12 +86,13 @@
 //        fast_pass_running_ms, lead_duty_ratio).
 //   POST /admin/capacity-sweep/run        — manual sweep trigger (async).
 //   POST /admin/capacity-snapshot/run     — manual snapshot trigger (async).
+//   POST /admin/lp-circuit/reset          — force-close the LP circuit breaker.
 // SCHEDULER (startCapacitySweepScheduler): fast pass every
 // CAPACITY_SWEEP_INTERVAL_MS + continuous lead loop + 23:50 ET snapshot.
 
 import supabase from '../supabase.js';
 import { runSQL } from '../admin/supabase-admin.js';
-import { getSalesSchedule, getLeads, getLeadByLdsId } from '../lp-client.js';
+import { getSalesSchedule, getLeads, getLeadByLdsId, getCircuitStatus, resetCircuit } from '../lp-client.js';
 import { getField, extractArray, sleep, RATE_LIMIT_SLEEP_MS } from '../sync-utils.js';
 import { lpDateToEastern } from '../lp-dates.js';
 import { processProspect } from '../sync-leads.js';
@@ -98,6 +121,34 @@ const STALE_AFTER_MS = parseInt(process.env.CAPACITY_STALE_AFTER_MS || '', 10)
 // lead-pass load ("Execution Timeout Expired") are routine, not exceptional.
 const SLOTS_TIMEOUT_MS = parseInt(process.env.CAPACITY_SLOTS_TIMEOUT_MS || '60000', 10);
 const SLOTS_RETRIES    = parseInt(process.env.CAPACITY_SLOTS_RETRIES || '3', 10);
+
+// The denominator sweep is CHUNKED, near window first. One 14-day call was
+// all-or-nothing: when LP went slow (2026-09-12 — GetSalesSchedule timing out
+// at 60s while even a trivial GetLostReasons took >12s) the whole window was
+// lost and swept_at could not advance at all, so the board painted DATA STALE
+// for 80+ minutes over numbers that were still correct. Chunking gives partial
+// credit: the dates the board is actually FOR refresh even when the long tail
+// times out.
+const SLOTS_CHUNK_DAYS = Math.max(1, parseInt(process.env.CAPACITY_SLOTS_CHUNK_DAYS || '4', 10));
+// Total wall-clock budget for the chunked sweep. A pass must never outlive its
+// own interval, or ticks queue up behind a doomed one. Near-window chunks are
+// exempt — they are the whole point of the pass.
+const SLOTS_BUDGET_MS = parseInt(process.env.CAPACITY_SLOTS_BUDGET_MS || '', 10)
+  || Math.max(60_000, Math.floor(SWEEP_INTERVAL_MS * 0.6));
+// A successful-but-short LP response used to be indistinguishable from a real
+// schedule change, and the stale-row delete would happily wipe the difference.
+// An HTTP 200 carrying [] deleted the entire window's denominator. Below this
+// ratio of the rows we previously held for the same dates, treat the response
+// as untrustworthy: keep the upsert, skip the delete, shout.
+const SLOTS_DELETE_MIN_RATIO = parseFloat(process.env.CAPACITY_SLOTS_DELETE_MIN_RATIO || '0.5');
+
+// Consecutive failed slot sweeps before we page someone. Until 2026-09-12 the
+// ONLY signal that board freshness had stopped advancing was the red banner on
+// whoever happened to open the board on their phone — nothing in system_events,
+// no ops ping, HTTP 200 throughout.
+const SLOTS_ALERT_STREAK = Math.max(1, parseInt(process.env.CAPACITY_SLOTS_ALERT_STREAK || '2', 10));
+// Shares the freshness-monitor kill switch: one place to silence ops pings.
+const GROUPME_ALERTS_DISABLED = String(process.env.FRESHNESS_GROUPME_ALERTS_DISABLED || 'false').toLowerCase() === 'true';
 
 // Force-release the fast-pass lock if a pass exceeds this. Belt-and-braces for
 // a promise that never settles (the per-call timeout is the primary guard).
@@ -248,11 +299,51 @@ function numeratorSQL(datePredicate) {
 
 // ─── a. Denominator sweep — GetSalesSchedule → lp_capacity_slots ─────────────
 
-async function sweepCapacitySlots(startDate, endDate) {
-  // This ONE call is the sole thing that advances the board's freshness stamp
-  // (swept_at). Unbounded and un-retried, a single LP "Execution Timeout
-  // Expired" 500 froze the stamp for a whole interval — three in a row and the
-  // board painted DATA STALE over correct numbers.
+/** Inclusive list of YYYY-MM-DD dates from startDate to endDate. */
+function enumerateDates(startDate, endDate) {
+  const out = [];
+  let cur = startDate;
+  // Guard against a malformed range spinning forever.
+  for (let n = 0; n <= 400 && cur <= endDate; n++) {
+    out.push(cur);
+    cur = addDays(cur, 1);
+  }
+  return out;
+}
+
+/**
+ * Near window (the dates the board is FOR) first and alone, then the tail in
+ * SLOTS_CHUNK_DAYS blocks. Order matters: the near chunk must get LP's
+ * attention before a slow tail can burn the budget.
+ */
+function buildSlotChunks(startDate, endDate) {
+  const days = enumerateDates(startDate, endDate);
+  if (!days.length) return [];
+  const chunks = [];
+  const near = days.slice(0, Math.max(1, NEAR_DAYS));
+  chunks.push({ start: near[0], end: near[near.length - 1], near: true });
+  const tail = days.slice(near.length);
+  for (let i = 0; i < tail.length; i += SLOTS_CHUNK_DAYS) {
+    const block = tail.slice(i, i + SLOTS_CHUNK_DAYS);
+    chunks.push({ start: block[0], end: block[block.length - 1], near: false });
+  }
+  return chunks;
+}
+
+/** Rows we currently hold for a date range — the baseline the delete guard uses. */
+async function countSlotRows(startDate, endDate) {
+  const { count, error } = await supabase
+    .from('lp_capacity_slots')
+    .select('*', { count: 'exact', head: true })
+    .gte('slot_date', startDate)
+    .lte('slot_date', endDate);
+  if (error) throw new Error(`lp_capacity_slots count failed: ${error.message}`);
+  return count ?? 0;
+}
+
+/** Fetch + upsert + guarded delete for ONE chunk of the forward window. */
+async function sweepSlotChunk(chunk) {
+  const { start: startDate, end: endDate } = chunk;
   let res;
   let attempts = 0;
   let lastErr = null;
@@ -268,7 +359,7 @@ async function sweepCapacitySlots(startDate, endDate) {
       break;
     } catch (err) {
       lastErr = err;
-      console.warn(`[CapacitySweep] GetSalesSchedule attempt ${attempt}/${SLOTS_RETRIES} failed: ${err.message}`);
+      console.warn(`[CapacitySweep] GetSalesSchedule ${startDate}..${endDate} attempt ${attempt}/${SLOTS_RETRIES} failed: ${err.message}`);
       if (attempt < SLOTS_RETRIES) await sleep(2000 * Math.pow(3, attempt - 1)); // 2s, 6s
     }
   }
@@ -304,6 +395,18 @@ async function sweepCapacitySlots(startDate, endDate) {
     }
   }
 
+  // Baseline BEFORE writing, so the guard compares like with like.
+  const priorCount = await countSlotRows(startDate, endDate);
+
+  // An empty 200 over dates we demonstrably had capacity for is not "every rep
+  // went home" — it is a bad response. Refuse it outright rather than deleting
+  // real rows and advancing freshness on a lie.
+  if (rows.length === 0 && priorCount > 0) {
+    throw new Error(
+      `GetSalesSchedule ${startDate}..${endDate} returned 0 slots but ${priorCount} rows are on file — refusing to trust an empty response`,
+    );
+  }
+
   for (let i = 0; i < rows.length; i += UPSERT_CHUNK) {
     const { error } = await supabase
       .from('lp_capacity_slots')
@@ -311,17 +414,102 @@ async function sweepCapacitySlots(startDate, endDate) {
     if (error) throw new Error(`lp_capacity_slots upsert failed: ${error.message}`);
   }
 
-  // Schedule changes: rows in the window that this sweep did NOT touch are no
+  // Schedule changes: rows in the chunk that this sweep did NOT touch are no
   // longer in LP's schedule — delete them (every touched row got swept_at=now).
-  const { error: delErr } = await supabase
-    .from('lp_capacity_slots')
-    .delete()
-    .gte('slot_date', startDate)
-    .lte('slot_date', endDate)
-    .lt('swept_at', sweptAt);
-  if (delErr) throw new Error(`lp_capacity_slots stale-row delete failed: ${delErr.message}`);
+  // Scoped to THIS chunk's dates: a chunk must never delete a neighbour's rows.
+  let deleteSkipped = false;
+  if (priorCount > 0 && rows.length < priorCount * SLOTS_DELETE_MIN_RATIO) {
+    deleteSkipped = true;
+    console.error(
+      `[CapacitySweep] ${startDate}..${endDate} returned ${rows.length} slots vs ${priorCount} on file ` +
+      `(< ${Math.round(SLOTS_DELETE_MIN_RATIO * 100)}%) — upserted but SKIPPED the stale-row delete; ` +
+      `suspect a partial LP response, not a schedule change`,
+    );
+  } else {
+    const { error: delErr } = await supabase
+      .from('lp_capacity_slots')
+      .delete()
+      .gte('slot_date', startDate)
+      .lte('slot_date', endDate)
+      .lt('swept_at', sweptAt);
+    if (delErr) throw new Error(`lp_capacity_slots stale-row delete failed: ${delErr.message}`);
+  }
 
-  return { days: days.length, slots: rows.length, swept_at: sweptAt, attempts };
+  return {
+    days: days.length,
+    slots: rows.length,
+    swept_at: sweptAt,
+    attempts,
+    prior_rows: priorCount,
+    delete_skipped: deleteSkipped,
+  };
+}
+
+/**
+ * Denominator sweep. Chunked for partial credit: the near window refreshes even
+ * when the tail is too slow, so board freshness no longer hangs on one
+ * all-or-nothing 14-day call.
+ *
+ * Throws only when the NEAR window fails — that is the case where the board
+ * genuinely cannot be trusted. A failed tail chunk is logged and left at its
+ * previous values.
+ */
+async function sweepCapacitySlots(startDate, endDate) {
+  const chunks = buildSlotChunks(startDate, endDate);
+  const deadline = Date.now() + SLOTS_BUDGET_MS;
+
+  const out = {
+    days: 0,
+    slots: 0,
+    swept_at: null,
+    attempts: 0,
+    chunks_ok: 0,
+    chunks_failed: 0,
+    chunks_skipped: 0,
+    near_swept_at: null,
+    errors: [],
+  };
+  let nearErr = null;
+
+  for (const chunk of chunks) {
+    const label = `${chunk.start}..${chunk.end}`;
+    // The near window always runs. Tail chunks yield once the budget is spent.
+    if (!chunk.near && Date.now() > deadline) {
+      out.chunks_skipped++;
+      continue;
+    }
+    try {
+      const r = await sweepSlotChunk(chunk);
+      out.chunks_ok++;
+      out.days += r.days;
+      out.slots += r.slots;
+      out.attempts += r.attempts;
+      if (!out.swept_at || r.swept_at > out.swept_at) out.swept_at = r.swept_at;
+      if (chunk.near) out.near_swept_at = r.swept_at;
+      if (r.delete_skipped) out.errors.push(`${label}: stale-row delete skipped (partial response)`);
+    } catch (err) {
+      out.chunks_failed++;
+      out.errors.push(`${label}: ${err.message}`);
+      if (chunk.near) {
+        nearErr = err;
+      } else {
+        console.warn(`[CapacitySweep] tail chunk ${label} failed: ${err.message} — those dates keep their previous values`);
+      }
+    }
+  }
+
+  if (nearErr) throw nearErr;
+
+  if (out.chunks_skipped) {
+    console.warn(`[CapacitySweep] ${out.chunks_skipped} tail chunk(s) skipped — ${SLOTS_BUDGET_MS}ms budget spent`);
+  }
+
+  // The near window succeeded, so the board's numbers are trustworthy even if
+  // the tail did not land. Record the success timestamp explicitly: it must not
+  // be inferred from max(swept_at) on data rows, because a legitimately empty
+  // schedule writes no rows and would read as "never swept".
+  lastSlotsSuccessAt = out.near_swept_at || out.swept_at || new Date().toISOString();
+  return out;
 }
 
 // ─── b. Numerator sweep — forward-window lead dispositions ───────────────────
@@ -539,10 +727,83 @@ async function refreshNearWindowLeads(windowStart) {
 let fastInProgress = false;
 let fastStartedAt = 0;
 let slotsFailStreak = 0;
+// Explicit "the denominator sweep last succeeded at" stamp. max(swept_at) over
+// data rows cannot express success-with-no-rows, and it is table-wide rather
+// than per-date. Null until the first successful pass of this process, in which
+// case the board falls back to max(swept_at) exactly as before.
+let lastSlotsSuccessAt = null;
 let leadInProgress = false;
 let lastFastSummary = null;
 let lastLeadSummary = null;
 let lastSnapshotSummary = null;
+
+// Has the current failure incident already been announced? Prevents a ping
+// every SWEEP_INTERVAL_MS for as long as LP is unwell.
+let slotsIncidentAnnounced = false;
+
+async function notifyOps(text) {
+  if (GROUPME_ALERTS_DISABLED) return { sent: false, reason: 'alerts_disabled' };
+  try {
+    const { sendGroupMeMessage } = await import('../groupme.js');
+    return await sendGroupMeMessage(text, { channel: 'ops' });
+  } catch (err) {
+    console.error('[CapacitySweep] GroupMe alert failed:', err.message);
+    return { sent: false, reason: err.message };
+  }
+}
+
+/**
+ * Announce once per incident, and announce the recovery. Both land in
+ * system_events so the outage is auditable after the fact — nothing
+ * capacity-related was recorded there before.
+ */
+async function recordSweepHealth({ failing, streak, error, lastSuccessAt }) {
+  const emit = async (event_type, payload) => {
+    try {
+      const { emitEvent } = await import('../event-emitter.js');
+      await emitEvent({
+        event_type,
+        source: 'capacity_sweep',
+        entity_type: 'system',
+        entity_id: 'capacity_sweep',
+        priority: failing ? 'high' : 'normal',
+        payload,
+        bypass_filter: true, // system health: no rule consumer, must not be gated
+      });
+    } catch (err) {
+      console.error(`[CapacitySweep] ${event_type} emit failed:`, err.message);
+    }
+  };
+
+  if (failing && streak >= SLOTS_ALERT_STREAK && !slotsIncidentAnnounced) {
+    slotsIncidentAnnounced = true;
+    const staleMin = lastSuccessAt
+      ? Math.round((Date.now() - new Date(lastSuccessAt).getTime()) / 60000)
+      : null;
+    await emit('capacity.sweep_failing', {
+      fail_streak: streak,
+      error,
+      last_success_at: lastSuccessAt,
+      stale_minutes: staleMin,
+    });
+    await notifyOps(
+      `⚠️ Appointment Capacity board — the availability sweep has failed ${streak}x in a row.
+` +
+      `Last good data: ${staleMin === null ? 'unknown' : `${staleMin} min ago`}.
+` +
+      `Error: ${error}
+` +
+      `Appointment counts are still live; the rep-availability side is what has stopped refreshing.`,
+    );
+    return;
+  }
+
+  if (!failing && slotsIncidentAnnounced) {
+    slotsIncidentAnnounced = false;
+    await emit('capacity.sweep_recovered', { last_success_at: lastSuccessAt });
+    await notifyOps('✅ Appointment Capacity board — the availability sweep is refreshing again.');
+  }
+}
 
 /** Fast pass: denominator + assignments. Seconds — safe on a strict interval. */
 export async function runFastCapacityPass() {
@@ -566,11 +827,18 @@ export async function runFastCapacityPass() {
     try {
       summary.slots = await sweepCapacitySlots(start, end);
       slotsFailStreak = 0;
+      await recordSweepHealth({ failing: false, streak: 0, lastSuccessAt: lastSlotsSuccessAt });
     } catch (err) {
       slotsFailStreak++;
       summary.slots = { error: err.message, fail_streak: slotsFailStreak };
-      const level = slotsFailStreak >= 2 ? console.error : console.warn;
+      const level = slotsFailStreak >= SLOTS_ALERT_STREAK ? console.error : console.warn;
       level(`[CapacitySweep] slot sweep failed (streak ${slotsFailStreak}): ${err.message} — board freshness stamp is NOT advancing`);
+      await recordSweepHealth({
+        failing: true,
+        streak: slotsFailStreak,
+        error: err.message,
+        lastSuccessAt: lastSlotsSuccessAt,
+      });
     }
     try {
       const assign = await computeMarketAssignments({ scope: 'forward_appts' });
@@ -743,11 +1011,23 @@ export async function runFillSnapshot(snapshotDate = todayET()) {
 // reads the SAME aggregate the TV board polls — never a parallel query that
 // can drift from it.
 export async function buildBoardResponse(date) {
-  const [marketRows, denomRows, numerRows, sweepRows] = await Promise.all([
+  const [marketRows, denomRows, numerRows, sweepRows, numerFreshRows] = await Promise.all([
     runSQL(`SELECT DISTINCT market_code, market_label FROM lp_branch_market_map ORDER BY market_code`),
     runSQL(`SELECT market, requested, booked FROM v_appt_board WHERE slot_date = '${date}'::date`),
     runSQL(numeratorSQL(`= '${date}'::date`)),
-    runSQL(`SELECT max(swept_at) AS last_sweep_at FROM lp_capacity_slots`),
+    // Two freshness reads, not one. The table-wide max(swept_at) is kept for
+    // backward compatibility, but it answers the wrong question: it is global
+    // rather than per-date, and it says nothing about which HALF of the board
+    // is behind. capacity_swept_at is the viewed date's own stamp;
+    // appointments_updated_at is the numerator's, which comes from the lead
+    // pass and stays current even while the denominator sweep is failing.
+    runSQL(`SELECT max(swept_at) AS last_sweep_at,
+                   max(swept_at) FILTER (WHERE slot_date = '${date}'::date) AS date_swept_at
+              FROM lp_capacity_slots`),
+    runSQL(`SELECT max(synced_at) AS appointments_updated_at
+              FROM lp_leads
+             WHERE appointment_date IS NOT NULL
+               AND (appointment_date AT TIME ZONE 'America/New_York')::date = '${date}'::date`),
   ]);
 
   // Live Five9 dial order for the corner badge. Cached and fail-open — a Five9
@@ -802,6 +1082,34 @@ export async function buildBoardResponse(date) {
   const stale = !lastSweepAt
     || (Date.now() - new Date(lastSweepAt).getTime()) > STALE_AFTER_MS;
 
+  // A sweep that succeeded over a legitimately empty schedule writes no rows,
+  // so max(swept_at) alone would read as "never swept". Prefer the explicit
+  // in-process success stamp when it is the newer of the two.
+  const dateSweptAt = sweepRows?.[0]?.date_swept_at || null;
+  const capacitySweptAt = [dateSweptAt, lastSlotsSuccessAt]
+    .filter(Boolean)
+    .sort()
+    .pop() || null;
+  const apptsUpdatedAt = numerFreshRows?.[0]?.appointments_updated_at || null;
+
+  const ageMs = (ts) => (ts ? Date.now() - new Date(ts).getTime() : null);
+  const capacityAge = ageMs(capacitySweptAt);
+  const apptsAge = ageMs(apptsUpdatedAt);
+
+  const capacityStale = capacityAge === null || capacityAge > STALE_AFTER_MS;
+  // The numerator gets a longer leash: it only moves when a disposition
+  // actually changes, so a quiet hour is not a fault. Absent data (no
+  // appointments at all for this date) is not staleness either.
+  const apptsStale = apptsAge !== null && apptsAge > STALE_AFTER_MS * 2;
+
+  // 'broken' is reserved for the case where the board genuinely cannot be
+  // trusted; 'failing' means the sweep is erroring but the last good numbers
+  // are recent enough to keep showing. The dashboard uses this to say WHICH
+  // half is behind instead of a blanket DATA STALE over correct numbers.
+  const sweepState = (capacityStale && apptsStale) || (capacityStale && slotsFailStreak >= SLOTS_ALERT_STREAK)
+    ? 'broken'
+    : (capacityStale || slotsFailStreak > 0 ? 'failing' : 'ok');
+
   return {
     date,
     generated_at: new Date().toISOString(),
@@ -810,6 +1118,13 @@ export async function buildBoardResponse(date) {
     forward_days: FORWARD_DAYS,
     stale,
     stale_after_ms: STALE_AFTER_MS,
+    // Split freshness (2026-09-12). See the two runSQL reads above.
+    capacity_swept_at: capacitySweptAt,
+    appointments_updated_at: apptsUpdatedAt,
+    capacity_stale: capacityStale,
+    appointments_stale: apptsStale,
+    sweep_fail_streak: slotsFailStreak,
+    sweep_state: sweepState,
     offices,
     unresolved,                    // always present — may not be hidden
     dial_rank_source: { campaign: dial.campaign, read_at: dial.read_at, error: dial.error ?? null },
@@ -843,6 +1158,16 @@ export function registerCapacityBoardRoutes(app) {
       slots_fail_streak: slotsFailStreak,
       slots_timeout_ms: SLOTS_TIMEOUT_MS,
       slots_retries: SLOTS_RETRIES,
+      slots_chunk_days: SLOTS_CHUNK_DAYS,
+      slots_budget_ms: SLOTS_BUDGET_MS,
+      slots_delete_min_ratio: SLOTS_DELETE_MIN_RATIO,
+      slots_alert_streak: SLOTS_ALERT_STREAK,
+      slots_last_success_at: lastSlotsSuccessAt,
+      slots_incident_announced: slotsIncidentAnnounced,
+      // The breaker sits in front of every LP call this sweep makes, so its
+      // state belongs in the same diagnostic. A latched-open breaker was the
+      // reason a short LP blip froze the board for 80+ minutes on 2026-09-12.
+      lp_circuit: getCircuitStatus(),
       fast_pass_running_ms: fastInProgress ? Date.now() - fastStartedAt : null,
       lead_duty_ratio: LEAD_DUTY_RATIO,
       forward_days: FORWARD_DAYS,
@@ -871,7 +1196,17 @@ export function registerCapacityBoardRoutes(app) {
     runHourlyFillSnapshot().catch((err) => console.error('[CapacityHourly] manual run failed:', err.message));
   });
 
-  console.log('[CapacityBoard] Routes: GET /board/capacity, GET /admin/capacity-sweep/status, POST /admin/capacity-sweep/run, POST /admin/capacity-snapshot/run');
+  // resetCircuit() existed but had NO production caller: the only way to clear
+  // a latched breaker was a redeploy. The breaker now self-heals, so this is a
+  // hurry-it-along lever rather than the sole remedy.
+  app.post('/admin/lp-circuit/reset', (req, res) => {
+    const before = getCircuitStatus();
+    resetCircuit();
+    console.warn('[CapacitySweep] LP circuit breaker manually reset via /admin/lp-circuit/reset');
+    res.json({ ok: true, before, after: getCircuitStatus() });
+  });
+
+  console.log('[CapacityBoard] Routes: GET /board/capacity, GET /admin/capacity-sweep/status, POST /admin/capacity-sweep/run, POST /admin/capacity-snapshot/run, POST /admin/lp-circuit/reset');
 }
 
 // ─── Schedulers ──────────────────────────────────────────────────────────────
