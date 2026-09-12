@@ -11,17 +11,26 @@ import {
 } from '../src/jobs/memory-recommend.js';
 
 /**
- * Chainable fake. `queue` is what v_command_center_queue returns; every write is
- * recorded so a test can assert exactly which columns were touched.
+ * Chainable fake. `queue` is the cards as they exist in the SOURCE TABLES; every
+ * write is recorded so a test can assert exactly which columns were touched.
+ *
+ * The view branch deliberately DELETES rec_source_version from every row it
+ * hands back, because the real v_command_center_queue does not select that
+ * column — it carries card_version and the other nine rec_* columns and stops.
+ * A fake that returned it made the queue look like a complete source of truth
+ * and let loadCandidates pass its tests while re-recommending all 400 cards on
+ * every production run. The column is served from the source tables instead,
+ * which is where it actually lives.
  */
 function fakeDb(queue = []) {
   const writes = [];
   const make = (table) => {
-    const ctx = { table, op: null, payload: null, filters: [] };
+    const ctx = { table, op: null, payload: null, filters: [], cols: '*' };
     const chain = {
-      select() { return chain; },
+      select(cols) { if (cols) ctx.cols = cols; return chain; },
       eq(k, v) { ctx.filters.push([k, v]); return chain; },
-      in() { return chain; }, order() { return chain; }, limit() { return chain; },
+      in(k, v) { ctx.filters.push([k, v]); return chain; },
+      order() { return chain; }, limit() { return chain; },
       insert(p) { ctx.op = 'insert'; ctx.payload = p; return chain; },
       update(p) { ctx.op = 'update'; ctx.payload = p; return chain; },
       maybeSingle() { return finish(true); },
@@ -31,7 +40,17 @@ function fakeDb(queue = []) {
       if (ctx.op) { writes.push({ ...ctx }); return { data: null, error: null }; }
       if (table === 'v_command_center_queue') {
         const id = (ctx.filters.find(([k]) => k === 'source_id') || [])[1];
-        const rows = id == null ? queue : queue.filter((r) => r.source_id === id);
+        const rows = (id == null ? queue : queue.filter((r) => r.source_id === id))
+          // eslint-disable-next-line no-unused-vars
+          .map(({ rec_source_version, ...visible }) => visible);
+        return { data: single ? (rows[0] ?? null) : rows, error: null };
+      }
+      // The source tables, where rec_source_version actually lives.
+      if (ctx.cols.includes('rec_source_version')) {
+        const ids = (ctx.filters.find(([k]) => k === 'id') || [])[1] || [];
+        const rows = queue
+          .filter((r) => r.source_table === table && ids.includes(r.source_id))
+          .map((r) => ({ id: r.source_id, rec_source_version: r.rec_source_version ?? null }));
         return { data: single ? (rows[0] ?? null) : rows, error: null };
       }
       return { data: single ? null : [], error: null };
@@ -204,6 +223,21 @@ test('a card whose recommendation still matches its content version is left alon
   ]);
   const got = await loadCandidates(db, 10);
   assert.deepEqual(got.map((c) => c.source_id), [51, 52]);
+});
+
+test('the queue view does NOT carry rec_source_version — it is read from the source table', async () => {
+  // The bug this pins. v_command_center_queue selects card_version and nine
+  // rec_* columns; rec_source_version is not among them. Read it off a queue
+  // row and you get undefined, which never equals card_version — so every card
+  // reads as stale and the whole backlog is re-recommended every run, nightly,
+  // forever. Production had all 400 cards "pending" with 126 already done.
+  const db = fakeDb([card({ source_id: 50, rec_at: '2026-09-10T03:00:00Z', rec_source_version: 'hash-v1', card_version: 'hash-v1' })]);
+  const viaView = await db.from('v_command_center_queue').select('*');
+  assert.equal('rec_source_version' in viaView.data[0], false, 'the view must not expose rec_source_version');
+  assert.equal(viaView.data[0].card_version, 'hash-v1');
+
+  const got = await loadCandidates(db, 10);
+  assert.deepEqual(got, [], 'a card whose version still matches must not be redone');
 });
 
 test('the run is capped at the limit it is given', async () => {
