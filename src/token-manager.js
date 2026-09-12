@@ -23,10 +23,41 @@
 //   So notes get their OWN optional credential and their OWN cache. Unset,
 //   getNoteToken() returns the primary token and behaviour is byte-identical
 //   to before. Set, only the note-write path authenticates as that user.
+//
+// SINGLE-FLIGHT (2026-09-12). Every LP call routes through getToken()
+// (lp-client.js:102), so a cold or expired cache used to mean EVERY concurrent
+// caller fired its own POST /token. The capacity lead pass alone opens ~180
+// per-lead fetches, so a restart produced a ~180-request login stampede
+// against LP.
+//
+// The cost was not the wasted requests, it was the queue behind them. Observed
+// on 2026-09-12: a token request took 80 SECONDS (16:30:04 -> 16:31:24) and
+// three refreshes landed inside one second. Meanwhile the capacity board's
+// GetSalesSchedule — which must await a token before it can issue its own
+// request — burned its entire 60s budget waiting in that queue and never
+// reached the schedule endpoint at all, failing at exactly 60000ms every
+// attempt with no LP-side error. The board read DATA STALE for hours and the
+// cause was diagnosed as "the vendor is slow". It was not; it was us.
+//
+// So: ONE refresh is shared by every concurrent caller, and the token fetch is
+// timeout-bounded. The timeout is not optional garnish — with single-flight, a
+// hung login blocks every LP call in the process, so it must be able to fail.
 
 let cachedToken = null;
 let tokenExpiry = null;
 let refreshTimer = null;
+// Shared in-flight refresh promises — the single-flight guards. Null when no
+// refresh is running. See the SINGLE-FLIGHT note above.
+let inFlightRefresh = null;
+let inFlightNoteRefresh = null;
+
+// A token fetch had NO timeout and could hang indefinitely. Under
+// single-flight that would wedge every LP call in the process, so this bound
+// is load-bearing.
+const TOKEN_TIMEOUT_MS = Math.max(
+  1000,
+  parseInt(process.env.LP_TOKEN_TIMEOUT_MS || '', 10) || 30_000,
+);
 
 // Separate cache for the note-writing identity. MUST NOT share storage with
 // the primary token: one cache holding two identities would hand whichever
@@ -38,6 +69,8 @@ let noteTokenExpiry = null;
 export const getToken = async () => {
   const now = Date.now();
   if (cachedToken && tokenExpiry && now < tokenExpiry) return cachedToken;
+  // refreshToken() is itself single-flighted, so N concurrent cold callers
+  // produce ONE login request rather than N.
   return await refreshToken();
 };
 
@@ -89,11 +122,22 @@ const requestToken = async ({ username, password, label }) => {
 
   console.log(`[Token] Requesting ${label} token from ${baseUrl}/token...`);
 
-  const res = await fetch(`${baseUrl}/token`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: params.toString(),
-  });
+  let res;
+  try {
+    res = await fetch(`${baseUrl}/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: params.toString(),
+      signal: AbortSignal.timeout(TOKEN_TIMEOUT_MS),
+    });
+  } catch (err) {
+    // A timeout/abort must surface as a normal failure so the breaker counts
+    // it and the next caller can retry, rather than hanging forever.
+    const reason = err?.name === 'TimeoutError' || err?.name === 'AbortError'
+      ? `timed out after ${TOKEN_TIMEOUT_MS}ms`
+      : err.message;
+    throw new Error(`[Token] ${label} request failed: ${reason}`);
+  }
 
   if (!res.ok) {
     const body = await res.text().catch(() => '');
@@ -104,16 +148,32 @@ const requestToken = async ({ username, password, label }) => {
 };
 
 export const refreshToken = async () => {
-  const data = await requestToken({
-    username: process.env.LP_USERNAME,
-    password: process.env.LP_PASSWORD,
-    label: 'primary',
-  });
-  cachedToken = data.access_token;
-  // LP tokens expire in 24 hours — refresh 1 hour early (23 hours)
-  tokenExpiry = Date.now() + (23 * 60 * 60 * 1000);
-  console.log('[Token] Refreshed — valid for 23 hours');
-  return cachedToken;
+  // Join the refresh already in flight rather than starting a competing one.
+  // The guard lives HERE rather than only in getToken() so every path shares
+  // it — including lp-client.js's 401 retry (which stampedes hardest, since
+  // concurrent calls all get 401 together) and the 23-hour scheduled refresh.
+  if (inFlightRefresh) return await inFlightRefresh;
+
+  inFlightRefresh = (async () => {
+    const data = await requestToken({
+      username: process.env.LP_USERNAME,
+      password: process.env.LP_PASSWORD,
+      label: 'primary',
+    });
+    cachedToken = data.access_token;
+    // LP tokens expire in 24 hours — refresh 1 hour early (23 hours)
+    tokenExpiry = Date.now() + (23 * 60 * 60 * 1000);
+    console.log('[Token] Refreshed — valid for 23 hours');
+    return cachedToken;
+  })();
+
+  try {
+    return await inFlightRefresh;
+  } finally {
+    // Cleared on settle, success or failure: a failed refresh must not pin a
+    // rejected promise that every later caller then inherits.
+    inFlightRefresh = null;
+  }
 };
 
 /**
@@ -127,20 +187,33 @@ export const refreshToken = async () => {
  * the reason and retries on backoff.
  */
 export const refreshNoteToken = async () => {
-  const data = await requestToken({
-    username: process.env.LP_NOTE_USERNAME,
-    password: process.env.LP_NOTE_PASSWORD,
-    label: 'note-identity',
-  });
-  cachedNoteToken = data.access_token;
-  noteTokenExpiry = Date.now() + (23 * 60 * 60 * 1000);
-  console.log(`[Token] Note-identity token refreshed (user=${process.env.LP_NOTE_USERNAME}) — valid for 23 hours`);
-  return cachedNoteToken;
+  if (inFlightNoteRefresh) return await inFlightNoteRefresh;
+
+  inFlightNoteRefresh = (async () => {
+    const data = await requestToken({
+      username: process.env.LP_NOTE_USERNAME,
+      password: process.env.LP_NOTE_PASSWORD,
+      label: 'note-identity',
+    });
+    cachedNoteToken = data.access_token;
+    noteTokenExpiry = Date.now() + (23 * 60 * 60 * 1000);
+    console.log(`[Token] Note-identity token refreshed (user=${process.env.LP_NOTE_USERNAME}) — valid for 23 hours`);
+    return cachedNoteToken;
+  })();
+
+  try {
+    return await inFlightNoteRefresh;
+  } finally {
+    inFlightNoteRefresh = null;
+  }
 };
 
 export const invalidateToken = () => {
   cachedToken = null;
   tokenExpiry = null;
+  // Deliberately does NOT touch inFlightRefresh. A refresh already in flight
+  // is fetching a NEWER token than the one being invalidated, so cancelling it
+  // would only make the next caller start another.
 };
 
 /** Invalidate the note-identity token only. */
@@ -153,6 +226,9 @@ export const getTokenStatus = () => ({
   hasToken: !!cachedToken,
   expiresAt: tokenExpiry ? new Date(tokenExpiry).toISOString() : null,
   expiresInMs: tokenExpiry ? tokenExpiry - Date.now() : null,
+  refreshInFlight: !!inFlightRefresh,
+  noteRefreshInFlight: !!inFlightNoteRefresh,
+  tokenTimeoutMs: TOKEN_TIMEOUT_MS,
   noteIdentity: hasNoteIdentity() ? (process.env.LP_NOTE_USERNAME || null) : null,
   hasNoteToken: !!cachedNoteToken,
   noteExpiresAt: noteTokenExpiry ? new Date(noteTokenExpiry).toISOString() : null,
