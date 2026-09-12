@@ -197,10 +197,14 @@ export function normalizeOutput(raw, card) {
     category: pick(raw?.category, CATEGORIES, 'operations'),
     build_text: raw?.build_text ? String(raw.build_text).slice(0, 2000) : null,
   };
-  // Framework rule 4, enforced rather than trusted.
-  if (out.risk !== 'none' && ['high'].includes(out.confidence)) out.confidence = 'medium';
-  // Risk backstop: an area that is always about money does not get "none".
+  // Risk backstop FIRST: an area that is always about money does not get
+  // "none". The ORDER matters. Run the backstop after the cap below and a
+  // backstopped card lands as money + high — the one combination rule 4 exists
+  // to prevent — and it lands on payroll and partner/vendor cards, the two
+  // areas that can least afford a confident-looking wrong answer.
   if (out.risk === 'none' && RISK_BACKSTOP_AREAS.has(String(card?.area || ''))) out.risk = 'money';
+  // Framework rule 4, enforced rather than trusted.
+  if (out.risk !== 'none' && out.confidence === 'high') out.confidence = 'medium';
   return out;
 }
 

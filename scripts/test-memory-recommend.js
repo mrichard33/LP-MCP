@@ -131,6 +131,18 @@ test('confidence is capped at medium whenever a risk is flagged', () => {
   assert.equal(out.confidence, 'medium');
 });
 
+test('a backstopped card is ALSO capped at medium, not left at high', () => {
+  // The bug this pins: the backstop and the cap both fire on the same card, so
+  // whichever runs second decides. With the cap last, a payroll card the model
+  // called risk:none/confidence:high came out money + high — precisely the
+  // combination rule 4 forbids, on precisely the cards that matter most.
+  for (const area of ['payroll-callcenter', 'partners-vendors']) {
+    const out = normalizeOutput({ ...goodReply, risk: 'none', confidence: 'high' }, card({ area }));
+    assert.equal(out.risk, 'money', `${area} should be backstopped to money`);
+    assert.equal(out.confidence, 'medium', `${area} must not stay at high once money is flagged`);
+  }
+});
+
 test('an area with no backstop keeps the risk the model gave', () => {
   const out = normalizeOutput({ ...goodReply, risk: 'none' }, card({ area: 'appointments' }));
   assert.equal(out.risk, 'none');
