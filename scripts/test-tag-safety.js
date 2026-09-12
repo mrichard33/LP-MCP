@@ -121,6 +121,68 @@ test('remove_tag explicit mode deletes only the present subset', async () => {
   assert.deepEqual(deletes[0].body, { tags: ['drop:b'] }, 'only the present tag is deleted');
 });
 
+// ─── exclusive flat tag sets (zOtz91P604CVWP47DIJx 2026-09-11) ─────────
+// The live incident: intent-imminent, intent-spike and intent-warm all stacked
+// on one contact because the intent ladder has no ':' and so no namespace.
+
+test('intent ladder is exclusive: adding intent-warm clears imminent and cold', async () => {
+  reset(['intent-cold', 'intent-imminent', 'bj:stage-3-comparing']);
+  await executeAddTag({ target_id: 'c1', action_payload: { tag: 'intent-warm' } }, ctx());
+
+  assert.equal(byMethod('PUT').length, 0);
+  const deletes = byMethod('DELETE');
+  assert.equal(deletes.length, 1, 'one DELETE carrying both stale rungs');
+  assert.deepEqual(
+    [...deletes[0].body.tags].sort(),
+    ['intent-cold', 'intent-imminent'],
+    'both other rungs removed; the unrelated bj:* tag untouched',
+  );
+  const posts = byMethod('POST');
+  assert.deepEqual(posts[0].body, { tags: ['intent-warm'] });
+});
+
+test('intent-spike is NOT a ladder rung: it survives a temperature change', async () => {
+  reset(['intent-spike', 'intent-imminent']);
+  await executeAddTag({ target_id: 'c1', action_payload: { tag: 'intent-warm' } }, ctx());
+
+  const deletes = byMethod('DELETE');
+  assert.equal(deletes.length, 1);
+  assert.deepEqual(
+    deletes[0].body,
+    { tags: ['intent-imminent'] },
+    'intent-spike marks a transient hot window, not a rung — it must stay',
+  );
+});
+
+test('exclusive set never reaches into the intent-bucket: namespace', async () => {
+  reset(['intent-bucket:high', 'intent-cold']);
+  await executeAddTag({ target_id: 'c1', action_payload: { tag: 'intent-warm' } }, ctx());
+
+  const deletes = byMethod('DELETE');
+  assert.equal(deletes.length, 1);
+  assert.deepEqual(
+    deletes[0].body,
+    { tags: ['intent-cold'] },
+    'intent-bucket:* is a separate reporting namespace and must not be evicted',
+  );
+});
+
+test('adding a ladder rung already present, with no siblings → no_op, zero writes', async () => {
+  reset(['intent-warm']);
+  const r = await executeAddTag({ target_id: 'c1', action_payload: { tag: 'intent-warm' } }, ctx());
+
+  assert.equal(r.action, 'no_op');
+  assert.equal(writes().length, 0);
+});
+
+test('ladder rung present alongside a stale sibling still cleans up', async () => {
+  reset(['intent-warm', 'intent-cold']);
+  const r = await executeAddTag({ target_id: 'c1', action_payload: { tag: 'intent-warm' } }, ctx());
+
+  assert.notEqual(r.action, 'no_op', 'a stale sibling means there is still work to do');
+  assert.deepEqual(byMethod('DELETE')[0].body, { tags: ['intent-cold'] });
+});
+
 test('add_tag reuses one GET across immutability + exclusivity + present checks', async () => {
   reset(['stage:old']);
   await executeAddTag({ target_id: 'c1', action_payload: { tag: 'stage:new' } }, ctx());
