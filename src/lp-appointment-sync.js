@@ -174,6 +174,7 @@ import {
   getCustomers3,
   getLeads,
   LpTimeoutError,
+  getInboundLeadInfo,
 } from './lp-client.js';
 
 // Interactive resolves (MCP set_lp_appointment) pass { fast:true } to every
@@ -205,6 +206,7 @@ import { five9DispatchConfigured, dispatchConfirmationCallback } from './five9/l
 // and format-helpers.js, neither of which imports anything from here.
 import { ghlFetch as sharedGhlFetch } from './actions/helpers.js';
 import { emitEvent } from './event-emitter.js';
+import { lpStoredAgeMinutes } from './lp-dates.js';
 import { LP_EMP } from './lp-source-ids.js';
 import { buildLpAppointmentCard } from './services/appointment-card.js';
 
@@ -1455,6 +1457,96 @@ async function clearSyncFailedTag(contactId) {
   await releaseFailureNotices(contactId);
 }
 
+// ─── Unissued-inbound defer gate (2026-09-11) ───────────────────
+//
+// Incident: contact 3IfrsqGrV3qJtId9RGXk. The chatbot hot-transfer path ran
+// AddLead WITHOUT an appointment, creating inbound row 423064. Two and a half
+// hours later a GHL booking fired this webhook. LP had not yet ISSUED that row,
+// so there was no lds_id, no prospect, and no phone/email match —
+// resolveLPLeadId correctly failed all five steps and the v5.2.0 self-heal
+// enrolled wf 8e30ff37, minting a SECOND inbound row (423079) for the same
+// lognumber. Two rows, one person.
+//
+// LP has no endpoint that attaches an appointment to an unissued inbound row.
+// See the banner in actions/handlers/lp-requeue.js: LeadAdd is the only way
+// into a queue, so "attach" can only ever mean "add another lead". The correct
+// move is to WAIT — hold the appointment, let LP issue the row it already has,
+// and let the 30-minute appointment-parity watchdog re-drive this orchestrator
+// once a real lds_id exists. At that point Step 0/1/2 resolve and
+// SetAppointment writes the appointment onto that one lead.
+//
+// MODES (read per call so Railway can flip without a deploy):
+//   off     gate disabled — byte-identical to pre-fix behaviour
+//   shadow  probe runs and emits telemetry, but STILL enrolls (default)
+//   on      probe runs and DEFERS when a fresh unissued row is found
+//
+// Default is 'shadow' because the defer path changes what I.LP-A sees on its
+// post-wait check — see the POST-DEPLOY section of the handoff. Do not flip to
+// 'on' until the I.LP-A branch exists.
+function inboundDeferMode() {
+  const raw = String(process.env.LP_INBOUND_DEFER_MODE || 'shadow').trim().toLowerCase();
+  return ['off', 'shadow', 'on'].includes(raw) ? raw : 'shadow';
+}
+
+// Past this age an unissued row is presumed stuck and we fall through to the
+// enroll rather than hold an appointment indefinitely. Floor of 30 min so a
+// typo can never make the gate fire on a row LP is still processing normally.
+function inboundDeferMaxAgeMin() {
+  return Math.max(30, Number(process.env.LP_INBOUND_DEFER_MAX_AGE_MIN) || 360);
+}
+
+/**
+ * Youngest UNISSUED inbound row for this contact, or null.
+ *
+ * "Unissued" means LP accepted the lead into its inbound queue but has not yet
+ * turned it into an lds_id. A row that HAS an lds_id is ignored — the resolver
+ * chain above will find it on its own and this gate must not interfere.
+ *
+ * FAILS OPEN. Returns null on a read error, an empty queue, or an unparseable
+ * shape, so a transient LP fault can never block a first, legitimate lead
+ * creation. The gate is an optimisation against duplication, never a safety net.
+ *
+ * `datereceived` is ET wall-clock with no offset (Nichole's 19:28:52.143 row was
+ * created at 23:28 UTC). lpStoredAgeMinutes() is the established converter for
+ * exactly this frame — see the READ SIDE block in src/lp-dates.js. Do NOT use a
+ * bare Date.parse here; it reads every row as ~4h older than it is.
+ *
+ * `deps` is a TEST SEAM only; production calls this with contactId alone.
+ */
+async function findUnissuedInboundRow(contactId, deps = {}) {
+  if (!contactId) return null;
+  const fetchInfo = deps.getInboundLeadInfo || getInboundLeadInfo;
+  try {
+    const info = await fetchInfo({ lognumber: contactId }, FAST);
+    const rows = Array.isArray(info)
+      ? info
+      : (info?.data || info?.leads || info?.results || info?.items || []);
+    if (!Array.isArray(rows) || rows.length === 0) return null;
+
+    let best = null;
+    for (const r of rows) {
+      if (!r) continue;
+      const ldsId = String(r.lds_id ?? r.LdsID ?? r.ldsid ?? '').trim();
+      if (ldsId) continue;                       // already issued — resolver owns it
+      const ageMin = lpStoredAgeMinutes(r.datereceived ?? r.DateReceived ?? null);
+      const candidate = {
+        inboundId: String(r.id ?? r.in1_id ?? '').trim() || null,
+        ageMin,
+        hasAppt: Boolean(String(r.apptdate ?? '').trim()),
+      };
+      if (!best) { best = candidate; continue; }
+      // Youngest wins. A row with no parseable age loses to one that has it.
+      if (ageMin != null && (best.ageMin == null || ageMin < best.ageMin)) best = candidate;
+    }
+    return best;
+  } catch (err) {
+    console.warn(
+      `[LP-APPT] inbound-queue probe failed for ${contactId}: ${err.message} — NOT deferring`
+    );
+    return null;
+  }
+}
+
 // ─── Main sync ──────────────────────────────────────────────────
 
 /**
@@ -1581,6 +1673,97 @@ async function syncAppointmentToLP({
   }
 
   if (!resolution) {
+    // ── Gate: does LP already have an UNISSUED inbound row for this
+    // contact? If so, enrolling wf 8e30ff37 below would mint a SECOND row
+    // for the same person. Defer instead and let the parity watchdog
+    // re-drive once LP issues an lds_id. Full rationale in the
+    // findUnissuedInboundRow banner above.
+    const deferMode = inboundDeferMode();
+    if (deferMode !== 'off') {
+      const pending = await findUnissuedInboundRow(contactId);
+      if (pending) {
+        const maxAgeMin = inboundDeferMaxAgeMin();
+        const stale = pending.ageMin != null && pending.ageMin > maxAgeMin;
+        const willDefer = deferMode === 'on' && !stale;
+
+        // Telemetry. bypass_filter is MANDATORY: this type is not in
+        // ALLOWED_EVENT_TYPES and never will be (that list's contract is
+        // "types with >=1 consuming agent_rule"), and shouldAllowEvent() is
+        // default-DROP — without it the shadow window produces nothing.
+        // Same precedent as agentic.hold_error and appt.enrichment_fetch.
+        void emitEvent({
+          event_type: 'lp.appointment_defer_pending_inbound',
+          event_subtype: willDefer ? 'deferred' : (stale ? 'stale_fell_through' : 'shadow'),
+          source: 'lp_mcp',
+          entity_type: 'contact',
+          entity_id: String(contactId),
+          ghl_contact_id: contactId,
+          priority: 'normal',
+          bypass_filter: true,
+          idempotency_key:
+            `appt_defer_${contactId}_${incomingDateNorm}_${incomingTimeNorm || 'x'}_${Date.now()}`,
+          payload: {
+            mode: deferMode,
+            in1_id: pending.inboundId,
+            inbound_age_min: pending.ageMin,
+            inbound_row_has_appt: pending.hasAppt,
+            max_age_min: maxAgeMin,
+            appt_date: incomingDateNorm,
+            appt_time: incomingTimeNorm || null,
+            deferred: willDefer,
+          },
+        }).catch(() => {});
+
+        if (willDefer) {
+          console.log(
+            `[LP-APPT] ⏸️ Deferring ${contactId}: LP inbound row ` +
+            `${pending.inboundId || '(unknown)'} is ${pending.ageMin ?? '?'}min old and NOT yet ` +
+            `issued — skipping wf 8e30ff37 enroll (would duplicate). Parity watchdog re-drives ` +
+            `every 30min until LP issues an lds_id.`
+          );
+          // Deliberately NO dedup mark and NO lp-appt-synced tag: LP does not
+          // hold this appointment yet, and the watchdog must be free to retry.
+          await addGHLNote(contactId,
+            `[LP SYNC] Appointment HELD — not yet written to Lead Perfection.\n` +
+            `LP already has this person in its inbound queue (in1_id ` +
+            `${pending.inboundId || 'unknown'}, ${pending.ageMin ?? '?'} min old) but has not ` +
+            `issued the lead yet. Creating a second lead to carry the appointment would ` +
+            `duplicate this person in LP, so the appointment is being held instead.\n` +
+            `It writes to the SAME lead automatically once LP issues it — re-checked every ` +
+            `30 minutes for up to ${maxAgeMin} minutes, then escalated.\n` +
+            `Appt: ${incomingDateNorm} ${incomingTimeNorm || ''}`
+          ).catch(() => {});
+          return {
+            success: true,
+            action: 'deferred_pending_lp_issuance',
+            contact_id: contactId,
+            lp_inbound_lead_id: pending.inboundId,
+            inbound_age_min: pending.ageMin,
+            appt_date: incomingDateNorm,
+            appt_time: incomingTimeNorm || null,
+            max_age_min: maxAgeMin,
+            retry_via: 'appointment_parity_watchdog',
+          };
+        }
+
+        if (stale && deferMode === 'on') {
+          console.warn(
+            `[LP-APPT] ⚠️ Inbound row ${pending.inboundId || '(unknown)'} for ${contactId} has ` +
+            `sat unissued for ${pending.ageMin}min (> ${maxAgeMin}) — falling through to enroll ` +
+            `so the appointment is not lost. This WILL create a duplicate inbound row.`
+          );
+          await sendGroupMeMessage(
+            `⚠️ LP INBOUND ROW STUCK — duplicate created deliberately\n\n` +
+            `👤 ${contactName || contactId}\n` +
+            `🆔 in1_id ${pending.inboundId || 'unknown'} unissued for ${pending.ageMin} min\n` +
+            `📅 Appt: ${incomingDateNorm} ${incomingTimeNorm || ''}\n\n` +
+            `The appointment was about to be lost, so a lead was created to carry it.\n` +
+            `→ In LP: kill the OLDER inbound row, keep the one carrying the appointment.`
+          ).catch(() => {});
+        }
+      }
+    }
+
     // ── Self-heal: no real lds_id yet ──────────────────────────────
     // Lead booked an appointment before LP issued its inbound entry, so
     // only an in1_id exists. Enroll in workflow 8e30ff37 ("Send Lead to
@@ -2193,6 +2376,9 @@ export {
   lpAlreadyHasAppointment,
   claimFailureNotice,
   releaseFailureNotices,
+  findUnissuedInboundRow,
+  inboundDeferMode,
+  inboundDeferMaxAgeMin,
   probeLPForContact,
   fetchLatestAppointment,
   // Exported 2026-07-28 for the enrichment no-op regression lock — case 10 in
