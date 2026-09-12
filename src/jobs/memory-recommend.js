@@ -275,6 +275,33 @@ export async function recommendOne(table, id, deps = {}) {
   return rec;
 }
 
+/** The two tables a Rulings card can come from. */
+const SOURCE_TABLES = Object.freeze(['claude_pending_items', 'claude_memory_conflicts']);
+
+/**
+ * The rec_source_version of each already-recommended card, read from the SOURCE
+ * TABLES rather than the queue.
+ *
+ * v_command_center_queue exposes card_version but NOT rec_source_version — it
+ * selects the other nine rec_* columns and stops. Reading it off a queue row
+ * therefore yields undefined, which never equals card_version, so every card
+ * looks stale and the entire backlog is re-recommended on every single run.
+ * One round-trip per table, not per card.
+ */
+async function loadRecVersions(db, rows) {
+  const out = new Map();
+  for (const table of SOURCE_TABLES) {
+    const ids = rows
+      .filter((r) => r.source_table === table && r.rec_at != null)
+      .map((r) => r.source_id);
+    if (ids.length === 0) continue;
+    const res = await db.from(table).select('id, rec_source_version').in('id', ids);
+    if (res.error) throw new Error(`${table}.rec_source_version: ${res.error.message}`);
+    for (const row of res.data || []) out.set(`${table}:${row.id}`, row.rec_source_version ?? null);
+  }
+  return out;
+}
+
 /**
  * Candidates: Rulings-lane cards with no recommendation, or whose CONTENT has
  * changed since the last one (rec_source_version no longer matches
@@ -292,11 +319,18 @@ export async function loadCandidates(db, limit) {
     .limit(Math.max(limit * 4, limit));
   if (res.error) throw new Error(`v_command_center_queue: ${res.error.message}`);
   const rows = res.data || [];
+  const recVersions = await loadRecVersions(db, rows);
+
   const stale = [];
   for (const r of rows) {
     // rec_at null = never recommended. Otherwise the recommendation is stale
     // only when the card's CONTENT hash moved — rec_* writes never trigger it.
-    const needs = r.rec_at == null || (r.rec_source_version ?? null) !== (r.card_version ?? null);
+    // A card whose version could not be read falls through as stale: doing the
+    // work twice is cheap, silently never refreshing a moved card is not.
+    const seen = recVersions.has(`${r.source_table}:${r.source_id}`)
+      ? recVersions.get(`${r.source_table}:${r.source_id}`)
+      : undefined;
+    const needs = r.rec_at == null || seen !== (r.card_version ?? null);
     if (needs) stale.push(r);
     if (stale.length >= limit) break;
   }
