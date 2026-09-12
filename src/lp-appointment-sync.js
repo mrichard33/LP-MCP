@@ -242,6 +242,14 @@ const LP_INBOUND_ID_FIELD   = '3YMxheIlPyhACB8zyc3W';
 const LP_PROSPECT_ID_FIELD  = 'ZRQAVrzhtzApzLlHmT87';
 
 const LP_SYNC_FAILED_TAG = 'lp-sync-failed';
+// Applied on the defer path (see the unissued-inbound gate below) and read by
+// I.LP-A's exit branch. I.LP-A clears `lp-appt-synced` at entry and checks it
+// after its wait; on a deferred contact that tag is correctly absent, so
+// without this marker I.LP-A would take its fallback and enroll the contact in
+// I.LP-OUT (8e30ff37) — the exact duplicate-AddLead the gate exists to prevent,
+// arriving from the GHL side instead. Cleared by clearSyncFailedTag() once the
+// appointment actually lands in LP.
+const LP_APPT_DEFERRED_TAG = 'lp-appt-deferred';
 
 // GHL custom fields synced FROM LeadPerfection (used by the early
 // idempotency check below).
@@ -1454,6 +1462,15 @@ async function clearSyncFailedTag(contactId) {
   } catch (err) {
     console.warn(`[LP-APPT] ${LP_SYNC_FAILED_TAG} cleanup failed for ${contactId}: ${err.message}`);
   }
+  // Drop the defer hold-tag too. Both call sites are terminal success paths —
+  // the pre-resolve "LP already holds this appt" exit, and the post-resolution
+  // writeback just before SetAppointment — so reaching either means LP now has
+  // (or is about to have) the appointment on a real lead and the hold is over.
+  // Neither is reachable from the deferred path itself, so this can never strip
+  // the tag in the same pass that applies it. Once dropped, I.LP-A's
+  // `lp-appt-deferred` exit branch stops firing and the contact resumes its
+  // normal post-wait flow.
+  await removeGHLTags(contactId, [LP_APPT_DEFERRED_TAG]).catch(() => {});
   await releaseFailureNotices(contactId);
 }
 
@@ -1733,6 +1750,13 @@ async function syncAppointmentToLP({
             `30 minutes for up to ${maxAgeMin} minutes, then escalated.\n` +
             `Appt: ${incomingDateNorm} ${incomingTimeNorm || ''}`
           ).catch(() => {});
+          // Hold marker for I.LP-A's exit branch — without it I.LP-A takes its
+          // fallback and enrolls I.LP-OUT, re-creating the duplicate from the
+          // GHL side. See the LP_APPT_DEFERRED_TAG banner. Best-effort: if the
+          // tag write fails we still defer, because enrolling anyway would
+          // duplicate in LP for certain, whereas I.LP-A's fallback is the
+          // pre-existing behaviour this gate is incrementally replacing.
+          await applyGHLTag(contactId, LP_APPT_DEFERRED_TAG).catch(() => {});
           return {
             success: true,
             action: 'deferred_pending_lp_issuance',
