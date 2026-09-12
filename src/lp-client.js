@@ -194,36 +194,136 @@ export const lpPost = async (endpoint, fields = {}, retries = 3, opts = {}) => {
 
 // ─── Circuit Breaker ─────────────────────────────────────────────
 
+// LP goes slow or 500s routinely — "Execution Timeout Expired" is documented as
+// routine in the capacity sweep. The breaker exists to stop us hammering LP while
+// it is down, NOT to take our own jobs down with it. So it must be able to close
+// itself.
+//
+// It could not, before: once circuitOpen was true, checkCircuit() threw BEFORE the
+// call ran, so recordSuccess() was unreachable and nothing but a process restart
+// cleared the flag (resetCircuit had no production caller). A ten-minute LP blip
+// became a multi-hour outage — most visibly the capacity board's freshness stamp,
+// which only advances on a successful LP fetch, so the board painted DATA STALE
+// until someone happened to deploy.
+//
+// States:  closed --(THRESHOLD consecutive failures)--> open
+//          open   --(cooldown elapsed)---------------->  half_open
+//          half_open --(single probe succeeds)-------->  closed
+//          half_open --(single probe fails)----------->  open, cooldown doubled (capped)
+
 let consecutiveFailures = 0;
 let circuitOpen = false;
-const CIRCUIT_THRESHOLD = 10;
+let circuitOpenedAt = null;
+let circuitCooldownMs = null;      // current cooldown; grows while probes keep failing
+let halfOpenProbeInFlight = false; // only one probe call at a time
 
+const CIRCUIT_THRESHOLD = 10;
+const CIRCUIT_COOLDOWN_MS = Math.max(
+  1000,
+  parseInt(process.env.LP_CIRCUIT_COOLDOWN_MS || '', 10) || 60_000,
+);
+const CIRCUIT_COOLDOWN_MAX_MS = Math.max(
+  CIRCUIT_COOLDOWN_MS,
+  parseInt(process.env.LP_CIRCUIT_COOLDOWN_MAX_MS || '', 10) || 600_000,
+);
+
+function currentCooldownMs() { return circuitCooldownMs ?? CIRCUIT_COOLDOWN_MS; }
+
+function circuitState() {
+  if (!circuitOpen) return 'closed';
+  if (halfOpenProbeInFlight) return 'half_open';
+  if (circuitOpenedAt !== null && Date.now() - circuitOpenedAt >= currentCooldownMs()) return 'half_open';
+  return 'open';
+}
+
+// Returns true when this call is the half-open probe, so withCircuit knows to
+// release the probe slot afterwards. Throws while the breaker is still cooling down.
 function checkCircuit() {
+  if (!circuitOpen) return false;
+
+  if (circuitState() === 'half_open' && !halfOpenProbeInFlight) {
+    halfOpenProbeInFlight = true;
+    console.warn('[LP] Circuit breaker HALF-OPEN — letting one probe call through');
+    return true;
+  }
+
+  const waitMs = Math.max(0, currentCooldownMs() - (Date.now() - (circuitOpenedAt ?? Date.now())));
+  throw new Error(
+    `Circuit breaker OPEN — LP API has failed ${consecutiveFailures} consecutive times. ` +
+    `Retrying in ${Math.ceil(waitMs / 1000)}s.`,
+  );
+}
+
+function recordSuccess() {
   if (circuitOpen) {
-    throw new Error('Circuit breaker OPEN — LP API has failed 10 consecutive times. Sync paused.');
+    console.log('[LP] Circuit breaker CLOSED — LP API is responding again');
+  }
+  consecutiveFailures = 0;
+  circuitOpen = false;
+  circuitOpenedAt = null;
+  circuitCooldownMs = null;
+}
+
+function recordFailure({ wasProbe = false } = {}) {
+  consecutiveFailures++;
+
+  // The half-open probe failed: stay open, but wait longer before the next probe
+  // so a prolonged LP outage does not turn into a steady trickle of doomed calls.
+  if (wasProbe && circuitOpen) {
+    circuitOpenedAt = Date.now();
+    circuitCooldownMs = Math.min(currentCooldownMs() * 2, CIRCUIT_COOLDOWN_MAX_MS);
+    console.warn(`[LP] Circuit half-open probe failed — reopening for ${circuitCooldownMs}ms`);
+    return;
+  }
+
+  if (!circuitOpen && consecutiveFailures >= CIRCUIT_THRESHOLD) {
+    circuitOpen = true;
+    circuitOpenedAt = Date.now();
+    circuitCooldownMs = CIRCUIT_COOLDOWN_MS;
+    console.error(
+      `[LP] Circuit breaker OPEN after ${consecutiveFailures} consecutive failures — ` +
+      `first retry in ${circuitCooldownMs}ms`,
+    );
   }
 }
-function recordSuccess() { consecutiveFailures = 0; circuitOpen = false; }
-function recordFailure() {
-  consecutiveFailures++;
-  if (consecutiveFailures >= CIRCUIT_THRESHOLD) circuitOpen = true;
+
+export function resetCircuit() {
+  consecutiveFailures = 0;
+  circuitOpen = false;
+  circuitOpenedAt = null;
+  circuitCooldownMs = null;
+  halfOpenProbeInFlight = false;
 }
 
-export function resetCircuit() { consecutiveFailures = 0; circuitOpen = false; }
-export function getCircuitStatus() { return { consecutiveFailures, circuitOpen }; }
+export function getCircuitStatus() {
+  const cooldownMs = circuitOpen ? currentCooldownMs() : null;
+  return {
+    consecutiveFailures,
+    circuitOpen, // retained: existing callers (get_sync_health) read this
+    state: circuitState(),
+    openedAt: circuitOpenedAt === null ? null : new Date(circuitOpenedAt).toISOString(),
+    cooldownMs,
+    retryInMs: circuitOpen && circuitOpenedAt !== null
+      ? Math.max(0, cooldownMs - (Date.now() - circuitOpenedAt))
+      : null,
+    threshold: CIRCUIT_THRESHOLD,
+  };
+}
 
 // Wraps an LP call with circuit breaker. Exported so ad-hoc callers
 // (e.g. the lp_api_probe admin tool) share the same breaker instead of
 // bypassing it with raw lpPost calls.
 export async function withCircuit(fn) {
-  checkCircuit();
+  const isProbe = checkCircuit();
   try {
     const result = await fn();
     recordSuccess();
     return result;
   } catch (err) {
-    recordFailure();
+    recordFailure({ wasProbe: isProbe });
     throw err;
+  } finally {
+    if (isProbe) halfOpenProbeInFlight = false;
   }
 }
 
