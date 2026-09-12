@@ -68,9 +68,17 @@
 //     (CAPACITY_SLOTS_ALERT_STREAK, silenced by FRESHNESS_GROUPME_ALERTS_DISABLED).
 //     Before this, the ONLY signal was the red banner on someone's phone.
 //   - /board/capacity reports freshness SPLIT: capacity_swept_at (this date's
-//     denominator) vs appointments_updated_at (the numerator, which the lead
-//     pass keeps current regardless), plus sweep_state ok|failing|broken. The
-//     dashboard uses it to name which half is behind.
+//     denominator) vs appointments_checked_at (the numerator's last healthy
+//     pass), plus sweep_state ok|failing|broken. The dashboard uses it to name
+//     which half is behind.
+//   - NUMERATOR LIVENESS IS A PROPERTY OF THE PASS, NOT THE DATA. The first cut
+//     derived it from max(lp_leads.synced_at) and was wrong within minutes of
+//     deploy: synced_at only moves when a lead CHANGES, so a quiet stretch read
+//     as a dead pipeline and the board reported "broken" — firing the
+//     dashboard's full-screen overlay over correct numbers, which is the very
+//     bug the split was built to remove. appointments_updated_at is still
+//     reported, but as INFORMATION ONLY; appointments_stale comes from
+//     lastLeadSuccessAt, with process uptime covering the never-succeeded case.
 //   - The lead loop pauses PROPORTIONALLY to the cycle it just finished
 //     (CAPACITY_LEAD_DUTY_RATIO, floored at CAPACITY_LEAD_LOOP_PAUSE_MS,
 //     capped at CAPACITY_LEAD_MAX_PAUSE_MS) and yields to an in-flight fast
@@ -732,6 +740,27 @@ let slotsFailStreak = 0;
 // than per-date. Null until the first successful pass of this process, in which
 // case the board falls back to max(swept_at) exactly as before.
 let lastSlotsSuccessAt = null;
+
+// Explicit "the NUMERATOR pipeline last completed a healthy pass" stamp.
+//
+// The first cut of the split-freshness work derived numerator staleness from
+// max(lp_leads.synced_at) for the viewed date, which is WRONG and was caught in
+// production within minutes of deploy: synced_at only moves when a lead's data
+// actually CHANGES, so a quiet stretch is indistinguishable from a dead
+// pipeline. On 2026-09-12 tomorrow's eleven appointments had not changed since
+// the previous evening (a Saturday looking at a Sunday — entirely normal, and
+// the sync engine was demonstrably alive, having written leads table-wide
+// through 14:00 UTC). The board reported sweep_state "broken" anyway, which
+// fires the dashboard's full-screen overlay — blanking the wall over correct
+// numbers, i.e. the exact bug the split was built to remove.
+//
+// Liveness is a property of the PASS, not of the data it happened to find.
+let lastLeadSuccessAt = null;
+// A never-yet-successful lead pass must not read as fresh forever. Null
+// lastLeadSuccessAt is judged against process uptime instead, so a boot reads
+// as "not yet known" (the lead pass takes minutes) while a process that has
+// been up far longer with no successful pass reads as genuinely stale.
+const processStartedAt = Date.now();
 let leadInProgress = false;
 let lastFastSummary = null;
 let lastLeadSummary = null;
@@ -893,8 +922,22 @@ export async function runLeadRefreshPass() {
       console.error('[CapacitySweep] forward market assignment failed:', err.message);
     }
     summary.elapsed_ms = Date.now() - startedAt;
+
+    // Healthy = we actually reached LP and walked the change window. A pass
+    // that threw, or whose paging died mid-walk (page_error — what a latched
+    // circuit breaker produces), has NOT refreshed the numerator and must not
+    // stamp liveness. A near-refresh where every lead failed is the same story.
+    const nearTotal = summary.near_refresh?.leads ?? 0;
+    const nearAllFailed = nearTotal > 0 && (summary.near_refresh?.processed ?? 0) === 0;
+    const leadsHealthy = !summary.leads?.error && !summary.leads?.page_error;
+    const nearHealthy = !summary.near_refresh?.error && !nearAllFailed;
+    summary.numerator_healthy = leadsHealthy && nearHealthy;
+    if (summary.numerator_healthy) {
+      lastLeadSuccessAt = new Date().toISOString();
+    }
+
     lastLeadSummary = summary;
-    console.log(`[CapacitySweep] lead pass done nearRefreshed=${summary.near_refresh?.processed ?? '?'}/${summary.near_refresh?.leads ?? '?'} changeMatched=${summary.leads?.matched ?? '?'} elapsed=${summary.elapsed_ms}ms`);
+    console.log(`[CapacitySweep] lead pass done nearRefreshed=${summary.near_refresh?.processed ?? '?'}/${summary.near_refresh?.leads ?? '?'} changeMatched=${summary.leads?.matched ?? '?'} healthy=${summary.numerator_healthy} elapsed=${summary.elapsed_ms}ms`);
     return summary;
   } finally {
     leadInProgress = false;
@@ -1090,17 +1133,29 @@ export async function buildBoardResponse(date) {
     .filter(Boolean)
     .sort()
     .pop() || null;
+  // INFORMATIONAL ONLY — "when did this date's appointments last change".
+  // Deliberately NOT the staleness input: it only moves on an actual data
+  // change, so a quiet Saturday reads identically to a dead pipeline. Deriving
+  // staleness from it reported "broken" over correct numbers (see the
+  // lastLeadSuccessAt note above).
   const apptsUpdatedAt = numerFreshRows?.[0]?.appointments_updated_at || null;
 
   const ageMs = (ts) => (ts ? Date.now() - new Date(ts).getTime() : null);
   const capacityAge = ageMs(capacitySweptAt);
-  const apptsAge = ageMs(apptsUpdatedAt);
 
   const capacityStale = capacityAge === null || capacityAge > STALE_AFTER_MS;
-  // The numerator gets a longer leash: it only moves when a disposition
-  // actually changes, so a quiet hour is not a fault. Absent data (no
-  // appointments at all for this date) is not staleness either.
-  const apptsStale = apptsAge !== null && apptsAge > STALE_AFTER_MS * 2;
+
+  // Numerator liveness is a property of the PASS. The lead pass is slow by
+  // design (tens of minutes per cycle, duty-cycled off LP), so it gets a much
+  // longer leash than the 5-minute denominator sweep.
+  const apptsCheckedAt = lastLeadSuccessAt;
+  const apptsLeash = STALE_AFTER_MS * 4;
+  const apptsAge = ageMs(apptsCheckedAt);
+  const apptsStale = apptsAge === null
+    // No successful pass yet this process: unknown, not stale, until the
+    // process has been up long enough that one should plainly have landed.
+    ? Date.now() - processStartedAt > apptsLeash
+    : apptsAge > apptsLeash;
 
   // 'broken' is reserved for the case where the board genuinely cannot be
   // trusted; 'failing' means the sweep is erroring but the last good numbers
@@ -1120,7 +1175,10 @@ export async function buildBoardResponse(date) {
     stale_after_ms: STALE_AFTER_MS,
     // Split freshness (2026-09-12). See the two runSQL reads above.
     capacity_swept_at: capacitySweptAt,
+    // last CHANGE to this date's appointments (informational)
     appointments_updated_at: apptsUpdatedAt,
+    // last healthy numerator PASS (the staleness input)
+    appointments_checked_at: apptsCheckedAt,
     capacity_stale: capacityStale,
     appointments_stale: apptsStale,
     sweep_fail_streak: slotsFailStreak,
@@ -1163,6 +1221,8 @@ export function registerCapacityBoardRoutes(app) {
       slots_delete_min_ratio: SLOTS_DELETE_MIN_RATIO,
       slots_alert_streak: SLOTS_ALERT_STREAK,
       slots_last_success_at: lastSlotsSuccessAt,
+      lead_last_success_at: lastLeadSuccessAt,
+      process_started_at: new Date(processStartedAt).toISOString(),
       slots_incident_announced: slotsIncidentAnnounced,
       // The breaker sits in front of every LP call this sweep makes, so its
       // state belongs in the same diagnostic. A latched-open breaker was the

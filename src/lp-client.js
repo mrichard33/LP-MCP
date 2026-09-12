@@ -216,6 +216,7 @@ let circuitOpen = false;
 let circuitOpenedAt = null;
 let circuitCooldownMs = null;      // current cooldown; grows while probes keep failing
 let halfOpenProbeInFlight = false; // only one probe call at a time
+let halfOpenProbeStartedAt = null; // when that probe was granted (watchdog)
 
 const CIRCUIT_THRESHOLD = 10;
 const CIRCUIT_COOLDOWN_MS = Math.max(
@@ -226,12 +227,46 @@ const CIRCUIT_COOLDOWN_MAX_MS = Math.max(
   CIRCUIT_COOLDOWN_MS,
   parseInt(process.env.LP_CIRCUIT_COOLDOWN_MAX_MS || '', 10) || 600_000,
 );
+// A granted probe holds the only slot until it settles. lpPost carries its own
+// 120s timeout x 3 retries (~360s), and a promise that never settles at all
+// would hold the slot FOREVER — which is the latch bug again through a
+// different door, and this repo has already learned that lesson once (see
+// CAPACITY_FAST_WATCHDOG_MS in jobs/capacity-sweep.js: "a never-settling LP
+// promise used to wedge this lock permanently").
+//
+// Observed live on 2026-09-12 at 16:14 UTC: state half_open, retryInMs 0,
+// openedAt and consecutiveFailures frozen across a minute while every caller
+// was refused — a hung probe sitting on the slot. So the slot gets a watchdog.
+const CIRCUIT_PROBE_TIMEOUT_MS = Math.max(
+  1000,
+  parseInt(process.env.LP_CIRCUIT_PROBE_TIMEOUT_MS || '', 10) || 180_000,
+);
 
 function currentCooldownMs() { return circuitCooldownMs ?? CIRCUIT_COOLDOWN_MS; }
 
+/**
+ * True while a probe legitimately holds the slot. Reclaims an abandoned one:
+ * without this a single hung LP call blocks recovery indefinitely.
+ */
+function probeSlotHeld() {
+  if (!halfOpenProbeInFlight) return false;
+  if (halfOpenProbeStartedAt !== null && Date.now() - halfOpenProbeStartedAt > CIRCUIT_PROBE_TIMEOUT_MS) {
+    console.warn(
+      `[LP] Circuit half-open probe abandoned after ${Date.now() - halfOpenProbeStartedAt}ms — releasing the probe slot`,
+    );
+    halfOpenProbeInFlight = false;
+    halfOpenProbeStartedAt = null;
+    return false;
+  }
+  return true;
+}
+
+// Reports the breaker's PHASE. Deliberately independent of whether the probe
+// slot is currently occupied — conflating the two is what made the stuck-slot
+// state above unreadable from outside (it showed 'half_open' with retryInMs 0
+// while nothing could actually get through).
 function circuitState() {
   if (!circuitOpen) return 'closed';
-  if (halfOpenProbeInFlight) return 'half_open';
   if (circuitOpenedAt !== null && Date.now() - circuitOpenedAt >= currentCooldownMs()) return 'half_open';
   return 'open';
 }
@@ -241,8 +276,9 @@ function circuitState() {
 function checkCircuit() {
   if (!circuitOpen) return false;
 
-  if (circuitState() === 'half_open' && !halfOpenProbeInFlight) {
+  if (circuitState() === 'half_open' && !probeSlotHeld()) {
     halfOpenProbeInFlight = true;
+    halfOpenProbeStartedAt = Date.now();
     console.warn('[LP] Circuit breaker HALF-OPEN — letting one probe call through');
     return true;
   }
@@ -262,6 +298,8 @@ function recordSuccess() {
   circuitOpen = false;
   circuitOpenedAt = null;
   circuitCooldownMs = null;
+  halfOpenProbeInFlight = false;
+  halfOpenProbeStartedAt = null;
 }
 
 function recordFailure({ wasProbe = false } = {}) {
@@ -293,6 +331,7 @@ export function resetCircuit() {
   circuitOpenedAt = null;
   circuitCooldownMs = null;
   halfOpenProbeInFlight = false;
+  halfOpenProbeStartedAt = null;
 }
 
 export function getCircuitStatus() {
@@ -301,6 +340,11 @@ export function getCircuitStatus() {
     consecutiveFailures,
     circuitOpen, // retained: existing callers (get_sync_health) read this
     state: circuitState(),
+    // The stuck-slot state was invisible without these: 'half_open' with
+    // retryInMs 0 looked identical whether a probe was available or wedged.
+    probeInFlight: halfOpenProbeInFlight,
+    probeStartedAt: halfOpenProbeStartedAt === null ? null : new Date(halfOpenProbeStartedAt).toISOString(),
+    probeTimeoutMs: CIRCUIT_PROBE_TIMEOUT_MS,
     openedAt: circuitOpenedAt === null ? null : new Date(circuitOpenedAt).toISOString(),
     cooldownMs,
     retryInMs: circuitOpen && circuitOpenedAt !== null
@@ -315,6 +359,10 @@ export function getCircuitStatus() {
 // bypassing it with raw lpPost calls.
 export async function withCircuit(fn) {
   const isProbe = checkCircuit();
+  // Identity for the slot we were granted. A probe the watchdog already
+  // abandoned must not release the slot of the probe that replaced it when it
+  // finally settles — that would allow two concurrent probes.
+  const myProbeAt = isProbe ? halfOpenProbeStartedAt : null;
   try {
     const result = await fn();
     recordSuccess();
@@ -323,7 +371,10 @@ export async function withCircuit(fn) {
     recordFailure({ wasProbe: isProbe });
     throw err;
   } finally {
-    if (isProbe) halfOpenProbeInFlight = false;
+    if (isProbe && halfOpenProbeStartedAt === myProbeAt) {
+      halfOpenProbeInFlight = false;
+      halfOpenProbeStartedAt = null;
+    }
   }
 }
 
