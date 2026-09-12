@@ -164,6 +164,35 @@ export const NAMESPACE_FALLBACK_VALUES = {
   'active-entry:': 'active-entry:other',
 };
 
+// 2026-09-12 (zOtz91P604CVWP47DIJx) — MUTUALLY EXCLUSIVE FLAT TAGS.
+//
+// The intent temperature tags carry no ':' separator, so the prefix mechanism
+// above cannot express them: 'intent-' as a prefix would ALSO capture the
+// unrelated 'intent-bucket:*' reporting namespace, and evicting a lead's
+// reporting bucket every time their temperature changed would be a worse bug
+// than the one this fixes.
+//
+// Evidence: that contact accumulated intent-imminent (22:40:48), intent-spike
+// (22:41:01) and intent-warm (22:45:30) simultaneously. LAYER3_DISPATCH removes
+// 'intent-cold' by hand when it sets 'intent-warm', but nothing clears a higher
+// rung, so the ladder stacked instead of moving.
+//
+// intent-spike is deliberately NOT a member: it marks a transient hot window
+// (INTENT_SPIKE_HOT_WINDOW), not a rung on the ladder, and must survive a
+// temperature change.
+//
+// Each set is mutually exclusive: adding any member removes the others. A tag
+// may appear in at most one set.
+export const EXCLUSIVE_TAG_SETS = [
+  ['intent-cold', 'intent-warm', 'intent-imminent'],
+];
+
+/** The other members of `tag`'s exclusive set, or [] when it belongs to none. */
+export function exclusiveSetSiblings(tag) {
+  const set = EXCLUSIVE_TAG_SETS.find((members) => members.includes(tag));
+  return set ? set.filter((t) => t !== tag) : [];
+}
+
 export async function executeAddTag(action, context = {}) {
   const contactId = action.target_id;
   const tag = normalizeTag(action.action_payload?.tag);
@@ -251,6 +280,18 @@ export async function executeAddTag(action, context = {}) {
     removedConflicting = currentTags.filter((t) => t.startsWith(namespace) && t !== tag);
   }
 
+  // Flat mutually-exclusive sets (see EXCLUSIVE_TAG_SETS). Membership is exact,
+  // never by prefix, so a set never reaches into a neighbouring namespace.
+  if (currentTags) {
+    const siblings = exclusiveSetSiblings(tag);
+    if (siblings.length > 0) {
+      const present = currentTags.filter((t) => siblings.includes(t));
+      for (const t of present) {
+        if (!removedConflicting.includes(t)) removedConflicting.push(t);
+      }
+    }
+  }
+
   // No-op-on-present: tag already there and nothing to clean up → zero writes
   // (GHL would coalesce a duplicate POST anyway; this saves the call).
   const alreadyPresent = currentTags ? currentTags.includes(tag) : false;
@@ -269,7 +310,7 @@ export async function executeAddTag(action, context = {}) {
     try {
       await ghlFetch('DELETE', `/contacts/${contactId}/tags`, { tags: removedConflicting });
       console.log(
-        `[ActionExecutor] namespace exclusivity enforced: contact=${contactId} ns=${namespace} removed=[${removedConflicting.join(',')}] adding=${tag}`
+        `[ActionExecutor] exclusivity enforced: contact=${contactId} ns=${namespace || 'exclusive-set'} removed=[${removedConflicting.join(',')}] adding=${tag}`
       );
       if (currentTags) {
         currentTags = currentTags.filter((t) => !removedConflicting.includes(t));
