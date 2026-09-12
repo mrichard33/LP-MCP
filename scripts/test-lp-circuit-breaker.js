@@ -30,6 +30,7 @@ import assert from 'node:assert/strict';
 
 const THRESHOLD = 10;   // CIRCUIT_THRESHOLD in src/lp-client.js
 const CEILING_MS = 2000; // must match LP_CIRCUIT_COOLDOWN_MAX_MS below
+const PROBE_TIMEOUT_MS = 1500; // must match LP_CIRCUIT_PROBE_TIMEOUT_MS below
 
 let withCircuit, resetCircuit, getCircuitStatus;
 const savedEnv = {};
@@ -39,6 +40,7 @@ const savedEnv = {};
 const ENV = {
   LP_CIRCUIT_COOLDOWN_MS: '1',      // clamped to 1000 floor; see note in the reopen test
   LP_CIRCUIT_COOLDOWN_MAX_MS: '2000', // one doubling off the 1000ms floor, so case 8 stays fast
+  LP_CIRCUIT_PROBE_TIMEOUT_MS: '1500', // short enough to exercise the slot watchdog
   LP_API_BASE_URL: 'https://lp.invalid',
   LP_APP_KEY: 'test', LP_CLIENT_ID: '1', LP_USERNAME: 'u', LP_PASSWORD: 'p',
   SUPABASE_URL: 'https://supabase.invalid', SUPABASE_SERVICE_ROLE_KEY: 'test',
@@ -179,4 +181,114 @@ test('case 10: getCircuitStatus keeps circuitOpen for existing callers', async (
   assert.ok('circuitOpen' in closed && 'consecutiveFailures' in closed);
   await openBreaker();
   assert.equal(getCircuitStatus().circuitOpen, true);
+});
+
+// ─── The probe slot ───────────────────────────────────────────────────────
+//
+// Only one probe may be in flight, or a recovering LP gets a thundering herd.
+// But the slot must never be held indefinitely: lpPost carries its own 120s
+// timeout x 3 retries (~360s), and a promise that never settles would hold the
+// slot forever — the latch bug again through a different door.
+//
+// This was observed live on 2026-09-12 at 16:14 UTC, on the very deploy that
+// fixed the original latch: state half_open, retryInMs 0, openedAt and
+// consecutiveFailures frozen across a minute while every caller was refused.
+// A hung probe was sitting on the slot.
+
+/** A call that never settles — the shape that wedges the slot. */
+const hang = () => new Promise(() => {});
+
+test('case 11: only one probe is admitted at a time', async () => {
+  await openBreaker();
+  await new Promise((r) => setTimeout(r, getCircuitStatus().cooldownMs + 50));
+
+  // First caller gets the slot and holds it (never settles).
+  const held = withCircuit(hang);
+  assert.equal(getCircuitStatus().probeInFlight, true);
+
+  // A second caller must be refused rather than piling onto a sick LP.
+  await assert.rejects(() => withCircuit(ok), /Circuit breaker OPEN/);
+  void held;
+});
+
+test('case 12: THE REGRESSION — a wedged probe does not hold the slot forever', async () => {
+  await openBreaker();
+  await new Promise((r) => setTimeout(r, getCircuitStatus().cooldownMs + 50));
+
+  const held = withCircuit(hang); // never settles
+  assert.equal(getCircuitStatus().probeInFlight, true);
+
+  // Past the probe watchdog, the slot is reclaimed and recovery resumes.
+  await new Promise((r) => setTimeout(r, PROBE_TIMEOUT_MS + 100));
+  assert.equal(await withCircuit(ok), 'payload', 'the abandoned probe blocked recovery — this is the latch bug again');
+  assert.equal(getCircuitStatus().state, 'closed');
+  void held;
+});
+
+test('case 13: an abandoned probe settling late cannot release a newer probe slot', async () => {
+  await openBreaker();
+  await new Promise((r) => setTimeout(r, getCircuitStatus().cooldownMs + 50));
+
+  // Grant a probe, then let the watchdog abandon it.
+  let release;
+  const slow = withCircuit(() => new Promise((_, rej) => { release = rej; }));
+  const firstProbeAt = getCircuitStatus().probeStartedAt;
+  await new Promise((r) => setTimeout(r, PROBE_TIMEOUT_MS + 100));
+
+  // A replacement probe takes the slot.
+  const second = withCircuit(hang);
+  const secondProbeAt = getCircuitStatus().probeStartedAt;
+  assert.notEqual(secondProbeAt, firstProbeAt, 'the replacement probe should own a fresh slot');
+
+  // The abandoned one now settles. It must NOT free the slot it no longer owns.
+  release(new Error('late failure'));
+  await slow.catch(() => {});
+  assert.equal(getCircuitStatus().probeInFlight, true, 'a late straggler freed a live probe slot — two probes could now run');
+  assert.equal(getCircuitStatus().probeStartedAt, secondProbeAt);
+  void second;
+});
+
+test('case 14: state reports the PHASE, not whether the slot happens to be free', async () => {
+  await openBreaker();
+  await new Promise((r) => setTimeout(r, getCircuitStatus().cooldownMs + 50));
+  const held = withCircuit(hang);
+  const s = getCircuitStatus();
+  // Conflating these is what made the live stuck-slot state unreadable.
+  assert.equal(s.state, 'half_open');
+  assert.equal(s.probeInFlight, true);
+  assert.ok(s.probeStartedAt, 'probeStartedAt must be reported so a wedged slot is diagnosable');
+  void held;
+});
+
+test('case 15: a successful probe leaves no slot behind', async () => {
+  await openBreaker();
+  await new Promise((r) => setTimeout(r, getCircuitStatus().cooldownMs + 50));
+  await withCircuit(ok);
+  const s = getCircuitStatus();
+  assert.equal(s.state, 'closed');
+  assert.equal(s.probeInFlight, false);
+  assert.equal(s.probeStartedAt, null);
+});
+
+test('case 16: a failed probe leaves no slot behind either', async () => {
+  await openBreaker();
+  await new Promise((r) => setTimeout(r, getCircuitStatus().cooldownMs + 50));
+  await assert.rejects(() => withCircuit(fail));
+  const s = getCircuitStatus();
+  assert.equal(s.circuitOpen, true);
+  assert.equal(s.probeInFlight, false, 'a failed probe must free the slot immediately, not wait for the watchdog');
+  assert.equal(s.probeStartedAt, null);
+});
+
+test('case 17: resetCircuit clears a wedged probe slot', async () => {
+  await openBreaker();
+  await new Promise((r) => setTimeout(r, getCircuitStatus().cooldownMs + 50));
+  const held = withCircuit(hang);
+  assert.equal(getCircuitStatus().probeInFlight, true);
+  resetCircuit();
+  const s = getCircuitStatus();
+  assert.equal(s.probeInFlight, false);
+  assert.equal(s.probeStartedAt, null);
+  assert.equal(await withCircuit(ok), 'payload');
+  void held;
 });
