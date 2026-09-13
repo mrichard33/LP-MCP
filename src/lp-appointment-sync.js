@@ -181,6 +181,45 @@ import {
 // live LP read so a degraded LP fails in ~12s instead of riding the
 // 120s × 3-retry sync budget (~360s+) and blowing the 180s tool ceiling.
 const FAST = { fast: true };
+
+/**
+ * Hard response budget for POST /webhook/ghl/set-lp-appointment.
+ *
+ * GoHighLevel hangs up at 60s and does NOT retry this webhook, so a slow
+ * request is recorded by Railway as a 499 and by the intake journal as an
+ * unfinished row — while the work itself completes. Measured over 72h to
+ * 2026-09-13: 161 requests, 41 client timeouts (25%), p90 46.5s, max 58.4s.
+ *
+ * The cause is not LP. It is the shared GHL limiter: a 429 pauses ALL GHL
+ * traffic for 300s (escalating to 900s) and every waiter then burns its full
+ * 30s fail-open. Two of those in one request is 60s.
+ *
+ * So we stop WAITING on the work rather than stop DOING it. Under budget the
+ * response is byte-for-byte what it always was; over budget the caller gets a
+ * 202 and the same promise keeps running under trackBackground, which the
+ * graceful-shutdown drain waits for. Mirrors bookingBudgetMs() in
+ * src/appointments/booking-endpoint.js.
+ */
+const DEFAULT_APPT_SYNC_BUDGET_MS = 8000;
+export function apptSyncBudgetMs() {
+  const raw = parseInt(process.env.APPT_SYNC_BUDGET_MS || '', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_APPT_SYNC_BUDGET_MS;
+}
+
+/**
+ * Resolve to the work's result if it settles within `budgetMs`, else to the
+ * sentinel { __deferred: true } while the work carries on untouched.
+ *
+ * Deliberately does NOT abort the work — the work is what currently succeeds.
+ * Only the waiting stops.
+ */
+export function raceBudget(promise, budgetMs) {
+  let timer;
+  const deadline = new Promise((resolve) => {
+    timer = setTimeout(() => resolve({ __deferred: true }), budgetMs);
+  });
+  return Promise.race([promise, deadline]).finally(() => clearTimeout(timer));
+}
 import {
   getGHLContact,
   updateGHLContactFields,
@@ -209,6 +248,7 @@ import { emitEvent } from './event-emitter.js';
 import { lpStoredAgeMinutes } from './lp-dates.js';
 import { LP_EMP } from './lp-source-ids.js';
 import { buildLpAppointmentCard } from './services/appointment-card.js';
+import { trackBackground } from './graceful-shutdown.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY;
 // GHL_LOCATION_ID removed 2026-07-28: its only consumer was the locationId
@@ -1656,11 +1696,25 @@ async function syncAppointmentToLP({
   const incomingTimeNorm = parseApptTime(appointmentTime);
   if (await lpAlreadyHasAppointment(contactId, incomingDateNorm, incomingTimeNorm)) {
     console.log(`[LP-APPT] ⏭️ LP already holds appt on ${incomingDateNorm} for ${contactId} (per GHL LP-synced fields) — skipping resolver + SetAppointment`);
-    await applyGHLTag(contactId, 'lp-appt-synced').catch(() => {});
-    await clearSyncFailedTag(contactId); // clear any prior false failure
-    await addGHLNote(contactId,
-      `[LP SYNC] Appointment already present in LP on ${incomingDateNorm} (field-set / SalesRabbit origin) — agentic sync skipped, no duplicate set.`
-    ).catch(() => {});
+    // BOOKKEEPING ONLY — a tag, a tag-clear and a note. Nothing downstream
+    // reads them synchronously, every one is idempotent, and the decision has
+    // already been made above. So they run AFTER the response, not inside it.
+    //
+    // WHY THIS MATTERS: essentially ALL production traffic takes this branch
+    // (30h of logs, zero SetAppointment calls). These four GHL calls
+    // (applyGHLTag + 2 tag DELETEs in clearSyncFailedTag + note GET/POST) each
+    // block on the shared limiter, which on a GHL 429 pauses every request for
+    // 300s and lets each waiter time out at the full 30s fail-open. Two such
+    // waits is 60s — exactly GHL's client timeout, which is why this route was
+    // logging 499s at ~60s while its work completed fine.
+    // trackBackground keeps the graceful-shutdown drain waiting for them.
+    trackBackground((async () => {
+      await applyGHLTag(contactId, 'lp-appt-synced').catch(() => {});
+      await clearSyncFailedTag(contactId); // clear any prior false failure
+      await addGHLNote(contactId,
+        `[LP SYNC] Appointment already present in LP on ${incomingDateNorm} (field-set / SalesRabbit origin) — agentic sync skipped, no duplicate set.`
+      ).catch(() => {});
+    })().catch((e) => console.warn(`[LP-APPT] deferred bookkeeping failed for ${contactId}: ${e.message}`)));
     return {
       success: true,
       action: 'already_in_lp_skipped_pre_resolve',
@@ -1945,12 +1999,16 @@ async function syncAppointmentToLP({
 
   const calendarLineGhlNote    = calendarName ? `\nCalendar: ${calendarName}` : '';
 
-  await addGHLNote(contactId,
+  // Deferred: the note is pure narration and costs two GHL calls (dedup GET +
+  // POST). writeApptSyncMark and applyApptSyncedTag above stay SYNCHRONOUS on
+  // purpose — the mark is the duplicate guard and the tag is the signal I.LP-A
+  // gates its fallback on, so neither may lag the response.
+  trackBackground(addGHLNote(contactId,
     `[LP SYNC v5.1.10] Appointment set\nLP Lead: ${ldsId} (via ${source}, step ${step})\nProspect: ${prospectId || 'N/A'}\n` +
     (lpSourceLine ? `Source: ${lpSourceLine}\n` : '') +
     `Date: ${apptDate} ${apptTime}` +
     calendarLineGhlNote
-  ).catch(() => {});
+  ).catch(() => {}));
 
   // 2026-08-27: ONE shared builder with the agentic path in
   // actions/handlers/lp-appointment.js (services/appointment-card.js). The two
@@ -1959,7 +2017,9 @@ async function syncAppointmentToLP({
   // printed "NONE" for a missing prospect. It also now carries Market, the
   // address and the email — all of which this function already had in hand and
   // none of which reached the card.
-  await sendGroupMeMessage(
+  // Deferred for the same reason: the card builder itself awaits resolveMarket
+  // (a Supabase read) before GroupMe's own dedup read and POST.
+  trackBackground((async () => sendGroupMeMessage(
     await buildLpAppointmentCard({
       contactId,
       name: contactName || undefined,
@@ -1975,7 +2035,7 @@ async function syncAppointmentToLP({
       calendarName,
       narrative: `Appointment written to Lead Perfection for LP lead ${ldsId}. The LP-side team works it from here.`,
     })
-  ).catch(() => {});
+  ))().catch(() => {}));
 
   console.log(`[LP-APPT] ✅ Done: lds_id=${ldsId}, ${apptDate} ${apptTime}`);
   return {
@@ -2338,12 +2398,33 @@ export function registerLPAppointmentSyncRoutes(app) {
         }
       }
 
-      const result = await syncAppointmentToLP({
+      // The work runs to completion either way; only the WAIT is bounded.
+      const work = syncAppointmentToLP({
         contactId, contactPhone, contactEmail, contactName,
         address1, city, state, postalCode,
         prospectId, inboundId, ghlLeadIdField,
         appointmentDate, appointmentTime, calendarName,
       });
+
+      const budgetMs = apptSyncBudgetMs();
+      const result = await raceBudget(work, budgetMs);
+
+      if (result && result.__deferred) {
+        // Over budget. Hand the still-running promise to the drain and ack, so
+        // GHL never sits past its 60s ceiling waiting on a limiter pause.
+        // p50 is ~3.4s, so in normal operation this branch is not taken and the
+        // full response body below is unchanged.
+        trackBackground(work.catch((e) =>
+          console.error(`[LP-APPT] deferred sync failed for ${contactId}: ${e.message}`)));
+        console.warn(`[LP-APPT] ⏱️ over ${budgetMs}ms budget for ${contactId} — 202, work continues in background`);
+        return res.status(202).json({
+          accepted: true,
+          action: 'lp_appointment_sync_deferred',
+          contact_id: contactId,
+          budget_ms: budgetMs,
+          elapsed_ms: Date.now() - startTime,
+        });
+      }
 
       result.elapsed_ms = Date.now() - startTime;
       res.json(result);
