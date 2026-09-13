@@ -28,12 +28,18 @@
  * observability layer that can drop a lead is worse than no observability
  * layer, so a lead is never blocked, and never delayed past 1.5s, by this file.
  *
- * ONE ALERT, NOT A STREAM
- * ───────────────────────
+ * ONE ALERT PER INCIDENT, NOT A STREAM AND NOT A ONE-SHOT
+ * ───────────────────────────────────────────────────────
  * The sweeper routes through the existing edge-triggered alert state
- * (src/alert-state.js). alert_key='intake_journal:unfinished' fires ONCE when
- * the count goes above zero and stays silent while it persists — never one
- * message per orphaned row, never a repeat while firing. Mark's standing rule.
+ * (src/alert-state.js), using its SET-valued API: one condition key per
+ * orphaned row under the prefix 'intake_journal:unfinished:'. Each sweep
+ * claims the whole set and announces ONE card naming only the rows that have
+ * never been announced. Already-announced rows stay silent for as long as they
+ * sit in the backlog; new ones still get a card. Never one message per row,
+ * never a repeat for the same row. Mark's standing rule.
+ *
+ * This replaced a single-key version that could only ever fire once — see the
+ * ALERT_PREFIX comment below for why that was a real defect, not a nicety.
  *
  * MODES (INTAKE_JOURNAL_MODE)
  * ───────────────────────────
@@ -45,11 +51,33 @@
 
 import supabase from './supabase.js';
 import { sendGroupMeMessage } from './groupme.js';
-import { reportAlertCondition } from './alert-state.js';
+import { claimAlertConditionSet, confirmAlertSend } from './alert-state.js';
 import { trackBackground, isShuttingDown } from './graceful-shutdown.js';
 
 const TABLE = 'intake_journal';
-const ALERT_KEY = 'intake_journal:unfinished';
+
+/**
+ * Alert-key namespace. ONE KEY PER ORPHANED ROW, not one key for the condition.
+ *
+ * v1.1 (2026-09-13) — the original used a single key whose `active` was
+ * `orphans > 0`. That was wrong in a way the 24h shadow soak proved:
+ * orphan rows are kept for 90 days, so the count NEVER returns to zero once
+ * anything lands in it. A single edge-triggered key would therefore fire once,
+ * then stay 'firing' forever — and reportAlertCondition is deliberately silent
+ * while firing, so no later incident could ever be announced. One alert, then
+ * permanent deafness.
+ *
+ * Measured on the real soak: 30 unfinished rows accrued over 48h and the count
+ * never once fell to 0. Going live on the old logic would have sent exactly one
+ * card — reading "30 lead requests started and never finished", which also
+ * badly overstated it (all 26 appointment rows had completed their work; only
+ * the HTTP ack was lost) — and then nothing, ever again.
+ *
+ * So each orphan row is its own condition, and claimAlertConditionSet hands
+ * back only the rows never announced before. One card per sweep naming ONLY
+ * what is new; silence when nothing is new; a fresh card when more appear.
+ */
+const ALERT_PREFIX = 'intake_journal:unfinished:';
 
 /** off | shadow | live. Anything unrecognized reads as shadow — the safe mode. */
 export function journalMode() {
@@ -323,23 +351,71 @@ export async function sweepIntakeJournal({ client: clientArg, send = sendGroupMe
     return { orphans, failures: failureCount, routes, oldest, action: 'shadow' };
   }
 
-  const res = await reportAlertCondition({
-    key: ALERT_KEY,
-    active: orphans > 0,
-    label: 'Intake journal — unfinished lead requests',
-    text: () =>
-      `🚨 SYSTEM — ${orphans} lead request(s) started and never finished.\n`
-      + `Routes: ${routes.join(', ')}\n`
-      + `Oldest: ${oldest}\n`
-      + `Failures (24h): ${failureCount}\n`
-      + `Payloads saved in intake_journal — re-submit by hand from the stored body.`,
-    detail: `orphans=${orphans} routes=[${routes.join(',')}] oldest=${oldest}`,
-    notifyRecovery: true,
-    send,
+  // LIVE. Claim the whole orphan set at once; the claim returns only the rows
+  // that have never been announced. Everything already announced stays silent
+  // however long it sits in the backlog, and a genuinely new orphan still gets
+  // a card — which is the property the single-key version could not provide.
+  const claim = await claimAlertConditionSet({
+    prefix: ALERT_PREFIX,
+    activeKeys: orphanRows.map((r) => `${ALERT_PREFIX}${r.id}`),
+    label: 'Intake journal — unfinished lead request',
+    detail: `routes=[${routes.join(',')}] oldest=${oldest}`,
+    client,
+    nowMs: now,
   });
 
-  console.log(summary);
-  return { orphans, failures: failureCount, routes, oldest, action: res.action };
+  // ok:false is "I could not tell" — the claim layer degraded. Announce
+  // nothing rather than risk a duplicate or a bogus card.
+  if (!claim.ok) {
+    console.warn(`[IntakeJournal] alert claim unavailable (${claim.reason}) — not alerting this sweep`);
+    return { orphans, failures: failureCount, routes, oldest, action: 'claim_failed' };
+  }
+
+  if (claim.newlyFiring.length === 0) {
+    console.log(`${summary} [no new unfinished requests — silent]`);
+    return { orphans, failures: failureCount, routes, oldest, action: 'silent', newly: 0 };
+  }
+
+  // Name only what is new. The backlog total rides along as context so the
+  // card is honest about scale without implying all of it just happened.
+  const newIds = new Set(claim.newlyFiring.map((k) => k.slice(ALERT_PREFIX.length)));
+  const newRows = orphanRows.filter((r) => newIds.has(String(r.id)));
+  const newRoutes = [...new Set(newRows.map((r) => r.route))].sort();
+  const newOldest = newRows.length ? newRows[0].received_at : oldest;
+
+  const text =
+    `🚨 SYSTEM — ${newRows.length} new lead request(s) started and never finished.\n`
+    + `Routes: ${newRoutes.join(', ')}\n`
+    + `Oldest of these: ${newOldest}\n`
+    + `Unfinished backlog: ${orphans} total | failures (24h): ${failureCount}\n`
+    + `Payloads saved in intake_journal — the request did not complete, but check\n`
+    + `whether the work landed anyway before treating these as lost.`;
+
+  let sent = false;
+  try {
+    const r = await send(text, { noDedup: true });
+    sent = r?.sent !== false;
+  } catch (err) {
+    console.error(`[IntakeJournal] alert send failed: ${err.message}`);
+  }
+
+  if (sent) {
+    await confirmAlertSend(claim.newlyFiring, { client, nowMs: now });
+  } else {
+    // The claim already marked these announced, so without this they would
+    // never be retried — a silently swallowed page. Release them so the next
+    // sweep re-claims and tries again: bounded at one attempt per sweep, the
+    // same posture alert-state.js takes when a send fails mid-transition.
+    await Promise.resolve(
+      client.from('alert_conditions').delete().in('alert_key', claim.newlyFiring),
+    ).catch((err) => console.warn(`[IntakeJournal] claim release failed: ${err.message}`));
+  }
+
+  console.log(`${summary} [alerted on ${newRows.length} new]`);
+  return {
+    orphans, failures: failureCount, routes, oldest,
+    action: sent ? 'fired' : 'send_failed', newly: newRows.length,
+  };
 }
 
 /**
