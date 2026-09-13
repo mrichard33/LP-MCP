@@ -46,6 +46,7 @@ import {
   getNoteToken, refreshNoteToken, invalidateNoteToken, hasNoteIdentity,
 } from './token-manager.js';
 import { LP_EMP } from './lp-source-ids.js';
+import { inspectAppointmentResponse, assertAppointmentAccepted } from './lp-appointment-guards.js';
 
 const LP_BASE = () => (process.env.LP_API_BASE_URL || '').replace(/\/+$/, '');
 
@@ -763,6 +764,36 @@ export async function setAppointment({ ldsId, setBy = LP_EMP.GHL_INTEGRATION, ap
   // Check for LP error response
   if (result?.error) {
     throw new Error(`LP SetAppointment error: ${result.error} (message: ${result.message || 'none'})`);
+  }
+
+  // ── LP SILENT REFUSAL GUARD ──────────────────────────────────────────
+  // LP answers a refusal with HTTP 200 and { Result: 1, Message: "market is
+  // OOA.  " }. `result.error` is never populated, so the check above passes and
+  // the caller then writes its dedup mark and applies `lp-appt-synced` — which
+  // self-locks that contact for LP_APPT_DEDUP_WINDOW_MIN (24h) against an
+  // appointment LP never accepted. Incident 2026-08-26, contact
+  // q5GehRye7DNkN6jlmjl3. src/lp-appointment-guards.js was written for exactly
+  // this and shipped unwired; this is the wiring.
+  //
+  // SHADOW BY DEFAULT. LP_APPT_REFUSAL_MARKERS matches broad substrings
+  // ('invalid', 'cannot', 'error', 'already has'), and no real SetAppointment
+  // reply was observable in 30h of production logs to validate them against —
+  // every request took the already-in-LP early exit. Shadow mode produces that
+  // evidence without risking a false refusal. Flip to enforce once the logged
+  // verdicts are clean.
+  const guardMode = String(process.env.LP_APPT_GUARD_MODE || 'shadow').toLowerCase().trim();
+  if (guardMode !== 'off') {
+    const verdict = inspectAppointmentResponse(result);
+    if (!verdict.accepted) {
+      if (guardMode === 'enforce') {
+        assertAppointmentAccepted(result, { ldsId, apptDate, apptTime });
+      }
+      console.warn(
+        `[LP] ⚠️ SetAppointment REFUSAL detected (shadow — NOT enforced): lds_id=${ldsId}, ` +
+        `reason=${verdict.reason}, Result=${verdict.resultCode}, Message="${verdict.message}". ` +
+        `Under LP_APPT_GUARD_MODE=enforce this would throw and the contact would NOT be marked synced.`
+      );
+    }
   }
 
   console.log(`[LP] SetAppointment SUCCESS: lds_id=${ldsId}, response: ${JSON.stringify(result).slice(0, 200)}`);
