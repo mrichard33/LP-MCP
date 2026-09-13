@@ -71,6 +71,12 @@ function parseFilters(u) {
   return out;
 }
 
+/** `in.(a,b,c)` — PostgREST's list form, used by the set-valued alert API. */
+function parseInList(val) {
+  return String(val).replace(/^\(|\)$/g, '').split(',')
+    .map((s) => s.trim().replace(/^"|"$/g, ''));
+}
+
 function matches(row, filters) {
   return filters.every(([col, op, val]) => {
     const cur = row[col];
@@ -81,6 +87,11 @@ function matches(row, filters) {
       case 'gt': return String(cur) > val;
       case 'lte': return String(cur) <= val;
       case 'gte': return String(cur) >= val;
+      case 'in': return parseInList(val).includes(String(cur));
+      // `like` is only ever used as a prefix scan, and claimAlertConditionSet
+      // re-filters exactly in JS afterwards, so returning everything here is
+      // faithful to how the real query behaves for our key shapes.
+      case 'like': return true;
       default: return true;
     }
   });
@@ -96,6 +107,14 @@ function handleAlertConditions(method, u, body) {
 
   if (method === 'POST') {
     const rows = Array.isArray(body) ? body : [body];
+    // An upsert carries ?on_conflict=... . With ignoreDuplicates that is
+    // ON CONFLICT DO NOTHING, so PostgREST returns ONLY the rows it actually
+    // inserted — which is exactly what makes "announce only the new ones" work.
+    if (u.searchParams.has('on_conflict')) {
+      const inserted = rows.filter((r) => !alertRows.has(r.alert_key));
+      for (const r of inserted) alertRows.set(r.alert_key, { ...r });
+      return res(inserted);
+    }
     for (const r of rows) {
       // The PRIMARY KEY collision is the whole serialization mechanism.
       if (alertRows.has(r.alert_key)) {
@@ -397,49 +416,100 @@ test('an oversized body is replaced by a marker, not stored whole', () => {
 
 const orphan = (id, route, received_at) => ({ id, route, received_at });
 
-test('live mode fires ONE alert for 3 orphans, stays silent while they persist, and clears at 0', async () => {
+test('live mode fires ONE card for 3 orphans and stays silent while they persist', async () => {
   reset();
   process.env.INTAKE_JOURNAL_MODE = 'live';
   const send = async (text) => { sent.push(text); return { sent: true }; };
 
-  const three = [
+  journalSelect.received = [
     orphan(1, '/webhook/lp', '2026-09-11T10:00:00.000Z'),
     orphan(2, '/webhooks/canvassing-lead', '2026-09-11T10:02:00.000Z'),
     orphan(3, '/webhook/lp', '2026-09-11T10:05:00.000Z'),
   ];
-  journalSelect.received = three;
 
-  // Sweep 1 — the firing edge.
   const s1 = await sweepIntakeJournal({ send });
   assert.equal(s1.orphans, 3);
+  assert.equal(s1.newly, 3);
   assert.equal(s1.action, 'fired');
   assert.equal(sent.length, 1, 'exactly one card, never one per row');
-  assert.match(sent[0], /3 lead request\(s\) started and never finished/);
+  assert.match(sent[0], /3 new lead request\(s\) started and never finished/);
   assert.match(sent[0], /\/webhook\/lp/);
   assert.match(sent[0], /\/webhooks\/canvassing-lead/);
-  assert.match(sent[0], /2026-09-11T10:00:00\.000Z/, 'must name the oldest');
+  assert.match(sent[0], /2026-09-11T10:00:00\.000Z/, 'must name the oldest of the new ones');
   assert.match(sent[0], /payloads saved in intake_journal/i);
 
-  // Sweep 2 — same 3 orphans. Must say nothing at all.
-  const s2 = await sweepIntakeJournal({ send });
-  assert.equal(s2.action, 'silent');
-  assert.equal(sent.length, 1, 'a persisting condition must NOT re-announce');
+  // The same 3, sweep after sweep. Must say nothing at all.
+  for (let i = 0; i < 3; i++) {
+    const s = await sweepIntakeJournal({ send });
+    assert.equal(s.action, 'silent', 'a persisting backlog must NOT re-announce');
+    assert.equal(s.newly, 0);
+  }
+  assert.equal(sent.length, 1, 'still exactly one card after repeated sweeps');
+});
 
-  // Sweep 3 — still the same. Still silent.
+// ── THE REGRESSION THIS FIX EXISTS FOR ──────────────────────────────
+// The v1.0 single-key version fired once and then went permanently deaf,
+// because orphan rows are kept 90 days so the count never returns to zero.
+// The 48h soak accrued 30 rows and never once hit 0.
+test('a NEW orphan still alerts even though the old ones never resolved', async () => {
+  reset();
+  process.env.INTAKE_JOURNAL_MODE = 'live';
+  const send = async (text) => { sent.push(text); return { sent: true }; };
+
+  journalSelect.received = [
+    orphan(1, '/webhook/lp', '2026-09-11T10:00:00.000Z'),
+    orphan(2, '/webhook/lp', '2026-09-11T10:02:00.000Z'),
+  ];
   await sweepIntakeJournal({ send });
   assert.equal(sent.length, 1);
 
-  // Sweep 4 — resolved.
-  journalSelect.received = [];
-  const s4 = await sweepIntakeJournal({ send });
-  assert.equal(s4.orphans, 0);
-  assert.equal(s4.action, 'recovered');
-  assert.equal(sent.length, 2, 'one recovery card');
-  assert.match(sent[1], /RECOVERED/);
+  // Backlog persists — nothing resolved — and two NEW ones appear.
+  journalSelect.received = [
+    orphan(1, '/webhook/lp', '2026-09-11T10:00:00.000Z'),
+    orphan(2, '/webhook/lp', '2026-09-11T10:02:00.000Z'),
+    orphan(3, '/webhook/ghl/set-lp-appointment', '2026-09-11T11:00:00.000Z'),
+    orphan(4, '/webhook/ghl/set-lp-appointment', '2026-09-11T11:04:00.000Z'),
+  ];
 
-  // Sweep 5 — still clean. No second recovery card.
-  await sweepIntakeJournal({ send });
-  assert.equal(sent.length, 2, 'a second healthy sweep must be a no-op');
+  const s = await sweepIntakeJournal({ send });
+  assert.equal(s.action, 'fired', 'new orphans MUST still alert — v1.0 went deaf here');
+  assert.equal(s.newly, 2);
+  assert.equal(s.orphans, 4);
+  assert.equal(sent.length, 2);
+
+  // The card names ONLY the new ones, and carries the backlog as context.
+  assert.match(sent[1], /2 new lead request\(s\)/);
+  assert.match(sent[1], /set-lp-appointment/);
+  assert.doesNotMatch(sent[1], /Routes: .*\/webhook\/lp/, 'must not re-list the old routes');
+  assert.match(sent[1], /Unfinished backlog: 4 total/);
+
+  // And it goes quiet again once those are announced.
+  const after = await sweepIntakeJournal({ send });
+  assert.equal(after.action, 'silent');
+  assert.equal(sent.length, 2);
+});
+
+test('a failed send is retried on the next sweep, not swallowed', async () => {
+  reset();
+  process.env.INTAKE_JOURNAL_MODE = 'live';
+  let failNext = true;
+  const send = async (text) => {
+    if (failNext) { failNext = false; throw new Error('groupme down'); }
+    sent.push(text);
+    return { sent: true };
+  };
+
+  journalSelect.received = [orphan(1, '/webhook/lp', '2026-09-11T10:00:00.000Z')];
+
+  const s1 = await sweepIntakeJournal({ send });
+  assert.equal(s1.action, 'send_failed');
+  assert.equal(sent.length, 0);
+
+  // The claim must have been released, so the next sweep announces it.
+  const s2 = await sweepIntakeJournal({ send });
+  assert.equal(s2.action, 'fired', 'a swallowed page is the failure this guards against');
+  assert.equal(sent.length, 1);
+  assert.match(sent[0], /1 new lead request/);
 });
 
 test('shadow mode never sends, however many orphans there are', async () => {
@@ -473,8 +543,15 @@ test('a failed read reports nothing and never clears a live alert', async () => 
   const s = await sweepIntakeJournal({ send });
   assert.equal(s.action, 'read_failed');
   assert.equal(sent.length, 1, 'must not send a false recovery card');
-  assert.equal(alertRows.get('intake_journal:unfinished').state, 'firing',
+  assert.equal(alertRows.get('intake_journal:unfinished:1').state, 'firing',
     'the live incident must stay firing');
+
+  // And when the read recovers with the same single orphan, still silent —
+  // a read blip must not manufacture a second card for the same row.
+  delete failTable.intake_journal;
+  const back = await sweepIntakeJournal({ send });
+  assert.equal(back.action, 'silent');
+  assert.equal(sent.length, 1);
 });
 
 test('off mode skips the sweep entirely', async () => {
