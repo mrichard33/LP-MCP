@@ -82,6 +82,7 @@
 
 import { hlRunSQL, esc } from '../admin/hl-client.js';
 import { emitEvent } from '../event-emitter.js';
+import { withGhlToken } from '../ghl-rate-limiter.js';
 
 const TARGET_TAG = 'suppress-automation';
 const GHL_API_KEY = process.env.GHL_API_KEY;
@@ -203,7 +204,7 @@ function buildCohortSql({ cohort, limit, minAgeHours, appointmentHorizonDays }) 
 async function ghlFetch(url, init, label) {
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     try {
-      const res = await fetch(url, { ...init, signal: AbortSignal.timeout(10000) });
+      const res = await withGhlToken(() => fetch(url, { ...init, signal: AbortSignal.timeout(10000) }));
       if (res.ok || !RETRY_STATUSES.has(res.status)) return res;
       if (attempt === MAX_ATTEMPTS) {
         console.warn(`[SuppressBackfill] ${label} gave up after ${MAX_ATTEMPTS} attempts: ${res.status}`);

@@ -7,6 +7,7 @@
  */
 
 import { getToken } from './token-manager.js';
+import { withGhlToken } from './ghl-rate-limiter.js';
 
 const LP_API_BASE = process.env.LP_API_BASE_URL || 'https://api.leadperfection.com';
 const GHL_API_KEY = process.env.GHL_API_KEY;
@@ -16,6 +17,7 @@ const GHL_LOCATION_ID = 'SsBG7j5KQAIP1SFP2Sca';
 
 async function lpPost(path, params, token) {
   const body = new URLSearchParams(params).toString();
+  // rate-limiter-exempt: Lead Perfection API, not GHL.
   const res = await fetch(`${LP_API_BASE}${path}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Authorization': `Bearer ${token}` },
@@ -32,7 +34,7 @@ async function ghlRequest(method, url, body) {
     signal: AbortSignal.timeout(30000),
   };
   if (body) opts.body = JSON.stringify(body);
-  const res = await fetch(url, opts);
+  const res = await withGhlToken(() => fetch(url, opts));
   return res.json();
 }
 

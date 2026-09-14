@@ -90,6 +90,7 @@
 import { getToken } from './token-manager.js';
 import { normalizePhone, getField, extractArray } from './sync-utils.js';
 import { latestJobValue } from './lp-job-value.js';
+import { withGhlToken } from './ghl-rate-limiter.js';
 
 const LP_API_BASE = process.env.LP_API_BASE_URL || 'https://api.leadperfection.com';
 const GHL_API_KEY = process.env.GHL_API_KEY;
@@ -98,6 +99,7 @@ const GHL_API_KEY = process.env.GHL_API_KEY;
 
 async function lpPost(path, params, token) {
   const body = new URLSearchParams(params).toString();
+  // rate-limiter-exempt: Lead Perfection API, not GHL.
   const res = await fetch(`${LP_API_BASE}${path}`, {
     method: 'POST',
     headers: {
@@ -111,14 +113,14 @@ async function lpPost(path, params, token) {
 }
 
 async function ghlGet(contactId) {
-  const res = await fetch(`https://services.leadconnectorhq.com/contacts/${contactId}`, {
+  const res = await withGhlToken(() => fetch(`https://services.leadconnectorhq.com/contacts/${contactId}`, {
     headers: {
       'Authorization': `Bearer ${GHL_API_KEY}`,
       'Version': '2021-07-28',
       'Accept': 'application/json',
     },
     signal: AbortSignal.timeout(30000),
-  });
+  }));
   return res.json();
 }
 
@@ -134,7 +136,7 @@ async function ghlGet(contactId) {
  * duplicate tags).
  */
 async function ghlPostTags(contactId, tags) {
-  const res = await fetch(`https://services.leadconnectorhq.com/contacts/${contactId}/tags`, {
+  const res = await withGhlToken(() => fetch(`https://services.leadconnectorhq.com/contacts/${contactId}/tags`, {
     method: 'POST',
     headers: {
       'Authorization': `Bearer ${GHL_API_KEY}`,
@@ -144,7 +146,7 @@ async function ghlPostTags(contactId, tags) {
     },
     body: JSON.stringify({ tags }),
     signal: AbortSignal.timeout(15000),
-  });
+  }));
   return { ok: res.ok, status: res.status };
 }
 

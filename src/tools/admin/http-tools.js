@@ -237,12 +237,21 @@ export function registerHttpTools(server) {
           payload = body;
         }
 
-        // Fire with timeout
+        // Fire with timeout.
+        //
+        // Deliberately NOT routed through withGhlToken (2026-09-14). This is a
+        // generic operator-driven HTTP tool — the URL is whatever the caller
+        // typed, it fires once per human request, and it is the tool you reach
+        // for when you need to probe GHL *while* the limiter is paused. Putting
+        // it behind the bucket would make the debugging tool unavailable
+        // exactly when it is needed. Every SERVICE-generated GHL call is
+        // governed; see src/ghl-rate-limiter.js withGhlToken.
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), timeout);
         const started = Date.now();
         let res;
         try {
+          // rate-limiter-exempt: operator-driven generic HTTP tool; must stay usable while the bucket is paused.
           res = await fetch(finalUrl, { method: m, headers: hdrs, body: payload, signal: controller.signal });
         } finally {
           clearTimeout(timer);

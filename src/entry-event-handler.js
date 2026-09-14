@@ -67,6 +67,7 @@ import { emitEvent } from './event-emitter.js';
 import { executeAddTag } from './actions/handlers/tags.js';
 import { resolveEntryFromSourceMap, entryTagSuffix } from './entry-source-map.js';
 import { isSuppressed, matchedSuppressionTags } from './suppression-guard.js';
+import { withGhlToken } from './ghl-rate-limiter.js';
 
 // Routing fix Step 2 — map-driven entry resolution. Default OFF so a merge is
 // a no-op; flipped to 'true' on Railway `dev` only after deploy. When OFF, both
@@ -234,14 +235,14 @@ async function fetchContactRaw(contactId) {
   if (!GHL_API_KEY) {
     throw new Error('GHL_API_KEY env var not configured');
   }
-  const res = await fetch(`https://services.leadconnectorhq.com/contacts/${contactId}`, {
+  const res = await withGhlToken(() => fetch(`https://services.leadconnectorhq.com/contacts/${contactId}`, {
     headers: {
       'Authorization': `Bearer ${GHL_API_KEY}`,
       'Version': '2021-07-28',
       'Accept': 'application/json',
     },
     signal: AbortSignal.timeout(10000),
-  });
+  }));
   if (!res.ok) {
     const text = await res.text().catch(() => '');
     throw new Error(`GHL GET /contacts/${contactId} returned ${res.status}: ${text.slice(0, 200)}`);

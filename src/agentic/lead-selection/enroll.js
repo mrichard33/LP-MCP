@@ -207,6 +207,7 @@ export async function enrollTopN({ limit = DEFAULT_ENROLL_LIMIT, dryRun = false 
           `🔁 S1.3 Stale Lead Revival — enrollment run (Route B)\n` +
           `Enrolled ${enrolled} · skipped ${skipped} · errors ${errors} (of ${candidates.length} scanned)\n` +
           `Segments → ${segLine}`;
+        // rate-limiter-exempt: GroupMe API, not GHL.
         await fetch('https://api.groupme.com/v3/bots/post', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },

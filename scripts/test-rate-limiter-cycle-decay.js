@@ -61,13 +61,15 @@ const evaluateDecay = () => acquireToken({ maxWaitMs: 250 });
 
 const cycles = () => getRateLimiterStats().consecutive429Cycles;
 
-test('five 429s pin currentPauseMs at the 15-minute MAX_PAUSE_MS ceiling', () => {
+test('five 429s pin currentPauseMs at the 3-minute MAX_PAUSE_MS ceiling', () => {
   resetCycles();
   for (let i = 0; i < 5; i++) report429();
 
   const stats = getRateLimiterStats();
   assert.equal(stats.consecutive429Cycles, 5);
-  assert.equal(stats.currentPauseMs, 900000, 'pinned at MAX_PAUSE_MS');
+  // v1.4 (2026-09-14): 300000/900000 → 60000/180000. Still a three-step ramp,
+  // so five 429s still pin it; the ceiling is now 3 minutes, not 15.
+  assert.equal(stats.currentPauseMs, 180000, 'pinned at MAX_PAUSE_MS');
   assert.equal(stats.paused, true);
   // v1.3 stats surface — what /n8n/rate-limiter/stats must now expose.
   assert.equal(stats.cycleDecayMs, DECAY_MS, 'env 200 clamped up to the 60s floor');
@@ -123,7 +125,7 @@ test('resetCycles() clears a pinned counter and lifts a stuck pause', () => {
   const stats = getRateLimiterStats();
   assert.equal(stats.consecutive429Cycles, 0);
   assert.equal(stats.paused, false);
-  assert.equal(stats.currentPauseMs, 300000, 'back to the BASE_PAUSE_MS floor');
+  assert.equal(stats.currentPauseMs, 60000, 'back to the BASE_PAUSE_MS floor');
 });
 
 test('regression: a pinned counter now reaches 0 on its own within 5 windows', async () => {

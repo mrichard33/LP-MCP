@@ -252,7 +252,7 @@
 
 import supabase from './supabase.js';
 import { sendGroupMeMessage } from './groupme.js';
-import { acquireToken, report429 } from './ghl-rate-limiter.js';
+import { acquireToken, report429, withGhlToken } from './ghl-rate-limiter.js';
 import { generateResponse, getReplySenderAllowlist, isRandyName } from './response-generator.js';
 // v3.18 — Bot Review Phase 0. Both are detached, fire-and-forget, never awaited.
 import { recordMessageContextDetached, markSentDetached } from './bot-feedback/fingerprint.js';
@@ -402,14 +402,17 @@ export function resolveEmailSender({ inboundTo = null, originatorUserId = null }
 async function fetchContactTags(contactId) {
   if (!contactId || !GHL_API_KEY) return null;
   try {
-    const res = await fetch(`https://services.leadconnectorhq.com/contacts/${contactId}`, {
+    // 2026-09-14: this read was the one GHL call in this module that held no
+    // token and reported no 429 — the other three all did. An ungoverned reader
+    // is how the bucket stays full while GHL throttles us (see withGhlToken).
+    const res = await withGhlToken(() => fetch(`https://services.leadconnectorhq.com/contacts/${contactId}`, {
       headers: {
         'Authorization': `Bearer ${GHL_API_KEY}`,
         'Version': '2021-07-28',
         'Accept': 'application/json',
       },
       signal: AbortSignal.timeout(10000),
-    });
+    }));
     if (!res.ok) return null;
     const data = await res.json();
     return data?.contact?.tags || [];
@@ -1317,6 +1320,7 @@ async function sendViaWebhook(contactId, message, channel, subject, action) {
     `threadOriginatorUserId=${threadOriginatorUserId || 'null'} ` +
     `(source=${replyFromAddress ? 'most_recent_inbound' : 'none'})`);
 
+  // rate-limiter-exempt: GHL INBOUND webhook (env-configured), not the rate-limited v2 API.
   const res = await fetch(GHL_SEND_MESSAGE_WEBHOOK_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

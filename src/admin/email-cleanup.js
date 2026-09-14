@@ -27,13 +27,12 @@
 
 import supabase from '../supabase.js';
 import { scoreEmail } from '../email-scorer.js';
-import { acquireToken } from '../ghl-rate-limiter.js';
+import { withGhlToken } from '../ghl-rate-limiter.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY;
 
 async function ghlFetch(method, path, body = null) {
   if (!GHL_API_KEY) throw new Error('GHL_API_KEY not configured');
-  await acquireToken();
   const url = `https://services.leadconnectorhq.com${path}`;
   const opts = {
     method,
@@ -46,7 +45,10 @@ async function ghlFetch(method, path, body = null) {
     signal: AbortSignal.timeout(15000),
   };
   if (body) opts.body = JSON.stringify(body);
-  const res = await fetch(url, opts);
+  // 2026-09-14: was acquireToken() + a bare fetch, which held a token but
+  // never called report429() — this module's throttling was invisible to the
+  // limiter. withGhlToken does both halves.
+  const res = await withGhlToken(() => fetch(url, opts));
   if (!res.ok) {
     const text = await res.text().catch(() => '');
     throw new Error(`GHL ${method} ${path} → ${res.status}: ${text.slice(0, 200)}`);

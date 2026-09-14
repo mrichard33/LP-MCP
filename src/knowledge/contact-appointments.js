@@ -29,6 +29,7 @@
 
 import { CALENDAR_MAP } from '../actions/constants.js';
 import { lpWallClockToGhlStartTime } from '../appointment-dates.js';
+import { withGhlToken } from '../ghl-rate-limiter.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY || '';
 const FETCH_TIMEOUT_MS = 8000;
@@ -157,7 +158,7 @@ async function fetchContactAppointments(contactId, { pastHours = 0 } = {}) {
   if (!contactId || !GHL_API_KEY) return null;
 
   try {
-    const res = await fetch(
+    const res = await withGhlToken(() => fetch(
       `https://services.leadconnectorhq.com/contacts/${contactId}/appointments`,
       {
         method: 'GET',
@@ -168,7 +169,7 @@ async function fetchContactAppointments(contactId, { pastHours = 0 } = {}) {
         },
         signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
       }
-    );
+    ));
 
     if (!res.ok) {
       const text = await res.text().catch(() => '');
@@ -249,7 +250,7 @@ async function fetchContactAppointments(contactId, { pastHours = 0 } = {}) {
 export async function hasPriorCompletedAppointment(contactId, calendarId) {
   if (!contactId || !calendarId || !GHL_API_KEY) return false;
   try {
-    const res = await fetch(
+    const res = await withGhlToken(() => fetch(
       `https://services.leadconnectorhq.com/contacts/${contactId}/appointments`,
       {
         method: 'GET',
@@ -260,7 +261,7 @@ export async function hasPriorCompletedAppointment(contactId, calendarId) {
         },
         signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
       }
-    );
+    ));
     if (!res.ok) return false;
     const data = await res.json();
     const events = Array.isArray(data?.events)

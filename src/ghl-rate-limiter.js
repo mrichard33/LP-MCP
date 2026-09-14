@@ -1,17 +1,27 @@
 /**
  * GHL Rate Limiter — src/ghl-rate-limiter.js
  *
- * Token bucket rate limiter shared by ALL GHL API consumers in the LP MCP:
+ * Token bucket rate limiter shared by ALL GHL API consumers in the LP MCP.
+ * Entry points, in order of how much traffic they carry:
+ *   - withGhlToken(fn)      — wraps a raw fetch at its call site (v1.4)
+ *   - acquireToken()/report429() — the manual pair, for clients that need to
+ *     inspect the response themselves (src/actions/helpers.js ghlFetch,
+ *     src/send-message-handler.js, src/actions/approval-path.js)
  *   - src/ghl.js (axios — sync engine)
- *   - src/action-executor.js (native fetch — action executor)
+ *
+ * EVERY call reaching services.leadconnectorhq.com's v2 API must go through one
+ * of those. scripts/test-ghl-rate-limiter-coverage.js enforces that as a test:
+ * a new raw fetch() in a module that talks to GHL either joins the bucket or
+ * carries a `// rate-limiter-exempt: <reason>` comment saying why it does not.
  *
  * Design:
  *   - Bucket capacity: 40 tokens (conservative under GHL's ~100/min limit)
  *   - Refill rate: 40 tokens per minute (~1 every 1.5 seconds)
  *   - Single global drainer interval (no per-caller intervals)
- *   - Hard timeout on each wait — fail-open after 30s rather than hang
- *   - On 429: drain bucket + pause ALL requests for 5 MINUTES
- *   - Exponential backoff on consecutive 429s: 5min → 10min → 15min (cap)
+ *   - Hard timeout on each wait — fail-open after 30s rather than hang, or
+ *     after GHL_RATE_PAUSE_WAIT_MS (5s) when the bucket is PAUSED
+ *   - On 429: drain bucket + pause ALL requests for 60 SECONDS
+ *   - Exponential backoff on consecutive 429s: 1min → 2min → 3min (cap)
  *   - Singleton: one instance shared across the entire process
  *
  * Headroom (env-driven, default 40):
@@ -19,10 +29,34 @@
  *   GHL_RATE_REFILL_PER_MIN  — refill rate (tokens/min)
  *   Ramp conservatively: 40 → 50 first, watch /n8n/rate-limiter/stats and keep
  *   total429s and timedOut at 0; hold ~15–30 min, then optionally 50 → 60. Stop
- *   the instant total429s rises — a 429 triggers a 5-min full pause (escalating
- *   to 15), far costlier than the throughput gained. Do not exceed ~60–70
+ *   the instant total429s rises — a 429 triggers a 60s full pause (escalating
+ *   to 3 min), costlier than the throughput gained. Do not exceed ~60–70
  *   without confirming GHL's per-location sustained limit, which is SHARED with
  *   the HL MCP (both servers draw on the same budget).
+ *
+ * v1.4 — 2026-09-14 — Coverage + pause economics (GHL 60s client timeouts)
+ *   Two defects, one symptom. POST /webhook/ghl/set-lp-appointment was being
+ *   hung up on by GoHighLevel at its own 60s client timeout — 41 of 161
+ *   requests over 72h, invisible to every error metric because a 499 is not a
+ *   5xx (PR #921 worked the latency around; this is the cause).
+ *
+ *   (a) COVERAGE. ~40 GHL call sites across 22 files called fetch() directly
+ *   and never entered the bucket; n8n-helpers.js's ghlRequest did not even
+ *   DETECT a 429. That is why every pause log read `tokens=50, paused=true`:
+ *   the bucket was FULL at the moment of the pause, because the callers
+ *   holding tokens were not the ones driving GHL over its limit. The limiter
+ *   was throttling the well-behaved half on behalf of load it could not see.
+ *   withGhlToken() below closes that, one line per call site.
+ *
+ *   (b) PAUSE ECONOMICS. processQueue() is gated on !isPaused(), so during a
+ *   pause NOTHING is dequeued by token — every waiter is guaranteed to reach
+ *   the fail-open timeout, which resolves it WITHOUT a token, and it calls GHL
+ *   anyway. The pause never reduced load on GHL; it only added 30s to every
+ *   call, and 6-10 sequential calls is 60s. Paused waits are now capped at
+ *   GHL_RATE_PAUSE_WAIT_MS (5s), and the pause itself cut 5min → 60s with the
+ *   ceiling 15min → 3min, matching HL-MCP (same GHL budget, same conclusion —
+ *   see its v1.2). The ordinary empty-bucket wait is UNCHANGED at 30s: that
+ *   queue can drain by token, so waiting in it is productive.
  *
  * v1.3 — 2026-08-02 — Cycle decay + admin reset (47-hour agentic outage)
  *   consecutive429Cycles had no reset path in practice: reportSuccess() was
@@ -92,8 +126,42 @@
 const BUCKET_CAPACITY = Math.max(1, parseInt(process.env.GHL_RATE_CAPACITY || '40', 10));
 const REFILL_RATE = Math.max(1, parseInt(process.env.GHL_RATE_REFILL_PER_MIN || '40', 10));  // tokens per minute
 const REFILL_INTERVAL_MS = (60 * 1000) / REFILL_RATE;  // ~1500ms per token at 40/min
-const BASE_PAUSE_MS = 300000;    // 5 minutes base pause
-const MAX_PAUSE_MS = 900000;     // 15 minutes maximum pause
+// v1.4 — 2026-09-14 — PAUSE ECONOMICS.
+//
+// The 5-minute pause was doing none of the backing-off it was written for, at
+// full cost. processQueue() is gated on !isPaused(), so during a pause NOTHING
+// is dequeued by token; the only exit is acquireToken's fail-open timeout,
+// which resolves the caller WITHOUT a token and the caller then calls GHL
+// anyway. So a pause never reduced load on GHL — it only added the full wait
+// to every call. Measured 2026-09-13/14: 3 separate 429s produced hundreds of
+// 30s stalls, and a route making 6-10 sequential GHL calls blew past
+// GoHighLevel's own 60s client timeout (see PR #921).
+//
+// Both knobs are env-tunable so this is reversible without a deploy.
+const BASE_PAUSE_MS = Math.max(
+  5000,
+  parseInt(process.env.GHL_RATE_PAUSE_MS || '60000', 10)
+);
+// 180s, not the old 900s. The ceiling has to move with the base or the shape of
+// the escalation changes: 300s base + 900s ceiling was a THREE-step ramp, but
+// 60s base + 900s ceiling would be a FIFTEEN-step one, and would still end in a
+// 15-minute blackout. 60/180 keeps the three steps and caps the worst case at
+// three minutes — and is exactly what HL-MCP settled on (its v1.2, after the
+// same 5-minute pause caused a 47-hour agentic outage). The two services share
+// one GHL budget, so they should not disagree about how hard to brake.
+const MAX_PAUSE_MS = Math.max(
+  BASE_PAUSE_MS,
+  parseInt(process.env.GHL_RATE_MAX_PAUSE_MS || '180000', 10)
+);
+
+// How long a waiter blocks while the bucket is PAUSED, as opposed to merely
+// empty. Kept far below WAIT_TIMEOUT_MS: the wait cannot prevent the call (we
+// fail open either way), so a long one buys nothing and costs everything. A
+// short one still spaces repeat callers out across the pause window.
+const PAUSE_WAIT_MS = Math.max(
+  250,
+  parseInt(process.env.GHL_RATE_PAUSE_WAIT_MS || '5000', 10)
+);
 
 // v1.2 — hard timeout on each waiter. Fail-open if the drainer somehow
 // stops firing. Downstream ghlFetch has its own 15s AbortSignal timeout,
@@ -227,9 +295,17 @@ export function acquireToken(opts = {}) {
   refill();
   decayCycles();
 
-  const maxWaitMs = Number.isFinite(opts.maxWaitMs)
+  const requested = Number.isFinite(opts.maxWaitMs)
     ? Math.max(250, Math.min(opts.maxWaitMs, WAIT_TIMEOUT_MS))
     : WAIT_TIMEOUT_MS;
+
+  // While PAUSED the queue cannot drain by token at all, so the waiter is
+  // guaranteed to reach its timeout and fail open. Capping it at PAUSE_WAIT_MS
+  // makes that inevitable outcome arrive in ~5s instead of ~30s. A request
+  // making N sequential GHL calls inside a pause window therefore costs
+  // N x 5s rather than N x 30s — the difference between finishing and being
+  // hung up on by GoHighLevel at 60s.
+  const maxWaitMs = isPaused() ? Math.min(requested, PAUSE_WAIT_MS) : requested;
 
   // Fast path: token available, not paused. No queue, no waiting.
   if (!isPaused() && tokens > 0) {
@@ -300,6 +376,36 @@ export function report429() {
     `Queue depth: ${waitQueue.length}. Total 429s: ${stats.total429s}. ` +
     `Consecutive cycles: ${consecutive429Cycles}`
   );
+}
+
+/**
+ * Govern a RAW GHL fetch that would otherwise bypass this bucket entirely.
+ *
+ * WHY THIS EXISTS (2026-09-14). Roughly half of LP-MCP's GHL traffic never
+ * touched this limiter: ~40 call sites across 22 files called fetch() directly,
+ * and n8n-helpers.js's ghlRequest did not even DETECT a 429. The governed
+ * callers were therefore throttled and paused on behalf of load they were not
+ * generating — which is exactly why every pause log reads `tokens=50,
+ * paused=true`: the bucket is FULL because the callers holding tokens are not
+ * the ones driving GHL over its limit.
+ *
+ * Deliberately a wrapper rather than a replacement client. Each call site keeps
+ * its own headers, timeout, status handling and error semantics — the diff is
+ * one line — so this cannot quietly change how any existing caller behaves:
+ *
+ *   const res = await withGhlToken(() => fetch(url, opts));
+ *
+ * @param {Function} fn   zero-arg thunk performing the fetch
+ * @param {Object} [opts] forwarded to acquireToken (e.g. { maxWaitMs })
+ * @returns whatever fn returns, untouched
+ */
+export async function withGhlToken(fn, opts = {}) {
+  await acquireToken(opts);
+  const res = await fn();
+  // Response-shaped results report their own throttle. Anything else passes
+  // through silently — this must never throw on an unexpected return value.
+  if (res && typeof res === 'object' && res.status === 429) report429();
+  return res;
 }
 
 /**
@@ -383,6 +489,12 @@ export function getRateLimiterStats() {
     currentPauseMs: Math.min(BASE_PAUSE_MS * Math.max(consecutive429Cycles, 1), MAX_PAUSE_MS),
     drainerActive: drainerHandle !== null,
     waitTimeoutMs: WAIT_TIMEOUT_MS,
+    // v1.4 — surfaced so /n8n/rate-limiter/stats shows the pause economics
+    // actually in force. These are env-tunable; reading them from a log line
+    // is how you confirm a live tuning change took effect.
+    basePauseMs: BASE_PAUSE_MS,
+    maxPauseMs: MAX_PAUSE_MS,
+    pauseWaitMs: PAUSE_WAIT_MS,
     cycleDecayMs: CYCLE_DECAY_MS,
     last429At: last429At || null,
     msSinceLast429: last429At ? Date.now() - last429At : null,
