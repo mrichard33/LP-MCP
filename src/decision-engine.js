@@ -577,7 +577,12 @@ async function hasDuplicatePendingActions(ruleKey, targetId) {
 // ═══════════════════════════════════════════════════════════════════
 
 async function isNewestLeadForContact(event) {
-  if (event.event_type !== 'lp.disposition_changed') return true;
+  // 2026-09-14 (WO-4a): lp.appointment_rescheduled is guarded too. NOTE there
+  // are TWO type checks for this guard — this one and the caller's in
+  // processSingleEventInner. Widening only the caller leaves this early return
+  // waving everything through, which reads exactly like a working guard.
+  if (event.event_type !== 'lp.disposition_changed'
+      && event.event_type !== 'lp.appointment_rescheduled') return true;
 
   const lpLeadId = event.entity_id || event.lp_lead_id;
   const ghlContactId = event.ghl_contact_id;
@@ -2196,7 +2201,15 @@ async function processSingleEventInner(event) {
     return { event_id: event.id, matched_rules: 0, actions_created: 0, routed_to: 'message_analyzer' };
   }
 
-  if (event.event_type === 'lp.disposition_changed') {
+  // 2026-09-14 (WO-4a): lp.appointment_rescheduled joins the newest-lead guard.
+  // It carries the same (lp_lead_id, ghl_contact_id) pair and drives the same
+  // sync_lp_appointment_to_ghl action, so an event from a superseded lead would
+  // push a dead appointment into GHL exactly as a stale disposition event would.
+  // The guard is opt-in by event type — a new type added without this line is
+  // silently exempt. Canary: prospect 230117 holds four lead rows on contact
+  // 3a3rAaHxnICmykJKGDt1 and only 575494 is live.
+  if (event.event_type === 'lp.disposition_changed'
+      || event.event_type === 'lp.appointment_rescheduled') {
     if (!(await isNewestLeadForContact(event))) {
       await supabase.from('system_events').update({
         processed: true, processed_by: 'decision_engine',
