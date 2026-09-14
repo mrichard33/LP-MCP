@@ -400,6 +400,25 @@ export async function runMemoryNightly({ dry_run = false, deps = {} } = {}) {
     result.digest = await runWeeklyDigest({ dry_run, mode, now, deps: { runSQL: sql, postGroupMe: post, env } });
   } catch (err) { result.errors.push(`digest: ${err.message}`); }
 
+  // 9.5 Omi catch-up (sql/112). A full pass, unbounded by the 15-minute tick's
+  //     page cap, so anything the scheduler missed — a restart, a Railway
+  //     redeploy, an Omi outage, a run that spent its request budget — is picked
+  //     up overnight rather than waiting for someone to notice a gap.
+  //
+  //     BEFORE the recommend step, deliberately: rows pulled here are candidates
+  //     for tonight's recommendations, and a catch-up that ran after would leave
+  //     every new Omi card unrecommended until tomorrow.
+  try {
+    const { runOmiPull, getPullMode } = await import('./omi-pull.js');
+    if (getPullMode(env) === 'off') {
+      result.omi_pull = { mode: 'off', skipped: true };
+    } else {
+      const r = await (deps.omiPull || runOmiPull)({ dry_run, deps: { env } });
+      result.omi_pull = { mode: r.mode, steps: r.steps, ok: r.ok };
+      for (const e of r.errors || []) result.errors.push(`omi_pull ${e}`);
+    }
+  } catch (err) { result.errors.push(`omi_pull: ${err.message}`); }
+
   // 10. Command Center recommendations (sql/102). Last on purpose: it is the
   //     only step that costs LLM tokens, and it is the one step whose absence
   //     costs nothing — a card with no recommendation is still rulable. Off

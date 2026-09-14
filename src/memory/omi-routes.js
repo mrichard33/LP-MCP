@@ -116,6 +116,19 @@ export function registerOmiRoutes(app, deps = {}) {
     const mode = getOmiMode(cfgEnv);
     if (mode === 'off') return res.status(503).json({ error: 'omi ingest disabled' });
 
+    // The webhook is OFF until it is deliberately turned on (sql/112, 2026-09-14).
+    //
+    // The pull in src/jobs/omi-pull.js now covers every conversation regardless
+    // of capture device, so this route is an accelerator rather than the way in.
+    // Both paths share the checkpoint key sha256('omi|'+id), so running both is
+    // safe — but running the webhook before the pull has been watched in shadow
+    // means the first thing anyone sees of the Omi path is unattended writes.
+    // Ahead of the auth checks on purpose: a disabled feature should say it is
+    // disabled, not make a caller guess whether their token was wrong.
+    if (String(cfgEnv.OMI_WEBHOOK_ENABLED || 'false').toLowerCase().trim() !== 'true') {
+      return res.status(503).json({ error: 'omi webhook disabled' });
+    }
+
     // 1. Our relay.
     const bearer = String(req.headers?.authorization || '').replace(/^Bearer\s+/i, '');
     if (!secretMatches(bearer, cfgEnv.OMI_INGEST_TOKEN)) {
@@ -175,6 +188,7 @@ export function registerOmiRoutes(app, deps = {}) {
 
   console.log(
     `[Omi] Routes: POST ${OMI_INGEST_PATH} — mode=${getOmiMode(env)} ` +
+    `webhook=${String(env.OMI_WEBHOOK_ENABLED || 'false').toLowerCase() === 'true' ? 'on' : 'off'} ` +
     `(Bearer OMI_INGEST_TOKEN + X-Omi-Token + X-Omi-Uid; ${allowedUids(env).length} uid(s) allowed, ` +
     `${getMaxBodyBytes(env)} byte cap, ${getRateLimitPerMin(env)}/min)`
   );

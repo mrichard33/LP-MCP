@@ -493,6 +493,10 @@ const ROUTE_ENV = {
   OMI_INGEST_TOKEN: 'relay-secret',
   OMI_WEBHOOK_TOKEN: 'omi-secret',
   OMI_ALLOWED_UIDS: 'uid-abc, uid-def',
+  // sql/112, 2026-09-14: the webhook is off by default now that the puller
+  // covers every conversation. The tests below are about what the route does
+  // when it IS enabled; the gate itself is tested separately.
+  OMI_WEBHOOK_ENABLED: 'true',
 };
 
 function routeUnderTest(envOverrides = {}, deps = {}) {
@@ -506,6 +510,35 @@ function routeUnderTest(envOverrides = {}, deps = {}) {
   });
   return { handlers: app.routes[`POST ${OMI_INGEST_PATH}`], state };
 }
+
+test('route: 503 when OMI_WEBHOOK_ENABLED is unset — the webhook is off by default', async () => {
+  // The puller covers every conversation, so the webhook is an accelerator that
+  // has to be switched on deliberately. Default-off is the point of the test.
+  const { handlers } = routeUnderTest({ OMI_WEBHOOK_ENABLED: undefined });
+  const res = await call(handlers, goodReq());
+  assert.equal(res.code, 503);
+  assert.equal(res.body.error, 'omi webhook disabled');
+});
+
+test('route: the disabled answer comes BEFORE auth, so it is not mistaken for a bad token', async () => {
+  // A caller with no credentials at all must still be told the feature is off.
+  // Answering 401 here would send whoever is wiring up n8n hunting for a token
+  // problem that does not exist.
+  const { handlers } = routeUnderTest({ OMI_WEBHOOK_ENABLED: 'false' });
+  const res = await call(handlers, { headers: {}, body: { id: 'conv-9' } });
+  assert.equal(res.code, 503);
+  assert.equal(res.body.error, 'omi webhook disabled');
+});
+
+test('route: an ingest is never attempted while the webhook is disabled', async () => {
+  let called = 0;
+  const { handlers } = routeUnderTest(
+    { OMI_WEBHOOK_ENABLED: 'no' },
+    { ingest: async () => { called += 1; return { status: 'written' }; } },
+  );
+  await call(handlers, goodReq());
+  assert.equal(called, 0);
+});
 
 function goodReq(body = { id: 'conv-9' }, headers = {}) {
   return {

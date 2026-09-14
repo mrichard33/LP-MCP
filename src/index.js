@@ -43,6 +43,8 @@ import { registerKbIngestionRoutes } from './knowledge/ingest-embeddings.js';
 import { registerMemoryRoutes } from './memory/memory-routes.js';
 import { registerRecommendRoutes } from './memory/recommend-routes.js';
 import { registerOmiRoutes, omiBodyParser } from './memory/omi-routes.js';
+import { registerOmiPullRoutes } from './memory/omi-pull-routes.js';
+import { startOmiPullScheduler } from './jobs/omi-pull.js';
 import { registerMemoryNightlyRoutes, startMemoryNightlyScheduler } from './jobs/memory-nightly.js';
 import { registerAdminMemoryRoutes } from './routes/admin-memory.js';
 // 2026-09-11 — Bot Review Phase 0 (handoff §5.1): coverage health + the 30-min
@@ -1951,6 +1953,9 @@ registerRecommendRoutes(app, authenticate);
 // NOT MCP_AUTH_TOKEN — the n8n relay must not hold the key to every admin
 // route here. Answers 503 until OMI_INGEST_MODE is set to shadow or live.
 registerOmiRoutes(app);
+// Admin controls for the outbound pull. Unlike the webhook above these are
+// ordinary operator endpoints, so they take the standard auth middleware.
+registerOmiPullRoutes(app, authenticate);
 registerMemoryNightlyRoutes(app, authenticate);
 // sql/098: n8n event door (pending / issue, never decision) + manual validation run.
 registerAdminMemoryRoutes(app, authenticate);
@@ -2206,6 +2211,7 @@ const server = app.listen(PORT, async () => {
   startWorkflowProjectionLoop();
   startMarketAssignmentScheduler();
   startMemoryNightlyScheduler();
+    startOmiPullScheduler();
   checkMemorySchema().catch((err) => console.warn('[MemorySchema] boot check failed:', err.message));
   startCapacitySweepScheduler();
   startGoalScorecardScheduler();

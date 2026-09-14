@@ -46,17 +46,38 @@ import { CATEGORIES } from '../memory/memory-rule.js';
 
 export const RECOMMEND_MODES = new Set(['off', 'shadow', 'live']);
 export const VERDICTS = Object.freeze([
+  // Rulings lane (sql/102).
   'approve', 'reject', 'answer', 'keep_left', 'keep_right', 'not_a_conflict', 'new_answer', 'yes', 'no', 'not_now',
+  // Stale-issue lane (sql/112).
+  'still_broken', 'fixed', 'no_longer_matters',
+  // To-do lane (sql/112).
+  'done', 'drop', 'keep', 'assign',
+]);
+
+/** Which verdicts belong to which lane. A verdict from the wrong lane is a miss. */
+export const LANE_VERDICTS = Object.freeze({
+  rulings: Object.freeze(['approve', 'reject', 'answer', 'keep_left', 'keep_right', 'not_a_conflict', 'new_answer', 'yes', 'no', 'not_now']),
+  stale: Object.freeze(['still_broken', 'fixed', 'no_longer_matters']),
+  todos: Object.freeze(['done', 'drop', 'keep', 'assign']),
+});
+
+/**
+ * A stable slug per REASON, not per verdict — it is what the Command Center
+ * groups a batch pass by, and a group header has to be something a person can
+ * read and agree with in one line ("12 issues whose fix PR is merged"). Two
+ * cards share a key only when the same sentence explains both.
+ */
+export const GROUP_KEYS = Object.freeze([
+  'fixed:pr-merged', 'fixed:verified-elsewhere',
+  'still_broken:no-evidence-of-fix',
+  'no_longer_matters:superseded', 'no_longer_matters:system-retired',
+  'done:pr-merged', 'done:confirmed-elsewhere',
+  'drop:duplicate-of-newer', 'drop:superseded',
+  'keep:no-evidence', 'keep:still-open',
+  'assign:owner-named',
 ]);
 export const CONFIDENCES = Object.freeze(['high', 'medium', 'low', 'no_evidence']);
 export const RISKS = Object.freeze(['money', 'live_leads', 'customer_messaging', 'none']);
-
-/**
- * Areas where "none" is almost never the right risk answer: payroll decisions
- * move money, and a partner or vendor decision moves a contract. The LLM is
- * allowed to be cautious; it is not allowed to be careless here.
- */
-const RISK_BACKSTOP_AREAS = new Set(['payroll-callcenter', 'partners-vendors']);
 
 export function getMode(env = process.env) {
   const m = String(env.MEMORY_RECOMMEND_MODE || 'off').toLowerCase().trim();
@@ -78,17 +99,40 @@ THE STANDING RULING FRAMEWORK. Apply it in this order, every time:
 2. Recommend a change ONLY when the evidence shows the current state is failing. An idea being better in the abstract is not evidence.
 3. A decision the owner CONFIRMED outranks a RECONSTRUCTED one, regardless of which is newer. Check the confidence and origin on every decision you cite.
 4. When money, live leads, or customer messaging are at stake: do NOT give a single verdict as if it were obvious. Lay out the tradeoff in the reason, and set confidence no higher than "medium". If there is nothing verifiable either way, say "no evidence either way" in the reason and set confidence to "no_evidence".
+   "At stake" means ACTING ON THIS CARD CHANGES ONE OF THESE THINGS. Be strict, and ask what the ruling itself does:
+     money              it changes a payment, a price, a commission, a budget or an invoice.
+     live_leads         it changes how a real lead is routed, dialled, assigned or suppressed.
+     customer_messaging it changes something a customer receives — an SMS, an email, a call script.
+   A card is NOT risky because of the area it is filed under, because a vendor is named, or because it sounds important. A reporting change that shows payroll numbers is reporting, not money. A note about a dialer setting nobody has applied is not live_leads. Most cards are "none", and a risk flag on a card that carries no risk is worse than no flag at all — it teaches the reader to ignore the ones that matter.
+
+THE THREE LANES. Which verdicts are available depends on what kind of card this is — the card says so, and a verdict from another lane is simply wrong:
+  Rulings (decision_needed, unconfirmed_decision, open_question, approval_needed, conflict):
+      approve | reject | answer | keep_left | keep_right | not_a_conflict | new_answer | yes | no | not_now
+  Stale issue (stale_issue) — an open issue nobody has verified in a long time. The question is always "is this still broken?":
+      still_broken        nothing shows it was fixed. This is the DEFAULT and it is not a failure — it re-starts the clock, it closes nothing.
+      fixed               ONLY with a concrete proof link: a merged PR, a commit, a file path, or a named check that passed. No link, no "fixed" — say still_broken and set confidence low instead. An issue closed on a guess is worse than one left open, because nobody looks at it again.
+      no_longer_matters   the thing it was about is gone — the workflow was deleted, the system was retired, the vendor was dropped.
+  To-do (todo):
+      done      the work is finished AND the evidence is about THIS item shipping. A PR that merely mentions the subject is not the item being done — that is "keep".
+      drop      it is a duplicate of a newer item, or superseded.
+      keep      still real, still someone's. This is the DEFAULT when evidence is thin. It snoozes for 30 days; it does not close anything.
+      assign    the record plainly names who owns it. Put the name in decision_text.
+
+AGE IS NOT EVIDENCE. Nothing is done, fixed, or droppable because it is old. If the only thing you can say about a card is how long it has been sitting there, the answer is still_broken or keep, at low confidence.
+
+GROUPING. Also return "group_key": a short slug naming the REASON, so cards that share one explanation can be ruled together. Use one of: ${GROUP_KEYS.join(' | ')}. If none of them describes your reason, return null — a card that does not fit a group is ruled on its own, which is fine.
 
 Cite only evidence you were actually given below. Never invent a decision id, an issue id, a PR, a file path or a metric. If the evidence is thin, that IS the finding — say so and set confidence low or no_evidence.
 
 Reply with JSON only, no prose and no code fence:
 {
-  "verdict": "approve|reject|answer|keep_left|keep_right|not_a_conflict|new_answer|yes|no|not_now",
+  "verdict": "approve|reject|answer|keep_left|keep_right|not_a_conflict|new_answer|yes|no|not_now|still_broken|fixed|no_longer_matters|done|drop|keep|assign",
   "reason": "at most two sentences, plain words",
   "evidence": [{"type":"decision|issue|workflow|pr|file|query","ref":"#123 or a name","note":"why it matters"}],
   "confidence": "high|medium|low|no_evidence",
   "risk": "money|live_leads|customer_messaging|none",
-  "decision_text": "the exact wording to save if this is approved",
+  "group_key": "one of the slugs above, or null",
+  "decision_text": "the exact wording to save if this is approved, or for assign, the owner's name",
   "category": "architecture|routing|messaging|appointments|sync|integration|data|agentic|infrastructure|reporting|compliance|operations",
   "build_text": "what would have to be built, or null if nothing"
 }`;
@@ -183,10 +227,29 @@ export function buildUserPrompt(card, ev) {
 }
 
 /** Clamp the model's output to the vocabularies the columns accept. */
+/** The safe answer for each lane: the one that changes nothing but the clock. */
+const LANE_DEFAULT_VERDICT = Object.freeze({ rulings: 'not_now', stale: 'still_broken', todos: 'keep' });
+
+/** A card's lane, from the view's own column, falling back to its card_type. */
+export function laneOf(card) {
+  const lane = String(card?.lane || '').trim();
+  if (LANE_VERDICTS[lane]) return lane;
+  const type = String(card?.card_type || '').trim();
+  if (type === 'stale_issue') return 'stale';
+  if (type === 'todo') return 'todos';
+  return 'rulings';
+}
+
 export function normalizeOutput(raw, card) {
   const pick = (v, list, fallback) => (list.includes(String(v || '').trim()) ? String(v).trim() : fallback);
+  const lane = laneOf(card);
   const out = {
-    verdict: pick(raw?.verdict, VERDICTS, 'not_now'),
+    // Scoped to the card's own lane. A model that answers "approve" on a stale
+    // issue has not given a weak answer, it has answered a different question —
+    // and letting it through would put an approve button's verdict behind a
+    // "Fixed" button. Falling back to the lane's safe default is the only
+    // reading that changes nothing.
+    verdict: pick(raw?.verdict, LANE_VERDICTS[lane], LANE_DEFAULT_VERDICT[lane]),
     reason: String(raw?.reason || '').slice(0, 1000) || 'No reason given.',
     evidence: Array.isArray(raw?.evidence)
       ? raw.evidence.slice(0, 8).map((e) => ({ type: String(e?.type || 'query'), ref: String(e?.ref || ''), note: String(e?.note || '').slice(0, 300) }))
@@ -196,15 +259,34 @@ export function normalizeOutput(raw, card) {
     decision_text: raw?.decision_text ? String(raw.decision_text).slice(0, 4000) : null,
     category: pick(raw?.category, CATEGORIES, 'operations'),
     build_text: raw?.build_text ? String(raw.build_text).slice(0, 2000) : null,
+    group_key: GROUP_KEYS.includes(String(raw?.group_key || '').trim()) ? String(raw.group_key).trim() : null,
+    lane,
   };
-  // Risk backstop FIRST: an area that is always about money does not get
-  // "none". The ORDER matters. Run the backstop after the cap below and a
-  // backstopped card lands as money + high — the one combination rule 4 exists
-  // to prevent — and it lands on payroll and partner/vendor cards, the two
-  // areas that can least afford a confident-looking wrong answer.
-  if (out.risk === 'none' && RISK_BACKSTOP_AREAS.has(String(card?.area || ''))) out.risk = 'money';
-  // Framework rule 4, enforced rather than trusted.
+  // THE BLANKET AREA BACKSTOP IS GONE (issue #2135, 2026-09-14).
+  //
+  // It used to read: if the model said "none" and the card's area was
+  // payroll-callcenter or partners-vendors, force "money". The intent was
+  // decent — those areas can least afford a confident wrong answer — but area
+  // is where a card is FILED, not what ruling on it DOES. A reporting tweak
+  // that happens to show payroll numbers was coming out as a money risk.
+  //
+  // Measured on 2026-09-14: 292 of 393 recommended cards carried a risk flag.
+  // 74%. At that rate the flag is decoration — a reader who sees it on three
+  // cards in four stops reading it, which costs exactly the cards it was
+  // supposed to protect. The target is 15-25%, and the definition now lives in
+  // rule 4 of the prompt: risk is what ACTING on the card changes, not what
+  // folder it sits in.
+  //
+  // What remains is rule 4's cap, enforced rather than trusted: a real risk and
+  // a confident verdict is the one combination that must never reach a batch
+  // pass, because high confidence is exactly what a batch selects on.
   if (out.risk !== 'none' && out.confidence === 'high') out.confidence = 'medium';
+
+  // A group key that contradicts its own verdict would put a card under a
+  // heading that does not describe it — and the heading is the only thing
+  // somebody reads before approving fifty at once.
+  if (out.group_key && !out.group_key.startsWith(`${out.verdict}:`)) out.group_key = null;
+
   return out;
 }
 
@@ -259,6 +341,9 @@ export async function recommendOne(table, id, deps = {}) {
       rec_verdict: rec.verdict, rec_reason: rec.reason, rec_evidence: rec.evidence,
       rec_confidence: rec.confidence, rec_risk: rec.risk, rec_at: new Date().toISOString(),
       rec_source_version: card.card_version,
+      // The column has existed since sql/102 and been written by nothing until
+      // now. It is what the Command Center groups a batch pass by.
+      rec_group_key: rec.group_key,
     };
     // Only the tables that have them — a conflict has no category or build.
     if (table === 'claude_pending_items') {
@@ -275,8 +360,10 @@ export async function recommendOne(table, id, deps = {}) {
   return rec;
 }
 
-/** The two tables a Rulings card can come from. */
-const SOURCE_TABLES = Object.freeze(['claude_pending_items', 'claude_memory_conflicts']);
+/** Every table a card can come from, across all three lanes (sql/112). */
+const SOURCE_TABLES = Object.freeze([
+  'claude_pending_items', 'claude_memory_conflicts', 'claude_known_issues',
+]);
 
 /**
  * The rec_source_version of each already-recommended card, read from the SOURCE

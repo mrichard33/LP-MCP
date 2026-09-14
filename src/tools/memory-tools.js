@@ -13,12 +13,16 @@
  *                      ≥ MEMORY_CONFLICT_THRESHOLD supersession rule.
  *   memory_precheck    "have we already decided this / did Mark reject it?"
  *                      — top active decisions, closed matches, open conflicts.
- *   memory_rule        apply ONE Command Center ruling (sql/102): approve,
- *                      reject, pick an option, rule a conflict, snooze, set a
- *                      rollout stage, or flip a ruling back. The dashboard and
- *                      chat both come through here, so every ruling — wherever
- *                      it was made — lands in claude_rulings_log in the same
- *                      shape, in one transaction.
+ *   memory_rule        apply ONE Command Center ruling, or one batch pass
+ *                      (sql/102 + sql/112). Three lanes: rule a decision or a
+ *                      conflict; say whether a stale issue is still broken,
+ *                      fixed or no longer relevant; or mark a to-do done,
+ *                      dropped, kept or assigned. batch_apply rules up to 50
+ *                      cards at once and batch_undo reverses the lot exactly.
+ *                      The dashboard and chat both come through here, so every
+ *                      ruling — wherever it was made — lands in
+ *                      claude_rulings_log in the same shape, in one
+ *                      transaction.
  *
  * All five touch only the claude_* memory tables and memory_vector_queries.
  * Nothing in the customer request path calls them.
@@ -182,13 +186,13 @@ export function registerMemoryTools(server) {
 
   server.tool(
     'memory_rule',
-    'Apply one Command Center ruling (the same door for the dashboard and for chat): approve / edit_approve / reject / pick_option / own_answer / yes / no on a pending item; keep_left / keep_right / not_a_conflict / new_answer on a conflict; snooze; not_relevant; stage (built | verified | no_build) on a decision; flip (reverses_id) to undo a ruling; recheck to refresh the recommendation. Writes decisions, closes the card, logs to claude_rulings_log in one transaction. Reason required on reject, flip and any ruling that differs from the recommendation. Dry run unless confirm is true.',
+    'Apply one Command Center ruling, or one batch pass — the same door for the dashboard and for chat. THREE LANES. Rulings: approve / edit_approve / reject / pick_option / own_answer / yes / no on a pending item; keep_left / keep_right / not_a_conflict / new_answer on a conflict. Stale issues (claude_known_issues): still_broken / fixed / no_longer_matters — fixed REQUIRES proof, a link to what fixed it. To-dos (claude_pending_items): done / drop / keep / assign — keep snoozes 30 days and closes nothing. Also snooze; not_relevant; stage (built | verified | no_build) on a decision; flip (reverses_id) to undo a ruling; recheck to refresh the recommendation. BATCHES: batch_apply takes verdict + targets (50 max, high-confidence recommendations only, never a Rulings card) and batch_undo takes batch_id + reason, reversing the whole batch exactly. Every path writes claude_rulings_log in one transaction. Reason required on reject, flip, batch_undo and any ruling that differs from the recommendation. Nothing closes on age alone. Dry run unless confirm is true.',
     {
       action: z.enum(RULE_ACTIONS),
       target: z.object({
-        table: z.enum(['claude_pending_items', 'claude_memory_conflicts', 'claude_decision_log']),
+        table: z.enum(['claude_pending_items', 'claude_memory_conflicts', 'claude_decision_log', 'claude_known_issues']),
         id: z.number().int(),
-      }).optional().describe('the card being ruled. Omit only on a flip — it finds its own card from reverses_id'),
+      }).optional().describe('the card being ruled. Omit on a flip (it finds its own card from reverses_id) and on a batch (which takes targets instead)'),
       card_version: z.string().optional().describe('from v_command_center_queue — rejects the ruling if the card changed since it was loaded'),
       text: z.string().optional().describe('the decision in your words. Defaults to the card text with its Omi provenance stripped, else the recommended wording'),
       option_key: z.string().optional().describe('pick_option: the index or text of the option chosen'),
@@ -196,7 +200,18 @@ export function registerMemoryTools(server) {
       reason: z.string().optional().describe('required on reject, no, flip, and on any ruling that differs from the recommendation'),
       snooze_until: z.string().optional().describe('YYYY-MM-DD, must be in the future'),
       stage: z.enum(['built', 'verified', 'no_build']).optional(),
-      proof: z.string().optional().describe('stage verified: what shows it is actually working'),
+      proof: z.string().optional().describe('stage verified, and REQUIRED for fixed: the link or line showing what fixed it — a merged PR, a commit, a file path, or what was checked'),
+      assignee: z.string().optional().describe('assign: who now owns the to-do'),
+      verdict: z.enum(['still_broken', 'fixed', 'no_longer_matters', 'done', 'drop', 'keep', 'assign'])
+        .optional().describe('batch_apply: the one verdict applied to every target'),
+      targets: z.array(z.object({
+        table: z.enum(['claude_pending_items', 'claude_known_issues']),
+        id: z.number().int(),
+        card_version: z.string().optional(),
+        proof: z.string().optional(),
+      })).max(50).optional().describe('batch_apply: up to 50 cards, all in the verdict\'s own lane'),
+      batch_id: z.string().optional().describe('batch_undo: the batch to reverse, from a previous batch_apply'),
+      rec_group_key: z.string().optional().describe('batch_apply: the group this pass came from, for the history entry'),
       build: z.object({ description: z.string() }).optional().describe('files a build_needed item against the new decision'),
       supersedes_id: z.number().int().optional().describe('the active decision this ruling replaces — answers a guard_conflict'),
       same_as_id: z.number().int().optional().describe('the active decision this ruling merely re-confirms — nothing new is written'),
