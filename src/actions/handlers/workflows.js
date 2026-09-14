@@ -207,6 +207,7 @@ import {
 // other tag write in the executor uses (present-check, cache upkeep, snapshot
 // write-through) rather than a raw DELETE from here.
 import { executeRemoveTag } from './tags.js';
+import { withGhlToken } from '../../ghl-rate-limiter.js';
 
 // ── Universal Dynamic Hold (2026-06-12) ────────────────────────────────
 // One GHL "dumb clock" workflow (dfd3ffaa) parks a contact for hold_hours and
@@ -267,13 +268,13 @@ export async function getLastInboundMessageMs(contactId) {
   const locationId = process.env.GHL_LOCATION_ID || 'SsBG7j5KQAIP1SFP2Sca';
 
   // Most recently updated conversation for the contact
-  const convRes = await fetch(
+  const convRes = await withGhlToken(() => fetch(
     `https://services.leadconnectorhq.com/conversations/search?contactId=${contactId}&locationId=${locationId}&limit=1`,
     {
       headers: { 'Authorization': `Bearer ${GHL_API_KEY}`, 'Version': '2021-04-15', 'Accept': 'application/json' },
       signal: AbortSignal.timeout(8000),
     }
-  );
+  ));
   if (!convRes.ok) {
     console.warn(`[ActionExecutor] getLastInboundMessageMs conversation search failed for ${contactId}: ${convRes.status}`);
     return NaN;
@@ -282,13 +283,13 @@ export async function getLastInboundMessageMs(contactId) {
   const conv = convData?.conversations?.[0];
   if (!conv?.id) return NaN;
 
-  const msgRes = await fetch(
+  const msgRes = await withGhlToken(() => fetch(
     `https://services.leadconnectorhq.com/conversations/${conv.id}/messages`,
     {
       headers: { 'Authorization': `Bearer ${GHL_API_KEY}`, 'Version': '2021-04-15', 'Accept': 'application/json' },
       signal: AbortSignal.timeout(8000),
     }
-  );
+  ));
   if (!msgRes.ok) {
     console.warn(`[ActionExecutor] getLastInboundMessageMs messages fetch failed for conv ${conv.id}: ${msgRes.status}`);
     return NaN;
@@ -322,13 +323,13 @@ export async function hasPriorInboundMessage(contactId) {
   const locationId = process.env.GHL_LOCATION_ID || 'SsBG7j5KQAIP1SFP2Sca';
 
   try {
-    const convRes = await fetch(
+    const convRes = await withGhlToken(() => fetch(
       `https://services.leadconnectorhq.com/conversations/search?contactId=${contactId}&locationId=${locationId}&limit=20`,
       {
         headers: { 'Authorization': `Bearer ${GHL_API_KEY}`, 'Version': '2021-04-15', 'Accept': 'application/json' },
         signal: AbortSignal.timeout(8000),
       }
-    );
+    ));
     if (!convRes.ok) {
       console.warn(`[HasPriorInbound] conversation search failed for ${contactId}: ${convRes.status}`);
       return null;
@@ -340,13 +341,13 @@ export async function hasPriorInboundMessage(contactId) {
 
     for (const conv of convs) {
       if (!conv?.id) continue;
-      const msgRes = await fetch(
+      const msgRes = await withGhlToken(() => fetch(
         `https://services.leadconnectorhq.com/conversations/${conv.id}/messages`,
         {
           headers: { 'Authorization': `Bearer ${GHL_API_KEY}`, 'Version': '2021-04-15', 'Accept': 'application/json' },
           signal: AbortSignal.timeout(8000),
         }
-      );
+      ));
       if (!msgRes.ok) {
         console.warn(`[HasPriorInbound] messages fetch failed for conv ${conv.id}: ${msgRes.status}`);
         return null; // partial read is unreadable, not "none"
@@ -636,6 +637,7 @@ export async function executeAddToWorkflow(action) {
       contentType = 'application/x-www-form-urlencoded';
     }
 
+    // rate-limiter-exempt: caller-configured outbound webhook, not the GHL v2 API.
     const res = await fetch(webhookUrl, {
       method: 'POST',
       headers: {
@@ -797,6 +799,7 @@ export async function executeIssueHold(action) {
     workflow_code: workflowCode,
   });
 
+  // rate-limiter-exempt: GHL /hooks webhook-trigger surface, not the rate-limited v2 API.
   const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },

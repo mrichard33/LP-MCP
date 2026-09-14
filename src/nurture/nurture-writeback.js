@@ -92,6 +92,8 @@
  *   and terminal-touch rules.
  */
 
+import { withGhlToken } from '../ghl-rate-limiter.js';
+
 const GHL_API_KEY = process.env.GHL_API_KEY;
 const GHL_BASE = 'https://services.leadconnectorhq.com';
 
@@ -156,7 +158,7 @@ async function ghlUpdate(contactId, customFields) {
   if (!GHL_API_KEY) {
     throw new Error('GHL_API_KEY not configured');
   }
-  const res = await fetch(`${GHL_BASE}/contacts/${contactId}`, {
+  const res = await withGhlToken(() => fetch(`${GHL_BASE}/contacts/${contactId}`, {
     method: 'PUT',
     headers: {
       'Authorization': `Bearer ${GHL_API_KEY}`,
@@ -165,7 +167,7 @@ async function ghlUpdate(contactId, customFields) {
     },
     body: JSON.stringify({ customFields }),
     signal: AbortSignal.timeout(10_000),
-  });
+  }));
   if (!res.ok) {
     const errText = await res.text().catch(() => '');
     throw new Error(`GHL update failed ${res.status}: ${errText.slice(0, 200)}`);

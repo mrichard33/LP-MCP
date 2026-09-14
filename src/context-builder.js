@@ -104,6 +104,7 @@ import { channelOfMessage } from './agentic/reply-sender.js';
 // v2.9: the canonical five-signal "is this person a customer" test. Reused
 // here so customer_relationship never disagrees with the suppression shapes.
 import { isCustomerP2 } from './agentic/lead-state/signals/context-reader.js';
+import { withGhlToken } from './ghl-rate-limiter.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY;
 const GHL_LOCATION_ID = process.env.GHL_LOCATION_ID || 'SsBG7j5KQAIP1SFP2Sca';
@@ -324,7 +325,7 @@ async function ghlFetch(method, path) {
   if (!GHL_API_KEY) return null;
   const url = `https://services.leadconnectorhq.com${path}`;
   try {
-    const res = await fetch(url, {
+    const res = await withGhlToken(() => fetch(url, {
       method,
       headers: {
         'Authorization': `Bearer ${GHL_API_KEY}`,
@@ -333,7 +334,7 @@ async function ghlFetch(method, path) {
         'Accept': 'application/json',
       },
       signal: AbortSignal.timeout(15000),
-    });
+    }));
     if (!res.ok) return null;
     const contentType = res.headers.get('content-type') || '';
     if (contentType.includes('application/json')) return res.json();

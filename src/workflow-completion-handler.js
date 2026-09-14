@@ -35,6 +35,7 @@
  */
 
 import { emitEvent } from './event-emitter.js';
+import { withGhlToken } from './ghl-rate-limiter.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY;
 const GHL_WEBHOOK_SECRET = process.env.GHL_WEBHOOK_SECRET || '';
@@ -101,10 +102,10 @@ async function handleWorkflowCompletedByTag(req, res) {
   let tags = [];
   if (GHL_API_KEY) {
     try {
-      const ghlRes = await fetch(`https://services.leadconnectorhq.com/contacts/${contactId}`, {
+      const ghlRes = await withGhlToken(() => fetch(`https://services.leadconnectorhq.com/contacts/${contactId}`, {
         headers: { 'Authorization': `Bearer ${GHL_API_KEY}`, 'Version': '2021-07-28', 'Accept': 'application/json' },
         signal: AbortSignal.timeout(10000),
-      });
+      }));
       if (ghlRes.ok) {
         const data = await ghlRes.json();
         tags = data?.contact?.tags || [];

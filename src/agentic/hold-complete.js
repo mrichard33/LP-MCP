@@ -41,6 +41,11 @@
 import { emitEvent } from '../event-emitter.js';
 import { sendGroupMeMessage } from '../groupme.js';
 
+// NOTE (2026-09-14): /hooks/ is GHL's INBOUND webhook-trigger surface, not the
+// rate-limited v2 API (services.leadconnectorhq.com/contacts, /conversations,
+// ...). It does not spend the API budget the token bucket exists to protect, so
+// refireTrigger below is deliberately NOT wrapped in withGhlToken. Everything
+// that does hit the v2 API is — see src/ghl-rate-limiter.js.
 const GHL_HOOK_BASE = 'https://services.leadconnectorhq.com/hooks';
 const GHL_LOC_ID = process.env.GHL_LOCATION_ID || 'SsBG7j5KQAIP1SFP2Sca';
 
@@ -54,6 +59,7 @@ function looksLikeTriggerId(s) {
 
 async function refireTrigger(triggerId, payload) {
   const url = `${GHL_HOOK_BASE}/${GHL_LOC_ID}/webhook-trigger/${triggerId}`;
+  // rate-limiter-exempt: GHL /hooks webhook-trigger surface, not the rate-limited v2 API.
   const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

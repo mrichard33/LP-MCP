@@ -313,6 +313,7 @@ import { checkApptEventDedup } from './services/appt-event-dedup.js';
 import { recentAnalysisExists, DEDUP_CONFIRM_WINDOW_MS } from './services/analysis-confirm.js';
 import { stripQuotedEmail } from './email-thread.js';
 import { trackBackground } from './graceful-shutdown.js';
+import { withGhlToken } from './ghl-rate-limiter.js';
 
 const GHL_WEBHOOK_SECRET = process.env.GHL_WEBHOOK_SECRET || '';
 const GHL_API_KEY = process.env.GHL_API_KEY;
@@ -381,6 +382,7 @@ async function triggerAgenticPipeline(contactId, messageText, channel = null, me
   // to the silence watchdog.
   let analysisSucceeded = false;
   try {
+    // rate-limiter-exempt: LP-MCP calling its own route.
     const analyzeRes = await fetch(`${SELF_BASE_URL}/n8n/analyze-message`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -438,6 +440,7 @@ async function triggerAgenticPipeline(contactId, messageText, channel = null, me
 
   // Step 2: Process pending events → Decision Engine creates actions
   try {
+    // rate-limiter-exempt: LP-MCP calling its own route.
     const processRes = await fetch(`${SELF_BASE_URL}/n8n/decision-engine/process`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -455,6 +458,7 @@ async function triggerAgenticPipeline(contactId, messageText, channel = null, me
 
   // Step 3: Execute pending actions → pre-generate response + send GroupMe approval
   try {
+    // rate-limiter-exempt: LP-MCP calling its own route.
     const execRes = await fetch(`${SELF_BASE_URL}/n8n/decision-engine/execute`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1443,14 +1447,14 @@ function resolveEntrySourceFromData(tags, ghlSource) {
 async function fetchGHLContact(contactId) {
   if (!GHL_API_KEY || !contactId) return null;
   try {
-    const res = await fetch(`https://services.leadconnectorhq.com/contacts/${contactId}`, {
+    const res = await withGhlToken(() => fetch(`https://services.leadconnectorhq.com/contacts/${contactId}`, {
       headers: {
         'Authorization': `Bearer ${GHL_API_KEY}`,
         'Version': '2021-07-28',
         'Accept': 'application/json',
       },
       signal: AbortSignal.timeout(10000),
-    });
+    }));
     if (!res.ok) {
       console.warn(`[BehavioralEmitter] GHL contact lookup failed for ${contactId}: ${res.status}`);
       return null;

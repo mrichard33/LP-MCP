@@ -154,6 +154,7 @@ import { sendGroupMeMessage } from '../groupme.js';
 import supabase from '../supabase.js';
 import { getGHLContact, updateGHLContactFields } from '../ghl.js';
 import { LP_SRS, LP_PRO, assertNotTransposed } from '../lp-source-ids.js';
+import { withGhlToken } from '../ghl-rate-limiter.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY;
 
@@ -350,7 +351,7 @@ export async function enrollLpLeadCreation({ contactId, calendarName = null, for
   // Exactly YYYY-MM-DDTHH:MM:SS+00:00 — see formatGhlEventStartTime().
   const eventStartTime = formatGhlEventStartTime(new Date());
 
-  const res = await fetch(url, {
+  const res = await withGhlToken(() => fetch(url, {
     method: 'POST',
     headers: {
       'Authorization': `Bearer ${GHL_API_KEY}`,
@@ -360,7 +361,7 @@ export async function enrollLpLeadCreation({ contactId, calendarName = null, for
     },
     body: JSON.stringify({ eventStartTime }),
     signal: AbortSignal.timeout(15000),
-  });
+  }));
   if (!res.ok) {
     const t = await res.text().catch(() => '');
     throw new Error(`GHL enroll ${contactId} → wf ${LEAD_CREATE_WORKFLOW_ID} failed: ${res.status}: ${t.slice(0, 200)}`);

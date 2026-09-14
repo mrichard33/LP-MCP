@@ -30,6 +30,7 @@ import supabase from './supabase.js';
 import { runSQL } from './admin/supabase-admin.js';
 import { emitEvent } from './event-emitter.js';
 import { updateGHLContactFields, addGHLNote } from './ghl.js';
+import { withGhlToken } from './ghl-rate-limiter.js';
 
 // ─── Config (env with safe fallbacks — no n8n env dependency) ──────────────
 const BATCH_SIZE = parseInt(process.env.STITCH_BATCH_SIZE || '50', 10);
@@ -131,9 +132,9 @@ async function ensureGhlFields() {
   // List existing
   let existing = [];
   try {
-    const res = await fetch(`${GHL_BASE}/locations/${GHL_LOCATION_ID}/customFields?model=contact`, {
+    const res = await withGhlToken(() => fetch(`${GHL_BASE}/locations/${GHL_LOCATION_ID}/customFields?model=contact`, {
       headers: GHL_HEADERS, signal: AbortSignal.timeout(15000),
-    });
+    }));
     if (res.ok) {
       const data = await res.json().catch(() => ({}));
       existing = data.customFields || data.customField || [];
@@ -155,11 +156,11 @@ async function ensureGhlFields() {
     if (hit?.id) { map[f.name] = hit.id; continue; }
     // Create
     try {
-      const res = await fetch(`${GHL_BASE}/locations/${GHL_LOCATION_ID}/customFields`, {
+      const res = await withGhlToken(() => fetch(`${GHL_BASE}/locations/${GHL_LOCATION_ID}/customFields`, {
         method: 'POST', headers: GHL_HEADERS,
         body: JSON.stringify({ name: f.name, dataType: f.dataType, model: 'contact' }),
         signal: AbortSignal.timeout(15000),
-      });
+      }));
       const data = await res.json().catch(() => ({}));
       const id = data?.customField?.id || data?.id || null;
       if (id) {
@@ -183,7 +184,7 @@ const digits = (s) => String(s || '').replace(/[^0-9]/g, '');
 async function ghlSearchContacts(query) {
   try {
     const url = `${GHL_BASE}/contacts/?locationId=${encodeURIComponent(GHL_LOCATION_ID)}&query=${encodeURIComponent(query)}&limit=20`;
-    const res = await fetch(url, { headers: GHL_HEADERS, signal: AbortSignal.timeout(15000) });
+    const res = await withGhlToken(() => fetch(url, { headers: GHL_HEADERS, signal: AbortSignal.timeout(15000) }));
     if (!res.ok) return [];
     const data = await res.json().catch(() => ({}));
     return data.contacts || [];

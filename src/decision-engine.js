@@ -245,6 +245,7 @@ import { fetchUpcomingAppointments } from './knowledge/contact-appointments.js';
 import { getLastInboundMessageMs, hasPriorInboundMessage } from './actions/handlers/workflows.js';
 // 2026-08-13 — shared with actions/index.executeLayer3Dispatch (see module header).
 import { inferChannelFromEvent } from './channel-inference.js';
+import { withGhlToken } from './ghl-rate-limiter.js';
 
 // ═══════════════════════════════════════════════════════════════════
 // CONSTANTS
@@ -489,10 +490,10 @@ async function passesStageGate(event, rule, intelligence) {
   if (!GHL_API_KEY) return true;
 
   try {
-    const res = await fetch(`https://services.leadconnectorhq.com/contacts/${contactId}`, {
+    const res = await withGhlToken(() => fetch(`https://services.leadconnectorhq.com/contacts/${contactId}`, {
       headers: { 'Authorization': `Bearer ${GHL_API_KEY}`, 'Version': '2021-07-28', 'Accept': 'application/json' },
       signal: AbortSignal.timeout(10000),
-    });
+    }));
     if (!res.ok) return true;
     const data = await res.json();
     const contact = data?.contact;
@@ -888,7 +889,7 @@ async function countThreadTurns(ghlContactId, sinceMinutes = 60) {
   const locationId = process.env.GHL_LOCATION_ID || 'SsBG7j5KQAIP1SFP2Sca';
 
   try {
-    const convRes = await fetch(
+    const convRes = await withGhlToken(() => fetch(
       `https://services.leadconnectorhq.com/conversations/search?contactId=${ghlContactId}&locationId=${locationId}&limit=1`,
       {
         headers: {
@@ -898,7 +899,7 @@ async function countThreadTurns(ghlContactId, sinceMinutes = 60) {
         },
         signal: AbortSignal.timeout(8000),
       }
-    );
+    ));
     if (!convRes.ok) {
       console.warn(`[ThreadCount] conversation search failed for ${ghlContactId}: ${convRes.status}`);
       return 0;
@@ -907,7 +908,7 @@ async function countThreadTurns(ghlContactId, sinceMinutes = 60) {
     const conv = convData?.conversations?.[0];
     if (!conv?.id) return 0;
 
-    const msgRes = await fetch(
+    const msgRes = await withGhlToken(() => fetch(
       `https://services.leadconnectorhq.com/conversations/${conv.id}/messages`,
       {
         headers: {
@@ -917,7 +918,7 @@ async function countThreadTurns(ghlContactId, sinceMinutes = 60) {
         },
         signal: AbortSignal.timeout(8000),
       }
-    );
+    ));
     if (!msgRes.ok) {
       console.warn(`[ThreadCount] messages fetch failed for conv ${conv.id}: ${msgRes.status}`);
       return 0;

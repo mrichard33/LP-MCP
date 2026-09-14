@@ -50,6 +50,7 @@ import { emitEvent } from './event-emitter.js';
 // wired through one call site avoids a second edit to the 2,000-line
 // index.js route block. See src/jobs/suppress-automation-backfill.js.
 import { registerSuppressAutomationBackfillRoutes } from './jobs/suppress-automation-backfill.js';
+import { withGhlToken } from './ghl-rate-limiter.js';
 
 const FIZZLE_DAYS = 7;
 const FIZZLE_MS = FIZZLE_DAYS * 86400000;
@@ -63,14 +64,14 @@ const GHL_API_KEY = process.env.GHL_API_KEY;
 async function fetchContactTags(contactId) {
   if (!GHL_API_KEY || !contactId) return null;
   try {
-    const res = await fetch(`https://services.leadconnectorhq.com/contacts/${contactId}`, {
+    const res = await withGhlToken(() => fetch(`https://services.leadconnectorhq.com/contacts/${contactId}`, {
       headers: {
         'Authorization': `Bearer ${GHL_API_KEY}`,
         'Version': '2021-07-28',
         'Accept': 'application/json',
       },
       signal: AbortSignal.timeout(10000),
-    });
+    }));
     if (!res.ok) {
       console.warn(`[PauseSweep] GHL contact lookup failed for ${contactId}: ${res.status}`);
       return null;
@@ -90,7 +91,7 @@ async function fetchContactTags(contactId) {
 async function removeContactTag(contactId, tag) {
   if (!GHL_API_KEY || !contactId) return false;
   try {
-    const res = await fetch(`https://services.leadconnectorhq.com/contacts/${contactId}/tags`, {
+    const res = await withGhlToken(() => fetch(`https://services.leadconnectorhq.com/contacts/${contactId}/tags`, {
       method: 'DELETE',
       headers: {
         'Authorization': `Bearer ${GHL_API_KEY}`,
@@ -100,7 +101,7 @@ async function removeContactTag(contactId, tag) {
       },
       body: JSON.stringify({ tags: [tag] }),
       signal: AbortSignal.timeout(10000),
-    });
+    }));
     if (!res.ok) {
       const body = await res.text();
       console.warn(`[PauseSweep] Tag removal failed for ${contactId}: ${res.status} ${body}`);

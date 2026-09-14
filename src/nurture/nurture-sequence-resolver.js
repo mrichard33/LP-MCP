@@ -48,6 +48,8 @@
  * misconfigured callers in production.
  */
 
+import { withGhlToken } from '../ghl-rate-limiter.js';
+
 const GHL_API_KEY = process.env.GHL_API_KEY;
 const GHL_API_BASE = 'https://services.leadconnectorhq.com';
 const SEQ_POS_FIELD_ID = 'apoe5TFnilPriJmIzvbo'; // ai_msg_sequence_position
@@ -82,7 +84,7 @@ function coerceSeqPos(raw) {
 async function fetchSeqPosFromGHL(contactId) {
   if (!GHL_API_KEY || !contactId) return null;
   try {
-    const res = await fetch(`${GHL_API_BASE}/contacts/${contactId}`, {
+    const res = await withGhlToken(() => fetch(`${GHL_API_BASE}/contacts/${contactId}`, {
       method: 'GET',
       headers: {
         'Authorization': `Bearer ${GHL_API_KEY}`,
@@ -90,7 +92,7 @@ async function fetchSeqPosFromGHL(contactId) {
         'Accept': 'application/json',
       },
       signal: AbortSignal.timeout(DEFAULT_TIMEOUT_MS),
-    });
+    }));
     if (!res.ok) {
       console.warn(`[SeqResolver] GHL GET /contacts/${contactId} returned ${res.status}`);
       return null;
