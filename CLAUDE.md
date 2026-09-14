@@ -13,7 +13,12 @@ accident — the ones that cost an incident when they were missed. It is not a t
 mirror do the rest:
 
 - `sendGroupMeMessage(text, { channel })` in `src/groupme.js` calls `mirrorToSlack` on every send, so
-  one call reaches both. Channels are `main`, `canvass`, `ops` (and `unknown` → `main`).
+  one call reaches both. Channels are `main`, `canvass`, `sales`, `ops` (and `unknown` → `main`).
+- **A market-scoped channel needs the market CODE, not the name.** `canvass` and `sales` resolve
+  `<prefix>-<slug>` through `slack_market_slugs`, which is keyed on the code (`FTMYR`), while the
+  card prints the display name (`Ft. Myers / SW Florida`). Passing the name resolves nothing and the
+  card lands in the rollup only. `resolveMarketCode()` in `src/actions/enrichment.js` returns the
+  code; `resolveMarket()` returns the name.
 - **Operational alarms use `channel: 'ops'`** → the dedicated ops bot, mirrored to
   `SLACK_CHANNEL_OPS` (#ops-alerts). Precedent: `src/jobs/lp-report-watchdog.js`,
   `src/jobs/capacity-sweep.js`, `maybeAlertFailClosed` in `src/decision-engine-heartbeat.js`.

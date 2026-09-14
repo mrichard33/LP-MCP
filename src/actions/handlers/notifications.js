@@ -35,6 +35,10 @@
  *   Reece_GroupMe_Notification_Standard_v1.md. Classified vs legacy
  *   routing; debug class → dev channel only; narratives auto-sanitized.
  *
+ *   2026-09-14 — a card on a market-scoped channel ('canvass', 'sales') now
+ *   carries the market CODE so the Slack mirror can reach that market's
+ *   channel. On the 'sales' channel the rep's market wins over the lead's.
+ *
  * 2026-05-14 — OPT IN TO v1.7 GROUPME DEBOUNCE (contactId passthrough).
  * 2026-05-13 — RECOVERABLE NON-IDEMPOTENT RETRY (ref: a${id} footer).
  * 2026-05-11 — PER-RULE COOLDOWN + WIDER LOG PREVIEW.
@@ -42,6 +46,7 @@
 
 import supabase from '../../supabase.js';
 import { sendGroupMeMessage } from '../../groupme.js';
+import { resolveRepMarketCode } from '../../rep-roster.js';
 import { checkForActionRef } from '../../groupme-read.js';
 import { interpolatePayload } from '../helpers.js';
 import { formatDateTime, formatDateTimeUS } from '../../format-helpers.js';
@@ -235,6 +240,10 @@ export async function executeSendNotification(action, context) {
       prospectId,
       // v3 — required-field card (classifier v1.1)
       market: enrichment.market,
+      // 2026-09-14 — the assigned rep. Already loaded from lp_leads.rep_name
+      // and rendered on the legacy card; the classified card was dropping it,
+      // which is the one line a "my rep never sent it" alert most needs.
+      rep: enrichment.repName,
       lpSource: enrichment.lpSource,
       lpSourceDetail: enrichment.lpSourceDetail,
       lossReason: enrichment.lossReason,
@@ -275,6 +284,25 @@ export async function executeSendNotification(action, context) {
     full = `${built}\n\nref: a${action.id}`;
   }
 
+  // 2026-09-14 — market routing for the Slack mirror.
+  //
+  // A market-scoped channel ('canvass', 'sales') needs the market CODE, not the
+  // display name the card prints: the mirror resolves the channel through
+  // slack_market_slugs, which is keyed on the code. Passing the name resolves
+  // nothing and the card quietly lands in the rollup only.
+  //
+  // For a sales card we want the market the REP works in, so the complaint
+  // reaches the team that can chase them. The roster is thin until people are
+  // onboarded through the Slack form, so a miss falls back to the lead's own
+  // market rather than dropping the routing. An explicit market on the rule
+  // payload beats both.
+  let marketCode = payload.market || payload.market_code || null;
+  if (!marketCode && payload.channel === 'sales' && enrichment.repName) {
+    const rep = await resolveRepMarketCode(enrichment.repName);
+    if (rep.code) marketCode = rep.code;
+  }
+  if (!marketCode) marketCode = enrichment.marketCode || null;
+
   // Rep-facing send — passes contactId for v1.7 debounce consolidation.
   // 2026-07-15 — rules may route to a per-purpose channel ('canvass' →
   // GROUPME_CANVASS_BOT_ID) and/or bypass the debounce with flushNow
@@ -283,6 +311,7 @@ export async function executeSendNotification(action, context) {
     contactId,
     contactName: name,
     channel: payload.channel || undefined,
+    market: marketCode || undefined,
     flushNow: payload.flushNow === true || payload.flush_now === true,
   });
   return {

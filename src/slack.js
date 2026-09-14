@@ -14,6 +14,8 @@
  *   main    → SLACK_CHANNEL_MAIN     (#lead-intelligence)
  *   canvass → market channel from slack_channels (when opts.market is given)
  *             PLUS SLACK_CHANNEL_CANVASS (#canvass-all)
+ *   sales   → market channel from slack_channels (when opts.market is given)
+ *             PLUS SLACK_CHANNEL_SALES (#sales-all)
  *   ops     → SLACK_CHANNEL_OPS      (#ops-alerts)
  *   unknown → main (mirrors _resolveBotId's fallback exactly)
  *
@@ -26,11 +28,20 @@ const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN || '';
 const MIRROR_ENABLED = String(process.env.SLACK_MIRROR_ENABLED || 'false') === 'true';
 const CH_MAIN = process.env.SLACK_CHANNEL_MAIN || '';
 const CH_CANVASS = process.env.SLACK_CHANNEL_CANVASS || '';
+const CH_SALES = process.env.SLACK_CHANNEL_SALES || '';
 const CH_OPS = process.env.SLACK_CHANNEL_OPS || '';
 
 // Codes with no Slack channel of their own. Boca and Miami are worked out of
-// the Fort Lauderdale office and post to its canvass channel.
+// the Fort Lauderdale office and post to its channels.
 const MARKET_ALIASES = { BOCA: 'FTLAU', MIAMI: 'FTLAU' };
+
+// Logical channel -> the slack_channels name prefix its market channels use,
+// and the env var holding its all-markets rollup. Adding a market-scoped
+// channel family is a row here, not a new branch below.
+const MARKET_FAMILIES = {
+  canvass: { prefix: 'canvass', rollup: () => CH_CANVASS },
+  sales: { prefix: 'sales', rollup: () => CH_SALES },
+};
 
 const CACHE_TTL_MS = 10 * 60 * 1000;
 let channelCache = null;      // Map channel_name -> slack_channel_id
@@ -52,7 +63,7 @@ function _client() {
   return _clientOverride || supabase;
 }
 
-console.log(`[Slack] mirror enabled=${MIRROR_ENABLED} token=${SLACK_BOT_TOKEN ? 'set' : 'unset'} main=${CH_MAIN || '-'} canvass=${CH_CANVASS || '-'} ops=${CH_OPS || '-'}`);
+console.log(`[Slack] mirror enabled=${MIRROR_ENABLED} token=${SLACK_BOT_TOKEN ? 'set' : 'unset'} main=${CH_MAIN || '-'} canvass=${CH_CANVASS || '-'} sales=${CH_SALES || '-'} ops=${CH_OPS || '-'}`);
 
 function _normKey(v) {
   return String(v || '').trim().toUpperCase();
@@ -89,25 +100,28 @@ async function _loadCache() {
 /**
  * Which Slack channel ids does this card go to?
  *
- * A canvass card with a market goes to BOTH the market channel and the
- * all-markets rollup — the market team needs it, and leadership watches one
- * feed instead of seven.
+ * A market-scoped card (canvass or sales) with a market goes to BOTH that
+ * market's channel and the all-markets rollup — the market team needs it, and
+ * leadership watches one feed instead of seven. With no market, or a market
+ * that has no channel, it still reaches the rollup rather than vanishing.
  *
  * @returns {Promise<string[]>} zero or more channel ids
  */
 export async function resolveSlackChannels(channel, opts = {}) {
   const chan = channel || 'main';
-  if (chan === 'canvass') {
+  const family = MARKET_FAMILIES[chan];
+  if (family) {
     const out = [];
     if (opts.market) {
       await _loadCache();
       const code = MARKET_ALIASES[_normKey(opts.market)] || _normKey(opts.market);
       const slug = slugCache?.get(code);
-      const id = slug && channelCache?.get(`canvass-${slug}`);
+      const id = slug && channelCache?.get(`${family.prefix}-${slug}`);
       if (id) out.push(id);
-      else console.warn(`[Slack] no canvass channel for market=${opts.market} — rollup only`);
+      else console.warn(`[Slack] no ${family.prefix} channel for market=${opts.market} — rollup only`);
     }
-    if (CH_CANVASS && !out.includes(CH_CANVASS)) out.push(CH_CANVASS);
+    const rollup = family.rollup();
+    if (rollup && !out.includes(rollup)) out.push(rollup);
     return out;
   }
   if (chan === 'ops') return CH_OPS ? [CH_OPS] : [];

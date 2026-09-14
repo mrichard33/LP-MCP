@@ -13,7 +13,7 @@
  * absence-is-signal doctrine on the Prospect line — plus optional Reason
  * (loss-reason:* tag, humanized), 📅 appointment (date AND time,
  * always together), and 📐 Estimate (calculator measurements) lines.
- * New buildClassifiedNotification args: market, lpSource,
+ * New buildClassifiedNotification args: rep, market, lpSource,
  * lpSourceDetail, lossReason, appointmentDisplay, calcSummary.
  * All optional — existing callers render unchanged minus the two new
  * always-on lines.
@@ -179,6 +179,7 @@ export function inferClassification(ruleKey = '', message = '') {
  * @param {string} [args.email]       — v1.2: renders ✉️ when present
  * @param {string} [args.jobSize]     — v1.2: e.g. "8 windows · 2 doors"; renders 📐 Job size when present
  * @param {string} [args.canvasser]   — v1.2: resolved canvasser NAME; renders 🚪 when present
+ * @param {string} [args.rep]         — 2026-09-14: assigned sales rep NAME; renders 🧑\u200d💼 when present
  * @param {string} [args.lpRef]       — v1.2: e.g. "inbound #418575" or "Lead 570351 | Prospect 454810"; renders 📋 LP when present
  * @param {'Cold'|'Warm'|'Hot'|'Imminent'} [args.tier]
  * @param {string} [args.status]      — short status descriptor
@@ -206,6 +207,7 @@ export function buildClassifiedNotification(args = {}) {
     email,
     jobSize,
     canvasser,
+    rep,
     lpRef,
     tier,
     status,
@@ -259,6 +261,7 @@ export function buildClassifiedNotification(args = {}) {
   if (email)     lines.push(`✉️ ${email}`);
   if (jobSize)   lines.push(`📐 Job size: ${jobSize}`);
   if (canvasser) lines.push(`🚪 Canvasser: ${canvasser}`);
+  if (rep)       lines.push(`🧑\u200d💼 Rep: ${rep}`);
   if (lpRef)     lines.push(`📋 LP: ${lpRef}`);
 
   lines.push('');
