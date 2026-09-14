@@ -447,8 +447,10 @@ export function buildJobSize({ window_count, door_count, slider_count } = {}) {
  *
  * `market` and `canvasserName` are resolved ONCE per processCanvassingLead run
  * and threaded through every card in that run — the market from the homeowner's
- * zip rather than the hardcoded literal 'Canvassing' this used to print, and the
- * canvasser from the LP roster.
+ * zip (falling back to the city, then to the classifier's "Unknown"), and the
+ * canvasser from the LP roster. There is deliberately no literal fallback:
+ * printing 'Canvassing' in the market slot named a source as a market and hid
+ * an unmapped or out-of-area zip.
  *
  * lpSourceDetail is the RESOLVED canvasser NAME and never p.promoter: GHL sends
  * the numeric Pro ID in that field, so the Src line rendered blank on every card
@@ -470,7 +472,11 @@ function canvassCard({
     name: [p.first_name, p.last_name].filter(Boolean).join(' ') || 'Unknown',
     phone: p.phone_raw,
     contactId: p.ghl_contact_id,
-    market: market || 'Canvassing',
+    // No literal fallback. "Canvassing" is a SOURCE, not a market — printing it
+    // in the market slot hid the real signal: the homeowner's zip is not in
+    // service_area_zips, i.e. possibly outside the service area. The classifier
+    // renders "Unknown" when this is absent, which is the honest answer.
+    market: market || undefined,
     lpSource: isEvent ? 'Events' : 'Canvassing',
     lpSourceDetail: canvasserName || undefined,
     // Shared with the LP appointment card so the two render an address the same
@@ -502,6 +508,7 @@ const DEFAULT_DEPS = {
   emitEvent,
   resolveCanvasserProId,
   checkServiceAreaZip,
+  resolveMarket,
   now: () => new Date(),
 };
 
@@ -541,13 +548,18 @@ export async function processCanvassingLead(payload, deps = {}) {
     // 1b. Resolve the market ONCE for every card this run will send. The zip is
     // the homeowner's, straight off the form — this handler has no fetched GHL
     // contact to read a market code from, which is why the cards hardcoded the
-    // literal 'Canvassing' as a "market" until now. Fail-soft: a lookup that
-    // errors leaves the old literal in place rather than losing the card.
+    // literal 'Canvassing' as a "market" until now.
+    //
+    // The city goes with it (2026-09-14): contact y3P1vbwA8nSiBMf7A58H carded
+    // "Market: Canvassing" because zip 32169 was missing from service_area_zips.
+    // With the city in hand an unmapped zip degrades to the city name instead of
+    // to nothing. Fail-soft: a lookup that errors leaves market null and the
+    // classifier renders "Unknown" rather than losing the card.
     let market = null;
     try {
-      market = await resolveMarket({ zip: p.zip });
+      market = await d.resolveMarket({ zip: p.zip, city: p.city });
     } catch (err) {
-      console.warn(`[Canvassing] market resolution failed for ${p.ghl_contact_id} (cards fall back): ${err.message}`);
+      console.warn(`[Canvassing] market resolution failed for ${p.ghl_contact_id} (cards render "Unknown"): ${err.message}`);
     }
 
     // 1c. Resolve the LP market CODE once for the Slack mirror (2026-09-09
