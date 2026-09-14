@@ -65,6 +65,11 @@
  *        human cancelled in one system; which system is authoritative is a
  *        judgement call, so a rep decides.
  *
+ *   E. lp_cancelled_ghl_active — LP cancelled (CXL/NoHome/NG), GHL still
+ *      holds an ACTIVE appointment. The mirror of D, and new in v1.2.
+ *      → ESCALATE, never auto-heal. Writing the appointment back into LP
+ *        would silently un-cancel something a human cancelled.
+ *
  * ---------------------------------------------------------------------
  * DNC HANDLING (owner ruling, Mark 2026-08-17)
  *
@@ -105,6 +110,43 @@
  *     against a moving now() manufactures phantom gaps for anything starting
  *     during the run. That artifact produced a 42-contact false gap in the
  *     2026-08-17 manual audit before it was caught.
+ *
+ * ---------------------------------------------------------------------
+ * v1.2 — 2026-09-14 — WHY THE HEALS NEVER HEALED (Class E)
+ *
+ * v1.1 made the counters honest, and the first live run under them answered
+ * the question immediately: healed=0, already_present=2. A full live sweep
+ * with writes enabled repaired NOTHING.
+ *
+ * The cause was in readLpBook. It dropped every lp_leads row whose disposition
+ * was CXL / NoHome / NG, so a contact LP had CANCELLED was indistinguishable
+ * from one LP had never heard of. Class A then treated it as a missing
+ * appointment and tried to heal it — and syncAppointmentToLP correctly refused
+ * every time ("LP already holds appt on <date> ... per GHL LP-synced fields"),
+ * because LP does hold the record; it is simply cancelled.
+ *
+ * So the gap could never clear. It was re-attempted every 30 minutes forever,
+ * burning one of only 10 writes per run and holding an alert slot that a
+ * genuinely missing appointment needed. The two systems were never in
+ * disagreement about the facts — they were answering different questions.
+ *
+ * Measured 2026-09-14: 28 lp_leads rows sat at CXL with a future appointment
+ * inside the 45-day window. Worked example — Frank Sarchapone
+ * (oubiIiCW8U0i7GmPMCC7): GHL appointment 4DyGUTgXMOCh12PpCHV5 status=new for
+ * 15 Sep 18:00; LP lead 207103, same slot, disposition CXL.
+ *
+ * Fix: readLpBook now returns { active, resolved } instead of discarding the
+ * resolved rows, and Class E escalates that case to a human. Class A is
+ * unchanged for contacts LP genuinely lacks.
+ *
+ * Two smaller fixes rode along:
+ *   - classifyHealResult now recognises 'create_lead_already_enrolled'. The
+ *     live run returned it and it landed in unknown_result — which is exactly
+ *     what that bucket is for, surfacing an unenumerated action rather than
+ *     quietly inflating the heal count.
+ *   - POST /n8n/appointments/parity-check now takes the authenticate
+ *     middleware. It was the only route in its group mounted without it, and
+ *     it accepts {dryRun:false} — a live sweep that writes to LP and GHL.
  *
  * ---------------------------------------------------------------------
  * v1.1 — 2026-09-14 — THE SWEEP WAS LYING (PARITY_AUTOHEAL switch-on)
@@ -192,9 +234,15 @@ function classifyHealResult(result) {
     case 'past_appointment_left_asis':
       return 'not_attempted';
     case 'lp_lead_creation_enrolled':
+    case 'create_lead_already_enrolled':
       // The self-heal path: no LP appointment yet, but the contact is enrolled
       // in the addlead-with-appointment workflow that creates one. Real work,
       // not yet a repair — it lands (or does not) on a later sweep.
+      //
+      // create_lead_already_enrolled added 2026-09-14: the first live run after
+      // v1.1 returned it and it fell into unknown_result, which is exactly what
+      // that bucket is for — surfacing an action nobody had enumerated instead
+      // of quietly inflating the heal count. Same family, already-enrolled.
       return 'heal_enrolled';
     default:
       return 'unknown_result';
@@ -255,7 +303,17 @@ async function readGhlBook(from, to) {
   return { active, cancelled };
 }
 
-/** LP book: appointments per contact in [from, to). */
+/**
+ * LP book: appointments per contact in [from, to).
+ *
+ * Returns TWO maps as of v1.2:
+ *   active   — appointments in a live disposition. The real LP book.
+ *   resolved — appointments whose disposition is CXL / NoHome / NG.
+ *
+ * Before v1.2 the resolved rows were simply dropped, which made "LP cancelled
+ * this appointment" indistinguishable from "LP never had this appointment".
+ * That is a real difference and it had a real cost — see Class E below.
+ */
 async function readLpBook(from, to) {
   const { data, error } = await supabase
     .from('lp_leads')
@@ -270,18 +328,22 @@ async function readLpBook(from, to) {
   if (error) throw new Error(`LP appointment read: ${error.message}`);
 
   // A contact can carry several lp_leads rows (rebooks, and the known
-  // identity-collision class). Keep the most recently updated row that is
-  // not in a resolved disposition — that is the live appointment.
+  // identity-collision class). Keep the most recently updated row per contact
+  // in each bucket.
   const book = new Map();
-  for (const row of data || []) {
-    if (RESOLVED_DISPOSITIONS.has(row.disposition_code)) continue;
-    const prev = book.get(row.ghl_contact_id);
-    if (!prev) { book.set(row.ghl_contact_id, row); continue; }
+  const resolved = new Map();
+  const keepNewest = (map, row) => {
+    const prev = map.get(row.ghl_contact_id);
+    if (!prev) { map.set(row.ghl_contact_id, row); return; }
     const a = row.updated_at_lp ? new Date(row.updated_at_lp).getTime() : 0;
     const b = prev.updated_at_lp ? new Date(prev.updated_at_lp).getTime() : 0;
-    if (a > b) book.set(row.ghl_contact_id, row);
+    if (a > b) map.set(row.ghl_contact_id, row);
+  };
+
+  for (const row of data || []) {
+    keepNewest(RESOLVED_DISPOSITIONS.has(row.disposition_code) ? resolved : book, row);
   }
-  return book;
+  return { active: book, resolved };
 }
 
 /**
@@ -336,10 +398,11 @@ export async function runAppointmentParityWatchdog({ dryRun = !PARITY_AUTOHEAL, 
   const asOf = new Date();
   const windowEnd = new Date(asOf.getTime() + PARITY_WINDOW_DAYS * 86400000);
 
-  const [{ active: ghlActive, cancelled: ghlCancelled }, lpBook] = await Promise.all([
-    _readGhlBook(asOf, windowEnd),
-    _readLpBook(asOf, windowEnd),
-  ]);
+  const [{ active: ghlActive, cancelled: ghlCancelled }, { active: lpBook, resolved: lpResolved }] =
+    await Promise.all([
+      _readGhlBook(asOf, windowEnd),
+      _readLpBook(asOf, windowEnd),
+    ]);
 
   const findings = [];
   let writes = 0;
@@ -349,6 +412,7 @@ export async function runAppointmentParityWatchdog({ dryRun = !PARITY_AUTOHEAL, 
     ghl_missing_appointment: 0,
     confirmation_drift: 0,
     cancellation_drift: 0,
+    lp_cancelled_ghl_active: 0,
     dnc_lifted: 0,
     dnc_partial_lift: 0,
     dnc_blocked_consent: 0,
@@ -375,9 +439,52 @@ export async function runAppointmentParityWatchdog({ dryRun = !PARITY_AUTOHEAL, 
 
   const canWrite = () => !dryRun && writes < PARITY_MAX_WRITES;
 
+  // ---- Class E: GHL active, LP CANCELLED. ESCALATE. -----------------
+  //
+  // v1.2 — 2026-09-14. This class did not exist, and its absence was the whole
+  // reason autoheal never healed anything. readLpBook dropped every row in a
+  // resolved disposition, so a contact LP had CANCELLED looked identical to one
+  // LP had never heard of — and Class A below then tried to "heal" it by
+  // writing the appointment to LP. syncAppointmentToLP correctly refused every
+  // time ("LP already holds appt ... per GHL LP-synced fields"), so the gap
+  // could never clear: it was re-attempted every 30 minutes forever, burning a
+  // write from a budget of 10 and holding an alert slot that a genuinely
+  // missing appointment needed.
+  //
+  // Verified 2026-09-14: 28 lp_leads rows sat at CXL with a future appointment
+  // inside the window. Frank Sarchapone (oubiIiCW8U0i7GmPMCC7) is the worked
+  // example — GHL appointment 4DyGUTgXMOCh12PpCHV5 status=new for 15 Sep 18:00,
+  // LP lead 207103 same slot, disposition CXL.
+  //
+  // ESCALATE, never auto-heal — the same reasoning Class D already applies to
+  // the mirror case: a cancellation that only half-landed means a human
+  // cancelled in one system, and which system is authoritative is a judgement
+  // call. Writing the appointment back into LP would silently un-cancel it.
+  for (const [cid, appt] of ghlActive) {
+    if (lpBook.has(cid)) continue;
+    const lpRow = lpResolved.get(cid);
+    if (!lpRow) continue;
+
+    counts.lp_cancelled_ghl_active++;
+    findings.push({
+      class: 'lp_cancelled_ghl_active',
+      contact_id: cid,
+      name: `${lpRow.first_name || ''} ${lpRow.last_name || ''}`.trim(),
+      ghl_appointment_id: appt.ghl_appointment_id,
+      ghl_start: appt.start_time,
+      ghl_status: appt.status,
+      lp_appointment_date: lpRow.appointment_date,
+      lp_disposition: lpRow.disposition_code,
+      lp_prospect_id: lpRow.lp_prospect_id,
+      action: 'escalate_to_rep',
+    });
+  }
+
   // ---- Class A: GHL has it, LP does not. AUTO-HEAL. -----------------
   for (const [cid, appt] of ghlActive) {
     if (lpBook.has(cid)) continue;
+    // A contact LP has cancelled is Class E above, not a missing appointment.
+    if (lpResolved.has(cid)) continue;
     counts.lp_missing_appointment++;
     const finding = {
       class: 'lp_missing_appointment',
@@ -510,6 +617,12 @@ export async function runAppointmentParityWatchdog({ dryRun = !PARITY_AUTOHEAL, 
   // starve the classes that repair state. The ops card below is what actually
   // reaches a human — no agent_rule consumes appointment.parity_gap, so the
   // event alone reached nobody even before the intake filter dropped it.
+  // Class E findings were built above but not yet emitted; they escalate on the
+  // same budget and in the same order as B/D.
+  const escalations = [
+    ...findings.filter((f) => f.class === 'lp_cancelled_ghl_active'),
+  ];
+
   for (const [cid, lead] of lpBook) {
     if (ghlActive.has(cid)) continue;
     const wasCancelled = ghlCancelled.has(cid);
@@ -525,6 +638,7 @@ export async function runAppointmentParityWatchdog({ dryRun = !PARITY_AUTOHEAL, 
       lp_prospect_id: lead.lp_prospect_id,
       action: 'escalate_to_rep',
     };
+    escalations.push(finding);
 
     if (canWrite()) {
       try {
@@ -547,6 +661,31 @@ export async function runAppointmentParityWatchdog({ dryRun = !PARITY_AUTOHEAL, 
       counts.write_ceiling_hit++;
     }
     findings.push(finding);
+  }
+
+  // Class E emits last — it is the newest class and the least understood, so it
+  // yields budget to the classes that have been load-bearing for longer.
+  for (const finding of escalations.filter((f) => f.class === 'lp_cancelled_ghl_active')) {
+    if (!canWrite()) {
+      if (!dryRun) counts.write_ceiling_hit++;
+      continue;
+    }
+    try {
+      const res = await _emitEvent({
+        event_type: 'appointment.parity_gap',
+        event_subtype: 'lp_cancelled_ghl_active',
+        source: 'appointment_parity_watchdog',
+        entity_type: 'contact',
+        entity_id: finding.contact_id,
+        ghl_contact_id: finding.contact_id,
+        payload: finding,
+        priority: 'high',
+        idempotency_key: `parity_lp_cancelled_${finding.contact_id}_${String(finding.ghl_start).slice(0, 13)}`,
+      });
+      writes++;
+      const outcome = classifyEmit(res);
+      outcomes[outcome === 'emitted' ? 'escalated' : outcome]++;
+    } catch (err) { errors++; }
   }
 
   const ghlCount = ghlActive.size;
@@ -588,7 +727,8 @@ export async function runAppointmentParityWatchdog({ dryRun = !PARITY_AUTOHEAL, 
   console.log(
     `[ApptParity] GHL ${ghlCount} / LP ${lpCount} / matched ${matched} (${summary.parity_pct}%) — ` +
     `${counts.lp_missing_appointment} LP-missing, ${counts.ghl_missing_appointment} GHL-missing, ` +
-    `${counts.confirmation_drift} confirm-drift, ${counts.cancellation_drift} cancel-drift — ` +
+    `${counts.confirmation_drift} confirm-drift, ${counts.cancellation_drift} cancel-drift, ` +
+    `${counts.lp_cancelled_ghl_active} lp-cancelled-ghl-active — ` +
     `${outcomeTail || 'no writes attempted'}, ${errors} errors` +
     (counts.write_ceiling_hit ? `, ${counts.write_ceiling_hit} over write ceiling` : '') +
     (dryRun ? ' [DRY RUN]' : '')
@@ -703,8 +843,12 @@ export function startAppointmentParityScheduler() {
   console.log(`[ApptParity] Scheduler armed: ${PARITY_WINDOW_DAYS}d window, ${PARITY_INTERVAL_MS / 60000}min cadence, autoheal=${PARITY_AUTOHEAL}`);
 }
 
-export function registerAppointmentParityRoutes(app) {
-  app.post('/n8n/appointments/parity-check', async (req, res) => {
+export function registerAppointmentParityRoutes(app, authenticate = (req, res, next) => next()) {
+  // authenticate is REQUIRED in practice — this route can run a live sweep that
+  // writes to LP and GHL (POST {dryRun:false}). The permissive default exists
+  // only so tests can mount the route without building an auth stack; index.js
+  // passes the real middleware.
+  app.post('/n8n/appointments/parity-check', authenticate, async (req, res) => {
     try {
       const dryRun = req.body?.dryRun !== false && !PARITY_AUTOHEAL ? true : req.body?.dryRun === true;
       res.json(await runAppointmentParityWatchdog({ dryRun }));

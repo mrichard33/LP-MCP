@@ -46,6 +46,18 @@ test('escalation-class findings produce an alert verdict', () => {
   assert.equal(v.gaps.length, 2);
 });
 
+test('an LP-cancelled / GHL-active gap is an escalation, not a heal', () => {
+  // Class E (v1.2). It must reach a human: auto-healing it would write the
+  // appointment back into LP and silently un-cancel something a human cancelled.
+  const v = shouldAlertParityGaps({ findings: [gap('c1', 'lp_cancelled_ghl_active')] });
+  assert.equal(v.verdict, 'alert');
+  assert.equal(v.gaps.length, 1);
+
+  const text = formatParityGapCard(v.gaps, { totalGaps: 1 });
+  assert.match(text, /Cancelled in LP, still ACTIVE in GHL/,
+    'the card must say which direction the cancellation went');
+});
+
 test('heal-class findings alone are healthy, not an alert', () => {
   // A sweep that only found things it repairs itself must not page. Firing on
   // the healthy case is precisely the habit that gets an alarm muted.

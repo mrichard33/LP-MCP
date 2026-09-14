@@ -42,10 +42,22 @@ const MAX_LISTED = 10;
 const LABELS = {
   ghl_missing_appointment: 'Booked in LP, missing from GHL',
   cancellation_drift: 'Cancelled in GHL, still set in LP',
+  lp_cancelled_ghl_active: 'Cancelled in LP, still ACTIVE in GHL',
 };
 
-/** Divergence classes that mean a human has to look. */
-const ESCALATION_CLASSES = new Set(['ghl_missing_appointment', 'cancellation_drift']);
+/**
+ * Divergence classes that mean a human has to look.
+ *
+ * lp_cancelled_ghl_active added 2026-09-14 (v1.2). It is the mirror of
+ * cancellation_drift and it must NEVER be auto-healed: writing the appointment
+ * back into LP would silently un-cancel something a human cancelled. A rep
+ * decides which system is right, exactly as with the other two.
+ */
+const ESCALATION_CLASSES = new Set([
+  'ghl_missing_appointment',
+  'cancellation_drift',
+  'lp_cancelled_ghl_active',
+]);
 
 /**
  * Decide whether a sweep's escalations are worth a card.

@@ -50,11 +50,13 @@ function books() {
   return { ghlActive, lpBook };
 }
 
-function deps(emitted) {
+function deps(emitted, resolved = new Map()) {
   const { ghlActive, lpBook } = books();
   return {
     readGhlBook: async () => ({ active: ghlActive, cancelled: new Map() }),
-    readLpBook: async () => lpBook,
+    // v1.2 shape: { active, resolved }. Resolved-disposition rows are no longer
+    // discarded — see Class E.
+    readLpBook: async () => ({ active: lpBook, resolved }),
     getGHLContact: async () => ({ tags: [] }),
     syncAppointmentToLP: async () => ({ success: true, action: 'lp_appointment_set' }),
     emitEvent: async (evt) => { emitted.push(evt.event_type); return { id: emitted.length }; },
@@ -97,4 +99,58 @@ test('findings are reported even when the budget is exhausted', async () => {
   assert.equal(gaps.length, 3,
     'an unwritten escalation is still a finding — the ops card is what reaches a human, '
     + 'and it reads findings, not events');
+});
+
+
+// ═══════════════════════════════════════════════════════════════════
+// Class E — LP cancelled it, GHL still has it active
+// ═══════════════════════════════════════════════════════════════════
+
+test('a contact LP CANCELLED is not treated as a missing appointment', async () => {
+  // THE BUG (2026-09-14). readLpBook dropped every row in a resolved
+  // disposition, so "LP cancelled this" was indistinguishable from "LP never
+  // had this" — and Class A then tried to heal it. syncAppointmentToLP refused
+  // every time ("LP already holds appt"), so the gap could never clear: it was
+  // re-attempted every 30 minutes forever, burning a write from a budget of 10.
+  // Worked example: Frank Sarchapone, GHL appointment status=new for 15 Sep
+  // 18:00, LP lead 207103 same slot at CXL.
+  const emitted = [];
+  const resolved = new Map([
+    ['heal-me', {
+      ghl_contact_id: 'heal-me', disposition_code: 'CXL',
+      appointment_date: soon(), first_name: 'Frank', last_name: 'Sarchapone',
+    }],
+  ]);
+  const r = await runAppointmentParityWatchdog({ deps: deps(emitted, resolved) });
+
+  assert.equal(r.counts.lp_missing_appointment, 0,
+    'a cancelled-in-LP contact must NOT be counted as missing from LP');
+  assert.equal(r.counts.lp_cancelled_ghl_active, 1, 'it is its own class');
+  assert.equal(r.outcomes.healed, 0, 'and it must never be auto-healed');
+  assert.equal(r.outcomes.heal_enrolled ?? 0, 0);
+
+  const e = r.findings.find((f) => f.class === 'lp_cancelled_ghl_active');
+  assert.ok(e, 'the finding must exist for the ops card to report it');
+  assert.equal(e.action, 'escalate_to_rep',
+    'writing the appointment back to LP would silently un-cancel it');
+  assert.equal(e.lp_disposition, 'CXL');
+});
+
+test('Class E escalates rather than emitting a heal', async () => {
+  const emitted = [];
+  const resolved = new Map([
+    ['heal-me', { ghl_contact_id: 'heal-me', disposition_code: 'CXL', appointment_date: soon() }],
+  ]);
+  await runAppointmentParityWatchdog({ deps: deps(emitted, resolved) });
+  assert.ok(!emitted.includes('dnc.lift_requested'),
+    'no DNC lift — that path belongs to a real heal attempt');
+});
+
+test('a genuinely missing contact is still healed', async () => {
+  // The other half: with NO resolved row, Class A must behave exactly as before.
+  const emitted = [];
+  const r = await runAppointmentParityWatchdog({ deps: deps(emitted, new Map()) });
+  assert.equal(r.counts.lp_missing_appointment, 1);
+  assert.equal(r.counts.lp_cancelled_ghl_active, 0);
+  assert.equal(r.outcomes.healed, 1, 'Class E must not swallow real missing appointments');
 });
