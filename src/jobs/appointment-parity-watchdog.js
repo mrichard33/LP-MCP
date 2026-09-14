@@ -112,6 +112,40 @@
  *     2026-08-17 manual audit before it was caught.
  *
  * ---------------------------------------------------------------------
+ * v1.3 — 2026-09-14 — CLASS B WAS ALARMING ON THE RECONCILER'S OWN LAG
+ *
+ * Class B escalated any contact with an LP appointment and no active GHL one,
+ * with NO minimum age on the LP row. But the LP→GHL reconciler runs in BATCHES
+ * every 30 minutes, and this watchdog runs on its own ~27-minute cadence, so it
+ * samples BETWEEN batches. Everything booked in LP since the last batch reads
+ * as a gap.
+ *
+ * Verified 2026-09-14 — six alerted contacts, all six self-healed with no human
+ * touching them, every GHL appointment matching LP's date and time exactly:
+ *   Gulliford  FivBslY9ggCiDhjuUSbA  alert 16:25 ET  appt created 17:00
+ *   Syrja      KuqcgHXQ8tszYPn0m1HI  alert 16:25     appt created 16:30
+ *   Williams   h11ktAUCjnIvXiMKZZdG  alert 16:25     appt created 16:30
+ *   Miller     sw1wdenhbj6gtsJW0pLN  alert 16:52     appt created 17:00
+ *   Schweitzer X5atTwAOiJANHiWRgDPt  alert 17:19     appt created 17:30
+ *   Godwin     Qpb7g8n9ebG8F83IPVrW  alert 17:19     appt created 17:30
+ * Zero real gaps in that sample. The GHL `created_at` timestamps cluster at :00
+ * and :30 and are identical within each batch — that IS the reconciler cadence,
+ * not a coincidence.
+ *
+ * Fix: PARITY_GHL_MISSING_MIN_AGE_MIN (default 90) — Class B skips an LP row
+ * younger than the gate. Measured canvass-submit → GHL-appointment-created over
+ * 30 days is p50 12.8 min, p90 46.7 min, p99 690 min, so 90 minutes suppresses
+ * ~95% of the false positives while anything genuinely stranded is caught on
+ * the next sweep (the gate delays a finding, it never drops one).
+ *
+ * CLASS B ONLY. Class E in particular keeps firing immediately: a CANCELLED LP
+ * record against a live GHL slot is never a timing artifact.
+ *
+ * Suppressed findings are COUNTED (`ghl_missing_too_new`) and printed in the
+ * summary line. A silent suppression is how an alarm becomes a blind spot —
+ * a sweep that held twelve findings has to say so.
+ *
+ * ---------------------------------------------------------------------
  * v1.2 — 2026-09-14 — WHY THE HEALS NEVER HEALED (Class E)
  *
  * v1.1 made the counters honest, and the first live run under them answered
@@ -193,6 +227,7 @@
  *   PARITY_WINDOW_DAYS=45        how far ahead to reconcile
  *   PARITY_MAX_WRITES=25         per-run write ceiling
  *   PARITY_INTERVAL_MS=30m
+ *   PARITY_GHL_MISSING_MIN_AGE_MIN=90   Class B grace period (reconciler lag)
  */
 
 import supabase from '../supabase.js';
@@ -200,7 +235,7 @@ import { getHlSupabase } from '../admin/hl-client.js';
 import { emitEvent } from '../event-emitter.js';
 import { syncAppointmentToLP } from '../lp-appointment-sync.js';
 import { getGHLContact } from '../ghl.js';
-import { utcToLpStoredIso } from '../lp-dates.js';
+import { utcToLpStoredIso, lpStoredAgeMinutes } from '../lp-dates.js';
 import { sendGroupMeMessage } from '../groupme.js';
 import { claimAlertConditionSet, confirmAlertSend } from '../alert-state.js';
 import { shouldAlertParityGaps, parityAlertKey, formatParityGapCard } from './appointment-parity-alerts.js';
@@ -266,6 +301,11 @@ const PARITY_WINDOW_DAYS = Number(process.env.PARITY_WINDOW_DAYS || 45);
 const PARITY_MAX_WRITES = Number(process.env.PARITY_MAX_WRITES || 25);
 const PARITY_INTERVAL_MS = Number(process.env.PARITY_INTERVAL_MS || 30 * 60 * 1000);
 
+// Class B grace period — see the v1.3 block above. The LP→GHL reconciler runs
+// in batches every 30 minutes and this sweep runs between batches, so a
+// freshly-booked LP row has not had its turn yet and is not a gap.
+const PARITY_GHL_MISSING_MIN_AGE_MIN = Number(process.env.PARITY_GHL_MISSING_MIN_AGE_MIN || 90);
+
 const ACTIVE_GHL_STATUSES = ['new', 'confirmed'];
 
 // LP dispositions that mean the appointment is resolved, not pending.
@@ -317,7 +357,9 @@ async function readGhlBook(from, to) {
 async function readLpBook(from, to) {
   const { data, error } = await supabase
     .from('lp_leads')
-    .select('ghl_contact_id, lp_lead_id, lp_prospect_id, first_name, last_name, disposition_code, appointment_set, appointment_confirmed, appointment_date, updated_at_lp')
+    // created_at_lp rides along for the Class B grace period (v1.3). Both LP
+    // clocks are needed: see lpRowAgeMinutes.
+    .select('ghl_contact_id, lp_lead_id, lp_prospect_id, first_name, last_name, disposition_code, appointment_set, appointment_confirmed, appointment_date, created_at_lp, updated_at_lp')
     .eq('appointment_set', true)
     // Bound built in the stored ET-wall-clock frame. Unlike the GHL
     // appointments read above (start_time is true UTC), lp_leads
@@ -344,6 +386,35 @@ async function readLpBook(from, to) {
     keepNewest(RESOLVED_DISPOSITIONS.has(row.disposition_code) ? resolved : book, row);
   }
   return { active: book, resolved };
+}
+
+/**
+ * How old an lp_leads row is, in real minutes, for the Class B grace period.
+ *
+ * Two things this must get right, both of which have burned someone here:
+ *
+ * 1. THE CLOCKS ARE ET WALL-CLOCK WEARING A +00:00 OFFSET. created_at_lp and
+ *    updated_at_lp are written through lpDateToEastern(), so subtracting them
+ *    from a true-UTC Date.now() reads every row as ~4 h OLDER than it is —
+ *    which would let a row booked ten minutes ago clear a 90-minute gate and
+ *    defeat the whole change. lpStoredAgeMinutes() does the conversion (and the
+ *    DST two-pass) — see the READ SIDE block in src/lp-dates.js. This is the
+ *    same class of defect as duplicate-lead-guard.js 2026-09-04.
+ *
+ * 2. THE OLDER CLOCK WINS. updated_at_lp moves on every re-sync, so gating on
+ *    it alone would let a long-standing row reset its own age each time LP
+ *    touched it and hide a real gap forever. We take the greater of the two
+ *    ages — the earlier clock — so a re-sync can never make a row look newer.
+ *
+ * Returns null when NEITHER clock is parseable. The caller escalates in that
+ * case: "I cannot tell how old this is" must not silence a gap, because a gap
+ * nobody is told about is the failure this whole module exists to prevent.
+ */
+function lpRowAgeMinutes(row, nowMs = Date.now()) {
+  const ages = [row?.created_at_lp, row?.updated_at_lp]
+    .map((stamp) => lpStoredAgeMinutes(stamp, nowMs))
+    .filter((n) => Number.isFinite(n));
+  return ages.length ? Math.max(...ages) : null;
 }
 
 /**
@@ -410,6 +481,10 @@ export async function runAppointmentParityWatchdog({ dryRun = !PARITY_AUTOHEAL, 
   const counts = {
     lp_missing_appointment: 0,
     ghl_missing_appointment: 0,
+    // v1.3: Class B findings held back because the LP row is younger than the
+    // reconciler's batch cadence. Counted rather than dropped — a suppression
+    // nobody can see is how an alarm turns into a blind spot.
+    ghl_missing_too_new: 0,
     confirmation_drift: 0,
     cancellation_drift: 0,
     lp_cancelled_ghl_active: 0,
@@ -627,6 +702,25 @@ export async function runAppointmentParityWatchdog({ dryRun = !PARITY_AUTOHEAL, 
     if (ghlActive.has(cid)) continue;
     const wasCancelled = ghlCancelled.has(cid);
     const cls = wasCancelled ? 'cancellation_drift' : 'ghl_missing_appointment';
+
+    // v1.3 grace period — CLASS B ONLY. The LP→GHL reconciler runs in batches
+    // every 30 minutes and this sweep samples between them, so an LP row booked
+    // since the last batch has simply not had its turn yet. Six-for-six on
+    // 2026-09-14: every alerted contact self-healed on the next batch.
+    //
+    // cancellation_drift is deliberately NOT gated: GHL already ACTED on that
+    // appointment (it holds a cancelled row), so nothing is pending and the
+    // divergence is not a timing artifact. Class E is likewise ungated above.
+    //
+    // A null age means neither LP clock parsed — escalate, do not suppress.
+    if (cls === 'ghl_missing_appointment') {
+      const ageMin = lpRowAgeMinutes(lead, asOf.getTime());
+      if (ageMin !== null && ageMin < PARITY_GHL_MISSING_MIN_AGE_MIN) {
+        counts.ghl_missing_too_new++;
+        continue;   // no finding, no event, no ops card — it rides the next sweep
+      }
+    }
+
     counts[cls]++;
 
     const finding = {
@@ -726,8 +820,13 @@ export async function runAppointmentParityWatchdog({ dryRun = !PARITY_AUTOHEAL, 
 
   console.log(
     `[ApptParity] GHL ${ghlCount} / LP ${lpCount} / matched ${matched} (${summary.parity_pct}%) — ` +
-    `${counts.lp_missing_appointment} LP-missing, ${counts.ghl_missing_appointment} GHL-missing, ` +
-    `${counts.confirmation_drift} confirm-drift, ${counts.cancellation_drift} cancel-drift, ` +
+    `${counts.lp_missing_appointment} LP-missing, ${counts.ghl_missing_appointment} GHL-missing` +
+    // v1.3: say what the grace period held back. A suppressed finding that never
+    // appears in the log is indistinguishable from one that was never found.
+    (counts.ghl_missing_too_new
+      ? ` (+${counts.ghl_missing_too_new} too-new, <${PARITY_GHL_MISSING_MIN_AGE_MIN}m)`
+      : '') +
+    `, ${counts.confirmation_drift} confirm-drift, ${counts.cancellation_drift} cancel-drift, ` +
     `${counts.lp_cancelled_ghl_active} lp-cancelled-ghl-active — ` +
     `${outcomeTail || 'no writes attempted'}, ${errors} errors` +
     (counts.write_ceiling_hit ? `, ${counts.write_ceiling_hit} over write ceiling` : '') +
@@ -828,7 +927,10 @@ async function maybeAlertParityGaps(summary, { dryRun, deps = {} } = {}) {
 }
 
 // Exported for tests.
-export const __testing = { classifyHealResult, classifyEmit, maybeAlertParityGaps, ALERT_PREFIX };
+export const __testing = {
+  classifyHealResult, classifyEmit, maybeAlertParityGaps, ALERT_PREFIX,
+  lpRowAgeMinutes, PARITY_GHL_MISSING_MIN_AGE_MIN,
+};
 
 let handle = null;
 
