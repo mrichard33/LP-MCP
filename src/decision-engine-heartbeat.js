@@ -83,6 +83,15 @@ import {
   shouldAlertAgenticSilence,
   formatAgenticSilenceAlert,
 } from './agentic-silence-alerts.js';
+// 2026-09-12 — fail-closed watchdog. rule.condition_failed_closed has been
+// emitted since 2026-07-03 and read by nobody; 433,748 of them accumulated
+// before a manual sweep found them 71 days later. Nothing watched the one
+// signal that says a rule was suppressed on data it could not read.
+import {
+  summarizeFailClosed,
+  shouldAlertFailClosed,
+  formatFailClosedAlert,
+} from './rule-fail-closed-alerts.js';
 // 2026-09-02 — per-contact reply SLA (Jacqueline Branham). Shadow by default.
 import { runReplySlaWatchdog } from './jobs/reply-sla-watchdog.js';
 
@@ -155,6 +164,33 @@ const DRAIN_BATCH_LIMIT = parseInt(
   process.env.DECISION_ENGINE_HEARTBEAT_DRAIN_BATCH_LIMIT || '50', 10
 );
 
+// 2026-09-12 — fail-closed watchdog window and threshold. See
+// src/rule-fail-closed-alerts.js for the class split; the short version is that
+// an unimplemented-operator suppression pages at any volume (the rule cannot
+// fire at all) while an unreadable-read suppression pages on a burst. Real
+// background after the engine stopped emitting non-events is ~1 infra
+// suppression per 6h, so 25 is well clear of normal and still catches an
+// outage the moment it starts skipping gates.
+const FAIL_CLOSED_WINDOW_HOURS = Math.max(
+  1, parseInt(process.env.RULE_FAIL_CLOSED_WINDOW_HOURS || '6', 10)
+);
+const FAIL_CLOSED_INFRA_THRESHOLD = Math.max(
+  1, parseInt(process.env.RULE_FAIL_CLOSED_INFRA_THRESHOLD || '25', 10)
+);
+// Bounds the read. A window holding more than this is already far past the
+// threshold, so the decision is unchanged and the extra rows only cost memory.
+const FAIL_CLOSED_SCAN_LIMIT = Math.max(
+  100, parseInt(process.env.RULE_FAIL_CLOSED_SCAN_LIMIT || '2000', 10)
+);
+// A dead rule does not self-resolve — it stays dead until somebody edits it —
+// so an unresolved card re-reminds daily, like the agentic-silence key.
+const FAIL_CLOSED_REMIND_MS = parseInt(
+  process.env.RULE_FAIL_CLOSED_REMIND_MS || `${24 * 60 * 60 * 1000}`, 10
+);
+const FAIL_CLOSED_ALERT_COOLDOWN_MS = parseInt(
+  process.env.RULE_FAIL_CLOSED_ALERT_COOLDOWN_MS || `${6 * 60 * 60 * 1000}`, 10
+);
+
 let intervalHandle = null;
 let isRunning = false; // reentrancy guard — prevents overlapping drain cycles
 
@@ -165,6 +201,8 @@ let lastSilenceAlertAt = 0;
 let lastSilenceCheck = null;
 // 2026-09-02 — most recent reply-SLA pass, surfaced on the status route.
 let lastReplySlaCheck = null;
+// 2026-09-12 — most recent fail-closed watchdog pass, same purpose.
+let lastFailClosedCheck = null;
 
 /**
  * Find the most recent processed_at timestamp across all system_events.
@@ -339,6 +377,81 @@ async function maybeAlertAgenticSilence() {
 }
 
 /**
+ * 2026-09-12 — read the fail-closed window.
+ *
+ * Returns null on a read failure, which maps to 'insufficient_evidence' and
+ * touches nothing: "I could not tell" must neither page nor clear, the same
+ * posture as getAgenticSilenceCounts.
+ */
+async function getFailClosedSummary() {
+  if (!supabase) return null;
+  const since = new Date(Date.now() - FAIL_CLOSED_WINDOW_HOURS * 60 * 60 * 1000).toISOString();
+  try {
+    const { data, error } = await supabase
+      .from('system_events')
+      .select('payload, ghl_contact_id')
+      .eq('event_type', 'rule.condition_failed_closed')
+      .gte('created_at', since)
+      .limit(FAIL_CLOSED_SCAN_LIMIT);
+    if (error) throw error;
+
+    const rows = (Array.isArray(data) ? data : []).map(r => ({
+      rule_key: r?.payload?.rule_key || null,
+      detail: r?.payload?.detail || null,
+      ghl_contact_id: r?.ghl_contact_id || null,
+    }));
+    return {
+      ...summarizeFailClosed(rows, FAIL_CLOSED_WINDOW_HOURS),
+      checked_at: new Date().toISOString(),
+    };
+  } catch (err) {
+    console.warn(`[DecisionEngineHeartbeat] fail-closed summary failed: ${err.message}`);
+    return null;
+  }
+}
+
+/**
+ * 2026-09-12 — GroupMe alert when rules are being suppressed on data the engine
+ * could not read, or on conditions it cannot evaluate at all.
+ *
+ * Best-effort throughout: a read failure or a send failure is logged, never
+ * thrown, and a failed read neither pages nor clears.
+ */
+async function maybeAlertFailClosed() {
+  const summary = await getFailClosedSummary();
+  const { alert, reasons, critical, verdict } = shouldAlertFailClosed(summary, {
+    infraThreshold: FAIL_CLOSED_INFRA_THRESHOLD,
+  });
+  lastFailClosedCheck = summary ? { ...summary, alert, reasons, verdict } : { verdict, error: 'read_failed' };
+
+  // Same three-way mapping as the silence watchdog: only a window we actually
+  // read can clear the condition.
+  const active = verdict === 'alert' ? true : verdict === 'healthy' ? false : null;
+
+  const res = await reportAlertCondition({
+    key: 'rules:fail_closed',
+    // 2026-09-14 — operational alarm, so it rides the ops channel like the LP
+    // report watchdog and the capacity sweep. That routes it to the dedicated
+    // ops bot AND mirrors it to SLACK_CHANNEL_OPS (#ops-alerts) via
+    // sendGroupMeMessage → mirrorToSlack, which is where this needs to land:
+    // Reece is migrating off GroupMe. The mirror is fail-silent by design, so
+    // a missing SLACK_MIRROR_ENABLED / SLACK_CHANNEL_OPS looks exactly like a
+    // quiet night — worth one forced check after deploy rather than assuming.
+    channel: 'ops',
+    active,
+    label: 'rule suppressions back to baseline',
+    text: () => formatFailClosedAlert(summary, reasons),
+    detail: reasons.join('; '),
+    remindMs: FAIL_CLOSED_REMIND_MS,
+    fallbackCooldownMs: FAIL_CLOSED_ALERT_COOLDOWN_MS,
+  });
+  if (res.sent && active === true) {
+    console.error(`[DecisionEngineHeartbeat] RULE FAIL-CLOSED alert sent — ${reasons.join('; ')}`);
+  }
+  return { alerted: !!(res.sent && active === true), action: res.action, reasons, critical, summary };
+}
+
+/**
  * One heartbeat cycle. Checks staleness, fires processEvents if needed.
  * Returns the result for logging / route response.
  */
@@ -359,6 +472,13 @@ export async function runDecisionEngineHeartbeat({ force = false } = {}) {
   // must run before the skip branch. Never throws into the heartbeat.
   lastReplySlaCheck = await runReplySlaWatchdog()
     .catch((err) => { console.warn(`[DecisionEngineHeartbeat] reply SLA watchdog threw (ignored): ${err.message}`); return { error: err.message }; });
+
+  // 2026-09-12 — fail-closed watchdog. Same placement reasoning again: a
+  // suppressed rule leaves no pending event (the source event is processed
+  // normally, it just produces no action), so this has to run before the skip
+  // branch or it would only look during a backlog.
+  await maybeAlertFailClosed()
+    .catch((err) => { console.warn(`[DecisionEngineHeartbeat] fail-closed watchdog threw (ignored): ${err.message}`); });
 
   const health = await checkEngineHealth();
 
@@ -535,6 +655,13 @@ export function registerDecisionEngineHeartbeatRoutes(app) {
         },
         // 2026-09-02 — per-contact reply SLA. ?refresh=1 runs a pass on demand.
         reply_sla: req.query?.refresh ? await runReplySlaWatchdog() : lastReplySlaCheck,
+        // 2026-09-12 — fail-closed watchdog. Same ?refresh=1 contract, so the
+        // current suppression picture is one curl away instead of a SQL trip.
+        rule_fail_closed: {
+          window_hours: FAIL_CLOSED_WINDOW_HOURS,
+          infra_threshold: FAIL_CLOSED_INFRA_THRESHOLD,
+          last_check: req.query?.refresh ? await getFailClosedSummary() : lastFailClosedCheck,
+        },
       });
     } catch (err) {
       res.status(500).json({ success: false, error: err.message });
