@@ -151,6 +151,38 @@ export async function resolveMarket({ ghlContact = null, lpLead = null, zip: zip
 }
 
 /**
+ * Resolve the market CODE (FTMYR, JAX, …) for a contact.
+ *
+ * resolveMarket() above returns the human NAME, which is what the cards print.
+ * Channel routing needs the code: the Slack mirror looks a market channel up
+ * through slack_market_slugs, which is keyed on the code. Returning the name
+ * there silently resolves nothing and the card lands in the rollup only —
+ * exactly the bug the canvassing handler had to work around by resolving the
+ * code a second time.
+ *
+ * Same two lookups as resolveMarket, minus the city fallback: a city name is a
+ * fine label but is never a market code.
+ */
+export async function resolveMarketCode({ ghlContact = null, lpLead = null, zip: zipArg = null } = {}) {
+  const code = readCF(ghlContact, CF.MARKET_CODE);
+  if (code) return String(code).toUpperCase();
+
+  const zip = (zipArg || ghlContact?.postalCode || lpLead?.zip || '').toString().trim().slice(0, 5);
+  if (/^\d{5}$/.test(zip)) {
+    try {
+      const { data } = await supabase.from('service_area_zips')
+        .select('market_code')
+        .eq('zip', zip)
+        .maybeSingle();
+      if (data?.market_code) return String(data.market_code).toUpperCase();
+    } catch (err) {
+      console.warn(`[Enrichment] market code lookup failed for ${zip}: ${err.message}`);
+    }
+  }
+  return null;
+}
+
+/**
  * Parse and humanize the loss-reason:* tag from a contact's tag set.
  *   "loss-reason:dnc"          → "DNC"
  *   "loss-reason:mobile-home"  → "Mobile Home"
@@ -207,6 +239,9 @@ export async function buildNotificationEnrichment(contactId, context = {}, { lpL
 
     // v5.0 additions
     market: null,
+    // 2026-09-14 — the CODE as well as the name. The name is for the card, the
+    // code is what channel routing needs.
+    marketCode: null,
     lossReason: parseLossReason(ghlContact?.tags),
     calcWindows: readCF(ghlContact, CF.WINDOW_COUNT),
     calcDoors: readCF(ghlContact, CF.DOOR_COUNT),
@@ -233,6 +268,11 @@ export async function buildNotificationEnrichment(contactId, context = {}, { lpL
     enrichment.market = await resolveMarket({ ghlContact, lpLead });
   } catch (err) {
     console.warn(`[Enrichment] market resolution failed for ${contactId}: ${err.message}`);
+  }
+  try {
+    enrichment.marketCode = await resolveMarketCode({ ghlContact, lpLead });
+  } catch (err) {
+    console.warn(`[Enrichment] market code resolution failed for ${contactId}: ${err.message}`);
   }
 
   const intelKey = ghlContactId || (lpLead?.ghl_contact_id) || (isLPLeadId(contactId) ? null : contactId);

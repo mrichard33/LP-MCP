@@ -155,10 +155,15 @@ const GROUPME_CANVASS_BOT_ID = process.env.GROUPME_CANVASS_BOT_ID || '';
 // on a dashboard. Unset until a group exists — and unset is harmless, because
 // the fallback below keeps every message on the main bot.
 const GROUPME_OPS_BOT_ID = process.env.GROUPME_OPS_BOT_ID || '';
+// Per-purpose bot for the market sales channels. Unset is fine and expected:
+// the Slack mirror is where sales cards are actually wanted, and an unset bot
+// falls back to the main group rather than dropping the message.
+const GROUPME_SALES_BOT_ID = process.env.GROUPME_SALES_BOT_ID || '';
 const SELF_BASE_URL = `http://localhost:${process.env.PORT || 8080}`;
 
 let warnedCanvassFallback = false;
 let warnedOpsFallback = false;
+let warnedSalesFallback = false;
 
 /**
  * Resolve a logical channel name to a GroupMe bot ID. Unknown/absent
@@ -171,6 +176,13 @@ function _resolveBotId(channel) {
     if (!warnedCanvassFallback) {
       console.warn('[GroupMe] GROUPME_CANVASS_BOT_ID unset — canvass-channel messages fall back to the main bot');
       warnedCanvassFallback = true;
+    }
+  }
+  if (channel === 'sales') {
+    if (GROUPME_SALES_BOT_ID) return GROUPME_SALES_BOT_ID;
+    if (!warnedSalesFallback) {
+      console.warn('[GroupMe] GROUPME_SALES_BOT_ID unset — sales-channel messages fall back to the main bot');
+      warnedSalesFallback = true;
     }
   }
   if (channel === 'ops') {
@@ -378,8 +390,8 @@ async function _isDuplicateCard(text, channel, opts = {}) {
  *   'canvass' → GROUPME_CANVASS_BOT_ID (falls back to the main bot with a
  *   one-time warning when unset). Omitted/unknown → main bot.
  * @param {string} [opts.market]      — LP market code (JAX, FTMYR, …). Used by
- *   the Slack mirror only: a canvass-channel card with a market posts to that
- *   market's Slack channel AND the all-markets rollup. Ignored by GroupMe.
+ *   the Slack mirror only: a canvass- or sales-channel card with a market posts
+ *   to that market's Slack channel AND the all-markets rollup. Ignored by GroupMe.
  * @param {boolean} [opts.noDedup]    — v1.8: skip the content-dedup backstop.
  *   For cards that must send even when byte-identical to a recent one
  *   (approval cards — time-sensitive operator decisions).

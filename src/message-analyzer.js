@@ -444,7 +444,7 @@ Required JSON structure:
   "recommended_action": <"advance_stage" | "deploy_objection_handler" | "fast_track_booking" | "continue_current" | "escalate_to_rep" | "suppress" | "objection_price" | "busy_callback" | "wrong_person" | "frustrated_fast_track" | "callback_request" | "guide_send" | "follow_up_scheduled">,
   "dq_detected": <null | "mobile-home" | "renter" | "lanai-only">,
   "requested_fulfillment": <"in_home_estimate" | "phone_call" | "info_only" | "unspecified">,
-  "escalation_category": <null | "existing_customer_service" | "legal_media" | "identity_ambiguous" | "commercial_hoa" | "contract_change" | "billing" | "vendor_recruiting" | "language" | "compliance_adjacent">,
+  "escalation_category": <null | "existing_customer_service" | "legal_media" | "identity_ambiguous" | "commercial_hoa" | "contract_change" | "billing" | "vendor_recruiting" | "language" | "compliance_adjacent" | "rep_promise_unfulfilled">,
   "guide_type": <null | "dhp" | "hurricane" | "energy" | "security" | "warranty" | "financing" | "reviews" | "credentials" | "booking-link" | "process">,
   "follow_up_bucket": <null | "tomorrow" | "few-days" | "1week" | "2weeks" | "1month" | "2months" | "after-holidays" | "seasonal">,
   "call_purpose": <null | "pricing_questions" | "general_questions" | "pre_visit_confirmation" | "requested_callback">,
@@ -595,8 +595,11 @@ A deterministic gate enforces the PROSPECT rule after you answer; do not rely on
 • "existing_customer_service" — ONLY for a person whose CUSTOMER RELATIONSHIP (see the LEAD CONTEXT) is EXISTING CUSTOMER or RETURNING CUSTOMER, and ONLY when the message is about work already done: install problems, warranty claims, service on installed product, or scheduling for a SERVICE visit. No selling.
   NEGATIVE EXAMPLES (leave escalation_category null — these are SALES escalations):
   - CUSTOMER RELATIONSHIP is PROSPECT. A prospect cannot be existing_customer_service no matter what they say. A prospect angry about a cancelled, missed, rescheduled, or no-show SALES appointment is a sales escalation.
-  - CUSTOMER RELATIONSHIP is RETURNING CUSTOMER and the complaint is about the NEW project's estimate or appointment (cancelled, missed, rescheduled, "nobody called me back"). That is a sales conversation on the new lead, not service on the old one.
+  - CUSTOMER RELATIONSHIP is RETURNING CUSTOMER and the complaint is about the NEW project's estimate or appointment (cancelled, missed, rescheduled, "nobody called me back"). That is a sales conversation on the new lead, not service on the old one. If they are chasing something the rep promised and never sent, use "rep_promise_unfulfilled" instead of leaving it null.
   - Any "scheduling complaint" about a sales estimate or in-home appointment, regardless of tone.
+• "rep_promise_unfulfilled" — the lead is chasing something a REP personally promised and never delivered: a quote, pricing, a proposal, paperwork, samples, or a promised call back that never came. The tell is a specific promised ARTEFACT plus it never arriving — "he said he'd email the quote and I never got it", "still waiting on the numbers from last week", "nobody ever sent me anything". Set this even when the tone is calm; it is the broken promise that matters, not the anger. This is a SALES escalation and applies to a PROSPECT as readily as a customer, so it is not blocked by the CUSTOMER RELATIONSHIP rule above.
+  NOT this: a lead asking for pricing they were never promised (that is a normal pricing ask), or a complaint about the appointment itself rather than an undelivered item.
+  The objection underneath is TRUST — see OBJECTION MAPPING — so set objection_type "trust" alongside it when you deploy an objection handler.
 • "legal_media" — legal threats, injury, damage claims, or press/media inquiries. Acknowledge only.
 • "identity_ambiguous" — wrong number, deceased contact, or a minor.
   NEGATIVE EXAMPLE: a signature whose name or email differs from the record
@@ -1182,6 +1185,10 @@ function validateAnalysis(analysis) {
     escalation_category: [
       'existing_customer_service', 'legal_media', 'identity_ambiguous', 'commercial_hoa',
       'contract_change', 'billing', 'vendor_recruiting', 'language', 'compliance_adjacent',
+      // 2026-09-14 — the rep promised something and it never arrived. Routed
+      // to the rep's own market sales channel, so somebody who can chase them
+      // sees it.
+      'rep_promise_unfulfilled',
     ].includes(analysis.escalation_category) ? analysis.escalation_category : null,
     guide_type: ['dhp', 'hurricane', 'energy', 'security', 'warranty', 'financing', 'reviews', 'credentials', 'booking-link', 'process'].includes(analysis.guide_type) ? analysis.guide_type : null,
     follow_up_bucket: ['tomorrow', 'few-days', '1week', '2weeks', '1month', '2months', 'after-holidays', 'seasonal'].includes(analysis.follow_up_bucket) ? analysis.follow_up_bucket : null,
