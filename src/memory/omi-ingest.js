@@ -166,10 +166,122 @@ export function normalizeOmiConversation(body, { now = new Date(), maxTranscript
     session_date,
     started_at: started_at || null,
     finished_at: b.finished_at || null,
-    // Omi's own summary fields are context for the extractor, never stored as-is.
+    // Omi's own summary fields. On the WEBHOOK path these are context for the
+    // extractor and are never stored as-is. On the PULL path they are the only
+    // content there is (see mapStructuredExtraction) — the Developer API returns
+    // transcript_segments: null on every endpoint.
     omi_title: String(structured.title || '').trim(),
     omi_overview: String(structured.overview || '').trim(),
     omi_category: String(structured.category || '').trim(),
+    omi_folder: String(b.folder_name || '').trim() || null,
+    omi_source: String(b.source || '').trim() || null,
+    structured,
+  };
+}
+
+// ─── 3a. Mapping — the no-LLM path ─────────────────────────────────────────
+/**
+ * True when Omi has already done the extraction for us.
+ *
+ * 2026-09-14: the Developer API returns `transcript_segments: null` on the
+ * conversation list AND on GET /user/conversations/{id} — there is no transcript
+ * to read, on any endpoint. What it DOES return is `structured`: Omi's own
+ * title, overview and action_items. So when `structured` carries content there
+ * is nothing for a model to extract; asking one would be paying to re-derive
+ * fields we already have, from a transcript we do not have.
+ */
+export function hasStructuredContent(body) {
+  const st = body && typeof body === 'object' && body.structured && typeof body.structured === 'object'
+    ? body.structured : null;
+  if (!st) return false;
+  const items = Array.isArray(st.action_items) ? st.action_items : [];
+  // A TITLE IS NOT CONTENT. Omi stamps a title on almost everything, including
+  // conversations it summarised into nothing, so treating a title as mappable
+  // would send a recording that has a real transcript and an empty summary down
+  // the no-LLM path and file it as "no business content" — losing the one case
+  // the extractor exists for. Only an overview or an action item is something
+  // to map.
+  return Boolean(String(st.overview || '').trim() || items.length > 0);
+}
+
+/**
+ * A word that means somebody settled something. Used ONLY to decide whether an
+ * overview with no action items is worth one unconfirmed_decision card, and it
+ * is deliberately conservative: a false negative costs one card nobody sees, a
+ * false positive puts noise in front of Mark every single day.
+ *
+ * Nothing this produces is ever a decision. It is a `decision_candidate`, which
+ * maps to item_type 'unconfirmed_decision' — a question for the Command Center.
+ */
+const DECISION_WORDS = /\b(decided?|decision|agreed?|we'?ll|we will|going to|switch(?:ing|ed)? to|move (?:to|off)|instead of|approved?|sign(?:ed)? off|settled on|the plan is|from now on|stop(?:ping|ped)? (?:using|doing)|start(?:ing|ed)? (?:using|doing))\b/i;
+
+/**
+ * An Omi conversation → the exact shape validateExtraction() returns, with no
+ * model call. Mapping, not extraction: every field comes from Omi's own JSON.
+ *
+ * confidence is 1 throughout. That is not a claim that the CONTENT is right —
+ * it is the honest statement that this is what Omi recorded, read verbatim,
+ * with no model in between to be unsure. The uncertainty that matters is
+ * carried by item_type ('unconfirmed_decision') and by confidence_label
+ * ('unconfirmed') in raw, exactly as on the webhook path. Setting it lower
+ * would only make the OMI_MIN_CONFIDENCE filter drop real items for a
+ * doubt that no step here actually introduced.
+ */
+export function mapStructuredExtraction(conv) {
+  const st = conv.structured && typeof conv.structured === 'object' ? conv.structured : {};
+  const title = String(st.title || '').trim();
+  const overview = String(st.overview || '').trim();
+  const rawItems = Array.isArray(st.action_items) ? st.action_items : [];
+
+  const items = [];
+  for (const it of rawItems) {
+    // Omi has shipped these as objects with `description` and, in older
+    // payloads, as bare strings.
+    const text = clampStr(typeof it === 'string' ? it : (it?.description ?? ''), 300).trim();
+    if (!text) continue;
+    // Already ticked off inside Omi — filing it as open work would be a to-do
+    // that was done before we heard about it.
+    if ((typeof it === 'object' && it?.completed === true)) continue;
+    items.push({
+      category: 'action_item',
+      text,
+      owner: null,
+      systems: [],
+      evidence: 'omi structured.action_items',
+      confidence: 1,
+      stated_by_mark: true,
+      omi_action_item_id: typeof it === 'object' && it?.id ? String(it.id) : null,
+      due_at: typeof it === 'object' && it?.due_at ? String(it.due_at) : null,
+    });
+  }
+
+  // A conversation where something was settled but nothing was assigned still
+  // carries the thing that was settled. One card, from the overview.
+  if (!items.length && overview && DECISION_WORDS.test(overview)) {
+    items.push({
+      category: 'decision_candidate',
+      text: clampStr(overview, 300).trim(),
+      owner: null,
+      systems: [],
+      evidence: 'omi structured.overview',
+      confidence: 1,
+      stated_by_mark: true,
+      omi_action_item_id: null,
+      due_at: null,
+    });
+  }
+
+  return {
+    has_business_content: items.length > 0,
+    title: clampStr(title || 'Omi conversation', 80).trim() || 'Omi conversation',
+    summary: clampStr(overview, 600).trim(),
+    // Omi gives us no transcript, so a search key cannot be "a phrase that
+    // appears literally in the transcript" the way the extractor's are. The
+    // category and folder are what Omi itself filed this under.
+    search_keys: [conv.omi_category, conv.omi_folder, 'Omi'].filter(Boolean).map((k) => clampStr(k, 80)),
+    items,
+    model: null,
+    via: 'structured',
   };
 }
 
@@ -410,15 +522,27 @@ export async function ingestOmiConversation(body, { db, llm, embed, env = proces
     const dup = await findDuplicate(db, { key, ledger_ref });
     if (dup) return { ...base, ...dup };
 
-    // A discarded or silent recording is recorded as handled and dropped.
-    if (conv.discarded || !conv.transcript.trim()) {
+    // A discarded recording, or one with neither a transcript nor Omi's own
+    // structured summary, is recorded as handled and dropped.
+    const structured = hasStructuredContent(body);
+    if (conv.discarded || (!conv.transcript.trim() && !structured)) {
       return { ...base, ...(await recordNoContent(db, { ledger_ref, mode: cfg.mode, reason: conv.discarded ? 'discarded' : 'empty_transcript' })) };
     }
 
-    // 3. Extract.
+    // 3. Extract — or, when Omi has already done it, map.
+    //
+    // 2026-09-14: the pull path ALWAYS lands here with structured content and
+    // no transcript, so it never spends a model call. The LLM branch below is
+    // now only reached by a webhook body that carries transcript_segments and
+    // no `structured` — which is the only shape a model can add anything to.
     stage = 'extract';
-    const llmFn = llm === undefined ? (await import('../llm-client.js')).callLLMJson : llm;
-    const extracted = await extractOmiItems(conv, { llm: llmFn });
+    let extracted;
+    if (structured) {
+      extracted = mapStructuredExtraction(conv);
+    } else {
+      const llmFn = llm === undefined ? (await import('../llm-client.js')).callLLMJson : llm;
+      extracted = { ...(await extractOmiItems(conv, { llm: llmFn })), via: 'llm' };
+    }
 
     // 4. Filter by confidence.
     stage = 'filter';
@@ -441,7 +565,11 @@ export async function ingestOmiConversation(body, { db, llm, embed, env = proces
     const llmForClassify = llm === undefined ? (await import('../llm-client.js')).callLLMJson : llm;
     const plan = await planRows(clean, conv, {
       db, embed: embedFn, llm: llmForClassify, cfg, key, ledger_ref, now,
-      extraction_model: extracted.model || cfg.model || null,
+      // Never borrow OMI_EXTRACT_MODEL on the mapped path. A row that no model
+      // touched must not carry a model's name — that is the field anyone
+      // auditing "what did this cost" reads first.
+      extraction_model: extracted.via === 'structured' ? null : (extracted.model || cfg.model || null),
+      extraction_via: extracted.via || 'llm',
     });
 
     // 9. Write (or, in shadow, describe).
@@ -456,7 +584,8 @@ export async function ingestOmiConversation(body, { db, llm, embed, env = proces
       return {
         ...base, status: 'shadow', planned: plan.payload.items.length,
         mentions: plan.payload.mentions.length, conflicts: plan.conflicts,
-        restated: plan.restated, deduped: plan.deduped,
+        restated: plan.restated, deduped: plan.deduped, via: extracted.via,
+        llm_calls: plan.llm_calls,
       };
     }
 
@@ -471,7 +600,10 @@ export async function ingestOmiConversation(body, { db, llm, embed, env = proces
       ? await embedNewItems(db, embedFn, pendingIds)
       : { embedded: 0, skipped: 'nothing to embed' };
 
-    return { ...base, ...out, conflicts: plan.conflicts, restated: plan.restated, deduped: plan.deduped, embed: embedded };
+    return {
+      ...base, ...out, conflicts: plan.conflicts, restated: plan.restated,
+      deduped: plan.deduped, embed: embedded, via: extracted.via, llm_calls: plan.llm_calls,
+    };
   } catch (err) {
     // 10. Record the failure WITHOUT any transcript text, then rethrow so the
     //     route answers 500 and n8n retries — which the idempotency key makes safe.
@@ -514,7 +646,7 @@ async function recordNoContent(db, { ledger_ref, mode, reason }) {
  * Dedupe → conflict check → the exact jsonb claude_omi_ingest() expects.
  * Nothing here writes; shadow mode runs this same function.
  */
-async function planRows(clean, conv, { db, embed, llm, cfg, key, ledger_ref, now, extraction_model }) {
+async function planRows(clean, conv, { db, embed, llm, cfg, key, ledger_ref, now, extraction_model, extraction_via = 'llm' }) {
   const openPending = await loadOpenPending(db);
   const seenInPayload = new Map();
   const items = [];
@@ -522,6 +654,13 @@ async function planRows(clean, conv, { db, embed, llm, cfg, key, ledger_ref, now
   const logs = [];
   let conflicts = 0;
   let restated = 0;
+  // Counted, not assumed. The mapped path spends nothing on extraction, but the
+  // conflict classifier below is still a model call — it fires only when a
+  // decision-shaped item vector-matches an ACTIVE decision above
+  // MEMORY_CONFLICT_THRESHOLD, which is rare. Returning the count means "zero
+  // LLM cost on the pull path" is something a run can be checked against
+  // rather than something a comment claims.
+  let llm_calls = 0;
   const deduped = { exact: 0, vector: 0, in_payload: 0 };
 
   const extraction_at = now.toISOString();
@@ -567,6 +706,7 @@ async function planRows(clean, conv, { db, embed, llm, cfg, key, ledger_ref, now
         const hits = await vectorHits(db, embed, it.text, { kind: 'decision', threshold: cfg.conflictThreshold });
         const top = hits.find((h) => String(h.status || 'active') === 'active');
         if (top) {
+          llm_calls += 1;
           const verdict = await classifyPair(llm, String(top.text || ''), it.text);
           if (verdict.verdict === 'same') {
             restated += 1;
@@ -597,7 +737,7 @@ async function planRows(clean, conv, { db, embed, llm, cfg, key, ledger_ref, now
     seenInPayload.set(textKey, true);
     items.push(buildItem(it, {
       conv, datePrefix, conflictsWith, conflictCheck, extraction_at, extraction_model,
-      speakers: conv.speakers, mark_spoke: conv.mark_spoke,
+      extraction_via, speakers: conv.speakers, mark_spoke: conv.mark_spoke,
     }));
   }
 
@@ -614,7 +754,7 @@ async function planRows(clean, conv, { db, embed, llm, cfg, key, ledger_ref, now
       mentions,
       ledger_ref,
     },
-    logs, conflicts, restated, deduped,
+    logs, conflicts, restated, deduped, llm_calls,
   };
 }
 
@@ -622,7 +762,7 @@ function mentionOf(conv, it) {
   return { conversation_id: conv.conversation_id, date: conv.session_date, item_text: it.text };
 }
 
-function buildItem(it, { conv, datePrefix, conflictsWith, conflictCheck, extraction_at, extraction_model, speakers, mark_spoke }) {
+function buildItem(it, { conv, datePrefix, conflictsWith, conflictCheck, extraction_at, extraction_model, extraction_via = 'llm', speakers, mark_spoke }) {
   const item_type = OMI_CATEGORY_MAP[it.category];
   let description = it.text;
   if (item_type === 'verification_needed') description = `${ISSUE_PREFIX}${description}`;
@@ -637,15 +777,25 @@ function buildItem(it, { conv, datePrefix, conflictsWith, conflictCheck, extract
     conversation_finished_at: conv.finished_at,
     extraction_at,
     extraction_model,
+    extraction_via,
     confidence: it.confidence,
     confidence_label: 'unconfirmed',
     omi_category: it.category,
+    // Omi's OWN category for the conversation, kept alongside ours. The handoff
+    // calls for the original to survive: ours says what kind of card this is,
+    // Omi's says what Omi thought the conversation was about.
+    omi_conversation_category: conv.omi_category || null,
+    omi_folder: conv.omi_folder || null,
+    omi_source: conv.omi_source || null,
     systems: it.systems,
     evidence: it.evidence,
     speakers,
     mark_spoke,
     stated_by_mark: it.stated_by_mark,
   };
+  // The write-back loop guard, when this row came from a task Omi already had.
+  if (it.omi_action_item_id) raw.omi_action_item_id = it.omi_action_item_id;
+  if (it.due_at) raw.due_at = it.due_at;
   if (conflictsWith) {
     raw.conflicts_with_decision_id = conflictsWith.id;
     raw.conflict_similarity = conflictsWith.similarity;
@@ -690,4 +840,7 @@ async function embedNewItems(db, embed, pendingIds) {
   }
 }
 
-export default { ingestOmiConversation, getOmiMode, getOmiConfig, omiCheckpointKey, omiLedgerRef };
+export default {
+  ingestOmiConversation, getOmiMode, getOmiConfig, omiCheckpointKey, omiLedgerRef,
+  hasStructuredContent, mapStructuredExtraction,
+};

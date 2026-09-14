@@ -481,6 +481,21 @@ export async function applyRule(input = {}, { db = supabase, now = new Date(), e
       result.embed_note = `deferred to the nightly: ${err.message}`;
     }
   }
+
+  // A ruling that filed a build to-do also puts it on Mark's Omi Tasks page,
+  // when write-back is on. Best effort and never awaited into the ruling's
+  // success: the ruling wrote a decision and filed the work, which is the job.
+  // Omi hearing about the follow-up is a convenience, and an Omi outage must
+  // not turn a completed ruling into an error on Mark's screen.
+  const buildId = Number.isInteger(data.build_item_id) ? data.build_item_id : null;
+  if (buildId) {
+    try {
+      const { pushRulingBuildItem } = await import('./omi-tasks.js');
+      result.omi_task = await pushRulingBuildItem(buildId, { deps: { env } });
+    } catch (err) {
+      result.omi_task = { skipped: err.message };
+    }
+  }
   return result;
 }
 

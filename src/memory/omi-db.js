@@ -10,7 +10,7 @@
  *   1. src/memory/omi-ingest.js imports no CRM / Five9 / messaging module.
  *      scripts/test-omi-ingest.js fails the build if one ever appears.
  *   2. omi-ingest.js never holds the real Supabase client. It is handed the
- *      proxy below, which allows exactly six operations on six memory tables
+ *      proxy below, which allows a named handful of verbs on six memory tables
  *      and throws OmiScopeError on everything else — including a SELECT on
  *      lp_leads, and including an INSERT on claude_decision_log (Omi proposes;
  *      it never decides).
@@ -20,6 +20,8 @@
  * to guard there, because the table is already fixed by the time they run.
  *
  * v1.0 — 2026-09-11. Initial (sql/101).
+ * v1.1 — 2026-09-14. The pull path (sql/112): claude_omi_sync, the memory
+ *        upsert RPC, and the one-column update described above.
  */
 
 export class OmiScopeError extends Error {
@@ -30,6 +32,7 @@ export class OmiScopeError extends Error {
 export const ALLOWED_RPC = Object.freeze([
   'claude_omi_ingest',        // sql/101 — the atomic write for one conversation
   'match_memory_embeddings',  // sql/094 — dedupe + conflict lookups (read-only)
+  'claude_omi_memory_upsert', // sql/112 — the atomic write for Omi memories
 ]);
 
 /**
@@ -38,17 +41,32 @@ export const ALLOWED_RPC = Object.freeze([
  *   claude_transcript_ledger      select    idempotency lookup for no-content replays
  *                                 upsert    the 'no_content' disposition row
  *   claude_pending_items          select    exact-text dedupe against open items
+ *                                 update    stamp omi_action_item_id ONLY (see below)
  *   claude_memory_validation_log  insert    shadow output + failure records
  *   claude_memory_embeddings      upsert    best-effort embed of the new items
+ *   claude_omi_sync               select    where the last pull stopped
+ *                                 upsert    where this pull stopped
  * Everything the ingest WRITES to memory goes through rpc('claude_omi_ingest')
- * instead, so there is no insert/update verb on the session or item tables here.
+ * or rpc('claude_omi_memory_upsert') instead, so there is no insert verb on the
+ * session or item tables here.
+ *
+ * 2026-09-14 (sql/112): claude_pending_items gained `update`, which is a real
+ * widening of this boundary and is worth being uncomfortable about. It exists
+ * for ONE column — omi_action_item_id, the write-back loop guard. The guard has
+ * to be written the instant Omi accepts a task, or the row and the task cannot
+ * be told apart afterwards and the two systems push the same to-do at each
+ * other forever. The verb guard cannot police WHICH column an update sets, so
+ * this is the honest note in its place: src/memory/omi-tasks.js is the only
+ * caller, and it sets omi_action_item_id and updated_at. Anything else updating
+ * a pending item from the Omi path is a bug, not a feature.
  */
 export const ALLOWED_TABLES = Object.freeze({
   claude_session_logs: ['select'],
   claude_transcript_ledger: ['select', 'upsert'],
-  claude_pending_items: ['select'],
+  claude_pending_items: ['select', 'update'],
   claude_memory_validation_log: ['insert'],
   claude_memory_embeddings: ['upsert'],
+  claude_omi_sync: ['select', 'upsert'],
 });
 
 function listAllowed() {
