@@ -223,3 +223,35 @@ test('source_cost: REECE-level Σ counts and Σ cents (the control-total shape)'
   assert.equal(cancelValue, 6000000);
   assert.notEqual(cancelValue, facts.get(k('gross_sold')).cents);
 });
+
+// ── marketing_cost fails to NULL, never to zero (2026-09-14) ─────────────────
+// Mirrors NULLIF(SUM(c.mcost_cents), 0) in scorecard_rebuild_facts (sql/109).
+// August 2026 and September MTD published $0 marketing cost against $269,602
+// in July — 68 and 47 rows, every one a hard zero — and every derived
+// cost-per-X computed against it. A period that reports no cost at all is
+// unknown, not free.
+test('source_cost: a period with no cost on any row publishes NULL, not 0', () => {
+  const rows = ROWS_SC.map((r) => ({ ...r, mcost_cents: 0 }));
+  const facts = expectedFacts('source_cost', rows);
+  const k = (metric) => factKey({ market: 'REECE', branch_code_raw: null, metric, bucket: null });
+  assert.equal(facts.get(k('marketing_cost')).cents, null);
+  // Only the cost metric is affected — the other money columns keep their sums,
+  // including working_amount, whose own Σ is deliberately left coalescing.
+  assert.equal(facts.get(k('gross_sold')).cents, 30000000);
+  assert.equal(facts.get(k('net_sales')).cents, 24000000);
+  assert.equal(facts.get(k('working_amount')).cents, 200000);
+  // …and the row count still reports how many rows contributed, so "unknown"
+  // is distinguishable from "no snapshot".
+  assert.equal(facts.get(k('marketing_cost')).count, 2);
+});
+
+test('source_cost: one row with cost is enough — the period still sums', () => {
+  const k = (metric) => factKey({ market: 'REECE', branch_code_raw: null, metric, bucket: null });
+  // The July 2026 shape: almost every sub-source is legitimately zero and a
+  // handful carry the spend. 66 of 71 July rows were zero and the month is
+  // correct at $269,601.81 — the rule must not touch it.
+  const rows = [...ROWS_SC.map((r) => ({ ...r, mcost_cents: 0 })),
+    { ...ROWS_SC[0], mcost_cents: 26960181 }];
+  const facts = expectedFacts('source_cost', rows);
+  assert.equal(facts.get(k('marketing_cost')).cents, 26960181);
+});
