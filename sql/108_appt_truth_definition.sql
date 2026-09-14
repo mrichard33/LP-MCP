@@ -1,8 +1,10 @@
 -- 108_appt_truth_definition.sql
 -- Canonical appointment-count definition for Lead Perfection.
 --
--- STATUS: NOT APPLIED. Ships as a file for review. Apply from the dashboard
--- (DDL is dashboard-only) after Mark signs off.
+-- STATUS: APPLIED to LP Supabase 2026-09-14 ~15:35Z. All three views created
+-- via CREATE OR REPLACE, run as individual statements rather than one
+-- transaction so a failure could not leave a half-applied set. Verified after
+-- apply with tests A-D below. Re-running this file is idempotent.
 --
 -- WHY THIS EXISTS
 -- The 2026-09-14 reconciliation produced five different "confirmed" counts for
@@ -33,7 +35,8 @@
 -- THE GRAIN: COUNT PROSPECTS, NOT LEAD ROWS
 -- lp_leads is keyed on lp_lead_id. One lp_prospect_id legitimately owns many
 -- lead rows over time - Bermudez Luis (prospect 358689) has seven, spanning
--- appointments in January, February and September. That is normal.
+-- appointments in January, February and September, with Data, DNC and OPPFDN
+-- in the mix. That is normal multi-appointment history, not duplication.
 --
 -- What is NOT normal is two LIVE lead rows for one prospect on the SAME
 -- appointment date. Measured 2026-09-14:
@@ -49,6 +52,19 @@
 -- Real, persistent, and small: 0-2 a day. A wider scan over ALL rows shows
 -- 2-8 a day, but most of that excess is dead history (Data/DNC/closed rows)
 -- that no count reads. Size the fix to the live number.
+--
+-- HOW THE COLLISIONS ARE CREATED - checked on created_at_lp, not on lead-id
+-- adjacency, which misleads. The five live collisions 9/08-9/17:
+--   400876 JULICH      575041 / 575052   4m apart,  MVP / MVP
+--   458357 Ingrassia   574953 / 574957   9m apart,  Self Generated / Lead Gurus
+--   230019 Reyes/Fuentes 572626 / 572972 1 day,     MVP / Prolific
+--   412674 Gibbons     537047 / 573470   4 months,  Reecewindows.com / Lead Gurus
+--   358689 Bermudez    550806 / 575443   3 months,  Prolific / Prolific
+-- Only JULICH fits a same-session double-submit. Three of the five are the
+-- same person arriving through a DIFFERENT source and getting a second lead
+-- row - which also means paying two vendors for one appointment. So a
+-- create-time guard must key on prospect + appointment date ALONE. Scoping it
+-- to same-session or same-source would catch one case in five.
 --
 -- So every count below is COUNT(DISTINCT prospect), with the raw row count
 -- kept beside it. The gap between the two IS the duplication, visible rather
@@ -80,8 +96,8 @@
 -- lp_leads holds CURRENT state. After the appointment day, dispositions advance
 -- past Cnf/Issue into sat/sold/demo outcomes, so v_appt_truth_daily under-reports
 -- confirmed for past dates (2026-09-09 reads 3 against the hourly feed's 90).
--- The decay starts the same day: 9/14 confirmed read 43 at 14:00Z and 42 by
--- 15:00Z while the day was still running. For history use the immutable
+-- The decay starts the same day: 9/14 confirmed read 43 at 14:00Z and 40 by
+-- 14:52Z while the day was still running. For history use the immutable
 -- lp_appt_fill_hourly snapshot. For today and forward dates use
 -- v_appt_truth_daily. This split is by design, not a defect.
 
@@ -189,28 +205,39 @@ COMMENT ON VIEW v_appt_prospect_dupes IS
 COMMIT;
 
 -- ---------------------------------------------------------------------------
--- VERIFICATION - run after applying.
+-- VERIFICATION - results from the 2026-09-14 post-apply run.
 -- Absolute counts decay through the day as dispositions advance, so the tests
 -- below are written as relationships, not fixed numbers.
 -- ---------------------------------------------------------------------------
 --
 -- A. Today's truth.
---    Expect: confirmed + set_pending = live_total
---            dup_live_rows = live_rows - live_total
---    Open defects as of 2026-09-14, all should trend to 0:
+--    Expect: dup_live_rows = live_rows - live_total
+--            confirmed + set_pending - live_total = prospects sitting in BOTH
+--              buckets on one date. Read 1 on 2026-09-14 (Bermudez, Issue+Set).
+--              It is NOT an error for the two buckets to overshoot live_total;
+--              that overshoot is the cross-bucket collision count.
+--    Open defects at apply time, all should trend to 0:
 --            nd_but_confirmed = 2 (prospects 355684 Marlatt, 383803 Buchalski)
 --            dup_live_rows = 1    (prospect 358689 Bermudez, leads 550806/575443)
---            live_with_prospect_cancel = 1 (prospect 450345 Golden, leads 574757/574758)
+--            live_with_prospect_cancel = 1 (prospect 450345 Golden, 574757/574758)
+--            set_but_confirmed = 2 on 9/15 and 4 on 9/16 - confirmations logged
+--              against rows still sitting on Set. Wider than the single Kualica
+--              record found in the export; not yet triaged.
 --
 --    SELECT * FROM v_appt_truth_daily WHERE slot_date = CURRENT_DATE;
 --
--- B. The two sources agree at the same instant. Expect diff 0, or diff equal to
---    dup_live_rows - the hourly scrape counts LP's screen, which is row-grained.
+-- B. The two sources agree AT THE SAME INSTANT - and only then. Run this in the
+--    first minutes after the top of the hour, or expect drift: at 14:52Z
+--    lp_leads read 40 confirmed for 9/14 against the 14:00Z snapshot's 43,
+--    because Issue rows had already advanced to sat/sold. Same run, 9/15 read
+--    11 against 9 as new confirmations landed. Neither is a defect. A
+--    persistent diff at matched times, or a non-zero confirmed_unattributed,
+--    is the signal worth chasing.
 --
 --    SELECT t.slot_date, t.confirmed AS leads_confirmed,
 --           h.confirmed AS hourly_confirmed,
 --           t.confirmed - h.confirmed AS diff,
---           t.dup_live_rows, h.confirmed_unattributed
+--           t.dup_live_rows, h.confirmed_unattributed, h.snapshot_hour
 --    FROM v_appt_truth_daily t
 --    JOIN v_appt_fill_hourly_markets h
 --      ON h.slot_date = t.slot_date
@@ -219,11 +246,12 @@ COMMIT;
 --                             WHERE slot_date = t.slot_date)
 --    WHERE t.slot_date = CURRENT_DATE;
 --
--- C. The WO-8 worklist for today and forward. Expect a handful of rows now,
---    zero once deduplication is in place upstream.
+-- C. The WO-8 worklist. Filter to live_rows > 1 - that is the set that inflates
+--    a count. Returned exactly five records for 9/08-9/17 at apply time.
 --
 --    SELECT * FROM v_appt_prospect_dupes
---    WHERE slot_date >= CURRENT_DATE ORDER BY slot_date, live_rows DESC;
+--    WHERE slot_date >= CURRENT_DATE AND live_rows > 1
+--    ORDER BY slot_date;
 --
 -- D. Records needing correction, not filtering. Expect 0 rows once clean.
 --    Returns BOTH ids - never key a write on lp_prospect_id alone.
