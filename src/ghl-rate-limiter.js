@@ -121,6 +121,8 @@
  * v1.0 — Initial implementation (30s pause — too short)
  */
 
+import { recordGhlRequest } from './ghl-shared-budget.js';
+
 // Env-driven (default 40) so headroom can be ramped via Railway env vars
 // without a deploy — see the header note for ramp guidance.
 const BUCKET_CAPACITY = Math.max(1, parseInt(process.env.GHL_RATE_CAPACITY || '40', 10));
@@ -292,6 +294,13 @@ function ensureDrainer() {
  *   for existing callers. Fail-open either way.
  */
 export function acquireToken(opts = {}) {
+  // Shared-budget measurement (2026-09-14). Every governed GHL call passes
+  // through here — withGhlToken and the manual acquireToken/report429 pairs
+  // alike — so this is the one place that sees the true per-service request
+  // rate. A Map increment, no I/O, and a no-op unless GHL_SHARED_BUDGET_MODE
+  // is 'shadow'. It measures only; it never throttles.
+  recordGhlRequest();
+
   refill();
   decayCycles();
 

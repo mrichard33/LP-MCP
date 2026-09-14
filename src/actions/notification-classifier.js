@@ -1,10 +1,16 @@
 /**
  * Notification Classifier — src/actions/notification-classifier.js
  *
+ * v1.2 (2026-09-14) — The always-on Prospect line now reads
+ * "Not yet assigned" rather than the literal "NONE" when LP has not
+ * issued a prospect ID. Doctrine unchanged (the line always renders;
+ * absence is signal) — only the wording, because "NONE" read as a
+ * permanent verdict on the lead rather than a not-yet state.
+ *
  * v1.1 (2026-06-11) — REQUIRED-FIELD CARD per Mark's directive: every
  * classified card now renders Market and Src (LP Source > Subsource)
  * lines — "Unknown" when unresolvable, consistent with the
- * Prospect: NONE absence-is-signal doctrine — plus optional Reason
+ * absence-is-signal doctrine on the Prospect line — plus optional Reason
  * (loss-reason:* tag, humanized), 📅 appointment (date AND time,
  * always together), and 📐 Estimate (calculator measurements) lines.
  * New buildClassifiedNotification args: market, lpSource,
@@ -49,6 +55,12 @@ export const NOTIFICATION_CLASSES = {
   intelligence: { emoji: '🧠', label: 'PIPELINE INTELLIGENCE' },
   debug:        { emoji: '🔧', label: 'DEBUG' },
 };
+
+// The Prospect line renders this when LP has not issued a prospect ID.
+// Exported so every other card builder uses the SAME words — the LP
+// appointment card's inline LP reference drifted from this line once
+// already (one printed NONE, the other N/A).
+export const PROSPECT_UNASSIGNED = 'Not yet assigned';
 
 export const ALLOWED_TIERS = ['Cold', 'Warm', 'Hot', 'Imminent'];
 export const REP_FACING_CLASSES = new Set(['system', 'priority', 'intelligence']);
@@ -156,7 +168,7 @@ export function inferClassification(ruleKey = '', message = '') {
  * @param {string} args.name          — contact display name
  * @param {string} args.phone         — raw phone (formatted internally)
  * @param {string} args.contactId     — GHL contact ID
- * @param {string} [args.prospectId]  — LP prospect ID; renders "NONE" if absent
+ * @param {string} [args.prospectId]  — LP prospect ID; renders "Not yet assigned" if absent
  * @param {string} [args.market]      — v1.1: market name; renders "Unknown" if absent
  * @param {string} [args.lpSource]    — v1.1: LP Source (parent channel)
  * @param {string} [args.lpSourceDetail] — v1.1: LP Subsource
@@ -223,11 +235,13 @@ export function buildClassifiedNotification(args = {}) {
   lines.push(`👤 ${name || 'Unknown'}${displayPhone ? ` | ${displayPhone}` : ''}`);
   lines.push(`Contact ID: ${contactId || 'unknown'}`);
 
-  // Per Mark's v4.2 directive (always render Prospect line — absence is
-  // signal): render "NONE" rather than omitting when prospect is unknown.
+  // Per Mark's v4.2 directive the Prospect line ALWAYS renders — absence is
+  // signal. v1.2 (2026-09-14): the absent value reads "Not yet assigned"
+  // rather than "NONE", which reps were reading as a permanent verdict on the
+  // lead instead of a state LP has yet to reach.
   const prospectClean = (prospectId && String(prospectId).trim() && prospectId !== 'Not in LP')
     ? String(prospectId)
-    : 'NONE';
+    : PROSPECT_UNASSIGNED;
   lines.push(`Prospect: ${prospectClean}`);
 
   // v1.1 — Market and Src are required fields on every card. "Unknown"
