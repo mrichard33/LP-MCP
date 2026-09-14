@@ -9,6 +9,7 @@ import { registerAllTools } from './tools/index.js';
 import { startSyncScheduler, fullSync, incrementalSync, handleWebhookEvent } from './sync-engine.js';
 import { trackInflight, trackBackground, installGracefulShutdown } from './graceful-shutdown.js';
 import { intakeJournal, startIntakeJournalSweeper, registerIntakeJournalRoutes } from './intake-journal.js';
+import { startSharedBudgetReporter, registerSharedBudgetRoutes } from './ghl-shared-budget.js';
 import { testConnection, getLeads } from './lp-client.js';
 import { getTokenStatus } from './token-manager.js';
 import supabase from './supabase.js';
@@ -1990,6 +1991,7 @@ registerGhostSweepRoutes(app);
 // so the one unauthenticated route in this group was also the one that could
 // mutate both systems. No global middleware covers /n8n/*.
 registerAppointmentParityRoutes(app, authenticate);
+registerSharedBudgetRoutes(app, authenticate);
 
 // ─── LP Callback Re-queue Verification ───────────────────────────
 // 2026-08-18 (handoff C4): POST /n8n/lp-requeue/verify-sweep — verify
@@ -2195,6 +2197,8 @@ const server = app.listen(PORT, async () => {
   // this running no tag event ever reaches the Decision Engine.
   startGhlTagProcessor();
   startIntakeJournalSweeper();
+  // Measurement only — no-op unless GHL_SHARED_BUDGET_MODE=shadow.
+  startSharedBudgetReporter();
   startDriftDetectorScheduler();
   startLeadStateSweepScheduler();
   startNoteChangeAnalyzerScheduler();
