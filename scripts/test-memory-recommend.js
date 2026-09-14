@@ -135,13 +135,29 @@ test('a conflict gets no category or build columns — it has none', async () =>
 
 // ─── the framework, enforced ───────────────────────────────────────────────
 
-test('a payroll card never comes back with risk "none"', () => {
+// ── The risk classifier, after issue #2135 (sql/112, 2026-09-14) ───────────
+// Three tests here used to assert the opposite: that a payroll-callcenter or
+// partners-vendors card was FORCED from "none" to "money" regardless of what
+// the card actually said. That backstop is gone, and its removal is the fix.
+//
+// Measured on the live database on 2026-09-14: 292 of 393 recommended cards
+// carried a risk flag — 74%. A flag on three cards in four is not a warning,
+// it is wallpaper, and a reader who learns to skip it skips the one card it
+// existed for. Area is where a card is FILED; risk is what ACTING on the card
+// changes. The definition now lives in rule 4 of the prompt.
+
+test('a payroll card the model called low-risk is left alone — area is not risk', () => {
   const out = normalizeOutput({ ...goodReply, risk: 'none' }, card({ area: 'payroll-callcenter' }));
-  assert.equal(out.risk, 'money');
+  assert.equal(out.risk, 'none');
 });
 
-test('a partners-vendors card is backstopped the same way', () => {
+test('a partners-vendors card is not flagged for being filed under partners-vendors', () => {
   const out = normalizeOutput({ ...goodReply, risk: 'none' }, card({ area: 'partners-vendors' }));
+  assert.equal(out.risk, 'none');
+});
+
+test('a real risk on a payroll card is respected — the flag was narrowed, not disabled', () => {
+  const out = normalizeOutput({ ...goodReply, risk: 'money' }, card({ area: 'payroll-callcenter' }));
   assert.equal(out.risk, 'money');
 });
 
@@ -150,22 +166,77 @@ test('confidence is capped at medium whenever a risk is flagged', () => {
   assert.equal(out.confidence, 'medium');
 });
 
-test('a backstopped card is ALSO capped at medium, not left at high', () => {
-  // The bug this pins: the backstop and the cap both fire on the same card, so
-  // whichever runs second decides. With the cap last, a payroll card the model
-  // called risk:none/confidence:high came out money + high — precisely the
-  // combination rule 4 forbids, on precisely the cards that matter most.
-  for (const area of ['payroll-callcenter', 'partners-vendors']) {
-    const out = normalizeOutput({ ...goodReply, risk: 'none', confidence: 'high' }, card({ area }));
-    assert.equal(out.risk, 'money', `${area} should be backstopped to money`);
-    assert.equal(out.confidence, 'medium', `${area} must not stay at high once money is flagged`);
+test('the cap holds on every risk value, in every area', () => {
+  // Rule 4's cap is the half that stayed, and it matters MORE now: a batch pass
+  // selects on high confidence, so "real risk + high confidence" is exactly the
+  // combination that must never become a fifty-card click.
+  for (const risk of ['money', 'live_leads', 'customer_messaging']) {
+    const out = normalizeOutput({ ...goodReply, risk, confidence: 'high' }, card({ area: 'payroll-callcenter' }));
+    assert.equal(out.risk, risk);
+    assert.equal(out.confidence, 'medium', `${risk} must not stay at high`);
   }
 });
 
-test('an area with no backstop keeps the risk the model gave', () => {
-  const out = normalizeOutput({ ...goodReply, risk: 'none' }, card({ area: 'appointments' }));
-  assert.equal(out.risk, 'none');
-  assert.equal(out.confidence, 'high');
+test('an unflagged card keeps its high confidence — the cap only fires on a real risk', () => {
+  for (const area of ['payroll-callcenter', 'partners-vendors', 'appointments']) {
+    const out = normalizeOutput({ ...goodReply, risk: 'none', confidence: 'high' }, card({ area }));
+    assert.equal(out.risk, 'none', `${area} should not be flagged`);
+    assert.equal(out.confidence, 'high', `${area} should keep high confidence`);
+  }
+});
+
+// ── Lanes (sql/112) ────────────────────────────────────────────────────────
+
+test('a stale-issue card only accepts stale-lane verdicts', () => {
+  const stale = card({ lane: 'stale', card_type: 'stale_issue' });
+  assert.equal(normalizeOutput({ ...goodReply, verdict: 'fixed' }, stale).verdict, 'fixed');
+  // "approve" is not a weak answer here, it is an answer to a different
+  // question — so it falls back to the verdict that changes nothing but the clock.
+  assert.equal(normalizeOutput({ ...goodReply, verdict: 'approve' }, stale).verdict, 'still_broken');
+});
+
+test('a to-do card only accepts to-do verdicts, and defaults to keep', () => {
+  const todo = card({ lane: 'todos', card_type: 'todo' });
+  assert.equal(normalizeOutput({ ...goodReply, verdict: 'done' }, todo).verdict, 'done');
+  assert.equal(normalizeOutput({ ...goodReply, verdict: 'keep_left' }, todo).verdict, 'keep');
+  // keep snoozes for 30 days; it never closes. Nothing closes on a fallback.
+  assert.equal(normalizeOutput({ ...goodReply, verdict: 'nonsense' }, todo).verdict, 'keep');
+});
+
+test('a rulings card still only accepts rulings verdicts', () => {
+  const rulings = card({ lane: 'rulings', card_type: 'decision_needed' });
+  assert.equal(normalizeOutput({ ...goodReply, verdict: 'approve' }, rulings).verdict, 'approve');
+  assert.equal(normalizeOutput({ ...goodReply, verdict: 'fixed' }, rulings).verdict, 'not_now');
+});
+
+test('the lane is read from card_type when the view did not supply one', () => {
+  // A card can reach normalizeOutput from somewhere other than the view — a
+  // recheck, a test, a future caller — so card_type has to be enough on its own.
+  const noLane = (over) => card({ lane: undefined, ...over });
+  assert.equal(normalizeOutput({ ...goodReply, verdict: 'fixed' }, noLane({ card_type: 'stale_issue' })).verdict, 'fixed');
+  assert.equal(normalizeOutput({ ...goodReply, verdict: 'done' }, noLane({ card_type: 'todo' })).verdict, 'done');
+  // Anything unrecognised falls back to the rulings lane, which is what every
+  // card was before sql/112.
+  assert.equal(normalizeOutput({ ...goodReply, verdict: 'approve' }, noLane({ card_type: 'open_question' })).verdict, 'approve');
+});
+
+// ── Group keys ─────────────────────────────────────────────────────────────
+
+test('a known group key is kept and an unknown one is dropped', () => {
+  const stale = card({ lane: 'stale', card_type: 'stale_issue' });
+  assert.equal(normalizeOutput({ ...goodReply, verdict: 'fixed', group_key: 'fixed:pr-merged' }, stale).group_key, 'fixed:pr-merged');
+  assert.equal(normalizeOutput({ ...goodReply, verdict: 'fixed', group_key: 'fixed:i-made-this-up' }, stale).group_key, null);
+  assert.equal(normalizeOutput({ ...goodReply, verdict: 'fixed' }, stale).group_key, null);
+});
+
+test('a group key that contradicts its own verdict is dropped', () => {
+  // The group header is the only line anyone reads before approving fifty
+  // cards. "12 issues whose fix PR is merged" sitting over a still_broken
+  // verdict would be a lie told at scale.
+  const stale = card({ lane: 'stale', card_type: 'stale_issue' });
+  const out = normalizeOutput({ ...goodReply, verdict: 'still_broken', group_key: 'fixed:pr-merged' }, stale);
+  assert.equal(out.verdict, 'still_broken');
+  assert.equal(out.group_key, null);
 });
 
 test('values outside the vocabulary fall back instead of reaching the column', () => {

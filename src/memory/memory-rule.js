@@ -52,12 +52,51 @@ import { checkpointKeyFor, decisionText, getConflictThreshold } from './memory-c
 
 /** Every action Release 1 accepts. Anything else is 'not_in_release'. */
 export const RULE_ACTIONS = Object.freeze([
+  // Rulings lane (sql/102).
   'approve', 'edit_approve', 'reject', 'pick_option', 'own_answer', 'yes', 'no',
   'keep_left', 'keep_right', 'not_a_conflict', 'new_answer',
   'snooze', 'not_relevant', 'stage', 'flip', 'recheck',
+  // Stale-issue lane (sql/112).
+  'still_broken', 'fixed', 'no_longer_matters',
+  // To-do lane (sql/112).
+  'done', 'drop', 'keep', 'assign',
+  // Batch passes (sql/112). These address a GROUP, not one card.
+  'batch_apply', 'batch_undo',
 ]);
 
-const RULABLE_TABLES = new Set(['claude_pending_items', 'claude_memory_conflicts', 'claude_decision_log']);
+/**
+ * The lane verdicts. They go to claude_rule_lane_apply rather than
+ * claude_rule_apply, because Release 1's writer knows nothing about stale
+ * issues and rejects claude_known_issues outright. Both write one
+ * claude_rulings_log row in one transaction, so the audit trail is the same
+ * shape whichever door a ruling came through.
+ */
+export const LANE_ACTIONS = Object.freeze(new Set([
+  'still_broken', 'fixed', 'no_longer_matters', 'done', 'drop', 'keep', 'assign',
+]));
+
+/** Which table each lane verdict may touch. Wrong table, wrong question. */
+export const LANE_ACTION_TABLE = Object.freeze({
+  still_broken: 'claude_known_issues',
+  fixed: 'claude_known_issues',
+  no_longer_matters: 'claude_known_issues',
+  done: 'claude_pending_items',
+  drop: 'claude_pending_items',
+  keep: 'claude_pending_items',
+  assign: 'claude_pending_items',
+});
+
+export const BATCH_ACTIONS = Object.freeze(new Set(['batch_apply', 'batch_undo']));
+
+/** A batch will not go past this, and neither will we — fail before the round trip. */
+export const BATCH_MAX = 50;
+
+const RULABLE_TABLES = new Set([
+  'claude_pending_items', 'claude_memory_conflicts', 'claude_decision_log',
+  // sql/112: the stale lane. Release 1's claude_rule_apply still rejects this
+  // table; only the lane verdicts, which go to claude_rule_lane_apply, may use it.
+  'claude_known_issues',
+]);
 /** claude_decision_log is a card only for these two — you do not "approve" a decision. */
 const DECISION_ONLY_ACTIONS = new Set(['stage', 'flip']);
 /** Actions that file a NEW active decision, so the conflict guard applies. */
@@ -124,7 +163,12 @@ export class RuleError extends Error {
 }
 
 /** Stable codes claude_rule_apply raises, in the order Node should test them. */
-const RPC_CODES = ['stale_card', 'already_reversed', 'changed_since', 'reason_required', 'proof_required', 'not_in_release', 'bad_input'];
+const RPC_CODES = [
+  'stale_card', 'already_reversed', 'changed_since', 'reason_required', 'proof_required',
+  'not_in_release', 'bad_input',
+  // sql/112 — the batch refusals.
+  'batch_too_large', 'not_batchable', 'confidence_too_low',
+];
 
 /** Map an RPC error message back to its stable code. */
 export function codeOf(message) {
@@ -179,6 +223,7 @@ async function loadCard(db, table, id) {
     claude_pending_items: 'id, item_type, description, status, options, origin, area, raw, rec_verdict, rec_decision_text, rec_category, rec_build_text, rec_risk, snooze_until',
     claude_memory_conflicts: 'id, kind, row_a, row_b, status, rec_verdict, rec_decision_text, rec_risk, snooze_until',
     claude_decision_log: 'id, decision, category, status, rollout_stage, area',
+    claude_known_issues: 'id, description, status, stale, verified_at, verification_note, area, origin, rec_verdict, rec_risk, rec_group_key, rec_confidence, snooze_until',
   }[table];
   const res = await db.from(table).select(cols).eq('id', id).maybeSingle();
   if (res.error) throw new RuleError('error', `load ${table} #${id}: ${res.error.message}`);
@@ -214,6 +259,89 @@ function categoryFor(card, input) {
   return rec && CATEGORIES.includes(rec) ? rec : 'operations';
 }
 
+/** Plain words for what a lane verdict is about to do. Shown by the dry run. */
+export function laneSummary(action, table, id, { proof = null, assignee = null } = {}) {
+  const ref = `${table === 'claude_known_issues' ? 'issue' : 'to-do'} #${id}`;
+  switch (action) {
+    case 'still_broken':      return `Mark ${ref} as still broken — re-verified today, nothing closed.`;
+    case 'fixed':             return `Close ${ref} as resolved, with the proof: ${proof}`;
+    case 'no_longer_matters': return `Close ${ref} as wont_fix — the thing it was about is gone.`;
+    case 'done':              return `Close ${ref} as done.`;
+    case 'drop':              return `Close ${ref} as dropped.`;
+    case 'keep':              return `Keep ${ref} and ask again in 30 days. Nothing closes.`;
+    case 'assign':            return `Give ${ref} to ${assignee}.`;
+    default:                  return `${action} on ${ref}.`;
+  }
+}
+
+/**
+ * The payload for a batch pass. Validated HERE as well as in SQL so a bad batch
+ * costs nothing and the message names the problem — the SQL refuses the same
+ * things, but a caller should not have to send fifty ids to be told fifty-one
+ * is too many.
+ */
+export function buildBatchPlan(input = {}, { now = new Date() } = {}) {
+  const action = String(input.action || '').trim();
+
+  if (action === 'batch_undo') {
+    const batch_id = input.batch_id ? String(input.batch_id).trim() : null;
+    if (!batch_id) throw new RuleError('bad_input', 'batch_undo needs batch_id');
+    const reason = input.reason == null || input.reason === '' ? null : String(input.reason).trim();
+    if (!reason) throw new RuleError('reason_required', 'an undo must say why');
+    return {
+      batch: true, action,
+      summary: `Reverse every ruling in batch ${batch_id}, restoring each row exactly as it was.`,
+      p: { batch_id, reason, ruled_by: input.ruled_by ? String(input.ruled_by) : 'mark (chat)' },
+    };
+  }
+
+  const verdict = String(input.verdict || '').trim();
+  if (!LANE_ACTIONS.has(verdict)) {
+    throw new RuleError('bad_input', `batch_apply needs a lane verdict — one of ${[...LANE_ACTIONS].join(', ')}`);
+  }
+  const targets = Array.isArray(input.targets) ? input.targets : null;
+  if (!targets || !targets.length) throw new RuleError('bad_input', 'batch_apply needs a non-empty targets array');
+  if (targets.length > BATCH_MAX) {
+    throw new RuleError('batch_too_large', `${targets.length} targets — ${BATCH_MAX} is the most that can be ruled at once, because ${BATCH_MAX} is about as many lines as anyone actually reads before clicking`);
+  }
+
+  const want = LANE_ACTION_TABLE[verdict];
+  const proof = input.proof ? String(input.proof).trim() : null;
+  const clean = targets.map((t, i) => {
+    const table = t?.table ? String(t.table) : want;
+    const id = t?.id == null ? null : Number(t.id);
+    if (!Number.isInteger(id) || id < 1) throw new RuleError('bad_input', `targets[${i}] needs an id`);
+    if (table !== want) throw new RuleError('bad_input', `targets[${i}]: ${verdict} rules ${want}, not ${table}`);
+    const rowProof = t?.proof ? String(t.proof).trim() : proof;
+    if (verdict === 'fixed' && !rowProof) {
+      throw new RuleError('proof_required', `targets[${i}] (#${id}): closing an issue as fixed needs a link to what fixed it`);
+    }
+    return {
+      table, id,
+      card_version: t?.card_version ? String(t.card_version) : null,
+      ...(rowProof ? { proof: rowProof } : {}),
+    };
+  });
+
+  if (verdict === 'assign' && !input.assignee) {
+    throw new RuleError('bad_input', 'assign needs an assignee');
+  }
+
+  return {
+    batch: true, action, verdict, count: clean.length,
+    summary: `${laneSummary(verdict, want, 0, { proof, assignee: input.assignee }).replace(/ #0/, 's')} — ${clean.length} of them, in one reversible pass.`,
+    p: {
+      verdict, targets: clean, proof,
+      assignee: input.assignee ? String(input.assignee).trim() : null,
+      reason: input.reason == null || input.reason === '' ? null : String(input.reason).trim(),
+      ruled_by: input.ruled_by ? String(input.ruled_by) : 'mark (chat)',
+      via: input.via === 'chat' ? 'chat' : 'dashboard',
+      rec_group_key: input.rec_group_key ? String(input.rec_group_key) : null,
+      session: sessionIdentity(now),
+    },
+  };
+}
+
 /**
  * Build the payload claude_rule_apply receives, and say what it will do.
  * Pure apart from the card read. Throws RuleError on bad input.
@@ -227,6 +355,59 @@ export async function buildPlan(input = {}, { db = supabase, now = new Date(), e
   let table = input.target?.table ? String(input.target.table) : null;
   let id = input.target?.id == null ? null : Number(input.target.id);
   const reverses_id = input.reverses_id == null ? null : Number(input.reverses_id);
+
+  // A batch addresses a group, not a card, so it has no plan to build here —
+  // applyRule routes it straight to claude_rule_batch / claude_rule_batch_undo.
+  if (BATCH_ACTIONS.has(action)) {
+    throw new RuleError('bad_input', `${action} is a batch action — it does not take a single target`);
+  }
+
+  // ── The lane verdicts (sql/112). A short path on purpose: a stale issue has
+  // no decision to write, no options to resolve, no build to file and no
+  // supersedes guard to run. Everything below this block is about a decision.
+  if (LANE_ACTIONS.has(action)) {
+    const want = LANE_ACTION_TABLE[action];
+    if (!table) table = want;
+    if (table !== want) {
+      throw new RuleError('bad_input', `${action} rules ${want}, not ${table}`);
+    }
+    if (!Number.isInteger(id) || id < 1) throw new RuleError('bad_input', 'target { table, id } is required');
+
+    const laneCard = await loadCard(db, table, id);
+    if (!laneCard) throw new RuleError('bad_input', `${table} #${id} not found`);
+
+    const laneProof = input.proof ? String(input.proof).trim() : null;
+    // Closing an issue as fixed without a link is a guess wearing a fact's
+    // clothes — and nobody re-opens a resolved issue to check. The SQL refuses
+    // it too; this is the same refusal one round trip earlier, with a message
+    // that says what to do about it.
+    if (action === 'fixed' && !laneProof) {
+      throw new RuleError('proof_required', 'closing an issue as fixed needs a link to what fixed it — a merged PR, a commit, a file path, or a line saying what was checked');
+    }
+    const assignee = input.assignee ? String(input.assignee).trim() : (input.owner ? String(input.owner).trim() : null);
+    if (action === 'assign' && !assignee) {
+      throw new RuleError('bad_input', 'assign needs an assignee — pass assignee');
+    }
+
+    const laneSession = sessionIdentity(now);
+    return {
+      lane: true,
+      card: laneCard,
+      overrides: Boolean(laneCard.rec_verdict && laneCard.rec_verdict !== action),
+      summary: laneSummary(action, table, id, { proof: laneProof, assignee }),
+      p: {
+        action, target_table: table, target_id: id,
+        card_version: input.card_version ? String(input.card_version) : null,
+        ruled_by: input.ruled_by ? String(input.ruled_by) : 'mark (chat)',
+        via: input.via === 'chat' ? 'chat' : 'dashboard',
+        reason: input.reason == null || input.reason === '' ? null : String(input.reason).trim(),
+        proof: laneProof,
+        assignee,
+        rec_group_key: laneCard.rec_group_key || null,
+        session: laneSession,
+      },
+    };
+  }
 
   // A flip addresses a RULING, so it can find its own card.
   let original = null;
@@ -357,8 +538,51 @@ export async function planRule(input = {}, deps = {}) {
     const mode = getRecommendMode(deps.env || process.env);
     return { dry_run: true, action, recommend_mode: mode, would: mode === 'off' ? 'nothing — MEMORY_RECOMMEND_MODE is off' : `re-run the recommendation for ${input.target?.table} #${input.target?.id}`, hint: 'add "confirm": true to run' };
   }
+  if (BATCH_ACTIONS.has(action)) {
+    try {
+      const plan = buildBatchPlan(input, { now: deps.now || new Date() });
+      return {
+        dry_run: true,
+        action,
+        batch: true,
+        verdict: plan.verdict ?? null,
+        count: plan.count ?? null,
+        targets: plan.p.targets ? plan.p.targets.map((t) => `${t.table} #${t.id}`) : null,
+        batch_id: plan.p.batch_id ?? null,
+        reason: plan.p.reason ?? null,
+        would: plan.summary,
+        refuses: action === 'batch_apply'
+          ? `anything above ${BATCH_MAX}, any Rulings card, any confidence below high, a "fixed" with no proof, or a card edited since it was loaded`
+          : 'a batch already reversed, or one whose rows have changed since it ran',
+        hint: 'add "confirm": true to write',
+      };
+    } catch (err) {
+      if (err instanceof RuleError) return { ok: false, code: err.code, error: err.message };
+      throw err;
+    }
+  }
+
   try {
-    const { p, card, original, overrides, verdict } = await buildPlan(input, deps);
+    const plan0 = await buildPlan(input, deps);
+    if (plan0.lane) {
+      return {
+        dry_run: true,
+        action: plan0.p.action,
+        lane: true,
+        target: `${plan0.p.target_table} #${plan0.p.target_id}`,
+        card_type: plan0.p.target_table === 'claude_known_issues' ? 'stale_issue' : 'todo',
+        ruled_by: plan0.p.ruled_by, via: plan0.p.via,
+        session: plan0.p.session,
+        proof: plan0.p.proof, assignee: plan0.p.assignee,
+        recommendation: plan0.card?.rec_verdict ?? null,
+        your_verdict: plan0.p.action,
+        overrides_recommendation: plan0.overrides,
+        reason: plan0.p.reason,
+        would: plan0.summary,
+        hint: 'add "confirm": true to write',
+      };
+    }
+    const { p, card, original, overrides, verdict } = plan0;
     return {
       dry_run: true,
       action: p.action,
@@ -436,6 +660,27 @@ export async function applyRule(input = {}, { db = supabase, now = new Date(), e
     return { ok: true, rec };
   }
 
+  // ── Batch passes (sql/112). One transaction, one batch_id, one log row per
+  // item — claude_rule_batch owns all of that, including the refusals. There is
+  // no guard call here because a batch never writes a decision.
+  if (BATCH_ACTIONS.has(String(input.action || '').trim())) {
+    let batchPlan;
+    try {
+      batchPlan = buildBatchPlan(input, { now });
+    } catch (err) {
+      if (err instanceof RuleError) return { ok: false, code: err.code, error: err.message };
+      throw err;
+    }
+    const fn = batchPlan.action === 'batch_undo' ? 'claude_rule_batch_undo' : 'claude_rule_batch';
+    const args = batchPlan.action === 'batch_undo'
+      ? { p_batch_id: batchPlan.p.batch_id, p_reason: batchPlan.p.reason, p_ruled_by: batchPlan.p.ruled_by }
+      : { p: batchPlan.p };
+    const res = await db.rpc(fn, args);
+    if (res?.error) return { ok: false, code: codeOf(res.error.message), message: res.error.message };
+    const data = (Array.isArray(res?.data) ? res.data[0] : res?.data) || {};
+    return { ...data, ok: data.ok !== false, summary: batchPlan.summary };
+  }
+
   const out = { guard: null };
   let plan;
   try {
@@ -444,6 +689,20 @@ export async function applyRule(input = {}, { db = supabase, now = new Date(), e
     if (err instanceof RuleError) return { ok: false, code: err.code, error: err.message };
     throw err;
   }
+
+  // ── A single lane verdict. Its own writer, because Release 1's rejects
+  // claude_known_issues and every verdict outside its own list. No decision is
+  // written, so the duplicate-decision guard below does not apply.
+  if (plan.lane) {
+    const res = await db.rpc('claude_rule_lane_apply', { p: plan.p });
+    if (res?.error) return { ok: false, code: codeOf(res.error.message), message: res.error.message };
+    const data = (Array.isArray(res?.data) ? res.data[0] : res?.data) || {};
+    return {
+      ...data, ok: data.ok !== false, summary: plan.summary,
+      overrode_recommendation: plan.overrides,
+    };
+  }
+
   const { p } = plan;
 
   const embedFn = embed === undefined ? await defaultEmbed(env) : embed;
@@ -499,4 +758,7 @@ export async function applyRule(input = {}, { db = supabase, now = new Date(), e
   return result;
 }
 
-export default { planRule, applyRule, RULE_ACTIONS, stripOmiPrefix, verdictFor, sessionIdentity };
+export default {
+  planRule, applyRule, RULE_ACTIONS, stripOmiPrefix, verdictFor, sessionIdentity,
+  LANE_ACTIONS, BATCH_ACTIONS, BATCH_MAX, buildBatchPlan, laneSummary,
+};

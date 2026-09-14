@@ -117,11 +117,171 @@ test('claude_decision_log is addressable only by stage and flip', async () => {
   assert.match(out.error, /stage and flip/);
 });
 
-test('an action outside Release 1 is not_in_release', async () => {
+test('an action the tool does not know is not_in_release', async () => {
+  // This used to use 'batch_apply' as its example. sql/112 ships batch_apply,
+  // so the example moved to something that genuinely is not an action.
   const db = fakeDb(rows());
-  const out = await applyRule({ action: 'batch_apply', target: { table: 'claude_pending_items', id: 40 } }, { db, now: NOW, env: ENV, embed: null });
+  const out = await applyRule({ action: 'yolo', target: { table: 'claude_pending_items', id: 40 } }, { db, now: NOW, env: ENV, embed: null });
   assert.equal(out.code, 'not_in_release');
-  assert.ok(!RULE_ACTIONS.includes('batch_apply'));
+  assert.ok(!RULE_ACTIONS.includes('yolo'));
+});
+
+// ─── The lane verdicts and batch passes (sql/112) ───────────────────────────
+
+const staleIssue = {
+  id: 812, description: 'MOD report is missing the CCC dispositions', status: 'open',
+  stale: true, area: 'scorecard-reporting', origin: 'live', rec_verdict: 'still_broken',
+  rec_confidence: 'high', rec_group_key: 'still_broken:no-evidence-of-fix',
+};
+const todoItem = {
+  id: 77, item_type: 'action_needed', status: 'open', origin: 'omi',
+  description: '[Omi 2026-09-12] Send Chris the September source numbers',
+  area: 'scorecard-reporting', raw: {}, options: null, rec_verdict: 'keep', rec_confidence: 'high',
+};
+const laneRows = (extra = {}) => rows({
+  'claude_known_issues:812': staleIssue,
+  'claude_pending_items:77': todoItem,
+  ...extra,
+});
+
+test('a lane verdict goes to claude_rule_lane_apply, not claude_rule_apply', async () => {
+  // Release 1's writer rejects claude_known_issues outright and every verdict
+  // outside its own list. Routing is the whole reason the lanes work at all.
+  const db = fakeDb(laneRows());
+  const out = await applyRule(
+    { action: 'still_broken', target: { table: 'claude_known_issues', id: 812 } },
+    { db, now: NOW, env: ENV, embed: null },
+  );
+  assert.equal(out.ok, true);
+  const rpcs = db.calls.filter((c) => c.rpc).map((c) => c.rpc);
+  assert.ok(rpcs.includes('claude_rule_lane_apply'), `expected lane writer, got ${rpcs.join(',')}`);
+  assert.ok(!rpcs.includes('claude_rule_apply'));
+});
+
+test('fixed without proof is refused before the round trip', async () => {
+  const db = fakeDb(laneRows());
+  const out = await applyRule(
+    { action: 'fixed', target: { table: 'claude_known_issues', id: 812 } },
+    { db, now: NOW, env: ENV, embed: null },
+  );
+  assert.equal(out.ok, false);
+  assert.equal(out.code, 'proof_required');
+  // Refused HERE means the database was never asked.
+  assert.equal(db.calls.filter((c) => c.rpc).length, 0);
+});
+
+test('fixed with proof is accepted and carries the proof through', async () => {
+  const db = fakeDb(laneRows());
+  const out = await applyRule(
+    { action: 'fixed', target: { table: 'claude_known_issues', id: 812 }, proof: 'https://github.com/mrichard33/LP-MCP/pull/900' },
+    { db, now: NOW, env: ENV, embed: null },
+  );
+  assert.equal(out.ok, true);
+  const call = db.calls.find((c) => c.rpc === 'claude_rule_lane_apply');
+  assert.equal(call.args.p.proof, 'https://github.com/mrichard33/LP-MCP/pull/900');
+});
+
+test('a lane verdict aimed at the wrong table is refused', async () => {
+  const db = fakeDb(laneRows());
+  const out = await applyRule(
+    { action: 'fixed', target: { table: 'claude_pending_items', id: 77 }, proof: 'x' },
+    { db, now: NOW, env: ENV, embed: null },
+  );
+  assert.equal(out.ok, false);
+  assert.equal(out.code, 'bad_input');
+});
+
+test('assign needs an assignee', async () => {
+  const db = fakeDb(laneRows());
+  const bad = await applyRule({ action: 'assign', target: { table: 'claude_pending_items', id: 77 } }, { db, now: NOW, env: ENV, embed: null });
+  assert.equal(bad.code, 'bad_input');
+  const good = await applyRule(
+    { action: 'assign', target: { table: 'claude_pending_items', id: 77 }, assignee: 'Amanda' },
+    { db, now: NOW, env: ENV, embed: null },
+  );
+  assert.equal(good.ok, true);
+  assert.equal(db.calls.find((c) => c.rpc === 'claude_rule_lane_apply').args.p.assignee, 'Amanda');
+});
+
+test('keep never closes anything — the dry run says so in plain words', async () => {
+  const plan = await planRule(
+    { action: 'keep', target: { table: 'claude_pending_items', id: 77 } },
+    { db: fakeDb(laneRows()), now: NOW, env: ENV },
+  );
+  assert.equal(plan.dry_run, true);
+  assert.match(plan.would, /30 days/);
+  assert.match(plan.would, /Nothing closes/i);
+});
+
+test('a batch over 50 is refused without asking the database', async () => {
+  const db = fakeDb(laneRows());
+  const targets = Array.from({ length: 51 }, (_, i) => ({ table: 'claude_pending_items', id: i + 1 }));
+  const out = await applyRule({ action: 'batch_apply', verdict: 'done', targets }, { db, now: NOW, env: ENV, embed: null });
+  assert.equal(out.ok, false);
+  assert.equal(out.code, 'batch_too_large');
+  assert.equal(db.calls.filter((c) => c.rpc).length, 0);
+});
+
+test('a batch of exactly 50 is allowed and reaches claude_rule_batch', async () => {
+  const db = fakeDb(laneRows());
+  const targets = Array.from({ length: 50 }, (_, i) => ({ table: 'claude_pending_items', id: i + 1 }));
+  const out = await applyRule({ action: 'batch_apply', verdict: 'done', targets }, { db, now: NOW, env: ENV, embed: null });
+  assert.equal(out.ok, true);
+  const call = db.calls.find((c) => c.rpc === 'claude_rule_batch');
+  assert.equal(call.args.p.targets.length, 50);
+});
+
+test('a batch of fixed with no proof anywhere is refused, naming the row', async () => {
+  const db = fakeDb(laneRows());
+  const out = await applyRule({
+    action: 'batch_apply', verdict: 'fixed',
+    targets: [{ table: 'claude_known_issues', id: 812 }, { table: 'claude_known_issues', id: 813 }],
+  }, { db, now: NOW, env: ENV, embed: null });
+  assert.equal(out.code, 'proof_required');
+  assert.match(out.error, /#812/);
+});
+
+test('a batch-level proof covers every row that has none of its own', async () => {
+  const db = fakeDb(laneRows());
+  const out = await applyRule({
+    action: 'batch_apply', verdict: 'fixed', proof: 'https://example.invalid/pr/1',
+    targets: [{ table: 'claude_known_issues', id: 812 }, { table: 'claude_known_issues', id: 813, proof: 'https://example.invalid/pr/2' }],
+  }, { db, now: NOW, env: ENV, embed: null });
+  assert.equal(out.ok, true);
+  const sent = db.calls.find((c) => c.rpc === 'claude_rule_batch').args.p.targets;
+  assert.equal(sent[0].proof, 'https://example.invalid/pr/1');
+  assert.equal(sent[1].proof, 'https://example.invalid/pr/2');
+});
+
+test('a batch mixing lanes is refused — a verdict rules one table', async () => {
+  const db = fakeDb(laneRows());
+  const out = await applyRule({
+    action: 'batch_apply', verdict: 'done',
+    targets: [{ table: 'claude_pending_items', id: 77 }, { table: 'claude_known_issues', id: 812 }],
+  }, { db, now: NOW, env: ENV, embed: null });
+  assert.equal(out.ok, false);
+  assert.equal(out.code, 'bad_input');
+});
+
+test('batch_undo needs a batch_id and a reason', async () => {
+  const db = fakeDb(laneRows());
+  assert.equal((await applyRule({ action: 'batch_undo', reason: 'wrong call' }, { db, now: NOW, env: ENV, embed: null })).code, 'bad_input');
+  assert.equal((await applyRule({ action: 'batch_undo', batch_id: 'b-1' }, { db, now: NOW, env: ENV, embed: null })).code, 'reason_required');
+  const ok = await applyRule({ action: 'batch_undo', batch_id: 'b-1', reason: 'wrong call' }, { db, now: NOW, env: ENV, embed: null });
+  assert.equal(ok.ok, true);
+  const call = db.calls.find((c) => c.rpc === 'claude_rule_batch_undo');
+  assert.equal(call.args.p_batch_id, 'b-1');
+  assert.equal(call.args.p_reason, 'wrong call');
+});
+
+test('a batch action never takes a single target', async () => {
+  const db = fakeDb(laneRows());
+  const out = await applyRule(
+    { action: 'batch_apply', target: { table: 'claude_pending_items', id: 77 } },
+    { db, now: NOW, env: ENV, embed: null },
+  );
+  assert.equal(out.ok, false);
+  assert.equal(out.code, 'bad_input');
 });
 
 // ─── decision text ─────────────────────────────────────────────────────────
