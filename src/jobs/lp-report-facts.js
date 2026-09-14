@@ -144,5 +144,28 @@ export function expectedFacts(reportType, rows) {
     }
   }
 
+  // ── marketing_cost fails to NULL, never to zero (2026-09-14) ───────────────
+  // Mirrors NULLIF(SUM(c.mcost_cents), 0) in scorecard_rebuild_facts.
+  //
+  // A cost column that reports nothing for a whole period must publish
+  // "unknown", not "free". August 2026 and September MTD both read $0 against
+  // $269,602 in July — 68 and 47 contributing rows, every one of them a hard
+  // zero, Modernize and Lead Gurus included — and every cost-per-lead,
+  // cost-per-issued, cost-per-sale and marketing-%-of-net derived from them was
+  // computing against a coalesced zero for six weeks.
+  //
+  // NOTE THE COLLAPSE THIS ACCEPTS: `money()` in lp-report-parse-source-cost.js
+  // returns 0 for any cell it cannot parse, blank included, so a missing figure
+  // and a real $0.00 are already identical by the time they reach here. A
+  // genuinely-zero period therefore resolves to unknown as well. That is the
+  // safe side: a suppressed tile, against a fabricated cost-per-lead. See the
+  // sql/109 header for what restoring the real distinction would take.
+  if (reportType === 'source_cost') {
+    const mc = out.get(factKey({
+      market: 'REECE', branch_code_raw: null, metric: 'marketing_cost', bucket: null,
+    }));
+    if (mc && mc.cents === 0) mc.cents = null;
+  }
+
   return out;
 }

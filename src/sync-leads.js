@@ -89,6 +89,7 @@ import { lpDateToEastern, lpCreatedDate } from './lp-dates.js';
 import { matchToGHL } from './ghl.js';
 import { executeAddTag, executeRemoveTag } from './actions/handlers/tags.js';
 import { upsertProspect } from './upsert-prospect.js';
+import { shouldEmitReschedule, buildRescheduleEvent, sameApptInstant } from './services/appointment-reschedule-emit.js';
 import { combineNotes } from './safe-notes.js';
 import { syncCallLogs, syncNotes, syncActivities, syncJobAndMilestones } from './sync-children.js';
 import { emitEvent, dispositionPriority } from './event-emitter.js';
@@ -552,7 +553,7 @@ export async function upsertLeadOnly(prospect) {
     // the existing ghl_contact_id into buildLeadRow. maybeSingle() returns
     // null cleanly for brand-new leads instead of erroring.
     const { data: existing } = await supabase.from('lp_leads')
-      .select('updated_at_lp, ghl_contact_id, ghl_link_source, demo_completed, appointment_set, closed_won, appointment_confirmed, appointment_verified, lp_branch_id, set_by_name, ever_confirmed, ever_sat, raw_lp_data')
+      .select('updated_at_lp, ghl_contact_id, ghl_link_source, demo_completed, appointment_set, closed_won, appointment_confirmed, appointment_date, appointment_verified, lp_branch_id, set_by_name, ever_confirmed, ever_sat, raw_lp_data')
       .eq('lp_lead_id', lpLeadId).maybeSingle();
 
     // Corroborated link resolution (no matchToGHL in Pass 1, so verifiedGhlId
@@ -577,6 +578,9 @@ export async function upsertLeadOnly(prospect) {
     const soldIn    = getField(lead, 'sold', 'Sold');
     const confIn    = getField(lead, 'confirmed', 'Confirmed');
     const verifIn   = getField(lead, 'verified', 'Verified');
+    // Derived exactly as buildLeadRow derives it, so the guard compares
+    // against the value that WOULD be written.
+    const apptDateIn = lpDateToEastern(getField(lead, 'apptdate', 'ApptDate'));
     const isApptSetIn = apptSetIn === 'true' || apptSetIn === true;
     const isDemoIn    = satIn === 'true' || satIn === true;
     const isSoldIn    = soldIn === 'true' || soldIn === true;
@@ -585,7 +589,15 @@ export async function upsertLeadOnly(prospect) {
       && existing.demo_completed  === isDemoIn
       && existing.closed_won      === isSoldIn
       && (confIn == null  || existing.appointment_confirmed === (confIn === 'true' || confIn === true))
-      && (verifIn == null || existing.appointment_verified  === (verifIn === 'true' || verifIn === true));
+      && (verifIn == null || existing.appointment_verified  === (verifIn === 'true' || verifIn === true))
+      // 2026-09-14 (WO-4a): appointment_date joins the guard. Defense in depth
+      // — the Maidment canary shows LP DOES bump LastChangedOn on a reschedule
+      // (lead 575494, updated_at_lp = the 9/13 16:25Z move), so this is not the
+      // failure that was observed. But this guard exists precisely because LP
+      // does not always bump it, and a reschedule that didn't would skip past
+      // both the upsert and the reschedule emit — leaving the STORED date stale
+      // as well as the event unsent, which is strictly worse than today.
+      && sameApptInstant(existing.appointment_date, apptDateIn);
 
     if (newUpdatedAt && existing?.updated_at_lp && existing.updated_at_lp === newUpdatedAt && flagsUnchanged) {
       const needsGhlIdBackfill = !existing.ghl_contact_id && resolved.ghlContactId;
@@ -700,7 +712,7 @@ export async function processProspect(prospect, { skipGHL = false, payloadHash =
 
     // ─── AGENTIC: Read existing state BEFORE upsert ──────────────
     const { data: existing } = await supabase.from('lp_leads')
-      .select('ghl_tag_applied, lp_day15_triggered, disposition_code, ghl_contact_id, ghl_link_source, updated_at_lp, demo_completed, appointment_set, closed_won, appointment_confirmed, appointment_verified, lp_branch_id, set_by_name, ever_confirmed, ever_sat, raw_lp_data, lp_payload_hash')
+      .select('ghl_tag_applied, lp_day15_triggered, disposition_code, ghl_contact_id, ghl_link_source, updated_at_lp, demo_completed, appointment_set, closed_won, appointment_confirmed, appointment_date, appointment_verified, lp_branch_id, set_by_name, ever_confirmed, ever_sat, raw_lp_data, lp_payload_hash')
       .eq('lp_lead_id', lpLeadId).single();
 
     const previousDisposition = existing?.disposition_code || null;
@@ -759,6 +771,9 @@ export async function processProspect(prospect, { skipGHL = false, payloadHash =
     const soldIn    = getField(lead, 'sold', 'Sold');
     const confIn    = getField(lead, 'confirmed', 'Confirmed');
     const verifIn   = getField(lead, 'verified', 'Verified');
+    // Derived exactly as buildLeadRow derives it, so the guard compares
+    // against the value that WOULD be written.
+    const apptDateIn = lpDateToEastern(getField(lead, 'apptdate', 'ApptDate'));
     const isApptSetIn = apptSetIn === 'true' || apptSetIn === true;
     const isDemoIn    = satIn === 'true' || satIn === true;
     const isSoldIn    = soldIn === 'true' || soldIn === true;
@@ -769,7 +784,15 @@ export async function processProspect(prospect, { skipGHL = false, payloadHash =
       && existing.demo_completed  === isDemoIn
       && existing.closed_won      === isSoldIn
       && (confIn == null  || existing.appointment_confirmed === (confIn === 'true' || confIn === true))
-      && (verifIn == null || existing.appointment_verified  === (verifIn === 'true' || verifIn === true));
+      && (verifIn == null || existing.appointment_verified  === (verifIn === 'true' || verifIn === true))
+      // 2026-09-14 (WO-4a): appointment_date joins the guard. Defense in depth
+      // — the Maidment canary shows LP DOES bump LastChangedOn on a reschedule
+      // (lead 575494, updated_at_lp = the 9/13 16:25Z move), so this is not the
+      // failure that was observed. But this guard exists precisely because LP
+      // does not always bump it, and a reschedule that didn't would skip past
+      // both the upsert and the reschedule emit — leaving the STORED date stale
+      // as well as the event unsent, which is strictly worse than today.
+      && sameApptInstant(existing.appointment_date, apptDateIn);
 
     // Branch backfill-on-skip (fix-pass 2): a row synced before lp_branch_id
     // existed looks "unchanged" forever (LP won't bump lastchangedon because
@@ -849,6 +872,43 @@ export async function processProspect(prospect, { skipGHL = false, payloadHash =
 
     const { error: upsertErr } = await supabase.from('lp_leads').upsert(row, { onConflict: 'lp_lead_id' });
     if (upsertErr) throw new Error(`Lead upsert failed for ${lpLeadId}: ${upsertErr.message}`);
+
+    // ─── WO-4a: Emit on an LP appointment-date change ────────────
+    //
+    // LP→GHL appointment sync used to fire ONLY on lp.disposition_changed, so a
+    // reschedule that left the disposition alone emitted nothing:
+    // reconcileLpAppointmentToGhl never ran and GHL kept the old date — holding
+    // a stale slot and double-counting the appointment across two days. Over 30
+    // days that is appt.booking = 2,823 created, 34 noop_already_exists, ONE
+    // updated. The reconciler handled reschedules correctly the whole time; it
+    // was simply never invoked.
+    //
+    // Emitted AFTER the upsert, deliberately: the handler re-reads the
+    // authoritative lp_leads row, so the row must already carry the new date.
+    // The decision and the event body live in services/appointment-reschedule-emit.js
+    // (pure, unit-tested); this site owns only the read and the emit.
+    const reschedule = shouldEmitReschedule({
+      previousAppointmentDate: existing?.appointment_date ?? null,
+      appointmentDate: row.appointment_date ?? null,
+      dispositionCode: newDisposition,
+    });
+    if (reschedule.emit) {
+      await emitEvent(buildRescheduleEvent({
+        lpLeadId,
+        lpProspectId,
+        ghlContactId: newLeadGhlId || existing?.ghl_contact_id || null,
+        previousAppointmentDate: existing.appointment_date,
+        appointmentDate: row.appointment_date,
+        dispositionCode: newDisposition,
+        leadName: `${getField(prospect, 'firstname', 'FirstName') || ''} ${getField(prospect, 'lastname', 'LastName') || ''}`.trim(),
+        leadSource: getField(lead, 'source', 'Source') || null,
+        priority: dispositionPriority(newDisposition),
+      }));
+      console.log(
+        `[Sync] APPT RESCHEDULED: lead ${lpLeadId} (${newDisposition}) ` +
+        `${existing.appointment_date} → ${row.appointment_date} — emitted lp.appointment_rescheduled`
+      );
+    }
 
     // ─── AGENTIC: Emit disposition change event ──────────────────
     if (dispositionChanged) {

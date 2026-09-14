@@ -280,6 +280,7 @@ import { registerSourceReconcileRoutes, startSourceReconcileScheduler } from './
 // 07:30 ET missing-report watchdog — watches the OUTCOME table, independent
 // of every pipeline stage (LP schedule / Gmail / n8n / ingest route).
 import { startLpReportWatchdog } from './jobs/lp-report-watchdog.js';
+import { startApptProspectDupeSweep } from './jobs/appt-prospect-dupe-sweep.js';
 // Clears chunked ingests that began and never finalized. They hold the snapshot
 // unique keys, so each one rejects its own corrected re-send until released.
 import { startLpCsvOrphanReaper } from './jobs/lp-csv-orphan-reaper.js';
@@ -2213,6 +2214,7 @@ const server = app.listen(PORT, async () => {
   startLpReportReconScheduler();
   startSourceReconcileScheduler();
   startLpReportWatchdog();
+  startApptProspectDupeSweep();
   startLpCsvOrphanReaper();
   startFbPublishWatchdog();
   startFive9SilenceWatchdog();
