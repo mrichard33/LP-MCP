@@ -26,6 +26,11 @@
  * writes the SAME date/time back to LP — idempotent at LP (disposition and
  * appointment unchanged, so sync-leads emits no new lp.disposition_changed),
  * and even a spurious re-fire lands on proof 1's fixed point.
+ * (2026-09-14, WO-4a: sync-leads now ALSO emits lp.appointment_rescheduled on a
+ * date-only move, so termination depends on that event staying quiet here too.
+ * It does — the date written back is identical, and shouldEmitReschedule
+ * compares instants and returns reason 'unchanged'. See
+ * scripts/test-appointment-reschedule-emit.js.)
  */
 
 import test from 'node:test';

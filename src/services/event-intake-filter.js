@@ -166,6 +166,17 @@ const ALLOWED_EVENT_TYPES = new Set([
                                    // with bypass_filter, so this is defense in depth:
                                    // if that flag is ever dropped the escalation
                                    // would die at intake with no trace.
+  'lp.appointment_rescheduled',    // 2026-09-14 (WO-4a) — rule
+                                   // LP_APPT_GHL_SYNC_RESCHEDULED routes an LP
+                                   // appointment-date change with the disposition
+                                   // UNCHANGED to sync_lp_appointment_to_ghl.
+                                   // Emitted by sync-leads without bypass_filter,
+                                   // so this entry is the plumbing, not a
+                                   // backstop: the allowlist is default-DROP and
+                                   // without it every reschedule lands in
+                                   // system_events_filtered and GHL keeps holding
+                                   // the stale slot — the exact defect this
+                                   // event exists to fix.
 
   // Quiet but rule-watched (must not drop)
   'ghl.lead_score_changed',        // 4 rules (W11_1_*)
