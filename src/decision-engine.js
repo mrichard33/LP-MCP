@@ -943,7 +943,33 @@ async function countThreadTurns(ghlContactId, sinceMinutes = 60) {
 // suppressing the rule on every evaluation (found via E2E telemetry).
 const ANNOTATION_CONDITION_KEYS = new Set(['description', 'notes', '_comment', '_doc']);
 
-function emitConditionFailClosed(event, ruleKey, missingKey, detail) {
+// 2026-09-12 — operators whose branch issues a live read (GHL contact, lp_leads,
+// appointments, system_events history). Everything else answers from the event
+// and the intelligence object already in hand. Used ONLY to order evaluation
+// (see the sort in evaluateContextConditions) — never to decide a result.
+//
+// Membership is deliberately opt-in: an operator added later and not listed
+// here simply keeps today's authored position, so a missed entry costs the
+// optimisation, never correctness.
+const IO_BACKED_CONDITION_KEYS = new Set([
+  // contact snapshot (GHL contact fetch → contact_tag_snapshot fallback)
+  'has_tag', 'not_has_tag', 'has_any_tag', 'not_has_any_tag',
+  'has_tag_prefix', 'not_has_tag_prefix', 'not_has_any_tag_prefix',
+  'custom_field_eq', 'custom_field_in',
+  // lp_leads / demo state
+  'lp_disposition_in', 'demo_state_eq',
+  // appointment lookups
+  'not_active_in_home_appointment', 'not_reschedule_inflight',
+  'not_duplicate_lead_live_appointment', 'no_future_appointment',
+  'last_active_appointment',
+  // system_events history
+  'thread_turn_count_gte', 'analysis_occurrence_gte', 'analysis_occurrence_lt',
+  'no_inbound_within_hours', 'inbound_within_hours', 'has_prior_inbound',
+  // may nest any of the above
+  'any_of',
+]);
+
+function emitConditionFailClosed(event, ruleKey, missingKey, detail, deps = {}) {
   // 2026-08-14 — accumulate on the event (same memo slot family as
   // _contactSnapshot / _cancelActiveAppts) so the responder-silence telemetry
   // below can name WHICH rules were suppressed instead of just reporting silence.
@@ -951,7 +977,11 @@ function emitConditionFailClosed(event, ruleKey, missingKey, detail) {
     if (!event._failClosedRules) event._failClosedRules = new Set();
     event._failClosedRules.add(ruleKey);
   }
-  emitEvent({
+  // deps seam mirrors deps.emitEvent in emitResponderSilenceIfUnanswered — the
+  // tests assert WHICH suppressions emit and which stay quiet, so the emitter
+  // has to be substitutable.
+  const emit = deps?.emitEvent || emitEvent;
+  emit({
     event_type: 'rule.condition_failed_closed',
     source: 'decision_engine',
     entity_type: 'contact',
@@ -994,9 +1024,48 @@ async function evaluateContextConditions(conditions, intelligence, event, opts =
 
   const failClosed = (condKey, detail) => {
     console.log(`[Context] FAIL-CLOSED: ${condKey} — ${detail} (rule ${ruleKey || '?'} suppressed)`);
-    emitConditionFailClosed(event, ruleKey, condKey, detail);
+    emitConditionFailClosed(event, ruleKey, condKey, detail, opts.deps);
     return false;
   };
+
+  // 2026-09-12 — NOT-APPLICABLE ≠ UNREADABLE.
+  //
+  // A contact-scoped condition on an event that carries no ghl_contact_id has
+  // nothing to read. The rule is still suppressed — that part is doctrine and
+  // does not change — but nothing FAILED, so filing it as
+  // rule.condition_failed_closed with detail "contact tags unreadable" claims a
+  // read broke when none was attempted.
+  //
+  // The cost of that conflation: 429,331 of the 433,748 fail-closed events
+  // since 2026-07-03 (99%) describe events with no contact at all, against zero
+  // distinct contacts. DNC_LIFT_ON_REENGAGEMENT_FIVE9 alone contributed
+  // 274,474 — it matches every five9.disposition_set, and ~60% of those are
+  // dials on numbers never matched to a GHL contact ("Dial Error", "Hung Up").
+  // Buried underneath sat the signal that matters: 829 genuinely unreadable
+  // reads across 198 real contacts, where a DNC/suppression gate was skipped
+  // blind. One is a non-event; the other is a compliance miss, and they were
+  // indistinguishable.
+  //
+  // So: suppress silently here, keep the rule in _failClosedRules (the
+  // responder-silence diagnostic still wants to name it), and reserve the
+  // emitted event for reads that actually failed.
+  const notApplicableNoContact = (condKey) => {
+    console.log(
+      `[Context] NOT-APPLICABLE: ${condKey} — event has no ghl_contact_id, ` +
+      `no read attempted (rule ${ruleKey || '?'} suppressed)`
+    );
+    if (event && ruleKey) {
+      if (!event._failClosedRules) event._failClosedRules = new Set();
+      event._failClosedRules.add(ruleKey);
+    }
+    return false;
+  };
+
+  // Contact-scoped branches share this: null means "could not resolve", and the
+  // reason decides whether it is telemetry-worthy.
+  const failClosedContactRead = (condKey, detail) => (
+    event?.ghl_contact_id ? failClosed(condKey, detail) : notApplicableNoContact(condKey)
+  );
   // Numeric reads: undefined/null/non-finite = the datum is absent → fail closed.
   const numOrNull = (field) => {
     const v = merged[field];
@@ -1005,7 +1074,26 @@ async function evaluateContextConditions(conditions, intelligence, event, opts =
     return Number.isFinite(n) ? n : null;
   };
 
-  for (const [key, expected] of Object.entries(conditions)) {
+  // 2026-09-12 — EVALUATION ORDER. This loop is a pure conjunction: every branch
+  // either short-circuits false or falls through to the next key, so the result
+  // does not depend on order. Its cost and its telemetry do. Evaluating the
+  // I/O-backed operators LAST means a rule whose cheap gate already rejects the
+  // event never issues a contact read, and never reports a fail-closed read that
+  // was never attempted.
+  //
+  // The case that forced this: DNC_LIFT_ON_REENGAGEMENT_FIVE9 lists has_any_tag
+  // ahead of event_subtype_in, and object key order is insertion order — so the
+  // tag branch ran on all 460,739 five9.disposition_set events since
+  // 2026-07-03, when event_subtype_in would have rejected ~99% of them (they are
+  // "Dial Error"/"Hung Up", not "Appointment Set"/"Confirmed") for free.
+  //
+  // Array.prototype.sort is stable in Node ≥11, so within each group the rule
+  // author's order is preserved.
+  const orderedConditions = Object.entries(conditions).sort(
+    ([a], [b]) => (IO_BACKED_CONDITION_KEYS.has(a) ? 1 : 0) - (IO_BACKED_CONDITION_KEYS.has(b) ? 1 : 0)
+  );
+
+  for (const [key, expected] of orderedConditions) {
     // 2026-07-04 — benign annotation keys. Rule authors document conditions
     // inline (e.g. BEHAVIORAL_DISENGAGEMENT_SEVERE carries a "description"
     // field inside its conditions JSON). These are not operators and must
@@ -1083,7 +1171,7 @@ async function evaluateContextConditions(conditions, intelligence, event, opts =
         // behavior let not_has_* conditions fail open on infra blips ("if we
         // can't see a blocked tag, we don't block") — that is exactly the
         // wildcard-pass this rework forbids.
-        if (tags === null) return failClosed(key, 'contact tags unreadable');
+        if (tags === null) return failClosedContactRead(key, 'contact tags unreadable');
 
         // 2026-08-14 — SNAPSHOT-TIER CASE NORMALIZATION (compliance-critical).
         // contact_tag_snapshot stores tags normalized (trim/lowercase/collapse,
@@ -1163,7 +1251,7 @@ async function evaluateContextConditions(conditions, intelligence, event, opts =
           customFields = snapshot === null ? null : snapshot.customFields;
           customFieldsFetched = true;
         }
-        if (customFields === null) return failClosed(key, 'contact custom fields unreadable');
+        if (customFields === null) return failClosedContactRead(key, 'contact custom fields unreadable');
         const entry = customFields.find(f => f?.id === fieldId);
         const actual = entry?.value ?? null;
         if (String(actual) !== String(expected.value)) {
@@ -1194,7 +1282,7 @@ async function evaluateContextConditions(conditions, intelligence, event, opts =
           customFields = snapshot === null ? null : snapshot.customFields;
           customFieldsFetched = true;
         }
-        if (customFields === null) return failClosed(key, 'contact custom fields unreadable');
+        if (customFields === null) return failClosedContactRead(key, 'contact custom fields unreadable');
         const entry = customFields.find(f => f?.id === fieldId);
         const actual = entry?.value ?? null;
         if (!values.includes(String(actual))) {
@@ -1214,7 +1302,7 @@ async function evaluateContextConditions(conditions, intelligence, event, opts =
         // lookup failed) instead of the fail-open hasActiveInHomeAppointment
         // helper, which maps errors to "no appointment" — a wildcard pass.
         const inHomeAppts = await fetchUpcomingAppointments(event.ghl_contact_id);
-        if (!Array.isArray(inHomeAppts)) return failClosed(key, 'appointment lookup unavailable');
+        if (!Array.isArray(inHomeAppts)) return failClosedContactRead(key, 'appointment lookup unavailable');
         if (inHomeAppts.some(a => isInHomeCalendarId(a.calendar_id))) {
           console.log(`[Context] BLOCKED: not_active_in_home_appointment — contact ${event.ghl_contact_id} has an active in-home appt`);
           return false;
@@ -1327,7 +1415,7 @@ async function evaluateContextConditions(conditions, intelligence, event, opts =
         const allowed = Array.isArray(expected) ? expected : [expected];
         const ghlContactId = event.ghl_contact_id;
         if (!ghlContactId) {
-          return failClosed(key, 'no ghl_contact_id on event');
+          return notApplicableNoContact(key);
         }
         const { data: lpLead, error: lpErr } = await supabase.from('lp_leads')
           .select('disposition_code')
@@ -1477,7 +1565,7 @@ async function evaluateContextConditions(conditions, intelligence, event, opts =
         if (!spec || typeof spec.field !== 'string' || !wanted || wanted.length === 0 || !Number.isFinite(threshold) || threshold < 1) {
           return failClosed(key, 'malformed spec — expected {field, values|value, count, window_days?, consecutive?}');
         }
-        if (!event?.ghl_contact_id) return failClosed(key, 'no ghl_contact_id on event');
+        if (!event?.ghl_contact_id) return notApplicableNoContact(key);
         const wantedSet = wanted.map(v => String(v));
         let occurrences;
         if (spec.consecutive === true) {
@@ -1588,7 +1676,7 @@ async function evaluateContextConditions(conditions, intelligence, event, opts =
         // 2026-07-03 fail-closed: null (GHL error) no longer passes — an
         // unknown calendar must not green-light a rule that requires "no
         // future appointment".
-        if (!Array.isArray(appts)) return failClosed(key, 'appointment lookup unavailable');
+        if (!Array.isArray(appts)) return failClosedContactRead(key, 'appointment lookup unavailable');
         if (appts.length > 0) {
           console.log(`[Context] BLOCKED: no_future_appointment — contact ${event.ghl_contact_id} has ${appts.length} upcoming`);
           return false;
@@ -1645,7 +1733,7 @@ async function evaluateContextConditions(conditions, intelligence, event, opts =
         // conservative direction this rework mandates (the paired
         // inbound_within_hours gate was already fail-closed, so under failure
         // NEITHER timeout rule fires now, instead of exactly one).
-        if (!Number.isFinite(lastMs)) return failClosed(key, 'last inbound age unknown');
+        if (!Number.isFinite(lastMs)) return failClosedContactRead(key, 'last inbound age unknown');
         const hoursSince = (Date.now() - lastMs) / 3_600_000;
         if (hoursSince < hours) {
           console.log(`[Context] BLOCKED: no_inbound_within_hours — inbound ${hoursSince.toFixed(1)}h ago < ${hours}h`);
@@ -1693,12 +1781,12 @@ async function evaluateContextConditions(conditions, intelligence, event, opts =
       // S5.2 enrollment rules, so an outage costs missed rescues on one source,
       // not silence system-wide.
       case 'has_prior_inbound': {
-        if (!event?.ghl_contact_id) return failClosed(key, 'no ghl_contact_id on event');
+        if (!event?.ghl_contact_id) return notApplicableNoContact(key);
         // deps seam mirrors deps.fetch / deps.supabase elsewhere in this file —
         // the helper owns two live GHL calls and must be substitutable in tests.
         const readPriorInbound = opts.deps?.hasPriorInboundMessage || hasPriorInboundMessage;
         const priorInbound = await readPriorInbound(event.ghl_contact_id);
-        if (priorInbound === null) return failClosed(key, 'inbound history unreadable');
+        if (priorInbound === null) return failClosedContactRead(key, 'inbound history unreadable');
         if (priorInbound !== !!expected) {
           console.log(`[Context] BLOCKED: has_prior_inbound — contact ${event.ghl_contact_id} prior_inbound=${priorInbound}, wanted ${!!expected}`);
           return false;

@@ -153,6 +153,123 @@ test('empty/absent conditions object → true (unconditional rule unchanged)', a
   assert.equal(await evaluateContextConditions({}, {}, bareEvent()), true);
 });
 
+// ── 2026-09-12: evaluation order + not-applicable vs unreadable ──────
+//
+// The 433,748 fail-closed events since 2026-07-03 were 99% non-events:
+// contact-scoped conditions evaluated against dialer traffic that carries no
+// GHL contact at all, reported as "contact tags unreadable". Two changes, both
+// asserted here: cheap conditions run first, and a missing contact suppresses
+// the rule WITHOUT claiming a read failed. Suppression itself never changes.
+
+// A spy pair: collects emitted fail-closed events, and a fetch that proves
+// whether the contact-snapshot branch was reached at all.
+const spyDeps = () => {
+  const emitted = [];
+  let fetchCalls = 0;
+  return {
+    emitted,
+    get fetchCalls() { return fetchCalls; },
+    deps: {
+      emitEvent: async (e) => { emitted.push(e); },
+      fetch: async () => { fetchCalls++; return { ok: false, status: 404 }; },
+      supabase: null,
+      sleep: async () => {},
+    },
+  };
+};
+
+const five9Event = (subtype) => ({
+  id: 42, ghl_contact_id: null, event_subtype: subtype, payload: {},
+});
+
+// DNC_LIFT_ON_REENGAGEMENT_FIVE9's real conditions, in their authored order:
+// has_any_tag FIRST, event_subtype_in second. That order is what ran the tag
+// branch on all 460,739 five9.disposition_set events.
+const DNC_LIFT_FIVE9_CONDITIONS = {
+  has_any_tag: ['stage:dnc', 'lp-dnc', 'dnc', 'dnc-sms', 'loss-reason:dnc'],
+  event_subtype_in: ['Appointment Set', 'Confirmed'],
+};
+
+test('cheap condition short-circuits before the contact read (DNC-lift on dialer noise)', async () => {
+  const spy = spyDeps();
+  const ev = five9Event('Dial Error'); // not in the allowlist
+  assert.equal(
+    await evaluateContextConditions(DNC_LIFT_FIVE9_CONDITIONS, {}, ev, {
+      ruleKey: 'DNC_LIFT_ON_REENGAGEMENT_FIVE9', deps: spy.deps,
+    }),
+    false,
+  );
+  assert.equal(spy.fetchCalls, 0, 'event_subtype_in must reject before any contact fetch');
+  assert.deepEqual(spy.emitted, [], 'a cheap non-match is not a fail-closed event');
+});
+
+test('ordering does not change the verdict when the cheap gate passes', async () => {
+  const spy = spyDeps();
+  const ev = five9Event('Appointment Set'); // allowed subtype → tag branch still runs
+  assert.equal(
+    await evaluateContextConditions(DNC_LIFT_FIVE9_CONDITIONS, {}, ev, {
+      ruleKey: 'DNC_LIFT_ON_REENGAGEMENT_FIVE9', deps: spy.deps,
+    }),
+    false,
+    'no contact → the DNC lift is still suppressed',
+  );
+});
+
+test('no ghl_contact_id → suppressed SILENTLY (nothing was read, so nothing failed)', async () => {
+  const spy = spyDeps();
+  const ev = { id: 7, ghl_contact_id: null, payload: {} };
+  assert.equal(
+    await evaluateContextConditions({ has_any_tag: ['dnc'] }, {}, ev, {
+      ruleKey: 'SOME_RULE', deps: spy.deps,
+    }),
+    false,
+    'suppression is unchanged — this is the load-bearing half',
+  );
+  assert.deepEqual(spy.emitted, [], 'no contact on the event is not an unreadable read');
+  assert.ok(ev._failClosedRules?.has('SOME_RULE'), 'still recorded for responder-silence diagnostics');
+});
+
+test('contact present but tags unreadable → still emits (the signal that was buried)', async () => {
+  const spy = spyDeps();
+  const ev = { id: 8, ghl_contact_id: 'c-real', payload: {} };
+  assert.equal(
+    await evaluateContextConditions({ has_any_tag: ['dnc'] }, {}, ev, {
+      ruleKey: 'SOME_RULE', deps: spy.deps,
+    }),
+    false,
+  );
+  assert.equal(spy.emitted.length, 1, 'a real failed read must stay observable');
+  assert.equal(spy.emitted[0].event_type, 'rule.condition_failed_closed');
+  assert.equal(spy.emitted[0].payload.detail, 'contact tags unreadable');
+  assert.equal(spy.emitted[0].payload.rule_key, 'SOME_RULE');
+  assert.equal(spy.emitted[0].ghl_contact_id, 'c-real');
+});
+
+test('lp_disposition_in with no contact → silent; unknown operator still emits', async () => {
+  const noContact = spyDeps();
+  const ev1 = { id: 9, ghl_contact_id: null, payload: {} };
+  assert.equal(
+    await evaluateContextConditions({ lp_disposition_in: ['CXL'] }, {}, ev1, {
+      ruleKey: 'R1', deps: noContact.deps,
+    }),
+    false,
+  );
+  assert.deepEqual(noContact.emitted, []);
+
+  // An unknown operator is a rule-authoring defect, not dialer noise — it names
+  // a rule that is silently dead, so it keeps emitting regardless of contact.
+  const unknown = spyDeps();
+  const ev2 = { id: 10, ghl_contact_id: null, payload: {} };
+  assert.equal(
+    await evaluateContextConditions({ lp_dispositon_in_typo: ['CXL'] }, {}, ev2, {
+      ruleKey: 'R2', deps: unknown.deps,
+    }),
+    false,
+  );
+  assert.equal(unknown.emitted.length, 1);
+  assert.equal(unknown.emitted[0].payload.detail, 'unknown condition operator');
+});
+
 // ── livechat channel inference (channel-flip fix) ───────────────────
 
 test('inferChannelFromEvent: TYPE_LIVE_CHAT → livechat (was: null → sms at send time)', () => {
