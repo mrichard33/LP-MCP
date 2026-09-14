@@ -51,6 +51,7 @@
  */
 
 import supabase from './supabase.js';
+import { checkDuplicateAppointment } from './services/lp-duplicate-appointment-guard.js';
 import { sendGroupMeMessage } from './groupme.js';
 import { flattenWebhookBody } from './webhook-body.js';
 import { fetchAndBuildAgenticNotes, isWeakNotes } from './services/agentic-lead-notes.js';
@@ -281,6 +282,11 @@ async function sendStripCard({ body, plan, mode }) {
     `📞 ${body.phone1 || 'no phone'} | Sender: ${body.sender || '?'}\n` +
     `📅 Sent time: ${body.adate || '?'} ${body.atime || '?'}${plan.hour != null ? ` (hour ${plan.hour} ET)` : ''}\n` +
     shadowLine +
+    // The duplicate case needs the OTHER lead ids to be actionable at all —
+    // "stripped, duplicate" with nothing to compare against is a dead end.
+    (plan.conflicts?.length
+      ? `Contact already holds: ${plan.conflicts.map((c) => `${c.lp_lead_id} (${c.disposition_code})`).join(', ')}\n`
+      : '') +
     `Confirm the real time with the customer and set it in LP (LP is system of record; Five9 lists repopulate at 6 AM).`,
     { flushNow: true }
   ).catch((err) => console.warn(`[LP-PROXY] GroupMe card failed: ${err.message}`));
@@ -322,6 +328,34 @@ export function registerLpAddleadProxyRoutes(app) {
     if (mode !== 'passthrough') {
       try {
         plan = planAddleadValidation(body);
+
+        // 2026-09-14 (Change C, PREVENT half) — a body that survives the hour
+        // checks can still be a SECOND live appointment on a day this contact
+        // already holds, which double-counts one person across confirmed and
+        // set. Expressed as another STRIP reason rather than a rejection, on
+        // purpose: the lead still reaches LP and still gets dialled, it just
+        // does not open a duplicate appointment row. Dropping the lead outright
+        // would trade a counting error for a lost customer.
+        //
+        // Fails open inside the same try/catch as every other stage here.
+        // Coverage is genuinely narrow — see the guard module header; it would
+        // have blocked none of the five observed cases, which arrived from
+        // vendors posting straight into LP.
+        if (plan.action === 'forward' && body.adate && body.atime) {
+          const dupe = await checkDuplicateAppointment({
+            ghlContactId: body.lognumber || null,
+            apptDate: body.adate,
+          });
+          if (dupe.action === 'block') {
+            plan = {
+              action: 'strip',
+              reason: 'duplicate_live_appointment',
+              hour: null,
+              conflicts: dupe.conflicts,
+            };
+          }
+        }
+
         if (plan.action === 'strip') {
           if (await claimAddleadNotice({ lognumber: body.lognumber, adate: body.adate, atime: body.atime, reason: plan.reason })) {
             await sendStripCard({ body, plan, mode });

@@ -47,6 +47,7 @@ import {
 } from './token-manager.js';
 import { LP_EMP } from './lp-source-ids.js';
 import { inspectAppointmentResponse, assertAppointmentAccepted } from './lp-appointment-guards.js';
+import { checkDuplicateAppointment, formatDuplicateBlock, lpApptDateToDay } from './services/lp-duplicate-appointment-guard.js';
 
 const LP_BASE = () => (process.env.LP_API_BASE_URL || '').replace(/\/+$/, '');
 
@@ -1123,6 +1124,35 @@ export async function addLead(fields = {}) {
     cleanFields[LP_ADDLEAD_SETTER_FIELD] = String(LP_EMP.GHL_INTEGRATION);
     console.log(`[LP] addLead: stamping setter ${LP_ADDLEAD_SETTER_FIELD}=${LP_EMP.GHL_INTEGRATION} (Integration, GoHighLevel)`);
   }
+
+  // 2026-09-14 (Change C, PREVENT half) — do not create a SECOND live lead on
+  // an appointment day this contact already holds. One lp_prospect_id with two
+  // live rows on one date double-counts a person across confirmed and set.
+  //
+  // FAILS OPEN on every error path, and skipped entirely when the caller passes
+  // _skip_dupe_check (the proxy route checks earlier, so it does not pay for a
+  // second lookup). See the module header for the coverage this genuinely has:
+  // it would have blocked NONE of the five observed cases, which all arrived
+  // from vendors posting straight into LP.
+  if (cleanFields.apptdate && cleanFields.appttime && !fields._skip_dupe_check) {
+    const verdict = await checkDuplicateAppointment({
+      ghlContactId: cleanFields.lognumber || null,
+      apptDate: cleanFields.apptdate,
+    });
+    if (verdict.action === 'block') {
+      const msg = formatDuplicateBlock({
+        ghlContactId: cleanFields.lognumber,
+        apptDay: lpApptDateToDay(cleanFields.apptdate),
+        conflicts: verdict.conflicts,
+      });
+      console.warn(`[LP] ${msg}`);
+      const err = new Error(msg);
+      err.code = 'DUPLICATE_LIVE_APPOINTMENT';
+      err.conflicts = verdict.conflicts;
+      throw err;
+    }
+  }
+  delete cleanFields._skip_dupe_check;
 
   console.log(`[LP] addLead → trying ${preferPath.toUpperCase()} path first: firstname=${cleanFields.firstname}, phone=${cleanFields.phone}, srs_id=${cleanFields.srs_id}, pro_id=${cleanFields.pro_id || '(none)'}, email=${cleanFields.email || '(none)'}, lognumber=${cleanFields.lognumber || '(none)'}, apptdate=${cleanFields.apptdate || '(none)'}, appttime=${cleanFields.appttime || '(none)'}`);
 
