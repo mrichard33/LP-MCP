@@ -110,12 +110,26 @@ function mockMarksClient(rows = new Map(), { insertError = null } = {}) {
   };
 }
 
-function mockDeps({ addLeadImpl, salesRabbitImpl, client, resolveCanvasserProId, checkServiceAreaZip } = {}) {
-  const calls = { addLead: [], groupme: [], ghlFields: [], salesrabbit: [], events: [] };
+// Stand-in for src/actions/enrichment.js resolveMarket, with the same order of
+// preference: zip → service_area_zips, else the city, else null. Only 33446 is
+// "mapped" here — every other zip exercises the unmapped path.
+const MARKET_BY_ZIP = new Map([['33446', 'Fort Lauderdale']]);
+async function stubResolveMarket({ zip, city } = {}) {
+  return MARKET_BY_ZIP.get(String(zip || '')) || (city ? String(city) : null);
+}
+
+function mockDeps({
+  addLeadImpl, salesRabbitImpl, client, resolveCanvasserProId, checkServiceAreaZip, resolveMarket,
+} = {}) {
+  const calls = { addLead: [], groupme: [], ghlFields: [], salesrabbit: [], events: [], market: [] };
   const deps = {
     client: client ?? mockMarksClient(),
     now: () => NOW,
     ...(resolveCanvasserProId ? { resolveCanvasserProId } : {}),
+    resolveMarket: async (args) => {
+      calls.market.push(args);
+      return (resolveMarket || stubResolveMarket)(args);
+    },
     // Zip → market code for the Slack mirror. Default: zip not in any market.
     checkServiceAreaZip: checkServiceAreaZip
       || (async (zip) => ({ checked: true, zip, in_service_area: false })),
@@ -651,6 +665,78 @@ test('card: opts.market carries the LP market code for the Slack mirror — fiel
     assert.equal(result.outcome, 'ok');
     assert.equal(createdOpts(calls).market, null);
   }
+});
+
+// ─── The Market line (2026-09-14) ───────────────────────────────
+//
+// Contact y3P1vbwA8nSiBMf7A58H carded "Market: Canvassing" — a SOURCE printed in
+// the market slot, which hid the real signal (zip 32169 absent from
+// service_area_zips). These pin the three outcomes and the absence of the literal.
+
+test('card: a mapped zip renders its market and passes zip + city to the resolver', async () => {
+  const { deps, calls } = mockDeps();
+  await processCanvassingLead(validPayload(), deps);
+  const card = calls.groupme.find((g) => g.text.includes('CANVASSING LEAD CREATED')).text;
+  assert.match(card, /🌍 Market: Fort Lauderdale/);
+  // Resolved ONCE per run, with both the zip and the city — the city is what
+  // lets an unmapped zip degrade to a place name instead of to nothing.
+  assert.deepEqual(calls.market, [{ zip: '33446', city: 'Delray Beach' }]);
+});
+
+test('card: an unmapped zip degrades to the city — never to "Canvassing"', async () => {
+  const { deps, calls } = mockDeps();
+  // 32169 / New Smyrna Beach: the live card that started this.
+  await processCanvassingLead(validPayload({ zip: '32169', city: 'New Smyrna Beach' }), deps);
+  const card = calls.groupme.find((g) => g.text.includes('CANVASSING LEAD CREATED')).text;
+  assert.match(card, /🌍 Market: New Smyrna Beach/);
+  assert.doesNotMatch(card, /Market: Canvassing/);
+});
+
+test('card: neither a mapped zip nor a city renders "Unknown"', async () => {
+  // A blank city is itself a blocked lead (city is required to post to LP), so
+  // this is the BLOCKED card — the only card that can carry no market at all.
+  const { deps, calls } = mockDeps();
+  const result = await processCanvassingLead(validPayload({ zip: '00000', city: '' }), deps);
+  assert.equal(result.outcome, 'skipped_missing_fields');
+  const card = calls.groupme.find((g) => g.text.includes('CANVASSING LEAD BLOCKED')).text;
+  assert.match(card, /🌍 Market: Unknown/);
+  assert.doesNotMatch(card, /Market: Canvassing/);
+});
+
+test('card: a resolver that throws is fail-soft — "Unknown", and the card still sends', async () => {
+  const { deps, calls } = mockDeps({
+    resolveMarket: async () => { throw new Error('market map unreachable'); },
+  });
+  const result = await processCanvassingLead(validPayload(), deps);
+  assert.equal(result.outcome, 'ok');
+  const card = calls.groupme.find((g) => g.text.includes('CANVASSING LEAD CREATED')).text;
+  assert.match(card, /🌍 Market: Unknown/);
+  assert.doesNotMatch(card, /Market: Canvassing/);
+});
+
+test('card: NO card this handler produces ever prints "Market: Canvassing"', async () => {
+  // Every branch that can reach a card: mapped zip, unmapped zip with a city,
+  // nothing resolvable, a throwing resolver, an LP failure, and a booth lead.
+  const runs = [
+    [validPayload(), {}],
+    [validPayload({ zip: '32169', city: 'New Smyrna Beach' }), {}],
+    [validPayload({ zip: '00000', city: '' }), {}],
+    [validPayload(), { resolveMarket: async () => { throw new Error('down'); } }],
+    [validPayload(), { addLeadImpl: async () => { throw new Error('LP 500'); } }],
+    [validPayload({ srs_id: '999' }), {}],
+  ];
+
+  let cards = 0;
+  for (const [payload, opts] of runs) {
+    const { deps, calls } = mockDeps(opts);
+    await processCanvassingLead(payload, deps);
+    for (const g of calls.groupme) {
+      cards += 1;
+      assert.doesNotMatch(g.text, /Market: Canvassing/);
+    }
+  }
+  // Guard the guard: a run that silently stopped carding would pass vacuously.
+  assert.ok(cards >= runs.length, `expected at least ${runs.length} cards, saw ${cards}`);
 });
 
 test('card: an unresolved canvasser omits the line entirely rather than printing an id', async () => {
