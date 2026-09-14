@@ -11,6 +11,7 @@
  *
  * Usage:
  *   node scripts/backfill-ghl-appointments.js [--live] [--horizon-days=N] [--contact-id=<id>] [--limit=N]
+ *                                             [--include-same-day] [--no-straggler-cancel]
  *
  *   --live             EXECUTE the plan. ⚠ DEVIATION FROM REPO NORM: other
  *                      backfills are live-by-default with a --dry-run opt-out;
@@ -21,10 +22,17 @@
  *   --horizon-days=N   Appointment window [now, now+N days] (default: 14)
  *   --contact-id=<id>  Restrict to one GHL contact
  *   --limit=N          Cap the number of contacts processed
+ *   --include-same-day Process appointments occurring TODAY. Off by default
+ *                      (D1): a calendar object created hours before an
+ *                      unconfirmed appointment fires a customer-visible
+ *                      reminder. Same-day CXL always cancels either way.
+ *   --no-straggler-cancel   Skip the D2 pass that cancels past-dated open GHL
+ *                      appointments held by contacts whose LP truth is a live
+ *                      forward appointment.
  *
- * SAME-DAY rows are flagged in the report (GHL reminder workflows fire on
- * booking) — eyeball them before --live. Unlinked leads (no ghl_contact_id)
- * are REPORT-ONLY. Re-running converges (already_in_sync).
+ * SAME-DAY rows are reported under their own op, `skipped_same_day`, with lead
+ * and contact ids, so a human can place them by hand. Unlinked leads (no
+ * ghl_contact_id) are REPORT-ONLY. Re-running converges (already_in_sync).
  *
  * Output: stdout + /tmp/backfill-report-YYYY-MM-DD.txt.
  * Exit codes: 0 clean, 1 completed-with-errors, 2 fatal/misconfig.
@@ -36,10 +44,12 @@ import { runGhlAppointmentBackfill } from '../src/admin/ghl-appointment-backfill
 
 const args = process.argv.slice(2);
 const opt = {
-  live:        args.includes('--live'),
-  horizonDays: parseInt((args.find(a => a.startsWith('--horizon-days=')) || '').split('=')[1] || '14', 10),
-  contactId:   (args.find(a => a.startsWith('--contact-id=')) || '').split('=')[1] || null,
-  limit:       parseInt((args.find(a => a.startsWith('--limit=')) || '').split('=')[1] || '0', 10),
+  live:           args.includes('--live'),
+  skipSameDay:    !args.includes('--include-same-day'),   // DEFAULT TRUE — opt out explicitly
+  stragglerCancel: !args.includes('--no-straggler-cancel'),
+  horizonDays:    parseInt((args.find(a => a.startsWith('--horizon-days=')) || '').split('=')[1] || '14', 10),
+  contactId:      (args.find(a => a.startsWith('--contact-id=')) || '').split('=')[1] || null,
+  limit:          parseInt((args.find(a => a.startsWith('--limit=')) || '').split('=')[1] || '0', 10),
 };
 
 async function main() {
@@ -57,7 +67,9 @@ async function main() {
   const out = (s = '') => { console.log(s); lines.push(s); };
 
   out('═'.repeat(72));
-  out(`LP→GHL appointment backfill — ${mode} — horizon ${opt.horizonDays}d — ${new Date().toISOString()}`);
+  out(`LP→GHL appointment backfill — ${mode} — horizon ${opt.horizonDays}d`
+      + ` — same-day ${opt.skipSameDay ? 'SKIPPED' : 'INCLUDED'}`
+      + ` — straggler-cancel ${opt.stragglerCancel ? 'on' : 'off'} — ${new Date().toISOString()}`);
   out('═'.repeat(72));
 
   const summary = await runGhlAppointmentBackfill({
@@ -65,6 +77,8 @@ async function main() {
     horizonDays: opt.horizonDays,
     contactId: opt.contactId,
     limit: opt.limit,
+    skipSameDay: opt.skipSameDay,
+    stragglerCancel: opt.stragglerCancel,
   });
 
   out(`Scanned ${summary.scanned_rows} rows → ${summary.linked_contacts} linked contacts → ${summary.processed} in window` +
@@ -73,10 +87,34 @@ async function main() {
   out('── Per-contact plan ' + '─'.repeat(52));
   summary.lines.forEach(l => out(`  ${l}`));
 
+  if (summary.skipped_same_day.length) {
+    out('');
+    out(`── ⏭ SKIPPED SAME-DAY (${summary.skipped_same_day.length}) — NOT booked; place by hand or re-run with --include-same-day ` + '─'.repeat(5));
+    summary.skipped_same_day.forEach(l => out(`  ${l}`));
+  }
+
   if (summary.same_day.length) {
     out('');
     out(`── ⚠ SAME-DAY rows (${summary.same_day.length}) — reminder workflows fire on booking; eyeball before --live ` + '─'.repeat(5));
     summary.same_day.forEach(l => out(`  ${l}`));
+  }
+
+  const st = summary.straggler_cancel;
+  if (st) {
+    out('');
+    if (st.guard_tripped) {
+      out(`── 🛑 STRAGGLER CANCEL — SCOPE GUARD TRIPPED, NOTHING CANCELLED ` + '─'.repeat(10));
+      out(`  ${st.reason}`);
+      out('  First candidates (for diagnosis only — NOT a plan):');
+      st.guard_sample.forEach(p => out(`    ${p.contact_id} appt=${p.appointment_id} stale=${p.stale_start_time} (${p.status}) ${p.name}`));
+    } else if (!st.ran) {
+      out(`── STRAGGLER CANCEL — did not run: ${st.reason}`);
+    } else {
+      out(`── 🧹 STRAGGLER CANCEL (${st.planned.length} planned${opt.live ? `, ${st.cancelled} cancelled` : ''}) `
+          + `— scope ${st.scope_contacts} contacts, lookback ${st.lookback_days}d ` + '─'.repeat(5));
+      st.planned.forEach(p => out(`  ${p.contact_id} appt=${p.appointment_id} stale=${p.stale_start_time} (${p.status}) lead=${p.lp_lead_id || '—'} lp_appt=${p.lp_appointment_date || '—'} ${p.name}`));
+      st.skipped.forEach(p => out(`  SKIPPED ${p.contact_id} appt=${p.appointment_id}: ${p.reason}`));
+    }
   }
 
   if (summary.unlinked_report_only.length) {
@@ -93,7 +131,7 @@ async function main() {
   if (summary.errors.length) {
     out('');
     out(`ERRORS (${summary.errors.length}):`);
-    summary.errors.slice(0, 10).forEach(e => out(`  ${e.contact_id} lead=${e.lp_lead_id}: ${e.error}`));
+    summary.errors.slice(0, 10).forEach(e => out(`  ${e.contact_id} lead=${e.lp_lead_id || '—'}${e.appointment_id ? ` appt=${e.appointment_id}` : ''}${e.pass ? ` [${e.pass}]` : ''}: ${e.error}`));
     if (summary.errors.length > 10) out(`  … +${summary.errors.length - 10} more`);
   }
   out('═'.repeat(72));
