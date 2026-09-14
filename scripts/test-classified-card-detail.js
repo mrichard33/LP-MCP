@@ -2,7 +2,7 @@
  * test-classified-card-detail.js — the v1.2 detail lines on classified cards,
  * and the ONE shared LP Appointment Set card builder (2026-08-27).
  *
- * Two things are locked here:
+ * Three things are locked here:
  *
  * 1. The new buildClassifiedNotification args (address, email, jobSize,
  *    canvasser, lpRef) render when present and are ABSENT when not — and every
@@ -15,6 +15,10 @@
  *    twice (see that module's header); these assertions are what stops a third
  *    drift from being invisible.
  *
+ * 3. An absent LP prospect reads "Not yet assigned" (2026-09-14) — and reads
+ *    the SAME on the header line and the inline LP reference. Those two have
+ *    disagreed before ("NONE" vs "N/A").
+ *
  * Run with:  node --test scripts/test-classified-card-detail.js
  */
 
@@ -26,7 +30,7 @@ import assert from 'node:assert/strict';
 delete process.env.SUPABASE_URL;
 delete process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-const { buildClassifiedNotification } = await import('../src/actions/notification-classifier.js');
+const { buildClassifiedNotification, PROSPECT_UNASSIGNED } = await import('../src/actions/notification-classifier.js');
 const {
   buildLpAppointmentCard,
   buildAppointmentDisplay,
@@ -47,14 +51,14 @@ const BASE = {
 
 // ─── Backward compatibility ─────────────────────────────────────
 
-test('an existing caller passing none of the new args is byte-identical to the old format', () => {
+test('an existing caller passing none of the new args renders the expected format', () => {
   const card = buildClassifiedNotification(BASE);
   assert.equal(card, [
     '🤖 SYSTEM EVENT — LP APPOINTMENT SET',
     '',
     '👤 Myron Thorner | (727) 555-1234',
     'Contact ID: q5GehRye7DNkN6jlmjl3',
-    'Prospect: NONE',
+    'Prospect: Not yet assigned',
     '🌍 Market: Unknown',
     '📋 Src: Unknown',
     '',
@@ -69,6 +73,13 @@ test('Market and Src stay ALWAYS-ON with the Unknown fallback — absence is sig
   const card = buildClassifiedNotification(BASE);
   assert.match(card, /🌍 Market: Unknown/);
   assert.match(card, /📋 Src: Unknown/);
+});
+
+test('the absent-prospect wording is "Not yet assigned", never "NONE"', () => {
+  assert.equal(PROSPECT_UNASSIGNED, 'Not yet assigned');
+  const card = buildClassifiedNotification(BASE);
+  assert.match(card, /Prospect: Not yet assigned/);
+  assert.doesNotMatch(card, /NONE/);
 });
 
 // ─── Each new line renders when present ─────────────────────────
@@ -190,14 +201,16 @@ test('buildLpAppointmentCard renders one card carrying LP ref, address, email an
   assert.match(card, /📌 Status: Appointment Set/);
 });
 
-test('a missing prospect reads NONE on BOTH the Prospect line and the LP ref', async () => {
+test('a missing prospect reads the same on BOTH the Prospect line and the LP ref', async () => {
   // The two hand-rolled copies disagreed here: one printed NONE, the other N/A.
+  // Both now come from PROSPECT_UNASSIGNED, so they cannot drift apart again.
   const card = await buildLpAppointmentCard({
     contactId: 'C1', lpLeadId: '570351', apptDate: '08/28/2026', apptTime: '18:00',
   });
-  assert.match(card, /Prospect: NONE/);
-  assert.match(card, /📋 LP: Lead 570351 \| Prospect NONE/);
+  assert.match(card, /Prospect: Not yet assigned/);
+  assert.match(card, /📋 LP: Lead 570351 \| Prospect not yet assigned/);
   assert.doesNotMatch(card, /N\/A/);
+  assert.doesNotMatch(card, /NONE/);
 });
 
 test('market resolution failing (no DB) degrades to Unknown rather than losing the card', async () => {

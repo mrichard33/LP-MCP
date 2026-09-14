@@ -6,6 +6,10 @@
  * snapshot, and the service-market tables so cards are self-sufficient and
  * reviewers can act without opening GHL/LP.
  *
+ * v5.1 (2026-09-14) — the Prospect line's absent value is now the shared
+ * PROSPECT_UNASSIGNED constant ("Not yet assigned") rather than a second
+ * hardcoded "NONE". Same doctrine, same words as the classified card.
+ *
  * v5.0 (2026-06-11) — REQUIRED-FIELD ENRICHMENT (Mark's directive:
  * "every message includes Contact Name, Prospect ID, GHL Contact ID,
  * Phone, Market, LP Source, LP Subsource" + dates always show date AND
@@ -44,8 +48,8 @@
  *      read from the GHL contact snapshot so calculator-completion
  *      notifications can show the measurements.
  *
- * v4.2 (2026-05-01) — ALWAYS-RENDER PROSPECT LINE ("NONE" when absent —
- *   absence is signal, per Mark's directive).
+ * v4.2 (2026-05-01) — ALWAYS-RENDER PROSPECT LINE (absence is signal,
+ *   per Mark's directive).
  * v4.1 (2026-05-01) — Optional headerEmoji on buildRichNotification.
  * v4.0 (2026-05-01) — LP SOURCE / SUB-SOURCE SPLIT ("Src: parent > sub").
  * v3.9 + v4.2 — message_preview fallback for ai.analysis_completed events.
@@ -53,6 +57,7 @@
 
 import supabase from '../supabase.js';
 import { formatPhone, formatDateTime, formatLpSource } from '../format-helpers.js';
+import { PROSPECT_UNASSIGNED } from './notification-classifier.js';
 import { isLPLeadId } from './helpers.js';
 
 // ═══════════════════════════════════════════════════════════════════
@@ -108,8 +113,15 @@ async function getMarketMap() {
  *   2. zip → service_area_zips → service_markets
  *   3. city as a last-resort label
  * Returns null when nothing resolves (renderers show "Unknown").
+ *
+ * `city` may be passed explicitly (2026-09-14) for callers that hold an
+ * address but no fetched GHL contact or lp_leads row — the canvassing
+ * intake being the one that matters. Without it those callers fell
+ * straight past step 3 and resolved null on any zip missing from
+ * service_area_zips, which is how a canvass card came to print a market
+ * that was not a market at all.
  */
-export async function resolveMarket({ ghlContact = null, lpLead = null, zip: zipArg = null } = {}) {
+export async function resolveMarket({ ghlContact = null, lpLead = null, zip: zipArg = null, city: cityArg = null } = {}) {
   const markets = await getMarketMap();
 
   // 1. LP branch/market code on the GHL contact
@@ -146,7 +158,7 @@ export async function resolveMarket({ ghlContact = null, lpLead = null, zip: zip
   }
 
   // 3. city fallback
-  const city = ghlContact?.city || lpLead?.city || null;
+  const city = cityArg || ghlContact?.city || lpLead?.city || null;
   return city ? String(city) : null;
 }
 
@@ -295,15 +307,17 @@ export function buildRichNotification({ baseMessage, name, phone, contactId, pro
   const idLabel = isLPLeadId(contactId) ? 'LP Lead ID' : 'Contact ID';
   const idParts = [`${idLabel}: ${contactId}`];
   // v4.2 (2026-05-01): always render the Prospect line. Per Mark's directive,
-  // absence-of-Prospect-ID is itself signal.
+  // absence-of-Prospect-ID is itself signal. v5.1 (2026-09-14): the absent
+  // value is the shared constant, so this card and the classified card can
+  // never disagree on the words.
   const prospectClean = (prospectId && String(prospectId).trim() && prospectId !== 'Not in LP')
     ? String(prospectId)
-    : 'NONE';
+    : PROSPECT_UNASSIGNED;
   idParts.push(`Prospect: ${prospectClean}`);
   lines.push(`   ${idParts.join(' | ')}`);
 
   // v5.0 — Market is a required field on every card. "Unknown" when
-  // unresolvable, consistent with the Prospect: NONE doctrine.
+  // unresolvable, consistent with the absence-is-signal doctrine.
   lines.push(`🌍 Market: ${enrichment.market || 'Unknown'}`);
 
   if (enrichment.messageText) {

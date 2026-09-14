@@ -25,7 +25,7 @@
  * The value written to LP is NOT this module's business and does not change.
  */
 
-import { buildClassifiedNotification } from '../actions/notification-classifier.js';
+import { buildClassifiedNotification, PROSPECT_UNASSIGNED } from '../actions/notification-classifier.js';
 import { resolveMarket } from '../actions/enrichment.js';
 import { formatApptTime12h } from '../format-helpers.js';
 import { normalizeState } from '../sync-utils.js';
@@ -134,7 +134,7 @@ export async function buildLpAppointmentCard({
 } = {}) {
   let market = null;
   try {
-    market = await resolveMarket({ ghlContact, lpLead, zip });
+    market = await resolveMarket({ ghlContact, lpLead, zip, city });
   } catch (err) {
     console.warn(`[LP-APPT] market resolution failed for ${contactId} (card renders Unknown): ${err.message}`);
   }
@@ -151,7 +151,10 @@ export async function buildLpAppointmentCard({
     lpSourceDetail,
     address: formatAddressLine({ address1, city, state, zip }),
     email: email || undefined,
-    lpRef: `Lead ${lpLeadId} | Prospect ${prospectId || 'NONE'}`,
+    // Same words as the card's own Prospect line, lowercased because this one
+    // sits mid-sentence after "Prospect". Sharing the constant is the point:
+    // these two lines have already disagreed once (NONE vs N/A).
+    lpRef: `Lead ${lpLeadId} | Prospect ${prospectId || PROSPECT_UNASSIGNED.toLowerCase()}`,
     appointmentDisplay: buildAppointmentDisplay({ apptDate, apptTime, calendarName, ghlStatus }),
     tier: 'Hot',
     status: 'Appointment Set',
