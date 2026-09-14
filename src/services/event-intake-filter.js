@@ -178,6 +178,24 @@ const ALLOWED_EVENT_TYPES = new Set([
                                    // the stale slot — the exact defect this
                                    // event exists to fix.
 
+  // ── APPOINTMENT PARITY WATCHDOG (2026-09-14) ──
+  // All three emitted by src/jobs/appointment-parity-watchdog.js. No consuming
+  // rule yet — listed for the same reason affiliate.lead_created is: the
+  // allowlist is default-DROP, so without these entries every finding lands in
+  // system_events_filtered and the watchdog has no event trail at all. That is
+  // not hypothetical here. PARITY_AUTOHEAL was switched on 2026-09-14 and the
+  // sweep logged "27 escalated" every 30 minutes while all 27 were dropped
+  // right here (26 rows, reason event_type_not_in_allowlist) — emitEvent
+  // returns {filtered:true} WITHOUT throwing, so the watchdog counted each one
+  // as a successful write.
+  //
+  // These make the findings QUERYABLE, not actionable. What reaches a human is
+  // the ops card the watchdog now sends directly (#ops-alerts). Add a consuming
+  // rule here if that ever changes.
+  'appointment.parity_gap',        // GHL/LP appointment divergence, rep decides
+  'appointment.confirmation_drift',// LP confirmed, GHL not
+  'dnc.lift_requested',            // operational DNC lifted on an opt-back-in
+
   // Quiet but rule-watched (must not drop)
   'ghl.lead_score_changed',        // 4 rules (W11_1_*)
   'ghl.appointment_no_show',       // 2 rules
