@@ -1984,7 +1984,12 @@ registerGhostSweepRoutes(app);
 // POST /n8n/appointments/parity-check — on-demand bidirectional
 // LP<->GHL appointment reconciliation. Dry-run unless PARITY_AUTOHEAL
 // is 'true'; reports the divergence classes and their findings.
-registerAppointmentParityRoutes(app);
+// 2026-09-14: was mounted WITHOUT authenticate, unlike every neighbouring
+// register*Routes call. POST /n8n/appointments/parity-check accepts
+// {dryRun:false}, which runs a live sweep writing to Lead Perfection and GHL —
+// so the one unauthenticated route in this group was also the one that could
+// mutate both systems. No global middleware covers /n8n/*.
+registerAppointmentParityRoutes(app, authenticate);
 
 // ─── LP Callback Re-queue Verification ───────────────────────────
 // 2026-08-18 (handoff C4): POST /n8n/lp-requeue/verify-sweep — verify

@@ -53,6 +53,10 @@ test('every other sync outcome is NOT a heal', () => {
     deferred_pending_lp_issuance: 'not_attempted',
     past_appointment_left_asis: 'not_attempted',
     lp_lead_creation_enrolled: 'heal_enrolled',
+    // Found by the first live run after v1.1: it returned this action and it
+    // landed in unknown_result, which is what that bucket is for. Same
+    // self-heal family, already enrolled.
+    create_lead_already_enrolled: 'heal_enrolled',
   };
 
   for (const [action, expected] of Object.entries(notHeals)) {
