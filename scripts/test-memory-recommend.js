@@ -353,3 +353,26 @@ test('canonical workflow codes are picked out of the card text', () => {
   assert.deepEqual(workflowCodesIn('S4.5 hands off to L.4 after the wait'), ['S4.5', 'L.4']);
   assert.deepEqual(workflowCodesIn('nothing canonical here'), []);
 });
+
+// ─── output budget ─────────────────────────────────────────────────────────
+
+test('the output budget leaves room for a thinking block, not just the JSON', async () => {
+  // 2026-09-15: at 900 tokens the first live backfill batch lost 24% of its
+  // cards — the models this call site runs on spend output tokens on a thinking
+  // block before the JSON, so half came back as thinking-only and half as JSON
+  // truncated mid-string. The verdict JSON is ~250 tokens; the budget has to
+  // carry the reasoning too. This asserts the headroom, not an exact number.
+  const db = fakeDb([card()]);
+  let seen = null;
+  await recommendOne('claude_pending_items', 50, {
+    ...deps(),
+    db,
+    mode: 'live',
+    callLLMJson: async (args) => { seen = args; return { data: goodReply }; },
+  });
+  assert.ok(seen, 'the model was called');
+  assert.ok(
+    seen.maxTokens >= 2000,
+    `maxTokens is ${seen.maxTokens} — too small once a thinking block is charged against it`,
+  );
+});
