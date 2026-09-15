@@ -154,7 +154,7 @@ async function alertOps(text, deps = {}) {
  * the belt to that braces: if a conversation is edited and reappears, the
  * checkpoint key still makes the re-ingest a no-op.
  */
-async function pullConversations(client, db, { cfg, env, now, deps, sync }) {
+async function pullConversations(client, db, { cfg, env, now, deps, sync, deep = false }) {
   const cursor = sync?.last_cursor || null;
   let seen = 0;
   let ingested = 0;
@@ -177,14 +177,37 @@ async function pullConversations(client, db, { cfg, env, now, deps, sync }) {
 
       // The list is newest-first, so once we reach something older than the
       // high-water mark there is nothing new behind it.
+      //
+      // THAT IS ONLY TRUE FOR CONVERSATIONS THAT SAVED PROMPTLY. A conversation
+      // that was still in_progress when an earlier run passed its position
+      // surfaces later at its ORIGINAL created_at — the list is ordered by
+      // created_at descending (verified over 25 consecutive rows, 2026-09-15),
+      // so it lands BELOW everything already ingested, and its finished_at is
+      // older than the cursor. Stop-at-known can never reach it: measured on the
+      // first live shadow day, runs 2 and 3 looked at exactly ONE conversation
+      // each before breaking, leaving at least 12 late-surfacing conversations
+      // permanently invisible with no error anywhere.
+      //
+      // A deep sweep therefore walks the whole window and lets idempotency do
+      // the work: the checkpoint key is sha256('omi|' + id) and claude_omi_ingest
+      // is ON CONFLICT DO NOTHING, so re-reading writes nothing. It also makes
+      // the cursor/ordering mismatch moot — the cursor is a finished_at while the
+      // list is ordered by created_at, which is not guaranteed to agree.
       const finished = conv?.finished_at || conv?.created_at || null;
-      if (cursor && finished && finished <= cursor) { hitKnown = true; break; }
+      if (!deep && cursor && finished && finished <= cursor) { hitKnown = true; break; }
       if (finished && (!newestFinished || finished > newestFinished)) newestFinished = finished;
 
       const res = await ingestOmiConversation(conv, { db, env, now: now(), embed: deps.embed, llm: deps.llm });
       llmCalls += Number(res.llm_calls || 0);
 
-      if (res.status === 'duplicate_event') { duplicates += 1; hitKnown = true; break; }
+      // Same reasoning as the cursor break above: a duplicate means "already
+      // ingested", which in a deep sweep is the expected case for most of the
+      // window, not a signal to stop.
+      if (res.status === 'duplicate_event') {
+        duplicates += 1;
+        if (!deep) { hitKnown = true; break; }
+        continue;
+      }
       if (res.status === 'no_content') { noContent += 1; continue; }
       if (res.status === 'shadow') {
         planned.push({ conversation_id: id, title: conv?.structured?.title || null, planned: res.planned });
@@ -197,15 +220,70 @@ async function pullConversations(client, db, { cfg, env, now, deps, sync }) {
     if (batch.length < cfg.pageSize) { stopped = 'end_of_list'; break; }
   }
 
-  return { seen, ingested, duplicates, no_content: noContent, llm_calls: llmCalls, cursor: newestFinished, stopped, planned };
+  return {
+    seen, ingested, duplicates, no_content: noContent, llm_calls: llmCalls,
+    cursor: newestFinished, stopped, planned, deep,
+    // seen and no_content are CONVERSATIONS; ingested is the pending ITEMS those
+    // conversations yield, and one conversation can yield several. Naming both
+    // units here stops the shadow log reading as "136 checked, 87 ingested" —
+    // two different things counted in one line (2026-09-15).
+    conversations_with_content: planned.length,
+  };
 }
 
 // ─── 2. Memories ───────────────────────────────────────────────────────────
 async function pullMemories(client, db, { cfg, now, mode }) {
-  const batch = await client.listMemories({ limit: cfg.pageSize, offset: 0 });
   const date = dateET(now());
   const memories = [];
+  let seen = 0;
+  let stopped = 'pages_exhausted';
 
+  // Omi clamps `limit` to 100 SERVER-SIDE — ask for 250 and you get 100 back,
+  // with has_more:true and no error. This loop used to be a single call with
+  // offset hardcoded to 0, so it read the newest 100 and nothing else: measured
+  // 2026-09-15, 152 durable memories existed and 52 of them were unreachable on
+  // every run, for ever, because the offset never moved. An exactly-round count
+  // out of a paged API is a cap, not a total.
+  //
+  // Memories carry no cursor, so every run re-reads every page. That is safe
+  // rather than wasteful: claude_omi_memory_upsert is idempotent on
+  // raw->>'omi_memory_id', so a re-read writes nothing. 152 memories is 2 pages
+  // against a 40-request budget.
+  for (let page = 0; page < cfg.maxPages; page++) {
+    const batch = await client.listMemories({ limit: cfg.pageSize, offset: page * cfg.pageSize });
+    if (!batch.length) { stopped = 'end_of_list'; break; }
+    seen += batch.length;
+    collectMemories(batch, memories);
+    if (batch.length < cfg.pageSize) { stopped = 'end_of_list'; break; }
+  }
+
+  if (!memories.length) return { seen, ingested: 0, skipped: 0, stopped };
+  if (mode === 'shadow') {
+    // `ingested` carries the WOULD-INGEST count in shadow, matching what
+    // pullConversations reports. It used to be hard 0 here with the real number
+    // hidden in `planned`, so the shadow log read "would ingest 0 row(s) from
+    // memories" on a run that had planned 100 of them (first live shadow run,
+    // 2026-09-15). A zero that means "nothing to do" and a zero that means "100
+    // rows, not shown" must not look the same — that log line is the only thing
+    // anyone reads before deciding to go live.
+    return { seen, ingested: memories.length, skipped: 0, planned: memories.length, shadow: true, stopped };
+  }
+
+  const res = await db.rpc('claude_omi_memory_upsert', {
+    p: { checkpoint_key: omiMemoryCheckpointKey(date), session_date: date, memories },
+  });
+  if (res?.error) throw new Error(`claude_omi_memory_upsert: ${res.error.message}`);
+  const out = (Array.isArray(res?.data) ? res.data[0] : res?.data) || {};
+  return {
+    seen,
+    ingested: Number(out.inserted || 0),
+    skipped: Number(out.skipped_existing || 0) + Number(out.skipped_duplicate || 0),
+    stopped,
+  };
+}
+
+/** Maps one page of Omi memories onto the upsert payload shape. */
+function collectMemories(batch, memories) {
   for (const m of batch) {
     const id = String(m?.id ?? '').trim();
     const content = String(m?.content ?? '').trim();
@@ -229,29 +307,6 @@ async function pullMemories(client, db, { cfg, now, mode }) {
       },
     });
   }
-
-  if (!memories.length) return { seen: batch.length, ingested: 0, skipped: 0 };
-  if (mode === 'shadow') {
-    // `ingested` carries the WOULD-INGEST count in shadow, matching what
-    // pullConversations reports. It used to be hard 0 here with the real number
-    // hidden in `planned`, so the shadow log read "would ingest 0 row(s) from
-    // memories" on a run that had planned 100 of them (first live shadow run,
-    // 2026-09-15). A zero that means "nothing to do" and a zero that means "100
-    // rows, not shown" must not look the same — that log line is the only thing
-    // anyone reads before deciding to go live.
-    return { seen: batch.length, ingested: memories.length, skipped: 0, planned: memories.length, shadow: true };
-  }
-
-  const res = await db.rpc('claude_omi_memory_upsert', {
-    p: { checkpoint_key: omiMemoryCheckpointKey(date), session_date: date, memories },
-  });
-  if (res?.error) throw new Error(`claude_omi_memory_upsert: ${res.error.message}`);
-  const out = (Array.isArray(res?.data) ? res.data[0] : res?.data) || {};
-  return {
-    seen: batch.length,
-    ingested: Number(out.inserted || 0),
-    skipped: Number(out.skipped_existing || 0) + Number(out.skipped_duplicate || 0),
-  };
 }
 
 // ─── 3. Action items ───────────────────────────────────────────────────────
@@ -300,6 +355,23 @@ async function pullActionItems(client, db, { mode }) {
   };
 }
 
+/**
+ * The one line anyone reads before deciding to go live, so it names its units.
+ * `seen` counts CONVERSATIONS while `ingested` counts the pending ITEMS they
+ * yield — reporting both as bare numbers read as a discrepancy (136 seen vs 87
+ * ingested vs 59 skipped, which does not add up until you know 77 conversations
+ * produced those 87 items). 2026-09-15.
+ */
+function shadowNote(kind, step, deep) {
+  const prefix = deep ? 'deep sweep: ' : '';
+  if (kind !== 'conversations') {
+    return `${prefix}would ingest ${step.ingested ?? 0} row(s) from ${kind}`;
+  }
+  return `${prefix}would ingest ${step.ingested ?? 0} item(s) from `
+    + `${step.conversations_with_content ?? 0} of ${step.seen ?? 0} conversation(s) `
+    + `(${step.no_content ?? 0} had no content, ${step.duplicates ?? 0} already ingested)`;
+}
+
 // ─── The run ───────────────────────────────────────────────────────────────
 /**
  * @param {object} opts
@@ -307,7 +379,7 @@ async function pullActionItems(client, db, { mode }) {
  *   kinds    subset of PULL_KINDS; defaults to all
  *   deps     { db, client, fetch, env, now, embed, llm, postGroupMe }
  */
-export async function runOmiPull({ dry_run = false, kinds = null, deps = {} } = {}) {
+export async function runOmiPull({ dry_run = false, deep = false, kinds = null, deps = {} } = {}) {
   const env = deps.env || process.env;
   const now = deps.now || (() => new Date());
   const cfg = getPullConfig(env);
@@ -315,7 +387,7 @@ export async function runOmiPull({ dry_run = false, kinds = null, deps = {} } = 
   const want = new Set(Array.isArray(kinds) && kinds.length ? kinds : PULL_KINDS);
 
   const started = Date.now();
-  const result = { ok: true, mode, dry_run, kinds: [...want], steps: {}, errors: [] };
+  const result = { ok: true, mode, dry_run, deep, kinds: [...want], steps: {}, errors: [] };
 
   if (mode === 'off') {
     result.skipped = 'OMI_PULL_MODE=off';
@@ -337,7 +409,7 @@ export async function runOmiPull({ dry_run = false, kinds = null, deps = {} } = 
       prev = await readSync(db, kind);
       let step;
       if (kind === 'conversations') {
-        step = await pullConversations(client, db, { cfg, env, now, deps, sync: prev });
+        step = await pullConversations(client, db, { cfg, env, now, deps, sync: prev, deep });
       } else if (kind === 'memories') {
         step = await pullMemories(client, db, { cfg, now, mode });
       } else if (kind === 'action_items') {
@@ -358,7 +430,7 @@ export async function runOmiPull({ dry_run = false, kinds = null, deps = {} } = 
           rows_checked: step.seen ?? 0,
           rows_flagged: step.ingested ?? 0,
           sample: { kind, ...step },
-          notes: `would ingest ${step.ingested ?? 0} row(s) from ${kind}`,
+          notes: shadowNote(kind, step, deep),
         });
       }
     } catch (err) {

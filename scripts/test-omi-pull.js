@@ -246,6 +246,99 @@ test('a conversation the webhook already ingested is a no-op and stops the page'
   assert.equal(res.steps.conversations.stopped, 'reached_known');
 });
 
+// ─── The late-surfacing conversation (2026-09-15) ──────────────────────────
+// Mark's desktop client stopped saving promptly; those conversations sit
+// in_progress on Omi's backend and surface later AT THEIR ORIGINAL created_at.
+// The list is ordered created_at-descending, so they land below everything
+// already ingested — and stop-at-first-known never reaches them.
+
+/** Newest first, exactly as the API orders it. The late one is second. */
+function listWithLateArrival() {
+  return [
+    apiConversation({
+      id: 'conv-new',
+      created_at: '2026-09-15T14:13:51.000Z',
+      finished_at: '2026-09-15T14:41:34.000Z',
+    }),
+    apiConversation({
+      id: 'conv-late',
+      created_at: '2026-09-14T21:29:56.000Z',
+      finished_at: '2026-09-14T21:30:56.000Z',
+    }),
+  ];
+}
+
+const SYNC_AT_CURSOR = {
+  claude_omi_sync: {
+    kind: 'conversations',
+    last_cursor: '2026-09-15T14:41:34.000Z',
+    consecutive_failures: 0,
+  },
+};
+
+test('an incremental pull STRANDS a conversation that surfaced late — this is the defect', async () => {
+  const { db } = fakeSupabase({
+    reads: SYNC_AT_CURSOR,
+    rpc: { claude_omi_ingest: () => ({ data: written(), error: null }) },
+  });
+  const fetch = fakeFetch({ 'GET /user/conversations': (n) => ({ body: n === 1 ? listWithLateArrival() : [] }) });
+
+  const res = await runOmiPull({ kinds: ['conversations'], deps: { db, fetch, env: ENV, now: NOW, llm: fakeLlm(), embed: null, sleep: noSleep } });
+
+  // It looks at exactly one conversation and stops — conv-late is never reached.
+  assert.equal(res.steps.conversations.seen, 1);
+  assert.equal(res.steps.conversations.stopped, 'reached_known');
+});
+
+test('a deep sweep reaches it: the whole window is walked, past the known high-water mark', async () => {
+  const { db, state } = fakeSupabase({
+    reads: SYNC_AT_CURSOR,
+    rpc: { claude_omi_ingest: () => ({ data: written(), error: null }) },
+  });
+  const fetch = fakeFetch({ 'GET /user/conversations': (n) => ({ body: n === 1 ? listWithLateArrival() : [] }) });
+
+  const res = await runOmiPull({ deep: true, kinds: ['conversations'], deps: { db, fetch, env: ENV, now: NOW, llm: fakeLlm(), embed: null, sleep: noSleep } });
+
+  assert.equal(res.deep, true);
+  assert.equal(res.steps.conversations.seen, 2, 'both conversations must be walked');
+  assert.notEqual(res.steps.conversations.stopped, 'reached_known');
+
+  const ingested = state.rpcCalls
+    .filter((c) => c.name === 'claude_omi_ingest')
+    .map((c) => c.args.p.checkpoint_key);
+  assert.ok(ingested.includes(omiCheckpointKey('conv-late')), 'the stranded conversation must be ingested');
+
+  // The cursor must not walk backwards onto the older conversation.
+  assert.equal(res.steps.conversations.cursor, '2026-09-15T14:41:34.000Z');
+});
+
+test('a deep sweep does not stop on an already-ingested conversation either', async () => {
+  // Every conversation in the window comes back duplicate_event — the normal
+  // case for a deep sweep, and it must keep walking rather than stop at #1.
+  const { db } = fakeSupabase({ reads: { ...SYNC_AT_CURSOR, claude_session_logs: { id: 77 } } });
+  const fetch = fakeFetch({ 'GET /user/conversations': (n) => ({ body: n === 1 ? listWithLateArrival() : [] }) });
+
+  const res = await runOmiPull({ deep: true, kinds: ['conversations'], deps: { db, fetch, env: ENV, now: NOW, llm: fakeLlm(), embed: null, sleep: noSleep } });
+
+  assert.equal(res.steps.conversations.seen, 2);
+  assert.equal(res.steps.conversations.duplicates, 2);
+  assert.notEqual(res.steps.conversations.stopped, 'reached_known');
+});
+
+test('the nightly catch-up runs deep — that is what makes it a catch-up', async () => {
+  const { runMemoryNightly } = await import('../src/jobs/memory-nightly.js');
+  const seen = [];
+  await runMemoryNightly({
+    dry_run: true,
+    deps: {
+      env: { ...ENV, OMI_PULL_MODE: 'shadow', OMI_INGEST_MODE: 'shadow', MEMORY_RECOMMEND_MODE: 'off' },
+      omiPull: async (opts) => { seen.push(opts); return { ok: true, mode: 'shadow', deep: opts.deep, steps: {}, errors: [] }; },
+    },
+  });
+  assert.equal(seen.length, 1, 'the nightly must run the Omi catch-up');
+  assert.equal(seen[0].deep, true);
+});
+
 test('restarting mid-run loses nothing: the cursor only moves on success', async () => {
   const { db, state } = fakeSupabase({
     reads: { claude_omi_sync: { kind: 'conversations', last_cursor: null, consecutive_failures: 0 } },
@@ -359,6 +452,50 @@ test('shadow mode writes a validation-log row and nothing else', async () => {
   // The only other write is the bookkeeping row.
   const tables = new Set(state.writes.map((w) => w.table));
   assert.deepEqual([...tables].sort(), ['claude_memory_validation_log', 'claude_omi_sync']);
+});
+
+test('memories page past the server-side cap of 100 — a round number is a cap, not a total', async () => {
+  // Measured 2026-09-15: Omi clamps `limit` to 100 server-side (ask for 250,
+  // get 100, has_more:true, no error). The pull used to call it once with
+  // offset 0, so 52 of Mark's 152 memories were unreachable on EVERY run.
+  const page = (n, from) => Array.from({ length: n }, (_, i) => ({
+    id: `mem_${from + i}`, content: `memory number ${from + i}`, category: 'core',
+  }));
+  const offsets = [];
+  const { db } = fakeSupabase({
+    rpc: { claude_omi_memory_upsert: () => ({ data: { inserted: 152, skipped_existing: 0, skipped_duplicate: 0 }, error: null }) },
+  });
+  const fetch = fakeFetch({
+    'GET /user/memories': (_n, u) => {
+      const offset = Number(u.searchParams.get('offset'));
+      offsets.push(offset);
+      // 152 total: a full page of 100, then a short page of 52 that ends it.
+      return { body: offset === 0 ? page(100, 0) : offset === 100 ? page(52, 100) : [] };
+    },
+  });
+
+  const res = await runOmiPull({ kinds: ['memories'], deps: { db, fetch, env: ENV, now: NOW, llm: fakeLlm(), embed: null, sleep: noSleep } });
+
+  assert.deepEqual(offsets, [0, 100], 'the offset must advance past the first page');
+  assert.equal(res.steps.memories.seen, 152, 'all 152 must be read, not the first 100');
+  assert.equal(res.steps.memories.stopped, 'end_of_list');
+});
+
+test('memories paging stops at a short page rather than spending the budget on empties', async () => {
+  const { db } = fakeSupabase({
+    rpc: { claude_omi_memory_upsert: () => ({ data: { inserted: 2, skipped_existing: 0, skipped_duplicate: 0 }, error: null }) },
+  });
+  let calls = 0;
+  const fetch = fakeFetch({
+    'GET /user/memories': () => {
+      calls += 1;
+      return { body: [{ id: 'mem_a', content: 'one' }, { id: 'mem_b', content: 'two' }] };
+    },
+  });
+
+  await runOmiPull({ kinds: ['memories'], deps: { db, fetch, env: ENV, now: NOW, llm: fakeLlm(), embed: null, sleep: noSleep } });
+
+  assert.equal(calls, 1, 'a page shorter than the page size is the end of the list');
 });
 
 test('the shadow log reports the memories it WOULD ingest, not a zero that reads as "nothing to do"', async () => {

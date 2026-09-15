@@ -400,10 +400,16 @@ export async function runMemoryNightly({ dry_run = false, deps = {} } = {}) {
     result.digest = await runWeeklyDigest({ dry_run, mode, now, deps: { runSQL: sql, postGroupMe: post, env } });
   } catch (err) { result.errors.push(`digest: ${err.message}`); }
 
-  // 9.5 Omi catch-up (sql/112). A full pass, unbounded by the 15-minute tick's
-  //     page cap, so anything the scheduler missed — a restart, a Railway
-  //     redeploy, an Omi outage, a run that spent its request budget — is picked
-  //     up overnight rather than waiting for someone to notice a gap.
+  // 9.5 Omi catch-up (sql/112). A DEEP pass — it walks the whole window instead
+  //     of stopping at the first conversation it already has, so anything the
+  //     scheduler missed is picked up overnight rather than waiting for someone
+  //     to notice a gap. The 15-minute tick keeps its early stop for latency.
+  //
+  //     deep:true is what makes this a catch-up at all. Without it the run stops
+  //     at the first known conversation, which on a live day was position ONE —
+  //     and a conversation that saved late sits below that for ever, because it
+  //     keeps its original created_at and the list is ordered by created_at.
+  //     Measured 2026-09-15: 12+ conversations were unreachable this way.
   //
   //     BEFORE the recommend step, deliberately: rows pulled here are candidates
   //     for tonight's recommendations, and a catch-up that ran after would leave
@@ -413,8 +419,8 @@ export async function runMemoryNightly({ dry_run = false, deps = {} } = {}) {
     if (getPullMode(env) === 'off') {
       result.omi_pull = { mode: 'off', skipped: true };
     } else {
-      const r = await (deps.omiPull || runOmiPull)({ dry_run, deps: { env } });
-      result.omi_pull = { mode: r.mode, steps: r.steps, ok: r.ok };
+      const r = await (deps.omiPull || runOmiPull)({ dry_run, deep: true, deps: { env } });
+      result.omi_pull = { mode: r.mode, deep: r.deep, steps: r.steps, ok: r.ok };
       for (const e of r.errors || []) result.errors.push(`omi_pull ${e}`);
     }
   } catch (err) { result.errors.push(`omi_pull: ${err.message}`); }
