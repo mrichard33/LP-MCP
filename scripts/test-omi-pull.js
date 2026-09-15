@@ -361,6 +361,33 @@ test('shadow mode writes a validation-log row and nothing else', async () => {
   assert.deepEqual([...tables].sort(), ['claude_memory_validation_log', 'claude_omi_sync']);
 });
 
+test('the shadow log reports the memories it WOULD ingest, not a zero that reads as "nothing to do"', async () => {
+  const { db, state } = fakeSupabase();
+  const fetch = fakeFetch({
+    'GET /user/memories': { body: [
+      { id: 'mem_a', content: 'Mark prefers morning installs', category: 'core' },
+      { id: 'mem_b', content: 'Installs pause the week of July 4', category: 'core' },
+    ] },
+  });
+
+  const res = await runOmiPull({
+    kinds: ['memories'],
+    deps: { db, fetch, env: { ...ENV, OMI_PULL_MODE: 'shadow', OMI_INGEST_MODE: 'shadow' }, now: NOW, llm: fakeLlm(), embed: null, sleep: noSleep },
+  });
+
+  assert.equal(res.mode, 'shadow');
+  assert.equal(state.rpcCalls.filter((c) => c.name === 'claude_omi_memory_upsert').length, 0, 'shadow must not write');
+
+  const log = state.writes
+    .filter((w) => w.table === 'claude_memory_validation_log')
+    .map((w) => w.row)
+    .find((r) => r.check_name === 'omi:pull_shadow' && r.sample?.kind === 'memories');
+
+  assert.ok(log, 'the memories step must describe itself in the shadow log');
+  assert.equal(log.rows_flagged, 2);
+  assert.match(log.notes, /would ingest 2 row\(s\) from memories/);
+});
+
 test('a live pull against a shadow ingest is forced down to shadow rather than silently discarding its work', () => {
   assert.equal(getPullMode({ OMI_PULL_MODE: 'live', OMI_INGEST_MODE: 'shadow' }), 'shadow');
   assert.equal(getPullMode({ OMI_PULL_MODE: 'live', OMI_INGEST_MODE: 'live' }), 'live');
