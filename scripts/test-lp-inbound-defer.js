@@ -7,7 +7,8 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { findUnissuedInboundRow, inboundDeferMode, inboundDeferMaxAgeMin }
+import { findUnissuedInboundRow, inboundDeferMode, inboundDeferMaxAgeMin,
+         inboundDeferDecision }
   from '../src/lp-appointment-sync.js';
 import { lpStoredAgeMinutes, utcToLpStoredIso } from '../src/lp-dates.js';
 
@@ -84,4 +85,44 @@ test('max age defaults to 360 and floors at 30', () => {
   process.env.LP_INBOUND_DEFER_MAX_AGE_MIN = '5';
   assert.equal(inboundDeferMaxAgeMin(), 30);
   delete process.env.LP_INBOUND_DEFER_MAX_AGE_MIN;
+});
+
+// ─── Stale decision (2026-09-15) ────────────────────────────────
+// Found by the shadow window: contact pbTY7u8gVQcXv9fMm58g, in1_id 423860 sat
+// unissued 9+ hours WITH apptdate 09/15/2026 2:00 PM already on it. The old
+// rule fell through at 360 min and would have minted a fourth inbound row for
+// a person who already had three.
+
+const D = (ageMin, hasAppt, maxAgeMin = 360) =>
+  inboundDeferDecision({ ageMin, hasAppt, maxAgeMin });
+
+test('fresh row defers whether or not it carries an appointment', () => {
+  assert.equal(D(30, false), 'defer');
+  assert.equal(D(30, true), 'defer');
+  assert.equal(D(360, true), 'defer');   // boundary: equal is NOT stale
+  assert.equal(D(360, false), 'defer');
+});
+
+test('stale row WITH the appointment holds — never mints a duplicate', () => {
+  assert.equal(D(361, true), 'hold_stale_holds_appt');
+  assert.equal(D(549, true), 'hold_stale_holds_appt');  // the live 423860 age
+});
+
+test('stale row WITHOUT an appointment still falls through', () => {
+  // The one case where the duplicate is earned: nothing in LP holds the appt,
+  // so waiting really can lose it.
+  assert.equal(D(361, false), 'fall_through_stale');
+  assert.equal(D(5000, false), 'fall_through_stale');
+});
+
+test('unknown age is never stale (fail-open, not "stuck")', () => {
+  assert.equal(D(null, true), 'defer');
+  assert.equal(D(null, false), 'defer');
+  assert.equal(D(undefined, false), 'defer');
+});
+
+test('a lowered max age moves the boundary but not the hasAppt rule', () => {
+  assert.equal(D(45, true, 30), 'hold_stale_holds_appt');
+  assert.equal(D(45, false, 30), 'fall_through_stale');
+  assert.equal(D(20, false, 30), 'defer');
 });
