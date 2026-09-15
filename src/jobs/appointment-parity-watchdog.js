@@ -270,14 +270,26 @@ function classifyHealResult(result) {
       return 'not_attempted';
     case 'lp_lead_creation_enrolled':
     case 'create_lead_already_enrolled':
+    case 'enrolled_lead_creation_workflow':
       // The self-heal path: no LP appointment yet, but the contact is enrolled
       // in the addlead-with-appointment workflow that creates one. Real work,
       // not yet a repair — it lands (or does not) on a later sweep.
       //
-      // create_lead_already_enrolled added 2026-09-14: the first live run after
-      // v1.1 returned it and it fell into unknown_result, which is exactly what
-      // that bucket is for — surfacing an action nobody had enumerated instead
-      // of quietly inflating the heal count. Same family, already-enrolled.
+      // THREE SPELLINGS, ONE OUTCOME. All three mean "enrolled in workflow
+      // 8e30ff37", and they are spread across two modules:
+      //   lp_lead_creation_enrolled      src/lp-appointment-sync.js
+      //   enrolled_lead_creation_workflow  enrollLpLeadCreation success path
+      //   create_lead_already_enrolled     enrollLpLeadCreation dedup path
+      // Both of the latter come out of the SAME function in
+      // src/admin/lp-force-addlead.js, which is why missing one was easy.
+      //
+      // Each was added only after a live run returned it and it landed in
+      // unknown_result — create_lead_already_enrolled on 2026-09-14,
+      // enrolled_lead_creation_workflow on 2026-09-15, in the very first sweep
+      // after PARITY_AUTOHEAL was switched on (contact pbTY7u8gVQcXv9fMm58g).
+      // That bucket is doing its job: it surfaces an unenumerated action
+      // instead of quietly inflating the heal count. Before adding a new
+      // return value to either module, add it here too.
       return 'heal_enrolled';
     default:
       return 'unknown_result';
