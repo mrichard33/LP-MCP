@@ -171,3 +171,42 @@ rather than flagging them, so it reads 0 instead of 95 once applied.
 No existing row is rewritten by sql/100 — the 95 keep the provenance the ruling
 gave them. Rollback: re-run the `claude_inherit_provenance()` block in sql/098
 section C.
+
+---
+
+## Addendum — 2026-09-15: the link sweep could not reach its own backlog (C2/C3)
+
+64 sessions stayed `link_confidence='unlinked'` through repeated sweeps while
+the nightly count of checked rows kept rising. The sweep was not failing — it
+was looking at the complement of the problem.
+
+**Three defects, all fixed in the skill and its query reference:**
+
+1. **Disjoint windows.** Mechanism 2 step 1 asked for unlinked sessions
+   `created_at > now() - interval '7 days'`; the nightly `unlinked_sessions_7d`
+   check flags `created_at < now() - interval '7 days'`. No sweep could ever
+   touch a flagged row. The sweep now has no age window (`queries.md` §4b lost
+   its 60-day bound too), and the check's `rows_checked` stays windowless so it
+   agrees with the pack's `unlinked_sessions` count. **Keep them aligned.**
+2. **The wrong matcher.** Step 3 matched `recent_chats.updated_at` to the
+   session's `created_at` within 3 minutes. For a sweep-written row `created_at`
+   is the *write* date, so the rule was comparing against the wrong clock
+   entirely — and `recent_chats` pages back only ~100 chats, far short of an
+   August backlog. `conversation_search` on `transcript_search_keys` is now the
+   primary matcher (works at any age); the timestamp rule is a fallback for live
+   rows only. The check's `sample` now carries the search keys, so it is the
+   sweep's worklist.
+3. **The heal would have corrupted dates.** The §6a C2 statement set
+   `session_date` from the chat's `updated_at` for every row it healed, guarded
+   only on `link_confidence`. Most of the 64 already carry a correct
+   `date_confidence='exact'` date reconstructed from their first user message,
+   and a chat's `updated_at` is its *last* activity. It is now two statements:
+   the link write always runs, the date write is guarded by
+   `date_confidence='write_date'`. The C3 child statements carry the same guard,
+   so a decision appended later by a live refresh keeps its own date (sql/100
+   ruling).
+
+Running C2 now: one chat per project (both `recent_chats` and
+`conversation_search` are project-scoped), report the batch per project before
+writing, one chat links to one session, never overwrite an `exact` link, never
+re-date a row that already says `exact`.
