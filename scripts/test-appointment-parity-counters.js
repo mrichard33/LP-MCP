@@ -57,6 +57,12 @@ test('every other sync outcome is NOT a heal', () => {
     // landed in unknown_result, which is what that bucket is for. Same
     // self-heal family, already enrolled.
     create_lead_already_enrolled: 'heal_enrolled',
+    // Found the same way on 2026-09-15, by the first sweep after
+    // PARITY_AUTOHEAL was switched on (contact pbTY7u8gVQcXv9fMm58g). This is
+    // the SUCCESS path of enrollLpLeadCreation, whose dedup path returns
+    // create_lead_already_enrolled above — one function, two return values, and
+    // only one of them had been enumerated.
+    enrolled_lead_creation_workflow: 'heal_enrolled',
   };
 
   for (const [action, expected] of Object.entries(notHeals)) {
@@ -128,4 +134,63 @@ test('the allowlist is still default-DROP for everything else', () => {
   // default-DROP posture is the point of the module.
   assert.equal(shouldAllowEvent({ event_type: 'appointment.something_invented' }).allow, false);
   assert.equal(shouldAllowEvent({ event_type: 'opportunity.created' }).allow, false);
+});
+
+
+// ═══════════════════════════════════════════════════════════════════
+// 5. The enumeration ratchet — stop losing actions to unknown_result
+// ═══════════════════════════════════════════════════════════════════
+
+test('every action the sync modules can RETURN is enumerated in classifyHealResult', async () => {
+  // WHY THIS EXISTS (2026-09-15). Three times now, a live sweep has returned a
+  // perfectly ordinary action that nobody had added to the switch, and it
+  // landed in unknown_result:
+  //   lp_lead_creation_enrolled        v1.1
+  //   create_lead_already_enrolled     2026-09-14, first live run after v1.1
+  //   enrolled_lead_creation_workflow  2026-09-15, first sweep after
+  //                                    PARITY_AUTOHEAL was switched on
+  // The last two are the dedup path and the success path of the SAME function
+  // (enrollLpLeadCreation), which is exactly how the third one hid.
+  //
+  // unknown_result is the safe landing spot — it never inflates the heal count,
+  // which is the defect v1.1 existed to kill — but an action sitting there is
+  // still a repair we cannot see. This test scans the two modules that feed
+  // syncAppointmentToLP and fails when a NEW action appears unenumerated, so it
+  // is caught at CI rather than by reading production logs a fourth time.
+  const { readFile } = await import('node:fs/promises');
+
+  // Actions that are HTTP route responses, not values returned to the watchdog.
+  // syncAppointmentToLP is called directly by the parity job, so these never
+  // reach classifyHealResult. Add to this set ONLY with the route line quoted.
+  const ROUTE_ONLY = new Set([
+    // src/lp-appointment-sync.js — res.status(202).json({...}) on budget overrun
+    'lp_appointment_sync_deferred',
+    // src/lp-appointment-sync.js — res.json({...}) on the GHL-only calendar
+    // branch, where LP SetAppointment is intentionally skipped
+    'five9_direct_dispatch',
+  ]);
+
+  // Comments are stripped first. The doc comment at the top of
+  // lp-force-addlead.js quotes `{ action:'forward' }` from another module's
+  // return value, and a scan that reads prose as code reports a defect that
+  // does not exist — which is how a guard like this gets muted.
+  const stripComments = (s) => s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+
+  const sources = ['src/lp-appointment-sync.js', 'src/admin/lp-force-addlead.js'];
+  const found = new Set();
+  for (const path of sources) {
+    const text = stripComments(await readFile(new URL(`../${path}`, import.meta.url), 'utf8'));
+    for (const m of text.matchAll(/action:\s*'([a-z0-9_]+)'/g)) found.add(m[1]);
+  }
+
+  assert.ok(found.size > 5, `expected to scan real action literals, found ${found.size}`);
+
+  const unenumerated = [...found]
+    .filter((a) => !ROUTE_ONLY.has(a))
+    .filter((a) => classifyHealResult({ success: true, action: a }) === 'unknown_result');
+
+  assert.deepEqual(unenumerated, [],
+    'these actions fall into unknown_result — add each to the classifyHealResult switch '
+    + '(or to ROUTE_ONLY above, with the route line quoted, if it is an HTTP response '
+    + 'the watchdog can never receive): ' + unenumerated.join(', '));
 });
