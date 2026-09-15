@@ -135,6 +135,9 @@ SELECT json_agg(row_to_json(s)) FROM (
   FROM claude_session_logs
   WHERE link_confidence = 'unlinked'
     AND surface = 'chat'
+    AND session_title NOT ILIKE '%[FOLDED%'
+    AND NOT coalesce(validation_notes ? 'folded_into', false)
+    AND NOT coalesce((validation_notes->>'link_unlinkable')::boolean, false)
   ORDER BY created_at ASC
 ) s
 ```
@@ -142,6 +145,16 @@ SELECT json_agg(row_to_json(s)) FROM (
 No age window, and oldest first (v4.6). A window here made the sweep blind to
 exactly the rows the nightly `unlinked_sessions_7d` check flags; the pack's
 `unlinked_sessions` count is windowless too, so all three now agree.
+
+**Keep this query and the nightly check aligned (v4.7).** The exclusions above
+are the same ones in `unlinked_sessions_7d` (`src/jobs/memory-validate.js`).
+A filter added in one place and not the other *is* the v4.6 bug in mirror image —
+the nightly stops flagging rows the sweep keeps serving. Change one, change both.
+
+A `[FOLDED → #NNN]` row was folded into another session, so its chat belongs to
+that other row; any match found for it is a false positive by construction. 43
+sat in the worklist on 2026-09-15 and the first real C2 run spent its whole
+budget refusing them.
 
 If `claude_transcript_ledger` does not exist, 4a errors. Treat that as
 "bridge not installed": skip reconciliation, keep the context pack (Query 1).
@@ -158,6 +171,29 @@ Fall back to timestamps **only** for a row written live in this project in the
 last 7 days (`date_confidence='exact'`): the `recent_chats` entry whose
 `updated_at` is within 3 minutes of the session's `created_at` (nearest wins;
 title similarity breaks ties; skip and report if still ambiguous).
+
+**Three gates before any fit test (v4.7).** Keys establish candidacy, not
+identity — a topical key matches every session on a long-running subject.
+
+```sql
+-- Gate A, ONE query at sweep start. Filter candidates against this set in
+-- memory; never a lookup per candidate, never a refusal after the fact.
+SELECT json_agg(u) FROM (
+  SELECT chat_url FROM claude_session_logs WHERE chat_url IS NOT NULL
+  UNION
+  SELECT chat_url FROM claude_transcript_ledger WHERE session_id IS NOT NULL
+) u;
+```
+
+- **Gate B** — reject when
+  `(chat.updated_at AT TIME ZONE 'America/New_York')::date < session_date`.
+  `updated_at` is UTC and `session_date` is an ET date, so comparing them raw is
+  an off-by-one: a chat last active `2026-09-08T02:00Z` is Sept 7 in ET. Same-day
+  passes.
+- **Gate C** — Gate B is impossible on `date_confidence='write_date'` rows, whose
+  `session_date` *is* the write date. Those are the sweep-written rows most prone
+  to mis-matching, so open the chat and confirm the work before accepting. Title
+  fit alone is not enough for them.
 
 Then, per match, one write — session link + ledger row together. Never
 downgrade an `exact` link.
