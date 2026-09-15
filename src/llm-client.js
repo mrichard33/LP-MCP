@@ -167,6 +167,26 @@ function openAIUsesCompletionTokens(model) {
   return /^(gpt-5|o\d)/i.test(String(model || ''));
 }
 
+// 2026-09-15 — TEMPERATURE 400 INCIDENT.
+// Anthropic REMOVED the sampling parameters (temperature / top_p / top_k) on the
+// newer families: Opus 5, Opus 4.8, Opus 4.7, Sonnet 5, Fable 5/5.1, Mythos 5/5.1.
+// Sending one is a hard 400, not a warning. LLM_MODEL_ANTHROPIC was repointed at
+// such a model and every recommendation died at the API boundary for ~11 hours —
+// 130 consecutive failures, 0 written, and nothing louder than rows in
+// claude_memory_validation_log. The OpenAI half of this guard has existed since
+// GPT-5 shipped (right above); the Anthropic half was never written.
+//
+// The caller is NOT wrong to ask for temperature 0 — deterministic JSON is a
+// reasonable request. Knowing the model cannot honour it belongs here.
+function anthropicRejectsSampling(model) {
+  return /^claude-(opus-(5|4-7|4-8)|sonnet-5|fable-5|mythos-5)/i.test(String(model || ''));
+}
+
+/** The 400 body Anthropic returns when a sampling parameter is not supported. */
+function isSamplingRejection(status, text) {
+  return status === 400 && /temperature|top_p|top_k/i.test(String(text || ''));
+}
+
 function withTimeout(promise, ms, label) {
   let timer;
   const timeout = new Promise((_, reject) => {
@@ -179,9 +199,9 @@ async function callAnthropic({ model, system, messages, maxTokens, temperature, 
   if (!ANTHROPIC_API_KEY) throw new Error(`[LLMClient:${fn}] ANTHROPIC_API_KEY not set`);
   const body = { model, max_tokens: maxTokens, messages };
   if (system) body.system = system;
-  if (temperature != null) body.temperature = temperature;
+  if (temperature != null && !anthropicRejectsSampling(model)) body.temperature = temperature;
 
-  const res = await fetch('https://api.anthropic.com/v1/messages', {
+  const post = () => fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -191,6 +211,22 @@ async function callAnthropic({ model, system, messages, maxTokens, temperature, 
     body: JSON.stringify(body),
     signal: AbortSignal.timeout(LLM_TIMEOUT_MS),
   });
+
+  let res = await post();
+  // The model list above is a fast path, not the guarantee. Every new family has
+  // removed these parameters, so a hardcoded list WILL fall behind — that is
+  // exactly how this broke. One retry without the parameter turns the next
+  // removal into a log line instead of a silent outage.
+  if (!res.ok && 'temperature' in body) {
+    const t = await res.text().catch(() => '');
+    if (isSamplingRejection(res.status, t)) {
+      console.warn(`[LLMClient:${fn}] ${model} rejected temperature — retrying without it. Add it to anthropicRejectsSampling().`);
+      delete body.temperature;
+      res = await post();
+    } else {
+      throw new Error(`Anthropic API ${res.status}: ${t.slice(0, 300)}`);
+    }
+  }
   if (!res.ok) {
     const t = await res.text().catch(() => '');
     throw new Error(`Anthropic API ${res.status}: ${t.slice(0, 300)}`);
