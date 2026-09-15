@@ -1545,11 +1545,43 @@ function inboundDeferMode() {
   return ['off', 'shadow', 'on'].includes(raw) ? raw : 'shadow';
 }
 
-// Past this age an unissued row is presumed stuck and we fall through to the
-// enroll rather than hold an appointment indefinitely. Floor of 30 min so a
-// typo can never make the gate fire on a row LP is still processing normally.
+// Past this age an unissued row is presumed stuck. What we do about it then
+// depends on whether that row already carries the appointment — see
+// inboundDeferDecision(). Floor of 30 min so a typo can never make the gate
+// fire on a row LP is still processing normally.
 function inboundDeferMaxAgeMin() {
   return Math.max(30, Number(process.env.LP_INBOUND_DEFER_MAX_AGE_MIN) || 360);
+}
+
+/**
+ * What the gate should do about a pending unissued row. PURE and
+ * MODE-INDEPENDENT: it answers "what would 'on' do", so shadow telemetry
+ * predicts real behaviour instead of describing the fall-through it took.
+ *
+ *   defer                  row is fresh — hold and let the watchdog retry
+ *   hold_stale_holds_appt  row is stuck BUT already carries the appointment
+ *   fall_through_stale     row is stuck and carries NO appointment
+ *
+ * The hold_stale_holds_appt case was found by the shadow window on 2026-09-15
+ * (contact pbTY7u8gVQcXv9fMm58g, in1_id 423860). That row sat unissued for
+ * 9+ hours with apptdate 09/15/2026 2:00 PM already on it. The original
+ * stale rule would have fallen through and enrolled at the 360-minute mark,
+ * minting a FOURTH inbound row for a person who already had three.
+ *
+ * The fall-through exists so an appointment is never lost. That justification
+ * only holds when the stuck row has NO appointment — then waiting really can
+ * lose one. When the stuck row ALREADY carries it, the appointment is not at
+ * risk: it is sitting on that row waiting for LP to issue it, and enrolling
+ * rescues nothing while guaranteeing a duplicate. So we hold and escalate to
+ * a human instead, who can unstick the row in LP.
+ *
+ * A null ageMin (unparseable datereceived) is never stale — findUnissuedInboundRow
+ * fails open, and an unknown age must not be read as "stuck".
+ */
+function inboundDeferDecision({ ageMin, hasAppt, maxAgeMin }) {
+  const stale = ageMin != null && ageMin > maxAgeMin;
+  if (!stale) return 'defer';
+  return hasAppt ? 'hold_stale_holds_appt' : 'fall_through_stale';
 }
 
 /**
@@ -1754,17 +1786,30 @@ async function syncAppointmentToLP({
       const pending = await findUnissuedInboundRow(contactId);
       if (pending) {
         const maxAgeMin = inboundDeferMaxAgeMin();
-        const stale = pending.ageMin != null && pending.ageMin > maxAgeMin;
-        const willDefer = deferMode === 'on' && !stale;
+        const decision = inboundDeferDecision({
+          ageMin: pending.ageMin,
+          hasAppt: pending.hasAppt,
+          maxAgeMin,
+        });
+        // Only 'on' acts. In shadow the decision is still computed and emitted
+        // so the telemetry says what 'on' WOULD do — that is how the
+        // hold_stale_holds_appt case was found before it ever ran.
+        const willDefer = deferMode === 'on' && decision !== 'fall_through_stale';
+        const staleHoldsAppt = decision === 'hold_stale_holds_appt';
 
         // Telemetry. bypass_filter is MANDATORY: this type is not in
         // ALLOWED_EVENT_TYPES and never will be (that list's contract is
         // "types with >=1 consuming agent_rule"), and shouldAllowEvent() is
         // default-DROP — without it the shadow window produces nothing.
         // Same precedent as agentic.hold_error and appt.enrichment_fetch.
+        //
+        // Subtype is the decision itself, prefixed 'shadow_' when the gate is
+        // only observing. Replaces the pre-2026-09-15 values 'deferred' /
+        // 'shadow' / 'stale_fell_through', which could not express "stale but
+        // we would hold anyway".
         void emitEvent({
           event_type: 'lp.appointment_defer_pending_inbound',
-          event_subtype: willDefer ? 'deferred' : (stale ? 'stale_fell_through' : 'shadow'),
+          event_subtype: deferMode === 'on' ? decision : `shadow_${decision}`,
           source: 'lp_mcp',
           entity_type: 'contact',
           entity_id: String(contactId),
@@ -1790,8 +1835,33 @@ async function syncAppointmentToLP({
             `[LP-APPT] ⏸️ Deferring ${contactId}: LP inbound row ` +
             `${pending.inboundId || '(unknown)'} is ${pending.ageMin ?? '?'}min old and NOT yet ` +
             `issued — skipping wf 8e30ff37 enroll (would duplicate). Parity watchdog re-drives ` +
-            `every 30min until LP issues an lds_id.`
+            `every 30min until LP issues an lds_id.` +
+            (staleHoldsAppt
+              ? ` Past ${maxAgeMin}min, but that row already carries the appointment — holding ` +
+                `and escalating rather than minting a duplicate that rescues nothing.`
+              : '')
           );
+          // A stuck row that already holds the appointment needs a human to
+          // unstick it in LP; the watchdog alone will retry forever. channel
+          // 'ops' routes to the ops bot and mirrors to Slack #ops-alerts —
+          // the house rule for operational alarms (CLAUDE.md, decision 2188).
+          // NOTE: the Slack mirror is fail-silent, so a missing card here
+          // looks exactly like a quiet night. Confirm one lands after deploy.
+          if (staleHoldsAppt) {
+            await sendGroupMeMessage(
+              `⚠️ LP INBOUND ROW STUCK — appointment HELD, no duplicate created\n\n` +
+              `👤 ${contactName || contactId}\n` +
+              `🆔 in1_id ${pending.inboundId || 'unknown'} unissued for ${pending.ageMin} min ` +
+              `(> ${maxAgeMin})\n` +
+              `📅 Appt: ${incomingDateNorm} ${incomingTimeNorm || ''}\n\n` +
+              `That row ALREADY carries this appointment — it is not at risk, LP just has not ` +
+              `issued the row. A second lead would duplicate this person and rescue nothing, ` +
+              `so nothing was created.\n` +
+              `→ In LP: issue in1_id ${pending.inboundId || 'unknown'} (or kill it if it is junk). ` +
+              `The appointment writes itself once the lead exists.`,
+              { channel: 'ops' }
+            ).catch(() => {});
+          }
           // Deliberately NO dedup mark and NO lp-appt-synced tag: LP does not
           // hold this appointment yet, and the watchdog must be free to retry.
           await addGHLNote(contactId,
@@ -1800,8 +1870,12 @@ async function syncAppointmentToLP({
             `${pending.inboundId || 'unknown'}, ${pending.ageMin ?? '?'} min old) but has not ` +
             `issued the lead yet. Creating a second lead to carry the appointment would ` +
             `duplicate this person in LP, so the appointment is being held instead.\n` +
-            `It writes to the SAME lead automatically once LP issues it — re-checked every ` +
-            `30 minutes for up to ${maxAgeMin} minutes, then escalated.\n` +
+            (staleHoldsAppt
+              ? `That row already carries this appointment, so nothing is at risk — it has been ` +
+                `stuck past ${maxAgeMin} minutes and the ops channel has been alerted to issue ` +
+                `it in LP by hand.\n`
+              : `It writes to the SAME lead automatically once LP issues it — re-checked every ` +
+                `30 minutes for up to ${maxAgeMin} minutes, then escalated.\n`) +
             `Appt: ${incomingDateNorm} ${incomingTimeNorm || ''}`
           ).catch(() => {});
           // Hold marker for I.LP-A's exit branch — without it I.LP-A takes its
@@ -1813,7 +1887,9 @@ async function syncAppointmentToLP({
           await applyGHLTag(contactId, LP_APPT_DEFERRED_TAG).catch(() => {});
           return {
             success: true,
-            action: 'deferred_pending_lp_issuance',
+            action: staleHoldsAppt
+              ? 'held_stale_inbound_holds_appointment'
+              : 'deferred_pending_lp_issuance',
             contact_id: contactId,
             lp_inbound_lead_id: pending.inboundId,
             inbound_age_min: pending.ageMin,
@@ -1821,22 +1897,29 @@ async function syncAppointmentToLP({
             appt_time: incomingTimeNorm || null,
             max_age_min: maxAgeMin,
             retry_via: 'appointment_parity_watchdog',
+            escalated: staleHoldsAppt,
           };
         }
 
-        if (stale && deferMode === 'on') {
+        // Only reached when the stuck row carries NO appointment. Here the
+        // fall-through earns its duplicate: waiting really could lose the
+        // appointment, because nothing in LP is holding it.
+        if (decision === 'fall_through_stale' && deferMode === 'on') {
           console.warn(
             `[LP-APPT] ⚠️ Inbound row ${pending.inboundId || '(unknown)'} for ${contactId} has ` +
-            `sat unissued for ${pending.ageMin}min (> ${maxAgeMin}) — falling through to enroll ` +
-            `so the appointment is not lost. This WILL create a duplicate inbound row.`
+            `sat unissued for ${pending.ageMin}min (> ${maxAgeMin}) and carries NO appointment — ` +
+            `falling through to enroll so the appointment is not lost. This WILL create a ` +
+            `duplicate inbound row.`
           );
           await sendGroupMeMessage(
             `⚠️ LP INBOUND ROW STUCK — duplicate created deliberately\n\n` +
             `👤 ${contactName || contactId}\n` +
             `🆔 in1_id ${pending.inboundId || 'unknown'} unissued for ${pending.ageMin} min\n` +
             `📅 Appt: ${incomingDateNorm} ${incomingTimeNorm || ''}\n\n` +
-            `The appointment was about to be lost, so a lead was created to carry it.\n` +
-            `→ In LP: kill the OLDER inbound row, keep the one carrying the appointment.`
+            `That row carries NO appointment, so the appointment was about to be lost and a ` +
+            `lead was created to carry it.\n` +
+            `→ In LP: kill the OLDER inbound row, keep the one carrying the appointment.`,
+            { channel: 'ops' }
           ).catch(() => {});
         }
       }
@@ -2484,6 +2567,7 @@ export {
   findUnissuedInboundRow,
   inboundDeferMode,
   inboundDeferMaxAgeMin,
+  inboundDeferDecision,
   probeLPForContact,
   fetchLatestAppointment,
   // Exported 2026-07-28 for the enrichment no-op regression lock — case 10 in
