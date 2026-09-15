@@ -24,13 +24,20 @@ import {
  */
 function fakeDb(queue = []) {
   const writes = [];
+  const queueReads = [];
   const make = (table) => {
-    const ctx = { table, op: null, payload: null, filters: [], cols: '*' };
+    const ctx = { table, op: null, payload: null, filters: [], cols: '*', limit: null };
     const chain = {
       select(cols) { if (cols) ctx.cols = cols; return chain; },
       eq(k, v) { ctx.filters.push([k, v]); return chain; },
       in(k, v) { ctx.filters.push([k, v]); return chain; },
-      order() { return chain; }, limit() { return chain; },
+      // `is` / `not` and a real `limit` exist so a test can reproduce the
+      // 2026-09-15 prefix window: a no-op limit() cannot show a backlog sitting
+      // below the rows the query actually fetched.
+      is(k, v) { ctx.filters.push([k, v, 'is']); return chain; },
+      not(k, op, v) { ctx.filters.push([k, v, `not.${op}`]); return chain; },
+      order() { return chain; },
+      limit(n) { ctx.limit = n; return chain; },
       insert(p) { ctx.op = 'insert'; ctx.payload = p; return chain; },
       update(p) { ctx.op = 'update'; ctx.payload = p; return chain; },
       maybeSingle() { return finish(true); },
@@ -40,9 +47,17 @@ function fakeDb(queue = []) {
       if (ctx.op) { writes.push({ ...ctx }); return { data: null, error: null }; }
       if (table === 'v_command_center_queue') {
         const id = (ctx.filters.find(([k]) => k === 'source_id') || [])[1];
-        const rows = (id == null ? queue : queue.filter((r) => r.source_id === id))
+        const recAt = ctx.filters.find(([k]) => k === 'rec_at');
+        queueReads.push({ filters: ctx.filters, limit: ctx.limit });
+        let rows = id == null ? queue.slice() : queue.filter((r) => r.source_id === id);
+        if (recAt) {
+          const wantNull = recAt[2] === 'is';
+          rows = rows.filter((r) => (r.rec_at == null) === wantNull);
+        }
+        rows = rows
           // eslint-disable-next-line no-unused-vars
           .map(({ rec_source_version, ...visible }) => visible);
+        if (ctx.limit != null) rows = rows.slice(0, ctx.limit);
         return { data: single ? (rows[0] ?? null) : rows, error: null };
       }
       // The source tables, where rec_source_version actually lives.
@@ -57,7 +72,7 @@ function fakeDb(queue = []) {
     };
     return chain;
   };
-  return { from: (t) => make(t), writes };
+  return { from: (t) => make(t), writes, queueReads };
 }
 
 const card = (over = {}) => ({
@@ -293,7 +308,10 @@ test('a card whose recommendation still matches its content version is left alon
     card({ source_id: 52 }),                                                                                          // never done
   ]);
   const got = await loadCandidates(db, 10);
-  assert.deepEqual(got.map((c) => c.source_id), [51, 52]);
+  // Never-recommended first, then content-moved. Since 2026-09-15 the two are
+  // separate passes, and an absent recommendation outranks a stale one when a
+  // capped run cannot do both. Within each pass the risk-first sort is intact.
+  assert.deepEqual(got.map((c) => c.source_id), [52, 51]);
 });
 
 test('the queue view does NOT carry rec_source_version — it is read from the source table', async () => {
@@ -315,6 +333,46 @@ test('the run is capped at the limit it is given', async () => {
   const db = fakeDb(Array.from({ length: 20 }, (_, i) => card({ source_id: 100 + i })));
   const got = await loadCandidates(db, 5);
   assert.equal(got.length, 5);
+});
+
+test('the backlog below the fetched window is still reachable', async () => {
+  // 2026-09-15 — the incident. loadCandidates used to fetch the first limit*4
+  // rows and filter THOSE. Once the top of the queue was fully recommended the
+  // endpoint reported an empty queue and stopped, with thousands of cards still
+  // needing one below the window. Live: 0 left in the first 600 rows, 3,045
+  // beyond it; a 150-card batch returned 2 candidates in 23 seconds.
+  //
+  // 600 recommended-and-current cards first, then 50 that were never done.
+  const done = Array.from({ length: 600 }, (_, i) => card({
+    source_id: 1000 + i, rec_at: '2026-09-10T03:00:00Z',
+    rec_source_version: 'hash-v1', card_version: 'hash-v1',
+  }));
+  const never = Array.from({ length: 50 }, (_, i) => card({ source_id: 9000 + i }));
+  const db = fakeDb([...done, ...never]);
+
+  const got = await loadCandidates(db, 150);
+  assert.equal(got.length, 50, 'every un-recommended card is reachable, wherever it sorts');
+  assert.deepEqual(got.map((c) => c.source_id), never.map((c) => c.source_id));
+});
+
+test('a full first pass never reads the queue a second time', async () => {
+  // Pass 2 is a refresh scan with a per-table version lookup behind it. When
+  // pass 1 already fills the limit there is nothing to refresh into, so paying
+  // for it would be pure waste on every batch of a long backfill.
+  const db = fakeDb(Array.from({ length: 40 }, (_, i) => card({ source_id: 200 + i })));
+  const got = await loadCandidates(db, 10);
+  assert.equal(got.length, 10);
+  assert.equal(db.queueReads.length, 1, 'only the never-recommended pass ran');
+});
+
+test('a content-moved card is still picked up when the first pass is short', async () => {
+  const db = fakeDb([
+    card({ source_id: 60, rec_at: '2026-09-10T03:00:00Z', rec_source_version: 'hash-old', card_version: 'hash-v2' }),
+    card({ source_id: 61, rec_at: '2026-09-10T03:00:00Z', rec_source_version: 'hash-v1', card_version: 'hash-v1' }),
+  ]);
+  const got = await loadCandidates(db, 10);
+  assert.deepEqual(got.map((c) => c.source_id), [60], 'moved card in, current card out');
+  assert.equal(db.queueReads.length, 2, 'the refresh pass ran because pass 1 was short');
 });
 
 // ─── the prompt ────────────────────────────────────────────────────────────
