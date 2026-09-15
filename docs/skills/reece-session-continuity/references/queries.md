@@ -135,21 +135,32 @@ SELECT json_agg(row_to_json(s)) FROM (
   FROM claude_session_logs
   WHERE link_confidence = 'unlinked'
     AND surface = 'chat'
-    AND created_at > NOW() - INTERVAL '60 days'
-  ORDER BY created_at DESC
+  ORDER BY created_at ASC
 ) s
 ```
+
+No age window, and oldest first (v4.6). A window here made the sweep blind to
+exactly the rows the nightly `unlinked_sessions_7d` check flags; the pack's
+`unlinked_sessions` count is windowless too, so all three now agree.
 
 If `claude_transcript_ledger` does not exist, 4a errors. Treat that as
 "bridge not installed": skip reconciliation, keep the context pack (Query 1).
 
-### 1b — Auto-link pass (v4.3, mandatory on the chat surface)
+### 1b — Auto-link pass (v4.6, mandatory on the chat surface)
 
-Match each row from 4b to the `recent_chats` entry whose `updated_at` is
-within 3 minutes of the session's `created_at` (nearest wins; title
-similarity breaks ties; skip and report if still ambiguous). Then, per
-match, one write — session link + ledger row together. Never downgrade an
-`exact` link.
+Match each row from 4b **by search keys first**: `conversation_search` on 2–3
+of its most distinctive `transcript_search_keys`, accepted only when the keys
+hit and the chat title is consistent with the session title. This is the only
+method that works on a sweep-written row, whose `created_at` is the write date
+rather than the conversation date.
+
+Fall back to timestamps **only** for a row written live in this project in the
+last 7 days (`date_confidence='exact'`): the `recent_chats` entry whose
+`updated_at` is within 3 minutes of the session's `created_at` (nearest wins;
+title similarity breaks ties; skip and report if still ambiguous).
+
+Then, per match, one write — session link + ledger row together. Never
+downgrade an `exact` link.
 
 ```sql
 WITH s AS (
@@ -909,20 +920,38 @@ SELECT json_agg(row_to_json(v)) FROM (
 would have rejected — review them before flipping the guard to `live`.
 
 ### Heal a sweep-written session once its chat is found (batch C2; never overwrite an exact link)
+
+**Never re-date a row that already says `date_confidence='exact'`.** The link and
+the date are two separate writes for that reason: most sweep-written sessions
+were reconstructed with a correct date from their first user message, and a
+chat's `updated_at` is its *last* activity — often weeks later. Folding the two
+together (as this statement did before v4.6) would silently move those dates.
+
 ```sql
+-- 1. link fields — always safe
 UPDATE claude_session_logs
 SET chat_url = '<url>', chat_title = '<title>', source_chat_updated_at = '<updated_at>',
-    session_date = ('<updated_at>'::timestamptz AT TIME ZONE 'America/New_York')::date,
-    date_confidence = 'exact', link_confidence = 'inferred', validation_status = 'passed',
+    link_confidence = 'inferred', validation_status = 'passed',
     validation_notes = coalesce(validation_notes, '{}'::jsonb) || jsonb_build_object('healed', now(), 'by', 'link sweep'),
     updated_at = now()
 WHERE id = <session id> AND coalesce(link_confidence, 'unlinked') <> 'exact';
 
--- C3, same statement family: the children follow the healed date
+-- 2. date fields — only when the date on file is just the write date
+UPDATE claude_session_logs
+SET session_date = ('<updated_at>'::timestamptz AT TIME ZONE 'America/New_York')::date,
+    date_confidence = 'exact', updated_at = now()
+WHERE id = <session id> AND date_confidence = 'write_date';
+
+-- 3. C3 — children follow, but only the ones still on the write date.
+-- A child appended later by a live refresh keeps its own date (sql/100 ruling:
+-- confirmed beats reconstructed), so `AND d.date_confidence = 'write_date'` is
+-- what stops this from dragging a correctly-dated decision backwards.
 UPDATE claude_decision_log d SET decision_date = s.session_date, date_confidence = 'exact'
-FROM claude_session_logs s WHERE s.id = d.session_id AND s.id = <session id> AND s.date_confidence = 'exact';
-UPDATE claude_known_issues i SET reported_date = s.session_date, date_confidence = 'exact'
-FROM claude_session_logs s WHERE s.id = i.reported_session_id AND s.id = <session id> AND s.date_confidence = 'exact';
+FROM claude_session_logs s WHERE s.id = d.session_id AND s.id = <session id>
+  AND s.date_confidence = 'exact' AND d.date_confidence = 'write_date';
+UPDATE claude_known_issues i SET reported_date = s.session_date, date_confidence = 'exact', updated_at = now()
+FROM claude_session_logs s WHERE s.id = i.reported_session_id AND s.id = <session id>
+  AND s.date_confidence = 'exact' AND i.date_confidence = 'write_date';
 
 INSERT INTO claude_transcript_ledger (chat_url, chat_title, chat_updated_at, session_id, disposition, reviewed_at, notes)
 VALUES ('<url>', '<title>', '<updated_at>', <session id>, 'linked', now(), 'link sweep YYYY-MM-DD')

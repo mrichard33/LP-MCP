@@ -43,6 +43,7 @@ import { runMemoryNightly, formatDigest, DIGEST_CONFLICTS_SQL, DIGEST_UNLINKED_S
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const sql098 = fs.readFileSync(path.join(__dirname, '..', 'sql', '098_memory_integrity.sql'), 'utf8');
 const sql100 = fs.readFileSync(path.join(__dirname, '..', 'sql', '100_provenance_inherit_narrow.sql'), 'utf8');
+const queriesRef = fs.readFileSync(path.join(__dirname, '..', 'docs', 'skills', 'reece-session-continuity', 'references', 'queries.md'), 'utf8');
 
 const NOW = new Date('2026-09-08T16:00:00Z');          // 12:00 ET, 2026-09-08
 const NO_RETRY = false;
@@ -456,6 +457,32 @@ test('every validation check is one SELECT with rows_checked / rows_flagged / sa
   for (const s of [DIGEST_CONFLICTS_SQL, DIGEST_UNLINKED_SQL, DIGEST_VALIDATION_SQL, DRAFT_CANDIDATES_SQL]) assert.match(s, /^\s*SELECT/);
 });
 
+// The v4.6 link-sweep fix. The sweep and this check used to sit on opposite
+// sides of the same 7-day line, so no sweep could ever reach a flagged row.
+test('unlinked_sessions_7d: checked counts every unlinked chat row, flagged only the overdue ones, and the sample is a usable sweep worklist', () => {
+  const c = VALIDATION_CHECKS.find((x) => x.name === 'unlinked_sessions_7d');
+  assert.ok(c, 'check missing');
+  // rows_checked must carry no age window — it is the sweep's whole population,
+  // and it has to agree with the pack's windowless unlinked_sessions count.
+  // Take the text of each count subquery by slicing back from its alias to the
+  // preceding "(SELECT" — a bracket-counting regex trips over coalesce(...).
+  const subqueryFor = (alias) => {
+    const end = c.sql.indexOf(`)::int AS ${alias}`);
+    assert.ok(end > 0, `${alias} missing`);
+    return c.sql.slice(c.sql.lastIndexOf('(SELECT', end), end);
+  };
+  const checked = subqueryFor('rows_checked');
+  assert.ok(checked.includes('chat_url IS NULL'), 'rows_checked must count unlinked rows');
+  assert.doesNotMatch(checked, /interval/, 'rows_checked must have no age window');
+  // rows_flagged is the alarm: unlinked AND past the 7-day line.
+  const flagged = subqueryFor('rows_flagged');
+  assert.match(flagged, /created_at < now\(\) - interval '7 days'/, 'rows_flagged is the overdue subset');
+  // The sample doubles as the worklist: oldest first, search keys attached,
+  // because conversation_search matches on keys and not on timestamps.
+  assert.match(c.sql, /transcript_search_keys AS search_keys/, 'sample must carry the search keys');
+  assert.match(c.sql, /ORDER BY created_at ASC/, 'most overdue first');
+});
+
 test('runMemoryValidation: dry run logs every check and repairs nothing; live syncs drifted metadata and marks orphans; log:false is SELECT-only', async () => {
   const seed = (s) => {
     if (/AS rows_flagged/.test(s)) {
@@ -661,4 +688,46 @@ test('re-running the planners gives identical output (idempotent)', () => {
   assert.equal(a, b);
   assert.equal(conflictScanSql({ kind: 'decision', threshold: 0.85 }), conflictScanSql({ kind: 'decision', threshold: 0.85 }));
   assert.deepEqual(VALIDATION_CHECKS.map((c) => c.sql), VALIDATION_CHECKS.map((c) => c.sql));
+});
+
+// The C2 heal statement is executed by hand during a link sweep, so the guard
+// has to live in the document. As written before v4.6 it set session_date from
+// the chat's updated_at for every row it healed — which would have moved ~60
+// correct, reconstructed dates to their chat's last-activity date.
+test('queries.md §6a: the C2 heal writes the link unconditionally but the date only for write_date rows', () => {
+  const heal = queriesRef.slice(queriesRef.indexOf('### Heal a sweep-written session'));
+  assert.ok(heal.length > 0, '§6a heal section missing');
+  assert.match(heal.slice(0, heal.indexOf('```sql')), /Never re-date a row that already says/, 'the warning must precede the statements');
+  // Only the code inside the fence — the prose above it also says "chat_url".
+  const open = heal.indexOf('```sql') + '```sql'.length;
+  const block = heal.slice(open, heal.indexOf('```', open));
+
+  // The date write and the link write must be separate statements.
+  const stmts = block.split(';')
+    .map((x) => x.split('\n').filter((l) => !l.trim().startsWith('--')).join('\n').trim())
+    .filter(Boolean);
+  const dateStmts = stmts.filter((x) => /session_date\s*=/.test(x));
+  assert.equal(dateStmts.length, 1, 'exactly one statement may set session_date');
+  assert.match(dateStmts[0], /date_confidence = 'write_date'/, 'the date write must be guarded by date_confidence');
+
+  const linkStmts = stmts.filter((x) => /chat_url\s*=/.test(x) && /^UPDATE claude_session_logs/.test(x));
+  assert.equal(linkStmts.length, 1, 'exactly one statement may set chat_url');
+  assert.doesNotMatch(linkStmts[0], /session_date/, 'the link write must not touch the date');
+  assert.match(linkStmts[0], /<> 'exact'/, 'never overwrite an exact link');
+
+  // C3 children follow the parent only while they are still on the write date.
+  for (const child of stmts.filter((x) => /^UPDATE claude_(decision_log|known_issues)/.test(x))) {
+    assert.match(child, /date_confidence = 'write_date'/, `child re-date must be guarded: ${child.slice(0, 60)}`);
+  }
+  assert.ok(!/DELETE/.test(block), 'the heal marks, it never deletes');
+});
+
+// The sweep in SKILL.md and the nightly check must cover the same rows.
+test('SKILL.md Mechanism 2: the sweep has no age window and matches on search keys before timestamps', () => {
+  const skill = fs.readFileSync(path.join(__dirname, '..', 'docs', 'skills', 'reece-session-continuity', 'SKILL.md'), 'utf8');
+  const mech = skill.slice(skill.indexOf('### Mechanism 2'), skill.indexOf('### Mechanism 3'));
+  assert.ok(mech.length > 0, 'Mechanism 2 missing');
+  assert.doesNotMatch(mech, /created_at > now\(\) - interval '7 days'/, 'the sweep must not re-introduce the window that made it blind');
+  assert.ok(mech.indexOf('conversation_search') < mech.indexOf('recent_chats(n=20)'), 'search keys come before timestamps');
+  assert.match(mech, /Never use this on a sweep-written row/, 'the timestamp fallback must be scoped to live rows');
 });
