@@ -495,6 +495,17 @@ test('unlinked_sessions_7d: checked counts every unlinked chat row, flagged only
   // because conversation_search matches on keys and not on timestamps.
   assert.match(c.sql, /transcript_search_keys AS search_keys/, 'sample must carry the search keys');
   assert.match(c.sql, /ORDER BY created_at ASC/, 'most overdue first');
+
+  // Mark's 2026-09-15 ruling: a row with no search keys and no reachable chat
+  // is not actionable, so it must not pin the alarm — but it is still real, so
+  // rows_checked keeps counting it. Nothing is deleted; the mark is reversible.
+  const unlinkable = /coalesce\(\(validation_notes->>'link_unlinkable'\)::boolean, false\) = false/;
+  assert.match(flagged, unlinkable, 'rows_flagged must exclude rows ruled unlinkable');
+  assert.doesNotMatch(checked, unlinkable, 'rows_checked must still count them');
+  // The sample is the sweep worklist, so it excludes them too — there is
+  // nothing a sweep could do with a row that has no keys.
+  const sample = c.sql.slice(c.sql.indexOf('AS title'));
+  assert.match(sample, unlinkable, 'the worklist sample must exclude them as well');
 });
 
 test('runMemoryValidation: dry run logs every check and repairs nothing; live syncs drifted metadata and marks orphans; log:false is SELECT-only', async () => {

@@ -210,3 +210,22 @@ Running C2 now: one chat per project (both `recent_chats` and
 `conversation_search` are project-scoped), report the batch per project before
 writing, one chat links to one session, never overwrite an `exact` link, never
 re-date a row that already says `exact`.
+
+**The 32 unlinkable sessions (Mark's ruling, 2026-09-15).** With the sweep fixed,
+the overdue backlog read 109, and it split in two: 77 rows carry
+`transcript_search_keys` and are C2's batch; 32 rows (4/15 – 8/01) were written
+before search keys existed and their chats are months beyond `recent_chats`
+reach, so no pass will ever link them. Leaving them flagged would pin the alarm
+permanently and hide a genuinely new unlinked session.
+
+They are marked, not deleted, and not moved out of `unlinked`:
+`link_confidence` stays `unlinked` (it is the truth) and the ruling goes in
+`validation_notes->>'link_unlinkable'`. `link_confidence` has a CHECK
+constraint (`exact` | `inferred` | `unlinked`), so a new value there would need
+a migration and would ripple into every query and doc reading the column;
+`validation_notes` is already the field used for marks of this kind
+(`duplicate_of`, `reason`, `ruling`). The nightly check excludes marked rows
+from `rows_flagged` and from the worklist sample, but still counts them in
+`rows_checked`. Reversible: strip the key and the row reappears in the alarm.
+The mark is about absent keys, not a permanent exemption — a row that later
+gains keys or a URL is picked up again.
