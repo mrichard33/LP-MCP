@@ -366,8 +366,12 @@ async function readGhlBook(from, to) {
  * this appointment" indistinguishable from "LP never had this appointment".
  * That is a real difference and it had a real cost — see Class E below.
  */
-async function readLpBook(from, to) {
-  const { data, error } = await supabase
+async function readLpBook(from, to, deps = {}) {
+  // deps seam per CLAUDE.md — anything reaching the database stays injectable.
+  // Added 2026-09-15 so the sentinel guard below can be tested against a
+  // BACKWARDS-WIDENED window, which is the only configuration where it fires.
+  const db = deps.supabase || supabase;
+  const { data, error } = await db
     .from('lp_leads')
     // created_at_lp rides along for the Class B grace period (v1.3). Both LP
     // clocks are needed: see lpRowAgeMinutes.
@@ -395,9 +399,43 @@ async function readLpBook(from, to) {
   };
 
   for (const row of data || []) {
+    // LP's null sentinel for "no appointment" is a pre-epoch date, not NULL:
+    // appointment_set=true with appointment_date=1900-01-01T14:00:00+00:00.
+    // 71 such rows exist (measured 2026-09-15). A sentinel is ABSENCE, so the
+    // row must never be read as an appointment LP holds.
+    //
+    // Today this is defence-in-depth and nothing more: the query's lower bound
+    // is now(), so a 1900 date cannot come back, and this guard drops zero rows
+    // on a live sweep. It is here because the bound is the ONLY thing stopping
+    // it — widen the window backwards (a "what did we miss last week" pass would)
+    // and every one of those 71 rows becomes a fabricated Class B gap against a
+    // real customer. Keep the guard at the row level so that change stays safe.
+    if (isSentinelAppointmentDate(row.appointment_date)) continue;
     keepNewest(RESOLVED_DISPOSITIONS.has(row.disposition_code) ? resolved : book, row);
   }
   return { active: book, resolved };
+}
+
+// LP writes a pre-epoch date rather than NULL when a lead has no appointment,
+// so appointment_set=true can sit against 1900-01-01. Anything before this is a
+// sentinel, never a booking — Reece has no appointment history before 2000.
+const SENTINEL_APPOINTMENT_BEFORE_MS = Date.UTC(2000, 0, 1);
+
+/**
+ * True when appointment_date is LP's "no appointment" sentinel rather than a date.
+ *
+ * Unparseable counts as a sentinel too: a date we cannot read is not evidence
+ * that LP holds an appointment, and Class B escalates a human on exactly that
+ * claim. This is the opposite posture to lpRowAgeMinutes, where an unreadable
+ * clock must NOT suppress a finding — there the unknown is the row's age and
+ * silence would hide a real gap; here the unknown is whether the appointment
+ * exists at all, and inventing one pages somebody about a customer who has none.
+ */
+function isSentinelAppointmentDate(value) {
+  if (!value) return true;
+  const ms = value instanceof Date ? value.getTime() : Date.parse(value);
+  if (!Number.isFinite(ms)) return true;
+  return ms < SENTINEL_APPOINTMENT_BEFORE_MS;
 }
 
 /**
@@ -942,6 +980,7 @@ async function maybeAlertParityGaps(summary, { dryRun, deps = {} } = {}) {
 export const __testing = {
   classifyHealResult, classifyEmit, maybeAlertParityGaps, ALERT_PREFIX,
   lpRowAgeMinutes, PARITY_GHL_MISSING_MIN_AGE_MIN,
+  isSentinelAppointmentDate, readLpBook,
 };
 
 let handle = null;
