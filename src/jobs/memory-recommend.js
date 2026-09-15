@@ -315,10 +315,19 @@ export async function recommendOne(table, id, deps = {}) {
   // The model comes from llm-client's own env contract. envPrefix('memory_recommend')
   // is MEMORY_RECOMMEND, so MEMORY_RECOMMEND_MODEL / _MODEL_ANTHROPIC / _MODEL_OPENAI
   // and _PROVIDER already select this call site without any lookup here.
+  // 2026-09-15 — THINKING-BUDGET INCIDENT. The first live backfill batch after the
+  // temperature fix lost 36 of 150 cards (24%) to one root cause: 900 output tokens.
+  // The models this call site now runs on emit a thinking block before any text, and
+  // that block is charged against max_tokens. Half the failures came back with
+  // stop_reason=max_tokens and blocks=[thinking] (no text at all); the other half were
+  // JSON cut off mid-string. Neither is a prompt problem and neither is salvageable
+  // after the fact — the answer was never finished. The verdict JSON itself is ~250
+  // tokens, so the budget has to carry the reasoning too. llm-client's own error text
+  // has said "raise maxTokens" all along.
   const res = await withTimeout(
     llm({
       fn: 'memory_recommend', system: SYSTEM_PROMPT, user: buildUserPrompt(card, ev),
-      maxTokens: 900, temperature: 0, json: true,
+      maxTokens: 3000, temperature: 0, json: true,
     }),
     getItemTimeout(env), `recommend ${table}#${id}`,
   );
