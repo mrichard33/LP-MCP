@@ -64,7 +64,7 @@
  */
 
 import { emitEvent } from './event-emitter.js';
-import { executeAddTag } from './actions/handlers/tags.js';
+import { applyTagsBatched } from './actions/handlers/tags.js';
 import { resolveEntryFromSourceMap, entryTagSuffix } from './entry-source-map.js';
 import { isSuppressed, matchedSuppressionTags } from './suppression-guard.js';
 import { withGhlToken } from './ghl-rate-limiter.js';
@@ -235,6 +235,10 @@ async function fetchContactRaw(contactId) {
   if (!GHL_API_KEY) {
     throw new Error('GHL_API_KEY env var not configured');
   }
+  // 2026-09-15 — maxWaitMs caps the rate-limiter QUEUE wait (the 10s
+  // AbortSignal below caps the HTTP call, a different thing). Without it a
+  // starved bucket adds up to 30s to this single read before GHL is even
+  // dialled. acquireToken clamps to [250, 30000], so this can only shorten.
   const res = await withGhlToken(() => fetch(`https://services.leadconnectorhq.com/contacts/${contactId}`, {
     headers: {
       'Authorization': `Bearer ${GHL_API_KEY}`,
@@ -242,7 +246,7 @@ async function fetchContactRaw(contactId) {
       'Accept': 'application/json',
     },
     signal: AbortSignal.timeout(10000),
-  }));
+  }), { maxWaitMs: 5000 });
   if (!res.ok) {
     const text = await res.text().catch(() => '');
     throw new Error(`GHL GET /contacts/${contactId} returned ${res.status}: ${text.slice(0, 200)}`);
@@ -463,45 +467,35 @@ async function handleEnsureRoutingTags(req, res) {
   }
   const sourceTag = ROUTING_TAG_MAP[inferred.source]?.source_tag || null;
 
-  // 4. Write the governance tags via the executor.
-  //    executeAddTag enforces:
-  //      - entry:* immutability (no-op if any entry:* exists)
-  //      - active-entry:* + source:* exclusivity (swap on conflict)
+  // 4. Write the governance tags in ONE batched call.
+  //
+  // 2026-09-15 (GHL token starvation) — this used to be four sequential
+  // executeAddTag calls, each doing its own GET plus a write: 7-11 GHL calls
+  // per request, every one queueing separately against an empty token bucket.
+  // That is where the route's 62-63s went. applyTagsBatched issues at most one
+  // DELETE and one POST, and takes the tags we ALREADY read above so it does
+  // no read of its own — 7-11 calls become 1-2 after the fetch.
+  //
+  // The namespace rules are unchanged: applyTagsBatched decides every tag
+  // through the same decideTagWrite the executor uses, so entry:* immutability
+  // and active-entry:/source:/intent-bucket: exclusivity still hold.
+  const plannedSteps = [
+    { step: 'add_entry', tag: `entry:${inferred.source}` },
+    { step: 'add_active_entry', tag: `active-entry:${inferred.source}` },
+    // NEW reporting tag — only present on map-driven matches.
+    ...(inferred.bucket ? [{ step: 'add_intent_bucket', tag: `intent-bucket:${inferred.bucket}` }] : []),
+    ...(sourceTag ? [{ step: 'add_source', tag: `source:${sourceTag}` }] : []),
+  ];
   const stepResults = [];
   try {
-    stepResults.push({
-      step: 'add_entry',
-      result: await executeAddTag({
-        target_id: contactId,
-        action_payload: { tag: `entry:${inferred.source}` },
-      }),
+    const batchResults = await applyTagsBatched(
+      contactId,
+      plannedSteps.map((p) => p.tag),
+      { currentTags: tags, maxWaitMs: 5000 },
+    );
+    plannedSteps.forEach((p, i) => {
+      stepResults.push({ step: p.step, result: batchResults[i] });
     });
-    stepResults.push({
-      step: 'add_active_entry',
-      result: await executeAddTag({
-        target_id: contactId,
-        action_payload: { tag: `active-entry:${inferred.source}` },
-      }),
-    });
-    // NEW reporting tag — only present on map-driven matches.
-    if (inferred.bucket) {
-      stepResults.push({
-        step: 'add_intent_bucket',
-        result: await executeAddTag({
-          target_id: contactId,
-          action_payload: { tag: `intent-bucket:${inferred.bucket}` },
-        }),
-      });
-    }
-    if (sourceTag) {
-      stepResults.push({
-        step: 'add_source',
-        result: await executeAddTag({
-          target_id: contactId,
-          action_payload: { tag: `source:${sourceTag}` },
-        }),
-      });
-    }
   } catch (err) {
     console.error(`[EnsureRoutingTags] tag write failed for ${contactId}: ${err.message}`);
     return res.status(502).json({

@@ -23,26 +23,48 @@
  * a result object rather than throwing. If a worker does throw, the rejection
  * propagates out of the returned promise.
  *
+ * 2026-09-15 — `shouldStop` makes the pool deadline-aware. It is checked
+ * BEFORE a runner claims its next item, never mid-item: an action already
+ * executing always runs to completion, so this can never interrupt a GHL or LP
+ * write halfway. Items never claimed are handed to `onNotStarted` so the caller
+ * can put them back where it got them — see executeActions, which releases them
+ * to 'pending' rather than letting them sit in 'executing' for the reaper (the
+ * reaper DROPS non-idempotent types, so stranding them loses work).
+ *
+ * The return value stays a plain results-by-index array: callers deep-equal it.
+ *
  * @template T, R
  * @param {T[]} items
  * @param {number} concurrency
  * @param {(item: T, idx: number) => Promise<R>} worker
+ * @param {object} [opts]
+ * @param {() => boolean} [opts.shouldStop]     stop claiming new items once true
+ * @param {(notStarted: T[]) => void} [opts.onNotStarted]  called once, only when
+ *        `shouldStop` fired, with the items never dispatched
  * @returns {Promise<R[]>}
  */
-export async function runPool(items, concurrency, worker) {
+export async function runPool(items, concurrency, worker, opts = {}) {
   const list = items || [];
   const results = new Array(list.length);
   if (list.length === 0) return results;
 
+  const shouldStop = typeof opts.shouldStop === 'function' ? opts.shouldStop : null;
   let next = 0;
+  let stopped = false;
   const workers = Math.max(1, Math.min(concurrency || 1, list.length));
   const runners = Array.from({ length: workers }, async () => {
     while (next < list.length) {
+      if (shouldStop && shouldStop()) { stopped = true; return; }
       const idx = next++;
       results[idx] = await worker(list[idx], idx);
     }
   });
   await Promise.all(runners);
+  // `next` is the high-water mark of claimed indices; everything from it on was
+  // never handed to a worker.
+  if (stopped && typeof opts.onNotStarted === 'function') {
+    opts.onNotStarted(list.slice(next));
+  }
   return results;
 }
 

@@ -491,6 +491,12 @@ export function getRateLimiterStats() {
   return {
     tokens,
     capacity: BUCKET_CAPACITY,
+    // 2026-09-15 — capacity was reported, refill was not, so the one number
+    // that governs SUSTAINED throughput could only be read from the Railway
+    // dashboard. That is how capacity got ramped to 120 while refill stayed
+    // two digits and nobody spotted the mismatch for weeks. Report both.
+    refillPerMin: REFILL_RATE,
+    refillIntervalMs: REFILL_INTERVAL_MS,
     paused: isPaused(),
     pauseRemainingMs: paused ? Math.max(0, pauseUntil - Date.now()) : 0,
     queueDepth: waitQueue.length,

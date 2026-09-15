@@ -298,7 +298,7 @@ import supabase from './supabase.js';
 // v2.14 — synchronous agentic-active ownership stamp on first SMS inbound.
 import { applyGHLTag } from './ghl.js';
 import { resolveEntryFromSourceMap, entryTagSuffix } from './entry-source-map.js';
-import { executeAddTag } from './actions/handlers/tags.js';
+import { applyTagsBatched } from './actions/handlers/tags.js';
 import { syncCancelledAppointmentState } from './actions/handlers/appointment-field-sync.js';
 import { checkDispositionStalenessOnBooking } from './services/disposition-staleness-guard.js';
 // 2026-07-03 — hard message-level dedup (Steve Nkzhm incident): every inbound
@@ -1527,11 +1527,22 @@ async function handleContactCreated(req, res) {
       const resolved = await resolveEntryFromSourceMap(resolverContact);
       const suffix = entryTagSuffix(resolved?.entryTag);
       if (suffix) {
-        await executeAddTag({ target_id: contactId, action_payload: { tag: `entry:${suffix}` } });
-        await executeAddTag({ target_id: contactId, action_payload: { tag: `active-entry:${suffix}` } });
-        if (resolved.bucket) {
-          await executeAddTag({ target_id: contactId, action_payload: { tag: `intent-bucket:${resolved.bucket}` } });
-        }
+        // 2026-09-15 (GHL token starvation) — one batched write instead of
+        // three sequential executeAddTag calls, each of which re-read the
+        // contact: 6-9 GHL calls become 1-2. Same namespace rules either way
+        // (applyTagsBatched routes every tag through decideTagWrite).
+        //
+        // currentTags is passed ONLY when the GHL read actually succeeded.
+        // In the webhook-body fallback branch `tags` is whatever the payload
+        // carried, which may be stale or partial — handing that over as the
+        // contact's true tag set would let a stale array defeat an exclusivity
+        // or immutability check. Omitting it makes applyTagsBatched do its own
+        // read, which is what the three separate calls did before.
+        await applyTagsBatched(
+          contactId,
+          [`entry:${suffix}`, `active-entry:${suffix}`, resolved.bucket ? `intent-bucket:${resolved.bucket}` : null],
+          { ...(ghlContact ? { currentTags: tags } : {}), maxWaitMs: 5000 },
+        );
         resolvedSubtype = 'map-resolved';
         console.log(`[BehavioralEmitter] map-resolved ${contactId}: "${entrySource}" → entry:${suffix} (bucket:${resolved.bucket}, signal source-map:${resolved.matchedOn})`);
       } else {

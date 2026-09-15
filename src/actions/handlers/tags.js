@@ -193,59 +193,70 @@ export function exclusiveSetSiblings(tag) {
   return set ? set.filter((t) => t !== tag) : [];
 }
 
-export async function executeAddTag(action, context = {}) {
-  const contactId = action.target_id;
-  const tag = normalizeTag(action.action_payload?.tag);
-  if (!contactId || !tag) throw new Error('Missing contactId or tag');
+/**
+ * Decide what one add_tag write should do, given the contact's current tags.
+ * PURE — no I/O, no logging. The caller owns both.
+ *
+ * 2026-09-15 (GHL token starvation) — extracted verbatim out of executeAddTag
+ * so the single-tag executor and the batched writer (applyTagsBatched) share
+ * ONE copy of the namespace rules. The alternative was a second copy, which is
+ * exactly how entry:* immutability ends up enforced on one path and silently
+ * not on the other.
+ *
+ * THE ORDER OF THE FOUR BLOCKS IS LOAD-BEARING. The fallback guard must run
+ * before exclusivity, or a fallback value issues the DELETE it would need to
+ * displace a specific sibling before discovering it must not.
+ *
+ * @param {string[]|null} currentTags  the contact's tags. NULL means the read
+ *   FAILED — every namespace decision is skipped and the tag is blind-added.
+ *   That is the historical behavior and must not change: a failed read is not
+ *   evidence that a namespace is empty. The 15-min audit sweep catches
+ *   stragglers.
+ * @param {string} tag  already normalized by the caller (normalizeTag)
+ * @param {string} contactId  only used to build the result objects
+ * @returns {{verdict: 'rejected'|'no_op'|'write', result?: object,
+ *            remove?: string[], alreadyPresent?: boolean, namespace?: string|null}}
+ */
+/**
+ * The rejection result for a malformed tag, or null when the tag is fine.
+ * PURE. Split out so it can be checked BEFORE a contact read — a tag ending in
+ * ':' must cost zero GHL calls (scripts/test-bj-stage-tag-hygiene.js).
+ */
+export function rejectedTagResult(tag, contactId) {
+  if (!String(tag).trim().endsWith(':')) return null;
+  return {
+    action: 'tag_construction_rejected',
+    skipped: true,
+    reason: `tag "${tag}" ends in ':' — empty namespace value`,
+    contact_id: contactId,
+    tag,
+  };
+}
 
-  // 2026-07-03 — tag hygiene: a tag ending in ':' is a namespace with an
-  // empty value (a template variable that failed to interpolate, e.g. the
-  // bare "concern-expressed:" on the Steve Nkzhm record). Never write it.
-  if (String(tag).trim().endsWith(':')) {
-    console.warn(`[ActionExecutor] tag.construction_rejected: "${tag}" for ${contactId} — empty namespace value (rule: ${action.rule_applied || 'manual'})`);
-    return {
-      action: 'tag_construction_rejected',
-      skipped: true,
-      reason: `tag "${tag}" ends in ':' — empty namespace value`,
-      contact_id: contactId,
-      tag,
-    };
-  }
+export function decideTagWrite(currentTags, tag, contactId) {
+  const rejected = rejectedTagResult(tag, contactId);
+  if (rejected) return { verdict: 'rejected', result: rejected };
 
-  const cache = context?._contactCache;
   const immutableNamespace = NAMESPACE_IMMUTABLE_PREFIXES.find((p) => tag.startsWith(p));
   const namespace = NAMESPACE_EXCLUSIVE_PREFIXES.find((p) => tag.startsWith(p));
-
-  // One best-effort read serves the immutability, exclusivity AND
-  // already-present checks (previously up to two separate GETs). Routed
-  // through the per-batch cache so sibling actions reuse it. A read failure
-  // logs but does NOT block the add — currentTags stays null and we fall
-  // back to the historical blind-add behavior. The 15-min audit sweep
-  // catches any straggler that slips through.
-  let currentTags = null; // null = read unknown → blind add, skip namespace logic
-  try {
-    const contact = await getContactCached(contactId, cache);
-    currentTags = contact?.tags || [];
-  } catch (err) {
-    console.error(`[executeAddTag] contact read failed for ${contactId}: ${err.message} — proceeding with add`);
-  }
 
   // MVI v2.6 — IMMUTABILITY: first-touch attribution wins. If the contact
   // already has any tag in this immutable namespace, drop the add.
   if (immutableNamespace && currentTags) {
     const existingInNamespace = currentTags.filter((t) => t.startsWith(immutableNamespace));
     if (existingInNamespace.length > 0) {
-      console.log(
-        `[ActionExecutor] immutable namespace: contact=${contactId} ns=${immutableNamespace} existing=[${existingInNamespace.join(',')}] — skipping add of ${tag}`
-      );
       return {
-        action: 'no_op',
-        contact_id: contactId,
-        tag_skipped: tag,
+        verdict: 'no_op',
         namespace: immutableNamespace,
-        immutable: true,
-        existing_in_namespace: existingInNamespace,
-        reason: 'immutable namespace already populated',
+        result: {
+          action: 'no_op',
+          contact_id: contactId,
+          tag_skipped: tag,
+          namespace: immutableNamespace,
+          immutable: true,
+          existing_in_namespace: existingInNamespace,
+          reason: 'immutable namespace already populated',
+        },
       };
     }
   }
@@ -259,17 +270,18 @@ export async function executeAddTag(action, context = {}) {
       (t) => t.startsWith(namespace) && t !== tag,
     );
     if (specificSiblings.length > 0) {
-      console.log(
-        `[ActionExecutor] fallback guard: contact=${contactId} ns=${namespace} keeping=[${specificSiblings.join(',')}] — skipping add of fallback ${tag} (rule: ${action.rule_applied || 'manual'})`
-      );
       return {
-        action: 'no_op',
-        contact_id: contactId,
-        tag_skipped: tag,
+        verdict: 'no_op',
         namespace,
-        fallback_blocked: true,
-        existing_in_namespace: specificSiblings,
-        reason: 'fallback value would displace a specific tag in the same namespace',
+        result: {
+          action: 'no_op',
+          contact_id: contactId,
+          tag_skipped: tag,
+          namespace,
+          fallback_blocked: true,
+          existing_in_namespace: specificSiblings,
+          reason: 'fallback value would displace a specific tag in the same namespace',
+        },
       };
     }
   }
@@ -297,12 +309,73 @@ export async function executeAddTag(action, context = {}) {
   const alreadyPresent = currentTags ? currentTags.includes(tag) : false;
   if (alreadyPresent && removedConflicting.length === 0) {
     return {
-      action: 'no_op',
-      contact_id: contactId,
-      tag_skipped: tag,
-      reason: 'tag already present',
+      verdict: 'no_op',
+      namespace: namespace || null,
+      result: {
+        action: 'no_op',
+        contact_id: contactId,
+        tag_skipped: tag,
+        reason: 'tag already present',
+      },
     };
   }
+
+  return {
+    verdict: 'write',
+    remove: removedConflicting,
+    alreadyPresent,
+    namespace: namespace || null,
+  };
+}
+
+export async function executeAddTag(action, context = {}) {
+  const contactId = action.target_id;
+  const tag = normalizeTag(action.action_payload?.tag);
+  if (!contactId || !tag) throw new Error('Missing contactId or tag');
+
+  // 2026-07-03 — tag hygiene: a tag ending in ':' is a namespace with an empty
+  // value (a template variable that failed to interpolate, e.g. the bare
+  // "concern-expressed:" on the Steve Nkzhm record). Rejected BEFORE the read:
+  // a malformed tag must cost zero GHL calls, not one.
+  const rejected = rejectedTagResult(tag, contactId);
+  if (rejected) {
+    console.warn(`[ActionExecutor] tag.construction_rejected: "${tag}" for ${contactId} — empty namespace value (rule: ${action.rule_applied || 'manual'})`);
+    return rejected;
+  }
+
+  const cache = context?._contactCache;
+
+  // One best-effort read serves the immutability, exclusivity AND
+  // already-present checks (previously up to two separate GETs). Routed
+  // through the per-batch cache so sibling actions reuse it. A read failure
+  // logs but does NOT block the add — currentTags stays null and we fall
+  // back to the historical blind-add behavior. The 15-min audit sweep
+  // catches any straggler that slips through.
+  let currentTags = null; // null = read unknown → blind add, skip namespace logic
+  try {
+    const contact = await getContactCached(contactId, cache);
+    currentTags = contact?.tags || [];
+  } catch (err) {
+    console.error(`[executeAddTag] contact read failed for ${contactId}: ${err.message} — proceeding with add`);
+  }
+
+  const decision = decideTagWrite(currentTags, tag, contactId);
+
+  if (decision.verdict === 'no_op') {
+    if (decision.result.immutable) {
+      console.log(
+        `[ActionExecutor] immutable namespace: contact=${contactId} ns=${decision.namespace} existing=[${decision.result.existing_in_namespace.join(',')}] — skipping add of ${tag}`
+      );
+    } else if (decision.result.fallback_blocked) {
+      console.log(
+        `[ActionExecutor] fallback guard: contact=${contactId} ns=${decision.namespace} keeping=[${decision.result.existing_in_namespace.join(',')}] — skipping add of fallback ${tag} (rule: ${action.rule_applied || 'manual'})`
+      );
+    }
+    return decision.result;
+  }
+
+  const { alreadyPresent, namespace } = decision;
+  let removedConflicting = decision.remove;
 
   // Enforce exclusivity (same-namespace DELETE only). Best-effort: a DELETE
   // failure logs but does not block the add (matches prior behavior).
@@ -339,6 +412,150 @@ export async function executeAddTag(action, context = {}) {
     contact_id: contactId,
     ...(namespace ? { namespace, removed_conflicting: removedConflicting } : {}),
   };
+}
+
+/**
+ * Apply several tags to one contact in ONE pair of GHL calls.
+ *
+ * 2026-09-15 — GHL token starvation. POST /webhook/ghl/ensure-routing-tags was
+ * costing 7-11 GHL calls per request: one contact read, then four sequential
+ * executeAddTag calls, each of which did its OWN read plus a write. With the
+ * bucket empty (tokens=0, queueDepth 5-23, total429s=0 — self-inflicted, GHL
+ * never pushed back) every one of those calls waited its own turn, and the
+ * route took 62-63s. The rate limiter's own v1.4 header names this shape:
+ * "6-10 sequential calls is 60s."
+ *
+ * The fix is available only because of the TAG-WRITE CONTRACT above: GHL tag
+ * writes are ADDITIVE, so one POST carrying four tags is exactly equivalent to
+ * four POSTs carrying one each. There is no read-modify-write here and no PUT.
+ *
+ * Cost: 1 read (0 when the caller supplies currentTags) + at most 1 DELETE +
+ * at most 1 POST, versus 2-3 per tag before.
+ *
+ * Every namespace rule still comes from decideTagWrite — the single copy — so
+ * entry:* immutability, active-entry:/source:/intent-bucket: exclusivity and
+ * the v2.8 fallback guard behave exactly as on the single-tag path.
+ *
+ * @param {string} contactId
+ * @param {Array<string|null|undefined>} tags  falsy entries are skipped, so a
+ *        caller can pass a conditional tag inline without building the array
+ * @param {object} [opts]
+ * @param {string[]|null} [opts.currentTags]  the contact's tags if the caller
+ *        already read them. Omit to have this function do one read. NULL is
+ *        meaningful and distinct from omitted: it means "the read failed" and
+ *        forces the blind-add path, matching executeAddTag.
+ * @param {number} [opts.maxWaitMs]  rate-limiter wait cap for the read
+ * @param {Map} [opts.cache]  per-batch contact cache, when one exists
+ * @returns {Promise<object[]>} one result per input tag, in input order, each
+ *        in the same shape executeAddTag returns (callers put these straight
+ *        into step_results)
+ */
+export async function applyTagsBatched(contactId, tags, opts = {}) {
+  if (!contactId) throw new Error('Missing contactId');
+  const wanted = (tags || []).filter(Boolean).map((t) => normalizeTag(t));
+  if (wanted.length === 0) return [];
+
+  const cache = opts.cache;
+  let currentTags;
+  if ('currentTags' in opts) {
+    // NULL is deliberate: the caller read and failed. Blind-add, as above.
+    currentTags = opts.currentTags === null ? null : [...(opts.currentTags || [])];
+  } else {
+    currentTags = null;
+    try {
+      const contact = await getContactCached(contactId, cache, { maxWaitMs: opts.maxWaitMs });
+      currentTags = contact?.tags || [];
+    } catch (err) {
+      console.error(`[applyTagsBatched] contact read failed for ${contactId}: ${err.message} — proceeding with add`);
+    }
+  }
+
+  // Decide every tag against a WORKING COPY that advances as we go. Two tags in
+  // the same namespace therefore resolve exactly as they would if issued one
+  // after the other — the batching must not change which one wins.
+  const results = new Array(wanted.length);
+  const pending = [];   // { tag, idx, remove, alreadyPresent, namespace }
+  const toAdd = [];
+  const toRemove = [];
+
+  for (let i = 0; i < wanted.length; i++) {
+    const tag = wanted[i];
+    const decision = decideTagWrite(currentTags, tag, contactId);
+
+    if (decision.verdict === 'rejected') {
+      console.warn(`[applyTagsBatched] tag.construction_rejected: "${tag}" for ${contactId} — empty namespace value`);
+      results[i] = decision.result;
+      continue;
+    }
+    if (decision.verdict === 'no_op') {
+      if (decision.result.immutable) {
+        console.log(
+          `[applyTagsBatched] immutable namespace: contact=${contactId} ns=${decision.namespace} existing=[${decision.result.existing_in_namespace.join(',')}] — skipping add of ${tag}`
+        );
+      } else if (decision.result.fallback_blocked) {
+        console.log(
+          `[applyTagsBatched] fallback guard: contact=${contactId} ns=${decision.namespace} keeping=[${decision.result.existing_in_namespace.join(',')}] — skipping add of fallback ${tag}`
+        );
+      }
+      results[i] = decision.result;
+      continue;
+    }
+
+    pending.push({ tag, idx: i, remove: decision.remove, alreadyPresent: decision.alreadyPresent, namespace: decision.namespace });
+    for (const t of decision.remove) if (!toRemove.includes(t)) toRemove.push(t);
+    if (!decision.alreadyPresent && !toAdd.includes(tag)) toAdd.push(tag);
+
+    // Advance the working copy so the next tag sees this one's effect.
+    if (currentTags) {
+      currentTags = currentTags.filter((t) => !decision.remove.includes(t));
+      if (!currentTags.includes(tag)) currentTags.push(tag);
+    }
+  }
+
+  if (pending.length === 0) return results;
+
+  // ONE exclusivity DELETE for every namespace at once. Best-effort, matching
+  // executeAddTag: a failure logs and the adds still go through, but the
+  // per-tag removed_conflicting is cleared so the snapshot stays honest about
+  // what was actually removed.
+  let removedOk = toRemove.length > 0;
+  if (toRemove.length > 0) {
+    try {
+      await ghlFetch('DELETE', `/contacts/${contactId}/tags`, { tags: toRemove }, { maxWaitMs: opts.maxWaitMs });
+      console.log(
+        `[applyTagsBatched] exclusivity enforced: contact=${contactId} removed=[${toRemove.join(',')}] adding=[${toAdd.join(',')}]`
+      );
+    } catch (err) {
+      console.error(`[applyTagsBatched] exclusivity DELETE failed for ${contactId}: ${err.message} — proceeding with add`);
+      removedOk = false;
+    }
+  }
+
+  // ONE additive POST — never PUT.
+  if (toAdd.length > 0) {
+    await ghlFetch('POST', `/contacts/${contactId}/tags`, { tags: toAdd }, { maxWaitMs: opts.maxWaitMs });
+  }
+
+  if (cache && currentTags) setCachedContactTags(contactId, cache, currentTags);
+
+  // ONE snapshot write-through for the whole batch (the RPC already unions add
+  // and subtracts remove server-side, so there is nothing to serialize here).
+  const appliedRemoves = removedOk ? toRemove : [];
+  await applyTagsToSnapshot(contactId, {
+    add: pending.map((p) => p.tag),
+    remove: appliedRemoves,
+  });
+
+  for (const p of pending) {
+    results[p.idx] = {
+      tag_applied: p.tag,
+      contact_id: contactId,
+      ...(p.namespace
+        ? { namespace: p.namespace, removed_conflicting: removedOk ? p.remove : [] }
+        : {}),
+    };
+  }
+  return results;
 }
 
 export async function executeRemoveTag(action, context = {}) {

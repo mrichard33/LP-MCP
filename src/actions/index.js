@@ -1152,6 +1152,46 @@ async function claimActions(n) {
 }
 
 /**
+ * Put rows we CLAIMED but never started back to 'pending'.
+ *
+ * 2026-09-15 — when the run budget expires mid-chunk, some batches are already
+ * flipped to 'executing' but have not been touched. Leaving them for the
+ * 10-minute reaper is not safe: reaper.js classes create_task, create_lp_lead
+ * and lp_callback_requeue as NON_IDEMPOTENT and DROPS them on stall rather than
+ * retrying, so a stranded LP lead would be silently lost ten minutes later.
+ *
+ * These rows were never executed, so releasing them is exact rather than a
+ * recovery guess — and deliberately does NOT touch retry_count: nothing was
+ * attempted, so nothing was retried. They get picked up on the next 60s run.
+ *
+ * Fail-soft: a release failure logs and leaves the row in 'executing', which is
+ * exactly the pre-existing reaper path — never worse than before.
+ */
+export async function releaseClaimedActions(actions, deps = {}) {
+  // deps seam (CLAUDE.md: anything reaching the database goes through one) so
+  // scripts/test-executor-budget.js can assert the write without a live DB.
+  const _supabase = deps.supabase || supabase;
+  const ids = (actions || []).map((a) => a.id).filter((id) => id != null);
+  if (ids.length === 0) return 0;
+  try {
+    const { error } = await _supabase
+      .from('agent_actions')
+      .update({ status: 'pending', updated_at: new Date().toISOString() })
+      .in('id', ids)
+      .eq('status', 'executing');
+    if (error) {
+      console.error(`[ActionExecutor] budget release failed for ${ids.length} action(s): ${error.message} — reaper will pick them up`);
+      return 0;
+    }
+    console.log(`[ActionExecutor] budget reached — released ${ids.length} unstarted action(s) back to pending`);
+    return ids.length;
+  } catch (err) {
+    console.error(`[ActionExecutor] budget release threw: ${err.message} — reaper will pick them up`);
+    return 0;
+  }
+}
+
+/**
  * Run one batch's actions serially in sequence_order. Preserves the original
  * semantics: a hard `failed` stops the batch; `rejected_by_validation` does
  * NOT (a single invariant violation shouldn't kill unrelated routing).
@@ -1202,9 +1242,17 @@ export async function executeActions({ limit } = {}) {
     const results = [];
     let completed = 0, failed = 0, rejectedByValidation = 0, skipped = 0;
     let claimedTotal = 0, chunks = 0, budgetExhausted = false, usedLegacyPath = false;
+    // 2026-09-15 — the budget used to be checked ONLY here, at the top of the
+    // claim loop, so a chunk that started under budget could run straight past
+    // it: 64,552ms observed against a 50,000ms budget. That overrun pushes the
+    // executor past the 60s scheduler cadence and starves the decision engine
+    // ("[DecisionEngineHeartbeat] FAILOVER — 57s stale"). The deadline below is
+    // also enforced INSIDE the pool, between batches.
+    const deadline = startTime + EXECUTOR_RUN_BUDGET_MS;
+    let released = 0;
 
     while (claimedTotal < totalLimit) {
-      if (Date.now() - startTime >= EXECUTOR_RUN_BUDGET_MS) { budgetExhausted = true; break; }
+      if (Date.now() >= deadline) { budgetExhausted = true; break; }
 
       const want = Math.min(EXECUTOR_CLAIM_CHUNK, totalLimit - claimedTotal);
       const { rows, claimed } = await claimActions(want);
@@ -1214,8 +1262,21 @@ export async function executeActions({ limit } = {}) {
       chunks++;
 
       const batches = groupByBatch(rows);
-      const batchResults = await runPool(batches, EXECUTOR_CONCURRENCY, runBatch);
+      // Batches already in flight always finish; only UNSTARTED ones are held
+      // back, and those go straight back to 'pending' (see
+      // releaseClaimedActions) rather than being stranded in 'executing'.
+      const unstarted = [];
+      const batchResults = await runPool(batches, EXECUTOR_CONCURRENCY, runBatch, {
+        shouldStop: () => Date.now() >= deadline,
+        onNotStarted: (pendingBatches) => {
+          budgetExhausted = true;
+          for (const b of pendingBatches) unstarted.push(...b);
+        },
+      });
       for (const br of batchResults) {
+        // A batch the budget held back leaves a hole in the results array —
+        // there is nothing to tally for work that never ran.
+        if (!br) continue;
         for (const r of br) {
           results.push(r);
           if (r.status === 'completed') completed++;
@@ -1223,6 +1284,13 @@ export async function executeActions({ limit } = {}) {
           else if (r.status === 'skipped') skipped++;
           else if (r.status === 'rejected_by_validation') rejectedByValidation++;
         }
+      }
+
+      if (unstarted.length > 0) {
+        // Legacy-select rows were never claimed, so there is nothing to release.
+        if (claimed) released += await releaseClaimedActions(unstarted);
+        claimedTotal -= unstarted.length;
+        break;
       }
 
       // Legacy fallback returns rows still in 'pending' (no lock); looping would
@@ -1235,7 +1303,7 @@ export async function executeActions({ limit } = {}) {
       `[ActionExecutor] Done: ${completed} completed, ${failed} failed, ${skipped} skipped, ` +
       `${rejectedByValidation} rejected_by_validation across ${chunks} chunk(s), ` +
       `${claimedTotal} claimed (concurrency=${EXECUTOR_CONCURRENCY})` +
-      `${budgetExhausted ? ' [budget exhausted]' : ''}${usedLegacyPath ? ' [legacy-select fallback]' : ''} (${elapsed}ms)`
+      `${budgetExhausted ? ' [budget exhausted]' : ''}${released ? ` [${released} released]` : ''}${usedLegacyPath ? ' [legacy-select fallback]' : ''} (${elapsed}ms)`
     );
 
     return {
@@ -1253,6 +1321,7 @@ export async function executeActions({ limit } = {}) {
       claimed_total: claimedTotal,
       chunks,
       budget_exhausted: budgetExhausted,
+      released_unstarted: released,
       concurrency: EXECUTOR_CONCURRENCY,
       used_legacy_path: usedLegacyPath || undefined,
       results,
