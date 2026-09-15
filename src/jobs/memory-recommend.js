@@ -398,39 +398,71 @@ async function loadRecVersions(db, rows) {
   return out;
 }
 
-/**
- * Candidates: Rulings-lane cards with no recommendation, or whose CONTENT has
- * changed since the last one (rec_source_version no longer matches
- * claude_card_version). Ordered by the queue's own risk-first sort, so a capped
- * run does the items that matter most.
- */
-export async function loadCandidates(db, limit) {
-  const res = await db.from('v_command_center_queue').select('*')
+/** The queue's own risk-first sort. Applied identically to both candidate passes. */
+function orderByRisk(q) {
+  return q
     .order('sort_conflict', { ascending: true })
     .order('sort_risk', { ascending: true })
     .order('sort_blocks', { ascending: true })
     .order('area_rank', { ascending: true })
     .order('area', { ascending: true })
-    .order('created_at', { ascending: true })
-    .limit(Math.max(limit * 4, limit));
-  if (res.error) throw new Error(`v_command_center_queue: ${res.error.message}`);
-  const rows = res.data || [];
+    .order('created_at', { ascending: true });
+}
+
+/**
+ * Candidates: cards with no recommendation, or whose CONTENT has changed since
+ * the last one (rec_source_version no longer matches claude_card_version).
+ * Ordered by the queue's own risk-first sort, so a capped run does the items
+ * that matter most.
+ *
+ * 2026-09-15 — UNREACHABLE-BACKLOG INCIDENT. This used to be one query: fetch
+ * the first `limit * 4` rows of the view and filter THOSE in JavaScript. That
+ * window is a fixed prefix. Once the top 600 rows were all recommended the
+ * endpoint reported an empty queue and stopped — with 3,045 cards still needing
+ * one, sitting below the window where nothing ever looked. A 150-card batch
+ * came back in 23 seconds having found 2. Same shape as the Omi cursor defect:
+ * a prefix that stops finding work and reports success.
+ *
+ * So the never-recommended case is now filtered SERVER-side, where the whole
+ * view is in scope rather than its first page.
+ */
+export async function loadCandidates(db, limit) {
+  // Pass 1 — never recommended. `rec_at IS NULL` means "needs one" by
+  // definition, so these rows skip loadRecVersions entirely: correct, and one
+  // round-trip per source table cheaper.
+  const fresh = await orderByRisk(
+    db.from('v_command_center_queue').select('*').is('rec_at', null),
+  ).limit(limit);
+  if (fresh.error) throw new Error(`v_command_center_queue: ${fresh.error.message}`);
+  const out = (fresh.data || []).slice(0, limit);
+  if (out.length >= limit) return out;
+
+  // Pass 2 — already recommended, but the card's CONTENT may have moved. This
+  // still reads a window, which is fine: it is a refresh, not the backlog, and
+  // `.not(rec_at is null)` spends the window only on rows that could be stale.
+  //
+  // It cannot be merged into pass 1. PostgREST cannot express
+  // `rec_at IS NULL OR rec_source_version <> card_version`, because
+  // rec_source_version is deliberately not on the view — see loadRecVersions.
+  const seenRes = await orderByRisk(
+    db.from('v_command_center_queue').select('*').not('rec_at', 'is', null),
+  ).limit(Math.max(limit * 4, limit));
+  if (seenRes.error) throw new Error(`v_command_center_queue: ${seenRes.error.message}`);
+  const rows = seenRes.data || [];
   const recVersions = await loadRecVersions(db, rows);
 
-  const stale = [];
   for (const r of rows) {
-    // rec_at null = never recommended. Otherwise the recommendation is stale
-    // only when the card's CONTENT hash moved — rec_* writes never trigger it.
-    // A card whose version could not be read falls through as stale: doing the
-    // work twice is cheap, silently never refreshing a moved card is not.
+    // The recommendation is stale only when the card's CONTENT hash moved —
+    // rec_* writes never trigger it. A card whose version could not be read
+    // falls through as stale: doing the work twice is cheap, silently never
+    // refreshing a moved card is not.
     const seen = recVersions.has(`${r.source_table}:${r.source_id}`)
       ? recVersions.get(`${r.source_table}:${r.source_id}`)
       : undefined;
-    const needs = r.rec_at == null || seen !== (r.card_version ?? null);
-    if (needs) stale.push(r);
-    if (stale.length >= limit) break;
+    if (seen !== (r.card_version ?? null)) out.push(r);
+    if (out.length >= limit) break;
   }
-  return stale;
+  return out;
 }
 
 /**
