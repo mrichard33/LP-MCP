@@ -40,22 +40,34 @@ export const VALIDATION_CHECKS = Object.freeze([
   {
     name: 'unlinked_sessions_7d',
     // rows_checked is every unlinked chat session — the link sweep's whole
-    // worklist. rows_flagged is the overdue subset (> 7 days), which is the
-    // real alarm: a fresh row is normally linked by the next chat in the same
-    // project, so only one that survived a week says the sweep is not reaching
-    // it. The sweep (skill Mechanism 2) must therefore run with NO age window;
-    // it used to query `created_at > 7 days`, the exact complement of the
-    // flagged set, so it could never touch a single flagged row. The sample is
-    // oldest-first and carries transcript_search_keys so it doubles as the
-    // sweep worklist: keys are what conversation_search matches on.
-    description: 'chat-surface sessions with no chat_url (checked = all, flagged = overdue past 7 days)',
+    // worklist. rows_flagged is the overdue subset (> 7 days) that is still
+    // actionable, which is the real alarm: a fresh row is normally linked by
+    // the next chat in the same project, so only one that survived a week says
+    // the sweep is not reaching it. The sweep (skill Mechanism 2) must
+    // therefore run with NO age window; it used to query `created_at > 7
+    // days`, the exact complement of the flagged set, so it could never touch
+    // a single flagged row. The sample is oldest-first and carries
+    // transcript_search_keys so it doubles as the sweep worklist: keys are
+    // what conversation_search matches on.
+    //
+    // A row marked validation_notes->>'link_unlinkable' is excluded from the
+    // flagged count but still counted in rows_checked. Mark's 2026-09-15
+    // ruling: 32 sessions written before search keys existed (v4.3) have
+    // nothing for conversation_search to match and their chats are months
+    // beyond recent_chats reach, so no pass will ever link them. Leaving them
+    // flagged would pin the alarm permanently and hide a genuinely new
+    // unlinked session. The mark is about absent keys, not a permanent
+    // exemption — a row that later gains keys or a URL is picked up again.
+    description: 'chat-surface sessions with no chat_url (checked = all, flagged = overdue past 7 days and still actionable)',
     sql: `
 SELECT
   (SELECT count(*) FROM claude_session_logs WHERE chat_url IS NULL AND coalesce(surface,'chat')='chat')::int AS rows_checked,
-  (SELECT count(*) FROM claude_session_logs WHERE chat_url IS NULL AND coalesce(surface,'chat')='chat' AND created_at < now() - interval '7 days')::int AS rows_flagged,
+  (SELECT count(*) FROM claude_session_logs WHERE chat_url IS NULL AND coalesce(surface,'chat')='chat' AND created_at < now() - interval '7 days'
+     AND coalesce((validation_notes->>'link_unlinkable')::boolean, false) = false)::int AS rows_flagged,
   (SELECT jsonb_agg(x) FROM (SELECT id, session_date, log_origin, left(session_title, 80) AS title,
        transcript_search_keys AS search_keys
      FROM claude_session_logs WHERE chat_url IS NULL AND coalesce(surface,'chat')='chat' AND created_at < now() - interval '7 days'
+       AND coalesce((validation_notes->>'link_unlinkable')::boolean, false) = false
      ORDER BY created_at ASC LIMIT ${SAMPLE}) x) AS sample`,
   },
   {
