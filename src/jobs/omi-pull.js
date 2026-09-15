@@ -232,7 +232,14 @@ async function pullMemories(client, db, { cfg, now, mode }) {
 
   if (!memories.length) return { seen: batch.length, ingested: 0, skipped: 0 };
   if (mode === 'shadow') {
-    return { seen: batch.length, ingested: 0, skipped: 0, planned: memories.length, shadow: true };
+    // `ingested` carries the WOULD-INGEST count in shadow, matching what
+    // pullConversations reports. It used to be hard 0 here with the real number
+    // hidden in `planned`, so the shadow log read "would ingest 0 row(s) from
+    // memories" on a run that had planned 100 of them (first live shadow run,
+    // 2026-09-15). A zero that means "nothing to do" and a zero that means "100
+    // rows, not shown" must not look the same — that log line is the only thing
+    // anyone reads before deciding to go live.
+    return { seen: batch.length, ingested: memories.length, skipped: 0, planned: memories.length, shadow: true };
   }
 
   const res = await db.rpc('claude_omi_memory_upsert', {
