@@ -229,3 +229,50 @@ from `rows_flagged` and from the worklist sample, but still counts them in
 `rows_checked`. Reversible: strip the key and the row reappears in the alarm.
 The mark is about absent keys, not a permanent exemption — a row that later
 gains keys or a URL is picked up again.
+
+---
+
+## Addendum — 2026-09-15 (2): the first real C2 run, and what it found
+
+The sweep ran in Reece Marketing & Funnel Builder and wrote nothing. Both causes
+are now fixed; a third finding overturned the sweep's own diagnosis.
+
+**1. The worklist was contaminated.** 43 of 231 unlinked-with-keys rows are
+`[FOLDED → #NNN]` — folded into another session, so their chat belongs to that
+other row and every match is a false positive. `queries.md` §4b and
+`unlinked_sessions_7d` now both exclude them, and both carry the alignment
+reminder: filtering one and not the other *is* the v4.6 bug in mirror image.
+
+**2. The matcher had no identity test.** Topical keys (`E.2-VC`, `Bot 5`) match
+every session on a long-running subject, so three September sessions surfaced
+spring chats that were already linked. Mechanism 2 step 2 now runs three gates:
+one up-front set of already-claimed `chat_url`s (not a per-candidate lookup), a
+date gate comparing **in ET** — `updated_at` is UTC, `session_date` is an ET
+date, so raw comparison is an off-by-one that rejects a chat active late the
+previous evening — and a stricter rule for `write_date` rows, which cannot be
+date-gated at all (their `session_date` *is* the write date) and must be
+confirmed by opening the chat.
+
+**3. The twin theory was wrong, and folding would have destroyed real work.**
+The sweep inferred from three refusals that most of the backlog were duplicates.
+Key-set overlap across all 188 candidates says otherwise: 4 rows at ≥0.60, 21 at
+0.40–0.60, **163 with no strong twin**. All four ≥0.60 pairs are a spring retro
+row against a September live row, and every one of those retro dates is
+corroborated to the day by its ledger `chat_updated_at` (367 Mar 11, 434 Apr 7,
+462 Apr 18, 516 May 7, 521 May 8). Mark ruled: separate sessions months apart on
+the same long-running subject. **No twin folding.** The one genuine duplicate is
+1035/1037 — same day, 27 minutes apart, both live.
+
+**A NULL trap caught in testing.** The first version of the folded filter used a
+bare `NOT (validation_notes ? 'folded_into')`. `validation_notes` is NULL on 77
+of the 78 overdue rows, and `NULL ? 'k'` is NULL, not false — so the WHERE
+dropped every one of them and `rows_flagged` read 0 instead of 77. A clean-looking
+alarm hiding all the work. Every jsonb existence test here is now
+coalesce-wrapped, with a test asserting it stays that way.
+
+**Still open:** the ~144 clean candidates need per-project sweep chats, and
+nothing on a session row says which project its chat lives in. `area` is
+populated on all 188 and partitions them well (chatbot-lane 51, calculator-lane
+18, scorecard-reporting 16, appointments 14, lp-ghl-sync 13, …), so the cheap fix
+is a one-time area→project map rather than 188 judgements, plus a `project`
+column written at checkpoint time going forward.

@@ -506,6 +506,61 @@ test('unlinked_sessions_7d: checked counts every unlinked chat row, flagged only
   // nothing a sweep could do with a row that has no keys.
   const sample = c.sql.slice(c.sql.indexOf('AS title'));
   assert.match(sample, unlinkable, 'the worklist sample must exclude them as well');
+
+  // v4.7: a [FOLDED -> #NNN] row's chat belongs to the row it was folded into,
+  // so any match a sweep finds for it is a false positive by construction.
+  // Same invariant as link_unlinkable: filtered from the alarm, still counted.
+  const folded = /session_title NOT ILIKE '%\[FOLDED%/;
+  const foldedNote = /NOT coalesce\(validation_notes \? 'folded_into', false\)/;
+  for (const [re, what] of [[folded, 'title marker'], [foldedNote, 'folded_into note']]) {
+    assert.match(flagged, re, `rows_flagged must exclude folded rows (${what})`);
+    assert.match(sample, re, `the worklist sample must exclude folded rows (${what})`);
+    assert.doesNotMatch(checked, re, `rows_checked must still count folded rows (${what})`);
+  }
+
+  // validation_notes is NULL on most rows (77 of 78 overdue on 2026-09-15), and
+  // `NULL ? 'k'` is NULL rather than false — so a bare
+  // `NOT (validation_notes ? 'folded_into')` evaluates NULL and the WHERE drops
+  // the row. That reads as a clean alarm while hiding every row with no notes:
+  // it took rows_flagged from 78 to 0 in testing. Every jsonb existence test
+  // here must be coalesce-wrapped. Missing data is never a wildcard pass.
+  for (const clause of c.sql.match(/validation_notes \? '[a-z_]+'/g) || []) {
+    const idx = c.sql.indexOf(clause);
+    const around = c.sql.slice(Math.max(0, idx - 40), idx + clause.length + 12);
+    assert.match(around, /coalesce\(validation_notes \? '[a-z_]+', false\)/,
+      `jsonb existence test must be NULL-safe: ${clause}`);
+  }
+});
+
+// The v4.6 bug was the sweep and the check covering different row sets. The
+// sweep's own worklist lives in the skill's queries.md section 4b, so a filter
+// added to one and not the other reintroduces it in mirror image.
+test('queries.md §4b and the nightly check exclude the same rows', () => {
+  const start = queriesRef.indexOf('**4b — Checkpoints still awaiting a transcript link:**');
+  assert.ok(start > 0, '§4b missing');
+  const block = queriesRef.slice(start, queriesRef.indexOf('###', start));
+  for (const re of [/session_title NOT ILIKE '%\[FOLDED%/, /NOT coalesce\(validation_notes \? 'folded_into', false\)/, /link_unlinkable/]) {
+    assert.match(block, re, `§4b must carry the same exclusion as unlinked_sessions_7d: ${re}`);
+  }
+  assert.doesNotMatch(block, /created_at [<>]/, '§4b must stay windowless (v4.6)');
+  assert.match(block, /Change one, change both/, '§4b must carry the alignment reminder');
+});
+
+// Keys establish candidacy, not identity. Without these a September session
+// matches a May chat on the same long-running subject and the link is refused
+// only after the search budget is already spent.
+test('SKILL.md Mechanism 2 states all three identity gates, with the ET conversion', () => {
+  const skill = fs.readFileSync(path.join(__dirname, '..', 'docs', 'skills', 'reece-session-continuity', 'SKILL.md'), 'utf8');
+  const mech = skill.slice(skill.indexOf('### Mechanism 2'), skill.indexOf('### Mechanism 3'));
+  // Gate A is an up-front set, not a per-candidate lookup.
+  assert.match(mech, /ONE query|one query/, 'Gate A must load claimed chat_urls once');
+  // Gate B must compare in ET; comparing a UTC timestamp to an ET date is an
+  // off-by-one that wrongly rejects a chat active late the previous evening.
+  assert.match(mech, /AT TIME ZONE 'America\/New_York'/, 'Gate B must convert to ET before comparing');
+  assert.match(mech, /Same-day passes/, 'Gate B must allow the same day');
+  // Gate C: write_date rows cannot be date-gated at all.
+  assert.match(mech, /write_date/, 'Gate C must name write_date rows');
+  assert.match(mech, /not\*{0,2} sufficient|not sufficient/, 'Gate C must say title fit alone is insufficient');
 });
 
 test('runMemoryValidation: dry run logs every check and repairs nothing; live syncs drifted metadata and marks orphans; log:false is SELECT-only', async () => {

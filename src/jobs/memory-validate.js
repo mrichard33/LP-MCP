@@ -50,6 +50,26 @@ export const VALIDATION_CHECKS = Object.freeze([
     // transcript_search_keys so it doubles as the sweep worklist: keys are
     // what conversation_search matches on.
     //
+    // Two exclusions from the flagged count and the worklist sample, both of
+    // which rows_checked still counts — the population never shrinks, only the
+    // actionable alarm narrows.
+    //
+    // A [FOLDED -> #NNN] row (or one carrying validation_notes->>'folded_into')
+    // was folded into another session, so its chat belongs to the row it was
+    // folded into and any match a sweep finds for it is a false positive by
+    // construction. 43 of them sat in the worklist on 2026-09-15 and the first
+    // real C2 run spent its budget refusing them. The SAME two clauses live in
+    // the skill's references/queries.md section 4b, which is where the sweep
+    // actually gets its worklist: a filter added in one place and not the other
+    // is exactly the v4.6 bug (the check and the sweep looking at different row
+    // sets). Change one, change both.
+    //
+    // Both jsonb tests are coalesce-wrapped because validation_notes is NULL on
+    // most rows (77 of 78 overdue on 2026-09-15), and `NULL ? 'k'` is NULL, not
+    // false — so a bare `NOT (validation_notes ? 'folded_into')` is NULL and the
+    // WHERE drops the row. That reads as a clean alarm while silently hiding
+    // every row that has no notes yet. Missing data is never a wildcard pass.
+    //
     // A row marked validation_notes->>'link_unlinkable' is excluded from the
     // flagged count but still counted in rows_checked. Mark's 2026-09-15
     // ruling: 32 sessions written before search keys existed (v4.3) have
@@ -63,11 +83,15 @@ export const VALIDATION_CHECKS = Object.freeze([
 SELECT
   (SELECT count(*) FROM claude_session_logs WHERE chat_url IS NULL AND coalesce(surface,'chat')='chat')::int AS rows_checked,
   (SELECT count(*) FROM claude_session_logs WHERE chat_url IS NULL AND coalesce(surface,'chat')='chat' AND created_at < now() - interval '7 days'
-     AND coalesce((validation_notes->>'link_unlinkable')::boolean, false) = false)::int AS rows_flagged,
+     AND coalesce((validation_notes->>'link_unlinkable')::boolean, false) = false
+     AND session_title NOT ILIKE '%[FOLDED%'
+     AND NOT coalesce(validation_notes ? 'folded_into', false))::int AS rows_flagged,
   (SELECT jsonb_agg(x) FROM (SELECT id, session_date, log_origin, left(session_title, 80) AS title,
        transcript_search_keys AS search_keys
      FROM claude_session_logs WHERE chat_url IS NULL AND coalesce(surface,'chat')='chat' AND created_at < now() - interval '7 days'
        AND coalesce((validation_notes->>'link_unlinkable')::boolean, false) = false
+       AND session_title NOT ILIKE '%[FOLDED%'
+       AND NOT coalesce(validation_notes ? 'folded_into', false)
      ORDER BY created_at ASC LIMIT ${SAMPLE}) x) AS sample`,
   },
   {
