@@ -34,9 +34,16 @@ const KB_FAQ_MIN_SIMILARITY       = parseFloat(process.env.KB_FAQ_MIN_SIMILARITY
 const KB_OBJECTION_MIN_SIMILARITY = parseFloat(process.env.KB_OBJECTION_MIN_SIMILARITY || '0.30');
 const KB_FAQ_EMBED_INTERVAL_MS    = parseInt(process.env.KB_FAQ_EMBED_INTERVAL_MS || '21600000', 10); // 6h
 
-/** Per-turn memoised embedder bound to the real OpenAI client. */
+/**
+ * Per-turn memoised embedder bound to the real OpenAI client.
+ *
+ * v1.13 — 2026-09-16. { fast: true }: the reply path gets one attempt and a
+ * short timeout instead of the batch client's 3 retries / 20s. A retry inside
+ * the 1500ms tier budget can never land, and the abandoned work kept running
+ * (and retrying) for up to ~60s after the turn had given up on it.
+ */
 export function makeQueryEmbedder(messageText) {
-  return makeMemoisedEmbedder(messageText, embed);
+  return makeMemoisedEmbedder(messageText, (t) => embed(t, { fast: true }));
 }
 
 // ── FAQ semantic match ─────────────────────────────────────────────
@@ -51,6 +58,23 @@ export async function matchFaqsSemantic(queryEmbedding, channel = 'sms', limit =
   });
   if (error) throw new Error(`match_kb_faqs: ${error.message}`);
   return data || [];
+}
+
+/**
+ * v1.13 — 2026-09-16. Shadow runs probe at threshold 0 so the audit row records
+ * how close a miss actually was. Before this, a miss wrote top_similarity=null,
+ * which cannot tell "just under the floor at 0.39" from "nothing close at 0.05"
+ * — so KB_FAQ_MIN_SIMILARITY could only ever be tuned by guessing. Live still
+ * queries at the floor, so no extra rows cross the wire on the answering path.
+ *
+ * @returns {Promise<{matches: Array, top: number|null}>} matches = at/above the
+ *   configured floor (the answer); top = true best similarity seen.
+ */
+export async function matchFaqsProbed(queryEmbedding, channel = 'sms', limit = 3, { probe = false } = {}) {
+  const rows = await matchFaqsSemantic(queryEmbedding, channel, limit, probe ? 0 : KB_FAQ_MIN_SIMILARITY);
+  const matches = probe ? rows.filter((r) => r.similarity >= KB_FAQ_MIN_SIMILARITY) : rows;
+  const top = typeof rows[0]?.similarity === 'number' ? rows[0].similarity : null;
+  return { matches, top };
 }
 
 // ── Objection type classifier (in memory) ──────────────────────────
@@ -69,6 +93,22 @@ async function getObjectionTypeVectors() {
     });
   }
   return objectionVectorsPromise;
+}
+
+/**
+ * v1.13 — 2026-09-16. Warm the six type descriptions at boot. They were embedded
+ * lazily, which put an embedBatch of six paragraph-length strings inside the
+ * FIRST live OBJECTION turn after every deploy — a second, larger OpenAI call
+ * sharing the same 1500ms budget as the query embed. Never throws: a failed warm
+ * just leaves the memo clear and the next turn retries, exactly as before.
+ */
+export async function warmObjectionTypeVectors() {
+  try {
+    await getObjectionTypeVectors();
+    console.log('[Tier1Semantic] objection type vectors warmed');
+  } catch (err) {
+    console.warn('[Tier1Semantic] objection vector warm failed (retried on first use):', err.message);
+  }
 }
 
 /**
@@ -178,6 +218,7 @@ export function startTier1EmbedSweep() {
     console.log('[Tier1Semantic] embed sweep disabled (KB_FAQ_SEMANTIC_MODE=off)');
     return null;
   }
+  warmObjectionTypeVectors();
   const first = setTimeout(() => { embedFaqsSweep('boot'); }, 30_000);
   if (typeof first.unref === 'function') first.unref();
   const interval = setInterval(() => { embedFaqsSweep('interval'); }, KB_FAQ_EMBED_INTERVAL_MS);
