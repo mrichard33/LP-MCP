@@ -76,6 +76,15 @@ export function getPullConfig(env = process.env) {
     maxPages: num(env, 'OMI_PULL_MAX_PAGES', 5, { min: 1, max: 100 }),
     pageSize: num(env, 'OMI_PULL_PAGE_SIZE', 100, { min: 1, max: 100 }),
     writeback: String(env.OMI_TASK_WRITEBACK || 'false').toLowerCase() === 'true',
+    // 2026-09-16, Mark's ruling: OFF by default. 277 of the 399 open Omi items
+    // were memories — "The user is using Claude as an AI assistant", "The user
+    // interacts with a person named Reece" (wrong; Reece is the company), 30 of
+    // them generated from screenshots rather than speech — and 232 were embedded
+    // and degrading memory_search. Conversations are the signal; memories were
+    // not. A flag rather than a deletion because the mapping code below is left
+    // intact: flipping this back to true restores the old behaviour exactly,
+    // with no code change and no deploy.
+    pullMemories: String(env.OMI_PULL_MEMORIES || 'false').toLowerCase() === 'true',
   };
 }
 
@@ -402,6 +411,28 @@ export async function runOmiPull({ dry_run = false, deep = false, kinds = null, 
     if (!want.has(kind)) continue;
     if (kind === 'writeback' && !cfg.writeback) {
       result.steps.writeback = { skipped: 'OMI_TASK_WRITEBACK=false' };
+      continue;
+    }
+
+    // 2026-09-16: a gated-off kind must still look ALIVE, which is why this does
+    // not copy the writeback skip above. That one `continue`s before writeSync,
+    // so its claude_omi_sync row keeps an ageing last_ok_at — indistinguishable
+    // from a puller that has quietly died. Skipping on purpose is a healthy
+    // outcome, so the row is stamped ok: last_ok_at moves, counts are zero,
+    // last_error is cleared and consecutive_failures stays 0.
+    //
+    // The flag wins over an explicit kinds:['memories'] from POST /admin/omi/pull,
+    // matching the writeback precedent — the env var is the switch, not the caller.
+    if (kind === 'memories' && !cfg.pullMemories) {
+      result.steps.memories = { skipped: 'OMI_PULL_MEMORIES=false', seen: 0, ingested: 0 };
+      try {
+        const prevMem = await readSync(db, 'memories');
+        await writeSync(db, 'memories', { ok: true, seen: 0, ingested: 0, prev: prevMem });
+      } catch (err) {
+        // Bookkeeping is not the work. A sync-row write that fails must not turn
+        // a deliberate skip into a run failure.
+        console.warn(`[OmiPull] memories skip bookkeeping failed: ${err.message}`);
+      }
       continue;
     }
 
