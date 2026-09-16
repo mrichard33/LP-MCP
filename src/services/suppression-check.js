@@ -101,6 +101,22 @@ export const SUPPRESS_TAGS = [
   // The rule-level not_has_any_tag gate on AGENTIC_RESPOND_POST_CHATBOT is a
   // second-layer backstop; this is the universal floor.
   'cannot-afford:pursuing-assistance',
+
+  // 2026-08-08 — canvassing leads are worked door-to-door by a human
+  // canvasser. Automated marketing on top of an active canvassing cycle
+  // competes with the person standing on the doorstep. 6,065 contacts carry
+  // this — the largest entry bucket in the system.
+  //
+  // Deliberately in SUPPRESS_TAGS (default mode) and NOT in
+  // REPLY_BLOCKING_TAGS: if a canvassed homeowner texts us back, the bot
+  // should still answer. This blocks proactive outbound and nurture, not a
+  // direct reply — matching the 2026-07-07 always-respond policy.
+  //
+  // This is where the §1a protection re-homes. Once suppress-automation stops
+  // gating mutations it stops gating them for canvassing contacts too, tag or
+  // no tag, so leaving the tag on them protects nothing. The protection has to
+  // sit on the send path, which is here.
+  'active-entry:canvassing',
 ];
 
 // Set for O(1) intersection check
@@ -319,7 +335,29 @@ export async function checkSuppressionLive(contact_id, { mode = 'default', chann
 //
 // Same snapshot read + fail-open contract as checkSuppression above.
 
-const MUTATION_SUPPRESS_TAGS = ['suppress-automation', 'stop-bot'];
+// 2026-08-08 — `suppress-automation` removed from the mutation gate.
+//
+// WHAT THE TAG ACTUALLY MEANS: 4,591 of 4,837 applications (95%) come from
+// AUTOMATION_SUPPRESS_ON_BOOKING — a 48h post-booking marketing pause on a
+// CONVERTING lead. Not a disqualification. Of 3,729 carriers, zero are
+// customers and 3,137 carry no compliance tag of any kind.
+//
+// WHY IT HAD TO GO: it was self-sealing. remove_tag had no audit exemption,
+// so the tag blocked its own removal — 963 blocked removals against 1,459
+// successful ones. A 48-hour pause became permanent on 3,729 contacts,
+// 3,052 of whom carry agentic-active, with every mutation against them
+// silently dropped.
+//
+// Three other call sites already treat this tag as a non-blocker
+// (SUPPRESS_TAGS 2026-05-14; send-message-handler v3.12; suppression-guard).
+//
+// THE PAUSE ITSELF IS STILL CORRECT and is preserved — re-scoped to outbound
+// in §1b rather than blocking all mutations. Pausing MARKETING on someone who
+// just booked is right. Blocking their stage moves, tag hygiene, opportunity
+// updates and appointment sync was not.
+//
+// stop-bot stays. Lead-initiated, universal.
+const MUTATION_SUPPRESS_TAGS = ['stop-bot'];
 const MUTATION_SUPPRESS_SET = new Set(MUTATION_SUPPRESS_TAGS);
 
 /**

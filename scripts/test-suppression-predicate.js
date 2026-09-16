@@ -42,6 +42,39 @@ test('agentic_reply + agentic-active: operational suppressors are bypassed', () 
   assert.deepEqual(r.bypassed_tags, ['suppress-outbound', 'cooling-active']);
 });
 
+// ─── §1b — canvassing (2026-08-08 ruling) ───────────────────────────────────
+// The pair of assertions that make this tag correct rather than merely present.
+// Canvassing leads are worked door-to-door by a person; automated marketing on
+// top of that competes with whoever is standing on the doorstep. But a
+// homeowner who texts back must still get an answer.
+
+test('active-entry:canvassing blocks proactive outbound', () => {
+  const r = matchSuppressionTags(['agentic-active', 'active-entry:canvassing']);
+  assert.equal(r.suppressed, true, 'an active canvassing cycle must not be marketed over');
+  assert.equal(r.matched_tag, 'active-entry:canvassing');
+});
+
+test('active-entry:canvassing still lets the bot answer a direct reply', () => {
+  // Deliberately absent from REPLY_BLOCKING_TAGS — the 2026-07-07
+  // always-respond policy. Adding it there would silence the bot on a
+  // canvassed homeowner who texts in, which is the opposite of the intent.
+  const r = matchSuppressionTags(
+    ['agentic-active', 'active-entry:canvassing'],
+    { mode: 'agentic_reply' },
+  );
+  assert.equal(r.suppressed, false, 'a canvassed homeowner who texts back must get an answer');
+  assert.deepEqual(r.bypassed_tags, ['active-entry:canvassing']);
+});
+
+test('entry:canvassing is permanent attribution and must NEVER suppress', () => {
+  // active-entry:* is the CURRENT source and is swapped on re-entry; entry:* is
+  // permanent. Suppressing on the permanent tag would silence every lead who
+  // ever came from canvassing, including the 295 who genuinely re-entered
+  // through another channel.
+  const r = matchSuppressionTags(['agentic-active', 'entry:canvassing']);
+  assert.equal(r.suppressed, false);
+});
+
 test('agentic_reply + agentic-active: consent/DNC family still blocks', () => {
   for (const tag of ['stop-bot', 'dnc', 'dnc-related', 'dnc-sms', 'do-not-contact', 'stage:dnc', 'unsubscribed']) {
     const r = matchSuppressionTags(['agentic-active', tag], { mode: 'agentic_reply' });
