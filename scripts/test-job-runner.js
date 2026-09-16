@@ -33,6 +33,7 @@ import {
   reapOrphanRuns,
   registerJobs,
   runJob,
+  isOccurrenceTaken,
   __resetJobRunnerForTests,
 } from '../src/job-runner.js';
 import { JOBS, JOB_IDS } from '../src/job-registry.js';
@@ -41,7 +42,7 @@ import { JOBS, JOB_IDS } from '../src/job-registry.js';
 // Chainable and awaitable at any point, like the real client. Records every
 // call so the assertions can look at exactly what would have been written.
 
-function fakeDb({ failInsert = false, failUpdate = false, failUpsert = false, nextId = 1 } = {}) {
+function fakeDb({ failInsert = false, failUpdate = false, failUpsert = false, insertError = null, nextId = 1 } = {}) {
   const calls = { insert: [], update: [], upsert: [], delete: [] };
   let idSeq = nextId;
 
@@ -49,6 +50,7 @@ function fakeDb({ failInsert = false, failUpdate = false, failUpsert = false, ne
     const state = { table, kind, payload, filters: [] };
     const settle = async () => {
       if (kind === 'insert') {
+        if (insertError) return { data: null, error: insertError };
         if (failInsert) return { data: null, error: { message: 'insert boom' } };
         const id = idSeq++;
         calls.insert.push({ table, payload, id });
@@ -232,6 +234,66 @@ test('with no supabase the job still runs and nothing is written', async () => {
   const out = await runJob('demo', async () => { ran = true; return { ok: true }; }, { supabase: null });
   assert.equal(ran, true);
   assert.equal(out.status, JOB_STATUS.OK);
+});
+
+// ─── The occurrence claim (sql/114) ─────────────────────────────────────────
+// The six daily jobs guard themselves with a module-level date claimed before
+// awaiting. That works inside one process and is worth nothing across two: each
+// replica has its own copy of the variable, both see "not run today", and both
+// run. The database is the only thing that can arbitrate.
+
+test('an occurrence key is written with the run', async () => {
+  const db = fakeDb();
+  await runJob('memory-nightly', async () => ({ ok: true }), deps(db, { occurrence: '2026-09-16' }));
+  assert.equal(db.calls.insert[0].payload.occurrence_key, '2026-09-16');
+});
+
+test('an interval job stores no occurrence and is never blocked', async () => {
+  const db = fakeDb();
+  await runJob('capacity-sweep-fast', async () => ({ ok: true }), deps(db));
+  assert.equal(db.calls.insert[0].payload.occurrence_key, null);
+});
+
+test('losing the claim SKIPS without running the job — the whole point', async () => {
+  const db = fakeDb({ insertError: { code: '23505', message: 'duplicate key value violates unique constraint "uq_job_runs_job_occurrence"' } });
+  let ran = false;
+  const out = await runJob('memory-nightly', async () => { ran = true; return { ok: true }; },
+    deps(db, { occurrence: '2026-09-16' }));
+
+  assert.equal(ran, false, 'the job must NOT run when another replica owns the slot');
+  assert.equal(out.status, JOB_STATUS.SKIPPED);
+  assert.match(out.summary, /2026-09-16/);
+  assert.equal(db.calls.update.length, 0, 'nothing to close — no row was opened');
+});
+
+test('an insert failure that is NOT a lost claim still runs the job unlogged', async () => {
+  // Fail open. A broken log must never cost a nightly pass.
+  const db = fakeDb({ insertError: { code: '08006', message: 'connection failure' } });
+  let ran = false;
+  const out = await runJob('memory-nightly', async () => { ran = true; return { ok: true }; },
+    deps(db, { occurrence: '2026-09-16' }));
+  assert.equal(ran, true);
+  assert.equal(out.status, JOB_STATUS.OK);
+});
+
+test('isOccurrenceTaken recognises the violation by code and by message', () => {
+  assert.equal(isOccurrenceTaken({ code: '23505' }), true);
+  assert.equal(isOccurrenceTaken({ message: 'duplicate key value violates unique constraint' }), true);
+  // Everything else is an ordinary error and must fail open.
+  assert.equal(isOccurrenceTaken({ code: '08006', message: 'connection failure' }), false);
+  assert.equal(isOccurrenceTaken(null), false);
+  assert.equal(isOccurrenceTaken({}), false);
+});
+
+test('a run is closed only by the replica that opened it', async () => {
+  // A slow process must not write a terminal result over a row another replica
+  // has since taken responsibility for.
+  const db = fakeDb();
+  await runJob('demo', async () => ({ ok: true }), deps(db));
+  assert.deepEqual(db.calls.update.at(-1).filters, [
+    ['eq', 'id', 1],
+    ['eq', 'instance_id', 'test-host'],
+  ]);
 });
 
 // ─── Registry, reaping, shutdown, prune ─────────────────────────────────────

@@ -81,6 +81,27 @@ carrying no new signal.
    as it is. It returns `{ status, summary, value, error }`, so a caller that
    needs the job's own return value reads `value`.
 
+## One run per occurrence (sql/114)
+
+The six daily jobs guard themselves with a module-level date claimed before
+awaiting. That is correct inside one process and worth nothing across two: each
+replica has its own copy of the variable, both see "not run today", and both
+run. It has not bitten yet only because the service runs a single replica, which
+is a deployment setting rather than a guarantee.
+
+`job_runs.occurrence_key` names the slot a run belongs to — the ET date the
+daily jobs already compute for their own gate — and a partial unique index on
+`(job_id, occurrence_key)` makes the database the arbiter. The second replica's
+INSERT loses, `runJob` returns `skipped`, and the job is never called.
+
+Pass it as `runJob('memory-nightly', () => runMemoryNightly(), { occurrence: today })`.
+Interval jobs pass nothing, store NULL, and are unaffected: running a watchdog
+twice is harmless, running a nightly twice is not.
+
+A lost claim is the *only* insert error that declines to run. Every other
+failure to open a row still runs the job unlogged — a broken log must never
+cost a nightly pass.
+
 ## Retention
 
 Runs older than 90 days are pruned daily (`JOB_RUNS_RETENTION_DAYS` overrides).

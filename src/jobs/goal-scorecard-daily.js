@@ -1038,7 +1038,7 @@ export function startGoalScorecardScheduler() {
     const hour = Number(parts.find((p) => p.type === 'hour')?.value ?? -1);
     const today = todayET();
     if (hour === 6 && lastRunDate !== today) {
-      await runJob('goal-scorecard-daily', () => attemptDailyRun(today, 'daily 06:00 ET'));
+      await runJob('goal-scorecard-daily', () => attemptDailyRun(today, 'daily 06:00 ET'), { occurrence: today });
     }
     // Watchdog window: any check from 07:00 ET onward (covers deploys that
     // boot mid-day — a fresh process still verifies today's snapshot exists).

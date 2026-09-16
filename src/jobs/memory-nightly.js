@@ -471,7 +471,7 @@ export function startMemoryNightlyScheduler() {
     const today = todayET(now);
     if (!shouldRun({ hour: hourET(now), today, lastRunDate, targetHour })) return;
     lastRunDate = today; // claim before awaiting
-    try { await runJob('memory-nightly', () => runMemoryNightly()); }
+    try { await runJob('memory-nightly', () => runMemoryNightly(), { occurrence: today }); }
     catch (err) { console.error('[MemoryNightly] run threw:', err.message); await alertGroupMe(`run threw: ${err.message}`); }
   };
   timer = setInterval(tick, 5 * 60 * 1000);
