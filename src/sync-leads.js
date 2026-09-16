@@ -85,7 +85,30 @@ import supabase from './supabase.js';
 import { getField, normalizePhone, loggedFirstKeys } from './sync-utils.js';
 import { logSyncError } from './sync-log.js';
 import { resolveSourceBucket } from './sync-sources.js';
-import { lpDateToEastern, lpCreatedDate } from './lp-dates.js';
+import { lpDateToEastern, lpCreatedDate, sanitizeLpApptDate } from './lp-dates.js';
+
+// Lead ids already warned about a dropped LP zero-date this process. Without
+// this a full sync would re-log every affected lead on every pass: the sentinel
+// lives in LP, so it comes back identical each time. Bounded by the number of
+// affected leads (71 as of 2026-09-16), not by sync volume.
+const warnedZeroApptDate = new Set();
+
+/**
+ * Log once per lead when LP's apptdate was present but held no usable date.
+ *
+ * The guard itself is silent by design (sanitizeLpApptDate is a pure date
+ * helper). This is the only place the rate stays observable: once the column
+ * stores null instead of 1900-01-01, no SQL over lp_leads can count these any
+ * more.
+ */
+function noteDroppedApptDate(rawAppt, sanitized, ldsId) {
+  if (!rawAppt || sanitized || warnedZeroApptDate.has(ldsId)) return;
+  warnedZeroApptDate.add(ldsId);
+  console.warn(
+    `[Sync] lead ${ldsId}: LP apptdate="${rawAppt}" carries no usable date `
+    + `(Delphi zero / pre-2000) — storing appointment_date=null, appointment_set untouched`,
+  );
+}
 import { matchToGHL } from './ghl.js';
 import { executeAddTag, executeRemoveTag } from './actions/handlers/tags.js';
 import { upsertProspect } from './upsert-prospect.js';
@@ -442,6 +465,9 @@ function buildLeadRow(prospect, lead, {
   // preferred over disposition-code interpretation for the Confirmed count.
   // Only stamped when LP actually sent the field: an absent field must not
   // flip a previously-true value back to false on an unrelated re-sync.
+  const rawApptDate  = getField(lead, 'apptdate', 'ApptDate');
+  const apptDateOut  = sanitizeLpApptDate(rawApptDate);
+  noteDroppedApptDate(rawApptDate, apptDateOut, getField(lead, 'lds_id', 'LdsID') || 'unknown');
   const confirmedRaw = getField(lead, 'confirmed', 'Confirmed');
   const verifiedRaw  = getField(lead, 'verified', 'Verified');
 
@@ -509,9 +535,9 @@ function buildLeadRow(prospect, lead, {
       ever_issued:     lpBool(getField(lead, 'everissued', 'EverIssued')),
       ever_net_issued: lpBool(getField(lead, 'evernetissued', 'EverNetIssued')),
 
-      appointment_date:   lpDateToEastern(getField(lead, 'apptdate', 'ApptDate')),
+      appointment_date:   apptDateOut,
       demo_completed:     isDemoCompleted,
-      demo_date:          isDemoCompleted ? lpDateToEastern(getField(lead, 'apptdate', 'ApptDate')) : null,
+      demo_date:          isDemoCompleted ? apptDateOut : null,
       closed_won:         isClosedWon,
       job_value:          parseFloat(getField(lead, 'gsa', 'GSA', 'grossamount', 'GrossAmount') || 0) || null,
       created_at_lp:      lpCreatedDate(prospect, lead, getField),
@@ -580,7 +606,7 @@ export async function upsertLeadOnly(prospect) {
     const verifIn   = getField(lead, 'verified', 'Verified');
     // Derived exactly as buildLeadRow derives it, so the guard compares
     // against the value that WOULD be written.
-    const apptDateIn = lpDateToEastern(getField(lead, 'apptdate', 'ApptDate'));
+    const apptDateIn = sanitizeLpApptDate(getField(lead, 'apptdate', 'ApptDate'));
     const isApptSetIn = apptSetIn === 'true' || apptSetIn === true;
     const isDemoIn    = satIn === 'true' || satIn === true;
     const isSoldIn    = soldIn === 'true' || soldIn === true;
@@ -773,7 +799,7 @@ export async function processProspect(prospect, { skipGHL = false, payloadHash =
     const verifIn   = getField(lead, 'verified', 'Verified');
     // Derived exactly as buildLeadRow derives it, so the guard compares
     // against the value that WOULD be written.
-    const apptDateIn = lpDateToEastern(getField(lead, 'apptdate', 'ApptDate'));
+    const apptDateIn = sanitizeLpApptDate(getField(lead, 'apptdate', 'ApptDate'));
     const isApptSetIn = apptSetIn === 'true' || apptSetIn === true;
     const isDemoIn    = satIn === 'true' || satIn === true;
     const isSoldIn    = soldIn === 'true' || soldIn === true;

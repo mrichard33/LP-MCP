@@ -1446,7 +1446,14 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
         else if (dd === 0) when = P.APPOINTMENT_WHEN_TODAY;
         else when = P.appointmentWhenUpcoming(n);
       }
-      apptStatus = `YES — ${context.lp.appointment_date}${when}`;
+      // A date can legitimately be absent while appointment_set is true: LP
+      // reports the appointment exists but returns its Delphi zero date for the
+      // date itself, which sanitizeLpApptDate() turns into null (2026-09-16).
+      // Interpolating that null would put "YES — null" in front of a model that
+      // writes to customers, so say what is actually known instead.
+      apptStatus = context.lp.appointment_date
+        ? `YES — ${context.lp.appointment_date}${when}`
+        : `YES — date unknown${when}`;
     }
     parts.push(...P.lpDemoAndAppointment(context.lp.demo_completed ? 'YES' : 'no', apptStatus));
     if (context.lp.closed_won) parts.push(...P.lpClosedWon(context.lp.job_value));
