@@ -579,11 +579,17 @@ export async function ingestOmiConversation(body, { db, llm, embed, env = proces
     //     The action count is read AFTER the word floor, so a conversation whose
     //     only items are "Fix it" counts as empty and is gated here rather than
     //     filing a session with nothing in it.
+    //
+    //     STRUCTURED ONLY. A body with transcript_segments and no `structured`
+    //     is the webhook shape, and there is nothing to count yet — emptiness is
+    //     the extractor's verdict to reach, a few steps down, and it already has
+    //     one (no_business_content). Gating here would drop a real conversation
+    //     for the crime of arriving before the model read it.
     stage = 'short_gate';
     const durationSec = conversationDurationSec(conv);
-    if (durationSec !== null && durationSec < cfg.minConversationSec) {
-      const mapped = structured ? mapStructuredExtraction(conv, { minActionWords: cfg.minActionWords }) : null;
-      const actionCount = mapped ? mapped.items.filter((it) => it.category === 'action_item').length : 0;
+    if (structured && durationSec !== null && durationSec < cfg.minConversationSec) {
+      const mapped = mapStructuredExtraction(conv, { minActionWords: cfg.minActionWords });
+      const actionCount = mapped.items.filter((it) => it.category === 'action_item').length;
       const overviewLen = conv.omi_overview.length;
       if (actionCount === 0 && overviewLen < cfg.minOverviewChars) {
         return {

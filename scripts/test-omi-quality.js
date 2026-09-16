@@ -22,6 +22,7 @@ import {
   mapStructuredExtraction,
   conversationDurationSec,
   getOmiConfig,
+  ingestOmiConversation,
 } from '../src/memory/omi-ingest.js';
 import { wordCount } from '../src/memory/memory-text.js';
 import { main as cleanupOmiMemories } from './cleanup-omi-memories.js';
@@ -171,7 +172,8 @@ test('OMI_PULL_MEMORIES unset means the memories endpoint is never called at all
   assert.equal(res.ok, true, 'a deliberate skip is not a failure');
   assert.equal(fetch.calls.length, 0, 'the API call must be skipped entirely — no spend, no rate-limit budget');
   assert.equal(state.rpcCalls.filter((c) => c.name === 'claude_omi_memory_upsert').length, 0);
-  assert.equal(res.steps.memories.skipped, 'OMI_PULL_MEMORIES=false');
+  assert.equal(res.steps.memories.skipped_reason, 'OMI_PULL_MEMORIES=false');
+  assert.equal(res.steps.memories.skipped, 0, '`skipped` is a count on this step and must stay numeric whatever the flag says');
 });
 
 test('a skipped memories pull still writes a HEALTHY sync row, so it cannot be mistaken for a dead puller', async () => {
@@ -203,7 +205,7 @@ test('the flag beats an explicit kinds:["memories"] request, matching the writeb
   });
 
   assert.equal(fetch.calls.length, 0, 'the env var is the switch, not the caller');
-  assert.ok(res.steps.memories.skipped);
+  assert.ok(res.steps.memories.skipped_reason);
 });
 
 test('OMI_PULL_MEMORIES=true restores the old behaviour exactly — the pull was gated, not deleted', async () => {
@@ -233,7 +235,7 @@ test('OMI_PULL_MEMORIES=true restores the old behaviour exactly — the pull was
   assert.equal(seen[0].memories.length, 2);
   assert.match(seen[0].memories[0].description, /^\[Omi memory\] /);
   assert.equal(res.steps.memories.ingested, 2);
-  assert.equal(res.steps.memories.skipped, 0, 'with the flag on, `skipped` is the upsert count, not a reason string');
+  assert.equal(res.steps.memories.skipped, 0, 'with the flag on, `skipped` is the upsert dedupe count — same type as when skipped');
 });
 
 // ─── 2. The short-conversation gate ────────────────────────────────────────
@@ -307,6 +309,39 @@ test('a short empty clip WITH readable timestamps is the one the gate claims —
   // disposition from no_content to too_short.
   const { state } = await pullOne(shortConversation({ overview: 'Short note, nothing settled, nobody owns.' }));
   assert.equal(ledgerWrites(state)[0].row.disposition, 'too_short');
+});
+
+test('a short WEBHOOK conversation — transcript, no structured — is never gated before the model reads it', async () => {
+  // Caught in review, not in production. The gate counts action items and
+  // overview length, and a webhook body has neither yet: transcript_segments is
+  // the content, and emptiness is the extractor's verdict to reach a few steps
+  // later, which it already does (no_business_content). Counting a
+  // not-yet-extracted body as empty would drop a real 60-second conversation
+  // for the crime of arriving before the model read it.
+  const { db, state } = fakeSupabase({
+    rpc: { claude_omi_ingest: () => ({ data: { status: 'written', session_id: 9, pending_ids: [21] }, error: null }) },
+  });
+  const llm = async () => ({
+    data: {
+      has_business_content: true,
+      title: 'Meta access',
+      summary: 'Shana has the Meta business account details.',
+      search_keys: ['Meta'],
+      items: [{ category: 'action_item', text: REAL_TASK, owner: null, systems: [], evidence: 'said aloud', confidence: 0.9, stated_by_mark: true }],
+    },
+    model: 'test-model',
+  });
+
+  const res = await ingestOmiConversation({
+    id: 'conv-webhook-short',
+    started_at: '2026-09-14T13:00:00.000Z',
+    finished_at: '2026-09-14T13:00:40.000Z',
+    discarded: false,
+    transcript_segments: [{ text: 'I need to call Shana about the Meta business account.', is_user: true }],
+  }, { db, llm, embed: null, env: ENV, now: NOW() });
+
+  assert.equal(res.status, 'written', 'a transcript-bearing body must reach the extractor');
+  assert.equal(ledgerWrites(state).filter((w) => w.row.disposition === 'too_short').length, 0, 'the gate must not judge a body it cannot count');
 });
 
 test('conversationDurationSec answers null rather than a misleading zero', () => {

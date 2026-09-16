@@ -431,7 +431,12 @@ export async function runOmiPull({ dry_run = false, deep = false, kinds = null, 
     // The flag wins over an explicit kinds:['memories'] from POST /admin/omi/pull,
     // matching the writeback precedent — the env var is the switch, not the caller.
     if (kind === 'memories' && !cfg.pullMemories) {
-      result.steps.memories = { skipped: 'OMI_PULL_MEMORIES=false', seen: 0, ingested: 0 };
+      // `skipped_reason`, not `skipped`. On this step `skipped` is a COUNT when
+      // the pull runs (rows the upsert deduped), so reusing it for a reason
+      // string would make one field change type depending on a flag — the kind
+      // of shape that breaks a dashboard quietly. The writeback step above can
+      // use `skipped` for its reason because it has no numeric one.
+      result.steps.memories = { skipped_reason: 'OMI_PULL_MEMORIES=false', seen: 0, ingested: 0, skipped: 0 };
       try {
         const prevMem = await readSync(db, 'memories');
         await writeSync(db, 'memories', { ok: true, seen: 0, ingested: 0, prev: prevMem });
