@@ -2,14 +2,21 @@
 /**
  * One-off attribution repair — scripts/backfill-source-attribution.js
  *
- * 2026-09-16 (issue #949). Before `source:` was registered in
- * NAMESPACE_FALLBACK_VALUES, `source:unknown` evicted correct paid-vendor tags
- * from 707 contacts in 30 days — source:internet-modernize 434 times,
- * my-home-pros 147, homebuddy 84, plus angi, lead-gurus and mvp-marketing.
+ * 2026-09-16 (issue #949). `source:unknown` destroyed correct paid-vendor
+ * attribution on ~2,389 contacts over 45 days — modernize, lead-gurus,
+ * myhomepros, homebuddy, contractor-appointments, mvp-marketing, angi,
+ * radio-simpletext and more.
  *
- * The removals are recoverable: every one was recorded in
- * system_events.payload.step_results[].result.removed_conflicting alongside the
- * contact id. This script reads them back and re-applies the vendor tag.
+ * TWO producers did it, and this script must read BOTH:
+ *   1. the routing-tags path — system_events ghl.routing_tags_ensured,
+ *      step_results[].result.removed_conflicting  (~710 contacts);
+ *   2. the ENTRY_HYGIENE_AT_CREATION_* rules — agent_actions rows running
+ *      remove_tag {prefix: "source:"}             (~1,705 contacts).
+ *
+ * The first version of this script read only (1), because (2) was not yet
+ * known to exist. A --write run would have repaired under a third of the
+ * damage and reported success. Both readers are now wired in; do not remove
+ * either.
  *
  * ORDER MATTERS. Run this only AFTER the fix is deployed. Without it, restoring
  * a tag just means the next routing-tags run on that contact evicts it again —
@@ -52,8 +59,21 @@ const DAYS = argOf('--days', 30);
 const LIMIT = argOf('--limit', Infinity);
 const PACE_MS = argOf('--pace-ms', 250);
 
-/** The generic parent. Recorded as removed, but not worth restoring on its own. */
-const GENERIC = 'source:internet';
+/**
+ * Tags that are recorded as removed but carry no vendor attribution, so
+ * restoring one is pointless at best.
+ *
+ *   source:internet  the generic parent — true of thousands of leads, names
+ *                    no vendor.
+ *   source:unknown   the FALLBACK itself. It shows up in the removal record
+ *                    whenever a later actor cleared it — e.g. contact
+ *                    RuUeUK82fcV5MYv4q5AU, where the routing-tags path wrote
+ *                    source:unknown and the hygiene rule then wiped it. Without
+ *                    this entry the script would "restore" the very tag this
+ *                    whole exercise exists to stop writing. Caught by checking
+ *                    the planner against real rows, not by the unit tests.
+ */
+const NON_RESTORABLE = new Set(['source:internet', 'source:unknown']);
 
 /**
  * Pick the tag that carries the most attribution. `source:internet-homebuddy`
@@ -61,7 +81,7 @@ const GENERIC = 'source:internet';
  * is strictly more specific. Otherwise fall back to the longest.
  */
 export function mostSpecific(tags) {
-  const real = [...new Set(tags)].filter((t) => t && t !== GENERIC);
+  const real = [...new Set(tags)].filter((t) => t && !NON_RESTORABLE.has(t));
   if (real.length === 0) return null;
   return real.sort((a, b) => b.length - a.length)[0];
 }
@@ -82,23 +102,74 @@ export function repairVerdict(currentTags) {
   return { repair: true, reason: 'eligible' };
 }
 
-/** Walk the recorded events and build contact -> tag-to-restore. */
-export function planFromEvents(rows) {
-  const byContact = new Map();
+/** Parse a jsonb column that may arrive as an object or as text. */
+function asJson(value) {
+  if (typeof value !== 'string') return value;
+  try { return JSON.parse(value); } catch { return null; }
+}
+
+/**
+ * Losses recorded by the ROUTING-TAGS path — system_events
+ * ghl.routing_tags_ensured, step_results[].result.removed_conflicting.
+ * Returns [contactId, removedTag] pairs.
+ */
+export function lossesFromEvents(rows) {
+  const out = [];
   for (const row of rows || []) {
     const contactId = row.ghl_contact_id;
     if (!contactId) continue;
-    let payload = row.payload;
-    if (typeof payload === 'string') {
-      try { payload = JSON.parse(payload); } catch { continue; }
-    }
+    const payload = asJson(row.payload);
     for (const step of payload?.step_results || []) {
       const result = step?.result;
       if (result?.tag_applied !== 'source:unknown') continue;
-      const removed = result.removed_conflicting || [];
-      if (removed.length === 0) continue;
+      for (const tag of result.removed_conflicting || []) out.push([contactId, tag]);
+    }
+  }
+  return out;
+}
+
+/**
+ * Losses recorded by the AGENT-RULE path — agent_actions rows where
+ * ENTRY_HYGIENE_AT_CREATION_* ran `remove_tag {prefix: "source:"}`.
+ *
+ * 2026-09-16 — this reader did not exist in the first version of the script,
+ * and its absence was the whole defect: the rules turned out to be the LARGER
+ * producer (1,705 contacts vs 710 via routing-tags, 2,349 in union), so a
+ * --write run would have repaired 30% and looked finished. The dry run caught
+ * it only because the totals were compared against the measurement query.
+ *
+ * executeRemoveTag reports a single removal as `tag_removed` (string) and a
+ * batch as `tags` (array) — both shapes occur in the real data.
+ */
+export function lossesFromActions(rows) {
+  const out = [];
+  for (const row of rows || []) {
+    const contactId = row.target_id;
+    if (!contactId) continue;
+    const result = asJson(row.execution_result);
+    if (!result) continue;
+    const removed = Array.isArray(result.tags)
+      ? result.tags
+      : (result.tag_removed ? [result.tag_removed] : []);
+    for (const tag of removed) {
+      if (typeof tag === 'string' && tag.startsWith('source:')) out.push([contactId, tag]);
+    }
+  }
+  return out;
+}
+
+/**
+ * Fold every recorded loss into one entry per contact, carrying the single
+ * most specific tag. Both producers are merged BEFORE choosing, so a contact
+ * hit by each does not get two plan rows or the weaker of the two tags.
+ */
+export function buildPlan(...lossLists) {
+  const byContact = new Map();
+  for (const list of lossLists) {
+    for (const [contactId, tag] of list || []) {
       const prior = byContact.get(contactId) || [];
-      byContact.set(contactId, prior.concat(removed));
+      prior.push(tag);
+      byContact.set(contactId, prior);
     }
   }
   const plan = [];
@@ -109,6 +180,13 @@ export function planFromEvents(rows) {
   return plan;
 }
 
+/** The three rules whose source: wipe destroyed attribution (issue #949). */
+export const WIPE_RULES = [
+  'ENTRY_HYGIENE_AT_CREATION_OTHER',
+  'ENTRY_HYGIENE_AT_CREATION_FALLBACK',
+  'ENTRY_HYGIENE_AT_CREATION_UNKNOWN',
+];
+
 async function main(deps = {}) {
   const supabase = deps.supabase || supabaseDefault;
   const readContact = deps.readContact || ((id) => getContactCached(id, undefined, { maxWaitMs: 5000 }));
@@ -118,22 +196,43 @@ async function main(deps = {}) {
   const since = new Date(Date.now() - DAYS * 86400000).toISOString();
   console.log(`[backfill] ${WRITE ? 'WRITE' : 'DRY RUN'} — events since ${since}`);
 
-  const rows = [];
+  // Page through a table, since Supabase caps a single response.
   const PAGE = 1000;
-  for (let from = 0; ; from += PAGE) {
-    const { data, error } = await supabase
-      .from('system_events')
-      .select('ghl_contact_id, payload')
-      .eq('event_type', 'ghl.routing_tags_ensured')
-      .gt('created_at', since)
-      .range(from, from + PAGE - 1);
-    if (error) throw new Error(`system_events read failed: ${error.message}`);
-    rows.push(...(data || []));
-    if (!data || data.length < PAGE) break;
+  async function fetchAll(label, build) {
+    const rows = [];
+    for (let from = 0; ; from += PAGE) {
+      const { data, error } = await build().range(from, from + PAGE - 1);
+      if (error) throw new Error(`${label} read failed: ${error.message}`);
+      rows.push(...(data || []));
+      if (!data || data.length < PAGE) break;
+    }
+    return rows;
   }
-  console.log(`[backfill] scanned ${rows.length} routing-tag events`);
 
-  const plan = planFromEvents(rows).slice(0, LIMIT);
+  // BOTH producers. The routing-tags path and the ENTRY_HYGIENE_AT_CREATION_*
+  // rules each destroyed attribution, and the rules were the larger of the two
+  // — reading only the first covers about 30% of the damage.
+  const eventRows = await fetchAll('system_events', () => supabase
+    .from('system_events')
+    .select('ghl_contact_id, payload')
+    .eq('event_type', 'ghl.routing_tags_ensured')
+    .gt('created_at', since));
+
+  const actionRows = await fetchAll('agent_actions', () => supabase
+    .from('agent_actions')
+    .select('target_id, execution_result')
+    .eq('action_type', 'remove_tag')
+    .in('rule_applied', WIPE_RULES)
+    .gt('created_at', since));
+
+  const fromEvents = lossesFromEvents(eventRows);
+  const fromActions = lossesFromActions(actionRows);
+  console.log(
+    `[backfill] scanned ${eventRows.length} routing-tag events (${fromEvents.length} losses) ` +
+    `and ${actionRows.length} rule remove_tag actions (${fromActions.length} losses)`
+  );
+
+  const plan = buildPlan(fromEvents, fromActions).slice(0, LIMIT);
   console.log(`[backfill] ${plan.length} contact(s) lost a specific vendor tag\n`);
 
   const tally = { restored: 0, would_restore: 0, no_longer_unknown: 0, already_has_specific: 0, unreadable: 0, failed: 0 };

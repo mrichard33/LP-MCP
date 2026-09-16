@@ -17,8 +17,11 @@ import assert from 'node:assert/strict';
 
 process.env.GHL_API_KEY = 'test-key';
 
-const { mostSpecific, repairVerdict, planFromEvents } =
+const { mostSpecific, repairVerdict, lossesFromEvents, lossesFromActions, buildPlan, WIPE_RULES } =
   await import('../scripts/backfill-source-attribution.js');
+
+/** The script's plan for one producer, as the old planFromEvents returned it. */
+const planFromEvents = (rows) => buildPlan(lossesFromEvents(rows));
 
 // ─── who gets repaired ─────────────────────────────────────────────────
 
@@ -71,6 +74,18 @@ test('only one tag is ever chosen', () => {
   assert.equal(typeof picked, 'string',
     'restoring both would recreate the double-source-tag state that is itself a defect');
   assert.equal(picked, 'source:internet-contractor-appointments-ppl-west');
+});
+
+test('source:unknown is never restored — it is the tag we stopped writing', () => {
+  // Real case: contact RuUeUK82fcV5MYv4q5AU. The routing-tags path wrote
+  // source:unknown, then the hygiene rule wiped it, so source:unknown appears
+  // in the removal record. Restoring it would re-create the exact damage.
+  assert.equal(mostSpecific(['source:unknown']), null);
+  assert.equal(mostSpecific(['source:internet', 'source:unknown']), null,
+    'neither the generic parent nor the fallback names a vendor');
+  assert.equal(mostSpecific(['source:unknown', 'source:internet-homebuddy']),
+    'source:internet-homebuddy',
+    'but a real vendor tag alongside it still wins');
 });
 
 test('duplicates and empties do not confuse the choice', () => {
@@ -148,4 +163,89 @@ test('a payload stored as a JSON string is parsed', () => {
   };
   assert.equal(planFromEvents([row])[0].tag, 'source:internet-lead-gurus',
     'system_events.payload comes back as json or text depending on the client');
+});
+
+// ─── the agent-rule producer (the one the first version missed) ────────────
+
+const ruleAction = (contactId, removed, rule = 'ENTRY_HYGIENE_AT_CREATION_OTHER') => ({
+  target_id: contactId,
+  execution_result: Array.isArray(removed)
+    ? { tags: removed, prefix: 'source:', contact_id: contactId, tags_removed: removed.length }
+    : { contact_id: contactId, tag_removed: removed },
+  rule_applied: rule,
+});
+
+test('the rule path is read at all — its absence was the defect', () => {
+  // ENTRY_HYGIENE_AT_CREATION_* wiped 1,705 contacts vs 710 via routing-tags.
+  // The first version of this script read only the latter, so --write would
+  // have repaired 30% and reported success.
+  const losses = lossesFromActions([
+    ruleAction('c1', ['source:internet', 'source:internet-contractor-appointments']),
+  ]);
+  assert.deepEqual(losses, [
+    ['c1', 'source:internet'],
+    ['c1', 'source:internet-contractor-appointments'],
+  ]);
+});
+
+test('a batch removal (tags array) and a single removal (tag_removed) both parse', () => {
+  assert.deepEqual(lossesFromActions([ruleAction('c1', ['source:internet-modernize'])]),
+    [['c1', 'source:internet-modernize']],
+    'executeRemoveTag reports a batch as tags[]');
+  assert.deepEqual(lossesFromActions([ruleAction('c2', 'source:internet-angi')]),
+    [['c2', 'source:internet-angi']],
+    'and a single removal as the tag_removed string — both shapes are in the real data');
+});
+
+test('non-source tags removed by the same action are ignored', () => {
+  assert.deepEqual(
+    lossesFromActions([ruleAction('c1', ['active-entry:other', 'source:internet-homebuddy'])]),
+    [['c1', 'source:internet-homebuddy']],
+    'these rules also wiped active-entry:; that is not attribution to restore here');
+});
+
+test('malformed action rows never throw', () => {
+  assert.deepEqual(lossesFromActions([{}, { target_id: null }, { target_id: 'c1', execution_result: null },
+    { target_id: 'c1', execution_result: '{not json' }, { target_id: 'c1', execution_result: {} }]), []);
+  assert.deepEqual(lossesFromActions(null), []);
+});
+
+test('an execution_result stored as a JSON string is parsed', () => {
+  const row = { target_id: 'c1', execution_result: JSON.stringify({ tags: ['source:radio-simpletext'] }) };
+  assert.deepEqual(lossesFromActions([row]), [['c1', 'source:radio-simpletext']]);
+});
+
+// ─── merging the two producers ─────────────────────────────────────────
+
+test('a contact hit by BOTH producers gets one row with the best tag', () => {
+  const plan = buildPlan(
+    lossesFromEvents([liveEvent('c1', ['source:internet'])]),
+    lossesFromActions([ruleAction('c1', ['source:internet-modernize'])]),
+  );
+  assert.equal(plan.length, 1, 'one write per contact, not one per producer');
+  assert.equal(plan[0].tag, 'source:internet-modernize',
+    'the merge must happen BEFORE choosing, or the weaker tag can win');
+});
+
+test('the two producers union rather than overwrite', () => {
+  const plan = buildPlan(
+    lossesFromEvents([liveEvent('c1', ['source:internet-homebuddy'])]),
+    lossesFromActions([ruleAction('c2', ['source:internet-angi'])]),
+  );
+  assert.equal(plan.length, 2);
+  assert.equal(plan.find((p) => p.contactId === 'c1').tag, 'source:internet-homebuddy');
+  assert.equal(plan.find((p) => p.contactId === 'c2').tag, 'source:internet-angi');
+});
+
+test('buildPlan tolerates missing and empty producer lists', () => {
+  assert.deepEqual(buildPlan(), []);
+  assert.deepEqual(buildPlan(null, undefined, []), []);
+});
+
+test('WIPE_RULES names exactly the three rules that wrote source:unknown', () => {
+  assert.deepEqual([...WIPE_RULES].sort(), [
+    'ENTRY_HYGIENE_AT_CREATION_FALLBACK',
+    'ENTRY_HYGIENE_AT_CREATION_OTHER',
+    'ENTRY_HYGIENE_AT_CREATION_UNKNOWN',
+  ], 'the other 20 hygiene rules wipe source: but then write a SPECIFIC tag — that is an upgrade, not loss');
 });
