@@ -59,6 +59,48 @@ export function lpDateToEastern(dateStr) {
 }
 
 /**
+ * Earliest year an LP appointment date can plausibly carry.
+ *
+ * LP is a Delphi application, and Delphi's TDateTime zero is 1899-12-30. When a
+ * lead has an appointment TIME but no appointment DATE, LP serialises the time
+ * onto that zero date and returns it as a normal-looking timestamp:
+ * "1900-01-01T14:00:00" is LP saying "2:00 PM, date unknown" — not an
+ * appointment in 1900.
+ */
+const LP_APPT_MIN_YEAR = 2000;
+
+/**
+ * An LP `apptdate` with the date actually filled in, or null.
+ *
+ * WHY (2026-09-16): lead 575791 mirrored `appointment_date = 1900-01-01T14:00`
+ * straight from LP. We did not corrupt it — the raw payload contains that
+ * verbatim, and one sibling row carries the literal Delphi zero
+ * `1899-12-30T11:00:00`. 71 of 134,257 dated leads are affected, still accruing
+ * a few a month since 2026-03-20.
+ *
+ * Storing the sentinel is worse than storing nothing: a 1900 date reads as a
+ * real appointment to anything that does not special-case it, and
+ * response-generator renders it into customer-facing model context. Returning
+ * null says what LP actually means — the date is unknown.
+ *
+ * `appointment_set` is deliberately NOT inferred from this. LP is still
+ * asserting the appointment exists; only the date is missing, and callers that
+ * care about existence read the boolean.
+ *
+ * A few affected rows carry plausible-looking but wrong years (1971, 1983,
+ * 1988) that look like human typos in LP rather than the zero date. The same
+ * floor catches those, which is why this is a year floor and not an equality
+ * check against the Delphi epoch.
+ */
+export function sanitizeLpApptDate(dateStr) {
+  const tagged = lpDateToEastern(dateStr);
+  if (!tagged) return null;
+  const ms = Date.parse(tagged);
+  if (!Number.isFinite(ms)) return null;
+  return new Date(ms).getUTCFullYear() < LP_APPT_MIN_YEAR ? null : tagged;
+}
+
+/**
  * Resolve the best available lead creation timestamp from LP data.
  * Prefers dateentered (lead-level, has actual time) over entrydate
  * (date-only, midnight-zeroed). Tags as UTC.

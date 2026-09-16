@@ -292,6 +292,69 @@ export function intakeJournal({ client: clientArg, track = trackBackground } = {
  *
  * @returns {Promise<{orphans:number, failures:number, routes:string[], oldest:string|null, action:string}>}
  */
+/** The deployment this process belongs to, or null when unset (local dev). */
+export function currentDeploymentId() {
+  return process.env.RAILWAY_DEPLOYMENT_ID || null;
+}
+
+/**
+ * Retire orphans left behind by containers that no longer exist.
+ *
+ * WHY (2026-09-16): two `intake_journal:unfinished:` keys had been firing since
+ * 2026-09-14 and could never clear, because orphan rows are retained 90 days
+ * and the condition is keyed per row. Looking at the data, the orphans were not
+ * stalls: 75 rows spread across 19 DIFFERENT deployments, one bad deploy alone
+ * accounting for 27, and only 2 on the container then running. They are
+ * requests that were in flight when a container was replaced — concentrated on
+ * the slowest routes (/webhook/ghl/set-lp-appointment 13.2%, contact-created
+ * 4.5%, versus 0.4% on the fast ones), exactly as you would expect.
+ *
+ * That is the alarm firing on the healthy case, which CLAUDE.md names as how a
+ * muted alarm starts. So classify instead of thresholding, using the outcome
+ * this codebase already has for it: runJob treats `interrupted` (a deploy
+ * killed the pass) as distinct from `failed`, and a pass that could not tell as
+ * `unknown`. A row whose container is gone can never finish; its outcome is
+ * unknowable, not failed, and unknowable must not page.
+ *
+ * AT STARTUP, NOT AT SHUTDOWN. A hard kill never runs shutdown code, so a
+ * drain-time write would miss precisely the cases that produce these rows. On
+ * boot, anything still 'received' from another deployment is by definition
+ * interrupted.
+ *
+ * FAILS OPEN: any error logs and returns; a journal that cannot reclassify must
+ * never block boot.
+ */
+export async function reclassifyInterruptedRows({ client: clientArg, deploymentId } = {}) {
+  if (journalMode() === 'off') return { reclassified: 0, action: 'disabled' };
+  const client = clientArg ?? supabase;
+  if (!client) return { reclassified: 0, action: 'no_client' };
+
+  const current = deploymentId !== undefined ? deploymentId : currentDeploymentId();
+  // With no deployment id we cannot tell our own rows from a dead container's,
+  // and guessing would retire live ones. Do nothing — that is the safe read.
+  if (!current) return { reclassified: 0, action: 'no_deployment_id' };
+
+  try {
+    const { data, error } = await client.from(TABLE)
+      .update({ status: 'interrupted' })
+      .eq('status', 'received')
+      .or(`deployment_id.is.null,deployment_id.neq.${current}`)
+      .select('id');
+    if (error) throw new Error(error.message);
+    const n = (data || []).length;
+    if (n > 0) {
+      console.log(
+        `[IntakeJournal] reclassified ${n} orphan(s) from prior deployments as interrupted `
+        + `(container gone — outcome unknowable, not failed)`,
+      );
+    }
+    return { reclassified: n, action: 'ok' };
+  } catch (err) {
+    console.warn(`[IntakeJournal] reclassify failed (non-blocking): ${err.message}`);
+    return { reclassified: 0, action: 'failed' };
+  }
+}
+
 export async function sweepIntakeJournal({ client: clientArg, send = sendGroupMeMessage, nowMs } = {}) {
   const mode = journalMode();
   const idle = { orphans: 0, failures: 0, routes: [], oldest: null, action: 'skipped' };
@@ -312,11 +375,18 @@ export async function sweepIntakeJournal({ client: clientArg, send = sendGroupMe
   let orphanRows = [];
   let failureCount = 0;
   try {
-    const { data, error } = await client.from(TABLE)
+    // Scope to THIS deployment. A 'received' row from a dead container is an
+    // interrupted request, not a stall, and reclassifyInterruptedRows() retires
+    // those at boot; this filter is the belt to that braces, so a reclassify
+    // that failed cannot resurrect the old false alarm.
+    let orphanQuery = client.from(TABLE)
       .select('id, route, received_at')
       .eq('status', 'received')
       .lt('received_at', orphanCutoff)
-      .gt('received_at', weekAgo)
+      .gt('received_at', weekAgo);
+    const deployId = currentDeploymentId();
+    if (deployId) orphanQuery = orphanQuery.eq('deployment_id', deployId);
+    const { data, error } = await orphanQuery
       .order('received_at', { ascending: true })
       .limit(500);
     if (error) throw new Error(error.message);
@@ -464,7 +534,11 @@ export function startIntakeJournalSweeper() {
     sweepIntakeJournal().catch((e) => console.error(`[IntakeJournal] sweep error: ${e.message}`));
   };
   setTimeout(() => {
-    tick();
+    // Retire prior-deployment orphans BEFORE the first sweep, so the sweep sees
+    // only rows this container is actually responsible for.
+    reclassifyInterruptedRows()
+      .catch((e) => console.warn(`[IntakeJournal] reclassify error: ${e.message}`))
+      .finally(tick);
     sweepTimer = setInterval(tick, SWEEP_INTERVAL_MS);
   }, SWEEP_FIRST_DELAY_MS);
 
@@ -547,5 +621,7 @@ export default {
   registerIntakeJournalRoutes,
   journalMode,
   journalRoutes,
+  reclassifyInterruptedRows,
+  currentDeploymentId,
   DEFAULT_ROUTES,
 };
