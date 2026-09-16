@@ -52,6 +52,11 @@ on "I could not tell" announces a recovery nobody earned. This is why the `shoul
 return a `verdict` (`alert` / `healthy` / `insufficient_evidence`) rather than just a boolean — the
 boolean cannot distinguish "healthy" from "too quiet to conclude".
 
+**Connection probes are read-only and never post.** `GET /health/integrations`
+(`src/integrations-health.js`) answers "can we reach LP / Five9 / Slack / GroupMe right now?"
+for the dashboard. A probe that cannot tell reports `unknown`, never `connected`; a GroupMe bot
+id alone is `unknown` because posting is the only way to exercise a bot.
+
 **Classify before you threshold.** An alarm that fires on the healthy case gets muted, and a muted
 alarm is how a 47-hour outage and a 71-day blind spot both went unnoticed. Exclude the legitimately-
 quiet cases explicitly (see the eligible-replies split in `agentic-silence-alerts.js` and the
