@@ -44,7 +44,7 @@
  * v1.0 — 2026-09-11. Initial (sql/101).
  */
 import { createHash } from 'node:crypto';
-import { stripPii, toEmbeddingRow } from './memory-text.js';
+import { stripPii, toEmbeddingRow, wordCount } from './memory-text.js';
 import { normText } from './memory-checkpoint.js';
 
 export class OmiBadRequest extends Error {
@@ -96,6 +96,8 @@ export function getOmiConfig(env = process.env) {
     conflictThreshold: num(env, 'MEMORY_CONFLICT_THRESHOLD', 0.85, { min: 0, max: 1 }),
     maxTranscriptChars: num(env, 'OMI_MAX_TRANSCRIPT_CHARS', 60000, { min: 1000 }),
     model: env.OMI_EXTRACT_MODEL || null,
+    // 2026-09-16 — the action-item substance floor. See mapStructuredExtraction.
+    minActionWords: num(env, 'OMI_MIN_ACTION_WORDS', 5, { min: 0 }),
   };
 }
 
@@ -227,11 +229,15 @@ const DECISION_WORDS = /\b(decided?|decision|agreed?|we'?ll|we will|going to|swi
  * would only make the OMI_MIN_CONFIDENCE filter drop real items for a
  * doubt that no step here actually introduced.
  */
-export function mapStructuredExtraction(conv) {
+export function mapStructuredExtraction(conv, { minActionWords = 0 } = {}) {
   const st = conv.structured && typeof conv.structured === 'object' ? conv.structured : {};
   const title = String(st.title || '').trim();
   const overview = String(st.overview || '').trim();
   const rawItems = Array.isArray(st.action_items) ? st.action_items : [];
+
+  // Counted BEFORE the word floor below, and it is what the overview fallback
+  // reads. See the comment on that fallback for why.
+  let survivedWithoutFloor = 0;
 
   const items = [];
   for (const it of rawItems) {
@@ -242,6 +248,15 @@ export function mapStructuredExtraction(conv) {
     // Already ticked off inside Omi — filing it as open work would be a to-do
     // that was done before we heard about it.
     if ((typeof it === 'object' && it?.completed === true)) continue;
+    survivedWithoutFloor += 1;
+    // 2026-09-16 — the substance floor (OMI_MIN_ACTION_WORDS, default 5). An
+    // action item too short to act on a week later is not a to-do, it is a
+    // fragment of transcription: 5 of the 116 open items read like "Fix it".
+    // The prefix is stripped first because an existing description may already
+    // carry "[Omi YYYY-MM-DD] ", which would otherwise pad the count by one.
+    // Deliberately the ONLY filter on action items — Mark reviewed the current
+    // set and approved it, so nothing else here second-guesses him.
+    if (minActionWords > 0 && wordCount(text.replace(OMI_PREFIX_RE, '')) < minActionWords) continue;
     items.push({
       category: 'action_item',
       text,
@@ -257,7 +272,15 @@ export function mapStructuredExtraction(conv) {
 
   // A conversation where something was settled but nothing was assigned still
   // carries the thing that was settled. One card, from the overview.
-  if (!items.length && overview && DECISION_WORDS.test(overview)) {
+  //
+  // 2026-09-16 — this reads survivedWithoutFloor, NOT items.length, and the
+  // difference matters. If the word floor above empties a conversation that DID
+  // have action items, reading items.length would open this gate and mint an
+  // unconfirmed_decision card the conversation does not have today. A change
+  // whose whole point is to remove noise must not manufacture a new row on its
+  // way past. A conversation Omi filed with no action items at all is the only
+  // one this fallback was ever for, and it still reaches it.
+  if (!survivedWithoutFloor && overview && DECISION_WORDS.test(overview)) {
     items.push({
       category: 'decision_candidate',
       text: clampStr(overview, 300).trim(),
@@ -538,7 +561,7 @@ export async function ingestOmiConversation(body, { db, llm, embed, env = proces
     stage = 'extract';
     let extracted;
     if (structured) {
-      extracted = mapStructuredExtraction(conv);
+      extracted = mapStructuredExtraction(conv, { minActionWords: cfg.minActionWords });
     } else {
       const llmFn = llm === undefined ? (await import('../llm-client.js')).callLLMJson : llm;
       extracted = { ...(await extractOmiItems(conv, { llm: llmFn })), via: 'llm' };

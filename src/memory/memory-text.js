@@ -27,6 +27,19 @@ export function stripPii(text) {
   return String(text).replace(EMAIL_RE, '[email]').replace(PHONE_RE, '[phone]');
 }
 
+/**
+ * Whitespace-delimited word count. Deliberately naive: the callers use it as a
+ * substance FLOOR ("is there enough here to be a task?"), not as linguistics.
+ * Added 2026-09-16 for the Omi action-item floor — "Fix it" is not a to-do
+ * anyone can act on a week later, "Call Shana to obtain the information needed
+ * for Meta business account access" is.
+ */
+export function wordCount(text) {
+  const t = String(text || '').trim();
+  if (!t) return 0;
+  return t.split(/\s+/).length;
+}
+
 function joinLines(...parts) {
   return parts.filter((p) => p && String(p).trim()).join('\n');
 }
