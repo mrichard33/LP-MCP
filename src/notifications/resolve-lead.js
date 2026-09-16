@@ -156,6 +156,11 @@ export async function resolveLeadId(input, deps = {}) {
         .from('lp_leads')
         .select('lp_lead_id, created_at_lp, synced_at')
         .eq('lp_prospect_id', prospectId)
+        // Most recent first, with lp_lead_id descending as the tie-break AND the
+        // real fallback when created_at_lp is null. src/lp-job-value.js records
+        // why id-order is trusted here: a COALESCE date chain falls through to
+        // "when we last touched this row", which is near-uniform and unrelated to
+        // chronology — ordering by noise rather than degrading gracefully.
         .order('created_at_lp', { ascending: false, nullsFirst: false })
         .order('lp_lead_id', { ascending: false })
         .limit(1),
