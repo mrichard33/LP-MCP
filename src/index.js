@@ -12,6 +12,10 @@ import { intakeJournal, startIntakeJournalSweeper, registerIntakeJournalRoutes }
 import { startSharedBudgetReporter, registerSharedBudgetRoutes } from './ghl-shared-budget.js';
 import { testConnection, getLeads } from './lp-client.js';
 import { getTokenStatus } from './token-manager.js';
+import { getToken } from './token-manager.js';
+import { buildIntegrationsHealth } from './integrations-health.js';
+import { five9AuthBreakerStatus, getSkills as five9GetSkills } from './five9-admin.js';
+import { getRecentGroupMeMessages } from './groupme-read.js';
 import supabase from './supabase.js';
 import { initFieldSync, runBulkFieldSync, logCycleStats } from './ghl-field-bootstrap.js';
 import { registerN8nEnrichRoute } from './n8n-enrichment.js';
@@ -1805,6 +1809,27 @@ app.get('/health', (req, res) => {
     },
     anthropic: process.env.ANTHROPIC_API_KEY ? 'configured' : 'MISSING',
   });
+});
+
+// ─── Integration reachability (2026-09-16) ───────────────────────────
+// Read-only probes for the services whose credentials live only here: the
+// LP API, Five9, Slack and GroupMe. Feeds the dashboard's Integrations grid so
+// a dead dialer or a silently no-op'd Slack mirror is visible on a screen
+// instead of inferred from a quiet night. Never posts anywhere; see
+// src/integrations-health.js for the state vocabulary and the tri-state rule.
+app.get('/health/integrations', authenticate, async (req, res) => {
+  try {
+    const result = await buildIntegrationsHealth({
+      env: process.env,
+      fetch,
+      lp: { getToken, getTokenStatus },
+      five9: { breakerStatus: five9AuthBreakerStatus, getSkills: five9GetSkills },
+      groupme: { getRecentMessages: getRecentGroupMeMessages },
+    });
+    res.json({ status: 'ok', ...result });
+  } catch (err) {
+    res.status(500).json({ status: 'error', error: err.message });
+  }
 });
 
 // ─── LLM provider/model diagnostics ──────────────────────────────────
