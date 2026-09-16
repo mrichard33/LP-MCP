@@ -276,3 +276,46 @@ populated on all 188 and partitions them well (chatbot-lane 51, calculator-lane
 18, scorecard-reporting 16, appointments 14, lp-ghl-sync 13, …), so the cheap fix
 is a one-time area→project map rather than 188 judgements, plus a `project`
 column written at checkpoint time going forward.
+
+---
+
+## Addendum — 2026-09-16: the stale column, and the shared-chat population
+
+**The 24-row clear landed.** Unlinked-with-keys 232 → 256, clean candidates
+188 → 212, 619 `exact` links untouched, 876 and 855 held as ruled. The cause was
+a positional zip: sorted sessions matched against sorted chats, attaching
+September sessions to spring chats other sessions own.
+
+**Gate B was reading the wrong column.** `claude_transcript_ledger.chat_updated_at`
+is the value at *review* time. A reopened chat keeps its old value, so a gate
+reading it rejects every reopened chat permanently — it would have refused session
+876's own correct link (ledger Mar 27; live search Sep 9 20:46 UTC, same day as
+the session). Gate B now names the live `conversation_search` / `recent_chats`
+value, and the stored column is marked history-only at §4b and at the re-open
+statement. Never gate on it.
+
+**The shared-chat population: 66 chats, not 92.** The 92 was pair-count inflated
+by groups of three or more.
+
+| Group span | Chats | Nature |
+|---|---|---|
+| Same day | 30 | double-checkpoints (the 1035/1037 pattern) |
+| 1–30 days | 12 | ambiguous |
+| Months apart | 24 (27 pairs) | reopen vs mis-link |
+
+**A key-overlap proxy split the 27 as 19 reopen / 8 mis-link, and it is not
+trustworthy.** It scored 876 a mis-link at 0.00 overlap when 876 is a proven
+reopen: the September session simply extracted different search keys for the same
+chat, so overlap measures whether two checkpointers picked similar words, not
+whether it is the same conversation. Treat 8 as an upper bound on mis-links. The
+definitive split needs live timestamps and therefore runs from a chat, not from
+Claude Code.
+
+**16 groups hold two `exact` links** (e.g. 939/968/971/973/974 against 234–237).
+Two sessions both claiming `exact` on one chat is a state the schema says cannot
+happen, which is the real question surfacing: if reopens are common, "one chat,
+one session" is wrong as a schema rule and the ledger's `chat_url` primary key
+cannot express the alternative. Refresh-only would fold ~19+ September sessions
+into spring rows — destroying real work, one-directionally. Many-sessions-per-chat
+is truthful but is a v4.0 LOCKED migration and Mark's ruling. **Nothing is folded
+until the live-timestamp table exists.**

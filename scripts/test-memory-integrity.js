@@ -543,6 +543,9 @@ test('queries.md §4b and the nightly check exclude the same rows', () => {
     assert.match(block, re, `§4b must carry the same exclusion as unlinked_sessions_7d: ${re}`);
   }
   assert.doesNotMatch(block, /created_at [<>]/, '§4b must stay windowless (v4.6)');
+  assert.match(block, /value at REVIEW time, not current/,
+    '§4b must carry the stale-column warning');
+  assert.match(block, /Never gate on it/, '§4b must forbid gating on chat_updated_at');
   assert.match(block, /Change one, change both/, '§4b must carry the alignment reminder');
 });
 
@@ -559,6 +562,17 @@ test('SKILL.md Mechanism 2 states all three identity gates, with the ET conversi
   assert.match(mech, /AT TIME ZONE 'America\/New_York'/, 'Gate B must convert to ET before comparing');
   assert.match(mech, /Same-day passes/, 'Gate B must allow the same day');
   // Gate C: write_date rows cannot be date-gated at all.
+  // Gate B must read the LIVE updated_at, not the ledger's stored column.
+  // claude_transcript_ledger.chat_updated_at is the value at review time: when a
+  // chat is reopened it stays where it was, so a gate reading it rejects every
+  // reopened chat permanently. Session 876 is the case — ledger Mar 27, live
+  // search Sep 9, same day as the session — so reading the column would refuse
+  // 876's own correct link, and a stale value is indistinguishable from a
+  // mis-link, which misreads the whole reopen class.
+  assert.match(mech, /never `claude_transcript_ledger\.chat_updated_at`/,
+    'Gate B must forbid the stale ledger column by name');
+  assert.match(mech, /LIVE value on the `conversation_search`/,
+    'Gate B must name the live source');
   assert.match(mech, /write_date/, 'Gate C must name write_date rows');
   assert.match(mech, /not\*{0,2} sufficient|not sufficient/, 'Gate C must say title fit alone is insufficient');
 });
