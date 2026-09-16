@@ -292,6 +292,33 @@ export function intakeJournal({ client: clientArg, track = trackBackground } = {
  *
  * @returns {Promise<{orphans:number, failures:number, routes:string[], oldest:string|null, action:string}>}
  */
+/**
+ * The status a row takes when its container disappeared mid-request.
+ *
+ * NOTE (2026-09-16): the `status` column carries a CHECK constraint that must
+ * list this value. The first release of the reclassifier shipped without the
+ * matching DDL, so every UPDATE was rejected and swallowed by the fail-open
+ * catch — the feature looked live and wrote nothing. isStatusConstraintError()
+ * below exists so that can never be a silent outcome again.
+ */
+const INTERRUPTED = 'interrupted';
+
+/** Named so the remediation log can print the exact constraint to alter. */
+const STATUS_CHECK_CONSTRAINT = 'intake_journal_status_check';
+
+/** Postgres check_violation. */
+const PG_CHECK_VIOLATION = '23514';
+
+/** One error line per process, not one per sweep. */
+let warnedStatusConstraint = false;
+
+/** Is this the schema rejecting our status value, rather than a transient fault? */
+export function isStatusConstraintError(err) {
+  if (!err) return false;
+  if (err.code === PG_CHECK_VIOLATION) return true;
+  return String(err.message || '').includes(STATUS_CHECK_CONSTRAINT);
+}
+
 /** The deployment this process belongs to, or null when unset (local dev). */
 export function currentDeploymentId() {
   return process.env.RAILWAY_DEPLOYMENT_ID || null;
@@ -336,11 +363,15 @@ export async function reclassifyInterruptedRows({ client: clientArg, deploymentI
 
   try {
     const { data, error } = await client.from(TABLE)
-      .update({ status: 'interrupted' })
+      .update({ status: INTERRUPTED })
       .eq('status', 'received')
       .or(`deployment_id.is.null,deployment_id.neq.${current}`)
       .select('id');
-    if (error) throw new Error(error.message);
+    if (error) {
+      const e = new Error(error.message);
+      e.code = error.code;          // 23514 on a CHECK violation
+      throw e;
+    }
     const n = (data || []).length;
     if (n > 0) {
       console.log(
@@ -350,6 +381,27 @@ export async function reclassifyInterruptedRows({ client: clientArg, deploymentI
     }
     return { reclassified: n, action: 'ok' };
   } catch (err) {
+    // A CHECK-constraint rejection is not a transient fault — it means the
+    // column does not accept 'interrupted' yet and NEVER will until the schema
+    // changes. Shipped 2026-09-16 without that DDL, so every pass failed
+    // silently behind the fail-open catch and no row was ever reclassified.
+    // That is the failure this module exists to prevent, so name it and name
+    // the remedy rather than logging it as one more non-blocking warning.
+    if (isStatusConstraintError(err)) {
+      if (!warnedStatusConstraint) {
+        warnedStatusConstraint = true;
+        console.error(
+          `[IntakeJournal] SCHEMA BLOCKED: '${INTERRUPTED}' is not permitted by `
+          + `${STATUS_CHECK_CONSTRAINT}, so orphans from dead containers cannot be `
+          + `reclassified. Sweep scoping still suppresses the false alarm, but rows stay `
+          + `labelled 'received'. Fix (Supabase dashboard, DDL): ALTER TABLE ${TABLE} `
+          + `DROP CONSTRAINT ${STATUS_CHECK_CONSTRAINT}, ADD CONSTRAINT `
+          + `${STATUS_CHECK_CONSTRAINT} CHECK (status IN ('received','done','rejected',`
+          + `'failed','${INTERRUPTED}'));`,
+        );
+      }
+      return { reclassified: 0, action: 'schema_blocked' };
+    }
     console.warn(`[IntakeJournal] reclassify failed (non-blocking): ${err.message}`);
     return { reclassified: 0, action: 'failed' };
   }
@@ -507,7 +559,8 @@ export async function pruneIntakeJournal({ client: clientArg, nowMs } = {}) {
     if (e1) throw new Error(e1.message);
 
     const { error: e2 } = await client.from(TABLE)
-      .delete().in('status', ['received', 'failed', 'rejected']).lt('received_at', openCutoff);
+      .delete().in('status', ['received', 'failed', 'rejected', 'interrupted'])
+      .lt('received_at', openCutoff);
     if (e2) throw new Error(e2.message);
   } catch (err) {
     console.warn(`[IntakeJournal] retention prune failed (ignored): ${err.message}`);
@@ -623,5 +676,6 @@ export default {
   journalRoutes,
   reclassifyInterruptedRows,
   currentDeploymentId,
+  isStatusConstraintError,
   DEFAULT_ROUTES,
 };

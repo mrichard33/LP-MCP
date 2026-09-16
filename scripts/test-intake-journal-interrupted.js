@@ -22,7 +22,7 @@ import assert from 'node:assert/strict';
 
 process.env.INTAKE_JOURNAL_MODE = 'live';
 
-const { reclassifyInterruptedRows, currentDeploymentId } =
+const { reclassifyInterruptedRows, currentDeploymentId, isStatusConstraintError } =
   await import('../src/intake-journal.js');
 
 /** Minimal PostgREST-shaped stub that records the filters it was handed. */
@@ -117,4 +117,69 @@ test('currentDeploymentId reads the Railway env, null when unset', () => {
   delete process.env.RAILWAY_DEPLOYMENT_ID;
   assert.equal(currentDeploymentId(), null);
   if (prev !== undefined) process.env.RAILWAY_DEPLOYMENT_ID = prev;
+});
+
+// ─── Schema-blocked (2026-09-16) ────────────────────────────────
+// The first release shipped without the DDL that lets `status` hold
+// 'interrupted'. Every UPDATE was rejected with a CHECK violation, the
+// fail-open catch swallowed it as a routine warning, and the feature looked
+// live while writing nothing. These lock the distinction.
+
+test('a CHECK violation is recognised by pg error code', () => {
+  const e = new Error('new row violates something');
+  e.code = '23514';
+  assert.equal(isStatusConstraintError(e), true);
+});
+
+test('a CHECK violation is recognised by constraint name in the message', () => {
+  const e = new Error('violates check constraint "intake_journal_status_check"');
+  assert.equal(isStatusConstraintError(e), true);
+});
+
+test('transient faults are NOT mistaken for a schema problem', () => {
+  assert.equal(isStatusConstraintError(new Error('connection reset')), false);
+  assert.equal(isStatusConstraintError(new Error('fetch failed')), false);
+  assert.equal(isStatusConstraintError(null), false);
+  assert.equal(isStatusConstraintError(undefined), false);
+});
+
+test('schema rejection reports schema_blocked, not the generic failure', async () => {
+  // The whole point: this outcome must be distinguishable from a blip, because
+  // it never recovers on its own.
+  const c = {
+    from() {
+      return {
+        update() {
+          return {
+            eq() { return this; },
+            or() { return this; },
+            select() {
+              return Promise.resolve({
+                data: null,
+                error: { message: 'violates check constraint "intake_journal_status_check"',
+                         code: '23514' },
+              });
+            },
+          };
+        },
+      };
+    },
+  };
+  const out = await reclassifyInterruptedRows({ client: c, deploymentId: 'deploy-current' });
+  assert.equal(out.action, 'schema_blocked');
+  assert.notEqual(out.action, 'failed');
+  assert.equal(out.reclassified, 0);
+});
+
+test('schema rejection still fails open — no throw, boot is never blocked', async () => {
+  const c = {
+    from() {
+      return { update() { return {
+        eq() { return this; }, or() { return this; },
+        select() { return Promise.reject(Object.assign(new Error('boom'), { code: '23514' })); },
+      }; } };
+    },
+  };
+  const out = await reclassifyInterruptedRows({ client: c, deploymentId: 'd' });
+  assert.equal(out.action, 'schema_blocked');
 });
