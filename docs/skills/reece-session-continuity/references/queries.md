@@ -146,6 +146,14 @@ No age window, and oldest first (v4.6). A window here made the sweep blind to
 exactly the rows the nightly `unlinked_sessions_7d` check flags; the pack's
 `unlinked_sessions` count is windowless too, so all three now agree.
 
+> **`chat_updated_at` is the value at REVIEW time, not current.** It is history.
+> Never gate on it. When a chat is reopened the stored value stays where it was,
+> so anything comparing it to a session date rejects every reopened chat — and a
+> stale value plus a reopen is indistinguishable from a mis-link, which misreads
+> the whole class. Session 876 is the worked example: ledger Mar 27, live search
+> Sep 9 20:46 UTC, same day as the session. Gate B (Mechanism 2) reads the LIVE
+> `updated_at` from the `conversation_search` / `recent_chats` result instead.
+
 **Keep this query and the nightly check aligned (v4.7).** The exclusions above
 are the same ones in `unlinked_sessions_7d` (`src/jobs/memory-validate.js`).
 A filter added in one place and not the other *is* the v4.6 bug in mirror image —
@@ -190,6 +198,10 @@ SELECT json_agg(u) FROM (
   `updated_at` is UTC and `session_date` is an ET date, so comparing them raw is
   an off-by-one: a chat last active `2026-09-08T02:00Z` is Sept 7 in ET. Same-day
   passes.
+  **`chat.updated_at` is the LIVE value from the `conversation_search` /
+  `recent_chats` result — never `claude_transcript_ledger.chat_updated_at`.**
+  That column is the value at review time and goes stale when a chat is reopened;
+  a gate reading it rejects every reopened chat permanently (see §4b).
 - **Gate C** — Gate B is impossible on `date_confidence='write_date'` rows, whose
   `session_date` *is* the write date. Those are the sweep-written rows most prone
   to mis-matching, so open the chat and confirm the work before accepting. Title
@@ -801,6 +813,10 @@ SELECT json_agg(row_to_json(s)) FROM (
 
 When `recent_chats` reports an `updated_at` later than the stored
 `chat_updated_at`, the chat continued after it was reviewed.
+
+This is exactly why `chat_updated_at` must never be used as a gate: between
+review and reopen it is simply wrong, and the row below is how it gets corrected.
+Read the live value for any decision; read the stored one only for history.
 
 ```sql
 UPDATE claude_transcript_ledger SET
