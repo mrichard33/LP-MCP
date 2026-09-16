@@ -77,6 +77,7 @@ import { runAutoclose, PROTECTED_LIST_SQL, logSql } from './memory-autoclose.js'
 import { runMemoryValidation, runDraftCheckpoints } from './memory-validate.js';
 import { runConflictScan } from './memory-conflicts.js';
 import { recommendBatch, getMode as getRecommendMode } from './memory-recommend.js';
+import { runJob } from '../job-runner.js';
 
 const TIMEZONE = 'America/New_York';
 const STALE_DAYS = 60;
@@ -470,7 +471,7 @@ export function startMemoryNightlyScheduler() {
     const today = todayET(now);
     if (!shouldRun({ hour: hourET(now), today, lastRunDate, targetHour })) return;
     lastRunDate = today; // claim before awaiting
-    try { await runMemoryNightly(); }
+    try { await runJob('memory-nightly', () => runMemoryNightly()); }
     catch (err) { console.error('[MemoryNightly] run threw:', err.message); await alertGroupMe(`run threw: ${err.message}`); }
   };
   timer = setInterval(tick, 5 * 60 * 1000);

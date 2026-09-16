@@ -37,6 +37,7 @@
 import supabase from './supabase.js';
 import { sendGroupMeMessage } from './groupme.js';
 import { reportAlertCondition } from './alert-state.js';
+import { runJob } from './job-runner.js';
 
 const ENABLED = (process.env.FIVE9_SILENCE_WATCHDOG_ENABLED || 'true') === 'true';
 const INTERVAL_MS = parseInt(process.env.FIVE9_SILENCE_INTERVAL_MS || '3600000', 10);
@@ -145,8 +146,8 @@ export function startFive9SilenceWatchdog() {
     return;
   }
   const tick = () =>
-    checkFive9Silence()
-      .then((sent) => { if (sent) console.log('[Five9Watchdog] silence alert sent'); })
+    runJob('five9-silence-watchdog', () => checkFive9Silence())
+      .then(({ value: sent }) => { if (sent) console.log('[Five9Watchdog] silence alert sent'); })
       .catch((e) => console.error('[Five9Watchdog] tick error:', e.message));
   setTimeout(tick, 30 * 1000);    // first run ~30s after boot
   setInterval(tick, INTERVAL_MS); // then on cadence

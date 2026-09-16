@@ -40,6 +40,7 @@ import { stripPii } from '../memory/memory-text.js';
 import { pushTasksToOmi } from '../memory/omi-tasks.js';
 import supabase from '../supabase.js';
 import { createHash } from 'node:crypto';
+import { runJob } from '../job-runner.js';
 
 export const PULL_MODES = new Set(['off', 'shadow', 'live']);
 export const PULL_KINDS = Object.freeze(['conversations', 'memories', 'action_items', 'writeback']);
@@ -494,8 +495,8 @@ export function startOmiPullScheduler(env = process.env) {
     if (!shouldRun({ nowMs: Date.now(), lastRunAt, intervalMin: cfg.intervalMin })) return;
     lastRunAt = Date.now(); // claim before awaiting, so a slow run cannot overlap itself
     try {
-      const res = await runOmiPull();
-      if (!res.ok) console.warn(`[OmiPull] run finished with errors: ${res.errors.join('; ')}`);
+      const { value: res } = await runJob('omi-pull', () => runOmiPull());
+      if (res && !res.ok) console.warn(`[OmiPull] run finished with errors: ${res.errors.join('; ')}`);
     } catch (err) {
       console.error(`[OmiPull] run threw: ${err.message}`);
     }

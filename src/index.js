@@ -55,6 +55,8 @@ import { registerAdminMemoryRoutes } from './routes/admin-memory.js';
 // outcomes job n8n calls. No DDL, no boot-time table creation.
 import { registerBotFeedbackRoutes } from './bot-feedback/routes.js';
 import { checkMemorySchema } from './memory/memory-migrations.js';
+import { startJobRunner } from './job-runner.js';
+import { JOBS } from './job-registry.js';
 import { startTier1EmbedSweep } from './knowledge/tier1-semantic.js';
 import { startExemplarSweep } from './knowledge/exemplars.js';
 import { startCiMomentsSweep } from './knowledge/ci-moments.js';
@@ -2205,6 +2207,14 @@ const server = app.listen(PORT, async () => {
   console.log(`MCP:          http://localhost:${PORT}/mcp`);
   console.log(`Health:       http://localhost:${PORT}/health`);
   await runMigrations();
+
+  // Job run history (2026-09-16, sql/113). Upserts the roster so a silent job
+  // is visible as silence, and closes any run left 'running' by the deploy that
+  // just replaced this container — that is `interrupted`, never a failure (same
+  // lesson as src/sync-log.js:56-70). Never throws: a missing sql/113 must not
+  // stop the service booting.
+  await startJobRunner(JOBS).catch((err) =>
+    console.error('[JobRunner] startup failed:', err.message));
   startTier1EmbedSweep(); // v1.10 — no-op while KB_FAQ_SEMANTIC_MODE=off
   startExemplarSweep();   // v1.11 — no-op while KB_EXEMPLAR_MODE=off
   startCiMomentsSweep();  // v1.12 — no-op while KB_CALL_MOMENTS_MODE=off

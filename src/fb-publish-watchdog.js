@@ -31,6 +31,7 @@
 import supabase from './supabase.js';
 import { sendGroupMeMessage } from './groupme.js';
 import { claimAlertConditionSet, confirmAlertSend } from './alert-state.js';
+import { runJob } from './job-runner.js';
 
 const ENABLED = (process.env.FB_WATCHDOG_ENABLED || 'true') === 'true';
 const GRACE_MIN = parseInt(process.env.FB_WATCHDOG_GRACE_MIN || '10', 10);
@@ -167,8 +168,8 @@ export function startFbPublishWatchdog() {
     return;
   }
   const tick = () =>
-    checkOverdueFbPosts()
-      .then((n) => { if (n) console.log(`[FBWatchdog] ${n} overdue post(s) flagged`); })
+    runJob('fb-publish-watchdog', () => checkOverdueFbPosts())
+      .then(({ value: n }) => { if (n) console.log(`[FBWatchdog] ${n} overdue post(s) flagged`); })
       .catch((e) => console.error('[FBWatchdog] tick error:', e.message));
   setTimeout(tick, 30 * 1000); // first run ~30s after boot
   setInterval(tick, INTERVAL_MS); // then on cadence
