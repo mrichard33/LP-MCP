@@ -52,6 +52,12 @@ on "I could not tell" announces a recovery nobody earned. This is why the `shoul
 return a `verdict` (`alert` / `healthy` / `insufficient_evidence`) rather than just a boolean — the
 boolean cannot distinguish "healthy" from "too quiet to conclude".
 
+**A job that never throws must still be able to fail.** `runJob` in `src/job-runner.js`
+records one row per scheduled pass, and it classifies from the RETURN VALUE, not just from a
+thrown error — `runMemoryNightly` and friends catch everything internally and report failure as
+`{ ok: false }`. `interrupted` (a deploy killed the pass) is never `failed`, and a job that
+could not tell is `unknown`. Roster in `src/job-registry.js`; see `docs/job-runs.md`.
+
 **Connection probes are read-only and never post.** `GET /health/integrations`
 (`src/integrations-health.js`) answers "can we reach LP / Five9 / Slack / GroupMe right now?"
 for the dashboard. A probe that cannot tell reports `unknown`, never `connected`; a GroupMe bot

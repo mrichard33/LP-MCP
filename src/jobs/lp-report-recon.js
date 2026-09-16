@@ -57,6 +57,7 @@ import { runSQL } from '../admin/supabase-admin.js';
 import { hourET, todayET, centsToDollars } from './lp-report-common.js';
 import { STATUS_BUCKET_MAP } from './lp-report-parse-b.js';
 import { computeProvisionalRtpGross } from './scorecard-rtp-source.js';
+import { runJob } from '../job-runner.js';
 
 const RECON_ENABLED = (process.env.LP_REPORT_RECON_ENABLED || 'true').trim() !== 'false';
 
@@ -604,7 +605,7 @@ export function startLpReportReconScheduler() {
     if (hourET() === 7 && lastReconDate !== today) {
       lastReconDate = today; // claim before awaiting (avoids double-fire)
       try {
-        await runLpReportRecon();
+        await runJob('lp-report-recon', () => runLpReportRecon());
       } catch (err) {
         console.error('[LPReportRecon] daily run failed:', err.message);
       }

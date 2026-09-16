@@ -102,6 +102,7 @@ import {
   timerToSeconds,
 } from '../five9-admin.js';
 import { getUsersFullInfo } from '../five9-users-info.js';
+import { runJob } from '../job-runner.js';
 
 const SNAPSHOT_ENABLED = process.env.FIVE9_CONFIG_SNAPSHOT_ENABLED === 'true';
 const SNAPSHOT_HOUR_ET = parseInt(process.env.FIVE9_CONFIG_SNAPSHOT_HOUR_ET || '4', 10);
@@ -660,7 +661,7 @@ export function startFive9ConfigSnapshotScheduler() {
     if (hourET() === SNAPSHOT_HOUR_ET && lastSnapshotDate !== today) {
       lastSnapshotDate = today; // claim before awaiting (avoids double-fire)
       try {
-        await runFive9ConfigSnapshot();
+        await runJob('five9-config-snapshot', () => runFive9ConfigSnapshot());
       } catch (err) {
         console.error('[Five9Snapshot] daily run failed:', err.message);
       }

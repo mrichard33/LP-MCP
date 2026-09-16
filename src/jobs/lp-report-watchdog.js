@@ -17,6 +17,7 @@
 import supabase from '../supabase.js';
 import { todayET, hourET } from './lp-report-common.js';
 import { reportAlertCondition } from '../alert-state.js';
+import { runJob } from '../job-runner.js';
 
 const DISABLED = !!(process.env.LP_REPORT_WATCHDOG_DISABLED || '').trim();
 
@@ -278,7 +279,7 @@ export function startLpReportWatchdog() {
     const h = hourET();
     if (h < 7 || (h === 7 && minuteET() < 30)) return;
     try {
-      await checkLpReportFreshness();
+      await runJob('lp-report-watchdog', () => checkLpReportFreshness());
     } catch (err) {
       console.error('[LPReportWatchdog] sweep failed:', err.message);
     }

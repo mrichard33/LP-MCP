@@ -107,6 +107,7 @@ import { processProspect } from '../sync-leads.js';
 import { computeMarketAssignments } from './market-assignment-daily.js';
 import { createPageWalker } from '../lp-paging.js';
 import { getDialRanks } from '../capacity/dialRankSource.js';
+import { runJob } from '../job-runner.js';
 
 const TIMEZONE = 'America/New_York';
 
@@ -1292,10 +1293,10 @@ export function startCapacitySweepScheduler() {
   // Fast pass: first run shortly after boot (fresh board after a deploy),
   // then on a strict interval — it finishes in seconds, so it never overlaps.
   setTimeout(() => {
-    runFastCapacityPass().catch((err) => console.error('[CapacitySweep] initial fast pass failed:', err.message));
+    runJob('capacity-sweep-fast', () => runFastCapacityPass()).catch((err) => console.error('[CapacitySweep] initial fast pass failed:', err.message));
   }, 15000);
   sweepTimer = setInterval(() => {
-    runFastCapacityPass().catch((err) => console.error('[CapacitySweep] fast pass failed:', err.message));
+    runJob('capacity-sweep-fast', () => runFastCapacityPass()).catch((err) => console.error('[CapacitySweep] fast pass failed:', err.message));
   }, SWEEP_INTERVAL_MS);
 
   // Lead pass: continuous chained loop — each cycle starts only after the

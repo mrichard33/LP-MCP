@@ -25,6 +25,7 @@ import {
   computeActuals, SCORECARD_GETLEAD_OPTIONS, DEFAULT_MARKET,
 } from './scorecard-metrics.js';
 import { resolveLiveMonthRevenue, PROVISIONAL_BASIS, LIVE_MONTH_SOURCE } from './scorecard-rtp-source.js';
+import { runJob } from '../job-runner.js';
 import {
   buildProspectMarketMap, buildProspectMarketMapFromAssignments,
   getMarketMaps, resolveMarket, normalizeZip5,
@@ -1037,7 +1038,7 @@ export function startGoalScorecardScheduler() {
     const hour = Number(parts.find((p) => p.type === 'hour')?.value ?? -1);
     const today = todayET();
     if (hour === 6 && lastRunDate !== today) {
-      await attemptDailyRun(today, 'daily 06:00 ET');
+      await runJob('goal-scorecard-daily', () => attemptDailyRun(today, 'daily 06:00 ET'));
     }
     // Watchdog window: any check from 07:00 ET onward (covers deploys that
     // boot mid-day — a fresh process still verifies today's snapshot exists).

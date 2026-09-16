@@ -38,6 +38,7 @@
  * v1.0 — 2026-06-17 (S1.3 audit remediation).
  */
 import supabase from '../supabase.js';
+import { runJob } from '../job-runner.js';
 
 const PROJECTION_INTERVAL_MS = Number(process.env.WORKFLOW_PROJECTION_INTERVAL_MS) || 120000; // 2 min
 const DEFAULT_BATCH = Number(process.env.WORKFLOW_PROJECTION_BATCH) || 500;
@@ -329,8 +330,8 @@ export function startWorkflowProjectionLoop() {
   }
   const tick = async () => {
     try {
-      const result = await runWorkflowProjection();
-      if (!result.success) console.warn('[WorkflowProjection] tick reported failures:', result.failed);
+      const { value: result } = await runJob('workflow-projection', () => runWorkflowProjection());
+      if (result && !result.success) console.warn('[WorkflowProjection] tick reported failures:', result.failed);
     } catch (err) {
       console.error('[WorkflowProjection] tick threw:', err.message);
     }

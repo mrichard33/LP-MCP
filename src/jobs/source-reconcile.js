@@ -55,6 +55,7 @@ import supabase from '../supabase.js';
 import { getSources } from '../lp-client.js';
 import { emitEvent } from '../event-emitter.js';
 import { loggedFirstKeys } from '../sync-utils.js';
+import { runJob } from '../job-runner.js';
 
 const TIMEZONE = 'America/New_York';
 
@@ -508,7 +509,7 @@ export function startSourceReconcileScheduler() {
     if (hour === 5 && minute >= 30 && lastRunKey !== today) {
       lastRunKey = today;
       try {
-        await runSourceReconcile();
+        await runJob('source-reconcile', () => runSourceReconcile());
       } catch (err) {
         console.error('[SourceReconcile] run failed:', err.message);
       }
