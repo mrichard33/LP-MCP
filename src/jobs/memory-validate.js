@@ -26,6 +26,14 @@
  * at it. Mark confirms by refreshing the session (which promotes it to
  * 'live') or drops it.
  *
+ * GATE B (2026-09-16) — claude_transcript_ledger.chat_updated_at is the chat's
+ * last activity AT REVIEW TIME, not now. A chat reopened after its ledger row
+ * was written leaves that column permanently behind; rows 4 to 8 months stale
+ * were observed on 2026-09-16. Never treat it as the current chat date and
+ * never let it produce date_confidence='exact'. The live value comes from
+ * conversation_search, which this service cannot call — so anything derived
+ * from this column is a guess and must be labelled one.
+ *
  * SQL shape follows memory-autoclose.js: SELECT candidates first (the run_sql
  * RPC returns only {status:'ok'} for a non-SELECT), then UPDATE.
  */
@@ -58,11 +66,18 @@ export const VALIDATION_CHECKS = Object.freeze([
     // was folded into another session, so its chat belongs to the row it was
     // folded into and any match a sweep finds for it is a false positive by
     // construction. 43 of them sat in the worklist on 2026-09-15 and the first
-    // real C2 run spent its budget refusing them. The SAME two clauses live in
-    // the skill's references/queries.md section 4b, which is where the sweep
+    // real C2 run spent its budget refusing them. The SAME two clauses belong
+    // in the skill's references/queries.md section 4b, which is where the sweep
     // actually gets its worklist: a filter added in one place and not the other
     // is exactly the v4.6 bug (the check and the sweep looking at different row
     // sets). Change one, change both.
+    //
+    // NOT YET MIRRORED (verified 2026-09-16): queries.md section 4b still reads
+    // `WHERE link_confidence = 'unlinked' AND surface = 'chat'` with no folded
+    // clauses, so the sweep continues to serve rows this check already hides.
+    // Note also that 4b keys off link_confidence while this check keys off
+    // chat_url IS NULL — those are different predicates and can disagree. Both
+    // need fixing on the skill side.
     //
     // Both jsonb tests are coalesce-wrapped because validation_notes is NULL on
     // most rows (77 of 78 overdue on 2026-09-15), and `NULL ? 'k'` is NULL, not
@@ -93,6 +108,41 @@ SELECT
        AND session_title NOT ILIKE '%[FOLDED%'
        AND NOT coalesce(validation_notes ? 'folded_into', false)
      ORDER BY created_at ASC LIMIT ${SAMPLE}) x) AS sample`,
+  },
+  {
+    // GATE B alarm. A ledger row whose chat_updated_at predates the session it
+    // points at is stale by construction: the session was written from work
+    // done in that chat, so the chat cannot have stopped moving before the
+    // session date. Every such row is a chat that was reopened after review.
+    //
+    // This exists because the stale column was being read as current. On
+    // 2026-09-16 a link sweep compared September session dates against these
+    // timestamps, concluded 25 September sessions were sitting on spring
+    // chats, and cleared 24 correct links. Sessions 983 and 1040 were then
+    // verified correct by opening the chats — each transcript contains that
+    // session's own memory_checkpoint payload. All 24 were restored.
+    //
+    // Nothing is repaired here. LP-MCP cannot call conversation_search, so it
+    // cannot learn the live updated_at; only the chat surface can refresh
+    // these. The count belongs in the Monday digest so the size of the stale
+    // population is known rather than rediscovered.
+    name: 'stale_ledger_timestamps',
+    description: 'ledger rows whose chat_updated_at predates the session_date of the session they point at (chat reopened after review — Gate B)',
+    sql: `
+SELECT
+  (SELECT count(*) FROM claude_transcript_ledger WHERE chat_updated_at IS NOT NULL AND session_id IS NOT NULL)::int AS rows_checked,
+  (SELECT count(*) FROM claude_transcript_ledger l JOIN claude_session_logs s ON s.id = l.session_id
+     WHERE l.chat_updated_at IS NOT NULL
+       AND (l.chat_updated_at AT TIME ZONE 'America/New_York')::date < s.session_date)::int AS rows_flagged,
+  (SELECT jsonb_agg(x) FROM (
+     SELECT l.session_id, s.session_date::text AS session_date,
+            (l.chat_updated_at AT TIME ZONE 'America/New_York')::date::text AS ledger_date,
+            (s.session_date - (l.chat_updated_at AT TIME ZONE 'America/New_York')::date) AS days_stale,
+            left(coalesce(l.chat_title, ''), 60) AS chat_title
+     FROM claude_transcript_ledger l JOIN claude_session_logs s ON s.id = l.session_id
+     WHERE l.chat_updated_at IS NOT NULL
+       AND (l.chat_updated_at AT TIME ZONE 'America/New_York')::date < s.session_date
+     ORDER BY 4 DESC LIMIT ${SAMPLE}) x) AS sample`,
   },
   {
     name: 'write_date_rows',
@@ -341,14 +391,24 @@ export function draftSessionRow(cand, now = new Date()) {
   const valid = updated && !Number.isNaN(updated.getTime());
   const title = String(cand.chat_title || 'untitled chat').slice(0, 300);
   const today = dateET(now);
+  // The ledger timestamp is the best date available here, so it is still used
+  // for session_date — but it is the chat's last activity AT REVIEW TIME, and a
+  // reopened chat leaves it months behind (Gate B, header). It is therefore
+  // never proof of an exact date.
   const session_date = valid ? dateET(updated) : today;
   const session_title = `[DRAFT] ${title}`.slice(0, 300);
   return {
     session_date,
-    date_confidence: valid ? 'exact' : 'write_date',
+    // ALWAYS 'write_date', even when the timestamp parsed cleanly. Stamping
+    // 'exact' here was self-sealing: the section 1c date self-heal only repairs
+    // 'write_date' rows, so a draft dated months early from a stale ledger row
+    // could never be corrected, and the context pack went on ranking it as
+    // recent. A draft's real date comes from the first user message when Mark
+    // opens the chat and refreshes it.
+    date_confidence: 'write_date',
     session_title,
     phase_focus: 'nightly draft — confirm or drop',
-    raw_summary: `[NIGHTLY DRAFT ${today} — chat "${title}" was found by reconciliation but never checkpointed. Open the chat and refresh this session (memory_checkpoint with session_id) to confirm it, or mark the ledger row no_content to drop it.]`,
+    raw_summary: `[NIGHTLY DRAFT ${today} — chat "${title}" was found by reconciliation but never checkpointed. Open the chat and refresh this session (memory_checkpoint with session_id) to confirm it, or mark the ledger row no_content to drop it. The date on this row is a guess from the ledger timestamp; the refresh sets the real one.]`,
     transcript_search_keys: [title].filter(Boolean),
     chat_url: cand.chat_url, chat_title: title,
     source_chat_updated_at: valid ? updated.toISOString() : null,
