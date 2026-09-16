@@ -255,6 +255,36 @@ test('registerJobs upserts the whole roster keyed on job_id', async () => {
   assert.equal(five9.enabled_default, false);
 });
 
+test('the gate is resolved at boot, because the dashboard cannot read this env', async () => {
+  const db = fakeDb();
+  await registerJobs(JOBS, deps(db, { env: { FIVE9_CONFIG_SNAPSHOT_ENABLED: 'true', MEMORY_NIGHTLY_ENABLED: 'false' } }));
+  const rows = db.calls.upsert[0].payload;
+  const byId = Object.fromEntries(rows.map((r) => [r.job_id, r]));
+
+  // Switched on by env despite shipping dark.
+  assert.equal(byId['five9-config-snapshot'].enabled, true);
+  assert.equal(byId['five9-config-snapshot'].enabled_default, false);
+  // Switched off by env despite defaulting on — must read disabled, not stale.
+  assert.equal(byId['memory-nightly'].enabled, false);
+  assert.equal(byId['memory-nightly'].enabled_default, true);
+  // Ungated jobs are always enabled.
+  assert.equal(byId['capacity-sweep-fast'].enabled, true);
+});
+
+test('every gate mirrors its own module, including the inverted and mode ones', () => {
+  const gate = (id) => JOBS.find((j) => j.id === id).isEnabled;
+  // LP_REPORT_WATCHDOG_DISABLED is inverted: any non-empty value disables.
+  assert.equal(gate('lp-report-watchdog')({}), true);
+  assert.equal(gate('lp-report-watchdog')({ LP_REPORT_WATCHDOG_DISABLED: '1' }), false);
+  // OMI_PULL_MODE is a mode, not a boolean, and ships off.
+  assert.equal(gate('omi-pull')({}), false);
+  assert.equal(gate('omi-pull')({ OMI_PULL_MODE: 'live' }), true);
+  assert.equal(gate('omi-pull')({ OMI_PULL_MODE: 'off' }), false);
+  // The ordinary default-on shape.
+  assert.equal(gate('source-reconcile')({}), true);
+  assert.equal(gate('source-reconcile')({ SOURCE_RECONCILE_ENABLED: 'false' }), false);
+});
+
 test('a missing sql/113 does not take the boot down', async () => {
   const db = fakeDb({ failUpsert: true });
   const res = await registerJobs(JOBS, deps(db));
@@ -314,6 +344,7 @@ test('the roster is unique, complete and shaped', () => {
     assert.match(j.id, /^[a-z0-9-]+$/, `${j.id} should be a slug`);
     assert.ok(j.label && j.group && j.cadence, `${j.id} needs a label, group and cadence`);
     assert.equal(typeof j.enabledDefault, 'boolean');
+    assert.equal(typeof j.isEnabled, 'function', `${j.id} needs a resolvable gate`);
   }
 });
 

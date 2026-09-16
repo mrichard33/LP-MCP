@@ -10,11 +10,17 @@
  * that is silent — which is the only failure mode that has ever actually hurt
  * here. Listing the expected jobs separately is what makes silence visible.
  *
- * `enabledEnv` / `enabledDefault` exist so the dashboard can say "disabled"
- * rather than "stale" for a job that is deliberately switched off. An alarm
- * that fires on the healthy case gets muted, and a muted alarm is how the
- * 47-hour outage and the 71-day blind spot both went unnoticed (CLAUDE.md,
- * "Classify before you threshold").
+ * `isEnabled(env)` exists so the dashboard can say "disabled" rather than
+ * "stale" for a job that is deliberately switched off. An alarm that fires on
+ * the healthy case gets muted, and a muted alarm is how the 47-hour outage and
+ * the 71-day blind spot both went unnoticed (CLAUDE.md, "Classify before you
+ * threshold").
+ *
+ * The gate has to be RESOLVED HERE, at boot, and stored: these env vars live on
+ * this service and the dashboard cannot see them. Each expression below mirrors
+ * the one in the job's own module exactly — including the inverted one
+ * (LP_REPORT_WATCHDOG_DISABLED) and the one that is a mode rather than a
+ * boolean (OMI_PULL_MODE). If you change a gate there, change it here.
  *
  * ADDING A JOB. Add a row here, then wrap its work call inside its own
  * start*Scheduler() with runJob('<id>', () => runX()). Wrap the WORK, not the
@@ -37,6 +43,7 @@ export const JOBS = Object.freeze([
     cadence: 'daily 03:00 ET',
     enabledEnv: 'MEMORY_NIGHTLY_ENABLED',
     enabledDefault: true,
+    isEnabled: (env) => String(env.MEMORY_NIGHTLY_ENABLED || 'true').toLowerCase() !== 'false',
   },
   {
     id: 'capacity-sweep-fast',
@@ -45,6 +52,7 @@ export const JOBS = Object.freeze([
     cadence: 'every 15 min',
     enabledEnv: null,
     enabledDefault: true,
+    isEnabled: () => true,
   },
   {
     id: 'lp-report-watchdog',
@@ -53,6 +61,7 @@ export const JOBS = Object.freeze([
     cadence: 'every 5 min from 07:30 ET',
     enabledEnv: 'LP_REPORT_WATCHDOG_DISABLED',
     enabledDefault: true,
+    isEnabled: (env) => !String(env.LP_REPORT_WATCHDOG_DISABLED || '').trim(),
   },
   {
     id: 'workflow-projection',
@@ -61,6 +70,7 @@ export const JOBS = Object.freeze([
     cadence: 'every 2 min',
     enabledEnv: 'WORKFLOW_PROJECTION_ENABLED',
     enabledDefault: true,
+    isEnabled: (env) => String(env.WORKFLOW_PROJECTION_ENABLED || 'true').toLowerCase() !== 'false',
   },
   {
     id: 'scorecard-validate',
@@ -69,6 +79,7 @@ export const JOBS = Object.freeze([
     cadence: 'daily 07:00 ET',
     enabledEnv: 'SCORECARD_VALIDATE_ENABLED',
     enabledDefault: true,
+    isEnabled: (env) => (env.SCORECARD_VALIDATE_ENABLED || 'true') === 'true',
   },
   {
     id: 'omi-pull',
@@ -77,6 +88,7 @@ export const JOBS = Object.freeze([
     cadence: 'every 15 min',
     enabledEnv: 'OMI_PULL_MODE',
     enabledDefault: false,
+    isEnabled: (env) => String(env.OMI_PULL_MODE || 'off').toLowerCase().trim() !== 'off',
   },
   {
     id: 'five9-silence-watchdog',
@@ -85,6 +97,7 @@ export const JOBS = Object.freeze([
     cadence: 'hourly',
     enabledEnv: 'FIVE9_SILENCE_WATCHDOG_ENABLED',
     enabledDefault: true,
+    isEnabled: (env) => (env.FIVE9_SILENCE_WATCHDOG_ENABLED || 'true') === 'true',
   },
   {
     id: 'fb-publish-watchdog',
@@ -93,6 +106,7 @@ export const JOBS = Object.freeze([
     cadence: 'every 5 min',
     enabledEnv: 'FB_WATCHDOG_ENABLED',
     enabledDefault: true,
+    isEnabled: (env) => (env.FB_WATCHDOG_ENABLED || 'true') === 'true',
   },
 
   // ── Keep their own detail table, but had no roster entry ──────────────────
@@ -103,6 +117,7 @@ export const JOBS = Object.freeze([
     cadence: 'daily 05:30 ET',
     enabledEnv: 'SOURCE_RECONCILE_ENABLED',
     enabledDefault: true,
+    isEnabled: (env) => (env.SOURCE_RECONCILE_ENABLED || 'true') === 'true',
   },
   {
     id: 'goal-scorecard-daily',
@@ -111,6 +126,7 @@ export const JOBS = Object.freeze([
     cadence: 'daily 06:00 ET',
     enabledEnv: null,
     enabledDefault: true,
+    isEnabled: () => true,
   },
   {
     id: 'lp-report-recon',
@@ -119,6 +135,7 @@ export const JOBS = Object.freeze([
     cadence: 'daily 07:00 ET',
     enabledEnv: 'LP_REPORT_RECON_ENABLED',
     enabledDefault: true,
+    isEnabled: (env) => (env.LP_REPORT_RECON_ENABLED || 'true').trim() !== 'false',
   },
   {
     id: 'five9-config-snapshot',
@@ -127,6 +144,7 @@ export const JOBS = Object.freeze([
     cadence: 'daily 04:00 ET',
     enabledEnv: 'FIVE9_CONFIG_SNAPSHOT_ENABLED',
     enabledDefault: false,
+    isEnabled: (env) => env.FIVE9_CONFIG_SNAPSHOT_ENABLED === 'true',
   },
 ]);
 

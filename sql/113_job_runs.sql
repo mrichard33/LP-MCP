@@ -63,13 +63,20 @@ CREATE TABLE IF NOT EXISTS public.job_registry (
   cadence         TEXT,               -- human text, e.g. 'daily 03:00 ET'
   enabled_env     TEXT,               -- env var that switches it off, if any
   enabled_default BOOLEAN NOT NULL DEFAULT TRUE,
+  enabled         BOOLEAN NOT NULL DEFAULT TRUE,
   registered_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Re-runnable on an instance created before `enabled` existed.
+ALTER TABLE public.job_registry
+  ADD COLUMN IF NOT EXISTS enabled BOOLEAN NOT NULL DEFAULT TRUE;
 
 COMMENT ON TABLE public.job_registry IS
   'Every instrumented background job. Upserted at boot by src/job-runner.js.';
 COMMENT ON COLUMN public.job_registry.enabled_default IS
-  'What the gate env var defaults to when unset. Lets the UI say "disabled" instead of "stale".';
+  'What the gate env var defaults to when unset — documents whether a job ships dark.';
+COMMENT ON COLUMN public.job_registry.enabled IS
+  'The gate RESOLVED at boot against this service''s own env. The dashboard cannot read those vars, so without this a deliberately disabled job would read as stale. Lets the UI say "disabled" instead.';
 
 -- ── B. The history ──────────────────────────────────────────────────────────
 
@@ -139,6 +146,7 @@ SELECT r.job_id,
        r.cadence,
        r.enabled_env,
        r.enabled_default,
+       r.enabled,
        l.status           AS last_status,
        l.started_at       AS last_started_at,
        l.finished_at      AS last_finished_at,

@@ -60,11 +60,15 @@ carrying no new signal.
 
 ## Adding the thirteenth job
 
-1. Add a row to `JOBS` in `src/job-registry.js`, including `enabledEnv` and
-   `enabledDefault` if the job has a gate. Those two fields are what let the
+1. Add a row to `JOBS` in `src/job-registry.js`, including an `isEnabled(env)`
+   that mirrors the gate in the job's own module exactly. That is what lets the
    dashboard say "disabled" instead of "stale" — an alarm that fires on the
    healthy case gets muted, and a muted alarm is how the outages above went
-   unnoticed.
+   unnoticed. The gate is **resolved here at boot and stored** in
+   `job_registry.enabled`, because these env vars live on this service and the
+   dashboard cannot read them. Watch the two odd ones:
+   `LP_REPORT_WATCHDOG_DISABLED` is inverted, and `OMI_PULL_MODE` is a mode
+   rather than a boolean.
 2. Wrap the call inside that job's own `start*Scheduler()`:
    ```js
    await runJob('my-job', () => runMyJob());

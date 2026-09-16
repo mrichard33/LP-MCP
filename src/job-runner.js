@@ -227,6 +227,10 @@ function serializable(value) {
 export async function registerJobs(jobs, deps = {}) {
   const client = db(deps);
   if (!client) return { registered: 0, skipped: 'no supabase' };
+  // Resolve each gate HERE, against this service's env. The dashboard cannot
+  // see these variables, so without a stored answer a job that is deliberately
+  // switched off is indistinguishable from one that has silently stopped.
+  const env = deps.env || process.env;
   const rows = jobs.map((j) => ({
     job_id: j.id,
     label: j.label,
@@ -234,6 +238,7 @@ export async function registerJobs(jobs, deps = {}) {
     cadence: j.cadence || null,
     enabled_env: j.enabledEnv || null,
     enabled_default: j.enabledDefault !== false,
+    enabled: typeof j.isEnabled === 'function' ? Boolean(j.isEnabled(env)) : true,
     registered_at: new Date((deps.now || (() => Date.now()))()).toISOString(),
   }));
   try {
