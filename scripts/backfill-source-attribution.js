@@ -46,6 +46,8 @@
  *   node scripts/backfill-source-attribution.js --limit 25 --write
  */
 
+import { pathToFileURL } from 'node:url';
+
 import supabaseDefault from '../src/supabase.js';
 import { executeAddTag } from '../src/actions/handlers/tags.js';
 import { getContactCached } from '../src/actions/contact-cache.js';
@@ -73,6 +75,12 @@ const PACE_MS = argOf('--pace-ms', 250);
  *                    whole exercise exists to stop writing. Caught by checking
  *                    the planner against real rows, not by the unit tests.
  */
+/**
+ * Credentials this script cannot run without. SUPABASE_* reach the LP database;
+ * GHL_API_KEY is used for the live per-contact read and the restore write.
+ */
+export const REQUIRED_ENV = ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'GHL_API_KEY'];
+
 const NON_RESTORABLE = new Set(['source:internet', 'source:unknown']);
 
 /**
@@ -193,8 +201,19 @@ async function main(deps = {}) {
   const addTag = deps.addTag || executeAddTag;
   const sleep = deps.sleep || ((ms) => new Promise((r) => setTimeout(r, ms)));
 
+  // Preflight. Nothing in the import chain loads dotenv, so these must come from
+  // the shell. Without it a missing variable surfaces as
+  // "TypeError: Cannot read properties of null (reading 'from')" several frames
+  // deep, which tells the operator nothing about what to set.
+  const missing = REQUIRED_ENV.filter((k) => !process.env[k]);
+  if (missing.length > 0) {
+    console.error(`[backfill] missing required environment variable(s): ${missing.join(', ')}`);
+    console.error('[backfill] these are NOT read from a .env file — set them in the shell, or run via `railway run`.');
+    throw new Error(`missing env: ${missing.join(', ')}`);
+  }
+
   const since = new Date(Date.now() - DAYS * 86400000).toISOString();
-  console.log(`[backfill] ${WRITE ? 'WRITE' : 'DRY RUN'} — events since ${since}`);
+  console.log(`[backfill] ${WRITE ? 'WRITE' : 'DRY RUN'} — events since ${since} (--days ${DAYS})`);
 
   // Page through a table, since Supabase caps a single response.
   const PAGE = 1000;
@@ -279,7 +298,18 @@ async function main(deps = {}) {
 }
 
 // Only run when invoked directly, so the helpers above stay importable by tests.
-if (import.meta.url === `file://${process.argv[1]}`) {
+//
+// 2026-09-16 — pathToFileURL, NOT `file://${process.argv[1]}`. On Windows argv[1]
+// is a backslash path, so the string form produces
+//   file://C:\Users\mark\LP-MCP\scripts\backfill-source-attribution.js
+// against an import.meta.url of
+//   file:///C:/Users/mark/LP-MCP/scripts/backfill-source-attribution.js
+// which never matches — main() silently never runs and the process exits 0 with
+// no output, indistinguishable from a clean run that found nothing. That is the
+// worst failure mode a repair script can have. It matched on Linux, which is why
+// it survived review. pathToFileURL is in Node core and handles drive letters,
+// backslashes and spaces (a repo path with a space broke the old form too).
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch((err) => { console.error(err); process.exit(1); });
 }
 

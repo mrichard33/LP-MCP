@@ -14,10 +14,11 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { pathToFileURL } from 'node:url';
 
 process.env.GHL_API_KEY = 'test-key';
 
-const { mostSpecific, repairVerdict, lossesFromEvents, lossesFromActions, buildPlan, WIPE_RULES } =
+const { mostSpecific, repairVerdict, lossesFromEvents, lossesFromActions, buildPlan, WIPE_RULES, REQUIRED_ENV } =
   await import('../scripts/backfill-source-attribution.js');
 
 /** The script's plan for one producer, as the old planFromEvents returned it. */
@@ -248,4 +249,46 @@ test('WIPE_RULES names exactly the three rules that wrote source:unknown', () =>
     'ENTRY_HYGIENE_AT_CREATION_OTHER',
     'ENTRY_HYGIENE_AT_CREATION_UNKNOWN',
   ], 'the other 20 hygiene rules wipe source: but then write a SPECIFIC tag — that is an upgrade, not loss');
+});
+
+// ─── the direct-run guard must work on Windows ─────────────────────────
+
+test('the direct-run guard matches on Windows-style paths', () => {
+  // 2026-09-16 — the guard was `import.meta.url === \`file://${process.argv[1]}\``.
+  // On Windows argv[1] is a backslash path, so that comparison was ALWAYS false:
+  // main() never ran, and the process exited 0 with no output — a repair script
+  // that looks like it succeeded and found nothing. It matched on Linux, which
+  // is the only reason it shipped.
+  const winPath = 'C:\\Users\\mark\\LP-MCP\\scripts\\backfill-source-attribution.js';
+  const winUrl = pathToFileURL(winPath).href;
+
+  assert.notEqual(winUrl, `file://${winPath}`,
+    'the old string form is what broke Windows — if these are ever equal the test has stopped testing anything');
+  assert.ok(winUrl.startsWith('file:///'),
+    `a Windows path must become a triple-slash file URL, got ${winUrl}`);
+  assert.ok(!winUrl.includes('\\'), 'and must contain no backslashes');
+});
+
+test('the direct-run guard still matches on POSIX paths', () => {
+  const posixPath = '/home/user/LP-MCP/scripts/backfill-source-attribution.js';
+  assert.equal(pathToFileURL(posixPath).href, `file://${posixPath}`,
+    'the fix must not change Linux behaviour, where the old form already worked');
+});
+
+test('the guard survives a path containing a space', () => {
+  // Latent on Linux too: the old form left the space unencoded, so
+  // import.meta.url (which percent-encodes) never matched.
+  const spaced = '/home/user/My Repos/LP-MCP/scripts/backfill-source-attribution.js';
+  const href = pathToFileURL(spaced).href;
+  assert.ok(href.includes('%20'), `expected the space to be encoded, got ${href}`);
+  assert.notEqual(href, `file://${spaced}`);
+});
+
+test('the env preflight names every credential the script cannot run without', () => {
+  // Nothing in the import chain loads dotenv. Without the preflight a missing
+  // variable surfaces as "Cannot read properties of null (reading 'from')"
+  // several frames into main(), which tells an operator nothing.
+  assert.deepEqual([...REQUIRED_ENV].sort(),
+    ['GHL_API_KEY', 'SUPABASE_SERVICE_ROLE_KEY', 'SUPABASE_URL'],
+    'SUPABASE_* reach the LP database; GHL_API_KEY does the live read and the restore write');
 });
