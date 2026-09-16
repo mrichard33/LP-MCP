@@ -509,7 +509,7 @@ export function startSourceReconcileScheduler() {
     if (hour === 5 && minute >= 30 && lastRunKey !== today) {
       lastRunKey = today;
       try {
-        await runJob('source-reconcile', () => runSourceReconcile());
+        await runJob('source-reconcile', () => runSourceReconcile(), { occurrence: today });
       } catch (err) {
         console.error('[SourceReconcile] run failed:', err.message);
       }

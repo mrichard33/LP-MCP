@@ -184,7 +184,7 @@ export function startScorecardValidateScheduler() {
     const today = new Intl.DateTimeFormat('en-CA', { timeZone: TIMEZONE, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
     if (hour === 7 && lastRunDate !== today) {
       lastRunDate = today;
-      try { await runJob('scorecard-validate', () => tick()); } catch (err) { console.error('[ScorecardValidate] run failed:', err.message); }
+      try { await runJob('scorecard-validate', () => tick(), { occurrence: today }); } catch (err) { console.error('[ScorecardValidate] run failed:', err.message); }
     }
   };
   validateTimer = setInterval(checkAndRun, 5 * 60 * 1000);

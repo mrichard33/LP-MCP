@@ -140,6 +140,10 @@ function db(deps) {
  * must keep ticking: a failed pass is data, not a reason to stop the timer, and
  * a failure to WRITE the log row must not take the job down with it.
  *
+ * `deps.occurrence` names the slot this run belongs to — the ET date for the
+ * daily jobs. With one set, the database decides which replica runs: the loser
+ * gets `skipped` and the job is never called. Interval jobs pass nothing.
+ *
  * Returns { status, summary, value, error } so a caller that wants the job's
  * own return value still has it.
  */
@@ -148,6 +152,9 @@ export async function runJob(jobId, fn, deps = {}) {
   const now = deps.now || (() => Date.now());
   const startedMs = now();
   const startedAt = new Date(startedMs).toISOString();
+
+  const owner = deps.instanceId || instanceId();
+  const occurrence = deps.occurrence ?? null;
 
   let runId = null;
   if (client) {
@@ -158,7 +165,8 @@ export async function runJob(jobId, fn, deps = {}) {
           job_id: jobId,
           status: JOB_STATUS.RUNNING,
           started_at: startedAt,
-          instance_id: deps.instanceId || instanceId(),
+          instance_id: owner,
+          occurrence_key: occurrence,
         })
         .select('id')
         .single();
@@ -166,7 +174,17 @@ export async function runJob(jobId, fn, deps = {}) {
       runId = data?.id ?? null;
       if (runId !== null) activeRunIds.add(runId);
     } catch (err) {
-      // Losing the log row must not lose the job. Run it unlogged and say so.
+      // A lost race on (job_id, occurrence_key) is not a failure: another
+      // replica claimed this slot first (sql/114). Decline WITHOUT running the
+      // job — winning that claim is the entire point of the index, and the
+      // per-process date guards in the daily jobs cannot see across containers.
+      if (isOccurrenceTaken(err)) {
+        const summary = `another run already owns ${jobId} for ${occurrence}`;
+        console.log(`[JobRunner] ${jobId}: ${summary}`);
+        return { status: JOB_STATUS.SKIPPED, summary, value: undefined, error: null };
+      }
+      // Any OTHER failure to open the row must not lose the job. Run it
+      // unlogged and say so.
       console.error(`[JobRunner] ${jobId}: could not open a run row: ${err.message}`);
     }
   }
@@ -200,7 +218,10 @@ export async function runJob(jobId, fn, deps = {}) {
           finished_at: new Date(finishedMs).toISOString(),
           elapsed_ms: Math.max(0, Math.round(finishedMs - startedMs)),
         })
-        .eq('id', runId);
+        .eq('id', runId)
+        // Owner in the predicate: a slow process must not write a terminal
+        // result over a row another replica has since taken responsibility for.
+        .eq('instance_id', owner);
       if (updErr) throw updErr;
     } catch (err) {
       console.error(`[JobRunner] ${jobId}: could not close run ${runId}: ${err.message}`);
@@ -208,6 +229,19 @@ export async function runJob(jobId, fn, deps = {}) {
   }
 
   return { status, summary, value, error };
+}
+
+/**
+ * Did this INSERT lose the (job_id, occurrence_key) claim from sql/114?
+ *
+ * Postgres reports 23505 for a unique violation. The message is matched too
+ * because PostgREST does not always carry the code through, and treating a lost
+ * claim as an ordinary error would run the job anyway — the exact double-run
+ * the index exists to prevent.
+ */
+export function isOccurrenceTaken(err) {
+  if (!err) return false;
+  return err.code === '23505' || /duplicate key value/i.test(err.message || '');
 }
 
 /** jsonb-safe: drop anything that will not survive JSON.stringify. */

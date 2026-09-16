@@ -661,7 +661,7 @@ export function startFive9ConfigSnapshotScheduler() {
     if (hourET() === SNAPSHOT_HOUR_ET && lastSnapshotDate !== today) {
       lastSnapshotDate = today; // claim before awaiting (avoids double-fire)
       try {
-        await runJob('five9-config-snapshot', () => runFive9ConfigSnapshot());
+        await runJob('five9-config-snapshot', () => runFive9ConfigSnapshot(), { occurrence: today });
       } catch (err) {
         console.error('[Five9Snapshot] daily run failed:', err.message);
       }

@@ -63,6 +63,14 @@ could not tell is `unknown`. Roster in `src/job-registry.js`; see `docs/job-runs
 for the dashboard. A probe that cannot tell reports `unknown`, never `connected`; a GroupMe bot
 id alone is `unknown` because posting is the only way to exercise a bot.
 
+**Text from outside is stripped before it reaches a model.** Every tool registered
+through `registerAllTools` has its text output passed through `stripUnicodeTags`
+(`src/text-sanitize.js`). Unicode TAG characters are invisible to every human who
+reviews a message and fully visible to a model, so anyone who can text the business
+could otherwise smuggle instructions into an agent's context. The wrapper sits at
+registration because that is the one place that covers all 126 tools and the next
+one added.
+
 **Classify before you threshold.** An alarm that fires on the healthy case gets muted, and a muted
 alarm is how a 47-hour outage and a 71-day blind spot both went unnoticed. Exclude the legitimately-
 quiet cases explicitly (see the eligible-replies split in `agentic-silence-alerts.js` and the

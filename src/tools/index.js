@@ -13,8 +13,17 @@ import { registerCapacityTools } from './capacity-tools.js';
 import { registerAdminTools } from './admin/index.js';
 import { registerFive9Tools } from './five9-tools.js';
 import { registerMemoryTools } from './memory-tools.js';
+import { withSanitizedResults } from '../text-sanitize.js';
 
-export function registerAllTools(server) {
+export function registerAllTools(rawServer) {
+  // 2026-09-16 — every tool's text output passes through the invisible-character
+  // strip on the way out (src/text-sanitize.js). These tools return customer
+  // -authored text: message bodies, contact names, notes. Unicode TAG characters
+  // are invisible to every human who reviews them and fully visible to a model,
+  // so anyone who can text the business could otherwise smuggle instructions
+  // into an agent's context. Registration is the one choke point that covers all
+  // 126 tools, including the ones added after this line.
+  const server = withSanitizedResults(rawServer);
   // LP data tools (16)
   registerLeadTools(server);
   registerPipelineTools(server);

@@ -605,7 +605,7 @@ export function startLpReportReconScheduler() {
     if (hourET() === 7 && lastReconDate !== today) {
       lastReconDate = today; // claim before awaiting (avoids double-fire)
       try {
-        await runJob('lp-report-recon', () => runLpReportRecon());
+        await runJob('lp-report-recon', () => runLpReportRecon(), { occurrence: today });
       } catch (err) {
         console.error('[LPReportRecon] daily run failed:', err.message);
       }
