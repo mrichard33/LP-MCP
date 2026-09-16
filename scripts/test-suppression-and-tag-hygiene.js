@@ -24,8 +24,14 @@ test('stop-bot tag matches mutation suppression', () => {
   assert.equal(matchMutationSuppression(['agentic-active', 'stop-bot']), 'stop-bot');
 });
 
-test('suppress-automation tag matches mutation suppression', () => {
-  assert.equal(matchMutationSuppression(['suppress-automation']), 'suppress-automation');
+test('suppress-automation NO LONGER matches mutation suppression (2026-08-08 ruling)', () => {
+  // It was self-sealing: remove_tag had no audit exemption, so the tag blocked
+  // its own removal and a 48-hour post-booking pause became permanent on 3,729
+  // contacts. The pause itself is still correct and now lives on the send path
+  // via SUPPRESS_TAGS, not on every mutation.
+  assert.equal(matchMutationSuppression(['suppress-automation']), null);
+  // stop-bot is lead-initiated and universal — it must still gate mutations.
+  assert.equal(matchMutationSuppression(['suppress-automation', 'stop-bot']), 'stop-bot');
 });
 
 test('matching is case-insensitive', () => {
