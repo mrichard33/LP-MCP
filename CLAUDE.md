@@ -30,6 +30,15 @@ mirror do the rest:
 Because the mirror sits below the card builders, there is no second copy of any message format.
 Build the card once.
 
+**When Slack is the PRIMARY destination, not a mirror, use `postToSlack(text, channelId)`** in
+`src/slack.js` — it returns `{ ok, ts, channel, error }`. `mirrorToSlack` fans out to several channels
+and reduces the result to a count, so it cannot tell you the message `ts` or that a specific post
+failed; it now delegates to `postToSlack` so there is still exactly one `chat.postMessage` call in the
+repo. Precedent: `src/notifications/slack-sale.js`, whose row has to store the `ts`, and which is
+Slack-only because GroupMe keeps firing for the same event from inside the GHL workflow. Unlike the
+mirror, `postToSlack` ignores `SLACK_MIRROR_ENABLED` — a destination of record must not depend on a
+migration switch.
+
 ## Alerting
 
 Alert modules are **pure and dependency-free** so they unit-test without importing supabase, GroupMe
@@ -117,6 +126,29 @@ Before claiming a rule never fires, check `agent_actions.rule_applied`. One flag
 - Deleting from `system_events` can trip `agent_actions_event_id_fkey`. Guard with
   `AND NOT EXISTS (SELECT 1 FROM agent_actions a WHERE a.event_id = e.id)` and delete in batches — a
   single large statement is atomic, so one FK violation rolls the whole thing back.
+
+**`lp_leads.close_date` is not all one thing — read `close_date_source` first.** Until 2026-09-16 the
+column was NULL on all 24,834 `closed_won` rows, because nothing ever wrote it; `get_rep_performance`
+still buckets by `appointment_date` for that reason. `sql/118` backfilled it and
+`POST /notifications/sale-announcement` now writes it per sale, so three cases coexist:
+
+| `close_date_source` | means |
+|---|---|
+| `appointment_proxy` | backfilled from `appointment_date` — the right MONTH, not the right DAY |
+| `sale_announcement` | written when the sale was announced — trustworthy to the day |
+| `lp` | reserved; nothing writes it until LP exposes a real close date |
+| NULL | a won lead with no `appointment_date` either. Undated, honestly |
+
+Anything that turns on the exact day must filter on the source. `sync-leads.js` never includes
+`close_date` in its upsert row, so `ON CONFLICT DO UPDATE` leaves it alone and a written value
+survives every sync — that is why the backfill is durable, and why adding `close_date` to that row
+object would silently erase all of this.
+
+**Rep names do not match across the LP/GHL boundary.** LP stores `"Last, First"` (`O'Connor, Tim`);
+GHL's Rep Display Name (`yxOTDIT7Um0JxkOPUbPo`) holds `"First Last"` (`Tim O'Connor`). An exact
+compare finds ZERO rows for every rep on the floor and fails silently — a metric that reads "no sales"
+rather than an error. Use `repNameKey()` in `src/notifications/sale-facts.js` to compare, and
+`formatRepFirstName()` in `src/response-generator.js` when a customer will read the name.
 
 ## Tests and CI
 

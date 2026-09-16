@@ -56,6 +56,17 @@ export const FACTS_BUDGET_MS = 3000;
 export const NOTABLE_STREAK_DAYS = 3;
 
 /**
+ * Explicit row bounds. The Supabase client defaults to 1,000 rows, and a DEFAULT
+ * is the wrong thing to rely on here: a month that quietly exceeded it would
+ * compute every rank against a TRUNCATED set and publish a confidently wrong
+ * number to the whole floor. Current volume is ~370-430 sales/month (measured
+ * 2026-09-16), so 5,000 is ~12x headroom — and if it is ever hit, buildRepFacts
+ * degrades instead of guessing. A missing fact is fine; a wrong rank is not.
+ */
+export const MTD_ROW_LIMIT = 5000;
+export const HISTORY_ROW_LIMIT = 2000;
+
+/**
  * Normalise a rep name to a key that matches across the LP/GHL boundary.
  * "O'Connor, Tim" and "Tim O'Connor" both → "connor o tim".
  *
@@ -189,13 +200,17 @@ export async function buildRepFacts(repDisplayName, saleAmount, deps = {}) {
       .select('rep_name, job_value, close_date')
       .eq('closed_won', true)
       .not('rep_name', 'is', null)
-      .gte('close_date', monthStart(at)),
+      .gte('close_date', monthStart(at))
+      .limit(MTD_ROW_LIMIT),
     remaining(),
   );
   if (mtd?.__timedOut) return bail('mtd_timeout');
   if (mtd?.error) return bail(`mtd_failed:${mtd.error.message}`);
 
   const rows = Array.isArray(mtd.data) ? mtd.data : [];
+
+  // Truncation would make every rank below silently wrong. Degrade instead.
+  if (rows.length >= MTD_ROW_LIMIT) return bail(`mtd_truncated_at_${MTD_ROW_LIMIT}`);
 
   const volumeByKey = new Map();
   const countByKey = new Map();
@@ -244,7 +259,8 @@ export async function buildRepFacts(repDisplayName, saleAmount, deps = {}) {
         .select('job_value, close_date')
         .eq('closed_won', true)
         .eq('rep_name', canonical ?? String(repDisplayName))
-        .gte('close_date', trailingYearStart(at)),
+        .gte('close_date', trailingYearStart(at))
+        .limit(HISTORY_ROW_LIMIT),
       remaining(),
     );
     if (hist?.__timedOut) {

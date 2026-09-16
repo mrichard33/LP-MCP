@@ -34,6 +34,7 @@ import { registerCallbackMessageRoutes } from './agentic-callback-message.js';
 import { registerNurtureRoutes } from './nurture/nurture-orchestrator.js';
 import { registerEngagementRoutes } from './nurture/nurture-engagement.js';
 import { registerAppointmentNotificationRoutes } from './notifications/appointment-notifications.js';
+import { registerSaleAnnouncementRoutes } from './notifications/sale-announcement.js';
 import { registerContractCancellationNotificationRoutes } from './notifications/cancellation-notifications.js';
 import { five9WebhookHandler } from './five9-events.js';
 import { probeGHLContactTracked } from './services/ghl-contact-probe.js';
@@ -1477,6 +1478,23 @@ export function registerRestApiRoutes(app, authenticate) {
   // ENABLE_ENHANCED_APPT_NOTIFICATIONS env var (returns 503 when not
   // 'true' so the workflow's 30-min timeout fires the fallback).
   registerAppointmentNotificationRoutes(app);
+
+  // ═══════════════════════════════════════════════════════════════
+  // POST /notifications/sale-announcement — Slack sales board
+  // ═══════════════════════════════════════════════════════════════
+  // Receives each completed sale from the GHL "I.LP-IN LP Inbound Disposition
+  // Webhook" (7f24f79d-3d93-4b62-bd24-074f9ade769a) Sold branch, enriches it
+  // with the rep's real month from lp_leads, composes the announcement and
+  // posts it to SLACK_CHANNEL_SALES.
+  //
+  // Auth is its OWN fail-closed bearer (SALE_ANNOUNCE_TOKEN), deliberately not
+  // the `authenticate` middleware — that one passes everything through when
+  // MCP_AUTH_TOKEN is unset or AUTH_SOFT_LAUNCH is true, which must never apply
+  // to something that posts to a channel the whole company reads.
+  //
+  // Gated by SALE_ANNOUNCE_ENABLED (records status 'disabled' and returns 200,
+  // rather than erroring, so GHL never retries a deliberate no-op).
+  registerSaleAnnouncementRoutes(app);
 
   // ═══════════════════════════════════════════════════════════════
   // POST /api/agentic/notifications/contract-cancellation — Email only

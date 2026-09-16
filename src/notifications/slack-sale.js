@@ -37,6 +37,28 @@ import { sendGroupMeMessage } from '../groupme.js';
 export const SLACK_RETRY_ATTEMPTS = 3;
 export const SLACK_RETRY_DELAY_MS = 5000;
 
+/**
+ * Slack errors that will answer identically on every attempt. Retrying these
+ * three times buys nothing and delays the ops alert by fifteen seconds — on the
+ * single most likely failure, a misconfigured SLACK_CHANNEL_SALES. CLAUDE.md's
+ * warning applies directly here: a misconfigured channel looks exactly like a
+ * quiet night, so the alert needs to be fast.
+ *
+ * `ratelimited`, `service_unavailable` and any transport error (threw) are
+ * deliberately NOT here — those are exactly what the retry is for.
+ */
+export const PERMANENT_SLACK_ERRORS = Object.freeze([
+  'no_token',
+  'no_channel',
+  'no_text',
+  'invalid_auth',
+  'account_inactive',
+  'token_revoked',
+  'channel_not_found',
+  'not_in_channel',
+  'is_archived',
+]);
+
 function groupMeMirrorEnabled() {
   return String(process.env.SALE_ANNOUNCE_GROUPME_MIRROR || 'false') === 'true';
 }
@@ -73,10 +95,16 @@ export async function postSaleAnnouncement(text, deps = {}) {
       return { ...last, attempts: attempt };
     }
     logger.warn?.(
-      `[SaleAnnounce] Slack post attempt ${attempt}/${attempts} failed: ${last.error}`,
+      `[SaleAnnounce] Slack post attempt ${attempt}/${attempts} ` +
+      `${last.threw ? 'threw' : 'failed'}: ${last.error}`,
     );
-    // A missing token or channel will fail identically every time.
-    if (last.error === 'no_token' || last.error === 'no_channel') break;
+    // A transport failure is always worth another go; a permanent refusal never
+    // is. Anything unrecognised is retried — guessing "permanent" wrongly loses
+    // a sale, guessing "transient" wrongly costs ten seconds.
+    if (!last.threw && PERMANENT_SLACK_ERRORS.includes(String(last.error))) {
+      logger.warn?.(`[SaleAnnounce] "${last.error}" is permanent — not retrying, alerting ops now`);
+      break;
+    }
     if (attempt < attempts) await wait(delayMs);
   }
 

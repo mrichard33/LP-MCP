@@ -153,7 +153,11 @@ export async function mirrorToSlack(text, channel, opts = {}) {
   for (const id of ids) {
     const res = await postToSlack(text, id);
     if (res.ok) ok++;
-    else console.warn(`[Slack] post to ${id} failed: ${res.error}`);
+    // "threw" and "failed" are not the same diagnosis and the log must keep them
+    // apart: threw means we never reached Slack (DNS, TLS, reset, timeout),
+    // failed means Slack answered and refused (invalid_auth, channel_not_found).
+    // One is our network, the other is our configuration.
+    else console.warn(`[Slack] post to ${id} ${res.threw ? 'threw' : 'failed'}: ${res.error}`);
   }
   return { mirrored: ok > 0, channels: ids.length, sent: ok };
 }
@@ -178,16 +182,20 @@ export async function mirrorToSlack(text, channel, opts = {}) {
  *   - It reports failure instead of swallowing it, so a caller that must know
  *     (retry, mark the row slack_failed, raise an ops alert) can. It still never
  *     throws.
+ *
+ * `threw: true` marks a transport failure — we never got an answer from Slack.
+ * `threw: false` with an error means Slack answered and refused. Retrying helps
+ * with the first and almost never with the second.
  */
 export async function postToSlack(text, channelId) {
-  if (!text) return { ok: false, ts: null, channel: channelId || null, error: 'no_text' };
-  if (!channelId) return { ok: false, ts: null, channel: null, error: 'no_channel' };
+  if (!text) return { ok: false, ts: null, channel: channelId || null, error: 'no_text', threw: false };
+  if (!channelId) return { ok: false, ts: null, channel: null, error: 'no_channel', threw: false };
   if (!SLACK_BOT_TOKEN) {
     if (!warnedNoToken) {
       console.warn('[Slack] SLACK_BOT_TOKEN unset — post is a no-op');
       warnedNoToken = true;
     }
-    return { ok: false, ts: null, channel: channelId, error: 'no_token' };
+    return { ok: false, ts: null, channel: channelId, error: 'no_token', threw: false };
   }
 
   try {
@@ -202,16 +210,17 @@ export async function postToSlack(text, channelId) {
     });
     const body = await res.json().catch(() => ({}));
     if (body?.ok) {
-      return { ok: true, ts: body.ts || null, channel: body.channel || channelId, error: null };
+      return { ok: true, ts: body.ts || null, channel: body.channel || channelId, error: null, threw: false };
     }
     return {
       ok: false,
       ts: null,
       channel: channelId,
       error: String(body?.error || res.status),
+      threw: false,
     };
   } catch (err) {
-    return { ok: false, ts: null, channel: channelId, error: err.message };
+    return { ok: false, ts: null, channel: channelId, error: err.message, threw: true };
   }
 }
 
