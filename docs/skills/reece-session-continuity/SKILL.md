@@ -7,6 +7,8 @@ description: "Use this skill at the START and END of every working session for t
 
 ## Overview
 
+> **v4.9 — 2026-09-16.** **`session.project` (sql/115).** Every session ever written lost the one fact that makes a link sweep targetable: which Claude project its chat lives in. `conversation_search` is project-scoped, so without it the only way to link a row is to open a chat in each project and probe — 189 rows are in that state, and the area→project table is a **search order, not an assignment**: each sweep chat already knows its own project implicitly, because search only returns that project's chats. Roughly 12 chats × 3 probes discovers the partition empirically instead of guessing 189 times. Pass `session.project` on every chat-surface write from now on and the backlog becomes the only population that ever needs discovering. Free text, not an enum — project names change, and a CHECK constraint here would repeat the `link_confidence` problem, where a fourth legitimate value needed a migration and rippled through every query that read the column. Nothing is backfilled: an absent project is the truth for an old row, and a guessed value written over a blank is worse than the blank.
+>
 > **v4.8 — 2026-09-16.** Gate B said "`updated_at`" without saying which one. `claude_transcript_ledger.chat_updated_at` is the value **at review time**, so a reopened chat keeps its old value — and a gate reading that column rejects every reopened chat, permanently. Session 876 is the case: the ledger says Mar 27, live `conversation_search` returned Sep 9 20:46 UTC, the same day as the session. Read from the ledger, 876's own correct link is refused forever. Worse, a stale value plus a reopen is indistinguishable from a mis-link, so the whole reopen class gets misread as bad data. Gate B now names the **live** value from the `conversation_search` / `recent_chats` result, and the stored column is marked history-only in §4b and at the re-open statement. Sizing the shared-chat population found 66 chats claimed by more than one session — 30 same-day double-checkpoints, 12 within a month, 27 pairs months apart — and 16 groups where **two** rows hold `exact`, a state the schema says cannot happen. Whether one chat may own many sessions is Mark's ruling; nothing is folded until the live-timestamp split exists.
 >
 > **v4.7 — 2026-09-15.** The first real C2 run wrote nothing, for two reasons. (a) **The worklist was contaminated:** 43 `[FOLDED → #NNN]` rows sat in it, and a folded row's chat belongs to the row it was folded into, so every match found for one is a false positive. `references/queries.md` §4b and the nightly check now both exclude them — *both*, because filtering one and not the other is the v4.6 bug in mirror image. (b) **The matcher had no identity test.** Topical keys match every session on a long-running subject, so three September sessions surfaced spring chats that were already linked. Mechanism 2 step 2 now runs three gates: an up-front set of already-claimed `chat_url`s, a date gate comparing in **ET** (`updated_at` is UTC, `session_date` is an ET date — comparing raw is an off-by-one), and a stricter rule for `write_date` rows, which cannot be date-gated at all and must be confirmed by opening the chat. Investigating also **disproved** a twin theory: only 4 of 188 candidates overlap a linked session by ≥0.60, and Mark ruled those are separate sessions months apart on the same subject. Folding them would have destroyed real work.
@@ -150,6 +152,8 @@ Write the same keys onto each `claude_decision_log` row created in the session, 
 
 Set `surface` to `chat`, `cowork`, or `code` on every write. When reconciliation runs later, checkpoints written from `cowork` or `code` are **expected** to be unlinked — do not flag them as gaps. Only `surface='chat'` rows with `link_confidence='unlinked'` are genuine backfill candidates.
 
+**Set `session.project` too, on every chat-surface write (sql/115).** It is the name of the Claude project this chat lives in. `conversation_search` is project-scoped, so a row without it cannot be *targeted* by a later link sweep — it can only be found by probing every project in turn. 189 rows are in that state right now because the field did not exist until 2026-09-16; each one costs searches that a single string at write time would have made unnecessary. Free text, so write the project's real name as it appears to you. Omit it only when there is genuinely no project (outside any project, or a `cowork` / `code` / `n8n` write).
+
 If a reconciliation is requested on a surface without the transcript tools, say so plainly and do the parts that work rather than silently skipping.
 
 ## Known blind spot — project scoping
@@ -230,6 +234,7 @@ Steps 2–4a below describe what the tool writes; you no longer write them by ha
 memory_checkpoint({
   session: {
     title, summary, phase_focus, surface: "chat" | "cowork" | "code" | "n8n",
+    project: "<the Claude project this chat is in>",   // sql/115 — set on every chat write
     search_keys: [5–8 verbatim strings], date?, chat_url?, chat_title?,
     workflows_touched?, mcp_verified_ids?
   },
@@ -509,6 +514,7 @@ The guard itself (`MEMORY_GUARD_MODE`) ships in `shadow` — it logs what it wou
 - [ ] `LP MCP:memory_context({ topic })` called with a real topic — NOT the old all-open-issues dump, NOT hand SQL unless the tool failed twice
 - [ ] `counts` read, so the size of what was left out is known
 - [ ] Reconciliation pass run (chat surface only) — ledger vs. recent_chats
+- [ ] `session.project` set on the checkpoint (sql/115) — the project this chat lives in
 - [ ] Auto-link pass run (Mechanism 2, mandatory): every unlinked `surface='chat'` session, any age, matched by `transcript_search_keys` through `conversation_search` (timestamps only as a fallback on live rows), URL + ledger row written
 - [ ] If this chat's own session has `date_confidence='write_date'`, its real date written from the first message (§1c)
 - [ ] Context synthesized into natural language (not raw JSON dumps)
