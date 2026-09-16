@@ -27,22 +27,40 @@ const TIMEOUT_MS = 20000;
 const MAX_RETRIES = 3;
 const BASE_BACKOFF_MS = 500;
 
+// v1.1 — 2026-09-16. Request-path callers get their own policy. The 20s/3-retry
+// budget above is sized for the background ingest sweeps; on the reply path it
+// sits inside a 1500ms box (KB_VECTOR_TIMEOUT_MS), so a single 429 — 500ms of
+// backoff plus a second full request — blew the whole lookup. 41 of 217 semantic
+// lookups over 13 days died this way, every one of them a 1500ms timeout.
+// Mirrors the `fast` mode on lpPost() in src/lp-client.js.
+const FAST_TIMEOUT_MS = parseInt(process.env.OPENAI_EMBED_FAST_TIMEOUT_MS || '3000', 10);
+
 const ENDPOINT = 'https://api.openai.com/v1/embeddings';
+
+// Seam so the retry/timeout policy is unit-testable without a network (CLAUDE.md).
+export const deps = { fetch: (...args) => fetch(...args) };
 
 // ═══════════════════════════════════════════════════════════════════
 // INTERNAL: HTTP call with exponential backoff
 // ═══════════════════════════════════════════════════════════════════
 
-async function callOpenAI(inputArray) {
+async function callOpenAI(inputArray, opts = {}) {
   if (!OPENAI_API_KEY) throw new Error('OPENAI_API_KEY not configured');
   if (!Array.isArray(inputArray) || inputArray.length === 0) {
     throw new Error('callOpenAI requires non-empty input array');
   }
 
+  // Reply-path callers pass { fast: true }: one attempt, short timeout. Batch
+  // callers pass nothing and keep the resilient policy.
+  const fast = opts.fast === true;
+  const perCallTimeoutMs = fast ? FAST_TIMEOUT_MS : TIMEOUT_MS;
+  const maxAttempts = fast ? 1 : MAX_RETRIES;
+
   let lastError = null;
-  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const isLastAttempt = attempt === maxAttempts - 1;
     try {
-      const res = await fetch(ENDPOINT, {
+      const res = await deps.fetch(ENDPOINT, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -54,7 +72,7 @@ async function callOpenAI(inputArray) {
           dimensions: DIMENSIONS,
           encoding_format: 'float',
         }),
-        signal: AbortSignal.timeout(TIMEOUT_MS),
+        signal: AbortSignal.timeout(perCallTimeoutMs),
       });
 
       if (res.status === 429 || res.status >= 500) {
@@ -63,9 +81,11 @@ async function callOpenAI(inputArray) {
         const backoff = retryAfter > 0
           ? retryAfter * 1000
           : BASE_BACKOFF_MS * Math.pow(2, attempt);
-        console.warn(`[OpenAIEmbeddings] HTTP ${res.status}, retry in ${backoff}ms (attempt ${attempt + 1}/${MAX_RETRIES})`);
-        await new Promise(r => setTimeout(r, backoff));
         lastError = new Error(`OpenAI HTTP ${res.status}`);
+        // Sleeping on the final attempt only delays the caller's failure.
+        if (isLastAttempt) break;
+        console.warn(`[OpenAIEmbeddings] HTTP ${res.status}, retry in ${backoff}ms (attempt ${attempt + 1}/${maxAttempts})`);
+        await new Promise(r => setTimeout(r, backoff));
         continue;
       }
 
@@ -94,9 +114,10 @@ async function callOpenAI(inputArray) {
     } catch (err) {
       if (err.name === 'AbortError' || err.name === 'TimeoutError') {
         const backoff = BASE_BACKOFF_MS * Math.pow(2, attempt);
-        console.warn(`[OpenAIEmbeddings] Timeout, retry in ${backoff}ms (attempt ${attempt + 1}/${MAX_RETRIES})`);
-        await new Promise(r => setTimeout(r, backoff));
         lastError = err;
+        if (isLastAttempt) break;
+        console.warn(`[OpenAIEmbeddings] Timeout, retry in ${backoff}ms (attempt ${attempt + 1}/${maxAttempts})`);
+        await new Promise(r => setTimeout(r, backoff));
         continue;
       }
       // Non-retryable error
@@ -115,16 +136,18 @@ async function callOpenAI(inputArray) {
  * Embed a single string. Returns the 1536-dim vector.
  *
  * @param {string} text — Input to embed (trimmed, non-empty)
+ * @param {Object} [opts]
+ * @param {boolean} [opts.fast] — reply path: 1 attempt, short timeout
  * @returns {Promise<{embedding: number[], tokens: number, cost_usd: number}>}
  */
-export async function embed(text) {
+export async function embed(text, opts = {}) {
   if (!text || typeof text !== 'string') {
     throw new Error('embed() requires non-empty string');
   }
   const trimmed = text.trim();
   if (!trimmed) throw new Error('embed() input is empty after trim');
 
-  const result = await callOpenAI([trimmed]);
+  const result = await callOpenAI([trimmed], opts);
   return {
     embedding: result.embeddings[0],
     tokens: result.tokens,

@@ -169,7 +169,7 @@ import {
 import { getKbFaqSemanticMode } from './tier1-semantic-core.js';
 import {
   makeQueryEmbedder,
-  matchFaqsSemantic,
+  matchFaqsProbed,
   classifyObjectionSemantic,
   logKbQuery,
 } from './tier1-semantic.js';
@@ -761,13 +761,17 @@ export async function searchFaqs(messageText, channel = 'sms', limit = 3, opts =
   const started = Date.now();
   const getQueryEmbedding = opts.getQueryEmbedding || makeQueryEmbedder(messageText);
   let semantic = [];
+  let topSim = null;
   let error = null;
   try {
-    semantic = await withTimeout(
-      (async () => matchFaqsSemantic(await getQueryEmbedding(), channel, limit))(),
+    // v1.13 — shadow probes below the floor so a miss records how close it got.
+    const probed = await withTimeout(
+      (async () => matchFaqsProbed(await getQueryEmbedding(), channel, limit, { probe: mode === 'shadow' }))(),
       KB_VECTOR_TIMEOUT_MS,
       'kb faq semantic',
     );
+    semantic = probed.matches;
+    topSim = probed.top;
   } catch (err) {
     error = err.message;
   }
@@ -777,7 +781,7 @@ export async function searchFaqs(messageText, channel = 'sms', limit = 3, opts =
     keyword = await searchFaqsKeyword(messageText, channel, limit);
   }
 
-  const top = typeof semantic[0]?.similarity === 'number' ? semantic[0].similarity : null;
+  const top = topSim;
   console.log(
     `[KBRetriever] faq ${mode}: semantic=${semantic.length} keyword=${keyword === null ? 'skipped' : keyword.length}` +
     ` top_sim=${top === null ? 'n/a' : top.toFixed(3)} latency=${Date.now() - started}ms` +
@@ -899,6 +903,54 @@ async function getConciergeBeliefDocs(intentClass) {
 }
 
 /**
+ * v1.13 — 2026-09-16. Start the per-turn query embedding EARLY.
+ *
+ * Every semantic tier shares one memoised embedding and then runs a pgvector
+ * RPC, with both steps inside one KB_VECTOR_TIMEOUT_MS (1500ms) box. Measured
+ * over 13 days of production audit rows: the embed is ~770ms and the RPC ~270ms
+ * (Tier 2 runs last, always attaches to a warm embedding, and its 268ms p50 is
+ * therefore RPC-only). The embed was eating three quarters of a budget it was
+ * never sized for, and 41 of 217 lookups died as 1500ms timeouts — 23% of the
+ * exemplar tier and 4% of Tier 2, which is live.
+ *
+ * Starting it at the top of generateResponse overlaps it with buildLeadContext
+ * and classifyInbound — the latter is a whole LLM round trip — so by the time
+ * any tier asks, the promise is already resolved and the box covers the RPC
+ * alone. One kickoff fixes every tier at once.
+ *
+ * Returns null when the text is empty or every semantic mode is off, which
+ * preserves the guarantee that all-flags-off is byte-identical to before.
+ *
+ * This is deliberately SPECULATIVE: the intent class is not known until
+ * classifyInbound has run, which is the very work being overlapped, so a turn
+ * that ends up needing no tier still embeds once. At text-embedding-3-small
+ * that is ~$0.00001 against ~13 turns/day — immaterial next to the 41 lookups
+ * the serial version was losing.
+ *
+ * @returns {(() => Promise<Object|null>)|null} memoised getter for buildKbPack
+ */
+export function prewarmQueryEmbedding(messageText) {
+  if (!messageText || typeof messageText !== 'string' || !messageText.trim()) return null;
+  const anySemanticOn = getKbFaqSemanticMode() !== 'off'
+    || getKbVectorMode() !== 'off'
+    || getKbExemplarMode() !== 'off'
+    || getKbCallMomentsMode() !== 'off';
+  if (!anySemanticOn) return null;
+
+  const getQueryEmbedding = makeQueryEmbedder(messageText);
+  const started = Date.now();
+  // Fire now, resolve later. The catch is required, not decorative: the memo
+  // rejects on failure and clears itself, and without a handler attached at
+  // kickoff that rejection is unhandled before any tier gets a chance to await.
+  // A failed prewarm is not fatal — the cleared memo means the first tier to
+  // ask simply embeds again, which is exactly the pre-v1.13 behaviour.
+  getQueryEmbedding()
+    .then(() => console.log(`[KBEmbed] prewarm ready in ${Date.now() - started}ms`))
+    .catch((err) => console.warn(`[KBEmbed] prewarm failed in ${Date.now() - started}ms (tiers re-embed): ${err.message}`));
+  return getQueryEmbedding;
+}
+
+/**
  * Build the full KB pack for a response generation call.
  *
  * v1.7 — Now also detects scheduling continuation signals (day names,
@@ -925,7 +977,10 @@ export async function buildKbPack(params) {
 
   // v1.10 — one query embedding per turn, computed lazily on first use and
   // shared by Tier 1 semantic FAQ, objection typing, and Tier 2.
-  const getQueryEmbedding = makeQueryEmbedder(messageText);
+  // v1.13 — reuse the embedding the reply path already started (see
+  // prewarmQueryEmbedding). Falling back to a fresh lazy embedder keeps every
+  // other caller of buildKbPack working unchanged.
+  const getQueryEmbedding = params.getQueryEmbedding || makeQueryEmbedder(messageText);
   const faqSemanticMode = getKbFaqSemanticMode();
 
   const detectedCompetitor = detectCompetitorMention(messageText);

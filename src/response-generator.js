@@ -258,6 +258,7 @@ import { buildLeadContext } from './context-builder.js';
 import { classifyInbound, isShortCircuit } from './knowledge/intent-classifier.js';
 import {
   buildKbPack,
+  prewarmQueryEmbedding,
   formatKbPackForPrompt,
   ensureEstimateLink,
   hasCompletedEstimate,
@@ -2695,6 +2696,14 @@ export function applyConfFlowMergeKeys(text, confFlowContext) {
 // ═══════════════════════════════════════════════════════════════════
 
 export async function generateResponse(contactId, channel, triggerMessage, opts = {}) {
+  // 2026-09-16 — start the KB query embedding BEFORE the first await. It costs
+  // ~770ms against a 1500ms per-tier budget when left to fire lazily inside
+  // buildKbPack, which is what made 41 of 217 semantic lookups time out over 13
+  // days. Everything between here and buildKbPack — the context build, and
+  // classifyInbound's LLM call — now runs while it is in flight. Returns null
+  // (and costs nothing) when every semantic mode is off.
+  const getQueryEmbedding = prewarmQueryEmbedding(triggerMessage);
+
   const context = await buildLeadContext(contactId, {
     includeConversation: true,
     skipCache: true,
@@ -2816,6 +2825,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   let kbPack = null;
   try {
     kbPack = await buildKbPack({
+      getQueryEmbedding,
       intentClass: classification.intent_class,
       messageText: triggerMessage,
       channel,
