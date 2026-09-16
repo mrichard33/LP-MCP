@@ -162,6 +162,18 @@ export const NAMESPACE_EXCLUSIVE_PREFIXES = [
 // resolver's "I don't know" — not for a legitimate low-priority value.
 export const NAMESPACE_FALLBACK_VALUES = {
   'active-entry:': 'active-entry:other',
+  // 2026-09-16 (issue #949) — source:unknown evicted a correct vendor tag on 707
+  // contacts in 30 days: source:internet-modernize (434x), my-home-pros (147x),
+  // homebuddy (84x), angi, lead-gurus, mvp-marketing. Only 3 events in the same
+  // window wrote a real source tag over another, so ~99% of these swaps were
+  // pure attribution loss on PAID lead vendors, straight into revenue-by-source.
+  //
+  // source:unknown is a fallback by construction, not a low-priority value:
+  // ROUTING_TAG_MAP in entry-event-handler.js maps 'other' -> source_tag
+  // 'unknown', and 'other' is what the resolver sets when it cannot determine a
+  // source at all. lp-contact-backstop.js:141 already says writing it "destroys
+  // the attribution the intake backstop exists to restore".
+  'source:': 'source:unknown',
 };
 
 // 2026-09-12 (zOtz91P604CVWP47DIJx) — MUTUALLY EXCLUSIVE FLAT TAGS.
