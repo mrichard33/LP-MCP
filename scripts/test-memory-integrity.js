@@ -455,9 +455,9 @@ test('memoryPrecheck: vector leg with history visible, same area first, conflict
 
 // ─── Validation checks ───────────────────────────────────────────────────────
 test('every validation check is one SELECT with rows_checked / rows_flagged / sample; the log row is escaped', () => {
-  assert.equal(VALIDATION_CHECKS.length, 11);
+  assert.equal(VALIDATION_CHECKS.length, 12);
   const names = VALIDATION_CHECKS.map((c) => c.name);
-  for (const n of ['unlinked_sessions_7d', 'write_date_rows', 'batch_pattern_live', 'duplicate_sessions_24h', 'active_decisions_no_area', 'embedding_coverage', 'orphan_embeddings', 'embedding_metadata_drift', 'conflicts_open', 'provenance_mismatch_children', 'flagged_sessions']) assert.ok(names.includes(n), n);
+  for (const n of ['unlinked_sessions_7d', 'stale_ledger_timestamps', 'write_date_rows', 'batch_pattern_live', 'duplicate_sessions_24h', 'active_decisions_no_area', 'embedding_coverage', 'orphan_embeddings', 'embedding_metadata_drift', 'conflicts_open', 'provenance_mismatch_children', 'flagged_sessions']) assert.ok(names.includes(n), n);
   for (const c of VALIDATION_CHECKS) {
     assert.match(c.sql, /^\s*SELECT/, c.name);
     for (const col of ['rows_checked', 'rows_flagged', 'sample']) assert.ok(c.sql.includes(`AS ${col}`), `${c.name} lacks ${col}`);
@@ -577,6 +577,32 @@ test('SKILL.md Mechanism 2 states all three identity gates, with the ET conversi
   assert.match(mech, /not\*{0,2} sufficient|not sufficient/, 'Gate C must say title fit alone is insufficient');
 });
 
+// GATE B (2026-09-16). This alarm exists because the stale column was read as
+// current: a link sweep compared September session dates against these
+// timestamps, concluded 25 September sessions sat on spring chats, and cleared
+// 24 correct links (all since restored, two verified by finding each session's
+// own memory_checkpoint payload in its chat). It must stay an ALARM — LP-MCP
+// cannot call conversation_search, so it cannot learn the live date and has
+// nothing it could correctly repair.
+test('stale_ledger_timestamps: flags ledger rows whose chat_updated_at predates the session they point at, and only reports', () => {
+  const c = VALIDATION_CHECKS.find((x) => x.name === 'stale_ledger_timestamps');
+  assert.ok(c, 'check missing');
+  // The comparison is the ledger row against the session it points at — not
+  // against the clock. A session is written from work done in that chat, so the
+  // chat cannot have stopped moving before the session date.
+  assert.match(c.sql, /claude_transcript_ledger l\s+JOIN claude_session_logs s ON s\.id = l\.session_id/);
+  assert.match(c.sql, /\(l\.chat_updated_at AT TIME ZONE 'America\/New_York'\)::date < s\.session_date/);
+  assert.doesNotMatch(c.sql, /now\(\)/, 'staleness is measured against the session, never the clock');
+  // Both sides compared as ET calendar dates: a late-evening UTC timestamp would
+  // otherwise read as the next day and flag itself.
+  assert.match(c.sql, /AT TIME ZONE 'America\/New_York'\)::date::text AS ledger_date/);
+  assert.doesNotMatch(c.sql, /\b(UPDATE|DELETE|INSERT)\b/, 'read-only: only the chat surface can refresh these');
+  for (const col of ['rows_checked', 'rows_flagged', 'sample']) assert.ok(c.sql.includes(`AS ${col}`), col);
+  // The sample is the worklist, so it carries the gap and leads with the worst.
+  assert.match(c.sql, /days_stale/);
+  assert.match(c.sql, /ORDER BY 4 DESC/);
+});
+
 test('runMemoryValidation: dry run logs every check and repairs nothing; live syncs drifted metadata and marks orphans; log:false is SELECT-only', async () => {
   const seed = (s) => {
     if (/AS rows_flagged/.test(s)) {
@@ -588,9 +614,9 @@ test('runMemoryValidation: dry run logs every check and repairs nothing; live sy
   };
   const dryCalls = [];
   const dry = await runMemoryValidation({ dry_run: true, deps: { runSQL: async (s) => { dryCalls.push(s); return seed(s); } } });
-  assert.equal(dry.dry_run, true); assert.equal(Object.keys(dry.checks).length, 11); assert.equal(dry.flagged_total, 14);
+  assert.equal(dry.dry_run, true); assert.equal(Object.keys(dry.checks).length, 12); assert.equal(dry.flagged_total, 14);
   assert.equal(dry.checks.embedding_metadata_drift.rows_flagged, 12); assert.equal(dry.checks.orphan_embeddings.rows_flagged, 2);
-  assert.equal(dryCalls.filter((s) => /^INSERT INTO claude_memory_validation_log/.test(s)).length, 11, 'one log row per check');
+  assert.equal(dryCalls.filter((s) => /^INSERT INTO claude_memory_validation_log/.test(s)).length, 12, 'one log row per check');
   assert.ok(dryCalls.every((s) => /^\s*SELECT|^INSERT INTO claude_memory_validation_log/.test(s)), 'dry run never UPDATEs');
   assert.ok(dryCalls.some((s) => /'dry_run'/.test(s))); assert.deepEqual(dry.repairs, {});
 
@@ -607,7 +633,7 @@ test('runMemoryValidation: dry run logs every check and repairs nothing; live sy
   assert.equal(q.logged, false); assert.ok(quiet.every((s) => /^\s*SELECT/.test(s)));
 
   const broken = await runMemoryValidation({ dry_run: true, deps: { runSQL: async (s) => { if (/claude_memory_conflicts/.test(s) && /AS rows_checked/.test(s)) throw new Error('relation does not exist'); return seed(s); } } });
-  assert.match(broken.checks.conflicts_open.error, /does not exist/); assert.equal(broken.errors.length, 1); assert.equal(Object.keys(broken.checks).length, 11, 'one failing check does not stop the rest');
+  assert.match(broken.checks.conflicts_open.error, /does not exist/); assert.equal(broken.errors.length, 1); assert.equal(Object.keys(broken.checks).length, 12, 'one failing check does not stop the rest');
 });
 
 // ─── Conflict scan ───────────────────────────────────────────────────────────
@@ -647,7 +673,15 @@ test('normalizePairs orders and dedupes; insert is ON CONFLICT DO NOTHING; runCo
 // ─── Draft checkpoints ───────────────────────────────────────────────────────
 test('draft checkpoints: deferred ledger rows with no session become origin=nightly sessions with a summary and keys only', async () => {
   const row = draftSessionRow({ chat_url: 'https://claude.ai/chat/z', chat_title: 'Payroll conflict', chat_updated_at: '2026-08-30T22:10:00Z' }, NOW);
-  assert.equal(row.log_origin, 'nightly'); assert.equal(row.session_date, '2026-08-30'); assert.equal(row.date_confidence, 'exact');
+  assert.equal(row.log_origin, 'nightly'); assert.equal(row.session_date, '2026-08-30');
+  // GATE B (2026-09-16): 'write_date', even though chat_updated_at parsed cleanly
+  // and still sets session_date. The ledger column is the chat's last activity AT
+  // REVIEW TIME, and a chat reopened afterwards leaves it months behind — so it
+  // dates the draft but never proves it. Stamping 'exact' here was self-sealing:
+  // the section 1c date self-heal only repairs 'write_date' rows, so a draft
+  // mis-dated from a stale row could never be corrected while the context pack
+  // went on ranking it as recent.
+  assert.equal(row.date_confidence, 'write_date', 'a cleanly parsed ledger timestamp must NEVER produce exact');
   assert.equal(row.link_confidence, 'exact'); assert.equal(row.source_chat_updated_at, '2026-08-30T22:10:00.000Z'); assert.deepEqual(row.transcript_search_keys, ['Payroll conflict']);
   assert.match(row.raw_summary, /^\[NIGHTLY DRAFT 2026-09-08/); assert.deepEqual(row.decisions_made, []);
   // sql/099: the draft's key is its own identity, so a half-finished nightly
