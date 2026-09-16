@@ -96,7 +96,11 @@ export function getOmiConfig(env = process.env) {
     conflictThreshold: num(env, 'MEMORY_CONFLICT_THRESHOLD', 0.85, { min: 0, max: 1 }),
     maxTranscriptChars: num(env, 'OMI_MAX_TRANSCRIPT_CHARS', 60000, { min: 1000 }),
     model: env.OMI_EXTRACT_MODEL || null,
-    // 2026-09-16 — the action-item substance floor. See mapStructuredExtraction.
+    // 2026-09-16 — the short-conversation gate and the action-item floor. All
+    // three must be met for a conversation to be skipped; see the gate itself
+    // in ingestOmiConversation for why duration alone is never enough.
+    minConversationSec: num(env, 'OMI_MIN_CONVERSATION_SEC', 90, { min: 0 }),
+    minOverviewChars: num(env, 'OMI_MIN_OVERVIEW_CHARS', 120, { min: 0 }),
     minActionWords: num(env, 'OMI_MIN_ACTION_WORDS', 5, { min: 0 }),
   };
 }
@@ -455,8 +459,16 @@ async function findDuplicate(db, { key, ledger_ref }) {
   if (session?.id) return { status: 'duplicate_event', session_id: session.id, reason: 'session_exists' };
   const l = await db.from('claude_transcript_ledger').select('session_id, disposition').eq('chat_url', ledger_ref).maybeSingle();
   const ledger = must(l, 'omi duplicate lookup (ledger)');
-  if (ledger?.disposition === 'no_content') {
-    return { status: 'duplicate_event', session_id: ledger.session_id ?? null, reason: 'no_content_already_recorded' };
+  // 2026-09-16 — 'too_short' belongs here for the same reason 'no_content' does:
+  // both are ledger rows saying "looked at, deliberately not filed". Without it
+  // the short gate would re-evaluate and re-upsert the same clip on every deep
+  // sweep, forever, which is the opposite of a skip.
+  if (ledger?.disposition === 'no_content' || ledger?.disposition === 'too_short') {
+    return {
+      status: 'duplicate_event',
+      session_id: ledger.session_id ?? null,
+      reason: ledger.disposition === 'too_short' ? 'too_short_already_recorded' : 'no_content_already_recorded',
+    };
   }
   return null;
 }
@@ -550,6 +562,40 @@ export async function ingestOmiConversation(body, { db, llm, embed, env = proces
     const structured = hasStructuredContent(body);
     if (conv.discarded || (!conv.transcript.trim() && !structured)) {
       return { ...base, ...(await recordNoContent(db, { ledger_ref, mode: cfg.mode, reason: conv.discarded ? 'discarded' : 'empty_transcript' })) };
+    }
+
+    // 2.5 The short-conversation gate (2026-09-16). 8 of 105 sessions carried no
+    //     action item at all — a brief clip that produced nothing still opened a
+    //     session row.
+    //
+    //     DURATION IS NEVER ENOUGH ON ITS OWN. All three conditions must hold,
+    //     because the thing being protected is the 30-second clip that carries a
+    //     real task: "Call Shana about Meta business account access" is worth
+    //     exactly as much said in twenty seconds as in twenty minutes. Length is
+    //     only permission to look at emptiness, never a verdict by itself.
+    //
+    //     A null duration never skips — see conversationDurationSec.
+    //
+    //     The action count is read AFTER the word floor, so a conversation whose
+    //     only items are "Fix it" counts as empty and is gated here rather than
+    //     filing a session with nothing in it.
+    stage = 'short_gate';
+    const durationSec = conversationDurationSec(conv);
+    if (durationSec !== null && durationSec < cfg.minConversationSec) {
+      const mapped = structured ? mapStructuredExtraction(conv, { minActionWords: cfg.minActionWords }) : null;
+      const actionCount = mapped ? mapped.items.filter((it) => it.category === 'action_item').length : 0;
+      const overviewLen = conv.omi_overview.length;
+      if (actionCount === 0 && overviewLen < cfg.minOverviewChars) {
+        return {
+          ...base,
+          ...(await recordTooShort(db, {
+            ledger_ref,
+            mode: cfg.mode,
+            reason: `${Math.round(durationSec)}s, no action items, ${overviewLen}-char overview`,
+          })),
+          duration_sec: Math.round(durationSec),
+        };
+      }
     }
 
     // 3. Extract — or, when Omi has already done it, map.
@@ -663,6 +709,49 @@ async function recordNoContent(db, { ledger_ref, mode, reason }) {
   }, { onConflict: 'chat_url' });
   if (res?.error) throw new Error(`omi no_content ledger: ${res.error.message}`);
   return { status: 'no_content', reason, ledger: 'no_content' };
+}
+
+/**
+ * Ledger row saying this conversation was too short and too empty to be worth a
+ * session. Added 2026-09-16.
+ *
+ * Its own disposition rather than another `no_content` reason so the skip is
+ * auditable — "how many clips is the gate dropping, and was that right?" is a
+ * question the ledger has to be able to answer on its own, without parsing a
+ * notes string. NEEDS sql/116: claude_transcript_ledger has a CHECK constraint
+ * on disposition (in the live database only — it is not in any sql/ file), so
+ * this write throws until that migration widens it.
+ */
+async function recordTooShort(db, { ledger_ref, mode, reason }) {
+  if (mode === 'shadow') {
+    await logOmi(db, { check_name: 'omi:shadow', mode: 'shadow', rows_checked: 0, rows_flagged: 0, sample: { ledger_ref, reason }, notes: 'would record too_short' });
+    return { status: 'too_short', reason, ledger: 'shadow' };
+  }
+  const res = await db.from('claude_transcript_ledger').upsert({
+    chat_url: ledger_ref, session_id: null, disposition: 'too_short',
+    reviewed_at: new Date().toISOString(), notes: `omi ingest: ${reason}`,
+  }, { onConflict: 'chat_url' });
+  if (res?.error) throw new Error(`omi too_short ledger: ${res.error.message}`);
+  return { status: 'too_short', reason, ledger: 'too_short' };
+}
+
+/**
+ * Seconds between started_at and finished_at, or null when that cannot be
+ * computed — either stamp missing, either unparseable, or the pair inverted.
+ *
+ * null is a real answer here, not a zero. The gate above treats it as "do not
+ * skip": a conversation whose timestamps we cannot read is exactly the one that
+ * must NOT be dropped on a duration argument we are unable to make.
+ */
+export function conversationDurationSec(conv) {
+  const startRaw = conv?.started_at;
+  const endRaw = conv?.finished_at;
+  if (!startRaw || !endRaw) return null;
+  const start = new Date(startRaw).getTime();
+  const end = new Date(endRaw).getTime();
+  if (Number.isNaN(start) || Number.isNaN(end)) return null;
+  const sec = (end - start) / 1000;
+  return sec < 0 ? null : sec;
 }
 
 /**
@@ -865,5 +954,5 @@ async function embedNewItems(db, embed, pendingIds) {
 
 export default {
   ingestOmiConversation, getOmiMode, getOmiConfig, omiCheckpointKey, omiLedgerRef,
-  hasStructuredContent, mapStructuredExtraction,
+  hasStructuredContent, mapStructuredExtraction, conversationDurationSec,
 };

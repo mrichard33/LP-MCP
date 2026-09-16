@@ -170,6 +170,7 @@ async function pullConversations(client, db, { cfg, env, now, deps, sync, deep =
   let ingested = 0;
   let duplicates = 0;
   let noContent = 0;
+  let tooShort = 0;
   let llmCalls = 0;
   let newestFinished = cursor;
   const planned = [];
@@ -219,6 +220,11 @@ async function pullConversations(client, db, { cfg, env, now, deps, sync, deep =
         continue;
       }
       if (res.status === 'no_content') { noContent += 1; continue; }
+      // 2026-09-16 — counted per RUN, logged once below, never one line per
+      // conversation: a deep sweep walks the whole window every time, so a
+      // per-conversation log would bury the run's real news under repeats of a
+      // decision already made and recorded in the ledger.
+      if (res.status === 'too_short') { tooShort += 1; continue; }
       if (res.status === 'shadow') {
         planned.push({ conversation_id: id, title: conv?.structured?.title || null, planned: res.planned });
         ingested += res.planned || 0;
@@ -231,7 +237,7 @@ async function pullConversations(client, db, { cfg, env, now, deps, sync, deep =
   }
 
   return {
-    seen, ingested, duplicates, no_content: noContent, llm_calls: llmCalls,
+    seen, ingested, duplicates, no_content: noContent, skipped_short: tooShort, llm_calls: llmCalls,
     cursor: newestFinished, stopped, planned, deep,
     // seen and no_content are CONVERSATIONS; ingested is the pending ITEMS those
     // conversations yield, and one conversation can yield several. Naming both
@@ -379,7 +385,8 @@ function shadowNote(kind, step, deep) {
   }
   return `${prefix}would ingest ${step.ingested ?? 0} item(s) from `
     + `${step.conversations_with_content ?? 0} of ${step.seen ?? 0} conversation(s) `
-    + `(${step.no_content ?? 0} had no content, ${step.duplicates ?? 0} already ingested)`;
+    + `(${step.no_content ?? 0} had no content, ${step.duplicates ?? 0} already ingested, `
+    + `${step.skipped_short ?? 0} too short)`;
 }
 
 // ─── The run ───────────────────────────────────────────────────────────────
