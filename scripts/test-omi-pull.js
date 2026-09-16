@@ -406,6 +406,12 @@ test('an Omi task we created is recognised as ours and not re-ingested', async (
 });
 
 // ─── Memories ──────────────────────────────────────────────────────────────
+// 2026-09-16 — every test below pins the memories path as it was BEFORE Mark's
+// ruling, so they all run with OMI_PULL_MEMORIES=true. That is the point: the
+// pull was gated off, not deleted, and these are the guard that flipping the
+// flag back on restores the old behaviour exactly. The default-off case is
+// covered in scripts/test-omi-quality.js.
+const MEM_ENV = { ...ENV, OMI_PULL_MEMORIES: 'true' };
 
 test('memories are scrubbed, prefixed, and handed to the upsert that makes them idempotent', async () => {
   const seen = [];
@@ -419,7 +425,7 @@ test('memories are scrubbed, prefixed, and handed to the upsert that makes them 
     ] },
   });
 
-  const res = await runOmiPull({ kinds: ['memories'], deps: { db, fetch, env: ENV, now: NOW, llm: fakeLlm(), embed: null, sleep: noSleep } });
+  const res = await runOmiPull({ kinds: ['memories'], deps: { db, fetch, env: MEM_ENV, now: NOW, llm: fakeLlm(), embed: null, sleep: noSleep } });
 
   assert.equal(res.ok, true);
   const p = seen[0];
@@ -474,7 +480,7 @@ test('memories page past the server-side cap of 100 — a round number is a cap,
     },
   });
 
-  const res = await runOmiPull({ kinds: ['memories'], deps: { db, fetch, env: ENV, now: NOW, llm: fakeLlm(), embed: null, sleep: noSleep } });
+  const res = await runOmiPull({ kinds: ['memories'], deps: { db, fetch, env: MEM_ENV, now: NOW, llm: fakeLlm(), embed: null, sleep: noSleep } });
 
   assert.deepEqual(offsets, [0, 100], 'the offset must advance past the first page');
   assert.equal(res.steps.memories.seen, 152, 'all 152 must be read, not the first 100');
@@ -493,7 +499,7 @@ test('memories paging stops at a short page rather than spending the budget on e
     },
   });
 
-  await runOmiPull({ kinds: ['memories'], deps: { db, fetch, env: ENV, now: NOW, llm: fakeLlm(), embed: null, sleep: noSleep } });
+  await runOmiPull({ kinds: ['memories'], deps: { db, fetch, env: MEM_ENV, now: NOW, llm: fakeLlm(), embed: null, sleep: noSleep } });
 
   assert.equal(calls, 1, 'a page shorter than the page size is the end of the list');
 });
@@ -509,7 +515,7 @@ test('the shadow log reports the memories it WOULD ingest, not a zero that reads
 
   const res = await runOmiPull({
     kinds: ['memories'],
-    deps: { db, fetch, env: { ...ENV, OMI_PULL_MODE: 'shadow', OMI_INGEST_MODE: 'shadow' }, now: NOW, llm: fakeLlm(), embed: null, sleep: noSleep },
+    deps: { db, fetch, env: { ...MEM_ENV, OMI_PULL_MODE: 'shadow', OMI_INGEST_MODE: 'shadow' }, now: NOW, llm: fakeLlm(), embed: null, sleep: noSleep },
   });
 
   assert.equal(res.mode, 'shadow');
