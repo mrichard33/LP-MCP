@@ -319,3 +319,63 @@ cannot express the alternative. Refresh-only would fold ~19+ September sessions
 into spring rows — destroying real work, one-directionally. Many-sessions-per-chat
 is truthful but is a v4.0 LOCKED migration and Mark's ruling. **Nothing is folded
 until the live-timestamp table exists.**
+
+---
+
+## Addendum — 2026-09-16 (3): the reopen verdict, session.project, and the C2 search order
+
+**The schema question is settled empirically.** Mark ran the 27-pair
+live-timestamp split himself: **20 of 27 resolved, every one a reopen, zero
+mis-links.** Seven remain only because their chats live in projects unreachable
+from one chat (798/227, 799/226, 800/228, 945/459, 1045/506, 1054/510, 1056/512).
+**Do not re-run the split.**
+
+That is stronger than the key-overlap proxy suggested and in the same direction:
+reopens are not merely the larger bucket, they are the only bucket observed. So
+"one chat, one session" is wrong as a *schema rule*, not as data hygiene, and the
+ledger's `chat_url` primary key cannot express the alternative. The fork —
+refresh-only versus a primary-plus-siblings ledger — is answerable now but is a
+v4.0 LOCKED migration and stays Mark's ruling. 876 and the three remaining held
+rows (798/227, 800/228, 945/459) all wait on it; they are the same question.
+947/457 resolved as a reopen and is no longer held.
+
+**Root cause of the C2 cost: no project field.** `memory_checkpoint` never
+recorded which Claude project a chat lived in, and `conversation_search` is
+project-scoped. sql/115 adds `claude_session_logs.project`, written at checkpoint
+time (skill v4.9). Free text, not an enum — project names change, and a CHECK
+here would repeat the `link_confidence` problem. Nothing is backfilled: an absent
+project is the truth for an old row.
+
+**The area→project table is a SEARCH ORDER, not an assignment.** Each sweep chat
+already knows its own project implicitly, because search only returns that
+project's chats. Roughly 12 chats × 3 probe searches from the largest areas' most
+distinctive keys discovers the partition empirically; write the discovered project
+onto whatever hits. Do not assign 189 rows by inference.
+
+| area | n | probable project |
+|---|---|---|
+| chatbot-lane | **51** | GHL Chatbot — **see blocker below** |
+| calculator-lane | 18 | Window Calculator · ROI Calculator |
+| scorecard-reporting | 16 | Reece Daily Ops · Reece Call Center |
+| appointments | 14 | Reece Lead Routing · Reece Daily Ops |
+| lp-ghl-sync | 13 | MCP GHL-Notion · n8n Workflow Architect |
+| agentic-engine | 11 | Reece n8n Workflow Architect |
+| content-copy | 10 | Reece Email Writer |
+| partners-vendors | 10 | Reece Daily Ops |
+| general | 9 | **unassignable — leave last** |
+| infrastructure | 7 | Memory System Optimization · n8n |
+| objections-rescue | 6 | Reece Lead Routing |
+| routing-workflows | 6 | Reece Lead Routing |
+| memory-system | 3 | Memory System Optimization |
+| five9-dialer | 3 | Reece Call Center |
+| lead-intake | 3 | Reece Lead Routing |
+| canvassing | 3 | Reece Lead Routing |
+| nurture-reengagement | 3 | Reece Email Writer |
+| call-intelligence | 2 | Reece Call Center |
+| payroll-callcenter | 1 | CC Payroll — Weekly |
+
+**Blocker, resolve before starting: chatbot-lane is 51 rows — a quarter of the
+backlog — and its project is not visible from Mark's current chat list.** No
+sweep method reaches those rows until that access gap is closed, so settle it
+first rather than discovering it mid-pass. `general` (9) is unassignable by
+design; expect some of it to stay unlinked permanently.

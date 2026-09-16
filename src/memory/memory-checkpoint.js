@@ -174,6 +174,13 @@ export function validateCheckpoint(input = {}, now = new Date(), env = process.e
   if (keys.length > 12) throw new CheckpointError('session.search_keys: keep it under 12');
   const surface = s.surface ? String(s.surface).toLowerCase() : 'chat';
   if (!SURFACES.has(surface)) throw new CheckpointError(`session.surface must be one of ${[...SURFACES].join(', ')}`);
+  // session.project (sql/101) — the Claude project the chat lives in. Optional,
+  // and free text on purpose: conversation_search is project-scoped, so this is
+  // the one fact that makes a later link sweep targetable instead of a probe
+  // across every project. Not an enum — project names change, and a CHECK here
+  // would repeat the link_confidence problem, where a fourth legitimate value
+  // needed a migration and rippled through every query that read the column.
+  const project = str(s.project, 'session.project', { max: 120 });
   const dateConfidenceGiven = s.date_confidence != null && s.date_confidence !== '';
   let date_confidence = dateConfidenceGiven ? String(s.date_confidence).toLowerCase() : 'exact';
   if (!DATE_CONFIDENCE.has(date_confidence)) throw new CheckpointError(`session.date_confidence must be one of ${[...DATE_CONFIDENCE].join(', ')}`);
@@ -204,7 +211,7 @@ export function validateCheckpoint(input = {}, now = new Date(), env = process.e
     date, date_confidence, date_confidence_given: dateConfidenceGiven || mode === 'retro',
     phase_focus: str(s.phase_focus, 'session.phase_focus', { max: 120 }),
     summary: str(s.summary, 'session.summary', { required: !sessionId }),
-    search_keys: keys, surface,
+    search_keys: keys, surface, project,
     chat_url: source ? source.chat_url : str(s.chat_url, 'session.chat_url', { max: 500 }),
     chat_title: source ? (source.chat_title ?? str(s.chat_title, 'session.chat_title', { max: 300 })) : str(s.chat_title, 'session.chat_title', { max: 300 }),
     workflows_touched: Array.isArray(s.workflows_touched) ? s.workflows_touched : [],
@@ -485,6 +492,7 @@ async function writeCheckpoint(c, { db, now, key, out, resume }) {
     if (c.session.date_confidence_given) patch.date_confidence = c.session.date_confidence;
     // A nightly draft that Mark refreshes from inside the chat becomes a real session.
     if (row?.log_origin === 'nightly') { patch.log_origin = retro ? 'retro' : 'live'; patch.validation_status = 'passed'; }
+    if (c.session.project) patch.project = c.session.project; // never blank an existing one on a refresh that omits it
     if (c.session.chat_url && row?.link_confidence !== 'exact') {
       patch.chat_url = c.session.chat_url; patch.chat_title = c.session.chat_title; patch.link_confidence = 'exact';
     }
@@ -512,7 +520,8 @@ async function writeCheckpoint(c, { db, now, key, out, resume }) {
         workflows_touched: c.session.workflows_touched, phase_status: {}, decisions_made: [], issues_found: [],
         issues_resolved: [], pending_items: [], board_versions: [], mcp_verified_ids: c.session.mcp_verified_ids,
         next_steps: [], raw_summary: c.session.summary, chat_url: c.session.chat_url, chat_title: c.session.chat_title,
-        transcript_search_keys: keys, surface: c.session.surface, log_origin: retro ? 'retro' : 'live',
+        transcript_search_keys: keys, surface: c.session.surface, project: c.session.project,
+        log_origin: retro ? 'retro' : 'live',
         link_confidence: c.session.chat_url ? 'exact' : 'unlinked', checkpoint_key: key,
         date_confidence: c.session.date_confidence,
       };

@@ -859,3 +859,64 @@ test('SKILL.md Mechanism 2: the sweep has no age window and matches on search ke
   assert.ok(mech.indexOf('conversation_search') < mech.indexOf('recent_chats(n=20)'), 'search keys come before timestamps');
   assert.match(mech, /Never use this on a sweep-written row/, 'the timestamp fallback must be scoped to live rows');
 });
+
+// sql/115. conversation_search is project-scoped, so a session that does not
+// record its project cannot be targeted by a later link sweep -- it has to be
+// found by probing every project in turn. 189 rows are in that state because
+// the field never existed. Optional by design: the backlog is NULL and a
+// refresh that omits it must not blank a project already on the row.
+test('session.project: optional, free text, written on insert, never blanked by a refresh', () => {
+  const base = {
+    session: {
+      title: 'Project field test', summary: 'x',
+      search_keys: ['alpha key', 'beta key', 'gamma key'],
+    },
+    decisions: [], issues: [],
+  };
+
+  // Absent is not an error -- every pre-113 write looks like this.
+  const without = validateCheckpoint(base, new Date('2026-09-16T12:00:00Z'), {});
+  assert.equal(without.session.project, null, 'absent project must parse as null, not throw');
+
+  // Present round-trips verbatim: no lowercasing, no enum check. Project names
+  // are Mark's and change; an enum here would be the link_confidence CHECK
+  // problem again (a fourth value needed a migration and rippled everywhere).
+  const withProj = validateCheckpoint(
+    { ...base, session: { ...base.session, project: 'Reece Marketing & Funnel Builder' } },
+    new Date('2026-09-16T12:00:00Z'), {});
+  assert.equal(withProj.session.project, 'Reece Marketing & Funnel Builder',
+    'project must survive validation unchanged -- mixed case and & included');
+
+  // The insert carries it, and the refresh patch is conditional so a later
+  // checkpoint that omits project cannot null out one already recorded.
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'memory', 'memory-checkpoint.js'), 'utf8');
+  assert.match(src, /project: c\.session\.project/, 'the insert row must send project');
+  assert.match(src, /if \(c\.session\.project\) patch\.project = c\.session\.project/,
+    'the refresh must set project only when given');
+  assert.doesNotMatch(src, /PROJECTS\s*=\s*new Set/, 'project must not be enumerated');
+});
+
+// The mirror and the sql/ directory have to agree, and the file number has to be
+// free: sql/101 and sql/102 are each already taken by two different features,
+// and 106 is used twice. A collision here ships a migration that never runs.
+test('sql/115 is registered in the migrations mirror and its number is unused elsewhere', () => {
+  const entry = MEMORY_MIGRATIONS.filter((m) => m.file === '115_session_project.sql');
+  assert.equal(entry.length, 1, 'exactly one mirror entry -- a plain ADD COLUMN has no second half');
+  assert.match(entry[0].check, /column_name = 'project'/, 'the check must probe the column itself');
+
+  const sqlDir = fs.readdirSync(path.join(__dirname, '..', 'sql'));
+  assert.ok(sqlDir.includes('115_session_project.sql'), 'the file must exist');
+  assert.equal(sqlDir.filter((f) => f.startsWith('115_')).length, 1, 'number 115 must be unique');
+
+  const sql115 = fs.readFileSync(path.join(__dirname, '..', 'sql', '115_session_project.sql'), 'utf8');
+  assert.match(sql115, /ADD COLUMN IF NOT EXISTS project text/, 'idempotent add');
+  // Scope the negative assertions to statements: the file's own comments explain
+  // why there is no CHECK and why nothing is backfilled, and prose that names
+  // the thing it forbids would fail a naive match. (Same trap as sql/100.)
+  const stmts115 = sql115.replace(/--[^\n]*/g, '');
+  // Nothing is backfilled: an absent project is the truth, and a guessed value
+  // written over a blank is worse than the blank.
+  assert.doesNotMatch(stmts115, /\bUPDATE\b/, 'sql/115 must not backfill');
+  assert.doesNotMatch(stmts115, /CHECK/, 'no CHECK constraint on project');
+  assert.doesNotMatch(stmts115, /\bDROP\b|\bDELETE\b/, 'sql/115 adds only');
+});
