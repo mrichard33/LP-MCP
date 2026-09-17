@@ -23,12 +23,76 @@
  * Two independent signals:
  *   1. Rate-limiter health — a non-empty wait queue implies tokens are
  *      exhausted (processQueue drains until queue empty OR tokens 0), so a
- *      deep queue means refill can't keep up. Also flags a fresh 429 (each
- *      429 triggers a 5-15 min FULL pause, far costlier than throttling)
- *      and a standing pause carried across checks.
+ *      deep queue means refill can't keep up. Also flags a SUSTAINED 429
+ *      burst or an ESCALATED pause (see the 2026-09-17 note below).
  *   2. Failed-action rate — a spike in agent_actions failures over a short
  *      window, independent of cause (limiter, GHL 5xx, handler bug).
+ *
+ * 2026-09-17 — THRESHOLDS REALIGNED TO RATE-LIMITER v1.4.
+ * ───────────────────────────────────────────────────────
+ * The 429 branch used to fire on `total429s > prev.total429s` — ANY single
+ * new 429, unconditionally critical. That was correct in June, when
+ * report429() paused ALL GHL traffic for a BASE_PAUSE_MS of 300s escalating
+ * to a MAX_PAUSE_MS of 900s: one 429 really did mean a multi-minute
+ * blackout worth waking someone for.
+ *
+ * Rate limiter v1.4 (2026-09-14) cut those to 60s base / 180s ceiling after
+ * the same 5-minute pause caused a 47-hour agentic outage. A first-step 429
+ * pause is now ~60s and clears inside a single heartbeat — ordinary
+ * backpressure, not an incident. This file's threshold was never moved with
+ * it, so from that date on routine throttling paged like a storm.
+ *
+ * Observed 2026-09-16/17 overnight, roughly every 35 min, each pair opening
+ * and clearing within ~4 minutes:
+ *     queue: 2 | tokens: 38/120 | timedOut: 15 | 429s: 2
+ * and the live service the next morning, 7.3h uptime, entirely healthy:
+ *     tokens 106/120, queueDepth 0, consecutive429Cycles 0,
+ *     total429s 2, timedOut 47, msSinceLast429 6.7h
+ *
+ * A contributing factor worth naming, because it is the reason the bursts
+ * happen at all: GHL_RATE_CAPACITY is ramped to 120 while
+ * GHL_RATE_REFILL_PER_MIN is 65. A burst can drain 120 tokens far faster
+ * than 65/min refills them, so waiters queue, some reach the 30s fail-open
+ * timeout and call GHL WITHOUT a token, and a couple of those ungoverned
+ * calls earn a 429. Retuning that ratio is a separate change; this one
+ * stops the symptom paging.
+ *
+ * What changed here:
+ *   - new 429s must reach `new429Delta` (default 3) in one check, OR the
+ *     pause must exceed `pauseAlertMs` (default 150s — past the first
+ *     escalation step, so the backoff is genuinely climbing).
+ *   - a STANDING pause only alerts once it is longer than `pauseAlertMs`;
+ *     a routine 60s pause carried across one check is not an incident.
+ *   - `timedOutDelta` default raised 3 → 25. Fail-open timeouts are normal
+ *     bursty behaviour under a capacity/refill mismatch; the Jun 4/5 storm
+ *     is caught by queue depth, not by this counter.
+ *
+ * What deliberately did NOT change: the queue-depth threshold (15). That is
+ * the signal that actually distinguishes a storm (23-29 deep, sustained)
+ * from backpressure (2 deep, clears in minutes), and it stayed correctly
+ * silent all night.
+ *
+ * Both new knobs read from env with an explicit threshold override, so they
+ * can be retuned from Railway without a deploy:
+ *   LIMITER_NEW_429_DELTA_ALERT   default 3
+ *   LIMITER_PAUSE_ALERT_MS        default 150000
+ *   LIMITER_TIMEOUT_DELTA_ALERT   default 25 (was 3)
  */
+
+// Defaults live here rather than in executor-heartbeat.js on purpose. That
+// file is ~36KB and the MCP write path can only replace it whole — which is
+// exactly how PR #648 dropped a const declaration and crashed the service on
+// boot for 52 minutes (see its 2026-08-08 hotfix note). Keeping this change
+// inside this small file means the caller's signature is untouched.
+const DEFAULT_QUEUE_DEPTH = 15;
+const DEFAULT_TIMEOUT_DELTA = 25;
+const DEFAULT_NEW_429_DELTA = 3;
+const DEFAULT_PAUSE_ALERT_MS = 150000;
+
+function envInt(name, fallback) {
+  const raw = parseInt(process.env[name] || '', 10);
+  return Number.isFinite(raw) && raw >= 0 ? raw : fallback;
+}
 
 /**
  * Decide whether the GHL rate limiter is unhealthy enough to alert.
@@ -38,7 +102,9 @@
  * @param {object|null} prev  Previous snapshot { timedOut, total429s } or null
  *   on first run. Cumulative counters are compared as deltas so a standing
  *   total doesn't re-alert forever.
- * @param {{queueDepth:number, timedOutDelta:number}} thresholds
+ * @param {{queueDepth?:number, timedOutDelta?:number, new429Delta?:number,
+ *          pauseAlertMs?:number}} [thresholds]
+ *   Any omitted key falls back to its env var, then to the module default.
  * @returns {{alert:boolean, reasons:string[], critical:boolean}}
  */
 export function shouldAlertLimiter(curr, prev, thresholds) {
@@ -49,32 +115,57 @@ export function shouldAlertLimiter(curr, prev, thresholds) {
   const paused = !!curr?.paused;
   const pauseRemainingMs = curr?.pauseRemainingMs ?? 0;
 
-  const queueThreshold = thresholds?.queueDepth ?? 15;
-  const timedOutDeltaThreshold = thresholds?.timedOutDelta ?? 3;
+  const queueThreshold = thresholds?.queueDepth
+    ?? envInt('LIMITER_QUEUE_ALERT_THRESHOLD', DEFAULT_QUEUE_DEPTH);
+  const timedOutDeltaThreshold = thresholds?.timedOutDelta
+    ?? envInt('LIMITER_TIMEOUT_DELTA_ALERT', DEFAULT_TIMEOUT_DELTA);
+  const new429DeltaThreshold = thresholds?.new429Delta
+    ?? envInt('LIMITER_NEW_429_DELTA_ALERT', DEFAULT_NEW_429_DELTA);
+  const pauseAlertMs = thresholds?.pauseAlertMs
+    ?? envInt('LIMITER_PAUSE_ALERT_MS', DEFAULT_PAUSE_ALERT_MS);
 
   const reasons = [];
   let critical = false;
 
-  // A 429 pauses ALL GHL traffic for 5-15 min — the worst outcome. Fire on
-  // any new 429 since the last check.
-  if (prev && total429s > (prev.total429s ?? 0)) {
-    const d = total429s - (prev.total429s ?? 0);
-    reasons.push(`${d} new GHL 429 — full pause ${Math.round(pauseRemainingMs / 1000)}s`);
+  // 2026-09-17 — a 429 is only an incident when the burst is SUSTAINED or the
+  // backoff has ESCALATED. Under rate-limiter v1.4 a first-step 429 pauses GHL
+  // traffic for ~60s and clears on its own; paging on that is what produced the
+  // overnight flapping. Two discriminators, either one sufficient:
+  //   (a) several 429s inside one check — the bucket is being hammered, not
+  //       brushed, and consecutive429Cycles is about to climb;
+  //   (b) a pause longer than the first step — the exponential backoff has
+  //       already escalated, which is the shape of a real storm.
+  const new429s = prev ? total429s - (prev.total429s ?? 0) : 0;
+  if (new429s >= new429DeltaThreshold) {
+    reasons.push(
+      `${new429s} new GHL 429 in one check — full pause ${Math.round(pauseRemainingMs / 1000)}s`
+    );
     critical = true;
-  } else if (paused) {
-    // Standing pause carried across checks (no fresh 429 this cycle).
+  } else if (new429s > 0 && pauseRemainingMs > pauseAlertMs) {
+    reasons.push(
+      `${new429s} new GHL 429 — escalated pause ${Math.round(pauseRemainingMs / 1000)}s ` +
+      `(> ${Math.round(pauseAlertMs / 1000)}s)`
+    );
+    critical = true;
+  } else if (paused && pauseRemainingMs > pauseAlertMs) {
+    // Standing pause carried across checks, and long enough to mean the
+    // backoff escalated rather than a routine first-step pause.
     reasons.push(`limiter paused — ${Math.round(pauseRemainingMs / 1000)}s remaining`);
     critical = true;
   }
 
   // Deep wait queue = refill can't keep up. A non-empty queue implies
-  // tokens are exhausted, so the depth alone is the signal.
+  // tokens are exhausted, so the depth alone is the signal. UNCHANGED at 15:
+  // this is the threshold that separates a storm (23-29 deep, sustained) from
+  // backpressure (2 deep, self-clearing), and it is what caught Jun 4/5.
   if (queueDepth >= queueThreshold) {
     reasons.push(`${queueDepth} requests queued, ${tokens} tokens — refill starved`);
   }
 
   // Bursty fail-open timeouts even if the queue snapshot is momentarily
-  // shallow. Delta since the last check.
+  // shallow. Delta since the last check. Threshold raised 3 -> 25 on
+  // 2026-09-17: with capacity 120 against a 65/min refill, small timeout
+  // bursts are the normal cost of a drained bucket, not a signal.
   if (prev && (timedOut - (prev.timedOut ?? 0)) >= timedOutDeltaThreshold) {
     reasons.push(`${timedOut - (prev.timedOut ?? 0)} token timeouts since last check`);
   }
