@@ -1,6 +1,7 @@
 // ─── LP report daily reconciliation — src/jobs/lp-report-recon.js ───
 //
-// Daily 07:00 ET (after the 6:00/6:15 report emails land and ingest), each
+// Daily 08:00 ET (after the 6:00/6:15 report emails land and ingest — 07:00 was
+// nine seconds ahead of the 137 ingest; see RECON_HOUR_ET), each
 // check writes one scorecard_recon_results row (upsert on recon_date +
 // recon_type; a missing snapshot writes 'skipped', never silence):
 //
@@ -30,11 +31,16 @@
 //
 // Report 137 "Sales Efficiency By Market" now ingests directly
 // (lp-csv-ingest.js, 2026-08-05) — the SE tie-out is automated here:
-//   se_internal              GSA − Cancelled − CD − Working − Hold vs NSA,
-//                            with the named $246,768 bucket residual.
+//   se_internal              GSA − Cancelled − CD − Working − Hold vs NSA.
+//                            SCOPE-AWARE: YTD snapshots carry the named
+//                            $246,768 bucket residual (exact match, where it
+//                            was measured); every other scope gets the
+//                            SE_MTD_RESIDUAL_TOLERANCE_CENTS band.
 //   se_hold_vs_job_status    137's Hold bucket vs Job Status YTD's HOA —
 //                            two independently generated reports; named
 //                            tolerance Δ1 job / $8,785 (verified 2026-08-05).
+//                            Paired on the CURRENT window, never on whichever
+//                            snapshot each type had newest.
 //
 // CROSS-REPORT OBSERVABILITY (§F). Recorded, never enforced — neither can
 // return 'fail', neither alerts, neither can block a send:
@@ -61,6 +67,20 @@ import { runJob } from '../job-runner.js';
 
 const RECON_ENABLED = (process.env.LP_REPORT_RECON_ENABLED || 'true').trim() !== 'false';
 
+// 2026-09-17 — moved 07:00 → 08:00 ET. The 137 (sales_efficiency) ingest lands at
+// ~11:00:26 UTC (07:00:26 ET) and the recon was starting at 11:00:17 UTC — NINE
+// SECONDS EARLIER. It therefore read the previous day's 137 snapshot against that
+// morning's fresh job_status snapshot and manufactured a Δ2 job / $34,389
+// "divergence" out of the calendar.
+//
+// pairOnCurrentWindow() below makes the comparison window-safe (it SKIPS rather
+// than comparing mismatched windows), but skipping every morning would lose the
+// check entirely. Moving the run to 08:00 ET gives a full hour of margin past the
+// last ingest so the check actually runs. Both halves are needed: the pairing
+// prevents the false positive, the hour prevents a permanent skip.
+const RECON_HOUR_ET = Math.min(23, Math.max(0,
+  parseInt(process.env.LP_REPORT_RECON_HOUR_ET || '8', 10)));
+
 // Known, accepted residuals. Keyed for the PR/report trail; each carries the
 // exact delta it forgives. July 2026: 2 records / $14,957.00 between Report A
 // and the Net Report (LP-side timing, investigated and accepted 2026-08-04).
@@ -72,9 +92,39 @@ export const NAMED_RECON_EXCEPTIONS = {
 // the report's own buckets do not foot to NSA — GSA − Cancelled − CD −
 // Working − Hold leaves a $246,768.00 residual. Recorded with its own code,
 // NEVER absorbed into a bucket to force a tie.
+//
+// 2026-09-17 — THIS CONSTANT IS YTD-SCOPED, AND THAT IS NOW LOAD-BEARING.
+// compareBuckets consumes a named exception only on EXACT equality, and every
+// current snapshot is scope 'mtd', whose residual is a different (much smaller)
+// number that moves as jobs shift between buckets. So the YTD constant could
+// never match an MTD residual. Measured over all 43 se_internal rows written
+// since 2026-08-06: 28 pass, 10 warn, and named_exceptions NULL on every single
+// one — the fingerprint that the exception has literally never applied. It
+// passed only on the days the MTD residual happened to land on exactly zero.
+// Observed MTD residual range: −$17,200.00 to +$38,881.00, against a GSA in the
+// millions.
+//
+// The YTD constant is kept, scoped to YTD where it was measured. MTD gets a
+// tolerance BAND instead, because an exact-match constant is the wrong mechanism
+// for a figure that moves daily. The exact residual is recorded on every run
+// either way — the band decides whether to WARN, never what to store.
 export const SE_BUCKET_RESIDUAL = { records: 0, cents: 24676800 };
+
+// MTD residual tolerance. Chosen from the measured range above (max |residual|
+// $38,881) with headroom — NOT tuned until it passed. Env-tunable so it can be
+// tightened from Railway once more history exists. A residual past this band is
+// an order of magnitude off everything observed, and IS worth a look.
+export const SE_MTD_RESIDUAL_TOLERANCE_CENTS = Math.max(
+  0,
+  parseInt(process.env.SE_MTD_RESIDUAL_TOLERANCE_CENTS || '5000000', 10),
+);
+
 // 137 Hold vs Job Status YTD HOA: Δ1 job / $8,785.00 between two
 // independently generated reports — a named tolerance, not a failure.
+// NOTE (2026-09-17): in practice the two tie EXACTLY every day they describe the
+// same window (09-08..09-16 all tied to the cent). The Δ2 / $34,389 seen on
+// 2026-09-17 was NOT a divergence — it was a one-day window lag from the ingest
+// race fixed below. Do not widen this to absorb a lag; the pairing is the fix.
 export const SE_HOLD_VS_HOA_TOLERANCE = { records: 1, cents: 878500 };
 
 /**
@@ -116,7 +166,7 @@ export function compareBuckets(lhs, rhs, { toleranceCents = 0, namedExceptions =
 async function currentSnapshot(reportType) {
   const { data, error } = await supabase
     .from('scorecard_report_snapshots')
-    .select('id, period_start, period_end, row_count, net_total_cents, gross_total_cents, ingested_at')
+    .select('id, period_start, period_end, scope, row_count, net_total_cents, gross_total_cents, ingested_at')
     .eq('report_type', reportType).eq('is_current', true)
     .order('period_start', { ascending: false })
     .limit(1).maybeSingle();
@@ -155,6 +205,37 @@ export function pairOnWindow(lhsSnaps, rhsSnaps) {
     if (r) return { lhs: l, rhs: r };
   }
   return null;
+}
+
+/**
+ * Pair two reports ONLY on their CURRENT window.
+ *
+ * 2026-09-17 — pairOnWindow() walks every is_current snapshot until it finds a
+ * shared window, and this repo keeps historical monthly snapshots current. When
+ * the morning's 137 ingest lands late, the newest shared window is NOT today's:
+ * it is AUGUST, which both sides still carry. pairOnWindow then returns a real,
+ * apples-to-apples pair of a month-old window, and a check built on it reports
+ * 'pass' on data nobody asked about. Observed live: §F's
+ * se_gsa_vs_milestone_gross recorded window 2026-08-01..2026-08-31 on 2026-09-17
+ * and the current September window on every other day that week.
+ *
+ * §F can live with that — it never alerts and never gates. An ALERTING check
+ * cannot: a silent stale 'pass' is worse than the false positive it replaces,
+ * because nothing says today went unchecked. So here the newest window on each
+ * side must be the SAME window, or there is no pair, and "I could not tell" is
+ * reported as such — the same three-way doctrine as reportAlertCondition's null.
+ *
+ * Callers pass snapshots newest-window-first (currentSnapshots orders by
+ * period_end DESC).
+ *
+ * @returns {{lhs: object, rhs: object}|null}
+ */
+export function pairOnCurrentWindow(lhsSnaps, rhsSnaps) {
+  const l = lhsSnaps?.[0];
+  const r = rhsSnaps?.[0];
+  if (!l || !r) return null;
+  if (l.period_start !== r.period_start || l.period_end !== r.period_end) return null;
+  return { lhs: l, rhs: r };
 }
 
 /** Compact description of what windows a side actually had, for skip reasons. */
@@ -405,41 +486,102 @@ export async function runLpReportRecon({ reconDate } = {}) {
     } else {
       const residualCents = Number(seSums.gsa) - Number(seSums.cancelled) - Number(seSums.cd)
         - Number(seSums.working) - Number(seSums.hold) - Number(seSums.nsa);
-      const cmpSe = compareBuckets(
-        { residual: { count: 0, cents: residualCents } },
-        { residual: { count: 0, cents: 0 } },
-        { namedExceptions: { SE_BUCKET_RESIDUAL } },
-      );
+      // 2026-09-17 — which exception applies depends on the snapshot's SCOPE. The
+      // $246,768 constant was measured on a YTD export; applied to an MTD residual
+      // it could never match, which is why this check warned on every non-zero
+      // residual and never once recorded an applied exception.
+      //
+      // An unknown or missing scope falls to the band deliberately: a genuine YTD
+      // residual is $246,768 and would blow past a $50,000 band anyway, so the
+      // quiet direction is also the safe one.
+      const isYtd = String(snapSe.scope || '').toLowerCase() === 'ytd';
+      const cmpSe = isYtd
+        ? compareBuckets(
+            { residual: { count: 0, cents: residualCents } },
+            { residual: { count: 0, cents: 0 } },
+            { namedExceptions: { SE_BUCKET_RESIDUAL } },
+          )
+        : compareBuckets(
+            { residual: { count: 0, cents: residualCents } },
+            { residual: { count: 0, cents: 0 } },
+            { toleranceCents: SE_MTD_RESIDUAL_TOLERANCE_CENTS },
+          );
+
+      // The exact residual is stored either way — the basis decides whether to
+      // WARN, never what to record.
       results.push(await writeResult(date, 'se_internal', cmpSe.ok ? 'pass' : 'warn', {
         note: 'GSA − Cancelled − CreditDecline − Working − Hold vs NSA (report 137 internal identity)',
+        scope: snapSe.scope ?? null,
+        basis: isYtd ? 'named SE_BUCKET_RESIDUAL (YTD, exact match)' : 'MTD tolerance band',
+        tolerance_cents: isYtd ? SE_BUCKET_RESIDUAL.cents : SE_MTD_RESIDUAL_TOLERANCE_CENTS,
         residual_cents: residualCents, residual: centsToDollars(residualCents),
       }, cmpSe.applied_exceptions.length ? { applied: cmpSe.applied_exceptions } : null));
+
       if (!cmpSe.ok) {
-        await alertGroupMe(`⚠️ LP recon: report 137 bucket residual ${centsToDollars(residualCents)} does not match the named SE_BUCKET_RESIDUAL exception ($246,768.00). Investigate before trusting 137-sourced net figures.`);
+        await alertGroupMe(isYtd
+          ? `⚠️ LP recon: report 137 YTD bucket residual ${centsToDollars(residualCents)} does not match the named SE_BUCKET_RESIDUAL exception ($246,768.00). Investigate before trusting 137-sourced net figures.`
+          : `⚠️ LP recon: report 137 MTD bucket residual ${centsToDollars(residualCents)} exceeds the ${centsToDollars(SE_MTD_RESIDUAL_TOLERANCE_CENTS)} tolerance — an order of magnitude off every residual observed. Investigate before trusting 137-sourced net figures.`);
       }
     }
 
     // se_hold_vs_job_status_hoa: two independent reports, one truth.
-    const snapJs = await currentSnapshot('job_status_ytd');
-    if (!snapJs) {
-      results.push(await writeResult(date, 'se_hold_vs_job_status_hoa', 'skipped', { reason: 'no current job_status_ytd snapshot' }));
+    //
+    // 2026-09-17 — PAIR ON WINDOW, as §F below already does. This used
+    // currentSnapshot() per report, which returns each type's newest snapshot
+    // regardless of the window it covers. The recon ran at 11:00:17 UTC and the
+    // 137 ingest landed at 11:00:26 UTC — nine seconds later — so it compared the
+    // 09-15 137 snapshot against the 09-16 job_status snapshot and reported a Δ2
+    // job / $34,389 divergence that did not exist. The fingerprint was
+    // unmistakable: that run's se_hold (33 / 80358500) was EXACTLY the previous
+    // day's job_status_hoa.
+    //
+    // pairOnCurrentWindow, not pairOnWindow: see its comment. pairOnWindow would
+    // have fallen back to the AUGUST window both reports still carry, reported
+    // 'pass' on month-old data, and alerted nothing.
+    const seSnapsHold = await currentSnapshots('sales_efficiency');
+    const jsSnaps = await currentSnapshots('job_status_ytd');
+    const holdPair = pairOnCurrentWindow(seSnapsHold, jsSnaps);
+
+    if (!holdPair) {
+      // Name the stale shared window we DECLINED. The near-miss is what a reader
+      // needs, and without it "no result" and "never ran" look identical.
+      const stale = pairOnWindow(seSnapsHold, jsSnaps);
+      results.push(await writeResult(date, 'se_hold_vs_job_status_hoa', 'skipped', {
+        reason: 'current sales_efficiency and job_status_ytd windows differ — comparing them would manufacture a difference out of the calendar',
+        sales_efficiency_windows: windowList(seSnapsHold),
+        job_status_ytd_windows: windowList(jsSnaps),
+        declined_stale_shared_window: stale
+          ? { period_start: stale.lhs.period_start, period_end: stale.lhs.period_end }
+          : null,
+      }));
     } else {
+      // Hold figures come from the PAIRED 137 snapshot, never from snapSe — snapSe
+      // is whatever has the newest period_start and may be a different window.
+      // Reusing its sums would reintroduce the bug on the 137 side.
+      const seHold = (await runSQL(`
+        SELECT COALESCE(SUM(num_hold),0)::bigint AS hold_count,
+               COALESCE(SUM(hold_cents),0)::bigint AS hold_cents
+        FROM lp_sales_efficiency_history WHERE snapshot_id = '${holdPair.lhs.id}'`))?.[0];
       const hoa = (await runSQL(`
         SELECT COUNT(*)::bigint AS n, COALESCE(SUM(gross_cents),0)::bigint AS cents
-        FROM lp_job_status_history WHERE snapshot_id = '${snapJs.id}' AND bucket = 'hoa'`))?.[0];
+        FROM lp_job_status_history WHERE snapshot_id = '${holdPair.rhs.id}' AND bucket = 'hoa'`))?.[0];
+
       const cmpHold = compareBuckets(
-        { hoa_hold: { count: Number(seSums?.hold_count ?? 0), cents: Number(seSums?.hold ?? 0) } },
+        { hoa_hold: { count: Number(seHold?.hold_count ?? 0), cents: Number(seHold?.hold_cents ?? 0) } },
         { hoa_hold: { count: Number(hoa?.n ?? 0), cents: Number(hoa?.cents ?? 0) } },
         { namedExceptions: { SE_HOLD_VS_HOA_TOLERANCE } },
       );
       results.push(await writeResult(date, 'se_hold_vs_job_status_hoa', cmpHold.ok ? 'pass' : 'warn', {
-        note: '137 Hold bucket vs Job Status YTD HOA — independent-report integrity check (named Δ1/$8,785 tolerance)',
-        se_hold: { count: Number(seSums?.hold_count ?? 0), cents: Number(seSums?.hold ?? 0) },
+        note: '137 Hold bucket vs Job Status YTD HOA — independent-report integrity check, paired on the current window (named Δ1/$8,785 tolerance)',
+        window: { period_start: holdPair.lhs.period_start, period_end: holdPair.lhs.period_end },
+        sales_efficiency: { snapshot_id: holdPair.lhs.id, scope: holdPair.lhs.scope },
+        job_status_ytd: { snapshot_id: holdPair.rhs.id, scope: holdPair.rhs.scope },
+        se_hold: { count: Number(seHold?.hold_count ?? 0), cents: Number(seHold?.hold_cents ?? 0) },
         job_status_hoa: { count: Number(hoa?.n ?? 0), cents: Number(hoa?.cents ?? 0) },
         deltas: cmpHold.deltas, total_delta: cmpHold.total_delta,
       }, cmpHold.applied_exceptions.length ? { applied: cmpHold.applied_exceptions } : null));
       if (!cmpHold.ok) {
-        await alertGroupMe(`⚠️ LP recon: report 137 Hold vs Job Status HOA diverges beyond the named Δ1/$8,785 tolerance — see scorecard_recon_results (se_hold_vs_job_status_hoa).`);
+        await alertGroupMe(`⚠️ LP recon: report 137 Hold vs Job Status HOA diverges beyond the named Δ1/$8,785 tolerance on the SHARED window ${holdPair.lhs.period_start}..${holdPair.lhs.period_end} — see scorecard_recon_results (se_hold_vs_job_status_hoa).`);
       }
     }
   }
@@ -589,7 +731,7 @@ export function registerLpReportReconRoutes(app) {
   console.log('[LPReportRecon] Routes registered: POST /n8n/admin/lp-report-recon-run | GET /n8n/admin/lp-report-recon-status');
 }
 
-// ─── Scheduler — daily at 07:00 ET (after the 6:00/6:15 report ingest) ───
+// ─── Scheduler — daily at RECON_HOUR_ET, default 08:00 ET (past every ingest) ───
 let reconTimer = null;
 let lastReconDate = null;
 
@@ -599,10 +741,10 @@ export function startLpReportReconScheduler() {
     console.log('[LPReportRecon] Scheduler DISABLED (LP_REPORT_RECON_ENABLED=false)');
     return;
   }
-  console.log('[LPReportRecon] Scheduler started — daily run at 07:00 ET');
+  console.log(`[LPReportRecon] Scheduler started — daily run at ${String(RECON_HOUR_ET).padStart(2, '0')}:00 ET`);
   const checkAndRun = async () => {
     const today = todayET();
-    if (hourET() === 7 && lastReconDate !== today) {
+    if (hourET() === RECON_HOUR_ET && lastReconDate !== today) {
       lastReconDate = today; // claim before awaiting (avoids double-fire)
       try {
         await runJob('lp-report-recon', () => runLpReportRecon(), { occurrence: today });

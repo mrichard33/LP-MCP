@@ -272,7 +272,7 @@ all as CSV.
 
 ## Cross-report reconciliations — read them, do not act on them
 
-Two checks in the daily 07:00 ET recon (`src/jobs/lp-report-recon.js`) compare
+Two checks in the daily 08:00 ET recon (`src/jobs/lp-report-recon.js`) compare
 one report against another. Both are **observability only**: neither can return
 `fail`, neither alerts, and neither can block a send.
 

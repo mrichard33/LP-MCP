@@ -281,7 +281,7 @@ import { registerCohortReobservationRoutes } from './jobs/cohort-reobservation.j
 // posts raw PDF bytes; parse/validate/write happens here, fail-closed.
 import { registerLpReportRoutes } from './jobs/lp-report-ingest.js';
 import { registerLpCsvRoutes } from './jobs/lp-csv-ingest.js';
-// Daily 07:00 ET cross-source recon for the ingested LP reports.
+// Daily 08:00 ET cross-source recon for the ingested LP reports.
 import { registerLpReportReconRoutes, startLpReportReconScheduler } from './jobs/lp-report-recon.js';
 // Daily 05:30 ET LP-driven source reconciler — diffs LP's authoritative source
 // list against lp_source_mapping. Reports only; never writes a mapping.
