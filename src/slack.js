@@ -186,8 +186,14 @@ export async function mirrorToSlack(text, channel, opts = {}) {
  * `threw: true` marks a transport failure — we never got an answer from Slack.
  * `threw: false` with an error means Slack answered and refused. Retrying helps
  * with the first and almost never with the second.
+ *
+ * opts.threadTs posts the message as a REPLY under that parent message instead
+ * of as a new message in the channel. Added 2026-09-17 so the sale-announcement
+ * stats line can sit under its celebration rather than doubling the length of
+ * the sales board — ~400 sales a month is ~800 messages if every stat is a
+ * top-level post.
  */
-export async function postToSlack(text, channelId) {
+export async function postToSlack(text, channelId, opts = {}) {
   if (!text) return { ok: false, ts: null, channel: channelId || null, error: 'no_text', threw: false };
   if (!channelId) return { ok: false, ts: null, channel: null, error: 'no_channel', threw: false };
   if (!SLACK_BOT_TOKEN) {
@@ -205,7 +211,13 @@ export async function postToSlack(text, channelId) {
         'Content-Type': 'application/json; charset=utf-8',
         Authorization: `Bearer ${SLACK_BOT_TOKEN}`,
       },
-      body: JSON.stringify({ channel: channelId, text: String(text) }),
+      body: JSON.stringify({
+        channel: channelId,
+        text: String(text),
+        // A reply, when the caller has a parent ts. Slack ignores the key when
+        // it is absent, so the ordinary post path is byte-identical to before.
+        ...(opts.threadTs ? { thread_ts: String(opts.threadTs) } : {}),
+      }),
       signal: AbortSignal.timeout(10000),
     });
     const body = await res.json().catch(() => ({}));

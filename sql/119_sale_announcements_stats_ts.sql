@@ -1,0 +1,32 @@
+-- 119_sale_announcements_stats_ts.sql
+-- Record the ts of the threaded stats reply.
+--
+-- STATUS: NO DASHBOARD WORK NEEDED. One ADD COLUMN IF NOT EXISTS, mirrored in
+-- src/index.js runMigrations() alongside the sql/117 block, so it applies itself
+-- on the next deploy. The file exists so the schema change has a home in the
+-- migration history, not because anyone has to run it.
+--
+-- ══ WHY ══
+-- Each announcement now posts twice: the celebration as a channel message, and
+-- the month numbers as a REPLY in its thread. slack_ts holds the first; this
+-- column holds the second, so a post can be traced, edited or deleted in full
+-- rather than leaving an orphaned reply behind.
+--
+-- It is nullable and stays NULL in three ordinary cases, none of them an error:
+--   - the facts came back degraded, so there were no numbers worth replying with
+--   - the reply failed to post (the announcement still succeeded — see
+--     postSaleStats in src/notifications/slack-sale.js for why that is logged
+--     rather than alerted)
+--   - the row predates this column
+--
+-- So `slack_stats_ts IS NULL` is NOT a health signal. Count it against
+-- status='posted' over a window if you want the reply delivery rate.
+
+alter table sale_announcements add column if not exists slack_stats_ts text;
+
+-- ══ VERIFY ══
+--   select json_agg(row_to_json(s)) from (
+--     select count(*) posted,
+--            count(slack_stats_ts) with_stats_reply
+--       from sale_announcements where status = 'posted'
+--   ) s;

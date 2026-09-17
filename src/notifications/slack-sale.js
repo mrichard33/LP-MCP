@@ -112,6 +112,43 @@ export async function postSaleAnnouncement(text, deps = {}) {
 }
 
 /**
+ * Post the stats line as a REPLY under the celebration.
+ *
+ * Deliberately weaker than postSaleAnnouncement, in every way:
+ *   - ONE attempt, no retry. The celebration already landed; the numbers are a
+ *     convenience, and spending fifteen seconds of backoff on a convenience
+ *     delays nothing useful.
+ *   - NO ops alert, and the caller must not mark the row slack_failed. A sale
+ *     that reached the board is not a dropped sale. Paging someone at 9pm
+ *     because a footnote did not render would be exactly the kind of noisy alarm
+ *     that gets a channel muted — and a muted channel is how the real outages in
+ *     CLAUDE.md went unnoticed.
+ *   - Never throws.
+ *
+ * Returns { ok, ts, error }.
+ */
+export async function postSaleStats(text, threadTs, deps = {}) {
+  const {
+    post = postToSlack,
+    channelId = salesRollupChannelId(),
+    logger = console,
+  } = deps;
+
+  if (!text) return { ok: false, ts: null, error: 'no_text' };
+  if (!threadTs) return { ok: false, ts: null, error: 'no_thread_ts' };
+  if (!channelId) return { ok: false, ts: null, error: 'no_channel' };
+
+  const res = await post(text, channelId, { threadTs });
+  if (!res.ok) {
+    logger.warn?.(
+      `[SaleAnnounce] stats reply failed (${res.error}) under ts=${threadTs} — ` +
+      'the announcement itself posted, so this is a log line, not an incident',
+    );
+  }
+  return { ok: res.ok, ts: res.ts, error: res.error };
+}
+
+/**
  * Mirror to GroupMe, but only once GHL steps 46-47 are gone.
  * Routed through sendGroupMeMessage on the 'sales' channel so the existing card
  * path and its Slack mirror stay the single place that knows how to send.

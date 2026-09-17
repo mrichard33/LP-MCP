@@ -1807,7 +1807,8 @@ async function runMigrations() {
               ON sale_announcements (lp_lead_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_sale_announcements_prospect
               ON sale_announcements (lp_prospect_id, created_at DESC);
-            ALTER TABLE lp_leads ADD COLUMN IF NOT EXISTS close_date_source text;`);
+            ALTER TABLE lp_leads ADD COLUMN IF NOT EXISTS close_date_source text;
+            ALTER TABLE sale_announcements ADD COLUMN IF NOT EXISTS slack_stats_ts text;`);
     console.log('[Migration] sale announcements (sql/117) + close_date_source (sql/118) ready');
   } catch (err) {
     console.error('[Migration] sale announcements FAILED (POST /notifications/sale-announcement will 500 on every sale until sql/117 is applied from the dashboard):', err.message);
