@@ -120,6 +120,11 @@ const FUNCTION_GROUPS = {
   agentic_callback: 'customer_facing',   // src/agentic-callback-message.js
   appt_notification: 'customer_facing',  // src/notifications/appointment-body-generator.js (legacy APPT_NOTIFICATION_MODEL)
   cancellation_body: 'customer_facing',  // src/notifications/cancellation-body-generator.js
+  // Sales-board announcement. Not a customer message, but it is read by the
+  // whole floor and its voice matters, so it rides customer_facing rather
+  // than the decision-engine group. Prompt lives in
+  // src/notifications/sale-announcement-rulebook.md.
+  sale_announcement: 'customer_facing', // src/notifications/sale-announcement-body-generator.js
 };
 
 // Normalize a function/group key to an ENV prefix.

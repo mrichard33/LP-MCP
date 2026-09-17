@@ -96,6 +96,11 @@ const GHL_FIELD_DECODER = {
   // ─── REP / OWNERSHIP ───────────────────────────────────────────
   'lPCvCXOQEQFXtuHekAq8': { name: 'Assigned Rep Name',       category: 'rep' },
   'ML9jAe1P5eq1uSwYTV3o': { name: 'LP Rep Name',             category: 'rep' },
+  // Added 2026-09-16: read by POST /notifications/sale-announcement as the rep
+  // the sales-board message names. Format is "First Last" here, while
+  // lp_leads.rep_name is "Last, First" — see repNameKey in
+  // src/notifications/sale-facts.js before comparing the two.
+  'yxOTDIT7Um0JxkOPUbPo': { name: 'Rep Display Name',        category: 'rep', notes: 'Customer-facing rep name, "First Last". src/context-builder.js reads it as lead.rep_display_name.' },
   '5TqwYJPONzmWS1UIfM3A': { name: 'LP Promoter Name',        category: 'rep' },
   '7YkTgCb9IXsoQWDsP50E': { name: 'Assigned To (User ID)',   category: 'rep' },
 

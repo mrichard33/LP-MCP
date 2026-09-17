@@ -151,24 +151,87 @@ export async function mirrorToSlack(text, channel, opts = {}) {
 
   let ok = 0;
   for (const id of ids) {
-    try {
-      const res = await fetch('https://slack.com/api/chat.postMessage', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json; charset=utf-8',
-          Authorization: `Bearer ${SLACK_BOT_TOKEN}`,
-        },
-        body: JSON.stringify({ channel: id, text: String(text) }),
-        signal: AbortSignal.timeout(10000),
-      });
-      const body = await res.json().catch(() => ({}));
-      if (body?.ok) ok++;
-      else console.warn(`[Slack] post to ${id} failed: ${body?.error || res.status}`);
-    } catch (err) {
-      console.warn(`[Slack] post to ${id} threw: ${err.message}`);
-    }
+    const res = await postToSlack(text, id);
+    if (res.ok) ok++;
+    // "threw" and "failed" are not the same diagnosis and the log must keep them
+    // apart: threw means we never reached Slack (DNS, TLS, reset, timeout),
+    // failed means Slack answered and refused (invalid_auth, channel_not_found).
+    // One is our network, the other is our configuration.
+    else console.warn(`[Slack] post to ${id} ${res.threw ? 'threw' : 'failed'}: ${res.error}`);
   }
   return { mirrored: ok > 0, channels: ids.length, sent: ok };
+}
+
+/**
+ * Post ONE message to ONE resolved channel id and return Slack's message ts.
+ *
+ * Added 2026-09-16 for the sale-announcement endpoint, which has to store the
+ * ts and channel on its row so a post can be traced, edited or threaded later.
+ * mirrorToSlack cannot serve that: it fans out to several channels and reduces
+ * the whole thing to a count, discarding every ts.
+ *
+ * mirrorToSlack was refactored onto this function rather than a third copy of
+ * chat.postMessage being written, because there must be exactly one place that
+ * knows how this repo talks to Slack.
+ *
+ * TWO DELIBERATE DIFFERENCES FROM mirrorToSlack:
+ *   - It does NOT check SLACK_MIRROR_ENABLED. That flag gates the GroupMe
+ *     MIRROR during the migration. This function is also used for posts where
+ *     Slack is the PRIMARY destination, and gating those on a mirror flag would
+ *     make "Slack is the system of record" depend on a migration switch.
+ *   - It reports failure instead of swallowing it, so a caller that must know
+ *     (retry, mark the row slack_failed, raise an ops alert) can. It still never
+ *     throws.
+ *
+ * `threw: true` marks a transport failure — we never got an answer from Slack.
+ * `threw: false` with an error means Slack answered and refused. Retrying helps
+ * with the first and almost never with the second.
+ */
+export async function postToSlack(text, channelId) {
+  if (!text) return { ok: false, ts: null, channel: channelId || null, error: 'no_text', threw: false };
+  if (!channelId) return { ok: false, ts: null, channel: null, error: 'no_channel', threw: false };
+  if (!SLACK_BOT_TOKEN) {
+    if (!warnedNoToken) {
+      console.warn('[Slack] SLACK_BOT_TOKEN unset — post is a no-op');
+      warnedNoToken = true;
+    }
+    return { ok: false, ts: null, channel: channelId, error: 'no_token', threw: false };
+  }
+
+  try {
+    const res = await fetch('https://slack.com/api/chat.postMessage', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json; charset=utf-8',
+        Authorization: `Bearer ${SLACK_BOT_TOKEN}`,
+      },
+      body: JSON.stringify({ channel: channelId, text: String(text) }),
+      signal: AbortSignal.timeout(10000),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (body?.ok) {
+      return { ok: true, ts: body.ts || null, channel: body.channel || channelId, error: null, threw: false };
+    }
+    return {
+      ok: false,
+      ts: null,
+      channel: channelId,
+      error: String(body?.error || res.status),
+      threw: false,
+    };
+  } catch (err) {
+    return { ok: false, ts: null, channel: channelId, error: err.message, threw: true };
+  }
+}
+
+/** The #sales-all rollup channel id, or '' when unset. */
+export function salesRollupChannelId() {
+  return CH_SALES;
+}
+
+/** The #ops-alerts channel id, or '' when unset. */
+export function opsChannelId() {
+  return CH_OPS;
 }
 
 /** TESTS ONLY — reset the cache between cases. */

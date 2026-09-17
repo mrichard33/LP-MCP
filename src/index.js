@@ -1772,6 +1772,46 @@ async function runMigrations() {
   } catch (err) {
     console.error('[Migration] intake journal FAILED (the journal middleware fails open, so intake keeps working but records nothing — apply sql/106 manually):', err.message);
   }
+
+  // Sale announcements (sql/117) + the lp_leads close-date provenance column
+  // (sql/118 §1). Mirrored so a fresh deploy self-heals; the dashboard files
+  // stay the source of truth.
+  //
+  // sql/118's BACKFILL IS DELIBERATELY NOT HERE. It rewrites close_date on
+  // ~24,834 rows, and a data write that size does not belong in a boot path —
+  // it runs once, by hand, from the dashboard. Only the ALTER is mirrored.
+  //
+  // A failure here is not silent in the way the others are: the endpoint writes
+  // its pending row BEFORE responding 200, so a missing table turns every sale
+  // into a 500 at GHL rather than a quiet degradation. Hence the louder message.
+  try {
+    const { runSQL } = await import('./admin/supabase-admin.js');
+    await runSQL(`CREATE TABLE IF NOT EXISTS sale_announcements (
+              id                bigserial   PRIMARY KEY,
+              lp_lead_id        text,
+              lp_prospect_id    text,
+              ghl_contact_id    text,
+              rep_display_name  text,
+              gross_sale_amount numeric,
+              idempotency_key   text        NOT NULL UNIQUE,
+              key_source        text        NOT NULL DEFAULT 'lead_id',
+              status            text        NOT NULL DEFAULT 'pending',
+              slack_ts          text,
+              slack_channel     text,
+              message_text      text,
+              facts_json        jsonb,
+              error_message     text,
+              created_at        timestamptz NOT NULL DEFAULT now(),
+              completed_at      timestamptz);
+            CREATE INDEX IF NOT EXISTS idx_sale_announcements_lead
+              ON sale_announcements (lp_lead_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_sale_announcements_prospect
+              ON sale_announcements (lp_prospect_id, created_at DESC);
+            ALTER TABLE lp_leads ADD COLUMN IF NOT EXISTS close_date_source text;`);
+    console.log('[Migration] sale announcements (sql/117) + close_date_source (sql/118) ready');
+  } catch (err) {
+    console.error('[Migration] sale announcements FAILED (POST /notifications/sale-announcement will 500 on every sale until sql/117 is applied from the dashboard):', err.message);
+  }
 }
 
 app.get('/', (req, res) => {
