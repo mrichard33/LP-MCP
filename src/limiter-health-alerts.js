@@ -72,18 +72,41 @@
  * from backpressure (2 deep, clears in minutes), and it stayed correctly
  * silent all night.
  *
- * Both new knobs read from env with an explicit threshold override, so they
- * can be retuned from Railway without a deploy:
- *   LIMITER_NEW_429_DELTA_ALERT   default 3
- *   LIMITER_PAUSE_ALERT_MS        default 150000
- *   LIMITER_TIMEOUT_DELTA_ALERT   default 25 (was 3)
+ * ⚠️ WHICH DEFAULTS ACTUALLY REACH THE LIVE HEARTBEAT
+ * ───────────────────────────────────────────────────
+ * Read this before changing a default below and expecting it to take effect.
+ * executor-heartbeat.js does NOT omit these thresholds — it passes two of
+ * them explicitly, from its own env-backed constants:
+ *
+ *     shouldAlertLimiter(curr, lastLimiterSnapshot, {
+ *       queueDepth:    LIMITER_QUEUE_ALERT_THRESHOLD,   // env || '15'
+ *       timedOutDelta: LIMITER_TIMEOUT_DELTA_ALERT,     // env || '3'
+ *     })
+ *
+ * Because `thresholds?.x ?? envInt(...)` honours anything the caller
+ * supplies, the caller's value WINS for those two on the heartbeat path.
+ * DEFAULT_TIMEOUT_DELTA below is therefore NOT self-activating:
+ *
+ *   → LIMITER_TIMEOUT_DELTA_ALERT=25 must be set in Railway for the raised
+ *     timeout threshold to apply. That is a REQUIRED step, not optional
+ *     tuning. Without it the caller keeps passing 3 and the timeout branch
+ *     fires exactly as it did before this change.
+ *
+ * The other two ARE self-activating — the caller passes neither, so they
+ * come from here (or their env var) the moment this merges:
+ *   LIMITER_NEW_429_DELTA_ALERT   default 3        ← no env var needed
+ *   LIMITER_PAUSE_ALERT_MS        default 150000   ← no env var needed
+ *
+ * The module defaults for queueDepth/timedOutDelta still apply on paths that
+ * omit them: this file's tests, and any future caller.
  */
 
 // Defaults live here rather than in executor-heartbeat.js on purpose. That
 // file is ~36KB and the MCP write path can only replace it whole — which is
 // exactly how PR #648 dropped a const declaration and crashed the service on
 // boot for 52 minutes (see its 2026-08-08 hotfix note). Keeping this change
-// inside this small file means the caller's signature is untouched.
+// inside this small file means the caller's signature is untouched — at the
+// cost documented above: the caller's explicit values win for two of the four.
 const DEFAULT_QUEUE_DEPTH = 15;
 const DEFAULT_TIMEOUT_DELTA = 25;
 const DEFAULT_NEW_429_DELTA = 3;
@@ -104,7 +127,9 @@ function envInt(name, fallback) {
  *   total doesn't re-alert forever.
  * @param {{queueDepth?:number, timedOutDelta?:number, new429Delta?:number,
  *          pauseAlertMs?:number}} [thresholds]
- *   Any omitted key falls back to its env var, then to the module default.
+ *   Anything the caller supplies WINS. Any omitted key falls back to its env
+ *   var, then to the module default. See the header note on which of these
+ *   the live heartbeat supplies.
  * @returns {{alert:boolean, reasons:string[], critical:boolean}}
  */
 export function shouldAlertLimiter(curr, prev, thresholds) {
@@ -163,9 +188,12 @@ export function shouldAlertLimiter(curr, prev, thresholds) {
   }
 
   // Bursty fail-open timeouts even if the queue snapshot is momentarily
-  // shallow. Delta since the last check. Threshold raised 3 -> 25 on
+  // shallow. Delta since the last check. Module default raised 3 -> 25 on
   // 2026-09-17: with capacity 120 against a 65/min refill, small timeout
-  // bursts are the normal cost of a drained bucket, not a signal.
+  // bursts are the normal cost of a drained bucket, not a signal. NOTE the
+  // header — on the live heartbeat path this threshold comes from the caller,
+  // so LIMITER_TIMEOUT_DELTA_ALERT=25 must be set in Railway for the raise to
+  // actually apply.
   if (prev && (timedOut - (prev.timedOut ?? 0)) >= timedOutDeltaThreshold) {
     reasons.push(`${timedOut - (prev.timedOut ?? 0)} token timeouts since last check`);
   }
