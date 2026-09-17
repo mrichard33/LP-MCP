@@ -50,8 +50,8 @@ import crypto from 'crypto';
 import supabaseDefault from '../supabase.js';
 import { resolveLeadId, canWriteBack } from './resolve-lead.js';
 import { buildRepFacts } from './sale-facts.js';
-import { generateSaleAnnouncement } from './sale-announcement-body-generator.js';
-import { postSaleAnnouncement, mirrorSaleToGroupMe, alertSaleDeliveryFailed } from './slack-sale.js';
+import { generateSaleAnnouncement, formatStatsLine } from './sale-announcement-body-generator.js';
+import { postSaleAnnouncement, postSaleStats, mirrorSaleToGroupMe, alertSaleDeliveryFailed } from './slack-sale.js';
 
 export const ROUTE_PATH = '/notifications/sale-announcement';
 
@@ -270,6 +270,8 @@ export async function completeAnnouncement(ctx, deps = {}) {
     facts: factsFn = buildRepFacts,
     compose = generateSaleAnnouncement,
     post = postSaleAnnouncement,
+    postStats = postSaleStats,
+    statsLine = formatStatsLine,
     mirror = mirrorSaleToGroupMe,
     alert = alertSaleDeliveryFailed,
     update = updateRow,
@@ -309,6 +311,23 @@ export async function completeAnnouncement(ctx, deps = {}) {
         completed_at: new Date(now()).toISOString(),
         error_message: null,
       }, deps);
+
+      // ── The stats reply, in the thread under the celebration ─────
+      // Added 2026-09-17. The month numbers used to ride inside the
+      // announcement and turned it into a ledger entry; they now sit one click
+      // away instead. Wrapped in its own try/catch because the row is ALREADY
+      // 'posted' at this point and nothing below may take that away — the sale
+      // reached the board, which is the thing that matters.
+      try {
+        const stats = statsLine(repDisplayName, facts, now());
+        if (stats) {
+          const statsRes = await postStats(stats, res.ts, deps);
+          if (statsRes.ok) await update(rowId, { slack_stats_ts: statsRes.ts }, deps);
+        }
+      } catch (err) {
+        logger.warn?.(`[SaleAnnounce] stats reply threw for row=${rowId}: ${err.message}`);
+      }
+
       await mirror(composed.text, deps);
       logger.log?.(
         `[SaleAnnounce] posted row=${rowId} rep="${repDisplayName}" ts=${res.ts} ` +

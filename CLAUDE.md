@@ -37,7 +37,22 @@ failed; it now delegates to `postToSlack` so there is still exactly one `chat.po
 repo. Precedent: `src/notifications/slack-sale.js`, whose row has to store the `ts`, and which is
 Slack-only because GroupMe keeps firing for the same event from inside the GHL workflow. Unlike the
 mirror, `postToSlack` ignores `SLACK_MIRROR_ENABLED` — a destination of record must not depend on a
-migration switch.
+migration switch. Pass `{ threadTs }` to reply under a message instead of posting a new one.
+
+**A celebration and a stat line are two different jobs — do not let one become the other.** The
+sale-announcement post carried the rep's month-to-date total inside the message for one day, and the
+model turned it into a ledger entry: *"Craig Barela closes another one — $1,500 today, $36,300 on the
+month."* None of the ten examples in `sale-announcement-rulebook.md` cite a month total; every one is
+the sale alone. `buildFactsBlock` now hands the model only what a person would cheer (a rank climb, a
+personal record, a 3+ day streak, a top-3 standing) and the numbers go out as a threaded reply from
+`formatStatsLine`. The reply is best-effort: one attempt, no retry, no ops alert, and it may never
+change a row that already reads `posted` — a sale that reached the board is not a dropped sale.
+
+**A rank climb is only celebratory if it LANDS well.** Live row 4 produced a real climb of 50 → 41
+out of a field of 50 — out of dead last. Any message using it states where the rep started, which is
+exactly what the rulebook's comparison rule forbids. `isCelebratableClimb` requires the destination to
+be in the top third of the field (floor of 3), and suppresses the climb outright when the field size
+is unknown. Do not relax that to "any improvement".
 
 ## Alerting
 

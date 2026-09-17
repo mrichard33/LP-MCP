@@ -71,7 +71,11 @@ USING THE FACTS BLOCK
 The user message carries a FACTS block. Every line in it is already true — do not
 recompute, reinterpret or extrapolate from it.
 - Use at most ONE fact. Two facts in two sentences reads like a report, not a board post.
-- If the FACTS block says "none", write the sale alone. That is a complete, correct post.
-- Never state a number that is not in the FACTS block or the sale amount.
+- If the FACTS block says "none", write the sale alone. That is a complete, correct post,
+  and it is what MOST posts should be — every example above is the sale alone.
+- Never state a number that is not in the FACTS block or the sale amount. In particular
+  there is no month-to-date total and no team total available to you; those go out
+  separately. Asking for them or inventing them turns a celebration into a ledger entry.
+- Never state two amounts in one message. One sale, one number.
 - Never mention the rank field size ("of 48 reps") — it invites the reader to do the
   subtraction the comparison rule forbids.

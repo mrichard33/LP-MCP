@@ -122,20 +122,52 @@ function money(n) {
 }
 
 /**
+ * Is a rank climb one we can state out loud?
+ *
+ * 2026-09-17. A climb is only celebratory if it LANDS somewhere respectable.
+ * The first live batch produced rank_climb {from: 50, to: 41} out of a field of
+ * 50 — a genuine climb that begins at dead last. Any message using it tells the
+ * floor exactly where that rep started, which is the one thing the rulebook's
+ * comparison rule forbids. The model that day wrote "Biggest close of his year"
+ * instead and the post read fine, but that was luck, not a guarantee, and a
+ * guard we rely on the model to honour is not a guard.
+ *
+ * Top third of the field, with a floor of 3 so a small field still works.
+ */
+export function isCelebratableClimb(climb, field) {
+  if (!climb || climb.to == null || climb.from == null) return false;
+  if (climb.to >= climb.from) return false;
+  if (!field || field < 2) return false;
+  return climb.to <= Math.max(3, Math.ceil(field / 3));
+}
+
+/**
  * Render the FACTS block. Only facts the rulebook is allowed to use appear here
  * — nothing that could be read as a rep doing badly ever reaches the model, so
  * the comparison rule cannot be violated even by a model that ignores it.
  *
- * rank is included only when it is a CLIMB or a top-3 standing. A bare "ranked
- * 41st" is exactly the fact the rulebook forbids, so it is filtered here rather
- * than trusted to the prompt.
+ * WHY THE MONTH TOTALS ARE NOT HERE (2026-09-17)
+ * ----------------------------------------------
+ * They used to be, and they were the whole problem. Fed "3 sales this month,
+ * $36,300 total", the model dutifully reported it and produced:
+ *
+ *   🧱 Craig Barela closes another one — $1,500 today, $36,300 on the month.
+ *
+ * That is a ledger entry, not a celebration. Note that NONE of the ten examples
+ * in the rulebook cite a month total — every one of them is the sale alone. So
+ * sale-only was always the target style, and the bookkeeping was working against
+ * it. The month numbers now go out as a threaded reply built by
+ * formatStatsLine(); this block carries only what a person would actually cheer.
+ *
+ * Most sales will therefore return 'none', which routes to the rulebook's
+ * "write the sale alone" path. That is correct, not a degradation.
  */
 export function buildFactsBlock(facts) {
   if (!facts || facts.degraded) return 'none';
 
   const lines = [];
 
-  if (facts.rank_climb) {
+  if (isCelebratableClimb(facts.rank_climb, facts.rank_field)) {
     lines.push(`Moved up the month's volume board: ${facts.rank_climb.from} to ${facts.rank_climb.to}.`);
   } else if (facts.rank != null && facts.rank <= 3) {
     lines.push(`Currently ${facts.rank === 1 ? '1st' : facts.rank === 2 ? '2nd' : '3rd'} on the month's volume board.`);
@@ -149,17 +181,34 @@ export function buildFactsBlock(facts) {
     lines.push(`${facts.streak_days} consecutive days with a sale.`);
   }
 
-  if (facts.mtd_sale_count != null && facts.mtd_sale_count > 1) {
-    const vol = money(facts.mtd_volume);
-    lines.push(
-      `${facts.mtd_sale_count} sales this month` + (vol ? `, ${vol} total.` : '.'),
-    );
-  }
+  return lines.length ? lines.join('\n') : 'none';
+}
+
+/** Month name for the stats line, in UTC to match how the facts were bucketed. */
+function monthName(date) {
+  return new Date(date).toLocaleString('en-US', { month: 'long', timeZone: 'UTC' });
+}
+
+/**
+ * The threaded stats reply — the numbers, kept out of the celebration.
+ *
+ * Pure and null-safe: degraded facts, or facts with nothing countable in them,
+ * return null and the caller posts no reply. Never throws.
+ */
+export function formatStatsLine(repDisplayName, facts, now = new Date()) {
+  if (!facts || facts.degraded) return null;
+
+  const count = Number(facts.mtd_sale_count) || 0;
+  if (count < 1) return null;
+
+  const month = monthName(now);
+  const vol = money(facts.mtd_volume);
+  const noun = count === 1 ? 'sale' : 'sales';
+
+  const first = `📊 ${repDisplayName} — ${count} ${noun} in ${month}` + (vol ? `, ${vol}.` : '.');
 
   const team = money(facts.team_mtd_volume);
-  if (team) lines.push(`Team total this month: ${team}.`);
-
-  return lines.length ? lines.join('\n') : 'none';
+  return team ? `${first}\nTeam month to date: ${team}.` : first;
 }
 
 export function buildUserPrompt({ repDisplayName, saleAmount, facts }) {

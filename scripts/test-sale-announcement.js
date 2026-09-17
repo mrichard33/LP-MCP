@@ -41,9 +41,11 @@ import {
   cleanMessage,
   validateMessage,
   buildFactsBlock,
+  formatStatsLine,
+  isCelebratableClimb,
   gitBlobSha,
 } from '../src/notifications/sale-announcement-body-generator.js';
-import { postSaleAnnouncement } from '../src/notifications/slack-sale.js';
+import { postSaleAnnouncement, postSaleStats } from '../src/notifications/slack-sale.js';
 
 const TOKEN = process.env.SALE_ANNOUNCE_TOKEN;
 
@@ -166,6 +168,7 @@ const quietLogger = { log() {}, warn() {}, error() {} };
 /** deps that exercise the real orchestration but stub Slack and the model. */
 function makeDeps(db, overrides = {}) {
   const slackCalls = [];
+  const statsCalls = [];
   const opsAlerts = [];
   const deferred = [];
 
@@ -186,6 +189,10 @@ function makeDeps(db, overrides = {}) {
       slackCalls.push(text);
       return { ok: true, ts: `ts-${slackCalls.length}`, channel: 'C_SALES', error: null, attempts: 1 };
     },
+    postStats: async (text, threadTs) => {
+      statsCalls.push({ text, threadTs });
+      return { ok: true, ts: `stats-${statsCalls.length}`, error: null };
+    },
     mirror: async () => ({ mirrored: false, reason: 'disabled' }),
     alert: async (detail) => { opsAlerts.push(detail); return { ok: true }; },
     // Collect the detached work so a test can await it deterministically.
@@ -196,6 +203,7 @@ function makeDeps(db, overrides = {}) {
   return {
     deps,
     slackCalls,
+    statsCalls,
     opsAlerts,
     async drain() {
       while (deferred.length) await deferred.shift()();
@@ -776,8 +784,18 @@ test('buildFactsBlock never hands the model a fact that could shame a rep', () =
   assert.ok(!low.includes('41'), 'a low rank must be filtered, not trusted to the prompt');
   assert.ok(!low.includes('48'), 'the field size invites the forbidden subtraction');
 
-  // A climb and a top-3 standing are allowed.
-  assert.match(buildFactsBlock({ degraded: false, rank_climb: { from: 4, to: 2 }, rank: 2 }), /4 to 2/);
+  // A climb and a top-3 standing are allowed. rank_field is REQUIRED for a
+  // climb: without it we cannot tell whether the landing spot is respectable,
+  // and per the repo's fail-closed doctrine unreadable data is never a wildcard
+  // pass. buildRepFacts always sets it alongside a rank, so real facts qualify.
+  assert.match(
+    buildFactsBlock({ degraded: false, rank_climb: { from: 4, to: 2 }, rank_field: 40, rank: 2 }),
+    /4 to 2/,
+  );
+  assert.ok(
+    !/4 to 2/.test(buildFactsBlock({ degraded: false, rank_climb: { from: 4, to: 2 }, rank: 2 })),
+    'a climb with an unknown field size is suppressed, not guessed at',
+  );
   assert.match(buildFactsBlock({ degraded: false, rank: 1 }), /1st/);
 
   // Streak and record.
@@ -817,4 +835,177 @@ test('the shipped rulebook carries all six structures and the comparison rule', 
   assert.ok(!system.includes('Change it only by PR'));
   assert.match(sha, /^[0-9a-f]{40}$/);
   __resetRulebookCache();
+});
+
+// ═════════════════════════════════════════════════════════════════
+// The threaded stats reply (2026-09-17)
+// ═════════════════════════════════════════════════════════════════
+test('the stats line posts as a reply in the announcement’s thread', async () => {
+  const db = makeDb({ leads: [{ lp_lead_id: '573581', lp_prospect_id: 'prospect_9' }] });
+  const h = makeDeps(db, {
+    facts: async () => ({
+      degraded: false, mtd_sale_count: 3, mtd_volume: 36300,
+      rank: 41, rank_field: 50, team_mtd_volume: 4214968,
+    }),
+  });
+  const handler = makeSaleAnnouncementHandler(h.deps);
+
+  await handler(req(payload()), makeRes());
+  await h.drain();
+
+  assert.equal(h.slackCalls.length, 1, 'one channel message');
+  assert.equal(h.statsCalls.length, 1, 'one threaded reply');
+  // The reply must carry the PARENT message's ts, or it lands as its own post.
+  assert.equal(h.statsCalls[0].threadTs, 'ts-1');
+  assert.match(h.statsCalls[0].text, /3 sales/);
+  assert.match(h.statsCalls[0].text, /36,300/);
+  assert.equal(db.announcements[0].slack_stats_ts, 'stats-1');
+  assert.equal(db.announcements[0].status, STATUSES.POSTED);
+});
+
+test('a failed stats reply leaves the row posted and raises NO ops alert', async () => {
+  // The sale reached the board. Losing the footnote is a log line, not an
+  // incident — alerting on it is how a channel gets muted.
+  const db = makeDb({ leads: [{ lp_lead_id: '573581', lp_prospect_id: 'prospect_9' }] });
+  const h = makeDeps(db, {
+    facts: async () => ({ degraded: false, mtd_sale_count: 2, mtd_volume: 1000 }),
+    postStats: async () => ({ ok: false, ts: null, error: 'ratelimited' }),
+  });
+  const handler = makeSaleAnnouncementHandler(h.deps);
+
+  await handler(req(payload()), makeRes());
+  await h.drain();
+
+  assert.equal(db.announcements[0].status, STATUSES.POSTED, 'still posted');
+  assert.equal(db.announcements[0].slack_stats_ts, undefined, 'no ts recorded');
+  assert.equal(h.opsAlerts.length, 0, 'a missing footnote must never page anyone');
+});
+
+test('a stats reply that THROWS cannot un-post the announcement', async () => {
+  const db = makeDb({ leads: [{ lp_lead_id: '573581', lp_prospect_id: 'prospect_9' }] });
+  const h = makeDeps(db, {
+    facts: async () => ({ degraded: false, mtd_sale_count: 2, mtd_volume: 1000 }),
+    postStats: async () => { throw new Error('socket hang up'); },
+  });
+  const handler = makeSaleAnnouncementHandler(h.deps);
+
+  await handler(req(payload()), makeRes());
+  await h.drain();
+
+  assert.equal(db.announcements[0].status, STATUSES.POSTED);
+  assert.equal(h.opsAlerts.length, 0);
+});
+
+test('degraded facts post the sale with no stats reply at all', async () => {
+  const db = makeDb({ leads: [{ lp_lead_id: '573581', lp_prospect_id: 'prospect_9' }] });
+  const h = makeDeps(db, { facts: async () => ({ degraded: true, reason: 'mtd_timeout' }) });
+  const handler = makeSaleAnnouncementHandler(h.deps);
+
+  await handler(req(payload()), makeRes());
+  await h.drain();
+
+  assert.equal(h.slackCalls.length, 1);
+  assert.equal(h.statsCalls.length, 0, 'nothing countable, so nothing to reply with');
+});
+
+test('a rep’s first sale of the month still gets a stats reply', async () => {
+  const db = makeDb({ leads: [{ lp_lead_id: '573581', lp_prospect_id: 'prospect_9' }] });
+  const h = makeDeps(db, {
+    facts: async () => ({ degraded: false, mtd_sale_count: 1, mtd_volume: 1500 }),
+  });
+  const handler = makeSaleAnnouncementHandler(h.deps);
+
+  await handler(req(payload()), makeRes());
+  await h.drain();
+
+  assert.equal(h.statsCalls.length, 1);
+  assert.match(h.statsCalls[0].text, /1 sale in/, 'singular, not "1 sales"');
+});
+
+test('postSaleStats never retries and never alerts', async () => {
+  let calls = 0;
+  const res = await postSaleStats('📊 stats', 'ts-parent', {
+    channelId: 'C_SALES',
+    logger: quietLogger,
+    post: async (text, channel, opts) => {
+      calls += 1;
+      assert.equal(opts.threadTs, 'ts-parent', 'threadTs must reach postToSlack');
+      return { ok: false, ts: null, error: 'ratelimited', threw: false };
+    },
+  });
+  assert.equal(res.ok, false);
+  assert.equal(calls, 1, 'exactly one attempt — the celebration already landed');
+});
+
+test('postSaleStats refuses to post without a parent ts', async () => {
+  // Without thread_ts this would land as a second top-level message and double
+  // the length of the board — the thing the threading exists to avoid.
+  let called = false;
+  const res = await postSaleStats('📊 stats', null, {
+    channelId: 'C_SALES', logger: quietLogger,
+    post: async () => { called = true; return { ok: true, ts: 'x' }; },
+  });
+  assert.equal(res.ok, false);
+  assert.equal(res.error, 'no_thread_ts');
+  assert.equal(called, false, 'must not post at all rather than post unthreaded');
+});
+
+// ═════════════════════════════════════════════════════════════════
+// formatStatsLine + the hardened rank-climb guard
+// ═════════════════════════════════════════════════════════════════
+test('formatStatsLine handles singular, plural and a missing team total', () => {
+  const now = new Date('2026-09-17T16:48:00Z');
+  const one = formatStatsLine('Craig Barela', { degraded: false, mtd_sale_count: 1, mtd_volume: 1500 }, now);
+  assert.match(one, /^📊 Craig Barela — 1 sale in September, \$1,500\.$/);
+
+  const many = formatStatsLine('Craig Barela', {
+    degraded: false, mtd_sale_count: 3, mtd_volume: 36300, team_mtd_volume: 4214968,
+  }, now);
+  assert.match(many, /3 sales in September, \$36,300\./);
+  assert.match(many, /Team month to date: \$4,214,968\./);
+
+  assert.equal(formatStatsLine('X', { degraded: true }, now), null);
+  assert.equal(formatStatsLine('X', null, now), null);
+  assert.equal(formatStatsLine('X', { degraded: false, mtd_sale_count: 0 }, now), null);
+});
+
+test('a rank climb out of the bottom of the board is never stated', () => {
+  // The real case, from live row 4 on 2026-09-17: a genuine climb that starts at
+  // dead last. Stating it tells the floor exactly where they were.
+  assert.equal(isCelebratableClimb({ from: 50, to: 41 }, 50), false);
+  // The other real case, row 1: a climb that lands near the top.
+  assert.equal(isCelebratableClimb({ from: 19, to: 6 }, 50), true);
+  // Boundary: top third of 50 is 17.
+  assert.equal(isCelebratableClimb({ from: 30, to: 17 }, 50), true);
+  assert.equal(isCelebratableClimb({ from: 30, to: 18 }, 50), false);
+  // Small fields keep a floor of 3 so 2nd place still counts.
+  assert.equal(isCelebratableClimb({ from: 5, to: 3 }, 5), true);
+  // Not a climb at all.
+  assert.equal(isCelebratableClimb({ from: 6, to: 6 }, 50), false);
+  assert.equal(isCelebratableClimb({ from: 3, to: 9 }, 50), false);
+  assert.equal(isCelebratableClimb(null, 50), false);
+  assert.equal(isCelebratableClimb({ from: 5, to: 1 }, null), false);
+});
+
+test('the FACTS block no longer carries any bookkeeping', () => {
+  // This is the defect the whole change exists for. Fed the month total, the
+  // model wrote "$1,500 today, $36,300 on the month" — a ledger entry.
+  const ledgerish = buildFactsBlock({
+    degraded: false, mtd_sale_count: 3, mtd_volume: 36300,
+    team_mtd_volume: 4214968, rank: 41, rank_field: 50, rank_climb: null,
+  });
+  assert.equal(ledgerish, 'none', 'nothing to cheer here, so the sale stands alone');
+
+  // Milestones still reach the model.
+  const rich = buildFactsBlock({
+    degraded: false, rank_climb: { from: 19, to: 6 }, rank_field: 50,
+    is_personal_record: true, notable_streak: true, streak_days: 4,
+    mtd_sale_count: 9, mtd_volume: 500000, team_mtd_volume: 4214968,
+  });
+  assert.match(rich, /19 to 6/);
+  assert.match(rich, /largest sale/);
+  assert.match(rich, /4 consecutive days/);
+  assert.ok(!rich.includes('500,000'), 'month volume must not appear');
+  assert.ok(!rich.includes('4,214,968'), 'team total must not appear');
+  assert.ok(!/9 sales/.test(rich), 'month count must not appear');
 });
