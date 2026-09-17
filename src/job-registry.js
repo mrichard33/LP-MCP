@@ -132,7 +132,7 @@ export const JOBS = Object.freeze([
     id: 'lp-report-recon',
     label: 'LP report reconciliation',
     group: 'lp-reports',
-    cadence: 'daily 07:00 ET',
+    cadence: 'daily 08:00 ET',
     enabledEnv: 'LP_REPORT_RECON_ENABLED',
     enabledDefault: true,
     isEnabled: (env) => (env.LP_REPORT_RECON_ENABLED || 'true').trim() !== 'false',
