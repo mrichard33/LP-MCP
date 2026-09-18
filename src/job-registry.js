@@ -155,6 +155,18 @@ export const JOBS = Object.freeze([
     enabledDefault: false,
     isEnabled: (env) => String(env.FRESHNESS_REFRESH_ENABLED || 'false').toLowerCase() === 'true',
   },
+  {
+    id: 'link-leak-monitor',
+    label: 'LP↔GHL link leak monitor',
+    group: 'sync',
+    cadence: 'daily 06:00 ET',
+    enabledEnv: 'LINK_LEAK_MONITOR_ENABLED',
+    // ON by default, unlike the two above. The failure it watches for is
+    // silence — the link leak reopened twice and neither round was noticed —
+    // and a watchdog that ships switched off watches nothing.
+    enabledDefault: true,
+    isEnabled: (env) => String(env.LINK_LEAK_MONITOR_ENABLED || 'true').toLowerCase() !== 'false',
+  },
 ]);
 
 /** Ids only — handy for tests and for asserting the wiring matches the roster. */

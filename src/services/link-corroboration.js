@@ -43,6 +43,21 @@ export const LINK_SOURCE = {
   // Distinct from legacy_unverified, which that path used to stamp on an
   // entirely unvalidated payload id.
   WEBHOOK_VERIFIED: 'webhook_verified',
+  // 2026-09-18: written ONLY by scripts/repair-lp-ghl-links.js, where an open
+  // P2 opportunity's contact was matched to an unlinked LP lead on the last 10
+  // digits of the phone.
+  //
+  // Deliberately NOT phone_email_match, even though the evidence is a phone
+  // agreement. That value means "matched against GHL via matchToGHL" and
+  // carries STRENGTH 3; this one compared the HL contacts MIRROR to lp_leads and
+  // never corroborated the candidate against live GHL identity. It therefore
+  // falls through linkStrength() to 1, so any later real corroboration displaces
+  // it — which is the correct direction for a repair.
+  //
+  // It is also the audit trail: `SELECT count(*) FROM lp_leads WHERE
+  // ghl_link_source = 'phone10_repair'` says exactly what that script did, for
+  // as long as the rows exist.
+  PHONE10_REPAIR: 'phone10_repair',
 };
 
 // Trust ranking for the downgrade guard: a stored rank-3 source is only ever

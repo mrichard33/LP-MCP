@@ -298,6 +298,9 @@ import { registerScorecardValidateRoutes, startScorecardValidateScheduler } from
 // 2026-08-06 Phase E — daily Five9 config snapshot + change log (ships dark)
 import { registerFive9SnapshotRoutes, startFive9ConfigSnapshotScheduler } from './jobs/five9-config-snapshot.js';
 import { registerFreshnessRefreshRoutes, startFreshnessRefreshScheduler } from './jobs/freshness-refresh.js';
+// 2026-09-18 — daily watch on the LP↔GHL link write path. The leak this
+// catches has been closed twice before and reopened unnoticed both times.
+import { registerLinkLeakRoutes, startLinkLeakScheduler } from './jobs/link-leak-monitor.js';
 import { registerCiRoutes } from './ci/routes.js';
 import { startCiWorkerScheduler } from './ci/worker.js';
 import { startCiDiscoveryScheduler } from './jobs/ci-discovery-scheduler.js';
@@ -1195,6 +1198,30 @@ async function runMigrations() {
     console.log('[Migration] sync hash gate substrate (sql/059) ready');
   } catch (err) {
     console.error('[Migration] sync hash gate substrate FAILED (hash gate runs ungated — apply sql/059 manually):', err.message);
+  }
+
+  // LP↔GHL link repair indexes (sql/122 — the file is the source of truth;
+  // this mirror guarantees a fresh deploy self-heals). PLAIN CREATE INDEX here,
+  // never CONCURRENTLY: per sql/README.md there is no code path in this repo
+  // that runs statements outside a transaction, and on a fresh deploy the table
+  // is empty anyway. On the LIVE table use the CONCURRENTLY form in sql/122
+  // from the dashboard — a plain build there would lock lp_leads against the
+  // 15-minute sync for the duration.
+  //
+  // Missing these costs SPEED, never correctness: the repair script and the
+  // link-leak monitor both still return the right answer, they just scan
+  // 242k rows to do it. Logged, not fatal.
+  try {
+    const { runSQL } = await import('./admin/supabase-admin.js');
+    await runSQL(`
+      CREATE INDEX IF NOT EXISTS idx_lp_leads_phone10
+        ON lp_leads (right(regexp_replace(coalesce(phone, ''), '[^0-9]', '', 'g'), 10));
+      CREATE INDEX IF NOT EXISTS idx_lp_leads_unlinked_recent
+        ON lp_leads (created_at_lp) WHERE ghl_contact_id IS NULL;
+    `);
+    console.log('[Migration] LP link repair indexes (sql/122) ready');
+  } catch (err) {
+    console.warn('[Migration] LP link repair indexes (sql/122) not applied — repair/monitor will table-scan:', err.message);
   }
 
   // Addlead address hold (sql/060 — the file is the source of truth; this
@@ -2317,6 +2344,7 @@ registerSourceReconcileRoutes(app);
 registerScorecardValidateRoutes(app);
 registerFive9SnapshotRoutes(app, authenticate);
 registerFreshnessRefreshRoutes(app);
+registerLinkLeakRoutes(app);
 registerCiRoutes(app, authenticate);            // 2026-08-21 — Call Intelligence ingest (PR 2; worker ships disarmed)
 
 const server = app.listen(PORT, async () => {
@@ -2374,6 +2402,7 @@ const server = app.listen(PORT, async () => {
   startScorecardValidateScheduler();
   startFive9ConfigSnapshotScheduler();
   startFreshnessRefreshScheduler();
+  startLinkLeakScheduler();
   // Probe ffmpeg, which transcodes Five9's GSM 6.10 recordings to a format a
   // browser can actually play. A CLEAR LOG LINE, NOT A CRASH: without it the
   // whole pipeline still runs and links still resolve, they just serve the
