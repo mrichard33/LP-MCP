@@ -21,8 +21,17 @@ import assert from 'node:assert/strict';
 import {
   stageDecision, buildMilestoneStageMap, derivedStageFromMilestones,
   parseLostReasonArg, resolveLostReason, normalizeLostReasons,
+  parseLostReasonIdArg, resolveLostReasonForStatus,
   WON_JOB_STATUSES, LOST_JOB_STATUSES,
 } from './reconcile-p2-stages.js';
+
+// The real ids, so a test that passes proves the pairing an operator would type.
+const ID = {
+  CUSTOMER_CANCELLED: '6aad8dc01f2de24d878ec356',
+  COLLECTIONS:        '6aad8dc0f4cad9983ac319ce',
+  FINANCING_DENIED:   '69cd48077ac164325a355e36',
+  GHOSTED:            '69cd4807e4ce65bc76877f98',
+};
 
 // ─── fixtures ───────────────────────────────────────────────────────────
 
@@ -216,27 +225,49 @@ test('Sent To Attorney is lost — a deal in collections is not in progress', ()
   assert.equal(decide(STAGE.CONTRACT_SIGNED, [job(93400, 'Sent To Attorney', ['M', 'R'])]).verdict, 'lose');
 });
 
-test('Credit Decline is NOT lost — it stays open and derives a stage', () => {
-  // Decided 2026-08-31. 149 of the 375 planned Contract Signed losses hung on
-  // this one status. Marking an opportunity lost is irreversible in reporting,
-  // and nobody has measured how often a decline is reworked and recovers. Until
-  // that is known it is in-progress work, which also aligns the reconciler with
-  // CANCELLED_JOB_STATUSES in src/lp-job-value.js.
-  assert.equal(LOST_JOB_STATUSES.has('Credit Decline'), false);
+test('Credit Decline IS lost — reversed 2026-09-18', () => {
+  // This test asserted the OPPOSITE until 2026-09-18, and the reasoning it
+  // carried is worth keeping: the status was excluded on 2026-08-31 — 149 of the
+  // 375 planned Contract Signed losses hung on it — because marking an
+  // opportunity lost is irreversible in reporting and nobody had measured how
+  // often a decline is reworked and recovers.
+  //
+  // Mark reversed it once that objection had an answer. The decline gets its OWN
+  // lost reason, "Financing Denied" (69cd48077ac164325a355e36), rather than being
+  // folded in with cancellations — so recovery rate becomes measurable after the
+  // fact by querying lost opportunities by reason. ~345 jobs / ~179 contacts.
+  assert.equal(LOST_JOB_STATUSES.has('Credit Decline'), true);
   assert.equal(WON_JOB_STATUSES.has('Credit Decline'), false);
   const d = decide(STAGE.CONTRACT_SIGNED, [job(93400, 'Credit Decline', ['M', 'R', 'H'])]);
-  assert.equal(d.verdict, 'move');
-  assert.equal(d.targetStageId, STAGE.PERMITTING);
+  assert.equal(d.verdict, 'lose');
+  assert.equal(d.jobStatus, 'Credit Decline');
+  // A loss never carries a stage move — the two phases stay disjoint.
+  assert.equal(d.targetStageId, null);
 });
 
-test('a Credit Decline job can still be the job that decides an opportunity', () => {
-  // It is not in CANCELLED_JOB_STATUSES either, so latestJob() may select it
-  // rather than falling through to an older job. Both halves have to agree or
-  // a decline would be selected and then have no verdict.
-  const jobs = [job(80100, 'Awaiting Product', ['M']), job(93400, 'Credit Decline', ['M', 'R'])];
+test('a NEWER in-progress job outranks a Credit Decline, and it is not lost', () => {
+  // Credit Decline stays OUT of CANCELLED_JOB_STATUSES in src/lp-job-value.js,
+  // so latestJob() can still select it — but only when it is the newest. A
+  // contact who was declined and then started live work is still working with us.
+  const jobs = [job(80100, 'Credit Decline', ['M', 'R']), job(93400, 'Awaiting Product', ['M', 'R', 'K'])];
   const d = decide(STAGE.CONTRACT_SIGNED, jobs);
   assert.equal(d.job.lp_job_id, '93400');
   assert.equal(d.verdict, 'move');
+  assert.equal(d.targetStageId, STAGE.IN_PRODUCTION);
+});
+
+test('a Credit Decline outranks an OLDER Paid In Full, and the decline decides', () => {
+  // The reverse of the returning-customer case. The old job was collected and
+  // its opportunity is already closed; the NEW one was declined. Reading "any
+  // job is complete" would mark this won and book revenue that never arrived.
+  const jobs = [
+    job(80100, 'Paid In Full', ['M', 'R', 'K', 'S', 'F', 'C']),
+    job(93400, 'Credit Decline', ['M', 'R']),
+  ];
+  const d = decide(STAGE.CONTRACT_SIGNED, jobs);
+  assert.equal(d.job.lp_job_id, '93400');
+  assert.equal(d.verdict, 'lose');
+  assert.equal(d.jobStatus, 'Credit Decline');
 });
 
 test('Installed & Unpaid is NOT won — the work is done, the money is not', () => {
@@ -371,4 +402,133 @@ test('GHL has answered the lost-reason collection as three different shapes', ()
   assert.deepEqual(normalizeLostReasons({ lossReasons: one }), one);
   assert.deepEqual(normalizeLostReasons({ data: one }), one);
   assert.deepEqual(normalizeLostReasons({ nothing: true }), []);
+});
+
+// ─── lost reasons by ID (2026-09-18) ────────────────────────────────────
+//
+// The name path cannot work: GHL's lost-reason collection endpoint 404s as
+// OPPORTUNITY_NOT_FOUND for this location, so resolveLostReason has no list to
+// match against and every loss is refused — 336 of them on the live pass.
+// --lost-reason-id bypasses the lookup entirely.
+
+test('one id can cover every lost status', () => {
+  const { spec, problems } = parseLostReasonIdArg(ID.CUSTOMER_CANCELLED);
+  assert.deepEqual(problems, []);
+  assert.equal(spec.fallback, ID.CUSTOMER_CANCELLED);
+  assert.deepEqual(spec.byStatus, {});
+  for (const status of LOST_JOB_STATUSES) {
+    const r = resolveLostReasonForStatus(status, { idSpec: spec, nameSpec: parseLostReasonArg('') });
+    assert.equal(r.id, ID.CUSTOMER_CANCELLED, `${status} should fall back to the single id`);
+    assert.equal(r.source, 'id');
+  }
+});
+
+test('per-status ids resolve to the right id per status', () => {
+  const { spec, problems } = parseLostReasonIdArg(
+    `Cancelled=${ID.CUSTOMER_CANCELLED},Cancelled By Mgt=${ID.CUSTOMER_CANCELLED},`
+    + `Dead Deal=${ID.GHOSTED},Sent To Attorney=${ID.COLLECTIONS},Credit Decline=${ID.FINANCING_DENIED}`,
+  );
+  assert.deepEqual(problems, []);
+  const nameSpec = parseLostReasonArg('');
+  const idOf = (status) => resolveLostReasonForStatus(status, { idSpec: spec, nameSpec }).id;
+  assert.equal(idOf('Cancelled'), ID.CUSTOMER_CANCELLED);
+  assert.equal(idOf('Cancelled By Mgt'), ID.CUSTOMER_CANCELLED);
+  assert.equal(idOf('Dead Deal'), ID.GHOSTED);
+  assert.equal(idOf('Sent To Attorney'), ID.COLLECTIONS);
+  assert.equal(idOf('Credit Decline'), ID.FINANCING_DENIED);
+  // Every lost status is covered — this is the pairing the live run uses, and a
+  // gap here is a refused loss there.
+  for (const status of LOST_JOB_STATUSES) assert.ok(idOf(status), `${status} has no id`);
+});
+
+test('an id resolves with NO GHL list — that is the whole point of the flag', () => {
+  // resolveLostReason needs `reasons` to match a name against. The id path must
+  // not consult it at all, because it cannot be fetched.
+  const { spec } = parseLostReasonIdArg(`Cancelled=${ID.CUSTOMER_CANCELLED}`);
+  const r = resolveLostReasonForStatus('Cancelled', {
+    idSpec: spec, nameSpec: parseLostReasonArg(''), reasons: [],
+  });
+  assert.equal(r.error, undefined);
+  assert.equal(r.id, ID.CUSTOMER_CANCELLED);
+  // And it names the reason from the shared mapping, for readable output.
+  assert.equal(r.name, 'Customer Cancelled');
+});
+
+test('when both an id and a name are given for one status, the id wins and warns', () => {
+  const { spec: idSpec } = parseLostReasonIdArg(`Cancelled=${ID.CUSTOMER_CANCELLED}`);
+  const nameSpec = parseLostReasonArg('Cancelled=Ghosted / Unresponsive');
+  const reasons = [{ id: ID.GHOSTED, name: 'Ghosted / Unresponsive' }];
+  const r = resolveLostReasonForStatus('Cancelled', { idSpec, nameSpec, reasons });
+  assert.equal(r.id, ID.CUSTOMER_CANCELLED);
+  assert.equal(r.source, 'id');
+  // Silently picking one would hide a real disagreement about an irreversible write.
+  assert.ok(r.warning, 'the conflict must be reported');
+  assert.match(r.warning, /Ghosted \/ Unresponsive/);
+});
+
+test('a status with neither an id nor a name is REFUSED, never defaulted', () => {
+  // The refusal is the feature. Guessing a reason writes an irreversible lie
+  // into loss reporting; a refused loss can always be re-run.
+  const empty = { idSpec: parseLostReasonIdArg('').spec, nameSpec: parseLostReasonArg(''), reasons: [] };
+  for (const status of LOST_JOB_STATUSES) {
+    assert.ok(resolveLostReasonForStatus(status, empty).error, `${status} must refuse`);
+  }
+  // And a pairing that covers only SOME statuses refuses the rest, rather than
+  // letting one id leak across.
+  const partial = {
+    idSpec: parseLostReasonIdArg(`Cancelled=${ID.CUSTOMER_CANCELLED}`).spec,
+    nameSpec: parseLostReasonArg(''), reasons: [],
+  };
+  assert.equal(resolveLostReasonForStatus('Cancelled', partial).id, ID.CUSTOMER_CANCELLED);
+  assert.ok(resolveLostReasonForStatus('Dead Deal', partial).error);
+});
+
+test('a malformed id is rejected at PARSE time, not at write time', () => {
+  // Catching a typo before the run starts is free. An id GHL rejects fails its
+  // own write and is counted as `failed`, which is also correct — but only for
+  // ids that are at least the right shape.
+  const bad = [
+    'not-an-id',                          // obviously not
+    '6aad8dc01f2de24d878ec35',            // 23 chars
+    '6aad8dc01f2de24d878ec3567',          // 25 chars
+    '6aad8dc01f2de24d878ec35g',           // 24 chars, not hex
+  ];
+  for (const value of bad) {
+    const { spec, problems } = parseLostReasonIdArg(value);
+    assert.equal(problems.length, 1, `${value} should be rejected`);
+    assert.equal(problems[0].reason, 'not_a_24_char_hex_id');
+    assert.equal(spec.fallback, null, `${value} must not survive into the spec`);
+  }
+  // Per-status pairs are validated the same way, and a bad one names its status
+  // so the operator knows which pair to fix.
+  const { spec, problems } = parseLostReasonIdArg(`Cancelled=${ID.CUSTOMER_CANCELLED},Dead Deal=nope`);
+  assert.equal(problems.length, 1);
+  assert.equal(problems[0].status, 'Dead Deal');
+  assert.equal(spec.byStatus['Cancelled'], ID.CUSTOMER_CANCELLED);
+  assert.equal(spec.byStatus['Dead Deal'], undefined);
+});
+
+test('an id that disagrees with the shared mapping is flagged but not blocked', () => {
+  // src/lp-lost-reasons.js is a COPY of GHL's config. If the two disagree, the
+  // operator on the command line is the one who just read the UI — so warn,
+  // print, and proceed.
+  const { spec } = parseLostReasonIdArg(`Credit Decline=${ID.GHOSTED}`);
+  const r = resolveLostReasonForStatus('Credit Decline', { idSpec: spec, nameSpec: parseLostReasonArg('') });
+  assert.equal(r.id, ID.GHOSTED);
+  assert.ok(r.mismatch, 'a pairing that contradicts the mapping must be reported');
+  assert.match(r.mismatch, /Financing Denied/);
+});
+
+test('the name path still works unchanged when no id is given', () => {
+  // --lost-reason is not deprecated; it is correct and will be the only path
+  // needed once the endpoint is fixed.
+  const reasons = [{ id: ID.CUSTOMER_CANCELLED, name: 'Customer Cancelled' }];
+  const r = resolveLostReasonForStatus('Cancelled', {
+    idSpec: parseLostReasonIdArg('').spec,
+    nameSpec: parseLostReasonArg('Cancelled=Customer Cancelled'),
+    reasons,
+  });
+  assert.equal(r.id, ID.CUSTOMER_CANCELLED);
+  assert.equal(r.name, 'Customer Cancelled');
+  assert.equal(r.source, 'name');
 });

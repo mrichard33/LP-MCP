@@ -66,6 +66,9 @@ import { isMilestoneAchieved } from './milestone-gate.js';
 import { mapJobFields, mapMilestoneChangeFields } from './lp-job-fields.js';
 import { selectFurthestMilestone } from './milestone-order.js';
 import { verifiedStamp, VERIFIED_FROM, FRESHNESS_VOLATILE_COLUMNS } from './services/freshness.js';
+import {
+  detectJobStatusChange, buildJobStatusEvent, classifyJobStatusEmit,
+} from './services/job-status-change.js';
 
 // ─── Note edit detection (2026-09-18) ────────────────────────────────────
 // syncNotes has always been INSERT-ONLY: it batch-checks lp_note_id and
@@ -761,6 +764,78 @@ export async function syncJobAndMilestones(job, lpLeadId, ghlContactId, opts = {
       suppressedUnlinked,
       jobUpsertError: buildJobUpsertError(jobId, lpLeadId, jobErr),
     };
+  }
+
+  // ─── lp.job_status_changed (2026-09-18) ──────────────────────────
+  // LP job STATUS changes emitted NOTHING until now, so a cancellation in LP
+  // never reached GHL and the P2 opportunity stayed open forever — 241 of a
+  // 249-job sample of dead LP jobs were still open on 2026-09-18. Milestones
+  // have had an event since v7.1; status never did.
+  //
+  // Emitted AFTER the upsert succeeded, deliberately: the early return above
+  // means a failed parent write never gets here, and announcing a transition we
+  // did not persist would leave the next pass unable to detect it (the stored
+  // status would still be the old one, so it would fire again) — or, worse, make
+  // a rule act on a row that does not say what the event says.
+  //
+  // The prior status costs nothing: existingJob was already read for the skip
+  // gate and JOB_COMPARE_COLUMNS already carries job_status. And a real change
+  // always defeats that gate, so skipJob can never swallow one.
+  //
+  // NEVER fails the sync. LP is the source of truth for the job either way, and
+  // scripts/reconcile-p2-stages.js is the backstop for anything this drops.
+  const statusChange = detectJobStatusChange(existingJob, jobRow);
+  if (statusChange) {
+    try {
+      const res = await emitEvent(buildJobStatusEvent({
+        change: statusChange,
+        lpJobId: jobId,
+        lpLeadId,
+        // Three layers, and they nest rather than compete. The job-changes
+        // sweep calls this with ghlContactId=null for EVERY record
+        // (src/sync-engine.js), so the stored link is the only source there —
+        // it is a copy propagated down from lp_leads, and the upsert above
+        // OMITS rather than nulls the column precisely so the sweep cannot
+        // erase it. When both are null, emitEvent's emit-time binding reads
+        // lp_leads itself: resolveEmitContactBinding only runs when no contact
+        // id was passed, so this fallback FEEDS that binding rather than
+        // masking it — which matters, because 93 jobs sat NULL against a
+        // linked parent lead as of 2026-08-31.
+        //
+        // The one case it cannot fix is a STALE non-null link on the job row
+        // disagreeing with lp_leads (a dedupe reassignment). That wins here and
+        // the binding never runs. Narrow, and scripts/reconcile-p2-stages.js is
+        // the backstop; noted rather than engineered around.
+        //
+        // All three null is still a true record: the engine records a
+        // GHL-targeted action on a contactless event as `skipped` rather than
+        // executing it (src/decision-engine.js), so nothing acts on a guess.
+        ghlContactId: ghlContactId || existingJob?.ghl_contact_id || null,
+        jobValue,
+        branchCode,
+      }));
+      const outcome = classifyJobStatusEmit(res);
+      if (outcome === 'dropped_at_intake') {
+        // The allowlist in src/services/event-intake-filter.js is default-DROP.
+        // If this ever prints, the event_type entry was lost and every
+        // P2_JOB_TERMINAL_* rule is dead — silently. Say so loudly.
+        console.error(
+          `[Sync] lp.job_status_changed DROPPED AT INTAKE for job ${jobId} ` +
+          `(${statusChange.old_status} → ${statusChange.new_status}) — ` +
+          'add it to ALLOWED_EVENT_TYPES in src/services/event-intake-filter.js',
+        );
+      } else {
+        console.log(
+          `[Sync] lp.job_status_changed job ${jobId}: ` +
+          `"${statusChange.old_status}" → "${statusChange.new_status}" (${outcome})`,
+        );
+      }
+    } catch (err) {
+      console.warn(
+        `[Sync] lp.job_status_changed emit FAILED for job ${jobId} ` +
+        `(${statusChange.old_status} → ${statusChange.new_status}): ${err.message} — continuing`,
+      );
+    }
   }
 
   const milestones = getField(job, 'milestones', 'Milestones') || [];

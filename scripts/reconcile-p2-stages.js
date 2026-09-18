@@ -89,25 +89,73 @@
  *
  * ─── TERMINAL STATUS ──────────────────────────────────────────────────────
  * WON  : Paid In Full · PIF Survey Ready · PIF NO Survey · Assumed Complete
- * LOST : Cancelled · Cancelled By Mgt · Dead Deal · Sent To Attorney
+ * LOST : Cancelled · Cancelled By Mgt · Dead Deal · Sent To Attorney ·
+ *        Credit Decline
  *
- * Everything else is in progress: derive a stage, leave the status open. Two
- * of those are decisions rather than omissions, both made 2026-08-31:
+ * Everything else is in progress: derive a stage, leave the status open. One of
+ * those is a decision rather than an omission, made 2026-08-31:
  *
  *   'Installed & Unpaid' (78 jobs / 61 contacts) — the work is done, the money
  *   is not collected. Its milestones carry it to Install Completed and it stays
  *   OPEN. It becomes won when a collected status is reached, not before;
  *   counting unpaid work as won overstates revenue.
  *
- *   'Credit Decline' (329 jobs / 179 contacts) — see LOST_JOB_STATUSES below.
- *   Left open pending a measurement of how often declines recover.
+ *   'Credit Decline' (~345 jobs / ~179 contacts) MOVED to LOST 2026-09-18 —
+ *   see LOST_JOB_STATUSES below. It keeps its own lost reason so recovery stays
+ *   measurable, and it stays OUT of CANCELLED_JOB_STATUSES in
+ *   src/lp-job-value.js, so a declined job still carries pipeline value and can
+ *   still be the job an opportunity tracks.
  *
  * A LOST REASON IS NEVER INVENTED. GHL's built-in Lost Reason picker is a
  * configured list; an unrecognised string either fails the write or pollutes
- * loss reporting. The list is fetched live (--fields=status), printed, and
- * --lost-reason= must name a reason from it — by name, matched
- * case-insensitively, either one reason for every lost status or per-status
- * pairs. Without it, losses are planned but refused at write time.
+ * loss reporting. Two ways to supply one, and a status with NEITHER is refused:
+ *
+ *   --lost-reason=     by NAME, matched case-insensitively against the list
+ *                      fetched live. Correct, and currently unusable — see below.
+ *   --lost-reason-id=  by ID, used verbatim. No GHL read, no validation beyond
+ *                      the 24-hex shape. An id GHL rejects fails its own write.
+ *
+ * Both take the same grammar: one value for every lost status, or per-status
+ * "Job Status=value" pairs. If both are given for one status the ID WINS and the
+ * conflict is printed. The resolved status→id pairing is printed at the top of
+ * every run, beside the milestone mapping.
+ *
+ * ─── THE LOST-REASON ENDPOINT IS BROKEN, HENCE --lost-reason-id ────────────
+ * Both /opportunities/loss-reasons and /opportunities/loss-reason 404 with
+ * OPPORTUNITY_NOT_FOUND for this location: GHL routes them as
+ * /opportunities/{id} and reads the path segment as an opportunity id. The
+ * reasons themselves exist and are correct — only the read path is wrong. That
+ * is why the live 2026-09-18 pass refused all 336 losses while the stage and win
+ * passes completed cleanly (89 moved, 1,186 won, 0 failed).
+ *
+ * The ids below were read from the GHL Lost Reasons UI and from live
+ * `L.0 P1 Loss Marker` workflow config on 2026-09-18. They are the reference for
+ * pairing --lost-reason-id until the endpoint is fixed:
+ *
+ *   Customer Cancelled        6aad8dc01f2de24d878ec356   ← post-contract
+ *   Collections / Attorney    6aad8dc0f4cad9983ac319ce   ← post-contract
+ *   Financing Denied          69cd48077ac164325a355e36
+ *   Ghosted / Unresponsive    69cd4807e4ce65bc76877f98
+ *   Price / Shopping          69cd4807e5a3aa0985aa450b
+ *   Cannot Qualify            69cd512e10b2ee8d9ff36a73
+ *   Invalid Lead              69cd512e626e00ee8a44f216
+ *   Bad Fit (Preference)      69cd512e75a8ab28a34d4618
+ *   Not Interested (Now)      69cd512e8bfe0935a0faa147
+ *   Deferred / Timing         69cd512ee8fe3d35ae8bf6be
+ *   Out of Service Area       69c55a4a362694f3cc77c898
+ *   Wrong Product             69fd1c763b7ee1d776c26309
+ *   DNC                       692a3a8e9205a42ce26af8da
+ *   Home is Fully Protected   6927b4637752675528f642ff
+ *
+ * Only the first two were created for jobs that die AFTER the contract is
+ * signed. Every other reason describes a pre-sale loss. Never substitute one for
+ * a P2 job death — it says the sale never happened, and GHL keeps no history
+ * that walks a lost reason back. The canonical status→reason mapping lives in
+ * src/lp-lost-reasons.js and is shared with the action executor.
+ *
+ * TODO — fix this properly in HL-MCP/src/clients/ghl.ts `getLossReasons`, which
+ * sends GET /opportunities/loss-reasons?locationId=… with no fallback and may
+ * hold the working path. Follow-up, not this PR.
  *
  * ─── IDEMPOTENCE, AND WHY --apply RE-READS ────────────────────────────────
  * Candidates come from the HL mirror, which lags GHL. A second run planned from
@@ -129,7 +177,15 @@
  * Usage:
  *   node scripts/reconcile-p2-stages.js                      # dry run, everything
  *   node scripts/reconcile-p2-stages.js --fields=stage --limit=25 --apply
- *   node scripts/reconcile-p2-stages.js --fields=status --lost-reason="..." --apply
+ *   node scripts/reconcile-p2-stages.js --fields=status --lost-reason-id="..." --apply
+ *
+ *   # the full pairing for every lost status (2026-09-18):
+ *   node scripts/reconcile-p2-stages.js --fields=status --apply --lost-reason-id=\
+ *     "Cancelled=6aad8dc01f2de24d878ec356,\
+ *      Cancelled By Mgt=6aad8dc01f2de24d878ec356,\
+ *      Dead Deal=69cd4807e4ce65bc76877f98,\
+ *      Sent To Attorney=6aad8dc0f4cad9983ac319ce,\
+ *      Credit Decline=69cd48077ac164325a355e36"
  *
  *   --apply            Actually write. Without it nothing is sent to GHL.
  *   --dry-run          Force dry run even alongside --apply.
@@ -137,8 +193,11 @@
  *   --pipeline=NAME    P2 only.
  *   --fields=a,b       Any of: stage, status (default both). Stage moves and
  *                      terminal statuses run separately for the phased rollout.
- *   --lost-reason=X    Either one reason name for every lost job status, or
- *                      comma-separated "Job Status=Reason Name" pairs.
+ *   --lost-reason=X    Either one reason NAME for every lost job status, or
+ *                      comma-separated "Job Status=Reason Name" pairs. Needs the
+ *                      live list, which currently 404s — prefer --lost-reason-id.
+ *   --lost-reason-id=X Same grammar, but GHL lost reason IDS. Skips the lookup
+ *                      entirely. Wins over --lost-reason for the same status.
  *   --log-dir=PATH     Where the .jsonl rollback log goes (default ./p2-reconcile).
  *
  * Environment (already set on the LP-MCP Railway service — this script does not
@@ -156,6 +215,9 @@ import { PIPELINE_IDS, STAGE_MAP, GHL_LOCATION_ID } from '../src/actions/constan
 import { checkForwardOnly, getStagePosition } from '../src/pipeline-guard.js';
 import { hlRunSQL } from '../src/admin/hl-client.js';
 import { latestJob } from '../src/lp-job-value.js';
+import {
+  JOB_STATUS_LOST_REASON, isLostReasonId, lostReasonIdForJobStatus,
+} from '../src/lp-lost-reasons.js';
 import { selectAllIn, assertComplete } from '../src/supabase-page.js';
 import supabase from '../src/supabase.js';
 
@@ -179,29 +241,24 @@ export const WON_JOB_STATUSES = new Set([
 /**
  * Job statuses that mean the job died.
  *
- * NOTE the overlap with CANCELLED_JOB_STATUSES in src/lp-job-value.js: the
- * first three are in both. That is not redundancy. There, they exclude a job
- * from being SELECTED (a cancelled job never decides a live opportunity);
- * here, they decide the verdict for a contact who has nothing else.
+ * NOTE the overlap with CANCELLED_JOB_STATUSES in src/lp-job-value.js: three of
+ * these are in both. That is not redundancy. There, they exclude a job from being
+ * SELECTED (a cancelled job never decides a live opportunity); here, they decide
+ * the verdict for a contact who has nothing else.
  *
- * 'CREDIT DECLINE' IS DELIBERATELY NOT HERE (decided 2026-08-31).
- * -------------------------------------------------------------
- * It was in the proposed list, and it is the single biggest lever in the plan:
- * 149 of the 375 losses the first dry run planned for the Contract Signed
- * cohort. Marking an opportunity lost is an irreversible reporting act — it
- * lands in close-rate and loss-reason reporting and nothing walks it back — and
- * nobody has yet measured how often a declined deal is reworked and recovered
- * versus how often it terminates. Until that is known, a decline is treated as
- * IN PROGRESS: it derives a stage from its milestones and its status stays
- * open.
+ * 'Credit Decline' ADDED 2026-09-18 (Mark).
+ * -----------------------------------------
+ * Previously excluded because nobody had measured how often a declined deal is
+ * reworked and recovered, and marking lost is irreversible. That objection is
+ * resolved by giving it its OWN lost reason — "Financing Denied"
+ * (69cd48077ac164325a355e36) — rather than folding it in with cancellations.
+ * Recovery rate becomes measurable after the fact by querying lost opportunities
+ * by reason.
  *
- * This also puts the reconciler on the same side as src/lp-job-value.js, which
- * keeps Credit Decline OUT of CANCELLED_JOB_STATUSES so the job retains its
- * pipeline value and can still be the job an opportunity tracks. The reporting
- * path (src/jobs/lp-report-parse-job-status.js) does count it lost; that
- * disagreement is pre-existing, documented in both files, and is exactly the
- * question a recovery-rate measurement would settle. Do not "fix" it by adding
- * the status here.
+ * ~345 jobs / ~179 contacts. It remains OUT of CANCELLED_JOB_STATUSES in
+ * src/lp-job-value.js, so a declined job is still SELECTABLE and still carries
+ * pipeline value — only the verdict changes. A contact with a newer live job is
+ * unaffected: latestJob() picks the newer one and it decides.
  *
  * 'Sent To Attorney' stays: 40 jobs across 5 contacts, and a deal in
  * collections is not a deal in progress.
@@ -211,6 +268,7 @@ export const LOST_JOB_STATUSES = new Set([
   'Cancelled By Mgt',
   'Dead Deal',
   'Sent To Attorney',
+  'Credit Decline',
 ]);
 
 const trimmed = (s) => (typeof s === 'string' ? s.trim() : '');
@@ -507,6 +565,93 @@ export function resolveLostReason(jobStatus, spec, reasons = []) {
   return { id: hit.id, name: hit.name };
 }
 
+/**
+ * Parse --lost-reason-id=. Same grammar as --lost-reason, but the values are GHL
+ * lost reason IDS rather than names, so nothing has to be looked up:
+ *
+ *   --lost-reason-id="6aad8dc01f2de24d878ec356"
+ *   --lost-reason-id="Cancelled=6aad8dc01f2de24d878ec356,Credit Decline=69cd48077ac164325a355e36"
+ *
+ * Added 2026-09-18 because the name path cannot work: GHL's lost-reason
+ * collection endpoint 404s as OPPORTUNITY_NOT_FOUND for this location (it routes
+ * /opportunities/loss-reasons as /opportunities/{id}), so resolveLostReason has
+ * no list to match a name against and every loss is refused. 336 of them, on the
+ * live 2026-09-18 pass.
+ *
+ * Reuses parseLostReasonArg for the grammar rather than restating it — a second
+ * parser is a second set of edge cases, and this one has coverage.
+ *
+ * Shape is validated HERE, at parse time, not at write time: a malformed id is a
+ * typo and catching it before a run starts is free, whereas an id GHL rejects
+ * fails its own write and is counted as `failed`, which is correct. Returns the
+ * problems rather than exiting, because this module is imported by
+ * scripts/test-reconcile-p2-stages.js and a process.exit at module scope would
+ * kill the test run.
+ *
+ * @param {string} raw
+ * @returns {{spec: {fallback: string|null, byStatus: Object}, problems: Array<{status: string|null, value: string, reason: string}>}}
+ */
+export function parseLostReasonIdArg(raw) {
+  const parsed = parseLostReasonArg(raw);
+  const spec = { fallback: null, byStatus: {} };
+  const problems = [];
+  if (parsed.fallback !== null) {
+    if (isLostReasonId(parsed.fallback)) spec.fallback = trimmed(parsed.fallback);
+    else problems.push({ status: null, value: parsed.fallback, reason: 'not_a_24_char_hex_id' });
+  }
+  for (const [status, value] of Object.entries(parsed.byStatus)) {
+    if (isLostReasonId(value)) spec.byStatus[status] = trimmed(value);
+    else problems.push({ status, value, reason: 'not_a_24_char_hex_id' });
+  }
+  return { spec, problems };
+}
+
+/**
+ * The Lost Reason to close a job of this status with. One resolver, two sources.
+ *
+ * An ID supplied for the status WINS and skips the name lookup entirely — no GHL
+ * read, no validation against a list that cannot be fetched. That is the whole
+ * point of the flag. When a name was ALSO configured for the same status the id
+ * still wins and a `warning` is returned so the run prints the conflict rather
+ * than silently picking one.
+ *
+ * A status with NEITHER still returns {error}. That refusal is correct and must
+ * not be softened into a default: guessing a reason writes an irreversible lie
+ * into loss reporting, and a refused loss can always be re-run.
+ *
+ * `mismatch` is advisory only — an id that disagrees with the canonical mapping
+ * in src/lp-lost-reasons.js is reported so a bad pairing is visible before any
+ * write, but it does NOT block: the table is a copy of GHL's config, and if the
+ * two ever disagree the operator on the command line is the one who just read
+ * the UI.
+ *
+ * @returns {{id: string, name: string|null, source: 'id'|'name', warning?: string, mismatch?: string}|{error: string}}
+ */
+export function resolveLostReasonForStatus(jobStatus, { idSpec, nameSpec, reasons = [] } = {}) {
+  const status = trimmed(jobStatus);
+  const byId = idSpec?.byStatus?.[status] || idSpec?.fallback || null;
+  if (byId) {
+    const out = { id: byId, name: null, source: 'id' };
+    const alsoNamed = nameSpec?.byStatus?.[status] || nameSpec?.fallback || null;
+    if (alsoNamed) {
+      out.warning = `both --lost-reason-id and --lost-reason given for "${status}" — `
+        + `using the id ${byId}, ignoring the name "${alsoNamed}"`;
+    }
+    const canonicalId = lostReasonIdForJobStatus(status);
+    const canonicalName = JOB_STATUS_LOST_REASON[status] || null;
+    if (canonicalId && canonicalId !== byId) {
+      out.mismatch = `id ${byId} for "${status}" is not the mapped `
+        + `"${canonicalName}" (${canonicalId}) — see src/lp-lost-reasons.js`;
+    } else if (canonicalName) {
+      out.name = canonicalName;
+    }
+    return out;
+  }
+  const byName = resolveLostReason(status, nameSpec, reasons);
+  if (byName.error) return byName;
+  return { ...byName, source: 'name' };
+}
+
 /** GHL has answered this collection as three different shapes over time. */
 export function normalizeLostReasons(payload) {
   const list = Array.isArray(payload) ? payload
@@ -550,6 +695,10 @@ const opt = {
   pipeline:   stringArg('pipeline', 'P2'),
   logDir:     stringArg('log-dir', 'p2-reconcile'),
   lostReason: parseLostReasonArg(stringArg('lost-reason', '')),
+  // Parsed, never validated-and-exited here: this block runs at IMPORT, and
+  // scripts/test-reconcile-p2-stages.js imports the module. Problems are
+  // reported inside main(), which only runs when invoked directly.
+  lostReasonId: parseLostReasonIdArg(stringArg('lost-reason-id', '')),
   doStage:    fields.includes('stage'),
   doStatus:   fields.includes('status'),
 };
@@ -734,13 +883,52 @@ async function main() {
   let lostReasons = [];
   let lostReasonError = null;
   if (opt.doStatus) {
-    ({ reasons: lostReasons, error: lostReasonError } = await fetchLostReasons());
-    console.log('\n─── GHL configured Lost Reasons ───────────────────────────────');
-    if (lostReasons.length) {
-      for (const r of lostReasons) console.log(`  ${r.id}  ${r.name}`);
+    // A malformed --lost-reason-id is fatal, and it is fatal HERE rather than at
+    // module scope so importing this file for its pure helpers never exits.
+    if (opt.lostReasonId.problems.length) {
+      for (const p of opt.lostReasonId.problems) {
+        console.error(
+          `[P2Reconcile] --lost-reason-id: "${p.value}"`
+          + `${p.status ? ` (for "${p.status}")` : ''} is not a 24-character hex id`,
+        );
+      }
+      process.exit(1);
+    }
+
+    // Skip the GHL read entirely when ids already cover every lost status. The
+    // endpoint 404s for this location anyway (see fetchLostReasons), and a run
+    // that needs nothing from it should not wait on it or print its failure.
+    const idSpec = opt.lostReasonId.spec;
+    const idsCoverEverything = Boolean(idSpec.fallback)
+      || [...LOST_JOB_STATUSES].every((st) => Boolean(idSpec.byStatus[st]));
+    if (idsCoverEverything) {
+      console.log('\n─── GHL configured Lost Reasons ───────────────────────────────');
+      console.log('  not read — --lost-reason-id covers every lost job status.');
     } else {
-      console.log(`  could not read them: ${lostReasonError}`);
-      console.log('  A loss cannot be written without one. Losses will be PLANNED and REFUSED.');
+      ({ reasons: lostReasons, error: lostReasonError } = await fetchLostReasons());
+      console.log('\n─── GHL configured Lost Reasons ───────────────────────────────');
+      if (lostReasons.length) {
+        for (const r of lostReasons) console.log(`  ${r.id}  ${r.name}`);
+      } else {
+        console.log(`  could not read them: ${lostReasonError}`);
+        console.log('  A loss cannot be written without one. Losses will be PLANNED and REFUSED.');
+      }
+    }
+
+    // ─── the status → lost reason pairing, printed before any write ──────
+    // Beside the milestone mapping, and for the same reason: a bad pairing is
+    // an irreversible mislabel on every loss of that status, and the only
+    // moment it is cheap to catch is before the run starts.
+    console.log('\n─── lost reason per job status ────────────────────────────────');
+    for (const st of [...LOST_JOB_STATUSES].sort()) {
+      const r = resolveLostReasonForStatus(st, { idSpec, nameSpec: opt.lostReason, reasons: lostReasons });
+      if (r.error) {
+        console.log(`  ${st.padEnd(18)} REFUSED — ${r.error}`);
+        continue;
+      }
+      console.log(`  ${st.padEnd(18)} ${r.id}  ${(r.name || '(name not resolved)').padEnd(24)} [from --lost-reason${r.source === 'id' ? '-id' : ''}]`);
+      if (r.warning) console.log(`  ${''.padEnd(18)} ⚠️  ${r.warning}`);
+      if (r.mismatch) console.log(`  ${''.padEnd(18)} ⚠️  ${r.mismatch}`);
     }
   }
 
@@ -885,7 +1073,9 @@ async function main() {
       bucket.set(decision.jobStatus || '(blank)', (bucket.get(decision.jobStatus || '(blank)') || 0) + 1);
 
       if (decision.verdict === 'lose') {
-        const reason = resolveLostReason(decision.jobStatus, opt.lostReason, lostReasons);
+        const reason = resolveLostReasonForStatus(decision.jobStatus, {
+          idSpec: opt.lostReasonId.spec, nameSpec: opt.lostReason, reasons: lostReasons,
+        });
         if (reason.error) {
           // Planned, not written. A loss with no configured reason either fails
           // the write or pollutes loss reporting; both are worse than stopping.
@@ -897,7 +1087,11 @@ async function main() {
         } else {
           body.lostReasonId = reason.id;
           record.lost_reason_id = reason.id;
-          record.lost_reason_name = reason.name;
+          // null when the id came from --lost-reason-id for a status the shared
+          // mapping does not name. The ID is what GHL stores and what the
+          // rollback log needs; the name is a convenience for reading it.
+          record.lost_reason_name = reason.name || null;
+          record.lost_reason_source = reason.source;
         }
       }
     }
