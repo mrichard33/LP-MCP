@@ -146,6 +146,15 @@ export const JOBS = Object.freeze([
     enabledDefault: false,
     isEnabled: (env) => env.FIVE9_CONFIG_SNAPSHOT_ENABLED === 'true',
   },
+  {
+    id: 'freshness-refresh',
+    label: 'Mirror freshness refresh',
+    group: 'sync',
+    cadence: 'daily 02:00 ET',
+    enabledEnv: 'FRESHNESS_REFRESH_ENABLED',
+    enabledDefault: false,
+    isEnabled: (env) => String(env.FRESHNESS_REFRESH_ENABLED || 'false').toLowerCase() === 'true',
+  },
 ]);
 
 /** Ids only — handy for tests and for asserting the wiring matches the roster. */

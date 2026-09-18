@@ -615,7 +615,11 @@ function buildLeadRow(prospect, lead, {
       raw_lp_data:        (() => { const { jobs, Jobs, ...rest } = lead; return rest; })(),
       synced_at:          new Date().toISOString(),
       // Dropped at serialization when disabled (undefined) — see sql/120.
+      // lp_verified_at KEEPS its original name: renaming a live column is not
+      // additive and would break every reader. The other mirror tables use
+      // verified_at (sql/121); v_supabase_freshness reconciles the two names.
       lp_verified_at:     VERIFIED_AT_ENABLED ? new Date().toISOString() : undefined,
+      verified_from:      VERIFIED_AT_ENABLED ? 'lp' : undefined,
     },
     isApptSet,
     isDemoCompleted,
@@ -1302,6 +1306,7 @@ export async function upsertLeadFromFlat(lp, ghlId, payloadHash = null) {
     updated_at_lp:      lpDateToEastern(getField(lp, 'lastchangedon', 'LastChangedOn')),
     synced_at:          new Date().toISOString(),
     lp_verified_at:     VERIFIED_AT_ENABLED ? new Date().toISOString() : undefined,
+    verified_from:      VERIFIED_AT_ENABLED ? 'lp' : undefined,
   };
 
   // v10.1: never overwrite an existing ghl_contact_id link with null.

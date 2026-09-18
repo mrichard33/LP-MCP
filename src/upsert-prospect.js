@@ -9,6 +9,44 @@
 // lp_leads stores ONE ROW per inquiry (lds_id). Lead-specific data lives here.
 
 import supabase from './supabase.js';
+import { diffLeadContent } from './services/lead-content-diff.js';
+import { verifiedStamp, verifiedAtEnabled, VERIFIED_FROM } from './services/freshness.js';
+
+// ─── Content gate (2026-09-18) ───────────────────────────────────────────
+// lp_prospects skipped the upsert whenever LP's `lastchanged` matched the
+// stored value. That is the SAME defect PR #971 removed from lp_leads: LP does
+// not bump lastchanged for every edit, so a corrected phone or address on the
+// prospect record could sit stale indefinitely. Compare content instead.
+//
+// Deliberately NOT gated behind LP_LEAD_CONTENT_DIFF_MODE. That flag soaks the
+// LEAD gate, whose allowlist covers 35 columns across two writers; this is one
+// writer over nine contact fields with no derivation logic to get wrong, and
+// holding it behind an unrelated flag would couple two independent rollouts.
+const PROSPECT_CONTENT_COLUMNS = Object.freeze([
+  'first_name', 'last_name', 'email', 'phone', 'phone_alt',
+  'address', 'city', 'state', 'zip',
+]);
+
+// Every column the skip path must read so the diff can see the stored row.
+const PROSPECT_SELECT = ['last_changed', 'ghl_contact_id', ...PROSPECT_CONTENT_COLUMNS]
+  .concat(verifiedAtEnabled() ? ['verified_at'] : [])
+  .join(', ');
+
+// Skip-path stamp, rate-limited to once per row per day: lp_prospects is 147k
+// rows and an unbounded stamp would add 147k updates per full sync (the v6.0
+// disk-I/O rule this file was written around). Mirrors stampLeadVerified in
+// src/sync-leads.js.
+const VERIFIED_STAMP_MIN_MS = 24 * 60 * 60 * 1000;
+
+async function stampProspectVerified(lpProspectId, existing) {
+  if (!verifiedAtEnabled() || !existing) return;
+  const last = existing.verified_at ? Date.parse(existing.verified_at) : 0;
+  if (Date.now() - last < VERIFIED_STAMP_MIN_MS) return;
+  const { error } = await supabase.from('lp_prospects')
+    .update(verifiedStamp(VERIFIED_FROM.LP))
+    .eq('lp_prospect_id', lpProspectId);
+  if (error) console.warn(`[Sync] prospect verified stamp failed for ${lpProspectId}: ${error.message}`);
+}
 
 function normalizePhone(phone) {
   if (!phone) return null;
@@ -58,19 +96,41 @@ export async function upsertProspect(prospect, opts = {}) {
     return null;
   }
 
-  // ─── CONDITIONAL WRITE: Skip if LP record hasn't changed ───────
+  // ─── CONDITIONAL WRITE: skip only when the CONTENT matches ─────
+  // Was: skip whenever LP's `lastchanged` equalled the stored value. LP does
+  // not bump that field for every edit, so a phone or address corrected in LP
+  // never landed. The timestamp test is KEPT as the cheap first pass — it is
+  // right far more often than not — and the content diff is what decides.
   const newLastChanged = getField(prospect, 'lastchanged', 'LastChanged', 'last_changed');
   if (newLastChanged) {
     try {
       const { data: existing } = await supabase.from('lp_prospects')
-        .select('last_changed, ghl_contact_id')
+        .select(PROSPECT_SELECT)
         .eq('lp_prospect_id', lpProspectId).single();
 
       if (existing?.last_changed
           && existing.last_changed === newLastChanged
           && (existing.ghl_contact_id === ghlContactId || (!ghlContactId && existing.ghl_contact_id))) {
-        _prospectSkips++;
-        return lpProspectId;
+        // Built with the SAME expressions as the upsert literal below, so the
+        // diff can never disagree with what the write path would store.
+        const candidate = {
+          first_name: getField(prospect, 'firstname', 'FirstName', 'first_name'),
+          last_name:  getField(prospect, 'lastname', 'LastName', 'last_name'),
+          email:      getField(prospect, 'email', 'Email'),
+          phone:      normalizePhone(getField(prospect, 'phone1', 'Phone1', 'phone')),
+          phone_alt:  normalizePhone(prospect.altphones?.[0]?.phone || getField(prospect, 'Phone2', 'phone2')),
+          address:    getField(prospect, 'address1', 'Address1'),
+          city:       getField(prospect, 'city', 'City'),
+          state:      getField(prospect, 'state', 'State'),
+          zip:        getField(prospect, 'zip', 'Zip'),
+        };
+        const drift = diffLeadContent(existing, candidate, PROSPECT_CONTENT_COLUMNS);
+        if (drift.length === 0) {
+          await stampProspectVerified(lpProspectId, existing);
+          _prospectSkips++;
+          return lpProspectId;
+        }
+        console.log(`[Sync] PROSPECT DRIFT ${lpProspectId}: ${drift.map(d => d.field).join(', ')} — forcing upsert`);
       }
     } catch (_) {
       // Row doesn't exist yet — proceed with insert
@@ -128,6 +188,7 @@ export async function upsertProspect(prospect, opts = {}) {
     has_sale: hasSale,
     total_job_value: totalJobValue || null,
     synced_at: new Date().toISOString(),
+    ...verifiedStamp(VERIFIED_FROM.LP),
     raw_lp_data: prospect,
   }, {
     onConflict: 'lp_prospect_id',
