@@ -120,10 +120,75 @@ import { pushLeadNotesImmediately } from './ghl-notes-sync.js';
 import { GHL_CONTACT_ID_PATTERN, lognumberCandidate } from './ghl-link-shape.js';
 import { resolveLeadGhlLink, LINK_SOURCE } from './services/link-corroboration.js';
 import { shouldRenewConsent } from './services/consent-renewal.js';
+import { diffLeadContent, contentDiffMode, LEAD_CONTENT_COLUMNS } from './services/lead-content-diff.js';
+
+// ─── Content-diff gate + verified stamp (2026-09-18) ─────────────────────
+//
+// LP_LEAD_CONTENT_DIFF_MODE: off | shadow (default) | enforce.
+//   shadow  — compute the diff on every row the legacy gate would skip, log it,
+//             count it, change nothing. Soak here first: a systematic diff on one
+//             column (e.g. a derivation change) would rewrite every row under
+//             enforce, and shadow is where that shows up as a field count.
+//   enforce — a non-empty diff forces the upsert.
+// LP_VERIFIED_AT_ENABLED (default false): stamp lp_leads.lp_verified_at on every
+//   write, and on the skip path at most once per VERIFIED_STAMP_MIN_MS. Off until
+//   sql/120 is applied — the column must exist before any select or write names it.
+const VERIFIED_AT_ENABLED = String(process.env.LP_VERIFIED_AT_ENABLED || 'false').toLowerCase() === 'true';
+const VERIFIED_STAMP_MIN_MS = 24 * 60 * 60 * 1000;
+const DRIFT_LOG_CAP = 50; // per-process log lines per mode, then counts only
+
+// Columns the skip-path readers must fetch so the diff can see the stored row.
+const CONTENT_SELECT = LEAD_CONTENT_COLUMNS.join(', ')
+  + ', ghl_intent_bucket, ghl_entry_tag'
+  + (VERIFIED_AT_ENABLED ? ', lp_verified_at' : '');
+
+// Candidate row for the diff. bucket/tag are pinned to the STORED values so only
+// LP-derived columns can register as drift (resolveSourceBucket is not called
+// on the skip path today, and this must not add a lookup per lead).
+function candidateRowForDiff(prospect, lead, { lpLeadId, lpProspectId, existing, resolved }) {
+  return buildLeadRow(prospect, lead, {
+    lpLeadId, lpProspectId,
+    bucket: existing.ghl_intent_bucket, tag: existing.ghl_entry_tag,
+    existingGhlId: existing.ghl_contact_id || null,
+    resolvedLink: resolved,
+  }).row;
+}
+
+// Returns true only when the gate should FORCE the upsert (enforce mode with a
+// non-empty diff). Shadow logs and counts; off does nothing.
+function noteContentDrift(lpLeadId, drift) {
+  if (!drift.length) return false;
+  const mode = contentDiffMode();
+  if (mode === 'off') return false;
+  for (const d of drift) _skipStats.driftFields[d.field] = (_skipStats.driftFields[d.field] || 0) + 1;
+  const fields = drift.map((d) => d.field).join(', ');
+  if (mode === 'shadow') {
+    _skipStats.driftShadow++;
+    if (_skipStats.driftShadow <= DRIFT_LOG_CAP) console.log(`[Sync] CONTENT DRIFT (shadow) lead ${lpLeadId}: ${fields}`);
+    return false;
+  }
+  _skipStats.driftForced++;
+  if (_skipStats.driftForced <= DRIFT_LOG_CAP) console.log(`[Sync] CONTENT DRIFT (enforce) lead ${lpLeadId}: forcing upsert — ${fields}`);
+  return true;
+}
+
+// Skip path: the row was compared against live LP and matched, which IS a
+// verification. Stamp it, but at most once a day per row — a full sync over
+// ~100K rows must not become 100K extra updates per pass.
+async function stampVerifiedOnSkip(lpLeadId, existing) {
+  if (!VERIFIED_AT_ENABLED || !existing) return;
+  const last = existing.lp_verified_at ? Date.parse(existing.lp_verified_at) : 0;
+  if (Date.now() - last < VERIFIED_STAMP_MIN_MS) return;
+  const { error } = await supabase.from('lp_leads')
+    .update({ lp_verified_at: new Date().toISOString() })
+    .eq('lp_lead_id', lpLeadId);
+  if (error) console.warn(`[Sync] lp_verified_at stamp failed for ${lpLeadId}: ${error.message}`);
+}
 
 // ─── Skip counter for observability ──────────────────────────────
-let _skipStats = { leads: 0, prospects: 0 };
-export function getSkipStats() { const s = { ..._skipStats }; _skipStats = { leads: 0, prospects: 0 }; return s; }
+const freshSkipStats = () => ({ leads: 0, prospects: 0, driftShadow: 0, driftForced: 0, driftFields: {} });
+let _skipStats = freshSkipStats();
+export function getSkipStats() { const s = { ..._skipStats, driftFields: { ..._skipStats.driftFields } }; _skipStats = freshSkipStats(); return s; }
 
 // ─── Disposition baseline (inbound pre-dispositioned backfill) ───
 //
@@ -549,6 +614,8 @@ function buildLeadRow(prospect, lead, {
       // multiply row size for no read benefit.
       raw_lp_data:        (() => { const { jobs, Jobs, ...rest } = lead; return rest; })(),
       synced_at:          new Date().toISOString(),
+      // Dropped at serialization when disabled (undefined) — see sql/120.
+      lp_verified_at:     VERIFIED_AT_ENABLED ? new Date().toISOString() : undefined,
     },
     isApptSet,
     isDemoCompleted,
@@ -579,7 +646,7 @@ export async function upsertLeadOnly(prospect) {
     // the existing ghl_contact_id into buildLeadRow. maybeSingle() returns
     // null cleanly for brand-new leads instead of erroring.
     const { data: existing } = await supabase.from('lp_leads')
-      .select('updated_at_lp, ghl_contact_id, ghl_link_source, demo_completed, appointment_set, closed_won, appointment_confirmed, appointment_date, appointment_verified, lp_branch_id, set_by_name, ever_confirmed, ever_sat, raw_lp_data')
+      .select(`ghl_contact_id, ghl_link_source, raw_lp_data, ${CONTENT_SELECT}`)
       .eq('lp_lead_id', lpLeadId).maybeSingle();
 
     // Corroborated link resolution (no matchToGHL in Pass 1, so verifiedGhlId
@@ -636,7 +703,16 @@ export async function upsertLeadOnly(prospect) {
         && String(getField(lead, 'brn_id', 'BrnId', 'BrnID') || '').trim() !== '';
       // Same failure mode for the 049 attribution columns.
       const needsAttrBackfill = needsAttributionBackfill(existing, lead);
-      if (!needsGhlIdBackfill && !needsBranchBackfill && !needsAttrBackfill) {
+      // Generic content gate: computed only here, where every legacy test has
+      // already said "unchanged" — so a drift count is a count of rows the old
+      // gate would have left stale. (Gated on the three backfills above for the
+      // same reason: a row they would rewrite anyway is not drift.)
+      const needsContentRefresh = (!needsGhlIdBackfill && !needsBranchBackfill && !needsAttrBackfill)
+        && noteContentDrift(lpLeadId, diffLeadContent(
+          existing, candidateRowForDiff(prospect, lead, { lpLeadId, lpProspectId, existing, resolved }),
+        ));
+      if (!needsGhlIdBackfill && !needsBranchBackfill && !needsAttrBackfill && !needsContentRefresh) {
+        await stampVerifiedOnSkip(lpLeadId, existing);
         // Skip path never upserts, so persist a fresh classification here or
         // stable rows would stay unclassified through the observe soak.
         // One-time per row: the resolver's fast path returns null once the
@@ -738,7 +814,7 @@ export async function processProspect(prospect, { skipGHL = false, payloadHash =
 
     // ─── AGENTIC: Read existing state BEFORE upsert ──────────────
     const { data: existing } = await supabase.from('lp_leads')
-      .select('ghl_tag_applied, lp_day15_triggered, disposition_code, ghl_contact_id, ghl_link_source, updated_at_lp, demo_completed, appointment_set, closed_won, appointment_confirmed, appointment_date, appointment_verified, lp_branch_id, set_by_name, ever_confirmed, ever_sat, raw_lp_data, lp_payload_hash')
+      .select(`ghl_tag_applied, lp_day15_triggered, ghl_contact_id, ghl_link_source, raw_lp_data, lp_payload_hash, ${CONTENT_SELECT}`)
       .eq('lp_lead_id', lpLeadId).single();
 
     const previousDisposition = existing?.disposition_code || null;
@@ -831,13 +907,23 @@ export async function processProspect(prospect, { skipGHL = false, payloadHash =
     // Same failure mode for the 049 attribution columns.
     const needsAttrBackfill = needsAttributionBackfill(existing, lead);
 
-    const recordUnchanged = existing?.updated_at_lp
+    const legacyUnchanged = existing?.updated_at_lp
       && newUpdatedAt
       && existing.updated_at_lp === newUpdatedAt
       && (existing.ghl_contact_id === newLeadGhlId || (!newLeadGhlId && existing.ghl_contact_id))
       && flagsUnchanged
       && !needsBranchBackfill
       && !needsAttrBackfill;
+
+    // Generic content gate — evaluated only when every legacy test says
+    // "unchanged", so drift counts measure exactly what the old gate missed.
+    const needsContentRefresh = (legacyUnchanged && !dispositionChanged)
+      ? noteContentDrift(lpLeadId, diffLeadContent(
+          existing, candidateRowForDiff(prospect, lead, { lpLeadId, lpProspectId, existing, resolved }),
+        ))
+      : false;
+
+    const recordUnchanged = legacyUnchanged && !needsContentRefresh;
 
     if (recordUnchanged && !dispositionChanged) {
       // Persist a fresh classification on the skip path (no upsert runs
@@ -858,6 +944,7 @@ export async function processProspect(prospect, { skipGHL = false, payloadHash =
           .eq('lp_lead_id', lpLeadId);
       }
       _skipStats.leads++;
+      await stampVerifiedOnSkip(lpLeadId, existing);
       // Reliability backstop: a stable lead sitting at a past-Data disposition
       // that never emitted a transition still needs to reach LP_DISP_*. No-op
       // for baseline/null dispositions and deduped after the first emit.
@@ -1214,6 +1301,7 @@ export async function upsertLeadFromFlat(lp, ghlId, payloadHash = null) {
     created_at_lp:      lpDateToEastern(getField(lp, 'dateadded', 'DateAdded', 'entrydate', 'EntryDate')),
     updated_at_lp:      lpDateToEastern(getField(lp, 'lastchangedon', 'LastChangedOn')),
     synced_at:          new Date().toISOString(),
+    lp_verified_at:     VERIFIED_AT_ENABLED ? new Date().toISOString() : undefined,
   };
 
   // v10.1: never overwrite an existing ghl_contact_id link with null.
