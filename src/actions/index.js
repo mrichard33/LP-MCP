@@ -228,6 +228,8 @@ import { validateAction } from '../services/validation-gate.js';
 // ─── Handlers ──────────────────────────────────────────────────────
 import { executeAddTag, executeRemoveTag, executeSetStage } from './handlers/tags.js';
 import { executeMoveOpportunity, executeUpdateOpportunity } from './handlers/opportunities.js';
+// 2026-09-18 — status → GHL lost reason, shared with scripts/reconcile-p2-stages.js
+import { lostReasonIdForJobStatus } from '../lp-lost-reasons.js';
 import { executeAddToWorkflow, executeRemoveFromWorkflow, executeIssueHold } from './handlers/workflows.js';
 import { executeBookAppointment, executeCancelAppointment, executeRescheduleAppointment, executeUpdateAppointmentStatus } from './handlers/appointments.js';
 import { executeSyncLpAppointmentToGhl } from './handlers/lp-ghl-appointment-sync.js';
@@ -533,6 +535,70 @@ async function executeLayer3Dispatch(action /*, context */) {
   };
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// 2026-09-18 — update_opportunity wrapper: supply the lost reason a
+// job-death rule cannot carry itself.
+// ═══════════════════════════════════════════════════════════════════
+//
+// executeUpdateOpportunity has accepted payload.lostReasonId since v4.1, but
+// nothing ever DERIVED one. P2_JOB_TERMINAL_LOST's action_template is static
+// config — {"pipeline":"P2","status":"lost"} — and it fires on five different
+// LP job statuses that map to four different reasons, so the template cannot
+// name the right one. Without this wrapper every rule-driven loss would land
+// with no reason at all, which is precisely what pollutes loss reporting and
+// what scripts/reconcile-p2-stages.js refuses to do on the manual path.
+//
+// The id comes from the SOURCE EVENT's subtype, which for lp.job_status_changed
+// IS the new job status (src/services/job-status-change.js), through the shared
+// mapping in src/lp-lost-reasons.js. Same table the reconciler checks against,
+// so a loss written by the rule and a loss written by the repair pass carry the
+// same reason.
+//
+// Scoped three ways so it can never touch another loss path: only a 'lost'
+// status, only when no lostReasonId was supplied (an explicit one always wins),
+// and only when the source event is lp.job_status_changed. The P1/P3 loss
+// routes, which carry their own ROUTE-TO-P3 contract (see the header of
+// handlers/opportunities.js), are untouched.
+//
+// THROWS rather than writing a reasonless loss. The rule's event_subtype_in
+// allowlist and JOB_STATUS_LOST_REASON's keys are the same five statuses, so a
+// miss means someone edited one without the other. A failed action is visible in
+// the queue and re-runnable; a loss closed with no reason is neither.
+//
+// Lives here rather than in handlers/opportunities.js because fetchSourceEvent
+// is already here and importing it the other way would be circular. Same shape
+// as executeSendMessageWithLock and executeLayer3Dispatch above.
+async function executeUpdateOpportunityWithLostReason(action, context) {
+  const payload = action.action_payload || {};
+  if (payload.status !== 'lost' || payload.lostReasonId) {
+    return executeUpdateOpportunity(action, context);
+  }
+
+  const event = await fetchSourceEvent(action);
+  if (event?.event_type !== 'lp.job_status_changed') {
+    return executeUpdateOpportunity(action, context);
+  }
+
+  const jobStatus = event.event_subtype || null;
+  const lostReasonId = lostReasonIdForJobStatus(jobStatus);
+  if (!lostReasonId) {
+    throw new Error(
+      `No lost reason mapped for LP job status "${jobStatus}" — refusing to close `
+      + `opportunity lost without one. Add it to JOB_STATUS_LOST_REASON in `
+      + `src/lp-lost-reasons.js, or drop it from the rule's event_subtype_in.`,
+    );
+  }
+
+  console.log(
+    `[ActionExecutor] update_opportunity: lost reason ${lostReasonId} derived from `
+    + `job status "${jobStatus}" (event ${event.id})`,
+  );
+  return executeUpdateOpportunity(
+    { ...action, action_payload: { ...payload, lostReasonId } },
+    context,
+  );
+}
+
 // ─── Handler registry ──────────────────────────────────────────────
 // Exported so scripts/test-agent-action-approval.js can assert the registry's
 // exact membership offline — specifically that five9_remove_numbers_from_dnc
@@ -543,7 +609,7 @@ export const ACTION_HANDLERS = {
   add_note: executeAddNote,                     // 2026-07-06 — escalation context summaries (Sentinel §7)
   set_stage: executeSetStage,                   // v4.3 — atomic stage tag swap
   move_opportunity: executeMoveOpportunity,
-  update_opportunity: executeUpdateOpportunity,
+  update_opportunity: executeUpdateOpportunityWithLostReason,  // 2026-09-18 — derives lostReasonId from the job status
   remove_from_workflow: executeRemoveFromWorkflow,
   add_to_workflow: executeAddToWorkflow,
   issue_hold: executeIssueHold,                  // 2026-06-12 — universal Dynamic Hold issuer (+ brain-side serialization)
