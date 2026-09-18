@@ -3,16 +3,30 @@
  * TIER A — propagate an existing lp_leads GHL link down to its children.
  * scripts/backfill-ghl-link-propagate.js
  *
- * Copies lp_leads.ghl_contact_id onto lp_jobs and lp_job_milestones rows that
- * carry NULL and whose parent lead is already linked. Zero external calls, no
- * identity inference, no GHL reads or writes. sql/075_ghl_link_propagate.sql
- * is the source of truth for the two statements; this runner adds the
- * measurement, the undo snapshot and the post-run invariant.
+ * Copies lp_leads.ghl_contact_id onto lp_jobs, lp_job_milestones, lp_notes and
+ * lp_call_logs rows that carry NULL and whose parent lead is already linked.
+ * Zero external calls, no identity inference, no GHL reads or writes.
+ * sql/075_ghl_link_propagate.sql is the source of truth for the original two
+ * statements; this runner adds the measurement, the undo snapshot and the
+ * post-run invariant.
+ *
+ * 2026-09-18 — NOTES AND CALLS ADDED. The original Tier A covered the two
+ * tables the milestone chain reads. lp_notes and lp_call_logs carried the same
+ * orphaned-link shape and nothing ever drained them: measured that day,
+ * lp_jobs 0 and lp_job_milestones 0 (this script did its job) against
+ * lp_notes 27,349 and lp_call_logs 236,961. Both write paths were writing a
+ * literal null; both are fixed in src/sync-children.js in the same change, and
+ * propagating without that fix would only have been undone by the next sync.
+ * Unlike jobs/milestones these two tables drive NO tag, NO event and NO
+ * opportunity move — they are read surfaces (get_lead_summary,
+ * get_call_history) — so this half is inert to the customer by construction,
+ * not merely by the arming argument below.
  *
  * Usage:
  *   node scripts/backfill-ghl-link-propagate.js --dry-run     # measure only
  *   node scripts/backfill-ghl-link-propagate.js               # execute
  *   node scripts/backfill-ghl-link-propagate.js --table=jobs  # jobs only
+ *   node scripts/backfill-ghl-link-propagate.js --table=notes,calls
  *   node scripts/backfill-ghl-link-propagate.js --no-undo     # skip snapshot
  *
  * Per the scripts/backfill-*.js convention this WRITES by default and
@@ -55,10 +69,22 @@ const strArg = (name, fallback) => {
 
 const DRY_RUN = has('dry-run');
 const NO_UNDO = has('no-undo');
-const TABLE = strArg('table', 'both');
+const TABLE = strArg('table', 'all');
 
-if (!['both', 'jobs', 'milestones'].includes(TABLE)) {
-  console.error(`--table must be one of: both, jobs, milestones (got "${TABLE}")`);
+// 'both' is kept as an alias for the two original targets so a runbook line or
+// a shell history entry written before 2026-09-18 still means what it meant
+// then. 'all' is the new default and includes notes and calls.
+const TABLE_KEYS = ['jobs', 'milestones', 'notes', 'calls'];
+const SELECTED = TABLE === 'all' ? TABLE_KEYS
+  : TABLE === 'both' ? ['jobs', 'milestones']
+  : TABLE.split(',').map((s) => s.trim()).filter(Boolean);
+
+const unknown = SELECTED.filter((k) => !TABLE_KEYS.includes(k));
+if (SELECTED.length === 0 || unknown.length > 0) {
+  console.error(
+    `--table must be "all", "both", or a comma-separated subset of ${TABLE_KEYS.join(', ')} `
+    + `(got "${TABLE}"${unknown.length ? `; unknown: ${unknown.join(', ')}` : ''})`,
+  );
   process.exit(1);
 }
 
@@ -97,16 +123,26 @@ async function measure() {
           AND ${ARMED_PREDICATE}) AS armed,
       (SELECT count(*) FROM lp_jobs j JOIN lp_leads l ON l.lp_lead_id = j.lp_lead_id
         WHERE j.ghl_contact_id IS NOT NULL AND l.ghl_contact_id IS NOT NULL
-          AND j.ghl_contact_id IS DISTINCT FROM l.ghl_contact_id) AS jobs_disagreeing
+          AND j.ghl_contact_id IS DISTINCT FROM l.ghl_contact_id) AS jobs_disagreeing,
+      (SELECT count(*) FROM lp_notes WHERE ghl_contact_id IS NULL) AS notes_null,
+      (SELECT count(*) FROM lp_call_logs WHERE ghl_contact_id IS NULL) AS calls_null,
+      (SELECT count(*) FROM lp_notes n JOIN lp_leads l ON l.lp_lead_id = n.lp_lead_id
+        WHERE n.ghl_contact_id IS NULL AND l.ghl_contact_id IS NOT NULL) AS notes_targeted,
+      (SELECT count(*) FROM lp_call_logs c JOIN lp_leads l ON l.lp_lead_id = c.lp_lead_id
+        WHERE c.ghl_contact_id IS NULL AND l.ghl_contact_id IS NOT NULL) AS calls_targeted
   `);
   return one(r);
 }
 
-// Which physical tables this invocation touches, in write order.
+// Which physical tables this invocation touches, in write order. `nullKey` /
+// `targetKey` name this target's columns in the measure() row so the reporting
+// loop below stays generic instead of growing a branch per table.
 const TARGETS = [
-  { key: 'jobs', table: 'lp_jobs', undo: 'lp_link_propagate_undo_jobs' },
-  { key: 'milestones', table: 'lp_job_milestones', undo: 'lp_link_propagate_undo_ms' },
-].filter((t) => TABLE === 'both' || TABLE === t.key);
+  { key: 'jobs', table: 'lp_jobs', undo: 'lp_link_propagate_undo_jobs', nullKey: 'jobs_null', targetKey: 'jobs_targeted' },
+  { key: 'milestones', table: 'lp_job_milestones', undo: 'lp_link_propagate_undo_ms', nullKey: 'ms_null', targetKey: 'ms_targeted' },
+  { key: 'notes', table: 'lp_notes', undo: 'lp_link_propagate_undo_notes', nullKey: 'notes_null', targetKey: 'notes_targeted' },
+  { key: 'calls', table: 'lp_call_logs', undo: 'lp_link_propagate_undo_calls', nullKey: 'calls_null', targetKey: 'calls_targeted' },
+].filter((t) => SELECTED.includes(t.key));
 
 async function snapshotUndo(stamp) {
   // Once a link is propagated, nothing in the row distinguishes it from one
@@ -147,11 +183,14 @@ async function main() {
 
   const before = await measure();
   console.log('\nBefore:');
-  console.log(`  lp_jobs           ghl_contact_id IS NULL : ${before.jobs_null}`);
-  console.log(`  lp_job_milestones ghl_contact_id IS NULL : ${before.ms_null}`);
+  for (const { table, nullKey } of TARGETS) {
+    console.log(`  ${table.padEnd(17)} ghl_contact_id IS NULL : ${before[nullKey]}`);
+  }
   console.log(`\n  targeted (parent lead already linked):`);
-  console.log(`    lp_jobs           : ${before.jobs_targeted}`);
-  console.log(`    lp_job_milestones : ${before.ms_targeted}  across ${before.leads_touched} leads`);
+  for (const { table, targetKey, key } of TARGETS) {
+    const across = key === 'milestones' ? `  across ${before.leads_touched} leads` : '';
+    console.log(`    ${table.padEnd(17)} : ${before[targetKey]}${across}`);
+  }
   console.log(`\n  NOT targeted — parent lead is itself unlinked (Tier B/C territory):`);
   console.log(`    lp_job_milestones : ${before.ms_blocked_on_lead}`);
   console.log(`\n  armed milestone fires (unfired, achieved, tag-mapped, contact resolvable): ${before.armed}`);
@@ -181,9 +220,10 @@ async function main() {
 
   const after = await measure();
   console.log('\nAfter:');
-  console.log(`  lp_jobs           ghl_contact_id IS NULL : ${after.jobs_null}  (was ${before.jobs_null})`);
-  console.log(`  lp_job_milestones ghl_contact_id IS NULL : ${after.ms_null}  (was ${before.ms_null})`);
-  console.log(`  armed milestone fires                   : ${after.armed}  (was ${before.armed})`);
+  for (const { table, nullKey } of TARGETS) {
+    console.log(`  ${table.padEnd(17)} ghl_contact_id IS NULL : ${after[nullKey]}  (was ${before[nullKey]})`);
+  }
+  console.log(`  armed milestone fires${' '.repeat(19)}: ${after.armed}  (was ${before.armed})`);
 
   // ─── Invariants ───────────────────────────────────────────────────────────
   // Asserted as "the targeted cohort is now empty" rather than
@@ -200,14 +240,13 @@ async function main() {
     }
   };
   console.log('\nInvariants:');
-  for (const { key, table } of TARGETS) {
-    checkDrained(table, key === 'jobs' ? after.jobs_targeted : after.ms_targeted);
+  for (const { table, targetKey } of TARGETS) {
+    checkDrained(table, after[targetKey]);
   }
 
-  const jobsDelta = Number(before.jobs_null) - Number(after.jobs_null);
-  const msDelta = Number(before.ms_null) - Number(after.ms_null);
-  console.log(`\n  observed drop — jobs: ${jobsDelta} (targeted ${before.jobs_targeted}), ` +
-              `milestones: ${msDelta} (targeted ${before.ms_targeted})`);
+  const drops = TARGETS.map(({ table, nullKey, targetKey }) =>
+    `${table}: ${Number(before[nullKey]) - Number(after[nullKey])} (targeted ${before[targetKey]})`);
+  console.log(`\n  observed drop — ${drops.join(', ')}`);
   console.log('  A drop smaller than "targeted" means the live sync inserted new');
   console.log('  null rows mid-run; the drained-cohort PASS above is the real check.');
 

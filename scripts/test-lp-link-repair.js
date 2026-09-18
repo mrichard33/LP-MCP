@@ -1,0 +1,260 @@
+/**
+ * scripts/test-lp-link-repair.js
+ *
+ * Unit coverage for the LP↔GHL link repair decision surface:
+ *   src/lp-link-selection.js — which lead a link is written onto
+ *   src/lp-link-match.js     — phone/zip/name normalization and the tiers
+ *   src/link-leak-alerts.js  — the prevention monitor's verdict
+ *
+ * All three are pure and dependency-free, which is why this suite needs no DB,
+ * no env vars and no GHL. scripts/repair-lp-ghl-links.js is the I/O shell over
+ * them and is deliberately NOT imported here — importing it would pull in the
+ * Supabase driver and the GHL fetch wrapper at module load.
+ *
+ * WHAT THESE GUARD AGAINST. Every failure here is silent. A wrong selection
+ * attaches a stranger's job to a customer and nothing downstream complains. A
+ * phone normalization that drops back to full-string compare matches ZERO rows
+ * and reads as "nothing to repair". A monitor that returns a boolean instead of
+ * a three-way verdict announces a recovery nobody earned. None of them throws.
+ *
+ * Pure-function tests — no DB, no network, no GHL.
+ * Run: node --test scripts/test-lp-link-repair.js
+ */
+
+import test from 'node:test';
+import assert from 'node:assert/strict';
+
+import { selectLinkLead } from '../src/lp-link-selection.js';
+import {
+  phone10, zipKey, lastNameKey, classifyTierOne, buildTier3Rows,
+} from '../src/lp-link-match.js';
+import { shouldAlertLinkLeak, formatLinkLeakAlert } from '../src/link-leak-alerts.js';
+
+const lead = (lp_lead_id, has_job, lp_prospect_id = '39362', extra = {}) =>
+  ({ lp_lead_id: String(lp_lead_id), lp_prospect_id: String(lp_prospect_id), has_job, ...extra });
+
+// ═══════════════════════════════════════════════════════════════════
+// Task 1 — the selection rule (Mark's ruling, 2026-09-18)
+// ═══════════════════════════════════════════════════════════════════
+
+test('1. one job-bearing lead among four → picks it, not the most recent', () => {
+  // The worked case from the ruling. Phone 7276571376, prospect 39362:
+  //   131444 CXL · 131185 Sale (HAS A JOB) · 509149 OPPFDN · 46436 CCC
+  // Picking by recency attaches to 509149 and misses the sale entirely — which
+  // is exactly what latestJob() would do, and why it is not reused here.
+  const candidates = [
+    lead(131444, false),
+    lead(131185, true),
+    lead(509149, false),
+    lead(46436, false),
+  ];
+  const res = selectLinkLead(candidates);
+  assert.equal(res.verdict, 'selected');
+  assert.equal(res.lead.lp_lead_id, '131185');
+  assert.notEqual(res.lead.lp_lead_id, '509149'); // the recency answer
+});
+
+test('2. two job-bearing leads under one prospect → picks the higher lp_lead_id', () => {
+  const res = selectLinkLead([lead(131185, true), lead(509149, true), lead(46436, false)]);
+  assert.equal(res.verdict, 'selected');
+  assert.equal(res.lead.lp_lead_id, '509149');
+  assert.equal(res.jobBearingCount, 2);
+});
+
+test('3. no job-bearing lead → selects nothing, classified no_job_bearing_lead', () => {
+  // A P2 opportunity means a contract was signed. A lead with no job is not the
+  // record we want, and guessing buries the evidence. Measured on the live
+  // cohort this is the LARGEST refusal bucket — 68 of 110 tier-1 matches.
+  const res = selectLinkLead([lead(131444, false), lead(509149, false)]);
+  assert.equal(res.verdict, 'no_job_bearing_lead');
+  assert.equal(res.lead, null);
+});
+
+test('"no candidates at all" is reported apart from "candidates, none with a job"', () => {
+  // "Not applicable" is not "unreadable" — the distinction that filed 432,474
+  // non-events in the decision engine when it was collapsed (CLAUDE.md).
+  assert.equal(selectLinkLead([]).verdict, 'no_candidates');
+  assert.equal(selectLinkLead([lead(1, false)]).verdict, 'no_job_bearing_lead');
+});
+
+test('job-bearing leads under DIFFERENT prospects → ambiguous, never a tie-break', () => {
+  const res = selectLinkLead([lead(131185, true, '39362'), lead(700001, true, '88888')]);
+  assert.equal(res.verdict, 'ambiguous');
+  assert.equal(res.lead, null);
+  assert.deepEqual(res.prospectIds, ['39362', '88888']);
+});
+
+test('a second prospect with NO job does not make the pick ambiguous', () => {
+  // The job-bearing filter runs FIRST. A shared phone whose other prospect has
+  // no job is precisely what the ruling disambiguates — refusing here would
+  // throw away a good repair.
+  const res = selectLinkLead([lead(131185, true, '39362'), lead(700001, false, '88888')]);
+  assert.equal(res.verdict, 'selected');
+  assert.equal(res.lead.lp_lead_id, '131185');
+});
+
+test('a jobs ARRAY works the same as the has_job boolean', () => {
+  const res = selectLinkLead([
+    { lp_lead_id: '1', lp_prospect_id: '9', jobs: [] },
+    { lp_lead_id: '2', lp_prospect_id: '9', jobs: [{ lp_job_id: '5' }] },
+  ]);
+  assert.equal(res.lead.lp_lead_id, '2');
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// Task 2 — the tiered matcher
+// ═══════════════════════════════════════════════════════════════════
+
+test('4. +13524453161 matches LP 3524453161', () => {
+  // THE test. GHL stores E.164, LP stores bare digits. Measured over the live
+  // 344-contact cohort: full-string equality matches 0, last-10 matches 110.
+  assert.equal(phone10('+13524453161'), '3524453161');
+  assert.equal(phone10('3524453161'), '3524453161');
+  assert.equal(phone10('+13524453161'), phone10('3524453161'));
+});
+
+test('phone normalization survives the vendor formats too', () => {
+  for (const v of ['(352) 445-3161', '352-445-3161', '352.445.3161', ' 1 352 445 3161 ']) {
+    assert.equal(phone10(v), '3524453161', `failed on ${v}`);
+  }
+});
+
+test('fewer than 10 digits is null, not a short key', () => {
+  // '445-3161' as a key would match every number ending in those 7 digits.
+  assert.equal(phone10('445-3161'), null);
+  assert.equal(phone10(''), null);
+  assert.equal(phone10(null), null);
+});
+
+test('5. phone matching two different prospects → ambiguous, no write', () => {
+  const res = classifyTierOne(
+    { ghl_contact_id: 'C1', ghlZip: '34239' },
+    [lead(131185, true, '39362', { zip: '34239' }), lead(700001, true, '88888', { zip: '34239' })],
+  );
+  assert.equal(res.verdict, 'ambiguous');
+  assert.equal(res.lead, null);
+  assert.equal(res.tier, null);
+});
+
+test('6. tier 2 — zip agreement raises confidence to high; absence leaves it medium', () => {
+  const candidates = [lead(131185, true, '39362', { zip: '34239' })];
+
+  // Mirror or live fetch, the classifier does not care where ghlZip came from —
+  // it is resolved once by the caller and both sources land in the same field.
+  const agreeing = classifyTierOne({ ghl_contact_id: 'C1', ghlZip: '34239' }, candidates);
+  assert.equal(agreeing.verdict, 'selected');
+  assert.equal(agreeing.confidence, 'high');
+
+  // No zip available at all (mirror absent AND the live read failed): the match
+  // still stands, at medium. Tier 2 raises confidence; it never gates a write.
+  const noZip = classifyTierOne({ ghl_contact_id: 'C1', ghlZip: null }, candidates);
+  assert.equal(noZip.verdict, 'selected');
+  assert.equal(noZip.lead.lp_lead_id, '131185');
+  assert.equal(noZip.confidence, 'medium');
+
+  // Disagreeing zips also stay medium — never a refusal. Phone is the match.
+  const disagreeing = classifyTierOne({ ghl_contact_id: 'C1', ghlZip: '33101' }, candidates);
+  assert.equal(disagreeing.verdict, 'selected');
+  assert.equal(disagreeing.confidence, 'medium');
+});
+
+test('ZIP+4 on one side and ZIP-5 on the other still agree', () => {
+  assert.equal(zipKey('34239-1234'), '34239');
+  assert.equal(zipKey('34239'), '34239');
+  assert.equal(zipKey('342'), null);   // too short to compare — not a prefix match
+  assert.equal(zipKey(null), null);
+});
+
+test('7. tier 3 reports and never selects a lead to write', () => {
+  const contact = { lastName: "O'Connor", ghlZip: '34239-1234', phone: '+13524453161' };
+  const rows = buildTier3Rows(contact, [
+    { lp_lead_id: '900', lp_prospect_id: '5', last_name: 'oconnor', zip: '34239', phone: '9998887777', has_job: true },
+  ]);
+  assert.equal(rows.length, 1);
+  // The shape is a REPORT ROW. There is no lead, no confidence and no tier on
+  // it — nothing a write path could consume even by accident.
+  assert.equal(rows[0].lp_lead_id, '900');
+  assert.equal('lead' in rows[0], false);
+  assert.equal('confidence' in rows[0], false);
+  assert.match(rows[0].matched, /last_name=oconnor/);
+  assert.match(rows[0].disagreed, /phone 3524453161≠9998887777/);
+});
+
+test('tier 3 needs BOTH keys — a missing zip yields nothing, never a name-only match', () => {
+  // A surname alone in a zip-less comparison is how you attach a stranger's job.
+  const leads = [{ lp_lead_id: '900', last_name: 'smith', zip: '34239', has_job: true }];
+  assert.deepEqual(buildTier3Rows({ lastName: 'Smith', ghlZip: null }, leads), []);
+  assert.deepEqual(buildTier3Rows({ lastName: null, ghlZip: '34239' }, leads), []);
+  assert.deepEqual(
+    buildTier3Rows({ lastName: 'Smith', ghlZip: '33101' }, leads), [],  // zips disagree
+  );
+});
+
+test('surname normalization collapses punctuation and spacing', () => {
+  assert.equal(lastNameKey("O'Connor"), 'oconnor');
+  assert.equal(lastNameKey('O Connor'), 'oconnor');
+  assert.equal(lastNameKey('  OCONNOR '), 'oconnor');
+  assert.equal(lastNameKey('X'), null);      // one letter is not a surname
+  assert.equal(lastNameKey(''), null);
+});
+
+test('an unmatched contact is "unmatched", distinct from every refusal', () => {
+  const res = classifyTierOne({ ghl_contact_id: 'C1', ghlZip: '34239' }, []);
+  assert.equal(res.verdict, 'unmatched');
+  assert.equal(res.lead, null);
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// Task 3 — the prevention monitor
+// ═══════════════════════════════════════════════════════════════════
+
+test('a new unlinked row where a GHL contact exists fires, and names the table', () => {
+  const sample = {
+    windowHours: 24,
+    readOk: true,
+    tables: { lp_jobs: 0, lp_job_milestones: 0, lp_notes: 3, lp_call_logs: 0 },
+  };
+  const d = shouldAlertLinkLeak(sample);
+  assert.equal(d.verdict, 'alert');
+  assert.equal(d.alert, true);
+  assert.deepEqual(d.offenders, [{ table: 'lp_notes', count: 3 }]);
+  // The table IS the diagnosis — notes fail through a different code path than
+  // jobs, and a bare total sends the next reader to the wrong file.
+  assert.match(formatLinkLeakAlert(sample, d.offenders), /lp_notes: 3/);
+});
+
+test('all zero is healthy — an explicit clear, not silence', () => {
+  const d = shouldAlertLinkLeak({
+    windowHours: 24, readOk: true, tables: { lp_jobs: 0, lp_notes: 0 },
+  });
+  assert.equal(d.verdict, 'healthy');
+  assert.equal(d.alert, false);
+});
+
+test('a failed read is insufficient_evidence — it must neither page nor clear', () => {
+  // The case people get wrong. Clearing on "I could not tell" announces a
+  // recovery nobody earned; the caller maps this to active: null.
+  const d = shouldAlertLinkLeak({
+    windowHours: 24, readOk: false, tables: { lp_jobs: 0, lp_notes: null },
+  });
+  assert.equal(d.verdict, 'insufficient_evidence');
+  assert.equal(d.alert, false);
+  assert.deepEqual(d.unreadable, ['lp_notes']);
+});
+
+test('a CONFIRMED leak still fires even when another table could not be read', () => {
+  // Incomplete evidence blocks the all-clear, never the alarm.
+  const d = shouldAlertLinkLeak({
+    windowHours: 24, readOk: false, tables: { lp_jobs: 5, lp_notes: null },
+  });
+  assert.equal(d.verdict, 'alert');
+  assert.deepEqual(d.offenders, [{ table: 'lp_jobs', count: 5 }]);
+  assert.deepEqual(d.unreadable, ['lp_notes']);
+});
+
+test('no tables measured at all is insufficient_evidence, not healthy', () => {
+  assert.equal(
+    shouldAlertLinkLeak({ windowHours: 24, readOk: true, tables: {} }).verdict,
+    'insufficient_evidence',
+  );
+});

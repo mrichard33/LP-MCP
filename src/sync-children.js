@@ -335,7 +335,16 @@ export async function syncCallLogs(lpLeadId, ghlContactId, calls) {
     callRowsById.set(callId, {
       lp_call_id:        callId,
       lp_lead_id:        lpLeadId,
-      ghl_contact_id:    ghlContactId || null,
+      // OMITTED, not nulled — the same treatment lp_jobs got in #784 and
+      // lp_job_milestones in its child follow-up. This path is insert-only
+      // today (the existingIds guard above `continue`s on a known call id), so
+      // the null could not yet clobber a stored link — but the identical
+      // literal on lp_notes DID, once its skip became conditional on a note
+      // edit. Measured 2026-09-18: 236,961 lp_call_logs rows sit NULL against a
+      // linked parent lead, every one of them written by this literal at INSERT
+      // time before the lead was resolved. Omitting the key is what lets
+      // scripts/backfill-ghl-link-propagate.js drain them and keep them drained.
+      ...(ghlContactId ? { ghl_contact_id: ghlContactId } : {}),
       call_date:         lpDateToEastern(callDatetime),
       call_duration_sec: getField(call, 'duration', 'Duration', 'call_duration', 'callduration'),
       call_result:       getField(call, 'resultcode', 'ResultCode', 'resultdescr', 'result'),
@@ -485,7 +494,23 @@ export async function syncNotes(lpLeadId, ghlContactId, notes) {
     noteRowsById.set(noteId, {
       lp_note_id:          noteId,
       lp_lead_id:          lpLeadId,
-      ghl_contact_id:      ghlContactId || null,
+      // OMITTED, not nulled. THE LAST INSTANCE OF THE #784 BUG, found
+      // 2026-09-18 while repairing the P2 link gap.
+      //
+      // Unlike lp_call_logs above, this path is NOT insert-only: the note-edit
+      // branch a few lines up deliberately falls THROUGH to this row build when
+      // LP's note body changed and nMode === 'enforce'. That re-upserts on
+      // lp_note_id with whatever ghlContactId the caller happens to hold — and
+      // syncAllChildRecords calls syncNotes with a null contact for every lead
+      // it could not resolve, so an edited note erased a link that was already
+      // correct. Measured 2026-09-18: 27,349 lp_notes rows NULL against a
+      // linked parent lead, versus 0 for lp_jobs and 0 for lp_job_milestones —
+      // those two were fixed and drained, these were never covered.
+      //
+      // Uniform key set across the bulk-upserted array still holds:
+      // ghlContactId is one parameter for the whole call, so every object in
+      // noteRows either carries the key or none of them does.
+      ...(ghlContactId ? { ghl_contact_id: ghlContactId } : {}),
       note_origin:         noteOriginOf(noteBody),
       note_body:           noteBody,
       note_type:           getField(note, 'rectype', 'RecType', 'type', 'note_type'),
