@@ -57,6 +57,34 @@ export function zipKey(value) {
 }
 
 /**
+ * The comparable form of an email, or null when it is not usable as identity.
+ *
+ * Lowercased and trimmed — LP and GHL disagree on case constantly. Anything
+ * without an `@` and a dot after it is rejected rather than compared.
+ *
+ * SHARED AND ROLE ADDRESSES ARE REFUSED. `info@`, `noreply@` and friends belong
+ * to a business, not a person, and one of them can span dozens of unrelated
+ * prospects — exactly the shape that attaches a stranger's job to a customer.
+ * The selection rule's multi-prospect guard would usually catch that, but it is
+ * cheaper and clearer to never offer the candidate. This list is deliberately
+ * short: it covers the addresses that are role accounts by definition, not every
+ * address that happens to be popular.
+ */
+const ROLE_LOCALPARTS = new Set([
+  'info', 'noreply', 'no-reply', 'donotreply', 'do-not-reply', 'admin', 'office',
+  'sales', 'support', 'contact', 'billing', 'service', 'help', 'test', 'email',
+  'none', 'na', 'n/a', 'unknown', 'customer',
+]);
+
+export function emailKey(value) {
+  const raw = String(value ?? '').trim().toLowerCase();
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(raw)) return null;
+  const local = raw.slice(0, raw.indexOf('@'));
+  if (ROLE_LOCALPARTS.has(local)) return null;
+  return raw;
+}
+
+/**
  * The comparable form of a surname: lowercase, letters only, or null.
  *
  * Tier 3 only. Strips punctuation and spacing so `O'Connor`, `oconnor` and
@@ -85,13 +113,19 @@ export function lastNameKey(value) {
  *   read — this does not care which, and the caller logs the source.
  * @param {Array<object>} candidates  matched lp_leads rows carrying
  *   lp_lead_id, lp_prospect_id, has_job and zip
+ * Each candidate may carry a `matched_via` string set by the caller ('phone',
+ * 'phone_alt', 'email', 'prospect'). It is reported back on the result so the
+ * summary and the rollback log can say HOW a link was reached — which is the
+ * only way to tell later whether widening the matcher was worth it, or whether
+ * one of the widenings is producing bad links.
+ *
  * @returns {{verdict: 'selected'|'unmatched'|'no_candidates'|'no_job_bearing_lead'|'ambiguous',
  *            lead: object|null, confidence: 'high'|'medium'|null, tier: 1|null,
- *            prospectIds: string[]}}
+ *            prospectIds: string[], via: string|null}}
  */
 export function classifyTierOne(contact, candidates) {
   if (!candidates || candidates.length === 0) {
-    return { verdict: 'unmatched', lead: null, confidence: null, tier: null, prospectIds: [] };
+    return { verdict: 'unmatched', lead: null, confidence: null, tier: null, prospectIds: [], via: null };
   }
 
   const picked = selectLinkLead(candidates);
@@ -102,6 +136,7 @@ export function classifyTierOne(contact, candidates) {
       confidence: null,
       tier: null,
       prospectIds: picked.prospectIds,
+      via: null,
     };
   }
 
@@ -109,7 +144,14 @@ export function classifyTierOne(contact, candidates) {
   const lz = zipKey(picked.lead?.zip);
   const confidence = gz && lz && gz === lz ? 'high' : 'medium';
 
-  return { verdict: 'selected', lead: picked.lead, confidence, tier: 1, prospectIds: picked.prospectIds };
+  return {
+    verdict: 'selected',
+    lead: picked.lead,
+    confidence,
+    tier: 1,
+    prospectIds: picked.prospectIds,
+    via: picked.lead?.matched_via ?? null,
+  };
 }
 
 /**

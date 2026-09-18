@@ -26,7 +26,7 @@ import assert from 'node:assert/strict';
 
 import { selectLinkLead } from '../src/lp-link-selection.js';
 import {
-  phone10, zipKey, lastNameKey, classifyTierOne, buildTier3Rows,
+  phone10, zipKey, lastNameKey, emailKey, classifyTierOne, buildTier3Rows,
 } from '../src/lp-link-match.js';
 import { shouldAlertLinkLeak, formatLinkLeakAlert } from '../src/link-leak-alerts.js';
 import {
@@ -314,4 +314,79 @@ test('readback and count are plain SELECTs the RPC can wrap', () => {
 test("a lp_lead_id containing a quote cannot break out of the literal", () => {
   const sql = buildLeadLinkUpdate("O'Brien", 'ZbJFTZNhvzHJRQ3MHXmX', 'phone10_repair');
   assert.match(sql, /lp_lead_id = 'O''Brien'/);
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// Part 2 — the widened matcher
+// ═══════════════════════════════════════════════════════════════════
+
+test('emailKey lowercases and trims, and refuses anything unusable', () => {
+  assert.equal(emailKey('  A.B@Example.COM '), 'a.b@example.com');
+  assert.equal(emailKey('joe@x.co'), 'joe@x.co');
+  for (const bad of ['bob@', '@x.com', 'not-an-email', 'a@b', '', null, undefined]) {
+    assert.equal(emailKey(bad), null, `should reject ${JSON.stringify(bad)}`);
+  }
+});
+
+test('role addresses are refused — they belong to a business, not a person', () => {
+  // One info@ can span dozens of unrelated prospects. The selection rule's
+  // multi-prospect guard would usually catch it, but never offering the
+  // candidate is cheaper and clearer.
+  for (const role of ['info@reece.com', 'noreply@x.io', 'sales@y.net', 'unknown@z.org']) {
+    assert.equal(emailKey(role), null, `should reject ${role}`);
+  }
+  // A real person whose name merely resembles one is untouched.
+  assert.equal(emailKey('info.smith@x.com'), 'info.smith@x.com');
+  assert.equal(emailKey('salesbob@x.com'), 'salesbob@x.com');
+});
+
+test('the prospect widening finds the job on a SIBLING lead', () => {
+  // The Espel case, prospect 2872: the phone match lands on a lead with no job,
+  // while a sibling lead under the same prospect carries one. Before this, the
+  // contact was refused no_job_bearing_lead and the job stayed invisible.
+  const phoneMatched = lead(514983, false, '2872', { zip: '33624', matched_via: 'phone' });
+  const sibling = lead(27320, true, '2872', { zip: '33624', matched_via: 'prospect' });
+
+  assert.equal(selectLinkLead([phoneMatched]).verdict, 'no_job_bearing_lead');
+
+  const res = classifyTierOne({ ghl_contact_id: 'C1', ghlZip: '33624' }, [phoneMatched, sibling]);
+  assert.equal(res.verdict, 'selected');
+  assert.equal(res.lead.lp_lead_id, '27320');
+  assert.equal(res.via, 'prospect', 'the summary must be able to say HOW this was reached');
+});
+
+test('widening never crosses into a second prospect', () => {
+  // Siblings are the same customer record. Two PROSPECTS with jobs are two
+  // customer records sharing a key, and that is still a refusal.
+  const res = classifyTierOne({ ghl_contact_id: 'C1', ghlZip: '33624' }, [
+    lead(27320, true, '2872', { matched_via: 'prospect' }),
+    lead(99001, true, '5555', { matched_via: 'prospect' }),
+  ]);
+  assert.equal(res.verdict, 'ambiguous');
+  assert.equal(res.lead, null);
+});
+
+test('a direct match that already has a job is unaffected by widening', () => {
+  // The widening only runs where the direct match produced no job-bearing lead.
+  // This pins that a phone match still wins and still reports via=phone.
+  const res = classifyTierOne({ ghl_contact_id: 'C1', ghlZip: '34239' }, [
+    lead(131185, true, '39362', { zip: '34239', matched_via: 'phone' }),
+  ]);
+  assert.equal(res.verdict, 'selected');
+  assert.equal(res.lead.lp_lead_id, '131185');
+  assert.equal(res.via, 'phone');
+});
+
+test('via is reported for every write path, and null when nothing was selected', () => {
+  for (const via of ['phone', 'phone_alt', 'email', 'prospect']) {
+    const res = classifyTierOne({ ghl_contact_id: 'C1', ghlZip: null },
+      [lead(1, true, '9', { matched_via: via })]);
+    assert.equal(res.via, via);
+  }
+  assert.equal(classifyTierOne({ ghl_contact_id: 'C1' }, []).via, null);
+  assert.equal(
+    classifyTierOne({ ghl_contact_id: 'C1' }, [lead(1, false, '9', { matched_via: 'phone' })]).via,
+    null,
+    'a refusal has no via — nothing was reached',
+  );
 });
