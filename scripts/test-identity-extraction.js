@@ -123,10 +123,14 @@ function stateFrom(identity, tags = []) {
   return { identity: { decision_maker_confirmed: 'unknown', decision_maker_question_asked: false, _source: {}, ...identity }, tags };
 }
 
+// These three are about ADDRESS and ZIP. They used decision_maker_confirmed:false
+// as a stand-in for "answered", which stopped being a pass on 2026-09-18 — see
+// the ALL DECISION MAKERS ATTEND test below. They now set `true` so the
+// assertions stay about the thing they are testing.
 test('gate: missing address + zip blocks slot offers', () => {
   const gate = assertBookingPrerequisites(stateFrom({
     first_name: 'Victor', last_name: 'Lopez', phone: '+15613230334',
-    decision_maker_confirmed: false,
+    decision_maker_confirmed: true,
   }));
   assert.equal(gate.ok, false);
   assert.deepEqual(gate.missing, ['address', 'zip']);
@@ -136,7 +140,7 @@ test('gate: zip is hard-required, city is not (zip proves service area)', () => 
   const noZip = assertBookingPrerequisites(stateFrom({
     first_name: 'Victor', last_name: 'Lopez', phone: '+15613230334',
     address_line1: '2885 S Oasis Dr', city: 'Boynton Beach',
-    decision_maker_confirmed: false,
+    decision_maker_confirmed: true,
   }));
   assert.equal(noZip.ok, false);
   assert.deepEqual(noZip.missing, ['zip']);
@@ -144,18 +148,24 @@ test('gate: zip is hard-required, city is not (zip proves service area)', () => 
   const noCity = assertBookingPrerequisites(stateFrom({
     first_name: 'Victor', last_name: 'Lopez', phone: '+15613230334',
     address_line1: '2885 S Oasis Dr', postal_code: '33435',
-    decision_maker_confirmed: false,
+    decision_maker_confirmed: true,
   }));
   assert.equal(noCity.ok, true, 'city absence never blocks — it derives from the zip');
 });
 
-test('gate: all present + decision_maker=false → status new', () => {
+// 2026-09-18 — ALL DECISION MAKERS ATTEND (Mark's ruling). This test asserted
+// the OPPOSITE until this date: decision_maker_confirmed=false meant "asked and
+// answered", the gate passed, and slots were offered to one person while a
+// partner who would not attend was on record. That was the ONE-LEGGER policy,
+// and it is reversed. Having asked is the first bar, not the only one.
+test('gate: all present but decision_maker=false → BLOCKED, status new', () => {
   const gate = assertBookingPrerequisites(stateFrom({
     first_name: 'Victor', last_name: 'Lopez', phone: '+15613230334',
     address_line1: '2885 S Oasis Dr', city: 'Boynton Beach', postal_code: '33435',
     decision_maker_confirmed: false,
   }));
-  assert.equal(gate.ok, true);
+  assert.equal(gate.ok, false, 'an answered-No must not clear the way to a slot offer');
+  assert.deepEqual(gate.missing, ['decision_maker_unresolved']);
   assert.equal(gate.appointment_status, 'new');
 });
 

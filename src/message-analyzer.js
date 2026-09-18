@@ -280,6 +280,14 @@ const ANALYSIS_CACHE_TTL_MS = parseInt(process.env.ANALYSIS_CACHE_TTL_MS || '120
 // catch, emits ai.analysis_failed, and frees the queue.
 const ANALYZE_TIMEOUT_MS = parseInt(process.env.ANALYZE_TIMEOUT_MS || '40000', 10);
 
+// 2026-09-18 — was a hardcoded 500 at the call site (Catherine Crosier).
+// A thinking model spends this budget reasoning before it writes any JSON, and
+// 500 never survived the reasoning: the analyzer threw three times in a row on
+// one inbound (system_events 3781516 / 3781525 / 3781535), went silent, and the
+// reply fell through to the backstop rule. resolveMaxTokens() in
+// src/llm-client.js enforces a floor underneath this for any thinking model.
+const ANALYZER_MAX_TOKENS = parseInt(process.env.MESSAGE_ANALYZER_MAX_TOKENS || '4000', 10);
+
 // v1.4: per-message slice cap when serializing conversation_recent for
 // the AI prompt. Was 150 in v1.1-v1.3 — too short to contain CTAs that
 // sit at the end of typical SMS bodies. 1000 chars covers full SMS
@@ -776,7 +784,7 @@ async function callClaude(messageText, context) {
     fn: 'message_analyzer',
     system: SYSTEM_PROMPT,
     user: userPrompt,
-    maxTokens: 500,
+    maxTokens: ANALYZER_MAX_TOKENS,
     json: true,
   });
 

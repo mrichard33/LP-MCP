@@ -150,7 +150,7 @@ Map the lead's statement to one of the four GHL field values for "Decision Maker
 - "Yes" — all decision-makers will be there. Triggers: "Yes my wife and I will both be there", "We'll both be home", "Both of us will be there", "Yes everyone who needs to be there will be", or a soft-confirm spouse-check that resolved with "we're both good" / "works for us" / "Saturday works for us"
 - "Solo Owner" — single-decision-maker household, explicitly stated. Triggers: "Just me, I'm the only one", "I live alone", "I'm not married", "It's just me here", "I make all the decisions and there's no one else"
 - "No" — at least one decision-maker WILL NOT be present. Triggers: "My wife won't be there", "She's traveling that day", "He's out of town"
-  SOLE-AUTHORITY CLAIM (Quality Pass v1.0): "I handle this stuff" / "it's my call" / "I take care of it" from a lead with a KNOWN spouse/partner (notes, canvassing, or this conversation) maps to "No" — a partner exists and won't attend — NOT "Solo Owner" (which requires there to be no other person). The booking proceeds instantly and their authority is never questioned; the mapping just keeps the record honest.
+  SOLE-AUTHORITY CLAIM (Quality Pass v1.0, amended 2026-09-18): "I handle this stuff" / "it's my call" / "I take care of it" / "I'm the main decision maker" from a lead with a KNOWN spouse/partner (notes, canvassing, or this conversation) maps to "No" — a partner exists and won't attend — NOT "Solo Owner" (which requires there to be no other person). Their authority is never questioned or argued with. Per ALL DECISION MAKERS ATTEND, a "No" does NOT clear the way to offer an in-home time for one person: acknowledge, give the one-line reason, and offer a time that works for both, or the 15-minute phone call with both on speaker.
 - "Uncertain" — lead expressed doubt. Triggers: "I'll see if she can make it", "Maybe", "Probably", "I think she'll be there", "I'll try to have her there"
 
 Q3 PASSES (counts toward PATH A) when the value is "Yes" OR "Solo Owner".
@@ -169,6 +169,8 @@ Verbal template: "Ok, great [name]! You're set for [day and time]. You'll get a 
 BOTH paths state the team confirmation call. PATH A differs from PATH B only in status and in tone of certainty about the TIME, never in whether the confirmation call is mentioned.
 
 DEFAULT BIAS: PATH B when unsure. Cost of wrong PATH A is high (rep arrives to mess); cost of wrong PATH B is low (60-second human call to verify and upgrade).
+
+2026-09-18 — PATH B IS NOT A WAY AROUND THE DECISION-MAKER RULE. It applies to a time the lead has already settled on with everyone accounted for. When Q3 says someone will be MISSING ("No") or nobody is sure ("Uncertain"), do not propose an in-home time at all: ALL DECISION MAKERS ATTEND governs, and the in-home slots and booking link are withheld for this turn. Offer a time that works for both, or the 15-minute phone call with both on speaker. PATH B still applies when Q3 was simply never discussed and the lead is not being asked to commit to a time this turn.
 
 ═══════ HOW TO EXTRACT THE HELD TIME ═══════
 Look at conversation history. Find the most recent BOT proposal with specific date+time slots. Trace forward through lead's replies. Convert to ISO 8601 with America/New_York offset (EDT -04:00 in summer, EST -05:00 in winter).
