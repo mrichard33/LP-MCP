@@ -157,7 +157,7 @@ import {
 import { acquireSyncLock } from './sync-lock.js';
 import { populateSourceMapping, backfillSourceMappingsFromLeads } from './sync-sources.js';
 import { syncDispositions, backfillDispositionsFromLeads } from './sync-dispositions.js';
-import { upsertLeadOnly, processProspect, attributionColumnsComplete } from './sync-leads.js';
+import { upsertLeadOnly, processProspect, attributionColumnsComplete, getSkipStats } from './sync-leads.js';
 import { syncAllChildRecords, syncJobAndMilestones, getChildSkipStats } from './sync-children.js';
 import {
   describeJobUpsertError,
@@ -672,6 +672,7 @@ export async function fullSync() {
 
   const duration = Date.now() - startedAt.getTime();
   logChildSkips('Full');
+  logLeadSkips('Full');
   console.log(`[Sync] Full sync complete — ${counts.leads} leads, ${counts.calls} calls, ${counts.notes} notes, ${counts.jobs} jobs, ${counts.milestones} milestones, ${failed} failed (${Math.round(duration / 1000)}s)`);
   return counts;
 }
@@ -685,6 +686,22 @@ function logChildSkips(label) {
   console.log(
     `[Sync] ${label} skipped (unchanged/existing) — jobs=${s.jobs} milestones=${s.milestones} ` +
     `calls=${s.calls} notes=${s.notes} activities=${s.activities}`,
+  );
+}
+
+// 2026-09-18 — surface the lead-writer skip counter and the content-diff gate's
+// drift counts (src/sync-leads.js). getSkipStats() had been exported since v7.5
+// and never read, so the lead skip count was invisible; the shadow soak for
+// LP_LEAD_CONTENT_DIFF_MODE needs driftFields per column to tell a derivation
+// difference (one column near 100%) from real drift. Drains on read — once per
+// cycle, at the end, like logChildSkips.
+function logLeadSkips(label) {
+  const s = getSkipStats();
+  const fields = Object.entries(s.driftFields).sort((a, b) => b[1] - a[1])
+    .map(([f, n]) => `${f}=${n}`).join(' ') || 'none';
+  console.log(
+    `[Sync] ${label} lead skips — leads=${s.leads} driftShadow=${s.driftShadow} ` +
+    `driftForced=${s.driftForced} driftFields: ${fields}`,
   );
 }
 
@@ -1003,6 +1020,7 @@ async function runLeadsSweep(since, windowEnd, logIds, maxLeads) {
   if (unchangedSkipped > 0) {
     console.log(`[Sync:Leads] Hash gate (${SYNC_HASH_GATE_MODE}): ${unchangedSkipped} unchanged prospects ${SYNC_HASH_GATE_MODE === 'enforce' ? 'skipped' : 'would skip'}`);
   }
+  logLeadSkips('Leads sweep');
   // v6.12: gate diagnostics. A low skip rate is only meaningful alongside
   // how many prospects HAD a stored hash to compare against.
   if (SYNC_HASH_GATE_MODE !== 'off' && (gateStored > 0 || gateAbsent > 0)) {

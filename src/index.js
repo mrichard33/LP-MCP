@@ -1813,6 +1813,29 @@ async function runMigrations() {
   } catch (err) {
     console.error('[Migration] sale announcements FAILED (POST /notifications/sale-announcement will 500 on every sale until sql/117 is applied from the dashboard):', err.message);
   }
+
+  // lp_leads.lp_verified_at + v_lp_lead_freshness (sql/120, 2026-09-18). The
+  // column is only named by sync-leads.js when LP_VERIFIED_AT_ENABLED=true, so
+  // a failure here degrades nothing — the flag stays off until the dashboard
+  // run has been confirmed. Both statements are idempotent and cheap (no data
+  // write), which is why the view is mirrored too.
+  try {
+    const { runSQL } = await import('./admin/supabase-admin.js');
+    await runSQL(`ALTER TABLE lp_leads ADD COLUMN IF NOT EXISTS lp_verified_at timestamptz;
+            CREATE OR REPLACE VIEW v_lp_lead_freshness AS
+            SELECT
+              count(*)                                                             AS active_leads,
+              count(*) FILTER (WHERE lp_verified_at >= now() - interval '1 day')    AS verified_24h,
+              count(*) FILTER (WHERE lp_verified_at >= now() - interval '7 days')   AS verified_7d,
+              count(*) FILTER (WHERE lp_verified_at IS NULL)                        AS never_verified,
+              round(100.0 * count(*) FILTER (WHERE lp_verified_at >= now() - interval '7 days')
+                    / greatest(count(*), 1), 2)                                     AS pct_verified_7d
+            FROM lp_leads
+            WHERE created_at_lp >= now() - interval '365 days';`);
+    console.log('[Migration] lp_verified_at + v_lp_lead_freshness (sql/120) ready');
+  } catch (err) {
+    console.warn('[Migration] lp_verified_at (sql/120) skipped — apply from the dashboard before LP_VERIFIED_AT_ENABLED=true:', err.message);
+  }
 }
 
 app.get('/', (req, res) => {
