@@ -401,7 +401,7 @@ test('prune deletes by the retention cutoff', async () => {
 
 test('the roster is unique, complete and shaped', () => {
   assert.equal(new Set(JOB_IDS).size, JOB_IDS.length, 'job ids must be unique');
-  assert.equal(JOBS.length, 12);
+  assert.equal(JOBS.length, 13);
   for (const j of JOBS) {
     assert.match(j.id, /^[a-z0-9-]+$/, `${j.id} should be a slug`);
     assert.ok(j.label && j.group && j.cadence, `${j.id} needs a label, group and cadence`);

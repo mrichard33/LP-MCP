@@ -297,6 +297,7 @@ import { startLpCsvOrphanReaper } from './jobs/lp-csv-orphan-reaper.js';
 import { registerScorecardValidateRoutes, startScorecardValidateScheduler } from './jobs/scorecard-validate.js';
 // 2026-08-06 Phase E — daily Five9 config snapshot + change log (ships dark)
 import { registerFive9SnapshotRoutes, startFive9ConfigSnapshotScheduler } from './jobs/five9-config-snapshot.js';
+import { registerFreshnessRefreshRoutes, startFreshnessRefreshScheduler } from './jobs/freshness-refresh.js';
 import { registerCiRoutes } from './ci/routes.js';
 import { startCiWorkerScheduler } from './ci/worker.js';
 import { startCiDiscoveryScheduler } from './jobs/ci-discovery-scheduler.js';
@@ -1836,6 +1837,61 @@ async function runMigrations() {
   } catch (err) {
     console.warn('[Migration] lp_verified_at (sql/120) skipped — apply from the dashboard before LP_VERIFIED_AT_ENABLED=true:', err.message);
   }
+
+  // verified_at / verified_from on the remaining LP mirror tables +
+  // v_supabase_freshness (sql/121, 2026-09-18).
+  //
+  // THIS MIRROR IS LOAD-BEARING, unlike sql/120's. LP_VERIFIED_AT_ENABLED is
+  // already true in production, so the moment this deploys the prospect skip
+  // path SELECTs verified_at and the child writers name it. If the columns are
+  // absent the prospect select throws, its catch swallows it, and the content
+  // gate collapses into re-upserting all 147k prospects every sync. This runs
+  // before startSyncScheduler(), so the columns exist before the first pass.
+  // The CONCURRENTLY index in sql/121 is deliberately NOT mirrored — it cannot
+  // run inside the transaction runSQL uses; apply it from the dashboard.
+  try {
+    const { runSQL } = await import('./admin/supabase-admin.js');
+    await runSQL(`ALTER TABLE lp_prospects      ADD COLUMN IF NOT EXISTS verified_at   timestamptz;
+            ALTER TABLE lp_prospects      ADD COLUMN IF NOT EXISTS verified_from text;
+            ALTER TABLE lp_notes          ADD COLUMN IF NOT EXISTS verified_at   timestamptz;
+            ALTER TABLE lp_notes          ADD COLUMN IF NOT EXISTS verified_from text;
+            ALTER TABLE lp_jobs           ADD COLUMN IF NOT EXISTS verified_at   timestamptz;
+            ALTER TABLE lp_jobs           ADD COLUMN IF NOT EXISTS verified_from text;
+            ALTER TABLE lp_job_milestones ADD COLUMN IF NOT EXISTS verified_at   timestamptz;
+            ALTER TABLE lp_job_milestones ADD COLUMN IF NOT EXISTS verified_from text;
+            ALTER TABLE lp_leads          ADD COLUMN IF NOT EXISTS verified_from text;
+            CREATE OR REPLACE VIEW v_supabase_freshness AS
+            WITH parts AS (
+              SELECT 'lp_leads'::text AS table_name, lp_verified_at AS verified_at
+                FROM lp_leads WHERE created_at_lp >= now() - interval '365 days'
+              UNION ALL
+              SELECT 'lp_prospects', verified_at
+                FROM lp_prospects WHERE synced_at >= now() - interval '365 days'
+              UNION ALL
+              SELECT 'lp_notes', verified_at
+                FROM lp_notes WHERE created_at_lp >= now() - interval '365 days'
+              UNION ALL
+              SELECT 'lp_jobs', verified_at
+                FROM lp_jobs WHERE synced_at >= now() - interval '365 days'
+              UNION ALL
+              SELECT 'lp_job_milestones', verified_at
+                FROM lp_job_milestones WHERE synced_at >= now() - interval '365 days'
+            )
+            SELECT
+              table_name,
+              count(*)                                                        AS active_rows,
+              count(*) FILTER (WHERE verified_at >= now() - interval '1 day')  AS verified_24h,
+              count(*) FILTER (WHERE verified_at >= now() - interval '7 days') AS verified_7d,
+              count(*) FILTER (WHERE verified_at IS NULL)                      AS never_verified,
+              round(100.0 * count(*) FILTER (WHERE verified_at >= now() - interval '7 days')
+                    / greatest(count(*), 1), 2)                                AS pct_verified_7d
+            FROM parts
+            GROUP BY table_name
+            ORDER BY active_rows DESC;`);
+    console.log('[Migration] mirror freshness (sql/121) ready');
+  } catch (err) {
+    console.warn('[Migration] mirror freshness (sql/121) FAILED — apply it from the dashboard NOW: until it lands the lp_prospects content gate is skipping nothing and every prospect is rewritten each sync:', err.message);
+  }
 }
 
 app.get('/', (req, res) => {
@@ -2260,6 +2316,7 @@ registerLpReportReconRoutes(app);
 registerSourceReconcileRoutes(app);
 registerScorecardValidateRoutes(app);
 registerFive9SnapshotRoutes(app, authenticate);
+registerFreshnessRefreshRoutes(app);
 registerCiRoutes(app, authenticate);            // 2026-08-21 — Call Intelligence ingest (PR 2; worker ships disarmed)
 
 const server = app.listen(PORT, async () => {
@@ -2316,6 +2373,7 @@ const server = app.listen(PORT, async () => {
   startGoalScorecardScheduler();
   startScorecardValidateScheduler();
   startFive9ConfigSnapshotScheduler();
+  startFreshnessRefreshScheduler();
   // Probe ffmpeg, which transcodes Five9's GSM 6.10 recordings to a format a
   // browser can actually play. A CLEAR LOG LINE, NOT A CRASH: without it the
   // whole pipeline still runs and links still resolve, they just serve the

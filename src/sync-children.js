@@ -65,6 +65,26 @@ import { getLead } from './lp-client.js';
 import { isMilestoneAchieved } from './milestone-gate.js';
 import { mapJobFields, mapMilestoneChangeFields } from './lp-job-fields.js';
 import { selectFurthestMilestone } from './milestone-order.js';
+import { verifiedStamp, VERIFIED_FROM, FRESHNESS_VOLATILE_COLUMNS } from './services/freshness.js';
+
+// ─── Note edit detection (2026-09-18) ────────────────────────────────────
+// syncNotes has always been INSERT-ONLY: it batch-checks lp_note_id and
+// `continue`s on any hit, on the stated premise that "notes are immutable once
+// created in LP". They are not — LP notes can be edited, and when one is, the
+// original body stays in Supabase permanently. Nothing has ever corrected it.
+//
+// Off by default. Turning it on widens the existence read from one id column to
+// the note body across 256k rows, and the body is the expensive part; measure
+// the sweep cost in shadow before enforcing.
+//   off (default) — today's behaviour, insert-only
+//   shadow        — detect edits, log them, still do not write
+//   enforce       — update the row when the body or its metadata changed
+const NOTE_EDIT_MODES = new Set(['off', 'shadow', 'enforce']);
+const noteEditMode = () => {
+  const m = String(process.env.LP_NOTE_EDIT_MODE || 'off').toLowerCase().trim();
+  return NOTE_EDIT_MODES.has(m) ? m : 'off';
+};
+const NOTE_COMPARE_COLUMNS = ['note_body', 'note_type', 'note_category', 'created_by_rep_name'];
 
 // ─── Skip counter for observability ──────────────────────────────
 // Read-once semantics: reading DRAINS the counter. src/sync-engine.js reads it
@@ -94,7 +114,12 @@ const skipUnchangedEnabled = () => process.env.SYNC_SKIP_UNCHANGED_CHILDREN !== 
 //     lp_jobs column from the LIVE payload, never from the stored one.
 //   • The keys inside it that anything downstream DOES read are compared
 //     individually, projected as scalars. See RAW_TRACKED_KEYS below.
-const VOLATILE_COLS = new Set(['synced_at', 'raw_lp_data']);
+// verified_at / verified_from join the volatile set for the same reason
+// synced_at is here: they change on every pass by construction, so comparing
+// them would make rowIsUnchanged() return false forever and the v7.5 skip —
+// the thing that took milestone writes from 2,111 per pass to near zero —
+// would silently stop working.
+const VOLATILE_COLS = new Set(['synced_at', 'raw_lp_data', ...FRESHNESS_VOLATILE_COLUMNS]);
 
 // Keys that live ONLY inside raw_lp_data and that something downstream reads.
 // The blob is excluded from the row comparison (above), so without these a
@@ -394,6 +419,29 @@ export async function syncNotes(lpLeadId, ghlContactId, notes) {
 
   const existingIds = await getExistingIds('lp_notes', 'lp_note_id', noteEntries.map(e => e.noteId));
 
+  // Load the comparable columns for rows that already exist, so an EDITED note
+  // can be detected. One read per lead, only for ids already on file, and only
+  // when the mode is on — off by default this block does nothing.
+  const existingNotes = new Map();
+  const nMode = noteEditMode();
+  if (nMode !== 'off' && existingIds.size > 0) {
+    const ids = noteEntries.map(e => e.noteId).filter(id => existingIds.has(id));
+    for (let i = 0; i < ids.length; i += 500) {
+      const { data, error } = await supabase.from('lp_notes')
+        .select(`lp_note_id, ${NOTE_COMPARE_COLUMNS.join(', ')}`)
+        .in('lp_note_id', ids.slice(i, i + 500));
+      // Fail OPEN: a failed read means we cannot prove an edit, so leave the
+      // rows alone. Treating an empty result as "no stored note" would rewrite
+      // every note on the lead from the payload — far worse than a missed edit.
+      if (error) {
+        console.warn(`[Sync] note edit read failed for lead ${lpLeadId}: ${error.message} — edit detection skipped this pass`);
+        existingNotes.clear();
+        break;
+      }
+      for (const r of data || []) existingNotes.set(r.lp_note_id, r);
+    }
+  }
+
   // 2026-07-29 echo-loop fix. A note the GHL→LP pipeline wrote onto the LP
   // prospect comes back to us here; without this stamp pushNotesToGHL sends it
   // straight back to the GHL contact it came from, wrapped in a "📋 LP Note"
@@ -419,11 +467,18 @@ export async function syncNotes(lpLeadId, ghlContactId, notes) {
   // may still want the original LP payload.
   const noteRowsById = new Map();
   for (const { note, noteId } of noteEntries) {
-    if (existingIds.has(noteId)) {
-      _childSkips.notes++;
-      continue;
-    }
     const noteBody = getField(note, 'note', 'notes', 'Notes', 'body', 'text', 'note_body', 'NoteBody', 'content', 'Content');
+    if (existingIds.has(noteId)) {
+      const stored = existingNotes.get(noteId);
+      const edited = stored && (
+        String(stored.note_body ?? '') !== String(noteBody ?? '')
+        || String(stored.note_type ?? '') !== String(getField(note, 'rectype', 'RecType', 'type', 'note_type') ?? '')
+      );
+      if (!edited) { _childSkips.notes++; continue; }
+      console.log(`[Sync] NOTE EDIT (${nMode}) ${noteId} on lead ${lpLeadId}: body changed in LP`);
+      if (nMode !== 'enforce') { _childSkips.notes++; continue; }
+      // falls through to the row build below, which upserts on lp_note_id
+    }
     noteRowsById.set(noteId, {
       lp_note_id:          noteId,
       lp_lead_id:          lpLeadId,
@@ -436,6 +491,7 @@ export async function syncNotes(lpLeadId, ghlContactId, notes) {
       created_by_rep_id:   getField(note, 'rep_id', 'agent', 'emp_id', 'EmpID'),
       created_at_lp:       lpDateToEastern(getField(note, 'date', 'Date', 'enteredon', 'EnteredOn', 'created_at')),
       synced_at:           new Date().toISOString(),
+      ...verifiedStamp(VERIFIED_FROM.LP),
       raw_lp_data:         note,
     });
   }
@@ -654,6 +710,7 @@ export async function syncJobAndMilestones(job, lpLeadId, ghlContactId, opts = {
     created_at_lp:   lpDateToEastern(getField(job, 'entrydate', 'EntryDate')),
     ...mapJobFields(job, existingJob || {}),
     synced_at:       new Date().toISOString(),
+    ...verifiedStamp(VERIFIED_FROM.LP),
     raw_lp_data:     job,
   };
 
@@ -813,6 +870,10 @@ export async function syncJobAndMilestones(job, lpLeadId, ghlContactId, opts = {
       // whose objects do not all carry the same keys.
       ...mapMilestoneChangeFields(ms),
       synced_at:   new Date().toISOString(),
+      // Spread, not a bare key: verifiedStamp() returns {} when disabled, and a
+      // constant shape when enabled, so every object in this bulk-upserted
+      // ARRAY still carries an identical key set (see the note above).
+      ...verifiedStamp(VERIFIED_FROM.LP),
     };
     if (suppressThisFire) {
       msRow.ghl_tag_fired = true;             // pre-mark so the sweeper skips it
