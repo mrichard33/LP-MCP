@@ -253,7 +253,7 @@
 import supabase from './supabase.js';
 import { sendGroupMeMessage } from './groupme.js';
 import { acquireToken, report429, withGhlToken } from './ghl-rate-limiter.js';
-import { generateResponse, getReplySenderAllowlist, isRandyName } from './response-generator.js';
+import { generateResponse, getReplySenderAllowlist, isRandyName, normalizeThreadSender } from './response-generator.js';
 // v3.18 — Bot Review Phase 0. Both are detached, fire-and-forget, never awaited.
 import { recordMessageContextDetached, markSentDetached } from './bot-feedback/fingerprint.js';
 import { judgeSentReplyDetached } from './bot-feedback/judge.js';
@@ -291,6 +291,9 @@ import {
 import { findNearDuplicate } from './services/message-similarity.js';
 import { checkNotSuperseded, commitAgenticSend } from './services/agentic-reply-locks.js';
 import { emitEvent } from './event-emitter.js';
+// 2026-09-18 — the decision-maker handoff writes its rep task as a GHL note
+// (GHL has no task API; see src/actions/handlers/tasks.js).
+import { addGHLNote } from './ghl.js';
 import { prerequisiteAskMessage } from './appointments/prerequisite-ask.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY || '';
@@ -356,16 +359,181 @@ const WEBHOOK_FOR_EMAIL = (process.env.GHL_SEND_EMAIL_VIA_WEBHOOK || 'false').to
 // ═══════════════════════════════════════════════════════════════════
 const AGENTIC_REPLY_FROM_EMAIL = String(process.env.AGENTIC_REPLY_FROM_EMAIL || 'mark@getreecewindows.com').trim().toLowerCase();
 const AGENTIC_REPLY_FROM_USER_ID = String(process.env.AGENTIC_REPLY_FROM_USER_ID || '').trim() || null;
-const AGENTIC_RANDY_EMAIL = String(process.env.AGENTIC_RANDY_EMAIL || 'randy@getreecewindows.com').trim().toLowerCase();
+
+// ─── 2026-09-18 — AGENTIC_RANDY_EMAIL IS A LIST, AND THE DEFAULTS ALWAYS APPLY.
+//
+// The 2026-09-02 fix above was correct and still fired on exactly one signal.
+// It just never matched. AGENTIC_RANDY_EMAIL held ONE address — the send
+// subdomain — while Randy's broadcast went out from the apex domain, so the
+// mailbox Catherine Crosier actually wrote to was not the mailbox the check
+// knew about. resolveEmailSender returned inbound_mailbox_continuity and her
+// reply went out FROM randy@getreecewindows.com, carrying Randy's GHL user id
+// 9YNXGEOajzmH9brXcLsy. See agent_actions 475065, 2026-09-18 21:40:05Z.
+//
+// Two changes, both defending the same thing:
+//   1. The var is now a COMMA-SEPARATED LIST. Randy sends from an apex and a
+//      send subdomain on two brand domains; one slot could never hold them.
+//   2. The defaults are MERGED IN, never replaced. Setting the env var adds to
+//      the list — it cannot shrink it. A single wrong value in Railway is what
+//      caused this incident, and it must not be able to cause it again.
+//
+// Matching stays exact, whole-address and case-insensitive. A prefix or domain
+// rule would catch unrelated mailboxes that merely start with "randy" — the
+// message history contains a real lead at randycundiff@gmail.com.
+const RANDY_MAILBOX_DEFAULTS = [
+  'randy@getreecewindows.com',
+  'randy@send.getreecewindows.com',
+  'randy@reecewindowsmail.com',
+  'randy@send.reecewindowsmail.com',
+];
+
+/** Split a comma/semicolon/whitespace-separated address list into clean lowercase entries. */
+function parseMailboxList(raw) {
+  return String(raw || '')
+    .split(/[,;\s]+/)
+    .map(a => a.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+const RANDY_MAILBOXES = new Set([
+  ...RANDY_MAILBOX_DEFAULTS,
+  ...parseMailboxList(process.env.AGENTIC_RANDY_EMAIL),
+]);
 
 /**
- * True only for Randy's broadcast mailbox — exact match, case-insensitive.
- * Deliberately NOT a prefix or domain match: every other Reece mailbox,
- * including a lead who happens to be called Randy, is not Randy. Pure.
+ * True for any of Randy's broadcast mailboxes — exact match on the whole
+ * address, case-insensitive. Deliberately NOT a prefix or domain match: every
+ * other Reece mailbox, including a lead who happens to be called Randy, is not
+ * Randy. Pure.
  */
 export function isRandyMailbox(addr) {
   const a = String(addr || '').trim().toLowerCase();
-  return !!a && a === AGENTIC_RANDY_EMAIL;
+  return !!a && RANDY_MAILBOXES.has(a);
+}
+
+/**
+ * LAST LINE OF DEFENCE, immediately before an email leaves the process.
+ *
+ * resolveEmailSender already reroutes a Randy thread, but it only sees the
+ * mailbox the lead wrote to. This sees the address that is actually about to
+ * be put on the wire, whatever produced it — sender continuity, a cached
+ * originator, a future code path nobody has written yet. If it is Randy's, it
+ * is replaced. Pure; the callers log and send.
+ *
+ * Returns { emailFrom, userId, blocked } — `blocked` is the original address
+ * when a swap happened, so the caller can log and record it on the row.
+ */
+export function enforceNonRandySender({ emailFrom = null, userId = null } = {}) {
+  if (!isRandyMailbox(emailFrom)) return { emailFrom, userId, blocked: null };
+  return {
+    emailFrom: AGENTIC_REPLY_FROM_EMAIL,
+    userId: AGENTIC_REPLY_FROM_USER_ID,
+    blocked: String(emailFrom).trim().toLowerCase(),
+  };
+}
+
+// ─── 2026-09-18 — MINIMUM DELAY BEFORE AN EMAIL REPLY ────────────────────
+//
+// An email answered in seconds reads as a machine. Mark's ruling: an email
+// reply waits at least EMAIL_REPLY_MIN_DELAY_MS (90s) from the moment the
+// lead's message ARRIVED — not from the moment generation happened to finish,
+// which is an accident of queue depth and says nothing about how the exchange
+// looks to the person reading it.
+//
+// SMS is deliberately untouched. A text answered quickly reads as attentive,
+// not automated, and the floor would only make the floor look slow.
+//
+// The wait is a DB deferral (status='pending' + retry_at), never an in-process
+// sleep. src/actions/send-message-flow.js records why: setTimeout reschedules
+// died on every Railway redeploy, so every deferral in this path is a row the
+// executor re-claims. The gate also sits BEFORE generation, so a deferred pass
+// costs no model call — and because it is computed from the inbound timestamp
+// it is idempotent: once the 90s have elapsed it never defers again, however
+// many times the action is retried.
+//
+// Dedup is unaffected. The deferral happens before any send, and the outbound
+// lock stays keyed to the inbound message_id via resolveTriggerId
+// (src/actions/index.js), so a re-claim that finds a prior delivery still
+// short-circuits on `already_sent`.
+const EMAIL_REPLY_MIN_DELAY_MS = parseInt(process.env.EMAIL_REPLY_MIN_DELAY_MS || '90000', 10);
+
+/**
+ * Should this email reply wait, and until when? Pure.
+ *
+ *   channel      resolved reply channel ('email' | 'sms' | 'livechat')
+ *   inboundAtMs  epoch ms the lead's inbound was received (NaN when unknown)
+ *   nowMs        epoch ms now
+ *   minDelayMs   floor; <= 0 disables the gate entirely
+ *
+ * Returns { defer, reason, retryAtMs }. An unknown inbound time NEVER defers —
+ * a read that cannot tell must not hold a reply hostage.
+ */
+export function decideEmailSendDelay({ channel, inboundAtMs, nowMs, minDelayMs = EMAIL_REPLY_MIN_DELAY_MS } = {}) {
+  if (channel !== 'email') return { defer: false, reason: 'not_email', retryAtMs: null };
+  if (!Number.isFinite(minDelayMs) || minDelayMs <= 0) return { defer: false, reason: 'disabled', retryAtMs: null };
+  if (!Number.isFinite(inboundAtMs)) return { defer: false, reason: 'inbound_time_unknown', retryAtMs: null };
+
+  const readyAtMs = inboundAtMs + minDelayMs;
+  if (Number.isFinite(nowMs) && nowMs >= readyAtMs) {
+    return { defer: false, reason: 'min_delay_elapsed', retryAtMs: null };
+  }
+  return { defer: true, reason: 'email_min_delay', retryAtMs: readyAtMs };
+}
+
+// ─── 2026-09-18 — A DECISION-MAKER MESSAGE NEVER GETS THE GENERIC FALLBACK ───
+//
+// Catherine Crosier wrote: "i am the main decision maker of the house hold they
+// would not make an appointment without my husband being at the appointment.
+// That is a shame you could have gotten some business bad decision on there
+// part." She was telling us the rule had cost us the job. The reply she got
+// back was "Thanks for reaching out — we want to make sure we get back to you
+// properly" (agent_actions 475065), which answers nobody.
+//
+// Under ALL DECISION MAKERS ATTEND this is the single most consequential thing
+// a lead can raise: it decides whether a visit happens and with whom. The
+// neutral fallback cannot hold that conversation, and sending it spends the
+// lead's patience on a message that says nothing. When generation fails on one
+// of these, a person takes it — a rep task and an ops card, not a form letter.
+//
+// Deliberately WIDE. A false positive costs one human glance at a lead who was
+// talking about their household anyway; a false negative is this incident
+// again. Pure — matching only, no I/O.
+const DECISION_MAKER_SIGNAL_PATTERNS = Object.freeze([
+  // Explicit authority claims.
+  /\b(?:main|primary|sole|only|the)\s+decision[\s-]?maker\b/i,
+  /\bdecision[\s-]?makers?\b/i,
+  /\bi\s+(?:make|handle|take care of)\s+(?:all\s+)?(?:the\s+)?decisions?\b/i,
+  /\bit'?s\s+my\s+call\b/i,
+  // Another party who will or will not be there.
+  /\b(?:my|our)\s+(?:husband|wife|spouse|partner|fianc[ée]e?|boyfriend|girlfriend|son|daughter|mother|father|mom|dad)\b/i,
+  /\bboth\s+(?:of\s+us|owners?|be\s+(?:there|home|present))\b/i,
+  /\b(?:he|she|they)\s+(?:won'?t|can'?t|cannot|will not)\s+be\s+(?:there|here|home|present|able)\b/i,
+  /\bwithout\s+(?:my|our|him|her|them)\b/i,
+  // Sole-ownership statements.
+  /\b(?:just|only)\s+me\b/i,
+  /\bi\s+(?:own|owns)\s+the\s+(?:house|home|property)\s+(?:alone|myself|by myself)\b/i,
+  /\bi\s+live\s+alone\b/i,
+  /\bi'?m\s+the\s+only\s+(?:one|owner)\b/i,
+  /\bon\s+the\s+deed\b/i,
+  // Needing to consult someone.
+  /\b(?:talk|speak|check)\s+(?:to|with)\s+(?:my|the)\s+(?:husband|wife|spouse|partner)\b/i,
+]);
+
+/**
+ * Does this inbound raise who owns the home or who makes the decision? Pure.
+ *
+ * @param {string} text  the lead's inbound message
+ * @returns {string[]} the matched fragments; empty means no decision-maker talk
+ */
+export function findDecisionMakerSignals(text) {
+  const body = String(text || '');
+  if (!body.trim()) return [];
+  const hits = [];
+  for (const rx of DECISION_MAKER_SIGNAL_PATTERNS) {
+    const m = body.match(rx);
+    if (m && !hits.includes(m[0])) hits.push(m[0]);
+  }
+  return hits;
 }
 
 /**
@@ -1271,11 +1439,18 @@ async function sendViaWebhook(contactId, message, channel, subject, action) {
   let replyFromAddress = rawReplyFromAddress;
   let threadOriginatorUserId = rawThreadOriginatorUserId;
   if (channel === 'email') {
-    const sender = resolveEmailSender({ inboundTo: rawReplyFromAddress, originatorUserId: rawThreadOriginatorUserId });
-    replyFromAddress = sender.emailFrom;
-    threadOriginatorUserId = sender.userId;
-    if (sender.reason === 'randy_thread_rerouted') {
-      console.log(`[SendMessage] 2026-09-02: Randy thread for ${contactId} (webhook path) — reply sender rerouted ${rawReplyFromAddress || 'unknown'} → ${sender.emailFrom}`);
+    const resolved = resolveEmailSender({ inboundTo: rawReplyFromAddress, originatorUserId: rawThreadOriginatorUserId });
+    // 2026-09-18 — last look before the wire, same guard as the Conv API path.
+    const guarded = enforceNonRandySender(resolved);
+    replyFromAddress = guarded.emailFrom;
+    threadOriginatorUserId = guarded.userId;
+    if (guarded.blocked) {
+      console.warn(
+        `[SendMessage] randy_sender_blocked_at_send: ${contactId} (webhook path) — resolver returned ` +
+        `${guarded.blocked} (reason=${resolved.reason}); sending as ${replyFromAddress || 'workflow default'} instead`
+      );
+    } else if (resolved.reason === 'randy_thread_rerouted') {
+      console.log(`[SendMessage] 2026-09-02: Randy thread for ${contactId} (webhook path) — reply sender rerouted ${rawReplyFromAddress || 'unknown'} → ${resolved.emailFrom}`);
     }
   }
 
@@ -1365,6 +1540,8 @@ async function sendViaWebhook(contactId, message, channel, subject, action) {
  * behavior — same as v3.10. No regression.
  */
 async function sendViaConversationsAPI(contactId, message, channel, subject, opts = {}) {
+  // Set by the send-time Randy guard below (email only); recorded on the result.
+  let randySenderBlockedAtSend = null;
   const searchData = await ghlFetch('GET',
     `/conversations/search?locationId=${GHL_LOCATION_ID}&contactId=${contactId}`);
   const conversations = Array.isArray(searchData)
@@ -1435,7 +1612,17 @@ async function sendViaConversationsAPI(contactId, message, channel, subject, opt
     // 2026-09-02 — never send as Randy. See resolveEmailSender (module top).
     // Keyed solely on the mailbox the lead wrote to; the thread-sender
     // classifier deliberately has no say over the sender.
-    const sender = resolveEmailSender({ inboundTo: replyFromAddr, originatorUserId });
+    const resolved = resolveEmailSender({ inboundTo: replyFromAddr, originatorUserId });
+    // 2026-09-18 — last look before the wire. See enforceNonRandySender.
+    const guarded = enforceNonRandySender(resolved);
+    const sender = { ...resolved, emailFrom: guarded.emailFrom, userId: guarded.userId };
+    if (guarded.blocked) {
+      randySenderBlockedAtSend = guarded.blocked;
+      console.warn(
+        `[SendMessage] randy_sender_blocked_at_send: ${contactId} — resolver returned ` +
+        `${guarded.blocked} (reason=${resolved.reason}); sending as ${sender.emailFrom || 'GHL default'} instead`
+      );
+    }
     if (sender.userId) {
       msgBody.userId = sender.userId;
     }
@@ -1497,6 +1684,9 @@ async function sendViaConversationsAPI(contactId, message, channel, subject, opt
     conversationId,
     messageId: result?.messageId || result?.id || null,
     status: result?.status || 'sent',
+    // 2026-09-18 — durable evidence that the send-time Randy guard fired.
+    // Railway logs roll off; the action row does not.
+    ...(randySenderBlockedAtSend ? { randySenderBlocked: randySenderBlockedAtSend } : {}),
     // 2026-08-14 — durable audit trail for reply-all. Railway logs roll off;
     // execution_result does not. Absent for non-email and for plain replies
     // with nobody else on the thread.
@@ -2630,6 +2820,35 @@ export async function executeSendMessage(action, context) {
     };
   }
 
+  // ── Minimum email reply delay (2026-09-18) ──
+  // Anchored on when the lead's message ARRIVED. sourceEventMeta.created_at is
+  // the inbound system_events row; newestInboundAt is the fallback when the
+  // source event could not be read. See decideEmailSendDelay (module top).
+  const inboundAtIso = sourceEventMeta?.created_at || newestInboundAtPre || null;
+  const emailDelay = decideEmailSendDelay({
+    channel,
+    inboundAtMs: inboundAtIso ? Date.parse(inboundAtIso) : NaN,
+    nowMs: Date.now(),
+  });
+  if (emailDelay.defer) {
+    const retryAt = new Date(emailDelay.retryAtMs).toISOString();
+    console.log(
+      `[SendMessage] ⏳ email min delay: ${contactId} inbound at ${inboundAtIso} — ` +
+      `holding until ${retryAt} (${EMAIL_REPLY_MIN_DELAY_MS}ms floor)`
+    );
+    return {
+      deferred: true,
+      reason: 'email_min_delay',
+      retry_at: retryAt,
+      contact_id: contactId,
+      channel,
+      inbound_at: inboundAtIso,
+    };
+  }
+  if (channel === 'email' && emailDelay.reason === 'inbound_time_unknown') {
+    console.warn(`[SendMessage] email min delay skipped for ${contactId} — inbound time unreadable; sending now rather than holding a reply on a read that could not tell`);
+  }
+
   // Livechat replies are generated with SMS constraints (short,
   // conversational, one question) — the widget is a chat surface.
   const generationChannel = channel === 'livechat' ? 'sms' : channel;
@@ -2792,9 +3011,100 @@ export async function executeSendMessage(action, context) {
       fallbackError = generationErr;
       generated = null; // ensure downstream metadata reflects "no AI generation"
 
+      // ── 2026-09-18 — a decision-maker message is NEVER answered by the
+      // fallback. See findDecisionMakerSignals (module top). The neutral copy
+      // cannot hold this conversation, so a person takes it: a rep task on the
+      // contact and an ops card, then hand off. No message is sent from here —
+      // the lead is better served by silence and a callback than by a form
+      // letter that ignores what they said.
+      const dmSignals = findDecisionMakerSignals(replyTriggerMessage || triggerMessage);
+      if (dmSignals.length) {
+        console.error(
+          `[SendMessage] ⛔ generation failed on a DECISION-MAKER message for ${contactId} ` +
+          `(signals: ${dmSignals.join(', ')}) — routing to a human instead of the fallback`
+        );
+
+        const handoffTags = await applyContactTags(contactId, [CALLBACK_TAG_SALES]);
+
+        // The rep task IS a GHL note — GHL has no task API, so create_task
+        // writes a note plus a notification (src/actions/handlers/tasks.js).
+        // Written here rather than queued so the task exists on merge: the
+        // event below needs an agent_rule to consume it, and a rule is DB
+        // config that ships separately. Fail-soft — the ops card and the
+        // handoff tag still land if the note write fails.
+        addGHLNote(
+          contactId,
+          `[AGENT TASK] Decision-maker reply needs a person.\n` +
+          `They said: "${String(replyTriggerMessage || triggerMessage || '').slice(0, 400)}"\n` +
+          `AI generation failed (${generationErr.message.slice(0, 150)}), and the generic ` +
+          `fallback was deliberately NOT sent — it cannot hold this conversation.\n` +
+          `Per ALL DECISION MAKERS ATTEND: acknowledge what they said without arguing, confirm ` +
+          `whether anyone else is on the home, and offer a time that works for everyone or the ` +
+          `15-minute call with both on speaker. Do not push if they have already refused.`
+        ).catch(err => console.warn(`[SendMessage] decision-maker rep task note failed for ${contactId}: ${err.message}`));
+
+        // Also emitted so a rule can pick this up for reporting or routing.
+        emitEvent({
+          event_type: 'agentic.decision_maker_handoff',
+          source_system: 'send_message_handler',
+          ghl_contact_id: contactId,
+          priority: 'high',
+          idempotency_key: `dm_handoff_${action.id}`,
+          payload: {
+            contact_id: contactId,
+            channel,
+            action_id: action.id,
+            rule_applied: action.rule_applied || null,
+            signals: dmSignals,
+            inbound_preview: String(replyTriggerMessage || triggerMessage || '').slice(0, 300),
+            generation_error: generationErr.message.slice(0, 300),
+          },
+        }).catch(err => console.warn(`[SendMessage] decision-maker handoff event failed: ${err.message}`));
+
+        // Operational alarm — the ops bot, mirrored to SLACK_CHANNEL_OPS. This
+        // is the one reply-path alert that does NOT belong on the default
+        // channel: nobody is going to reply to this lead until a person sees it.
+        sendGroupMeMessage(
+          `🛑 DECISION-MAKER MESSAGE — AI FAILED, NO REPLY SENT\n` +
+          `Contact: ${contactId}\n` +
+          `Channel: ${channel.toUpperCase()}\n` +
+          `Rule: ${action.rule_applied || 'manual'}\n` +
+          `They said: "${String(replyTriggerMessage || triggerMessage || '').slice(0, 200)}"\n` +
+          `Error: ${generationErr.message.slice(0, 150)}\n` +
+          `→ Needs a person. The generic fallback was deliberately NOT sent.`,
+          { channel: 'ops' }
+        ).catch(err => console.warn(`[SendMessage] ops alert (decision-maker handoff) failed: ${err.message}`));
+
+        return {
+          action: 'send_message_handed_off',
+          contact_id: contactId,
+          channel,
+          reason: 'decision_maker_message_generation_failed',
+          decision_maker_signals: dmSignals,
+          handoff_tag: CALLBACK_TAG_SALES,
+          tags_applied: handoffTags ? [CALLBACK_TAG_SALES] : [],
+          _fallback_send: false,
+          _generation_error: generationErr.message.slice(0, 300),
+        };
+      }
+
       // Safe fallback copy (src/ai-fallback.js) — neutral, opens the door,
       // triggers no compliance gates.
-      const fb = buildAiFallback(generationChannel, subject);
+      //
+      // 2026-09-18 — on a Randy thread it takes the bridge variant. Catherine
+      // Crosier had replied to a Randy broadcast and got the cold opener back
+      // (agent_actions 475065), which reads as a different company answering.
+      // Without a model this path cannot paraphrase her point, so the variant
+      // bridges generically — but it never opens cold.
+      const fbThreadSender = normalizeThreadSender(threadSenderType ?? 'rep');
+      const fbRandyThread = channel === 'email' && fbThreadSender.type === 'randy';
+      const fb = buildAiFallback(generationChannel, subject, {
+        randyThread: fbRandyThread,
+        bridgeName: fbThreadSender.name || 'Randy',
+      });
+      if (fbRandyThread) {
+        console.log(`[SendMessage] fallback for ${contactId} uses the ${fbThreadSender.name || 'Randy'} bridge variant`);
+      }
       message = fb.message;
       subject = fb.subject;
 
@@ -3459,6 +3769,10 @@ export async function executeSendMessage(action, context) {
     //   SELECT execution_result->>'email_from' FROM agent_actions WHERE ...
     email_from: sendResult?.emailFrom || null,
     email_user_id: sendResult?.emailUserId || null,
+    // 2026-09-18 — non-null only when the send-time guard had to swap a Randy
+    // address out. A row carrying this means the resolver missed and the net
+    // caught it; that is worth knowing before the next mailbox is added.
+    randy_sender_blocked: sendResult?.randySenderBlocked || null,
     ai_generated: !!generated,
     intent_class: generated?.intent_class || null,
     classifier_method: generated?.classification_method || null,
@@ -3494,4 +3808,10 @@ export const _internal = {
   // 2026-09-02 — never send as Randy.
   resolveEmailSender,
   isRandyMailbox,
+  // 2026-09-18 — the send-time net underneath the resolver.
+  enforceNonRandySender,
+  // 2026-09-18 — the 90s floor on email replies.
+  decideEmailSendDelay,
+  // 2026-09-18 — a decision-maker message is never answered by the fallback.
+  findDecisionMakerSignals,
 };

@@ -561,8 +561,24 @@ export function assertBookingPrerequisites(state, opts = {}) {
   // via service_area_zips and never block).
   if (!id.address_line1) missing.push('address');
   if (!id.postal_code) missing.push('zip');
+  // 2026-09-18 — ALL DECISION MAKERS ATTEND (Mark's ruling). Until this date
+  // the gate only asked whether the QUESTION had been put. That let an
+  // answered-"No" — a partner exists and will not be there — satisfy the gate
+  // and clear the way for a slot offer to one person, which is exactly what the
+  // new policy forbids. Having asked is now the FIRST bar, not the only one:
+  // the answer must also be favourable (decision_maker_confirmed === true,
+  // which covers both "Yes, all present" and "Solo Owner").
+  //
+  // Only ONE decision-maker key is ever pushed, so the ask resolver still gets
+  // a single unambiguous next question.
+  //
+  // Scope: consulted only where requires_in_home_gate is true. The 15-minute
+  // phone call with both parties on speaker is deliberately NOT gated — it is
+  // the alternative the policy offers when schedules will not line up, and
+  // gating it would remove the way out of the very problem it solves.
   const dmAsked = id.decision_maker_question_asked || id.decision_maker_confirmed !== 'unknown';
   if (!dmAsked) missing.push('decision_maker_question');
+  else if (id.decision_maker_confirmed !== true) missing.push('decision_maker_unresolved');
   if (!id.phone) missing.push('phone');
 
   const emailAsked = tags.includes(EMAIL_ASKED_TAG);

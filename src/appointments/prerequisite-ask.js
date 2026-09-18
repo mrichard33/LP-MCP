@@ -47,6 +47,10 @@ export const PREREQUISITE_ASK_ORDER = Object.freeze([
   'address',
   'zip',
   'decision_maker_question',
+  // 2026-09-18 — asked, but the answer says someone will be missing or nobody
+  // is sure. Ranked immediately after the first ask: it is the same subject,
+  // one step further on, and it blocks a slot offer for the same reason.
+  'decision_maker_unresolved',
   'phone',
 ]);
 
@@ -64,7 +68,8 @@ export const PREREQUISITE_ASK_INSTRUCTION = Object.freeze({
   name: 'their name ("So I can get this set up right — who do I have the pleasure of speaking with?")',
   address: 'the property address INCLUDING zip code ("What\'s the address of the home we\'d be looking at — street and zip?") — the zip is how we confirm they\'re in our service area',
   zip: 'the zip code of the property ("And what\'s the zip there? Just want to confirm you\'re in our service area.")',
-  decision_maker_question: 'decision-maker presence ("Will everyone who\'s part of the decision be home for the visit?")',
+  decision_maker_question: 'decision-maker presence ("Is there anyone else on the home with you, or anyone else who\'d weigh in?")',
+  decision_maker_unresolved: 'a time that works for EVERYONE who\'s part of the decision — they have told you someone will be missing or that they are not sure. Acknowledge that without arguing, give the one-line reason (our specialist prices the openings on the spot and nobody should have to relay that secondhand), then offer to find a time that suits both. If schedules genuinely will not line up, offer the 15-minute phone call with both of them on speaker. Do NOT offer an in-home slot for one person',
   phone: 'the best phone number to reach them',
 });
 
@@ -76,7 +81,8 @@ export const PREREQUISITE_ASK_MESSAGE = Object.freeze({
   name: "So I can get this set up right, who do I have the pleasure of speaking with?",
   address: "What's the address of the home we'd be looking at, including the zip?",
   zip: "And what's the zip there? Just want to confirm you're in our service area.",
-  decision_maker_question: "Will everyone who's part of the decision be home for the visit?",
+  decision_maker_question: "Is there anyone else on the home with you, or anyone else who'd weigh in?",
+  decision_maker_unresolved: "Happy to work around both your schedules. What day tends to work best for the two of you?",
   phone: "What's the best phone number to reach you?",
 });
 

@@ -277,7 +277,7 @@
     "label": "Randy broadcast bridge, exact opener wording",
     "target": "framing",
     "kind": "interpolated",
-    "probe": "asked me to reach out personally after seeing your message.\" Then continue in rep/company (we/our team) voice."
+    "probe": "asked me to reach out because you mentioned [their point].\" Replace [their point] with the specific thing THIS lead just said"
   },
   {
     "id": "L1776",

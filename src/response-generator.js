@@ -331,7 +331,13 @@ export const RESPONSE_GENERATOR_VERSION = 'v2.7.14';
 // `response_generator` fn key (customer_facing group). Legacy
 // RESPONSE_GENERATOR_MODEL is still honored by the client for Anthropic
 // back-compat.
-const MAX_TOKENS = parseInt(process.env.RESPONSE_GENERATOR_MAX_TOKENS || '2000', 10);
+// 2026-09-18 — raised 2000 → 8000 (Catherine Crosier, agent_actions 475065).
+// On a thinking model the reply's budget is shared with the model's reasoning,
+// and 2000 was consumed entirely before a single word of the reply was written,
+// so every generation threw and shipped the generic ai-fallback copy instead.
+// resolveMaxTokens() in src/llm-client.js now enforces a floor underneath this
+// for any thinking model, so this number can only ever raise the budget.
+const MAX_TOKENS = parseInt(process.env.RESPONSE_GENERATOR_MAX_TOKENS || '8000', 10);
 const PROMPT_TIMEZONE = process.env.REECE_TIMEZONE || 'America/New_York';
 
 // v2.7.4: how many recent edits to inject as in-context learning examples.
@@ -2196,6 +2202,80 @@ export function findBadEmailDirections(message, { contactEmail = null, allowed =
   return violations;
 }
 
+// ─── Randy bridge guard (2026-09-18 — Catherine Crosier incident) ────────
+//
+// A lead who replies to a Randy broadcast is answering RANDY. A reply that
+// opens cold, as though the thread began with us, reads as a different company
+// entirely — and the prompt's bridge instruction was only ever an instruction.
+// On 2026-09-18 the generation failed outright and the generic ai-fallback copy
+// went out on a Randy thread (agent_actions 475065), which is the same failure
+// with the prompt removed: no bridge, and no sign the lead's message was read.
+//
+// So the bridge is now CHECKED, not merely asked for, and the check has three
+// parts because a bridge can fail three different ways:
+//   1. Randy is not named in the opening at all — the lead has no idea why a
+//      stranger is writing.
+//   2. Randy is named but the handoff is not stated — reads as Randy writing.
+//   3. The bridge is there but generic — it does not name what the lead said,
+//      so it lands as a form letter answering nobody.
+//
+// The window is the OPENING, not the whole message: a bridge buried in
+// paragraph three is not a bridge. Pure — the caller throws.
+
+/** "asked me to reach out" and its honest variants. */
+const RANDY_BRIDGE_HANDOFF_RX =
+  /\b(?:asked|had|wanted)\s+me\s+to\s+(?:reach\s+out|get\s+in\s+touch|follow\s+up|connect|pick\s+this\s+up|answer|help)|\bpassed\s+(?:your|this|it)\s*(?:note|message|reply|email|along|on)/i;
+
+/**
+ * Naming what the lead ACTUALLY SAID, not merely that they wrote.
+ *
+ * "after seeing your message" is deliberately NOT a match. That was the old
+ * prompt's verbatim bridge, and it is the generic form this guard exists to
+ * reject: it proves an email arrived, not that anyone read it. What counts is
+ * a construct that has to be followed by their content.
+ */
+const RANDY_BRIDGE_REFERENCE_RX =
+  /\byou\s+(?:mentioned|said|wrote|asked|told|brought\s+up|raised|noted|flagged|pointed\s+out|let\s+(?:us|me)\s+know)\b|\byour\s+(?:point|question|concern)\b|\b(?:because|since)\s+you\b/i;
+
+/** How much of the message counts as "the opening". */
+const RANDY_BRIDGE_OPENING_CHARS = 320;
+
+/**
+ * Does this draft open with the Randy handoff bridge? Pure.
+ *
+ *   message     the generated reply body
+ *   bridgeName  the broadcast signer being bridged from (normally 'Randy');
+ *               null/empty means this is not a bridged thread and nothing is
+ *               checked
+ *
+ * @returns {string[]} problems; empty means the bridge is present and specific
+ */
+export function findMissingRandyBridge(message, { bridgeName = null } = {}) {
+  const name = String(bridgeName || '').trim();
+  if (!name) return [];
+
+  const body = String(message || '');
+  // The opening is the first two sentences, or RANDY_BRIDGE_OPENING_CHARS,
+  // whichever reaches further — a short first line must not shrink the window
+  // below a legitimate bridge.
+  const sentences = body.split(/(?<=[.!?])\s+/).slice(0, 2).join(' ');
+  const opening = (sentences.length > RANDY_BRIDGE_OPENING_CHARS ? sentences : body.slice(0, RANDY_BRIDGE_OPENING_CHARS));
+
+  const problems = [];
+  const namePattern = new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+  if (!namePattern.test(opening)) {
+    problems.push(`opening does not name ${name}`);
+    return problems; // the other two checks are meaningless without the name
+  }
+  if (!RANDY_BRIDGE_HANDOFF_RX.test(opening)) {
+    problems.push(`opening names ${name} but does not say ${name} asked us to reach out`);
+  }
+  if (!RANDY_BRIDGE_REFERENCE_RX.test(opening)) {
+    problems.push('bridge does not name what the lead actually said');
+  }
+  return problems;
+}
+
 function assertNoBadEmailDirections(message, contactId, contactEmail) {
   const bad = findBadEmailDirections(message, {
     contactEmail,
@@ -3198,6 +3278,41 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // reply, and it is never one with raw template syntax in it.
   assertNoUnresolvedTokens(validated.message, contactId);
 
+  // ─── Randy bridge guard (2026-09-18 — Catherine Crosier incident) ───
+  //
+  // The prompt asks for the bridge; this makes shipping without it impossible.
+  // Throwing hands control to the retry-then-safe-fallback loop in
+  // send-message-handler, which regenerates once with the note below and, if
+  // that also fails, sends the Randy variant of the fallback copy — so a
+  // Randy thread can never receive a reply that opens as though we started it.
+  //
+  // Suppressed on escalate_to_rep for the same reason the prompt suppresses it
+  // (emailBridgeSuppressedByEscalation): a two-sentence acknowledgment has no
+  // room for a handoff preamble, and demanding both hands the model
+  // contradictory openers.
+  if (channel === 'email' && opts.recommendedAction !== 'escalate_to_rep') {
+    const { senderName: bridgeSender, bridgeName } = resolveEmailSender(opts.threadSenderType);
+    if (bridgeName && bridgeSender) {
+      const bridgeProblems = findMissingRandyBridge(validated.message, { bridgeName });
+      if (bridgeProblems.length) {
+        console.error(`[ResponseGenerator] ⛔ missing ${bridgeName} bridge for ${contactId}: ${bridgeProblems.join('; ')}`);
+        const err = new Error(`missing_randy_bridge: ${bridgeProblems.join('; ')}`);
+        // Carried on the error, not mutated onto opts — send-message-handler
+        // builds a fresh opts literal per attempt (see the repeat-ask guard).
+        // The note states the SHAPE and the reason, so the retry does not have
+        // to infer what "bridge" means.
+        err.regenerationNote =
+          `Your previous draft did not open with the handoff bridge: ${bridgeProblems.join('; ')}. ` +
+          `This lead is replying to an email signed by ${bridgeName}, so a cold opening reads as a different company. ` +
+          `Open with "${bridgeSender} here — ${bridgeName} asked me to reach out because you mentioned [their point]", ` +
+          `replacing [their point] with the specific thing this lead just said, paraphrased in one short clause in your ` +
+          `own words. Do not write "your message" or "your email" as the stand-in — name the actual point. ` +
+          `${bridgeName} is referred to in the third person and never authors the reply.`;
+        throw err;
+      }
+    }
+  }
+
   // ─── Repeat-ask guard (2026-09-11 — Alfredo Fontan incident) ───
   //
   // The ESTABLISHED block tells the model the question is closed. This makes
@@ -3353,11 +3468,29 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
 
     const inHome = isInHomeCalendarId(targetCalId);
     if (inHome) {
-      // In-home: ALWAYS book — status tracks decision-maker confirmation.
-      // 'confirmed' only when decision-makers are confirmed (Yes | Solo Owner),
-      // else 'new' (tentative; a human confirms). No hold, no dm-pending tag.
+      // In-home: status tracks decision-maker confirmation. 'confirmed' only
+      // when decision-makers are confirmed (Yes | Solo Owner), else 'new'
+      // (tentative; a human confirms).
       const dm = cap.qualifying_data?.decision_makers_present;
       cap.status = (dm === 'Yes' || dm === 'Solo Owner') ? 'confirmed' : 'new';
+
+      // 2026-09-18 — ALL DECISION MAKERS ATTEND (Mark's ruling). The model is
+      // not allowed to book an in-home visit for one person while the
+      // decision-maker question is open. Until this date the comment above
+      // read "ALWAYS book" and an unresolved answer merely downgraded the
+      // STATUS, so a one-legger visit still landed on the calendar and a rep
+      // still drove out to a house where the decision could not be made.
+      //
+      // Dropping the companion is not dropping the lead: the gate above has
+      // already suppressed slots and the booking link for this turn, and the
+      // prompt block tells the model to ask about the other decision maker
+      // instead. The phone-call calendars are untouched (they take the `else`
+      // branch) because the 15-minute call with both on speaker is the
+      // alternative this policy offers, not something it blocks.
+      if (bookingGate && bookingGate.missing.includes('decision_maker_unresolved')) {
+        console.log(`[ResponseGenerator] ⛔ in-home book_appointment dropped for ${contactId} — decision-maker question unresolved (dm="${dm ?? 'absent'}")`);
+        validated.companion_action = null;
+      }
     } else {
       // Phone calendars (PPR, Confirmation Call): no decision-maker concept —
       // strip qualifying_data so we never write a spurious DM value for a call.

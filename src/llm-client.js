@@ -19,6 +19,8 @@
  *   LLM_MODEL_ANTHROPIC     default Anthropic model (default: claude-sonnet-4-6)
  *   LLM_MODEL_OPENAI        default OpenAI model    (default: gpt-5.4-mini)
  *   LLM_TIMEOUT_MS          per-call timeout ms     (default: 30000)
+ *   LLM_THINKING_MIN_MAX_TOKENS  floor on max_tokens for thinking models
+ *                           (default: 8000) — see the token-starvation note below
  *   ANTHROPIC_VERSION       anthropic-version header (default: 2023-06-01)
  *   ANTHROPIC_API_KEY / OPENAI_API_KEY   provider credentials
  *
@@ -187,6 +189,45 @@ function anthropicRejectsSampling(model) {
   return /^claude-(opus-(5|4-7|4-8)|sonnet-5|fable-5|mythos-5)/i.test(String(model || ''));
 }
 
+// 2026-09-18 — EXTENDED-THINKING TOKEN STARVATION (Catherine Crosier incident).
+// The newer Anthropic families think before they answer, and every thinking
+// token is spent out of the SAME max_tokens budget as the reply. On
+// claude-sonnet-5 the reply writer's 2000-token budget and the analyzer's
+// hardcoded 500 were both consumed entirely by thinking blocks, so the API
+// returned a 200 carrying blocks=[thinking] and no text at all. The
+// empty-completion guard below turned that into an error, correctly — but the
+// error is the SYMPTOM. The cause is a budget written for a model that did not
+// think, left in place when the model was repointed at one that does.
+//
+// Cost: ghl_contact_id WMDdZiYWnEM4AFta5Gg3, 2026-09-18. agent_actions 475065
+// shipped the generic ai-fallback copy because response_generator returned no
+// text; system_events 3781516 / 3781525 / 3781535 are the same failure in
+// message_analyzer, three times, which is why the analyzer went silent and the
+// backstop rule had to write the reply. This was NOT specific to one contact —
+// every AI reply on this model was falling back.
+//
+// A per-call-site number will fall behind the next family exactly the way the
+// temperature list did (see above), so the floor is enforced HERE, once, for
+// every caller present and future. A caller that asks for more still gets more;
+// the floor only ever raises.
+const THINKING_MIN_MAX_TOKENS = parseInt(process.env.LLM_THINKING_MIN_MAX_TOKENS || '8000', 10);
+
+/** True for Anthropic families that spend max_tokens on thinking before text. */
+export function modelUsesThinkingBudget(model) {
+  return /^claude-(opus-(5|4-7|4-8)|sonnet-5|fable-5|mythos-5)/i.test(String(model || ''));
+}
+
+/**
+ * Final max_tokens for a call. Pure. Raises a thinking model's budget to the
+ * floor so the reply is not starved by the model's own reasoning; leaves every
+ * other model, and any caller already asking for more, exactly as requested.
+ */
+export function resolveMaxTokens(model, requested) {
+  const asked = Number.isFinite(requested) ? requested : 500;
+  if (!modelUsesThinkingBudget(model)) return asked;
+  return Math.max(asked, THINKING_MIN_MAX_TOKENS);
+}
+
 /** The 400 body Anthropic returns when a sampling parameter is not supported. */
 function isSamplingRejection(status, text) {
   return status === 400 && /temperature|top_p|top_k/i.test(String(text || ''));
@@ -323,7 +364,12 @@ export async function callLLM({ fn, system = null, user = null, messages = null,
   const msgs = messages || (user != null ? [{ role: 'user', content: user }] : []);
   if (!msgs.length) throw new Error(`[LLMClient:${fn}] no messages/user provided`);
 
-  const args = { model, system, messages: msgs, maxTokens, temperature, json, fn };
+  const effectiveMaxTokens = resolveMaxTokens(model, maxTokens);
+  if (effectiveMaxTokens !== maxTokens) {
+    console.log(`[LLMClient:${fn}] ${model} thinks against its output budget — max_tokens raised ${maxTokens} → ${effectiveMaxTokens}`);
+  }
+
+  const args = { model, system, messages: msgs, maxTokens: effectiveMaxTokens, temperature, json, fn };
   return withTimeout(
     provider === 'openai' ? callOpenAI(args) : callAnthropic(args),
     LLM_TIMEOUT_MS + 2000,
