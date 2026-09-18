@@ -29,6 +29,9 @@ import {
   phone10, zipKey, lastNameKey, classifyTierOne, buildTier3Rows,
 } from '../src/lp-link-match.js';
 import { shouldAlertLinkLeak, formatLinkLeakAlert } from '../src/link-leak-alerts.js';
+import {
+  buildLeadLinkUpdate, buildLeadLinkReadback, buildJobsLinkUpdate, buildJobsLinkCount,
+} from '../src/lp-link-write-sql.js';
 
 const lead = (lp_lead_id, has_job, lp_prospect_id = '39362', extra = {}) =>
   ({ lp_lead_id: String(lp_lead_id), lp_prospect_id: String(lp_prospect_id), has_job, ...extra });
@@ -257,4 +260,58 @@ test('no tables measured at all is insufficient_evidence, not healthy', () => {
     shouldAlertLinkLeak({ windowHours: 24, readOk: true, tables: {} }).verdict,
     'insufficient_evidence',
   );
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// The write statements — shape only, but the shape is what broke
+// ═══════════════════════════════════════════════════════════════════
+
+test('the lead write is a BARE UPDATE, never a data-modifying CTE', () => {
+  // 2026-09-18: all 42 live writes were refused with "WITH clause containing a
+  // data-modifying statement must be at the top level". runSQL wraps any
+  // statement beginning with SELECT or WITH (sql/run_sql.sql), which pushes the
+  // CTE below the top level. CLAUDE.md's `WITH u AS (... RETURNING 1)` idiom is
+  // correct for the MCP tool and wrong here — this pins the difference.
+  const sql = buildLeadLinkUpdate('131185', 'ZbJFTZNhvzHJRQ3MHXmX', 'phone10_repair');
+  assert.match(sql.trimStart(), /^UPDATE\b/);
+  assert.doesNotMatch(sql, /\bWITH\b/i);
+  assert.doesNotMatch(sql, /\bRETURNING\b/i);
+});
+
+test('the jobs write is a bare UPDATE too', () => {
+  const sql = buildJobsLinkUpdate('131185', 'ZbJFTZNhvzHJRQ3MHXmX');
+  assert.match(sql.trimStart(), /^UPDATE\b/);
+  assert.doesNotMatch(sql, /\bWITH\b/i);
+});
+
+test('every write carries the IS NULL race guard', () => {
+  // The live 15-minute sync runs while the repair does. A lead linked between
+  // our read and our write must be left alone — the one outcome the rollback
+  // log could not undo.
+  for (const sql of [
+    buildLeadLinkUpdate('1', 'ZbJFTZNhvzHJRQ3MHXmX', 'phone10_repair'),
+    buildJobsLinkUpdate('1', 'ZbJFTZNhvzHJRQ3MHXmX'),
+  ]) {
+    assert.match(sql, /AND ghl_contact_id IS NULL/);
+  }
+});
+
+test('the lead write always sets ghl_link_source alongside the id', () => {
+  // A populated ghl_contact_id must never sit next to a NULL source.
+  const sql = buildLeadLinkUpdate('1', 'ZbJFTZNhvzHJRQ3MHXmX', 'phone10_repair');
+  assert.match(sql, /ghl_contact_id = 'ZbJFTZNhvzHJRQ3MHXmX'/);
+  assert.match(sql, /ghl_link_source = 'phone10_repair'/);
+});
+
+test('readback and count are plain SELECTs the RPC can wrap', () => {
+  assert.match(buildLeadLinkReadback('1').trimStart(), /^SELECT\b/);
+  assert.match(buildJobsLinkCount('1', 'ZbJFTZNhvzHJRQ3MHXmX').trimStart(), /^SELECT\b/);
+  // Aliased, because the RPC returns [{n: 3}] — an unaliased count(*) would
+  // come back under a key the caller does not read.
+  assert.match(buildJobsLinkCount('1', 'ZbJFTZNhvzHJRQ3MHXmX'), /count\(\*\) AS n/);
+});
+
+test("a lp_lead_id containing a quote cannot break out of the literal", () => {
+  const sql = buildLeadLinkUpdate("O'Brien", 'ZbJFTZNhvzHJRQ3MHXmX', 'phone10_repair');
+  assert.match(sql, /lp_lead_id = 'O''Brien'/);
 });

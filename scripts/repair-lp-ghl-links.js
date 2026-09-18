@@ -104,6 +104,9 @@ import { ghlFetch } from '../src/actions/helpers.js';
 import { PIPELINE_IDS } from '../src/actions/constants.js';
 import { hlRunSQL } from '../src/admin/hl-client.js';
 import { shapeValidLognumber } from '../src/ghl-link-shape.js';
+import {
+  buildLeadLinkUpdate, buildLeadLinkReadback, buildJobsLinkUpdate, buildJobsLinkCount,
+} from '../src/lp-link-write-sql.js';
 import { runSQL } from '../src/admin/supabase-admin.js';
 import {
   phone10, zipKey, lastNameKey, classifyTierOne, buildTier3Rows,
@@ -291,47 +294,54 @@ function openLog() {
 /**
  * Write the link onto one lead and its jobs.
  *
- * Both statements carry `AND ghl_contact_id IS NULL`. The live 15-minute sync
- * runs while this does, so a lead legitimately linked between the read and the
- * write must be left alone — the guard turns that race into a reported no-op
- * instead of an overwrite, which is the one outcome nobody could undo from the
- * rollback log.
+ * The statements themselves live in src/lp-link-write-sql.js, pure and
+ * unit-tested, because their SHAPE is what broke on 2026-09-18: the
+ * CLAUDE.md `WITH u AS (... RETURNING 1)` row-count idiom is correct for the
+ * Supabase MCP tool and WRONG through this repo's runSQL, which wraps any
+ * SELECT/WITH statement and so pushes the CTE below the top level. All 42
+ * writes were refused. See that module's header for the full account.
  *
- * ghl_link_source is stamped in the same statement. A populated ghl_contact_id
- * must never sit next to a NULL source — that is what made the
- * Y21mrJPUGYGKIWFptVpu link untraceable (see src/sync-children.js, 2026-07-29).
+ * The outcome is READ BACK rather than inferred, because the RPC returns a
+ * status object for a non-SELECT and cannot report rows_affected.
+ *
+ * ghl_link_source is set in the same statement. A populated ghl_contact_id must
+ * never sit next to a NULL source — that is what made the Y21mrJPUGYGKIWFptVpu
+ * link untraceable (see src/sync-children.js, 2026-07-29).
  */
 async function writeLink(lpLeadId, contactId, source) {
   // Shape-check the id before it reaches a statement. Two jobs: it refuses a
   // malformed id that GHL's mirror should never have held, and it means the
-  // interpolation below cannot carry anything but 20 alphanumerics. Shape
-  // validity is NOT link validity (src/ghl-link-shape.js) — the phone match is
-  // what makes this a link; this is the floor, not the evidence.
+  // interpolation cannot carry anything but 20 alphanumerics. Shape validity is
+  // NOT link validity (src/ghl-link-shape.js) — the phone match is the
+  // evidence; this is the floor.
   if (!shapeValidLognumber(contactId)) {
     throw new Error(`refusing to write a malformed GHL contact id: ${JSON.stringify(contactId)}`);
   }
-  const leadRows = await runSQL(`
-    WITH u AS (
-      UPDATE lp_leads
-         SET ghl_contact_id = '${contactId}', ghl_link_source = '${String(source).replace(/'/g, "''")}'
-       WHERE lp_lead_id = '${String(lpLeadId).replace(/'/g, "''")}'
-         AND ghl_contact_id IS NULL
-      RETURNING 1
-    ) SELECT count(*) AS n FROM u
-  `);
-  const leadsUpdated = Number(leadRows?.[0]?.n || 0);
-  if (leadsUpdated === 0) return { leadsUpdated: 0, jobsUpdated: 0 };
 
-  const jobRows = await runSQL(`
-    WITH u AS (
-      UPDATE lp_jobs
-         SET ghl_contact_id = '${contactId}'
-       WHERE lp_lead_id = '${String(lpLeadId).replace(/'/g, "''")}'
-         AND ghl_contact_id IS NULL
-      RETURNING 1
-    ) SELECT count(*) AS n FROM u
-  `);
-  return { leadsUpdated, jobsUpdated: Number(jobRows?.[0]?.n || 0) };
+  await runSQL(buildLeadLinkUpdate(lpLeadId, contactId, source));
+
+  const after = await runSQL(buildLeadLinkReadback(lpLeadId));
+  const landed = Array.isArray(after) && after.length ? (after[0].ghl_contact_id ?? null) : undefined;
+
+  if (landed === undefined) {
+    // The lead vanished, or lp_lead_id never matched. The candidate set is
+    // built from lp_leads, so this should be impossible — surface it loudly
+    // rather than counting it as a race.
+    throw new Error(`lead ${lpLeadId} not found on readback — candidate set is stale`);
+  }
+  if (landed !== contactId) {
+    // Raced (landed is another id) or the update silently did nothing (NULL).
+    // Either way we did not write, and the caller reports it without failing.
+    return { leadsUpdated: 0, jobsUpdated: 0, landed };
+  }
+
+  await runSQL(buildJobsLinkUpdate(lpLeadId, contactId));
+  const jobs = await runSQL(buildJobsLinkCount(lpLeadId, contactId));
+  return {
+    leadsUpdated: 1,
+    jobsUpdated: Number((Array.isArray(jobs) && jobs[0]?.n) || 0),
+    landed,
+  };
 }
 
 function writeTier3Csv(rows) {
@@ -460,7 +470,7 @@ async function main() {
         // write. Not an error — the live sync got there first, and its link is
         // at least as good as ours.
         stats.raced++;
-        log.write({ ...entry, result: 'raced_guard_held' });
+        log.write({ ...entry, result: 'raced_guard_held', landed_ghl_contact_id: res.landed });
       } else {
         stats.written++;
         acted++;
