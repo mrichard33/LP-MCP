@@ -201,6 +201,15 @@ const ALLOWED_EVENT_TYPES = new Set([
   'ghl.appointment_no_show',       // 2 rules
   'ghl.appointment_cancelled',     // 2 rules
   'lp.milestone_completed',        // 7 rules (P2 milestones)
+  // 2026-09-18 — LP job STATUS changes (src/sync-children.js). Consumed by
+  // P2_JOB_TERMINAL_LOST and P2_JOB_TERMINAL_WON, which close the P2
+  // opportunity when the job dies or is paid. WITHOUT THIS LINE the emitter
+  // works, the events land in system_events_filtered, and both rules are dead
+  // in total silence — the allowlist is default-DROP. Added with the emitter
+  // rather than with the rules for that reason: the rules are applied by hand
+  // afterwards (sql/seeds/2026-09-18_p2_job_status_terminal_rules.sql), and a
+  // deploy gap would have looked exactly like a broken emitter.
+  'lp.job_status_changed',         // 2 rules (P2_JOB_TERMINAL_LOST/WON)
   'system.drift_detected',         // 1 rule
   'email.enrichment_available',    // 1 rule
   'ghl.entry_detected',            // 1 rule
