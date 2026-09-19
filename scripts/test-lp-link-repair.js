@@ -26,9 +26,12 @@ import assert from 'node:assert/strict';
 
 import { selectLinkLead } from '../src/lp-link-selection.js';
 import {
-  phone10, zipKey, lastNameKey, classifyTierOne, buildTier3Rows,
+  phone10, zipKey, lastNameKey, emailKey, classifyTierOne, buildTier3Rows,
 } from '../src/lp-link-match.js';
 import { shouldAlertLinkLeak, formatLinkLeakAlert } from '../src/link-leak-alerts.js';
+import {
+  buildLeadLinkUpdate, buildLeadLinkReadback, buildJobsLinkUpdate, buildJobsLinkCount,
+} from '../src/lp-link-write-sql.js';
 
 const lead = (lp_lead_id, has_job, lp_prospect_id = '39362', extra = {}) =>
   ({ lp_lead_id: String(lp_lead_id), lp_prospect_id: String(lp_prospect_id), has_job, ...extra });
@@ -256,5 +259,134 @@ test('no tables measured at all is insufficient_evidence, not healthy', () => {
   assert.equal(
     shouldAlertLinkLeak({ windowHours: 24, readOk: true, tables: {} }).verdict,
     'insufficient_evidence',
+  );
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// The write statements — shape only, but the shape is what broke
+// ═══════════════════════════════════════════════════════════════════
+
+test('the lead write is a BARE UPDATE, never a data-modifying CTE', () => {
+  // 2026-09-18: all 42 live writes were refused with "WITH clause containing a
+  // data-modifying statement must be at the top level". runSQL wraps any
+  // statement beginning with SELECT or WITH (sql/run_sql.sql), which pushes the
+  // CTE below the top level. CLAUDE.md's `WITH u AS (... RETURNING 1)` idiom is
+  // correct for the MCP tool and wrong here — this pins the difference.
+  const sql = buildLeadLinkUpdate('131185', 'ZbJFTZNhvzHJRQ3MHXmX', 'phone10_repair');
+  assert.match(sql.trimStart(), /^UPDATE\b/);
+  assert.doesNotMatch(sql, /\bWITH\b/i);
+  assert.doesNotMatch(sql, /\bRETURNING\b/i);
+});
+
+test('the jobs write is a bare UPDATE too', () => {
+  const sql = buildJobsLinkUpdate('131185', 'ZbJFTZNhvzHJRQ3MHXmX');
+  assert.match(sql.trimStart(), /^UPDATE\b/);
+  assert.doesNotMatch(sql, /\bWITH\b/i);
+});
+
+test('every write carries the IS NULL race guard', () => {
+  // The live 15-minute sync runs while the repair does. A lead linked between
+  // our read and our write must be left alone — the one outcome the rollback
+  // log could not undo.
+  for (const sql of [
+    buildLeadLinkUpdate('1', 'ZbJFTZNhvzHJRQ3MHXmX', 'phone10_repair'),
+    buildJobsLinkUpdate('1', 'ZbJFTZNhvzHJRQ3MHXmX'),
+  ]) {
+    assert.match(sql, /AND ghl_contact_id IS NULL/);
+  }
+});
+
+test('the lead write always sets ghl_link_source alongside the id', () => {
+  // A populated ghl_contact_id must never sit next to a NULL source.
+  const sql = buildLeadLinkUpdate('1', 'ZbJFTZNhvzHJRQ3MHXmX', 'phone10_repair');
+  assert.match(sql, /ghl_contact_id = 'ZbJFTZNhvzHJRQ3MHXmX'/);
+  assert.match(sql, /ghl_link_source = 'phone10_repair'/);
+});
+
+test('readback and count are plain SELECTs the RPC can wrap', () => {
+  assert.match(buildLeadLinkReadback('1').trimStart(), /^SELECT\b/);
+  assert.match(buildJobsLinkCount('1', 'ZbJFTZNhvzHJRQ3MHXmX').trimStart(), /^SELECT\b/);
+  // Aliased, because the RPC returns [{n: 3}] — an unaliased count(*) would
+  // come back under a key the caller does not read.
+  assert.match(buildJobsLinkCount('1', 'ZbJFTZNhvzHJRQ3MHXmX'), /count\(\*\) AS n/);
+});
+
+test("a lp_lead_id containing a quote cannot break out of the literal", () => {
+  const sql = buildLeadLinkUpdate("O'Brien", 'ZbJFTZNhvzHJRQ3MHXmX', 'phone10_repair');
+  assert.match(sql, /lp_lead_id = 'O''Brien'/);
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// Part 2 — the widened matcher
+// ═══════════════════════════════════════════════════════════════════
+
+test('emailKey lowercases and trims, and refuses anything unusable', () => {
+  assert.equal(emailKey('  A.B@Example.COM '), 'a.b@example.com');
+  assert.equal(emailKey('joe@x.co'), 'joe@x.co');
+  for (const bad of ['bob@', '@x.com', 'not-an-email', 'a@b', '', null, undefined]) {
+    assert.equal(emailKey(bad), null, `should reject ${JSON.stringify(bad)}`);
+  }
+});
+
+test('role addresses are refused — they belong to a business, not a person', () => {
+  // One info@ can span dozens of unrelated prospects. The selection rule's
+  // multi-prospect guard would usually catch it, but never offering the
+  // candidate is cheaper and clearer.
+  for (const role of ['info@reece.com', 'noreply@x.io', 'sales@y.net', 'unknown@z.org']) {
+    assert.equal(emailKey(role), null, `should reject ${role}`);
+  }
+  // A real person whose name merely resembles one is untouched.
+  assert.equal(emailKey('info.smith@x.com'), 'info.smith@x.com');
+  assert.equal(emailKey('salesbob@x.com'), 'salesbob@x.com');
+});
+
+test('the prospect widening finds the job on a SIBLING lead', () => {
+  // The Espel case, prospect 2872: the phone match lands on a lead with no job,
+  // while a sibling lead under the same prospect carries one. Before this, the
+  // contact was refused no_job_bearing_lead and the job stayed invisible.
+  const phoneMatched = lead(514983, false, '2872', { zip: '33624', matched_via: 'phone' });
+  const sibling = lead(27320, true, '2872', { zip: '33624', matched_via: 'prospect' });
+
+  assert.equal(selectLinkLead([phoneMatched]).verdict, 'no_job_bearing_lead');
+
+  const res = classifyTierOne({ ghl_contact_id: 'C1', ghlZip: '33624' }, [phoneMatched, sibling]);
+  assert.equal(res.verdict, 'selected');
+  assert.equal(res.lead.lp_lead_id, '27320');
+  assert.equal(res.via, 'prospect', 'the summary must be able to say HOW this was reached');
+});
+
+test('widening never crosses into a second prospect', () => {
+  // Siblings are the same customer record. Two PROSPECTS with jobs are two
+  // customer records sharing a key, and that is still a refusal.
+  const res = classifyTierOne({ ghl_contact_id: 'C1', ghlZip: '33624' }, [
+    lead(27320, true, '2872', { matched_via: 'prospect' }),
+    lead(99001, true, '5555', { matched_via: 'prospect' }),
+  ]);
+  assert.equal(res.verdict, 'ambiguous');
+  assert.equal(res.lead, null);
+});
+
+test('a direct match that already has a job is unaffected by widening', () => {
+  // The widening only runs where the direct match produced no job-bearing lead.
+  // This pins that a phone match still wins and still reports via=phone.
+  const res = classifyTierOne({ ghl_contact_id: 'C1', ghlZip: '34239' }, [
+    lead(131185, true, '39362', { zip: '34239', matched_via: 'phone' }),
+  ]);
+  assert.equal(res.verdict, 'selected');
+  assert.equal(res.lead.lp_lead_id, '131185');
+  assert.equal(res.via, 'phone');
+});
+
+test('via is reported for every write path, and null when nothing was selected', () => {
+  for (const via of ['phone', 'phone_alt', 'email', 'prospect']) {
+    const res = classifyTierOne({ ghl_contact_id: 'C1', ghlZip: null },
+      [lead(1, true, '9', { matched_via: via })]);
+    assert.equal(res.via, via);
+  }
+  assert.equal(classifyTierOne({ ghl_contact_id: 'C1' }, []).via, null);
+  assert.equal(
+    classifyTierOne({ ghl_contact_id: 'C1' }, [lead(1, false, '9', { matched_via: 'phone' })]).via,
+    null,
+    'a refusal has no via — nothing was reached',
   );
 });

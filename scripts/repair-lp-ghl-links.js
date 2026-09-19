@@ -104,9 +104,12 @@ import { ghlFetch } from '../src/actions/helpers.js';
 import { PIPELINE_IDS } from '../src/actions/constants.js';
 import { hlRunSQL } from '../src/admin/hl-client.js';
 import { shapeValidLognumber } from '../src/ghl-link-shape.js';
+import {
+  buildLeadLinkUpdate, buildLeadLinkReadback, buildJobsLinkUpdate, buildJobsLinkCount,
+} from '../src/lp-link-write-sql.js';
 import { runSQL } from '../src/admin/supabase-admin.js';
 import {
-  phone10, zipKey, lastNameKey, classifyTierOne, buildTier3Rows,
+  phone10, zipKey, lastNameKey, emailKey, classifyTierOne, buildTier3Rows,
 } from '../src/lp-link-match.js';
 import { LINK_SOURCE } from '../src/services/link-corroboration.js';
 import { selectAllIn } from '../src/supabase-page.js';
@@ -154,7 +157,7 @@ async function fetchOpenP2(mirrorHasAddress) {
   const zipCol = mirrorHasAddress ? 'c.postal_code' : 'NULL::text';
   const rows = await hlRunSQL(`
     SELECT o.ghl_opportunity_id, o.ghl_contact_id, o.monetary_value,
-           c.first_name, c.last_name, c.phone, ${zipCol} AS postal_code
+           c.first_name, c.last_name, c.phone, c.email, ${zipCol} AS postal_code
       FROM opportunities o
       JOIN contacts c ON c.ghl_contact_id = o.ghl_contact_id
      WHERE o.ghl_pipeline_id = '${PIPELINE_P2}'
@@ -215,31 +218,169 @@ async function contactsWithJobs(contactIds) {
 const sqlList = (values) => values.map((v) => `'${String(v).replace(/'/g, "''")}'`).join(',');
 
 /**
- * Unlinked LP leads whose normalized phone is in `keys`.
- *
- * Goes through runSQL rather than the PostgREST client on purpose: the match is
- * on an EXPRESSION over the phone column, and `.in('phone', keys)` would be an
- * exact-string compare that happens to work only because LP currently stores
- * bare 10 digits. The day one vendor row arrives as `(352) 445-3161`, the
- * client form misses it silently and the expression form does not.
- * sql/122 adds the matching index so this is a lookup, not a 242k-row scan.
+ * The select list every candidate query returns. One place, so the three
+ * identity queries and the prospect widening cannot drift into different shapes.
  */
-async function fetchLeadsByPhone10(keys) {
+const LEAD_COLS = `l.lp_lead_id, l.lp_prospect_id, l.last_name, l.zip, l.phone, l.email,
+             right(regexp_replace(coalesce(l.phone,''), '[^0-9]', '', 'g'), 10) AS phone10,
+             right(regexp_replace(coalesce(l.phone_alt,''), '[^0-9]', '', 'g'), 10) AS phone_alt10,
+             lower(btrim(coalesce(l.email,''))) AS email_key,
+             EXISTS (SELECT 1 FROM lp_jobs j WHERE j.lp_lead_id = l.lp_lead_id) AS has_job`;
+
+/**
+ * Unlinked LP leads matching `keys` on one identity column.
+ *
+ * Goes through runSQL rather than the PostgREST client on purpose: the phone
+ * match is on an EXPRESSION over the column, and `.in('phone', keys)` would be
+ * an exact-string compare that happens to work only because LP currently stores
+ * bare 10 digits. The day one vendor row arrives as `(352) 445-3161`, the client
+ * form misses it silently and the expression form does not. sql/122 adds the
+ * matching index so this is a lookup, not a 242k-row scan.
+ *
+ * @param {string} expr  the SQL expression to match against — must be one of the
+ *   three below, never caller-supplied text.
+ */
+async function fetchLeadsByIdentity(expr, keys, via) {
   const out = [];
   const CHUNK = 200;
   for (let i = 0; i < keys.length; i += CHUNK) {
     const chunk = keys.slice(i, i + CHUNK);
     const rows = await runSQL(`
-      SELECT l.lp_lead_id, l.lp_prospect_id, l.last_name, l.zip, l.phone,
-             right(regexp_replace(coalesce(l.phone,''), '[^0-9]', '', 'g'), 10) AS phone10,
-             EXISTS (SELECT 1 FROM lp_jobs j WHERE j.lp_lead_id = l.lp_lead_id) AS has_job
+      SELECT ${LEAD_COLS}
         FROM lp_leads l
        WHERE l.ghl_contact_id IS NULL
-         AND right(regexp_replace(coalesce(l.phone,''), '[^0-9]', '', 'g'), 10) IN (${sqlList(chunk)})
+         AND ${expr} IN (${sqlList(chunk)})
     `);
-    out.push(...(Array.isArray(rows) ? rows : []));
+    for (const r of (Array.isArray(rows) ? rows : [])) out.push({ ...r, matched_via: via });
   }
   return out;
+}
+
+const PHONE10_EXPR = `right(regexp_replace(coalesce(l.phone,''), '[^0-9]', '', 'g'), 10)`;
+const PHONE_ALT10_EXPR = `right(regexp_replace(coalesce(l.phone_alt,''), '[^0-9]', '', 'g'), 10)`;
+const EMAIL_EXPR = `lower(btrim(coalesce(l.email,'')))`;
+
+/**
+ * Every unlinked lead under these prospects — the prospect-level widening.
+ *
+ * WHY THIS IS NOT A WEAKER INFERENCE. An lp_prospect_id IS one customer record
+ * in LP; its leads are that household's history, not different people. The
+ * original rule refused whenever the phone-matched LEAD carried no job, which
+ * threw away every case where the household's job sits under a sibling lead —
+ * and that is the dominant shape in this cohort. Measured 2026-09-18: 67 of 109
+ * phone-matched contacts were refused `no_job_bearing_lead`, and 200 of tier 3's
+ * 204 review rows carry the same "LP lead has no job" note.
+ *
+ * Worked example, prospect 2872 (Lizette & Luis Espel): six leads, two of them
+ * carrying a $10,236 job. The phone match lands on one; the GHL opportunity is
+ * valued at $20,472 — both jobs. Without this widening the second job stays
+ * invisible to every contact-id-keyed query.
+ *
+ * The prospects come only from leads an identity key already matched, so this
+ * widens WITHIN a customer we have already identified — it never reaches a new
+ * one. Ambiguity across prospects is still refused by selectLinkLead().
+ */
+async function fetchLeadsByProspect(prospectIds) {
+  const out = [];
+  const CHUNK = 200;
+  for (let i = 0; i < prospectIds.length; i += CHUNK) {
+    const chunk = prospectIds.slice(i, i + CHUNK);
+    const rows = await runSQL(`
+      SELECT ${LEAD_COLS}
+        FROM lp_leads l
+       WHERE l.ghl_contact_id IS NULL
+         AND l.lp_prospect_id IN (${sqlList(chunk)})
+    `);
+    for (const r of (Array.isArray(rows) ? rows : [])) out.push({ ...r, matched_via: 'prospect' });
+  }
+  return out;
+}
+
+/**
+ * Per-prospect job facts, IGNORING link state — the diagnostic that splits
+ * `no_job_bearing_lead` into two very different problems.
+ *
+ * The candidate queries all filter `ghl_contact_id IS NULL`, because that is the
+ * write scope. That filter also hides the answer to the question a human
+ * actually needs: does LP hold a job for this customer AT ALL?
+ *
+ *   jobs = 0                  → LP has the customer and no job. Either the job
+ *                               was never created in LP, or the opportunity
+ *                               should not be in P2. Nothing to link.
+ *   jobs > 0, all linked      → LP has the job and it is attached to a DIFFERENT
+ *                               GHL contact. That is a duplicate contact in GHL,
+ *                               not a missing link — and merging contacts is a
+ *                               GHL write this script must never make.
+ *
+ * Neither is reachable by matching harder, which is exactly why they are
+ * reported by name instead of being left in one undifferentiated refusal bucket.
+ */
+async function fetchProspectJobFacts(prospectIds) {
+  const facts = new Map();
+  const CHUNK = 200;
+  for (let i = 0; i < prospectIds.length; i += CHUNK) {
+    const chunk = prospectIds.slice(i, i + CHUNK);
+    const rows = await runSQL(`
+      SELECT l.lp_prospect_id,
+             count(j.lp_job_id) AS jobs,
+             count(j.lp_job_id) FILTER (WHERE l.ghl_contact_id IS NOT NULL) AS jobs_linked_elsewhere
+        FROM lp_leads l
+        JOIN lp_jobs j ON j.lp_lead_id = l.lp_lead_id
+       WHERE l.lp_prospect_id IN (${sqlList(chunk)})
+       GROUP BY l.lp_prospect_id
+    `);
+    for (const r of (Array.isArray(rows) ? rows : [])) {
+      facts.set(String(r.lp_prospect_id), {
+        jobs: Number(r.jobs || 0),
+        linkedElsewhere: Number(r.jobs_linked_elsewhere || 0),
+      });
+    }
+  }
+  return facts;
+}
+
+/**
+ * Does ANY lp_lead carry these identity keys, linked or not — and does it have a
+ * job? The diagnostic that splits `unmatched` the way fetchProspectJobFacts
+ * splits the refusals.
+ *
+ * Every candidate query filters `ghl_contact_id IS NULL` because that is the
+ * write scope, which means "unmatched" as reported really says "no UNLINKED LP
+ * lead". That conflates two different worlds:
+ *
+ *   nothing at all            → LP never received this customer. The contract
+ *                               exists only in GHL. Nothing to link, ever.
+ *   exists but already linked → the LP record is attached to a DIFFERENT GHL
+ *                               contact. Two contacts for one person; the fix is
+ *                               a GHL merge, which is a write this script must
+ *                               never make.
+ *
+ * Returns key → {any, linked, withJob}.
+ */
+async function fetchIdentityReach(expr, keys) {
+  const reach = new Map();
+  const CHUNK = 200;
+  for (let i = 0; i < keys.length; i += CHUNK) {
+    const chunk = keys.slice(i, i + CHUNK);
+    const rows = await runSQL(`
+      SELECT ${expr} AS k,
+             count(*) AS any_rows,
+             count(*) FILTER (WHERE l.ghl_contact_id IS NOT NULL) AS linked_rows,
+             count(*) FILTER (WHERE EXISTS (
+               SELECT 1 FROM lp_jobs j WHERE j.lp_lead_id = l.lp_lead_id)) AS with_job
+        FROM lp_leads l
+       WHERE ${expr} IN (${sqlList(chunk)})
+       GROUP BY 1
+    `);
+    for (const r of (Array.isArray(rows) ? rows : [])) {
+      reach.set(String(r.k), {
+        any: Number(r.any_rows || 0),
+        linked: Number(r.linked_rows || 0),
+        withJob: Number(r.with_job || 0),
+      });
+    }
+  }
+  return reach;
 }
 
 /** Unlinked LP leads matching any of these surname keys — tier 3 candidates only. */
@@ -291,47 +432,108 @@ function openLog() {
 /**
  * Write the link onto one lead and its jobs.
  *
- * Both statements carry `AND ghl_contact_id IS NULL`. The live 15-minute sync
- * runs while this does, so a lead legitimately linked between the read and the
- * write must be left alone — the guard turns that race into a reported no-op
- * instead of an overwrite, which is the one outcome nobody could undo from the
- * rollback log.
+ * The statements themselves live in src/lp-link-write-sql.js, pure and
+ * unit-tested, because their SHAPE is what broke on 2026-09-18: the
+ * CLAUDE.md `WITH u AS (... RETURNING 1)` row-count idiom is correct for the
+ * Supabase MCP tool and WRONG through this repo's runSQL, which wraps any
+ * SELECT/WITH statement and so pushes the CTE below the top level. All 42
+ * writes were refused. See that module's header for the full account.
  *
- * ghl_link_source is stamped in the same statement. A populated ghl_contact_id
- * must never sit next to a NULL source — that is what made the
- * Y21mrJPUGYGKIWFptVpu link untraceable (see src/sync-children.js, 2026-07-29).
+ * The outcome is READ BACK rather than inferred, because the RPC returns a
+ * status object for a non-SELECT and cannot report rows_affected.
+ *
+ * ghl_link_source is set in the same statement. A populated ghl_contact_id must
+ * never sit next to a NULL source — that is what made the Y21mrJPUGYGKIWFptVpu
+ * link untraceable (see src/sync-children.js, 2026-07-29).
  */
 async function writeLink(lpLeadId, contactId, source) {
   // Shape-check the id before it reaches a statement. Two jobs: it refuses a
   // malformed id that GHL's mirror should never have held, and it means the
-  // interpolation below cannot carry anything but 20 alphanumerics. Shape
-  // validity is NOT link validity (src/ghl-link-shape.js) — the phone match is
-  // what makes this a link; this is the floor, not the evidence.
+  // interpolation cannot carry anything but 20 alphanumerics. Shape validity is
+  // NOT link validity (src/ghl-link-shape.js) — the phone match is the
+  // evidence; this is the floor.
   if (!shapeValidLognumber(contactId)) {
     throw new Error(`refusing to write a malformed GHL contact id: ${JSON.stringify(contactId)}`);
   }
-  const leadRows = await runSQL(`
-    WITH u AS (
-      UPDATE lp_leads
-         SET ghl_contact_id = '${contactId}', ghl_link_source = '${String(source).replace(/'/g, "''")}'
-       WHERE lp_lead_id = '${String(lpLeadId).replace(/'/g, "''")}'
-         AND ghl_contact_id IS NULL
-      RETURNING 1
-    ) SELECT count(*) AS n FROM u
-  `);
-  const leadsUpdated = Number(leadRows?.[0]?.n || 0);
-  if (leadsUpdated === 0) return { leadsUpdated: 0, jobsUpdated: 0 };
 
-  const jobRows = await runSQL(`
-    WITH u AS (
-      UPDATE lp_jobs
-         SET ghl_contact_id = '${contactId}'
-       WHERE lp_lead_id = '${String(lpLeadId).replace(/'/g, "''")}'
-         AND ghl_contact_id IS NULL
-      RETURNING 1
-    ) SELECT count(*) AS n FROM u
-  `);
-  return { leadsUpdated, jobsUpdated: Number(jobRows?.[0]?.n || 0) };
+  await runSQL(buildLeadLinkUpdate(lpLeadId, contactId, source));
+
+  const after = await runSQL(buildLeadLinkReadback(lpLeadId));
+  const landed = Array.isArray(after) && after.length ? (after[0].ghl_contact_id ?? null) : undefined;
+
+  if (landed === undefined) {
+    // The lead vanished, or lp_lead_id never matched. The candidate set is
+    // built from lp_leads, so this should be impossible — surface it loudly
+    // rather than counting it as a race.
+    throw new Error(`lead ${lpLeadId} not found on readback — candidate set is stale`);
+  }
+  if (landed !== contactId) {
+    // Raced (landed is another id) or the update silently did nothing (NULL).
+    // Either way we did not write, and the caller reports it without failing.
+    return { leadsUpdated: 0, jobsUpdated: 0, landed };
+  }
+
+  await runSQL(buildJobsLinkUpdate(lpLeadId, contactId));
+  const jobs = await runSQL(buildJobsLinkCount(lpLeadId, contactId));
+  return {
+    leadsUpdated: 1,
+    jobsUpdated: Number((Array.isArray(jobs) && jobs[0]?.n) || 0),
+    landed,
+  };
+}
+
+/**
+ * Every cohort opportunity with its verdict and its REASON.
+ *
+ * The point of the repair is not "as many links as possible" — it is that no
+ * opportunity is left silently unexplained. A contact this script refuses is
+ * not a failure; it is a finding, and the finding has an owner:
+ *
+ *   selected                          → this script writes it
+ *   ambiguous                         → a human picks, or the duplicate is merged
+ *   no_job_anywhere                   → LP has the customer and no job. Either the
+ *                                       job was never created or the opportunity
+ *                                       does not belong in P2
+ *   no_lp_record_at_all               → LP never received this customer
+ *   lp_record_exists_but_has_no_job   → same as no_job_anywhere, reached by a
+ *                                       linked lead rather than an unlinked one
+ *   lp_job_linked_to_another_contact  → two GHL contacts for one person; fix is a
+ *                                       GHL merge, which this script never does
+ */
+function writeClassificationCsv(cohort, decisions) {
+  fs.mkdirSync(opt.reportDir, { recursive: true });
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const file = path.join(opt.reportDir, `lp-link-classification-${stamp}.csv`);
+  const esc = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+  const header = [
+    'ghl_contact_id', 'ghl_opportunity_id', 'ghl_name', 'ghl_phone', 'ghl_email', 'ghl_zip',
+    'monetary_value', 'verdict', 'reason', 'matched_via', 'confidence',
+    'lp_lead_id', 'lp_prospect_id', 'owner',
+  ].join(',');
+
+  const OWNER = {
+    selected: 'script',
+    ambiguous: 'human — pick the right LP record, or merge the duplicate',
+    no_job_anywhere: 'human — LP has no job for this customer',
+    lp_record_exists_but_has_no_job: 'human — LP has no job for this customer',
+    no_lp_record_at_all: 'human — LP never received this customer',
+    lp_job_linked_to_another_contact: 'human — duplicate GHL contact, needs a merge',
+  };
+
+  const lines = cohort.map((c) => {
+    const d = decisions.get(c.ghl_contact_id) || {};
+    const reason = d.verdict === 'selected' ? 'selected' : (d.reason || d.verdict || 'unclassified');
+    return [
+      c.ghl_contact_id, c.ghl_opportunity_id,
+      `${c.first_name || ''} ${c.last_name || ''}`.trim(),
+      phone10(c.phone) || '', c.email || '', zipKey(c.ghlZip) || '',
+      c.monetary_value ?? '', d.verdict || '', reason, d.via || '', d.confidence || '',
+      d.lead?.lp_lead_id || '', d.lead?.lp_prospect_id || '',
+      OWNER[reason] || OWNER[d.verdict] || 'unclassified',
+    ].map(esc).join(',');
+  });
+  fs.writeFileSync(file, `${header}\n${lines.join('\n')}\n`);
+  return file;
 }
 
 function writeTier3Csv(rows) {
@@ -390,21 +592,132 @@ async function main() {
   );
 
   // ─── Tier 1 (+2) ──────────────────────────────────────────────────────────
+  // Three identity keys, then a widening to the whole prospect. Phone, alt
+  // phone and email are all identity-grade and all already used by matchToGHL,
+  // so none of them is a weaker claim than the others — they are alternative
+  // ways of reaching the SAME customer, and the selection rule refuses if they
+  // disagree about which prospect that is.
   const decisions = new Map();   // ghl_contact_id → decision
+  const viaCounts = new Map();   // how each written link was reached
   if (runTier1) {
-    const keys = [...new Set(cohort.map((c) => phone10(c.phone)).filter(Boolean))];
-    console.log(`\ntier 1: ${keys.length} distinct normalized phones from ${cohort.length} contacts`);
-    const leads = await fetchLeadsByPhone10(keys);
+    const phoneKeys = [...new Set(cohort.map((c) => phone10(c.phone)).filter(Boolean))];
+    const emailKeys = [...new Set(cohort.map((c) => emailKey(c.email)).filter(Boolean))];
+    console.log(`\ntier 1: ${phoneKeys.length} distinct phones, ${emailKeys.length} usable emails, from ${cohort.length} contacts`);
+
+    // A GHL contact's phone can match an LP lead's phone OR its phone_alt —
+    // the household's second number is the same household.
     const byPhone = new Map();
-    for (const l of leads) {
-      if (!byPhone.has(l.phone10)) byPhone.set(l.phone10, []);
-      byPhone.get(l.phone10).push(l);
+    const byEmail = new Map();
+    const addTo = (map, key, lead) => {
+      if (!key) return;
+      if (!map.has(key)) map.set(key, []);
+      map.get(key).push(lead);
+    };
+
+    for (const l of await fetchLeadsByIdentity(PHONE10_EXPR, phoneKeys, 'phone')) {
+      addTo(byPhone, l.phone10, l);
     }
-    console.log(`tier 1: ${leads.length} unlinked lp_leads rows matched on ${byPhone.size} of those`);
+    for (const l of await fetchLeadsByIdentity(PHONE_ALT10_EXPR, phoneKeys, 'phone_alt')) {
+      addTo(byPhone, l.phone_alt10, l);
+    }
+    if (emailKeys.length) {
+      for (const l of await fetchLeadsByIdentity(EMAIL_EXPR, emailKeys, 'email')) {
+        addTo(byEmail, l.email_key, l);
+      }
+    }
+    console.log(
+      `tier 1: matched on phone/alt for ${byPhone.size} keys, on email for ${byEmail.size} keys`,
+    );
+
+    // Per-contact candidate set from the identity keys, deduped by lead id — a
+    // lead reachable by both phone and email must not count twice, and the
+    // FIRST way it was reached is the one reported (phone before email).
+    const directFor = (c) => {
+      const seen = new Map();
+      for (const l of [...(byPhone.get(phone10(c.phone)) || []),
+                       ...(byEmail.get(emailKey(c.email)) || [])]) {
+        if (!seen.has(l.lp_lead_id)) seen.set(l.lp_lead_id, l);
+      }
+      return [...seen.values()];
+    };
+
+    // Widen to the prospect ONLY where the direct match produced no job-bearing
+    // lead. Fetching every prospect's leads unconditionally would be a much
+    // larger read for no gain: where a job was already found, the sibling leads
+    // cannot change the answer.
+    const needProspect = new Set();
+    for (const c of cohort) {
+      const direct = directFor(c);
+      if (direct.length && !direct.some((l) => l.has_job)) {
+        for (const l of direct) if (l.lp_prospect_id) needProspect.add(String(l.lp_prospect_id));
+      }
+    }
+    const byProspect = new Map();
+    if (needProspect.size) {
+      console.log(`tier 1: widening to ${needProspect.size} prospects whose matched lead carries no job`);
+      for (const l of await fetchLeadsByProspect([...needProspect])) {
+        addTo(byProspect, String(l.lp_prospect_id), l);
+      }
+    }
 
     for (const c of cohort) {
-      const key = phone10(c.phone);
-      decisions.set(c.ghl_contact_id, classifyTierOne(c, key ? byPhone.get(key) || [] : []));
+      const direct = directFor(c);
+      const seen = new Map(direct.map((l) => [l.lp_lead_id, l]));
+      if (direct.length && !direct.some((l) => l.has_job)) {
+        for (const l of direct) {
+          for (const sib of byProspect.get(String(l.lp_prospect_id)) || []) {
+            if (!seen.has(sib.lp_lead_id)) seen.set(sib.lp_lead_id, sib);
+          }
+        }
+      }
+      const d = classifyTierOne(c, [...seen.values()]);
+      // Remember which prospects this contact reached, so a refusal can be
+      // explained below without re-running the match.
+      d.reachedProspects = [...new Set([...seen.values()]
+        .map((l) => (l.lp_prospect_id == null ? null : String(l.lp_prospect_id)))
+        .filter(Boolean))];
+      decisions.set(c.ghl_contact_id, d);
+    }
+
+    // Split `no_job_bearing_lead` by WHY. See fetchProspectJobFacts.
+    const refusedProspects = [...new Set(
+      [...decisions.values()]
+        .filter((d) => d.verdict === 'no_job_bearing_lead')
+        .flatMap((d) => d.reachedProspects || []),
+    )];
+    if (refusedProspects.length) {
+      const facts = await fetchProspectJobFacts(refusedProspects);
+      for (const d of decisions.values()) {
+        if (d.verdict !== 'no_job_bearing_lead') continue;
+        const reached = (d.reachedProspects || []).map((id) => facts.get(id)).filter(Boolean);
+        const jobs = reached.reduce((n, f) => n + f.jobs, 0);
+        const elsewhere = reached.reduce((n, f) => n + f.linkedElsewhere, 0);
+        d.reason = jobs === 0 ? 'no_job_anywhere'
+          : elsewhere > 0 ? 'job_linked_to_another_contact'
+            : 'job_exists_but_unreachable';
+      }
+    }
+
+    // Split `unmatched` the same way. See fetchIdentityReach.
+    const unmatchedContacts = cohort.filter(
+      (c) => decisions.get(c.ghl_contact_id)?.verdict === 'unmatched');
+    if (unmatchedContacts.length) {
+      const uPhones = [...new Set(unmatchedContacts.map((c) => phone10(c.phone)).filter(Boolean))];
+      const uEmails = [...new Set(unmatchedContacts.map((c) => emailKey(c.email)).filter(Boolean))];
+      const phoneReach = uPhones.length ? await fetchIdentityReach(PHONE10_EXPR, uPhones) : new Map();
+      const emailReach = uEmails.length ? await fetchIdentityReach(EMAIL_EXPR, uEmails) : new Map();
+      for (const c of unmatchedContacts) {
+        const hits = [phoneReach.get(phone10(c.phone) || ''), emailReach.get(emailKey(c.email) || '')]
+          .filter(Boolean);
+        const any = hits.reduce((n, h) => n + h.any, 0);
+        const linked = hits.reduce((n, h) => n + h.linked, 0);
+        const withJob = hits.reduce((n, h) => n + h.withJob, 0);
+        const d = decisions.get(c.ghl_contact_id);
+        d.reason = any === 0 ? 'no_lp_record_at_all'
+          : withJob === 0 ? 'lp_record_exists_but_has_no_job'
+            : linked > 0 ? 'lp_job_linked_to_another_contact'
+              : 'lp_job_exists_but_unreachable';
+      }
     }
   }
 
@@ -428,6 +741,7 @@ async function main() {
     }
     stats.matched++;
     if (d.confidence === 'high') stats.confidence_high++; else stats.confidence_medium++;
+    viaCounts.set(d.via || 'unknown', (viaCounts.get(d.via || 'unknown') ?? 0) + 1);
 
     if (acted >= opt.limit) { stats.over_limit++; continue; }
 
@@ -437,6 +751,7 @@ async function main() {
       ghl_opportunity_id: c.ghl_opportunity_id,
       tier: d.tier,
       confidence: d.confidence,
+      matched_via: d.via,
       zip_source: zipKey(c.postal_code) ? 'mirror' : (c.ghlZip ? 'live_ghl' : 'none'),
       lp_lead_id: d.lead.lp_lead_id,
       lp_prospect_id: d.lead.lp_prospect_id ?? null,
@@ -460,7 +775,7 @@ async function main() {
         // write. Not an error — the live sync got there first, and its link is
         // at least as good as ours.
         stats.raced++;
-        log.write({ ...entry, result: 'raced_guard_held' });
+        log.write({ ...entry, result: 'raced_guard_held', landed_ghl_contact_id: res.landed });
       } else {
         stats.written++;
         acted++;
@@ -522,12 +837,40 @@ async function main() {
     console.log('\ntier 1/2 — phone, last 10 digits:');
     console.log(`  matched (a lead was selected)    : ${stats.matched}`);
     console.log(`    confidence high (zip agrees)   : ${stats.confidence_high}`);
-    console.log(`    confidence medium (phone only) : ${stats.confidence_medium}`);
+    console.log(`    confidence medium (no zip agr) : ${stats.confidence_medium}`);
+    // How each match was REACHED. This is the only way to tell later whether a
+    // widening earned its place, or whether one of them is producing bad links.
+    for (const via of ['phone', 'phone_alt', 'email', 'prospect', 'unknown']) {
+      const n = viaCounts.get(via) ?? 0;
+      if (n) console.log(`    via ${via.padEnd(26)}: ${n}`);
+    }
     console.log(`  written                          : ${stats.written}${opt.apply ? '' : '  (dry run — nothing written)'}`);
     console.log(`  raced (link appeared mid-run)    : ${stats.raced}`);
     console.log(`  ambiguous (refused)              : ${stats.ambiguous}`);
     console.log(`  no_job_bearing_lead (refused)    : ${stats.no_job_bearing_lead}`);
-    console.log(`  unmatched (no LP lead by phone)  : ${stats.unmatched}`);
+    // WHY, because "no job-bearing lead" is three different problems with three
+    // different owners, and only one of them is ever a matching bug.
+    const reasons = new Map();
+    for (const d of decisions.values()) {
+      if (d.verdict !== 'no_job_bearing_lead') continue;
+      const r = d.reason || 'unclassified';
+      reasons.set(r, (reasons.get(r) ?? 0) + 1);
+    }
+    for (const [r, n] of [...reasons].sort((a, b) => b[1] - a[1])) {
+      console.log(`    ${r.padEnd(30)}: ${n}`);
+    }
+    console.log(`  unmatched (no unlinked LP lead)  : ${stats.unmatched}`);
+  {
+    const ur = new Map();
+    for (const d of decisions.values()) {
+      if (d.verdict !== 'unmatched') continue;
+      const r = d.reason || 'unclassified';
+      ur.set(r, (ur.get(r) ?? 0) + 1);
+    }
+    for (const [r, n] of [...ur].sort((a, b) => b[1] - a[1])) {
+      console.log(`    ${r.padEnd(30)}: ${n}`);
+    }
+  }
     console.log(`  over --limit (classified only)   : ${stats.over_limit}`);
     console.log(`  failed                           : ${stats.failed}`);
   }
@@ -542,6 +885,10 @@ async function main() {
       console.log('  ^ 0 because NO zip was available for any contact — not because none matched.');
       console.log('    Apply HL-MCP sql/017, or re-run with GHL_API_KEY set and without --no-live-zip.');
     }
+  }
+  if (runTier1) {
+    const cf = writeClassificationCsv(cohort, decisions);
+    console.log(`\nevery cohort opportunity, with its reason and owner:\n  ${cf}`);
   }
   console.log(`\nzip source used — mirror: ${zipSource.mirror}, live GHL: ${zipSource.live}, none: ${zipSource.none}`);
   if (runTier1) {
