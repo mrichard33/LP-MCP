@@ -75,10 +75,12 @@ export const STAGE_MAP = {
   // RTP is also the event LP's Net revenue report is keyed on. Financing
   // approval is a precondition, not the milestone.
   //
-  // The stage ID is unchanged by a GHL rename, so nothing breaks either way;
-  // this map just stops lying about what the stage means. New rules use the
-  // canonical name. 'Financing Approved' is retained below as a legacy alias
-  // because agent_rules rows and older seeds still carry it.
+  // 2026-09-19: the 'Financing Approved' alias is GONE. It was kept because
+  // agent_rule 346 (P2_MILESTONE_RTP) still named it; that rule now names the
+  // canonical stage and nothing else referenced it. Mark's ruling: financing
+  // approval is not a thing this pipeline tracks, so a stage name asserting it
+  // is worse than no alias. Re-adding it would let a rule keep claiming an
+  // event the business does not measure.
   'Released to Production (RTP)':        '375089e1-aaa5-429f-8c4c-5e01058fa8f8',
   'Permitting & HOA':                    '561f35fe-3632-40e9-bf0d-b9061bdf2589',
   // Build Execution
@@ -91,7 +93,6 @@ export const STAGE_MAP = {
   // P2 — Legacy aliases
   'Closed Won (Contract Signed)':            'fec39f2e-ba39-4536-95b2-bbac7ca6c454',
   'Financing Pending / Document Collection': 'b7fc445c-a969-42b1-9a7a-eda5c89f25a5',
-  'Financing Approved':                      '375089e1-aaa5-429f-8c4c-5e01058fa8f8',
   'Released to Production':                  '375089e1-aaa5-429f-8c4c-5e01058fa8f8',
   'RTP':                                     '375089e1-aaa5-429f-8c4c-5e01058fa8f8',
   'HOA / Permit In Progress':                '561f35fe-3632-40e9-bf0d-b9061bdf2589',

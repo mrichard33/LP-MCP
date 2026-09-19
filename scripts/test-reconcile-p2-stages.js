@@ -53,7 +53,7 @@ const STAGE = {
  */
 const MAPPING = buildMilestoneStageMap([
   rule('P2_MILESTONE_MEASURE', 'M', 'Financing Pending'),
-  rule('P2_MILESTONE_RTP', 'R', 'Financing Approved'),        // legacy alias, deliberate
+  rule('P2_MILESTONE_RTP', 'R', 'Released to Production (RTP)'),
   rule('P2_MILESTONE_HOA', 'H', 'Permitting & HOA'),
   rule('P2_MILESTONE_PERMIT_SUBMIT', 'U', 'Permitting & HOA'),
   rule('P2_MILESTONE_PERMIT_ISSUED', 'P', 'Permitting & HOA'),
@@ -299,9 +299,11 @@ test('a terminal status wins over the stage derivation, so the two phases stay d
 
 // ─── the derived mapping ────────────────────────────────────────────────
 
-test('the mapping is derived from agent_rules, aliases and all', () => {
-  // P2_MILESTONE_RTP deliberately names the legacy alias 'Financing Approved'
-  // because it is the rollback-safe target. Both names resolve to 375089e1.
+test('the mapping is derived from agent_rules', () => {
+  // 2026-09-19: P2_MILESTONE_RTP used to name the legacy alias 'Financing
+  // Approved'. Both names resolved to 375089e1, so the rule always worked —
+  // but the name asserted an event the business does not track. The rule now
+  // names the canonical stage and the alias is gone from constants.js.
   assert.equal(MAPPING.R.stageId, STAGE.RTP);
   assert.equal(MAPPING.M.stageId, STAGE.FINANCING_PENDING);
   assert.equal(MAPPING.B.stageId, STAGE.REFERRAL);

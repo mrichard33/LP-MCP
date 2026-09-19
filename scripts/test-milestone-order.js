@@ -32,7 +32,7 @@ import { selectFurthestMilestone, milestoneOrdinal, __testing } from '../src/mil
 const JULIA_FIRES = [
   { mdtId: 'M', actDateEt: '2024-12-12' }, // Measure          → Financing Pending
   { mdtId: 'O', actDateEt: '2024-12-16' }, // Quoted           → no rule (ordinal 0)
-  { mdtId: 'R', actDateEt: '2024-12-16' }, // RTP              → Financing Approved
+  { mdtId: 'R', actDateEt: '2024-12-16' }, // RTP              → Released to Production (RTP)
   { mdtId: 'K', actDateEt: '2024-12-17' }, // Ordered          → In Production
   { mdtId: 'U', actDateEt: '2025-01-03' }, // Permit Submit    → Permitting & HOA
   { mdtId: 'P', actDateEt: '2025-01-03' }, // Permit Issued    → Permitting & HOA

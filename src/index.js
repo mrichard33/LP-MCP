@@ -119,6 +119,7 @@ import { registerGroupMeRoutes } from './groupme.js';
 import { registerLPAppointmentSyncRoutes } from './lp-appointment-sync.js';
 // ─── LP Addlead Validation Proxy (GHL addlead → hour gate → LP) ──
 import { registerLpAddleadProxyRoutes } from './lp-addlead-proxy.js';
+import { registerApIntakeRoutes } from './ap-intake.js';
 // ─── Canvassing Intake (I.CC → deterministic time/notes → LP) ────
 import { registerCanvassingIntakeRoutes } from './canvassing-intake.js';
 // ─── Workflow Completion (tag-based self-enrichment) ─────────────
@@ -2225,6 +2226,7 @@ registerLPAppointmentSyncRoutes(app);
 
 // ─── LP Addlead Validation Proxy (GHL addlead → hour gate → LP) ──
 registerLpAddleadProxyRoutes(app);
+registerApIntakeRoutes(app);
 
 // ─── Canvassing Intake (I.CC → deterministic time/notes → LP) ────
 registerCanvassingIntakeRoutes(app);
