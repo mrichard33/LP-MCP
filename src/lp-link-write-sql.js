@@ -77,4 +77,50 @@ export function buildJobsLinkCount(lpLeadId, contactId) {
      AND ghl_contact_id = '${q(contactId)}'`;
 }
 
+/**
+ * Clear a link the corroborator refused, keeping the verdict as the audit trail.
+ *
+ * 2026-09-19. Used by scripts/repair-rejected-links.js for rows whose stored
+ * ghl_contact_id IS the rejected candidate — LP's own lognumber, verified
+ * against the GHL contact's phone/email and found to disagree. The id is the
+ * wrong part; ghl_link_source is the record of why it went, so it stays.
+ *
+ * Both guards matter. `ghl_contact_id = <the id we read>` leaves a row alone if
+ * the live sync changed it between our read and our write, and the source
+ * predicate means a row reclassified in the meantime is no longer ours to
+ * clear. A bare UPDATE, for the run_sql reason documented at the top of this
+ * file.
+ */
+export function buildRejectedLinkClear(lpLeadId, seenContactId) {
+  return `UPDATE lp_leads
+     SET ghl_contact_id = NULL
+   WHERE lp_lead_id = '${q(lpLeadId)}'
+     AND ghl_contact_id = '${q(seenContactId)}'
+     AND ghl_link_source IN ('rejected_conflict', 'rejected_uncorroborated')`;
+}
+
+/**
+ * Restore an honest classification on a link that was never itself rejected.
+ *
+ * The other shape behind the same symptom: the stored id came from a good
+ * phone match and a DIFFERENT lognumber candidate was rejected, which
+ * overwrote the row's classification. The id is fine and must not be cleared;
+ * only the label is wrong. legacy_unverified is the honest floor — it says
+ * "linked, not corroborated", which is exactly what is true — and it puts the
+ * row back in scope for normal verification.
+ */
+export function buildRejectedSourceReset(lpLeadId, seenContactId) {
+  return `UPDATE lp_leads
+     SET ghl_link_source = 'legacy_unverified'
+   WHERE lp_lead_id = '${q(lpLeadId)}'
+     AND ghl_contact_id = '${q(seenContactId)}'
+     AND ghl_link_source IN ('rejected_conflict', 'rejected_uncorroborated')`;
+}
+
+/** Read both columns back, so each outcome is observed rather than assumed. */
+export function buildRejectedLinkReadback(lpLeadId) {
+  return `SELECT ghl_contact_id, ghl_link_source FROM lp_leads
+   WHERE lp_lead_id = '${q(lpLeadId)}'`;
+}
+
 export const _internal = { q };

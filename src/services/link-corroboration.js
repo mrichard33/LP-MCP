@@ -58,6 +58,17 @@ export const LINK_SOURCE = {
   // ghl_link_source = 'phone10_repair'` says exactly what that script did, for
   // as long as the rows exist.
   PHONE10_REPAIR: 'phone10_repair',
+  // 2026-09-19: written ONLY by scripts/propagate-prospect-links.js. One LP
+  // prospect is one person, so leads under it cannot belong to two different
+  // GHL contacts. Where some of a prospect's leads carried a link and its
+  // siblings were NULL, the link is copied across — and ONLY when every
+  // linked sibling agrees on the same id. A prospect whose leads disagree is
+  // the ambiguous case and is refused, never tie-broken.
+  //
+  // No new evidence is created here: the id is already trusted on a sibling
+  // row. So like phone10_repair this falls through linkStrength() to 1 and any
+  // later real corroboration displaces it, and it is its own audit trail.
+  PROSPECT_PROPAGATED: 'prospect_propagated',
 };
 
 // Trust ranking for the downgrade guard: a stored rank-3 source is only ever
