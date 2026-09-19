@@ -86,13 +86,51 @@ function hasJob(lead) {
  * @returns {{verdict: 'selected'|'no_candidates'|'no_job_bearing_lead'|'ambiguous',
  *            lead: object|null, prospectIds: string[], jobBearingCount: number}}
  */
-export function selectLinkLead(candidates = []) {
+export function selectLinkLead(candidates = [], { requireJob = true } = {}) {
   const leads = (candidates || []).filter(Boolean);
   if (leads.length === 0) {
     return { verdict: 'no_candidates', lead: null, prospectIds: [], jobBearingCount: 0 };
   }
 
   const jobBearing = leads.filter(hasJob);
+
+  // ─── requireJob: false ────────────────────────────────────────────────────
+  // 2026-09-19. Added for the unreferenced-contact cohort, where the question
+  // is not "which lead produced this opportunity's job" but "is there an
+  // unlinked LP lead that is plainly this person". Mark's job rule is UNCHANGED
+  // and still the default; this only widens the one cohort that asks a
+  // different question.
+  //
+  // Why the job rule does not transfer. Measured that day: lp_jobs holds 6,248
+  // rows against 24,885 WON leads — 24.5% coverage. A 25-contact sample turned
+  // up two closed deals ($17,380 and $32,156) carrying closed_won and a
+  // job_value with no lp_jobs row at all. For the P2 cohort a missing job row
+  // IS the defect being repaired, so requiring one is right there. Here it
+  // refuses real customers over an incomplete mirror: 548 of 572 contacts, of
+  // which 532 reach exactly one prospect.
+  //
+  // The rule's ambiguity work is replaced, not dropped. When it falls back, the
+  // prospect count is taken over EVERY candidate lead rather than the
+  // job-bearing ones, which is a STRICTER test — a key reaching three prospects
+  // none of which has a job counts as 3 here and as 0 to the job-filtered
+  // guard. The caller pairs this with a fan-out query that drops its own
+  // lp_jobs filter, so both halves see the same population.
+  //
+  // This never changes a decision the default would have made: job-bearing
+  // leads still win whenever any exist.
+  if (jobBearing.length === 0 && !requireJob) {
+    const allProspects = distinctProspects(leads);
+    if (allProspects.length > 1) {
+      return { verdict: 'ambiguous', lead: null, prospectIds: allProspects, jobBearingCount: 0 };
+    }
+    return {
+      verdict: 'selected',
+      lead: highestLeadId(leads),
+      prospectIds: allProspects,
+      jobBearingCount: 0,
+    };
+  }
+
   if (jobBearing.length === 0) {
     // Leads exist, none produced a job. Reported, never written — see the
     // header. The caller surfaces this as its own summary bucket.
@@ -114,22 +152,25 @@ export function selectLinkLead(candidates = []) {
     };
   }
 
-  // One prospect, one or more job-bearing leads: the most recent by lp_lead_id.
+  return {
+    verdict: 'selected',
+    lead: highestLeadId(jobBearing),
+    prospectIds,
+    jobBearingCount: jobBearing.length,
+  };
+}
+
+/** The most recent lead by lp_lead_id, with the string value as the tie-break. */
+function highestLeadId(leads) {
   let best = null;
-  for (const lead of jobBearing) {
+  for (const lead of leads) {
     const rank = leadIdRank(lead.lp_lead_id);
     const tie = lead.lp_lead_id == null ? '' : String(lead.lp_lead_id);
     if (best === null || rank > best.rank || (rank === best.rank && tie > best.tie)) {
       best = { rank, tie, lead };
     }
   }
-
-  return {
-    verdict: 'selected',
-    lead: best.lead,
-    prospectIds,
-    jobBearingCount: jobBearing.length,
-  };
+  return best.lead;
 }
 
 /**
@@ -149,4 +190,4 @@ function distinctProspects(leads) {
 
 // TEST SEAM — the ranking primitive, exposed the way entry-source-map.js and
 // sync-leads.js expose theirs.
-export const _internal = { leadIdRank, hasJob, distinctProspects };
+export const _internal = { leadIdRank, hasJob, distinctProspects, highestLeadId };

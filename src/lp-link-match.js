@@ -122,7 +122,7 @@ export function lastNameKey(value) {
  *            lead: object|null, confidence: 'high'|'medium'|null, tier: 1|null,
  *            prospectIds: string[], via: string|null}}
  */
-export function classifyTierOne(contact, candidates, fanoutByKey) {
+export function classifyTierOne(contact, candidates, fanoutByKey, { requireJob = true } = {}) {
   if (!candidates || candidates.length === 0) {
     return { verdict: 'unmatched', lead: null, confidence: null, tier: null, prospectIds: [], via: null };
   }
@@ -145,7 +145,11 @@ export function classifyTierOne(contact, candidates, fanoutByKey) {
     };
   }
 
-  const picked = selectLinkLead(kept);
+  // requireJob: false only for the unreferenced-contact cohort — see the note
+  // in selectLinkLead. The caller must pair it with a fan-out map built without
+  // the lp_jobs filter, or the two halves judge ambiguity over different
+  // populations and the guard above goes blind to jobless fan-out.
+  const picked = selectLinkLead(kept, { requireJob });
   if (picked.verdict !== 'selected') {
     return {
       verdict: picked.verdict,

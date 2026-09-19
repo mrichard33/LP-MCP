@@ -42,6 +42,17 @@
  * not the most recent non-cancelled. `latestJob()` in src/lp-job-value.js
  * answers a different question and is untouched.
  *
+ * ─── TWO COHORTS, ONE MATCHER ──────────────────────────────────────────────
+ *   --cohort=p2            (default) open P2 opportunities with no lp_jobs row
+ *   --cohort=unreferenced  live GHL contacts that no LP lead points at
+ *
+ * The second is the mirror image of the first: that one starts from an open
+ * opportunity and asks where the customer's LP job is; this one starts from a
+ * contact nothing points at and asks whether an unlinked LP lead is plainly the
+ * same person. Everything after the cohort fetch is shared on purpose — a
+ * contact reached the second way is not better evidence, so it does not get a
+ * weaker bar.
+ *
  * ─── TIERS ─────────────────────────────────────────────────────────────────
  *   1  phone, last 10 digits, both sides normalized   → auto-write
  *   2  phone + zip agreement                          → auto-write, confidence high
@@ -149,7 +160,13 @@ const opt = {
   liveZip: !has('no-live-zip'),
   logDir: strArg('log-dir', './lp-link-repair'),
   reportDir: strArg('report-dir', './reports'),
+  cohort: strArg('cohort', 'p2'),
 };
+
+if (!['p2', 'unreferenced'].includes(opt.cohort)) {
+  console.error(`--cohort accepts p2 and unreferenced (got: ${opt.cohort})`);
+  process.exit(1);
+}
 
 const badTiers = [...opt.tiers].filter((t) => !['1', '2', '3'].includes(t));
 if (badTiers.length) {
@@ -199,6 +216,57 @@ async function fetchOpenP2(mirrorHasAddress) {
     );
   }
   return rows || [];
+}
+
+/**
+ * Live GHL contacts that no LP lead references, from the HL mirror.
+ *
+ * 2026-09-19. The mirror image of fetchOpenP2: that one starts from an open
+ * opportunity and asks "where is this customer's LP job"; this one starts from
+ * a contact nothing points at and asks "is there an unlinked LP lead that is
+ * plainly the same person". Measured that day: 25,040 live contacts, 18,595
+ * referenced, 6,446 unreferenced, of which 563 match an unlinked LP lead on the
+ * last 10 phone digits.
+ *
+ * EVERYTHING DOWNSTREAM IS UNCHANGED, and that is the point of routing it
+ * through this script rather than writing a second matcher. The fan-out guard,
+ * the job-bearing selection rule, the tier-3 report-only discipline and
+ * phone10_repair as the source all apply exactly as they do to the P2 cohort.
+ * A contact reached this way is not better evidence than one reached from an
+ * opportunity, so it does not get a weaker bar.
+ *
+ * Two instances, so the referenced set is fetched from LP and filtered in
+ * memory rather than joined (CLAUDE.md).
+ */
+async function fetchUnreferencedContacts(mirrorHasAddress) {
+  const zipCol = mirrorHasAddress ? 'c.postal_code' : 'NULL::text';
+
+  const referenced = new Set(
+    (await runSQL('SELECT DISTINCT ghl_contact_id FROM lp_leads WHERE ghl_contact_id IS NOT NULL'))
+      .map((r) => r.ghl_contact_id),
+  );
+
+  const rows = await hlRunSQL(`
+    SELECT c.ghl_contact_id, NULL::text AS ghl_opportunity_id, NULL::numeric AS monetary_value,
+           c.first_name, c.last_name, c.phone, c.email, ${zipCol} AS postal_code
+      FROM contacts c
+     WHERE c.deleted_at IS NULL
+     ORDER BY c.ghl_contact_id
+  `);
+
+  // Same completeness discipline as fetchOpenP2: a partial candidate set would
+  // silently under-repair rather than fail, which is the worse failure.
+  const [{ n } = {}] = await hlRunSQL(
+    'SELECT count(*) AS n FROM contacts c WHERE c.deleted_at IS NULL');
+  const expected = Number(n);
+  if (Number.isFinite(expected) && (rows || []).length !== expected) {
+    throw new Error(
+      `HL contacts read incomplete: got ${(rows || []).length} of ${expected}. `
+      + 'Refusing to repair from a partial candidate set.',
+    );
+  }
+
+  return (rows || []).filter((c) => !referenced.has(c.ghl_contact_id));
 }
 
 /** True when the contacts mirror carries postal_code (i.e. sql/017 has been applied). */
@@ -412,7 +480,20 @@ async function fetchIdentityReach(expr, keys) {
  * discarding good links — see disqualifyByFanout in src/lp-link-match.js for
  * the two live cases that pin the difference.
  */
-async function fetchKeyFanout(phoneExpr, altExpr, keys) {
+/**
+ * How many LP prospects each phone key reaches.
+ *
+ * `requireJob` must match what selectLinkLead is called with. With it true
+ * (the P2 cohort) only job-bearing prospects count, which is the population
+ * that cohort's selection judges over. With it false (the unreferenced cohort)
+ * EVERY prospect counts — a key reaching three prospects none of which has a
+ * job is 3 here and 0 under the filter, and that difference is the entire
+ * guard for a cohort whose leads mostly have no job row.
+ */
+async function fetchKeyFanout(phoneExpr, altExpr, keys, { requireJob = true } = {}) {
+  const jobFilter = requireJob
+    ? 'AND EXISTS (SELECT 1 FROM lp_jobs j WHERE j.lp_lead_id = l.lp_lead_id)'
+    : '';
   const out = new Map();
   const CHUNK = 200;
   for (let i = 0; i < keys.length; i += CHUNK) {
@@ -422,12 +503,12 @@ async function fetchKeyFanout(phoneExpr, altExpr, keys) {
         SELECT ${phoneExpr} AS k, l.lp_prospect_id
           FROM lp_leads l
          WHERE ${phoneExpr} IN (${sqlList(chunk)})
-           AND EXISTS (SELECT 1 FROM lp_jobs j WHERE j.lp_lead_id = l.lp_lead_id)
+           ${jobFilter}
         UNION ALL
         SELECT ${altExpr} AS k, l.lp_prospect_id
           FROM lp_leads l
          WHERE ${altExpr} IN (${sqlList(chunk)})
-           AND EXISTS (SELECT 1 FROM lp_jobs j WHERE j.lp_lead_id = l.lp_lead_id)
+           ${jobFilter}
       ) u GROUP BY k
     `);
     for (const r of (Array.isArray(rows) ? rows : [])) out.set(String(r.k), Number(r.n || 0));
@@ -624,9 +705,17 @@ async function main() {
     + `${mirrorHasAddress ? '' : ' — sql/017 (HL-MCP) not applied yet; tier 2 falls back to live GHL reads'}`,
   );
 
-  const opps = await fetchOpenP2(mirrorHasAddress);
-  console.log(`open P2 opportunities: ${opps.length}`);
+  const opps = opt.cohort === 'unreferenced'
+    ? await fetchUnreferencedContacts(mirrorHasAddress)
+    : await fetchOpenP2(mirrorHasAddress);
+  console.log(opt.cohort === 'unreferenced'
+    ? `live GHL contacts no LP lead references: ${opps.length}`
+    : `open P2 opportunities: ${opps.length}`);
 
+  // For the unreferenced cohort this is a no-op by construction — lp_jobs is
+  // keyed on ghl_contact_id, so a contact nothing references has no job row.
+  // It is left in the path rather than branched around so both cohorts go
+  // through exactly the same filter.
   const withJobs = await contactsWithJobs([...new Set(opps.map((o) => o.ghl_contact_id))]);
   const cohort = opps.filter((o) => !withJobs.has(o.ghl_contact_id));
   console.log(`of those, WITHOUT any lp_jobs row (the repair cohort): ${cohort.length}`);
@@ -680,7 +769,10 @@ async function main() {
 
     // Fan-out over EVERY lead carrying the key, link state ignored. This is the
     // population the ambiguity guard has to see — see disqualifyByFanout.
-    const fanoutByKey = await fetchKeyFanout(PHONE10_EXPR, PHONE_ALT10_EXPR, phoneKeys);
+    // The unreferenced cohort accepts a lead with no job, so its ambiguity guard
+    // must count every prospect a key reaches, not just job-bearing ones.
+    const requireJob = opt.cohort !== 'unreferenced';
+    const fanoutByKey = await fetchKeyFanout(PHONE10_EXPR, PHONE_ALT10_EXPR, phoneKeys, { requireJob });
     const wide = [...fanoutByKey.entries()].filter(([, n]) => n > 1);
     console.log(`tier 1: ${wide.length} of ${phoneKeys.length} phone keys reach more than one job-bearing prospect — those contacts are refused`);
 
@@ -724,7 +816,7 @@ async function main() {
           }
         }
       }
-      const d = classifyTierOne(c, [...seen.values()], fanoutByKey);
+      const d = classifyTierOne(c, [...seen.values()], fanoutByKey, { requireJob });
       // Remember which prospects this contact reached, so a refusal can be
       // explained below without re-running the match.
       d.reachedProspects = [...new Set([...seen.values()]
@@ -776,10 +868,64 @@ async function main() {
     }
   }
 
+  // ─── The prospect invariant, checked against live state ───────────────────
+  //
+  // 2026-09-19. One LP prospect is one person, so it cannot own two GHL
+  // contacts. The write guard is `ghl_contact_id IS NULL`, which protects the
+  // LEAD but says nothing about its SIBLINGS — so a selection can be perfectly
+  // unambiguous on its own key and still put a second contact on a prospect
+  // that already has one.
+  //
+  // That is not hypothetical: the first live run of --cohort=unreferenced did
+  // it once, on prospect 401902, whose leads carry three transposed spellings
+  // of one number (9176347921 / 9176347492 / 9146347921). Each key was
+  // unambiguous; together they reached two contacts.
+  //
+  // Checked here against live state rather than inside classifyTierOne, because
+  // it is a fact about the database at write time, not about the match.
+  const selected = [...decisions.values()].filter((d) => d.verdict === 'selected' && d.lead?.lp_prospect_id);
+  if (selected.length) {
+    const prospectIds = [...new Set(selected.map((d) => String(d.lead.lp_prospect_id)))];
+    const existing = new Map();
+    for (let i = 0; i < prospectIds.length; i += 200) {
+      const rows = await runSQL(`
+        SELECT lp_prospect_id, ghl_contact_id FROM lp_leads
+         WHERE lp_prospect_id IN (${sqlList(prospectIds.slice(i, i + 200))})
+           AND ghl_contact_id IS NOT NULL
+         GROUP BY lp_prospect_id, ghl_contact_id`);
+      for (const r of (Array.isArray(rows) ? rows : [])) {
+        const k = String(r.lp_prospect_id);
+        if (!existing.has(k)) existing.set(k, new Set());
+        existing.get(k).add(r.ghl_contact_id);
+      }
+    }
+    let refused = 0;
+    for (const [contactId, d] of decisions) {
+      if (d.verdict !== 'selected' || !d.lead?.lp_prospect_id) continue;
+      const held = existing.get(String(d.lead.lp_prospect_id));
+      if (!held || held.size === 0) continue;
+      if (held.has(contactId)) continue;   // already ours; the write is a no-op
+      // The prospect points somewhere else. Which of the two is right is a
+      // triage decision with evidence behind it (see
+      // src/prospect-link-election.js), not a repair's call.
+      decisions.set(contactId, {
+        ...d,
+        verdict: 'prospect_already_linked',
+        lead: null,
+        heldBy: [...held],
+      });
+      refused++;
+    }
+    if (refused) {
+      console.log(`\nprospect invariant: ${refused} selection(s) refused — the prospect already points at a different contact`);
+    }
+  }
+
   // ─── Writes ───────────────────────────────────────────────────────────────
   const stats = {
     matched: 0, written: 0, ambiguous: 0, no_job_bearing_lead: 0,
     no_candidates: 0, unmatched: 0, raced: 0, over_limit: 0, failed: 0, ambiguous_key: 0,
+    prospect_already_linked: 0,
     confidence_high: 0, confidence_medium: 0,
   };
   const log = openLog();
@@ -887,7 +1033,7 @@ async function main() {
   console.log(`\n${'─'.repeat(74)}`);
   console.log('SUMMARY');
   console.log('─'.repeat(74));
-  console.log(`cohort (open P2, no lp_jobs row)   : ${cohort.length}`);
+  console.log(`cohort (${opt.cohort === 'unreferenced' ? 'unreferenced contacts' : 'open P2, no lp_jobs row'})   : ${cohort.length}`);
   if (runTier1) {
     console.log('\ntier 1/2 — phone, last 10 digits:');
     console.log(`  matched (a lead was selected)    : ${stats.matched}`);
@@ -903,6 +1049,7 @@ async function main() {
     console.log(`  raced (link appeared mid-run)    : ${stats.raced}`);
     console.log(`  ambiguous (refused)              : ${stats.ambiguous}`);
     console.log(`  ambiguous_key (refused)          : ${stats.ambiguous_key}`);
+    console.log(`  prospect_already_linked (refused): ${stats.prospect_already_linked}`);
     console.log(`  no_job_bearing_lead (refused)    : ${stats.no_job_bearing_lead}`);
     // WHY, because "no job-bearing lead" is three different problems with three
     // different owners, and only one of them is ever a matching bug.
@@ -949,7 +1096,7 @@ async function main() {
   console.log(`\nzip source used — mirror: ${zipSource.mirror}, live GHL: ${zipSource.live}, none: ${zipSource.none}`);
   if (runTier1) {
     console.log(
-      `\nof the ${cohort.length} unreconcilable opportunities, `
+      `\nof the ${cohort.length} ${opt.cohort === 'unreferenced' ? 'unreferenced contacts' : 'unreconcilable opportunities'}, `
       + `${opt.apply ? stats.written : stats.matched} ${opt.apply ? 'now carry' : 'would carry'} a link `
       + `(${cohort.length - (opt.apply ? stats.written : stats.matched)} still unresolved).`,
     );
