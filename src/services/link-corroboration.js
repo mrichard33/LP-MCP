@@ -69,6 +69,27 @@ export const LINK_SOURCE = {
   // row. So like phone10_repair this falls through linkStrength() to 1 and any
   // later real corroboration displaces it, and it is its own audit trail.
   PROSPECT_PROPAGATED: 'prospect_propagated',
+  // 2026-09-19: written ONLY by scripts/repair-dead-link-targets.js, where the
+  // GHL contact a lead pointed at is soft-deleted in the mirror. The link does
+  // not point at a person any more, so the id is cleared and this stands in its
+  // place as the record of why — a NULL id under a stale phone_email_match
+  // would claim evidence that no longer exists.
+  //
+  // Reserved for a target that is GONE. A contact that is merely
+  // uncorroboratable (no phone and no email to compare against) is NOT this:
+  // that is "could not tell", and a read concluding nothing must never destroy
+  // a link. Those rows are reported and left alone.
+  TARGET_UNRESOLVABLE: 'target_unresolvable',
+  // 2026-09-19: written ONLY by scripts/elect-prospect-links.js, where the
+  // leads under one prospect disagreed about their GHL contact and
+  // src/prospect-link-election.js elected one on evidence (phone agreement
+  // first, then source trust, then how many leads held it). The losing leads
+  // are re-pointed at the winner, because one LP prospect is one person.
+  //
+  // Strength 1 like the other repair sources, so a later real corroboration
+  // displaces it, and it is its own audit trail: this value marks every lead
+  // whose link was decided by the ladder rather than matched directly.
+  PROSPECT_ELECTED: 'prospect_elected',
 };
 
 // Trust ranking for the downgrade guard: a stored rank-3 source is only ever

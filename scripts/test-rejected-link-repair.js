@@ -15,6 +15,7 @@ import {
   buildRejectedLinkClear,
   buildRejectedSourceReset,
   buildRejectedLinkReadback,
+  buildDeadTargetClear,
 } from '../src/lp-link-write-sql.js';
 
 const LEAD = '531457';
@@ -68,4 +69,28 @@ test('readback returns both columns, so each outcome is observed', () => {
   const sql = buildRejectedLinkReadback(LEAD);
   assert.match(sql.trimStart(), /^SELECT /);
   assert.ok(sql.includes('ghl_contact_id') && sql.includes('ghl_link_source'));
+});
+
+// ─── Dead link targets ──────────────────────────────────────────────────────
+
+test('dead-target clear removes the id AND retires the stale source', () => {
+  const sql = buildDeadTargetClear(LEAD, ID);
+  const set = setClause(sql);
+  assert.match(set, /ghl_contact_id = NULL/);
+  assert.match(set, /ghl_link_source = 'target_unresolvable'/,
+    'the old source asserted evidence about a contact that has since been deleted');
+  assert.match(sql.trimStart(), /^UPDATE /);
+  assert.doesNotMatch(sql, /\bWITH\b/i);
+});
+
+test('dead-target clear guards on the id we read, but not on the source', () => {
+  const sql = buildDeadTargetClear(LEAD, ID);
+  assert.ok(sql.includes(`ghl_contact_id = '${ID}'`),
+    'a row the live sync relinked between read and write is not ours to touch');
+  assert.doesNotMatch(sql, /WHERE[\s\S]*ghl_link_source/,
+    'the contact being gone is true whatever the row claims about how it was linked');
+});
+
+test('dead-target clear escapes quotes in the id', () => {
+  assert.ok(buildDeadTargetClear(LEAD, "o'brien").includes("'o''brien'"));
 });

@@ -123,4 +123,39 @@ export function buildRejectedLinkReadback(lpLeadId) {
    WHERE lp_lead_id = '${q(lpLeadId)}'`;
 }
 
+/**
+ * Clear a link whose GHL contact no longer exists, recording why.
+ *
+ * 2026-09-19. Used by scripts/repair-dead-link-targets.js. Unlike the rejected
+ * clear above this also REPLACES the source: the old one (typically
+ * phone_email_match) asserted evidence about a contact that has since been
+ * deleted, and leaving it beside a NULL id would keep claiming it.
+ *
+ * Guards on the id we read, so a row the live sync relinked in the meantime is
+ * left alone. A bare UPDATE, for the run_sql reason at the top of this file.
+ */
+export function buildDeadTargetClear(lpLeadId, seenContactId) {
+  return `UPDATE lp_leads
+     SET ghl_contact_id = NULL, ghl_link_source = 'target_unresolvable'
+   WHERE lp_lead_id = '${q(lpLeadId)}'
+     AND ghl_contact_id = '${q(seenContactId)}'`;
+}
+
+/**
+ * Re-point a lead at the contact elected for its prospect.
+ *
+ * 2026-09-19. Used by scripts/elect-prospect-links.js. Unlike
+ * buildLeadLinkUpdate, which writes only into a NULL, this deliberately
+ * OVERWRITES a populated id — that is the whole point, since the conflict is
+ * two populated ids under one prospect. The guard is therefore the losing id
+ * we actually read, not IS NULL: if the live sync changed the row in the
+ * meantime, the election was made on stale evidence and must not apply.
+ */
+export function buildElectedLinkUpdate(lpLeadId, seenContactId, electedContactId) {
+  return `UPDATE lp_leads
+     SET ghl_contact_id = '${q(electedContactId)}', ghl_link_source = 'prospect_elected'
+   WHERE lp_lead_id = '${q(lpLeadId)}'
+     AND ghl_contact_id = '${q(seenContactId)}'`;
+}
+
 export const _internal = { q };
