@@ -26,7 +26,7 @@ import assert from 'node:assert/strict';
 
 import { selectLinkLead } from '../src/lp-link-selection.js';
 import {
-  phone10, zipKey, lastNameKey, emailKey, classifyTierOne, buildTier3Rows,
+  phone10, zipKey, lastNameKey, classifyTierOne, buildTier3Rows, disqualifyByFanout,
 } from '../src/lp-link-match.js';
 import { shouldAlertLinkLeak, formatLinkLeakAlert } from '../src/link-leak-alerts.js';
 import {
@@ -320,25 +320,7 @@ test("a lp_lead_id containing a quote cannot break out of the literal", () => {
 // Part 2 — the widened matcher
 // ═══════════════════════════════════════════════════════════════════
 
-test('emailKey lowercases and trims, and refuses anything unusable', () => {
-  assert.equal(emailKey('  A.B@Example.COM '), 'a.b@example.com');
-  assert.equal(emailKey('joe@x.co'), 'joe@x.co');
-  for (const bad of ['bob@', '@x.com', 'not-an-email', 'a@b', '', null, undefined]) {
-    assert.equal(emailKey(bad), null, `should reject ${JSON.stringify(bad)}`);
-  }
-});
 
-test('role addresses are refused — they belong to a business, not a person', () => {
-  // One info@ can span dozens of unrelated prospects. The selection rule's
-  // multi-prospect guard would usually catch it, but never offering the
-  // candidate is cheaper and clearer.
-  for (const role of ['info@reece.com', 'noreply@x.io', 'sales@y.net', 'unknown@z.org']) {
-    assert.equal(emailKey(role), null, `should reject ${role}`);
-  }
-  // A real person whose name merely resembles one is untouched.
-  assert.equal(emailKey('info.smith@x.com'), 'info.smith@x.com');
-  assert.equal(emailKey('salesbob@x.com'), 'salesbob@x.com');
-});
 
 test('the prospect widening finds the job on a SIBLING lead', () => {
   // The Espel case, prospect 2872: the phone match lands on a lead with no job,
@@ -389,4 +371,72 @@ test('via is reported for every write path, and null when nothing was selected',
     null,
     'a refusal has no via — nothing was reached',
   );
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// The key fan-out guard — the 2026-09-19 false link
+// ═══════════════════════════════════════════════════════════════════
+
+test('a key reaching several job-bearing prospects is refused, even with one unlinked lead', () => {
+  // THE CASE. GHL contact fkAMlTXbJ6uLokm2bdqN was linked to LP lead 397568 —
+  // June & Bryan Holmes, phone 2396711291 — on a shared email. The contact's
+  // phone is 9414996465. Different people. The email was the CANVASSER'S own
+  // (raiello54@gmail.com, promoter "Aiello, Robert - FTM"), on 148 leads across
+  // 76 prospects, 5 of them job-bearing.
+  //
+  // The old guard saw ONE candidate, because only one of those 148 leads was
+  // still unlinked — the `ghl_contact_id IS NULL` write-scope filter hid the
+  // ambiguity. Fan-out is measured over the key instead.
+  const candidates = [lead(397568, true, '303620', { match_key: 'raiello54@gmail.com' })];
+  const fanout = new Map([['raiello54@gmail.com', 5]]);
+
+  assert.equal(selectLinkLead(candidates).verdict, 'selected', 'the old guard saw no ambiguity');
+
+  const res = classifyTierOne({ ghl_contact_id: 'C1', ghlZip: null }, candidates, fanout);
+  assert.equal(res.verdict, 'ambiguous_key');
+  assert.equal(res.lead, null);
+  assert.equal(res.fanout, 5);
+});
+
+test('a key reaching ONE job-bearing prospect still writes, even if it spans two prospects', () => {
+  // The counter-case that stops the guard being too blunt. Lead 522468 (Manuela
+  // Hernandez) shares a phone with lead 310163 under a different prospect — LP
+  // holds the same person twice — but only one of those prospects has a job, so
+  // the job-bearing rule already resolves it and the link is correct.
+  // Counting ALL prospects instead of job-bearing ones would discard it.
+  const candidates = [lead(522468, true, '418115', { match_key: '2393246951', zip: '33990' })];
+  const res = classifyTierOne({ ghl_contact_id: 'C1', ghlZip: '33990' },
+    candidates, new Map([['2393246951', 1]]));
+  assert.equal(res.verdict, 'selected');
+  assert.equal(res.lead.lp_lead_id, '522468');
+});
+
+test('a key with no fan-out entry FAILS CLOSED', () => {
+  // "Could not tell" must never write a link — the same doctrine as the
+  // three-way alert verdicts elsewhere in this repo.
+  const res = classifyTierOne({ ghl_contact_id: 'C1' },
+    [lead(1, true, '9', { match_key: '5551234567' })], new Map());
+  assert.equal(res.verdict, 'ambiguous_key');
+  assert.equal(res.fanout, null);
+});
+
+test('candidates with no match_key bypass the guard — they are not key-derived', () => {
+  // The prospect widening reaches siblings through a lead we already identified,
+  // not through a key, so the key guard has nothing to say about them.
+  const { kept, rejected } = disqualifyByFanout(
+    [lead(1, true, '9'), lead(2, true, '9', { match_key: 'k' })],
+    new Map([['k', 3]]),
+  );
+  assert.equal(kept.length, 1);
+  assert.equal(kept[0].lp_lead_id, '1');
+  assert.deepEqual(rejected, [{ key: 'k', fanout: 3 }]);
+});
+
+test('email is gone as a match key, and stays gone', async () => {
+  // A canvasser's own address on 148 customer records is not identity. Across
+  // the whole 306-opportunity cohort the email tier produced two matches and
+  // both were the same false one. If you re-add it, this test should be the
+  // thing that makes you justify it.
+  const mod = await import('../src/lp-link-match.js');
+  assert.equal('emailKey' in mod, false, 'email must not be a match key here');
 });

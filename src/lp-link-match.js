@@ -57,32 +57,31 @@ export function zipKey(value) {
 }
 
 /**
- * The comparable form of an email, or null when it is not usable as identity.
+ * ─── WHY EMAIL IS NOT A MATCH KEY HERE ──────────────────────────────────────
+ * It was one, for a few hours on 2026-09-19, and it wrote a false link.
  *
- * Lowercased and trimmed — LP and GHL disagree on case constantly. Anything
- * without an `@` and a dot after it is rejected rather than compared.
+ * GHL contact fkAMlTXbJ6uLokm2bdqN was matched to LP lead 397568 — June & Bryan
+ * Holmes, phone 2396711291 — on a shared email. The contact's phone is
+ * 9414996465. Different people entirely. The email was `raiello54@gmail.com`,
+ * and lead 397568 is `lead_source = 'Canvass'` with
+ * `promoter_name = 'Aiello, Robert - FTM'`: the CANVASSER'S OWN ADDRESS, typed
+ * into 148 customers' records spanning 76 prospects.
  *
- * SHARED AND ROLE ADDRESSES ARE REFUSED. `info@`, `noreply@` and friends belong
- * to a business, not a person, and one of them can span dozens of unrelated
- * prospects — exactly the shape that attaches a stranger's job to a customer.
- * The selection rule's multi-prospect guard would usually catch that, but it is
- * cheaper and clearer to never offer the candidate. This list is deliberately
- * short: it covers the addresses that are role accounts by definition, not every
- * address that happens to be popular.
+ * CANVASSER-ENTERED CONTACT FIELDS ARE NOT CUSTOMER IDENTITY. A canvassing lead
+ * (`lead_source` of 'Canvass' or 'Canvass Sticky', `ghl_entry_tag`
+ * 'entry:canvassing') carries whatever the person at the door typed, and a
+ * canvasser filling a required field reaches for their own address. Measured the
+ * same day: four leads in this cohort carry emails shared across 2,418 prospects.
+ *
+ * And the yield did not justify any of it — across the entire 306-opportunity
+ * cohort the email tier produced TWO matches, and both were this same false one.
+ * Phone had already found everything email could legitimately find.
+ *
+ * So email is gone rather than gated. If you are about to add it back, you need
+ * new evidence that it finds something phone does not, AND it must pass the
+ * fan-out guard below. The guard alone would have blocked this case; the tier
+ * still would not have earned its place.
  */
-const ROLE_LOCALPARTS = new Set([
-  'info', 'noreply', 'no-reply', 'donotreply', 'do-not-reply', 'admin', 'office',
-  'sales', 'support', 'contact', 'billing', 'service', 'help', 'test', 'email',
-  'none', 'na', 'n/a', 'unknown', 'customer',
-]);
-
-export function emailKey(value) {
-  const raw = String(value ?? '').trim().toLowerCase();
-  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(raw)) return null;
-  const local = raw.slice(0, raw.indexOf('@'));
-  if (ROLE_LOCALPARTS.has(local)) return null;
-  return raw;
-}
 
 /**
  * The comparable form of a surname: lowercase, letters only, or null.
@@ -123,12 +122,30 @@ export function lastNameKey(value) {
  *            lead: object|null, confidence: 'high'|'medium'|null, tier: 1|null,
  *            prospectIds: string[], via: string|null}}
  */
-export function classifyTierOne(contact, candidates) {
+export function classifyTierOne(contact, candidates, fanoutByKey) {
   if (!candidates || candidates.length === 0) {
     return { verdict: 'unmatched', lead: null, confidence: null, tier: null, prospectIds: [], via: null };
   }
 
-  const picked = selectLinkLead(candidates);
+  // The key guard runs BEFORE selection, not after. A key that reaches several
+  // job-bearing prospects is not a tie to break — it is not evidence at all, and
+  // letting it reach selectLinkLead would invite the same mistake in a new form.
+  const { kept, rejected } = disqualifyByFanout(candidates, fanoutByKey);
+  if (kept.length === 0 && rejected.length > 0) {
+    const worst = rejected.reduce((a, b) => ((b.fanout ?? Infinity) > (a.fanout ?? Infinity) ? b : a));
+    return {
+      verdict: 'ambiguous_key',
+      lead: null,
+      confidence: null,
+      tier: null,
+      prospectIds: [],
+      via: null,
+      fanout: worst.fanout,
+      fanoutKey: worst.key,
+    };
+  }
+
+  const picked = selectLinkLead(kept);
   if (picked.verdict !== 'selected') {
     return {
       verdict: picked.verdict,
@@ -152,6 +169,52 @@ export function classifyTierOne(contact, candidates) {
     prospectIds: picked.prospectIds,
     via: picked.lead?.matched_via ?? null,
   };
+}
+
+/**
+ * Drop candidates whose match key reaches more than one JOB-BEARING prospect.
+ *
+ * THE DEFECT THIS CLOSES, measured 2026-09-19. Every candidate query filters
+ * `ghl_contact_id IS NULL`, because that is the write scope. `selectLinkLead`
+ * then judged ambiguity over THAT FILTERED SET — so a key shared by 76 prospects
+ * looked perfectly unambiguous, because only one of its 148 leads happened to
+ * still be unlinked. The guard was measuring the wrong population.
+ *
+ * Ambiguity is a property of the KEY, not of how many of its rows are currently
+ * writable. So the caller counts fan-out over ALL leads carrying the key,
+ * ignoring link state, and passes it in here.
+ *
+ * WHY JOB-BEARING PROSPECTS AND NOT ALL PROSPECTS. A blanket "fan-out > 1 is
+ * ambiguous" is too blunt and would discard good links. Lead 522468 — Manuela
+ * Hernandez — shares a phone with lead 310163 under a different prospect,
+ * because LP holds the same person twice. Only one of those prospects has a job,
+ * so the job-bearing rule already resolves it correctly and the link is right.
+ * Counting job-bearing prospects separates the two cases exactly:
+ *
+ *   canvasser email raiello54@gmail.com : 76 prospects, 5 with jobs → REFUSE
+ *   phone 2393246951 (lead 522468)      :  2 prospects, 1 with a job → ALLOW
+ *
+ * FAILS CLOSED. A key with no fan-out entry is treated as unknown and its
+ * candidates are dropped: we could not tell, and "could not tell" must never
+ * write a link. Same doctrine as the three-way alert verdicts in this repo.
+ *
+ * @param {Array<object>} candidates  each may carry `match_key`
+ * @param {Map<string, number>} fanoutByKey  key → DISTINCT job-bearing prospects
+ * @returns {{kept: Array<object>, rejected: Array<{key: string, fanout: number|null}>}}
+ */
+export function disqualifyByFanout(candidates, fanoutByKey) {
+  const kept = [];
+  const rejected = [];
+  for (const c of candidates || []) {
+    // A candidate with no key is one the caller reached some other way (the
+    // prospect widening); it is not key-derived, so the key guard does not apply.
+    if (!c || !c.match_key) { if (c) kept.push(c); continue; }
+    const fanout = fanoutByKey instanceof Map ? fanoutByKey.get(c.match_key) : undefined;
+    if (fanout === undefined || fanout === null) { rejected.push({ key: c.match_key, fanout: null }); continue; }
+    if (fanout > 1) { rejected.push({ key: c.match_key, fanout }); continue; }
+    kept.push(c);
+  }
+  return { kept, rejected };
 }
 
 /**

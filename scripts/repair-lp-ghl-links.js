@@ -65,6 +65,18 @@
  * AMBIGUITY IS A REFUSAL, NOT A COIN FLIP. More than one candidate surviving the
  * selection rule is reported `ambiguous` and nothing is written.
  *
+ * AND AMBIGUITY IS A PROPERTY OF THE KEY, NOT OF THE WRITABLE ROWS. Every
+ * candidate query filters `ghl_contact_id IS NULL`, because that is the write
+ * scope. Judging ambiguity over THAT set is how a key shared by 76 prospects
+ * passed as unambiguous on 2026-09-19 — only one of its 148 leads was still
+ * unlinked. fetchKeyFanout counts over every lead carrying the key, link state
+ * ignored, and a key reaching more than one JOB-BEARING prospect is refused
+ * `ambiguous_key` before selection ever runs.
+ *
+ * EMAIL IS NOT A MATCH KEY. It was, briefly, and it wrote a false link off a
+ * canvasser's own address that appears on 148 customers' records. The full
+ * account is in the header of src/lp-link-match.js. Do not re-add it.
+ *
  * ─── SAFETY ────────────────────────────────────────────────────────────────
  * DRY RUN BY DEFAULT — needs --apply to write anything.
  * Every write is guarded `AND ghl_contact_id IS NULL`, so a link established by
@@ -109,7 +121,7 @@ import {
 } from '../src/lp-link-write-sql.js';
 import { runSQL } from '../src/admin/supabase-admin.js';
 import {
-  phone10, zipKey, lastNameKey, emailKey, classifyTierOne, buildTier3Rows,
+  phone10, zipKey, lastNameKey, classifyTierOne, buildTier3Rows,
 } from '../src/lp-link-match.js';
 import { LINK_SOURCE } from '../src/services/link-corroboration.js';
 import { selectAllIn } from '../src/supabase-page.js';
@@ -258,7 +270,6 @@ async function fetchLeadsByIdentity(expr, keys, via) {
 
 const PHONE10_EXPR = `right(regexp_replace(coalesce(l.phone,''), '[^0-9]', '', 'g'), 10)`;
 const PHONE_ALT10_EXPR = `right(regexp_replace(coalesce(l.phone_alt,''), '[^0-9]', '', 'g'), 10)`;
-const EMAIL_EXPR = `lower(btrim(coalesce(l.email,'')))`;
 
 /**
  * Every unlinked lead under these prospects — the prospect-level widening.
@@ -381,6 +392,51 @@ async function fetchIdentityReach(expr, keys) {
     }
   }
   return reach;
+}
+
+/**
+ * Per-key fan-out: how many DISTINCT JOB-BEARING prospects each key reaches,
+ * across EVERY lead carrying it, link state ignored.
+ *
+ * This is the population the ambiguity guard must see. Every other query here
+ * filters `ghl_contact_id IS NULL` because that is the write scope — and on
+ * 2026-09-19 that filter is exactly what let a key shared by 76 prospects look
+ * unambiguous, because only one of its 148 leads was still unlinked. The guard
+ * was measuring the writable rows instead of the key.
+ *
+ * Both phone columns are unioned: a key is "reached" whether it appears as a
+ * lead's phone or its phone_alt, so the fan-out cannot be understated by a
+ * household whose second number carries the duplicate.
+ *
+ * Counting JOB-BEARING prospects, not all prospects, is what keeps this from
+ * discarding good links — see disqualifyByFanout in src/lp-link-match.js for
+ * the two live cases that pin the difference.
+ */
+async function fetchKeyFanout(phoneExpr, altExpr, keys) {
+  const out = new Map();
+  const CHUNK = 200;
+  for (let i = 0; i < keys.length; i += CHUNK) {
+    const chunk = keys.slice(i, i + CHUNK);
+    const rows = await runSQL(`
+      SELECT k, count(DISTINCT lp_prospect_id) AS n FROM (
+        SELECT ${phoneExpr} AS k, l.lp_prospect_id
+          FROM lp_leads l
+         WHERE ${phoneExpr} IN (${sqlList(chunk)})
+           AND EXISTS (SELECT 1 FROM lp_jobs j WHERE j.lp_lead_id = l.lp_lead_id)
+        UNION ALL
+        SELECT ${altExpr} AS k, l.lp_prospect_id
+          FROM lp_leads l
+         WHERE ${altExpr} IN (${sqlList(chunk)})
+           AND EXISTS (SELECT 1 FROM lp_jobs j WHERE j.lp_lead_id = l.lp_lead_id)
+      ) u GROUP BY k
+    `);
+    for (const r of (Array.isArray(rows) ? rows : [])) out.set(String(r.k), Number(r.n || 0));
+    // A key with NO job-bearing lead never appears above. Record it as 0 rather
+    // than leaving it absent, because absent means "could not tell" to the guard
+    // and would fail closed on a key that is simply not ambiguous.
+    for (const k of chunk) if (!out.has(k)) out.set(k, 0);
+  }
+  return out;
 }
 
 /** Unlinked LP leads matching any of these surname keys — tier 3 candidates only. */
@@ -601,41 +657,39 @@ async function main() {
   const viaCounts = new Map();   // how each written link was reached
   if (runTier1) {
     const phoneKeys = [...new Set(cohort.map((c) => phone10(c.phone)).filter(Boolean))];
-    const emailKeys = [...new Set(cohort.map((c) => emailKey(c.email)).filter(Boolean))];
-    console.log(`\ntier 1: ${phoneKeys.length} distinct phones, ${emailKeys.length} usable emails, from ${cohort.length} contacts`);
+    console.log(`\ntier 1: ${phoneKeys.length} distinct phones from ${cohort.length} contacts`);
 
     // A GHL contact's phone can match an LP lead's phone OR its phone_alt —
     // the household's second number is the same household.
     const byPhone = new Map();
-    const byEmail = new Map();
     const addTo = (map, key, lead) => {
       if (!key) return;
       if (!map.has(key)) map.set(key, []);
       map.get(key).push(lead);
     };
 
+    // Both phone columns key on the SAME normalized value, so a contact's phone
+    // matching an LP lead's phone_alt is the same household's second number.
     for (const l of await fetchLeadsByIdentity(PHONE10_EXPR, phoneKeys, 'phone')) {
-      addTo(byPhone, l.phone10, l);
+      addTo(byPhone, l.phone10, { ...l, match_key: l.phone10 });
     }
     for (const l of await fetchLeadsByIdentity(PHONE_ALT10_EXPR, phoneKeys, 'phone_alt')) {
-      addTo(byPhone, l.phone_alt10, l);
+      addTo(byPhone, l.phone_alt10, { ...l, match_key: l.phone_alt10 });
     }
-    if (emailKeys.length) {
-      for (const l of await fetchLeadsByIdentity(EMAIL_EXPR, emailKeys, 'email')) {
-        addTo(byEmail, l.email_key, l);
-      }
-    }
-    console.log(
-      `tier 1: matched on phone/alt for ${byPhone.size} keys, on email for ${byEmail.size} keys`,
-    );
+    console.log(`tier 1: matched on phone/alt for ${byPhone.size} keys`);
+
+    // Fan-out over EVERY lead carrying the key, link state ignored. This is the
+    // population the ambiguity guard has to see — see disqualifyByFanout.
+    const fanoutByKey = await fetchKeyFanout(PHONE10_EXPR, PHONE_ALT10_EXPR, phoneKeys);
+    const wide = [...fanoutByKey.entries()].filter(([, n]) => n > 1);
+    console.log(`tier 1: ${wide.length} of ${phoneKeys.length} phone keys reach more than one job-bearing prospect — those contacts are refused`);
 
     // Per-contact candidate set from the identity keys, deduped by lead id — a
     // lead reachable by both phone and email must not count twice, and the
     // FIRST way it was reached is the one reported (phone before email).
     const directFor = (c) => {
       const seen = new Map();
-      for (const l of [...(byPhone.get(phone10(c.phone)) || []),
-                       ...(byEmail.get(emailKey(c.email)) || [])]) {
+      for (const l of byPhone.get(phone10(c.phone)) || []) {
         if (!seen.has(l.lp_lead_id)) seen.set(l.lp_lead_id, l);
       }
       return [...seen.values()];
@@ -670,7 +724,7 @@ async function main() {
           }
         }
       }
-      const d = classifyTierOne(c, [...seen.values()]);
+      const d = classifyTierOne(c, [...seen.values()], fanoutByKey);
       // Remember which prospects this contact reached, so a refusal can be
       // explained below without re-running the match.
       d.reachedProspects = [...new Set([...seen.values()]
@@ -702,13 +756,14 @@ async function main() {
     const unmatchedContacts = cohort.filter(
       (c) => decisions.get(c.ghl_contact_id)?.verdict === 'unmatched');
     if (unmatchedContacts.length) {
+      // Phone only, deliberately. Email is not identity in this data (see the
+      // header of src/lp-link-match.js), so using it to decide "an LP record
+      // exists for this customer" would report the same falsehood the matcher
+      // was removed for — just in a CSV column instead of a write.
       const uPhones = [...new Set(unmatchedContacts.map((c) => phone10(c.phone)).filter(Boolean))];
-      const uEmails = [...new Set(unmatchedContacts.map((c) => emailKey(c.email)).filter(Boolean))];
       const phoneReach = uPhones.length ? await fetchIdentityReach(PHONE10_EXPR, uPhones) : new Map();
-      const emailReach = uEmails.length ? await fetchIdentityReach(EMAIL_EXPR, uEmails) : new Map();
       for (const c of unmatchedContacts) {
-        const hits = [phoneReach.get(phone10(c.phone) || ''), emailReach.get(emailKey(c.email) || '')]
-          .filter(Boolean);
+        const hits = [phoneReach.get(phone10(c.phone) || '')].filter(Boolean);
         const any = hits.reduce((n, h) => n + h.any, 0);
         const linked = hits.reduce((n, h) => n + h.linked, 0);
         const withJob = hits.reduce((n, h) => n + h.withJob, 0);
@@ -724,7 +779,7 @@ async function main() {
   // ─── Writes ───────────────────────────────────────────────────────────────
   const stats = {
     matched: 0, written: 0, ambiguous: 0, no_job_bearing_lead: 0,
-    no_candidates: 0, unmatched: 0, raced: 0, over_limit: 0, failed: 0,
+    no_candidates: 0, unmatched: 0, raced: 0, over_limit: 0, failed: 0, ambiguous_key: 0,
     confidence_high: 0, confidence_medium: 0,
   };
   const log = openLog();
@@ -847,6 +902,7 @@ async function main() {
     console.log(`  written                          : ${stats.written}${opt.apply ? '' : '  (dry run — nothing written)'}`);
     console.log(`  raced (link appeared mid-run)    : ${stats.raced}`);
     console.log(`  ambiguous (refused)              : ${stats.ambiguous}`);
+    console.log(`  ambiguous_key (refused)          : ${stats.ambiguous_key}`);
     console.log(`  no_job_bearing_lead (refused)    : ${stats.no_job_bearing_lead}`);
     // WHY, because "no job-bearing lead" is three different problems with three
     // different owners, and only one of them is ever a matching bug.
