@@ -287,11 +287,46 @@ async function checkEngineHealth() {
  *
  * @returns {Promise<object|null>} counts, or null if the read failed.
  */
+/**
+ * The most frequent error string across a set of ai.analysis_failed payloads.
+ *
+ * Grouped on a NORMALIZED key, not the raw message: the two live causes on
+ * 2026-09-18 both embed per-call detail (a contact id, a millisecond count), so
+ * counting raw strings would have reported 57 distinct "top" errors instead of
+ * 2 real ones. Digits and long hex ids collapse; the raw message of whichever
+ * group wins is what gets displayed, so the operator still sees a real example.
+ */
+function mostCommonError(failures) {
+  const groups = new Map();
+  for (const row of failures || []) {
+    const raw = row?.payload?.error;
+    if (typeof raw !== 'string' || !raw) continue;
+    const key = raw
+      .replace(/[0-9a-zA-Z]{20,}/g, '<id>')   // GHL/contact ids
+      .replace(/\d+/g, '<n>')                  // ms counts, token budgets, statuses
+      .slice(0, 200);
+    const hit = groups.get(key);
+    if (hit) hit.n++;
+    else groups.set(key, { n: 1, sample: raw });
+  }
+  let best = null;
+  for (const g of groups.values()) {
+    if (!best || g.n > best.n) best = g;
+  }
+  return best ? best.sample : null;
+}
+
 async function getAgenticSilenceCounts() {
   if (!supabase) return null;
   const since = new Date(Date.now() - SILENCE_WINDOW_HOURS * 60 * 60 * 1000).toISOString();
   try {
-    const [analysesRes, repliesRes] = await Promise.all([
+    // 2026-09-19 — read the FAILURES too. Zero analyses has two very different
+    // causes: the analyzer never ran (limiter / webhook / flag), or it ran and
+    // threw. Both were indistinguishable on the card until now, and on
+    // 2026-09-18 the second one cost the whole diagnosis — 31 ai.analysis_failed
+    // rows sat in this same table, naming their own cause, while the alert
+    // pointed at the rate limiter. See formatAgenticSilenceAlert.
+    const [analysesRes, repliesRes, failuresRes] = await Promise.all([
       supabase
         .from('system_events')
         .select('id', { count: 'exact', head: true })
@@ -303,9 +338,22 @@ async function getAgenticSilenceCounts() {
         .eq('event_type', 'ghl.reply_received')
         .gte('created_at', since)
         .limit(1000),
+      supabase
+        .from('system_events')
+        .select('payload')
+        .eq('event_type', 'ai.analysis_failed')
+        .gte('created_at', since)
+        .limit(1000),
     ]);
     if (analysesRes.error) throw analysesRes.error;
     if (repliesRes.error) throw repliesRes.error;
+    // A failed failures-read must not fail the whole count: the silence verdict
+    // does not depend on it, and losing the enrichment is better than losing
+    // the page. Degrade to "no failure detail" and carry on.
+    const failures = failuresRes.error ? [] : (Array.isArray(failuresRes.data) ? failuresRes.data : []);
+    if (failuresRes.error) {
+      console.warn(`[DecisionEngineHeartbeat] ai.analysis_failed read failed: ${failuresRes.error.message}`);
+    }
 
     const replies = Array.isArray(repliesRes.data) ? repliesRes.data : [];
     const isSilenced = (a) => typeof a === 'string'
@@ -316,6 +364,8 @@ async function getAgenticSilenceCounts() {
       analyses: analysesRes.count ?? 0,
       eligibleReplies: replies.length - skippedReplies,
       skippedReplies,
+      failures: failures.length,
+      topError: mostCommonError(failures),
       windowHours: SILENCE_WINDOW_HOURS,
       checked_at: new Date().toISOString(),
     };
