@@ -84,7 +84,22 @@ export function shouldAlertAgenticSilence(counts, thresholds) {
 /**
  * Build the GroupMe alert body for an agentic-silence trigger.
  *
- * @param {object} counts { analyses, eligibleReplies, windowHours, skippedReplies }
+ * 2026-09-19 — THE CARD POINTED AT THE WRONG DASHBOARD.
+ * This body reported only successes, so a pipeline that was running and FAILING
+ * read exactly like one that was idle: "analyses: 0", then a standing
+ * instruction to go look at the rate limiter and Railway logs. On 2026-09-18
+ * the analyzer had failed 31 times in the window from two distinct causes
+ * (a thinking model starved of max_tokens, and an unbounded GHL read blowing
+ * the 40s analyze budget), and BOTH were already written to system_events as
+ * ai.analysis_failed — in the same table this watchdog was already reading,
+ * one query away. The operator was sent to the limiter instead.
+ *
+ * "Failing" and "idle" are different incidents with different first moves, so
+ * the card now names which one it is. Same doctrine as the eligible-replies
+ * split above: classify, do not just threshold.
+ *
+ * @param {object} counts { analyses, eligibleReplies, windowHours, skippedReplies,
+ *   failures, topError }
  * @param {string[]} reasons
  * @returns {string}
  */
@@ -93,16 +108,27 @@ export function formatAgenticSilenceAlert(counts, reasons) {
   const eligibleReplies = counts?.eligibleReplies ?? 0;
   const windowHours = counts?.windowHours ?? 6;
   const skippedReplies = counts?.skippedReplies ?? 0;
+  const failures = counts?.failures ?? 0;
+  const topError = counts?.topError || null;
 
   const skippedNote = skippedReplies > 0
     ? `\n(${skippedReplies} more repl${skippedReplies === 1 ? 'y' : 'ies'} excluded — bot deliberately silenced)`
     : '';
 
+  // failures > 0 means the analyzer IS running and the cause is already
+  // recorded. Lead with it, and send the operator to the rows that hold it
+  // rather than to the limiter, which is only a suspect in the idle case.
+  const failureLine = failures > 0 ? ` | failed: ${failures}` : '';
+  const diagnosis = failures > 0
+    ? (topError ? `top error: ${String(topError).slice(0, 300)}\n` : '') +
+      `the analyzer is FAILING, not idle — check system_events ai.analysis_failed`
+    : `check /n8n/rate-limiter/stats and Railway logs for [MessageAnalyzer] / [AgenticPipeline]`;
+
   return (
     `🔴 Agentic bot silent — leads are being ghosted\n` +
-    `analyses: ${analyses} | answerable replies: ${eligibleReplies} | window: ${windowHours}h${skippedNote}\n` +
+    `analyses: ${analyses}${failureLine} | answerable replies: ${eligibleReplies} | window: ${windowHours}h${skippedNote}\n` +
     `triggered: ${(reasons || []).join('; ') || 'unspecified'}\n` +
-    `check /n8n/rate-limiter/stats and Railway logs for [MessageAnalyzer] / [AgenticPipeline]`
+    diagnosis
   );
 }
 

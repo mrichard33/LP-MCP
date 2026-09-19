@@ -119,6 +119,24 @@ const PIPELINE_CACHE_TTL_MS = parseInt(process.env.PIPELINE_CACHE_TTL_MS || '900
 // (null / []) so a slow data source yields partial context instead of a hang.
 const CONTEXT_SB_TIMEOUT_MS = parseInt(process.env.CONTEXT_SB_TIMEOUT_MS || '6000', 10);
 
+// 2026-09-19 — GHL READS HAD NO CEILING AT ALL (agentic silence incident).
+// v2.8 above bounded every SUPABASE read and left the GHL read unbounded, so
+// ghlFetch took the rate limiter's full WAIT_TIMEOUT_MS (30s) for a token and
+// then AbortSignal.timeout(15000) on the wire — 45s for ONE read, against the
+// analyzer's 40s ANALYZE_TIMEOUT_MS ceiling (message-analyzer.js). A single
+// contended call therefore blew the whole analyze budget before the other five
+// reads were attempted, and the failure surfaced as the useless
+// "buildLeadContext timed out after 40000ms": 27 of 57 ai.analysis_failed rows
+// in the 7 days to 2026-09-18, against 0 completed analyses on 9/17.
+//
+// ghl-rate-limiter.js's own acquireToken docstring already prescribes the fix —
+// a handler making several sequential GHL calls MUST pass a short maxWaitMs so a
+// starved bucket cannot stack 30s waits past the caller's watchdog. This file
+// never got that treatment. 5s + 12s = 17s worst case per read, comfortably
+// inside 40s even if two run back to back.
+const CONTEXT_GHL_WAIT_MS = parseInt(process.env.CONTEXT_GHL_WAIT_MS || '5000', 10);
+const CONTEXT_GHL_TIMEOUT_MS = parseInt(process.env.CONTEXT_GHL_TIMEOUT_MS || '12000', 10);
+
 // GHL Custom Field IDs
 const CF_LP_LEAD_ID = 'GmAVmW6V9sekD7pVONKr';
 const CF_LP_INBOUND_ID = '3YMxheIlPyhACB8zyc3W';
@@ -293,7 +311,17 @@ async function loadPipelineStages() {
     return pipelineCache;
   }
 
-  const data = await ghlFetch('GET', `/opportunities/pipelines?locationId=${GHL_LOCATION_ID}`);
+  // Stage NAMES are cosmetic — the opportunity's own stage id still reaches the
+  // context. An unreadable pipeline list must never fail the whole build, and
+  // must not poison the cache either.
+  let data = null;
+  try {
+    data = await ghlFetch('GET', `/opportunities/pipelines?locationId=${GHL_LOCATION_ID}`);
+  } catch (err) {
+    if (!(err instanceof GhlUnavailableError)) throw err;
+    console.warn(`[ContextBuilder] pipeline stages unreadable, stage names omitted: ${err.message}`);
+    return pipelineCache || new Map();
+  }
   const pipelines = data?.pipelines || [];
   const stageMap = new Map();
   for (const pipe of pipelines) {
@@ -321,11 +349,38 @@ async function resolvePipelineStage(stageId) {
 // GHL API HELPERS
 // ═══════════════════════════════════════════════════════════════════
 
+/**
+ * 2026-09-19 — "not applicable" is not "unreadable" (CLAUDE.md, fail-closed
+ * doctrine). ghlFetch used to flatten BOTH into `null`: a 404 for a contact
+ * with no opportunity and a 500/429/timeout for a contact we simply could not
+ * read came back identically, so the analyzer could not tell an empty lead from
+ * an unreachable one and answered both the same way. Callers that can safely
+ * proceed without the data catch this and degrade; callers that cannot (the
+ * contact record itself) let it propagate.
+ */
+export class GhlUnavailableError extends Error {
+  constructor(resource, cause) {
+    super(`GHL ${resource} unreadable: ${cause}`);
+    this.name = 'GhlUnavailableError';
+    this.resource = resource;
+  }
+}
+
+/**
+ * @throws {GhlUnavailableError} the read could not be completed (timeout,
+ *   network, throttle, 5xx). Distinct from a `null` return, which means the
+ *   read SUCCEEDED and the resource genuinely is not there.
+ */
 async function ghlFetch(method, path) {
   if (!GHL_API_KEY) return null;
   const url = `https://services.leadconnectorhq.com${path}`;
+  const resource = `${method} ${path.split('?')[0]}`;
   try {
-    const res = await withGhlToken(() => fetch(url, {
+    // Bounded on BOTH halves: the queue wait (maxWaitMs, clamped and fail-open
+    // by the limiter) and the wire time. The outer race is the backstop for a
+    // thunk that never settles at all — AbortSignal alone cannot cover the time
+    // spent queued for a token, which is where the 30s actually went.
+    const fetchOpts = {
       method,
       headers: {
         'Authorization': `Bearer ${GHL_API_KEY}`,
@@ -333,15 +388,30 @@ async function ghlFetch(method, path) {
         'Content-Type': 'application/json',
         'Accept': 'application/json',
       },
-      signal: AbortSignal.timeout(15000),
-    }));
-    if (!res.ok) return null;
+      signal: AbortSignal.timeout(CONTEXT_GHL_TIMEOUT_MS),
+    };
+    // Kept on one line as `withGhlToken(() => fetch(` — that exact form is what
+    // test-ghl-rate-limiter-coverage.js scans for. Splitting it across lines
+    // reads identically but trips the guard as an ungoverned call site.
+    const res = await withTimeout(
+      withGhlToken(() => fetch(url, fetchOpts), { maxWaitMs: CONTEXT_GHL_WAIT_MS }),
+      `GHL ${resource}`,
+      CONTEXT_GHL_WAIT_MS + CONTEXT_GHL_TIMEOUT_MS,
+    );
+    // 404 is an answer: the resource is not there. Everything else non-2xx is
+    // the server declining to tell us, which is not the same thing.
+    if (res.status === 404) return null;
+    if (!res.ok) throw new GhlUnavailableError(resource, `HTTP ${res.status}`);
     const contentType = res.headers.get('content-type') || '';
     if (contentType.includes('application/json')) return res.json();
     return null;
   } catch (err) {
-    console.error(`[ContextBuilder] GHL ${method} ${path} failed:`, err.message);
-    return null;
+    if (err instanceof GhlUnavailableError) {
+      console.error(`[ContextBuilder] ${err.message}`);
+      throw err;
+    }
+    console.error(`[ContextBuilder] GHL ${resource} failed:`, err.message);
+    throw new GhlUnavailableError(resource, err.message);
   }
 }
 
@@ -431,7 +501,7 @@ function extractMessages(msgData) {
   return [];
 }
 
-async function fetchConversation(contactId, limit = 10) {
+async function fetchConversation(contactId, limit = 10, degraded = null) {
   try {
     const searchData = await ghlFetch('GET',
       `/conversations/search?locationId=${GHL_LOCATION_ID}&contactId=${contactId}`);
@@ -462,6 +532,7 @@ async function fetchConversation(contactId, limit = 10) {
       timestamp: m.dateAdded || m.createdAt || null,
     })).reverse();
   } catch (err) {
+    if (err instanceof GhlUnavailableError) degraded?.push('conversation');
     console.error(`[ContextBuilder] fetchConversation failed for ${contactId}:`, err.message);
     return [];
   }
@@ -625,7 +696,7 @@ async function fetchLPNotes(lpLeadId, limit = 8) {
  * generated reply can personalize from what the team actually knows about
  * this person. Fail-soft: any error returns [] and generation proceeds.
  */
-async function fetchGHLNotes(ghlContactId, limit = 6) {
+async function fetchGHLNotes(ghlContactId, limit = 6, degraded = null) {
   if (!ghlContactId) return [];
   try {
     const data = await ghlFetch('GET', `/contacts/${ghlContactId}/notes`);
@@ -639,6 +710,7 @@ async function fetchGHLNotes(ghlContactId, limit = 6) {
       .sort((a, b) => String(b.date).localeCompare(String(a.date)))
       .slice(0, limit);
   } catch (err) {
+    if (err instanceof GhlUnavailableError) degraded?.push('ghl_notes');
     console.warn(`[ContextBuilder] GHL notes fetch failed for ${ghlContactId}:`, err.message);
     return [];
   }
@@ -670,9 +742,17 @@ async function fetchLPCalls(lpLeadId, limit = 5) {
   }
 }
 
-async function fetchOpportunity(contactId) {
-  const data = await ghlFetch('GET',
-    `/opportunities/search?location_id=${GHL_LOCATION_ID}&contact_id=${contactId}`);
+async function fetchOpportunity(contactId, degraded = null) {
+  let data;
+  try {
+    data = await ghlFetch('GET',
+      `/opportunities/search?location_id=${GHL_LOCATION_ID}&contact_id=${contactId}`);
+  } catch (err) {
+    if (!(err instanceof GhlUnavailableError)) throw err;
+    degraded?.push('opportunity');
+    console.warn(`[ContextBuilder] ${err.message} — proceeding without opportunity`);
+    return null;
+  }
   const opps = data?.opportunities || [];
   if (!opps.length) return null;
   const sorted = opps.sort((a, b) =>
@@ -820,10 +900,21 @@ export async function buildLeadContext(ghlContactId, options = {}) {
     if (cached) return cached;
   }
 
+  // 2026-09-19 — which sources fell back, so a caller can tell a lead with
+  // nothing on file from a lead we could not read. Enrichment pushes here and
+  // proceeds; the CONTACT read is not enrichment and is not caught (below).
+  const degraded = [];
+
+  // fetchGHLContact is deliberately NOT wrapped: without the contact record the
+  // context loses every custom field — estimate total, trust level, decision
+  // makers, rep name — and the LP resolution chain loses two of its three
+  // paths. Answering a lead we cannot see is the wildcard pass the fail-closed
+  // doctrine forbids, so GhlUnavailableError propagates to analyzeMessage,
+  // which files ai.analysis_failed and lets the reply buffer retry.
   const [ghlContact, intelligence, opportunity] = await Promise.all([
     fetchGHLContact(ghlContactId),
     fetchLeadIntelligence(ghlContactId),
-    fetchOpportunity(ghlContactId),
+    fetchOpportunity(ghlContactId, degraded),
   ]);
 
   // ─── Step 2: LP Lead Resolution Chain ──────────────────────────
@@ -915,13 +1006,13 @@ export async function buildLeadContext(ghlContactId, options = {}) {
 
   const lpLeadId = lpLead?.lp_lead_id || null;
   const [conversation, lpNotes, lpCalls, pipelineStageInfo, nurtureHistory, openObjectionState, ghlNotes, lpProspectHistory] = await Promise.all([
-    (includeConversation && ghlContact) ? fetchConversation(ghlContactId, 10) : [],
+    (includeConversation && ghlContact) ? fetchConversation(ghlContactId, 10, degraded) : [],
     fetchLPNotes(lpLeadId),
     fetchLPCalls(lpLeadId),
     opportunity?.pipelineStageId ? resolvePipelineStage(opportunity.pipelineStageId) : null,
     fetchNurtureHistory(ghlContactId, workflow_code),
     fetchOpenObjectionState(ghlContactId),
-    fetchGHLNotes(ghlContactId),
+    fetchGHLNotes(ghlContactId, 6, degraded),
     // v2.9: whole-prospect history for customer_relationship.
     fetchLPProspectHistory(lpLead?.lp_prospect_id || cfProspectId || null),
   ]);
@@ -1155,6 +1246,10 @@ export async function buildLeadContext(ghlContactId, options = {}) {
         // v2.9
         lp_prospect_history_rows: lpProspectHistory.length,
         customer_relationship: relationship.customer_relationship,
+        // 2026-09-19: sources that were UNREADABLE this build, as opposed to
+        // genuinely empty. `opportunity: false` above means either; this says
+        // which. Empty array is the healthy case.
+        degraded_sources: degraded,
       },
       warnings: [
         ...(staleness.isStaleActive ? [`lp_data_stale_active:${staleness.ageMinutes}min`] : []),
