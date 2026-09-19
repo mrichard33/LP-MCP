@@ -301,6 +301,7 @@ import { registerFreshnessRefreshRoutes, startFreshnessRefreshScheduler } from '
 // 2026-09-18 — daily watch on the LP↔GHL link write path. The leak this
 // catches has been closed twice before and reopened unnoticed both times.
 import { registerLinkLeakRoutes, startLinkLeakScheduler } from './jobs/link-leak-monitor.js';
+import { registerP2UnresolvableRoutes, startP2UnresolvableScheduler } from './jobs/p2-unresolvable-monitor.js';
 import { registerCiRoutes } from './ci/routes.js';
 import { startCiWorkerScheduler } from './ci/worker.js';
 import { startCiDiscoveryScheduler } from './jobs/ci-discovery-scheduler.js';
@@ -1222,6 +1223,23 @@ async function runMigrations() {
     console.log('[Migration] LP link repair indexes (sql/122) ready');
   } catch (err) {
     console.warn('[Migration] LP link repair indexes (sql/122) not applied — repair/monitor will table-scan:', err.message);
+  }
+
+  // P2 link health snapshot (sql/123 — the file is the source of truth; this
+  // mirror guarantees a fresh deploy self-heals). The monitor writes one row
+  // per daily pass and the growth rule in src/p2-unresolvable-alerts.js
+  // compares against the previous row, so WITHOUT this table that rule does not
+  // error — it silently never fires, which is the failure mode this repo keeps
+  // paying for. Logged loudly for that reason.
+  try {
+    const { runSQL } = await import('./admin/supabase-admin.js');
+    const { readFile } = await import('node:fs/promises');
+    const { fileURLToPath } = await import('node:url');
+    const path = fileURLToPath(new URL('../sql/123_p2_link_health.sql', import.meta.url));
+    await runSQL(await readFile(path, 'utf8'));
+    console.log('[Migration] P2 link health (sql/123) ready');
+  } catch (err) {
+    console.warn('[Migration] P2 link health (sql/123) FAILED — the unresolvable-P2 monitor will still alert on its window rule, but the backlog-growth rule never fires and no history is recorded until this is applied:', err.message);
   }
 
   // Addlead address hold (sql/060 — the file is the source of truth; this
@@ -2345,6 +2363,7 @@ registerScorecardValidateRoutes(app);
 registerFive9SnapshotRoutes(app, authenticate);
 registerFreshnessRefreshRoutes(app);
 registerLinkLeakRoutes(app);
+registerP2UnresolvableRoutes(app);
 registerCiRoutes(app, authenticate);            // 2026-08-21 — Call Intelligence ingest (PR 2; worker ships disarmed)
 
 const server = app.listen(PORT, async () => {
@@ -2403,6 +2422,7 @@ const server = app.listen(PORT, async () => {
   startFive9ConfigSnapshotScheduler();
   startFreshnessRefreshScheduler();
   startLinkLeakScheduler();
+  startP2UnresolvableScheduler();
   // Probe ffmpeg, which transcodes Five9's GSM 6.10 recordings to a format a
   // browser can actually play. A CLEAR LOG LINE, NOT A CRASH: without it the
   // whole pipeline still runs and links still resolve, they just serve the
