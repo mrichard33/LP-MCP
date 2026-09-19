@@ -404,7 +404,8 @@ test('the roster is unique, complete and shaped', () => {
   // Bump this when you add a job — the count is here so an accidental DELETION
   // is caught too, which a "shape of each row" loop cannot see.
   // 13 → 14 on 2026-09-18: link-leak-monitor.
-  assert.equal(JOBS.length, 14);
+  // 14 → 15 on 2026-09-19: p2-unresolvable-monitor.
+  assert.equal(JOBS.length, 15);
   for (const j of JOBS) {
     assert.match(j.id, /^[a-z0-9-]+$/, `${j.id} should be a slug`);
     assert.ok(j.label && j.group && j.cadence, `${j.id} needs a label, group and cadence`);

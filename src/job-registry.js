@@ -167,6 +167,19 @@ export const JOBS = Object.freeze([
     enabledDefault: true,
     isEnabled: (env) => String(env.LINK_LEAK_MONITOR_ENABLED || 'true').toLowerCase() !== 'false',
   },
+  {
+    id: 'p2-unresolvable-monitor',
+    label: 'P2 opportunities with no LP job',
+    group: 'sync',
+    cadence: 'daily 06:30 ET',
+    enabledEnv: 'P2_UNRESOLVABLE_MONITOR_ENABLED',
+    // ON by default, for the same reason as the monitor above: what it watches
+    // for is a pile that nothing counted for months. It is also the only writer
+    // of p2_link_health, so switching it off stops the history as well as the
+    // alert.
+    enabledDefault: true,
+    isEnabled: (env) => String(env.P2_UNRESOLVABLE_MONITOR_ENABLED || 'true').toLowerCase() !== 'false',
+  },
 ]);
 
 /** Ids only — handy for tests and for asserting the wiring matches the roster. */
