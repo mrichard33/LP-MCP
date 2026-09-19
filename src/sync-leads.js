@@ -405,7 +405,7 @@ function effectiveLeadSource(lead) {
 // (mirrors the `_internal` export convention used in entry-source-map.js).
 export const _internal = {
   deriveSourceFromPromoter, effectiveLeadSource, PROMOTER_SOURCE_CHANNELS,
-  lpBool, needsAttributionBackfill,
+  lpBool, needsAttributionBackfill, buildLeadRow,
 };
 
 // ─── LP string-boolean coercion ──────────────────────────────────
@@ -503,17 +503,40 @@ function buildLeadRow(prospect, lead, {
   // Never persist an id the resolver classified as rejected. Enforce mode
   // already does this (link-corroboration.js returns existingGhlId on those
   // paths); this makes observe mode stop overriding it with the raw lognumber.
-  if (resolvedLink && REJECTED_LINK_SOURCES.has(resolvedLink.linkSource)
-      && leadGhlId && leadGhlId !== existingGhlId) {
-    console.warn(`[Sync] lead ${lpLeadId}: refusing ghl_contact_id=${leadGhlId} (${resolvedLink.linkSource}) — keeping ${existingGhlId || 'no link'}`);
-    leadGhlId = existingGhlId || null;
+  //
+  // 2026-09-19 (rejected-source coherence). The 2026-07-29 guard only covered
+  // a NEW id, and it stamped the rejected verdict onto the row even when the
+  // stored link survived. That left 19 live rows reading "refused to bind"
+  // next to a populated ghl_contact_id — 16 whose id was the rejected
+  // candidate itself, 3 whose id came from a good phone match and merely had
+  // its classification overwritten.
+  //
+  // The rule: a rejected verdict describes the CANDIDATE, not the link we are
+  // keeping. Whenever a stored link survives this pass, its own classification
+  // survives with it. Only when there is no stored link does the rejection
+  // become the row's source — and then it sits next to a NULL id, which is
+  // coherent as an audit trail.
+  //
+  // Note this deliberately does NOT clear a stored id. Every call site strips
+  // a null ghl_contact_id before the upsert (see :779, :1012, :1341) so the
+  // link can never be lost to a sync; clearing one is a deliberate, logged,
+  // reversible repair, not something a 15-minute sweep does on the quiet.
+  let suppressLinkSource = false;
+  if (resolvedLink && REJECTED_LINK_SOURCES.has(resolvedLink.linkSource) && leadGhlId) {
+    if (leadGhlId !== existingGhlId) {
+      console.warn(`[Sync] lead ${lpLeadId}: refusing ghl_contact_id=${leadGhlId} (${resolvedLink.linkSource}) — keeping ${existingGhlId || 'no link'}`);
+      leadGhlId = existingGhlId || null;
+    }
+    if (leadGhlId && leadGhlId === existingGhlId) suppressLinkSource = true;
   }
 
   // Floor: a populated ghl_contact_id must never be written with a NULL
   // ghl_link_source. Only applies when there is no stored row to preserve a
   // classification from — on an existing row the key stays omitted.
-  const resolvedLinkSource = resolvedLink?.linkSource
-    || (leadGhlId && !existingGhlId ? LINK_SOURCE.LEGACY_UNVERIFIED : undefined);
+  const resolvedLinkSource = suppressLinkSource
+    ? undefined
+    : (resolvedLink?.linkSource
+      || (leadGhlId && !existingGhlId ? LINK_SOURCE.LEGACY_UNVERIFIED : undefined));
 
   // v10.2: stamp the effective source (native, else promoter-derived) so the
   // "Internet, <Vendor>" feeds stop persisting null source/sourcesubdescr.
