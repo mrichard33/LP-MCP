@@ -247,7 +247,7 @@ import { emitEvent } from './event-emitter.js';
 // in-memory analysisCache, it holds across processes and restarts.
 import { claimConsumedMessages, releaseConsumedMessages } from './services/consumed-messages.js';
 import { runInboundIdentityPass } from './services/identity-extraction.js';
-import { callLLM, resolveLLM } from './llm-client.js';
+import { callLLM, resolveLLM, llmBudgetMs } from './llm-client.js';
 // Booking-flow ownership guard (2026-06-03). When a booking is in flight the
 // booking flow owns the turn — the analyzer must not divert it into objection-
 // handling or rep escalation (that produced a duplicate "a rep will call" send
@@ -279,6 +279,28 @@ const ANALYSIS_CACHE_TTL_MS = parseInt(process.env.ANALYSIS_CACHE_TTL_MS || '120
 // work against this timeout converts any hang into a thrown error that hits the
 // catch, emits ai.analysis_failed, and frees the queue.
 const ANALYZE_TIMEOUT_MS = parseInt(process.env.ANALYZE_TIMEOUT_MS || '40000', 10);
+
+// 2026-09-19 — NESTED TIMEOUTS THAT DID NOT COMPOSE.
+// Three clocks run on one inbound: the pipeline's fetch abort around
+// POST /n8n/analyze-message, the ANALYZE_TIMEOUT_MS ceiling above, and the LLM
+// call inside. Each was an independent literal, and they did not add up — 40s of
+// context plus 30s of model is 70s against a 45s caller. A slow-but-HEALTHY
+// analysis could therefore blow the outer deadline while every number in
+// isolation looked defensible, and raising the LLM floor for thinking models
+// would have widened that gap silently.
+//
+// The outer deadline is now DERIVED from the inner ones, so the pipeline can
+// never again be given less time than the work it is waiting on. Overhead covers
+// the route hop, JSON encode/decode and the post-analysis writes.
+const ANALYZE_OVERHEAD_MS = parseInt(process.env.ANALYZE_OVERHEAD_MS || '5000', 10);
+
+/**
+ * Wall-clock ceiling for one POST /n8n/analyze-message, end to end.
+ * Callers awaiting that route MUST use this rather than a literal.
+ */
+export function analyzeBudgetMs() {
+  return ANALYZE_TIMEOUT_MS + llmBudgetMs('message_analyzer') + ANALYZE_OVERHEAD_MS;
+}
 
 // 2026-09-18 — was a hardcoded 500 at the call site (Catherine Crosier).
 // A thinking model spends this budget reasoning before it writes any JSON, and
