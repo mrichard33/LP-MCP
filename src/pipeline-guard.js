@@ -36,14 +36,34 @@ const STAGE_POSITIONS = {
   // P2 — Client Lifecycle (8 stages, positions 0-7)
   //
   // The LP milestones that drive these do NOT arrive in stage order. Median
-  // days from RTP, measured over 2,158 jobs Jan–Aug 2026:
-  //   M Measure −3 · H HOA 0 · R RTP 0 · O Quoted +4 · K Ordered +10
-  //   U Permit Submit +14 · P Permit Issued +21 · V/E/G Received +39
-  //   S Start +49 · F Install End +49 · C Completion +55 · B Insp Passed +57
-  // So Ordered (+10) pushes a job to position 4 BEFORE Permit Issued (+21)
-  // asks for position 3. That backward request is blocked here, by design.
+  // days from RTP, re-measured 2026-09-20 over 4,787 jobs carrying an RTP:
+  //   M Measure −3 · H HOA 0 · R RTP 0 · O Quoted +4 · K Ordered +11
+  //   U Permit Submit +19 · P Permit Issued +28 · G/E/V Received +42/+43/+45
+  //   F Install End +55 · S Install Start +61 · C Completion +67
+  //   B Insp Passed +71 · I Insp Set +72
+  //
+  // THREE inversions follow from that, not one. Each is a pair where the
+  // LATER milestone drives an EARLIER position, so the guard blocks it:
+  //
+  //   K Ordered (+11) → pos 4   before  U/P Permits (+19/+28) → pos 3
+  //   F Install End (+55) → pos 6  before  S Install Start (+61) → pos 5
+  //   B Insp Passed (+71) → pos 7  before  I Insp Set (+72) → pos 6
+  //
+  // The permit pair is not a mis-ordering that a reorder would fix: permitting
+  // runs +19 to +28 while production runs from +11, so they OVERLAP. A linear
+  // pipeline cannot hold both, and whichever stage the opportunity shows, the
+  // other is a lie. Permit state belongs in the lp-milestone-permit-* tags,
+  // which already fire and already carry it.
+  //
   // Message triggers must therefore key on the lp-milestone-* TAG, which
   // always lands, not on a GHL pipeline_stage_updated event, which does not.
+  //
+  // 2026-09-20: H (HOA Approved) no longer moves the opportunity at all —
+  // agent rule 114 is tag-only. It lands on or before the day of RTP for
+  // 97.4% of jobs (2,968 same day, 767 earlier, of 3,837), so it is a
+  // precondition of release rather than a phase after it, and moving on it
+  // emptied stage 3 the same day every job reached it. With it gone, RTP
+  // holds from 0 to +11 (Ordered), which is the dwell that stage was for.
   'fec39f2e-ba39-4536-95b2-bbac7ca6c454': 0,   // 1. Contract Signed
   'b7fc445c-a969-42b1-9a7a-eda5c89f25a5': 1,   // 2. Financing Pending
   '375089e1-aaa5-429f-8c4c-5e01058fa8f8': 2,   // 3. Released to Production (RTP)
