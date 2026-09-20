@@ -258,6 +258,29 @@ import { generateResponse, getReplySenderAllowlist, isRandyName, normalizeThread
 import { recordMessageContextDetached, markSentDetached } from './bot-feedback/fingerprint.js';
 import { judgeSentReplyDetached } from './bot-feedback/judge.js';
 import { buildAiFallback } from './ai-fallback.js';
+import { llmBudgetMs } from './llm-client.js';
+
+// 2026-09-19 — hoisted out of executeSendMessage so the executor's watchdog can
+// be DERIVED from it rather than guessed. Same defect as the analyze path: the
+// 120s send_message override was chosen against a 30s model call, and raising
+// the thinking-model floor pushes the real worst case past it in silence. When
+// the watchdog wins that race it kills a live generation and the customer gets
+// the templated fallback instead of the reply we actually wrote.
+const MAX_GENERATION_ATTEMPTS = 2;
+const GENERATION_BACKOFF_MS = 1500;
+// Context build + GHL reply-context reads + the send, all behind the rate
+// limiter. A watchdog ceiling, not a target — the 10-min reaper is the real
+// backstop for a genuinely hung handler.
+const SEND_PATH_OVERHEAD_MS = parseInt(process.env.SEND_PATH_OVERHEAD_MS || '45000', 10);
+
+/**
+ * Wall-clock ceiling for one send_message handler run.
+ * src/actions/index.js uses this for the per-handler watchdog override.
+ */
+export function sendMessageBudgetMs() {
+  return SEND_PATH_OVERHEAD_MS
+    + MAX_GENERATION_ATTEMPTS * (llmBudgetMs('response_generator') + GENERATION_BACKOFF_MS);
+}
 import {
   buildHumanHandoffAlertPayload,
   handoffNeedsHumanAlert,
@@ -2917,7 +2940,6 @@ export async function executeSendMessage(action, context) {
     // null error_message — a silent non-send. Now: retry once for transient
     // flukes, then send a safe templated fallback so the lead always gets a
     // reply, and surface the failure (see fallbackUsed at the return below).
-    const MAX_GENERATION_ATTEMPTS = 2;
     let generationErr = null;
     // 2026-09-11 (Alfredo Fontan): a guard inside generateResponse can hand the
     // retry an instruction. The repeat-ask guard uses it to carry the CLOSED

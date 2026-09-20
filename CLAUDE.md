@@ -101,6 +101,38 @@ quiet cases explicitly (see the eligible-replies split in `agentic-silence-alert
 three-class split in `rule-fail-closed-alerts.js`) rather than raising the threshold until it stops
 crying wolf.
 
+## LLM budgets: a constant written for the old model is the recurring bug
+
+This has now bitten three times in two days, each time wearing a different error
+message, each time the same root cause: **a number chosen for a model that no longer runs here.**
+
+- 2026-09-18 — `max_tokens: 500` was spent entirely on thinking, so the API returned
+  `blocks=[thinking]` and no text. 29 failures.
+- 2026-09-19 — the 30s `LLM_TIMEOUT_MS` was written for a family that answered immediately.
+  `The operation was aborted due to timeout`, on the first analysis after the fix above.
+
+Both are now enforced **once, in `src/llm-client.js`**, keyed off the same
+`modelUsesThinkingBudget()` predicate: `resolveMaxTokens()` floors the token budget,
+`resolveTimeout()` floors the clock. Do not re-solve either at a call site — a per-call-site
+number falls behind the next family exactly the way the temperature list did. A caller asking
+for more still gets more; the floors only ever raise.
+
+**Nested timeouts must COMPOSE, and the outer one must be derived, not guessed.** The analyze
+path carried three independent literals that did not add up — a 45s caller abort over a 40s
+context ceiling plus a 30s model call. A slow-but-healthy analysis could be killed by its own
+caller while every number looked defensible alone, and raising the model floor widened that gap
+silently. Enclosing deadlines now derive:
+
+| deadline | derived from | file |
+|---|---|---|
+| `POST /n8n/analyze-message` abort | `analyzeBudgetMs()` | `src/behavioral-emitter.js` |
+| analyze budget | `ANALYZE_TIMEOUT_MS` + `llmBudgetMs('message_analyzer')` | `src/message-analyzer.js` |
+| `send_message` watchdog | `sendMessageBudgetMs()` in the `Math.max` | `src/actions/index.js` |
+
+If you add a timeout around anything that calls an LLM, add `llmBudgetMs(fn)` into it rather
+than picking a number. `scripts/test-llm-timeout-budget.js` fails if the chain stops composing —
+that test is the guard, so do not weaken it to make a new literal fit.
+
 ## The Decision Engine
 
 Rules live in the `agent_rules` Supabase table — **database config, not code**, so a rule change

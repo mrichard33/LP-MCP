@@ -172,7 +172,7 @@
  */
 
 import supabase from '../supabase.js';
-import { executeSendMessage } from '../send-message-handler.js';
+import { executeSendMessage, sendMessageBudgetMs } from '../send-message-handler.js';
 import { registerRateLimiterRoutes } from '../ghl-rate-limiter.js';
 import { getEventContext } from './resolvers.js';
 import { processApprovalQueue } from './approval-path.js';
@@ -1151,9 +1151,16 @@ const HANDLER_TIMEOUT_OVERRIDES_MS = {
   // and the row stayed `pending` — a customer reply recorded as unsent. Same
   // scoped-override reasoning as set_lp_appointment above; still well under
   // the 10-min reaper. The sent marker keeps a late retry from double-texting.
+  // 2026-09-19 — sendMessageBudgetMs() added to the Math.max. The 120s literal
+  // was measured against a 30s model call; a thinking model raises the floor to
+  // 60s and two generation attempts then exceed it, so the watchdog would start
+  // killing healthy generations mid-flight. Deriving keeps this ceiling above
+  // the work it is guarding no matter which model the env points at next. The
+  // literal stays as a floor so behaviour never regresses below today's.
   send_message: Math.max(
     HANDLER_TIMEOUT_MS,
     parseInt(process.env.EXECUTOR_SEND_MESSAGE_TIMEOUT_MS || '120000', 10),
+    sendMessageBudgetMs(),
   ),
 };
 

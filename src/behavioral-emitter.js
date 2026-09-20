@@ -294,6 +294,9 @@
 
 import { emitEvent } from './event-emitter.js';
 import { upsertLeadIntelligence } from './context-builder.js';
+// The analyze deadline below is derived from the analyzer's own budget, not
+// guessed. message-analyzer does not import this module, so no cycle.
+import { analyzeBudgetMs } from './message-analyzer.js';
 import supabase from './supabase.js';
 // v2.14 — synchronous agentic-active ownership stamp on first SMS inbound.
 import { applyGHLTag } from './ghl.js';
@@ -390,7 +393,12 @@ async function triggerAgenticPipeline(contactId, messageText, channel = null, me
       // ai.analysis_completed and ultimately keys the outbound dedup lock to the
       // real inbound (not evt-${id}).
       body: JSON.stringify({ contactId, message: messageText, channel, message_id: messageId }),
-      signal: AbortSignal.timeout(45000),
+      // 2026-09-19 — DERIVED, not a literal. This deadline has to cover the
+      // analyzer's context ceiling AND its model call; as a hardcoded 45000 it
+      // covered neither reliably (40s + 30s = 70s), so a healthy-but-slow
+      // analysis could be aborted here and re-run from scratch. Raising the
+      // LLM floor for thinking models would have widened that gap in silence.
+      signal: AbortSignal.timeout(analyzeBudgetMs()),
     });
     if (!analyzeRes.ok) {
       console.warn(`[AgenticPipeline] Analyze failed: ${analyzeRes.status}`);

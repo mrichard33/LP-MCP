@@ -73,6 +73,9 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const ANTHROPIC_VERSION = process.env.ANTHROPIC_VERSION || '2023-06-01';
 const LLM_TIMEOUT_MS = parseInt(process.env.LLM_TIMEOUT_MS || '30000', 10);
+// Slack on the outer race so it never fires before the inner AbortSignal does —
+// the abort carries a useful message, the race does not.
+const RACE_SLACK_MS = 2000;
 
 const GLOBAL_PROVIDER = (process.env.LLM_PROVIDER || 'anthropic').toLowerCase();
 
@@ -228,6 +231,45 @@ export function resolveMaxTokens(model, requested) {
   return Math.max(asked, THINKING_MIN_MAX_TOKENS);
 }
 
+// 2026-09-19 — THE SAME BUG, ONE FIELD OVER. The 2026-09-18 fix above raised the
+// TOKEN budget for a thinking model and left the CLOCK budget at a 30s default
+// written for a family that answered immediately. A model that reasons before it
+// writes is simply slower, so the first analysis after that fix died on
+// "The operation was aborted due to timeout" (system_events, 2026-09-19 10:48 ET,
+// contact 6HX5W2wHnvFzMjGmJz87) — a different error, the same root cause:
+// a constant chosen for a model that no longer runs here.
+//
+// Enforced in the same place and the same shape as resolveMaxTokens, for the
+// reason stated there: a per-call-site number falls behind the next family. A
+// caller asking for longer still gets longer; the floor only ever raises.
+const THINKING_MIN_TIMEOUT_MS = parseInt(process.env.LLM_THINKING_MIN_TIMEOUT_MS || '60000', 10);
+
+/**
+ * Final per-call timeout for a model. Pure. Raises a thinking model's clock to
+ * the floor; leaves every other model exactly as requested.
+ */
+export function resolveTimeout(model, requested) {
+  const asked = Number.isFinite(requested) ? requested : LLM_TIMEOUT_MS;
+  if (!modelUsesThinkingBudget(model)) return asked;
+  return Math.max(asked, THINKING_MIN_TIMEOUT_MS);
+}
+
+/**
+ * The wall-clock ceiling ONE callLLM(fn) can consume, race slack included.
+ *
+ * Exported so an enclosing deadline can be DERIVED rather than guessed. Three
+ * timeouts sit on the analyze path — the pipeline's fetch abort, the analyzer's
+ * context ceiling, and this — and until now each was an independent literal.
+ * They did not compose: 40s of context plus 30s of model is 70s against a 45s
+ * caller, so a slow-but-healthy analysis could blow the outer deadline while
+ * every individual number looked reasonable. Callers now add this in instead of
+ * hardcoding a number that silently goes stale the next time the model changes.
+ */
+export function llmBudgetMs(fn) {
+  const { model } = resolveLLM(fn);
+  return resolveTimeout(model, LLM_TIMEOUT_MS) + RACE_SLACK_MS;
+}
+
 /** The 400 body Anthropic returns when a sampling parameter is not supported. */
 function isSamplingRejection(status, text) {
   return status === 400 && /temperature|top_p|top_k/i.test(String(text || ''));
@@ -241,7 +283,7 @@ function withTimeout(promise, ms, label) {
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
-async function callAnthropic({ model, system, messages, maxTokens, temperature, fn }) {
+async function callAnthropic({ model, system, messages, maxTokens, temperature, fn, timeoutMs = LLM_TIMEOUT_MS }) {
   if (!ANTHROPIC_API_KEY) throw new Error(`[LLMClient:${fn}] ANTHROPIC_API_KEY not set`);
   const body = { model, max_tokens: maxTokens, messages };
   if (system) body.system = system;
@@ -255,7 +297,7 @@ async function callAnthropic({ model, system, messages, maxTokens, temperature, 
       'anthropic-version': ANTHROPIC_VERSION,
     },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(LLM_TIMEOUT_MS),
+    signal: AbortSignal.timeout(timeoutMs),
   });
 
   let res = await post();
@@ -302,7 +344,7 @@ async function callAnthropic({ model, system, messages, maxTokens, temperature, 
   return { text, provider: 'anthropic', model, usage: data.usage || null, raw: data };
 }
 
-async function callOpenAI({ model, system, messages, maxTokens, temperature, json, fn }) {
+async function callOpenAI({ model, system, messages, maxTokens, temperature, json, fn, timeoutMs = LLM_TIMEOUT_MS }) {
   if (!OPENAI_API_KEY) throw new Error(`[LLMClient:${fn}] OPENAI_API_KEY not set`);
   const msgs = system ? [{ role: 'system', content: system }, ...messages] : messages;
   const body = { model, messages: msgs };
@@ -323,7 +365,7 @@ async function callOpenAI({ model, system, messages, maxTokens, temperature, jso
       'Authorization': `Bearer ${OPENAI_API_KEY}`,
     },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(LLM_TIMEOUT_MS),
+    signal: AbortSignal.timeout(timeoutMs),
   });
   if (!res.ok) {
     const t = await res.text().catch(() => '');
@@ -369,10 +411,20 @@ export async function callLLM({ fn, system = null, user = null, messages = null,
     console.log(`[LLMClient:${fn}] ${model} thinks against its output budget — max_tokens raised ${maxTokens} → ${effectiveMaxTokens}`);
   }
 
-  const args = { model, system, messages: msgs, maxTokens: effectiveMaxTokens, temperature, json, fn };
+  const effectiveTimeoutMs = resolveTimeout(model, LLM_TIMEOUT_MS);
+  if (effectiveTimeoutMs !== LLM_TIMEOUT_MS) {
+    console.log(`[LLMClient:${fn}] ${model} thinks before it writes — timeout raised ${LLM_TIMEOUT_MS} → ${effectiveTimeoutMs}ms`);
+  }
+
+  const args = {
+    model, system, messages: msgs, maxTokens: effectiveMaxTokens,
+    temperature, json, fn, timeoutMs: effectiveTimeoutMs,
+  };
   return withTimeout(
     provider === 'openai' ? callOpenAI(args) : callAnthropic(args),
-    LLM_TIMEOUT_MS + 2000,
+    // Derived, not a literal: the race must always sit OUTSIDE the abort, or a
+    // raised inner timeout silently starts losing to a stale outer one.
+    effectiveTimeoutMs + RACE_SLACK_MS,
     `callLLM:${fn}`,
   );
 }
