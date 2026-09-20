@@ -20,7 +20,7 @@
  * a later stage). Ranking by act_date would pick the wrong winner. These
  * ordinals mirror the P2 stage each live agent_rule targets, read from
  * agent_rules on 2026-08-16:
- *   M → Financing Pending (2)          R → Financing Approved/RTP (3)
+ *   M → Financing Pending (2)          R → Released to Production (RTP) (3)
  *   H,U,P → Permitting & HOA (4)       K,G → In Production (5)
  *   S → Install Scheduled (6)          F,C,I → Install Completed (7)
  *   B → Referral & Expansion (8)
