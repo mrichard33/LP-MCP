@@ -477,7 +477,43 @@ const QUALIFYING_TAGS = [
   'bj:stage-3-comparing', 'bj:stage-4-negotiating', 'bj:stage-5-committed',
 ];
 
+// 2026-09-21 — COMPLIANCE CARVE-OUT (~199 missed opt-outs, 2026-05-15 → 2026-09-21).
+// The stage gate below is a SALES-QUALIFICATION test: do not engage a lead we
+// have not earned. A rule that SUPPRESSES contact does the opposite job, and
+// must never be gated on whether the lead is worth selling to. These five
+// inherited the gate purely from their key prefix (BEHAVIORAL_ / INTENT_),
+// never by anyone's decision.
+//
+// BEHAVIORAL_DNC_REPLY is the one where that is guaranteed to be wrong: a
+// person texting STOP is almost never a qualified lead, so the gate blocked
+// the rule exactly when it mattered. 84% of opt-out replies never reached LP
+// or Five9; the rare fires were contacts who happened to be late-stage
+// (QzEyHIThzCQDUNETOBto carried bj:stage-3-comparing). Two booked contacts
+// were blocked anyway because they carry window-estimate-booked and
+// QUALIFYING_TAGS expects appt:window-estimate. Diagnosed 2026-09-21 after
+// qM5QYwn5ISZ8DQOgFJpX ("STOP WITH THE SOLICITATION") was dialled ~7 more
+// times; the regex was never the cause — payload_message_matches compiles
+// with the 'i' flag.
+//
+// Named keys, not a prefix, and deliberately not derived from rule.category:
+// a new BEHAVIORAL_* sales rule must not inherit an exemption by accident.
+const STAGE_GATE_EXEMPT_RULE_KEYS = new Set([
+  'BEHAVIORAL_DNC_REPLY',
+  'INTENT_DNC_HARD_REQUEST',
+  'INTENT_SPIKE_GUARD_DNC',
+  'INTENT_CANCEL_REQUESTED',
+  'BEHAVIORAL_DISENGAGEMENT_SEVERE',
+]);
+
+export function isStageGateExempt(ruleKey) {
+  return STAGE_GATE_EXEMPT_RULE_KEYS.has(String(ruleKey || ''));
+}
+
 async function passesStageGate(event, rule, intelligence) {
+  // Suppression/exit rules run for everyone — qualification is irrelevant to
+  // whether we must stop contacting someone. Checked before the prefix test so
+  // isBehavioralRule() keeps its meaning for dedupPolicy(), which shares it.
+  if (isStageGateExempt(rule.rule_key)) return true;
   if (!isBehavioralRule(rule.rule_key)) return true;
 
   const contactId = event.ghl_contact_id;
@@ -2396,6 +2432,12 @@ export function registerDecisionEngineRoutes(app) {
 // src/notifications/*). Not part of the runtime API.
 export const _internal = {
   resolveActionPriority,
+  // 2026-09-21 — stage-gate compliance carve-out (missed STOP opt-outs)
+  matchesPattern,
+  passesStageGate,
+  isStageGateExempt,
+  STAGE_GATE_EXEMPT_RULE_KEYS,
+  QUALIFYING_TAGS,
   DEFAULT_PRIORITY_BY_TYPE,
   DEFAULT_ACTION_PRIORITY,
   TIME_SENSITIVE_PRIORITY,

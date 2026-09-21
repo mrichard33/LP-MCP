@@ -92,6 +92,7 @@ import {
 import { getUsersFullInfo, getUserProfile } from '../five9-users-info.js';
 import { tryAcquireLock, releaseLock, decideLockHeldReschedule } from '../services/outbound-locks.js';
 import { emitEvent } from '../event-emitter.js';
+import { resolveContactDncNumbers } from '../actions/resolvers.js';
 
 /* ---------------------------------------------------------------------- *
  * Guardrail 1 — master flag (ships dark).
@@ -1769,17 +1770,57 @@ export async function executeAsyncDeleteRecordsFromList(action) {
   return gateResult;
 }
 
-export function executeAddNumbersToDnc(action) {
+/**
+ * Add numbers to the Five9 DNC list.
+ *
+ * Two ways to supply the numbers:
+ *   params.numbers[]               — an explicit list (unchanged, pre-2026-09)
+ *   params.numbers_from_contact    — 2026-09-21: resolve every number the
+ *                                    CONTACT owns (GHL primary + additional,
+ *                                    LP phone + phone_alt across all of the
+ *                                    prospect's leads).
+ *
+ * The second mode exists because a STOP revokes consent for the person, not
+ * for the handset that sent it, and a rule row cannot know a contact's numbers
+ * at authoring time. resolveContactDncNumbers throws on a failed read and on
+ * an empty result, so a resolution problem surfaces as a retried/failed action
+ * rather than a Five9 write that quietly suppressed nobody.
+ */
+export function executeAddNumbersToDnc(action, deps = {}) {
   const payload = action.action_payload || {};
-  const numbers = (Array.isArray(payload.numbers) ? payload.numbers : [])
-    .map(n => String(n ?? '').trim()).filter(Boolean);
-  if (!numbers.length) throw new Error('five9_add_numbers_to_dnc requires action_payload.numbers[]');
+  const fromContact = payload.numbers_from_contact === true;
+
+  const resolveNumbers = async () => {
+    if (!fromContact) {
+      const explicit = (Array.isArray(payload.numbers) ? payload.numbers : [])
+        .map(n => String(n ?? '').trim()).filter(Boolean);
+      if (!explicit.length) {
+        throw new Error('five9_add_numbers_to_dnc requires action_payload.numbers[] or numbers_from_contact:true');
+      }
+      return { numbers: explicit, sources: null };
+    }
+    const contactId = action.target_id;
+    if (!contactId) throw new Error('five9_add_numbers_to_dnc numbers_from_contact requires action.target_id');
+    const resolver = deps.resolveContactDncNumbers || resolveContactDncNumbers;
+    return resolver(contactId, deps.eventContext || {});
+  };
+
   return withFive9WriteGate({ action, subtype: 'add_numbers_to_dnc', entityType: 'five9_dnc', entityId: 'dnc' }, async (ctx) => {
+    const { numbers, sources } = await resolveNumbers();
+    if (sources) {
+      ctx.resolved_from = sources;
+      console.log(`[FIVE9 WRITES] add_numbers_to_dnc resolved ${numbers.length} number(s) for ${action.target_id}: ${JSON.stringify(sources)}`);
+    }
     ctx.previous_state = await checkDncForNumbers(numbers);
     await ctx.soap('addNumbersToDnc', buildNumbersXml(numbers));
-    if (ctx.dry_run) return { numbers_submitted: numbers.length };
+    if (ctx.dry_run) return { numbers_submitted: numbers.length, numbers_from_contact: fromContact, resolved_from: sources || undefined };
     ctx.new_state = await checkDncForNumbers(numbers); // read-back proves the add
-    return { numbers_submitted: numbers.length, now_on_dnc: ctx.new_state.on_dnc.length };
+    return {
+      numbers_submitted: numbers.length,
+      now_on_dnc: ctx.new_state.on_dnc.length,
+      numbers_from_contact: fromContact,
+      resolved_from: sources || undefined,
+    };
   });
 }
 
