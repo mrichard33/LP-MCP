@@ -459,7 +459,28 @@ function enrichFromLP(enrichedRecord, rawLead) {
   else if (pf.verified) highestStage = 'Verified';
   else if (pf.set) highestStage = 'Set';
 
-  const markets = [...new Set(allLeads.map(l => l.brn_id).filter(Boolean))].join(', ');
+  // ── lp_market is ONE market (2026-09-21) ──────────────────────────
+  // This used to be `[...new Set(allLeads.map(l => l.brn_id))].join(', ')` —
+  // every branch the prospect had ever been worked by, joined into a field
+  // that is single-valued by contract. For the 135 contacts whose LP history
+  // spans two branches that wrote things like "LAKE, FTMYR", which is not a
+  // market: slack_market_slugs matched nothing, so every card they produced
+  // fell through to the #sales-all rollup, and one printed
+  // "Market: LAKE, FTMYR" to the floor.
+  //
+  // Same rule and same reason as lp_gross_sale_amount below and lp_lead_id
+  // further down — the most recently entered lead. Derived from the SAME
+  // sorted list as lp_lead_id so the two fields describe one lead instead of
+  // contradicting each other. Readers validate it anyway
+  // (actions/enrichment.js normalizeMarketCode), which is what heals the
+  // contacts whose stored value is already joined.
+  const leadsNewestFirst = [...allLeads].sort((a, b) => {
+    const dateA = new Date(a.dateentered || a.DateEntered || a.entrydate || 0);
+    const dateB = new Date(b.dateentered || b.DateEntered || b.entrydate || 0);
+    return dateB - dateA;
+  });
+  const newestLead = leadsNewestFirst[0] || null;
+  const markets = newestLead?.brn_id ? String(newestLead.brn_id).trim().toUpperCase() : '';
 
   // ── lp_gross_sale_amount is ONE job's value (2026-08-31) ──────────
   // This used to SUM GrossSaleAmount across every lead, while
@@ -515,18 +536,12 @@ function enrichFromLP(enrichedRecord, rawLead) {
     apptStatus = latestAppt.disposition || '';
   }
 
-  // v2.0: Extract the real lds_id from the latest lead for lp_lead_id writeback
-  let latestLdsId = '';
-  if (allLeads.length > 0) {
-    // Use the most recently entered lead's lds_id
-    const sortedByDate = [...allLeads].sort((a, b) => {
-      const dateA = new Date(a.dateentered || a.DateEntered || a.entrydate || 0);
-      const dateB = new Date(b.dateentered || b.DateEntered || b.entrydate || 0);
-      return dateB - dateA;
-    });
-    const latest = sortedByDate[0];
-    latestLdsId = String(latest.lds_id || latest.LeadID || latest.id || '');
-  }
+  // v2.0: Extract the real lds_id from the latest lead for lp_lead_id writeback.
+  // Reuses the single sort above so lp_lead_id and lp_market can never point at
+  // two different leads.
+  const latestLdsId = newestLead
+    ? String(newestLead.lds_id || newestLead.LeadID || newestLead.id || '')
+    : '';
 
   const lastSynced = (() => {
     const d = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));

@@ -49,7 +49,10 @@ import { isLPLeadId, ghlFetch } from './helpers.js';
 const LP_LEAD_COLUMNS =
   'lp_lead_id, lp_prospect_id, ghl_contact_id, first_name, last_name, phone, ' +
   'city, zip, lead_source, lead_source_detail, disposition_code, disposition_label, rep_name, ' +
-  'appointment_set, appointment_date, demo_completed';
+  // lp_branch_id (2026-09-21) is the market of THIS lead. resolveMarketCode
+  // prefers it over the contact-level GHL field, which is a rollup across
+  // every branch a prospect has ever been in and cannot route a card.
+  'lp_branch_id, appointment_set, appointment_date, demo_completed';
 
 // v3.10 — GHL custom field IDs used in the prospect-ID fallback. Mirrors
 // lp-dnc.js. Single source of truth for the field ID lives in the project's

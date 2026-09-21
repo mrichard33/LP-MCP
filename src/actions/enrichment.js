@@ -74,6 +74,26 @@ const CF = {
   ESTIMATE_PDF: 'WwmVP3sAjdqYQbZyITZT',    // Calculator: generated PDF URL
 };
 
+// Test seam, same rationale as slack.js's __setSlackClientForTests: the market
+// and zip lookups read the module-level supabase singleton, and these resolvers
+// are reached from ~20 emitters with no injection point. null = production.
+let _clientOverride = null;
+
+/** TESTS ONLY — point the market/zip lookups at a stub client. */
+export function __setEnrichmentClientForTests(client) {
+  _clientOverride = client;
+}
+
+/** TESTS ONLY — drop the cached service_markets map between cases. */
+export function __resetMarketCacheForTests() {
+  _marketCache = null;
+  _marketCacheAt = 0;
+}
+
+function _client() {
+  return _clientOverride || supabase;
+}
+
 function readCF(ghlContact, fieldId) {
   const arr = ghlContact?.customFields || [];
   const f = arr.find(x => x.id === fieldId);
@@ -96,7 +116,7 @@ async function getMarketMap() {
   const now = Date.now();
   if (_marketCache && now - _marketCacheAt < MARKET_CACHE_TTL_MS) return _marketCache;
   try {
-    const { data } = await supabase.from('service_markets').select('market_code, market_name');
+    const { data } = await _client().from('service_markets').select('market_code, market_name');
     if (Array.isArray(data) && data.length > 0) {
       _marketCache = new Map(data.map(r => [String(r.market_code).toUpperCase(), r.market_name]));
       _marketCacheAt = now;
@@ -108,11 +128,60 @@ async function getMarketMap() {
 }
 
 /**
+ * A market code that is not a known market is not a code (2026-09-21).
+ *
+ * n8n-enrichment.js used to write EVERY branch a prospect had ever been in
+ * into the single-valued GHL field CF.MARKET_CODE, joined: "LAKE, FTMYR".
+ * Both resolvers below passed that straight through, so all 135 contacts whose
+ * LP history spans two branches resolved no Slack channel and every card they
+ * produced landed in the #sales-all rollup. One of them printed
+ * "Market: LAKE, FTMYR" on a customer-issue card.
+ *
+ * Returning null for an unrecognised value lets the zip lookup below run —
+ * which was correct all along (the Naples lead's zip 34116 maps to FTMYR).
+ * That is what heals the contacts whose stored field is already poisoned,
+ * without a GHL backfill.
+ *
+ * COUPLING, deliberate: this validates against service_markets, while channel
+ * routing resolves through slack_market_slugs — two tables keyed independently.
+ * Every slug code is a service_markets code today (verified 2026-09-21), so
+ * nothing routable is rejected. ADDING A MARKET MEANS A ROW IN BOTH: a code in
+ * slack_market_slugs alone would be discarded here and its cards would fall to
+ * the rollup. The stricter check is worth that obligation — it means a typo'd
+ * or retired code resolves the REAL market from the zip instead of routing on
+ * a value no channel matches.
+ *
+ * @returns {string|null} the upper-cased code when it is a real market
+ */
+export function normalizeMarketCode(raw, markets) {
+  if (raw === undefined || raw === null) return null;
+  const code = String(raw).trim().toUpperCase();
+  if (!code) return null;
+  return markets?.has?.(code) ? code : null;
+}
+
+/**
+ * normalizeMarketCode for callers that hold a raw code and no market map —
+ * the canvassing intake, which reads the same poisoned field off its webhook
+ * body. Loads the cached map itself and never throws.
+ */
+export async function toKnownMarketCode(raw) {
+  return normalizeMarketCode(raw, await getMarketMap());
+}
+
+/**
  * Resolve the human market name for a contact.
- *   1. GHL market-code custom field → service_markets
- *   2. zip → service_area_zips → service_markets
- *   3. city as a last-resort label
+ *   1. this lead's lp_branch_id → service_markets   (2026-09-21)
+ *   2. GHL market-code custom field → service_markets
+ *   3. zip → service_area_zips → service_markets
+ *   4. city as a last-resort label
  * Returns null when nothing resolves (renderers show "Unknown").
+ *
+ * Steps 1 and 2 are validated against service_markets, so both now depend on
+ * that table loading. getMarketMap keeps the previous cache on a failed read
+ * and only a cold-start failure yields an empty map; when it does, every code
+ * is rejected and resolution degrades to the zip — which is the safe direction,
+ * and still lands the card somewhere.
  *
  * `city` may be passed explicitly (2026-09-14) for callers that hold an
  * address but no fetched GHL contact or lp_leads row — the canvassing
@@ -124,16 +193,22 @@ async function getMarketMap() {
 export async function resolveMarket({ ghlContact = null, lpLead = null, zip: zipArg = null, city: cityArg = null } = {}) {
   const markets = await getMarketMap();
 
-  // 1. LP branch/market code on the GHL contact
-  const code = readCF(ghlContact, CF.MARKET_CODE);
-  if (code) {
-    const name = markets.get(String(code).toUpperCase());
-    if (name) return name;
-    // Unrecognized code — still better than nothing
-    return String(code).toUpperCase();
-  }
+  // 1. The branch of THIS lead, when the caller has one. A card is about one
+  // appointment, and that appointment belongs to one market — the contact-level
+  // field below is a property of the person, not of the lead that raised the
+  // card, and the two disagree for any prospect worked by two branches.
+  const leadCode = normalizeMarketCode(lpLead?.lp_branch_id, markets);
+  if (leadCode) return markets.get(leadCode);
 
-  // 2. zip → service_area_zips.
+  // 2. LP branch/market code on the GHL contact.
+  //
+  // 2026-09-21: an unrecognised value no longer falls through to
+  // `return code` — printing "LAKE, FTMYR" as a market is worse than falling
+  // through to the zip, which resolves the real one. See normalizeMarketCode.
+  const code = normalizeMarketCode(readCF(ghlContact, CF.MARKET_CODE), markets);
+  if (code) return markets.get(code);
+
+  // 3. zip → service_area_zips.
   //
   // An explicit zip wins over both record lookups: callers that have the zip in
   // hand and no fetched contact (the canvassing intake, whose payload carries
@@ -144,7 +219,7 @@ export async function resolveMarket({ ghlContact = null, lpLead = null, zip: zip
   const zip = (zipArg || ghlContact?.postalCode || lpLead?.zip || '').toString().trim().slice(0, 5);
   if (/^\d{5}$/.test(zip)) {
     try {
-      const { data } = await supabase.from('service_area_zips')
+      const { data } = await _client().from('service_area_zips')
         .select('market_code')
         .eq('zip', zip)
         .maybeSingle();
@@ -157,7 +232,7 @@ export async function resolveMarket({ ghlContact = null, lpLead = null, zip: zip
     }
   }
 
-  // 3. city fallback
+  // 4. city fallback
   const city = cityArg || ghlContact?.city || lpLead?.city || null;
   return city ? String(city) : null;
 }
@@ -176,13 +251,22 @@ export async function resolveMarket({ ghlContact = null, lpLead = null, zip: zip
  * fine label but is never a market code.
  */
 export async function resolveMarketCode({ ghlContact = null, lpLead = null, zip: zipArg = null } = {}) {
-  const code = readCF(ghlContact, CF.MARKET_CODE);
-  if (code) return String(code).toUpperCase();
+  // Same precedence as resolveMarket, and for the same reason: this lead's own
+  // branch beats the contact-level field, and a value that is not a real market
+  // code is discarded rather than routed on. Unvalidated, this line shipped
+  // "LAKE, FTMYR" to the Slack mirror, which matched no channel.
+  const markets = await getMarketMap();
+
+  const leadCode = normalizeMarketCode(lpLead?.lp_branch_id, markets);
+  if (leadCode) return leadCode;
+
+  const code = normalizeMarketCode(readCF(ghlContact, CF.MARKET_CODE), markets);
+  if (code) return code;
 
   const zip = (zipArg || ghlContact?.postalCode || lpLead?.zip || '').toString().trim().slice(0, 5);
   if (/^\d{5}$/.test(zip)) {
     try {
-      const { data } = await supabase.from('service_area_zips')
+      const { data } = await _client().from('service_area_zips')
         .select('market_code')
         .eq('zip', zip)
         .maybeSingle();
@@ -290,7 +374,7 @@ export async function buildNotificationEnrichment(contactId, context = {}, { lpL
   const intelKey = ghlContactId || (lpLead?.ghl_contact_id) || (isLPLeadId(contactId) ? null : contactId);
   if (intelKey) {
     try {
-      const { data: intel } = await supabase.from('lead_intelligence')
+      const { data: intel } = await _client().from('lead_intelligence')
         .select('intent_score, intent_tier, objection_type, psychological_barrier, rep_briefing, ai_reasoning')
         .eq('ghl_contact_id', intelKey)
         .maybeSingle();

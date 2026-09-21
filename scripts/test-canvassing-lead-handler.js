@@ -118,6 +118,11 @@ async function stubResolveMarket({ zip, city } = {}) {
   return MARKET_BY_ZIP.get(String(zip || '')) || (city ? String(city) : null);
 }
 
+// The markets service_markets actually holds. toKnownMarketCode rejects
+// anything else, which is what stops a joined value like "LAKE, FTMYR"
+// reaching the Slack mirror (see actions/enrichment.js normalizeMarketCode).
+const KNOWN_MARKETS = new Set(['FTMYR', 'LAKE', 'FTLAU', 'BOCA', 'MIAMI', 'JAX', 'ORL', 'SAR', 'STPET', 'GENERAL']);
+
 function mockDeps({
   addLeadImpl, salesRabbitImpl, client, resolveCanvasserProId, checkServiceAreaZip, resolveMarket,
 } = {}) {
@@ -129,6 +134,10 @@ function mockDeps({
     resolveMarket: async (args) => {
       calls.market.push(args);
       return (resolveMarket || stubResolveMarket)(args);
+    },
+    toKnownMarketCode: async (raw) => {
+      const code = String(raw ?? '').trim().toUpperCase();
+      return KNOWN_MARKETS.has(code) ? code : null;
     },
     // Zip → market code for the Slack mirror. Default: zip not in any market.
     checkServiceAreaZip: checkServiceAreaZip
@@ -635,6 +644,19 @@ test('card: opts.market carries the LP market code for the Slack mirror — fiel
     });
     await processCanvassingLead(validPayload({ z0MV6mXi0w9WwdCOFThh: 'FTMYR' }), deps);
     assert.equal(createdOpts(calls).market, 'FTMYR');
+  }
+
+  // 1b. 2026-09-21 — a multi-branch field is NOT a market. "LAKE, FTMYR" is
+  //     what 135 contacts carry; it must fall through to the zip exactly as if
+  //     the field had been blank, not route on a value no channel matches.
+  {
+    const seen = [];
+    const { deps, calls } = mockDeps({
+      checkServiceAreaZip: async (zip) => { seen.push(zip); return { checked: true, zip, in_service_area: true, market_code: 'FTLAU' }; },
+    });
+    await processCanvassingLead(validPayload({ z0MV6mXi0w9WwdCOFThh: 'LAKE, FTMYR' }), deps);
+    assert.deepEqual(seen, ['33446'], 'the zip lookup has to run');
+    assert.equal(createdOpts(calls).market, 'FTLAU');
   }
 
   // 2. No field → the homeowner's zip resolves through service_area_zips.
