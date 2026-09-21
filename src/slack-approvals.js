@@ -32,7 +32,7 @@
  *              └─ anything else → SLACK_INTERACTIONS_FORWARD_URL, raw bytes
  *                                 and Slack's signing headers unchanged
  *
- * Three rules make that safe:
+ * Four rules make that safe:
  *
  *   - FORWARDING IS INDEPENDENT OF SLACK_APPROVALS_ENABLED. Once Slack points
  *     here, onboarding clicks must work whether or not agent approvals are on.
@@ -42,6 +42,10 @@
  *     parser treats any action_id that is not `deny_member` as an approval, so
  *     leaking an `approval_approve` click into it would read as "approve a team
  *     member" with a null id.
+ *   - THE FORWARD CARRIES ITS OWN CREDENTIAL. SLACK_INTERACTIONS_FORWARD_AUTH
+ *     goes out as a header the target matches with n8n's built-in Header Auth,
+ *     so a POST straight to that URL is refused before any node runs. Unset =
+ *     not sent, so it can ship ahead of the n8n change.
  *   - THE SIGNATURE IS CHECKED BEFORE EITHER PATH. Unset SLACK_SIGNING_SECRET
  *     refuses everything (verifySlackSignature returns no_secret) — including
  *     forwards. That is deliberate: set the secret BEFORE repointing Slack.
@@ -61,11 +65,23 @@ const APPROVERS = parseApproverIds(process.env.SLACK_APPROVER_IDS);
 // put the whole Slack payload on the wire. Unset = forwarding off.
 const RAW_FORWARD_URL = (process.env.SLACK_INTERACTIONS_FORWARD_URL || '').trim();
 const FORWARD_URL = RAW_FORWARD_URL.startsWith('https://') ? RAW_FORWARD_URL : '';
+// Proves to the forward target that a request came from LP MCP and not straight
+// off the internet (2026-09-21). n8n's OPS.SLK-E webhook verifies nothing of its
+// own, so before Slack was repointed here anyone who knew that URL could approve
+// a team member. Slack's own signature cannot serve: n8n would need the raw
+// bytes and the signing secret to check it. A header it can match with its
+// built-in Header Auth credential can.
+//
+// UNSET = NOT SENT, deliberately. The header has to be going out BEFORE n8n
+// starts requiring it, or onboarding breaks in the gap between the two changes.
+const FORWARD_AUTH_HEADER = (process.env.SLACK_INTERACTIONS_FORWARD_AUTH_HEADER || 'X-LPMCP-Forward-Auth').trim();
+const FORWARD_AUTH_VALUE = (process.env.SLACK_INTERACTIONS_FORWARD_AUTH || '').trim();
+
 if (RAW_FORWARD_URL && !FORWARD_URL) {
   console.error(`[SlackApprovals] SLACK_INTERACTIONS_FORWARD_URL must start with https:// — forwarding DISABLED (got "${RAW_FORWARD_URL.slice(0, 40)}")`);
 }
 
-console.log(`[SlackApprovals] enabled=${slackApprovalsEnabled()} secret=${SIGNING_SECRET ? 'set' : 'unset'} approvers=${APPROVERS.size} forward=${FORWARD_URL ? new URL(FORWARD_URL).host : '-'}`);
+console.log(`[SlackApprovals] enabled=${slackApprovalsEnabled()} secret=${SIGNING_SECRET ? 'set' : 'unset'} approvers=${APPROVERS.size} forward=${FORWARD_URL ? new URL(FORWARD_URL).host : '-'} forward_auth=${FORWARD_AUTH_VALUE ? `sending ${FORWARD_AUTH_HEADER}` : 'not sent'}`);
 // A forward target with no secret refuses every click, ours and theirs alike.
 // Say so at boot rather than letting it be discovered by a broken onboarding.
 if (FORWARD_URL && !SIGNING_SECRET) {
@@ -82,14 +98,21 @@ export function slackRawBodyParser() {
  *
  * The body is relayed as the exact Buffer Slack sent, and the two signing
  * headers ride along, so the destination can verify the signature itself if it
- * ever starts to. Nothing else is copied — no auth headers, no cookies.
+ * ever starts to. NOTHING is copied from the inbound request beyond those two —
+ * no Authorization, no cookies. The only other header is our own forward
+ * credential, which this process owns and the caller can never influence.
  *
  * ONE ATTEMPT, no retry. The destination replaces the Slack card through
  * response_url, so a dropped forward leaves the buttons visibly unclicked and
  * the operator simply clicks again; a retry would risk two card replacements
  * for one click. Never throws.
  */
-export async function forwardInteraction(rawBody, headers = {}, { url = FORWARD_URL, fetchImpl = fetch } = {}) {
+export async function forwardInteraction(rawBody, headers = {}, {
+  url = FORWARD_URL,
+  fetchImpl = fetch,
+  authHeader = FORWARD_AUTH_HEADER,
+  authValue = FORWARD_AUTH_VALUE,
+} = {}) {
   if (!url) return { forwarded: false, reason: 'no_url' };
   try {
     const res = await fetchImpl(url, {
@@ -98,6 +121,8 @@ export async function forwardInteraction(rawBody, headers = {}, { url = FORWARD_
         'Content-Type': 'application/x-www-form-urlencoded',
         'X-Slack-Request-Timestamp': String(headers['x-slack-request-timestamp'] || ''),
         'X-Slack-Signature': String(headers['x-slack-signature'] || ''),
+        // Our own credential, not Slack's, and not copied from the request.
+        ...(authValue && authHeader ? { [authHeader]: authValue } : {}),
       },
       body: rawBody,
       signal: AbortSignal.timeout(8000),
