@@ -341,6 +341,63 @@ test('the forward relays the exact bytes and the signing headers, nothing else',
   assert.ok(!sent.includes('cookie'), `leaked headers: ${sent.join(',')}`);
 });
 
+// ─── the forward carries its own credential ──────────────────────
+//
+// n8n's OPS.SLK-E webhook verifies nothing of its own, so anyone who knew that
+// URL could approve a team member. LP MCP sends a header n8n matches with its
+// built-in Header Auth; these pin that it goes out, that it is OURS and not
+// copied from the request, and that an unset secret sends nothing (so this can
+// deploy before the n8n side is switched on).
+
+test('the forward credential is sent when configured', async () => {
+  const calls = [];
+  const fetchImpl = async (url, opts) => { calls.push(opts); return { ok: true, status: 200 }; };
+
+  await forwardInteraction(Buffer.from('payload=%7B%7D'), {}, {
+    url: 'https://n8n.example.com/hook',
+    fetchImpl,
+    authHeader: 'X-LPMCP-Forward-Auth',
+    authValue: 's3cret',
+  });
+  assert.equal(calls[0].headers['X-LPMCP-Forward-Auth'], 's3cret');
+});
+
+test('an unset credential sends NO header, so it can ship before n8n flips', async () => {
+  const calls = [];
+  const fetchImpl = async (url, opts) => { calls.push(opts); return { ok: true, status: 200 }; };
+
+  await forwardInteraction(Buffer.from('payload=%7B%7D'), {}, {
+    url: 'https://n8n.example.com/hook', fetchImpl, authValue: '',
+  });
+  const sent = Object.keys(calls[0].headers).map((k) => k.toLowerCase());
+  assert.ok(!sent.includes('x-lpmcp-forward-auth'), `unexpected auth header: ${sent.join(',')}`);
+});
+
+test('the credential is ours — an inbound header of the same name cannot set it', async () => {
+  const calls = [];
+  const fetchImpl = async (url, opts) => { calls.push(opts); return { ok: true, status: 200 }; };
+
+  await forwardInteraction(Buffer.from('payload=%7B%7D'), {
+    'x-lpmcp-forward-auth': 'attacker-supplied',
+    authorization: 'Bearer nope',
+  }, {
+    url: 'https://n8n.example.com/hook', fetchImpl, authHeader: 'X-LPMCP-Forward-Auth', authValue: 'real',
+  });
+  assert.equal(calls[0].headers['X-LPMCP-Forward-Auth'], 'real', 'the caller must not be able to influence it');
+  const sent = Object.keys(calls[0].headers).map((k) => k.toLowerCase());
+  assert.ok(!sent.includes('authorization'));
+});
+
+test('a 401 from the target is reported, not swallowed', async () => {
+  // This is what a misconfigured Header Auth credential looks like. It has to
+  // reach the log, or onboarding fails silently.
+  const r = await forwardInteraction(Buffer.from('x'), {}, {
+    url: 'https://n8n.example.com/hook',
+    fetchImpl: async () => ({ ok: false, status: 401 }),
+  });
+  assert.deepEqual(r, { forwarded: false, reason: 'http_401' });
+});
+
 test('no forward URL configured is a no-op, not an error', async () => {
   let called = false;
   const r = await forwardInteraction(Buffer.from('x'), {}, { url: '', fetchImpl: async () => { called = true; } });
