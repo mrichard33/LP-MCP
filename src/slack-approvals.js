@@ -179,9 +179,14 @@ export async function handleInteraction(parsed, { approvers = APPROVERS, resolve
   }
 
   if (result.outcome === 'already_resolved') {
+    // 'auto_closed' is a machine status (src/approval-card-autoclose.js), and
+    // "Already auto_closed" reads like a system error to the person clicking.
+    const how = result.previousStatus === 'auto_closed'
+      ? 'closed automatically — its actions were already handled'
+      : `already ${result.previousStatus}${result.resolvedBy ? ` by ${result.resolvedBy}` : ''}`;
     await reply(responseUrl, {
       replace_original: true,
-      text: `${originalText}\n\nℹ️ Already ${result.previousStatus}${result.resolvedBy ? ` by ${result.resolvedBy}` : ''}.`,
+      text: `${originalText}\n\nℹ️ This card was ${how}.`,
     });
     return { handled: true, action: 'already_resolved' };
   }
