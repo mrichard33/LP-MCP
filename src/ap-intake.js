@@ -203,8 +203,26 @@ export async function resolveApContact(body, { mode = intakeMode(), deps, log } 
  * indistinguishable from one it never sent.
  */
 function logClientDisconnect(req, res, started, label) {
-  req.on('close', () => {
-    if (res.writableEnded) return;
+  // 2026-09-21 — LISTEN ON `res`, NOT `req`, AND CHECK writableFinished.
+  //
+  // The first cut used `req.on('close')` with `res.writableEnded`. On Node the
+  // REQUEST stream's 'close' fires as soon as the request body has been read —
+  // on every healthy request, before the handler has answered. So this logged
+  // `client disconnected after 5ms — ActiveProspect gave up` at severity error
+  // for every single call, including the four successful probes that first
+  // exercised it.
+  //
+  // That is the failure CLAUDE.md names directly: an alarm that fires on the
+  // healthy case gets muted, and a muted alarm is how a 47-hour outage went
+  // unnoticed. Worse here than useless — this line is the ONLY evidence we can
+  // ever get of ActiveProspect's real delivery timeout, since LeadConduit
+  // exposes none, so drowning it in false positives costs the one measurement.
+  //
+  // The RESPONSE's 'close' fires when the response completes OR the connection
+  // is torn down early, and `writableFinished` is true only once the whole
+  // response was flushed. That pair distinguishes the two.
+  res.on('close', () => {
+    if (res.writableFinished) return;
     console.warn(`[${label}] client disconnected after ${Date.now() - started}ms — `
       + 'ActiveProspect gave up before we answered');
   });
