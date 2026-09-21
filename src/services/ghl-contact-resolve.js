@@ -37,8 +37,9 @@
 import { ghlFetch } from '../actions/helpers.js';
 import { GHL_LOCATION_ID } from '../actions/constants.js';
 import { normalizePhone } from '../sync-utils.js';
+import { findContactIdByPhone } from './ghl-contact-mirror.js';
 
-export const DEFAULT_DEPS = { ghlFetch };
+export const DEFAULT_DEPS = { ghlFetch, findContactIdByPhone };
 
 /** Names GHL should never be given. Mirrors the backstop's NAME_JUNK intent. */
 const NAME_JUNK = new Set(['', 'n/a', 'na', 'none', 'null', 'undefined', 'test', 'unknown']);
@@ -114,11 +115,33 @@ export async function searchByPhone(normalizedPhone, { deps = DEFAULT_DEPS, log 
  *                which is the condition Phase A had to clean up by hand.
  */
 export async function resolveOrCreateContact(input, {
-  create = true, deps = DEFAULT_DEPS, log = console,
+  create = true, deps = DEFAULT_DEPS, log = console, mirrorFirst = false,
 } = {}) {
   const phone = normalizePhone(input?.phone);
   if (!phone || phone.replace(/[^0-9]/g, '').length < 10) {
     return { contactId: null, outcome: 'no_phone' };
+  }
+
+  // TIER 0 (opt-in) — the HL contacts mirror, which costs no GHL token.
+  //
+  // ghlFetch shares one process-wide bucket with the action executor
+  // (src/ghl-rate-limiter.js), so a search during an executor batch queues
+  // behind it: that is what made /intake/ap-resolve time out at 1200ms on
+  // 2026-09-21 while the search itself measured 101-270ms. On a latency-capped
+  // path a full bucket cannot be assumed, so intake asks the mirror first.
+  //
+  // Opt-in rather than default: lp-contact-backstop.js shares this function and
+  // runs off the request path, where token contention costs it nothing.
+  //
+  // A mirror hit is a last-10-digit exact match on a shape-valid id, already
+  // enforced in findContactIdByPhone — ambiguity and unreadability both return
+  // null, which falls through to exactly the behaviour below. The mirror can
+  // save a round trip; it can never be the reason a contact is missed.
+  if (mirrorFirst) {
+    // Through deps so a test can stub it; `?.` so a deps stub that predates
+    // this tier simply skips it rather than throwing.
+    const mirrored = await deps.findContactIdByPhone?.(phone, { log });
+    if (mirrored) return { contactId: mirrored, outcome: 'found' };
   }
 
   const match = await searchByPhone(phone, { deps, log });

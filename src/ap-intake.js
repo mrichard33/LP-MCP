@@ -156,8 +156,16 @@ export async function resolveApContact(body, { mode = intakeMode(), deps, log } 
     const tags = [AP_INTAKE_TAG, 'lp-linked', 'stage:new-lead',
       ...backstopTagsFor('Internet', vendor || null, { suppressOutbound: false })];
     const result = await raceWithNullTimeout(
-      resolveOrCreateContact({ ...input, tags },
-        { create: mode === 'live', ...(deps ? { deps } : {}), ...(log ? { log } : {}) }),
+      resolveOrCreateContact({ ...input, tags }, {
+        create: mode === 'live',
+        // Ask the HL contacts mirror before GoHighLevel. ghlFetch queues on the
+        // same token bucket as the action executor, which is what timed this
+        // endpoint out at 1200ms on 2026-09-21 while the search itself measured
+        // 101-270ms. See services/ghl-contact-mirror.js.
+        mirrorFirst: true,
+        ...(deps ? { deps } : {}),
+        ...(log ? { log } : {}),
+      }),
       RESOLVE_TIMEOUT_MS,
     );
     const resolveMs = Date.now() - t0;
@@ -221,7 +229,12 @@ export function registerApIntakeRoutes(app) {
     const r = await resolveApContact(body, { mode });
 
     console.log(
-      `[AP-RESOLVE] vendor=${vendor || '?'} mode=${mode} resolve=${r.outcome}/${r.resolveMs}ms `
+      // srs_id is logged, not used: it is LP's own SubSource id, and printing it
+      // beside the vendor NAME we actually route on (against
+      // lp_source_mapping.lp_source_subdetail) is how shadow answers whether the
+      // two agree before anything depends on them agreeing.
+      `[AP-RESOLVE] vendor=${vendor || '?'} srs=${pick(body, 'srs_id', 'srsid', 'SRS_id') || '?'} `
+      + `mode=${mode} resolve=${r.outcome}/${r.resolveMs}ms `
       + `${r.contactId ? `returned=${r.contactId}` : `returned=no${r.wouldStamp ? ` would=${r.wouldStamp}` : ''}`} `
       + `total=${Date.now() - started}ms`
     );
