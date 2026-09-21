@@ -35,6 +35,21 @@
  *   P2_TERMINAL_CREATE_GUARD_MODE (off | shadow | enforce, default shadow).
  *   See src/p2-opportunity-context.js.
  *
+ *   v5.5 (2026-09-21): every P2 opportunity now records WHICH LP job it tracks,
+ *   in the "LP Job ID" opportunity custom field (sMZfcWAdoqh88pghLsNQ, created
+ *   2026-09-21). Until now nothing on an opportunity said so, and value, source
+ *   and won/lost were all decided from "the contact's newest live job" — a proxy
+ *   that breaks for the 293 contacts holding more than one job. The create path
+ *   stamps it; the move path stamps it IF EMPTY and never overwrites a populated
+ *   one, and values from that one job. And an event speaking for a TERMINAL job
+ *   that is not the tracked one no longer moves or creates a different job's
+ *   opportunity (skipped_other_job) — an old job's replayed milestone could
+ *   previously drag a repeat customer's NEW opportunity backwards, with only the
+ *   forward-only guard standing in the way. No new env var: the other-job skip
+ *   rides P2_TERMINAL_CREATE_GUARD_MODE. Events already carry the job id in
+ *   system_events.payload.job_id. FAIL OPEN throughout — an unreadable event, an
+ *   unknown job id, or no jobs behaves exactly as v5.4 does.
+ *
  *   v4.4 (2026-06-16): duplicate-opportunity recovery (N1). When the create
  *   path's POST is rejected by GHL with 400 "Can not create duplicate
  *   opportunity for the contact" (meta.existingId), update that existing opp
@@ -68,7 +83,9 @@ import { checkStageMoveEvidence } from '../stage-evidence.js';
 import { emitEvent } from '../../event-emitter.js';
 import { openJobValueForContact } from '../../lp-job-value.js';
 import { opportunitySourceField } from '../../lp-source-attribution.js';
-import { loadP2CreateContext, terminalGuardMode } from '../../p2-opportunity-context.js';
+import {
+  loadP2CreateContext, terminalGuardMode, eventJobIdForAction, readOppJobId, OPP_CF_LP_JOB_ID,
+} from '../../p2-opportunity-context.js';
 
 // ─── v5.0 (2026-08-16): one-open-opportunity-per-pipeline invariant ──
 // Standing rule (Mark): a contact must never hold more than one OPEN
@@ -190,6 +207,9 @@ export async function executeMoveOpportunity(action) {
   // has an existing value clobbered by a stage move.
   const jobValue = await openJobValueForContact(contactId);
   const valueField = jobValue === null ? {} : { monetaryValue: jobValue };
+  // v5.5 (2026-09-21): the event that queued this action names the LP job
+  // (system_events.payload.job_id). Null for manual actions — everything below falls back.
+  const eventJobId = pipeline === 'P2' ? await eventJobIdForAction(action) : null;
 
   // ── Stage-transition evidence validator (2026-07-03) ────────────
   // Milestone stages require real-world evidence BEFORE any move, no matter
@@ -265,15 +285,36 @@ export async function executeMoveOpportunity(action) {
     // opps[0] is open by construction (the openOpps filter above), but the
     // invariant is enforced at the WRITE rather than inherited from that filter
     // — that inheritance is exactly what made the freeze accidental.
-    const moveValueField = isValueWritable(opps[0]) ? valueField : {};
-    await ghlFetch('PUT', `/opportunities/${opps[0].id}`, { pipelineStageId: stageId, status: status || 'open', ...moveValueField });
+    let moveValueField = isValueWritable(opps[0]) ? valueField : {};
+    let jobIdField = {};
+    if (pipeline === 'P2') {
+      const stampedJobId = readOppJobId(opps[0]);
+      const ctx = await loadP2CreateContext(contactId, { stampedJobId, eventJobId });
+      if (ctx.otherJob) {
+        const mode = terminalGuardMode();
+        console.warn(`[ActionExecutor] P2 move from ANOTHER job (${mode}): contact=${contactId} opp=${opps[0].id} tracked=${ctx.job?.lp_job_id} event_job=${ctx.eventJob?.lp_job_id} status="${ctx.eventJob?.job_status}" stage="${stage}"`);
+        if (mode === 'enforce') {
+          return {
+            action: 'skipped_other_job', opportunity_id: opps[0].id, pipeline, target_stage: stage,
+            tracked_job_id: ctx.job?.lp_job_id ?? null, event_job_id: ctx.eventJob?.lp_job_id ?? null,
+          };
+        }
+      }
+      if (ctx.job && ctx.value !== null && isValueWritable(opps[0])) moveValueField = { monetaryValue: ctx.value };
+      // Stamp-if-empty. A populated LP Job ID is never overwritten.
+      if (ctx.job && !stampedJobId) {
+        jobIdField = { customFields: [{ id: OPP_CF_LP_JOB_ID, field_value: String(ctx.job.lp_job_id) }] };
+      }
+    }
+    await ghlFetch('PUT', `/opportunities/${opps[0].id}`, { pipelineStageId: stageId, status: status || 'open', ...moveValueField, ...jobIdField });
     return {
       action: 'updated',
       opportunity_id: opps[0].id,
       pipeline,
       stage,
       status,
-      monetary_value: Object.keys(moveValueField).length ? jobValue : null,
+      monetary_value: moveValueField.monetaryValue ?? null,
+      lp_job_id_stamped: jobIdField.customFields ? jobIdField.customFields[0].field_value : null,
       backward_override: !guard.allowed && allowBackward,
     };
   } else {
@@ -308,9 +349,26 @@ export async function executeMoveOpportunity(action) {
     //    dead (115 of 157 creates in 30 days). Create-path only; an existing open
     //    opp still moves. Fails OPEN on no job / unreadable. Mode flag, default shadow.
     let terminalGuard = null;
+    let createValueField = valueField;
+    let createJobIdField = {};
     if (pipeline === 'P2') {
-      const ctx = await loadP2CreateContext(contactId);
+      const ctx = await loadP2CreateContext(contactId, { eventJobId });
       if (ctx.source) sourceField = { source: ctx.source };
+      if (ctx.job) {
+        createJobIdField = { customFields: [{ id: OPP_CF_LP_JOB_ID, field_value: String(ctx.job.lp_job_id) }] };
+        createValueField = ctx.value === null ? {} : { monetaryValue: ctx.value };
+      }
+      if (ctx.otherJob) {
+        // An old terminal job's milestone must not open an opportunity for a DIFFERENT job at the old job's stage.
+        const otherMode = terminalGuardMode();
+        console.warn(`[ActionExecutor] P2 create from ANOTHER job (${otherMode}): contact=${contactId} tracked=${ctx.job?.lp_job_id} event_job=${ctx.eventJob?.lp_job_id} stage="${stage}"`);
+        if (otherMode === 'enforce') {
+          return {
+            action: 'skipped_other_job', pipeline, target_stage: stage, contact_id: contactId,
+            tracked_job_id: ctx.job?.lp_job_id ?? null, event_job_id: ctx.eventJob?.lp_job_id ?? null,
+          };
+        }
+      }
       if (ctx.terminal) {
         const mode = terminalGuardMode();
         terminalGuard = `${mode}:${ctx.verdict}`;
@@ -331,10 +389,11 @@ export async function executeMoveOpportunity(action) {
         contactId,
         name,
         status: status || 'open',
-        ...valueField,
+        ...createValueField,
         ...sourceField,
+        ...createJobIdField,
       });
-      return { action: 'created', opportunity_id: newOpp?.opportunity?.id, pipeline, stage, status, monetary_value: jobValue, source: sourceField.source || null, terminal_guard: terminalGuard };
+      return { action: 'created', opportunity_id: newOpp?.opportunity?.id, pipeline, stage, status, monetary_value: createValueField.monetaryValue ?? null, source: sourceField.source || null, lp_job_id: createJobIdField.customFields ? createJobIdField.customFields[0].field_value : null, terminal_guard: terminalGuard };
     } catch (err) {
       // v4.4 (2026-06-16) — Duplicate-opportunity recovery (N1).
       // GHL permits only one open opportunity per contact and rejects the

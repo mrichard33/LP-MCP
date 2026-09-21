@@ -215,6 +215,7 @@ import { PIPELINE_IDS, STAGE_MAP, GHL_LOCATION_ID } from '../src/actions/constan
 import { checkForwardOnly, getStagePosition } from '../src/pipeline-guard.js';
 import { hlRunSQL } from '../src/admin/hl-client.js';
 import { latestJob } from '../src/lp-job-value.js';
+import { readOppJobId } from '../src/p2-opportunity-context.js';
 import {
   JOB_STATUS_LOST_REASON, isLostReasonId, lostReasonIdForJobStatus,
 } from '../src/lp-lost-reasons.js';
@@ -406,7 +407,7 @@ export function derivedStageFromMilestones(milestones = [], mapping = {}) {
  *            unmappedMdtIds: string[], completedMilestones: number,
  *            detail: string}}
  */
-export function stageDecision({ currentStageId, jobs = [], mapping = {} } = {}) {
+export function stageDecision({ currentStageId, jobs = [], mapping = {}, trackedJobId = null } = {}) {
   const base = {
     job: null,
     targetStageId: null,
@@ -421,6 +422,27 @@ export function stageDecision({ currentStageId, jobs = [], mapping = {} } = {}) 
   // 1. No LP job record at all. Out of scope by decision — see the header.
   if (rows.length === 0) {
     return { ...base, verdict: 'skip_no_job', detail: 'contact has no lp_jobs row' };
+  }
+
+  // 1b. The opportunity SAYS which job it tracks (2026-09-21, the LP Job ID
+  //     custom field). That beats every heuristic below: a repeat customer's
+  //     2024 Paid In Full opportunity must close won on ITS job, not stay open
+  //     because a newer job is still in production. When the stamped id names a
+  //     job we did not read, fall through and behave exactly as before rather
+  //     than refusing — a stamp we cannot resolve is no worse than no stamp.
+  const tracked = trackedJobId == null
+    ? null
+    : rows.find((r) => String(r.lp_job_id) === String(trackedJobId)) || null;
+  if (tracked) {
+    const trackedStatus = trimmed(tracked.job_status);
+    const withTracked = { ...base, job: tracked, jobStatus: trackedStatus };
+    if (WON_JOB_STATUSES.has(trackedStatus)) {
+      return { ...withTracked, verdict: 'win', detail: `tracked job ${tracked.lp_job_id} is "${trackedStatus}"` };
+    }
+    if (LOST_JOB_STATUSES.has(trackedStatus)) {
+      return { ...withTracked, verdict: 'lose', detail: `tracked job ${tracked.lp_job_id} is "${trackedStatus}"` };
+    }
+    return stageFromJob(tracked, { currentStageId, mapping, base });
   }
 
   // 2. Jobs exist but every one of them is cancelled or dead. latestJob()
@@ -451,6 +473,19 @@ export function stageDecision({ currentStageId, jobs = [], mapping = {} } = {}) 
   }
 
   // 4. In progress. Derive a stage from THAT job's completed milestones.
+  return stageFromJob(job, { currentStageId, mapping, base });
+}
+
+/**
+ * Phase 2 of stageDecision: one in-progress job, its milestones, the guard.
+ *
+ * Extracted 2026-09-21 so the stamped-job path and the latestJob() path run the
+ * SAME derivation. Two copies of this would be two chances to disagree about
+ * what a milestone means, and the disagreement would only surface on the repeat
+ * customers this whole change exists to get right.
+ */
+function stageFromJob(job, { currentStageId, mapping, base }) {
+  const withJob = { ...base, job, jobStatus: trimmed(job.job_status) };
   const { target, completed, unmapped } = derivedStageFromMilestones(job.milestones || [], mapping);
   const withMilestones = { ...withJob, completedMilestones: completed, unmappedMdtIds: unmapped };
 
@@ -730,7 +765,7 @@ async function loadMilestoneMapping() {
 /** Open P2 opportunities, from the HL mirror rather than paging GHL. */
 async function fetchCandidates() {
   const rows = await hlRunSQL(`
-    SELECT o.ghl_opportunity_id, o.ghl_contact_id, o.ghl_stage_id, o.status, o.name
+    SELECT o.ghl_opportunity_id, o.ghl_contact_id, o.ghl_stage_id, o.status, o.name, o.custom_fields
       FROM opportunities o
      WHERE o.ghl_pipeline_id = '${pipelineId}'
        AND o.ghl_contact_id IS NOT NULL
@@ -868,7 +903,13 @@ async function readLiveOpportunity(opportunityId) {
   const res = await ghlFetch('GET', `/opportunities/${opportunityId}`);
   const o = res?.opportunity || res;
   if (!o || !o.id) return null;
-  return { stageId: o.pipelineStageId, status: o.status };
+  // 2026-09-21 — the tracked LP job comes from THIS live read, not from the HL
+  // mirror. The mirror does carry opportunity custom fields, but it LAGS GHL by
+  // up to one sync: opp Ua0Q6GSBpEV9LmAowXX0 was stamped in GHL at 20:12Z and
+  // the mirror only caught up at 20:22Z. A stage decision made from inside that
+  // window is a decision about the wrong job, and this read is already being
+  // issued per candidate before every write — so it costs nothing to be right.
+  return { stageId: o.pipelineStageId, status: o.status, trackedJobId: readOppJobId(o) };
 }
 
 function openLog() {
@@ -1014,7 +1055,13 @@ async function main() {
     const bump = (key, n = 1) => { stats[key] += n; if (atCS) csStats[key] += n; };
     let currentStageId = opp.ghl_stage_id;
     let currentStatus = opp.status;
-    let decision = stageDecision({ currentStageId, jobs, mapping });
+    // The mirror's stamped LP Job ID is a HINT for planning only. It carries
+    // opportunity custom fields but LAGS GHL by up to one sync, so a dry run can
+    // plan from a job id that is minutes out of date. That costs a miss, never a
+    // wrong write: the live re-read below is what authorises anything, and a
+    // missed row is picked up by the next run once the mirror catches up.
+    let trackedJobId = readOppJobId({ customFields: opp.custom_fields });
+    let decision = stageDecision({ currentStageId, jobs, mapping, trackedJobId });
 
     if (decision.verdict === 'skip_no_job') {
       bump('skipped_no_job');
@@ -1069,7 +1116,9 @@ async function main() {
       if (live.status !== 'open') { bump('already_live'); continue; }
       currentStageId = live.stageId;
       currentStatus = live.status;
-      const redecided = stageDecision({ currentStageId, jobs, mapping });
+      // GHL is authoritative for the tracked job at the moment of writing.
+      trackedJobId = live.trackedJobId;
+      const redecided = stageDecision({ currentStageId, jobs, mapping, trackedJobId });
       if (redecided.verdict !== decision.verdict) { bump('already_live'); continue; }
       if (redecided.verdict === 'move' && redecided.targetStageId === currentStageId) {
         bump('already_live'); continue;

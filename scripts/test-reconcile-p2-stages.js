@@ -534,3 +534,93 @@ test('the name path still works unchanged when no id is given', () => {
   assert.equal(r.name, 'Customer Cancelled');
   assert.equal(r.source, 'name');
 });
+
+// ─── the stamped LP Job ID (2026-09-21) ─────────────────────────────────
+//
+// Until the "LP Job ID" opportunity custom field existed, which job an
+// opportunity tracked was inferred from "the contact's newest live job". For the
+// 293 contacts holding more than one job that proxy is wrong, and it is wrong in
+// the direction that hurts: a repeat customer's finished 2024 opportunity stays
+// open forever because a newer job is still in production.
+//
+// stageDecision now accepts the id the opportunity itself carries. It is the
+// authority when it names a job we read, and it is ignored when it does not —
+// a stamp we cannot resolve must be no worse than no stamp at all.
+
+const decideTracked = (currentStageId, jobs, trackedJobId) =>
+  stageDecision({ currentStageId, jobs, mapping: MAPPING, trackedJobId });
+
+test('a stamped 2024 Paid In Full job wins, though a newer job is still live', () => {
+  // Without the stamp this is the "returning customer" case above and stays
+  // open at In Production. With it, the opportunity closes won on its own job.
+  const jobs = [
+    job(80100, 'Paid In Full', ['M', 'R', 'H', 'K', 'G', 'S', 'F', 'C', 'B']),
+    job(93400, 'Awaiting Product', ['M', 'R', 'K']),
+  ];
+  assert.equal(decide(STAGE.CONTRACT_SIGNED, jobs).verdict, 'move', 'unstamped: today’s behaviour');
+
+  const d = decideTracked(STAGE.CONTRACT_SIGNED, jobs, '80100');
+  assert.equal(d.verdict, 'win');
+  assert.equal(d.job.lp_job_id, '80100');
+});
+
+test('a stamped CANCELLED job loses, though the contact still has live work', () => {
+  const jobs = [
+    job(80100, 'Cancelled', ['M']),
+    job(93400, 'Awaiting Product', ['M', 'R', 'K']),
+  ];
+  const d = decideTracked(STAGE.CONTRACT_SIGNED, jobs, '80100');
+  assert.equal(d.verdict, 'lose');
+  assert.equal(d.job.lp_job_id, '80100');
+});
+
+test('a stamped IN-PROGRESS job derives its stage from ITS OWN milestones', () => {
+  // The newer job is further along. Stamping the older one must not borrow the
+  // newer one's milestones — that is the exact bleed this field exists to stop.
+  const jobs = [
+    job(80100, 'Awaiting Product', ['M', 'R']),
+    job(93400, 'Awaiting Product', ['M', 'R', 'H', 'K', 'G']),
+  ];
+  const stamped = decideTracked(STAGE.CONTRACT_SIGNED, jobs, '80100');
+  const unstamped = decide(STAGE.CONTRACT_SIGNED, jobs);
+  assert.equal(stamped.job.lp_job_id, '80100');
+  assert.equal(unstamped.job.lp_job_id, '93400');
+  assert.notEqual(stamped.targetStageId, unstamped.targetStageId,
+    'the two jobs are at different stages, so the stamp must change the answer');
+});
+
+test('a stamped id naming a job we did not read behaves EXACTLY as today', () => {
+  const jobs = [
+    job(80100, 'Paid In Full', ['M', 'R', 'H', 'K', 'G', 'S', 'F', 'C', 'B']),
+    job(93400, 'Awaiting Product', ['M', 'R', 'K']),
+  ];
+  assert.deepEqual(
+    decideTracked(STAGE.CONTRACT_SIGNED, jobs, '99999'),
+    decide(STAGE.CONTRACT_SIGNED, jobs),
+  );
+});
+
+test('a null stamp is the unstamped path, not a third behaviour', () => {
+  const jobs = [job(93400, 'Awaiting Product', ['M', 'R', 'K'])];
+  assert.deepEqual(decideTracked(STAGE.CONTRACT_SIGNED, jobs, null), decide(STAGE.CONTRACT_SIGNED, jobs));
+});
+
+test('a stamped job still obeys the forward-only guard', () => {
+  // The stamp says WHICH job decides. It does not license a backward move.
+  const jobs = [job(80100, 'Awaiting Product', ['M', 'R'])];
+  const d = decideTracked(STAGE.IN_PRODUCTION, jobs, '80100');
+  assert.equal(d.verdict, 'skip_not_forward');
+});
+
+test('a stamped job with no completed milestone is left where it is', () => {
+  const jobs = [
+    job(80100, 'Awaiting Product', []),
+    job(93400, 'Awaiting Product', ['M', 'R', 'K']),
+  ];
+  const d = decideTracked(STAGE.CONTRACT_SIGNED, jobs, '80100');
+  assert.equal(d.verdict, 'skip_already_correct');
+});
+
+test('the stamp cannot conjure a job for a contact who has none', () => {
+  assert.equal(decideTracked(STAGE.CONTRACT_SIGNED, [], '80100').verdict, 'skip_no_job');
+});
