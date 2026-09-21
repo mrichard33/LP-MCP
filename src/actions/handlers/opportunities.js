@@ -17,6 +17,24 @@
  *   isValueWritable() below — and the create path stops producing records with
  *   no source and a first-name-only name.
  *
+ *   v5.0 (2026-08-16): one-open-opportunity-per-pipeline invariant — in-process
+ *   lock keyed contact+pipeline, and opps[0] replaced by pickPrimaryOpp().
+ *   Documented here 2026-09-21; it had only ever been a body comment.
+ *
+ *   v5.3 (2026-08-31): the create path's source carries the LP VENDOR too where
+ *   the contact and LP agree on the channel ("Internet" → "Internet, Modernize").
+ *   Documented here 2026-09-21; it had only ever been an inline comment.
+ *
+ *   v5.4 (2026-09-21): the P2 create path reads the JOB, not just the contact.
+ *   Source is the LP "Source, Subsource" of the lead owning the deciding job, so
+ *   a blank or 'lp-backstop' contact no longer mints a sourceless opportunity (21
+ *   of 1,144 open P2 opps). And a terminal-job guard stops the create path
+ *   minting a NEW open opp for a job already Paid In Full or dead — 115 of the
+ *   157 P2 creates in 30 days. Guard is CREATE-only (an existing open opp still
+ *   moves), P2-only, fails OPEN on no job or an unreadable read, and ships behind
+ *   P2_TERMINAL_CREATE_GUARD_MODE (off | shadow | enforce, default shadow).
+ *   See src/p2-opportunity-context.js.
+ *
  *   v4.4 (2026-06-16): duplicate-opportunity recovery (N1). When the create
  *   path's POST is rejected by GHL with 400 "Can not create duplicate
  *   opportunity for the contact" (meta.existingId), update that existing opp
@@ -50,6 +68,7 @@ import { checkStageMoveEvidence } from '../stage-evidence.js';
 import { emitEvent } from '../../event-emitter.js';
 import { openJobValueForContact } from '../../lp-job-value.js';
 import { opportunitySourceField } from '../../lp-source-attribution.js';
+import { loadP2CreateContext, terminalGuardMode } from '../../p2-opportunity-context.js';
 
 // ─── v5.0 (2026-08-16): one-open-opportunity-per-pipeline invariant ──
 // Standing rule (Mark): a contact must never hold more than one OPEN
@@ -280,7 +299,30 @@ export async function executeMoveOpportunity(action) {
     // differs from LP's ("Canvassing", "Window Estimator") are returned
     // unchanged, so this only ever adds detail and never rewrites a value
     // another path set. See src/lp-source-attribution.js.
-    const sourceField = opportunitySourceField(c);
+    let sourceField = opportunitySourceField(c);
+    // v5.4 (2026-09-21): P2 create reads the JOB, not just the contact.
+    //  - SOURCE: LP "Source, Subsource" of the lead that owns the deciding job.
+    //    The contact-based value above returns nothing for blank/'lp-backstop'
+    //    contacts, which is how 21 open P2 opps ended up with no source.
+    //  - GUARD: never mint a NEW open opp for a job that is already collected or
+    //    dead (115 of 157 creates in 30 days). Create-path only; an existing open
+    //    opp still moves. Fails OPEN on no job / unreadable. Mode flag, default shadow.
+    let terminalGuard = null;
+    if (pipeline === 'P2') {
+      const ctx = await loadP2CreateContext(contactId);
+      if (ctx.source) sourceField = { source: ctx.source };
+      if (ctx.terminal) {
+        const mode = terminalGuardMode();
+        terminalGuard = `${mode}:${ctx.verdict}`;
+        console.warn(`[ActionExecutor] P2 create on terminal job (${mode}): contact=${contactId} job=${ctx.job?.lp_job_id} status="${ctx.job?.job_status}" stage="${stage}" rule=${action.rule_applied || 'manual'}`);
+        if (mode === 'enforce') {
+          return {
+            action: 'skipped_terminal_job', pipeline, target_stage: stage, contact_id: contactId,
+            lp_job_id: ctx.job?.lp_job_id ?? null, job_status: ctx.job?.job_status ?? null, verdict: ctx.verdict,
+          };
+        }
+      }
+    }
     try {
       const newOpp = await ghlFetch('POST', '/opportunities/', {
         pipelineId,
@@ -292,7 +334,7 @@ export async function executeMoveOpportunity(action) {
         ...valueField,
         ...sourceField,
       });
-      return { action: 'created', opportunity_id: newOpp?.opportunity?.id, pipeline, stage, status, monetary_value: jobValue };
+      return { action: 'created', opportunity_id: newOpp?.opportunity?.id, pipeline, stage, status, monetary_value: jobValue, source: sourceField.source || null, terminal_guard: terminalGuard };
     } catch (err) {
       // v4.4 (2026-06-16) — Duplicate-opportunity recovery (N1).
       // GHL permits only one open opportunity per contact and rejects the

@@ -176,20 +176,54 @@ export function latestJobValue(jobs = []) {
  * @param {string} ghlContactId
  * @returns {Promise<number|null>}
  */
-export async function openJobValueForContact(ghlContactId) {
-  if (!ghlContactId) return null;
+/**
+ * Every lp_jobs row that belongs to this contact, plus the contact's lp_leads.
+ *
+ * 2026-09-21: a job is the contact's if lp_jobs.ghl_contact_id says so OR if its
+ * parent lp_lead is linked to the contact. The second path is not optional: 29
+ * jobs sat NULL against a linked parent lead (link_source prospect_propagated),
+ * so the direct read alone returned nothing, P2 opps were created with no value
+ * (5onB9TIyhRrtt65UfPMn, QSGFZuZhc2tHdCgWOGbe) and reconcile-p2-stages called
+ * the same contacts "no LP job". Never throws — returns { error } instead.
+ */
+export async function jobsForContact(ghlContactId) {
+  if (!ghlContactId) return { jobs: [], leads: [], error: null };
   // Imported lazily so the pure half of this module stays loadable without the
   // Supabase driver — that is what lets scripts/test-lp-job-value.js run as a
   // real unit test rather than needing a database.
   const { default: supabase } = await import('./supabase.js');
-  const { data, error } = await supabase.from('lp_jobs')
-    .select('lp_job_id, job_status, job_value')
+  const cols = 'lp_job_id, lp_lead_id, job_status, job_value';
+
+  const { data: leads, error: leadErr } = await supabase.from('lp_leads')
+    .select('lp_lead_id, lead_source, lead_source_detail')
     .eq('ghl_contact_id', ghlContactId);
+  if (leadErr) return { jobs: [], leads: [], error: leadErr.message };
+
+  const { data: direct, error: directErr } = await supabase.from('lp_jobs')
+    .select(cols).eq('ghl_contact_id', ghlContactId);
+  if (directErr) return { jobs: [], leads: leads || [], error: directErr.message };
+
+  let viaLead = [];
+  const leadIds = [...new Set((leads || []).map((l) => String(l.lp_lead_id)).filter(Boolean))];
+  if (leadIds.length) {
+    const { data, error } = await supabase.from('lp_jobs').select(cols).in('lp_lead_id', leadIds);
+    if (error) return { jobs: [], leads: leads || [], error: error.message };
+    viaLead = data || [];
+  }
+
+  const byId = new Map();
+  for (const j of [...(direct || []), ...viaLead]) byId.set(String(j.lp_job_id), j);
+  return { jobs: [...byId.values()], leads: leads || [], error: null };
+}
+
+export async function openJobValueForContact(ghlContactId) {
+  if (!ghlContactId) return null;
+  const { jobs, error } = await jobsForContact(ghlContactId);
   if (error) {
     // Never block a stage move on a value lookup: the move is the action the
     // rule asked for, the value is enrichment. Log and omit.
-    console.warn(`[JobValue] lookup failed for contact ${ghlContactId}: ${error.message}`);
+    console.warn(`[JobValue] lookup failed for contact ${ghlContactId}: ${error}`);
     return null;
   }
-  return latestJobValue(data || []);
+  return latestJobValue(jobs);
 }

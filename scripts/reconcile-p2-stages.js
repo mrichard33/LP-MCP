@@ -220,6 +220,7 @@ import {
 } from '../src/lp-lost-reasons.js';
 import { selectAllIn, assertComplete } from '../src/supabase-page.js';
 import supabase from '../src/supabase.js';
+import { WON_JOB_STATUSES, LOST_JOB_STATUSES } from '../src/lp-job-terminal.js';
 
 // ═══════════════════════════════════════════════════════════════════
 // PURE — the decision surface. Everything below the fold is I/O.
@@ -231,12 +232,9 @@ import supabase from '../src/supabase.js';
  * 'Installed & Unpaid' is NOT here, deliberately: the work is done, the money
  * is not. Its milestones carry it to Install Completed and it stays open.
  */
-export const WON_JOB_STATUSES = new Set([
-  'Paid In Full',
-  'PIF Survey Ready',
-  'PIF NO Survey',
-  'Assumed Complete',
-]);
+// Moved to src/lp-job-terminal.js 2026-09-21 so the live create guard shares it.
+// Re-exported: scripts/test-reconcile-p2-stages.js imports it from here.
+export { WON_JOB_STATUSES };
 
 /**
  * Job statuses that mean the job died.
@@ -263,13 +261,8 @@ export const WON_JOB_STATUSES = new Set([
  * 'Sent To Attorney' stays: 40 jobs across 5 contacts, and a deal in
  * collections is not a deal in progress.
  */
-export const LOST_JOB_STATUSES = new Set([
-  'Cancelled',
-  'Cancelled By Mgt',
-  'Dead Deal',
-  'Sent To Attorney',
-  'Credit Decline',
-]);
+// Moved to src/lp-job-terminal.js 2026-09-21. Re-exported for the test.
+export { LOST_JOB_STATUSES };
 
 const trimmed = (s) => (typeof s === 'string' ? s.trim() : '');
 
@@ -776,7 +769,7 @@ async function fetchJobsWithMilestones(contactIds) {
   const byJobId = new Map();
 
   const jobRows = await selectAllIn(supabase, 'lp_jobs', {
-    columns: 'id, ghl_contact_id, lp_job_id, job_status, job_value',
+    columns: 'id, ghl_contact_id, lp_job_id, lp_lead_id, job_status, job_value',
     orderBy: 'id',
     column: 'ghl_contact_id',
     values: contactIds,
@@ -786,6 +779,43 @@ async function fetchJobsWithMilestones(contactIds) {
     if (!byContact.has(row.ghl_contact_id)) byContact.set(row.ghl_contact_id, []);
     byContact.get(row.ghl_contact_id).push(job);
     byJobId.set(String(row.lp_job_id), job);
+  }
+
+  // 2026-09-21 — the same blind spot src/lp-job-value.js#jobsForContact closes.
+  // 29 lp_jobs rows carry a NULL ghl_contact_id while their parent lp_lead IS
+  // linked (link_source prospect_propagated). The read above finds none of them,
+  // so those contacts were reported "no LP job" here and their P2 opportunities
+  // were created with no value. Attach each such job to the contact that owns its
+  // LEAD — never to the job row's own null — and dedupe on lp_job_id so a job
+  // reachable both ways is counted once.
+  const leadRows = await selectAllIn(supabase, 'lp_leads', {
+    columns: 'id, lp_lead_id, ghl_contact_id',
+    orderBy: 'id',
+    column: 'ghl_contact_id',
+    values: contactIds,
+  });
+  const contactByLeadId = new Map();
+  for (const lead of leadRows) {
+    if (lead.lp_lead_id != null) contactByLeadId.set(String(lead.lp_lead_id), lead.ghl_contact_id);
+  }
+  let viaLeadCount = 0;
+  if (contactByLeadId.size) {
+    const leadLinkedJobs = await selectAllIn(supabase, 'lp_jobs', {
+      columns: 'id, ghl_contact_id, lp_job_id, lp_lead_id, job_status, job_value',
+      orderBy: 'id',
+      column: 'lp_lead_id',
+      values: [...contactByLeadId.keys()],
+    });
+    for (const row of leadLinkedJobs) {
+      if (byJobId.has(String(row.lp_job_id))) continue;
+      const ownerContactId = contactByLeadId.get(String(row.lp_lead_id));
+      if (!ownerContactId) continue;
+      const job = { ...row, milestones: [] };
+      if (!byContact.has(ownerContactId)) byContact.set(ownerContactId, []);
+      byContact.get(ownerContactId).push(job);
+      byJobId.set(String(row.lp_job_id), job);
+      viaLeadCount++;
+    }
   }
 
   // Only COMPLETED milestones matter — lp_job_milestones holds a row per
@@ -801,7 +831,9 @@ async function fetchJobsWithMilestones(contactIds) {
   });
   for (const row of milestoneRows) byJobId.get(String(row.lp_job_id))?.milestones.push(row);
 
-  return { byContact, jobCount: jobRows.length, milestoneCount: milestoneRows.length };
+  return {
+    byContact, jobCount: byJobId.size, milestoneCount: milestoneRows.length, viaLeadCount,
+  };
 }
 
 /**
@@ -942,10 +974,11 @@ async function main() {
   console.log(`[P2Reconcile]   of which at "1. Contract Signed": ${atContractSigned}`);
   if (opt.limit) console.log(`[P2Reconcile]   acting on at most ${opt.limit} of them (--limit)`);
 
-  const { byContact: jobsByContact, jobCount, milestoneCount } =
+  const { byContact: jobsByContact, jobCount, milestoneCount, viaLeadCount } =
     await fetchJobsWithMilestones([...new Set(candidates.map((c) => c.ghl_contact_id))]);
   console.log(`[P2Reconcile] ${jobsByContact.size} of those contacts have at least one lp_jobs row`);
   console.log(`[P2Reconcile] ${jobCount} lp_jobs rows, ${milestoneCount} completed milestones read`);
+  console.log(`[P2Reconcile] ${viaLeadCount} jobs reached only through the lead link`);
 
   const log = openLog();
   console.log(`[P2Reconcile] rollback log → ${log.file}`);
