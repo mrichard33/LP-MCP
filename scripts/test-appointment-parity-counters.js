@@ -28,8 +28,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-const { __testing } = await import('../src/jobs/appointment-parity-watchdog.js');
-const { classifyHealResult, classifyEmit } = __testing;
+const { runAppointmentParityWatchdog, __testing } =
+  await import('../src/jobs/appointment-parity-watchdog.js');
+const { classifyHealResult, classifyEmit, readLpBook } = __testing;
 
 const { shouldAllowEvent } = (await import('../src/services/event-intake-filter.js')).__testing;
 
@@ -136,6 +137,113 @@ test('the allowlist is still default-DROP for everything else', () => {
   assert.equal(shouldAllowEvent({ event_type: 'opportunity.created' }).allow, false);
 });
 
+
+// ═══════════════════════════════════════════════════════════════════
+// 4. CCC is a cancellation — v1.4, 2026-09-21
+// ═══════════════════════════════════════════════════════════════════
+//
+// RESOLVED_DISPOSITIONS omitted CCC (Customer Called to Cancel), so readLpBook
+// filed every CCC row in the ACTIVE book and Class D read it against GHL's
+// cancelled row as "Cancelled in GHL, still set in LP". Both systems agreed;
+// the card was wrong on its face. 33 of the 50 standing
+// appt_parity:gap:cancellation_drift:* keys were contacts at CCC.
+//
+// Worked example — Virginia Vargas, LP lead 577249, appointment 2026-09-21
+// 14:00, disposition CCC, GHL appointment cancelled.
+//
+// Both cases below run the REAL readLpBook over a stubbed supabase, then feed
+// its two books into a real sweep through the deps seam. Injecting pre-split
+// maps would pass whatever the constant said, which is the one thing under test.
+
+/** Minimal stand-in for the supabase query builder readLpBook uses. */
+function stubSupabase(rows) {
+  const chain = {
+    select: () => chain,
+    eq: () => chain,
+    gte: () => chain,
+    lt: () => chain,
+    not: () => chain,
+    then: (resolve) => resolve({ data: rows, error: null }),
+  };
+  return { from: () => chain };
+}
+
+const soon = () => new Date(Date.now() + 5 * 86400000).toISOString();
+
+/** Virginia Vargas as lp_leads actually holds her. */
+const cccRow = () => ({
+  ghl_contact_id: '3uJGXPPwgvieYhcp9BE9',
+  lp_lead_id: '577249',
+  first_name: 'Virginia',
+  last_name: 'Vargas',
+  disposition_code: 'CCC',
+  appointment_set: true,
+  appointment_confirmed: false,
+  appointment_date: soon(),
+  created_at_lp: soon(),
+  updated_at_lp: soon(),
+});
+
+/** A sweep whose books come from the real readLpBook, with everything else stubbed. */
+async function sweepWithCcc({ ghlActive = new Map(), ghlCancelled = new Map() } = {}) {
+  const books = await readLpBook(
+    new Date(),
+    new Date(Date.now() + 45 * 86400000),
+    { supabase: stubSupabase([cccRow()]) },
+  );
+
+  const sent = [];
+  const summary = await runAppointmentParityWatchdog({
+    deps: {
+      readGhlBook: async () => ({ active: ghlActive, cancelled: ghlCancelled }),
+      readLpBook: async () => books,
+      getGHLContact: async () => ({ tags: [] }),
+      syncAppointmentToLP: async () => ({ success: true, action: 'lp_appointment_set' }),
+      emitEvent: async () => ({ id: 1 }),
+      claimAlertConditionSet: async () => ({ ok: true, newlyFiring: [], cleared: [] }),
+      confirmAlertSend: async () => ({ ok: true }),
+      send: async (text) => { sent.push(text); return { sent: true }; },
+    },
+  });
+  return { books, summary, sent };
+}
+
+const ghlAppt = (status) => new Map([['3uJGXPPwgvieYhcp9BE9', {
+  ghl_contact_id: '3uJGXPPwgvieYhcp9BE9',
+  ghl_appointment_id: 'appt-vargas',
+  status,
+  start_time: soon(),
+}]]);
+
+test('CCC + cancelled in GHL: both systems agree, so NOTHING is reported', async () => {
+  const { books, summary, sent } = await sweepWithCcc({ ghlCancelled: ghlAppt('cancelled') });
+
+  assert.equal(books.active.has('3uJGXPPwgvieYhcp9BE9'), false,
+    'a CCC row must not sit in the ACTIVE LP book — that is what manufactured the drift card');
+  assert.equal(books.resolved.has('3uJGXPPwgvieYhcp9BE9'), true,
+    'it belongs in the resolved book, exactly like CXL');
+
+  assert.equal(summary.counts.cancellation_drift, 0,
+    'LP cancelled and GHL cancelled is agreement, not drift — this is the Vargas card');
+  assert.deepEqual(summary.findings, [], 'no finding of any class');
+  assert.deepEqual(sent, [], 'and no ops card: shouldAlertParityGaps sees nothing to escalate');
+});
+
+test('CCC + ACTIVE in GHL: that IS worth a page, as Class E', async () => {
+  // The case the fix must not swallow. LP gave the slot up and GHL is still
+  // holding it, so a rep is driving to a cancelled appointment.
+  const { summary } = await sweepWithCcc({ ghlActive: ghlAppt('new') });
+
+  assert.equal(summary.counts.lp_cancelled_ghl_active, 1);
+  assert.equal(summary.counts.cancellation_drift, 0, 'not the mirror class');
+  assert.equal(summary.counts.lp_missing_appointment, 0,
+    'and never Class A — "healing" it would write the appointment back and un-cancel it');
+
+  const findings = summary.findings.filter((f) => f.class === 'lp_cancelled_ghl_active');
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].lp_disposition, 'CCC');
+  assert.equal(findings[0].action, 'escalate_to_rep');
+});
 
 // ═══════════════════════════════════════════════════════════════════
 // 5. The enumeration ratchet — stop losing actions to unknown_result
