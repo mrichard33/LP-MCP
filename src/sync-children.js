@@ -63,6 +63,7 @@ import { emitEvent } from './event-emitter.js';
 import { combineNotes } from './safe-notes.js';
 import { getLead } from './lp-client.js';
 import { isMilestoneAchieved } from './milestone-gate.js';
+import { staleFireMode, staleFireVerdict } from './milestone-stale-gate.js';
 import { mapJobFields, mapMilestoneChangeFields } from './lp-job-fields.js';
 import { selectFurthestMilestone } from './milestone-order.js';
 import { verifiedStamp, VERIFIED_FROM, FRESHNESS_VOLATILE_COLUMNS } from './services/freshness.js';
@@ -945,7 +946,17 @@ export async function syncJobAndMilestones(job, lpLeadId, ghlContactId, opts = {
     // means "fired OR deliberately suppressed"). #512.
     const isFirstCompletion = !!(actDate && achieved && !existing?.act_date && !existing?.ghl_tag_fired && tag);
     const wouldFire = isFirstCompletion && !!ghlContactId;         // fires only if a contact is linked now
-    const suppressThisFire = isFirstCompletion && suppressSideEffects; // suppress linked OR unlinked
+    // 2026-09-21: same stale-fire gate as the sweeper (src/milestone-stale-gate.js).
+    // In enforce it rides the existing suppress path, so the row is pre-marked and
+    // the sweeper can never fire it later. Counted in suppressedFires/suppressedUnlinked.
+    const staleness = isFirstCompletion
+      ? staleFireVerdict({ actDate: actDateEt, jobStatus: jobRow.job_status })
+      : { stale: false };
+    if (staleness.stale && staleFireMode() !== 'off') {
+      console.warn(`[Sync] STALE FIRE (${staleFireMode()}) ${tag} job=${jobId} lead=${lpLeadId} reason=${staleness.reason} age=${staleness.ageDays ?? 'n/a'}d`);
+    }
+    const staleSuppress = staleness.stale && staleFireMode() === 'enforce';
+    const suppressThisFire = isFirstCompletion && (suppressSideEffects || staleSuppress); // suppress linked OR unlinked
 
     const msRow = {
       lp_job_id: jobId, lp_lead_id: lpLeadId,
