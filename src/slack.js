@@ -23,6 +23,7 @@
  * with no channel of their own map through MARKET_ALIASES first.
  */
 import supabase from './supabase.js';
+import { buildApprovalBlocks } from './slack-approvals-core.js';
 
 const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN || '';
 const MIRROR_ENABLED = String(process.env.SLACK_MIRROR_ENABLED || 'false') === 'true';
@@ -30,6 +31,9 @@ const CH_MAIN = process.env.SLACK_CHANNEL_MAIN || '';
 const CH_CANVASS = process.env.SLACK_CHANNEL_CANVASS || '';
 const CH_SALES = process.env.SLACK_CHANNEL_SALES || '';
 const CH_OPS = process.env.SLACK_CHANNEL_OPS || '';
+// Slack approval buttons (2026-09-21). Off unless the literal 'true'.
+const APPROVALS_ENABLED = String(process.env.SLACK_APPROVALS_ENABLED || 'false') === 'true';
+const CH_APPROVALS = process.env.SLACK_CHANNEL_APPROVALS || '';
 
 // Codes with no Slack channel of their own. Boca and Miami are worked out of
 // the Fort Lauderdale office and post to its channels.
@@ -217,6 +221,9 @@ export async function postToSlack(text, channelId, opts = {}) {
         // A reply, when the caller has a parent ts. Slack ignores the key when
         // it is absent, so the ordinary post path is byte-identical to before.
         ...(opts.threadTs ? { thread_ts: String(opts.threadTs) } : {}),
+        // Interactive cards (approval buttons). `text` stays as the
+        // notification fallback Slack requires alongside blocks.
+        ...(Array.isArray(opts.blocks) && opts.blocks.length ? { blocks: opts.blocks } : {}),
       }),
       signal: AbortSignal.timeout(10000),
     });
@@ -245,6 +252,29 @@ export function salesRollupChannelId() {
 export function opsChannelId() {
   return CH_OPS;
 }
+
+/** True only when the flag is on AND a bot token exists. */
+export function slackApprovalsEnabled() {
+  return APPROVALS_ENABLED && !!SLACK_BOT_TOKEN;
+}
+
+/** Where approval cards go: SLACK_CHANNEL_APPROVALS, else #lead-intelligence. */
+export function approvalsChannelId() {
+  return CH_APPROVALS || CH_MAIN;
+}
+
+/**
+ * Post an approval card with Approve / Reject buttons. Never throws; returns
+ * postToSlack's shape so the caller can fall back to the plain-text mirror.
+ */
+export async function postSlackApprovalCard(text, shortRef) {
+  if (!slackApprovalsEnabled()) return { ok: false, ts: null, channel: null, error: 'disabled', threw: false };
+  const channel = approvalsChannelId();
+  if (!channel) return { ok: false, ts: null, channel: null, error: 'no_channel', threw: false };
+  return postToSlack(text, channel, { blocks: buildApprovalBlocks(text, shortRef) });
+}
+
+console.log(`[Slack] approvals enabled=${APPROVALS_ENABLED} channel=${CH_APPROVALS || CH_MAIN || '-'}`);
 
 /** TESTS ONLY — reset the cache between cases. */
 export function __resetSlackCacheForTests() {
