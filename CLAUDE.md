@@ -39,6 +39,17 @@ Slack-only because GroupMe keeps firing for the same event from inside the GHL w
 mirror, `postToSlack` ignores `SLACK_MIRROR_ENABLED` — a destination of record must not depend on a
 migration switch. Pass `{ threadTs }` to reply under a message instead of posting a new one.
 
+**`POST /webhook/slack/interactions` is the front door for the WHOLE workspace, not just us.** A Slack
+app has exactly one Interactivity Request URL, and n8n's `OPS.SLK-E Approval Buttons` (team
+onboarding, `approve_member` / `deny_member`) owned it first. `src/slack-approvals.js` therefore
+verifies the signature, handles our two `approval_*` buttons, and relays everything else to
+`SLACK_INTERACTIONS_FORWARD_URL` as the exact bytes Slack sent. Three things that look optional and
+are not: forwarding must NOT be gated on `SLACK_APPROVALS_ENABLED` (a flag flip would break someone
+else's production flow), our own buttons must never be forwarded even with the flag off (n8n reads
+any `action_id` that is not `deny_member` as an approval), and the relay copies only the two
+`X-Slack-*` signing headers — never `Authorization`. Unset `SLACK_SIGNING_SECRET` refuses
+everything, forwards included, so set the secret BEFORE repointing Slack.
+
 **A celebration and a stat line are two different jobs — do not let one become the other.** The
 sale-announcement post carried the rep's month-to-date total inside the message for one day, and the
 model turned it into a ledger entry: *"Craig Barela closes another one — $1,500 today, $36,300 on the

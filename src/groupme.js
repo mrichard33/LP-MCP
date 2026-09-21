@@ -13,6 +13,23 @@
  *       "No 1234"           → reject
  *       "Edit 1234 <desc>"  → AI rewrites with the description as guidance
  *
+ * v1.9 — SHARED APPROVAL RESOLVER + SLACK BUTTONS (2026-09-21).
+ *   PROBLEM: src/slack.js was send-only. Approval cards reached Slack as a text
+ *   mirror whose footer read "Reply: Yes 1234", but nothing in this repo
+ *   received anything from Slack. Mark replied "yes" in Slack and nothing
+ *   happened; 10+ actions had been sitting in pending_approval since 09-07.
+ *
+ *   FIX: resolveApproval() below is the ONE approve/reject path, called by the
+ *   GroupMe callback here and by Slack button clicks in src/slack-approvals.js.
+ *   It is CLAIM-FIRST — the request row leaves 'pending' in one conditional
+ *   UPDATE before any action moves — so a GroupMe "Yes" racing a Slack click
+ *   resolves the card exactly once.
+ *
+ *   When SLACK_APPROVALS_ENABLED is on, approval cards post a Slack BUTTON card
+ *   instead of the plain-text mirror (opts.noSlackMirror). GroupMe stays the
+ *   system of record: the button card goes out only after the GroupMe send
+ *   succeeds, and falls back to today's text mirror if Slack refuses.
+ *
  * v1.8 — CONTENT DEDUP BACKSTOP (2026-08-27).
  *   PROBLEM: the v1.7 debounce below only consolidates messages that carry a
  *   contactId and are not flushNow. Everything else — every operator card,
@@ -137,7 +154,7 @@ import { generateResponse } from './response-generator.js';
 // GroupMe → Slack migration (2026-09-09). Every card that POSTs to GroupMe is
 // mirrored to Slack at the send layer, so the two carry byte-identical text
 // with no second copy of any format. Fail-silent; see src/slack.js.
-import { mirrorToSlack } from './slack.js';
+import { mirrorToSlack, postSlackApprovalCard, slackApprovalsEnabled } from './slack.js';
 
 const GROUPME_BOT_ID = process.env.GROUPME_BOT_ID || '';
 const GROUPME_GROUP_ID = process.env.GROUPME_GROUP_ID || '';
@@ -402,7 +419,7 @@ async function _isDuplicateCard(text, channel, opts = {}) {
  *   send failed.
  */
 export async function sendGroupMeMessage(text, opts = {}) {
-  const { contactId, contactName, flushNow, channel, noDedup } = opts || {};
+  const { contactId, contactName, flushNow, channel, noDedup, noSlackMirror } = opts || {};
   const botId = _resolveBotId(channel);
 
   if (!botId) {
@@ -418,7 +435,7 @@ export async function sendGroupMeMessage(text, opts = {}) {
     if (!noDedup && await _isDuplicateCard(text, channel)) {
       return { sent: false, reason: 'duplicate_suppressed' };
     }
-    return await _sendRawGroupMeMessage(text, botId, { channel, market: opts.market });
+    return await _sendRawGroupMeMessage(text, botId, { channel, market: opts.market, skipMirror: !!noSlackMirror });
   }
 
   // Debounced path: queue for consolidation.
@@ -433,8 +450,11 @@ export async function sendGroupMeMessage(text, opts = {}) {
  */
 async function _sendRawGroupMeMessage(text, botId = GROUPME_BOT_ID, mirror = {}) {
   // Fire-and-forget: Slack must never delay or fail a GroupMe send.
-  mirrorToSlack(text, mirror.channel, { market: mirror.market })
-    .catch((err) => console.warn(`[Slack] mirror threw (ignored): ${err.message}`));
+  // v1.9: approval cards set skipMirror when Slack gets a button card instead.
+  if (!mirror.skipMirror) {
+    mirrorToSlack(text, mirror.channel, { market: mirror.market })
+      .catch((err) => console.warn(`[Slack] mirror threw (ignored): ${err.message}`));
+  }
   try {
     const res = await fetch('https://api.groupme.com/v3/bots/post', {
       method: 'POST',
@@ -666,6 +686,21 @@ function approvalFooter(shortRef) {
 }
 
 /**
+ * v1.9: post the Slack button card. If Slack refuses or throws, fall back to
+ * the plain-text mirror so Slack users still SEE the approval. Never throws.
+ */
+async function _postSlackButtonsOrMirror(cardText, fallbackText, shortRef) {
+  try {
+    const r = await postSlackApprovalCard(cardText, shortRef);
+    if (r?.ok) return;
+    console.warn(`[Slack] approval card #${shortRef} failed (${r?.error}) — falling back to text mirror`);
+  } catch (err) {
+    console.warn(`[Slack] approval card #${shortRef} threw (${err.message}) — falling back to text mirror`);
+  }
+  await mirrorToSlack(fallbackText, 'main').catch(() => {});
+}
+
+/**
  * v1.5 — Insert-first dedup. Claim the batch by inserting the tracking
  * record BEFORE sending the GroupMe message.
  * v1.6 — Footer line now advertises Edit X option.
@@ -722,6 +757,9 @@ export async function sendApprovalRequest(batchActions, contactName, contactPhon
     lines.push(`⚠️ AI generation failed: ${enrichment.aiGenerationError.slice(0, 100)}`);
   }
 
+  // v1.9: the Slack button card carries the body WITHOUT the typed-reply footer.
+  const slackCardText = lines.join('\n');
+
   lines.push('');
   lines.push(approvalFooter(shortRef));
 
@@ -754,7 +792,10 @@ export async function sendApprovalRequest(batchActions, contactName, contactPhon
   // approval cards would never collide anyway — but an approval is a
   // time-sensitive operator decision, and it must not depend on that staying
   // true. The v1.5 insert-first claim above is already this path's dedup.
-  const sendResult = await sendGroupMeMessage(msg, { noDedup: true });
+  // v1.9: with Slack approvals on, the text mirror is replaced by a button card,
+  // posted below and only after the GroupMe send (the system of record) succeeds.
+  const useSlackButtons = slackApprovalsEnabled();
+  const sendResult = await sendGroupMeMessage(msg, { noDedup: true, noSlackMirror: useSlackButtons });
   if (!sendResult?.sent) {
     await supabase
       .from('groupme_approval_requests')
@@ -767,6 +808,7 @@ export async function sendApprovalRequest(batchActions, contactName, contactPhon
   }
 
   console.log(`[GroupMe] Approval request sent: #${shortRef} (${first.rule_applied}, ${batchActions.length} actions)`);
+  if (useSlackButtons) await _postSlackButtonsOrMirror(slackCardText, msg, shortRef);
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -862,6 +904,8 @@ async function sendRegeneratedApprovalCard({
   lines.push(`✏️ Edit: "${editInstruction.slice(0, 200)}"`);
   lines.push(`🎯 ${actionSummary}`);
   lines.push(`📱 "${newMessage}"`);
+  // v1.9: Edit X stays GroupMe-only, so the Slack card says where to go for it.
+  const slackCardText = `${lines.join('\n')}\n(To change the message again, use GroupMe: Edit ${shortRef} <change>)`;
   lines.push('');
   lines.push(approvalFooter(shortRef));
 
@@ -891,11 +935,13 @@ async function sendRegeneratedApprovalCard({
 
   // v1.8: noDedup for the same reason as sendApprovalRequest — an operator
   // decision card must never be suppressed by a content match.
-  const sendResult = await sendGroupMeMessage(msg, { noDedup: true });
+  const useSlackButtons = slackApprovalsEnabled();
+  const sendResult = await sendGroupMeMessage(msg, { noDedup: true, noSlackMirror: useSlackButtons });
   if (!sendResult?.sent) {
     await supabase.from('groupme_approval_requests').delete().eq('short_ref', shortRef).catch(() => {});
     throw new Error(`Edit GroupMe send failed: ${sendResult?.reason || 'unknown'}`);
   }
+  if (useSlackButtons) await _postSlackButtonsOrMirror(slackCardText, msg, shortRef);
 
   return true;
 }
@@ -1085,6 +1131,105 @@ async function editApprovalRequest(shortRef, editInstruction, senderName) {
 // INBOUND: Handle GroupMe callback webhook
 // ═══════════════════════════════════════════════════════════════════
 
+/**
+ * v1.9 (2026-09-21) — ONE approval resolver for every channel.
+ *
+ * Extracted from handleGroupMeCallback so GroupMe text replies and Slack
+ * buttons (src/slack-approvals.js) run the exact same approve/reject path.
+ *
+ * CLAIM-FIRST: the request row leaves 'pending' in one conditional UPDATE
+ * before any action is touched, so two people clicking at once (or a GroupMe
+ * "Yes" racing a Slack click) resolve the card exactly once. The loser gets
+ * 'already_resolved'. If the agent_actions write fails, the claim is released
+ * so the card can be retried.
+ *
+ * actionCount is the number of rows that ACTUALLY moved out of
+ * pending_approval. Zero means they were handled elsewhere (dashboard or
+ * approve_action tool), and no execution is triggered.
+ */
+export async function resolveApproval({ shortRef, approve, resolverName, via = 'groupme' } = {}) {
+  const ref = String(shortRef ?? '').trim();
+  const who = String(resolverName ?? '').trim() || 'unknown';
+  const viaLabel = via === 'slack' ? 'Slack' : 'GroupMe';
+  const verbing = approve ? 'approving' : 'rejecting';
+  if (!ref) return { ok: false, outcome: 'not_found', shortRef: ref };
+
+  const nowIso = new Date().toISOString();
+  const { data: request, error: claimErr } = await supabase
+    .from('groupme_approval_requests')
+    .update({ status: approve ? 'approved' : 'rejected', resolved_by: who, resolved_at: nowIso })
+    .eq('short_ref', ref)
+    .eq('status', 'pending')
+    .select('*')
+    .maybeSingle();
+
+  if (claimErr) {
+    console.error(`[Approval] claim failed for #${ref}: ${claimErr.message}`);
+    await sendGroupMeMessage(`❌ Error ${verbing} #${ref}: ${claimErr.message}`);
+    return { ok: false, outcome: 'error', shortRef: ref, error: claimErr.message };
+  }
+
+  if (!request) {
+    const { data: existing } = await supabase
+      .from('groupme_approval_requests')
+      .select('status, resolved_by')
+      .eq('short_ref', ref)
+      .maybeSingle();
+    if (existing) {
+      return { ok: false, outcome: 'already_resolved', shortRef: ref, previousStatus: existing.status, resolvedBy: existing.resolved_by || null };
+    }
+    return { ok: false, outcome: 'not_found', shortRef: ref };
+  }
+
+  const actionIds = request.action_ids || [];
+  const actionUpdate = approve
+    ? { status: 'pending', approved_by: who.toLowerCase(), approved_at: nowIso, updated_at: nowIso }
+    : { status: 'rejected', approved_by: who.toLowerCase(), error_message: `Rejected via ${viaLabel} by ${who}`, updated_at: nowIso };
+
+  const { data: moved, error: actErr } = await supabase
+    .from('agent_actions')
+    .update(actionUpdate)
+    .in('id', actionIds)
+    .eq('status', 'pending_approval')
+    .select('id');
+
+  if (actErr) {
+    console.error(`[Approval] ${verbing} update failed for #${ref}: ${actErr.message}`);
+    const { error: relErr } = await supabase
+      .from('groupme_approval_requests')
+      .update({ status: 'pending', resolved_by: null, resolved_at: null })
+      .eq('id', request.id);
+    if (relErr) console.error(`[Approval] claim release failed for #${ref}: ${relErr.message}`);
+    await sendGroupMeMessage(`❌ Error ${verbing} #${ref}: ${actErr.message}`);
+    return { ok: false, outcome: 'error', shortRef: ref, error: actErr.message };
+  }
+
+  const actionCount = moved?.length || 0;
+
+  // Mark related Edit-X rows so in-context learning prefers confirmed corrections.
+  supabase
+    .from('agent_response_edits')
+    .update({ approval_outcome: approve ? 'approved' : 'rejected', approved_at: nowIso })
+    .in('action_id', actionIds)
+    .is('approval_outcome', null)
+    .then(({ error: updErr }) => {
+      if (updErr) console.warn(`[Approval] Failed to mark edits ${approve ? 'approved' : 'rejected'}: ${updErr.message}`);
+    });
+
+  if (approve) {
+    await sendGroupMeMessage(`✅ Approved #${ref} (${request.rule_applied}) by ${who}. ${actionCount} actions queued for execution.`);
+    console.log(`[Approval] ✅ #${ref} — ${actionCount} actions by ${who} via ${viaLabel}`);
+    if (actionCount > 0) {
+      triggerExecution().catch(err => console.warn(`[Approval] Auto-execute failed after approval: ${err.message}`));
+    }
+  } else {
+    await sendGroupMeMessage(`🚫 Rejected #${ref} (${request.rule_applied}) by ${who}. ${actionCount} actions cancelled.`);
+    console.log(`[Approval] 🚫 #${ref} — ${actionCount} actions by ${who} via ${viaLabel}`);
+  }
+
+  return { ok: true, outcome: approve ? 'approved' : 'rejected', shortRef: ref, actionCount, ruleApplied: request.rule_applied };
+}
+
 async function handleGroupMeCallback(payload) {
   if (payload.sender_type === 'bot') return { handled: false, reason: 'bot_message' };
 
@@ -1123,110 +1268,14 @@ async function handleGroupMeCallback(payload) {
 
   console.log(`[GroupMe] Approval ${isApproved ? 'YES' : 'NO'} for #${shortRef} by ${senderName}`);
 
-  const { data: request } = await supabase
-    .from('groupme_approval_requests')
-    .select('*')
-    .eq('short_ref', shortRef)
-    .eq('status', 'pending')
-    .maybeSingle();
+  const result = await resolveApproval({ shortRef, approve: isApproved, resolverName: senderName, via: 'groupme' });
 
-  if (!request) {
+  if (result.outcome === 'not_found' || result.outcome === 'already_resolved') {
     await sendGroupMeMessage(`❓ No pending approval found for #${shortRef}. It may have already been processed.`);
     return { handled: true, action: 'not_found', shortRef };
   }
-
-  const actionIds = request.action_ids || [];
-
-  if (isApproved) {
-    const { error } = await supabase
-      .from('agent_actions')
-      .update({
-        status: 'pending',
-        approved_by: senderName.toLowerCase(),
-        updated_at: new Date().toISOString(),
-      })
-      .in('id', actionIds)
-      .eq('status', 'pending_approval');
-
-    if (error) {
-      console.error('[GroupMe] Approval update failed:', error.message);
-      await sendGroupMeMessage(`❌ Error approving #${shortRef}: ${error.message}`);
-      return { handled: true, action: 'error', error: error.message };
-    }
-
-    await supabase
-      .from('groupme_approval_requests')
-      .update({ status: 'approved', resolved_by: senderName, resolved_at: new Date().toISOString() })
-      .eq('short_ref', shortRef);
-
-    // v1.6: also retroactively mark any agent_response_edits rows for these
-    // actions as approval_outcome='approved' so the in-context-learning
-    // retrieval can prefer confirmed-good corrections.
-    supabase
-      .from('agent_response_edits')
-      .update({
-        approval_outcome: 'approved',
-        approved_at: new Date().toISOString(),
-      })
-      .in('action_id', actionIds)
-      .is('approval_outcome', null)
-      .then(({ error: updErr }) => {
-        if (updErr) console.warn(`[GroupMe] Failed to mark edits approved: ${updErr.message}`);
-      });
-
-    await sendGroupMeMessage(`✅ Approved #${shortRef} (${request.rule_applied}). ${actionIds.length} actions queued for execution.`);
-
-    console.log(`[GroupMe] ✅ Batch approved: #${shortRef} — ${actionIds.length} actions by ${senderName}`);
-
-    triggerExecution().catch(err => {
-      console.warn(`[GroupMe] Auto-execute failed after approval: ${err.message}`);
-    });
-
-    return { handled: true, action: 'approved', shortRef, actionCount: actionIds.length };
-
-  } else {
-    const { error } = await supabase
-      .from('agent_actions')
-      .update({
-        status: 'rejected',
-        approved_by: senderName.toLowerCase(),
-        error_message: `Rejected via GroupMe by ${senderName}`,
-        updated_at: new Date().toISOString(),
-      })
-      .in('id', actionIds)
-      .eq('status', 'pending_approval');
-
-    if (error) {
-      console.error('[GroupMe] Rejection update failed:', error.message);
-      await sendGroupMeMessage(`❌ Error rejecting #${shortRef}: ${error.message}`);
-      return { handled: true, action: 'error', error: error.message };
-    }
-
-    await supabase
-      .from('groupme_approval_requests')
-      .update({ status: 'rejected', resolved_by: senderName, resolved_at: new Date().toISOString() })
-      .eq('short_ref', shortRef);
-
-    // v1.6: mark related edits as rejected so they don't pollute the
-    // in-context-learning corpus with corrections that were ultimately
-    // judged wrong.
-    supabase
-      .from('agent_response_edits')
-      .update({
-        approval_outcome: 'rejected',
-        approved_at: new Date().toISOString(),
-      })
-      .in('action_id', actionIds)
-      .is('approval_outcome', null)
-      .then(({ error: updErr }) => {
-        if (updErr) console.warn(`[GroupMe] Failed to mark edits rejected: ${updErr.message}`);
-      });
-
-    await sendGroupMeMessage(`🚫 Rejected #${shortRef} (${request.rule_applied}). ${actionIds.length} actions cancelled.`);
-
-    console.log(`[GroupMe] 🚫 Batch rejected: #${shortRef} — ${actionIds.length} actions by ${senderName}`);
-    return { handled: true, action: 'rejected', shortRef, actionCount: actionIds.length };
-  }
+  if (!result.ok) return { handled: true, action: 'error', error: result.error };
+  return { handled: true, action: result.outcome, shortRef, actionCount: result.actionCount };
 }
 
 // ═══════════════════════════════════════════════════════════════════

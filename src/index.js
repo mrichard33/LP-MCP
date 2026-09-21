@@ -115,6 +115,8 @@ import { registerAgenticMvRefreshRoutes } from './agentic-mv-refresh.js';
 import { registerAppointmentNotificationRoutes } from './notifications/appointment-notifications.js';
 // ─── GroupMe Two-Way Integration ─────────────────────────────────
 import { registerGroupMeRoutes } from './groupme.js';
+// ─── Slack approval buttons (Approve / Reject on approval cards) ─
+import { registerSlackApprovalRoutes, slackRawBodyParser } from './slack-approvals.js';
 // ─── LP Appointment Sync (GHL → LP) ────────────────────────────
 import { registerLPAppointmentSyncRoutes } from './lp-appointment-sync.js';
 // ─── LP Addlead Validation Proxy (GHL addlead → hour gate → LP) ──
@@ -330,6 +332,10 @@ const app = express();
 // could apply (and explain) its own OMI_MAX_BODY_BYTES cap. Mounted first, on
 // that path only; every other route keeps the default limit.
 app.use('/memory/omi', omiBodyParser());
+// Slack signs the exact raw bytes. The global urlencoded parser below would
+// consume the stream first, so this path gets express.raw and body-parser's
+// own already-parsed check makes the global parsers skip it.
+app.use('/webhook/slack', slackRawBodyParser());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 // Graceful drain: count in-flight requests so SIGTERM waits for them.
@@ -2220,6 +2226,7 @@ registerFallthroughSweepRoutes(app);
 
 // ─── GroupMe Two-Way Integration ─────────────────────────────────
 registerGroupMeRoutes(app);
+registerSlackApprovalRoutes(app);
 
 // ─── LP Appointment Sync (GHL → LP) ──────────────────────────────
 registerLPAppointmentSyncRoutes(app);
