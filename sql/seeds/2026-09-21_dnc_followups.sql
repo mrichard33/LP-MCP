@@ -60,3 +60,40 @@ COMMIT;
 --   UPDATE agent_rules SET enabled=FALSE, updated_at=NOW() WHERE rule_key='DNC_LIFT_ON_REENTRY_E0';
 --   (BEHAVIORAL_DNC_REPLY v7 regex is in its notes history; restoring it changes nothing functionally.)
 --   then POST /n8n/decision-engine/reload-rules.
+
+-- ════════════════════════════════════════════════════════════════════
+-- ANSWER to item 1's open question — 2026-09-21 (Claude Code)
+--
+-- "Root cause is engine-side and open" is now closed. It was
+-- passesStageGate() in src/decision-engine.js.
+--
+-- Every rule key starting with BEHAVIORAL_ / OBJECTION_ / INTENT_ is held to
+-- a SALES-QUALIFICATION test: the contact must carry one of 14
+-- QUALIFYING_TAGS (appointment or late buyer-journey) or sit at
+-- buyer_stage >= 3. A COMPLIANCE rule inherited a SALES gate purely from how
+-- it was named, and a person texting STOP is almost never a qualified lead —
+-- so the gate blocked the rule exactly when it mattered.
+--
+-- This also explains the two things that made the Sep-5 story not quite fit:
+--   * Identical text matched on one event and not another ("Stop" fired at
+--     17:10 on 8/28 but not at 10:21). The gate reads the CONTACT, not the
+--     message.
+--   * Booked contacts were blocked too — dDEvTYYv56kW031zv0ml and
+--     qM5QYwn5ISZ8DQOgFJpX both had appointments, but carry
+--     window-estimate-booked while QUALIFYING_TAGS lists appt:window-estimate.
+--
+-- And it is NOT a Sep-5 regression. Opt-out replies where the rule did not
+-- fire, by month: May 23/27 · Jun 32/43 · Jul 20/31 · Aug 40/50 · Sep 84/86 —
+-- ~199 missed since 2026-05-15, when the condition gate was added. The last
+-- organic fire was 2026-09-05 because QzEyHIThzCQDUNETOBto happened to carry
+-- bj:stage-3-comparing, not because anything changed that day.
+--
+-- Fixed in code via STAGE_GATE_EXEMPT_RULE_KEYS (five named suppression
+-- rules skip the gate; sales rules still get it). INTENT_DNC_HARD_REQUEST and
+-- INTENT_SPIKE_GUARD_DNC were silently gated the same way and are exempt too.
+-- The v8 regex above stays as it is — harmless, and re-litigating it is how
+-- the next session loses another day.
+--
+-- See sql/seeds/2026-09-21_behavioral_dnc_reply_five9.sql for the companion
+-- rule change that finally pushes a STOP to Five9.
+-- ════════════════════════════════════════════════════════════════════
