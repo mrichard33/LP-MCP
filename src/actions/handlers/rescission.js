@@ -43,6 +43,7 @@
 import supabase from '../../supabase.js';
 import { applyGHLTag, updateGHLContactFields, getGHLContact } from '../../ghl.js';
 import { computeRescissionDeadline, detectSigningDate } from '../../rescission-window.js';
+import { resolveMarket } from '../enrichment.js';
 
 // GHL custom field IDs — provisioned by Mark in GHL UI per Phase 2 checklist.
 // If env vars not set, handler still tags the contact (custom field write is
@@ -61,7 +62,6 @@ const GHL_LOCATION_ID = process.env.GHL_LOCATION_ID || 'SsBG7j5KQAIP1SFP2Sca';
 const CF_ESTIMATE_VALUE = 'PqUYMgBojosjSGMBEUqX';
 const CF_WINDOW_COUNT_PRIMARY = 'h9FJTUbmUHIuD6JKmpXv';
 const CF_WINDOW_COUNT_ALT = 'YWhoVixgPtvEDzSXcMpJ';
-const CF_MARKET = 'z0MV6mXi0w9WwdCOFThh';
 const CF_ASSIGNED_REP = 'lPCvCXOQEQFXtuHekAq8';
 
 async function fetchSourceEvent(eventId) {
@@ -177,7 +177,14 @@ export async function executeComputeRescissionDispatch(action /*, context */) {
   }
   const estimateValue = getCFValue(contact, CF_ESTIMATE_VALUE);
   const windowCount = getCFValue(contact, CF_WINDOW_COUNT_PRIMARY) || getCFValue(contact, CF_WINDOW_COUNT_ALT);
-  const market = getCFValue(contact, CF_MARKET);
+  // 2026-09-21: resolved, not read raw off z0MV6mXi0w9WwdCOFThh. That field is
+  // not reliably a single code — until the writer was fixed it held every
+  // branch a prospect had ever been worked by, joined ("LAKE, FTMYR"), and
+  // ~136 contacts still carry that until each is re-enriched. Printing it
+  // verbatim put a string that is not a market on an operator card.
+  // resolveMarket validates it, falls back to the zip, and returns the display
+  // NAME the card wanted anyway.
+  const market = await resolveMarket({ ghlContact: contact });
   const repName = getCFValue(contact, CF_ASSIGNED_REP);
 
   const batchId = `rescission_${event?.id || action.id}_${Date.now()}`;

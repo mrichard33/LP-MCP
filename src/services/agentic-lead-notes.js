@@ -179,6 +179,27 @@ function clamp(text, maxChars) {
 }
 
 /**
+ * A market code is ONE token (2026-09-21).
+ *
+ * z0MV6mXi0w9WwdCOFThh is not reliably single-valued: until the writer was
+ * fixed, /n8n/enrich-lead wrote every branch a prospect had ever been worked
+ * by, comma-joined, and ~136 contacts still hold values like "LAKE, FTMYR"
+ * until each is re-enriched. A rep reading "WANTS: 7 windows — LAKE, FTMYR /
+ * Lee" is being told something that is not true of any one market, so a value
+ * that is not a single token is dropped rather than printed.
+ *
+ * Shape only, on purpose. This module has NO imports by design — the brief is
+ * a pure function of the contact so it unit-tests without GHL or supabase —
+ * and the semantic check (actions/enrichment.js normalizeMarketCode) needs the
+ * service_markets map. Shape alone is enough to catch every joined value.
+ */
+function marketCodeOrNull(raw) {
+  if (raw === undefined || raw === null) return null;
+  const code = String(raw).trim().toUpperCase();
+  return /^[A-Z0-9]{2,12}$/.test(code) ? code : null;
+}
+
+/**
  * The labelled body of the brief, minus the transcript. Shared by the full
  * build and the augment path so the two can never drift apart.
  * Returns [{ label, body }] with empty sections already dropped.
@@ -195,7 +216,7 @@ function buildSections(contact, opts = {}) {
 
   push('SUMMARY', g(F.AI_SUMMARY) || g(F.AI_SUMMARY_ALT));
 
-  const market = g(F.MARKET_CODE);
+  const market = marketCodeOrNull(g(F.MARKET_CODE));
   const county = g(F.COUNTY);
   const windows = g(F.WINDOW_COUNT);
   push('WANTS', [
@@ -332,4 +353,5 @@ export async function fetchAndBuildAgenticNotes(contactId, opts = {}, deps = {})
 
 export const _internal = {
   F, EXCLUDED_FIELDS, MAX_NOTES_CHARS, WEAK_NOTES_CHARS, SEP, HEADER_LABEL, buildSections,
+  marketCodeOrNull,
 };

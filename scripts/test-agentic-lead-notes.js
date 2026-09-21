@@ -324,3 +324,39 @@ test('fetchAndBuildAgenticNotes builds, and augments when asked', async () => {
   assert.ok(augmented.includes('OPENER: Hi Cynthia'));
   assert.ok(augmented.includes('CONVERSATION:'));
 });
+
+// ─── the market code on the WANTS line (2026-09-21) ──────────────
+//
+// z0MV6mXi0w9WwdCOFThh is not reliably single-valued: /n8n/enrich-lead used to
+// write every branch a prospect had ever been worked by, comma-joined, and
+// ~136 contacts still hold values like "LAKE, FTMYR". Telling a rep the lead
+// is in two markets at once is worse than telling them nothing.
+
+test('REGRESSION: a joined market value is dropped from the brief, not printed', () => {
+  const out = buildAgenticLeadNotes(contactFixture({ [F.MARKET_CODE]: 'LAKE, FTMYR' }), {});
+  assert.ok(!out.includes('LAKE, FTMYR'), 'a two-market string must never reach a rep');
+  assert.ok(!out.includes('LAKE'), 'and not half of it either');
+});
+
+test('a single valid code still renders on the WANTS line', () => {
+  const out = buildAgenticLeadNotes(contactFixture({ [F.MARKET_CODE]: 'FTMYR' }), {});
+  assert.ok(out.includes('FTMYR'));
+});
+
+test('dropping the market leaves the rest of WANTS intact', () => {
+  // The line is a join of product, window count and market — losing one part
+  // must not take the others with it.
+  const out = buildAgenticLeadNotes(contactFixture({ [F.MARKET_CODE]: 'LAKE, FTMYR' }), {});
+  assert.ok(out.includes('7 windows'));
+  assert.ok(out.includes('Impact Windows'));
+});
+
+test('marketCodeOrNull: one token in, anything else out', () => {
+  const { marketCodeOrNull } = _internal;
+  assert.equal(marketCodeOrNull('FTMYR'), 'FTMYR');
+  assert.equal(marketCodeOrNull('ftmyr'), 'FTMYR');
+  assert.equal(marketCodeOrNull('ORL  '), 'ORL', 'LP pads branch codes with spaces');
+  for (const v of ['LAKE, FTMYR', 'LAKE,FTMYR', 'FT MYR', 'LAKE;FTMYR', '', '   ', null, undefined]) {
+    assert.equal(marketCodeOrNull(v), null, `expected null for ${JSON.stringify(v)}`);
+  }
+});
