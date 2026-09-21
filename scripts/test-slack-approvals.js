@@ -23,7 +23,7 @@ import {
   parseInteraction,
   verifySlackSignature,
 } from '../src/slack-approvals-core.js';
-import { handleInteraction } from '../src/slack-approvals.js';
+import { forwardInteraction, handleInteraction } from '../src/slack-approvals.js';
 
 const SECRET = 'test_signing_secret';
 
@@ -288,4 +288,81 @@ test('an error keeps the buttons: ephemeral note, original untouched', async () 
   assert.equal(s.replies[0].body.response_type, 'ephemeral');
   assert.equal(s.replies[0].body.replace_original, false, 'a failed click must leave the card clickable');
   assert.match(s.replies[0].body.text, /connection reset/);
+});
+
+// ─── fan-out to the prior owner of the Interactivity URL ─────────
+//
+// A Slack app has one Interactivity URL. n8n's "OPS.SLK-E Approval Buttons"
+// (team onboarding) owned it first, so anything that is not one of our two
+// buttons has to reach it untouched.
+
+/** The real shape OPS.SLK-E sends: JSON in `value`, its own action_ids. */
+function teamMemberClick(actionId = 'approve_member') {
+  return formBody({
+    type: 'block_actions',
+    user: { id: 'U_BOSS', name: 'boss' },
+    response_url: 'https://hooks.slack.com/actions/T1/B9/Z9',
+    channel: { id: 'C_OPS' },
+    message: { text: 'APPROVAL NEEDED · Jane Doe', ts: '1758400000.001' },
+    actions: [{ action_id: actionId, value: JSON.stringify({ member_id: 42, label: 'Jane Doe' }) }],
+  });
+}
+
+test('an onboarding click is not ours — it parses to null so it gets forwarded', () => {
+  // Both buttons, because n8n treats any action_id that is not deny_member as
+  // an approval. Either one reaching handleInteraction would be a bug.
+  assert.equal(parseInteraction(teamMemberClick('approve_member')), null);
+  assert.equal(parseInteraction(teamMemberClick('deny_member')), null);
+});
+
+test('the forward relays the exact bytes and the signing headers, nothing else', async () => {
+  const raw = Buffer.from(teamMemberClick());
+  const calls = [];
+  const fetchImpl = async (url, opts) => { calls.push({ url, opts }); return { ok: true, status: 200 }; };
+
+  const r = await forwardInteraction(raw, {
+    'x-slack-request-timestamp': '1758400000',
+    'x-slack-signature': 'v0=deadbeef',
+    authorization: 'Bearer super-secret',
+    cookie: 'session=abc',
+  }, { url: 'https://n8n.example.com/webhook/slack-approval', fetchImpl });
+
+  assert.deepEqual(r, { forwarded: true });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, 'https://n8n.example.com/webhook/slack-approval');
+  assert.equal(calls[0].opts.method, 'POST');
+  // Byte-identical: a re-serialized body would invalidate the signature.
+  assert.equal(calls[0].opts.body, raw);
+  assert.equal(calls[0].opts.headers['X-Slack-Request-Timestamp'], '1758400000');
+  assert.equal(calls[0].opts.headers['X-Slack-Signature'], 'v0=deadbeef');
+  // Our own credentials must never ride along to a third party.
+  const sent = Object.keys(calls[0].opts.headers).map((k) => k.toLowerCase());
+  assert.ok(!sent.includes('authorization'), `leaked headers: ${sent.join(',')}`);
+  assert.ok(!sent.includes('cookie'), `leaked headers: ${sent.join(',')}`);
+});
+
+test('no forward URL configured is a no-op, not an error', async () => {
+  let called = false;
+  const r = await forwardInteraction(Buffer.from('x'), {}, { url: '', fetchImpl: async () => { called = true; } });
+  assert.deepEqual(r, { forwarded: false, reason: 'no_url' });
+  assert.equal(called, false);
+});
+
+test('a refusing or unreachable destination never throws and never retries', async () => {
+  let attempts = 0;
+
+  const refused = await forwardInteraction(Buffer.from('x'), {}, {
+    url: 'https://n8n.example.com/hook',
+    fetchImpl: async () => { attempts++; return { ok: false, status: 500 }; },
+  });
+  assert.deepEqual(refused, { forwarded: false, reason: 'http_500' });
+  assert.equal(attempts, 1, 'a retry would risk two card replacements for one click');
+
+  const threw = await forwardInteraction(Buffer.from('x'), {}, {
+    url: 'https://n8n.example.com/hook',
+    fetchImpl: async () => { attempts++; throw new Error('ECONNRESET'); },
+  });
+  assert.equal(threw.forwarded, false);
+  assert.match(threw.reason, /ECONNRESET/);
+  assert.equal(attempts, 2);
 });
