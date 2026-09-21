@@ -31,9 +31,26 @@ const jobIdOf = (job) => {
 /** GHL Opportunity custom field "LP Job ID" (opportunity.lp_job_id), created 2026-09-21. */
 export const OPP_CF_LP_JOB_ID = 'sMZfcWAdoqh88pghLsNQ';
 
-/** Pure. The LP job id stamped on an opportunity as GHL returns it, or null. */
+/**
+ * Pure. The LP job id stamped on an opportunity, or null.
+ *
+ * Reads two shapes, because two sources feed this. The GHL API returns an
+ * ARRAY of custom fields (or omits the key). The HL mirror's
+ * opportunities.custom_fields column defaults to '{}'::jsonb — an OBJECT — on
+ * every row the opportunity sync has not written custom fields for: 2,710 rows
+ * location-wide, 253 of them in P2, measured 2026-09-21.
+ *
+ * `x || []` does NOT catch that second case. {} is truthy, so the fallback
+ * never fires and .find throws
+ *   ((intermediate value) || []).find is not a function
+ * which killed scripts/backfill-p2-opportunity-job-id.js on its first
+ * object-shaped row — before a single opportunity was scanned. Array.isArray is
+ * the guard. An empty object means "no custom fields recorded", which is no job
+ * id, so it reads as null rather than as an error.
+ */
 export function readOppJobId(opp) {
-  const cf = (opp?.customFields || []).find((f) => f?.id === OPP_CF_LP_JOB_ID);
+  const list = Array.isArray(opp?.customFields) ? opp.customFields : [];
+  const cf = list.find((f) => f?.id === OPP_CF_LP_JOB_ID);
   const v = cf?.fieldValueString ?? cf?.fieldValue ?? cf?.field_value ?? cf?.value ?? null;
   const s = v == null ? '' : String(v).trim();
   return s === '' ? null : s;
