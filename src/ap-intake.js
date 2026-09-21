@@ -1,64 +1,69 @@
 /**
  * ActiveProspect intake hop — src/ap-intake.js
  *
- * POST /intake/ap-lead
- *
- * ActiveProspect posts the lead here instead of straight to Lead Perfection.
- * We resolve the GHL contact, stamp its id into `lognumber` / `User1`, forward
- * to LP, and return LP's own response bytes so AP's existing success/failure
- * handling keeps working unchanged.
- *
- * ─── WHY WE FORWARD TO LP, RATHER THAN HANDING THE ID BACK ──────────────────
- * The first design had AP call us for an id and then post to LP itself. That
- * is worse, and the reason is latency, which is the constraint that decides
- * this whole design:
- *
- *   today          AP waits for the LP post.                      1 round trip
- *   two-hop        AP waits for us, THEN for the LP post.         2 round trips
- *   this (one-hop) AP waits for us; we do the LP post inline.     1 round trip
- *
- * AP is ALREADY waiting on Lead Perfection today, so folding the contact
- * resolve in front of that same call adds only the resolve — capped below —
- * instead of adding a whole extra round trip. It also makes ordering a fact
- * rather than a configuration: LP cannot see the lead before the contact
- * exists, because the same function does both in order.
+ * POST /intake/ap-resolve   resolve only  ← the one ActiveProspect should use
+ * POST /intake/ap-lead      resolve + deliver to LP  (fallback)
  *
  * LP accepts `lognumber` / `User1` ONLY on AddLead and never again
- * (src/ghl-note-pipeline/resolve-or-create.js:15-17), so this ordering is the
- * only way the id ever reaches LP.
+ * (src/ghl-note-pipeline/resolve-or-create.js:15-17). So the GHL contact id has
+ * to be on the lead the FIRST time LP sees it, or the link has to be rebuilt
+ * afterwards by the matcher — which is the backlog Phase A spent a session
+ * repairing. Both routes exist to put the id there at AddLead time.
  *
- * ─── WHAT THIS COSTS, STATED PLAINLY ────────────────────────────────────────
- * We become the delivery path. If this service is down, AP's delivery fails
- * and retries; leads are delayed rather than lost, and AP should carry a
- * fallback delivery straight to LP for a total outage. That is the trade for
- * the ordering guarantee, and it is the same trade lp-addlead-proxy.js already
- * makes for the chatbot path.
+ * ─── WHY THERE ARE TWO, AND WHY /ap-resolve WON (2026-09-21, Mark's ruling) ─
+ * /ap-lead was built first and replaces LeadConduit step 12 outright: resolve,
+ * post to LP inline, mirror LP's bytes back. One round trip, and ordering is a
+ * fact rather than a configuration.
+ *
+ * Then we actually looked at step 12. It carries 22 proven field mappings,
+ * Automated retry, and a dedicated downstream failure filter at step 14.
+ * Replacing it means re-creating all of that AND making this service the
+ * delivery artery for every purchased lead: if we are down, every AP delivery
+ * fails and retries.
+ *
+ * /ap-resolve is the additive shape instead. It answers with the contact id and
+ * nothing else; LeadConduit appends the response to the lead, and step 12 maps
+ * it into lognumber/User1 with everything else about step 12 untouched. The
+ * cost is one extra HTTP round trip (~0.2-0.5s) — NOT an extra wait on LP,
+ * because AP waits on LP in both shapes. The benefit is that a bad deploy or a
+ * GHL outage here cannot cost a lead: step 12 still posts to LP exactly as it
+ * does today.
+ *
+ * /ap-lead stays as the fallback for the case where LeadConduit turns out not
+ * to let step 12 map an appended response field.
  *
  * ─── THE LATENCY BUDGET IS THE ACCEPTANCE TEST ──────────────────────────────
- * Measured on n8n workflow YOozjkCkeNEe4s3a (I.AP), the pipe this replaces:
- * zero errors, typical 1.1-2.1s, several 5-6s, worst 20.7s. n8n never failed —
- * ActiveProspect gave up while it was still working. The long tail was tag
- * resolution, LP Subsource/Source writes and the ensure-routing-tags call.
+ * Measured on n8n workflow YOozjkCkeNEe4s3a (I.AP), which AP already delivers
+ * to: zero errors, typical 1.1-2.1s, several 5-6s, worst 20.7s. n8n never
+ * failed — ActiveProspect gave up while it was still working. The long tail was
+ * tag resolution, LP Subsource/Source writes and the ensure-routing-tags call.
  *
  * NONE of that is needed to answer ActiveProspect, so none of it is on this
- * path. The response does exactly two things: resolve a contact, forward to
- * LP. Enrichment happens afterwards, driven by the event the sync already
- * emits when the lead comes back.
+ * path. /ap-resolve does exactly one thing, and /ap-lead exactly two. I.AP is
+ * NOT replaced and must stay: it does the enrichment, and its own phone search
+ * means it finds the contact we created rather than creating a second one.
  *
  * The resolve is capped by AP_INTAKE_RESOLVE_TIMEOUT_MS and FAILS OPEN: on a
- * timeout, an error, or an unconfirmable match, we forward to LP with no id
- * rather than hanging. The lead reaches the floor either way and the matcher
- * links it afterwards exactly as it does today. A slow GHL must never cost a
- * lead.
+ * timeout, an error, or an unconfirmable match, we answer with no id rather
+ * than hanging. The lead reaches the floor either way and the matcher links it
+ * afterwards exactly as it does today. A slow GHL must never cost a lead.
+ *
+ * /ap-resolve expresses that same contract as ALWAYS HTTP 200. A non-200 marks
+ * the step failed in LeadConduit and can trip flow error handling; a 200 with an
+ * empty contact_id just means "no id, carry on".
+ *
+ * There is no configurable delivery timeout in LeadConduit's step UI and none
+ * is published, so logClientDisconnect() below is the only way we learn what
+ * AP's real ceiling is: the socket closing before we answered.
  *
  * ─── MODES (AP_INTAKE_MODE) ─────────────────────────────────────────────────
  *   off     pure passthrough — forward to LP untouched.
- *   shadow  DEFAULT. Search, never create, never stamp. Forwards to LP exactly
- *           as `off` does, and logs what it WOULD have stamped plus the real
- *           timings. This is what makes re-pointing AP at us a safe step on
- *           its own: in shadow the endpoint is a transparent proxy, so the
- *           risky move (changing AP) and the behaviour change (stamping ids)
- *           happen on different days.
+ *   shadow  DEFAULT. Search, never create, never return an id. Logs what it
+ *           WOULD have stamped plus the real timings. This is what makes
+ *           re-pointing AP at us a safe step on its own: in shadow neither
+ *           endpoint changes anything a lead can see, so the risky move
+ *           (changing AP) and the behaviour change (stamping ids) happen on
+ *           different days.
  *   live    resolve-or-create and stamp.
  */
 
@@ -108,71 +113,151 @@ export function pick(body, ...keys) {
  */
 export function contactInputFromApBody(body, { vendor = '' } = {}) {
   return {
-    phone: pick(body, 'phone', 'phone1', 'Phone1', 'phone_1', 'primary_phone'),
-    firstName: pick(body, 'firstname', 'first_name', 'FirstName'),
-    lastName: pick(body, 'lastname', 'last_name', 'LastName'),
-    email: pick(body, 'email', 'Email'),
-    address: pick(body, 'address1', 'Address1', 'address'),
+    phone: pick(body, 'phone', 'phone1', 'Phone1', 'phone_1', 'primary_phone',
+      'Phone', 'mobile', 'cell', 'phone_number'),
+    firstName: pick(body, 'firstname', 'first_name', 'FirstName', 'firstName'),
+    lastName: pick(body, 'lastname', 'last_name', 'LastName', 'lastName'),
+    email: pick(body, 'email', 'Email', 'email_address'),
+    address: pick(body, 'address1', 'Address1', 'address', 'address_1', 'Address', 'street'),
     city: pick(body, 'city', 'City'),
     state: pick(body, 'state', 'State'),
-    postalCode: pick(body, 'zip', 'Zip', 'postal_code', 'postalCode'),
+    postalCode: pick(body, 'zip', 'Zip', 'postal_code', 'postalCode', 'zipcode'),
     // The real origin, not the pipe that carried it — the same choice
     // lp-contact-backstop.js makes for its `source` field.
     source: vendor || pick(body, 'sourcesubdescr', 'source', 'Source') || 'activeprospect',
   };
 }
 
+/** Same widening, for the one value read outside contactInputFromApBody. */
+export function vendorFromApBody(body) {
+  return pick(body, 'sourcesubdescr', 'vendor', 'lp_subsource', 'source',
+    'source_name', 'lead_source', 'Source');
+}
+
+/**
+ * Resolve the GHL contact for an AP payload. Shared by both routes so there is
+ * exactly one copy of the mode gate, the tag set and the timeout ceiling.
+ *
+ * Never throws: every failure is reported as an `outcome` and an empty id,
+ * because both callers must forward the lead regardless (fail-open contract,
+ * see the header note).
+ *
+ * `contactId` is populated ONLY in live mode. `wouldStamp` carries what shadow
+ * found, so shadow can measure the real hit rate while writing nothing and
+ * returning nothing a caller could act on.
+ */
+export async function resolveApContact(body, { mode = intakeMode(), deps, log } = {}) {
+  if (mode === 'off') return { contactId: null, wouldStamp: null, outcome: 'skipped', resolveMs: 0 };
+
+  const vendor = vendorFromApBody(body);
+  const t0 = Date.now();
+  try {
+    const input = contactInputFromApBody(body, { vendor });
+    const tags = [AP_INTAKE_TAG, 'lp-linked', 'stage:new-lead',
+      ...backstopTagsFor('Internet', vendor || null, { suppressOutbound: false })];
+    const result = await raceWithNullTimeout(
+      resolveOrCreateContact({ ...input, tags },
+        { create: mode === 'live', ...(deps ? { deps } : {}), ...(log ? { log } : {}) }),
+      RESOLVE_TIMEOUT_MS,
+    );
+    const resolveMs = Date.now() - t0;
+    // The ceiling won. Answer without an id rather than hang.
+    if (result === null) return { contactId: null, wouldStamp: null, outcome: 'timeout', resolveMs };
+    return {
+      contactId: mode === 'live' ? (result.contactId || null) : null,
+      wouldStamp: result.contactId || null,
+      outcome: result.outcome,
+      resolveMs,
+    };
+  } catch (err) {
+    const resolveMs = Date.now() - t0;
+    // Fail open by contract: a GHL problem must not stop a lead reaching the
+    // sales floor.
+    console.warn(`[AP-INTAKE] resolve failed (${resolveMs}ms), continuing without id: ${err.message}`);
+    return { contactId: null, wouldStamp: null, outcome: 'error', resolveMs };
+  }
+}
+
+/**
+ * Log the moment ActiveProspect gives up on us.
+ *
+ * LeadConduit exposes NO delivery timeout setting in its step UI and publishes
+ * none, so the only way to learn the real ceiling is to notice the socket
+ * closing before we answered. Without this line a lead AP abandoned is
+ * indistinguishable from one it never sent.
+ */
+function logClientDisconnect(req, res, started, label) {
+  req.on('close', () => {
+    if (res.writableEnded) return;
+    console.warn(`[${label}] client disconnected after ${Date.now() - started}ms — `
+      + 'ActiveProspect gave up before we answered');
+  });
+}
+
 export function registerApIntakeRoutes(app) {
-  app.post('/intake/ap-lead', async (req, res) => {
+  // ── Resolve only. The step that sits BEFORE the Lead Perfection Form POST.
+  //
+  // WHY THIS EXISTS ALONGSIDE /intake/ap-lead (2026-09-21, Mark's ruling).
+  // /intake/ap-lead replaces LeadConduit step 12 outright and posts to LP
+  // itself. Step 12 carries 22 proven field mappings, Automated retry and a
+  // dedicated downstream failure filter (step 14); replacing it makes this
+  // service the delivery artery for every purchased lead. This route is the
+  // additive shape instead: we return the contact id, LeadConduit appends it
+  // to the lead, and step 12 maps it into lognumber/User1 unchanged. If we are
+  // slow or down, step 12 still posts to LP exactly as it does today, so
+  // neither a bad deploy nor a GHL outage can cost a lead.
+  //
+  // ALWAYS HTTP 200, including on timeout and error. A non-200 marks the step
+  // failed in LeadConduit and can trip flow error handling; a 200 carrying an
+  // empty contact_id means "no id, carry on", which is the fail-open contract
+  // expressed in the only vocabulary the flow understands.
+  app.post('/intake/ap-resolve', async (req, res) => {
     const started = Date.now();
+    logClientDisconnect(req, res, started, 'AP-RESOLVE');
     const mode = intakeMode();
     const body = flattenWebhookBody(req.body || {});
-    const vendor = pick(body, 'sourcesubdescr', 'vendor', 'source');
+    const vendor = vendorFromApBody(body);
 
-    let contactId = null;
-    let outcome = 'skipped';
-    let resolveMs = 0;
+    const r = await resolveApContact(body, { mode });
 
-    if (mode !== 'off') {
-      const t0 = Date.now();
-      try {
-        const input = contactInputFromApBody(body, { vendor });
-        // Shadow searches but never creates, so it can measure the real hit
-        // rate and the real latency while writing nothing.
-        const tags = [AP_INTAKE_TAG, 'lp-linked', 'stage:new-lead',
-          ...backstopTagsFor('Internet', vendor || null, { suppressOutbound: false })];
-        const result = await raceWithNullTimeout(
-          resolveOrCreateContact({ ...input, tags }, { create: mode === 'live' }),
-          RESOLVE_TIMEOUT_MS,
-        );
-        resolveMs = Date.now() - t0;
-        if (result === null) {
-          // The ceiling won. Forward without an id rather than hang.
-          outcome = 'timeout';
-        } else {
-          outcome = result.outcome;
-          if (mode === 'live') contactId = result.contactId;
-        }
-      } catch (err) {
-        resolveMs = Date.now() - t0;
-        outcome = 'error';
-        // Fail open by contract: a GHL problem must not stop a lead reaching
-        // the sales floor.
-        console.warn(`[AP-INTAKE] resolve failed (${resolveMs}ms), forwarding without id: ${err.message}`);
-      }
-    }
+    console.log(
+      `[AP-RESOLVE] vendor=${vendor || '?'} mode=${mode} resolve=${r.outcome}/${r.resolveMs}ms `
+      + `${r.contactId ? `returned=${r.contactId}` : `returned=no${r.wouldStamp ? ` would=${r.wouldStamp}` : ''}`} `
+      + `total=${Date.now() - started}ms`
+    );
+
+    res.status(200).json({
+      contact_id: r.contactId || '',
+      outcome: r.outcome,
+      ms: r.resolveMs,
+      // Shadow's whole product: what we WOULD have handed back, with nothing
+      // written and nothing the flow can map yet.
+      ...(mode === 'shadow' ? { would_stamp: r.wouldStamp || '' } : {}),
+    });
+  });
+
+  // ── Resolve AND deliver. Replaces step 12. Kept as the fallback for the case
+  // where LeadConduit cannot map an appended response field onto step 12.
+  app.post('/intake/ap-lead', async (req, res) => {
+    const started = Date.now();
+    logClientDisconnect(req, res, started, 'AP-INTAKE');
+    const mode = intakeMode();
+    const body = flattenWebhookBody(req.body || {});
+    const vendor = vendorFromApBody(body);
+
+    const r = await resolveApContact(body, { mode });
 
     // Stamp only when we actually have an id. LP takes these at AddLead and
     // never again, so a blank would waste the one chance rather than defer it.
-    const outbound = contactId
-      ? { ...body, lognumber: contactId, User1: contactId }
+    const outbound = r.contactId
+      ? { ...body, lognumber: r.contactId, User1: r.contactId }
       : body;
 
     try {
       const lp = await forwardToLp(outbound);
       console.log(
-        `[AP-INTAKE] vendor=${vendor || '?'} mode=${mode} resolve=${outcome}/${resolveMs}ms `
-        + `${contactId ? `stamped=${contactId} ` : 'stamped=no '}`
+        `[AP-INTAKE] vendor=${vendor || '?'} mode=${mode} resolve=${r.outcome}/${r.resolveMs}ms `
+        + `${r.contactId ? `stamped=${r.contactId} ` : 'stamped=no '}`
         + `lp=${lp.status} total=${Date.now() - started}ms`
       );
       // Contract: return LP's own bytes, so ActiveProspect's existing handling
@@ -186,7 +271,8 @@ export function registerApIntakeRoutes(app) {
     }
   });
 
-  console.log(`[AP-INTAKE] Registered: POST /intake/ap-lead (mode=${intakeMode()}, resolve_ceiling=${RESOLVE_TIMEOUT_MS}ms)`);
+  console.log(`[AP-INTAKE] Registered: POST /intake/ap-resolve, POST /intake/ap-lead `
+    + `(mode=${intakeMode()}, resolve_ceiling=${RESOLVE_TIMEOUT_MS}ms)`);
 }
 
-export const _internal = { intakeMode, raceWithNullTimeout, RESOLVE_TIMEOUT_MS, AP_INTAKE_TAG };
+export const _internal = { intakeMode, raceWithNullTimeout, logClientDisconnect, RESOLVE_TIMEOUT_MS, AP_INTAKE_TAG };
