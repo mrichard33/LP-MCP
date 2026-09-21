@@ -80,9 +80,10 @@ export function isDuplicate400(err) {
 }
 
 /** Search GHL for a contact on this phone. Null when nothing is confirmable. */
-export async function searchByPhone(normalizedPhone, { deps = DEFAULT_DEPS, log = console } = {}) {
+export async function searchByPhone(normalizedPhone, { deps = DEFAULT_DEPS, log = console, priority } = {}) {
   const q = encodeURIComponent(normalizedPhone);
-  const res = await deps.ghlFetch('GET', `/contacts/?query=${q}&locationId=${GHL_LOCATION_ID}`);
+  const rate = priority ? { priority } : undefined;
+  const res = await deps.ghlFetch('GET', `/contacts/?query=${q}&locationId=${GHL_LOCATION_ID}`, null, rate);
   const pick = pickPhoneMatch(res?.contacts, normalizedPhone);
   if (!pick) return null;
   if (pick.verified) return pick.contact;
@@ -92,7 +93,7 @@ export async function searchByPhone(normalizedPhone, { deps = DEFAULT_DEPS, log 
   // read failure returns null — see the rule in this file's header.
   const want = normalizedPhone.slice(-10);
   try {
-    const full = await deps.ghlFetch('GET', `/contacts/${pick.candidate.id}`);
+    const full = await deps.ghlFetch('GET', `/contacts/${pick.candidate.id}`, null, rate);
     const contact = full?.contact || full || {};
     const cp = normalizePhone(contact?.phone);
     if (cp && cp.slice(-10) === want) return contact;
@@ -115,7 +116,7 @@ export async function searchByPhone(normalizedPhone, { deps = DEFAULT_DEPS, log 
  *                which is the condition Phase A had to clean up by hand.
  */
 export async function resolveOrCreateContact(input, {
-  create = true, deps = DEFAULT_DEPS, log = console, mirrorFirst = false,
+  create = true, deps = DEFAULT_DEPS, log = console, mirrorFirst = false, priority,
 } = {}) {
   const phone = normalizePhone(input?.phone);
   if (!phone || phone.replace(/[^0-9]/g, '').length < 10) {
@@ -144,7 +145,7 @@ export async function resolveOrCreateContact(input, {
     if (mirrored) return { contactId: mirrored, outcome: 'found' };
   }
 
-  const match = await searchByPhone(phone, { deps, log });
+  const match = await searchByPhone(phone, { deps, log, priority });
   if (match?.id) return { contactId: match.id, outcome: 'found' };
 
   if (!create) return { contactId: null, outcome: 'none' };
@@ -166,14 +167,16 @@ export async function resolveOrCreateContact(input, {
   };
 
   try {
-    const cr = await deps.ghlFetch('POST', '/contacts/', body);
+    // The create is the call that must never starve: LP accepts `lognumber`
+    // only at AddLead, so an intake that fails open here loses the id for good.
+    const cr = await deps.ghlFetch('POST', '/contacts/', body, priority ? { priority } : undefined);
     const contactId = cr?.contact?.id || cr?.id || null;
     return { contactId, outcome: contactId ? 'created' : 'none' };
   } catch (err) {
     if (!isDuplicate400(err)) throw err;
     // GHL deduped server-side — another pipe created it between our search and
     // our create. Re-search and use theirs; ours was never written.
-    const raced = await searchByPhone(phone, { deps, log });
+    const raced = await searchByPhone(phone, { deps, log, priority });
     if (raced?.id) return { contactId: raced.id, outcome: 'found' };
     throw err;
   }

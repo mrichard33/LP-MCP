@@ -128,6 +128,47 @@ import { recordGhlRequest } from './ghl-shared-budget.js';
 const BUCKET_CAPACITY = Math.max(1, parseInt(process.env.GHL_RATE_CAPACITY || '40', 10));
 const REFILL_RATE = Math.max(1, parseInt(process.env.GHL_RATE_REFILL_PER_MIN || '40', 10));  // tokens per minute
 const REFILL_INTERVAL_MS = (60 * 1000) / REFILL_RATE;  // ~1500ms per token at 40/min
+
+// v1.5 — 2026-09-21 — LEAD INTAKE MUST NOT QUEUE BEHIND BATCH WORK.
+//
+// POST /intake/ap-resolve timed out on four consecutive probes at its 1200ms
+// ceiling while the GHL search it makes measured 101-270ms. It was not waiting
+// on GoHighLevel: the action executor was mid-batch, and the two share this
+// bucket. That window's logs read `20 executed ... [budget exhausted]
+// (61464ms)` and `limiter alert sent — 12 token timeouts`.
+//
+// FIFO is the wrong discipline when the callers are not equals. An executor
+// action that waits 30s retries on the next tick and loses nothing. A lead
+// intake that waits 30s is a lead ActiveProspect has already given up on, and
+// Lead Perfection accepts `lognumber` only at AddLead and never again — so the
+// id is not late, it is gone.
+//
+// Two changes, and BOTH are needed:
+//
+//   PRIORITY  a high-priority waiter jumps ahead of every normal waiter, so it
+//             never queues behind a batch that is already enqueued.
+//   RESERVE   normal callers stop drawing at RESERVE tokens, so a high-priority
+//             caller finds the FAST PATH open rather than a queue to jump.
+//             Priority alone would still leave intake waiting for the next
+//             refill (~750ms at 80/min) whenever a batch had drained the
+//             bucket to zero — which is exactly the observed failure.
+//
+// The reserve costs the executor almost nothing: intake volume is a few leads
+// an hour, so these tokens sit unused and refill continuously, while the
+// executor keeps capacity-minus-reserve and simply stops a little earlier.
+//
+// Default is 10% of capacity, floor 4 — 12 at the live capacity of 120. Clamped
+// below capacity so a misconfigured reserve can never starve normal callers
+// completely.
+const RESERVE_TOKENS = Math.max(0, Math.min(
+  BUCKET_CAPACITY - 1,
+  parseInt(process.env.GHL_RATE_RESERVE || String(Math.max(4, Math.floor(BUCKET_CAPACITY * 0.1))), 10),
+));
+
+/** Tokens a caller of this priority may draw down to. */
+function floorFor(priority) {
+  return priority === 'high' ? 0 : RESERVE_TOKENS;
+}
 // v1.4 — 2026-09-14 — PAUSE ECONOMICS.
 //
 // The 5-minute pause was doing none of the backing-off it was written for, at
@@ -192,6 +233,8 @@ let consecutive429Cycles = 0;
 let last429At = 0;
 let lastCycleDecayAt = Date.now();
 const waitQueue = [];
+/** Drained before waitQueue, and only by callers that passed priority:'high'. */
+const priorityQueue = [];
 
 // v1.2 — single global drainer handle. Started lazily on first wait.
 let drainerHandle = null;
@@ -203,6 +246,8 @@ let stats = {
   total429s: 0,
   longestWaitMs: 0,
   timedOut: 0,        // v1.2 — count of fail-open timeouts
+  highAcquired: 0,    // v1.5 — tokens taken by synchronous lead intake
+  highTimedOut: 0,    // v1.5 — intakes that failed open anyway. Must stay 0.
   lastReset: Date.now(),
 };
 
@@ -225,6 +270,22 @@ function decayCycles() {
   );
 }
 
+// v1.5 — the cautious restart must clear the RESERVE, not sit under it.
+//
+// This used to seed two tokens flat, deliberately few, so the first calls after
+// a pause trickle rather than stampede. But a normal caller needs tokens ABOVE
+// the reserve, so seeding 2 against a reserve of 12 left every batch caller
+// queued until refill climbed past 12 — ~9 seconds of total blockage after each
+// recovery. Worse, it inverted the reserve's meaning, from "keep a little back
+// for intake" into "only intake may run at all".
+//
+// Seeding RESERVE + 2 keeps both intents: normal callers get exactly the two
+// cautious tokens they always had, and the reserve above them stays intact for
+// intake. Clamped to capacity.
+function cautiousRestartTokens() {
+  return Math.min(BUCKET_CAPACITY, RESERVE_TOKENS + 2);
+}
+
 function refill() {
   const now = Date.now();
   const elapsed = now - lastRefill;
@@ -235,25 +296,33 @@ function refill() {
   }
 }
 
+function releaseOne(queue) {
+  tokens--;
+  const entry = queue.shift();
+  const waitMs = Date.now() - entry.queuedAt;
+  stats.totalWaited++;
+  if (waitMs > stats.longestWaitMs) stats.longestWaitMs = waitMs;
+  // entry.resolve is the wrapped version that clears the timeout and
+  // sets entry.resolved = true to block any double-resolve race with
+  // the timeout firing simultaneously.
+  entry.resolve();
+}
+
 function processQueue() {
-  while (waitQueue.length > 0 && tokens > 0 && !isPaused()) {
-    tokens--;
-    const entry = waitQueue.shift();
-    const waitMs = Date.now() - entry.queuedAt;
-    stats.totalWaited++;
-    if (waitMs > stats.longestWaitMs) stats.longestWaitMs = waitMs;
-    // entry.resolve is the wrapped version that clears the timeout and
-    // sets entry.resolved = true to block any double-resolve race with
-    // the timeout firing simultaneously.
-    entry.resolve();
-  }
+  if (isPaused()) return;
+  // Priority first, and down to the last token — the reserve exists FOR these
+  // callers, so it would be self-defeating to withhold it from them.
+  while (priorityQueue.length > 0 && tokens > 0) releaseOne(priorityQueue);
+  // Normal callers stop at the reserve, leaving those tokens for an intake that
+  // has not arrived yet. This is the half that keeps the FAST path open.
+  while (waitQueue.length > 0 && tokens > RESERVE_TOKENS) releaseOne(waitQueue);
 }
 
 function isPaused() {
   if (!paused) return false;
   if (Date.now() >= pauseUntil) {
     paused = false;
-    tokens = Math.min(2, BUCKET_CAPACITY); // Very cautious restart
+    tokens = cautiousRestartTokens(); // Very cautious restart, above the reserve
     console.log(`[RateLimiter] Pause ended. Resuming with ${tokens} tokens. Consecutive 429 cycles: ${consecutive429Cycles}`);
     processQueue();
     return false;
@@ -276,7 +345,10 @@ function ensureDrainer() {
   drainerHandle = setInterval(() => {
     refill();
     decayCycles();
-    if (waitQueue.length > 0) {
+    // v1.5 — BOTH queues. Gating on waitQueue alone would leave a lone
+    // high-priority waiter parked until its fail-open timeout, which is the
+    // exact failure this lane exists to prevent.
+    if (priorityQueue.length > 0 || waitQueue.length > 0) {
       processQueue();
     }
   }, REFILL_INTERVAL_MS);
@@ -292,6 +364,11 @@ function ensureDrainer() {
  *   429-paused bucket cannot stack 30s waits past the executor's 60s
  *   handler watchdog. Default: WAIT_TIMEOUT_MS (30s), behavior unchanged
  *   for existing callers. Fail-open either way.
+ * @param {'high'|'normal'} [opts.priority]  'high' draws below the reserve and
+ *   jumps every normal waiter (v1.5, 2026-09-21). It is for SYNCHRONOUS LEAD
+ *   INTAKE only — a third party is on the line and the id cannot be obtained
+ *   later. Batch and sweep callers must stay normal: if everything is high
+ *   priority then nothing is, and the reserve protects no one.
  */
 export function acquireToken(opts = {}) {
   // Shared-budget measurement (2026-09-14). Every governed GHL call passes
@@ -316,8 +393,14 @@ export function acquireToken(opts = {}) {
   // hung up on by GoHighLevel at 60s.
   const maxWaitMs = isPaused() ? Math.min(requested, PAUSE_WAIT_MS) : requested;
 
-  // Fast path: token available, not paused. No queue, no waiting.
-  if (!isPaused() && tokens > 0) {
+  const high = opts.priority === 'high';
+  if (high) stats.highAcquired++;
+
+  // Fast path: token available above this caller's floor, not paused. No queue,
+  // no waiting. A normal caller stops at RESERVE_TOKENS; a high-priority one
+  // draws to zero. Keeping that gap is what makes this path — not the queue —
+  // the one a lead intake takes while a batch is running.
+  if (!isPaused() && tokens > floorFor(opts.priority)) {
     tokens--;
     stats.totalAcquired++;
     return Promise.resolve();
@@ -341,15 +424,19 @@ export function acquireToken(opts = {}) {
 
       // Remove from queue if still present (race-safe — splice no-ops
       // on idx=-1).
-      const idx = waitQueue.indexOf(entry);
-      if (idx >= 0) waitQueue.splice(idx, 1);
+      const queue = high ? priorityQueue : waitQueue;
+      const idx = queue.indexOf(entry);
+      if (idx >= 0) queue.splice(idx, 1);
 
       stats.timedOut++;
+      if (high) stats.highTimedOut++;
       stats.totalAcquired++; // count as acquired (fail-open) for monitoring
       const waited = Date.now() - entry.queuedAt;
       console.warn(
-        `[RateLimiter] acquireToken timed out after ${waited}ms ` +
-        `(queue=${waitQueue.length}, tokens=${tokens}, paused=${isPaused()}) — failing open`
+        `[RateLimiter] acquireToken timed out after ${waited}ms `
+        + `(priority=${high ? 'high' : 'normal'}, queue=${waitQueue.length}, `
+        + `priorityQueue=${priorityQueue.length}, tokens=${tokens}, `
+        + `reserve=${RESERVE_TOKENS}, paused=${isPaused()}) — failing open`
       );
       resolve();
     }, maxWaitMs);
@@ -361,7 +448,9 @@ export function acquireToken(opts = {}) {
       resolve();
     };
 
-    waitQueue.push(entry);
+    // A high-priority waiter only ever queues behind other high-priority
+    // waiters, never behind the batch that is already in waitQueue.
+    (high ? priorityQueue : waitQueue).push(entry);
   });
 }
 
@@ -441,7 +530,7 @@ export function resetCycles() {
   lastCycleDecayAt = Date.now();
   paused = false;
   pauseUntil = 0;
-  tokens = Math.min(2, BUCKET_CAPACITY); // same cautious restart as isPaused()
+  tokens = cautiousRestartTokens(); // same cautious restart as isPaused()
   processQueue();
   console.warn(
     `[RateLimiter] resetCycles: consecutive429Cycles ${previous} → 0, ` +
@@ -459,20 +548,37 @@ export function resetCycles() {
  * pretending.
  */
 export function drainStuckWaiters() {
-  const cleared = waitQueue.length;
+  // v1.5 — both queues. A priority waiter stuck behind a wedged drainer is the
+  // MORE urgent of the two to release, so leaving it out would invert the point
+  // of the lane.
+  const stuck = [...priorityQueue.splice(0), ...waitQueue.splice(0)];
+  const cleared = stuck.length;
   const ages = [];
-  while (waitQueue.length > 0) {
-    const entry = waitQueue.shift();
+  while (stuck.length > 0) {
+    const entry = stuck.shift();
     ages.push(Date.now() - entry.queuedAt);
     if (!entry.resolved) {
-      entry.resolved = true;
       stats.timedOut++;
       stats.totalAcquired++;
-      // We can't access the original timeoutHandle here, but entry.resolve
-      // will be a no-op due to entry.resolved=true. We could call it
-      // anyway to clean up the timeout, but the gain is small.
+      // 2026-09-21 — DO NOT set entry.resolved before calling entry.resolve.
+      //
+      // This block used to read `entry.resolved = true` first, and
+      // entry.resolve opens with `if (entry.resolved) return`. So the call
+      // below no-opped: the caller's promise was never resolved and
+      // timeoutHandle was never cleared — and when that timeout later fired it
+      // ALSO returned early on the same flag. The waiter's promise never
+      // settled, at all, ever.
+      //
+      // The old comment here ("entry.resolve will be a no-op ... the gain is
+      // small") knew about the no-op and missed what it cost: this is the admin
+      // recovery for orphaned waiters, and it was permanently orphaning every
+      // waiter it touched — the exact bug class v1.2 was written to eliminate.
+      //
+      // entry.resolve does all three things correctly on its own: sets the
+      // flag, clears the timeout, resolves the promise. Just call it.
       try {
         if (typeof entry.resolve === 'function') entry.resolve();
+        else entry.resolved = true;
       } catch (e) { /* swallow */ }
     }
   }
@@ -500,6 +606,15 @@ export function getRateLimiterStats() {
     paused: isPaused(),
     pauseRemainingMs: paused ? Math.max(0, pauseUntil - Date.now()) : 0,
     queueDepth: waitQueue.length,
+    // v1.5 — the two numbers that say whether intake is actually protected.
+    // priorityQueueDepth should sit at 0: a high-priority caller that has to
+    // queue at all means the reserve was exhausted, which is the signal to
+    // raise GHL_RATE_RESERVE. highTimedOut must stay 0 — every one of those is
+    // a lead whose GHL id was lost.
+    priorityQueueDepth: priorityQueue.length,
+    reserveTokens: RESERVE_TOKENS,
+    highAcquired: stats.highAcquired,
+    highTimedOut: stats.highTimedOut,
     consecutive429Cycles,
     currentPauseMs: Math.min(BASE_PAUSE_MS * Math.max(consecutive429Cycles, 1), MAX_PAUSE_MS),
     drainerActive: drainerHandle !== null,
