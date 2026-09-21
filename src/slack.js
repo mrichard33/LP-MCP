@@ -31,6 +31,10 @@ const CH_MAIN = process.env.SLACK_CHANNEL_MAIN || '';
 const CH_CANVASS = process.env.SLACK_CHANNEL_CANVASS || '';
 const CH_SALES = process.env.SLACK_CHANNEL_SALES || '';
 const CH_OPS = process.env.SLACK_CHANNEL_OPS || '';
+// 2026-09-21 — #contact-center. Customer service issues found in a missed
+// reply route here, not to the sales floor: a screen repair or a warranty
+// question is not a lead, and putting it in #sales-<market> buries it.
+const CH_SERVICE = process.env.SLACK_CHANNEL_SERVICE || '';
 // Slack approval buttons (2026-09-21). Off unless the literal 'true'.
 const APPROVALS_ENABLED = String(process.env.SLACK_APPROVALS_ENABLED || 'false') === 'true';
 const CH_APPROVALS = process.env.SLACK_CHANNEL_APPROVALS || '';
@@ -51,9 +55,16 @@ const MARKET_ALIASES = { BOCA: 'FTLAU', MIAMI: 'FTLAU' };
 //            a poisoned market value resolved no channel and every card fell
 //            back to the rollup, so nobody read the market channels at all.
 // The divergence is deliberate; do not "tidy" it back into one rule.
+//   service: NO, same reasoning as sales — a customer waiting on a service
+//            call belongs to the market that installed the job. With no
+//            market resolved it falls back to SLACK_CHANNEL_SERVICE, which
+//            is the contact-center channel, never #lead-intelligence: an
+//            unrouted service issue must still reach someone who handles
+//            service.
 const MARKET_FAMILIES = {
   canvass: { prefix: 'canvass', rollup: () => CH_CANVASS, alsoRollup: true },
   sales: { prefix: 'sales', rollup: () => CH_SALES, alsoRollup: false },
+  service: { prefix: 'service', rollup: () => CH_SERVICE, alsoRollup: false },
 };
 
 const CACHE_TTL_MS = 10 * 60 * 1000;
@@ -76,7 +87,7 @@ function _client() {
   return _clientOverride || supabase;
 }
 
-console.log(`[Slack] mirror enabled=${MIRROR_ENABLED} token=${SLACK_BOT_TOKEN ? 'set' : 'unset'} main=${CH_MAIN || '-'} canvass=${CH_CANVASS || '-'} sales=${CH_SALES || '-'} ops=${CH_OPS || '-'}`);
+console.log(`[Slack] mirror enabled=${MIRROR_ENABLED} token=${SLACK_BOT_TOKEN ? 'set' : 'unset'} main=${CH_MAIN || '-'} canvass=${CH_CANVASS || '-'} sales=${CH_SALES || '-'} ops=${CH_OPS || '-'} service=${CH_SERVICE || '-'}`);
 
 function _normKey(v) {
   return String(v || '').trim().toUpperCase();
