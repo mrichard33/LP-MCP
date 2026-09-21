@@ -268,7 +268,19 @@ test('a card resolved elsewhere replaces the original instead of erroring', asyn
 
   assert.equal(out.action, 'already_resolved');
   assert.equal(s.replies[0].body.replace_original, true);
-  assert.match(s.replies[0].body.text, /Already approved by Mark/);
+  assert.match(s.replies[0].body.text, /already approved by Mark/);
+});
+
+test('an auto-closed card says what happened in English, not "Already auto_closed"', async () => {
+  // auto_closed is written by the sweep (src/approval-card-autoclose.js) when
+  // every action on the card was already handled. The raw status reads like a
+  // system error to whoever clicked, so handleInteraction spells it out.
+  const s = stubs({ result: { ok: false, outcome: 'already_resolved', previousStatus: 'auto_closed', resolvedBy: 'system:auto_close' } });
+  const out = await handleInteraction(parseInteraction(formBody(clickPayload())), s.opts);
+
+  assert.equal(out.action, 'already_resolved');
+  assert.match(s.replies[0].body.text, /closed automatically — its actions were already handled/);
+  assert.doesNotMatch(s.replies[0].body.text, /auto_closed/, 'the machine status must not reach the person clicking');
 });
 
 test('a missing card replaces the original with the expired note', async () => {

@@ -26,6 +26,12 @@
  * add_to_workflow, and remove_from_workflow are also excluded because they
  * can affect customer experience indirectly.
  *
+ * CARD AUTO-CLOSE (2026-09-21) — every pass, after the phases above, closes
+ *   any approval card none of whose actions is still pending_approval
+ *   (src/approval-card-autoclose.js). Auto-executed, auto-rejected and
+ *   dashboard-approved actions no longer leave their cards open forever.
+ *   Kill switch: APPROVAL_CARD_AUTOCLOSE_DISABLED=true.
+ *
  * Reversible: revert this commit, or set environment flag
  * APPROVAL_ESCALATION_DISABLED=true to halt without redeploy.
  */
@@ -33,6 +39,7 @@
 import supabase from './supabase.js';
 import { emitEvent } from './event-emitter.js';
 import { postSlackApprovalCard, slackApprovalsEnabled } from './slack.js';
+import { closeStaleApprovalCards } from './approval-card-autoclose.js';
 
 // ═══════════════════════════════════════════════════════════════════
 // CONSTANTS
@@ -193,8 +200,15 @@ export async function runApprovalEscalationSweep({ dryRun = false } = {}) {
   }
 
   if (!actions?.length) {
+    // A pass with nothing waiting is exactly when stale cards are most likely,
+    // so the close must run here too — not only on the full-pass path below.
+    const cards = await closeStaleApprovalCards({ dryRun }).catch((err) => {
+      console.warn(`[ApprovalEscalation] card auto-close threw (ignored): ${err.message}`);
+      return { closed: 0 };
+    });
     return {
       success: true,
+      cards_auto_closed: cards.closed || 0,
       checked: 0,
       escalated: 0,
       auto_executed: 0,
@@ -404,9 +418,17 @@ export async function runApprovalEscalationSweep({ dryRun = false } = {}) {
     escalated++;
   }
 
+  // After Phases 1-3, so a card whose actions were just auto-executed or
+  // auto-rejected closes in the same pass rather than waiting 15 more minutes.
+  const cards = await closeStaleApprovalCards({ dryRun }).catch((err) => {
+    console.warn(`[ApprovalEscalation] card auto-close threw (ignored): ${err.message}`);
+    return { closed: 0 };
+  });
+
   const elapsed_ms = Date.now() - startTime;
   const summary = {
     success: true,
+    cards_auto_closed: cards.closed || 0,
     checked: actions.length,
     escalated,
     auto_executed: autoExecuted,
