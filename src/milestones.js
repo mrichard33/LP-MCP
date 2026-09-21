@@ -3,6 +3,7 @@ import { applyGHLTag } from './ghl.js';
 import { emitEvent } from './event-emitter.js';
 import { classifyMilestoneDate, MIN_PLAUSIBLE_ACT_DATE } from './milestone-gate.js';
 import { selectAllIn } from './supabase-page.js';
+import { staleFireMode, staleFireVerdict } from './milestone-stale-gate.js';
 
 // Rows per candidate page. PostgREST caps a response at 1,000 on this project
 // and says nothing when it truncates, so this is the cap made explicit rather
@@ -267,13 +268,13 @@ export async function processMilestoneTriggers(now = new Date()) {
     const jobDataMap = {};
     if (jobIds.length > 0) {
       const jobs = await selectAllIn(supabase, 'lp_jobs', {
-        columns: 'id, lp_job_id, job_value, branch_code',
+        columns: 'id, lp_job_id, job_value, branch_code, job_status',
         orderBy: 'id',
         column: 'lp_job_id',
         values: jobIds,
       });
       for (const job of jobs) {
-        jobDataMap[job.lp_job_id] = { job_value: job.job_value, branch_code: job.branch_code };
+        jobDataMap[job.lp_job_id] = { job_value: job.job_value, branch_code: job.branch_code, job_status: job.job_status };
       }
     }
 
@@ -359,6 +360,30 @@ async function processPage(page, {
 
     const tag = MDT_TAG_MAP[milestone.mdt_id];
     if (!tag) { onNoTag(); continue; }
+
+    // 2026-09-21 stale-fire gate. Per ROW, after the read — readCandidatePage's
+    // predicate is pinned by scripts/test-ghl-link-propagate.js and is untouched.
+    // Enforce retires the row with the SAME audit columns the #512 backfill uses,
+    // so it never fires later and stays distinguishable from a real fire.
+    const staleness = staleFireVerdict({
+      actDate: milestone.act_date,
+      jobStatus: (jobDataMap[milestone.lp_job_id] || {}).job_status,
+      now,
+    });
+    if (staleness.stale) {
+      const mode = staleFireMode();
+      if (mode !== 'off') {
+        console.warn(`[Milestones] STALE FIRE (${mode}) ${tag} contact=${ghlContactId} job=${milestone.lp_job_id} reason=${staleness.reason} age=${staleness.ageDays ?? 'n/a'}d`);
+      }
+      if (mode === 'enforce') {
+        if (!scanOnly) {
+          await supabase.from('lp_job_milestones')
+            .update({ ghl_tag_fired: true, tag_suppressed_backfill: true, tag_suppressed_at: new Date().toISOString() })
+            .eq('lp_job_id', milestone.lp_job_id).eq('mdt_id', milestone.mdt_id);
+        }
+        continue;
+      }
+    }
 
     // Everything above is classification and touches nothing. The line below
     // is the first outward-facing act in this function, so scan-only stops
