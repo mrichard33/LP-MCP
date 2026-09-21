@@ -1,0 +1,273 @@
+#!/usr/bin/env node
+/**
+ * P2 OPPORTUNITY LP JOB ID BACKFILL — scripts/backfill-p2-opportunity-job-id.js
+ *
+ * WHY THIS EXISTS
+ * ---------------
+ * src/lp-job-value.js has said since 2026-08-31 that "nothing on the opportunity
+ * records which job it belongs to, which is what an lp_job_id reference is meant
+ * to fix." The field now exists — GHL opportunity custom field "LP Job ID"
+ * (sMZfcWAdoqh88pghLsNQ, created 2026-09-21) — and the live path stamps it from
+ * here on. This stamps the opportunities already on the board.
+ *
+ * Until every P2 opportunity carries it, value, source and won/lost are all
+ * decided from "the contact's newest live job" — a proxy that is right for the
+ * ~1,878 single-job contacts and wrong for the 293 holding more than one.
+ *
+ * HOW A JOB IS MATCHED, in order
+ * ------------------------------
+ *   only_job      the contact has exactly one job. Nothing to get wrong.
+ *   value_match   exactly one job's job_value equals the opp's monetaryValue,
+ *                 to the cent. The value was written FROM that job.
+ *   deciding_job  an OPEN opp with no other signal: decidingJob() — the same
+ *                 rule the live path and the reconciler already use.
+ *   ambiguous     everything else. A CLOSED opp with several jobs and no value
+ *                 match cannot be resolved from anything on the record, so it is
+ *                 listed in full and left alone. That list IS the deliverable
+ *                 for a manual pass — guessing would bury the evidence.
+ *
+ * STAMP-IF-EMPTY
+ * --------------
+ * A populated LP Job ID is NEVER overwritten, by this script or by the live
+ * path. Candidates are scanned from the HL mirror, which carries opportunity
+ * custom fields but LAGS GHL by up to one sync — so the mirror can still show a
+ * row as unstamped minutes after GHL has it. That only over-selects, which is
+ * safe: under --execute every opportunity is re-read LIVE immediately before the
+ * write and a row already stamped is counted already_stamped and skipped. The
+ * same lag makes DRY-RUN counts run optimistic; the live pass is the real number.
+ *
+ * ROLLBACK
+ * --------
+ * Every intended write is appended to a JSONL log BEFORE the PUT is issued.
+ * Because this only ever fills an EMPTY field, rollback is clearing it.
+ *
+ * PACING
+ * ------
+ * Sequential on the shared ghlFetch token bucket (40/min, shared with HL MCP).
+ * Do not parallelise. A failure is counted and the run continues.
+ *
+ * Usage
+ *   node scripts/backfill-p2-opportunity-job-id.js                 # DRY RUN
+ *   node scripts/backfill-p2-opportunity-job-id.js --execute --limit=25
+ *   node scripts/backfill-p2-opportunity-job-id.js --execute
+ *   node scripts/backfill-p2-opportunity-job-id.js --opportunity-id=Ua0Q6GSBpEV9LmAowXX0
+ */
+
+import { appendFileSync } from 'node:fs';
+import { pathToFileURL } from 'node:url';
+import { ghlFetch } from '../src/actions/helpers.js';
+import { hlRunSQL, esc } from '../src/admin/hl-client.js';
+import { PIPELINE_IDS } from '../src/actions/constants.js';
+import { jobsForContact } from '../src/lp-job-value.js';
+import { decidingJob, readOppJobId, OPP_CF_LP_JOB_ID } from '../src/p2-opportunity-context.js';
+
+const P2_PIPELINE_ID   = PIPELINE_IDS.P2;
+const MAX_MIRROR_AGE_H = 24;
+
+// ─── args ────────────────────────────────────────────────────────────
+const args = process.argv.slice(2);
+const has    = (n)    => args.includes(`--${n}`);
+const strArg = (n, d) => (args.find((a) => a.startsWith(`--${n}=`)) || '').split('=')[1] || d;
+const numArg = (n, d) => { const v = parseInt(strArg(n, ''), 10); return Number.isFinite(v) ? v : d; };
+
+const opt = {
+  execute:       has('execute'),
+  limit:         numArg('limit', 0),
+  opportunityId: strArg('opportunity-id', ''),
+};
+
+// ─── the decision, pure and exported so a test can pin it ────────────
+
+/**
+ * Which LP job does this opportunity track?
+ *
+ * `status`        open | won | lost | abandoned
+ * `monetaryValue` the opp's value as GHL holds it
+ * `jobs`          every lp_jobs row belonging to the contact
+ *
+ * → { write: true, jobId, how } | { write: false, reason }
+ */
+export function jobIdMatch({ status, monetaryValue, jobs }) {
+  const rows = (jobs || []).filter(Boolean);
+  if (rows.length === 0) return { write: false, reason: 'no_lp_job' };
+  if (rows.length === 1) return { write: true, jobId: String(rows[0].lp_job_id), how: 'only_job' };
+  const v = Number(monetaryValue);
+  const byValue = Number.isFinite(v) && v > 0
+    ? rows.filter((j) => Math.round(parseFloat(j.job_value) * 100) === Math.round(v * 100)) : [];
+  if (byValue.length === 1) return { write: true, jobId: String(byValue[0].lp_job_id), how: 'value_match' };
+  if (status === 'open') {
+    const { job } = decidingJob(rows);
+    if (job) return { write: true, jobId: String(job.lp_job_id), how: 'deciding_job' };
+  }
+  return { write: false, reason: 'ambiguous_multi_job' };
+}
+
+// ─── rollback log ────────────────────────────────────────────────────
+const LOG_PATH = `/tmp/p2-opp-job-id-backfill-${new Date().toISOString().replace(/[:.]/g, '-')}.jsonl`;
+
+/** Record the write BEFORE issuing it — a crash mid-PUT must not lose the row. */
+function logRollback(entry) {
+  appendFileSync(LOG_PATH, `${JSON.stringify({ ts: new Date().toISOString(), ...entry })}\n`);
+}
+
+// ─── candidates ──────────────────────────────────────────────────────
+/**
+ * P2 opportunities the mirror shows as unstamped, ALL statuses. The mirror lags
+ * GHL, so this list can include rows already stamped — see STAMP-IF-EMPTY above.
+ */
+async function fetchUnstampedP2() {
+  const idFilter = opt.opportunityId ? `AND ghl_opportunity_id = '${esc(opt.opportunityId)}'` : '';
+  const rows = await hlRunSQL(`
+    SELECT ghl_opportunity_id, ghl_contact_id, status, monetary_value, custom_fields, synced_at
+      FROM opportunities
+     WHERE ghl_pipeline_id = '${esc(P2_PIPELINE_ID)}'
+       AND ghl_contact_id IS NOT NULL
+       AND deleted_at IS NULL ${idFilter}
+     ORDER BY ghl_opportunity_id
+  `);
+  return (Array.isArray(rows) ? rows : [])
+    .filter((r) => readOppJobId({ customFields: r.custom_fields }) === null);
+}
+
+/** The mirror lags GHL by up to one sync. Writing from a badly stale read can clobber. */
+function assertMirrorFresh(rows) {
+  const stamps = rows.map((r) => Date.parse(r.synced_at)).filter(Number.isFinite);
+  if (!stamps.length) return;
+  const ageH = (Date.now() - Math.max(...stamps)) / 3_600_000;
+  console.log(`mirror freshness: newest sync ${ageH.toFixed(1)}h ago`);
+  if (opt.execute && ageH > MAX_MIRROR_AGE_H) {
+    console.error(`\n  REFUSING TO WRITE: mirror is ${ageH.toFixed(1)}h stale (limit ${MAX_MIRROR_AGE_H}h).`
+      + '\n  Re-sync opportunities, then re-run.');
+    process.exit(1);
+  }
+}
+
+// ─── run ─────────────────────────────────────────────────────────────
+async function run() {
+  let candidates = await fetchUnstampedP2();
+  console.log(`${candidates.length} P2 opportunities show no LP Job ID in the mirror (all statuses)`);
+  assertMirrorFresh(candidates);
+  if (opt.limit) {
+    candidates = candidates.slice(0, opt.limit);
+    console.log(`  capped to ${candidates.length} by --limit`);
+  }
+  if (!candidates.length) return { written: 0, failed: 0, ambiguousIds: [] };
+
+  const stats = {
+    written: 0, failed: 0, already_stamped: 0, jobs_unreadable: 0,
+    no_lp_job: 0, ambiguous_multi_job: 0,
+  };
+  const byHow = new Map();
+  const ambiguousIds = [];
+  // One job read per CONTACT: a repeat customer holds several P2 opps.
+  const jobCache = new Map();
+  let shown = 0;
+  const sampleCap = opt.execute ? 15 : Infinity;
+
+  for (const o of candidates) {
+    if (!jobCache.has(o.ghl_contact_id)) {
+      jobCache.set(o.ghl_contact_id, await jobsForContact(o.ghl_contact_id));
+    }
+    const { jobs, error } = jobCache.get(o.ghl_contact_id);
+    if (error) {
+      // Unreadable is not "no job". Count it apart and touch nothing.
+      stats.jobs_unreadable++;
+      console.error(`  UNREADABLE ${o.ghl_opportunity_id} (contact ${o.ghl_contact_id}): ${error}`);
+      continue;
+    }
+
+    const decision = jobIdMatch({ status: o.status, monetaryValue: o.monetary_value, jobs });
+    if (!decision.write) {
+      stats[decision.reason]++;
+      if (decision.reason === 'ambiguous_multi_job') ambiguousIds.push(o.ghl_opportunity_id);
+      continue;
+    }
+    byHow.set(decision.how, (byHow.get(decision.how) || 0) + 1);
+
+    if (!opt.execute) {
+      stats.written++;
+      if (shown++ < sampleCap) {
+        console.log(`  would stamp ${o.ghl_opportunity_id}  → job ${decision.jobId}  (${decision.how})`);
+      }
+      continue;
+    }
+
+    // STAMP-IF-EMPTY, confirmed against GHL rather than against the lagging
+    // mirror. This is the only check standing between a stale candidate list and
+    // overwriting a job id the live path stamped minutes ago.
+    try {
+      const live = await ghlFetch('GET', `/opportunities/${o.ghl_opportunity_id}`);
+      if (readOppJobId(live?.opportunity || live) !== null) { stats.already_stamped++; continue; }
+    } catch (err) {
+      stats.failed++;
+      console.error(`  FAILED (live read) ${o.ghl_opportunity_id}: ${err.message}`);
+      continue;
+    }
+
+    logRollback({
+      kind: 'opportunity', id: o.ghl_opportunity_id, field: 'LP Job ID',
+      field_id: OPP_CF_LP_JOB_ID, old: null, new: decision.jobId, how: decision.how, status: o.status,
+    });
+    try {
+      // The customFields LITERAL, nothing else. Any other key here is a field
+      // this backfill never intended to touch.
+      await ghlFetch('PUT', `/opportunities/${o.ghl_opportunity_id}`, {
+        customFields: [{ id: OPP_CF_LP_JOB_ID, field_value: decision.jobId }],
+      });
+      stats.written++;
+      if (stats.written % 25 === 0) console.log(`  ${stats.written} stamped...`);
+    } catch (err) {
+      stats.failed++;                                    // failures never abort the run
+      console.error(`  FAILED ${o.ghl_opportunity_id}: ${err.message}`);
+    }
+  }
+
+  console.log(`\n─── P2 opportunity LP Job ID ${'─'.repeat(42)}`);
+  console.log(`${opt.execute ? 'stamped' : 'would stamp'}            ${stats.written}`);
+  console.log(`failed                   ${stats.failed}`);
+  console.log(`already stamped in GHL   ${stats.already_stamped}   (mirror lagged — not an error)`);
+  console.log(`skipped no_lp_job        ${stats.no_lp_job}`);
+  console.log(`skipped ambiguous        ${stats.ambiguous_multi_job}`);
+  console.log(`jobs unreadable          ${stats.jobs_unreadable}`);
+
+  if (byHow.size) {
+    console.log('\nby match:');
+    for (const [how, n] of [...byHow].sort((a, b) => b[1] - a[1])) {
+      console.log(`  ${String(n).padStart(5)}  ${how}`);
+    }
+  }
+
+  // The full list, not a sample: it IS the deliverable for the manual pass.
+  console.log(`\n─── ${ambiguousIds.length} opportunities whose job could NOT be determined ───`);
+  console.log('A closed opportunity on a multi-job contact with no value match says nothing about');
+  console.log('which job it tracked. Guessing would put a wrong job id on the record permanently.');
+  for (const id of ambiguousIds) console.log(`  ${id}`);
+
+  return { ...stats, ambiguousIds };
+}
+
+// ─── main ────────────────────────────────────────────────────────────
+async function main() {
+  console.log('─'.repeat(74));
+  console.log(`P2 OPPORTUNITY LP JOB ID BACKFILL   [${opt.execute ? 'LIVE — WRITES TO GHL' : 'DRY RUN'}]`);
+  if (opt.execute) console.log(`rollback log → ${LOG_PATH}`);
+  console.log('─'.repeat(74));
+
+  const stats = await run();
+
+  if (stats.failed > 0) {
+    console.error(`\n  FAIL: ${stats.failed} opportunit(ies) errored. Re-run to retry — stamped rows are skipped.`);
+    process.exitCode = 1;
+  } else {
+    console.log('\n  PASS: no write errors');
+  }
+
+  console.log(opt.execute
+    ? `\nDone. Rollback log: ${LOG_PATH}`
+    : '\nDRY RUN, nothing written. Re-run with --execute to write.');
+}
+
+// Importing this module for its pure helpers must not start a run.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((err) => { console.error('Fatal:', err.message); process.exit(1); });
+}

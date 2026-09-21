@@ -11,8 +11,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { decidingJob, sourceForJob, terminalGuardMode } from '../src/p2-opportunity-context.js';
+import {
+  decidingJob, sourceForJob, terminalGuardMode,
+  readOppJobId, resolveTrackedJob, OPP_CF_LP_JOB_ID,
+} from '../src/p2-opportunity-context.js';
 import { p2SourceRepair } from './backfill-p2-opportunity-source.js';
+import { jobIdMatch } from './backfill-p2-opportunity-job-id.js';
 
 // ─── fixtures ────────────────────────────────────────────────────────
 const job = (lp_job_id, job_status, lp_lead_id, job_value = '15000') =>
@@ -171,4 +175,144 @@ test('no LP source means nothing is written, whatever the opp currently says', (
     p2SourceRepair({ ...repair(), current: 'Internet', target: null }),
     { write: false, reason: 'no_lp_source' },
   );
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// v5.5 — the opportunity records WHICH LP job it tracks
+// ═══════════════════════════════════════════════════════════════════
+
+const CANCELLED = 'Cancelled';
+const LIVE = 'Awaiting Product';
+const WON = 'Paid In Full';
+
+// ─── readOppJobId ────────────────────────────────────────────────────
+
+test('readOppJobId reads fieldValueString, the shape GHL actually returns', () => {
+  const opp = { customFields: [{ id: OPP_CF_LP_JOB_ID, type: 'string', fieldValueString: '58862' }] };
+  assert.equal(readOppJobId(opp), '58862');
+});
+
+test('readOppJobId ignores other custom fields on the same opportunity', () => {
+  const opp = { customFields: [
+    { id: 'someOtherFieldId00', type: 'string', fieldValueString: 'No' },
+    { id: OPP_CF_LP_JOB_ID, type: 'string', fieldValueString: '54595' },
+  ] };
+  assert.equal(readOppJobId(opp), '54595');
+});
+
+test('an absent, blank or whitespace LP Job ID reads as null, never as ""', () => {
+  assert.equal(readOppJobId({ customFields: [] }), null, 'empty array');
+  assert.equal(readOppJobId({}), null, 'no customFields at all');
+  assert.equal(readOppJobId(null), null, 'no opp');
+  assert.equal(readOppJobId({ customFields: [{ id: OPP_CF_LP_JOB_ID, fieldValueString: '' }] }), null, 'blank');
+  assert.equal(readOppJobId({ customFields: [{ id: OPP_CF_LP_JOB_ID, fieldValueString: '   ' }] }), null, 'spaces');
+});
+
+// ─── resolveTrackedJob ───────────────────────────────────────────────
+
+test('a STAMPED job wins over a newer live job — that is the whole point', () => {
+  const jobs = [job(40001, WON, 700), job(58862, LIVE, 900)];
+  const r = resolveTrackedJob({ jobs, stampedJobId: '40001' });
+  assert.equal(r.job.lp_job_id, 40001);
+  assert.equal(r.via, 'stamped');
+  assert.equal(r.verdict, 'terminal_won');
+});
+
+test("an unstamped opp follows the EVENT's job when that job is live", () => {
+  const jobs = [job(40001, LIVE, 700), job(58862, LIVE, 900)];
+  const r = resolveTrackedJob({ jobs, eventJobId: '40001' });
+  assert.equal(r.job.lp_job_id, 40001);
+  assert.equal(r.via, 'event');
+  assert.equal(r.otherJob, false);
+});
+
+test("a TERMINAL event job that is not the latest flags otherJob and does not take over", () => {
+  const jobs = [job(40001, CANCELLED, 700), job(58862, LIVE, 900)];
+  const r = resolveTrackedJob({ jobs, eventJobId: '40001' });
+  assert.equal(r.job.lp_job_id, 58862, 'the live job is still the tracked one');
+  assert.equal(r.via, 'latest');
+  assert.equal(r.otherJob, true, 'an old job replaying a milestone at a different opportunity');
+  assert.equal(r.eventJob.lp_job_id, 40001);
+});
+
+test('a terminal event job that IS the tracked one is not "another job"', () => {
+  const jobs = [job(58862, WON, 900)];
+  const r = resolveTrackedJob({ jobs, eventJobId: '58862' });
+  assert.equal(r.job.lp_job_id, 58862);
+  assert.equal(r.otherJob, false);
+  assert.equal(r.verdict, 'terminal_won');
+});
+
+test('a stamped id naming a job we did not read falls through, never refuses', () => {
+  const jobs = [job(58862, LIVE, 900)];
+  const r = resolveTrackedJob({ jobs, stampedJobId: '99999' });
+  assert.equal(r.job.lp_job_id, 58862);
+  assert.equal(r.via, 'latest');
+});
+
+test('the stamp beats the event even when the event names a live job', () => {
+  const jobs = [job(40001, WON, 700), job(58862, LIVE, 900)];
+  const r = resolveTrackedJob({ jobs, stampedJobId: '40001', eventJobId: '58862' });
+  assert.equal(r.via, 'stamped');
+  assert.equal(r.job.lp_job_id, 40001);
+});
+
+test('no jobs at all yields a null job and no_job — never a guess', () => {
+  const r = resolveTrackedJob({ jobs: [], stampedJobId: '40001', eventJobId: '58862' });
+  assert.equal(r.job, null);
+  assert.equal(r.verdict, 'no_job');
+  assert.equal(r.otherJob, false);
+});
+
+test('ids compare across string and number without missing a match', () => {
+  const jobs = [job('58862', LIVE, 900)];
+  assert.equal(resolveTrackedJob({ jobs, stampedJobId: 58862 }).via, 'stamped');
+});
+
+// ─── jobIdMatch ──────────────────────────────────────────────────────
+
+test('one job is one answer', () => {
+  const d = jobIdMatch({ status: 'open', monetaryValue: 15000, jobs: [job(58862, LIVE, 900)] });
+  assert.deepEqual(d, { write: true, jobId: '58862', how: 'only_job' });
+});
+
+test("the opp's value identifies its job to the cent", () => {
+  const jobs = [job(40001, WON, 700, '22500.00'), job(58862, LIVE, 900, '15333.00')];
+  const d = jobIdMatch({ status: 'won', monetaryValue: 15333, jobs });
+  assert.deepEqual(d, { write: true, jobId: '58862', how: 'value_match' });
+});
+
+test('an OPEN opp with no value match falls back to the deciding job', () => {
+  const jobs = [job(40001, WON, 700, '22500'), job(58862, LIVE, 900, '15333')];
+  const d = jobIdMatch({ status: 'open', monetaryValue: null, jobs });
+  assert.deepEqual(d, { write: true, jobId: '58862', how: 'deciding_job' });
+});
+
+test('a CLOSED opp with no value match is ambiguous, never guessed', () => {
+  const jobs = [job(40001, WON, 700, '22500'), job(58862, LIVE, 900, '15333')];
+  assert.deepEqual(
+    jobIdMatch({ status: 'won', monetaryValue: null, jobs }),
+    { write: false, reason: 'ambiguous_multi_job' },
+  );
+});
+
+test('two jobs sharing one value is ambiguous — a value match must be UNIQUE', () => {
+  const jobs = [job(40001, WON, 700, '15333'), job(58862, LIVE, 900, '15333')];
+  assert.deepEqual(
+    jobIdMatch({ status: 'won', monetaryValue: 15333, jobs }),
+    { write: false, reason: 'ambiguous_multi_job' },
+  );
+});
+
+test('a zero or missing value never matches a job', () => {
+  const jobs = [job(40001, WON, 700, '0'), job(58862, LIVE, 900, '15333')];
+  assert.deepEqual(
+    jobIdMatch({ status: 'lost', monetaryValue: 0, jobs }),
+    { write: false, reason: 'ambiguous_multi_job' },
+  );
+});
+
+test('no LP job at all is reported, not stamped', () => {
+  assert.deepEqual(jobIdMatch({ status: 'open', monetaryValue: 15000, jobs: [] }),
+    { write: false, reason: 'no_lp_job' });
 });

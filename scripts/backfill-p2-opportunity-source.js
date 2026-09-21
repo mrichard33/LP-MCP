@@ -59,7 +59,7 @@ import { ghlFetch } from '../src/actions/helpers.js';
 import { hlRunSQL, esc } from '../src/admin/hl-client.js';
 import { PIPELINE_IDS } from '../src/actions/constants.js';
 import { jobsForContact } from '../src/lp-job-value.js';
-import { decidingJob, sourceForJob } from '../src/p2-opportunity-context.js';
+import { resolveTrackedJob, sourceForJob, readOppJobId } from '../src/p2-opportunity-context.js';
 import { combinedSourceLabel } from '../src/format-helpers.js';
 import { BACKSTOP_SENTINEL } from '../src/lp-source-attribution.js';
 
@@ -123,7 +123,7 @@ function logRollback(entry) {
 async function fetchP2Opportunities() {
   const idFilter = opt.opportunityId ? `AND ghl_opportunity_id = '${esc(opt.opportunityId)}'` : '';
   const rows = await hlRunSQL(`
-    SELECT ghl_opportunity_id, ghl_contact_id, status, source AS current_source, synced_at
+    SELECT ghl_opportunity_id, ghl_contact_id, status, source AS current_source, custom_fields, synced_at
       FROM opportunities
      WHERE ghl_pipeline_id = '${esc(P2_PIPELINE_ID)}'
        AND ghl_contact_id IS NOT NULL
@@ -182,9 +182,25 @@ async function run() {
       continue;
     }
 
-    const { job } = decidingJob(jobs);
+    // Prefer the job the opportunity SAYS it tracks. The mirror's copy of the
+    // custom field lags GHL by up to one sync, so for a MULTI-JOB contact — the
+    // only case where the stamped id changes the answer — confirm it live before
+    // deciding. Single-job contacts need no extra call: every path agrees.
+    let stampedJobId = readOppJobId({ customFields: o.custom_fields });
+    if (jobs.length > 1) {
+      try {
+        const res = await ghlFetch('GET', `/opportunities/${o.ghl_opportunity_id}`);
+        stampedJobId = readOppJobId(res?.opportunity || res) ?? stampedJobId;
+      } catch (err) {
+        console.warn(`  live read failed for ${o.ghl_opportunity_id} (${err.message}) — using the mirror's stamp`);
+      }
+    }
+
+    const { job } = resolveTrackedJob({ jobs, stampedJobId });
     const target = sourceForJob(job, leads);
-    const distinctLabels = new Set((leads || [])
+    // With a job actually stamped on the opp, there is no ambiguity left to
+    // report: the opp itself named the job, so its lead names the source.
+    const distinctLabels = (stampedJobId && job) ? 1 : new Set((leads || [])
       .map((l) => combinedSourceLabel(l.lead_source, l.lead_source_detail))
       .filter(Boolean)).size;
 

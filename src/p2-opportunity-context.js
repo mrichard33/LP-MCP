@@ -11,7 +11,7 @@
  * FAIL OPEN is the binding rule. Unreadable jobs or no job at all means CREATE,
  * exactly as before — absence of evidence never blocks a live customer.
  */
-import { latestJob, jobsForContact } from './lp-job-value.js';
+import { latestJob, latestJobValue, jobsForContact } from './lp-job-value.js';
 import { combinedSourceLabel } from './format-helpers.js';
 import { WON_JOB_STATUSES, LOST_JOB_STATUSES } from './lp-job-terminal.js';
 
@@ -27,6 +27,66 @@ const jobIdOf = (job) => {
   const n = Number(String(job?.lp_job_id ?? '').trim());
   return Number.isFinite(n) ? n : -Infinity;
 };
+
+/** GHL Opportunity custom field "LP Job ID" (opportunity.lp_job_id), created 2026-09-21. */
+export const OPP_CF_LP_JOB_ID = 'sMZfcWAdoqh88pghLsNQ';
+
+/** Pure. The LP job id stamped on an opportunity as GHL returns it, or null. */
+export function readOppJobId(opp) {
+  const cf = (opp?.customFields || []).find((f) => f?.id === OPP_CF_LP_JOB_ID);
+  const v = cf?.fieldValueString ?? cf?.fieldValue ?? cf?.field_value ?? cf?.value ?? null;
+  const s = v == null ? '' : String(v).trim();
+  return s === '' ? null : s;
+}
+
+const isTerminalStatus = (status) => WON_JOB_STATUSES.has(trimmed(status)) || LOST_JOB_STATUSES.has(trimmed(status));
+const verdictFor = (job) => {
+  if (!job) return 'no_job';
+  const s = trimmed(job.job_status);
+  if (WON_JOB_STATUSES.has(s)) return 'terminal_won';
+  if (LOST_JOB_STATUSES.has(s)) return 'terminal_lost';
+  return 'live';
+};
+
+/**
+ * Pure. Which ONE job does this opportunity track?
+ *   1. the job already stamped on the opp        (via 'stamped')
+ *   2. the event's job, if it is not terminal    (via 'event')
+ *   3. decidingJob() — newest live, else newest  (via 'latest')
+ *   4. the event's job                           (via 'event')
+ * `otherJob` is true when the event speaks for a TERMINAL job that is not the
+ * tracked one — an old job's replayed milestone reaching a different opportunity.
+ */
+export function resolveTrackedJob({ jobs = [], stampedJobId = null, eventJobId = null } = {}) {
+  const rows = (jobs || []).filter(Boolean);
+  const find = (id) => (id == null ? null : rows.find((j) => String(j.lp_job_id) === String(id)) || null);
+  const stamped = find(stampedJobId);
+  const ev = find(eventJobId);
+  const latest = decidingJob(rows).job;
+  let job = null; let via = 'none';
+  if (stamped) { job = stamped; via = 'stamped'; }
+  else if (ev && !isTerminalStatus(ev.job_status)) { job = ev; via = 'event'; }
+  else if (latest) { job = latest; via = 'latest'; }
+  else if (ev) { job = ev; via = 'event'; }
+  const otherJob = Boolean(ev && job && String(ev.lp_job_id) !== String(job.lp_job_id) && isTerminalStatus(ev.job_status));
+  return { job, via, verdict: verdictFor(job), otherJob, eventJob: ev };
+}
+
+/** The LP job id on the event that queued this action, or null. Never throws. */
+export async function eventJobIdForAction(action) {
+  if (!action?.event_id) return null;
+  try {
+    const { default: supabase } = await import('./supabase.js');
+    const { data, error } = await supabase.from('system_events')
+      .select('payload').eq('id', action.event_id).maybeSingle();
+    if (error || !data) return null;
+    const id = data.payload?.job_id ?? data.payload?.lp_job_id ?? null;
+    return id == null || String(id).trim() === '' ? null : String(id).trim();
+  } catch (err) {
+    console.warn(`[P2Context] event read failed for action ${action?.id}: ${err.message}`);
+    return null;
+  }
+}
 
 /** Pure. Same order as stageDecision() in scripts/reconcile-p2-stages.js. */
 export function decidingJob(jobs = []) {
@@ -56,15 +116,18 @@ export function sourceForJob(job, leads = []) {
   return labels.size === 1 ? [...labels][0] : null;
 }
 
-export async function loadP2CreateContext(contactId) {
+export async function loadP2CreateContext(contactId, { stampedJobId = null, eventJobId = null } = {}) {
   const { jobs, leads, error } = await jobsForContact(contactId);
   if (error) {
     console.warn(`[P2Context] unreadable for ${contactId}: ${error} — failing open`);
-    return { terminal: false, verdict: 'unreadable', job: null, source: null };
+    return { terminal: false, verdict: 'unreadable', job: null, source: null, value: null, via: 'none', otherJob: false };
   }
-  const { job, verdict } = decidingJob(jobs);
+  const { job, via, verdict, otherJob, eventJob } = resolveTrackedJob({ jobs, stampedJobId, eventJobId });
   return {
     terminal: verdict === 'terminal_won' || verdict === 'terminal_lost',
-    verdict, job, source: sourceForJob(job, leads),
+    verdict, job, via, otherJob, eventJob,
+    source: sourceForJob(job, leads),
+    // ONE job's value, by the same rules as everywhere else: a cancelled job → null → key omitted.
+    value: job ? latestJobValue([job]) : null,
   };
 }
