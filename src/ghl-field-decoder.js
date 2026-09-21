@@ -234,7 +234,13 @@ const GHL_FIELD_DECODER = {
   // ─── DQ / GATE OUTCOMES ────────────────────────────────────────
   'JGGG47GLbo6bu7cnmPWm': { name: 'Loss Reason Category',    category: 'dq', notes: 'Inferred from Jeanne live data — "Price", "OutOfArea", etc.' },
   'SB3GnioJxR8OgRiqLmF3': { name: 'Booked Flag (boolean)',   category: 'dq', notes: 'Inferred from Jeanne — true/false flag.' },
-  'z0MV6mXi0w9WwdCOFThh': { name: 'DQ Code',                 category: 'dq', notes: 'Inferred from Jeanne — OUT_OF_AREA, etc.' },
+
+  // Was mislabelled 'DQ Code' (category dq) until 2026-09-21, which sent
+  // anyone decoding a contact looking for a market in the wrong section. Four
+  // modules read this field as the LP branch code: actions/enrichment.js,
+  // canvassing-lead-handler.js, actions/handlers/rescission.js and
+  // services/agentic-lead-notes.js.
+  'z0MV6mXi0w9WwdCOFThh': { name: 'LP Market Code (brn_id)', category: 'identity', notes: 'LP branch code — FTMYR, LAKE, STPET, … Written by /n8n/enrich-lead; read for Slack market routing.' },
 
   // ─── CANVASSING ────────────────────────────────────────────────
   '57gPw256Sw4GsoPpANQr': { name: 'Canvasser Name',          category: 'canvassing' },

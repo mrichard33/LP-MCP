@@ -14,8 +14,8 @@
  *   main    → SLACK_CHANNEL_MAIN     (#lead-intelligence)
  *   canvass → market channel from slack_channels (when opts.market is given)
  *             PLUS SLACK_CHANNEL_CANVASS (#canvass-all)
- *   sales   → market channel from slack_channels (when opts.market is given)
- *             PLUS SLACK_CHANNEL_SALES (#sales-all)
+ *   sales   → market channel from slack_channels ALONE when one resolves;
+ *             SLACK_CHANNEL_SALES (#sales-all) only as the fallback
  *   ops     → SLACK_CHANNEL_OPS      (#ops-alerts)
  *   unknown → main (mirrors _resolveBotId's fallback exactly)
  *
@@ -42,9 +42,18 @@ const MARKET_ALIASES = { BOCA: 'FTLAU', MIAMI: 'FTLAU' };
 // Logical channel -> the slack_channels name prefix its market channels use,
 // and the env var holding its all-markets rollup. Adding a market-scoped
 // channel family is a row here, not a new branch below.
+//
+// alsoRollup (2026-09-21) — do market cards ALSO go to the all-markets feed?
+//   canvass: yes. The market team needs it and leadership watches one feed
+//            instead of seven. Unchanged.
+//   sales:   NO. A customer issue belongs to one market's floor. In practice
+//            #sales-all had become the only place any of them landed, because
+//            a poisoned market value resolved no channel and every card fell
+//            back to the rollup, so nobody read the market channels at all.
+// The divergence is deliberate; do not "tidy" it back into one rule.
 const MARKET_FAMILIES = {
-  canvass: { prefix: 'canvass', rollup: () => CH_CANVASS },
-  sales: { prefix: 'sales', rollup: () => CH_SALES },
+  canvass: { prefix: 'canvass', rollup: () => CH_CANVASS, alsoRollup: true },
+  sales: { prefix: 'sales', rollup: () => CH_SALES, alsoRollup: false },
 };
 
 const CACHE_TTL_MS = 10 * 60 * 1000;
@@ -104,10 +113,13 @@ async function _loadCache() {
 /**
  * Which Slack channel ids does this card go to?
  *
- * A market-scoped card (canvass or sales) with a market goes to BOTH that
- * market's channel and the all-markets rollup — the market team needs it, and
- * leadership watches one feed instead of seven. With no market, or a market
- * that has no channel, it still reaches the rollup rather than vanishing.
+ * A CANVASS card with a market goes to BOTH that market's channel and the
+ * all-markets rollup — the market team needs it, and leadership watches one
+ * feed instead of seven.
+ *
+ * A SALES card with a resolvable market goes to that market's channel ONLY
+ * (2026-09-21, alsoRollup: false above). With no market, or a market that has
+ * no channel, EITHER family still reaches its rollup rather than vanishing.
  *
  * @returns {Promise<string[]>} zero or more channel ids
  */
@@ -124,6 +136,12 @@ export async function resolveSlackChannels(channel, opts = {}) {
       if (id) out.push(id);
       else console.warn(`[Slack] no ${family.prefix} channel for market=${opts.market} — rollup only`);
     }
+    // A family that does not rollup keeps ONLY its market channel — but only
+    // once one actually resolved. With no market, or a market with no channel,
+    // the rollup is still the destination: a card must never have nowhere to
+    // go, and the mirror is fail-silent, so a dropped card looks like a quiet
+    // night rather than an error.
+    if (out.length && family.alsoRollup === false) return out;
     const rollup = family.rollup();
     if (rollup && !out.includes(rollup)) out.push(rollup);
     return out;

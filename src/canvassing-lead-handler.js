@@ -52,7 +52,7 @@ import {
 import { flattenWebhookBody, webhookShapeFingerprint } from './webhook-body.js';
 import { buildLeadNoteLines } from './services/lead-note-lines.js';
 import { resolveCanvasserProId } from './services/canvasser-roster.js';
-import { resolveMarket } from './actions/enrichment.js';
+import { resolveMarket, toKnownMarketCode } from './actions/enrichment.js';
 import { checkServiceAreaZip } from './services/identity-extraction.js';
 
 // GHL custom field carrying the LP branch/market code (STPET, FTMYR, …) — the
@@ -509,6 +509,7 @@ const DEFAULT_DEPS = {
   resolveCanvasserProId,
   checkServiceAreaZip,
   resolveMarket,
+  toKnownMarketCode,
   now: () => new Date(),
 };
 
@@ -571,7 +572,11 @@ export async function processCanvassingLead(payload, deps = {}) {
     // over a lookup.
     let marketCode = null;
     try {
-      marketCode = p.market_code || null;
+      // 2026-09-21: VALIDATED, not trusted. This is the same GHL field that
+      // carried "LAKE, FTMYR" — every branch a prospect had ever been in,
+      // joined — and an unrecognised value resolves no Slack channel. Treating
+      // it as unset lets the zip below produce the real market.
+      marketCode = await d.toKnownMarketCode(p.market_code);
       if (!marketCode) {
         const area = await d.checkServiceAreaZip(p.zip);
         marketCode = area?.market_code ? String(area.market_code).toUpperCase() : null;

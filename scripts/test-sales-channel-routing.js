@@ -19,6 +19,7 @@ const CH_CANVASS_ALL = 'C_CANVASS_ALL';
 const CH_SALES_ALL = 'C_SALES_ALL';
 const CH_SALES_FTMYR = 'C_SALES_FTMYR';
 const CH_SALES_FTLAU = 'C_SALES_FTLAU';
+const CH_CANVASS_FTMYR = 'C_CANVASS_FTMYR';
 const CH_OPS = 'C_OPS';
 
 const posts = [];
@@ -38,6 +39,7 @@ const stubDb = {
             { channel_name: 'sales-fortmyers', slack_channel_id: CH_SALES_FTMYR },
             { channel_name: 'sales-fortlauderdale', slack_channel_id: CH_SALES_FTLAU },
             { channel_name: 'canvass-all', slack_channel_id: CH_CANVASS_ALL },
+            { channel_name: 'canvass-fortmyers', slack_channel_id: CH_CANVASS_FTMYR },
           ] };
         }
         if (table === 'slack_market_slugs') {
@@ -75,15 +77,19 @@ function reset() {
 
 // ─── the sales channel family ───────────────────────────────────
 
-test('sales + a known market → that market channel AND the rollup', async () => {
+// 2026-09-21 — sales no longer ALSO posts to #sales-all. The rollup was
+// removed on purpose (slack.js MARKET_FAMILIES.alsoRollup); a customer issue
+// belongs to one market's floor. Do not "restore" it as a regression: the two
+// tests below it, where nothing resolves, are what keep a card from vanishing.
+test('sales + a known market → that market channel ONLY', async () => {
   reset();
   const ids = await slack.resolveSlackChannels('sales', { market: 'FTMYR' });
-  assert.deepEqual(ids, [CH_SALES_FTMYR, CH_SALES_ALL]);
+  assert.deepEqual(ids, [CH_SALES_FTMYR]);
 });
 
 test('sales market code is case-insensitive', async () => {
   reset();
-  assert.deepEqual(await slack.resolveSlackChannels('sales', { market: 'ftmyr' }), [CH_SALES_FTMYR, CH_SALES_ALL]);
+  assert.deepEqual(await slack.resolveSlackChannels('sales', { market: 'ftmyr' }), [CH_SALES_FTMYR]);
 });
 
 test('sales with no market → rollup only, no warning', async () => {
@@ -101,23 +107,32 @@ test('a market with a slug but no sales channel → rollup only, warns once', as
 
 test('BOCA and MIAMI alias to Fort Lauderdale on the sales channel too', async () => {
   reset();
-  assert.deepEqual(await slack.resolveSlackChannels('sales', { market: 'BOCA' }), [CH_SALES_FTLAU, CH_SALES_ALL]);
-  assert.deepEqual(await slack.resolveSlackChannels('sales', { market: 'MIAMI' }), [CH_SALES_FTLAU, CH_SALES_ALL]);
+  assert.deepEqual(await slack.resolveSlackChannels('sales', { market: 'BOCA' }), [CH_SALES_FTLAU]);
+  assert.deepEqual(await slack.resolveSlackChannels('sales', { market: 'MIAMI' }), [CH_SALES_FTLAU]);
+});
+
+test('sales routes to the market channel ONLY; canvass still posts to both', async () => {
+  // The load-bearing assertion of the 2026-09-21 change: the two families
+  // deliberately differ, driven by MARKET_FAMILIES.alsoRollup. Asserting the
+  // pair together is what stops someone collapsing them back into one rule.
+  reset();
+  assert.deepEqual(await slack.resolveSlackChannels('sales', { market: 'FTMYR' }), [CH_SALES_FTMYR]);
+  assert.deepEqual(await slack.resolveSlackChannels('canvass', { market: 'FTMYR' }), [CH_CANVASS_FTMYR, CH_CANVASS_ALL]);
 });
 
 test('adding sales did not disturb canvass, ops or main', async () => {
   reset();
-  assert.deepEqual(await slack.resolveSlackChannels('canvass', { market: 'FTMYR' }), [CH_CANVASS_ALL]);
+  assert.deepEqual(await slack.resolveSlackChannels('canvass', { market: 'FTMYR' }), [CH_CANVASS_FTMYR, CH_CANVASS_ALL]);
   assert.deepEqual(await slack.resolveSlackChannels('ops', {}), [CH_OPS]);
   assert.deepEqual(await slack.resolveSlackChannels('main', {}), [CH_MAIN]);
   assert.deepEqual(await slack.resolveSlackChannels(undefined, {}), [CH_MAIN]);
 });
 
-test('a sales card actually posts to both channels', async () => {
+test('a sales card actually posts to the one market channel', async () => {
   reset();
   const r = await slack.mirrorToSlack('rep never sent the quote', 'sales', { market: 'FTMYR' });
-  assert.deepEqual(r, { mirrored: true, channels: 2, sent: 2 });
-  assert.deepEqual(posts.map((p) => p.channel), [CH_SALES_FTMYR, CH_SALES_ALL]);
+  assert.deepEqual(r, { mirrored: true, channels: 1, sent: 1 });
+  assert.deepEqual(posts.map((p) => p.channel), [CH_SALES_FTMYR]);
   assert.equal(posts[0].text, 'rep never sent the quote');
 });
 
