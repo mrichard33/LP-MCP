@@ -147,7 +147,7 @@ export function vendorFromApBody(body) {
  * returning nothing a caller could act on.
  */
 export async function resolveApContact(body, { mode = intakeMode(), deps, log } = {}) {
-  if (mode === 'off') return { contactId: null, wouldStamp: null, outcome: 'skipped', resolveMs: 0 };
+  if (mode === 'off') return { contactId: null, wouldStamp: null, outcome: 'skipped', resolveMs: 0, mirrorMs: null };
 
   const vendor = vendorFromApBody(body);
   const t0 = Date.now();
@@ -175,19 +175,22 @@ export async function resolveApContact(body, { mode = intakeMode(), deps, log } 
     );
     const resolveMs = Date.now() - t0;
     // The ceiling won. Answer without an id rather than hang.
-    if (result === null) return { contactId: null, wouldStamp: null, outcome: 'timeout', resolveMs };
+    if (result === null) return { contactId: null, wouldStamp: null, outcome: 'timeout', resolveMs, mirrorMs: null };
     return {
       contactId: mode === 'live' ? (result.contactId || null) : null,
       wouldStamp: result.contactId || null,
       outcome: result.outcome,
       resolveMs,
+      // How much of resolveMs was the mirror query. See the note in
+      // services/ghl-contact-resolve.js — the two have opposite fixes.
+      mirrorMs: result.mirrorMs ?? null,
     };
   } catch (err) {
     const resolveMs = Date.now() - t0;
     // Fail open by contract: a GHL problem must not stop a lead reaching the
     // sales floor.
     console.warn(`[AP-INTAKE] resolve failed (${resolveMs}ms), continuing without id: ${err.message}`);
-    return { contactId: null, wouldStamp: null, outcome: 'error', resolveMs };
+    return { contactId: null, wouldStamp: null, outcome: 'error', resolveMs, mirrorMs: null };
   }
 }
 
@@ -239,7 +242,7 @@ export function registerApIntakeRoutes(app) {
       // lp_source_mapping.lp_source_subdetail) is how shadow answers whether the
       // two agree before anything depends on them agreeing.
       `[AP-RESOLVE] vendor=${vendor || '?'} srs=${pick(body, 'srs_id', 'srsid', 'SRS_id') || '?'} `
-      + `mode=${mode} resolve=${r.outcome}/${r.resolveMs}ms `
+      + `mode=${mode} resolve=${r.outcome}/${r.resolveMs}ms mirror=${r.mirrorMs ?? '-'}ms `
       + `${r.contactId ? `returned=${r.contactId}` : `returned=no${r.wouldStamp ? ` would=${r.wouldStamp}` : ''}`} `
       + `total=${Date.now() - started}ms`
     );
