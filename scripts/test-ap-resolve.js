@@ -161,33 +161,58 @@ test('a slow GHL is capped, and the cap reads as timeout not as a match', async 
 
 // ─── Learning AP's real timeout ─────────────────────────────────────────────
 
-test('a client that hangs up before we answer is logged', () => {
-  // LeadConduit exposes no delivery timeout setting and publishes none, so this
-  // line is the only evidence of what AP's real ceiling is.
-  const handlers = {};
-  const req = { on: (ev, fn) => { handlers[ev] = fn; } };
-  const res = { writableEnded: false };
+/** Express-ish req/res pair whose `close` handler the test fires by hand. */
+function reqRes({ writableFinished }) {
+  const reqHandlers = {};
+  const resHandlers = {};
+  return {
+    req: { on: (ev, fn) => { reqHandlers[ev] = fn; } },
+    res: { writableFinished, on: (ev, fn) => { resHandlers[ev] = fn; } },
+    fireReqClose: () => reqHandlers.close?.(),
+    fireResClose: () => resHandlers.close?.(),
+  };
+}
+
+function captureWarnings(fn) {
   const lines = [];
   const prevWarn = console.warn;
   console.warn = (m) => lines.push(m);
-  try {
-    logClientDisconnect(req, res, Date.now() - 4200, 'AP-RESOLVE');
-    handlers.close();
-  } finally { console.warn = prevWarn; }
+  try { fn(); } finally { console.warn = prevWarn; }
+  return lines;
+}
+
+test('a client that hangs up before we answer is logged', () => {
+  // LeadConduit exposes no delivery timeout setting and publishes none, so this
+  // line is the only evidence of what AP's real ceiling is.
+  const h = reqRes({ writableFinished: false });
+  const lines = captureWarnings(() => {
+    logClientDisconnect(h.req, h.res, Date.now() - 4200, 'AP-RESOLVE');
+    h.fireResClose();
+  });
   assert.equal(lines.length, 1);
   assert.match(lines[0], /^\[AP-RESOLVE\] client disconnected after \d+ms/);
 });
 
-test('a normal close after we answered logs nothing', () => {
-  const handlers = {};
-  const req = { on: (ev, fn) => { handlers[ev] = fn; } };
-  const res = { writableEnded: true };
-  const lines = [];
-  const prevWarn = console.warn;
-  console.warn = (m) => lines.push(m);
-  try {
-    logClientDisconnect(req, res, Date.now(), 'AP-RESOLVE');
-    handlers.close();
-  } finally { console.warn = prevWarn; }
+test('a fully-sent response logs nothing', () => {
+  const h = reqRes({ writableFinished: true });
+  const lines = captureWarnings(() => {
+    logClientDisconnect(h.req, h.res, Date.now(), 'AP-RESOLVE');
+    h.fireResClose();
+  });
   assert.equal(lines.length, 0, 'every successful lead would otherwise log a false alarm');
+});
+
+test('it listens on the RESPONSE, never the request', () => {
+  // Regression, seen in production on the very first four probes: the first cut
+  // used req.on('close'), which fires as soon as the request BODY has been read
+  // — on every healthy request, before the handler has answered. It logged
+  // `ActiveProspect gave up` at severity error for all four successful probes.
+  // An alarm that fires on the healthy case gets muted, and this alarm is the
+  // only measurement of AP's real timeout we can ever take.
+  const h = reqRes({ writableFinished: false });
+  const lines = captureWarnings(() => {
+    logClientDisconnect(h.req, h.res, Date.now(), 'AP-RESOLVE');
+    h.fireReqClose();   // the event the broken version listened for
+  });
+  assert.equal(lines.length, 0, 'a request-stream close is not a disconnect');
 });
