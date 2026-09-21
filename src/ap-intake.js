@@ -163,6 +163,11 @@ export async function resolveApContact(body, { mode = intakeMode(), deps, log } 
         // endpoint out at 1200ms on 2026-09-21 while the search itself measured
         // 101-270ms. See services/ghl-contact-mirror.js.
         mirrorFirst: true,
+        // Synchronous lead intake: ActiveProspect is on the line, and LP takes
+        // `lognumber` at AddLead and never again, so an id we fail to get here
+        // is not late — it is gone. This draws below the rate limiter's reserve
+        // and ahead of every batch waiter (src/ghl-rate-limiter.js v1.5).
+        priority: 'high',
         ...(deps ? { deps } : {}),
         ...(log ? { log } : {}),
       }),
