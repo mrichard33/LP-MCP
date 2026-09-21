@@ -208,6 +208,29 @@ test('an absent, blank or whitespace LP Job ID reads as null, never as ""', () =
   assert.equal(readOppJobId({ customFields: [{ id: OPP_CF_LP_JOB_ID, fieldValueString: '   ' }] }), null, 'spaces');
 });
 
+test('an OBJECT-shaped custom_fields reads as null instead of throwing', () => {
+  // Regression, 2026-09-21. The HL mirror's opportunities.custom_fields column
+  // defaults to '{}'::jsonb, so a row the opportunity sync has not written
+  // custom fields for arrives as an OBJECT, not an array — 253 such rows in P2.
+  // The original guard was `(opp?.customFields || []).find(...)`, and {} is
+  // truthy, so the fallback never fired and .find threw. That took
+  // scripts/backfill-p2-opportunity-job-id.js down on its first object-shaped
+  // row, before it scanned a single opportunity. The suite missed it because
+  // every case above passes an array or omits the key.
+  assert.equal(readOppJobId({ customFields: {} }), null, 'the mirror default');
+  assert.equal(readOppJobId({ customFields: { someKey: 'someValue' } }), null, 'a populated object');
+});
+
+test('readOppJobId never throws on any shape the two sources can produce', () => {
+  // GHL returns an array or omits the key; the mirror can return either shape.
+  // Nothing here should be an error — absence of a stamp is a null, not a fault,
+  // and a scan over thousands of rows must not die on one odd row.
+  for (const shape of [{}, [], null, undefined, 0, '', 'string', 42, true, [null], [{}]]) {
+    assert.doesNotThrow(() => readOppJobId({ customFields: shape }), `shape: ${JSON.stringify(shape)}`);
+    assert.equal(readOppJobId({ customFields: shape }), null, `shape: ${JSON.stringify(shape)}`);
+  }
+});
+
 // ─── resolveTrackedJob ───────────────────────────────────────────────
 
 test('a STAMPED job wins over a newer live job — that is the whole point', () => {
