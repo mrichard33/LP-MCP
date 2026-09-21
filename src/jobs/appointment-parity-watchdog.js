@@ -65,7 +65,7 @@
  *        human cancelled in one system; which system is authoritative is a
  *        judgement call, so a rep decides.
  *
- *   E. lp_cancelled_ghl_active — LP cancelled (CXL/NoHome/NG), GHL still
+ *   E. lp_cancelled_ghl_active — LP cancelled (CXL/CCC/NoHome/NG), GHL still
  *      holds an ACTIVE appointment. The mirror of D, and new in v1.2.
  *      → ESCALATE, never auto-heal. Writing the appointment back into LP
  *        would silently un-cancel something a human cancelled.
@@ -110,6 +110,42 @@
  *     against a moving now() manufactures phantom gaps for anything starting
  *     during the run. That artifact produced a 42-contact false gap in the
  *     2026-08-17 manual audit before it was caught.
+ *
+ * ---------------------------------------------------------------------
+ * v1.4 — 2026-09-21 — CCC IS A CANCELLATION AND WE WERE NOT READING IT AS ONE
+ *
+ * RESOLVED_DISPOSITIONS listed CXL / NoHome / NG and omitted CCC — Customer
+ * Called to Cancel. So readLpBook put every CCC row in the ACTIVE book, and the
+ * Class B/D loop compared it against GHL's cancelled row and called it
+ * cancellation_drift: "Cancelled in GHL, still set in LP".
+ *
+ * Both systems agreed. The customer called, the appointment was cancelled in LP
+ * AND in GHL, and the watchdog paged a rep about it anyway. The card is not a
+ * near-miss or a stale read — it is wrong on its face, which is the fastest way
+ * to get an ops channel muted, and a muted channel is how the 2026-08-02
+ * 47-hour outage stayed invisible.
+ *
+ * Measured 2026-09-21: of the 50 appt_parity:gap:cancellation_drift:* keys in
+ * alert_conditions, 33 are contacts currently sitting at CCC — two thirds of
+ * that alarm's entire standing history was false. 4,299 lp_leads rows carry the
+ * code, so this was never a rare shape.
+ *
+ * Worked example — Virginia Vargas, LP lead 577249 (contact 3uJGXPPwgvieYhcp9BE9),
+ * appointment 2026-09-21 14:00, disposition CCC, GHL appointment cancelled.
+ * Nothing about that contact needs a human.
+ *
+ * Fix: CCC joins RESOLVED_DISPOSITIONS. A CCC row now lands in the `resolved`
+ * book, which turns the two cases the right way round:
+ *   CCC + GHL cancelled  → both sides agree. No finding, no card. (Was Class D.)
+ *   CCC + GHL ACTIVE     → Class E, lp_cancelled_ghl_active. LP gave the slot
+ *                          up and GHL is still holding it — a rep is driving to
+ *                          a cancelled appointment, which is the case that
+ *                          actually warrants the page.
+ *
+ * The same reasoning that put CXL in the set in v1.2 applies unchanged; CCC was
+ * simply missed. Before adding a disposition here, confirm it means the
+ * appointment is RESOLVED and not merely re-dispositioned — a live code in this
+ * set silently deletes a whole class of real findings.
  *
  * ---------------------------------------------------------------------
  * v1.3 — 2026-09-14 — CLASS B WAS ALARMING ON THE RECONCILER'S OWN LAG
@@ -321,7 +357,11 @@ const PARITY_GHL_MISSING_MIN_AGE_MIN = Number(process.env.PARITY_GHL_MISSING_MIN
 const ACTIVE_GHL_STATUSES = ['new', 'confirmed'];
 
 // LP dispositions that mean the appointment is resolved, not pending.
-const RESOLVED_DISPOSITIONS = new Set(['CXL', 'NoHome', 'NG']);
+//   CXL     cancelled
+//   CCC     Customer Called to Cancel — added 2026-09-21, see v1.4 above
+//   NoHome  not home for the appointment
+//   NG      not given / no good
+const RESOLVED_DISPOSITIONS = new Set(['CXL', 'CCC', 'NoHome', 'NG']);
 
 // Operational DNC — liftable on a genuine opt-back-in.
 const OPERATIONAL_DNC_TAGS = ['dnc', 'dnc-related', 'stage:dnc', 'lp-dnc'];
@@ -360,7 +400,9 @@ async function readGhlBook(from, to) {
  *
  * Returns TWO maps as of v1.2:
  *   active   — appointments in a live disposition. The real LP book.
- *   resolved — appointments whose disposition is CXL / NoHome / NG.
+ *   resolved — appointments whose disposition is CXL / CCC / NoHome / NG.
+ *              CCC (Customer Called to Cancel) joined the set 2026-09-21; see
+ *              the v1.4 block above for what its absence cost.
  *
  * Before v1.2 the resolved rows were simply dropped, which made "LP cancelled
  * this appointment" indistinguishable from "LP never had this appointment".
