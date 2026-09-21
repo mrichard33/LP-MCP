@@ -138,17 +138,31 @@ export async function resolveOrCreateContact(input, {
   // enforced in findContactIdByPhone — ambiguity and unreadability both return
   // null, which falls through to exactly the behaviour below. The mirror can
   // save a round trip; it can never be the reason a contact is missed.
+  // 2026-09-21 — timed separately, and reported on every return below.
+  //
+  // Under real executor load the intake endpoint measured 26/37/54ms on three
+  // probes and 781/948/1093ms on three others, same phone, same path, every one
+  // a mirror HIT. A mirror hit spends no GHL token (highTimedOut and
+  // priorityQueueDepth were both 0 throughout), so that 20x swing is NOT the
+  // rate limiter — it is either the HL Supabase query or event-loop delay while
+  // the executor runs its handlers in this same process.
+  //
+  // One combined `resolveMs` cannot tell those apart, and they have opposite
+  // fixes. So the mirror call carries its own clock.
+  let mirrorMs;
   if (mirrorFirst) {
     // Through deps so a test can stub it; `?.` so a deps stub that predates
     // this tier simply skips it rather than throwing.
+    const t0 = Date.now();
     const mirrored = await deps.findContactIdByPhone?.(phone, { log });
-    if (mirrored) return { contactId: mirrored, outcome: 'found' };
+    mirrorMs = Date.now() - t0;
+    if (mirrored) return { contactId: mirrored, outcome: 'found', mirrorMs };
   }
 
   const match = await searchByPhone(phone, { deps, log, priority });
-  if (match?.id) return { contactId: match.id, outcome: 'found' };
+  if (match?.id) return { contactId: match.id, outcome: 'found', mirrorMs };
 
-  if (!create) return { contactId: null, outcome: 'none' };
+  if (!create) return { contactId: null, outcome: 'none', mirrorMs };
 
   const body = {
     locationId: GHL_LOCATION_ID,
@@ -171,13 +185,13 @@ export async function resolveOrCreateContact(input, {
     // only at AddLead, so an intake that fails open here loses the id for good.
     const cr = await deps.ghlFetch('POST', '/contacts/', body, priority ? { priority } : undefined);
     const contactId = cr?.contact?.id || cr?.id || null;
-    return { contactId, outcome: contactId ? 'created' : 'none' };
+    return { contactId, outcome: contactId ? 'created' : 'none', mirrorMs };
   } catch (err) {
     if (!isDuplicate400(err)) throw err;
     // GHL deduped server-side — another pipe created it between our search and
     // our create. Re-search and use theirs; ours was never written.
     const raced = await searchByPhone(phone, { deps, log, priority });
-    if (raced?.id) return { contactId: raced.id, outcome: 'found' };
+    if (raced?.id) return { contactId: raced.id, outcome: 'found', mirrorMs };
     throw err;
   }
 }

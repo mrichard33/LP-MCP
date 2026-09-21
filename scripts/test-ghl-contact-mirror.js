@@ -191,3 +191,48 @@ test('the duplicate-400 re-search asks GHL, not the mirror', async () => {
   assert.equal(r.outcome, 'found');
   assert.equal(r.contactId, ID_B, 'their contact stands; ours was never written');
 });
+
+// ─── Telling a slow mirror from a busy event loop ───────────────────────────
+
+test('the mirror call is timed separately from the whole resolve', async () => {
+  // Under executor load the endpoint measured 26/37/54ms on three probes and
+  // 781/948/1093ms on three others — same phone, same path, every one a mirror
+  // HIT. A hit spends no GHL token, so that swing is NOT the rate limiter: it
+  // is either the HL Supabase query or event-loop delay from the executor in
+  // this same process. Those have opposite fixes and one combined number cannot
+  // tell them apart, so the mirror carries its own clock.
+  const deps = {
+    ...ghl([]),
+    findContactIdByPhone: async () => {
+      await new Promise((r) => setTimeout(r, 60));
+      return ID_A;
+    },
+  };
+  const r = await resolveOrCreateContact({ phone: '8132633466' },
+    { create: true, mirrorFirst: true, deps, log: quiet });
+  assert.equal(r.contactId, ID_A);
+  assert.ok(r.mirrorMs >= 50, `mirror time was measured, saw ${r.mirrorMs}`);
+});
+
+test('a mirror MISS still reports its own cost', async () => {
+  // The slow case worth catching is a slow miss: it pays the mirror AND then
+  // the live search, so attributing the total matters most exactly here.
+  const deps = {
+    ...ghl([{ contacts: [] }]),
+    findContactIdByPhone: async () => {
+      await new Promise((r) => setTimeout(r, 40));
+      return null;
+    },
+  };
+  const r = await resolveOrCreateContact({ phone: '8132633466' },
+    { create: false, mirrorFirst: true, deps, log: quiet });
+  assert.equal(r.outcome, 'none');
+  assert.ok(r.mirrorMs >= 30, `a miss reports its cost too, saw ${r.mirrorMs}`);
+});
+
+test('without the mirror tier there is no mirror time to report', async () => {
+  const deps = ghl([{ contacts: [] }]);
+  const r = await resolveOrCreateContact({ phone: '8132633466' },
+    { create: false, deps, log: quiet });
+  assert.equal(r.mirrorMs, undefined, 'undefined, not a misleading 0');
+});
