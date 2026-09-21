@@ -32,6 +32,7 @@
 
 import supabase from './supabase.js';
 import { emitEvent } from './event-emitter.js';
+import { postSlackApprovalCard, slackApprovalsEnabled } from './slack.js';
 
 // ═══════════════════════════════════════════════════════════════════
 // CONSTANTS
@@ -120,6 +121,50 @@ function buildEscalationMessage(rule, actionGroup) {
 // ═══════════════════════════════════════════════════════════════════
 // SWEEP
 // ═══════════════════════════════════════════════════════════════════
+
+/**
+ * Give an escalated group a clickable ref. Reuses a pending
+ * groupme_approval_requests row covering any of these actions. Otherwise it
+ * claims one keyed on the lowest action id, the same short_ref convention
+ * sendApprovalRequest uses. Returns null when no usable pending row exists;
+ * the caller then skips the Slack card.
+ */
+async function ensureApprovalRef(group) {
+  const ids = group.actions.map((a) => a.id).sort((a, b) => a - b);
+  const { data: existing, error: findErr } = await supabase
+    .from('groupme_approval_requests')
+    .select('short_ref')
+    .eq('status', 'pending')
+    .overlaps('action_ids', ids)
+    .limit(1);
+  if (findErr) {
+    console.warn(`[ApprovalEscalation] ref lookup failed: ${findErr.message}`);
+    return null;
+  }
+  if (existing?.length) return existing[0].short_ref;
+
+  const shortRef = String(ids[0]);
+  const { error: insErr } = await supabase.from('groupme_approval_requests').insert({
+    short_ref: shortRef,
+    batch_id: `escalation_${shortRef}`,
+    action_ids: ids,
+    rule_applied: group.rule,
+    target_id: group.targetId,
+    status: 'pending',
+    requested_at: new Date().toISOString(),
+  });
+  if (!insErr) return shortRef;
+  if (insErr.code === '23505') {
+    const { data: row } = await supabase
+      .from('groupme_approval_requests')
+      .select('status')
+      .eq('short_ref', shortRef)
+      .maybeSingle();
+    return row?.status === 'pending' ? shortRef : null;
+  }
+  console.warn(`[ApprovalEscalation] ref claim failed: ${insErr.message}`);
+  return null;
+}
 
 export async function runApprovalEscalationSweep({ dryRun = false } = {}) {
   if (process.env.APPROVAL_ESCALATION_DISABLED === 'true') {
@@ -321,6 +366,20 @@ export async function runApprovalEscalationSweep({ dryRun = false } = {}) {
     const text = buildEscalationMessage(group.rule, group);
     const ok = await postGroupMe(text);
     if (!ok) { errors++; continue; }
+
+    // Slack button card. Best-effort: never fails or delays the sweep.
+    if (slackApprovalsEnabled()) {
+      try {
+        const ref = await ensureApprovalRef(group);
+        if (ref) {
+          const card = text.replace('Approve in dashboard or via LP MCP approve_action tool.', `Approve or reject below (ref #${ref}).`);
+          const r = await postSlackApprovalCard(card, ref);
+          if (!r?.ok) console.warn(`[ApprovalEscalation] Slack card #${ref} failed: ${r?.error}`);
+        }
+      } catch (err) {
+        console.warn(`[ApprovalEscalation] Slack card error (ignored): ${err.message}`);
+      }
+    }
 
     // Stamp _escalated_at on each action's payload so we don't re-ping.
     // Use a single bulk update keyed by action ids.
