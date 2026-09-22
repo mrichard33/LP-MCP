@@ -129,12 +129,65 @@ async function fetchUnstampedP2() {
     .filter((r) => readOppJobId({ customFields: r.custom_fields }) === null);
 }
 
-/** The mirror lags GHL by up to one sync. Writing from a badly stale read can clobber. */
-function assertMirrorFresh(rows) {
-  const stamps = rows.map((r) => Date.parse(r.synced_at)).filter(Number.isFinite);
-  if (!stamps.length) return;
-  const ageH = (Date.now() - Math.max(...stamps)) / 3_600_000;
-  console.log(`mirror freshness: newest sync ${ageH.toFixed(1)}h ago`);
+/**
+ * Pure. Hours since a sync timestamp, or null when there is nothing readable to
+ * measure. Exported so the arithmetic pins in a test without a database.
+ */
+export function mirrorAgeHours(newestSyncedAt, nowMs = Date.now()) {
+  const t = Date.parse(newestSyncedAt);
+  return Number.isFinite(t) ? (nowMs - t) / 3_600_000 : null;
+}
+
+/**
+ * Pure. The freshness probe, exported so a test can pin the one property that
+ * matters: it spans the WHOLE P2 pipeline and carries no --opportunity-id filter.
+ */
+export function mirrorFreshnessSQL() {
+  return `SELECT max(synced_at) AS newest
+            FROM opportunities
+           WHERE ghl_pipeline_id = '${esc(P2_PIPELINE_ID)}'
+             AND deleted_at IS NULL`;
+}
+
+/**
+ * Is the opportunity sync still running? A badly stale mirror means the
+ * candidate list itself is untrustworthy, so --execute refuses.
+ *
+ * 2026-09-22 — this asks the WHOLE P2 pipeline, and NOT the candidate rows. The
+ * difference is not cosmetic. `synced_at` records when a row last CHANGED, not
+ * when it was last checked, so measuring across the candidates made the guard
+ * mean "has this opportunity been edited lately" — a question about one record's
+ * history, not about whether the sync is alive. That refused every
+ * `--opportunity-id=` run on an untouched opportunity: the canary against
+ * l41hB2e8N6DZLiQ954KU read `265.2h stale` and exited 1 while the pipeline's
+ * newest sync was 0.17h old (2,896 P2 rows, 122 synced in the last 24h).
+ *
+ * Backwards in the one place it matters most. A long-untouched opportunity is
+ * the SAFEST row to stamp, and a single-row canary is exactly what you want to
+ * run before turning 2,488 permanent writes loose.
+ */
+async function assertMirrorFresh() {
+  let ageH = null;
+  try {
+    const rows = await hlRunSQL(mirrorFreshnessSQL());
+    ageH = mirrorAgeHours((Array.isArray(rows) ? rows[0] : null)?.newest);
+  } catch (err) {
+    console.error(`  mirror freshness probe failed: ${err.message}`);
+  }
+
+  if (ageH === null) {
+    // Could not tell. "I could not read it" is not evidence of freshness, so it
+    // must not license a write — the same three-way rule src/alert-state.js uses.
+    console.log('mirror freshness: UNKNOWN (no readable sync timestamp)');
+    if (opt.execute) {
+      console.error('\n  REFUSING TO WRITE: could not read the mirror\'s sync time.'
+        + '\n  Re-run once the HL mirror is reachable.');
+      process.exit(1);
+    }
+    return;
+  }
+
+  console.log(`mirror freshness: newest P2 opportunity sync ${ageH.toFixed(1)}h ago (whole pipeline)`);
   if (opt.execute && ageH > MAX_MIRROR_AGE_H) {
     console.error(`\n  REFUSING TO WRITE: mirror is ${ageH.toFixed(1)}h stale (limit ${MAX_MIRROR_AGE_H}h).`
       + '\n  Re-sync opportunities, then re-run.');
@@ -146,7 +199,7 @@ function assertMirrorFresh(rows) {
 async function run() {
   let candidates = await fetchUnstampedP2();
   console.log(`${candidates.length} P2 opportunities show no LP Job ID in the mirror (all statuses)`);
-  assertMirrorFresh(candidates);
+  await assertMirrorFresh();
   if (opt.limit) {
     candidates = candidates.slice(0, opt.limit);
     console.log(`  capped to ${candidates.length} by --limit`);
