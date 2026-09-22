@@ -154,13 +154,27 @@ const FIVE9_WRITE_OPS = {
 // pinned together by scripts/test-five9-approval-carveout.js.
 const EXEC_AUTO_APPROVED_FIVE9_OP = 'five9_add_records_to_list';
 
+// 2026-09-21 — the second carve-out, mirroring AUTO_APPROVED_FIVE9_DNC_OP in
+// src/tools/agent-tools.js. Same two-layer discipline: a literal, not an
+// import, so one edit cannot open both layers. Add-only and irreversible on
+// the Five9 side, so holding it behind approval delays a consumer's opt-out
+// rather than protecting them. Armed only while FIVE9_WRITES_ENABLED is set —
+// the flag check is duplicated here for the same belt-and-braces reason.
+const EXEC_AUTO_APPROVED_FIVE9_DNC_OP = 'five9_add_numbers_to_dnc';
+
+function execAutoApproved(actionType) {
+  if (actionType === EXEC_AUTO_APPROVED_FIVE9_OP) return true;
+  if (actionType !== EXEC_AUTO_APPROVED_FIVE9_DNC_OP) return false;
+  return String(process.env.FIVE9_WRITES_ENABLED || '').toLowerCase() === 'true';
+}
+
 export async function executeFive9Write(action) {
   const fn = FIVE9_WRITE_OPS[action.action_type];
   if (!fn) throw new Error(`five9 handler: unknown op ${action.action_type}`);
   // Belt-and-braces: a five9 write row must have entered through the
   // approve_action gate. requires_approval=false means someone bypassed it —
-  // except for the one carved-out op, which is queued unarmed by design.
-  if (action.requires_approval !== true && action.action_type !== EXEC_AUTO_APPROVED_FIVE9_OP) {
+  // except for the carved-out ops, which are queued unarmed by design.
+  if (action.requires_approval !== true && !execAutoApproved(action.action_type)) {
     throw new Error(`REFUSED: ${action.action_type} must be queued with requires_approval=true (approve_action gate)`);
   }
   return fn(action);

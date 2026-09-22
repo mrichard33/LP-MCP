@@ -45,6 +45,11 @@ import supabase from '../supabase.js';
 import { getLeadByLdsId } from '../lp-client.js';
 import { updateGHLContactFields } from '../ghl.js';
 import { isLPLeadId, ghlFetch } from './helpers.js';
+// 2026-09-21 — NANP-strict normalizer (10 digits, [2-9] leading, or null).
+// Deliberately the outbound guard's copy, not sync-utils' looser
+// replace(/\D/g,''): a DNC write must never carry a 7-digit or 12-digit
+// string that Five9 would silently store as a number nobody owns.
+import { normalizePhone as normalizeNanpPhone } from '../outbound-phone-guard.js';
 
 const LP_LEAD_COLUMNS =
   'lp_lead_id, lp_prospect_id, ghl_contact_id, first_name, last_name, phone, ' +
@@ -302,4 +307,93 @@ export async function getEventContext(action) {
     console.error(`[ActionExecutor] Failed to fetch event context for action ${action.id}:`, err.message);
     return {};
   }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// DNC NUMBER RESOLUTION (2026-09-21)
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * Every phone number belonging to a contact, for a DNC write.
+ *
+ * WHY THIS EXISTS: a STOP text revokes consent for the PERSON, not for the
+ * one handset the message happened to arrive on. Five9 dials from the LP
+ * lead's phone AND phone_alt, and a prospect can carry several leads; pushing
+ * only the GHL primary left a second number of the same person live on the
+ * dialer. qM5QYwn5ISZ8DQOgFJpX was called ~7 more times after opting out.
+ *
+ * FAIL-CLOSED, both ways. A read that FAILS throws so the executor retries —
+ * it must never look like "this person has no other numbers". An empty result
+ * also throws: adding nothing to DNC and reporting success is the failure mode
+ * this whole change exists to end. Numbers that are not valid NANP are dropped
+ * silently, because adding a malformed number to DNC suppresses nobody while a
+ * mistyped one could suppress a stranger.
+ *
+ * @param {string} contactId — GHL contact ID
+ * @param {object} [eventContext]
+ * @param {object} [deps] — { supabase, ghlFetch } seam for tests
+ * @returns {Promise<{numbers: string[], sources: object}>} 10-digit strings
+ */
+export async function resolveContactDncNumbers(contactId, eventContext = {}, deps = {}) {
+  const db = deps.supabase || supabase;
+  const fetchGhl = deps.ghlFetch || ghlFetch;
+  if (!contactId) throw new Error('resolveContactDncNumbers requires a contact id');
+
+  const found = new Map(); // 10 digits → first source that produced it
+  const add = (raw, source) => {
+    const digits = normalizeNanpPhone(raw);
+    if (digits && !found.has(digits)) found.set(digits, source);
+  };
+
+  // 1. GHL — the primary, plus every additional number on the record.
+  //    A failure here throws: the GHL contact is the authoritative identity.
+  const ghlRes = await fetchGhl('GET', `/contacts/${contactId}`);
+  const contact = ghlRes?.contact || {};
+  add(contact.phone, 'ghl_primary');
+  for (const extra of Array.isArray(contact.additionalPhones) ? contact.additionalPhones : []) {
+    // GHL returns either a bare string or { phone } depending on API version.
+    add(typeof extra === 'string' ? extra : extra?.phone, 'ghl_additional');
+  }
+
+  // 2. LP — every lead for this contact, and every lead of the same prospect.
+  //    lp_leads is keyed per LEAD; one person re-quoted three times has three
+  //    rows and the dialer works from all of them.
+  const { data: byContact, error: contactErr } = await db
+    .from('lp_leads')
+    .select('lp_lead_id, lp_prospect_id, phone, phone_alt')
+    .eq('ghl_contact_id', contactId)
+    .limit(200);
+  if (contactErr) throw new Error(`lp_leads read failed for ${contactId}: ${contactErr.message}`);
+
+  const prospectIds = [...new Set((byContact || []).map(r => r.lp_prospect_id).filter(Boolean))];
+  let byProspect = [];
+  if (prospectIds.length) {
+    const { data, error } = await db
+      .from('lp_leads')
+      .select('lp_lead_id, lp_prospect_id, phone, phone_alt')
+      .in('lp_prospect_id', prospectIds)
+      .limit(500);
+    if (error) throw new Error(`lp_leads prospect read failed for ${contactId}: ${error.message}`);
+    byProspect = data || [];
+  }
+
+  for (const row of [...(byContact || []), ...byProspect]) {
+    add(row.phone, 'lp_phone');
+    add(row.phone_alt, 'lp_phone_alt');
+  }
+
+  // 3. The triggering event, when it carried the inbound number. Last, so it
+  //    only ever ADDS a number the records missed.
+  add(eventContext?.inbound_from || eventContext?.from || null, 'event_payload');
+
+  if (!found.size) {
+    throw new Error(
+      `resolveContactDncNumbers found no valid phone number for ${contactId} — ` +
+      'refusing to report a DNC write that would suppress nothing'
+    );
+  }
+
+  const sources = {};
+  for (const [digits, source] of found) sources[digits] = source;
+  return { numbers: [...found.keys()], sources };
 }

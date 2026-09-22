@@ -39,10 +39,36 @@ import supabase from '../supabase.js';
  * decision. Adding a second op here means writing a second named constant and
  * justifying it on its own merits, which is the point. In particular
  * five9_delete_record_from_list, five9_modify_campaign_lists,
- * five9_reset_campaign, five9_reset_list_position and five9_add_numbers_to_dnc
- * stay gated; scripts/test-five9-approval-carveout.js asserts exactly that.
+ * five9_reset_campaign and five9_reset_list_position stay gated;
+ * scripts/test-five9-approval-carveout.js asserts exactly that.
  */
 const AUTO_APPROVED_FIVE9_OP = 'five9_add_records_to_list';
+
+/**
+ * The SECOND op, added 2026-09-21 on its own merits — a second named constant,
+ * exactly as the comment above demands, not a string appended to a list.
+ *
+ * five9_add_numbers_to_dnc is ADD-ONLY, and on the Five9 side there is no way
+ * back: removal was deleted 2026-08-21 by ruling. That makes it the most
+ * restrictive write we have — it can only ever stop us contacting someone. The
+ * approval gate on it was not protecting the consumer, it was delaying their
+ * opt-out: a STOP sat in pending_approval until someone clicked, while the
+ * dialer kept calling (qM5QYwn5ISZ8DQOgFJpX, ~7 calls after opting out).
+ *
+ * A held DNC write is a compliance breach in a way a held campaign edit is
+ * not, so this one is carved out. Every other five9_ op stays coerced,
+ * including every removal, reset and campaign write.
+ *
+ * GATED ON FIVE9_WRITES_ENABLED. With the flag unset the whole Five9 write
+ * path is dry-run (src/five9/admin-writes.js withFive9WriteGate): an unarmed
+ * row would then be neither reviewed nor executed, which is the worst of both.
+ * Flag off ⇒ this op is coerced like any other and a human still sees it.
+ */
+const AUTO_APPROVED_FIVE9_DNC_OP = 'five9_add_numbers_to_dnc';
+
+export function five9DncAutoApproveEnabled() {
+  return String(process.env.FIVE9_WRITES_ENABLED || '').toLowerCase() === 'true';
+}
 
 export function resolveRequiresApproval(actionType, requested) {
   const type = String(actionType || '');
@@ -50,7 +76,8 @@ export function resolveRequiresApproval(actionType, requested) {
   // The carve-out only lowers the FLOOR the prefix rule imposes. An explicit
   // requires_approval:true from the caller is still honoured — a human who
   // deliberately asks to review this push gets to review it.
-  const isCarvedOut = type === AUTO_APPROVED_FIVE9_OP;
+  const isCarvedOut = type === AUTO_APPROVED_FIVE9_OP
+    || (type === AUTO_APPROVED_FIVE9_DNC_OP && five9DncAutoApproveEnabled());
   const requiresApproval = isFive9Write && !isCarvedOut ? true : (requested || false);
   return {
     isFive9Write,
