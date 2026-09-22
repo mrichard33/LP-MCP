@@ -198,7 +198,7 @@ export const OP_CLASSIFICATION = Object.freeze({
 
   /* -- DNC --------------------------------------------------------------- */
   addNumbersToDnc: c('write', 'enabled', 'shipped', 'Shipped as five9_add_numbers_to_dnc. DNC is ADD-ONLY by ruling.'),
-  removeNumbersFromDnc: c('write', 'denied', 'not-built', 'Ruled by Mark 2026-08-21 and removed outright: Reece does not take numbers off DNC under any circumstance, so there is no gate, override, or reason string that yields it. The action type five9_remove_numbers_from_dnc must stay an unknown action type.'),
+  removeNumbersFromDnc: c('write', 'gated', 'shipped', 'AMENDED 2026-09-21. The 2026-08-21 ruling (Reece does not take numbers off DNC, so there is no gate, override or reason string that yields it) still governs every general caller: five9_remove_numbers_from_dnc stays in FORBIDDEN_ACTION_TYPES and stays an unknown action type. Mark then ruled that a consumer who RE-ENTERS through a fresh first-party submission is lifted everywhere, Five9 included, so the SOAP method is reachable by exactly one action type — five9_remove_numbers_from_dnc_reentry — which is welded to DNC_LIFT_ON_REENTRY_E0 and re-proves consent:new-submission and the trigger event\'s age (<=15 min) at execution. It cannot lift a contact-initiated STOP: that rule refuses any contact carrying suppress:dnc-reply / suppress:dnc-voice. "gated" rather than "enabled" because the gate is the whole design.'),
   checkDncForNumbers: c('read', 'skip', 'shipped', READ_SHIPPED),
 
   /* -- dispositions ------------------------------------------------------ */
@@ -402,7 +402,12 @@ export const OP_REGISTRY = Object.freeze([
   /* -- DNC --------------------------------------------------------------- */
   reg('five9_add_numbers_to_dnc', 'addNumbersToDnc', null, 'enabled', {
     guards: ['checkDncForNumbers'], readBeforeWrite: true, builder: 'buildNumbersXml',
-    note: 'ADD-ONLY. There is no removal counterpart and none may be added.',
+    note: 'ADD-ONLY. The only removal counterpart is the re-entry op below, which is not a general removal.',
+  }),
+  reg('five9_remove_numbers_from_dnc_reentry', 'removeNumbersFromDnc', null, 'gated', {
+    guards: ['ruleApplied:DNC_LIFT_ON_REENTRY_E0', 'consentTagAtExecution', 'triggerEventAge<=15m', 'checkDncForNumbers'],
+    readBeforeWrite: true, builder: 'buildNumbersXml',
+    note: 'NOT a general DNC removal — see removeNumbersFromDnc in OP_CLASSIFICATION. Welded to one rule; refuses every other rule_applied, a missing consent tag, an unreadable tag read, and a trigger event older than 15 minutes. five9_remove_numbers_from_dnc remains FORBIDDEN.',
   }),
 
   /* -- user skills ------------------------------------------------------- */

@@ -70,14 +70,29 @@ export function five9DncAutoApproveEnabled() {
   return String(process.env.FIVE9_WRITES_ENABLED || '').toLowerCase() === 'true';
 }
 
-export function resolveRequiresApproval(actionType, requested) {
+/**
+ * The re-entry DNC lift (2026-09-21, Mark's ruling). Third named constant,
+ * and the only one whose exemption depends on WHO QUEUED IT rather than on
+ * the action type alone: it is armed unless rule_applied is exactly
+ * DNC_LIFT_ON_REENTRY_E0. A row of this type from anywhere else stays
+ * approval-gated and is refused by the op itself at execution.
+ *
+ * Keyed that way on purpose. General Five9 DNC removal was deleted
+ * 2026-08-21 by ruling; this is one rule's lift, not a removal capability
+ * anyone can pick up by naming the action type.
+ */
+const AUTO_APPROVED_REENTRY_OP = 'five9_remove_numbers_from_dnc_reentry';
+export const REENTRY_DNC_LIFT_RULE_KEY = 'DNC_LIFT_ON_REENTRY_E0';
+
+export function resolveRequiresApproval(actionType, requested, ruleApplied = null) {
   const type = String(actionType || '');
   const isFive9Write = type.startsWith('five9_');
   // The carve-out only lowers the FLOOR the prefix rule imposes. An explicit
   // requires_approval:true from the caller is still honoured — a human who
   // deliberately asks to review this push gets to review it.
   const isCarvedOut = type === AUTO_APPROVED_FIVE9_OP
-    || (type === AUTO_APPROVED_FIVE9_DNC_OP && five9DncAutoApproveEnabled());
+    || (type === AUTO_APPROVED_FIVE9_DNC_OP && five9DncAutoApproveEnabled())
+    || (type === AUTO_APPROVED_REENTRY_OP && ruleApplied === REENTRY_DNC_LIFT_RULE_KEY);
   const requiresApproval = isFive9Write && !isCarvedOut ? true : (requested || false);
   return {
     isFive9Write,
@@ -238,7 +253,7 @@ export function registerAgentTools(server) {
     async (params) => {
       try {
         const { requiresApproval, coerced: approvalCoerced } =
-          resolveRequiresApproval(params.action_type, params.requires_approval);
+          resolveRequiresApproval(params.action_type, params.requires_approval, params.rule_applied || null);
         const status = requiresApproval ? 'pending_approval' : 'pending';
         const insertRow = {
           event_id: params.event_id,

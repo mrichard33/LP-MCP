@@ -62,6 +62,8 @@ import {
   executeSetCampaignStrategies,
   executeCreateList,
   executeResetListPosition,
+  executeRemoveNumbersFromDncReentry,
+  REENTRY_DNC_LIFT_RULE_KEY,
 } from '../../five9/admin-writes.js';
 
 const FIVE9_WRITE_OPS = {
@@ -74,12 +76,21 @@ const FIVE9_WRITE_OPS = {
   // 2026-08-12 Phase F — the BULK sibling of delete_record_from_list.
   five9_async_delete_records_from_list: executeAsyncDeleteRecordsFromList,
   five9_add_numbers_to_dnc: executeAddNumbersToDnc,
-  // NOTE: DNC REMOVAL IS NOT AN OP AND MUST NOT BE RE-ADDED. Removed
+  // 2026-09-21 — the ONE re-entry removal (Mark's ruling: a consumer who
+  // comes back with a fresh first-party submission is lifted everywhere,
+  // Five9 included). Welded to DNC_LIFT_ON_REENTRY_E0 and re-proves the
+  // consent tag and the event's age at execution time; it does not reopen a
+  // general removal path and does not lift a contact-initiated STOP. The
+  // contract is in src/five9/admin-writes.js.
+  five9_remove_numbers_from_dnc_reentry: executeRemoveNumbersFromDncReentry,
+  // NOTE: GENERAL DNC REMOVAL IS NOT AN OP AND MUST NOT BE RE-ADDED. Removed
   // 2026-08-21 by explicit ruling: Reece does not take numbers off DNC under
   // any circumstance, so there is no gate, override, or justification path
   // that makes it available — the action type simply does not exist. A
   // queued five9_remove_numbers_from_dnc now fails as an unknown action type,
-  // which is the intended outcome, not a regression to fix.
+  // which is the intended outcome, not a regression to fix. The re-entry op
+  // above is a DIFFERENT action type on purpose: nothing that was queued
+  // against the old name can start working again by accident.
   // 2026-08-05 Phase D
   five9_user_skill_add: executeUserSkillAdd,
   five9_user_skill_modify: executeUserSkillModify,
@@ -162,8 +173,19 @@ const EXEC_AUTO_APPROVED_FIVE9_OP = 'five9_add_records_to_list';
 // the flag check is duplicated here for the same belt-and-braces reason.
 const EXEC_AUTO_APPROVED_FIVE9_DNC_OP = 'five9_add_numbers_to_dnc';
 
-function execAutoApproved(actionType) {
+// 2026-09-21 — the re-entry DNC lift. Note what this keys on: the ACTION's
+// rule_applied, not the action type. The exemption belongs to one rule, so a
+// row of this type queued by anything else is still armed AND still refused
+// by the op itself. Keying it on the type would make the exemption reusable
+// by whoever queues the next one, which is exactly what the 2026-08-21
+// removal ruling was protecting against.
+const EXEC_AUTO_APPROVED_REENTRY_OP = 'five9_remove_numbers_from_dnc_reentry';
+
+function execAutoApproved(actionType, action) {
   if (actionType === EXEC_AUTO_APPROVED_FIVE9_OP) return true;
+  if (actionType === EXEC_AUTO_APPROVED_REENTRY_OP) {
+    return action?.rule_applied === REENTRY_DNC_LIFT_RULE_KEY;
+  }
   if (actionType !== EXEC_AUTO_APPROVED_FIVE9_DNC_OP) return false;
   return String(process.env.FIVE9_WRITES_ENABLED || '').toLowerCase() === 'true';
 }
@@ -174,7 +196,7 @@ export async function executeFive9Write(action) {
   // Belt-and-braces: a five9 write row must have entered through the
   // approve_action gate. requires_approval=false means someone bypassed it —
   // except for the carved-out ops, which are queued unarmed by design.
-  if (action.requires_approval !== true && !execAutoApproved(action.action_type)) {
+  if (action.requires_approval !== true && !execAutoApproved(action.action_type, action)) {
     throw new Error(`REFUSED: ${action.action_type} must be queued with requires_approval=true (approve_action gate)`);
   }
   return fn(action);

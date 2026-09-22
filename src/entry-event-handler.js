@@ -26,6 +26,19 @@
  *      routing telemetry — distinct from ghl.entry_detected so it does
  *      not trigger Route B rules.
  *
+ * v2.3 — 2026-09-21. RE-ENTRY SOURCE. VALID_SOURCES accepts 'reentry', so
+ *   E.0's re-entry branch can POST /webhook/ghl/entry for a contact that is
+ *   on DNC but has just made a NEW first-party submission. The resulting
+ *   ghl.entry_detected / reentry event is what DNC_LIFT_ON_REENTRY_E0
+ *   consumes; that rule has been enabled and dormant since 2026-09-21 purely
+ *   because this handler rejected the source with a 400.
+ *
+ *   'reentry' is deliberately NOT in ROUTING_TAG_MAP. It is not an entry
+ *   SOURCE the way calculator or canvassing are — the contact already has
+ *   an entry:* lineage from whenever they first arrived, and overwriting it
+ *   would erase the attribution of the original lead. It names an EVENT
+ *   ("this person came back"), and only the lift rule consumes it.
+ *
  * v2.2 — 2026-07-20. SUPPRESSION GUARD (Fix 0a). ensure-routing-tags now
  *        refuses to write routing tags for a contact carrying any
  *        suppression tag (dnc, stage:dnc, dnc-sms, do-not-contact,
@@ -87,6 +100,7 @@ const VALID_SOURCES = new Set([
   'high_intent_digital',  // High-intent digital signal
   'manual',               // Rep manual entry
   'other',                // v2.0 — E.0 default branch
+  'reentry',              // v2.3 — a DNC contact submitted a NEW first-party request
 ]);
 
 // Map internal entry-source name -> (source-tag suffix).
@@ -102,6 +116,22 @@ const ROUTING_TAG_MAP = {
   'canvassing':          { source_tag: 'canvass' },
   'other':               { source_tag: 'unknown' },
 };
+
+/**
+ * Normalize a Route B source to its canonical name, or null if it is not one.
+ *
+ * Pulled out of handleEntryEvent (2026-09-21) so the accept/reject decision
+ * is testable without a live emitEvent. The handler is the only caller and
+ * its behaviour is unchanged: lowercase, trim, then membership.
+ */
+export function normalizeEntrySource(raw) {
+  if (raw === null || raw === undefined) return null;
+  const source = String(raw).toLowerCase().trim();
+  if (!source) return null;
+  return VALID_SOURCES.has(source) ? source : null;
+}
+
+export { VALID_SOURCES };
 
 const GHL_API_KEY = process.env.GHL_API_KEY;
 
@@ -179,22 +209,23 @@ function resolveEntryFields(req) {
 
 async function handleEntryEvent(req, res) {
   const { contactId, sourceRaw, context, fingerprint } = resolveEntryFields(req);
-  const source = sourceRaw ? String(sourceRaw).toLowerCase().trim() : null;
+  const rawTrimmed = sourceRaw ? String(sourceRaw).toLowerCase().trim() : null;
+  const source = normalizeEntrySource(sourceRaw);
 
   console.log('[EntryEvent] inbound shape:', JSON.stringify(fingerprint));
 
   if (!contactId) {
     return res.status(400).json({ error: 'Missing contactId', debug: fingerprint });
   }
-  if (!source) {
+  if (!rawTrimmed) {
     return res.status(400).json({
       error: 'Missing source. Must be one of: ' + [...VALID_SOURCES].join(', '),
       debug: fingerprint,
     });
   }
-  if (!VALID_SOURCES.has(source)) {
+  if (!source) {
     return res.status(400).json({
-      error: `Invalid source "${source}". Must be one of: ${[...VALID_SOURCES].join(', ')}`,
+      error: `Invalid source "${rawTrimmed}". Must be one of: ${[...VALID_SOURCES].join(', ')}`,
       debug: fingerprint,
     });
   }

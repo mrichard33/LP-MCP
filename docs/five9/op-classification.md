@@ -54,14 +54,14 @@ action type, or as a reader in `src/five9-admin.js`), `not-built` otherwise.
 | reads | 59 |
 | writes | 123 |
 | `enabled` | 19 |
-| `gated` | 44 |
-| `denied` | 40 |
+| `gated` | 45 |
+| `denied` | 39 |
 | `skip` | 79 |
-| shipped today | 79 |
-| registered action types | 37 |
+| shipped today | 80 |
+| registered action types | 38 |
 
 **No new operation is registered by this PR.** The registry ships seeded with
-exactly the 37 action types that already existed, and one of them —
+exactly the 38 action types that already existed, and one of them —
 `five9_create_campaign_profile` — migrated onto `buildFromSchema`.
 Tiers below are the *proposal* for later tranches, not a description of what is
 live. Each tranche is its own reviewable PR against a builder that has already
@@ -241,7 +241,7 @@ Sorted by name. A registered operation shows its action type beneath it.
 | `removeIvrIcons` | write | **skip** | not-built | NEW SURFACE, flagged for Mark. Cosmetic, as setIvrIcons — proposed skip. |
 | `removeIvrScriptOwnership` | write | **skip** | not-built | NEW SURFACE, flagged for Mark. Clears the othersCanCopy flag set by setIvrScriptOwnership — proposed skip for the same reason. |
 | `removeListsFromCampaign`<br>→ `five9_remove_lists_from_campaign` | write | **gated** | shipped | Shipped as five9_remove_lists_from_campaign: confirm_token restating the campaign name, refuses while RUNNING. The attached-list set before the change rides on the audit event. |
-| `removeNumbersFromDnc` | write | **denied** | not-built | Ruled by Mark 2026-08-21 and removed outright: Reece does not take numbers off DNC under any circumstance, so there is no gate, override, or reason string that yields it. The action type five9_remove_numbers_from_dnc must stay an unknown action type. |
+| `removeNumbersFromDnc`<br>→ `five9_remove_numbers_from_dnc_reentry` | write | **gated** | shipped | AMENDED 2026-09-21. The 2026-08-21 ruling (Reece does not take numbers off DNC, so there is no gate, override or reason string that yields it) still governs every general caller: five9_remove_numbers_from_dnc stays in FORBIDDEN_ACTION_TYPES and stays an unknown action type. Mark then ruled that a consumer who RE-ENTERS through a fresh first-party submission is lifted everywhere, Five9 included, so the SOAP method is reachable by exactly one action type — five9_remove_numbers_from_dnc_reentry — which is welded to DNC_LIFT_ON_REENTRY_E0 and re-proves consent:new-submission and the trigger event's age (<=15 min) at execution. It cannot lift a contact-initiated STOP: that rule refuses any contact carrying suppress:dnc-reply / suppress:dnc-voice. "gated" rather than "enabled" because the gate is the whole design. |
 | `removeSkillAudioFile` | write | **skip** | not-built | Audio asset management; a Five9-UI task with no agentic path that produces the file. |
 | `removeSkillsFromCampaign`<br>→ `five9_remove_skills_from_campaign` | write | **gated** | shipped | Shipped as five9_remove_skills_from_campaign: confirm_token restating the campaign name. Does NOT blanket-refuse while RUNNING — it carries the sharper guard instead: removing the LAST skill on a RUNNING campaign is refused, because every call already queued on it would be stranded with nothing to route to. The same removal is allowed once the campaign is stopped. |
 | `removeSpeedDialNumber` | write | **skip** | not-built | NEW SURFACE, flagged for Mark. Removes a desktop shortcut by code; proposed skip for the same reason as createSpeedDialNumber. Note it is remove*, not delete*, and destroys no history. |

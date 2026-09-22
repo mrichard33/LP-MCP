@@ -93,6 +93,8 @@ import { getUsersFullInfo, getUserProfile } from '../five9-users-info.js';
 import { tryAcquireLock, releaseLock, decideLockHeldReschedule } from '../services/outbound-locks.js';
 import { emitEvent } from '../event-emitter.js';
 import { resolveContactDncNumbers } from '../actions/resolvers.js';
+import { ghlFetch } from '../actions/helpers.js';
+import supabase from '../supabase.js';
 
 /* ---------------------------------------------------------------------- *
  * Guardrail 1 — master flag (ships dark).
@@ -1824,6 +1826,163 @@ export function executeAddNumbersToDnc(action, deps = {}) {
   });
 }
 
+/**
+ * DNC removal for ONE case, and one case only: a consumer who came back.
+ *
+ * 2026-09-21, Mark's ruling: when a lead re-enters through a fresh
+ * first-party submission, DNC is lifted everywhere — including Five9. Until
+ * now the Five9 arm could not be lifted at all (see the tombstone below), so
+ * a re-entered lead was routed, worked, and then silently skipped by the
+ * dialer. DNC_LIFT_ON_REENTRY_E0's own notification had to say "Five9 DNC
+ * was NOT removed. If this lead should be called, dial manually."
+ *
+ * THIS IS NOT A GENERAL REMOVAL, AND IT MUST NOT BECOME ONE. The tombstone
+ * below still stands for every other path. What makes this op safe is not a
+ * gate a caller can satisfy — it is that the op is welded to one rule and
+ * re-proves the consent at execution time:
+ *
+ *   1. action.rule_applied must be exactly DNC_LIFT_ON_REENTRY_E0. Any other
+ *      caller is refused outright. There is no reason string, no override,
+ *      no approver who can widen this — deliberately, because that is what
+ *      the 2026-08-21 ruling removed and it should stay removed.
+ *   2. The contact must STILL carry consent:new-submission when the action
+ *      runs. The rule checks it at queue time; by execution the tag may have
+ *      been removed (the rule removes it itself, at action priority 200) or
+ *      the submission may have been retracted. Queue-time consent is not
+ *      execution-time consent.
+ *   3. The triggering ghl.entry_detected/reentry event must be <= 15 minutes
+ *      old. A stale event means this row sat in a queue through an incident
+ *      or a deploy; re-consenting someone on the strength of a submission
+ *      from hours ago is exactly the kind of drift the freshness check
+ *      exists to stop.
+ *
+ * Any of those failing is a REFUSAL, not a retry: none of them get better by
+ * waiting, and a retrying DNC removal is the thing we least want in a queue.
+ *
+ * Note what this does NOT lift: a contact-initiated STOP. That is
+ * suppress:dnc-reply, and DNC_LIFT_ON_REENTRY_E0 refuses to fire at all for
+ * a contact carrying it (not_has_any_tag, added 2026-09-16). A person who
+ * texted STOP is cleared by a human, deliberately.
+ */
+export async function executeRemoveNumbersFromDncReentry(action, deps = {}) {
+  const ruleApplied = action.rule_applied || null;
+  if (ruleApplied !== REENTRY_DNC_LIFT_RULE_KEY) {
+    throw new Error(
+      `REFUSED: five9_remove_numbers_from_dnc_reentry runs only for ${REENTRY_DNC_LIFT_RULE_KEY}, ` +
+      `not "${ruleApplied || 'none'}". Five9 DNC removal has no general path — see the tombstone in src/five9/admin-writes.js.`
+    );
+  }
+  const contactId = action.target_id;
+  if (!contactId) throw new Error('five9_remove_numbers_from_dnc_reentry requires action.target_id');
+
+  const readTags = deps.readContactTags || _readContactTagsForReentry;
+  const readEvent = deps.readTriggerEvent || _readReentryEventForAction;
+  const resolveNumbers = deps.resolveContactDncNumbers || resolveContactDncNumbers;
+  // 2026-09-22 — checkDncForNumbers is a LIVE SOAP read, and it runs even in
+  // dry-run (ctx.soap short-circuits the write, not the read-back). Behind the
+  // deps seam so a test never reaches Five9: without it the happy-path tests
+  // silently depended on FIVE9_USERNAME/PASSWORD being present, passed on a
+  // developer machine that had them, and failed in CI, which does not.
+  const checkDnc = deps.checkDncForNumbers || checkDncForNumbers;
+  const now = deps.now ? deps.now() : Date.now();
+
+  return withFive9WriteGate(
+    { action, subtype: 'remove_numbers_from_dnc_reentry', entityType: 'five9_dnc', entityId: 'dnc' },
+    async (ctx) => {
+      // ── re-prove the consent, at execution time ──
+      const tags = await readTags(contactId);
+      if (!Array.isArray(tags)) {
+        // Unreadable is NOT absent. Fail closed: refuse rather than lift on
+        // a read we could not make.
+        throw new Error(`REFUSED: could not read tags for ${contactId} — refusing to lift Five9 DNC on an unverified consent`);
+      }
+      const hasConsent = tags.some((t) => String(t || '').toLowerCase() === REENTRY_CONSENT_TAG);
+      if (!hasConsent) {
+        throw new Error(`REFUSED: ${contactId} no longer carries ${REENTRY_CONSENT_TAG} — queue-time consent is not execution-time consent`);
+      }
+
+      const evt = await readEvent(action);
+      if (!evt) throw new Error(`REFUSED: no ghl.entry_detected/reentry event found for action ${action.id}`);
+      const ageMs = now - Date.parse(evt.created_at || '');
+      if (!Number.isFinite(ageMs)) throw new Error(`REFUSED: re-entry event ${evt.id} has an unreadable created_at`);
+      if (ageMs > REENTRY_MAX_EVENT_AGE_MS) {
+        throw new Error(
+          `REFUSED: re-entry event ${evt.id} is ${Math.round(ageMs / 60000)} min old (max ${REENTRY_MAX_EVENT_AGE_MS / 60000}) — ` +
+          'this row sat in a queue; re-consenting on a stale submission is not consent'
+        );
+      }
+
+      const { numbers, sources } = await resolveNumbers(contactId, {});
+      ctx.previous_state = await checkDnc(numbers);
+      await ctx.soap('removeNumbersFromDnc', buildNumbersXml(numbers));
+
+      // The audit event is separate from withFive9WriteGate's own
+      // five9.admin_write row on purpose: a DNC REMOVAL is the one write
+      // anyone will come looking for by name, and it should not have to be
+      // found by filtering a generic write log.
+      const emit = deps.emitEvent || emitEvent;
+      await emit({
+        event_type: 'five9.dnc_removed_reentry',
+        source: 'action_executor',
+        entity_type: 'contact',
+        entity_id: contactId,
+        ghl_contact_id: contactId,
+        payload: {
+          contact_id: contactId,
+          numbers,
+          number_sources: sources,
+          event_id: evt.id,
+          event_age_minutes: Math.round(ageMs / 60000),
+          consent_tag_seen: true,
+          rule_applied: ruleApplied,
+          action_id: action.id,
+        },
+        priority: 'high',
+        bypass_filter: true,
+        idempotency_key: `five9_dnc_removed_reentry_${action.id}`,
+      }).catch((err) => console.warn(`[FIVE9 WRITES] re-entry audit emit failed (write already done): ${err.message}`));
+
+      if (ctx.dry_run) return { numbers_submitted: numbers.length, event_id: evt.id, resolved_from: sources };
+      ctx.new_state = await checkDnc(numbers); // read-back proves the removal
+      return {
+        numbers_submitted: numbers.length,
+        still_on_dnc: ctx.new_state.on_dnc.length,
+        event_id: evt.id,
+        resolved_from: sources,
+      };
+    }
+  );
+}
+
+// The re-entry op's three constants, named so a reader sees the whole
+// contract without reading the body.
+export const REENTRY_DNC_LIFT_RULE_KEY = 'DNC_LIFT_ON_REENTRY_E0';
+export const REENTRY_CONSENT_TAG = 'consent:new-submission';
+export const REENTRY_MAX_EVENT_AGE_MS = 15 * 60 * 1000;
+
+async function _readContactTagsForReentry(contactId) {
+  try {
+    const res = await ghlFetch('GET', `/contacts/${contactId}`);
+    const tags = res?.contact?.tags;
+    return Array.isArray(tags) ? tags : null;
+  } catch (err) {
+    console.warn(`[FIVE9 WRITES] re-entry consent read failed for ${contactId}: ${err.message}`);
+    return null;
+  }
+}
+
+async function _readReentryEventForAction(action) {
+  if (!action?.event_id) return null;
+  const { data } = await supabase
+    .from('system_events')
+    .select('id, event_type, event_subtype, created_at')
+    .eq('id', action.event_id)
+    .maybeSingle();
+  if (!data) return null;
+  if (data.event_type !== 'ghl.entry_detected' || data.event_subtype !== 'reentry') return null;
+  return data;
+}
+
 /* DNC REMOVAL IS NOT IMPLEMENTED, AND THIS IS NOT AN OVERSIGHT.
  *
  * executeRemoveNumbersFromDnc existed from Phase C (2026-07-21) until
@@ -1838,6 +1997,15 @@ export function executeAddNumbersToDnc(action, deps = {}) {
  *
  * addNumbersToDnc above is unaffected: adding to DNC is always allowed and
  * needs no justification.
+ *
+ * 2026-09-21 AMENDMENT. One narrow exception now exists, directly above:
+ * executeRemoveNumbersFromDncReentry, for a consumer who came back with a
+ * fresh first-party submission (Mark's ruling). It is welded to
+ * DNC_LIFT_ON_REENTRY_E0 and re-proves the consent tag and the event's age
+ * at execution time. It does NOT reopen a general path, and it does not lift
+ * a contact-initiated STOP. Everything in this comment still applies to
+ * every other caller: there is no reason string, no override, and no
+ * approver who can remove a number outside that one rule.
  */
 
 /* ---------------------------------------------------------------------- *
