@@ -165,6 +165,16 @@ export async function runReplySlaWatchdog(deps = {}) {
           age_minutes: ageMin,
           contact_id: contactId,
           message_preview: String(r.payload?.message_text || '').slice(0, 100),
+          // 2026-09-21 — the self-heal rules read these. message_preview alone
+          // could not drive payload_message_matches (100 chars truncates an
+          // opt-out mid-sentence: "…please take me o"), and without inbound_at
+          // a recovery reply cannot tell whether a rep already answered.
+          // All three come from the row this loop already selected — no extra
+          // read. Capped at 1000 chars: long enough for any opt-out wording,
+          // short enough that system_events.payload stays a payload.
+          message_text: String(r.payload?.message_text || '').slice(0, 1000),
+          channel: r.payload?.channel || null,
+          inbound_at: r.created_at,
         },
         idempotency_key: `reply_sla_${r.id}`,
       });

@@ -57,9 +57,10 @@
  *     lp_callback_requeue
  *   Messaging + notification (3):
  *     send_message, send_notification, create_task
- *   Orchestration + compute (7):
+ *   Orchestration + compute (8):
  *     layer3_dispatch, emit_event, check_eligibility, check_throttle,
- *     compute_risk_score, calculate_time_lapse_tier, classify_bucket
+ *     compute_risk_score, calculate_time_lapse_tier, classify_bucket,
+ *     reanalyze_reply
  *   State machines (5):
  *     compute_rescission_dispatch, transition_objection_state,
  *     resolve_objection_state, classify_lead_state, end_agentic_handoff
@@ -250,6 +251,7 @@ import { executeUpdateCustomFields, executeUpdateContactEmail } from './handlers
 import { executePersistEstablishedFacts } from './handlers/established-facts.js';
 import { executeCalculateTimeLapseTier } from './handlers/time-lapse.js';
 import { executeEmitEvent } from './handlers/system-events.js';
+import { executeReanalyzeReply } from './handlers/reanalyze-reply.js';  // 2026-09-21 — missed-reply self-heal
 import { executeComputeRescissionDispatch } from './handlers/rescission.js';
 // Phase 1 #52 — Intake/Routing Layer eligibility gate
 import { executeCheckEligibility } from './handlers/eligibility.js';
@@ -635,6 +637,7 @@ export const ACTION_HANDLERS = {
   send_message: executeSendMessageWithLock,      // MVI v2.5 — outbound_locks wrap; 2026-05-13 — + suppression gate
   layer3_dispatch: executeLayer3Dispatch,        // MVI v2.5 — Layer 3 fan-out
   emit_event: executeEmitEvent,                  // MVI v2.5 — observability / follow-on
+  reanalyze_reply: executeReanalyzeReply,        // 2026-09-21 — re-run a failed analysis so the NORMAL rules own the outcome
   compute_rescission_dispatch: executeComputeRescissionDispatch, // 2026-05-06 — FL rescission rescue (Thomas Michaud post-mortem)
   check_eligibility: executeCheckEligibility,    // 2026-05-13 — Phase 1 #52 Intake/Routing eligibility gate
   compute_risk_score: executeComputeRiskScore,   // 2026-05-13 — Phase 1 #54 composite scoring
@@ -715,6 +718,7 @@ export const ACTION_HANDLERS = {
 // Handlers that need the triggering event's payload injected as context.
 const CONTEXT_AWARE_HANDLERS = new Set([
   'send_notification',
+  'reanalyze_reply',         // 2026-09-21 — reads source_event_id off the agentic.reply_unanswered payload
   'create_task',
   'book_appointment',
   'reschedule_appointment',  // v2.7.8 — needs context for date interpolation in new_start_time
@@ -784,6 +788,34 @@ const MUTATION_GATED_ACTION_TYPES = new Set([
 // Centralized in suppression-check.js so the exemption is unit-tested as a
 // pure predicate.
 
+/**
+ * not_before_seconds — pure deferral decision. (2026-09-21)
+ *
+ * Measured from created_at, NOT from now. A now-based check would push the
+ * deadline forward on every sweep and never converge, so a row queued ten
+ * minutes ago runs immediately instead of restarting its own clock.
+ *
+ * created_at always arrives: claim_agent_actions is RETURNS SETOF
+ * agent_actions / RETURNING *, and the legacy fallback selects *. If it ever
+ * stops arriving the action runs NOW and says so — deferring from now()
+ * instead would re-defer forever and the action would never run at all.
+ *
+ * @returns {{seconds:number, retry_at:string|null, warn:string|null}}
+ */
+export function decideNotBefore(action, nowMs) {
+  const seconds = Number(action?.action_payload?.not_before_seconds) || 0;
+  if (seconds <= 0) return { seconds: 0, retry_at: null, warn: null };
+  if (!action.created_at) {
+    return { seconds, retry_at: null, warn: `asked for not_before_seconds=${seconds} but the row has no created_at — running now` };
+  }
+  const readyAt = Date.parse(action.created_at) + seconds * 1000;
+  if (!Number.isFinite(readyAt)) {
+    return { seconds, retry_at: null, warn: `asked for not_before_seconds=${seconds} but created_at is unparseable — running now` };
+  }
+  if (readyAt <= nowMs) return { seconds, retry_at: null, warn: null };
+  return { seconds, retry_at: new Date(readyAt).toISOString(), warn: null };
+}
+
 async function executeSingleAction(action, batchContext = {}, priorBatchResults = []) {
   const handler = ACTION_HANDLERS[action.action_type];
   if (!handler) {
@@ -794,6 +826,36 @@ async function executeSingleAction(action, batchContext = {}, priorBatchResults 
       updated_at: new Date().toISOString(),
     }).eq('id', action.id);
     return { action_id: action.id, status: 'failed', error: `Unknown: ${action.action_type}` };
+  }
+
+  // ═══ not_before_seconds (2026-09-21) ═════════════════════════════
+  // A declarative "hold this action for N seconds after it was queued",
+  // usable from a rule row. Built on retry_at — the executor's existing
+  // deferral — rather than a sleep: a sleeping handler holds an executor
+  // slot and dies with the deploy, and the claim query at :claimActions
+  // already honours retry_at, so a deferred row simply is not claimed yet.
+  //
+  // The one live use is the reply-recovery send: giving a rep three minutes
+  // to answer first means the bot's apology never lands on top of a human
+  // reply. Measured from created_at, not from now, so a row that was
+  // already queued 10 minutes ago runs immediately instead of restarting
+  // the clock on every sweep — a now-based check never converges.
+  //
+  // created_at always arrives: claim_agent_actions is RETURNS SETOF
+  // agent_actions / RETURNING *, and the legacy fallback selects *. If it
+  // ever stops arriving, the action runs NOW and says so — deferring from
+  // now() instead would re-defer on every sweep and never run at all.
+  const hold = decideNotBefore(action, Date.now());
+  if (hold.warn) console.warn(`[ActionExecutor] ${action.action_type} #${action.id} ${hold.warn}`);
+  if (hold.retry_at) {
+    await supabase.from('agent_actions').update({
+      status: 'pending',
+      retry_at: hold.retry_at,
+      error_message: `deferred: not_before_seconds=${hold.seconds}`,
+      updated_at: new Date().toISOString(),
+    }).eq('id', action.id);
+    console.log(`[ActionExecutor] ⏸️ ${action.action_type} #${action.id} held until ${hold.retry_at} (not_before_seconds=${hold.seconds})`);
+    return { action_id: action.id, status: 'pending', deferred: true, retry_at: hold.retry_at, reason: 'not_before_seconds' };
   }
 
   await supabase.from('agent_actions').update({

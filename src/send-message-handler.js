@@ -2573,6 +2573,26 @@ async function verifyPriorSendLanded(action, channel) {
 // MAIN HANDLER
 // ═══════════════════════════════════════════════════════════════════
 
+/**
+ * The first outbound message that post-dates a given inbound. (2026-09-21)
+ *
+ * Pure so the decision is testable without a GHL thread. Used by the
+ * skip_if_answered_since_inbound gate: if anything went out after the message
+ * we are apologising for, the recovery reply is not redundant — it is wrong.
+ *
+ * @param {Array} messages   GHL thread, newest first
+ * @param {number} inboundAtMs
+ * @returns {object|null} the answering message, or null
+ */
+export function findAnswerSinceInbound(messages, inboundAtMs) {
+  if (!Array.isArray(messages) || !Number.isFinite(inboundAtMs)) return null;
+  return messages.find((m) => {
+    if (m?.direction !== 'outbound') return false;
+    const ts = Date.parse(m.dateAdded || m.dateUpdated || '');
+    return Number.isFinite(ts) && ts > inboundAtMs;
+  }) || null;
+}
+
 export async function executeSendMessage(action, context) {
   const _tStart = Date.now(); // 2026-07-03 hotfix: phase-timing telemetry
   const contactId = action.target_id;
@@ -2603,6 +2623,64 @@ export async function executeSendMessage(action, context) {
   }
   if (!['sms', 'email', 'livechat'].includes(channel)) {
     throw new Error(`Invalid channel "${channel}" — must be "sms", "email", or "livechat"`);
+  }
+
+  // ── skip_if_answered_since_inbound (2026-09-21) ────────────────
+  // For the missed-reply recovery send. The whole point of that reply is
+  // "this person texted us and nobody answered" — so if ANYONE answered in
+  // the meantime, the reply is not just redundant, it is wrong: it opens
+  // with an apology for a silence that no longer exists, on top of a rep's
+  // message.
+  //
+  // Two things land in that window and this covers both: a human rep
+  // replying in GHL, and a reply produced by the re-analysis this same rule
+  // family queues first (AGENTIC_REPLY_SLA_REANALYZE). Pairs with
+  // not_before_seconds, which is what creates the window.
+  //
+  // Distinct from the gates further down: those compare the DRAFT against
+  // recent outbounds (near-duplicate) or yield to a newer INBOUND. This one
+  // asks a simpler question — has anything at all gone out since the message
+  // we are apologising for?
+  if (payload.skip_if_answered_since_inbound === true) {
+    const inboundAtRaw = payload.inbound_at || context.inbound_at || null;
+    const inboundAtMs = inboundAtRaw ? Date.parse(inboundAtRaw) : NaN;
+    if (!Number.isFinite(inboundAtMs)) {
+      // No reference point means the check cannot run. Skipping rather than
+      // sending: an unanchored recovery apology is the exact message this
+      // gate exists to prevent, and a dropped recovery costs nothing that
+      // the alert rule does not already report.
+      console.warn(`[SendMessage] ⏭️ ${contactId} action ${action.id} asked for skip_if_answered_since_inbound but carries no usable inbound_at — skipping rather than sending an unanchored apology`);
+      return { skipped: true, reason: 'answered_check_no_inbound_at', contact_id: contactId, channel };
+    }
+    try {
+      const fetched = await fetchRecentMessages(contactId);
+      const answeringMsg = findAnswerSinceInbound(fetched?.messages, inboundAtMs);
+      if (answeringMsg) {
+        console.log(`[SendMessage] ⏭️ ANSWERED SINCE INBOUND: ${contactId} action ${action.id} — an outbound at ${answeringMsg.dateAdded || answeringMsg.dateUpdated} post-dates the inbound at ${inboundAtRaw}; the recovery reply is no longer needed`);
+        return {
+          skipped: true,
+          reason: 'answered_since_inbound',
+          contact_id: contactId,
+          channel,
+          inbound_at: inboundAtRaw,
+          answered_at: answeringMsg.dateAdded || answeringMsg.dateUpdated || null,
+        };
+      }
+    } catch (err) {
+      // Deliberately neither fail-open nor fail-closed. Sending blind risks
+      // talking over a rep; skipping drops a recovery for a transient GHL
+      // blip. Defer instead — the same resolution the tag-source failure
+      // below takes, and the window this send is already inside makes two
+      // more minutes harmless.
+      console.warn(`[SendMessage] ⏸️ DEFERRED: answered-since-inbound check failed for ${contactId} (${err.message}) — retrying in 120s rather than guessing`);
+      return {
+        deferred: true,
+        reason: 'answered_check_unavailable',
+        retry_at: new Date(Date.now() + 120 * 1000).toISOString(),
+        contact_id: contactId,
+        channel,
+      };
+    }
   }
 
   // ── Guardrail 1: Fetch contact tags ────────────────────────────
