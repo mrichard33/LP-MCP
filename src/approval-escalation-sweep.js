@@ -40,6 +40,10 @@ import supabase from './supabase.js';
 import { emitEvent } from './event-emitter.js';
 import { postSlackApprovalCard, slackApprovalsEnabled } from './slack.js';
 import { closeStaleApprovalCards } from './approval-card-autoclose.js';
+import { buildApprovalCardText, stripRulePrefix } from './approval-card.js';
+import { loadApprovalCardContext } from './approval-card-context.js';
+import { resolveContactInfo, getEventContext } from './actions/resolvers.js';
+import { buildNotificationEnrichment } from './actions/enrichment.js';
 
 // ═══════════════════════════════════════════════════════════════════
 // CONSTANTS
@@ -106,23 +110,100 @@ async function postGroupMe(text) {
 }
 
 /**
- * Build a single-message escalation summary for a batch of related actions.
- * Groups by rule_applied so the operator sees one alert per rule firing,
- * not one per action.
+ * Can the Phase 2 auto-execute path run this action on its own?
+ * Same gates as the Phase 2 loop below — kept in one place so the reminder
+ * card cannot promise an auto-run the sweep will not actually do.
  */
-function buildEscalationMessage(rule, actionGroup) {
-  const ageMin = Math.round(actionGroup.maxAgeMin);
-  const targetId = actionGroup.targetId;
-  const actionCount = actionGroup.actions.length;
-  const actionTypes = [...new Set(actionGroup.actions.map(a => a.action_type))].join(', ');
+function isAutoExecutable(action) {
+  if (!SAFE_ACTION_TYPES.has(action.action_type)) return false;
+  if ((action.confidence || 0) < MIN_CONFIDENCE_FOR_AUTO_EXECUTE) return false;
+  if (action.action_type === 'send_notification' && action.target_system !== 'groupme') return false;
+  return true;
+}
 
+/**
+ * 2026-09-22 — the "If nobody decides" line on the timeout reminder.
+ *
+ * The old reminder said only "Approve in dashboard", so the approver could not
+ * tell whether ignoring it was safe. It often is not neutral: #486315 (mark a
+ * $116,000 opportunity WON) was a 30-minute reminder, and at 60 minutes this
+ * sweep ran it with nobody having decided. The card now says so up front.
+ *
+ * Mirrors Phases 2 and 3 exactly. Pure.
+ */
+export function describeTimeoutOutcome(actions, nowMs = Date.now()) {
+  const ageMin = (a) => (nowMs - new Date(a.created_at).getTime()) / 60000;
+  const oldest = Math.max(...actions.map(ageMin));
+
+  if (actions.some(a => a.action_type === 'send_message')) {
+    const left = Math.max(0, Math.round(PHASE_3_AUTO_REJECT_SEND_MESSAGE_AFTER_HOURS * 60 - oldest));
+    const when = left >= 60 ? `about ${Math.floor(left / 60)}h ${left % 60}m` : `about ${left} min`;
+    return `If nobody decides: the reply is dropped at the ${PHASE_3_AUTO_REJECT_SEND_MESSAGE_AFTER_HOURS}-hour mark (in ${when}) and is never sent.`;
+  }
+  if (actions.every(isAutoExecutable)) {
+    const left = Math.max(0, Math.round(PHASE_2_AUTO_EXECUTE_AFTER_MIN - oldest));
+    return left > 0
+      ? `If nobody decides: it runs AUTOMATICALLY at the ${PHASE_2_AUTO_EXECUTE_AFTER_MIN}-minute mark (in about ${left} min). Reject now to stop it.`
+      : 'If nobody decides: it runs AUTOMATICALLY on the next check (within 15 min). Reject now to stop it.';
+  }
+  return 'If nobody decides: nothing happens — it keeps waiting for you.';
+}
+
+/**
+ * Minimal reminder, used only if building the full card fails. Same rule as
+ * every card: plain words in the body, the rule code only in the ref line.
+ */
+function buildFallbackReminder(group, ref) {
+  const first = group.actions[0] || {};
+  const ageMin = Math.round(group.maxAgeMin);
   return [
-    `⏰ APPROVAL TIMEOUT (${ageMin}min): ${rule}`,
-    `Contact: ${targetId}`,
-    `${actionCount} action${actionCount === 1 ? '' : 's'} pending: ${actionTypes}`,
-    `IDs: ${actionGroup.actions.map(a => a.id).join(', ')}`,
-    `Approve in dashboard or via LP MCP approve_action tool.`,
+    `⏰ Still waiting on approval${ref ? ` · #${ref}` : ''} · ${ageMin} min`,
+    stripRulePrefix(first.reasoning) || `${group.actions.length} action${group.actions.length === 1 ? '' : 's'} waiting.`,
+    describeTimeoutOutcome(group.actions),
+    `ref: ${[group.rule, `actions ${group.actions.map(a => a.id).join(', ')}`].filter(Boolean).join(' · ')}`,
   ].join('\n');
+}
+
+/**
+ * 2026-09-22 — the timeout reminder is the approval card again, not a
+ * summary of codes. It printed `⏰ APPROVAL TIMEOUT (47min): P2_JOB_TERMINAL_WON`,
+ * a raw GHL contact id and bare action types — the same defect PR #1007 fixed
+ * on the first card, surviving on the second chance to decide.
+ *
+ * Returns the body shared by GroupMe and Slack (no reply footer). Never throws.
+ */
+export async function buildTimeoutReminder(group, ref, deps = {}) {
+  const resolveContact = deps.resolveContactInfo || resolveContactInfo;
+  const eventContext = deps.getEventContext || getEventContext;
+  const enrich = deps.buildNotificationEnrichment || buildNotificationEnrichment;
+  const first = group.actions[0];
+  try {
+    const info = await resolveContact(first.target_id).catch(() => ({ name: null, phone: null }));
+    const ctx = await eventContext(first).catch(() => ({}));
+    const enrichment = await enrich(first.target_id, ctx, {
+      lpLead: info.lpLead || null, ghlContactId: info.ghlContactId || null, ghlContact: info.ghlContact || null,
+    }).catch(() => ({}));
+    const { rule, event } = await loadApprovalCardContext(first, deps);
+    return buildApprovalCardText({
+      actions: group.actions,
+      shortRef: ref || String(first.id),
+      rule,
+      event,
+      contactName: info.name,
+      contactPhone: info.phone,
+      enrichment,
+      header: `⏰ Still waiting on approval${ref ? ` · #${ref}` : ''} · ${Math.round(group.maxAgeMin)} min`,
+      notes: [describeTimeoutOutcome(group.actions)],
+    });
+  } catch (err) {
+    console.warn(`[ApprovalEscalation] reminder card build failed (${err.message}) — sending the minimal reminder`);
+    return buildFallbackReminder(group, ref);
+  }
+}
+
+/** GroupMe footer: a typed reply works only when a card row carries the ref. */
+function reminderFooter(ref) {
+  return ref ? `Reply: Yes ${ref}  •  No ${ref}` : 'Approve or reject in the dashboard.';
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -188,7 +269,7 @@ export async function runApprovalEscalationSweep({ dryRun = false } = {}) {
   // a Phase 1 candidate. Phase 2 + Phase 3 are subsets of Phase 1.
   const { data: actions, error } = await supabase
     .from('agent_actions')
-    .select('id, rule_applied, action_type, target_system, target_id, action_payload, confidence, created_at')
+    .select('id, event_id, batch_id, reasoning, rule_applied, action_type, target_system, target_id, action_payload, confidence, created_at')
     .eq('status', 'pending_approval')
     .gte('created_at', lookbackStart)
     .lte('created_at', escalateBefore)
@@ -281,11 +362,8 @@ export async function runApprovalEscalationSweep({ dryRun = false } = {}) {
   // ─── PHASE 2: Auto-execute safe actions over 60min ───────────────
   for (const action of actions) {
     if (action.created_at > autoExecBefore) continue;
-    if (!SAFE_ACTION_TYPES.has(action.action_type)) continue;
-    if ((action.confidence || 0) < MIN_CONFIDENCE_FOR_AUTO_EXECUTE) continue;
-
-    // send_notification is only safe when going to GroupMe
-    if (action.action_type === 'send_notification' && action.target_system !== 'groupme') continue;
+    // send_notification is only safe when going to GroupMe — see isAutoExecutable.
+    if (!isAutoExecutable(action)) continue;
 
     if (dryRun) {
       console.log(`[ApprovalEscalation] DRY RUN would auto-execute ${action.id} (${action.action_type})`);
@@ -340,7 +418,7 @@ export async function runApprovalEscalationSweep({ dryRun = false } = {}) {
   // low-confidence items that humans still need to look at.
   const { data: stillStuck } = await supabase
     .from('agent_actions')
-    .select('id, rule_applied, action_type, target_system, target_id, action_payload, confidence, created_at')
+    .select('id, event_id, batch_id, reasoning, rule_applied, action_type, target_system, target_id, action_payload, confidence, created_at')
     .eq('status', 'pending_approval')
     .gte('created_at', lookbackStart)
     .lte('created_at', escalateBefore)
@@ -377,19 +455,24 @@ export async function runApprovalEscalationSweep({ dryRun = false } = {}) {
       continue;
     }
 
-    const text = buildEscalationMessage(group.rule, group);
-    const ok = await postGroupMe(text);
+    // The ref comes first now (2026-09-22) so BOTH cards carry it: the GroupMe
+    // reminder can then take a typed "Yes <ref>", not only the Slack buttons.
+    let ref = null;
+    try {
+      ref = await ensureApprovalRef(group);
+    } catch (err) {
+      console.warn(`[ApprovalEscalation] ref claim threw (ignored): ${err.message}`);
+    }
+    const card = await buildTimeoutReminder(group, ref);
+    const ok = await postGroupMe(`${card}\n\n${reminderFooter(ref)}`);
     if (!ok) { errors++; continue; }
 
     // Slack button card. Best-effort: never fails or delays the sweep.
-    if (slackApprovalsEnabled()) {
+    if (ref && slackApprovalsEnabled()) {
       try {
-        const ref = await ensureApprovalRef(group);
-        if (ref) {
-          const card = text.replace('Approve in dashboard or via LP MCP approve_action tool.', `Approve or reject below (ref #${ref}).`);
-          const r = await postSlackApprovalCard(card, ref);
-          if (!r?.ok) console.warn(`[ApprovalEscalation] Slack card #${ref} failed: ${r?.error}`);
-        }
+        const r = await postSlackApprovalCard(card, ref);
+        if (r?.ok) console.log(`[ApprovalEscalation] Slack reminder #${ref} posted (channel ${r.channel}, ts ${r.ts})`);
+        else console.warn(`[ApprovalEscalation] Slack card #${ref} failed: ${r?.error}`);
       } catch (err) {
         console.warn(`[ApprovalEscalation] Slack card error (ignored): ${err.message}`);
       }

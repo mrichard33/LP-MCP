@@ -684,7 +684,9 @@ function approvalFooter(shortRef) {
 async function _postSlackButtonsOrMirror(cardText, fallbackText, shortRef) {
   try {
     const r = await postSlackApprovalCard(cardText, shortRef);
-    if (r?.ok) return;
+    // 2026-09-22 — a success used to leave no trace, so "did the card reach
+    // Slack?" could only be answered by a failure line's absence. Log it.
+    if (r?.ok) { console.log(`[Slack] approval card #${shortRef} posted (channel ${r.channel}, ts ${r.ts})`); return; }
     console.warn(`[Slack] approval card #${shortRef} failed (${r?.error}) — falling back to text mirror`);
   } catch (err) {
     console.warn(`[Slack] approval card #${shortRef} threw (${err.message}) — falling back to text mirror`);

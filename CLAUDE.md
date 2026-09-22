@@ -57,6 +57,10 @@ Contact) and feeds both GroupMe and the Slack button card through `renderApprova
 `src/groupme.js`. New action or event type? Add its sentence to `describeApprove` / `describeEvent`
 — the fallback works, but it reads like a config dump. Never write a pronoun for the contact; the
 card uses their first name. Dry-run any card with `node scripts/render-approval-card.js <action id>`.
+The 30-minute reminder (`buildTimeoutReminder` in `src/approval-escalation-sweep.js`) is the same
+card with a `⏰ Still waiting` header plus an "If nobody decides" line — keep that line in step with
+the sweep's own phases, because ignoring a reminder is not neutral: safe actions auto-run at 60 min.
+A Slack card that posts logs `[Slack] approval card #<ref> posted`; look for that line, not silence.
 
 **A celebration and a stat line are two different jobs — do not let one become the other.** The
 sale-announcement post carried the rep's month-to-date total inside the message for one day, and the
