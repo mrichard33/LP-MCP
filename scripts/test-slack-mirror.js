@@ -20,6 +20,8 @@ const CH_CANVASS = 'C_CANVASS_ALL';
 const CH_OPS = 'C_OPS';
 const CH_FTMYR = 'C_CANVASS_FTMYR';
 const CH_FTLAU = 'C_CANVASS_FTLAU';
+const CH_SERVICE = 'C_SERVICE_CONTACT_CENTER';
+const CH_SERVICE_ORL = 'C_SERVICE_ORLANDO';
 
 // ─── fetch stub: capture Slack posts, script the response ───────
 const posts = [];
@@ -47,12 +49,14 @@ const stubDb = {
             { channel_name: 'canvass-fortmyers', slack_channel_id: CH_FTMYR },
             { channel_name: 'canvass-fortlauderdale', slack_channel_id: CH_FTLAU },
             { channel_name: 'lead-intelligence', slack_channel_id: CH_MAIN },
+            { channel_name: 'service-orlando', slack_channel_id: CH_SERVICE_ORL },
           ] };
         }
         if (table === 'slack_market_slugs') {
           return { data: [
             { market_code: 'FTMYR', slug: 'fortmyers' },
             { market_code: 'FTLAU', slug: 'fortlauderdale' },
+            { market_code: 'ORL', slug: 'orlando' },
           ] };
         }
         throw new Error(`unexpected table: ${table}`);
@@ -84,6 +88,7 @@ process.env.SLACK_BOT_TOKEN = 'xoxb-test';
 process.env.SLACK_CHANNEL_MAIN = CH_MAIN;
 process.env.SLACK_CHANNEL_CANVASS = CH_CANVASS;
 process.env.SLACK_CHANNEL_OPS = CH_OPS;
+process.env.SLACK_CHANNEL_SERVICE = CH_SERVICE;
 const disabled = await import('../src/slack.js?disabled');
 
 test('MIRROR_ENABLED=false → {mirrored:false, reason:disabled}, fetch never called', async () => {
@@ -229,4 +234,45 @@ test('empty text → disabled reason, fetch never called', async () => {
   const r = await slack.mirrorToSlack('', 'main');
   assert.deepEqual(r, { mirrored: false, reason: 'disabled' });
   assert.equal(posts.length, 0);
+});
+
+
+// ─── service family (2026-09-21) ────────────────────────────────
+// Customer service issues surfaced by a missed reply route to the market's
+// service channel, not the sales floor. Same alsoRollup:false discipline as
+// sales — a service issue belongs to the market that installed the job.
+
+test('service + a market CODE resolves the market channel ONLY', async () => {
+  reset(slack);
+  const r = await slack.mirrorToSlack('screen is torn', 'service', { market: 'ORL' });
+  assert.deepEqual(r, { mirrored: true, channels: 1, sent: 1 }, 'one channel — no rollup copy, alsoRollup is false for service');
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].body.channel, CH_SERVICE_ORL);
+});
+
+test('service with NO market falls back to the contact-center channel, not main', async () => {
+  // The fallback matters: an unrouted service issue must still reach someone
+  // who handles service. Landing in #lead-intelligence would bury it.
+  reset(slack);
+  const r = await slack.mirrorToSlack('warranty question', 'service');
+  assert.deepEqual(r, { mirrored: true, channels: 1, sent: 1 });
+  assert.equal(posts[0].body.channel, CH_SERVICE);
+  assert.notEqual(posts[0].body.channel, CH_MAIN);
+});
+
+test('service with an unresolvable market falls back rather than dropping', async () => {
+  // The market NAME instead of the CODE is the classic mistake — the card
+  // prints "Orlando / Central Florida" while slack_market_slugs is keyed on
+  // ORL. It must degrade to the rollup, never to nothing.
+  reset(slack);
+  const r = await slack.mirrorToSlack('leak after install', 'service', { market: 'Orlando / Central Florida' });
+  assert.deepEqual(r, { mirrored: true, channels: 1, sent: 1 });
+  assert.equal(posts[0].body.channel, CH_SERVICE);
+});
+
+test('service does not disturb canvass routing', async () => {
+  reset(slack);
+  const r = await slack.mirrorToSlack('door knocked', 'canvass', { market: 'FTMYR' });
+  assert.deepEqual(r, { mirrored: true, channels: 2, sent: 2 }, 'canvass still copies to its rollup');
+  assert.deepEqual(posts.map((p) => p.body.channel).sort(), [CH_CANVASS, CH_FTMYR].sort());
 });

@@ -184,7 +184,7 @@ test('D1 — removed action types are absent from ACTION_HANDLERS entirely', asy
   }
 });
 
-test('D1 — the registry holds exactly the 75 documented action types', async () => {
+test('D1 — the registry holds exactly the 76 documented action types', async () => {
   const { ACTION_HANDLERS } = await import('../src/actions/index.js');
   const types = Object.keys(ACTION_HANDLERS);
   // The header comment in src/actions/index.js enumerates these by name. It
@@ -194,11 +194,13 @@ test('D1 — the registry holds exactly the 75 documented action types', async (
   // 11 campaign-composition ops).
   // 2026-09-11 (Alfredo Fontan): 73 → 74, persist_established_facts — the
   // analyzer-time write of facts the lead stated in their own words.
-  // 2026-09-21 (E.0 re-entry, Mark's ruling): 74 → 75 and five9_* 37 → 38,
+  // 2026-09-21 (missed-reply self-heal): 74 → 75, reanalyze_reply — re-runs a
+  // failed message analysis so the NORMAL rules own the outcome.
+  // 2026-09-21 (E.0 re-entry, Mark's ruling): 75 → 76 and five9_* 37 → 38,
   // five9_remove_numbers_from_dnc_reentry — the ONE welded DNC lift. The
   // general five9_remove_numbers_from_dnc stays forbidden; see
   // scripts/test-five9-op-registry.js for that pin.
-  assert.equal(types.length, 75);
+  assert.equal(types.length, 76);
   assert.equal(types.filter(t => t.startsWith('five9_')).length, 38);
   // Every type the coercion loop covers must actually be dispatchable.
   for (const actionType of FIVE9_WRITE_TYPES) {
