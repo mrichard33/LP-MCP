@@ -361,4 +361,67 @@ export function registerKbIngestionRoutes(app) {
       res.status(500).json({ error: err.message });
     }
   });
+
+  /**
+   * FAQ threshold probe — READ-ONLY, and the reason this exists.
+   *
+   * 2026-09-22. Calibrating KB_FAQ_MIN_SIMILARITY meant texting the live bot
+   * one question at a time and reading the audit table afterwards: 6 of an
+   * 18-question set landed in a whole afternoon, each one a real SMS to a real
+   * conversation. There was no way to ask "what would this question score?"
+   * without sending it.
+   *
+   * Always queries at threshold 0 and returns the true similarity for every
+   * candidate, so a miss is legible ("0.378, just under the floor") instead of
+   * an empty result. `would_match` is computed in JS against the CURRENT floor
+   * rather than pushed into the RPC, which is what makes a floor change
+   * testable before it is deployed.
+   *
+   * Sends nothing, writes nothing, logs no audit row — it cannot disturb a
+   * conversation or contaminate the kb_vector_queries sample it is used to
+   * interpret.
+   *
+   *   GET /n8n/kb/faq-probe?q=How+many+days+will+you+be+at+my+house
+   *   GET /n8n/kb/faq-probe?q=...&threshold=0.35&channel=sms&limit=5
+   */
+  app.get('/n8n/kb/faq-probe', async (req, res) => {
+    try {
+      const q = String(req.query?.q || '').trim();
+      if (!q) return res.status(400).json({ error: 'q required' });
+
+      const channel = String(req.query?.channel || 'sms');
+      const limit = Math.min(parseInt(req.query?.limit || '5', 10) || 5, 20);
+      const floor = req.query?.threshold !== undefined
+        ? parseFloat(req.query.threshold)
+        : parseFloat(process.env.KB_FAQ_MIN_SIMILARITY || '0.40');
+
+      const { embed } = await import('./openai-embeddings.js');
+      const { matchFaqsSemantic } = await import('./tier1-semantic.js');
+
+      const started = Date.now();
+      const queryEmbedding = await embed(q);
+      const rows = await matchFaqsSemantic(queryEmbedding, channel, limit, 0);
+
+      const candidates = (rows || []).map(r => ({
+        faq_id: r.id ?? r.faq_id ?? null,
+        question_pattern: r.question_pattern,
+        similarity: Math.round((r.similarity ?? 0) * 1000) / 1000,
+        would_match: (r.similarity ?? 0) >= floor,
+      }));
+
+      res.json({
+        query: q,
+        channel,
+        threshold: floor,
+        top_similarity: candidates[0]?.similarity ?? null,
+        match_count: candidates.filter(c => c.would_match).length,
+        matched: candidates.filter(c => c.would_match).map(c => c.question_pattern),
+        candidates,
+        latency_ms: Date.now() - started,
+      });
+    } catch (err) {
+      console.error('[KBIngest] /faq-probe error:', err.message);
+      res.status(500).json({ error: err.message });
+    }
+  });
 }
