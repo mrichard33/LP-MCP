@@ -240,6 +240,7 @@ import { executeAddTag, executeRemoveTag, executeSetStage } from './handlers/tag
 import { executeMoveOpportunity, executeUpdateOpportunity } from './handlers/opportunities.js';
 // 2026-09-18 — status → GHL lost reason, shared with scripts/reconcile-p2-stages.js
 import { lostReasonIdForJobStatus } from '../lp-lost-reasons.js';
+import { postL6AfterP2Loss } from '../loss-routing/l6.js';  // 2026-09-22 — P2 loss → L.6
 import { executeAddToWorkflow, executeRemoveFromWorkflow, executeIssueHold } from './handlers/workflows.js';
 import { executeBookAppointment, executeCancelAppointment, executeRescheduleAppointment, executeUpdateAppointmentStatus } from './handlers/appointments.js';
 import { executeSyncLpAppointmentToGhl } from './handlers/lp-ghl-appointment-sync.js';
@@ -604,10 +605,23 @@ async function executeUpdateOpportunityWithLostReason(action, context) {
     `[ActionExecutor] update_opportunity: lost reason ${lostReasonId} derived from `
     + `job status "${jobStatus}" (event ${event.id})`,
   );
-  return executeUpdateOpportunity(
+  const result = await executeUpdateOpportunity(
     { ...action, action_payload: { ...payload, lostReasonId } },
     context,
   );
+
+  // 2026-09-22 — the P2 loss must reach L.6. Closing the opportunity alone left
+  // ~510 lost P2 contacts with no Lost Type, no P3 placement, no loss tags and
+  // no marketing removal, because nothing ever called L.6. Best-effort: the
+  // opportunity is already closed, so an L.6 failure is recorded on the result
+  // (execution_result.l6 and tag_hygiene_log) and never fails the action — a
+  // retry would re-close an opportunity that is already lost.
+  const l6 = await postL6AfterP2Loss(action, result, lostReasonId);
+  if (l6) {
+    console.log(`[ActionExecutor] update_opportunity: L.6 ${l6.action}${l6.reason ? ` (${l6.reason})` : ''} for opportunity ${result?.opportunity_id}`);
+    return { ...result, l6 };
+  }
+  return result;
 }
 
 // ─── Handler registry ──────────────────────────────────────────────

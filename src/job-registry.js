@@ -180,6 +180,18 @@ export const JOBS = Object.freeze([
     enabledDefault: true,
     isEnabled: (env) => String(env.P2_UNRESOLVABLE_MONITOR_ENABLED || 'true').toLowerCase() !== 'false',
   },
+  {
+    id: 'tag-hygiene-sweep',
+    label: 'Tag hygiene sweep',
+    group: 'ghl',
+    cadence: 'daily 03:00 ET',
+    enabledEnv: 'TAG_SWEEP_ENABLED',
+    // OFF by default (2026-09-22): unlike the monitors above, this job WRITES
+    // to GHL contacts. It is switched on by setting TAG_SWEEP_ENABLED=true, and
+    // even then runs in TAG_SWEEP_MODE=report until Mark flips it to apply.
+    enabledDefault: false,
+    isEnabled: (env) => String(env.TAG_SWEEP_ENABLED || '').toLowerCase() === 'true',
+  },
 ]);
 
 /** Ids only — handy for tests and for asserting the wiring matches the roster. */

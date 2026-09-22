@@ -202,6 +202,14 @@ Anything that turns on the exact day must filter on the source. `sync-leads.js` 
 survives every sync — that is why the backfill is durable, and why adding `close_date` to that row
 object would silently erase all of this.
 
+**`tag_hygiene_log` is the L.6 idempotency record, not just a log.** A P2 loss closed by
+`P2_JOB_TERMINAL_LOST` now posts to L.6 (`src/loss-routing/l6.js`), and so does
+`scripts/backfill-loss-routing.js --mode=p2`. A post is refused when that table already holds a
+`posted_l6` row with `mode='apply'` for the opportunity, when the live contact already has a `p3:*`
+tag, or when the table cannot be read — a double post routes a contact twice. Dry runs log under
+`mode='report'` and never count. The daily tag sweep (`src/jobs/tag-hygiene-sweep.js`) logs there
+too, and never removes a tag in `PROTECTED_TAGS` (`src/tag-hygiene/rules.js`), whatever rule matched.
+
 **Rep names do not match across the LP/GHL boundary.** LP stores `"Last, First"` (`O'Connor, Tim`);
 GHL's Rep Display Name (`yxOTDIT7Um0JxkOPUbPo`) holds `"First Last"` (`Tim O'Connor`). An exact
 compare finds ZERO rows for every rep on the floor and fails silently — a metric that reads "no sales"
