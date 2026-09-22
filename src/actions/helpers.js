@@ -51,7 +51,25 @@ export function isLPLeadId(id) {
  */
 export async function ghlFetch(method, path, body = null, rateOpts = {}) {
   if (!GHL_API_KEY) throw new Error('GHL_API_KEY not configured');
-  await acquireToken({ maxWaitMs: rateOpts.maxWaitMs });
+  // 2026-09-22 — `priority` MUST be forwarded, not just `maxWaitMs`.
+  //
+  // This line read `acquireToken({ maxWaitMs: rateOpts.maxWaitMs })` for a day
+  // after the priority lane shipped (#988), so every caller asking for
+  // `priority: 'high'` was silently served as a normal caller and the lane was
+  // dead code on the one path built for it. `/n8n/rate-limiter/stats` read
+  // `highAcquired: 0` across 42 real ActiveProspect leads — a counter that can
+  // only stay 0 if no priority token was ever drawn.
+  //
+  // What it cost, measured on that traffic (Railway http-response-time,
+  // /intake/ap-resolve, busiest hour): p50 2277ms, p90 3004ms against a 3000ms
+  // ceiling — at least a tenth of real leads timing out and failing open, for
+  // exactly the reason the lane was built to remove.
+  //
+  // The bug survived because the tests sat on either side of this seam and
+  // never across it: the limiter suite calls acquireToken directly, the
+  // resolver suite stubs ghlFetch. scripts/test-booking-token-wait.js now
+  // asserts the forward against the limiter's own live counter.
+  await acquireToken({ maxWaitMs: rateOpts.maxWaitMs, priority: rateOpts.priority });
   const url = `https://services.leadconnectorhq.com${path}`;
   const opts = {
     method,
