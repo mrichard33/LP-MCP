@@ -141,3 +141,24 @@ export function lostReasonIdForJobStatus(jobStatus) {
   const name = lostReasonNameForJobStatus(jobStatus);
   return name === null ? null : (LOST_REASON_IDS[name] || null);
 }
+
+/**
+ * The Lost Reason NAME for a GHL lost reason id, or null when the id is not one
+ * of ours. Pure — the reverse of LOST_REASON_IDS.
+ *
+ * 2026-09-22: added for the L.6 auto-call. L.6 reads the reason by LABEL, while
+ * an opportunity only carries the id, so every post needs this lookup. An
+ * unknown id returns null and the caller refuses to post — L.6 would otherwise
+ * classify a loss it has no label for.
+ *
+ * @param {string} id
+ * @returns {string|null}
+ */
+export function lostReasonNameForId(id) {
+  const key = typeof id === 'string' ? id.trim() : '';
+  if (!key) return null;
+  for (const [name, value] of Object.entries(LOST_REASON_IDS)) {
+    if (value === key) return name;
+  }
+  return null;
+}

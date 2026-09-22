@@ -305,6 +305,7 @@ import { registerFreshnessRefreshRoutes, startFreshnessRefreshScheduler } from '
 // catches has been closed twice before and reopened unnoticed both times.
 import { registerLinkLeakRoutes, startLinkLeakScheduler } from './jobs/link-leak-monitor.js';
 import { registerP2UnresolvableRoutes, startP2UnresolvableScheduler } from './jobs/p2-unresolvable-monitor.js';
+import { registerTagHygieneRoutes, startTagHygieneScheduler } from './jobs/tag-hygiene-sweep.js';  // 2026-09-22
 import { registerCiRoutes } from './ci/routes.js';
 import { startCiWorkerScheduler } from './ci/worker.js';
 import { startCiDiscoveryScheduler } from './jobs/ci-discovery-scheduler.js';
@@ -2373,6 +2374,7 @@ registerFive9SnapshotRoutes(app, authenticate);
 registerFreshnessRefreshRoutes(app);
 registerLinkLeakRoutes(app);
 registerP2UnresolvableRoutes(app);
+registerTagHygieneRoutes(app, authenticate);
 registerCiRoutes(app, authenticate);            // 2026-08-21 — Call Intelligence ingest (PR 2; worker ships disarmed)
 
 const server = app.listen(PORT, async () => {
@@ -2432,6 +2434,7 @@ const server = app.listen(PORT, async () => {
   startFreshnessRefreshScheduler();
   startLinkLeakScheduler();
   startP2UnresolvableScheduler();
+  startTagHygieneScheduler();
   // Probe ffmpeg, which transcodes Five9's GSM 6.10 recordings to a format a
   // browser can actually play. A CLEAR LOG LINE, NOT A CRASH: without it the
   // whole pipeline still runs and links still resolve, they just serve the
