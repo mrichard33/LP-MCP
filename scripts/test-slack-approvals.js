@@ -40,7 +40,7 @@ function clickPayload(overrides = {}) {
     type: 'block_actions',
     user: { id: 'U_MARK', name: 'mark' },
     response_url: 'https://hooks.slack.com/actions/T1/B2/C3',
-    message: { text: '🔔 APPROVAL [#427743]' },
+    message: { text: '🔔 Approval needed · #427743' },
     actions: [{ action_id: ACTION_APPROVE, value: '427743' }],
     ...overrides,
   };
@@ -143,7 +143,7 @@ test('approve and reject buttons parse', () => {
   assert.equal(approve.userId, 'U_MARK');
   assert.equal(approve.userName, 'mark');
   assert.equal(approve.responseUrl, 'https://hooks.slack.com/actions/T1/B2/C3');
-  assert.equal(approve.originalText, '🔔 APPROVAL [#427743]');
+  assert.equal(approve.originalText, '🔔 Approval needed · #427743');
 
   const reject = parseInteraction(formBody(clickPayload({
     actions: [{ action_id: ACTION_REJECT, value: '99' }],
@@ -177,7 +177,7 @@ test('a response_url that is not hooks.slack.com is dropped', () => {
 // ─── buildApprovalBlocks ─────────────────────────────────────────
 
 test('the card carries two buttons bound to the same ref', () => {
-  const blocks = buildApprovalBlocks('🔔 APPROVAL [#427743]', 427743);
+  const blocks = buildApprovalBlocks('🔔 Approval needed · #427743', 427743);
   const actions = blocks.find((b) => b.type === 'actions');
   assert.equal(actions.elements.length, 2);
 
@@ -195,6 +195,29 @@ test('mrkdwn control characters in the card body are escaped', () => {
   assert.equal(escapeMrkdwn('a & b <c>'), 'a &amp; b &lt;c&gt;');
   const blocks = buildApprovalBlocks('Rep: Smith & <script>', '1');
   assert.equal(blocks[0].text.text, 'Rep: Smith &amp; &lt;script&gt;');
+});
+
+test('a plain-English card reaches Slack whole: same body, no typed-reply footer, code only in ref', async () => {
+  // 2026-09-22 — the Slack card is the same body as GroupMe minus the
+  // "Reply: Yes …" line; buttons replace it.
+  const { buildApprovalCardText } = await import('../src/approval-card.js');
+  const body = buildApprovalCardText({
+    actions: [{ id: 486315, event_id: 3856701, action_type: 'update_opportunity', action_payload: { status: 'won', pipeline: 'P2' }, rule_applied: 'P2_JOB_TERMINAL_WON' }],
+    shortRef: '486315',
+    rule: { rule_name: 'LP job reached a collected status -> mark P2 opportunity won' },
+    event: { id: 3856701, event_type: 'lp.job_status_changed', created_at: '2026-09-22T18:53:29Z', payload: { lp_job_id: '58856', old_status: 'Started', new_status: 'Paid In Full', job_value: 116000, branch_code: 'FTMYR' } },
+    contactName: 'Stacey Wheeler',
+    contactPhone: '5613739673',
+  });
+  const blocks = buildApprovalBlocks(body, '486315');
+  const text = blocks[0].text.text;
+  assert.equal(text, body); // nothing in this card needs mrkdwn escaping
+  assert.match(text, /^What happened: /m);
+  assert.match(text, /^If you approve: /m);
+  assert.match(text, /^If you reject: /m);
+  assert.doesNotMatch(text, /Reply: Yes/);
+  assert.deepEqual(text.split('\n').filter((l) => l.includes('P2_JOB_TERMINAL_WON')), ['ref: P2_JOB_TERMINAL_WON · event 3856701']);
+  assert.equal(blocks[1].elements[0].value, '486315');
 });
 
 // ─── handleInteraction ───────────────────────────────────────────
