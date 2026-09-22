@@ -50,6 +50,14 @@ any `action_id` that is not `deny_member` as an approval), and the relay copies 
 `X-Slack-*` signing headers — never `Authorization`. Unset `SLACK_SIGNING_SECRET` refuses
 everything, forwards included, so set the secret BEFORE repointing Slack.
 
+**Approval cards speak plain English; the rule code lives only in the `ref:` line.** A card that
+printed `P2_JOB_TERMINAL_WON` and `update_opportunity` could not be decided from (#486315). The body
+is built once, purely, in `src/approval-card.js` (What happened / If you approve / If you reject /
+Contact) and feeds both GroupMe and the Slack button card through `renderApprovalCard` in
+`src/groupme.js`. New action or event type? Add its sentence to `describeApprove` / `describeEvent`
+— the fallback works, but it reads like a config dump. Never write a pronoun for the contact; the
+card uses their first name. Dry-run any card with `node scripts/render-approval-card.js <action id>`.
+
 **A celebration and a stat line are two different jobs — do not let one become the other.** The
 sale-announcement post carried the rep's month-to-date total inside the message for one day, and the
 model turned it into a ledger entry: *"Craig Barela closes another one — $1,500 today, $36,300 on the

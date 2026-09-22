@@ -13,6 +13,14 @@
  *       "No 1234"           → reject
  *       "Edit 1234 <desc>"  → AI rewrites with the description as guidance
  *
+ * v2.0 — PLAIN-ENGLISH APPROVAL CARDS (2026-09-22).
+ *   PROBLEM: the card printed the rule CODE, a generic score/tier/prospect
+ *   header and a bare action_type (`update_opportunity`) — never what
+ *   happened, what approving changes, or what rejecting means (#486315).
+ *   FIX: renderApprovalCard() builds the body in src/approval-card.js from the
+ *   agent_rules name and the triggering system_events row. The rule code now
+ *   appears only in the `ref:` footer. Buttons, short_ref and dedup unchanged.
+ *
  * v1.9 — SHARED APPROVAL RESOLVER + SLACK BUTTONS (2026-09-21).
  *   PROBLEM: src/slack.js was send-only. Approval cards reached Slack as a text
  *   mirror whose footer read "Reply: Yes 1234", but nothing in this repo
@@ -155,6 +163,8 @@ import { generateResponse } from './response-generator.js';
 // mirrored to Slack at the send layer, so the two carry byte-identical text
 // with no second copy of any format. Fail-silent; see src/slack.js.
 import { mirrorToSlack, postSlackApprovalCard, slackApprovalsEnabled } from './slack.js';
+import { buildApprovalCardText, describeApprove, describeReject } from './approval-card.js';
+import { loadApprovalCardContext } from './approval-card-context.js';
 
 const GROUPME_BOT_ID = process.env.GROUPME_BOT_ID || '';
 const GROUPME_GROUP_ID = process.env.GROUPME_GROUP_ID || '';
@@ -661,24 +671,6 @@ const RULE_DISPLAY_NAMES = {
   'AGENTIC_RESPOND_POST_CHATBOT': '🤖 AGENTIC RESPONSE',
 };
 
-function formatActionSummary(actions) {
-  const parts = [];
-  for (const a of actions) {
-    if (a.action_type === 'add_tag') parts.push(`Tag: ${a.action_payload?.tag}`);
-    else if (a.action_type === 'remove_tag') {
-      const tags = a.action_payload?.tags || [a.action_payload?.tag];
-      parts.push(`Remove: ${tags.join(', ')}`);
-    }
-    else if (a.action_type === 'move_opportunity') parts.push(`Pipeline → ${a.action_payload?.pipeline} ${a.action_payload?.stage}`);
-    else if (a.action_type === 'remove_from_workflow') parts.push('Remove from workflow');
-    else if (a.action_type === 'create_task') parts.push(`Task: ${(a.action_payload?.title || '').slice(0, 60)}`);
-    else if (a.action_type === 'send_notification') parts.push('Notify');
-    else if (a.action_type === 'send_message') parts.push(`send_message: ${(a.action_payload?.channel || 'SMS').toUpperCase()} reply`);
-    else parts.push(a.action_type);
-  }
-  return parts.join(' | ');
-}
-
 // v1.6: standardized footer line so all approval cards advertise the
 // Yes / No / Edit options consistently.
 function approvalFooter(shortRef) {
@@ -701,6 +693,47 @@ async function _postSlackButtonsOrMirror(cardText, fallbackText, shortRef) {
 }
 
 /**
+ * v2.0 (2026-09-22) — render an approval card WITHOUT sending it.
+ *
+ * Plain-English card — what happened / if you approve / if you reject /
+ * contact — built once in src/approval-card.js for both GroupMe and Slack.
+ * The rule code appears only in the `ref:` line. sendApprovalRequest renders
+ * through here, and so does scripts/render-approval-card.js (the dry run), so
+ * a dry-run render is byte-for-byte what a live card would say.
+ *
+ * @returns {Promise<{ slackCardText: string, groupmeText: string }>}
+ */
+export async function renderApprovalCard(batchActions, contactName, contactPhone, enrichment = {}, deps = {}) {
+  const first = batchActions[0];
+  const shortRef = String(first.id);
+  const { rule, event } = await loadApprovalCardContext(first, deps);
+  let slackCardText;
+  try {
+    slackCardText = buildApprovalCardText({
+      actions: batchActions,
+      shortRef,
+      rule,
+      event,
+      contactName,
+      contactPhone,
+      enrichment,
+      fallbackTitle: RULE_DISPLAY_NAMES[first.rule_applied] || null,
+    });
+  } catch (err) {
+    // A wording bug must never cost an operator decision: the card still goes
+    // out, bare but actionable, and the log says why it looks thin.
+    console.warn(`[GroupMe] approval card #${shortRef} formatter threw (${err.message}) — sending the minimal card`);
+    slackCardText = [
+      `🔔 Approval needed · #${shortRef}`,
+      String(first.reasoning || '').replace(/^\s*Rule\s+[A-Z0-9_]+\s*:\s*/, '') || 'Agent action needs approval.',
+      `Contact: ${contactName || 'Unknown'}`,
+      `ref: ${[first.rule_applied, first.event_id != null ? `event ${first.event_id}` : null].filter(Boolean).join(' · ')}`,
+    ].join('\n');
+  }
+  return { slackCardText, groupmeText: `${slackCardText}\n\n${approvalFooter(shortRef)}` };
+}
+
+/**
  * v1.5 — Insert-first dedup. Claim the batch by inserting the tracking
  * record BEFORE sending the GroupMe message.
  * v1.6 — Footer line now advertises Edit X option.
@@ -717,53 +750,8 @@ export async function sendApprovalRequest(batchActions, contactName, contactPhon
   const batchId = first.batch_id || `s_${first.id}`;
   const shortRef = String(first.id);
 
-  const ruleName = RULE_DISPLAY_NAMES[first.rule_applied] || first.rule_applied;
-  const actionSummary = formatActionSummary(batchActions);
-
-  const lines = [];
-  lines.push(`🔔 APPROVAL [#${shortRef}]`);
-  lines.push(`${ruleName}`);
-  lines.push(`👤 ${contactName || 'Unknown'}${contactPhone ? ` (${contactPhone})` : ''}`);
-
-  if (enrichment.messageText) {
-    const msg = enrichment.messageText.slice(0, 200);
-    lines.push(`💬 "${msg}"${enrichment.messageType ? ` [${enrichment.messageType}]` : ''}`);
-  }
-
-  const lpParts = [];
-  if (enrichment.lpSource) lpParts.push(`Src: ${enrichment.lpSource}`);
-  if (enrichment.repName) lpParts.push(`Rep: ${enrichment.repName}`);
-  if (enrichment.disposition) lpParts.push(`Disp: ${enrichment.disposition}`);
-  if (enrichment.prospectId && enrichment.prospectId !== 'Not in LP') lpParts.push(`Prospect: ${enrichment.prospectId}`);
-  if (lpParts.length > 0) lines.push(`📋 ${lpParts.join(' | ')}`);
-
-  if (enrichment.score || enrichment.tier) {
-    const intentParts = [];
-    if (enrichment.score) intentParts.push(`Score: ${enrichment.score}`);
-    if (enrichment.tier) intentParts.push(`Tier: ${enrichment.tier}`);
-    if (enrichment.barrier) intentParts.push(`Barrier: ${enrichment.barrier}`);
-    lines.push(`📊 ${intentParts.join(' | ')}`);
-  }
-
-  if (enrichment.aiSummary) {
-    lines.push(`🤖 ${enrichment.aiSummary.slice(0, 150)}`);
-  }
-
-  lines.push(`🎯 ${actionSummary}`);
-
-  if (enrichment.generatedMessage) {
-    lines.push(`📱 "${enrichment.generatedMessage}"`);
-  } else if (enrichment.aiGenerationError) {
-    lines.push(`⚠️ AI generation failed: ${enrichment.aiGenerationError.slice(0, 100)}`);
-  }
-
   // v1.9: the Slack button card carries the body WITHOUT the typed-reply footer.
-  const slackCardText = lines.join('\n');
-
-  lines.push('');
-  lines.push(approvalFooter(shortRef));
-
-  const msg = lines.join('\n');
+  const { slackCardText, groupmeText: msg } = await renderApprovalCard(batchActions, contactName, contactPhone, enrichment);
 
   // v1.5: INSERT-FIRST DEDUP
   const { error: claimErr } = await supabase
@@ -894,16 +882,22 @@ async function recoverTriggerMessage(eventId, contactIdHint) {
 async function sendRegeneratedApprovalCard({
   request, batchActions, newMessage, editInstruction, senderName, shortRef,
 }) {
-  const ruleName = RULE_DISPLAY_NAMES[request.rule_applied] || request.rule_applied;
-  const actionSummary = formatActionSummary(batchActions);
-
+  // v2.0 (2026-09-22): same doctrine as the first card — plain words in the
+  // body, the rule code only in the ref line.
   const lines = [];
-  lines.push(`🔄 EDITED [#${shortRef}] (by ${senderName})`);
-  lines.push(`${ruleName}`);
-  lines.push(`👤 ${request.contact_name || 'Unknown'}`);
-  lines.push(`✏️ Edit: "${editInstruction.slice(0, 200)}"`);
-  lines.push(`🎯 ${actionSummary}`);
-  lines.push(`📱 "${newMessage}"`);
+  lines.push(`🔄 Edited · #${shortRef} (by ${senderName})`);
+  if (RULE_DISPLAY_NAMES[request.rule_applied]) lines.push(RULE_DISPLAY_NAMES[request.rule_applied]);
+  lines.push(`Contact: ${request.contact_name || 'Unknown'}`);
+  lines.push(`Edit asked for: "${editInstruction.slice(0, 200)}"`);
+  // The send_message payload is rewritten by the caller; show the NEW text.
+  const effects = batchActions.map(a => describeApprove(
+    a.action_type === 'send_message' ? { ...a, action_payload: { ...(a.action_payload || {}), message: newMessage } } : a,
+    { contactName: request.contact_name },
+  ));
+  if (effects.length === 1) lines.push(`If you approve: ${effects[0]}`);
+  else { lines.push('If you approve:'); for (const e of effects) lines.push(`• ${e}`); }
+  lines.push(`If you reject: ${describeReject(batchActions, { contactName: request.contact_name })}`);
+  if (request.rule_applied) lines.push(`ref: ${request.rule_applied}`);
   // v1.9: Edit X stays GroupMe-only, so the Slack card says where to go for it.
   const slackCardText = `${lines.join('\n')}\n(To change the message again, use GroupMe: Edit ${shortRef} <change>)`;
   lines.push('');
