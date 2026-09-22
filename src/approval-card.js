@@ -428,18 +428,22 @@ export function cardTitle({ rule, actions, fallbackTitle }) {
  * @param {string}   [args.contactPhone]
  * @param {object}   [args.enrichment]   buildNotificationEnrichment output (+ generatedMessage)
  * @param {string}   [args.fallbackTitle] used only when no rule row was found
+ * @param {string}   [args.header]     replaces the "🔔 Approval needed" first line
+ *                                     (the timeout reminder uses its own)
+ * @param {string[]} [args.notes]      extra plain lines, placed after the contact
  * @returns {string}
  */
 export function buildApprovalCardText({
   actions = [], shortRef, rule = null, event = null,
   contactName = null, contactPhone = null, enrichment = {}, fallbackTitle = null,
+  header = null, notes = [],
 }) {
   const first = actions[0] || {};
   const ruleCode = first.rule_applied || null;
   const ctx = { event, contactName, enrichment };
 
   const lines = [];
-  lines.push(`🔔 Approval needed · #${shortRef}`);
+  lines.push(header || `🔔 Approval needed · #${shortRef}`);
   lines.push(cardTitle({ rule, actions, fallbackTitle }));
   lines.push(`What happened: ${describeEvent({ event, action: first, contactName, enrichment })}`);
 
@@ -455,6 +459,7 @@ export function buildApprovalCardText({
 
   const detail = detailLine({ rule, enrichment });
   if (detail) lines.push(detail);
+  for (const n of notes || []) if (n) lines.push(n);
 
   // The rule code is for diagnosis only. Anything above that echoed it
   // (a free-text reasoning fallback, a title fallback) is scrubbed so the
