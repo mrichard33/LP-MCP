@@ -76,6 +76,8 @@
  *       five9_reset_campaign, five9_set_outbound_campaign,
  *       five9_add_records_to_list, five9_delete_record_from_list,
  *       five9_add_numbers_to_dnc
+ *     2026-09-21 — five9_remove_numbers_from_dnc_reentry (the ONE re-entry
+ *       lift; welded to DNC_LIFT_ON_REENTRY_E0, not a general removal)
  *     2026-08-05 Phase D — five9_user_skill_add, five9_user_skill_modify,
  *       five9_user_skill_remove, five9_create_campaign_profile
  *     2026-08-06 Phase D-2 — five9_modify_campaign_profile (WSDL-verified
@@ -657,6 +659,11 @@ export const ACTION_HANDLERS = {
   // parks it as pending without burning retry_count.
   five9_async_delete_records_from_list: executeFive9Write,
   five9_add_numbers_to_dnc: executeFive9Write,
+  // 2026-09-21 — the ONE re-entry DNC lift (Mark's ruling). A DIFFERENT
+  // action type from the five9_remove_numbers_from_dnc deleted 2026-08-21,
+  // so nothing queued against the old name can start working again. The op
+  // refuses any rule_applied but DNC_LIFT_ON_REENTRY_E0.
+  five9_remove_numbers_from_dnc_reentry: executeFive9Write,
   // five9_remove_numbers_from_dnc was removed 2026-08-21 — DNC removal is not
   // an operation this system offers. See the note in handlers/five9.js.
   // 2026-08-05 Phase D — user skills + campaign profile create. Same gate,
