@@ -66,6 +66,7 @@ globalThis.fetch = async (url, opts = {}) => {
 
 const { ghlFetch } = await import('../src/actions/helpers.js');
 const { getContactCached } = await import('../src/actions/contact-cache.js');
+const { getRateLimiterStats } = await import('../src/ghl-rate-limiter.js');
 
 // ═══ 1. ghlFetch forwards the cap, and defaults unchanged ═════════════
 
@@ -84,6 +85,45 @@ test('(1b) a body still serialises correctly with rateOpts present', async () =>
   await ghlFetch('POST', '/calendars/events/appointments', { a: 1 }, { maxWaitMs: 8000 });
   assert.deepEqual(calls[0].body, { a: 1 });
   assert.equal(calls[0].method, 'POST');
+});
+
+// ═══ 1c. ghlFetch forwards PRIORITY, not just the cap ════════════════
+//
+// 2026-09-22. The lane shipped in #988 was dead on the one path built for it,
+// because this function forwarded only `maxWaitMs` and dropped `priority`.
+// Nothing caught it: the limiter suite calls acquireToken directly, the
+// resolver suite stubs ghlFetch, and this suite only ever exercised the cap.
+// A day of real ActiveProspect traffic did catch it —
+// /n8n/rate-limiter/stats read `highAcquired: 0` across 42 leads.
+//
+// The header above explains why acquireToken cannot be stubbed here (frozen ESM
+// namespace, and `npm test` runs without --experimental-test-module-mocks).
+// It does not need to be: the limiter is a process singleton that COUNTS
+// priority acquisitions, so the forward is observable from the outside. That
+// counter is the same one whose zero exposed the bug in production.
+
+test('(1c) a high-priority ghlFetch actually draws a priority token', async () => {
+  const before = getRateLimiterStats().highAcquired;
+  await ghlFetch('GET', '/contacts/abc', null, { priority: 'high' });
+  assert.equal(getRateLimiterStats().highAcquired, before + 1,
+    'priority must reach acquireToken — highAcquired staying flat is the production symptom');
+});
+
+test('(1d) a normal ghlFetch is still normal', async () => {
+  // The lane is only meaningful if it is narrow. Every existing caller passes
+  // no priority and must keep drawing from the ordinary pool.
+  const before = getRateLimiterStats().highAcquired;
+  await ghlFetch('GET', '/contacts/abc');
+  await ghlFetch('GET', '/contacts/abc', null, { maxWaitMs: 8000 });
+  assert.equal(getRateLimiterStats().highAcquired, before,
+    'no priority asked for, none taken');
+});
+
+test('(1e) priority is a queueing concern and never alters the request', async () => {
+  calls = [];
+  await ghlFetch('POST', '/calendars/events/appointments', { a: 1 }, { priority: 'high' });
+  await ghlFetch('POST', '/calendars/events/appointments', { a: 1 });
+  assert.deepEqual(calls[0], calls[1]);
 });
 
 // ═══ 2. getContactCached threads the cap, cache still short-circuits ══
