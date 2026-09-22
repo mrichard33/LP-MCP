@@ -292,6 +292,9 @@ import {
   extractClose,
   closesRepeat,
 } from './agentic/conversation-repetition.js';
+// 2026-09-22 — a carrier blocked a correct reply because it echoed "Bitcoin"
+// back. See src/agentic/carrier-risk.js for the message and the 30007 error.
+import { carrierRisks, carrierRiskNote, CARRIER_SAFETY_RULE } from './agentic/carrier-risk.js';
 import { fetchRecentAndUpcomingAppointments, formatAppointmentsForPrompt } from './knowledge/contact-appointments.js';
 import {
   resolveBookingCalendar,
@@ -1158,6 +1161,10 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
   }
 
   parts.push(...P.ONE_QUESTION_RULE);
+
+  // Carrier safety is an SMS concern only — email has no carrier filter, and
+  // rendering it there would spend tokens teaching a rule that cannot apply.
+  if (channel === 'sms') parts.push(...CARRIER_SAFETY_RULE);
 
   // 2026-08-29 — NEPQ conversation discipline. Refines the Chatbot channel
   // inside the Antifragile framework; the commitment gate inside turns
@@ -3485,6 +3492,32 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
           `Keep the part that answered their question — that was right. Rewrite only the ending: ` +
           `${priorCloses.length ? `do not ask for a day, a time, a call, or who will be home, because that ask has already been made ${priorCloses.length} time(s) and ignored. ` : ''}` +
           `End with exactly ONE question, or with no question at all. A short, useful answer that asks nothing is a better message than a fourth version of the same request.`;
+        throw err;
+      }
+    }
+  }
+
+  // ─── Carrier-block guard (2026-09-22 — message ghmZnX5TZjeFeagYwaaR) ───
+  //
+  // The prompt rule above prevents the common case; this makes the failure
+  // non-shippable. A carrier-blocked SMS is the worst outcome available: the
+  // send records `completed`, GHL accepts it, and the customer receives
+  // nothing — so from their side the bot stopped replying mid-conversation.
+  // SMS only; email has no carrier filter.
+  //
+  // Regenerate-once then ship, matching the concession-pivot shape. If the
+  // retry still carries the term, send-delivery-verify will catch the block
+  // and AGENTIC_SEND_BLOCKED_ESCALATE puts a human on it — the reply is not
+  // silently dropped either way.
+  if (channel === 'sms') {
+    const risks = carrierRisks(validated.message);
+    if (risks.length) {
+      if (opts.regenerationNote) {
+        console.error(`[ResponseGenerator] \u26d4 carrier-risk survived regeneration for ${contactId}: ${risks.join(', ')} — sending anyway, delivery may be blocked`);
+      } else {
+        console.warn(`[ResponseGenerator] \u26a0\ufe0f carrier-risk for ${contactId}: ${risks.join(', ')} — regenerating once`);
+        const err = new Error(`carrier_risk: ${risks.join(', ')}`);
+        err.regenerationNote = carrierRiskNote(risks);
         throw err;
       }
     }
