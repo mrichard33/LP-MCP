@@ -1878,6 +1878,12 @@ export async function executeRemoveNumbersFromDncReentry(action, deps = {}) {
   const readTags = deps.readContactTags || _readContactTagsForReentry;
   const readEvent = deps.readTriggerEvent || _readReentryEventForAction;
   const resolveNumbers = deps.resolveContactDncNumbers || resolveContactDncNumbers;
+  // 2026-09-22 — checkDncForNumbers is a LIVE SOAP read, and it runs even in
+  // dry-run (ctx.soap short-circuits the write, not the read-back). Behind the
+  // deps seam so a test never reaches Five9: without it the happy-path tests
+  // silently depended on FIVE9_USERNAME/PASSWORD being present, passed on a
+  // developer machine that had them, and failed in CI, which does not.
+  const checkDnc = deps.checkDncForNumbers || checkDncForNumbers;
   const now = deps.now ? deps.now() : Date.now();
 
   return withFive9WriteGate(
@@ -1907,7 +1913,7 @@ export async function executeRemoveNumbersFromDncReentry(action, deps = {}) {
       }
 
       const { numbers, sources } = await resolveNumbers(contactId, {});
-      ctx.previous_state = await checkDncForNumbers(numbers);
+      ctx.previous_state = await checkDnc(numbers);
       await ctx.soap('removeNumbersFromDnc', buildNumbersXml(numbers));
 
       // The audit event is separate from withFive9WriteGate's own
@@ -1937,7 +1943,7 @@ export async function executeRemoveNumbersFromDncReentry(action, deps = {}) {
       }).catch((err) => console.warn(`[FIVE9 WRITES] re-entry audit emit failed (write already done): ${err.message}`));
 
       if (ctx.dry_run) return { numbers_submitted: numbers.length, event_id: evt.id, resolved_from: sources };
-      ctx.new_state = await checkDncForNumbers(numbers); // read-back proves the removal
+      ctx.new_state = await checkDnc(numbers); // read-back proves the removal
       return {
         numbers_submitted: numbers.length,
         still_on_dnc: ctx.new_state.on_dnc.length,

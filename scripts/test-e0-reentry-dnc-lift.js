@@ -21,7 +21,9 @@
  * action type, so the exemption cannot be picked up by naming the type.
  *
  * Offline and pure: every I/O seam is injected, and FIVE9_WRITES_ENABLED is
- * left unset so withFive9WriteGate runs in dry-run — no SOAP call is made.
+ * left unset so withFive9WriteGate runs in dry-run. Dry-run alone is NOT
+ * enough to keep this offline — it short-circuits the WRITE, not the
+ * checkDncForNumbers read-back — so that read is injected too.
  */
 
 import test from 'node:test';
@@ -65,6 +67,11 @@ const deps = (over = {}) => ({
   readContactTags: async () => [REENTRY_CONSENT_TAG, 'dnc', 'stop-bot'],
   readTriggerEvent: async () => freshEvent,
   resolveContactDncNumbers: async () => ({ numbers: ['8134166946'], sources: { '8134166946': 'ghl_primary' } }),
+  // checkDncForNumbers is a LIVE SOAP read that runs even in dry-run, so it
+  // MUST be stubbed. Without this the suite reaches Five9 and its result
+  // depends on whether FIVE9_USERNAME/PASSWORD happen to be set — green on a
+  // machine that has them, red in CI, which does not. That is how this was caught.
+  checkDncForNumbers: async (nums) => ({ checked: nums, on_dnc: nums, not_on_dnc: [] }),
   emitEvent: async () => ({ id: 1 }),
   ...over,
 });
