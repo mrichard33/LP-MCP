@@ -670,6 +670,58 @@ export const offersAlreadyMade = (list) => [
   `\nALREADY OFFERED (do not re-offer as though it were new): ${list.join('; ')}`,
 ];
 
+// ═══════════════════════════════════════════════════════════════════
+// PATTERN BREAK — the close has repeated
+// (2026-09-22, chatbot QA — GHL hZOcPk6XmMvWVvjZJ7mz)
+// ═══════════════════════════════════════════════════════════════════
+//
+// Seven turns, seven versions of the same ask. The answers above the close
+// were correct every time, so this block deliberately does not touch them —
+// it removes the booking ask for ONE turn and requires a different move.
+//
+// Standing policy is always-respond (PR #486): the reply still goes out, and
+// `stop-bot` stays the only thing that stops it. This changes what it says.
+export const LOOP_BREAK_HEADER = [
+  `\n═══════ PATTERN BREAK — REQUIRED THIS TURN ═══════`,
+];
+
+export const loopBreakDirective = (repeats, closes) => [
+  `Your last ${repeats + 1} messages closed with the same ask. Verbatim, most recent last:`,
+  ...closes.map(c => `  • "${c}"`),
+  `Sending a reworded version of that ask again is a defect. It reads as not listening, and it is why this thread is going in circles.`,
+  `THIS TURN:`,
+  `  1. Answer what they actually said. That part has been working — keep doing it.`,
+  `  2. DROP the booking ask entirely. No day, no time, no "quick call", no asking who will be home. Not rephrased — GONE for this one message.`,
+  `  3. Replace it with ONE of: a genuinely useful fact they have not been told; a simpler, smaller next step than the one they keep not taking; or one open question about THEIR situation in their own words. Silence is also allowed — a short answer with no ask at all is a valid message.`,
+  `The booking ask returns on a later turn, once they have re-engaged. You are not giving it up, you are giving them room.`,
+];
+
+export const LOOP_BREAK_FOOTER = [
+  `═══════ END PATTERN BREAK ═══════`,
+];
+
+// ═══════════════════════════════════════════════════════════════════
+// SPOUSE ADVOCACY — already spent
+// (2026-09-22 — enforces system-core.js "ONE advocacy attempt maximum, ever")
+// ═══════════════════════════════════════════════════════════════════
+//
+// The rule was written and never enforceable: nothing recorded that the
+// attempt had been made, so "once, ever" was re-read as "once per turn" seven
+// turns running. The no-single-leg policy is unchanged — what is capped is
+// the PITCH, not the logistics, and not the explanation if they ask why.
+export const spouseAdvocacySpent = (ourWords) => [
+  `\nBOTH-OWNERS PITCH: ALREADY USED IN THIS CONVERSATION — DO NOT MAKE IT AGAIN.`,
+  ourWords ? `  You already said: "${ourWords}"` : null,
+  `  You get ONE attempt at advocating for both owners attending, and it is spent. Do not re-pitch it, do not re-frame it, do not attach it to a scheduling question, and do not work it into an either/or ("...or the 15 minute call with them on speaker?").`,
+  `  STILL ALLOWED: booking a time that happens to suit both of them, and answering plainly WHY both owners attend if they ask. Policy is unchanged — we do not run single-leg appointments. You simply may not sell it a second time.`,
+].filter(Boolean);
+
+// The NEPQ tonality rule, restated at the data frame because the layer states
+// it 2,000 tokens earlier and six of seven real closes broke it anyway.
+export const ONE_QUESTION_RULE = [
+  `\nONE QUESTION. Exactly one question mark in this message, and one thing asked. No stacked either/or closes — "would a day this week work, or is the 15 minute call easier?" is TWO asks wearing one question mark, and it is banned. Pick the single best question and ask only that.`,
+];
+
 // 2026-09-11. A second apology for the same mistake reads as a script, not as
 // contrition — and a thread that opens with an apology every turn teaches the
 // customer that the apology means nothing.

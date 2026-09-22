@@ -281,6 +281,17 @@ import { buildNepqBlock } from './agentic/nepq-layer.js';
 // resolved from the CRM fields AND from the lead's own words in the transcript.
 // See src/agentic/established-facts.js for why the second tier had to exist.
 import { buildEstablishedFacts, FACT_LABELS } from './agentic/established-facts.js';
+// 2026-09-22 — the close repeated seven turns running and the spouse pitch ran
+// with it. See src/agentic/conversation-repetition.js for the thread.
+import {
+  loopBreakState,
+  spouseAdvocacyState,
+  isSpousePitch,
+  countQuestions,
+  isDoubleBarrelled,
+  extractClose,
+  closesRepeat,
+} from './agentic/conversation-repetition.js';
 import { fetchRecentAndUpcomingAppointments, formatAppointmentsForPrompt } from './knowledge/contact-appointments.js';
 import {
   resolveBookingCalendar,
@@ -1129,6 +1140,24 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
     }
     parts.push(...P.ESTABLISHED_FOOTER);
   }
+
+  // ─── PATTERN BREAK + ADVOCACY CAP (2026-09-22 — GHL hZOcPk6XmMvWVvjZJ7mz) ───
+  //
+  // Placed immediately after ESTABLISHED and BEFORE the NEPQ layer, for the
+  // same reason ESTABLISHED sits there: the questioning discipline has to be
+  // chosen against what this conversation has already spent. A loop-break
+  // chosen after the NEPQ block would be arguing with it.
+  if (opts.loopBreak?.looping) {
+    parts.push(...P.LOOP_BREAK_HEADER);
+    parts.push(...P.loopBreakDirective(opts.loopBreak.repeats, opts.loopBreak.recentCloses));
+    parts.push(...P.LOOP_BREAK_FOOTER);
+  }
+
+  if (opts.spouseAdvocacy?.used) {
+    parts.push(...P.spouseAdvocacySpent(opts.spouseAdvocacy.our_words));
+  }
+
+  parts.push(...P.ONE_QUESTION_RULE);
 
   // 2026-08-29 — NEPQ conversation discipline. Refines the Chatbot channel
   // inside the Antifragile framework; the commitment gate inside turns
@@ -2816,6 +2845,42 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     console.warn(`[ResponseGenerator] established-facts build failed for ${contactId}: ${err.message}`);
   }
 
+  // ─── REPETITION STATE (2026-09-22 — GHL hZOcPk6XmMvWVvjZJ7mz) ─────────
+  // Same contract as established-facts above: pure, synchronous, and it
+  // cannot fail the turn. A throw here would cost a lead a reply over a
+  // formatting rule, which is a worse outcome than the repetition it fixes.
+  //
+  // `escalated` reads the tag LOOP_ESCALATION_UNCLEAR writes. The rule keeps
+  // filing the human task; standing policy is always-respond (PR #486) so it
+  // never blocks the send — it changes what the send SAYS.
+  let loopBreak = { looping: false, repeats: 0, recentCloses: [], themes: [] };
+  let spouseAdvocacy = { used: false, source: null, our_words: null };
+  try {
+    // `current_tags` is the field the context builder populates — `tags` is
+    // empty on this object. Reading the wrong one here would not throw; it
+    // would silently report "no escalation" forever, which is the same failure
+    // mode that left applyPostQualificationBypass dormant (see line ~2920).
+    const contactTags = (context.lead?.current_tags || context.lead?.tags || [])
+      .map(t => String(t).toLowerCase());
+    loopBreak = loopBreakState({
+      conversation: context.conversation_recent || [],
+      leadName: context.lead?.name || null,
+      escalated: contactTags.includes('loop-escalation'),
+    });
+    spouseAdvocacy = spouseAdvocacyState({
+      conversation: context.conversation_recent || [],
+      tags: contactTags,
+    });
+    if (loopBreak.looping) {
+      console.log(`[ResponseGenerator] 🔁 pattern break for ${contactId}: ${loopBreak.repeats} repeated close(s), themes=${loopBreak.themes.join(',') || 'none'}`);
+    }
+    if (spouseAdvocacy.used) {
+      console.log(`[ResponseGenerator] 👥 both-owners pitch already spent for ${contactId} (${spouseAdvocacy.source})`);
+    }
+  } catch (err) {
+    console.warn(`[ResponseGenerator] repetition-state build failed for ${contactId}: ${err.message}`);
+  }
+
   // 2026-07-29 (Kelly Callahan incident) — decision-time context. See
   // DECISION-TIME CONTEXT above. When live state and the snapshot disagree
   // about the funnel stage, a sibling action rewrote the contact between
@@ -3191,6 +3256,10 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       // ESTABLISHED block and supplies the transcript tier of the
       // decision-maker line in the KNOWN CONTACT PROFILE.
       established,
+      // 2026-09-22: what this conversation has already SPENT — the repeated
+      // close and the one-shot both-owners pitch.
+      loopBreak,
+      spouseAdvocacy,
       serviceArea,
       serviceAreaTentative,
       // 2026-08-18 (invented-phone incident): the only phone number the model
@@ -3369,6 +3438,53 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
           `Your previous draft conceded the customer's objection and then changed the subject: ${pivots.join(', ')}. ` +
           `Do not open by agreeing with an objection and then asking for something else. Ask a question back about ` +
           `THEIR position instead, using their own words — see the NEPQ objection block.`;
+        throw err;
+      }
+    }
+  }
+
+  // ─── Repetition guards (2026-09-22 — GHL hZOcPk6XmMvWVvjZJ7mz) ───
+  //
+  // Three rules that existed only as prompt copy until now. All three use the
+  // concession-pivot shape — REGENERATE ONCE, then ship — rather than the
+  // repeat-ask shape that can fall through to the safe fallback. Rationale:
+  // a lead who gets a slightly repetitive reply is in a worse conversation, a
+  // lead who gets the safe fallback is in a dead one, and always-respond
+  // (PR #486) means the message goes out either way.
+  {
+    const offences = [];
+
+    // 1. The close repeats a close we already sent. This is the defect.
+    const draftClose = extractClose(validated.message);
+    const priorCloses = loopBreak.recentCloses || [];
+    const dropName = (context.lead?.name || '').toLowerCase().split(/\s+/).filter(Boolean);
+    if (draftClose && priorCloses.some(c => closesRepeat(draftClose, c, { drop: dropName }))) {
+      offences.push(`repeated the same close ("${draftClose}")`);
+    }
+
+    // 2. The both-owners pitch, made a second time.
+    if (spouseAdvocacy.used && isSpousePitch(validated.message)) {
+      offences.push('re-pitched both owners attending after that attempt was already spent');
+    }
+
+    // 3. NEPQ: one question, one ask.
+    const questions = countQuestions(validated.message);
+    if (questions > 1) offences.push(`asked ${questions} questions (the cap is one)`);
+    else if (isDoubleBarrelled(validated.message)) {
+      offences.push('used a stacked either/or close — two asks in one question mark');
+    }
+
+    if (offences.length) {
+      if (opts.regenerationNote) {
+        console.warn(`[ResponseGenerator] ⚠️ repetition survived regeneration for ${contactId}: ${offences.join('; ')} — sending anyway`);
+      } else {
+        console.warn(`[ResponseGenerator] ⚠️ repetition for ${contactId}: ${offences.join('; ')} — regenerating once`);
+        const err = new Error(`conversation_repetition: ${offences.length} offence(s)`);
+        err.regenerationNote =
+          `Your previous draft ${offences.join(', and ')}. ` +
+          `Keep the part that answered their question — that was right. Rewrite only the ending: ` +
+          `${priorCloses.length ? `do not ask for a day, a time, a call, or who will be home, because that ask has already been made ${priorCloses.length} time(s) and ignored. ` : ''}` +
+          `End with exactly ONE question, or with no question at all. A short, useful answer that asks nothing is a better message than a fourth version of the same request.`;
         throw err;
       }
     }
