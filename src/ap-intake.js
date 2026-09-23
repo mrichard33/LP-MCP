@@ -104,6 +104,81 @@ export function pick(body, ...keys) {
   return '';
 }
 
+// ─── Vendor NAME, not LeadConduit's record id (2026-09-23) ──────────────────
+//
+// Shadow mode's first two days logged `vendor=659d63d0effd26f951b6da45 srs=790`
+// on every call: step 12's payload carries LeadConduit's 24-hex vendor/source
+// record id, not a name. In live mode that id became the GHL contact's
+// `source` AND a junk `source:internet-659d63d0…` attribution tag, because
+// both were built from whatever pick() found first.
+//
+// The payload's `srs_id` is the reliable handle. It is LP's own SubSource id
+// — the value LP attributes the lead under — and lp_source_catalog (refreshed
+// daily by src/jobs/source-reconcile.js) maps it to the name LP reports and
+// lp_source_mapping routes on: 790 → HomeBuddy, 717 → MyHomePros,
+// 874 → Swish Leads, each matching every lp_leads row with that srs_id.
+
+/** LeadConduit record ids are 24-hex ObjectIds. Never a vendor name. */
+const LEADCONDUIT_ID = /^[0-9a-f]{24}$/i;
+export function looksLikeLeadConduitId(value) {
+  return LEADCONDUIT_ID.test(String(value || '').trim());
+}
+
+/** pick(), skipping values that are LeadConduit record ids. */
+export function pickName(body, ...keys) {
+  for (const k of keys) {
+    const v = pick(body, k);
+    if (v && !looksLikeLeadConduitId(v)) return v;
+  }
+  return '';
+}
+
+// srs_id → subsource name, cached in memory. ActiveProspect is waiting on the
+// line, so the lead path must never wait on this: the load is capped, runs at
+// route registration to warm the cache, and on any failure the answer is "no
+// name" — the lead proceeds exactly as it did before this lookup existed.
+const SRS_CACHE_TTL_MS = 60 * 60 * 1000;
+const SRS_LOAD_TIMEOUT_MS = 300;
+const srsCache = { names: null, at: 0 };
+
+async function loadSrsNamesFromCatalog() {
+  // Imported lazily so the pure helpers in this module stay testable without
+  // Supabase credentials.
+  const { default: supabase } = await import('./supabase.js');
+  const { data, error } = await supabase
+    .from('lp_source_catalog')
+    .select('lp_source_id, lp_source_subdetail')
+    .eq('active', true);
+  if (error) throw new Error(error.message);
+  const names = new Map();
+  for (const row of data || []) {
+    const id = String(row.lp_source_id ?? '').trim();
+    const name = String(row.lp_source_subdetail ?? '').trim();
+    if (id && name) names.set(id, name);
+  }
+  return names;
+}
+
+/**
+ * The cached srs_id → name map. Serves the last good map while stale, never
+ * caches a failure, and never throws.
+ */
+export async function getSrsNames({ load = loadSrsNamesFromCatalog, now = Date.now } = {}) {
+  if (srsCache.names && now() - srsCache.at < SRS_CACHE_TTL_MS) return srsCache.names;
+  try {
+    const names = await raceWithNullTimeout(load(), SRS_LOAD_TIMEOUT_MS);
+    if (names instanceof Map && names.size > 0) {
+      srsCache.names = names;
+      srsCache.at = now();
+      return names;
+    }
+    if (names === null) console.warn(`[AP-INTAKE] source catalog load exceeded ${SRS_LOAD_TIMEOUT_MS}ms — vendor name from payload only`);
+  } catch (err) {
+    console.warn(`[AP-INTAKE] source catalog load failed — vendor name from payload only: ${err.message}`);
+  }
+  return srsCache.names || new Map();
+}
+
 /**
  * Build the GHL contact shape from an ActiveProspect payload.
  *
@@ -123,14 +198,21 @@ export function contactInputFromApBody(body, { vendor = '' } = {}) {
     state: pick(body, 'state', 'State'),
     postalCode: pick(body, 'zip', 'Zip', 'postal_code', 'postalCode', 'zipcode'),
     // The real origin, not the pipe that carried it — the same choice
-    // lp-contact-backstop.js makes for its `source` field.
-    source: vendor || pick(body, 'sourcesubdescr', 'source', 'Source') || 'activeprospect',
+    // lp-contact-backstop.js makes for its `source` field. Never a
+    // LeadConduit record id (see the vendor note above).
+    source: vendor || pickName(body, 'sourcesubdescr', 'source', 'Source') || 'activeprospect',
   };
 }
 
-/** Same widening, for the one value read outside contactInputFromApBody. */
-export function vendorFromApBody(body) {
-  return pick(body, 'sourcesubdescr', 'vendor', 'lp_subsource', 'source',
+/**
+ * The vendor NAME for an AP payload: LP's catalog name for the payload's
+ * srs_id first, then any payload field holding a real name. '' when neither —
+ * a blank is better than an id, which would become a bogus attribution tag.
+ */
+export function vendorFromApBody(body, { srsNames = null } = {}) {
+  const srsId = pick(body, 'srs_id', 'srsid', 'SRS_id');
+  const fromCatalog = srsId && srsNames ? srsNames.get(srsId) : '';
+  return fromCatalog || pickName(body, 'sourcesubdescr', 'vendor', 'lp_subsource', 'source',
     'source_name', 'lead_source', 'Source');
 }
 
@@ -146,10 +228,10 @@ export function vendorFromApBody(body) {
  * found, so shadow can measure the real hit rate while writing nothing and
  * returning nothing a caller could act on.
  */
-export async function resolveApContact(body, { mode = intakeMode(), deps, log } = {}) {
-  if (mode === 'off') return { contactId: null, wouldStamp: null, outcome: 'skipped', resolveMs: 0, mirrorMs: null };
+export async function resolveApContact(body, { mode = intakeMode(), deps, log, srsNames } = {}) {
+  const vendor = vendorFromApBody(body, { srsNames: srsNames ?? await getSrsNames() });
+  if (mode === 'off') return { contactId: null, wouldStamp: null, outcome: 'skipped', resolveMs: 0, mirrorMs: null, vendor };
 
-  const vendor = vendorFromApBody(body);
   const t0 = Date.now();
   try {
     const input = contactInputFromApBody(body, { vendor });
@@ -175,7 +257,7 @@ export async function resolveApContact(body, { mode = intakeMode(), deps, log } 
     );
     const resolveMs = Date.now() - t0;
     // The ceiling won. Answer without an id rather than hang.
-    if (result === null) return { contactId: null, wouldStamp: null, outcome: 'timeout', resolveMs, mirrorMs: null };
+    if (result === null) return { contactId: null, wouldStamp: null, outcome: 'timeout', resolveMs, mirrorMs: null, vendor };
     return {
       contactId: mode === 'live' ? (result.contactId || null) : null,
       wouldStamp: result.contactId || null,
@@ -184,13 +266,14 @@ export async function resolveApContact(body, { mode = intakeMode(), deps, log } 
       // How much of resolveMs was the mirror query. See the note in
       // services/ghl-contact-resolve.js — the two have opposite fixes.
       mirrorMs: result.mirrorMs ?? null,
+      vendor,
     };
   } catch (err) {
     const resolveMs = Date.now() - t0;
     // Fail open by contract: a GHL problem must not stop a lead reaching the
     // sales floor.
     console.warn(`[AP-INTAKE] resolve failed (${resolveMs}ms), continuing without id: ${err.message}`);
-    return { contactId: null, wouldStamp: null, outcome: 'error', resolveMs, mirrorMs: null };
+    return { contactId: null, wouldStamp: null, outcome: 'error', resolveMs, mirrorMs: null, vendor };
   }
 }
 
@@ -250,16 +333,14 @@ export function registerApIntakeRoutes(app) {
     logClientDisconnect(req, res, started, 'AP-RESOLVE');
     const mode = intakeMode();
     const body = flattenWebhookBody(req.body || {});
-    const vendor = vendorFromApBody(body);
 
     const r = await resolveApContact(body, { mode });
 
     console.log(
-      // srs_id is logged, not used: it is LP's own SubSource id, and printing it
-      // beside the vendor NAME we actually route on (against
-      // lp_source_mapping.lp_source_subdetail) is how shadow answers whether the
-      // two agree before anything depends on them agreeing.
-      `[AP-RESOLVE] vendor=${vendor || '?'} srs=${pick(body, 'srs_id', 'srsid', 'SRS_id') || '?'} `
+      // srs_id is printed beside the vendor NAME it resolved to (via
+      // lp_source_catalog — see the vendor note at the top). Shadow printing
+      // the two side by side is how the 24-hex LeadConduit id was caught.
+      `[AP-RESOLVE] vendor=${r.vendor || '?'} srs=${pick(body, 'srs_id', 'srsid', 'SRS_id') || '?'} `
       + `mode=${mode} resolve=${r.outcome}/${r.resolveMs}ms mirror=${r.mirrorMs ?? '-'}ms `
       + `${r.contactId ? `returned=${r.contactId}` : `returned=no${r.wouldStamp ? ` would=${r.wouldStamp}` : ''}`} `
       + `total=${Date.now() - started}ms`
@@ -282,7 +363,6 @@ export function registerApIntakeRoutes(app) {
     logClientDisconnect(req, res, started, 'AP-INTAKE');
     const mode = intakeMode();
     const body = flattenWebhookBody(req.body || {});
-    const vendor = vendorFromApBody(body);
 
     const r = await resolveApContact(body, { mode });
 
@@ -295,7 +375,7 @@ export function registerApIntakeRoutes(app) {
     try {
       const lp = await forwardToLp(outbound);
       console.log(
-        `[AP-INTAKE] vendor=${vendor || '?'} mode=${mode} resolve=${r.outcome}/${r.resolveMs}ms `
+        `[AP-INTAKE] vendor=${r.vendor || '?'} mode=${mode} resolve=${r.outcome}/${r.resolveMs}ms `
         + `${r.contactId ? `stamped=${r.contactId} ` : 'stamped=no '}`
         + `lp=${lp.status} total=${Date.now() - started}ms`
       );
@@ -310,8 +390,15 @@ export function registerApIntakeRoutes(app) {
     }
   });
 
+  // Warm the srs_id → vendor-name cache so the first lead after a deploy does
+  // not pay for the catalog read. Fire-and-forget: getSrsNames never throws.
+  getSrsNames();
+
   console.log(`[AP-INTAKE] Registered: POST /intake/ap-resolve, POST /intake/ap-lead `
     + `(mode=${intakeMode()}, resolve_ceiling=${RESOLVE_TIMEOUT_MS}ms)`);
 }
 
-export const _internal = { intakeMode, raceWithNullTimeout, logClientDisconnect, RESOLVE_TIMEOUT_MS, AP_INTAKE_TAG };
+export const _internal = {
+  intakeMode, raceWithNullTimeout, logClientDisconnect, RESOLVE_TIMEOUT_MS, AP_INTAKE_TAG,
+  __resetSrsCacheForTest() { srsCache.names = null; srsCache.at = 0; },
+};

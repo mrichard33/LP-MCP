@@ -13,7 +13,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { contactInputFromApBody, pick, _internal } from '../src/ap-intake.js';
+import {
+  contactInputFromApBody, pick, _internal,
+  vendorFromApBody, looksLikeLeadConduitId, pickName, getSrsNames, resolveApContact,
+} from '../src/ap-intake.js';
 import {
   pickPhoneMatch, isDuplicate400, cleanName, resolveOrCreateContact,
 } from '../src/services/ghl-contact-resolve.js';
@@ -86,6 +89,102 @@ test('AP field spellings map to the GHL contact shape', () => {
 test('source falls back through the body before a generic default', () => {
   assert.equal(contactInputFromApBody({ sourcesubdescr: 'Porch101' }).source, 'Porch101');
   assert.equal(contactInputFromApBody({}).source, 'activeprospect');
+});
+
+// ─── Vendor NAME, never LeadConduit's record id (2026-09-23) ─────────────────
+//
+// Shadow logged `vendor=659d63d0effd26f951b6da45 srs=790` on every call: the
+// payload's vendor field is LeadConduit's record id. Live mode then wrote that
+// id into the contact's source and a `source:internet-659d63d0…` tag.
+
+const LC_ID = '659d63d0effd26f951b6da45';
+const SRS_NAMES = new Map([['790', 'HomeBuddy'], ['717', 'MyHomePros'], ['874', 'Swish Leads']]);
+
+test('looksLikeLeadConduitId: 24-hex only', () => {
+  assert.equal(looksLikeLeadConduitId(LC_ID), true);
+  assert.equal(looksLikeLeadConduitId('HomeBuddy'), false);
+  assert.equal(looksLikeLeadConduitId('659d63d0effd26f951b6da4'), false, '23 chars');
+  assert.equal(looksLikeLeadConduitId(''), false);
+});
+
+test('pickName skips LeadConduit ids and keeps looking', () => {
+  assert.equal(pickName({ vendor: LC_ID, source: 'HomeBuddy' }, 'vendor', 'source'), 'HomeBuddy');
+  assert.equal(pickName({ vendor: LC_ID }, 'vendor'), '');
+});
+
+test('vendor comes from the LP catalog name for srs_id, not the payload id', () => {
+  assert.equal(vendorFromApBody({ vendor: LC_ID, srs_id: '790' }, { srsNames: SRS_NAMES }), 'HomeBuddy');
+  assert.equal(vendorFromApBody({ source: LC_ID, srs_id: '717' }, { srsNames: SRS_NAMES }), 'MyHomePros');
+});
+
+test('vendor falls back to a real payload name, and never to an id', () => {
+  assert.equal(vendorFromApBody({ vendor: LC_ID, sourcesubdescr: 'Porch101' }, { srsNames: SRS_NAMES }), 'Porch101');
+  assert.equal(vendorFromApBody({ vendor: LC_ID, srs_id: '999' }, { srsNames: SRS_NAMES }), '', 'unknown srs, id-only payload');
+  assert.equal(vendorFromApBody({ vendor: LC_ID, srs_id: '790' }), '', 'no catalog available');
+});
+
+test('contact source never falls back to a LeadConduit id', () => {
+  assert.equal(contactInputFromApBody({ source: LC_ID }).source, 'activeprospect');
+});
+
+test('resolveApContact tags and sources the contact by vendor name', async () => {
+  const calls = [];
+  const deps = {
+    ghlFetch: async (method, path, body) => {
+      calls.push({ method, path, body });
+      return method === 'POST' ? { contact: { id: 'new1' } } : { contacts: [] };
+    },
+    // HL mirror miss, so the resolve goes on to GHL search + create.
+    findContactIdByPhone: async () => null,
+  };
+  const r = await resolveApContact(
+    { vendor: LC_ID, srs_id: '790', phone: '3865551234', first_name: 'Ada' },
+    { mode: 'live', deps, srsNames: SRS_NAMES, log: { warn: () => {} } },
+  );
+  assert.equal(r.vendor, 'HomeBuddy');
+  const post = calls.find((c) => c.method === 'POST');
+  assert.ok(post, 'live created a contact');
+  assert.equal(post.body.source, 'HomeBuddy');
+  assert.ok(post.body.tags.includes('source:internet-homebuddy'));
+  assert.ok(!post.body.tags.some((t) => t.includes(LC_ID)), 'no tag carries the LeadConduit id');
+});
+
+test('getSrsNames caches a good load and never caches a failure', async () => {
+  _internal.__resetSrsCacheForTest();
+  let loads = 0;
+  const failing = async () => { loads++; throw new Error('db down'); };
+  const prevWarn = console.warn; console.warn = () => {};
+  try {
+    assert.equal((await getSrsNames({ load: failing })).size, 0, 'failure → empty map, no throw');
+    assert.equal((await getSrsNames({ load: failing })).size, 0);
+    assert.equal(loads, 2, 'a failure is retried on the next call');
+
+    const good = async () => { loads++; return new Map(SRS_NAMES); };
+    assert.equal((await getSrsNames({ load: good })).get('790'), 'HomeBuddy');
+    assert.equal((await getSrsNames({ load: failing })).get('790'), 'HomeBuddy', 'cached — no reload inside the TTL');
+    assert.equal(loads, 3);
+
+    const later = () => Date.now() + 2 * 60 * 60 * 1000;
+    assert.equal((await getSrsNames({ load: failing, now: later })).get('790'), 'HomeBuddy', 'stale map served when a refresh fails');
+  } finally {
+    console.warn = prevWarn;
+    _internal.__resetSrsCacheForTest();
+  }
+});
+
+test('getSrsNames gives up at its ceiling instead of holding the lead', async () => {
+  _internal.__resetSrsCacheForTest();
+  const prevWarn = console.warn; console.warn = () => {};
+  try {
+    const started = Date.now();
+    const slow = () => new Promise((r) => setTimeout(() => r(new Map(SRS_NAMES)), 2000));
+    const names = await getSrsNames({ load: slow });
+    assert.equal(names.size, 0);
+    assert.ok(Date.now() - started < 1000, 'returned at the ceiling');
+  } finally {
+    console.warn = prevWarn;
+    _internal.__resetSrsCacheForTest();
+  }
 });
 
 test('the intake tag agent rule 355 routes on is applied', () => {
