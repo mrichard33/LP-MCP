@@ -166,6 +166,36 @@ test('the real advocacy line is recognised as a pitch', () => {
   assert.equal(isSpousePitch(pitch), true);
 });
 
+test('REGRESSION 2026-09-23: "works best when both" is a pitch', () => {
+  // Live thread hZOcPk6XmMvWVvjZJ7mz, action 488159. The v1.0 word list looked
+  // for better/easier/more useful and missed "works best", so the pitch was
+  // never marked spent and the next turn repeated the both-owners framing.
+  const real = "Your online estimate came to $7,385.10 for the 5 windows. Since our specialist prices everything on the spot, it works best when both you and Paloma are there, what's a time that could work for both of you?";
+  assert.equal(isSpousePitch(real), true);
+});
+
+test('the follow-up turn is then blocked from repeating it', () => {
+  // Action 488163, the very next reply. With 488159 recorded as the spent
+  // attempt, spouseAdvocacyState must report used=true so the prompt forbids
+  // a second pitch.
+  const convo = asTurns([
+    "Your online estimate came to $7,385.10 for the 5 windows. Since our specialist prices everything on the spot, it works best when both you and Paloma are there, what's a time that could work for both of you?",
+  ]);
+  const state = spouseAdvocacyState({ conversation: convo });
+  assert.equal(state.used, true);
+  assert.equal(state.source, 'transcript');
+});
+
+test('other natural phrasings of the same value claim are caught', () => {
+  for (const s of [
+    'It goes better when both of you are there.',
+    'The visit is most helpful when both owners can ask questions.',
+    'It works best when you and your wife are both home.',
+  ]) {
+    assert.equal(isSpousePitch(s), true, `missed: ${s}`);
+  }
+});
+
 test('a plain scheduling ask naming two people is NOT a pitch', () => {
   // This must stay legal forever — the cap is on advocacy, not on logistics.
   assert.equal(isSpousePitch('What day this week works for both you and Paloma?'), false);

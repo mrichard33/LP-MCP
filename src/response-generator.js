@@ -295,6 +295,9 @@ import {
 // 2026-09-22 — a carrier blocked a correct reply because it echoed "Bitcoin"
 // back. See src/agentic/carrier-risk.js for the message and the 30007 error.
 import { carrierRisks, carrierRiskNote, CARRIER_SAFETY_RULE } from './agentic/carrier-risk.js';
+// 2026-09-23 — the prompt carried today's DATE and the copy still said "before
+// storm season" in September. See src/agentic/storm-season.js.
+import { stormSeasonBlock } from './agentic/storm-season.js';
 import { fetchRecentAndUpcomingAppointments, formatAppointmentsForPrompt } from './knowledge/contact-appointments.js';
 import {
   resolveBookingCalendar,
@@ -959,6 +962,18 @@ function formatTodayForPrompt() {
 // of elapsed time would land on the wrong day across a DST boundary. The step itself is
 // plain UTC arithmetic on that already-localized date, so PROMPT_TIMEZONE stays the only
 // source of truth for which day it is.
+// Today as YYYY-MM-DD in PROMPT_TIMEZONE. Same en-CA/timezone resolution the
+// tomorrow helper below already depends on, so all three date views (today,
+// tomorrow, season) can never disagree about which day it is.
+//
+// 2026-09-23: the storm-season block needs an ISO date, and
+// formatTodayForPrompt() returns "Tuesday, September 23, 2026". Passing that to
+// a YYYY-MM-DD parser returns null, which renders NO season block and looks
+// exactly like working code — the silent-noop failure this repo keeps paying for.
+function todayIsoInPromptTz() {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: PROMPT_TIMEZONE }).format(new Date());
+}
+
 function formatTomorrowForPrompt() {
   const [y, m, d] = new Intl.DateTimeFormat('en-CA', { timeZone: PROMPT_TIMEZONE })
     .format(new Date())
@@ -1051,6 +1066,15 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
 
   parts.push(...P.currentDateHeader(PROMPT_TIMEZONE));
   parts.push(...P.todayIs(formatTodayForPrompt(), formatTomorrowForPrompt()));
+
+  // Seasonal awareness sits WITH the date, not elsewhere: a date the model is
+  // given but not told the meaning of is how "before storm season" survived
+  // into September. Null (unparseable date) renders nothing — a wrong season
+  // is worse than no season.
+  {
+    const season = stormSeasonBlock(todayIsoInPromptTz());
+    if (season) parts.push(...season);
+  }
 
   // ── TIME NOW (2026-08-29, Myron Thorner q5GehRye7DNkN6jlmjl3) ──────────
   // The model previously received only the current DATE — the block directly
