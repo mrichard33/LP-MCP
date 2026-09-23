@@ -762,9 +762,11 @@ export async function searchFaqs(messageText, channel = 'sms', limit = 3, opts =
   const getQueryEmbedding = opts.getQueryEmbedding || makeQueryEmbedder(messageText);
   let semantic = [];
   let topSim = null;
+  let candidates = [];
   let error = null;
   try {
     // v1.13 — shadow probes below the floor so a miss records how close it got.
+    // v1.14 — and WHICH faq it got close to; see matchFaqsProbed.
     const probed = await withTimeout(
       (async () => matchFaqsProbed(await getQueryEmbedding(), channel, limit, { probe: mode === 'shadow' }))(),
       KB_VECTOR_TIMEOUT_MS,
@@ -772,6 +774,7 @@ export async function searchFaqs(messageText, channel = 'sms', limit = 3, opts =
     );
     semantic = probed.matches;
     topSim = probed.top;
+    candidates = probed.candidates;
   } catch (err) {
     error = err.message;
   }
@@ -800,6 +803,19 @@ export async function searchFaqs(messageText, channel = 'sms', limit = 3, opts =
       question_pattern: String(f.question_pattern || '').slice(0, 120),
       similarity: f.similarity,
     })),
+    // Everything the probe SAW, floor or no floor — top-first, so a miss is
+    // attributable and the first-to-second margin is readable. `sources` keeps
+    // meaning "what the live path would have answered with"; these two must
+    // never be conflated. NULL (not []) when nothing was probed, so "live mode"
+    // is distinguishable from "probed and found nothing".
+    top_candidates: candidates.length
+      ? candidates.map((f) => ({
+        faq_id: f.id,
+        question_pattern: String(f.question_pattern || '').slice(0, 120),
+        similarity: f.similarity,
+        matched: f.matched,
+      }))
+      : null,
     latency_ms: Date.now() - started,
     error,
   });
