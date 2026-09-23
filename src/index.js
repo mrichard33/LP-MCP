@@ -815,6 +815,13 @@ async function runMigrations() {
     await runSQL(`ALTER TABLE kb_vector_queries
       ADD COLUMN IF NOT EXISTS tier TEXT NOT NULL DEFAULT 'kb_embeddings',
       ADD COLUMN IF NOT EXISTS keyword_match_count INTEGER;`);
+    // 2026-09-23 — top_candidates records WHICH faq a shadow probe saw, not
+    // just how close it got. `sources` only ever held matches at/above the
+    // floor, so a miss wrote a score and no identity — and a score alone
+    // cannot say whether lowering the floor would gain a right answer or a
+    // wrong one. Nullable and shadow-only; NULL means "not probed".
+    await runSQL(`ALTER TABLE kb_vector_queries
+      ADD COLUMN IF NOT EXISTS top_candidates JSONB;`);
     await runSQL(`CREATE OR REPLACE FUNCTION match_kb_faqs (
       query_embedding vector(1536),
       p_channel       TEXT    DEFAULT 'sms',

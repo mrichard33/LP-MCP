@@ -61,20 +61,66 @@ export async function matchFaqsSemantic(queryEmbedding, channel = 'sms', limit =
 }
 
 /**
+ * How many candidates a shadow probe pulls back for the audit row, regardless
+ * of how many the caller wants as an answer. Cheap (the RPC is already running)
+ * and it is the tail that shows whether a match was a clear winner or one of
+ * several near-identical guesses.
+ */
+const PROBE_AUDIT_CANDIDATES = 5;
+
+/**
  * v1.13 — 2026-09-16. Shadow runs probe at threshold 0 so the audit row records
  * how close a miss actually was. Before this, a miss wrote top_similarity=null,
  * which cannot tell "just under the floor at 0.39" from "nothing close at 0.05"
  * — so KB_FAQ_MIN_SIMILARITY could only ever be tuned by guessing. Live still
  * queries at the floor, so no extra rows cross the wire on the answering path.
  *
- * @returns {Promise<{matches: Array, top: number|null}>} matches = at/above the
- *   configured floor (the answer); top = true best similarity seen.
+ * v1.14 — 2026-09-23. The probe recorded the SCORE of a miss and not its
+ * IDENTITY, which is the one fact needed to act on it: "0.378 and it was the
+ * right FAQ" says lower the floor, "0.378 and it was the wrong one" says the
+ * floor is doing its job. Both wrote an identical-looking row, and the empty
+ * `sources` on a miss made the difference invisible.
+ *
+ * That gap was not theoretical. The 0.40 -> 0.35 change was argued from a
+ * near-miss ("What does single or double hung mean", 0.386) ASSUMED to be
+ * pointing at the right FAQ. Probed directly afterwards it was pointing at
+ * "Do you sell aluminum or vinyl windows?" — so lowering the floor turned one
+ * clean miss into two confident wrong matches. The assumption was the bug; this
+ * field is what makes it checkable instead of assumable.
+ *
+ * `candidates` is every row the search saw, unfiltered, top-first — so the
+ * MARGIN between first and second is readable too. On this corpus that margin
+ * separates right from wrong far more sharply than the absolute score does
+ * (right answers led by 0.046-0.159, wrong ones by 0.017-0.027).
+ *
+ * @returns {Promise<{matches: Array, top: number|null, candidates: Array}>}
+ *   matches = at/above the configured floor (the answer); top = true best
+ *   similarity seen; candidates = everything seen, [] when not probing.
  */
-export async function matchFaqsProbed(queryEmbedding, channel = 'sms', limit = 3, { probe = false } = {}) {
-  const rows = await matchFaqsSemantic(queryEmbedding, channel, limit, probe ? 0 : KB_FAQ_MIN_SIMILARITY);
-  const matches = probe ? rows.filter((r) => r.similarity >= KB_FAQ_MIN_SIMILARITY) : rows;
+export async function matchFaqsProbed(
+  queryEmbedding,
+  channel = 'sms',
+  limit = 3,
+  { probe = false, match = matchFaqsSemantic } = {},
+) {
+  // `match` is a deps seam (CLAUDE.md): the only DB call in here, injectable so
+  // the probe's shaping is testable without supabase or a live RPC.
+  //
+  // Probing already ignores the floor, so widening the fetch costs one RPC of
+  // the same shape and never changes what the caller is handed back.
+  const fetchCount = probe ? Math.max(limit, PROBE_AUDIT_CANDIDATES) : limit;
+  const rows = await match(queryEmbedding, channel, fetchCount, probe ? 0 : KB_FAQ_MIN_SIMILARITY);
+  const matches = probe
+    ? rows.filter((r) => r.similarity >= KB_FAQ_MIN_SIMILARITY).slice(0, limit)
+    : rows;
   const top = typeof rows[0]?.similarity === 'number' ? rows[0].similarity : null;
-  return { matches, top };
+  // Stamp `matched` HERE. The floor is this module's private constant, and a
+  // caller reaching for it would either duplicate the env read or reference a
+  // name it does not have in scope. One owner, no second copy of the rule.
+  const candidates = probe
+    ? rows.map((r) => ({ ...r, matched: r.similarity >= KB_FAQ_MIN_SIMILARITY }))
+    : [];
+  return { matches, top, candidates };
 }
 
 // ── Objection type classifier (in memory) ──────────────────────────

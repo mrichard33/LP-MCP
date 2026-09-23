@@ -93,3 +93,104 @@ test('objection type descriptions cover exactly the six kb_objection_scripts typ
     assert.ok(typeof v === 'string' && v.length > 40, k);
   }
 });
+
+// ══════════════════════════════════════════════════════════════════════════
+// PROBE IDENTITY — matchFaqsProbed must say WHICH faq, not only how close
+//
+// Added 2026-09-23. The probe recorded the SCORE of a near-miss and discarded
+// its IDENTITY, which is the one fact the score cannot supply: "0.378 and it
+// was the right FAQ" argues for lowering the floor; "0.378 and it was the
+// wrong one" argues the floor is working. Both wrote an identical-looking row.
+//
+// That gap had already cost a bad call. The 0.40 -> 0.35 change was argued
+// from a near-miss ASSUMED to point at the right FAQ; probed afterwards it
+// pointed at the wrong one, so the lower floor turned a clean miss into two
+// confident wrong matches.
+//
+// The RPC is stubbed, so these run with no env and no network.
+// ══════════════════════════════════════════════════════════════════════════
+
+const { matchFaqsProbed } = await import('../src/knowledge/tier1-semantic.js');
+
+/** Rows a match_kb_faqs call would return, top-first. */
+const FAKE_ROWS = [
+  { id: 3,  question_pattern: 'Do you sell aluminum or vinyl windows?', similarity: 0.386 },
+  { id: 17, question_pattern: 'Impact windows vs hurricane shutters?',  similarity: 0.359 },
+  { id: 18, question_pattern: 'How much do impact windows cost?',       similarity: 0.290 },
+];
+
+/** A queryEmbedding-shaped object; the stub ignores its contents. */
+const EMBEDDING = { embedding: new Array(1536).fill(0) };
+
+/** Stand-in for the match_kb_faqs RPC — the deps seam, no supabase needed. */
+const fakeMatch = (rows) => async (_emb, _ch, count, threshold) =>
+  rows.filter((r) => r.similarity >= threshold).slice(0, count);
+
+test('probe returns the candidate IDENTITIES, not just the top score', async () => {
+  const { matches, top, candidates } = await matchFaqsProbed(
+    EMBEDDING, 'sms', 3, { probe: true, match: fakeMatch(FAKE_ROWS) },
+  );
+
+  // The bug: this used to be unanswerable from the audit row.
+  assert.equal(candidates.length, 3, 'every candidate the search saw is recorded');
+  assert.equal(candidates[0].faq_id ?? candidates[0].id, 3);
+  assert.match(candidates[0].question_pattern, /aluminum or vinyl/);
+  assert.equal(top, 0.386);
+
+  // And each one says whether it cleared the floor, so a reader never has to
+  // re-derive the threshold to interpret the row.
+  for (const c of candidates) {
+    assert.equal(typeof c.matched, 'boolean', 'every candidate carries a matched flag');
+  }
+
+  // matches stays exactly "what the live path would answer with".
+  assert.ok(matches.length <= 3);
+  for (const m of matches) assert.ok(m.similarity >= 0.35 || m.similarity >= 0.40);
+});
+
+test('the first-to-second margin is readable from the candidates', async () => {
+  // The margin is the signal the absolute score hides: on this corpus a right
+  // answer led by 0.046-0.159 and a wrong one by 0.017-0.027. Recording the
+  // tail is what makes that computable later without another live probe.
+  const { candidates } = await matchFaqsProbed(
+    EMBEDDING, 'sms', 3, { probe: true, match: fakeMatch(FAKE_ROWS) },
+  );
+  const margin = candidates[0].similarity - candidates[1].similarity;
+  assert.ok(Math.abs(margin - 0.027) < 1e-9, `expected the real 0.027 margin, got ${margin}`);
+});
+
+test('live mode records NO candidates — [] means "not probed"', async () => {
+  // Live must stay distinguishable from a probed miss: kb-retriever writes
+  // NULL for an empty candidate list, so "we did not look below the floor"
+  // never reads as "we looked and found nothing".
+  const { candidates } = await matchFaqsProbed(
+    EMBEDDING, 'sms', 3, { probe: false, match: fakeMatch(FAKE_ROWS) },
+  );
+  assert.deepEqual(candidates, [], 'not probing records nothing');
+});
+
+test('THE REGRESSION: at 0.40 these rows miss cleanly; at 0.35 they answer WRONG', async () => {
+  // FAKE_ROWS is the real result for "What does single or double hung mean":
+  // top is #3 "Do you sell aluminum or vinyl windows?" at 0.386 — the WRONG
+  // FAQ. This is the query the 0.40 -> 0.35 change was argued from, on the
+  // assumption its near-miss pointed at the RIGHT one. It did not.
+  //
+  // The floor cannot tell these apart; only the identity can. That is the
+  // whole reason the probe now records it.
+  const live40 = await matchFaqsProbed(EMBEDDING, 'sms', 3, { match: fakeMatch(FAKE_ROWS) });
+  assert.deepEqual(live40.matches, [], 'at a 0.40 floor the query correctly answers nothing');
+
+  // Same rows, floor lowered: two wrong FAQs now clear it.
+  const admitted = FAKE_ROWS.filter((r) => r.similarity >= 0.35);
+  assert.equal(admitted.length, 2, 'lowering to 0.35 admits two rows');
+  assert.match(admitted[0].question_pattern, /aluminum or vinyl/, 'and the best of them is wrong');
+});
+
+test('a probe with no candidates at all is still safe to serialize', async () => {
+  const { matches, top, candidates } = await matchFaqsProbed(
+    EMBEDDING, 'sms', 3, { probe: true, match: fakeMatch([]) },
+  );
+  assert.deepEqual(candidates, []);
+  assert.deepEqual(matches, []);
+  assert.equal(top, null, 'no rows means no similarity, not 0');
+});
