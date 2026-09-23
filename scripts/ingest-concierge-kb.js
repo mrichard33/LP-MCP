@@ -13,6 +13,13 @@
  * Usage:
  *   LP_BASE_URL=https://<lp-mcp-host> node scripts/ingest-concierge-kb.js
  *   node scripts/ingest-concierge-kb.js https://<lp-mcp-host>
+ *   node scripts/ingest-concierge-kb.js --only=reece_faq_core,reece_offer_ladder
+ *
+ * --only (2026-09-23): re-ingest just the named docs. Two of these docs
+ * (reece_belief_stack, reece_compliance_guardrails) were re-versioned live
+ * from outside this repo before the repo copy caught up, so a blanket run can
+ * roll a doc BACK. Ingest only what you changed. DOC_META keeps the section
+ * and version labels those two docs carry live.
  *
  * Optional: MCP_AUTH_TOKEN env adds an Authorization: Bearer header (the
  * /n8n/kb/* routes are unauthenticated today, but the header is harmless if
@@ -25,7 +32,16 @@ import { dirname, join, basename } from 'node:path';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const KB_DIR = join(__dirname, '..', 'data', 'kb', 'concierge');
 
-const BASE_URL = (process.env.LP_BASE_URL || process.argv[2] || '').replace(/\/$/, '');
+const args = process.argv.slice(2);
+const onlyArg = args.find((a) => a.startsWith('--only='));
+const ONLY = onlyArg ? new Set(onlyArg.slice('--only='.length).split(',').map((s) => s.trim()).filter(Boolean)) : null;
+const BASE_URL = (process.env.LP_BASE_URL || args.find((a) => !a.startsWith('--')) || '').replace(/\/$/, '');
+
+// Live section/version labels for docs that carry their own canon version.
+const DOC_META = {
+  reece_belief_stack: { source_section: 'Big Domino Asset Bible v2.0 §1', source_doc_version: '2026-09-22' },
+  reece_compliance_guardrails: { source_section: 'GTD 7.6 hard lines', source_doc_version: '2026-09-23' },
+};
 if (!BASE_URL) {
   console.error('ERROR: set LP_BASE_URL env or pass the base URL as the first arg.');
   console.error('  e.g. LP_BASE_URL=https://lp-mcp-production.up.railway.app node scripts/ingest-concierge-kb.js');
@@ -36,7 +52,17 @@ const headers = { 'Content-Type': 'application/json' };
 if (process.env.MCP_AUTH_TOKEN) headers.Authorization = `Bearer ${process.env.MCP_AUTH_TOKEN}`;
 
 async function main() {
-  const files = (await readdir(KB_DIR)).filter((f) => f.endsWith('.md')).sort();
+  const files = (await readdir(KB_DIR))
+    .filter((f) => f.endsWith('.md'))
+    .filter((f) => !ONLY || ONLY.has(basename(f, '.md')))
+    .sort();
+  if (ONLY) {
+    const missing = [...ONLY].filter((d) => !files.includes(`${d}.md`));
+    if (missing.length) {
+      console.error(`ERROR: --only names docs with no file in ${KB_DIR}: ${missing.join(', ')}`);
+      process.exit(2);
+    }
+  }
   if (files.length === 0) {
     console.error(`ERROR: no .md docs found in ${KB_DIR}`);
     process.exit(2);
@@ -49,7 +75,8 @@ async function main() {
     const body = JSON.stringify({
       text,
       source_doc,
-      source_section: 'concierge',
+      source_section: DOC_META[source_doc]?.source_section || 'concierge',
+      source_doc_version: DOC_META[source_doc]?.source_doc_version,
       replace: true,
       ingested_by: 'claude',
     });
