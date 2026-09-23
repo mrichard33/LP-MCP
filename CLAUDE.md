@@ -222,6 +222,21 @@ tag, or when the table cannot be read — a double post routes a contact twice. 
 `mode='report'` and never count. The daily tag sweep (`src/jobs/tag-hygiene-sweep.js`) logs there
 too, and never removes a tag in `PROTECTED_TAGS` (`src/tag-hygiene/rules.js`), whatever rule matched.
 
+**A contact's newest LP job is often a placeholder copy, not the job.** LP keeps a do-nothing
+duplicate of many sales: contract `NEW`, status `New`, no payment, no milestone, the same value as the
+real job, and usually a higher id. "Newest job wins" picked it for 5 of 11 LP Job ID stamps checked on
+2026-09-23. Anything that chooses ONE job must first run `dropShadowJobs()`
+(`src/p2-opportunity-context.js`). `decidingJob`, the stamping backfill and the P2 reconciler already
+do. It only drops a job with no progress when a same-value twin has progress, so a returning
+customer's new job at a different price still wins.
+
+**`lp_leads` / `lp_jobs` have holes, and a missing lead silently takes its jobs with it.**
+`lp_jobs.lp_lead_id` references `lp_leads`, so a job whose lead never synced fails the FK on every
+write. Only about 40% of LP lead ids 530k–542k (April–May 2026) are present. The live parent-heal
+(`LP_JOB_PARENT_HEAL_MODE`) only sees jobs whose status changes, so old jobs never heal.
+`scripts/repair-p2-missing-lp-jobs.js` recovers them per P2 opportunity. "No LP job" on a P2
+opportunity is a copy gap far more often than a job LP never created.
+
 **Rep names do not match across the LP/GHL boundary.** LP stores `"Last, First"` (`O'Connor, Tim`);
 GHL's Rep Display Name (`yxOTDIT7Um0JxkOPUbPo`) holds `"First Last"` (`Tim O'Connor`). An exact
 compare finds ZERO rows for every rep on the floor and fails silently — a metric that reads "no sales"

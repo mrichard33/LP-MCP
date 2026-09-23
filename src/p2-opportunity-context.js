@@ -105,9 +105,96 @@ export async function eventJobIdForAction(action) {
   }
 }
 
+/**
+ * Pure. Has this job visibly MOVED in LP? true / false, or null when the row
+ * carries no evidence either way (neither `payments` nor `milestones` was read).
+ *
+ * Progress is a payment above zero, or a milestone with an actual date. Two
+ * shapes feed this: LP's raw payload (`actdate`) via jobsForContact, and
+ * lp_job_milestones rows (`act_date`) via scripts/reconcile-p2-stages.js.
+ */
+export function jobShowsProgress(job) {
+  const pays = job?.payments;
+  const ms = job?.milestones;
+  if (!Array.isArray(pays) && !Array.isArray(ms)) return null;
+  const paid = (Array.isArray(pays) ? pays : []).some((p) => parseFloat(p?.pmtamount) > 0);
+  const moved = (Array.isArray(ms) ? ms : []).some((m) => trimmed(String(m?.actdate ?? m?.act_date ?? '')) !== '');
+  return paid || moved;
+}
+
+const day = (v) => {
+  const t = trimmed(String(v ?? '')).slice(0, 10);
+  return /^\d{4}-\d{2}-\d{2}$/.test(t) ? t : null;
+};
+
+/** Pure. The last day this job visibly moved (payment or actual milestone), or null. */
+export function lastProgressDay(job) {
+  const days = [
+    ...(Array.isArray(job?.payments) ? job.payments : [])
+      .filter((p) => parseFloat(p?.pmtamount) > 0).map((p) => day(p?.pmtdate)),
+    ...(Array.isArray(job?.milestones) ? job.milestones : [])
+      .map((m) => day(m?.actdate ?? m?.act_date)),
+  ].filter(Boolean);
+  return days.length ? days.sort().at(-1) : null;
+}
+
+const valueCents = (job) => {
+  const v = parseFloat(job?.job_value);
+  return Number.isFinite(v) && v > 0 ? Math.round(v * 100) : null;
+};
+
+/**
+ * Pure. Drop the PLACEHOLDER copies of a job, keep everything else.
+ *
+ * 2026-09-23 — LP routinely holds a second job for the same sale: contract
+ * number "NEW", status "New", no milestone, no payment, and never touched again
+ * (a rehash, or the first entry before the real contract was keyed). It always
+ * carries the SAME value as the real job and usually a HIGHER job id, so
+ * "newest job wins" picked it. Spot-check of the LP Job ID stamps found five
+ * opportunities pointed at one, each left open forever tracking a job that
+ * never moves:
+ *   DihbTKVylzPeywexwvq2  59236 New  over 58867 Paid In Full
+ *   8zZVZvTdyWL8uJzsrcjq  59385 New  over 59365 Paid In Full
+ *   OWGhVMjhegC0jJWzoBKs  57791 New  over 57521 Paid In Full
+ *   yvCnVHHZkN6GLJcsn4Gt  58699      over 58692 Paid In Full  (LP note on 58699:
+ *                                    "This job is a duplicate of 36441 Rehash is
+ *                                    the correct one")
+ *   ETEo1ygopSvrritRqlQa  58297 New  over 58322 Cancelled
+ *
+ * A job is dropped ONLY when all of these hold: it shows no progress (known, not
+ * merely unread); another job for the contact has the exact same value to the
+ * cent; and that other job kept moving AFTER this one's contract date. The value
+ * match is what keeps a returning customer safe — an old Paid In Full job and a
+ * brand-new "New" job at a different price are two sales, and the new one must
+ * still win. The date is what keeps a REWRITE safe: zvVMD0635puXoChV7eLv holds
+ * 57744 (April, stuck at Out to Measure since May) and 59965 (a real contract
+ * written in September at the same value, not yet moved). Nothing happened on
+ * the old one after the new one was written, so neither is dropped and the
+ * newest still wins. A job whose contract date is unknown is never dropped.
+ */
+export function dropShadowJobs(jobs = []) {
+  const rows = (jobs || []).filter(Boolean);
+  if (rows.length < 2) return rows;
+  const shadows = new Set();
+  for (const job of rows) {
+    if (jobShowsProgress(job) !== false) continue;
+    const cents = valueCents(job);
+    if (cents === null) continue;
+    const written = day(job.contractdate);
+    if (!written) continue;
+    const realTwin = rows.some((o) => {
+      if (o === job || valueCents(o) !== cents || jobShowsProgress(o) !== true) return false;
+      const moved = lastProgressDay(o);
+      return moved !== null && moved > written;
+    });
+    if (realTwin) shadows.add(job);
+  }
+  return shadows.size ? rows.filter((j) => !shadows.has(j)) : rows;
+}
+
 /** Pure. Same order as stageDecision() in scripts/reconcile-p2-stages.js. */
 export function decidingJob(jobs = []) {
-  const rows = (jobs || []).filter(Boolean);
+  const rows = dropShadowJobs(jobs);
   if (rows.length === 0) return { job: null, verdict: 'no_job' };
   const live = latestJob(rows);
   if (live === null) {
