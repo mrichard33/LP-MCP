@@ -333,7 +333,7 @@ export const pipeline = (pipeStr, stageStr, status, daysInStage) => [
 // 2026-07-06 (Bot 2/3/4 consolidation). The band decides whether the reply gives before it asks: LOW is value-first with no booking CTA, NEUTRAL allows a soft ask, HIGH allows a direct one.
 // Was response-generator.js:1173.
 export const trustLevelScore = (t) => [
-  `TRUST LEVEL SCORE: ${t}/5 (${t <= 2 ? 'LOW — value-first: give (a guide, an answer) before asking; no booking CTA as the primary ask' : t === 3 ? 'NEUTRAL — free estimate framing, soft booking ask allowed' : 'HIGH — direct booking ask appropriate'}).`,
+  `TRUST LEVEL SCORE: ${t}/5 (${t <= 2 ? 'LOW — value-first: give (a guide, an answer) before asking; no booking CTA as the primary ask' : t === 3 ? 'NEUTRAL — no-cost, no-obligation framing, soft booking ask allowed' : 'HIGH — direct booking ask appropriate'}).`,
 ];
 
 // Closes the known-contact profile.

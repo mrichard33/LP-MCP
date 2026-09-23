@@ -450,7 +450,7 @@ function markAnalyzed(contactId, messageText) {
 // AI SYSTEM PROMPT
 // ═══════════════════════════════════════════════════════════════════
 
-const SYSTEM_PROMPT = `You are the Antifragile Sales System intelligence engine for Reece Windows & Doors, a hurricane impact window and door company in South Florida.
+const SYSTEM_PROMPT = `You are the Antifragile Sales System intelligence engine for Reece Windows & Doors, a hurricane impact window and door company serving homeowners across Florida.
 
 You analyze inbound lead messages to determine their position in the buyer journey and recommend the optimal next action.
 

@@ -73,8 +73,8 @@ function ctx({ stage = 3, trust = 3, booked = false, objection = null, phase = n
 // Stage subtraction
 // ═══════════════════════════════════════════════════════════════════
 
-test('layer reports v1.2', () => {
-  assert.equal(NEPQ_LAYER_VERSION, '1.2');
+test('layer reports v1.3', () => {
+  assert.equal(NEPQ_LAYER_VERSION, '1.3');
 });
 
 test('stage 3 with prior_quotes closed drops the "had anyone out before" example', () => {
@@ -264,6 +264,33 @@ test('a genuine apology with no pivot is not flagged', () => {
 test('an ask-back that stays on the objection is not flagged', () => {
   const good = "Close — how close does it need to be before you'd sign off on it?";
   assert.deepEqual(findConcessionPivots(good, ALFREDO_ESTABLISHED, { objectionOpen: true }), []);
+});
+
+// v1.3 (2026-09-23): a neutral disarm that stays on THEIR objection is the
+// approved shape, and the guard used to regenerate it. Agreeing and then
+// asking about something else is still the defect, whatever the opener.
+test('a neutral disarm followed by a question about their objection is not flagged', () => {
+  for (const good of [
+    "Fair enough. What's the part you're still turning over?",
+    "That's not a problem. How do you mean?",
+  ]) {
+    assert.deepEqual(findConcessionPivots(good, ALFREDO_ESTABLISHED, { objectionOpen: true }), [], good);
+  }
+});
+
+test('a soft opener followed by a qualifying or booking question is still flagged', () => {
+  for (const bad of [
+    'I hear you. Is anyone else part of the decision?',
+    'That makes sense. Would Tuesday at 2 PM work?',
+    "Fair enough. What's the address of the home?",
+  ]) {
+    assert.equal(findConcessionPivots(bad, ALFREDO_ESTABLISHED, { objectionOpen: true }).length, 1, bad);
+  }
+});
+
+test('a hard concession followed by any other question is still flagged', () => {
+  const bad = "You're right. What would you need to see?";
+  assert.equal(findConcessionPivots(bad, ALFREDO_ESTABLISHED, { objectionOpen: true }).length, 1);
 });
 
 test('no objection in play means nothing to concede', () => {

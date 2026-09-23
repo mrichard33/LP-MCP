@@ -128,3 +128,49 @@ test('any other NEPQ_LAYER_MODE value leaves the layer ON', () => {
 test('version constant is exported', () => {
   assert.equal(typeof NEPQ_LAYER_VERSION, 'string');
 });
+
+// ── v1.3 (2026-09-23, Mark's canon + NEPQ rulings) ────────────────────
+
+const OBJECTION_CTX = { intelligence: { buyer_stage: 4 }, objection_state: { state_code: 'PRICE_TOO_HIGH' } };
+
+test('v1.3: the price shape clarifies and never asks the lead for a target number', () => {
+  const b = buildNepqBlock(OBJECTION_CTX, { closed_questions: [], facts: [], objections_raised: [] });
+  assert.ok(!/where does it need to\s+land/.test(b), 'the old target-number shape is back');
+  assert.match(b, /"How do you mean\?"/);
+  assert.match(b, /Is price the main thing for you, or making sure/);
+  assert.match(b, /Never ask them for a target number/);
+});
+
+test('v1.3: a neutral disarm is allowed only when it stays on their objection', () => {
+  const b = buildNepqBlock(OBJECTION_CTX, { closed_questions: [], facts: [], objections_raised: [] });
+  assert.match(b, /ALLOWED: a short neutral disarm \("That's not a problem\." \/ "Fair enough\."\)/);
+  assert.match(b, /ONLY when the same message then asks about THEIR objection/);
+  assert.match(b, /Never open with: "Fair point"/);
+});
+
+test('v1.3: the stage-4 transition defaults to the Protection Profile Review', () => {
+  const b = buildNepqBlock({ intelligence: { buyer_stage: 4 } });
+  assert.match(b, /the next step is a quick\s+15-minute Protection Profile Review\. Would that help\?/);
+  // The in-home version survives, but only behind the three owner exceptions.
+  assert.match(b, /ONLY for a price shopper, a booking with every decision maker/);
+  assert.ok(!/exact pricing/.test(b), 'the in-home transition should promise written pricing, not "exact pricing"');
+});
+
+test('v1.3: the commitment gate allows the Reveal and nothing else', () => {
+  const b = buildNepqBlock({ lp: { appointment_set: true } });
+  assert.match(b, /NEPQ DISCOVERY IS OFF/);
+  assert.match(b, /The one question allowed here is THE REVEAL, once per booking/);
+});
+
+test('v1.3: no exclamation marks in any rendered block', () => {
+  for (const ctx of [{}, { lp: { appointment_set: true } }, OBJECTION_CTX, { intelligence: { buyer_stage: 2 } }]) {
+    const b = buildNepqBlock(ctx, { closed_questions: [], facts: [], objections_raised: [] });
+    // The banned-openers line quotes "Great!" etc. on purpose; nothing else may.
+    const withoutBanList = b.replace(/Banned openers:[^\n]*/, '');
+    assert.ok(!/!/.test(withoutBanList), 'an exclamation mark leaked into NEPQ copy');
+  }
+});
+
+test('version is 1.3', () => {
+  assert.equal(NEPQ_LAYER_VERSION, '1.3');
+});

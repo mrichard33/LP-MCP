@@ -334,6 +334,7 @@ import { resolveServicePhone } from './services/market-phone.js';
 // See src/prompts/response-generator/index.js.
 import * as P from './prompts/response-generator/index.js';
 import { dialWindowPromptLine, canPromiseImmediateCall } from './dial-window.js';
+import { normalizeRepNote } from './agentic/rep-note.js';
 // v2.7.14 — Bot Review Phase 0. Pure shaping helpers only: no I/O, no writes.
 import { buildInputSnapshot, extractKbModes, extractKbSources } from './bot-feedback/fingerprint-core.js';
 
@@ -2128,6 +2129,10 @@ function validateResponse(parsed, channel, knownAppointments = null) {
     ? normalizeQualifyingData(parsed.qualifying_data)
     : null;
 
+  // 2026-09-23 — the lead's answer to the competitor decider, the Reveal, or
+  // the mistrust "what happened?", for the rep. See src/agentic/rep-note.js.
+  const repNote = normalizeRepNote(parsed.rep_note);
+
   // v2.7.8: dispatch companion validation by action_type. Four supported:
   // book_appointment, cancel_appointment, reschedule_appointment, and
   // update_appointment_status (2026-06-03, book-then-capture upgrade). Each
@@ -2165,6 +2170,7 @@ function validateResponse(parsed, channel, knownAppointments = null) {
     frameworks_applied: frameworksApplied,
     cancel_flow_state: cancelFlowState,
     qualifying_data: qualifyingData,
+    rep_note: repNote,
     reasoning: String(parsed.reasoning || '').slice(0, 500),
     companion_action: companionAction,
   };
@@ -2519,14 +2525,32 @@ export function findRepeatedQuestions(message, established) {
 
 // The concede-and-pivot opener. Banned in the NEPQ objection block; detected
 // here. "Fair point, Alfredo — close is close." is the live instance.
-const CONCESSION_OPENER_RX =
-  /^\s*(?:fair\s+(?:point|enough)|you'?re\s+right|that'?s\s+(?:fair|true)|i\s+(?:understand|hear\s+you|get\s+(?:it|that))|that\s+makes\s+sense|totally\s+fair|absolutely|no\s+argument)\b/i;
+//
+// v1.3 (2026-09-23): split in two, in step with objectionBlock() in
+// src/agentic/nepq-layer.js. A HARD concession ("fair point", "you're right",
+// "absolutely") concedes the argument itself, so any question after it that
+// is not another concession is the pivot. A SOFT disarm ("fair enough",
+// "that's not a problem", "I hear you", "that makes sense") is allowed when
+// the same message asks about THEIR objection — so it is flagged only when
+// what follows is a pivot phrase or a question about something else
+// (decision makers, address, window count, a day or time). Before this split
+// the guard flagged the layer's own approved shape, "Fair enough. What's the
+// part you're still turning over?", and regenerated a correct reply.
+const HARD_CONCESSION_RX =
+  /^\s*(?:fair\s+point|you'?re\s+right|that'?s\s+(?:fair|true)|absolutely|no\s+argument)\b/i;
+const SOFT_DISARM_RX =
+  /^\s*(?:fair\s+enough|that'?s\s+not\s+a\s+problem|i\s+(?:understand|hear\s+you|get\s+(?:it|that))|that\s+makes\s+sense|totally\s+fair)\b/i;
+const CONCESSION_OPENER_RX = new RegExp(`${HARD_CONCESSION_RX.source}|${SOFT_DISARM_RX.source}`, 'i');
 
 // A pivot: the concession is followed by a question about something else.
 // "To get the visit scheduled correctly, will it just be you home…" is the
 // live instance — it drops the objection and asks for a qualifier instead.
 const PIVOT_RX =
   /\b(?:to\s+get|so\s+(?:i|we)\s+can|in\s+order\s+to|before\s+(?:we|i)|meanwhile|that\s+said|anyway)\b/i;
+
+// A question that leaves the objection for booking or qualifying ground.
+const TOPIC_CHANGE_RX =
+  /\b(?:anyone\s+else|someone\s+else|who\s+else|both\s+of\s+you|decision\s+makers?|address|zip|how\s+many\s+(?:windows|openings)|window\s+count|what\s+(?:day|time)|which\s+(?:day|time)|\d{1,2}(?::\d{2})?\s*(?:am|pm)|schedule|book(?:ed|ing)?|calendar|appointment)\b/i;
 
 /**
  * Concession-then-pivot in a draft, while an objection is open. Pure; exported
@@ -2553,9 +2577,12 @@ export function findConcessionPivots(message, established, { objectionOpen = fal
   for (let i = 0; i < sentences.length; i += 1) {
     if (!CONCESSION_OPENER_RX.test(sentences[i])) continue;
     // A concession that STAYS on the objection is fine. A concession followed
-    // by a pivot phrase or by a question about anything else is the defect.
+    // by a pivot phrase, or by a question about anything else, is the defect.
     const rest = sentences.slice(i + 1).join(' ');
-    if (PIVOT_RX.test(rest) || (rest.includes('?') && !CONCESSION_OPENER_RX.test(rest))) {
+    const pivot = PIVOT_RX.test(rest) || (rest.includes('?') && TOPIC_CHANGE_RX.test(rest));
+    const hardPivot = HARD_CONCESSION_RX.test(sentences[i])
+      && rest.includes('?') && !CONCESSION_OPENER_RX.test(rest);
+    if (pivot || hardPivot) {
       out.push(`concession then pivot: "${sentences[i]}"`);
     }
   }

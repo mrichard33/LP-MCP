@@ -62,7 +62,7 @@ import { upsertLeadIntelligence } from '../../context-builder.js';
 // resolved model with zero new config.
 const LLM_FN = 'message_analyzer';
 
-const NOTE_SYSTEM_PROMPT = `You are the Antifragile Sales System note-intelligence engine for Reece Windows & Doors, a hurricane impact window/door company in South Florida.
+const NOTE_SYSTEM_PROMPT = `You are the Antifragile Sales System note-intelligence engine for Reece Windows & Doors, a hurricane impact window/door company serving homeowners across Florida.
 
 You read INTERNAL LeadPerfection (LP) rep notes and call results for a single lead and infer the lead's CURRENT relationship stage. These notes are written by real sales reps and canvassers who interacted with the homeowner in person or by phone — they are ground truth about where the relationship actually stands.
 
