@@ -106,6 +106,18 @@ export async function resolveEntryFromSourceMap(contact) {
   const raw =
     readCF(contact, CF_LP_SOURCE) ||
     (contact?.source ? String(contact.source).trim() : null);
+  return resolveEntryForSource({ subdetail, raw });
+}
+
+/**
+ * Same resolution from source NAMES, for callers that know the LP source
+ * before any GHL contact exists (2026-09-23: the ActiveProspect intake, which
+ * creates the contact and must tag it by the map at creation — see
+ * src/ap-intake.js). Returns the same shape as resolveEntryFromSourceMap.
+ */
+export async function resolveEntryForSource({ subdetail = null, raw = null } = {}) {
+  subdetail = subdetail ? String(subdetail).trim() || null : null;
+  raw = raw ? String(raw).trim() || null : null;
   if (!subdetail && !raw) return null;
 
   const rows = await loadSourceMap();
@@ -120,6 +132,11 @@ export async function resolveEntryFromSourceMap(contact) {
     bridgeWfId: hit.row.ghl_bridge_wf_id || null,
     matchedOn: hit.matchedOn,
   };
+}
+
+/** Load the table ahead of the first lookup (never throws). */
+export async function warmSourceMap() {
+  try { await loadSourceMap(); } catch { /* loadSourceMap already logs */ }
 }
 
 /** Strip a leading "entry:" from a mapped entry tag → the bare suffix. */

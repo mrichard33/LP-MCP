@@ -16,7 +16,9 @@ import assert from 'node:assert/strict';
 import {
   contactInputFromApBody, pick, _internal,
   vendorFromApBody, looksLikeLeadConduitId, pickName, getSrsNames, resolveApContact,
+  intakeEntryTags,
 } from '../src/ap-intake.js';
+import { __setCacheForTest as setSourceMapForTest } from '../src/entry-source-map.js';
 import {
   pickPhoneMatch, isDuplicate400, cleanName, resolveOrCreateContact,
 } from '../src/services/ghl-contact-resolve.js';
@@ -185,6 +187,79 @@ test('getSrsNames gives up at its ceiling instead of holding the lead', async ()
     console.warn = prevWarn;
     _internal.__resetSrsCacheForTest();
   }
+});
+
+// ─── Entry lane from lp_source_mapping (2026-09-23) ──────────────────────────
+//
+// Mark ruled Swish Leads high-intent-digital (E.7) on 2026-09-14, but this
+// intake tagged every Internet vendor entry:other, so Swish went to E.5.
+
+const SOURCE_MAP = [
+  { lp_source_subdetail: 'Swish Leads', lp_source_raw: 'Internet', ghl_intent_bucket: 'high-intent-digital', ghl_entry_tag: 'entry:high-intent-digital' },
+  { lp_source_subdetail: 'HomeBuddy', lp_source_raw: null, ghl_intent_bucket: 'other', ghl_entry_tag: 'entry:other' },
+  { lp_source_subdetail: 'Cold Email', lp_source_raw: null, ghl_intent_bucket: null, ghl_entry_tag: 'entry:unmapped' },
+];
+const activeEntries = (tags) => tags.filter((t) => t.startsWith('active-entry:'));
+
+test('intakeEntryTags: a mapped high-intent vendor gets the E.7 lane', () => {
+  const tags = intakeEntryTags('Swish Leads', { entryTag: 'entry:high-intent-digital', bucket: 'high-intent-digital' });
+  assert.deepEqual(activeEntries(tags), ['active-entry:high-intent-digital'], 'exactly one active-entry');
+  assert.ok(tags.includes('entry:high-intent-digital'));
+  assert.ok(tags.includes('intent-bucket:high-intent-digital'));
+  assert.ok(tags.includes('source:internet-swish-leads'), 'vendor attribution kept');
+  assert.ok(tags.includes('lp-backstop-created'), 'always-tags kept');
+});
+
+test('intakeEntryTags: no mapping keeps the old Internet default', () => {
+  assert.deepEqual(activeEntries(intakeEntryTags('HomeBuddy', null)), ['active-entry:other']);
+});
+
+test('intakeEntryTags: a lane no intake rule routes falls back to other, never strands', () => {
+  const tags = intakeEntryTags('Cold Email', { entryTag: 'entry:unmapped', bucket: null });
+  assert.deepEqual(activeEntries(tags), ['active-entry:other']);
+  assert.ok(!tags.some((t) => t.includes('unmapped')));
+});
+
+async function createdTagsFor(vendorSrs, { mapFlag = 'true' } = {}) {
+  const prevFlag = process.env.ENTRY_RESOLVER_MAP_DRIVEN;
+  process.env.ENTRY_RESOLVER_MAP_DRIVEN = mapFlag;
+  setSourceMapForTest(SOURCE_MAP);
+  const calls = [];
+  const deps = {
+    ghlFetch: async (method, path, body) => {
+      calls.push({ method, body });
+      return method === 'POST' ? { contact: { id: 'new1' } } : { contacts: [] };
+    },
+    findContactIdByPhone: async () => null,
+  };
+  try {
+    const r = await resolveApContact(
+      { vendor: '65f87915c02b96b7b4ce87c8', srs_id: vendorSrs, phone: '3865551234', first_name: 'Ada' },
+      { mode: 'live', deps, srsNames: new Map([['874', 'Swish Leads'], ['790', 'HomeBuddy']]), log: { warn: () => {} } },
+    );
+    return { r, tags: calls.find((c) => c.method === 'POST').body.tags };
+  } finally {
+    if (prevFlag === undefined) delete process.env.ENTRY_RESOLVER_MAP_DRIVEN;
+    else process.env.ENTRY_RESOLVER_MAP_DRIVEN = prevFlag;
+  }
+}
+
+test('resolveApContact: a Swish lead is created in the high-intent lane', async () => {
+  const { r, tags } = await createdTagsFor('874');
+  assert.equal(r.entry, 'high-intent-digital');
+  assert.deepEqual(activeEntries(tags), ['active-entry:high-intent-digital']);
+  assert.ok(tags.includes('ap-intake-created'), 'provenance tag the routing rules require');
+});
+
+test('resolveApContact: a HomeBuddy lead stays in the other lane', async () => {
+  const { r, tags } = await createdTagsFor('790');
+  assert.equal(r.entry, 'other');
+  assert.deepEqual(activeEntries(tags), ['active-entry:other']);
+});
+
+test('resolveApContact: with the map flag off, Swish keeps the old default', async () => {
+  const { tags } = await createdTagsFor('874', { mapFlag: 'false' });
+  assert.deepEqual(activeEntries(tags), ['active-entry:other']);
 });
 
 test('the intake tag agent rule 355 routes on is applied', () => {

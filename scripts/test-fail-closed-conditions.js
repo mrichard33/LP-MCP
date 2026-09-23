@@ -105,13 +105,15 @@ test('dedupPolicy: behavioral rules match exactly and block on completed', () =>
   assert.ok(p.statuses.includes('completed'));
 });
 
-test('dedupPolicy: the two intake E.5 routing rules share one group and block on completed', () => {
-  // 2026-09-23 — 355 (contact.created) and _LATE (ghl.routing_tags_ensured)
-  // must never both enroll a contact in E.5, which has no double-entry guard.
-  for (const key of ['INTAKE_ROUTE_BACKSTOP_OTHER', 'INTAKE_ROUTE_BACKSTOP_OTHER_LATE']) {
+test('dedupPolicy: every intake bridge routing rule shares one group and blocks on completed', () => {
+  // 2026-09-23 — the E.5 pair (355 + _LATE) and the E.7 pair (_HID + _HID_LATE)
+  // must never enroll one contact twice, or into both bridges; neither E.5 nor
+  // E.7 has a double-entry guard.
+  for (const key of ['INTAKE_ROUTE_BACKSTOP_OTHER', 'INTAKE_ROUTE_BACKSTOP_OTHER_LATE',
+    'INTAKE_ROUTE_BACKSTOP_HID', 'INTAKE_ROUTE_BACKSTOP_HID_LATE']) {
     const p = dedupPolicy(key);
     assert.ok(p, `${key} must be deduped`);
-    assert.equal(p.group, 'INTAKE_ROUTE_BACKSTOP_OTHER%');
+    assert.equal(p.group, 'INTAKE_ROUTE_BACKSTOP_%');
     assert.ok(p.statuses.includes('completed'), 'a completed E.5 enrollment must block the other rule');
   }
 });
