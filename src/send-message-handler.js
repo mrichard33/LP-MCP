@@ -318,6 +318,7 @@ import { emitEvent } from './event-emitter.js';
 // (GHL has no task API; see src/actions/handlers/tasks.js).
 import { addGHLNote } from './ghl.js';
 import { prerequisiteAskMessage } from './appointments/prerequisite-ask.js';
+import { buildRepNoteAction } from './agentic/rep-note.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY || '';
 const GHL_LOCATION_ID = process.env.GHL_LOCATION_ID || 'SsBG7j5KQAIP1SFP2Sca';
@@ -3752,6 +3753,22 @@ export async function executeSendMessage(action, context) {
         }
       } catch (qdErr) {
         console.warn(`[SendMessage] qualifying data persist failed for ${contactId} (fail-soft): ${qdErr.message}`);
+      }
+    }
+
+    // 2026-09-23 — REP NOTE: the lead answered the competitor decider, the
+    // Reveal, or the mistrust "what happened?". Queue it as a contact note so
+    // the rep walks in knowing it. Failure-soft: the send already happened.
+    const repNoteAction = generated
+      ? buildRepNoteAction({ repNote: generated.rep_note, contactId, eventId: action.event_id })
+      : null;
+    if (repNoteAction) {
+      try {
+        const { error: repNoteErr } = await supabase.from('agent_actions').insert(repNoteAction);
+        if (repNoteErr) throw new Error(repNoteErr.message);
+        console.log(`[SendMessage] rep note queued for ${contactId}`);
+      } catch (rnErr) {
+        console.warn(`[SendMessage] rep note queue failed for ${contactId} (fail-soft): ${rnErr.message}`);
       }
     }
 

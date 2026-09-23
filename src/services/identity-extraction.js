@@ -350,7 +350,7 @@ export function heuristicExtract(messages = []) {
 // 2b. EXTRACTION — structured LLM pass (booking intent / placeholder name)
 // ═══════════════════════════════════════════════════════════════════
 
-const EXTRACTION_SYSTEM_PROMPT = `You extract customer identity data from a sales chat transcript for Reece Windows & Doors (South Florida).
+const EXTRACTION_SYSTEM_PROMPT = `You extract customer identity data from a sales chat transcript for Reece Windows & Doors (Florida).
 
 Return ONLY a JSON object with exactly these keys (null when the customer did not provide the value — NEVER guess or infer beyond the transcript):
 {

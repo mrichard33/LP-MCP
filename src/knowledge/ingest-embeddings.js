@@ -28,6 +28,7 @@
 
 import supabase from '../supabase.js';
 import { embedBatch, chunkText, estimateTokens } from './openai-embeddings.js';
+import { denyAll } from '../auth.js';
 
 const DEFAULT_TARGET_TOKENS = 500;
 const DEFAULT_OVERLAP_TOKENS = 50;
@@ -299,6 +300,68 @@ export async function listSourceDocs() {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// RE-EMBED IN PLACE (2026-09-23)
+// ═══════════════════════════════════════════════════════════════════
+
+export const REEMBED_MAX_CHUNKS = 200;
+
+/**
+ * Re-embed existing chunks whose text was corrected in place.
+ *
+ * WHY THIS EXISTS: the canon fix of 2026-09-23 corrects text inside docs that
+ * have no source file in this repo (reece_canonical_kb, reece_content_playbook
+ * and others were ingested from outside it), and inside docs whose live copy
+ * is NEWER than the repo copy. Re-ingesting would mean reassembling a doc
+ * from overlapping chunks, or rolling a doc back to an older file. So the
+ * text is corrected by SQL, row by row, and this refreshes the vectors of
+ * exactly those rows — the chunk boundaries, ids and metadata stay put.
+ *
+ * Only ACTIVE rows are touched; an id that is missing or inactive is
+ * reported, never resurrected.
+ *
+ * @param {{ chunkIds: number[] }} params
+ * @param {{ supabase?: object, embedBatch?: Function }} [deps]
+ */
+export async function reembedChunks({ chunkIds }, deps = {}) {
+  const db = deps.supabase || supabase;
+  const embedFn = deps.embedBatch || embedBatch;
+
+  const ids = [...new Set((chunkIds || []).map(Number).filter(n => Number.isInteger(n) && n > 0))];
+  if (!ids.length) throw new Error('chunk_ids must be a non-empty array of integer ids');
+  if (ids.length > REEMBED_MAX_CHUNKS) throw new Error(`at most ${REEMBED_MAX_CHUNKS} chunk_ids per call`);
+
+  const { data, error } = await db
+    .from('kb_embeddings')
+    .select('id, chunk_text')
+    .in('id', ids)
+    .eq('active', true);
+  if (error) throw new Error(`kb_embeddings read failed: ${error.message}`);
+
+  const rows = (data || []).filter(r => typeof r.chunk_text === 'string' && r.chunk_text.trim());
+  const found = new Set(rows.map(r => r.id));
+  const missing = ids.filter(id => !found.has(id));
+  if (!rows.length) return { requested: ids.length, updated: 0, missing, failed: [] };
+
+  const { embeddings, tokens, cost_usd } = await embedFn(rows.map(r => r.chunk_text));
+  if (!Array.isArray(embeddings) || embeddings.length !== rows.length) {
+    throw new Error(`embedding count mismatch: ${embeddings?.length} for ${rows.length} chunks`);
+  }
+
+  let updated = 0;
+  const failed = [];
+  for (let i = 0; i < rows.length; i += 1) {
+    const { error: upErr } = await db
+      .from('kb_embeddings')
+      .update({ embedding: embeddings[i], chunk_token_count: estimateTokens(rows[i].chunk_text) })
+      .eq('id', rows[i].id);
+    if (upErr) failed.push({ id: rows[i].id, error: upErr.message });
+    else updated += 1;
+  }
+  console.log(`[KBIngest] reembed: ${updated}/${rows.length} chunks, missing=${missing.length}, tokens=${tokens}`);
+  return { requested: ids.length, updated, missing, failed, tokens, cost_usd };
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // LOGGING
 // ═══════════════════════════════════════════════════════════════════
 
@@ -314,7 +377,40 @@ async function logIngestion(entry) {
 // EXPRESS ROUTES
 // ═══════════════════════════════════════════════════════════════════
 
-export function registerKbIngestionRoutes(app) {
+export function registerKbIngestionRoutes(app, authenticate = denyAll) {
+  /**
+   * Re-embed corrected rows NOW instead of waiting for the next deploy or the
+   * 6-hour FAQ sweep. AUTHENTICATED (the standard operator auth passed in by
+   * src/index.js): it spends OpenAI budget and rewrites vectors, so unlike the
+   * older /n8n/kb/* routes above it is never open. Registered without an auth
+   * middleware it refuses everything (denyAll) rather than going open.
+   *
+   * Body: { chunk_ids?: number[], faqs?: true } — at least one of the two.
+   *   chunk_ids → reembedChunks() on those active kb_embeddings rows
+   *   faqs      → embedFaqsSweep(): every active kb_faqs row whose text hash
+   *               changed, including new rows with no embedding yet
+   */
+  app.post('/n8n/kb/reembed', authenticate, async (req, res) => {
+    try {
+      const body = req.body || {};
+      const wantChunks = Array.isArray(body.chunk_ids) && body.chunk_ids.length > 0;
+      const wantFaqs = body.faqs === true;
+      if (!wantChunks && !wantFaqs) {
+        return res.status(400).json({ error: 'pass chunk_ids (array) and/or faqs: true' });
+      }
+      const out = {};
+      if (wantChunks) out.chunks = await reembedChunks({ chunkIds: body.chunk_ids });
+      if (wantFaqs) {
+        const { embedFaqsSweep } = await import('./tier1-semantic.js');
+        out.faqs = await embedFaqsSweep('manual');
+      }
+      res.json(out);
+    } catch (err) {
+      console.error('[KBIngest] /reembed error:', err.message);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   /**
    * Ingest text into the KB.
    * Body: { text, source_doc, source_doc_version?, source_section?,

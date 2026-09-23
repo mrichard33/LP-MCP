@@ -5,6 +5,36 @@ Notable behavioral changes to the LP MCP server. Newest first.
 Rule-layer (`agent_rules`) changes ship through the database, not through this
 repo — they are recorded in `sql/seeds/` on the date they were applied live.
 
+## 2026-09-23
+
+Chatbot canon + NEPQ alignment (Mark's 2026-09-23 rulings). Install time stays
+"1 to 2 days".
+
+- **Bot instructions** (`src/prompts/response-generator/*`) — Florida-wide
+  service area; one approved brand line; no insurance-savings promises; no
+  "no fine print"; factory-trained, Reece-certified crews; the 30-Day Price
+  Guarantee is gone. One offer per message: the in-home time for both
+  decision makers comes first, and the 15-minute call on speaker only on a
+  later turn. Competitor objections get the NEPQ decider question instead of
+  a "what to ask every company" list. New: THE REVEAL (one question after a
+  booking) and a one-time two-slot hold on "let me think about it". The
+  Protection Profile Review stays the default offer, with three named in-home
+  exceptions. No exclamation marks, no exceptions.
+- **`rep_note`** — new top-level reply field. The lead's answer to the
+  decider, the Reveal, or the mistrust "what happened?" is queued as an
+  `add_note` on the contact (`src/agentic/rep-note.js`, rule
+  `REP_NOTE_CAPTURE`).
+- **NEPQ layer v1.3** (`src/agentic/nepq-layer.js`) — never asks for a target
+  number; a neutral disarm is allowed when the question stays on their
+  objection; Stage-4 transition defaults to the Review. `findConcessionPivots`
+  moved in step so it no longer regenerates that approved shape.
+- **`POST /n8n/kb/reembed`** — re-embeds corrected `kb_embeddings` chunks in
+  place and/or runs the FAQ sweep now. Behind the standard operator auth
+  (moved to `src/auth.js`, unchanged); unauthenticated calls get 401.
+- **`sql/124`** — library data fixes (FAQs, proof points, specs, objection
+  scripts, story arcs, reece_* docs), old text backed up to `notes` /
+  `metadata.prior_text`. Applied after merge.
+
 ## 2026-09-09
 
 Rescission rescue routes to O.0; objection-confirmed tag family normalized to

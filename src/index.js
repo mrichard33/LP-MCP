@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import { makeAuthenticate } from './auth.js';
 import crypto from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import express from 'express';
@@ -404,19 +405,9 @@ app.get(TRACKER_PATH, (req, res) => {
 
 const AUTH_SOFT_LAUNCH = process.env.AUTH_SOFT_LAUNCH === 'true';
 
-function authenticate(req, res, next) {
-  if (!MCP_AUTH_TOKEN) return next();
-
-  const authHeader = req.headers.authorization;
-  if (authHeader === `Bearer ${MCP_AUTH_TOKEN}`) return next();
-
-  if (AUTH_SOFT_LAUNCH) {
-    console.warn(`[Auth] SOFT_LAUNCH: unauthenticated ${req.method} ${req.path} from ${req.ip} ua="${req.headers['user-agent'] || 'none'}" — would reject in enforce mode`);
-    return next();
-  }
-
-  return res.status(401).json({ error: 'Unauthorized' });
-}
+// The standard operator auth. Lives in src/auth.js so route modules can be
+// tested against the real check (2026-09-23); behaviour is unchanged.
+const authenticate = makeAuthenticate({ token: MCP_AUTH_TOKEN, softLaunch: AUTH_SOFT_LAUNCH });
 
 async function runMigrations() {
   try {
@@ -2148,7 +2139,9 @@ registerMessageAnalyzerRoutes(app);
 registerIntentScorerRoutes(app);
 
 // ─── Phase 4: KB Vector Ingestion ────────────────────────────────
-registerKbIngestionRoutes(app);
+// The older /n8n/kb/* routes stay as they were. POST /n8n/kb/reembed spends
+// OpenAI budget and rewrites vectors, so it takes the standard auth.
+registerKbIngestionRoutes(app, authenticate);
 
 // ─── Memory vector tier (sql/094): server-side backfill + hybrid search ──
 // Operator surface only; nothing in the request path calls it. Authenticated.

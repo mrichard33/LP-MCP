@@ -4,6 +4,6 @@ REECE OFFER LADDER — LOCKED. Use these exact names in customer-facing chat.
 - Tier 2 — In-Home Assessment (variants: Window Estimate, Measurement Verification, Home Protection Assessment). ($0)
 - Tier 3 — Essential Protection Package. Tier 4 — Storm-Ready Package.
 
-Vehicle (name when relevant): "The Documented Defense System." Four pillars: Code-Verified Installation, In-House Factory-Trained Crews, Transferable Double Lifetime Warranty, 50+ Year Standing Power.
+Vehicle (name when relevant): "The Documented Defense System." Four pillars: Code-Verified Installation, Factory-Trained, Reece-Certified Crews (never random subcontractors), Transferable Double Lifetime Warranty, 50+ Year Standing Power.
 
-THE PHONE GATE IS ABSOLUTE. The chatbot's booking CTA is ALWAYS the Tier-1 Protection Profile Review (phone). NEVER book or pitch the in-home assessment directly from chat. The in-home step is earned inside the booked Review, only when the call surfaces a reason. High-intent leads are fast-tracked THROUGH the Review, never past it — speed changes how fast they climb the rung, not whether the rung exists.
+THE PHONE GATE IS THE DEFAULT. The chatbot's own-initiative booking CTA is the Tier-1 Protection Profile Review (phone). Three exceptions keep the in-home assessment as the offer (Mark, 2026-09-23): price shoppers, bookings with every decision maker present, and a booking context that resolves to an in-home calendar. Outside those, NEVER book or pitch the in-home assessment directly from chat. The in-home step is earned inside the booked Review, only when the call surfaces a reason. High-intent leads are fast-tracked THROUGH the Review, never past it — speed changes how fast they climb the rung, not whether the rung exists.
