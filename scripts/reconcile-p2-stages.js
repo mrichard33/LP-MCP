@@ -215,7 +215,7 @@ import { PIPELINE_IDS, STAGE_MAP, GHL_LOCATION_ID } from '../src/actions/constan
 import { checkForwardOnly, getStagePosition } from '../src/pipeline-guard.js';
 import { hlRunSQL } from '../src/admin/hl-client.js';
 import { latestJob } from '../src/lp-job-value.js';
-import { readOppJobId } from '../src/p2-opportunity-context.js';
+import { readOppJobId, dropShadowJobs } from '../src/p2-opportunity-context.js';
 import {
   JOB_STATUS_LOST_REASON, isLostReasonId, lostReasonIdForJobStatus,
 } from '../src/lp-lost-reasons.js';
@@ -448,16 +448,19 @@ export function stageDecision({ currentStageId, jobs = [], mapping = {}, tracked
   // 2. Jobs exist but every one of them is cancelled or dead. latestJob()
   //    filters those before picking, so it would answer null here — which is
   //    indistinguishable from (1) unless we look at the raw list first.
-  const job = latestJob(rows);
+  //    Placeholder copies of a job are dropped first (dropShadowJobs, 2026-09-23)
+  //    — the same filter decidingJob() applies, so the two cannot disagree.
+  const real = dropShadowJobs(rows);
+  const job = latestJob(real);
   if (job === null) {
-    const newest = rows.reduce((a, b) => (jobIdOf(b) > jobIdOf(a) ? b : a), rows[0]);
+    const newest = real.reduce((a, b) => (jobIdOf(b) > jobIdOf(a) ? b : a), real[0]);
     const status = trimmed(newest.job_status);
     return {
       ...base,
       verdict: 'lose',
       job: newest,
       jobStatus: status,
-      detail: `all ${rows.length} job(s) cancelled/dead, newest is "${status || '(blank)'}"`,
+      detail: `all ${real.length} job(s) cancelled/dead, newest is "${status || '(blank)'}"`,
     };
   }
 
@@ -804,7 +807,7 @@ async function fetchJobsWithMilestones(contactIds) {
   const byJobId = new Map();
 
   const jobRows = await selectAllIn(supabase, 'lp_jobs', {
-    columns: 'id, ghl_contact_id, lp_job_id, lp_lead_id, job_status, job_value',
+    columns: 'id, ghl_contact_id, lp_job_id, lp_lead_id, job_status, job_value, contractdate:raw_lp_data->>contractdate',
     orderBy: 'id',
     column: 'ghl_contact_id',
     values: contactIds,
@@ -836,7 +839,7 @@ async function fetchJobsWithMilestones(contactIds) {
   let viaLeadCount = 0;
   if (contactByLeadId.size) {
     const leadLinkedJobs = await selectAllIn(supabase, 'lp_jobs', {
-      columns: 'id, ghl_contact_id, lp_job_id, lp_lead_id, job_status, job_value',
+      columns: 'id, ghl_contact_id, lp_job_id, lp_lead_id, job_status, job_value, contractdate:raw_lp_data->>contractdate',
       orderBy: 'id',
       column: 'lp_lead_id',
       values: [...contactByLeadId.keys()],

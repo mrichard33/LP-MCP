@@ -192,7 +192,12 @@ export async function jobsForContact(ghlContactId) {
   // Supabase driver — that is what lets scripts/test-lp-job-value.js run as a
   // real unit test rather than needing a database.
   const { default: supabase } = await import('./supabase.js');
-  const cols = 'lp_job_id, lp_lead_id, job_status, job_value';
+  // contractdate / payments / milestones (2026-09-23) are the evidence dropShadowJobs()
+  // in src/p2-opportunity-context.js needs to tell a real job from its
+  // placeholder copy. JSON-path projection verified against this deployment
+  // the same day (lp_jobs 58867 / 59236 → 2 payments vs 0).
+  const cols = 'lp_job_id, lp_lead_id, job_status, job_value, contractdate:raw_lp_data->>contractdate, '
+    + 'payments:raw_lp_data->payments, milestones:raw_lp_data->milestones';
 
   const { data: leads, error: leadErr } = await supabase.from('lp_leads')
     .select('lp_lead_id, lead_source, lead_source_detail')

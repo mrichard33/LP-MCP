@@ -26,6 +26,14 @@
  *                 listed in full and left alone. That list IS the deliverable
  *                 for a manual pass — guessing would bury the evidence.
  *
+ * PLACEHOLDER JOBS (2026-09-23)
+ * -----------------------------
+ * Every match above runs on dropShadowJobs(jobs) (src/p2-opportunity-context.js),
+ * not on the raw list. LP keeps a do-nothing copy of many sales — contract "NEW",
+ * status "New", no milestone, no payment, same value as the real job and usually
+ * a higher id. Left in, it made value_match ambiguous and deciding_job picked the
+ * copy: 5 of the first 11 deciding_job-shaped stamps pointed at one.
+ *
  * STAMP-IF-EMPTY
  * --------------
  * A populated LP Job ID is NEVER overwritten, by this script or by the live
@@ -51,6 +59,17 @@
  *   node scripts/backfill-p2-opportunity-job-id.js --execute --limit=25
  *   node scripts/backfill-p2-opportunity-job-id.js --execute
  *   node scripts/backfill-p2-opportunity-job-id.js --opportunity-id=Ua0Q6GSBpEV9LmAowXX0
+ *   node scripts/backfill-p2-opportunity-job-id.js --restamp            # DRY RUN
+ *   node scripts/backfill-p2-opportunity-job-id.js --restamp --execute
+ *
+ * --restamp (2026-09-23) is the ONE exception to stamp-if-empty, and it is
+ * narrow: it rewrites a stamp only when the stamped job is a placeholder that
+ * dropShadowJobs() now removes, and the fixed rule names a different job by
+ * evidence (only_job or value_match — a deciding_job guess is listed for a
+ * person, never written). Every
+ * candidate is read LIVE from GHL; the write happens only if the live stamp still
+ * equals the placeholder id it was judged against. Old and new ids go to the
+ * rollback log first, so rollback is writing `old` back.
  */
 
 import { appendFileSync } from 'node:fs';
@@ -59,7 +78,7 @@ import { ghlFetch } from '../src/actions/helpers.js';
 import { hlRunSQL, esc } from '../src/admin/hl-client.js';
 import { PIPELINE_IDS } from '../src/actions/constants.js';
 import { jobsForContact } from '../src/lp-job-value.js';
-import { decidingJob, readOppJobId, OPP_CF_LP_JOB_ID } from '../src/p2-opportunity-context.js';
+import { decidingJob, dropShadowJobs, readOppJobId, OPP_CF_LP_JOB_ID } from '../src/p2-opportunity-context.js';
 
 const P2_PIPELINE_ID   = PIPELINE_IDS.P2;
 const MAX_MIRROR_AGE_H = 24;
@@ -74,6 +93,7 @@ const opt = {
   execute:       has('execute'),
   limit:         numArg('limit', 0),
   opportunityId: strArg('opportunity-id', ''),
+  restamp:       has('restamp'),
 };
 
 // ─── the decision, pure and exported so a test can pin it ────────────
@@ -88,7 +108,7 @@ const opt = {
  * → { write: true, jobId, how } | { write: false, reason }
  */
 export function jobIdMatch({ status, monetaryValue, jobs }) {
-  const rows = (jobs || []).filter(Boolean);
+  const rows = dropShadowJobs(jobs);
   if (rows.length === 0) return { write: false, reason: 'no_lp_job' };
   if (rows.length === 1) return { write: true, jobId: String(rows[0].lp_job_id), how: 'only_job' };
   const v = Number(monetaryValue);
@@ -100,6 +120,30 @@ export function jobIdMatch({ status, monetaryValue, jobs }) {
     if (job) return { write: true, jobId: String(job.lp_job_id), how: 'deciding_job' };
   }
   return { write: false, reason: 'ambiguous_multi_job' };
+}
+
+/**
+ * Pure. Should an EXISTING stamp be rewritten? Only when the stamped job is a
+ * placeholder copy (dropShadowJobs removes it) and jobIdMatch — run on the same
+ * jobs — names a different job. Anything else leaves the stamp alone.
+ *
+ * → { write: true, from, to, how } | { write: false, reason }
+ */
+export function restampDecision({ stampedJobId, status, monetaryValue, jobs }) {
+  if (stampedJobId == null || String(stampedJobId).trim() === '') return { write: false, reason: 'not_stamped' };
+  const from = String(stampedJobId).trim();
+  const all = (jobs || []).filter(Boolean);
+  if (!all.some((j) => String(j.lp_job_id) === from)) return { write: false, reason: 'stamped_job_unread' };
+  if (dropShadowJobs(all).some((j) => String(j.lp_job_id) === from)) return { write: false, reason: 'stamp_ok' };
+  const m = jobIdMatch({ status, monetaryValue, jobs: all });
+  if (!m.write) return { write: false, reason: `placeholder_but_${m.reason}` };
+  // deciding_job is a best guess, not evidence. Overwriting a stamp needs
+  // evidence — i8MKAm0n8mRYXhIVRNuI's placeholder was a door add-on whose
+  // rewrite was later cancelled, and "newest live job" would have moved it onto
+  // the main Paid In Full job. The placeholder stamp is still wrong, so the
+  // suggestion is listed for a person rather than dropped.
+  if (m.how === 'deciding_job') return { write: false, reason: 'placeholder_needs_review', suggest: m.jobId };
+  return { write: true, from, to: m.jobId, how: m.how };
 }
 
 // ─── rollback log ────────────────────────────────────────────────────
@@ -299,6 +343,103 @@ async function run() {
   return { ...stats, ambiguousIds };
 }
 
+// ─── --restamp ───────────────────────────────────────────────────────
+/**
+ * Every P2 opportunity whose contact holds a placeholder job, judged against its
+ * LIVE stamp. The mirror is used only to find contacts: it lags GHL and does not
+ * carry custom fields for every row (l41hB2e8N6DZLiQ954KU read `{}` there while
+ * GHL held 19590), so it is never trusted for the stamp itself.
+ */
+async function runRestamp() {
+  const idFilter = opt.opportunityId ? `AND ghl_opportunity_id = '${esc(opt.opportunityId)}'` : '';
+  const rows = await hlRunSQL(`
+    SELECT ghl_opportunity_id, ghl_contact_id, status, monetary_value
+      FROM opportunities
+     WHERE ghl_pipeline_id = '${esc(P2_PIPELINE_ID)}'
+       AND ghl_contact_id IS NOT NULL
+       AND deleted_at IS NULL ${idFilter}
+     ORDER BY ghl_opportunity_id
+  `);
+  const opps = Array.isArray(rows) ? rows : [];
+  console.log(`${opps.length} P2 opportunities scanned for placeholder stamps`);
+
+  const stats = { rewritten: 0, failed: 0, no_placeholder: 0, jobs_unreadable: 0, changed_since_read: 0 };
+  const reasons = new Map();
+  const planned = [];
+  const review = [];
+  const jobCache = new Map();
+  let processed = 0;
+
+  for (const o of opps) {
+    if (opt.limit && processed >= opt.limit) break;
+    if (!jobCache.has(o.ghl_contact_id)) jobCache.set(o.ghl_contact_id, await jobsForContact(o.ghl_contact_id));
+    const { jobs, error } = jobCache.get(o.ghl_contact_id);
+    if (error) { stats.jobs_unreadable++; console.error(`  UNREADABLE ${o.ghl_opportunity_id}: ${error}`); continue; }
+    if (dropShadowJobs(jobs).length === jobs.length) { stats.no_placeholder++; continue; }
+
+    let live;
+    try {
+      live = await ghlFetch('GET', `/opportunities/${o.ghl_opportunity_id}`);
+      live = live?.opportunity || live;
+    } catch (err) {
+      stats.failed++;
+      console.error(`  FAILED (live read) ${o.ghl_opportunity_id}: ${err.message}`);
+      continue;
+    }
+    const decision = restampDecision({
+      stampedJobId: readOppJobId(live), status: live?.status || o.status,
+      monetaryValue: live?.monetaryValue ?? o.monetary_value, jobs,
+    });
+    if (!decision.write) {
+      reasons.set(decision.reason, (reasons.get(decision.reason) || 0) + 1);
+      if (decision.reason.startsWith('placeholder_')) {
+        review.push(`${o.ghl_opportunity_id}  stamped ${readOppJobId(live)} (placeholder)  ${decision.suggest ? `suggest ${decision.suggest}` : decision.reason}  ${live?.status || o.status}`);
+      }
+      continue;
+    }
+    processed++;
+    planned.push({ id: o.ghl_opportunity_id, status: live?.status || o.status, ...decision });
+    console.log(`  ${opt.execute ? 'restamp' : 'would restamp'} ${o.ghl_opportunity_id}  ${decision.from} → ${decision.to}  (${decision.how}, ${live?.status || o.status})`);
+    if (!opt.execute) continue;
+
+    // Compare-and-set. The decision above was made against `live`; re-read so a
+    // stamp the live path changed in between is never overwritten.
+    try {
+      const again = await ghlFetch('GET', `/opportunities/${o.ghl_opportunity_id}`);
+      if (readOppJobId(again?.opportunity || again) !== decision.from) { stats.changed_since_read++; continue; }
+    } catch (err) {
+      stats.failed++;
+      console.error(`  FAILED (re-read) ${o.ghl_opportunity_id}: ${err.message}`);
+      continue;
+    }
+    logRollback({
+      kind: 'opportunity', id: o.ghl_opportunity_id, field: 'LP Job ID', field_id: OPP_CF_LP_JOB_ID,
+      old: decision.from, new: decision.to, how: `restamp:${decision.how}`, status: live?.status || o.status,
+    });
+    try {
+      await ghlFetch('PUT', `/opportunities/${o.ghl_opportunity_id}`, {
+        customFields: [{ id: OPP_CF_LP_JOB_ID, field_value: decision.to }],
+      });
+      stats.rewritten++;
+    } catch (err) {
+      stats.failed++;
+      console.error(`  FAILED ${o.ghl_opportunity_id}: ${err.message}`);
+    }
+  }
+
+  console.log(`\n─── LP Job ID restamp ${'─'.repeat(50)}`);
+  console.log(`${opt.execute ? 'restamped' : 'would restamp'}          ${opt.execute ? stats.rewritten : planned.length}`);
+  console.log(`failed                   ${stats.failed}`);
+  console.log(`changed since read       ${stats.changed_since_read}   (live path moved it — left alone)`);
+  console.log(`contact has no placeholder ${stats.no_placeholder}`);
+  console.log(`jobs unreadable          ${stats.jobs_unreadable}`);
+  for (const [r, n] of [...reasons].sort((a, b) => b[1] - a[1])) console.log(`  left alone: ${String(n).padStart(4)}  ${r}`);
+  console.log(`\n─── ${review.length} placeholder stamps a person must decide ───`);
+  for (const line of review) console.log(`  ${line}`);
+  console.log('\nNext: scripts/reconcile-p2-stages.js --fields=status (dry run) closes the ones whose real job is terminal.');
+  return { ...stats, planned, review };
+}
+
 // ─── main ────────────────────────────────────────────────────────────
 async function main() {
   console.log('─'.repeat(74));
@@ -306,7 +447,7 @@ async function main() {
   if (opt.execute) console.log(`rollback log → ${LOG_PATH}`);
   console.log('─'.repeat(74));
 
-  const stats = await run();
+  const stats = opt.restamp ? await runRestamp() : await run();
 
   if (stats.failed > 0) {
     console.error(`\n  FAIL: ${stats.failed} opportunit(ies) errored. Re-run to retry — stamped rows are skipped.`);
