@@ -130,6 +130,11 @@ const FUNCTION_GROUPS = {
   // than the decision-engine group. Prompt lives in
   // src/notifications/sale-announcement-rulebook.md.
   sale_announcement: 'customer_facing', // src/notifications/sale-announcement-body-generator.js
+  // Carrier-block recovery: rewrites ONE already-approved SMS so a carrier
+  // will deliver it. The output goes straight to a customer, so it rides the
+  // customer_facing tier — and inherits the resolveMaxTokens/resolveTimeout
+  // floors rather than carrying a number of its own.
+  carrier_resend: 'customer_facing',    // src/services/carrier-resend-runner.js
 };
 
 // Normalize a function/group key to an ENV prefix.
