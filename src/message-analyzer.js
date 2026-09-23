@@ -576,6 +576,14 @@ Before classifying, read the LAST [outbound] in the conversation end-to-end. If 
 • Outbound: "…3:30 PM or 4:00 PM?" → Inbound: "4:00 PM works" → that IS the slot confirmation. The flow proceeds with 4:00 PM — never re-offer the same options.
 • Outbound asked ANY qualification question → a short inbound ("yes", "just me", "tomorrow", "the morning") is almost always the answer to it, not a new topic.
 
+STANDING OFFER — THE SAME RULE WHEN THE OUTBOUND ASKED NOTHING (2026-09-23)
+An offer is not always a question. The AI-disclosure script ends "SAY THE WORD and I'll have one of them reach out directly." — a real offer carrying no question mark at all, so the open-question rule above never engaged and a one-word acceptance was classified as noise. The bot promised a person and nothing happened.
+• If the last outbound OFFERED to put a human in touch (any wording: "say the word", "just say the word", "I can have someone reach out", "want me to get a teammate on this", "I'll have one of them reach out"), then a bare affirmative — "yes", "yes please", "sure", "please do", "that'd be great", "ok", "sounds good" — IS acceptance of that offer.
+  → recommended_action "callback_request" AND requested_fulfillment "phone_call".
+  This is NOT the inference the requested-fulfillment rule forbids. The offer named the fulfillment; their word accepted it. It is the same reading as "When's good for a quick call?" → "tomorrow" two bullets up.
+• DISAMBIGUATION when one outbound made the offer AND asked something else (the disclosure opens with the offer and then continues with the lead's own question, so one message can carry both): a bare affirmative cannot answer an OPEN question that needs content, so it attaches to the yes/no offer, not to the open question. An inbound that actually answers the open question ("my windows are original to the house") is NOT an acceptance — classify it normally and leave the offer standing.
+• An acceptance is not a booking. Do NOT set fast_track_booking or invent a time they never gave.
+
 ═══════════════════════════════════════════════════════════════════
 CALL PURPOSE — call_purpose (WHY they want the phone call)
 ═══════════════════════════════════════════════════════════════════
@@ -610,6 +618,7 @@ requested_fulfillment captures the lead's OWN stated ask this turn — it outran
 • "phone_call" — they explicitly want to talk by phone: "call me", "let's talk first", "can we discuss over the phone".
 • "info_only" — they explicitly want materials only: "just send me info", "email me the details, no calls".
 • "unspecified" — everything else (the default). A generic booking intent ("let's schedule", "what's next") is unspecified — the funnel default picks the appointment type.
+ONE EXCEPTION to "never from inference", and only this one: when the previous outbound OFFERED to put a human in touch and this inbound is a bare acceptance of it, set "phone_call". See STANDING OFFER above. The offer supplied the words; they said yes to them.
 
 ═══════════════════════════════════════════════════════════════════
 ESCALATION CATEGORIES — escalation_category (with escalate_to_rep)

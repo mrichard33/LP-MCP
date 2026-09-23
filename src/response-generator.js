@@ -295,6 +295,9 @@ import {
 // 2026-09-22 — a carrier blocked a correct reply because it echoed "Bitcoin"
 // back. See src/agentic/carrier-risk.js for the message and the 30007 error.
 import { carrierRisks, carrierRiskNote, CARRIER_SAFETY_RULE } from './agentic/carrier-risk.js';
+// 2026-09-23 — the prompt carried today's DATE and the copy still said "before
+// storm season" in September. See src/agentic/storm-season.js.
+import { stormSeasonBlock } from './agentic/storm-season.js';
 import { fetchRecentAndUpcomingAppointments, formatAppointmentsForPrompt } from './knowledge/contact-appointments.js';
 import {
   resolveBookingCalendar,
@@ -959,6 +962,18 @@ function formatTodayForPrompt() {
 // of elapsed time would land on the wrong day across a DST boundary. The step itself is
 // plain UTC arithmetic on that already-localized date, so PROMPT_TIMEZONE stays the only
 // source of truth for which day it is.
+// Today as YYYY-MM-DD in PROMPT_TIMEZONE. Same en-CA/timezone resolution the
+// tomorrow helper below already depends on, so all three date views (today,
+// tomorrow, season) can never disagree about which day it is.
+//
+// 2026-09-23: the storm-season block needs an ISO date, and
+// formatTodayForPrompt() returns "Tuesday, September 23, 2026". Passing that to
+// a YYYY-MM-DD parser returns null, which renders NO season block and looks
+// exactly like working code — the silent-noop failure this repo keeps paying for.
+function todayIsoInPromptTz() {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: PROMPT_TIMEZONE }).format(new Date());
+}
+
 function formatTomorrowForPrompt() {
   const [y, m, d] = new Intl.DateTimeFormat('en-CA', { timeZone: PROMPT_TIMEZONE })
     .format(new Date())
@@ -1051,6 +1066,15 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
 
   parts.push(...P.currentDateHeader(PROMPT_TIMEZONE));
   parts.push(...P.todayIs(formatTodayForPrompt(), formatTomorrowForPrompt()));
+
+  // Seasonal awareness sits WITH the date, not elsewhere: a date the model is
+  // given but not told the meaning of is how "before storm season" survived
+  // into September. Null (unparseable date) renders nothing — a wrong season
+  // is worse than no season.
+  {
+    const season = stormSeasonBlock(todayIsoInPromptTz());
+    if (season) parts.push(...season);
+  }
 
   // ── TIME NOW (2026-08-29, Myron Thorner q5GehRye7DNkN6jlmjl3) ──────────
   // The model previously received only the current DATE — the block directly
@@ -1158,6 +1182,13 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
 
   if (opts.spouseAdvocacy?.used) {
     parts.push(...P.spouseAdvocacySpent(opts.spouseAdvocacy.our_words));
+  }
+
+  // Sits AFTER the pattern break for the same reason that sits after
+  // ESTABLISHED: both suppress the close, and the strongest reason to drop the
+  // ask must be the last one the model reads before the one-question rule.
+  if (opts.handoffPending) {
+    parts.push(...P.handoffPending);
   }
 
   parts.push(...P.ONE_QUESTION_RULE);
@@ -2862,6 +2893,10 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // never blocks the send — it changes what the send SAYS.
   let loopBreak = { looping: false, repeats: 0, recentCloses: [], themes: [] };
   let spouseAdvocacy = { used: false, source: null, our_words: null };
+  // 2026-09-23 — the lead took the disclosure script's "just say the word"
+  // offer, HOT_CALL_IMMEDIATE filed the callback, and a person now owns it.
+  // Suppresses the booking ASK for this turn; never the reply (PR #486).
+  let handoffPending = false;
   try {
     // `current_tags` is the field the context builder populates — `tags` is
     // empty on this object. Reading the wrong one here would not throw; it
@@ -2883,6 +2918,14 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     }
     if (spouseAdvocacy.used) {
       console.log(`[ResponseGenerator] 👥 both-owners pitch already spent for ${contactId} (${spouseAdvocacy.source})`);
+    }
+    // Both hot-call paths converge on this one tag: HOT_CALL_IMMEDIATE adds it
+    // on a callback_request, BEHAVIORAL_ESCALATE_NON_CS_HOT_CALL on an
+    // escalate_to_rep. Reading the tag rather than re-deriving the intent means
+    // the prompt agrees with what the Decision Engine actually did.
+    handoffPending = contactTags.includes('intent:callback-requested');
+    if (handoffPending) {
+      console.log(`[ResponseGenerator] 📞 handoff pending for ${contactId} — booking ask suppressed, reply continues`);
     }
   } catch (err) {
     console.warn(`[ResponseGenerator] repetition-state build failed for ${contactId}: ${err.message}`);
@@ -3267,6 +3310,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       // close and the one-shot both-owners pitch.
       loopBreak,
       spouseAdvocacy,
+      handoffPending,
       serviceArea,
       serviceAreaTentative,
       // 2026-08-18 (invented-phone incident): the only phone number the model

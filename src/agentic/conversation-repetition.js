@@ -91,8 +91,19 @@ const CLOSE_THEMES = Object.freeze([
  */
 const SPOUSE_PITCH_RX = [
   // Advocacy: the visit is better / more useful / easier when both are there.
-  /\b(?:more useful|a lot more useful|better|easier|smoother|best)\b[^.?!]{0,60}\bboth\b/i,
-  /\bboth\b[^.?!]{0,60}\b(?:more useful|a lot more useful|ask questions on the spot|nothing to relay)\b/i,
+  //
+  // 2026-09-23 — "works best" and "best when" were added after the live thread
+  // on hZOcPk6XmMvWVvjZJ7mz got "it works best when both you and Paloma are
+  // there" past the v1.0 list, which only looked for better/easier/more useful.
+  // The pitch is a VALUE CLAIM about joint attendance however it is worded, so
+  // the verb side of the pattern has to cover the ordinary ways of saying
+  // "this goes better" — not just the three the first incident happened to use.
+  /\b(?:more useful|a lot more useful|better|easier|smoother|best|works best|goes better|most helpful)\b[^.?!]{0,60}\bboth\b/i,
+  /\bboth\b[^.?!]{0,60}\b(?:more useful|a lot more useful|works best|goes better|ask questions on the spot|nothing to relay)\b/i,
+  // "it works best when both of you are there" — value claim BEFORE the
+  // when-clause, which the two patterns above (verb near "both") can miss when
+  // the gap runs longer than 60 characters.
+  /\b(?:works best|goes better|is (?:a lot )?(?:better|easier|more useful))\b[^.?!]{0,40}\bwhen\b[^.?!]{0,60}\b(?:both|you and|and you)\b/i,
   // The explicit preference being planted or defended.
   /\bif there'?s any way both of you\b/i,
   /\b(?:she|he|they) (?:doesn'?t|don'?t) have to\b/i,

@@ -16,12 +16,21 @@
  * propagates behind the send by up to a minute (observed 2026-08-31), so
  * checking too early produces false failures.
  *
- * Kill switch: SEND_VERIFY_ENABLED=false.
+ * 2026-09-23 — it now also RECOVERS. On a flagged row it hands the failure to
+ * attemptCarrierResend, which rewrites and re-queues the one message when (and
+ * only when) it can prove a carrier content filter was the cause. A recovered
+ * send emits agentic.send_recovered_after_block and files no human task; every
+ * other outcome emits agentic.send_delivery_failed exactly as before, so the
+ * existing escalation rule is untouched.
+ *
+ * Kill switches: SEND_VERIFY_ENABLED=false (the whole reconciler),
+ * CARRIER_RESEND_ENABLED=false (recovery only — back to alert-a-human).
  */
 
 import supabase from '../supabase.js';
 import { ghlFetch } from '../actions/helpers.js';
 import { emitEvent } from '../event-emitter.js';
+import { attemptCarrierResend } from './carrier-resend-runner.js';
 
 const MIN_AGE_SEC = Math.max(60, parseInt(process.env.SEND_VERIFY_MIN_AGE_SEC || '120', 10));
 const MAX_AGE_MIN = Math.max(5, parseInt(process.env.SEND_VERIFY_MAX_AGE_MIN || '60', 10));
@@ -88,7 +97,40 @@ export async function verifyRecentSends() {
         updated_at: new Date().toISOString(),
       }).eq('id', row.id);
 
-      await emitEvent({
+      // 2026-09-23 — RECOVER before escalating. A carrier-blocked reply reads
+      // to the lead as the bot going silent mid-conversation, and until now the
+      // only fix was a human picking up a task. attemptCarrierResend rewrites
+      // that one message without the blocked vocabulary and queues it once.
+      //
+      // It refuses unless it can prove the cause was CONTENT (a known
+      // carrier-risk term in the body) and that the thread has not moved on —
+      // a dead number, a landline and an opt-out all fail that test, which is
+      // why they still land on a person. See src/agentic/carrier-resend.js.
+      const recovery = await attemptCarrierResend({ ...row, execution_result: { ...row.execution_result, delivery_verified: true, delivery_status: status } })
+        .catch((err) => {
+          console.warn(`[SendVerify] carrier resend threw for action ${row.id} (ignored): ${err.message}`);
+          return { queued: false, reason: 'threw' };
+        });
+
+      // Exactly ONE of these fires. A recovered send files no human task —
+      // that is the whole point — but it still leaves a trail. Anything we
+      // could not recover emits the original event, so
+      // AGENTIC_SEND_BLOCKED_ESCALATE behaves exactly as it did before.
+      await emitEvent(recovery.queued ? {
+        event_type: 'agentic.send_recovered_after_block',
+        source: 'send_verify',
+        entity_type: 'contact',
+        entity_id: String(row.target_id || 'unknown'),
+        ghl_contact_id: row.target_id || null,
+        priority: 'normal',
+        payload: {
+          action_id: row.id,
+          message_id: messageId,
+          delivery_status: status,
+          resend_action_id: recovery.newActionId || null,
+        },
+        idempotency_key: `send_recovered_after_block_${row.id}`,
+      } : {
         event_type: 'agentic.send_delivery_failed',
         source: 'send_verify',
         entity_type: 'contact',
@@ -96,7 +138,12 @@ export async function verifyRecentSends() {
         ghl_contact_id: row.target_id || null,
         priority: 'high',
         bypass_filter: true,
-        payload: { action_id: row.id, message_id: messageId, delivery_status: status },
+        payload: {
+          action_id: row.id,
+          message_id: messageId,
+          delivery_status: status,
+          resend_outcome: recovery.reason || 'not_attempted',
+        },
         idempotency_key: `send_delivery_failed_${row.id}`,
       }).catch(() => {});
     } else {
