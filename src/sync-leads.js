@@ -677,7 +677,7 @@ export async function upsertLeadOnly(prospect) {
       .eq('lp_lead_id', lpLeadId).maybeSingle();
 
     // Corroborated link resolution (no matchToGHL in Pass 1, so verifiedGhlId
-    // is null — this path can only ever produce lognumber_verified /
+    // is null — this path can only ever produce lognumber_verified / user1_verified /
     // rejected_* / existing_preserved). In observe mode the returned id is
     // the legacy derivation, so Pass 1 behavior is unchanged.
     const resolved = await resolveLeadGhlLink({

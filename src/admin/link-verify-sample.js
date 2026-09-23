@@ -24,7 +24,7 @@ const DEFAULT_SAMPLE_SIZE = 50;
 const MAX_SAMPLE_SIZE = 500;
 const CANDIDATE_POOL_LIMIT = 5000;
 const DEFAULT_SOURCES = ['rejected_uncorroborated', 'rejected_conflict'];
-const SAMPLEABLE_SOURCES = new Set([...DEFAULT_SOURCES, 'lognumber_verified']);
+const SAMPLEABLE_SOURCES = new Set([...DEFAULT_SOURCES, 'lognumber_verified', 'user1_verified']);
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const jobs = new Map();
@@ -35,6 +35,7 @@ const EXPECTED_VERDICT = {
   rejected_uncorroborated: 'no_identity',
   rejected_conflict: 'fail',
   lognumber_verified: 'pass',
+  user1_verified: 'pass',
 };
 
 function summarizeAges(ageDays) {

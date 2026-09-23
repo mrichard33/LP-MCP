@@ -4,7 +4,9 @@
 // (deriveLeadGhlId) with identity-checked resolution. Every candidate link
 // is classified into a ghl_link_source, and the resolver only *binds* a
 // lognumber candidate when the GHL contact's phone/email corroborates the
-// LP prospect's.
+// LP prospect's. Since 2026-09-23 a User1 candidate is tried when lognumber
+// is not shape-valid (ActiveProspect leads) — same verification, and it binds
+// only on a pass, in either mode (see user1_verified below).
 //
 // Rollout modes (LP_LINK_CORROBORATION_MODE):
 //   observe (default) — full classification runs and persists
@@ -26,7 +28,7 @@
 import { createClient } from '@supabase/supabase-js';
 import supabase from '../supabase.js';
 import { normalizePhone, getField } from '../sync-utils.js';
-import { lognumberCandidate } from '../ghl-link-shape.js';
+import { lognumberCandidate, user1Candidate } from '../ghl-link-shape.js';
 import { ghlFetch } from '../actions/helpers.js';
 
 export const LINK_SOURCE = {
@@ -90,6 +92,13 @@ export const LINK_SOURCE = {
   // displaces it, and it is its own audit trail: this value marks every lead
   // whose link was decided by the ladder rather than matched directly.
   PROSPECT_ELECTED: 'prospect_elected',
+  // 2026-09-23: the LP lead's User1 (userfields slot 1, "HLCID") held a
+  // shape-valid GHL id, lognumber did NOT, and the GHL contact's phone/email
+  // corroborated the LP prospect. This is the ActiveProspect path: LeadConduit
+  // step 13 spends LogNumber on the Modernize Lead ID and carries our
+  // /intake/ap-resolve contact id in User1 instead. Same evidence as
+  // lognumber_verified, so the same strength (2).
+  USER1_VERIFIED: 'user1_verified',
 };
 
 // Trust ranking for the downgrade guard: a stored rank-3 source is only ever
@@ -98,6 +107,7 @@ const STRENGTH = {
   [LINK_SOURCE.PHONE_EMAIL_MATCH]: 3,
   [LINK_SOURCE.LOGNUMBER_CORROBORATED]: 3,
   [LINK_SOURCE.LOGNUMBER_VERIFIED]: 2,
+  [LINK_SOURCE.USER1_VERIFIED]: 2,
 };
 function linkStrength(source) {
   return (source && STRENGTH[source]) || 1;
@@ -371,7 +381,11 @@ async function verifyForEnforce(lpIdentity, candidateId, lpLeadId) {
 
 // ─── Resolution ──────────────────────────────────────────────────
 
-function buildConflictRow({ lpLeadId, lpProspectId, lognumberId, verifiedGhlId, existingGhlId, resolution, reason, lpIdentity, ghlDetail }) {
+// user1Id rides in `detail` rather than a column: lp_link_conflicts has no
+// User1 column (DDL is dashboard-only), and LP only accepts User1 on AddLead,
+// so one lead never carries two different User1 values — the natural key
+// (lead, lognumber id, verified id, resolution) still dedupes correctly.
+function buildConflictRow({ lpLeadId, lpProspectId, lognumberId, verifiedGhlId, existingGhlId, resolution, reason, lpIdentity, ghlDetail, user1Id = null }) {
   return {
     lp_lead_id: lpLeadId || null,
     lp_prospect_id: lpProspectId || null,
@@ -384,7 +398,14 @@ function buildConflictRow({ lpLeadId, lpProspectId, lognumberId, verifiedGhlId, 
     lp_email: lpIdentity?.email || null,
     ghl_phone: ghlDetail?.ghl_phone || null,
     ghl_email: ghlDetail?.ghl_email || null,
-    detail: { lp_phone_alt: lpIdentity?.phoneAlt || null, ...(ghlDetail || {}) },
+    detail: {
+      lp_phone_alt: lpIdentity?.phoneAlt || null,
+      ...(user1Id ? { user1_ghl_id: user1Id } : {}),
+      // candidate_field marks rows where User1 was the id under test; on a
+      // user1_disagrees_with_lognumber row lognumber was, so it is omitted.
+      ...(user1Id && !lognumberId ? { candidate_field: 'user1' } : {}),
+      ...(ghlDetail || {}),
+    },
   };
 }
 
@@ -410,8 +431,19 @@ export async function resolveLeadGhlLink(
 ) {
   const mode = corroborationMode();
   const lognumberId = lognumberCandidate(lead);
+  // 2026-09-23: User1 is a candidate ONLY when lognumber is not. When both are
+  // shape-valid, lognumber keeps its path unchanged; a differing User1 is
+  // recorded as a conflict below and never bound.
+  const user1Raw = user1Candidate(lead);
+  const user1Id = lognumberId ? null : user1Raw;
+  const user1DisagreesWithLognumber = Boolean(lognumberId && user1Raw && user1Raw !== lognumberId);
+  // The one candidate this pass evaluates.
+  const candidateId = lognumberId || user1Id;
+
   // Pre-resolver behavior: lognumber shape-wins, then the phone/email match,
   // then the stored link. This is what observe mode must keep returning.
+  // User1 is deliberately NOT in it: the legacy result is shape-only, and a
+  // User1 id may only reach a row after corroboration passes (returnedUser1Pass).
   const legacyId = lognumberId || verifiedGhlId || existingGhlId || null;
   const returned = (id, linkSource, conflict = null, deferred = false) => ({
     ghlContactId: mode === 'observe' ? legacyId : id,
@@ -419,9 +451,19 @@ export async function resolveLeadGhlLink(
     conflict,
     deferred,
   });
+  // A corroborated User1 binds in BOTH modes. Observe mode exists to keep the
+  // pre-resolver lognumber behavior bit-identical; there was no pre-resolver
+  // User1 behavior to preserve, and without this the ActiveProspect leads
+  // could never link until enforce is switched on.
+  const returnedUser1Pass = (id) => ({
+    ghlContactId: id,
+    linkSource: LINK_SOURCE.USER1_VERIFIED,
+    conflict: null,
+    deferred: false,
+  });
 
   const existingStrength = linkStrength(existingLinkSource);
-  const candidateUnchanged = !lognumberId || lognumberId === existingGhlId;
+  const candidateUnchanged = !candidateId || candidateId === existingGhlId;
   const verifiedAgreesOrAbsent = !verifiedGhlId || verifiedGhlId === existingGhlId;
 
   // Cheap upgrade: this cycle's phone/email match confirms the stored link.
@@ -445,6 +487,19 @@ export async function resolveLeadGhlLink(
 
   const lpIdentity = extractLpIdentity(lead, prospect);
 
+  // Two LP fields naming two different GHL contacts. Lognumber keeps its
+  // path; User1 is never bound here, but the disagreement is recorded. Sits
+  // after the fast path so an unchanged re-sync stays zero-query.
+  if (user1DisagreesWithLognumber) {
+    await deps.recordConflict(buildConflictRow({
+      lpLeadId, lpProspectId, lognumberId, verifiedGhlId: null, existingGhlId,
+      resolution: 'user1_ignored',
+      reason: 'user1_disagrees_with_lognumber',
+      lpIdentity,
+      user1Id: user1Raw,
+    }));
+  }
+
   // Case 1+2+3: a verified phone/email match exists.
   if (verifiedGhlId) {
     if (lognumberId && lognumberId === verifiedGhlId) {
@@ -461,25 +516,45 @@ export async function resolveLeadGhlLink(
       await deps.recordConflict(conflict);
       return returned(verifiedGhlId, LINK_SOURCE.PHONE_EMAIL_MATCH, conflict);
     }
+    if (user1Id && user1Id !== verifiedGhlId) {
+      // Same as the lognumber case above: the verified match wins.
+      const conflict = buildConflictRow({
+        lpLeadId, lpProspectId, lognumberId: null, verifiedGhlId, existingGhlId,
+        resolution: LINK_SOURCE.PHONE_EMAIL_MATCH,
+        reason: 'user1_disagrees_with_verified_match',
+        lpIdentity,
+        user1Id,
+      });
+      await deps.recordConflict(conflict);
+      return returned(verifiedGhlId, LINK_SOURCE.PHONE_EMAIL_MATCH, conflict);
+    }
+    // No candidate, or User1 equals the verified match — the phone/email
+    // match is the stronger evidence either way (strength 3).
     return returned(verifiedGhlId, LINK_SOURCE.PHONE_EMAIL_MATCH);
   }
 
-  // Case 4: lognumber only → verify before binding.
-  if (lognumberId) {
+  // Case 4: lognumber (or, failing that, User1) only → verify before binding.
+  if (candidateId) {
+    const field = lognumberId ? 'lognumber' : 'User1';
     // Downgrade guard: a rank-3 stored link is never displaced by anything
     // weaker than a differing verified match (handled above).
-    if (existingStrength >= 3 && lognumberId !== existingGhlId) {
-      console.log(`[LinkCorroboration] downgrade guard: kept ${existingLinkSource} link for lead ${lpLeadId} over lognumber candidate ${lognumberId}`);
+    if (existingStrength >= 3 && candidateId !== existingGhlId) {
+      console.log(`[LinkCorroboration] downgrade guard: kept ${existingLinkSource} link for lead ${lpLeadId} over ${field} candidate ${candidateId}`);
       return returned(existingGhlId, null);
     }
 
     const { verdict, detail } = mode === 'enforce'
-      ? await verifyForEnforce(lpIdentity, lognumberId, lpLeadId)
-      : await verifyLognumberCandidate({ lpIdentity, candidateId: lognumberId, lpLeadId });
+      ? await verifyForEnforce(lpIdentity, candidateId, lpLeadId)
+      : await verifyLognumberCandidate({ lpIdentity, candidateId, lpLeadId });
 
     if (verdict === 'pass') {
-      return returned(lognumberId, LINK_SOURCE.LOGNUMBER_VERIFIED);
+      return lognumberId
+        ? returned(lognumberId, LINK_SOURCE.LOGNUMBER_VERIFIED)
+        : returnedUser1Pass(user1Id);
     }
+    // Every non-pass outcome below goes through returned(), so in observe
+    // mode a rejected or deferred User1 can never reach the row: legacyId
+    // does not contain it.
     if (verdict === 'no_identity') {
       // Contact has neither phone nor email (the Wanda case) → refuse to bind.
       return returned(existingGhlId, LINK_SOURCE.REJECTED_UNCORROBORATED);
@@ -491,6 +566,7 @@ export async function resolveLeadGhlLink(
         reason: 'ghl_contact_identity_contradicts_lp',
         lpIdentity,
         ghlDetail: detail,
+        user1Id,
       });
       await deps.recordConflict(conflict);
       return returned(existingGhlId, LINK_SOURCE.REJECTED_CONFLICT, conflict);
