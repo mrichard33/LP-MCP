@@ -70,7 +70,10 @@
 import { forwardToLp } from './lp-addlead-proxy.js';
 import { flattenWebhookBody } from './webhook-body.js';
 import { resolveOrCreateContact } from './services/ghl-contact-resolve.js';
-import { backstopTagsFor } from './services/lp-contact-backstop.js';
+import {
+  backstopTagsFor, sourceDetailTagFor, LP_BACKSTOP_ALWAYS_TAGS,
+} from './services/lp-contact-backstop.js';
+import { resolveEntryForSource, entryTagSuffix, warmSourceMap } from './entry-source-map.js';
 
 /** Hard ceiling on the contact resolve. See the budget note above. */
 const RESOLVE_TIMEOUT_MS = Number(process.env.AP_INTAKE_RESOLVE_TIMEOUT_MS || 1200);
@@ -216,6 +219,60 @@ export function vendorFromApBody(body, { srsNames = null } = {}) {
     'source_name', 'lead_source', 'Source');
 }
 
+// ─── Entry lane from lp_source_mapping, not a fixed table (2026-09-23) ──────
+//
+// The contact used to be tagged with backstopTagsFor('Internet', vendor), whose
+// fixed LP_BACKSTOP_TAG_MAP files EVERY Internet vendor as entry:other. That
+// overrode Mark's per-vendor routing in lp_source_mapping: Swish Leads was
+// ruled high-intent-digital (E.7) on 2026-09-14, yet every Swish contact this
+// intake created went to E.5 via rule 355. The n8n I.AP path, which tags via
+// /webhook/ghl/ensure-routing-tags, does honour the map — so the lane a lead got
+// depended on which pipe happened to create it.
+//
+// Now the vendor's mapped entry tag wins, gated by the same
+// ENTRY_RESOLVER_MAP_DRIVEN flag that gates the map everywhere else. On a miss,
+// a slow table load or the flag off, it falls back to exactly the old tags.
+const ENTRY_MAP_TIMEOUT_MS = 300;
+
+// Only lanes an intake rule actually routes: other → E.5
+// (INTAKE_ROUTE_BACKSTOP_OTHER*), high-intent-digital → E.7
+// (INTAKE_ROUTE_BACKSTOP_HID*). The map also holds lanes no intake rule
+// consumes — 16 sources map to entry:unmapped — and tagging a contact into one
+// of those strands it with no bridge, which is the very failure this fixes.
+// Anything else keeps the old default (entry:other → E.5).
+const ROUTED_INTAKE_LANES = new Set(['other', 'high-intent-digital']);
+
+async function mappedEntryFor(vendor) {
+  if (process.env.ENTRY_RESOLVER_MAP_DRIVEN !== 'true' || !vendor) return null;
+  try {
+    return await raceWithNullTimeout(resolveEntryForSource({ subdetail: vendor }), ENTRY_MAP_TIMEOUT_MS);
+  } catch (err) {
+    console.warn(`[AP-INTAKE] source-map lookup failed for "${vendor}" — default Internet tags: ${err.message}`);
+    return null;
+  }
+}
+
+/**
+ * Create-time tags for an AP contact. Exactly one entry:* and one
+ * active-entry:*, same as backstopTagsFor. Pure, so the lane choice is
+ * testable without a network.
+ */
+export function intakeEntryTags(vendor, mapped = null) {
+  const suffix = entryTagSuffix(mapped?.entryTag);
+  if (!suffix || !ROUTED_INTAKE_LANES.has(suffix)) {
+    return backstopTagsFor('Internet', vendor || null, { suppressOutbound: false });
+  }
+  const detail = sourceDetailTagFor('Internet', vendor);
+  return [
+    `entry:${suffix}`,
+    `active-entry:${suffix}`,
+    ...(mapped.bucket ? [`intent-bucket:${mapped.bucket}`] : []),
+    'source:internet',
+    ...(detail ? [detail] : []),
+    ...LP_BACKSTOP_ALWAYS_TAGS,
+  ];
+}
+
 /**
  * Resolve the GHL contact for an AP payload. Shared by both routes so there is
  * exactly one copy of the mode gate, the tag set and the timeout ceiling.
@@ -233,10 +290,14 @@ export async function resolveApContact(body, { mode = intakeMode(), deps, log, s
   if (mode === 'off') return { contactId: null, wouldStamp: null, outcome: 'skipped', resolveMs: 0, mirrorMs: null, vendor };
 
   const t0 = Date.now();
+  let entry = null;
   try {
     const input = contactInputFromApBody(body, { vendor });
-    const tags = [AP_INTAKE_TAG, 'lp-linked', 'stage:new-lead',
-      ...backstopTagsFor('Internet', vendor || null, { suppressOutbound: false })];
+    const mapped = await mappedEntryFor(vendor);
+    const mappedLane = entryTagSuffix(mapped?.entryTag);
+    entry = ROUTED_INTAKE_LANES.has(mappedLane) ? mappedLane : 'other';
+    const tags = [...new Set([AP_INTAKE_TAG, 'lp-linked', 'stage:new-lead',
+      ...intakeEntryTags(vendor, mapped)])];
     const result = await raceWithNullTimeout(
       resolveOrCreateContact({ ...input, tags }, {
         create: mode === 'live',
@@ -257,7 +318,7 @@ export async function resolveApContact(body, { mode = intakeMode(), deps, log, s
     );
     const resolveMs = Date.now() - t0;
     // The ceiling won. Answer without an id rather than hang.
-    if (result === null) return { contactId: null, wouldStamp: null, outcome: 'timeout', resolveMs, mirrorMs: null, vendor };
+    if (result === null) return { contactId: null, wouldStamp: null, outcome: 'timeout', resolveMs, mirrorMs: null, vendor, entry };
     return {
       contactId: mode === 'live' ? (result.contactId || null) : null,
       wouldStamp: result.contactId || null,
@@ -267,13 +328,14 @@ export async function resolveApContact(body, { mode = intakeMode(), deps, log, s
       // services/ghl-contact-resolve.js — the two have opposite fixes.
       mirrorMs: result.mirrorMs ?? null,
       vendor,
+      entry,
     };
   } catch (err) {
     const resolveMs = Date.now() - t0;
     // Fail open by contract: a GHL problem must not stop a lead reaching the
     // sales floor.
     console.warn(`[AP-INTAKE] resolve failed (${resolveMs}ms), continuing without id: ${err.message}`);
-    return { contactId: null, wouldStamp: null, outcome: 'error', resolveMs, mirrorMs: null, vendor };
+    return { contactId: null, wouldStamp: null, outcome: 'error', resolveMs, mirrorMs: null, vendor, entry };
   }
 }
 
@@ -340,7 +402,7 @@ export function registerApIntakeRoutes(app) {
       // srs_id is printed beside the vendor NAME it resolved to (via
       // lp_source_catalog — see the vendor note at the top). Shadow printing
       // the two side by side is how the 24-hex LeadConduit id was caught.
-      `[AP-RESOLVE] vendor=${r.vendor || '?'} srs=${pick(body, 'srs_id', 'srsid', 'SRS_id') || '?'} `
+      `[AP-RESOLVE] vendor=${r.vendor || '?'} srs=${pick(body, 'srs_id', 'srsid', 'SRS_id') || '?'} entry=${r.entry || '-'} `
       + `mode=${mode} resolve=${r.outcome}/${r.resolveMs}ms mirror=${r.mirrorMs ?? '-'}ms `
       + `${r.contactId ? `returned=${r.contactId}` : `returned=no${r.wouldStamp ? ` would=${r.wouldStamp}` : ''}`} `
       + `total=${Date.now() - started}ms`
@@ -390,15 +452,17 @@ export function registerApIntakeRoutes(app) {
     }
   });
 
-  // Warm the srs_id → vendor-name cache so the first lead after a deploy does
-  // not pay for the catalog read. Fire-and-forget: getSrsNames never throws.
+  // Warm the srs_id → vendor-name cache and the lp_source_mapping snapshot so
+  // the first lead after a deploy does not pay for either read.
+  // Fire-and-forget: neither throws.
   getSrsNames();
+  warmSourceMap();
 
   console.log(`[AP-INTAKE] Registered: POST /intake/ap-resolve, POST /intake/ap-lead `
     + `(mode=${intakeMode()}, resolve_ceiling=${RESOLVE_TIMEOUT_MS}ms)`);
 }
 
 export const _internal = {
-  intakeMode, raceWithNullTimeout, logClientDisconnect, RESOLVE_TIMEOUT_MS, AP_INTAKE_TAG,
+  intakeMode, mappedEntryFor, raceWithNullTimeout, logClientDisconnect, RESOLVE_TIMEOUT_MS, AP_INTAKE_TAG,
   __resetSrsCacheForTest() { srsCache.names = null; srsCache.at = 0; },
 };

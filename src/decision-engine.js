@@ -412,15 +412,17 @@ function isAppointmentSyncRule(ruleKey) {
 const DEDUP_STATUSES_WITH_COMPLETED = ['pending', 'pending_approval', 'approved', 'executing', 'completed'];
 const DEDUP_STATUSES_INFLIGHT = ['pending', 'pending_approval', 'approved', 'executing'];
 
-// 2026-09-23 — intake E.5 routing is TWO rules that must never both enroll the
-// same contact. INTAKE_ROUTE_BACKSTOP_OTHER (355) listens on contact.created;
+// 2026-09-23 — intake bridge routing rules must never both enroll the same
+// contact. The group covers every INTAKE_ROUTE_BACKSTOP_* key: _OTHER/_OTHER_LATE
+// (→ E.5) and _HID/_HID_LATE (→ E.7), so one contact gets exactly one intake
+// bridge. Original case, the E.5 pair: INTAKE_ROUTE_BACKSTOP_OTHER (355) listens on contact.created;
 // n8n I.AP creates contacts WITHOUT active-entry:other and ensure-routing-tags
 // adds it ~6-10s later, so 355's has_tag failed and 229 AP contacts in 14 days
 // never reached any bridge. INTAKE_ROUTE_BACKSTOP_OTHER_LATE re-checks on
 // ghl.routing_tags_ensured. has_tag reads the contact LIVE, so a late-processed
 // contact.created could pass both — and E.5 has no double-entry guard. One
 // group, blocking on completed too, makes them mutually exclusive per contact.
-const INTAKE_ROUTE_PREFIX = 'INTAKE_ROUTE_BACKSTOP_OTHER';
+const INTAKE_ROUTE_PREFIX = 'INTAKE_ROUTE_BACKSTOP_';
 export function dedupPolicy(ruleKey) {
   if (isLpDispRule(ruleKey)) return { statuses: DEDUP_STATUSES_WITH_COMPLETED, group: 'LP_DISP_%' };
   if (ruleKey && ruleKey.startsWith(INTAKE_ROUTE_PREFIX)) {
