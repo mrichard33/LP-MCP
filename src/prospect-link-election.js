@@ -65,6 +65,7 @@ const STRENGTH = {
   phone_email_match: 3,
   lognumber_corroborated: 3,
   lognumber_verified: 2,
+  user1_verified: 2,
 };
 
 const REJECTED = new Set(['rejected_conflict', 'rejected_uncorroborated']);

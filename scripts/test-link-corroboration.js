@@ -30,7 +30,7 @@ import {
   LINK_SOURCE,
   _internal,
 } from '../src/services/link-corroboration.js';
-import { shapeValidLognumber, lognumberCandidate } from '../src/ghl-link-shape.js';
+import { shapeValidLognumber, lognumberCandidate, user1Candidate } from '../src/ghl-link-shape.js';
 
 // ─── Fixtures ────────────────────────────────────────────────────
 
@@ -462,4 +462,226 @@ test('verifyLognumberCandidate: live contact gone → no_identity', withDeps({
   });
   assert.equal(res.verdict, 'no_identity');
   assert.equal(res.source, 'ghl_live');
+}));
+
+// ─── User1 candidate (ActiveProspect, 2026-09-23) ────────────────
+//
+// LeadConduit step 13 spends LogNumber on the Modernize Lead ID (11-12 digits
+// or 24 hex — never 20 chars) and carries our /intake/ap-resolve contact id in
+// User1. GetLead returns User1 as the fldnumber "1" slot of `userfields`
+// (titled "HLCID"), exactly as stored in lp_leads.raw_lp_data.
+
+const MODERNIZE_ID = '100022472233';
+const apLead = (user1, lognumber = MODERNIZE_ID) => ({
+  lognumber,
+  userfields: [
+    { fldnumber: '1', fieldtitle: 'HLCID', fieldvalue: user1 },
+    { fldnumber: '11', fieldtitle: 'Call ID', fieldvalue: '' },
+    { fldnumber: '12', fieldtitle: 'GTR ID', fieldvalue: '' },
+  ],
+});
+
+test('user1Candidate reads userfields slot 1 and shape-checks it', () => {
+  assert.equal(user1Candidate(apLead(SHELL_ID)), SHELL_ID);
+  assert.equal(user1Candidate(apLead(`  ${SHELL_ID} `)), SHELL_ID, 'trimmed');
+  assert.equal(user1Candidate(apLead('0')), null, 'LP default value');
+  assert.equal(user1Candidate(apLead('')), null);
+  assert.equal(user1Candidate(apLead('not-a-ghl-id')), null);
+  assert.equal(user1Candidate({ userfields: [{ fldnumber: '11', fieldvalue: SHELL_ID }] }), null, 'other slots ignored');
+  assert.equal(user1Candidate({ userfields: 'garbage' }), null);
+  assert.equal(user1Candidate({}), null);
+  assert.equal(user1Candidate(null), null);
+  assert.equal(lognumberCandidate(apLead(SHELL_ID)), null, 'Modernize id is not a lognumber candidate');
+});
+
+test('user1: Modernize lognumber + corroborated User1 binds as user1_verified', withDeps({
+  mode: 'enforce',
+  liveContacts: { [SHELL_ID]: { phone: '+17272421300', email: null } },
+}, async (calls) => {
+  const res = await resolveLeadGhlLink({
+    lead: apLead(SHELL_ID),
+    prospect: wandaProspect,
+  }, { lpLeadId: '700001' });
+  assert.equal(res.ghlContactId, SHELL_ID);
+  assert.equal(res.linkSource, LINK_SOURCE.USER1_VERIFIED);
+  assert.deepEqual(calls.live, [SHELL_ID]);
+  assert.equal(calls.conflicts.length, 0);
+}));
+
+test('user1: contradicting contact is not bound — rejected_conflict + conflict row', withDeps({
+  mode: 'enforce',
+  liveContacts: { [SHELL_ID]: { phone: '+19998887777', email: 'someone.else@example.com' } },
+}, async (calls) => {
+  const res = await resolveLeadGhlLink({
+    lead: apLead(SHELL_ID),
+    prospect: wandaProspect,
+  }, { lpLeadId: '700002' });
+  assert.equal(res.ghlContactId, null);
+  assert.equal(res.linkSource, LINK_SOURCE.REJECTED_CONFLICT);
+  assert.equal(calls.conflicts.length, 1);
+  assert.equal(calls.conflicts[0].resolution, LINK_SOURCE.REJECTED_CONFLICT);
+  assert.equal(calls.conflicts[0].lognumber_ghl_id, null, 'lognumber held no GHL id');
+  assert.equal(calls.conflicts[0].detail.candidate_field, 'user1');
+  assert.equal(calls.conflicts[0].detail.user1_ghl_id, SHELL_ID);
+}));
+
+test('user1: no-identity contact is not bound — rejected_uncorroborated', withDeps({
+  mode: 'enforce',
+  liveContacts: { [SHELL_ID]: { phone: null, email: null } },
+}, async () => {
+  const res = await resolveLeadGhlLink({
+    lead: apLead(SHELL_ID),
+    prospect: wandaProspect,
+  }, { lpLeadId: '700003' });
+  assert.equal(res.ghlContactId, null);
+  assert.equal(res.linkSource, LINK_SOURCE.REJECTED_UNCORROBORATED);
+}));
+
+test('user1: both shape-valid and different → lognumber path, User1 conflict recorded, User1 never read', withDeps({
+  mode: 'enforce',
+  liveContacts: {
+    [OTHER_ID]: { phone: '+17272421300' },
+    [SHELL_ID]: { phone: '+17272421300' },
+  },
+}, async (calls) => {
+  const res = await resolveLeadGhlLink({
+    lead: apLead(SHELL_ID, OTHER_ID),
+    prospect: wandaProspect,
+  }, { lpLeadId: '700004' });
+  assert.equal(res.ghlContactId, OTHER_ID, 'lognumber path unchanged');
+  assert.equal(res.linkSource, LINK_SOURCE.LOGNUMBER_VERIFIED);
+  assert.deepEqual(calls.live, [OTHER_ID], 'User1 is never verified when lognumber is a candidate');
+  assert.equal(calls.conflicts.length, 1);
+  assert.equal(calls.conflicts[0].reason, 'user1_disagrees_with_lognumber');
+  assert.equal(calls.conflicts[0].lognumber_ghl_id, OTHER_ID);
+  assert.equal(calls.conflicts[0].detail.user1_ghl_id, SHELL_ID);
+  assert.equal(calls.conflicts[0].detail.candidate_field, undefined, 'lognumber, not User1, was the candidate');
+}));
+
+test('user1: equal to lognumber → no conflict, lognumber path as today', withDeps({
+  mode: 'enforce',
+  liveContacts: { [SHELL_ID]: { phone: '+17272421300' } },
+}, async (calls) => {
+  const res = await resolveLeadGhlLink({
+    lead: apLead(SHELL_ID, SHELL_ID),
+    prospect: wandaProspect,
+  }, { lpLeadId: '700005' });
+  assert.equal(res.linkSource, LINK_SOURCE.LOGNUMBER_VERIFIED);
+  assert.equal(calls.conflicts.length, 0);
+}));
+
+test('user1: empty or garbage User1 behaves exactly like today', withDeps({ mode: 'enforce' }, async (calls) => {
+  for (const bad of ['', '0', 'garbage', 'AbcDefGhij123456789']) {
+    const res = await resolveLeadGhlLink({
+      lead: apLead(bad),
+      prospect: wandaProspect,
+      existingGhlId: THIRD_ID,
+      existingLinkSource: null,
+    }, { lpLeadId: '700006' });
+    assert.equal(res.ghlContactId, THIRD_ID, `User1 ${JSON.stringify(bad)} must not bind`);
+    assert.equal(res.linkSource, LINK_SOURCE.EXISTING_PRESERVED);
+  }
+  assert.equal(calls.live.length + calls.cache.length + calls.conflicts.length, 0);
+}));
+
+test('user1: downgrade guard keeps a strength-3 link over a differing User1', withDeps({
+  mode: 'enforce',
+  liveContacts: { [SHELL_ID]: { phone: '+17272421300' } },
+}, async (calls) => {
+  const res = await resolveLeadGhlLink({
+    lead: apLead(SHELL_ID),
+    prospect: wandaProspect,
+    existingGhlId: OTHER_ID,
+    existingLinkSource: LINK_SOURCE.PHONE_EMAIL_MATCH,
+  }, { lpLeadId: '700007' });
+  assert.equal(res.ghlContactId, OTHER_ID);
+  assert.equal(res.linkSource, null);
+  assert.equal(calls.live.length, 0, 'guard fires before any verification read');
+}));
+
+test('user1: equal to a verified phone/email match → phone_email_match', withDeps({ mode: 'enforce' }, async (calls) => {
+  const res = await resolveLeadGhlLink({
+    lead: apLead(SHELL_ID),
+    prospect: wandaProspect,
+    verifiedGhlId: SHELL_ID,
+  }, { lpLeadId: '700008' });
+  assert.equal(res.ghlContactId, SHELL_ID);
+  assert.equal(res.linkSource, LINK_SOURCE.PHONE_EMAIL_MATCH);
+  assert.equal(calls.live.length + calls.conflicts.length, 0);
+}));
+
+test('user1: disagreeing with a verified match → verified wins, conflict recorded', withDeps({ mode: 'enforce' }, async (calls) => {
+  const res = await resolveLeadGhlLink({
+    lead: apLead(SHELL_ID),
+    prospect: wandaProspect,
+    verifiedGhlId: OTHER_ID,
+  }, { lpLeadId: '700009' });
+  assert.equal(res.ghlContactId, OTHER_ID);
+  assert.equal(res.linkSource, LINK_SOURCE.PHONE_EMAIL_MATCH);
+  assert.equal(calls.conflicts.length, 1);
+  assert.equal(calls.conflicts[0].reason, 'user1_disagrees_with_verified_match');
+}));
+
+test('user1: fast path — bound User1 link re-syncs with zero reads', withDeps({ mode: 'enforce' }, async (calls) => {
+  const res = await resolveLeadGhlLink({
+    lead: apLead(SHELL_ID),
+    prospect: wandaProspect,
+    existingGhlId: SHELL_ID,
+    existingLinkSource: LINK_SOURCE.USER1_VERIFIED,
+  }, { lpLeadId: '700010' });
+  assert.equal(res.ghlContactId, SHELL_ID);
+  assert.equal(res.linkSource, null);
+  assert.equal(calls.live.length + calls.cache.length + calls.verdictLookups.length + calls.conflicts.length, 0);
+}));
+
+test('user1: strength 2, same as lognumber_verified', () => {
+  assert.equal(_internal.linkStrength(LINK_SOURCE.USER1_VERIFIED), 2);
+  assert.equal(_internal.linkStrength(LINK_SOURCE.USER1_VERIFIED), _internal.linkStrength(LINK_SOURCE.LOGNUMBER_VERIFIED));
+});
+
+test('observe + user1 pass → returns the User1 id (binds in both modes)', withDeps({
+  mode: 'observe',
+  cacheContacts: { [SHELL_ID]: { phone: '+17272421300', email: null, synced_at: '2026-09-22T00:00:00Z' } },
+}, async (calls) => {
+  const res = await resolveLeadGhlLink({
+    lead: apLead(SHELL_ID),
+    prospect: wandaProspect,
+  }, { lpLeadId: '700011' });
+  assert.equal(res.ghlContactId, SHELL_ID);
+  assert.equal(res.linkSource, LINK_SOURCE.USER1_VERIFIED);
+  assert.equal(calls.live.length, 0, 'observe still never reads GHL live');
+}));
+
+test('observe + user1 fail → returns the legacy result, never the User1 id', withDeps({
+  mode: 'observe',
+  cacheContacts: { [SHELL_ID]: { phone: '+19998887777', email: null } },
+}, async (calls) => {
+  const unlinked = await resolveLeadGhlLink({
+    lead: apLead(SHELL_ID),
+    prospect: wandaProspect,
+  }, { lpLeadId: '700012' });
+  assert.equal(unlinked.ghlContactId, null, 'legacy result for an unlinked AP lead is no link');
+  assert.equal(unlinked.linkSource, LINK_SOURCE.REJECTED_CONFLICT);
+  assert.equal(calls.conflicts.length, 1);
+
+  const linked = await resolveLeadGhlLink({
+    lead: apLead(SHELL_ID),
+    prospect: wandaProspect,
+    existingGhlId: THIRD_ID,
+    existingLinkSource: LINK_SOURCE.LEGACY_UNVERIFIED,
+  }, { lpLeadId: '700013' });
+  assert.equal(linked.ghlContactId, THIRD_ID, 'existing link, never the rejected User1');
+}));
+
+test('observe + user1 unknown (cache row missing) → deferred, User1 not returned', withDeps({
+  mode: 'observe',
+  cacheContacts: {},
+}, async () => {
+  const res = await resolveLeadGhlLink({
+    lead: apLead(SHELL_ID),
+    prospect: wandaProspect,
+  }, { lpLeadId: '700014' });
+  assert.equal(res.ghlContactId, null);
+  assert.equal(res.linkSource, null);
+  assert.equal(res.deferred, true);
 }));
