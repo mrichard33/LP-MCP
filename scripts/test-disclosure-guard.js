@@ -99,7 +99,7 @@ const { APPROVED_DISCLOSURE_VARIANTS, SYSTEM_IDENTITY_AND_VOICE } =
 
 test('every approved disclosure variant passes the guard unblocked', () => {
   const entries = Object.entries(APPROVED_DISCLOSURE_VARIANTS);
-  assert.ok(entries.length >= 2, 'expected both approved variants to be exported');
+  assert.ok(entries.length >= 1, 'expected at least one approved variant to be exported');
 
   for (const [name, body] of entries) {
     const result = guardDisclosure(body);
@@ -140,4 +140,39 @@ test('the disclosure fallback itself survives the guard', () => {
   // It is the replacement body. If it were ever caught, the guard would have
   // nothing safe to substitute.
   assert.equal(guardDisclosure(DISCLOSURE_FALLBACK).blocked, false);
+});
+
+test('the disclosure is an OPENING, not the whole reply', () => {
+  // The approved script answers "are you a bot" and stops. If the model treated
+  // it as the complete message, every disclosure turn would drop whatever the
+  // lead actually asked — which is the same "deflecting an easy question"
+  // failure the ANSWER FIRST rule exists to prevent.
+  assert.match(
+    SYSTEM_IDENTITY_AND_VOICE,
+    /IN THE SAME MESSAGE, continue naturally with their original question/,
+  );
+});
+
+test('no sendable text carries a bracketed stage direction', () => {
+  // "[Continue naturally with their original question.]" is an instruction TO
+  // the model. A variant containing a bracketed placeholder would be copied
+  // into the SMS verbatim — the same class of bug as the "{{custom_values.rep_name}}"
+  // merge tag that shipped raw to Kelly Callahan.
+  for (const [name, body] of Object.entries(APPROVED_DISCLOSURE_VARIANTS)) {
+    assert.doesNotMatch(body, /\[[^\]]+\]/, `variant "${name}" contains a bracketed placeholder`);
+    assert.doesNotMatch(body, /\{\{/, `variant "${name}" contains a raw merge tag`);
+  }
+});
+
+test('the approved script keeps the two lines that earn the trust', () => {
+  // Regression on CONTENT, not just deliverability. Three rewrites in one day
+  // each dropped one of these: the REASON the automation exists ("so nobody's
+  // left waiting") and the answer to the real worry behind "is this a bot"
+  // ("someone on the team sees every conversation" — am I shouting into a void).
+  const script = APPROVED_DISCLOSURE_VARIANTS.standard;
+  assert.match(script, /nobody's left waiting/);
+  assert.match(script, /sees every conversation/);
+  // And it must never re-acquire what broke the earlier scripts.
+  assert.doesNotMatch(script, /\b(he|him|his|she|her|hers)\b/i, 'no gendered pronoun');
+  assert.doesNotMatch(script, /\{\{/, 'no rep-name dependency');
 });

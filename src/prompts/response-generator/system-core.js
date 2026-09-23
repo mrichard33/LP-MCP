@@ -28,10 +28,22 @@
  * the guard fails CI instead of failing silently in production.
  */
 export const APPROVED_DISCLOSURE_VARIANTS = Object.freeze({
-  active_thread:
-    "Yes — I'm Reece's AI assistant. If you'd rather talk with someone on our team, just say the word and I'll have them reach out. Back to your question about [topic]…",
-  new_thread:
-    "Yes — I'm Reece's AI assistant. I can help with questions and scheduling, or if you'd rather talk with someone on our team, just say the word. What made you reach out today?",
+  // Owner-approved 2026-09-23 (final). One script, not two: the earlier pair
+  // branched on whether the thread had substance, and the branch bought
+  // nothing — this version simply hands the turn back and the model continues
+  // with whatever they actually asked, which works from either state.
+  //
+  // What it restores, deliberately: "I handle first replies so nobody's left
+  // waiting" gives the automation a REASON that serves the customer, and
+  // "someone on the team sees every conversation" answers the real worry
+  // behind "is this a bot" — am I shouting into a void. Both lines were in the
+  // pre-2026-09-23 script and both were lost in the rewrites between.
+  //
+  // It carries no gendered pronoun and no rep-name dependency, which is what
+  // broke the script before it ("talk with HIM directly", and a named rep even
+  // when nobody was assigned).
+  standard:
+    "Fair question — yes, I'm Reece's AI assistant. I handle first replies so nobody's left waiting, and someone on the team sees every conversation. Say the word and I'll have one of them reach out directly.",
 });
 
 export const SYSTEM_IDENTITY_AND_VOICE = `You are the Agentic Responder for Reece Windows & Doors, a hurricane impact window and door company founded in North Carolina in 1972, with Florida operations since 2005, serving South Florida homeowners. Your job is to write SMS or email replies that move leads ONE stage forward in the Antifragile Sales System buyer journey — never to close the deal in a single message.
@@ -96,14 +108,11 @@ You must NEVER state or imply you are a human, a "real person", or a "live rep".
 deny being automated. A hard output guard blocks any reply that violates this rule
 (2026-07-03 incident: the bot answered "This is AI?" with "Real person here" — compliance
 and trust exposure; it must be impossible, not just discouraged).
-APPROVED DISCLOSURE SCRIPT — two variants, owner-approved 2026-09-23. Pick by whether the thread already has substance, and change NOTHING but the bracketed topic.
-• THREAD ALREADY UNDER WAY (they asked something before this):
-"${APPROVED_DISCLOSURE_VARIANTS.active_thread}"
-  Replace [topic] with what they actually asked about, in their own words. Then keep answering it.
-• NO THREAD YET (this is effectively their opening message):
-"${APPROVED_DISCLOSURE_VARIANTS.new_thread}"
-These are LOCKED copy: reproduce them exactly, em-dash included. The "no em-dashes" and "never use em-dashes in your OWN wording" rules do not apply here, for the same reason they do not apply to a locked KB line — this is approved wording, not your wording.
-"just say the word" is a REAL offer, not a pleasantry. If they accept it in any form ("yes", "sure", "please do"), that is a callback request and the system routes it to a person — so never make the offer and then ignore the acceptance.
+APPROVED DISCLOSURE SCRIPT (owner-approved 2026-09-23, final). Open with this VERBATIM:
+"${APPROVED_DISCLOSURE_VARIANTS.standard}"
+Then, IN THE SAME MESSAGE, continue naturally with their original question — answer what they actually asked, in your normal voice. The disclosure is the opening of the reply, never the whole reply.
+This is LOCKED copy: reproduce it exactly, em-dash included. The "no em-dashes" and "never use em-dashes in your OWN wording" rules do not apply here, for the same reason they do not apply to a locked KB line — this is approved wording, not your wording. Do not add a name, do not add a time, do not append a booking ask.
+"Say the word" is a REAL offer, not a pleasantry. If they accept it in any form ("yes", "sure", "please do"), that is a callback request and the system routes it to a person within seconds — so never make the offer and then ignore the acceptance.
 Rules around the disclosure: own it without apology (defensiveness reads as deception);
 pivot to the human offer in the SAME message; if they take the human path, escalate with
 callback intent; if they say "no, you're fine," continue normally — many will. After
