@@ -716,6 +716,29 @@ export const spouseAdvocacySpent = (ourWords) => [
   `  STILL ALLOWED: booking a time that happens to suit both of them, and answering plainly WHY both owners attend if they ask. Policy is unchanged — we do not run single-leg appointments. You simply may not sell it a second time.`,
 ].filter(Boolean);
 
+// ═══════════════════════════════════════════════════════════════════
+// HANDOFF PENDING — a person is already on the way (2026-09-23)
+// ═══════════════════════════════════════════════════════════════════
+//
+// The AI-disclosure script offers "just say the word and I'll have them reach
+// out". When the lead takes that offer, HOT_CALL_IMMEDIATE pushes the callback
+// to LP (the dial trigger, ~4s to LP_ASAP) and tags intent:callback-requested.
+//
+// What must NOT happen next is the bot asking for the appointment again. They
+// just told us they would rather talk to a person; answering that with another
+// booking ask is the same "not listening" defect as the seven repeated closes
+// (PR #1013), and here it also contradicts a promise we made one turn ago.
+//
+// It must equally not go SILENT. Standing policy is always-respond (PR #486)
+// and stop-bot stays the rep's takeover switch alone — if the rep is slow, the
+// lead still gets answers. So this suppresses the ASK, never the reply.
+export const handoffPending = [
+  `\nA PERSON IS ALREADY ON THE WAY. This lead asked to speak with someone on the team, and that callback is already filed — a human has it.`,
+  `  DO NOT ask for an appointment, a day, a time, or a call in this message. The ask has been answered; repeating it now reads as ignoring what they just said, one turn after we promised them a person.`,
+  `  DO keep helping: answer whatever they asked, plainly and completely. If they have no open question, confirm in one short line that someone from the team will reach out, and stop.`,
+  `  Never say a specific person's name or promise a specific time unless that exact name or time is already in the conversation. "Someone from the team" is correct and sufficient.`,
+];
+
 // The NEPQ tonality rule, restated at the data frame because the layer states
 // it 2,000 tokens earlier and six of seven real closes broke it anyway.
 export const ONE_QUESTION_RULE = [

@@ -442,3 +442,44 @@ test('plain-text bodies pass through htmlEmailToText untouched', () => {
   const plain = 'Just a normal reply.\n\nThanks';
   assert.equal(htmlEmailToText(plain), plain);
 });
+
+// ══════════════════════════════════════════════════════════════════════════
+// HANDOFF PENDING — "just say the word" was taken up (2026-09-23)
+//
+// The AI-disclosure script promises "just say the word and I'll have them
+// reach out". When the lead accepts, HOT_CALL_IMMEDIATE files the callback and
+// tags intent:callback-requested. Two things must then be true of the very next
+// reply, and they pull in opposite directions:
+//
+//   1. it must NOT ask for the appointment again — that reads as ignoring what
+//      they just said, one turn after we promised them a person;
+//   2. it must still REPLY — always-respond (PR #486) is unchanged and
+//      stop-bot remains the rep's takeover switch alone.
+//
+// So the block suppresses the ASK, never the message.
+// ══════════════════════════════════════════════════════════════════════════
+
+test('handoff pending: the prompt forbids the booking ask', () => {
+  const p = kellyPrompt({ handoffPending: true });
+  assert.match(p, /A PERSON IS ALREADY ON THE WAY/);
+  assert.match(p, /DO NOT ask for an appointment, a day, a time, or a call/);
+});
+
+test('handoff pending: the prompt still requires a reply', () => {
+  // The failure mode this guards is over-correction into silence.
+  const p = kellyPrompt({ handoffPending: true });
+  assert.match(p, /DO keep helping: answer whatever they asked/);
+});
+
+test('handoff pending: never names a person or a time we did not state', () => {
+  const p = kellyPrompt({ handoffPending: true });
+  assert.match(p, /Never say a specific person's name or promise a specific time/);
+});
+
+test('handoff pending is ABSENT by default — it must be opt-in', () => {
+  // A block that rendered unconditionally would suppress the booking ask on
+  // every turn of every conversation, which is a far worse bug than the one it
+  // fixes: the bot would stop asking for appointments entirely.
+  const p = kellyPrompt();
+  assert.doesNotMatch(p, /A PERSON IS ALREADY ON THE WAY/);
+});
