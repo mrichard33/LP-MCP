@@ -437,8 +437,8 @@ function buildLogLabel(payload, fallback) {
  * in that workflow (e.g. "S4.1" → "active-s4.1"). Returns null when no
  * canonical_code is available, which disables the guard (fail-open).
  *
- * isAlreadyEnrolled: live GHL read of the contact's tags; true iff the
- * derived active tag is present. Live (not cache) is deliberate — a stale
+ * v2.0 idempotency (now entryGuardMatch + readLiveTags): live GHL read of the
+ * contact's tags; skip iff the derived active tag is present. Live (not cache) is deliberate — a stale
  * cache miss would let a duplicate enrollment through, which is the exact
  * failure we're closing. Fail-open on any read error so a transient GHL
  * outage can never block a legitimate first-time enrollment.
@@ -484,15 +484,56 @@ export function tagsToClearOnRemoval(canonicalCode) {
   return tag ? [tag] : [];
 }
 
-async function isAlreadyEnrolled(contactId, activeTag) {
-  if (!activeTag) return false;
+/**
+ * v2.3 (2026-09-25) — Entry guard: which live tag, if any, says "do not send
+ * this contact in again". Pure, so it unit-tests without GHL.
+ *
+ * WHY: INTAKE_ROUTE_BACKSTOP_E0 (rule 383) posted every backstop/AP lead to
+ * E.0 and 51 of 51 went through. Its only guard was active-e.0, which E.0
+ * itself removes ~2 minutes into its run — so a lead I.LP-IN had already routed
+ * (now carrying active-e.5 / stage:entry-bridge / a booked stage) was routed a
+ * second time. 20 of 185 E.0 entrants entered twice in 3 days. A rule can now
+ * name the downstream tags that prove the lead was already routed:
+ *
+ *   skip_if_any_tag     exact tags, e.g. ["active-e.5", "stage:entry-bridge"]
+ *   skip_if_tag_prefix  prefixes, e.g. ["stage:"]  (any funnel stage at all)
+ *   skip_allow_tags     exceptions to the prefixes, e.g. ["stage:new-lead"]
+ *
+ * The derived active-<code> tag is checked first, exactly as before (v2.0).
+ * Tags compare case-insensitively; GHL lower-cases on write but rules are
+ * typed by hand.
+ *
+ * @returns {{ reason: 'already_enrolled'|'entry_guard', tag: string } | null}
+ */
+export function entryGuardMatch(tags, { activeTag = null, payload = {} } = {}) {
+  const have = (Array.isArray(tags) ? tags : []).map((t) => String(t).toLowerCase());
+  const list = (v) => (Array.isArray(v) ? v : []).map((t) => String(t).trim().toLowerCase()).filter(Boolean);
+  if (activeTag && have.includes(activeTag.toLowerCase())) return { reason: 'already_enrolled', tag: activeTag };
+  const exact = list(payload.skip_if_any_tag);
+  const hit = have.find((t) => exact.includes(t));
+  if (hit) return { reason: 'entry_guard', tag: hit };
+  const prefixes = list(payload.skip_if_tag_prefix);
+  const allow = list(payload.skip_allow_tags);
+  const pre = have.find((t) => !allow.includes(t) && prefixes.some((p) => t.startsWith(p)));
+  return pre ? { reason: 'entry_guard', tag: pre } : null;
+}
+
+function hasEntryGuard(payload) {
+  return ['skip_if_any_tag', 'skip_if_tag_prefix'].some((k) => Array.isArray(payload?.[k]) && payload[k].length > 0);
+}
+
+/**
+ * Live GHL tag read for the guards above. Returns null on any read error —
+ * callers fail OPEN on null so a transient GHL outage can never block a
+ * legitimate first-time enrollment (same stance as v2.0).
+ */
+async function readLiveTags(contactId) {
   try {
     const res = await ghlFetch('GET', `/contacts/${contactId}`);
-    const tags = res?.contact?.tags || [];
-    return tags.includes(activeTag);
+    return res?.contact?.tags || [];
   } catch (err) {
     console.warn(`[ActionExecutor] idempotency tag-read failed for ${contactId} (fail-open, will enroll): ${err.message}`);
-    return false;
+    return null;
   }
 }
 
@@ -603,20 +644,38 @@ export async function executeAddToWorkflow(action) {
   // destination workflow (active-<canonical_code> present). This prevents the
   // duplicate Route-B webhook POSTs that change nothing, never confirm, and get
   // reaped after the >10min executor TTL (Kessler / Wakefield / Stanton
-  // 2026-06-16). Only engages when canonical_code is present; isAlreadyEnrolled
+  // 2026-06-16). Only engages when canonical_code is present; readLiveTags
   // fails open on any read error so a transient GHL hiccup can't block a route.
+  // v2.3 — plus the rule's own entry guard (skip_if_any_tag / _prefix), read
+  // from the same single live tag fetch.
   const activeTag = deriveActiveTag(canonicalCode);
-  if (activeTag && await isAlreadyEnrolled(contactId, activeTag)) {
-    console.log(`[ActionExecutor] ⏭️ add_to_workflow skipped — ${contactId} already has ${activeTag} (${wfLabel})`);
-    return {
-      action: 'skipped_already_enrolled',
-      contact_id: contactId,
-      canonical_code: canonicalCode,
-      canonical_name: canonicalName,
-      active_tag: activeTag,
-      workflow_name: payload.workflow_name || null,
-      route: 'skip',
-    };
+  if (activeTag || hasEntryGuard(payload)) {
+    const tags = await readLiveTags(contactId);
+    const match = tags ? entryGuardMatch(tags, { activeTag, payload }) : null;
+    if (match?.reason === 'already_enrolled') {
+      console.log(`[ActionExecutor] ⏭️ add_to_workflow skipped — ${contactId} already has ${activeTag} (${wfLabel})`);
+      return {
+        action: 'skipped_already_enrolled',
+        contact_id: contactId,
+        canonical_code: canonicalCode,
+        canonical_name: canonicalName,
+        active_tag: activeTag,
+        workflow_name: payload.workflow_name || null,
+        route: 'skip',
+      };
+    }
+    if (match) {
+      console.log(`[ActionExecutor] ⏭️ add_to_workflow skipped — ${contactId} carries ${match.tag}, already routed (${wfLabel})`);
+      return {
+        action: 'skipped_entry_guard',
+        contact_id: contactId,
+        canonical_code: canonicalCode,
+        canonical_name: canonicalName,
+        guard_tag: match.tag,
+        workflow_name: payload.workflow_name || null,
+        route: 'skip',
+      };
+    }
   }
 
   // ── Route B: POST to inbound webhook URL ──────────────────────
