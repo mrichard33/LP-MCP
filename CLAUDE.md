@@ -77,6 +77,18 @@ exactly what the rulebook's comparison rule forbids. `isCelebratableClimb` requi
 be in the top third of the field (floor of 3), and suppresses the climb outright when the field size
 is unknown. Do not relax that to "any improvement".
 
+**Info emails the bot promised go out through ONE switch, `INFO_EMAIL_WEBHOOK_URL`.** Unset, they
+send through the Conversations API. Set, one POST carries `subject`, `preheader` and `body_html` to a
+GHL Inbound Webhook workflow. Every email needs all three (Mark, 2026-09-24). Point the URL only at a
+workflow that sends those fields unchanged. A workflow with a ChatGPT step rewriting the text (as
+U.SEND-AI and I.AI-MAIL do today) skips every check in `src/actions/handlers/info-email.js`.
+
+**Only an opt-out silences the bot (Mark, 2026-09-24).** A classifier handoff tags the contact and,
+where a person must act, pages one — and the bot still replies, unless `handoffReplyPolicy`
+(`src/agentic/handoff-policy.js`) says `silent` (STOP, WRONG_NUMBER) or `workflow` (a GHL workflow
+answers the tag). A new handoff class replies by default. Do not add a silent class without Mark's
+ruling, and never add `stop-bot` to a rule whose trigger is not an opt-out.
+
 ## Alerting
 
 Alert modules are **pure and dependency-free** so they unit-test without importing supabase, GroupMe

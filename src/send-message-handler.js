@@ -286,6 +286,7 @@ import {
   handoffNeedsHumanAlert,
   HANDOFF_ALERT_RULE,
 } from './human-handoff-alert.js';
+import { HUMAN_FOLLOW_UP_INTENTS } from './agentic/handoff-policy.js';
 import { bumpContactCache } from './context-builder.js';
 // v3.6: rich GroupMe notification — same helpers used by tasks v2.0 +
 // notifications handlers, so all four GroupMe surfaces share one format.
@@ -1902,6 +1903,18 @@ async function sendWithFallback(contactId, message, channel, subject, action, op
   throw new Error('Conv API failed and no webhook URL configured');
 }
 
+/**
+ * 2026-09-24 — email a deliverable (send_info_email) through the same routing
+ * agentic email replies use: Conversations API first, the "Send Reply"
+ * inbound-webhook workflow as the fallback. Deliberately NOT executeSendMessage:
+ * that path is built for replies (reply locks, supersession, staleness
+ * regeneration) and would drop or rewrite a deliverable the lead was already
+ * told is on its way. See src/actions/handlers/info-email.js.
+ */
+export async function sendAgenticEmail(contactId, html, subject, action) {
+  return sendWithFallback(contactId, html, 'email', subject, action);
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // COMPLIANCE GATE SHORT-CIRCUIT
 // ═══════════════════════════════════════════════════════════════════
@@ -1979,8 +1992,13 @@ async function handleShortCircuit(contactId, generated, action, context, opts = 
   // Queue ONE action-required alert on exactly those, deduped per contact per
   // 30 minutes by the send_notification cooldown. Fail-soft: the tag write has
   // already happened and must not be undone by a Supabase hiccup here.
+  // 2026-09-24 — when the bot replies after the handoff (handoff-policy.js),
+  // only the handoffs a person must act on still page: an upset lead asking
+  // for a manager, and a promise we did not keep. The rest the reply handles.
+  const botReplies = !!opts.botReplies;
   let humanAlertQueued = false;
-  if (!opts.dryRun && handoffNeedsHumanAlert(handoffTag)) {
+  if (!opts.dryRun && handoffNeedsHumanAlert(handoffTag) &&
+      (!botReplies || HUMAN_FOLLOW_UP_INTENTS.has(generated.intent_class))) {
     try {
       const { error: alertErr } = await supabase.from('agent_actions').insert({
         event_id: action.event_id || null,
@@ -1995,11 +2013,14 @@ async function handleShortCircuit(contactId, generated, action, context, opts = 
           handoffTag,
           lastInbound: generated.trigger_message_preview || context?.trigger_message || '',
           conversationId: context?.conversation_id || action?.action_payload?.conversation_id || null,
+          botReplied: botReplies,
         }),
         reasoning:
-          `Silent human handoff (${generated.intent_class || 'unknown'}${generated.handler_code ? `/${generated.handler_code}` : ''}` +
-          `${handoffTag ? `, ${handoffTag}` : ''}) — the bot sent nothing and no GHL workflow answers this tag. ` +
-          `A person has to reply.`,
+          `${botReplies ? 'Human follow-up' : 'Silent human handoff'} (${generated.intent_class || 'unknown'}${generated.handler_code ? `/${generated.handler_code}` : ''}` +
+          `${handoffTag ? `, ${handoffTag}` : ''}) — ` +
+          (botReplies
+            ? 'the bot acknowledged the lead, and a person has to follow up.'
+            : 'the bot sent nothing and no GHL workflow answers this tag. A person has to reply.'),
         confidence: 1.0,
         rule_applied: HANDOFF_ALERT_RULE,
         status: 'pending',
@@ -2022,7 +2043,7 @@ async function handleShortCircuit(contactId, generated, action, context, opts = 
     `Method: ${generated.classification_method || 'unknown'} (${(generated.classifier_confidence || 0).toFixed(2)})\n` +
     (callbackBasis ? `Callback basis: ${callbackBasis}\n` : '') +
     `Inbound: "${preview}"\n` +
-    `→ GHL workflow on tag now owns the response.`
+    (botReplies ? `→ The bot is replying to the lead too.` : `→ GHL workflow on tag now owns the response.`)
   ).catch(err => {
     console.warn(`[SendMessage] GroupMe (short-circuit) failed: ${err.message}`);
   });
@@ -2244,7 +2265,44 @@ const COMPANION_AUTO_EXECUTE = new Set([
   'book_appointment',
   'cancel_appointment',
   'reschedule_appointment',
+  // 2026-09-24 — the information email the reply just told the lead is on
+  // its way. The body is written by the model and validated in
+  // response-generator (validateInfoEmailPayload); src/actions/handlers/
+  // info-email.js delivers it. Auto-executes because the lead ASKED for it
+  // this turn — holding it for approval would make the SMS a lie again.
+  'send_info_email',
 ]);
+
+// Rule name on the queued email, so info emails are countable on their own
+// rather than disappearing into the reply rule that produced them.
+export const INFO_EMAIL_RULE = 'AGENTIC_INFO_EMAIL';
+
+/**
+ * The rep task for a promise the bot made and could not keep. Pure; exported
+ * for tests.
+ */
+export function buildUndeliveredPromiseTask({ contactId, eventId = null, promise }) {
+  return {
+    event_id: eventId || null,
+    action_type: 'create_task',
+    target_system: 'ghl',
+    target_entity: 'contact',
+    target_id: contactId,
+    action_payload: {
+      title: 'Bot promised {{contact_name}} something by email — nothing was sent',
+      description:
+        `The bot told the lead: "${String(promise).slice(0, 300)}". No email was queued. ` +
+        'Send what was promised (or correct it) and reply in the thread so they are not left waiting.',
+      due_in_hours: 2,
+      priority: 'high',
+    },
+    reasoning: 'Undelivered send promise survived regeneration (src/agentic/send-promise.js)',
+    confidence: 1.0,
+    rule_applied: 'UNDELIVERED_PROMISE_ALERT',
+    status: 'pending',
+    requires_approval: false,
+  };
+}
 
 // ═══════════════════════════════════════════════════════════════════
 // INLINE BOOKING (2026-08-13) — book before we promise
@@ -2432,7 +2490,9 @@ async function insertCompanionAction(parentAction, generated, callPurpose = null
   // genuinely runs first and seq reflects that. cancel has always run first.
   // reschedule keeps v4.10's parentSeq + 2 — it is not on the inline path.
   const seqAfterSend = (ctype === 'reschedule_appointment');
-  const companionSeqOrder = seqAfterSend ? parentSeq + 2 : parentSeq - 1;
+  // send_info_email runs after the SMS that announces it, never before.
+  const companionSeqOrder = ctype === 'send_info_email' ? parentSeq + 1
+    : seqAfterSend ? parentSeq + 2 : parentSeq - 1;
 
   // Quality Pass v1.0 Item 5 — stamp the analyzer's call purpose onto
   // phone-call bookings server-side (deterministic; the model never
@@ -2457,7 +2517,7 @@ async function insertCompanionAction(parentAction, generated, callPurpose = null
           ? `Companion to send_message ${parentAction.id} (auto-fire path): ${companion.reasoning}`
           : `Companion to send_message ${parentAction.id} (${parentAction.rule_applied || 'manual'}, auto-fire path)`,
         confidence: 1.0,
-        rule_applied: parentAction.rule_applied,
+        rule_applied: ctype === 'send_info_email' ? INFO_EMAIL_RULE : parentAction.rule_applied,
         status: 'pending',
         requires_approval: false,
         batch_id: parentAction.batch_id || null,
@@ -2478,7 +2538,9 @@ async function insertCompanionAction(parentAction, generated, callPurpose = null
         ? `appointment_id="${cap.appointment_id || '?'}"`
         : ctype === 'reschedule_appointment'
           ? `old="${cap.old_appointment_id || '?'}" → ${cap.new_calendar_name || '?'} ${cap.new_start_time || '?'} status="${cap.status || '?'}"`
-          : '(unknown)';
+          : ctype === 'send_info_email'
+            ? `subject="${String(cap.subject || '?').slice(0, 80)}" (${String(cap.body || '').length} chars)`
+            : '(unknown)';
 
     console.log(`[SendMessage] ✅ Companion ${ctype} queued: id=${data.id} seq=${data.sequence_order} batch=${data.batch_id || 'none'} — ${summary}`);
 
@@ -3101,6 +3163,15 @@ export async function executeSendMessage(action, context) {
           await new Promise(r => setTimeout(r, 1500)); // brief backoff before retry
         }
       }
+    }
+
+    // 2026-09-24 — a handoff the bot also answers (handoff-policy.js): apply
+    // the handoff tag, card and, where a person must act, the alert, then
+    // carry on and send the reply. Fail-soft: the reply matters more.
+    if (!generationErr && generated?.handoff) {
+      await handleShortCircuit(contactId, generated.handoff, action, context, {
+        channel, replyContext, tags, botReplies: true,
+      }).catch(err => console.warn(`[SendMessage] handoff side effects failed for ${contactId} (fail-soft): ${err.message}`));
     }
 
     // If generation failed after all retries, use the channel-appropriate safe
@@ -3753,6 +3824,22 @@ export async function executeSendMessage(action, context) {
         }
       } catch (qdErr) {
         console.warn(`[SendMessage] qualifying data persist failed for ${contactId} (fail-soft): ${qdErr.message}`);
+      }
+    }
+
+    // 2026-09-24 — UNDELIVERED PROMISE: the reply still says something is
+    // being sent and carries nothing that sends it (the guard in
+    // response-generator regenerated once and the retry did the same). The
+    // lead is now waiting on an email. Put a person on it rather than let the
+    // promise lapse silently. Failure-soft: the send already happened.
+    if (generated && generated.undelivered_promise) {
+      try {
+        await supabase.from('agent_actions').insert(buildUndeliveredPromiseTask({
+          contactId, eventId: action.event_id, promise: generated.undelivered_promise,
+        }));
+        console.warn(`[SendMessage] undelivered promise for ${contactId} — rep task queued`);
+      } catch (upErr) {
+        console.warn(`[SendMessage] undelivered-promise task failed for ${contactId} (fail-soft): ${upErr.message}`);
       }
     }
 

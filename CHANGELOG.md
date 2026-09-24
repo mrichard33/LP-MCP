@@ -5,6 +5,56 @@ Notable behavioral changes to the LP MCP server. Newest first.
 Rule-layer (`agent_rules`) changes ship through the database, not through this
 repo — they are recorded in `sql/seeds/` on the date they were applied live.
 
+## 2026-09-24
+
+The bot promised emails it had no way to send, and went quiet on the lead who
+asked where it was.
+
+- **Only an opt-out silences the bot** (Mark). Every classifier handoff used to
+  be silent; of the 11 live classes only STOP is an opt-out. Now
+  (`src/agentic/handoff-policy.js`): STOP and WRONG_NUMBER stay silent; the
+  two callback tags a GHL workflow answers stay with the workflow; everything
+  else (ANGRY, FULFILLMENT_NOT_RECEIVED, WHO_IS_THIS, MOVED, RENTER, MOBILE)
+  still tags the contact AND gets a reply written for that moment. Only ANGRY
+  and FULFILLMENT_NOT_RECEIVED still page a person ("HUMAN FOLLOW-UP NEEDED").
+- **Missed-reply opt-out rule narrowed** (DB, `sql/seeds/2026-09-24_optout_only_stops_bot.sql`,
+  applied live) — "not interested" no longer applies stop-bot; it gets the
+  recovery reply. The "signed with another company" rule already keeps the
+  bot on (v4, 2026-09-09).
+
+- **Incident** — GHL BazzY5Ihu2heR4osVlBF (Mark Test): "Want us to send a
+  quick comparison…?" → "Sure" → "Sending that comparison to <email> now".
+  Nothing was sent; the model's own reasoning called that reply "fulfilling
+  the promise". The same week: Kenneth Sr (Hurricane Guide "to the email on
+  file"), Alyce ("I'll get that over to you soon"). 3 of 3 real promises in
+  7 days were never delivered. Open issue #220 (2026-07-26) was the same class.
+- **`send_info_email`** (new action + companion) — when the lead accepts, the
+  model writes the email in the same turn; `src/actions/handlers/info-email.js`
+  delivers it through the Conversations API path agentic email replies use.
+  Not a `send_message`: reply locks and supersession would drop it as a
+  duplicate of the SMS that announced it. Gated by stop-bot/suppression and
+  hard opt-outs; no email on file → operator event; a landed retry never
+  resends.
+- **Subject, preheader and body on every info email.** The model now writes
+  a preheader too (a missing one is taken from the body's first sentence).
+  The direct path adds it as the hidden preview line at the top of the HTML.
+- **Webhook delivery** (`INFO_EMAIL_WEBHOOK_URL`; unset = direct) — one POST
+  carries `subject`, `preheader` and `body_html` to a GHL Inbound Webhook
+  workflow that sends them in the branded template. All four live email
+  workflows were checked first; none takes all three from a webhook
+  (U.SEND-AI and I.AI-MAIL are tag-triggered and have GPT write the text; S4.5
+  is the nurture rotation; I.AG-IN has no preheader).
+- **Undelivered-promise guard** (`src/agentic/send-promise.js`) — a reply that
+  says something is sent/on its way without carrying `send_info_email` or an
+  accepted guide regenerates once; if the retry still promises, it ships with
+  a high-priority rep task (`UNDELIVERED_PROMISE_ALERT`).
+- **Prompt** — new SEND INFO BY EMAIL section: only two things can reach an
+  inbox (an email the bot writes, or the Hurricane Guide); never offer a
+  brochure/comparison/PDF/link; an offer is a question.
+- **`reanalyze_reply`** — the rule's unrendered `{{source_event_id}}` beat the
+  event payload's real id, so the missed-reply re-analysis failed 4 of 4 times.
+  Unrendered placeholders now count as absent.
+
 ## 2026-09-23
 
 Chatbot canon + NEPQ alignment (Mark's 2026-09-23 rulings). Install time stays

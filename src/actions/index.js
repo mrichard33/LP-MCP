@@ -55,8 +55,9 @@
  *   LP (4):
  *     set_lp_appointment, create_lp_lead, update_lp_dnc_status,
  *     lp_callback_requeue
- *   Messaging + notification (3):
- *     send_message, send_notification, create_task
+ *   Messaging + notification (4):
+ *     send_message, send_notification, create_task,
+ *     send_info_email (2026-09-24 — the email the bot told the lead is coming)
  *   Orchestration + compute (8):
  *     layer3_dispatch, emit_event, check_eligibility, check_throttle,
  *     compute_risk_score, calculate_time_lapse_tier, classify_bucket,
@@ -273,6 +274,7 @@ import { executeClassifyLeadState } from './handlers/lead-state.js';
 // 2026-07-06 (Bot 2/3/4 consolidation) — GHL contact-note writer (escalation
 // context summaries) + dispatch-param interpolation.
 import { executeAddNote } from './handlers/notes.js';
+import { executeSendInfoEmail } from './handlers/info-email.js';
 // 2026-07-21 Phase C — Five9 gated writes (one dispatcher for all fourteen
 // five9_* action types; guardrails + audit live in src/five9/admin-writes.js)
 import { executeFive9Write } from './handlers/five9.js';
@@ -631,7 +633,8 @@ async function executeUpdateOpportunityWithLostReason(action, context) {
 export const ACTION_HANDLERS = {
   add_tag: executeAddTag,
   remove_tag: executeRemoveTag,
-  add_note: executeAddNote,                     // 2026-07-06 — escalation context summaries (Sentinel §7)
+  add_note: executeAddNote,
+  send_info_email: (action, context) => executeSendInfoEmail(action, context), // 2026-09-24 — the email the bot told the lead is on its way                     // 2026-07-06 — escalation context summaries (Sentinel §7)
   set_stage: executeSetStage,                   // v4.3 — atomic stage tag swap
   move_opportunity: executeMoveOpportunity,
   update_opportunity: executeUpdateOpportunityWithLostReason,  // 2026-09-18 — derives lostReasonId from the job status
@@ -793,6 +796,9 @@ const CONTEXT_AWARE_HANDLERS = new Set([
 // so the stop-bot contact-tag lookup doesn't apply; they carry their own
 // gates (FIVE9_WRITES_ENABLED + approve_action + fleet-wide write lock).
 const MUTATION_GATED_ACTION_TYPES = new Set([
+  // 2026-09-24 — contact-facing: a stop-bot / suppress-automation contact
+  // gets no bot email either. (Hard opt-outs are re-checked in the handler.)
+  'send_info_email',
   'move_opportunity',
   'update_opportunity',
   'add_to_workflow',

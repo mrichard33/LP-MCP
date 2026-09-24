@@ -32,7 +32,14 @@ export async function executeReanalyzeReply(action, context = {}, deps = {}) {
   const analyze = deps.analyzeMessage || analyzeMessage;
   const payload = action.action_payload || {};
 
-  const sourceEventId = payload.source_event_id ?? context.source_event_id ?? null;
+  // 2026-09-24 — rule AGENTIC_REPLY_SLA_REANALYZE carries the literal string
+  // "{{source_event_id}}" (the decision engine does not render payload
+  // templates), which is truthy, so the ?? never reached the event payload
+  // that holds the real id. Every self-heal re-analysis failed 4/4 on
+  // "could not read event {{source_event_id}}" while the operator alert said
+  // "The self-heal re-ran the analysis". An unrendered placeholder is absent.
+  const usable = (v) => (v != null && !/\{\{.*\}\}/.test(String(v)) ? v : null);
+  const sourceEventId = usable(payload.source_event_id) ?? usable(context.source_event_id) ?? null;
   if (!sourceEventId) throw new Error('reanalyze_reply requires action_payload.source_event_id');
 
   // Read the ORIGINAL reply, not the watchdog's copy of it. The watchdog caps

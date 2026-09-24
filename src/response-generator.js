@@ -256,6 +256,7 @@
 
 import { buildLeadContext } from './context-builder.js';
 import { classifyInbound, isShortCircuit } from './knowledge/intent-classifier.js';
+import { handoffReplyPolicy, handoffReplyNote } from './agentic/handoff-policy.js';
 import {
   buildKbPack,
   prewarmQueryEmbedding,
@@ -335,6 +336,7 @@ import { resolveServicePhone } from './services/market-phone.js';
 import * as P from './prompts/response-generator/index.js';
 import { dialWindowPromptLine, canPromiseImmediateCall } from './dial-window.js';
 import { normalizeRepNote } from './agentic/rep-note.js';
+import { findUndeliveredSendPromise, undeliveredPromiseNote, validateInfoEmailPayload } from './agentic/send-promise.js';
 // v2.7.14 — Bot Review Phase 0. Pure shaping helpers only: no I/O, no writes.
 import { buildInputSnapshot, extractKbModes, extractKbSources } from './bot-feedback/fingerprint-core.js';
 
@@ -2080,6 +2082,22 @@ function validateGuideDispositionCompanion(cap, ca) {
   };
 }
 
+// 2026-09-24 — a short information email the model writes in the same turn
+// the lead accepts it. Delivered by src/actions/handlers/info-email.js. The
+// payload is held to reply-level hard lines (src/agentic/send-promise.js).
+function validateSendInfoEmailCompanion(cap, ca) {
+  const v = validateInfoEmailPayload(cap);
+  if (v.error) {
+    console.warn(`[ResponseGenerator] Dropping send_info_email: ${v.error}`);
+    return null;
+  }
+  return {
+    action_type: 'send_info_email',
+    action_payload: { subject: v.subject, preheader: v.preheader, body: v.body },
+    reasoning: typeof ca.reasoning === 'string' ? ca.reasoning.slice(0, 500) : null,
+  };
+}
+
 // `knownAppointments` is the SAME list that fed the EXISTING APPOINTMENTS
 // prompt block (fetchRecentAndUpcomingAppointments). Passing it here closes the
 // loop: the block is the only place the model may take an appointment_id from,
@@ -2154,6 +2172,8 @@ function validateResponse(parsed, channel, knownAppointments = null) {
       companionAction = validateUpdateAppointmentStatusCompanion(cap, ca);
     } else if (ca.action_type === 'guide_disposition') {
       companionAction = validateGuideDispositionCompanion(cap, ca);
+    } else if (ca.action_type === 'send_info_email') {
+      companionAction = validateSendInfoEmailCompanion(cap, ca);
     } else {
       console.warn(`[ResponseGenerator] Dropping unsupported companion_action.action_type="${ca.action_type}"`);
     }
@@ -3020,10 +3040,23 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     };
   }
 
+  // 2026-09-24 (Mark): the bot never goes quiet except on an opt-out. A
+  // handoff still tags the contact and alerts a person, but unless it is an
+  // opt-out or a GHL workflow answers the tag, the bot replies as well. See
+  // src/agentic/handoff-policy.js. The send handler applies the tag and the
+  // alert from `handoff` on the result.
+  let handoff = null;
   if (isShortCircuit(classification)) {
-    console.log(`[ResponseGenerator] SHORT-CIRCUIT for ${contactId}: ${classification.intent_class} → ${classification.ghl_handoff_tag} (${classification.classification_method})`);
-    return makeShortCircuitResult(classification, channel, triggerMessage);
+    const policy = handoffReplyPolicy(classification);
+    if (policy !== 'reply') {
+      console.log(`[ResponseGenerator] SHORT-CIRCUIT (${policy}) for ${contactId}: ${classification.intent_class} → ${classification.ghl_handoff_tag} (${classification.classification_method})`);
+      return makeShortCircuitResult(classification, channel, triggerMessage);
+    }
+    handoff = makeShortCircuitResult(classification, channel, triggerMessage);
+    console.log(`[ResponseGenerator] HANDOFF + REPLY for ${contactId}: ${classification.intent_class} → ${classification.ghl_handoff_tag} (${classification.classification_method})`);
   }
+  const promptHint = [opts.promptHint, handoff ? handoffReplyNote(classification.intent_class) : null]
+    .filter(Boolean).join('\n\n') || null;
 
   const buyerStage    = inferBuyerStage(context);
   const fastTrack     = isHyperactiveBuyer(context);
@@ -3351,7 +3384,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       // 2026-07-06 — prompt_hint plumb (Bot 2/3/4 consolidation): approved
       // script from the matched agent_rule / layer3 dispatch row. Anchors the
       // reply via the SCRIPT DIRECTIVE block in buildResponsePrompt.
-      promptHint: opts.promptHint || null,
+      promptHint,
       // Quality Pass v1.0: regeneration instruction (Items 1b/1c) and the
       // analyzer's call purpose (Item 5 — purpose-specific call framing).
       regenerationNote: opts.regenerationNote || null,
@@ -3516,6 +3549,30 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
           `Your previous draft conceded the customer's objection and then changed the subject: ${pivots.join(', ')}. ` +
           `Do not open by agreeing with an objection and then asking for something else. Ask a question back about ` +
           `THEIR position instead, using their own words — see the NEPQ objection block.`;
+        throw err;
+      }
+    }
+  }
+
+  // ─── Undelivered-promise guard (2026-09-24 — GHL BazzY5Ihu2heR4osVlBF) ───
+  //
+  // "Sending that comparison to <email> now" went out with nothing attached
+  // that could send it, and the lead waited for an email that never existed.
+  // A reply may only say something is being sent when the same reply carries
+  // the action that sends it (send_info_email, or an accepted guide). Same
+  // shape as the guards below: regenerate once; if the retry still promises
+  // without delivering, ship it FLAGGED — send-message-handler turns the flag
+  // into a rep task, so a person keeps the promise instead of nobody.
+  {
+    const promise = findUndeliveredSendPromise(validated.message, validated.companion_action, { channel });
+    if (promise) {
+      if (opts.regenerationNote) {
+        console.warn(`[ResponseGenerator] ⚠️ undelivered send promise survived regeneration for ${contactId}: "${promise}" — sending flagged for a rep`);
+        validated.undelivered_promise = promise;
+      } else {
+        console.warn(`[ResponseGenerator] ⚠️ undelivered send promise for ${contactId}: "${promise}" — regenerating once`);
+        const err = new Error(`undelivered_send_promise: ${promise.slice(0, 120)}`);
+        err.regenerationNote = undeliveredPromiseNote(promise);
         throw err;
       }
     }
@@ -3763,6 +3820,9 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
 
   return {
     short_circuit: false,
+    // Present when a handoff fired and the bot replies anyway. The send
+    // handler applies its tag and alert.
+    handoff,
     intent_class: classification.intent_class,
     classifier_confidence: classification.confidence,
     classification_method: classification.classification_method,

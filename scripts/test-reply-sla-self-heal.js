@@ -143,6 +143,31 @@ test('an event with no message text skips — there is nothing to analyze', asyn
   assert.equal(res.reason, 'source_event_has_no_message_text');
 });
 
+// 2026-09-24 — the live rule row carries the unrendered template
+// "{{source_event_id}}". Every live re-analysis failed on it (4/4) because the
+// literal string beat the event payload's real id in the ?? chain.
+test('an unrendered {{source_event_id}} falls back to the event payload id', async () => {
+  const calls = [];
+  const res = await executeReanalyzeReply(
+    action({ source_event_id: '{{source_event_id}}' }),
+    { source_event_id: REPLY_EVENT.id },
+    {
+      supabase: mockDb(REPLY_EVENT),
+      analyzeMessage: async (...args) => { calls.push(args); return { buyer_stage: 1, recommended_action: 'continue_current' }; },
+    },
+  );
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][2], REPLY_EVENT.id);
+  assert.equal(res.reanalyzed, true);
+});
+
+test('an unrendered placeholder with no fallback still fails loudly, not with a bad DB read', async () => {
+  await assert.rejects(
+    executeReanalyzeReply(action({ source_event_id: '{{source_event_id}}' }), {}, { supabase: mockDb(REPLY_EVENT) }),
+    /requires action_payload\.source_event_id/,
+  );
+});
+
 // ── 4. the action is registered and context-aware ────────────────────
 
 test('reanalyze_reply is wired into the executor and gets the event payload', async () => {
