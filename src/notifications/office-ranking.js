@@ -35,7 +35,7 @@
 
 import supabaseDefault from '../supabase.js';
 import { officeMarketCode, officeMarketCodes } from '../slack.js';
-import { branchName } from '../approval-card.js';
+import { branchName, BRANCH_NAMES } from '../approval-card.js';
 import { repNameKey, monthStart, MTD_ROW_LIMIT } from './sale-facts.js';
 
 export const RANKING_BUDGET_MS = 3000;
@@ -174,4 +174,101 @@ export function formatOfficeRanking({ repLine = null, ranking = null, repDisplay
   }
 
   return parts.length ? parts.join('\n\n') : null;
+}
+
+// ─────────────────────────────────────────────────────────────────
+// The office-vs-office board for #sales-all (2026-09-24)
+//
+// Requested on top of the per-office boards: #sales-all ranks the OFFICES
+// against each other by month-to-date volume. It rides in the stats reply
+// under each celebration (not the celebration itself — the celebration and the
+// numbers are two jobs, see CLAUDE.md). Offices are grouped exactly like the
+// channel routing (BOCA/MIAMI count for Fort Lauderdale). A sale whose lead has
+// no branch, or a branch code we cannot name, is left off rather than shown
+// under a raw code nobody on the floor would recognise.
+// ─────────────────────────────────────────────────────────────────
+
+/** Pure: rows of { lp_branch_id, job_value } → offices ranked by volume (ties share a rank). */
+export function rankOffices(rows) {
+  const byOffice = new Map();
+  for (const r of rows || []) {
+    const office = officeMarketCode(r.lp_branch_id);
+    if (!office || !BRANCH_NAMES[office]) continue;
+    const cur = byOffice.get(office) || { office, name: BRANCH_NAMES[office], volume: 0, count: 0 };
+    cur.volume += Number(r.job_value) || 0;
+    cur.count += 1;
+    byOffice.set(office, cur);
+  }
+  const list = [...byOffice.values()].sort(
+    (a, b) => b.volume - a.volume || b.count - a.count || a.name.localeCompare(b.name),
+  );
+  let prevVolume = null;
+  let prevRank = 0;
+  list.forEach((row, i) => {
+    row.rank = row.volume === prevVolume ? prevRank : i + 1;
+    prevVolume = row.volume;
+    prevRank = row.rank;
+  });
+  return list;
+}
+
+/**
+ * Read this month's closed-won sales for every office and rank the offices.
+ * Returns { degraded: false, rows } or { degraded: true, reason }. Never throws.
+ */
+export async function buildCompanyOfficeRanking(deps = {}) {
+  const {
+    supabase = supabaseDefault,
+    now = () => new Date(),
+    logger = console,
+    budgetMs = RANKING_BUDGET_MS,
+  } = deps;
+
+  const bail = (reason) => {
+    logger.warn?.(`[SaleAnnounce] office-vs-office ranking degraded (${reason})`);
+    return { degraded: true, reason };
+  };
+
+  let res;
+  let timer;
+  try {
+    res = await Promise.race([
+      supabase
+        .from('lp_leads')
+        .select('lp_branch_id, job_value')
+        .eq('closed_won', true)
+        .not('lp_branch_id', 'is', null)
+        .gte('close_date', monthStart(now()))
+        .limit(MTD_ROW_LIMIT),
+      new Promise((resolve) => { timer = setTimeout(() => resolve({ __timedOut: true }), budgetMs); }),
+    ]);
+  } catch (err) {
+    return bail(`threw:${err.message}`);
+  } finally {
+    clearTimeout(timer);
+  }
+  if (res?.__timedOut) return bail('timeout');
+  if (res?.error) return bail(`read_failed:${res.error.message}`);
+
+  const data = Array.isArray(res?.data) ? res.data : [];
+  if (data.length >= MTD_ROW_LIMIT) return bail(`truncated_at_${MTD_ROW_LIMIT}`);
+
+  return { degraded: false, rows: rankOffices(data) };
+}
+
+/**
+ * Pure: the office board block for the #sales-all stats reply, or null.
+ *
+ *   🏢 Office power ranking — September
+ *   1. Fort Myers — $1,448,173 (62)  ← this sale
+ *   2. St. Petersburg — $1,303,392 (53)
+ */
+export function formatCompanyOfficeRanking({ ranking = null, market = null, now = new Date() } = {}) {
+  if (!ranking || ranking.degraded || !ranking.rows?.length) return null;
+  const here = officeMarketCode(market);
+  const lines = [`🏢 Office power ranking — ${monthName(now)}`];
+  for (const r of ranking.rows) {
+    lines.push(`${r.rank}. ${r.name} — ${money(r.volume)} (${r.count})` + (here && r.office === here ? '  ← this sale' : ''));
+  }
+  return lines.join('\n');
 }
