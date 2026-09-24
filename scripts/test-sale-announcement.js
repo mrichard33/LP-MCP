@@ -57,6 +57,9 @@ import {
   rankOffice,
   displayRepName,
   formatOfficeRanking,
+  rankOffices,
+  buildCompanyOfficeRanking,
+  formatCompanyOfficeRanking,
 } from '../src/notifications/office-ranking.js';
 
 const TOKEN = process.env.SALE_ANNOUNCE_TOKEN;
@@ -207,6 +210,9 @@ function makeDeps(db, overrides = {}) {
     },
     mirror: async () => ({ mirrored: false, reason: 'disabled' }),
     alert: async (detail) => { opsAlerts.push(detail); return { ok: true }; },
+    // The #sales-all office board is on by default; tests that are not about
+    // it get no board, so their stats-reply assertions stay exact.
+    companyRanking: async () => ({ degraded: true, reason: 'not_under_test' }),
     // Collect the detached work so a test can await it deterministically.
     defer: (fn) => { deferred.push(fn); },
     ...overrides,
@@ -1034,6 +1040,18 @@ test('the FACTS block no longer carries any bookkeeping', () => {
 const C_SALES_FTMYR = 'C_SALES_FTMYR';
 const C_SALES_FTLAU = 'C_SALES_FTLAU';
 
+async function withEnv(name, value, fn) {
+  const prev = process.env[name];
+  if (value === undefined) delete process.env[name];
+  else process.env[name] = value;
+  try {
+    return await fn();
+  } finally {
+    if (prev === undefined) delete process.env[name];
+    else process.env[name] = prev;
+  }
+}
+
 async function withMarketFlag(value, fn) {
   const prev = process.env.SALE_ANNOUNCE_MARKET_ENABLED;
   if (value === undefined) delete process.env.SALE_ANNOUNCE_MARKET_ENABLED;
@@ -1317,7 +1335,7 @@ test('postSaleToMarket does not retry not_in_channel, and does retry a transient
 });
 
 test('flag off: exactly one post, no market read, no market fields', async () => {
-  await withMarketFlag(undefined, async () => {
+  await withEnv('SALE_ANNOUNCE_OFFICE_BOARD_ENABLED', 'false', () => withMarketFlag(undefined, async () => {
     let reads = 0;
     const db = makeDb({ leads: [{ lp_lead_id: '573581', lp_prospect_id: 'prospect_9', lp_branch_id: 'FTMYR' }] });
     const h = makeMarketDeps(db, { readMarket: async () => { reads++; return 'FTMYR'; } });
@@ -1333,7 +1351,7 @@ test('flag off: exactly one post, no market read, no market fields', async () =>
     for (const k of ['market_code', 'slack_market_channel', 'slack_market_ts', 'market_message_text', 'market_error']) {
       assert.equal(row[k], undefined, `${k} untouched`);
     }
-  });
+  }));
 });
 
 // ─── the ranking itself ─────────────────────────────────────────
@@ -1414,4 +1432,130 @@ test('buildOfficeRanking reads every code that posts to the office, and degrades
   assert.equal(truncated.degraded, true, 'a truncated board is never published');
 
   assert.equal((await buildOfficeRanking(null, { logger: quietLogger })).degraded, true);
+});
+
+// ═════════════════════════════════════════════════════════════════
+// The office-vs-office board in the #sales-all stats reply (2026-09-24)
+// ═════════════════════════════════════════════════════════════════
+const OFFICE_ROWS = [
+  { lp_branch_id: 'FTMYR', job_value: 50000 },
+  { lp_branch_id: 'FTMYR', job_value: 30000 },
+  { lp_branch_id: 'JAX', job_value: 60000 },
+  { lp_branch_id: 'FTLAU', job_value: 10000 },
+  { lp_branch_id: 'BOCA', job_value: 15000 },
+  { lp_branch_id: 'OUT_OF_AREA', job_value: 999999 },
+  { lp_branch_id: null, job_value: 999999 },
+];
+
+test('rankOffices folds BOCA into Fort Lauderdale and drops codes nobody can name', () => {
+  assert.deepEqual(
+    rankOffices(OFFICE_ROWS).map((r) => [r.rank, r.name, r.volume, r.count]),
+    [
+      [1, 'Fort Myers', 80000, 2],
+      [2, 'Jacksonville', 60000, 1],
+      [3, 'Fort Lauderdale', 25000, 2],
+    ],
+  );
+  const tied = rankOffices([{ lp_branch_id: 'ORL', job_value: 5 }, { lp_branch_id: 'SAR', job_value: 5 }]);
+  assert.deepEqual(tied.map((r) => r.rank), [1, 1]);
+});
+
+test('the #sales-all stats reply carries the office board, with this sale’s office marked', async () => {
+  const db = makeDb({ leads: [{ lp_lead_id: '573581', lp_prospect_id: 'prospect_9', lp_branch_id: 'BOCA' }] });
+  const h = makeDeps(db, {
+    facts: async () => ({ degraded: false, mtd_sale_count: 3, mtd_volume: 36300 }),
+    companyRanking: async () => ({ degraded: false, rows: rankOffices(OFFICE_ROWS) }),
+  });
+  const handler = makeSaleAnnouncementHandler(h.deps);
+  await withMarketFlag(undefined, async () => {
+    await handler(req(payload()), makeRes());
+    await h.drain();
+  });
+
+  assert.equal(h.slackCalls.length, 1, 'the celebration is untouched and posted once');
+  assert.equal(h.statsCalls.length, 1, 'still one reply');
+  assert.equal(h.statsCalls[0].threadTs, 'ts-1');
+  const [statsPart, boardPart] = h.statsCalls[0].text.split('\n\n');
+  assert.match(statsPart, /^📊 Tim O’Connor — 3 sales in September, \$36,300\./);
+  assert.equal(boardPart, [
+    '🏢 Office power ranking — September',
+    '1. Fort Myers — $80,000 (2)',
+    '2. Jacksonville — $60,000 (1)',
+    '3. Fort Lauderdale — $25,000 (2)  ← this sale',
+  ].join('\n'));
+});
+
+test('degraded rep facts still post the office board on its own', async () => {
+  const db = makeDb({ leads: [{ lp_lead_id: '573581', lp_prospect_id: 'prospect_9', lp_branch_id: 'JAX' }] });
+  const h = makeDeps(db, {
+    facts: async () => ({ degraded: true, reason: 'mtd_timeout' }),
+    companyRanking: async () => ({ degraded: false, rows: rankOffices(OFFICE_ROWS) }),
+  });
+  const handler = makeSaleAnnouncementHandler(h.deps);
+  await handler(req(payload()), makeRes());
+  await h.drain();
+
+  assert.equal(h.statsCalls.length, 1);
+  assert.match(h.statsCalls[0].text, /^🏢 Office power ranking/);
+  assert.match(h.statsCalls[0].text, /2\. Jacksonville — \$60,000 \(1\) {2}← this sale/);
+});
+
+test('an office board that throws leaves the rep stats reply intact', async () => {
+  const db = makeDb({ leads: [{ lp_lead_id: '573581', lp_prospect_id: 'prospect_9' }] });
+  const h = makeDeps(db, {
+    facts: async () => ({ degraded: false, mtd_sale_count: 2, mtd_volume: 1000 }),
+    companyRanking: async () => { throw new Error('db down'); },
+  });
+  const handler = makeSaleAnnouncementHandler(h.deps);
+  await handler(req(payload()), makeRes());
+  await h.drain();
+
+  assert.equal(db.announcements[0].status, STATUSES.POSTED);
+  assert.equal(h.statsCalls.length, 1);
+  assert.ok(!h.statsCalls[0].text.includes('Office power ranking'));
+});
+
+test('SALE_ANNOUNCE_OFFICE_BOARD_ENABLED=false turns the board off without a read', async () => {
+  let reads = 0;
+  const db = makeDb({ leads: [{ lp_lead_id: '573581', lp_prospect_id: 'prospect_9' }] });
+  const h = makeDeps(db, {
+    facts: async () => ({ degraded: false, mtd_sale_count: 2, mtd_volume: 1000 }),
+    companyRanking: async () => { reads++; return { degraded: false, rows: rankOffices(OFFICE_ROWS) }; },
+  });
+  const handler = makeSaleAnnouncementHandler(h.deps);
+  await withEnv('SALE_ANNOUNCE_OFFICE_BOARD_ENABLED', 'false', async () => {
+    await handler(req(payload()), makeRes());
+    await h.drain();
+  });
+  assert.equal(reads, 0);
+  assert.ok(!h.statsCalls[0].text.includes('Office power ranking'));
+});
+
+test('buildCompanyOfficeRanking ranks offices and degrades rather than guess', async () => {
+  const fake = (result) => ({
+    from() {
+      const chain = {
+        select() { return chain; },
+        eq() { return chain; },
+        not() { return chain; },
+        gte() { return chain; },
+        limit() { return Promise.resolve(result); },
+      };
+      return chain;
+    },
+  });
+  const ok = await buildCompanyOfficeRanking({ supabase: fake({ data: OFFICE_ROWS, error: null }), logger: quietLogger });
+  assert.equal(ok.degraded, false);
+  assert.equal(ok.rows[0].name, 'Fort Myers');
+
+  const failed = await buildCompanyOfficeRanking({ supabase: fake({ data: null, error: { message: 'boom' } }), logger: quietLogger });
+  assert.equal(failed.degraded, true);
+
+  const truncated = await buildCompanyOfficeRanking({
+    supabase: fake({ data: new Array(5000).fill({ lp_branch_id: 'JAX', job_value: 1 }), error: null }),
+    logger: quietLogger,
+  });
+  assert.equal(truncated.degraded, true, 'a truncated board is never published');
+
+  assert.equal(formatCompanyOfficeRanking({ ranking: failed }), null);
 });

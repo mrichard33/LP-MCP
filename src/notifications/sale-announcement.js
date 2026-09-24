@@ -51,7 +51,12 @@ import supabaseDefault from '../supabase.js';
 import { resolveLeadId, canWriteBack } from './resolve-lead.js';
 import { buildRepFacts } from './sale-facts.js';
 import { generateSaleAnnouncement, formatStatsLine, formatRepMonthLine } from './sale-announcement-body-generator.js';
-import { buildOfficeRanking, formatOfficeRanking } from './office-ranking.js';
+import {
+  buildOfficeRanking,
+  formatOfficeRanking,
+  buildCompanyOfficeRanking,
+  formatCompanyOfficeRanking,
+} from './office-ranking.js';
 import {
   postSaleAnnouncement,
   postSaleStats,
@@ -85,6 +90,16 @@ function featureEnabled() {
  */
 function marketPostEnabled() {
   return String(process.env.SALE_ANNOUNCE_MARKET_ENABLED || 'false') === 'true';
+}
+
+/**
+ * 2026-09-24 — the office-vs-office ranking in the #sales-all stats reply.
+ * ON by default (requested directly, and it only adds read-only lines to a
+ * reply that already exists); SALE_ANNOUNCE_OFFICE_BOARD_ENABLED=false is the
+ * kill switch.
+ */
+function officeBoardEnabled() {
+  return String(process.env.SALE_ANNOUNCE_OFFICE_BOARD_ENABLED || 'true') !== 'false';
 }
 
 /**
@@ -322,6 +337,7 @@ export async function completeAnnouncement(ctx, deps = {}) {
     readMarket = readLeadMarket,
     resolveMarket = resolveSaleMarketChannel,
     officeRanking = buildOfficeRanking,
+    companyRanking = buildCompanyOfficeRanking,
     postMarket = postSaleToMarket,
     marketAlert = alertMarketChannelUnreachable,
     update = updateRow,
@@ -351,9 +367,12 @@ export async function completeAnnouncement(ctx, deps = {}) {
     await update(rowId, { message_text: composed.text, facts_json: facts }, deps);
 
     // ── 3b. Market (flag-gated, never fatal) ─────────────────────
+    // Read for the market post AND for marking "this sale" on the #sales-all
+    // office board. With both off, the lead is not read at all.
     const marketOn = marketPostEnabled();
+    const officeBoardOn = officeBoardEnabled();
     let market = null;
-    if (marketOn && leadId) {
+    if ((marketOn || officeBoardOn) && leadId) {
       try {
         market = await readMarket(leadId, deps);
       } catch (err) {
@@ -380,10 +399,23 @@ export async function completeAnnouncement(ctx, deps = {}) {
       // away instead. Wrapped in its own try/catch because the row is ALREADY
       // 'posted' at this point and nothing below may take that away — the sale
       // reached the board, which is the thing that matters.
+      //
+      // 2026-09-24: the office-vs-office ranking rides in the same reply,
+      // below the rep's numbers. Either part may be missing; the reply posts
+      // whatever there is, and nothing at all when there is neither.
       try {
         const stats = statsLine(repDisplayName, facts, now());
-        if (stats) {
-          const statsRes = await postStats(stats, res.ts, deps);
+        let board = null;
+        if (officeBoardOn) {
+          try {
+            board = formatCompanyOfficeRanking({ ranking: await companyRanking(deps), market, now: now() });
+          } catch (err) {
+            logger.warn?.(`[SaleAnnounce] office board threw for row=${rowId}: ${err.message}`);
+          }
+        }
+        const reply = [stats, board].filter(Boolean).join('\n\n');
+        if (reply) {
+          const statsRes = await postStats(reply, res.ts, deps);
           if (statsRes.ok) await update(rowId, { slack_stats_ts: statsRes.ts }, deps);
         }
       } catch (err) {
