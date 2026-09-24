@@ -22,6 +22,7 @@ process.env.SUPABASE_SERVICE_ROLE_KEY ||= 'test-key';
 
 const {
   findSendPromise, findUndeliveredSendPromise, undeliveredPromiseNote, validateInfoEmailPayload,
+  resolvePreheader, emailPlainText,
 } = await import('../src/agentic/send-promise.js');
 const {
   buildInfoEmailHtml, decideInfoEmailSend, executeSendInfoEmail,
@@ -215,8 +216,26 @@ test('the preheader is held to the same lines as the body', () => {
 
 test('the direct path puts the preheader first, hidden and escaped', () => {
   const html = withPreheader('<p>Hi</p>', 'A & B <now>');
-  assert.match(html, /^<div style="display:none;[^"]*">A &amp; B &lt;now&gt;<\/div>\n<p>Hi<\/p>$/);
+  assert.match(html, /^<div data-preheader style="display:none;[^"]*">A &amp; B &lt;now&gt;<\/div>\n<p>Hi<\/p>$/);
   assert.equal(withPreheader('<p>Hi</p>', ''), '<p>Hi</p>');
+});
+
+test('every agentic email reply gets one preview line: the model\'s, else the body\'s first sentence', () => {
+  // A normal email reply (send_message) had no preview line at all until
+  // 2026-09-24; sendWithFallback now applies exactly this on the email channel.
+  const reply = '<p>Hi Dana,</p>\n<p>Great question about the frames. Ours are aluminum with a thermal break.</p>';
+  assert.equal(resolvePreheader(null, emailPlainText(reply)), 'Great question about the frames.');
+  assert.equal(resolvePreheader('Frames, glass, and what the warranty covers.', emailPlainText(reply)),
+    'Frames, glass, and what the warranty covers.');
+  assert.equal(resolvePreheader('null', 'Thanks for the note. More below.'), 'Thanks for the note.');
+  const once = withPreheader(reply, 'A');
+  assert.equal(withPreheader(once, 'B'), once, 'never two preview lines');
+  assert.equal((once.match(/data-preheader/g) || []).length, 1);
+});
+
+test('plain-text email bodies keep a real first paragraph that is not a greeting', () => {
+  assert.equal(resolvePreheader('', 'Thanks for reaching out, we can help.\n\nMore detail here.'), 'Thanks for reaching out, we can help.');
+  assert.equal(emailPlainText('A&amp;B<br>next'), 'A&B\nnext');
 });
 
 test('the switch is the webhook URL: set means workflow, unset means direct', () => {
@@ -256,7 +275,7 @@ test('the webhook carries subject, preheader and body in one request', async () 
 test('the direct path sends the same preheader inside the HTML', async () => {
   const { deps, calls } = fakeDeps();
   await executeSendInfoEmail(ACTION_PH, {}, deps);
-  assert.match(calls.sent[0].html, /^<div style="display:none;[^"]*">What each one protects\.<\/div>/);
+  assert.match(calls.sent[0].html, /^<div data-preheader style="display:none;[^"]*">What each one protects\.<\/div>/);
 });
 
 test('the webhook path keeps every gate: opt-out, no email, already sent', async () => {

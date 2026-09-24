@@ -257,6 +257,7 @@
 import { buildLeadContext } from './context-builder.js';
 import { classifyInbound, isShortCircuit } from './knowledge/intent-classifier.js';
 import { handoffReplyPolicy, handoffReplyNote } from './agentic/handoff-policy.js';
+import { notInterestedTurn } from './agentic/not-interested.js';
 import {
   buildKbPack,
   prewarmQueryEmbedding,
@@ -1432,6 +1433,10 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
     const turn = (os.attempt_number ?? 0) >= 1 ? 2 : 1;
     parts.push(...P.objectionState(os.state_code, os.parent_state, os.entered_at, os.attempt_number, turn));
   }
+  // 2026-09-24 (Mark) — "not interested" gets one "what changed?", then a
+  // warm close. See src/agentic/not-interested.js.
+  const niTurn = notInterestedTurn(triggerMessage, context.conversation_recent);
+  if (niTurn) parts.push(...P.notInterestedTurnBlock(niTurn));
   if (String(process.env.NAMED_STORM_MODE || '').toLowerCase() === 'true') {
     parts.push(...P.NAMED_STORM_POSTURE);
   }
@@ -2117,6 +2122,11 @@ function validateResponse(parsed, channel, knownAppointments = null) {
       ? parsed.subject
       : 'Message from Reece Windows & Doors';
   }
+  // 2026-09-24 — every email carries a preview line (Mark). The send handler
+  // falls back to the body's first sentence when this is missing.
+  const preheader = channel === 'email' && typeof parsed.preheader === 'string' && parsed.preheader.trim()
+    ? parsed.preheader.replace(/\s+/g, ' ').trim()
+    : null;
 
   const trustLevel = (typeof parsed.trust_level_targeted === 'number' && parsed.trust_level_targeted >= 1 && parsed.trust_level_targeted <= 6)
     ? parsed.trust_level_targeted
@@ -2183,6 +2193,7 @@ function validateResponse(parsed, channel, knownAppointments = null) {
     message: parsed.message.trim(),
     channel,
     subject,
+    preheader,
     story_arc: storyArc,
     trust_level_targeted: trustLevel,
     hso_breakdown: parsed.hso_breakdown && typeof parsed.hso_breakdown === 'object' ? parsed.hso_breakdown : null,

@@ -130,11 +130,7 @@ export function validateInfoEmailPayload(cap) {
   if (subject.length > INFO_EMAIL_LIMITS.subjectMax) return { error: `subject over ${INFO_EMAIL_LIMITS.subjectMax} chars` };
   if (body.length < INFO_EMAIL_LIMITS.bodyMin) return { error: `body under ${INFO_EMAIL_LIMITS.bodyMin} chars` };
   if (body.length > INFO_EMAIL_LIMITS.bodyMax) return { error: `body over ${INFO_EMAIL_LIMITS.bodyMax} chars` };
-  let preheader = typeof cap?.preheader === 'string' ? cap.preheader.replace(/\s+/g, ' ').trim() : '';
-  if (!preheader) preheader = firstSentence(body.split(/\n{2,}/).slice(1).join(' ') || body);
-  if (preheader.length > INFO_EMAIL_LIMITS.preheaderMax) {
-    preheader = `${preheader.slice(0, INFO_EMAIL_LIMITS.preheaderMax - 1).replace(/\s+\S*$/, '')}…`;
-  }
+  const preheader = resolvePreheader(cap?.preheader, body);
   const all = `${subject}\n${preheader}\n${body}`;
   if (/\{\{|\}\}/.test(all)) return { error: 'unrendered merge tag' };
   if (/https?:\/\/|www\./i.test(all)) return { error: 'contains a link (the model cannot know real URLs)' };
@@ -142,8 +138,47 @@ export function validateInfoEmailPayload(cap) {
   return { subject, preheader, body };
 }
 
-// The first sentence, whitespace collapsed. Used for a missing preheader; the
-// greeting paragraph ("Mark,") is skipped by the caller.
+/**
+ * The inbox preview line for any email the bot sends (Mark, 2026-09-24:
+ * every email carries a subject, a preheader and a body). The model's own
+ * line wins; a missing one is the body's first sentence, skipping a short
+ * greeting paragraph ("Mark," / "Hi Mark,"). Capped at a word boundary.
+ * Used by send_info_email and by every agentic email reply.
+ *
+ * @param {unknown} preheader the model's line, if any
+ * @param {string} bodyText   the email body as plain text
+ * @returns {string}
+ */
+export function resolvePreheader(preheader, bodyText) {
+  let out = typeof preheader === 'string' ? preheader.replace(/\s+/g, ' ').trim() : '';
+  if (!out || /^(null|none)$/i.test(out)) {
+    const paras = String(bodyText || '').replace(/\r\n/g, '\n').split(/\n{2,}/).map(p => p.trim()).filter(Boolean);
+    if (paras.length > 1 && paras[0].length <= 40 && /[,!:]$|^(hi|hello|hey|dear)\b/i.test(paras[0])) paras.shift();
+    out = firstSentence(paras.join(' '));
+  }
+  if (out.length > INFO_EMAIL_LIMITS.preheaderMax) {
+    out = `${out.slice(0, INFO_EMAIL_LIMITS.preheaderMax - 1).replace(/\s+\S*$/, '')}…`;
+  }
+  return out;
+}
+
+/** An email body (plain text or simple HTML) as plain text with paragraph breaks. */
+export function emailPlainText(body) {
+  return String(body || '')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/(p|div|h[1-6]|li)>/gi, '\n\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&#39;|&apos;/g, "'")
+    .replace(/&quot;/g, '"')
+    .replace(/[ \t]+\n/g, '\n')
+    .trim();
+}
+
+// The first sentence, whitespace collapsed.
 function firstSentence(text) {
   const t = String(text || '').replace(/\s+/g, ' ').trim();
   const m = t.match(/^.*?[.!?](?=\s|$)/);

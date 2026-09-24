@@ -19,6 +19,7 @@ export const OBJECTION_PPR_AND_CONFIRMATION_SPEC = `═══════ OBJECT
 - Spouse → acknowledge BOTH parties. Use the SPOUSE two-turn play below.
 - Trust → SA2. One specific proof point.
 - Competitor → SA3. Ask the NEPQ decider, one question: "Comparing is smart. When you've seen everyone and the prices are close, what will make the decision for you?" Do NOT hand them a checklist of what to ask other companies, and do NOT invite a price bake-off (see BELIEF-STACK FRAMING). When they answer, save their answer in "rep_note" ("Decider: …") so the rep walks in knowing what decides it. Never name or trash competitors. Once they have other quotes: "When you've got the other quotes, the 15-minute review is the easiest way to compare apples to apples."
+- NOT INTERESTED → a decline, not an objection. Never argue, pitch, reframe, or offer a time. Turn 1, ONE question and nothing else: "No problem, [first name]. Just so I know, what changed?" If they give a reason, handle THAT objection with its own play. If they repeat it or give no reason: "Totally understand. If anything changes, just text me here." and never ask again.
 - DIY / window film / shutters → educate on the alternative's REAL gap (Stage 2 mechanics — what film or shutters can't do that code-verified impact windows can), respect the instinct to save money, never mock the idea. Micro-offer = a short email with the facts (see SEND INFO BY EMAIL), offered as a question, NOT a booking push.
 UNIVERSAL FORMULA: Acknowledge → Reframe → Micro-offer. Never argue, never repeat the same rebuttal twice, never handle more than one objection per message. Same objection restated twice after handling → you are not going to win it in chat; hand off gracefully.
 TWO-TURN PLAYS (Mistrust / Spouse / Budget): when an OBJECTION STATE block appears in the user prompt, it tells you which turn you are on. Turn 1 = listen/categorize ONLY (empathy or the one categorizing question — no solutions, no financing, no differentiation yet). Turn 2 = the targeted response to what they told you. The two-turn pacing IS the technique — never flatten it into one reply.
@@ -512,6 +513,16 @@ export const objectionState = (stateCode, parentState, enteredAt, attemptNumber,
   `Open objection state: ${stateCode}${parentState ? ` (parent: ${parentState})` : ''}, entered ${enteredAt || 'unknown'}, attempt ${attemptNumber ?? 0}.`,
   `You are on TURN ${turn} of this objection. Turn 1 = listen/categorize only (empathy or ONE categorizing question — no solutions, no financing, no differentiation). Turn 2 = the targeted response to what they told you. Never flatten the two turns into one reply.`,
   `═══════ END OBJECTION STATE ═══════`,
+];
+
+// 2026-09-24 (Mark) — "not interested": ask why once, then close. The turn is
+// decided in src/agentic/not-interested.js from the thread, not by the model.
+export const notInterestedTurnBlock = (turn) => [
+  `\n═══════ NOT INTERESTED (turn ${turn === 'close' ? 2 : 1}) ═══════`,
+  turn === 'close'
+    ? `You already asked what changed. Close warmly and ask nothing: "Totally understand. If anything changes, just text me here." No offer, no question, no companion_action.`
+    : `The lead said they are not interested. Reply with ONE question and nothing else: "No problem, [first name]. Just so I know, what changed?" No pitch, no reframe, no offer, no time slot.`,
+  `═══════ END NOT INTERESTED ═══════`,
 ];
 
 // Priorities 2 through 5: auto-book on a hard confirmation, the closing acknowledgment, the human-correction override, and the ask-first default. (2) carries the interaction with the in-home gate blocks above it.

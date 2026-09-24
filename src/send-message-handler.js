@@ -287,6 +287,8 @@ import {
   HANDOFF_ALERT_RULE,
 } from './human-handoff-alert.js';
 import { HUMAN_FOLLOW_UP_INTENTS } from './agentic/handoff-policy.js';
+import { resolvePreheader, emailPlainText } from './agentic/send-promise.js';
+import { withPreheader } from './actions/handlers/info-email.js';
 import { bumpContactCache } from './context-builder.js';
 // v3.6: rich GroupMe notification — same helpers used by tasks v2.0 +
 // notifications handlers, so all four GroupMe surfaces share one format.
@@ -1823,6 +1825,15 @@ async function sendWithFallback(contactId, message, channel, subject, action, op
         throw new Error(`phone_guard_refused: body contains unlisted phone number(s) [${offendingList}]`);
       }
     }
+  }
+
+  // ── 2026-09-24 — every email carries an inbox preview line (Mark) ──
+  // Added here, after every body guard has run on the plain body and right
+  // before the POST, so no guard or duplicate check ever sees the hidden
+  // line. The model's own line wins (opts.preheader); otherwise the body's
+  // first sentence. withPreheader never adds a second one.
+  if (channel === 'email') {
+    message = withPreheader(message, resolvePreheader(opts.preheader, emailPlainText(message)));
   }
 
   // ── 2026-07-03 direct send (AGENTIC_DIRECT_SEND, default true) ──
@@ -3673,6 +3684,7 @@ export async function executeSendMessage(action, context) {
     contactId, message, channel, subject, action,
     {
       fromNumber: replyContext?.fromNumber || null,
+      preheader: generated?.preheader || null,
       // 2026-08-18 phone guard: the only numbers this body may contain — the
       // market service phone this generation resolved and the contact's own
       // known number. The sending line is added inside sendWithFallback.
