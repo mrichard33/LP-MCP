@@ -294,6 +294,7 @@ Return ONLY a valid JSON object. The very first character MUST be { and the very
 {
   "message": "The response text to send",
   "subject": "Email subject (null for SMS)",
+  "preheader": "Email inbox preview line: one sentence under 90 characters that adds to the subject and never repeats it (null for SMS)",
   "story_arc": "SA1|SA2|SA3|SA4|SA5|none",
   "trust_level_targeted": 1-6,
   "hso_breakdown": {

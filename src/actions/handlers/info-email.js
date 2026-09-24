@@ -107,11 +107,14 @@ export function resolveInfoEmailDelivery(env = process.env) {
 
 // The inbox preview line. Hidden in the body, shown by every mail client
 // next to the subject. Escaped: it is model text.
+export const PREHEADER_MARKER = 'data-preheader';
+
 export function withPreheader(html, preheader) {
   const text = String(preheader || '').trim();
   if (!text) return html;
+  if (String(html || '').includes(PREHEADER_MARKER)) return html; // never two
   const esc = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  return `<div style="display:none;max-height:0;overflow:hidden;opacity:0;mso-hide:all;">${esc}</div>\n${html}`;
+  return `<div ${PREHEADER_MARKER} style="display:none;max-height:0;overflow:hidden;opacity:0;mso-hide:all;">${esc}</div>\n${html}`;
 }
 
 /**

@@ -17,6 +17,15 @@ asked where it was.
   else (ANGRY, FULFILLMENT_NOT_RECEIVED, WHO_IS_THIS, MOVED, RENTER, MOBILE)
   still tags the contact AND gets a reply written for that moment. Only ANGRY
   and FULFILLMENT_NOT_RECEIVED still page a person ("HUMAN FOLLOW-UP NEEDED").
+- **"Not interested" gets one "what changed?"** (Mark) — then a warm close
+  and never again (`src/agentic/not-interested.js` decides the turn from the
+  thread). A stated reason is routed by the existing objection rules; "not
+  interested" itself stays on the cooling track (rule 297, the 2026-06-17
+  decline ruling). O.0 has no not-interested branch.
+- **Preview line on every bot email reply.** Normal email replies had none;
+  the inbox showed the body's first words. The model now writes `preheader`,
+  and `sendWithFallback` adds it (or the body's first sentence) as the hidden
+  preview line right before the send, after every body guard, never twice.
 - **Missed-reply opt-out rule narrowed** (DB, `sql/seeds/2026-09-24_optout_only_stops_bot.sql`,
   applied live) — "not interested" no longer applies stop-bot; it gets the
   recovery reply. The "signed with another company" rule already keeps the
