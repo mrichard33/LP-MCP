@@ -1,6 +1,7 @@
 import supabase from '../supabase.js';
 import { getCircuitStatus } from '../lp-client.js';
 import { incrementalSync } from '../sync-engine.js';
+import { getIdentityHealth } from '../identity-health.js';
 
 export function registerSyncTools(server) {
 
@@ -152,6 +153,26 @@ export function registerSyncTools(server) {
             day15_untriggered_leads: day15Untriggered || 0,
             circuit_breaker: circuit,
           }, null, 2),
+        }],
+      };
+    }
+  );
+
+  // Tool: get_identity_health (2026-09-24) — people, not rows. Read-only.
+  // Beside get_sync_health because it answers the same kind of question: is
+  // the data we report on trustworthy? get_sync_health asks whether the copy
+  // is current; this asks whether its rows are the people they claim to be.
+  // Reads the sql/125 views; src/identity-health.js has the why.
+  server.tool(
+    'get_identity_health',
+    'LP↔GHL identity health (read-only, no arguments). Returns: lp_to_ghl_link_pct by lead age (last_30d / d31_90 / d91_365, windowed on created_at_lp); outcomes_linked_90d as [linked, total] for sets and closed_won; people_vs_rows (distinct GHL contacts vs linked LP rows, overcount_pct = share of rows that repeat a person already counted); link_mismatches (GHL ids whose LP rows disagree on phone or last name — suspected bad links, see v_identity_link_mismatches); five9_events_with_lp_key_pct_30d; unmatched_callers_30d_by_campaign (Five9 callers matching no LP phone, from v_unmatched_inbound_callers_30d); appt_set_without_lp_record_30d; leads_missing_source_90d. A percentage is null when its window is empty. A failed read errors rather than reporting zeros.',
+    {},
+    async () => {
+      const report = await getIdentityHealth();
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify(report, null, 2),
         }],
       };
     }

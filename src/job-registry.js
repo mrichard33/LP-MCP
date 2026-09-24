@@ -192,6 +192,20 @@ export const JOBS = Object.freeze([
     enabledDefault: false,
     isEnabled: (env) => String(env.TAG_SWEEP_ENABLED || '').toLowerCase() === 'true',
   },
+  {
+    id: 'missed-caller-recovery',
+    label: 'Missed paid caller recovery',
+    group: 'five9',
+    cadence: 'every 15 min',
+    enabledEnv: 'MISSED_CALLER_RECOVERY_MODE',
+    // A MODE, not a boolean (2026-09-24): off | shadow | live, default shadow.
+    // Enabled in shadow too — shadow runs every decision and logs would_push,
+    // so a silent shadow job is as much a defect as a silent live one.
+    // Mirrors recoveryMode() in src/jobs/missed-caller-recovery.js: anything
+    // but an explicit 'off' runs (an unrecognised value falls back to shadow).
+    enabledDefault: true,
+    isEnabled: (env) => String(env.MISSED_CALLER_RECOVERY_MODE || 'shadow').toLowerCase().trim() !== 'off',
+  },
 ]);
 
 /** Ids only — handy for tests and for asserting the wiring matches the roster. */

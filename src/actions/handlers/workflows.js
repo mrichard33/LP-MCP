@@ -443,6 +443,25 @@ function buildLogLabel(payload, fallback) {
  * failure we're closing. Fail-open on any read error so a transient GHL
  * outage can never block a legitimate first-time enrollment.
  */
+/**
+ * v2.2 (2026-09-24) — body for triggers that read customData, not the flat keys.
+ *
+ * E.0 Master Router's "Find Contact" step reads
+ * {{inboundWebhookRequest.customData.ghl_contact_id}} — the shape GHL's own
+ * I.LP-IN workflow posts to it — while every bridge trigger reads the flat
+ * {{inboundWebhookRequest.contact_id}} that the default form body sends. A form
+ * POST to E.0 therefore returned 200 and matched nobody: E.0 ended silently at
+ * step 3. Routing intake leads through E.0 (INTAKE_ROUTE_BACKSTOP_E0) needs this
+ * shape. The flat keys ride along at the top level too, so a trigger reading
+ * either form finds the contact; ghl_contact_id is always the real target id.
+ */
+export function buildCustomDataBody(webhookPayload, contactId) {
+  return {
+    ...webhookPayload,
+    customData: { ...webhookPayload, ghl_contact_id: contactId, contact_id: contactId },
+  };
+}
+
 function deriveActiveTag(canonicalCode) {
   if (!canonicalCode || typeof canonicalCode !== 'string') return null;
   const code = canonicalCode.trim().toLowerCase();
@@ -631,6 +650,9 @@ export async function executeAddToWorkflow(action) {
     let body, contentType;
     if (format === 'json') {
       body = JSON.stringify(webhookPayload);
+      contentType = 'application/json';
+    } else if (format === 'json_custom_data') {
+      body = JSON.stringify(buildCustomDataBody(webhookPayload, contactId));
       contentType = 'application/json';
     } else {
       body = buildFormBody(webhookPayload);
