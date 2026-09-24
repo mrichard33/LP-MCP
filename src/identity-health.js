@@ -11,8 +11,14 @@
  *   3. Five9 inbound callers with no LP record: 257 Google PPC Windows callers
  *      in 30 days, and calls dispositioned "Appointment Set" with no LP lead.
  *
- * READ-ONLY. It reads the three views in sql/125 plus lp_leads and
- * five9_events_raw, and writes nothing.
+ * READ-ONLY. It reads the three views in sql/125, the new-caller view in
+ * sql/127, lp_leads and five9_events_raw, and writes nothing.
+ *
+ * sql/127 (2026-09-24) answers "are agents typing new callers into Five9 and it
+ * never reaches LP?". It is not a broken sync — Five9 opens LP's own lookup page
+ * and a new lead is meant to be created THERE — but brand-new callers usually
+ * never get entered. new_callers_talked_no_lp_30d makes that visible per team
+ * and agent.
  *
  * A FAILED READ THROWS. It never returns zeros in place of an answer: a tool
  * that reports "0 mismatches" because its query failed reads as a clean bill
@@ -69,6 +75,36 @@ export const UNMATCHED_SQL = `
   GROUP BY campaign
   ORDER BY callers DESC, campaign`;
 
+// Brand-new callers who stayed on the line with an agent but never reached LP
+// (sql/127, 2026-09-24). One read: the view is materialized once and every
+// breakdown is taken from that copy, so the heavy lp_leads anti-join runs once.
+export const TOP_AGENTS = 15;
+export const RECENT_APPT_SET = 10;
+export const NEW_CALLERS_SQL = `
+  WITH v AS MATERIALIZED (SELECT * FROM v_new_callers_no_lp_30d)
+  SELECT
+    (SELECT count(DISTINCT caller) FROM v) AS callers,
+    (SELECT count(*) FROM v) AS calls,
+    (SELECT count(DISTINCT caller) FROM v WHERE disposition = '${APPT_SET_DISPOSITION}') AS appt_set_callers,
+    (SELECT count(DISTINCT caller) FROM v WHERE call_at >= now() - interval '7 days') AS callers_last_7d,
+    (SELECT json_agg(t ORDER BY t.callers DESC, t.team) FROM (
+       SELECT team,
+              count(DISTINCT caller) AS callers,
+              count(DISTINCT caller) FILTER (WHERE disposition = '${APPT_SET_DISPOSITION}') AS appt_set_callers
+         FROM v GROUP BY team) t) AS by_team,
+    (SELECT json_agg(a ORDER BY a.callers DESC, a.agent) FROM (
+       SELECT agent_name AS agent, min(team) AS team,
+              count(DISTINCT caller) AS callers,
+              count(DISTINCT caller) FILTER (WHERE disposition = '${APPT_SET_DISPOSITION}') AS appt_set_callers
+         FROM v GROUP BY agent_name
+        ORDER BY count(DISTINCT caller) DESC, agent_name
+        LIMIT ${TOP_AGENTS}) a) AS by_agent,
+    (SELECT json_agg(r ORDER BY r.call_at DESC) FROM (
+       SELECT caller, campaign, agent_name AS agent, call_at, minutes
+         FROM v WHERE disposition = '${APPT_SET_DISPOSITION}'
+        ORDER BY call_at DESC
+        LIMIT ${RECENT_APPT_SET}) r) AS recent_appt_set`;
+
 /** bigint/numeric come back from run_sql as strings; a missing value is 0 rows. */
 function num(v) {
   const n = Number(v ?? 0);
@@ -87,6 +123,16 @@ export function pct(part, whole) {
   return Math.min(100, Math.max(0, v));
 }
 
+/** A json_agg column: an array, a JSON string of one, or NULL for no rows. */
+function jsonList(v) {
+  if (Array.isArray(v)) return v;
+  if (typeof v === 'string' && v.trim()) {
+    const parsed = JSON.parse(v);
+    return Array.isArray(parsed) ? parsed : [];
+  }
+  return [];
+}
+
 function firstRow(rows, label) {
   if (!Array.isArray(rows)) {
     throw new Error(`identity health: ${label} returned no row set`);
@@ -95,17 +141,18 @@ function firstRow(rows, label) {
 }
 
 /**
- * Pure: turn the four query results into the tool's JSON shape.
+ * Pure: turn the five query results into the tool's JSON shape.
  *
  * overcount_pct is the share of linked LP rows that are a REPEAT of a person
  * already counted — (rows − people) / rows. That is the fraction a row-based
  * report overstates by, and unlike (rows − people) / people it stays inside
  * 0..100 however many times one person re-enters.
  */
-export function buildIdentityHealth({ leads, people, five9, unmatched }) {
+export function buildIdentityHealth({ leads, people, five9, unmatched, newCallers }) {
   const l = firstRow(leads, 'lead windows');
   const p = firstRow(people, 'people');
   const f = firstRow(five9, 'five9 keys');
+  const n = firstRow(newCallers, 'new callers');
   const campaigns = Array.isArray(unmatched) ? unmatched : [];
 
   const peopleCount = num(p.people);
@@ -135,17 +182,47 @@ export function buildIdentityHealth({ leads, people, five9, unmatched }) {
     })),
     appt_set_without_lp_record_30d: campaigns.reduce((s, r) => s + num(r.appt_set), 0),
     leads_missing_source_90d: num(l.missing_source_90d),
+    // Brand-new callers (no LP lead, not one of our numbers) who stayed on the
+    // line 2+ minutes with an agent. "On the line" is Five9 start→end and can
+    // include menu and hold time. A caller handled by two teams or agents
+    // counts once in each of their rows, so the breakdowns can sum past
+    // `callers`.
+    new_callers_talked_no_lp_30d: {
+      callers: num(n.callers),
+      calls: num(n.calls),
+      appt_set_callers: num(n.appt_set_callers),
+      callers_last_7d: num(n.callers_last_7d),
+      by_team: jsonList(n.by_team).map((r) => ({
+        team: r.team ?? 'unmapped',
+        callers: num(r.callers),
+        appt_set_callers: num(r.appt_set_callers),
+      })),
+      by_agent: jsonList(n.by_agent).slice(0, TOP_AGENTS).map((r) => ({
+        agent: r.agent ?? '',
+        team: r.team ?? 'unmapped',
+        callers: num(r.callers),
+        appt_set_callers: num(r.appt_set_callers),
+      })),
+      recent_appt_set: jsonList(n.recent_appt_set).slice(0, RECENT_APPT_SET).map((r) => ({
+        caller: r.caller ?? '',
+        campaign: r.campaign ?? '',
+        agent: r.agent ?? '',
+        call_at: r.call_at ?? null,
+        minutes: num(r.minutes),
+      })),
+    },
   };
 }
 
-/** Run the four reads (in parallel) and build the report. Throws on any failed read. */
+/** Run the five reads (in parallel) and build the report. Throws on any failed read. */
 export async function getIdentityHealth(deps = {}) {
   const runSQL = deps.runSQL || defaultRunSQL;
-  const [leads, people, five9, unmatched] = await Promise.all([
+  const [leads, people, five9, unmatched, newCallers] = await Promise.all([
     runSQL(LEAD_WINDOWS_SQL),
     runSQL(PEOPLE_SQL),
     runSQL(FIVE9_KEY_SQL),
     runSQL(UNMATCHED_SQL),
+    runSQL(NEW_CALLERS_SQL),
   ]);
-  return buildIdentityHealth({ leads, people, five9, unmatched });
+  return buildIdentityHealth({ leads, people, five9, unmatched, newCallers });
 }

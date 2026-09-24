@@ -2023,6 +2023,70 @@ async function runMigrations() {
   } catch (err) {
     console.warn('[Migration] missed_caller_recovery_log (sql/126) skipped — apply it from the dashboard; the recovery job logs nothing and pushes nothing until it exists:', err.message);
   }
+
+  // New callers who talked to an agent but never reached LP (sql/127,
+  // 2026-09-24). Read-only view behind get_identity_health's
+  // new_callers_talked_no_lp_30d; a failure only makes that tool error. Kept in
+  // step with sql/127 — including the `own` CTE, which must NOT become "every
+  // DNIS ever seen": on an outbound call the DNIS is the customer.
+  try {
+    const { runSQL } = await import('./admin/supabase-admin.js');
+    await runSQL(`CREATE OR REPLACE VIEW v_new_callers_no_lp_30d AS
+            WITH lp_ph AS (
+              SELECT DISTINCT right(regexp_replace(phone,'\\D','','g'),10) AS p FROM lp_leads WHERE phone IS NOT NULL
+              UNION
+              SELECT right(regexp_replace(phone_alt,'\\D','','g'),10) FROM lp_leads WHERE phone_alt IS NOT NULL
+            ),
+            own AS (
+              SELECT right(regexp_replace(ani,'\\D','','g'),10) AS p
+                FROM five9_events_raw WHERE received_at >= now() - interval '30 days' AND ani IS NOT NULL
+               GROUP BY 1 HAVING count(DISTINCT dnis) >= 20
+              UNION
+              SELECT right(regexp_replace(dnis,'\\D','','g'),10)
+                FROM five9_events_raw WHERE received_at >= now() - interval '30 days' AND dnis IS NOT NULL
+               GROUP BY 1 HAVING count(DISTINCT ani) >= 20
+            ),
+            agent_team AS (
+              SELECT DISTINCT ON (lower(agent_name)) lower(agent_name) AS name_key, team
+                FROM ci_agent_map WHERE agent_name IS NOT NULL
+               ORDER BY lower(agent_name), active DESC NULLS LAST, updated_at DESC NULLS LAST
+            ),
+            calls AS (
+              SELECT right(regexp_replace(coalesce(e.ani,''),'\\D','','g'),10) AS caller,
+                     e.campaign,
+                     e.disposition_name AS disposition,
+                     round(e.duration_sec / 60.0, 1) AS minutes,
+                     e.agent_name,
+                     e.received_at AS call_at,
+                     coalesce(m.team,
+                              CASE substring(e.agent_name from ' - ([A-Za-z]+)$')
+                                WHEN 'LF' THEN 'lightfire'
+                                WHEN 'NC' THEN 'north_carolina'
+                              END,
+                              'unmapped') AS team
+              FROM five9_events_raw e
+              LEFT JOIN agent_team m
+                     ON m.name_key = lower(regexp_replace(e.agent_name, ' - [A-Za-z]+$', ''))
+              WHERE e.event_type = 'disposition'
+                AND e.received_at >= now() - interval '30 days'
+                AND coalesce(e.lp_rec_key,'') = ''
+                AND coalesce(e.agent_name,'') <> ''
+                AND e.duration_sec >= 120
+                AND e.campaign NOT ILIKE ALL (ARRAY['%dispatch%','%confirmation%','%reset%','%rehash%'])
+                AND coalesce(e.disposition_name,'') NOT IN
+                    ('Service Call','Do Not Call','DNC','Bad Data','Confirmed','Spanish - Send data to Spanish list')
+            )
+            SELECT c.caller, c.campaign, c.disposition, c.minutes, c.agent_name, c.team, c.call_at
+            FROM calls c
+            LEFT JOIN lp_ph l ON l.p = c.caller
+            LEFT JOIN own   o ON o.p = c.caller
+            WHERE length(c.caller) = 10
+              AND l.p IS NULL
+              AND o.p IS NULL;`);
+    console.log('[Migration] new-callers view (sql/127) ready');
+  } catch (err) {
+    console.warn('[Migration] new-callers view (sql/127) skipped — get_identity_health will error until sql/127 is applied from the dashboard:', err.message);
+  }
 }
 
 app.get('/', (req, res) => {
