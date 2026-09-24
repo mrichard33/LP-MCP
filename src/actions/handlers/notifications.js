@@ -46,6 +46,7 @@
 
 import supabase from '../../supabase.js';
 import { sendGroupMeMessage } from '../../groupme.js';
+import { resolveSlackChannels } from '../../slack.js';
 import { resolveRepMarketCode } from '../../rep-roster.js';
 import { checkForActionRef } from '../../groupme-read.js';
 import { interpolatePayload } from '../helpers.js';
@@ -321,13 +322,39 @@ export async function executeSendNotification(action, context) {
   // 2026-07-15 — rules may route to a per-purpose channel ('canvass' →
   // GROUPME_CANVASS_BOT_ID) and/or bypass the debounce with flushNow
   // (work-queue cards like SMS-CONFIRMED / TIME CHANGE).
-  await sendGroupMeMessage(full, {
+  const sendResult = await sendGroupMeMessage(full, {
     contactId,
     contactName: name,
     channel: payload.channel || undefined,
     market: marketCode || undefined,
     flushNow: payload.flushNow === true || payload.flush_now === true,
   });
+
+  // 2026-09-24 — record WHERE this card was routed, not just what it said.
+  //
+  // Until now execution_result held the message text and nothing about its
+  // destination, so a market card that quietly fell into the all-markets
+  // rollup was byte-identical in the record to one that reached its market.
+  // The mirror is fail-silent by design, which means a misroute reads as a
+  // quiet night. This turns "did that reach the Fort Lauderdale floor?" into
+  // a query instead of a guess.
+  //
+  // INTENDED, not delivered, and deliberately so: rep-facing cards go through
+  // the v1.7 debounce queue, so at this point the card has not been posted yet
+  // and no delivered-channel list exists. The intended destination is both
+  // knowable now and the thing actually being asked about — whether the
+  // ROUTING is right. Delivery failures are a separate diagnosis and already
+  // log per channel in postToSlack.
+  let slackChannels = null;
+  try {
+    slackChannels = await resolveSlackChannels(
+      payload.channel || 'main',
+      marketCode ? { market: marketCode } : {},
+    );
+  } catch (err) {
+    // Never fail a sent card over bookkeeping.
+    console.warn(`[Notify] slack channel record failed (card already sent): ${err.message}`);
+  }
   return {
     action: 'groupme_sent',
     format: formatPath,
@@ -335,5 +362,13 @@ export async function executeSendNotification(action, context) {
     message: full.slice(0, LOG_PREVIEW_CHARS),
     ref_footer: `a${action.id}`,
     retry_count: action.retry_count || 0,
+    // Routing record (2026-09-24). market_code is the CODE the mirror resolves
+    // on, never the display name the card prints — passing the name resolves
+    // nothing and lands in the rollup. null here is itself the finding: it
+    // means the card could only reach the all-markets feed.
+    market_code: marketCode || null,
+    slack_channels: slackChannels,
+    // Present only on the immediate path; debounced cards post later.
+    slack_delivered: sendResult?.slack?.channelIds || null,
   };
 }

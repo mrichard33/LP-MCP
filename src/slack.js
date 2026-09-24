@@ -183,16 +183,23 @@ export async function mirrorToSlack(text, channel, opts = {}) {
   if (!ids.length) return { mirrored: false, reason: 'no_channel' };
 
   let ok = 0;
+  // 2026-09-24 — the ids that actually ACCEPTED the post, not just the ones we
+  // aimed at. A card refused by Slack must not read as delivered.
+  const delivered = [];
   for (const id of ids) {
     const res = await postToSlack(text, id);
-    if (res.ok) ok++;
+    if (res.ok) { ok++; delivered.push(id); }
     // "threw" and "failed" are not the same diagnosis and the log must keep them
     // apart: threw means we never reached Slack (DNS, TLS, reset, timeout),
     // failed means Slack answered and refused (invalid_auth, channel_not_found).
     // One is our network, the other is our configuration.
     else console.warn(`[Slack] post to ${id} ${res.threw ? 'threw' : 'failed'}: ${res.error}`);
   }
-  return { mirrored: ok > 0, channels: ids.length, sent: ok };
+  // `channels` stays a COUNT — callers and ~20 assertions already read it that
+  // way. `channelIds` is additive, and it is the field that makes routing
+  // provable: a market card that quietly fell into the all-markets rollup is
+  // otherwise byte-identical in the record to one that reached its market.
+  return { mirrored: ok > 0, channels: ids.length, channelIds: delivered, sent: ok };
 }
 
 /**

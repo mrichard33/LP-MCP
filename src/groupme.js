@@ -459,12 +459,33 @@ export async function sendGroupMeMessage(text, opts = {}) {
  * indirectly via sendGroupMeMessage(text) (no opts → immediate path).
  */
 async function _sendRawGroupMeMessage(text, botId = GROUPME_BOT_ID, mirror = {}) {
-  // Fire-and-forget: Slack must never delay or fail a GroupMe send.
+  // Started here, awaited at the END — the two posts still overlap, so this
+  // costs no wall-clock time, but the caller gets the mirror's result instead
+  // of nothing. Awaiting it BEFORE the GroupMe POST would serialize two network
+  // calls and slow every card; that is the whole reason for the split.
+  //
+  // 2026-09-24 — why capture it at all: without the resolved channel ids, a
+  // market card that quietly fell into the all-markets rollup is byte-identical
+  // in the record to one that reached its market. The mirror is fail-silent, so
+  // a misroute reads as a quiet night.
+  //
+  // The .catch() stays: Slack must never delay or FAIL a GroupMe send, and
+  // awaiting a rejected promise would do exactly that. It resolves to a shape
+  // the caller can read instead.
   // v1.9: approval cards set skipMirror when Slack gets a button card instead.
-  if (!mirror.skipMirror) {
-    mirrorToSlack(text, mirror.channel, { market: mirror.market })
-      .catch((err) => console.warn(`[Slack] mirror threw (ignored): ${err.message}`));
-  }
+  const mirrorPromise = mirror.skipMirror
+    ? null
+    : mirrorToSlack(text, mirror.channel, { market: mirror.market })
+      .catch((err) => {
+        console.warn(`[Slack] mirror threw (ignored): ${err.message}`);
+        return { mirrored: false, reason: 'threw' };
+      });
+
+  const withMirror = async (result) => {
+    const slack = mirrorPromise ? await mirrorPromise : null;
+    return slack ? { ...result, slack } : result;
+  };
+
   try {
     const res = await fetch('https://api.groupme.com/v3/bots/post', {
       method: 'POST',
@@ -475,12 +496,12 @@ async function _sendRawGroupMeMessage(text, botId = GROUPME_BOT_ID, mirror = {})
     if (!res.ok) {
       const body = await res.text().catch(() => '');
       console.error(`[GroupMe] POST failed: ${res.status} ${body.slice(0, 200)}`);
-      return { sent: false, reason: `http_${res.status}` };
+      return withMirror({ sent: false, reason: `http_${res.status}` });
     }
-    return { sent: true };
+    return withMirror({ sent: true });
   } catch (err) {
     console.error('[GroupMe] Send failed:', err.message);
-    return { sent: false, reason: err.message };
+    return withMirror({ sent: false, reason: err.message });
   }
 }
 

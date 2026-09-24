@@ -474,7 +474,7 @@ Required JSON structure:
   "recommended_action": <"advance_stage" | "deploy_objection_handler" | "fast_track_booking" | "continue_current" | "escalate_to_rep" | "suppress" | "objection_price" | "busy_callback" | "wrong_person" | "frustrated_fast_track" | "callback_request" | "guide_send" | "follow_up_scheduled">,
   "dq_detected": <null | "mobile-home" | "renter" | "lanai-only">,
   "requested_fulfillment": <"in_home_estimate" | "phone_call" | "info_only" | "unspecified">,
-  "escalation_category": <null | "existing_customer_service" | "legal_media" | "identity_ambiguous" | "commercial_hoa" | "contract_change" | "billing" | "vendor_recruiting" | "language" | "compliance_adjacent" | "rep_promise_unfulfilled">,
+  "escalation_category": <null | "existing_customer_service" | "legal_media" | "identity_ambiguous" | "commercial_hoa" | "contract_change" | "billing" | "vendor_recruiting" | "language" | "compliance_adjacent" | "rep_promise_unfulfilled" | "document_request">,
   "guide_type": <null | "dhp" | "hurricane" | "energy" | "security" | "warranty" | "financing" | "reviews" | "credentials" | "booking-link" | "process">,
   "follow_up_bucket": <null | "tomorrow" | "few-days" | "1week" | "2weeks" | "1month" | "2months" | "after-holidays" | "seasonal">,
   "call_purpose": <null | "pricing_questions" | "general_questions" | "pre_visit_confirmation" | "requested_callback">,
@@ -639,6 +639,9 @@ A deterministic gate enforces the PROSPECT rule after you answer; do not rely on
 • "rep_promise_unfulfilled" — the lead is chasing something a REP personally promised and never delivered: a quote, pricing, a proposal, paperwork, samples, or a promised call back that never came. The tell is a specific promised ARTEFACT plus it never arriving — "he said he'd email the quote and I never got it", "still waiting on the numbers from last week", "nobody ever sent me anything". Set this even when the tone is calm; it is the broken promise that matters, not the anger. This is a SALES escalation and applies to a PROSPECT as readily as a customer, so it is not blocked by the CUSTOMER RELATIONSHIP rule above.
   NOT this: a lead asking for pricing they were never promised (that is a normal pricing ask), or a complaint about the appointment itself rather than an undelivered item.
   The objection underneath is TRUST — see OBJECTION MAPPING — so set objection_type "trust" alongside it when you deploy an objection handler.
+• "document_request" — the lead is asking for a document, paperwork, or written materials that nobody promised them: a warranty, a copy of their contract, a spec sheet, an invoice, a receipt, a permit, an inspection report. The tell is a specific ARTEFACT requested with NO reference to anyone having said they would send it. Set this even when the tone is friendly; the point is that a document request needs a person, not a bot reply.
+  PRECEDENCE: if they reference a promise at all ("he said he'd send", "still waiting on the one you mentioned"), use "rep_promise_unfulfilled" instead — that is the stronger signal and it wins. document_request is the COLD case only.
+  NOT this: asking for pricing, a quote, or an estimate (a normal sales ask — leave null), or a general question the bot can simply answer ("what colours do you have?").
 • "legal_media" — legal threats, injury, damage claims, or press/media inquiries. Acknowledge only.
 • "identity_ambiguous" — wrong number, deceased contact, or a minor.
   NEGATIVE EXAMPLE: a signature whose name or email differs from the record
@@ -1228,6 +1231,16 @@ function validateAnalysis(analysis) {
       // to the rep's own market sales channel, so somebody who can chase them
       // sees it.
       'rep_promise_unfulfilled',
+      // 2026-09-24 — a document request nobody promised. Same destination as
+      // rep_promise_unfulfilled (the rep's market sales channel) but a separate
+      // category on purpose: rep_promise_unfulfilled is a TRUST signal that
+      // drives objection routing, and folding cold requests into it would both
+      // dilute that signal and make the two impossible to count apart.
+      //
+      // This allowlist is why the category has to be added in TWO places. A
+      // value missing here is silently rewritten to null — the rule downstream
+      // then never fires, with no error anywhere to say why.
+      'document_request',
     ].includes(analysis.escalation_category) ? analysis.escalation_category : null,
     guide_type: ['dhp', 'hurricane', 'energy', 'security', 'warranty', 'financing', 'reviews', 'credentials', 'booking-link', 'process'].includes(analysis.guide_type) ? analysis.guide_type : null,
     follow_up_bucket: ['tomorrow', 'few-days', '1week', '2weeks', '1month', '2months', 'after-holidays', 'seasonal'].includes(analysis.follow_up_bucket) ? analysis.follow_up_bucket : null,
