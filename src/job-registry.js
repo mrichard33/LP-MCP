@@ -193,6 +193,18 @@ export const JOBS = Object.freeze([
     isEnabled: (env) => String(env.TAG_SWEEP_ENABLED || '').toLowerCase() === 'true',
   },
   {
+    id: 'office-power-ranking',
+    label: 'Office power ranking',
+    group: 'notifications',
+    cadence: 'daily 08:00 ET',
+    enabledEnv: 'OFFICE_POWER_RANKING_ENABLED',
+    // OFF by default (2026-09-24): a public league table that names every
+    // office including last is a sales-floor decision, not something a deploy
+    // should start doing on its own.
+    enabledDefault: false,
+    isEnabled: (env) => String(env.OFFICE_POWER_RANKING_ENABLED || '').toLowerCase() === 'true',
+  },
+  {
     id: 'missed-caller-recovery',
     label: 'Missed paid caller recovery',
     group: 'five9',
