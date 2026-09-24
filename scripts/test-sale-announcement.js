@@ -45,7 +45,13 @@ import {
   isCelebratableClimb,
   gitBlobSha,
 } from '../src/notifications/sale-announcement-body-generator.js';
-import { postSaleAnnouncement, postSaleStats } from '../src/notifications/slack-sale.js';
+import {
+  postSaleAnnouncement,
+  postSaleStats,
+  postSaleToMarket,
+  resolveSaleMarketChannel,
+} from '../src/notifications/slack-sale.js';
+import { __setSlackClientForTests, __resetSlackCacheForTests } from '../src/slack.js';
 
 const TOKEN = process.env.SALE_ANNOUNCE_TOKEN;
 
@@ -538,6 +544,7 @@ test('a permanent Slack refusal is not retried; a transient one is', async () =>
   });
   assert.equal(p.ok, false);
   assert.equal(perm, 1, 'a permanent refusal is attempted once');
+  assert.equal(p.attempts, 1, 'and reports one attempt, not the configured three');
 
   // A transport throw is exactly what the retry exists for.
   let threw = 0;
@@ -1008,4 +1015,264 @@ test('the FACTS block no longer carries any bookkeeping', () => {
   assert.ok(!rich.includes('500,000'), 'month volume must not appear');
   assert.ok(!rich.includes('4,214,968'), 'team total must not appear');
   assert.ok(!/9 sales/.test(rich), 'month count must not appear');
+});
+
+// ═════════════════════════════════════════════════════════════════
+// The market channel (2026-09-24)
+//
+// Every sale landed in #sales-all only — rows 80–90 (FTMYR / JAX / STPET / ORL)
+// all carry C0C0AQMARE1 — because nothing ever looked up a market. With
+// SALE_ANNOUNCE_MARKET_ENABLED the same text also posts to #sales-<market>,
+// and a market failure must never un-post the sale.
+// ═════════════════════════════════════════════════════════════════
+const C_SALES_FTMYR = 'C_SALES_FTMYR';
+const C_SALES_FTLAU = 'C_SALES_FTLAU';
+
+async function withMarketFlag(value, fn) {
+  const prev = process.env.SALE_ANNOUNCE_MARKET_ENABLED;
+  if (value === undefined) delete process.env.SALE_ANNOUNCE_MARKET_ENABLED;
+  else process.env.SALE_ANNOUNCE_MARKET_ENABLED = value;
+  try {
+    return await fn();
+  } finally {
+    if (prev === undefined) delete process.env.SALE_ANNOUNCE_MARKET_ENABLED;
+    else process.env.SALE_ANNOUNCE_MARKET_ENABLED = prev;
+  }
+}
+
+/** makeDeps plus stubs for the market post, and a stats stub that records the channel. */
+function makeMarketDeps(db, overrides = {}) {
+  const marketCalls = [];
+  const marketAlerts = [];
+  const statsCalls = [];
+  const h = makeDeps(db, {
+    facts: async () => ({ degraded: false, mtd_sale_count: 3, mtd_volume: 36300 }),
+    resolveMarket: async (market) => ({ FTMYR: C_SALES_FTMYR, FTLAU: C_SALES_FTLAU })[market] || null,
+    postMarket: async (text, channel) => {
+      marketCalls.push({ text, channel });
+      return { ok: true, ts: `mts-${marketCalls.length}`, channel, error: null, attempts: 1 };
+    },
+    postStats: async (text, threadTs, d = {}) => {
+      statsCalls.push({ text, threadTs, channelId: d.channelId ?? null });
+      return { ok: true, ts: `stats-${statsCalls.length}`, error: null };
+    },
+    marketAlert: async (detail) => { marketAlerts.push(detail); return { ok: true }; },
+    ...overrides,
+  });
+  return { ...h, marketCalls, marketAlerts, statsCalls };
+}
+
+async function runSale(h) {
+  const handler = makeSaleAnnouncementHandler(h.deps);
+  await handler(req(payload()), makeRes());
+  await h.drain();
+}
+
+test('an FTMYR sale posts to #sales-all AND #sales-fortmyers with identical text', async () => {
+  await withMarketFlag('true', async () => {
+    const db = makeDb({ leads: [{ lp_lead_id: '573581', lp_prospect_id: 'prospect_9', lp_branch_id: 'FTMYR' }] });
+    const h = makeMarketDeps(db);
+    await runSale(h);
+
+    assert.equal(h.slackCalls.length, 1, 'one rollup post');
+    assert.equal(h.marketCalls.length, 1, 'one market post');
+    assert.equal(h.marketCalls[0].channel, C_SALES_FTMYR);
+    assert.equal(h.marketCalls[0].text, h.slackCalls[0], 'never recomposed');
+
+    const row = db.announcements[0];
+    assert.equal(row.status, STATUSES.POSTED);
+    assert.equal(row.slack_channel, 'C_SALES', '#sales-all fields unchanged');
+    assert.equal(row.market_code, 'FTMYR');
+    assert.equal(row.slack_market_channel, C_SALES_FTMYR);
+    assert.equal(row.slack_market_ts, 'mts-1');
+    assert.equal(row.market_error, null);
+    assert.equal(h.opsAlerts.length, 0);
+  });
+});
+
+test('a BOCA sale posts to #sales-all AND #sales-fortlauderdale (real alias)', async () => {
+  // Uses the REAL resolveSaleMarketChannel → resolveSlackChannels path, so the
+  // BOCA → FTLAU alias in slack.js is what is under test, not a stub of it.
+  __resetSlackCacheForTests();
+  __setSlackClientForTests({
+    from(table) {
+      return {
+        select: async () => {
+          if (table === 'slack_channels') {
+            return { data: [
+              { channel_name: 'sales-all', slack_channel_id: 'C_SALES' },
+              { channel_name: 'sales-fortmyers', slack_channel_id: C_SALES_FTMYR },
+              { channel_name: 'sales-fortlauderdale', slack_channel_id: C_SALES_FTLAU },
+            ] };
+          }
+          if (table === 'slack_market_slugs') {
+            return { data: [
+              { market_code: 'FTMYR', slug: 'fortmyers' },
+              { market_code: 'FTLAU', slug: 'fortlauderdale' },
+            ] };
+          }
+          throw new Error(`unexpected table ${table}`);
+        },
+      };
+    },
+  });
+  try {
+    await withMarketFlag('true', async () => {
+      const db = makeDb({ leads: [{ lp_lead_id: '573581', lp_prospect_id: 'prospect_9', lp_branch_id: 'BOCA' }] });
+      const h = makeMarketDeps(db, { resolveMarket: resolveSaleMarketChannel });
+      await runSale(h);
+
+      assert.equal(h.slackCalls.length, 1);
+      assert.deepEqual(h.marketCalls.map((c) => c.channel), [C_SALES_FTLAU]);
+      assert.equal(db.announcements[0].market_code, 'BOCA', 'the raw code is recorded');
+      assert.equal(db.announcements[0].slack_market_channel, C_SALES_FTLAU);
+    });
+  } finally {
+    __setSlackClientForTests(null);
+    __resetSlackCacheForTests();
+  }
+});
+
+test('resolveSaleMarketChannel never returns the rollup id', async () => {
+  const resolveChannels = async () => ['C_ROLLUP'];
+  assert.equal(await resolveSaleMarketChannel('ORL', { resolveChannels, rollupId: 'C_ROLLUP', logger: quietLogger }), null);
+  assert.equal(await resolveSaleMarketChannel(null, { resolveChannels, rollupId: 'C_ROLLUP', logger: quietLogger }), null);
+  const boom = async () => { throw new Error('db down'); };
+  assert.equal(await resolveSaleMarketChannel('FTMYR', { resolveChannels: boom, logger: quietLogger }), null);
+});
+
+test('a lead with no branch posts to #sales-all only, cleanly', async () => {
+  await withMarketFlag('true', async () => {
+    const db = makeDb({ leads: [{ lp_lead_id: '573581', lp_prospect_id: 'prospect_9', lp_branch_id: null }] });
+    const h = makeMarketDeps(db);
+    await runSale(h);
+
+    assert.equal(h.slackCalls.length, 1);
+    assert.equal(h.marketCalls.length, 0);
+    const row = db.announcements[0];
+    assert.equal(row.status, STATUSES.POSTED);
+    assert.equal(row.market_code, undefined);
+    assert.equal(row.market_error, undefined, 'no market is not an error');
+    assert.equal(h.opsAlerts.length + h.marketAlerts.length, 0);
+  });
+});
+
+test('a market code with no channel is recorded, and the sale still posts', async () => {
+  await withMarketFlag('true', async () => {
+    const db = makeDb({ leads: [{ lp_lead_id: '573581', lp_prospect_id: 'prospect_9', lp_branch_id: 'ZZZ' }] });
+    const h = makeMarketDeps(db);
+    await runSale(h);
+
+    assert.equal(h.marketCalls.length, 0);
+    assert.equal(db.announcements[0].status, STATUSES.POSTED);
+    assert.equal(db.announcements[0].market_code, 'ZZZ');
+    assert.equal(db.announcements[0].market_error, 'no_market_channel');
+  });
+});
+
+test('a market post refused with not_in_channel stays posted and pages ops once', async () => {
+  await withMarketFlag('true', async () => {
+    const db = makeDb({ leads: [{ lp_lead_id: '573581', lp_prospect_id: 'prospect_9', lp_branch_id: 'FTMYR' }] });
+    const h = makeMarketDeps(db, {
+      postMarket: async (text, channel) => ({ ok: false, ts: null, channel, error: 'not_in_channel', attempts: 1 }),
+    });
+    await runSale(h);
+
+    const row = db.announcements[0];
+    assert.equal(row.status, STATUSES.POSTED, 'the sale reached #sales-all');
+    assert.equal(row.market_error, 'slack:not_in_channel after 1 attempts');
+    assert.equal(row.slack_market_channel, C_SALES_FTMYR);
+    assert.equal(row.slack_market_ts, undefined);
+    assert.equal(h.marketAlerts.length, 1, 'one ops line naming the channel');
+    assert.equal(h.marketAlerts[0].channel, C_SALES_FTMYR);
+    assert.equal(h.opsAlerts.length, 0, 'not a dropped-sale alert');
+    assert.equal(h.statsCalls.length, 1, 'no stats reply under a post that never landed');
+  });
+});
+
+test('a transient market failure is recorded but does not page ops', async () => {
+  await withMarketFlag('true', async () => {
+    const db = makeDb({ leads: [{ lp_lead_id: '573581', lp_prospect_id: 'prospect_9', lp_branch_id: 'FTMYR' }] });
+    const h = makeMarketDeps(db, {
+      postMarket: async (text, channel) => ({ ok: false, ts: null, channel, error: 'ratelimited', attempts: 3 }),
+    });
+    await runSale(h);
+    assert.equal(db.announcements[0].status, STATUSES.POSTED);
+    assert.equal(db.announcements[0].market_error, 'slack:ratelimited after 3 attempts');
+    assert.equal(h.marketAlerts.length, 0);
+  });
+});
+
+test('a market post that THROWS cannot un-post the announcement', async () => {
+  await withMarketFlag('true', async () => {
+    const db = makeDb({ leads: [{ lp_lead_id: '573581', lp_prospect_id: 'prospect_9', lp_branch_id: 'FTMYR' }] });
+    const h = makeMarketDeps(db, { postMarket: async () => { throw new Error('socket hang up'); } });
+    await runSale(h);
+    assert.equal(db.announcements[0].status, STATUSES.POSTED);
+    assert.equal(h.opsAlerts.length, 0);
+  });
+});
+
+test('postSaleToMarket does not retry not_in_channel, and does retry a transient error', async () => {
+  const calls = [];
+  const refused = await postSaleToMarket('hello', C_SALES_FTMYR, {
+    post: async (text, channel) => { calls.push(channel); return { ok: false, channel, error: 'not_in_channel', threw: false }; },
+    wait: async () => {},
+    logger: quietLogger,
+  });
+  assert.equal(refused.ok, false);
+  assert.equal(refused.attempts, 1);
+  assert.deepEqual(calls, [C_SALES_FTMYR]);
+
+  let n = 0;
+  const flaky = await postSaleToMarket('hello', C_SALES_FTMYR, {
+    post: async (text, channel) => (++n < 2
+      ? { ok: false, channel, error: 'ratelimited', threw: false }
+      : { ok: true, ts: 'm1', channel, error: null }),
+    wait: async () => {},
+    logger: quietLogger,
+  });
+  assert.equal(flaky.ok, true);
+  assert.equal(flaky.attempts, 2);
+  assert.equal(flaky.channel, C_SALES_FTMYR);
+});
+
+test('flag off: exactly one post, no market read, no market fields', async () => {
+  await withMarketFlag(undefined, async () => {
+    let reads = 0;
+    const db = makeDb({ leads: [{ lp_lead_id: '573581', lp_prospect_id: 'prospect_9', lp_branch_id: 'FTMYR' }] });
+    const h = makeMarketDeps(db, { readMarket: async () => { reads++; return 'FTMYR'; } });
+    await runSale(h);
+
+    assert.equal(h.slackCalls.length, 1);
+    assert.equal(h.marketCalls.length, 0);
+    assert.equal(reads, 0, 'the off path does not even read the market');
+    assert.equal(h.statsCalls.length, 1);
+    const row = db.announcements[0];
+    assert.equal(row.status, STATUSES.POSTED);
+    for (const k of ['market_code', 'slack_market_channel', 'slack_market_ts', 'slack_market_stats_ts', 'market_error']) {
+      assert.equal(row[k], undefined, `${k} untouched`);
+    }
+  });
+});
+
+test('the stats reply is threaded under EACH celebration, in that post’s channel', async () => {
+  await withMarketFlag('true', async () => {
+    const db = makeDb({ leads: [{ lp_lead_id: '573581', lp_prospect_id: 'prospect_9', lp_branch_id: 'FTMYR' }] });
+    const h = makeMarketDeps(db);
+    await runSale(h);
+
+    assert.equal(h.statsCalls.length, 2);
+    // Rollup reply: under the rollup ts, default (rollup) channel.
+    assert.equal(h.statsCalls[0].threadTs, 'ts-1');
+    assert.equal(h.statsCalls[0].channelId, null);
+    // Market reply: under the market ts, in the market channel.
+    assert.equal(h.statsCalls[1].threadTs, 'mts-1');
+    assert.equal(h.statsCalls[1].channelId, C_SALES_FTMYR);
+    assert.equal(h.statsCalls[0].text, h.statsCalls[1].text);
+
+    const row = db.announcements[0];
+    assert.equal(row.slack_stats_ts, 'stats-1');
+    assert.equal(row.slack_market_stats_ts, 'stats-2');
+  });
 });
