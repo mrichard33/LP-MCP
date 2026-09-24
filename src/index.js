@@ -307,6 +307,7 @@ import { registerFreshnessRefreshRoutes, startFreshnessRefreshScheduler } from '
 import { registerLinkLeakRoutes, startLinkLeakScheduler } from './jobs/link-leak-monitor.js';
 import { registerP2UnresolvableRoutes, startP2UnresolvableScheduler } from './jobs/p2-unresolvable-monitor.js';
 import { registerTagHygieneRoutes, startTagHygieneScheduler } from './jobs/tag-hygiene-sweep.js';  // 2026-09-22
+import { startMissedCallerRecoveryScheduler } from './jobs/missed-caller-recovery.js';  // 2026-09-24
 import { registerCiRoutes } from './ci/routes.js';
 import { startCiWorkerScheduler } from './ci/worker.js';
 import { startCiDiscoveryScheduler } from './jobs/ci-discovery-scheduler.js';
@@ -1998,6 +1999,30 @@ async function runMigrations() {
   } catch (err) {
     console.warn('[Migration] identity-health views (sql/125) skipped — get_identity_health will error until sql/125 is applied from the dashboard:', err.message);
   }
+
+  // missed_caller_recovery_log (sql/126, 2026-09-24). The unique key IS the
+  // recovery job's idempotency guard — it claims a row before it queues a
+  // dial — so the table must exist before the first pass. Awaited before the
+  // schedulers start; a failure makes every pass fail its log write (and so
+  // push nothing), never double-push.
+  try {
+    const { runSQL } = await import('./admin/supabase-admin.js');
+    await runSQL(`CREATE TABLE IF NOT EXISTS missed_caller_recovery_log (
+              id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+              caller_phone text NOT NULL,
+              campaign text NOT NULL,
+              last_call_at timestamptz NOT NULL,
+              last_disposition text,
+              mode text NOT NULL,
+              action text NOT NULL,
+              detail text,
+              created_at timestamptz NOT NULL DEFAULT now(),
+              UNIQUE (caller_phone, campaign, last_call_at)
+            );`);
+    console.log('[Migration] missed_caller_recovery_log (sql/126) ready');
+  } catch (err) {
+    console.warn('[Migration] missed_caller_recovery_log (sql/126) skipped — apply it from the dashboard; the recovery job logs nothing and pushes nothing until it exists:', err.message);
+  }
 }
 
 app.get('/', (req, res) => {
@@ -2490,6 +2515,7 @@ const server = app.listen(PORT, async () => {
   startLinkLeakScheduler();
   startP2UnresolvableScheduler();
   startTagHygieneScheduler();
+  startMissedCallerRecoveryScheduler();
   // Probe ffmpeg, which transcodes Five9's GSM 6.10 recordings to a format a
   // browser can actually play. A CLEAR LOG LINE, NOT A CRASH: without it the
   // whole pipeline still runs and links still resolve, they just serve the
