@@ -154,6 +154,22 @@ test('Appointment Set with no LP record is alerted and never dialled', async () 
   assert.equal(h.calls.events.length, 1);
   assert.equal(h.calls.events[0].event_type, 'identity.appt_without_lp_record');
   assert.equal(h.db.log[0].action, 'alert_appt_no_lp');
+  assert.equal(h.calls.events[0].bypass_filter, true, 'no rule consumes it, so the intake allowlist would drop it');
+});
+
+test('an alert the intake filter drops fails the pass instead of reading ok', async () => {
+  // The first live alert (2026-09-24) went to system_events_filtered while
+  // the job reported ok. emitEvent does not throw on a filter drop.
+  for (const outcome of [{ filtered: true, reason: 'event_type_not_in_allowlist' }, null]) {
+    const h = harness({ rows: [row({ last_disposition: 'Appointment Set' })] });
+    const res = await runMissedCallerRecovery({
+      env: { MISSED_CALLER_RECOVERY_MODE: 'shadow' },
+      nowMs: NOW,
+      deps: { ...harnessDeps(h), runSQL: async () => [row({ last_disposition: 'Appointment Set' })], emitEvent: async () => outcome },
+    });
+    assert.equal(res.ok, false, `outcome ${JSON.stringify(outcome)}`);
+    assert.match(res.errors.join(' '), /did not land/);
+  }
 });
 
 // ─── the 72-hour boundary (UTC on both sides) ──────────────────────────────

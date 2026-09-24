@@ -319,7 +319,13 @@ export async function runMissedCallerRecovery({ env = process.env, nowMs = Date.
       if (kind === 'appt_no_lp') {
         const id = await log(row, 'alert_appt_no_lp', 'Appointment Set on a call with no LP record — not dialled');
         if (id) {
-          await emitEvent({
+          // bypass_filter is LOAD-BEARING (2026-09-24). No agent_rule consumes
+          // this event — it is observability for a human — so it is not on the
+          // intake allowlist, and without the bypass emitEvent drops it into
+          // system_events_filtered and returns { filtered: true } without
+          // throwing. That is exactly how the first live alert (9549727102,
+          // Google PPC, 2026-09-24 03:07Z) vanished while the pass read ok.
+          const emitted = await emitEvent({
             event_type: 'identity.appt_without_lp_record',
             source: 'lp_mcp',
             entity_type: 'phone',
@@ -334,7 +340,14 @@ export async function runMissedCallerRecovery({ env = process.env, nowMs = Date.
               log_id: id,
             },
             idempotency_key: `appt_without_lp_${row.caller}_${row.campaign}_${row.last_call_at}`,
-          }).catch((err) => errors.push(`emit ${row.caller}: ${err.message}`));
+            bypass_filter: true,
+          }).catch((err) => { errors.push(`emit ${row.caller}: ${err.message}`); return undefined; });
+          // emitEvent never throws: it returns null on a write error and
+          // { filtered } when the intake filter drops the event. Either way the
+          // alert did not land, and the pass must not read ok.
+          if (emitted === null || emitted?.filtered) {
+            errors.push(`emit ${row.caller}: identity.appt_without_lp_record did not land (${emitted?.reason || 'emitEvent returned null'})`);
+          }
         }
         continue;
       }
