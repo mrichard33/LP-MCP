@@ -122,7 +122,7 @@ test('channel main → exactly one POST to CH_MAIN with the exact text', async (
   reset(slack);
   const text = '🔔 LP Appointment Set\nJane Doe · (239) 555-0100';
   const r = await slack.mirrorToSlack(text, 'main');
-  assert.deepEqual(r, { mirrored: true, channels: 1, sent: 1 });
+  assert.deepEqual(r, { mirrored: true, channels: 1, sent: 1, channelIds: [CH_MAIN] });
   assert.equal(posts.length, 1);
   assert.equal(posts[0].body.channel, CH_MAIN);
   assert.equal(posts[0].body.text, text);
@@ -139,7 +139,7 @@ test('channel ops → exactly one POST to CH_OPS', async () => {
 test('canvass + market FTMYR → market channel first, then CH_CANVASS', async () => {
   reset(slack);
   const r = await slack.mirrorToSlack('canvass card', 'canvass', { market: 'FTMYR' });
-  assert.deepEqual(r, { mirrored: true, channels: 2, sent: 2 });
+  assert.deepEqual(r, { mirrored: true, channels: 2, sent: 2, channelIds: [CH_FTMYR, CH_CANVASS] });
   assert.deepEqual(posts.map((p) => p.body.channel), [CH_FTMYR, CH_CANVASS]);
   assert.equal(posts[0].body.text, 'canvass card');
   assert.equal(posts[1].body.text, 'canvass card');
@@ -156,7 +156,7 @@ test('canvass + lowercase code → same two channels (case-insensitive)', async 
 test('canvass + market BOCA → aliases to canvass-fortlauderdale AND CH_CANVASS', async () => {
   reset(slack);
   const r = await slack.mirrorToSlack('canvass card', 'canvass', { market: 'BOCA' });
-  assert.deepEqual(r, { mirrored: true, channels: 2, sent: 2 });
+  assert.deepEqual(r, { mirrored: true, channels: 2, sent: 2, channelIds: [CH_FTLAU, CH_CANVASS] });
   assert.deepEqual(posts.map((p) => p.body.channel), [CH_FTLAU, CH_CANVASS]);
   assert.equal(warns.length, 0);
 });
@@ -170,7 +170,7 @@ test('canvass + market MIAMI → aliases to canvass-fortlauderdale AND CH_CANVAS
 test('canvass + market RFED (no alias, no slug) → CH_CANVASS only, one warning', async () => {
   reset(slack);
   const r = await slack.mirrorToSlack('canvass card', 'canvass', { market: 'RFED' });
-  assert.deepEqual(r, { mirrored: true, channels: 1, sent: 1 });
+  assert.deepEqual(r, { mirrored: true, channels: 1, sent: 1, channelIds: [CH_CANVASS] });
   assert.deepEqual(posts.map((p) => p.body.channel), [CH_CANVASS]);
   assert.equal(warns.length, 1);
   assert.match(warns[0], /no canvass channel for market=RFED/);
@@ -179,7 +179,7 @@ test('canvass + market RFED (no alias, no slug) → CH_CANVASS only, one warning
 test('canvass + unknown market → one POST to CH_CANVASS, one warning', async () => {
   reset(slack);
   const r = await slack.mirrorToSlack('canvass card', 'canvass', { market: 'NOPE' });
-  assert.deepEqual(r, { mirrored: true, channels: 1, sent: 1 });
+  assert.deepEqual(r, { mirrored: true, channels: 1, sent: 1, channelIds: [CH_CANVASS] });
   assert.deepEqual(posts.map((p) => p.body.channel), [CH_CANVASS]);
   assert.equal(warns.length, 1);
   assert.match(warns[0], /no canvass channel for market=NOPE/);
@@ -214,7 +214,7 @@ test('Slack returns ok:false → warns with the error string, does NOT throw', a
   reset(slack);
   slackResponse = () => ({ ok: false, error: 'invalid_auth' });
   const r = await slack.mirrorToSlack('card', 'main');
-  assert.deepEqual(r, { mirrored: false, channels: 1, sent: 0 });
+  assert.deepEqual(r, { mirrored: false, channels: 1, sent: 0, channelIds: [] });
   assert.equal(warns.length, 1);
   assert.match(warns[0], /post to C_MAIN failed: invalid_auth/);
 });
@@ -245,7 +245,7 @@ test('empty text → disabled reason, fetch never called', async () => {
 test('service + a market CODE resolves the market channel ONLY', async () => {
   reset(slack);
   const r = await slack.mirrorToSlack('screen is torn', 'service', { market: 'ORL' });
-  assert.deepEqual(r, { mirrored: true, channels: 1, sent: 1 }, 'one channel — no rollup copy, alsoRollup is false for service');
+  assert.deepEqual(r, { mirrored: true, channels: 1, sent: 1, channelIds: [CH_SERVICE_ORL] }, 'one channel — no rollup copy, alsoRollup is false for service');
   assert.equal(posts.length, 1);
   assert.equal(posts[0].body.channel, CH_SERVICE_ORL);
 });
@@ -255,7 +255,7 @@ test('service with NO market falls back to the contact-center channel, not main'
   // who handles service. Landing in #lead-intelligence would bury it.
   reset(slack);
   const r = await slack.mirrorToSlack('warranty question', 'service');
-  assert.deepEqual(r, { mirrored: true, channels: 1, sent: 1 });
+  assert.deepEqual(r, { mirrored: true, channels: 1, sent: 1, channelIds: [CH_SERVICE] });
   assert.equal(posts[0].body.channel, CH_SERVICE);
   assert.notEqual(posts[0].body.channel, CH_MAIN);
 });
@@ -266,13 +266,43 @@ test('service with an unresolvable market falls back rather than dropping', asyn
   // ORL. It must degrade to the rollup, never to nothing.
   reset(slack);
   const r = await slack.mirrorToSlack('leak after install', 'service', { market: 'Orlando / Central Florida' });
-  assert.deepEqual(r, { mirrored: true, channels: 1, sent: 1 });
+  assert.deepEqual(r, { mirrored: true, channels: 1, sent: 1, channelIds: [CH_SERVICE] });
   assert.equal(posts[0].body.channel, CH_SERVICE);
 });
 
 test('service does not disturb canvass routing', async () => {
   reset(slack);
   const r = await slack.mirrorToSlack('door knocked', 'canvass', { market: 'FTMYR' });
-  assert.deepEqual(r, { mirrored: true, channels: 2, sent: 2 }, 'canvass still copies to its rollup');
+  assert.deepEqual(r, { mirrored: true, channels: 2, sent: 2, channelIds: [CH_FTMYR, CH_CANVASS] }, 'canvass still copies to its rollup');
   assert.deepEqual(posts.map((p) => p.body.channel).sort(), [CH_CANVASS, CH_FTMYR].sort());
+});
+
+// ─── channelIds: the DELIVERY record (2026-09-24) ───────────────
+// `channels` is a count of what we aimed at. `channelIds` is what accepted.
+// They diverge exactly when a card silently missed its destination, which is
+// the failure this field exists to make visible.
+
+test('channelIds records only the channels that ACCEPTED the post', async () => {
+  reset(slack);
+  // canvass+FTMYR fans out to the market channel, then the rollup. Fail only
+  // the rollup: the record must show the market channel got it and the rollup
+  // did not.
+  slackResponse = () => (posts[posts.length - 1].body.channel === CH_CANVASS
+    ? { ok: false, error: 'channel_not_found' }
+    : { ok: true });
+  const r = await slack.mirrorToSlack('canvass card', 'canvass', { market: 'FTMYR' });
+  assert.deepEqual(r, { mirrored: true, channels: 2, sent: 1, channelIds: [CH_FTMYR] });
+});
+
+test('a card that reached only the rollup is distinguishable from one that reached its market', async () => {
+  // The whole point. Before channelIds these two outcomes were byte-identical
+  // in the record — a Boca card in #sales-all read exactly like one that
+  // landed in #sales-fortlauderdale.
+  reset(slack);
+  const routed = await slack.mirrorToSlack('card', 'canvass', { market: 'FTMYR' });
+  reset(slack);
+  const rollupOnly = await slack.mirrorToSlack('card', 'canvass', { market: 'NOPE' });
+  assert.ok(routed.channelIds.includes(CH_FTMYR));
+  assert.deepEqual(rollupOnly.channelIds, [CH_CANVASS]);
+  assert.notDeepEqual(routed.channelIds, rollupOnly.channelIds);
 });

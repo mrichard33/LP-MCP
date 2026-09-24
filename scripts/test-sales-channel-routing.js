@@ -131,7 +131,7 @@ test('adding sales did not disturb canvass, ops or main', async () => {
 test('a sales card actually posts to the one market channel', async () => {
   reset();
   const r = await slack.mirrorToSlack('rep never sent the quote', 'sales', { market: 'FTMYR' });
-  assert.deepEqual(r, { mirrored: true, channels: 1, sent: 1 });
+  assert.deepEqual(r, { mirrored: true, channels: 1, sent: 1, channelIds: [CH_SALES_FTMYR] });
   assert.deepEqual(posts.map((p) => p.channel), [CH_SALES_FTMYR]);
   assert.equal(posts[0].text, 'rep never sent the quote');
 });
