@@ -52,6 +52,7 @@ import { interpolatePayload } from '../helpers.js';
 import { formatDateTime, formatDateTimeUS } from '../../format-helpers.js';
 import { resolveContactInfo, resolveLPProspectId } from '../resolvers.js';
 import { buildNotificationEnrichment, buildRichNotification, formatCalcSummary } from '../enrichment.js';
+import { sendServiceCard, resolveServiceMarketForContact } from '../service-card.js';
 import {
   buildClassifiedNotification,
   isClassifiedPayload,
@@ -219,6 +220,13 @@ export async function executeSendNotification(action, context) {
 
   const payload = interpolatePayload(action.action_payload, enrichedContext);
 
+  // 2026-09-24 — plain-English service card for the call center
+  // (rule SERVICE_REQUEST_TAG_TO_SLACK). Own format and own dedup; see
+  // src/actions/service-card.js.
+  if (payload.card === 'service') {
+    return await sendServiceCard({ action, context, contactId, name, phone, ghlContact, enrichment });
+  }
+
   // ══════════════════════════════════════════════════════════════════
   // 2026-05-14 v2 — CLASSIFIED vs LEGACY routing
   // ══════════════════════════════════════════════════════════════════
@@ -302,6 +310,12 @@ export async function executeSendNotification(action, context) {
     if (rep.code) marketCode = rep.code;
   }
   if (!marketCode) marketCode = enrichment.marketCode || null;
+  // 2026-09-24 — service cards: a record that lists the Lakeland office goes
+  // to #service-lakeland whatever its market; everyone else keeps their own
+  // market (ORL stays #service-orlando). An explicit market on the rule wins.
+  if (payload.channel === 'service' && !(payload.market || payload.market_code)) {
+    marketCode = await resolveServiceMarketForContact(contactId, ghlContact, marketCode);
+  }
 
   // Rep-facing send — passes contactId for v1.7 debounce consolidation.
   // 2026-07-15 — rules may route to a per-purpose channel ('canvass' →
