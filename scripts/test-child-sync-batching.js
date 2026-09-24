@@ -326,6 +326,15 @@ test('note_origin is still classified at ingest for both AI BRIEF prefixes', asy
   assert.deepEqual(bulkPayload('lp_notes').map(r => r.note_origin), ['lp', 'ghl_ai_brief', 'ghl_ai_brief']);
 });
 
+test('a Revin summary is stamped lp_revin at ingest, so the GHL push skips it', async () => {
+  fresh();
+  await syncNotes(LEAD, CONTACT, [
+    mkNote({ id: 'n1', enteredby: 'Agent, Revin', note: 'Lead confirmed the appointment by text.' }),
+    mkNote({ id: 'n2' }),
+  ]);
+  assert.deepEqual(bulkPayload('lp_notes').map(r => r.note_origin), ['lp_revin', 'lp']);
+});
+
 test('id-less notes sharing a date are deduped rather than colliding in the batch', async () => {
   fresh();
   await syncNotes(LEAD, CONTACT, [
