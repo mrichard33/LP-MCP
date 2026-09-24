@@ -22,7 +22,7 @@ process.env.SUPABASE_SERVICE_ROLE_KEY ||= 'test-key';
 
 const {
   findSendPromise, findUndeliveredSendPromise, undeliveredPromiseNote, validateInfoEmailPayload,
-  resolvePreheader, emailPlainText,
+  resolvePreheader, emailPlainText, withReeceTeamSignOff,
 } = await import('../src/agentic/send-promise.js');
 const {
   buildInfoEmailHtml, decideInfoEmailSend, executeSendInfoEmail,
@@ -92,12 +92,24 @@ test('the regeneration note names the fix, not just the prohibition', () => {
 
 // ── The email payload ────────────────────────────────────────────────
 
-const GOOD_BODY = 'Mark,\n\nShutters protect only when someone puts them up in time. Impact windows are always on, including when you are away.\n\nWe install to current Florida code and document the work.\n\nReece Windows & Doors';
+const GOOD_BODY = 'Mark,\n\nShutters protect only when someone puts them up in time. Impact windows are always on, including when you are away.\n\nWe install to current Florida code and document the work.\n\nReece Team';
 
 test('a good payload survives, trimmed', () => {
   const v = validateInfoEmailPayload({ subject: '  Impact windows vs. shutters  ', body: `  ${GOOD_BODY}  ` });
   assert.equal(v.subject, 'Impact windows vs. shutters');
   assert.equal(v.body, GOOD_BODY);
+});
+
+test('every info email is signed "Reece Team", whatever the model wrote', () => {
+  const core = 'Mark,\n\nImpact windows are always on.\n\nWe install to current Florida code.';
+  assert.match(withReeceTeamSignOff(`${core}\n\nReece Windows & Doors`), /code\.\n\nReece Team$/);
+  assert.doesNotMatch(withReeceTeamSignOff(`${core}\n\nReece Windows & Doors`), /Windows & Doors/);
+  assert.match(withReeceTeamSignOff(`${core}\n\nBest,\nReece Windows & Doors`), /Best,\nReece Team$/);
+  assert.match(withReeceTeamSignOff(`${core}\n\nBest,`), /Best,\nReece Team$/);
+  assert.match(withReeceTeamSignOff(core), /code\.\n\nReece Team$/, 'unsigned → appended');
+  assert.equal(withReeceTeamSignOff(`${core}\n\nReece Team`), `${core}\n\nReece Team`, 'never twice');
+  const v = validateInfoEmailPayload({ subject: 's', body: `${core} More detail for length here.\n\nReece Windows & Doors` });
+  assert.match(v.body, /\n\nReece Team$/);
 });
 
 test('payloads that would reach a customer wrong are dropped', () => {
