@@ -14,9 +14,32 @@
  * a new raw fetch() in a module that talks to GHL either joins the bucket or
  * carries a `// rate-limiter-exempt: <reason>` comment saying why it does not.
  *
+ * ─── GOHIGHLEVEL'S ACTUAL PUBLISHED LIMIT ───────────────────────────────────
+ * https://marketplace.gohighlevel.com/docs/other/rate-limits/
+ *
+ *   BURST  100 requests per 10 SECONDS  = 600/minute
+ *   DAILY  200,000 requests per day
+ *   both per Marketplace app, per resource (Location/Company).
+ *
+ * 2026-09-24 — this file said "conservative under GHL's ~100/min limit" from
+ * v1.0 until today. That is the 10-SECOND burst figure read as a per-MINUTE
+ * one: wrong by 6x, and every default here descended from it.
+ *
+ * What the misreading cost, measured: 159 executor token timeouts in 40
+ * minutes, waits up to 13.0s, the bucket pinned at its reserve — while average
+ * consumption was ~31 calls/min against an 80/min budget (39%) and
+ * `total429s` had been 0 for the life of the process. GoHighLevel was never
+ * the constraint. We were throttling ourselves to a seventh of the real
+ * ceiling and timing out jobs against our own number.
+ *
+ * So: DERIVE from the documented ceiling, never re-guess. GHL_DOCUMENTED_*
+ * below are the published figures; the defaults are a stated fraction of them.
+ * scripts/test-ghl-rate-limiter-budget.js fails if a default escapes the
+ * ceiling — the same guard scripts/test-llm-timeout-budget.js plays for the
+ * LLM budgets, and for the same reason (see CLAUDE.md, "a constant written for
+ * the old model is the recurring bug").
+ *
  * Design:
- *   - Bucket capacity: 40 tokens (conservative under GHL's ~100/min limit)
- *   - Refill rate: 40 tokens per minute (~1 every 1.5 seconds)
  *   - Single global drainer interval (no per-caller intervals)
  *   - Hard timeout on each wait — fail-open after 30s rather than hang, or
  *     after GHL_RATE_PAUSE_WAIT_MS (5s) when the bucket is PAUSED
@@ -24,15 +47,27 @@
  *   - Exponential backoff on consecutive 429s: 1min → 2min → 3min (cap)
  *   - Singleton: one instance shared across the entire process
  *
- * Headroom (env-driven, default 40):
+ * Headroom (env-driven):
  *   GHL_RATE_CAPACITY        — bucket capacity (tokens)
  *   GHL_RATE_REFILL_PER_MIN  — refill rate (tokens/min)
- *   Ramp conservatively: 40 → 50 first, watch /n8n/rate-limiter/stats and keep
- *   total429s and timedOut at 0; hold ~15–30 min, then optionally 50 → 60. Stop
- *   the instant total429s rises — a 429 triggers a 60s full pause (escalating
- *   to 3 min), costlier than the throughput gained. Do not exceed ~60–70
- *   without confirming GHL's per-location sustained limit, which is SHARED with
- *   the HL MCP (both servers draw on the same budget).
+ *
+ *   CAPACITY absorbs bursts; REFILL sets the sustained rate. They do different
+ *   jobs and must move TOGETHER. Capacity below one minute of refill is the
+ *   failure mode we just had: the executor claims a batch, fires N handlers
+ *   concurrently, drains the bucket in seconds, and everything behind it then
+ *   waits on the refill trickle. At capacity 120 / refill 150 a 100-call queue
+ *   takes ~40s to clear — past the 30s wait timeout, so those calls time out
+ *   even though the per-minute average looks healthy. Keep capacity >= refill.
+ *
+ *   The budget is SHARED with the HL MCP (GHL meters per app per location, and
+ *   both servers draw on the same one), so the default takes HALF the
+ *   documented burst ceiling and leaves the other half for HL.
+ *
+ *   Ramping: step, do not jump, and hold each step long enough to see real
+ *   load — `total429s: 0` on a freshly-deployed process is a reset counter,
+ *   not evidence. Stop the instant total429s rises: that is the real working
+ *   ceiling, and it belongs in this comment when found. A 429 costs a 60s full
+ *   pause (escalating to 3 min) — far more than the throughput gained.
  *
  * v1.4 — 2026-09-14 — Coverage + pause economics (GHL 60s client timeouts)
  *   Two defects, one symptom. POST /webhook/ghl/set-lp-appointment was being
@@ -123,11 +158,61 @@
 
 import { recordGhlRequest } from './ghl-shared-budget.js';
 
-// Env-driven (default 40) so headroom can be ramped via Railway env vars
-// without a deploy — see the header note for ramp guidance.
-const BUCKET_CAPACITY = Math.max(1, parseInt(process.env.GHL_RATE_CAPACITY || '40', 10));
-const REFILL_RATE = Math.max(1, parseInt(process.env.GHL_RATE_REFILL_PER_MIN || '40', 10));  // tokens per minute
-const REFILL_INTERVAL_MS = (60 * 1000) / REFILL_RATE;  // ~1500ms per token at 40/min
+/**
+ * GoHighLevel's PUBLISHED ceilings, not our policy.
+ * https://marketplace.gohighlevel.com/docs/other/rate-limits/
+ *
+ * The burst limit is documented per 10 SECONDS. It is expressed here per
+ * MINUTE because that is the unit this limiter works in, and reading the one
+ * as the other is exactly the mistake that shipped in v1.0 (see header).
+ */
+export const GHL_DOCUMENTED_BURST_PER_MIN = 600;   // = 100 requests / 10 seconds
+export const GHL_DOCUMENTED_PER_DAY = 200_000;
+
+/**
+ * The rate the DAILY cap implies if it ran flat out for 24h: 200000/1440 = 138.
+ *
+ * This is the lower of GoHighLevel's two ceilings and the one nobody was
+ * watching. The burst limit (600/min) is only available in bursts; a rate
+ * sustained all day is governed by this number instead.
+ *
+ * NOTHING IN THIS SYSTEM ENFORCES THE DAILY CAP. src/ghl-shared-budget.js
+ * counts per-minute requests but deliberately has no enforce mode, and there
+ * is no daily counter anywhere. Measured real demand is ~13,500 calls/day —
+ * 7% of the cap — so the margin is large, but it is demand keeping us inside
+ * it, not a guard.
+ */
+export const GHL_SUSTAINED_CEILING_PER_MIN = Math.floor(GHL_DOCUMENTED_PER_DAY / (60 * 24));  // 138
+
+/**
+ * Our policy, stated as a FRACTION of the documented ceiling so the
+ * relationship survives the next person to touch it.
+ *
+ * A quarter of the BURST ceiling. Refill governs how fast a queue drains after
+ * a batch empties the bucket — the failure we actually had — not how many
+ * calls we make in a day, which is set by demand (~13,500/day, 7% of the cap).
+ * Capacity equals refill so the bucket always holds a full minute of burst.
+ *
+ * NOTE this sits ABOVE GHL_SUSTAINED_CEILING_PER_MIN (138). That is a
+ * deliberate margin, not an oversight: 150/min held flat out for 24h would be
+ * 216,000 calls and would breach the daily cap. It is safe only because real
+ * demand is ~9 calls/min on average. Anything that could run flat out for
+ * hours — a backfill, a retry storm — must pace itself; the limiter will not
+ * do it, and no daily counter exists to catch it.
+ *
+ * Raising refill further therefore buys queue-drain speed at the cost of that
+ * margin. Do not go past 300 (half the shared burst ceiling) without a daily
+ * guard, and do not raise at all on a freshly-deployed process reporting
+ * total429s 0 — a reset counter has simply not been asked anything yet.
+ */
+export const DEFAULT_REFILL_PER_MIN = Math.floor(GHL_DOCUMENTED_BURST_PER_MIN / 4);  // 150
+export const DEFAULT_CAPACITY = DEFAULT_REFILL_PER_MIN;                              // 150
+
+// Env-driven so headroom can be ramped via Railway without a deploy — see the
+// header note for ramp guidance.
+const BUCKET_CAPACITY = Math.max(1, parseInt(process.env.GHL_RATE_CAPACITY || String(DEFAULT_CAPACITY), 10));
+const REFILL_RATE = Math.max(1, parseInt(process.env.GHL_RATE_REFILL_PER_MIN || String(DEFAULT_REFILL_PER_MIN), 10));  // tokens per minute
+const REFILL_INTERVAL_MS = (60 * 1000) / REFILL_RATE;  // 400ms per token at 150/min
 
 // v1.5 — 2026-09-21 — LEAD INTAKE MUST NOT QUEUE BEHIND BATCH WORK.
 //
@@ -157,7 +242,7 @@ const REFILL_INTERVAL_MS = (60 * 1000) / REFILL_RATE;  // ~1500ms per token at 4
 // an hour, so these tokens sit unused and refill continuously, while the
 // executor keeps capacity-minus-reserve and simply stops a little earlier.
 //
-// Default is 10% of capacity, floor 4 — 12 at the live capacity of 120. Clamped
+// Default is 10% of capacity, floor 4 — 15 at the capacity of 150. Clamped
 // below capacity so a misconfigured reserve can never starve normal callers
 // completely.
 const RESERVE_TOKENS = Math.max(0, Math.min(
