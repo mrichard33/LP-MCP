@@ -328,7 +328,7 @@ function _maybePruneDedupMarks(client) {
  *
  * @returns {Promise<boolean>} true = suppress this send.
  */
-async function _isDuplicateCard(text, channel, opts = {}) {
+export async function _isDuplicateCard(text, channel, opts = {}) {
   const client = opts.client ?? _dedupClientOverride ?? supabase;
   if (!GROUPME_DEDUP_ENABLED) return false;
   if (!client || !text) return false;

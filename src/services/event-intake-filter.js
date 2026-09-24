@@ -308,6 +308,15 @@ const ALLOWED_TAG_ADDED_SUBTYPES = new Set([
   // and consumes the tag. Without this entry the event was dropped at
   // intake and engaged-but-unbooked leads received the guide, then sat.
   'enroll:s2.2-chatbot',            // rule ENROLL_S2_2_FROM_CHATBOT_NO_BOOK
+
+  // ── SERVICE REQUESTS → SLACK (2026-09-24) ──
+  // Applied by the chat widget / live-chat flow when an existing customer
+  // needs service or a person. Consumer: SERVICE_REQUEST_TAG_TO_SLACK, which
+  // posts a plain-English card to #service-<market>. Before this entry both
+  // tags were dropped here (32 events / 3 days), so no service request from
+  // chat ever reached a person.
+  'customer-service-request',       // rule SERVICE_REQUEST_TAG_TO_SLACK
+  'needs-human-followup',           // rule SERVICE_REQUEST_TAG_TO_SLACK
 ]);
 
 /**
