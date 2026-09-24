@@ -307,6 +307,7 @@ import { registerFreshnessRefreshRoutes, startFreshnessRefreshScheduler } from '
 import { registerLinkLeakRoutes, startLinkLeakScheduler } from './jobs/link-leak-monitor.js';
 import { registerP2UnresolvableRoutes, startP2UnresolvableScheduler } from './jobs/p2-unresolvable-monitor.js';
 import { registerTagHygieneRoutes, startTagHygieneScheduler } from './jobs/tag-hygiene-sweep.js';  // 2026-09-22
+import { startOfficePowerRankingScheduler } from './jobs/office-power-ranking.js';  // 2026-09-24
 import { startMissedCallerRecoveryScheduler } from './jobs/missed-caller-recovery.js';  // 2026-09-24
 import { registerCiRoutes } from './ci/routes.js';
 import { startCiWorkerScheduler } from './ci/worker.js';
@@ -2585,6 +2586,7 @@ const server = app.listen(PORT, async () => {
   startLinkLeakScheduler();
   startP2UnresolvableScheduler();
   startTagHygieneScheduler();
+  startOfficePowerRankingScheduler();
   startMissedCallerRecoveryScheduler();
   // Probe ffmpeg, which transcodes Five9's GSM 6.10 recordings to a format a
   // browser can actually play. A CLEAR LOG LINE, NOT A CRASH: without it the
