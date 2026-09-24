@@ -22,12 +22,15 @@ The bot promised emails it had no way to send.
   duplicate of the SMS that announced it. Gated by stop-bot/suppression and
   hard opt-outs; no email on file → operator event; a landed retry never
   resends.
-- **Hybrid delivery** (`INFO_EMAIL_DELIVERY=workflow`, default `direct`) —
-  the checked subject and HTML body are saved on two dedicated contact fields
-  (Info Email Subject / Info Email Body, created by
-  `POST /n8n/info-email/ensure-fields`), then the tag `trigger-send-info`
-  starts GHL workflow U.SEND-AI. Stays `direct` until U.SEND-AI sends those
-  fields instead of writing its own GPT email.
+- **Subject, preheader and body on every info email.** The model now writes
+  a preheader too (a missing one is taken from the body's first sentence).
+  The direct path adds it as the hidden preview line at the top of the HTML.
+- **Webhook delivery** (`INFO_EMAIL_WEBHOOK_URL`; unset = direct) — one POST
+  carries `subject`, `preheader` and `body_html` to a GHL Inbound Webhook
+  workflow that sends them in the branded template. All four live email
+  workflows were checked first; none takes all three from a webhook
+  (U.SEND-AI and I.AI-MAIL are tag-triggered and have GPT write the text; S4.5
+  is the nurture rotation; I.AG-IN has no preheader).
 - **Undelivered-promise guard** (`src/agentic/send-promise.js`) — a reply that
   says something is sent/on its way without carrying `send_info_email` or an
   accepted guide regenerates once; if the retry still promises, it ships with

@@ -10,7 +10,7 @@
  *   - src/agentic/send-promise.js     detect a promise with no delivery; validate the email
  *   - src/actions/handlers/info-email.js  deliver it (gates, dedup, HTML)
  *   - buildUndeliveredPromiseTask     a surviving promise becomes a rep task
- *   - INFO_EMAIL_DELIVERY=workflow    the "Hybrid" path through U.SEND-AI
+ *   - INFO_EMAIL_WEBHOOK_URL          the GHL inbound-webhook path (subject, preheader, body)
  *
  * Run: node --test scripts/test-info-email.js
  */
@@ -25,8 +25,7 @@ const {
 } = await import('../src/agentic/send-promise.js');
 const {
   buildInfoEmailHtml, decideInfoEmailSend, executeSendInfoEmail,
-  resolveInfoEmailDelivery, makeInfoEmailFieldResolver, registerInfoEmailRoutes,
-  INFO_EMAIL_TRIGGER_TAG,
+  resolveInfoEmailDelivery, withPreheader, buildInfoEmailWebhookPayload,
 } = await import('../src/actions/handlers/info-email.js');
 const { buildUndeliveredPromiseTask, INFO_EMAIL_RULE } = await import('../src/send-message-handler.js');
 
@@ -195,115 +194,92 @@ test('a retry that cannot check the thread refuses to resend blind', async () =>
   assert.equal(calls.sent.length, 1);
 });
 
-// ── Hybrid: sending through U.SEND-AI ────────────────────────────────
+// ── Subject, preheader and body, on both paths ───────────────────────
 
-function workflowDeps(opts = {}) {
+test('a missing preheader is filled from the body, skipping the greeting', () => {
+  const v = validateInfoEmailPayload({ subject: 'Impact vs shutters', body: GOOD_BODY });
+  assert.equal(v.preheader, 'Shutters protect only when someone puts them up in time.');
+});
+
+test('a given preheader is kept, trimmed, and capped', () => {
+  assert.equal(validateInfoEmailPayload({ subject: 's', preheader: '  What each one asks of you.  ', body: GOOD_BODY }).preheader,
+    'What each one asks of you.');
+  const long = validateInfoEmailPayload({ subject: 's', preheader: 'word '.repeat(40), body: GOOD_BODY }).preheader;
+  assert.ok(long.length <= 110 && long.endsWith('…'));
+});
+
+test('the preheader is held to the same lines as the body', () => {
+  assert.match(validateInfoEmailPayload({ subject: 's', preheader: 'From $4,000', body: GOOD_BODY }).error, /dollar/);
+  assert.match(validateInfoEmailPayload({ subject: 's', preheader: 'see www.x.com', body: GOOD_BODY }).error, /link/);
+});
+
+test('the direct path puts the preheader first, hidden and escaped', () => {
+  const html = withPreheader('<p>Hi</p>', 'A & B <now>');
+  assert.match(html, /^<div style="display:none;[^"]*">A &amp; B &lt;now&gt;<\/div>\n<p>Hi<\/p>$/);
+  assert.equal(withPreheader('<p>Hi</p>', ''), '<p>Hi</p>');
+});
+
+test('the switch is the webhook URL: set means workflow, unset means direct', () => {
+  assert.equal(resolveInfoEmailDelivery({}), 'direct');
+  assert.equal(resolveInfoEmailDelivery({ INFO_EMAIL_WEBHOOK_URL: '  ' }), 'direct');
+  assert.equal(resolveInfoEmailDelivery({ INFO_EMAIL_WEBHOOK_URL: 'https://services.leadconnectorhq.com/hooks/x' }), 'workflow');
+});
+
+function webhookDeps(opts = {}) {
   const { deps, calls } = fakeDeps(opts);
-  calls.steps = [];
+  calls.posts = [];
   Object.assign(deps, {
     delivery: 'workflow',
-    ensureFields: async () => ({ subject: { id: 'F_SUBJ' }, body: { id: 'F_BODY' } }),
-    writeFields: async (id, cf) => {
-      if (opts.writeThrows) throw new Error('ghl 500');
-      calls.steps.push(['fields', cf]);
-    },
-    removeTag: async (id, tag) => { calls.steps.push(['remove', tag]); },
-    addTag: async (id, tag) => { calls.steps.push(['add', tag]); },
+    postWebhook: async (p) => { if (opts.postThrows) throw new Error('webhook 500'); calls.posts.push(p); },
   });
   return { deps, calls };
 }
 
-test('the switch defaults to direct; only "workflow" turns the workflow on', () => {
-  assert.equal(resolveInfoEmailDelivery({}), 'direct');
-  assert.equal(resolveInfoEmailDelivery({ INFO_EMAIL_DELIVERY: 'Workflow ' }), 'workflow');
-  assert.equal(resolveInfoEmailDelivery({ INFO_EMAIL_DELIVERY: 'yes' }), 'direct');
-});
+const ACTION_PH = { ...ACTION, action_payload: { ...ACTION.action_payload, preheader: 'What each one protects.' } };
 
-test('workflow mode saves the checked text BEFORE adding the trigger tag', async () => {
-  const { deps, calls } = workflowDeps();
-  const r = await executeSendInfoEmail(ACTION, {}, deps);
+test('the webhook carries subject, preheader and body in one request', async () => {
+  const { deps, calls } = webhookDeps();
+  const r = await executeSendInfoEmail(ACTION_PH, {}, deps);
   assert.equal(r.delivery, 'workflow');
   assert.equal(calls.sent.length, 0, 'the direct send must not also fire');
-  assert.deepEqual(calls.steps.map(s => s[0]), ['fields', 'add']);
-  const [, cf] = calls.steps[0];
-  assert.deepEqual(cf[0], { id: 'F_SUBJ', field_value: 'Impact windows vs. shutters' });
-  assert.match(cf[1].field_value, /^<p>Mark,<\/p>/);
-  assert.equal(calls.steps[1][1], INFO_EMAIL_TRIGGER_TAG);
-  assert.equal(calls.events.at(-1).payload.delivery, 'workflow');
+  assert.equal(calls.posts.length, 1);
+  const p = calls.posts[0];
+  assert.equal(p.contact_id, 'BazzY5Ihu2heR4osVlBF');
+  assert.equal(p.email, 'm@example.com');
+  assert.equal(p.subject, 'Impact windows vs. shutters');
+  assert.equal(p.preheader, 'What each one protects.');
+  assert.match(p.body_html, /^<p>Mark,<\/p>/);
+  assert.doesNotMatch(p.body_html, /display:none/, 'the workflow sets the preheader itself');
+  assert.equal(calls.events.at(-1).payload.preheader, 'What each one protects.');
 });
 
-test('a tag left over from last time is removed first, so the workflow fires again', async () => {
-  const { deps, calls } = workflowDeps({ tags: ['Trigger-Send-Info'] });
-  await executeSendInfoEmail(ACTION, {}, deps);
-  assert.deepEqual(calls.steps.map(s => s[0]), ['fields', 'remove', 'add']);
+test('the direct path sends the same preheader inside the HTML', async () => {
+  const { deps, calls } = fakeDeps();
+  await executeSendInfoEmail(ACTION_PH, {}, deps);
+  assert.match(calls.sent[0].html, /^<div style="display:none;[^"]*">What each one protects\.<\/div>/);
 });
 
-test('workflow mode keeps every gate: opt-out, no email, already sent', async () => {
+test('the webhook path keeps every gate: opt-out, no email, already sent', async () => {
   for (const opts of [
     { tags: ['dnc'] },
     { email: null },
     { messages: [{ direction: 'outbound', messageType: 'TYPE_EMAIL', dateAdded: '2026-09-24T00:21:00Z', meta: { email: { subject: 'Impact windows vs. shutters' } } }] },
   ]) {
-    const { deps, calls } = workflowDeps(opts);
-    await executeSendInfoEmail(ACTION, {}, deps);
-    assert.deepEqual(calls.steps, [], `touched GHL for ${JSON.stringify(opts).slice(0, 60)}`);
+    const { deps, calls } = webhookDeps(opts);
+    await executeSendInfoEmail(ACTION_PH, {}, deps);
+    assert.equal(calls.posts.length, 0, `posted for ${JSON.stringify(opts).slice(0, 60)}`);
   }
 });
 
-test('a failed field write adds no tag and fails the action so it retries', async () => {
-  const { deps, calls } = workflowDeps({ writeThrows: true });
-  await assert.rejects(executeSendInfoEmail(ACTION, {}, deps), /ghl 500/);
-  assert.deepEqual(calls.steps, []);
+test('a failed webhook fails the action so the executor retries it', async () => {
+  const { deps } = webhookDeps({ postThrows: true });
+  await assert.rejects(executeSendInfoEmail(ACTION_PH, {}, deps), /webhook 500/);
 });
 
-test('field resolver reuses existing fields and creates only what is missing', async () => {
-  const created = [];
-  const ensure = makeInfoEmailFieldResolver({
-    listFields: async () => [{ id: 'X1', name: 'Info Email Subject', fieldKey: 'contact.info_email_subject' }],
-    createField: async (f) => { created.push(f); return { id: 'X2', fieldKey: 'contact.info_email_body' }; },
-  });
-  const f = await ensure();
-  assert.equal(f.subject.id, 'X1');
-  assert.equal(f.body.id, 'X2');
-  assert.deepEqual(created, [{ name: 'Info Email Body', dataType: 'LARGE_TEXT', model: 'contact' }]);
-  await ensure();
-  assert.equal(created.length, 1, 'a complete result is cached');
-});
-
-test('field resolver never caches a partial result', async () => {
-  let lists = 0;
-  const ensure = makeInfoEmailFieldResolver({
-    listFields: async () => { lists++; return []; },
-    createField: async (f) => (f.name === 'Info Email Body' && lists === 1 ? null : { id: `id-${f.name}` }),
-  });
-  await assert.rejects(ensure(), /could not resolve or create/);
-  const f = await ensure();
-  assert.equal(f.body.id, 'id-Info Email Body');
-  assert.equal(lists, 2);
-});
-
-test('POST /n8n/info-email/ensure-fields rejects an unauthenticated call', async () => {
-  const { default: express } = await import('express');
-  const { makeAuthenticate } = await import('../src/auth.js');
-  let ensured = 0;
-  const ensure = async () => { ensured++; return { subject: { id: 'a', fieldKey: 'contact.info_email_subject' }, body: { id: 'b', fieldKey: 'contact.info_email_body' } }; };
-  for (const [auth, header, want] of [
-    [makeAuthenticate({ token: 'tok', log: () => {} }), null, 401],
-    [undefined, 'Bearer tok', 401],
-    [makeAuthenticate({ token: 'tok', log: () => {} }), 'Bearer tok', 200],
-  ]) {
-    const app = express();
-    registerInfoEmailRoutes(app, auth, { ensure });
-    const server = await new Promise(r => { const s = app.listen(0, '127.0.0.1', () => r(s)); });
-    try {
-      const res = await fetch(`http://127.0.0.1:${server.address().port}/n8n/info-email/ensure-fields`, {
-        method: 'POST', headers: header ? { Authorization: header } : {},
-      });
-      assert.equal(res.status, want);
-      if (want === 200) assert.equal((await res.json()).merge_tags.body, '{{contact.info_email_body}}');
-    } finally { await new Promise(r => server.close(r)); }
-  }
-  assert.equal(ensured, 1, 'only the authenticated call may create fields');
+test('the webhook payload is exactly the fields the workflow maps', () => {
+  const p = buildInfoEmailWebhookPayload({ contactId: 'c1', email: 'e@x.com', subject: 's', preheader: 'p', body: 'Hi\n\nThere', actionId: 5 });
+  assert.deepEqual(Object.keys(p).sort(), ['action_id', 'body_html', 'body_text', 'contact_id', 'email', 'preheader', 'source', 'subject']);
+  assert.equal(p.body_html, '<p>Hi</p>\n<p>There</p>');
 });
 
 // ── A promise that survives becomes a person's job ───────────────────

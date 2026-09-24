@@ -2092,7 +2092,7 @@ function validateSendInfoEmailCompanion(cap, ca) {
   }
   return {
     action_type: 'send_info_email',
-    action_payload: { subject: v.subject, body: v.body },
+    action_payload: { subject: v.subject, preheader: v.preheader, body: v.body },
     reasoning: typeof ca.reasoning === 'string' ? ca.reasoning.slice(0, 500) : null,
   };
 }

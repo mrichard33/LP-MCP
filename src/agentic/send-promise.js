@@ -105,6 +105,7 @@ export function undeliveredPromiseNote(promise) {
 
 export const INFO_EMAIL_LIMITS = Object.freeze({
   subjectMax: 120,
+  preheaderMax: 110,
   bodyMin: 60,
   bodyMax: 3500,
 });
@@ -115,8 +116,12 @@ export const INFO_EMAIL_LIMITS = Object.freeze({
  * verbatim, so it is held to the same hard lines as a reply: no prices, no
  * links the model could have invented, no unrendered merge tags.
  *
+ * Every email carries a subject, a preheader and a body (Mark, 2026-09-24).
+ * A missing preheader is filled from the body's first sentence rather than
+ * dropping an email the lead was already told is coming.
+ *
  * @param {object} cap action_payload
- * @returns {{subject: string, body: string} | {error: string}}
+ * @returns {{subject: string, preheader: string, body: string} | {error: string}}
  */
 export function validateInfoEmailPayload(cap) {
   const subject = typeof cap?.subject === 'string' ? cap.subject.replace(/\s+/g, ' ').trim() : '';
@@ -125,9 +130,22 @@ export function validateInfoEmailPayload(cap) {
   if (subject.length > INFO_EMAIL_LIMITS.subjectMax) return { error: `subject over ${INFO_EMAIL_LIMITS.subjectMax} chars` };
   if (body.length < INFO_EMAIL_LIMITS.bodyMin) return { error: `body under ${INFO_EMAIL_LIMITS.bodyMin} chars` };
   if (body.length > INFO_EMAIL_LIMITS.bodyMax) return { error: `body over ${INFO_EMAIL_LIMITS.bodyMax} chars` };
-  const all = `${subject}\n${body}`;
+  let preheader = typeof cap?.preheader === 'string' ? cap.preheader.replace(/\s+/g, ' ').trim() : '';
+  if (!preheader) preheader = firstSentence(body.split(/\n{2,}/).slice(1).join(' ') || body);
+  if (preheader.length > INFO_EMAIL_LIMITS.preheaderMax) {
+    preheader = `${preheader.slice(0, INFO_EMAIL_LIMITS.preheaderMax - 1).replace(/\s+\S*$/, '')}…`;
+  }
+  const all = `${subject}\n${preheader}\n${body}`;
   if (/\{\{|\}\}/.test(all)) return { error: 'unrendered merge tag' };
   if (/https?:\/\/|www\./i.test(all)) return { error: 'contains a link (the model cannot know real URLs)' };
   if (/\$\s?\d/.test(all)) return { error: 'contains a dollar figure (no pricing by email either)' };
-  return { subject, body };
+  return { subject, preheader, body };
+}
+
+// The first sentence, whitespace collapsed. Used for a missing preheader; the
+// greeting paragraph ("Mark,") is skipped by the caller.
+function firstSentence(text) {
+  const t = String(text || '').replace(/\s+/g, ' ').trim();
+  const m = t.match(/^.*?[.!?](?=\s|$)/);
+  return (m ? m[0] : t).trim();
 }
