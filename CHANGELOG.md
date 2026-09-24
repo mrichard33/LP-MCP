@@ -22,6 +22,9 @@ asked where it was.
   thread). A stated reason is routed by the existing objection rules; "not
   interested" itself stays on the cooling track (rule 297, the 2026-06-17
   decline ruling). O.0 has no not-interested branch.
+- **Info emails are signed "Reece Team"** (Mark). The prompt asks for it and
+  `withReeceTeamSignOff` enforces it after the safety checks run on the
+  model's own text, so a replaced last line can never hide a link or price.
 - **Preview line on every bot email reply.** Normal email replies had none;
   the inbox showed the body's first words. The model now writes `preheader`,
   and `sendWithFallback` adds it (or the body's first sentence) as the hidden

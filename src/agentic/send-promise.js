@@ -125,17 +125,44 @@ export const INFO_EMAIL_LIMITS = Object.freeze({
  */
 export function validateInfoEmailPayload(cap) {
   const subject = typeof cap?.subject === 'string' ? cap.subject.replace(/\s+/g, ' ').trim() : '';
-  const body = typeof cap?.body === 'string' ? cap.body.replace(/\r\n/g, '\n').trim() : '';
+  const rawBody = typeof cap?.body === 'string' ? cap.body.replace(/\r\n/g, '\n').trim() : '';
   if (!subject) return { error: 'missing subject' };
   if (subject.length > INFO_EMAIL_LIMITS.subjectMax) return { error: `subject over ${INFO_EMAIL_LIMITS.subjectMax} chars` };
-  if (body.length < INFO_EMAIL_LIMITS.bodyMin) return { error: `body under ${INFO_EMAIL_LIMITS.bodyMin} chars` };
-  if (body.length > INFO_EMAIL_LIMITS.bodyMax) return { error: `body over ${INFO_EMAIL_LIMITS.bodyMax} chars` };
-  const preheader = resolvePreheader(cap?.preheader, body);
-  const all = `${subject}\n${preheader}\n${body}`;
+  if (rawBody.length < INFO_EMAIL_LIMITS.bodyMin) return { error: `body under ${INFO_EMAIL_LIMITS.bodyMin} chars` };
+  if (rawBody.length > INFO_EMAIL_LIMITS.bodyMax) return { error: `body over ${INFO_EMAIL_LIMITS.bodyMax} chars` };
+  const preheader = resolvePreheader(cap?.preheader, rawBody);
+  // Checks run on what the MODEL wrote, before the sign-off is applied: the
+  // sign-off swap replaces a short last line, and that line must never be
+  // able to hide a link or a price from these checks.
+  const all = `${subject}\n${preheader}\n${rawBody}`;
   if (/\{\{|\}\}/.test(all)) return { error: 'unrendered merge tag' };
   if (/https?:\/\/|www\./i.test(all)) return { error: 'contains a link (the model cannot know real URLs)' };
   if (/\$\s?\d/.test(all)) return { error: 'contains a dollar figure (no pricing by email either)' };
-  return { subject, preheader, body };
+  return { subject, preheader, body: withReeceTeamSignOff(rawBody) };
+}
+
+/**
+ * Every info email is signed "Reece Team" (Mark, 2026-09-24). The prompt asks
+ * for it; this makes it true whatever the model wrote. A short last line that
+ * is not a sentence ("Reece Windows & Doors", "— Mark") is taken as the
+ * model's signature and replaced; otherwise the sign-off is appended.
+ */
+export const INFO_EMAIL_SIGN_OFF = 'Reece Team';
+
+export function withReeceTeamSignOff(body) {
+  const text = String(body || '').trim();
+  if (!text) return text;
+  const lines = text.split('\n');
+  const last = lines[lines.length - 1].trim();
+  if (last === INFO_EMAIL_SIGN_OFF) return text;
+  const looksLikeSignature = last.length <= 40 && !/[.?!]$/.test(last) && !/^(best|thanks|thank you|regards|sincerely|cheers|warmly)\b.*,$/i.test(last);
+  if (looksLikeSignature) {
+    lines[lines.length - 1] = INFO_EMAIL_SIGN_OFF;
+    return lines.join('\n');
+  }
+  // "Best," alone on the last line: keep it, sign under it.
+  if (/,$/.test(last) && last.length <= 20) return `${text}\n${INFO_EMAIL_SIGN_OFF}`;
+  return `${text}\n\n${INFO_EMAIL_SIGN_OFF}`;
 }
 
 /**
