@@ -7,7 +7,20 @@ repo — they are recorded in `sql/seeds/` on the date they were applied live.
 
 ## 2026-09-24
 
-The bot promised emails it had no way to send.
+The bot promised emails it had no way to send, and went quiet on the lead who
+asked where it was.
+
+- **Only an opt-out silences the bot** (Mark). Every classifier handoff used to
+  be silent; of the 11 live classes only STOP is an opt-out. Now
+  (`src/agentic/handoff-policy.js`): STOP and WRONG_NUMBER stay silent; the
+  two callback tags a GHL workflow answers stay with the workflow; everything
+  else (ANGRY, FULFILLMENT_NOT_RECEIVED, WHO_IS_THIS, MOVED, RENTER, MOBILE)
+  still tags the contact AND gets a reply written for that moment. Only ANGRY
+  and FULFILLMENT_NOT_RECEIVED still page a person ("HUMAN FOLLOW-UP NEEDED").
+- **Missed-reply opt-out rule narrowed** (DB, `sql/seeds/2026-09-24_optout_only_stops_bot.sql`,
+  applied live) — "not interested" no longer applies stop-bot; it gets the
+  recovery reply. The "signed with another company" rule already keeps the
+  bot on (v4, 2026-09-09).
 
 - **Incident** — GHL BazzY5Ihu2heR4osVlBF (Mark Test): "Want us to send a
   quick comparison…?" → "Sure" → "Sending that comparison to <email> now".

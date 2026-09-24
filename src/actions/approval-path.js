@@ -856,6 +856,18 @@ export async function processApprovalQueue() {
           inlineHandoffs += completedCount > 0 ? 1 : 0;
           inlineHandoffApplied = true;
         } else {
+          // 2026-09-24 — a handoff the bot still answers (handoff-policy.js):
+          // the reply goes to the approval card below like any other, and the
+          // handoff tag goes on now. No separate alert: a person is already
+          // reviewing this card.
+          if (generated.handoff) {
+            const h = generated.handoff;
+            const handoffTags = [h.handoff_tag, h.is_disqualifier ? 'suppress-automation' : null].filter(Boolean);
+            if (handoffTags.length) {
+              await applyContactTagsInline(sendAction.target_id, handoffTags)
+                .catch(err => console.warn(`[ActionExecutor] handoff tag failed for ${sendAction.target_id} (fail-soft): ${err.message}`));
+            }
+          }
           const updatedPayload = {
             ...sendAction.action_payload,
             message: generated.message,

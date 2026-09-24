@@ -256,6 +256,7 @@
 
 import { buildLeadContext } from './context-builder.js';
 import { classifyInbound, isShortCircuit } from './knowledge/intent-classifier.js';
+import { handoffReplyPolicy, handoffReplyNote } from './agentic/handoff-policy.js';
 import {
   buildKbPack,
   prewarmQueryEmbedding,
@@ -3039,10 +3040,23 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     };
   }
 
+  // 2026-09-24 (Mark): the bot never goes quiet except on an opt-out. A
+  // handoff still tags the contact and alerts a person, but unless it is an
+  // opt-out or a GHL workflow answers the tag, the bot replies as well. See
+  // src/agentic/handoff-policy.js. The send handler applies the tag and the
+  // alert from `handoff` on the result.
+  let handoff = null;
   if (isShortCircuit(classification)) {
-    console.log(`[ResponseGenerator] SHORT-CIRCUIT for ${contactId}: ${classification.intent_class} → ${classification.ghl_handoff_tag} (${classification.classification_method})`);
-    return makeShortCircuitResult(classification, channel, triggerMessage);
+    const policy = handoffReplyPolicy(classification);
+    if (policy !== 'reply') {
+      console.log(`[ResponseGenerator] SHORT-CIRCUIT (${policy}) for ${contactId}: ${classification.intent_class} → ${classification.ghl_handoff_tag} (${classification.classification_method})`);
+      return makeShortCircuitResult(classification, channel, triggerMessage);
+    }
+    handoff = makeShortCircuitResult(classification, channel, triggerMessage);
+    console.log(`[ResponseGenerator] HANDOFF + REPLY for ${contactId}: ${classification.intent_class} → ${classification.ghl_handoff_tag} (${classification.classification_method})`);
   }
+  const promptHint = [opts.promptHint, handoff ? handoffReplyNote(classification.intent_class) : null]
+    .filter(Boolean).join('\n\n') || null;
 
   const buyerStage    = inferBuyerStage(context);
   const fastTrack     = isHyperactiveBuyer(context);
@@ -3370,7 +3384,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       // 2026-07-06 — prompt_hint plumb (Bot 2/3/4 consolidation): approved
       // script from the matched agent_rule / layer3 dispatch row. Anchors the
       // reply via the SCRIPT DIRECTIVE block in buildResponsePrompt.
-      promptHint: opts.promptHint || null,
+      promptHint,
       // Quality Pass v1.0: regeneration instruction (Items 1b/1c) and the
       // analyzer's call purpose (Item 5 — purpose-specific call framing).
       regenerationNote: opts.regenerationNote || null,
@@ -3806,6 +3820,9 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
 
   return {
     short_circuit: false,
+    // Present when a handoff fired and the bot replies anyway. The send
+    // handler applies its tag and alert.
+    handoff,
     intent_class: classification.intent_class,
     classifier_confidence: classification.confidence,
     classification_method: classification.classification_method,

@@ -87,6 +87,8 @@ export function ghlConversationLink(contactId, conversationId = null) {
  * @param {string} [args.handoffTag]
  * @param {string} [args.lastInbound]      the lead's last message
  * @param {string} [args.conversationId]   GHL conversation id, when known
+ * @param {boolean} [args.botReplied]      the bot answered too (2026-09-24);
+ *                                         a person still has to follow up
  * @returns {object} action_payload
  */
 export function buildHumanHandoffAlertPayload({
@@ -96,10 +98,28 @@ export function buildHumanHandoffAlertPayload({
   handoffTag = null,
   lastInbound = '',
   conversationId = null,
+  botReplied = false,
 } = {}) {
   const inbound = String(lastInbound || '').replace(/\s+/g, ' ').trim().slice(0, 200);
   const intent = intentClass || 'unknown';
   const handler = handlerCode ? ` / ${handlerCode}` : '';
+
+  if (botReplied) {
+    return {
+      notification_class: 'priority',
+      action_verb: 'HUMAN FOLLOW-UP NEEDED',
+      tier: 'Imminent',
+      status: `Bot acknowledged; a person must follow up (${intent})`,
+      act_within: '1 hour',
+      narrative:
+        `The bot answered this lead, but it needs a person — intent ${intent}${handler}` +
+        `${handoffTag ? `, tag ${handoffTag}` : ''}. ` +
+        (inbound ? `They last said: "${inbound}". ` : '') +
+        `Follow up here: ${ghlConversationLink(contactId, conversationId)}`,
+      flush_now: true,
+      cooldown_minutes: HANDOFF_ALERT_COOLDOWN_MINUTES,
+    };
+  }
 
   const narrative =
     `The bot stopped replying and handed this lead to a person — intent ${intent}${handler}` +

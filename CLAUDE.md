@@ -83,6 +83,12 @@ GHL Inbound Webhook workflow. Every email needs all three (Mark, 2026-09-24). Po
 workflow that sends those fields unchanged. A workflow with a ChatGPT step rewriting the text (as
 U.SEND-AI and I.AI-MAIL do today) skips every check in `src/actions/handlers/info-email.js`.
 
+**Only an opt-out silences the bot (Mark, 2026-09-24).** A classifier handoff tags the contact and,
+where a person must act, pages one — and the bot still replies, unless `handoffReplyPolicy`
+(`src/agentic/handoff-policy.js`) says `silent` (STOP, WRONG_NUMBER) or `workflow` (a GHL workflow
+answers the tag). A new handoff class replies by default. Do not add a silent class without Mark's
+ruling, and never add `stop-bot` to a rule whose trigger is not an opt-out.
+
 ## Alerting
 
 Alert modules are **pure and dependency-free** so they unit-test without importing supabase, GroupMe

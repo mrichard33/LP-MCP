@@ -286,6 +286,7 @@ import {
   handoffNeedsHumanAlert,
   HANDOFF_ALERT_RULE,
 } from './human-handoff-alert.js';
+import { HUMAN_FOLLOW_UP_INTENTS } from './agentic/handoff-policy.js';
 import { bumpContactCache } from './context-builder.js';
 // v3.6: rich GroupMe notification — same helpers used by tasks v2.0 +
 // notifications handlers, so all four GroupMe surfaces share one format.
@@ -1991,8 +1992,13 @@ async function handleShortCircuit(contactId, generated, action, context, opts = 
   // Queue ONE action-required alert on exactly those, deduped per contact per
   // 30 minutes by the send_notification cooldown. Fail-soft: the tag write has
   // already happened and must not be undone by a Supabase hiccup here.
+  // 2026-09-24 — when the bot replies after the handoff (handoff-policy.js),
+  // only the handoffs a person must act on still page: an upset lead asking
+  // for a manager, and a promise we did not keep. The rest the reply handles.
+  const botReplies = !!opts.botReplies;
   let humanAlertQueued = false;
-  if (!opts.dryRun && handoffNeedsHumanAlert(handoffTag)) {
+  if (!opts.dryRun && handoffNeedsHumanAlert(handoffTag) &&
+      (!botReplies || HUMAN_FOLLOW_UP_INTENTS.has(generated.intent_class))) {
     try {
       const { error: alertErr } = await supabase.from('agent_actions').insert({
         event_id: action.event_id || null,
@@ -2007,11 +2013,14 @@ async function handleShortCircuit(contactId, generated, action, context, opts = 
           handoffTag,
           lastInbound: generated.trigger_message_preview || context?.trigger_message || '',
           conversationId: context?.conversation_id || action?.action_payload?.conversation_id || null,
+          botReplied: botReplies,
         }),
         reasoning:
-          `Silent human handoff (${generated.intent_class || 'unknown'}${generated.handler_code ? `/${generated.handler_code}` : ''}` +
-          `${handoffTag ? `, ${handoffTag}` : ''}) — the bot sent nothing and no GHL workflow answers this tag. ` +
-          `A person has to reply.`,
+          `${botReplies ? 'Human follow-up' : 'Silent human handoff'} (${generated.intent_class || 'unknown'}${generated.handler_code ? `/${generated.handler_code}` : ''}` +
+          `${handoffTag ? `, ${handoffTag}` : ''}) — ` +
+          (botReplies
+            ? 'the bot acknowledged the lead, and a person has to follow up.'
+            : 'the bot sent nothing and no GHL workflow answers this tag. A person has to reply.'),
         confidence: 1.0,
         rule_applied: HANDOFF_ALERT_RULE,
         status: 'pending',
@@ -2034,7 +2043,7 @@ async function handleShortCircuit(contactId, generated, action, context, opts = 
     `Method: ${generated.classification_method || 'unknown'} (${(generated.classifier_confidence || 0).toFixed(2)})\n` +
     (callbackBasis ? `Callback basis: ${callbackBasis}\n` : '') +
     `Inbound: "${preview}"\n` +
-    `→ GHL workflow on tag now owns the response.`
+    (botReplies ? `→ The bot is replying to the lead too.` : `→ GHL workflow on tag now owns the response.`)
   ).catch(err => {
     console.warn(`[SendMessage] GroupMe (short-circuit) failed: ${err.message}`);
   });
@@ -3154,6 +3163,15 @@ export async function executeSendMessage(action, context) {
           await new Promise(r => setTimeout(r, 1500)); // brief backoff before retry
         }
       }
+    }
+
+    // 2026-09-24 — a handoff the bot also answers (handoff-policy.js): apply
+    // the handoff tag, card and, where a person must act, the alert, then
+    // carry on and send the reply. Fail-soft: the reply matters more.
+    if (!generationErr && generated?.handoff) {
+      await handleShortCircuit(contactId, generated.handoff, action, context, {
+        channel, replyContext, tags, botReplies: true,
+      }).catch(err => console.warn(`[SendMessage] handoff side effects failed for ${contactId} (fail-soft): ${err.message}`));
     }
 
     // If generation failed after all retries, use the channel-appropriate safe
