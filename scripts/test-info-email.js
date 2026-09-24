@@ -10,6 +10,7 @@
  *   - src/agentic/send-promise.js     detect a promise with no delivery; validate the email
  *   - src/actions/handlers/info-email.js  deliver it (gates, dedup, HTML)
  *   - buildUndeliveredPromiseTask     a surviving promise becomes a rep task
+ *   - INFO_EMAIL_DELIVERY=workflow    the "Hybrid" path through U.SEND-AI
  *
  * Run: node --test scripts/test-info-email.js
  */
@@ -24,6 +25,8 @@ const {
 } = await import('../src/agentic/send-promise.js');
 const {
   buildInfoEmailHtml, decideInfoEmailSend, executeSendInfoEmail,
+  resolveInfoEmailDelivery, makeInfoEmailFieldResolver, registerInfoEmailRoutes,
+  INFO_EMAIL_TRIGGER_TAG,
 } = await import('../src/actions/handlers/info-email.js');
 const { buildUndeliveredPromiseTask, INFO_EMAIL_RULE } = await import('../src/send-message-handler.js');
 
@@ -190,6 +193,117 @@ test('a retry that cannot check the thread refuses to resend blind', async () =>
   // A first attempt cannot have landed yet, so it goes out.
   await executeSendInfoEmail(ACTION, {}, deps);
   assert.equal(calls.sent.length, 1);
+});
+
+// ── Hybrid: sending through U.SEND-AI ────────────────────────────────
+
+function workflowDeps(opts = {}) {
+  const { deps, calls } = fakeDeps(opts);
+  calls.steps = [];
+  Object.assign(deps, {
+    delivery: 'workflow',
+    ensureFields: async () => ({ subject: { id: 'F_SUBJ' }, body: { id: 'F_BODY' } }),
+    writeFields: async (id, cf) => {
+      if (opts.writeThrows) throw new Error('ghl 500');
+      calls.steps.push(['fields', cf]);
+    },
+    removeTag: async (id, tag) => { calls.steps.push(['remove', tag]); },
+    addTag: async (id, tag) => { calls.steps.push(['add', tag]); },
+  });
+  return { deps, calls };
+}
+
+test('the switch defaults to direct; only "workflow" turns the workflow on', () => {
+  assert.equal(resolveInfoEmailDelivery({}), 'direct');
+  assert.equal(resolveInfoEmailDelivery({ INFO_EMAIL_DELIVERY: 'Workflow ' }), 'workflow');
+  assert.equal(resolveInfoEmailDelivery({ INFO_EMAIL_DELIVERY: 'yes' }), 'direct');
+});
+
+test('workflow mode saves the checked text BEFORE adding the trigger tag', async () => {
+  const { deps, calls } = workflowDeps();
+  const r = await executeSendInfoEmail(ACTION, {}, deps);
+  assert.equal(r.delivery, 'workflow');
+  assert.equal(calls.sent.length, 0, 'the direct send must not also fire');
+  assert.deepEqual(calls.steps.map(s => s[0]), ['fields', 'add']);
+  const [, cf] = calls.steps[0];
+  assert.deepEqual(cf[0], { id: 'F_SUBJ', field_value: 'Impact windows vs. shutters' });
+  assert.match(cf[1].field_value, /^<p>Mark,<\/p>/);
+  assert.equal(calls.steps[1][1], INFO_EMAIL_TRIGGER_TAG);
+  assert.equal(calls.events.at(-1).payload.delivery, 'workflow');
+});
+
+test('a tag left over from last time is removed first, so the workflow fires again', async () => {
+  const { deps, calls } = workflowDeps({ tags: ['Trigger-Send-Info'] });
+  await executeSendInfoEmail(ACTION, {}, deps);
+  assert.deepEqual(calls.steps.map(s => s[0]), ['fields', 'remove', 'add']);
+});
+
+test('workflow mode keeps every gate: opt-out, no email, already sent', async () => {
+  for (const opts of [
+    { tags: ['dnc'] },
+    { email: null },
+    { messages: [{ direction: 'outbound', messageType: 'TYPE_EMAIL', dateAdded: '2026-09-24T00:21:00Z', meta: { email: { subject: 'Impact windows vs. shutters' } } }] },
+  ]) {
+    const { deps, calls } = workflowDeps(opts);
+    await executeSendInfoEmail(ACTION, {}, deps);
+    assert.deepEqual(calls.steps, [], `touched GHL for ${JSON.stringify(opts).slice(0, 60)}`);
+  }
+});
+
+test('a failed field write adds no tag and fails the action so it retries', async () => {
+  const { deps, calls } = workflowDeps({ writeThrows: true });
+  await assert.rejects(executeSendInfoEmail(ACTION, {}, deps), /ghl 500/);
+  assert.deepEqual(calls.steps, []);
+});
+
+test('field resolver reuses existing fields and creates only what is missing', async () => {
+  const created = [];
+  const ensure = makeInfoEmailFieldResolver({
+    listFields: async () => [{ id: 'X1', name: 'Info Email Subject', fieldKey: 'contact.info_email_subject' }],
+    createField: async (f) => { created.push(f); return { id: 'X2', fieldKey: 'contact.info_email_body' }; },
+  });
+  const f = await ensure();
+  assert.equal(f.subject.id, 'X1');
+  assert.equal(f.body.id, 'X2');
+  assert.deepEqual(created, [{ name: 'Info Email Body', dataType: 'LARGE_TEXT', model: 'contact' }]);
+  await ensure();
+  assert.equal(created.length, 1, 'a complete result is cached');
+});
+
+test('field resolver never caches a partial result', async () => {
+  let lists = 0;
+  const ensure = makeInfoEmailFieldResolver({
+    listFields: async () => { lists++; return []; },
+    createField: async (f) => (f.name === 'Info Email Body' && lists === 1 ? null : { id: `id-${f.name}` }),
+  });
+  await assert.rejects(ensure(), /could not resolve or create/);
+  const f = await ensure();
+  assert.equal(f.body.id, 'id-Info Email Body');
+  assert.equal(lists, 2);
+});
+
+test('POST /n8n/info-email/ensure-fields rejects an unauthenticated call', async () => {
+  const { default: express } = await import('express');
+  const { makeAuthenticate } = await import('../src/auth.js');
+  let ensured = 0;
+  const ensure = async () => { ensured++; return { subject: { id: 'a', fieldKey: 'contact.info_email_subject' }, body: { id: 'b', fieldKey: 'contact.info_email_body' } }; };
+  for (const [auth, header, want] of [
+    [makeAuthenticate({ token: 'tok', log: () => {} }), null, 401],
+    [undefined, 'Bearer tok', 401],
+    [makeAuthenticate({ token: 'tok', log: () => {} }), 'Bearer tok', 200],
+  ]) {
+    const app = express();
+    registerInfoEmailRoutes(app, auth, { ensure });
+    const server = await new Promise(r => { const s = app.listen(0, '127.0.0.1', () => r(s)); });
+    try {
+      const res = await fetch(`http://127.0.0.1:${server.address().port}/n8n/info-email/ensure-fields`, {
+        method: 'POST', headers: header ? { Authorization: header } : {},
+      });
+      assert.equal(res.status, want);
+      if (want === 200) assert.equal((await res.json()).merge_tags.body, '{{contact.info_email_body}}');
+    } finally { await new Promise(r => server.close(r)); }
+  }
+  assert.equal(ensured, 1, 'only the authenticated call may create fields');
 });
 
 // ── A promise that survives becomes a person's job ───────────────────

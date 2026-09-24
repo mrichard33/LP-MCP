@@ -77,6 +77,13 @@ exactly what the rulebook's comparison rule forbids. `isCelebratableClimb` requi
 be in the top third of the field (floor of 3), and suppresses the climb outright when the field size
 is unknown. Do not relax that to "any improvement".
 
+**Info emails the bot promised go out through ONE switch, `INFO_EMAIL_DELIVERY`.** `direct` (the
+default) sends through the Conversations API. `workflow` saves the checked subject and body on the
+contact fields Info Email Subject / Info Email Body, then adds `trigger-send-info`, which starts GHL
+workflow U.SEND-AI. Never set `workflow` while U.SEND-AI still has its ChatGPT step writing the body:
+that text skips every check in `src/actions/handlers/info-email.js` and `validateInfoEmailPayload`.
+Do not reuse the S4.5 AI Email Subject/Body Draft fields for this — every nurture cycle rewrites them.
+
 ## Alerting
 
 Alert modules are **pure and dependency-free** so they unit-test without importing supabase, GroupMe

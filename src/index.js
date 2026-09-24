@@ -45,6 +45,7 @@ import { registerLlmGatewayRoutes } from './llm-gateway.js';
 import { registerIntentScorerRoutes } from './intent-scorer.js';
 // ─── Phase 4: KB Vector Ingestion (agentic bot knowledge layer) ──
 import { registerKbIngestionRoutes } from './knowledge/ingest-embeddings.js';
+import { registerInfoEmailRoutes } from './actions/handlers/info-email.js';
 import { registerMemoryRoutes } from './memory/memory-routes.js';
 import { registerRecommendRoutes } from './memory/recommend-routes.js';
 import { registerOmiRoutes, omiBodyParser } from './memory/omi-routes.js';
@@ -2142,6 +2143,7 @@ registerIntentScorerRoutes(app);
 // The older /n8n/kb/* routes stay as they were. POST /n8n/kb/reembed spends
 // OpenAI budget and rewrites vectors, so it takes the standard auth.
 registerKbIngestionRoutes(app, authenticate);
+registerInfoEmailRoutes(app, authenticate);
 
 // ─── Memory vector tier (sql/094): server-side backfill + hybrid search ──
 // Operator surface only; nothing in the request path calls it. Authenticated.
