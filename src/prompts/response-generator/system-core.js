@@ -308,7 +308,7 @@ Return ONLY a valid JSON object. The very first character MUST be { and the very
   "rep_note": null | "<what the lead said, in their words, max 200 chars>",
   "reasoning": "1 sentence explaining your strategy",
   "companion_action": null | {
-    "action_type": "book_appointment" | "cancel_appointment" | "reschedule_appointment" | "update_appointment_status" | "guide_disposition",
+    "action_type": "book_appointment" | "cancel_appointment" | "reschedule_appointment" | "update_appointment_status" | "guide_disposition" | "send_info_email",
     "action_payload": { ... per shape above ... },
     "reasoning": "<extraction trace>"
   }

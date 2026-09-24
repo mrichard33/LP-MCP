@@ -1902,6 +1902,18 @@ async function sendWithFallback(contactId, message, channel, subject, action, op
   throw new Error('Conv API failed and no webhook URL configured');
 }
 
+/**
+ * 2026-09-24 — email a deliverable (send_info_email) through the same routing
+ * agentic email replies use: Conversations API first, the "Send Reply"
+ * inbound-webhook workflow as the fallback. Deliberately NOT executeSendMessage:
+ * that path is built for replies (reply locks, supersession, staleness
+ * regeneration) and would drop or rewrite a deliverable the lead was already
+ * told is on its way. See src/actions/handlers/info-email.js.
+ */
+export async function sendAgenticEmail(contactId, html, subject, action) {
+  return sendWithFallback(contactId, html, 'email', subject, action);
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // COMPLIANCE GATE SHORT-CIRCUIT
 // ═══════════════════════════════════════════════════════════════════
@@ -2244,7 +2256,44 @@ const COMPANION_AUTO_EXECUTE = new Set([
   'book_appointment',
   'cancel_appointment',
   'reschedule_appointment',
+  // 2026-09-24 — the information email the reply just told the lead is on
+  // its way. The body is written by the model and validated in
+  // response-generator (validateInfoEmailPayload); src/actions/handlers/
+  // info-email.js delivers it. Auto-executes because the lead ASKED for it
+  // this turn — holding it for approval would make the SMS a lie again.
+  'send_info_email',
 ]);
+
+// Rule name on the queued email, so info emails are countable on their own
+// rather than disappearing into the reply rule that produced them.
+export const INFO_EMAIL_RULE = 'AGENTIC_INFO_EMAIL';
+
+/**
+ * The rep task for a promise the bot made and could not keep. Pure; exported
+ * for tests.
+ */
+export function buildUndeliveredPromiseTask({ contactId, eventId = null, promise }) {
+  return {
+    event_id: eventId || null,
+    action_type: 'create_task',
+    target_system: 'ghl',
+    target_entity: 'contact',
+    target_id: contactId,
+    action_payload: {
+      title: 'Bot promised {{contact_name}} something by email — nothing was sent',
+      description:
+        `The bot told the lead: "${String(promise).slice(0, 300)}". No email was queued. ` +
+        'Send what was promised (or correct it) and reply in the thread so they are not left waiting.',
+      due_in_hours: 2,
+      priority: 'high',
+    },
+    reasoning: 'Undelivered send promise survived regeneration (src/agentic/send-promise.js)',
+    confidence: 1.0,
+    rule_applied: 'UNDELIVERED_PROMISE_ALERT',
+    status: 'pending',
+    requires_approval: false,
+  };
+}
 
 // ═══════════════════════════════════════════════════════════════════
 // INLINE BOOKING (2026-08-13) — book before we promise
@@ -2432,7 +2481,9 @@ async function insertCompanionAction(parentAction, generated, callPurpose = null
   // genuinely runs first and seq reflects that. cancel has always run first.
   // reschedule keeps v4.10's parentSeq + 2 — it is not on the inline path.
   const seqAfterSend = (ctype === 'reschedule_appointment');
-  const companionSeqOrder = seqAfterSend ? parentSeq + 2 : parentSeq - 1;
+  // send_info_email runs after the SMS that announces it, never before.
+  const companionSeqOrder = ctype === 'send_info_email' ? parentSeq + 1
+    : seqAfterSend ? parentSeq + 2 : parentSeq - 1;
 
   // Quality Pass v1.0 Item 5 — stamp the analyzer's call purpose onto
   // phone-call bookings server-side (deterministic; the model never
@@ -2457,7 +2508,7 @@ async function insertCompanionAction(parentAction, generated, callPurpose = null
           ? `Companion to send_message ${parentAction.id} (auto-fire path): ${companion.reasoning}`
           : `Companion to send_message ${parentAction.id} (${parentAction.rule_applied || 'manual'}, auto-fire path)`,
         confidence: 1.0,
-        rule_applied: parentAction.rule_applied,
+        rule_applied: ctype === 'send_info_email' ? INFO_EMAIL_RULE : parentAction.rule_applied,
         status: 'pending',
         requires_approval: false,
         batch_id: parentAction.batch_id || null,
@@ -2478,7 +2529,9 @@ async function insertCompanionAction(parentAction, generated, callPurpose = null
         ? `appointment_id="${cap.appointment_id || '?'}"`
         : ctype === 'reschedule_appointment'
           ? `old="${cap.old_appointment_id || '?'}" → ${cap.new_calendar_name || '?'} ${cap.new_start_time || '?'} status="${cap.status || '?'}"`
-          : '(unknown)';
+          : ctype === 'send_info_email'
+            ? `subject="${String(cap.subject || '?').slice(0, 80)}" (${String(cap.body || '').length} chars)`
+            : '(unknown)';
 
     console.log(`[SendMessage] ✅ Companion ${ctype} queued: id=${data.id} seq=${data.sequence_order} batch=${data.batch_id || 'none'} — ${summary}`);
 
@@ -3753,6 +3806,22 @@ export async function executeSendMessage(action, context) {
         }
       } catch (qdErr) {
         console.warn(`[SendMessage] qualifying data persist failed for ${contactId} (fail-soft): ${qdErr.message}`);
+      }
+    }
+
+    // 2026-09-24 — UNDELIVERED PROMISE: the reply still says something is
+    // being sent and carries nothing that sends it (the guard in
+    // response-generator regenerated once and the retry did the same). The
+    // lead is now waiting on an email. Put a person on it rather than let the
+    // promise lapse silently. Failure-soft: the send already happened.
+    if (generated && generated.undelivered_promise) {
+      try {
+        await supabase.from('agent_actions').insert(buildUndeliveredPromiseTask({
+          contactId, eventId: action.event_id, promise: generated.undelivered_promise,
+        }));
+        console.warn(`[SendMessage] undelivered promise for ${contactId} — rep task queued`);
+      } catch (upErr) {
+        console.warn(`[SendMessage] undelivered-promise task failed for ${contactId} (fail-soft): ${upErr.message}`);
       }
     }
 

@@ -34,6 +34,10 @@ AUTO-BOOK:
 ❌ Telling a PHONE-booked lead that our team will call to confirm the call
 ❌ Including a booking link AND companion_action
 
+SEND INFO:
+❌ Saying something is sent, sending, on its way, or in their inbox without companion_action send_info_email (or an accepted guide_disposition) in the same reply
+❌ Offering or naming a document that does not exist (comparison sheet, brochure, PDF, reviews link)
+
 QUALIFYING DATA:
 ❌ Emitting decision_makers_present with a value other than "Yes", "No", "Solo Owner", or "Uncertain" (case-sensitive)
 ❌ Emitting qualifying_data when lead never stated values — leave it absent instead
