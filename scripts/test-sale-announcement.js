@@ -45,7 +45,19 @@ import {
   isCelebratableClimb,
   gitBlobSha,
 } from '../src/notifications/sale-announcement-body-generator.js';
-import { postSaleAnnouncement, postSaleStats } from '../src/notifications/slack-sale.js';
+import {
+  postSaleAnnouncement,
+  postSaleStats,
+  postSaleToMarket,
+  resolveSaleMarketChannel,
+} from '../src/notifications/slack-sale.js';
+import { __setSlackClientForTests, __resetSlackCacheForTests } from '../src/slack.js';
+import {
+  buildOfficeRanking,
+  rankOffice,
+  displayRepName,
+  formatOfficeRanking,
+} from '../src/notifications/office-ranking.js';
 
 const TOKEN = process.env.SALE_ANNOUNCE_TOKEN;
 
@@ -538,6 +550,7 @@ test('a permanent Slack refusal is not retried; a transient one is', async () =>
   });
   assert.equal(p.ok, false);
   assert.equal(perm, 1, 'a permanent refusal is attempted once');
+  assert.equal(p.attempts, 1, 'and reports one attempt, not the configured three');
 
   // A transport throw is exactly what the retry exists for.
   let threw = 0;
@@ -1008,4 +1021,397 @@ test('the FACTS block no longer carries any bookkeeping', () => {
   assert.ok(!rich.includes('500,000'), 'month volume must not appear');
   assert.ok(!rich.includes('4,214,968'), 'team total must not appear');
   assert.ok(!/9 sales/.test(rich), 'month count must not appear');
+});
+// ═════════════════════════════════════════════════════════════════
+// The market channel: the office power ranking (2026-09-24)
+//
+// Every sale landed in #sales-all only — rows 80–90 (FTMYR / JAX / STPET / ORL)
+// all carry C0C0AQMARE1 — because nothing ever looked up a market. With
+// SALE_ANNOUNCE_MARKET_ENABLED, #sales-all keeps the celebration and the
+// market channel gets the rep's month line plus the office's full month-to-date
+// ranking (sales-floor request). A market failure must never un-post the sale.
+// ═════════════════════════════════════════════════════════════════
+const C_SALES_FTMYR = 'C_SALES_FTMYR';
+const C_SALES_FTLAU = 'C_SALES_FTLAU';
+
+async function withMarketFlag(value, fn) {
+  const prev = process.env.SALE_ANNOUNCE_MARKET_ENABLED;
+  if (value === undefined) delete process.env.SALE_ANNOUNCE_MARKET_ENABLED;
+  else process.env.SALE_ANNOUNCE_MARKET_ENABLED = value;
+  try {
+    return await fn();
+  } finally {
+    if (prev === undefined) delete process.env.SALE_ANNOUNCE_MARKET_ENABLED;
+    else process.env.SALE_ANNOUNCE_MARKET_ENABLED = prev;
+  }
+}
+
+/** A ranking as buildOfficeRanking returns it, for the offices the tests use. */
+function stubRanking(market) {
+  const office = market === 'BOCA' ? 'FTLAU' : market;
+  const officeName = { FTMYR: 'Fort Myers', FTLAU: 'Fort Lauderdale' }[office] || office;
+  const rows = rankOffice([
+    { rep_name: 'Smith, Jane', job_value: 100000 },
+    { rep_name: 'O’Connor, Tim', job_value: 20000 },
+    { rep_name: 'O’Connor, Tim', job_value: 16300 },
+    { rep_name: 'Barela, Craig', job_value: 31500 },
+  ]);
+  return {
+    degraded: false, office, officeName, rows,
+    totalVolume: rows.reduce((t, r) => t + r.volume, 0),
+    totalCount: rows.reduce((t, r) => t + r.count, 0),
+  };
+}
+
+/** makeDeps plus stubs for the market post and ranking, and a stats stub that records the channel. */
+function makeMarketDeps(db, overrides = {}) {
+  const marketCalls = [];
+  const marketAlerts = [];
+  const statsCalls = [];
+  const rankingCalls = [];
+  const h = makeDeps(db, {
+    facts: async () => ({ degraded: false, mtd_sale_count: 3, mtd_volume: 36300 }),
+    resolveMarket: async (market) => ({ FTMYR: C_SALES_FTMYR, FTLAU: C_SALES_FTLAU })[market] || null,
+    officeRanking: async (market) => { rankingCalls.push(market); return stubRanking(market); },
+    postMarket: async (text, channel) => {
+      marketCalls.push({ text, channel });
+      return { ok: true, ts: `mts-${marketCalls.length}`, channel, error: null, attempts: 1 };
+    },
+    postStats: async (text, threadTs, d = {}) => {
+      statsCalls.push({ text, threadTs, channelId: d.channelId ?? null });
+      return { ok: true, ts: `stats-${statsCalls.length}`, error: null };
+    },
+    marketAlert: async (detail) => { marketAlerts.push(detail); return { ok: true }; },
+    ...overrides,
+  });
+  return { ...h, marketCalls, marketAlerts, statsCalls, rankingCalls };
+}
+
+async function runSale(h) {
+  const handler = makeSaleAnnouncementHandler(h.deps);
+  await handler(req(payload()), makeRes());
+  await h.drain();
+}
+
+test('an FTMYR sale: celebration in #sales-all, office ranking in #sales-fortmyers', async () => {
+  await withMarketFlag('true', async () => {
+    const db = makeDb({ leads: [{ lp_lead_id: '573581', lp_prospect_id: 'prospect_9', lp_branch_id: 'FTMYR' }] });
+    const h = makeMarketDeps(db);
+    await runSale(h);
+
+    assert.equal(h.slackCalls.length, 1, 'one rollup post');
+    assert.match(h.slackCalls[0], /puts \$31,500 on the board/, '#sales-all keeps the celebration');
+    assert.equal(h.marketCalls.length, 1, 'one market post');
+    assert.equal(h.marketCalls[0].channel, C_SALES_FTMYR);
+
+    const text = h.marketCalls[0].text;
+    assert.notEqual(text, h.slackCalls[0], 'the market channel does not get the celebration again');
+    assert.match(text, /^📊 Tim O’Connor — 3 sales in September, \$36,300\./);
+    assert.match(text, /🏆 Fort Myers — September power ranking/);
+    assert.match(text, /1\. Jane Smith — \$100,000 \(1\)/);
+    assert.match(text, /2\. Tim O’Connor — \$36,300 \(2\) {2}← today/);
+    assert.match(text, /3\. Craig Barela — \$31,500 \(1\)/);
+    assert.match(text, /Office total: \$167,800 · 4 sales/);
+    assert.deepEqual(h.rankingCalls, ['FTMYR']);
+
+    const row = db.announcements[0];
+    assert.equal(row.status, STATUSES.POSTED);
+    assert.equal(row.slack_channel, 'C_SALES', '#sales-all fields unchanged');
+    assert.equal(row.market_code, 'FTMYR');
+    assert.equal(row.slack_market_channel, C_SALES_FTMYR);
+    assert.equal(row.slack_market_ts, 'mts-1');
+    assert.equal(row.market_message_text, text);
+    assert.equal(row.market_error, null);
+    assert.equal(h.opsAlerts.length, 0);
+  });
+});
+
+test('the stats reply threads under #sales-all only; the market post needs no thread', async () => {
+  await withMarketFlag('true', async () => {
+    const db = makeDb({ leads: [{ lp_lead_id: '573581', lp_prospect_id: 'prospect_9', lp_branch_id: 'FTMYR' }] });
+    const h = makeMarketDeps(db);
+    await runSale(h);
+
+    assert.equal(h.statsCalls.length, 1);
+    assert.equal(h.statsCalls[0].threadTs, 'ts-1');
+    assert.equal(h.statsCalls[0].channelId, null, 'rollup channel (the default)');
+    assert.equal(db.announcements[0].slack_stats_ts, 'stats-1');
+  });
+});
+
+test('a BOCA sale posts Fort Lauderdale’s ranking to #sales-fortlauderdale (real alias)', async () => {
+  // Uses the REAL resolveSaleMarketChannel → resolveSlackChannels path, so the
+  // BOCA → FTLAU alias in slack.js is what is under test, not a stub of it.
+  __resetSlackCacheForTests();
+  __setSlackClientForTests({
+    from(table) {
+      return {
+        select: async () => {
+          if (table === 'slack_channels') {
+            return { data: [
+              { channel_name: 'sales-all', slack_channel_id: 'C_SALES' },
+              { channel_name: 'sales-fortmyers', slack_channel_id: C_SALES_FTMYR },
+              { channel_name: 'sales-fortlauderdale', slack_channel_id: C_SALES_FTLAU },
+            ] };
+          }
+          if (table === 'slack_market_slugs') {
+            return { data: [
+              { market_code: 'FTMYR', slug: 'fortmyers' },
+              { market_code: 'FTLAU', slug: 'fortlauderdale' },
+            ] };
+          }
+          throw new Error(`unexpected table ${table}`);
+        },
+      };
+    },
+  });
+  try {
+    await withMarketFlag('true', async () => {
+      const db = makeDb({ leads: [{ lp_lead_id: '573581', lp_prospect_id: 'prospect_9', lp_branch_id: 'BOCA' }] });
+      const h = makeMarketDeps(db, { resolveMarket: resolveSaleMarketChannel });
+      await runSale(h);
+
+      assert.equal(h.slackCalls.length, 1);
+      assert.deepEqual(h.marketCalls.map((c) => c.channel), [C_SALES_FTLAU]);
+      assert.match(h.marketCalls[0].text, /🏆 Fort Lauderdale — September power ranking/);
+      assert.equal(db.announcements[0].market_code, 'BOCA', 'the raw code is recorded');
+      assert.equal(db.announcements[0].slack_market_channel, C_SALES_FTLAU);
+    });
+  } finally {
+    __setSlackClientForTests(null);
+    __resetSlackCacheForTests();
+  }
+});
+
+test('resolveSaleMarketChannel never returns the rollup id', async () => {
+  const resolveChannels = async () => ['C_ROLLUP'];
+  assert.equal(await resolveSaleMarketChannel('ORL', { resolveChannels, rollupId: 'C_ROLLUP', logger: quietLogger }), null);
+  assert.equal(await resolveSaleMarketChannel(null, { resolveChannels, rollupId: 'C_ROLLUP', logger: quietLogger }), null);
+  const boom = async () => { throw new Error('db down'); };
+  assert.equal(await resolveSaleMarketChannel('FTMYR', { resolveChannels: boom, logger: quietLogger }), null);
+});
+
+test('a lead with no branch posts to #sales-all only, cleanly', async () => {
+  await withMarketFlag('true', async () => {
+    const db = makeDb({ leads: [{ lp_lead_id: '573581', lp_prospect_id: 'prospect_9', lp_branch_id: null }] });
+    const h = makeMarketDeps(db);
+    await runSale(h);
+
+    assert.equal(h.slackCalls.length, 1);
+    assert.equal(h.marketCalls.length, 0);
+    assert.equal(h.rankingCalls.length, 0);
+    const row = db.announcements[0];
+    assert.equal(row.status, STATUSES.POSTED);
+    assert.equal(row.market_code, undefined);
+    assert.equal(row.market_error, undefined, 'no market is not an error');
+    assert.equal(h.opsAlerts.length + h.marketAlerts.length, 0);
+  });
+});
+
+test('a market code with no channel is recorded, and the sale still posts', async () => {
+  await withMarketFlag('true', async () => {
+    const db = makeDb({ leads: [{ lp_lead_id: '573581', lp_prospect_id: 'prospect_9', lp_branch_id: 'ZZZ' }] });
+    const h = makeMarketDeps(db);
+    await runSale(h);
+
+    assert.equal(h.marketCalls.length, 0);
+    assert.equal(db.announcements[0].status, STATUSES.POSTED);
+    assert.equal(db.announcements[0].market_code, 'ZZZ');
+    assert.equal(db.announcements[0].market_error, 'no_market_channel');
+  });
+});
+
+test('a ranking that cannot be read still posts the rep’s month line', async () => {
+  await withMarketFlag('true', async () => {
+    const db = makeDb({ leads: [{ lp_lead_id: '573581', lp_prospect_id: 'prospect_9', lp_branch_id: 'FTMYR' }] });
+    const h = makeMarketDeps(db, { officeRanking: async () => ({ degraded: true, reason: 'timeout' }) });
+    await runSale(h);
+
+    assert.equal(h.marketCalls.length, 1);
+    assert.equal(h.marketCalls[0].text, '📊 Tim O’Connor — 3 sales in September, $36,300.');
+    assert.equal(db.announcements[0].market_error, null);
+  });
+});
+
+test('no facts and no ranking: nothing is posted to the market, and the sale stays posted', async () => {
+  await withMarketFlag('true', async () => {
+    const db = makeDb({ leads: [{ lp_lead_id: '573581', lp_prospect_id: 'prospect_9', lp_branch_id: 'FTMYR' }] });
+    const h = makeMarketDeps(db, {
+      facts: async () => ({ degraded: true, reason: 'mtd_timeout' }),
+      officeRanking: async () => { throw new Error('db down'); },
+    });
+    await runSale(h);
+
+    assert.equal(h.slackCalls.length, 1);
+    assert.equal(h.marketCalls.length, 0);
+    assert.equal(db.announcements[0].status, STATUSES.POSTED);
+    assert.equal(db.announcements[0].market_error, 'no_market_text');
+  });
+});
+
+test('a market post refused with not_in_channel stays posted and pages ops once', async () => {
+  await withMarketFlag('true', async () => {
+    const db = makeDb({ leads: [{ lp_lead_id: '573581', lp_prospect_id: 'prospect_9', lp_branch_id: 'FTMYR' }] });
+    const h = makeMarketDeps(db, {
+      postMarket: async (text, channel) => ({ ok: false, ts: null, channel, error: 'not_in_channel', attempts: 1 }),
+    });
+    await runSale(h);
+
+    const row = db.announcements[0];
+    assert.equal(row.status, STATUSES.POSTED, 'the sale reached #sales-all');
+    assert.equal(row.market_error, 'slack:not_in_channel after 1 attempts');
+    assert.equal(row.slack_market_channel, C_SALES_FTMYR);
+    assert.equal(row.slack_market_ts, undefined);
+    assert.match(row.market_message_text, /power ranking/, 'the text is kept for a hand repost');
+    assert.equal(h.marketAlerts.length, 1, 'one ops line naming the channel');
+    assert.equal(h.marketAlerts[0].channel, C_SALES_FTMYR);
+    assert.equal(h.opsAlerts.length, 0, 'not a dropped-sale alert');
+  });
+});
+
+test('a transient market failure is recorded but does not page ops', async () => {
+  await withMarketFlag('true', async () => {
+    const db = makeDb({ leads: [{ lp_lead_id: '573581', lp_prospect_id: 'prospect_9', lp_branch_id: 'FTMYR' }] });
+    const h = makeMarketDeps(db, {
+      postMarket: async (text, channel) => ({ ok: false, ts: null, channel, error: 'ratelimited', attempts: 3 }),
+    });
+    await runSale(h);
+    assert.equal(db.announcements[0].status, STATUSES.POSTED);
+    assert.equal(db.announcements[0].market_error, 'slack:ratelimited after 3 attempts');
+    assert.equal(h.marketAlerts.length, 0);
+  });
+});
+
+test('a market post that THROWS cannot un-post the announcement', async () => {
+  await withMarketFlag('true', async () => {
+    const db = makeDb({ leads: [{ lp_lead_id: '573581', lp_prospect_id: 'prospect_9', lp_branch_id: 'FTMYR' }] });
+    const h = makeMarketDeps(db, { postMarket: async () => { throw new Error('socket hang up'); } });
+    await runSale(h);
+    assert.equal(db.announcements[0].status, STATUSES.POSTED);
+    assert.equal(h.opsAlerts.length, 0);
+  });
+});
+
+test('postSaleToMarket does not retry not_in_channel, and does retry a transient error', async () => {
+  const calls = [];
+  const refused = await postSaleToMarket('hello', C_SALES_FTMYR, {
+    post: async (text, channel) => { calls.push(channel); return { ok: false, channel, error: 'not_in_channel', threw: false }; },
+    wait: async () => {},
+    logger: quietLogger,
+  });
+  assert.equal(refused.ok, false);
+  assert.equal(refused.attempts, 1);
+  assert.deepEqual(calls, [C_SALES_FTMYR]);
+
+  let n = 0;
+  const flaky = await postSaleToMarket('hello', C_SALES_FTMYR, {
+    post: async (text, channel) => (++n < 2
+      ? { ok: false, channel, error: 'ratelimited', threw: false }
+      : { ok: true, ts: 'm1', channel, error: null }),
+    wait: async () => {},
+    logger: quietLogger,
+  });
+  assert.equal(flaky.ok, true);
+  assert.equal(flaky.attempts, 2);
+  assert.equal(flaky.channel, C_SALES_FTMYR);
+});
+
+test('flag off: exactly one post, no market read, no market fields', async () => {
+  await withMarketFlag(undefined, async () => {
+    let reads = 0;
+    const db = makeDb({ leads: [{ lp_lead_id: '573581', lp_prospect_id: 'prospect_9', lp_branch_id: 'FTMYR' }] });
+    const h = makeMarketDeps(db, { readMarket: async () => { reads++; return 'FTMYR'; } });
+    await runSale(h);
+
+    assert.equal(h.slackCalls.length, 1);
+    assert.equal(h.marketCalls.length, 0);
+    assert.equal(h.rankingCalls.length, 0);
+    assert.equal(reads, 0, 'the off path does not even read the market');
+    assert.equal(h.statsCalls.length, 1);
+    const row = db.announcements[0];
+    assert.equal(row.status, STATUSES.POSTED);
+    for (const k of ['market_code', 'slack_market_channel', 'slack_market_ts', 'market_message_text', 'market_error']) {
+      assert.equal(row[k], undefined, `${k} untouched`);
+    }
+  });
+});
+
+// ─── the ranking itself ─────────────────────────────────────────
+
+test('rankOffice sums per rep across LP/GHL name orders and shares tied ranks', () => {
+  const rows = rankOffice([
+    { rep_name: 'Wheeler, Donte', job_value: 50000 },
+    { rep_name: 'Donte Wheeler', job_value: 10000 },
+    { rep_name: 'Dorsett, Beverly', job_value: 30000 },
+    { rep_name: 'Trainer, Tyler', job_value: 30000 },
+    { rep_name: 'Bailey, Olga', job_value: 5000 },
+    { rep_name: null, job_value: 99999 },
+  ]);
+  assert.deepEqual(
+    rows.map((r) => [r.rank, r.name, r.volume, r.count]),
+    [
+      [1, 'Donte Wheeler', 60000, 2],
+      [2, 'Beverly Dorsett', 30000, 1],
+      [2, 'Tyler Trainer', 30000, 1],
+      [4, 'Olga Bailey', 5000, 1],
+    ],
+  );
+});
+
+test('displayRepName turns LP "Last, First" into "First Last"', () => {
+  assert.equal(displayRepName('Wheeler, Donte'), 'Donte Wheeler');
+  assert.equal(displayRepName('O’Connor, Tim'), 'Tim O’Connor');
+  assert.equal(displayRepName('Tim O’Connor'), 'Tim O’Connor');
+});
+
+test('formatOfficeRanking lists every rep and marks today’s', () => {
+  const ranking = stubRanking('FTMYR');
+  const text = formatOfficeRanking({ repLine: null, ranking, repDisplayName: 'Tim O’Connor', now: new Date('2026-09-16T15:00:00Z') });
+  const lines = text.split('\n');
+  assert.equal(lines[0], '🏆 Fort Myers — September power ranking');
+  assert.equal(lines.length, 1 + ranking.rows.length + 1, 'header, every rep, total');
+  assert.equal(lines.filter((l) => l.includes('← today')).length, 1);
+  assert.equal(formatOfficeRanking({ ranking: { degraded: true } }), null);
+});
+
+test('buildOfficeRanking reads every code that posts to the office, and degrades rather than guess', async () => {
+  let inArgs = null;
+  const fake = (result) => ({
+    from() {
+      const chain = {
+        select() { return chain; },
+        eq() { return chain; },
+        not() { return chain; },
+        in(col, vals) { inArgs = [col, vals]; return chain; },
+        gte() { return chain; },
+        limit() { return Promise.resolve(result); },
+      };
+      return chain;
+    },
+  });
+
+  const ok = await buildOfficeRanking('BOCA', {
+    supabase: fake({ data: [{ rep_name: 'Doe, Jane', job_value: 20000 }], error: null }),
+    now: () => new Date('2026-09-16T15:00:00Z'),
+    logger: quietLogger,
+  });
+  assert.equal(ok.degraded, false);
+  assert.equal(ok.office, 'FTLAU');
+  assert.equal(ok.officeName, 'Fort Lauderdale');
+  assert.equal(inArgs[0], 'lp_branch_id');
+  assert.deepEqual([...inArgs[1]].sort(), ['BOCA', 'FTLAU', 'MIAMI']);
+  assert.equal(ok.totalVolume, 20000);
+
+  const failed = await buildOfficeRanking('FTMYR', {
+    supabase: fake({ data: null, error: { message: 'boom' } }), logger: quietLogger,
+  });
+  assert.equal(failed.degraded, true);
+
+  const truncated = await buildOfficeRanking('FTMYR', {
+    supabase: fake({ data: new Array(5000).fill({ rep_name: 'Doe, Jane', job_value: 1 }), error: null }),
+    logger: quietLogger,
+  });
+  assert.equal(truncated.degraded, true, 'a truncated board is never published');
+
+  assert.equal((await buildOfficeRanking(null, { logger: quietLogger })).degraded, true);
 });

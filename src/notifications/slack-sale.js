@@ -29,9 +29,24 @@
  * call to produce DIFFERENT wording for the same sale, so a retry that finally
  * succeeded could post text nobody reviewed and that does not match what the row
  * records. The message is composed once and is then a fixed artifact.
+ *
+ * THE MARKET CHANNEL IS A SECOND DESTINATION, NOT A SECOND SOURCE OF TRUTH
+ * -----------------------------------------------------------------------
+ * 2026-09-24. Every sale went to #sales-all and nowhere else: rows 80–90
+ * (FTMYR / JAX / STPET / ORL) all carry slack_channel C0C0AQMARE1, because
+ * postSaleAnnouncement only ever defaulted to the rollup and nothing looked up
+ * a market. A market floor never saw its own sales.
+ *
+ * The market post is the office power ranking, not a second copy of the
+ * celebration (see office-ranking.js), and it is deliberately secondary:
+ * #sales-all is still the destination of record, so a market failure never
+ * marks the row slack_failed. A market channel the bot is
+ * not in (not_in_channel / channel_not_found) is the one failure that WILL
+ * recur on every sale in that market until someone invites the bot, and the
+ * rollup post makes it look like everything worked — so that one pages ops.
  */
 
-import { postToSlack, salesRollupChannelId, opsChannelId } from '../slack.js';
+import { postToSlack, salesRollupChannelId, opsChannelId, resolveSlackChannels } from '../slack.js';
 import { sendGroupMeMessage } from '../groupme.js';
 
 export const SLACK_RETRY_ATTEMPTS = 3;
@@ -58,6 +73,13 @@ export const PERMANENT_SLACK_ERRORS = Object.freeze([
   'not_in_channel',
   'is_archived',
 ]);
+
+/**
+ * Market-post errors that mean "the bot cannot reach this channel" — a missing
+ * invite or a renamed/deleted channel. Both are permanent (PERMANENT_SLACK_ERRORS
+ * already stops the retry) and both need a person, so they alert ops.
+ */
+export const MARKET_UNREACHABLE_ERRORS = Object.freeze(['not_in_channel', 'channel_not_found']);
 
 function groupMeMirrorEnabled() {
   return String(process.env.SALE_ANNOUNCE_GROUPME_MIRROR || 'false') === 'true';
@@ -87,8 +109,14 @@ export async function postSaleAnnouncement(text, deps = {}) {
   }
 
   let last = { ok: false, ts: null, channel: channelId, error: 'not_attempted' };
+  // 2026-09-24 — the attempts actually MADE. Returning the configured maximum
+  // made a permanent refusal (one attempt, then break) read "after 3 attempts"
+  // in the ops alert and on the row, which sends whoever reads it looking for a
+  // flaky network instead of a missing bot invite.
+  let made = 0;
 
   for (let attempt = 1; attempt <= attempts; attempt++) {
+    made = attempt;
     last = await post(text, channelId);
     if (last.ok) {
       if (attempt > 1) logger.log?.(`[SaleAnnounce] Slack post succeeded on attempt ${attempt}`);
@@ -108,7 +136,72 @@ export async function postSaleAnnouncement(text, deps = {}) {
     if (attempt < attempts) await wait(delayMs);
   }
 
-  return { ...last, attempts };
+  return { ...last, attempts: made };
+}
+
+/**
+ * The #sales-<market> channel id for an LP market code, or null.
+ *
+ * Reuses resolveSlackChannels so the slug lookup, the BOCA/MIAMI → FTLAU
+ * aliases and the 10-minute cache stay in exactly one place. For the sales
+ * family that returns the market channel alone when one resolves and the
+ * rollup as a fallback — the rollup is dropped here, because the caller has
+ * ALREADY posted there and a second copy in #sales-all is a duplicate, not a
+ * market post. Never throws.
+ */
+export async function resolveSaleMarketChannel(market, deps = {}) {
+  const {
+    resolveChannels = resolveSlackChannels,
+    rollupId = salesRollupChannelId(),
+    logger = console,
+  } = deps;
+  if (!market) return null;
+  try {
+    const ids = await resolveChannels('sales', { market });
+    return (ids || []).find((id) => id && id !== rollupId) || null;
+  } catch (err) {
+    logger.warn?.(`[SaleAnnounce] market channel resolve failed for market=${market}: ${err.message}`);
+    return null;
+  }
+}
+
+/**
+ * Post the office ranking to the market channel.
+ *
+ * Same retry loop and same PERMANENT_SLACK_ERRORS rule as the rollup post. The
+ * deps object is built fresh on purpose: completeAnnouncement's own deps use
+ * `post` for a different function, so passing them through would hand
+ * postSaleAnnouncement the wrong poster. Returns { ok, ts, channel, error,
+ * attempts }. Never throws.
+ */
+export async function postSaleToMarket(text, channelId, deps = {}) {
+  const { post = postToSlack, attempts, delayMs, wait, logger = console } = deps;
+  if (!channelId) return { ok: false, ts: null, channel: null, error: 'no_channel', attempts: 0 };
+  const inner = { post, channelId, logger };
+  if (attempts !== undefined) inner.attempts = attempts;
+  if (delayMs !== undefined) inner.delayMs = delayMs;
+  if (wait !== undefined) inner.wait = wait;
+  return postSaleAnnouncement(text, inner);
+}
+
+/**
+ * One line to #ops-alerts when a market channel refused the post because the
+ * bot cannot reach it. The sale DID reach #sales-all, so this is worded as a
+ * setup problem to fix, not a dropped sale.
+ */
+export async function alertMarketChannelUnreachable(detail, deps = {}) {
+  const { post = postToSlack, channelId = opsChannelId(), logger = console } = deps;
+  if (!channelId) {
+    logger.warn?.('[SaleAnnounce] SLACK_CHANNEL_OPS unset — market channel failure not alerted');
+    return { ok: false, error: 'no_ops_channel' };
+  }
+  const body =
+    `⚠️ Sale posted to #sales-all but NOT to market channel ${detail?.channel || '(unknown)'} ` +
+    `(market ${detail?.market || '(unknown)'}): ${detail?.error || '(unknown)'} — ` +
+    `invite Reece Bot to that channel. sale_announcements.id: ${detail?.row_id ?? '(none)'}`;
+  const res = await post(body, channelId);
+  if (!res.ok) logger.warn?.(`[SaleAnnounce] market ops alert failed to post: ${res.error}`);
+  return res;
 }
 
 /**

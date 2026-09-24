@@ -50,8 +50,18 @@ import crypto from 'crypto';
 import supabaseDefault from '../supabase.js';
 import { resolveLeadId, canWriteBack } from './resolve-lead.js';
 import { buildRepFacts } from './sale-facts.js';
-import { generateSaleAnnouncement, formatStatsLine } from './sale-announcement-body-generator.js';
-import { postSaleAnnouncement, postSaleStats, mirrorSaleToGroupMe, alertSaleDeliveryFailed } from './slack-sale.js';
+import { generateSaleAnnouncement, formatStatsLine, formatRepMonthLine } from './sale-announcement-body-generator.js';
+import { buildOfficeRanking, formatOfficeRanking } from './office-ranking.js';
+import {
+  postSaleAnnouncement,
+  postSaleStats,
+  mirrorSaleToGroupMe,
+  alertSaleDeliveryFailed,
+  resolveSaleMarketChannel,
+  postSaleToMarket,
+  alertMarketChannelUnreachable,
+  MARKET_UNREACHABLE_ERRORS,
+} from './slack-sale.js';
 
 export const ROUTE_PATH = '/notifications/sale-announcement';
 
@@ -65,6 +75,16 @@ export const STATUSES = Object.freeze({
 
 function featureEnabled() {
   return String(process.env.SALE_ANNOUNCE_ENABLED || 'false') === 'true';
+}
+
+/**
+ * 2026-09-24 — also post the office power ranking to the sale's
+ * #sales-<market> channel. Off unless the literal 'true', and when off nothing
+ * about the rollup path changes (not even the lead read), so the flip is the
+ * only thing that can change behaviour.
+ */
+function marketPostEnabled() {
+  return String(process.env.SALE_ANNOUNCE_MARKET_ENABLED || 'false') === 'true';
 }
 
 /**
@@ -260,6 +280,31 @@ export async function stampCloseDate({ leadId, amount, now }, deps = {}) {
 }
 
 /**
+ * The LP market code (lp_leads.lp_branch_id) for a lead, or null.
+ * Never fatal: a sale whose market cannot be read still posts to #sales-all.
+ */
+export async function readLeadMarket(leadId, deps = {}) {
+  const { supabase = supabaseDefault, logger = console } = deps;
+  if (!leadId) return null;
+  try {
+    const res = await supabase
+      .from('lp_leads')
+      .select('lp_branch_id')
+      .eq('lp_lead_id', leadId)
+      .single();
+    if (res.error || !res.data) {
+      logger.warn?.(`[SaleAnnounce] market read failed lead=${leadId}: ${res.error?.message || 'no row'}`);
+      return null;
+    }
+    const code = String(res.data.lp_branch_id ?? '').trim();
+    return code || null;
+  } catch (err) {
+    logger.warn?.(`[SaleAnnounce] market read threw lead=${leadId}: ${err.message}`);
+    return null;
+  }
+}
+
+/**
  * Everything after the 200: stamp, gather facts, compose, post.
  * Never throws — it runs detached, so a throw here is an unhandled rejection.
  */
@@ -274,6 +319,11 @@ export async function completeAnnouncement(ctx, deps = {}) {
     statsLine = formatStatsLine,
     mirror = mirrorSaleToGroupMe,
     alert = alertSaleDeliveryFailed,
+    readMarket = readLeadMarket,
+    resolveMarket = resolveSaleMarketChannel,
+    officeRanking = buildOfficeRanking,
+    postMarket = postSaleToMarket,
+    marketAlert = alertMarketChannelUnreachable,
     update = updateRow,
     now = () => new Date(),
   } = deps;
@@ -299,6 +349,18 @@ export async function completeAnnouncement(ctx, deps = {}) {
     const composed = await compose({ repDisplayName, saleAmount: amount, facts }, deps);
 
     await update(rowId, { message_text: composed.text, facts_json: facts }, deps);
+
+    // ── 3b. Market (flag-gated, never fatal) ─────────────────────
+    const marketOn = marketPostEnabled();
+    let market = null;
+    if (marketOn && leadId) {
+      try {
+        market = await readMarket(leadId, deps);
+      } catch (err) {
+        logger.warn?.(`[SaleAnnounce] market read threw lead=${leadId}: ${err.message}`);
+        market = null;
+      }
+    }
 
     // ── 4. Post ──────────────────────────────────────────────────
     const res = await post(composed.text, deps);
@@ -328,10 +390,76 @@ export async function completeAnnouncement(ctx, deps = {}) {
         logger.warn?.(`[SaleAnnounce] stats reply threw for row=${rowId}: ${err.message}`);
       }
 
+      // ── The market channel: the office power ranking ─────────────
+      // 2026-09-24 (sales-floor request). #sales-all carries the celebration; the market
+      // channel gets the rep's month line and the office's full month-to-date
+      // board instead of a second copy of it. No model call — the post is
+      // built from data, so there is nothing to recompose. Its own try/catch
+      // for the same reason as the stats reply: the row is already 'posted'
+      // and the sale already reached #sales-all, so NOTHING in here may change
+      // status. A failure is recorded on the row (market_error) and logged;
+      // only a channel the bot cannot reach pages ops, because that one recurs
+      // on every sale in the market and the rollup post hides it.
+      let marketChannel = null;
+      if (marketOn) {
+        try {
+          marketChannel = market ? await resolveMarket(market, { logger }) : null;
+          if (!marketChannel) {
+            logger.log?.(`[SaleAnnounce] no market channel for lead=${leadId || '(none)'} branch=${market || '(none)'}`);
+            if (market) await update(rowId, { market_code: market, market_error: 'no_market_channel' }, deps);
+          } else {
+            let ranking = null;
+            try {
+              ranking = await officeRanking(market, deps);
+            } catch (err) {
+              logger.warn?.(`[SaleAnnounce] office ranking threw for row=${rowId}: ${err.message}`);
+            }
+            const marketText = formatOfficeRanking({
+              repLine: formatRepMonthLine(repDisplayName, facts, now()),
+              ranking,
+              repDisplayName,
+              now: now(),
+            });
+            if (!marketText) {
+              logger.warn?.(`[SaleAnnounce] nothing to post to market=${market} for row=${rowId} — facts and ranking both unavailable`);
+              await update(rowId, { market_code: market, slack_market_channel: marketChannel, market_error: 'no_market_text' }, deps);
+            } else {
+              const mres = await postMarket(marketText, marketChannel, { logger });
+              if (mres.ok) {
+                await update(rowId, {
+                  market_code: market,
+                  slack_market_channel: mres.channel || marketChannel,
+                  slack_market_ts: mres.ts,
+                  market_message_text: marketText,
+                  market_error: null,
+                }, deps);
+              } else {
+                logger.warn?.(
+                  `[SaleAnnounce] market post failed row=${rowId} market=${market} channel=${marketChannel}: ` +
+                  `${mres.error} after ${mres.attempts} attempts — #sales-all post stands`,
+                );
+                await update(rowId, {
+                  market_code: market,
+                  slack_market_channel: marketChannel,
+                  market_message_text: marketText,
+                  market_error: `slack:${mres.error} after ${mres.attempts} attempts`,
+                }, deps);
+                if (MARKET_UNREACHABLE_ERRORS.includes(String(mres.error))) {
+                  await marketAlert({ row_id: rowId, market, channel: marketChannel, error: mres.error }, { logger });
+                }
+              }
+            }
+          }
+        } catch (err) {
+          logger.warn?.(`[SaleAnnounce] market post threw for row=${rowId}: ${err.message}`);
+        }
+      }
+
       await mirror(composed.text, deps);
       logger.log?.(
         `[SaleAnnounce] posted row=${rowId} rep="${repDisplayName}" ts=${res.ts} ` +
-        `key_source=${keySource} source=${composed.source}`,
+        `key_source=${keySource} source=${composed.source} ` +
+        `market=${market || '-'} market_channel=${marketChannel || '-'}`,
       );
       return { ok: true, status: STATUSES.POSTED, ts: res.ts };
     }

@@ -43,6 +43,25 @@ const CH_APPROVALS = process.env.SLACK_CHANNEL_APPROVALS || '';
 // the Fort Lauderdale office and post to its channels.
 const MARKET_ALIASES = { BOCA: 'FTLAU', MIAMI: 'FTLAU' };
 
+/**
+ * The market code whose channels a code posts to: BOCA → FTLAU, FTMYR → FTMYR.
+ * Exported (2026-09-24) so the sale-announcement office ranking groups the same
+ * codes into one office as the channel routing does — a Boca sale that posts to
+ * #sales-fortlauderdale must also count on Fort Lauderdale's board.
+ */
+export function officeMarketCode(code) {
+  const k = _normKey(code);
+  if (!k) return null;
+  return MARKET_ALIASES[k] || k;
+}
+
+/** Every market code that posts to this office's channels: FTLAU → [FTLAU, BOCA, MIAMI]. */
+export function officeMarketCodes(code) {
+  const office = officeMarketCode(code);
+  if (!office) return [];
+  return [office, ...Object.keys(MARKET_ALIASES).filter((k) => MARKET_ALIASES[k] === office)];
+}
+
 // Logical channel -> the slack_channels name prefix its market channels use,
 // and the env var holding its all-markets rollup. Adding a market-scoped
 // channel family is a row here, not a new branch below.

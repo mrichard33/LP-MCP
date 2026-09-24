@@ -190,12 +190,12 @@ function monthName(date) {
 }
 
 /**
- * The threaded stats reply — the numbers, kept out of the celebration.
- *
- * Pure and null-safe: degraded facts, or facts with nothing countable in them,
- * return null and the caller posts no reply. Never throws.
+ * The rep's own month in one line: "📊 Tim O'Connor — 3 sales in September,
+ * $36,300." The first line of the stats reply, and (2026-09-24) the opening
+ * line of the market channel's office ranking post. Null when there is nothing
+ * countable. Pure, never throws.
  */
-export function formatStatsLine(repDisplayName, facts, now = new Date()) {
+export function formatRepMonthLine(repDisplayName, facts, now = new Date()) {
   if (!facts || facts.degraded) return null;
 
   const count = Number(facts.mtd_sale_count) || 0;
@@ -205,7 +205,18 @@ export function formatStatsLine(repDisplayName, facts, now = new Date()) {
   const vol = money(facts.mtd_volume);
   const noun = count === 1 ? 'sale' : 'sales';
 
-  const first = `📊 ${repDisplayName} — ${count} ${noun} in ${month}` + (vol ? `, ${vol}.` : '.');
+  return `📊 ${repDisplayName} — ${count} ${noun} in ${month}` + (vol ? `, ${vol}.` : '.');
+}
+
+/**
+ * The threaded stats reply — the numbers, kept out of the celebration.
+ *
+ * Pure and null-safe: degraded facts, or facts with nothing countable in them,
+ * return null and the caller posts no reply. Never throws.
+ */
+export function formatStatsLine(repDisplayName, facts, now = new Date()) {
+  const first = formatRepMonthLine(repDisplayName, facts, now);
+  if (!first) return null;
 
   const team = money(facts.team_mtd_volume);
   return team ? `${first}\nTeam month to date: ${team}.` : first;
