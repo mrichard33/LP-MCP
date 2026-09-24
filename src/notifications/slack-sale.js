@@ -37,9 +37,10 @@
  * postSaleAnnouncement only ever defaulted to the rollup and nothing looked up
  * a market. A market floor never saw its own sales.
  *
- * The market post reuses the SAME composed text (never a second model call) and
- * is deliberately secondary: #sales-all is still the destination of record, so a
- * market failure never marks the row slack_failed. A market channel the bot is
+ * The market post is the office power ranking, not a second copy of the
+ * celebration (see office-ranking.js), and it is deliberately secondary:
+ * #sales-all is still the destination of record, so a market failure never
+ * marks the row slack_failed. A market channel the bot is
  * not in (not_in_channel / channel_not_found) is the one failure that WILL
  * recur on every sale in that market until someone invites the bot, and the
  * rollup post makes it look like everything worked — so that one pages ops.
@@ -165,7 +166,7 @@ export async function resolveSaleMarketChannel(market, deps = {}) {
 }
 
 /**
- * Post the already-composed announcement to the market channel.
+ * Post the office ranking to the market channel.
  *
  * Same retry loop and same PERMANENT_SLACK_ERRORS rule as the rollup post. The
  * deps object is built fresh on purpose: completeAnnouncement's own deps use

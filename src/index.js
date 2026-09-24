@@ -1866,7 +1866,7 @@ async function runMigrations() {
               ADD COLUMN IF NOT EXISTS market_code text,
               ADD COLUMN IF NOT EXISTS slack_market_channel text,
               ADD COLUMN IF NOT EXISTS slack_market_ts text,
-              ADD COLUMN IF NOT EXISTS slack_market_stats_ts text,
+              ADD COLUMN IF NOT EXISTS market_message_text text,
               ADD COLUMN IF NOT EXISTS market_error text;`);
     console.log('[Migration] sale announcements (sql/117, 119, 128) + close_date_source (sql/118) ready');
   } catch (err) {
