@@ -54,11 +54,32 @@
  * than dropped: an office that is absent reads as a bug, and a zero is the
  * honest answer. Offices with no sales at ALL in the trailing 30 days are left
  * out — that is a closed or not-yet-open branch, not a losing one.
+ *
+ * ─── MONTH TO DATE IS NOW THE DEFAULT (2026-09-25) ──────────────────────────
+ * The sales floor asked for the board to show the 1st through today, every
+ * day, and to reset for every office on the 1st. That is a different question
+ * from "who is hot this week", so it is a second MODE rather than a new job:
+ *
+ *   OFFICE_POWER_RANKING_WINDOW=mtd      (default) the Florida calendar month
+ *                                        to date, all seven offices, movement
+ *                                        against the same board 24h earlier
+ *   OFFICE_POWER_RANKING_WINDOW=rolling  the 7-day board described above
+ *
+ * The day-accuracy argument above does NOT apply to a month window:
+ * `appointment_proxy` is exactly "the right MONTH", so month-to-date counts
+ * every closed-won sale in the month — and a won lead with no close_date at
+ * all counts by its appointment_date (wonInWindowFilter in sale-facts.js).
+ * Seventeen September sales ($629,748) were invisible without that. The window
+ * is monthWindowET, the same one the per-sale boards use, so the daily post,
+ * the #sales-all reply and the office channels always agree and reset together
+ * at midnight on the 1st, Florida time.
  */
 
 import supabaseDefault from '../supabase.js';
 import { officeMarketCode } from '../slack.js';
-import { branchName } from '../approval-card.js';
+import { branchName, BRANCH_NAMES } from '../approval-card.js';
+import { monthWindowET, wonInWindowFilter } from './sale-facts.js';
+import { allOffices, rangeLabel } from './office-ranking.js';
 
 export const POWER_RANKING_BUDGET_MS = 5000;
 
@@ -73,6 +94,11 @@ export const DAY_ACCURATE_CLOSE_SOURCES = Object.freeze(['sale_announcement', 'l
 
 /** Default rolling window. Env override: OFFICE_POWER_RANKING_WINDOW_DAYS. */
 export const DEFAULT_WINDOW_DAYS = 7;
+
+/** 'mtd' (default) or 'rolling'. See the header. */
+export function windowMode() {
+  return String(process.env.OFFICE_POWER_RANKING_WINDOW || 'mtd').toLowerCase() === 'rolling' ? 'rolling' : 'mtd';
+}
 
 export function windowDays() {
   const n = parseInt(process.env.OFFICE_POWER_RANKING_WINDOW_DAYS || '', 10);
@@ -182,8 +208,15 @@ export function formatOfficePowerRanking({ ranking = null, now = new Date(), day
   const totalCount = rows.reduce((t, r) => t + r.count, 0);
   if (totalCount === 0) return null;
 
-  const header = days === 1 ? 'today' : `last ${days} days`;
-  const lines = [`🏆 Office power ranking — ${header}`];
+  let title;
+  if (ranking.mode === 'mtd') {
+    title = ranking.window?.complete
+      ? `🏁 ${ranking.window.monthName} final standings`
+      : `🏆 Office power ranking — ${rangeLabel(ranking.window)}`;
+  } else {
+    title = `🏆 Office power ranking — ${days === 1 ? 'today' : `last ${days} days`}`;
+  }
+  const lines = [title];
   for (const r of rows) {
     lines.push(`${r.rank}. ${r.name} — ${money(r.volume)} (${r.count})${moveMark(r.move)}`);
   }
@@ -197,19 +230,24 @@ export function formatOfficePowerRanking({ ranking = null, now = new Date(), day
  * One windowed read of day-accurate closed-won sales.
  * Returns { ok: true, data } or { ok: false, reason }. Never throws.
  */
-async function readWindow({ supabase, sinceIso, untilIso, budgetMs }) {
+async function readWindow({ supabase, sinceIso, untilIso, budgetMs, monthMode = false }) {
   let res;
   let timer;
   try {
-    res = await Promise.race([
-      supabase
-        .from('lp_leads')
-        .select('lp_branch_id, job_value')
-        .eq('closed_won', true)
+    const base = supabase
+      .from('lp_leads')
+      .select('lp_branch_id, job_value')
+      .eq('closed_won', true);
+    // Month mode counts every won sale in the window, proxy dates and no-date
+    // leads included; rolling mode keeps to day-accurate sources (header).
+    const query = monthMode
+      ? base.or(wonInWindowFilter(sinceIso, untilIso))
+      : base
         .in('close_date_source', DAY_ACCURATE_CLOSE_SOURCES)
         .gte('close_date', sinceIso)
-        .lt('close_date', untilIso)
-        .limit(POWER_RANKING_ROW_LIMIT),
+        .lt('close_date', untilIso);
+    res = await Promise.race([
+      query.limit(POWER_RANKING_ROW_LIMIT),
       new Promise((resolve) => { timer = setTimeout(() => resolve({ __timedOut: true }), budgetMs); }),
     ]);
   } catch (err) {
@@ -239,6 +277,9 @@ async function readWindow({ supabase, sinceIso, untilIso, budgetMs }) {
  * Never throws.
  */
 export async function buildOfficePowerRanking(deps = {}) {
+  const mode = deps.mode || windowMode();
+  if (mode === 'mtd') return buildMonthToDate(deps);
+
   const {
     supabase = supabaseDefault,
     now = () => new Date(),
@@ -286,5 +327,65 @@ export async function buildOfficePowerRanking(deps = {}) {
     totalVolume: rows.reduce((t, r) => t + r.volume, 0),
     totalCount: rows.reduce((t, r) => t + r.count, 0),
     movementAvailable: previous.ok,
+  };
+}
+
+/**
+ * The month-to-date board: every office, the Florida calendar month from the
+ * 1st to now (or the whole month, for a closed `window` — the final standings
+ * posted on the 1st), with movement against the same board 24 hours earlier.
+ *
+ * Offices are the seven named offices (allOffices), always listed, $0
+ * included. A sale on a branch code nobody can name is left off rather than
+ * shown under a raw code.
+ *
+ * Returns { degraded: false, mode: 'mtd', window, rows, ... } or
+ * { degraded: true, reason }. Never throws.
+ */
+export async function buildMonthToDate(deps = {}) {
+  const {
+    supabase = supabaseDefault,
+    now = () => new Date(),
+    logger = console,
+    budgetMs = POWER_RANKING_BUDGET_MS,
+  } = deps;
+  const at = new Date(now());
+  const win = deps.window || monthWindowET(at);
+
+  const bail = (reason) => {
+    logger.warn?.(`[OfficePowerRanking] month-to-date degraded (${reason})`);
+    return { degraded: true, reason };
+  };
+
+  const named = (rows) => rows.filter((r) => BRANCH_NAMES[officeMarketCode(r?.lp_branch_id)]);
+  const untilIso = win.complete ? win.endIso : at.toISOString();
+
+  const current = await readWindow({ supabase, sinceIso: win.startIso, untilIso, budgetMs, monthMode: true });
+  if (!current.ok) return bail(current.reason);
+  const currentRows = rankOffices(named(current.data), allOffices());
+
+  // Movement since yesterday: the same month's board as it stood 24h ago. Not
+  // for a closed month (final standings are the result, not a race), and not
+  // when that board was empty — ranking seven offices tied at $0 would print
+  // an arrow on every line that means nothing.
+  let rows = currentRows.map((r) => ({ ...r, move: null }));
+  let movementAvailable = false;
+  const dayAgo = new Date(at.getTime() - 86400000).toISOString();
+  if (!win.complete && dayAgo > win.startIso) {
+    const previous = await readWindow({ supabase, sinceIso: win.startIso, untilIso: dayAgo, budgetMs, monthMode: true });
+    if (previous.ok && named(previous.data).length) {
+      rows = withMovement(currentRows, rankOffices(named(previous.data), allOffices()));
+      movementAvailable = true;
+    }
+  }
+
+  return {
+    degraded: false,
+    mode: 'mtd',
+    window: win,
+    rows,
+    totalVolume: rows.reduce((t, r) => t + r.volume, 0),
+    totalCount: rows.reduce((t, r) => t + r.count, 0),
+    movementAvailable,
   };
 }

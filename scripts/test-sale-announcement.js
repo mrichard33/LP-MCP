@@ -60,7 +60,9 @@ import {
   rankOffices,
   buildCompanyOfficeRanking,
   formatCompanyOfficeRanking,
+  rangeLabel,
 } from '../src/notifications/office-ranking.js';
+import { monthWindowET, buildRepFacts } from '../src/notifications/sale-facts.js';
 
 const TOKEN = process.env.SALE_ANNOUNCE_TOKEN;
 
@@ -1125,7 +1127,7 @@ test('an FTMYR sale: celebration in #sales-all, office ranking in #sales-fortmye
     const text = h.marketCalls[0].text;
     assert.notEqual(text, h.slackCalls[0], 'the market channel does not get the celebration again');
     assert.match(text, /^📊 Tim O’Connor — 3 sales in September, \$36,300\./);
-    assert.match(text, /🏆 Fort Myers — September power ranking/);
+    assert.match(text, /🏆 Fort Myers — September 1–16 power ranking/);
     assert.match(text, /1\. Jane Smith — \$100,000 \(1\)/);
     assert.match(text, /2\. Tim O’Connor — \$36,300 \(2\) {2}← today/);
     assert.match(text, /3\. Craig Barela — \$31,500 \(1\)/);
@@ -1191,7 +1193,7 @@ test('a BOCA sale posts Fort Lauderdale’s ranking to #sales-fortlauderdale (re
 
       assert.equal(h.slackCalls.length, 1);
       assert.deepEqual(h.marketCalls.map((c) => c.channel), [C_SALES_FTLAU]);
-      assert.match(h.marketCalls[0].text, /🏆 Fort Lauderdale — September power ranking/);
+      assert.match(h.marketCalls[0].text, /🏆 Fort Lauderdale — September 1–16 power ranking/);
       assert.equal(db.announcements[0].market_code, 'BOCA', 'the raw code is recorded');
       assert.equal(db.announcements[0].slack_market_channel, C_SALES_FTLAU);
     });
@@ -1386,7 +1388,7 @@ test('formatOfficeRanking lists every rep and marks today’s', () => {
   const ranking = stubRanking('FTMYR');
   const text = formatOfficeRanking({ repLine: null, ranking, repDisplayName: 'Tim O’Connor', now: new Date('2026-09-16T15:00:00Z') });
   const lines = text.split('\n');
-  assert.equal(lines[0], '🏆 Fort Myers — September power ranking');
+  assert.equal(lines[0], '🏆 Fort Myers — September 1–16 power ranking');
   assert.equal(lines.length, 1 + ranking.rows.length + 1, 'header, every rep, total');
   assert.equal(lines.filter((l) => l.includes('← today')).length, 1);
   assert.equal(formatOfficeRanking({ ranking: { degraded: true } }), null);
@@ -1394,6 +1396,7 @@ test('formatOfficeRanking lists every rep and marks today’s', () => {
 
 test('buildOfficeRanking reads every code that posts to the office, and degrades rather than guess', async () => {
   let inArgs = null;
+  let orArg = null;
   const fake = (result) => ({
     from() {
       const chain = {
@@ -1401,7 +1404,7 @@ test('buildOfficeRanking reads every code that posts to the office, and degrades
         eq() { return chain; },
         not() { return chain; },
         in(col, vals) { inArgs = [col, vals]; return chain; },
-        gte() { return chain; },
+        or(filter) { orArg = filter; return chain; },
         limit() { return Promise.resolve(result); },
       };
       return chain;
@@ -1419,6 +1422,12 @@ test('buildOfficeRanking reads every code that posts to the office, and degrades
   assert.equal(inArgs[0], 'lp_branch_id');
   assert.deepEqual([...inArgs[1]].sort(), ['BOCA', 'FTLAU', 'MIAMI']);
   assert.equal(ok.totalVolume, 20000);
+  // Florida's September, and a won lead with no close date counts by its appointment.
+  assert.equal(
+    orArg,
+    'and(close_date.gte.2026-09-01T04:00:00.000Z,close_date.lt.2026-10-01T04:00:00.000Z),' +
+    'and(close_date.is.null,appointment_date.gte.2026-09-01T04:00:00.000Z,appointment_date.lt.2026-10-01T04:00:00.000Z)',
+  );
 
   const failed = await buildOfficeRanking('FTMYR', {
     supabase: fake({ data: null, error: { message: 'boom' } }), logger: quietLogger,
@@ -1447,17 +1456,22 @@ const OFFICE_ROWS = [
   { lp_branch_id: null, job_value: 999999 },
 ];
 
-test('rankOffices folds BOCA into Fort Lauderdale and drops codes nobody can name', () => {
+test('rankOffices lists EVERY office, folds BOCA into Fort Lauderdale, drops codes nobody can name', () => {
   assert.deepEqual(
     rankOffices(OFFICE_ROWS).map((r) => [r.rank, r.name, r.volume, r.count]),
     [
       [1, 'Fort Myers', 80000, 2],
       [2, 'Jacksonville', 60000, 1],
       [3, 'Fort Lauderdale', 25000, 2],
+      [4, 'Lakeland', 0, 0],
+      [4, 'Orlando', 0, 0],
+      [4, 'Sarasota', 0, 0],
+      [4, 'St. Petersburg', 0, 0],
     ],
   );
+  assert.equal(rankOffices([]).length, 7, 'a month with no sales still lists all seven offices');
   const tied = rankOffices([{ lp_branch_id: 'ORL', job_value: 5 }, { lp_branch_id: 'SAR', job_value: 5 }]);
-  assert.deepEqual(tied.map((r) => r.rank), [1, 1]);
+  assert.deepEqual(tied.slice(0, 2).map((r) => r.rank), [1, 1]);
 });
 
 test('the #sales-all stats reply carries the office board, with this sale’s office marked', async () => {
@@ -1478,10 +1492,14 @@ test('the #sales-all stats reply carries the office board, with this sale’s of
   const [statsPart, boardPart] = h.statsCalls[0].text.split('\n\n');
   assert.match(statsPart, /^📊 Tim O’Connor — 3 sales in September, \$36,300\./);
   assert.equal(boardPart, [
-    '🏢 Office power ranking — September',
+    '🏢 Office power ranking — September 1–16',
     '1. Fort Myers — $80,000 (2)',
     '2. Jacksonville — $60,000 (1)',
     '3. Fort Lauderdale — $25,000 (2)  ← this sale',
+    '4. Lakeland — $0 (0)',
+    '4. Orlando — $0 (0)',
+    '4. Sarasota — $0 (0)',
+    '4. St. Petersburg — $0 (0)',
   ].join('\n'));
 });
 
@@ -1538,7 +1556,7 @@ test('buildCompanyOfficeRanking ranks offices and degrades rather than guess', a
         select() { return chain; },
         eq() { return chain; },
         not() { return chain; },
-        gte() { return chain; },
+        or() { return chain; },
         limit() { return Promise.resolve(result); },
       };
       return chain;
@@ -1558,4 +1576,57 @@ test('buildCompanyOfficeRanking ranks offices and degrades rather than guess', a
   assert.equal(truncated.degraded, true, 'a truncated board is never published');
 
   assert.equal(formatCompanyOfficeRanking({ ranking: failed }), null);
+});
+
+// ═════════════════════════════════════════════════════════════════
+// Month to date, in Florida time (2026-09-25)
+// ═════════════════════════════════════════════════════════════════
+test('monthWindowET resets on the 1st in Florida, not at 8 PM the night before', () => {
+  const lateSep30 = monthWindowET(new Date('2026-10-01T03:30:00Z')); // 11:30 PM ET Sept 30
+  assert.equal(lateSep30.monthName, 'September');
+  assert.equal(lateSep30.throughDay, 30);
+  const earlyOct1 = monthWindowET(new Date('2026-10-01T04:30:00Z')); // 12:30 AM ET Oct 1
+  assert.equal(earlyOct1.monthName, 'October');
+  assert.equal(earlyOct1.startIso, '2026-10-01T04:00:00.000Z');
+  assert.equal(earlyOct1.throughDay, 1);
+  // Standard time: December starts at 05:00Z.
+  assert.equal(monthWindowET(new Date('2026-12-10T12:00:00Z')).startIso, '2026-12-01T05:00:00.000Z');
+  // Last month, for the final standings on the 1st.
+  const closed = monthWindowET(new Date('2026-10-01T12:00:00Z'), -1);
+  assert.equal(closed.monthName, 'September');
+  assert.equal(closed.throughDay, 30);
+  assert.equal(closed.endIso, '2026-10-01T04:00:00.000Z');
+});
+
+test('every board states its range: the 1st through today', () => {
+  assert.equal(rangeLabel(monthWindowET(new Date('2026-09-25T15:00:00Z'))), 'September 1–25');
+  assert.equal(rangeLabel(monthWindowET(new Date('2026-10-01T15:00:00Z'))), 'October 1');
+  const text = formatCompanyOfficeRanking({
+    ranking: { degraded: false, rows: rankOffices([]), window: monthWindowET(new Date('2026-09-25T15:00:00Z')) },
+    showTotal: true,
+  });
+  assert.match(text, /^🏢 Office power ranking — September 1–25\n/);
+  assert.match(text, /Company total: \$0 · 0 sales$/);
+});
+
+test('buildRepFacts counts a won lead with no close date by its appointment date', async () => {
+  let orArg = null;
+  let gteCalledOnCloseDate = false;
+  const supabase = {
+    from() {
+      const chain = {
+        select() { return chain; },
+        eq() { return chain; },
+        not() { return chain; },
+        gte(col) { if (col === 'close_date') gteCalledOnCloseDate = true; return chain; },
+        or(f) { orArg = f; return chain; },
+        limit() { return Promise.resolve({ data: [], error: null }); },
+      };
+      return chain;
+    },
+  };
+  await buildRepFacts('Tim O’Connor', 1000, { supabase, now: () => new Date('2026-09-25T15:00:00Z'), logger: quietLogger });
+  assert.match(orArg, /and\(close_date\.is\.null,appointment_date\.gte\.2026-09-01T04:00:00\.000Z/);
+  // The trailing-year history read still filters close_date directly; the MONTH read must not.
+  assert.ok(gteCalledOnCloseDate, 'history read unchanged');
 });

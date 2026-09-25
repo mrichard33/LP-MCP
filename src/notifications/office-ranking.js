@@ -36,7 +36,7 @@
 import supabaseDefault from '../supabase.js';
 import { officeMarketCode, officeMarketCodes } from '../slack.js';
 import { branchName, BRANCH_NAMES } from '../approval-card.js';
-import { repNameKey, monthStart, MTD_ROW_LIMIT } from './sale-facts.js';
+import { repNameKey, monthWindowET, wonInWindowFilter, MTD_ROW_LIMIT } from './sale-facts.js';
 
 export const RANKING_BUDGET_MS = 3000;
 
@@ -46,8 +46,24 @@ function money(n) {
   return `$${Math.round(v).toLocaleString('en-US')}`;
 }
 
-function monthName(date) {
-  return new Date(date).toLocaleString('en-US', { month: 'long', timeZone: 'UTC' });
+/**
+ * "September 1–25": the range every board states outright, so nobody has to
+ * guess whether a number is month-to-date (2026-09-25 request: the 1st through
+ * today, every day). A closed month reads "September 1–30".
+ */
+export function rangeLabel(win) {
+  if (!win) return '';
+  return win.throughDay > win.firstDay
+    ? `${win.monthName} ${win.firstDay}–${win.throughDay}`
+    : `${win.monthName} ${win.firstDay}`;
+}
+
+/**
+ * The offices a board always lists, even at $0: every named branch that is its
+ * own office (BOCA and MIAMI post as Fort Lauderdale, so they are not).
+ */
+export function allOffices() {
+  return Object.keys(BRANCH_NAMES).filter((code) => officeMarketCode(code) === code);
 }
 
 /** LP "Wheeler, Donte" → "Donte Wheeler". Anything without a comma is left as is. */
@@ -99,6 +115,7 @@ export async function buildOfficeRanking(market, deps = {}) {
     logger = console,
     budgetMs = RANKING_BUDGET_MS,
   } = deps;
+  const win = deps.window || monthWindowET(now());
 
   const office = officeMarketCode(market);
   if (!office) return { degraded: true, reason: 'no_market' };
@@ -119,7 +136,7 @@ export async function buildOfficeRanking(market, deps = {}) {
         .eq('closed_won', true)
         .not('rep_name', 'is', null)
         .in('lp_branch_id', codes)
-        .gte('close_date', monthStart(now()))
+        .or(wonInWindowFilter(win.startIso, win.endIso))
         .limit(MTD_ROW_LIMIT),
       new Promise((resolve) => { timer = setTimeout(() => resolve({ __timedOut: true }), budgetMs); }),
     ]);
@@ -139,6 +156,7 @@ export async function buildOfficeRanking(market, deps = {}) {
     degraded: false,
     office,
     officeName: branchName(office) || office,
+    window: win,
     rows,
     totalVolume: rows.reduce((t, r) => t + r.volume, 0),
     totalCount: rows.reduce((t, r) => t + r.count, 0),
@@ -151,7 +169,7 @@ export async function buildOfficeRanking(market, deps = {}) {
  *
  *   📊 Donte Wheeler — 7 sales in September, $185,801.
  *
- *   🏆 Jacksonville — September power ranking
+ *   🏆 Jacksonville — September 1–25 power ranking
  *   1. Donte Wheeler — $185,801 (7)  ← today
  *   2. Beverly Dorsett — $107,297 (5)
  *   Office total: $292,098 · 12 sales
@@ -162,7 +180,7 @@ export function formatOfficeRanking({ repLine = null, ranking = null, repDisplay
 
   if (ranking && !ranking.degraded && ranking.rows?.length) {
     const today = repNameKey(repDisplayName);
-    const lines = [`🏆 ${ranking.officeName} — ${monthName(now)} power ranking`];
+    const lines = [`🏆 ${ranking.officeName} — ${rangeLabel(ranking.window || monthWindowET(now))} power ranking`];
     for (const r of ranking.rows) {
       lines.push(
         `${r.rank}. ${r.name} — ${money(r.volume)} (${r.count})` + (today && r.key === today ? '  ← today' : ''),
@@ -186,11 +204,19 @@ export function formatOfficeRanking({ repLine = null, ranking = null, repDisplay
 // channel routing (BOCA/MIAMI count for Fort Lauderdale). A sale whose lead has
 // no branch, or a branch code we cannot name, is left off rather than shown
 // under a raw code nobody on the floor would recognise.
+//
+// 2026-09-25: EVERY office is listed, $0 included — a board that silently
+// drops an office reads as "that office does not exist", not "had no sales".
 // ─────────────────────────────────────────────────────────────────
 
-/** Pure: rows of { lp_branch_id, job_value } → offices ranked by volume (ties share a rank). */
+/**
+ * Pure: rows of { lp_branch_id, job_value } → every office ranked by volume
+ * (ties share a rank; offices with no sales sit at $0 at the bottom).
+ */
 export function rankOffices(rows) {
-  const byOffice = new Map();
+  const byOffice = new Map(
+    allOffices().map((office) => [office, { office, name: BRANCH_NAMES[office], volume: 0, count: 0 }]),
+  );
   for (const r of rows || []) {
     const office = officeMarketCode(r.lp_branch_id);
     if (!office || !BRANCH_NAMES[office]) continue;
@@ -223,6 +249,7 @@ export async function buildCompanyOfficeRanking(deps = {}) {
     logger = console,
     budgetMs = RANKING_BUDGET_MS,
   } = deps;
+  const win = deps.window || monthWindowET(now());
 
   const bail = (reason) => {
     logger.warn?.(`[SaleAnnounce] office-vs-office ranking degraded (${reason})`);
@@ -238,7 +265,7 @@ export async function buildCompanyOfficeRanking(deps = {}) {
         .select('lp_branch_id, job_value')
         .eq('closed_won', true)
         .not('lp_branch_id', 'is', null)
-        .gte('close_date', monthStart(now()))
+        .or(wonInWindowFilter(win.startIso, win.endIso))
         .limit(MTD_ROW_LIMIT),
       new Promise((resolve) => { timer = setTimeout(() => resolve({ __timedOut: true }), budgetMs); }),
     ]);
@@ -253,22 +280,40 @@ export async function buildCompanyOfficeRanking(deps = {}) {
   const data = Array.isArray(res?.data) ? res.data : [];
   if (data.length >= MTD_ROW_LIMIT) return bail(`truncated_at_${MTD_ROW_LIMIT}`);
 
-  return { degraded: false, rows: rankOffices(data) };
+  const rows = rankOffices(data);
+  return {
+    degraded: false,
+    window: win,
+    rows,
+    totalVolume: rows.reduce((t, r) => t + r.volume, 0),
+    totalCount: rows.reduce((t, r) => t + r.count, 0),
+  };
 }
 
 /**
- * Pure: the office board block for the #sales-all stats reply, or null.
+ * Pure: the office board, or null.
  *
- *   🏢 Office power ranking — September
- *   1. Fort Myers — $1,448,173 (62)  ← this sale
- *   2. St. Petersburg — $1,303,392 (53)
+ *   🏢 Office power ranking — September 1–25
+ *   1. Fort Myers — $1,639,894 (67)  ← this sale
+ *   ...
+ *   7. Lakeland — $72,364 (4)
+ *
+ * `title` replaces the header (the daily post and the final standings use
+ * their own); `showTotal` adds a company total line.
  */
-export function formatCompanyOfficeRanking({ ranking = null, market = null, now = new Date() } = {}) {
+export function formatCompanyOfficeRanking({
+  ranking = null, market = null, now = new Date(), title = null, showTotal = false,
+} = {}) {
   if (!ranking || ranking.degraded || !ranking.rows?.length) return null;
   const here = officeMarketCode(market);
-  const lines = [`🏢 Office power ranking — ${monthName(now)}`];
+  const lines = [title || `🏢 Office power ranking — ${rangeLabel(ranking.window || monthWindowET(now))}`];
   for (const r of ranking.rows) {
     lines.push(`${r.rank}. ${r.name} — ${money(r.volume)} (${r.count})` + (here && r.office === here ? '  ← this sale' : ''));
+  }
+  if (showTotal) {
+    const count = ranking.rows.reduce((t, r) => t + r.count, 0);
+    const volume = ranking.rows.reduce((t, r) => t + r.volume, 0);
+    lines.push(`Company total: ${money(volume)} · ${count} ${count === 1 ? 'sale' : 'sales'}`);
   }
   return lines.join('\n');
 }
