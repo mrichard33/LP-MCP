@@ -98,7 +98,11 @@ INSERT INTO kb_faqs (kb_key, question_pattern, canonical_answer, channel, tier, 
  'both', 'factual', true, $$Source: product ch03.$$),
 
 ('LIB-P04',
- $$Why vinyl instead of aluminum? | Isn't aluminum stronger? | What are the frames made of? | Are vinyl frames strong enough? | Do you sell aluminum or vinyl windows?$$,
+ -- The customer phrasing leads DELIBERATELY. With "Why vinyl instead of
+ -- aluminum?" first, "Do you sell aluminum windows?" was won by LIB-P09
+ -- (doors) at 0.510 — the LEADING phrase dominates the embedding, so the
+ -- most-asked wording goes first. Verified 0.510 wrong -> 0.562 right.
+ $$Do you sell aluminum or vinyl windows? | Why vinyl instead of aluminum? | Isn't aluminum stronger? | What are the frames made of? | Are vinyl frames strong enough? | I'm only interested in aluminum windows.$$,
  $$Our vinyl frames are reinforced with a metal alloy, and the manufacturer rates them 3 times stronger than aluminum. They're also backed for life against pitting, corroding, and cracking.$$,
  'both', 'factual', true,
  $$Attribute the strength claim to the MANUFACTURER. Source: product ch04/ch05. Replaces #3.$$),
@@ -262,5 +266,15 @@ INSERT INTO kb_faqs (kb_key, question_pattern, canonical_answer, channel, tier, 
  $$Yes, we offer 0% APR financing so you can protect your home now and pay over time. A specialist walks you through the terms at the visit so you can pick a monthly amount that fits.$$,
  'both', 'factual', true,
  $$Mark's ruling 2026-09-25: KEEP the 0% APR claim. This DEPARTS from Golden KB Library v1.1, which asked for confirmation before stating it. Beyond 0% APR, quote no rates or terms in chat (canon ch13). Replaces #8.$$);
+
+-- ── 3. Post-ingest corrections, found by re-probing ─────────────────────
+-- #2 is a legacy row with no alternate phrasings, and it lost its own
+-- question to LIB-P11 (inspect existing windows) by 0.009 — close, but the
+-- right answer to a REPAIR question is this one, not the inspection one.
+-- Verified 0.556 (2nd) -> 0.675 (1st, clear of LIB-P11 at 0.565).
+UPDATE kb_faqs
+SET question_pattern = $$Does Reece repair old windows? | Can you just fix the windows I already have? | Can you repair my windows? | Do you do window repair? | Can you fix my existing windows?$$,
+    updated_at = now()
+WHERE id = 2 AND active = true;
 
 COMMIT;
