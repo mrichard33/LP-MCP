@@ -308,6 +308,7 @@ import { registerLinkLeakRoutes, startLinkLeakScheduler } from './jobs/link-leak
 import { registerP2UnresolvableRoutes, startP2UnresolvableScheduler } from './jobs/p2-unresolvable-monitor.js';
 import { registerTagHygieneRoutes, startTagHygieneScheduler } from './jobs/tag-hygiene-sweep.js';  // 2026-09-22
 import { startOfficePowerRankingScheduler } from './jobs/office-power-ranking.js';  // 2026-09-24
+import { startSaleBackstopScheduler } from './jobs/sale-announce-backstop.js';  // 2026-09-25
 import { startMissedCallerRecoveryScheduler } from './jobs/missed-caller-recovery.js';  // 2026-09-24
 import { registerCiRoutes } from './ci/routes.js';
 import { startCiWorkerScheduler } from './ci/worker.js';
@@ -1868,7 +1869,8 @@ async function runMigrations() {
               ADD COLUMN IF NOT EXISTS slack_market_channel text,
               ADD COLUMN IF NOT EXISTS slack_market_ts text,
               ADD COLUMN IF NOT EXISTS market_message_text text,
-              ADD COLUMN IF NOT EXISTS market_error text;`);
+              ADD COLUMN IF NOT EXISTS market_error text;
+            ALTER TABLE sale_announcements ADD COLUMN IF NOT EXISTS announce_source text;`);
     console.log('[Migration] sale announcements (sql/117, 119, 128) + close_date_source (sql/118) ready');
   } catch (err) {
     console.error('[Migration] sale announcements FAILED (POST /notifications/sale-announcement will 500 on every sale until sql/117 is applied from the dashboard):', err.message);
@@ -2587,6 +2589,7 @@ const server = app.listen(PORT, async () => {
   startP2UnresolvableScheduler();
   startTagHygieneScheduler();
   startOfficePowerRankingScheduler();
+  startSaleBackstopScheduler();
   startMissedCallerRecoveryScheduler();
   // Probe ffmpeg, which transcodes Five9's GSM 6.10 recordings to a format a
   // browser can actually play. A CLEAR LOG LINE, NOT A CRASH: without it the
