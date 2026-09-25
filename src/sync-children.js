@@ -70,6 +70,7 @@ import { verifiedStamp, VERIFIED_FROM, FRESHNESS_VOLATILE_COLUMNS } from './serv
 import {
   detectJobStatusChange, buildJobStatusEvent, classifyJobStatusEmit,
 } from './services/job-status-change.js';
+import { noteOriginOf } from './note-origin.js';
 
 // ─── Note edit detection (2026-09-18) ────────────────────────────────────
 // syncNotes has always been INSERT-ONLY: it batch-checks lp_note_id and
@@ -455,19 +456,9 @@ export async function syncNotes(lpLeadId, ghlContactId, notes) {
     }
   }
 
-  // 2026-07-29 echo-loop fix. A note the GHL→LP pipeline wrote onto the LP
-  // prospect comes back to us here; without this stamp pushNotesToGHL sends it
-  // straight back to the GHL contact it came from, wrapped in a "📋 LP Note"
-  // header that defeats addGHLNote's body-match dedup. Classify once, at
-  // ingest, so the push filter is a plain indexed equality.
-  //
-  // BOTH prefixes are matched on purpose: rows written before Task F carry the
-  // legacy "[AI BRIEF", rows after carry "[GHL · AI BRIEF". "** IMPORTANT **"
-  // is prepended by writeLpNote for landmine notes.
-  const noteOriginOf = (body) => {
-    const b = String(body || '').replace(/^\*\* IMPORTANT \*\*\s*/, '');
-    return /^\[(?:GHL · )?AI BRIEF · /.test(b) ? 'ghl_ai_brief' : 'lp';
-  };
+  // 2026-07-29 echo-loop fix, 2026-09-25 Revin: note_origin is classified
+  // once, at ingest, so the push filter is a plain indexed equality. The
+  // classifier (and why) lives in src/note-origin.js.
 
   // Batched (perf/batch-child-sync) — was one round-trip per note. Deduped by
   // lp_note_id, last occurrence wins: the id fallback above is
@@ -512,7 +503,7 @@ export async function syncNotes(lpLeadId, ghlContactId, notes) {
       // ghlContactId is one parameter for the whole call, so every object in
       // noteRows either carries the key or none of them does.
       ...(ghlContactId ? { ghl_contact_id: ghlContactId } : {}),
-      note_origin:         noteOriginOf(noteBody),
+      note_origin:         noteOriginOf(noteBody, getField(note, 'enteredby', 'EnteredBy', 'rep_name', 'entered_by')),
       note_body:           noteBody,
       note_type:           getField(note, 'rectype', 'RecType', 'type', 'note_type'),
       note_category:       getField(note, 'category', 'Category'),

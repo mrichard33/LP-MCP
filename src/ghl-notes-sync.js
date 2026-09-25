@@ -17,6 +17,10 @@
 
 import supabase from './supabase.js';
 import { addGHLNote } from './ghl.js';
+import { NEVER_PUSH_ORIGINS } from './note-origin.js';
+
+// PostgREST list literal for .not('note_origin', 'in', …).
+const NEVER_PUSH_IN = `(${NEVER_PUSH_ORIGINS.join(',')})`;
 
 // ─── Terminal failure state (sql/050) ────────────────────────────────────────
 //
@@ -145,8 +149,9 @@ export async function pushNotesToGHL({ batchSize = 50, delayMs = 300, maxNotes =
       .not('ghl_contact_id', 'is', null)
       .eq('ghl_note_pushed', false)
       .eq('ghl_note_push_terminal', false)
-      // Echo-loop guard: never push a note that originated in GHL back to GHL.
-      .neq('note_origin', 'ghl_ai_brief')
+      // Echo-loop guard: never push a GHL AI brief back to GHL.
+      // See src/note-origin.js.
+      .not('note_origin', 'in', NEVER_PUSH_IN)
       .not('note_body', 'is', null)
       // OLDEST FIRST — so newest notes are added last and appear at top in GHL
       .order('created_at_lp', { ascending: true, nullsFirst: false })
@@ -236,8 +241,9 @@ export async function pushLeadNotesImmediately(lpLeadId, ghlContactId) {
       .eq('lp_lead_id', lpLeadId)
       .eq('ghl_note_pushed', false)
       .eq('ghl_note_push_terminal', false)
-      // Echo-loop guard: never push a note that originated in GHL back to GHL.
-      .neq('note_origin', 'ghl_ai_brief')
+      // Echo-loop guard: never push a GHL AI brief back to GHL.
+      // See src/note-origin.js.
+      .not('note_origin', 'in', NEVER_PUSH_IN)
       .not('note_body', 'is', null)
       .order('created_at_lp', { ascending: true, nullsFirst: false });
 
@@ -306,8 +312,9 @@ export async function countUnpushedNotes() {
       .not('ghl_contact_id', 'is', null)
       .eq('ghl_note_pushed', false)
       .eq('ghl_note_push_terminal', false)
-      // Echo-loop guard: never push a note that originated in GHL back to GHL.
-      .neq('note_origin', 'ghl_ai_brief')
+      // Echo-loop guard: never push a GHL AI brief back to GHL.
+      // See src/note-origin.js.
+      .not('note_origin', 'in', NEVER_PUSH_IN)
       .not('note_body', 'is', null);
     if (error) return -1;
     return count || 0;

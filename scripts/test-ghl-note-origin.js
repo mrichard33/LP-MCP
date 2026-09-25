@@ -14,6 +14,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { stampNoteOrigin } from '../src/ghl-note-pipeline/summarizer.js';
+import { noteOriginOf, NEVER_PUSH_ORIGINS } from '../src/note-origin.js';
 
 const CID = 'j4U3klwGR5dzx64Szfe8';
 const BRIEF = `[AI BRIEF · 7/28/26 7:37 PM]  COLD · appt missed
@@ -69,11 +70,8 @@ test('empty / null input does not throw', () => {
 });
 
 // ─── Task H: origin classification must match BOTH prefixes ──────────────────
-// Mirrors noteOriginOf() in src/sync-children.js and the sql/050 backfill.
-const noteOriginOf = (body) => {
-  const b = String(body || '').replace(/^\*\* IMPORTANT \*\*\s*/, '');
-  return /^\[(?:GHL · )?AI BRIEF · /.test(b) ? 'ghl_ai_brief' : 'lp';
-};
+// The real classifier (src/note-origin.js) — this suite used to carry a copy,
+// which is how a mirror drifts from what ingest actually does.
 
 test('classifies the LEGACY [AI BRIEF prefix as GHL-origin', () => {
   assert.equal(noteOriginOf(BRIEF), 'ghl_ai_brief');
@@ -117,4 +115,26 @@ test('the round-tripped GHL wrapper is still classified GHL-origin', () => {
   // the stored body is the bare brief — this asserts we classify what we store.
   assert.equal(noteOriginOf(BRIEF), 'ghl_ai_brief');
   assert.equal(noteOriginOf(wrapped), 'lp'); // wrapper form is not a stored shape
+});
+
+// ─── 2026-09-25: Revin summaries are labelled lp_revin and still pushed ─────
+
+test('a note by "Agent, Revin" is lp_revin, whatever its body', () => {
+  assert.equal(noteOriginOf('Customer replied YES to appointment reminder.', 'Agent, Revin'), 'lp_revin');
+  assert.equal(noteOriginOf('x', 'agent,revin'), 'lp_revin');
+});
+
+test('a person\'s note, or a rep merely named like Revin, stays lp', () => {
+  assert.equal(noteOriginOf('Revin texted them earlier', 'Griffin, Sean'), 'lp');
+  assert.equal(noteOriginOf('x', 'Revington, Sam'), 'lp');
+  assert.equal(noteOriginOf('x', null), 'lp');
+});
+
+test('an AI brief is still ghl_ai_brief even if Revin somehow authored it', () => {
+  assert.equal(noteOriginOf(BRIEF, 'Agent, Revin'), 'ghl_ai_brief');
+});
+
+test('the push skips only GHL AI briefs — Revin summaries still go to GHL', () => {
+  assert.deepEqual([...NEVER_PUSH_ORIGINS], ['ghl_ai_brief']);
+  assert.ok(!NEVER_PUSH_ORIGINS.includes('lp_revin'));
 });

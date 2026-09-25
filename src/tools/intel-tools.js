@@ -511,7 +511,7 @@ export function registerIntelTools(server) {
               source: 'lp',
               type: 'note',
               summary: `Note: ${body.slice(0, 100)}${body.length > 100 ? '…' : ''}`,
-              detail: { full_note: body, rep: row.rep_name, lp_lead_id: row.lp_lead_id },
+              detail: { full_note: body, rep: row.created_by_rep_name ?? row.rep_name, lp_lead_id: row.lp_lead_id },  // lp_notes has no rep_name column (2026-09-25)
             });
           } else if (source === 'lp_activities') {
             events.push({
