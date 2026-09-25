@@ -107,6 +107,7 @@
  *   doesn't wait on the approval pipeline), then nulled so downstream
  *   companion handlers never see an unknown type. Tags applied:
  *     accepted → enroll:s2.2-chatbot + hurricane-guide-queue
+ *     (2026-09-25: send-hurricane-guide — the U.GUIDE delivery tag)
  *     declined → enroll:s2.2-chatbot + hurricane-guide-declined
  *   Delivery itself is owned by GHL workflow U.GUIDE (0f51bc3d), which is
  *   gate-idempotent — re-queues and regenerates cannot double-send.
@@ -257,6 +258,10 @@
 import { buildLeadContext } from './context-builder.js';
 import { classifyInbound, isShortCircuit } from './knowledge/intent-classifier.js';
 import { handoffReplyPolicy, handoffReplyNote } from './agentic/handoff-policy.js';
+import {
+  HURRICANE_GUIDE_TAG, guideAwaitingDelivery, guideResendOps, guideResendReplyNote, guideTagForType,
+  lastOutboundOfferedGuide, isGuideAcceptance,
+} from './agentic/guide-delivery.js';
 import { notInterestedTurn } from './agentic/not-interested.js';
 import {
   buildKbPack,
@@ -337,7 +342,7 @@ import { resolveServicePhone } from './services/market-phone.js';
 import * as P from './prompts/response-generator/index.js';
 import { dialWindowPromptLine, canPromiseImmediateCall } from './dial-window.js';
 import { normalizeRepNote } from './agentic/rep-note.js';
-import { findUndeliveredSendPromise, undeliveredPromiseNote, validateInfoEmailPayload } from './agentic/send-promise.js';
+import { findUndeliveredSendPromise, undeliveredPromiseNote, rewriteUndeliveredPromise, validateInfoEmailPayload } from './agentic/send-promise.js';
 // v2.7.14 — Bot Review Phase 0. Pure shaping helpers only: no I/O, no writes.
 import { buildInputSnapshot, extractKbModes, extractKbSources } from './bot-feedback/fingerprint-core.js';
 
@@ -1458,11 +1463,16 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
   // v2.7.11: guide-offer gate state for the GUIDE OFFER — BOOKING FAILURE
   // EXIT section. Computed from the three hurricane-guide-* tags so the AI
   // never has to infer gate state from raw tag lists.
+  // 2026-09-25 — the bot's OWN offer counts as offered. Nothing tags
+  // hurricane-guide-offered when the responder makes the offer in text, so
+  // "Yeah sure" to it read as a fresh turn and the guide never went (Mark Test
+  // BazzY5Ihu2heR4osVlBF, action 497141 → 497148).
   {
     const gTags = context.lead.current_tags || [];
     const gSent = gTags.includes('hurricane-guide-sent');
     const gDeclined = gTags.includes('hurricane-guide-declined');
-    const gOffered = gTags.includes('hurricane-guide-offered');
+    const gOffered = gTags.includes('hurricane-guide-offered') ||
+      lastOutboundOfferedGuide(context.conversation_recent) === 'hurricane';
     if (gSent || gDeclined) {
       parts.push(...P.guideOfferResolved(gSent ? "sent" : "declined"));
     } else if (gOffered) {
@@ -3066,7 +3076,34 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     handoff = makeShortCircuitResult(classification, channel, triggerMessage);
     console.log(`[ResponseGenerator] HANDOFF + REPLY for ${contactId}: ${classification.intent_class} → ${classification.ghl_handoff_tag} (${classification.classification_method})`);
   }
-  const promptHint = [opts.promptHint, handoff ? handoffReplyNote(classification.intent_class) : null]
+
+  // 2026-09-25 — "didn't get it" re-sends a guide in the same turn (Mark Test
+  // BazzY5Ihu2heR4osVlBF: "I didn't get it?" got silence, then a handoff with
+  // nothing sent). When the missing item is a guide and an email is on file,
+  // the send handler re-fires the delivery tag (handoff.guide_resend) and the
+  // reply is a holding reply that is TRUE: it is being resent right now. Any
+  // other missing item keeps the FULFILLMENT_NOT_RECEIVED note (send_info_email,
+  // or a team member follows up). The human alert is unchanged either way.
+  let guideResend = null;
+  if (handoff && String(classification.intent_class || '').toUpperCase() === 'FULFILLMENT_NOT_RECEIVED' &&
+      context.lead?.email) {
+    const guideType = guideAwaitingDelivery({
+      tags: context.lead?.current_tags || [],
+      conversation: context.conversation_recent || [],
+      inbound: triggerMessage,
+    });
+    const queued = Array.isArray(opts.deliveryTags) ? opts.deliveryTags : [];
+    const ops = guideType ? guideResendOps(guideType, { alreadyQueued: queued.includes(guideTagForType(guideType)) }) : null;
+    if (ops) {
+      guideResend = { type: guideType, ...ops };
+      handoff.guide_resend = guideResend;
+      console.log(`[ResponseGenerator] guide resend for ${contactId}: ${guideType} → remove [${ops.remove.join(', ')}] add [${ops.add.join(', ')}]`);
+    }
+  }
+  const handoffNote = guideResend
+    ? guideResendReplyNote(guideResend.type)
+    : (handoff ? handoffReplyNote(classification.intent_class) : null);
+  const promptHint = [opts.promptHint, handoffNote]
     .filter(Boolean).join('\n\n') || null;
 
   const buyerStage    = inferBuyerStage(context);
@@ -3565,6 +3602,31 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     }
   }
 
+  // ─── Accepted guide offer delivers (2026-09-25 — GHL BazzY5Ihu2heR4osVlBF) ───
+  //
+  // The bot offered the Hurricane Preparedness Guide "to the email on file",
+  // the lead said "Yeah sure", and no tag went on. The prompt asks for
+  // guide_disposition; this makes it true whatever the model emitted. Only
+  // when: the bot's last message offered THE hurricane guide, this inbound is
+  // a plain yes, an email is on file (U.GUIDE sends only to one), the guide is
+  // not already resolved, nothing else in this turn already delivers it, and
+  // the model chose no other companion (a booking always wins).
+  if (!validated.companion_action &&
+      !(opts.deliveryTags || []).length &&
+      context.lead?.email &&
+      lastOutboundOfferedGuide(context.conversation_recent) === 'hurricane' &&
+      isGuideAcceptance(triggerMessage)) {
+    const gTags = context.lead?.current_tags || [];
+    if (!gTags.includes('hurricane-guide-sent') && !gTags.includes('hurricane-guide-declined')) {
+      validated.companion_action = {
+        action_type: 'guide_disposition',
+        action_payload: { outcome: 'accepted' },
+        reasoning: `server: "${String(triggerMessage).slice(0, 60)}" accepts the guide offer in the previous outbound`,
+      };
+      console.log(`[ResponseGenerator] guide offer accepted by ${contactId} — guide_disposition forced (model emitted none)`);
+    }
+  }
+
   // ─── Undelivered-promise guard (2026-09-24 — GHL BazzY5Ihu2heR4osVlBF) ───
   //
   // "Sending that comparison to <email> now" went out with nothing attached
@@ -3574,11 +3636,22 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // shape as the guards below: regenerate once; if the retry still promises
   // without delivering, ship it FLAGGED — send-message-handler turns the flag
   // into a rep task, so a person keeps the promise instead of nobody.
+  //
+  // 2026-09-25 — the delivery can also be a TAG this turn adds: the guide_send
+  // dispatch's sibling add_tag (opts.deliveryTags) or a guide resend. And a
+  // promise that survives the retry is no longer shipped as written: the
+  // sentence is rewritten to "I'll have the team send that over to <email>",
+  // and the flag still files the rep task that keeps it.
   {
-    const promise = findUndeliveredSendPromise(validated.message, validated.companion_action, { channel });
+    const deliveryTags = [
+      ...(Array.isArray(opts.deliveryTags) ? opts.deliveryTags : []),
+      ...(guideResend ? [guideResend.tag] : []),
+    ];
+    const promise = findUndeliveredSendPromise(validated.message, validated.companion_action, { channel, deliveryTags });
     if (promise) {
       if (opts.regenerationNote) {
-        console.warn(`[ResponseGenerator] ⚠️ undelivered send promise survived regeneration for ${contactId}: "${promise}" — sending flagged for a rep`);
+        validated.message = rewriteUndeliveredPromise(validated.message, promise, { email: context.lead?.email || null });
+        console.warn(`[ResponseGenerator] ⚠️ undelivered send promise survived regeneration for ${contactId}: "${promise}" — rewritten to a team send, flagged for a rep`);
         validated.undelivered_promise = promise;
       } else {
         console.warn(`[ResponseGenerator] ⚠️ undelivered send promise for ${contactId}: "${promise}" — regenerating once`);
@@ -3718,10 +3791,17 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // booking:active pattern rather than the post-send companion pipeline.
   // Idempotent by design: U.GUIDE re-entry is gate-guarded and the S2.2
   // enrollment rule is suppression-gated, so a regenerate cannot double-fire.
+  //
+  // 2026-09-25 — accepted adds send-hurricane-guide, the tag U.GUIDE Hurricane
+  // Guide Delivery is named for (it also listens for hurricane-guide-queue,
+  // which S2.2 adds on its own path). If this same turn's dispatch batch
+  // already adds it, it is not added twice — U.GUIDE removes the tag on entry,
+  // so a second add would enroll the contact a second time.
   if (validated.companion_action?.action_type === 'guide_disposition' && !dryRun) {
     const gdOutcome = validated.companion_action.action_payload.outcome;
+    const alreadyQueued = (opts.deliveryTags || []).includes(HURRICANE_GUIDE_TAG);
     const gdTags = gdOutcome === 'accepted'
-      ? ['enroll:s2.2-chatbot', 'hurricane-guide-queue']
+      ? ['enroll:s2.2-chatbot', ...(alreadyQueued ? [] : [HURRICANE_GUIDE_TAG])]
       : ['enroll:s2.2-chatbot', 'hurricane-guide-declined'];
     for (const gdTag of gdTags) {
       applyGHLTag(contactId, gdTag).catch(err =>

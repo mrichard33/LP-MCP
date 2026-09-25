@@ -10,7 +10,8 @@
  * it.
  *
  * Pure and dependency-free. Used by src/response-generator.js (regenerate
- * once, then flag) and unit-tested in scripts/test-info-email.js.
+ * once, then rewrite to "the team will send it" and flag for a rep task) and
+ * unit-tested in scripts/test-info-email.js and scripts/test-guide-delivery.js.
  */
 
 // First-person promise to deliver something, or a claim that it is on its
@@ -68,18 +69,24 @@ export function findSendPromise(message) {
  *   - companion_action guide_disposition accepted (the Hurricane
  *     Preparedness Guide flow delivers it).
  *
+ *   - deliveryTags: a guide delivery tag the SAME turn adds (2026-09-25). The
+ *     layer3 guide_send dispatch delivers through a sibling add_tag
+ *     (send-<type>-guide), and a "didn't get it" turn re-adds one; either is
+ *     the send, and "I'm sending that guide now" is then true.
+ *
  * Email replies are exempt: an email IS the delivery, and "I've attached the
  * details below" in an email is true.
  *
  * @param {string} message
  * @param {object|null} companion   validated companion_action
- * @param {{channel?: string}} [opts]
+ * @param {{channel?: string, deliveryTags?: string[]}} [opts]
  * @returns {string|null}
  */
-export function findUndeliveredSendPromise(message, companion, { channel = 'sms' } = {}) {
+export function findUndeliveredSendPromise(message, companion, { channel = 'sms', deliveryTags = [] } = {}) {
   if (channel === 'email') return null;
   const promise = findSendPromise(message);
   if (!promise) return null;
+  if (Array.isArray(deliveryTags) && deliveryTags.length > 0) return null;
   const type = companion?.action_type || null;
   if (type === 'send_info_email') return null;
   // The guide flow delivers on acceptance; its confirmation ("it'll hit your
@@ -99,6 +106,29 @@ export function undeliveredPromiseNote(promise) {
     `(3) it is the Hurricane Preparedness Guide → follow the GUIDE OFFER rules. ` +
     `Never write "sending", "sent", "on its way", or "check your inbox" in a reply that does not carry the action that delivers it.`
   );
+}
+
+/**
+ * 2026-09-25 — what a promise becomes when the retry still could not attach a
+ * delivery. The lead is told the truth — a person will send it — and the
+ * send handler files the rep task that makes that true
+ * (buildUndeliveredPromiseTask). Shipping the broken promise as written is how
+ * "Sending that comparison now" left a lead checking an empty inbox.
+ *
+ * Replaces the offending sentence only; the rest of the reply stands.
+ *
+ * @param {string} message
+ * @param {string} promise  the sentence findSendPromise returned
+ * @param {{ email?: string|null }} [opts]
+ * @returns {string}
+ */
+export function rewriteUndeliveredPromise(message, promise, { email = null } = {}) {
+  const addr = typeof email === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim()) ? email.trim() : null;
+  const honest = addr
+    ? `I'll have the team send that over to ${addr}.`
+    : "I'll have the team send that over to you.";
+  // Same sentence split findSendPromise used, so the promise is found verbatim.
+  return sentences(message).map(s => (s === promise ? honest : s)).join(' ');
 }
 
 // ── send_info_email payload validation ────────────────────────────────

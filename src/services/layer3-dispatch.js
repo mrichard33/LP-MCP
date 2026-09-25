@@ -20,6 +20,9 @@
 import supabase from '../supabase.js';
 import { fetchUpcomingAppointments } from '../knowledge/contact-appointments.js';
 import { isInHomeCalendarId } from '../knowledge/booking-calendar-router.js';
+import { interpolatePayload } from '../actions/helpers.js';
+import { inferChannelFromEvent } from '../channel-inference.js';
+import { deliveryTagsFromSubActions } from '../agentic/guide-delivery.js';
 
 // ═══════════════════════════════════════════════════════════════════
 // 2026-09-02 — follow-up promise vs soft decline (Jacqueline Branham,
@@ -145,12 +148,14 @@ export async function hasActiveInHomeAppointment(contactId) {
   }
 }
 
+// opts.supabase is a test seam; production always uses the shared client.
 export async function getDispatchForClassification(payload, opts = {}) {
-  if (!supabase) return { dispatch: null, reason: 'no_supabase' };
+  const db = opts.supabase || supabase;
+  if (!db) return { dispatch: null, reason: 'no_supabase' };
   const recommended = payload?.recommended_action;
   if (!recommended) return { dispatch: null, reason: 'no_recommended_action' };
 
-  const { data, error } = await supabase
+  const { data, error } = await db
     .from('layer3_action_dispatch')
     .select('*')
     .eq('recommended_action', recommended)
@@ -229,4 +234,99 @@ export async function getDispatchForClassification(payload, opts = {}) {
   }
 
   return { dispatch: data, confidence, threshold };
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// 2026-09-25 — the fan-out plan, pure.
+//
+// Lifted out of actions/index.executeLayer3Dispatch so the rows a dispatch
+// queues are testable without a database, and so the send_message can be told
+// what its siblings deliver BEFORE any of them is inserted. The guide_send row
+// delivers through a sibling add_tag (send-{{guide_type}}-guide), not a
+// companion, so the send-promise guard in response-generator could not see it
+// and would have rewritten "I'm sending that hurricane guide now" as a broken
+// promise. delivery_tags on the send_message payload is how it knows.
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * @returns {Array<object>} agent_actions insert rows, in sequence order. Rows
+ *   the fan-out cannot target (GHL action with no contact) are omitted.
+ */
+export function planLayer3SubActions({ event, dispatch, result = {}, targetId = null }) {
+  const subActions = Array.isArray(dispatch?.actions) ? dispatch.actions : [];
+  const batchId = `layer3_${event.id}_${dispatch.recommended_action}_${Date.now()}`;
+  // 2026-09-02 — a dispatch guard may override interpolation inputs (the
+  // soft-decline guard forces follow_up_bucket to '1week'). Spread so the
+  // fetched event row is never mutated.
+  const interpContext = { ...(event.payload || {}), ...(result.payload_overrides || {}) };
+  const rows = [];
+
+  for (let i = 0; i < subActions.length; i++) {
+    const tmpl = subActions[i] || {};
+    if (!tmpl.action_type) continue;
+
+    const targetSystem = tmpl.target_system || 'ghl';
+    const targetEntity = tmpl.target_entity || 'contact';
+    const subTargetId = tmpl.target_id || targetId;
+
+    if (targetSystem === 'ghl' && !subTargetId) {
+      console.log(`[ActionExecutor] layer3_dispatch: skipping ${tmpl.action_type} — no GHL contact id`);
+      continue;
+    }
+
+    // 2026-07-06 (Bot 2/3/4 consolidation) — interpolate dispatch params
+    // against the triggering event payload so rows can carry dynamic tokens
+    // like "follow-up:{{follow_up_bucket}}" or "send-{{guide_type}}-guide"
+    // (analyzer-emitted fields). interpolate() only matches single-word
+    // {{token}} / {{token|filter}} — GHL merge tags ({{contact.first_name}},
+    // {{trigger_link.xyz}}) contain dots and pass through UNTOUCHED. An
+    // absent token blanks to '' — executeAddTag's trailing-':' hygiene guard
+    // rejects the malformed tag rather than writing it.
+    let actionPayload = interpolatePayload(tmpl.params || tmpl.payload || {}, interpContext);
+
+    // 2026-08-13 — stamp the REAL channel from the triggering event, mirroring
+    // what decision-engine.createActionsFromRule already does for rule
+    // templates. Six layer3_action_dispatch rows hardcoded "channel": "sms", so
+    // every email inbound owned by Layer 3 was answered (and WRITTEN) for SMS
+    // (Andrea, 2026-08-12). Spread rather than mutate: interpolatePayload
+    // returns the ORIGINAL params object when the event payload is empty.
+    if (tmpl.action_type === 'send_message') {
+      const eventChannel = inferChannelFromEvent(event);
+      if (eventChannel && actionPayload.channel !== eventChannel) {
+        console.log(
+          `[ActionExecutor] layer3 channel override (${dispatch.recommended_action}): ` +
+          `${tmpl.params?.channel || 'unset'} → ${eventChannel} (event ${event.id})`
+        );
+        actionPayload = { ...actionPayload, channel: eventChannel };
+      }
+    }
+
+    const row = {
+      event_id: event.id,
+      action_type: tmpl.action_type,
+      target_system: targetSystem,
+      target_entity: targetEntity,
+      target_id: String(subTargetId || ''),
+      action_payload: actionPayload,
+      reasoning: `LAYER3_DISPATCH(${dispatch.recommended_action}): ${dispatch.notes || 'data-driven dispatch'}`,
+      confidence: result.confidence ?? 1.0,
+      rule_applied: 'LAYER3_DISPATCH',
+      status: 'pending',
+      requires_approval: false,
+      batch_id: batchId,
+      sequence_order: i,
+    };
+    if (tmpl.priority !== undefined && tmpl.priority !== null) row.priority = tmpl.priority;
+    rows.push(row);
+  }
+
+  // 2026-09-25 — tell the reply what this batch delivers (see block header).
+  const deliveryTags = deliveryTagsFromSubActions(rows);
+  if (deliveryTags.length) {
+    for (const row of rows) {
+      if (row.action_type !== 'send_message') continue;
+      row.action_payload = { ...row.action_payload, delivery_tags: deliveryTags };
+    }
+  }
+  return rows;
 }
