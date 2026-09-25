@@ -8,14 +8,14 @@
  *   'lp'           a person's note in Lead Perfection — push it to GHL
  *   'ghl_ai_brief' written INTO LP by the GHL note pipeline — never push back
  *                  (2026-07-29 echo-loop fix; see sql/050)
- *   'lp_revin'     written by Revin, LP's own texting bot — never push
+ *   'lp_revin'     written by Revin, LP's own texting bot — pushed like 'lp'
  *
  * WHY lp_revin (2026-09-25). Revin writes one ~160-character summary note per
- * SMS conversation into LP ("Agent, Revin": 69,658 notes, none a transcript).
- * The push copied every one onto the GHL contact as "📋 LP Note", so the team
- * saw Revin's texting as a wall of LP notes instead of messages. Mark's call
- * (2026-09-24): show them as messages on the dashboard, stop copying them into
- * GHL, leave LP untouched. lp_notes keeps every row; only the push skips them.
+ * SMS conversation into LP ("Agent, Revin": 69,671 notes, none a transcript).
+ * The label lets the dashboard and reports tell Revin's texting apart from a
+ * rep's note. The summaries STILL go to GHL (user ruling, 2026-09-25: "I want
+ * the Revin notes summaries to still be going to GHL"), so lp_revin is NOT in
+ * NEVER_PUSH_ORIGINS. Adding it there is the one-line switch if that changes.
  */
 
 const AI_BRIEF = /^\[(?:GHL · )?AI BRIEF · /;
@@ -38,4 +38,4 @@ export function noteOriginOf(body, repName = null) {
 }
 
 /** note_origin values the LP→GHL push must never send. */
-export const NEVER_PUSH_ORIGINS = Object.freeze(['ghl_ai_brief', 'lp_revin']);
+export const NEVER_PUSH_ORIGINS = Object.freeze(['ghl_ai_brief']);

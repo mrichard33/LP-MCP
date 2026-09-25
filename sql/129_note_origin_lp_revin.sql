@@ -7,14 +7,11 @@
 -- (src/note-origin.js); this marks the rows already stored.
 --
 -- WHY: Revin, LP's texting bot, writes a ~160-char summary note per SMS
--- conversation under rep "Agent, Revin" (69,671 rows on 2026-09-25, 32,814 of
--- them not yet pushed). pushNotesToGHL copied each onto the GHL contact as
--- "📋 LP Note". Mark (2026-09-24): show them as messages on the dashboard, stop
--- copying them into GHL, leave LP untouched. Rows are kept; only the push
--- skips them (NEVER_PUSH_ORIGINS in src/note-origin.js).
+-- conversation under rep "Agent, Revin" (69,671 rows on 2026-09-25). The label
+-- tells Revin's texting apart from a rep's note. It does NOT stop the GHL push:
+-- the summaries still go to GHL (user ruling, 2026-09-25). See src/note-origin.js.
 --
--- Safe before the code deploys: the old push filter was neq 'ghl_ai_brief',
--- so it keeps pushing these until the new filter ships. Idempotent.
+-- Idempotent. Applied 2026-09-25.
 -- ═══════════════════════════════════════════════════════════════════════════
 
 UPDATE lp_notes

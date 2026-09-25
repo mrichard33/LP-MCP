@@ -149,7 +149,7 @@ export async function pushNotesToGHL({ batchSize = 50, delayMs = 300, maxNotes =
       .not('ghl_contact_id', 'is', null)
       .eq('ghl_note_pushed', false)
       .eq('ghl_note_push_terminal', false)
-      // Echo-loop guard (GHL AI briefs) and Revin summaries: never pushed.
+      // Echo-loop guard: never push a GHL AI brief back to GHL.
       // See src/note-origin.js.
       .not('note_origin', 'in', NEVER_PUSH_IN)
       .not('note_body', 'is', null)
@@ -241,7 +241,7 @@ export async function pushLeadNotesImmediately(lpLeadId, ghlContactId) {
       .eq('lp_lead_id', lpLeadId)
       .eq('ghl_note_pushed', false)
       .eq('ghl_note_push_terminal', false)
-      // Echo-loop guard (GHL AI briefs) and Revin summaries: never pushed.
+      // Echo-loop guard: never push a GHL AI brief back to GHL.
       // See src/note-origin.js.
       .not('note_origin', 'in', NEVER_PUSH_IN)
       .not('note_body', 'is', null)
@@ -312,7 +312,7 @@ export async function countUnpushedNotes() {
       .not('ghl_contact_id', 'is', null)
       .eq('ghl_note_pushed', false)
       .eq('ghl_note_push_terminal', false)
-      // Echo-loop guard (GHL AI briefs) and Revin summaries: never pushed.
+      // Echo-loop guard: never push a GHL AI brief back to GHL.
       // See src/note-origin.js.
       .not('note_origin', 'in', NEVER_PUSH_IN)
       .not('note_body', 'is', null);

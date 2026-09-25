@@ -117,7 +117,7 @@ test('the round-tripped GHL wrapper is still classified GHL-origin', () => {
   assert.equal(noteOriginOf(wrapped), 'lp'); // wrapper form is not a stored shape
 });
 
-// ─── 2026-09-25: Revin summaries are LP notes, but never pushed to GHL ───────
+// ─── 2026-09-25: Revin summaries are labelled lp_revin and still pushed ─────
 
 test('a note by "Agent, Revin" is lp_revin, whatever its body', () => {
   assert.equal(noteOriginOf('Customer replied YES to appointment reminder.', 'Agent, Revin'), 'lp_revin');
@@ -134,6 +134,7 @@ test('an AI brief is still ghl_ai_brief even if Revin somehow authored it', () =
   assert.equal(noteOriginOf(BRIEF, 'Agent, Revin'), 'ghl_ai_brief');
 });
 
-test('the push skips both non-LP origins', () => {
-  assert.deepEqual([...NEVER_PUSH_ORIGINS].sort(), ['ghl_ai_brief', 'lp_revin']);
+test('the push skips only GHL AI briefs — Revin summaries still go to GHL', () => {
+  assert.deepEqual([...NEVER_PUSH_ORIGINS], ['ghl_ai_brief']);
+  assert.ok(!NEVER_PUSH_ORIGINS.includes('lp_revin'));
 });
