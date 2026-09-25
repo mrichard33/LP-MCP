@@ -25,12 +25,18 @@
  *
  * Kill switches: SEND_VERIFY_ENABLED=false (the whole reconciler),
  * CARRIER_RESEND_ENABLED=false (recovery only — back to alert-a-human).
+ *
+ * 2026-09-25 — `deps` seam added so this module is testable without a live
+ * service, per the repo convention. It reaches four services (supabase, GHL,
+ * the event bus, the resend runner) and every branch that matters here is a
+ * decision about which of two events to emit; that was previously unreachable
+ * from a test. Production passes nothing and gets the real four.
  */
 
-import supabase from '../supabase.js';
-import { ghlFetch } from '../actions/helpers.js';
-import { emitEvent } from '../event-emitter.js';
-import { attemptCarrierResend } from './carrier-resend-runner.js';
+import supabaseDefault from '../supabase.js';
+import { ghlFetch as ghlFetchDefault } from '../actions/helpers.js';
+import { emitEvent as emitEventDefault } from '../event-emitter.js';
+import { attemptCarrierResend as attemptCarrierResendDefault } from './carrier-resend-runner.js';
 
 const MIN_AGE_SEC = Math.max(60, parseInt(process.env.SEND_VERIFY_MIN_AGE_SEC || '120', 10));
 const MAX_AGE_MIN = Math.max(5, parseInt(process.env.SEND_VERIFY_MAX_AGE_MIN || '60', 10));
@@ -41,7 +47,12 @@ const FAILED_STATUSES = new Set(['failed', 'undelivered', 'rejected', 'error']);
 /**
  * Verify recently-completed sends against GHL. Returns a summary; never throws.
  */
-export async function verifyRecentSends() {
+export async function verifyRecentSends(deps = {}) {
+  const supabase = deps.supabase || supabaseDefault;
+  const ghlFetch = deps.ghlFetch || ghlFetchDefault;
+  const emitEvent = deps.emitEvent || emitEventDefault;
+  const attemptCarrierResend = deps.attemptCarrierResend || attemptCarrierResendDefault;
+
   if (process.env.SEND_VERIFY_ENABLED === 'false') {
     return { skipped: true, reason: 'disabled' };
   }
