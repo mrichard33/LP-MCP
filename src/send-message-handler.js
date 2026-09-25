@@ -2300,10 +2300,11 @@ export function buildUndeliveredPromiseTask({ contactId, eventId = null, promise
     target_entity: 'contact',
     target_id: contactId,
     action_payload: {
-      title: 'Bot promised {{contact_name}} something by email — nothing was sent',
+      title: 'Send {{contact_name}} what the bot offered — the team was named to send it',
       description:
-        `The bot told the lead: "${String(promise).slice(0, 300)}". No email was queued. ` +
-        'Send what was promised (or correct it) and reply in the thread so they are not left waiting.',
+        `The bot's draft said: "${String(promise).slice(0, 300)}". Nothing in that turn could send it, so the ` +
+        'reply told the lead the team will send it over instead. Send what was promised and reply in the ' +
+        'thread so they are not left waiting.',
       due_in_hours: 2,
       priority: 'high',
     },
@@ -3134,6 +3135,10 @@ export async function executeSendMessage(action, context) {
           // script from the matched rule / dispatch row rides the action
           // payload and anchors the generated reply (SCRIPT DIRECTIVE block).
           promptHint: payload.prompt_hint || null,
+          // 2026-09-25 — guide delivery tags a layer3 sibling add_tag puts on
+          // in this same turn (services/layer3-dispatch.planLayer3SubActions).
+          // The send-promise guard counts them as the delivery.
+          deliveryTags: Array.isArray(payload.delivery_tags) ? payload.delivery_tags : [],
           // 2026-07-06 — request-first routing: the analyzer's
           // requested_fulfillment (from the ai.analysis_completed payload in
           // the event context) outranks funnel defaults in the calendar router.
@@ -3183,6 +3188,22 @@ export async function executeSendMessage(action, context) {
       await handleShortCircuit(contactId, generated.handoff, action, context, {
         channel, replyContext, tags, botReplies: true,
       }).catch(err => console.warn(`[SendMessage] handoff side effects failed for ${contactId} (fail-soft): ${err.message}`));
+    }
+
+    // 2026-09-25 — "didn't get it" on a guide: re-fire the delivery tag so GHL
+    // sends it again (src/agentic/guide-delivery.js guideResendOps). Remove
+    // first, then add, so the tag-added trigger fires even if the tag stuck,
+    // and clear U.GUIDE's own "already sent" gate. Runs once per send (never
+    // per generation attempt), so a retry cannot enroll the contact twice.
+    if (!generationErr && generated?.handoff?.guide_resend) {
+      const gr = generated.handoff.guide_resend;
+      try {
+        const removed = gr.remove?.length ? await removeContactTags(contactId, gr.remove) : true;
+        const added = gr.add?.length ? await applyContactTags(contactId, gr.add) : true;
+        console.log(`[SendMessage] guide resend for ${contactId} (${gr.type}): removed=${removed} added=${added} [${gr.add.join(', ') || 'batch adds it'}]`);
+      } catch (err) {
+        console.warn(`[SendMessage] guide resend failed for ${contactId} (fail-soft): ${err.message}`);
+      }
     }
 
     // If generation failed after all retries, use the channel-appropriate safe
@@ -3592,6 +3613,7 @@ export async function executeSendMessage(action, context) {
             threadSenderType: 'rep',
             fromNumber: replyContext?.fromNumber || null,
             promptHint: payload.prompt_hint || null,
+            deliveryTags: Array.isArray(payload.delivery_tags) ? payload.delivery_tags : [],
             requestedFulfillment: context.requested_fulfillment || null,
             callPurpose: context.call_purpose || null,
             regenerationNote: regenNotes[regenReason],

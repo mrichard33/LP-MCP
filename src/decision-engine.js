@@ -2016,8 +2016,10 @@ async function createActionsFromRule(event, rule) {
       // sweep own it; a double fan-out would queue the reply twice (the
       // outbound lock would dedup the send, but not the tag/hold siblings).
       const isLayer3FanOut = tmpl.action_type === 'layer3_dispatch';
+      // 2026-09-25 — the low-confidence fallback is rule 106's reply by another
+      // name; it gets the same fast path.
       const isReplySend = tmpl.action_type === 'send_message' &&
-        (rule.rule_key === 'AGENTIC_RESPOND_POST_CHATBOT' || priority <= 15);
+        (rule.rule_key === 'AGENTIC_RESPOND_POST_CHATBOT' || rule.rule_key === LOWCONF_FALLBACK_RULE_KEY || priority <= 15);
       if (!requiresApproval && data.status === 'pending' && (isReplySend || isLayer3FanOut)) {
         executeActionById(data.id, isLayer3FanOut ? { allowExecuting: false } : {}).catch(err =>
           console.warn(`[DecisionEngine] ${tmpl.action_type} fast-path failed for action ${data.id}: ${err.message}`));
@@ -2177,6 +2179,111 @@ async function responderStandDownActions(deps = {}) {
   } catch {
     return RESPONDER_STAND_DOWN_FALLBACK;
   }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// LAYER 3 LOW-CONFIDENCE FALLBACK (2026-09-25 — Mark Test BazzY5Ihu2heR4osVlBF)
+// ═══════════════════════════════════════════════════════════════════
+//
+// The stand-down list above has a hole in it. Rule 106 stands down for an
+// intent because a layer3 dispatch row owns the reply — but the dispatcher
+// then drops that row when the analyzer's confidence is under the row's
+// min_confidence. Both sides stood down and NOBODY answered: "Yeah sure" to the
+// bot's own guide offer scored guide_send at 0.6 against a 0.65 gate (action
+// 497148), and "I didn't get it?" hit the same gap four minutes later (497154).
+// Same shape on real leads: Alyce (kMpGByubOHH9hk5yTxvv, guide_send 0.6) and
+// Maritza Rodriguez (O3P8I7Dju6Q5Pq8blI0W, wrong_person 0.5).
+//
+// So: when the dispatcher drops a stand-down intent for low confidence, queue
+// exactly what rule 106 would have queued if it had not stood down — same
+// action_template (prompt_hint included), same guards (every context condition
+// except the nin itself, plus the stage gate) — under its own rule_applied so
+// the fallback is countable. A low-confidence classification can mean a
+// generic reply; it can never mean silence.
+//
+// The nin list is read from rule 106 at runtime, never copied, so the two
+// cannot drift. If rule 106 is not loaded (disabled), there is no responder to
+// fall back to and the turn stays silent on purpose — that is the owner's switch.
+export const LOWCONF_FALLBACK_RULE_KEY = 'LAYER3_LOWCONF_FALLBACK';
+
+/**
+ * Pure. The synthetic rule the fallback queues from: rule 106 with the
+ * stand-down removed and its own key. Returns null when the responder has no
+ * stand-down list or `recommended` is not on it — then rule 106 itself already
+ * owned the turn and a fallback would double-text.
+ */
+export function buildLowConfidenceFallbackRule(responderRule, recommended) {
+  if (!responderRule || !recommended) return null;
+  const conds = { ...(responderRule.conditions || {}), ...(responderRule.context_conditions || {}) };
+  const nin = Array.isArray(conds.recommended_action_nin) ? conds.recommended_action_nin : [];
+  if (!nin.includes(recommended)) return null;
+  const { recommended_action_nin: _dropped, ...guards } = conds;
+  return {
+    ...responderRule,
+    rule_key: LOWCONF_FALLBACK_RULE_KEY,
+    rule_name: `Layer 3 low-confidence fallback → ${responderRule.rule_key}`,
+    conditions: null,
+    context_conditions: guards,
+  };
+}
+
+// A send_message already queued for this event means somebody owns the reply
+// (a strike rule, a dispatch that ran after all). The fallback exists to end
+// silence, not to add a second text.
+async function eventHasQueuedReply(eventId, db) {
+  if (!eventId) return false;
+  const { data, error } = await db
+    .from('agent_actions')
+    .select('id')
+    .eq('event_id', eventId)
+    .eq('action_type', 'send_message')
+    .not('status', 'in', '(skipped,rejected,cancelled)')
+    .limit(1);
+  if (error) throw new Error(`reply lookup failed: ${error.message}`);
+  return Array.isArray(data) && data.length > 0;
+}
+
+/**
+ * Called by actions/index.executeLayer3Dispatch when a dispatch is skipped for
+ * below_confidence_threshold. Returns { queued, reason, actions? }.
+ *
+ * deps is a test seam: { loadRules, fetchLeadIntelligence, evaluateContextConditions,
+ * passesStageGate, eventHasQueuedReply, createActionsFromRule }.
+ */
+export async function runLayer3LowConfidenceFallback(event, deps = {}) {
+  const recommended = event?.payload?.recommended_action || null;
+  const rules = await (deps.loadRules || loadRules)();
+  const responder = (rules || []).find(r => r.rule_key === RESPONDER_RULE_KEY);
+  if (!responder) return { queued: 0, reason: 'responder_rule_not_loaded' };
+
+  const fallbackRule = buildLowConfidenceFallbackRule(responder, recommended);
+  if (!fallbackRule) return { queued: 0, reason: 'not_a_stand_down_intent', recommended_action: recommended };
+
+  if (!matchesPattern(event, responder.event_pattern)) {
+    return { queued: 0, reason: 'responder_event_pattern_mismatch' };
+  }
+
+  const intelligence = await (deps.fetchLeadIntelligence || fetchLeadIntelligence)(event.ghl_contact_id);
+  const evaluate = deps.evaluateContextConditions || evaluateContextConditions;
+  // Evaluated under rule 106's own key so a fail-closed read is attributed to
+  // the rule whose guard it is.
+  if (!(await evaluate(fallbackRule.context_conditions, intelligence, event, { ruleKey: RESPONDER_RULE_KEY }))) {
+    return { queued: 0, reason: 'responder_guards_blocked' };
+  }
+  if (!(await (deps.passesStageGate || passesStageGate)(event, responder, intelligence))) {
+    return { queued: 0, reason: 'responder_stage_gate_blocked' };
+  }
+
+  if (await (deps.eventHasQueuedReply || ((id) => eventHasQueuedReply(id, supabase)))(event.id)) {
+    return { queued: 0, reason: 'reply_already_queued' };
+  }
+
+  const actions = await (deps.createActionsFromRule || createActionsFromRule)(event, fallbackRule);
+  console.log(
+    `[DecisionEngine] ${LOWCONF_FALLBACK_RULE_KEY}: ${recommended} below threshold for ` +
+    `${event.ghl_contact_id} → responder queued ${actions.length} action(s) (event ${event.id})`
+  );
+  return { queued: actions.length, reason: 'fallback_queued', actions };
 }
 
 /**

@@ -119,7 +119,7 @@ NON-NEGOTIABLE RULE: Never ask the customer for information already present in t
 COMPANY INBOX: team@getreecewindows.com. This is the ONLY email address a customer may send us files, photos, measurements, or documents. When a customer asks where to email something, give this address. NEVER tell a customer to send anything to their own email address, and never invent any other address.
 Inferred Buyer Stage: 2/5
 Active Entry: active-entry:E.2-calculator-bridge
-GUIDE OFFER STATUS: OUTSTANDING — already offered, unanswered. Never re-offer. If the lead provides an email now, emit guide_disposition outcome "accepted"; if they decline the guide now, emit outcome "declined".
+GUIDE OFFER STATUS: OUTSTANDING — already offered, unanswered. Never re-offer. If the lead accepts now (a yes, or an email) and an email is on file or given, emit guide_disposition outcome "accepted"; if they decline the guide now, emit outcome "declined".
 
 ENGAGEMENT: opens=0 | clicks=0 | replies=0 | VSL=not watched
 

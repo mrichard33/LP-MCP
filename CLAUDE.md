@@ -197,6 +197,15 @@ costs the optimisation, never correctness.
 Before claiming a rule never fires, check `agent_actions.rule_applied`. One flagged as dead had fired
 47 times.
 
+**A stand-down is only safe if something else answers.** Rule 106 (`AGENTIC_RESPOND_POST_CHATBOT`)
+skips every intent in its `recommended_action_nin` because a `layer3_action_dispatch` row owns that
+reply — but the dispatcher drops a row under its `min_confidence`, and for months that meant nobody
+answered (Mark Test, 2026-09-25: "Yeah sure" to the bot's own guide offer, guide_send 0.6 < 0.65).
+`runLayer3LowConfidenceFallback` (`src/decision-engine.js`) now queues rule 106's own template under
+`rule_applied = 'LAYER3_LOWCONF_FALLBACK'` whenever that happens, reading the nin list live. Adding an
+intent to the nin list is therefore safe; removing the fallback is not. Audit:
+`sql/verify/2026-09-25_layer3_silence_audit.sql`.
+
 ## Supabase
 
 **Two separate instances — LP and HL.** No cross-joins; fetch from one and filter against the other.

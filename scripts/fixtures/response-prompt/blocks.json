@@ -549,7 +549,7 @@
     "label": "Guide offer outstanding, never re-offer it",
     "target": "playbooks",
     "kind": "static",
-    "probe": "GUIDE OFFER STATUS: OUTSTANDING — already offered, unanswered. Never re-offer. If the lead provides an email n"
+    "probe": "GUIDE OFFER STATUS: OUTSTANDING — already offered, unanswered. Never re-offer. If the lead accepts now (a yes, or an email) and"
   },
   {
     "id": "L2016",
