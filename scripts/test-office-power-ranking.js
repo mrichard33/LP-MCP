@@ -28,7 +28,8 @@ import {
   DAY_ACCURATE_CLOSE_SOURCES,
   POWER_RANKING_ROW_LIMIT,
 } from '../src/notifications/office-power-ranking.js';
-import { runOfficePowerRanking } from '../src/jobs/office-power-ranking.js';
+import { runOfficePowerRanking, dueSlot } from '../src/jobs/office-power-ranking.js';
+import { monthWindowET } from '../src/notifications/sale-facts.js';
 
 const quiet = { warn: () => {}, log: () => {}, error: () => {} };
 const sale = (branch, value) => ({ lp_branch_id: branch, job_value: value });
@@ -179,6 +180,7 @@ function supa(queue) {
         in(k, v) { q.filters[k] = v; return chain; },
         gte(k, v) { q.filters[`gte_${k}`] = v; return chain; },
         lt(k, v) { q.filters[`lt_${k}`] = v; return chain; },
+        or(f) { q.filters.or = f; return chain; },
         limit(n) { q.filters.limit = n; return Promise.resolve(queue.shift() ?? { data: [] }); },
       };
       return chain;
@@ -190,7 +192,7 @@ test('only day-accurate close sources are read', async () => {
   // appointment_proxy is the right MONTH, not the right DAY. A 7-day window
   // built on it would pull in sales that closed elsewhere in the month.
   const supabase = supa([{ data: [sale('ORL', 100)] }, { data: [] }, { data: [] }]);
-  await buildOfficePowerRanking({ supabase, logger: quiet, days: 7 });
+  await buildOfficePowerRanking({ supabase, logger: quiet, days: 7, mode: 'rolling' });
   assert.deepEqual(supabase.calls[0].filters.close_date_source, DAY_ACCURATE_CLOSE_SOURCES);
   assert.ok(!DAY_ACCURATE_CLOSE_SOURCES.includes('appointment_proxy'));
   assert.equal(supabase.calls[0].filters.closed_won, true);
@@ -199,7 +201,7 @@ test('only day-accurate close sources are read', async () => {
 test('the previous window abuts the current one and does not overlap it', async () => {
   const supabase = supa([{ data: [] }, { data: [] }, { data: [] }]);
   const now = new Date('2026-09-24T12:00:00Z');
-  await buildOfficePowerRanking({ supabase, logger: quiet, days: 7, now: () => now });
+  await buildOfficePowerRanking({ supabase, logger: quiet, days: 7, mode: 'rolling', now: () => now });
   const current = supabase.calls[0].filters;
   const previous = supabase.calls[2].filters;
   assert.equal(previous.lt_close_date, current.gte_close_date,
@@ -209,14 +211,14 @@ test('the previous window abuts the current one and does not overlap it', async 
 
 test('a timed-out read degrades instead of publishing a partial board', async () => {
   const supabase = { from() { return { select() { return this; }, eq() { return this; }, in() { return this; }, gte() { return this; }, lt() { return this; }, limit() { return new Promise(() => {}); } }; } };
-  const out = await buildOfficePowerRanking({ supabase, logger: quiet, budgetMs: 20, days: 7 });
+  const out = await buildOfficePowerRanking({ supabase, logger: quiet, budgetMs: 20, days: 7, mode: 'rolling' });
   assert.equal(out.degraded, true);
   assert.equal(out.reason, 'timeout');
 });
 
 test('a truncated read degrades rather than ranking a partial field', async () => {
   const many = Array.from({ length: POWER_RANKING_ROW_LIMIT }, () => sale('ORL', 1));
-  const out = await buildOfficePowerRanking({ supabase: supa([{ data: many }]), logger: quiet, days: 7 });
+  const out = await buildOfficePowerRanking({ supabase: supa([{ data: many }]), logger: quiet, days: 7, mode: 'rolling' });
   assert.equal(out.degraded, true);
   assert.match(out.reason, /^truncated_at_/);
 });
@@ -227,7 +229,7 @@ test('a failed PREVIOUS read costs the arrows, not the board', async () => {
     { data: [sale('ORL', 100)] },          // roster
     { error: { message: 'boom' } },        // previous
   ]);
-  const out = await buildOfficePowerRanking({ supabase, logger: quiet, days: 7 });
+  const out = await buildOfficePowerRanking({ supabase, logger: quiet, days: 7, mode: 'rolling' });
   assert.equal(out.degraded, false, 'the board still publishes');
   assert.equal(out.movementAvailable, false);
   assert.equal(out.rows[0].move, null);
@@ -292,4 +294,70 @@ test('no configured channel fails rather than posting into the void', async () =
   });
   assert.equal(out.ok, false);
   assert.equal(out.reason, 'no_channel');
+});
+
+// ─── Month to date (2026-09-25) ─────────────────────────────────────────────
+// The default mode: the Florida calendar month from the 1st through today,
+// every office listed, reset on the 1st with last month's final standings.
+
+const SEPT_25 = new Date('2026-09-25T23:00:00Z'); // 7 PM ET
+
+test('month to date counts proxy-dated and no-close-date sales, not just day-accurate ones', async () => {
+  const supabase = supa([{ data: [sale('ORL', 100)] }, { data: [sale('ORL', 50)] }]);
+  await buildOfficePowerRanking({ supabase, logger: quiet, mode: 'mtd', now: () => SEPT_25 });
+  const f = supabase.calls[0].filters;
+  assert.equal(f.close_date_source, undefined, 'no day-accuracy filter on a month window');
+  assert.match(f.or, /close_date\.gte\.2026-09-01T04:00:00\.000Z,close_date\.lt\.2026-09-25T23:00:00\.000Z/);
+  assert.match(f.or, /close_date\.is\.null,appointment_date\.gte\.2026-09-01T04:00:00\.000Z/);
+  // Movement: the same month as it stood 24h ago.
+  assert.match(supabase.calls[1].filters.or, /close_date\.lt\.2026-09-24T23:00:00\.000Z/);
+});
+
+test('month to date lists all seven offices, $0 included, and names none it cannot', async () => {
+  const supabase = supa([{ data: [sale('JAX', 500), sale('BOCA', 200), sale('OUT_OF_AREA', 9999)] }, { data: [] }]);
+  const out = await buildOfficePowerRanking({ supabase, logger: quiet, mode: 'mtd', now: () => SEPT_25 });
+  assert.equal(out.rows.length, 7);
+  assert.deepEqual(out.rows.slice(0, 2).map((r) => [r.office, r.volume]), [['JAX', 500], ['FTLAU', 200]]);
+  assert.ok(!out.rows.some((r) => r.office === 'OUT_OF_AREA'));
+  assert.equal(out.movementAvailable, false, 'an empty board 24h ago gives no arrows');
+
+  const text = formatOfficePowerRanking({ ranking: out });
+  assert.match(text, /^🏆 Office power ranking — September 1–25\n/);
+  assert.match(text, /^3\. St\. Petersburg — \$0 \(0\)$/m, 'offices tied at $0 share a rank');
+  assert.match(text, /Across all offices: \$700 · 2 sales$/);
+});
+
+test('the final standings read the whole closed month and say so', async () => {
+  const supabase = supa([{ data: [sale('SAR', 900)] }]);
+  const oct1 = new Date('2026-10-01T12:00:00Z');
+  const out = await buildOfficePowerRanking({
+    supabase, logger: quiet, mode: 'mtd', now: () => oct1, window: monthWindowET(oct1, -1),
+  });
+  assert.equal(supabase.calls.length, 1, 'no movement read for a closed month');
+  assert.match(supabase.calls[0].filters.or, /close_date\.gte\.2026-09-01T04:00:00\.000Z,close_date\.lt\.2026-10-01T04:00:00\.000Z/);
+  assert.match(formatOfficePowerRanking({ ranking: out }), /^🏁 September final standings\n1\. Sarasota — \$900 \(1\)/);
+});
+
+test('the job posts the final standings for LAST month on the 1st', async () => {
+  let built = null;
+  const out = await runOfficePowerRanking({
+    kind: 'final', mode: 'mtd', now: () => new Date('2026-10-01T12:00:00Z'),
+    build: async (opts) => { built = opts; return buildOfficePowerRanking({ ...opts, supabase: supa([{ data: [sale('ORL', 10)] }]), logger: quiet }); },
+    send: async () => ({ ok: true, ts: '9.9' }),
+    channelId: 'C_SALES', logger: quiet,
+  });
+  assert.equal(out.ok, true);
+  assert.equal(out.kind, 'final');
+  assert.equal(built.window.monthName, 'September');
+  assert.equal(built.window.complete, true);
+});
+
+test('slots: 8 PM daily month to date, 8 AM on the 1st for the final; rolling keeps 8 AM', () => {
+  assert.equal(dueSlot({ hour: 20, day: 25, mode: 'mtd' }), 'daily');
+  assert.equal(dueSlot({ hour: 8, day: 25, mode: 'mtd' }), null);
+  assert.equal(dueSlot({ hour: 8, day: 1, mode: 'mtd' }), 'final');
+  assert.equal(dueSlot({ hour: 20, day: 1, mode: 'mtd' }), 'daily', 'the new month’s first board still posts');
+  assert.equal(dueSlot({ hour: 8, day: 25, mode: 'rolling' }), 'daily');
+  assert.equal(dueSlot({ hour: 8, day: 1, mode: 'rolling' }), 'daily');
+  assert.equal(dueSlot({ hour: 20, day: 25, mode: 'rolling' }), null);
 });

@@ -196,13 +196,28 @@ export const JOBS = Object.freeze([
     id: 'office-power-ranking',
     label: 'Office power ranking',
     group: 'notifications',
-    cadence: 'daily 08:00 ET',
+    // 2026-09-25: month-to-date by default (OFFICE_POWER_RANKING_WINDOW=mtd)
+    // posts at 20:00 ET; the rolling 7-day mode keeps 08:00 ET.
+    cadence: 'daily 20:00 ET (mtd) / 08:00 ET (rolling)',
     enabledEnv: 'OFFICE_POWER_RANKING_ENABLED',
     // OFF by default (2026-09-24): a public league table that names every
     // office including last is a sales-floor decision, not something a deploy
     // should start doing on its own.
     enabledDefault: false,
     isEnabled: (env) => String(env.OFFICE_POWER_RANKING_ENABLED || '').toLowerCase() === 'true',
+  },
+  {
+    // 2026-09-25: last month's final standings, 08:00 ET on the 1st, before
+    // every office starts again at $0. Same gate as the daily board, and only
+    // in month-to-date mode — the rolling board has no month to close.
+    id: 'office-power-ranking-final',
+    label: 'Office power ranking — month final',
+    group: 'notifications',
+    cadence: 'monthly, 1st 08:00 ET',
+    enabledEnv: 'OFFICE_POWER_RANKING_ENABLED',
+    enabledDefault: false,
+    isEnabled: (env) => String(env.OFFICE_POWER_RANKING_ENABLED || '').toLowerCase() === 'true'
+      && String(env.OFFICE_POWER_RANKING_WINDOW || 'mtd').toLowerCase() !== 'rolling',
   },
   {
     id: 'missed-caller-recovery',

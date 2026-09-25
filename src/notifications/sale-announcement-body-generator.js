@@ -45,7 +45,7 @@ import path from 'path';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import { callLLM } from '../llm-client.js';
-import { hasMilestone } from './sale-facts.js';
+import { hasMilestone, monthWindowET } from './sale-facts.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const RULEBOOK_PATH = path.join(HERE, 'sale-announcement-rulebook.md');
@@ -184,9 +184,11 @@ export function buildFactsBlock(facts) {
   return lines.length ? lines.join('\n') : 'none';
 }
 
-/** Month name for the stats line, in UTC to match how the facts were bucketed. */
+/** Month name for the stats line. */
 function monthName(date) {
-  return new Date(date).toLocaleString('en-US', { month: 'long', timeZone: 'UTC' });
+  // Florida's calendar month, the same window the counts use (2026-09-25), so
+  // "3 sales in September" never labels a count that has already rolled over.
+  return monthWindowET(date).monthName;
 }
 
 /**

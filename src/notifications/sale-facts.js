@@ -84,6 +84,73 @@ export function repNameKey(raw) {
   return s.split(' ').filter(Boolean).sort().join(' ');
 }
 
+// ─── The month, in Florida time (2026-09-25) ──────────────────────
+// Every "month to date" number (the rep's month line, both power rankings, the
+// daily board) reads ONE window so they can never disagree. It is the
+// America/New_York calendar month: from 8 PM ET on the last day the UTC
+// monthStart() below already says "next month", which reset the boards four
+// hours early. The 1st in Florida is the reset — no stored state to clear.
+
+const ET = 'America/New_York';
+
+function etParts(d) {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: ET, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', hourCycle: 'h23',
+  }).formatToParts(new Date(d));
+  const get = (t) => Number(parts.find((p) => p.type === t)?.value);
+  return { y: get('year'), m: get('month'), d: get('day'), h: get('hour') % 24 };
+}
+
+/** The UTC instant of 00:00 ET on y-m-d. Midnight is 04:00Z (EDT) or 05:00Z (EST); never ambiguous. */
+function etMidnight(y, m, d) {
+  for (const utcHour of [4, 5]) {
+    const t = new Date(Date.UTC(y, m - 1, d, utcHour));
+    const p = etParts(t);
+    if (p.h === 0 && p.d === new Date(Date.UTC(y, m - 1, d)).getUTCDate()) return t;
+  }
+  return new Date(Date.UTC(y, m - 1, d, 5));
+}
+
+/**
+ * The ET calendar month containing `date`, shifted by `offsetMonths`
+ * (-1 = last month, for the final standings on the 1st).
+ * Returns { startIso, endIso, monthName, firstDay: 1, throughDay, complete }.
+ * throughDay is today's ET day for the current month, the last day otherwise.
+ */
+export function monthWindowET(date = new Date(), offsetMonths = 0) {
+  const now = etParts(date);
+  const first = new Date(Date.UTC(now.y, now.m - 1 + offsetMonths, 1));
+  const y = first.getUTCFullYear();
+  const m = first.getUTCMonth() + 1;
+  const next = new Date(Date.UTC(y, m, 1));
+  const lastDay = new Date(Date.UTC(y, m, 0)).getUTCDate();
+  const complete = offsetMonths < 0;
+  return {
+    startIso: etMidnight(y, m, 1).toISOString(),
+    endIso: etMidnight(next.getUTCFullYear(), next.getUTCMonth() + 1, 1).toISOString(),
+    monthName: first.toLocaleString('en-US', { month: 'long', timeZone: 'UTC' }),
+    firstDay: 1,
+    throughDay: complete ? lastDay : now.d,
+    complete,
+  };
+}
+
+/**
+ * PostgREST .or() filter: a won lead belongs to the window by close_date, or —
+ * when close_date is NULL — by appointment_date.
+ *
+ * 2026-09-25: 17 September sales ($629,748) were missing from every board
+ * because nothing writes close_date for a sale LP marks won unless it came
+ * through the announcement endpoint, and sql/118's appointment_proxy backfill
+ * stopped at 9/17. Falling back to appointment_date is the same rule sql/118
+ * used. Read-side on purpose: sync-leads.js must never carry close_date in its
+ * upsert row (CLAUDE.md), or it would erase every stamped close date.
+ */
+export function wonInWindowFilter(startIso, endIso) {
+  return `and(close_date.gte.${startIso},close_date.lt.${endIso}),` +
+    `and(close_date.is.null,appointment_date.gte.${startIso},appointment_date.lt.${endIso})`;
+}
+
 /** First of the current month, UTC, as an ISO timestamp. */
 export function monthStart(date) {
   const d = new Date(date);
@@ -191,6 +258,7 @@ export async function buildRepFacts(repDisplayName, saleAmount, deps = {}) {
   };
 
   // ─── Read 1: this month's closed-won rows, all reps ─────────────
+  const win = monthWindowET(at);
   // One read serves the team total, the field size, both ranks and this rep's
   // own month. ~370-430 sales/month across ~66 reps (measured 2026-09-16), so
   // this is a few hundred narrow rows.
@@ -200,7 +268,7 @@ export async function buildRepFacts(repDisplayName, saleAmount, deps = {}) {
       .select('rep_name, job_value, close_date')
       .eq('closed_won', true)
       .not('rep_name', 'is', null)
-      .gte('close_date', monthStart(at))
+      .or(wonInWindowFilter(win.startIso, win.endIso))
       .limit(MTD_ROW_LIMIT),
     remaining(),
   );

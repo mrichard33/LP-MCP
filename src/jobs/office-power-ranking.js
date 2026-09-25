@@ -22,6 +22,15 @@
  * OFFICE_POWER_RANKING_ENABLED must be 'true'. A public league table naming
  * every office including last is a sales-floor decision, not something that
  * should start posting because a deploy went out.
+ *
+ * ─── MONTH TO DATE + THE MONTHLY RESET (2026-09-25) ─────────────────────────
+ * In the default 'mtd' mode (see the builder's header) two slots run:
+ *   - daily at 20:00 ET — the month-to-date board, "September 1–25". 8 PM and
+ *     not 8 AM because "the 1st through today" should include today's sales.
+ *   - 08:00 ET on the 1st — the FINAL standings for the month just closed,
+ *     posted before the board starts again at $0 for every office. Its own job
+ *     id (office-power-ranking-final) so a missed final shows as its own gap.
+ * The 'rolling' mode keeps the original single 08:00 slot.
  */
 
 import { runJob } from '../job-runner.js';
@@ -31,12 +40,27 @@ import {
   buildOfficePowerRanking,
   formatOfficePowerRanking,
   windowDays,
+  windowMode,
 } from '../notifications/office-power-ranking.js';
+import { monthWindowET } from '../notifications/sale-facts.js';
 
 export const JOB_ID = 'office-power-ranking';
+export const FINAL_JOB_ID = 'office-power-ranking-final';
 
-/** 08:00 ET — on the floor before the day starts, after the prior day closed. */
+/** Rolling mode: 08:00 ET — on the floor before the day starts, after the prior day closed. */
 export const RUN_HOUR_ET = 8;
+/** Month-to-date mode: 20:00 ET, so "the 1st through today" includes today. */
+export const MTD_RUN_HOUR_ET = 20;
+/** The final standings for the month just closed: 08:00 ET on the 1st. */
+export const FINAL_RUN_HOUR_ET = 8;
+
+/** Which slot, if any, is due at this ET hour/day. Pure, for the scheduler and its tests. */
+export function dueSlot({ hour, day, mode = windowMode() }) {
+  if (mode === 'rolling') return hour === RUN_HOUR_ET ? 'daily' : null;
+  if (day === 1 && hour === FINAL_RUN_HOUR_ET) return 'final';
+  if (hour === MTD_RUN_HOUR_ET) return 'daily';
+  return null;
+}
 
 export function rankingEnabled() {
   return String(process.env.OFFICE_POWER_RANKING_ENABLED || '').toLowerCase() === 'true';
@@ -62,6 +86,8 @@ export async function runOfficePowerRanking(deps = {}) {
     logger = console,
     now = () => new Date(),
     days = windowDays(),
+    mode = windowMode(),
+    kind = 'daily',
   } = deps;
 
   if (!channelId) {
@@ -69,7 +95,9 @@ export async function runOfficePowerRanking(deps = {}) {
     return { ok: false, reason: 'no_channel' };
   }
 
-  const ranking = await build({ days, now });
+  // 'final' = the whole of LAST month, as it closed.
+  const window = mode === 'mtd' && kind === 'final' ? monthWindowET(now(), -1) : undefined;
+  const ranking = await build({ days, now, mode, ...(window ? { window } : {}) });
   if (ranking?.degraded) {
     logger.warn?.(`[OfficePowerRanking] not posting — ${ranking.reason}`);
     return { ok: false, reason: ranking.reason };
@@ -89,11 +117,13 @@ export async function runOfficePowerRanking(deps = {}) {
 
   logger.log?.(
     `[OfficePowerRanking] posted — ${ranking.rows.length} offices, `
-    + `${ranking.totalCount} sales over ${days}d, movement=${ranking.movementAvailable} ts=${res.ts}`,
+    + `${ranking.totalCount} sales over ${mode === 'mtd' ? `${kind} month window` : `${days}d`}, `
+    + `movement=${ranking.movementAvailable} ts=${res.ts}`,
   );
   return {
     ok: true,
     posted: true,
+    kind,
     offices: ranking.rows.length,
     sales: ranking.totalCount,
     volume: ranking.totalVolume,
@@ -101,11 +131,12 @@ export async function runOfficePowerRanking(deps = {}) {
   };
 }
 
-// ── Scheduler — daily at 08:00 ET ───────────────────────────────────────────
+// ── Scheduler ───────────────────────────────────────────────────────────────
 // The 5-minute tick convention every daily job here uses; the WORK is wrapped
-// in runJob, not the tick (docs/job-runs.md).
+// in runJob, not the tick (docs/job-runs.md). Slots: see dueSlot().
 let timer = null;
 let lastRunSlot = null;
+let lastFinalSlot = null;
 
 export function startOfficePowerRankingScheduler() {
   if (timer) return;
@@ -113,19 +144,29 @@ export function startOfficePowerRankingScheduler() {
     console.log('[OfficePowerRanking] disabled (OFFICE_POWER_RANKING_ENABLED is not true)');
     return;
   }
+  const mode = windowMode();
   console.log(
-    `[OfficePowerRanking] Scheduler started — daily at ${String(RUN_HOUR_ET).padStart(2, '0')}:00 ET, `
-    + `${windowDays()}-day window`,
+    mode === 'mtd'
+      ? `[OfficePowerRanking] Scheduler started — month to date daily at ${MTD_RUN_HOUR_ET}:00 ET, `
+        + `final standings at 0${FINAL_RUN_HOUR_ET}:00 ET on the 1st`
+      : `[OfficePowerRanking] Scheduler started — daily at ${String(RUN_HOUR_ET).padStart(2, '0')}:00 ET, `
+        + `${windowDays()}-day window`,
   );
   const checkAndRun = async () => {
-    const today = todayET();
-    if (hourET() === RUN_HOUR_ET && lastRunSlot !== today) {
-      lastRunSlot = today;
-      try {
-        await runJob(JOB_ID, () => runOfficePowerRanking(), { occurrence: today });
-      } catch (err) {
-        console.error('[OfficePowerRanking] run failed:', err.message);
+    const today = todayET();               // YYYY-MM-DD, ET
+    const slot = dueSlot({ hour: hourET(), day: Number(today.slice(8, 10)), mode });
+    try {
+      if (slot === 'daily' && lastRunSlot !== today) {
+        lastRunSlot = today;
+        await runJob(JOB_ID, () => runOfficePowerRanking({ kind: 'daily' }), { occurrence: today });
+      } else if (slot === 'final' && lastFinalSlot !== today) {
+        lastFinalSlot = today;
+        // Keyed on the month being CLOSED, e.g. 2026-09 on 2026-10-01.
+        const closed = monthWindowET(new Date(), -1).startIso.slice(0, 7);
+        await runJob(FINAL_JOB_ID, () => runOfficePowerRanking({ kind: 'final' }), { occurrence: closed });
       }
+    } catch (err) {
+      console.error('[OfficePowerRanking] run failed:', err.message);
     }
   };
   timer = setInterval(checkAndRun, 5 * 60 * 1000);
@@ -137,4 +178,5 @@ export function __resetSchedulerForTests() {
   if (timer) clearInterval(timer);
   timer = null;
   lastRunSlot = null;
+  lastFinalSlot = null;
 }
