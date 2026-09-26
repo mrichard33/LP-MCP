@@ -54,9 +54,13 @@
  */
 import express from 'express';
 import { resolveApproval } from './groupme.js';
-import { slackApprovalsEnabled } from './slack.js';
+import { slackApprovalsEnabled, lookupSlackUserEmail } from './slack.js';
 import { trackBackground } from './graceful-shutdown.js';
-import { verifySlackSignature, parseInteraction, parseApproverIds } from './slack-approvals-core.js';
+import {
+  verifySlackSignature, parseInteraction, parseApproverIds, parsePayrollInteraction, isPayrollAction,
+} from './slack-approvals-core.js';
+import { approvePayrollRun } from './payroll/ledger-actions.js';
+import { createPayrollStore } from './payroll/store.js';
 
 const SIGNING_SECRET = process.env.SLACK_SIGNING_SECRET || '';
 const APPROVERS = parseApproverIds(process.env.SLACK_APPROVER_IDS);
@@ -205,15 +209,56 @@ export async function handleInteraction(parsed, { approvers = APPROVERS, resolve
 }
 
 /**
+ * Payroll Approve click (2026-09-26). Separate from handleInteraction: it is
+ * authorised against active lf_report_approvers EMAILS (resolved from the
+ * clicker's Slack profile), not SLACK_APPROVER_IDS, and it approves a
+ * payroll_runs row rather than agent_actions.
+ */
+export async function handlePayrollInteraction(parsed, {
+  approve = approvePayrollRun,
+  deps = null,
+  reply = respond,
+} = {}) {
+  const { runId, userId, userName, responseUrl, originalText } = parsed;
+  let result;
+  try {
+    const d = deps || { store: createPayrollStore(), lookupEmail: (id) => lookupSlackUserEmail(id) };
+    result = await approve({ runId, slackUserId: userId, slackUserName: userName }, d);
+  } catch (err) {
+    result = { ok: false, outcome: 'error', reason: err.message };
+  }
+  if (result.ok) {
+    const dollars = `$${(result.payableCents / 100).toFixed(2)}`;
+    await reply(responseUrl, {
+      replace_original: true,
+      text: `${originalText}\n\n✅ Approved by ${result.approver} — ${result.linesApproved} pending line${result.linesApproved === 1 ? '' : 's'} approved (${dollars} payable). Needs-review and disputed lines were not approved. Mark it paid with payroll_mark_paid after paying.`,
+    });
+    return { handled: true, action: 'approved' };
+  }
+  const why = result.outcome === 'already_resolved'
+    ? `This run is already ${result.previousStatus}${result.resolvedBy ? ` (by ${result.resolvedBy})` : ''}.`
+    : result.outcome === 'not_found' ? 'No such payroll run.'
+      : `Not approved: ${String(result.reason || result.outcome).slice(0, 200)}.`;
+  console.warn(`[Payroll] approve ${runId} by ${userName} (${userId}) refused: ${result.outcome} ${result.reason || ''}`);
+  await reply(responseUrl, { response_type: 'ephemeral', replace_original: false, text: `${why} Nothing changed.` });
+  return { handled: true, action: result.outcome };
+}
+
+/**
  * @param {object} app — express app
  * @param {object} [deps] — network seam, per the repo's deps convention. Tests
  *   point `forwardUrl` at a local stub; production passes nothing.
  */
-export function registerSlackApprovalRoutes(app, { forwardUrl = FORWARD_URL, forward = forwardInteraction } = {}) {
+export function registerSlackApprovalRoutes(app, {
+  forwardUrl = FORWARD_URL,
+  forward = forwardInteraction,
+  payrollLive = () => String(process.env.PAYROLL_ENGINE_MODE || '').toLowerCase().trim() === 'live',
+  payrollHandler = handlePayrollInteraction,
+} = {}) {
   app.post('/webhook/slack/interactions', (req, res) => {
     const approvalsOn = slackApprovalsEnabled();
-    // Nothing configured for either job — ack so Slack does not retry, and stop.
-    if (!approvalsOn && !forwardUrl) {
+    // Nothing configured for any job — ack so Slack does not retry, and stop.
+    if (!approvalsOn && !forwardUrl && !payrollLive()) {
       console.log('[SlackApprovals] click received while disabled and not forwarding — ignored');
       return res.status(200).send('');
     }
@@ -243,6 +288,27 @@ export function registerSlackApprovalRoutes(app, { forwardUrl = FORWARD_URL, for
       }
       trackBackground(
         handleInteraction(parsed).catch((err) => console.error(`[SlackApprovals] handler error: ${err.message}`)),
+      );
+      return;
+    }
+
+    // Payroll clicks are ours too and are NEVER forwarded — not even a
+    // malformed one: n8n would read any action_id but deny_member as approval.
+    // Gated on PAYROLL_ENGINE_MODE=live, not SLACK_APPROVALS_ENABLED: a shadow
+    // card has no button, and a stale live card must not act after a switch
+    // back to shadow.
+    if (isPayrollAction(rawBody)) {
+      const payroll = parsePayrollInteraction(rawBody);
+      if (!payroll) {
+        console.warn('[Payroll] malformed payroll click — dropped, not forwarded');
+        return;
+      }
+      if (!payrollLive()) {
+        console.log(`[Payroll] approve click on run ${payroll.runId} while not live — ignored`);
+        return;
+      }
+      trackBackground(
+        payrollHandler(payroll).catch((err) => console.error(`[Payroll] approve handler error: ${err.message}`)),
       );
       return;
     }

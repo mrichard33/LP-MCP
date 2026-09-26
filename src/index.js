@@ -313,6 +313,7 @@ import { startOfficePowerRankingScheduler } from './jobs/office-power-ranking.js
 import { startSaleBackstopScheduler } from './jobs/sale-announce-backstop.js';  // 2026-09-25
 import { startMissedCallerRecoveryScheduler } from './jobs/missed-caller-recovery.js';  // 2026-09-24
 import { registerLeadLeakRoutes, startLeadLeakScheduler } from './jobs/lead-leak-monitor.js';  // 2026-09-26
+import { startPayrollEngineScheduler } from './jobs/payroll-engine.js';  // 2026-09-26
 import { registerCiRoutes } from './ci/routes.js';
 import { startCiWorkerScheduler } from './ci/worker.js';
 import { startCiDiscoveryScheduler } from './jobs/ci-discovery-scheduler.js';
@@ -936,6 +937,7 @@ const server = app.listen(PORT, async () => {
   startSaleBackstopScheduler();
   startMissedCallerRecoveryScheduler();
   startLeadLeakScheduler();
+  startPayrollEngineScheduler();
   // Probe ffmpeg, which transcodes Five9's GSM 6.10 recordings to a format a
   // browser can actually play. A CLEAR LOG LINE, NOT A CRASH: without it the
   // whole pipeline still runs and links still resolve, they just serve the

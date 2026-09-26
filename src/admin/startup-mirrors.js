@@ -2188,4 +2188,86 @@ export const STARTUP_MIRRORS = [
     fail: '[Migration] lead_leak_daily (sql/130) skipped — apply it from the dashboard; the lead-leak monitor stores nothing until it exists:',
     level: 'warn',
   },
+
+  // Payroll Engine tables (sql/131, 2026-09-26 — the file is the source of
+  // truth). Additive: five new tables and one index. DDL only — the LightFire
+  // rule seed and the AI-agent exclusions stay in the sql file, applied from the
+  // dashboard. Without the seed a run finds no rule and files every line
+  // needs_review, which pays nothing: the safe direction.
+  {
+    name: 'sql/131',
+    expects: {
+      tables: ['pay_rules', 'pay_excluded_agents', 'payroll_runs', 'payroll_ledger', 'payroll_audit'],
+      indexes: ['payroll_ledger_line_key_idx'],
+    },
+    sql: [
+      `CREATE TABLE IF NOT EXISTS pay_rules (
+              id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+              payee_type text NOT NULL CHECK (payee_type IN ('partner','call_center')),
+              partner_id uuid REFERENCES lf_partners(id),
+              campaign text,
+              event_type text NOT NULL,
+              amount_cents integer,
+              pct numeric(6,4),
+              lead_age_rule text NOT NULL DEFAULT 'any' CHECK (lead_age_rule IN ('any','aged_only','new_only')),
+              requires_review boolean NOT NULL DEFAULT false,
+              effective_from date NOT NULL,
+              effective_to date,
+              active boolean NOT NULL DEFAULT true,
+              note text,
+              created_by text NOT NULL,
+              created_at timestamptz NOT NULL DEFAULT now()
+            );`,
+      `CREATE TABLE IF NOT EXISTS pay_excluded_agents (
+              agent_name text PRIMARY KEY,
+              reason text NOT NULL,
+              created_at timestamptz NOT NULL DEFAULT now()
+            );`,
+      `CREATE TABLE IF NOT EXISTS payroll_runs (
+              id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+              payee_type text NOT NULL,
+              partner_id uuid REFERENCES lf_partners(id),
+              period_start date NOT NULL,
+              period_end date NOT NULL,
+              mode text NOT NULL CHECK (mode IN ('shadow','live')),
+              status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','paid','void')),
+              total_cents bigint NOT NULL DEFAULT 0,
+              approved_by text, approved_at timestamptz,
+              paid_by text, paid_at timestamptz,
+              created_at timestamptz NOT NULL DEFAULT now(),
+              UNIQUE NULLS NOT DISTINCT (payee_type, partner_id, period_start, period_end, mode)
+            );`,
+      `CREATE TABLE IF NOT EXISTS payroll_ledger (
+              id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+              run_id uuid NOT NULL REFERENCES payroll_runs(id),
+              line_key text NOT NULL,
+              lp_lead_id text NOT NULL,
+              campaign text,
+              agent_name text,
+              event_type text NOT NULL,
+              event_date date NOT NULL,
+              lead_created_date date,
+              rule_id uuid REFERENCES pay_rules(id),
+              amount_cents integer NOT NULL DEFAULT 0,
+              status text NOT NULL CHECK (status IN ('pending','needs_review','disputed','excluded','approved','paid')),
+              flag_reason text,
+              source_report text NOT NULL DEFAULT '134 Jobs by Milestone Date',
+              created_at timestamptz NOT NULL DEFAULT now(),
+              UNIQUE (run_id, line_key)
+            );`,
+      `CREATE INDEX IF NOT EXISTS payroll_ledger_line_key_idx ON payroll_ledger (line_key);`,
+      `CREATE TABLE IF NOT EXISTS payroll_audit (
+              id bigserial PRIMARY KEY,
+              run_id uuid REFERENCES payroll_runs(id),
+              ledger_id uuid REFERENCES payroll_ledger(id),
+              action text NOT NULL,
+              actor text NOT NULL,
+              detail jsonb,
+              created_at timestamptz NOT NULL DEFAULT now()
+            );`,
+    ],
+    ready: '[Migration] payroll engine tables (sql/131) ready',
+    fail: '[Migration] payroll engine tables (sql/131) skipped — apply sql/131 from the dashboard; payroll runs fail gracefully until it exists:',
+    level: 'warn',
+  },
 ];
