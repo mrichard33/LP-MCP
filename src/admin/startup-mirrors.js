@@ -2188,4 +2188,45 @@ export const STARTUP_MIRRORS = [
     fail: '[Migration] lead_leak_daily (sql/130) skipped — apply it from the dashboard; the lead-leak monitor stores nothing until it exists:',
     level: 'warn',
   },
+
+  // Time to first call + leads that never reached LP (sql/131, 2026-09-26 — the
+  // file is the source of truth). Two new tables, nothing existing altered. A
+  // failure makes the daily pass fail its write for these tables only; the
+  // lead_leak_daily rows and the alarms still run.
+  {
+    name: 'sql/131',
+    expects: {
+      tables: ['lead_call_speed_daily', 'lead_intake_gap_daily'],
+    },
+    sql: [
+      `CREATE TABLE IF NOT EXISTS lead_call_speed_daily (
+              created_day date PRIMARY KEY,
+              leads integer NOT NULL,
+              expected integer NOT NULL,
+              called integer NOT NULL,
+              never_called integer NOT NULL,
+              called_1h integer NOT NULL,
+              called_24h integer NOT NULL,
+              median_min numeric,
+              p90_min numeric,
+              updated_at timestamptz DEFAULT now()
+            );`,
+      `CREATE TABLE IF NOT EXISTS lead_intake_gap_daily (
+              id bigserial PRIMARY KEY,
+              run_date date NOT NULL,
+              ghl_contact_id text NOT NULL,
+              first_name text,
+              last_name text,
+              phone10 text,
+              source text,
+              date_added timestamptz,
+              class text NOT NULL,
+              created_at timestamptz DEFAULT now(),
+              UNIQUE (run_date, ghl_contact_id)
+            );`,
+    ],
+    ready: '[Migration] lead_call_speed_daily + lead_intake_gap_daily (sql/131) ready',
+    fail: '[Migration] sql/131 skipped — apply it from the dashboard; time-to-first-call and never-reached-LP rows are not stored until it exists:',
+    level: 'warn',
+  },
 ];
