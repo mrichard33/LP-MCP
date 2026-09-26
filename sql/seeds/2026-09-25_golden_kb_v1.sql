@@ -312,4 +312,24 @@ INSERT INTO kb_faqs (kb_key, question_pattern, canonical_answer, channel, tier, 
  'both', 'factual', true,
  $$Scope boundary. Roofing confirmed retired by Mark 2026-09-25; history-acknowledging wording is Mark's 2026-09-26 ruling. Replaces retired #14.$$);
 
+
+
+-- ── 5. Single-hung IS offered — Mark, 2026-09-26 ────────────────────────
+-- KB-02 deliberately omitted single-hung during the ingest above, because
+-- Mark had not ruled on it and a list that never says "no single-hung" cannot
+-- state anything false. That reasoning was wrong, and this is the correction.
+-- A lead who asks "do you have single hung?" and gets back a list of seven
+-- OTHER styles has been told no. An absent item in a "we offer X, Y, Z" answer
+-- is an implied denial, so an unruled item needs a ruling, not silence.
+-- Mark's words: "Yes, we offer single hung."
+-- Verified: "Do you have single hung windows?" -> KB-02 first at 0.676, and
+-- "What window styles do you offer?" still KB-02 at 0.758 (no regression).
+-- Note: reece-product-knowledge, the skill KB-02 was written from, still never
+-- mentions single-hung. That skill is synced and Mark's to edit.
+UPDATE kb_faqs
+SET canonical_answer = $$We offer single-hung, double-hung, sliders, casements, awnings, picture, bay and bow, and garden windows, plus sliding patio doors. On a double-hung both sashes move and tilt in for easy cleaning. Which rooms are you thinking about?$$,
+    embedding = NULL, embedded_at = NULL, embedding_hash = NULL,
+    updated_at = now()
+WHERE id = 65 AND kb_key = 'KB-02';
+
 COMMIT;

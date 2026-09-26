@@ -1,0 +1,77 @@
+{
+  "name": "39-sms-calculator-last-resort",
+  "covers": "sms \u00b7 calculator last resort \u00b7 gated on 2+ refusals of a call (Mark, 2026-09-26)",
+  "env": {},
+  "channel": "sms",
+  "triggerMessage": "I really can't do a call. Can I just get a price?",
+  "fastTrack": false,
+  "trafficTemp": "warm",
+  "kbPack": null,
+  "availability": null,
+  "classification": {
+    "intent_class": "BUSY",
+    "confidence": 0.88,
+    "classification_method": "rules",
+    "reasoning": "Lead signalled they cannot talk now."
+  },
+  "context": {
+    "now": {
+      "iso": "2026-09-02T15:30:00Z",
+      "date_human": "Wednesday, September 2, 2026",
+      "time_human": "11:30 AM",
+      "tz": "America/New_York"
+    },
+    "lead": {
+      "ghl_contact_id": "FIXTURECONTACT000001",
+      "name": "Dana Whitfield",
+      "first_name": "Dana",
+      "lead_score": 42,
+      "date_added": "2026-08-30T13:00:00Z",
+      "entry_source": "Facebook Lead Form",
+      "current_tags": [],
+      "objection_tags": [],
+      "suppression_tags": [],
+      "contact_notes": [],
+      "rep_display_name": null,
+      "lp_rep_name": null,
+      "trust_level_score": null,
+      "current_buyer_tag": null,
+      "current_bj_tag": null,
+      "current_stage_tag": null
+    },
+    "lp": {
+      "matched": false,
+      "notes": [],
+      "recent_calls": []
+    },
+    "intelligence": {},
+    "engagement": {
+      "emails_opened": 0,
+      "links_clicked": 0,
+      "replies_count": 0,
+      "vsl_watched": false
+    },
+    "objection_state": {
+      "state_code": "APPOINTMENT_FRICTION.timing_delay",
+      "parent_state": "APPOINTMENT_FRICTION",
+      "entered_at": "2026-09-20T14:00:00.000Z",
+      "attempt_number": 2
+    },
+    "pipeline": null,
+    "estimate": {
+      "has_data": false,
+      "total": null,
+      "window_count": null
+    },
+    "conversation_recent": []
+  },
+  "opts": {
+    "servicePhoneDisplay": "(954) 280-8890",
+    "serviceAreaTentative": {
+      "checked": true,
+      "city_served": true,
+      "city": "Coral Springs"
+    },
+    "regenerationNote": "The first draft repeated an earlier outbound almost word for word. Say something new."
+  }
+}

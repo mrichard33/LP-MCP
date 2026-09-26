@@ -206,6 +206,37 @@ answered (Mark Test, 2026-09-25: "Yeah sure" to the bot's own guide offer, guide
 intent to the nin list is therefore safe; removing the fallback is not. Audit:
 `sql/verify/2026-09-25_layer3_silence_audit.sql`.
 
+## The FAQ corpus (`kb_faqs`)
+
+Database content, like `agent_rules` — a change ships without a PR, but the embedding sweep runs
+every 6 hours, so force it with `POST /n8n/kb/reembed {"faqs":true}` and confirm with
+`GET /n8n/kb/faq-probe?q=...` (read `would_match`, not `matched`). Record every change in
+`sql/seeds/` so it is reproducible. `KB_FAQ_SEMANTIC_MODE` is `live`; rollback is one env var
+(`shadow`).
+
+**The LEADING phrase in `question_pattern` dominates the vector.** `buildFaqEmbedText`
+(`src/knowledge/tier1-semantic-core.js:27`) embeds `question_pattern` + the first 240 characters of
+the answer, so a row must lead with the phrasing customers actually type, not the tidiest one. This
+has now been fixed four times: LIB-P04 led with "Why vinyl instead of aluminum?" and lost
+"Do you sell aluminum windows?" to a doors FAQ; LIB-P10 led with the compound "Do you do shutters or
+garage doors?" and lost a pure garage-door question to LIB-P09's *"yes, we do doors"* by 0.015. Lead
+with the customer's words, then re-probe the neighbours — reordering moves the whole vector.
+
+**Omitting an item from a list of what we offer reads as a DENIAL.** Single-hung was left out of
+KB-02 on 2026-09-25 because Mark had not ruled on it, on the theory that a list which never says
+"no single-hung" cannot state something false. That theory was wrong: a lead who asks
+"do you have single hung?" and gets back a list of seven other styles has been told no. **We DO offer
+single-hung** (Mark, 2026-09-26) and KB-02 now leads with it. The same trap applies to any
+"we offer X, Y, Z" answer — an absent item is an implied no, so an unruled item needs a ruling, not
+silence. Note that `reece-product-knowledge`, the skill KB-02 was written from, still never mentions
+single-hung; that skill is synced and Mark's to edit, so it is not the place to look this up.
+
+**Retiring a FAQ without a replacement leaves a hole the search fills with the nearest thing.**
+Retiring `#14` (roofing) during the golden ingest left no roofing answer at all, and a live lead
+walked into it — the three FAQs retrieval offered were all irrelevant (top 0.405) and only the
+model's own knowledge saved the reply. When a topic is retired because the answer CHANGED, the new
+answer still has to exist (`LIB-P12`).
+
 ## Supabase
 
 **Two separate instances — LP and HL.** No cross-joins; fetch from one and filter against the other.
