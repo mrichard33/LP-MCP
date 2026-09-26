@@ -7,16 +7,23 @@
 -- labels WHY, and prices the real leaks. One row per uncalled lead per run.
 --
 -- reason (first match wins — src/lead-leak-classify.js):
---   already_progressed   Set/Sale/… with no Five9 call on record. NOT a leak —
---                        a gap in LP's call data. Tracked as a data-quality count.
+--   not_issued_call_center  NIS — set but never issued to a rep. A leak.
+--   not_covered_by_rep   NOC — set but no rep covered it. A leak.
+--   rep_hold_expired     NoRehash older than REP_HOLD_DAYS — back in play. A leak.
+--   rep_hold             NoRehash inside the hold, or no hold date
+--                        (detail.hold_date_unknown). Not a leak.
+--   already_progressed   current code Set/Sale/… with no Five9 call on record.
+--                        NOT a leak — a gap in LP's call data.
+--   already_progressed_flag  counted only because LP's appointment/won flag is on.
 --   dnc | missing_phone | duplicate | missing_source | data_undecided | dead_status
 --   not_in_five9         callable, and Five9 holds no contact for the number
---   routing_or_automation_failure   callable, in Five9, never dialled — the real leak
+--   routing_or_automation_failure   callable, in Five9, never dialled — a leak
 --   unverified           callable, but not looked up in Five9 (over the daily cap)
 --
 -- est_value is an ESTIMATE (source close rate × average won job value, trailing
--- 180 days), set only for not_in_five9 / routing_or_automation_failure /
--- unverified. NULL everywhere else, and NULL on a run whose close-rate read failed.
+-- 180 days), set only for the leak reasons (not_issued_call_center,
+-- not_covered_by_rep, rep_hold_expired, not_in_five9, routing_or_automation_failure, unverified).
+-- NULL everywhere else, and NULL on a run whose close-rate read failed.
 --
 -- The UNIQUE key makes a same-day rerun overwrite rather than double-count.
 --

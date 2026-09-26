@@ -57,7 +57,7 @@ import { postToSlack as defaultPostToSlack, opsChannelId } from '../slack.js';
 import { runJob } from '../job-runner.js';
 import { hourET, todayET } from './lp-report-common.js';
 import {
-  normalizePhone10, wasCalled, isProgressed,
+  normalizePhone10, wasCalled, needsDncCheck, isRetiredCode, holdDateUnknown,
   classifyUncalledLead, finalizeReason, buildRates, estimateValue,
   summarize, formatSlackSummary, LEAK_REASONS,
 } from '../lead-leak-classify.js';
@@ -152,7 +152,7 @@ export async function readFive9History({ runSQL, windowDays, nowMs }) {
 async function readUniverse({ runSQL, sinceMs }) {
   return asRows(await runSQL(`
     SELECT lp_lead_id, lp_prospect_id, phone, lead_source, disposition_code,
-           call_count, appointment_set, closed_won, created_at_lp
+           call_count, appointment_set, closed_won, created_at_lp, updated_at_lp
       FROM lp_leads
      WHERE created_at_lp >= '${new Date(sinceMs).toISOString()}'
      ORDER BY created_at_lp DESC
@@ -264,12 +264,11 @@ export async function measureLeadLeak({ env = process.env, nowMs = Date.now(), d
     dupCalledPhones = await readDupCalledPhones({ runSQL, uncalled, five9 });
   } catch (err) { return insufficient('duplicate check', err); }
 
-  // DNC only where it could change the answer: not already progressed, not
-  // already LP-DNC, with a usable phone.
+  // DNC only where it could change the answer: not already decided by its
+  // codes (NIS, NoRehash, progressed), not already LP-DNC, with a usable phone.
   const dncCandidates = [...new Set(uncalled
-    .filter((l) => !isProgressed(l) && classifyUncalledLead(l, {}) !== 'dnc')
-    .map((l) => normalizePhone10(l.phone))
-    .filter(Boolean))];
+    .filter((l) => needsDncCheck(l, nowMs))
+    .map((l) => normalizePhone10(l.phone)))];
   let five9Dnc;
   try {
     five9Dnc = await readFive9Dnc({ checkDnc, phones: dncCandidates });
@@ -284,7 +283,7 @@ export async function measureLeadLeak({ env = process.env, nowMs = Date.now(), d
 
   // Classify. `uncalled` is newest first, so the capped Five9 lookups spend
   // themselves on the leads a caller could still act on.
-  const ctx = { five9Dnc, dupCalledPhones };
+  const ctx = { nowMs, five9Dnc, dupCalledPhones };
   let lookups = 0;
   let lookupErrors = 0;
   let consecutiveErrors = 0;
@@ -314,13 +313,19 @@ export async function measureLeadLeak({ env = process.env, nowMs = Date.now(), d
         phone10: normalizePhone10(lead.phone),
         created_at_lp: lead.created_at_lp ?? null,
         lp_call_count: lead.call_count ?? null,
+        ...(reason === 'rep_hold' || reason === 'rep_hold_expired'
+          ? { hold_started: lead.updated_at_lp ?? null, ...(holdDateUnknown(lead) ? { hold_date_unknown: true } : {}) }
+          : {}),
         ...(lookup ? { five9_lookup: lookup } : {}),
       },
     });
   }
   if (lookupErrors) errors.push(`five9 contact lookup: ${lookupErrors} failed (marked unverified)`);
 
-  const summary = summarize(rows);
+  // Over the whole window, called or not: a retired code in use is a hygiene
+  // problem wherever it appears.
+  const retiredCodeInUse = leads.filter(isRetiredCode).length;
+  const summary = summarize(rows, { retiredCodeInUse });
   return {
     verdict: summary.real_leaks > 0 ? 'leaks_found' : 'no_leaks',
     runDate,
@@ -393,7 +398,8 @@ export async function runLeadLeakMonitor({ env = process.env, nowMs = Date.now()
 
   const b = m.summary.by_reason;
   const line = `real_leaks=${m.summary.real_leaks} est_at_risk=$${m.summary.est_value_at_risk}`
-    + ` progressed=${b.already_progressed.leads} data=${b.data_undecided.leads}`
+    + ` progressed=${b.already_progressed.leads}+${b.already_progressed_flag.leads}flag data=${b.data_undecided.leads}`
+    + ` not_issued=${b.not_issued_call_center.leads} not_covered=${b.not_covered_by_rep.leads} hold=${b.rep_hold.leads}/${b.rep_hold_expired.leads}expired`
     + ` uncalled=${m.summary.uncalled}/${m.universe} stored=${stored}`;
   console.log(`[LeadLeak] ${cfg.mode} ${m.verdict} — ${line}${posted ? ' posted' : ''}`);
 

@@ -34,9 +34,43 @@
 // lp_leads.disposition_code values (disposition_label is NULL on every row as
 // of 2026-09-26, so the CODE is what is read). Compared case-insensitively.
 
+// Reece's meanings win over LP's own lp_dispositions labels in this monitor
+// (ruled 2026-09-26). LP's table calls NIS "Not Interested - Shown" and NOC "No
+// Contact"; that is not how Reece uses them, and it is to be corrected in LP.
+
+// NIS = Not Issued: the appointment was set but never issued to a rep and never
+// demoed — usually a call-center problem. A REAL leak, priced. Checked FIRST,
+// before the progressed rules: every NIS lead carries appointment_set = true
+// (39 of 39 on 2026-09-26), so a flag-first order would hide all of them.
+export const NOT_ISSUED_DISPOSITIONS = Object.freeze(['NIS']);
+
+// NOC = Not Covered: the appointment was set but no sales rep covered it. A
+// REAL leak, priced, with its own line (ruled 2026-09-26 — it was briefly on the
+// dead list, which was wrong). Checked first for the same reason as NIS: all 49
+// NOC leads in the 2026-09-26 window carry appointment_set = true.
+export const NOT_COVERED_DISPOSITIONS = Object.freeze(['NOC']);
+
+// NoRehash = the rep ran the demo and asked for a hold to work the lead
+// themselves. Nobody reaches out during the hold. Also checked before the
+// progressed rules (24 of 25 carry appointment_set = true).
+export const REP_HOLD_DISPOSITIONS = Object.freeze(['NoRehash']);
+
+// How long a NoRehash hold lasts, in days. Within it the lead is `rep_hold`
+// (not a leak, $0); after it the lead is back in play and reads
+// `rep_hold_expired` (a leak, priced). Change the hold here and nowhere else.
+export const REP_HOLD_DAYS = 7;
+
+// Codes that should no longer be used at all. A lead still carrying one is
+// classified normally (NIS2 is also dead) AND counted as retired_code_in_use,
+// so the number shows whether anyone is still picking it.
+export const RETIRED_DISPOSITIONS = Object.freeze(['NIS2']); // NIS2 = retired, should not be used
+
 // The lead reached an appointment or beyond. Zero Five9 calls here means LP's
-// call data is missing, NOT that the lead leaked. Reported on its own line as a
-// data-quality number, never counted as a leak.
+// call data is missing, NOT that the lead leaked. Reported as a data-quality
+// number, never counted as a leak. Split in two (2026-09-26): by CURRENT CODE
+// (`already_progressed`) and by LP's appointment/won FLAG alone
+// (`already_progressed_flag`) — the flag is set on leads whose code now says
+// CXL, ND, OPPFDN…, and those are a different question from a booked lead.
 export const PROGRESSED_DISPOSITIONS = Object.freeze(['Set', 'Sale', 'Cnf', 'Verif', 'Issue', 'Reset']);
 
 // LP's own do-not-call disposition. The Five9 DNC list is checked separately.
@@ -48,14 +82,20 @@ export const DNC_DISPOSITIONS = Object.freeze(['DNC']);
 export const DATA_DISPOSITIONS = Object.freeze(['Data']);
 
 // Dispositions that mean "stop calling". Edit this list to change what counts
-// as a dead lead. Live codes NOT on it as of 2026-09-26: NIS, NIS2, NOC,
-// NoRehash (~29 leads in 60 days) — they fall through to the leak reasons
-// until someone rules on them. Not added silently on purpose.
-export const DEAD_DISPOSITIONS = Object.freeze(['CXL', 'NoHome', 'No Demo', 'ND', 'OPPFDN', 'CCC', '1Leg']);
+// as a dead lead. NIS, NOC and NoRehash are deliberately NOT here — see above.
+export const DEAD_DISPOSITIONS = Object.freeze([
+  'CXL', 'NoHome', 'No Demo', 'ND', 'OPPFDN', 'CCC', '1Leg',
+  'NIS2', // NIS2 = retired, should not be used (also counted as retired_code_in_use)
+]);
 
 // ─── Reasons, in first-match-wins order ──────────────────────────────────────
 export const REASONS = Object.freeze([
+  'not_issued_call_center',
+  'not_covered_by_rep',
+  'rep_hold_expired',
+  'rep_hold',
   'already_progressed',
+  'already_progressed_flag',
   'dnc',
   'missing_phone',
   'duplicate',
@@ -67,10 +107,18 @@ export const REASONS = Object.freeze([
   'routing_or_automation_failure',
 ]);
 
-// The real leaks: callable, clean, and never dialled (or not provably dialled
-// because the Five9 lookup cap ran out). Only these are priced, and only these
-// make the headline number.
-export const LEAK_REASONS = Object.freeze(['not_in_five9', 'routing_or_automation_failure', 'unverified']);
+// The real leaks: never dialled and should have been — a call-center issuing
+// failure, a rep hold that ran out, or a callable, clean lead Five9 never rang
+// (or could not be checked for because the lookup cap ran out). Only these are
+// priced, and only these make the headline number.
+export const LEAK_REASONS = Object.freeze([
+  'not_issued_call_center',
+  'not_covered_by_rep',
+  'rep_hold_expired',
+  'not_in_five9',
+  'routing_or_automation_failure',
+  'unverified',
+]);
 export const PRICED_REASONS = LEAK_REASONS;
 
 const lowerSet = (list) => new Set(list.map((s) => String(s).trim().toLowerCase()));
@@ -78,6 +126,11 @@ const PROGRESSED = lowerSet(PROGRESSED_DISPOSITIONS);
 const DNC = lowerSet(DNC_DISPOSITIONS);
 const DATA = lowerSet(DATA_DISPOSITIONS);
 const DEAD = lowerSet(DEAD_DISPOSITIONS);
+const NOT_ISSUED = lowerSet(NOT_ISSUED_DISPOSITIONS);
+const NOT_COVERED = lowerSet(NOT_COVERED_DISPOSITIONS);
+const REP_HOLD = lowerSet(REP_HOLD_DISPOSITIONS);
+const RETIRED = lowerSet(RETIRED_DISPOSITIONS);
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 const dispo = (lead) => String(lead?.disposition_code ?? '').trim().toLowerCase();
 
@@ -130,8 +183,49 @@ export function wasCalled(lead, ctx) {
   return Number(ctx.five9Phones.get(p)) >= created;
 }
 
-export function isProgressed(lead) {
-  return PROGRESSED.has(dispo(lead)) || lead?.appointment_set === true || lead?.closed_won === true;
+export const isRetiredCode = (lead) => RETIRED.has(dispo(lead));
+
+/**
+ * When the NoRehash hold started, in ms, or null. LP exposes no
+ * disposition-change date (checked 2026-09-26: no column, no history table),
+ * so this is updated_at_lp — LP's `lastchangedon`. That is "last changed", so a
+ * later edit to the lead restarts the clock: a hold can only look LONGER than it
+ * is, never shorter, which is the safe direction for "do not reach out".
+ */
+export function holdStartedMs(lead) {
+  const ms = Date.parse(lead?.updated_at_lp ?? '');
+  return Number.isFinite(ms) ? ms : null;
+}
+
+/** A NoRehash lead whose hold start cannot be read — kept on hold, never guessed. */
+export function holdDateUnknown(lead) {
+  return REP_HOLD.has(dispo(lead)) && holdStartedMs(lead) === null;
+}
+
+/**
+ * The reasons decided by the lead's own codes and flags alone, before any
+ * phone, DNC or source check: not issued, not covered, rep hold, progressed
+ * by code, progressed by flag. Null when none applies.
+ */
+function codeFirstReason(lead, nowMs) {
+  if (NOT_ISSUED.has(dispo(lead))) return 'not_issued_call_center';
+  if (NOT_COVERED.has(dispo(lead))) return 'not_covered_by_rep';
+  if (REP_HOLD.has(dispo(lead))) {
+    const started = holdStartedMs(lead);
+    if (started === null) return 'rep_hold';
+    return nowMs - started > REP_HOLD_DAYS * DAY_MS ? 'rep_hold_expired' : 'rep_hold';
+  }
+  if (PROGRESSED.has(dispo(lead))) return 'already_progressed';
+  if (lead?.appointment_set === true || lead?.closed_won === true) return 'already_progressed_flag';
+  return null;
+}
+
+/**
+ * Whether the Five9 DNC answer could change this lead's reason. False for leads
+ * the code-first rules already decide, and for LP-DNC leads (already `dnc`).
+ */
+export function needsDncCheck(lead, nowMs = Date.now()) {
+  return codeFirstReason(lead, nowMs) === null && !DNC.has(dispo(lead)) && !!normalizePhone10(lead?.phone);
 }
 
 /**
@@ -139,12 +233,20 @@ export function isProgressed(lead) {
  * Five9 contact lookup can decide. Returns a reason, or null meaning "clean and
  * callable — ask Five9 whether it even holds the number" (finalizeReason).
  *
+ * ORDER (ruled 2026-09-26): NIS, NOC and NoRehash come FIRST — the current code
+ * wins over LP's appointment_set flag for those three, because nearly every one
+ * of them carries the flag. Taken literally that also puts them ahead of DNC: a NIS lead
+ * whose number is on DNC reads not_issued_call_center. Move the codeFirstReason
+ * call below the DNC line if that should change.
+ *
  * ctx:
+ *   nowMs            the clock for the rep-hold age (default now)
  *   five9Dnc         Set of normalized phones on the Five9 DNC list
  *   dupCalledPhones  Set of normalized phones another, CALLED lp_leads row shares
  */
 export function classifyUncalledLead(lead, ctx = {}) {
-  if (isProgressed(lead)) return 'already_progressed';
+  const early = codeFirstReason(lead, ctx.nowMs ?? Date.now());
+  if (early) return early;
 
   const phone = normalizePhone10(lead?.phone);
   if (DNC.has(dispo(lead)) || (phone && ctx.five9Dnc?.has(phone))) return 'dnc';
@@ -198,19 +300,23 @@ export function estimateValue(lead, reason, rates) {
 
 /**
  * Counts and estimated $ by reason, plus the headline and top sources.
- * `rows` are the stored shape: { reason, lead_source, est_value }.
+ * `rows` are the stored shape: { reason, lead_source, est_value, detail }.
+ * `retiredCodeInUse` is counted by the job over the whole window (called leads
+ * too), because it is a code-hygiene number, not a property of uncalled leads.
  */
-export function summarize(rows) {
+export function summarize(rows, { retiredCodeInUse = 0 } = {}) {
   const byReason = {};
   for (const reason of REASONS) byReason[reason] = { leads: 0, est_value: 0 };
   const leakBySource = new Map();
   let realLeaks = 0;
   let valueAtRisk = 0;
+  let holdDateUnknownCount = 0;
 
   for (const r of rows || []) {
     const bucket = byReason[r.reason] || (byReason[r.reason] = { leads: 0, est_value: 0 });
     bucket.leads += 1;
     bucket.est_value += Number(r.est_value) || 0;
+    if (r.detail?.hold_date_unknown) holdDateUnknownCount += 1;
     if (LEAK_REASONS.includes(r.reason)) {
       realLeaks += 1;
       valueAtRisk += Number(r.est_value) || 0;
@@ -231,6 +337,8 @@ export function summarize(rows) {
     est_value_at_risk: Math.round(valueAtRisk),
     by_reason: byReason,
     top_sources: topSources,
+    hold_date_unknown: holdDateUnknownCount,
+    retired_code_in_use: retiredCodeInUse,
   };
 }
 
@@ -247,14 +355,21 @@ export function formatSlackSummary({ runDate, windowDays, summary, revenueAvaila
   const n = (reason) => num(b[reason]?.leads);
   const lines = [
     `📉 *Lead Leak Monitor — ${runDate}* (leads from the last ${windowDays} days)`,
-    `Real leaks (callable, never dialled): *${num(summary.real_leaks)}*`,
+    `Real leaks (should be worked, never dialled): *${num(summary.real_leaks)}*`,
     revenueAvailable
       ? `Revenue at risk (estimate): *${money(summary.est_value_at_risk)}*`
       : 'Revenue at risk (estimate): unavailable — the close-rate read failed',
     '',
+    `• Not issued to a rep (call center, NIS): ${n('not_issued_call_center')}`,
+    `• Set, but no rep covered it (NOC): ${n('not_covered_by_rep')}`,
+    `• Rep hold over, back in play (NoRehash > ${REP_HOLD_DAYS} days): ${n('rep_hold_expired')}`,
     `• Never dialled, Five9 has the number: ${n('routing_or_automation_failure')}`,
     `• Not in Five9 at all: ${n('not_in_five9')}`,
     `• Not checked in Five9 yet (over the daily lookup cap): ${n('unverified')}`,
+    '',
+    'Not leaks:',
+    `• On rep hold (NoRehash, ${REP_HOLD_DAYS} days): ${n('rep_hold')}`
+      + (summary.hold_date_unknown ? ` (${num(summary.hold_date_unknown)} with no hold date — kept on hold)` : ''),
     `• Do not call: ${n('dnc')}   • No usable phone: ${n('missing_phone')}   • Duplicate of a called lead: ${n('duplicate')}`,
     `• No lead source: ${n('missing_source')}   • Dead status: ${n('dead_status')}`,
   ];
@@ -264,8 +379,11 @@ export function formatSlackSummary({ runDate, windowDays, summary, revenueAvaila
   }
   lines.push(
     '',
-    `Not leaks, tracked separately — booked/sold but no Five9 call on record (LP call data gap): ${n('already_progressed')}`
-      + ` · "Data" leads awaiting a ruling: ${n('data_undecided')}`,
+    'Tracked separately (LP call data gaps and open rulings):',
+    `• Booked/sold by current code (Set/Sale/Cnf/Verif/Issue/Reset), no Five9 call on record: ${n('already_progressed')}`,
+    `• Counted only because LP's appointment/won flag is on (code says otherwise): ${n('already_progressed_flag')}`,
+    `• "Data" leads awaiting a ruling: ${n('data_undecided')}`,
+    `• Retired codes still in use (${RETIRED_DISPOSITIONS.join(', ')}): ${num(summary.retired_code_in_use)}`,
     'Details: GET /api/lp/lead-leak',
   );
   return lines.join('\n');
