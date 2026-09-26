@@ -60,12 +60,12 @@ test('sql/061 defines the CHECK, and it admits exactly auto and human', () => {
 });
 
 test('the runMigrations mirror agrees with sql/061, character for character', () => {
-  // A fresh deploy self-heals from the mirror in src/index.js. If the two ever
+  // A fresh deploy self-heals from the mirror in src/admin/startup-mirrors.js. If the two ever
   // disagree, the constraint depends on which one ran, which is the worst kind
   // of schema drift: invisible until an insert fails on one instance only.
   const fromFile = allowedDecidedBy(read('sql/061_call_intel_schema.sql'));
-  const fromMirror = allowedDecidedBy(read('src/index.js'));
-  assert.ok(fromMirror, 'runMigrations must still carry the ci_matches DDL');
+  const fromMirror = allowedDecidedBy(read('src/admin/startup-mirrors.js'));
+  assert.ok(fromMirror, 'the startup mirrors must still carry the ci_matches DDL');
   assert.deepEqual(fromMirror.slice().sort(), fromFile.slice().sort());
 });
 
@@ -162,7 +162,7 @@ test("the human review path still writes 'human'", () => {
 test("NO source file writes 'system' as a decided_by value, ever again", () => {
   // The regression guard. A comment may discuss the old value; an assignment
   // may not reintroduce it.
-  const files = ['src/ci/worker.js', 'src/ci/routes.js', 'src/ci/sync.js', 'src/ci/reconcile.js', 'src/index.js'];
+  const files = ['src/ci/worker.js', 'src/ci/routes.js', 'src/ci/sync.js', 'src/ci/reconcile.js', 'src/index.js', 'src/admin/startup-mirrors.js'];
   for (const rel of files) {
     const src = read(rel);
     assert.equal(
@@ -183,7 +183,7 @@ test('the SQL that reads decided_by is untouched by this fix', () => {
 
 test('v_ci_review_queue still surfaces decided_by for both kinds of row', () => {
   // A reviewer has to be able to tell a matcher verdict from a human one.
-  for (const rel of ['sql/066_ci_reconcile_ops.sql', 'src/index.js']) {
+  for (const rel of ['sql/066_ci_reconcile_ops.sql', 'src/admin/startup-mirrors.js']) {
     const sql = read(rel);
     const view = /CREATE OR REPLACE VIEW v_ci_review_queue[\s\S]*?ORDER BY c\.call_start/i.exec(sql);
     assert.ok(view, `${rel} must still define v_ci_review_queue`);
