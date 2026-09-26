@@ -153,8 +153,23 @@ test('NoRehash with appointment_set = true → rep_hold / rep_hold_expired, not 
   assert.equal(needsDncCheck(over, NOW), false, 'decided by its code — no DNC lookup spent on it');
 });
 
-test('NOC → dead_status; NIS2 → dead_status and counted as a retired code in use', () => {
-  assert.equal(classifyUncalledLead(lead({ disposition_code: 'NOC' })), 'dead_status');
+test('NOC → not_covered_by_rep, a priced leak — even with appointment_set = true', () => {
+  assert.equal(classifyUncalledLead(lead({ disposition_code: 'NOC' }), { nowMs: NOW }), 'not_covered_by_rep');
+  assert.equal(
+    classifyUncalledLead(lead({ disposition_code: 'NOC', appointment_set: true }), { nowMs: NOW }),
+    'not_covered_by_rep',
+    'the current code wins over the flag (49 of 49 live NOC leads carry it)',
+  );
+  assert.ok(LEAK_REASONS.includes('not_covered_by_rep'));
+  const rates = buildRates([{ source: 'Google PPC', leads: 100, won: 10, avg_value: 12000 }]);
+  assert.equal(estimateValue(lead(), 'not_covered_by_rep', rates), 1200);
+  const s = summarize([{ reason: 'not_covered_by_rep', lead_source: 'A', est_value: 1200 }]);
+  assert.equal(s.real_leaks, 1);
+  const text = formatSlackSummary({ runDate: '2026-09-26', windowDays: 60, summary: s });
+  assert.match(text, /Set, but no rep covered it \(NOC\): 1/);
+});
+
+test('NIS2 → dead_status and counted as a retired code in use', () => {
   assert.equal(classifyUncalledLead(lead({ disposition_code: 'NIS2' })), 'dead_status');
   const s = summarize([{ reason: 'dead_status', lead_source: 'A', est_value: null }], { retiredCodeInUse: 1 });
   assert.equal(s.retired_code_in_use, 1);

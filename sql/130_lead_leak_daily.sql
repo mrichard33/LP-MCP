@@ -8,6 +8,7 @@
 --
 -- reason (first match wins — src/lead-leak-classify.js):
 --   not_issued_call_center  NIS — set but never issued to a rep. A leak.
+--   not_covered_by_rep   NOC — set but no rep covered it. A leak.
 --   rep_hold_expired     NoRehash older than REP_HOLD_DAYS — back in play. A leak.
 --   rep_hold             NoRehash inside the hold, or no hold date
 --                        (detail.hold_date_unknown). Not a leak.
@@ -21,7 +22,7 @@
 --
 -- est_value is an ESTIMATE (source close rate × average won job value, trailing
 -- 180 days), set only for the leak reasons (not_issued_call_center,
--- rep_hold_expired, not_in_five9, routing_or_automation_failure, unverified).
+-- not_covered_by_rep, rep_hold_expired, not_in_five9, routing_or_automation_failure, unverified).
 -- NULL everywhere else, and NULL on a run whose close-rate read failed.
 --
 -- The UNIQUE key makes a same-day rerun overwrite rather than double-count.

@@ -399,7 +399,7 @@ export async function runLeadLeakMonitor({ env = process.env, nowMs = Date.now()
   const b = m.summary.by_reason;
   const line = `real_leaks=${m.summary.real_leaks} est_at_risk=$${m.summary.est_value_at_risk}`
     + ` progressed=${b.already_progressed.leads}+${b.already_progressed_flag.leads}flag data=${b.data_undecided.leads}`
-    + ` not_issued=${b.not_issued_call_center.leads} hold=${b.rep_hold.leads}/${b.rep_hold_expired.leads}expired`
+    + ` not_issued=${b.not_issued_call_center.leads} not_covered=${b.not_covered_by_rep.leads} hold=${b.rep_hold.leads}/${b.rep_hold_expired.leads}expired`
     + ` uncalled=${m.summary.uncalled}/${m.universe} stored=${stored}`;
   console.log(`[LeadLeak] ${cfg.mode} ${m.verdict} — ${line}${posted ? ' posted' : ''}`);
 

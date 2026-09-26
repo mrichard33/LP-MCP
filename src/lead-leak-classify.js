@@ -44,6 +44,12 @@
 // (39 of 39 on 2026-09-26), so a flag-first order would hide all of them.
 export const NOT_ISSUED_DISPOSITIONS = Object.freeze(['NIS']);
 
+// NOC = Not Covered: the appointment was set but no sales rep covered it. A
+// REAL leak, priced, with its own line (ruled 2026-09-26 — it was briefly on the
+// dead list, which was wrong). Checked first for the same reason as NIS: all 49
+// NOC leads in the 2026-09-26 window carry appointment_set = true.
+export const NOT_COVERED_DISPOSITIONS = Object.freeze(['NOC']);
+
 // NoRehash = the rep ran the demo and asked for a hold to work the lead
 // themselves. Nobody reaches out during the hold. Also checked before the
 // progressed rules (24 of 25 carry appointment_set = true).
@@ -76,16 +82,16 @@ export const DNC_DISPOSITIONS = Object.freeze(['DNC']);
 export const DATA_DISPOSITIONS = Object.freeze(['Data']);
 
 // Dispositions that mean "stop calling". Edit this list to change what counts
-// as a dead lead. NIS and NoRehash are deliberately NOT here — see above.
+// as a dead lead. NIS, NOC and NoRehash are deliberately NOT here — see above.
 export const DEAD_DISPOSITIONS = Object.freeze([
   'CXL', 'NoHome', 'No Demo', 'ND', 'OPPFDN', 'CCC', '1Leg',
-  'NOC',  // NOC = Not Covered
   'NIS2', // NIS2 = retired, should not be used (also counted as retired_code_in_use)
 ]);
 
 // ─── Reasons, in first-match-wins order ──────────────────────────────────────
 export const REASONS = Object.freeze([
   'not_issued_call_center',
+  'not_covered_by_rep',
   'rep_hold_expired',
   'rep_hold',
   'already_progressed',
@@ -107,6 +113,7 @@ export const REASONS = Object.freeze([
 // priced, and only these make the headline number.
 export const LEAK_REASONS = Object.freeze([
   'not_issued_call_center',
+  'not_covered_by_rep',
   'rep_hold_expired',
   'not_in_five9',
   'routing_or_automation_failure',
@@ -120,6 +127,7 @@ const DNC = lowerSet(DNC_DISPOSITIONS);
 const DATA = lowerSet(DATA_DISPOSITIONS);
 const DEAD = lowerSet(DEAD_DISPOSITIONS);
 const NOT_ISSUED = lowerSet(NOT_ISSUED_DISPOSITIONS);
+const NOT_COVERED = lowerSet(NOT_COVERED_DISPOSITIONS);
 const REP_HOLD = lowerSet(REP_HOLD_DISPOSITIONS);
 const RETIRED = lowerSet(RETIRED_DISPOSITIONS);
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -196,11 +204,12 @@ export function holdDateUnknown(lead) {
 
 /**
  * The reasons decided by the lead's own codes and flags alone, before any
- * phone, DNC or source check: not issued, rep hold, progressed by code,
- * progressed by flag. Null when none applies.
+ * phone, DNC or source check: not issued, not covered, rep hold, progressed
+ * by code, progressed by flag. Null when none applies.
  */
 function codeFirstReason(lead, nowMs) {
   if (NOT_ISSUED.has(dispo(lead))) return 'not_issued_call_center';
+  if (NOT_COVERED.has(dispo(lead))) return 'not_covered_by_rep';
   if (REP_HOLD.has(dispo(lead))) {
     const started = holdStartedMs(lead);
     if (started === null) return 'rep_hold';
@@ -224,9 +233,9 @@ export function needsDncCheck(lead, nowMs = Date.now()) {
  * Five9 contact lookup can decide. Returns a reason, or null meaning "clean and
  * callable — ask Five9 whether it even holds the number" (finalizeReason).
  *
- * ORDER (ruled 2026-09-26): NIS and NoRehash come FIRST — the current code wins
- * over LP's appointment_set flag for those two, because every one of them
- * carries the flag. Taken literally that also puts them ahead of DNC: a NIS lead
+ * ORDER (ruled 2026-09-26): NIS, NOC and NoRehash come FIRST — the current code
+ * wins over LP's appointment_set flag for those three, because nearly every one
+ * of them carries the flag. Taken literally that also puts them ahead of DNC: a NIS lead
  * whose number is on DNC reads not_issued_call_center. Move the codeFirstReason
  * call below the DNC line if that should change.
  *
@@ -352,6 +361,7 @@ export function formatSlackSummary({ runDate, windowDays, summary, revenueAvaila
       : 'Revenue at risk (estimate): unavailable — the close-rate read failed',
     '',
     `• Not issued to a rep (call center, NIS): ${n('not_issued_call_center')}`,
+    `• Set, but no rep covered it (NOC): ${n('not_covered_by_rep')}`,
     `• Rep hold over, back in play (NoRehash > ${REP_HOLD_DAYS} days): ${n('rep_hold_expired')}`,
     `• Never dialled, Five9 has the number: ${n('routing_or_automation_failure')}`,
     `• Not in Five9 at all: ${n('not_in_five9')}`,
