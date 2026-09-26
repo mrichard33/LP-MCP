@@ -311,3 +311,44 @@ test('buildEstablishedFacts does not mutate its input', () => {
   buildEstablishedFacts(input);
   assert.equal(JSON.stringify(input), before);
 });
+
+// ═══════════════════════════════════════════════════════════════════
+// 2026-09-26 — tier 2b: a VOLUNTEERED sole-owner statement
+// (Carlos, LSZTKuLhNEPfwW2az5Ek: "I'm the owner" closed nothing because no
+// outbound had asked, so the bot kept addressing "whoever else is deciding")
+// ═══════════════════════════════════════════════════════════════════
+
+test('"I\'m the owner" said without being asked closes decision_makers as Solo Owner', () => {
+  const est = buildEstablishedFacts(ctx({
+    turns: [
+      { direction: 'outbound', channel: 'sms', timestamp: T.askDm, text: 'What is going on with the door?' },
+      { direction: 'inbound', channel: 'sms', timestamp: T.longInbound, text: "I don't like the color. I'm the owner, I make all the decisions." },
+    ],
+  }));
+  assert.ok(est.closed_questions.includes('decision_makers'));
+  const fact = est.facts.find(f => f.key === 'decision_makers');
+  assert.equal(fact.value, 'Solo Owner');
+  assert.equal(fact.source, 'transcript');
+  assert.match(fact.their_words, /I'm the owner/);
+});
+
+test('a volunteered statement that names a second person closes nothing', () => {
+  const est = buildEstablishedFacts(ctx({
+    turns: [
+      { direction: 'inbound', channel: 'sms', timestamp: T.longInbound, text: "My wife and I own the place, it's my call though." },
+    ],
+  }));
+  assert.equal(est.closed_questions.includes('decision_makers'), false);
+});
+
+test('a paired answer with a value still wins over a later volunteered statement', () => {
+  const est = buildEstablishedFacts(ctx({
+    turns: [
+      { direction: 'outbound', channel: 'sms', timestamp: T.askDm, text: 'Will anyone else be there, or is it just you?' },
+      { direction: 'inbound', channel: 'sms', timestamp: T.longInbound, text: 'My wife will be there too.' },
+      { direction: 'inbound', channel: 'sms', timestamp: T.longInbound, text: "It's my call at the end of the day." },
+    ],
+  }));
+  const fact = est.facts.find(f => f.key === 'decision_makers');
+  assert.equal(fact.value, 'Yes', 'the paired "wife will be there" answer is the fact');
+});

@@ -564,6 +564,72 @@ export function findDecisionMakerSignals(text) {
 }
 
 /**
+ * Hand a decision-maker conversation to a person: the sales callback tag, a
+ * rep task (a GHL note — GHL has no task API), the
+ * `agentic.decision_maker_handoff` event, and an ops card.
+ *
+ * Extracted 2026-09-26 from the generation-failure path so the discovery
+ * discipline's refused-twice case (a reply IS sent; see
+ * response-generator.js `dm_handoff`) shares the exact same side effects.
+ * This function only does the side effects and RETURNS — whether a message
+ * goes out is the caller's decision, never this function's.
+ *
+ * Fail-soft throughout: the tag, note, event and card each land independently.
+ *
+ * @returns {Promise<{tagsApplied: boolean}>}
+ */
+async function routeDecisionMakerHandoff(contactId, action, {
+  channel, triggerMessage, reason, signals = [], detail = '', card, generationError = null,
+} = {}) {
+  const tagsApplied = await applyContactTags(contactId, [CALLBACK_TAG_SALES]);
+
+  // Written here rather than queued so the task exists on merge: the event
+  // below needs an agent_rule to consume it, and a rule is DB config that
+  // ships separately.
+  addGHLNote(
+    contactId,
+    `[AGENT TASK] Decision-maker reply needs a person.\n` +
+    `They said: "${String(triggerMessage || '').slice(0, 400)}"\n` +
+    `${detail}`
+  ).catch(err => console.warn(`[SendMessage] decision-maker rep task note failed for ${contactId}: ${err.message}`));
+
+  // Also emitted so a rule can pick this up for reporting or routing.
+  emitEvent({
+    event_type: 'agentic.decision_maker_handoff',
+    source_system: 'send_message_handler',
+    ghl_contact_id: contactId,
+    priority: 'high',
+    idempotency_key: `dm_handoff_${action.id}`,
+    payload: {
+      contact_id: contactId,
+      channel,
+      action_id: action.id,
+      rule_applied: action.rule_applied || null,
+      reason,
+      signals,
+      inbound_preview: String(triggerMessage || '').slice(0, 300),
+      ...(generationError ? { generation_error: String(generationError).slice(0, 300) } : {}),
+    },
+  }).catch(err => console.warn(`[SendMessage] decision-maker handoff event failed: ${err.message}`));
+
+  // Operational alarm — the ops bot, mirrored to SLACK_CHANNEL_OPS. This is
+  // the one reply-path alert that does NOT belong on the default channel:
+  // nobody is going to move this lead forward until a person sees it.
+  sendGroupMeMessage(
+    `${card}\n` +
+    `Contact: ${contactId}\n` +
+    `Channel: ${String(channel || 'sms').toUpperCase()}\n` +
+    `Rule: ${action.rule_applied || 'manual'}\n` +
+    `They said: "${String(triggerMessage || '').slice(0, 200)}"\n` +
+    (generationError ? `Error: ${String(generationError).slice(0, 150)}\n` : '') +
+    `→ Needs a person. ${generationError ? 'The generic fallback was deliberately NOT sent.' : 'The bot told the lead a team member will call; do not book a single-leg visit.'}`,
+    { channel: 'ops' }
+  ).catch(err => console.warn(`[SendMessage] ops alert (decision-maker handoff) failed: ${err.message}`));
+
+  return { tagsApplied: !!tagsApplied };
+}
+
+/**
  * Decide the outbound email sender. Pure — all I/O happens in the callers.
  *
  *   inboundTo         the address the lead wrote to (our receiving mailbox)
@@ -3190,6 +3256,23 @@ export async function executeSendMessage(action, context) {
       }).catch(err => console.warn(`[SendMessage] handoff side effects failed for ${contactId} (fail-soft): ${err.message}`));
     }
 
+    // 2026-09-26 — the named decision-maker was refused twice (discovery
+    // discipline, Fix 3). The reply still goes out — it says a team member
+    // will call — and a person owns the visit: same tag, rep note, event and
+    // ops card as the generation-failure path, WITHOUT that path's silence.
+    if (!generationErr && generated?.dm_handoff) {
+      await routeDecisionMakerHandoff(contactId, action, {
+        channel,
+        triggerMessage: replyTriggerMessage || triggerMessage,
+        reason: generated.dm_handoff.reason,
+        signals: [generated.dm_handoff.name || generated.dm_handoff.relation || 'named decision-maker'].filter(Boolean),
+        detail: `The lead named ${generated.dm_handoff.name || `their ${generated.dm_handoff.relation || 'co-owner'}`} and twice said they need not be involved. ` +
+          `The bot asked once how they feel about it, was refused again, and has now told the lead a team member will call to sort out the visit. ` +
+          `Do NOT book a single-leg visit. Reach out, find a time that works for everyone, or make the call with both on the line.`,
+        card: `🤝 DECISION-MAKER HANDOFF — A PERSON SORTS THE VISIT OUT`,
+      }).catch(err => console.warn(`[SendMessage] decision-maker handoff side effects failed for ${contactId} (fail-soft): ${err.message}`));
+    }
+
     // 2026-09-25 — "didn't get it" on a guide: re-fire the delivery tag so GHL
     // sends it again (src/agentic/guide-delivery.js guideResendOps). Remove
     // first, then add, so the tag-added trigger fires even if the tag stuck,
@@ -3228,56 +3311,19 @@ export async function executeSendMessage(action, context) {
           `(signals: ${dmSignals.join(', ')}) — routing to a human instead of the fallback`
         );
 
-        const handoffTags = await applyContactTags(contactId, [CALLBACK_TAG_SALES]);
-
-        // The rep task IS a GHL note — GHL has no task API, so create_task
-        // writes a note plus a notification (src/actions/handlers/tasks.js).
-        // Written here rather than queued so the task exists on merge: the
-        // event below needs an agent_rule to consume it, and a rule is DB
-        // config that ships separately. Fail-soft — the ops card and the
-        // handoff tag still land if the note write fails.
-        addGHLNote(
-          contactId,
-          `[AGENT TASK] Decision-maker reply needs a person.\n` +
-          `They said: "${String(replyTriggerMessage || triggerMessage || '').slice(0, 400)}"\n` +
-          `AI generation failed (${generationErr.message.slice(0, 150)}), and the generic ` +
-          `fallback was deliberately NOT sent — it cannot hold this conversation.\n` +
-          `Per ALL DECISION MAKERS ATTEND: acknowledge what they said without arguing, confirm ` +
-          `whether anyone else is on the home, and offer a time that works for everyone or the ` +
-          `15-minute call with both on speaker. Do not push if they have already refused.`
-        ).catch(err => console.warn(`[SendMessage] decision-maker rep task note failed for ${contactId}: ${err.message}`));
-
-        // Also emitted so a rule can pick this up for reporting or routing.
-        emitEvent({
-          event_type: 'agentic.decision_maker_handoff',
-          source_system: 'send_message_handler',
-          ghl_contact_id: contactId,
-          priority: 'high',
-          idempotency_key: `dm_handoff_${action.id}`,
-          payload: {
-            contact_id: contactId,
-            channel,
-            action_id: action.id,
-            rule_applied: action.rule_applied || null,
-            signals: dmSignals,
-            inbound_preview: String(replyTriggerMessage || triggerMessage || '').slice(0, 300),
-            generation_error: generationErr.message.slice(0, 300),
-          },
-        }).catch(err => console.warn(`[SendMessage] decision-maker handoff event failed: ${err.message}`));
-
-        // Operational alarm — the ops bot, mirrored to SLACK_CHANNEL_OPS. This
-        // is the one reply-path alert that does NOT belong on the default
-        // channel: nobody is going to reply to this lead until a person sees it.
-        sendGroupMeMessage(
-          `🛑 DECISION-MAKER MESSAGE — AI FAILED, NO REPLY SENT\n` +
-          `Contact: ${contactId}\n` +
-          `Channel: ${channel.toUpperCase()}\n` +
-          `Rule: ${action.rule_applied || 'manual'}\n` +
-          `They said: "${String(replyTriggerMessage || triggerMessage || '').slice(0, 200)}"\n` +
-          `Error: ${generationErr.message.slice(0, 150)}\n` +
-          `→ Needs a person. The generic fallback was deliberately NOT sent.`,
-          { channel: 'ops' }
-        ).catch(err => console.warn(`[SendMessage] ops alert (decision-maker handoff) failed: ${err.message}`));
+        const { tagsApplied: handoffTags } = await routeDecisionMakerHandoff(contactId, action, {
+          channel,
+          triggerMessage: replyTriggerMessage || triggerMessage,
+          reason: 'decision_maker_message_generation_failed',
+          signals: dmSignals,
+          generationError: generationErr.message,
+          detail: `AI generation failed (${generationErr.message.slice(0, 150)}), and the generic ` +
+            `fallback was deliberately NOT sent — it cannot hold this conversation.\n` +
+            `Per ALL DECISION MAKERS ATTEND: acknowledge what they said without arguing, confirm ` +
+            `whether anyone else is on the home, and offer a time that works for everyone or the ` +
+            `15-minute call with both on speaker. Do not push if they have already refused.`,
+          card: `🛑 DECISION-MAKER MESSAGE — AI FAILED, NO REPLY SENT`,
+        });
 
         return {
           action: 'send_message_handed_off',

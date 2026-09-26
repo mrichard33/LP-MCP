@@ -1,0 +1,112 @@
+{
+  "name": "36-sms-problem-named-probe-first",
+  "covers": "sms · NEPQ v1.4 DISCOVERY DISCIPLINE · lead named a problem in their own words → PROBE FIRST with their words · no booking ask (Carlos LSZTKuLhNEPfwW2az5Ek, 2026-09-26)",
+  "env": {},
+  "channel": "sms",
+  "triggerMessage": "I don't like the color and design of my front door.",
+  "fastTrack": false,
+  "trafficTemp": "warm",
+  "kbPack": null,
+  "availability": null,
+  "classification": {
+    "intent_class": "QUESTION",
+    "confidence": 0.6,
+    "classification_method": "llm",
+    "reasoning": "Problem statement about the door."
+  },
+  "context": {
+    "now": {
+      "iso": "2026-09-02T15:30:00Z",
+      "date_human": "Wednesday, September 2, 2026",
+      "time_human": "11:30 AM",
+      "tz": "America/New_York"
+    },
+    "lead": {
+      "ghl_contact_id": "FIXTURECONTACT000001",
+      "name": "Dana Whitfield",
+      "first_name": "Dana",
+      "lead_score": 58,
+      "date_added": "2026-08-30T13:00:00Z",
+      "entry_source": "Facebook Lead Form",
+      "current_tags": [],
+      "objection_tags": [],
+      "suppression_tags": [],
+      "contact_notes": [],
+      "rep_display_name": null,
+      "lp_rep_name": null,
+      "trust_level_score": 3,
+      "current_buyer_tag": null,
+      "current_bj_tag": null,
+      "current_stage_tag": null,
+      "decision_makers_present": null
+    },
+    "lp": {
+      "matched": false,
+      "notes": [],
+      "recent_calls": []
+    },
+    "intelligence": {
+      "buyer_stage": 2,
+      "buyer_stage_confidence": 0.8
+    },
+    "engagement": {
+      "emails_opened": 1,
+      "links_clicked": 0,
+      "replies_count": 2,
+      "vsl_watched": false
+    },
+    "objection_state": null,
+    "pipeline": null,
+    "estimate": null,
+    "conversation_recent": [
+      {
+        "direction": "outbound",
+        "channel": "sms",
+        "timestamp": "2026-09-02T15:20:00Z",
+        "text": "Hi Dana, this is the Reece team. What is going on with the windows or doors that made you reach out?"
+      },
+      {
+        "direction": "inbound",
+        "channel": "sms",
+        "timestamp": "2026-09-02T15:28:00Z",
+        "text": "I don't like the color and design of my front door."
+      }
+    ]
+  },
+  "opts": {
+    "established": {
+      "facts": [],
+      "closed_questions": [],
+      "offers_made": [],
+      "apologies_made": [],
+      "objections_raised": []
+    },
+    "discipline": {
+      "version": "1.0",
+      "booking": {
+        "allowed": false,
+        "reason": "default_probe_first",
+        "recent_asks": 0
+      },
+      "probe": {
+        "problem_named": "I don't like the color and design of my front door.",
+        "family": "colour and design",
+        "probe_done": false,
+        "urgent": false
+      },
+      "decision_makers": {
+        "status": "unknown",
+        "name": null,
+        "relation": null,
+        "ask_count": 0,
+        "feel_ask_count": 0,
+        "ask_allowed": false
+      },
+      "opener": {
+        "asked": true,
+        "text": "Hi Dana, this is the Reece team. What is going on with the windows or doors that made you reach out?",
+        "age_sec": 600
+      }
+    }
+  }
+}

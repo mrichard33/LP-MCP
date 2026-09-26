@@ -32,10 +32,10 @@ HARD RULE: every clock time you write must be LATER than 11:30 AM. Before writin
 PHONE ROOM: OPEN right now (staffed Mon–Fri 8:00 AM–8:00 PM, Sat 9:00 AM–8:00 PM, Sun 9:00 AM–5:00 PM ET). An immediate callback CAN be promised.
 HARD RULE: only promise an immediate or "next few minutes" callback when the phone room is OPEN above. When it is CLOSED, say the call goes out when we open and do not offer a calendar slot instead.
 
-CLASSIFICATION: GENERAL_QUESTION (0.82 confidence, llm)
-Classifier reasoning: Lead asked an open pricing question with no objection language.
+CLASSIFICATION: QUESTION (0.91 confidence, llm)
+Classifier reasoning: Product/process question, no scheduling intent.
 
-TRAFFIC TEMPERATURE: HOT — calibrate hook intensity per Traffic Secrets section.
+TRAFFIC TEMPERATURE: WARM — calibrate hook intensity per Traffic Secrets section.
 
 ═══════ ESTABLISHED — ALREADY SETTLED IN THIS CONVERSATION ═══════
 Everything below is already known. It came from the CRM record or from the customer's own words in this thread. Treat it as fact and build on it.
@@ -47,18 +47,29 @@ ONE QUESTION. Exactly one question mark in this message, and one thing asked. No
 CARRIER SAFETY (SMS): never repeat a cryptocurrency name, a peer-to-peer cash app name, or debt-relief wording back to the customer — not even to decline it. Mobile carriers block the whole message on the word alone, so the customer receives NOTHING and the thread looks abandoned. If they ask about one, decline without naming it ("we can't take that one, but our team can go over the options we do offer"). Reece's real vocabulary — financing, 0% APR, grants, rebates, insurance — is always fine.
 === CONVERSATION DISCIPLINE (NEPQ) ===
 
-STAGE: CONNECTION — they are not yet convinced this is a real problem.
+STAGE: SOLUTION AWARENESS.
 
-Take the focus off us and put it on them. No pitch, no company history, no
-credentials. One open question about what prompted them to look.
-Reece examples (adapt, do not recite):
-- "What got you looking at the windows now, out of curiosity?"
-- "What's going on with them that made you reach out?"
-Do NOT ask about budget, timing, or decision-makers yet. They don't know
-their own answer to those questions this early.
+Two halves, in order.
+PAST: what have they already tried, and how did it work out? This surfaces
+how long they've lived with it without them feeling accused.
+- "Have you had anyone out to look at them before?"
+- "How did that go?"
+
+FUTURE: what does handled actually look like to them?
+- "If they were sorted, what would that change day to day?"
+- "Besides the noise and the cooling bill, what else would need to be right
+  for you to feel good about it?"
+Positioning against other companies may begin here — never before.
 
 === DISCOVERY DISCIPLINE (this turn) ===
-(not computed — fall back to: answer what they said, ONE question at most, no booking ask unless they asked about scheduling)
+BOOKING ASK: NOT ALLOWED this turn — they asked you a question and did not ask about scheduling.
+Answer plainly. Then EITHER one discovery question about THEIR situation in THEIR
+words ("What made you start looking at this now?", "Which one is the worst?") OR
+no question at all. Do not ask for a day, a time, a call, an address, or who will
+be home. A booking ask may return on a later turn; it is not gone, it is waiting.
+DECISION-MAKERS: unknown and NOT to be asked this turn (this reply answers something
+else). Never write "both of you", "whoever else", or "anyone else deciding". Talk to the
+one person in this conversation.
 
 TONE (binding):
 - Neutral and curious. Never enthusiastic. No exclamation points.
@@ -112,22 +123,8 @@ is a promise we cannot keep.
 Example shape: "You're set for [day] at [time]. Someone from our team will
 call before then to go over the details and finalize the visit."
 
-═══════ POST-APPOINTMENT CONDUCT — HARD BAN (highest authority) ═══════
-This contact is PAST their appointment. Evidence: lp.demo_completed, lp.disposition:OPPFDN, tag:lp-demo-completed. Their visit already happened; they are waiting on what comes AFTER it (a proposal, pricing, a callback), not on scheduling.
-ABSOLUTELY PROHIBITED in this reply — these override FAST_TRACK, the funnel stage tag, the buyer stage, and any booking instruction elsewhere in this prompt:
-  · Offering, proposing, or asking about ANY appointment, visit, or time slot.
-  · The words/ideas "verification visit", "re-measure", "specialist comes out", "get someone out to you", "back on the calendar".
-  · Asking whether decision-makers can be present. That question belongs to pre-appointment qualification and is insulting to someone who already sat the visit.
-  · Any booking link or calendar widget.
-NEVER state or imply that anyone is coming back out. Do NOT invent a follow-up visit, a second appointment, or a return trip. If the LP notes and appointment records in this prompt do not explicitly say a return visit is scheduled, then none is — say nothing about one.
-EXCEPTION: a genuine FUTURE appointment exists on record (see EXISTING APPOINTMENTS). You may confirm or discuss THAT appointment, and only that one. You still may not propose a different or additional one.
-What TO do: acknowledge what they actually said, be specific about the real next step (their rep sending the estimate/proposal), and if they are waiting on a human, say plainly that you are getting it to that person. Under-promise.
-═══════ END POST-APPOINTMENT CONDUCT ═══════
-
-⚡ FAST_TRACK is set, but this contact is POST-APPOINTMENT — the fast-track BOOKING push is SUPPRESSED. Keep the urgency (reply fast, be concrete, no education filler); drop the booking ask entirely.
-
 LEAD: Dana Whitfield
-Entry: Facebook Lead Form | Lead Score: 68 | Date Added: 2026-08-30T13:00:00Z
+Entry: Facebook Lead Form | Lead Score: 58 | Date Added: 2026-08-30T13:00:00Z
 
 ═══════ KNOWN CONTACT PROFILE (CRM record + this conversation) ═══════
 Name: Dana Whitfield
@@ -138,38 +135,32 @@ Decision-maker presence: NEVER ASKED
 NON-NEGOTIABLE RULE: Never ask the customer for information already present in this profile — it is on file. Only a field marked NOT KNOWN may ever be asked for, one at a time, and only when the booking-gate rules below call for it.
 ═══════ END KNOWN CONTACT PROFILE ═══════
 COMPANY INBOX: team@getreecewindows.com. This is the ONLY email address a customer may send us files, photos, measurements, or documents. When a customer asks where to email something, give this address. NEVER tell a customer to send anything to their own email address, and never invent any other address.
-Inferred Buyer Stage: 4/5
+Inferred Buyer Stage: 3/5
+TRUST LEVEL SCORE: 3/5 (NEUTRAL — no-cost, no-obligation framing, soft booking ask allowed).
 GUIDE OFFER STATUS: ELIGIBLE — offer ONLY per the GUIDE OFFER — BOOKING FAILURE EXIT rules.
 
-LP CRM (Ground Truth):
-Disposition: OPPFDN (Opportunity Found)
-Sales Rep (the FIELD rep who owns this deal — NOT the author of your reply): Dorsett, Beverly
-Demo: YES | Appointment: no
+PRIOR AI ANALYSIS:
+Buyer Stage: 3 (conf: 0.8)
 
-ENGAGEMENT: opens=0 | clicks=0 | replies=0 | VSL=not watched
-Completed: lp-demo-completed
+ENGAGEMENT: opens=1 | clicks=0 | replies=2 | VSL=not watched
 
 CONVERSATION HISTORY (most recent last):
-[inbound] Saw the ad about the hurricane windows.
-[outbound] Happy to help, Dana. Are you looking at the whole house or a few openings?
-[inbound] Hey, can you tell me more about what this would run us?
+[outbound/sms] Thanks for reaching out, Dana. What has you looking at the windows right now?
+[inbound/sms] Just comparing a few companies.
+[outbound/sms] That makes sense. Every window we install is code-verified and documented, and you keep the paperwork.
+[inbound/sms] Who does the install, you or subcontractors?
 ANTI-REPETITION (HARD RULE): NEVER send a message substantially identical (~80%+ similar) to ANY [outbound] above. If what you were about to say has already been said, say something meaningfully different or advance the conversation to its next step instead.
 ANSWERED-QUESTION (HARD RULE): before drafting, check whether the newest [inbound] ANSWERS a question your last [outbound] asked. If it does, ACT on the answer — confirm it, schedule it, book it. Never re-ask a question the lead has answered ("4:00 PM works" answers "3:30 or 4:00?" — the only valid reply confirms 4:00 PM). Re-asking reads as not listening and destroys trust.
 LEAD-ASKED-QUESTION (HARD RULE): if the newest [inbound] contains a direct question to us, your FIRST sentence answers it plainly. Yes, no, or the actual fact. Only then may you offer times, ask a qualifying question, or advance the conversation. A slot offer is not an answer. "Our rep will cover that" is not an answer to "can you do it?" If the honest answer is no, say no in plain words and then say what we do instead. An unanswered question asked twice ends the conversation.
 RULED-OUT WINDOW (HARD RULE): when the lead states they are unavailable for a day, a date, or a part of a day ("we're busy tomorrow", "not this weekend", "mornings don't work"), that window is CLOSED for the rest of the thread. Never propose it again, never propose it under a different name, and never present it as an alternative to itself. Offer from outside the closed window, and if CALENDAR AVAILABILITY has nothing outside it, say so plainly and ask what does work.
 DAY-NAMING (HARD RULE): each calendar day gets exactly ONE name for the whole thread. If you called it "tomorrow", it stays "tomorrow"; if you called it "Saturday", it stays "Saturday". Never offer the same date twice under two labels, and never present one label as an option against the other. Before naming any day, resolve it against TODAY IS and TOMORROW IS in this prompt. If the lead corrects you on a date, do not merely agree — re-derive every day you have offered so far and re-offer from the corrected calendar.
 
-═══════ EXISTING APPOINTMENTS (active — upcoming, plus any that ended in the last 24h) — AUTHORITATIVE for cancel/reschedule ═══════
-  [1] appointment_id="appt_0001" | calendar="Window Estimate" | start="Friday, September 4 at 10:00 AM" (2026-09-04T14:00:00Z) | status="new" | title="Window Estimate — Dana Whitfield"
-When emitting cancel_appointment or reschedule_appointment companions, use ONLY appointment_id values from this block.
-═══════ END EXISTING APPOINTMENTS ═══════
-
 ═══════ NO BOOKING LINK AUTHORIZED ═══════
 No booking link is available for this response. Do NOT include any URL or merge tag in your message.
 ═══════ END NO BOOKING LINK AUTHORIZED ═══════
 
 THE INBOUND MESSAGE TO RESPOND TO:
-"Any word on the pricing from the visit?"
+"Who does the install, you or subcontractors?"
 
 Generate the sms response. Follow this priority order:
 (1) CANCELLATION FLOW: if the lead expressed cancel intent for an existing appointment OR is mid-state-machine in a cancel/reschedule conversation (read EXISTING APPOINTMENTS + conversation history together), follow the CANCELLATION FLOW state machine in the system prompt. Emit cancel_appointment when the lead pushed back on reschedule (state 2 case B). Emit reschedule_appointment when the lead hard-confirmed a proposed reschedule slot (state 3). Otherwise no companion_action this turn.

@@ -57,6 +57,42 @@
  *      contradicted the PROTECTION PROFILE REVIEW booking gate. The Review is
  *      the default; the in-home version is for the three owner exceptions only.
  *   4. The commitment gate allows exactly one question: THE REVEAL.
+ *
+ * v1.4 (2026-09-26, discovery discipline — fourteen days of live replies)
+ * ─────────────────────────────────────────────────────────────────────
+ * Everything below was already written in this file and was still not
+ * happening. The reason is ORDER: this block renders at roughly position 18
+ * of 51 in buildResponsePrompt; the in-home booking gate and the closing
+ * PRIORITY ORDER render ~500 lines later, and the priority's "(5) DEFAULT"
+ * was a two-slot booking ask. The last instruction wins. So v1.4 makes the
+ * discipline DATA (src/agentic/discovery-discipline.js), renders it here as
+ * a DISCOVERY DISCIPLINE section, has the priority order defer to it, and
+ * backs every rule with a code guard in response-generator.js:
+ *
+ *   Fix 1  ANSWER, THEN DISCOVER. A booking/time/call ask is allowed only
+ *          when the lead asked about scheduling or next steps, or at most
+ *          once every three bot turns. Otherwise: answer, then ONE discovery
+ *          question in their words, or none. Enforced by findBookingAsks.
+ *   Fix 2  PROBE FIRST. A problem named in their words ("don't like the
+ *          colour and design") gets echoed back as one question before any
+ *          transition or booking ask. A stated deadline skips the probe.
+ *   Fix 3  DECISION-MAKERS. Ask once ("Is this your call, or is anyone else
+ *          weighing in on it?"); a sole owner is booked and never hears about
+ *          another person again; a named-but-absent spouse gets ONE NEPQ
+ *          question ("How does Paloma feel…"), then a human sorts the visit
+ *          out. Never "whoever else", "both of you" or "anyone else deciding"
+ *          for a person nobody named. Enforced by findPhantomDecisionMaker.
+ *   Fix 4  TONE. "Good question" / "Great question" join the banned openers;
+ *          exclamation marks are stripped in code.
+ *   Fix 5  THE OPENER. A GHL workflow already asked "What are you hoping to
+ *          get done…" seconds earlier (Sonya, Felix, Ronald); the bot must not
+ *          ask it again. Enforced by findRepeatedOpener.
+ *   Fix 6  INSURANCE. One approved shape, carrier decides the number. Enforced
+ *          by findInsuranceOutcomeClaims.
+ *
+ * buildNepqBlock takes a third argument, the discipline object. Absent, the
+ * section renders as "(not computed)" — visible in a Bot Review replay rather
+ * than silently missing, the ESTABLISHED precedent.
  */
 
 /**
@@ -67,7 +103,8 @@
 const TONALITY = `
 TONE (binding):
 - Neutral and curious. Never enthusiastic. No exclamation points.
-- Banned openers: "Great!", "Perfect!", "Awesome!", "Absolutely!", "Happy to help!"
+- Banned openers: "Great!", "Perfect!", "Awesome!", "Absolutely!", "Happy to help!", "Good question", "Great question"
+- Never praise the question. Start with the answer, or with their words.
 - ONE question per message. ONE question mark. Never two.
 - Never rebut. When they push back, ask a question back instead of explaining.
 - Short. Under 160 characters is the target, 320 is the ceiling.
@@ -97,7 +134,10 @@ CONSEQUENCE QUESTIONS — STRICT CAPS:
 - Frame it around cost, comfort, hassle, or another season of the same thing.
 - NEVER about physical danger to them or their family.
 - NEVER name an insurance carrier.
-- NEVER predict a claim outcome, a premium change, or a denial.
+- NEVER predict a claim outcome, a premium change, or a denial. If insurance
+  comes up, the ONLY shape is: "Impact windows can qualify for wind-mitigation
+  credits, and we give you the documentation your insurance company asks for.
+  Your insurance company decides the final number."
 - NEVER promise or imply a price reduction, a discount, or that prices rise.
 - NEVER invent a deadline, a countdown, or a limited-time anything.
 - If they answer flatly or brush it off, drop it and move to the visit offer.
@@ -268,7 +308,7 @@ Positioning against other companies may begin here — never before.`;
   // Stage 4 — negotiating, not yet committed.
   const qualifying = renderExamples([
     { key: 'timeline', text: 'How important is it to get this handled this year?' },
-    { key: 'decision_makers', text: 'Would anyone else be looking at this with you, or is it your call?' },
+    { key: 'decision_makers', text: 'Is this your call, or is anyone else weighing in on it?' },
   ], closed);
 
   return `
@@ -398,12 +438,127 @@ re-ask for it.`;
 }
 
 /**
+ * v1.4 — the turn's discipline, rendered. This is the section the closing
+ * PRIORITY ORDER now defers to, so it says plainly what THIS reply may ask.
+ *
+ * @param {object|null} d  buildDiscipline() output from discovery-discipline.js
+ * @param {object|null} established
+ * @returns {string}
+ */
+export function disciplineBlock(d, established = null) {
+  if (!d) {
+    return `
+=== DISCOVERY DISCIPLINE (this turn) ===
+(not computed — fall back to: answer what they said, ONE question at most, no booking ask unless they asked about scheduling)`;
+  }
+  const parts = ['\n=== DISCOVERY DISCIPLINE (this turn) ==='];
+
+  // ── Fix 1 ──
+  if (d.booking?.allowed) {
+    parts.push(`BOOKING ASK: ALLOWED this turn (${d.booking.reason === 'lead_asked_about_scheduling'
+      ? 'they asked about scheduling or next steps, or picked a time'
+      : d.booking.reason.startsWith('recommended_action')
+        ? 'the analyzer marked this a fast-track turn'
+        : 'nothing blocks it'}). Answer first, then ONE offer, one question mark.`);
+  } else {
+    const why = d.booking?.reason === 'lead_asked_a_question'
+      ? 'they asked you a question and did not ask about scheduling'
+      : d.booking?.reason === 'booking_ask_in_last_3_turns'
+        ? `you already asked for a time in the last three messages (${d.booking.recent_asks}) and it was not taken up`
+        : d.booking?.reason === 'handoff_pending'
+          ? 'a person from the team is already reaching out'
+          : 'nothing in this turn calls for it';
+    parts.push(`BOOKING ASK: NOT ALLOWED this turn — ${why}.
+Answer plainly. Then EITHER one discovery question about THEIR situation in THEIR
+words ("What made you start looking at this now?", "Which one is the worst?") OR
+no question at all. Do not ask for a day, a time, a call, an address, or who will
+be home. A booking ask may return on a later turn; it is not gone, it is waiting.`);
+  }
+
+  // ── Fix 2 ──
+  const p = d.probe || {};
+  if (p.problem_named && p.urgent) {
+    parts.push(`URGENT TIMING STATED: "${p.problem_named}". They have a deadline, so skip the probe
+and go straight to scheduling logistics — what has to happen, and when.`);
+  } else if (p.problem_named && !p.probe_done) {
+    parts.push(`PROBE FIRST. They named a problem in their own words: "${p.problem_named}".
+Nothing has asked about it yet. This reply echoes THEIR words back as ONE question
+("The ${p.family === 'colour and design' ? 'colour and design' : 'part you mentioned'} — what don't you like about it?",
+"How long has that been going on?", "How is that affecting you day to day?").
+No transition, no next step, no address, no booking, no decision-maker question.
+Ask, then stop.`);
+  } else if (p.problem_named && p.probe_done) {
+    parts.push(`PROBE DONE. They named "${p.problem_named}" and it has been asked about. The
+TRANSITION play is open when the rest of this section allows it: "Based on what you
+said about [their words], the next step is…".`);
+  }
+
+  // ── Fix 3 ──
+  const dm = d.decision_makers || {};
+  const who = dm.name || (dm.relation ? `their ${dm.relation}` : 'the other person');
+  switch (dm.status) {
+    case 'sole':
+      parts.push(`DECISION-MAKERS: SOLE. This customer alone decides and has said so. Book them as
+the sole owner. NEVER write "both of you", "whoever else", "anyone else deciding", or
+mention a spouse or partner. Do not ask the decision-maker question. It is closed.`);
+      break;
+    case 'named_present':
+      parts.push(`DECISION-MAKERS: ${who} is part of this and is on board. Offer a time that works for
+both of them (one offer, one question mark). Do not re-ask whether ${who} will be there.`);
+      break;
+    case 'named_absent':
+      if ((dm.feel_ask_count || 0) === 0) {
+        parts.push(`DECISION-MAKERS: ${who} was named, and the customer says ${who} does not need to
+be there. We do not run single-leg visits, and we do not argue. Ask ONCE, NEPQ style,
+using the name: "How does ${dm.name || who} feel about getting the windows done?"
+Nothing else — no times, no both-of-you pitch, no reason why.`);
+      } else {
+        parts.push(`DECISION-MAKERS: you already asked how ${who} feels. Do not ask again. If they
+now say ${who} is on board, offer a time for both; otherwise say a team member will call
+to sort the visit out, and ask nothing.`);
+      }
+      break;
+    case 'handoff':
+      parts.push(`DECISION-MAKERS: HANDOFF. ${who} was named, the customer has twice said ${who} need
+not be involved, and we do not run single-leg visits. Do NOT ask again and do NOT book.
+Say a team member will call to sort the visit out. No question in this message.`);
+      break;
+    case 'asked':
+      parts.push(`DECISION-MAKERS: you asked and they have not answered. Do not ask again this turn.
+Answer what they said; the question stays open for a later turn.`);
+      break;
+    default:
+      if (dm.ask_allowed) {
+        parts.push(`DECISION-MAKERS: unknown, never asked, and this is a booking-relevant turn. If you
+ask, ask exactly once and exactly this: "Is this your call, or is anyone else weighing
+in on it?" Never assume a second person exists.`);
+      } else {
+        parts.push(`DECISION-MAKERS: unknown and NOT to be asked this turn (this reply answers something
+else). Never write "both of you", "whoever else", or "anyone else deciding". Talk to the
+one person in this conversation.`);
+      }
+  }
+
+  // ── Fix 5 ──
+  if (d.opener?.asked) {
+    const when = d.opener.age_sec != null ? `${d.opener.age_sec} seconds ago` : 'moments ago';
+    parts.push(`OPENER ALREADY ASKED ${when} by an automated message: "${d.opener.text}".
+Do NOT ask it again in any wording. If their reply is just "Hi", "Yes" or "Ok", respond
+briefly and wait — a short line with no question is a valid message — or ask ONE
+different discovery question (which room, how long, what is the worst one).`);
+  }
+
+  return parts.join('\n');
+}
+
+/**
  * Build the NEPQ prompt block for a given lead context.
  * @param {object} ctx           the object returned by buildLeadContext()
  * @param {object} [established] the object returned by buildEstablishedFacts()
+ * @param {object} [discipline]  the object returned by buildDiscipline() (v1.4)
  * @returns {string}             prompt text, or '' when the layer is disabled
  */
-export function buildNepqBlock(ctx, established = null) {
+export function buildNepqBlock(ctx, established = null, discipline = null) {
   if (process.env.NEPQ_LAYER_MODE === 'off') return '';
 
   // ── THE COMMITMENT GATE STILL WINS (Myron Thorner, 2026-08-28) ────────
@@ -419,6 +574,10 @@ export function buildNepqBlock(ctx, established = null) {
     stageBlock(ctx, established),
     booked ? '' : establishedBlock(established),
     booked ? '' : objectionBlock(ctx, established),
+    // v1.4 — the turn's discipline. Rendered for unbooked contacts only: a
+    // booked customer is on the commitment gate above, where discovery is off
+    // and a booking ask has nothing to attach to.
+    booked ? '' : disciplineBlock(discipline, established),
     TONALITY,
     CLARIFY_AND_PROBE,
     CONSEQUENCE_GUARDRAILS,
@@ -444,4 +603,4 @@ call before then to go over the details and finalize the visit."`,
   ].filter(Boolean).join('\n');
 }
 
-export const NEPQ_LAYER_VERSION = '1.3';
+export const NEPQ_LAYER_VERSION = '1.4';

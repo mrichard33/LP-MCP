@@ -1,0 +1,124 @@
+{
+  "name": "35-sms-product-question-no-booking-ask",
+  "covers": "sms · NEPQ v1.4 DISCOVERY DISCIPLINE · lead asked a product question with no scheduling intent → BOOKING ASK: NOT ALLOWED · decision-maker unknown and not to be asked (2026-09-26)",
+  "env": {},
+  "channel": "sms",
+  "triggerMessage": "Who does the install, you or subcontractors?",
+  "fastTrack": false,
+  "trafficTemp": "warm",
+  "kbPack": null,
+  "availability": null,
+  "classification": {
+    "intent_class": "QUESTION",
+    "confidence": 0.91,
+    "classification_method": "llm",
+    "reasoning": "Product/process question, no scheduling intent."
+  },
+  "context": {
+    "now": {
+      "iso": "2026-09-02T15:30:00Z",
+      "date_human": "Wednesday, September 2, 2026",
+      "time_human": "11:30 AM",
+      "tz": "America/New_York"
+    },
+    "lead": {
+      "ghl_contact_id": "FIXTURECONTACT000001",
+      "name": "Dana Whitfield",
+      "first_name": "Dana",
+      "lead_score": 58,
+      "date_added": "2026-08-30T13:00:00Z",
+      "entry_source": "Facebook Lead Form",
+      "current_tags": [],
+      "objection_tags": [],
+      "suppression_tags": [],
+      "contact_notes": [],
+      "rep_display_name": null,
+      "lp_rep_name": null,
+      "trust_level_score": 3,
+      "current_buyer_tag": null,
+      "current_bj_tag": null,
+      "current_stage_tag": null,
+      "decision_makers_present": null
+    },
+    "lp": {
+      "matched": false,
+      "notes": [],
+      "recent_calls": []
+    },
+    "intelligence": {
+      "buyer_stage": 3,
+      "buyer_stage_confidence": 0.8
+    },
+    "engagement": {
+      "emails_opened": 1,
+      "links_clicked": 0,
+      "replies_count": 2,
+      "vsl_watched": false
+    },
+    "objection_state": null,
+    "pipeline": null,
+    "estimate": null,
+    "conversation_recent": [
+      {
+        "direction": "outbound",
+        "channel": "sms",
+        "timestamp": "2026-09-02T14:50:00Z",
+        "text": "Thanks for reaching out, Dana. What has you looking at the windows right now?"
+      },
+      {
+        "direction": "inbound",
+        "channel": "sms",
+        "timestamp": "2026-09-02T14:52:00Z",
+        "text": "Just comparing a few companies."
+      },
+      {
+        "direction": "outbound",
+        "channel": "sms",
+        "timestamp": "2026-09-02T14:53:00Z",
+        "text": "That makes sense. Every window we install is code-verified and documented, and you keep the paperwork."
+      },
+      {
+        "direction": "inbound",
+        "channel": "sms",
+        "timestamp": "2026-09-02T15:28:00Z",
+        "text": "Who does the install, you or subcontractors?"
+      }
+    ]
+  },
+  "opts": {
+    "established": {
+      "facts": [],
+      "closed_questions": [],
+      "offers_made": [],
+      "apologies_made": [],
+      "objections_raised": []
+    },
+    "discipline": {
+      "version": "1.0",
+      "booking": {
+        "allowed": false,
+        "reason": "lead_asked_a_question",
+        "recent_asks": 0
+      },
+      "probe": {
+        "problem_named": null,
+        "family": null,
+        "probe_done": false,
+        "urgent": false
+      },
+      "decision_makers": {
+        "status": "unknown",
+        "name": null,
+        "relation": null,
+        "ask_count": 0,
+        "feel_ask_count": 0,
+        "ask_allowed": false
+      },
+      "opener": {
+        "asked": false,
+        "text": null,
+        "age_sec": null
+      }
+    }
+  }
+}
