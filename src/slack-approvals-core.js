@@ -109,3 +109,84 @@ export function buildApprovalBlocks(text, shortRef) {
     },
   ];
 }
+
+// ─── Payroll run approval (2026-09-26) ──────────────────────────────────────
+//
+// A separate action id, not a third decision on approval_approve: the agent
+// approval path resolves a numeric groupme_approval_requests ref, while a
+// payroll card carries a run uuid and is authorised against a different list
+// (active lf_report_approvers emails, not SLACK_APPROVER_IDS).
+//
+// It MUST be recognised here. Anything this module does not parse is relayed
+// to n8n's onboarding workflow, which reads every action_id that is not
+// `deny_member` as an approval (CLAUDE.md, "front door for the WHOLE
+// workspace").
+
+export const ACTION_PAYROLL_APPROVE = 'payroll_approve';
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Parse a payroll Approve click. Returns null for anything else — including a
+ * payroll click whose value is not a uuid, which is dropped rather than
+ * forwarded (see isPayrollAction).
+ */
+export function parsePayrollInteraction(rawBody) {
+  const params = new URLSearchParams(Buffer.isBuffer(rawBody) ? rawBody.toString('utf8') : String(rawBody || ''));
+  const raw = params.get('payload');
+  if (!raw) return null;
+  let p;
+  try { p = JSON.parse(raw); } catch { return null; }
+  if (p?.type !== 'block_actions') return null;
+  const action = Array.isArray(p.actions) ? p.actions[0] : null;
+  if (action?.action_id !== ACTION_PAYROLL_APPROVE) return null;
+  const runId = String(action.value ?? '').trim();
+  if (!UUID_RE.test(runId)) return null;
+  return {
+    kind: 'payroll',
+    decision: 'approve',
+    runId,
+    userId: String(p.user?.id || ''),
+    userName: String(p.user?.name || p.user?.username || p.user?.id || 'unknown'),
+    responseUrl: isSlackResponseUrl(p.response_url) ? p.response_url : '',
+    originalText: String(p.message?.text || ''),
+  };
+}
+
+/** True for ANY click on a payroll_* action, parseable or not — never forwarded. */
+export function isPayrollAction(rawBody) {
+  const params = new URLSearchParams(Buffer.isBuffer(rawBody) ? rawBody.toString('utf8') : String(rawBody || ''));
+  try {
+    const p = JSON.parse(params.get('payload') || 'null');
+    const id = Array.isArray(p?.actions) ? String(p.actions[0]?.action_id || '') : '';
+    return id.startsWith('payroll_');
+  } catch { return false; }
+}
+
+/** Card body + one Approve button (confirm dialog). No Reject: disputes are resolved line by line. */
+export function buildPayrollApproveBlocks(text, runId, pendingLabel = '') {
+  return [
+    { type: 'section', text: { type: 'mrkdwn', text: escapeMrkdwn(text).slice(0, 2900) } },
+    {
+      type: 'actions',
+      block_id: `payroll_${runId}`,
+      elements: [
+        {
+          type: 'button',
+          action_id: ACTION_PAYROLL_APPROVE,
+          style: 'primary',
+          text: { type: 'plain_text', text: 'Approve payroll' },
+          value: String(runId),
+          confirm: {
+            title: { type: 'plain_text', text: 'Approve this payroll run?' },
+            text: {
+              type: 'mrkdwn',
+              text: `Approves the pending lines${pendingLabel ? ` (${pendingLabel})` : ''}. Needs-review and disputed lines are NOT approved. No money moves — paid is marked by a person.`,
+            },
+            confirm: { type: 'plain_text', text: 'Approve' },
+            deny: { type: 'plain_text', text: 'Cancel' },
+          },
+        },
+      ],
+    },
+  ];
+}

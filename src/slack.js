@@ -298,6 +298,30 @@ export async function postToSlack(text, channelId, opts = {}) {
   }
 }
 
+/**
+ * A Slack member's email via users.info, or null. Added 2026-09-26 for the
+ * payroll Approve button, which is authorised against lf_report_approvers
+ * EMAILS, not Slack member ids. Needs the bot's `users:read.email` scope.
+ * Never throws: any failure returns { email: null, error } and the caller
+ * refuses — an approver we cannot identify is not an approver.
+ */
+export async function lookupSlackUserEmail(userId, { fetchImpl = fetch, token = SLACK_BOT_TOKEN } = {}) {
+  if (!userId) return { email: null, error: 'no_user' };
+  if (!token) return { email: null, error: 'no_token' };
+  try {
+    const res = await fetchImpl(`https://slack.com/api/users.info?user=${encodeURIComponent(userId)}`, {
+      headers: { Authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(8000),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!body?.ok) return { email: null, error: String(body?.error || res.status) };
+    const email = String(body.user?.profile?.email || '').trim().toLowerCase();
+    return email ? { email, error: null } : { email: null, error: 'no_email_on_profile' };
+  } catch (err) {
+    return { email: null, error: err.message };
+  }
+}
+
 /** The #sales-all rollup channel id, or '' when unset. */
 export function salesRollupChannelId() {
   return CH_SALES;

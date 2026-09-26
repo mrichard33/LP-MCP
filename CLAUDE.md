@@ -49,6 +49,10 @@ else's production flow), our own buttons must never be forwarded even with the f
 any `action_id` that is not `deny_member` as an approval), and the relay copies only the two
 `X-Slack-*` signing headers — never `Authorization`. Unset `SLACK_SIGNING_SECRET` refuses
 everything, forwards included, so set the secret BEFORE repointing Slack.
+The payroll card's `payroll_approve` button (2026-09-26) is ours too: any `payroll_*` click is
+handled or dropped, never forwarded, and it is gated on `PAYROLL_ENGINE_MODE=live`, not on
+`SLACK_APPROVALS_ENABLED`. It authorises by active `lf_report_approvers` EMAIL (Slack `users.info`,
+bot scope `users:read.email`), not `SLACK_APPROVER_IDS`.
 
 **Approval cards speak plain English; the rule code lives only in the `ref:` line.** A card that
 printed `P2_JOB_TERMINAL_WON` and `update_opportunity` could not be decided from (#486315). The body

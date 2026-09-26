@@ -270,6 +270,19 @@ export const JOBS = Object.freeze([
     enabledDefault: true,
     isEnabled: (env) => String(env.LEAD_LEAK_ALERT_MODE || 'shadow').toLowerCase().trim() !== 'off',
   },
+  {
+    id: 'payroll-engine',
+    label: 'Payroll engine (LightFire + call center)',
+    group: 'payroll',
+    cadence: 'weekly Mon 07:00 ET',
+    enabledEnv: 'PAYROLL_ENGINE_MODE',
+    // A MODE, not a boolean (2026-09-26): off | shadow | live, default shadow.
+    // Shadow writes mode='shadow' runs and posts a comparison card with no
+    // Approve button, so a silent shadow week is a defect too. Mirrors
+    // payrollMode() in src/jobs/payroll-engine.js: anything but 'off' runs.
+    enabledDefault: true,
+    isEnabled: (env) => String(env.PAYROLL_ENGINE_MODE || 'shadow').toLowerCase().trim() !== 'off',
+  },
 ]);
 
 /** Ids only — handy for tests and for asserting the wiring matches the roster. */
