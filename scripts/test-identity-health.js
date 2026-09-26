@@ -213,9 +213,9 @@ test('the runMigrations mirror of sql/127 matches the file', () => {
   const norm = (t) => t.split('\n').map((l) => l.trim()).filter((l) => l && !l.startsWith('--')).join('\n');
   const file = readFileSync(new URL('../sql/127_new_callers_no_lp_view.sql', import.meta.url), 'utf8');
   const fileView = norm(file.slice(file.indexOf('CREATE OR REPLACE VIEW v_new_callers_no_lp_30d')));
-  const idx = readFileSync(new URL('../src/index.js', import.meta.url), 'utf8');
+  const idx = readFileSync(new URL('../src/admin/startup-mirrors.js', import.meta.url), 'utf8');
   const i = idx.indexOf('CREATE OR REPLACE VIEW v_new_callers_no_lp_30d');
-  const mirrored = idx.slice(i, idx.indexOf('`);', i)).replace(/\\\\/g, '\\');
+  const mirrored = idx.slice(i, idx.indexOf('`,', i)).replace(/\\\\/g, '\\');
   const bare = (t) => t.replace(/;\s*$/, '');
   assert.equal(bare(norm(mirrored)), bare(fileView));
 });

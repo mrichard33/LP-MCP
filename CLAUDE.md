@@ -218,6 +218,17 @@ intent to the nin list is therefore safe; removing the fallback is not. Audit:
   `AND NOT EXISTS (SELECT 1 FROM agent_actions a WHERE a.event_id = e.id)` and delete in batches — a
   single large statement is atomic, so one FK violation rolls the whole thing back.
 
+**Boot-time schema mirrors check before they touch anything (2026-09-26).** The blocks live in
+`src/admin/startup-mirrors.js` and `src/admin/startup-schema.js` runs them: one catalog read, then DDL
+only for a block with something missing. A no-op `ADD COLUMN IF NOT EXISTS` still takes ACCESS
+EXCLUSIVE on the table (8s lock_timeout on hot tables) and every DDL statement reloads PostgREST's
+schema cache, so running them blindly each boot produced lock-timeout and PGRST002 "FAILED" lines for
+schema that was present. A new block must declare every table, added column, view (plus its columns)
+and index it creates — `scripts/test-startup-schema.js` fails otherwise. A mirror guarantees an object
+EXISTS; a view body change that adds no column is not re-applied, so apply that sql/ file from the
+dashboard. Blocks that define functions (`expects: null`) still run every boot. Set Railway variables
+in one batch: each single set is a redeploy, and overlapping boots contend for the same locks.
+
 **`lp_leads.close_date` is not all one thing — read `close_date_source` first.** Until 2026-09-16 the
 column was NULL on all 24,834 `closed_won` rows, because nothing ever wrote it; `get_rep_performance`
 still buckets by `appointment_date` for that reason. `sql/118` backfilled it and

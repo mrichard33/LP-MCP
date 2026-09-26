@@ -117,7 +117,10 @@ test('the propagation only ever writes rows whose own link is NULL', () => {
 });
 
 test('the propagation is not wired into runMigrations — it must stay operator-gated', async () => {
-  const indexSrc = await readFile(new URL('../src/index.js', import.meta.url), 'utf8');
+  // The mirror blocks moved to src/admin/startup-mirrors.js on 2026-09-26;
+  // both files are checked so the guard covers the boot path wherever it lives.
+  const indexSrc = await readFile(new URL('../src/index.js', import.meta.url), 'utf8')
+    + await readFile(new URL('../src/admin/startup-mirrors.js', import.meta.url), 'utf8');
   assert.doesNotMatch(
     indexSrc,
     /075_ghl_link_propagate|lp_link_propagate/,
