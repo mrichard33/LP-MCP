@@ -422,3 +422,13 @@ test('columnTables lists every table the catalog read must return columns for', 
   }
   assert.doesNotThrow(() => buildCatalogSql(tables));
 });
+
+test('src/index.js carries no boot DDL of its own — new mirrors go in startup-mirrors.js', () => {
+  // 2026-09-26: #1049 merged alongside #1048 and added its sql/130 block to
+  // runMigrations() the old way, after runStartupSchema() — so it re-ran its
+  // DDL on every boot, unchecked. A block outside STARTUP_MIRRORS is exactly
+  // what this module exists to replace.
+  const src = repoFile('src/index.js');
+  const ddl = /CREATE\s+(?:UNIQUE\s+)?(?:TABLE|INDEX|OR REPLACE VIEW|OR REPLACE FUNCTION)\b|ADD COLUMN/i;
+  assert.doesNotMatch(src, ddl, 'move the block into src/admin/startup-mirrors.js and declare what it creates');
+});

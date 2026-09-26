@@ -2144,4 +2144,48 @@ export const STARTUP_MIRRORS = [
     fail: '[Migration] new-callers view (sql/127) skipped — get_identity_health will error until sql/127 is applied from the dashboard:',
     level: 'warn',
   },
+
+  // Lead Leak Monitor results (sql/130, 2026-09-26 — the file is the source of
+  // truth). Additive: a new table and a view over it, nothing existing altered.
+  // A failure makes the scheduled pass fail its write (runJob files it failed);
+  // it never touches lp_*, GHL or Five9 either way. Shipped in #1049 as its own
+  // block after runStartupSchema(); moved here so it is checked, not re-run.
+  {
+    name: 'sql/130',
+    expects: {
+      tables: ['lead_leak_daily'],
+      columns: [
+        ['v_lead_leak_summary', 'run_date'],
+        ['v_lead_leak_summary', 'reason'],
+        ['v_lead_leak_summary', 'leads'],
+        ['v_lead_leak_summary', 'est_value_at_risk'],
+      ],
+      views: ['v_lead_leak_summary'],
+    },
+    sql: [
+      `CREATE TABLE IF NOT EXISTS lead_leak_daily (
+              id bigserial PRIMARY KEY,
+              run_date date NOT NULL,
+              lp_lead_id text NOT NULL,
+              lp_prospect_id text,
+              lead_source text,
+              disposition text,
+              reason text NOT NULL,
+              est_value numeric,
+              detail jsonb,
+              created_at timestamptz DEFAULT now(),
+              UNIQUE (run_date, lp_lead_id)
+            );`,
+      `CREATE OR REPLACE VIEW v_lead_leak_summary AS
+            SELECT run_date,
+                   reason,
+                   count(*)        AS leads,
+                   sum(est_value)  AS est_value_at_risk
+              FROM lead_leak_daily
+             GROUP BY run_date, reason;`,
+    ],
+    ready: '[Migration] lead_leak_daily + v_lead_leak_summary (sql/130) ready',
+    fail: '[Migration] lead_leak_daily (sql/130) skipped — apply it from the dashboard; the lead-leak monitor stores nothing until it exists:',
+    level: 'warn',
+  },
 ];

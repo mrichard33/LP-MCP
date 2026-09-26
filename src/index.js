@@ -437,37 +437,6 @@ async function runMigrations() {
   } catch (err) {
     console.error('[Migration] startup schema check crashed:', err.message);
   }
-
-  // Lead Leak Monitor results (sql/130, 2026-09-26 — the file is the source of
-  // truth). Additive: a new table and a view over it, nothing existing altered.
-  // A failure makes the scheduled pass fail its write (runJob files it failed);
-  // it never touches lp_*, GHL or Five9 either way.
-  try {
-    const { runSQL } = await import('./admin/supabase-admin.js');
-    await runSQL(`CREATE TABLE IF NOT EXISTS lead_leak_daily (
-              id bigserial PRIMARY KEY,
-              run_date date NOT NULL,
-              lp_lead_id text NOT NULL,
-              lp_prospect_id text,
-              lead_source text,
-              disposition text,
-              reason text NOT NULL,
-              est_value numeric,
-              detail jsonb,
-              created_at timestamptz DEFAULT now(),
-              UNIQUE (run_date, lp_lead_id)
-            );`);
-    await runSQL(`CREATE OR REPLACE VIEW v_lead_leak_summary AS
-            SELECT run_date,
-                   reason,
-                   count(*)        AS leads,
-                   sum(est_value)  AS est_value_at_risk
-              FROM lead_leak_daily
-             GROUP BY run_date, reason;`);
-    console.log('[Migration] lead_leak_daily + v_lead_leak_summary (sql/130) ready');
-  } catch (err) {
-    console.warn('[Migration] lead_leak_daily (sql/130) skipped — apply it from the dashboard; the lead-leak monitor stores nothing until it exists:', err.message);
-  }
 }
 
 app.get('/', (req, res) => {
