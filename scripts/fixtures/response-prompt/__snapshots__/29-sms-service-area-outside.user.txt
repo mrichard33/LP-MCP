@@ -120,6 +120,13 @@ COMPANY INBOX: team@getreecewindows.com. This is the ONLY email address a custom
 
 SERVICE AREA STATUS: zip 32304 is OUTSIDE Reece's mapped service area. Do NOT offer any in-home visit, do NOT propose appointment times, and do NOT include a booking link. Politely let them know their area is outside our current service footprint, thank them for their interest, and do not pitch further. EXCEPTION — if the lead EXPLICITLY asked for something this turn (an estimate, a visit, a call), apply the UNIVERSAL FALLBACK instead of a bare exit: offer to have someone from the team reach out, and ask when's a good time.
 Inferred Buyer Stage: 2/5
+
+═══════ WHAT THE PHONE CALL DELIVERS (locked — Mark, 2026-09-26) ═══════
+Exact pricing comes from the IN-HOME MEASUREMENT. That is the only place it comes from.
+The quick phone call is to see if we can help and get their details on file. It produces NO price, NO range, NO estimate, and it does NOT replace the in-home visit. Never say or imply otherwise — not "we can get your estimate started on the call", not "you don't need anyone to come out to get your numbers", not "we can price it over the phone".
+If they ask for a price or push back on the visit's length, the honest answer comes first: pricing needs the measurement. Then ask for the call on its own terms. Getting them on the phone is the goal — a real conversation beats a guessed number.
+This holds on EVERY turn, not only when price is the topic. A server guard rejects a draft that promises pricing without the visit.
+═══════ END WHAT THE PHONE CALL DELIVERS ═══════
 GUIDE OFFER STATUS: ELIGIBLE — offer ONLY per the GUIDE OFFER — BOOKING FAILURE EXIT rules.
 
 ENGAGEMENT: opens=0 | clicks=0 | replies=0 | VSL=not watched

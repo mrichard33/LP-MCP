@@ -2316,6 +2316,37 @@ export function buildUndeliveredPromiseTask({ contactId, eventId = null, promise
   };
 }
 
+/**
+ * The rep task for a draft that promised pricing without the in-home visit
+ * (2026-09-26, action 512799). The sentence was replaced with the honest
+ * boundary before sending, so the lead was NOT told something false — but they
+ * asked for a number and got a correction, which is the moment a person should
+ * pick it up. Pure; exported for tests.
+ */
+export function buildEstimatePromiseTask({ contactId, eventId = null, promise }) {
+  return {
+    event_id: eventId || null,
+    action_type: 'create_task',
+    target_system: 'ghl',
+    target_entity: 'contact',
+    target_id: contactId,
+    action_payload: {
+      title: 'Call {{contact_name}} — they want a price and the bot could not give one',
+      description:
+        `The bot's draft said: "${String(promise).slice(0, 300)}". We cannot price without the in-home `
+        + 'measurement, so that sentence was replaced with the honest version before the reply went out. '
+        + 'They are asking for a number — call them, explain what the measurement gives them, and book the visit.',
+      due_in_hours: 2,
+      priority: 'high',
+    },
+    reasoning: 'Estimate promised without the in-home visit, survived regeneration (src/agentic/estimate-promise.js)',
+    confidence: 1.0,
+    rule_applied: 'ESTIMATE_PROMISE_CORRECTED',
+    status: 'pending',
+    requires_approval: false,
+  };
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // INLINE BOOKING (2026-08-13) — book before we promise
 // ═══════════════════════════════════════════════════════════════════
@@ -3874,6 +3905,22 @@ export async function executeSendMessage(action, context) {
         console.warn(`[SendMessage] undelivered promise for ${contactId} — rep task queued`);
       } catch (upErr) {
         console.warn(`[SendMessage] undelivered-promise task failed for ${contactId} (fail-soft): ${upErr.message}`);
+      }
+    }
+
+    // 2026-09-26 — ESTIMATE PROMISE: the draft claimed a price or estimate
+    // without the in-home visit and still did after one regeneration, so the
+    // sentence was replaced with the honest boundary. The lead asked for a
+    // number and got a correction instead — that is a call a person should
+    // make. Failure-soft: the send already happened.
+    if (generated && generated.estimate_promise) {
+      try {
+        await supabase.from('agent_actions').insert(buildEstimatePromiseTask({
+          contactId, eventId: action.event_id, promise: generated.estimate_promise,
+        }));
+        console.warn(`[SendMessage] estimate promise corrected for ${contactId} — rep task queued`);
+      } catch (epErr) {
+        console.warn(`[SendMessage] estimate-promise task failed for ${contactId} (fail-soft): ${epErr.message}`);
       }
     }
 

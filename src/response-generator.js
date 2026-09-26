@@ -269,6 +269,7 @@ import {
   formatKbPackForPrompt,
   ensureEstimateLink,
   hasCompletedEstimate,
+  getEstimateCalculatorUrl,
 } from './knowledge/kb-retriever.js';
 import {
   fetchFreeSlots,
@@ -343,6 +344,7 @@ import * as P from './prompts/response-generator/index.js';
 import { dialWindowPromptLine, canPromiseImmediateCall } from './dial-window.js';
 import { normalizeRepNote } from './agentic/rep-note.js';
 import { findUndeliveredSendPromise, undeliveredPromiseNote, rewriteUndeliveredPromise, validateInfoEmailPayload } from './agentic/send-promise.js';
+import { findUnbackedEstimatePromise, estimatePromiseNote, rewriteEstimatePromise, calculatorFallbackAllowed } from './agentic/estimate-promise.js';
 // v2.7.14 — Bot Review Phase 0. Pure shaping helpers only: no I/O, no writes.
 import { buildInputSnapshot, extractKbModes, extractKbSources } from './bot-feedback/fingerprint-core.js';
 
@@ -1437,6 +1439,16 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
     const os = context.objection_state;
     const turn = (os.attempt_number ?? 0) >= 1 ? 2 : 1;
     parts.push(...P.objectionState(os.state_code, os.parent_state, os.entered_at, os.attempt_number, turn));
+  }
+  // 2026-09-26 — what the phone call delivers, and does not. UNCONDITIONAL:
+  // action 512799 promised an estimate from the call on a TIMING turn, where
+  // the PRICE-SHOPPER block that forbids it was never loaded.
+  parts.push(...P.WHAT_THE_CALL_DELIVERS);
+  // The calculator URL is only put in front of the model once the lead has
+  // declined a call twice (Mark, 2026-09-26). Withheld otherwise, so an early
+  // link is impossible rather than merely discouraged.
+  if (calculatorFallbackAllowed(context.objection_state)) {
+    parts.push(...P.calculatorLastResort(getEstimateCalculatorUrl({ contactId: context.lead?.ghl_contact_id || null })));
   }
   // 2026-09-24 (Mark) — "not interested" gets one "what changed?", then a
   // warm close. See src/agentic/not-interested.js.
@@ -3657,6 +3669,40 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
         console.warn(`[ResponseGenerator] ⚠️ undelivered send promise for ${contactId}: "${promise}" — regenerating once`);
         const err = new Error(`undelivered_send_promise: ${promise.slice(0, 120)}`);
         err.regenerationNote = undeliveredPromiseNote(promise);
+        throw err;
+      }
+    }
+  }
+
+  // ─── Estimate-promise guard (2026-09-26 — GHL dcKRwIyxn53eIOvrkJdA) ───
+  //
+  // Action 512799 told a lead "the 15-minute call covers exactly that, we can
+  // get your estimate started without the 90-minute in-person visit." Mark's
+  // ruling: not possible. Exact pricing comes from the in-home measurement;
+  // the quick call is to see if we can help. The rule existed only as prompt
+  // copy in the PRICE-SHOPPER block, which loads on PRICE turns — that turn was
+  // a TIMING turn, so nothing was defending the boundary.
+  //
+  // Same escalation as the undelivered-promise guard above, and for the same
+  // reason: a legitimate calculator sentence and an illegitimate phone-estimate
+  // promise are not cleanly separable by regex, so a false positive must cost
+  // one regeneration rather than a safe-fallback reply. If it survives the
+  // retry the sentence is replaced with the truth and the turn is FLAGGED, so
+  // a rep sees what the lead was told.
+  {
+    const promise = findUnbackedEstimatePromise(validated.message, {
+      hasAuthoritativeEstimate: !!context.estimate?.has_data,
+      calculatorOffered: calculatorFallbackAllowed(context.objection_state),
+    });
+    if (promise) {
+      if (opts.regenerationNote) {
+        validated.message = rewriteEstimatePromise(validated.message, promise);
+        console.warn(`[ResponseGenerator] ⚠️ estimate promise survived regeneration for ${contactId}: "${promise}" — rewritten to the honest boundary, flagged for a rep`);
+        validated.estimate_promise = promise;
+      } else {
+        console.warn(`[ResponseGenerator] ⚠️ estimate promised without the in-home visit for ${contactId}: "${promise}" — regenerating once`);
+        const err = new Error(`estimate_promise_without_visit: ${promise.slice(0, 120)}`);
+        err.regenerationNote = estimatePromiseNote(promise);
         throw err;
       }
     }
