@@ -1,0 +1,112 @@
+{
+  "name": "38-sms-opener-already-asked-by-workflow",
+  "covers": "sms · NEPQ v1.4 DISCOVERY DISCIPLINE · GHL workflow sent the opener 20 seconds ago and the lead replied Hi → OPENER ALREADY ASKED · booking ask not allowed (Sonya In4V4ZMGT1w1o2cuidgw, 2026-09-26)",
+  "env": {},
+  "channel": "sms",
+  "triggerMessage": "Hi",
+  "fastTrack": false,
+  "trafficTemp": "warm",
+  "kbPack": null,
+  "availability": null,
+  "classification": {
+    "intent_class": "UNCLEAR",
+    "confidence": 0.4,
+    "classification_method": "fallback",
+    "reasoning": "Greeting only."
+  },
+  "context": {
+    "now": {
+      "iso": "2026-09-02T15:30:00Z",
+      "date_human": "Wednesday, September 2, 2026",
+      "time_human": "11:30 AM",
+      "tz": "America/New_York"
+    },
+    "lead": {
+      "ghl_contact_id": "FIXTURECONTACT000001",
+      "name": "Dana Whitfield",
+      "first_name": "Dana",
+      "lead_score": 58,
+      "date_added": "2026-08-30T13:00:00Z",
+      "entry_source": "Facebook Lead Form",
+      "current_tags": [],
+      "objection_tags": [],
+      "suppression_tags": [],
+      "contact_notes": [],
+      "rep_display_name": null,
+      "lp_rep_name": null,
+      "trust_level_score": 3,
+      "current_buyer_tag": null,
+      "current_bj_tag": null,
+      "current_stage_tag": null,
+      "decision_makers_present": null
+    },
+    "lp": {
+      "matched": false,
+      "notes": [],
+      "recent_calls": []
+    },
+    "intelligence": {
+      "buyer_stage": 1,
+      "buyer_stage_confidence": 0.8
+    },
+    "engagement": {
+      "emails_opened": 1,
+      "links_clicked": 0,
+      "replies_count": 2,
+      "vsl_watched": false
+    },
+    "objection_state": null,
+    "pipeline": null,
+    "estimate": null,
+    "conversation_recent": [
+      {
+        "direction": "outbound",
+        "channel": "sms",
+        "timestamp": "2026-09-02T15:29:40Z",
+        "text": "Hi Dana, thanks for reaching out to Reece Windows & Doors. What are you hoping to get done with your windows or doors?"
+      },
+      {
+        "direction": "inbound",
+        "channel": "sms",
+        "timestamp": "2026-09-02T15:30:00Z",
+        "text": "Hi"
+      }
+    ]
+  },
+  "opts": {
+    "established": {
+      "facts": [],
+      "closed_questions": [],
+      "offers_made": [],
+      "apologies_made": [],
+      "objections_raised": []
+    },
+    "discipline": {
+      "version": "1.0",
+      "booking": {
+        "allowed": false,
+        "reason": "booking_ask_in_last_3_turns",
+        "recent_asks": 0
+      },
+      "probe": {
+        "problem_named": null,
+        "family": null,
+        "probe_done": false,
+        "urgent": false
+      },
+      "decision_makers": {
+        "status": "unknown",
+        "name": null,
+        "relation": null,
+        "ask_count": 0,
+        "feel_ask_count": 0,
+        "ask_allowed": false
+      },
+      "opener": {
+        "asked": true,
+        "text": "Hi Dana, thanks for reaching out to Reece Windows & Doors. What are you hoping to get done with your windows or doors?",
+        "age_sec": 20
+      }
+    }
+  }
+}

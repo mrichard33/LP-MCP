@@ -1,0 +1,129 @@
+{
+  "name": "37-sms-sole-owner-booking-allowed",
+  "covers": "sms · NEPQ v1.4 DISCOVERY DISCIPLINE · lead volunteered they are the owner → decision_makers closed Solo Owner from the transcript · DECISION-MAKERS: SOLE · lead asked about next steps → BOOKING ASK: ALLOWED (2026-09-26)",
+  "env": {},
+  "channel": "sms",
+  "triggerMessage": "I'm the owner, it's just me. What's the next step?",
+  "fastTrack": false,
+  "trafficTemp": "warm",
+  "kbPack": null,
+  "availability": null,
+  "classification": {
+    "intent_class": "BOOK_NEXTSTEP",
+    "confidence": 0.93,
+    "classification_method": "keyword",
+    "reasoning": "Asked for the next step."
+  },
+  "context": {
+    "now": {
+      "iso": "2026-09-02T15:30:00Z",
+      "date_human": "Wednesday, September 2, 2026",
+      "time_human": "11:30 AM",
+      "tz": "America/New_York"
+    },
+    "lead": {
+      "ghl_contact_id": "FIXTURECONTACT000001",
+      "name": "Dana Whitfield",
+      "first_name": "Dana",
+      "lead_score": 58,
+      "date_added": "2026-08-30T13:00:00Z",
+      "entry_source": "Facebook Lead Form",
+      "current_tags": [],
+      "objection_tags": [],
+      "suppression_tags": [],
+      "contact_notes": [],
+      "rep_display_name": null,
+      "lp_rep_name": null,
+      "trust_level_score": 3,
+      "current_buyer_tag": null,
+      "current_bj_tag": null,
+      "current_stage_tag": null,
+      "decision_makers_present": null
+    },
+    "lp": {
+      "matched": false,
+      "notes": [],
+      "recent_calls": []
+    },
+    "intelligence": {
+      "buyer_stage": 4,
+      "buyer_stage_confidence": 0.8
+    },
+    "engagement": {
+      "emails_opened": 1,
+      "links_clicked": 0,
+      "replies_count": 2,
+      "vsl_watched": false
+    },
+    "objection_state": null,
+    "pipeline": null,
+    "estimate": null,
+    "conversation_recent": [
+      {
+        "direction": "outbound",
+        "channel": "sms",
+        "timestamp": "2026-09-02T15:10:00Z",
+        "text": "Based on what you said about the drafts, the next step is a quick 15-minute Protection Profile Review. Would that help?"
+      },
+      {
+        "direction": "inbound",
+        "channel": "sms",
+        "timestamp": "2026-09-02T15:28:00Z",
+        "text": "I'm the owner, it's just me. What's the next step?"
+      }
+    ]
+  },
+  "opts": {
+    "established": {
+      "facts": [
+        {
+          "key": "decision_makers",
+          "value": "Solo Owner",
+          "source": "transcript",
+          "their_words": "I'm the owner, it's just me. What's the next step?",
+          "at": "2026-09-02T15:28:00Z",
+          "at_human": "11:28 AM"
+        }
+      ],
+      "closed_questions": [
+        "decision_makers"
+      ],
+      "offers_made": [
+        {
+          "kind": "callback",
+          "at": "2026-09-02T15:10:00Z",
+          "detail": "15-minute Protection Profile Review"
+        }
+      ],
+      "apologies_made": [],
+      "objections_raised": []
+    },
+    "discipline": {
+      "version": "1.0",
+      "booking": {
+        "allowed": true,
+        "reason": "lead_asked_about_scheduling",
+        "recent_asks": 1
+      },
+      "probe": {
+        "problem_named": null,
+        "family": null,
+        "probe_done": true,
+        "urgent": false
+      },
+      "decision_makers": {
+        "status": "sole",
+        "name": null,
+        "relation": null,
+        "ask_count": 0,
+        "feel_ask_count": 0,
+        "ask_allowed": false
+      },
+      "opener": {
+        "asked": false,
+        "text": null,
+        "age_sec": null
+      }
+    }
+  }
+}

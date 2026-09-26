@@ -281,3 +281,12 @@ test('tokenSimilarity is containment, so a short close inside a long one scores 
   assert.ok(tokenSimilarity(short, long) >= 0.6);
   assert.equal(tokenSimilarity([], long), 0);
 });
+
+// ── v1.1 (2026-09-26): the one approved decision-maker ask ─────────────
+
+test('the approved decision-maker ask is a single ask, not a double-barrelled close', () => {
+  assert.equal(isDoubleBarrelled('Is this your call, or is anyone else weighing in on it?'), false);
+  assert.equal(isDoubleBarrelled('Would anyone else be looking at this with you, or is it your call?'), false);
+  // Everything else with "or is" stays caught.
+  assert.equal(isDoubleBarrelled('Would Tuesday work, or is Thursday easier?'), true);
+});

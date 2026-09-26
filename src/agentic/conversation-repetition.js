@@ -308,10 +308,19 @@ export function countQuestions(message) {
  */
 const SECOND_CLAUSE_RX = /\bor\s+(?:just\s+)?(?:is|are|was|were|am|would|will|can|could|should|shall|may|might|do|does|did|have|has|had|if|find|pick|grab|book|schedule|set|go|try|start|take|use|want|prefer|we|you|i)\b/i;
 
+// 2026-09-26 — the ONE approved decision-maker question, "Is this your call,
+// or is anyone else weighing in on it?" (Mark's discovery-discipline ruling),
+// is a single ask about who decides even though its second clause opens with
+// "or is". The stage-4 example it replaced ("…or is it your call?") had the
+// same shape. Without this carve-out the repetition guard regenerated the
+// mandated question every time the model used it.
+const APPROVED_DECISION_MAKER_ASK_RX = /\byour\s+call\b[^?]*\bor\s+is\s+(?:anyone|anybody|someone)\s+else\b|\bor\s+is\s+it\s+your\s+call\b/i;
+
 export function isDoubleBarrelled(message) {
   const close = extractClose(message);
   if (!close || !close.includes('?')) return false;
+  if (APPROVED_DECISION_MAKER_ASK_RX.test(close)) return false;
   return SECOND_CLAUSE_RX.test(close);
 }
 
-export const CONVERSATION_REPETITION_VERSION = '1.0';
+export const CONVERSATION_REPETITION_VERSION = '1.1';

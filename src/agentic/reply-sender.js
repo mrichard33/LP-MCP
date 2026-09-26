@@ -374,8 +374,12 @@ const HUMAN_CLAIM_PATTERNS = [
   /talking to a (human|person)/i,
 ];
 
+// 2026-09-26 — opener changed from "Good question —" to "Fair question —", the
+// owner-approved disclosure opener (system-core.js APPROVED_DISCLOSURE_VARIANTS).
+// "Good question" is now a banned opener everywhere else; the guard's own
+// replacement body must not be the one message that still uses it.
 export const DISCLOSURE_FALLBACK =
-  "Good question — I'm an AI assistant helping the Reece Windows & Doors team respond quickly. " +
+  "Fair question — I'm an AI assistant helping the Reece Windows & Doors team respond quickly. " +
   'A human team member reviews these conversations and can follow up directly.';
 
 /**

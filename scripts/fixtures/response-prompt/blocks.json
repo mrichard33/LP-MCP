@@ -882,10 +882,50 @@
   {
     "id": "L2306",
     "lines": "2306",
-    "label": "Priority five, default booking ask-first protocol",
+    "label": "Priority five, default defers to the NEPQ discovery discipline (2026-09-26)",
     "target": "playbooks",
     "kind": "static",
-    "probe": "(5) DEFAULT: BOOKING — ASK-FIRST PROTOCOL with TWO real specific-time slots from CALENDAR AVAILABILITY, OR fal"
+    "probe": "(5) DEFAULT: answer what they actually said, then take the next step the CONVERSATION DISCIPLINE (NEPQ) block names for THIS TURN."
+  },
+  {
+    "id": "NEPQ_DISCIPLINE",
+    "lines": "nepq-layer.js disciplineBlock",
+    "label": "NEPQ v1.4 discovery discipline section (rendered from opts.discipline)",
+    "target": "nepq-layer",
+    "kind": "dynamic",
+    "probe": "=== DISCOVERY DISCIPLINE (this turn) ==="
+  },
+  {
+    "id": "NEPQ_DISCIPLINE_NO_ASK",
+    "lines": "nepq-layer.js disciplineBlock",
+    "label": "NEPQ v1.4 booking ask not allowed this turn",
+    "target": "nepq-layer",
+    "kind": "dynamic",
+    "probe": "BOOKING ASK: NOT ALLOWED this turn"
+  },
+  {
+    "id": "NEPQ_DISCIPLINE_PROBE",
+    "lines": "nepq-layer.js disciplineBlock",
+    "label": "NEPQ v1.4 probe first on a named problem",
+    "target": "nepq-layer",
+    "kind": "dynamic",
+    "probe": "PROBE FIRST. They named a problem in their own words"
+  },
+  {
+    "id": "NEPQ_DISCIPLINE_SOLE",
+    "lines": "nepq-layer.js disciplineBlock",
+    "label": "NEPQ v1.4 sole decision-maker",
+    "target": "nepq-layer",
+    "kind": "dynamic",
+    "probe": "DECISION-MAKERS: SOLE."
+  },
+  {
+    "id": "NEPQ_DISCIPLINE_OPENER",
+    "lines": "nepq-layer.js disciplineBlock",
+    "label": "NEPQ v1.4 opener already asked by a workflow",
+    "target": "nepq-layer",
+    "kind": "dynamic",
+    "probe": "OPENER ALREADY ASKED"
   },
   {
     "id": "L2307",

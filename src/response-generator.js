@@ -302,6 +302,29 @@ import {
 // 2026-09-22 — a carrier blocked a correct reply because it echoed "Bitcoin"
 // back. See src/agentic/carrier-risk.js for the message and the 30007 error.
 import { carrierRisks, carrierRiskNote, CARRIER_SAFETY_RULE } from './agentic/carrier-risk.js';
+// 2026-09-26 — answer, then DISCOVER (not answer, then book). The NEPQ block
+// said so from position 18 of 51 and the closing priority order overrode it
+// from position 51. See src/agentic/discovery-discipline.js for the fourteen
+// days of live replies behind each guard.
+import {
+  buildDiscipline,
+  findBookingAsks,
+  bookingAskNote,
+  findBannedOpeners,
+  bannedOpenerNote,
+  stripBannedOpener,
+  findExclamations,
+  stripExclamations,
+  findPhantomDecisionMaker,
+  phantomDecisionMakerNote,
+  findInsuranceOutcomeClaims,
+  insuranceNote,
+  replaceInsuranceClaims,
+  findRepeatedOpener,
+  repeatedOpenerNote,
+  stripSentences,
+  holdingLine,
+} from './agentic/discovery-discipline.js';
 // 2026-09-23 — the prompt carried today's DATE and the copy still said "before
 // storm season" in September. See src/agentic/storm-season.js.
 import { stormSeasonBlock } from './agentic/storm-season.js';
@@ -1214,7 +1237,9 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
   // v1.2 (2026-09-11): the layer now reads the established facts too, so it can
   // subtract questions the lead has already answered and render an objection
   // play. Same object the ESTABLISHED block above was built from.
-  const nepqBlock = buildNepqBlock(context, opts.established);
+  // v1.4 (2026-09-26): the discipline object says what THIS turn may ask; the
+  // closing PRIORITY ORDER (5) now defers to the section it renders.
+  const nepqBlock = buildNepqBlock(context, opts.established, opts.discipline || null);
   if (nepqBlock) parts.push(nepqBlock);
 
   // Acknowledgment-only conduct is decided BEFORE the email opener, because it
@@ -2492,7 +2517,8 @@ const REPEAT_QUESTION_PATTERNS = Object.freeze({
     /\bonly\s+you\b/i,
     /\bboth\s+(?:of\s+you\s+)?(?:be\s+)?(?:home|there|present|available)\b/i,
     /\bdecision[-\s]?makers?\b/i,
-    /\bis\s+it\s+your\s+call\b/i,
+    /\bis\s+(?:it|this)\s+your\s+call\b/i,
+    /\bweigh(?:s|ing)?\s+in\b/i,
     /\b(?:wife|husband|spouse|partner)\s+(?:be\s+)?(?:home|there|joining)\b/i,
   ],
   window_count: [
@@ -2999,6 +3025,34 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     console.warn(`[ResponseGenerator] repetition-state build failed for ${contactId}: ${err.message}`);
   }
 
+  // ─── DISCOVERY DISCIPLINE (2026-09-26) ────────────────────────────────
+  // What THIS turn may ask: a booking ask or not, a probe first or not, where
+  // the decision-maker question stands, whether a workflow already sent the
+  // opener. Same contract as the two states above: pure, synchronous, and it
+  // cannot fail the turn. Anchored to context.now.iso like every other clock
+  // in this prompt, so a replayed turn measures the opener's age from the
+  // instant it was generated at.
+  let discipline = null;
+  try {
+    const parsedNow = Date.parse(context.now?.iso ?? '');
+    discipline = buildDiscipline({
+      triggerMessage,
+      conversation: context.conversation_recent || [],
+      established,
+      recommendedAction: opts.recommendedAction || null,
+      handoffPending,
+      nowMs: Number.isFinite(parsedNow) ? parsedNow : Date.now(),
+    });
+    console.log(
+      `[ResponseGenerator] 🧭 discipline for ${contactId}: booking_ask=${discipline.booking.allowed ? 'allowed' : 'no'} (${discipline.booking.reason}), ` +
+      `probe=${discipline.probe.problem_named ? (discipline.probe.urgent ? 'urgent' : discipline.probe.probe_done ? 'done' : 'first') : 'n/a'}, ` +
+      `dm=${discipline.decision_makers.status}${discipline.decision_makers.name ? `(${discipline.decision_makers.name})` : ''}, ` +
+      `opener_asked=${discipline.opener.asked}`
+    );
+  } catch (err) {
+    console.warn(`[ResponseGenerator] discipline build failed for ${contactId}: ${err.message}`);
+  }
+
   // 2026-07-29 (Kelly Callahan incident) — decision-time context. See
   // DECISION-TIME CONTEXT above. When live state and the snapshot disagree
   // about the funnel stage, a sibling action rewrote the contact between
@@ -3419,6 +3473,8 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       loopBreak,
       spouseAdvocacy,
       handoffPending,
+      // 2026-09-26: what this turn may ask. Rendered inside the NEPQ block.
+      discipline,
       serviceArea,
       serviceAreaTentative,
       // 2026-08-18 (invented-phone incident): the only phone number the model
@@ -3709,6 +3765,110 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     }
   }
 
+  // ─── Discovery-discipline guards (2026-09-26) ────────────────────────
+  //
+  // Six rules that existed as prompt copy and were broken in live threads for
+  // fourteen days (see src/agentic/discovery-discipline.js). Same shape as the
+  // repetition guards above — every offence in a draft is collected into ONE
+  // regeneration note, the send loop allows one retry, and on the second draft
+  // the deterministic rewrites run instead of shipping the defect. The lead
+  // always gets a reply (PR #486); what changes is what it says.
+  //
+  // Exclamation marks never cost a round trip: "Great!" → "Great." is a
+  // punctuation edit, not a rewrite.
+  if (findExclamations(validated.message) > 0) {
+    console.log(`[ResponseGenerator] ✂️ stripped ${findExclamations(validated.message)} exclamation mark(s) for ${contactId}`);
+    validated.message = stripExclamations(validated.message);
+  }
+  {
+    const dm = discipline?.decision_makers || null;
+    const bookingAllowed = discipline ? discipline.booking.allowed : true;
+    const leadFirstName = String(context.lead?.name || '').trim().split(/\s+/)[0] || null;
+    const notes = [];
+    const fixes = [];
+
+    const openers = findBannedOpeners(validated.message);
+    if (openers.length) {
+      notes.push(bannedOpenerNote(openers));
+      fixes.push(() => { validated.message = stripBannedOpener(validated.message); });
+    }
+
+    if (!bookingAllowed) {
+      const asks = findBookingAsks(validated.message);
+      if (asks.length) {
+        notes.push(bookingAskNote(discipline.booking.reason));
+        fixes.push(() => {
+          validated.message = stripSentences(validated.message, s => asks.includes(s));
+          // A time ask that was stripped cannot leave a booking companion behind.
+          if (validated.companion_action?.action_type === 'book_appointment') validated.companion_action = null;
+        });
+      }
+    }
+
+    if (dm) {
+      const phantoms = findPhantomDecisionMaker(validated.message, dm);
+      if (phantoms.length) {
+        notes.push(phantomDecisionMakerNote(dm));
+        fixes.push(() => {
+          validated.message = stripSentences(validated.message, s => phantoms.includes(s));
+          const q = validated.companion_action?.qualifying_data?.decision_makers_present;
+          if (dm.status === 'sole' && validated.companion_action?.action_type === 'book_appointment' && q && q !== 'Solo Owner') {
+            validated.companion_action = null;
+          }
+        });
+      }
+    }
+
+    const insurance = findInsuranceOutcomeClaims(validated.message);
+    if (insurance.violations.length) {
+      notes.push(insuranceNote(insurance));
+      fixes.push(() => { validated.message = replaceInsuranceClaims(validated.message); });
+    }
+
+    if (discipline?.opener?.asked) {
+      const repeats = findRepeatedOpener(validated.message, discipline.opener.text);
+      if (repeats.length) {
+        notes.push(repeatedOpenerNote(discipline.opener.text, discipline.opener.age_sec));
+        fixes.push(() => { validated.message = stripSentences(validated.message, s => repeats.includes(s)); });
+      }
+    }
+
+    if (notes.length) {
+      if (opts.regenerationNote) {
+        console.warn(`[ResponseGenerator] ⚠️ discipline offences survived regeneration for ${contactId} (${notes.length}) — applying deterministic rewrites`);
+        for (const fix of fixes) fix();
+        if (!validated.message.trim()) validated.message = holdingLine(leadFirstName);
+        validated.discipline_rewrites = notes.length;
+      } else {
+        console.warn(`[ResponseGenerator] ⚠️ discipline offence(s) for ${contactId}: ${notes.length} — regenerating once`);
+        const err = new Error(`discovery_discipline: ${notes.length} offence(s)`);
+        err.regenerationNote = notes.join('\n\n');
+        throw err;
+      }
+    }
+
+    // Fix 3, step 3b — the named person was refused twice. A human sorts the
+    // visit out; this reply says so and asks nothing. The send handler applies
+    // the tag, the rep note, the event and the ops card (routeDecisionMakerHandoff).
+    if (dm?.status === 'handoff') {
+      const saysTeamWillCall = /\b(?:someone|somebody|a\s+(?:team\s+)?member|one\s+of\s+(?:our|the)\s+team|our\s+team)\b[^.?!]{0,60}\b(?:call|reach\s+out|give\s+you\s+a\s+(?:call|ring))\b/i;
+      if (!saysTeamWillCall.test(validated.message)) {
+        validated.message = leadFirstName
+          ? `Understood, ${leadFirstName}. I'll have someone from our team call you to sort out the visit.`
+          : `Understood. I'll have someone from our team call you to sort out the visit.`;
+      } else {
+        validated.message = stripSentences(validated.message, s => s.includes('?')) || validated.message;
+      }
+      validated.companion_action = null;
+      validated.dm_handoff = {
+        reason: 'decision_maker_refused_twice',
+        name: dm.name || null,
+        relation: dm.relation || null,
+      };
+      console.log(`[ResponseGenerator] 🤝 decision-maker handoff for ${contactId}: ${dm.name || dm.relation || 'the named person'} refused twice — no booking, a person takes it`);
+    }
+  }
+
   // ─── Carrier-block guard (2026-09-22 — message ghmZnX5TZjeFeagYwaaR) ───
   //
   // The prompt rule above prevents the common case; this makes the failure
@@ -3974,6 +4134,10 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
           // answer — which is the only thing that distinguishes a prompt
           // failure from a fact-gathering failure.
           established,
+          // 2026-09-26: what the bot was TOLD it may ask this turn. A replay of
+          // a booking ask after an unrelated answer needs to show whether the
+          // discipline said no and the model ignored it, or never said.
+          discipline,
         },
       }),
     },

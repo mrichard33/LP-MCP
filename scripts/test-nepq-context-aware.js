@@ -73,8 +73,8 @@ function ctx({ stage = 3, trust = 3, booked = false, objection = null, phase = n
 // Stage subtraction
 // ═══════════════════════════════════════════════════════════════════
 
-test('layer reports v1.3', () => {
-  assert.equal(NEPQ_LAYER_VERSION, '1.3');
+test('layer reports v1.4', () => {
+  assert.equal(NEPQ_LAYER_VERSION, '1.4');
 });
 
 test('stage 3 with prior_quotes closed drops the "had anyone out before" example', () => {

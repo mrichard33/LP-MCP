@@ -132,7 +132,22 @@ const OUTBOUND_QUESTION_PATTERNS = Object.freeze({
 // question followed by an inbound — whether or not a machine-readable value
 // falls out. `value` may be null and the fact still stands, because the lead's
 // own words are what the responder is told to reference.
-const SOLO_OWNER_RX = /\b(?:just\s+(?:me|myself|mine)|only\s+me|myself\s+only|by\s+myself|it'?s\s+(?:just\s+)?me|me\s+only|solo|i'?m\s+the\s+only\s+one|my\s+(?:call|decision)\s+(?:alone|only)?)\b/i;
+// 2026-09-26 (discovery discipline, Carlos LSZTKuLhNEPfwW2az5Ek): "I'm the
+// owner" and "I make all the decisions" were not on this list, so the bot kept
+// addressing "whoever else is deciding" to a man who had said so twice. The
+// sole/primary shapes are the ones send-message-handler's DECISION_MAKER_SIGNAL
+// list already recognised for routing; they now close the question too.
+const SOLO_OWNER_RX = /\b(?:just\s+(?:me|myself|mine)|only\s+me|myself\s+only|by\s+myself|it'?s\s+(?:just\s+)?me|me\s+only|solo|i'?m\s+the\s+only\s+(?:one|owner)|my\s+(?:call|decision)\s+(?:alone|only)?|(?:main|primary|sole|only)\s+decision[\s-]?maker|i\s+(?:make|handle|take\s+care\s+of)\s+(?:all\s+)?(?:the|my\s+own)\s+decisions?|i'?m\s+the\s+(?:home)?owner|i\s+own\s+(?:the|this|my)\s+(?:house|home|place|property)|i\s+live\s+alone|it'?s\s+my\s+(?:house|home|call|decision)|on\s+the\s+deed)\b/i;
+
+/**
+ * Does this inbound say the lead alone decides? Exported so the discovery
+ * discipline reads the same shapes this ledger closes on. A statement that
+ * ALSO names another person ("my wife and I own it") is not a sole-owner
+ * statement; the caller checks that.
+ */
+export function isSoloOwnerStatement(text) {
+  return SOLO_OWNER_RX.test(String(text || ''));
+}
 const BOTH_PRESENT_RX = /\b(?:both\s+of\s+us|we'?ll\s+both|my\s+(?:wife|husband|spouse|partner)\s+(?:and|will|too)|we\s+both|us\s+both|yes,?\s+both)\b/i;
 const NEGATIVE_DM_RX = /\b(?:(?:she|he|they)\s+(?:won'?t|can'?t|will\s+not)\s+be|not\s+(?:be\s+)?(?:home|there|available)|(?:she|he|they)'?s?\s+(?:out\s+of\s+town|traveling|working))\b/i;
 
@@ -311,6 +326,36 @@ function transcriptFacts(turns) {
   return out;
 }
 
+// ── tier 2b: a VOLUNTEERED sole-owner statement (2026-09-26) ────────────
+//
+// Tier 2 closes a question only on an outbound-question → inbound pairing.
+// "I'm the owner" said without being asked closed nothing, so the layer kept
+// offering the decision-maker ask and the bot kept inventing "whoever else is
+// deciding". A lead who volunteers that they alone decide has answered the
+// question; the pairing rule exists to stop US from closing a question with
+// our own words, not to discard theirs.
+//
+// Conservative: the statement must not name a second person in the same
+// message ("my wife and I own it" is two owners, not one).
+const NAMES_ANOTHER_PERSON_RX = /\b(?:my|our)\s+(?:wife|husband|spouse|partner|fianc[ée]e?|boyfriend|girlfriend|mom|mother|dad|father|son|daughter|brother|sister|roommate)\b/i;
+const NAME_AND_I_RX = /\b[A-Z][a-z]+\s+and\s+(?:I|me)\b/;
+
+function volunteeredSoleOwner(turns) {
+  for (let i = turns.length - 1; i >= 0; i -= 1) {
+    const t = turns[i];
+    if (t.direction !== 'inbound' || !t.text) continue;
+    if (!SOLO_OWNER_RX.test(t.text) || NAMES_ANOTHER_PERSON_RX.test(t.text) || NAME_AND_I_RX.test(t.text)) continue;
+    return {
+      value: 'Solo Owner',
+      their_words: quote(t.text),
+      at: t.at,
+      asked_at: null,
+      volunteered: true,
+    };
+  }
+  return null;
+}
+
 // ── the rest of the ledger ──────────────────────────────────────────────
 
 function collectOffers(turns) {
@@ -394,6 +439,13 @@ export function buildEstablishedFacts({
 
   const fromFields = fieldFacts({ lead, lp, estimate });
   const fromTranscript = transcriptFacts(turns);
+  // A paired answer with a value wins over a volunteered one; a volunteered
+  // sole-owner statement fills the gap when nothing was asked, or when the
+  // paired answer produced no machine-readable value.
+  const volunteered = volunteeredSoleOwner(turns);
+  if (volunteered && (!fromTranscript.decision_makers || fromTranscript.decision_makers.value === null)) {
+    fromTranscript.decision_makers = volunteered;
+  }
 
   const facts = [];
   for (const key of CLOSED_QUESTION_KEYS) {
