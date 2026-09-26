@@ -383,7 +383,7 @@ test('sql/073 adds the column, and runMigrations mirrors it exactly', () => {
   // A fresh deploy self-heals from the mirror. If the two disagree the column
   // depends on which one ran — schema drift that is invisible until a write
   // fails on one instance only.
-  assert.match(read('src/index.js'), /ALTER TABLE ci_calls ADD COLUMN IF NOT EXISTS pending_review_reason text;/);
+  assert.match(read('src/admin/startup-mirrors.js'), /ALTER TABLE ci_calls ADD COLUMN IF NOT EXISTS pending_review_reason text;/);
 });
 
 test('sql/073 writes NO data — it is additive, with no backfill', () => {

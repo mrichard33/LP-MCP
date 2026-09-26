@@ -170,7 +170,13 @@ export function matchSuppressionTags(tags, { mode = 'default', logContact = null
   // Always-respond policy (see REPLY_BLOCKING_TAGS above): for a direct
   // agentic reply on a contact the bot owns, only stop-bot + the consent
   // family block. Operational suppressors are reported, not enforced.
-  if (mode === 'agentic_reply' && t.includes('agentic-active')) {
+  //
+  // 2026-09-26 — 'direct_reply' is the same predicate WITHOUT the
+  // agentic-active requirement. The live-chat fast lane answers a website
+  // visitor who just typed to us; that contact usually carries no ownership
+  // tag yet, and the handoff's rule for it is explicit: stop-bot and the
+  // consent/DNC family block, the operational suppressors do not.
+  if ((mode === 'agentic_reply' && t.includes('agentic-active')) || mode === 'direct_reply') {
     const blocking = t.filter(x => REPLY_BLOCKING_SET.has(x));
     if (blocking.length > 0) {
       return {

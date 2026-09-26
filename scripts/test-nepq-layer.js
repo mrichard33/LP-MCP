@@ -171,6 +171,120 @@ test('v1.3: no exclamation marks in any rendered block', () => {
   }
 });
 
-test('version is 1.3', () => {
-  assert.equal(NEPQ_LAYER_VERSION, '1.3');
+// ── v1.4 (2026-09-26, discovery discipline) ────────────────────────────
+
+const UNBOOKED = { intelligence: { buyer_stage: 3 } };
+const EST = { closed_questions: [], facts: [], objections_raised: [] };
+
+function discipline(overrides = {}) {
+  return {
+    version: '1.0',
+    booking: { allowed: false, reason: 'lead_asked_a_question', recent_asks: 0 },
+    probe: { problem_named: null, family: null, probe_done: false, urgent: false },
+    decision_makers: { status: 'unknown', name: null, relation: null, ask_count: 0, feel_ask_count: 0, ask_allowed: false },
+    opener: { asked: false, text: null, age_sec: null },
+    ...overrides,
+  };
+}
+
+test('v1.4: "Good question" and "Great question" are banned openers on the same line', () => {
+  const b = buildNepqBlock(UNBOOKED, EST);
+  const line = b.match(/Banned openers:[^\n]*/)[0];
+  assert.match(line, /"Good question"/);
+  assert.match(line, /"Great question"/);
+  assert.match(line, /"Happy to help!"/);
+});
+
+test('v1.4: the stage-4 decision-maker example is the one approved single ask', () => {
+  const b = buildNepqBlock({ intelligence: { buyer_stage: 4 } }, EST);
+  assert.match(b, /"Is this your call, or is anyone else weighing in on it\?"/);
+  assert.ok(!/Would anyone else be looking at this with you/.test(b), 'the old either/or example is back');
+});
+
+test('v1.4: the discipline section renders "(not computed)" when no discipline is passed', () => {
+  const b = buildNepqBlock(UNBOOKED, EST);
+  assert.match(b, /=== DISCOVERY DISCIPLINE \(this turn\) ===/);
+  assert.match(b, /\(not computed/);
+});
+
+test('v1.4: a booked contact never gets the discipline section (commitment gate wins)', () => {
+  const b = buildNepqBlock({ lp: { appointment_set: true } }, EST, discipline());
+  assert.ok(!/DISCOVERY DISCIPLINE/.test(b));
+  assert.match(b, /NEPQ DISCOVERY IS OFF/);
+});
+
+test('v1.4: booking ask NOT allowed renders the answer-then-discover instruction', () => {
+  const b = buildNepqBlock(UNBOOKED, EST, discipline());
+  assert.match(b, /BOOKING ASK: NOT ALLOWED this turn — they asked you a question/);
+  assert.match(b, /Do not ask for a day, a time, a call, an address, or who will\nbe home/);
+});
+
+test('v1.4: booking ask allowed says so and stays at one offer', () => {
+  const b = buildNepqBlock(UNBOOKED, EST, discipline({ booking: { allowed: true, reason: 'lead_asked_about_scheduling', recent_asks: 0 } }));
+  assert.match(b, /BOOKING ASK: ALLOWED this turn \(they asked about scheduling/);
+  assert.match(b, /ONE offer, one question mark/);
+});
+
+test('v1.4: a named problem renders PROBE FIRST with their words; a deadline skips it', () => {
+  const probe = { problem_named: "I don't like the color and design", family: 'colour and design', probe_done: false, urgent: false };
+  const b = buildNepqBlock(UNBOOKED, EST, discipline({ probe }));
+  assert.match(b, /PROBE FIRST\. They named a problem in their own words: "I don't like the color and design"/);
+  assert.match(b, /no address, no booking, no decision-maker question/);
+
+  const urgent = buildNepqBlock(UNBOOKED, EST, discipline({ probe: { ...probe, urgent: true } }));
+  assert.match(urgent, /URGENT TIMING STATED/);
+  assert.ok(!/PROBE FIRST/.test(urgent));
+
+  const done = buildNepqBlock(UNBOOKED, EST, discipline({ probe: { ...probe, probe_done: true } }));
+  assert.match(done, /PROBE DONE/);
+  assert.match(done, /TRANSITION play is open/);
+});
+
+test('v1.4: decision-maker states render the right instruction', () => {
+  const dm = (status, extra = {}) => discipline({ decision_makers: { status, name: null, relation: null, ask_count: 0, feel_ask_count: 0, ask_allowed: false, ...extra } });
+
+  const sole = buildNepqBlock(UNBOOKED, EST, dm('sole'));
+  assert.match(sole, /DECISION-MAKERS: SOLE/);
+  assert.match(sole, /NEVER write "both of you", "whoever else"/);
+
+  const absent = buildNepqBlock(UNBOOKED, EST, dm('named_absent', { name: 'Paloma', relation: 'wife' }));
+  assert.match(absent, /"How does Paloma feel about getting the windows done\?"/);
+  assert.match(absent, /Ask ONCE/);
+
+  const asked = buildNepqBlock(UNBOOKED, EST, dm('named_absent', { name: 'Paloma', relation: 'wife', feel_ask_count: 1 }));
+  assert.match(asked, /you already asked how Paloma feels\. Do not ask again/);
+
+  const handoff = buildNepqBlock(UNBOOKED, EST, dm('handoff', { name: 'Paloma', relation: 'wife', feel_ask_count: 1 }));
+  assert.match(handoff, /DECISION-MAKERS: HANDOFF/);
+  assert.match(handoff, /Do NOT ask again and do NOT book/);
+
+  const unknownNoAsk = buildNepqBlock(UNBOOKED, EST, dm('unknown'));
+  assert.match(unknownNoAsk, /NOT to be asked this turn/);
+
+  const unknownAsk = buildNepqBlock(UNBOOKED, EST, dm('unknown', { ask_allowed: true }));
+  assert.match(unknownAsk, /exactly this: "Is this your call, or is anyone else weighing\nin on it\?"/);
+});
+
+test('v1.4: an opener already sent by a workflow is named with its age', () => {
+  const b = buildNepqBlock(UNBOOKED, EST, discipline({ opener: { asked: true, text: 'What are you hoping to get done with your windows or doors?', age_sec: 20 } }));
+  assert.match(b, /OPENER ALREADY ASKED 20 seconds ago by an automated message/);
+  assert.match(b, /Do NOT ask it again in any wording/);
+});
+
+test('v1.4: the approved insurance shape is in the consequence caps', () => {
+  const b = buildNepqBlock(UNBOOKED, EST);
+  assert.match(b, /Your insurance company decides the final number/);
+});
+
+test('v1.4: no exclamation marks in the discipline section either', () => {
+  const b = buildNepqBlock(UNBOOKED, EST, discipline({
+    probe: { problem_named: 'the frames are rotting', family: 'rot', probe_done: false, urgent: false },
+    decision_makers: { status: 'named_absent', name: 'Dan', relation: 'husband', ask_count: 1, feel_ask_count: 0, ask_allowed: false },
+    opener: { asked: true, text: 'What are you hoping to get done?', age_sec: 15 },
+  }));
+  assert.ok(!/!/.test(b.replace(/Banned openers:[^\n]*/, '')), 'an exclamation mark leaked into NEPQ copy');
+});
+
+test('version is 1.4', () => {
+  assert.equal(NEPQ_LAYER_VERSION, '1.4');
 });

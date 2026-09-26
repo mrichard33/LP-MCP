@@ -15,7 +15,7 @@
  * The order is written down in THREE places:
  *
  *   sql/063_ci_claim_fn.sql   the claim function
- *   src/index.js              runMigrations()'s self-healing mirror of it
+ *   src/admin/startup-mirrors.js  the boot-time self-healing mirror of it
  *   src/ci/worker.js          claimBatch's fallback SELECT, used when the
  *                             function is missing
  *
@@ -65,8 +65,8 @@ test('the runMigrations mirror orders identically to sql/063', () => {
   // ordering depends on which one ran — invisible until someone wonders why
   // yesterday's calls are being processed before this morning's.
   const fromFile = claimOrderBy(read('sql/063_ci_claim_fn.sql'));
-  const fromMirror = claimOrderBy(read('src/index.js'));
-  assert.ok(fromMirror, 'runMigrations must still carry the claim_ci_calls DDL');
+  const fromMirror = claimOrderBy(read('src/admin/startup-mirrors.js'));
+  assert.ok(fromMirror, 'the startup mirrors must still carry the claim_ci_calls DDL');
   assert.deepEqual(fromMirror, fromFile);
 });
 

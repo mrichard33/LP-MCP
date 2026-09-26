@@ -409,7 +409,9 @@ test('the roster is unique, complete and shaped', () => {
   // 16 → 17 on 2026-09-24: missed-caller-recovery.
   // 17 → 18 on 2026-09-24: office-power-ranking.
   // 18 → 19 on 2026-09-25: office-power-ranking-final (month-end standings).
-  assert.equal(JOBS.length, 19);
+  // 19 → 20 on 2026-09-25: sale-announce-backstop.
+  // 20 → 21 on 2026-09-26: lead-leak-monitor.
+  assert.equal(JOBS.length, 21);
   for (const j of JOBS) {
     assert.match(j.id, /^[a-z0-9-]+$/, `${j.id} should be a slug`);
     assert.ok(j.label && j.group && j.cadence, `${j.id} needs a label, group and cadence`);

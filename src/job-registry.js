@@ -207,6 +207,19 @@ export const JOBS = Object.freeze([
     isEnabled: (env) => String(env.OFFICE_POWER_RANKING_ENABLED || '').toLowerCase() === 'true',
   },
   {
+    // 2026-09-25: announces sales LP shows as won that the GHL I.LP-IN path
+    // never announced (LP's webhook stopped delivering on 09-24). ON by
+    // default; SALE_ANNOUNCE_BACKSTOP_ENABLED=false turns it off. Mirrors
+    // backstopEnabled() in src/notifications/sale-backstop.js.
+    id: 'sale-announce-backstop',
+    label: 'Sale announcement backstop',
+    group: 'notifications',
+    cadence: 'every 10 min',
+    enabledEnv: 'SALE_ANNOUNCE_BACKSTOP_ENABLED',
+    enabledDefault: true,
+    isEnabled: (env) => String(env.SALE_ANNOUNCE_BACKSTOP_ENABLED || 'true').toLowerCase() !== 'false',
+  },
+  {
     // 2026-09-25: last month's final standings, 08:00 ET on the 1st, before
     // every office starts again at $0. Same gate as the daily board, and only
     // in month-to-date mode — the rolling board has no month to close.
@@ -232,6 +245,18 @@ export const JOBS = Object.freeze([
     // but an explicit 'off' runs (an unrecognised value falls back to shadow).
     enabledDefault: true,
     isEnabled: (env) => String(env.MISSED_CALLER_RECOVERY_MODE || 'shadow').toLowerCase().trim() !== 'off',
+  },
+  {
+    id: 'lead-leak-monitor',
+    label: 'Lead leak monitor (uncalled LP leads)',
+    group: 'five9',
+    cadence: 'daily 07:00 ET',
+    enabledEnv: 'LEAD_LEAK_MONITOR_MODE',
+    // A MODE, not a boolean (2026-09-26): off | shadow | live, default shadow.
+    // Shadow measures and stores every morning, so a silent shadow run is a
+    // defect too. Mirrors leadLeakMode() in src/jobs/lead-leak-monitor.js.
+    enabledDefault: true,
+    isEnabled: (env) => String(env.LEAD_LEAK_MONITOR_MODE || 'shadow').toLowerCase().trim() !== 'off',
   },
 ]);
 

@@ -591,6 +591,16 @@ export async function classifyInbound(messageText, opts = {}) {
   }
 
   // ─── LAYER 2: Semantic classification ────────────────────────────
+  // 2026-09-26 — the live-chat fast lane (src/live-chat/fast-lane.js) makes
+  // exactly ONE model call per reply, and it is not this one. With noLLM the
+  // regex and keyword layers still route STOP / wrong-number / DNC exactly as
+  // before, and anything they miss is UNCLEAR for the merged reply call to
+  // classify itself.
+  if (opts.noLLM) {
+    const result = makeUnclearResult({ reasoning: 'no_llm_layer_requested', method: 'no_llm' });
+    logDecision(opts.ghlContactId, messageText, result, opts.channel);
+    return result;
+  }
   let semantic;
   try {
     semantic = await classifyWithClaude(
