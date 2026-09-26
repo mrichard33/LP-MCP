@@ -246,6 +246,18 @@ export const JOBS = Object.freeze([
     enabledDefault: true,
     isEnabled: (env) => String(env.MISSED_CALLER_RECOVERY_MODE || 'shadow').toLowerCase().trim() !== 'off',
   },
+  {
+    id: 'lead-leak-monitor',
+    label: 'Lead leak monitor (uncalled LP leads)',
+    group: 'five9',
+    cadence: 'daily 07:00 ET',
+    enabledEnv: 'LEAD_LEAK_MONITOR_MODE',
+    // A MODE, not a boolean (2026-09-26): off | shadow | live, default shadow.
+    // Shadow measures and stores every morning, so a silent shadow run is a
+    // defect too. Mirrors leadLeakMode() in src/jobs/lead-leak-monitor.js.
+    enabledDefault: true,
+    isEnabled: (env) => String(env.LEAD_LEAK_MONITOR_MODE || 'shadow').toLowerCase().trim() !== 'off',
+  },
 ]);
 
 /** Ids only — handy for tests and for asserting the wiring matches the roster. */

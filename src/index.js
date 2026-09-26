@@ -312,6 +312,7 @@ import { registerTagHygieneRoutes, startTagHygieneScheduler } from './jobs/tag-h
 import { startOfficePowerRankingScheduler } from './jobs/office-power-ranking.js';  // 2026-09-24
 import { startSaleBackstopScheduler } from './jobs/sale-announce-backstop.js';  // 2026-09-25
 import { startMissedCallerRecoveryScheduler } from './jobs/missed-caller-recovery.js';  // 2026-09-24
+import { registerLeadLeakRoutes, startLeadLeakScheduler } from './jobs/lead-leak-monitor.js';  // 2026-09-26
 import { registerCiRoutes } from './ci/routes.js';
 import { startCiWorkerScheduler } from './ci/worker.js';
 import { startCiDiscoveryScheduler } from './jobs/ci-discovery-scheduler.js';
@@ -435,6 +436,37 @@ async function runMigrations() {
     });
   } catch (err) {
     console.error('[Migration] startup schema check crashed:', err.message);
+  }
+
+  // Lead Leak Monitor results (sql/130, 2026-09-26 — the file is the source of
+  // truth). Additive: a new table and a view over it, nothing existing altered.
+  // A failure makes the scheduled pass fail its write (runJob files it failed);
+  // it never touches lp_*, GHL or Five9 either way.
+  try {
+    const { runSQL } = await import('./admin/supabase-admin.js');
+    await runSQL(`CREATE TABLE IF NOT EXISTS lead_leak_daily (
+              id bigserial PRIMARY KEY,
+              run_date date NOT NULL,
+              lp_lead_id text NOT NULL,
+              lp_prospect_id text,
+              lead_source text,
+              disposition text,
+              reason text NOT NULL,
+              est_value numeric,
+              detail jsonb,
+              created_at timestamptz DEFAULT now(),
+              UNIQUE (run_date, lp_lead_id)
+            );`);
+    await runSQL(`CREATE OR REPLACE VIEW v_lead_leak_summary AS
+            SELECT run_date,
+                   reason,
+                   count(*)        AS leads,
+                   sum(est_value)  AS est_value_at_risk
+              FROM lead_leak_daily
+             GROUP BY run_date, reason;`);
+    console.log('[Migration] lead_leak_daily + v_lead_leak_summary (sql/130) ready');
+  } catch (err) {
+    console.warn('[Migration] lead_leak_daily (sql/130) skipped — apply it from the dashboard; the lead-leak monitor stores nothing until it exists:', err.message);
   }
 }
 
@@ -868,6 +900,7 @@ registerScorecardValidateRoutes(app);
 registerFive9SnapshotRoutes(app, authenticate);
 registerFreshnessRefreshRoutes(app);
 registerLinkLeakRoutes(app);
+registerLeadLeakRoutes(app);
 registerP2UnresolvableRoutes(app);
 registerTagHygieneRoutes(app, authenticate);
 registerCiRoutes(app, authenticate);            // 2026-08-21 — Call Intelligence ingest (PR 2; worker ships disarmed)
@@ -933,6 +966,7 @@ const server = app.listen(PORT, async () => {
   startOfficePowerRankingScheduler();
   startSaleBackstopScheduler();
   startMissedCallerRecoveryScheduler();
+  startLeadLeakScheduler();
   // Probe ffmpeg, which transcodes Five9's GSM 6.10 recordings to a format a
   // browser can actually play. A CLEAR LOG LINE, NOT A CRASH: without it the
   // whole pipeline still runs and links still resolve, they just serve the
