@@ -30,7 +30,14 @@ const PGRST002 = 'Supabase SQL error: Could not query the database for the schem
 
 // ─── fakes ───────────────────────────────────────────────────────────────────
 
-/** A mutable fake catalog in the raw shape run_sql returns. */
+/**
+ * A mutable fake catalog. `asRunSql` wraps it the way the LIVE run_sql returns
+ * any SELECT — [{ <column>: value }] — which is what every harness read uses.
+ * The first deploy (2026-09-26) was tested only against the bare object and
+ * missed exactly this wrapper.
+ */
+const asRunSql = (db) => [{ catalog: structuredClone(db) }];
+
 function fakeDb({ tables = [], views = [], indexes = [], columns = [] } = {}) {
   return { tables: [...tables], views: [...views], indexes: [...indexes], columns: [...columns] };
 }
@@ -54,7 +61,7 @@ function harness(db, { ddl = () => {}, readCatalog } = {}) {
       calls.ddl.push({ sql, destructive });
       return ddl(sql, calls.ddl.length);
     },
-    readCatalog: readCatalog || (async () => { calls.catalog += 1; return structuredClone(db); }),
+    readCatalog: readCatalog || (async () => { calls.catalog += 1; return asRunSql(db); }),
     readSqlFile: async (rel) => `-- file ${rel}`,
     opsAlert: async (text) => { calls.alerts.push(text); },
     log: rec.log,
@@ -182,7 +189,7 @@ test('a transient catalog read is retried once before giving up on verification'
   let n = 0;
   const db = FULL();
   const { deps, calls } = harness(db, {
-    readCatalog: async () => { n += 1; if (n === 1) throw new Error(PGRST002); return structuredClone(db); },
+    readCatalog: async () => { n += 1; if (n === 1) throw new Error(PGRST002); return asRunSql(db); },
   });
   const t = await runStartupSchema([LEADS_BLOCK], deps);
   assert.equal(t.verified, true);
@@ -206,7 +213,7 @@ test('DDL succeeded but the re-probe read failed: trusted as applied, not paged'
   db.columns = db.columns.filter((c) => c !== 'lp_prospects.verified_at');
   let reads = 0;
   const { deps, calls } = harness(db, {
-    readCatalog: async () => { reads += 1; if (reads > 1) throw new Error('boom'); return structuredClone(db); },
+    readCatalog: async () => { reads += 1; if (reads > 1) throw new Error('boom'); return asRunSql(db); },
   });
   const t = await runStartupSchema([LEADS_BLOCK], deps);
   assert.deepEqual([t.applied, t.missing], [1, 0]);
@@ -218,7 +225,7 @@ test('DDL failed and the re-probe read failed: still missing (the first read pro
   db.columns = db.columns.filter((c) => c !== 'lp_prospects.verified_at');
   let reads = 0;
   const { deps, calls } = harness(db, {
-    readCatalog: async () => { reads += 1; if (reads > 1) throw new Error('boom'); return structuredClone(db); },
+    readCatalog: async () => { reads += 1; if (reads > 1) throw new Error('boom'); return asRunSql(db); },
     ddl: () => { throw new Error('permission denied'); },
   });
   const t = await runStartupSchema([LEADS_BLOCK], deps);
@@ -269,6 +276,26 @@ test('parseCatalog refuses anything that could be mistaken for "everything is mi
   assert.throws(() => parseCatalog({ tables: ['a'] }), /unexpected shape/);
   const c = parseCatalog([{ tables: ['a'], views: [], indexes: [], columns: ['a.b'] }]);
   assert.ok(c.columns.has('a.b'));
+});
+
+test("parseCatalog unwraps the live run_sql row wrapper (the 2026-09-26 first-boot miss)", () => {
+  // Live run_sql: SELECT COALESCE(jsonb_agg(row_to_json(sub)), '[]') FROM (<query>) sub
+  const live = [{ catalog: { tables: ['lp_leads'], views: ['v'], indexes: ['i'], columns: ['lp_leads.x'] } }];
+  const c = parseCatalog(live);
+  assert.ok(c.tables.has('lp_leads'));
+  assert.ok(c.columns.has('lp_leads.x'));
+  // An unaliased column (what shipped first) must still be refused, not guessed at.
+  assert.throws(() => parseCatalog([{ jsonb_build_object: live[0].catalog }]), /unexpected shape/);
+  // run_sql's own empty answer is a failed read, never "everything is missing".
+  assert.throws(() => parseCatalog([]), /unexpected shape/);
+});
+
+test('buildCatalogSql starts with SELECT and aliases its one column as catalog', () => {
+  // run_sql only wraps (and returns rows for) statements matching ^(SELECT|WITH)\s;
+  // anything else it EXECUTEs and answers {status:'ok'} with no data at all.
+  const sql = buildCatalogSql(['lp_leads']);
+  assert.match(sql, /^(SELECT|WITH)\s/);
+  assert.match(sql, /\)\s*AS catalog$/);
 });
 
 test('missingObjects names each kind readably', () => {

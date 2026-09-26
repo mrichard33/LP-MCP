@@ -86,18 +86,29 @@ export function buildCatalogSql(tables) {
     'columns', COALESCE((SELECT jsonb_agg(table_name::text || '.' || column_name::text)
                            FROM information_schema.columns
                           WHERE table_schema = 'public' AND table_name IN (${list})), '[]'::jsonb)
-  )`;
+  ) AS catalog`;
 }
 
 /**
- * Turn the raw run_sql result into sets. Anything that is not the expected
+ * Turn the raw run_sql result into sets.
+ *
+ * The live run_sql does NOT return a SELECT's value as-is: it wraps every
+ * SELECT/WITH as `jsonb_agg(row_to_json(sub))`, so the catalog arrives as
+ * [{ catalog: { tables, views, indexes, columns } }]. The first deploy of this
+ * module (2026-09-26 21:03 UTC) expected the bare object, read the row
+ * wrapper as "unexpected shape", and fell back to running every block — safe,
+ * but it checked nothing. Hence the `AS catalog` alias and the unwrap below;
+ * the bare-object form is still accepted for a run_sql that returns it.
+ *
+ * Anything that is not the expected
  * shape THROWS, so the caller treats it as a failed read — never as "the
  * database is empty", which would read every object as missing and page.
  * An empty table list is refused for the same reason: a live database always
  * has tables, so zero means we could not see them, not that they are gone.
  */
 export function parseCatalog(raw) {
-  const r = Array.isArray(raw) && raw.length === 1 ? raw[0] : raw;
+  let r = Array.isArray(raw) && raw.length === 1 ? raw[0] : raw;
+  if (r && typeof r === 'object' && !Array.isArray(r) && r.catalog && typeof r.catalog === 'object') r = r.catalog;
   const ok = r && typeof r === 'object'
     && ['tables', 'views', 'indexes', 'columns'].every((k) => Array.isArray(r[k]));
   if (!ok) throw new Error('catalog read returned an unexpected shape');
