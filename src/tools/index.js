@@ -13,6 +13,7 @@ import { registerCapacityTools } from './capacity-tools.js';
 import { registerAdminTools } from './admin/index.js';
 import { registerFive9Tools } from './five9-tools.js';
 import { registerMemoryTools } from './memory-tools.js';
+import { registerSalesBoardTools } from './sales-board-tools.js';
 import { withSanitizedResults } from '../text-sanitize.js';
 
 export function registerAllTools(rawServer) {
@@ -68,4 +69,9 @@ export function registerAllTools(rawServer) {
   //   MEMORY_VECTOR_MODE), memory_checkpoint (confirm-gated write in the v4
   //   skill shape). claude_* tables only; never the customer request path.
   registerMemoryTools(server);
+  // Sales-board hand-post tools (2) — 2026-09-26
+  //   post_office_power_ranking, announce_missed_sale. Dry run by default.
+  //   For a board or a sale that fell outside the automatic windows (the 9/25
+  //   8 PM board lost to the switchover, lead 577880 outside the 48h lookback).
+  registerSalesBoardTools(server);
 }
