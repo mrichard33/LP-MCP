@@ -547,6 +547,65 @@ const DECISION_MAKER_SIGNAL_PATTERNS = Object.freeze([
 ]);
 
 /**
+ * The GHL Conversations API body for a Live_Chat send. Pure. The one place
+ * that knows the shape (2026-09-26 — the live-chat fast lane sends through
+ * it too, so a GHL field rename is fixed once).
+ */
+export function livechatSendBody({ contactId, conversationId, message }) {
+  return { type: 'Live_Chat', contactId, conversationId, message };
+}
+
+/**
+ * The per-stage timing block for one reply. Pure; exported for tests.
+ *
+ * Stage durations are between consecutive marks that are both present. The
+ * analysis event (t4) is the action's source event for rule-106 / layer-3
+ * replies, and its payload carries the reply event's own marks (t0/t1) since
+ * 2026-09-26 (message-analyzer.js). Older rows simply report null.
+ *
+ * @param {object} args
+ * @param {object|null} args.sourceEventMeta  { event_type, created_at, payload }
+ * @param {object} args.action                agent_actions row
+ * @param {string|null} args.claimedAt        action.updated_at at handler entry
+ * @param {number|null} args.generatedAtMs
+ * @param {number|null} args.sentAtMs
+ */
+export function buildReplyTiming({ sourceEventMeta = null, action = {}, claimedAt = null, generatedAtMs = null, sentAtMs = null } = {}) {
+  const iso = (v) => {
+    if (v === null || v === undefined || v === '') return null;
+    const ms = typeof v === 'number' ? v : Date.parse(v);
+    return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
+  };
+  const p = sourceEventMeta?.payload || {};
+  const isAnalysis = sourceEventMeta?.event_type === 'ai.analysis_completed';
+  const isReplyEvent = sourceEventMeta?.event_type === 'ghl.reply_received';
+  const marks = {
+    t0_inbound_received: iso(isAnalysis
+      ? (p.inbound_received_at || p.inbound_webhook_received_at)
+      : isReplyEvent ? (p.inbound_at || p.webhook_received_at) : null),
+    t1_event_written: iso(isAnalysis ? p.inbound_event_created_at : isReplyEvent ? sourceEventMeta?.created_at : null),
+    t2_action_created: iso(action?.created_at),
+    t3_action_claimed: iso(claimedAt),
+    t4_analysis_done: iso(isAnalysis ? (p.analysis_completed_at || sourceEventMeta?.created_at) : null),
+    t5_generation_done: iso(generatedAtMs),
+    t6_ghl_sent: iso(sentAtMs),
+  };
+  const ms = (k) => (marks[k] ? Date.parse(marks[k]) : null);
+  const diff = (a, b) => (ms(a) !== null && ms(b) !== null ? Math.max(0, ms(b) - ms(a)) : null);
+  return {
+    ...marks,
+    total_ms: diff('t0_inbound_received', 't6_ghl_sent'),
+    // From the analysis landing to this action being claimed: the engine hop
+    // plus the pull-queue wait.
+    queue_ms: diff('t4_analysis_done', 't3_action_claimed'),
+    analyze_ms: diff('t1_event_written', 't4_analysis_done'),
+    generate_ms: diff('t3_action_claimed', 't5_generation_done'),
+    send_ms: diff('t5_generation_done', 't6_ghl_sent'),
+    source_event_type: sourceEventMeta?.event_type || null,
+  };
+}
+
+/**
  * Does this inbound raise who owns the home or who makes the decision? Pure.
  *
  * @param {string} text  the lead's inbound message
@@ -1759,7 +1818,8 @@ async function sendViaConversationsAPI(contactId, message, channel, subject, opt
     }
   } else if (channel === 'livechat') {
     // Live_Chat: body lives in msgBody.message; no sender number concept.
-    msgBody.message = message;
+    // 2026-09-26 — one builder, shared with the live-chat fast lane.
+    Object.assign(msgBody, livechatSendBody({ contactId, conversationId, message }));
   } else {
     // SMS: body lives in msgBody.message.
     // 2026-07-03 — identity inheritance: fromNumber is the number the
@@ -2736,6 +2796,11 @@ export function findAnswerSinceInbound(messages, inboundAtMs) {
 
 export async function executeSendMessage(action, context) {
   const _tStart = Date.now(); // 2026-07-03 hotfix: phase-timing telemetry
+  // 2026-09-26 (reply timing): claim_agent_actions sets updated_at = now() and
+  // returns the row, so updated_at AS RECEIVED here is the claim instant (t3).
+  // Captured before anything below writes the row again.
+  const _claimedAt = action?.updated_at || null;
+  let _tGenerated = null; // set right after the generation loop (t5)
   const contactId = action.target_id;
   if (!contactId) throw new Error('Missing contactId (target_id)');
 
@@ -3246,6 +3311,8 @@ export async function executeSendMessage(action, context) {
         }
       }
     }
+
+    _tGenerated = Date.now(); // 2026-09-26 reply timing: t5
 
     // 2026-09-24 — a handoff the bot also answers (handoff-policy.js): apply
     // the handoff tag, card and, where a person must act, the alert, then
@@ -4024,11 +4091,36 @@ export async function executeSendMessage(action, context) {
     `pre_send=${_tPreSend - _tStart}ms send=${_tSent - _tPreSend}ms commit=${_tCommitted - _tSent}ms`
   );
 
+  // 2026-09-26 — per-stage reply timing (B1 of the live-chat handoff). Every
+  // mark is an ISO timestamp or null; a missing mark yields a null duration,
+  // never NaN. Read by scripts/reply-latency-report.js.
+  //   t0 inbound received   GHL dateAdded when the webhook carried it, else
+  //                         when our webhook handler received it
+  //   t1 event written      ghl.reply_received row created
+  //   t2 action created     agent_actions row created
+  //   t3 action claimed     claim_agent_actions stamped updated_at
+  //   t4 analysis done      ai.analysis_completed row created
+  //   t5 generation done    generateResponse returned (guards included)
+  //   t6 ghl sent           GHL accepted the message
+  const timing = buildReplyTiming({
+    sourceEventMeta,
+    action,
+    claimedAt: _claimedAt,
+    generatedAtMs: _tGenerated,
+    sentAtMs: _tSent,
+  });
+  console.log(
+    `[ReplyTiming] contact=${contactId} action=${action.id ?? 'n/a'} rule=${action.rule_applied || 'manual'} channel=${channel} ` +
+    `total_ms=${timing.total_ms ?? 'n/a'} queue_ms=${timing.queue_ms ?? 'n/a'} analyze_ms=${timing.analyze_ms ?? 'n/a'} ` +
+    `generate_ms=${timing.generate_ms ?? 'n/a'} send_ms=${timing.send_ms ?? 'n/a'}`
+  );
+
   return {
     action: 'message_sent',
     contact_id: contactId,
     channel,
     message_length: message.length,
+    timing,
     // 2026-07-07 duplicate-send incident (14:51:23/14:51:55): the sent body
     // is persisted in execution_result so the near-duplicate gate has a
     // Supabase-side memory of what just went out — the GHL conversation

@@ -121,6 +121,11 @@ const FUNCTION_GROUPS = {
   memory_recommend: 'decision_engine',   // src/jobs/memory-recommend.js
   // customer-facing — text a human reads
   response_generator: 'customer_facing', // src/response-generator.js
+  // 2026-09-26 — website live chat, one merged classify+reply call under a
+  // 10s customer-facing deadline (src/live-chat/fast-lane.js). LIVE_CHAT_MODEL
+  // / LIVE_CHAT_PROVIDER select it; it MUST be a non-thinking model or every
+  // reply falls back (the lane logs that at startup).
+  live_chat: 'customer_facing',
   nurture_generator: 'customer_facing',  // src/nurture/nurture-generator.js
   agentic_callback: 'customer_facing',   // src/agentic-callback-message.js
   appt_notification: 'customer_facing',  // src/notifications/appointment-body-generator.js (legacy APPT_NOTIFICATION_MODEL)
