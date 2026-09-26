@@ -30,6 +30,8 @@
  * true of it.
  */
 
+import { firstCallAfter, creationCallMs, lpLocalToUtcMs } from './lead-speed.js';
+
 // ─── Dispositions — Mark edits these lists ───────────────────────────────────
 // lp_leads.disposition_code values (disposition_label is NULL on every row as
 // of 2026-09-26, so the CODE is what is read). Compared case-insensitively.
@@ -162,25 +164,20 @@ export function leadKey(leadId) {
 }
 
 /**
- * Did Five9 dial this lead? Key first, then phone.
- * `ctx.five9Keys`   — Set of LDS keys seen on disposition events.
- * `ctx.five9Phones` — Map normalized phone → latest ms it was seen on any
- *                     disposition event (the end of its day slice).
- *
- * The phone must have been seen on or after the lead's creation. A number a
- * previous lead was dialled on, weeks before this one arrived, says nothing
- * about whether anyone rang the new lead — and repeat customers are exactly
- * the leads that case would hide. A lead with no readable creation time
- * accepts any sighting (the safe direction: it can hide a leak, never invent one).
+ * Did Five9 work this lead? One definition, shared with the timing in
+ * src/lead-speed.js: a Five9 disposition event on its LDS key or phone at or
+ * after the lead's real creation time (firstCallAfter), or the live call it
+ * was created during (creationCallMs). `ctx.five9Keys` / `ctx.five9Phones`
+ * are Maps of key/phone → ascending call times (ms). LP's call_count is never
+ * consulted.
  */
 export function wasCalled(lead, ctx) {
-  const key = leadKey(lead?.lp_lead_id);
-  if (key && ctx.five9Keys?.has(key)) return true;
-  const p = normalizePhone10(lead?.phone);
-  if (!p || !ctx.five9Phones?.has(p)) return false;
-  const created = Date.parse(lead?.created_at_lp ?? '');
-  if (!Number.isFinite(created)) return true;
-  return Number(ctx.five9Phones.get(p)) >= created;
+  const who = {
+    leadId: lead?.lp_lead_id,
+    phone10: normalizePhone10(lead?.phone),
+    createdAtLp: lead?.created_at_lp,
+  };
+  return firstCallAfter(who, ctx) !== null || creationCallMs(who, ctx) !== null;
 }
 
 export const isRetiredCode = (lead) => RETIRED.has(dispo(lead));
@@ -193,8 +190,9 @@ export const isRetiredCode = (lead) => RETIRED.has(dispo(lead));
  * is, never shorter, which is the safe direction for "do not reach out".
  */
 export function holdStartedMs(lead) {
-  const ms = Date.parse(lead?.updated_at_lp ?? '');
-  return Number.isFinite(ms) ? ms : null;
+  // LP's digits are Eastern time labelled UTC (src/lead-speed.js header);
+  // read raw, every hold would look 4–5 hours older than it is.
+  return lpLocalToUtcMs(lead?.updated_at_lp);
 }
 
 /** A NoRehash lead whose hold start cannot be read — kept on hold, never guessed. */
@@ -343,6 +341,15 @@ export function summarize(rows, { retiredCodeInUse = 0 } = {}) {
 }
 
 const money = (n) => `$${Math.round(Number(n) || 0).toLocaleString('en-US')}`;
+const fmtPct = (x) => (x == null ? 'n/a' : `${Math.round(x * 100)}%`);
+/** Working minutes → "12m" / "3h 5m" / "2d 4h". */
+function fmtMinutes(m) {
+  if (m == null || !Number.isFinite(m)) return 'n/a';
+  const mins = Math.round(m);
+  if (mins < 60) return `${mins}m`;
+  const h = Math.floor(mins / 60);
+  return h < 48 ? `${h}h ${mins % 60}m` : `${Math.floor(h / 24)}d ${h % 24}h`;
+}
 const num = (n) => Number(n || 0).toLocaleString('en-US');
 
 /**
@@ -350,7 +357,9 @@ const num = (n) => Number(n || 0).toLocaleString('en-US');
  * never to a customer. The $ figure is labelled an estimate every time it
  * appears, because it is one (source close rate × average job value).
  */
-export function formatSlackSummary({ runDate, windowDays, summary, revenueAvailable = true }) {
+export function formatSlackSummary({
+  runDate, windowDays, summary, revenueAvailable = true, speed = null, intake = null, dashboardUrl = null,
+}) {
   const b = summary.by_reason;
   const n = (reason) => num(b[reason]?.leads);
   const lines = [
@@ -359,6 +368,13 @@ export function formatSlackSummary({ runDate, windowDays, summary, revenueAvaila
     revenueAvailable
       ? `Revenue at risk (estimate): *${money(summary.est_value_at_risk)}*`
       : 'Revenue at risk (estimate): unavailable — the close-rate read failed',
+    ...(speed ? [
+      `Typical time to first call (Five9, last 7 days): *${fmtMinutes(speed.last7?.median_min)}*`
+        + ` (prior 28 days: ${fmtMinutes(speed.prior28?.median_min)})`
+        + ` · called within 1h: ${fmtPct(speed.last7?.pct_called_1h)}`,
+    ] : []),
+    ...(intake ? [`Leads in GHL that never reached LP: *${num(intake.not_in_lp)}*`
+      + (intake.not_in_lp_but_called ? ` (+${num(intake.not_in_lp_but_called)} not in LP but Five9 reached them)` : '')] : []),
     '',
     `• Not issued to a rep (call center, NIS): ${n('not_issued_call_center')}`,
     `• Set, but no rep covered it (NOC): ${n('not_covered_by_rep')}`,
@@ -384,7 +400,7 @@ export function formatSlackSummary({ runDate, windowDays, summary, revenueAvaila
     `• Counted only because LP's appointment/won flag is on (code says otherwise): ${n('already_progressed_flag')}`,
     `• "Data" leads awaiting a ruling: ${n('data_undecided')}`,
     `• Retired codes still in use (${RETIRED_DISPOSITIONS.join(', ')}): ${num(summary.retired_code_in_use)}`,
-    'Details: GET /api/lp/lead-leak',
+    dashboardUrl ? `Details: ${dashboardUrl}` : 'Details: Dashboard → Lead Leaks (or GET /api/lp/lead-leak)',
   );
   return lines.join('\n');
 }

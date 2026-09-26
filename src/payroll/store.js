@@ -5,7 +5,7 @@
 // a plain fake. Nothing here decides pay — that is src/payroll/rules.js.
 //
 // Every method THROWS on a database error (with the PostgREST code attached),
-// so the caller can tell "the tables are not there yet" (sql/131 unapplied)
+// so the caller can tell "the tables are not there yet" (sql/132 unapplied)
 // from "there were no rows". A read that failed must never be reported as a
 // quiet week.
 

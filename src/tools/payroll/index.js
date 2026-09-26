@@ -25,7 +25,7 @@ function text(obj) {
 }
 
 function errorText(err) {
-  if (isMissingTableError(err)) return text({ error: 'payroll tables are missing — apply sql/131_payroll_engine.sql in the Supabase dashboard', detail: err.message });
+  if (isMissingTableError(err)) return text({ error: 'payroll tables are missing — apply sql/132_payroll_engine.sql in the Supabase dashboard', detail: err.message });
   return text({ error: err.message });
 }
 

@@ -37,7 +37,7 @@
 //   existing line — including a person's resolution — exactly as it was.
 //
 // NOT READY IS NOT A CRASH
-//   Until sql/131 is applied the tables do not exist. A pass then logs, posts
+//   Until sql/132 is applied the tables do not exist. A pass then logs, posts
 //   one ops note and returns { ok:false, reason:'tables_missing' }; runJob
 //   files it failed, which is true.
 
@@ -232,7 +232,7 @@ export async function runPayrollEngine({ period = null, confirm = false, mode = 
     return { ok: true, mode: writeMode, dry_run: !confirm, period: p, missing_leads: missing, results };
   } catch (err) {
     if (isMissingTableError(err)) {
-      const msg = `⚠️ Payroll engine could not run for ${p.start} – ${p.end}: payroll tables are missing. Apply sql/131_payroll_engine.sql in the Supabase dashboard. (${err.message})`;
+      const msg = `⚠️ Payroll engine could not run for ${p.start} – ${p.end}: payroll tables are missing. Apply sql/132_payroll_engine.sql in the Supabase dashboard. (${err.message})`;
       console.error(`[Payroll] ${msg}`);
       if (confirm) await opsNote(msg);
       return { ok: false, reason: 'tables_missing', error: err.message, period: p };

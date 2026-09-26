@@ -515,6 +515,38 @@ export const objectionState = (stateCode, parentState, enteredAt, attemptNumber,
   `═══════ END OBJECTION STATE ═══════`,
 ];
 
+// 2026-09-26 (GHL dcKRwIyxn53eIOvrkJdA, action 512799) — the bot told a lead
+// "the 15-minute call covers exactly that, we can get your estimate started
+// without the 90-minute in-person visit." Mark's ruling: not possible.
+//
+// The prohibition already existed, but only inside PRICE-SHOPPER DIRECT
+// ANSWERS, which loads on PRICE turns. That was a TIMING turn, so the model
+// never saw it. This block is UNCONDITIONAL for exactly that reason — the
+// promise is available on every turn, so the boundary has to be too.
+export const WHAT_THE_CALL_DELIVERS = [
+  `\n═══════ WHAT THE PHONE CALL DELIVERS (locked — Mark, 2026-09-26) ═══════`,
+  `Exact pricing comes from the IN-HOME MEASUREMENT. That is the only place it comes from.`,
+  `The quick phone call is to see if we can help and get their details on file. It produces NO price, NO range, NO estimate, and it does NOT replace the in-home visit. Never say or imply otherwise — not "we can get your estimate started on the call", not "you don't need anyone to come out to get your numbers", not "we can price it over the phone".`,
+  `If they ask for a price or push back on the visit's length, the honest answer comes first: pricing needs the measurement. Then ask for the call on its own terms. Getting them on the phone is the goal — a real conversation beats a guessed number.`,
+  `This holds on EVERY turn, not only when price is the topic. A server guard rejects a draft that promises pricing without the visit.`,
+  `═══════ END WHAT THE PHONE CALL DELIVERS ═══════`,
+];
+
+// 2026-09-26 (Mark) — the last-resort fallback for a lead who will not take a
+// call. This block is only rendered when calculatorFallbackAllowed() passes
+// (2+ recovery attempts on a state that is about wanting to move forward), so
+// the URL is WITHHELD from the prompt entirely until then — the model cannot
+// send a link it was never given. Same discipline as the in-home gate: withhold
+// the material rather than trust an instruction not to use it.
+export const calculatorLastResort = (url) => [
+  `\n═══════ CALCULATOR — LAST RESORT (this turn only) ═══════`,
+  `They have now declined a call more than once. Stop asking for it a third time.`,
+  `Offer the self-serve pricing calculator instead, ONCE, in this turn: ${url}`,
+  `Say plainly what it is: it gives them a RANGE in a few minutes with nobody calling them, and a range is not a quote — exact pricing still needs the in-home measurement. Do not call it an estimate, a quote, or "your numbers".`,
+  `Leave the door open in one short clause (they can text here any time), and do not ask another question. No pressure, no second ask.`,
+  `═══════ END CALCULATOR ═══════`,
+];
+
 // 2026-09-24 (Mark) — "not interested": ask why once, then close. The turn is
 // decided in src/agentic/not-interested.js from the thread, not by the model.
 export const notInterestedTurnBlock = (turn) => [

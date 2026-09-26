@@ -42,18 +42,35 @@
 //   Anything unrecognised is `shadow`, never `live` (missed-caller-recovery
 //   precedent): a typo must not start posting, nor silently switch it off.
 //
+// TIME TO FIRST CALL, AND LEADS THAT NEVER REACHED LP (2026-09-26)
+//   The same pass also measures how long leads wait for their first Five9
+//   call (src/lead-speed.js — Five9 only, LP's clock corrected from Eastern)
+//   into lead_call_speed_daily, and finds GHL contacts that never became an LP
+//   lead (src/lead-intake-gap.js) into lead_intake_gap_daily (sql/131). Both
+//   feed the dashboard's Lead Leaks page.
+//
+// ALERTS — LEAD_LEAK_ALERT_MODE, default `shadow` (src/lead-speed-alerts.js)
+//   Three edge-triggered cards on channel 'ops' (the ops bot, mirrored to
+//   #ops-alerts), each naming the leads: time to first call getting worse and
+//   GHL leads that never reached LP (daily pass), and owed leads waiting past
+//   the grace with no call (hourly pass, call-center hours). Shadow logs the
+//   card instead of sending it. Going live is Mark's decision.
+//
 // ENDPOINT (registerLeadLeakRoutes):
 //   GET|POST /api/lp/lead-leak → measure now, return the summary. Never posts,
 //   never stores.
-// SCHEDULER (startLeadLeakScheduler): daily at 07:00 ET.
+// SCHEDULERS: startLeadLeakScheduler — daily at 07:00 ET;
+//   startLeadUncalledScheduler — hourly, CALL_CENTER_OPEN_HOUR…CLOSE ET.
 
 import { runSQL as defaultRunSQL } from '../admin/supabase-admin.js';
+import { hlRunSQL as defaultHlRunSQL } from '../admin/hl-client.js';
 import defaultSupabase from '../supabase.js';
 import {
   checkDncForNumbers as defaultCheckDnc,
   getContactRecords as defaultGetContactRecords,
 } from '../five9-admin.js';
 import { postToSlack as defaultPostToSlack, opsChannelId } from '../slack.js';
+import { reportAlertCondition as defaultReportAlertCondition } from '../alert-state.js';
 import { runJob } from '../job-runner.js';
 import { hourET, todayET } from './lp-report-common.js';
 import {
@@ -61,20 +78,43 @@ import {
   classifyUncalledLead, finalizeReason, buildRates, estimateValue,
   summarize, formatSlackSummary, LEAK_REASONS,
 } from '../lead-leak-classify.js';
+import {
+  lpLocalToUtcMs, etDay, firstCallAfter, creationCallMs, minutesToFirstCall, waitingMs,
+  dailySpeedRows, speedStats, CALL_CENTER_OPEN_HOUR, CALL_CENTER_CLOSE_HOUR,
+} from '../lead-speed.js';
+import {
+  buildIntakeCandidatesSql, classifyIntakeGap, summarizeIntakeGap, INTAKE_GRACE_HOURS,
+} from '../lead-intake-gap.js';
+import {
+  alertConfig, alertMode, shouldAlertSpeed, shouldAlertUncalled, shouldAlertIntakeGap,
+  verdictToActive, formatSpeedAlert, formatSpeedRecovered, formatUncalledAlert,
+  formatUncalledRecovered, formatIntakeGapAlert, formatIntakeGapRecovered, shiftDay,
+} from '../lead-speed-alerts.js';
 
 export const JOB_ID = 'lead-leak-monitor';
+export const UNCALLED_JOB_ID = 'lead-uncalled-check';
 export const TABLE = 'lead_leak_daily';
+export const SPEED_TABLE = 'lead_call_speed_daily';
+export const INTAKE_TABLE = 'lead_intake_gap_daily';
 export const MODES = Object.freeze(['off', 'shadow', 'live']);
 const RUN_HOUR_ET = 7;
-const DAY_MS = 24 * 60 * 60 * 1000;
+const HOUR_MS = 60 * 60 * 1000;
+const DAY_MS = 24 * HOUR_MS;
 const LEAD_CHUNK = 500;   // ≤500 leads per query — the handoff's ceiling
 const DNC_BATCH = 200;    // five9_check_dnc's own cap
 const WRITE_BATCH = 500;
 const RATE_WINDOW_DAYS = 180;
+// The hourly "waiting right now" pass only needs the last two days of leads.
+const UNCALLED_WINDOW_DAYS = 2;
 // Stop asking Five9 after this many lookups fail in a row: an auth breaker or
 // an outage would otherwise cost ~300 doomed SOAP calls. The rest go
 // `unverified`, which is the honest label.
 const MAX_CONSECUTIVE_LOOKUP_ERRORS = 5;
+// Reminders while an alarm stands. The waiting-leads card repeats every few
+// hours because new leads join it; the other two are once-a-day problems.
+const REMIND_SPEED_MS = 24 * HOUR_MS;
+const REMIND_INTAKE_MS = 24 * HOUR_MS;
+const REMIND_UNCALLED_MS = 3 * HOUR_MS;
 
 /* --- config, read per pass ---------------------------------------------- */
 
@@ -94,8 +134,10 @@ export function leadLeakConfig(env = process.env) {
     mode: leadLeakMode(env),
     windowDays: positiveInt(env.LEAD_LEAK_WINDOW_DAYS, 60),
     lookupCap: positiveInt(env.LEAD_LEAK_FIVE9_LOOKUP_CAP, 300),
+    intakeDays: positiveInt(env.LEAD_INTAKE_WINDOW_DAYS, 30),
     // Blank → the ops channel the other monitors report to.
     slackChannel: String(env.LEAD_LEAK_SLACK_CHANNEL ?? '').trim() || opsChannelId(),
+    dashboardUrl: String(env.LEAD_LEAK_DASHBOARD_URL ?? '').trim() || null,
   };
 }
 
@@ -107,15 +149,25 @@ const asRows = (res, what) => {
   return res;
 };
 
+/** Append ascending times into a Map entry. Sorted once at the end. */
+function addTimes(map, key, times) {
+  const list = map.get(key) || [];
+  for (const t of times || []) {
+    const ms = Date.parse(t);
+    if (Number.isFinite(ms)) list.push(ms);
+  }
+  if (list.length) map.set(key, list);
+}
+
 /**
- * Five9 disposition history, one day-slice at a time (see header).
- *   keys   — Set of LDS lp_rec_keys ('LDS' || lp_lead_id)
- *   phones — Map normalized dnis/ani → end of the latest slice it appeared in,
- *            from EVERY event. INQ-keyed events (most of them) cannot be tied
- *            to a lead by key, so their phone is the only link. The time is
- *            what lets wasCalled ignore a dial that happened before the lead
- *            existed; a slice end is at or after the real call, so the error is
- *            at most a day and always toward "called", never toward a leak.
+ * Five9 disposition history, one day-slice at a time (see header), as CALL
+ * TIMES — not just "was it ever dialled", because the dashboard and the speed
+ * alarm need "when":
+ *   keys   — Map 'LDS<lp_lead_id>' → ascending call times (ms)
+ *   phones — Map phone10 → ascending call times (ms), from EVERY event.
+ *            INQ-keyed events (most of them) cannot be tied to a lead by key,
+ *            so their phone is the only link.
+ * A call's time is call_start_at (real UTC), falling back to received_at.
  * Also returns when the Five9 record starts, so the universe can be clamped:
  * a lead older than the record cannot be judged either way.
  */
@@ -126,32 +178,44 @@ export async function readFive9History({ runSQL, windowDays, nowMs }) {
   const firstAt = first?.first_at ? Date.parse(first.first_at) : NaN;
   if (!Number.isFinite(firstAt)) throw new Error('five9_events_raw holds no disposition events');
 
-  const keys = new Set();
+  const keys = new Map();
   const phones = new Map();
   const startMs = Math.max(nowMs - windowDays * DAY_MS, firstAt);
   for (let from = startMs; from < nowMs; from += DAY_MS) {
     const to = Math.min(from + DAY_MS, nowMs);
     const [row] = asRows(await runSQL(`
-      SELECT array_agg(DISTINCT lp_rec_key) FILTER (WHERE lp_rec_key LIKE 'LDS%') AS keys,
-             array_agg(DISTINCT dnis) FILTER (WHERE dnis IS NOT NULL) AS dnis,
-             array_agg(DISTINCT ani)  FILTER (WHERE ani  IS NOT NULL) AS ani
-        FROM five9_events_raw
-       WHERE event_type = 'disposition'
-         AND received_at >= '${new Date(from).toISOString()}'
-         AND received_at <  '${new Date(to).toISOString()}'
+      WITH s AS (
+        SELECT lp_rec_key, dnis, ani, coalesce(call_start_at, received_at) AS t
+          FROM five9_events_raw
+         WHERE event_type = 'disposition'
+           AND received_at >= '${new Date(from).toISOString()}'
+           AND received_at <  '${new Date(to).toISOString()}'
+      )
+      SELECT
+        (SELECT json_agg(json_build_array(k, ts)) FROM (
+           SELECT lp_rec_key AS k, array_agg(DISTINCT t ORDER BY t) AS ts
+             FROM s WHERE lp_rec_key LIKE 'LDS%' GROUP BY 1) a) AS keys,
+        (SELECT json_agg(json_build_array(p, ts)) FROM (
+           SELECT p, array_agg(DISTINCT t ORDER BY t) AS ts FROM (
+             SELECT dnis AS p, t FROM s WHERE dnis IS NOT NULL
+             UNION ALL
+             SELECT ani, t FROM s WHERE ani IS NOT NULL) x
+            GROUP BY p) b) AS phones
     `), 'five9 day slice');
-    for (const k of row?.keys || []) keys.add(String(k).trim());
-    for (const raw of [...(row?.dnis || []), ...(row?.ani || [])]) {
+    for (const [k, ts] of row?.keys || []) addTimes(keys, String(k).trim(), ts);
+    for (const [raw, ts] of row?.phones || []) {
       const p = normalizePhone10(raw);
-      if (p) phones.set(p, to); // slices run oldest first, so the last write is the latest
+      if (p) addTimes(phones, p, ts);
     }
   }
+  for (const list of keys.values()) list.sort((a, b) => a - b);
+  for (const list of phones.values()) list.sort((a, b) => a - b);
   return { keys, phones, firstAt };
 }
 
 async function readUniverse({ runSQL, sinceMs }) {
   return asRows(await runSQL(`
-    SELECT lp_lead_id, lp_prospect_id, phone, lead_source, disposition_code,
+    SELECT lp_lead_id, lp_prospect_id, first_name, last_name, phone, lead_source, disposition_code,
            call_count, appointment_set, closed_won, created_at_lp, updated_at_lp
       FROM lp_leads
      WHERE created_at_lp >= '${new Date(sinceMs).toISOString()}'
@@ -160,11 +224,28 @@ async function readUniverse({ runSQL, sinceMs }) {
 }
 
 /**
+ * lp_leads rows for these phones, chunked at 500 against idx_lp_leads_phone10 —
+ * the expression below must stay byte-identical to that index or it seq-scans
+ * 240k rows.
+ */
+async function readLeadsByPhone({ runSQL, phones, what }) {
+  const out = [];
+  for (let i = 0; i < phones.length; i += LEAD_CHUNK) {
+    const chunk = phones.slice(i, i + LEAD_CHUNK);
+    out.push(...asRows(await runSQL(`
+      SELECT lp_lead_id, created_at_lp,
+             right(regexp_replace(coalesce(phone, ''::text), '[^0-9]'::text, ''::text, 'g'::text), 10) AS phone10
+        FROM lp_leads
+       WHERE right(regexp_replace(coalesce(phone, ''::text), '[^0-9]'::text, ''::text, 'g'::text), 10) IN (${sqlList(chunk)})
+    `), what));
+  }
+  return out;
+}
+
+/**
  * Phones an uncalled lead shares with ANOTHER lp_leads row that Five9 did
  * dial — typically an earlier lead for the same household, dialled before this
- * one arrived. Chunked at 500 phones against idx_lp_leads_phone10 — the
- * expression below must stay byte-identical to that index or it seq-scans 240k
- * rows.
+ * one arrived.
  */
 async function readDupCalledPhones({ runSQL, uncalled, five9 }) {
   const byPhone = new Map();
@@ -172,22 +253,13 @@ async function readDupCalledPhones({ runSQL, uncalled, five9 }) {
     const p = normalizePhone10(l.phone);
     if (p) byPhone.set(p, (byPhone.get(p) || new Set()).add(String(l.lp_lead_id)));
   }
-  const phones = [...byPhone.keys()];
+  const rows = await readLeadsByPhone({ runSQL, phones: [...byPhone.keys()], what: 'duplicate check' });
   const dup = new Set();
-  for (let i = 0; i < phones.length; i += LEAD_CHUNK) {
-    const chunk = phones.slice(i, i + LEAD_CHUNK);
-    const rows = asRows(await runSQL(`
-      SELECT lp_lead_id, created_at_lp,
-             right(regexp_replace(coalesce(phone, ''::text), '[^0-9]'::text, ''::text, 'g'::text), 10) AS phone10
-        FROM lp_leads
-       WHERE right(regexp_replace(coalesce(phone, ''::text), '[^0-9]'::text, ''::text, 'g'::text), 10) IN (${sqlList(chunk)})
-    `), 'duplicate check');
-    for (const r of rows) {
-      const own = byPhone.get(r.phone10);
-      if (!own || own.has(String(r.lp_lead_id))) continue;
-      const sibling = { lp_lead_id: r.lp_lead_id, phone: r.phone10, created_at_lp: r.created_at_lp };
-      if (wasCalled(sibling, { five9Keys: five9.keys, five9Phones: five9.phones })) dup.add(r.phone10);
-    }
+  for (const r of rows) {
+    const own = byPhone.get(r.phone10);
+    if (!own || own.has(String(r.lp_lead_id))) continue;
+    const sibling = { lp_lead_id: r.lp_lead_id, phone: r.phone10, created_at_lp: r.created_at_lp };
+    if (wasCalled(sibling, { five9Keys: five9.keys, five9Phones: five9.phones })) dup.add(r.phone10);
   }
   return dup;
 }
@@ -227,23 +299,65 @@ async function lookupFive9Contact(getContactRecords, phone) {
   }
 }
 
+/**
+ * GHL contacts that never became an LP lead (src/lead-intake-gap.js). Throws
+ * on a failed read — the caller turns that into "could not tell", never 0.
+ */
+async function readIntakeGap({ runSQL, hlRunSQL, five9, nowMs, days, runDate }) {
+  const sinceIso = new Date(Math.max(nowMs - days * DAY_MS, five9.firstAt)).toISOString();
+  const untilIso = new Date(nowMs - INTAKE_GRACE_HOURS * HOUR_MS).toISOString();
+  const candidates = asRows(await hlRunSQL(buildIntakeCandidatesSql({ sinceIso, untilIso })), 'hl contacts');
+  const phones = [...new Set(candidates.map((c) => normalizePhone10(c.phone)).filter(Boolean))];
+  const lpRows = await readLeadsByPhone({ runSQL, phones, what: 'intake lp check' });
+  const lpPhones = new Set(lpRows.map((r) => r.phone10));
+  return candidates
+    .map((c) => ({ c, phone10: normalizePhone10(c.phone) }))
+    .filter(({ phone10 }) => phone10)
+    .map(({ c, phone10 }) => ({
+      run_date: runDate,
+      ghl_contact_id: String(c.ghl_contact_id),
+      first_name: c.first_name ?? null,
+      last_name: c.last_name ?? null,
+      phone10,
+      source: c.source ?? null,
+      date_added: c.date_added ?? null,
+      class: classifyIntakeGap(
+        { phone10, addedMs: Date.parse(c.date_added ?? '') },
+        { lpPhones, five9Phones: five9.phones },
+      ),
+    }));
+}
+
 /* --- the measurement ---------------------------------------------------- */
 
 /**
  * Measure, classify and price. Never throws. Returns
- *   { verdict, rows, summary, errors, ... }
+ *   { verdict, rows, summary, speed, intake, offenders, errors, ... }
  * where verdict is 'leaks_found' | 'no_leaks' | 'insufficient_evidence'.
+ *
+ * opts (the hourly pass narrows these):
+ *   windowDays  override LEAD_LEAK_WINDOW_DAYS
+ *   lookups     false → skip Five9 contact lookups (open leads read `unverified`)
+ *   rates       false → skip the close-rate read ($ stays blank)
+ *   intake      false → skip the never-reached-LP check
  */
-export async function measureLeadLeak({ env = process.env, nowMs = Date.now(), deps = {} } = {}) {
+export async function measureLeadLeak({ env = process.env, nowMs = Date.now(), deps = {}, opts = {} } = {}) {
   const runSQL = deps.runSQL || defaultRunSQL;
+  const hlRunSQL = deps.hlRunSQL || defaultHlRunSQL;
   const checkDnc = deps.checkDnc || defaultCheckDnc;
   const getContactRecords = deps.getContactRecords || defaultGetContactRecords;
-  const { windowDays, lookupCap } = leadLeakConfig(env);
+  const cfg = leadLeakConfig(env);
+  const windowDays = opts.windowDays ?? cfg.windowDays;
+  const lookupCap = opts.lookups === false ? 0 : cfg.lookupCap;
+  const acfg = alertConfig(env);
   const runDate = todayET(new Date(nowMs));
   const errors = [];
   const insufficient = (stage, err) => {
     errors.push(`${stage}: ${err.message}`);
-    return { verdict: 'insufficient_evidence', runDate, windowDays, rows: [], summary: null, errors };
+    return {
+      verdict: 'insufficient_evidence', runDate, windowDays, rows: [], summary: null,
+      speed: null, intake: null, offenders: null, errors,
+    };
   };
 
   let five9;
@@ -257,7 +371,14 @@ export async function measureLeadLeak({ env = process.env, nowMs = Date.now(), d
     leads = await readUniverse({ runSQL, sinceMs });
   } catch (err) { return insufficient('lp_leads', err); }
 
-  const uncalled = leads.filter((l) => !wasCalled(l, { five9Keys: five9.keys, five9Phones: five9.phones }));
+  // One definition of "called", and its time: the first Five9 call on the
+  // lead's LDS key or phone at or after it really existed (src/lead-speed.js).
+  const tctx = { five9Keys: five9.keys, five9Phones: five9.phones };
+  const timing = leads.map((lead) => {
+    const who = { leadId: lead.lp_lead_id, phone10: normalizePhone10(lead.phone), createdAtLp: lead.created_at_lp };
+    return { lead, firstCallMs: firstCallAfter(who, tctx), liveCallMs: creationCallMs(who, tctx) };
+  });
+  const uncalled = timing.filter((t) => t.firstCallMs === null && t.liveCallMs === null).map((t) => t.lead);
 
   let dupCalledPhones;
   try {
@@ -265,7 +386,7 @@ export async function measureLeadLeak({ env = process.env, nowMs = Date.now(), d
   } catch (err) { return insufficient('duplicate check', err); }
 
   // DNC only where it could change the answer: not already decided by its
-  // codes (NIS, NoRehash, progressed), not already LP-DNC, with a usable phone.
+  // codes (NIS, NOC, NoRehash, progressed), not already LP-DNC, with a phone.
   const dncCandidates = [...new Set(uncalled
     .filter((l) => needsDncCheck(l, nowMs))
     .map((l) => normalizePhone10(l.phone)))];
@@ -275,10 +396,12 @@ export async function measureLeadLeak({ env = process.env, nowMs = Date.now(), d
   } catch (err) { return insufficient('five9 dnc', err); }
 
   let rates = null;
-  try {
-    rates = await readRates({ runSQL, nowMs });
-  } catch (err) {
-    errors.push(`close rates: ${err.message}`); // counts stay true; $ goes blank
+  if (opts.rates !== false) {
+    try {
+      rates = await readRates({ runSQL, nowMs });
+    } catch (err) {
+      errors.push(`close rates: ${err.message}`); // counts stay true; $ goes blank
+    }
   }
 
   // Classify. `uncalled` is newest first, so the capped Five9 lookups spend
@@ -297,10 +420,11 @@ export async function measureLeadLeak({ env = process.env, nowMs = Date.now(), d
         lookup = await lookupFive9Contact(getContactRecords, normalizePhone10(lead.phone));
         if (lookup === 'error') { lookupErrors += 1; consecutiveErrors += 1; } else consecutiveErrors = 0;
       } else {
-        lookup = 'over_cap';
+        lookup = lookupCap === 0 ? 'skipped' : 'over_cap';
       }
       reason = finalizeReason(lookup);
     }
+    const createdMs = lpLocalToUtcMs(lead.created_at_lp);
     rows.push({
       run_date: runDate,
       lp_lead_id: String(lead.lp_lead_id),
@@ -310,8 +434,12 @@ export async function measureLeadLeak({ env = process.env, nowMs = Date.now(), d
       reason,
       est_value: rates ? estimateValue(lead, reason, rates) : null,
       detail: {
+        first_name: lead.first_name ?? null,
+        last_name: lead.last_name ?? null,
         phone10: normalizePhone10(lead.phone),
         created_at_lp: lead.created_at_lp ?? null,
+        // The real instant (LP's digits are Eastern), for age on the dashboard.
+        created_utc: createdMs == null ? null : new Date(createdMs).toISOString(),
         lp_call_count: lead.call_count ?? null,
         ...(reason === 'rep_hold' || reason === 'rep_hold_expired'
           ? { hold_started: lead.updated_at_lp ?? null, ...(holdDateUnknown(lead) ? { hold_date_unknown: true } : {}) }
@@ -321,6 +449,57 @@ export async function measureLeadLeak({ env = process.env, nowMs = Date.now(), d
     });
   }
   if (lookupErrors) errors.push(`five9 contact lookup: ${lookupErrors} failed (marked unverified)`);
+
+  // Time to first call, per lead. `expected` = the lead was owed a call: it
+  // got one, or it is uncalled for a leak reason. An uncalled DNC, rep-hold,
+  // "Data" or already-booked lead was never owed one and would only make the
+  // numbers look worse than the floor is (classify before you threshold).
+  const reasonById = new Map(rows.map((r) => [r.lp_lead_id, r.reason]));
+  // A lead created during a live call never waited, so it is left out of the
+  // speed numbers altogether (src/lead-speed.js, CREATION_CALL_WINDOW_MIN).
+  const speedItems = timing.filter((t) => t.liveCallMs === null).map(({ lead, firstCallMs }) => {
+    const createdMs = lpLocalToUtcMs(lead.created_at_lp);
+    const minutes = minutesToFirstCall(lead.created_at_lp, firstCallMs);
+    const waited = waitingMs(lead.created_at_lp, nowMs);
+    return {
+      createdDay: createdMs == null ? null : etDay(createdMs),
+      minutes,
+      expected: firstCallMs !== null || LEAK_REASONS.includes(reasonById.get(String(lead.lp_lead_id))),
+      settled24h: (minutes != null && minutes <= 24 * 60) || (waited != null && waited >= DAY_MS),
+    };
+  });
+  const last7Start = shiftDay(runDate, -7);
+  const prior28Start = shiftDay(last7Start, -28);
+  const inDays = (from, to) => speedItems.filter((i) => i.createdDay >= from && i.createdDay < to);
+  const speed = {
+    // The window's first day is partial (it starts mid-day); drop it.
+    daily: dailySpeedRows(speedItems).filter((d) => d.created_day > etDay(sinceMs)),
+    last7: speedStats(inDays(last7Start, runDate)),
+    prior28: speedStats(inDays(prior28Start, last7Start)),
+    decision: shouldAlertSpeed({ leads: speedItems, todayDay: runDate }, acfg),
+  };
+
+  // Owed leads waiting past the grace with no Five9 call — named on the cards.
+  const offenders = rows
+    .filter((r) => LEAK_REASONS.includes(r.reason))
+    .map((r) => ({ ...r.detail, lead_source: r.lead_source, reason: r.reason, lp_lead_id: r.lp_lead_id,
+      waitingMs: waitingMs(r.detail.created_at_lp, nowMs) }))
+    .filter((o) => o.waitingMs != null && o.waitingMs > acfg.graceHours * HOUR_MS)
+    .sort((a, b) => b.waitingMs - a.waitingMs);
+
+  // GHL contacts that never reached LP. Its own three-way: a failed HL read
+  // leaves `intake` null (could not tell), and never blocks the leak counts.
+  let intake = null;
+  if (opts.intake !== false) {
+    try {
+      const gapRows = await readIntakeGap({
+        runSQL, hlRunSQL, five9, nowMs, days: Math.min(cfg.intakeDays, windowDays), runDate,
+      });
+      intake = { rows: gapRows, summary: summarizeIntakeGap(gapRows) };
+    } catch (err) {
+      errors.push(`intake gap: ${err.message}`);
+    }
+  }
 
   // Over the whole window, called or not: a retired code in use is a hygiene
   // problem wherever it appears.
@@ -333,39 +512,60 @@ export async function measureLeadLeak({ env = process.env, nowMs = Date.now(), d
     since: new Date(sinceMs).toISOString(),
     universe: leads.length,
     called: leads.length - uncalled.length,
+    created_on_live_call: timing.filter((t) => t.liveCallMs !== null).length,
     five9: { keys: five9.keys.size, phones: five9.phones.size, first_event_at: new Date(five9.firstAt).toISOString() },
     lookups: { made: lookups, cap: lookupCap, failed: lookupErrors },
     revenueAvailable: !!rates,
     rows,
     summary,
+    speed,
+    intake,
+    offenders,
     errors,
   };
 }
 
 /* --- store + report ----------------------------------------------------- */
 
-/** Upsert the day's rows. A same-day rerun overwrites. Asserts the row count (CLAUDE.md). */
-async function storeRows(db, rows) {
+/** Upsert rows in batches, asserting the row count (CLAUDE.md). */
+async function upsertRows(db, table, rows, onConflict) {
   let written = 0;
   for (let i = 0; i < rows.length; i += WRITE_BATCH) {
     const batch = rows.slice(i, i + WRITE_BATCH);
-    const { error, count } = await db.from(TABLE)
-      .upsert(batch, { onConflict: 'run_date,lp_lead_id', count: 'exact' });
-    if (error) throw new Error(`${TABLE} write: ${error.message}`);
+    const { error, count } = await db.from(table).upsert(batch, { onConflict, count: 'exact' });
+    if (error) throw new Error(`${table} write: ${error.message}`);
     if (typeof count === 'number' && count !== batch.length) {
-      throw new Error(`${TABLE} write: expected ${batch.length} rows, wrote ${count}`);
+      throw new Error(`${table} write: expected ${batch.length} rows, wrote ${count}`);
     }
     written += batch.length;
   }
   return written;
 }
 
-/** One scheduled pass. Returns the runJob verdict shape. */
+/**
+ * Deliver one alarm by mode. off → nothing; shadow → log the card it WOULD
+ * send; live → reportAlertCondition (edge-triggered, channel 'ops'). A verdict
+ * of insufficient_evidence is `active: null` — touch nothing.
+ */
+async function deliverAlert({ mode, report, key, label, verdict, text, recoveredText, remindMs, detail }) {
+  if (mode === 'off') return { action: 'off' };
+  const active = verdictToActive(verdict);
+  if (mode === 'shadow') {
+    if (active === true) console.log(`[LeadLeak] shadow alert ${key} — would send:\n${typeof text === 'function' ? text() : text}`);
+    return { action: active === true ? 'shadow_would_fire' : 'shadow_quiet' };
+  }
+  return report({ key, active, label, channel: 'ops', remindMs, text, recoveredText, detail });
+}
+
+/** One scheduled daily pass. Returns the runJob verdict shape. */
 export async function runLeadLeakMonitor({ env = process.env, nowMs = Date.now(), deps = {} } = {}) {
   const cfg = leadLeakConfig(env);
   if (cfg.mode === 'off') return { skipped: true, reason: 'LEAD_LEAK_MONITOR_MODE=off' };
   const db = deps.supabase || defaultSupabase;
   const send = deps.postToSlack || defaultPostToSlack;
+  const report = deps.reportAlertCondition || defaultReportAlertCondition;
+  const aMode = alertMode(env);
+  const acfg = alertConfig(env);
 
   const m = await measureLeadLeak({ env, nowMs, deps });
   if (m.verdict === 'insufficient_evidence') {
@@ -378,15 +578,48 @@ export async function runLeadLeakMonitor({ env = process.env, nowMs = Date.now()
   const errors = [...m.errors];
   let stored = 0;
   try {
-    stored = await storeRows(db, m.rows);
+    stored = await upsertRows(db, TABLE, m.rows, 'run_date,lp_lead_id');
   } catch (err) {
     errors.push(err.message);
   }
+  try {
+    await upsertRows(db, SPEED_TABLE,
+      m.speed.daily.map((d) => ({ ...d, updated_at: new Date(nowMs).toISOString() })), 'created_day');
+  } catch (err) {
+    errors.push(err.message);
+  }
+  if (m.intake) {
+    try {
+      await upsertRows(db, INTAKE_TABLE, m.intake.rows, 'run_date,ghl_contact_id');
+    } catch (err) {
+      errors.push(err.message);
+    }
+  }
+
+  // Alarms: time to first call getting worse, and GHL leads that never
+  // reached LP. The waiting-leads alarm is the hourly pass's job.
+  const speedDecision = m.speed.decision;
+  await deliverAlert({
+    mode: aMode, report, key: 'lead_speed_slow', label: 'Time to first call',
+    verdict: speedDecision.verdict, remindMs: REMIND_SPEED_MS,
+    text: () => formatSpeedAlert(speedDecision, m.offenders, { cfg: acfg, dashboardUrl: cfg.dashboardUrl }),
+    recoveredText: () => formatSpeedRecovered(speedDecision),
+    detail: JSON.stringify({ recent: speedDecision.recent, baseline: speedDecision.baseline }),
+  });
+  const intakeDecision = shouldAlertIntakeGap(m.intake?.rows ?? null, { readOk: !!m.intake });
+  await deliverAlert({
+    mode: aMode, report, key: 'lead_intake_gap', label: 'Leads never reached LP',
+    verdict: intakeDecision.verdict, remindMs: REMIND_INTAKE_MS,
+    text: () => formatIntakeGapAlert(intakeDecision.missing, { cfg: acfg, dashboardUrl: cfg.dashboardUrl }),
+    recoveredText: formatIntakeGapRecovered,
+    detail: `missing=${intakeDecision.count}`,
+  });
 
   let posted = false;
   if (cfg.mode === 'live') {
     const text = formatSlackSummary({
       runDate: m.runDate, windowDays: m.windowDays, summary: m.summary, revenueAvailable: m.revenueAvailable,
+      speed: m.speed, intake: m.intake?.summary ?? null, dashboardUrl: cfg.dashboardUrl,
     });
     const res = await send(text, cfg.slackChannel);
     posted = !!res?.ok;
@@ -400,12 +633,14 @@ export async function runLeadLeakMonitor({ env = process.env, nowMs = Date.now()
   const line = `real_leaks=${m.summary.real_leaks} est_at_risk=$${m.summary.est_value_at_risk}`
     + ` progressed=${b.already_progressed.leads}+${b.already_progressed_flag.leads}flag data=${b.data_undecided.leads}`
     + ` not_issued=${b.not_issued_call_center.leads} not_covered=${b.not_covered_by_rep.leads} hold=${b.rep_hold.leads}/${b.rep_hold_expired.leads}expired`
-    + ` uncalled=${m.summary.uncalled}/${m.universe} stored=${stored}`;
+    + ` uncalled=${m.summary.uncalled}/${m.universe} stored=${stored}`
+    + ` median_first_call_7d=${m.speed.last7.median_min ?? '?'}m speed=${speedDecision.verdict}`
+    + ` never_reached_lp=${m.intake ? m.intake.summary.not_in_lp : '?'}`;
   console.log(`[LeadLeak] ${cfg.mode} ${m.verdict} — ${line}${posted ? ' posted' : ''}`);
 
   // Only a failed WRITE or a failed live POST is this job failing. The
-  // lookup and close-rate notes are degradations it already labelled.
-  const hardFailure = errors.some((e) => e.startsWith(`${TABLE} write`) || e.startsWith('slack:'));
+  // lookup, close-rate and intake notes are degradations it already labelled.
+  const hardFailure = errors.some((e) => / write: /.test(e) || e.startsWith('slack:'));
   return {
     ok: !hardFailure,
     mode: cfg.mode,
@@ -415,6 +650,36 @@ export async function runLeadLeakMonitor({ env = process.env, nowMs = Date.now()
     posted,
     ...(hardFailure ? { errors } : { notes: errors }),
   };
+}
+
+/**
+ * The hourly pass: owed leads from the last two days that have waited more
+ * than the grace (call-center hours) with no Five9 call. No Five9 contact
+ * lookups, no $, no storage — just the named card.
+ */
+export async function runLeadUncalledCheck({ env = process.env, nowMs = Date.now(), deps = {} } = {}) {
+  const aMode = alertMode(env);
+  if (aMode === 'off') return { skipped: true, reason: 'LEAD_LEAK_ALERT_MODE=off' };
+  const report = deps.reportAlertCondition || defaultReportAlertCondition;
+  const cfg = leadLeakConfig(env);
+  const acfg = alertConfig(env);
+
+  const m = await measureLeadLeak({
+    env, nowMs, deps, opts: { windowDays: UNCALLED_WINDOW_DAYS, lookups: false, rates: false, intake: false },
+  });
+  const decision = shouldAlertUncalled(m.offenders, { readOk: m.verdict !== 'insufficient_evidence' });
+  const res = await deliverAlert({
+    mode: aMode, report, key: 'lead_uncalled_fresh', label: 'Leads waiting with no call',
+    verdict: decision.verdict, remindMs: REMIND_UNCALLED_MS,
+    text: () => formatUncalledAlert(m.offenders, { cfg: acfg, dashboardUrl: cfg.dashboardUrl }),
+    recoveredText: formatUncalledRecovered,
+    detail: `waiting=${decision.count}`,
+  });
+  console.log(`[LeadLeak] uncalled check ${aMode} ${decision.verdict} — waiting=${decision.count ?? '?'} (${res?.action})`);
+  if (decision.verdict === 'insufficient_evidence') {
+    return { checked: false, readFailed: true, reason: m.errors.join('; ') };
+  }
+  return { ok: true, mode: aMode, verdict: decision.verdict, summary: `waiting=${decision.count} ${res?.action}` };
 }
 
 /* --- endpoint ----------------------------------------------------------- */
@@ -435,10 +700,12 @@ export function registerLeadLeakRoutes(app) {
     try {
       const m = await guarded(() => measureLeadLeak());
       if (m.busy) return res.status(409).json({ ok: false, error: 'a lead-leak pass is already running' });
-      const { rows, ...rest } = m;
+      const { rows, intake, offenders, ...rest } = m;
       res.json({
         ok: m.verdict !== 'insufficient_evidence',
         ...rest,
+        intake: intake ? { summary: intake.summary, missing: intake.rows.filter((r) => r.class === 'not_in_lp') } : null,
+        waiting: offenders ? offenders.slice(0, 50) : null,
         // A short sample of the real leaks, newest first — the full list is in
         // lead_leak_daily after a scheduled pass.
         sample: rows.filter((r) => LEAK_REASONS.includes(r.reason)).slice(0, 25),
@@ -452,10 +719,10 @@ export function registerLeadLeakRoutes(app) {
   console.log('[LeadLeak] Route registered: GET+POST /api/lp/lead-leak');
 }
 
-/* --- scheduler — daily at 07:00 ET -------------------------------------- */
+/* --- schedulers --------------------------------------------------------- */
 // Same 5-minute tick as the other daily monitors. The WORK is wrapped in
-// runJob, not the tick (docs/job-runs.md), and the ET date is the occurrence
-// key so a second replica cannot run the same morning twice.
+// runJob, not the tick (docs/job-runs.md), and the occurrence key (ET date,
+// or ET date + hour) stops a second replica running the same slot twice.
 let timer = null;
 let lastRunDate = null;
 
@@ -482,4 +749,34 @@ export function startLeadLeakScheduler() {
 
 export function stopLeadLeakScheduler() {
   if (timer) { clearInterval(timer); timer = null; }
+}
+
+let uncalledTimer = null;
+let lastUncalledSlot = null;
+
+export function startLeadUncalledScheduler() {
+  if (uncalledTimer) return;
+  if (alertMode() === 'off') {
+    console.log('[LeadLeak] uncalled check disabled (LEAD_LEAK_ALERT_MODE=off)');
+    return;
+  }
+  console.log(`[LeadLeak] Uncalled check started — hourly ${CALL_CENTER_OPEN_HOUR}:00–${CALL_CENTER_CLOSE_HOUR}:00 ET (mode=${alertMode()})`);
+  const checkAndRun = async () => {
+    const hour = hourET();
+    if (hour < CALL_CENTER_OPEN_HOUR || hour >= CALL_CENTER_CLOSE_HOUR) return;
+    const slot = `${todayET()}T${String(hour).padStart(2, '0')}`;
+    if (lastUncalledSlot === slot) return;
+    lastUncalledSlot = slot;
+    try {
+      await runJob(UNCALLED_JOB_ID, () => guarded(() => runLeadUncalledCheck())
+        .then((r) => (r?.busy ? { skipped: true, reason: 'another lead-leak pass was running' } : r)), { occurrence: slot });
+    } catch (err) {
+      console.error('[LeadLeak] uncalled check failed:', err.message);
+    }
+  };
+  uncalledTimer = setInterval(checkAndRun, 5 * 60 * 1000);
+}
+
+export function stopLeadUncalledScheduler() {
+  if (uncalledTimer) { clearInterval(uncalledTimer); uncalledTimer = null; }
 }

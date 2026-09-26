@@ -433,7 +433,7 @@ test('13. missing tables → { ok:false } plus an ops note, no throw', async () 
   assert.equal(out.ok, false);
   assert.equal(out.reason, 'tables_missing');
   assert.equal(rec.notes.length, 1);
-  assert.match(rec.notes[0], /sql\/131/);
+  assert.match(rec.notes[0], /sql\/132/);
   assert.equal(rec.posts.length, 0);
 });
 

@@ -59,20 +59,20 @@ test('key build: lead 600001 → LDS600001 — the LEAD id, not INQ || prospect'
   assert.equal(leadKey(600001), 'LDS600001');
   assert.equal(leadKey('600001'), 'LDS600001');
   assert.equal(leadKey(null), null);
-  const inqOnly = { five9Keys: new Set(['INQ423639']), five9Phones: new Map() };
+  const inqOnly = { five9Keys: new Map([['INQ423639', [Date.parse('2026-09-21T00:00:00Z')]]]), five9Phones: new Map() };
   assert.equal(wasCalled(lead(), inqOnly), false, 'an INQ key never marks a lead called');
 });
 
-test('called = LDS key match OR a phone sighting on/after the lead was created', () => {
-  const none = { five9Keys: new Set(), five9Phones: new Map() };
+test('called = LDS key match OR a phone call on/after the lead was created (Five9 times)', () => {
+  const none = { five9Keys: new Map(), five9Phones: new Map() };
   const after = Date.parse('2026-09-21T00:00:00Z');
   const before = Date.parse('2026-09-01T00:00:00Z');
   assert.equal(wasCalled(lead(), none), false);
-  assert.equal(wasCalled(lead(), { ...none, five9Keys: new Set(['LDS600001']) }), true);
-  assert.equal(wasCalled(lead(), { ...none, five9Phones: new Map([['3524453161', after]]) }), true);
-  assert.equal(wasCalled(lead({ phone: '+13524453161' }), { ...none, five9Phones: new Map([['3524453161', after]]) }), true);
+  assert.equal(wasCalled(lead(), { ...none, five9Keys: new Map([['LDS600001', [after]]]) }), true);
+  assert.equal(wasCalled(lead(), { ...none, five9Phones: new Map([['3524453161', [after]]]) }), true);
+  assert.equal(wasCalled(lead({ phone: '+13524453161' }), { ...none, five9Phones: new Map([['3524453161', [after]]]) }), true);
   // Dialled weeks before this lead existed — that was some earlier lead.
-  assert.equal(wasCalled(lead(), { ...none, five9Phones: new Map([['3524453161', before]]) }), false);
+  assert.equal(wasCalled(lead(), { ...none, five9Phones: new Map([['3524453161', [before]]]) }), false);
   // LP call_count is a hint only — it never makes a lead "called".
   assert.equal(wasCalled(lead({ call_count: 9 }), none), false);
 });
@@ -247,7 +247,12 @@ function stubSQL({ five9Fails = false, leads = [], keys = [], phones = [], sibli
       if (five9Fails) throw new Error('statement timeout');
       return [{ first_at: '2026-07-28T20:28:17Z' }];
     }
-    if (sql.includes('FROM five9_events_raw')) return [{ keys, dnis: phones, ani: [] }];
+    if (sql.includes('FROM five9_events_raw')) {
+      // The day-slice shape: [key|phone, [call times]]. Every call lands an
+      // hour before NOW — after every test lead was created.
+      const t = [new Date(NOW - 3600 * 1000).toISOString()];
+      return [{ keys: keys.map((k) => [k, t]), phones: phones.map((p) => [p, t]) }];
+    }
     if (sql.includes('GROUP BY 1')) return [{ source: 'Google PPC', leads: 100, won: 10, avg_value: 12000 }];
     if (sql.includes(' IN (')) return siblings;
     if (sql.includes('FROM lp_leads')) return leads;
@@ -259,15 +264,23 @@ function stubDb() {
   const writes = [];
   return {
     writes,
-    from: () => ({
-      upsert: async (batch) => { writes.push(...batch); return { error: null, count: batch.length }; },
-    }),
+    byTable: {},
+    from(table) {
+      return {
+        upsert: async (batch) => {
+          (this.byTable[table] ||= []).push(...batch);
+          if (table === 'lead_leak_daily') writes.push(...batch);
+          return { error: null, count: batch.length };
+        },
+      };
+    },
   };
 }
 
 test('failed Five9 read → insufficient_evidence, not "0 leaks"; nothing stored or posted', async () => {
   const deps = {
     runSQL: stubSQL({ five9Fails: true, leads: [lead()] }),
+    hlRunSQL: async () => [],
     checkDnc: async () => ({ on_dnc: [] }),
     getContactRecords: async () => ({ count: 1 }),
     supabase: stubDb(),
@@ -290,6 +303,7 @@ test('failed Five9 DNC read → insufficient_evidence (unknown DNC is never "cle
     env: {}, nowMs: NOW,
     deps: {
       runSQL: stubSQL({ leads: [lead()] }),
+      hlRunSQL: async () => [],
       checkDnc: async () => { throw new Error('Five9 auth breaker open'); },
       getContactRecords: async () => ({ count: 1 }),
     },
@@ -318,6 +332,7 @@ test('end to end: called leads drop out, the rest are labelled, capped lookups g
       phones: ['(352) 555-0002'],
       siblings: [{ lp_lead_id: '99', created_at_lp: '2026-08-01T00:00:00Z', phone10: '3525550008' }],
     }),
+    hlRunSQL: async () => [],
     checkDnc: async () => ({ on_dnc: [] }),
     getContactRecords: async ({ criteria }) => {
       lookedUp.push(criteria[0].value);
@@ -354,6 +369,7 @@ test('live posts once; a failed post is a failed pass, not a quiet morning', asy
   const sent = [];
   const deps = {
     runSQL: stubSQL({ leads: [lead()] }),
+    hlRunSQL: async () => [],
     checkDnc: async () => ({ on_dnc: [] }),
     getContactRecords: async () => ({ count: 1 }),
     supabase: stubDb(),

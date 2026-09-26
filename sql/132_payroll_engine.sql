@@ -1,5 +1,5 @@
 -- ════════════════════════════════════════════════════════════════════
--- sql/131 — Payroll Engine, Phase 1 (2026-09-26)
+-- sql/132 — Payroll Engine, Phase 1 (2026-09-26)
 --
 -- Run in the Supabase dashboard SQL editor, LP MCP instance, as ONE execution.
 -- Additive only: five new tables, one index, a seed. Nothing existing altered.
