@@ -1256,7 +1256,13 @@ function validateAnalysis(analysis) {
 // MAIN ENTRY POINT
 // ═══════════════════════════════════════════════════════════════════
 
-export async function analyzeMessage(ghlContactId, messageText, eventId = null, channel = null, messageId = null) {
+/**
+ * @param {object|null} inbound  2026-09-26 reply-timing provenance from the
+ *   caller: { event_id, received_at, webhook_received_at, event_created_at }
+ *   of the ghl.reply_received row this analysis answers. Carried onto the
+ *   ai.analysis_completed payload unchanged; null on legacy paths.
+ */
+export async function analyzeMessage(ghlContactId, messageText, eventId = null, channel = null, messageId = null, inbound = null) {
   if (!checkRateLimit()) {
     console.warn(`[MessageAnalyzer] Rate limit reached (${ANALYSIS_RATE_LIMIT}/hr). Skipping ${ghlContactId}`);
     return null;
@@ -1562,6 +1568,15 @@ export async function analyzeMessage(ghlContactId, messageText, eventId = null, 
         message_text: messageText,
         message_preview: messageText.slice(0, 100),
         analysis_duration_ms: Date.now() - startTime,
+        // 2026-09-26 (reply timing, scripts/reply-latency-report.js): where the
+        // inbound came from and when. The send handler reads these off
+        // sourceEventMeta.payload for t0/t1 of execution_result.timing. Null
+        // on paths that never carried them (the pending-replies poller).
+        inbound_event_id: inbound?.event_id ?? eventId ?? null,
+        inbound_received_at: inbound?.received_at ?? null,
+        inbound_webhook_received_at: inbound?.webhook_received_at ?? null,
+        inbound_event_created_at: inbound?.event_created_at ?? null,
+        analysis_completed_at: new Date().toISOString(),
         lp_data_available: context.lp?.matched || false,
         lp_fallback_used: context.lp?._fallback_used || false,
         // Quality Pass v1.0 Item 4 — effective appointment state (PR #485
@@ -1743,7 +1758,12 @@ export async function analyzePendingReplies({ limit = 10 } = {}) {
                          : (rawType.includes('live_chat') || rawType.includes('livechat') || rawType.includes('webchat')) ? 'livechat'
                          : rawType.includes('sms')   ? 'sms'
                          : null;
-    const result = await analyzeMessage(contactId, messageText, event.id, inboundChannel, event.payload?.message_id || null);
+    const result = await analyzeMessage(contactId, messageText, event.id, inboundChannel, event.payload?.message_id || null, {
+      event_id: event.id,
+      received_at: event.payload?.inbound_at || null,
+      webhook_received_at: event.payload?.webhook_received_at || null,
+      event_created_at: event.created_at || null,
+    });
     // 2026-07-03: the dedup sentinel ({skipped:true, reason:'recently_analyzed'})
     // is a terminal no-op — count it skipped, keep the consumed-message claim
     // (the message WAS handled by whoever analyzed it first).
@@ -1836,10 +1856,13 @@ export function registerMessageAnalyzerRoutes(app) {
     // channel through to analyzeMessage and onto ai.analysis_completed.
     // Null is safe — analyzer treats it as "unknown" and downstream
     // decision-engine v2.13 falls back to the rule template's channel.
-    const { contactId, message, channel, message_id } = req.body || {};
+    // 2026-09-26 (reply timing): `inbound` carries the reply event's id and
+    // receipt times across this HTTP hop so ai.analysis_completed can name
+    // them and the send handler can measure t0/t1 without a second query.
+    const { contactId, message, channel, message_id, inbound } = req.body || {};
     if (!contactId || !message) return res.status(400).json({ error: 'contactId and message required' });
     try {
-      const result = await analyzeMessage(contactId, message, null, channel || null, message_id || null);
+      const result = await analyzeMessage(contactId, message, null, channel || null, message_id || null, inbound || null);
       res.json(buildAnalyzeResponse(result));
     } catch (err) {
       res.status(500).json({ error: err.message });

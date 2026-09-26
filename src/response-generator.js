@@ -1094,7 +1094,10 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
     }
     parts.push(...P.signOffFooter(ident.signature));
   }
-  parts.push(channel === 'sms' ? P.SMS_CONSTRAINTS : P.EMAIL_CONSTRAINTS);
+  // 2026-09-26 — livechat is a short-message channel; before this it fell to
+  // the email constraints (the pipeline never generated for it, so nothing
+  // noticed). The live-chat fast lane does.
+  parts.push(channel === 'email' ? P.EMAIL_CONSTRAINTS : P.SMS_CONSTRAINTS);
 
   parts.push(...P.currentDateHeader(PROMPT_TIMEZONE));
   parts.push(...P.todayIs(formatTodayForPrompt(), formatTomorrowForPrompt()));
@@ -1855,7 +1858,9 @@ function salvageLeadingMessage(clean, jsonStart) {
   return out;
 }
 
-function parseJsonFromResponse(text) {
+// 2026-09-26 — exported for the live-chat fast lane, which parses the same
+// JSON object shape from its one merged call.
+export function parseJsonFromResponse(text) {
   let clean = text.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
 
   try {
@@ -2143,7 +2148,8 @@ function validateSendInfoEmailCompanion(cap, ca) {
 // loop: the block is the only place the model may take an appointment_id from,
 // so an id that isn't in it was invented. Omit it (or pass null) and id vetting
 // is skipped entirely — pre-2026-09-09 behavior.
-function validateResponse(parsed, channel, knownAppointments = null) {
+// 2026-09-26 — exported for the live-chat fast lane (same output contract).
+export function validateResponse(parsed, channel, knownAppointments = null) {
   const knownIds = knownAppointmentIdSet(knownAppointments);
   if (!parsed || typeof parsed !== 'object') return null;
   if (!parsed.message || typeof parsed.message !== 'string') return null;

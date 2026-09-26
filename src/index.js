@@ -316,6 +316,8 @@ import { startCiDiscoveryScheduler } from './jobs/ci-discovery-scheduler.js';
 import { logFfmpegStatus } from './ci/recordings.js';
 // ─── Agentic Hold-Complete (return-from-hold re-entry) ───────────
 import { registerHoldCompleteRoutes } from './agentic/hold-complete.js';
+// 2026-09-26 — website live chat answered synchronously (src/live-chat/).
+import { registerLiveChatRoutes } from './live-chat/index.js';
 // ─── FB Publish Watchdog (alert on missed WF4 publish window) ────
 import { startFbPublishWatchdog } from './fb-publish-watchdog.js';
 // ─── Five9 ESS Silence Watchdog (alert on a quiet Five9 feed) ────
@@ -2276,6 +2278,8 @@ registerDecisionEngineRoutes(app);
 registerActionExecutorRoutes(app);
 registerStateRoutes(app);
 registerHoldCompleteRoutes(app);
+// 2026-09-26 — POST /webhooks/live-chat-inbound, behind LIVE_CHAT_FAST_LANE_MODE (default off).
+registerLiveChatRoutes(app);
 
 // ─── Executor Heartbeat (failover for n8n cron) ──────────────────
 registerExecutorHeartbeatRoutes(app);
