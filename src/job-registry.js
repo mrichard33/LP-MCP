@@ -258,6 +258,18 @@ export const JOBS = Object.freeze([
     enabledDefault: true,
     isEnabled: (env) => String(env.LEAD_LEAK_MONITOR_MODE || 'shadow').toLowerCase().trim() !== 'off',
   },
+  {
+    id: 'lead-uncalled-check',
+    label: 'Leads waiting with no Five9 call',
+    group: 'five9',
+    cadence: 'hourly 08:00–20:00 ET',
+    enabledEnv: 'LEAD_LEAK_ALERT_MODE',
+    // A MODE (2026-09-26): off | shadow | live, default shadow. Shadow still
+    // runs every hour and logs the card it would send, so a silent shadow pass
+    // is a defect too. Mirrors alertMode() in src/lead-speed-alerts.js.
+    enabledDefault: true,
+    isEnabled: (env) => String(env.LEAD_LEAK_ALERT_MODE || 'shadow').toLowerCase().trim() !== 'off',
+  },
 ]);
 
 /** Ids only — handy for tests and for asserting the wiring matches the roster. */
