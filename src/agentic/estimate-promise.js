@@ -65,7 +65,10 @@ const HONEST_REFUSAL = [
   // "No, not a real one. Anyone who gives you a phone number is guessing"
   /\b(?:can'?t|cannot|can not|won'?t|not able to|no way to|impossible to)\s+(?:give|quote|price|do|get)\b/i,
   /\bnot\s+(?:a\s+)?real\s+(?:one|price|quote|number)\b/i,
-  /\b(?:is|would be|are)\s+guessing\b/i,
+  // Any talk of GUESSING is the language of refusing to give a number, never
+  // of offering one: "anyone who gives you a phone number is guessing", "a
+  // real conversation beats a guessed number".
+  /\bguess(?:ed|es|ing)?\b/i,
   // "pricing needs the in-home measurement", "we measure before we quote"
   /\b(?:needs?|requires?|takes?)\s+(?:the\s+)?(?:(?:in[-\s]?home|on[-\s]?site|actual)\s+)?(?:measurement|measuring|visit|appointment|assessment)\b/i,
   /\bbefore\s+we\s+(?:quote|price)\b/i,

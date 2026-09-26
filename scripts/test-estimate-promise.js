@@ -92,6 +92,8 @@ const CLEAN = [
   'No need to worry about the cost of the visit.',
   'There is no cost for the in-home visit.',
   'The assessment is no cost and no obligation.',
+  // Talk of GUESSING always refuses a number, never offers one.
+  'A real conversation on the phone beats a guessed number.',
 ];
 
 test('honest copy and scripted answers pass untouched', () => {
