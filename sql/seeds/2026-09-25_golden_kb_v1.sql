@@ -277,4 +277,39 @@ SET question_pattern = $$Does Reece repair old windows? | Can you just fix the w
     updated_at = now()
 WHERE id = 2 AND active = true;
 
+-- ── 4. Live-traffic corrections, 2026-09-26 ─────────────────────────────
+-- Read from the first live `mode = 'live'` FAQ turns. Both answers that went
+-- out were CORRECT, so nothing here is a customer-facing defect — but in both
+-- cases being right depended on the model overruling what retrieval handed it,
+-- which is a thin margin, not a design.
+
+-- 4a. A pure garage-door question lost to LIB-P09 ("yes, we do doors") by
+-- 0.015, because LIB-P10 led with the compound "shutters or garage doors"
+-- phrasing. The leading phrase dominates the vector (buildFaqEmbedText), so
+-- lead with what people actually type — same fix as LIB-P04 and #2 above.
+-- Verified: 0.635 (2nd, behind LIB-P09 0.651) -> 0.681 (1st, LIB-P09 0.651).
+-- Regression-checked: "Do you sell hurricane shutters?" still lands here
+-- (0.725), and LIB-P09 still wins "Do you sell doors?" (0.701) and
+-- "Do you do patio doors?" (0.757).
+UPDATE kb_faqs
+SET question_pattern = $$Do you sell garage doors? | Can you replace my garage door? | Do you do shutters or garage doors? | Do you sell hurricane shutters? | Do you do accordion shutters?$$,
+    embedding = NULL, embedded_at = NULL, embedding_hash = NULL,
+    updated_at = now()
+WHERE id = 78 AND kb_key = 'LIB-P10';
+
+-- 4b. Roofing had NO answer in the corpus at all: retiring #14 ("Roofing is
+-- Southeast Florida only") in section 1 above left a hole, and a live lead
+-- walked straight into it ("How about roofing? I saw an old ad many years ago
+-- that you guys do roofing"). The three FAQs retrieval offered were all
+-- irrelevant (top 0.405); the model answered "No roofing" from elsewhere.
+-- Wording acknowledges the history rather than implying we never did it —
+-- Mark's ruling 2026-09-26 — because leads still remember the old ads.
+-- Verified: 0.405 (irrelevant row) -> 0.646 (1st, this row).
+INSERT INTO kb_faqs (kb_key, question_pattern, canonical_answer, channel, tier, active, notes) VALUES
+('LIB-P12',
+ $$Do you do roofing? | Do you still do roofs? | I saw an old ad that you do roofing | Can you replace my roof? | Do you do roofs too?$$,
+ $$We did offer roofing in South Florida years back, but we don't anymore. Impact windows and doors are all we do now, and it's all we've focused on since.$$,
+ 'both', 'factual', true,
+ $$Scope boundary. Roofing confirmed retired by Mark 2026-09-25; history-acknowledging wording is Mark's 2026-09-26 ruling. Replaces retired #14.$$);
+
 COMMIT;
