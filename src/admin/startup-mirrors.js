@@ -2332,21 +2332,69 @@ export const STARTUP_MIRRORS = [
     level: 'warn',
   },
 
-  // lp_leads.lp_deleted_at (sql/133, 2026-09-27 — the file is the source of
+  // Inbound Caller Capture (sql/133, 2026-09-27 — the file is the source of
+  // truth). Additive: one table and a view over it. The table is also the
+  // job's idempotency record, so until it exists the job stores nothing and
+  // creates nothing in any mode — it logs and skips.
+  {
+    name: 'sql/133',
+    expects: {
+      tables: ['inbound_capture_daily'],
+      columns: [
+        ['v_inbound_capture_summary', 'run_date'],
+        ['v_inbound_capture_summary', 'label'],
+        ['v_inbound_capture_summary', 'team'],
+        ['v_inbound_capture_summary', 'callers'],
+      ],
+      views: ['v_inbound_capture_summary'],
+    },
+    sql: [
+      `CREATE TABLE IF NOT EXISTS inbound_capture_daily (
+              id bigserial PRIMARY KEY,
+              run_at timestamptz NOT NULL,
+              caller_phone text NOT NULL,
+              call_at timestamptz NOT NULL,
+              campaign text,
+              team text,
+              agent_name text,
+              disposition text,
+              minutes numeric,
+              label text NOT NULL,
+              mode text NOT NULL,
+              action_taken text NOT NULL DEFAULT 'none',
+              ghl_contact_id text,
+              agent_action_id bigint,
+              created_at timestamptz DEFAULT now(),
+              UNIQUE (caller_phone, call_at)
+            );`,
+      `CREATE OR REPLACE VIEW v_inbound_capture_summary AS
+            SELECT (run_at AT TIME ZONE 'America/New_York')::date AS run_date,
+                   label,
+                   team,
+                   count(DISTINCT caller_phone) AS callers
+              FROM inbound_capture_daily
+             GROUP BY 1, 2, 3;`,
+    ],
+    ready: '[Migration] inbound_capture_daily + v_inbound_capture_summary (sql/133) ready',
+    fail: '[Migration] inbound_capture_daily (sql/133) skipped — apply it from the dashboard; inbound caller capture stores and creates nothing until it exists:',
+    level: 'warn',
+  },
+
+  // lp_leads.lp_deleted_at (sql/134, 2026-09-27 — the file is the source of
   // truth). One nullable column, no default: metadata-only. The capacity sweep
   // stamps it when LP returns a lead's customer without the lead, and the board
   // counts and near-window refresh read `lp_deleted_at IS NULL` — so the column
   // must exist before the sweep's first pass, which is why it is mirrored.
   {
-    name: 'sql/133',
+    name: 'sql/134',
     expects: {
       columns: [
         ['lp_leads', 'lp_deleted_at'],
       ],
     },
     sql: 'ALTER TABLE lp_leads ADD COLUMN IF NOT EXISTS lp_deleted_at timestamptz;',
-    ready: '[Migration] lp_leads.lp_deleted_at (sql/133) ready',
-    fail: '[Migration] lp_leads.lp_deleted_at (sql/133) FAILED — the capacity board and near-window refresh query this column and will error until sql/133 is applied from the dashboard:',
+    ready: '[Migration] lp_leads.lp_deleted_at (sql/134) ready',
+    fail: '[Migration] lp_leads.lp_deleted_at (sql/134) FAILED — the capacity board and near-window refresh query this column and will error until sql/134 is applied from the dashboard:',
     level: 'error',
   },
 ];

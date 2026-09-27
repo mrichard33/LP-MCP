@@ -52,9 +52,11 @@
  *   Appointments (5):
  *     book_appointment, cancel_appointment, reschedule_appointment,
  *     update_appointment_status, sync_lp_appointment_to_ghl
- *   LP (4):
+ *   LP (5):
  *     set_lp_appointment, create_lp_lead, update_lp_dnc_status,
- *     lp_callback_requeue
+ *     lp_callback_requeue,
+ *     capture_inbound_caller (2026-09-27 — an approved Inbound Caller Capture;
+ *       enrolls through 8e30ff37, never a second creation path)
  *   Messaging + notification (4):
  *     send_message, send_notification, create_task,
  *     send_info_email (2026-09-24 — the email the bot told the lead is coming)
@@ -242,6 +244,7 @@ import { executeBookAppointment, executeCancelAppointment, executeRescheduleAppo
 import { executeSyncLpAppointmentToGhl } from './handlers/lp-ghl-appointment-sync.js';
 import { executeSetLPAppointment } from './handlers/lp-appointment.js';
 import { executeCreateLPLead } from './handlers/lp-lead.js';
+import { executeCaptureInboundCaller } from './handlers/inbound-capture.js';
 import { executeLpCallbackRequeue } from './handlers/lp-requeue.js';
 import { executeUpdateLPDNCStatus } from './handlers/lp-dnc.js';
 import { executeSetDND } from './handlers/dnd.js';
@@ -594,6 +597,7 @@ export const ACTION_HANDLERS = {
   send_notification: executeSendNotification,
   set_lp_appointment: executeSetLPAppointment,
   create_lp_lead: executeCreateLPLead,           // 2026-05-01 — agentic LP push (Jane recovery)
+  capture_inbound_caller: executeCaptureInboundCaller, // 2026-09-27 — approved Inbound Caller Capture (src/jobs/inbound-caller-capture.js)
   lp_callback_requeue: executeLpCallbackRequeue, // 2026-08-18 — callback_request → LP re-queue (the push IS the dial trigger)
   update_lp_dnc_status: executeUpdateLPDNCStatus, // 2026-05-01 — agentic DNC push (Charles Poulos recovery)
   set_dnd: executeSetDND,                        // 2026-07-20 Fix 6b — GHL-side channel DND. Handler landed 2026-07-20, wired 2026-07-22.

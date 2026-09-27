@@ -708,7 +708,7 @@ export async function refreshNearWindowLead({ ldsId, cstId }, deps = {}) {
   }
   if (presence.verdict === 'absent') {
     await d.markDeleted(ldsId);
-    d.log.warn(`[CapacitySweep] lead ${ldsId} is no longer in LP — customer ${cstId} now has leads [${presence.leadIds.join(', ')}]; marked lp_deleted_at, removed from the board (sql/133)`);
+    d.log.warn(`[CapacitySweep] lead ${ldsId} is no longer in LP — customer ${cstId} now has leads [${presence.leadIds.join(', ')}]; marked lp_deleted_at, removed from the board (sql/134)`);
     return 'deleted_in_lp';
   }
   throw firstErr; // unknown — change nothing
@@ -733,7 +733,7 @@ async function markLeadDeletedInLp(ldsId) {
 // ~100–200 GetLead calls per sweep, throttled.
 async function refreshNearWindowLeads(windowStart) {
   const nearEnd = addDays(windowStart, NEAR_DAYS);
-  // lp_deleted_at IS NULL (sql/133): a lead LP has deleted is never re-fetched
+  // lp_deleted_at IS NULL (sql/134): a lead LP has deleted is never re-fetched
   // — asking LP for it by lead id is a guaranteed 500 timeout.
   const rows = await runSQL(`
     SELECT lp_lead_id, lp_prospect_id
@@ -763,7 +763,7 @@ async function refreshNearWindowLeads(windowStart) {
     }
   });
   if (stats.recovered_by_customer || stats.deleted_in_lp) {
-    console.log(`[CapacitySweep] near-window refresh: ${stats.recovered_by_customer} refreshed via customer lookup, ${stats.deleted_in_lp} marked deleted in LP (sql/133)`);
+    console.log(`[CapacitySweep] near-window refresh: ${stats.recovered_by_customer} refreshed via customer lookup, ${stats.deleted_in_lp} marked deleted in LP (sql/134)`);
   }
 
   // Branch-coverage observability (fix-pass 2): branch_populated must track
