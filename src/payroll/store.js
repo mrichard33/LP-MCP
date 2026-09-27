@@ -285,7 +285,7 @@ export function createPayrollStore({ supabase = defaultSupabase } = {}) {
       return data?.[0] || null;
     },
 
-    /* ── dispute tickets (sql/133) ── */
+    /* ── dispute tickets (sql/134) ── */
 
     async getDispute(id) {
       const { data, error } = await supabase.from('payroll_disputes').select('*').eq('id', id).maybeSingle();

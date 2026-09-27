@@ -1,5 +1,5 @@
 -- ════════════════════════════════════════════════════════════════════
--- sql/133 — Payroll Phase 2: fewer flags + partner dispute tickets (2026-09-27)
+-- sql/134 — Payroll Phase 2: fewer flags + partner dispute tickets (2026-09-27)
 --
 -- Run in the Supabase dashboard SQL editor, LP MCP instance, as ONE execution,
 -- BEFORE merging the code that ships with it: that code writes status 'info',

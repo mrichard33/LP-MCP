@@ -313,6 +313,7 @@ import { startOfficePowerRankingScheduler } from './jobs/office-power-ranking.js
 import { startSaleBackstopScheduler } from './jobs/sale-announce-backstop.js';  // 2026-09-25
 import { startMissedCallerRecoveryScheduler } from './jobs/missed-caller-recovery.js';  // 2026-09-24
 import { registerLeadLeakRoutes, startLeadLeakScheduler, startLeadUncalledScheduler } from './jobs/lead-leak-monitor.js';  // 2026-09-26
+import { registerInboundCaptureRoutes, startInboundCaptureScheduler } from './jobs/inbound-caller-capture.js';  // 2026-09-27
 import { startPayrollEngineScheduler } from './jobs/payroll-engine.js';  // 2026-09-26
 import { registerCiRoutes } from './ci/routes.js';
 import { startCiWorkerScheduler } from './ci/worker.js';
@@ -871,6 +872,7 @@ registerFive9SnapshotRoutes(app, authenticate);
 registerFreshnessRefreshRoutes(app);
 registerLinkLeakRoutes(app);
 registerLeadLeakRoutes(app);
+registerInboundCaptureRoutes(app);
 registerP2UnresolvableRoutes(app);
 registerTagHygieneRoutes(app, authenticate);
 registerCiRoutes(app, authenticate);            // 2026-08-21 — Call Intelligence ingest (PR 2; worker ships disarmed)
@@ -938,6 +940,7 @@ const server = app.listen(PORT, async () => {
   startMissedCallerRecoveryScheduler();
   startLeadLeakScheduler();
   startLeadUncalledScheduler();
+  startInboundCaptureScheduler();
   startPayrollEngineScheduler();
   // Probe ffmpeg, which transcodes Five9's GSM 6.10 recordings to a format a
   // browser can actually play. A CLEAR LOG LINE, NOT A CRASH: without it the
