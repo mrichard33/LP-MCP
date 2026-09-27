@@ -868,6 +868,15 @@ export const STARTUP_MIRRORS = [
   // one-shot label relabels (sql/040 §C) are NOT run here (data ops, applied once via migration).
   // The two DROP NOT NULLs are not something a catalog read can see; they shipped in the same
   // file as the three columns, so the columns stand in for them.
+  //
+  // 2026-09-27: the view lists its columns instead of `s.*`. Postgres expands `*` once, when a
+  // view is created, so the live view froze at sql/040's 41 columns + source_rank. sql/042 then
+  // added rtp_gross_dollars to lp_market_scorecard_daily, and re-running `s.*` tried to slot it in
+  // before source_rank: "cannot change name of view column source_rank to rtp_gross_dollars".
+  // (This block had never really run — it called the missing exec_sql — so the error first
+  // surfaced on the 2026-09-26 21:03 boot.) The list below is exactly the live view's, so a
+  // replace on live is a no-op and a fresh database gets the same view. sql/040 itself is left
+  // as written: it is the historical file, and it is correct at the point it ran.
   {
     name: 'sql/040',
     expects: {
@@ -898,7 +907,18 @@ export const STARTUP_MIRRORS = [
             CREATE OR REPLACE VIEW lp_market_scorecard_resolved AS
               SELECT DISTINCT ON (market, period_start) *
               FROM (
-                SELECT s.*,
+                SELECT
+                       s.id, s.market, s.as_of_date, s.period_start,
+                       s.period_end, s.days_elapsed, s.leads, s.issued,
+                       s.sets, s.demos, s.sales, s.ko_count,
+                       s.good_business, s.gross_sales, s.net_sales, s.pending_dollars,
+                       s.deposits, s.demo_pct, s.close_pct, s.good_rate_pct,
+                       s.ko_pct, s.nsli, s.avg_sale, s.computed_from,
+                       s.reconciled, s.raw_inputs, s.created_at, s.net_issue,
+                       s.net_close, s.gsli, s.pct_issue, s.pct_net_close,
+                       s.raw_leads_in, s.released_dollars, s.working_dollars, s.pending_total,
+                       s.revenue_basis, s.working_days_in_period, s.revenue_as_of, s.provisional_gross_dollars,
+                       s.provisional_days,
                   CASE
                     WHEN revenue_basis = 'rtp_net_by_milestone_date'               THEN 1
                     WHEN revenue_basis = 'rtp_gross_by_milestone_date_provisional' THEN 2

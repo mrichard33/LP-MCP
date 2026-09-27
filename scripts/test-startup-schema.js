@@ -432,3 +432,16 @@ test('src/index.js carries no boot DDL of its own — new mirrors go in startup-
   const ddl = /CREATE\s+(?:UNIQUE\s+)?(?:TABLE|INDEX|OR REPLACE VIEW|OR REPLACE FUNCTION)\b|ADD COLUMN/i;
   assert.doesNotMatch(src, ddl, 'move the block into src/admin/startup-mirrors.js and declare what it creates');
 });
+
+test('no mirrored view selects <alias>.* — a table that gains a column makes the view un-replaceable', () => {
+  // 2026-09-27: sql/040's `SELECT s.*` froze at 41 columns when it first ran;
+  // sql/042 then added rtp_gross_dollars to lp_market_scorecard_daily, and
+  // replaying the mirror failed with "cannot change name of view column
+  // source_rank to rtp_gross_dollars". A view mirror must list its columns.
+  for (const b of STARTUP_MIRRORS.filter((x) => x.expects?.views?.length)) {
+    const sql = blockSql(b).replace(/--[^\n]*/g, '');
+    for (const m of sql.matchAll(/CREATE OR REPLACE VIEW\s+(\w+)\s+AS([\s\S]*?)(?:;|$)/gi)) {
+      assert.doesNotMatch(m[2], /\b\w+\.\*/, `${b.name}: view ${m[1]} selects <alias>.* — list the columns`);
+    }
+  }
+});
