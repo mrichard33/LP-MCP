@@ -57,7 +57,14 @@
 //
 // ENDPOINT
 //   GET|POST /api/lp/inbound-capture → the classified list. Never creates, never
-//   posts, never stores. ?hours=N narrows it (default: the whole 30-day view).
+//   posts, never stores. Default window: INBOUND_CAPTURE_LOOKBACK_HOURS (48), the
+//   same calls the hourly pass sees. ?hours=N picks another window; ?hours=all
+//   reads the whole 30-day view.
+//
+//   2026-09-27 — the default USED to be the whole view. Measured on the first
+//   live pass, GHL costs several seconds per caller, so ~232 callers is ~25
+//   minutes: past any HTTP timeout, and the whole time it holds the one-pass
+//   lock, so the hourly action pass skips its slot. Ask for `all` on purpose.
 
 import { runSQL as defaultRunSQL } from '../admin/supabase-admin.js';
 import defaultSupabase from '../supabase.js';
@@ -641,9 +648,15 @@ async function guarded(fn) {
   try { return await inFlight; } finally { inFlight = null; }
 }
 
-/** The endpoint's body. Exported for tests. Never creates, posts or stores. */
-export async function dryRun({ hours = null, nowMs = Date.now(), env = process.env, deps = {} } = {}) {
+/**
+ * The endpoint's body. Exported for tests. Never creates, posts or stores.
+ * `hours`: omitted → the lookback window (48h); a number → that many hours;
+ * 'all' → the whole 30-day view (slow — see the header).
+ */
+export async function dryRun({ hours, nowMs = Date.now(), env = process.env, deps = {} } = {}) {
   const cfg = captureConfig(env);
+  if (hours === 'all') hours = null;
+  else hours = positiveInt(hours, cfg.lookbackHours);
   const m = await measureCallers({ nowMs, hours, deps });
   if (m.verdict === 'insufficient_evidence') return { ok: false, verdict: m.verdict, errors: m.errors };
   const byTeamLabel = {};
@@ -666,8 +679,9 @@ export async function dryRun({ hours = null, nowMs = Date.now(), env = process.e
 
 export function registerInboundCaptureRoutes(app) {
   const handler = async (req, res) => {
-    const raw = req.query?.hours ?? req.body?.hours;
-    const hours = raw == null || raw === '' ? null : positiveInt(raw, null);
+    const raw = String(req.query?.hours ?? req.body?.hours ?? '').trim().toLowerCase();
+    // Blank or unreadable → the 48h default inside dryRun; `all` → the whole view.
+    const hours = raw === 'all' ? 'all' : raw || undefined;
     try {
       const out = await guarded(() => dryRun({ hours }));
       if (out.busy) return res.status(409).json({ ok: false, error: 'an inbound-capture pass is already running' });

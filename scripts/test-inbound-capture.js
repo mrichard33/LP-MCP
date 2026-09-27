@@ -488,7 +488,37 @@ test('dry run: never writes, never creates, never posts — and the labels recon
   assert.equal(out.summary.candidates, out.summary.callers - b.dnc - b.already_in_lp - b.existing_customer - b.unverified);
   assert.equal(out.summary.candidates, 2);
   assert.equal(out.calls_by_team_and_label.lightfire.no_ghl_contact, 1);
-  assert.equal(out.window, '30d (whole view)');
+  assert.equal(out.window, '48h');
+});
+
+// 2026-09-27 — the default was the whole 30-day view. On the first live pass
+// GHL cost several seconds per caller, so a plain call ran ~25 minutes and held
+// the one-pass lock the hourly action pass needs.
+test('dry run: defaults to the 48h lookback window, not the whole view', async () => {
+  const w = world({ view: [call('8130000001'), call('8130000007', { call_at: '2026-09-10T13:00:00.000Z' })] });
+  const out = await dryRun({ nowMs: NOW, env: env('shadow'), deps: w.deps });
+  assert.equal(out.window, '48h');
+  assert.match(w.sql[0], /call_at >= '2026-09-25T15:00:00.000Z'/);
+  assert.equal(out.summary.callers, 1);
+});
+
+test('dry run: follows INBOUND_CAPTURE_LOOKBACK_HOURS, and ?hours=N overrides it', async () => {
+  const w = world();
+  const a = await dryRun({ nowMs: NOW, env: { ...env('shadow'), INBOUND_CAPTURE_LOOKBACK_HOURS: '24' }, deps: w.deps });
+  assert.equal(a.window, '24h');
+  const b = await dryRun({ hours: '6', nowMs: NOW, env: env('shadow'), deps: w.deps });
+  assert.equal(b.window, '6h');
+  assert.match(w.sql.at(-1), /call_at >= '2026-09-27T09:00:00.000Z'/);
+});
+
+test('dry run: hours=all reads the whole view; junk falls back to 48h', async () => {
+  const w = world({ view: [call('8130000001'), call('8130000007', { call_at: '2026-09-10T13:00:00.000Z' })] });
+  const all = await dryRun({ hours: 'all', nowMs: NOW, env: env('shadow'), deps: w.deps });
+  assert.equal(all.window, '30d (whole view)');
+  assert.doesNotMatch(w.sql[0], /call_at >=/);
+  assert.equal(all.summary.callers, 2);
+  const junk = await dryRun({ hours: 'banana', nowMs: NOW, env: env('shadow'), deps: w.deps });
+  assert.equal(junk.window, '48h');
 });
 
 test('daily summary: posts to the ops channel in shadow and creates nothing', async () => {
