@@ -283,6 +283,19 @@ export const JOBS = Object.freeze([
     enabledDefault: true,
     isEnabled: (env) => String(env.PAYROLL_ENGINE_MODE || 'shadow').toLowerCase().trim() !== 'off',
   },
+  {
+    id: 'inbound-caller-capture',
+    label: 'Inbound callers with no LP lead',
+    group: 'five9',
+    cadence: 'hourly 08:00–20:00 ET + summary 07:15 ET',
+    enabledEnv: 'INBOUND_CAPTURE_MODE',
+    // A MODE, not a boolean (2026-09-27): off | shadow | approval | live,
+    // default shadow. Shadow stores rows hourly and posts the 07:15 summary, so
+    // a silent shadow day is a defect too. Mirrors captureMode() in
+    // src/jobs/inbound-caller-capture.js: anything but 'off' runs.
+    enabledDefault: true,
+    isEnabled: (env) => String(env.INBOUND_CAPTURE_MODE || 'shadow').toLowerCase().trim() !== 'off',
+  },
 ]);
 
 /** Ids only — handy for tests and for asserting the wiring matches the roster. */

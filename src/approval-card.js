@@ -318,6 +318,16 @@ export function describeApprove(action, { event, contactName, enrichment = {} } 
       const nums = Array.isArray(pl.numbers) ? pl.numbers : [];
       return `Adds ${nums.length} number${nums.length === 1 ? '' : 's'} to the Five9 do-not-call list (permanent): ${listNumbers(nums)}.`;
     }
+    case 'capture_inbound_caller': {
+      // 2026-09-27 — Inbound Caller Capture. The caller has no name on file,
+      // so the card names the phone, never a pronoun.
+      const phone = formatPhoneUS(pl.caller_phone);
+      const first = pl.ghl_contact_id
+        ? 'Sends their existing GHL contact'
+        : `Creates a GHL contact for ${phone} (tagged inbound-capture) and sends it`;
+      return `${first} through "Send Lead to Lead Perfection" (8e30ff37) to create the LP lead. `
+        + 'Nothing is texted or booked. It re-checks DNC and LP first and does nothing if either changed.';
+    }
     case 'five9_start_campaign':
       return `Starts the Five9 campaign "${pl.campaign_name}".`;
     case 'five9_stop_campaign':
