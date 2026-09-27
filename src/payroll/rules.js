@@ -40,7 +40,9 @@ export const EVENT_DEMO = 'completed_demo';
 export const EVENT_DIRECT_NET = 'direct_job_net';
 export const CANVASS_SOURCES = Object.freeze(['Canvass', 'Canvass Sticky']);
 export const NO_SETTER = 'No, Setter';
-export const STATUSES = Object.freeze(['pending', 'needs_review', 'disputed', 'excluded', 'approved', 'paid']);
+// `info` (2026-09-27): a $0 row the partner should SEE but nobody needs to act
+// on — a new-lead demo, which is paid through the 1.5% when the job nets.
+export const STATUSES = Object.freeze(['pending', 'needs_review', 'disputed', 'excluded', 'info', 'approved', 'paid']);
 /** Lines that count toward the payable total. needs_review / disputed never do. */
 export const PAYABLE = Object.freeze(['pending', 'approved', 'paid']);
 
@@ -171,14 +173,19 @@ export function lineKey(payee, leadId, eventType, eventDate) {
  * Is this event LightFire's to be paid (or visibly excluded) for?
  *   - an LF agent → yes
  *   - an excluded (AI) agent → yes, so the exclusion SHOWS in the ledger
- *   - no agent on file, canvass lead → yes, to review (never skipped)
- *   - no agent on file, any other lead → no (vendor pre-set, not flagged)
  *   - an in-house Reece agent → no, it is not LightFire's event
+ *   - no agent on file:
+ *       canvass CONFIRMATION → yes, to review: an appointment was confirmed
+ *         and nobody is recorded as confirming it — the data does not match up
+ *       a demo or a net (set-based) → no. Ruled 2026-09-27: a canvass
+ *         appointment arrives pre-set ("No, Setter"), LightFire did not set it
+ *         and already earns $15 for confirming it. A vendor pre-set is not
+ *         LightFire's either. Neither earns a line.
  */
-export function isLightFireCandidate(agent, lead, excluded) {
+export function isLightFireCandidate(agent, lead, excluded, { setBased = true } = {}) {
   if (isLightFireAgent(agent)) return true;
   if (excluded?.has?.(String(agent ?? '').trim())) return true;
-  if (isNoAgent(agent)) return isCanvassLead(lead);
+  if (isNoAgent(agent)) return !setBased && isCanvassLead(lead);
   return false;
 }
 
@@ -213,7 +220,7 @@ export function buildLightFireEvents({ canvassLeads = [], demoLeads = [], netJob
     if (!isCanvassLead(lead)) continue;
     const date = lpEtDate(lead.confirmed_date);
     if (!inPeriod(date)) continue;
-    if (!isLightFireCandidate(lead.confirmed_by_name, lead, excluded)) continue;
+    if (!isLightFireCandidate(lead.confirmed_by_name, lead, excluded, { setBased: false })) continue;
     events.push(baseEvent(lead, EVENT_CANVASS_CONFIRM, lead.confirmed_by_name, date));
   }
 
@@ -284,10 +291,14 @@ function ruleAmount(rule, ev) {
  *   4. age rule, but lead age unknown        → needs_review, $0 (fail closed)
  *   5. new_only rule, lead aged              → null (the demo rule pays it)
  *   6. net amount zero or negative           → needs_review, $0
- *   7. no agent on file (canvass)            → needs_review
- *   8. aged_only rule, lead not aged         → disputed, $0
+ *   7. no confirmer on file (canvass)        → needs_review
+ *   8. aged_only rule, lead not aged         → info, $0 (not payable, not flagged)
  *   9. rule requires review                  → needs_review, amount computed
  *  10. otherwise                             → pending, amount computed
+ *
+ * Flag only what does not match up (ruled 2026-09-27). A new-lead demo is not
+ * a dispute — nobody billed it at the aged rate; it simply earns the 1.5%
+ * instead — so it is an `info` row the partner can see, not a flag.
  *
  * ctx: { rules, partnerId, excluded:Set, paidElsewhere:Map<line_key, run_id>, agedDays }
  */
@@ -334,13 +345,11 @@ export function evaluateLine(ev, ctx) {
 
   const amount = ruleAmount(rule, ev);
   if (ev.no_agent) {
-    const who = ev.event_type === EVENT_CANVASS_CONFIRM ? 'no confirmer' : 'no phone setter';
-    const pay = rule.lead_age_rule === 'aged_only' && aged === false ? 0 : amount;
-    return line('needs_review', `pre-set canvass appointment, ${who} recorded — confirm LightFire earned it`,
-      { ...withRule, amount_cents: pay });
+    return line('needs_review', 'canvass appointment confirmed with no confirmer recorded — check who confirmed it',
+      { ...withRule, amount_cents: amount });
   }
   if (rule.lead_age_rule === 'aged_only' && aged === false) {
-    return line('disputed', 'new-lead demo billed at aged rate', withRule);
+    return line('info', 'not payable – new lead (paid 1.5% on net)', withRule);
   }
   if (rule.requires_review) {
     return line('needs_review', 'caller unprovable (LightFire dialer)', { ...withRule, amount_cents: amount });

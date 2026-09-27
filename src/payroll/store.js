@@ -276,9 +276,68 @@ export function createPayrollStore({ supabase = defaultSupabase } = {}) {
     },
 
     async findActiveApprover(email) {
+      // ilike for case, with its wildcards escaped: an unescaped `_` (common in
+      // emails) matches any character, so "a_b@x.com" would pass as "axb@x.com".
+      const exact = String(email).replace(/[\\%_]/g, (c) => `\\${c}`);
       const { data, error } = await supabase.from('lf_report_approvers')
-        .select('email, name, active').ilike('email', String(email)).eq('active', true).limit(1);
+        .select('email, name, active').ilike('email', exact).eq('active', true).limit(1);
       if (error) throw fail('lf_report_approvers', error);
+      return data?.[0] || null;
+    },
+
+    /* ── dispute tickets (sql/133) ── */
+
+    async getDispute(id) {
+      const { data, error } = await supabase.from('payroll_disputes').select('*').eq('id', id).maybeSingle();
+      if (error) throw fail('payroll_disputes', error);
+      return data || null;
+    },
+
+    async listDisputes({ partnerId = null, status = null, limit = 500 } = {}) {
+      let q = supabase.from('payroll_disputes').select('*');
+      if (partnerId) q = q.eq('partner_id', partnerId);
+      if (status) q = q.eq('status', status);
+      const { data, error } = await q.order('filed_at', { ascending: false }).limit(limit);
+      if (error) throw fail('payroll_disputes', error);
+      return data || [];
+    },
+
+    async findOpenDisputeForLine(ledgerId) {
+      const { data, error } = await supabase.from('payroll_disputes').select('id')
+        .eq('ledger_id', ledgerId).eq('status', 'open').limit(1);
+      if (error) throw fail('payroll_disputes', error);
+      return data?.[0] || null;
+    },
+
+    /** Insert one ticket. A duplicate open ticket on the same line (unique index) returns { duplicate:true }. */
+    async insertDispute(row) {
+      const { data, error } = await supabase.from('payroll_disputes').insert(row).select('*').single();
+      if (error?.code === '23505') return { duplicate: true };
+      if (error) throw fail('payroll_disputes insert', error);
+      return { dispute: data };
+    },
+
+    /** Conditional update: only while the ticket is still in `fromStatus` (null = any). */
+    async updateDispute(id, fromStatus, patch) {
+      let q = supabase.from('payroll_disputes').update(patch).eq('id', id);
+      if (fromStatus) q = q.eq('status', fromStatus);
+      const { data, error } = await q.select('*');
+      if (error) throw fail('payroll_disputes update', error);
+      return data?.[0] || null;
+    },
+
+    /** Approved tickets not yet carried into any run, for one partner. */
+    async listUnappliedApprovedDisputes(partnerId) {
+      const { data, error } = await supabase.from('payroll_disputes').select('*')
+        .eq('partner_id', partnerId).eq('status', 'approved').is('applied_run_id', null)
+        .order('id');
+      if (error) throw fail('payroll_disputes', error);
+      return data || [];
+    },
+
+    async updateLine(lineId, patch) {
+      const { data, error } = await supabase.from('payroll_ledger').update(patch).eq('id', lineId).select('*');
+      if (error) throw fail('payroll_ledger update', error);
       return data?.[0] || null;
     },
 

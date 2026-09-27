@@ -10,6 +10,13 @@
 //   payroll_mark_paid    mark an APPROVED run paid (confirm:true + actor)
 //   payroll_export       CSV for one run (optionally one campaign)
 //   payroll_list_rules   pay_rules + pay_excluded_agents
+//   payroll_file_dispute    a partner's ticket on a line, or on a lead the run missed
+//   payroll_decide_dispute  approve / deny a ticket (active lf_report_approvers only)
+//   payroll_list_disputes   tickets, by partner and status
+//
+// The dispute tools are the dashboard's write path (2026-09-27). The dashboard
+// passes the SIGNED-IN user's email and, for a partner, the partner_id from the
+// account — never from the browser. These tools re-check both anyway.
 
 import { z } from 'zod';
 import { runPayrollEngine, payrollMode } from '../../jobs/payroll-engine.js';
@@ -17,6 +24,9 @@ import { createPayrollStore, isMissingTableError } from '../../payroll/store.js'
 import { resolvePayrollLine, markPayrollRunPaid } from '../../payroll/ledger-actions.js';
 import { buildPayrollCsv } from '../../payroll/export.js';
 import { summarizeLines, STATUSES } from '../../payroll/rules.js';
+import { fileDispute, decideDispute, DISPUTE_STATUSES, DISPUTABLE_EVENTS } from '../../payroll/disputes.js';
+import { postToSlack } from '../../slack.js';
+import { payrollChannel } from '../../jobs/payroll-engine.js';
 
 const ymd = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'YYYY-MM-DD');
 
@@ -130,6 +140,65 @@ export function registerPayrollTools(server, { store: storeOverride = null } = {
         const s = store();
         const [rules, excluded] = await Promise.all([s.listAllRules(), s.listExcludedAgents()]);
         return text({ rules, excluded_agents: excluded });
+      } catch (err) { return errorText(err); }
+    },
+  );
+
+  server.tool(
+    'payroll_file_dispute',
+    'File a payroll dispute ticket for a partner. Either ledger_id (dispute a line on that partner\'s payroll) or lp_lead_id + event_type + event_date (a lead the run missed). A reason is required; claimed_amount (dollars) is optional. One open ticket per line. Posts a note to the payroll Slack channel. Moves no money.',
+    {
+      partner_id: z.string().uuid().describe('The partner filing — from the signed-in account'),
+      filed_by_email: z.string().email(),
+      ledger_id: z.string().uuid().optional(),
+      lp_lead_id: z.string().optional(),
+      event_type: z.enum(DISPUTABLE_EVENTS).optional(),
+      event_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+      claimed_amount: z.union([z.number(), z.string()]).optional().describe('Dollars, e.g. 250 or "15.00"'),
+      reason: z.string().describe('What is wrong, in the partner\'s words'),
+    },
+    async (a) => {
+      try {
+        return text(await fileDispute({
+          partnerId: a.partner_id, filedByEmail: a.filed_by_email, ledgerId: a.ledger_id,
+          lpLeadId: a.lp_lead_id, eventType: a.event_type, eventDate: a.event_date,
+          claimedAmount: a.claimed_amount, reason: a.reason,
+        }, { store: store(), post: postToSlack, channel: payrollChannel() }));
+      } catch (err) { return errorText(err); }
+    },
+  );
+
+  server.tool(
+    'payroll_decide_dispute',
+    'Approve or deny a payroll dispute ticket. Only an active lf_report_approvers email may decide. Deny needs a note the partner will read. Approve takes approved_amount (dollars; defaults to the claimed amount, else the line amount). An approval on a line in a still-pending run updates that line; otherwise it is added to the partner\'s next weekly run as a dispute_adjustment line, once.',
+    {
+      dispute_id: z.number().int().positive(),
+      decision: z.enum(['approve', 'deny']),
+      decided_by_email: z.string().email(),
+      note: z.string().optional(),
+      approved_amount: z.union([z.number(), z.string()]).optional(),
+    },
+    async (a) => {
+      try {
+        return text(await decideDispute({
+          disputeId: a.dispute_id, decision: a.decision, decidedByEmail: a.decided_by_email,
+          note: a.note, approvedAmount: a.approved_amount,
+        }, { store: store() }));
+      } catch (err) { return errorText(err); }
+    },
+  );
+
+  server.tool(
+    'payroll_list_disputes',
+    'List payroll dispute tickets, newest first, optionally for one partner and one status (open, approved, denied). Read-only.',
+    {
+      partner_id: z.string().uuid().optional(),
+      status: z.enum(DISPUTE_STATUSES).optional(),
+      limit: z.number().int().min(1).max(500).optional(),
+    },
+    async ({ partner_id, status, limit = 200 } = {}) => {
+      try {
+        return text({ disputes: await store().listDisputes({ partnerId: partner_id ?? null, status: status ?? null, limit }) });
       } catch (err) { return errorText(err); }
     },
   );
