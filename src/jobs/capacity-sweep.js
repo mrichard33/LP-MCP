@@ -100,7 +100,8 @@
 
 import supabase from '../supabase.js';
 import { runSQL } from '../admin/supabase-admin.js';
-import { getSalesSchedule, getLeads, getLeadByLdsId, getCircuitStatus, resetCircuit } from '../lp-client.js';
+import { getSalesSchedule, getLeads, getLeadByLdsId, getProspectByCstId, getCircuitStatus, resetCircuit } from '../lp-client.js';
+import { leadPresenceInProspect } from '../lp-lead-presence.js';
 import { getField, extractArray, sleep, RATE_LIMIT_SLEEP_MS } from '../sync-utils.js';
 import { lpDateToEastern } from '../lp-dates.js';
 import { processProspect } from '../sync-leads.js';
@@ -302,6 +303,7 @@ function numeratorSQL(datePredicate) {
     FROM lp_leads l
     LEFT JOIN lp_lead_market_assignments a ON a.lead_id = l.lp_lead_id
     WHERE l.appointment_date IS NOT NULL
+      AND l.lp_deleted_at IS NULL
       AND (l.appointment_date AT TIME ZONE 'America/New_York')::date ${datePredicate}
     GROUP BY 1, 2`;
 }
@@ -660,6 +662,64 @@ async function sweepForwardLeadDispositions(windowStart, windowEnd) {
   return stats;
 }
 
+// ─── One near-window lead: by lead id, then by customer (2026-09-27) ────────
+//
+// LP answers GetLead for a lead id it has DELETED with a 500 "Execution
+// Timeout Expired", never an empty result — so a deleted duplicate failed
+// every pass (99 times in 13 hours for 578101 + 577827) and stayed on the board
+// as a second, unconfirmed copy of a real appointment. When the lead-id fetch
+// fails, fetch the CUSTOMER instead (fast) and let leadPresenceInProspect
+// decide: present → refresh through the same writer; absent → stamp
+// lp_deleted_at; unknown → rethrow the original error, exactly as before.
+//
+// Returns 'refreshed' | 'recovered_by_customer' | 'deleted_in_lp' | 'gone'.
+const DIGITS = /^\d+$/;
+
+export async function refreshNearWindowLead({ ldsId, cstId }, deps = {}) {
+  const d = {
+    getLeadByLdsId, getProspectByCstId, processProspect,
+    timeout: (p, label) => withTimeout(p, PROSPECT_TIMEOUT_MS, label),
+    markDeleted: markLeadDeletedInLp,
+    log: console,
+    ...deps,
+  };
+  let firstErr;
+  try {
+    const res = await d.getLeadByLdsId(ldsId);
+    const prospect = extractArray(res)[0];
+    if (!prospect) return 'gone'; // empty answer — nothing to refresh
+    await d.timeout(d.processProspect(prospect), `lds_id=${ldsId}`);
+    return 'refreshed';
+  } catch (err) {
+    firstErr = err;
+  }
+
+  if (!cstId) throw firstErr;
+  let presence;
+  try {
+    presence = leadPresenceInProspect(await d.getProspectByCstId(cstId), { cstId, ldsId });
+  } catch (err) {
+    throw firstErr; // the customer lookup failed too — report the original
+  }
+
+  if (presence.verdict === 'present') {
+    await d.timeout(d.processProspect(presence.prospect), `cst_id=${cstId}`);
+    return 'recovered_by_customer';
+  }
+  if (presence.verdict === 'absent') {
+    await d.markDeleted(ldsId);
+    d.log.warn(`[CapacitySweep] lead ${ldsId} is no longer in LP — customer ${cstId} now has leads [${presence.leadIds.join(', ')}]; marked lp_deleted_at, removed from the board (sql/133)`);
+    return 'deleted_in_lp';
+  }
+  throw firstErr; // unknown — change nothing
+}
+
+async function markLeadDeletedInLp(ldsId) {
+  if (!DIGITS.test(String(ldsId))) throw new Error(`markLeadDeletedInLp: bad lead id ${ldsId}`);
+  await runSQL(`UPDATE lp_leads SET lp_deleted_at = now()
+                 WHERE lp_lead_id = '${ldsId}' AND lp_deleted_at IS NULL`);
+}
+
 // ─── b'. Near-window full refresh — per-lead re-fetch for board dates ────────
 //
 // The change-window sweep catches new appointments but depends on LP's
@@ -673,29 +733,38 @@ async function sweepForwardLeadDispositions(windowStart, windowEnd) {
 // ~100–200 GetLead calls per sweep, throttled.
 async function refreshNearWindowLeads(windowStart) {
   const nearEnd = addDays(windowStart, NEAR_DAYS);
+  // lp_deleted_at IS NULL (sql/133): a lead LP has deleted is never re-fetched
+  // — asking LP for it by lead id is a guaranteed 500 timeout.
   const rows = await runSQL(`
-    SELECT lp_lead_id
+    SELECT lp_lead_id, lp_prospect_id
     FROM lp_leads
     WHERE appointment_date IS NOT NULL
+      AND lp_deleted_at IS NULL
       AND (appointment_date AT TIME ZONE 'America/New_York')::date
           BETWEEN '${windowStart}'::date AND '${nearEnd}'::date`);
-  const leadIds = (Array.isArray(rows) ? rows : []).map((r) => String(r.lp_lead_id)).filter(Boolean);
+  const leads = (Array.isArray(rows) ? rows : [])
+    .map((r) => ({ ldsId: String(r.lp_lead_id || ''), cstId: r.lp_prospect_id ? String(r.lp_prospect_id) : null }))
+    .filter((r) => r.ldsId);
 
-  const stats = { near_end: nearEnd, leads: leadIds.length, processed: 0, failed: 0 };
-  await processInBatches(leadIds, LEAD_CONCURRENCY, async (ldsId) => {
+  const stats = { near_end: nearEnd, leads: leads.length, processed: 0, failed: 0, recovered_by_customer: 0, deleted_in_lp: 0 };
+  await processInBatches(leads, LEAD_CONCURRENCY, async (lead) => {
     try {
-      const res = await getLeadByLdsId(ldsId);
-      const prospect = extractArray(res)[0];
-      if (!prospect) return; // lead gone from LP — nothing to refresh
-      await withTimeout(processProspect(prospect), PROSPECT_TIMEOUT_MS, `lds_id=${ldsId}`);
-      stats.processed++;
+      const outcome = await refreshNearWindowLead(lead);
+      if (outcome === 'deleted_in_lp') stats.deleted_in_lp++;
+      else {
+        if (outcome === 'recovered_by_customer') stats.recovered_by_customer++;
+        if (outcome !== 'gone') stats.processed++;
+      }
     } catch (err) {
       stats.failed++;
-      console.warn(`[CapacitySweep] near-window refresh lds_id=${ldsId} failed: ${err.message}`);
+      console.warn(`[CapacitySweep] near-window refresh lds_id=${lead.ldsId} failed: ${err.message}`);
     } finally {
       await sleep(RATE_LIMIT_SLEEP_MS); // LP monitors for excessive use
     }
   });
+  if (stats.recovered_by_customer || stats.deleted_in_lp) {
+    console.log(`[CapacitySweep] near-window refresh: ${stats.recovered_by_customer} refreshed via customer lookup, ${stats.deleted_in_lp} marked deleted in LP (sql/133)`);
+  }
 
   // Branch-coverage observability (fix-pass 2): branch_populated must track
   // leads — a persistent gap means a writer path is dropping brn_id again.
@@ -704,6 +773,7 @@ async function refreshNearWindowLeads(windowStart) {
       SELECT count(*) AS leads, count(lp_branch_id) AS branch_populated
       FROM lp_leads
       WHERE appointment_date IS NOT NULL
+        AND lp_deleted_at IS NULL
         AND (appointment_date AT TIME ZONE 'America/New_York')::date
             BETWEEN '${windowStart}'::date AND '${nearEnd}'::date`);
     stats.branch_populated = Number(cov?.[0]?.branch_populated ?? 0);
@@ -989,6 +1059,7 @@ export async function runHourlyFillSnapshot() {
       FROM lp_leads l
       LEFT JOIN lp_lead_market_assignments a ON a.lead_id = l.lp_lead_id
       WHERE l.appointment_date IS NOT NULL
+        AND l.lp_deleted_at IS NULL
         AND (l.appointment_date AT TIME ZONE 'America/New_York')::date
             BETWEEN '${today}'::date AND '${end}'::date
       GROUP BY 1, 2
@@ -1029,6 +1100,7 @@ export async function runFillSnapshot(snapshotDate = todayET()) {
       FROM lp_leads l
       LEFT JOIN lp_lead_market_assignments a ON a.lead_id = l.lp_lead_id
       WHERE l.appointment_date IS NOT NULL
+        AND l.lp_deleted_at IS NULL
         AND (l.appointment_date AT TIME ZONE 'America/New_York')::date >= '${snapshotDate}'::date
       GROUP BY 1, 2
     ) n ON n.slot_date = d.slot_date AND n.market = d.market
@@ -1071,6 +1143,7 @@ export async function buildBoardResponse(date) {
     runSQL(`SELECT max(synced_at) AS appointments_updated_at
               FROM lp_leads
              WHERE appointment_date IS NOT NULL
+               AND lp_deleted_at IS NULL
                AND (appointment_date AT TIME ZONE 'America/New_York')::date = '${date}'::date`),
   ]);
 

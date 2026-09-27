@@ -251,6 +251,8 @@ export async function checkFieldDrift({ sample = FIELD_DRIFT_SAMPLE } = {}) {
     const { data: rows, error } = await supabase
       .from('lp_leads')
       .select('lp_lead_id, demo_completed, appointment_set, closed_won')
+      // sql/133: a lead LP deleted can only time out on a live fetch.
+      .is('lp_deleted_at', null)
       .order('created_at_lp', { ascending: false })
       .limit(sample);
 
