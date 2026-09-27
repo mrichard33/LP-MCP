@@ -59,8 +59,16 @@ import { resolveAgentLabel } from './teams.js';
 import { syncCall } from './sync.js';
 import { verifyPendingLpNotes } from './verify.js';
 import { alertUnreadableFolder } from './alerts.js';
+import { createArchiveBreaker, isArchiveUnreachable, archiveOutageVerdict, formatArchiveOutageAlert, formatArchiveRecovered, ARCHIVE_MAX_COOLDOWN_MS } from './archive-outage.js';
+import { reportAlertCondition } from '../alert-state.js';
 
 const LOG = '[CIWorker]';
+
+// One breaker per process for the recording archive (src/ci/archive-outage.js).
+// Module-level on purpose: it must outlive a tick, because the whole point is
+// that the NEXT ticks stop connecting while the archive refuses us.
+const archiveBreaker = createArchiveBreaker();
+const ARCHIVE_ALERT_KEY = 'ci:recording_archive_unreachable';
 
 /**
  * ci_matches.decided_by for a machine-made decision.
@@ -1095,10 +1103,22 @@ export function bestRecordingForCall(call, recordings, windowSeconds = 180) {
 const NOT_YET_IMPLEMENTED = {};
 
 /** Dispatch one claimed call to its stage handler. */
-export async function advanceOne(call, { db = supabase, cfg = getConfig(), adapter, listings, transcriber, loadAudio, callJson, lpClient, ghlClient, now = new Date(), canvasserPhones, agentMap } = {}) {
+export async function advanceOne(call, { db = supabase, cfg = getConfig(), adapter, listings, transcriber, loadAudio, callJson, lpClient, ghlClient, now = new Date(), canvasserPhones, agentMap, breaker = archiveBreaker } = {}) {
   try {
     if (call.status === 'discovered') {
-      return await stageFetchRecording(call, { db, cfg, adapter, listings, now });
+      // 2026-09-27: while the archive refuses connections, a fetch is not
+      // attempted at all — the call is put back until the cool-down ends,
+      // attempts untouched. See src/ci/archive-outage.js.
+      if (breaker.isOpen()) {
+        await releaseLease(db, call.id, { next_retry_at: new Date(breaker.openUntil()).toISOString() });
+        return { outcome: 'archive_paused' };
+      }
+      const r = await stageFetchRecording(call, { db, cfg, adapter, listings, now });
+      // no_campaign returns before the archive is touched, so it proves nothing.
+      if (r?.reason === 'no_campaign') return r;
+      const outageSince = breaker.recordReachable();
+      if (outageSince != null) console.log(`${LOG} recording archive reachable again after ${Math.round((Date.now() - outageSince) / 60000)} min`);
+      return { ...r, archive: 'reachable' };
     }
     // THE GATE. `fetched` resolves the customer BEFORE Whisper is asked for
     // anything — see stageEarlyMatch and src/ci/match-gate.js.
@@ -1127,9 +1147,58 @@ export async function advanceOne(call, { db = supabase, cfg = getConfig(), adapt
     await releaseLease(db, call.id);
     return { outcome: 'noop', status: call.status };
   } catch (err) {
+    // An unreachable archive is an OUTAGE, not this call's failure: no attempt
+    // bump, no ci_events row per call, and every later fetch pauses until the
+    // cool-down ends. Before 2026-09-27 this path parked 16,771 calls as
+    // permanently `failed` over one month-long outage.
+    if (call.status === 'discovered' && isArchiveUnreachable(err)) {
+      const { openUntil, cooldownMs } = breaker.recordUnreachable(err);
+      await releaseLease(db, call.id, {
+        next_retry_at: new Date(openUntil).toISOString(),
+        status_detail: `archive unreachable (paused ${Math.round(cooldownMs / 60000)} min): ${String(err.message || err)}`.slice(0, 500),
+      });
+      return { outcome: 'archive_unreachable', error: err.message };
+    }
     await recordFailure(db, call, call.status, err, cfg);
     return { outcome: 'failed', error: err.message };
   }
+}
+
+/**
+ * Report the archive's state for this tick through the shared edge-triggered
+ * alert (one card per outage, a daily reminder while it lasts, one recovery
+ * card). Never throws — an alert problem must not stop the pipeline.
+ */
+async function reportArchiveOutage({ db, cfg, tally, breaker = archiveBreaker, nowMs = Date.now() }) {
+  const decision = archiveOutageVerdict({ ...tally, breaker: breaker.state(), nowMs });
+  const st = breaker.state();
+  const host = cfg?.sftp?.host || 'recording archive';
+  const port = cfg?.sftp?.port || '';
+  try {
+    await reportAlertCondition({
+      key: ARCHIVE_ALERT_KEY,
+      active: decision.active,
+      label: 'Call-recording archive unreachable',
+      channel: 'ops',
+      remindMs: 24 * 60 * 60 * 1000,
+      text: async () => {
+        let waiting = null;
+        try {
+          const { count } = await db.from('ci_calls').select('id', { count: 'exact', head: true }).eq('status', 'discovered');
+          waiting = count;
+        } catch { /* the card still goes out without the count */ }
+        return formatArchiveOutageAlert({
+          host, port, outageMs: decision.outageMs, lastError: st.lastError, waiting,
+          nextTryMs: Math.min(ARCHIVE_MAX_COOLDOWN_MS, Math.max(0, st.openUntil - nowMs)),
+        });
+      },
+      recoveredText: formatArchiveRecovered({ host, port }),
+      detail: st.lastError || undefined,
+    });
+  } catch (err) {
+    console.warn(`${LOG} archive outage alert failed: ${err.message}`);
+  }
+  return decision;
 }
 
 /**
@@ -1192,10 +1261,15 @@ export async function runTick({ db = supabase, cfg = getConfig(), adapter, trans
     const listings = createListingCache({ adapter: sftp, cfg });
 
     const outcomes = {};
+    const archiveTally = { reachable: 0, unreachable: 0, paused: 0 };
     for (const call of batch.rows) {
       const r = await advanceOne(call, { db, cfg, adapter: sftp, listings, transcriber, loadAudio, callJson, lpClient, ghlClient, now, canvasserPhones: roster, agentMap: agents });
       outcomes[r.outcome] = (outcomes[r.outcome] || 0) + 1;
+      if (r.archive === 'reachable') archiveTally.reachable++;
+      else if (r.outcome === 'archive_unreachable') archiveTally.unreachable++;
+      else if (r.outcome === 'archive_paused') archiveTally.paused++;
     }
+    await reportArchiveOutage({ db, cfg, tally: archiveTally });
     // The listing line is the measurement, not decoration: pairs well below
     // calls is this cache working, and pairs == calls is it silently bypassed.
     const listed = listings.stats();
