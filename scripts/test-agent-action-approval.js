@@ -184,7 +184,7 @@ test('D1 — removed action types are absent from ACTION_HANDLERS entirely', asy
   }
 });
 
-test('D1 — the registry holds exactly the 77 documented action types', async () => {
+test('D1 — the registry holds exactly the 78 documented action types', async () => {
   const { ACTION_HANDLERS } = await import('../src/actions/index.js');
   const types = Object.keys(ACTION_HANDLERS);
   // The header comment in src/actions/index.js enumerates these by name. It
@@ -203,7 +203,9 @@ test('D1 — the registry holds exactly the 77 documented action types', async (
   // 2026-09-24 (Mark Test, the "comparison" that never arrived): 76 → 77,
   // send_info_email — the bot's reply said an email was on its way and nothing
   // could send one. See src/actions/handlers/info-email.js.
-  assert.equal(types.length, 77);
+  // 2026-09-27 (Inbound Caller Capture): 77 → 78, capture_inbound_caller — what
+  // an approved capture runs. See src/actions/handlers/inbound-capture.js.
+  assert.equal(types.length, 78);
   assert.equal(types.filter(t => t.startsWith('five9_')).length, 38);
   // Every type the coercion loop covers must actually be dispatchable.
   for (const actionType of FIVE9_WRITE_TYPES) {

@@ -2311,4 +2311,52 @@ export const STARTUP_MIRRORS = [
     fail: '[Migration] payroll engine tables (sql/132) skipped — apply sql/132 from the dashboard; payroll runs fail gracefully until it exists:',
     level: 'warn',
   },
+
+  // Inbound Caller Capture (sql/133, 2026-09-27 — the file is the source of
+  // truth). Additive: one table and a view over it. The table is also the
+  // job's idempotency record, so until it exists the job stores nothing and
+  // creates nothing in any mode — it logs and skips.
+  {
+    name: 'sql/133',
+    expects: {
+      tables: ['inbound_capture_daily'],
+      columns: [
+        ['v_inbound_capture_summary', 'run_date'],
+        ['v_inbound_capture_summary', 'label'],
+        ['v_inbound_capture_summary', 'team'],
+        ['v_inbound_capture_summary', 'callers'],
+      ],
+      views: ['v_inbound_capture_summary'],
+    },
+    sql: [
+      `CREATE TABLE IF NOT EXISTS inbound_capture_daily (
+              id bigserial PRIMARY KEY,
+              run_at timestamptz NOT NULL,
+              caller_phone text NOT NULL,
+              call_at timestamptz NOT NULL,
+              campaign text,
+              team text,
+              agent_name text,
+              disposition text,
+              minutes numeric,
+              label text NOT NULL,
+              mode text NOT NULL,
+              action_taken text NOT NULL DEFAULT 'none',
+              ghl_contact_id text,
+              agent_action_id bigint,
+              created_at timestamptz DEFAULT now(),
+              UNIQUE (caller_phone, call_at)
+            );`,
+      `CREATE OR REPLACE VIEW v_inbound_capture_summary AS
+            SELECT (run_at AT TIME ZONE 'America/New_York')::date AS run_date,
+                   label,
+                   team,
+                   count(DISTINCT caller_phone) AS callers
+              FROM inbound_capture_daily
+             GROUP BY 1, 2, 3;`,
+    ],
+    ready: '[Migration] inbound_capture_daily + v_inbound_capture_summary (sql/133) ready',
+    fail: '[Migration] inbound_capture_daily (sql/133) skipped — apply it from the dashboard; inbound caller capture stores and creates nothing until it exists:',
+    level: 'warn',
+  },
 ];
