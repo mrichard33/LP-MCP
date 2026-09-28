@@ -2310,7 +2310,7 @@ export const STARTUP_MIRRORS = [
               lead_created_date date,
               rule_id uuid REFERENCES pay_rules(id),
               amount_cents integer NOT NULL DEFAULT 0,
-              status text NOT NULL CHECK (status IN ('pending','needs_review','disputed','excluded','approved','paid')),
+              status text NOT NULL CHECK (status IN ('pending','needs_review','disputed','excluded','info','approved','paid')),
               flag_reason text,
               source_report text NOT NULL DEFAULT '134 Jobs by Milestone Date',
               created_at timestamptz NOT NULL DEFAULT now(),
@@ -2380,21 +2380,62 @@ export const STARTUP_MIRRORS = [
     level: 'warn',
   },
 
-  // lp_leads.lp_deleted_at (sql/134, 2026-09-27 — the file is the source of
+  // Payroll dispute tickets (sql/134, 2026-09-27 — the file is the source of
+  // truth). Mirrors the new table and its indexes only. The file's ALTER of the
+  // payroll_ledger status CHECK (adds 'info') and its pay_rules UPDATE are
+  // applied from the dashboard; a fresh database gets 'info' from the sql/132
+  // block above, which already carries the widened CHECK.
+  {
+    name: 'sql/134',
+    expects: {
+      tables: ['payroll_disputes'],
+      indexes: ['payroll_disputes_partner_status_idx', 'payroll_disputes_one_open_per_line_idx'],
+    },
+    sql: [
+      `CREATE TABLE IF NOT EXISTS payroll_disputes (
+              id bigserial PRIMARY KEY,
+              partner_id uuid NOT NULL REFERENCES lf_partners(id),
+              ledger_id uuid REFERENCES payroll_ledger(id),
+              lp_lead_id text NOT NULL,
+              event_type text NOT NULL,
+              event_date date,
+              claimed_amount_cents integer,
+              reason text NOT NULL,
+              status text NOT NULL DEFAULT 'open' CHECK (status IN ('open','approved','denied')),
+              filed_by_email text NOT NULL,
+              filed_at timestamptz NOT NULL DEFAULT now(),
+              decided_by text,
+              decided_at timestamptz,
+              decision_note text,
+              approved_amount_cents integer,
+              applied_run_id uuid REFERENCES payroll_runs(id),
+              created_at timestamptz NOT NULL DEFAULT now()
+            );`,
+      `CREATE INDEX IF NOT EXISTS payroll_disputes_partner_status_idx ON payroll_disputes (partner_id, status);`,
+      `CREATE UNIQUE INDEX IF NOT EXISTS payroll_disputes_one_open_per_line_idx
+              ON payroll_disputes (ledger_id) WHERE status = 'open' AND ledger_id IS NOT NULL;`,
+      `ALTER TABLE payroll_disputes ENABLE ROW LEVEL SECURITY;`,
+    ],
+    ready: '[Migration] payroll_disputes (sql/134) ready',
+    fail: '[Migration] payroll_disputes (sql/134) skipped — apply sql/134 from the dashboard; dispute tickets cannot be filed until it exists:',
+    level: 'warn',
+  },
+
+  // lp_leads.lp_deleted_at (sql/135, 2026-09-27 — the file is the source of
   // truth). One nullable column, no default: metadata-only. The capacity sweep
   // stamps it when LP returns a lead's customer without the lead, and the board
   // counts and near-window refresh read `lp_deleted_at IS NULL` — so the column
   // must exist before the sweep's first pass, which is why it is mirrored.
   {
-    name: 'sql/134',
+    name: 'sql/135',
     expects: {
       columns: [
         ['lp_leads', 'lp_deleted_at'],
       ],
     },
     sql: 'ALTER TABLE lp_leads ADD COLUMN IF NOT EXISTS lp_deleted_at timestamptz;',
-    ready: '[Migration] lp_leads.lp_deleted_at (sql/134) ready',
-    fail: '[Migration] lp_leads.lp_deleted_at (sql/134) FAILED — the capacity board and near-window refresh query this column and will error until sql/134 is applied from the dashboard:',
+    ready: '[Migration] lp_leads.lp_deleted_at (sql/135) ready',
+    fail: '[Migration] lp_leads.lp_deleted_at (sql/135) FAILED — the capacity board and near-window refresh query this column and will error until sql/135 is applied from the dashboard:',
     level: 'error',
   },
 ];

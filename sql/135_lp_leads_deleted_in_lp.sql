@@ -1,5 +1,5 @@
 -- ════════════════════════════════════════════════════════════════════
--- sql/134 — lp_leads.lp_deleted_at: a lead LP no longer has (2026-09-27)
+-- sql/135 — lp_leads.lp_deleted_at: a lead LP no longer has (2026-09-27)
 --
 -- Run in the Supabase dashboard SQL editor, LP MCP instance. Additive only:
 -- one nullable column, no default, no backfill — a metadata-only change.
@@ -31,4 +31,4 @@ ALTER TABLE lp_leads ADD COLUMN IF NOT EXISTS lp_deleted_at timestamptz;
 
 COMMENT ON COLUMN lp_leads.lp_deleted_at IS
   'Set when LP returned this lead''s customer without the lead (LP deleted it, usually a duplicate). '
-  'NULL = present in LP as far as we know. Excluded from the capacity board. See sql/134.';
+  'NULL = present in LP as far as we know. Excluded from the capacity board. See sql/135.';

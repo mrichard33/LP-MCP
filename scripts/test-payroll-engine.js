@@ -27,7 +27,7 @@ const PERIOD = { start: '2026-09-14', end: '2026-09-20' };
 
 const RULES = [
   { id: 'r-canvass', payee_type: 'partner', partner_id: PARTNER.id, campaign: null, event_type: 'canvass_confirmed_appt',
-    amount_cents: 1500, pct: null, lead_age_rule: 'any', requires_review: true, effective_from: '2026-09-01', effective_to: null, active: true },
+    amount_cents: 1500, pct: null, lead_age_rule: 'any', requires_review: false, effective_from: '2026-09-01', effective_to: null, active: true },
   { id: 'r-demo', payee_type: 'partner', partner_id: PARTNER.id, campaign: null, event_type: 'completed_demo',
     amount_cents: 25000, pct: null, lead_age_rule: 'aged_only', requires_review: false, effective_from: '2026-09-01', effective_to: null, active: true },
   { id: 'r-direct', payee_type: 'partner', partner_id: PARTNER.id, campaign: null, event_type: 'direct_job_net',
@@ -125,6 +125,8 @@ function fakeStore({
     },
     async findActiveApprover(email) { return approvers.find((a) => a.email === email && a.active) || null; },
     async missingLeadCheck() { return missing; },
+    async listUnappliedApprovedDisputes() { return []; },
+    async updateDispute() { return null; },
   };
 }
 
@@ -163,14 +165,14 @@ test('1. an AI setter on any event is excluded at $0', () => {
 
 /* ─── 2. aged-only demo ─────────────────────────────────────────────────── */
 
-test('2. demo: lead 29 days old at set date is disputed; 30 days old is pending $250', () => {
+test('2. demo: lead 29 days old at set date is a $0 info row (not flagged); 30 days old is pending $250', () => {
   const young = lead({ created_at_lp: at('2026-08-17'), set_date: at('2026-09-15'), ever_sat: true, demo_date: at('2026-09-17') });
   const aged = lead({ lp_lead_id: '500009', created_at_lp: at('2026-08-16'), set_date: at('2026-09-15'), ever_sat: true, demo_date: at('2026-09-17') });
   const [y, a] = eventsFor({ demoLeads: [young, aged] });
   const ly = evaluateLine(y, ctx());
-  assert.equal(ly.status, 'disputed');
+  assert.equal(ly.status, 'info');
   assert.equal(ly.amount_cents, 0);
-  assert.equal(ly.flag_reason, 'new-lead demo billed at aged rate');
+  assert.equal(ly.flag_reason, 'not payable – new lead (paid 1.5% on net)');
   const la = evaluateLine(a, ctx());
   assert.equal(la.status, 'pending');
   assert.equal(la.amount_cents, 25000);
@@ -186,13 +188,24 @@ test('2b. an unknown lead age fails closed to needs_review, never guessed', () =
 
 /* ─── 3. canvass confirmation ───────────────────────────────────────────── */
 
-test('3. a canvass-confirmed appointment by an LF agent is needs_review at $15', () => {
+test('3. a canvass confirmation recorded to an LF agent is pending $15 — no review (ruled 2026-09-27)', () => {
   const [ev] = eventsFor({ canvassLeads: [lead({ lead_source: 'Canvass Sticky', set_by_name: 'No, Setter', confirmed_by_name: 'Wright - LF, Carla', confirmed_date: at('2026-09-18') })] });
   assert.equal(ev.event_type, EVENT_CANVASS_CONFIRM);
   const l = evaluateLine(ev, ctx());
-  assert.equal(l.status, 'needs_review');
+  assert.equal(l.status, 'pending');
   assert.equal(l.amount_cents, 1500);
-  assert.equal(l.flag_reason, 'caller unprovable (LightFire dialer)');
+  assert.equal(l.flag_reason, null);
+});
+
+test('3b. a canvass confirmation with nobody recorded as confirmer does not match up → needs_review', () => {
+  const [ev] = eventsFor({ canvassLeads: [lead({ lead_source: 'Canvass', confirmed_by_name: 'No, Setter', confirmed_date: at('2026-09-18') })] });
+  const l = evaluateLine(ev, ctx());
+  assert.equal(l.status, 'needs_review');
+  assert.match(l.flag_reason, /no confirmer recorded/);
+  // A rule that still says requires_review keeps sending LF confirmations to review.
+  const [lf] = eventsFor({ canvassLeads: [lead({ lead_source: 'Canvass', confirmed_by_name: 'Deer - LF, Craig', confirmed_date: at('2026-09-18') })] });
+  const strict = RULES.map((r) => (r.id === 'r-canvass' ? { ...r, requires_review: true } : r));
+  assert.equal(evaluateLine(lf, ctx({ rules: strict })).status, 'needs_review');
 });
 
 /* ─── 4. Direct 1.5% ────────────────────────────────────────────────────── */
@@ -247,7 +260,7 @@ test('5b. end to end: a key paid last week comes back disputed', async () => {
 
 test('6. running the same period twice adds no duplicate lines and keeps a resolution', async () => {
   const demo = lead({ created_at_lp: at('2026-05-01'), ever_sat: true, demo_date: at('2026-09-16') });
-  const store = fakeStore({ demos: [demo], canvass: [lead({ lp_lead_id: '500003', lead_source: 'Canvass', confirmed_by_name: 'Deer - LF, Craig', confirmed_date: at('2026-09-15') })] });
+  const store = fakeStore({ demos: [demo], canvass: [lead({ lp_lead_id: '500003', lead_source: 'Canvass', confirmed_by_name: 'No, Setter', confirmed_date: at('2026-09-15') })] });
   const first = (await run(store)).out;
   const runId = first.results.find((r) => r.payee === 'lightfire').run_id;
   assert.equal(store.state.lines.length, 2);
@@ -342,7 +355,7 @@ test('9. shadow never shows an Approve button and never approves or pays', async
   assert.ok(store.state.lines.every((l) => !['approved', 'paid'].includes(l.status)));
 });
 
-test('9b. live: Approve moves only pending lines; needs_review/disputed stay out; paid is a person', async () => {
+test('9b. live: Approve moves only pending lines; info/flagged lines stay out; paid is a person', async () => {
   const demo = lead({ created_at_lp: at('2026-05-01'), ever_sat: true, demo_date: at('2026-09-16') });
   const young = lead({ lp_lead_id: '500020', created_at_lp: at('2026-09-01'), set_date: at('2026-09-10'), ever_sat: true, demo_date: at('2026-09-16') });
   const store = fakeStore({ demos: [demo, young], approvers: [{ email: 'mark@x.com', name: 'Mark Richard', active: true }] });
@@ -360,7 +373,7 @@ test('9b. live: Approve moves only pending lines; needs_review/disputed stay out
   const run1 = store.state.runs.find((r) => r.id === lf.run_id);
   assert.equal(run1.status, 'approved');
   assert.equal(run1.approved_by, 'Mark Richard');
-  assert.equal(store.state.lines.find((l) => l.lp_lead_id === '500020').status, 'disputed');
+  assert.equal(store.state.lines.find((l) => l.lp_lead_id === '500020').status, 'info');
   assert.ok(store.state.audits.some((x) => x.action === 'approved' && x.actor === 'Mark Richard'));
 
   const again = await approvePayrollRun({ runId: lf.run_id, slackUserId: 'U1' }, { store, lookupEmail: async () => ({ email: 'mark@x.com' }) });
@@ -370,20 +383,18 @@ test('9b. live: Approve moves only pending lines; needs_review/disputed stay out
   const paid = await markPayrollRunPaid({ runId: lf.run_id, actor: 'Mark', confirm: true }, { store });
   assert.equal(paid.ok, true);
   assert.equal(store.state.lines.find((l) => l.lp_lead_id === '500001').status, 'paid');
-  assert.equal(store.state.lines.find((l) => l.lp_lead_id === '500020').status, 'disputed');
+  assert.equal(store.state.lines.find((l) => l.lp_lead_id === '500020').status, 'info');
 });
 
 /* ─── 10. No, Setter ────────────────────────────────────────────────────── */
 
-test('10. "No, Setter" on a canvass lead → needs_review; on any other lead → no line', () => {
+test('10. "No, Setter" earns no demo or Direct line, canvass or not (ruled 2026-09-27)', () => {
   const canvass = lead({ lead_source: 'Canvass', set_by_name: 'No, Setter', created_at_lp: at('2026-05-01'), ever_sat: true, demo_date: at('2026-09-16') });
   const vendor = lead({ lp_lead_id: '500030', lead_source: 'Affiliates', set_by_name: 'No, Setter', ever_sat: true, demo_date: at('2026-09-16') });
-  const evs = eventsFor({ demoLeads: [canvass, vendor] });
-  assert.equal(evs.length, 1, 'the vendor pre-set earns nothing and is not flagged');
-  const l = evaluateLine(evs[0], ctx());
-  assert.equal(l.status, 'needs_review');
-  assert.match(l.flag_reason, /no phone setter/);
-  assert.equal(l.amount_cents, 25000);
+  const netted = { lead: lead({ lp_lead_id: '500031', lead_source: 'Canvass', set_by_name: 'No, Setter', created_at_lp: at('2026-09-01'), set_date: at('2026-09-02') }),
+    job_number: 'C77', rtp_date: '2026-09-16', net_cents: 500000 };
+  const evs = eventsFor({ demoLeads: [canvass, vendor], netJobs: [netted] });
+  assert.equal(evs.length, 0, 'LightFire did not set a pre-set appointment; its $15 confirmation is its pay');
   // Canvass is decided by lead_source, never by the setter text.
   assert.equal(isCanvassLead({ lead_source: 'Internet', set_by_name: 'No, Setter' }), false);
   assert.equal(isCanvassLead({ lead_source: 'Canvass Sticky' }), true);

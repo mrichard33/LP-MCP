@@ -137,5 +137,5 @@ test('every board count and the near-window selection exclude lp_deleted_at rows
   const blocks = src.split(/FROM lp_leads\b/).slice(1).map((b) => b.slice(0, 400));
   const byAppt = blocks.filter((b) => /appointment_date IS NOT NULL/.test(b));
   assert.ok(byAppt.length >= 5, `expected the numerator, hourly, snapshot, refresh and coverage reads, found ${byAppt.length}`);
-  for (const b of byAppt) assert.match(b, /lp_deleted_at IS NULL/, `an lp_leads read by appointment_date ignores sql/134:\n${b.slice(0, 200)}`);
+  for (const b of byAppt) assert.match(b, /lp_deleted_at IS NULL/, `an lp_leads read by appointment_date ignores sql/135:\n${b.slice(0, 200)}`);
 });
