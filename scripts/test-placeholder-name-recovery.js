@@ -13,7 +13,7 @@ process.env.GHL_API_KEY = process.env.GHL_API_KEY || 'test-key';
 
 const {
   needsNameRecovery, buildRecoveryCorpus, isTrustworthyName, recoverPlaceholderName,
-  pickLpRealName, lpProspectsNeedingName,
+  pickLpRealName, lpProspectsNeedingName, trustworthyLastName,
 } = await import('../src/services/placeholder-name-recovery.js');
 const { resolveHandlerTimeoutMs } = await import('../src/actions/index.js');
 const { llmBudgetMs } = await import('../src/llm-client.js');
@@ -275,4 +275,48 @@ test('run: no run id → nothing is written', async () => {
   } finally {
     if (prevUrl !== undefined) process.env.HL_SUPABASE_URL = prevUrl;
   }
+});
+
+// ─── 2026-09-28 first live dry run: three non-names it promoted ───
+// Transcripts are the live Chat Transcript fields of those contacts.
+
+test('an all-caps menu reply is not a name (59eU0qiZ0BwhV1BZGFfm)', () => {
+  const turns = buildRecoveryCorpus('DO YOU REPLACE JUST ONE WINDOW / 352-751-1201   KJHBI@AOL.COM / ANSWER QUESTIONS / SINGLE FAMILY', []);
+  assert.equal(isTrustworthyName('Answer', turns), false);
+  assert.equal(isTrustworthyName('ANSWER', turns), false);
+});
+test('lowercase words after "I\'m" are not a name (sepi4pLeWMRFg8B3CZtF)', () => {
+  const turns = buildRecoveryCorpus("hi mam good morning mam I'm pilipina speack tagalog only / 3524846403 / ok ako po ay si Lory", []);
+  assert.equal(isTrustworthyName('Pilipina', turns), false);
+  assert.equal(isTrustworthyName('Lory', turns), true, 'the name she did give is written like a name');
+});
+test('a possessive is not a surname; the first name survives (sgt5AGF0AVTBaMNr7Loq)', async () => {
+  const t = "hi, this is Jason TINA's husband. I was trying to get a hold of Christopher. 407-443-0444.";
+  const turns = buildRecoveryCorpus(t, []);
+  assert.equal(isTrustworthyName('Jason', turns), true);
+  assert.equal(trustworthyLastName("TINA's", turns), '');
+  const { deps, calls } = fakeDeps({ extracted: identity('Jason', "TINA's") });
+  const r = await recoverPlaceholderName('j1', { firstName: 'guest' }, { transcript: t }, deps);
+  assert.equal(r.found, true);
+  assert.deepEqual(calls.updates[0], { firstName: 'Jason', lastName: '' });
+});
+test('names the dry run got right still pass', () => {
+  let turns = buildRecoveryCorpus('I received a message that my windows are ready. / Carmen Díaz, my phone number is 407-719-4432.', []);
+  assert.equal(isTrustworthyName('Carmen', turns), true);
+  assert.equal(trustworthyLastName('Díaz', turns), 'Díaz');
+  turns = buildRecoveryCorpus('need speak to somebody Ana 3214426724', []);
+  assert.equal(isTrustworthyName('Ana', turns), true);
+  turns = buildRecoveryCorpus('Hello can you provide the QMID number? / Mike 954-345-3234', []);
+  assert.equal(isTrustworthyName('Mike', turns), true);
+});
+test('"my name is" counts in any casing; a bare lowercase name does not', () => {
+  assert.equal(isTrustworthyName('Joe', buildRecoveryCorpus('hi my name is joe smith', [])), true);
+  assert.equal(isTrustworthyName('Joe', buildRecoveryCorpus('hi this is joe', [])), false);
+});
+test('a name glued inside another word is not a match', () => {
+  assert.equal(isTrustworthyName('Ana', buildRecoveryCorpus('Anastasia here, call me', [])), false);
+});
+test('LP names holding two people keep the first ("Robert Edward/ Barbara")', () => {
+  assert.deepEqual(pickLpRealName([{ first_name: 'Robert Edward/ Barbara', last_name: 'Staufenberg ' }]),
+    { firstName: 'Robert Edward', lastName: 'Staufenberg' });
 });

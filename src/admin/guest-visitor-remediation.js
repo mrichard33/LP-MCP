@@ -39,8 +39,8 @@
  *      and a check that the name is in the customer's own words. The
  *      heuristic-only pass missed names typed next to a phone number
  *      ("Britt Austen 386-898-1082"), and the old live check skipped a bare
- *      "guest" as a "real name". When the chat has no name but LP already
- *      does (a call or vendor feed learned it), that name is written to GHL.
+ *      "guest" as a "real name". When LP already has the name (a call or a
+ *      vendor feed learned it), LP's name wins and the chat is not read.
  *      Any LP prospect still carrying the placeholder gets the real name via
  *      UpdateProspectInfo (first/last name only — never blanks a field).
  *   3. Every mutation logs system_events `remediation.guest_visitor`.
@@ -328,30 +328,32 @@ export async function runGuestVisitorRemediation({
           record(contactId, 'warn', `lp_leads read failed: ${err.message}`);
         }
 
-        // Source 1: the chat. Dry run swaps the GHL writes for no-ops.
-        const transcript = readCustomField(contact, TRANSCRIPT_FIELD_ID);
-        let rec = { found: false, reason: 'not attempted' };
-        try {
-          rec = await recoverPlaceholderName(contactId, contact, { transcript: transcript || '' },
-            dryRun ? { updateFields: async () => 'dry_run', removeTags: async () => {} } : {});
-        } catch (err) {
-          record(contactId, 'error', `chat name recovery failed: ${err.message}`);
-        }
-
+        // Source 1: LP. A name LP holds came from a vendor form or a person on
+        // the phone — better evidence than anything read out of a chat, and it
+        // costs no model call. 2026-09-28: the first dry run took "ANSWER
+        // QUESTIONS" from the chat of a contact LP had as Robert Staufenberg.
         let realName = null;
-        if (rec.found) {
-          realName = { firstName: rec.firstName, lastName: rec.lastName };
-          record(contactId, 'promoted', `${Object.entries(rec.payload).map(([k, v]) => `${k}=${v}`).join(', ')} (from chat; ghl_write=${rec.ghlWrite})`);
-          await logRemediation(contactId, 'promoted', { ...rec.payload, source: 'chat', ghl_write: rec.ghlWrite });
+        const lpName = pickLpRealName(lpRows);
+        let rec = { found: false, reason: 'not attempted' };
+        if (lpName) {
+          await putStandardFields(contactId, lpName);
+          if (tags.includes(NAME_PLACEHOLDER_TAG)) await removeTags(contactId, [NAME_PLACEHOLDER_TAG]);
+          realName = lpName;
+          record(contactId, 'promoted_from_lp', `firstName=${lpName.firstName}, lastName=${lpName.lastName}`);
+          await logRemediation(contactId, 'promoted_from_lp', lpName);
         } else {
-          // Source 2: LP already knows the name (phone call / vendor feed).
-          const lpName = pickLpRealName(lpRows);
-          if (lpName) {
-            await putStandardFields(contactId, lpName);
-            if (tags.includes(NAME_PLACEHOLDER_TAG)) await removeTags(contactId, [NAME_PLACEHOLDER_TAG]);
-            realName = lpName;
-            record(contactId, 'promoted_from_lp', `firstName=${lpName.firstName}, lastName=${lpName.lastName}`);
-            await logRemediation(contactId, 'promoted_from_lp', lpName);
+          // Source 2: the chat. Dry run swaps the GHL writes for no-ops.
+          const transcript = readCustomField(contact, TRANSCRIPT_FIELD_ID);
+          try {
+            rec = await recoverPlaceholderName(contactId, contact, { transcript: transcript || '' },
+              dryRun ? { updateFields: async () => 'dry_run', removeTags: async () => {} } : {});
+          } catch (err) {
+            record(contactId, 'error', `chat name recovery failed: ${err.message}`);
+          }
+          if (rec.found) {
+            realName = { firstName: rec.firstName, lastName: rec.lastName };
+            record(contactId, 'promoted', `${Object.entries(rec.payload).map(([k, v]) => `${k}=${v}`).join(', ')} (from chat; ghl_write=${rec.ghlWrite})`);
+            await logRemediation(contactId, 'promoted', { ...rec.payload, source: 'chat', ghl_write: rec.ghlWrite });
           }
         }
 
