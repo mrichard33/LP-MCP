@@ -608,3 +608,11 @@ test('review: posts the card with the shared secret header and records the reque
   assert.equal(posts[0].init.headers['X-DNC-Lift-Secret'], SECRET);
   assert.equal(JSON.parse(posts[0].init.body).sms_carrier_stop, true);
 });
+
+test('backfill: every candidate read is paged (PostgREST caps a plain read at 1,000 rows)', () => {
+  const src = readFileSync(new URL('./backfill-contact-consent.js', import.meta.url), 'utf8');
+  assert.match(src, /selectAllPaged\(supabase, 'contact_tag_snapshot'/);
+  assert.match(src, /selectAllPaged\(supabase, 'agentic_messages'/);
+  assert.match(src, /selectAllIn\(supabase, 'contact_consent'/);
+  assert.doesNotMatch(src, /from\('contact_tag_snapshot'\)/, 'a plain select would silently stop at 1,000 rows');
+});

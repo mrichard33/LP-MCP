@@ -109,19 +109,28 @@ export function backfillEventFor(state) {
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const { default: supabase } = await import('../src/supabase.js');
+  if (!supabase) throw new Error('SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY are not set (LP instance) — nothing was read');
   const { ghlFetch } = await import('../src/actions/helpers.js');
+  const { selectAllPaged, selectAllIn } = await import('../src/supabase-page.js');
 
   // ── candidates ──
-  const snap = await supabase.from('contact_tag_snapshot')
-    .select('ghl_contact_id, tags')
-    .overlaps('tags', CANDIDATE_TAGS);
-  if (snap.error) throw new Error(`contact_tag_snapshot read failed: ${snap.error.message}`);
-  const unsub = await supabase.from('agentic_messages')
-    .select('ghl_contact_id').not('unsubscribed_at', 'is', null);
-  if (unsub.error) throw new Error(`agentic_messages read failed: ${unsub.error.message}`);
-  const unsubSet = new Set((unsub.data || []).map((r) => r.ghl_contact_id).filter(Boolean));
+  // PAGED, not a single select (fixed 2026-09-28, before the first run):
+  // PostgREST silently caps a read at 1,000 rows and the snapshot holds 1,206
+  // candidates, so a plain select would have backfilled ~1,000 and reported
+  // that as the whole population. selectAllPaged throws on a short read.
+  const snap = await selectAllPaged(supabase, 'contact_tag_snapshot', {
+    columns: 'ghl_contact_id, tags',
+    orderBy: 'ghl_contact_id',
+    refine: (q) => q.overlaps('tags', CANDIDATE_TAGS),
+  });
+  const unsub = await selectAllPaged(supabase, 'agentic_messages', {
+    columns: 'id, ghl_contact_id',
+    orderBy: 'id',
+    refine: (q) => q.not('unsubscribed_at', 'is', null),
+  });
+  const unsubSet = new Set(unsub.map((r) => r.ghl_contact_id).filter(Boolean));
 
-  const byId = new Map((snap.data || []).map((r) => [r.ghl_contact_id, r.tags || []]));
+  const byId = new Map(snap.map((r) => [r.ghl_contact_id, r.tags || []]));
   for (const id of unsubSet) if (!byId.has(id)) byId.set(id, []);
   let ids = [...byId.keys()].filter(Boolean).sort();
   if (args.limit) ids = ids.slice(0, args.limit);
@@ -129,7 +138,10 @@ async function main() {
   // ── derive ──
   const rows = [];
   const counts = { candidates: ids.length, live_read_failed: 0, no_opt_out_now: 0, dnc_full: 0, sms_carrier_stop: 0, phone_revoked: 0, email_revoked: 0 };
+  console.error(`[backfill] ${ids.length} candidates — reading ${args.snapshotOnly ? 'the tag snapshot' : 'live GHL contacts (this takes a while)'}…`);
+  let seen = 0;
   for (const id of ids) {
+    if (++seen % 100 === 0) console.error(`[backfill] ${seen}/${ids.length}`);
     let tags = byId.get(id);
     let dndSettings = null;
     let readFrom = 'snapshot';
@@ -152,13 +164,13 @@ async function main() {
   }
 
   // Existing rows are left alone, so the dry run reports what --execute would insert.
-  const existing = new Set();
-  for (let i = 0; i < rows.length; i += 500) {
-    const chunk = rows.slice(i, i + 500).map((r) => r.id);
-    const ex = await supabase.from('contact_consent').select('ghl_contact_id').in('ghl_contact_id', chunk);
-    if (ex.error) throw new Error(`contact_consent read failed (apply sql/136 first): ${ex.error.message}`);
-    for (const r of ex.data || []) existing.add(r.ghl_contact_id);
-  }
+  const existingRows = await selectAllIn(supabase, 'contact_consent', {
+    columns: 'ghl_contact_id',
+    orderBy: 'ghl_contact_id',
+    column: 'ghl_contact_id',
+    values: rows.map((r) => r.id),
+  });
+  const existing = new Set(existingRows.map((r) => r.ghl_contact_id));
   const toInsert = rows.filter((r) => !existing.has(r.id));
 
   const report = {
@@ -219,5 +231,8 @@ async function main() {
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
-  main().catch((err) => { console.error(err); process.exit(1); });
+  // process.exit on success too: imported modules (the GHL rate limiter) keep
+  // timers alive, and a script that never returns to the prompt looks hung.
+  main().then(() => process.exit(process.exitCode || 0))
+    .catch((err) => { console.error(err); process.exit(1); });
 }
