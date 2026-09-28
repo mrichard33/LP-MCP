@@ -59,12 +59,19 @@ const ops = Object.keys(OP_CLASSIFICATION).sort((a, b) => a.localeCompare(b));
 
 const count = (pred) => ops.filter((o) => pred(OP_CLASSIFICATION[o])).length;
 const tierCount = (t) => count((r) => r.tier === t);
-const registered = new Map(OP_REGISTRY.map((e) => [e.soapOperation, e.actionType]));
+// An operation can have more than one action type: removeNumbersFromDnc has
+// the re-entry lift and (2026-09-28) the Slack-approved lift. A Map keyed on
+// the operation kept only the last one and hid the other.
+const registered = new Map();
+for (const e of OP_REGISTRY) {
+  if (!registered.has(e.soapOperation)) registered.set(e.soapOperation, []);
+  registered.get(e.soapOperation).push(e.actionType);
+}
 
 const rows = ops.map((op) => {
   const r = OP_CLASSIFICATION[op];
-  const at = registered.get(op);
-  const name = at ? `\`${op}\`<br>→ \`${at}\`` : `\`${op}\``;
+  const ats = registered.get(op) || [];
+  const name = ats.length ? `\`${op}\`` + ats.map((at) => `<br>→ \`${at}\``).join('') : `\`${op}\``;
   return `| ${name} | ${r.kind} | **${r.tier}** | ${r.status} | ${esc(r.reason)} |`;
 });
 

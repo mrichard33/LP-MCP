@@ -438,9 +438,10 @@ test('the registry matches the handler map that is actually wired up', async () 
   assert.deepEqual(registered, live, 'registry and ACTION_HANDLERS have diverged');
   // PR3 registered 24 and no more. PR4 adds 13: the web connector pair plus
   // 11 campaign-composition ops. 2026-09-21 adds the 38th, the one welded
-  // re-entry DNC lift. The number is pinned so the NEXT tranche moves it
+  // re-entry DNC lift. 2026-09-28 adds the 39th, the Slack-approved DNC lift
+  // (Consent Model v1). The number is pinned so the NEXT tranche moves it
   // deliberately, in that PR, rather than by accident here.
-  assert.equal(live.length, 38, 'PR3’s 24 + PR4’s 13 + the re-entry DNC lift');
+  assert.equal(live.length, 39, 'PR3’s 24 + PR4’s 13 + the re-entry lift + the Slack-approved lift');
 });
 
 test('PR4 — removeDispositionsFromCampaign is BUILT but UNREGISTERED', async () => {
@@ -545,17 +546,31 @@ test('five9_remove_numbers_from_dnc still resolves to "Unknown action type"', as
 
   assert.ok(schema.operations.removeNumbersFromDnc, 'precondition: the SOAP op does exist in v13');
 
-  // Exactly one caller, and it is the welded one. A SECOND entry here is the
-  // change that would quietly restore general removal.
+  // Exactly TWO callers, both welded. 2026-09-28 (Consent Model v1) added the
+  // Slack-approved lift by handoff; a THIRD entry here is the change that
+  // would quietly restore general removal.
   const callers = OP_REGISTRY.filter((e) => e.soapOperation === 'removeNumbersFromDnc');
-  assert.deepEqual(callers.map((e) => e.actionType), ['five9_remove_numbers_from_dnc_reentry'],
-    'removeNumbersFromDnc may have exactly ONE caller, the re-entry lift');
-  assert.equal(callers[0].tier, 'gated', 'it is gated, never enabled — the gate is the whole design');
+  assert.deepEqual(callers.map((e) => e.actionType).sort(),
+    ['five9_remove_numbers_from_dnc_approved', 'five9_remove_numbers_from_dnc_reentry'],
+    'removeNumbersFromDnc may have exactly TWO callers: the re-entry lift and the Slack-approved lift');
+  for (const c of callers) {
+    assert.equal(c.tier, 'gated', `${c.actionType} is gated, never enabled — the gate is the whole design`);
+  }
 
   // The classification must still carry the original ruling, so the next
   // reader sees what was amended rather than only what is allowed now.
   assert.match(OP_CLASSIFICATION.removeNumbersFromDnc.reason, /2026-08-21/);
   assert.match(OP_CLASSIFICATION.removeNumbersFromDnc.reason, /DNC_LIFT_ON_REENTRY_E0/);
+  assert.match(OP_CLASSIFICATION.removeNumbersFromDnc.reason, /SLACK_DNC_LIFT/);
+});
+
+test('the Slack-approved lift REFUSES every caller but its one rule', async () => {
+  const writes = await import('../src/five9/admin-writes.js');
+  await assert.rejects(
+    () => writes.executeRemoveNumbersFromDncApproved(
+      { id: 1, target_id: 'c1', rule_applied: 'DNC_LIFT_ON_REENTRY_E0', action_payload: {} }, {}),
+    /REFUSED: five9_remove_numbers_from_dnc_approved — runs only for SLACK_DNC_LIFT/,
+  );
 });
 
 test('the re-entry lift REFUSES every caller but its one rule', async () => {
@@ -571,13 +586,13 @@ test('the re-entry lift REFUSES every caller but its one rule', async () => {
   );
 });
 
-test('DNC removal is reachable ONLY through the re-entry lift', () => {
+test('DNC removal is reachable ONLY through the two welded lifts', () => {
   const adds = OP_REGISTRY.filter((e) => e.soapOperation === 'addNumbersToDnc');
   assert.equal(adds.length, 1);
   assert.equal(adds[0].actionType, 'five9_add_numbers_to_dnc');
   const dncOps = OP_REGISTRY.filter((e) => /Dnc/i.test(e.soapOperation)).map((e) => e.soapOperation).sort();
-  assert.deepEqual(dncOps, ['addNumbersToDnc', 'removeNumbersFromDnc'],
-    'adds, plus the one welded removal — nothing else may touch DNC');
+  assert.deepEqual(dncOps, ['addNumbersToDnc', 'removeNumbersFromDnc', 'removeNumbersFromDnc'],
+    'adds, plus the welded removals — nothing else may touch DNC');
 });
 
 test('deleteIVRScript stays create-compensation only, never an action type', () => {

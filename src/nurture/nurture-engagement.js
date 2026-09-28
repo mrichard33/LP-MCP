@@ -496,6 +496,28 @@ async function applyEngagement(generation_id, resolution, occurred_at, payload) 
       idempotency_key: `nurture_unsub_${generation_id}`,
     });
     emittedEvent = 'nurture.unsubscribed';
+
+    // 2026-09-28 — Consent Model v1. An email unsubscribe revokes EMAIL ONLY:
+    // the TCPA does not govern email, and Mark ruled an unsubscribe must not
+    // block calls or texts. Recorded directly (not through a rule) so it lands
+    // even though no rule consumes nurture.unsubscribed. Fail-soft: the
+    // engagement row is already written and GHL U.UNS already set Email DND —
+    // a missing consent table or a DB hiccup must not turn this into a 500
+    // that makes GHL retry the webhook.
+    try {
+      const { recordConsentChange } = await import('../consent/consent-store.js');
+      await recordConsentChange({
+        ghlContactId: row.ghl_contact_id,
+        channel: 'email',
+        change: 'revoked',
+        source: 'email_unsub',
+        reason: 'Email unsubscribe/complaint via GHL engagement webhook (I.ENG-S4.5R)',
+        actor: 'system',
+        evidence: { generation_id, workflow_code: row.workflow_code, occurred_at },
+      });
+    } catch (err) {
+      console.warn(`[NurtureEngagement] consent write for email unsubscribe failed (fail-soft) ${row.ghl_contact_id}: ${err.message}`);
+    }
   }
 
   return {

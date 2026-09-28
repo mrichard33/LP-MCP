@@ -33,6 +33,7 @@
  * Action payload shape:
  *   {
  *     dnc_code: "P",        // Required. One of C/M/T/E/P, or "CLEAR"
+ *     mode:     "clear",    // Optional alias for dnc_code "CLEAR" (2026-09-28)
  *     emp_id:   "5686",     // Optional. Defaults to 5686
  *     phone:    "+18135551234"  // Optional. Sent to LP for audit
  *   }
@@ -97,9 +98,15 @@ export async function executeUpdateLPDNCStatus(action) {
   }
 
   // ─── Validate DNC code ─────────────────────────────────────────────
-  const rawCode = payload.dnc_code || payload.newDncStatus || payload.code;
+  // 2026-09-28 (Consent Model v1) — `mode: 'clear'` is an alias for
+  // dnc_code: 'CLEAR', so the Slack DNC-lift batch can say what it means.
+  // Same path, same LP call: LP has no per-code clear, so a clear wipes C
+  // and T (and every other code) at once. LP_DNC_CLEAR_CODE is still NOT
+  // probe-confirmed — see lp-client.js; a wrong value fails loud here.
+  const modeClear = String(payload.mode || '').trim().toLowerCase() === 'clear';
+  const rawCode = modeClear ? 'CLEAR' : (payload.dnc_code || payload.newDncStatus || payload.code);
   if (!rawCode) {
-    throw new Error('update_lp_dnc_status: action_payload.dnc_code is required (one of: C/M/T/E/P)');
+    throw new Error('update_lp_dnc_status: action_payload.dnc_code is required (one of: C/M/T/E/P), or mode: "clear"');
   }
   const code = String(rawCode).trim().toUpperCase();
   const isClear = code === 'CLEAR';

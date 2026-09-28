@@ -2438,4 +2438,68 @@ export const STARTUP_MIRRORS = [
     fail: '[Migration] lp_leads.lp_deleted_at (sql/135) FAILED — the capacity board and near-window refresh query this column and will error until sql/135 is applied from the dashboard:',
     level: 'error',
   },
+
+  // Consent model v1 (sql/136, sql/137, sql/140 — 2026-09-28; the files are
+  // the source of truth). Three additive tables. The consent_events index is
+  // PLAIN here — instant on an empty table; the CONCURRENTLY form for the live
+  // table is sql/138. record_consent_change() (sql/139) is deliberately NOT
+  // mirrored: a function block runs every boot and reloads the schema cache.
+  // Until the tables exist, consent writes log and skip (shadow data only) and
+  // the Slack DNC-lift route refuses with 503 rather than lift without its
+  // idempotency record.
+  {
+    name: 'sql/136+137+140',
+    expects: {
+      tables: ['contact_consent', 'consent_events', 'dnc_lift_requests'],
+      indexes: ['idx_consent_events_contact', 'idx_dnc_lift_requests_contact'],
+    },
+    sql: [
+      `CREATE TABLE IF NOT EXISTS contact_consent (
+              ghl_contact_id text PRIMARY KEY,
+              lp_lead_id text,
+              lp_prospect_id text,
+              phone_consent text NOT NULL DEFAULT 'unknown' CHECK (phone_consent IN ('granted','revoked','unknown')),
+              email_consent text NOT NULL DEFAULT 'unknown' CHECK (email_consent IN ('granted','revoked','unknown')),
+              sms_carrier_stop boolean NOT NULL DEFAULT false,
+              dnc_full boolean NOT NULL DEFAULT false,
+              last_reason text,
+              last_source text,
+              last_changed_by text,
+              updated_at timestamptz NOT NULL DEFAULT now()
+            );`,
+      `CREATE TABLE IF NOT EXISTS consent_events (
+              id bigserial PRIMARY KEY,
+              ghl_contact_id text NOT NULL,
+              channel text NOT NULL CHECK (channel IN ('phone','email','all')),
+              change text NOT NULL CHECK (change IN ('revoked','granted','dnc_full_on','dnc_full_off','carrier_stop_on','carrier_stop_off')),
+              source text NOT NULL,
+              reason text,
+              actor text NOT NULL,
+              evidence jsonb,
+              created_at timestamptz NOT NULL DEFAULT now()
+            );`,
+      `CREATE INDEX IF NOT EXISTS idx_consent_events_contact ON consent_events (ghl_contact_id, created_at DESC);`,
+      `CREATE TABLE IF NOT EXISTS dnc_lift_requests (
+              request_id text PRIMARY KEY,
+              ghl_contact_id text NOT NULL,
+              status text NOT NULL DEFAULT 'awaiting_decision' CHECK (status IN ('awaiting_decision','processing','approved','kept_blocked','failed')),
+              review_payload jsonb,
+              decision text CHECK (decision IN ('approve','keep_blocked')),
+              slack_user_id text,
+              slack_user_name text,
+              slack_ts text,
+              batch_result jsonb,
+              requested_at timestamptz NOT NULL DEFAULT now(),
+              decided_at timestamptz,
+              completed_at timestamptz
+            );`,
+      `CREATE INDEX IF NOT EXISTS idx_dnc_lift_requests_contact ON dnc_lift_requests (ghl_contact_id, requested_at DESC);`,
+      `ALTER TABLE contact_consent ENABLE ROW LEVEL SECURITY;`,
+      `ALTER TABLE consent_events ENABLE ROW LEVEL SECURITY;`,
+      `ALTER TABLE dnc_lift_requests ENABLE ROW LEVEL SECURITY;`,
+    ],
+    ready: '[Migration] consent model tables (sql/136, 137, 140) ready',
+    fail: '[Migration] consent model tables (sql/136, 137, 140) skipped — apply them from the dashboard; consent writes skip and DNC-lift decisions refuse until they exist:',
+    level: 'warn',
+  },
 ];

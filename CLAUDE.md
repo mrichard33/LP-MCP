@@ -49,6 +49,8 @@ else's production flow), our own buttons must never be forwarded even with the f
 any `action_id` that is not `deny_member` as an approval), and the relay copies only the two
 `X-Slack-*` signing headers — never `Authorization`. Unset `SLACK_SIGNING_SECRET` refuses
 everything, forwards included, so set the secret BEFORE repointing Slack.
+The DNC-lift buttons (`dnc_lift_*`, 2026-09-28) are relayed ONLY to `SLACK_DNC_LIFT_FORWARD_URL` (n8n
+OPS.DNC-LIFT) and dropped when it is unset — never to the onboarding forward.
 The payroll card's `payroll_approve` button (2026-09-26) is ours too: any `payroll_*` click is
 handled or dropped, never forwarded, and it is gated on `PAYROLL_ENGINE_MODE=live`, not on
 `SLACK_APPROVALS_ENABLED`. It authorises by active `lf_report_approvers` EMAIL (Slack `users.info`,
@@ -92,6 +94,25 @@ where a person must act, pages one — and the bot still replies, unless `handof
 (`src/agentic/handoff-policy.js`) says `silent` (STOP, WRONG_NUMBER) or `workflow` (a GHL workflow
 answers the tag). A new handoff class replies by default. Do not add a silent class without Mark's
 ruling, and never add `stop-bot` to a rule whose trigger is not an opt-out.
+
+## Consent (2026-09-28)
+
+`contact_consent` / `consent_events` (sql/136–139) are the record of who may be contacted and why not.
+Write them only through `record_consent_change` (the action) or `recordConsentChange()`
+(`src/consent/consent-store.js`) — the database function does the upsert and the audit row in one
+transaction. `CONSENT_MODEL_MODE` is `shadow`: nothing gates a send on these tables yet.
+
+- **`phone` means texts AND automated calls.** Never add an `sms` or `call` channel; the pair splits
+  only behind `CONSENT_SPLIT_SMS_CALL` after counsel signs off, and that path is not built.
+- **A texted STOP (`sms_carrier_stop`) is never cleared by a person.** A Slack lift restores calls,
+  LP and Five9 and leaves SMS/RCS DND and `dnc-sms` in place. `detectCarrierStop` treats an
+  unreadable contact as a STOP.
+- **Five9 DNC removal has exactly two callers**, both welded: the re-entry lift and
+  `five9_remove_numbers_from_dnc_approved` (Slack, `SLACK_DNC_LIFT`). The approved op refuses any
+  `approved_by` that is not a Slack user id, which is what keeps GroupMe and auto-escalation
+  approvals out. Do not add a carve-out for it in `resolveRequiresApproval`.
+- `POST /slack/dnc-lift/decision` is idempotent on `request_id` through `dnc_lift_requests`
+  (sql/140) and refuses (503) without it.
 
 ## Alerting
 

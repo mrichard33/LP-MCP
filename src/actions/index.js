@@ -52,6 +52,9 @@
  *   Appointments (5):
  *     book_appointment, cancel_appointment, reschedule_appointment,
  *     update_appointment_status, sync_lp_appointment_to_ghl
+ *   Consent (2) — 2026-09-28, Consent Model v1:
+ *     record_consent_change (contact_consent + consent_events, shadow),
+ *     request_dnc_lift_review (asks a person in #dnc-lift-approval)
  *   LP (5):
  *     set_lp_appointment, create_lp_lead, update_lp_dnc_status,
  *     lp_callback_requeue,
@@ -84,8 +87,11 @@
  *       five9_reset_campaign, five9_set_outbound_campaign,
  *       five9_add_records_to_list, five9_delete_record_from_list,
  *       five9_add_numbers_to_dnc
- *     2026-09-21 — five9_remove_numbers_from_dnc_reentry (the ONE re-entry
+ *     2026-09-21 — five9_remove_numbers_from_dnc_reentry (the re-entry
  *       lift; welded to DNC_LIFT_ON_REENTRY_E0, not a general removal)
+ *     2026-09-28 — five9_remove_numbers_from_dnc_approved (the Slack-approved
+ *       lift; welded to SLACK_DNC_LIFT, human approval required, never
+ *       carved out of approve_action)
  *     2026-08-05 Phase D — five9_user_skill_add, five9_user_skill_modify,
  *       five9_user_skill_remove, five9_create_campaign_profile
  *     2026-08-06 Phase D-2 — five9_modify_campaign_profile (WSDL-verified
@@ -248,6 +254,8 @@ import { executeCreateLPLead } from './handlers/lp-lead.js';
 import { executeCaptureInboundCaller } from './handlers/inbound-capture.js';
 import { executeLpCallbackRequeue } from './handlers/lp-requeue.js';
 import { executeUpdateLPDNCStatus } from './handlers/lp-dnc.js';
+import { executeRecordConsentChange } from './handlers/consent.js';
+import { executeRequestDncLiftReview } from '../consent/dnc-lift-review.js';
 import { executeSetDND } from './handlers/dnd.js';
 import { executeCreateTask } from './handlers/tasks.js';
 import { executeSendNotification } from './handlers/notifications.js';
@@ -601,6 +609,8 @@ export const ACTION_HANDLERS = {
   capture_inbound_caller: executeCaptureInboundCaller, // 2026-09-27 — approved Inbound Caller Capture (src/jobs/inbound-caller-capture.js)
   lp_callback_requeue: executeLpCallbackRequeue, // 2026-08-18 — callback_request → LP re-queue (the push IS the dial trigger)
   update_lp_dnc_status: executeUpdateLPDNCStatus, // 2026-05-01 — agentic DNC push (Charles Poulos recovery)
+  record_consent_change: executeRecordConsentChange, // 2026-09-28 — Consent Model v1: contact_consent + consent_events (shadow)
+  request_dnc_lift_review: executeRequestDncLiftReview, // 2026-09-28 — asks a person in #dnc-lift-approval (n8n OPS.DNC-LIFT)
   set_dnd: executeSetDND,                        // 2026-07-20 Fix 6b — GHL-side channel DND. Handler landed 2026-07-20, wired 2026-07-22.
   update_custom_fields: executeUpdateCustomFields,
   persist_established_facts: executePersistEstablishedFacts, // 2026-09-11 — analyzer-time fact persistence
@@ -637,6 +647,11 @@ export const ACTION_HANDLERS = {
   // so nothing queued against the old name can start working again. The op
   // refuses any rule_applied but DNC_LIFT_ON_REENTRY_E0.
   five9_remove_numbers_from_dnc_reentry: executeFive9Write,
+  // 2026-09-28 — the Slack-approved DNC lift (Consent Model v1). Also a
+  // different action type from the deleted general removal; the op refuses
+  // any rule_applied but SLACK_DNC_LIFT and any approver who is not a Slack
+  // user approving through approve_action. Stays approval-gated (five9_ prefix).
+  five9_remove_numbers_from_dnc_approved: executeFive9Write,
   // five9_remove_numbers_from_dnc was removed 2026-08-21 — DNC removal is not
   // an operation this system offers. See the note in handlers/five9.js.
   // 2026-08-05 Phase D — user skills + campaign profile create. Same gate,
@@ -704,6 +719,8 @@ const CONTEXT_AWARE_HANDLERS = new Set([
   'send_message',
   'create_lp_lead',          // 2026-05-01 — needs event payload for appointment_date/time
   'persist_established_facts', // 2026-09-11 — reads established_facts off the ai.analysis_completed payload
+  'record_consent_change',   // 2026-09-28 — require_event_channel reads the trigger's channel (STOP by SMS vs email)
+  'request_dnc_lift_review', // 2026-09-28 — the card shows the trigger's source / sub-source
 ]);
 // Note: layer3_dispatch doesn't go through CONTEXT_AWARE_HANDLERS because
 // it fetches its own source event row (it needs event.id, not just the
@@ -1533,6 +1550,64 @@ export async function executeActionById(actionId, opts = {}) {
     direct_execute: true,
     prior_status: action.status,
   };
+}
+
+/**
+ * 2026-09-28 — run a just-queued batch NOW and return every action's outcome.
+ *
+ * Built for POST /slack/dnc-lift/decision: the person who clicked Approve has
+ * to see, in the Slack thread, whether GHL / LP / Five9 actually changed. The
+ * queue executor cannot tell them — it runs the rows some time later and
+ * reports only counts.
+ *
+ * Race-free with the background executor by construction:
+ *   - the caller inserts the rows with retry_at in the future, so
+ *     claim_agent_actions does not pick them up in the meantime;
+ *   - this function CLAIMS them itself (pending → executing, retry_at cleared)
+ *     before running any, and runs only the rows its claim returned. A row it
+ *     could not claim is reported 'not_claimed', never run twice.
+ *   If the process dies mid-run, unclaimed rows run from the queue once their
+ *   retry_at passes, and claimed ones fall to the reaper like any other.
+ *
+ * continueOnFailure (default true) differs from runBatch on purpose: the lift
+ * touches independent systems, and a failed LP clear must not stop the Five9
+ * removal the person approved. Each failure is reported per action instead.
+ *
+ * @param {number[]} actionIds
+ * @returns {Promise<Array<{action_id:number, action_type?:string, status:string, error?:string, result?:object}>>}
+ */
+export async function runActionsNow(actionIds, { continueOnFailure = true } = {}) {
+  const ids = (actionIds || []).map(Number).filter(Number.isFinite);
+  if (ids.length === 0) return [];
+  const nowIso = new Date().toISOString();
+  const { data: claimed, error } = await supabase
+    .from('agent_actions')
+    .update({ status: 'executing', retry_at: null, updated_at: nowIso })
+    .in('id', ids)
+    .eq('status', 'pending')
+    .select('*');
+  if (error) throw new Error(`runActionsNow: claim failed: ${error.message}`);
+
+  const rows = (claimed || []).slice().sort((a, b) =>
+    (a.sequence_order ?? 0) - (b.sequence_order ?? 0) || a.id - b.id);
+  const byId = new Map();
+  const batchContext = { _contactCache: new Map() };
+  const prior = [];
+  let stop = false;
+  for (const a of rows) {
+    if (stop) { byId.set(a.id, { action_id: a.id, action_type: a.action_type, status: 'not_run_after_failure' }); continue; }
+    let r;
+    try {
+      r = await executeSingleAction(a, batchContext, prior);
+    } catch (err) {
+      r = { action_id: a.id, status: 'failed', error: err.message };
+    }
+    const out = { ...r, action_id: a.id, action_type: a.action_type };
+    byId.set(a.id, out);
+    prior.push({ ...out, action: a });
+    if (out.status === 'failed' && !continueOnFailure) stop = true;
+  }
+  return ids.map((id) => byId.get(id) || { action_id: id, status: 'not_claimed' });
 }
 
 // ═══════════════════════════════════════════════════════════════════

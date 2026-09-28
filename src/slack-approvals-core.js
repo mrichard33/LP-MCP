@@ -190,3 +190,22 @@ export function buildPayrollApproveBlocks(text, runId, pendingLabel = '') {
     },
   ];
 }
+
+// ─── DNC-lift buttons (2026-09-28, Consent Model v1) ─────────────────────────
+// The Approve Lift / Keep Blocked buttons n8n's "OPS.DNC-LIFT Slack Approval"
+// posts in #dnc-lift-approval. Slack sends their clicks to this app's ONE
+// interactivity URL like every other button, so the front door must recognise
+// them: relayed to the onboarding workflow, `dnc_lift_approve` would read as
+// "approve a team member" (it treats every action_id but deny_member as an
+// approval). They go ONLY to SLACK_DNC_LIFT_FORWARD_URL, or nowhere.
+export const DNC_LIFT_ACTION_PREFIX = 'dnc_lift_';
+
+/** True for ANY click on a dnc_lift_* action — never relayed to onboarding. */
+export function isDncLiftAction(rawBody) {
+  const params = new URLSearchParams(Buffer.isBuffer(rawBody) ? rawBody.toString('utf8') : String(rawBody || ''));
+  try {
+    const p = JSON.parse(params.get('payload') || 'null');
+    const id = Array.isArray(p?.actions) ? String(p.actions[0]?.action_id || '') : '';
+    return id.startsWith(DNC_LIFT_ACTION_PREFIX);
+  } catch { return false; }
+}

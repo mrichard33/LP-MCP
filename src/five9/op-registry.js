@@ -198,7 +198,7 @@ export const OP_CLASSIFICATION = Object.freeze({
 
   /* -- DNC --------------------------------------------------------------- */
   addNumbersToDnc: c('write', 'enabled', 'shipped', 'Shipped as five9_add_numbers_to_dnc. DNC is ADD-ONLY by ruling.'),
-  removeNumbersFromDnc: c('write', 'gated', 'shipped', 'AMENDED 2026-09-21. The 2026-08-21 ruling (Reece does not take numbers off DNC, so there is no gate, override or reason string that yields it) still governs every general caller: five9_remove_numbers_from_dnc stays in FORBIDDEN_ACTION_TYPES and stays an unknown action type. Mark then ruled that a consumer who RE-ENTERS through a fresh first-party submission is lifted everywhere, Five9 included, so the SOAP method is reachable by exactly one action type — five9_remove_numbers_from_dnc_reentry — which is welded to DNC_LIFT_ON_REENTRY_E0 and re-proves consent:new-submission and the trigger event\'s age (<=15 min) at execution. It cannot lift a contact-initiated STOP: that rule refuses any contact carrying suppress:dnc-reply / suppress:dnc-voice. "gated" rather than "enabled" because the gate is the whole design.'),
+  removeNumbersFromDnc: c('write', 'gated', 'shipped', 'AMENDED 2026-09-21. The 2026-08-21 ruling (Reece does not take numbers off DNC, so there is no gate, override or reason string that yields it) still governs every general caller: five9_remove_numbers_from_dnc stays in FORBIDDEN_ACTION_TYPES and stays an unknown action type. Mark then ruled that a consumer who RE-ENTERS through a fresh first-party submission is lifted everywhere, Five9 included, so the SOAP method is reachable by exactly one action type — five9_remove_numbers_from_dnc_reentry — which is welded to DNC_LIFT_ON_REENTRY_E0 and re-proves consent:new-submission and the trigger event\'s age (<=15 min) at execution. It cannot lift a contact-initiated STOP: that rule refuses any contact carrying suppress:dnc-reply / suppress:dnc-voice. "gated" rather than "enabled" because the gate is the whole design. AMENDED AGAIN 2026-09-28 (Consent Model v1): a second caller, five9_remove_numbers_from_dnc_approved, for a lift a PERSON approved in Slack (#dnc-lift-approval). Welded to SLACK_DNC_LIFT; refuses unless approved via approve_action by a Slack user id, requires evidence.slack_ts, accepts numbers_from_contact only, and refuses a request to clear SMS for a contact who texted STOP. No general path exists.'),
   checkDncForNumbers: c('read', 'skip', 'shipped', READ_SHIPPED),
 
   /* -- dispositions ------------------------------------------------------ */
@@ -408,6 +408,11 @@ export const OP_REGISTRY = Object.freeze([
     guards: ['ruleApplied:DNC_LIFT_ON_REENTRY_E0', 'consentTagAtExecution', 'triggerEventAge<=15m', 'checkDncForNumbers'],
     readBeforeWrite: true, builder: 'buildNumbersXml',
     note: 'NOT a general DNC removal — see removeNumbersFromDnc in OP_CLASSIFICATION. Welded to one rule; refuses every other rule_applied, a missing consent tag, an unreadable tag read, and a trigger event older than 15 minutes. five9_remove_numbers_from_dnc remains FORBIDDEN.',
+  }),
+  reg('five9_remove_numbers_from_dnc_approved', 'removeNumbersFromDnc', null, 'gated', {
+    guards: ['ruleApplied:SLACK_DNC_LIFT', 'approvedViaApproveAction', 'approvedBy:slackUserId', 'evidence.slack_ts', 'numbersFromContactOnly', 'noSmsClearOnCarrierStop', 'checkDncForNumbers'],
+    readBeforeWrite: true, builder: 'buildNumbersXml',
+    note: 'NOT a general DNC removal — the human-approved Slack lift (2026-09-28). Welded to SLACK_DNC_LIFT; refuses auto/GroupMe approvals, a missing slack_ts, any free-form number list, and an SMS clear for a contact who texted STOP. five9_remove_numbers_from_dnc remains FORBIDDEN.',
   }),
 
   /* -- user skills ------------------------------------------------------- */
