@@ -1,8 +1,20 @@
 /**
  * Guest-visitor remediation — shared core + admin HTTP routes
  *
- *   POST /admin/remediate-guest-visitors        { dry_run?, limit?, skip_victor? }
+ *   POST /admin/remediate-guest-visitors        { dry_run?, limit?, skip_victor?, only_with_phone? }
  *   GET  /admin/remediate-guest-visitors/:jobId
+ *
+ * 2026-09-28 — every recorded row is also written to system_events
+ * (remediation.guest_visitor, subtype `dry_run:<action>` / `live:<action>`,
+ * payload.run_id = the job id), so a run survives a server restart. The job
+ * itself lives in memory: on 2026-09-28 five dry runs in a row were wiped by
+ * redeploys (two merges and three one-at-a-time Railway variable sets) before
+ * any finished, and the status URL then answered job_not_found with nothing
+ * to show. Read a run back with:
+ *   SELECT event_subtype, entity_id, payload->>'detail' FROM system_events
+ *   WHERE event_type = 'remediation.guest_visitor' AND payload->>'run_id' = '<job id>';
+ * only_with_phone limits the sweep to contacts that can actually reach LP;
+ * most of the cohort is abandoned chats with no phone and no transcript.
  *
  * Mirrors scripts/remediate-guest-visitors.js (the CLI wraps this module) —
  * exposed over HTTP so the one-time sweep can run on Railway without shell
@@ -86,19 +98,50 @@ function readCustomField(contact, fieldId) {
  * Run the full remediation. Returns { dry_run, actions, counts }.
  * `onProgress(action)` fires per recorded action (used by the HTTP job).
  */
+/**
+ * The system_events row that persists one recorded action of a run. Pure, so
+ * the shape (and the idempotency key that stops a retry double-writing) is
+ * unit-tested in scripts/test-placeholder-name-recovery.js.
+ */
+export function buildRunRowEvent({ runId, dryRun, seq, entry }) {
+  return {
+    event_type: 'remediation.guest_visitor',
+    event_subtype: `${dryRun ? 'dry_run' : 'live'}:${entry.action}`,
+    source: 'lp_mcp',
+    entity_type: 'contact',
+    entity_id: entry.contact_id,
+    ghl_contact_id: entry.contact_id && entry.contact_id !== '-' ? entry.contact_id : null,
+    payload: { run_id: runId, dry_run: dryRun, seq, action: entry.action, detail: entry.detail },
+    priority: 'low',
+    idempotency_key: `gvr:${runId}:${seq}`,
+    bypass_filter: true,
+  };
+}
+
 export async function runGuestVisitorRemediation({
   dryRun = false,
   limit = DEFAULT_LIMIT,
   skipVictor = false,
+  onlyWithPhone = false,
+  runId = null,
   onProgress = null,
-} = {}) {
+} = {}, deps = {}) {
   const actions = [];
+  const emit = deps.emitEvent || emitEvent;
 
+  // Persist rows in order without blocking the sweep; awaited before return.
+  let persistChain = Promise.resolve();
   const record = (contactId, action, detail = '') => {
     const entry = { contact_id: contactId, action, detail };
     actions.push(entry);
     console.log(`[GuestVisitorRemediation] ${dryRun ? '[DRY] ' : ''}${contactId} — ${action}${detail ? `: ${detail}` : ''}`);
     try { onProgress?.(entry); } catch { /* progress is best-effort */ }
+    if (runId) {
+      const seq = actions.length;
+      persistChain = persistChain
+        .then(() => emit(buildRunRowEvent({ runId, dryRun, seq, entry })))
+        .catch((err) => console.warn(`[GuestVisitorRemediation] run row ${seq} not saved: ${err.message}`));
+    }
   };
 
   const logRemediation = async (contactId, action, payload) => {
@@ -225,12 +268,15 @@ export async function runGuestVisitorRemediation({
     // Cache schema uses first_name/last_name (verified 2026-07-04 — there is
     // no contact_name column). The widget writes the placeholder either whole
     // into first_name ("Guest Visitor bljpx") or split ("Guest" / "Visitor x").
-    const { data, error } = await hl
+    let query = hl
       .from('contacts')
       .select('ghl_contact_id, first_name, last_name, tags')
       .or('first_name.ilike.guest visitor%,first_name.ilike.guest,first_name.ilike.visitor')
-      .is('deleted_at', null)
-      .limit(limit);
+      .is('deleted_at', null);
+    // A contact with no phone can never be sent to LP, and nearly all of them
+    // are abandoned chats with nothing to read — skip them when asked.
+    if (onlyWithPhone) query = query.not('phone', 'is', null).neq('phone', '');
+    const { data, error } = await query.limit(limit);
 
     if (error) {
       record('-', 'sweep_error', `cache query failed: ${error.message}`);
@@ -338,7 +384,8 @@ export async function runGuestVisitorRemediation({
     return acc;
   }, {});
 
-  return { dry_run: dryRun, total_actions: actions.length, counts, actions };
+  await persistChain;
+  return { dry_run: dryRun, run_id: runId, total_actions: actions.length, counts, actions };
 }
 
 // ─── HTTP routes (background job + status, same shape as agentic-lead-states) ───
@@ -355,6 +402,7 @@ export function registerGuestVisitorRemediationRoutes(app) {
     const dryRun = body.dry_run === true;
     const limit = parseInt(body.limit, 10) || DEFAULT_LIMIT;
     const skipVictor = body.skip_victor === true;
+    const onlyWithPhone = body.only_with_phone === true;
 
     const jobId = generateJobId();
     const job = {
@@ -363,6 +411,7 @@ export function registerGuestVisitorRemediationRoutes(app) {
       dry_run: dryRun,
       limit,
       skip_victor: skipVictor,
+      only_with_phone: onlyWithPhone,
       started_at: new Date().toISOString(),
       completed_at: null,
       progress: 0,
@@ -378,6 +427,8 @@ export function registerGuestVisitorRemediationRoutes(app) {
           dryRun,
           limit,
           skipVictor,
+          onlyWithPhone,
+          runId: jobId,
           onProgress: (entry) => { job.progress += 1; job.last_action = entry; },
         });
         job.status = 'complete';
@@ -396,7 +447,7 @@ export function registerGuestVisitorRemediationRoutes(app) {
       job_id: jobId,
       dry_run: dryRun,
       status_url: `/admin/remediate-guest-visitors/${jobId}`,
-      message: 'Remediation running in background (~600ms per contact). Poll status_url.',
+      message: 'Remediation running in background (~600ms per contact). Poll status_url. Every row is also saved to system_events (remediation.guest_visitor, payload.run_id = job_id), so a restart loses nothing.',
     });
   });
 
@@ -406,7 +457,7 @@ export function registerGuestVisitorRemediationRoutes(app) {
       return res.status(404).json({
         ok: false,
         error: 'job_not_found',
-        message: 'Job ID not recognized — may have been lost on server restart. Mutations already applied are durable; query system_events for remediation.guest_visitor rows.',
+        message: `Job ID not recognized — may have been lost on server restart. Every row it recorded is in system_events: event_type = 'remediation.guest_visitor' AND payload->>'run_id' = '${req.params.jobId}'.`,
       });
     }
     return res.json({ ok: true, ...job });

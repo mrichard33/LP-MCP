@@ -209,3 +209,70 @@ test('lpProspectsNeedingName: only placeholder prospects, de-duplicated', () => 
     { lp_prospect_id: null, first_name: 'guest' },
   ]), ['1']);
 });
+
+// ─── remediation sweep: restart-proof run rows (2026-09-28) ───────
+// Five dry runs in a row were wiped by redeploys before any finished; the
+// in-memory job was the only copy. Every row now also lands in system_events.
+
+const { buildRunRowEvent, runGuestVisitorRemediation } =
+  await import('../src/admin/guest-visitor-remediation.js');
+
+test('run row: dry-run subtype, run id in payload, idempotent per row', () => {
+  const ev = buildRunRowEvent({
+    runId: 'gvr_x', dryRun: true, seq: 7,
+    entry: { contact_id: 'c1', action: 'promoted', detail: 'firstName=Britt' },
+  });
+  assert.equal(ev.event_type, 'remediation.guest_visitor');
+  assert.equal(ev.event_subtype, 'dry_run:promoted');
+  assert.equal(ev.payload.run_id, 'gvr_x');
+  assert.equal(ev.payload.detail, 'firstName=Britt');
+  assert.equal(ev.idempotency_key, 'gvr:gvr_x:7');
+  assert.equal(ev.ghl_contact_id, 'c1');
+  assert.equal(ev.bypass_filter, true);
+});
+test('run row: live subtype; a "-" placeholder id is not a contact', () => {
+  const ev = buildRunRowEvent({ runId: 'r', dryRun: false, seq: 1, entry: { contact_id: '-', action: 'sweep_error', detail: '' } });
+  assert.equal(ev.event_subtype, 'live:sweep_error');
+  assert.equal(ev.ghl_contact_id, null);
+});
+test('run: every recorded row is saved before the run returns', async () => {
+  const saved = [];
+  const prevUrl = process.env.HL_SUPABASE_URL;
+  delete process.env.HL_SUPABASE_URL; // no HL cache → one "sweep_skipped" row
+  try {
+    const r = await runGuestVisitorRemediation(
+      { dryRun: true, skipVictor: true, runId: 'gvr_test' },
+      { emitEvent: async (ev) => { saved.push(ev); } },
+    );
+    assert.equal(r.run_id, 'gvr_test');
+    assert.equal(saved.length, r.total_actions);
+    assert.ok(saved.length >= 1);
+    assert.equal(saved[0].event_subtype, 'dry_run:sweep_skipped');
+  } finally {
+    if (prevUrl !== undefined) process.env.HL_SUPABASE_URL = prevUrl;
+  }
+});
+test('run: a failed save never breaks the sweep', async () => {
+  const prevUrl = process.env.HL_SUPABASE_URL;
+  delete process.env.HL_SUPABASE_URL;
+  try {
+    const r = await runGuestVisitorRemediation(
+      { dryRun: true, skipVictor: true, runId: 'gvr_test2' },
+      { emitEvent: async () => { throw new Error('db down'); } },
+    );
+    assert.ok(r.total_actions >= 1);
+  } finally {
+    if (prevUrl !== undefined) process.env.HL_SUPABASE_URL = prevUrl;
+  }
+});
+test('run: no run id → nothing is written', async () => {
+  const saved = [];
+  const prevUrl = process.env.HL_SUPABASE_URL;
+  delete process.env.HL_SUPABASE_URL;
+  try {
+    await runGuestVisitorRemediation({ dryRun: true, skipVictor: true }, { emitEvent: async (ev) => { saved.push(ev); } });
+    assert.equal(saved.length, 0);
+  } finally {
+    if (prevUrl !== undefined) process.env.HL_SUPABASE_URL = prevUrl;
+  }
+});
