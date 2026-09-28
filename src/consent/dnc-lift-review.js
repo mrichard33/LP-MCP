@@ -154,7 +154,12 @@ export async function executeRequestDncLiftReview(action, context = {}, deps = {
   try {
     res = await doFetch(webhook, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        // The same shared secret the decision route checks, so n8n can refuse
+        // a review request that did not come from here. Unset = not sent.
+        ...(env.DNC_LIFT_WEBHOOK_SECRET ? { 'X-DNC-Lift-Secret': String(env.DNC_LIFT_WEBHOOK_SECRET) } : {}),
+      },
       body: JSON.stringify(payload),
       signal: AbortSignal.timeout(15000),
     });

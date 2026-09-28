@@ -576,3 +576,35 @@ test('backfill: the handoff\'s tag mapping', () => {
   assert.deepEqual(backfill.backfillEventFor(sms), { channel: 'phone', change: 'carrier_stop_on' });
   assert.equal(backfill.parseArgs([]).execute, false, 'dry run is the default');
 });
+
+test('review: posts the card with the shared secret header and records the request first', async () => {
+  const inserted = [];
+  const posts = [];
+  const db = {
+    from(name) {
+      assert.equal(name, 'dnc_lift_requests');
+      const api = {
+        select() { return api; }, eq() { return api; }, neq() { return api; }, gte() { return api; },
+        limit: async () => ({ data: [], error: null }),
+        insert: async (row) => { inserted.push(row); return { error: null }; },
+        update() { return { eq: async () => ({ error: null }) }; },
+      };
+      return api;
+    },
+  };
+  const out = await review.executeRequestDncLiftReview(
+    { id: 1, target_id: CONTACT, action_payload: { trigger: 'manual_tag' } }, {},
+    {
+      env: { N8N_DNC_LIFT_REVIEW_WEBHOOK: 'https://n8n.example.com/webhook/dnc-lift-review', DNC_LIFT_WEBHOOK_SECRET: SECRET },
+      supabase: db,
+      readContact: async () => ({ firstName: 'Jane', phone: '+18134166946', tags: ['dnc', 'dnc-sms'] }),
+      getConsent: async () => ({ status: 'ok', consent: null, events: [] }),
+      newRequestId: () => 'dnc-lift-test',
+      fetch: async (url, init) => { posts.push({ url, init }); return { ok: true, status: 200 }; },
+    },
+  );
+  assert.equal(out.request_id, 'dnc-lift-test');
+  assert.equal(inserted[0].status, 'awaiting_decision');
+  assert.equal(posts[0].init.headers['X-DNC-Lift-Secret'], SECRET);
+  assert.equal(JSON.parse(posts[0].init.body).sms_carrier_stop, true);
+});
