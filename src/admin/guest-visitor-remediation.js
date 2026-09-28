@@ -15,11 +15,22 @@
  *      confirmed→new if one exists, malformed `concern-expressed:` +
  *      stacked `bj:stage-4-negotiating` removed.
  *   2. Sweep: HL contacts cache candidates (first_name/last_name split OR
- *      whole-in-first placeholder), each re-read LIVE before any mutation.
- *      Transcript-extractable names are promoted (placeholder rule, via
+ *      whole-in-first placeholder OR a bare "guest"), each re-read LIVE
+ *      before any mutation. Transcript-extractable names are promoted (placeholder rule, via
  *      buildPromotionPayload — payload can never carry a tags key);
  *      otherwise the contact is tagged `name-placeholder`. Any tag ending
  *      in ':' is removed.
+ *
+ *      2026-09-28 — the name step now uses recoverPlaceholderName
+ *      (src/services/placeholder-name-recovery.js), the same code
+ *      create_lp_lead runs: chat messages + transcript, model + heuristics,
+ *      and a check that the name is in the customer's own words. The
+ *      heuristic-only pass missed names typed next to a phone number
+ *      ("Britt Austen 386-898-1082"), and the old live check skipped a bare
+ *      "guest" as a "real name". When the chat has no name but LP already
+ *      does (a call or vendor feed learned it), that name is written to GHL.
+ *      Any LP prospect still carrying the placeholder gets the real name via
+ *      UpdateProspectInfo (first/last name only — never blanks a field).
  *   3. Every mutation logs system_events `remediation.guest_visitor`.
  *
  * Safety: all GHL writes go through ghlFetch (token-bucket limiter) plus a
@@ -29,13 +40,19 @@
 import { createClient } from '@supabase/supabase-js';
 import { ghlFetch } from '../actions/helpers.js';
 import { emitEvent } from '../event-emitter.js';
+import lpSupabase from '../supabase.js';
+import { updateProspectInfo } from '../lp-client.js';
 import {
   isPlaceholderName,
-  heuristicExtract,
-  buildPromotionPayload,
   geocodeStreetToZip,
   NAME_PLACEHOLDER_TAG,
 } from '../services/identity-extraction.js';
+import {
+  needsNameRecovery,
+  recoverPlaceholderName,
+  pickLpRealName,
+  lpProspectsNeedingName,
+} from '../services/placeholder-name-recovery.js';
 
 export const VICTOR_ID = 'XdAUR9qR42UdBre6Byrw';
 const TRANSCRIPT_FIELD_ID = 'RF710H9k39oLl9TsQIy4';
@@ -211,7 +228,7 @@ export async function runGuestVisitorRemediation({
     const { data, error } = await hl
       .from('contacts')
       .select('ghl_contact_id, first_name, last_name, tags')
-      .or('first_name.ilike.guest visitor%,and(first_name.ilike.guest,last_name.ilike.visitor%)')
+      .or('first_name.ilike.guest visitor%,first_name.ilike.guest,first_name.ilike.visitor')
       .is('deleted_at', null)
       .limit(limit);
 
@@ -243,7 +260,7 @@ export async function runGuestVisitorRemediation({
           await logRemediation(contactId, 'empty_tags_removed', { tags: emptyValueTags });
         }
 
-        if (!isPlaceholderName(liveName)) {
+        if (!needsNameRecovery(contact.firstName, contact.lastName)) {
           if (tags.includes(NAME_PLACEHOLDER_TAG)) {
             await removeTags(contactId, [NAME_PLACEHOLDER_TAG]);
             record(contactId, 'placeholder_tag_cleared', `real name "${liveName}" already on record`);
@@ -254,33 +271,63 @@ export async function runGuestVisitorRemediation({
           continue;
         }
 
-        const transcript = readCustomField(contact, TRANSCRIPT_FIELD_ID);
-        const extracted = transcript ? heuristicExtract([{ direction: 'inbound', text: transcript }]) : null;
+        let lpRows = [];
+        try {
+          const { data: rows } = await lpSupabase
+            .from('lp_leads')
+            .select('lp_lead_id, lp_prospect_id, first_name, last_name, created_at_lp')
+            .eq('ghl_contact_id', contactId);
+          lpRows = rows || [];
+        } catch (err) {
+          record(contactId, 'warn', `lp_leads read failed: ${err.message}`);
+        }
 
-        if (extracted?.first_name) {
-          if (extracted.address_line1 && !extracted.postal_code && !contact.postalCode) {
-            const geo = await geocodeStreetToZip(extracted.address_line1, {
-              city: extracted.city || contact.city,
-              state: extracted.state || contact.state || 'FL',
-            });
-            if (geo?.zip) extracted.postal_code = geo.zip;
-          }
-          const { payload } = buildPromotionPayload(contact, { ...extracted, _source: {
-            first_name: 'extracted', last_name: 'extracted', phone: 'extracted', email: 'extracted',
-            address_line1: 'extracted', city: 'extracted', state: 'extracted', postal_code: 'extracted',
-          } });
-          if (Object.keys(payload).length) {
-            await putStandardFields(contactId, payload);
-            record(contactId, 'promoted', Object.entries(payload).map(([k, v]) => `${k}=${v}`).join(', '));
-            await logRemediation(contactId, 'promoted', payload);
+        // Source 1: the chat. Dry run swaps the GHL writes for no-ops.
+        const transcript = readCustomField(contact, TRANSCRIPT_FIELD_ID);
+        let rec = { found: false, reason: 'not attempted' };
+        try {
+          rec = await recoverPlaceholderName(contactId, contact, { transcript: transcript || '' },
+            dryRun ? { updateFields: async () => 'dry_run', removeTags: async () => {} } : {});
+        } catch (err) {
+          record(contactId, 'error', `chat name recovery failed: ${err.message}`);
+        }
+
+        let realName = null;
+        if (rec.found) {
+          realName = { firstName: rec.firstName, lastName: rec.lastName };
+          record(contactId, 'promoted', `${Object.entries(rec.payload).map(([k, v]) => `${k}=${v}`).join(', ')} (from chat; ghl_write=${rec.ghlWrite})`);
+          await logRemediation(contactId, 'promoted', { ...rec.payload, source: 'chat', ghl_write: rec.ghlWrite });
+        } else {
+          // Source 2: LP already knows the name (phone call / vendor feed).
+          const lpName = pickLpRealName(lpRows);
+          if (lpName) {
+            await putStandardFields(contactId, lpName);
             if (tags.includes(NAME_PLACEHOLDER_TAG)) await removeTags(contactId, [NAME_PLACEHOLDER_TAG]);
+            realName = lpName;
+            record(contactId, 'promoted_from_lp', `firstName=${lpName.firstName}, lastName=${lpName.lastName}`);
+            await logRemediation(contactId, 'promoted_from_lp', lpName);
+          }
+        }
+
+        if (realName) {
+          // LP prospects still carrying the placeholder get the real name.
+          for (const prospectId of lpProspectsNeedingName(lpRows)) {
+            try {
+              if (!dryRun) {
+                await updateProspectInfo({ custnumber: prospectId, updates: { firstname: realName.firstName, lastname: realName.lastName } });
+              }
+              record(contactId, 'lp_name_fixed', `prospect ${prospectId} → ${realName.firstName} ${realName.lastName}`.trim());
+              await logRemediation(contactId, 'lp_name_fixed', { prospect_id: prospectId, ...realName });
+            } catch (err) {
+              record(contactId, 'error', `LP name update failed for prospect ${prospectId}: ${err.message}`);
+            }
           }
         } else if (!tags.includes(NAME_PLACEHOLDER_TAG)) {
           await addTags(contactId, [NAME_PLACEHOLDER_TAG]);
-          record(contactId, 'tagged_placeholder', transcript ? 'no name in transcript' : 'no transcript field');
-          await logRemediation(contactId, 'tagged_placeholder', {});
+          record(contactId, 'tagged_placeholder', rec.reason || 'no name found');
+          await logRemediation(contactId, 'tagged_placeholder', { reason: rec.reason });
         } else {
-          record(contactId, 'skipped', 'already tagged name-placeholder, no name extractable');
+          record(contactId, 'skipped', `already tagged name-placeholder, no name found (${rec.reason})`);
         }
       }
     }
