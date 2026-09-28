@@ -7,6 +7,11 @@ repo — they are recorded in `sql/seeds/` on the date they were applied live.
 
 ## 2026-09-28
 
+- **ActiveProspect re-entries now ask for a DNC-lift review.** n8n I.AP calls
+  `POST /webhook/ap/dnc-reentry` when a delivered lead matches an existing
+  contact; if that contact is on DNC, a card is posted to `#dnc-lift-approval`
+  naming ActiveProspect and the vendor. Previously nothing saw these leads.
+
 Consent Model v1 — one record of who may be contacted, on which channel, and
 who changed it. Ships in **shadow**: nothing reads the new tables to gate a send.
 

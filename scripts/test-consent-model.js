@@ -616,3 +616,83 @@ test('backfill: every candidate read is paged (PostgREST caps a plain read at 1,
   assert.match(src, /selectAllIn\(supabase, 'contact_consent'/);
   assert.doesNotMatch(src, /from\('contact_tag_snapshot'\)/, 'a plain select would silently stop at 1,000 rows');
 });
+
+// ── ActiveProspect re-entry (2026-09-28) ─────────────────────────────────────
+
+function apDb({ snapshotTags = [], snapshotError = false, queued = [] } = {}) {
+  const inserted = [];
+  const from = (name) => {
+    const api = {
+      select() { return api; }, eq() { return api; }, in() { return api; }, gte() { return api; },
+      limit: async () => ({ data: name === 'agent_actions' ? queued : [], error: null }),
+      maybeSingle: async () => (snapshotError
+        ? { data: null, error: { message: 'boom' } }
+        : { data: snapshotTags === null ? null : { tags: snapshotTags }, error: null }),
+      insert(row) { inserted.push({ table: name, row }); return { select: () => ({ single: async () => ({ data: { id: 777 }, error: null }) }) }; },
+    };
+    return api;
+  };
+  return { db: { from }, inserted };
+}
+const apDeps = (db, consent = { status: 'ok', consent: null }) => ({
+  env: { DNC_LIFT_WEBHOOK_SECRET: SECRET }, supabase: db, getConsent: async () => consent,
+});
+
+test('ap re-entry: refuses without the shared secret, and needs a contact id', async () => {
+  const { db, inserted } = apDb();
+  assert.equal((await review.handleApDncReentry({ body: { contactId: CONTACT }, headers: {} }, apDeps(db))).status, 401);
+  assert.equal((await review.handleApDncReentry({ body: {}, headers }, apDeps(db))).status, 400);
+  assert.equal(inserted.length, 0);
+});
+
+test('ap re-entry: a contact that is not blocked queues nothing', async () => {
+  const { db, inserted } = apDb({ snapshotTags: ['customer'] });
+  const out = await review.handleApDncReentry({ body: { contactId: CONTACT, vendor: 'Modernize' }, headers }, apDeps(db));
+  assert.deepEqual(out.json, { ok: true, skipped: 'not_blocked' });
+  assert.equal(inserted.length, 0);
+});
+
+test('ap re-entry: a DNC contact queues ONE review naming ActiveProspect and the vendor', async () => {
+  const { db, inserted } = apDb({ snapshotTags: ['dnc', 'stage:dnc'] });
+  const out = await review.handleApDncReentry({ body: { contactId: CONTACT, vendor: 'Modernize', lead_id: 'L1' }, headers }, apDeps(db));
+  assert.equal(out.json.queued, true);
+  assert.equal(inserted.length, 1);
+  const row = inserted[0].row;
+  assert.equal(row.action_type, 'request_dnc_lift_review');
+  assert.equal(row.rule_applied, 'AP_DNC_REENTRY');
+  assert.equal(row.requires_approval, false);
+  assert.deepEqual(row.action_payload, { trigger: 'activeprospect', vendor: 'Modernize', lead_id: 'L1' });
+});
+
+test('ap re-entry: blocked per the consent record alone is enough', async () => {
+  const { db, inserted } = apDb({ snapshotTags: [] });
+  await review.handleApDncReentry({ body: { contactId: CONTACT }, headers },
+    apDeps(db, { status: 'ok', consent: { dnc_full: false, phone_consent: 'revoked', sms_carrier_stop: false } }));
+  assert.equal(inserted.length, 1);
+});
+
+test('ap re-entry: when nothing can be read it still asks (the handler re-checks live)', async () => {
+  const { db, inserted } = apDb({ snapshotError: true });
+  const out = await review.handleApDncReentry({ body: { contactId: CONTACT }, headers }, apDeps(db, { status: 'error', consent: null }));
+  assert.equal(out.json.blocked, 'unknown');
+  assert.equal(inserted.length, 1);
+});
+
+test('ap re-entry: a review already queued for the contact is not queued twice', async () => {
+  const { db, inserted } = apDb({ snapshotTags: ['dnc'], queued: [{ id: 55 }] });
+  const out = await review.handleApDncReentry({ body: { contactId: CONTACT }, headers }, apDeps(db));
+  assert.equal(out.json.skipped, 'already_queued');
+  assert.equal(inserted.length, 0);
+});
+
+test('ap re-entry: the card says ActiveProspect and the vendor, not the contact\'s original source', () => {
+  const p = review.buildReviewPayload({
+    requestId: 'r', contactId: CONTACT, trigger: 'activeprospect', vendor: 'Modernize',
+    carrier: store.detectCarrierStop({ tags: ['dnc'] }), reenteredAt: '2026-09-28T15:00:00Z',
+    contact: { firstName: 'Jane', phone: '8134166946', source: 'Estimate Calculator', tags: ['dnc', 'active-entry:calculator'] },
+    consentRead: { status: 'ok', consent: null, events: [] },
+  });
+  assert.equal(p.source, 'ActiveProspect');
+  assert.equal(p.sub_source, 'Modernize');
+  assert.equal(p.trigger, 'activeprospect');
+});
