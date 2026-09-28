@@ -29,6 +29,8 @@
  *
  *   Slack → /webhook/slack/interactions
  *              ├─ approval_approve / approval_reject  → resolveApproval()
+ *              ├─ payroll_*                           → handlePayrollInteraction()
+ *              ├─ dnc_lift_* (2026-09-28)             → SLACK_DNC_LIFT_FORWARD_URL only
  *              └─ anything else → SLACK_INTERACTIONS_FORWARD_URL, raw bytes
  *                                 and Slack's signing headers unchanged
  *
@@ -58,6 +60,7 @@ import { slackApprovalsEnabled, lookupSlackUserEmail } from './slack.js';
 import { trackBackground } from './graceful-shutdown.js';
 import {
   verifySlackSignature, parseInteraction, parseApproverIds, parsePayrollInteraction, isPayrollAction,
+  isDncLiftAction,
 } from './slack-approvals-core.js';
 import { approvePayrollRun } from './payroll/ledger-actions.js';
 import { createPayrollStore } from './payroll/store.js';
@@ -80,6 +83,16 @@ const FORWARD_URL = RAW_FORWARD_URL.startsWith('https://') ? RAW_FORWARD_URL : '
 // starts requiring it, or onboarding breaks in the gap between the two changes.
 const FORWARD_AUTH_HEADER = (process.env.SLACK_INTERACTIONS_FORWARD_AUTH_HEADER || 'X-LPMCP-Forward-Auth').trim();
 const FORWARD_AUTH_VALUE = (process.env.SLACK_INTERACTIONS_FORWARD_AUTH || '').trim();
+
+// 2026-09-28 — where dnc_lift_* clicks go: the interaction webhook of n8n's
+// "OPS.DNC-LIFT Slack Approval". Separate from FORWARD_URL on purpose — that one
+// is the onboarding workflow, which would read these clicks as approvals.
+// https only; unset = DNC-lift clicks are dropped (the card stays unclicked).
+const RAW_DNC_LIFT_URL = (process.env.SLACK_DNC_LIFT_FORWARD_URL || '').trim();
+const DNC_LIFT_URL = RAW_DNC_LIFT_URL.startsWith('https://') ? RAW_DNC_LIFT_URL : '';
+if (RAW_DNC_LIFT_URL && !DNC_LIFT_URL) {
+  console.error(`[SlackApprovals] SLACK_DNC_LIFT_FORWARD_URL must start with https:// — DNC-lift clicks will be DROPPED (got "${RAW_DNC_LIFT_URL.slice(0, 40)}")`);
+}
 
 if (RAW_FORWARD_URL && !FORWARD_URL) {
   console.error(`[SlackApprovals] SLACK_INTERACTIONS_FORWARD_URL must start with https:// — forwarding DISABLED (got "${RAW_FORWARD_URL.slice(0, 40)}")`);
@@ -254,11 +267,12 @@ export function registerSlackApprovalRoutes(app, {
   forward = forwardInteraction,
   payrollLive = () => String(process.env.PAYROLL_ENGINE_MODE || '').toLowerCase().trim() === 'live',
   payrollHandler = handlePayrollInteraction,
+  dncLiftUrl = DNC_LIFT_URL,
 } = {}) {
   app.post('/webhook/slack/interactions', (req, res) => {
     const approvalsOn = slackApprovalsEnabled();
     // Nothing configured for any job — ack so Slack does not retry, and stop.
-    if (!approvalsOn && !forwardUrl && !payrollLive()) {
+    if (!approvalsOn && !forwardUrl && !payrollLive() && !dncLiftUrl) {
       console.log('[SlackApprovals] click received while disabled and not forwarding — ignored');
       return res.status(200).send('');
     }
@@ -310,6 +324,19 @@ export function registerSlackApprovalRoutes(app, {
       trackBackground(
         payrollHandler(payroll).catch((err) => console.error(`[Payroll] approve handler error: ${err.message}`)),
       );
+      return;
+    }
+
+    // DNC-lift clicks (2026-09-28) go to their own n8n workflow and NEVER to
+    // the onboarding forward, whatever SLACK_APPROVALS_ENABLED says. The
+    // signature check above is what makes the clicking user's id trustworthy
+    // by the time n8n posts it to /slack/dnc-lift/decision.
+    if (isDncLiftAction(rawBody)) {
+      if (!dncLiftUrl) {
+        console.warn('[SlackApprovals] DNC-lift click received but SLACK_DNC_LIFT_FORWARD_URL is unset — dropped, not forwarded');
+        return;
+      }
+      trackBackground(forward(rawBody, headers, { url: dncLiftUrl }));
       return;
     }
 

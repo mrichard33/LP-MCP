@@ -535,6 +535,35 @@ test('14c. the route never forwards a payroll click to n8n, live or not', async 
   }
 });
 
+test('14d. a DNC-lift click goes ONLY to its own workflow, never to onboarding (2026-09-28)', async () => {
+  const { isDncLiftAction } = await import('../src/slack-approvals-core.js');
+  const liftClick = formBody(click({ actions: [{ action_id: 'dnc_lift_approve', value: 'dnc-lift-1' }] }));
+  assert.equal(isDncLiftAction(liftClick), true);
+  assert.equal(isDncLiftAction(formBody(click({ actions: [{ action_id: 'approve_member', value: 'x' }] }))), false);
+
+  const sent = [];
+  const post = mountRoute({
+    forwardUrl: 'https://n8n.example.com/webhook/onboarding',
+    dncLiftUrl: 'https://n8n.example.com/webhook/dnc-lift',
+    forward: async (_b, _h, { url }) => { sent.push(url); return { forwarded: true }; },
+    payrollLive: () => false,
+  });
+  await post(liftClick);
+  await post(formBody(click({ actions: [{ action_id: 'dnc_lift_keep_blocked', value: 'dnc-lift-1' }] })));
+  assert.deepEqual(sent, ['https://n8n.example.com/webhook/dnc-lift', 'https://n8n.example.com/webhook/dnc-lift']);
+
+  // With no DNC-lift URL the click is DROPPED — it must not fall through to onboarding.
+  const sent2 = [];
+  const post2 = mountRoute({
+    forwardUrl: 'https://n8n.example.com/webhook/onboarding',
+    dncLiftUrl: '',
+    forward: async (_b, _h, { url }) => { sent2.push(url); return { forwarded: true }; },
+    payrollLive: () => false,
+  });
+  await post2(liftClick);
+  assert.deepEqual(sent2, []);
+});
+
 /* ─── export + card ─────────────────────────────────────────────────────── */
 
 test('the CSV export has the agreed columns and escapes values', () => {

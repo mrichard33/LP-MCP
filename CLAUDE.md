@@ -49,6 +49,8 @@ else's production flow), our own buttons must never be forwarded even with the f
 any `action_id` that is not `deny_member` as an approval), and the relay copies only the two
 `X-Slack-*` signing headers — never `Authorization`. Unset `SLACK_SIGNING_SECRET` refuses
 everything, forwards included, so set the secret BEFORE repointing Slack.
+The DNC-lift buttons (`dnc_lift_*`, 2026-09-28) are relayed ONLY to `SLACK_DNC_LIFT_FORWARD_URL` (n8n
+OPS.DNC-LIFT) and dropped when it is unset — never to the onboarding forward.
 The payroll card's `payroll_approve` button (2026-09-26) is ours too: any `payroll_*` click is
 handled or dropped, never forwarded, and it is gated on `PAYROLL_ENGINE_MODE=live`, not on
 `SLACK_APPROVALS_ENABLED`. It authorises by active `lf_report_approvers` EMAIL (Slack `users.info`,
