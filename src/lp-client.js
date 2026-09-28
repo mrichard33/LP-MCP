@@ -1084,7 +1084,13 @@ function _translateToLegacy(restFields) {
  * Add a lead to LP's inbound queue. LEGACY-FIRST with REST fallback.
  *
  * Required fields (caller should provide REST naming):
- *   firstname, address1, city, state, zip, phone, srs_id
+ *   firstname, phone, srs_id
+ *
+ * 2026-09-28 (Mark): LP needs a NAME and a PHONE. address1/city/state/zip
+ * are sent when present, never required here — requiring them made
+ * create_lp_lead's name+phone rule a dead letter (the lead would reach
+ * this line and throw). Callers that want an address still gate on it
+ * themselves (canvassing, affiliate, the addlead proxy's address gate).
  *
  * Optional fields:
  *   email     — LP accepts leads without email; field is omitted when blank
@@ -1106,7 +1112,7 @@ function _translateToLegacy(restFields) {
 export async function addLead(fields = {}) {
   // Validate required fields up-front. EMAIL IS NOT REQUIRED — LP accepts
   // leads without email. Per Mark's correction 2026-05-02.
-  const required = ['firstname', 'address1', 'city', 'state', 'zip', 'phone', 'srs_id'];
+  const required = ['firstname', 'phone', 'srs_id'];
   const missing = required.filter(k => {
     const v = fields[k];
     return v === undefined || v === null || String(v).trim() === '';

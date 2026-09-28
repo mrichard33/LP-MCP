@@ -18,14 +18,18 @@
  * appointment in GHL only, never in LP. This handler closes the gap.
  *
  * Idempotency: handler short-circuits if either lp_inbound_lead_id or
- * lp_lead_id is already populated on the contact. The reaper marks
+ * lp_lead_id is already populated on the contact. Since 2026-09-28 it then
+ * asks LP by phone whether this person already has a lead from the last 15
+ * days, and reuses it instead of creating a duplicate (see
+ * src/services/lp-existing-lead-guard.js). The reaper marks
  * create_lp_lead non-idempotent (2026-05-01) so retries on stuck rows
  * are failed rather than retried — the in-handler check is the safety
  * net for normal duplicate fires.
  *
- * Field validation: requires firstname, phone, address1, city, state,
- * postalCode (per LP's actual addLead requirements). EMAIL IS OPTIONAL
- * (corrected 2026-05-02 — earlier versions wrongly required it).
+ * Field validation: requires firstname and phone ONLY (Mark, 2026-09-28).
+ * Address, city, state, zip and email are sent when present, never
+ * required — 7 of 8 missed chat leads had no address and were rejected
+ * here. (Email was already optional since 2026-05-02.)
  * Missing-field case is a clean SKIP (not a throw) so the action
  * doesn't churn through retries — operator must update the contact
  * in GHL and the next event-driven fire will retry.
@@ -96,7 +100,7 @@
  */
 
 import supabase from '../../supabase.js';
-import { addLead as lpAddLead, extractInboundLeadId } from '../../lp-client.js';
+import { addLead as lpAddLead, extractInboundLeadId, getCustomers3, getLeads } from '../../lp-client.js';
 import { sendGroupMeMessage } from '../../groupme.js';
 import { addGHLNote, updateGHLContactFields, applyGHLTag } from '../../ghl.js';
 import { isLPLeadId, ghlFetch } from '../helpers.js';
@@ -104,6 +108,10 @@ import { parseLongDate } from '../date-parsers.js';
 import { resolveContactInfo } from '../resolvers.js';
 import { buildRichNotification } from '../enrichment.js';
 import { LP_SRS, assertNotTransposed, resolvePromoterForSource } from '../../lp-source-ids.js';
+import {
+  existingLeadGuardMode, existingLeadWindowDays, decideExistingLeadAction,
+  flattenLpLeads, pickNewestLead,
+} from '../../services/lp-existing-lead-guard.js';
 // v1.2 — the deterministic call-center brief. Pure builder + a fetch
 // wrapper that returns null on ANY failure, so this stays fail-soft.
 import { buildAgenticLeadNotes, isWeakNotes } from '../../services/agentic-lead-notes.js';
@@ -229,6 +237,95 @@ function resolveNotes(payload, ghlContact, contactId, hasAppointment) {
   return `Lead from GHL Agentic system. Contact ID: ${contactId}. See chat history in GHL for details.`;
 }
 
+/**
+ * 2026-09-28 — find this person's newest LP lead by phone, on ANY prospect.
+ * Deliberately not resolveLPLeadId: that resolver only accepts a phone match
+ * whose lognumber is this GHL contact, and vendor leads posted straight into
+ * LP have an empty lognumber — the exact leads we were duplicating. See the
+ * header of src/services/lp-existing-lead-guard.js. Throws on an LP error so
+ * the caller fails open.
+ */
+async function findExistingLpLead(phone) {
+  const prospects = await getCustomers3({ phone }, { fast: true });
+  const list = (Array.isArray(prospects) ? prospects : [prospects]).filter(Boolean);
+  const leads = [];
+  // Cap: a phone shared by more than a handful of prospects is a data problem,
+  // and every prospect costs one LP round trip on the create path.
+  for (const p of list.slice(0, 5)) {
+    const pid = p.ProspectID || p.prospectid || p.CstID || p.cst_id;
+    if (!pid) continue;
+    const res = await getLeads({ cst_id: pid, PageSize: 50 }, { fast: true });
+    for (const l of flattenLpLeads(res)) leads.push({ ...l, _prospectId: l._prospectId || String(pid) });
+  }
+  const newest = pickNewestLead(leads);
+  if (newest && !newest.createdAtLp) {
+    // LP gave no entry time — fall back to our cache. Still nothing means the
+    // lead is too new to be synced, which decideExistingLeadAction reads as new.
+    try {
+      const { data } = await supabase
+        .from('lp_leads')
+        .select('created_at_lp')
+        .eq('lp_lead_id', newest.ldsId)
+        .maybeSingle();
+      newest.createdAtLp = data?.created_at_lp || null;
+    } catch {}
+  }
+  return newest;
+}
+
+/**
+ * 2026-09-28 — reuse an existing LP lead instead of creating a duplicate.
+ * Writes the lds_id back to GHL and, when there is an appointment to set,
+ * hands it to executeSetLPAppointment with the LEAD ID as the target. Passing
+ * the contact id instead would re-run resolveLPLeadId, which cannot see a
+ * vendor lead with no lognumber and would skip the appointment. The date and
+ * time go in the payload because SetAppointment only reads them off the GHL
+ * contact when its target is a contact.
+ */
+async function reuseExistingLpLead(action, contactId, existing, appt) {
+  await updateGHLContactFields(contactId, [{ id: FIELD_LP_LEAD_ID, field_value: existing.ldsId }]).catch(() => {});
+  await applyGHLTag(contactId, 'lp-existing-lead-reused').catch(() => {});
+
+  let apptResult = null;
+  if (appt) {
+    try {
+      const { executeSetLPAppointment } = await import('./lp-appointment.js');
+      apptResult = await executeSetLPAppointment({
+        ...action,
+        target_id: existing.ldsId,
+        action_payload: { ...(action.action_payload || {}), appt_date: appt.adate, appt_time: appt.atime },
+      });
+    } catch (err) {
+      apptResult = { action: 'set_appt_error', error: err.message };
+      // We did not create a lead, so this appointment now exists only in GHL.
+      // Say so loudly — the reuse must not turn a booking into a silent miss.
+      await sendGroupMeMessage(
+        `⚠️ LP APPT NOT SET on reused lead ${existing.ldsId} (contact ${contactId}, ${appt.adate} ${appt.atime}): ${String(err.message).slice(0, 200)}\n👉 Set the appointment in LP by hand.`
+      ).catch(() => {});
+    }
+  }
+
+  const srcLabel = existing.lpSourceDetail || existing.lpSource || 'source unknown';
+  await addGHLNote(contactId,
+    `[LP CREATE v1.4] Did NOT create a new LP lead — this person already has LP lead ${existing.ldsId} ` +
+    `(${srcLabel}, created ${existing.createdAtLp || 'within the last sync cycle'}).\n` +
+    (apptResult
+      ? `Appointment ${appt.adate} ${appt.atime} handed to SetAppointment → ${apptResult.action}${apptResult.error ? ` (${apptResult.error})` : ''}`
+      : 'No appointment to set.')
+  ).catch(() => {});
+
+  console.log(`[LP-CREATE] ♻️ Reused existing LP lead ${existing.ldsId} for ${contactId} (${srcLabel}); appt=${apptResult?.action || 'none'}`);
+  return {
+    action: 'existing_lp_lead_reused',
+    contact_id: contactId,
+    lp_lead_id: existing.ldsId,
+    lp_prospect_id: existing.prospectId,
+    existing_source: srcLabel,
+    existing_created_at_lp: existing.createdAtLp,
+    appointment_result: apptResult,
+  };
+}
+
 export async function executeCreateLPLead(action) {
   const contactId = action.target_id;
   const payload = action.action_payload || {};
@@ -281,9 +378,38 @@ export async function executeCreateLPLead(action) {
     };
   }
 
+  // ─── Existing-LP-lead guard (2026-09-28) ──────────────────────────
+  // The GHL-field check above misses vendor leads that went straight into
+  // LP and never wrote back to this contact. Ask LP by phone. FAIL-OPEN:
+  // any error proceeds to create — a duplicate is repairable, a lost lead
+  // is not. Mode: LP_CREATE_EXISTING_LEAD_GUARD_MODE (shadow | live | off).
+  const guardMode = existingLeadGuardMode();
+  const guardPhone = normalizePhone(ghlContact.phone);
+  if (guardMode !== 'off' && guardPhone) {
+    try {
+      const existing = await findExistingLpLead(guardPhone);
+      if (existing) {
+        const verdict = decideExistingLeadAction({
+          createdAtLp: existing.createdAtLp,
+          now: new Date(),
+          windowDays: existingLeadWindowDays(),
+        });
+        if (verdict === 'reuse') {
+          if (guardMode === 'live') {
+            const appt = resolveAppointment(payload, eventPayload, ghlContact, payload.include_appt !== false);
+            return await reuseExistingLpLead(action, contactId, existing, appt);
+          }
+          console.log(`[LP-CREATE] 🕶️ EXISTING-LEAD SHADOW ${contactId}: would reuse lds_id=${existing.ldsId} (${existing.lpSourceDetail || existing.lpSource || 'source?'}, created ${existing.createdAtLp || 'not yet cached'}) — creating anyway (shadow)`);
+        }
+      }
+    } catch (err) {
+      console.warn(`[LP-CREATE] existing-lead guard failed for ${contactId} (proceeding with create): ${err.message}`);
+    }
+  }
+
   // ─── Validate required GHL fields ─────────────────────────────────
-  // We need the basics that LP requires to create a lead. EMAIL IS
-  // NOT REQUIRED — LP accepts leads without email (corrected 2026-05-02).
+  // LP needs a first name and a phone — nothing else (Mark, 2026-09-28).
+  // EMAIL IS NOT REQUIRED — LP accepts leads without email (2026-05-02).
   // Skip cleanly (don't throw) if any required field is missing — the
   // action would just retry and we'd churn notifications. The skip is
   // its own success state.
@@ -298,11 +424,9 @@ export async function executeCreateLPLead(action) {
   const missing = [];
   if (!firstName) missing.push('firstName');
   if (!phone)     missing.push('phone');
-  if (!address1)  missing.push('address1');
-  if (!city)      missing.push('city');
-  if (!state)     missing.push('state');
-  if (!zip)       missing.push('postalCode');
-  // Note: email is NOT in this list — LP accepts emailless leads.
+  // 2026-09-28 (Mark): LP needs a NAME and a PHONE — nothing else is
+  // required. Address, city, state, zip and email are sent when present
+  // (lp-client's addLead strips blanks) but never block the push.
 
   if (missing.length) {
     const { name } = await resolveContactInfo(contactId, eventPayload);
