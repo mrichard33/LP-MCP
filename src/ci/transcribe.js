@@ -246,10 +246,14 @@ export async function transcribeCall(call, recordings, { transcriber, loadAudio,
   });
   if (low) console.log(`${LOG} call=${call.id} low_confidence: ${reasons.join(', ')}`);
 
+  // Say which engine actually produced the row, so cost, quality and any
+  // regression can be split by engine after the flip. Hardcoding 'openai'
+  // would make self-hosted transcripts indistinguishable from paid ones.
+  const selfHosted = cfg.transcribeEngine === 'speech';
   return {
     call_id: call.id,
-    engine: 'openai',
-    engine_model: model,
+    engine: selfHosted ? 'reece-speech-api' : 'openai',
+    engine_model: selfHosted ? cfg.speech.modelLabel : model,
     language: perFile.find((f) => f.language)?.language ?? null,
     // 'stereo_channels' only when a stereo file actually produced labelled
     // turns — never asserted from config alone.
@@ -342,6 +346,156 @@ export function createOpenAITranscriber({ apiKey = process.env.OPENAI_API_KEY, f
   };
 }
 
+/**
+ * Self-hosted transcription via reece-speech-api (faster-whisper).
+ *
+ * Uses the ASYNC job endpoints, not /v1/transcribe: the sync route answers 413
+ * for anything longer than the service's SYNC_MAX_SECONDS (900), and Five9
+ * calls routinely run long. Create a job, poll it, map the result into the
+ * SAME shape createOpenAITranscriber returns, so transcribeCall and everything
+ * after it cannot tell the engines apart.
+ *
+ * Channel handling is identical to the OpenAI path: split one side of a stereo
+ * file, or send the whole buffer when it cannot be split.
+ *
+ * Contract, read from mrichard33/reece-speech-api main (app/main.py, app/auth.py,
+ * app/jobs.py) on 2026-09-28 — its /openapi.json does not describe it:
+ *   POST /v1/jobs      → 202 {job_id, status:'queued', chunks_total}
+ *   GET  /v1/jobs/{id} → 200 {job_id, status, chunks_total, chunks_done, chunks,
+ *                             result, error}
+ *   status is exactly queued | processing | done | failed; `result` is null
+ *   until done, then {text, language, duration, model, segments[{start,end,text}]}.
+ *
+ * Two poll answers are TRANSIENT and keep the loop going until the deadline:
+ * 429 (the service rate-limits polls too, 30/min per key) and 503 (model still
+ * loading after a service restart, or its job store briefly unreachable).
+ * Giving up on either would throw away a job that is still running. A 404 is
+ * NOT transient — the default memory store forgets every job on restart, so
+ * the job is gone and only a resubmit (the call's normal retry) recovers it.
+ *
+ * Throws on any failure. recordFailure() then applies the normal backoff and
+ * the call retries. There is deliberately NO silent fallback to OpenAI, since
+ * that would quietly bring back the cost this exists to remove.
+ */
+export function createSpeechApiTranscriber({
+  baseUrl,
+  apiKey,
+  timeoutMs = 240000,
+  pollMs = 5000,
+  language = 'auto',
+  fetchImpl = fetch,
+  sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
+  clock = () => Date.now(),
+} = {}) {
+  return async function transcribe({ buffer, filename, channel }) {
+    if (!baseUrl) throw new Error('CI_SPEECH_API_URL is not configured');
+    if (!apiKey) throw new Error('CI_SPEECH_API_KEY is not configured');
+    const base = String(baseUrl).replace(/\/+$/, '');
+    const headers = speechAuthHeaders(apiKey);
+
+    let payload = buffer;
+    if (channel !== null && channel !== undefined) {
+      const one = extractChannel(buffer, channel);
+      if (one) payload = one;
+      else console.warn(`${LOG} could not split channel ${channel} of ${filename}; sending whole file`);
+    }
+
+    const form = new FormData();
+    form.append('audio', new Blob([payload], { type: 'audio/wav' }), basename(filename) || 'audio.wav');
+    form.append('language', language);
+    form.append('timestamps', 'true');
+
+    const deadline = clock() + timeoutMs;
+    const created = await fetchImpl(`${base}/v1/jobs`, { method: 'POST', headers, body: form });
+    if (!created.ok) {
+      const detail = await created.text().catch(() => '');
+      throw new Error(`speech job create failed (${created.status}): ${detail.slice(0, 300)}`);
+    }
+    const jobId = jobIdOf(await created.json());
+    if (!jobId) throw new Error('speech job create returned no job id');
+
+    for (;;) {
+      await sleep(pollMs);
+      // Checked AFTER the wait, so no request goes out once the budget is spent.
+      if (clock() > deadline) throw new Error(`speech job ${jobId} timed out after ${Math.round(timeoutMs / 1000)}s`);
+      const res = await fetchImpl(`${base}/v1/jobs/${encodeURIComponent(jobId)}`, { headers });
+      if (res.status === 429 || res.status === 503) continue;
+      if (!res.ok) {
+        const detail = await res.text().catch(() => '');
+        throw new Error(`speech job ${jobId} poll failed (${res.status}): ${detail.slice(0, 300)}`);
+      }
+      const job = await res.json();
+      const state = jobStateOf(job);
+      if (state === 'done') return mapSpeechResult(job);
+      if (state === 'failed') {
+        throw new Error(`speech job ${jobId} failed: ${String(job?.error ?? 'unknown').slice(0, 300)}`);
+      }
+    }
+  };
+}
+
+/** The service checks `Authorization: Bearer <SPEECH_API_KEY>` and nothing else (app/auth.py). */
+export function speechAuthHeaders(apiKey) {
+  return { Authorization: `Bearer ${apiKey}` };
+}
+
+/** POST /v1/jobs answers {job_id, status, chunks_total}. */
+export function jobIdOf(json) {
+  return json?.job_id ?? null;
+}
+
+/**
+ * 'done' | 'failed' | 'pending'. The service's statuses are exactly
+ * queued | processing | done | failed. Anything else THROWS rather than being
+ * polled until the deadline: an unknown status means the contract changed,
+ * and that should surface on the first poll, not as a 4-minute timeout.
+ */
+export function jobStateOf(job) {
+  const s = job?.status;
+  if (s === 'done') return 'done';
+  if (s === 'failed') return 'failed';
+  if (s === 'queued' || s === 'processing') return 'pending';
+  throw new Error(`speech job returned unknown status ${JSON.stringify(s ?? null)}`);
+}
+
+/**
+ * Map a finished job to the transcriber contract used by transcribeCall.
+ * confidence stays null and low_confidence false, EXACTLY as the OpenAI path
+ * returns. assessConfidence() still applies its own empty/sparse-output rules,
+ * so low-confidence detection is unchanged across engines.
+ */
+export function mapSpeechResult(job) {
+  const body = job?.result ?? {};
+  const segs = Array.isArray(body.segments) ? body.segments : [];
+  return {
+    text: String(body.text ?? '').trim(),
+    segments: segs.map((s) => ({
+      start: Number(s.start ?? 0),
+      end: Number(s.end ?? s.start ?? 0),
+      text: String(s.text ?? '').trim(),
+    })),
+    language: body.language ?? null,
+    audio_seconds: typeof body.duration === 'number' ? Math.round(body.duration) : null,
+    confidence: null,
+    low_confidence: false,
+  };
+}
+
+/** The ONE place the engine flag is read to build a transcriber. */
+export function selectTranscriber(cfg = getConfig(), deps = {}) {
+  if (cfg.transcribeEngine === 'speech') {
+    return createSpeechApiTranscriber({
+      baseUrl: cfg.speech.url,
+      apiKey: cfg.speech.apiKey,
+      timeoutMs: cfg.speech.timeoutMs,
+      pollMs: cfg.speech.pollMs,
+      language: cfg.speech.language,
+      ...deps,
+    });
+  }
+  return createOpenAITranscriber(deps);
+}
+
 function basename(p) {
   return String(p || '').split('/').filter(Boolean).pop() || '';
 }
@@ -357,4 +511,7 @@ export default {
   transcribeCall,
   createStorageAudioLoader,
   createOpenAITranscriber,
+  createSpeechApiTranscriber,
+  selectTranscriber,
+  mapSpeechResult,
 };

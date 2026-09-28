@@ -107,6 +107,34 @@ export function parseConfig(env = process.env) {
     transferRecordingEnabledFrom: env.CI_TRANSFER_RECORDING_ENABLED_FROM || null,
 
     transcribeModel: env.CI_TRANSCRIBE_MODEL || 'gpt-4o-mini-transcribe',
+
+    /**
+     * Which engine transcribes: 'openai' (paid, the pre-2026-09-28 behaviour) or
+     * 'speech' (the self-hosted faster-whisper service, reece-speech-api).
+     * Anything that is not exactly 'speech', including unset and typos, coerces to
+     * 'openai'. A misconfigured deploy keeps working the way it always has
+     * instead of failing every call. Flipping this is Mark's decision, never part
+     * of a PR.
+     */
+    transcribeEngine: String(env.CI_TRANSCRIBE_ENGINE || 'openai').trim().toLowerCase() === 'speech' ? 'speech' : 'openai',
+    speech: {
+      url: String(env.CI_SPEECH_API_URL || '').trim().replace(/\/+$/, '') || null,
+      apiKey: env.CI_SPEECH_API_KEY || null,
+      // Per-file budget for one job, create + poll. Kept UNDER the 300s worker
+      // lease (CI_WORKER_LEASE_SECONDS) so a slow job fails and retries rather
+      // than letting the lease expire mid-call.
+      timeoutMs: intFloor(env.CI_SPEECH_TIMEOUT_MS, 240000, 10000),
+      // 5s, not 2s (2026-09-28): the service rate-limits EVERY /v1/ request,
+      // polls included, at RATE_LIMIT_PER_MIN=30 per key. A stereo call polls
+      // two jobs at once, so 2s would be 60/min and poll straight into 429s.
+      // Two jobs at 5s is 24/min. The service README suggests 10-15s.
+      pollMs: intFloor(env.CI_SPEECH_POLL_MS, 5000, 1000),
+      // 'auto' on purpose: Florida calls include Spanish speakers.
+      language: env.CI_SPEECH_LANGUAGE || 'auto',
+      // Stored in ci_transcripts.engine_model so a transcript says what made it.
+      modelLabel: env.CI_SPEECH_MODEL_LABEL || 'faster-whisper-small-int8',
+    },
+
     promptVersion: env.CI_PROMPT_VERSION || 'v1',
 
     /**
