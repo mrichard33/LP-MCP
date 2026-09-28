@@ -112,6 +112,32 @@
  *     2026-08-17 manual audit before it was caught.
  *
  * ---------------------------------------------------------------------
+ * v1.5 — 2026-09-28 — CLASS B TRUSTED A STALE CACHE, AND AGED THE WRONG CLOCK
+ *
+ * Two false-positive sources in Class B, both seen on one card:
+ * SANDRA WATSON / Rose Nelson, contact Bq3lxQMhFduSVV1FX7PF, LP lead 579074.
+ *
+ * 1. The GHL book comes from the HL Supabase `appointments` cache. The real
+ *    GHL appointment PlB224EDUJYZJ2xnJ7mr was created 20:30:23Z and the
+ *    reconciler confirmed already_in_sync at 20:35:50Z — but the cache never
+ *    received the row, so the 20:37Z sweep escalated a booked customer.
+ *    Fix: before escalating a Class B gap, read GHL LIVE for that contact
+ *    (fetchUpcomingAppointments, the same lookup the reconciler uses). An
+ *    active appointment inside the window suppresses the finding and is
+ *    counted as ghl_missing_cache_stale. A failed lookup or an exhausted
+ *    per-sweep budget ESCALATES exactly as before — the check can only
+ *    remove a finding GHL itself contradicts, never hide one it cannot see.
+ *
+ * 2. The 90-minute grace aged the lead, not the appointment. This lead was
+ *    created 9/27 and SET 9/28 16:28 ET, so it cleared the gate instantly.
+ *    Fix: age from lp_leads.set_date when present (95% of future set rows);
+ *    fall back to the v1.3 older-clock rule when it is not. set_date does not
+ *    move on re-sync — only a genuine new set moves it — so the v1.3 concern
+ *    (a re-sync resetting a row's age forever) does not apply to it.
+ *
+ * CLASS B ONLY. Classes D and E are untouched.
+ *
+ * ---------------------------------------------------------------------
  * v1.4 — 2026-09-21 — CCC IS A CANCELLATION AND WE WERE NOT READING IT AS ONE
  *
  * RESOLVED_DISPOSITIONS listed CXL / NoHome / NG and omitted CCC — Customer
@@ -264,12 +290,16 @@
  *   PARITY_MAX_WRITES=25         per-run write ceiling
  *   PARITY_INTERVAL_MS=30m
  *   PARITY_GHL_MISSING_MIN_AGE_MIN=90   Class B grace period (reconciler lag)
+ *   PARITY_GHL_LIVE_CHECK=true          Class B live GHL read before escalating
+ *   PARITY_GHL_LIVE_CHECK_MAX=40        per-sweep cap on those live reads
  */
 
 import supabase from '../supabase.js';
 import { getHlSupabase } from '../admin/hl-client.js';
 import { emitEvent } from '../event-emitter.js';
 import { syncAppointmentToLP } from '../lp-appointment-sync.js';
+import { fetchUpcomingAppointments } from '../knowledge/contact-appointments.js';
+import { normalizeGhlStartTime } from '../services/lp-ghl-appointment-reconciler.js';
 import { getGHLContact } from '../ghl.js';
 import { utcToLpStoredIso, lpStoredAgeMinutes } from '../lp-dates.js';
 import { sendGroupMeMessage } from '../groupme.js';
@@ -354,6 +384,17 @@ const PARITY_INTERVAL_MS = Number(process.env.PARITY_INTERVAL_MS || 30 * 60 * 10
 // freshly-booked LP row has not had its turn yet and is not a gap.
 const PARITY_GHL_MISSING_MIN_AGE_MIN = Number(process.env.PARITY_GHL_MISSING_MIN_AGE_MIN || 90);
 
+// v1.5 — live GHL read before a Class B escalation. Read-only. ON by default:
+// it can only suppress a finding GHL itself contradicts. Set 'false' to disable.
+const PARITY_GHL_LIVE_CHECK = process.env.PARITY_GHL_LIVE_CHECK !== 'false';
+const PARITY_GHL_LIVE_CHECK_MAX = Number(process.env.PARITY_GHL_LIVE_CHECK_MAX || 40);
+
+// fetchUpcomingAppointments filters only cancelled/noshow/no-show, so re-filter
+// the full dead-status set (same list the reconciler uses).
+const NON_ACTIVE_GHL_LIVE_STATUSES = new Set([
+  'cancelled', 'canceled', 'no_show', 'noshow', 'no-show', 'invalid',
+]);
+
 const ACTIVE_GHL_STATUSES = ['new', 'confirmed'];
 
 // LP dispositions that mean the appointment is resolved, not pending.
@@ -417,7 +458,7 @@ async function readLpBook(from, to, deps = {}) {
     .from('lp_leads')
     // created_at_lp rides along for the Class B grace period (v1.3). Both LP
     // clocks are needed: see lpRowAgeMinutes.
-    .select('ghl_contact_id, lp_lead_id, lp_prospect_id, first_name, last_name, disposition_code, appointment_set, appointment_confirmed, appointment_date, created_at_lp, updated_at_lp')
+    .select('ghl_contact_id, lp_lead_id, lp_prospect_id, first_name, last_name, disposition_code, appointment_set, appointment_confirmed, appointment_date, set_date, created_at_lp, updated_at_lp')
     .eq('appointment_set', true)
     // Bound built in the stored ET-wall-clock frame. Unlike the GHL
     // appointments read above (start_time is true UTC), lp_leads
@@ -503,6 +544,13 @@ function isSentinelAppointmentDate(value) {
  * nobody is told about is the failure this whole module exists to prevent.
  */
 function lpRowAgeMinutes(row, nowMs = Date.now()) {
+  // v1.5: the appointment's own clock wins when LP gave us one. set_date is in
+  // the same ET-wall-clock frame as the other LP clocks, so the same converter
+  // applies. A negative age (set_date in the future) is bad data — fall back.
+  if (row?.set_date) {
+    const setAge = lpStoredAgeMinutes(row.set_date, nowMs);
+    if (Number.isFinite(setAge) && setAge >= 0) return setAge;
+  }
   const ages = [row?.created_at_lp, row?.updated_at_lp]
     .map((stamp) => lpStoredAgeMinutes(stamp, nowMs))
     .filter((n) => Number.isFinite(n));
@@ -556,6 +604,7 @@ export async function runAppointmentParityWatchdog({ dryRun = !PARITY_AUTOHEAL, 
   const _getGHLContact = deps.getGHLContact || getGHLContact;
   const _syncAppointmentToLP = deps.syncAppointmentToLP || syncAppointmentToLP;
   const _emitEvent = deps.emitEvent || emitEvent;
+  const _fetchUpcomingAppointments = deps.fetchUpcomingAppointments || fetchUpcomingAppointments;
 
   // ONE captured instant for both books — see SAFETY above.
   const asOf = new Date();
@@ -570,6 +619,7 @@ export async function runAppointmentParityWatchdog({ dryRun = !PARITY_AUTOHEAL, 
   const findings = [];
   let writes = 0;
   let errors = 0;
+  let liveChecks = 0;   // v1.5 — Class B live GHL reads this sweep
   const counts = {
     lp_missing_appointment: 0,
     ghl_missing_appointment: 0,
@@ -577,6 +627,10 @@ export async function runAppointmentParityWatchdog({ dryRun = !PARITY_AUTOHEAL, 
     // reconciler's batch cadence. Counted rather than dropped — a suppression
     // nobody can see is how an alarm turns into a blind spot.
     ghl_missing_too_new: 0,
+    // v1.5: Class B findings GHL contradicted on a live read (cache was stale),
+    // and live reads that failed (those findings still escalate).
+    ghl_missing_cache_stale: 0,
+    ghl_live_check_failed: 0,
     confirmation_drift: 0,
     cancellation_drift: 0,
     lp_cancelled_ghl_active: 0,
@@ -811,6 +865,33 @@ export async function runAppointmentParityWatchdog({ dryRun = !PARITY_AUTOHEAL, 
         counts.ghl_missing_too_new++;
         continue;   // no finding, no event, no ops card — it rides the next sweep
       }
+
+      // v1.5 — the GHL book above is a CACHE. Before paging a human that GHL is
+      // missing an appointment, ask GHL. Suppress only on a positive, in-window,
+      // active hit. Failure or budget exhaustion falls through and escalates.
+      if (PARITY_GHL_LIVE_CHECK && liveChecks < PARITY_GHL_LIVE_CHECK_MAX) {
+        liveChecks++;
+        try {
+          const live = await _fetchUpcomingAppointments(cid);
+          if (Array.isArray(live)) {
+            const hit = live.find((a) => {
+              if (NON_ACTIVE_GHL_LIVE_STATUSES.has(String(a?.status || '').toLowerCase())) return false;
+              const ms = Date.parse(normalizeGhlStartTime(a?.start_time) || '');
+              return Number.isFinite(ms) && ms >= asOf.getTime() && ms < windowEnd.getTime();
+            });
+            if (hit) {
+              counts.ghl_missing_cache_stale++;
+              console.warn(`[ApptParity] ${cid}: GHL live holds ${hit.appointment_id} (${hit.status}) — HL cache missing it, not escalating`);
+              continue;
+            }
+          } else {
+            counts.ghl_live_check_failed++;   // null = lookup failed; escalate below
+          }
+        } catch (err) {
+          counts.ghl_live_check_failed++;
+          console.warn(`[ApptParity] live GHL check failed for ${cid} (escalating): ${err.message}`);
+        }
+      }
     }
 
     counts[cls]++;
@@ -917,6 +998,12 @@ export async function runAppointmentParityWatchdog({ dryRun = !PARITY_AUTOHEAL, 
     // appears in the log is indistinguishable from one that was never found.
     (counts.ghl_missing_too_new
       ? ` (+${counts.ghl_missing_too_new} too-new, <${PARITY_GHL_MISSING_MIN_AGE_MIN}m)`
+      : '') +
+    (counts.ghl_missing_cache_stale
+      ? ` (+${counts.ghl_missing_cache_stale} found live in GHL, HL cache stale)`
+      : '') +
+    (counts.ghl_live_check_failed
+      ? ` (${counts.ghl_live_check_failed} live GHL checks failed — escalated)`
       : '') +
     `, ${counts.confirmation_drift} confirm-drift, ${counts.cancellation_drift} cancel-drift, ` +
     `${counts.lp_cancelled_ghl_active} lp-cancelled-ghl-active — ` +
