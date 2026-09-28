@@ -60,7 +60,7 @@
  * unset the op dry-runs, and this module reports dry_run:true and applied:false
  * rather than pretending the read-back matched.
  *
- * NON-MARKET LISTS: anything attached that is not one of the 14 market lists
+ * NON-MARKET LISTS: anything attached that is not one of the 12 market lists
  * (the "Data - Hot - Unmapped" / "Data - Warm - Unmapped" pair seen live on
  * 2026-09-03, or the legacy statewide lists if they are ever re-attached) is
  * pinned to the highest priority number — dialed last — and never reordered
@@ -80,8 +80,12 @@ export const MARKET_LISTS = Object.freeze({
   JAX_MKT:   { hot: 'Data - Hot - JAX less than 7', warm: 'Data - Warm - JAX less than 30' },
   FTMYR_MKT: { hot: 'Data - Hot - FTM less than 7', warm: 'Data - Warm - FTM less than 30' },
   SAR_MKT:   { hot: 'Data - Hot - SAR less than 7', warm: 'Data - Warm - SAR less than 30' },
-  LAKE_MKT:  { hot: 'Data - Hot - LKE less than 7', warm: 'Data - Warm - LKE less than 30' },
 });
+// 2026-09-28 — no LAKE_MKT entry: Lakeland merged into Orlando. The two LKE
+// lists ('Data - Hot - LKE less than 7' / 'Data - Warm - LKE less than 30') are
+// therefore NON-market lists — pinned last like the Unmapped pair, never
+// ranked — until they are detached through the approval-gated
+// five9_remove_lists_from_campaign action.
 
 export const CAMPAIGNS = Object.freeze({
   hot: 'Data - Hot Leads less than 7',

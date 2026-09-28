@@ -715,66 +715,66 @@ zip,city,county,market_code
 33784,Saint Petersburg,Pinellas,STPET
 33785,Indian Rocks Beach,Pinellas,STPET
 33786,Belleair Beach,Pinellas,STPET
-33801,Lakeland,Polk,LAKE
-33802,Lakeland,Polk,LAKE
-33803,Lakeland,Polk,LAKE
-33804,Lakeland,Polk,LAKE
-33805,Lakeland,Polk,LAKE
-33806,Lakeland,Polk,LAKE
-33807,Lakeland,Polk,LAKE
-33809,Lakeland,Polk,LAKE
-33810,Lakeland,Polk,LAKE
-33811,Lakeland,Polk,LAKE
-33812,Lakeland,Polk,LAKE
-33813,Lakeland,Polk,LAKE
-33815,Lakeland,Polk,LAKE
-33820,Alturas,Polk,LAKE
-33823,Auburndale,Polk,LAKE
-33827,Babson Park,Polk,LAKE
-33830,Bartow,Polk,LAKE
-33831,Bartow,Polk,LAKE
-33834,Bowling Green,Hardee,LAKE
-33835,Bradley,Polk,LAKE
-33836,Davenport,Polk,LAKE
-33837,Davenport,Polk,LAKE
-33838,Dundee,Polk,LAKE
-33839,Eagle Lake,Polk,LAKE
-33840,Eaton Park,Polk,LAKE
-33841,Fort Meade,Polk,LAKE
-33843,Frostproof,Polk,LAKE
-33844,Haines City,Polk,LAKE
-33845,Haines City,Polk,LAKE
-33846,Highland City,Polk,LAKE
-33847,Homeland,Polk,LAKE
+33801,Lakeland,Polk,ORL
+33802,Lakeland,Polk,ORL
+33803,Lakeland,Polk,ORL
+33804,Lakeland,Polk,ORL
+33805,Lakeland,Polk,ORL
+33806,Lakeland,Polk,ORL
+33807,Lakeland,Polk,ORL
+33809,Lakeland,Polk,ORL
+33810,Lakeland,Polk,ORL
+33811,Lakeland,Polk,ORL
+33812,Lakeland,Polk,ORL
+33813,Lakeland,Polk,ORL
+33815,Lakeland,Polk,ORL
+33820,Alturas,Polk,ORL
+33823,Auburndale,Polk,ORL
+33827,Babson Park,Polk,ORL
+33830,Bartow,Polk,ORL
+33831,Bartow,Polk,ORL
+33834,Bowling Green,Hardee,ORL
+33835,Bradley,Polk,ORL
+33836,Davenport,Polk,ORL
+33837,Davenport,Polk,ORL
+33838,Dundee,Polk,ORL
+33839,Eagle Lake,Polk,ORL
+33840,Eaton Park,Polk,ORL
+33841,Fort Meade,Polk,ORL
+33843,Frostproof,Polk,ORL
+33844,Haines City,Polk,ORL
+33845,Haines City,Polk,ORL
+33846,Highland City,Polk,ORL
+33847,Homeland,Polk,ORL
 33848,Intercession City,Osceola,ORL
-33849,Kathleen,Polk,LAKE
-33850,Lake Alfred,Polk,LAKE
-33851,Lake Hamilton,Polk,LAKE
+33849,Kathleen,Polk,ORL
+33850,Lake Alfred,Polk,ORL
+33851,Lake Hamilton,Polk,ORL
 33852,Lake Placid,Highlands,FTMYR
-33853,Lake Wales,Polk,LAKE
-33854,Lakeshore,Polk,LAKE
-33855,Indian Lake Estates,Polk,LAKE
-33856,Nalcrest,Polk,LAKE
-33858,Loughman,Polk,LAKE
-33859,Lake Wales,Polk,LAKE
-33860,Mulberry,Polk,LAKE
-33863,Nichols,Polk,LAKE
-33865,Ona,Hardee,LAKE
-33867,River Ranch,Polk,LAKE
-33868,Polk City,Polk,LAKE
-33873,Wauchula,Hardee,LAKE
-33877,Waverly,Polk,LAKE
-33880,Winter Haven,Polk,LAKE
-33881,Winter Haven,Polk,LAKE
-33882,Winter Haven,Polk,LAKE
-33883,Winter Haven,Polk,LAKE
-33884,Winter Haven,Polk,LAKE
-33885,Winter Haven,Polk,LAKE
-33888,Winter Haven,Polk,LAKE
-33890,Zolfo Springs,Hardee,LAKE
-33896,Davenport,Polk,LAKE
-33897,Davenport,Polk,LAKE
-33898,Lake Wales,Polk,LAKE
+33853,Lake Wales,Polk,ORL
+33854,Lakeshore,Polk,ORL
+33855,Indian Lake Estates,Polk,ORL
+33856,Nalcrest,Polk,ORL
+33858,Loughman,Polk,ORL
+33859,Lake Wales,Polk,ORL
+33860,Mulberry,Polk,ORL
+33863,Nichols,Polk,ORL
+33865,Ona,Hardee,ORL
+33867,River Ranch,Polk,ORL
+33868,Polk City,Polk,ORL
+33873,Wauchula,Hardee,ORL
+33877,Waverly,Polk,ORL
+33880,Winter Haven,Polk,ORL
+33881,Winter Haven,Polk,ORL
+33882,Winter Haven,Polk,ORL
+33883,Winter Haven,Polk,ORL
+33884,Winter Haven,Polk,ORL
+33885,Winter Haven,Polk,ORL
+33888,Winter Haven,Polk,ORL
+33890,Zolfo Springs,Hardee,ORL
+33896,Davenport,Polk,ORL
+33897,Davenport,Polk,ORL
+33898,Lake Wales,Polk,ORL
 33901,Fort Myers,Lee,FTMYR
 33902,Fort Myers,Lee,FTMYR
 33903,North Fort Myers,Lee,FTMYR
@@ -1026,7 +1026,7 @@ zip,city,county,market_code
 34755,Minneola,Lake,ORL
 34756,Montverde,Lake,ORL
 34758,Kissimmee,Osceola,ORL
-34759,Kissimmee,Polk,LAKE
+34759,Kissimmee,Polk,ORL
 34760,Oakland,Orange,ORL
 34761,Ocoee,Orange,ORL
 34762,The Villages,Lake,ORL

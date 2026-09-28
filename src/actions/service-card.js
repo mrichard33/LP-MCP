@@ -5,8 +5,9 @@
  * service. Built for people who have never seen the contact: who, phone, what
  * they need, and where to click. No scores, no source codes.
  *
- * ROUTING (Mark, 2026-09-24):
- *   - Record lists the Lakeland office  → LAKE  (#service-lakeland)
+ * ROUTING (Mark, 2026-09-24; Lakeland line changed 2026-09-28):
+ *   - Record lists the Lakeland office  → ORL   (#service-orlando — Lakeland
+ *     merged into Orlando on 2026-09-28; #service-lakeland is no longer routed)
  *   - Otherwise                         → the contact's own market (ORL → #service-orlando)
  *   - No market at all                  → SLACK_CHANNEL_SERVICE (#contact-center), via src/slack.js
  *
@@ -53,7 +54,10 @@ export function getCustomField(contact, id) {
 }
 
 /**
- * Lakeland office wins; otherwise the known market code; otherwise null.
+ * Lakeland office wins (→ ORL since the 2026-09-28 merge — the override stays so
+ * a Lakeland-office customer whose market field says something else still lands
+ * with the office that serves them); otherwise the known market code; otherwise
+ * null.
  *
  * The raw market field is only a last resort (the caller's validated code
  * comes first), and it must be ONE code. ~135 contacts still hold joined
@@ -62,7 +66,7 @@ export function getCustomField(contact, id) {
  */
 export function resolveServiceMarket(contact, fallbackCode) {
   const office = getCustomField(contact, FIELD.SERVICING_OFFICE);
-  if (/lakeland/i.test(office)) return 'LAKE';
+  if (/lakeland/i.test(office)) return 'ORL';
   const code = String(fallbackCode || getCustomField(contact, FIELD.MARKET) || '').trim().toUpperCase();
   return /^[A-Z]+$/.test(code) ? code : null;
 }

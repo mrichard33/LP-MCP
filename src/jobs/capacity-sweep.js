@@ -1116,7 +1116,7 @@ export async function runFillSnapshot(snapshotDate = todayET()) {
 // ─── Board aggregate route ───────────────────────────────────────────────────
 
 /**
- * Compose the /board/capacity response for one ET date. All 7 markets emit
+ * Compose the /board/capacity response for one ET date. All 6 markets emit
  * even at zero; anything the branch/assignment maps can't place (UNRESOLVED,
  * OUT_OF_AREA, UNASSIGNED) folds into the always-present `unresolved` bucket —
  * business rule 2: never a silent drop, never a hidden bucket.

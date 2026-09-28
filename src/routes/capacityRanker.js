@@ -3,7 +3,7 @@
  *
  * Reads next-day appointment capacity from the SAME source the Appointment
  * Capacity TV board reads (buildBoardResponse in src/jobs/capacity-sweep.js —
- * the function behind GET /board/capacity), ranks the seven markets
+ * the function behind GET /board/capacity), ranks the six markets
  * (src/capacity/rankMarkets.js), compares against the last APPLIED ranking in
  * dial_priority_log, and — only in live mode, only on a material change —
  * reorders the two Data campaigns' lists (src/capacity/applyDialPriority.js).

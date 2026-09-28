@@ -13,21 +13,25 @@ const liveLists = [
   { name: 'Data - Hot - Unmapped',        dialingPriority: 8 },
 ];
 
-test('ranks the seven markets 1..7 and ignores non-market lists', async () => {
+// 2026-09-28 — Lakeland merged into Orlando. The LKE list is still attached
+// live until the approval-gated detach runs, so it stays in the fixture: it is
+// now a NON-market list and must never be given a rank or a LAKE_MKT badge.
+test('ranks the six markets 1..6 and ignores non-market lists (LKE included)', async () => {
   _resetDialRankCache();
   const r = await getDialRanks({ getCampaign: async () => ({ lists: liveLists }), log: () => {} });
   assert.deepEqual(r.ranks, {
     FTMYR_MKT: 1, SAR_MKT: 2, JAX_MKT: 3, STPET_MKT: 4,
-    ORL_MKT: 5, LAKE_MKT: 6, FTLAU_MKT: 7,
+    ORL_MKT: 5, FTLAU_MKT: 6,
   });
-  assert.equal(Object.values(r.ranks).includes(8), false);
+  assert.equal('LAKE_MKT' in r.ranks, false, 'no Lakeland badge after the merge');
+  assert.equal(Object.values(r.ranks).includes(7), false);
 });
 
-test('gapped Five9 priorities still print 1..7', async () => {
+test('gapped Five9 priorities still print 1..6', async () => {
   _resetDialRankCache();
   const gapped = liveLists.slice(0, 7).map((l, i) => ({ ...l, dialingPriority: (i + 1) * 10 }));
   const r = await getDialRanks({ getCampaign: async () => ({ lists: gapped }), log: () => {} });
-  assert.deepEqual(Object.values(r.ranks).sort((a, b) => a - b), [1, 2, 3, 4, 5, 6, 7]);
+  assert.deepEqual(Object.values(r.ranks).sort((a, b) => a - b), [1, 2, 3, 4, 5, 6]);
 });
 
 test('a Five9 failure returns empty ranks and does not throw', async () => {

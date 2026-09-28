@@ -251,7 +251,7 @@ export async function getMarketPerformance({
  * score that put it there. This counts how long that has been true so the
  * ranker can force it up for one cycle.
  *
- * Bottom half of n ranked markets is rank > n/2 — for the seven LP markets
+ * Bottom half of n ranked markets is rank > n/2 — for the six LP markets
  * that is ranks 4 through 7. The FIRST top-half placement stops the count:
  * the streak is consecutive by definition, so an older run of bottom-half
  * placements behind a top-half one does not carry forward.

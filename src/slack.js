@@ -41,7 +41,13 @@ const CH_APPROVALS = process.env.SLACK_CHANNEL_APPROVALS || '';
 
 // Codes with no Slack channel of their own. Boca and Miami are worked out of
 // the Fort Lauderdale office and post to its channels.
-const MARKET_ALIASES = { BOCA: 'FTLAU', MIAMI: 'FTLAU' };
+// 2026-09-28 — Lakeland merged into Orlando (sql/135). LP still stamps the raw
+// branch 'LAKE' on its leads (and GHL's LP Market field keeps receiving it), so
+// the alias, not the data, is what sends a Lakeland card to #sales-orlando /
+// #canvass-orlando / #service-orlando — and counts a Lakeland sale on Orlando's
+// office leaderboard. The LAKE rows in slack_channels / slack_market_slugs were
+// removed; without this line a Lakeland card would fall back to the rollup.
+const MARKET_ALIASES = { BOCA: 'FTLAU', MIAMI: 'FTLAU', LAKE: 'ORL' };
 
 /**
  * The market code whose channels a code posts to: BOCA → FTLAU, FTMYR → FTMYR.

@@ -1,7 +1,7 @@
 /**
  * test-capacity-ranker.js — capacity-driven Five9 list priority ranker.
  *
- * THE RULE UNDER TEST: Lakeland on 2026-09-04 read 0.0 % filled (0 of 2
+ * THE RULE UNDER TEST (pre-merge board — see PRE_MERGE_MARKETS): Lakeland on 2026-09-04 read 0.0 % filled (0 of 2
  * requested) with 3 appointments already pending — open_true = -1. A naive
  * fill-% sort ranks it FIRST and points the whole floor at a market with
  * nothing to sell. It must rank LAST. Fort Myers (1/43, 39 truly open) ranks
@@ -70,6 +70,17 @@ import {
   PERF_MEMO_MS,
 } from '../src/capacity/marketPerformance.js';
 
+// ─── 2026-09-28: Lakeland merged into Orlando ────────────────────────────────
+// MARKET_CODES is six now (sql/135_lake_orl_merge.sql). The fixtures below are
+// REAL pre-merge boards — seven markets, with Lakeland as the small one — and
+// they are the regression cover for the ranking RULES, which do not depend on
+// which markets exist. So the pure-ranker tests run them against the market
+// list that was live on those dates, passed explicitly. The post-merge default
+// (six markets, ranks 1–6, no LAKE_MKT, no LKE list ever ranked) has its own
+// "MERGE:" block further down.
+const PRE_MERGE_MARKETS = Object.freeze([...MARKET_CODES, 'LAKE_MKT']);
+const rankPreMerge = (rows, opts = {}) => rankMarkets(rows, { markets: PRE_MERGE_MARKETS, ...opts });
+
 // ─── Fixture: GET /board/capacity?date=2026-09-04, live 2026-09-03 12:48 ET ──
 // (the HANDOFF worked example; STPET read 6/29 by 17:01 UTC — LP data moves)
 const FIXTURE_2026_09_04 = [
@@ -121,7 +132,7 @@ const order = (ranking) => ranking.map((r) => r.market.replace('_MKT', ''));
 // ─── rankMarkets ─────────────────────────────────────────────────────────────
 
 test('2026-09-04 fixture: FTMYR_MKT ranks first, LAKE_MKT ranks LAST (not first)', () => {
-  const { ranking, unknown } = rankMarkets(FIXTURE_2026_09_04);
+  const { ranking, unknown } = rankPreMerge(FIXTURE_2026_09_04);
   assert.equal(unknown.length, 0, 'every market filed capacity');
   assert.equal(ranking.length, 7);
   assert.equal(ranking[0].market, 'FTMYR_MKT', 'Fort Myers 1/43 is priority 1');
@@ -132,7 +143,7 @@ test('2026-09-04 fixture: FTMYR_MKT ranks first, LAKE_MKT ranks LAST (not first)
 });
 
 test('2026-09-04 fixture: full order is by ABSOLUTE open slots, oversold last', () => {
-  const { ranking } = rankMarkets(FIXTURE_2026_09_04);
+  const { ranking } = rankPreMerge(FIXTURE_2026_09_04);
   // 39, 17, 14, 13, 9, 4 open — then Lakeland at -1, oversold.
   assert.deepEqual(
     ranking.map((r) => r.market),
@@ -145,7 +156,7 @@ test('2026-09-04 fixture: full order is by ABSOLUTE open slots, oversold last', 
 });
 
 test('2026-09-04 fixture: Lakeland carries BOTH oversold and small_denominator, open_true = -1', () => {
-  const m = byMarket(rankMarkets(FIXTURE_2026_09_04).ranking);
+  const m = byMarket(rankPreMerge(FIXTURE_2026_09_04).ranking);
   assert.equal(m.LAKE_MKT.fill_pct, 0);
   assert.equal(m.LAKE_MKT.open_true, -1);
   assert.equal(m.LAKE_MKT.oversold, true);
@@ -158,7 +169,7 @@ test('2026-09-04 fixture: Lakeland carries BOTH oversold and small_denominator, 
 });
 
 test('2026-09-04 fixture: fill % and open_true per market match the handoff table', () => {
-  const m = byMarket(rankMarkets(FIXTURE_2026_09_04).ranking);
+  const m = byMarket(rankPreMerge(FIXTURE_2026_09_04).ranking);
   assert.equal(m.FTMYR_MKT.fill_pct, 2.3);  assert.equal(m.FTMYR_MKT.open_true, 39);
   assert.equal(m.FTLAU_MKT.fill_pct, 14.3); assert.equal(m.FTLAU_MKT.open_true, 4);
   assert.equal(m.JAX_MKT.fill_pct, 19.0);   assert.equal(m.JAX_MKT.open_true, 9);
@@ -169,7 +180,7 @@ test('2026-09-04 fixture: fill % and open_true per market match the handoff tabl
 
 test('UNKNOWN fail-open: requested = 0 lands in unknown[] and is absent from ranking[]', () => {
   const rows = FIXTURE_2026_09_04.map((r) => (r.market === 'SAR_MKT' ? { ...r, requested: 0, confirmed: 0, set_pending: 0 } : r));
-  const { ranking, unknown } = rankMarkets(rows);
+  const { ranking, unknown } = rankPreMerge(rows);
   assert.deepEqual(unknown.map((u) => u.market), ['SAR_MKT']);
   assert.equal(unknown[0].reason, 'requested_zero');
   assert.ok(!ranking.some((r) => r.market === 'SAR_MKT'), 'not in ranking');
@@ -179,15 +190,15 @@ test('UNKNOWN fail-open: requested = 0 lands in unknown[] and is absent from ran
 
 test('UNKNOWN fail-open: a market with NO capacity row lands in unknown[] with no_capacity_row', () => {
   const rows = FIXTURE_2026_09_04.filter((r) => r.market !== 'JAX_MKT');
-  const { ranking, unknown } = rankMarkets(rows);
+  const { ranking, unknown } = rankPreMerge(rows);
   assert.deepEqual(unknown, [{ market: 'JAX_MKT', reason: 'no_capacity_row' }]);
   assert.ok(!ranking.some((r) => r.market === 'JAX_MKT'));
   assert.notEqual(ranking[0].market, 'JAX_MKT', 'an unknown market is never priority 1');
 });
 
-test('UNKNOWN: a market code outside the seven is surfaced as unmapped_market, never ranked', () => {
+test('UNKNOWN: a market code outside the list is surfaced as unmapped_market, never ranked', () => {
   const rows = [...FIXTURE_2026_09_04, { market: 'TPA_MKT', requested: 10, confirmed: 0, set_pending: 0 }];
-  const { ranking, unknown } = rankMarkets(rows);
+  const { ranking, unknown } = rankPreMerge(rows);
   assert.ok(!ranking.some((r) => r.market === 'TPA_MKT'));
   assert.deepEqual(unknown.map((u) => [u.market, u.reason]), [['TPA_MKT', 'unmapped_market']]);
 });
@@ -199,7 +210,7 @@ test('SMALL DENOMINATOR: requested < 4 ranks after every normal market, before o
     { market: 'JAX_MKT',   requested: 21, confirmed: 4,  set_pending: 8 },   // 19 %, normal
     { market: 'LAKE_MKT',  requested: 10, confirmed: 5,  set_pending: 6 },   // 50 %, oversold (open -1)
   ];
-  const { ranking } = rankMarkets(rows);
+  const { ranking } = rankPreMerge(rows);
   assert.deepEqual(ranking.map((r) => r.market), ['JAX_MKT', 'ORL_MKT', 'FTLAU_MKT', 'LAKE_MKT']);
   const m = byMarket(ranking);
   assert.deepEqual(m.FTLAU_MKT.flags, ['small_denominator']);
@@ -211,7 +222,7 @@ test('OVERSOLD: open_true = 0 counts as full (<= 0), ranks last even at 0 % fill
     { market: 'ORL_MKT', requested: 10, confirmed: 9, set_pending: 0 },   // 90 %, open 1
     { market: 'SAR_MKT', requested: 10, confirmed: 0, set_pending: 10 },  // 0 %, open 0
   ];
-  const { ranking } = rankMarkets(rows);
+  const { ranking } = rankPreMerge(rows);
   assert.deepEqual(ranking.map((r) => r.market), ['ORL_MKT', 'SAR_MKT']);
   assert.equal(byMarket(ranking).SAR_MKT.open_true, 0);
   assert.equal(byMarket(ranking).SAR_MKT.oversold, true);
@@ -222,7 +233,7 @@ test('ranking is deterministic on ties (same fill % → more open slots first, t
     { market: 'SAR_MKT', requested: 10, confirmed: 2, set_pending: 5 }, // 20 %, open 3
     { market: 'JAX_MKT', requested: 20, confirmed: 4, set_pending: 2 }, // 20 %, open 14
   ];
-  assert.deepEqual(rankMarkets(rows).ranking.map((r) => r.market), ['JAX_MKT', 'SAR_MKT']);
+  assert.deepEqual(rankPreMerge(rows).ranking.map((r) => r.market), ['JAX_MKT', 'SAR_MKT']);
 });
 
 // ─── 2026-09-05: rank on TRUE OPEN SLOTS, weighted by market performance ─────
@@ -231,7 +242,7 @@ test('ranking is deterministic on ties (same fill % → more open slots first, t
 // regression cover for behaviour that already shipped.
 
 test('2026-09-05: JAX must NOT rank 1 — it has ONE genuinely open slot', () => {
-  const { ranking } = rankMarkets(FIXTURE_2026_09_05, { performance: PERF_2026_09_04 });
+  const { ranking } = rankPreMerge(FIXTURE_2026_09_05, { performance: PERF_2026_09_04 });
   const m = byMarket(ranking);
   assert.equal(m.JAX_MKT.open_true, 1, '17 requested - 2 confirmed - 14 pending');
   assert.notEqual(ranking[0].market, 'JAX_MKT', 'JAX ranked FIRST under the old fill-% sort');
@@ -242,13 +253,13 @@ test('2026-09-05: JAX must NOT rank 1 — it has ONE genuinely open slot', () =>
 });
 
 test('2026-09-05: full expected order is FTM, STP, SAR, LKE, ORL, JAX, FTL', () => {
-  const { ranking, unknown } = rankMarkets(FIXTURE_2026_09_05, { performance: PERF_2026_09_04 });
+  const { ranking, unknown } = rankPreMerge(FIXTURE_2026_09_05, { performance: PERF_2026_09_04 });
   assert.equal(unknown.length, 0, 'every market filed capacity');
   assert.deepEqual(order(ranking), ['FTMYR', 'STPET', 'SAR', 'LAKE', 'ORL', 'JAX', 'FTLAU']);
 });
 
 test('2026-09-05: FTM outranks STP — both have 7 open, the weight is the only differentiator', () => {
-  const { ranking } = rankMarkets(FIXTURE_2026_09_05, { performance: PERF_2026_09_04 });
+  const { ranking } = rankPreMerge(FIXTURE_2026_09_05, { performance: PERF_2026_09_04 });
   const m = byMarket(ranking);
   assert.equal(m.FTMYR_MKT.open_true, 7);
   assert.equal(m.STPET_MKT.open_true, 7, 'identical capacity — nothing to separate them but performance');
@@ -262,7 +273,7 @@ test('2026-09-05: FTM outranks STP — both have 7 open, the weight is the only 
 });
 
 test('2026-09-05: FTL ranks LAST — open_true = -2 is oversold', () => {
-  const { ranking } = rankMarkets(FIXTURE_2026_09_05, { performance: PERF_2026_09_04 });
+  const { ranking } = rankPreMerge(FIXTURE_2026_09_05, { performance: PERF_2026_09_04 });
   const last = ranking[ranking.length - 1];
   assert.equal(last.market, 'FTLAU_MKT');
   assert.equal(last.open_true, -2);
@@ -271,7 +282,7 @@ test('2026-09-05: FTL ranks LAST — open_true = -2 is oversold', () => {
 });
 
 test('2026-09-05: LKE ranks 4th on absolute score — neither 1st nor last', () => {
-  const { ranking } = rankMarkets(FIXTURE_2026_09_05, { performance: PERF_2026_09_04 });
+  const { ranking } = rankPreMerge(FIXTURE_2026_09_05, { performance: PERF_2026_09_04 });
   const m = byMarket(ranking);
   assert.equal(m.LAKE_MKT.rank, 4);
   assert.notEqual(ranking[0].market, 'LAKE_MKT');
@@ -282,7 +293,7 @@ test('2026-09-05: LKE ranks 4th on absolute score — neither 1st nor last', () 
 });
 
 test('2026-09-05: absolute slots, not a rate — LKE at 100 % open still ranks below STP at 35 %', () => {
-  const { ranking } = rankMarkets(FIXTURE_2026_09_05, { performance: PERF_2026_09_04 });
+  const { ranking } = rankPreMerge(FIXTURE_2026_09_05, { performance: PERF_2026_09_04 });
   const m = byMarket(ranking);
   // Lakeland is 2 of 2 open (100 %); St. Pete is 7 of 20 (35 %). Sorting on
   // the RATE would put Lakeland first and spend the floor's best hour on two
@@ -292,7 +303,7 @@ test('2026-09-05: absolute slots, not a rate — LKE at 100 % open still ranks b
 });
 
 test('2026-09-05: score = open_true × perf_multiplier, reported per market', () => {
-  const { ranking } = rankMarkets(FIXTURE_2026_09_05, { performance: PERF_2026_09_04 });
+  const { ranking } = rankPreMerge(FIXTURE_2026_09_05, { performance: PERF_2026_09_04 });
   for (const r of ranking) {
     assert.equal(r.score, Math.round(r.open_true * r.perf_multiplier * 1000) / 1000, r.market);
     assert.ok(Number.isFinite(r.set_to_sale), `${r.market} reports set_to_sale`);
@@ -309,7 +320,7 @@ test('2026-09-05: RANKER_PERF_WEIGHT=0 → pure open-slot order', () => {
     if (code === '_company') continue;
     assert.equal(p.multiplier, 1, 'W=0 disables weighting entirely');
   }
-  const { ranking } = rankMarkets(FIXTURE_2026_09_05, { performance: flat });
+  const { ranking } = rankPreMerge(FIXTURE_2026_09_05, { performance: flat });
   const m = byMarket(ranking);
   // FTM and STP now tie exactly (both 7 open, both ×1.0) and the deterministic
   // fallback — more open slots, then market code — keeps FTM first.
@@ -327,7 +338,7 @@ test('2026-09-05: RANKER_PERF_WEIGHT=0 → pure open-slot order', () => {
 });
 
 test('2026-09-05: no performance data at all → every multiplier 1.0, ranking still sane', () => {
-  const { ranking } = rankMarkets(FIXTURE_2026_09_05);
+  const { ranking } = rankPreMerge(FIXTURE_2026_09_05);
   for (const r of ranking) assert.equal(r.perf_multiplier, 1);
   assert.deepEqual(order(ranking), ['FTMYR', 'STPET', 'SAR', 'LAKE', 'JAX', 'ORL', 'FTLAU']);
   assert.notEqual(ranking[0].market, 'JAX_MKT', 'the regression is fixed by open_true alone');
@@ -335,8 +346,8 @@ test('2026-09-05: no performance data at all → every multiplier 1.0, ranking s
 });
 
 test('the weight is what separates ORL from JAX — both have exactly 1 open slot', () => {
-  const unweighted = byMarket(rankMarkets(FIXTURE_2026_09_05).ranking);
-  const weighted = byMarket(rankMarkets(FIXTURE_2026_09_05, { performance: PERF_2026_09_04 }).ranking);
+  const unweighted = byMarket(rankPreMerge(FIXTURE_2026_09_05).ranking);
+  const weighted = byMarket(rankPreMerge(FIXTURE_2026_09_05, { performance: PERF_2026_09_04 }).ranking);
   assert.equal(unweighted.ORL_MKT.open_true, 1);
   assert.equal(unweighted.JAX_MKT.open_true, 1);
   assert.ok(unweighted.JAX_MKT.rank < unweighted.ORL_MKT.rank, 'unweighted: alphabetical, JAX first');
@@ -346,14 +357,14 @@ test('the weight is what separates ORL from JAX — both have exactly 1 open slo
 test('2026-09-05: the weight CANNOT flip a 7-vs-4 capacity gap', () => {
   // SAR is the best-converting market with open slots (15.7 %) and still ranks
   // below both 7-slot markets. Capacity dominates, by construction.
-  const { ranking } = rankMarkets(FIXTURE_2026_09_05, { performance: PERF_2026_09_04 });
+  const { ranking } = rankPreMerge(FIXTURE_2026_09_05, { performance: PERF_2026_09_04 });
   const m = byMarket(ranking);
   assert.equal(m.SAR_MKT.open_true, 4);
   assert.ok(m.SAR_MKT.rank > m.FTMYR_MKT.rank && m.SAR_MKT.rank > m.STPET_MKT.rank);
   // Even at an absurd weight the clamp holds the spread inside ±0.15, so the
   // best 4-slot market maxes at 4.6 and the worst 7-slot market floors at 5.95.
   const extreme = computeMultipliers(SCORECARD_90D, { weight: 99 });
-  const r2 = byMarket(rankMarkets(FIXTURE_2026_09_05, { performance: extreme }).ranking);
+  const r2 = byMarket(rankPreMerge(FIXTURE_2026_09_05, { performance: extreme }).ranking);
   assert.ok(r2.SAR_MKT.rank > r2.FTMYR_MKT.rank && r2.SAR_MKT.rank > r2.STPET_MKT.rank);
 });
 
@@ -487,7 +498,7 @@ test('getMarketPerformance FAILS OPEN: a query error yields 1.0 everywhere, neve
   assert.deepEqual(perf, {});
   // and rankMarkets on an empty table is pure open-slot order — degraded, but
   // still a sane dial list, and JAX is still not first.
-  const { ranking } = rankMarkets(FIXTURE_2026_09_05, { performance: perf });
+  const { ranking } = rankPreMerge(FIXTURE_2026_09_05, { performance: perf });
   assert.deepEqual(order(ranking), ['FTMYR', 'STPET', 'SAR', 'LAKE', 'JAX', 'ORL', 'FTLAU']);
   assert.notEqual(ranking[0].market, 'JAX_MKT');
   assert.ok(warnings.some((w) => /run_sql exploded/.test(w)), 'the failure is logged, not swallowed');
@@ -520,7 +531,7 @@ test('countBottomHalfStreaks: a top-half placement RESETS the counter', () => {
 
 test('starvation: bottom-half 3x with confirmed=0 and open_true>0 is promoted to RANK 2', () => {
   const streaks = { LAKE_MKT: 3 };
-  const { ranking } = rankMarkets(FIXTURE_2026_09_05, { performance: PERF_2026_09_04, starvationStreaks: streaks });
+  const { ranking } = rankPreMerge(FIXTURE_2026_09_05, { performance: PERF_2026_09_04, starvationStreaks: streaks });
   const m = byMarket(ranking);
   assert.equal(m.LAKE_MKT.rank, 2, 'promoted from 4th');
   assert.equal(m.LAKE_MKT.starvation_promoted, true);
@@ -536,7 +547,7 @@ test('starvation: bottom-half 3x with confirmed=0 and open_true>0 is promoted to
 
 test('starvation: NEVER forces rank 1, even if it is the only ranked market left', () => {
   const rows = [{ market: 'LAKE_MKT', requested: 2, confirmed: 0, set_pending: 0 }];
-  const { ranking } = rankMarkets(rows, { starvationStreaks: { LAKE_MKT: 9 } });
+  const { ranking } = rankPreMerge(rows, { starvationStreaks: { LAKE_MKT: 9 } });
   assert.equal(ranking[0].market, 'LAKE_MKT');
   assert.equal(ranking[0].rank, 1, 'it is rank 1 because it is alone — not because it was promoted');
   assert.equal(ranking[0].starvation_promoted, false, 'no promotion when there is nothing to promote past');
@@ -544,7 +555,7 @@ test('starvation: NEVER forces rank 1, even if it is the only ranked market left
 
 test('starvation: does NOT fire below 3 consecutive runs', () => {
   for (const streak of [0, 1, 2]) {
-    const { ranking } = rankMarkets(FIXTURE_2026_09_05, { performance: PERF_2026_09_04, starvationStreaks: { LAKE_MKT: streak } });
+    const { ranking } = rankPreMerge(FIXTURE_2026_09_05, { performance: PERF_2026_09_04, starvationStreaks: { LAKE_MKT: streak } });
     const m = byMarket(ranking);
     assert.equal(m.LAKE_MKT.starvation_promoted, false, `streak ${streak}`);
     assert.equal(m.LAKE_MKT.rank, 4, `streak ${streak} leaves it at its earned rank`);
@@ -553,12 +564,12 @@ test('starvation: does NOT fire below 3 consecutive runs', () => {
 
 test('starvation: does NOT fire when the market has confirmed appointments', () => {
   const rows = FIXTURE_2026_09_05.map((r) => (r.market === 'LAKE_MKT' ? { ...r, requested: 4, confirmed: 1 } : r));
-  const { ranking } = rankMarkets(rows, { performance: PERF_2026_09_04, starvationStreaks: { LAKE_MKT: 9 } });
+  const { ranking } = rankPreMerge(rows, { performance: PERF_2026_09_04, starvationStreaks: { LAKE_MKT: 9 } });
   assert.equal(byMarket(ranking).LAKE_MKT.starvation_promoted, false, 'it is being worked — not starving');
 });
 
 test('starvation: does NOT fire on an oversold market (nothing to sell)', () => {
-  const { ranking } = rankMarkets(FIXTURE_2026_09_05, { performance: PERF_2026_09_04, starvationStreaks: { FTLAU_MKT: 9 } });
+  const { ranking } = rankPreMerge(FIXTURE_2026_09_05, { performance: PERF_2026_09_04, starvationStreaks: { FTLAU_MKT: 9 } });
   const m = byMarket(ranking);
   assert.equal(m.FTLAU_MKT.starvation_promoted, false, 'open_true = -2');
   assert.equal(m.FTLAU_MKT.rank, 7, 'still last');
@@ -568,7 +579,7 @@ test('starvation: promoting to rank 2 puts the market TOP HALF, so it is not pro
   // Cycle 1 — 3 bottom-half runs behind it, so it promotes.
   const history = historyPlacing('LAKE_MKT', 6, 3);
   const streaks1 = countBottomHalfStreaks(history);
-  const run1 = rankMarkets(FIXTURE_2026_09_05, { performance: PERF_2026_09_04, starvationStreaks: streaks1 });
+  const run1 = rankPreMerge(FIXTURE_2026_09_05, { performance: PERF_2026_09_04, starvationStreaks: streaks1 });
   assert.equal(byMarket(run1.ranking).LAKE_MKT.rank, 2);
   assert.equal(byMarket(run1.ranking).LAKE_MKT.starvation_promoted, true);
 
@@ -576,7 +587,7 @@ test('starvation: promoting to rank 2 puts the market TOP HALF, so it is not pro
   // 7 is top half, so the streak resets to 0 and the guard stands down.
   const streaks2 = countBottomHalfStreaks([{ ranking: run1.ranking }, ...history]);
   assert.equal(streaks2.LAKE_MKT ?? 0, 0, 'the counter reset');
-  const run2 = rankMarkets(FIXTURE_2026_09_05, { performance: PERF_2026_09_04, starvationStreaks: streaks2 });
+  const run2 = rankPreMerge(FIXTURE_2026_09_05, { performance: PERF_2026_09_04, starvationStreaks: streaks2 });
   assert.equal(byMarket(run2.ranking).LAKE_MKT.starvation_promoted, false);
   assert.equal(byMarket(run2.ranking).LAKE_MKT.rank, 4, 'back to its earned rank');
 });
@@ -584,15 +595,15 @@ test('starvation: promoting to rank 2 puts the market TOP HALF, so it is not pro
 // ─── isMaterialChange ────────────────────────────────────────────────────────
 
 test('material change: no prior applied ranking is material', () => {
-  const next = rankMarkets(FIXTURE_2026_09_04);
+  const next = rankPreMerge(FIXTURE_2026_09_04);
   const r = isMaterialChange(null, next);
   assert.equal(r.changed, true);
   assert.deepEqual(r.reasons, ['no_prior_applied_ranking']);
 });
 
 test('material change: identical ranking is NOT a change', () => {
-  const a = rankMarkets(FIXTURE_2026_09_04);
-  const b = rankMarkets(FIXTURE_2026_09_04);
+  const a = rankPreMerge(FIXTURE_2026_09_04);
+  const b = rankPreMerge(FIXTURE_2026_09_04);
   assert.equal(isMaterialChange(a, b).changed, false);
 });
 
@@ -601,10 +612,10 @@ test('material change: a swap on a FRACTIONAL score gap alone is NOT material', 
   // slots; only the performance weight separates them, by 0.18 of a slot. If
   // that alone could re-point the floor, every refresh of the multipliers
   // would trigger a Five9 write.
-  const prev = rankMarkets(FIXTURE_2026_09_05, { performance: PERF_2026_09_04 });
+  const prev = rankPreMerge(FIXTURE_2026_09_05, { performance: PERF_2026_09_04 });
   // Flip the weighting so STP edges out FTM — same capacity, swapped order.
   const flipped = { ...PERF_2026_09_04, STPET_MKT: { ...PERF_2026_09_04.STPET_MKT, multiplier: 1.05 } };
-  const next = rankMarkets(FIXTURE_2026_09_05, { performance: flipped });
+  const next = rankPreMerge(FIXTURE_2026_09_05, { performance: flipped });
   assert.equal(next.ranking[0].market, 'STPET_MKT', 'they did swap');
   assert.equal(prev.ranking[0].market, 'FTMYR_MKT');
   const gap = Math.abs(byMarket(next.ranking).FTMYR_MKT.score - byMarket(next.ranking).STPET_MKT.score);
@@ -613,10 +624,10 @@ test('material change: a swap on a FRACTIONAL score gap alone is NOT material', 
 });
 
 test('material change: a market genuinely GAINING a slot past the margin IS material', () => {
-  const prev = rankMarkets(FIXTURE_2026_09_05, { performance: PERF_2026_09_04 });
+  const prev = rankPreMerge(FIXTURE_2026_09_05, { performance: PERF_2026_09_04 });
   // SAR frees up 4 more slots: open 4 → 8, jumping both 7-slot markets.
   const rows = FIXTURE_2026_09_05.map((r) => (r.market === 'SAR_MKT' ? { ...r, requested: 12 } : r));
-  const next = rankMarkets(rows, { performance: PERF_2026_09_04 });
+  const next = rankPreMerge(rows, { performance: PERF_2026_09_04 });
   assert.equal(next.ranking[0].market, 'SAR_MKT');
   const r = isMaterialChange(prev, next);
   assert.equal(r.changed, true);
@@ -624,42 +635,42 @@ test('material change: a market genuinely GAINING a slot past the margin IS mate
 });
 
 test('material change: a rank swap at or over the margin IS material', () => {
-  const prev = rankMarkets(FIXTURE_2026_09_04);
+  const prev = rankPreMerge(FIXTURE_2026_09_04);
   // ORL drops to 2/27 = 7.4 % — jumps over FTLAU (14.3), JAX, STPET, SAR
   const rows = FIXTURE_2026_09_04.map((r) => (r.market === 'ORL_MKT' ? { ...r, confirmed: 2 } : r));
-  const r = isMaterialChange(prev, rankMarkets(rows));
+  const r = isMaterialChange(prev, rankPreMerge(rows));
   assert.equal(r.changed, true);
   assert.ok(r.reasons.some((s) => s.includes('rank swap')), r.reasons.join('; '));
 });
 
 test('material change: the margin is configurable — the same fractional swap IS material at 0.1', () => {
-  const prev = rankMarkets(FIXTURE_2026_09_05, { performance: PERF_2026_09_04 });
+  const prev = rankPreMerge(FIXTURE_2026_09_05, { performance: PERF_2026_09_04 });
   const flipped = { ...PERF_2026_09_04, STPET_MKT: { ...PERF_2026_09_04.STPET_MKT, multiplier: 1.05 } };
-  const next = rankMarkets(FIXTURE_2026_09_05, { performance: flipped });
+  const next = rankPreMerge(FIXTURE_2026_09_05, { performance: flipped });
   assert.equal(isMaterialChange(prev, next, { swapMargin: 0.5 }).changed, false);
   assert.equal(isMaterialChange(prev, next, { swapMargin: 0.1 }).changed, true);
 });
 
 test('material change: starvation_promoted flipping state IS material on its own', () => {
-  const prev = rankMarkets(FIXTURE_2026_09_05, { performance: PERF_2026_09_04 });
-  const next = rankMarkets(FIXTURE_2026_09_05, { performance: PERF_2026_09_04, starvationStreaks: { LAKE_MKT: 3 } });
+  const prev = rankPreMerge(FIXTURE_2026_09_05, { performance: PERF_2026_09_04 });
+  const next = rankPreMerge(FIXTURE_2026_09_05, { performance: PERF_2026_09_04, starvationStreaks: { LAKE_MKT: 3 } });
   const r = isMaterialChange(prev, next);
   assert.equal(r.changed, true);
   assert.ok(r.reasons.some((s) => /LAKE_MKT: starvation_promoted false → true/.test(s)), r.reasons.join('; '));
 });
 
 test('material change: a market changing oversold state is material regardless of rank', () => {
-  const prev = rankMarkets(FIXTURE_2026_09_04);
+  const prev = rankPreMerge(FIXTURE_2026_09_04);
   // Lakeland pending drops 3 → 1: open_true = 1, no longer oversold (still small)
   const rows = FIXTURE_2026_09_04.map((r) => (r.market === 'LAKE_MKT' ? { ...r, set_pending: 1 } : r));
-  const r = isMaterialChange(prev, rankMarkets(rows));
+  const r = isMaterialChange(prev, rankPreMerge(rows));
   assert.equal(r.changed, true);
   assert.ok(r.reasons.some((s) => s.includes('LAKE_MKT: oversold true → false')), r.reasons.join('; '));
 });
 
 test('material change: a market becoming UNKNOWN is material', () => {
-  const prev = rankMarkets(FIXTURE_2026_09_04);
-  const next = rankMarkets(FIXTURE_2026_09_04.filter((r) => r.market !== 'SAR_MKT'));
+  const prev = rankPreMerge(FIXTURE_2026_09_04);
+  const next = rankPreMerge(FIXTURE_2026_09_04.filter((r) => r.market !== 'SAR_MKT'));
   const r = isMaterialChange(prev, next);
   assert.equal(r.changed, true);
   assert.ok(r.reasons.some((s) => s.includes('SAR_MKT: unknown false → true')));
@@ -682,19 +693,65 @@ const LIVE_WARM_LISTS = LIVE_HOT_LISTS.map((l) => ({
   ...l, name: l.name.replace('Hot', 'Warm').replace('less than 7', 'less than 30'),
 }));
 
-test('mapping: the 14 market list names match what is attached to both campaigns live', () => {
+// The list-block tests run on the POST-MERGE world (2026-09-28): the board no
+// longer emits LAKE_MKT — branch LAKE folds into ORL_MKT through
+// lp_branch_market_map — so the 2026-09-04 board is replayed with Lakeland's
+// row added into Orlando's. The LKE lists stay in the live fixtures because
+// they remain attached until the approval-gated detach runs.
+const mergeLakeIntoOrl = (rows) => {
+  const lake = rows.find((r) => r.market === 'LAKE_MKT');
+  return rows.filter((r) => r.market !== 'LAKE_MKT').map((r) => (r.market === 'ORL_MKT' && lake
+    ? { ...r,
+      requested: r.requested + lake.requested,
+      confirmed: r.confirmed + lake.confirmed,
+      set_pending: r.set_pending + lake.set_pending }
+    : r));
+};
+// ORL 29 requested / 11 confirmed / 6 pending → 12 open.
+const FIXTURE_2026_09_04_MERGED = mergeLakeIntoOrl(FIXTURE_2026_09_04);
+// ORL 18 requested / 6 confirmed / 9 pending → 3 open.
+const FIXTURE_2026_09_05_MERGED = mergeLakeIntoOrl(FIXTURE_2026_09_05);
+
+test('mapping: the 12 market list names match what is attached to both campaigns live', () => {
   const hot = new Set(LIVE_HOT_LISTS.map((l) => l.name));
   const warm = new Set(LIVE_WARM_LISTS.map((l) => l.name));
   for (const code of MARKET_CODES) {
     assert.ok(hot.has(MARKET_LISTS[code].hot), `${code} hot list attached`);
     assert.ok(warm.has(MARKET_LISTS[code].warm), `${code} warm list attached`);
   }
-  assert.equal(Object.keys(MARKET_LISTS).length, 7, 'seven markets — no Tampa');
+  assert.equal(Object.keys(MARKET_LISTS).length, 6, 'six markets — no Tampa, no Lakeland');
   assert.ok(!Object.keys(MARKET_LISTS).some((c) => /TPA|TAMPA/i.test(c)));
 });
 
-test('computeListBlock: rank → dialingPriority, Lakeland dials last among markets, Unmapped pinned after', () => {
-  const rank = rankMarkets(FIXTURE_2026_09_04);
+test('MERGE: six markets, ranked 1–6, and LAKE_MKT is not one of them', () => {
+  assert.deepEqual([...MARKET_CODES].sort(),
+    ['FTLAU_MKT', 'FTMYR_MKT', 'JAX_MKT', 'ORL_MKT', 'SAR_MKT', 'STPET_MKT']);
+  assert.ok(!('LAKE_MKT' in MARKET_LISTS), 'no LKE mapping');
+  const { ranking, unknown } = rankMarkets(FIXTURE_2026_09_04_MERGED);
+  assert.deepEqual(ranking.map((r) => r.rank), [1, 2, 3, 4, 5, 6]);
+  assert.deepEqual(order(ranking), ['FTMYR', 'STPET', 'SAR', 'ORL', 'JAX', 'FTLAU']);
+  assert.equal(byMarket(ranking).ORL_MKT.open_true, 12, 'Orlando carries the former Lakeland slots');
+  assert.deepEqual(unknown, []);
+});
+
+test('MERGE: a stray LAKE_MKT row is surfaced as unmapped, never ranked', () => {
+  const { ranking, unknown } = rankMarkets(FIXTURE_2026_09_04);
+  assert.ok(!ranking.some((r) => r.market === 'LAKE_MKT'));
+  assert.deepEqual(unknown.map((u) => [u.market, u.reason]), [['LAKE_MKT', 'unmapped_market']]);
+});
+
+test('MERGE: the LKE lists never receive a ranked priority — pinned last with Unmapped, both tiers', () => {
+  for (const [tier, lists] of [['hot', LIVE_HOT_LISTS], ['warm', LIVE_WARM_LISTS]]) {
+    const block = computeListBlock(lists, rankMarkets(FIXTURE_2026_09_04_MERGED), tier);
+    const lke = MARKET_LISTS.ORL_MKT[tier].replace(' ORL ', ' LKE ');
+    assert.equal(block.intended[lke], 7, `${tier}: LKE dials after every ranked market`);
+    assert.ok(block.pinned.includes(lke), `${tier}: LKE is a pinned non-market list`);
+    assert.deepEqual(block.unknown_lists, [], `${tier}: LKE is not an "unknown market"`);
+  }
+});
+
+test('computeListBlock: rank → dialingPriority, market lists 1–6, LKE and Unmapped pinned after', () => {
+  const rank = rankMarkets(FIXTURE_2026_09_04_MERGED);
   const block = computeListBlock(LIVE_HOT_LISTS, rank, 'hot');
   assert.equal(block.intended['Data - Hot - FTM less than 7'], 1);
   assert.equal(block.intended['Data - Hot - STP less than 7'], 2);
@@ -702,15 +759,15 @@ test('computeListBlock: rank → dialingPriority, Lakeland dials last among mark
   assert.equal(block.intended['Data - Hot - ORL less than 7'], 4);
   assert.equal(block.intended['Data - Hot - JAX less than 7'], 5);
   assert.equal(block.intended['Data - Hot - FTL less than 7'], 6);
-  assert.equal(block.intended['Data - Hot - LKE less than 7'], 7);
-  assert.equal(block.intended['Data - Hot - Unmapped'], 8, 'non-market list pinned to the highest number');
-  assert.deepEqual(block.pinned, ['Data - Hot - Unmapped']);
+  assert.equal(block.intended['Data - Hot - LKE less than 7'], 7, 'former market list, now pinned');
+  assert.equal(block.intended['Data - Hot - Unmapped'], 7, 'non-market list pinned to the highest number');
+  assert.deepEqual(block.pinned, ['Data - Hot - LKE less than 7', 'Data - Hot - Unmapped']);
   assert.deepEqual(block.skipped, []);
   assert.equal(block.changed, true);
 });
 
 test('computeListBlock: REORDER ONLY — every attached list is resubmitted, none dropped or added, priority/ratio untouched', () => {
-  const block = computeListBlock(LIVE_WARM_LISTS, rankMarkets(FIXTURE_2026_09_04), 'warm');
+  const block = computeListBlock(LIVE_WARM_LISTS, rankMarkets(FIXTURE_2026_09_04_MERGED), 'warm');
   assert.deepEqual(block.lists.map((l) => l.name), LIVE_WARM_LISTS.map((l) => l.name), 'same lists, same order as read');
   for (let i = 0; i < block.lists.length; i += 1) {
     assert.equal(block.lists[i].priority, LIVE_WARM_LISTS[i].priority, 'priority carried as read');
@@ -720,19 +777,19 @@ test('computeListBlock: REORDER ONLY — every attached list is resubmitted, non
 
 test('computeListBlock: a missing market list is skipped and logged — never created', () => {
   const lists = LIVE_HOT_LISTS.filter((l) => l.name !== 'Data - Hot - JAX less than 7');
-  const block = computeListBlock(lists, rankMarkets(FIXTURE_2026_09_04), 'hot');
+  const block = computeListBlock(lists, rankMarkets(FIXTURE_2026_09_04_MERGED), 'hot');
   assert.deepEqual(block.skipped, [{ market: 'JAX_MKT', list: 'Data - Hot - JAX less than 7', reason: 'list_not_attached' }]);
   assert.ok(!block.lists.some((l) => l.name === 'Data - Hot - JAX less than 7'), 'not added');
   assert.equal(block.lists.length, lists.length);
 });
 
 test('computeListBlock: an UNKNOWN market\'s list still dials — after ranked markets, never priority 1', () => {
-  const rows = FIXTURE_2026_09_04.map((r) => (r.market === 'SAR_MKT' ? { ...r, requested: 0, confirmed: 0, set_pending: 0 } : r));
+  const rows = FIXTURE_2026_09_04_MERGED.map((r) => (r.market === 'SAR_MKT' ? { ...r, requested: 0, confirmed: 0, set_pending: 0 } : r));
   const block = computeListBlock(LIVE_HOT_LISTS, rankMarkets(rows), 'hot');
   const sar = block.intended['Data - Hot - SAR less than 7'];
   assert.ok(sar > 1, 'never priority 1');
-  assert.equal(sar, 7, 'after the six ranked markets');
-  assert.equal(block.intended['Data - Hot - Unmapped'], 8, 'pinned list still last');
+  assert.equal(sar, 6, 'after the five ranked markets');
+  assert.equal(block.intended['Data - Hot - Unmapped'], 7, 'pinned list still last');
   assert.deepEqual(block.unknown_lists, ['Data - Hot - SAR less than 7']);
 });
 
@@ -741,14 +798,14 @@ test('computeListBlock: legacy statewide lists, if attached, are pinned last and
     ...LIVE_HOT_LISTS,
     { name: 'Data - Hot Leads less than 7', priority: 9, dialingPriority: 3, dialingRatio: 1 },
   ];
-  const block = computeListBlock(lists, rankMarkets(FIXTURE_2026_09_04), 'hot');
-  assert.equal(block.intended['Data - Hot Leads less than 7'], 8);
-  assert.equal(block.intended['Data - Hot - Unmapped'], 8, 'all non-market lists share the last number');
-  assert.deepEqual(block.pinned, ['Data - Hot - Unmapped', 'Data - Hot Leads less than 7']);
+  const block = computeListBlock(lists, rankMarkets(FIXTURE_2026_09_04_MERGED), 'hot');
+  assert.equal(block.intended['Data - Hot Leads less than 7'], 7);
+  assert.equal(block.intended['Data - Hot - Unmapped'], 7, 'all non-market lists share the last number');
+  assert.deepEqual(block.pinned, ['Data - Hot - LKE less than 7', 'Data - Hot - Unmapped', 'Data - Hot Leads less than 7']);
 });
 
 test('computeListBlock: changed=false when the attached order already matches', () => {
-  const rank = rankMarkets(FIXTURE_2026_09_04);
+  const rank = rankMarkets(FIXTURE_2026_09_04_MERGED);
   const first = computeListBlock(LIVE_HOT_LISTS, rank, 'hot');
   const second = computeListBlock(first.lists, rank, 'hot');
   assert.equal(second.changed, false);
@@ -898,7 +955,7 @@ function fakeFive9({
 test('CYCLE: modifyCampaignLists THROWS → startCampaign is still called (finally guarantee), campaign reads RUNNING', async () => {
   const f = fakeFive9({ refuse: 'SOAP fault: modifyCampaignLists exploded' });
   await assert.rejects(
-    applyDialPriority(rankMarkets(FIXTURE_2026_09_04), { ...f.deps, cycleCampaigns: true, log: () => {} }),
+    applyDialPriority(rankPreMerge(FIXTURE_2026_09_04), { ...f.deps, cycleCampaigns: true, log: () => {} }),
     /modifyCampaignLists exploded/,
     'the reorder failure still surfaces (logged, abandoned, not retried)',
   );
@@ -914,7 +971,7 @@ test('CYCLE: modifyCampaignLists THROWS → startCampaign is still called (final
 test('CYCLE: read-back MISMATCH after a landed write → campaign is still restarted', async () => {
   const f = fakeFive9({ applyWrites: false, refuseWhileRunning: true });
   await assert.rejects(
-    applyDialPriority(rankMarkets(FIXTURE_2026_09_04), { ...f.deps, cycleCampaigns: true, log: () => {} }),
+    applyDialPriority(rankPreMerge(FIXTURE_2026_09_04), { ...f.deps, cycleCampaigns: true, log: () => {} }),
     /read-back order does not match intent/,
   );
   assert.deepEqual(f.calls.map((c) => c[0]), ['stop', 'modify', 'start']);
@@ -923,7 +980,7 @@ test('CYCLE: read-back MISMATCH after a landed write → campaign is still resta
 
 test('CYCLE: stop before modify, start after, one campaign at a time — the write lands only because the campaign was stopped', async () => {
   const f = fakeFive9({ refuseWhileRunning: true });
-  const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), { ...f.deps, cycleCampaigns: true, log: () => {} });
+  const out = await applyDialPriority(rankPreMerge(FIXTURE_2026_09_04), { ...f.deps, cycleCampaigns: true, log: () => {} });
   assert.deepEqual(f.calls, [
     ['stop', CAMPAIGNS.hot], ['modify', CAMPAIGNS.hot], ['start', CAMPAIGNS.hot],
     ['stop', CAMPAIGNS.warm], ['modify', CAMPAIGNS.warm], ['start', CAMPAIGNS.warm],
@@ -945,7 +1002,7 @@ test('CYCLE: stop before modify, start after, one campaign at a time — the wri
 test('CYCLE: restart reads non-RUNNING twice then RUNNING → retried with EXPONENTIAL backoff, restarted:true', async () => {
   const sleeps = [];
   const f = fakeFive9({ startsBeforeRunning: 2 });
-  const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), {
+  const out = await applyDialPriority(rankPreMerge(FIXTURE_2026_09_04), {
     ...f.deps, cycleCampaigns: true, log: () => {},
     sleep: async (ms) => { sleeps.push(ms); },
   });
@@ -974,7 +1031,7 @@ test('BACKOFF: 2, 4, 8, 16, 32, then capped at 60s — the published ladder', ()
 test('LAG: state still reads NOT_RUNNING right after an accepted start → the verify poll waits it out, ONE start call', async () => {
   const sleeps = [];
   const f = fakeFive9({ startLagMs: 3000 }); // Five9 reports state 3s late
-  const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), {
+  const out = await applyDialPriority(rankPreMerge(FIXTURE_2026_09_04), {
     ...f.deps, cycleCampaigns: true,
     sleep: async (ms) => { sleeps.push(ms); f.advance(ms); }, log: () => {},
   });
@@ -991,7 +1048,7 @@ test('LAG: a 25s reporting lag is absorbed INSIDE the attempt budget — no CRIT
   // Under the OLD budget (3 x 2s + a 10s final read) this campaign was declared
   // dark while it was in fact dialing.
   const f = fakeFive9({ startLagMs: 25000 });
-  const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), {
+  const out = await applyDialPriority(rankPreMerge(FIXTURE_2026_09_04), {
     ...f.deps, cycleCampaigns: true,
     sleep: async (ms) => { f.advance(ms); }, log: (m) => log.push(m),
   });
@@ -1006,7 +1063,7 @@ test('LAG: a 25s reporting lag is absorbed INSIDE the attempt budget — no CRIT
 test('LAG: a genuinely dark campaign still fails once the budget is spent — the alarm is not disarmed', async () => {
   const log = [];
   const f = fakeFive9({ startAlwaysFails: true });
-  const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), {
+  const out = await applyDialPriority(rankPreMerge(FIXTURE_2026_09_04), {
     ...f.deps, cycleCampaigns: true, sleep: async () => {}, log: (m) => log.push(m),
   });
   assert.equal(out.campaigns.hot.restarted, false);
@@ -1029,7 +1086,7 @@ test('LAG: a genuinely dark campaign still fails once the budget is spent — th
 
 test('DRAIN: no start is fired while the campaign reads STOPPING — the restart waits it out', async () => {
   const f = fakeFive9({ stopDrainMs: 25000 }); // 25s drain, as seen live
-  const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), {
+  const out = await applyDialPriority(rankPreMerge(FIXTURE_2026_09_04), {
     ...f.deps, cycleCampaigns: true,
     sleep: async (ms) => { f.advance(ms); }, log: () => {},
   });
@@ -1045,7 +1102,7 @@ test('DRAIN: no start is fired while the campaign reads STOPPING — the restart
 test('DRAIN: a 25s drain would have blown the OLD ~16s budget — both campaigns still come back', async () => {
   const log = [];
   const f = fakeFive9({ stopDrainMs: 25000 });
-  const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), {
+  const out = await applyDialPriority(rankPreMerge(FIXTURE_2026_09_04), {
     ...f.deps, cycleCampaigns: true,
     sleep: async (ms) => { f.advance(ms); }, log: (m) => log.push(m),
   });
@@ -1062,7 +1119,7 @@ test('DRAIN: a 25s drain would have blown the OLD ~16s budget — both campaigns
 test('DRAIN: waiting is BOUNDED — a campaign that never leaves STOPPING is declared dark, not hung', async () => {
   const log = [];
   const f = fakeFive9({ stopDrainMs: 10 * 60 * 1000 }); // drains long past any budget
-  const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), {
+  const out = await applyDialPriority(rankPreMerge(FIXTURE_2026_09_04), {
     ...f.deps, cycleCampaigns: true, restartMaxWaitMs: 60000,
     sleep: async (ms) => { f.advance(ms); }, log: (m) => log.push(m),
   });
@@ -1075,7 +1132,7 @@ test('DRAIN: waiting is BOUNDED — a campaign that never leaves STOPPING is dec
 
 test('DRAIN: the dark window is still REPORTED, never hidden by the new waiting', async () => {
   const f = fakeFive9({ stopDrainMs: 20000 });
-  const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), {
+  const out = await applyDialPriority(rankPreMerge(FIXTURE_2026_09_04), {
     ...f.deps, cycleCampaigns: true,
     sleep: async (ms) => { f.advance(ms); }, log: () => {},
   });
@@ -1096,7 +1153,7 @@ test('DRAIN: the dark window is still REPORTED, never hidden by the new waiting'
 
 test('SETTLE: the list write waits for the stop to actually land, and settle_ms is recorded', async () => {
   const f = fakeFive9({ stopDrainMs: 12000, refuseWhileRunning: true });
-  const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), {
+  const out = await applyDialPriority(rankPreMerge(FIXTURE_2026_09_04), {
     ...f.deps, cycleCampaigns: true,
     sleep: async (ms) => { f.advance(ms); }, log: () => {},
   });
@@ -1113,7 +1170,7 @@ test('SETTLE: a stop that NEVER settles → no reorder is attempted, the campaig
   // Drains far past the settle timeout, then finally comes back — so the
   // restart succeeds and the only casualty is this run's reorder.
   const f = fakeFive9({ stopDrainMs: 40000, refuseWhileRunning: true });
-  const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), {
+  const out = await applyDialPriority(rankPreMerge(FIXTURE_2026_09_04), {
     ...f.deps, cycleCampaigns: true, stopSettleTimeoutMs: 10000,
     sleep: async (ms) => { f.advance(ms); }, log: (m) => log.push(m),
   });
@@ -1154,7 +1211,7 @@ test('RESTART: startCampaign is REJECTED twice, then succeeds → campaign ends 
   // loop gave up and "Data - Warm Leads less than 30" stayed dark for two hours.
   const log = [];
   const f = fakeFive9({ startRejectsFirst: 2 });
-  const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), {
+  const out = await applyDialPriority(rankPreMerge(FIXTURE_2026_09_04), {
     ...f.deps, cycleCampaigns: true,
     sleep: async (ms) => { f.advance(ms); }, log: (m) => log.push(m),
   });
@@ -1170,7 +1227,7 @@ test('RESTART: startCampaign is REJECTED twice, then succeeds → campaign ends 
 
 test('RESTART: an exception NEVER exits the loop early — every attempt is spent before giving up', async () => {
   const f = fakeFive9({ startThrows: true });
-  const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), {
+  const out = await applyDialPriority(rankPreMerge(FIXTURE_2026_09_04), {
     ...f.deps, cycleCampaigns: true, sleep: async () => {}, log: () => {},
   });
   assert.equal(f.calls.filter((c) => c[0] === 'start' && c[1] === CAMPAIGNS.hot).length, DEFAULT_RESTART.maxAttempts,
@@ -1181,7 +1238,7 @@ test('RESTART: an exception NEVER exits the loop early — every attempt is spen
 
 test('RESTART: the CEILING ends the loop even when attempts remain', async () => {
   const f = fakeFive9({ startAlwaysFails: true });
-  const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), {
+  const out = await applyDialPriority(rankPreMerge(FIXTURE_2026_09_04), {
     ...f.deps, cycleCampaigns: true, restartCeilingMs: 30000,
     sleep: async (ms) => { f.advance(ms); }, log: () => {},
   });
@@ -1207,7 +1264,7 @@ test('SETTLE: a stop that settles INSTANTLY reports settle_ms 0, not null', asyn
   // is the number the stop-settle timeout is tuned from, so a measured zero
   // must survive.
   const f = fakeFive9({ refuseWhileRunning: true }); // no drain: settles at once
-  const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), {
+  const out = await applyDialPriority(rankPreMerge(FIXTURE_2026_09_04), {
     ...f.deps, cycleCampaigns: true,
     sleep: async (ms) => { f.advance(ms); }, log: () => {},
   });
@@ -1222,7 +1279,7 @@ test('SETTLE: a stop that settles INSTANTLY reports settle_ms 0, not null', asyn
 test('SETTLE: a run that never cycled still reports settle_ms null', async () => {
   // The other side of the same contract: null keeps meaning "not measured".
   const f = fakeFive9();
-  const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), {
+  const out = await applyDialPriority(rankPreMerge(FIXTURE_2026_09_04), {
     ...f.deps, cycleCampaigns: false, log: () => {},
   });
   assert.equal(out.settle_ms, null);
@@ -1238,7 +1295,7 @@ test('GUARD: a campaign already dark from an EARLIER run blocks cycling the othe
   // Warm also failed to come back, the floor would have had NO Data campaign
   // dialing at all.
   const f = fakeFive9({ states: { [CAMPAIGNS.hot]: 'NOT_RUNNING' } });
-  const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), {
+  const out = await applyDialPriority(rankPreMerge(FIXTURE_2026_09_04), {
     ...f.deps, cycleCampaigns: true, log: () => {},
   });
   assert.equal(out.campaigns.warm.cycled, false, 'warm must NOT be stopped while hot is dark');
@@ -1257,7 +1314,7 @@ test('GUARD: an UNREADABLE peer is treated as dark — the campaign that cannot 
   // stops itself. Warm's own cycle later reads cleanly, so this isolates the
   // guard rather than also breaking warm's restart verification.
   let warmReads = 0;
-  const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), {
+  const out = await applyDialPriority(rankPreMerge(FIXTURE_2026_09_04), {
     ...f.deps, cycleCampaigns: true, log: () => {},
     getCampaignState: async (name) => {
       if (name === CAMPAIGNS.warm && (warmReads += 1) === 1) throw new Error('Five9 unreachable');
@@ -1277,7 +1334,7 @@ test('GUARD: an UNREADABLE peer is treated as dark — the campaign that cannot 
 
 test('GUARD: with BOTH campaigns RUNNING the guard is silent — normal cycling is unaffected', async () => {
   const f = fakeFive9();
-  const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), {
+  const out = await applyDialPriority(rankPreMerge(FIXTURE_2026_09_04), {
     ...f.deps, cycleCampaigns: true, log: () => {},
   });
   assert.deepEqual(f.calls, [
@@ -1289,7 +1346,7 @@ test('GUARD: with BOTH campaigns RUNNING the guard is silent — normal cycling 
 
 test('DOWNTIME: measured to the start Five9 accepted, not to the confirmation read that waits out the lag', async () => {
   const f = fakeFive9({ startLagMs: 30 });
-  const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), {
+  const out = await applyDialPriority(rankPreMerge(FIXTURE_2026_09_04), {
     ...f.deps, cycleCampaigns: true, restartSettleMs: 60, log: () => {},
     // Real elapsed time AND fake-clock time, so the settle genuinely waits.
     sleep: async (ms) => { f.advance(ms); await new Promise((r) => setTimeout(r, ms)); },
@@ -1302,7 +1359,7 @@ test('DOWNTIME: measured to the start Five9 accepted, not to the confirmation re
 test('CYCLE: restart NEVER succeeds → applied:false, restart_failures populated, restart_error recorded', async () => {
   const log = [];
   const f = fakeFive9({ startAlwaysFails: true });
-  const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), { ...f.deps, cycleCampaigns: true, log: (m) => log.push(m) });
+  const out = await applyDialPriority(rankPreMerge(FIXTURE_2026_09_04), { ...f.deps, cycleCampaigns: true, log: (m) => log.push(m) });
   assert.equal(out.applied, false, 'a landed reorder never counts as applied when the campaign is dark');
   assert.deepEqual(out.restart_failures, [CAMPAIGNS.hot], 'hot is named');
   assert.equal(out.campaigns.hot.restarted, false);
@@ -1320,7 +1377,7 @@ test('CYCLE: restart NEVER succeeds → applied:false, restart_failures populate
 
 test('CYCLE: startCampaign THROWS every time → still bounded, restart_failures populated, the throw does not escape', async () => {
   const f = fakeFive9({ startThrows: true });
-  const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), { ...f.deps, cycleCampaigns: true, log: () => {} });
+  const out = await applyDialPriority(rankPreMerge(FIXTURE_2026_09_04), { ...f.deps, cycleCampaigns: true, log: () => {} });
   assert.equal(out.applied, false);
   assert.match(out.campaigns.hot.restart_error, /startCampaign fault/);
   assert.deepEqual(out.restart_failures, [CAMPAIGNS.hot]);
@@ -1329,7 +1386,7 @@ test('CYCLE: startCampaign THROWS every time → still bounded, restart_failures
 
 test('CYCLE: a campaign already NOT_RUNNING is reordered and LEFT STOPPED — never stopped, never started, cycled:false', async () => {
   const f = fakeFive9({ states: { [CAMPAIGNS.hot]: 'NOT_RUNNING' }, refuseWhileRunning: true });
-  const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), { ...f.deps, cycleCampaigns: true, log: () => {} });
+  const out = await applyDialPriority(rankPreMerge(FIXTURE_2026_09_04), { ...f.deps, cycleCampaigns: true, log: () => {} });
   assert.deepEqual(f.calls.filter((c) => c[1] === CAMPAIGNS.hot), [['modify', CAMPAIGNS.hot]], 'hot: write only');
   assert.equal(out.campaigns.hot.cycled, false);
   assert.equal(out.campaigns.hot.was_running, false);
@@ -1347,7 +1404,7 @@ test('CYCLE: a campaign already NOT_RUNNING is reordered and LEFT STOPPED — ne
 test('CYCLE: flag OFF (default) → no stop, no start, a RUNNING campaign still refuses the write (today\'s behavior)', async () => {
   const f = fakeFive9({ refuseWhileRunning: true });
   await assert.rejects(
-    applyDialPriority(rankMarkets(FIXTURE_2026_09_04), { ...f.deps, log: () => {} }),
+    applyDialPriority(rankPreMerge(FIXTURE_2026_09_04), { ...f.deps, log: () => {} }),
     /REFUSED.*RUNNING/,
   );
   assert.deepEqual(f.calls, [['modify', CAMPAIGNS.hot]], 'no lifecycle calls at all');
@@ -1355,7 +1412,7 @@ test('CYCLE: flag OFF (default) → no stop, no start, a RUNNING campaign still 
 
 test('CYCLE: dry-run (FIVE9_WRITES_ENABLED off) never stops a campaign even with the flag on', async () => {
   const f = fakeFive9({ writesEnabled: false });
-  const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), { ...f.deps, cycleCampaigns: true, log: () => {} });
+  const out = await applyDialPriority(rankPreMerge(FIXTURE_2026_09_04), { ...f.deps, cycleCampaigns: true, log: () => {} });
   assert.equal(out.dry_run, true);
   assert.ok(!f.calls.some((c) => c[0] === 'stop' || c[0] === 'start'));
   assert.equal(out.campaigns.hot.cycled, false);
@@ -1363,7 +1420,7 @@ test('CYCLE: dry-run (FIVE9_WRITES_ENABLED off) never stops a campaign even with
 
 test('CYCLE: no write needed → no cycle (order already matches)', async () => {
   const f = fakeFive9();
-  const rank = rankMarkets(FIXTURE_2026_09_04);
+  const rank = rankPreMerge(FIXTURE_2026_09_04);
   await applyDialPriority(rank, { ...f.deps, cycleCampaigns: true, log: () => {} });
   f.calls.length = 0;
   const out = await applyDialPriority(rank, { ...f.deps, cycleCampaigns: true, log: () => {} });
@@ -1376,7 +1433,7 @@ test('CYCLE: cycleCampaigns without stopCampaign/startCampaign deps is refused u
   const f = fakeFive9();
   const { stopCampaign, startCampaign, ...rest } = f.deps;
   await assert.rejects(
-    applyDialPriority(rankMarkets(FIXTURE_2026_09_04), { ...rest, cycleCampaigns: true, log: () => {} }),
+    applyDialPriority(rankPreMerge(FIXTURE_2026_09_04), { ...rest, cycleCampaigns: true, log: () => {} }),
     /cycleCampaigns requires stopCampaign and startCampaign/,
   );
   assert.deepEqual(f.calls, [], 'nothing was touched');
@@ -1385,7 +1442,7 @@ test('CYCLE: cycleCampaigns without stopCampaign/startCampaign deps is refused u
 test('CYCLE: getCampaignState, when injected, is used for restart verification', async () => {
   const f = fakeFive9();
   const reads = [];
-  const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), {
+  const out = await applyDialPriority(rankPreMerge(FIXTURE_2026_09_04), {
     ...f.deps, cycleCampaigns: true, log: () => {},
     getCampaignState: async (name) => { reads.push(name); return { name, state: f.campaignState[name] }; },
   });
@@ -1401,7 +1458,7 @@ test('CYCLE: getCampaignState, when injected, is used for restart verification',
 
 test('applyDialPriority: writes both campaigns, reads back, applied=true when the order matches', async () => {
   const f = fakeFive9();
-  const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), { ...f.deps, log: () => {} });
+  const out = await applyDialPriority(rankPreMerge(FIXTURE_2026_09_04), { ...f.deps, log: () => {} });
   assert.equal(out.applied, true);
   assert.equal(out.dry_run, false);
   assert.equal(f.writes.length, 2);
@@ -1418,7 +1475,7 @@ test('applyDialPriority: writes both campaigns, reads back, applied=true when th
 test('applyDialPriority: read-back mismatch throws, applied stays false, no retry', async () => {
   const f = fakeFive9({ applyWrites: false }); // Five9 "accepts" but nothing changes
   await assert.rejects(
-    applyDialPriority(rankMarkets(FIXTURE_2026_09_04), { ...f.deps, log: () => {} }),
+    applyDialPriority(rankPreMerge(FIXTURE_2026_09_04), { ...f.deps, log: () => {} }),
     /read-back order does not match intent.*not retrying/,
   );
   assert.equal(f.writes.length, 1, 'stopped at the first mismatch — no retry, no second campaign');
@@ -1426,7 +1483,7 @@ test('applyDialPriority: read-back mismatch throws, applied stays false, no retr
 
 test('applyDialPriority: FIVE9_WRITES_ENABLED off → dry-run, applied=false, no read-back assertion', async () => {
   const f = fakeFive9({ writesEnabled: false });
-  const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), { ...f.deps, log: () => {} });
+  const out = await applyDialPriority(rankPreMerge(FIXTURE_2026_09_04), { ...f.deps, log: () => {} });
   assert.equal(out.applied, false);
   assert.equal(out.dry_run, true);
   assert.equal(f.writes.length, 2, 'the gated op still ran (it previews the envelope)');
@@ -1436,7 +1493,7 @@ test('applyDialPriority: FIVE9_WRITES_ENABLED off → dry-run, applied=false, no
 test('applyDialPriority: a REFUSED write (e.g. campaign RUNNING) surfaces as a thrown error, not a retry', async () => {
   const f = fakeFive9({ refuse: 'REFUSED: modify_campaign_lists on a RUNNING campaign' });
   await assert.rejects(
-    applyDialPriority(rankMarkets(FIXTURE_2026_09_04), { ...f.deps, log: () => {} }),
+    applyDialPriority(rankPreMerge(FIXTURE_2026_09_04), { ...f.deps, log: () => {} }),
     /REFUSED.*RUNNING/,
   );
   assert.equal(f.writes.length, 1);
@@ -1444,7 +1501,7 @@ test('applyDialPriority: a REFUSED write (e.g. campaign RUNNING) surfaces as a t
 
 test('applyDialPriority: no write when the order already matches', async () => {
   const f = fakeFive9();
-  const rank = rankMarkets(FIXTURE_2026_09_04);
+  const rank = rankPreMerge(FIXTURE_2026_09_04);
   await applyDialPriority(rank, { ...f.deps, log: () => {} });
   const before = f.writes.length;
   const out = await applyDialPriority(rank, { ...f.deps, log: () => {} });
@@ -1454,9 +1511,11 @@ test('applyDialPriority: no write when the order already matches', async () => {
 });
 
 // ─── runCapacityRanker (route orchestration, fake I/O) ───────────────────────
+// The route runs the LIVE market list (six, post-merge), so every route test
+// replays the pre-merge boards with Lakeland added into Orlando.
 
 function fakeRun({
-  prev = null, mode = 'shadow', rows = FIXTURE_2026_09_04, applyImpl = null,
+  prev = null, mode = 'shadow', rows = FIXTURE_2026_09_04_MERGED, applyImpl = null,
   insertImpl = null, stale = false, now = null, performance = PERF_2026_09_04,
   history = [], historyImpl = null, perfWeight = 0.25,
   lockHeld = false, lockImpl = null, releaseImpl = null,
@@ -1602,7 +1661,7 @@ test('LOCK: taken BEFORE any capacity read — a refused run does no work at all
     lockHeld: true,
     lockImpl: async () => { order.push('lock'); return { acquired: false, reason: 'lock_held' }; },
   });
-  deps.fetchCapacity = async () => { order.push('capacity'); return { rows: FIXTURE_2026_09_05, stale: false, last_sweep_at: null }; };
+  deps.fetchCapacity = async () => { order.push('capacity'); return { rows: FIXTURE_2026_09_05_MERGED, stale: false, last_sweep_at: null }; };
   const { status } = await runCapacityRanker({ slot_date: '2026-09-05' }, deps);
   assert.equal(status, 409);
   assert.deepEqual(order, ['lock'], 'the capacity read never ran');
@@ -1617,10 +1676,11 @@ test('LOCK: a malformed slot_date is rejected BEFORE the lock is taken', async (
 });
 
 test('route: the 2026-09-05 board end to end — order, multipliers and new fields', async () => {
-  const { deps, calls } = fakeRun({ rows: FIXTURE_2026_09_05 });
+  const { deps, calls } = fakeRun({ rows: FIXTURE_2026_09_05_MERGED });
   const { status, body } = await runCapacityRanker({ slot_date: '2026-09-05' }, deps);
   assert.equal(status, 200);
-  assert.deepEqual(order(body.ranking), ['FTMYR', 'STPET', 'SAR', 'LAKE', 'ORL', 'JAX', 'FTLAU']);
+  assert.deepEqual(order(body.ranking), ['FTMYR', 'STPET', 'SAR', 'ORL', 'JAX', 'FTLAU']);
+  assert.deepEqual(body.ranking.map((r) => r.rank), [1, 2, 3, 4, 5, 6]);
   assert.notEqual(body.ranking[0].market, 'JAX_MKT', 'THE regression');
   const m = byMarket(body.ranking);
   // every field the handoff asks the response to carry
@@ -1638,7 +1698,7 @@ test('route: the 2026-09-05 board end to end — order, multipliers and new fiel
 });
 
 test('route: a market performance outage degrades to unweighted, warns, and still answers 200', async () => {
-  const { deps } = fakeRun({ rows: FIXTURE_2026_09_05, performance: {} });
+  const { deps } = fakeRun({ rows: FIXTURE_2026_09_05_MERGED, performance: {} });
   const { status, body } = await runCapacityRanker({ slot_date: '2026-09-05' }, deps);
   assert.equal(status, 200, 'the floor still needs a dial order');
   assert.ok(body.warnings.some((w) => /market performance unavailable/.test(w)), body.warnings.join('; '));
@@ -1649,7 +1709,7 @@ test('route: a market performance outage degrades to unweighted, warns, and stil
 
 test('route: a starvation-history read failure warns but never fails the run', async () => {
   const { deps } = fakeRun({
-    rows: FIXTURE_2026_09_05,
+    rows: FIXTURE_2026_09_05_MERGED,
     historyImpl: async () => { throw new Error('dial_priority_log unreachable'); },
   });
   const { status, body } = await runCapacityRanker({ slot_date: '2026-09-05' }, deps);
@@ -1659,16 +1719,16 @@ test('route: a starvation-history read failure warns but never fails the run', a
 });
 
 test('route: starvation promotion surfaces in the response and the warnings', async () => {
-  const { deps } = fakeRun({
-    rows: FIXTURE_2026_09_05,
-    history: historyPlacing('LAKE_MKT', 6, 3),
-  });
+  // Post-merge there is no Lakeland to starve, so JAX plays the part: nothing
+  // confirmed, one slot open, bottom half three runs running.
+  const rows = FIXTURE_2026_09_05_MERGED.map((r) => (r.market === 'JAX_MKT' ? { ...r, confirmed: 0, set_pending: 16 } : r));
+  const { deps } = fakeRun({ rows, history: historyPlacing('JAX_MKT', 5, 3, 6) });
   const { body } = await runCapacityRanker({ slot_date: '2026-09-05' }, deps);
   const m = byMarket(body.ranking);
-  assert.equal(m.LAKE_MKT.rank, 2);
-  assert.equal(m.LAKE_MKT.starvation_promoted, true);
-  assert.notEqual(body.ranking[0].market, 'LAKE_MKT', 'never rank 1');
-  assert.ok(body.warnings.some((w) => /starvation guard promoted LAKE_MKT to rank 2/.test(w)), body.warnings.join('; '));
+  assert.equal(m.JAX_MKT.rank, 2);
+  assert.equal(m.JAX_MKT.starvation_promoted, true);
+  assert.notEqual(body.ranking[0].market, 'JAX_MKT', 'never rank 1');
+  assert.ok(body.warnings.some((w) => /starvation guard promoted JAX_MKT to rank 2/.test(w)), body.warnings.join('; '));
 });
 
 test('route: defaults slot_date to tomorrow in America/New_York', async () => {
@@ -1700,8 +1760,10 @@ test('route: SHADOW mode computes, logs one row, returns the ranking, and NEVER 
   assert.equal(body.log_id, 42);
   assert.equal(body.ranking[0].market, 'FTMYR_MKT');
   assert.equal(body.ranking[0].rank, 1);
-  assert.equal(body.ranking[6].market, 'LAKE_MKT');
-  assert.deepEqual(body.ranking[6].flags, ['oversold', 'small_denominator']);
+  assert.equal(body.ranking.length, 6, 'six markets since the Lakeland merge');
+  assert.equal(body.ranking[5].market, 'FTLAU_MKT');
+  assert.equal(body.ranking[5].rank, 6);
+  assert.ok(!body.ranking.some((r) => r.market === 'LAKE_MKT'), 'Lakeland is never ranked');
   assert.deepEqual(body.unknown, []);
   for (const r of body.ranking) {
     for (const k of ['market', 'rank', 'fill_pct', 'open_true', 'flags']) assert.ok(k in r, `ranking row carries ${k}`);
@@ -1718,7 +1780,7 @@ test('route: LIVE mode with a material change applies and logs applied=true', as
 });
 
 test('route: LIVE mode with NO material change writes nothing, logs changed=false', async () => {
-  const prev = rankMarkets(FIXTURE_2026_09_04);
+  const prev = rankMarkets(FIXTURE_2026_09_04_MERGED);
   const { deps, calls } = fakeRun({ mode: 'live', prev: { id: 7, ran_at: 'x', slot_date: '2026-09-04', ...prev } });
   const { body } = await runCapacityRanker({ slot_date: '2026-09-04' }, deps);
   assert.equal(body.changed, false);
@@ -2680,7 +2742,7 @@ test('CYCLE MARK: set while the reorder runs, cleared once the campaign is back'
       return f.deps.modifyCampaignLists(action);
     },
   };
-  await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), deps);
+  await applyDialPriority(rankPreMerge(FIXTURE_2026_09_04), deps);
   assert.deepEqual(seenDuringWrite, [[CAMPAIGNS.hot, true], [CAMPAIGNS.warm, true]], 'marked across the whole stopped window');
   assert.equal(isCycling(CAMPAIGNS.hot), false, 'cleared once it is dialing again');
   assert.equal(isCycling(CAMPAIGNS.warm), false);
@@ -2689,7 +2751,7 @@ test('CYCLE MARK: set while the reorder runs, cleared once the campaign is back'
 test('CYCLE MARK: a campaign that FAILS to restart is left UNMARKED, so the watchdog pages about it', async () => {
   _resetCycling();
   const f = fakeFive9({ startAlwaysFails: true });
-  const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), {
+  const out = await applyDialPriority(rankPreMerge(FIXTURE_2026_09_04), {
     ...f.deps, cycleCampaigns: true, sleep: async () => {}, log: () => {},
   });
   assert.deepEqual(out.restart_failures, [CAMPAIGNS.hot], 'the campaign really is dark');
@@ -2704,7 +2766,7 @@ test('CYCLE MARK: a campaign that FAILS to restart is left UNMARKED, so the watc
 test('CYCLE MARK: a stop that throws leaves nothing marked', async () => {
   _resetCycling();
   const f = fakeFive9();
-  await assert.rejects(applyDialPriority(rankMarkets(FIXTURE_2026_09_04), {
+  await assert.rejects(applyDialPriority(rankPreMerge(FIXTURE_2026_09_04), {
     ...f.deps,
     cycleCampaigns: true,
     log: () => {},

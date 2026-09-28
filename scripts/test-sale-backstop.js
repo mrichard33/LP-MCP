@@ -202,7 +202,8 @@ test('the digest lists each sale with rep, amount, office and day', () => {
   assert.equal(text, [
     "📋 2 sales that didn't reach the board when they closed:",
     '• Joel Pignotti — $99,160 (Fort Myers) · Sep 25',
-    '• David Carter — $5,814 (Lakeland) · Sep 25',
+    // LAKE prints as Orlando since the 2026-09-28 merge (MARKET_ALIASES LAKE → ORL).
+    '• David Carter — $5,814 (Orlando) · Sep 25',
     'Congratulations to all of you. 🎉',
   ].join('\n'));
 });

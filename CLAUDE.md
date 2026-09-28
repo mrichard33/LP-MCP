@@ -304,6 +304,13 @@ write. Only about 40% of LP lead ids 530k–542k (April–May 2026) are present.
 `scripts/repair-p2-missing-lp-jobs.js` recovers them per P2 opportunity. "No LP job" on a P2
 opportunity is a copy gap far more often than a job LP never created.
 
+**Six markets, not seven — Lakeland is Orlando (2026-09-28, `sql/135_lake_orl_merge.sql`).** LP still
+prints branch `LAKE`, and it stays raw wherever a raw branch is stored (`branch_code_raw`,
+`lp_branch_id`, `rep_home_market`), exactly like BOCA/MIAMI for Fort Lauderdale. The fold happens in
+`lp_branch_market_map` (data) and `MARKET_ALIASES` in `src/slack.js` (Slack routing and the office
+leaderboard). Never write `LAKE_MKT` again, and never re-apply `sql/037` or `sql/017` by hand — both
+re-seed the pre-merge Lakeland rows.
+
 **Rep names do not match across the LP/GHL boundary.** LP stores `"Last, First"` (`O'Connor, Tim`);
 GHL's Rep Display Name (`yxOTDIT7Um0JxkOPUbPo`) holds `"First Last"` (`Tim O'Connor`). An exact
 compare finds ZERO rows for every rep on the floor and fails silently — a metric that reads "no sales"

@@ -37,7 +37,7 @@
  * at open_true <= 0, so JAX at 1 sailed straight through it.
  *
  * ABSOLUTE, NOT A RATE. The dialer's job is to fill slots, so the size of the
- * prize is what matters. Sorting by open RATE puts Lakeland (2 of 2 open =
+ * prize is what matters. Sorting by open RATE puts a 2-slot market (2 of 2 open =
  * 100 %) above St. Pete (7 of 20 = 35 %) and spends the floor's best hour on
  * two appointments. Sorting by absolute open slots puts the work where the
  * work is.
@@ -67,9 +67,17 @@ export const DEFAULT_SWAP_MARGIN = 0.5;
 /** Consecutive bottom-half applied rankings before starvation promotion. */
 export const DEFAULT_STARVATION_THRESHOLD = 3;
 
-/** The seven LP markets. There is no Tampa market — LP has no TPA branch. */
+/**
+ * The six LP markets. There is no Tampa market — LP has no TPA branch.
+ *
+ * 2026-09-28 — Lakeland merged into Orlando (sql/135_lake_orl_merge.sql).
+ * lp_branch_market_map now folds branch LAKE into ORL_MKT, so Lakeland's reps
+ * and appointments arrive inside Orlando's capacity row. LAKE_MKT must NOT come
+ * back here: it would read as an unfiled market and park the empty LKE lists
+ * in the "unknown" tier above every non-market list.
+ */
 export const MARKET_CODES = Object.freeze([
-  'FTLAU_MKT', 'ORL_MKT', 'STPET_MKT', 'JAX_MKT', 'FTMYR_MKT', 'SAR_MKT', 'LAKE_MKT',
+  'FTLAU_MKT', 'ORL_MKT', 'STPET_MKT', 'JAX_MKT', 'FTMYR_MKT', 'SAR_MKT',
 ]);
 
 // Sort tiers — lower dials first. Precedence is UNKNOWN (excluded entirely) >
@@ -95,7 +103,7 @@ function round3(n) {
  * @param {Array<{market:string, requested:number, confirmed:number, set_pending:number}>} rows
  *        One row per market for ONE slot date (the board's `offices` array).
  * @param {object} [opts]
- * @param {string[]} [opts.markets]  Market codes expected (default: the seven).
+ * @param {string[]} [opts.markets]  Market codes expected (default: the six).
  *        A code in `markets` with no row → unknown (fail open). A row whose
  *        code is NOT in `markets` → unknown with reason 'unmapped_market' so it
  *        is visible rather than silently ranked against a list that does not
@@ -195,7 +203,7 @@ export function rankMarkets(rows, {
   // consecutive APPLIED rankings, force it to rank 2 for one cycle.
   //
   // NEVER rank 1 — the top slot stays earned on score. Rank 2 is enough to get
-  // the market worked, and it self-cancels: rank 2 of seven is top half, so
+  // the market worked, and it self-cancels: rank 2 of six is top half, so
   // the streak resets and the guard stands down on the next run.
   //
   // Oversold markets are never promoted; there is nothing to sell.
