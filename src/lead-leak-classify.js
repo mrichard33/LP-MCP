@@ -98,9 +98,15 @@ export const PROGRESSED_DISPOSITIONS = Object.freeze(['Set', 'Sale', 'Cnf', 'Ver
 // LP's own do-not-call disposition. The Five9 DNC list is checked separately.
 export const DNC_DISPOSITIONS = Object.freeze(['DNC']);
 
-// "Data" leads. Mark has not ruled whether these are meant to be dialled
-// (2,842 of them in the 2026-09-26 pull), so they get their own bucket and are
-// kept OUT of the revenue headline until he does.
+// "Data" leads. Until 2026-09-28 they had their own unpriced bucket,
+// data_undecided, kept OUT of the headline while nobody had ruled whether they
+// are meant to be dialled. Ruled 2026-09-28: "Lead leak monitor absolutely needs
+// to count data leads." A Data lead is now a clean, callable lead like any
+// other: it goes through the Five9 lookup and lands in not_in_five9 /
+// routing_or_automation_failure / unverified, priced and in the headline. That
+// morning's run had 169 uncalled Data leads against 5 counted leaks, so the
+// headline jumps the day this ships — that is the point, not a regression.
+// The code is still listed so the summary can say how many leaks are Data.
 export const DATA_DISPOSITIONS = Object.freeze(['Data']);
 
 // Dispositions that mean "stop calling". Edit this list to change what counts
@@ -123,7 +129,6 @@ export const REASONS = Object.freeze([
   'missing_phone',
   'duplicate',
   'missing_source',
-  'data_undecided',
   'dead_status',
   'not_in_five9',
   'unverified',
@@ -257,6 +262,7 @@ export function nocReason(lead, serviceAreaZips) {
 
 /** Does this lead carry the NOC code? (The job batches a zip lookup for these.) */
 export const isNotCovered = (lead) => NOT_COVERED.has(dispo(lead));
+export const isDataLead = (lead) => DATA.has(dispo(lead));
 
 /**
  * The reasons decided by the lead's own codes and flags alone, before any
@@ -310,7 +316,7 @@ export function classifyUncalledLead(lead, ctx = {}) {
   if (!phone) return 'missing_phone';
   if (ctx.dupCalledPhones?.has(phone)) return 'duplicate';
   if (!String(lead?.lead_source ?? '').trim()) return 'missing_source';
-  if (DATA.has(dispo(lead))) return 'data_undecided';
+  // No Data line here any more (ruled 2026-09-28) — see DATA_DISPOSITIONS.
   if (DEAD.has(dispo(lead))) return 'dead_status';
   return null;
 }
@@ -357,7 +363,7 @@ export function estimateValue(lead, reason, rates) {
 
 /**
  * Counts and estimated $ by reason, plus the headline and top sources.
- * `rows` are the stored shape: { reason, lead_source, est_value, detail }.
+ * `rows` are the stored shape: { reason, lead_source, disposition, est_value, detail }.
  * `retiredCodeInUse` is counted by the job over the whole window (called leads
  * too), because it is a code-hygiene number, not a property of uncalled leads.
  */
@@ -368,6 +374,8 @@ export function summarize(rows, { retiredCodeInUse = 0 } = {}) {
   let realLeaks = 0;
   let valueAtRisk = 0;
   let holdDateUnknownCount = 0;
+  let dataLeaks = 0;
+  let dataValue = 0;
 
   for (const r of rows || []) {
     const bucket = byReason[r.reason] || (byReason[r.reason] = { leads: 0, est_value: 0 });
@@ -377,6 +385,10 @@ export function summarize(rows, { retiredCodeInUse = 0 } = {}) {
     if (LEAK_REASONS.includes(r.reason)) {
       realLeaks += 1;
       valueAtRisk += Number(r.est_value) || 0;
+      if (DATA.has(String(r.disposition ?? '').trim().toLowerCase())) {
+        dataLeaks += 1;
+        dataValue += Number(r.est_value) || 0;
+      }
       const s = sourceKey(r.lead_source);
       leakBySource.set(s, (leakBySource.get(s) || 0) + 1);
     }
@@ -396,6 +408,9 @@ export function summarize(rows, { retiredCodeInUse = 0 } = {}) {
     top_sources: topSources,
     hold_date_unknown: holdDateUnknownCount,
     retired_code_in_use: retiredCodeInUse,
+    // Leaks whose LP code is "Data" — already inside real_leaks / est_value_at_risk.
+    data_leaks: dataLeaks,
+    data_value_at_risk: Math.round(dataValue),
   };
 }
 
@@ -443,6 +458,8 @@ export function formatSlackSummary({
     `• Never dialled, Five9 has the number: ${n('routing_or_automation_failure')}`,
     `• Not in Five9 at all: ${n('not_in_five9')}`,
     `• Not checked in Five9 yet (over the daily lookup cap): ${n('unverified')}`,
+    ...(summary.data_leaks ? [`   ↳ of these, LP code "Data": ${num(summary.data_leaks)}`
+      + (revenueAvailable ? ` (${money(summary.data_value_at_risk)} of the estimate)` : '')] : []),
     '',
     'Not leaks:',
     `• On rep hold (NoRehash, ${REP_HOLD_DAYS} days): ${n('rep_hold')}`
@@ -459,7 +476,6 @@ export function formatSlackSummary({
     'Tracked separately (LP call data gaps and open rulings):',
     `• Booked/sold by current code (Set/Sale/Cnf/Verif/Issue/Reset), no Five9 call on record: ${n('already_progressed')}`,
     `• Counted only because LP's appointment/won flag is on (code says otherwise): ${n('already_progressed_flag')}`,
-    `• "Data" leads awaiting a ruling: ${n('data_undecided')}`,
     `• Retired codes still in use (${RETIRED_DISPOSITIONS.join(', ')}): ${num(summary.retired_code_in_use)}`,
     ...(cleanup && cleanup.mode !== 'off' ? [cleanup.removed === null
       ? '🧹 Cleanup: could not finish — see the server log'

@@ -210,13 +210,14 @@ test('NIS2 → dead_status and counted as a retired code in use', () => {
   assert.match(text, /Retired codes still in use \(NIS2\): 1/);
 });
 
-test('the rest of the order: missing_phone > duplicate > missing_source > data > dead', () => {
+test('the rest of the order: missing_phone > duplicate > missing_source > dead', () => {
   assert.equal(classifyUncalledLead(lead({ phone: '123' })), 'missing_phone');
   const dup = { dupCalledPhones: new Set(['3524453161']) };
   assert.equal(classifyUncalledLead(lead({ lead_source: '' }), dup), 'duplicate');
   assert.equal(classifyUncalledLead(lead({ lead_source: '  ', disposition_code: 'Data' })), 'missing_source');
-  assert.equal(classifyUncalledLead(lead({ disposition_code: 'Data' })), 'data_undecided');
-  assert.equal(classifyUncalledLead(lead({ disposition_code: 'data' })), 'data_undecided', 'case-insensitive');
+  // Ruled 2026-09-28: a clean Data lead is callable — it goes on to the Five9 lookup.
+  assert.equal(classifyUncalledLead(lead({ disposition_code: 'Data' })), null);
+  assert.equal(classifyUncalledLead(lead({ disposition_code: 'data' })), null, 'case-insensitive');
   for (const code of ['CXL', 'NoHome', 'No Demo', 'ND', 'OPPFDN', 'CCC', '1Leg']) {
     assert.equal(classifyUncalledLead(lead({ disposition_code: code })), 'dead_status', code);
   }
@@ -230,18 +231,24 @@ test('finalizeReason: absent / present / anything else', () => {
   assert.equal(finalizeReason('error'), 'unverified');
 });
 
-test('Data → data_undecided, excluded from the $ headline', () => {
+test('Data leads count as leaks: priced, in the headline, and called out in the summary', () => {
+  // Ruled 2026-09-28: "Lead leak monitor absolutely needs to count data leads."
   const rates = buildRates([{ source: 'Google PPC', leads: 100, won: 10, avg_value: 12000 }]);
-  assert.equal(estimateValue(lead(), 'data_undecided', rates), null);
-  assert.equal(estimateValue(lead(), 'routing_or_automation_failure', rates), 1200);
+  assert.equal(estimateValue(lead({ disposition_code: 'Data' }), 'not_in_five9', rates), 1200);
   const s = summarize([
-    { reason: 'data_undecided', lead_source: 'Google PPC', est_value: null },
-    { reason: 'routing_or_automation_failure', lead_source: 'Google PPC', est_value: 1200 },
+    { reason: 'not_in_five9', lead_source: 'Google PPC', disposition: 'Data', est_value: 1200 },
+    { reason: 'routing_or_automation_failure', lead_source: 'Google PPC', disposition: 'data', est_value: 1200 },
+    { reason: 'routing_or_automation_failure', lead_source: 'Google PPC', disposition: 'Issued', est_value: 1200 },
+    { reason: 'dnc', lead_source: 'Google PPC', disposition: 'Data', est_value: null },
   ]);
-  assert.equal(s.real_leaks, 1);
-  assert.equal(s.est_value_at_risk, 1200);
-  assert.equal(s.by_reason.data_undecided.leads, 1);
-  assert.deepEqual(s.top_sources, [{ source: 'Google PPC', leaks: 1 }]);
+  assert.equal(s.real_leaks, 3);
+  assert.equal(s.est_value_at_risk, 3600);
+  assert.equal(s.data_leaks, 2, 'a Data lead on DNC is not a leak');
+  assert.equal(s.data_value_at_risk, 2400);
+  assert.ok(!('data_undecided' in s.by_reason) || s.by_reason.data_undecided.leads === 0);
+  const text = formatSlackSummary({ runDate: '2026-09-29', windowDays: 60, summary: s });
+  assert.match(text, /of these, LP code "Data": 2 \(\$2,400 of the estimate\)/);
+  assert.doesNotMatch(text, /awaiting a ruling/);
 });
 
 test('the Slack text labels $ an estimate and gives each bucket its own line', () => {
@@ -253,7 +260,6 @@ test('the Slack text labels $ an estimate and gives each bucket its own line', (
     { reason: 'already_progressed', lead_source: 'A', est_value: null },
     { reason: 'already_progressed_flag', lead_source: 'A', est_value: null },
     { reason: 'already_progressed_flag', lead_source: 'A', est_value: null },
-    { reason: 'data_undecided', lead_source: 'A', est_value: null },
   ]);
   assert.equal(s.real_leaks, 3);
   const text = formatSlackSummary({ runDate: '2026-09-26', windowDays: 60, summary: s });
@@ -264,7 +270,7 @@ test('the Slack text labels $ an estimate and gives each bucket its own line', (
   assert.match(text, /On rep hold \(NoRehash, 7 days\): 1 \(1 with no hold date/);
   assert.match(text, /Booked\/sold by current code .*: 1/);
   assert.match(text, /only because LP's appointment\/won flag is on .*: 2/);
-  assert.match(text, /"Data" leads awaiting a ruling: 1/);
+  assert.doesNotMatch(text, /LP code "Data"/, 'no Data line when there are no Data leaks');
   assert.match(text, /GET \/api\/lp\/lead-leak/);
   assert.ok(REASONS.every((r) => r in s.by_reason));
 });
@@ -350,7 +356,7 @@ test('end to end: called leads drop out, the rest are labelled, capped lookups g
     lead({ lp_lead_id: '1', lp_prospect_id: '1', phone: '3525550001' }),                          // called by key
     lead({ lp_lead_id: '2', lp_prospect_id: '2', phone: '+1 352 555 0002' }),                     // called by phone
     lead({ lp_lead_id: '3', lp_prospect_id: '3', phone: '3525550003', disposition_code: 'Set' }), // progressed
-    lead({ lp_lead_id: '4', lp_prospect_id: '4', phone: '3525550004', disposition_code: 'Data' }),
+    lead({ lp_lead_id: '4', lp_prospect_id: '4', phone: '3525550004', disposition_code: 'Data' }), // Data: a real lead since 2026-09-28
     lead({ lp_lead_id: '5', lp_prospect_id: '5', phone: '3525550005' }),                          // INQ5 ignored; lookup: present
     lead({ lp_lead_id: '6', lp_prospect_id: '6', phone: '3525550006' }),                          // lookup: absent
     lead({ lp_lead_id: '7', lp_prospect_id: '7', phone: '3525550007' }),                          // over the cap
@@ -374,24 +380,25 @@ test('end to end: called leads drop out, the rest are labelled, capped lookups g
     supabase: stubDb(),
     postToSlack: async () => { throw new Error('shadow must not post'); },
   };
-  const m = await measureLeadLeak({ env: { LEAD_LEAK_FIVE9_LOOKUP_CAP: '2' }, nowMs: NOW, deps });
+  const m = await measureLeadLeak({ env: { LEAD_LEAK_FIVE9_LOOKUP_CAP: '3' }, nowMs: NOW, deps });
   assert.equal(m.universe, 9);
   assert.equal(m.called, 3);
   assert.equal(m.summary.retired_code_in_use, 1, 'counted over the whole window, called leads too');
   const byId = Object.fromEntries(m.rows.map((r) => [r.lp_lead_id, r.reason]));
   assert.deepEqual(byId, {
     3: 'already_progressed',
-    4: 'data_undecided',
+    4: 'routing_or_automation_failure',
     5: 'routing_or_automation_failure',
     6: 'not_in_five9',
     7: 'unverified',
     8: 'duplicate',
   });
-  assert.deepEqual(lookedUp, ['3525550005', '3525550006'], 'cap honoured');
-  assert.equal(m.summary.real_leaks, 3);
-  assert.equal(m.summary.est_value_at_risk, 3600);
+  assert.deepEqual([...lookedUp].sort(), ['3525550004', '3525550005', '3525550006'], 'cap honoured');
+  assert.equal(m.summary.real_leaks, 4);
+  assert.equal(m.summary.est_value_at_risk, 4800);
+  assert.equal(m.summary.data_leaks, 1);
 
-  const r = await runLeadLeakMonitor({ env: { LEAD_LEAK_FIVE9_LOOKUP_CAP: '2' }, nowMs: NOW, deps });
+  const r = await runLeadLeakMonitor({ env: { LEAD_LEAK_FIVE9_LOOKUP_CAP: '3' }, nowMs: NOW, deps });
   assert.equal(r.ok, true);
   assert.equal(r.mode, 'shadow');
   assert.equal(r.posted, false);

@@ -471,9 +471,10 @@ export async function measureLeadLeak({ env = process.env, nowMs = Date.now(), d
   if (lookupErrors) errors.push(`five9 contact lookup: ${lookupErrors} failed (marked unverified)`);
 
   // Time to first call, per lead. `expected` = the lead was owed a call: it
-  // got one, or it is uncalled for a leak reason. An uncalled DNC, rep-hold,
-  // "Data" or already-booked lead was never owed one and would only make the
-  // numbers look worse than the floor is (classify before you threshold).
+  // got one, or it is uncalled for a leak reason. An uncalled DNC, rep-hold
+  // or already-booked lead was never owed one and would only make the numbers
+  // look worse than the floor is (classify before you threshold). "Data" leads
+  // ARE owed a call since 2026-09-28 — see DATA_DISPOSITIONS.
   const reasonById = new Map(rows.map((r) => [r.lp_lead_id, r.reason]));
   // A lead created during a live call never waited, so it is left out of the
   // speed numbers altogether (src/lead-speed.js, CREATION_CALL_WINDOW_MIN).
@@ -725,7 +726,7 @@ export async function runLeadLeakMonitor({ env = process.env, nowMs = Date.now()
 
   const b = m.summary.by_reason;
   const line = `real_leaks=${m.summary.real_leaks} est_at_risk=$${m.summary.est_value_at_risk}`
-    + ` progressed=${b.already_progressed.leads}+${b.already_progressed_flag.leads}flag data=${b.data_undecided.leads}`
+    + ` progressed=${b.already_progressed.leads}+${b.already_progressed_flag.leads}flag data_leaks=${m.summary.data_leaks}`
     + ` not_issued=${b.not_issued_call_center.leads} not_covered=${b.not_covered_by_rep.leads} hold=${b.rep_hold.leads}/${b.rep_hold_expired.leads}expired`
     + ` uncalled=${m.summary.uncalled}/${m.universe} stored=${stored}`
     + ` median_first_call_7d=${m.speed.last7.median_min ?? '?'}m speed=${speedDecision.verdict}`
