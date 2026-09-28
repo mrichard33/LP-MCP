@@ -15,6 +15,9 @@ import {
   createArchiveBreaker,
   archiveOutageVerdict,
   formatArchiveOutageAlert,
+  inheritedOutageStart,
+  ARCHIVE_EVENT_DOWN,
+  ARCHIVE_EVENT_UP,
   ARCHIVE_BASE_COOLDOWN_MS,
   ARCHIVE_MAX_COOLDOWN_MS,
   ARCHIVE_ALERT_AFTER_MS,
@@ -92,20 +95,28 @@ test('the card says paused-not-failed and where to look', () => {
 
 // ─── wiring: advanceOne ─────────────────────────────────────────────────────
 
-function fakeDb() {
+// `markers` is what a read of the newest ci_events outage marker returns;
+// `readError` makes that read fail the way PostgREST does (resolved { error }).
+function fakeDb({ markers = [], readError = null } = {}) {
   const log = [];
   return {
     log,
     from(table) {
+      let filtered = false;
       const chain = {
         select() { return chain; }, eq() { return chain; }, limit() { return chain; },
+        is() { filtered = true; return chain; }, in() { return chain; }, order() { return chain; },
         maybeSingle: async () => ({ data: null, error: null }),
         insert: async (row) => { log.push({ table, op: 'insert', row }); return { error: null }; },
         update(patch) {
           const thenable = { eq() { return thenable; }, then: (res, rej) => { log.push({ table, op: 'update', patch }); return Promise.resolve({ error: null }).then(res, rej); } };
           return thenable;
         },
-        then: (res, rej) => Promise.resolve({ data: [], error: null }).then(res, rej),
+        then: (res, rej) => Promise.resolve(
+          table === 'ci_events' && filtered
+            ? (readError ? { data: null, error: { message: readError } } : { data: markers, error: null })
+            : { data: [], error: null },
+        ).then(res, rej),
       };
       return chain;
     },
@@ -130,7 +141,9 @@ test('a reset pauses the call WITHOUT touching its attempts, and writes no ci_ev
   assert.equal('attempts' in updates[0].patch, false, 'an outage is not the call\'s failure');
   assert.equal('status' in updates[0].patch, false, 'never parked as failed');
   assert.ok(updates[0].patch.next_retry_at, 'comes back after the cool-down');
-  assert.equal(db.log.filter((l) => l.table === 'ci_events').length, 0);
+  const events = db.log.filter((l) => l.table === 'ci_events');
+  assert.equal(events.filter((l) => l.row.call_id != null).length, 0, 'no per-call row');
+  assert.deepEqual(events.map((l) => [l.row.call_id, l.row.event]), [[null, ARCHIVE_EVENT_DOWN]], 'one durable outage-start marker');
   assert.equal(breaker.isOpen(), true);
 });
 
@@ -154,4 +167,89 @@ test('a non-outage error still fails the call exactly as before', async () => {
   const upd = db.log.find((l) => l.op === 'update');
   assert.equal(upd.patch.attempts, 3);
   assert.equal(breaker.isOpen(), false);
+});
+
+// ─── the outage clock survives a restart (2026-09-28) ───────────────────────
+//
+// Eight deploys in an hour reset the per-process clock every time, so the
+// 30-minute card never went out. These pin the durable markers.
+
+test('seedSince only moves the outage start earlier, and leaves the cool-down alone', () => {
+  let t = 10_000_000;
+  const b = createArchiveBreaker({ now: () => t });
+  assert.equal(b.seedSince(1), null, 'no outage in this process → nothing to seed');
+  const { openUntil } = b.recordUnreachable(LIVE_RESET);
+  assert.equal(b.seedSince(t - 60_000), t - 60_000);
+  assert.equal(b.seedSince(t + 60_000), t - 60_000, 'never later');
+  assert.equal(b.openUntil(), openUntil);
+  assert.equal(b.state().failures, 1);
+});
+
+test('inheritedOutageStart: only a DOWN marker is proof of an unbroken outage', () => {
+  const now = Date.parse('2026-09-28T17:30:00Z');
+  assert.equal(inheritedOutageStart({ event: ARCHIVE_EVENT_DOWN, created_at: '2026-09-28T16:39:54Z' }, now), Date.parse('2026-09-28T16:39:54Z'));
+  assert.equal(inheritedOutageStart({ event: ARCHIVE_EVENT_UP, created_at: '2026-09-28T16:39:54Z' }, now), null);
+  assert.equal(inheritedOutageStart(null, now), null);
+  assert.equal(inheritedOutageStart({ event: ARCHIVE_EVENT_DOWN, created_at: 'garbage' }, now), null);
+  assert.equal(inheritedOutageStart({ event: ARCHIVE_EVENT_DOWN, created_at: '2026-09-29T00:00:00Z' }, now), null, 'a future marker is not evidence');
+});
+
+test('restart: a fresh process inherits the outage start and alerts on its FIRST reset', async () => {
+  const fortyMinAgo = new Date(Date.now() - 40 * 60 * 1000).toISOString();
+  const db = fakeDb({ markers: [{ event: ARCHIVE_EVENT_DOWN, created_at: fortyMinAgo }] });
+  const breaker = createArchiveBreaker();
+  const adapter = { list: async () => { throw LIVE_RESET; }, fetch: async () => Buffer.alloc(0) };
+  const r = await advanceOne({ ...CALL }, { db, adapter, breaker });
+  assert.equal(r.outcome, 'archive_unreachable');
+  assert.equal(breaker.state().since, Date.parse(fortyMinAgo));
+  assert.equal(archiveOutageVerdict({ unreachable: 1, breaker: breaker.state(), nowMs: Date.now() }).verdict, 'alert');
+  assert.equal(db.log.filter((l) => l.table === 'ci_events').length, 0, 'an inherited outage writes no second marker');
+});
+
+test('newest marker is UP: a new outage writes DOWN and starts its clock now', async () => {
+  const db = fakeDb({ markers: [{ event: ARCHIVE_EVENT_UP, created_at: '2026-09-01T00:00:00Z' }] });
+  const breaker = createArchiveBreaker();
+  const before = Date.now();
+  await advanceOne({ ...CALL }, { db, adapter: { list: async () => { throw LIVE_RESET; } }, breaker });
+  assert.ok(breaker.state().since >= before);
+  assert.deepEqual(db.log.filter((l) => l.table === 'ci_events').map((l) => l.row.event), [ARCHIVE_EVENT_DOWN]);
+});
+
+test('marker read fails: the process clock is used, the call is still paused, nothing throws', async () => {
+  const db = fakeDb({ readError: 'statement timeout' });
+  const breaker = createArchiveBreaker();
+  const before = Date.now();
+  const r = await advanceOne({ ...CALL }, { db, adapter: { list: async () => { throw LIVE_RESET; } }, breaker });
+  assert.equal(r.outcome, 'archive_unreachable');
+  assert.ok(breaker.state().since >= before);
+  assert.equal(db.log.filter((l) => l.op === 'update').length, 1, 'lease released as usual');
+});
+
+test('a working listing after an outage writes exactly one UP marker', async () => {
+  const db = fakeDb();
+  let t = 0;
+  const breaker = createArchiveBreaker({ now: () => t });
+  breaker.recordUnreachable(LIVE_RESET);
+  t = ARCHIVE_MAX_COOLDOWN_MS + 1; // cool-down over: the next fetch is the probe
+  const adapter = { list: async () => [], fetch: async () => Buffer.alloc(0) };
+  await advanceOne({ ...CALL }, { db, adapter, breaker });
+  await advanceOne({ ...CALL, id: 'call-2' }, { db, adapter, breaker });
+  const ups = db.log.filter((l) => l.table === 'ci_events' && l.row.event === ARCHIVE_EVENT_UP);
+  assert.equal(ups.length, 1);
+  assert.equal(ups[0].row.call_id, null);
+  assert.equal(breaker.state().since, null);
+});
+
+test('a new process whose first listing works closes a DOWN left by an earlier process — once', async () => {
+  const db = fakeDb({ markers: [{ event: ARCHIVE_EVENT_DOWN, created_at: '2026-09-28T16:39:54Z' }] });
+  const breaker = createArchiveBreaker();
+  const adapter = { list: async () => [], fetch: async () => Buffer.alloc(0) };
+  await advanceOne({ ...CALL }, { db, adapter, breaker });
+  await advanceOne({ ...CALL, id: 'call-2' }, { db, adapter, breaker });
+  assert.equal(db.log.filter((l) => l.table === 'ci_events' && l.row.event === ARCHIVE_EVENT_UP).length, 1);
+});
+
+test('the card names when the outage was first seen', () => {
+  const card = formatArchiveOutageAlert({ host: 'h', port: 1, outageMs: 3600000, sinceMs: Date.parse('2026-09-28T16:39:54Z'), waiting: 1, nextTryMs: 60000 });
+  assert.match(card, /first seen 2026-09-28 16:39 UTC, 1h 0m so far/);
 });

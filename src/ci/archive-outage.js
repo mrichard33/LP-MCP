@@ -27,11 +27,27 @@
 //     listing actually SUCCEEDED this tick, null when no fetch ran (nothing
 //     was checked, so nothing is cleared).
 //
-// Pure — no I/O. The worker owns the calls, the lease writes and the alert.
+// 2026-09-28. The outage clock must survive a restart. `since` lived only in
+// this process, and the alert needs ALERT_AFTER_MS of outage — so on the day
+// #1059 shipped, eight deploys in an hour (every merge auto-deploys) reset the
+// clock each time. The 16:38 process first saw the reset at 16:39:54, would
+// have paged at 17:09:54, and was replaced at 17:09:57. A month-long outage
+// stayed silent through its own fix. The worker now keeps two durable markers
+// in ci_events (call_id NULL, stage 'fetch'): ARCHIVE_EVENT_DOWN when an
+// outage starts, ARCHIVE_EVENT_UP when a listing next works. A new process
+// that finds DOWN as the newest marker inherits its time via seedSince —
+// proof that nothing has reached the archive since. At most two rows per
+// outage, against the ~3,000 a day the per-call rows used to write.
+//
+// Pure — no I/O. The worker owns the calls, the lease writes, the markers and
+// the alert.
 
 export const ARCHIVE_BASE_COOLDOWN_MS = 5 * 60 * 1000;
 export const ARCHIVE_MAX_COOLDOWN_MS = 60 * 60 * 1000;
 export const ARCHIVE_ALERT_AFTER_MS = 30 * 60 * 1000;
+
+export const ARCHIVE_EVENT_DOWN = 'archive_unreachable';
+export const ARCHIVE_EVENT_UP = 'archive_reachable';
 
 const UNREACHABLE = /ECONNRESET|ECONNREFUSED|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|ENOTFOUND|EAI_AGAIN|reset the connection|Timed out while waiting for handshake|Connection lost before handshake|getConnection/i;
 
@@ -61,6 +77,15 @@ export function createArchiveBreaker({
       openUntil = now() + cooldown;
       return { openUntil, cooldownMs: cooldown, failures };
     },
+    /**
+     * Carry an outage start forward from a durable marker (an earlier
+     * process). Only ever moves `since` EARLIER, and only during an outage
+     * this process has itself seen; the cool-down is untouched.
+     */
+    seedSince(ms) {
+      if (since != null && Number.isFinite(ms) && ms < since) since = ms;
+      return since;
+    },
     /** A listing succeeded: the outage, if any, is over. */
     recordReachable() {
       const was = since;
@@ -71,6 +96,21 @@ export function createArchiveBreaker({
       return { open: now() < openUntil, openUntil, failures, since, lastError };
     },
   };
+}
+
+/**
+ * The outage start to inherit from the newest durable marker, or null.
+ * Only a DOWN marker with no UP after it is proof of an unbroken outage; a
+ * missing, UP, unparseable or future-dated marker inherits nothing.
+ *
+ * @param {{event:string, created_at:string}|null} latest
+ * @param {number} nowMs
+ */
+export function inheritedOutageStart(latest, nowMs) {
+  if (!latest || latest.event !== ARCHIVE_EVENT_DOWN) return null;
+  const t = Date.parse(latest.created_at);
+  if (!Number.isFinite(t) || t > nowMs) return null;
+  return t;
 }
 
 /**
@@ -99,9 +139,10 @@ const fmtDuration = (ms) => {
   return `${Math.max(1, Math.round(ms / 60000))} min`;
 };
 
-export function formatArchiveOutageAlert({ host, port, outageMs, lastError, waiting, nextTryMs }) {
+export function formatArchiveOutageAlert({ host, port, outageMs, sinceMs, lastError, waiting, nextTryMs }) {
+  const first = Number.isFinite(sinceMs) ? `first seen ${new Date(sinceMs).toISOString().slice(0, 16).replace('T', ' ')} UTC, ` : '';
   return [
-    `📼 Call recordings: the recording archive is refusing connections (${fmtDuration(outageMs)} so far in this process).`,
+    `📼 Call recordings: the recording archive is refusing connections (${first}${fmtDuration(outageMs)} so far).`,
     `Host: ${host}:${port}`,
     `Last error: ${lastError || 'unknown'}`,
     `${waiting ?? '?'} call(s) waiting for their recording. They are PAUSED, not failed — they resume on their own when the archive answers.`,

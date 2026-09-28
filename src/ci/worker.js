@@ -59,7 +59,7 @@ import { resolveAgentLabel } from './teams.js';
 import { syncCall } from './sync.js';
 import { verifyPendingLpNotes } from './verify.js';
 import { alertUnreadableFolder } from './alerts.js';
-import { createArchiveBreaker, isArchiveUnreachable, archiveOutageVerdict, formatArchiveOutageAlert, formatArchiveRecovered, ARCHIVE_MAX_COOLDOWN_MS } from './archive-outage.js';
+import { createArchiveBreaker, isArchiveUnreachable, archiveOutageVerdict, formatArchiveOutageAlert, formatArchiveRecovered, inheritedOutageStart, ARCHIVE_MAX_COOLDOWN_MS, ARCHIVE_EVENT_DOWN, ARCHIVE_EVENT_UP } from './archive-outage.js';
 import { reportAlertCondition } from '../alert-state.js';
 
 const LOG = '[CIWorker]';
@@ -69,6 +69,83 @@ const LOG = '[CIWorker]';
 // that the NEXT ticks stop connecting while the archive refuses us.
 const archiveBreaker = createArchiveBreaker();
 const ARCHIVE_ALERT_KEY = 'ci:recording_archive_unreachable';
+
+/* ─── durable outage markers (2026-09-28) ────────────────────────────────
+ * The breaker's clock is per process, and a busy merge day restarts the
+ * process faster than the 30-minute alert threshold — see
+ * src/ci/archive-outage.js. These two markers carry the outage start across
+ * restarts. Both are best-effort: a failed read or write leaves the process
+ * clock in charge (the pre-2026-09-28 behaviour) and never stops the worker.
+ */
+
+/** Newest outage marker, or null. Throws on a failed read — callers catch. */
+async function readArchiveMarker(db) {
+  const { data, error } = await db.from('ci_events')
+    .select('event, created_at')
+    .is('call_id', null)
+    .eq('stage', 'fetch')
+    .in('event', [ARCHIVE_EVENT_DOWN, ARCHIVE_EVENT_UP])
+    .order('created_at', { ascending: false })
+    .limit(1);
+  if (error) throw new Error(error.message);
+  return Array.isArray(data) ? (data[0] ?? null) : null;
+}
+
+async function writeArchiveMarker(db, event, detail) {
+  const { error } = await db.from('ci_events').insert({ call_id: null, stage: 'fetch', event, detail });
+  if (error) throw new Error(error.message);
+}
+
+/**
+ * First reset of an outage in THIS process. If an earlier process already
+ * recorded the outage (DOWN is the newest marker), inherit its start; else
+ * record the start now.
+ */
+async function markOutageStart(db, breaker, err, cfg) {
+  try {
+    const inherited = inheritedOutageStart(await readArchiveMarker(db), Date.now());
+    if (inherited != null) {
+      breaker.seedSince(inherited);
+      console.log(`${LOG} recording archive outage carried over from ${new Date(inherited).toISOString()}`);
+      return 'inherited';
+    }
+    await writeArchiveMarker(db, ARCHIVE_EVENT_DOWN, {
+      host: cfg?.sftp?.host ?? null,
+      port: cfg?.sftp?.port ?? null,
+      error: String(err?.message ?? err ?? '').slice(0, 300),
+    });
+    return 'started';
+  } catch (e) {
+    console.warn(`${LOG} outage marker unavailable, using this process's clock: ${e.message}`);
+    return 'unknown';
+  }
+}
+
+// Breakers whose process has already checked for a DOWN marker left open by
+// an earlier process. Once per breaker, so a healthy archive costs one read
+// per process, not one per call.
+const endChecked = new WeakSet();
+
+/**
+ * A listing worked. Close the durable outage if one is open: always when this
+ * process saw the outage, and once per process otherwise (an earlier process
+ * recorded DOWN and was replaced before the archive came back).
+ */
+async function markOutageEnd(db, breaker, outageSince) {
+  if (outageSince == null) {
+    if (endChecked.has(breaker)) return;
+    endChecked.add(breaker);
+  }
+  try {
+    if (outageSince == null) {
+      const latest = await readArchiveMarker(db);
+      if (latest?.event !== ARCHIVE_EVENT_DOWN) return;
+    }
+    await writeArchiveMarker(db, ARCHIVE_EVENT_UP, outageSince != null ? { outage_since: new Date(outageSince).toISOString() } : null);
+  } catch (e) {
+    console.warn(`${LOG} could not record archive recovery marker: ${e.message}`);
+  }
+}
 
 /**
  * ci_matches.decided_by for a machine-made decision.
@@ -1118,6 +1195,7 @@ export async function advanceOne(call, { db = supabase, cfg = getConfig(), adapt
       if (r?.reason === 'no_campaign') return r;
       const outageSince = breaker.recordReachable();
       if (outageSince != null) console.log(`${LOG} recording archive reachable again after ${Math.round((Date.now() - outageSince) / 60000)} min`);
+      await markOutageEnd(db, breaker, outageSince);
       return { ...r, archive: 'reachable' };
     }
     // THE GATE. `fetched` resolves the customer BEFORE Whisper is asked for
@@ -1152,7 +1230,8 @@ export async function advanceOne(call, { db = supabase, cfg = getConfig(), adapt
     // cool-down ends. Before 2026-09-27 this path parked 16,771 calls as
     // permanently `failed` over one month-long outage.
     if (call.status === 'discovered' && isArchiveUnreachable(err)) {
-      const { openUntil, cooldownMs } = breaker.recordUnreachable(err);
+      const { openUntil, cooldownMs, failures } = breaker.recordUnreachable(err);
+      if (failures === 1) await markOutageStart(db, breaker, err, cfg);
       await releaseLease(db, call.id, {
         next_retry_at: new Date(openUntil).toISOString(),
         status_detail: `archive unreachable (paused ${Math.round(cooldownMs / 60000)} min): ${String(err.message || err)}`.slice(0, 500),
@@ -1188,7 +1267,7 @@ async function reportArchiveOutage({ db, cfg, tally, breaker = archiveBreaker, n
           waiting = count;
         } catch { /* the card still goes out without the count */ }
         return formatArchiveOutageAlert({
-          host, port, outageMs: decision.outageMs, lastError: st.lastError, waiting,
+          host, port, outageMs: decision.outageMs, sinceMs: st.since ?? undefined, lastError: st.lastError, waiting,
           nextTryMs: Math.min(ARCHIVE_MAX_COOLDOWN_MS, Math.max(0, st.openUntil - nowMs)),
         });
       },
