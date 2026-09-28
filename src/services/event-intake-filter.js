@@ -317,6 +317,13 @@ const ALLOWED_TAG_ADDED_SUBTYPES = new Set([
   // chat ever reached a person.
   'customer-service-request',       // rule SERVICE_REQUEST_TAG_TO_SLACK
   'needs-human-followup',           // rule SERVICE_REQUEST_TAG_TO_SLACK
+
+  // ── CONSENT MODEL v1 (2026-09-28) ──
+  // A person adds this tag to ask for a manual DNC-lift review. Consumer:
+  // DNC_LIFT_REVIEW_REQUEST, which posts the Approve / Keep Blocked card to
+  // #dnc-lift-approval. Without this entry the request is dropped here and no
+  // card ever appears.
+  'dnc-lift:request',               // rule DNC_LIFT_REVIEW_REQUEST
 ]);
 
 /**

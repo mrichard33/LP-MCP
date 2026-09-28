@@ -1,7 +1,7 @@
 /**
  * Five9 admin write handler — src/actions/handlers/five9.js
  *
- * One dispatcher for all twenty-four five9_* write action types. The real work
+ * One dispatcher for every five9_* write action type. The real work
  * (guardrails, serialization lock, read-before-write, audit events) lives
  * in src/five9/admin-writes.js — this file is only the executor-facing
  * seam plus the belt-and-braces approval check.
@@ -64,6 +64,7 @@ import {
   executeResetListPosition,
   executeRemoveNumbersFromDncReentry,
   REENTRY_DNC_LIFT_RULE_KEY,
+  executeRemoveNumbersFromDncApproved,
 } from '../../five9/admin-writes.js';
 
 const FIVE9_WRITE_OPS = {
@@ -83,6 +84,13 @@ const FIVE9_WRITE_OPS = {
   // general removal path and does not lift a contact-initiated STOP. The
   // contract is in src/five9/admin-writes.js.
   five9_remove_numbers_from_dnc_reentry: executeRemoveNumbersFromDncReentry,
+  // 2026-09-28 — the SECOND narrow removal (Consent Model v1): a lift a
+  // person approved in Slack (#dnc-lift-approval). Welded to SLACK_DNC_LIFT,
+  // refuses any approval that is not a Slack user through approve_action,
+  // needs the card's slack_ts, and resolves numbers from the contact only.
+  // It is NOT carved out of the approval assertion below — the approval IS
+  // the gate. Contract in src/five9/admin-writes.js.
+  five9_remove_numbers_from_dnc_approved: executeRemoveNumbersFromDncApproved,
   // NOTE: GENERAL DNC REMOVAL IS NOT AN OP AND MUST NOT BE RE-ADDED. Removed
   // 2026-08-21 by explicit ruling: Reece does not take numbers off DNC under
   // any circumstance, so there is no gate, override, or justification path

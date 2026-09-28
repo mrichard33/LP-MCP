@@ -45,6 +45,9 @@ const FIVE9_WRITE_TYPES = [
   // loop covers it: it is exempt only when rule_applied is
   // DNC_LIFT_ON_REENTRY_E0, so queued by anything else it must stay armed.
   'five9_remove_numbers_from_dnc_reentry',
+  // 2026-09-28 — the Slack-approved lift. NO carve-out: the five9_ prefix
+  // coercion to requires_approval=true is exactly what the op relies on.
+  'five9_remove_numbers_from_dnc_approved',
   'five9_user_skill_add',
   'five9_user_skill_modify',
   'five9_user_skill_remove',
@@ -205,13 +208,16 @@ test('D1 — the registry holds exactly the 78 documented action types', async (
   // could send one. See src/actions/handlers/info-email.js.
   // 2026-09-27 (Inbound Caller Capture): 77 → 78, capture_inbound_caller — what
   // an approved capture runs. See src/actions/handlers/inbound-capture.js.
-  assert.equal(types.length, 78);
-  assert.equal(types.filter(t => t.startsWith('five9_')).length, 38);
+  // 2026-09-28 (Consent Model v1): 78 → 81 and five9_* 38 → 39 —
+  // record_consent_change, request_dnc_lift_review, and
+  // five9_remove_numbers_from_dnc_approved (the Slack-approved lift).
+  assert.equal(types.length, 81);
+  assert.equal(types.filter(t => t.startsWith('five9_')).length, 39);
   // Every type the coercion loop covers must actually be dispatchable.
   for (const actionType of FIVE9_WRITE_TYPES) {
     assert.equal(typeof ACTION_HANDLERS[actionType], 'function', `${actionType} is asserted below but not registered`);
   }
-  assert.equal(FIVE9_WRITE_TYPES.length, 38);
+  assert.equal(FIVE9_WRITE_TYPES.length, 39);
 });
 
 test('PR4 — the web connector pair and composition ops are covered, by name', () => {

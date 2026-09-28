@@ -31,6 +31,10 @@ export async function executeEmitEvent(action) {
     payload: params.payload || {},
     priority: params.priority || 'normal',
     idempotency_key: params.idempotency_key || null,
+    // 2026-09-28 — opt-in only. An event no rule consumes (consent.dnc_lifted_manual,
+    // consent.dnc_lift_denied) is DROPPED by the intake allowlist unless the
+    // template asks for it; those are audit events, so their templates do.
+    ...(params.bypass_filter === true ? { bypass_filter: true } : {}),
   });
 
   return {

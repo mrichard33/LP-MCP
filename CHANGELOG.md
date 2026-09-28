@@ -5,6 +5,26 @@ Notable behavioral changes to the LP MCP server. Newest first.
 Rule-layer (`agent_rules`) changes ship through the database, not through this
 repo — they are recorded in `sql/seeds/` on the date they were applied live.
 
+## 2026-09-28
+
+Consent Model v1 — one record of who may be contacted, on which channel, and
+who changed it. Ships in **shadow**: nothing reads the new tables to gate a send.
+
+- **`contact_consent` + `consent_events`** (sql/136–139). `record_consent_change`
+  writes both in one transaction. Channels are `phone` (texts + automated calls,
+  paired per FCC 24-24 para. 32), `email`, `all`. `CONSENT_SPLIT_SMS_CALL` is a
+  hook only; the split is not built.
+- **Slack-approved DNC lift.** A `dnc-lift:request` tag (or a re-entry the
+  first-party auto-lift does not own) posts an Approve / Keep Blocked card to
+  `#dnc-lift-approval` via n8n. `POST /slack/dnc-lift/decision` runs the lift
+  and returns per-system results for the thread. A lead who texted STOP gets
+  calls, LP and Five9 back; texts stay off.
+- **`five9_remove_numbers_from_dnc_approved`** — the second narrow exception to
+  add-only Five9 DNC. Human Slack approval through `approve_action` only.
+- **Email unsubscribes are email-only** in the consent record.
+- `update_lp_dnc_status` accepts `mode: 'clear'`; `emit_event` accepts
+  `bypass_filter`.
+
 ## 2026-09-24
 
 The bot promised emails it had no way to send, and went quiet on the lead who

@@ -120,6 +120,7 @@ import { registerAppointmentNotificationRoutes } from './notifications/appointme
 import { registerGroupMeRoutes } from './groupme.js';
 // ─── Slack approval buttons (Approve / Reject on approval cards) ─
 import { registerSlackApprovalRoutes, slackRawBodyParser } from './slack-approvals.js';
+import { registerDncLiftDecisionRoutes } from './consent/dnc-lift-decision.js';
 // ─── LP Appointment Sync (GHL → LP) ────────────────────────────
 import { registerLPAppointmentSyncRoutes } from './lp-appointment-sync.js';
 // ─── LP Addlead Validation Proxy (GHL addlead → hour gate → LP) ──
@@ -726,6 +727,9 @@ registerFallthroughSweepRoutes(app);
 // ─── GroupMe Two-Way Integration ─────────────────────────────────
 registerGroupMeRoutes(app);
 registerSlackApprovalRoutes(app);
+// 2026-09-28 — Consent Model v1: n8n's OPS.DNC-LIFT posts Slack decisions here.
+// Own fail-closed header secret (DNC_LIFT_WEBHOOK_SECRET), not the MCP token.
+registerDncLiftDecisionRoutes(app);
 
 // ─── LP Appointment Sync (GHL → LP) ──────────────────────────────
 registerLPAppointmentSyncRoutes(app);

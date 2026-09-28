@@ -1983,6 +1983,141 @@ async function _readReentryEventForAction(action) {
   return data;
 }
 
+/**
+ * DNC removal for the SECOND narrow case: a human approved it in Slack.
+ *
+ * 2026-09-28, Consent Model v1 (Mark's handoff). Some leads give new consent
+ * through a source the re-entry lift above does not cover — an ActiveProspect
+ * exclusive-consent campaign, for one. A person reviews those in
+ * #dnc-lift-approval, and ONLY an Approve click there reaches this op, through
+ * POST /slack/dnc-lift/decision (src/consent/dnc-lift-decision.js).
+ *
+ * LIKE THE RE-ENTRY OP, THIS IS NOT A GENERAL REMOVAL. The tombstone below
+ * still governs every other caller. Every guard fails CLOSED and is a
+ * REFUSAL, never a retry — none of them improves by waiting:
+ *
+ *   1. rule_applied must be exactly SLACK_DNC_LIFT (welded, like re-entry).
+ *   2. The row must have been approved by a PERSON through approve_action:
+ *      requires_approval true, approved_at set, and approved_by a Slack user
+ *      id (U…/W…, as Slack writes it). That shape is what refuses an
+ *      auto-approval — the escalation sweep writes 'auto_escalation_60min',
+ *      the GroupMe path lowercases — and a hand-set string alike.
+ *   3. action_payload.approved_by must name the SAME Slack user: the route
+ *      states who clicked, and approve_action must agree.
+ *   4. action_payload.evidence.slack_ts is required — the card the decision
+ *      was made on.
+ *   5. numbers_from_contact:true only. A free-form number list is refused:
+ *      the numbers are resolved from the contact at execution time, so this
+ *      op can only ever lift the person the card was about.
+ *   6. If the request asks to clear SMS (clear_sms:true) and the contact's
+ *      consent row says they texted STOP (sms_carrier_stop), refuse. Five9 is
+ *      voice-only here, so the lift itself never touches SMS; the guard
+ *      protects the paired GHL step from a request built on a stale read. An
+ *      unreadable consent row with clear_sms:true is also a refusal.
+ *
+ * Gated by FIVE9_WRITES_ENABLED like every Five9 write (withFive9WriteGate).
+ */
+export async function executeRemoveNumbersFromDncApproved(action, deps = {}) {
+  const refuse = (why) => {
+    const msg = `REFUSED: five9_remove_numbers_from_dnc_approved — ${why}`;
+    console.warn(`[FIVE9 WRITES] ${msg} (action ${action?.id ?? '?'}, contact ${action?.target_id ?? '?'})`);
+    return new Error(msg);
+  };
+  const payload = action?.action_payload || {};
+
+  const ruleApplied = action?.rule_applied || null;
+  if (ruleApplied !== APPROVED_DNC_LIFT_RULE_KEY) {
+    throw refuse(`runs only for ${APPROVED_DNC_LIFT_RULE_KEY}, not "${ruleApplied || 'none'}". ` +
+      'Five9 DNC removal has no general path — see the tombstone in src/five9/admin-writes.js.');
+  }
+  const contactId = action.target_id;
+  if (!contactId) throw refuse('action.target_id (GHL contact id) is required');
+
+  if (action.requires_approval !== true) throw refuse('the row was not queued requires_approval=true');
+  if (!action.approved_at) throw refuse('the row has no approved_at — it was never approved via approve_action');
+  if (!isSlackUserId(action.approved_by)) {
+    throw refuse(`approved_by "${action.approved_by || ''}" is not a Slack user id — only a person approving in Slack may lift Five9 DNC (auto and GroupMe approvals are refused)`);
+  }
+  if (String(payload.approved_by || '') !== String(action.approved_by)) {
+    throw refuse(`action_payload.approved_by (${payload.approved_by || 'missing'}) does not match the approver on the row (${action.approved_by})`);
+  }
+  const slackTs = payload.evidence?.slack_ts;
+  if (!slackTs || !String(slackTs).trim()) throw refuse('evidence.slack_ts is required');
+  if (payload.numbers_from_contact !== true) throw refuse('numbers_from_contact:true is required');
+  if (payload.numbers != null || payload.removals != null) {
+    throw refuse('a free-form number list is not accepted — numbers are resolved from the contact');
+  }
+
+  if (payload.clear_sms === true) {
+    const readConsent = deps.getConsent || _getConsentForApprovedLift;
+    const c = await readConsent(contactId);
+    if (!c || c.status !== 'ok') throw refuse(`could not read consent for ${contactId} — refusing a request that asks to clear SMS`);
+    if (c.consent?.sms_carrier_stop === true) {
+      throw refuse(`${contactId} texted STOP (sms_carrier_stop) — a Slack lift never clears SMS`);
+    }
+  }
+
+  const resolveNumbers = deps.resolveContactDncNumbers || resolveContactDncNumbers;
+  const checkDnc = deps.checkDncForNumbers || checkDncForNumbers;
+
+  return withFive9WriteGate(
+    { action, subtype: 'remove_numbers_from_dnc_approved', entityType: 'five9_dnc', entityId: 'dnc' },
+    async (ctx) => {
+      const { numbers, sources } = await resolveNumbers(contactId, {});
+      ctx.previous_state = await checkDnc(numbers);
+      await ctx.soap('removeNumbersFromDnc', buildNumbersXml(numbers));
+
+      // Its own audit event, like re-entry's: a human-approved DNC removal is
+      // the write someone will come looking for by name.
+      const emit = deps.emitEvent || emitEvent;
+      await emit({
+        event_type: 'five9.dnc_removed_approved',
+        source: 'action_executor',
+        entity_type: 'contact',
+        entity_id: contactId,
+        ghl_contact_id: contactId,
+        payload: {
+          contact_id: contactId,
+          numbers,
+          number_sources: sources,
+          approved_by: action.approved_by,
+          approved_by_name: payload.approved_by_name || null,
+          approved_at: action.approved_at,
+          evidence: payload.evidence || null,
+          rule_applied: ruleApplied,
+          action_id: action.id,
+        },
+        priority: 'high',
+        bypass_filter: true,
+        idempotency_key: `five9_dnc_removed_approved_${action.id}`,
+      }).catch((err) => console.warn(`[FIVE9 WRITES] approved-lift audit emit failed (write already done): ${err.message}`));
+
+      if (ctx.dry_run) return { numbers_submitted: numbers.length, resolved_from: sources, approved_by: action.approved_by };
+      ctx.new_state = await checkDnc(numbers); // read-back proves the removal
+      return {
+        numbers_submitted: numbers.length,
+        still_on_dnc: ctx.new_state.on_dnc.length,
+        resolved_from: sources,
+        approved_by: action.approved_by,
+      };
+    }
+  );
+}
+
+// The approved-lift contract, named so a reader sees it without the body.
+export const APPROVED_DNC_LIFT_RULE_KEY = 'SLACK_DNC_LIFT';
+// Slack member ids: U… (user) or W… (Enterprise Grid), uppercase alnum. Case-
+// sensitive on purpose — the GroupMe approval path lowercases its approver.
+export const SLACK_USER_ID_RE = /^[UW][A-Z0-9]{6,}$/;
+export function isSlackUserId(v) {
+  return typeof v === 'string' && SLACK_USER_ID_RE.test(v);
+}
+
+async function _getConsentForApprovedLift(contactId) {
+  const { getConsent } = await import('../consent/consent-store.js');
+  return getConsent(contactId, { eventLimit: 1 });
+}
+
 /* DNC REMOVAL IS NOT IMPLEMENTED, AND THIS IS NOT AN OVERSIGHT.
  *
  * executeRemoveNumbersFromDnc existed from Phase C (2026-07-21) until
@@ -2006,6 +2141,13 @@ async function _readReentryEventForAction(action) {
  * a contact-initiated STOP. Everything in this comment still applies to
  * every other caller: there is no reason string, no override, and no
  * approver who can remove a number outside that one rule.
+ *
+ * 2026-09-28 AMENDMENT. A second narrow exception, directly above:
+ * executeRemoveNumbersFromDncApproved, for a lift a PERSON approved in
+ * #dnc-lift-approval (Consent Model v1). It is welded to SLACK_DNC_LIFT,
+ * requires a Slack-user approval through approve_action plus the card's
+ * slack_ts, and resolves numbers from the contact only. Still no general
+ * path: five9_remove_numbers_from_dnc stays deleted and forbidden.
  */
 
 /* ---------------------------------------------------------------------- *
