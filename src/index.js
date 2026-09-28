@@ -121,6 +121,7 @@ import { registerGroupMeRoutes } from './groupme.js';
 // ─── Slack approval buttons (Approve / Reject on approval cards) ─
 import { registerSlackApprovalRoutes, slackRawBodyParser } from './slack-approvals.js';
 import { registerDncLiftDecisionRoutes } from './consent/dnc-lift-decision.js';
+import { registerApDncReentryRoutes } from './consent/dnc-lift-review.js';
 // ─── LP Appointment Sync (GHL → LP) ────────────────────────────
 import { registerLPAppointmentSyncRoutes } from './lp-appointment-sync.js';
 // ─── LP Addlead Validation Proxy (GHL addlead → hour gate → LP) ──
@@ -731,6 +732,9 @@ registerSlackApprovalRoutes(app);
 // 2026-09-28 — Consent Model v1: n8n's OPS.DNC-LIFT posts Slack decisions here.
 // Own fail-closed header secret (DNC_LIFT_WEBHOOK_SECRET), not the MCP token.
 registerDncLiftDecisionRoutes(app);
+// 2026-09-28 — n8n I.AP reports an ActiveProspect lead that matched an existing
+// contact; if that contact is on DNC, a person is asked in #dnc-lift-approval.
+registerApDncReentryRoutes(app);
 
 // ─── LP Appointment Sync (GHL → LP) ──────────────────────────────
 registerLPAppointmentSyncRoutes(app);

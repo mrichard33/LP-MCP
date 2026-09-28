@@ -74,7 +74,7 @@ export function decideReviewEligibility({ tags, recentRequest }) {
  * The payload n8n turns into the Slack card. Pure — everything it needs is
  * passed in, so the card's content is unit-tested.
  */
-export function buildReviewPayload({ requestId, contactId, contact, context = {}, trigger, consentRead, carrier, reenteredAt }) {
+export function buildReviewPayload({ requestId, contactId, contact, context = {}, trigger, consentRead, carrier, reenteredAt, vendor = null }) {
   const tags = contact?.tags || [];
   const name = [contact?.firstName, contact?.lastName].filter(Boolean).join(' ').trim()
     || contact?.contactName || contact?.name || 'Unknown';
@@ -84,10 +84,16 @@ export function buildReviewPayload({ requestId, contactId, contact, context = {}
     ghl_contact_id: contactId,
     contact_name: name,
     phone_last4: phoneLast4(contact?.phone),
-    source: contact?.source || tagSuffix(tags, 'entry:') || null,
-    sub_source: tagSuffix(tags, 'active-entry:') || attribution?.utmSource || context?.source || null,
+    // An ActiveProspect re-entry names the channel and the vendor that just
+    // sent the lead — the contact's own source is from whenever it FIRST
+    // arrived, which is not what the reviewer is deciding on.
+    source: trigger === 'activeprospect' ? 'ActiveProspect' : (contact?.source || tagSuffix(tags, 'entry:') || null),
+    sub_source: trigger === 'activeprospect'
+      ? (vendor || null)
+      : (tagSuffix(tags, 'active-entry:') || attribution?.utmSource || context?.source || null),
     reentered_at: reenteredAt,
     trigger,
+    vendor: vendor || null,
     blocking_tags: blockingTags(tags),
     sms_carrier_stop: carrier.carrierStop,
     carrier_stop_basis: carrier.basis,
@@ -139,6 +145,7 @@ export async function executeRequestDncLiftReview(action, context = {}, deps = {
   const payload = buildReviewPayload({
     requestId, contactId, contact, context, trigger, consentRead, carrier,
     reenteredAt: context?.occurred_at || action.created_at || new Date(now).toISOString(),
+    vendor: action.action_payload?.vendor || null,
   });
 
   const ins = await db.from('dnc_lift_requests').insert({
@@ -179,4 +186,95 @@ export async function executeRequestDncLiftReview(action, context = {}, deps = {
     sms_carrier_stop: carrier.carrierStop,
     blocking_tags: payload.blocking_tags,
   };
+}
+
+// ─── ActiveProspect re-entry → review (2026-09-28) ───────────────────────────
+//
+// POST /webhook/ap/dnc-reentry — called by n8n I.AP (YOozjkCkeNEe4s3a) on its
+// "link" branch: an ActiveProspect lead whose phone matched a contact already
+// in GHL. Before this, that branch only added an intake note, so a DNC lead
+// who came back through a purchased/exclusive-consent source never reached a
+// person — no event, no tag, nothing the rules could see. E.0's `reentry`
+// event only covers first-party consent (DNC_LIFT_ON_REENTRY_E0 owns those).
+//
+// It only ASKS. It queues one request_dnc_lift_review (rule_applied
+// AP_DNC_REENTRY); that handler still re-reads the contact live, skips a
+// contact reviewed in the last 24h, and skips one E0 lifts on its own.
+//
+// "Is this contact blocked?" is answered from our own tables — no GHL call on
+// every purchased lead. When neither can be read, it queues anyway: the cost
+// of asking is one card a person dismisses; the cost of not asking is a lead
+// nobody is told about. The handler's live read drops it if it isn't blocked.
+//
+// Auth: the same fail-closed X-DNC-Lift-Secret as /slack/dnc-lift/decision.
+
+export const AP_DNC_REENTRY_RULE_KEY = 'AP_DNC_REENTRY';
+const GHL_CONTACT_ID_RE = /^[A-Za-z0-9]{10,40}$/;
+
+/** Blocked per our own records? true / false / null (could not tell). Pure. */
+export function isBlockedPerRecords({ consentRead, snapshotTags }) {
+  const c = consentRead?.status === 'ok' ? consentRead.consent : null;
+  if (c && (c.dnc_full === true || c.phone_consent === 'revoked' || c.sms_carrier_stop === true)) return true;
+  if (Array.isArray(snapshotTags) && blockingTags(snapshotTags).length > 0) return true;
+  const consentKnown = consentRead?.status === 'ok';
+  const snapshotKnown = Array.isArray(snapshotTags);
+  return consentKnown || snapshotKnown ? false : null;
+}
+
+export async function handleApDncReentry({ body = {}, headers = {} }, deps = {}) {
+  const env = deps.env || process.env;
+  const db = deps.supabase || supabase;
+  const { checkDncLiftSecret } = await import('./dnc-lift-decision.js');
+  const auth = checkDncLiftSecret(headers, env.DNC_LIFT_WEBHOOK_SECRET);
+  if (!auth.ok) return { status: auth.reason === 'secret_not_configured' ? 503 : 401, json: { ok: false, error: auth.reason } };
+
+  const contactId = typeof body.contactId === 'string' ? body.contactId.trim() : '';
+  if (!GHL_CONTACT_ID_RE.test(contactId)) return { status: 400, json: { ok: false, error: 'contactId is required' } };
+  const vendor = typeof body.vendor === 'string' && body.vendor.trim() ? body.vendor.trim().slice(0, 120) : null;
+  const leadId = body.lead_id != null && String(body.lead_id).trim() ? String(body.lead_id).trim().slice(0, 80) : null;
+
+  const [consentRead, snap] = await Promise.all([
+    (deps.getConsent || getConsent)(contactId, { supabase: db, eventLimit: 1 }),
+    // null = could not read; [] = read fine, contact has no snapshot row.
+    db.from('contact_tag_snapshot').select('tags').eq('ghl_contact_id', contactId).maybeSingle()
+      .then((r) => (r.error ? null : (r.data?.tags || [])), () => null),
+  ]);
+  const blocked = isBlockedPerRecords({ consentRead, snapshotTags: snap });
+  if (blocked === false) return { status: 200, json: { ok: true, skipped: 'not_blocked' } };
+
+  // One queued ask per contact at a time: a vendor that re-sends the same lead
+  // twice in a minute must not produce two cards before the first request row
+  // (the handler's 24h record) exists.
+  const since = new Date((deps.now ? deps.now() : Date.now()) - REVIEW_COOLDOWN_MS).toISOString();
+  const dupe = await db.from('agent_actions').select('id')
+    .eq('action_type', 'request_dnc_lift_review').eq('target_id', contactId)
+    .in('status', ['pending', 'executing']).gte('created_at', since).limit(1);
+  if (!dupe.error && (dupe.data || []).length) {
+    return { status: 200, json: { ok: true, skipped: 'already_queued', action_id: dupe.data[0].id } };
+  }
+
+  const ins = await db.from('agent_actions').insert({
+    action_type: 'request_dnc_lift_review',
+    target_system: 'lp',
+    target_entity: 'contact',
+    target_id: contactId,
+    action_payload: { trigger: 'activeprospect', vendor, lead_id: leadId },
+    rule_applied: AP_DNC_REENTRY_RULE_KEY,
+    reasoning: `ActiveProspect delivered a lead${vendor ? ` from ${vendor}` : ''} for a contact on DNC — asking a person in #dnc-lift-approval`,
+    status: 'pending',
+    requires_approval: false,
+    priority: 20,
+  }).select('id').single();
+  if (ins.error) return { status: 500, json: { ok: false, error: `could not queue the review: ${ins.error.message}` } };
+
+  console.log(`[DncLiftReview] ActiveProspect re-entry for ${contactId}${vendor ? ` (${vendor})` : ''} — review queued (action ${ins.data.id}, blocked=${blocked === null ? 'unknown' : 'yes'})`);
+  return { status: 200, json: { ok: true, queued: true, action_id: ins.data.id, blocked: blocked === null ? 'unknown' : true } };
+}
+
+export function registerApDncReentryRoutes(app) {
+  app.post('/webhook/ap/dnc-reentry', async (req, res) => {
+    const out = await handleApDncReentry({ body: req.body || {}, headers: req.headers || {} })
+      .catch((err) => ({ status: 500, json: { ok: false, error: err.message } }));
+    res.status(out.status).json(out.json);
+  });
 }

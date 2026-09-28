@@ -113,6 +113,9 @@ transaction. `CONSENT_MODEL_MODE` is `shadow`: nothing gates a send on these tab
   approvals out. Do not add a carve-out for it in `resolveRequiresApproval`.
 - `POST /slack/dnc-lift/decision` is idempotent on `request_id` through `dnc_lift_requests`
   (sql/140) and refuses (503) without it.
+- **ActiveProspect re-entries reach review only through `POST /webhook/ap/dnc-reentry`**, which
+  n8n I.AP calls on its "link" branch (the lead's phone matched an existing contact). E.0's
+  `reentry` event covers first-party consent only. The endpoint asks; it never lifts.
 
 ## Alerting
 
