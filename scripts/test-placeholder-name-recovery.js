@@ -320,3 +320,16 @@ test('LP names holding two people keep the first ("Robert Edward/ Barbara")', ()
   assert.deepEqual(pickLpRealName([{ first_name: 'Robert Edward/ Barbara', last_name: 'Staufenberg ' }]),
     { firstName: 'Robert Edward', lastName: 'Staufenberg' });
 });
+
+test('LP name field notes are dropped ("(Spanish?) Ana E", HiGBHMfUZwu79sLX32Mv)', () => {
+  assert.deepEqual(pickLpRealName([{ first_name: '(Spanish?) Ana E', last_name: 'Marin De Ramos' }]),
+    { firstName: 'Ana E', lastName: 'Marin De Ramos' });
+  assert.deepEqual(pickLpRealName([{ first_name: 'Maria [call after 5]', last_name: "O'Neil-Diaz" }]),
+    { firstName: 'Maria', lastName: "O'Neil-Diaz" });
+});
+test('an LP name that is still not a name after cleaning is skipped', () => {
+  assert.equal(pickLpRealName([{ first_name: '???', last_name: 'x' }]), null);
+  assert.equal(pickLpRealName([{ first_name: '(Spanish?)', last_name: '' }]), null);
+  assert.deepEqual(pickLpRealName([{ first_name: 'Linda', last_name: '#2 lead' }]),
+    { firstName: 'Linda', lastName: '' });
+});

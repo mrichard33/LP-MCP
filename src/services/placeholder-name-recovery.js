@@ -197,8 +197,14 @@ export async function recoverPlaceholderName(contactId, contact, { transcript = 
 // ─── LP side (used by the guest-visitor remediation sweep) ────────
 
 // LP sometimes holds two people in one field ("Robert Edward/ Barbara") —
-// keep the first.
-const cleanNamePart = (s) => String(s || '').split('/')[0].replace(/\s+/g, ' ').trim();
+// keep the first. Staff also leave notes in brackets inside the name field
+// ("(Spanish?) Ana E", HiGBHMfUZwu79sLX32Mv, 2026-09-28 dry run) — drop them.
+const cleanNamePart = (s) => String(s || '').split('/')[0]
+  .replace(/\([^)]*\)|\[[^\]]*\]/g, ' ')
+  .replace(/\s+/g, ' ').trim();
+// After cleaning, a name is letters, spaces, apostrophes, hyphens and dots
+// only. Anything else is a note, not a name — skip that LP row.
+const looksLikeLpName = (s) => /^[\p{L}][\p{L}\s'’.-]*$/u.test(s);
 
 /**
  * From this contact's lp_leads rows, the newest name that is NOT a
@@ -212,7 +218,9 @@ export function pickLpRealName(rows = []) {
   for (const r of sorted) {
     const first = cleanNamePart(r?.first_name);
     const last = cleanNamePart(r?.last_name);
-    if (first && !needsNameRecovery(first, last)) return { firstName: first, lastName: last };
+    if (first && looksLikeLpName(first) && !needsNameRecovery(first, last)) {
+      return { firstName: first, lastName: last && looksLikeLpName(last) ? last : '' };
+    }
   }
   return null;
 }
