@@ -58,9 +58,34 @@ export function buildRecoveryCorpus(transcript, messages = []) {
 
 const escapeRe = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
+// A name "as written": the exact casing, not glued to other letters. \b is
+// not Unicode-aware in JS, so "Díaz" / "Émile" need explicit \p{L} guards.
+const writtenAs = (n) => new RegExp(`(?<![\\p{L}])${escapeRe(n)}(?![\\p{L}])`, 'u');
+
+/**
+ * 2026-09-28 (first live dry run) — a word only counts as a name if the
+ * customer WROTE it like one: the exact name-cased word appears in their own
+ * text, or it follows "my name is" in any casing. The dry run over the 25
+ * phone-bearing placeholder contacts promoted three non-names, all of which
+ * this rejects:
+ *   "ANSWER QUESTIONS"                  — an all-caps menu reply (59eU0qiZ0BwhV1BZGFfm)
+ *   "I'm pilipina speack tagalog only"  — lowercase words after "I'm";
+ *                                         her name, Lory, came later in Tagalog
+ *   "this is Jason TINA's husband"      — "Jason" stays; the possessive is no surname
+ * A real name typed all-lowercase ("hi this is joe") is rejected too. That is
+ * deliberate: the contact is flagged for a person instead of getting a guess.
+ */
+function writtenLikeAName(name, inbound) {
+  const n = String(name || '').trim();
+  if (!n || !/\p{Lu}/u.test(n.charAt(0)) || !/\p{Ll}/u.test(n)) return false;
+  const stated = new RegExp(`\\bmy name is\\s+${escapeRe(n)}(?![\\p{L}])`, 'iu');
+  return inbound.some((t) => writtenAs(n).test(t.text) || stated.test(t.text));
+}
+
 /**
  * Guard against the model handing back a name the customer never gave.
- *   1. The first name must appear, as a word, in the customer's own text.
+ *   1. The first name must appear in the customer's own text, written like a
+ *      name (writtenLikeAName above).
  *   2. It must not be an agent introducing itself — "Hi, I'm Sarah an
  *      appointment specialist", "Audrey here regarding Reece Windows". Checked
  *      on outbound messages and on any inbound text that mentions Reece (bot
@@ -69,14 +94,25 @@ const escapeRe = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 export function isTrustworthyName(firstName, turns = []) {
   const f = String(firstName || '').trim();
   if (!f || needsNameRecovery(f, '')) return false;
-  const word = new RegExp(`\\b${escapeRe(f)}\\b`, 'i');
   const inbound = turns.filter((t) => t.direction !== 'outbound');
-  if (!inbound.some((t) => word.test(t.text))) return false;
+  if (!writtenLikeAName(f, inbound)) return false;
 
   const selfIntro = new RegExp(
     `\\b(?:i(?:'|’)?m|i am|this is|my name is)\\s+${escapeRe(f)}\\b|\\b${escapeRe(f)}\\s+here\\b`, 'i');
   const agentish = turns.filter((t) => t.direction === 'outbound' || /reece/i.test(t.text));
   return !agentish.some((t) => selfIntro.test(t.text));
+}
+
+/**
+ * The surname to keep, or '' — a possessive ("TINA's husband") is not a
+ * surname, and a surname must be written like a name too. Dropping it keeps
+ * the (trusted) first name rather than failing the whole recovery.
+ */
+export function trustworthyLastName(lastName, turns = []) {
+  const l = String(lastName || '').trim();
+  if (!l || /['’]s$/i.test(l)) return '';
+  const inbound = turns.filter((t) => t.direction !== 'outbound');
+  return writtenLikeAName(l, inbound) ? l : '';
 }
 
 async function defaultFetchMessages(contactId) {
@@ -140,9 +176,10 @@ export async function recoverPlaceholderName(contactId, contact, { transcript = 
   // for the payload builder: it only overwrites a name it recognises as a
   // placeholder, and it does not recognise a bare "guest".
   const src = identity._source || {};
+  const lastName = trustworthyLastName(identity.last_name, turns) || null;
   const { payload } = buildPromotionPayload(
     { ...contact, firstName: null, lastName: null },
-    { ...identity, _source: { ...src, first_name: 'extracted', last_name: identity.last_name ? 'extracted' : src.last_name } },
+    { ...identity, last_name: lastName, _source: { ...src, first_name: 'extracted', last_name: lastName ? 'extracted' : src.last_name } },
   );
   if (!payload.firstName) return { found: false, reason: 'no promotable name' };
 
@@ -159,7 +196,9 @@ export async function recoverPlaceholderName(contactId, contact, { transcript = 
 
 // ─── LP side (used by the guest-visitor remediation sweep) ────────
 
-const cleanNamePart = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+// LP sometimes holds two people in one field ("Robert Edward/ Barbara") —
+// keep the first.
+const cleanNamePart = (s) => String(s || '').split('/')[0].replace(/\s+/g, ' ').trim();
 
 /**
  * From this contact's lp_leads rows, the newest name that is NOT a
