@@ -1,8 +1,9 @@
 /**
  * Canvassing Lead Handler — src/canvassing-lead-handler.js
  *
- * POST /webhooks/canvassing-lead — called by the GHL workflow "I.CV
- * Canvassing Intake v2" (standard Webhook action) immediately after
+ * POST /webhooks/canvassing-lead — called by the GHL workflow "U.CEF
+ * Canvassing Entry Form V2" (standard Webhook action; the header named it
+ * "I.CV Canvassing Intake v2" until 2026-09-28) immediately after
  * contact creation + tagging. Replaces the ten fragile steps of the
  * legacy I.CC intake: the "Subtract 5 Hours" ChatGPT step (hardcoded UTC
  * offset — broke every DST change), six text/datetime formatters, a
@@ -845,6 +846,20 @@ export async function processCanvassingLead(payload, deps = {}) {
  * Register POST /webhooks/canvassing-lead. Respond-then-process: GHL gets
  * its answer after validation + idempotency pre-check only.
  */
+export const MARK_PRECHECK_TIMEOUT_MS = 3000;
+
+/** Resolve to `fallback` if `promise` has not settled within `ms`. Never rejects on timeout. */
+export function withTimeout(promise, ms, fallback) {
+  let t;
+  return Promise.race([
+    promise.finally(() => clearTimeout(t)),
+    new Promise((resolve) => { t = setTimeout(() => {
+      console.warn(`[Canvassing] mark pre-check exceeded ${ms}ms — treating as no mark (fail-open)`);
+      resolve(fallback);
+    }, ms); }),
+  ]);
+}
+
 export function registerCanvassingLeadRoutes(app) {
   app.post('/webhooks/canvassing-lead', async (req, res) => {
     // Optional shared-secret guard (idiom: /webhook/lp). Open when unset.
@@ -869,7 +884,14 @@ export function registerCanvassingLeadRoutes(app) {
     }
 
     const payload = validation.normalized;
-    const existing = await findRecentCanvassMark(payload.ghl_contact_id);
+    // Capped (2026-09-28). GHL's Webhook action gives up after 60s and never
+    // retries — four canvass leads were lost that way on 2026-09-24 (the
+    // request never reached us; see src/canvass-lead-backstop.js). This read
+    // is the only I/O before the 202, and the Supabase client has no timeout
+    // of its own, so a slow database would reproduce the same silent loss. A
+    // timeout reads as "no mark" — the handler's fail-open doctrine — and
+    // claimCanvassMark still closes the double-post race before addLead.
+    const existing = await withTimeout(findRecentCanvassMark(payload.ghl_contact_id), MARK_PRECHECK_TIMEOUT_MS, null);
     if (existing) {
       console.log(`[Canvassing] duplicate POST for ${payload.ghl_contact_id} (mark ${existing.status} @ ${existing.created_at}) — skipping`);
       return res.status(200).json({ accepted: false, duplicate: true });

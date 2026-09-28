@@ -283,6 +283,18 @@ export const JOBS = Object.freeze([
     isEnabled: (env) => String(env.CHAT_LP_INTAKE_MODE || 'shadow').toLowerCase().trim() !== 'off',
   },
   {
+    id: 'canvass-lead-backstop',
+    label: 'Canvass leads GHL never delivered',
+    group: 'five9',
+    cadence: 'every 15 min',
+    enabledEnv: 'CANVASS_BACKSTOP_MODE',
+    // A MODE (2026-09-28): off | shadow | live, default shadow. Shadow reads and
+    // decides every pass and logs who it would send, so a silent shadow pass is
+    // a defect too. Mirrors backstopMode() in src/canvass-lead-backstop.js.
+    enabledDefault: true,
+    isEnabled: (env) => String(env.CANVASS_BACKSTOP_MODE || 'shadow').toLowerCase().trim() !== 'off',
+  },
+  {
     id: 'payroll-engine',
     label: 'Payroll engine (LightFire + call center)',
     group: 'payroll',
