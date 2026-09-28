@@ -49,7 +49,7 @@ import { runSQL } from '../admin/supabase-admin.js';
 import { getConfig, nextRetryAt } from './config.js';
 import { createSftpAdapter, createManualAdapter, createListingCache, describeRecording, matchRecordingToCall, storeAudio, sha256Hex, ensureLinkToken, linkableRecording, transcodeAndStoreMp3 } from './recordings.js';
 import { dateDirFor, last4, last10 } from './time.js';
-import { transcribeCall, createOpenAITranscriber, createStorageAudioLoader } from './transcribe.js';
+import { transcribeCall, selectTranscriber, createStorageAudioLoader } from './transcribe.js';
 import { analyzeTranscript } from './analyze.js';
 import { blockingReviewFlags, deferredReviewReason } from './analysis-schema.js';
 import { matchCall, loadCanvasserPhones, reviewReasonFor } from './match.js';
@@ -492,7 +492,7 @@ export async function stageTranscribe(call, { db = supabase, cfg = getConfig(), 
   }
 
   const row = await transcribeCall(call, recordings, {
-    transcriber: transcriber || createOpenAITranscriber(),
+    transcriber: transcriber || selectTranscriber(cfg),
     loadAudio: loadAudio || createStorageAudioLoader({ db }),
     cfg,
   });
