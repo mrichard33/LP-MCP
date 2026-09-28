@@ -114,6 +114,14 @@ transaction. `CONSENT_MODEL_MODE` is `shadow`: nothing gates a send on these tab
 - `POST /slack/dnc-lift/decision` is idempotent on `request_id` through `dnc_lift_requests`
   (sql/140) and refuses (503) without it.
 
+**GHL webhooks do not retry, and a lost one leaves no trace here (2026-09-28).** Four canvass leads
+never reached LP on 2026-09-24: GHL's step logged "Response timed out … 60 seconds", yet Railway's
+edge, `intake_journal` and our logs have no record of the calls. A GHL→LP-MCP intake therefore needs a
+sweep that looks from the GHL side (the HL mirror) for contacts that should have arrived and did not.
+Precedents: `src/jobs/canvass-lead-backstop.js` (re-drives through the webhook's own pipeline) and
+`src/jobs/chat-lead-intake-sweep.js`. Keep any I/O before a webhook's response capped — the
+`findRecentCanvassMark` pre-check is held to 3s for that reason.
+
 ## Alerting
 
 Alert modules are **pure and dependency-free** so they unit-test without importing supabase, GroupMe
