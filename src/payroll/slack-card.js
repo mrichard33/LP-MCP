@@ -15,6 +15,7 @@ const LABELS = [
   ['needs_review', 'Needs review'],
   ['disputed', 'Disputed'],
   ['excluded', 'Excluded'],
+  ['info', 'Info only (not payable)'],
 ];
 
 function mdy(ymd) {

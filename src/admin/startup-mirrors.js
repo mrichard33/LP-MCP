@@ -2310,7 +2310,7 @@ export const STARTUP_MIRRORS = [
               lead_created_date date,
               rule_id uuid REFERENCES pay_rules(id),
               amount_cents integer NOT NULL DEFAULT 0,
-              status text NOT NULL CHECK (status IN ('pending','needs_review','disputed','excluded','approved','paid')),
+              status text NOT NULL CHECK (status IN ('pending','needs_review','disputed','excluded','info','approved','paid')),
               flag_reason text,
               source_report text NOT NULL DEFAULT '134 Jobs by Milestone Date',
               created_at timestamptz NOT NULL DEFAULT now(),
@@ -2377,6 +2377,47 @@ export const STARTUP_MIRRORS = [
     ],
     ready: '[Migration] inbound_capture_daily + v_inbound_capture_summary (sql/133) ready',
     fail: '[Migration] inbound_capture_daily (sql/133) skipped — apply it from the dashboard; inbound caller capture stores and creates nothing until it exists:',
+    level: 'warn',
+  },
+
+  // Payroll dispute tickets (sql/134, 2026-09-27 — the file is the source of
+  // truth). Mirrors the new table and its indexes only. The file's ALTER of the
+  // payroll_ledger status CHECK (adds 'info') and its pay_rules UPDATE are
+  // applied from the dashboard; a fresh database gets 'info' from the sql/132
+  // block above, which already carries the widened CHECK.
+  {
+    name: 'sql/134',
+    expects: {
+      tables: ['payroll_disputes'],
+      indexes: ['payroll_disputes_partner_status_idx', 'payroll_disputes_one_open_per_line_idx'],
+    },
+    sql: [
+      `CREATE TABLE IF NOT EXISTS payroll_disputes (
+              id bigserial PRIMARY KEY,
+              partner_id uuid NOT NULL REFERENCES lf_partners(id),
+              ledger_id uuid REFERENCES payroll_ledger(id),
+              lp_lead_id text NOT NULL,
+              event_type text NOT NULL,
+              event_date date,
+              claimed_amount_cents integer,
+              reason text NOT NULL,
+              status text NOT NULL DEFAULT 'open' CHECK (status IN ('open','approved','denied')),
+              filed_by_email text NOT NULL,
+              filed_at timestamptz NOT NULL DEFAULT now(),
+              decided_by text,
+              decided_at timestamptz,
+              decision_note text,
+              approved_amount_cents integer,
+              applied_run_id uuid REFERENCES payroll_runs(id),
+              created_at timestamptz NOT NULL DEFAULT now()
+            );`,
+      `CREATE INDEX IF NOT EXISTS payroll_disputes_partner_status_idx ON payroll_disputes (partner_id, status);`,
+      `CREATE UNIQUE INDEX IF NOT EXISTS payroll_disputes_one_open_per_line_idx
+              ON payroll_disputes (ledger_id) WHERE status = 'open' AND ledger_id IS NOT NULL;`,
+      `ALTER TABLE payroll_disputes ENABLE ROW LEVEL SECURITY;`,
+    ],
+    ready: '[Migration] payroll_disputes (sql/134) ready',
+    fail: '[Migration] payroll_disputes (sql/134) skipped — apply sql/134 from the dashboard; dispute tickets cannot be filed until it exists:',
     level: 'warn',
   },
 ];

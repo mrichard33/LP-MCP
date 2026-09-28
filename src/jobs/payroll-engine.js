@@ -47,6 +47,7 @@ import {
   previousWeekET, describeMissingLeads, PAYEE_LIGHTFIRE,
 } from '../payroll/rules.js';
 import { buildPayrollCardText, buildPayrollCardBlocks } from '../payroll/slack-card.js';
+import { disputeAdjustmentLines } from '../payroll/disputes.js';
 import { postToSlack } from '../slack.js';
 import { runJob } from '../job-runner.js';
 import { hourET } from './lp-report-common.js';
@@ -172,10 +173,19 @@ export async function runPayrollEngine({ period = null, confirm = false, mode = 
     } else {
       const runRow = confirm ? (await store.ensureRun({ payeeType: 'partner', partnerId: partner.id, period: p, mode: writeMode })).run : null;
       const lf = await computeLightFire({ store, partner, rules, excluded, period: p, runId: runRow?.id || null, env });
-      let lines = lf.lines;
+      // Approved dispute tickets not yet in any run (2026-09-27) ride in this
+      // run as `dispute_adjustment` lines — but only into a run that is still
+      // pending: a re-run of a week already approved or paid must not grow.
+      // A read failure here is not a quiet week: it throws like any other read.
+      const adjustments = (!runRow || runRow.status === 'pending')
+        ? disputeAdjustmentLines(await store.listUnappliedApprovedDisputes(partner.id))
+        : [];
+      const toWrite = [...lf.lines, ...adjustments.map(({ dispute_id, ...l }) => l)];
+      let lines = toWrite;
       let inserted = [];
       if (confirm) {
-        inserted = await store.insertLines(runRow.id, lf.lines);
+        inserted = await store.insertLines(runRow.id, toWrite);
+        for (const a of adjustments) await store.updateDispute(a.dispute_id, 'approved', { applied_run_id: runRow.id });
         lines = await store.getLines(runRow.id);
         const summaryNow = summarizeLines(lines);
         if (runRow.status === 'pending') await store.setRunTotal(runRow.id, summaryNow.payableCents);
@@ -207,7 +217,7 @@ export async function runPayrollEngine({ period = null, confirm = false, mode = 
       }
       results.push({
         payee: PAYEE_LIGHTFIRE, run_id: runRow?.id || null, run_status: runRow?.status || null,
-        events: lf.events, lines_inserted: inserted.length, summary, unmatched_134: lf.unmatched,
+        events: lf.events, adjustments: adjustments.length, lines_inserted: inserted.length, summary, unmatched_134: lf.unmatched,
         coverage_134: lf.coverage, text, posted: posted ? { ok: !!posted.ok, ts: posted.ts || null, error: posted.error || null } : null,
       });
     }

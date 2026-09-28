@@ -10,7 +10,7 @@
 import { summarizeLines } from './rules.js';
 
 const RESOLVABLE_TO = Object.freeze(['pending', 'disputed', 'excluded']);
-const OPEN_LINE = Object.freeze(['pending', 'needs_review', 'disputed', 'excluded']);
+const OPEN_LINE = Object.freeze(['pending', 'needs_review', 'disputed', 'excluded', 'info']);
 
 async function refreshTotal(store, runId) {
   const lines = await store.getLines(runId);
