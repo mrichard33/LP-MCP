@@ -662,6 +662,29 @@ export async function getLeadByLdsId(ldsId, opts = {}) {
 }
 
 /**
+ * GetLead by CUSTOMER (cst_id) — the customer and every lead LP still has on it.
+ *
+ * 2026-09-27: the fast, reliable counterpart to getLeadByLdsId. A lead LP has
+ * deleted makes the lds_id form time out (500 "Execution Timeout Expired")
+ * instead of returning empty; the customer form answers in about a second and
+ * shows which leads remain. Keep the full 2000→today range: a narrowed range
+ * was seen returning an unrelated customer. See src/lp-lead-presence.js.
+ */
+export async function getProspectByCstId(cstId, opts = {}) {
+  return withCircuit(() => lpPost('/api/Customers/GetLead', {
+    startdate:   '2000-01-01',
+    enddate:     new Date().toISOString().slice(0, 10),
+    cst_id:      String(cstId),
+    lds_id:      '0',
+    ils_id:      '0',
+    PageSize:    '1',
+    StartIndex:  '1',
+    options:     '0',
+    SortOrder:   '0',
+  }, 3, opts));
+}
+
+/**
  * POST /api/Downloads/GetLeadsByCQDID — the dialer feed for one call queue.
  *
  * Returns the leads in queue `cqdId` that are available to be dialed, one

@@ -2420,4 +2420,22 @@ export const STARTUP_MIRRORS = [
     fail: '[Migration] payroll_disputes (sql/134) skipped — apply sql/134 from the dashboard; dispute tickets cannot be filed until it exists:',
     level: 'warn',
   },
+
+  // lp_leads.lp_deleted_at (sql/135, 2026-09-27 — the file is the source of
+  // truth). One nullable column, no default: metadata-only. The capacity sweep
+  // stamps it when LP returns a lead's customer without the lead, and the board
+  // counts and near-window refresh read `lp_deleted_at IS NULL` — so the column
+  // must exist before the sweep's first pass, which is why it is mirrored.
+  {
+    name: 'sql/135',
+    expects: {
+      columns: [
+        ['lp_leads', 'lp_deleted_at'],
+      ],
+    },
+    sql: 'ALTER TABLE lp_leads ADD COLUMN IF NOT EXISTS lp_deleted_at timestamptz;',
+    ready: '[Migration] lp_leads.lp_deleted_at (sql/135) ready',
+    fail: '[Migration] lp_leads.lp_deleted_at (sql/135) FAILED — the capacity board and near-window refresh query this column and will error until sql/135 is applied from the dashboard:',
+    level: 'error',
+  },
 ];
