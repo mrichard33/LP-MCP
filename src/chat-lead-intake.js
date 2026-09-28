@@ -14,8 +14,8 @@
  *   pushes them through the same canonical path force_lp_lead_creation uses.
  *
  * WHO (rulings, 2026-09-28)
- *   Every chat lead with a phone — booked or not — once it is an hour old
- *   (the chatbot's own booking path gets the first hour), sent without waiting
+ *   Every chat lead with a phone — booked or not — once it is MIN_AGE_HOURS old
+ *   (3h by default; the primary chat path and the booking path go first), sent without waiting
  *   for an address (the LP address backfill fills it in later). A contact
  *   carrying an opt-out / delete / suppress tag (EXCLUDE_TAGS) is never sent.
  */
@@ -33,7 +33,25 @@ export const CHAT_TAGS = Object.freeze([
   'chatbot', 'chat-widget', 'live-chat',
 ]);
 
-export const MIN_AGE_HOURS = 1;
+// 2026-09-28 — 3 hours by default (was 1). The primary chat path (GHL I.CT →
+// rule 386 → create_lp_lead) sends at ~65 minutes, and lp_leads syncs ~15
+// minutes behind LP. At 3 hours, anything the primary path sent is already in
+// lp_leads, so the phone check below sees it. This sweep is the SAFETY NET for
+// what the primary path missed — it must never race it.
+export const MIN_AGE_HOURS = (() => {
+  const n = Number(process.env.CHAT_LP_INTAKE_MIN_AGE_HOURS);
+  return Number.isFinite(n) && n >= 1 ? n : 3;
+})();
+
+// Tags that mean another path already sent this contact to LP (or linked it).
+export const SENT_ELSEWHERE_TAGS = Object.freeze([
+  'lp-pushed-by-agentic', 'lp-existing-lead-reused', 'lp-linked', 'lp-lead-issued', 'lp-inbound',
+]);
+
+export function hasSentElsewhereTag(tags) {
+  const set = new Set(SENT_ELSEWHERE_TAGS);
+  return (Array.isArray(tags) ? tags : []).some((t) => set.has(String(t).trim().toLowerCase()));
+}
 // 30 days, the same window the never-reached-LP monitor reports on, so the
 // sweep can clear anything that monitor would count. Measured 2026-09-28: 11
 // eligible chat contacts in 30 days — MAX_PER_PASS is never the limit.
@@ -88,10 +106,11 @@ export function buildChatCandidatesSql({ sinceIso, untilIso }) {
  * JS keeps the rules in one testable place and guards against a drifted read.
  *   lpPhones  Set of phone10 with an lp_leads row (already in LP, just unstamped)
  *   marked    Set of contact ids that already carry a chat-intake mark
+ *   sentElsewhere  Set of contact ids with a create_lp_lead agent action
  * Returns { send, skipped } — `send` oldest first, capped at `max`.
  */
-export function selectChatLeads(candidates, { lpPhones, marked, nowMs, max = MAX_PER_PASS }) {
-  const skipped = { not_chat: 0, too_new: 0, too_old: 0, no_phone: 0, excluded: 0, in_lp: 0, already_sent: 0, over_cap: 0 };
+export function selectChatLeads(candidates, { lpPhones, marked, sentElsewhere, nowMs, max = MAX_PER_PASS }) {
+  const skipped = { not_chat: 0, too_new: 0, too_old: 0, no_phone: 0, excluded: 0, in_lp: 0, already_sent: 0, sent_elsewhere: 0, over_cap: 0 };
   const send = [];
   const seenPhones = new Set();
   for (const c of candidates || []) {
@@ -104,6 +123,8 @@ export function selectChatLeads(candidates, { lpPhones, marked, nowMs, max = MAX
     if (!Number.isFinite(addedMs) || addedMs > nowMs - MIN_AGE_HOURS * 3600_000) { skipped.too_new += 1; continue; }
     if (addedMs < nowMs - LOOKBACK_DAYS * 86_400_000) { skipped.too_old += 1; continue; }
     if (marked?.has(id)) { skipped.already_sent += 1; continue; }
+    // Another path (rule 147 / rule 386 / I.LP-OUT) already sent or linked it.
+    if (sentElsewhere?.has(id) || hasSentElsewhereTag(c.tags)) { skipped.sent_elsewhere += 1; continue; }
     // Same phone twice in one pass (a duplicate contact) → push one.
     if (lpPhones?.has(phone10) || seenPhones.has(phone10)) { skipped.in_lp += 1; continue; }
     if (send.length >= max) { skipped.over_cap += 1; continue; }

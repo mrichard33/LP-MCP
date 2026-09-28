@@ -20,7 +20,7 @@ import assert from 'node:assert/strict';
 
 import {
   isChatContact, selectChatLeads, buildChatCandidatesSql, chatIntakeMode,
-  formatChatIntakeCard, markKey, MAX_PER_PASS,
+  formatChatIntakeCard, markKey, MAX_PER_PASS, MIN_AGE_HOURS, hasSentElsewhereTag,
 } from '../src/chat-lead-intake.js';
 import { runChatLeadIntakeSweep } from '../src/jobs/chat-lead-intake-sweep.js';
 import { buildIntakeCandidatesSql, hasExcludedTag } from '../src/lead-intake-gap.js';
@@ -31,7 +31,7 @@ const hoursAgo = (h) => new Date(NOW - h * 3_600_000).toISOString();
 const contact = (id, over = {}) => ({
   ghl_contact_id: id, first_name: 'Pat', last_name: 'Lee',
   phone: `(239) 555-${String(1000 + Number(String(id).replace(/\D/g, '') || 0)).slice(-4)}`,
-  source: 'Reece ChatBot', tags: ['entry:chatbot'], date_added: hoursAgo(3), ...over,
+  source: 'Reece ChatBot', tags: ['entry:chatbot'], date_added: hoursAgo(4), ...over,
 });
 
 test('chat contact is recognised by source or tag', () => {
@@ -109,7 +109,7 @@ test('mode defaults to shadow; junk falls back to shadow', () => {
 
 // --- the pass --------------------------------------------------------------
 
-function stubDeps({ candidates = [contact('c1'), contact('c2')], lpPhones = [], marked = [], enrollFails = [], hlFails = false, marksFail = false } = {}) {
+function stubDeps({ candidates = [contact('c1'), contact('c2')], lpPhones = [], marked = [], agentic = [], enrollFails = [], hlFails = false, marksFail = false } = {}) {
   const calls = { enroll: [], marks: [], sends: [] };
   const supabase = {
     from(table) {
@@ -128,7 +128,9 @@ function stubDeps({ candidates = [contact('c1'), contact('c2')], lpPhones = [], 
     calls,
     deps: {
       hlRunSQL: async () => { if (hlFails) throw new Error('hl down'); return candidates; },
-      runSQL: async () => lpPhones.map((p) => ({ phone10: p })),
+      runSQL: async (sql) => (/agent_actions/.test(sql)
+        ? agentic.map((id) => ({ target_id: id }))
+        : lpPhones.map((p) => ({ phone10: p }))),
       supabase,
       enroll: async ({ contactId, notify }) => {
         assert.equal(notify, false, 'the sweep posts its own card');
@@ -208,4 +210,41 @@ test('card names people by first name + initial, never a full surname', () => {
   const text = formatChatIntakeCard({ mode: 'live', sent: [{ ghl_contact_id: 'x1', first_name: 'Pat', last_name: 'Lee' }], failed: [] });
   assert.match(text, /Pat L\. · x1/);
   assert.doesNotMatch(text, /Lee/);
+});
+
+// --- 2026-09-28 safety-net behaviour -----------------------------------------
+
+test('min age defaults to 3 hours', () => {
+  assert.equal(MIN_AGE_HOURS, 3);
+});
+
+test('selection: under 3 hours waits for the primary chat path', () => {
+  const { send, skipped } = selectChatLeads(
+    [contact('young', { date_added: hoursAgo(2) }), contact('old', { date_added: hoursAgo(4) })],
+    { lpPhones: new Set(), marked: new Set(), nowMs: NOW });
+  assert.deepEqual(send.map((r) => r.ghl_contact_id), ['old']);
+  assert.equal(skipped.too_new, 1);
+});
+
+test('selection: a contact another path sent is skipped (tag or agent action)', () => {
+  const rows = [
+    contact('t1', { tags: ['entry:chatbot', 'lp-pushed-by-agentic'] }),
+    contact('t2', { tags: ['entry:chatbot', 'LP-Existing-Lead-Reused'] }),
+    contact('a1'),
+    contact('ok'),
+  ];
+  const { send, skipped } = selectChatLeads(rows, {
+    lpPhones: new Set(), marked: new Set(), sentElsewhere: new Set(['a1']), nowMs: NOW,
+  });
+  assert.deepEqual(send.map((r) => r.ghl_contact_id), ['ok']);
+  assert.equal(skipped.sent_elsewhere, 3);
+  assert.equal(hasSentElsewhereTag(['lp-linked']), true);
+  assert.equal(hasSentElsewhereTag(['entry:chatbot']), false);
+});
+
+test('live: a contact with a create_lp_lead action is not enrolled again', async () => {
+  const { deps, calls } = stubDeps({ agentic: ['c1'] });
+  const r = await runChatLeadIntakeSweep({ env: { CHAT_LP_INTAKE_MODE: 'live' }, nowMs: NOW, deps });
+  assert.deepEqual(calls.enroll, ['c2']);
+  assert.equal(r.skipped.sent_elsewhere, 1);
 });

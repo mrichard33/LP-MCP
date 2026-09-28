@@ -2,7 +2,7 @@
  * Chat lead intake sweep — src/jobs/chat-lead-intake-sweep.js
  *
  * Every 15 minutes, all hours: chat leads (GHL contacts from the chatbot or
- * chat widget) that are at least an hour old and still have no LP id are sent
+ * chat widget) that are at least MIN_AGE_HOURS old (3h default) and still have no LP id are sent
  * to LP through enrollLpLeadCreation — the same canonical path
  * force_lp_lead_creation uses (workflow 8e30ff37 → addlead → inbound-id
  * writeback → LP callback fills the lead id). Selection rules and the WHY live
@@ -74,6 +74,26 @@ async function readLpPhones(runSQL, phones) {
   return out;
 }
 
+/**
+ * Contact ids that already have a create_lp_lead action (queued, running or
+ * done) — i.e. the primary chat path or the booking path already sent them.
+ * Throws on a bad read so the pass fails CLOSED and sends nobody.
+ */
+async function readAgenticSent(runSQL, ids) {
+  const out = new Set();
+  for (let i = 0; i < ids.length; i += LEAD_CHUNK) {
+    const rows = asRows(await runSQL(`
+      SELECT DISTINCT target_id
+        FROM agent_actions
+       WHERE action_type = 'create_lp_lead'
+         AND status IN ('pending','pending_approval','approved','executing','completed')
+         AND target_id IN (${sqlList(ids.slice(i, i + LEAD_CHUNK))})
+    `), 'agentic sent check');
+    for (const r of rows) if (r.target_id) out.add(String(r.target_id));
+  }
+  return out;
+}
+
 /** Contact ids that already carry a chat-intake mark (any age). */
 async function readMarked(db, ids) {
   const out = new Set();
@@ -105,11 +125,12 @@ export async function runChatLeadIntakeSweep({ env = process.env, nowMs = Date.n
     out.candidates = candidates.length;
     const phones = [...new Set(candidates.map((c) => normalizePhone10(c.phone)).filter(Boolean))];
     const ids = [...new Set(candidates.map((c) => String(c.ghl_contact_id)))];
-    const [lpPhones, marked] = await Promise.all([
+    const [lpPhones, marked, sentElsewhere] = await Promise.all([
       phones.length ? readLpPhones(d.runSQL, phones) : new Set(),
       ids.length ? readMarked(d.supabase, ids) : new Set(),
+      ids.length ? readAgenticSent(d.runSQL, ids) : new Set(),
     ]);
-    picked = selectChatLeads(candidates, { lpPhones, marked, nowMs, max: MAX_PER_PASS });
+    picked = selectChatLeads(candidates, { lpPhones, marked, sentElsewhere, nowMs, max: MAX_PER_PASS });
   } catch (err) {
     errors.push(`read: ${err.message}`);
     return finish();
