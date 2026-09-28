@@ -75,6 +75,7 @@ import { runJob } from '../job-runner.js';
 import { hourET, todayET } from './lp-report-common.js';
 import {
   normalizePhone10, wasCalled, needsDncCheck, isRetiredCode, holdDateUnknown,
+  isNotCovered, isNewlyRetiredCode, zip5,
   classifyUncalledLead, finalizeReason, buildRates, estimateValue,
   summarize, formatSlackSummary, LEAK_REASONS,
 } from '../lead-leak-classify.js';
@@ -89,6 +90,7 @@ import {
   alertConfig, alertMode, shouldAlertSpeed, shouldAlertUncalled, shouldAlertIntakeGap,
   verdictToActive, formatSpeedAlert, formatSpeedRecovered, formatUncalledAlert,
   formatUncalledRecovered, formatIntakeGapAlert, formatIntakeGapRecovered, shiftDay,
+  shouldAlertRetiredCode, formatRetiredCodeAlert, formatRetiredCodeRecovered,
 } from '../lead-speed-alerts.js';
 
 export const JOB_ID = 'lead-leak-monitor';
@@ -216,7 +218,7 @@ export async function readFive9History({ runSQL, windowDays, nowMs }) {
 async function readUniverse({ runSQL, sinceMs }) {
   return asRows(await runSQL(`
     SELECT lp_lead_id, lp_prospect_id, first_name, last_name, phone, lead_source, disposition_code,
-           call_count, appointment_set, closed_won, created_at_lp, updated_at_lp
+           call_count, appointment_set, closed_won, created_at_lp, updated_at_lp, zip
       FROM lp_leads
      WHERE created_at_lp >= '${new Date(sinceMs).toISOString()}'
      ORDER BY created_at_lp DESC
@@ -406,7 +408,25 @@ export async function measureLeadLeak({ env = process.env, nowMs = Date.now(), d
 
   // Classify. `uncalled` is newest first, so the capped Five9 lookups spend
   // themselves on the leads a caller could still act on.
-  const ctx = { nowMs, five9Dnc, dupCalledPhones };
+  // NOC out-of-area guard: one lookup for the uncalled NOC leads' zips against
+  // service_area_zips (the check_service_area table). A failed read leaves the
+  // set null, and NOC stays a priced leak — never "out of area" by default.
+  let serviceAreaZips = null;
+  const nocZips = [...new Set(uncalled.filter(isNotCovered).map((l) => zip5(l.zip)).filter(Boolean))];
+  if (nocZips.length) {
+    try {
+      const inArea = asRows(await runSQL(
+        `SELECT zip FROM service_area_zips WHERE zip IN (${sqlList(nocZips)})`,
+      ), 'service area');
+      serviceAreaZips = new Set(inArea.map((r) => String(r.zip)));
+    } catch (err) {
+      errors.push(`service area: ${err.message} (NOC kept as leaks)`);
+    }
+  } else {
+    serviceAreaZips = new Set();
+  }
+
+  const ctx = { nowMs, five9Dnc, dupCalledPhones, serviceAreaZips };
   let lookups = 0;
   let lookupErrors = 0;
   let consecutiveErrors = 0;
@@ -504,6 +524,11 @@ export async function measureLeadLeak({ env = process.env, nowMs = Date.now(), d
   // Over the whole window, called or not: a retired code in use is a hygiene
   // problem wherever it appears.
   const retiredCodeInUse = leads.filter(isRetiredCode).length;
+  // A retired code put on a lead in the last day — somebody still picking it.
+  const retiredFresh = leads.filter((l) => isNewlyRetiredCode(l, nowMs)).map((l) => ({
+    lp_lead_id: String(l.lp_lead_id), first_name: l.first_name ?? null, last_name: l.last_name ?? null,
+    disposition_code: l.disposition_code,
+  }));
   const summary = summarize(rows, { retiredCodeInUse });
   return {
     verdict: summary.real_leaks > 0 ? 'leaks_found' : 'no_leaks',
@@ -521,6 +546,7 @@ export async function measureLeadLeak({ env = process.env, nowMs = Date.now(), d
     speed,
     intake,
     offenders,
+    retiredFresh,
     errors,
   };
 }
@@ -555,6 +581,61 @@ async function deliverAlert({ mode, report, key, label, verdict, text, recovered
     return { action: active === true ? 'shadow_would_fire' : 'shadow_quiet' };
   }
   return report({ key, active, label, channel: 'ops', remindMs, text, recoveredText, detail });
+}
+
+/* --- 90-day cleanup (2026-09-28) -------------------------------------- */
+// The three lead-leak tables grow every morning (~1,100 + ~80 rows a day, and
+// a rewrite of 60 speed rows). Rows past LEAD_LEAK_RETENTION_DAYS are removed
+// AFTER the morning pass has stored its own rows — never before, so a pass
+// that dies half-way can never be followed by a cleanup that ate yesterday.
+// LEAD_LEAK_CLEANUP_MODE: off | dry_run (count only — the code default, so the
+// first run on any box proves the number before anything is deleted) | live.
+export const RETENTION_TABLES = Object.freeze([
+  { table: TABLE, column: 'run_date' },
+  { table: INTAKE_TABLE, column: 'run_date' },
+  { table: SPEED_TABLE, column: 'created_day' },
+]);
+
+export function cleanupConfig(env = process.env) {
+  const raw = String(env.LEAD_LEAK_CLEANUP_MODE ?? '').trim().toLowerCase();
+  return {
+    mode: ['off', 'dry_run', 'live'].includes(raw) ? raw : 'dry_run',
+    retentionDays: positiveInt(env.LEAD_LEAK_RETENTION_DAYS, 90),
+  };
+}
+
+/**
+ * Remove (or, in dry_run, count) rows older than the retention window.
+ * Never throws: a table that fails is reported and the rest still run.
+ * Uses the supabase client, not runSQL — the run_sql RPC wraps WITH/SELECT in
+ * a subquery, so a counted DELETE cannot go through it (src/lp-link-write-sql.js).
+ * @returns {{ mode, cutoff, removed, byTable, errors }}  removed = rows deleted
+ *   (live) or that WOULD be deleted (dry_run); null if any table failed.
+ */
+export async function cleanupOldRows({ db = defaultSupabase, runDate, env = process.env }) {
+  const { mode, retentionDays } = cleanupConfig(env);
+  const cutoff = shiftDay(runDate, -retentionDays);
+  const out = { mode, cutoff, retentionDays, removed: 0, byTable: {}, errors: [] };
+  if (mode === 'off') return { ...out, removed: null };
+  for (const { table, column } of RETENTION_TABLES) {
+    try {
+      const q = mode === 'live'
+        ? db.from(table).delete({ count: 'exact' }).lt(column, cutoff)
+        : db.from(table).select(column, { count: 'exact', head: true }).lt(column, cutoff);
+      const { error, count } = await q;
+      if (error) throw new Error(error.message);
+      out.byTable[table] = count ?? 0;
+      out.removed += count ?? 0;
+    } catch (err) {
+      out.byTable[table] = null;
+      out.errors.push(`cleanup ${table}: ${err.message}`);
+    }
+  }
+  if (out.errors.length) out.removed = null;
+  console.log(`[LeadLeak] cleanup ${mode} — older than ${cutoff}: `
+    + Object.entries(out.byTable).map(([t, n]) => `${t}=${n ?? '?'}`).join(' ')
+    + (out.errors.length ? ` errors=${out.errors.join('; ')}` : ''));
+  return out;
 }
 
 /** One scheduled daily pass. Returns the runJob verdict shape. */
@@ -596,6 +677,10 @@ export async function runLeadLeakMonitor({ env = process.env, nowMs = Date.now()
     }
   }
 
+  // Cleanup runs only now, after this morning's rows are stored.
+  const cleanup = await cleanupOldRows({ db, runDate: m.runDate, env });
+  errors.push(...cleanup.errors);
+
   // Alarms: time to first call getting worse, and GHL leads that never
   // reached LP. The waiting-leads alarm is the hourly pass's job.
   const speedDecision = m.speed.decision;
@@ -615,11 +700,20 @@ export async function runLeadLeakMonitor({ env = process.env, nowMs = Date.now()
     detail: `missing=${intakeDecision.count}`,
   });
 
+  const retiredDecision = shouldAlertRetiredCode(m.retiredFresh);
+  await deliverAlert({
+    mode: aMode, report, key: 'lead_retired_code', label: 'Retired disposition code used',
+    verdict: retiredDecision.verdict, remindMs: REMIND_INTAKE_MS,
+    text: () => formatRetiredCodeAlert(m.retiredFresh, { cfg: acfg, dashboardUrl: cfg.dashboardUrl }),
+    recoveredText: formatRetiredCodeRecovered,
+    detail: `fresh=${retiredDecision.count}`,
+  });
+
   let posted = false;
   if (cfg.mode === 'live') {
     const text = formatSlackSummary({
       runDate: m.runDate, windowDays: m.windowDays, summary: m.summary, revenueAvailable: m.revenueAvailable,
-      speed: m.speed, intake: m.intake?.summary ?? null, dashboardUrl: cfg.dashboardUrl,
+      speed: m.speed, intake: m.intake?.summary ?? null, dashboardUrl: cfg.dashboardUrl, cleanup,
     });
     const res = await send(text, cfg.slackChannel);
     posted = !!res?.ok;
@@ -635,11 +729,14 @@ export async function runLeadLeakMonitor({ env = process.env, nowMs = Date.now()
     + ` not_issued=${b.not_issued_call_center.leads} not_covered=${b.not_covered_by_rep.leads} hold=${b.rep_hold.leads}/${b.rep_hold_expired.leads}expired`
     + ` uncalled=${m.summary.uncalled}/${m.universe} stored=${stored}`
     + ` median_first_call_7d=${m.speed.last7.median_min ?? '?'}m speed=${speedDecision.verdict}`
-    + ` never_reached_lp=${m.intake ? m.intake.summary.not_in_lp : '?'}`;
+    + ` never_reached_lp=${m.intake ? m.intake.summary.not_in_lp : '?'}`
+    + ` noc_out_of_area=${b.noc_out_of_area?.leads ?? 0} retired_fresh=${m.retiredFresh.length}`
+    + ` cleanup_${cleanup.mode}=${cleanup.removed ?? '?'}`;
   console.log(`[LeadLeak] ${cfg.mode} ${m.verdict} — ${line}${posted ? ' posted' : ''}`);
 
   // Only a failed WRITE or a failed live POST is this job failing. The
-  // lookup, close-rate and intake notes are degradations it already labelled.
+  // lookup, close-rate, intake and cleanup notes are degradations it already
+  // labelled — a failed cleanup must never fail (or re-run) the monitor.
   const hardFailure = errors.some((e) => / write: /.test(e) || e.startsWith('slack:'));
   return {
     ok: !hardFailure,

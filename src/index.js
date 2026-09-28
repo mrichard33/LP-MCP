@@ -313,6 +313,7 @@ import { startOfficePowerRankingScheduler } from './jobs/office-power-ranking.js
 import { startSaleBackstopScheduler } from './jobs/sale-announce-backstop.js';  // 2026-09-25
 import { startMissedCallerRecoveryScheduler } from './jobs/missed-caller-recovery.js';  // 2026-09-24
 import { registerLeadLeakRoutes, startLeadLeakScheduler, startLeadUncalledScheduler } from './jobs/lead-leak-monitor.js';  // 2026-09-26
+import { startChatLeadIntakeScheduler } from './jobs/chat-lead-intake-sweep.js';  // 2026-09-28
 import { registerInboundCaptureRoutes, startInboundCaptureScheduler } from './jobs/inbound-caller-capture.js';  // 2026-09-27
 import { startPayrollEngineScheduler } from './jobs/payroll-engine.js';  // 2026-09-26
 import { registerCiRoutes } from './ci/routes.js';
@@ -940,6 +941,7 @@ const server = app.listen(PORT, async () => {
   startMissedCallerRecoveryScheduler();
   startLeadLeakScheduler();
   startLeadUncalledScheduler();
+  startChatLeadIntakeScheduler();
   startInboundCaptureScheduler();
   startPayrollEngineScheduler();
   // Probe ffmpeg, which transcodes Five9's GSM 6.10 recordings to a format a

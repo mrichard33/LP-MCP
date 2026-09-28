@@ -24,6 +24,16 @@
  * is a coincidence, and trusting it marked unrelated leads as called. INQ
  * events still count, through their phone.
  *
+ * Re-measured 2026-09-28 over 30 days (08-29 → 09-27), counting a match only
+ * when the phone on both sides agrees:
+ *   LDS → lp_leads.lp_lead_id       15,549 events, 7,561 hit a lead,  7,468 agree (98.8%)
+ *   INQ → lp_lead_id / prospect id  125,923 events,                       0 agree
+ *   INQ → GHL "LP inbound id"       125,923 events, 26,392 hit a contact, 25,962 agree (98.4%)
+ * So INQ is not noise: it is LP's INBOUND id (in1_id, GHL field
+ * 3YMxheIlPyhACB8zyc3W). It stays out of the key anyway — no LP table here
+ * carries in1_id, so joining it means a hop through the HL mirror, and the
+ * phone fallback already credits those calls (their phone agrees 98.4%).
+ *
  * FIRST MATCH WINS, in the order of REASONS below. The order is the ruling in
  * the handoff, not a style choice: a DNC lead that is also "Data" must read
  * `dnc`, because the DNC is the reason it must not be dialled whatever else is
@@ -51,6 +61,16 @@ export const NOT_ISSUED_DISPOSITIONS = Object.freeze(['NIS']);
 // dead list, which was wrong). Checked first for the same reason as NIS: all 49
 // NOC leads in the 2026-09-26 window carry appointment_set = true.
 export const NOT_COVERED_DISPOSITIONS = Object.freeze(['NOC']);
+
+// NOC OUT-OF-AREA GUARD (2026-09-28). "Not Covered" only means lost business
+// when the home is somewhere a rep COULD have gone. Sampled NOC zips (33511,
+// 31525, 33935) are all in the service area, but 3 of 52 NOC leads in the last
+// 60 days were not — a zip outside service_area_zips (the table the
+// check_service_area tool reads), or none at all. Those are bad data, not lost
+// sales: they get their own line, `noc_out_of_area`, at $0, so they show up for
+// review instead of inflating the dollars. If the zip lookup itself fails, a NOC
+// lead stays a priced leak — "could not tell" is never "out of area".
+export const NOC_OUT_OF_AREA_REASON = 'noc_out_of_area';
 
 // NoRehash = the rep ran the demo and asked for a hold to work the lead
 // themselves. Nobody reaches out during the hold. Also checked before the
@@ -94,6 +114,7 @@ export const DEAD_DISPOSITIONS = Object.freeze([
 export const REASONS = Object.freeze([
   'not_issued_call_center',
   'not_covered_by_rep',
+  'noc_out_of_area',
   'rep_hold_expired',
   'rep_hold',
   'already_progressed',
@@ -183,6 +204,21 @@ export function wasCalled(lead, ctx) {
 export const isRetiredCode = (lead) => RETIRED.has(dispo(lead));
 
 /**
+ * A retired code put on a lead RECENTLY — LP's last-changed time (Eastern,
+ * corrected) inside the last `windowMs`. Historical NIS2 rows stay readable
+ * and keep counting in retired_code_in_use; only a fresh one is somebody still
+ * picking the code, which is the data-quality alarm (2026-09-28). LP exposes no
+ * disposition-change date, so "last changed" is the best available: an older
+ * NIS2 lead edited for another reason would also fire, which errs toward
+ * asking, never toward silence.
+ */
+export function isNewlyRetiredCode(lead, nowMs, windowMs = DAY_MS) {
+  if (!isRetiredCode(lead)) return false;
+  const changed = lpLocalToUtcMs(lead?.updated_at_lp);
+  return changed !== null && changed >= nowMs - windowMs && changed <= nowMs + 60 * 60 * 1000;
+}
+
+/**
  * When the NoRehash hold started, in ms, or null. LP exposes no
  * disposition-change date (checked 2026-09-26: no column, no history table),
  * so this is updated_at_lp — LP's `lastchangedon`. That is "last changed", so a
@@ -200,14 +236,36 @@ export function holdDateUnknown(lead) {
   return REP_HOLD.has(dispo(lead)) && holdStartedMs(lead) === null;
 }
 
+/** The first five digits of a US zip, or null ("33914-1234" → "33914"). */
+export function zip5(raw) {
+  const d = String(raw ?? '').replace(/\D/g, '');
+  return d.length >= 5 ? d.slice(0, 5) : null;
+}
+
+/**
+ * NOC split (see NOC_OUT_OF_AREA_REASON). `serviceAreaZips` is a Set of in-area
+ * zip5s, or null/undefined when the lookup could not be made — then the lead
+ * stays a priced `not_covered_by_rep`. A missing or malformed zip is bad data
+ * whatever the lookup says.
+ */
+export function nocReason(lead, serviceAreaZips) {
+  const z = zip5(lead?.zip);
+  if (!z) return NOC_OUT_OF_AREA_REASON;
+  if (serviceAreaZips instanceof Set && !serviceAreaZips.has(z)) return NOC_OUT_OF_AREA_REASON;
+  return 'not_covered_by_rep';
+}
+
+/** Does this lead carry the NOC code? (The job batches a zip lookup for these.) */
+export const isNotCovered = (lead) => NOT_COVERED.has(dispo(lead));
+
 /**
  * The reasons decided by the lead's own codes and flags alone, before any
  * phone, DNC or source check: not issued, not covered, rep hold, progressed
  * by code, progressed by flag. Null when none applies.
  */
-function codeFirstReason(lead, nowMs) {
+function codeFirstReason(lead, nowMs, ctx = {}) {
   if (NOT_ISSUED.has(dispo(lead))) return 'not_issued_call_center';
-  if (NOT_COVERED.has(dispo(lead))) return 'not_covered_by_rep';
+  if (NOT_COVERED.has(dispo(lead))) return nocReason(lead, ctx.serviceAreaZips);
   if (REP_HOLD.has(dispo(lead))) {
     const started = holdStartedMs(lead);
     if (started === null) return 'rep_hold';
@@ -239,11 +297,12 @@ export function needsDncCheck(lead, nowMs = Date.now()) {
  *
  * ctx:
  *   nowMs            the clock for the rep-hold age (default now)
+ *   serviceAreaZips  Set of in-area zip5s for the NOC guard, or null (unknown)
  *   five9Dnc         Set of normalized phones on the Five9 DNC list
  *   dupCalledPhones  Set of normalized phones another, CALLED lp_leads row shares
  */
 export function classifyUncalledLead(lead, ctx = {}) {
-  const early = codeFirstReason(lead, ctx.nowMs ?? Date.now());
+  const early = codeFirstReason(lead, ctx.nowMs ?? Date.now(), ctx);
   if (early) return early;
 
   const phone = normalizePhone10(lead?.phone);
@@ -359,6 +418,7 @@ const num = (n) => Number(n || 0).toLocaleString('en-US');
  */
 export function formatSlackSummary({
   runDate, windowDays, summary, revenueAvailable = true, speed = null, intake = null, dashboardUrl = null,
+  cleanup = null,
 }) {
   const b = summary.by_reason;
   const n = (reason) => num(b[reason]?.leads);
@@ -377,7 +437,8 @@ export function formatSlackSummary({
       + (intake.not_in_lp_but_called ? ` (+${num(intake.not_in_lp_but_called)} not in LP but Five9 reached them)` : '')] : []),
     '',
     `• Not issued to a rep (call center, NIS): ${n('not_issued_call_center')}`,
-    `• Set, but no rep covered it (NOC): ${n('not_covered_by_rep')}`,
+    `• Not Covered (no rep): ${n('not_covered_by_rep')}`,
+    ...(b.noc_out_of_area?.leads ? [`• NOC — out of area (review): ${n('noc_out_of_area')} ($0 — zip outside the service area or missing)`] : []),
     `• Rep hold over, back in play (NoRehash > ${REP_HOLD_DAYS} days): ${n('rep_hold_expired')}`,
     `• Never dialled, Five9 has the number: ${n('routing_or_automation_failure')}`,
     `• Not in Five9 at all: ${n('not_in_five9')}`,
@@ -400,6 +461,9 @@ export function formatSlackSummary({
     `• Counted only because LP's appointment/won flag is on (code says otherwise): ${n('already_progressed_flag')}`,
     `• "Data" leads awaiting a ruling: ${n('data_undecided')}`,
     `• Retired codes still in use (${RETIRED_DISPOSITIONS.join(', ')}): ${num(summary.retired_code_in_use)}`,
+    ...(cleanup && cleanup.mode !== 'off' ? [cleanup.removed === null
+      ? '🧹 Cleanup: could not finish — see the server log'
+      : `🧹 Cleanup: ${cleanup.mode === 'live' ? 'removed' : 'would remove (dry run)'} ${num(cleanup.removed)} rows older than ${cleanup.retentionDays ?? 90} days`] : []),
     dashboardUrl ? `Details: ${dashboardUrl}` : 'Details: Dashboard → Lead Leaks (or GET /api/lp/lead-leak)',
   );
   return lines.join('\n');

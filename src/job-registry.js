@@ -271,6 +271,18 @@ export const JOBS = Object.freeze([
     isEnabled: (env) => String(env.LEAD_LEAK_ALERT_MODE || 'shadow').toLowerCase().trim() !== 'off',
   },
   {
+    id: 'chat-lead-intake',
+    label: 'Chat leads sent to LP',
+    group: 'five9',
+    cadence: 'every 15 min',
+    enabledEnv: 'CHAT_LP_INTAKE_MODE',
+    // A MODE (2026-09-28): off | shadow | live, default shadow. Shadow reads and
+    // decides every pass and logs who it would send, so a silent shadow pass is
+    // a defect too. Mirrors chatIntakeMode() in src/chat-lead-intake.js.
+    enabledDefault: true,
+    isEnabled: (env) => String(env.CHAT_LP_INTAKE_MODE || 'shadow').toLowerCase().trim() !== 'off',
+  },
+  {
     id: 'payroll-engine',
     label: 'Payroll engine (LightFire + call center)',
     group: 'payroll',

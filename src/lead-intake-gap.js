@@ -29,11 +29,40 @@
  * the HL mirror, the LP check runs against LP, and the classes meet here.
  */
 
+const esc = (s) => String(s).replace(/'/g, "''");
+
 // GHL custom fields that carry the LP link. Either one set means the push landed.
 export const LP_ID_FIELDS = Object.freeze([
   'GmAVmW6V9sekD7pVONKr', // LP lead id
   '3YMxheIlPyhACB8zyc3W', // LP inbound id (in1_id) — set by addlead before LP makes the lead
 ]);
+
+// Tags that mean "do not call this person / this is not a lead" (2026-09-28).
+// A contact carrying one is neither pushed to LP by the chat intake sweep nor
+// counted as a missed lead here: a DNC or deleted contact that never reached
+// the dialer is the system working, not a leak. Built from the consent/DNC
+// families the repo already honours (reply-sla-watchdog, objection-state ghost
+// sweep, suppress-automation backfill). `stop-bot` is deliberately NOT here —
+// it is the rep-takeover flag, not an opt-out (CLAUDE.md, "Only an opt-out
+// silences the bot"). Compared case-insensitively.
+export const EXCLUDE_TAGS = Object.freeze([
+  'dnc', 'dnc-related', 'dnc-sms', 'do-not-contact', 'stage:dnc', 'lp-dnc',
+  'unsubscribed', 'optedout',
+  'suppress-outbound', 'contact:delete', 'no-contact-method', 'hard-disqualified',
+  'p3:not-interested-now',
+]);
+
+/** Does this tag list carry any exclusion tag? */
+export function hasExcludedTag(tags) {
+  const set = new Set(EXCLUDE_TAGS);
+  return (Array.isArray(tags) ? tags : []).some((t) => set.has(String(t).trim().toLowerCase()));
+}
+
+/** SQL predicate: the contact's tags hold none of EXCLUDE_TAGS (case-insensitive). */
+export function excludeTagsSql(column = 'c.tags') {
+  const list = EXCLUDE_TAGS.map((t) => `'${esc(t)}'`).join(',');
+  return `NOT EXISTS (SELECT 1 FROM unnest(coalesce(${column}, '{}'::text[])) AS t(tag) WHERE lower(t.tag) IN (${list}))`;
+}
 
 // How old a contact must be before a missing LP id is a gap. Addlead is async
 // and LP turns the inbound row into a lead on its own schedule.
@@ -41,7 +70,6 @@ export const INTAKE_GRACE_HOURS = 24;
 
 export const INTAKE_CLASSES = Object.freeze(['not_in_lp', 'not_in_lp_but_called', 'in_lp_unlinked']);
 
-const esc = (s) => String(s).replace(/'/g, "''");
 
 /**
  * The HL mirror read: contacts added between `sinceIso` and `untilIso`, not
@@ -57,6 +85,7 @@ export function buildIntakeCandidatesSql({ sinceIso, untilIso }) {
        AND c.date_added >= '${esc(sinceIso)}'
        AND c.date_added <  '${esc(untilIso)}'
        AND length(regexp_replace(coalesce(c.phone, ''), '[^0-9]', '', 'g')) >= 10
+       AND ${excludeTagsSql('c.tags')}
        AND NOT EXISTS (
          SELECT 1
            FROM jsonb_array_elements(CASE WHEN jsonb_typeof(c.custom_fields::jsonb) = 'array'

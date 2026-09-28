@@ -22,7 +22,7 @@ import assert from 'node:assert/strict';
 import {
   normalizePhone10, leadKey, wasCalled, classifyUncalledLead, finalizeReason,
   buildRates, estimateValue, summarize, formatSlackSummary, REASONS, LEAK_REASONS,
-  REP_HOLD_DAYS, holdDateUnknown, needsDncCheck,
+  REP_HOLD_DAYS, holdDateUnknown, needsDncCheck, isNewlyRetiredCode,
 } from '../src/lead-leak-classify.js';
 import {
   measureLeadLeak, runLeadLeakMonitor, leadLeakMode, leadLeakConfig,
@@ -153,12 +153,13 @@ test('NoRehash with appointment_set = true → rep_hold / rep_hold_expired, not 
   assert.equal(needsDncCheck(over, NOW), false, 'decided by its code — no DNC lookup spent on it');
 });
 
-test('NOC → not_covered_by_rep, a priced leak — even with appointment_set = true', () => {
-  assert.equal(classifyUncalledLead(lead({ disposition_code: 'NOC' }), { nowMs: NOW }), 'not_covered_by_rep');
+test('NOC in the service area → not_covered_by_rep, a priced leak — even with appointment_set = true', () => {
+  const inArea = { nowMs: NOW, serviceAreaZips: new Set(['33914']) };
+  assert.equal(classifyUncalledLead(lead({ disposition_code: 'NOC', zip: '33914' }), inArea), 'not_covered_by_rep');
   assert.equal(
-    classifyUncalledLead(lead({ disposition_code: 'NOC', appointment_set: true }), { nowMs: NOW }),
+    classifyUncalledLead(lead({ disposition_code: 'NOC', zip: '33914-1234', appointment_set: true }), inArea),
     'not_covered_by_rep',
-    'the current code wins over the flag (49 of 49 live NOC leads carry it)',
+    'the current code wins over the flag (49 of 49 live NOC leads carry it); ZIP+4 reads as its zip5',
   );
   assert.ok(LEAK_REASONS.includes('not_covered_by_rep'));
   const rates = buildRates([{ source: 'Google PPC', leads: 100, won: 10, avg_value: 12000 }]);
@@ -166,7 +167,39 @@ test('NOC → not_covered_by_rep, a priced leak — even with appointment_set = 
   const s = summarize([{ reason: 'not_covered_by_rep', lead_source: 'A', est_value: 1200 }]);
   assert.equal(s.real_leaks, 1);
   const text = formatSlackSummary({ runDate: '2026-09-26', windowDays: 60, summary: s });
-  assert.match(text, /Set, but no rep covered it \(NOC\): 1/);
+  assert.match(text, /Not Covered \(no rep\): 1/);
+  assert.ok(!/NOC — out of area/.test(text), 'no review line when there is nothing to review');
+});
+
+test('NOC outside the service area, or with no zip → noc_out_of_area: $0, not a leak, its own line', () => {
+  const inArea = { nowMs: NOW, serviceAreaZips: new Set(['33914']) };
+  assert.equal(classifyUncalledLead(lead({ disposition_code: 'NOC', zip: '90210' }), inArea), 'noc_out_of_area');
+  assert.equal(classifyUncalledLead(lead({ disposition_code: 'NOC', zip: '' }), inArea), 'noc_out_of_area');
+  assert.equal(classifyUncalledLead(lead({ disposition_code: 'NOC', zip: '339' }), inArea), 'noc_out_of_area');
+  assert.ok(!LEAK_REASONS.includes('noc_out_of_area'));
+  const rates = buildRates([{ source: 'Google PPC', leads: 100, won: 10, avg_value: 12000 }]);
+  assert.equal(estimateValue(lead(), 'noc_out_of_area', rates), null);
+  const s = summarize([
+    { reason: 'not_covered_by_rep', lead_source: 'A', est_value: 1200 },
+    { reason: 'noc_out_of_area', lead_source: 'A', est_value: null },
+  ]);
+  assert.equal(s.real_leaks, 1);
+  const text = formatSlackSummary({ runDate: '2026-09-28', windowDays: 60, summary: s });
+  assert.match(text, /NOC — out of area \(review\): 1 \(\$0/);
+});
+
+test('NOC when the service-area lookup failed → stays a priced leak (could not tell ≠ out of area)', () => {
+  assert.equal(classifyUncalledLead(lead({ disposition_code: 'NOC', zip: '90210' }), { nowMs: NOW, serviceAreaZips: null }),
+    'not_covered_by_rep');
+});
+
+test('a NIS2 put on a lead in the last day is "new"; an old NIS2 is not', () => {
+  const now = Date.parse('2026-09-28T16:00:00Z'); // 12:00 ET
+  // LP digits are Eastern: 10:00 "UTC" = 10:00 ET = 14:00Z, two hours ago.
+  assert.equal(isNewlyRetiredCode(lead({ disposition_code: 'NIS2', updated_at_lp: '2026-09-28T10:00:00+00:00' }), now), true);
+  assert.equal(isNewlyRetiredCode(lead({ disposition_code: 'NIS2', updated_at_lp: '2026-09-22T10:45:22+00:00' }), now), false);
+  assert.equal(isNewlyRetiredCode(lead({ disposition_code: 'NIS2', updated_at_lp: null }), now), false);
+  assert.equal(isNewlyRetiredCode(lead({ disposition_code: 'NOC', updated_at_lp: '2026-09-28T10:00:00+00:00' }), now), false);
 });
 
 test('NIS2 → dead_status and counted as a retired code in use', () => {
