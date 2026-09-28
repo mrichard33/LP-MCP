@@ -64,7 +64,8 @@ export function alertMode(env = process.env) {
 // ─── Plain-English reasons, for cards and the daily post ─────────────────────
 export const REASON_LABELS = Object.freeze({
   not_issued_call_center: 'Not issued to a rep (call center, NIS)',
-  not_covered_by_rep: 'Set, but no rep covered it (NOC)',
+  not_covered_by_rep: 'Not Covered (no rep)',
+  noc_out_of_area: 'NOC — out of area (review)',
   rep_hold_expired: 'Rep hold over, back in play',
   routing_or_automation_failure: 'Never dialled — Five9 has the number',
   not_in_five9: 'Never dialled — not in Five9 at all',
@@ -245,5 +246,31 @@ export function formatIntakeGapAlert(missing, { cfg = ALERT_DEFAULTS, dashboardU
 }
 
 export const formatIntakeGapRecovered = () => '✅ Every GHL lead from the window has reached LP (or been called).';
+
+/**
+ * Retired disposition codes put on a lead since the last check (NIS2,
+ * 2026-09-28). A data-quality alarm, not a leak bucket: the lead is still
+ * classified normally; this names who used the dead code so it gets re-coded.
+ * `fresh` items: { lp_lead_id, first_name, last_name, disposition_code }.
+ */
+export function shouldAlertRetiredCode(fresh, { readOk = true } = {}) {
+  if (!readOk || !Array.isArray(fresh)) return { verdict: 'insufficient_evidence', count: null };
+  return { verdict: fresh.length ? 'alert' : 'healthy', count: fresh.length };
+}
+
+export function formatRetiredCodeAlert(fresh, { cfg = ALERT_DEFAULTS, dashboardUrl } = {}) {
+  const lines = fresh.slice(0, cfg.maxNamed).map((l) => `• ${displayName(l.first_name, l.last_name)}`
+    + ` · coded ${l.disposition_code} · LP ${l.lp_lead_id}`);
+  if (fresh.length > cfg.maxNamed) lines.push(`…and ${fresh.length - cfg.maxNamed} more`);
+  return [
+    `🏷️ *Retired code used on ${fresh.length} lead${fresh.length === 1 ? '' : 's'} in the last day*`,
+    'NIS2 is retired and should not be used. Please re-code these in LP:',
+    ...lines,
+    '',
+    linkLine(dashboardUrl),
+  ].join('\n');
+}
+
+export const formatRetiredCodeRecovered = () => '✅ No retired codes used in the last day.';
 
 export { LEAK_REASONS };

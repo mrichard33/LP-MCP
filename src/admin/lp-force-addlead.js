@@ -329,7 +329,7 @@ async function writeMark(key, contactId) {
  * @returns {Promise<Object>} { success, action, contact_id, workflow_id }
  * @throws if contactId missing or the GHL enrollment call fails.
  */
-export async function enrollLpLeadCreation({ contactId, calendarName = null, force = false }) {
+export async function enrollLpLeadCreation({ contactId, calendarName = null, force = false, notify = true }) {
   if (!contactId) throw new Error('enrollLpLeadCreation: contactId required');
   if (!GHL_API_KEY) throw new Error('GHL_API_KEY not configured');
 
@@ -369,7 +369,11 @@ export async function enrollLpLeadCreation({ contactId, calendarName = null, for
 
   await writeMark(dedupKey, contactId);
 
-  await sendGroupMeMessage(
+  // notify:false (2026-09-28) — the chat-lead intake sweep enrolls several
+  // contacts per pass and posts ONE ops summary of its own; a per-contact card
+  // in the main channel for each would bury it. Every other caller keeps the
+  // card exactly as before.
+  if (notify) await sendGroupMeMessage(
     `🛠️ LP Lead Creation Triggered\n` +
     `👤 contact: ${contactId}${calendarName ? ` | ${calendarName}` : ''}\n` +
     (gateFields?.set_srs || gateFields?.set_pro

@@ -345,6 +345,16 @@ compare finds ZERO rows for every rep on the floor and fails silently — a metr
 rather than an error. Use `repNameKey()` in `src/notifications/sale-facts.js` to compare, and
 `formatRepFirstName()` in `src/response-generator.js` when a customer will read the name.
 
+**Five9 → LP lead: the key is `'LDS' || lp_lead_id`, phone is the fallback (measured 2026-09-28).**
+Five9 events carry `lp_rec_key` as `LDS<n>` or `INQ<n>`. Over 30 days, counting a match only when the
+phone on both sides agrees: LDS → `lp_leads.lp_lead_id` agreed on 7,468 of 7,561 (98.8%). INQ →
+`lp_lead_id` or `lp_prospect_id` agreed 0 times — but INQ is not noise, it is LP's INBOUND id
+(`in1_id`, GHL field `3YMxheIlPyhACB8zyc3W`): INQ → that field agreed on 25,962 of 26,392 (98.4%).
+No LP table carries `in1_id`, so INQ would need a hop through the HL mirror; the phone fallback
+already credits those calls. Never join INQ to a lead or prospect id — the ranges overlap
+numerically, so it "matches" and marks unrelated leads as called. See `leadKey` in
+`src/lead-leak-classify.js`.
+
 ## Tests and CI
 
 `npm test` is `node --test scripts/test-*.js`. New suites go in `scripts/` under that name pattern.

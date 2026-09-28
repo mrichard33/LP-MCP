@@ -32,7 +32,9 @@ import {
   formatSpeedAlert, formatUncalledAlert, formatIntakeGapAlert, displayName, phoneTail, formatWait, shiftDay,
   ALERT_DEFAULTS,
 } from '../src/lead-speed-alerts.js';
-import { runLeadLeakMonitor, runLeadUncalledCheck, measureLeadLeak } from '../src/jobs/lead-leak-monitor.js';
+import {
+  runLeadLeakMonitor, runLeadUncalledCheck, measureLeadLeak, cleanupOldRows, cleanupConfig,
+} from '../src/jobs/lead-leak-monitor.js';
 
 const iso = (ms) => new Date(ms).toISOString();
 
@@ -218,8 +220,14 @@ const lpLead = (over = {}) => ({
   created_at_lp: lpTs(3), updated_at_lp: lpTs(3), ...over,
 });
 
-function stubSQL({ leads = [], five9Fails = false, callPhones = [], lpPhonesForIntake = [] } = {}) {
+function stubSQL({
+  leads = [], five9Fails = false, callPhones = [], lpPhonesForIntake = [], inAreaZips = [], serviceAreaFails = false,
+} = {}) {
   return async (sql) => {
+    if (sql.includes('service_area_zips')) {
+      if (serviceAreaFails) throw new Error('service_area_zips unreadable');
+      return inAreaZips.map((zip) => ({ zip }));
+    }
     if (sql.includes('min(received_at)')) {
       if (five9Fails) throw new Error('statement timeout');
       return [{ first_at: '2026-07-28T20:28:17Z' }];
@@ -235,12 +243,32 @@ function stubSQL({ leads = [], five9Fails = false, callPhones = [], lpPhonesForI
   };
 }
 
-function stubDb() {
+// Upserts are recorded per table; `old` seeds rows the cleanup can see, as
+// { table: [{ run_date | created_day }] }. delete/select(head) honour .lt().
+function stubDb({ old = {}, failTable = null } = {}) {
   const byTable = {};
+  const deleted = {};
+  const seeded = Object.fromEntries(Object.entries(old).map(([t, rows]) => [t, [...rows]]));
+  const lt = (table, op) => ({
+    lt: async (col, cutoff) => {
+      if (table === failTable) return { error: { message: 'boom' }, count: null };
+      const rows = seeded[table] || [];
+      const hit = rows.filter((r) => String(r[col]) < cutoff);
+      if (op === 'delete') {
+        seeded[table] = rows.filter((r) => !(String(r[col]) < cutoff));
+        deleted[table] = (deleted[table] || 0) + hit.length;
+      }
+      return { error: null, count: hit.length };
+    },
+  });
   return {
     byTable,
+    deleted,
+    seeded,
     from: (table) => ({
       upsert: async (batch) => { (byTable[table] ||= []).push(...batch); return { error: null, count: batch.length }; },
+      delete: () => lt(table, 'delete'),
+      select: () => lt(table, 'select'),
     }),
   };
 }
@@ -366,4 +394,104 @@ test('a lead keyed in during a live call counts as worked, and stays out of the 
     ? [{ keys: [], phones: [['3524453161', old]] }] : runSQL(sql));
   const m2 = await measureLeadLeak({ env: {}, nowMs: NOW, deps: baseDeps({ runSQL: runOld }), opts: { windowDays: 2, intake: false, lookups: false } });
   assert.equal(m2.called, 0);
+});
+
+/* --- close-out fixes (2026-09-28) ------------------------------------- */
+
+const OLD = {
+  lead_leak_daily: [{ run_date: '2026-06-01' }, { run_date: '2026-06-29' }, { run_date: '2026-09-27' }],
+  lead_intake_gap_daily: [{ run_date: '2026-06-01' }, { run_date: '2026-09-27' }],
+  lead_call_speed_daily: [{ created_day: '2026-06-15' }, { created_day: '2026-08-01' }],
+};
+
+test('cleanup: dry run counts rows older than 90 days and deletes nothing', async () => {
+  const db = stubDb({ old: OLD });
+  const c = await cleanupOldRows({ db, runDate: '2026-09-28', env: {} });
+  assert.equal(c.mode, 'dry_run', 'the code default is a dry run');
+  assert.equal(c.cutoff, '2026-06-30');
+  assert.deepEqual(c.byTable, { lead_leak_daily: 2, lead_intake_gap_daily: 1, lead_call_speed_daily: 1 });
+  assert.equal(c.removed, 4);
+  assert.deepEqual(db.deleted, {});
+});
+
+test('cleanup: live deletes exactly those rows; off does nothing; a failing table is reported, not thrown', async () => {
+  const db = stubDb({ old: OLD });
+  const c = await cleanupOldRows({ db, runDate: '2026-09-28', env: { LEAD_LEAK_CLEANUP_MODE: 'live' } });
+  assert.equal(c.removed, 4);
+  assert.deepEqual(db.deleted, { lead_leak_daily: 2, lead_intake_gap_daily: 1, lead_call_speed_daily: 1 });
+  assert.equal(db.seeded.lead_leak_daily.length, 1, 'yesterday survives');
+
+  const off = await cleanupOldRows({ db: stubDb({ old: OLD }), runDate: '2026-09-28', env: { LEAD_LEAK_CLEANUP_MODE: 'off' } });
+  assert.equal(off.removed, null);
+
+  const bad = await cleanupOldRows({ db: stubDb({ old: OLD, failTable: 'lead_intake_gap_daily' }),
+    runDate: '2026-09-28', env: { LEAD_LEAK_CLEANUP_MODE: 'live' } });
+  assert.equal(bad.removed, null);
+  assert.match(bad.errors[0], /cleanup lead_intake_gap_daily: boom/);
+  assert.equal(bad.byTable.lead_leak_daily, 2, 'the other tables still ran');
+  assert.equal(cleanupConfig({ LEAD_LEAK_RETENTION_DAYS: '30' }).retentionDays, 30);
+});
+
+test('daily pass runs the cleanup AFTER storing, reports its count, and a cleanup failure never fails the pass', async () => {
+  const order = [];
+  const db = stubDb({ old: OLD });
+  const wrapped = {
+    ...db,
+    from: (table) => {
+      const t = db.from(table);
+      return {
+        upsert: async (b) => { order.push(`store:${table}`); return t.upsert(b); },
+        delete: () => ({ lt: async (c, v) => { order.push(`delete:${table}`); return t.delete().lt(c, v); } }),
+        select: () => ({ lt: async (c, v) => { order.push(`count:${table}`); return t.select().lt(c, v); } }),
+      };
+    },
+  };
+  const sent = [];
+  const deps = baseDeps({ supabase: wrapped, postToSlack: async (text) => { sent.push(text); return { ok: true }; } });
+  const r = await runLeadLeakMonitor({ env: { LEAD_LEAK_MONITOR_MODE: 'live', LEAD_LEAK_CLEANUP_MODE: 'live' }, nowMs: NOW, deps });
+  assert.equal(r.ok, true);
+  assert.ok(order.indexOf('store:lead_leak_daily') < order.indexOf('delete:lead_leak_daily'), order.join(' '));
+  // This file's NOW is 2026-09-26 → cutoff 2026-06-28: three seeded rows are older.
+  assert.match(sent[0], /🧹 Cleanup: removed 3 rows older than 90 days/);
+  assert.match(r.summary, /cleanup_live=3/);
+
+  const failing = baseDeps({ supabase: stubDb({ old: OLD, failTable: 'lead_leak_daily' }) });
+  const r2 = await runLeadLeakMonitor({ env: { LEAD_LEAK_CLEANUP_MODE: 'live' }, nowMs: NOW, deps: failing });
+  assert.equal(r2.ok, true, 'a failed cleanup is a note, not a failed monitor');
+  assert.ok(r2.notes.some((n) => /cleanup lead_leak_daily/.test(n)));
+});
+
+test('NOC zip lookup: in-area stays a leak, out-of-area goes to review, a failed lookup keeps it a leak', async () => {
+  const noc = (id, zip) => lpLead({ lp_lead_id: id, phone: `35255500${id.slice(-2)}`, disposition_code: 'NOC', zip });
+  const leads = [noc('911', '33914'), noc('912', '90210')];
+  const m = await measureLeadLeak({ env: {}, nowMs: NOW, deps: baseDeps({ runSQL: stubSQL({ leads, inAreaZips: ['33914'] }) }),
+    opts: { intake: false } });
+  const byId = Object.fromEntries(m.rows.map((r) => [r.lp_lead_id, r.reason]));
+  assert.deepEqual(byId, { 911: 'not_covered_by_rep', 912: 'noc_out_of_area' });
+  assert.equal(m.rows.find((r) => r.lp_lead_id === '912').est_value, null, '$0 — not priced');
+
+  const failed = await measureLeadLeak({ env: {}, nowMs: NOW,
+    deps: baseDeps({ runSQL: stubSQL({ leads, serviceAreaFails: true }) }), opts: { intake: false } });
+  assert.ok(failed.rows.every((r) => r.reason === 'not_covered_by_rep'));
+  assert.ok(failed.errors.some((e) => /service area: .*NOC kept as leaks/.test(e)));
+});
+
+test('daily pass, alerts live: a NIS2 set in the last day fires the retired-code card naming the lead', async () => {
+  const calls = [];
+  const fresh = lpLead({ lp_lead_id: '930', first_name: 'Pat', last_name: 'Lee', phone: '3525550930',
+    disposition_code: 'NIS2', created_at_lp: lpTs(48), updated_at_lp: lpTs(2) });
+  const old = lpLead({ lp_lead_id: '931', phone: '3525550931', disposition_code: 'NIS2',
+    created_at_lp: lpTs(400), updated_at_lp: lpTs(300) });
+  const deps = baseDeps({
+    runSQL: stubSQL({ leads: [fresh, old] }),
+    reportAlertCondition: async (args) => { calls.push(args); return { action: 'fired' }; },
+  });
+  await runLeadLeakMonitor({ env: { LEAD_LEAK_ALERT_MODE: 'live' }, nowMs: NOW, deps });
+  const card = calls.find((c) => c.key === 'lead_retired_code');
+  assert.equal(card.active, true);
+  assert.equal(card.channel, 'ops');
+  const text = card.text();
+  assert.match(text, /Retired code used on 1 lead/);
+  assert.match(text, /Pat L\. · coded NIS2 · LP 930/);
+  assert.ok(!text.includes('LP 931'), 'an old NIS2 is history, not a new use');
 });
