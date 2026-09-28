@@ -704,12 +704,69 @@ export const HEAL_BUDGET = Object.freeze({
   pollMs: 3000,
 });
 
-async function readLastRestartFailureLive() {
-  if (!supabase) throw new Error('Supabase not configured');
-  const { data, error } = await supabase
+/**
+ * How hard a status read tries before calling a campaign UNREADABLE.
+ *
+ * 2026-09-28 — one Five9 read that failed was enough to page "floor is not
+ * dialing it" and then "HEAL FAILED … STILL not RUNNING" three times in one
+ * afternoon (dial_priority_log 429, 430, 433). No campaign was down: there was
+ * no stop or start in five9.admin_write, and both read RUNNING minutes later.
+ * A single blip is not evidence, so read up to 3 times (~6s) before concluding.
+ */
+export const STATE_READ_RETRY = Object.freeze({ tries: 3, delaysMs: [2000, 4000], budgetMs: 20000 });
+
+/**
+ * Read one campaign's state, retrying a read that throws or comes back empty.
+ * Returns { state, error, attempts }: state is Five9's string (null when every
+ * try failed) and error is the LAST failure's message. The error used to be
+ * swallowed at both call sites, so nobody could tell WHY Five9 did not answer.
+ */
+export async function readCampaignState(getOutbound, campaign, {
+  tries = STATE_READ_RETRY.tries,
+  delaysMs = STATE_READ_RETRY.delaysMs,
+  // Retry FAST failures only. A Five9 read that timed out already spent 20s
+  // per SOAP call (FIVE9_ADMIN_TIMEOUT_MS), and the n8n watchdog gives
+  // campaign-state 30s — retrying a timeout would blow that and turn a slow
+  // Five9 into a failed poll. The failures this exists for returned in <1s.
+  budgetMs = STATE_READ_RETRY.budgetMs,
+  sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
+  clock = () => Date.now(),
+  log = console.log,
+} = {}) {
+  let error = null;
+  const started = clock();
+  for (let i = 0; i < tries; i += 1) {
+    try {
+      const state = (await getOutbound(campaign))?.state;
+      if (state) return { state, error: null, attempts: i + 1 };
+      error = 'Five9 returned no state';
+    } catch (err) {
+      error = err?.message || String(err);
+    }
+    log(`[CapacityRanker] Five9 state read for ${campaign} failed (attempt ${i + 1}/${tries}): ${error}`);
+    if (i === tries - 1) return { state: null, error, attempts: i + 1 };
+    const delay = delaysMs[i] ?? delaysMs[delaysMs.length - 1] ?? 0;
+    if (clock() - started + delay > budgetMs) {
+      log(`[CapacityRanker] Five9 state read for ${campaign}: not retrying — ${clock() - started}ms already spent (budget ${budgetMs}ms)`);
+      return { state: null, error, attempts: i + 1 };
+    }
+    await sleep(delay);
+  }
+  return { state: null, error, attempts: tries };
+}
+
+// `client` is a test seam; production always uses the module's supabase.
+export async function readLastRestartFailureLive(client = supabase) {
+  if (!client) throw new Error('Supabase not configured');
+  const { data, error } = await client
     .from(TABLE)
     .select('id, ran_at, restart_failures, healed_at, cycle_disabled_until')
     .not('restart_failures', 'is', null)
+    // 2026-09-28 — only a RANKING run's restart failure is an incident. Heal
+    // rows used to qualify too, so every heal became the "source" of the next
+    // one: 331 (Sept 21) → 429 → 430 → 433 on 2026-09-28, a chain of heals
+    // citing each other while the last real failure was a week old.
+    .neq('mode', 'heal')
     .order('ran_at', { ascending: false })
     .limit(1);
   if (error) {
@@ -858,6 +915,9 @@ export async function healCampaigns(deps = {}) {
   const alreadyRunning = [];
   const failed = [];
   const skippedCycling = [];
+  // Five9 did not answer, after retries. NOT a failure: nothing was started and
+  // nothing is known to be down. The watchdog already pages for it.
+  const unreadable = [];
   const attempted = [];   // what this sweep SPENT budget on, durable in heal_attempted
   const standDown = [];   // dark, observed, deliberately not restarted
 
@@ -874,12 +934,8 @@ export async function healCampaigns(deps = {}) {
       continue;
     }
     const readState = async () => String((await getOutbound(campaign))?.state || '').toUpperCase();
-    let state = null;
-    try {
-      state = await readState();
-    } catch (err) {
-      state = null;
-    }
+    const read = await readCampaignState(getOutbound, campaign, { sleep, log });
+    const state = read.state ? String(read.state).toUpperCase() : null;
     if (state === 'RUNNING') {
       alreadyRunning.push(campaign);
       // The campaign is back, so any stand-down condition it was carrying is
@@ -888,7 +944,12 @@ export async function healCampaigns(deps = {}) {
       continue;
     }
     if (!state) {
-      failed.push({ campaign, error: 'state is UNREADABLE — refusing to guess; Five9 may be unreachable' });
+      // "Could not tell" is not "down" (CLAUDE.md, Alerting). Reporting it as a
+      // failed restart posted "STILL not RUNNING" for campaigns that were
+      // dialing the whole time, and wrote restart_failures that the next heal
+      // then treated as a fresh incident.
+      unreadable.push({ campaign, error: `state is UNREADABLE after ${read.attempts} reads (${read.error}) — refusing to guess` });
+      log(`[CapacityRanker] HEAL: ${campaign} is UNREADABLE after ${read.attempts} reads (${read.error}) — not starting it and not calling it down`);
       continue;
     }
 
@@ -943,8 +1004,8 @@ export async function healCampaigns(deps = {}) {
   const acted = healed.length > 0 || failed.length > 0 || standDown.length > 0;
   const outcome = failed.length
     ? 'heal_failed'
-    : (healed.length ? 'healed' : (standDown.length ? 'stood_down' : 'noop'));
-  const summary = `heal: ${outcome} — healed=[${healed.join(', ')}] already_running=[${alreadyRunning.join(', ')}] failed=[${failed.map((f) => f.campaign).join(', ')}] stood_down=[${standDown.map((s2) => `${s2.campaign} (${s2.state}, ${s2.attempts_today} today)`).join('; ')}] cycling=[${skippedCycling.join(', ')}] may_act=${mayAct} (source dial_priority_log id ${source?.id ?? 'none'})`;
+    : (healed.length ? 'healed' : (standDown.length ? 'stood_down' : (unreadable.length ? 'unreadable' : 'noop')));
+  const summary = `heal: ${outcome} — healed=[${healed.join(', ')}] already_running=[${alreadyRunning.join(', ')}] failed=[${failed.map((f) => `${f.campaign} (${f.error})`).join('; ')}] unreadable=[${unreadable.map((u) => u.campaign).join(', ')}] stood_down=[${standDown.map((s2) => `${s2.campaign} (${s2.state}, ${s2.attempts_today} today)`).join('; ')}] cycling=[${skippedCycling.join(', ')}] may_act=${mayAct} (source dial_priority_log id ${source?.id ?? 'none'})`;
   log(`[CapacityRanker] ${summary}`);
 
   // The outcome row: a durable record that a heal DID something. mode is
@@ -1012,7 +1073,8 @@ export async function healCampaigns(deps = {}) {
 
   // 503 whenever a campaign is left NOT_RUNNING — whether heal failed to
   // restart it or deliberately declined to. Either way the floor is not
-  // dialing it and the n8n execution should go red.
+  // dialing it and the n8n execution should go red. UNREADABLE alone is 200:
+  // heal knows nothing is down, and the watchdog owns that page.
   return {
     status: (failed.length || standDown.length) ? 503 : 200,
     body: {
@@ -1020,6 +1082,7 @@ export async function healCampaigns(deps = {}) {
       healed,
       already_running: alreadyRunning,
       failed,
+      unreadable,
       // What the sweep looked at, and what it deliberately left alone. swept is
       // always BOTH Data campaigns — source_log_id is provenance for the
       // incident being closed, not the scope of the sweep.
@@ -1077,8 +1140,14 @@ export function withinWatchdogWindow(now = new Date()) {
 /** The card for a campaign that is down during dial hours. The live state goes
  *  in the BODY, never in the alert key — see watchdogAlertKey. */
 export function watchdogAlertText(campaign, state) {
-  const shown = state ? String(state).toUpperCase() : 'UNREADABLE';
-  return `⚠ CAPACITY RANKER: ${campaign} is ${shown} during dial hours — floor is not dialing it. Check Five9 now.`;
+  // 2026-09-28 — UNREADABLE says what we know, not what we fear. The old text
+  // claimed "floor is not dialing it" for a campaign Five9 simply did not
+  // answer about, and every such card on 2026-09-28 was for a campaign that
+  // was dialing. Still a page: a real outage has shown up first as UNREADABLE.
+  if (!state) {
+    return `⚠ CAPACITY RANKER: ${campaign} is UNREADABLE during dial hours — Five9 did not answer ${STATE_READ_RETRY.tries} status checks in a row, so the floor may not be dialing it. Check Five9 now.`;
+  }
+  return `⚠ CAPACITY RANKER: ${campaign} is ${String(state).toUpperCase()} during dial hours — floor is not dialing it. Check Five9 now.`;
 }
 
 /**
@@ -1123,15 +1192,23 @@ export async function checkCampaignState(deps = {}) {
     cycling = isCycling,
     report = reportAlertCondition,
     now = new Date(),
+    sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
     log = console.log,
   } = deps;
 
   const campaigns = await Promise.all([CAMPAIGNS.hot, CAMPAIGNS.warm].map(async (name) => {
-    const c = await getOutbound(name).catch(() => null);
-    const ok = String(c?.state || '').toUpperCase() === 'RUNNING';
+    // Retried, and the reason logged: one failed read used to page on its own.
+    const read = await readCampaignState(getOutbound, name, { sleep, log });
+    const ok = String(read.state || '').toUpperCase() === 'RUNNING';
     // Only ask about a campaign that is actually down; a RUNNING one is never
     // "cycling" for reporting purposes even mid-reorder.
-    return { campaign: name, state: c?.state ?? null, ok, cycling: ok ? false : cycling(name) };
+    return {
+      campaign: name,
+      state: read.state ?? null,
+      ok,
+      cycling: ok ? false : cycling(name),
+      ...(read.state ? {} : { read_error: read.error }),
+    };
   }));
   const allRunning = campaigns.every((s) => s.ok);
   // Down AND unexplained. A campaign the ranker is cycling right now is not a
@@ -1153,7 +1230,7 @@ export async function checkCampaignState(deps = {}) {
           active,
           label: `${c.campaign} is RUNNING again`,
           text,
-          detail: `state=${c.state ?? 'UNREADABLE'} cycling=${c.cycling}`,
+          detail: `state=${c.state ?? 'UNREADABLE'} cycling=${c.cycling}${c.read_error ? ` read_error=${c.read_error}` : ''}`,
           send: sendAlert,
           fallbackCooldownMs: WATCHDOG_SUPPRESS_MS,
         });

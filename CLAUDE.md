@@ -155,6 +155,13 @@ could otherwise smuggle instructions into an agent's context. The wrapper sits a
 registration because that is the one place that covers all 126 tools and the next
 one added.
 
+**UNREADABLE is not down (dialer watchdog and heal, 2026-09-28).** A Five9 status read that fails is
+retried (`readCampaignState` in `src/routes/capacityRanker.js`, 3 reads over ~6s) and its reason is
+logged. Still unreadable, the watchdog pages with honest wording ("may not be dialing"), because a real
+outage has shown up first as UNREADABLE — but heal files it under `unreadable`, never `failed`. It
+writes no `restart_failures` and posts no "STILL not RUNNING" card. One blip used to produce three false
+"HEAL FAILED" cards in an afternoon, each heal row becoming the next heal's source.
+
 **Classify before you threshold.** An alarm that fires on the healthy case gets muted, and a muted
 alarm is how a 47-hour outage and a 71-day blind spot both went unnoticed. Exclude the legitimately-
 quiet cases explicitly (see the eligible-replies split in `agentic-silence-alerts.js` and the

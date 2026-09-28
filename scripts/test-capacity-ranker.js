@@ -45,6 +45,8 @@ import {
   watchdogAlertKey,
   watchdogAlertText,
   checkCampaignState,
+  readCampaignState,
+  readLastRestartFailureLive,
   healCampaigns,
   todayET,
   endOfDayET,
@@ -2222,12 +2224,50 @@ test('HEAL: a campaign that still will not start → 503, heal_failed, and a lou
   assert.match(calls.alerts[0], /HEAL FAILED/);
 });
 
-test('HEAL: an UNREADABLE campaign is reported, never guessed at', async () => {
+// 2026-09-28 — dial_priority_log 429, 430, 433: three "HEAL FAILED … STILL not
+// RUNNING" cards in one afternoon for campaigns that were dialing the whole
+// time. Five9 simply did not answer a status read. "Could not tell" is not
+// "down", so it is not a failed restart, writes no restart_failures (which the
+// next heal would read as a new incident) and posts no failure card.
+test('HEAL: an UNREADABLE campaign is reported, never guessed at — and never called down', async () => {
   const { deps, calls } = fakeHeal({ states: { [CAMPAIGNS.warm]: null } });
   const { status, body } = await healCampaigns(deps);
-  assert.equal(status, 503);
-  assert.match(body.failed[0].error, /UNREADABLE/);
+  assert.equal(status, 200, 'nothing is known to be down, so the n8n execution stays green');
+  assert.equal(body.outcome, 'unreadable');
+  assert.deepEqual(body.failed, []);
+  assert.equal(body.unreadable[0].campaign, CAMPAIGNS.warm);
+  assert.match(body.unreadable[0].error, /UNREADABLE after 3 reads \(Five9 returned no state\)/);
   assert.deepEqual(calls.starts, [], 'a campaign we cannot see is not a campaign we start');
+  assert.deepEqual(calls.inserted, [], 'no outcome row, so no restart_failures for the next heal to chase');
+  assert.ok(!calls.alerts.some((t) => /HEAL FAILED|STILL not RUNNING/.test(t)), 'no false failure card');
+});
+
+test('HEAL: a read that fails once and then answers is not UNREADABLE', async () => {
+  const { deps, calls } = fakeHeal({ states: { [CAMPAIGNS.warm]: 'RUNNING' } });
+  let reads = 0;
+  const real = deps.getOutbound;
+  deps.getOutbound = async (name) => {
+    if (name === CAMPAIGNS.warm && reads++ === 0) throw new Error('SOAP fault: connection reset');
+    return real(name);
+  };
+  const logs = [];
+  deps.log = (m) => logs.push(m);
+  const { status, body } = await healCampaigns(deps);
+  assert.equal(status, 200);
+  assert.deepEqual(body.unreadable, []);
+  assert.ok(body.already_running.includes(CAMPAIGNS.warm));
+  assert.deepEqual(calls.starts, []);
+  assert.ok(logs.some((m) => /Five9 state read for Data - Warm Leads less than 30 failed \(attempt 1\/3\): SOAP fault: connection reset/.test(m)),
+    'the reason Five9 did not answer is logged, not swallowed');
+});
+
+test('HEAL: a confirmed-down campaign that will not start still fails loudly (no regression)', async () => {
+  const { deps, calls } = fakeHeal({ startWorks: false });
+  const { status, body } = await healCampaigns(deps);
+  assert.equal(status, 503);
+  assert.equal(body.outcome, 'heal_failed');
+  assert.deepEqual(body.unreadable, []);
+  assert.match(calls.alerts[0], /HEAL FAILED: Data - Warm Leads less than 30 is STILL not RUNNING/);
 });
 
 test('HEAL: both campaigns named → both handled, and one outcome row covers the sweep', async () => {
@@ -2513,6 +2553,7 @@ function watchdogFake({ states = { hot: 'RUNNING', warm: 'RUNNING' }, throwFor =
     deps: {
       report: makeReport(store, { sendThrows }),
       log: () => {},
+      sleep: async () => {},
       inWindow: () => true,
       cycling: (name) => cyclingNames.includes(name),
       getOutbound: async (name) => {
@@ -2553,7 +2594,76 @@ test('WATCHDOG: an unreadable campaign alerts too — "cannot confirm" is not "f
   const { status, body } = await checkCampaignState(f.deps);
   assert.equal(status, 503);
   assert.match(f.sent[0], /Data - Hot Leads less than 7 is UNREADABLE during dial hours/);
-  assert.equal(body.campaigns.find((c) => c.campaign === CAMPAIGNS.hot).state, null);
+  // 2026-09-28 — but it says what we know: Five9 did not answer. It no longer
+  // claims the floor is not dialing, which was false every time on 2026-09-28.
+  assert.match(f.sent[0], /did not answer 3 status checks in a row, so the floor may not be dialing it/);
+  assert.doesNotMatch(f.sent[0], /floor is not dialing it/);
+  const hot = body.campaigns.find((c) => c.campaign === CAMPAIGNS.hot);
+  assert.equal(hot.state, null);
+  assert.match(hot.read_error, /Five9 getOutboundCampaign fault/, 'the reason travels with the result');
+});
+
+test('WATCHDOG: one failed read that then answers RUNNING pages nobody (2026-09-28)', async () => {
+  const f = watchdogFake();
+  let hotReads = 0;
+  const real = f.deps.getOutbound;
+  f.deps.getOutbound = async (name) => {
+    if (name === CAMPAIGNS.hot && hotReads++ === 0) throw new Error('Five9 getOutboundCampaign fault');
+    return real(name);
+  };
+  const logs = [];
+  f.deps.log = (m) => logs.push(m);
+  const { status, body } = await checkCampaignState(f.deps);
+  assert.equal(status, 200);
+  assert.equal(body.all_running, true, 'so the n8n watchdog does not call heal either');
+  assert.deepEqual(f.sent, [], 'a single blip is not evidence');
+  assert.ok(logs.some((m) => /Five9 state read for Data - Hot Leads less than 7 failed \(attempt 1\/3\)/.test(m)));
+});
+
+test('HEAL SOURCE: a heal row is never the source of the next heal (2026-09-28 chain 331 → 429 → 430 → 433)', async () => {
+  const calls = [];
+  const builder = {
+    from(t) { calls.push(['from', t]); return this; },
+    select(c) { calls.push(['select', c]); return this; },
+    not(c, op, v) { calls.push(['not', c, op, v]); return this; },
+    neq(c, v) { calls.push(['neq', c, v]); return this; },
+    order(c, o) { calls.push(['order', c, o]); return this; },
+    limit(n) { calls.push(['limit', n]); return Promise.resolve({ data: [{ id: 428 }], error: null }); },
+  };
+  const row = await readLastRestartFailureLive(builder);
+  assert.deepEqual(row, { id: 428 });
+  assert.ok(calls.some((c) => c[0] === 'neq' && c[1] === 'mode' && c[2] === 'heal'), 'mode=heal rows are excluded');
+  assert.ok(calls.some((c) => c[0] === 'not' && c[1] === 'restart_failures'), 'still only rows that recorded a failure');
+});
+
+test('readCampaignState: retries on throw or empty state, then gives up with the last reason', async () => {
+  const slept = [];
+  const sleep = async (ms) => { slept.push(ms); };
+  const answers = [new Error('timeout'), { state: '' }, { state: 'RUNNING' }];
+  const ok = await readCampaignState(async () => {
+    const a = answers.shift();
+    if (a instanceof Error) throw a;
+    return a;
+  }, 'X', { sleep, log: () => {} });
+  assert.deepEqual(ok, { state: 'RUNNING', error: null, attempts: 3 });
+  assert.deepEqual(slept, [2000, 4000]);
+
+  const dead = await readCampaignState(async () => { throw new Error('SOAP 500'); }, 'X', { sleep: async () => {}, log: () => {} });
+  assert.deepEqual(dead, { state: null, error: 'SOAP 500', attempts: 3 });
+});
+
+test('readCampaignState: a SLOW failure (a timeout) is not retried past the budget — the watchdog has 30s', async () => {
+  let t = 0;
+  let reads = 0;
+  const r = await readCampaignState(async () => {
+    reads += 1;
+    t += 20000; // one Five9 SOAP timeout
+    throw new Error('Five9 admin API timeout after 20000ms (getOutboundCampaign)');
+  }, 'X', { sleep: async (ms) => { t += ms; }, clock: () => t, log: () => {} });
+  assert.equal(reads, 1, 'one timeout already used the budget');
+  assert.equal(r.state, null);
+  assert.equal(r.attempts, 1);
+  assert.match(r.error, /timeout/);
 });
 
 test('WATCHDOG: both down → both named, one message each', async () => {

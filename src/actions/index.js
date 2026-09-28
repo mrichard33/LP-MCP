@@ -192,6 +192,7 @@
 
 import supabase from '../supabase.js';
 import { executeSendMessage, sendMessageBudgetMs } from '../send-message-handler.js';
+import { llmBudgetMs } from '../llm-client.js';
 import { registerRateLimiterRoutes } from '../ghl-rate-limiter.js';
 import { getEventContext } from './resolvers.js';
 import { processApprovalQueue } from './approval-path.js';
@@ -1201,11 +1202,21 @@ const HANDLER_TIMEOUT_MS = parseInt(process.env.EXECUTOR_HANDLER_TIMEOUT_MS || '
 // LP-side duplicate guard (already_in_lp / already_set_in_lp /
 // duplicate_sync_suppressed), and a payload-hash dedup would collapse a
 // genuine later reschedule for the same contact.
+const LP_APPOINTMENT_TIMEOUT_MS = Math.max(
+  HANDLER_TIMEOUT_MS,
+  parseInt(process.env.EXECUTOR_LP_APPOINTMENT_TIMEOUT_MS || '120000', 10),
+);
 const HANDLER_TIMEOUT_OVERRIDES_MS = {
-  set_lp_appointment: Math.max(
-    HANDLER_TIMEOUT_MS,
-    parseInt(process.env.EXECUTOR_LP_APPOINTMENT_TIMEOUT_MS || '120000', 10),
-  ),
+  set_lp_appointment: LP_APPOINTMENT_TIMEOUT_MS,
+  // 2026-09-28 — create_lp_lead now (a) asks LP by phone for an existing lead
+  // and, when it reuses one, runs the whole set_lp_appointment handler inline,
+  // and (b) for a "Guest Visitor" contact reads the chat and runs the
+  // identity_extraction model before it sends. Either leg alone can outlast the
+  // 60s global ceiling, and a watchdog kill here is a lost lead (the reaper
+  // marks create_lp_lead non-idempotent, so it is never retried). So the
+  // ceiling is DERIVED: the appointment handler's own ceiling plus one model
+  // call — never a literal (CLAUDE.md "LLM budgets").
+  create_lp_lead: LP_APPOINTMENT_TIMEOUT_MS + llmBudgetMs('identity_extraction'),
   // 2026-09-02 — send_message = reply-context build + Claude generation + GHL
   // send, each behind the rate limiter. Action 401270 (gpPQYhCsqdGy10wU14Rp)
   // hit the 60s watchdog at 14:56:49Z, the zombie delivered the SMS 39s later,
