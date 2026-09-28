@@ -71,6 +71,25 @@ async function readLpPhones(runSQL, phones) {
   return out;
 }
 
+/**
+ * Contact ids another path already sent (a create_lp_lead action that is queued,
+ * running or done). Throws on a bad read so the pass fails CLOSED.
+ */
+async function readAgenticSent(runSQL, ids) {
+  const out = new Set();
+  for (let i = 0; i < ids.length; i += CHUNK) {
+    const rows = asRows(await runSQL(`
+      SELECT DISTINCT target_id
+        FROM agent_actions
+       WHERE action_type = 'create_lp_lead'
+         AND status IN ('pending','pending_approval','approved','executing','completed')
+         AND target_id IN (${sqlList(ids.slice(i, i + CHUNK))})
+    `), 'agentic sent check');
+    for (const r of rows) if (r.target_id) out.add(String(r.target_id));
+  }
+  return out;
+}
+
 /** Contact ids present in `table` under `keyFor(id)`, any age. */
 async function readKeys(db, table, ids, keyFor, what) {
   const out = new Set();
@@ -102,12 +121,13 @@ export async function runCanvassLeadBackstop({ env = process.env, nowMs = Date.n
     out.candidates = candidates.length;
     const ids = [...new Set(candidates.map((c) => String(c.ghl_contact_id)))];
     const phones = [...new Set(candidates.map((c) => normalizePhone10(c.phone)).filter(Boolean))];
-    const [lpPhones, arrived, tried] = await Promise.all([
+    const [lpPhones, arrived, tried, sentElsewhere] = await Promise.all([
       phones.length ? readLpPhones(d.runSQL, phones) : new Set(),
       ids.length ? readKeys(d.supabase, CANVASS_MARKS_TABLE, ids, (id) => id, 'canvass marks read') : new Set(),
       ids.length ? readKeys(d.supabase, MARKS_TABLE, ids, markKey, 'backstop marks read') : new Set(),
+      ids.length ? readAgenticSent(d.runSQL, ids) : new Set(),
     ]);
-    picked = selectCanvassLeads(candidates, { lpPhones, arrived, tried, nowMs, max: MAX_PER_PASS });
+    picked = selectCanvassLeads(candidates, { lpPhones, arrived, tried, sentElsewhere, nowMs, max: MAX_PER_PASS });
   } catch (err) {
     errors.push(`read: ${err.message}`);
     return finish();
