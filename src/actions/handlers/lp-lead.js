@@ -112,6 +112,8 @@ import {
   existingLeadGuardMode, existingLeadWindowDays, decideExistingLeadAction,
   flattenLpLeads, pickNewestLead,
 } from '../../services/lp-existing-lead-guard.js';
+import { needsNameRecovery, recoverPlaceholderName } from '../../services/placeholder-name-recovery.js';
+import { NAME_PLACEHOLDER_TAG } from '../../services/identity-extraction.js';
 // v1.2 — the deterministic call-center brief. Pure builder + a fetch
 // wrapper that returns null on ANY failure, so this stays fail-soft.
 import { buildAgenticLeadNotes, isWeakNotes } from '../../services/agentic-lead-notes.js';
@@ -126,6 +128,7 @@ const FIELD_LP_LEAD_ID          = 'GmAVmW6V9sekD7pVONKr'; // real lds_id
 const FIELD_LP_SOURCE_ID        = 'k6j4IBh5IejPooSCsj49'; // srs_id — LP SubSource (3-digit)
 const FIELD_LP_PROMOTER_ID      = 'BbUJ6RrdTjjEqqRA8JVx'; // pro_id — LP Promoter (4-digit)
 const FIELD_CONTACT_SUMMARY     = 'dDFaBRpRn2aHVZTboUeB'; // AI Short Summary (brief fallback)
+const FIELD_CHAT_TRANSCRIPT     = 'RF710H9k39oLl9TsQIy4'; // Chat Transcript (visitor's side of the widget chat)
 
 // Default LP SubSource ID for chatbot leads. Sourced from the registry
 // (830 = "Reece ChatBot"). Override via env only if Reece's SubSource map
@@ -407,6 +410,44 @@ export async function executeCreateLPLead(action) {
     }
   }
 
+  // ─── Placeholder-name recovery (2026-09-28) ───────────────────────
+  // Chat contacts are created as "Guest Visitor xxxxx" (often normalised to
+  // a bare "guest"). If the visitor gave their name in the chat, write it to
+  // GHL and send LP the real name. If not, the contact is skipped below as
+  // missing a first name — LP never gets a placeholder (Mark, 2026-09-28).
+  // Runs after the existing-lead guard on purpose: a reused lead already has
+  // its name in LP, so there is nothing to recover.
+  let nameRecovery = null;
+  if (needsNameRecovery(ghlContact.firstName, ghlContact.lastName)) {
+    const wasName = [ghlContact.firstName, ghlContact.lastName].filter(Boolean).join(' ') || '(blank)';
+    let rec = null;
+    if (!normalizePhone(ghlContact.phone)) {
+      // Skipped below for the phone anyway — do not spend a model call on it.
+      rec = { found: false, reason: 'no phone, chat not read' };
+    } else {
+      try {
+        rec = await recoverPlaceholderName(contactId, ghlContact, { transcript: readCF(ghlContact, FIELD_CHAT_TRANSCRIPT) });
+      } catch (err) {
+        rec = { found: false, reason: `recovery failed: ${err.message}` };
+      }
+    }
+    if (rec.found) {
+      ghlContact = { ...ghlContact, ...rec.payload };
+      nameRecovery = { from: wasName, to: [rec.firstName, rec.lastName].filter(Boolean).join(' '), ghl_write: rec.ghlWrite, fields: Object.keys(rec.payload) };
+      await addGHLNote(contactId,
+        `[LP CREATE v1.4] Name recovered from the chat: "${nameRecovery.to}" (was "${wasName}").\n` +
+        `Updated on this contact: ${nameRecovery.fields.join(', ')}` +
+        (rec.ghlWrite === true ? '' : ` — GHL update did NOT save (${rec.ghlWrite}); LP still gets the real name.`)
+      ).catch(() => {});
+      console.log(`[LP-CREATE] 🪪 ${contactId}: recovered name "${nameRecovery.to}" from chat (was "${wasName}", ghl_write=${rec.ghlWrite})`);
+    } else {
+      nameRecovery = { from: wasName, to: null, reason: rec.reason };
+      ghlContact = { ...ghlContact, firstName: '', lastName: '' };
+      await applyGHLTag(contactId, NAME_PLACEHOLDER_TAG).catch(() => {});
+      console.warn(`[LP-CREATE] 🪪 ${contactId}: placeholder name "${wasName}", none recovered (${rec.reason})`);
+    }
+  }
+
   // ─── Validate required GHL fields ─────────────────────────────────
   // LP needs a first name and a phone — nothing else (Mark, 2026-09-28).
   // EMAIL IS NOT REQUIRED — LP accepts leads without email (2026-05-02).
@@ -434,8 +475,11 @@ export async function executeCreateLPLead(action) {
     // the contact isn't in LP yet, which is exactly the state we're trying
     // to fix — so the GroupMe alert points the operator to the missing
     // fields blocking the push.
+    const placeholderLine = nameRecovery && !nameRecovery.to
+      ? ` (name on file was "${nameRecovery.from}"; ${nameRecovery.reason})`
+      : '';
     const skipMsg = buildRichNotification({
-      baseMessage: `⚠️ LP CREATE SKIP: missing required field(s) — ${missing.join(', ')}`,
+      baseMessage: `⚠️ LP CREATE SKIP: missing required field(s) — ${missing.join(', ')}${placeholderLine}`,
       name,
       phone,
       contactId,
@@ -444,7 +488,7 @@ export async function executeCreateLPLead(action) {
     });
     await sendGroupMeMessage(skipMsg).catch(() => {});
     await addGHLNote(contactId,
-      `[LP CREATE v1.3] Skipped — required field(s) missing: ${missing.join(', ')}\n` +
+      `[LP CREATE v1.3] Skipped — required field(s) missing: ${missing.join(', ')}${placeholderLine}\n` +
       `Lead cannot be pushed to Lead Perfection until these are populated.\n` +
       `Add the missing fields in GHL; the next appointment_booked event will retry the push.`
     ).catch(() => {});
@@ -453,6 +497,7 @@ export async function executeCreateLPLead(action) {
       action: 'skipped_missing_fields',
       contact_id: contactId,
       missing_fields: missing,
+      name_recovery: nameRecovery,
     };
   }
 
@@ -633,6 +678,7 @@ export async function executeCreateLPLead(action) {
     appt_date: adate || null,
     appt_time: atime || null,
     appt_included: !!(adate && atime),
+    name_recovery: nameRecovery,
     lp_response: lpResponse,
   };
 }
