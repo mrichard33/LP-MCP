@@ -6,9 +6,13 @@ import {
 
 const cf = (pairs) => ({ customFields: Object.entries(pairs).map(([id, value]) => ({ id, value })) });
 
-test('Lakeland office overrides ORL market', () => {
+// 2026-09-28 — Lakeland merged into Orlando: the Lakeland-office override now
+// lands on ORL (#service-orlando), whatever the contact's market field says.
+test('Lakeland office routes to Orlando', () => {
   const c = cf({ [FIELD.MARKET]: 'ORL', [FIELD.SERVICING_OFFICE]: '5110 S Florida Ave, Suite 105, Lakeland 33813' });
-  assert.equal(resolveServiceMarket(c, 'ORL'), 'LAKE');
+  assert.equal(resolveServiceMarket(c, 'ORL'), 'ORL');
+  const other = cf({ [FIELD.MARKET]: 'FTMYR', [FIELD.SERVICING_OFFICE]: '5110 S Florida Ave, Suite 105, Lakeland 33813' });
+  assert.equal(resolveServiceMarket(other, 'FTMYR'), 'ORL', 'the office still wins over another market');
 });
 
 test('ORL without Lakeland office stays ORL', () => {

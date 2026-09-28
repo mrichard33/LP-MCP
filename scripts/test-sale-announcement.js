@@ -1463,13 +1463,14 @@ test('rankOffices lists EVERY office, folds BOCA into Fort Lauderdale, drops cod
       [1, 'Fort Myers', 80000, 2],
       [2, 'Jacksonville', 60000, 1],
       [3, 'Fort Lauderdale', 25000, 2],
-      [4, 'Lakeland', 0, 0],
       [4, 'Orlando', 0, 0],
       [4, 'Sarasota', 0, 0],
       [4, 'St. Petersburg', 0, 0],
     ],
   );
-  assert.equal(rankOffices([]).length, 7, 'a month with no sales still lists all seven offices');
+  // Six since 2026-09-28: Lakeland (LAKE) folds into Orlando like BOCA into Fort Lauderdale.
+  assert.equal(rankOffices([]).length, 6, 'a month with no sales still lists all six offices');
+  assert.deepEqual(rankOffices([{ lp_branch_id: 'LAKE', job_value: 7 }])[0].name, 'Orlando', 'a Lakeland sale counts for Orlando');
   const tied = rankOffices([{ lp_branch_id: 'ORL', job_value: 5 }, { lp_branch_id: 'SAR', job_value: 5 }]);
   assert.deepEqual(tied.slice(0, 2).map((r) => r.rank), [1, 1]);
 });
@@ -1496,7 +1497,6 @@ test('the #sales-all stats reply carries the office board, with this sale’s of
     '1. Fort Myers — $80,000 (2)',
     '2. Jacksonville — $60,000 (1)',
     '3. Fort Lauderdale — $25,000 (2)  ← this sale',
-    '4. Lakeland — $0 (0)',
     '4. Orlando — $0 (0)',
     '4. Sarasota — $0 (0)',
     '4. St. Petersburg — $0 (0)',

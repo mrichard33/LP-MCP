@@ -313,10 +313,12 @@ test('month to date counts proxy-dated and no-close-date sales, not just day-acc
   assert.match(supabase.calls[1].filters.or, /close_date\.lt\.2026-09-24T23:00:00\.000Z/);
 });
 
-test('month to date lists all seven offices, $0 included, and names none it cannot', async () => {
+test('month to date lists all six offices, $0 included, and names none it cannot', async () => {
   const supabase = supa([{ data: [sale('JAX', 500), sale('BOCA', 200), sale('OUT_OF_AREA', 9999)] }, { data: [] }]);
   const out = await buildOfficePowerRanking({ supabase, logger: quiet, mode: 'mtd', now: () => SEPT_25 });
-  assert.equal(out.rows.length, 7);
+  // Six since 2026-09-28 — Lakeland merged into Orlando.
+  assert.equal(out.rows.length, 6);
+  assert.ok(!out.rows.some((r) => r.office === 'LAKE'), 'no separate Lakeland office');
   assert.deepEqual(out.rows.slice(0, 2).map((r) => [r.office, r.volume]), [['JAX', 500], ['FTLAU', 200]]);
   assert.ok(!out.rows.some((r) => r.office === 'OUT_OF_AREA'));
   assert.equal(out.movementAvailable, false, 'an empty board 24h ago gives no arrows');

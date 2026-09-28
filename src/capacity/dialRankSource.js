@@ -1,14 +1,14 @@
 // ─── Live Five9 dial rank — src/capacity/dialRankSource.js ──────────────────
 //
 // Reads the LIVE list order on "Data - Hot Leads less than 7" and returns
-// market_code → rank 1..7 (1 dials first). This is what the TV board's corner
+// market_code → rank 1..6 (1 dials first). This is what the TV board's corner
 // badge prints, so it must reflect Five9 itself — including a reorder a human
 // made in the admin UI, which dial_priority_log would never see.
 //
 // DENSE-RANKED, not raw. Five9's dialingPriority can have gaps, and the
-// non-market "Data - Hot - Unmapped" list sits at the end. Only the 7 market
-// lists are ranked, sorted by their raw priority, and numbered 1..7 — so a card
-// can never print an 8.
+// non-market "Data - Hot - Unmapped" list sits at the end. Only the 6 market
+// lists are ranked, sorted by their raw priority, and numbered 1..6 — so a card
+// can never print a 7. (Six since 2026-09-28: Lakeland merged into Orlando.)
 //
 // FAILS OPEN. A Five9 error returns the last good ranks (or {}), never throws.
 // The board is a wall display: a missing badge is fine, a blank screen is not.

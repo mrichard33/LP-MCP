@@ -312,8 +312,9 @@ export async function executeSendNotification(action, context) {
   }
   if (!marketCode) marketCode = enrichment.marketCode || null;
   // 2026-09-24 — service cards: a record that lists the Lakeland office goes
-  // to #service-lakeland whatever its market; everyone else keeps their own
-  // market (ORL stays #service-orlando). An explicit market on the rule wins.
+  // to that office's channel whatever its market — #service-orlando since the
+  // 2026-09-28 Lakeland → Orlando merge; everyone else keeps their own market.
+  // An explicit market on the rule wins.
   if (payload.channel === 'service' && !(payload.market || payload.market_code)) {
     marketCode = await resolveServiceMarketForContact(contactId, ghlContact, marketCode);
   }
