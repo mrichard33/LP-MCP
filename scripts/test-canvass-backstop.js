@@ -136,7 +136,7 @@ test('mode defaults to shadow; ET date helper', () => {
 
 // --- the pass --------------------------------------------------------------
 
-function stubDeps({ candidates = [row('c1'), row('c2')], arrived = [], tried = [], hlFails = false, marksFail = false, live = {}, outcome = 'ok' } = {}) {
+function stubDeps({ candidates = [row('c1'), row('c2')], arrived = [], tried = [], agentic = [], hlFails = false, marksFail = false, live = {}, outcome = 'ok' } = {}) {
   const calls = { process: [], marks: [], sends: [], reads: [] };
   const supabase = {
     from(table) {
@@ -156,7 +156,7 @@ function stubDeps({ candidates = [row('c1'), row('c2')], arrived = [], tried = [
     calls,
     deps: {
       hlRunSQL: async () => { if (hlFails) throw new Error('hl down'); return candidates; },
-      runSQL: async () => [],
+      runSQL: async (sql) => (/agent_actions/.test(sql) ? agentic.map((id) => ({ target_id: id })) : []),
       supabase,
       getContact: async (id) => { calls.reads.push(id); return id in live ? live[id] : liveContact(id); },
       validate: validateCanvassingPayload,
@@ -236,4 +236,19 @@ test('route pre-check: a hung read resolves to "no mark" within the cap', async 
   assert.equal(res, null);
   assert.ok(Date.now() - started < 1000);
   assert.equal(await withTimeout(Promise.resolve({ status: 'lp_created' }), 50, null).then((x) => x.status), 'lp_created');
+});
+
+test('selection: a lead another path already sent is skipped (action or tag)', () => {
+  const { send, skipped } = selectCanvassLeads(
+    [row('c1'), row('c2'), row('c3', { tags: ['canvass-v2', 'lp-pushed-by-agentic'] })],
+    { lpPhones: new Set(), arrived: new Set(), tried: new Set(), sentElsewhere: new Set(['c2']), nowMs: NOW });
+  assert.deepEqual(send.map((r) => r.ghl_contact_id), ['c1']);
+  assert.equal(skipped.sent_elsewhere, 2);
+});
+
+test('live: a lead with a create_lp_lead action in flight is not re-sent', async () => {
+  const { deps, calls } = stubDeps({ agentic: ['c1'] });
+  const r = await runCanvassLeadBackstop({ env: { CANVASS_BACKSTOP_MODE: 'live' }, nowMs: NOW, deps });
+  assert.deepEqual(calls.process, ['c2']);
+  assert.equal(r.skipped.sent_elsewhere, 1);
 });

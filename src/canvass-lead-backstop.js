@@ -36,6 +36,7 @@
 
 import { LP_ID_FIELDS, excludeTagsSql, hasExcludedTag } from './lead-intake-gap.js';
 import { normalizePhone10 } from './lead-leak-classify.js';
+import { hasSentElsewhereTag } from './chat-lead-intake.js';
 
 const esc = (s) => String(s).replace(/'/g, "''");
 
@@ -104,9 +105,10 @@ export function buildCanvassCandidatesSql({ sinceIso, untilIso }) {
  *   lpPhones  Set of phone10 already in lp_leads
  *   arrived   Set of contact ids with a canvassing_intake_marks row (any status)
  *   tried     Set of contact ids this sweep already attempted
+ *   sentElsewhere  Set of contact ids with a live/finished create_lp_lead action
  */
-export function selectCanvassLeads(candidates, { lpPhones, arrived, tried, nowMs, max = MAX_PER_PASS }) {
-  const skipped = { not_canvass: 0, too_new: 0, too_old: 0, no_phone: 0, excluded: 0, webhook_arrived: 0, already_tried: 0, in_lp: 0, over_cap: 0 };
+export function selectCanvassLeads(candidates, { lpPhones, arrived, tried, sentElsewhere, nowMs, max = MAX_PER_PASS }) {
+  const skipped = { not_canvass: 0, too_new: 0, too_old: 0, no_phone: 0, excluded: 0, webhook_arrived: 0, already_tried: 0, sent_elsewhere: 0, in_lp: 0, over_cap: 0 };
   const send = [];
   const seenPhones = new Set();
   for (const c of candidates || []) {
@@ -121,6 +123,13 @@ export function selectCanvassLeads(candidates, { lpPhones, arrived, tried, nowMs
     if (addedMs < nowMs - LOOKBACK_DAYS * 86_400_000) { skipped.too_old += 1; continue; }
     if (arrived?.has(id)) { skipped.webhook_arrived += 1; continue; }
     if (tried?.has(id)) { skipped.already_tried += 1; continue; }
+    // Another path already sent it (2026-09-28). A canvass lead that books in
+    // GHL gets a create_lp_lead from GHL_APPT_BOOKED_NEEDS_LP_LEAD — median 9.5
+    // min after creation, but 47 of 286 in 30 days fired 30 min–3 h in, inside
+    // this sweep's window. Its LP id lands only after LP's callback, so the LP
+    // id check alone can miss a send still in flight. Same double-send the chat
+    // sweep hit (d73e542); same two locks: the action row and the tag.
+    if (sentElsewhere?.has(id) || hasSentElsewhereTag(tags)) { skipped.sent_elsewhere += 1; continue; }
     if (lpPhones?.has(phone10) || seenPhones.has(phone10)) { skipped.in_lp += 1; continue; }
     if (send.length >= max) { skipped.over_cap += 1; continue; }
     seenPhones.add(phone10);
