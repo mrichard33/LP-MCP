@@ -194,9 +194,10 @@ const round1 = (x) => (x == null ? null : Math.round(x * 10) / 10);
  * `leads` items: { createdDay, minutes, expected }
  *   minutes   working minutes to first Five9 call, null = never called
  *   expected  true when the lead SHOULD have been called — it was called, or it
- *             is uncalled for a leak reason. An uncalled DNC, rep-hold, "Data"
- *             or already-booked lead was never owed a call, so it is left out of
- *             the called-within shares (classify before you threshold).
+ *             is uncalled for a leak reason. An uncalled DNC, rep-hold or
+ *             already-booked lead was never owed a call, so it is left out of
+ *             the called-within shares (classify before you threshold). "Data"
+ *             leads count as owed since 2026-09-28.
  *
  * Median/p90 are over called leads only — a never-called lead has no time to
  * average; it shows up in never_called and in the within-24h share instead.
