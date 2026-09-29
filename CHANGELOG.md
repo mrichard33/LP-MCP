@@ -7,6 +7,11 @@ repo — they are recorded in `sql/seeds/` on the date they were applied live.
 
 ## 2026-09-29
 
+- **Lead-leak clocks count business hours only.** Waiting time, time to first
+  call and the "no retry" gap skip every closed hour: 8am–8pm ET Monday–Friday,
+  9am–5pm ET Saturday–Sunday (`BUSINESS_HOURS` in `src/lead-speed.js`). Before,
+  the clock started at the next opening but then ran through every night, and
+  weekends used weekday hours. The hourly waiting check runs on the same hours.
 - **An approved DNC lift now actually clears DNC in Lead Perfection.** The clear
   sent `N`, a guess LP rejects ("Invalid DNC value"), so every LP clear failed —
   Slack lifts and automatic re-entry lifts alike. LP's API docs say a blank value
