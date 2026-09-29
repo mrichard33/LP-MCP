@@ -90,7 +90,7 @@ import { runJob } from '../job-runner.js';
 import { hourET, todayET } from './lp-report-common.js';
 import {
   normalizePhone10, wasCalled, needsDncCheck, isRetiredCode, holdDateUnknown,
-  isNotCovered, isNewlyRetiredCode, zip5, isDataLead, summarizeContactRecord,
+  isNotCovered, isNewlyRetiredCode, zip5, isDataLead, summarizeContactRecord, isRetryOwedDispo,
   classifyUncalledLead, finalizeReason, buildRates, estimateValue,
   summarize, formatSlackSummary, LEAK_REASONS, CALLED_NO_RETRY_REASON,
 } from '../lead-leak-classify.js';
@@ -590,6 +590,9 @@ export async function measureLeadLeak({ env = process.env, nowMs = Date.now(), d
     const lastByKey = five9.last?.get(`LDS${String(t.lead.lp_lead_id).trim()}`);
     const lastByPhone = five9.last?.get(t.who.phone10);
     const lastRec = [lastByKey, lastByPhone].filter(Boolean).sort((a, b) => b.ms - a.ms)[0];
+    // Reached and decided (Appointment Set, Not Interested, DNC…) is not owed
+    // a retry, whatever LP's code still says — see RETRY_OWED_DISPOSITIONS.
+    if (!isRetryOwedDispo(lastRec?.name)) continue;
     retryWaiting.push({
       first_name: t.lead.first_name ?? null,
       last_name: t.lead.last_name ?? null,

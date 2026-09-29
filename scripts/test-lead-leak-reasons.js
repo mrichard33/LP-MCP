@@ -18,7 +18,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
-  finalizeReason, summarizeContactRecord, contactRecordRows, LEAK_REASONS,
+  finalizeReason, summarizeContactRecord, contactRecordRows, LEAK_REASONS, isRetryOwedDispo,
 } from '../src/lead-leak-classify.js';
 import { precreateCalls, callsSince, workingMsBetween, lpLocalToUtcMs } from '../src/lead-speed.js';
 import { formatUncalledAlert, reasonText, REASON_LABELS } from '../src/lead-speed-alerts.js';
@@ -166,6 +166,30 @@ test('a called lead that is not "Data" any more is not owed a retry', async () =
     opts: { windowDays: 2, lookups: 'card', rates: false, intake: false },
   });
   assert.equal(m.offenders.length, 0);
+});
+
+test('a lead Five9 last dispositioned as reached-and-decided is not owed a retry', async () => {
+  // First live hour (2026-09-29): Appointment Set / Not Interested / Do Not Call
+  // / Bad Data leads still coded "Data" in LP were named as "no retry since".
+  for (const dispo of ['Appointment Set', 'Not Interested', 'Do Not Call', 'Bad Data', 'Callback']) {
+    const donnaCalls = [DONNA_MS - 2 * HOUR];
+    const runSQL = async (sql) => {
+      if (sql.includes('min(received_at)')) return [{ first_at: '2026-07-28T20:28:17Z' }];
+      if (sql.includes('FROM five9_events_raw')) {
+        return [{ keys: [], phones: [['4079211871', donnaCalls.map(iso), dispo, iso(donnaCalls[0])]] }];
+      }
+      if (sql.includes('FROM lp_leads')) return [DONNA];
+      return [];
+    };
+    const m = await measureLeadLeak({
+      env: {}, nowMs: NOW, deps: deps({ runSQL }), opts: { windowDays: 2, lookups: 'card', rates: false, intake: false },
+    });
+    assert.equal(m.offenders.length, 0, `${dispo} is not "no retry"`);
+  }
+  assert.equal(isRetryOwedDispo('Hung Up'), true);
+  assert.equal(isRetryOwedDispo('answering machine'), true, 'case-insensitive');
+  assert.equal(isRetryOwedDispo(null), true, 'no readable disposition stays visible');
+  assert.equal(isRetryOwedDispo('Some New Outcome'), false, 'allowlist: a new disposition does not page by default');
 });
 
 test('a called lead on the Five9 DNC list is not owed a retry', async () => {
