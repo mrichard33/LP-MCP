@@ -714,7 +714,7 @@ function channelRule(ruleKey) {
 const dndChannels = (tpl) => tpl.find((s) => s.action_type === 'set_dnd').params.channels.slice().sort();
 const types = (tpl) => tpl.map((s) => s.action_type);
 
-test('channel tags: dnc-sms and dnc-voice block calls + texts only, with Five9 and LP', () => {
+test('channel tags: dnc-sms and dnc-voice block calls + texts only, with Five9 and LP Do Not Call', () => {
   for (const [key, tag, guard] of [['TAG_DNC_SMS_OPTOUT', 'dnc-sms', 'suppress:dnc-reply'],
                                    ['TAG_DNC_VOICE_OPTOUT', 'dnc-voice', 'suppress:dnc-voice']]) {
     const { pattern, context, template } = channelRule(key);
@@ -722,7 +722,8 @@ test('channel tags: dnc-sms and dnc-voice block calls + texts only, with Five9 a
     assert.deepEqual(context, { not_has_tag: guard }, `${key} must not re-run the automatic opt-out`);
     assert.deepEqual(dndChannels(template), ['Call', 'RCS', 'SMS'], `${key} must leave email open`);
     assert.ok(types(template).includes('five9_add_numbers_to_dnc'));
-    assert.deepEqual(template.filter((s) => s.action_type === 'update_lp_dnc_status').map((s) => s.params.dnc_code).sort(), ['C', 'T']);
+    assert.deepEqual(template.filter((s) => s.action_type === 'update_lp_dnc_status').map((s) => s.params.dnc_code), ['C'],
+      `${key}: LP holds ONE DNC value, so calls + texts is Do Not Call only (a T after it would win)`);
     assert.ok(!template.some((s) => s.action_type === 'add_tag'), `${key} adds no tags (no stop-bot)`);
   }
 });
@@ -792,4 +793,14 @@ test('approving a staff dnc-sms block restores calls AND texts, and email, with 
   assert.equal(byType(rows, 'five9_remove_numbers_from_dnc_approved')[0].action_payload.clear_sms, true);
   assert.deepEqual(byType(rows, 'record_consent_change').map((r) => `${r.action_payload.channel}/${r.action_payload.change}`),
     ['all/dnc_full_off', 'phone/granted', 'email/granted']);
+});
+
+// ── LP holds one DNC value: calls + texts opt-outs send C only (2026-09-29) ──
+test('the single-code seed drops every T step from the five calls+texts rules and nothing else', () => {
+  const sql = readFileSync(new URL('../sql/seeds/2026-09-29_lp_dnc_single_code.sql', import.meta.url), 'utf8');
+  for (const key of ['BEHAVIORAL_DNC_REPLY', 'RECONCILE_LP_DNC_ON_LINK', 'TAG_DNC_SMS_OPTOUT', 'TAG_DNC_VOICE_OPTOUT', 'VOICE_DNC_REQUEST']) {
+    assert.ok(sql.includes(`'${key}'`), `${key} is not covered`);
+  }
+  assert.match(sql, /e->>'action_type' = 'update_lp_dnc_status' AND e->'params'->>'dnc_code' = 'T'/);
+  assert.match(sql, /ORDER BY ord/, 'the remaining steps keep their order');
 });
