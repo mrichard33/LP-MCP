@@ -27,6 +27,11 @@
 --   the tag, and GHL's own STOP handling, which tags dnc-sms (~100 contacts in
 --   the 30 days to 2026-09-29) and until now never reached Five9 or LP.
 --
+-- LP gets ONE code, C (Do Not Call) — LP holds a single internal DNC value per
+--   prospect, so a C then a T used to leave only T (the user's ruling
+--   2026-09-29: calls + texts opt-outs are Do Not Call in LP). See
+--   2026-09-29_lp_dnc_single_code.sql.
+--
 -- LIFT. dnc-sms is a carrier-STOP signal to the lift (detectCarrierStop): an
 --   approved lift gives calls, LP and Five9 back and leaves texts off. The
 --   lift clears dnc-voice and dnc-email and turns Email DND off.
@@ -43,7 +48,7 @@ INSERT INTO agent_rules
    action_template, requires_approval, enabled, priority, rule_type, created_by, notes)
 SELECT
   'TAG_DNC_SMS_OPTOUT',
-  'dnc-sms tag → opt out of calls + texts (Five9, LP, consent)',
+  'dnc-sms tag → opt out of calls + texts (Five9, LP Do Not Call, consent)',
   'reconciliation',
   '{"event_type": "ghl.tag_added", "event_subtype": "dnc-sms"}'::jsonb,
   NULL,
@@ -55,8 +60,6 @@ SELECT
      "params": {"reason": "dnc-sms tag in GHL — suppress dialing", "numbers_from_contact": true}},
     {"action_type": "update_lp_dnc_status", "target_system": "lp", "target_entity": "contact",
      "params": {"emp_id": "5686", "dnc_code": "C"}},
-    {"action_type": "update_lp_dnc_status", "target_system": "lp", "target_entity": "contact",
-     "params": {"emp_id": "5686", "dnc_code": "T"}},
     {"action_type": "record_consent_change", "target_system": "lp", "target_entity": "contact", "priority": 20,
      "params": {"channel": "phone", "change": "revoked", "source": "ghl_tag",
                 "reason": "dnc-sms tag added in GHL — texts + automated calls (FCC 24-24 para. 32); email continues"}}
@@ -71,7 +74,7 @@ INSERT INTO agent_rules
    action_template, requires_approval, enabled, priority, rule_type, created_by, notes)
 SELECT
   'TAG_DNC_VOICE_OPTOUT',
-  'dnc-voice tag → opt out of calls + texts (Five9, LP, consent)',
+  'dnc-voice tag → opt out of calls + texts (Five9, LP Do Not Call, consent)',
   'reconciliation',
   '{"event_type": "ghl.tag_added", "event_subtype": "dnc-voice"}'::jsonb,
   NULL,
@@ -83,8 +86,6 @@ SELECT
      "params": {"reason": "dnc-voice tag in GHL — suppress dialing", "numbers_from_contact": true}},
     {"action_type": "update_lp_dnc_status", "target_system": "lp", "target_entity": "contact",
      "params": {"emp_id": "5686", "dnc_code": "C"}},
-    {"action_type": "update_lp_dnc_status", "target_system": "lp", "target_entity": "contact",
-     "params": {"emp_id": "5686", "dnc_code": "T"}},
     {"action_type": "record_consent_change", "target_system": "lp", "target_entity": "contact", "priority": 20,
      "params": {"channel": "phone", "change": "revoked", "source": "ghl_tag",
                 "reason": "dnc-voice tag added in GHL — calls + texts (FCC 24-24 para. 32); email continues"}}
