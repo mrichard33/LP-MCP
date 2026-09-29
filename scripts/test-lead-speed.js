@@ -22,7 +22,7 @@ import assert from 'node:assert/strict';
 
 import {
   lpLocalToUtcMs, etDay, workingStartMs, firstCallAfter, minutesToFirstCall, waitingMs,
-  percentile, dailySpeedRows, speedStats,
+  percentile, dailySpeedRows, speedStats, isOpenAt, BUSINESS_HOURS,
 } from '../src/lead-speed.js';
 import {
   buildIntakeCandidatesSql, classifyIntakeGap, summarizeIntakeGap, LP_ID_FIELDS,
@@ -509,4 +509,42 @@ test('daily pass, alerts live: a NIS2 set in the last day fires the retired-code
   assert.match(text, /Retired code used on 1 lead/);
   assert.match(text, /Pat L\. · coded NIS2 · LP 930/);
   assert.ok(!text.includes('LP 931'), 'an old NIS2 is history, not a new use');
+});
+
+/* --- business hours only (2026-09-29) -------------------------------- */
+// The user's ruling: only business hours count — 8am–8pm ET Monday–Friday,
+// 9am–5pm ET Saturday–Sunday. 2026-09-26 is a Saturday, 09-28 a Monday. LP
+// timestamps below are Eastern digits (see lpLocalToUtcMs); Five9 times are UTC
+// (ET = UTC−4 in late September).
+
+test('a lead that arrives at 4am has waited 0 until 8am, and 1h at 9am', () => {
+  const at4am = '2026-09-29T04:00:00+00:00'; // Tuesday 04:00 ET
+  assert.equal(waitingMs(at4am, Date.parse('2026-09-29T11:30:00Z')), 0, '7:30am ET — still closed');
+  assert.equal(waitingMs(at4am, Date.parse('2026-09-29T13:00:00Z')), 60 * 60000, '9am ET');
+});
+
+test('closed hours overnight are not counted', () => {
+  // Monday 3pm ET → Tuesday 9am ET: 5h Monday + 1h Tuesday, not 18h.
+  assert.equal(waitingMs('2026-09-28T15:00:00+00:00', Date.parse('2026-09-29T13:00:00Z')), 6 * 3600000);
+  // Monday 7pm ET, first call Tuesday 8:30am ET → 60 + 30 business minutes.
+  assert.equal(minutesToFirstCall('2026-09-28T19:00:00+00:00', Date.parse('2026-09-29T12:30:00Z')), 90);
+});
+
+test('weekends open 9am–5pm', () => {
+  const iso = (ms) => new Date(ms).toISOString();
+  // Saturday 8:30am ET → opens 9am ET.
+  assert.equal(iso(workingStartMs(Date.parse('2026-09-26T12:30:00Z'))), '2026-09-26T13:00:00.000Z');
+  // Saturday 6pm ET (after the 5pm close) → Sunday 9am ET.
+  assert.equal(iso(workingStartMs(Date.parse('2026-09-26T22:00:00Z'))), '2026-09-27T13:00:00.000Z');
+  // Friday 9pm ET → Saturday 9am ET, not 8am.
+  assert.equal(iso(workingStartMs(Date.parse('2026-09-26T01:00:00Z'))), '2026-09-26T13:00:00.000Z');
+  // Sunday 6pm ET → Monday 8am ET.
+  assert.equal(iso(workingStartMs(Date.parse('2026-09-27T22:00:00Z'))), '2026-09-28T12:00:00.000Z');
+  // Saturday 4pm ET → Sunday 10am ET: 1h Saturday + 1h Sunday.
+  assert.equal(waitingMs('2026-09-26T16:00:00+00:00', Date.parse('2026-09-27T14:00:00Z')), 2 * 3600000);
+  assert.equal(isOpenAt(Date.parse('2026-09-26T12:30:00Z')), false, 'Sat 8:30am');
+  assert.equal(isOpenAt(Date.parse('2026-09-26T13:30:00Z')), true, 'Sat 9:30am');
+  assert.equal(isOpenAt(Date.parse('2026-09-26T21:30:00Z')), false, 'Sat 5:30pm');
+  assert.equal(isOpenAt(Date.parse('2026-09-28T23:30:00Z')), true, 'Mon 7:30pm');
+  assert.deepEqual(BUSINESS_HOURS, { weekday: { open: 8, close: 20 }, weekend: { open: 9, close: 17 } });
 });

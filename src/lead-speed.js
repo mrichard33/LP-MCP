@@ -19,19 +19,26 @@
  * every lead look created four (five, in winter) hours earlier than it was —
  * so every LP time passes through lpLocalToUtcMs before it meets a Five9 time.
  *
- * THE CLOCK STARTS WHEN THE CALL CENTER IS OPEN. A lead that arrives at 11pm
- * and is called at 8:05am was not ignored for nine hours. "Time to first call"
- * and the "not called yet" grace both count from the later of the lead's
- * arrival and the next opening (CALL_CENTER_OPEN_HOUR…CALL_CENTER_CLOSE_HOUR
- * ET, every day). Measuring raw clock time would page every morning on the
- * overnight leads — an alarm that fires on the healthy case gets muted
- * (CLAUDE.md, "Classify before you threshold").
+ * THE CLOCK ONLY RUNS WHILE THE CALL CENTER IS OPEN. A lead that arrives at
+ * 11pm and is called at 8:05am was not ignored for nine hours — it waited five
+ * minutes. "Time to first call", "waiting" and the "no retry" gap all count
+ * business hours only (BUSINESS_HOURS below). Measuring raw clock time would
+ * page every morning on the overnight leads — an alarm that fires on the
+ * healthy case gets muted (CLAUDE.md, "Classify before you threshold").
+ *
+ * 2026-09-29 (the user's ruling): business hours are 8am–8pm Monday–Friday and
+ * 9am–5pm Saturday–Sunday, ET. Before this the clock started at the next
+ * opening but then ran straight through every night after it, so a lead that
+ * arrived at 3pm and was still waiting at 9am the next day read ~18h, not 6h;
+ * and weekends used the weekday hours.
  */
 
 export const TIMEZONE = 'America/New_York';
 // Hours the phones are worked, ET, 24h clock. Change them here and nowhere else.
-export const CALL_CENTER_OPEN_HOUR = 8;
-export const CALL_CENTER_CLOSE_HOUR = 20;
+export const BUSINESS_HOURS = Object.freeze({
+  weekday: Object.freeze({ open: 8, close: 20 }), // Monday–Friday
+  weekend: Object.freeze({ open: 9, close: 17 }), // Saturday, Sunday
+});
 
 const MINUTE_MS = 60 * 1000;
 const HOUR_MS = 60 * MINUTE_MS;
@@ -86,17 +93,47 @@ export function etDay(ms) {
   return `${f.year}-${String(f.month).padStart(2, '0')}-${String(f.day).padStart(2, '0')}`;
 }
 
+/** Business hours for an ET calendar date: { open, close } (24h clock). */
+export function hoursForDay(year, month, day) {
+  const dow = new Date(Date.UTC(year, month - 1, day)).getUTCDay(); // 0 = Sunday
+  return dow === 0 || dow === 6 ? BUSINESS_HOURS.weekend : BUSINESS_HOURS.weekday;
+}
+
+/** The opening and closing instants (true UTC ms) of the ET day containing `ms`. */
+function dayWindow(ms) {
+  const f = etParts(ms);
+  const h = hoursForDay(f.year, f.month, f.day);
+  return {
+    f,
+    openMs: etWallToUtcMs(f.year, f.month, f.day, h.open),
+    closeMs: etWallToUtcMs(f.year, f.month, f.day, h.close),
+  };
+}
+
+/** Midnight ET at the start of the calendar day after the ET date `f`. */
+function nextEtMidnight(f) {
+  const n = new Date(Date.UTC(f.year, f.month - 1, f.day + 1));
+  return etWallToUtcMs(n.getUTCFullYear(), n.getUTCMonth() + 1, n.getUTCDate(), 0);
+}
+
 /**
  * When the phones could first have rung for something that arrived at `ms`:
- * `ms` itself inside open hours, else the next opening.
+ * `ms` itself inside business hours, else the next opening (the same day's if
+ * it is still early, otherwise the next day's — weekend hours on a weekend).
  */
-export function workingStartMs(ms, open = CALL_CENTER_OPEN_HOUR, close = CALL_CENTER_CLOSE_HOUR) {
-  const f = etParts(ms);
-  if (f.hour >= open && f.hour < close) return ms;
-  const base = f.hour < open ? ms : ms + DAY_MS; // after closing → tomorrow's opening
-  const d = etParts(base);
-  return etWallToUtcMs(d.year, d.month, d.day, open);
+export function workingStartMs(ms) {
+  let t = ms;
+  for (let guard = 0; guard < 14; guard += 1) {
+    const { f, openMs, closeMs } = dayWindow(t);
+    if (t < openMs) return openMs;
+    if (t < closeMs) return t;
+    t = nextEtMidnight(f);
+  }
+  return t;
 }
+
+/** Is the call center open at `ms`? */
+export const isOpenAt = (ms) => workingStartMs(ms) === ms;
 
 /** First value in an ascending array that is ≥ t, or null (binary search). */
 function firstAtOrAfter(sorted, t) {
@@ -209,40 +246,40 @@ export function callsSince({ leadId, phone10, createdAtLp }, ctx, hours = PRECRE
 
 /**
  * Call-center time between two instants, in ms: only the hours inside
- * CALL_CENTER_OPEN_HOUR…CLOSE ET count. "No retry in 4 hours" must not fire at
+ * BUSINESS_HOURS (ET, weekend hours on weekends) count. "No retry in 4 hours" must not fire at
  * 8:30am on a lead last rung at 7pm — the phones were off for 13 of those hours.
  */
-export function workingMsBetween(fromMs, toMs, open = CALL_CENTER_OPEN_HOUR, close = CALL_CENTER_CLOSE_HOUR) {
+export function workingMsBetween(fromMs, toMs) {
   if (!Number.isFinite(fromMs) || !Number.isFinite(toMs) || toMs <= fromMs) return 0;
   let total = 0;
   let cursor = fromMs;
   for (let guard = 0; guard < 400 && cursor < toMs; guard += 1) {
-    const start = workingStartMs(cursor, open, close);
+    const start = workingStartMs(cursor);
     if (start >= toMs) break;
-    const d = etParts(start);
-    const end = etWallToUtcMs(d.year, d.month, d.day, close);
-    total += Math.min(end, toMs) - start;
-    cursor = end;
+    const { closeMs } = dayWindow(start);
+    total += Math.min(closeMs, toMs) - start;
+    cursor = closeMs;
   }
   return total;
 }
 
 /**
- * Working minutes from the lead's arrival to its first call — the clock
- * starting at workingStartMs. A call made before opening (someone dialled early)
- * counts as 0, never negative. Null when there was no call or no creation time.
+ * Business minutes from the lead's arrival to its first call: closed hours
+ * (nights, and outside the shorter weekend hours) never count. A call made
+ * before opening (someone dialled early) counts as 0, never negative. Null
+ * when there was no call or no creation time.
  */
 export function minutesToFirstCall(createdAtLp, firstCallMs) {
   const createdMs = lpLocalToUtcMs(createdAtLp);
   if (createdMs == null || firstCallMs == null) return null;
-  return Math.max(0, (firstCallMs - workingStartMs(createdMs)) / MINUTE_MS);
+  return workingMsBetween(createdMs, firstCallMs) / MINUTE_MS;
 }
 
-/** How long a still-uncalled lead has been waiting, in working hours' terms (ms). */
+/** How long a still-uncalled lead has been waiting, in business hours only (ms). */
 export function waitingMs(createdAtLp, nowMs) {
   const createdMs = lpLocalToUtcMs(createdAtLp);
   if (createdMs == null) return null;
-  return Math.max(0, nowMs - workingStartMs(createdMs));
+  return workingMsBetween(createdMs, nowMs);
 }
 
 /** Percentile (0–1) of a numeric array, linear interpolation. Null when empty. */
