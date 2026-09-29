@@ -21,6 +21,7 @@
  */
 
 import { LEAK_REASONS } from './lead-leak-classify.js';
+import { BUSINESS_HOURS } from './lead-speed.js';
 
 // ─── Thresholds — one place; each is env-overridable in alertConfig() ────────
 export const ALERT_DEFAULTS = Object.freeze({
@@ -247,6 +248,12 @@ function groupedOffenderLines(offenders, max, nowMs) {
   return out;
 }
 
+/** { open: 8, close: 20 } → "8am–8pm". */
+const hourLabel = ({ open, close }) => {
+  const h = (n) => `${n % 12 || 12}${n < 12 ? 'am' : 'pm'}`;
+  return `${h(open)}–${h(close)}`;
+};
+
 const linkLine = (dashboardUrl) => (dashboardUrl ? `Full list: ${dashboardUrl}` : 'Full list: Dashboard → Lead Leaks');
 
 export function formatSpeedAlert(decision, offenders, { cfg = ALERT_DEFAULTS, dashboardUrl, nowMs = Date.now() } = {}) {
@@ -279,7 +286,8 @@ export function formatSpeedRecovered(decision) {
 export function formatUncalledAlert(offenders, { cfg = ALERT_DEFAULTS, dashboardUrl, nowMs = Date.now() } = {}) {
   return [
     `📵 *${offenders.length} lead${offenders.length === 1 ? '' : 's'} waiting more than ${cfg.graceHours}h for a Five9 call*`,
-    '(never called, or called and not retried — clock counts call-center hours only)',
+    '(never called, or called and not retried — waiting time counts business hours only: '
+      + `${hourLabel(BUSINESS_HOURS.weekday)} Mon–Fri, ${hourLabel(BUSINESS_HOURS.weekend)} Sat–Sun)`,
     ...groupedOffenderLines(offenders, cfg.maxNamed, nowMs),
     '',
     linkLine(dashboardUrl),
