@@ -120,7 +120,9 @@ transaction. `CONSENT_MODEL_MODE` is `shadow`: nothing gates a send on these tab
 - **LP clears DNC with a BLANK `newDncStatus`** (LP's API docs: "Passing a blank value will remove
   the existing selection and reset the status"). The old clear value `N` was a guess LP rejects
   ("Invalid DNC value"), so every LP clear failed until 2026-09-29. LP holds ONE internal DNC value
-  per prospect (`GetLead` → `intdnc`, e.g. "Do Not Text"): a C then a T leaves only T.
+  per prospect (`GetLead` → `intdnc`, e.g. "Do Not Text"): a C then a T leaves only T. So a
+  calls + texts opt-out sends **C (Do Not Call) only** (the user's ruling, 2026-09-29) — never add a T
+  step after it.
 - `POST /slack/dnc-lift/decision` is idempotent on `request_id` through `dnc_lift_requests`
   (sql/140) and refuses (503) without it.
 - **A tag blocks only its own channel (2026-09-29).** `dnc-sms` / `dnc-voice` → calls + texts

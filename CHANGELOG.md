@@ -7,6 +7,11 @@ repo — they are recorded in `sql/seeds/` on the date they were applied live.
 
 ## 2026-09-29
 
+- **Calls + texts opt-outs mark Lead Perfection "Do Not Call".** LP keeps one
+  DNC value per record, and the rules sent Do Not Call then Do Not Text, so the
+  record ended up "Do Not Text" and looked callable in LP. The five rules now
+  send Do Not Call only (`sql/seeds/2026-09-29_lp_dnc_single_code.sql`).
+
 - **An approved DNC lift now actually clears DNC in Lead Perfection.** The clear
   sent `N`, a guess LP rejects ("Invalid DNC value"), so every LP clear failed —
   Slack lifts and automatic re-entry lifts alike. LP's API docs say a blank value
