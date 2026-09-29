@@ -280,8 +280,12 @@ test('the Slack text labels $ an estimate and gives each bucket its own line', (
 const NOW = Date.parse('2026-09-26T12:00:00Z');
 
 // Routes each SQL statement to a canned answer by what it reads.
-function stubSQL({ five9Fails = false, leads = [], keys = [], phones = [], siblings = [] } = {}) {
+function stubSQL({ five9Fails = false, leads = [], keys = [], phones = [], siblings = [], dncPhones = [], optedOut = [] } = {}) {
   return async (sql) => {
+    // The "why" reads (2026-09-29): another LP lead coded DNC on the phone, and
+    // opt-outs in contact_consent.
+    if (sql.includes('FROM contact_consent')) return optedOut.map((id) => ({ ghl_contact_id: id }));
+    if (sql.includes("disposition_code = 'DNC'")) return dncPhones.map((p) => ({ phone10: p }));
     if (sql.includes('min(received_at)')) {
       if (five9Fails) throw new Error('statement timeout');
       return [{ first_at: '2026-07-28T20:28:17Z' }];
@@ -322,6 +326,7 @@ test('failed Five9 read → insufficient_evidence, not "0 leaks"; nothing stored
     hlRunSQL: async () => [],
     checkDnc: async () => ({ on_dnc: [] }),
     getContactRecords: async () => ({ count: 1 }),
+    findLeadInDataQueues: async () => ({ present: false, row: null, truncated_queues: [] }),
     supabase: stubDb(),
     postToSlack: async () => { throw new Error('must not post'); },
   };
@@ -345,6 +350,7 @@ test('failed Five9 DNC read → insufficient_evidence (unknown DNC is never "cle
       hlRunSQL: async () => [],
       checkDnc: async () => { throw new Error('Five9 auth breaker open'); },
       getContactRecords: async () => ({ count: 1 }),
+      findLeadInDataQueues: async () => ({ present: false, row: null, truncated_queues: [] }),
     },
   });
   assert.equal(m.verdict, 'insufficient_evidence');
@@ -380,7 +386,15 @@ test('end to end: called leads drop out, the rest are labelled, capped lookups g
     supabase: stubDb(),
     postToSlack: async () => { throw new Error('shadow must not post'); },
   };
+  deps.findLeadInDataQueues = async ([id]) => (id === '5'
+    ? { present: true, row: { Lds_ID: 5, Cqd_ID: 8, NumDialingAttempts: '0', LastCallResult: '' }, truncated_queues: [] }
+    : { present: false, row: null, truncated_queues: [] });
   const m = await measureLeadLeak({ env: { LEAD_LEAK_FIVE9_LOOKUP_CAP: '3' }, nowMs: NOW, deps });
+  const why = Object.fromEntries(m.rows.map((r) => [r.lp_lead_id, r.detail.why]));
+  assert.match(why[5], /LP has it in "Data - Hot Leads <7", 0 dial attempts/);
+  assert.match(why[6], /^Never loaded into Five9\. LP has it in none of its Data call queues/);
+  assert.match(why[8], /another LP lead with the same phone was already called/);
+  assert.ok(m.rows.every((r) => typeof r.detail.why === 'string' && r.detail.why.length > 0), 'every row explained');
   assert.equal(m.universe, 9);
   assert.equal(m.called, 3);
   assert.equal(m.summary.retired_code_in_use, 1, 'counted over the whole window, called leads too');
@@ -412,6 +426,7 @@ test('live posts once; a failed post is a failed pass, not a quiet morning', asy
     hlRunSQL: async () => [],
     checkDnc: async () => ({ on_dnc: [] }),
     getContactRecords: async () => ({ count: 1 }),
+    findLeadInDataQueues: async () => ({ present: false, row: null, truncated_queues: [] }),
     supabase: stubDb(),
     postToSlack: async (text, channel) => { sent.push({ text, channel }); return { ok: false, error: 'channel_not_found' }; },
   };
