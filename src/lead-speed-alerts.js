@@ -21,6 +21,7 @@
  */
 
 import { LEAK_REASONS } from './lead-leak-classify.js';
+import { workingMsBetween } from './lead-speed.js';
 
 // ─── Thresholds — one place; each is env-overridable in alertConfig() ────────
 export const ALERT_DEFAULTS = Object.freeze({
@@ -68,6 +69,8 @@ export function alertMode(env = process.env) {
 export const REASON_LABELS = Object.freeze({
   called_no_retry: 'Called, no retry since',
   not_on_dial_list: 'In Five9 but not on any dialing list',
+  // The group header; each line names the list (reasonText).
+  on_list_not_dialed: 'On a Five9 list but no call recorded',
   not_issued_call_center: 'Not issued to a rep (call center, NIS)',
   not_covered_by_rep: 'Not Covered (no rep)',
   noc_out_of_area: 'NOC — out of area (review)',
@@ -77,13 +80,50 @@ export const REASON_LABELS = Object.freeze({
   unverified: 'Not verified — Five9 lookup failed or skipped',
 });
 
-// Group order on the waiting card: the most actionable first.
+// Tie-break order for groups on the waiting card, the most actionable first.
+// Groups are ordered by how many FRESH leads they hold (groupedOffenderLines);
+// this only decides between groups with equal counts.
 export const CARD_REASON_ORDER = Object.freeze([
-  'called_no_retry', 'not_on_dial_list', 'routing_or_automation_failure', 'not_in_five9',
+  'called_no_retry', 'not_on_dial_list', 'on_list_not_dialed', 'routing_or_automation_failure', 'not_in_five9',
   'not_issued_call_center', 'not_covered_by_rep', 'rep_hold_expired', 'unverified',
 ]);
 
-const DAY_MS = 24 * 60 * 60 * 1000;
+const HOUR_MS = 60 * 60 * 1000;
+const DAY_MS = 24 * HOUR_MS;
+
+// Freshest leads first (2026-09-29). The cards used to list the longest wait
+// first, so on the daily card (60-day window) the 15 named lines were all
+// August leads and a lead from this morning — the one still worth saving —
+// never made the card. "Fresh" for group ordering is the last 24 CALL-CENTER
+// hours, so a lead from Friday evening still counts as fresh on Monday morning.
+export const FRESH_WORKING_MS = 24 * HOUR_MS;
+// The daily speed card names only leads created in the last this-many days;
+// older ones are one count line pointing at the dashboard.
+export const SPEED_CARD_NAMED_DAYS = 7;
+
+/**
+ * When the lead was created (ms), or null. The job sets `createdMs`; a caller
+ * that only has the wait falls back to now − wait, which orders the same way.
+ */
+export function offenderCreatedMs(o, nowMs = Date.now()) {
+  if (Number.isFinite(o?.createdMs)) return o.createdMs;
+  return Number.isFinite(o?.waitingMs) ? nowMs - o.waitingMs : null;
+}
+
+/** Sort comparator: newest lead first; an unknown creation time goes last. */
+export function newestFirst(a, b, nowMs = Date.now()) {
+  const ca = offenderCreatedMs(a, nowMs);
+  const cb = offenderCreatedMs(b, nowMs);
+  if (ca == null || cb == null) return (ca == null) - (cb == null);
+  return cb - ca;
+}
+
+/** { reason: count } over every offender — the endpoint's waiting_by_reason. */
+export function countByReason(offenders) {
+  const out = {};
+  for (const o of offenders || []) out[o.reason] = (out[o.reason] || 0) + 1;
+  return out;
+}
 
 /** 'YYYY-MM-DD' shifted by n days. */
 export function shiftDay(day, n) {
@@ -203,6 +243,9 @@ export function reasonText(o, nowMs = Date.now()) {
       ? `${formatWait(nowMs - o.calls.lastMs)} ago` : null].filter(Boolean).join(', ');
     return `Called ${o.calls.count}× (last: ${last}) — no retry since`;
   }
+  if (o.reason === 'on_list_not_dialed' && o.five9_record?.list) {
+    return `On ${o.five9_record.list} in Five9 but no call recorded`;
+  }
   return REASON_LABELS[o.reason] || o.reason;
 }
 
@@ -216,33 +259,58 @@ function offenderLine(o, nowMs) {
     + ` · ${reasonText(o, nowMs)} · LP ${o.lp_lead_id}`;
 }
 
-function offenderLines(offenders, max, nowMs) {
-  const shown = offenders.slice(0, max).map((o) => offenderLine(o, nowMs));
-  if (offenders.length > max) shown.push(`…and ${offenders.length - max} more`);
+/**
+ * Split `max` named lines across groups of these sizes, round-robin in group
+ * order: every group gets a line before any gets a second, so each gets 3 (or
+ * all it has) before any gets a 4th — the handoff's floor — and one large
+ * group can no longer use up the whole card. Returns lines per group.
+ */
+export function allocateLines(sizes, max) {
+  const shown = sizes.map(() => 0);
+  let left = Math.max(0, Math.floor(max));
+  while (left > 0) {
+    let gave = false;
+    for (let i = 0; i < sizes.length && left > 0; i += 1) {
+      if (shown[i] < sizes[i]) { shown[i] += 1; left -= 1; gave = true; }
+    }
+    if (!gave) break;
+  }
   return shown;
 }
 
 /**
- * The same lines grouped by reason, a header with the count per group, so the
- * team sees "6 not on a dialing list / 6 called, no retry" at a glance. `max`
- * still caps the NAMED lines across the whole card; every group keeps its
- * header and full count even when its lines are cut.
+ * The lines grouped by reason (2026-09-29, #1079), so the team sees "31 not on
+ * a dialing list / 6 called, no retry" at a glance:
+ *   - inside each group, newest lead first;
+ *   - groups ordered by how many leads from the last 24 call-center hours they
+ *     hold, most first (then total, then CARD_REASON_ORDER) — the group with
+ *     today's leads is the one someone can still act on;
+ *   - `max` named lines split across groups (allocateLines);
+ *   - every header carries the group's FULL count, and "(showing N)" when its
+ *     lines were cut.
  */
 function groupedOffenderLines(offenders, max, nowMs) {
   const groups = new Map();
   for (const o of offenders) groups.set(o.reason, [...(groups.get(o.reason) || []), o]);
+  const isFresh = (o) => {
+    const c = offenderCreatedMs(o, nowMs);
+    return c != null && workingMsBetween(c, nowMs) <= FRESH_WORKING_MS;
+  };
   const rank = (r) => { const i = CARD_REASON_ORDER.indexOf(r); return i < 0 ? CARD_REASON_ORDER.length : i; };
-  const ordered = [...groups.entries()].sort((a, b) => rank(a[0]) - rank(b[0]) || a[0].localeCompare(b[0]));
+  const ordered = [...groups.entries()]
+    .map(([reason, list]) => ({
+      reason, list: [...list].sort((a, b) => newestFirst(a, b, nowMs)), fresh: list.filter(isFresh).length,
+    }))
+    .sort((a, b) => b.fresh - a.fresh || b.list.length - a.list.length
+      || rank(a.reason) - rank(b.reason) || a.reason.localeCompare(b.reason));
+  const shown = allocateLines(ordered.map((g) => g.list.length), max);
   const out = [];
-  let named = 0;
-  for (const [reason, list] of ordered) {
-    out.push(`*${REASON_LABELS[reason] || reason} (${list.length})*`);
-    for (const o of list) {
-      if (named >= max) break;
-      out.push(offenderLine(o, nowMs));
-      named += 1;
-    }
-  }
+  ordered.forEach((g, i) => {
+    const cut = shown[i] < g.list.length ? ` (showing ${shown[i]})` : '';
+    out.push(`*${REASON_LABELS[g.reason] || g.reason} — ${g.list.length}${cut}*`);
+    for (const o of g.list.slice(0, shown[i])) out.push(offenderLine(o, nowMs));
+  });
+  const named = shown.reduce((n, x) => n + x, 0);
   if (offenders.length > named) out.push(`…and ${offenders.length - named} more`);
   return out;
 }
@@ -261,12 +329,18 @@ export function formatSpeedAlert(decision, offenders, { cfg = ALERT_DEFAULTS, da
     why.push(`${pct(r.pct_not_called_24h)} of leads were not called within 24 working hours,`
       + ` up from ${pct(b.pct_not_called_24h)}.`);
   }
+  // Name only the last SPEED_CARD_NAMED_DAYS of leads (2026-09-29): this card
+  // runs off the 60-day pass, and its named lines were all August leads.
+  const since = nowMs - SPEED_CARD_NAMED_DAYS * DAY_MS;
+  const recent = offenders.filter((o) => { const c = offenderCreatedMs(o, nowMs); return c == null || c >= since; });
+  const older = offenders.length - recent.length;
   return [
     '🐢 *Leads are being called more slowly* (Five9 call records)',
     ...why,
     '',
     offenders.length ? `Leads waiting right now for a call (${offenders.length}):` : 'No lead is waiting past the grace right now.',
-    ...offenderLines(offenders, cfg.maxNamed, nowMs),
+    ...groupedOffenderLines(recent, cfg.maxNamed, nowMs),
+    ...(older ? [`+ ${older} older lead${older === 1 ? '' : 's'} (${SPEED_CARD_NAMED_DAYS + 1}+ days) — see dashboard`] : []),
     '',
     linkLine(dashboardUrl),
   ].join('\n');

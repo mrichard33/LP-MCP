@@ -70,6 +70,11 @@
 //       calls — src/lead-speed.js precreateCalls)
 //   The hourly pass now looks up only the leads it will name, capped at
 //   LEAD_UNCALLED_LOOKUP_CAP (default 40), and groups the card by reason.
+//   Later that day: a blank Five9 attempts field now reads 0 (it had kept
+//   dozens of never-listed Simpletext leads in the routing bucket), and a
+//   lead ON a list with no call in our history reads `on_list_not_dialed`.
+//   Cards and `waiting[]` list the NEWEST leads first; the daily speed card
+//   names only the last 7 days (src/lead-speed-alerts.js).
 //
 // ENDPOINT (registerLeadLeakRoutes):
 //   GET|POST /api/lp/lead-leak → measure now, return the summary. Never posts,
@@ -107,7 +112,7 @@ import {
   alertConfig, alertMode, shouldAlertSpeed, shouldAlertUncalled, shouldAlertIntakeGap,
   verdictToActive, formatSpeedAlert, formatSpeedRecovered, formatUncalledAlert,
   formatUncalledRecovered, formatIntakeGapAlert, formatIntakeGapRecovered, shiftDay,
-  shouldAlertRetiredCode, formatRetiredCodeAlert, formatRetiredCodeRecovered,
+  shouldAlertRetiredCode, formatRetiredCodeAlert, formatRetiredCodeRecovered, newestFirst, countByReason,
 } from '../lead-speed-alerts.js';
 
 export const JOB_ID = 'lead-leak-monitor';
@@ -626,7 +631,17 @@ export async function measureLeadLeak({ env = process.env, nowMs = Date.now(), d
       } else {
         lookup = lookupCap === 0 ? 'skipped' : 'over_cap';
       }
-      reason = finalizeReason(lookup);
+      // Every lead here is uncalled — no Five9 call for it in our history.
+      reason = finalizeReason(lookup, { calledInHistory: false });
+      // 2026-09-29: what still lands here after not_on_dial_list and
+      // on_list_not_dialed is a record shape nobody has named yet. Log Five9's
+      // raw values so the next label can be written from evidence.
+      if (reason === 'routing_or_automation_failure') {
+        const raw = lookup && typeof lookup === 'object' ? lookup.raw : null;
+        console.log(`[LeadLeak] unmatched five9 record lp_lead_id=${lead.lp_lead_id}`
+          + ` list=${JSON.stringify(raw?.list ?? null)} campaign=${JSON.stringify(raw?.campaign ?? null)}`
+          + ` attempts=${JSON.stringify(raw?.attempts ?? null)}${raw ? '' : ' (record not parseable)'}`);
+      }
     }
     const record = lookup && typeof lookup === 'object' ? lookup : null;
     const createdMs = lpLocalToUtcMs(lead.created_at_lp);
@@ -727,7 +742,9 @@ export async function measureLeadLeak({ env = process.env, nowMs = Date.now(), d
   }
 
   // Owed leads waiting past the grace for a Five9 call — named on the cards:
-  // never called (a leak reason), or called and not retried.
+  // never called (a leak reason), or called and not retried. NEWEST FIRST
+  // (2026-09-29): longest-wait-first put August leads at the top of the daily
+  // list and pushed this morning's leads below the card's cap.
   const offenders = [
     ...rows
       .filter((r) => LEAK_REASONS.includes(r.reason))
@@ -736,7 +753,8 @@ export async function measureLeadLeak({ env = process.env, nowMs = Date.now(), d
     ...retryWaiting,
   ]
     .filter((o) => o.waitingMs != null && o.waitingMs > acfg.graceHours * HOUR_MS)
-    .sort((a, b) => b.waitingMs - a.waitingMs);
+    .map((o) => ({ ...o, createdMs: lpLocalToUtcMs(o.created_at_lp) }))
+    .sort((a, b) => newestFirst(a, b, nowMs));
 
   // GHL contacts that never reached LP. Its own three-way: a failed HL read
   // leaves `intake` null (could not tell), and never blocks the leak counts.
@@ -1029,21 +1047,28 @@ async function guarded(fn) {
   try { return await inFlight; } finally { inFlight = null; }
 }
 
+/** The GET /api/lp/lead-leak body for one measurement. */
+export function leadLeakResponse(m) {
+  const { rows, intake, offenders, ...rest } = m;
+  return {
+    ok: m.verdict !== 'insufficient_evidence',
+    ...rest,
+    intake: intake ? { summary: intake.summary, missing: intake.rows.filter((r) => r.class === 'not_in_lp') } : null,
+    // Newest first; waiting_by_reason counts ALL of them, not just these 50.
+    waiting: offenders ? offenders.slice(0, 50) : null,
+    waiting_by_reason: offenders ? countByReason(offenders) : null,
+    // A short sample of the real leaks, newest first — the full list is in
+    // lead_leak_daily after a scheduled pass.
+    sample: rows.filter((r) => LEAK_REASONS.includes(r.reason)).slice(0, 25),
+  };
+}
+
 export function registerLeadLeakRoutes(app) {
   const handler = async (_req, res) => {
     try {
       const m = await guarded(() => measureLeadLeak());
       if (m.busy) return res.status(409).json({ ok: false, error: 'a lead-leak pass is already running' });
-      const { rows, intake, offenders, ...rest } = m;
-      res.json({
-        ok: m.verdict !== 'insufficient_evidence',
-        ...rest,
-        intake: intake ? { summary: intake.summary, missing: intake.rows.filter((r) => r.class === 'not_in_lp') } : null,
-        waiting: offenders ? offenders.slice(0, 50) : null,
-        // A short sample of the real leaks, newest first — the full list is in
-        // lead_leak_daily after a scheduled pass.
-        sample: rows.filter((r) => LEAK_REASONS.includes(r.reason)).slice(0, 25),
-      });
+      res.json(leadLeakResponse(m));
     } catch (err) {
       res.status(500).json({ ok: false, error: err.message });
     }

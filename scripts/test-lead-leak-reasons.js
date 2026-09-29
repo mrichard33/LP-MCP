@@ -19,10 +19,13 @@ import assert from 'node:assert/strict';
 
 import {
   finalizeReason, summarizeContactRecord, contactRecordRows, LEAK_REASONS, isRetryOwedDispo,
+  isEmptyFive9Value, parseFive9Attempts,
 } from '../src/lead-leak-classify.js';
 import { precreateCalls, callsSince, workingMsBetween, lpLocalToUtcMs } from '../src/lead-speed.js';
-import { formatUncalledAlert, reasonText, REASON_LABELS } from '../src/lead-speed-alerts.js';
-import { measureLeadLeak, runLeadUncalledCheck } from '../src/jobs/lead-leak-monitor.js';
+import {
+  formatUncalledAlert, formatSpeedAlert, reasonText, REASON_LABELS, allocateLines,
+} from '../src/lead-speed-alerts.js';
+import { measureLeadLeak, runLeadUncalledCheck, leadLeakResponse } from '../src/jobs/lead-leak-monitor.js';
 
 const HOUR = 3600 * 1000;
 
@@ -60,19 +63,82 @@ test('record parsing: single and multi-record answers, matched on lead_id', () =
   assert.equal(fallback.list, 'Data - Hot - JAX less than 7', 'no lead_id match → the newest record');
 });
 
-test('classifier: not_on_dial_list, routing failure, not_in_five9, unverified', () => {
+test('classifier: not_on_dial_list, on_list_not_dialed, routing failure, not_in_five9, unverified', () => {
   // Group A (Ron A., LP 579248): in Five9, no list, never attempted.
   assert.equal(finalizeReason(summarizeContactRecord(f9Record(RON), '579248')), 'not_on_dial_list');
-  // On a list but never dialled — the older finding, still its own reason.
+  // On a list with no call in our history → on_list_not_dialed (2026-09-29).
   const listed = { ...RON, f9_last_list: 'Data - Hot - JAX less than 7' };
-  assert.equal(finalizeReason(summarizeContactRecord(f9Record(listed), '579248')), 'routing_or_automation_failure');
-  // A blank attempts field is unreadable, never "0" — so never "not on a list".
-  const blank = { ...RON, 'Number of attempts': '' };
-  assert.equal(finalizeReason(summarizeContactRecord(f9Record(blank), '579248')), 'routing_or_automation_failure');
+  assert.equal(finalizeReason(summarizeContactRecord(f9Record(listed), '579248')), 'on_list_not_dialed');
+  assert.equal(finalizeReason(summarizeContactRecord(f9Record(listed), '579248'), { calledInHistory: true }),
+    'routing_or_automation_failure', 'on a list AND a call in history is not this reason');
+  // No list, but Five9 says it attempted: still unnamed — the routing bucket.
+  const attempted = { ...RON, 'Number of attempts': '00002' };
+  assert.equal(finalizeReason(summarizeContactRecord(f9Record(attempted), '579248')), 'routing_or_automation_failure');
+  // Attempts that are not digits are unreadable, never 0.
+  const junk = { ...RON, 'Number of attempts': 'n/a' };
+  assert.equal(summarizeContactRecord(f9Record(junk), '579248').attempts, null);
+  assert.equal(finalizeReason(summarizeContactRecord(f9Record(junk), '579248')), 'routing_or_automation_failure');
   assert.equal(finalizeReason('absent'), 'not_in_five9');
   assert.equal(finalizeReason('error'), 'unverified');
   assert.equal(finalizeReason('present'), 'routing_or_automation_failure', 'unparseable record keeps the old answer');
   assert.ok(LEAK_REASONS.includes('not_on_dial_list'), 'priced and counted like any leak');
+  assert.ok(LEAK_REASONS.includes('on_list_not_dialed'), 'priced and counted like any leak');
+});
+
+test('Five9 empty values: null, "", whitespace, "0", "00000" and 0 are all empty; "00001" is 1', () => {
+  for (const v of [null, undefined, '', '   ', '0', '00000', 0]) {
+    assert.equal(isEmptyFive9Value(v), true, JSON.stringify(v));
+    assert.equal(parseFive9Attempts(v), 0, `attempts ${JSON.stringify(v)} → 0`);
+  }
+  assert.equal(parseFive9Attempts('00001'), 1);
+  assert.equal(parseFive9Attempts(' 3 '), 3);
+  assert.equal(isEmptyFive9Value('LP_ASAP'), false);
+});
+
+/* --- the live cases from 2026-09-29 (after #1079) ----------------------- */
+
+test('LP 579216: list null, campaign null, attempts null, lead_id match → not_on_dial_list', () => {
+  // Five9 left every field blank; #1079 read blank attempts as "unreadable".
+  const rec = { number1: '3525551216', lead_id: '579216', f9_last_list: null, f9_last_campaign: null,
+    'Number of attempts': null, 'Contact create time and date': '2026-09-28 20:00:00.000' };
+  const s = summarizeContactRecord(f9Record(rec), '579216');
+  assert.equal(s.leadIdMatch, true);
+  assert.equal(s.list, null);
+  assert.equal(s.attempts, 0);
+  assert.equal(finalizeReason(s), 'not_on_dial_list');
+});
+
+test('list "" and attempts "00000" → not_on_dial_list', () => {
+  const rec = { number1: '3525550001', lead_id: '579206', f9_last_list: '', 'Number of attempts': '00000' };
+  assert.equal(finalizeReason(summarizeContactRecord(f9Record(rec), '579206')), 'not_on_dial_list');
+});
+
+test('LP 579486 (Sherrod W.): no list, campaign set, 0 attempts, NO lead_id match → not_on_dial_list', () => {
+  const rec = { number1: '7275550486', lead_id: '512345', f9_last_list: '', f9_last_campaign: 'St Pete Sticky',
+    'Number of attempts': '0' };
+  const s = summarizeContactRecord(f9Record(rec), '579486');
+  assert.equal(s.leadIdMatch, false);
+  assert.equal(s.campaign, 'St Pete Sticky');
+  assert.equal(finalizeReason(s), 'not_on_dial_list', 'lead_id_match is not required');
+});
+
+test('LP 565211: on LP_ASAP, attempts "00001", no Five9 call → on_list_not_dialed, and the card names LP_ASAP', () => {
+  const rec = { number1: '8135555211', lead_id: '565211', f9_last_list: 'LP_ASAP', f9_last_campaign: 'LP_ASAP',
+    'Number of attempts': '00001' };
+  const s = summarizeContactRecord(f9Record(rec), '565211');
+  assert.equal(s.attempts, 1);
+  assert.equal(finalizeReason(s), 'on_list_not_dialed');
+  const o = { reason: 'on_list_not_dialed', five9_record: { list: s.list } };
+  assert.equal(reasonText(o), 'On LP_ASAP in Five9 but no call recorded');
+  assert.equal(REASON_LABELS.on_list_not_dialed, 'On a Five9 list but no call recorded');
+  assert.equal(finalizeReason('error'), 'unverified', 'a lookup error is still unverified');
+});
+
+test('several records for one phone: lead_id match wins, else the newest create time', () => {
+  const older = { number1: '1', lead_id: '1', f9_last_list: 'OLD', 'Contact create time and date': '2026-08-01 10:00:00.000' };
+  const newer = { number1: '1', lead_id: '2', f9_last_list: 'NEW', 'Contact create time and date': '2026-09-01 10:00:00.000' };
+  assert.equal(summarizeContactRecord(f9Record(older, newer), '1').list, 'OLD');
+  assert.equal(summarizeContactRecord(f9Record(older, newer), '999').list, 'NEW');
 });
 
 /* --- inquiry-stage calls ----------------------------------------------- */
@@ -220,8 +286,8 @@ test('hourly pass: lookups only for leads the card names, capped by LEAD_UNCALLE
   assert.ok(!looked.includes('3525550200'), 'not looked up — it is not on the card');
   assert.equal(looked.length, 2, 'the cap holds');
   const text = calls[0].text();
-  assert.match(text, /\*Not in Five9 at all \(2\)\*/);
-  assert.match(text, /\*Not verified — Five9 lookup failed or skipped \(1\)\*/, 'the one over the cap says so');
+  assert.match(text, /\*Not in Five9 at all — 2\*/);
+  assert.match(text, /\*Not verified — Five9 lookup failed or skipped — 1\*/, 'the one over the cap says so');
 });
 
 test('card: grouped by reason with counts, the cap, "…and N more", and the dashboard link', () => {
@@ -234,9 +300,9 @@ test('card: grouped by reason with counts, the cap, "…and N more", and the das
   const text = formatUncalledAlert(offenders, { cfg: { graceHours: 2, maxNamed: 4 }, dashboardUrl: 'https://d/leaks', nowMs: NOW });
   const lines = text.split('\n');
   assert.match(lines[0], /6 leads waiting more than 2h for a Five9 call/);
-  // Called-no-retry first, then not-on-a-list; headers carry the FULL count.
-  const h1 = lines.indexOf('*Called, no retry since (3)*');
-  const h2 = lines.indexOf('*In Five9 but not on any dialing list (3)*');
+  // Equal fresh counts → the tie-break order; headers carry the FULL count.
+  const h1 = lines.indexOf('*Called, no retry since — 3 (showing 2)*');
+  const h2 = lines.indexOf('*In Five9 but not on any dialing list — 3 (showing 2)*');
   assert.ok(h1 > 0 && h2 > h1, 'both group headers, in order');
   assert.match(text, /A B\. · …0000 · Internet · waiting 22h 4m · Called 1× \(last: Hung Up, 20h 0m ago\) — no retry since · LP b1/);
   assert.equal(lines.filter((l) => l.startsWith('• ')).length, 4, 'maxNamed caps named lines across groups');
@@ -246,4 +312,119 @@ test('card: grouped by reason with counts, the cap, "…and N more", and the das
     assert.ok(!l.includes(`· ${REASON_LABELS.unverified} ·`), 'a successful lookup never reads unverified');
     assert.ok(!/· Never dialled ·/.test(l));
   }
+});
+
+/* --- freshest leads first (2026-09-29) ---------------------------------- */
+
+// An offender created `hoursAgo` real hours before NOW.
+const aged = (id, reason, hoursAgo, extra = {}) => ({
+  first_name: 'Lee', last_name: `N${id}`, phone10: '3525550000', lead_source: 'Simpletext', reason,
+  lp_lead_id: String(id), createdMs: NOW - hoursAgo * HOUR, waitingMs: hoursAgo * HOUR, ...extra,
+});
+const namedIds = (text) => text.split('\n').filter((l) => l.startsWith('• ')).map((l) => l.split(' · LP ')[1]);
+
+test('card: a lead created today is listed before one from 2 days ago', () => {
+  const offenders = [aged(1, 'not_in_five9', 50), aged(2, 'not_in_five9', 3), aged(3, 'not_in_five9', 26)];
+  const text = formatUncalledAlert(offenders, { cfg: { graceHours: 2, maxNamed: 15 }, nowMs: NOW });
+  assert.deepEqual(namedIds(text), ['2', '3', '1']);
+});
+
+test('card: groups ordered by leads from the last 24 call-center hours, most first', () => {
+  // Five old leads (a week ago) vs two from this morning: the fresh group leads.
+  const offenders = [
+    ...[1, 2, 3, 4, 5].map((i) => aged(`o${i}`, 'not_in_five9', 24 * 7 + i)),
+    aged('f1', 'on_list_not_dialed', 3, { five9_record: { list: 'LP_ASAP' } }),
+    aged('f2', 'on_list_not_dialed', 4, { five9_record: { list: 'LP_ASAP' } }),
+  ];
+  const lines = formatUncalledAlert(offenders, { cfg: { graceHours: 2, maxNamed: 15 }, nowMs: NOW }).split('\n');
+  const fresh = lines.indexOf('*On a Five9 list but no call recorded — 2*');
+  const old = lines.indexOf('*Not in Five9 at all — 5*');
+  assert.ok(fresh > 0 && old > fresh, 'the group holding today\'s leads comes first');
+  assert.ok(lines.some((l) => l.includes('· On LP_ASAP in Five9 but no call recorded · LP f1')));
+});
+
+test('card: 40 offenders across 3 reasons, maxNamed 15 → every group shows ≥3 lines and its full count', () => {
+  const offenders = [
+    ...Array.from({ length: 31 }, (_, i) => aged(`a${i}`, 'not_on_dial_list', 3 + i)),
+    ...Array.from({ length: 6 }, (_, i) => aged(`b${i}`, 'not_in_five9', 30 + i)),
+    ...Array.from({ length: 3 }, (_, i) => aged(`c${i}`, 'unverified', 60 + i)),
+  ];
+  const text = formatUncalledAlert(offenders, { cfg: { graceHours: 2, maxNamed: 15 }, nowMs: NOW });
+  const lines = text.split('\n');
+  const headers = lines.filter((l) => /^\*.+ — \d+/.test(l));
+  assert.deepEqual(headers, [
+    '*In Five9 but not on any dialing list — 31 (showing 6)*',
+    '*Not in Five9 at all — 6*',
+    '*Not verified — Five9 lookup failed or skipped — 3*',
+  ]);
+  // Lines under each header.
+  const counts = headers.map((h) => {
+    let n = 0;
+    for (let i = lines.indexOf(h) + 1; i < lines.length && lines[i].startsWith('• '); i += 1) n += 1;
+    return n;
+  });
+  for (const n of counts) assert.ok(n >= 3, `every group gets at least 3 lines (${counts})`);
+  assert.equal(counts.reduce((a, b) => a + b, 0), 15, 'the cap is the whole card');
+  assert.ok(lines.includes('…and 25 more'));
+  assert.deepEqual(allocateLines([31, 6, 3], 15), [6, 6, 3]);
+  assert.deepEqual(allocateLines([31, 6, 3, 2, 9], 7), [2, 2, 1, 1, 1], 'too many groups: spread, never one hogging');
+  assert.deepEqual(allocateLines([2], 15), [2]);
+});
+
+test('speed card: leads from August are counted, not named', () => {
+  const decision = { reasons: ['slower'], recent: { median_min: 90 }, baseline: { median_min: 20 } };
+  const august = [1, 2, 3].map((i) => aged(`aug${i}`, 'not_in_five9', 24 * 50 + i));
+  const text = formatSpeedAlert(decision, [aged('new', 'not_on_dial_list', 5), ...august], { nowMs: NOW });
+  assert.deepEqual(namedIds(text), ['new']);
+  assert.match(text, /^\+ 3 older leads \(8\+ days\) — see dashboard$/m);
+  assert.match(text, /Leads waiting right now for a call \(4\):/, 'the headline still counts everyone');
+  const onlyOld = formatSpeedAlert(decision, august, { nowMs: NOW });
+  assert.deepEqual(namedIds(onlyOld), []);
+  assert.match(onlyOld, /\+ 3 older leads \(8\+ days\)/);
+});
+
+test('endpoint: waiting[0] is the newest lead; waiting_by_reason totals every offender', async () => {
+  const lead = (id, created, phone) => lpLead({ lp_lead_id: id, first_name: 'X', last_name: id, phone, created_at_lp: created });
+  const leads = [
+    lead('579001', '2026-09-28T09:30:00+00:00', '3525551001'),
+    lead('579003', '2026-09-29T10:00:00+00:00', '3525551003'), // 10:00 ET today — the newest
+    lead('579002', '2026-09-28T15:00:00+00:00', '3525551002'),
+  ];
+  const listed = { number1: '3525551002', lead_id: '579002', f9_last_list: 'LP_ASAP', 'Number of attempts': '00001' };
+  const m = await measureLeadLeak({
+    env: {}, nowMs: NOW,
+    deps: deps({
+      runSQL: stubSQL(leads),
+      getContactRecords: async ({ criteria }) => (criteria[0].value === '3525551002' ? f9Record(listed) : { count: 0 }),
+    }),
+    opts: { windowDays: 2, rates: false, intake: false, queues: false },
+  });
+  const body = leadLeakResponse(m);
+  assert.deepEqual(body.waiting.map((w) => w.lp_lead_id), ['579003', '579002', '579001']);
+  assert.deepEqual(body.waiting_by_reason, { not_in_five9: 2, on_list_not_dialed: 1 });
+  assert.equal(Object.values(body.waiting_by_reason).reduce((a, b) => a + b, 0), m.offenders.length);
+});
+
+test('a record left in routing_or_automation_failure is logged with its raw Five9 values', async () => {
+  const attempted = { number1: '3525551009', lead_id: '579009', f9_last_list: '', f9_last_campaign: 'DIAL ASAP',
+    'Number of attempts': '00002' };
+  const logged = [];
+  const orig = console.log;
+  console.log = (msg, ...rest) => { logged.push(String(msg)); if (!String(msg).startsWith('[LeadLeak] unmatched')) orig(msg, ...rest); };
+  try {
+    const m = await measureLeadLeak({
+      env: {}, nowMs: NOW,
+      deps: deps({
+        runSQL: stubSQL([lpLead({ lp_lead_id: '579009', first_name: 'R', last_name: 'L', phone: '3525551009',
+          created_at_lp: '2026-09-28T12:00:00+00:00' })]),
+        getContactRecords: async () => f9Record(attempted),
+      }),
+      opts: { windowDays: 2, rates: false, intake: false, queues: false },
+    });
+    assert.equal(m.rows[0].reason, 'routing_or_automation_failure');
+  } finally {
+    console.log = orig;
+  }
+  assert.ok(logged.includes('[LeadLeak] unmatched five9 record lp_lead_id=579009 list="" campaign="DIAL ASAP" attempts="00002"'),
+    logged.join('\n'));
 });

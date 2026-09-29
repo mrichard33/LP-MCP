@@ -91,6 +91,10 @@ export function explainUncalled(reason, f = {}) {
   switch (reason) {
     case 'not_in_five9':
       return join('Never loaded into Five9.', lpQueueClause(f), dncHistoryClause(f), contextClause(f));
+    // Five9 may count an attempt here (LP 565211: LP_ASAP, 1 attempt) — what is
+    // missing is the call in OUR history, so "never dialled" would be wrong.
+    case 'on_list_not_dialed':
+      return join(five9Clause(f), 'No Five9 call for it is in our call history.', lpQueueClause(f), dncHistoryClause(f), contextClause(f));
     case 'not_on_dial_list':
     case 'routing_or_automation_failure':
       return join(five9Clause(f), 'Five9 has never dialled it.', lpQueueClause(f), dncHistoryClause(f), contextClause(f));

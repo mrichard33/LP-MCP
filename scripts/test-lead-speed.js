@@ -187,7 +187,7 @@ test('cards name the leads — first name + initial, last four digits only', () 
   }];
   const text = formatUncalledAlert(offenders, { dashboardUrl: 'https://dash.example/lead-leaks' });
   assert.match(text, /1 lead waiting more than 2h for a Five9 call/);
-  assert.match(text, /\*Never dialled — Five9 has the number \(1\)\*/, 'grouped under its reason');
+  assert.match(text, /\*Never dialled — Five9 has the number — 1\*/, 'grouped under its reason');
   assert.match(text, /Jane D\. · …3161 · Google PPC · waiting 3h 10m · Never dialled — Five9 has the number · LP 578472/);
   assert.match(text, /https:\/\/dash\.example\/lead-leaks/);
   assert.ok(!text.includes('3524453161'), 'never the full number');
