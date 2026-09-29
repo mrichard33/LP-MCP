@@ -697,40 +697,71 @@ test('ap re-entry: the card says ActiveProspect and the vendor, not the contact\
   assert.equal(p.trigger, 'activeprospect');
 });
 
-// ── a manual `dnc` tag (2026-09-29) ─────────────────────────────────────────
-// A person adding `dnc` in GHL blocked nothing: rule 241 only moves the state.
-// TAG_DNC_MANUAL_OPTOUT is the full opt-out. Parsed out of its seed so this
-// pins what is actually applied.
-function manualDncTemplate() {
-  const sql = readFileSync(new URL('../sql/seeds/2026-09-29_manual_dnc_tag_optout.sql', import.meta.url), 'utf8');
-  assert.ok(sql.includes("'TAG_DNC_MANUAL_OPTOUT'"));
-  assert.ok(sql.includes('{"event_type": "ghl.tag_added", "event_subtype": "dnc"}'), 'fires on the dnc tag');
-  const m = sql.match(/'(\[\s*\{"action_type"[\s\S]*?\])'::jsonb/);
-  assert.ok(m, 'seed has no action_template literal');
-  return JSON.parse(m[1]);
+// ── per-channel opt-out tags (2026-09-29) ───────────────────────────────────
+// The user's ruling: a contact is opted out only on the channel they asked to
+// stop. dnc-sms / dnc-voice → calls + texts (the FCC pair); dnc-email → email.
+// Plain `dnc` blocks nothing, so the full-opt-out rule is disabled. Parsed out
+// of the seeds so these pin what is actually applied.
+const CHANNEL_SEED = new URL('../sql/seeds/2026-09-29_channel_dnc_tags.sql', import.meta.url);
+function channelRule(ruleKey) {
+  const sql = readFileSync(CHANNEL_SEED, 'utf8');
+  const block = sql.split('INSERT INTO agent_rules').slice(1).find((b) => b.includes(`'${ruleKey}',`));
+  assert.ok(block, `seed has no INSERT for ${ruleKey}`);
+  const literals = [...block.matchAll(/'(\{[^']*\}|\[[\s\S]*?\])'::jsonb/g)].map((m) => JSON.parse(m[1]));
+  const [pattern, context, template] = literals;
+  return { pattern, context, template };
 }
+const dndChannels = (tpl) => tpl.find((s) => s.action_type === 'set_dnd').params.channels.slice().sort();
+const types = (tpl) => tpl.map((s) => s.action_type);
 
-test('manual dnc tag: blocks every channel, Five9 and LP C+T, and stops the bot', () => {
-  const steps = manualDncTemplate();
-  const dnd = steps.find((s) => s.action_type === 'set_dnd');
-  assert.equal(dnd.params.status, 'active');
-  assert.equal(dnd.params.channels, undefined, 'no channel list = every DND channel, email included');
-  assert.ok(steps.some((s) => s.action_type === 'five9_add_numbers_to_dnc' && s.params.numbers_from_contact === true));
-  assert.deepEqual(steps.filter((s) => s.action_type === 'update_lp_dnc_status').map((s) => s.params.dnc_code).sort(), ['C', 'T']);
-  assert.ok(steps.some((s) => s.action_type === 'add_tag' && s.params.tag === 'stop-bot'));
-  assert.ok(!steps.some((s) => s.action_type === 'add_tag' && s.params.tag === 'dnc-sms'), 'nobody texted STOP');
+test('channel tags: dnc-sms and dnc-voice block calls + texts only, with Five9 and LP', () => {
+  for (const [key, tag, guard] of [['TAG_DNC_SMS_OPTOUT', 'dnc-sms', 'suppress:dnc-reply'],
+                                   ['TAG_DNC_VOICE_OPTOUT', 'dnc-voice', 'suppress:dnc-voice']]) {
+    const { pattern, context, template } = channelRule(key);
+    assert.deepEqual(pattern, { event_type: 'ghl.tag_added', event_subtype: tag });
+    assert.deepEqual(context, { not_has_tag: guard }, `${key} must not re-run the automatic opt-out`);
+    assert.deepEqual(dndChannels(template), ['Call', 'RCS', 'SMS'], `${key} must leave email open`);
+    assert.ok(types(template).includes('five9_add_numbers_to_dnc'));
+    assert.deepEqual(template.filter((s) => s.action_type === 'update_lp_dnc_status').map((s) => s.params.dnc_code).sort(), ['C', 'T']);
+    assert.ok(!template.some((s) => s.action_type === 'add_tag'), `${key} adds no tags (no stop-bot)`);
+  }
 });
 
-test('manual dnc tag: records dnc_full_on from manual_tag and is not a carrier STOP', async () => {
-  const db = consentDb({ [CONTACT]: { email_consent: 'granted', phone_consent: 'granted' } });
-  const step = manualDncTemplate().find((s) => s.action_type === 'record_consent_change');
-  await executeRecordConsentChange(
-    { id: 1, target_id: CONTACT, rule_applied: 'TAG_DNC_MANUAL_OPTOUT', action_payload: step.params },
-    {},
-    { supabase: db, env: {} },
-  );
-  const row = db.rows.get(CONTACT);
-  assert.equal(row.dnc_full, true);
-  assert.equal(row.sms_carrier_stop, false, 'an approved Slack lift may reopen texts');
-  assert.deepEqual(db.events.map((e) => `${e.channel}/${e.change}/${e.source}`), ['all/dnc_full_on/manual_tag']);
+test('channel tags: dnc-email blocks email only — no Five9, no LP', () => {
+  const { pattern, template } = channelRule('TAG_DNC_EMAIL_OPTOUT');
+  assert.deepEqual(pattern, { event_type: 'ghl.tag_added', event_subtype: 'dnc-email' });
+  assert.deepEqual(dndChannels(template), ['Email']);
+  assert.deepEqual(types(template), ['set_dnd', 'record_consent_change']);
+});
+
+test('channel tags: each records only its own channel, from ghl_tag', async () => {
+  const cases = [['TAG_DNC_SMS_OPTOUT', 'phone/revoked/ghl_tag'], ['TAG_DNC_VOICE_OPTOUT', 'phone/revoked/ghl_tag'],
+                 ['TAG_DNC_EMAIL_OPTOUT', 'email/revoked/ghl_tag']];
+  for (const [key, expected] of cases) {
+    const db = consentDb({ [CONTACT]: { email_consent: 'granted', phone_consent: 'granted' } });
+    const step = channelRule(key).template.find((s) => s.action_type === 'record_consent_change');
+    await executeRecordConsentChange({ id: 1, target_id: CONTACT, rule_applied: key, action_payload: step.params }, {}, { supabase: db, env: {} });
+    const row = db.rows.get(CONTACT);
+    assert.deepEqual(db.events.map((e) => `${e.channel}/${e.change}/${e.source}`), [expected]);
+    assert.equal(row.dnc_full, false, `${key} is not a full opt-out`);
+    assert.equal(row.sms_carrier_stop, false);
+    if (expected.startsWith('email')) assert.equal(row.phone_consent, 'granted');
+    else assert.equal(row.email_consent, 'granted');
+  }
+});
+
+test('channel tags: the tags reach the engine, and dnc-email counts as blocked and is cleared by a lift', async () => {
+  const { __testing: { ALLOWED_TAG_ADDED_SUBTYPES } } = await import('../src/services/event-intake-filter.js');
+  for (const t of ['dnc-sms', 'dnc-voice', 'dnc-email']) assert.ok(ALLOWED_TAG_ADDED_SUBTYPES.has(t), `${t} is dropped by the intake filter`);
+  assert.ok(store.DNC_FAMILY_TAGS.includes('dnc-email'));
+  assert.ok(decision.LIFT_TAGS.includes('dnc-email'));
+  assert.ok(!decision.LIFT_TAGS.includes('dnc-sms'), 'dnc-sms stays: it is the texted-STOP record');
+  const sql = readFileSync(CHANNEL_SEED, 'utf8');
+  assert.match(sql, /WHERE rule_key IN \('DNC_LIFT_REVIEW_REQUEST', 'DNC_LIFT_REVIEW_REQUEST_REENTRY'\)/);
+});
+
+test('plain dnc is not a full opt-out: TAG_DNC_MANUAL_OPTOUT is only ever disabled', () => {
+  const sql = readFileSync(new URL('../sql/seeds/2026-09-29_manual_dnc_tag_optout.sql', import.meta.url), 'utf8');
+  assert.ok(!/INSERT INTO agent_rules/.test(sql), 'the full-opt-out rule must not be re-created');
+  assert.match(sql, /SET enabled = false/);
 });

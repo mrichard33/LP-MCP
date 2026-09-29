@@ -7,12 +7,14 @@ repo — they are recorded in `sql/seeds/` on the date they were applied live.
 
 ## 2026-09-29
 
-- **A `dnc` tag added in GHL is now a full opt-out.** Rule
-  `TAG_DNC_MANUAL_OPTOUT` (`sql/seeds/2026-09-29_manual_dnc_tag_optout.sql`)
-  sets DND on every channel, adds the number to Five9 DNC, sets LP codes C + T,
-  adds `stop-bot` and records `all/dnc_full_on` (source `manual_tag`). Before,
-  the tag only moved the contact's funnel state (rule 241), so nothing was
-  actually blocked. An approved Slack lift undoes all of it.
+- **A channel opt-out tag now blocks its channel, and only that.** `dnc-sms` and
+  `dnc-voice` block calls + texts (GHL DND, Five9, LP codes C + T); `dnc-email`
+  blocks email only. Each records the change in the consent record (source
+  `ghl_tag`). Before, the intake filter dropped these tags, so a person adding
+  them — or GHL's own STOP handling adding `dnc-sms` — reached neither Five9 nor
+  LP. Plain `dnc` still blocks nothing (rule 241 moves the funnel state). Seeds:
+  `sql/seeds/2026-09-29_channel_dnc_tags.sql`; the short-lived full-opt-out rule
+  is disabled in `sql/seeds/2026-09-29_manual_dnc_tag_optout.sql`.
 
 ## 2026-09-28
 
