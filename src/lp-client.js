@@ -915,6 +915,16 @@ export async function updateDncStatus({ custid, newDncStatus, empid = LP_EMP.GHL
     resultCode === 0 ||
     (typeof message === 'string' && /^\s*Error\s*:/i.test(message));
 
+  // 2026-09-29 — "Current DNC status is already set to supplied value" is LP
+  // saying the record already reads what we asked for. That is the outcome we
+  // wanted, not a failure: 9 of the 26 Do Not Call re-sends that day got it and
+  // sat in retry. On a clear it means the record is already clear — also the
+  // outcome we wanted. Any other refusal still fails loud.
+  if (looksLikeError && /already set to supplied value/i.test(message)) {
+    console.log(`[LP] UpdateDNCStatus no-op: custid=${custid} already ${shown}`);
+    return { ...item, already_set: true };
+  }
+
   if (looksLikeError) {
     throw new Error(`LP UpdateDNCStatus error (custid=${custid}, code=${shown}, empid=${empid}): ${message || '(no message)'}`);
   }

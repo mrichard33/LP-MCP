@@ -53,3 +53,17 @@ test('an LP error still fails loud, naming the blank clear', async () => {
     /single space = CLEAR.*Invalid DNC value/,
   );
 });
+
+test('"already set to supplied value" on a set code is success, not a retry', async () => {
+  const r = recorder([{ Result: 0, Message: 'Error: Current DNC status is already set to supplied value. ' }]);
+  const out = await updateDncStatus({ custid: 449505, newDncStatus: 'C', empid: 5686 }, { lpPost: r.lpPost });
+  assert.equal(out.already_set, true);
+  assert.equal(r.calls.length, 1);
+});
+
+test('a clear on a record that is already clear is success; any other refusal still fails', async () => {
+  const r = recorder([{ Result: 0, Message: 'Error: Current DNC status is already set to supplied value.' }]);
+  assert.equal((await updateDncStatus({ custid: 1, newDncStatus: 'CLEAR' }, { lpPost: r.lpPost })).already_set, true);
+  const bad = recorder([{ Result: 0, Message: 'Error: Invalid DNC value.' }]);
+  await assert.rejects(updateDncStatus({ custid: 1, newDncStatus: 'CLEAR' }, { lpPost: bad.lpPost }), /Invalid DNC value/);
+});
