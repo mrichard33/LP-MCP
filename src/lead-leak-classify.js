@@ -142,6 +142,29 @@ export const REASONS = Object.freeze([
 // call, so the waiting card names it rather than dropping it.
 export const CALLED_NO_RETRY_REASON = 'called_no_retry';
 
+// Which LAST Five9 disposition leaves a lead owed another call (2026-09-29).
+// Only "we did not reach them": the first live hour of called_no_retry named
+// 139 leads, and among the Data leads it drew from 7 had last been dispositioned
+// "Appointment Set", 7 "Not Interested", 5 "Do Not Call" and 4 "Bad Data" —
+// reached and decided, with LP's code simply not caught up. Paging on those is
+// the healthy case crying wolf (CLAUDE.md, "Classify before you threshold").
+// An allowlist, not a denylist: a new outcome disposition added in Five9 must
+// not start paging by default. A lead with NO readable last disposition is
+// kept — "could not tell" stays visible rather than going quiet.
+export const RETRY_OWED_DISPOSITIONS = Object.freeze([
+  'Hung Up', 'Answering Machine', 'No Answer', 'NA', 'Busy', 'Left Voicemail', 'Sent To Voicemail',
+  'Abandon', 'Caller Disconnected', 'Hangup', 'Declined', 'Recycle', 'No Disposition', 'X-ACW',
+  'Dial Error', 'System Error', 'Timeout', 'Hardware Timeout', 'Agent Error', 'Forced Logout',
+  'Force Stop', 'Resource Unavailable', 'Unknown Connection', 'No Response From Caller', 'Voicemail Returned',
+]);
+const RETRY_OWED = new Set(RETRY_OWED_DISPOSITIONS.map((d) => d.toLowerCase()));
+
+/** Does this last Five9 disposition leave the lead owed a retry? Unknown → true. */
+export function isRetryOwedDispo(name) {
+  const d = String(name ?? '').trim().toLowerCase();
+  return !d || RETRY_OWED.has(d);
+}
+
 // The real leaks: never dialled and should have been — a call-center issuing
 // failure, a rep hold that ran out, or a callable, clean lead Five9 never rang
 // (or could not be checked for because the lookup cap ran out). Only these are
