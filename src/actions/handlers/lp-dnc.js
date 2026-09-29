@@ -101,8 +101,8 @@ export async function executeUpdateLPDNCStatus(action) {
   // 2026-09-28 (Consent Model v1) — `mode: 'clear'` is an alias for
   // dnc_code: 'CLEAR', so the Slack DNC-lift batch can say what it means.
   // Same path, same LP call: LP has no per-code clear, so a clear wipes C
-  // and T (and every other code) at once. LP_DNC_CLEAR_CODE is still NOT
-  // probe-confirmed — see lp-client.js; a wrong value fails loud here.
+  // and T (and every other code) at once. LP_DNC_CLEAR_CODE is blank, per
+  // LP's API docs (see lp-client.js).
   const modeClear = String(payload.mode || '').trim().toLowerCase() === 'clear';
   const rawCode = modeClear ? 'CLEAR' : (payload.dnc_code || payload.newDncStatus || payload.code);
   if (!rawCode) {
@@ -274,7 +274,7 @@ async function clearLPDNC({ contactId, ghlContact, payload, empId, prospectId, l
       const { name } = await resolveContactInfo(contactId, {});
       await applyGHLTag(contactId, 'lp-dnc-clear-failed').catch(() => {});
       const failMsg = buildRichNotification({
-        baseMessage: `LP DNC CLEAR FAILED: could not wipe LP DNC (clear code ${LP_DNC_CLEAR_CODE})`,
+        baseMessage: `LP DNC CLEAR FAILED: could not wipe LP DNC (blank newDncStatus)`,
         name,
         phone,
         contactId,
@@ -283,7 +283,7 @@ async function clearLPDNC({ contactId, ghlContact, payload, empId, prospectId, l
       });
       await sendGroupMeMessage(
         `${failMsg}\nError: ${String(err.message).slice(0, 250)}\n` +
-        `Clear code may be wrong — confirm LP_DNC_CLEAR_CODE via a safe probe. Manual recovery may be required.`,
+        `Check the prospect ID and empid in LP. Manual recovery may be required.`,
         { flushNow: true },
       ).catch(() => {});
       throw err;
@@ -303,7 +303,7 @@ async function clearLPDNC({ contactId, ghlContact, payload, empId, prospectId, l
   await addGHLNote(contactId,
     `[LP DNC] Cleared — consent re-established via new inbound (${source})\n` +
     (prospectId
-      ? `LP Prospect ID: ${prospectId} — DNC wiped with clear code ${LP_DNC_CLEAR_CODE} (empid ${empId})\n`
+      ? `LP Prospect ID: ${prospectId} — DNC wiped with a blank newDncStatus (empid ${empId})\n`
       : `No LP prospect ID on contact — no LP-side DNC to clear.\n`) +
     `Removed idempotency tags: ${dncTags.length ? dncTags.join(', ') : '(none present)'}\n` +
     (prospectId && lpResponse ? `LP response: ${JSON.stringify(lpResponse).slice(0, 200)}` : '')

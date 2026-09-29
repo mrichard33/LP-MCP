@@ -117,6 +117,10 @@ transaction. `CONSENT_MODEL_MODE` is `shadow`: nothing gates a send on these tab
   `five9_remove_numbers_from_dnc_approved` (Slack, `SLACK_DNC_LIFT`). The approved op refuses any
   `approved_by` that is not a Slack user id, which is what keeps GroupMe and auto-escalation
   approvals out. Do not add a carve-out for it in `resolveRequiresApproval`.
+- **LP clears DNC with a BLANK `newDncStatus`** (LP's API docs: "Passing a blank value will remove
+  the existing selection and reset the status"). The old clear value `N` was a guess LP rejects
+  ("Invalid DNC value"), so every LP clear failed until 2026-09-29. LP holds ONE internal DNC value
+  per prospect (`GetLead` → `intdnc`, e.g. "Do Not Text"): a C then a T leaves only T.
 - `POST /slack/dnc-lift/decision` is idempotent on `request_id` through `dnc_lift_requests`
   (sql/140) and refuses (503) without it.
 - **A tag blocks only its own channel (2026-09-29).** `dnc-sms` / `dnc-voice` → calls + texts
