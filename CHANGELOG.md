@@ -18,6 +18,22 @@ repo — they are recorded in `sql/seeds/` on the date they were applied live.
   the clock started at the next opening but then ran through every night, and
   weekends used weekday hours. The hourly waiting check runs on the same hours.
 
+- **Lead-leak cards: right label for leads on no dialing list, freshest leads
+  first.** Five9 leaves "Number of attempts" blank on a contact nobody has
+  dialled, and a blank was read as "unreadable" — so dozens of never-listed
+  leads (mostly Simpletext) still read "Never dialled — Five9 has the number".
+  Blank, `0` and `00000` now read as empty, and those leads read "In Five9 but
+  not on any dialing list". A lead that IS on a Five9 list but has no call in
+  our history gets its own priced reason, `on_list_not_dialed` ("On LP_ASAP in
+  Five9 but no call recorded"). Whatever is still left as a routing failure is
+  logged as `[LeadLeak] unmatched five9 record` with Five9's raw values.
+  The cards and `GET /api/lp/lead-leak` `waiting[]` now list the newest leads
+  first; groups are ordered by how many leads from the last 24 call-center
+  hours they hold, each header shows the full count ("— 31 (showing 6)"), and
+  the named lines are split so every group gets at least 3. The daily speed
+  card names only the last 7 days and counts the rest in one line. The
+  endpoint adds `waiting_by_reason`. What counts as a leak did not change.
+
 - **An approved DNC lift now actually clears DNC in Lead Perfection.** The clear
   sent `N`, a guess LP rejects ("Invalid DNC value"), so every LP clear failed —
   Slack lifts and automatic re-entry lifts alike. LP's API docs say a blank value

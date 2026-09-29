@@ -133,6 +133,7 @@ export const REASONS = Object.freeze([
   'not_in_five9',
   'unverified',
   'not_on_dial_list',
+  'on_list_not_dialed',
   'routing_or_automation_failure',
 ]);
 
@@ -175,6 +176,7 @@ export const LEAK_REASONS = Object.freeze([
   'rep_hold_expired',
   'not_in_five9',
   'not_on_dial_list',
+  'on_list_not_dialed',
   'routing_or_automation_failure',
   'unverified',
 ]);
@@ -354,23 +356,59 @@ export function classifyUncalledLead(lead, ctx = {}) {
 
 /**
  * The last step for a lead classifyUncalledLead left open. `lookup` is what
- * lookupFive9Contact returned — a string, or a parsed record summary:
+ * lookupFive9Contact returned — a string, or a parsed record summary. In order:
  *   'absent'                                   → not_in_five9
  *   { present, onList:false, attempts:0 }      → not_on_dial_list (2026-09-29)
+ *   { present, onList:true } and no Five9 call
+ *     for this lead in our history             → on_list_not_dialed (2026-09-29)
  *   'present' / any other present record       → routing_or_automation_failure
  *   'error', 'over_cap', 'skipped'             → unverified
+ *
  * "Not on a dialing list" is the finding behind six of the twelve leads on the
  * 2026-09-29 card: Five9 held the contact (lead_id = the LP lead) but
  * f9_last_list was empty and it had never been attempted — nothing had put it
- * on a list. That is a different fix from a list that holds it and never dials.
+ * on a list. lead_id_match is NOT required: LP 579486 (lead_id_match false) is
+ * exactly this case.
+ *
+ * "On a list, no call recorded" is a different problem (LP 565211 / 565537:
+ * list LP_ASAP, attempts 1, nothing in five9_events_raw) — the list holds the
+ * number, but no dial reached our history. `opts.calledInHistory` says whether
+ * one did; every lead the job sends here is uncalled, so it defaults false.
+ *
+ * What is left in routing_or_automation_failure (no list but attempted, or an
+ * unreadable attempts field) is logged by the job so it can be named next.
  */
-export function finalizeReason(lookup) {
+export function finalizeReason(lookup, { calledInHistory = false } = {}) {
   if (lookup === 'absent') return 'not_in_five9';
   if (lookup === 'present') return 'routing_or_automation_failure';
   if (lookup && typeof lookup === 'object' && lookup.present) {
-    return lookup.onList === false && lookup.attempts === 0 ? 'not_on_dial_list' : 'routing_or_automation_failure';
+    if (lookup.onList === false && lookup.attempts === 0) return 'not_on_dial_list';
+    if (lookup.onList === true && !calledInHistory) return 'on_list_not_dialed';
+    return 'routing_or_automation_failure';
   }
   return 'unverified';
+}
+
+/**
+ * Is this Five9 field empty? Five9 fills unset fields with '', a bare '0' or a
+ * zero-padded '00000' depending on the field — all mean "nothing there".
+ */
+export function isEmptyFive9Value(raw) {
+  const s = String(raw ?? '').trim();
+  return !s || /^0+$/.test(s);
+}
+
+/**
+ * Five9's "Number of attempts": '00001' → 1, and blank → 0 (2026-09-29). Five9
+ * leaves the field blank on a contact nobody has dialled — LP 579216 / 579206
+ * came back { list: null, attempts: null } and so read as a routing failure
+ * when they were simply never put on a list. Anything that is not digits is
+ * unreadable → null, so it can never be called "not on a list".
+ */
+export function parseFive9Attempts(raw) {
+  if (isEmptyFive9Value(raw)) return 0;
+  const s = String(raw).trim();
+  return /^\d+$/.test(s) ? Number(s) : null;
 }
 
 /** Contact-record field names Five9 uses (getContactRecords `fields`). */
@@ -402,11 +440,12 @@ export function contactRecordRows(res) {
 
 /**
  * The Five9 contact record for this lead: the one whose lead_id is the LP lead
- * id, else the newest for the phone. Returns
- *   { present:true, onList, attempts, list, campaign, leadIdMatch }
- * or null when there is no parseable record. `attempts` is null when Five9 left
- * the field blank or unreadable — never read as 0, so an unreadable record can
- * never be called "not on a list".
+ * id, else the newest ("Contact create time and date") for the phone. Returns
+ *   { present:true, onList, attempts, list, campaign, leadIdMatch, raw }
+ * or null when there is no parseable record. Empty values ('', '0', '00000')
+ * read as no list / no campaign, and a blank attempts field reads as 0 (see
+ * parseFive9Attempts); `attempts` is null only for a value that is not digits.
+ * `raw` keeps Five9's strings as sent, for the unmatched-record log line.
  */
 export function summarizeContactRecord(res, lpLeadId) {
   const rows = contactRecordRows(res);
@@ -415,16 +454,16 @@ export function summarizeContactRecord(res, lpLeadId) {
   const match = rows.find((r) => want && String(r[F9.leadId] ?? '').trim() === want);
   const newest = [...rows].sort((a, b) => String(b[F9.created] ?? '').localeCompare(String(a[F9.created] ?? '')))[0];
   const r = match || newest;
-  const attemptsRaw = String(r[F9.attempts] ?? '').trim();
-  const attempts = /^\d+$/.test(attemptsRaw) ? Number(attemptsRaw) : null;
-  const list = String(r[F9.list] ?? '').trim() || null;
+  const text = (raw) => (isEmptyFive9Value(raw) ? null : String(raw).trim());
+  const list = text(r[F9.list]);
   return {
     present: true,
     onList: !!list,
-    attempts,
+    attempts: parseFive9Attempts(r[F9.attempts]),
     list,
-    campaign: String(r[F9.campaign] ?? '').trim() || null,
+    campaign: text(r[F9.campaign]),
     leadIdMatch: !!match,
+    raw: { list: r[F9.list] ?? null, campaign: r[F9.campaign] ?? null, attempts: r[F9.attempts] ?? null },
   };
 }
 
@@ -552,6 +591,7 @@ export function formatSlackSummary({
     `• Rep hold over, back in play (NoRehash > ${REP_HOLD_DAYS} days): ${n('rep_hold_expired')}`,
     `• Never dialled, Five9 has the number: ${n('routing_or_automation_failure')}`,
     ...(b.not_on_dial_list?.leads ? [`• In Five9 but not on any dialing list: ${n('not_on_dial_list')}`] : []),
+    ...(b.on_list_not_dialed?.leads ? [`• On a Five9 list but no call recorded: ${n('on_list_not_dialed')}`] : []),
     `• Not in Five9 at all: ${n('not_in_five9')}`,
     `• Not checked in Five9 (over the daily lookup cap, or the lookup failed): ${n('unverified')}`,
     ...(summary.data_leaks ? [`   ↳ of these, LP code "Data": ${num(summary.data_leaks)}`
