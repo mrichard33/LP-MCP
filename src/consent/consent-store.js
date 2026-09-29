@@ -139,7 +139,16 @@ export function applyConsentChange(prev, { channel, change }) {
 
 // GHL sets SMS/RCS DND to 'permanent' itself when the contact texts a STOP
 // keyword; the API refuses to change it (see src/actions/handlers/dnd.js).
-const CARRIER_STOP_TAGS = ['dnc-sms', 'suppress:dnc-reply'];
+//
+// 2026-09-29 — dnc-sms is NOT on this list any more. Since TAG_DNC_SMS_OPTOUT a
+// person can add dnc-sms to block calls + texts, and that tag alone made the
+// lift keep texts off with "This lead texted STOP" on a contact who never did
+// (the user's test contact). A real STOP always leaves a stronger signal: of
+// the 1,072 contacts carrying dnc-sms that day, 1,070 also had
+// suppress:dnc-reply or consent sms_carrier_stop; GHL's own STOP sets the
+// 'permanent' DND read below. The user's ruling: a lift restores texts unless
+// the lead really texted STOP.
+const CARRIER_STOP_TAGS = ['suppress:dnc-reply'];
 
 /**
  * Did this lead text STOP? Any ONE signal is enough — the cost of a false
@@ -147,7 +156,8 @@ const CARRIER_STOP_TAGS = ['dnc-sms', 'suppress:dnc-reply'];
  * of a false "no" is texting someone who told us to stop.
  *
  *   consent row sms_carrier_stop = true
- *   tag dnc-sms or suppress:dnc-reply   (written by BEHAVIORAL_DNC_REPLY)
+ *   tag suppress:dnc-reply   (written by BEHAVIORAL_DNC_REPLY; dnc-sms alone is
+ *                            a staff block, not proof of a STOP)
  *   GHL dndSettings SMS or RCS status 'permanent' (GHL's own STOP lock)
  *   the contact could not be read at all (unreadable is NOT "no")
  *

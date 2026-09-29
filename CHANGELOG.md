@@ -7,6 +7,13 @@ repo — they are recorded in `sql/seeds/` on the date they were applied live.
 
 ## 2026-09-29
 
+- **Approving a DNC lift now restores texts too, unless the lead really texted
+  STOP.** A `dnc-sms` tag on its own no longer counts as a texted STOP — staff
+  add it to block calls + texts, and the card was wrongly warning "This lead
+  texted STOP" and keeping texts off. A real STOP (a STOP reply, the consent
+  record, or GHL's own STOP lock) still keeps texts off. The lift also records
+  email as open again, since it already turned Email DND off.
+
 - **Alerts post to Slack only.** `reportAlertCondition`'s default sender is now
   `sendAlertMessage` (`src/alert-state.js`), which posts straight to Slack —
   `channel: 'ops'`, a blank channel or an unknown one → `SLACK_CHANNEL_OPS`

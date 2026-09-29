@@ -21,8 +21,10 @@
  * rather than lift without the idempotency record.
  *
  * APPROVE queues ONE batch (batch_id = request_id), in this order:
- *   1. record_consent_change  all/dnc_full_off, then phone/granted
- *      (with a carrier STOP: granted FOR CALLS, reason says SMS stays blocked)
+ *   1. record_consent_change  all/dnc_full_off, phone/granted, email/granted
+ *      (with a carrier STOP: phone granted FOR CALLS, reason says SMS stays
+ *      blocked). email/granted since 2026-09-29: the lift already turned Email
+ *      DND off, so the record has to say email is open again too.
  *   2. remove_tag  the DNC family — NOT dnc-sms when the lead texted STOP
  *   3. set_dnd inactive  Call, Email, WhatsApp, GMB, FB (+ SMS, RCS only
  *      without a carrier STOP)
@@ -124,6 +126,10 @@ export function buildLiftBatch({ contactId, requestId, slackUserId, slackUserNam
       reason: carrierStop
         ? 'Granted for CALLS only — the lead texted STOP, so SMS stays carrier-blocked until START/UNSTOP or a new form with SMS consent'
         : 'Manual DNC lift approved in #dnc-lift-approval',
+    }),
+    base('record_consent_change', 'lp', {
+      channel: 'email', change: 'granted', source: 'slack_lift', actor, evidence,
+      reason: 'Manual DNC lift approved in #dnc-lift-approval — Email DND turned off',
     }),
     base('remove_tag', 'ghl', { tags, bypass_suppression: true }),
     base('set_dnd', 'ghl', {

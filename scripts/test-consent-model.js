@@ -278,11 +278,11 @@ test('5. Slack approve without carrier STOP → all channels restored', async ()
 
   const rows = h.calls.inserted;
   assert.deepEqual(rows.map((r) => r.action_type), [
-    'record_consent_change', 'record_consent_change', 'remove_tag', 'set_dnd',
+    'record_consent_change', 'record_consent_change', 'record_consent_change', 'remove_tag', 'set_dnd',
     'update_lp_dnc_status', 'five9_remove_numbers_from_dnc_approved', 'add_tag', 'emit_event',
   ], 'the handoff\'s order');
   assert.ok(rows.every((r) => r.batch_id === 'req-1'), 'one batch, batch_id = request_id');
-  assert.deepEqual(rows.slice(0, 2).map((r) => `${r.action_payload.channel}/${r.action_payload.change}`), ['all/dnc_full_off', 'phone/granted']);
+  assert.deepEqual(rows.slice(0, 3).map((r) => `${r.action_payload.channel}/${r.action_payload.change}`), ['all/dnc_full_off', 'phone/granted', 'email/granted']);
   assert.ok(byType(rows, 'remove_tag')[0].action_payload.tags.includes('dnc-sms'));
   assert.ok(byType(rows, 'remove_tag')[0].action_payload.bypass_suppression);
   assert.deepEqual([...byType(rows, 'set_dnd')[0].action_payload.channels].sort(),
@@ -539,16 +539,16 @@ test('review: E0 owns first-party re-entries, a STOP goes to a person, 24h dedup
 });
 
 test('review: card payload carries last-4, blocking tags, and the STOP warning verbatim', () => {
-  const carrier = store.detectCarrierStop({ tags: ['dnc-sms', 'dnc'] });
+  const carrier = store.detectCarrierStop({ tags: ['dnc-sms', 'suppress:dnc-reply', 'dnc'] });
   const p = review.buildReviewPayload({
     requestId: 'dnc-lift-1', contactId: CONTACT, trigger: 'manual_tag', carrier, reenteredAt: '2026-09-28T15:00:00Z',
-    contact: { firstName: 'Jane', lastName: 'Doe', phone: '+1 (813) 416-6946', source: 'ActiveProspect', tags: ['dnc-sms', 'dnc', 'active-entry:high-intent-digital'] },
+    contact: { firstName: 'Jane', lastName: 'Doe', phone: '+1 (813) 416-6946', source: 'ActiveProspect', tags: ['dnc-sms', 'suppress:dnc-reply', 'dnc', 'active-entry:high-intent-digital'] },
     consentRead: { status: 'ok', consent: null, events: [{ id: 1 }] },
   });
   assert.equal(p.contact_name, 'Jane Doe');
   assert.equal(p.phone_last4, '6946');
   assert.ok(!JSON.stringify(p).includes('8134166946'), 'the card never carries the full number');
-  assert.deepEqual(p.blocking_tags, ['dnc', 'dnc-sms']);
+  assert.deepEqual(p.blocking_tags, ['dnc', 'dnc-sms', 'suppress:dnc-reply']);
   assert.equal(p.sms_warning, 'This lead texted STOP. Approving restores calls only. Texts stay off until they text START or submit a new form with SMS consent.');
   assert.equal(p.sub_source, 'high-intent-digital');
 });
@@ -597,7 +597,7 @@ test('review: posts the card with the shared secret header and records the reque
     {
       env: { N8N_DNC_LIFT_REVIEW_WEBHOOK: 'https://n8n.example.com/webhook/dnc-lift-review', DNC_LIFT_WEBHOOK_SECRET: SECRET },
       supabase: db,
-      readContact: async () => ({ firstName: 'Jane', phone: '+18134166946', tags: ['dnc', 'dnc-sms'] }),
+      readContact: async () => ({ firstName: 'Jane', phone: '+18134166946', tags: ['dnc', 'dnc-sms', 'suppress:dnc-reply'] }),
       getConsent: async () => ({ status: 'ok', consent: null, events: [] }),
       newRequestId: () => 'dnc-lift-test',
       fetch: async (url, init) => { posts.push({ url, init }); return { ok: true, status: 200 }; },
@@ -764,4 +764,32 @@ test('plain dnc is not a full opt-out: TAG_DNC_MANUAL_OPTOUT is only ever disabl
   const sql = readFileSync(new URL('../sql/seeds/2026-09-29_manual_dnc_tag_optout.sql', import.meta.url), 'utf8');
   assert.ok(!/INSERT INTO agent_rules/.test(sql), 'the full-opt-out rule must not be re-created');
   assert.match(sql, /SET enabled = false/);
+});
+
+// ── a staff-added dnc-sms is not a texted STOP (2026-09-29) ─────────────────
+// The user's ruling: approving a lift restores texts too, unless the lead
+// really texted STOP. dnc-sms alone (TAG_DNC_SMS_OPTOUT, a staff block) used
+// to read as a STOP and kept texts off with the STOP warning on the card.
+test('a dnc-sms tag alone is not a texted STOP; a STOP reply or GHL\'s lock still is', () => {
+  assert.equal(store.detectCarrierStop({ tags: ['dnc-sms'] }).carrierStop, false);
+  assert.equal(store.detectCarrierStop({ tags: ['dnc-sms', 'suppress:dnc-reply'] }).carrierStop, true);
+  assert.equal(store.detectCarrierStop({ tags: ['dnc-sms'], consent: { sms_carrier_stop: true } }).carrierStop, true);
+  assert.equal(store.detectCarrierStop({ tags: ['dnc-sms'], dndSettings: { SMS: { status: 'permanent' } } }).carrierStop, true);
+  assert.equal(store.detectCarrierStop({ tags: ['dnc-sms'], contactReadFailed: true }).carrierStop, true);
+});
+
+test('approving a staff dnc-sms block restores calls AND texts, and email, with no STOP warning', async () => {
+  const h = liftHarness({ tags: ['dnc-sms', 'dnc-email'] });
+  const out = await decision.handleDncLiftDecision({ body: body(), headers }, h.deps);
+  assert.equal(out.status, 200, JSON.stringify(out.json));
+  assert.equal(out.json.sms_carrier_stop, false);
+  assert.equal(out.json.sms_warning, null);
+  const rows = h.calls.inserted;
+  const removed = byType(rows, 'remove_tag')[0].action_payload.tags;
+  assert.ok(removed.includes('dnc-sms') && removed.includes('dnc-email'));
+  assert.deepEqual([...byType(rows, 'set_dnd')[0].action_payload.channels].sort(),
+    ['Call', 'Email', 'FB', 'GMB', 'RCS', 'SMS', 'WhatsApp']);
+  assert.equal(byType(rows, 'five9_remove_numbers_from_dnc_approved')[0].action_payload.clear_sms, true);
+  assert.deepEqual(byType(rows, 'record_consent_change').map((r) => `${r.action_payload.channel}/${r.action_payload.change}`),
+    ['all/dnc_full_off', 'phone/granted', 'email/granted']);
 });
