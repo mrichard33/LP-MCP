@@ -162,12 +162,34 @@ async function linkProspect({ ghlContactId, prospect, cstId, ldsId }) {
   }
 }
 
+/**
+ * create_lp_lead said "already in LP" and named a lead id. Return that lead's
+ * prospect when lp_leads links the SAME lead to the SAME contact; otherwise
+ * null (the caller keeps deferring). Two independent records must agree —
+ * the GHL field and the lp_leads link — before a note is written on the lead.
+ */
+export async function prospectFromAlreadyInLp(res, ghlContactId, db = supabase) {
+  if (res?.action !== 'already_in_lp' || !res.lp_lead_id || !ghlContactId) return null;
+  try {
+    const { data, error } = await db
+      .from('lp_leads')
+      .select('lp_prospect_id, lp_lead_id')
+      .eq('lp_lead_id', String(res.lp_lead_id))
+      .eq('ghl_contact_id', ghlContactId)
+      .maybeSingle();
+    if (error || !data?.lp_prospect_id) return null;
+    return { prospectId: String(data.lp_prospect_id), ldsId: String(data.lp_lead_id) };
+  } catch {
+    return null;
+  }
+}
+
 // ─── Full resolve-or-create (LIVE only) ──────────────────────────
 // Returns:
 //   { outcome:'resolved'|'linked', prospectId }                 → write the note now
 //   { outcome:'ambiguous_deferred', detail }                    → alert + retry
 //   { outcome:'created_deferred', detail }                      → retry (cst_id ~60s later)
-//   { outcome:'missing_fields_deferred', detail }               → handler already alerted
+//   { outcome:'missing_fields_deferred', detail }               → handler already alerted; not retried
 //   { outcome:'lp_unavailable' }                                → retry, no alert
 //   { outcome:'error', detail }                                 → retry
 export async function resolveOrCreateLpLead({ ghlContactId, ghlContact }) {
@@ -211,6 +233,20 @@ export async function resolveOrCreateLpLead({ ghlContactId, ghlContact }) {
       }
       if (res?.action === 'skipped_missing_fields') {
         return { outcome: 'missing_fields_deferred', detail: `missing: ${(res.missing_fields || []).join(', ')}` };
+      }
+      // 2026-09-29 — "already in LP" is not "just created". The GHL contact
+      // already names its LP lead, so nothing is coming back from the
+      // /webhook/lp callback, and waiting for it retried 13 notes five times
+      // each in the week to 2026-09-29 before giving up and dropping the note
+      // (QTwOgih8f39hKMD1jJJD, lJb5UIubqbncclEvWppR, HZLm5C3xzusr9SkISX5y —
+      // all CXL leads, which resolveLPLeadId's 0b step skips as unbookable).
+      // When lp_leads links that same lead to this contact, write the note on
+      // it now. A note is not an appointment, so the bookable-disposition
+      // gate that step applies does not belong here.
+      const already = await prospectFromAlreadyInLp(res, ghlContactId);
+      if (already) {
+        console.log(`[GHLNote/ROC] ${ghlContactId} already in LP → using linked lead ${already.ldsId} (prospect ${already.prospectId})`);
+        return { outcome: 'linked', prospectId: already.prospectId, ldsId: already.ldsId };
       }
       // lp_lead_created | already_in_lp | (anything else that posted): the note
       // defers until the /webhook/lp callback syncs the new cst_id into lp_leads

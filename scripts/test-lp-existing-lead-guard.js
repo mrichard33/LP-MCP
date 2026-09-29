@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   decideExistingLeadAction, existingLeadGuardMode, existingLeadWindowDays,
-  flattenLpLeads, pickNewestLead,
+  flattenLpLeads, pickNewestLead, formatGuardDecisionLine, buildGuardCheck,
 } from '../src/services/lp-existing-lead-guard.js';
 
 const NOW = new Date('2026-09-28T16:00:00Z');
@@ -98,4 +98,34 @@ test('no usable lead → null', () => {
   assert.equal(pickNewestLead([]), null);
   assert.equal(pickNewestLead([{ dateentered: '2026-01-01' }]), null);
   assert.equal(pickNewestLead(undefined), null);
+});
+
+// ─── one line per decision (2026-09-29) ───────────────────────────
+// The first shadow review had no denominator: only "would reuse" was logged.
+
+const vendorLead = { ldsId: '565033', lpSourceDetail: 'MyHomePros', createdAtLp: '2026-08-06T18:14:08.96' };
+
+test('every decision carries the same searchable prefix', () => {
+  for (const decision of ['no_phone', 'none', 'create', 'would_reuse', 'reused', 'error']) {
+    const line = formatGuardDecisionLine({ contactId: 'c1', mode: 'shadow', decision });
+    assert.match(line, /^\[LP-CREATE\] EXISTING-LEAD decision=/);
+    assert.match(line, new RegExp(`decision=${decision} mode=shadow contact=c1`));
+  }
+});
+test('lines name the LP lead and say why', () => {
+  const create = formatGuardDecisionLine({ contactId: 'c1', mode: 'shadow', decision: 'create', existing: vendorLead, windowDays: 15 });
+  assert.match(create, /lds=565033 source=MyHomePros created=2026-08-06/);
+  assert.match(create, /older than 15d/);
+  const would = formatGuardDecisionLine({ contactId: 'c1', mode: 'shadow', decision: 'would_reuse', existing: { ...vendorLead, createdAtLp: null } });
+  assert.match(would, /created=not yet cached/);
+  assert.match(would, /SHADOW, creating anyway/);
+  const err = formatGuardDecisionLine({ contactId: 'c1', mode: 'live', decision: 'error', error: 'LP timeout' });
+  assert.match(err, /error=LP timeout/);
+});
+test('the returned check mirrors the decision for SQL counting', () => {
+  assert.deepEqual(buildGuardCheck({ mode: 'shadow', decision: 'none' }),
+    { mode: 'shadow', decision: 'none', lp_lead_id: null, lp_source: null, created_at_lp: null });
+  assert.deepEqual(buildGuardCheck({ mode: 'shadow', decision: 'would_reuse', existing: vendorLead }),
+    { mode: 'shadow', decision: 'would_reuse', lp_lead_id: '565033', lp_source: 'MyHomePros', created_at_lp: '2026-08-06T18:14:08.96' });
+  assert.equal(buildGuardCheck({ mode: 'live', decision: 'error', error: 'x' }).error, 'x');
 });

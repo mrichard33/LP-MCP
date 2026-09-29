@@ -110,7 +110,7 @@ import { buildRichNotification } from '../enrichment.js';
 import { LP_SRS, assertNotTransposed, resolvePromoterForSource } from '../../lp-source-ids.js';
 import {
   existingLeadGuardMode, existingLeadWindowDays, decideExistingLeadAction,
-  flattenLpLeads, pickNewestLead,
+  flattenLpLeads, pickNewestLead, formatGuardDecisionLine, buildGuardCheck,
 } from '../../services/lp-existing-lead-guard.js';
 import { needsNameRecovery, recoverPlaceholderName } from '../../services/placeholder-name-recovery.js';
 import { NAME_PLACEHOLDER_TAG } from '../../services/identity-extraction.js';
@@ -386,28 +386,36 @@ export async function executeCreateLPLead(action) {
   // LP and never wrote back to this contact. Ask LP by phone. FAIL-OPEN:
   // any error proceeds to create — a duplicate is repairable, a lost lead
   // is not. Mode: LP_CREATE_EXISTING_LEAD_GUARD_MODE (shadow | live | off).
+  // 2026-09-29: every evaluation logs ONE "EXISTING-LEAD decision=" line and
+  // returns the same decision as execution_result.existing_lead_check — see
+  // formatGuardDecisionLine for why (the first shadow review had no count).
   const guardMode = existingLeadGuardMode();
   const guardPhone = normalizePhone(ghlContact.phone);
+  const windowDays = existingLeadWindowDays();
+  let guard = { decision: guardMode === 'off' ? 'off' : 'no_phone', existing: null, error: null };
   if (guardMode !== 'off' && guardPhone) {
     try {
       const existing = await findExistingLpLead(guardPhone);
-      if (existing) {
-        const verdict = decideExistingLeadAction({
-          createdAtLp: existing.createdAtLp,
-          now: new Date(),
-          windowDays: existingLeadWindowDays(),
-        });
-        if (verdict === 'reuse') {
-          if (guardMode === 'live') {
-            const appt = resolveAppointment(payload, eventPayload, ghlContact, payload.include_appt !== false);
-            return await reuseExistingLpLead(action, contactId, existing, appt);
-          }
-          console.log(`[LP-CREATE] 🕶️ EXISTING-LEAD SHADOW ${contactId}: would reuse lds_id=${existing.ldsId} (${existing.lpSourceDetail || existing.lpSource || 'source?'}, created ${existing.createdAtLp || 'not yet cached'}) — creating anyway (shadow)`);
-        }
+      if (!existing) {
+        guard = { decision: 'none', existing: null, error: null };
+      } else {
+        const verdict = decideExistingLeadAction({ createdAtLp: existing.createdAtLp, now: new Date(), windowDays });
+        const decision = verdict !== 'reuse' ? 'create' : (guardMode === 'live' ? 'reused' : 'would_reuse');
+        guard = { decision, existing, error: null };
       }
     } catch (err) {
-      console.warn(`[LP-CREATE] existing-lead guard failed for ${contactId} (proceeding with create): ${err.message}`);
+      guard = { decision: 'error', existing: null, error: err.message };
     }
+  }
+  if (guardMode !== 'off') {
+    const line = formatGuardDecisionLine({ contactId, mode: guardMode, windowDays, ...guard });
+    if (guard.decision === 'error') console.warn(line); else console.log(line);
+  }
+  const existingLeadCheck = buildGuardCheck({ mode: guardMode, ...guard });
+  if (guard.decision === 'reused') {
+    const appt = resolveAppointment(payload, eventPayload, ghlContact, payload.include_appt !== false);
+    const reused = await reuseExistingLpLead(action, contactId, guard.existing, appt);
+    return { ...reused, existing_lead_check: existingLeadCheck };
   }
 
   // ─── Placeholder-name recovery (2026-09-28) ───────────────────────
@@ -498,6 +506,7 @@ export async function executeCreateLPLead(action) {
       contact_id: contactId,
       missing_fields: missing,
       name_recovery: nameRecovery,
+      existing_lead_check: existingLeadCheck,
     };
   }
 
@@ -679,6 +688,7 @@ export async function executeCreateLPLead(action) {
     appt_time: atime || null,
     appt_included: !!(adate && atime),
     name_recovery: nameRecovery,
+    existing_lead_check: existingLeadCheck,
     lp_response: lpResponse,
   };
 }
