@@ -75,10 +75,114 @@
  *
  * Killable without a redeploy via ALERT_STATE_ENABLED=false, which drops every
  * caller onto the fallback cooldown path.
+ *
+ * WHERE THE CARD GOES — SLACK, NOT GROUPME (2026-09-29)
+ * ────────────────────────────────────────────────────
+ * Mark ruled that every alert moves from GroupMe to Slack. Until then the
+ * default sender was sendGroupMeMessage (channel 'ops' → the GroupMe ops bot,
+ * mirrored to #ops-alerts) — project-memory decision #2188, now superseded.
+ * The default is sendAlertMessage below, which posts straight to Slack through
+ * postToSlack. ALERT_SEND_TARGET is the rollback switch:
+ *   slack   (default) Slack only.
+ *   groupme exactly the old path: sendGroupMeMessage, which still mirrors.
+ *   both    GroupMe with its mirror OFF, plus the direct Slack post — so Slack
+ *           gets one copy, not two.
+ * Anything unrecognised is `slack`: a typo must not quietly put alerts back on
+ * GroupMe.
  */
 
 import supabase from './supabase.js';
 import { sendGroupMeMessage } from './groupme.js';
+import { postToSlack, resolveSlackChannels, opsChannelId } from './slack.js';
+
+// ─── The alert sender ─────────────────────────────────────────────────
+
+export const ALERT_SEND_TARGETS = Object.freeze(['slack', 'groupme', 'both']);
+
+/** slack | groupme | both; unset or unrecognised → slack. Read per send. */
+export function alertSendTarget(env = process.env) {
+  const raw = String(env.ALERT_SEND_TARGET ?? '').trim().toLowerCase();
+  return ALERT_SEND_TARGETS.includes(raw) ? raw : 'slack';
+}
+
+// Logical channels slack.js can resolve to a channel of their own. 'ops', a
+// blank channel and anything else go to #ops-alerts: an alert with no channel
+// named is an operational alarm, and GroupMe's own fallback (the main bot)
+// would bury it in #lead-intelligence among hundreds of lead cards.
+const SLACK_ROUTED_CHANNELS = new Set(['main', 'canvass', 'sales', 'service']);
+
+let _sendDepsOverride = null;
+
+/** TESTS ONLY — stub postToSlack / sendGroupMeMessage / channel lookups / env. */
+export function __setAlertSendDepsForTests(deps) {
+  _sendDepsOverride = deps;
+}
+
+/** Slack channel ids for a logical channel. Never empty unless ops is unset. */
+async function _slackTargets(channel, opts, d) {
+  if (channel && SLACK_ROUTED_CHANNELS.has(channel)) {
+    const ids = await d.resolveSlackChannels(channel, opts).catch(() => []);
+    if (ids.length) return ids;
+  }
+  const ops = d.opsChannelId();
+  return ops ? [ops] : [];
+}
+
+/**
+ * Send one alert card to wherever ALERT_SEND_TARGET says. Never throws.
+ * Returns { sent, target, reason?, slack?, groupme? } — `sent` is what
+ * _sendAndStamp reads, so a Slack refusal (postToSlack reports it, it does not
+ * throw) must come back as sent:false or the next sweep would never retry.
+ *
+ * `opts` is sendGroupMeMessage's: { channel, noDedup, flushNow, market }.
+ */
+export async function sendAlertMessage(text, opts = {}) {
+  const d = {
+    postToSlack, resolveSlackChannels, opsChannelId, sendGroupMeMessage, env: process.env,
+    ..._sendDepsOverride,
+  };
+  const target = alertSendTarget(d.env);
+  const out = { sent: false, target };
+
+  if (target === 'groupme' || target === 'both') {
+    try {
+      // In `both` the GroupMe mirror is switched off: we post to Slack below.
+      out.groupme = await d.sendGroupMeMessage(text, target === 'both' ? { ...opts, noSlackMirror: true } : opts);
+    } catch (err) {
+      out.groupme = { sent: false, reason: err.message };
+    }
+    if (target === 'groupme') return { ...out, sent: out.groupme?.sent !== false, reason: out.groupme?.reason };
+  }
+
+  let ids = [];
+  try {
+    ids = await _slackTargets(opts.channel, { market: opts.market }, d);
+  } catch (err) {
+    console.warn(`[AlertSend] Slack channel resolve failed: ${err.message}`);
+  }
+  if (!ids.length) {
+    // Deliberately NOT a GroupMe fallback: an unset SLACK_CHANNEL_OPS is a
+    // configuration error to fix, and silently re-routing to GroupMe is how
+    // it would go unnoticed.
+    console.error('[AlertSend] no Slack channel for this alert — is SLACK_CHANNEL_OPS set?');
+    out.slack = { ok: false, error: 'no_slack_channel' };
+  } else {
+    const results = [];
+    for (const id of ids) {
+      const res = await d.postToSlack(text, id);
+      if (!res?.ok) console.warn(`[AlertSend] Slack post to ${id} ${res?.threw ? 'threw' : 'failed'}: ${res?.error}`);
+      results.push(res);
+    }
+    const ok = results.some((r) => r?.ok);
+    out.slack = { ok, channels: ids, error: ok ? null : results.map((r) => r?.error).filter(Boolean).join(', ') || 'post_failed' };
+  }
+
+  // In `both`, either copy landing counts as sent: re-sending on the next sweep
+  // would duplicate the copy that DID land.
+  out.sent = out.slack.ok || (target === 'both' && out.groupme?.sent === true);
+  if (!out.sent) out.reason = `slack: ${out.slack.error}`;
+  return out;
+}
 
 const TABLE = 'alert_conditions';
 const DETAIL_CHARS = 500;
@@ -158,7 +262,8 @@ async function _resolveText(text) {
  * @param {string|Function} [args.recoveredText]  Overrides the default card.
  * @param {string} [args.detail]  Last body/reason, stored for reading the
  *   table by eye. Never matched on.
- * @param {string} [args.channel] GroupMe channel, passed straight through.
+ * @param {string} [args.channel] Logical channel ('ops', 'main', …), passed to the
+ *   sender. sendAlertMessage maps it to Slack; blank → #ops-alerts.
  * @param {number} [args.remindMs=0]  Re-remind after this long while the
  *   condition persists. 0 = never, which is right for live-ops states that
  *   clear on their own. Use a long interval only where a human must act.
@@ -166,6 +271,7 @@ async function _resolveText(text) {
  * @param {number} [args.fallbackCooldownMs=0]  The emitter's pre-existing
  *   cooldown, used ONLY on the DB-error path.
  * @param {Function} [args.send]    Injectable sender (tests, capacityRanker).
+ *   Default sendAlertMessage (ALERT_SEND_TARGET). Must resolve to { sent }.
  * @param {object} [args.client]    Injectable supabase (tests).
  * @param {number} [args.nowMs]     Injectable clock (tests).
  *
@@ -185,7 +291,7 @@ export async function reportAlertCondition(args = {}) {
     remindMs = 0,
     notifyRecovery = true,
     fallbackCooldownMs = 0,
-    send = sendGroupMeMessage,
+    send = sendAlertMessage,
     client: clientArg,
     nowMs,
   } = args;
@@ -302,7 +408,7 @@ async function _fire({ client, key, label, text, detail, channel, remindMs, send
  * Send the card for a won transition, then record that we sent it.
  *
  * On a send failure the notify stamp is left null so the NEXT sweep retries —
- * bounded at one attempt per sweep, silent while GroupMe is down, and exactly
+ * bounded at one attempt per sweep, silent while Slack is down, and exactly
  * one card when it comes back.
  */
 async function _sendAndStamp({ client, key, text, channel, send, now, kind, alreadyStamped = false, remindMs = 0 }) {
@@ -319,6 +425,10 @@ async function _sendAndStamp({ client, key, text, channel, send, now, kind, alre
   try {
     const res = await send(body, { channel, noDedup: true });
     sent = res?.sent !== false;
+    // postToSlack reports a refusal instead of throwing, so a failed Slack
+    // post arrives here as sent:false. Log it the same way as a throw — an
+    // unset channel must not read as a quiet night.
+    if (!sent) console.error(`[AlertState] ${key} send failed: ${res?.reason || 'sent:false'}`);
   } catch (err) {
     console.error(`[AlertState] ${key} send failed: ${err.message}`);
   }
@@ -383,7 +493,11 @@ async function _clear({ client, key, label, recoveredText, channel, notifyRecove
   }
 
   try {
-    await send(body, { channel, noDedup: true });
+    const res = await send(body, { channel, noDedup: true });
+    if (res?.sent === false) {
+      console.error(`[AlertState] ${key} recovery send failed: ${res?.reason || 'sent:false'}`);
+      return { action: 'recovered', sent: false, reason: 'send_failed' };
+    }
     return { action: 'recovered', sent: true };
   } catch (err) {
     console.error(`[AlertState] ${key} recovery send failed: ${err.message}`);
@@ -417,7 +531,11 @@ async function _fallbackFire({ key, text, channel, send, now, fallbackCooldownMs
   if (!body) return { action: 'fallback_fired', sent: false, reason: 'no_text' };
 
   try {
-    await send(body, { channel, noDedup: true });
+    const res = await send(body, { channel, noDedup: true });
+    if (res?.sent === false) {
+      console.error(`[AlertState] ${key} fallback send failed: ${res?.reason || 'sent:false'}`);
+      return { action: 'fallback_fired', sent: false, reason: 'send_failed' };
+    }
     return { action: 'fallback_fired', sent: true, reason };
   } catch (err) {
     console.error(`[AlertState] ${key} fallback send failed: ${err.message}`);
@@ -673,6 +791,8 @@ export function formatRecovered(label, openedAt, nowMs) {
 
 export default {
   reportAlertCondition,
+  sendAlertMessage,
+  alertSendTarget,
   claimAlertConditionSet,
   confirmAlertSend,
   formatRecovered,

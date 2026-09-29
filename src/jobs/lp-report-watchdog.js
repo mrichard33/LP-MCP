@@ -16,7 +16,7 @@
 
 import supabase from '../supabase.js';
 import { todayET, hourET } from './lp-report-common.js';
-import { reportAlertCondition } from '../alert-state.js';
+import { reportAlertCondition, sendAlertMessage } from '../alert-state.js';
 import { runJob } from '../job-runner.js';
 
 const DISABLED = !!(process.env.LP_REPORT_WATCHDOG_DISABLED || '').trim();
@@ -243,24 +243,22 @@ export async function checkLpReportFreshness({ alert = true } = {}) {
 }
 
 /**
- * One place that talks to GroupMe, so routing is decided once.
+ * One place that sends this watchdog's alerts, so routing is decided once.
  *
- * `channel: 'ops'` resolves to GROUPME_OPS_BOT_ID and falls back to the main
- * bot when that is unset (groupme.js `_resolveBotId`) — so this is inert until
- * the env var exists, and no message is ever dropped. It matters because the
- * 2026-08-12 alerts fired correctly into a channel carrying hundreds of
- * per-lead messages a day and were never seen.
+ * `channel: 'ops'` → #ops-alerts. Slack only since 2026-09-29 (sendAlertMessage,
+ * ALERT_SEND_TARGET in src/alert-state.js); it used to be the GroupMe ops bot.
+ * It matters because the 2026-08-12 alerts fired correctly into a channel
+ * carrying hundreds of per-lead messages a day and were never seen.
  */
 async function notify(text) {
   try {
-    const { sendGroupMeMessage } = await import('../groupme.js');
     // 2026-09-04 — the result is RETURNED, not swallowed. alert-state.js marks
     // an incident announced only on a send it can confirm; reporting a failed
     // send as success would suppress the retry and, later, announce a recovery
     // for an alert nobody ever saw.
-    return await sendGroupMeMessage(text, { channel: 'ops' });
+    return await sendAlertMessage(text, { channel: 'ops' });
   } catch (err) {
-    console.error('[LPReportWatchdog] GroupMe alert failed:', err.message);
+    console.error('[LPReportWatchdog] alert failed:', err.message);
     return { sent: false, reason: err.message };
   }
 }

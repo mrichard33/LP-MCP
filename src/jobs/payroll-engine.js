@@ -66,12 +66,13 @@ export function payrollChannel(env = process.env) {
   return (env.PAYROLL_SLACK_CHANNEL || '').trim() || (env.SLACK_CHANNEL_OPS || '').trim();
 }
 
-// groupme.js is imported lazily: it pulls in the whole approval/mirror stack,
+// alert-state.js is imported lazily: it pulls in the whole approval/mirror stack,
 // and only a failed pass needs it.
 async function defaultOpsNote(text) {
   try {
-    const { sendGroupMeMessage } = await import('../groupme.js');
-    await sendGroupMeMessage(text, { channel: 'ops' });
+    // Slack by default since 2026-09-29 (ALERT_SEND_TARGET, src/alert-state.js).
+    const { sendAlertMessage } = await import('../alert-state.js');
+    await sendAlertMessage(text, { channel: 'ops' });
   } catch (err) {
     console.warn(`[Payroll] ops note failed: ${err.message}`);
   }

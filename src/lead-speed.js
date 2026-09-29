@@ -159,6 +159,75 @@ export function creationCallMs({ leadId, phone10, createdAtLp }, ctx) {
 }
 
 /**
+ * INQUIRY-STAGE CALLS (2026-09-29). Five9 often dials a lead while it is still
+ * an LP INQUIRY — lp_rec_key 'INQ…', before LP has stamped the lead — and LP's
+ * create time can land hours AFTER that dial. Six leads on the 2026-09-29 card
+ * read "Never dialled" though DIAL ASAP had rung each of them 1–3 times on
+ * 9/27–9/28 (Answering Machine / Hung Up); Five9's contact record already
+ * carried lead_id = the LP lead id at call time, so those were calls to THIS
+ * lead. creationCallMs's 60-minute window cannot see them.
+ *
+ * So a Five9 call on the lead's phone (or key) up to `hours` (env
+ * LEAD_PRECREATE_CALL_HOURS, default 48) BEFORE created_at_lp marks the lead
+ * as called. Such a lead is kept OUT of the time-to-first-call numbers: its
+ * "first call" precedes its creation, so the minutes would read 0 or negative
+ * and flatter the floor. Excluded, not counted as 0.
+ *
+ * The Eastern-offset reading in lpLocalToUtcMs is unchanged; this only widens
+ * what counts as "called", it does not move LP's clock.
+ *
+ * Returns { count, lastMs } over [created − hours, created), or null.
+ */
+export const PRECREATE_CALL_HOURS = 48;
+
+export function precreateCalls({ leadId, phone10, createdAtLp }, ctx, hours = PRECREATE_CALL_HOURS) {
+  const createdMs = lpLocalToUtcMs(createdAtLp);
+  if (createdMs == null) return null;
+  const from = createdMs - hours * HOUR_MS;
+  const times = new Set();
+  const add = (list) => { for (const t of list || []) if (t >= from && t < createdMs) times.add(t); };
+  if (leadId != null) add(ctx.five9Keys?.get(`LDS${String(leadId).trim()}`));
+  if (phone10) add(ctx.five9Phones?.get(phone10));
+  if (!times.size) return null;
+  return { count: times.size, lastMs: Math.max(...times) };
+}
+
+/**
+ * Every Five9 call on this lead from `hours` before it was created onward,
+ * ascending and de-duplicated (a call seen on both its key and its phone is one
+ * call). What "Called N×" on the waiting card counts.
+ */
+export function callsSince({ leadId, phone10, createdAtLp }, ctx, hours = PRECREATE_CALL_HOURS) {
+  const createdMs = lpLocalToUtcMs(createdAtLp);
+  const from = createdMs == null ? -Infinity : createdMs - hours * HOUR_MS;
+  const times = new Set();
+  const add = (list) => { for (const t of list || []) if (t >= from) times.add(t); };
+  if (leadId != null) add(ctx.five9Keys?.get(`LDS${String(leadId).trim()}`));
+  if (phone10) add(ctx.five9Phones?.get(phone10));
+  return [...times].sort((a, b) => a - b);
+}
+
+/**
+ * Call-center time between two instants, in ms: only the hours inside
+ * CALL_CENTER_OPEN_HOUR…CLOSE ET count. "No retry in 4 hours" must not fire at
+ * 8:30am on a lead last rung at 7pm — the phones were off for 13 of those hours.
+ */
+export function workingMsBetween(fromMs, toMs, open = CALL_CENTER_OPEN_HOUR, close = CALL_CENTER_CLOSE_HOUR) {
+  if (!Number.isFinite(fromMs) || !Number.isFinite(toMs) || toMs <= fromMs) return 0;
+  let total = 0;
+  let cursor = fromMs;
+  for (let guard = 0; guard < 400 && cursor < toMs; guard += 1) {
+    const start = workingStartMs(cursor, open, close);
+    if (start >= toMs) break;
+    const d = etParts(start);
+    const end = etWallToUtcMs(d.year, d.month, d.day, close);
+    total += Math.min(end, toMs) - start;
+    cursor = end;
+  }
+  return total;
+}
+
+/**
  * Working minutes from the lead's arrival to its first call — the clock
  * starting at workingStartMs. A call made before opening (someone dialled early)
  * counts as 0, never negative. Null when there was no call or no creation time.

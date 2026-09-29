@@ -436,8 +436,8 @@ async function runMigrations() {
       runSQL,
       readSqlFile: (rel) => readFile(new URL(`../${rel}`, import.meta.url), 'utf8'),
       opsAlert: async (text) => {
-        const { sendGroupMeMessage } = await import('./groupme.js');
-        return sendGroupMeMessage(text, { channel: 'ops' });
+        const { sendAlertMessage } = await import('./alert-state.js');
+        return sendAlertMessage(text, { channel: 'ops' });
       },
     });
   } catch (err) {

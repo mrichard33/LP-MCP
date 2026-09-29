@@ -50,11 +50,26 @@
 //   feed the dashboard's Lead Leaks page.
 //
 // ALERTS — LEAD_LEAK_ALERT_MODE, default `shadow` (src/lead-speed-alerts.js)
-//   Three edge-triggered cards on channel 'ops' (the ops bot, mirrored to
-//   #ops-alerts), each naming the leads: time to first call getting worse and
-//   GHL leads that never reached LP (daily pass), and owed leads waiting past
-//   the grace with no call (hourly pass, call-center hours). Shadow logs the
-//   card instead of sending it. Going live is Mark's decision.
+//   Edge-triggered cards on channel 'ops', which is Slack #ops-alerts only
+//   since 2026-09-29 (sendAlertMessage in src/alert-state.js; it used to be the
+//   GroupMe ops bot with a Slack mirror — ALERT_SEND_TARGET rolls it back).
+//   Each names the leads: time to first call getting worse and GHL leads that
+//   never reached LP (daily pass), and owed leads waiting past the grace for a
+//   call (hourly pass, call-center hours). Shadow logs the card instead of
+//   sending it. Going live is Mark's decision.
+//
+// WHY EACH WAITING LEAD IS WAITING (2026-09-29)
+//   The hourly card used to read "Never dialled" on every line: it skipped the
+//   Five9 contact lookup, and it ignored calls made while the lead was still an
+//   LP inquiry. A live check of its twelve names found two different problems,
+//   neither of which it could show:
+//     - six were in Five9 but on NO dialing list (f9_last_list empty, 0
+//       attempts) → `not_on_dial_list`
+//     - six HAD been rung 1–3× by DIAL ASAP before LP stamped the lead, then
+//       never retried → `called_no_retry` (inquiry-stage calls now count as
+//       calls — src/lead-speed.js precreateCalls)
+//   The hourly pass now looks up only the leads it will name, capped at
+//   LEAD_UNCALLED_LOOKUP_CAP (default 40), and groups the card by reason.
 //
 // ENDPOINT (registerLeadLeakRoutes):
 //   GET|POST /api/lp/lead-leak → measure now, return the summary. Never posts,
@@ -75,13 +90,14 @@ import { runJob } from '../job-runner.js';
 import { hourET, todayET } from './lp-report-common.js';
 import {
   normalizePhone10, wasCalled, needsDncCheck, isRetiredCode, holdDateUnknown,
-  isNotCovered, isNewlyRetiredCode, zip5,
+  isNotCovered, isNewlyRetiredCode, zip5, isDataLead, summarizeContactRecord,
   classifyUncalledLead, finalizeReason, buildRates, estimateValue,
-  summarize, formatSlackSummary, LEAK_REASONS,
+  summarize, formatSlackSummary, LEAK_REASONS, CALLED_NO_RETRY_REASON,
 } from '../lead-leak-classify.js';
 import {
   lpLocalToUtcMs, etDay, firstCallAfter, creationCallMs, minutesToFirstCall, waitingMs,
   dailySpeedRows, speedStats, CALL_CENTER_OPEN_HOUR, CALL_CENTER_CLOSE_HOUR,
+  precreateCalls, callsSince, workingMsBetween, PRECREATE_CALL_HOURS,
 } from '../lead-speed.js';
 import {
   buildIntakeCandidatesSql, classifyIntakeGap, summarizeIntakeGap, INTAKE_GRACE_HOURS,
@@ -137,6 +153,10 @@ export function leadLeakConfig(env = process.env) {
     windowDays: positiveInt(env.LEAD_LEAK_WINDOW_DAYS, 60),
     lookupCap: positiveInt(env.LEAD_LEAK_FIVE9_LOOKUP_CAP, 300),
     intakeDays: positiveInt(env.LEAD_INTAKE_WINDOW_DAYS, 30),
+    // 2026-09-29 — see "WHY EACH WAITING LEAD IS WAITING" in the header.
+    precreateHours: positiveInt(env.LEAD_PRECREATE_CALL_HOURS, PRECREATE_CALL_HOURS),
+    retryGapHours: positiveInt(env.LEAD_RETRY_GAP_HOURS, 4),
+    uncalledLookupCap: positiveInt(env.LEAD_UNCALLED_LOOKUP_CAP, 40),
     // Blank → the ops channel the other monitors report to.
     slackChannel: String(env.LEAD_LEAK_SLACK_CHANNEL ?? '').trim() || opsChannelId(),
     dashboardUrl: String(env.LEAD_LEAK_DASHBOARD_URL ?? '').trim() || null,
@@ -161,6 +181,14 @@ function addTimes(map, key, times) {
   if (list.length) map.set(key, list);
 }
 
+/** Keep the later of two { ms, name } last-call records under `id`. */
+function keepLast(map, id, t, name) {
+  const ms = Date.parse(t ?? '');
+  if (!Number.isFinite(ms)) return;
+  const prev = map.get(id);
+  if (!prev || ms >= prev.ms) map.set(id, { ms, name: name ? String(name) : null });
+}
+
 /**
  * Five9 disposition history, one day-slice at a time (see header), as CALL
  * TIMES — not just "was it ever dialled", because the dashboard and the speed
@@ -169,6 +197,9 @@ function addTimes(map, key, times) {
  *   phones — Map phone10 → ascending call times (ms), from EVERY event.
  *            INQ-keyed events (most of them) cannot be tied to a lead by key,
  *            so their phone is the only link.
+ *   last   — Map 'LDS<id>' | phone10 → { ms, name } of the latest call and its
+ *            disposition name, for the "Called 2× (last: Answering Machine…)"
+ *            line (2026-09-29). One entry per key/phone, not per call.
  * A call's time is call_start_at (real UTC), falling back to received_at.
  * Also returns when the Five9 record starts, so the universe can be clamped:
  * a lead older than the record cannot be judged either way.
@@ -182,37 +213,43 @@ export async function readFive9History({ runSQL, windowDays, nowMs }) {
 
   const keys = new Map();
   const phones = new Map();
+  const last = new Map();
   const startMs = Math.max(nowMs - windowDays * DAY_MS, firstAt);
   for (let from = startMs; from < nowMs; from += DAY_MS) {
     const to = Math.min(from + DAY_MS, nowMs);
     const [row] = asRows(await runSQL(`
       WITH s AS (
-        SELECT lp_rec_key, dnis, ani, coalesce(call_start_at, received_at) AS t
+        SELECT lp_rec_key, dnis, ani, disposition_name AS d, coalesce(call_start_at, received_at) AS t
           FROM five9_events_raw
          WHERE event_type = 'disposition'
            AND received_at >= '${new Date(from).toISOString()}'
            AND received_at <  '${new Date(to).toISOString()}'
       )
       SELECT
-        (SELECT json_agg(json_build_array(k, ts)) FROM (
-           SELECT lp_rec_key AS k, array_agg(DISTINCT t ORDER BY t) AS ts
+        (SELECT json_agg(json_build_array(k, ts, ld, lt)) FROM (
+           SELECT lp_rec_key AS k, array_agg(DISTINCT t ORDER BY t) AS ts,
+                  (array_agg(d ORDER BY t DESC))[1] AS ld, max(t) AS lt
              FROM s WHERE lp_rec_key LIKE 'LDS%' GROUP BY 1) a) AS keys,
-        (SELECT json_agg(json_build_array(p, ts)) FROM (
-           SELECT p, array_agg(DISTINCT t ORDER BY t) AS ts FROM (
-             SELECT dnis AS p, t FROM s WHERE dnis IS NOT NULL
+        (SELECT json_agg(json_build_array(p, ts, ld, lt)) FROM (
+           SELECT p, array_agg(DISTINCT t ORDER BY t) AS ts,
+                  (array_agg(d ORDER BY t DESC))[1] AS ld, max(t) AS lt FROM (
+             SELECT dnis AS p, t, d FROM s WHERE dnis IS NOT NULL
              UNION ALL
-             SELECT ani, t FROM s WHERE ani IS NOT NULL) x
+             SELECT ani, t, d FROM s WHERE ani IS NOT NULL) x
             GROUP BY p) b) AS phones
     `), 'five9 day slice');
-    for (const [k, ts] of row?.keys || []) addTimes(keys, String(k).trim(), ts);
-    for (const [raw, ts] of row?.phones || []) {
+    for (const [k, ts, ld, lt] of row?.keys || []) {
+      addTimes(keys, String(k).trim(), ts);
+      keepLast(last, String(k).trim(), lt, ld);
+    }
+    for (const [raw, ts, ld, lt] of row?.phones || []) {
       const p = normalizePhone10(raw);
-      if (p) addTimes(phones, p, ts);
+      if (p) { addTimes(phones, p, ts); keepLast(last, p, lt, ld); }
     }
   }
   for (const list of keys.values()) list.sort((a, b) => a - b);
   for (const list of phones.values()) list.sort((a, b) => a - b);
-  return { keys, phones, firstAt };
+  return { keys, phones, last, firstAt };
 }
 
 async function readUniverse({ runSQL, sinceMs }) {
@@ -291,11 +328,17 @@ async function readRates({ runSQL, nowMs }) {
   `), 'close rates'));
 }
 
-/** 'present' | 'absent' | 'error' for one number in the Five9 contact DB. */
-async function lookupFive9Contact(getContactRecords, phone) {
+/**
+ * One number in the Five9 contact DB: 'absent' | 'error' | the record summary
+ * (src/lead-leak-classify.js summarizeContactRecord — list, campaign, attempts,
+ * matched on lead_id = the LP lead id, else the newest record) | 'present' when
+ * Five9 counted a record we could not parse.
+ */
+async function lookupFive9Contact(getContactRecords, phone, lpLeadId) {
   try {
     const res = await getContactRecords({ criteria: [{ field: 'number1', value: phone }] });
-    return Number(res?.count) > 0 ? 'present' : 'absent';
+    if (!(Number(res?.count) > 0)) return 'absent';
+    return summarizeContactRecord(res, lpLeadId) || 'present';
   } catch {
     return 'error';
   }
@@ -339,7 +382,9 @@ async function readIntakeGap({ runSQL, hlRunSQL, five9, nowMs, days, runDate }) 
  *
  * opts (the hourly pass narrows these):
  *   windowDays  override LEAD_LEAK_WINDOW_DAYS
- *   lookups     false → skip Five9 contact lookups (open leads read `unverified`)
+ *   lookups     false → skip Five9 contact lookups (open leads read `unverified`);
+ *               'card' → look up only leads past the grace (the ones the waiting
+ *               card will name), capped at LEAD_UNCALLED_LOOKUP_CAP
  *   rates       false → skip the close-rate read ($ stays blank)
  *   intake      false → skip the never-reached-LP check
  */
@@ -350,7 +395,8 @@ export async function measureLeadLeak({ env = process.env, nowMs = Date.now(), d
   const getContactRecords = deps.getContactRecords || defaultGetContactRecords;
   const cfg = leadLeakConfig(env);
   const windowDays = opts.windowDays ?? cfg.windowDays;
-  const lookupCap = opts.lookups === false ? 0 : cfg.lookupCap;
+  const cardLookupsOnly = opts.lookups === 'card';
+  const lookupCap = opts.lookups === false ? 0 : cardLookupsOnly ? cfg.uncalledLookupCap : cfg.lookupCap;
   const acfg = alertConfig(env);
   const runDate = todayET(new Date(nowMs));
   const errors = [];
@@ -374,13 +420,36 @@ export async function measureLeadLeak({ env = process.env, nowMs = Date.now(), d
   } catch (err) { return insufficient('lp_leads', err); }
 
   // One definition of "called", and its time: the first Five9 call on the
-  // lead's LDS key or phone at or after it really existed (src/lead-speed.js).
+  // lead's LDS key or phone at or after it really existed (src/lead-speed.js),
+  // the live call it was created during, or — since 2026-09-29 — a call up to
+  // LEAD_PRECREATE_CALL_HOURS before LP stamped it (the inquiry-stage dial).
   const tctx = { five9Keys: five9.keys, five9Phones: five9.phones };
   const timing = leads.map((lead) => {
     const who = { leadId: lead.lp_lead_id, phone10: normalizePhone10(lead.phone), createdAtLp: lead.created_at_lp };
-    return { lead, firstCallMs: firstCallAfter(who, tctx), liveCallMs: creationCallMs(who, tctx) };
+    const liveCallMs = creationCallMs(who, tctx);
+    return {
+      lead,
+      who,
+      firstCallMs: firstCallAfter(who, tctx),
+      liveCallMs,
+      // Recorded apart from firstCallMs: it is NOT a time to first call.
+      precreate: liveCallMs === null ? precreateCalls(who, tctx, cfg.precreateHours) : null,
+    };
   });
-  const uncalled = timing.filter((t) => t.firstCallMs === null && t.liveCallMs === null).map((t) => t.lead);
+  const isCalled = (t) => t.firstCallMs !== null || t.liveCallMs !== null || t.precreate !== null;
+  const uncalled = timing.filter((t) => !isCalled(t)).map((t) => t.lead);
+
+  // CALLED, NO RETRY (2026-09-29). A lead Five9 rang that is still coded
+  // "Data" and has had no call in LEAD_RETRY_GAP_HOURS call-center hours is
+  // still owed a call. Only leads from the hourly window (UNCALLED_WINDOW_DAYS)
+  // — older ones are the dialer's list/retry policy, not a lead waiting now —
+  // and only clean, callable ones (classifyUncalledLead null; DNC read below).
+  const retryFloorMs = nowMs - UNCALLED_WINDOW_DAYS * DAY_MS;
+  const retryCandidates = timing.filter((t) => {
+    if (!isCalled(t) || !isDataLead(t.lead)) return false;
+    const createdMs = lpLocalToUtcMs(t.lead.created_at_lp);
+    return createdMs != null && createdMs >= retryFloorMs && !!t.who.phone10;
+  });
 
   let dupCalledPhones;
   try {
@@ -389,7 +458,7 @@ export async function measureLeadLeak({ env = process.env, nowMs = Date.now(), d
 
   // DNC only where it could change the answer: not already decided by its
   // codes (NIS, NOC, NoRehash, progressed), not already LP-DNC, with a phone.
-  const dncCandidates = [...new Set(uncalled
+  const dncCandidates = [...new Set([...uncalled, ...retryCandidates.map((t) => t.lead)]
     .filter((l) => needsDncCheck(l, nowMs))
     .map((l) => normalizePhone10(l.phone)))];
   let five9Dnc;
@@ -435,15 +504,21 @@ export async function measureLeadLeak({ env = process.env, nowMs = Date.now(), d
     let reason = classifyUncalledLead(lead, ctx);
     let lookup = null;
     if (reason === null) {
-      if (lookups < lookupCap && consecutiveErrors < MAX_CONSECUTIVE_LOOKUP_ERRORS) {
+      // The hourly pass only spends lookups on leads its card will name.
+      const waited = waitingMs(lead.created_at_lp, nowMs);
+      const willBeNamed = waited != null && waited > acfg.graceHours * HOUR_MS;
+      if (cardLookupsOnly && !willBeNamed) {
+        lookup = 'skipped';
+      } else if (lookups < lookupCap && consecutiveErrors < MAX_CONSECUTIVE_LOOKUP_ERRORS) {
         lookups += 1;
-        lookup = await lookupFive9Contact(getContactRecords, normalizePhone10(lead.phone));
+        lookup = await lookupFive9Contact(getContactRecords, normalizePhone10(lead.phone), lead.lp_lead_id);
         if (lookup === 'error') { lookupErrors += 1; consecutiveErrors += 1; } else consecutiveErrors = 0;
       } else {
         lookup = lookupCap === 0 ? 'skipped' : 'over_cap';
       }
       reason = finalizeReason(lookup);
     }
+    const record = lookup && typeof lookup === 'object' ? lookup : null;
     const createdMs = lpLocalToUtcMs(lead.created_at_lp);
     rows.push({
       run_date: runDate,
@@ -464,7 +539,9 @@ export async function measureLeadLeak({ env = process.env, nowMs = Date.now(), d
         ...(reason === 'rep_hold' || reason === 'rep_hold_expired'
           ? { hold_started: lead.updated_at_lp ?? null, ...(holdDateUnknown(lead) ? { hold_date_unknown: true } : {}) }
           : {}),
-        ...(lookup ? { five9_lookup: lookup } : {}),
+        ...(lookup ? { five9_lookup: record ? 'present' : lookup } : {}),
+        ...(record ? { five9_record: { list: record.list, campaign: record.campaign, attempts: record.attempts,
+          lead_id_match: record.leadIdMatch } } : {}),
       },
     });
   }
@@ -478,7 +555,9 @@ export async function measureLeadLeak({ env = process.env, nowMs = Date.now(), d
   const reasonById = new Map(rows.map((r) => [r.lp_lead_id, r.reason]));
   // A lead created during a live call never waited, so it is left out of the
   // speed numbers altogether (src/lead-speed.js, CREATION_CALL_WINDOW_MIN).
-  const speedItems = timing.filter((t) => t.liveCallMs === null).map(({ lead, firstCallMs }) => {
+  // So is one first rung at the inquiry stage (2026-09-29): its first call is
+  // BEFORE its creation, and counting it as 0 minutes would flatter the floor.
+  const speedItems = timing.filter((t) => t.liveCallMs === null && t.precreate === null).map(({ lead, firstCallMs }) => {
     const createdMs = lpLocalToUtcMs(lead.created_at_lp);
     const minutes = minutesToFirstCall(lead.created_at_lp, firstCallMs);
     const waited = waitingMs(lead.created_at_lp, nowMs);
@@ -500,11 +579,44 @@ export async function measureLeadLeak({ env = process.env, nowMs = Date.now(), d
     decision: shouldAlertSpeed({ leads: speedItems, todayDay: runDate }, acfg),
   };
 
-  // Owed leads waiting past the grace with no Five9 call — named on the cards.
-  const offenders = rows
-    .filter((r) => LEAK_REASONS.includes(r.reason))
-    .map((r) => ({ ...r.detail, lead_source: r.lead_source, reason: r.reason, lp_lead_id: r.lp_lead_id,
-      waitingMs: waitingMs(r.detail.created_at_lp, nowMs) }))
+  // Called leads owed a retry (see retryCandidates above).
+  const retryGapMs = cfg.retryGapHours * HOUR_MS;
+  const retryWaiting = [];
+  for (const t of retryCandidates) {
+    if (classifyUncalledLead(t.lead, ctx) !== null) continue; // DNC, no source, dead…
+    const calls = callsSince(t.who, tctx, cfg.precreateHours);
+    const lastMs = calls.length ? calls[calls.length - 1] : null;
+    if (lastMs == null || workingMsBetween(lastMs, nowMs) < retryGapMs) continue;
+    const lastByKey = five9.last?.get(`LDS${String(t.lead.lp_lead_id).trim()}`);
+    const lastByPhone = five9.last?.get(t.who.phone10);
+    const lastRec = [lastByKey, lastByPhone].filter(Boolean).sort((a, b) => b.ms - a.ms)[0];
+    retryWaiting.push({
+      first_name: t.lead.first_name ?? null,
+      last_name: t.lead.last_name ?? null,
+      phone10: t.who.phone10,
+      created_at_lp: t.lead.created_at_lp ?? null,
+      lead_source: t.lead.lead_source ?? null,
+      lp_lead_id: String(t.lead.lp_lead_id),
+      reason: CALLED_NO_RETRY_REASON,
+      calls: {
+        count: calls.length,
+        lastMs,
+        lastDispo: lastRec?.name ?? null,
+        before_creation: t.precreate?.count ?? 0,
+      },
+      waitingMs: waitingMs(t.lead.created_at_lp, nowMs),
+    });
+  }
+
+  // Owed leads waiting past the grace for a Five9 call — named on the cards:
+  // never called (a leak reason), or called and not retried.
+  const offenders = [
+    ...rows
+      .filter((r) => LEAK_REASONS.includes(r.reason))
+      .map((r) => ({ ...r.detail, lead_source: r.lead_source, reason: r.reason, lp_lead_id: r.lp_lead_id,
+        waitingMs: waitingMs(r.detail.created_at_lp, nowMs) })),
+    ...retryWaiting,
+  ]
     .filter((o) => o.waitingMs != null && o.waitingMs > acfg.graceHours * HOUR_MS)
     .sort((a, b) => b.waitingMs - a.waitingMs);
 
@@ -539,6 +651,10 @@ export async function measureLeadLeak({ env = process.env, nowMs = Date.now(), d
     universe: leads.length,
     called: leads.length - uncalled.length,
     created_on_live_call: timing.filter((t) => t.liveCallMs !== null).length,
+    // Rung before LP stamped them (inquiry stage) and never after — counted as
+    // called, kept out of the speed numbers.
+    called_before_creation: timing.filter((t) => t.precreate !== null && t.firstCallMs === null).length,
+    called_no_retry: retryWaiting.length,
     five9: { keys: five9.keys.size, phones: five9.phones.size, first_event_at: new Date(five9.firstAt).toISOString() },
     lookups: { made: lookups, cap: lookupCap, failed: lookupErrors },
     revenueAvailable: !!rates,
@@ -688,7 +804,7 @@ export async function runLeadLeakMonitor({ env = process.env, nowMs = Date.now()
   await deliverAlert({
     mode: aMode, report, key: 'lead_speed_slow', label: 'Time to first call',
     verdict: speedDecision.verdict, remindMs: REMIND_SPEED_MS,
-    text: () => formatSpeedAlert(speedDecision, m.offenders, { cfg: acfg, dashboardUrl: cfg.dashboardUrl }),
+    text: () => formatSpeedAlert(speedDecision, m.offenders, { cfg: acfg, dashboardUrl: cfg.dashboardUrl, nowMs }),
     recoveredText: () => formatSpeedRecovered(speedDecision),
     detail: JSON.stringify({ recent: speedDecision.recent, baseline: speedDecision.baseline }),
   });
@@ -752,8 +868,10 @@ export async function runLeadLeakMonitor({ env = process.env, nowMs = Date.now()
 
 /**
  * The hourly pass: owed leads from the last two days that have waited more
- * than the grace (call-center hours) with no Five9 call. No Five9 contact
- * lookups, no $, no storage — just the named card.
+ * than the grace (call-center hours) for a Five9 call — never called, or
+ * called and not retried. Five9 contact lookups for the named leads only
+ * (LEAD_UNCALLED_LOOKUP_CAP), so each line carries a real reason. No $, no
+ * storage — just the named card.
  */
 export async function runLeadUncalledCheck({ env = process.env, nowMs = Date.now(), deps = {} } = {}) {
   const aMode = alertMode(env);
@@ -763,13 +881,13 @@ export async function runLeadUncalledCheck({ env = process.env, nowMs = Date.now
   const acfg = alertConfig(env);
 
   const m = await measureLeadLeak({
-    env, nowMs, deps, opts: { windowDays: UNCALLED_WINDOW_DAYS, lookups: false, rates: false, intake: false },
+    env, nowMs, deps, opts: { windowDays: UNCALLED_WINDOW_DAYS, lookups: 'card', rates: false, intake: false },
   });
   const decision = shouldAlertUncalled(m.offenders, { readOk: m.verdict !== 'insufficient_evidence' });
   const res = await deliverAlert({
     mode: aMode, report, key: 'lead_uncalled_fresh', label: 'Leads waiting with no call',
     verdict: decision.verdict, remindMs: REMIND_UNCALLED_MS,
-    text: () => formatUncalledAlert(m.offenders, { cfg: acfg, dashboardUrl: cfg.dashboardUrl }),
+    text: () => formatUncalledAlert(m.offenders, { cfg: acfg, dashboardUrl: cfg.dashboardUrl, nowMs }),
     recoveredText: formatUncalledRecovered,
     detail: `waiting=${decision.count}`,
   });

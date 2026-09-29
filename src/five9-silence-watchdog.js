@@ -35,7 +35,6 @@
  */
 
 import supabase from './supabase.js';
-import { sendGroupMeMessage } from './groupme.js';
 import { reportAlertCondition } from './alert-state.js';
 import { runJob } from './job-runner.js';
 
@@ -134,7 +133,7 @@ export async function checkFive9Silence() {
     remindMs: REMIND_MS,
     notifyRecovery: false,
     fallbackCooldownMs: REALERT_MS,
-    send: sendGroupMeMessage,
+    // No `send`: alert-state's default posts to Slack (ALERT_SEND_TARGET, 2026-09-29).
   });
 
   return res.sent === true;

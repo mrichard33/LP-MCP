@@ -13,9 +13,8 @@
 
 import { formatLpSource } from '../format-helpers.js';
 import { buildClassifiedNotification } from '../actions/notification-classifier.js';
-import { sendGroupMeMessage } from '../groupme.js';
 import { generateBackstopInsight } from './backstop-insight.js';
-import { reportAlertCondition, __resetAlertStateFallback } from '../alert-state.js';
+import { reportAlertCondition, sendAlertMessage, __resetAlertStateFallback } from '../alert-state.js';
 
 /**
  * Source line for the card header, covering BOTH the single-lead and
@@ -316,7 +315,8 @@ export async function notifyBackstopRun({
   // Injectable sender, same seam alert-state.js and capacityRanker already use.
   // ES module bindings are read-only, so this is the only way a test can watch
   // what would have been posted without reaching the real GroupMe client.
-  send = (text) => sendGroupMeMessage(text, { flushNow: true }),
+  // Slack by default since 2026-09-29 (ALERT_SEND_TARGET, src/alert-state.js).
+  send = (text) => sendAlertMessage(text, { flushNow: true }),
 }) {
   try {
     const { severity, errorRate } = classifyRun({ counts, scan });
@@ -390,7 +390,7 @@ export async function notifyBackstopRun({
  */
 export async function notifyBackstopFailure({
   sweepMode, error, nowMs = Date.now(),
-  send = (text) => sendGroupMeMessage(text, { flushNow: true }),
+  send = (text) => sendAlertMessage(text, { flushNow: true }),
 }) {
   try {
     if (notifyMode() === 'off') return { sent: false, reason: 'notify_off' };

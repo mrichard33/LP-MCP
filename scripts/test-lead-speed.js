@@ -186,7 +186,8 @@ test('cards name the leads — first name + initial, last four digits only', () 
     reason: 'routing_or_automation_failure', lp_lead_id: '578472', waitingMs: 3 * 3600000 + 600000,
   }];
   const text = formatUncalledAlert(offenders, { dashboardUrl: 'https://dash.example/lead-leaks' });
-  assert.match(text, /1 lead waiting more than 2h with no Five9 call/);
+  assert.match(text, /1 lead waiting more than 2h for a Five9 call/);
+  assert.match(text, /\*Never dialled — Five9 has the number \(1\)\*/, 'grouped under its reason');
   assert.match(text, /Jane D\. · …3161 · Google PPC · waiting 3h 10m · Never dialled — Five9 has the number · LP 578472/);
   assert.match(text, /https:\/\/dash\.example\/lead-leaks/);
   assert.ok(!text.includes('3524453161'), 'never the full number');
@@ -388,12 +389,25 @@ test('a lead keyed in during a live call counts as worked, and stays out of the 
   assert.equal(m.created_on_live_call, 1);
   assert.equal(m.offenders.length, 0);
   assert.equal(m.speed.daily.reduce((n, d) => n + d.leads, 0), 0, 'never waited — not in the speed rows');
-  // A call more than an hour before creation is someone else's (an earlier lead).
-  const old = [new Date(createdMs - 90 * 60000).toISOString()];
-  const runOld = async (sql) => (sql.includes('FROM five9_events_raw') && !sql.includes('min(received_at)')
-    ? [{ keys: [], phones: [['3524453161', old]] }] : runSQL(sql));
-  const m2 = await measureLeadLeak({ env: {}, nowMs: NOW, deps: baseDeps({ runSQL: runOld }), opts: { windowDays: 2, intake: false, lookups: false } });
-  assert.equal(m2.called, 0);
+  // 2026-09-29: a call more than an hour before creation is no longer "someone
+  // else's" — it is the inquiry-stage dial (LEAD_PRECREATE_CALL_HOURS, 48h).
+  // Called, and kept out of the speed numbers like the live call.
+  const phonesAt = (times) => async (sql) => (sql.includes('FROM five9_events_raw') && !sql.includes('min(received_at)')
+    ? [{ keys: [], phones: [['3524453161', times]] }] : runSQL(sql));
+  const opts = { windowDays: 2, intake: false, lookups: false };
+  const early = [new Date(createdMs - 90 * 60000).toISOString()];
+  const m2 = await measureLeadLeak({ env: {}, nowMs: NOW, deps: baseDeps({ runSQL: phonesAt(early) }), opts });
+  assert.equal(m2.called, 1);
+  assert.equal(m2.called_before_creation, 1);
+  assert.equal(m2.speed.daily.reduce((n, d) => n + d.leads, 0), 0, 'no negative or zero minutes in the speed rows');
+  // Past the pre-create window it is not this lead's call.
+  const tooEarly = [new Date(createdMs - 49 * 3600000).toISOString()];
+  const m3 = await measureLeadLeak({ env: {}, nowMs: NOW, deps: baseDeps({ runSQL: phonesAt(tooEarly) }), opts });
+  assert.equal(m3.called, 0);
+  const m4 = await measureLeadLeak({
+    env: { LEAD_PRECREATE_CALL_HOURS: '72' }, nowMs: NOW, deps: baseDeps({ runSQL: phonesAt(tooEarly) }), opts,
+  });
+  assert.equal(m4.called, 1, 'LEAD_PRECREATE_CALL_HOURS widens it');
 });
 
 /* --- close-out fixes (2026-09-28) ------------------------------------- */
