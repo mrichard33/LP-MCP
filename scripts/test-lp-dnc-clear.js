@@ -20,19 +20,19 @@ function recorder(response = [{ Result: 1, Message: 'Success' }]) {
   return { calls, lpPost: async (path, fields) => { calls.push({ path, fields }); return response; } };
 }
 
-test('CLEAR sends a blank newDncStatus (LP docs), never N', async () => {
-  assert.equal(LP_DNC_CLEAR_CODE, '');
+test('CLEAR sends a single space (LP\'s blank), never N or an empty field', async () => {
+  assert.equal(LP_DNC_CLEAR_CODE, ' ');
   const r = recorder();
   await updateDncStatus({ custid: 458487, newDncStatus: 'CLEAR', empid: 5686 }, { lpPost: r.lpPost });
   assert.equal(r.calls.length, 1);
   assert.equal(r.calls[0].path, '/api/Customers/UpdateDNCStatus');
-  assert.equal(r.calls[0].fields.newDncStatus, '');
-  assert.notEqual(r.calls[0].fields.newDncStatus, 'N');
+  assert.equal(r.calls[0].fields.newDncStatus, ' ');
+  assert.ok(!['N', ''].includes(r.calls[0].fields.newDncStatus), 'both were rejected by LP on 2026-09-29');
 });
 
-test('the blank value survives form encoding as an empty field', () => {
-  const body = new URLSearchParams({ custid: '458487', newDncStatus: '', empid: '5686' }).toString();
-  assert.match(body, /(^|&)newDncStatus=(&|$)/);
+test('the single space survives form encoding', () => {
+  const body = new URLSearchParams({ custid: '458487', newDncStatus: ' ', empid: '5686' }).toString();
+  assert.match(body, /(^|&)newDncStatus=\+(&|$)/);
 });
 
 test('set codes are sent as-is, and an unknown code is refused before any call', async () => {
@@ -50,6 +50,6 @@ test('an LP error still fails loud, naming the blank clear', async () => {
   const r = recorder([{ Result: 0, Message: 'Error: Invalid DNC value.' }]);
   await assert.rejects(
     updateDncStatus({ custid: 458487, newDncStatus: 'CLEAR', empid: 5686 }, { lpPost: r.lpPost }),
-    /blank = CLEAR.*Invalid DNC value/,
+    /single space = CLEAR.*Invalid DNC value/,
   );
 });
