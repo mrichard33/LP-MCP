@@ -37,7 +37,8 @@ repo — they are recorded in `sql/seeds/` on the date they were applied live.
 - **An approved DNC lift now actually clears DNC in Lead Perfection.** The clear
   sent `N`, a guess LP rejects ("Invalid DNC value"), so every LP clear failed —
   Slack lifts and automatic re-entry lifts alike. LP's API docs say a blank value
-  resets the status; the clear now sends blank.
+  resets the status. An empty field was rejected the same way, so the clear now
+  sends a single space.
 
 - **Approving a DNC lift now restores texts too, unless the lead really texted
   STOP.** A `dnc-sms` tag on its own no longer counts as a texted STOP — staff

@@ -863,17 +863,19 @@ export async function setAppointment({ ldsId, setBy = LP_EMP.GHL_INTEGRATION, ap
  */
 const VALID_DNC_CODES = new Set(['C', 'M', 'T', 'E', 'P']);
 
-// ─── DNC CLEAR value (2026-07-24; confirmed from LP's API docs 2026-09-29) ──
+// ─── DNC CLEAR value (2026-07-24; LP API docs; see the 2026-09-29 notes) ──
 // LP's own documentation for /api/Customers/UpdateDNCStatus: "Passing a blank
-// value will remove the existing selection and reset the status." So a clear
-// sends newDncStatus = '' (empty string).
+// value will remove the existing selection and reset the status."
 //
-// Until 2026-09-29 this sent 'N' — an unconfirmed guess — and LP rejected it
-// with "Error: Invalid DNC value." (custid 458487, Mark Test), so every clear
-// failed: the Slack-approved lift and the automatic re-entry lifts alike. The
-// user supplied the docs screenshot. Do not reintroduce an env override that
-// maps an empty variable back to a letter — that is exactly how 'N' happened.
-export const LP_DNC_CLEAR_CODE = '';
+// 2026-09-29, prospect 458487 (Mark Test — the ONLY record the user approved
+// for trying clear values, at most three):
+//   1. 'N'  → "Error: Invalid DNC value."  (the original, unconfirmed guess)
+//   2. ''   → "Error: Invalid DNC value."  (an empty form field reads as
+//             missing — LP's validator does not treat it as "blank")
+//   3. ' '  → a single space: LP's "blank" value. The third and last value.
+// If ' ' is rejected too, STOP and ask LP support which value clears DNC —
+// do not try a fourth value on a live record.
+export const LP_DNC_CLEAR_CODE = ' ';
 
 export async function updateDncStatus({ custid, newDncStatus, empid = LP_EMP.GHL_INTEGRATION, phone }, deps = {}) {
   if (!custid) {
@@ -889,7 +891,7 @@ export async function updateDncStatus({ custid, newDncStatus, empid = LP_EMP.GHL
     throw new Error(`updateDncStatus: invalid newDncStatus "${newDncStatus}" (must be one of: C/M/T/E/P or CLEAR)`);
   }
   const code = isClear ? LP_DNC_CLEAR_CODE : raw;
-  const shown = isClear ? '(blank = CLEAR)' : code;
+  const shown = isClear ? '(single space = CLEAR)' : code;
 
   console.log(`[LP] UpdateDNCStatus: custid=${custid}, code=${shown}, empid=${empid}${phone ? `, phone=${phone}` : ''}`);
 
