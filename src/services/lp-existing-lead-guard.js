@@ -90,3 +90,44 @@ export function pickNewestLead(leads) {
     createdAtLp: leadDate(best),
   };
 }
+
+/**
+ * One log line per guard evaluation (2026-09-29).
+ *
+ * The first 24h shadow review found ZERO "would reuse" lines and could not
+ * tell whether that meant "the guard works and nothing matched" or "the guard
+ * never ran": it only logged when it WOULD reuse. Every evaluation now logs
+ * one line with a decision, so a review can count — filter on
+ * "EXISTING-LEAD decision=":
+ *   no_phone     contact has no phone, guard not run
+ *   none         LP has no lead on this phone
+ *   create       LP has a lead, older than the window → create a new one
+ *   would_reuse  shadow: LP has a recent lead; a new one is created anyway
+ *   reused       live: the recent LP lead was reused, nothing created
+ *   error        LP lookup failed → create (fail-open)
+ * The same object is returned on the action as execution_result
+ * .existing_lead_check, so the counts are also a SQL query away.
+ */
+export function formatGuardDecisionLine({ contactId, mode, decision, existing = null, windowDays = 15, error = null } = {}) {
+  let line = `[LP-CREATE] EXISTING-LEAD decision=${decision} mode=${mode} contact=${contactId}`;
+  if (existing) {
+    const src = existing.lpSourceDetail || existing.lpSource || 'source?';
+    line += ` lds=${existing.ldsId} source=${src} created=${existing.createdAtLp || 'not yet cached'}`;
+  }
+  if (decision === 'create') line += ` (older than ${windowDays}d)`;
+  if (decision === 'would_reuse') line += ' — SHADOW, creating anyway';
+  if (error) line += ` error=${String(error).slice(0, 200)}`;
+  return line;
+}
+
+/** The execution_result.existing_lead_check object for the same decision. */
+export function buildGuardCheck({ mode, decision, existing = null, error = null } = {}) {
+  return {
+    mode,
+    decision,
+    lp_lead_id: existing?.ldsId || null,
+    lp_source: existing ? (existing.lpSourceDetail || existing.lpSource || null) : null,
+    created_at_lp: existing?.createdAtLp || null,
+    ...(error ? { error: String(error).slice(0, 200) } : {}),
+  };
+}

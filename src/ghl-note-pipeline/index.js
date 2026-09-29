@@ -25,6 +25,7 @@ import {
 import { summarizeConversation, stampNoteOrigin } from './summarizer.js';
 import { writeLpNote } from './lp-write.js';
 import { classifyMatch, resolveOrCreateLpLead } from './resolve-or-create.js';
+import { decideDefer } from './defer-policy.js';
 import { trackBackground } from '../graceful-shutdown.js';
 
 // ─── Config ──────────────────────────────────────────────────────
@@ -217,11 +218,14 @@ function classifyLabel(cls) {
 }
 
 // Defer a row that has no LP prospect yet (lead created/ambiguous/unavailable).
-// Leaves it pending for a later sweep; alerts at most once per outcome; gives up
-// (→ failed) once attempts reach MAX_ATTEMPTS so permanently-stuck rows (e.g. an
-// un-creatable lead missing its address) stop looping.
+// When to give up and when to alert live in defer-policy.js (pure, tested):
+// self-healing outcomes retry up to MAX_ATTEMPTS and alert only on give-up;
+// ambiguous alerts once; missing fields stop on the first attempt because a
+// retry cannot add a phone and create_lp_lead has already alerted (2026-09-29).
 async function deferLead(id, claimedRow, attempts, outcome, detail) {
-  const failed = attempts >= MAX_ATTEMPTS;
+  const { failed, alert, verb } = decideDefer({
+    outcome, attempts, lastError: claimedRow.last_error, maxAttempts: MAX_ATTEMPTS,
+  });
   const nowIso = new Date().toISOString();
   await supabase
     .from('ghl_conversation_pending')
@@ -235,13 +239,7 @@ async function deferLead(id, claimedRow, attempts, outcome, detail) {
     })
     .eq('id', id);
 
-  // created_deferred / lp_unavailable self-resolve, so they only alert if they
-  // exhaust retries. ambiguous / missing-fields alert once (deduped on the
-  // prior last_error), and anything alerts on final give-up.
-  const alertable = outcome === 'ambiguous_deferred' || outcome === 'missing_fields_deferred';
-  const firstTimeForOutcome = claimedRow.last_error !== outcome;
-  if (failed || (alertable && firstTimeForOutcome)) {
-    const verb = failed ? `gave up after ${attempts} attempts` : 'deferred';
+  if (alert) {
     sendGroupMeMessage(
       `⚠️ GHL→LP lead ${verb} · row=${id} · contact=${claimedRow.ghl_contact_id} · ${outcome}` +
         (detail ? ` · ${detail}` : ''),
