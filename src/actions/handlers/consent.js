@@ -11,7 +11,7 @@
  *     change:   'revoked' | 'granted' | 'dnc_full_on' | 'dnc_full_off'
  *               | 'carrier_stop_on' | 'carrier_stop_off'
  *     source:   'sms_stop' | 'voice_request' | 'email_unsub' | 'lp_dnc'
- *               | 'auto_lift' | 'slack_lift' | 'slack_review' | …
+ *               | 'manual_tag' | 'auto_lift' | 'slack_lift' | 'slack_review' | …
  *     reason?:  free text
  *     actor?:   'system' (default) or the Slack approver
  *     evidence?: object — merged over { rule_applied, event_id, action_id }

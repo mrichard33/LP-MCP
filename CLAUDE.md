@@ -113,6 +113,10 @@ transaction. `CONSENT_MODEL_MODE` is `shadow`: nothing gates a send on these tab
   approvals out. Do not add a carve-out for it in `resolveRequiresApproval`.
 - `POST /slack/dnc-lift/decision` is idempotent on `request_id` through `dnc_lift_requests`
   (sql/140) and refuses (503) without it.
+- **A `dnc` tag is a full opt-out** (`TAG_DNC_MANUAL_OPTOUT`, 2026-09-29): every DND channel, Five9,
+  LP C+T, `stop-bot`, consent `all/dnc_full_on` from `manual_tag`, no carrier STOP. Rule 241
+  `TAG_DNC_TO_HARDLOSS` only moves the objection state — before this rule, a person tagging `dnc`
+  blocked nothing.
 - **ActiveProspect re-entries reach review only through `POST /webhook/ap/dnc-reentry`**, which
   n8n I.AP calls on its "link" branch (the lead's phone matched an existing contact). E.0's
   `reentry` event covers first-party consent only. The endpoint asks; it never lifts.
