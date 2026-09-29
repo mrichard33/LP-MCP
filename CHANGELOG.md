@@ -5,6 +5,17 @@ Notable behavioral changes to the LP MCP server. Newest first.
 Rule-layer (`agent_rules`) changes ship through the database, not through this
 repo — they are recorded in `sql/seeds/` on the date they were applied live.
 
+## 2026-09-29
+
+- **A channel opt-out tag now blocks its channel, and only that.** `dnc-sms` and
+  `dnc-voice` block calls + texts (GHL DND, Five9, LP codes C + T); `dnc-email`
+  blocks email only. Each records the change in the consent record (source
+  `ghl_tag`). Before, the intake filter dropped these tags, so a person adding
+  them — or GHL's own STOP handling adding `dnc-sms` — reached neither Five9 nor
+  LP. Plain `dnc` still blocks nothing (rule 241 moves the funnel state). Seeds:
+  `sql/seeds/2026-09-29_channel_dnc_tags.sql`; the short-lived full-opt-out rule
+  is disabled in `sql/seeds/2026-09-29_manual_dnc_tag_optout.sql`.
+
 ## 2026-09-28
 
 - **ActiveProspect re-entries now ask for a DNC-lift review.** n8n I.AP calls

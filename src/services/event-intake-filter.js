@@ -324,6 +324,15 @@ const ALLOWED_TAG_ADDED_SUBTYPES = new Set([
   // #dnc-lift-approval. Without this entry the request is dropped here and no
   // card ever appears.
   'dnc-lift:request',               // rule DNC_LIFT_REVIEW_REQUEST
+
+  // ── PER-CHANNEL OPT-OUT TAGS (2026-09-29) ──
+  // A tag blocks only its own channel (the user's ruling; plain `dnc` blocks
+  // nothing — rule 241 moves the state only). These were dropped here, so a
+  // person tagging dnc-sms, or GHL's own STOP handling doing it, never reached
+  // Five9 or LP.
+  'dnc-sms',                        // rule TAG_DNC_SMS_OPTOUT   (calls + texts)
+  'dnc-voice',                      // rule TAG_DNC_VOICE_OPTOUT (calls + texts)
+  'dnc-email',                      // rule TAG_DNC_EMAIL_OPTOUT (email only)
 ]);
 
 /**
