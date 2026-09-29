@@ -863,37 +863,35 @@ export async function setAppointment({ ldsId, setBy = LP_EMP.GHL_INTEGRATION, ap
  */
 const VALID_DNC_CODES = new Set(['C', 'M', 'T', 'E', 'P']);
 
-// ─── DNC CLEAR code (Phase 2, 2026-07-24) ──────────────────────────────
-// The single-character value UpdateDNCStatus accepts to WIPE the internal
-// DNC flag (re-entry = new consent — see actions/handlers/lp-dnc.js CLEAR).
+// ─── DNC CLEAR value (2026-07-24; confirmed from LP's API docs 2026-09-29) ──
+// LP's own documentation for /api/Customers/UpdateDNCStatus: "Passing a blank
+// value will remove the existing selection and reset the status." So a clear
+// sends newDncStatus = '' (empty string).
 //
-// ⚠ NOT probe-confirmed against production. The documented probe (candidate
-// clear values "N"/""/"0"/"None", the accepted one being the clear code)
-// MUTATES a live prospect's DNC on success, and the only known-DNC probe
-// target on hand — prospect 447640 (Max Lesser) — is under a valid, current
-// STOP revocation that must NOT be lifted. Confirm the exact value with a
-// safe probe against a DISPOSABLE sandbox prospect, then set LP_DNC_CLEAR_CODE.
-// Default 'N' (first UpdateDNCStatus clear candidate). A wrong value fails
-// LOUD here (LP returns Result:0 / "Error:") — never a silent mis-clear.
-export const LP_DNC_CLEAR_CODE = (process.env.LP_DNC_CLEAR_CODE || 'N').trim().toUpperCase();
+// Until 2026-09-29 this sent 'N' — an unconfirmed guess — and LP rejected it
+// with "Error: Invalid DNC value." (custid 458487, Mark Test), so every clear
+// failed: the Slack-approved lift and the automatic re-entry lifts alike. The
+// user supplied the docs screenshot. Do not reintroduce an env override that
+// maps an empty variable back to a letter — that is exactly how 'N' happened.
+export const LP_DNC_CLEAR_CODE = '';
 
-export async function updateDncStatus({ custid, newDncStatus, empid = LP_EMP.GHL_INTEGRATION, phone }) {
+export async function updateDncStatus({ custid, newDncStatus, empid = LP_EMP.GHL_INTEGRATION, phone }, deps = {}) {
   if (!custid) {
     throw new Error('updateDncStatus: custid (LP prospect ID) is required');
   }
   if (!newDncStatus) {
     throw new Error('updateDncStatus: newDncStatus is required (one of: C/M/T/E/P or CLEAR)');
   }
+  const post = deps.lpPost || ((path, fields) => withCircuit(() => lpPost(path, fields)));
   const raw = String(newDncStatus).trim().toUpperCase();
-  // CLEAR path — wipe the DNC flag. Accept the literal 'CLEAR' alias or the
-  // configured clear code itself; both resolve to LP_DNC_CLEAR_CODE on the wire.
-  const isClear = raw === 'CLEAR' || raw === LP_DNC_CLEAR_CODE;
-  const code = isClear ? LP_DNC_CLEAR_CODE : raw;
-  if (!isClear && !VALID_DNC_CODES.has(code)) {
+  const isClear = raw === 'CLEAR';
+  if (!isClear && !VALID_DNC_CODES.has(raw)) {
     throw new Error(`updateDncStatus: invalid newDncStatus "${newDncStatus}" (must be one of: C/M/T/E/P or CLEAR)`);
   }
+  const code = isClear ? LP_DNC_CLEAR_CODE : raw;
+  const shown = isClear ? '(blank = CLEAR)' : code;
 
-  console.log(`[LP] UpdateDNCStatus: custid=${custid}, code=${code}${isClear ? ' (CLEAR)' : ''}, empid=${empid}${phone ? `, phone=${phone}` : ''}`);
+  console.log(`[LP] UpdateDNCStatus: custid=${custid}, code=${shown}, empid=${empid}${phone ? `, phone=${phone}` : ''}`);
 
   const fields = {
     custid:       String(custid),
@@ -902,7 +900,7 @@ export async function updateDncStatus({ custid, newDncStatus, empid = LP_EMP.GHL
   };
   if (phone) fields.phone = String(phone);
 
-  const result = await withCircuit(() => lpPost('/api/Customers/UpdateDNCStatus', fields));
+  const result = await post('/api/Customers/UpdateDNCStatus', fields);
 
   // LP returns array-wrapped responses for this endpoint — unwrap.
   const item = Array.isArray(result) ? (result[0] || {}) : (result || {});
@@ -916,10 +914,10 @@ export async function updateDncStatus({ custid, newDncStatus, empid = LP_EMP.GHL
     (typeof message === 'string' && /^\s*Error\s*:/i.test(message));
 
   if (looksLikeError) {
-    throw new Error(`LP UpdateDNCStatus error (custid=${custid}, code=${code}, empid=${empid}): ${message || '(no message)'}`);
+    throw new Error(`LP UpdateDNCStatus error (custid=${custid}, code=${shown}, empid=${empid}): ${message || '(no message)'}`);
   }
 
-  console.log(`[LP] UpdateDNCStatus SUCCESS: custid=${custid}, code=${code}, response: ${JSON.stringify(item).slice(0, 200)}`);
+  console.log(`[LP] UpdateDNCStatus SUCCESS: custid=${custid}, code=${shown}, response: ${JSON.stringify(item).slice(0, 200)}`);
   return item;
 }
 
