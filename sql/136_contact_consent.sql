@@ -39,7 +39,7 @@ CREATE TABLE IF NOT EXISTS contact_consent (
   sms_carrier_stop    boolean NOT NULL DEFAULT false,
   dnc_full            boolean NOT NULL DEFAULT false,
   last_reason         text,
-  last_source         text,          -- sms_stop | voice_request | email_unsub | lp_dnc | auto_lift | slack_lift | slack_review | backfill
+  last_source         text,          -- sms_stop | voice_request | email_unsub | lp_dnc | ghl_tag | auto_lift | slack_lift | slack_review | backfill
   last_changed_by     text,          -- 'system' or the Slack approver
   updated_at          timestamptz NOT NULL DEFAULT now()
 );

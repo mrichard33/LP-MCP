@@ -63,7 +63,7 @@ const CHANGE_CHANNELS = {
  * (detectCarrierStop).
  */
 export const DNC_FAMILY_TAGS = Object.freeze([
-  'dnc', 'dnc-sms', 'dnc-voice', 'stage:dnc', 'p3:dnc', 'lp-dnc', 'do-not-contact',
+  'dnc', 'dnc-sms', 'dnc-voice', 'dnc-email', 'stage:dnc', 'p3:dnc', 'lp-dnc', 'do-not-contact',
   'loss-reason:dnc', 'stop-bot', 'suppress:dnc-reply', 'suppress:dnc-voice',
 ]);
 

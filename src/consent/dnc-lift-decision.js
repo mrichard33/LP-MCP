@@ -53,7 +53,7 @@ import { APPROVED_DNC_LIFT_RULE_KEY, isSlackUserId } from '../five9/admin-writes
 
 export const KEEP_BLOCKED_RULE_KEY = 'SLACK_DNC_KEEP_BLOCKED';
 export const LIFT_TAGS = Object.freeze([
-  'dnc', 'stage:dnc', 'lp-dnc', 'do-not-contact', 'dnc-voice', 'loss-reason:dnc',
+  'dnc', 'stage:dnc', 'lp-dnc', 'do-not-contact', 'dnc-voice', 'dnc-email', 'loss-reason:dnc',
   'stop-bot', 'mark-p1-lost', 'suppress-automation',
 ]);
 export const CARRIER_STOP_KEEP_TAG = 'dnc-sms';
