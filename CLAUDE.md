@@ -19,9 +19,12 @@ mirror do the rest:
   card prints the display name (`Ft. Myers / SW Florida`). Passing the name resolves nothing and the
   card lands in the rollup only. `resolveMarketCode()` in `src/actions/enrichment.js` returns the
   code; `resolveMarket()` returns the name.
-- **Operational alarms use `channel: 'ops'`** → the dedicated ops bot, mirrored to
-  `SLACK_CHANNEL_OPS` (#ops-alerts). Precedent: `src/jobs/lp-report-watchdog.js`,
-  `src/jobs/capacity-sweep.js`, `maybeAlertFailClosed` in `src/decision-engine-heartbeat.js`.
+- **Operational alarms go to Slack only (Mark, 2026-09-29; supersedes decision #2188).** Send them
+  through `reportAlertCondition` (its default sender) or `sendAlertMessage(text, { channel: 'ops' })`
+  in `src/alert-state.js` — never `sendGroupMeMessage`. `'ops'`, a blank channel and anything unknown
+  post to `SLACK_CHANNEL_OPS` (#ops-alerts). `ALERT_SEND_TARGET=groupme|both` is the rollback switch;
+  an unset Slack channel is `sent:false` and a log line, never a GroupMe fallback. Precedent:
+  `src/jobs/lp-report-watchdog.js`, `src/jobs/capacity-sweep.js`, `src/routes/capacityRanker.js`.
 - The mirror is **fail-silent by design** (`src/slack.js`): a bad token, a missing channel or
   `SLACK_MIRROR_ENABLED` unset logs and returns. That means a misconfigured Slack channel looks
   exactly like a quiet night. After shipping anything that alerts, confirm a card actually lands —

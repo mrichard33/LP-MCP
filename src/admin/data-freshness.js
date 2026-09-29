@@ -41,7 +41,6 @@
 
 import supabase from '../supabase.js';
 import { getJobStatusChanges, probeLeadEndpoints, getLeadByLdsId, getCircuitStatus } from '../lp-client.js';
-import { sendGroupMeMessage } from '../groupme.js';
 import { extractArray, getField } from '../sync-utils.js';
 import { runSQL } from './supabase-admin.js';
 import { lpStoredAgeMinutes, lpStoredToUtcIso } from '../lp-dates.js';
@@ -459,7 +458,7 @@ async function reportFreshness({ key, active, label, text, detail }) {
     detail,
     notifyRecovery: false,
     fallbackCooldownMs: FALLBACK_COOLDOWN_MS,
-    send: sendGroupMeMessage,
+    // No `send`: alert-state's default posts to Slack (ALERT_SEND_TARGET, 2026-09-29).
   });
   return res.sent === true;
 }

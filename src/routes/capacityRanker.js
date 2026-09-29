@@ -82,9 +82,8 @@ import { getOutboundCampaign } from '../five9-admin.js';
 import {
   executeModifyCampaignLists, executeStartCampaign, executeStopCampaign, five9WritesEnabled,
 } from '../five9/admin-writes.js';
-import { sendGroupMeMessage } from '../groupme.js';
 import { tryAcquireLock, releaseLock } from '../services/outbound-locks.js';
-import { reportAlertCondition } from '../alert-state.js';
+import { reportAlertCondition, sendAlertMessage } from '../alert-state.js';
 import { rankMarkets, isMaterialChange, DEFAULT_SWAP_MARGIN, MARKET_CODES } from '../capacity/rankMarkets.js';
 import {
   applyDialPriority, CAMPAIGNS, TIERS, isCycling, restartCampaignVerified, DEFAULT_RESTART,
@@ -667,9 +666,10 @@ export async function raiseRestartAlert({ campaigns, message, disabledUntil, log
     log(`[CapacityRanker] WARN could not queue the restart-failure alert: ${err.message}`);
   }
   try {
-    await sendGroupMeMessage(text, { noDedup: true });
+    // Slack by default since 2026-09-29 (ALERT_SEND_TARGET, src/alert-state.js).
+    await sendAlertMessage(text, { noDedup: true });
   } catch (err) {
-    log(`[CapacityRanker] WARN could not send the restart-failure GroupMe alert: ${err.message}`);
+    log(`[CapacityRanker] WARN could not send the restart-failure alert: ${err.message}`);
   }
 }
 
@@ -850,7 +850,7 @@ export async function healCampaigns(deps = {}) {
     startCampaign = executeStartCampaign,
     insertLog = insertLogLive,
     markHealed = markHealedLive,
-    sendAlert = (text) => sendGroupMeMessage(text, { noDedup: true }),
+    sendAlert = (text) => sendAlertMessage(text, { noDedup: true }),
     cycling = isCycling,
     report = reportAlertCondition,
     readHealAttemptsToday = readHealAttemptsTodayLive,
@@ -1187,7 +1187,7 @@ export function watchdogAlertKey(campaign) {
 export async function checkCampaignState(deps = {}) {
   const {
     getOutbound = getOutboundCampaign,
-    sendAlert = (text) => sendGroupMeMessage(text, { noDedup: true }),
+    sendAlert = (text) => sendAlertMessage(text, { noDedup: true }),
     inWindow = withinWatchdogWindow,
     cycling = isCycling,
     report = reportAlertCondition,
@@ -1237,7 +1237,7 @@ export async function checkCampaignState(deps = {}) {
         if (r?.sent && active === true) alerted.push(c.campaign);
       } catch (err) {
         // The alert is the whole point, so a failure to send is itself loud.
-        log(`[CapacityRanker] WATCHDOG could not send the GroupMe alert for ${c.campaign}: ${err.message}`);
+        log(`[CapacityRanker] WATCHDOG could not send the alert for ${c.campaign}: ${err.message}`);
       }
     }
   } else if (needsAttention) {

@@ -844,10 +844,11 @@ let slotsIncidentAnnounced = false;
 async function notifyOps(text) {
   if (GROUPME_ALERTS_DISABLED) return { sent: false, reason: 'alerts_disabled' };
   try {
-    const { sendGroupMeMessage } = await import('../groupme.js');
-    return await sendGroupMeMessage(text, { channel: 'ops' });
+    // Slack by default since 2026-09-29 (ALERT_SEND_TARGET, src/alert-state.js).
+    const { sendAlertMessage } = await import('../alert-state.js');
+    return await sendAlertMessage(text, { channel: 'ops' });
   } catch (err) {
-    console.error('[CapacitySweep] GroupMe alert failed:', err.message);
+    console.error('[CapacitySweep] alert failed:', err.message);
     return { sent: false, reason: err.message };
   }
 }

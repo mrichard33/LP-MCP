@@ -302,8 +302,7 @@ import { fetchUpcomingAppointments } from '../knowledge/contact-appointments.js'
 import { normalizeGhlStartTime } from '../services/lp-ghl-appointment-reconciler.js';
 import { getGHLContact } from '../ghl.js';
 import { utcToLpStoredIso, lpStoredAgeMinutes } from '../lp-dates.js';
-import { sendGroupMeMessage } from '../groupme.js';
-import { claimAlertConditionSet, confirmAlertSend } from '../alert-state.js';
+import { claimAlertConditionSet, confirmAlertSend, sendAlertMessage } from '../alert-state.js';
 import { shouldAlertParityGaps, parityAlertKey, formatParityGapCard } from './appointment-parity-alerts.js';
 
 // One alert key per contact per class — see appointment-parity-alerts.js for
@@ -1033,7 +1032,7 @@ export async function runAppointmentParityWatchdog({ dryRun = !PARITY_AUTOHEAL, 
 async function maybeAlertParityGaps(summary, { dryRun, deps = {} } = {}) {
   const claim = deps.claimAlertConditionSet || claimAlertConditionSet;
   const confirm = deps.confirmAlertSend || confirmAlertSend;
-  const send = deps.send || ((text) => sendGroupMeMessage(text, { channel: 'ops', noDedup: true }));
+  const send = deps.send || ((text) => sendAlertMessage(text, { channel: 'ops', noDedup: true }));
   const client = deps.client;
 
   const verdict = shouldAlertParityGaps({

@@ -62,15 +62,26 @@ export function alertMode(env = process.env) {
 }
 
 // ─── Plain-English reasons, for cards and the daily post ─────────────────────
+// 2026-09-29 — `unverified` used to read plain "Never dialled", which is what
+// every line on the waiting card said because the hourly pass never looked a
+// lead up. It now means only "we could not check", and says so.
 export const REASON_LABELS = Object.freeze({
+  called_no_retry: 'Called, no retry since',
+  not_on_dial_list: 'In Five9 but not on any dialing list',
   not_issued_call_center: 'Not issued to a rep (call center, NIS)',
   not_covered_by_rep: 'Not Covered (no rep)',
   noc_out_of_area: 'NOC — out of area (review)',
   rep_hold_expired: 'Rep hold over, back in play',
   routing_or_automation_failure: 'Never dialled — Five9 has the number',
-  not_in_five9: 'Never dialled — not in Five9 at all',
-  unverified: 'Never dialled',
+  not_in_five9: 'Not in Five9 at all',
+  unverified: 'Not verified — Five9 lookup failed or skipped',
 });
+
+// Group order on the waiting card: the most actionable first.
+export const CARD_REASON_ORDER = Object.freeze([
+  'called_no_retry', 'not_on_dial_list', 'routing_or_automation_failure', 'not_in_five9',
+  'not_issued_call_center', 'not_covered_by_rep', 'rep_hold_expired', 'unverified',
+]);
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -181,20 +192,64 @@ export const formatMinutes = (m) => (m == null ? 'n/a' : formatWait(m * 60000));
 const pct = (x) => (x == null ? 'n/a' : `${Math.round(x * 100)}%`);
 
 /**
- * One line per named lead. `offenders` items:
- *   { first_name, last_name, phone10, lead_source, reason, waitingMs, lp_lead_id }
+ * The reason as the card prints it. called_no_retry carries its own numbers:
+ * "Called 2× (last: Answering Machine, 20h 3m ago) — no retry since".
+ * `o.calls` = { count, lastMs, lastDispo } when the job had them; `nowMs` is
+ * the clock the age is measured against.
  */
-function offenderLines(offenders, max) {
-  const shown = offenders.slice(0, max).map((o) => `• ${displayName(o.first_name, o.last_name)} · ${phoneTail(o.phone10)}`
+export function reasonText(o, nowMs = Date.now()) {
+  if (o.reason === 'called_no_retry' && o.calls) {
+    const last = [o.calls.lastDispo || 'no disposition', Number.isFinite(o.calls.lastMs)
+      ? `${formatWait(nowMs - o.calls.lastMs)} ago` : null].filter(Boolean).join(', ');
+    return `Called ${o.calls.count}× (last: ${last}) — no retry since`;
+  }
+  return REASON_LABELS[o.reason] || o.reason;
+}
+
+/**
+ * One line per named lead. `offenders` items:
+ *   { first_name, last_name, phone10, lead_source, reason, waitingMs, lp_lead_id, calls? }
+ */
+function offenderLine(o, nowMs) {
+  return `• ${displayName(o.first_name, o.last_name)} · ${phoneTail(o.phone10)}`
     + ` · ${o.lead_source || 'no source'} · waiting ${formatWait(o.waitingMs)}`
-    + ` · ${REASON_LABELS[o.reason] || o.reason} · LP ${o.lp_lead_id}`);
+    + ` · ${reasonText(o, nowMs)} · LP ${o.lp_lead_id}`;
+}
+
+function offenderLines(offenders, max, nowMs) {
+  const shown = offenders.slice(0, max).map((o) => offenderLine(o, nowMs));
   if (offenders.length > max) shown.push(`…and ${offenders.length - max} more`);
   return shown;
 }
 
+/**
+ * The same lines grouped by reason, a header with the count per group, so the
+ * team sees "6 not on a dialing list / 6 called, no retry" at a glance. `max`
+ * still caps the NAMED lines across the whole card; every group keeps its
+ * header and full count even when its lines are cut.
+ */
+function groupedOffenderLines(offenders, max, nowMs) {
+  const groups = new Map();
+  for (const o of offenders) groups.set(o.reason, [...(groups.get(o.reason) || []), o]);
+  const rank = (r) => { const i = CARD_REASON_ORDER.indexOf(r); return i < 0 ? CARD_REASON_ORDER.length : i; };
+  const ordered = [...groups.entries()].sort((a, b) => rank(a[0]) - rank(b[0]) || a[0].localeCompare(b[0]));
+  const out = [];
+  let named = 0;
+  for (const [reason, list] of ordered) {
+    out.push(`*${REASON_LABELS[reason] || reason} (${list.length})*`);
+    for (const o of list) {
+      if (named >= max) break;
+      out.push(offenderLine(o, nowMs));
+      named += 1;
+    }
+  }
+  if (offenders.length > named) out.push(`…and ${offenders.length - named} more`);
+  return out;
+}
+
 const linkLine = (dashboardUrl) => (dashboardUrl ? `Full list: ${dashboardUrl}` : 'Full list: Dashboard → Lead Leaks');
 
-export function formatSpeedAlert(decision, offenders, { cfg = ALERT_DEFAULTS, dashboardUrl } = {}) {
+export function formatSpeedAlert(decision, offenders, { cfg = ALERT_DEFAULTS, dashboardUrl, nowMs = Date.now() } = {}) {
   const r = decision.recent;
   const b = decision.baseline;
   const why = [];
@@ -210,8 +265,8 @@ export function formatSpeedAlert(decision, offenders, { cfg = ALERT_DEFAULTS, da
     '🐢 *Leads are being called more slowly* (Five9 call records)',
     ...why,
     '',
-    offenders.length ? `Leads waiting right now with no call (${offenders.length}):` : 'No lead is waiting past the grace right now.',
-    ...offenderLines(offenders, cfg.maxNamed),
+    offenders.length ? `Leads waiting right now for a call (${offenders.length}):` : 'No lead is waiting past the grace right now.',
+    ...offenderLines(offenders, cfg.maxNamed, nowMs),
     '',
     linkLine(dashboardUrl),
   ].join('\n');
@@ -221,17 +276,17 @@ export function formatSpeedRecovered(decision) {
   return `✅ Time to first call is back to normal: ${formatMinutes(decision.recent?.median_min)} over the last few days.`;
 }
 
-export function formatUncalledAlert(offenders, { cfg = ALERT_DEFAULTS, dashboardUrl } = {}) {
+export function formatUncalledAlert(offenders, { cfg = ALERT_DEFAULTS, dashboardUrl, nowMs = Date.now() } = {}) {
   return [
-    `📵 *${offenders.length} lead${offenders.length === 1 ? '' : 's'} waiting more than ${cfg.graceHours}h with no Five9 call*`,
-    '(clock counts call-center hours only)',
-    ...offenderLines(offenders, cfg.maxNamed),
+    `📵 *${offenders.length} lead${offenders.length === 1 ? '' : 's'} waiting more than ${cfg.graceHours}h for a Five9 call*`,
+    '(never called, or called and not retried — clock counts call-center hours only)',
+    ...groupedOffenderLines(offenders, cfg.maxNamed, nowMs),
     '',
     linkLine(dashboardUrl),
   ].join('\n');
 }
 
-export const formatUncalledRecovered = () => '✅ Every owed lead has now had a Five9 call.';
+export const formatUncalledRecovered = () => '✅ Every owed lead has now had a Five9 call (or a retry).';
 
 export function formatIntakeGapAlert(missing, { cfg = ALERT_DEFAULTS, dashboardUrl } = {}) {
   const lines = missing.slice(0, cfg.maxNamed).map((g) => `• ${displayName(g.first_name, g.last_name)} · ${phoneTail(g.phone10)}`

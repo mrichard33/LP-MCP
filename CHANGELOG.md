@@ -5,6 +5,26 @@ Notable behavioral changes to the LP MCP server. Newest first.
 Rule-layer (`agent_rules`) changes ship through the database, not through this
 repo — they are recorded in `sql/seeds/` on the date they were applied live.
 
+## 2026-09-29
+
+- **Alerts post to Slack only.** `reportAlertCondition`'s default sender is now
+  `sendAlertMessage` (`src/alert-state.js`), which posts straight to Slack —
+  `channel: 'ops'`, a blank channel or an unknown one → `SLACK_CHANNEL_OPS`
+  (#ops-alerts). The watchdogs that passed their own GroupMe sender (capacity
+  ranker, five9 silence, data freshness, LP report, backstop, capacity sweep,
+  appointment parity, payroll ops note, startup schema, live-chat ops) use it
+  too. Rollback without a code change: `ALERT_SEND_TARGET=groupme` (old path)
+  or `both`; anything else is `slack`. No GroupMe fallback when the Slack
+  channel is unset — it logs `[AlertSend] no Slack channel` instead.
+- **Lead-leak waiting card names a real reason per lead.** Inquiry-stage Five9
+  calls (up to `LEAD_PRECREATE_CALL_HOURS`, default 48, before LP stamped the
+  lead) now count as calls and stay out of the speed numbers. New reasons:
+  `called_no_retry` (rung, still "Data", no call in `LEAD_RETRY_GAP_HOURS`
+  call-center hours, default 4) and `not_on_dial_list` (in Five9, empty
+  `f9_last_list`, 0 attempts). The hourly pass looks up only the leads it will
+  name (`LEAD_UNCALLED_LOOKUP_CAP`, default 40), and the card is grouped by
+  reason.
+
 ## 2026-09-28
 
 - **ActiveProspect re-entries now ask for a DNC-lift review.** n8n I.AP calls

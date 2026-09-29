@@ -26,7 +26,7 @@ import { callLLM, llmBudgetMs, resolveLLM } from '../llm-client.js';
 import { claimConsumedMessages } from '../services/consumed-messages.js';
 import { acquireAgenticSlot, commitAgenticSend, releaseAgenticSlot } from '../services/agentic-reply-locks.js';
 import { emitEvent } from '../event-emitter.js';
-import { sendGroupMeMessage } from '../groupme.js';
+import { sendAlertMessage } from '../alert-state.js';
 import { recordMessageContextDetached, markSentDetached } from '../bot-feedback/fingerprint.js';
 import { livechatSendBody } from '../send-message-handler.js';
 import { createLiveChatFastLane, liveChatMode, liveChatHardTimeoutMs, LIVE_CHAT_RULE } from './fast-lane.js';
@@ -101,7 +101,7 @@ export function buildProductionLane() {
     commitSend: (contactId, jobId, opts) => commitAgenticSend(contactId, jobId, opts),
     releaseSlot: releaseAgenticSlot,
     emitEvent,
-    opsAlert: (text) => sendGroupMeMessage(text, { channel: 'ops' }),
+    opsAlert: (text) => sendAlertMessage(text, { channel: 'ops' }),
     fingerprint: recordMessageContextDetached,
     markSent: (actionId) => markSentDetached('reply', String(actionId)),
     captureIdentity,
