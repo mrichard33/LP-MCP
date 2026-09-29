@@ -109,7 +109,10 @@ transaction. `CONSENT_MODEL_MODE` is `shadow`: nothing gates a send on these tab
   only behind `CONSENT_SPLIT_SMS_CALL` after counsel signs off, and that path is not built.
 - **A texted STOP (`sms_carrier_stop`) is never cleared by a person.** A Slack lift restores calls,
   LP and Five9 and leaves SMS/RCS DND and `dnc-sms` in place. `detectCarrierStop` treats an
-  unreadable contact as a STOP.
+  unreadable contact as a STOP. A STOP is `suppress:dnc-reply`, consent `sms_carrier_stop` or GHL's
+  `permanent` SMS DND — **not** the `dnc-sms` tag alone (2026-09-29): staff add that tag to block
+  calls + texts, and the lift must restore texts for them (the user's ruling). Every other lift
+  restores calls, texts and email, and records `email/granted` too.
 - **Five9 DNC removal has exactly two callers**, both welded: the re-entry lift and
   `five9_remove_numbers_from_dnc_approved` (Slack, `SLACK_DNC_LIFT`). The approved op refuses any
   `approved_by` that is not a Slack user id, which is what keeps GroupMe and auto-escalation
