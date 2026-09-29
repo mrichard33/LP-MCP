@@ -138,6 +138,7 @@ const deps = (over = {}) => ({
   hlRunSQL: async () => [],
   checkDnc: async () => ({ on_dnc: [] }),
   getContactRecords: async ({ criteria }) => (criteria[0].value === '9046135153' ? f9Record(RON) : { count: 0 }),
+  findLeadInDataQueues: async () => ({ present: false, row: null, truncated_queues: [] }),
   ...over,
 });
 

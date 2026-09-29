@@ -84,7 +84,8 @@ import {
   checkDncForNumbers as defaultCheckDnc,
   getContactRecords as defaultGetContactRecords,
 } from '../five9-admin.js';
-import { postToSlack as defaultPostToSlack, opsChannelId } from '../slack.js';
+import { postToSlack as defaultPostToSlack, opsChannelId, officeMarketCode } from '../slack.js';
+import { explainUncalled } from '../lead-leak-explain.js';
 import { reportAlertCondition as defaultReportAlertCondition } from '../alert-state.js';
 import { runJob } from '../job-runner.js';
 import { hourET, todayET } from './lp-report-common.js';
@@ -255,7 +256,8 @@ export async function readFive9History({ runSQL, windowDays, nowMs }) {
 async function readUniverse({ runSQL, sinceMs }) {
   return asRows(await runSQL(`
     SELECT lp_lead_id, lp_prospect_id, first_name, last_name, phone, lead_source, disposition_code,
-           call_count, appointment_set, closed_won, created_at_lp, updated_at_lp, zip
+           call_count, appointment_set, closed_won, created_at_lp, updated_at_lp, zip,
+           lp_branch_id, ghl_contact_id
       FROM lp_leads
      WHERE created_at_lp >= '${new Date(sinceMs).toISOString()}'
      ORDER BY created_at_lp DESC
@@ -316,6 +318,79 @@ async function readFive9Dnc({ checkDnc, phones }) {
   return onDnc;
 }
 
+/* --- the "why" facts (2026-09-29) --------------------------------------
+ * "I want to make sure on our lead leaks page it shows why they're not being
+ * called." Each helper answers one question for the page's per-lead sentence
+ * (src/lead-leak-explain.js) and returns null — "couldn't check" — on a failed
+ * read. None of them can change a lead's reason or fail the pass.
+ */
+
+/**
+ * Was this phone ever DNC before? Yes when another lp_leads row for the same
+ * phone is coded DNC, or contact_consent holds a DNC / texted STOP / revoked
+ * phone consent for the contact. Checked 2026-09-29: none of that morning's
+ * 162 Data leaks had any of these, and no five9 DNC write or LP DNC→Data code
+ * change either — system_events is not read here because it is too large to
+ * scan per pass, and it added nothing on that day's leads.
+ * @returns Map lp_lead_id → true/false, or null when a read failed.
+ */
+async function readEverDnc({ runSQL, rows, leadById }) {
+  const phones = [...new Set(rows.map((r) => r.detail.phone10).filter(Boolean))];
+  const contacts = [...new Set(rows.map((r) => leadById.get(r.lp_lead_id)?.ghl_contact_id).filter(Boolean).map(String))];
+  const dncPhones = new Set();
+  for (let i = 0; i < phones.length; i += LEAD_CHUNK) {
+    const got = asRows(await runSQL(`
+      SELECT DISTINCT right(regexp_replace(coalesce(phone, ''::text), '[^0-9]'::text, ''::text, 'g'::text), 10) AS phone10
+        FROM lp_leads
+       WHERE right(regexp_replace(coalesce(phone, ''::text), '[^0-9]'::text, ''::text, 'g'::text), 10) IN (${sqlList(phones.slice(i, i + LEAD_CHUNK))})
+         AND disposition_code = 'DNC'
+    `), 'ever-dnc phones');
+    for (const r of got) dncPhones.add(String(r.phone10));
+  }
+  const optedOut = new Set();
+  for (let i = 0; i < contacts.length; i += LEAD_CHUNK) {
+    const got = asRows(await runSQL(`
+      SELECT ghl_contact_id FROM contact_consent
+       WHERE ghl_contact_id IN (${sqlList(contacts.slice(i, i + LEAD_CHUNK))})
+         AND (dnc_full OR sms_carrier_stop OR phone_consent = 'revoked')
+    `), 'ever-dnc consent');
+    for (const r of got) optedOut.add(String(r.ghl_contact_id));
+  }
+  const out = new Map();
+  for (const r of rows) {
+    const lead = leadById.get(r.lp_lead_id);
+    out.set(r.lp_lead_id, (!!r.detail.phone10 && dncPhones.has(r.detail.phone10))
+      || (!!lead?.ghl_contact_id && optedOut.has(String(lead.ghl_contact_id))));
+  }
+  return out;
+}
+
+/**
+ * LP's own view of a lead: which Data call queue it sits in, and LP's dial
+ * attempts. LP is the only writer into the Five9 Data lists
+ * (src/five9/list-dispatch.js), so a lead in NONE of these queues is one LP is
+ * not feeding to the dialer at all. One cached snapshot per pass
+ * (findLeadInDataQueues, src/services/lp-callback-requeue.js).
+ * @returns {object|'none'|'unknown'|null} per lead — null = couldn't read.
+ */
+async function readLpQueue(findInQueues, lpLeadId) {
+  const res = await findInQueues([lpLeadId]);
+  if (res?.present && res.row) {
+    const n = (v) => (/^\d+$/.test(String(v ?? '').trim()) ? Number(v) : null);
+    return {
+      cqd_id: n(res.row.Cqd_ID ?? res.row.cqd_id),
+      attempts: n(res.row.NumDialingAttempts),
+      last_result: res.row.LastCallResult ?? null,
+    };
+  }
+  return res?.truncated_queues?.length ? 'unknown' : 'none';
+}
+
+const defaultFindLeadInDataQueues = async (ids) => {
+  const { findLeadInDataQueues } = await import('../services/lp-callback-requeue.js');
+  return findLeadInDataQueues(ids);
+};
+
 async function readRates({ runSQL, nowMs }) {
   return buildRates(asRows(await runSQL(`
     SELECT coalesce(nullif(trim(lead_source), ''), '(none)') AS source,
@@ -371,6 +446,41 @@ async function readIntakeGap({ runSQL, hlRunSQL, five9, nowMs, days, runDate }) 
         { lpPhones, five9Phones: five9.phones },
       ),
     }));
+}
+
+/** Fill detail.why (and the facts behind it) on every row. Never throws. */
+async function addWhy({ rows, uncalled, five9Dnc, nowMs, runSQL, deps, opts, errors }) {
+  const leadById = new Map(uncalled.map((l) => [String(l.lp_lead_id), l]));
+  let everDnc = null;
+  try {
+    everDnc = await readEverDnc({ runSQL, rows, leadById });
+  } catch (err) {
+    errors.push(`why: dnc history: ${err.message}`);
+  }
+  const findInQueues = deps.findLeadInDataQueues || defaultFindLeadInDataQueues;
+  let queueFailed = false;
+  for (const r of rows) {
+    const lead = leadById.get(r.lp_lead_id) || {};
+    const d = r.detail;
+    const createdMs = d.created_utc ? Date.parse(d.created_utc) : NaN;
+    d.market = lead.lp_branch_id ? officeMarketCode(lead.lp_branch_id) : null;
+    d.age_days = Number.isFinite(createdMs) ? Math.max(0, Math.floor((nowMs - createdMs) / DAY_MS)) : null;
+    d.ever_dnc = everDnc ? (everDnc.get(r.lp_lead_id) ?? null) : null;
+    if (r.reason === 'dnc') {
+      d.dnc_source = String(lead.disposition_code ?? '').trim().toUpperCase() === 'DNC' ? 'lp_code'
+        : (d.phone10 && five9Dnc.has(d.phone10) ? 'five9_list' : null);
+    }
+    if (opts.queues !== false && LEAK_REASONS.includes(r.reason) && !queueFailed) {
+      try {
+        d.lp_queue = await readLpQueue(findInQueues, r.lp_lead_id);
+      } catch (err) {
+        queueFailed = true; // one failed snapshot read fails them all — stop asking
+        errors.push(`why: lp queues: ${err.message}`);
+      }
+    }
+    if (queueFailed && LEAK_REASONS.includes(r.reason) && d.lp_queue === undefined) d.lp_queue = null;
+    d.why = explainUncalled(r.reason, { ...d, disposition: r.disposition });
+  }
 }
 
 /* --- the measurement ---------------------------------------------------- */
@@ -546,6 +656,11 @@ export async function measureLeadLeak({ env = process.env, nowMs = Date.now(), d
     });
   }
   if (lookupErrors) errors.push(`five9 contact lookup: ${lookupErrors} failed (marked unverified)`);
+
+  // The "why" for every uncalled lead (see readEverDnc / readLpQueue above).
+  // The hourly pass skips the LP queue read (a full snapshot is slow) and
+  // still gets a sentence from what it has.
+  await addWhy({ rows, uncalled, five9Dnc, nowMs, runSQL, deps, opts, errors });
 
   // Time to first call, per lead. `expected` = the lead was owed a call: it
   // got one, or it is uncalled for a leak reason. An uncalled DNC, rep-hold
@@ -881,7 +996,7 @@ export async function runLeadUncalledCheck({ env = process.env, nowMs = Date.now
   const acfg = alertConfig(env);
 
   const m = await measureLeadLeak({
-    env, nowMs, deps, opts: { windowDays: UNCALLED_WINDOW_DAYS, lookups: 'card', rates: false, intake: false },
+    env, nowMs, deps, opts: { windowDays: UNCALLED_WINDOW_DAYS, lookups: 'card', rates: false, intake: false, queues: false },
   });
   const decision = shouldAlertUncalled(m.offenders, { readOk: m.verdict !== 'insufficient_evidence' });
   const res = await deliverAlert({

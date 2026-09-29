@@ -279,6 +279,7 @@ const baseDeps = (over = {}) => ({
   hlRunSQL: async () => [],
   checkDnc: async () => ({ on_dnc: [] }),
   getContactRecords: async () => ({ count: 1 }),
+  findLeadInDataQueues: async () => ({ present: false, row: null, truncated_queues: [] }),
   supabase: stubDb(),
   postToSlack: async () => ({ ok: true }),
   reportAlertCondition: async () => { throw new Error('must not report'); },
