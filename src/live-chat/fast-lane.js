@@ -79,6 +79,7 @@ import { guardDisclosure } from '../agentic/reply-sender.js';
 import { matchSuppressionTags } from '../services/suppression-check.js';
 import { buildMessageKey } from '../services/consumed-messages.js';
 import { isDNCSignal } from '../behavioral-emitter.js';
+import { resolveTimeout } from '../llm-client.js';
 
 export const LIVE_CHAT_RULE = 'LIVE_CHAT_FAST_LANE';
 export const LIVE_CHAT_FALLBACK_MESSAGE = 'Thanks. Let me grab the right person for that, one moment.';
@@ -98,6 +99,31 @@ export function liveChatHardTimeoutMs(env = process.env) {
 export function liveChatContextCapMs(env = process.env) {
   const raw = parseInt(env.LIVE_CHAT_CONTEXT_CAP_MS || '', 10);
   return Number.isFinite(raw) && raw > 0 ? raw : 1500;
+}
+
+/**
+ * The startup model check. Returns the warning line, or null when the model
+ * can meet the lane deadline.
+ *
+ * 2026-09-29 — this used to compare llmBudgetMs('live_chat') with the deadline.
+ * That budget is how long the client is WILLING to wait (LLM_TIMEOUT_MS, 30s,
+ * plus race slack), not how long the model takes, so it is 32s for every model
+ * and the check fired for claude-haiku-4-5-20251001 — the model chosen for
+ * this lane — claiming "every reply will fall back" when none would. A warning
+ * that fires on the healthy case gets ignored, and then it is ignored on the
+ * day it is true. The real question is whether the client's timeout FLOOR for
+ * this model sits above the deadline, which is true only for the thinking
+ * families (resolveTimeout raises them to 60s). The lane's own race enforces
+ * the deadline, so nothing else here changes.
+ *
+ * @param {{model: string, provider: string, deadlineMs: number, timeoutFor?: Function}} args
+ * @returns {string|null}
+ */
+export function liveChatModelWarning({ model, provider, deadlineMs, timeoutFor = resolveTimeout }) {
+  const floor = timeoutFor(model, deadlineMs);
+  if (!(floor > deadlineMs)) return null;
+  return `[LiveChat] ${LIVE_CHAT_RULE}: model ${model} (${provider}) is a thinking model with a ${floor}ms timeout floor, ` +
+    `above the ${deadlineMs}ms lane deadline — replies will routinely fall back. Set LIVE_CHAT_MODEL to a non-thinking model.`;
 }
 
 /**

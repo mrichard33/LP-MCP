@@ -284,3 +284,13 @@ test('p90 total under 6s across 20 mocked runs', async () => {
   const p90 = totals[Math.ceil(0.9 * totals.length) - 1];
   assert.ok(p90 < 6000, `p90 ${p90}ms`);
 });
+
+test('startup model check: Haiku 4.5 meets the deadline, a thinking model does not', async () => {
+  // 2026-09-29 — the old check compared the client's 30s wait ceiling with the
+  // 10s deadline and so warned for every model, Haiku included.
+  const { liveChatModelWarning } = await import('../src/live-chat/fast-lane.js');
+  assert.equal(liveChatModelWarning({ model: 'claude-haiku-4-5-20251001', provider: 'anthropic', deadlineMs: 10000 }), null);
+  assert.equal(liveChatModelWarning({ model: 'gpt-5.4-mini', provider: 'openai', deadlineMs: 10000 }), null);
+  const w = liveChatModelWarning({ model: 'claude-sonnet-5', provider: 'anthropic', deadlineMs: 10000 });
+  assert.match(w, /claude-sonnet-5 \(anthropic\) is a thinking model with a \d+ms timeout floor, above the 10000ms lane deadline/);
+});

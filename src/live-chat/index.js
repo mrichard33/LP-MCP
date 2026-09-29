@@ -22,14 +22,14 @@ import { GHL_LOCATION_ID } from '../actions/constants.js';
 import { buildLeadContext } from '../context-builder.js';
 import { buildKbPack, prewarmQueryEmbedding } from '../knowledge/kb-retriever.js';
 import { classifyInbound } from '../knowledge/intent-classifier.js';
-import { callLLM, llmBudgetMs, resolveLLM } from '../llm-client.js';
+import { callLLM, resolveLLM } from '../llm-client.js';
 import { claimConsumedMessages } from '../services/consumed-messages.js';
 import { acquireAgenticSlot, commitAgenticSend, releaseAgenticSlot } from '../services/agentic-reply-locks.js';
 import { emitEvent } from '../event-emitter.js';
 import { sendAlertMessage } from '../alert-state.js';
 import { recordMessageContextDetached, markSentDetached } from '../bot-feedback/fingerprint.js';
 import { livechatSendBody } from '../send-message-handler.js';
-import { createLiveChatFastLane, liveChatMode, liveChatHardTimeoutMs, LIVE_CHAT_RULE } from './fast-lane.js';
+import { createLiveChatFastLane, liveChatMode, liveChatHardTimeoutMs, liveChatModelWarning } from './fast-lane.js';
 
 async function fetchContact(contactId) {
   const res = await ghlFetch('GET', `/contacts/${contactId}`, null, { priority: 'high', maxWaitMs: 1500 });
@@ -115,13 +115,7 @@ export function registerLiveChatRoutes(app) {
 
   const mode = liveChatMode();
   const { model, provider } = resolveLLM('live_chat');
-  const budget = llmBudgetMs('live_chat');
-  const deadline = liveChatHardTimeoutMs();
-  if (mode !== 'off' && budget > deadline) {
-    console.warn(
-      `[LiveChat] ${LIVE_CHAT_RULE}: model ${model} (${provider}) has a ${budget}ms call budget, above the ${deadline}ms lane deadline — ` +
-      `every reply will fall back. Set LIVE_CHAT_MODEL to a non-thinking model.`
-    );
-  }
+  const warning = liveChatModelWarning({ model, provider, deadlineMs: liveChatHardTimeoutMs() });
+  if (mode !== 'off' && warning) console.warn(warning);
   console.log(`[LiveChat] fast lane mounted at POST /webhooks/live-chat-inbound (mode=${mode}, model=${model}, secret=${process.env.LIVE_CHAT_WEBHOOK_SECRET ? 'set' : 'UNSET — route refuses everything'})`);
 }
