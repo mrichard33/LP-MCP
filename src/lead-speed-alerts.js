@@ -21,7 +21,7 @@
  */
 
 import { LEAK_REASONS } from './lead-leak-classify.js';
-import { workingMsBetween } from './lead-speed.js';
+import { BUSINESS_HOURS, workingMsBetween } from './lead-speed.js';
 
 // ─── Thresholds — one place; each is env-overridable in alertConfig() ────────
 export const ALERT_DEFAULTS = Object.freeze({
@@ -103,7 +103,8 @@ export const SPEED_CARD_NAMED_DAYS = 7;
 
 /**
  * When the lead was created (ms), or null. The job sets `createdMs`; a caller
- * that only has the wait falls back to now − wait, which orders the same way.
+ * that only has the wait falls back to now − wait — an approximation, since the
+ * wait counts business hours only, but it keeps a longer wait older.
  */
 export function offenderCreatedMs(o, nowMs = Date.now()) {
   if (Number.isFinite(o?.createdMs)) return o.createdMs;
@@ -315,6 +316,12 @@ function groupedOffenderLines(offenders, max, nowMs) {
   return out;
 }
 
+/** { open: 8, close: 20 } → "8am–8pm". */
+const hourLabel = ({ open, close }) => {
+  const h = (n) => `${n % 12 || 12}${n < 12 ? 'am' : 'pm'}`;
+  return `${h(open)}–${h(close)}`;
+};
+
 const linkLine = (dashboardUrl) => (dashboardUrl ? `Full list: ${dashboardUrl}` : 'Full list: Dashboard → Lead Leaks');
 
 export function formatSpeedAlert(decision, offenders, { cfg = ALERT_DEFAULTS, dashboardUrl, nowMs = Date.now() } = {}) {
@@ -353,7 +360,8 @@ export function formatSpeedRecovered(decision) {
 export function formatUncalledAlert(offenders, { cfg = ALERT_DEFAULTS, dashboardUrl, nowMs = Date.now() } = {}) {
   return [
     `📵 *${offenders.length} lead${offenders.length === 1 ? '' : 's'} waiting more than ${cfg.graceHours}h for a Five9 call*`,
-    '(never called, or called and not retried — clock counts call-center hours only)',
+    '(never called, or called and not retried — waiting time counts business hours only: '
+      + `${hourLabel(BUSINESS_HOURS.weekday)} Mon–Fri, ${hourLabel(BUSINESS_HOURS.weekend)} Sat–Sun)`,
     ...groupedOffenderLines(offenders, cfg.maxNamed, nowMs),
     '',
     linkLine(dashboardUrl),

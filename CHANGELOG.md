@@ -7,6 +7,12 @@ repo — they are recorded in `sql/seeds/` on the date they were applied live.
 
 ## 2026-09-29
 
+- **Lead-leak clocks count business hours only.** Waiting time, time to first
+  call and the "no retry" gap skip every closed hour: 8am–8pm ET Monday–Friday,
+  9am–5pm ET Saturday–Sunday (`BUSINESS_HOURS` in `src/lead-speed.js`). Before,
+  the clock started at the next opening but then ran through every night, and
+  weekends used weekday hours. The hourly waiting check runs on the same hours.
+
 - **Lead-leak cards: right label for leads on no dialing list, freshest leads
   first.** Five9 leaves "Number of attempts" blank on a contact nobody has
   dialled, and a blank was read as "unreadable" — so dozens of never-listed

@@ -80,7 +80,8 @@
 //   GET|POST /api/lp/lead-leak → measure now, return the summary. Never posts,
 //   never stores.
 // SCHEDULERS: startLeadLeakScheduler — daily at 07:00 ET;
-//   startLeadUncalledScheduler — hourly, CALL_CENTER_OPEN_HOUR…CLOSE ET.
+//   startLeadUncalledScheduler — hourly during business hours (BUSINESS_HOURS in
+//   src/lead-speed.js: 8am–8pm ET Mon–Fri, 9am–5pm ET Sat–Sun).
 
 import { runSQL as defaultRunSQL } from '../admin/supabase-admin.js';
 import { hlRunSQL as defaultHlRunSQL } from '../admin/hl-client.js';
@@ -102,7 +103,7 @@ import {
 } from '../lead-leak-classify.js';
 import {
   lpLocalToUtcMs, etDay, firstCallAfter, creationCallMs, minutesToFirstCall, waitingMs,
-  dailySpeedRows, speedStats, CALL_CENTER_OPEN_HOUR, CALL_CENTER_CLOSE_HOUR,
+  dailySpeedRows, speedStats, isOpenAt, BUSINESS_HOURS,
   precreateCalls, callsSince, workingMsBetween, PRECREATE_CALL_HOURS,
 } from '../lead-speed.js';
 import {
@@ -1119,10 +1120,12 @@ export function startLeadUncalledScheduler() {
     console.log('[LeadLeak] uncalled check disabled (LEAD_LEAK_ALERT_MODE=off)');
     return;
   }
-  console.log(`[LeadLeak] Uncalled check started — hourly ${CALL_CENTER_OPEN_HOUR}:00–${CALL_CENTER_CLOSE_HOUR}:00 ET (mode=${alertMode()})`);
+  const bh = BUSINESS_HOURS;
+  console.log(`[LeadLeak] Uncalled check started — hourly ${bh.weekday.open}:00–${bh.weekday.close}:00 ET Mon–Fri, `
+    + `${bh.weekend.open}:00–${bh.weekend.close}:00 ET Sat–Sun (mode=${alertMode()})`);
   const checkAndRun = async () => {
     const hour = hourET();
-    if (hour < CALL_CENTER_OPEN_HOUR || hour >= CALL_CENTER_CLOSE_HOUR) return;
+    if (!isOpenAt(Date.now())) return;
     const slot = `${todayET()}T${String(hour).padStart(2, '0')}`;
     if (lastUncalledSlot === slot) return;
     lastUncalledSlot = slot;
