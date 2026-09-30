@@ -311,6 +311,7 @@ import { registerFreshnessRefreshRoutes, startFreshnessRefreshScheduler } from '
 import { registerLinkLeakRoutes, startLinkLeakScheduler } from './jobs/link-leak-monitor.js';
 import { registerP2UnresolvableRoutes, startP2UnresolvableScheduler } from './jobs/p2-unresolvable-monitor.js';
 import { registerTagHygieneRoutes, startTagHygieneScheduler } from './jobs/tag-hygiene-sweep.js';  // 2026-09-22
+import { startF0IntegrityAuditScheduler } from './jobs/f0-integrity-audit.js';  // 2026-09-30
 import { startOfficePowerRankingScheduler } from './jobs/office-power-ranking.js';  // 2026-09-24
 import { startSaleBackstopScheduler } from './jobs/sale-announce-backstop.js';  // 2026-09-25
 import { startMissedCallerRecoveryScheduler } from './jobs/missed-caller-recovery.js';  // 2026-09-24
@@ -945,6 +946,7 @@ const server = app.listen(PORT, async () => {
   startLinkLeakScheduler();
   startP2UnresolvableScheduler();
   startTagHygieneScheduler();
+  startF0IntegrityAuditScheduler();
   startOfficePowerRankingScheduler();
   startSaleBackstopScheduler();
   startMissedCallerRecoveryScheduler();
