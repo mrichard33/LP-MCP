@@ -53,6 +53,7 @@ import { updateGHLContactFields } from './ghl.js';
 import { buildGHLFieldPayload, computeFieldHash, getConfiguredFieldCount } from './ghl-field-map.js';
 import { latestJobValue } from './lp-job-value.js';
 import { leadHadDemo } from './demo-truth.js';
+import { pickCurrentLead } from './current-lead.js';
 import { executeAddTag } from './actions/handlers/tags.js';
 import { emitEvent, dispositionPriority } from './event-emitter.js';
 import { sendGroupMeMessage } from './groupme.js';
@@ -100,11 +101,22 @@ let fieldSyncStats = { checked: 0, pushed: 0, skipped: 0, failed: 0, cleared: 0 
 export function buildMergedLead(leads, jobs = null) {
   if (!leads || leads.length === 0) return null;
 
-  // Sort by updated_at_lp DESC — newest first
+  // Sort by updated_at_lp DESC — used for aggregates only.
   const sorted = [...leads].sort((a, b) =>
     new Date(b.updated_at_lp || 0) - new Date(a.updated_at_lp || 0)
   );
-  const newest = sorted[0];
+  // Status fields come from the CURRENT lead (most recently created), the same
+  // definition routing uses (src/current-lead.js). Was: most recently updated,
+  // which let a touched duplicate lead overwrite the live lead's disposition.
+  //
+  // 2026-09-30 (fix/f0-oppfdn-integrity): EXPECT A ONE-TIME PUSH WAVE for the
+  // ~438 multi-lead contacts whose current lead changes under this rule. It
+  // emits no lp.disposition_changed: syncLeadFieldsToGHL compares the pushed
+  // code with this merged lead's own disposition_code, which is the same value.
+  //
+  // Soft-deleted LP leads (lp_deleted_at) are skipped here exactly as
+  // fetchCurrentLead skips them, so the field and routing pick the same lead.
+  const newest = pickCurrentLead(leads.filter(l => !l.lp_deleted_at)) || sorted[0];
 
   // Find the lead with the most recent appointment date (where appt was set)
   const withAppt = sorted.filter(l => l.appointment_set && l.appointment_date);
@@ -266,7 +278,7 @@ function extractDispositionFromPayload(fields) {
  * @param {string|null} oldCode  - Prior code (null for first sync)
  * @param {Object} lead          - Merged lead (for LP IDs)
  */
-async function maybeEmitDispositionChanged(ghlContactId, newCode, oldCode, lead) {
+async function maybeEmitDispositionChanged(ghlContactId, newCode, oldCode, lead, emit = emitEvent) {
   // Only fire when the code has actually changed (or first-time write from null)
   if (!newCode || newCode === oldCode) return;
 
@@ -274,7 +286,7 @@ async function maybeEmitDispositionChanged(ghlContactId, newCode, oldCode, lead)
   const idempotencyKey = `lp.disp.sync.${ghlContactId}.${newCode}`;
 
   try {
-    await emitEvent({
+    await emit({
       event_type: 'lp.disposition_changed',
       event_subtype: newCode,
       source: 'lp_sync',
@@ -308,7 +320,10 @@ async function maybeEmitDispositionChanged(ghlContactId, newCode, oldCode, lead)
  * v4: Handles 'not_found' return — clears stale ghl_contact_id automatically.
  * v5: Emits lp.disposition_changed when disposition_code changes.
  */
-export async function syncLeadFieldsToGHL(lead, ghlContactId, storedHash) {
+export async function syncLeadFieldsToGHL(lead, ghlContactId, storedHash, deps = {}) {
+  // deps: test seam (updateGHLContactFields, emitEvent, supabase), per CLAUDE.md.
+  const pushFields = deps.updateGHLContactFields || updateGHLContactFields;
+  const db = deps.supabase !== undefined ? deps.supabase : supabase;
   if (!ghlContactId || !lead) {
     return { pushed: false, hash: storedHash };
   }
@@ -333,7 +348,7 @@ export async function syncLeadFieldsToGHL(lead, ghlContactId, storedHash) {
   const incomingDisposition = extractDispositionFromPayload(fields);
 
   // Push to GHL
-  const result = await updateGHLContactFields(ghlContactId, fields);
+  const result = await pushFields(ghlContactId, fields);
 
   if (result === true) {
     fieldSyncStats.pushed++;
@@ -347,7 +362,7 @@ export async function syncLeadFieldsToGHL(lead, ghlContactId, storedHash) {
     // forces a redundant push — and a legitimate re-push can't be falsely
     // skipped by a stale per-lead hash left on an older row.
     try {
-      await supabase.from('lp_leads')
+      await db.from('lp_leads')
         .update({ ghl_fields_hash: newHash })
         .eq('ghl_contact_id', ghlContactId);
     } catch (err) {
@@ -361,7 +376,7 @@ export async function syncLeadFieldsToGHL(lead, ghlContactId, storedHash) {
     // When storedHash === null this is the contact's first sync — treat prior
     // disposition as null so the event fires unconditionally for new codes.
     const priorDisposition = storedHash === null ? null : (lead.disposition_code || null);
-    await maybeEmitDispositionChanged(ghlContactId, incomingDisposition, priorDisposition, lead);
+    await maybeEmitDispositionChanged(ghlContactId, incomingDisposition, priorDisposition, lead, deps.emitEvent || emitEvent);
     await maybeStampDemoTag(ghlContactId, lead);
 
     return { pushed: true, hash: newHash };
@@ -433,7 +448,7 @@ export async function bulkFieldSync(batchSize = 100, delayMs = 200, maxPushesPer
     while (true) {
       const { data, error } = await supabase
         .from('lp_leads')
-        .select('lp_lead_id, lp_prospect_id, ghl_contact_id, ghl_fields_hash, disposition_code, disposition_label, rep_name, promoter_name, appointment_set, appointment_date, demo_completed, closed_won, job_value, lead_source, lead_source_detail, call_count, last_contact_date, updated_at_lp, appts:raw_lp_data->appointments')
+        .select('lp_lead_id, lp_prospect_id, ghl_contact_id, ghl_fields_hash, disposition_code, disposition_label, rep_name, promoter_name, appointment_set, appointment_date, demo_completed, closed_won, job_value, lead_source, lead_source_detail, call_count, last_contact_date, created_at_lp, updated_at_lp, lp_deleted_at, appts:raw_lp_data->appointments')
         .not('ghl_contact_id', 'is', null)
         .order('updated_at_lp', { ascending: false })
         .range(offset, offset + LEAD_PAGE_SIZE - 1);

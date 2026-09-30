@@ -247,6 +247,8 @@ import { getLastInboundMessageMs, hasPriorInboundMessage } from './actions/handl
 import { inferChannelFromEvent } from './channel-inference.js';
 import { withGhlToken } from './ghl-rate-limiter.js';
 import { contactHadDemo } from './demo-truth.js';
+import { fetchCurrentLead } from './current-lead.js';
+import { lpStoredToUtcMs } from './lp-dates.js';
 
 // ═══════════════════════════════════════════════════════════════════
 // CONSTANTS
@@ -1017,7 +1019,7 @@ const IO_BACKED_CONDITION_KEYS = new Set([
   'has_tag_prefix', 'not_has_tag_prefix', 'not_has_any_tag_prefix',
   'custom_field_eq', 'custom_field_in',
   // lp_leads / demo state
-  'lp_disposition_in', 'demo_state_eq',
+  'lp_disposition_in', 'demo_state_eq', 'lp_current_lead_match',
   // appointment lookups
   'not_active_in_home_appointment', 'not_reschedule_inflight',
   'not_duplicate_lead_live_appointment', 'no_future_appointment',
@@ -1068,6 +1070,57 @@ function emitConditionFailClosed(event, ruleKey, missingKey, detail, deps = {}) 
 // a wildcard pass. This applies engine-wide, to every condition type,
 // including the not_* negative conditions that previously failed open by
 // design. Deliberate, documented fail-open exceptions no longer apply here.
+// 2026-09-30 (fix/f0-oppfdn-integrity) — lp_current_lead_match.
+//
+// Pure core of the verb: judges the contact's CURRENT lead (src/current-lead.js,
+// the same definition GHL field sync writes to "LP Disposition") against a spec.
+// Every key present must pass; every key is optional.
+//   disposition_in             current disposition_code must be listed
+//   disposition_not_in         current disposition_code must NOT be listed
+//                              (a null/empty code passes — it is not listed)
+//   max_days_since_appointment appointment_date within N days, not in the future;
+//                              a missing date FAILS. appointment_date is stored as
+//                              ET wall clock tagged +00:00, so it goes through
+//                              lpStoredToUtcMs before any arithmetic.
+//   allow_synthetic: false     inbound-backfill replays (payload.synthetic) FAIL
+//
+// F.0 used to be entered by a GHL stage trigger that trusted a field with two
+// writers; ~19 of 390 contacts in F.0 had no demo. This verb is what the F.0
+// entry and exit rules gate on instead. Returns { pass, reason }.
+// inbound-backfill writes payload.synthetic as a JSON boolean (2,287 of 2,287
+// events, 2026-09-30); the string form is accepted too so a sender that
+// stringifies its payload cannot slip a replay past the gate.
+function isSyntheticEvent(event) {
+  const v = event?.payload?.synthetic;
+  return v === true || v === 'true';
+}
+
+export function evaluateCurrentLeadMatch(lead, spec, event, nowMs = Date.now()) {
+  const cfg = spec && typeof spec === 'object' ? spec : {};
+  if (cfg.allow_synthetic === false && isSyntheticEvent(event)) {
+    return { pass: false, reason: 'synthetic event (allow_synthetic=false)' };
+  }
+  if (!lead) return { pass: false, reason: 'no current LP lead' };
+  const disp = String(lead.disposition_code ?? '').trim();
+  if (Array.isArray(cfg.disposition_in) && !cfg.disposition_in.includes(disp)) {
+    return { pass: false, reason: `current disposition "${disp || 'null'}" not in [${cfg.disposition_in.join(',')}]` };
+  }
+  if (Array.isArray(cfg.disposition_not_in) && disp && cfg.disposition_not_in.includes(disp)) {
+    return { pass: false, reason: `current disposition "${disp}" in [${cfg.disposition_not_in.join(',')}]` };
+  }
+  if (cfg.max_days_since_appointment !== undefined && cfg.max_days_since_appointment !== null) {
+    const maxDays = Number(cfg.max_days_since_appointment);
+    const apptMs = lead.appointment_date ? lpStoredToUtcMs(lead.appointment_date) : NaN;
+    if (!Number.isFinite(apptMs)) return { pass: false, reason: 'current lead has no appointment_date' };
+    if (apptMs > nowMs) return { pass: false, reason: `appointment ${lead.appointment_date} is in the future` };
+    const days = (nowMs - apptMs) / 86_400_000;
+    if (!Number.isFinite(maxDays) || days > maxDays) {
+      return { pass: false, reason: `appointment ${days.toFixed(1)} days ago > ${cfg.max_days_since_appointment}` };
+    }
+  }
+  return { pass: true, reason: `current lead ${lead.lp_lead_id ?? '?'} (${disp || 'null'}) matches` };
+}
+
 async function evaluateContextConditions(conditions, intelligence, event, opts = {}) {
   if (!conditions || typeof conditions !== 'object') return true;
   const intel = intelligence || {};
@@ -1491,6 +1544,37 @@ async function evaluateContextConditions(conditions, intelligence, event, opts =
         const disp = lpLead.disposition_code || null;
         if (!allowed.includes(disp)) {
           console.log(`[Context] BLOCKED: lp_disposition "${disp}" not in [${allowed.join(',')}]`);
+          return false;
+        }
+        break;
+      }
+
+      // 2026-09-30 — see evaluateCurrentLeadMatch above. Fails CLOSED: a read
+      // error or a contact with no LP lead never adds or removes anyone. An
+      // event with no contact is not-applicable (quiet), not a failed read.
+      case 'lp_current_lead_match': {
+        const spec = expected && typeof expected === 'object' ? expected : {};
+        if (spec.allow_synthetic === false && isSyntheticEvent(event)) {
+          console.log(`[lp_current_lead_match] BLOCKED: synthetic event (rule ${ruleKey || '?'})`);
+          return false;
+        }
+        const clContactId = event?.ghl_contact_id;
+        if (!clContactId) return notApplicableNoContact(key);
+        const clDb = opts.deps?.supabase !== undefined ? opts.deps.supabase : supabase;
+        let currentLead;
+        try {
+          currentLead = await fetchCurrentLead(clContactId, clDb);
+        } catch (err) {
+          console.log(`[lp_current_lead_match] read failed for ${clContactId}: ${err.message}`);
+          return failClosed(key, `current lead read failed: ${err.message}`);
+        }
+        if (!currentLead) {
+          console.log(`[lp_current_lead_match] no LP lead for ${clContactId}`);
+          return failClosed(key, 'contact has no LP lead — current-lead gate cannot pass');
+        }
+        const verdict = evaluateCurrentLeadMatch(currentLead, spec, event, opts.deps?.nowMs ?? Date.now());
+        if (!verdict.pass) {
+          console.log(`[lp_current_lead_match] BLOCKED ${clContactId}: ${verdict.reason} (rule ${ruleKey || '?'})`);
           return false;
         }
         break;

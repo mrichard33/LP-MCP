@@ -193,6 +193,18 @@ export const JOBS = Object.freeze([
     isEnabled: (env) => String(env.TAG_SWEEP_ENABLED || '').toLowerCase() === 'true',
   },
   {
+    // 2026-09-30 (fix/f0-oppfdn-integrity): read-only report of anyone in F.0
+    // whose current LP lead is not OPPFDN or who never really demoed. Posts to
+    // #ops-alerts every day, clean or not.
+    id: 'f0-integrity-audit',
+    label: 'F.0 integrity audit',
+    group: 'ghl',
+    cadence: 'daily 08:00 ET',
+    enabledEnv: 'F0_AUDIT_ENABLED',
+    enabledDefault: true,
+    isEnabled: (env) => String(env.F0_AUDIT_ENABLED || 'true').toLowerCase() !== 'false',
+  },
+  {
     id: 'office-power-ranking',
     label: 'Office power ranking',
     group: 'notifications',
