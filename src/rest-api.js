@@ -42,6 +42,7 @@ import { LINK_SOURCE } from './services/link-corroboration.js';
 import { createAppointmentFromLpHandler } from './appointments/booking-endpoint.js';
 import { flattenWebhookBody } from './webhook-body.js';
 import { trackImmediate } from './graceful-shutdown.js';
+import { leadHadDemo } from './demo-truth.js';
 
 // ═══════════════════════════════════════════════════════════════════
 // WEBHOOK SIGNATURE VERIFICATION (optional but recommended)
@@ -637,7 +638,7 @@ async function voiceCallerContextHandler(req, res) {
       .select(
         'first_name, last_name, disposition_code, disposition_label, ' +
         'closed_won, appointment_set, demo_completed, last_contact_date, ' +
-        'ghl_tag_applied'
+        'ghl_tag_applied, appts:raw_lp_data->appointments'
       )
       .or(`phone.ilike.%${last10}%,phone_alt.ilike.%${last10}%`)
       .order('synced_at', { ascending: false })
@@ -667,7 +668,7 @@ async function voiceCallerContextHandler(req, res) {
     console.log(
       `[VoiceCallerContext] HIT phone=${last10} ` +
       `name=${row.first_name || '?'} disp=${row.disposition_code || '?'} ` +
-      `dnc=${isDnc} appt=${row.appointment_set} demo=${row.demo_completed}`
+      `dnc=${isDnc} appt=${row.appointment_set} demo=${leadHadDemo(row)}`
     );
 
     return res.json({
@@ -675,7 +676,9 @@ async function voiceCallerContextHandler(req, res) {
       first_name: row.first_name || '',
       is_existing_customer: row.closed_won === true,
       has_prior_appointment: row.appointment_set === true,
-      demo_completed: row.demo_completed === true,
+      // 2026-09-30 (fix/demo-truth): demo truth, not LP's sat flag (true for
+      // NOC, reset by a rebook). See src/demo-truth.js.
+      demo_completed: leadHadDemo(row),
       disposition_code: row.disposition_code || '',
       disposition_label: row.disposition_label || '',
       is_dnc: isDnc,

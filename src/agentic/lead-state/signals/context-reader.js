@@ -149,7 +149,12 @@ const APPT_GRACE_DAYS = Number(process.env.APPT_ACTIVE_GRACE_DAYS || 2);
 
 export function hasActiveBooking(ctx) {
   // 1. LP field branch — requires an UPCOMING (or within-grace) date and no demo yet.
-  if (ctx?.lp?.appointment_set === true && ctx?.lp?.demo_completed !== true) {
+  // 2026-09-30 (fix/demo-truth): lp.demo_completed now means "this lead ever
+  // had a demo" (src/demo-truth.js). This branch needs "the CURRENT appointment
+  // already ran", which is LP's raw sat flag — carried as current_appointment_sat.
+  // Falls back to demo_completed for a ctx built without it.
+  const currentApptSat = ctx?.lp?.current_appointment_sat ?? ctx?.lp?.demo_completed;
+  if (ctx?.lp?.appointment_set === true && currentApptSat !== true) {
     const apptRaw = ctx?.lp?.appointment_date;
     if (apptRaw) {
       // lp.appointment_date holds ET wall-clock digits tagged +00:00, so

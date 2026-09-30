@@ -90,6 +90,7 @@
 import { getToken } from './token-manager.js';
 import { normalizePhone, getField, extractArray } from './sync-utils.js';
 import { latestJobValue } from './lp-job-value.js';
+import { contactHadDemo } from './demo-truth.js';
 import { withGhlToken } from './ghl-rate-limiter.js';
 
 const LP_API_BASE = process.env.LP_API_BASE_URL || 'https://api.leadperfection.com';
@@ -410,6 +411,17 @@ function buildEnrichedRecord(fullData, leadInfo, prospectIdValue, contactId) {
 
 // ─── Enrich from LP (aggregate across all leads) ─────────────────
 
+// A raw LP API lead in the shape src/demo-truth.js reads from lp_leads.
+function rawLpLeadForDemoTruth(lead) {
+  const sold = getField(lead, 'sold', 'Sold');
+  return {
+    disposition_code: getField(lead, 'disposition', 'Disposition'),
+    closed_won: sold === 'true' || sold === true,
+    appts: Array.isArray(lead?.appointments) ? lead.appointments : [],
+  };
+}
+
+
 function enrichFromLP(enrichedRecord, rawLead) {
   const fullRaw = rawLead || {};
 
@@ -562,7 +574,12 @@ function enrichFromLP(enrichedRecord, rawLead) {
     lp_total_leads: allLeads.length,
     lp_gross_sale_amount: totalGrossSale,
     lp_ever_sold: pf.sold ? 'Yes' : 'No',
-    lp_ever_sat: pf.sat ? 'Yes' : 'No',
+    // 2026-09-30 (fix/demo-truth): "LP Ever Sat" is demo truth across ALL of
+    // the prospect's leads (src/demo-truth.js) — the same value ghl-field-sync
+    // writes to this field. LP's sat/eversat are true for NOC (no demo) and sat
+    // is reset by a rebook; pf.sat still drives lp_highest_stage, which is LP's
+    // own stage ladder and not a demo claim.
+    lp_ever_sat: contactHadDemo(allLeads.map(rawLpLeadForDemoTruth)) ? 'Yes' : 'No',
     lp_best_lead_sales_rep: salesRep,
     lp_total_appointments: totalAppointments,
     lp_latest_appt_status: apptStatus,

@@ -105,6 +105,7 @@ import { channelOfMessage } from './agentic/reply-sender.js';
 // here so customer_relationship never disagrees with the suppression shapes.
 import { isCustomerP2 } from './agentic/lead-state/signals/context-reader.js';
 import { withGhlToken } from './ghl-rate-limiter.js';
+import { leadHadDemo } from './demo-truth.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY;
 const GHL_LOCATION_ID = process.env.GHL_LOCATION_ID || 'SsBG7j5KQAIP1SFP2Sca';
@@ -559,7 +560,9 @@ async function fetchLeadIntelligence(contactId) {
   }
 }
 
-const LP_LEAD_COLUMNS = 'id, lp_lead_id, lp_prospect_id, first_name, last_name, disposition_code, disposition_label, rep_name, promoter_name, lead_source, lead_source_detail, call_count, last_call_date, appointment_set, appointment_date, demo_completed, demo_date, days_to_demo, closed_won, job_value, created_at_lp, ghl_contact_id, synced_at';
+// appts (2026-09-30, fix/demo-truth): the lead's appointment list, so
+// lp.demo_completed can come from src/demo-truth.js instead of LP's sat flag.
+const LP_LEAD_COLUMNS = 'id, lp_lead_id, lp_prospect_id, first_name, last_name, disposition_code, disposition_label, rep_name, promoter_name, lead_source, lead_source_detail, call_count, last_call_date, appointment_set, appointment_date, demo_completed, demo_date, days_to_demo, closed_won, job_value, created_at_lp, ghl_contact_id, synced_at, appts:raw_lp_data->appointments';
 
 function backfillGhlContactId(lpLeadRow, ghlContactId) {
   if (!lpLeadRow || !ghlContactId || lpLeadRow.ghl_contact_id) return;
@@ -1157,7 +1160,20 @@ export async function buildLeadContext(ghlContactId, options = {}) {
       appointment_minutes_delta: apptCancelled ? null : (apptPhase ? apptPhase.minutes_delta : null),
       appointment_time_human: apptCancelled ? null : (apptPhase ? apptPhase.appointment_time_human : null),
       appointment_time_known: apptCancelled ? null : (apptPhase ? apptPhase.time_known : null),
-      demo_completed: lpLead?.demo_completed || false,
+      // 2026-09-30 (fix/demo-truth): "had a demo" is src/demo-truth.js over
+      // this lead's own appointments and disposition, not LP's sat flag. LP
+      // marks NOC ("Not Covered", no demo) sat=true and resets sat when the
+      // lead is rebooked, so a NoRehash demo followed by a cancelled rebook
+      // read as pre-demo. Deliberately LEAD grain, not the whole prospect
+      // history: isDemoStall ages the demo by demo_date, which only exists
+      // for this lead, and an undated demo from a years-old lead would skip
+      // that age window. The contact-wide answer reaches the responder
+      // through the lp-demo-completed tag (derivePostAppointment).
+      demo_completed: leadHadDemo(lpLead),
+      // The raw LP flag — "the CURRENT appointment sat". hasActiveBooking uses
+      // this, because a demo that happened earlier must not hide a fresh
+      // booking on the same lead.
+      current_appointment_sat: lpLead?.demo_completed === true,
       demo_date: lpLead?.demo_date || null,
       days_to_demo: lpLead?.days_to_demo || null,
       closed_won: lpLead?.closed_won || false,
