@@ -31,6 +31,7 @@ import { getGHLContact } from '../ghl.js';
 import { decodeFields } from '../ghl-field-decoder.js';
 import { getLead as lpGetLead, getCustomers3 as lpGetCustomers3 } from '../lp-client.js';
 import { extractArray, getField } from '../sync-utils.js';
+import { contactHadDemo } from '../demo-truth.js';
 
 const DEFAULT_TIMEOUT_MS = parseInt(
   process.env.APPT_NOTIFICATION_CONTEXT_TIMEOUT_MS || '4000',
@@ -115,7 +116,8 @@ async function loadLeadSummary(contactId) {
       'lp_lead_id, lp_prospect_id, first_name, last_name, phone, email, ' +
         'lead_source, lead_source_detail, disposition_code, disposition_label, ' +
         'rep_name, appointment_set, appointment_date, demo_completed, demo_date, ' +
-        'closed_won, job_value, call_count, last_contact_date, created_at_lp',
+        'closed_won, job_value, call_count, last_contact_date, created_at_lp, ' +
+        'appts:raw_lp_data->appointments',
     )
     .eq('ghl_contact_id', contactId)
     .order('created_at_lp', { ascending: false })
@@ -148,8 +150,12 @@ async function loadLeadSummary(contactId) {
       .limit(10),
   ]);
 
+  // 2026-09-30 (fix/demo-truth): the body generators read lead.demo_completed
+  // as "has this person EVER had an in-home estimate". That is demo truth
+  // across the contact's leads (src/demo-truth.js), not the newest lead's LP
+  // sat flag — which is true for NOC (no demo) and reset by a rebook.
   return {
-    lead: primary,
+    lead: { ...primary, demo_completed: contactHadDemo(leads) },
     all_leads: leads,
     recent: {
       calls: calls.data || [],

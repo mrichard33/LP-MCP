@@ -52,6 +52,8 @@ import supabase from './supabase.js';
 import { updateGHLContactFields } from './ghl.js';
 import { buildGHLFieldPayload, computeFieldHash, getConfiguredFieldCount } from './ghl-field-map.js';
 import { latestJobValue } from './lp-job-value.js';
+import { leadHadDemo } from './demo-truth.js';
+import { executeAddTag } from './actions/handlers/tags.js';
 import { emitEvent, dispositionPriority } from './event-emitter.js';
 import { sendGroupMeMessage } from './groupme.js';
 
@@ -59,6 +61,29 @@ import { sendGroupMeMessage } from './groupme.js';
 // Used to detect disposition changes from the field payload after a push so we
 // can emit lp.disposition_changed without an extra Supabase round-trip.
 const DISPOSITION_FIELD_ID = 'URWTGtobi9a9Y7gwGxC8';
+
+// off | shadow (default) | live. Add-only: this path never removes the tag.
+// Removal of false positives happens only through scripts/backfill-demo-truth.js.
+//
+// 2026-09-30 (fix/demo-truth): lp-demo-completed was on 1,733 contacts against
+// ~5,013 true demos — seven cancel/no-show rules stripped it and nothing added it
+// for Sale or NoRehash, so demoed leads who cancelled were routed as pre-demo into
+// S5.2. The merged lead's demo_completed is the demo-truth value, so stamping from
+// it keeps the tag in step with the "LP Demo Completed" field it was pushed with.
+const DEMO_TAG_SYNC_MODE = String(process.env.DEMO_TAG_SYNC_MODE || 'shadow').toLowerCase();
+
+async function maybeStampDemoTag(ghlContactId, lead) {
+  if (!lead?.demo_completed || DEMO_TAG_SYNC_MODE === 'off') return;
+  if (DEMO_TAG_SYNC_MODE !== 'live') {
+    console.log(`[FieldSync] DEMO TAG (shadow): would add lp-demo-completed to ${ghlContactId}`);
+    return;
+  }
+  try {
+    await executeAddTag({ target_id: ghlContactId, action_payload: { tag: 'lp-demo-completed' } });
+  } catch (err) {
+    console.warn(`[FieldSync] demo tag add failed for ${ghlContactId}: ${err.message}`);
+  }
+}
 
 // Track stats per sync cycle
 let fieldSyncStats = { checked: 0, pushed: 0, skipped: 0, failed: 0, cleared: 0 };
@@ -87,8 +112,10 @@ export function buildMergedLead(leads, jobs = null) {
     ? withAppt.sort((a, b) => new Date(b.appointment_date) - new Date(a.appointment_date))[0]
     : null;
 
-  // Aggregate "ever" flags across ALL leads
-  const everDemoCompleted = sorted.some(l => l.demo_completed === true);
+  // Aggregate "ever" flags across ALL leads.
+  // Demo truth comes from demo-truth.js (appointment/lead dispositions), never
+  // from LP's sat flag: LP marks NOC as sat=true and resets sat on rebook.
+  const everDemoCompleted = sorted.some(leadHadDemo);
   const everClosedWon = sorted.some(l => l.closed_won === true);
 
   // The CURRENT job's value — not a max, not a sum. See the v5.1 note above.
@@ -335,6 +362,7 @@ export async function syncLeadFieldsToGHL(lead, ghlContactId, storedHash) {
     // disposition as null so the event fires unconditionally for new codes.
     const priorDisposition = storedHash === null ? null : (lead.disposition_code || null);
     await maybeEmitDispositionChanged(ghlContactId, incomingDisposition, priorDisposition, lead);
+    await maybeStampDemoTag(ghlContactId, lead);
 
     return { pushed: true, hash: newHash };
   } else if (result === 'not_found') {
@@ -405,7 +433,7 @@ export async function bulkFieldSync(batchSize = 100, delayMs = 200, maxPushesPer
     while (true) {
       const { data, error } = await supabase
         .from('lp_leads')
-        .select('lp_lead_id, lp_prospect_id, ghl_contact_id, ghl_fields_hash, disposition_code, disposition_label, rep_name, promoter_name, appointment_set, appointment_date, demo_completed, closed_won, job_value, lead_source, lead_source_detail, call_count, last_contact_date, updated_at_lp')
+        .select('lp_lead_id, lp_prospect_id, ghl_contact_id, ghl_fields_hash, disposition_code, disposition_label, rep_name, promoter_name, appointment_set, appointment_date, demo_completed, closed_won, job_value, lead_source, lead_source_detail, call_count, last_contact_date, updated_at_lp, appts:raw_lp_data->appointments')
         .not('ghl_contact_id', 'is', null)
         .order('updated_at_lp', { ascending: false })
         .range(offset, offset + LEAD_PAGE_SIZE - 1);

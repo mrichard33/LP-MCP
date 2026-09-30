@@ -19,7 +19,8 @@
  *                    OR a durable booked-* tag OR LP disposition Set/Cnf.
  *   demo_completed — GHL appointment with status showed
  *                    OR HPA-/HPRC-Completed or lp-demo-completed tag
- *                    OR LP post-demo disposition (FDNS/BO/1Leg/OPPFDN/CS).
+ *                    OR LP demo truth (src/demo-truth.js: a demo disposition
+ *                    on ANY of the contact's leads or appointments, or a sale).
  *
  * Demotions (Reactivation, Long-Term Hold, P3 stages, loss stages) and any
  * stage not listed here require no evidence — they are unrestricted, exactly
@@ -33,6 +34,7 @@
 import { ghlFetch } from './helpers.js';
 import { STAGE_MAP } from './constants.js';
 import supabase from '../supabase.js';
+import { isDemoDisposition, demoEvidence } from '../demo-truth.js';
 
 // Appointment statuses that prove a booking exists (GHL appointmentStatus,
 // lowercased). 'showed' also proves booking — a demo that happened was booked.
@@ -45,7 +47,10 @@ const BOOKING_TAG_RE = /^(chatbot-)?booked-|^stage:booked-/i;
 
 // Post-demo evidence.
 const DEMO_APPT_STATUSES = new Set(['showed']);
-const POST_DEMO_LP_DISPOSITIONS = new Set(['FDNS', 'BO', '1Leg', 'OPPFDN', 'CS']);
+// 2026-09-30 (fix/demo-truth): the LP side of this gate is src/demo-truth.js,
+// not a local list. The old list (FDNS/BO/1Leg/OPPFDN/CS) counted BO and 1Leg,
+// which are not demos, and only ever saw the NEWEST lead's disposition — so a
+// demo on an earlier appointment was invisible once the lead was rebooked.
 // HPA-Completed / HPRC-Completed rep tags + the sync-derived lp-demo-completed
 // marker (mirrors a demo-complete LP disposition; see resolveDemoState).
 const DEMO_TAG_RE = /^(hpa|hprc)-completed$|^lp-demo-completed$/i;
@@ -61,12 +66,14 @@ export const STAGE_EVIDENCE_REQUIREMENTS = {
  * contributes no evidence.
  *   appointments — [{status}] (raw, ANY time — a showed appt is in the past)
  *   tags         — string[]
- *   lpDisposition — string|null
+ *   lpDisposition — string|null   (newest lead's disposition)
+ *   lpDemoEvidence — string|null  (demoEvidence() across ALL the contact's
+ *                    leads and appointments; null = no demo or unreadable)
  *
  * Returns { satisfied, matched, missing_evidence } — missing_evidence lists
  * the acceptable evidence classes that were checked and absent.
  */
-export function evaluateStageEvidence(evidenceKind, { appointments = null, tags = null, lpDisposition = null } = {}) {
+export function evaluateStageEvidence(evidenceKind, { appointments = null, tags = null, lpDisposition = null, lpDemoEvidence = null } = {}) {
   const appts = Array.isArray(appointments) ? appointments : [];
   const tagList = Array.isArray(tags) ? tags : [];
 
@@ -92,8 +99,11 @@ export function evaluateStageEvidence(evidenceKind, { appointments = null, tags 
     }
     const tag = tagList.find((t) => DEMO_TAG_RE.test(String(t)));
     if (tag) return { satisfied: true, matched: `tag:${tag}`, missing_evidence: [] };
-    if (lpDisposition && POST_DEMO_LP_DISPOSITIONS.has(lpDisposition)) {
+    if (lpDisposition && isDemoDisposition(lpDisposition)) {
       return { satisfied: true, matched: `lp_disposition:${lpDisposition}`, missing_evidence: [] };
+    }
+    if (lpDemoEvidence) {
+      return { satisfied: true, matched: `lp_demo:${lpDemoEvidence}`, missing_evidence: [] };
     }
     return {
       satisfied: false,
@@ -131,19 +141,26 @@ async function fetchTags(contactId) {
   }
 }
 
-async function fetchLPDisposition(contactId) {
-  if (!supabase) return null;
+// Every lp_leads row for the contact, newest first: the newest disposition
+// feeds the booking check (Set/Cnf); all rows feed demo truth. Fail-soft: an
+// unreadable read yields { lpDisposition: null, lpDemoEvidence: null }.
+async function fetchLPFacts(contactId) {
+  if (!supabase) return { lpDisposition: null, lpDemoEvidence: null };
   try {
     const { data, error } = await supabase.from('lp_leads')
-      .select('disposition_code')
+      .select('disposition_code, closed_won, appts:raw_lp_data->appointments')
       .eq('ghl_contact_id', contactId)
       .order('synced_at', { ascending: false })
-      .limit(1).maybeSingle();
+      .limit(50);
     if (error) throw new Error(error.message);
-    return data?.disposition_code || null;
+    const rows = Array.isArray(data) ? data : [];
+    return {
+      lpDisposition: rows[0]?.disposition_code || null,
+      lpDemoEvidence: demoEvidence(rows),
+    };
   } catch (err) {
     console.warn(`[stage-evidence] LP disposition fetch failed for ${contactId}: ${err.message}`);
-    return null;
+    return { lpDisposition: null, lpDemoEvidence: null };
   }
 }
 
@@ -158,13 +175,13 @@ export async function checkStageMoveEvidence(contactId, stageId) {
   const requirement = STAGE_EVIDENCE_REQUIREMENTS[stageId];
   if (!requirement) return { required: false };
 
-  const [appointments, tags, lpDisposition] = await Promise.all([
+  const [appointments, tags, { lpDisposition, lpDemoEvidence }] = await Promise.all([
     fetchAllAppointments(contactId),
     fetchTags(contactId),
-    fetchLPDisposition(contactId),
+    fetchLPFacts(contactId),
   ]);
 
-  const verdict = evaluateStageEvidence(requirement.evidence, { appointments, tags, lpDisposition });
+  const verdict = evaluateStageEvidence(requirement.evidence, { appointments, tags, lpDisposition, lpDemoEvidence });
   return {
     required: true,
     allowed: verdict.satisfied,

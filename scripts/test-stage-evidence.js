@@ -87,11 +87,30 @@ test('demo_completed satisfied by HPA/HPRC-Completed or lp-demo-completed tag', 
   }
 });
 
-test('demo_completed satisfied by LP post-demo dispositions', () => {
-  for (const disp of ['FDNS', 'BO', '1Leg', 'OPPFDN', 'CS']) {
+test('demo_completed satisfied by LP demo dispositions (src/demo-truth.js)', () => {
+  for (const disp of ['Sale', 'OPPFDN', 'NoRehash', 'FDNS', 'SW', 'PM']) {
     const v = evaluateStageEvidence('demo_completed', { appointments: [], tags: [], lpDisposition: disp });
     assert.equal(v.satisfied, true, `disp=${disp}`);
   }
+});
+
+// 2026-09-30 (fix/demo-truth): NOC is "Not Covered" — the rep did not demo, even
+// though LP marks it sat. BO and 1Leg were in the old local list and are not
+// demos either (Mark's definition).
+test('NOC / BO / 1Leg do NOT satisfy demo_completed', () => {
+  for (const disp of ['NOC', 'BO', '1Leg', 'NIS']) {
+    const v = evaluateStageEvidence('demo_completed', { appointments: [], tags: [], lpDisposition: disp });
+    assert.equal(v.satisfied, false, `disp=${disp}`);
+  }
+});
+
+test('demo_completed satisfied by a demo on an earlier appointment or lead', () => {
+  // Napoly: NoRehash demo, then a cancelled rebook on the same lead — newest disposition CXL.
+  const v = evaluateStageEvidence('demo_completed', {
+    appointments: [], tags: [], lpDisposition: 'CXL', lpDemoEvidence: 'appt:NoRehash',
+  });
+  assert.equal(v.satisfied, true);
+  assert.equal(v.matched, 'lp_demo:appt:NoRehash');
 });
 
 test('pre-demo dispositions (Set/Cnf) do NOT satisfy demo_completed', () => {

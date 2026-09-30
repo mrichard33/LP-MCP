@@ -246,6 +246,7 @@ import { getLastInboundMessageMs, hasPriorInboundMessage } from './actions/handl
 // 2026-08-13 — shared with actions/index.executeLayer3Dispatch (see module header).
 import { inferChannelFromEvent } from './channel-inference.js';
 import { withGhlToken } from './ghl-rate-limiter.js';
+import { contactHadDemo } from './demo-truth.js';
 
 // ═══════════════════════════════════════════════════════════════════
 // CONSTANTS
@@ -870,12 +871,16 @@ async function getContactSnapshot(event, deps = {}) {
 // trusted here — only the disposition, the sync-derived lp-demo-completed tag,
 // and the analyzer buyer_stage decide. (Mark: tags are not always accurate.)
 //
-// VALIDATE this set against the lp_dispositions table / Master System Map before
-// merging — these are the dispositions that mean a demo actually occurred
-// (Sale will normally be excluded upstream as customer). No-show / cancel
-// dispositions are intentionally NOT here (they are APPOINTMENT_DISRUPTION and
-// route to S5.2 v2 via their own LP_DISP_* rules, not O.0).
-const DEMO_COMPLETE_DISPOSITIONS = ['FDNS', 'OPPFDN', 'Sale', '1Leg', 'BO'];
+// 2026-09-30 (fix/demo-truth): step 1 now asks src/demo-truth.js across ALL
+// of the contact's leads and every appointment on them, instead of matching the
+// NEWEST lead's disposition against a local list. The old list counted 1Leg and
+// BO (not demos) and missed NoRehash/SW/PM, and newest-lead-only lost a demo the
+// moment the lead was rebooked or a newer lead arrived — so a demoed lead who
+// cancelled read as pre-demo. No-show / cancel dispositions are still NOT demos
+// (they are APPOINTMENT_DISRUPTION and route to S5.2 v2 via their own LP_DISP_*
+// rules, not O.0). Fail-soft exactly as before: an unreadable lp_leads read
+// falls through to the GHL checks below.
+const DEMO_STATE_LEAD_LIMIT = 50;
 
 // GHL "Appointment Status" field (jHFRKGGsYJJFRbWwthkG; same id as
 // APPT_STATUS_FIELD in src/lp-appointment-sync.js, decoded as "Appointment Status"
@@ -891,15 +896,13 @@ async function resolveDemoState(event, intelligence, deps = {}) {
   const intel = intelligence || {};
   const db = deps.supabase !== undefined ? deps.supabase : supabase;
   const ghlContactId = event?.ghl_contact_id || null;
-  // 1) LP disposition — system of record (wins when present)
+  // 1) LP demo truth — system of record (wins when present)
   if (ghlContactId && db) {
-    const { data: lpLead } = await db.from('lp_leads')
-      .select('disposition_code')
+    const { data: lpLeads } = await db.from('lp_leads')
+      .select('disposition_code, closed_won, appts:raw_lp_data->appointments')
       .eq('ghl_contact_id', ghlContactId)
-      .order('synced_at', { ascending: false })
-      .limit(1).maybeSingle();
-    const disp = lpLead?.disposition_code || null;
-    if (disp && DEMO_COMPLETE_DISPOSITIONS.includes(disp)) return 'post';
+      .limit(DEMO_STATE_LEAD_LIMIT);
+    if (contactHadDemo(lpLeads)) return 'post';
   }
   // One GHL fetch feeds both the appointment-outcome check (1.5) and the
   // lp-demo-completed tag check (2) — and, since 2026-08-14, is shared with
