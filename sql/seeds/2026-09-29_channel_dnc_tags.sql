@@ -32,6 +32,15 @@
 --   2026-09-29: calls + texts opt-outs are Do Not Call in LP). See
 --   2026-09-29_lp_dnc_single_code.sql.
 --
+-- LIVE-TAG GUARD (2026-09-30). Each rule also requires has_tag <its tag>,
+--   which reads the contact LIVE. A tag event is a diff of GHL webhook
+--   snapshots, and an out-of-order snapshot reports a tag as "added" just after
+--   it was removed: on 2026-09-30 DNC_LIFT_ON_REENGAGEMENT_LP auto-lifted
+--   HSbgCxhok5IMEj8reiP4 (appointment confirmed), removed dnc-sms, and a stale
+--   snapshot 4s later read as "dnc-sms added" — TAG_DNC_SMS_OPTOUT re-blocked a
+--   customer with a confirmed appointment. The tag was not on the contact.
+--   Applied live 2026-09-30 ~22:45 UTC; see 2026-09-30_channel_dnc_live_tag_guard.sql.
+--
 -- LIFT. dnc-sms is a carrier-STOP signal to the lift (detectCarrierStop): an
 --   approved lift gives calls, LP and Five9 back and leaves texts off. The
 --   lift clears dnc-voice and dnc-email and turns Email DND off.
@@ -52,7 +61,7 @@ SELECT
   'reconciliation',
   '{"event_type": "ghl.tag_added", "event_subtype": "dnc-sms"}'::jsonb,
   NULL,
-  '{"not_has_tag": "suppress:dnc-reply"}'::jsonb,
+  '{"has_tag": "dnc-sms", "not_has_tag": "suppress:dnc-reply"}'::jsonb,
   '[
     {"action_type": "set_dnd", "target_system": "ghl", "target_entity": "contact", "priority": 20,
      "params": {"status": "active", "channels": ["SMS", "RCS", "Call"], "reason": "TAG_DNC_SMS_OPTOUT — dnc-sms tag: calls + texts (FCC 24-24 pair); email continues"}},
@@ -78,7 +87,7 @@ SELECT
   'reconciliation',
   '{"event_type": "ghl.tag_added", "event_subtype": "dnc-voice"}'::jsonb,
   NULL,
-  '{"not_has_tag": "suppress:dnc-voice"}'::jsonb,
+  '{"has_tag": "dnc-voice", "not_has_tag": "suppress:dnc-voice"}'::jsonb,
   '[
     {"action_type": "set_dnd", "target_system": "ghl", "target_entity": "contact", "priority": 20,
      "params": {"status": "active", "channels": ["SMS", "RCS", "Call"], "reason": "TAG_DNC_VOICE_OPTOUT — dnc-voice tag: calls + texts (FCC 24-24 pair); email continues"}},
@@ -104,7 +113,7 @@ SELECT
   'reconciliation',
   '{"event_type": "ghl.tag_added", "event_subtype": "dnc-email"}'::jsonb,
   NULL,
-  '{}'::jsonb,
+  '{"has_tag": "dnc-email"}'::jsonb,
   '[
     {"action_type": "set_dnd", "target_system": "ghl", "target_entity": "contact", "priority": 20,
      "params": {"status": "active", "channels": ["Email"], "reason": "TAG_DNC_EMAIL_OPTOUT — dnc-email tag: email only; calls + texts continue"}},
