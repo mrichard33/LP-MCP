@@ -1082,7 +1082,18 @@ function emitConditionFailClosed(event, ruleKey, missingKey, detail, deps = {}) 
 //                              a missing date FAILS. appointment_date is stored as
 //                              ET wall clock tagged +00:00, so it goes through
 //                              lpStoredToUtcMs before any arithmetic.
+//   appointment_within_days    appointment_date upcoming, or at most N days ago;
+//                              a missing date FAILS. For cancel-type routing,
+//                              where the cancelled appointment is usually still
+//                              in the future.
 //   allow_synthetic: false     inbound-backfill replays (payload.synthetic) FAIL
+//
+// 2026-10-01 — appointment_within_days. Sharyn Blake (3UHhZjKgDtQgtDD3N8qI)
+// was sent to S5.2 by LP_DISP_CANCEL_COLD_TO_S5_2 on 9/30 for an April
+// cancel: LP-MCP first copied that old lead (lp_leads has holes) and its
+// first sync emitted lp.disposition_changed:CXL, minutes before the new lead
+// she demoed on was copied. A cancel signal for a months-old appointment is
+// history, not news.
 //
 // F.0 used to be entered by a GHL stage trigger that trusted a field with two
 // writers; ~19 of 390 contacts in F.0 had no demo. This verb is what the F.0
@@ -1116,6 +1127,15 @@ export function evaluateCurrentLeadMatch(lead, spec, event, nowMs = Date.now()) 
     const days = (nowMs - apptMs) / 86_400_000;
     if (!Number.isFinite(maxDays) || days > maxDays) {
       return { pass: false, reason: `appointment ${days.toFixed(1)} days ago > ${cfg.max_days_since_appointment}` };
+    }
+  }
+  if (cfg.appointment_within_days !== undefined && cfg.appointment_within_days !== null) {
+    const maxDays = Number(cfg.appointment_within_days);
+    const apptMs = lead.appointment_date ? lpStoredToUtcMs(lead.appointment_date) : NaN;
+    if (!Number.isFinite(apptMs)) return { pass: false, reason: 'current lead has no appointment_date' };
+    const days = (nowMs - apptMs) / 86_400_000;
+    if (!Number.isFinite(maxDays) || days > maxDays) {
+      return { pass: false, reason: `appointment ${days.toFixed(1)} days ago > ${cfg.appointment_within_days}` };
     }
   }
   return { pass: true, reason: `current lead ${lead.lp_lead_id ?? '?'} (${disp || 'null'}) matches` };
@@ -1530,16 +1550,23 @@ async function evaluateContextConditions(conditions, intelligence, event, opts =
         if (!ghlContactId) {
           return notApplicableNoContact(key);
         }
-        const { data: lpLead, error: lpErr } = await supabase.from('lp_leads')
-          .select('disposition_code')
-          .eq('ghl_contact_id', ghlContactId)
-          .order('synced_at', { ascending: false })
-          .limit(1).maybeSingle();
-        // 2026-07-03 fail-closed: a failed LP lookup is missing data, not a
-        // wildcard. A contact with NO LP record (query ok, no row) has no
-        // disposition — that is also "no match" unless the rule explicitly
-        // allows null. Never treat either as a pass.
-        if (lpErr) return failClosed(key, `lp_leads lookup failed: ${lpErr.message}`);
+        // 2026-10-01 — judge the CURRENT lead (src/current-lead.js), the same
+        // one GHL "LP Disposition" and lp_current_lead_match use. This read the
+        // most recently SYNCED lead, so a months-old lead copied in late
+        // decided the route: Sharyn Blake's April CXL lead was first synced on
+        // 9/30, four minutes before the lead she demoed on, and
+        // LP_DISP_CANCEL_COLD_TO_S5_2 sent her to S5.2.
+        const ldDb = opts.deps?.supabase !== undefined ? opts.deps.supabase : supabase;
+        let lpLead;
+        try {
+          lpLead = await fetchCurrentLead(ghlContactId, ldDb);
+        } catch (lpErr) {
+          // 2026-07-03 fail-closed: a failed LP lookup is missing data, not a
+          // wildcard. A contact with NO LP record (query ok, no row) has no
+          // disposition — that is also "no match" unless the rule explicitly
+          // allows null. Never treat either as a pass.
+          return failClosed(key, `lp_leads lookup failed: ${lpErr.message}`);
+        }
         if (!lpLead) return failClosed(key, 'contact has no LP record — disposition gate cannot pass');
         const disp = lpLead.disposition_code || null;
         if (!allowed.includes(disp)) {
