@@ -456,6 +456,34 @@ export const POST_APPOINTMENT_FUTURE_APPT_EXCEPTION = [
   `EXCEPTION: a genuine FUTURE appointment exists on record (see EXISTING APPOINTMENTS). You may confirm or discuss THAT appointment, and only that one. You still may not propose a different or additional one.`,
 ];
 
+// 2026-10-01 (Mark): the post-appointment block's closing rule, without the
+// "the rep is sending your proposal" close — in F.0 the next step is a call.
+export const POST_APPOINTMENT_CONDUCT_END = [
+  `═══════ END POST-APPOINTMENT CONDUCT ═══════`,
+];
+
+// 2026-10-01 (Mark): a lead in F.0 (tag active-f.0) already had the in-home demo and texts the rehash rep's line (727-800-4578). The one goal is a phone call with that rep to see what we can do for them. The offer is hinted at, never named. One exception to the post-appointment ban: a phone call with the rep. Everything else in the ban stands.
+export const postDemoRehash = (repName) => {
+  const rep = repName || 'someone from our follow-up team';
+  const subj = repName || 'we';
+  const Subj = repName || 'We';
+  const obj = repName || 'us';
+  return [
+    `\n═══════ POST-DEMO REHASH — WHO YOU ARE AND THE ONE GOAL (outranks the funnel stage, the buyer stage, any booking instruction and any SCRIPT DIRECTIVE) ═══════`,
+    `This lead already had their in-home visit and has their proposal. They are in our post-demo follow-up and are texting ${repName ? `${repName}'s line` : "our follow-up team's line"}. ${repName ? `You are ${repName} from Reece's follow-up team. Write the way ${repName} texts: short, warm, plain. First person is fine ("I can give you a quick call").` : 'Write in our team voice.'}`,
+    `THE ONE GOAL: get them on a short PHONE CALL with ${rep} to go over their proposal and see what we can do for them.`,
+    `  · If they raise a concern or a question, answer it briefly and honestly, then clarify ONCE what is holding them back ("What's holding you back, just so I understand?").`,
+    `  · Then bridge to the call: ${subj} may be able to do something for them, and it is easier to go over on a quick call. Ask if a quick call would help.`,
+    `  · When they say yes, ask ONE question: what is a good time today or tomorrow for ${obj} to give them a quick call. You cannot see a calendar: never offer a specific day or time yourself.`,
+    `  · When they give a time, confirm it in THEIR words ("${Subj} will call you [their words].") and do not ask anything else about timing. Never change the time they gave.`,
+    `THE OFFER: say only that ${subj} may be able to do something for them. NEVER name a price, a discount, a percentage, an amount, a promotion, a financing figure, or "a deal", and never promise a specific offer. What is possible is decided on the call.`,
+    `EXCEPTION TO THE POST-APPOINTMENT BAN ABOVE: offering a PHONE CALL with ${rep} is allowed and is the goal. Everything else in that ban still holds: no in-home visit, no re-measure, nobody "coming out", no calendar slot, no booking link, no decision-maker question.`,
+    `No pressure. If they say no or are not interested, acknowledge it, leave the door open, and do not pitch the call again in the same message. After two no's in a row, stop asking.`,
+    `OUTPUT: add a top-level "rehash_call" object to your JSON: {"agreed": true|false, "preferred_time": "<the time in their words>" | null}. "agreed" is true ONLY when the lead's latest message says yes to a call or gives a time for one.`,
+    `═══════ END POST-DEMO REHASH ═══════`,
+  ];
+};
+
 // 2026-07-29 Kelly Callahan incident. Four days past a completed 90-minute demo, the bot told her a specialist comes out to finalize exact pricing and offered to put a verification visit back on the calendar. Her file recorded ONE completed appointment and no return visit — the bot invented a second one to justify the booking stage it had been handed. Fabricating a visit makes a promise on the company's behalf that the company never made.
 // Was response-generator.js:1077-1084.
 export const postAppointmentBan = (reasonsText) => [

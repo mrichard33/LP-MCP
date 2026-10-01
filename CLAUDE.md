@@ -98,6 +98,14 @@ where a person must act, pages one — and the bot still replies, unless `handof
 answers the tag). A new handoff class replies by default. Do not add a silent class without Mark's
 ruling, and never add `stop-bot` to a rule whose trigger is not an opt-out.
 
+**Post-demo F.0 leads talk to the rehash rep (Mark, 2026-10-01).** A contact tagged `active-f.0` (or texting
+727-800-4578) gets SMS replies written AS the rep in the GHL custom value `rehash_rep_name`, read by
+`src/services/ghl-custom-values.js` and written in as a literal (never the merge tag). The one goal is a
+phone call with that rep; the offer is hinted at, never named (`stripOfferTalk`). Layer3 script directives
+are dropped for these replies because every one is pre-demo copy. A "yes" to the call posts one card a day
+to #contact-rehash (`SLACK_CHANNEL_REHASH`, default C0C5YMHNYJH) via `src/notifications/rehash-call.js`.
+No resolved name → the reply signs "Reece Team"; never guess a name. See `src/agentic/rehash.js`.
+
 ## Consent (2026-09-28)
 
 `contact_consent` / `consent_events` (sql/136–139) are the record of who may be contacted and why not.

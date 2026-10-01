@@ -50,6 +50,13 @@ export const signOffFooter = (signature) => [
   `═══════ END LINE IDENTITY ═══════`,
 ];
 
+// 2026-10-01 (Mark): the rehash line is the rep's own; F.0 texts already speak in the rep's first person ("just text me here and I'll help"), so the body may too.
+export const signOffFooterRehash = (signature) => [
+  `Never sign with any name other than "${signature}", and never sign more than once in a message.`,
+  `You are ${signature}: first person ("I") is fine, and so is "we" for the company.`,
+  `═══════ END LINE IDENTITY ═══════`,
+];
+
 // Unsigned thread: sign a substantive reply once to establish who is texting, but never sign a bare acknowledgment — a signature would outweigh the message.
 // Was response-generator.js:1231-1232.
 export const signOffNotYetSigned = (signature) => [

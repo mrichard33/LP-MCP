@@ -293,7 +293,8 @@ import { bumpContactCache } from './context-builder.js';
 // v3.6: rich GroupMe notification — same helpers used by tasks v2.0 +
 // notifications handlers, so all four GroupMe surfaces share one format.
 import { resolveContactInfo, resolveLPProspectId } from './actions/resolvers.js';
-import { buildNotificationEnrichment, buildRichNotification } from './actions/enrichment.js';
+import { notifyRehashCall } from './notifications/rehash-call.js';
+import { buildNotificationEnrichment, buildRichNotification, resolveMarket } from './actions/enrichment.js';
 // 2026-07-03 rebuild (Steve Nkzhm incident) — channel/identity inheritance,
 // AI-disclosure hard guard, per-contact supersession check.
 import { resolveReplyContext, guardDisclosure, fetchRecentMessages, channelOfMessage } from './agentic/reply-sender.js';
@@ -4077,6 +4078,21 @@ export async function executeSendMessage(action, context) {
         console.log(`[SendMessage] rep note queued for ${contactId}`);
       } catch (rnErr) {
         console.warn(`[SendMessage] rep note queue failed for ${contactId} (fail-soft): ${rnErr.message}`);
+      }
+    }
+
+    // 2026-10-01 — REHASH CALL: a post-demo F.0 lead said yes to a call with
+    // the rehash rep. Tell the rep in #contact-rehash, or "<rep> will call
+    // you" is a promise nobody keeps. Failure-soft: the send already happened.
+    if (generated?.rehash?.active && generated?.rehash_call?.agreed) {
+      try {
+        const { name, phone, lpLead, ghlContact } = await resolveContactInfo(contactId, context);
+        let market = null;
+        try { market = await resolveMarket({ ghlContact, lpLead }); } catch { /* the card still goes out */ }
+        const firstName = String(name || '').trim().split(/\s+/)[0] || null;
+        await notifyRehashCall({ contactId, generated, triggerMessage: replyTriggerMessage, contact: { firstName: firstName && firstName !== 'Unknown' ? firstName : null, phone, market } });
+      } catch (rcErr) {
+        console.warn(`[SendMessage] rehash call card failed for ${contactId} (fail-soft): ${rcErr.message}`);
       }
     }
 
