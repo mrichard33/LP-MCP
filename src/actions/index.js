@@ -285,6 +285,7 @@ import { executeSendInfoEmail } from './handlers/info-email.js';
 // 2026-07-21 Phase C — Five9 gated writes (one dispatcher for all fourteen
 // five9_* action types; guardrails + audit live in src/five9/admin-writes.js)
 import { executeFive9Write } from './handlers/five9.js';
+import { trackAction } from '../graceful-shutdown.js';
 
 // MVI v2.5 — fetch the source event for a given action. The shared
 // getEventContext returns ONLY the spread payload (no event_id /
@@ -813,7 +814,18 @@ export function decideNotBefore(action, nowMs) {
   return { seconds, retry_at: new Date(readyAt).toISOString(), warn: null };
 }
 
-async function executeSingleAction(action, batchContext = {}, priorBatchResults = []) {
+// 2026-10-01 (Dan H., action 532106) — every action run is tracked by the
+// graceful-shutdown drain. The reply fast path (decision-engine.js and the
+// layer3 fan-out below) starts executeActionById without awaiting it, so a
+// deploy's SIGTERM did not know a customer reply was being written and exited
+// three seconds into it; the row sat in 'executing' until the 10-minute
+// reaper. Wrapping here covers every path at once: the fast path,
+// executeActionById, the sweep and runActionsNow.
+function executeSingleAction(action, batchContext = {}, priorBatchResults = []) {
+  return trackAction(executeSingleActionUntracked(action, batchContext, priorBatchResults));
+}
+
+async function executeSingleActionUntracked(action, batchContext = {}, priorBatchResults = []) {
   const handler = ACTION_HANDLERS[action.action_type];
   if (!handler) {
     await supabase.from('agent_actions').update({
@@ -1371,7 +1383,9 @@ export async function executeActions({ limit } = {}) {
   try {
     // Phase 0: reap stuck 'executing' (killed-process zombies) + orphaned
     // 'approved' rows. Phase 1: send pending_approval GroupMe cards.
-    const reaperResult = await reapStuckActions();
+    // 2026-10-01 — a killed customer reply is retried once its own watchdog
+    // has passed (~3 min), not after the generic 10 (see reaper.js).
+    const reaperResult = await reapStuckActions({ sendMessageWatchdogMs: resolveHandlerTimeoutMs('send_message') });
     // Reconcile recently-completed sends against GHL delivery status. Runs on
     // the executor cadence, lagged by SEND_VERIFY_MIN_AGE_SEC because GHL's
     // message list propagates behind the send. Fail-soft — never blocks a run.

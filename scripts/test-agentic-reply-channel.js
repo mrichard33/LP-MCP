@@ -21,11 +21,30 @@ const { decideReplyChannel, deriveInboundContext, channelOfMessage } =
 
 // ── decideReplyChannel ───────────────────────────────────────────────
 
-test('livechat inbound + fresh session → Live_Chat, not downgraded', () => {
+// 2026-10-01 (Mark): the live chat belongs to the live-chat fast lane. The
+// normal pipeline never answers inside it — a fresh chat goes out by text.
+test('livechat inbound + fresh session + phone → SMS (the chat is the fast lane\'s)', () => {
   const d = decideReplyChannel({ requestedChannel: 'livechat', inboundOrigin: 'livechat', hasPhone: true, livechatAgeMin: 3, ttlMin: 15 });
-  assert.equal(d.channel, 'livechat');
-  assert.equal(d.channelType, 'Live_Chat');
-  assert.equal(d.downgraded, false);
+  assert.equal(d.channel, 'sms');
+  assert.equal(d.channelType, 'SMS');
+  assert.equal(d.downgraded, true);
+  assert.equal(d.reason, 'livechat_owned_by_fast_lane');
+});
+
+test('livechat inbound + fresh session + NO phone → no send (a person is told)', () => {
+  const d = decideReplyChannel({ requestedChannel: null, inboundOrigin: 'livechat', hasPhone: false, livechatAgeMin: 1, ttlMin: 15 });
+  assert.equal(d.channel, null);
+  assert.equal(d.reason, 'livechat_owned_by_fast_lane_no_phone');
+});
+
+test('Krystal (iUsgBlDcwqRS0U9boAdX, 2026-10-01): a Chat Widget message (TYPE_WEBCHAT) is answered by SMS, never in the chat', () => {
+  const ctx = deriveInboundContext([{ direction: 'inbound', messageType: 'TYPE_WEBCHAT', type: 5, dateAdded: new Date(Date.now() - 60000).toISOString() }]);
+  assert.equal(ctx.inboundOrigin, 'livechat');
+  const d = decideReplyChannel({ requestedChannel: 'sms', inboundOrigin: ctx.inboundOrigin, hasPhone: true, livechatAgeMin: ctx.livechatAgeMin });
+  assert.equal(d.channel, 'sms');
+  for (const age of [0, 5, 14, 60]) {
+    assert.notEqual(decideReplyChannel({ inboundOrigin: 'livechat', hasPhone: true, livechatAgeMin: age }).channel, 'livechat', `age ${age}`);
+  }
 });
 
 test('livechat inbound + stale session + phone → SMS downgrade', () => {
@@ -115,10 +134,10 @@ test('no requested channel + no inbound → sms (unchanged fallback)', () => {
   assert.equal(d.reason, 'no_inbound_found');
 });
 
-test('no requested channel + fresh livechat inbound → livechat (unchanged)', () => {
+test('no requested channel + fresh livechat inbound → SMS, never the chat (2026-10-01)', () => {
   const d = decideReplyChannel({ requestedChannel: null, inboundOrigin: 'livechat', hasPhone: true, livechatAgeMin: 2, ttlMin: 15 });
-  assert.equal(d.channel, 'livechat');
-  assert.equal(d.reason, 'livechat_fresh');
+  assert.equal(d.channel, 'sms');
+  assert.equal(d.reason, 'livechat_owned_by_fast_lane');
 });
 
 // ── channelOfMessage / deriveInboundContext (identity inheritance) ──

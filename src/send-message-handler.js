@@ -3089,6 +3089,14 @@ export async function executeSendMessage(action, context) {
     });
     if (!replyContext.channel) {
       console.log(`[SendMessage] ⏭️ no sendable channel for ${contactId}: ${replyContext.reason} (origin: ${replyContext.inboundOrigin || 'none'})`);
+      // 2026-10-01 — the normal bot no longer answers inside the website chat
+      // (reply-sender.decideReplyChannel). A chat-widget visitor with no phone
+      // to text would otherwise get silence, so a person is told.
+      if (String(replyContext.reason || '').startsWith('livechat_owned_by_fast_lane')) {
+        import('./alert-state.js')
+          .then(({ sendAlertMessage }) => sendAlertMessage(`💬 CHAT VISITOR WITH NO PHONE — NOT ANSWERED BY THE BOT\nContact: ${contactId}\n→ They wrote through the website chat widget and there is no phone to text back. Answer them in GHL.`, { channel: 'ops' }))
+          .catch((err) => console.warn(`[SendMessage] chat no-phone alert failed for ${contactId}: ${err.message}`));
+      }
       return {
         action: 'send_message_no_channel',
         contact_id: contactId,

@@ -184,6 +184,18 @@ thrown error — `runMemoryNightly` and friends catch everything internally and 
 `{ ok: false }`. `interrupted` (a deploy killed the pass) is never `failed`, and a job that
 could not tell is `unknown`. Roster in `src/job-registry.js`; see `docs/job-runs.md`.
 
+**A deploy must never cut a customer reply off (2026-10-01, Dan H.).** Every Railway deploy SIGTERMs
+the old container, and `src/graceful-shutdown.js` waits only for what it can see. The reply fast path starts
+`executeActionById` without awaiting it, so the drain logged "Drained cleanly after 0ms" twice in 13 minutes
+with Dan's reply half-written. Every action run now goes through `trackAction` (wrapped once, in
+`executeSingleAction`), pending reply buffers fire on shutdown (`flushReplyBuffersNow`), and the reaper
+retries a stuck `send_message` after its own watchdog + 60s (`reaperAgeMsFor`), not 10 minutes. New
+fire-and-forget work that matters to a customer goes through `trackBackground`/`trackAction` too.
+
+**Only the live-chat fast lane answers in the website chat (Mark, 2026-10-01).** `decideReplyChannel`
+never returns `livechat` for the normal pipeline: a chat-widget origin goes out by SMS, or (no phone) is
+not sent and #ops-alerts is told. GHL's "Chat Widget" (type 5, `TYPE_WEBCHAT`) reads as livechat there.
+
 **Connection probes are read-only and never post.** `GET /health/integrations`
 (`src/integrations-health.js`) answers "can we reach LP / Five9 / Slack / GroupMe right now?"
 for the dashboard. A probe that cannot tell reports `unknown`, never `connected`; a GroupMe bot
