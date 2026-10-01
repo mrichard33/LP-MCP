@@ -324,6 +324,18 @@ export const JOBS = Object.freeze([
     isEnabled: (env) => String(env.CANVASS_BACKSTOP_MODE || 'shadow').toLowerCase().trim() !== 'off',
   },
   {
+    id: 'dnc-reentry-sweep',
+    label: 'Blocked leads that came back → DNC-lift card',
+    group: 'five9',
+    cadence: 'every 15 min',
+    enabledEnv: 'DNC_REENTRY_SWEEP_MODE',
+    // A MODE (2026-10-01): off | shadow | live, default LIVE — it only asks a
+    // person in #dnc-lift-approval. Mirrors reentryMode() in
+    // src/consent/dnc-reentry.js.
+    enabledDefault: true,
+    isEnabled: (env) => String(env.DNC_REENTRY_SWEEP_MODE || 'live').toLowerCase().trim() !== 'off',
+  },
+  {
     id: 'payroll-engine',
     label: 'Payroll engine (LightFire + call center)',
     group: 'payroll',

@@ -7,9 +7,18 @@
  * card in #dnc-lift-approval. The click comes back to
  * POST /slack/dnc-lift/decision (./dnc-lift-decision.js).
  *
- * Queued by DNC_LIFT_REVIEW_REQUEST (manual `dnc-lift:request` tag) and
+ * Queued by DNC_LIFT_REVIEW_REQUEST (manual `dnc-lift:request` tag),
  * DNC_LIFT_REVIEW_REQUEST_REENTRY (a re-entry the first-party auto-lift does
- * not own). requires_approval false — it only asks; it changes nothing.
+ * not own), POST /webhook/ap/dnc-reentry, and the DNC re-entry sweep
+ * (src/jobs/dnc-reentry-sweep.js — a new LP lead for a blocked number).
+ * requires_approval false — it only asks; it changes nothing.
+ *
+ * "Blocked" is not only a GHL tag (2026-10-01). 68 of 73 returning leads whose
+ * number sat on Five9's DNC list in one week carried no DNC tag and no consent
+ * row — the block predates the consent model and lives only in the dialer. A
+ * tag-only check called every one of them "not blocked", so no card ever
+ * posted. The handler therefore also counts the consent record and, when
+ * neither shows a block, Five9's DNC list.
  *
  * What this handler enforces itself, because the rule engine has no operator
  * for it:
@@ -34,6 +43,7 @@ import crypto from 'node:crypto';
 import supabase from '../supabase.js';
 import { ghlFetch } from '../actions/helpers.js';
 import { getConsent, detectCarrierStop, blockingTags, isMissingSchemaError } from './consent-store.js';
+import { normalizePhone10 } from '../lead-leak-classify.js';
 
 export const REVIEW_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 export const FIRST_PARTY_CONSENT_TAG = 'consent:new-submission';
@@ -59,9 +69,9 @@ function tagSuffix(tags, prefix) {
  * Should this contact be sent to a person at all? Pure.
  * @returns {{ask:boolean, reason:string}}
  */
-export function decideReviewEligibility({ tags, recentRequest }) {
+export function decideReviewEligibility({ tags, recentRequest, blockedElsewhere = [] }) {
   const lower = (tags || []).map((t) => String(t || '').toLowerCase());
-  if (blockingTags(tags).length === 0) return { ask: false, reason: 'not_blocked' };
+  if (blockingTags(tags).length === 0 && blockedElsewhere.length === 0) return { ask: false, reason: 'not_blocked' };
   const hasStop = CONTACT_INITIATED_STOP_TAGS.some((t) => lower.includes(t));
   if (lower.includes(FIRST_PARTY_CONSENT_TAG) && !hasStop) {
     return { ask: false, reason: 'first_party_auto_lift_owns_it' };
@@ -70,11 +80,24 @@ export function decideReviewEligibility({ tags, recentRequest }) {
   return { ask: true, reason: 'ok' };
 }
 
+// Labels for a block that is not a GHL tag. n8n prints blocking_tags as the
+// card's "Blocked by:" line, so these ride along there (readable as-is) — the
+// live card needs no n8n change to show them.
+export const BLOCKED_IN_CONSENT = 'consent record: calls + texts off';
+export const BLOCKED_IN_FIVE9 = 'Five9 DNC list';
+
+/** Blocks the consent record shows. Pure. */
+export function consentBlocks(consentRead) {
+  const c = consentRead?.status === 'ok' ? consentRead.consent : null;
+  if (!c) return [];
+  return c.dnc_full === true || c.phone_consent === 'revoked' || c.sms_carrier_stop === true ? [BLOCKED_IN_CONSENT] : [];
+}
+
 /**
  * The payload n8n turns into the Slack card. Pure — everything it needs is
  * passed in, so the card's content is unit-tested.
  */
-export function buildReviewPayload({ requestId, contactId, contact, context = {}, trigger, consentRead, carrier, reenteredAt, vendor = null }) {
+export function buildReviewPayload({ requestId, contactId, contact, context = {}, trigger, consentRead, carrier, reenteredAt, vendor = null, leadSource = null, blockedElsewhere = [] }) {
   const tags = contact?.tags || [];
   const name = [contact?.firstName, contact?.lastName].filter(Boolean).join(' ').trim()
     || contact?.contactName || contact?.name || 'Unknown';
@@ -87,14 +110,17 @@ export function buildReviewPayload({ requestId, contactId, contact, context = {}
     // An ActiveProspect re-entry names the channel and the vendor that just
     // sent the lead — the contact's own source is from whenever it FIRST
     // arrived, which is not what the reviewer is deciding on.
-    source: trigger === 'activeprospect' ? 'ActiveProspect' : (contact?.source || tagSuffix(tags, 'entry:') || null),
-    sub_source: trigger === 'activeprospect'
+    // The re-entry sweep names the NEW lead's LP source and vendor, for the
+    // same reason.
+    source: trigger === 'activeprospect' ? 'ActiveProspect'
+      : (leadSource || contact?.source || tagSuffix(tags, 'entry:') || null),
+    sub_source: trigger === 'activeprospect' || leadSource
       ? (vendor || null)
       : (tagSuffix(tags, 'active-entry:') || attribution?.utmSource || context?.source || null),
     reentered_at: reenteredAt,
     trigger,
     vendor: vendor || null,
-    blocking_tags: blockingTags(tags),
+    blocking_tags: [...blockingTags(tags), ...blockedElsewhere],
     sms_carrier_stop: carrier.carrierStop,
     carrier_stop_basis: carrier.basis,
     sms_warning: carrier.carrierStop ? SMS_CARRIER_STOP_WARNING : null,
@@ -132,13 +158,33 @@ export async function executeRequestDncLiftReview(action, context = {}, deps = {
     throw new Error(`request_dnc_lift_review: 24h check failed: ${recent.error.message}`);
   }
 
-  const verdict = decideReviewEligibility({ tags: contact.tags, recentRequest: (recent.data || [])[0] || null });
+  const consentRead = await (deps.getConsent || getConsent)(contactId, { supabase: db, eventLimit: 5 });
+  const blockedElsewhere = consentBlocks(consentRead);
+  // Five9 is read only when neither the tags nor the consent record show a
+  // block: that is the case the tag-only check got wrong, and it keeps one
+  // SOAP call off every ordinary card.
+  if (blockingTags(contact.tags).length === 0 && blockedElsewhere.length === 0) {
+    const phone10 = normalizePhone10(contact.phone);
+    if (phone10) {
+      const checkDnc = deps.checkDnc || (await import('../five9-admin.js')).checkDncForNumbers;
+      let res;
+      try {
+        res = await checkDnc([phone10]);
+      } catch (err) {
+        // Could not tell — throw so the executor retries, rather than calling
+        // a lead "not blocked" on a failed read.
+        throw new Error(`request_dnc_lift_review: Five9 DNC check failed for ${contactId}: ${err.message}`);
+      }
+      if ((res?.on_dnc || []).includes(phone10)) blockedElsewhere.push(BLOCKED_IN_FIVE9);
+    }
+  }
+
+  const verdict = decideReviewEligibility({ tags: contact.tags, recentRequest: (recent.data || [])[0] || null, blockedElsewhere });
   if (!verdict.ask) {
     console.log(`[DncLiftReview] not asking for ${contactId}: ${verdict.reason}`);
     return { action: 'skipped', skipped: true, reason: verdict.reason };
   }
 
-  const consentRead = await (deps.getConsent || getConsent)(contactId, { supabase: db, eventLimit: 5 });
   const carrier = detectCarrierStop({ consent: consentRead.consent, tags: contact.tags, dndSettings: contact.dndSettings });
   const requestId = deps.newRequestId ? deps.newRequestId() : `dnc-lift-${crypto.randomUUID()}`;
   const trigger = action.action_payload?.trigger || (context?.source === 'reentry' ? 'reentry' : 'manual_tag');
@@ -146,6 +192,8 @@ export async function executeRequestDncLiftReview(action, context = {}, deps = {
     requestId, contactId, contact, context, trigger, consentRead, carrier,
     reenteredAt: context?.occurred_at || action.created_at || new Date(now).toISOString(),
     vendor: action.action_payload?.vendor || null,
+    leadSource: action.action_payload?.lead_source || null,
+    blockedElsewhere,
   });
 
   const ins = await db.from('dnc_lift_requests').insert({
@@ -240,7 +288,13 @@ export async function handleApDncReentry({ body = {}, headers = {} }, deps = {})
       .then((r) => (r.error ? null : (r.data?.tags || [])), () => null),
   ]);
   const blocked = isBlockedPerRecords({ consentRead, snapshotTags: snap });
-  if (blocked === false) return { status: 200, json: { ok: true, skipped: 'not_blocked' } };
+  if (blocked === false) {
+    // Logged (2026-10-01): six calls in two days came back not_blocked with no
+    // trace anywhere, and nobody could tell which contacts I.AP had sent. The
+    // DNC re-entry sweep re-checks the same lead against Five9 once it is in LP.
+    console.log(`[DncLiftReview] ActiveProspect re-entry for ${contactId}${vendor ? ` (${vendor})` : ''} — not blocked per our records; the re-entry sweep checks Five9`);
+    return { status: 200, json: { ok: true, skipped: 'not_blocked' } };
+  }
 
   // One queued ask per contact at a time: a vendor that re-sends the same lead
   // twice in a minute must not produce two cards before the first request row
