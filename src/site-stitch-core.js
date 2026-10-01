@@ -52,6 +52,7 @@ export function buildAggregateSql({ visitorId, contactId, maxEventId, recencyDay
       (select string_agg(vid, ',') from linked) as visitor_ids_csv,
       (select count(*) from ev) as pageviews,
       (select count(distinct session_id) from ev) as sessions,
+      (select min(created_at) from ev) as first_visit,
       (select max(created_at) from ev) as last_visit,
       (select coalesce(utm_source, fbclid) from ev where coalesce(utm_source, fbclid) is not null order by created_at asc limit 1) as first_touch_source,
       coalesce((select jsonb_object_agg(page_path, cnt) from perpage), '{}'::jsonb) as page_counts,
@@ -131,4 +132,110 @@ export function buildMappedContactsSql(ids, visitorId) {
           from public.visitor_identity_map
           where contact_id in (${list.join(',')})
           group by contact_id`;
+}
+
+// ─── One row per lead: site_lead_summary (sql/142, 2026-10-01) ──────────────
+// site_events is one row per page view and visitor_identity_map one row per
+// browser; nothing held one row per LEAD. I.STITCH now upserts this row from
+// the same aggregate it writes to GHL, so the two always agree.
+
+const sqlText = (v) => (v == null || String(v).trim() === '' ? 'null' : `'${q(String(v).trim())}'`);
+const sqlTs = (v) => {
+  if (v == null || v === '') return 'null';
+  const t = Date.parse(v);
+  return Number.isFinite(t) ? `'${new Date(t).toISOString()}'::timestamptz` : 'null';
+};
+const sqlInt = (v) => (Number.isFinite(Number(v)) ? String(Math.trunc(Number(v))) : '0');
+const sqlTextArray = (arr) => {
+  const list = (Array.isArray(arr) ? arr : []).filter(x => x != null && String(x) !== '');
+  return list.length ? `array[${list.map(x => `'${q(x)}'`).join(',')}]::text[]` : `'{}'::text[]`;
+};
+
+/**
+ * Upsert for one contact's summary row. A first touch already stored is kept
+ * when this aggregate has none — the same "unknown never erases" rule the GHL
+ * field follows (buildSiteFieldUpdates).
+ */
+export function buildSummaryUpsertSql({ contactId, agg, score, topPages }) {
+  const a = agg || {};
+  const pageCounts = (a.page_counts && typeof a.page_counts === 'object') ? a.page_counts : {};
+  return `insert into public.site_lead_summary
+      (contact_id, visitor_ids, pages_viewed, sessions, first_visit, last_visit,
+       first_touch_source, intent_score, top_pages, page_counts, updated_at)
+    values ('${q(contactId)}', ${sqlTextArray(a.visitor_ids)}, ${sqlInt(a.pageviews)}, ${sqlInt(a.sessions)},
+       ${sqlTs(a.first_visit)}, ${sqlTs(a.last_visit)}, ${sqlText(a.first_touch_source)}, ${sqlInt(score)},
+       ${sqlTextArray(topPages)}, '${q(JSON.stringify(pageCounts))}'::jsonb, now())
+    on conflict (contact_id) do update set
+      visitor_ids = excluded.visitor_ids,
+      pages_viewed = excluded.pages_viewed,
+      sessions = excluded.sessions,
+      first_visit = excluded.first_visit,
+      last_visit = excluded.last_visit,
+      first_touch_source = coalesce(excluded.first_touch_source, public.site_lead_summary.first_touch_source),
+      intent_score = excluded.intent_score,
+      top_pages = excluded.top_pages,
+      page_counts = excluded.page_counts,
+      updated_at = now()`;
+}
+
+/**
+ * Contacts the returning-visit refresh should rebuild, one row each:
+ *  - stitched contacts with no summary row yet (this IS the backfill), and
+ *  - contacts whose mapped browsers have a page view newer than the row's
+ *    last_visit — a known lead browsing again without submitting a form,
+ *    which before 2026-10-01 never reached GHL at all.
+ * Carries the previous score and page counts so the caller can decide
+ * whether the change deserves a GHL note.
+ */
+export function buildRefreshCandidatesSql(limit) {
+  const n = Math.max(1, Math.min(500, Math.trunc(Number(limit)) || 50));
+  return `select distinct on (m.contact_id)
+        m.contact_id, m.visitor_id,
+        (s.contact_id is not null) as has_summary,
+        s.intent_score as prev_score, s.page_counts as prev_page_counts
+      from public.visitor_identity_map m
+      left join public.site_lead_summary s on s.contact_id = m.contact_id
+      where s.contact_id is null
+         or exists (select 1 from public.site_events e
+                    where e.visitor_id = m.visitor_id and e.event_type = 'pageview'
+                      and e.created_at > coalesce(s.last_visit, '-infinity'::timestamptz))
+      order by m.contact_id
+      limit ${n}`;
+}
+
+/**
+ * Does a refreshed total deserve a GHL note? A note on every return visit
+ * would bury the contact's timeline, so only when something a rep would act
+ * on changed. Never for a backfill (no previous row): those contacts already
+ * got their note when they were first stitched.
+ */
+export function refreshNoteReason(prev, next, { threshold = 50, highPaths = [] } = {}) {
+  if (!prev || !prev.has_summary || !next) return null;
+  const before = Number(prev.prev_score) || 0;
+  const after = Number(next.score) || 0;
+  if (before < threshold && after >= threshold) return 'crossed_high_intent';
+  const seen = (prev.prev_page_counts && typeof prev.prev_page_counts === 'object') ? prev.prev_page_counts : {};
+  const isHigh = (p) => highPaths.some(h => String(p || '').startsWith(h));
+  const newHigh = Object.keys(next.page_counts || {}).find(p => isHigh(p) && !(p in seen));
+  if (newHigh) return 'new_high_intent_page';
+  if (after - before >= 20) return 'score_jump';
+  return null;
+}
+
+/**
+ * One batch of the 180-day cleanup (Mark, 2026-10-01). Only page views and
+ * custom events from browsers that never identified — a stitched lead keeps
+ * its whole history, and identify rows are never touched.
+ */
+export function buildRetentionDeleteSql(days, batch) {
+  const d = Math.trunc(Number(days));
+  const b = Math.max(1, Math.min(20000, Math.trunc(Number(batch)) || 5000));
+  if (!(d >= 30)) throw new Error(`site_events retention: refusing ${days} days (minimum 30)`);
+  const where = `e.event_type <> 'identify'
+        and e.created_at < now() - interval '${d} days'
+        and not exists (select 1 from public.visitor_identity_map m where m.visitor_id = e.visitor_id)`;
+  return {
+    count: `select count(*)::int as n from (select e.id from public.site_events e where ${where} limit ${b}) x`,
+    delete: `delete from public.site_events where id in (select e.id from public.site_events e where ${where} limit ${b})`,
+  };
 }

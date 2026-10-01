@@ -193,6 +193,23 @@ export const JOBS = Object.freeze([
     isEnabled: (env) => String(env.TAG_SWEEP_ENABLED || '').toLowerCase() === 'true',
   },
   {
+    // 2026-10-01: deletes anonymous site_events page views older than
+    // SITE_EVENTS_RETENTION_DAYS (180, Mark's ruling). Never a stitched lead's
+    // history, never identify rows. 0 turns it off; mirrors retentionDays()
+    // in src/jobs/site-events-retention.js.
+    id: 'site-events-retention',
+    label: 'Site events retention (anonymous, 180d)',
+    group: 'tracking',
+    cadence: 'daily 04:00 ET',
+    enabledEnv: 'SITE_EVENTS_RETENTION_DAYS',
+    enabledDefault: true,
+    isEnabled: (env) => {
+      const raw = env.SITE_EVENTS_RETENTION_DAYS;
+      const n = raw == null || raw === '' ? 180 : Math.trunc(Number(raw));
+      return Number.isFinite(n) && n > 0;
+    },
+  },
+  {
     // 2026-09-30 (fix/f0-oppfdn-integrity): read-only report of anyone in F.0
     // whose current LP lead is not OPPFDN or who never really demoed. Posts to
     // #ops-alerts every day, clean or not.

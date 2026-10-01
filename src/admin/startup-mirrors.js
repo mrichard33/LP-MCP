@@ -2502,4 +2502,33 @@ export const STARTUP_MIRRORS = [
     fail: '[Migration] consent model tables (sql/136, 137, 140) skipped — apply them from the dashboard; consent writes skip and DNC-lift decisions refuse until they exist:',
     level: 'warn',
   },
+  // site_lead_summary (sql/142, 2026-10-01 — the file is the source of
+  // truth). One row per GHL contact, upserted by I.STITCH. Until it exists the
+  // stitch still writes GHL as before and skips the row; the returning-visit
+  // refresh does nothing (its candidate query reads this table).
+  {
+    name: 'sql/142',
+    expects: {
+      tables: ['site_lead_summary'],
+    },
+    sql: [
+      `CREATE TABLE IF NOT EXISTS site_lead_summary (
+              contact_id text PRIMARY KEY,
+              visitor_ids text[] NOT NULL DEFAULT '{}',
+              pages_viewed integer NOT NULL DEFAULT 0,
+              sessions integer NOT NULL DEFAULT 0,
+              first_visit timestamptz,
+              last_visit timestamptz,
+              first_touch_source text,
+              intent_score integer NOT NULL DEFAULT 0,
+              top_pages text[] NOT NULL DEFAULT '{}',
+              page_counts jsonb NOT NULL DEFAULT '{}'::jsonb,
+              updated_at timestamptz NOT NULL DEFAULT now()
+            );`,
+      `ALTER TABLE site_lead_summary ENABLE ROW LEVEL SECURITY;`,
+    ],
+    ready: '[Migration] site_lead_summary (sql/142) ready',
+    fail: '[Migration] site_lead_summary (sql/142) skipped — apply sql/142 from the dashboard; I.STITCH keeps writing GHL but has no per-lead row and no returning-visit refresh until it exists:',
+    level: 'warn',
+  },
 ];

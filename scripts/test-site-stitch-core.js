@@ -17,7 +17,9 @@ import assert from 'node:assert/strict';
 
 import {
   buildAggregateSql, buildSiteFieldUpdates, exactMatches, pickContact, buildMappedContactsSql,
+  buildSummaryUpsertSql, buildRefreshCandidatesSql, refreshNoteReason, buildRetentionDeleteSql,
 } from '../src/site-stitch-core.js';
+import { runSiteEventsRetention, retentionDays } from '../src/jobs/site-events-retention.js';
 
 const FIELDS = { last_site_visit: 'f_last', site_intent_score: 'f_score', site_pages_viewed: 'f_pages', first_touch_source: 'f_ft' };
 
@@ -112,4 +114,119 @@ test('buildMappedContactsSql: escaped ids, null when there is nothing to ask', (
   assert.match(sql, /contact_id in \('A','B''1'\)/);
   assert.match(sql, /visitor_id = 'v''1'/);
   assert.equal(buildMappedContactsSql([], 'v'), null);
+});
+
+// ─── One row per lead + returning-visit refresh + retention (2026-10-01) ────
+
+test('aggregate reports first_visit as well as last_visit', () => {
+  const sql = buildAggregateSql({ visitorId: 'v', contactId: 'C', maxEventId: 1, recencyDays: 7 });
+  assert.match(sql, /min\(created_at\) from ev\) as first_visit/);
+  assert.match(sql, /max\(created_at\) from ev\) as last_visit/);
+});
+
+const AGG = {
+  visitor_ids: ['b292', "v'2"], pageviews: '64', sessions: 4,
+  first_visit: '2026-09-16T22:00:00Z', last_visit: '2026-10-01T14:59:18Z',
+  first_touch_source: null, page_counts: { '/': 14, "/o'brien": 1 },
+};
+
+test('summary upsert: one row per contact, keyed on contact_id, values escaped', () => {
+  const sql = buildSummaryUpsertSql({ contactId: 'BazzY5Ihu2heR4osVlBF', agg: AGG, score: 100, topPages: ['/', '/about/'] });
+  assert.match(sql, /insert into public\.site_lead_summary/);
+  assert.match(sql, /on conflict \(contact_id\) do update/);
+  assert.match(sql, /array\['b292','v''2'\]::text\[\]/);
+  assert.match(sql, /, 64, 4,/);
+  assert.match(sql, /'2026-09-16T22:00:00\.000Z'::timestamptz/);
+  assert.match(sql, /"\/o''brien":1/);           // jsonb text escaped
+  assert.match(sql, /array\['\/','\/about\/'\]::text\[\]/);
+});
+
+test('summary upsert: an unknown first touch keeps the stored one', () => {
+  const sql = buildSummaryUpsertSql({ contactId: 'C', agg: AGG, score: 1, topPages: [] });
+  assert.match(sql, /,\s*null, 1,/);             // first_touch_source sent as null
+  assert.match(sql, /first_touch_source = coalesce\(excluded\.first_touch_source, public\.site_lead_summary\.first_touch_source\)/);
+  assert.match(sql, /'\{\}'::text\[\]/);           // empty top pages
+});
+
+test('summary upsert: junk numbers and dates become 0 / null, never broken SQL', () => {
+  const sql = buildSummaryUpsertSql({ contactId: 'C', agg: { pageviews: 'x', first_visit: 'not a date' }, score: NaN, topPages: null });
+  assert.match(sql, /'\{\}'::text\[\], 0, 0,\s*null, null, null, 0,/);
+});
+
+test('refresh candidates: backfill rows with no summary AND newer page views, capped', () => {
+  const sql = buildRefreshCandidatesSql(50);
+  assert.match(sql, /left join public\.site_lead_summary s on s\.contact_id = m\.contact_id/);
+  assert.match(sql, /where s\.contact_id is null/);
+  assert.match(sql, /e\.created_at > coalesce\(s\.last_visit, '-infinity'::timestamptz\)/);
+  assert.match(sql, /distinct on \(m\.contact_id\)/);
+  assert.match(sql, /limit 50$/);
+  assert.match(buildRefreshCandidatesSql(99999), /limit 500$/);
+  assert.match(buildRefreshCandidatesSql('nope'), /limit 50$/);
+});
+
+const HIGH = { threshold: 50, highPaths: ['/pricing', '/estimate', '/financing'] };
+
+test('refresh note: never for a backfill (no previous row)', () => {
+  assert.equal(refreshNoteReason({ has_summary: false }, { score: 100, page_counts: { '/estimate': 3 } }, HIGH), null);
+  assert.equal(refreshNoteReason(null, { score: 100 }, HIGH), null);
+});
+
+test('refresh note: crossing the high-intent line is noted', () => {
+  assert.equal(refreshNoteReason({ has_summary: true, prev_score: 40, prev_page_counts: { '/': 2 } },
+    { score: 55, page_counts: { '/': 3 } }, HIGH), 'crossed_high_intent');
+});
+
+test('refresh note: a first visit to a high-intent page is noted', () => {
+  assert.equal(refreshNoteReason({ has_summary: true, prev_score: 100, prev_page_counts: { '/': 9 } },
+    { score: 100, page_counts: { '/': 9, '/financing/': 1 } }, HIGH), 'new_high_intent_page');
+});
+
+test('refresh note: a 20-point jump is noted; a quiet extra page view is not', () => {
+  const prev = { has_summary: true, prev_score: 60, prev_page_counts: { '/': 2, '/estimate': 1 } };
+  assert.equal(refreshNoteReason(prev, { score: 80, page_counts: { '/': 9, '/estimate': 1 } }, HIGH), 'score_jump');
+  assert.equal(refreshNoteReason(prev, { score: 66, page_counts: { '/': 4, '/estimate': 2 } }, HIGH), null);
+});
+
+test('retention SQL: anonymous only, never identify rows, batched, refuses < 30 days', () => {
+  const { count, delete: del } = buildRetentionDeleteSql(180, 5000);
+  for (const sql of [count, del]) {
+    assert.match(sql, /e\.event_type <> 'identify'/);
+    assert.match(sql, /interval '180 days'/);
+    assert.match(sql, /not exists \(select 1 from public\.visitor_identity_map m where m\.visitor_id = e\.visitor_id\)/);
+    assert.match(sql, /limit 5000/);
+  }
+  assert.match(del, /^delete from public\.site_events where id in \(/);
+  assert.throws(() => buildRetentionDeleteSql(7, 5000), /minimum 30/);
+  assert.throws(() => buildRetentionDeleteSql('x', 5000), /minimum 30/);
+});
+
+test('retentionDays: 180 by default, 0 (off) for 0/garbage, else the number', () => {
+  assert.equal(retentionDays({}), 180);
+  assert.equal(retentionDays({ SITE_EVENTS_RETENTION_DAYS: '' }), 180);
+  assert.equal(retentionDays({ SITE_EVENTS_RETENTION_DAYS: '0' }), 0);
+  assert.equal(retentionDays({ SITE_EVENTS_RETENTION_DAYS: 'off' }), 0);
+  assert.equal(retentionDays({ SITE_EVENTS_RETENTION_DAYS: '365' }), 365);
+});
+
+test('retention run: deletes batch by batch until nothing is left, and reports the total', async () => {
+  const pending = [5000, 5000, 1234];
+  const calls = [];
+  const deps = { runSQL: async (sql) => {
+    calls.push(sql.startsWith('delete') ? 'delete' : 'count');
+    if (sql.startsWith('select')) return [{ n: pending[0] ?? 0 }];
+    pending.shift(); return { status: 'ok' };
+  } };
+  const out = await runSiteEventsRetention({ days: 180, deps });
+  assert.deepEqual(out, { ok: true, days: 180, deleted: 11234, batches: 3, more_remaining: false });
+  assert.deepEqual(calls, ['count', 'delete', 'count', 'delete', 'count', 'delete']);
+});
+
+test('retention run: nothing old enough means no delete at all; disabled does nothing', async () => {
+  const calls = [];
+  const deps = { runSQL: async (sql) => { calls.push(sql.slice(0, 6)); return [{ n: 0 }]; } };
+  assert.equal((await runSiteEventsRetention({ days: 180, deps })).deleted, 0);
+  assert.deepEqual(calls, ['select']);
+  const off = await runSiteEventsRetention({ days: 0, deps });
+  assert.equal(off.skipped, true);
+  assert.equal(calls.length, 1);
 });
