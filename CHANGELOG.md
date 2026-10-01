@@ -5,6 +5,18 @@ Notable behavioral changes to the LP MCP server. Newest first.
 Rule-layer (`agent_rules`) changes ship through the database, not through this
 repo — they are recorded in `sql/seeds/` on the date they were applied live.
 
+## 2026-10-01
+
+- **Blocked leads that come back now ask for a DNC lift on their own.** A new
+  job, `dnc-reentry-sweep`, checks every new LP lead once (every vendor, not
+  just ActiveProspect) and posts the Approve / Keep Blocked card in
+  #dnc-lift-approval when the number is blocked. Nobody needs to add the
+  `dnc-lift:request` tag. "Blocked" now includes Five9's DNC list: most
+  returning leads were blocked only there, so the old check called them "not
+  blocked" and no card ever posted. A lead that opted out after it arrived
+  (its own DNC disposition, a STOP, or an agent's Five9 "Do Not Call") never
+  gets a card. `DNC_REENTRY_SWEEP_MODE` = off | shadow | live (default live).
+
 ## 2026-09-29
 
 - **Calls + texts opt-outs mark Lead Perfection "Do Not Call".** LP keeps one

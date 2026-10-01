@@ -134,9 +134,19 @@ transaction. `CONSENT_MODEL_MODE` is `shadow`: nothing gates a send on these tab
   `suppress:dnc-voice` so an automatic opt-out is not run twice, and all three on `has_tag` of their
   own tag (read live): a stale GHL webhook snapshot reports a tag "added" right after a lift removed
   it, and on 2026-09-30 that re-blocked a customer with a confirmed appointment.
-- **ActiveProspect re-entries reach review only through `POST /webhook/ap/dnc-reentry`**, which
-  n8n I.AP calls on its "link" branch (the lead's phone matched an existing contact). E.0's
-  `reentry` event covers first-party consent only. The endpoint asks; it never lifts.
+- **A new lead for a blocked number asks for review on its own (2026-10-01).** The
+  `dnc-reentry-sweep` job (`src/jobs/dnc-reentry-sweep.js`, rules in `src/consent/dnc-reentry.js`)
+  checks every new LP lead ONCE, whatever the vendor, and queues `request_dnc_lift_review`
+  (`DNC_REENTRY_SWEEP`) when the number is blocked. Nobody adds `dnc-lift:request` by hand.
+  **"Blocked" includes Five9's DNC list** — in one week 68 of 73 blocked returning leads had no
+  DNC tag and no consent row (their block predates the consent model), so a tag/consent-only check
+  called them all "not blocked" and no card ever posted. The review handler counts consent and
+  Five9 too. **Never ask to lift a fresh opt-out:** a lead whose own disposition is DNC, or that
+  saw a consent opt-out or a Five9 "Do Not Call"/"DNC" disposition after it arrived, is settled
+  without a card (agents' Five9 dispositions write nothing to our consent tables). LP times are
+  Eastern wall clock — compare `arrived_at`, not raw `created_at_lp`. `DNC_REENTRY_SWEEP_MODE`
+  off|shadow|live, default live (it only asks). `POST /webhook/ap/dnc-reentry` (n8n I.AP's
+  "link" branch) and E.0's `reentry` event still ask too; the endpoint asks, it never lifts.
 
 **GHL webhooks do not retry, and a lost one leaves no trace here (2026-09-28).** Four canvass leads
 never reached LP on 2026-09-24: GHL's step logged "Response timed out … 60 seconds", yet Railway's
