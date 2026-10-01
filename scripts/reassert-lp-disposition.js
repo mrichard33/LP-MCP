@@ -77,7 +77,7 @@ async function loadLeads(deps) {
   const byContact = new Map();
   for (let from = 0; ; from += PAGE) {
     const { data, error } = await deps.supabase.from('lp_leads')
-      .select('ghl_contact_id, lp_lead_id, disposition_code, created_at_lp, updated_at_lp, lp_deleted_at')
+      .select('ghl_contact_id, lp_lead_id, disposition_code, appointment_date, created_at_lp, updated_at_lp, lp_deleted_at')
       .not('ghl_contact_id', 'is', null)
       .order('id', { ascending: true })
       .range(from, from + PAGE - 1);
