@@ -328,6 +328,8 @@ import { logFfmpegStatus } from './ci/recordings.js';
 import { registerHoldCompleteRoutes } from './agentic/hold-complete.js';
 // 2026-09-26 — website live chat answered synchronously (src/live-chat/).
 import { registerLiveChatRoutes } from './live-chat/index.js';
+// 2026-10-01 — answers a live chat message GHL never sent us (a contact merge drops the webhook).
+import { startLiveChatMissedReplyScheduler } from './jobs/live-chat-missed-reply-sweep.js';
 // ─── FB Publish Watchdog (alert on missed WF4 publish window) ────
 import { startFbPublishWatchdog } from './fb-publish-watchdog.js';
 // ─── Five9 ESS Silence Watchdog (alert on a quiet Five9 feed) ────
@@ -930,6 +932,7 @@ const server = app.listen(PORT, async () => {
   startLeadLeakScheduler();
   startLeadUncalledScheduler();
   startChatLeadIntakeScheduler();
+  startLiveChatMissedReplyScheduler();
   startCanvassBackstopScheduler();
   startInboundCaptureScheduler();
   startPayrollEngineScheduler();

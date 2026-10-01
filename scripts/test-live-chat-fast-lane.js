@@ -39,7 +39,7 @@ function makeReq(body, secret = SECRET) {
 function makeLane({
   mode = 'live', tags = [], llm = () => ({ message: 'Sure. What made you start looking at this now?' }),
   llmDelayMs = 5, hardTimeoutMs = 2000, contextCapMs = 300, buildContext = null, messages = [],
-  insertAction = null, now = null, checkServiceArea = null, lookupPlace = null, findConversation = null, phone = null,
+  insertAction = null, now = null, checkServiceArea = null, lookupPlace = null, findConversation = null, phone = null, firstName = 'Alyce',
 } = {}) {
   const state = { sends: [], actions: [], updates: [], events: [], ops: [], claimed: new Set(), llmCalls: [], captured: [], fingerprints: [], slots: [], lookups: [], places: [], fetchedConversations: [], lookedUp: [] };
   let nextId = 1000;
@@ -51,7 +51,7 @@ function makeLane({
     contextCapMs: () => contextCapMs,
     log: () => {},
     warn: () => {},
-    fetchContact: async () => ({ id: 'C1', firstName: 'Alyce', tags, phone, email: null }),
+    fetchContact: async () => ({ id: 'C1', firstName, tags, phone, email: null }),
     fetchMessages: async (convId) => { state.fetchedConversations.push(convId); return messages; },
     findConversation: async (cid) => { state.lookedUp.push(cid); return findConversation ? findConversation(cid) : null; },
     buildContext: buildContext || (async () => { throw new Error('no lead context in tests'); }),
@@ -516,4 +516,78 @@ test('live sends carry the action id and the visitor message for the I.LVO webho
   assert.equal(state.sends[0].actionId, out.action_id);
   assert.equal(state.sends[0].inboundMessage, 'Who does the install?');
   assert.equal(state.updates.find(u => u.status === 'completed').execution_result.send_method, 'ghl_webhook');
+});
+
+// ── 2026-10-01 live chat "Guest Visitor ljloa": price → visit, name + phone ──
+// The first chat after go-live asked for a price three times and got "why
+// now?" twice, a dead end, and a call promise with no name asked.
+
+const T = (direction, body, sec) => ({ direction, body, dateAdded: new Date(Date.parse('2026-10-01T20:01:00Z') + sec * 1000).toISOString() });
+const LJLOA = [
+  T('inbound', 'Hi there! Do you service my area?', 0),
+  T('outbound', "Happy to check that for you. What's your zip code?", 10),
+  T('inbound', '27101', 60),
+  T('outbound', 'Yes, we serve Winston-Salem (27101). What got you looking at windows right now?', 90),
+  T('inbound', 'My windows are really old. Can you give me a price on 12 new windows?', 130),
+];
+
+test('ljloa: a first price ask tells the model to bridge to the visit and ask name + phone', async () => {
+  const { lane, state } = makeLane({ firstName: 'Guest Visitor ljloa', messages: LJLOA, llm: () => ({ message: "Exact pricing comes from a free in-home measurement, and you keep written pricing good for a year. A team member will call to set a time that works. What's your first name and the best number to reach you?" }) });
+  const out = await lane.processInbound(INBOUND('My windows are really old. Can you give me a price on 12 new windows?'));
+  assert.equal(out.outcome, 'sent');
+  assert.match(state.llmCalls[0].user, /PRICE REQUEST/);
+  assert.match(state.llmCalls[0].user, /What's your first name and the best number to reach you\?/);
+  assert.equal(state.llmCalls.length, 1, 'a compliant draft needs no regeneration');
+});
+
+test('ljloa: a call promise with no name or phone is never sent as is', async () => {
+  const { lane, state } = makeLane({ firstName: 'Guest Visitor ljloa', messages: LJLOA, llm: () => ({ message: 'Got it. A team member will call you shortly to go over the details.' }) });
+  await lane.processInbound(INBOUND('ok sounds good'));
+  assert.equal(state.llmCalls.length, 2, 'one regeneration was asked for');
+  assert.match(state.llmCalls[1].user, /first name and phone number/);
+  assert.match(state.sends[0].message, /What's your first name and the best number to reach you\?$/);
+});
+
+test('ljloa: the second price ask gets the fixed Transition with no model call', async () => {
+  const thread = [...LJLOA,
+    T('outbound', 'Pricing depends on the size, type of glass, and where each window is. What made you decide to replace them now?', 140),
+    T('inbound', 'I just want to get a price. They look old and they do not look good.', 230),
+  ];
+  const { lane, state } = makeLane({ firstName: 'Guest Visitor ljloa', messages: thread });
+  const out = await lane.processInbound(INBOUND('I just want to get a price. They look old and they do not look good.'));
+  assert.equal(out.outcome, 'sent');
+  assert.equal(state.llmCalls.length, 0);
+  assert.match(state.sends[0].message, /^Understood, you want a real number\./);
+  assert.match(state.sends[0].message, /free in-home measurement/);
+  assert.match(state.sends[0].message, /What's your first name and the best number to reach you\?$/);
+  assert.doesNotMatch(state.sends[0].message, /\$\d/, 'never a price');
+  const done = state.updates.find(u => u.execution_result);
+  assert.deepEqual(done.execution_result.price_turn, { asks: 2, insist: true, deterministic: true });
+});
+
+test('ljloa: "I just told you they are old" never gets the why-now question again', async () => {
+  const thread = [...LJLOA,
+    T('outbound', 'Pricing depends on the size. What made you decide to replace them now?', 140),
+    T('inbound', 'I just told you they are old.', 180),
+  ];
+  const { lane, state } = makeLane({ firstName: 'Guest Visitor ljloa', messages: thread, llm: () => ({ message: 'Got it—old windows. What prompted you to look at replacing them now?' }) });
+  await lane.processInbound(INBOUND('I just told you they are old.'));
+  assert.match(state.llmCalls[0].user, /VISITOR SAYS THEY ALREADY ANSWERED/);
+  assert.doesNotMatch(state.sends[0].message, /now\?/);
+  assert.match(state.sends[0].message, /free in-home measurement/);
+  assert.match(state.sends[0].message, /\?$/);
+});
+
+test('a known name and phone: the call promise goes out with no extra ask', async () => {
+  const { lane, state } = makeLane({ firstName: 'Mark', phone: '+19543792151', messages: LJLOA, llm: () => ({ message: 'Thanks for confirming the number. A team member will call you shortly to set up the in-home measurement.' }) });
+  await lane.processInbound(INBOUND('Hello?'));
+  assert.equal(state.llmCalls.length, 1);
+  assert.equal(state.sends[0].message, 'Thanks for confirming the number. A team member will call you shortly to set up the in-home measurement.');
+});
+
+test('a phone typed in this message counts; only the name is asked', async () => {
+  const { lane, state } = makeLane({ firstName: 'Guest Visitor ljloa', messages: LJLOA, llm: () => ({ message: 'Thanks. A team member will call you to set up a time that works.' }) });
+  await lane.processInbound(INBOUND('9543792151'));
+  assert.match(state.sends[0].message, /what is your first name/i);
+  assert.doesNotMatch(state.sends[0].message, /phone number/);
 });

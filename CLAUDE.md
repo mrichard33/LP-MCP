@@ -142,8 +142,10 @@ transaction. `CONSENT_MODEL_MODE` is `shadow`: nothing gates a send on these tab
 never reached LP on 2026-09-24: GHL's step logged "Response timed out … 60 seconds", yet Railway's
 edge, `intake_journal` and our logs have no record of the calls. A GHL→LP-MCP intake therefore needs a
 sweep that looks from the GHL side (the HL mirror) for contacts that should have arrived and did not.
-Precedents: `src/jobs/canvass-lead-backstop.js` (re-drives through the webhook's own pipeline) and
-`src/jobs/chat-lead-intake-sweep.js`. Keep any I/O before a webhook's response capped — the
+Precedents: `src/jobs/canvass-lead-backstop.js` (re-drives through the webhook's own pipeline),
+`src/jobs/chat-lead-intake-sweep.js` and `src/jobs/live-chat-missed-reply-sweep.js` (2026-10-01: a visitor
+who types a phone number that already has a contact is MERGED by GHL, and that message's I.LVI webhook
+never fires). Keep any I/O before a webhook's response capped — the
 `findRecentCanvassMark` pre-check is held to 3s for that reason.
 
 ## Alerting
