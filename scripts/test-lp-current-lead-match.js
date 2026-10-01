@@ -9,7 +9,7 @@ process.env.SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY ||
 process.env.GHL_API_KEY = process.env.GHL_API_KEY || 'test-ghl-key';
 
 const { evaluateCurrentLeadMatch, _internal } = await import('../src/decision-engine.js');
-const { flagF0Contact, formatF0AuditReport } = await import('../src/jobs/f0-integrity-audit.js');
+const { flagF0Contact, formatF0AuditReport, isMissingFromF0, runF0IntegrityAudit } = await import('../src/jobs/f0-integrity-audit.js');
 const evaluateContextConditions = _internal?.evaluateContextConditions
   || (await import('../src/decision-engine.js')).evaluateContextConditions;
 
@@ -56,6 +56,25 @@ test('max_days uses the stored ET frame: 14d minus 2h in ET is still inside the 
   // 13.9 days ago in true time. Read naively as UTC it would look 4h older.
   const l = { ...lead('OPPFDN'), appointment_date: daysAgo(13.9) };
   assert.equal(evaluateCurrentLeadMatch(l, ENTER, evt(), NOW).pass, true);
+});
+
+// 2026-10-01 — S5.2 cancel entry: the cancelled appointment is usually still
+// upcoming, so future passes; an April cancel re-synced in September fails.
+const CANCEL = { disposition_in: ['CXL', 'CCC'], appointment_within_days: 14, allow_synthetic: false };
+
+test('appointment_within_days: upcoming and recent pass; old and missing fail', () => {
+  assert.equal(evaluateCurrentLeadMatch(lead('CXL', -3), CANCEL, evt(), NOW).pass, true);
+  assert.equal(evaluateCurrentLeadMatch(lead('CXL', 0), CANCEL, evt(), NOW).pass, true);
+  assert.equal(evaluateCurrentLeadMatch(lead('CCC', 13), CANCEL, evt(), NOW).pass, true);
+  assert.equal(evaluateCurrentLeadMatch(lead('CXL', 15), CANCEL, evt(), NOW).pass, false);
+  assert.equal(evaluateCurrentLeadMatch(lead('CXL', null), CANCEL, evt(), NOW).pass, false);
+});
+
+test('appointment_within_days (Sharyn Blake): an April CXL first synced on 9/30 does not route', () => {
+  const april = { ...lead('CXL'), lp_lead_id: '524525', appointment_date: '2026-04-16T14:00:00+00:00' };
+  const v = evaluateCurrentLeadMatch(april, CANCEL, evt(), NOW);
+  assert.equal(v.pass, false);
+  assert.match(v.reason, /days ago/);
 });
 
 test('allow_synthetic:false fails an inbound-backfill replay', () => {
@@ -130,7 +149,7 @@ test('audit: flags no leads, non-OPPFDN (Sale included) and no real demo; passes
 });
 
 test('audit report: clean run still says so; failure says it could not run', () => {
-  assert.match(formatF0AuditReport({ total: 390, flagged: [] }), /0 of 390 .* clean/);
+  assert.match(formatF0AuditReport({ total: 390, flagged: [] }), /0 of 390 .*0 demos missing — clean/);
   assert.match(formatF0AuditReport({ total: 0, flagged: [], error: 'boom' }), /could not run: boom/);
   const many = Array.from({ length: 30 }, (_, i) => ({ contact_id: `c${i}`, disposition: 'NOC', reason: 'x' }));
   const text = formatF0AuditReport({ total: 400, flagged: many });
@@ -141,4 +160,93 @@ test('audit report: clean run still says so; failure says it could not run', () 
 test('allow_synthetic:false also catches a stringified "true"', () => {
   assert.equal(evaluateCurrentLeadMatch(lead('OPPFDN'), ENTER, evt({ synthetic: 'true' }), NOW).pass, false);
   assert.equal(evaluateCurrentLeadMatch(lead('OPPFDN'), ENTER, evt({ synthetic: false }), NOW).pass, true);
+});
+
+// 2026-10-01 — the audit's other direction: demoed recently, not in F.0.
+test('missing: recent OPPFDN demo without active-f.0 is missing; in F.0, excluded, old or unread is not', () => {
+  const demo = [lead('OPPFDN', 1)];
+  assert.equal(isMissingFromF0(demo, ['lp-demo-completed'], NOW), true);
+  assert.equal(isMissingFromF0(demo, ['active-f.0'], NOW), false);
+  assert.equal(isMissingFromF0(demo, ['Customer'], NOW), false);
+  assert.equal(isMissingFromF0(demo, undefined, NOW), false, 'not in the HL cache is not missing');
+  assert.equal(isMissingFromF0([lead('OPPFDN', 20)], [], NOW), false);
+  assert.equal(isMissingFromF0([lead('OPPFDN', -1)], [], NOW), false);
+  assert.equal(isMissingFromF0([lead('Sale', 1)], [], NOW), false);
+});
+
+test('missing (Sharyn Blake): a blank Data lead on top of the demo lead does not hide it', () => {
+  const demoLead = { ...lead('OPPFDN', 1), lp_lead_id: '579801', created_at_lp: '2026-09-28T10:10:40Z' };
+  const data = { lp_lead_id: '579804', disposition_code: 'Data', appointment_date: null, created_at_lp: '2026-09-28T10:14:53Z' };
+  assert.equal(isMissingFromF0([demoLead, data], [], NOW), true);
+});
+
+test('missing report: lists the demos that never reached F.0', () => {
+  const text = formatF0AuditReport({ total: 390, flagged: [], missing: [{ contact_id: 'c9', lp_lead_id: 'L9' }] });
+  assert.match(text, /NOT in F\.0: 1/);
+  assert.match(text, /c9 · lead L9/);
+});
+
+function fakeSupabase(rows) {
+  return {
+    from() {
+      const filters = [];
+      const q = {
+        select() { return q; },
+        eq(k, v) { filters.push((r) => r[k] === v); return q; },
+        gte(k, v) { filters.push((r) => r[k] && r[k] >= v); return q; },
+        in(k, vs) { filters.push((r) => vs.includes(r[k])); return q; },
+        not(k) { filters.push((r) => r[k] != null); return q; },
+        is() { return q; },
+        limit() { return q; },
+        then(res) { return Promise.resolve({ data: rows.filter((r) => filters.every((f) => f(r))), error: null }).then(res); },
+      };
+      return q;
+    },
+  };
+}
+
+test('runF0IntegrityAudit: reports a demo that is missing from F.0 and posts nothing when post=false', async () => {
+  const rows = [
+    { ghl_contact_id: 'in-f0', ...lead('OPPFDN', 2) },
+    { ghl_contact_id: 'missed', ...lead('OPPFDN', 1), lp_lead_id: 'L-missed' },
+  ];
+  const hl = { 'in-f0': ['active-f.0'], missed: ['lp-demo-completed'] };
+  const deps = {
+    supabase: fakeSupabase(rows),
+    nowMs: NOW,
+    hlRunSQL: async (sql) => (/unnest\(tags\)/.test(sql)
+      ? [{ ghl_contact_id: 'in-f0' }]
+      : Object.entries(hl).filter(([id]) => sql.includes(`'${id}'`)).map(([id, tags]) => ({ ghl_contact_id: id, tags }))),
+    sendAlertMessage: async () => { throw new Error('must not post'); },
+  };
+  const r = await runF0IntegrityAudit({ post: false, deps });
+  assert.equal(r.ok, true);
+  assert.deepEqual(r.flagged, []);
+  assert.deepEqual(r.missing, [{ contact_id: 'missed', lp_lead_id: 'L-missed' }]);
+  assert.match(r.text, /NOT in F\.0: 1/);
+});
+
+// 2026-10-01 — lp_disposition_in judges the CURRENT lead, not the last-synced one.
+test('lp_disposition_in (Sharyn Blake): an old CXL lead synced last does not route when a newer lead is live', async () => {
+  const rows = [
+    { ghl_contact_id: 'c-sb', lp_lead_id: '524525', disposition_code: 'CXL', appointment_date: '2026-04-16T14:00:00+00:00',
+      created_at_lp: '2026-04-07T13:45:10Z', updated_at_lp: '2026-04-15T19:58:50Z' },
+    { ghl_contact_id: 'c-sb', lp_lead_id: '579801', disposition_code: 'Cnf', appointment_date: '2026-10-01T14:00:00+00:00',
+      created_at_lp: '2026-09-30T10:10:40Z', updated_at_lp: '2026-09-30T10:20:00Z' },
+  ];
+  const ev = { id: 1, ghl_contact_id: 'c-sb', event_type: 'lp.disposition_changed', payload: {} };
+  const deps = { supabase: fakeSupabase(rows) };
+  assert.equal(await evaluateContextConditions({ lp_disposition_in: ['CXL', 'CCC'] }, {}, ev, { ruleKey: 'T', deps }), false);
+  assert.equal(await evaluateContextConditions({ lp_disposition_in: ['Cnf'] }, {}, ev, { ruleKey: 'T', deps }), true);
+});
+
+test('S5.2 cancel gate: an April CXL that is the only lead still fails appointment_within_days', async () => {
+  const rows = [{ ghl_contact_id: 'c-old', lp_lead_id: '524525', disposition_code: 'CXL',
+    appointment_date: '2026-04-16T14:00:00+00:00', created_at_lp: '2026-04-07T13:45:10Z' }];
+  const ev = { id: 2, ghl_contact_id: 'c-old', event_type: 'lp.disposition_changed', payload: {} };
+  const deps = { supabase: fakeSupabase(rows), nowMs: NOW };
+  const cond = { lp_disposition_in: ['CXL', 'CCC'], lp_current_lead_match: { appointment_within_days: 14 } };
+  assert.equal(await evaluateContextConditions(cond, {}, ev, { ruleKey: 'T', deps }), false);
+  const fresh = [{ ...rows[0], appointment_date: daysAgo(-2) }];
+  assert.equal(await evaluateContextConditions(cond, {}, ev, { ruleKey: 'T', deps: { supabase: fakeSupabase(fresh), nowMs: NOW } }), true);
 });
