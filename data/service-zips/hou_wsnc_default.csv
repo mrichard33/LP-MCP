@@ -1,0 +1,251 @@
+zip,city,county,market_code
+27006,Advance,Davie,WSNC
+27009,Belews Creek,Forsyth,WSNC
+27011,Boonville,Yadkin,WSNC
+27012,Clemmons,Forsyth,WSNC
+27014,Cooleemee,Davie,WSNC
+27016,Danbury,Stokes,WSNC
+27018,East Bend,Yadkin,WSNC
+27019,Germanton,Stokes,WSNC
+27020,Hamptonville,Yadkin,WSNC
+27021,King,Stokes,WSNC
+27022,Lawsonville,Stokes,WSNC
+27023,Lewisville,Forsyth,WSNC
+27028,Mocksville,Davie,WSNC
+27040,Pfafftown,Forsyth,WSNC
+27042,Pine Hall,Stokes,WSNC
+27043,Pinnacle,Stokes,WSNC
+27045,Rural Hall,Forsyth,WSNC
+27046,Sandy Ridge,Stokes,WSNC
+27050,Tobaccoville,Forsyth,WSNC
+27051,Walkertown,Forsyth,WSNC
+27052,Walnut Cove,Stokes,WSNC
+27053,Westfield,Stokes,WSNC
+27055,Yadkinville,Yadkin,WSNC
+27101,Winston-Salem,Forsyth,WSNC
+27103,Winston-Salem,Forsyth,WSNC
+27104,Winston-Salem,Forsyth,WSNC
+27105,Winston-Salem,Forsyth,WSNC
+27106,Winston-Salem,Forsyth,WSNC
+27107,Winston-Salem,Davidson,WSNC
+27109,Winston-Salem,Forsyth,WSNC
+27110,Winston-Salem,Forsyth,WSNC
+27127,Winston-Salem,Forsyth,WSNC
+27239,Denton,Davidson,WSNC
+27284,Kernersville,Forsyth,WSNC
+27292,Lexington,Davidson,WSNC
+27295,Lexington,Davidson,WSNC
+27299,Linwood,Davidson,WSNC
+27351,Southmont,Davidson,WSNC
+27360,Thomasville,Davidson,WSNC
+27374,Welcome,Davidson,WSNC
+28642,Jonesville,Yadkin,WSNC
+77002,Houston,Harris,HOU
+77003,Houston,Harris,HOU
+77004,Houston,Harris,HOU
+77005,Houston,Harris,HOU
+77006,Houston,Harris,HOU
+77007,Houston,Harris,HOU
+77008,Houston,Harris,HOU
+77009,Houston,Harris,HOU
+77010,Houston,Harris,HOU
+77011,Houston,Harris,HOU
+77012,Houston,Harris,HOU
+77013,Houston,Harris,HOU
+77014,Houston,Harris,HOU
+77015,Houston,Harris,HOU
+77016,Houston,Harris,HOU
+77017,Houston,Harris,HOU
+77018,Houston,Harris,HOU
+77019,Houston,Harris,HOU
+77020,Houston,Harris,HOU
+77021,Houston,Harris,HOU
+77022,Houston,Harris,HOU
+77023,Houston,Harris,HOU
+77024,Houston,Harris,HOU
+77025,Houston,Harris,HOU
+77026,Houston,Harris,HOU
+77027,Houston,Harris,HOU
+77028,Houston,Harris,HOU
+77029,Houston,Harris,HOU
+77030,Houston,Harris,HOU
+77031,Houston,Harris,HOU
+77032,Houston,Harris,HOU
+77033,Houston,Harris,HOU
+77034,Houston,Harris,HOU
+77035,Houston,Harris,HOU
+77036,Houston,Harris,HOU
+77037,Houston,Harris,HOU
+77038,Houston,Harris,HOU
+77039,Houston,Harris,HOU
+77040,Houston,Harris,HOU
+77041,Houston,Harris,HOU
+77042,Houston,Harris,HOU
+77043,Houston,Harris,HOU
+77044,Houston,Harris,HOU
+77045,Houston,Harris,HOU
+77046,Houston,Harris,HOU
+77047,Houston,Harris,HOU
+77048,Houston,Harris,HOU
+77049,Houston,Harris,HOU
+77050,Houston,Harris,HOU
+77051,Houston,Harris,HOU
+77053,Houston,Fort Bend,HOU
+77054,Houston,Harris,HOU
+77055,Houston,Harris,HOU
+77056,Houston,Harris,HOU
+77057,Houston,Harris,HOU
+77058,Houston,Harris,HOU
+77059,Houston,Harris,HOU
+77060,Houston,Harris,HOU
+77061,Houston,Harris,HOU
+77062,Houston,Harris,HOU
+77063,Houston,Harris,HOU
+77064,Houston,Harris,HOU
+77065,Houston,Harris,HOU
+77066,Houston,Harris,HOU
+77067,Houston,Harris,HOU
+77068,Houston,Harris,HOU
+77069,Houston,Harris,HOU
+77070,Houston,Harris,HOU
+77071,Houston,Harris,HOU
+77072,Houston,Harris,HOU
+77073,Houston,Harris,HOU
+77074,Houston,Harris,HOU
+77075,Houston,Harris,HOU
+77076,Houston,Harris,HOU
+77077,Houston,Harris,HOU
+77078,Houston,Harris,HOU
+77079,Houston,Harris,HOU
+77080,Houston,Harris,HOU
+77081,Houston,Harris,HOU
+77082,Houston,Harris,HOU
+77083,Houston,Harris,HOU
+77084,Houston,Harris,HOU
+77085,Houston,Harris,HOU
+77086,Houston,Harris,HOU
+77087,Houston,Harris,HOU
+77088,Houston,Harris,HOU
+77089,Houston,Harris,HOU
+77090,Houston,Harris,HOU
+77091,Houston,Harris,HOU
+77092,Houston,Harris,HOU
+77093,Houston,Harris,HOU
+77094,Houston,Harris,HOU
+77095,Houston,Harris,HOU
+77096,Houston,Harris,HOU
+77098,Houston,Harris,HOU
+77099,Houston,Harris,HOU
+77204,Houston,Harris,HOU
+77301,Conroe,Montgomery,HOU
+77302,Conroe,Montgomery,HOU
+77303,Conroe,Montgomery,HOU
+77304,Conroe,Montgomery,HOU
+77306,Conroe,Montgomery,HOU
+77316,Montgomery,Montgomery,HOU
+77318,Willis,Montgomery,HOU
+77336,Huffman,Harris,HOU
+77338,Humble,Harris,HOU
+77339,Kingwood,Harris,HOU
+77345,Kingwood,Harris,HOU
+77346,Humble,Harris,HOU
+77354,Magnolia,Montgomery,HOU
+77355,Magnolia,Montgomery,HOU
+77356,Montgomery,Montgomery,HOU
+77357,New Caney,Montgomery,HOU
+77362,Pinehurst,Montgomery,HOU
+77365,Porter,Montgomery,HOU
+77372,Splendora,Montgomery,HOU
+77373,Spring,Harris,HOU
+77375,Tomball,Harris,HOU
+77377,Tomball,Harris,HOU
+77378,Willis,Montgomery,HOU
+77379,Spring,Harris,HOU
+77380,Spring,Montgomery,HOU
+77381,Spring,Montgomery,HOU
+77382,Spring,Montgomery,HOU
+77384,Conroe,Montgomery,HOU
+77385,Conroe,Montgomery,HOU
+77386,Spring,Montgomery,HOU
+77388,Spring,Harris,HOU
+77389,Spring,Harris,HOU
+77396,Humble,Harris,HOU
+77401,Bellaire,Harris,HOU
+77406,Richmond,Fort Bend,HOU
+77407,Richmond,Fort Bend,HOU
+77417,Beasley,Fort Bend,HOU
+77422,Brazoria,Brazoria,HOU
+77429,Cypress,Harris,HOU
+77430,Damon,Brazoria,HOU
+77431,Danciger,Brazoria,HOU
+77433,Cypress,Harris,HOU
+77441,Fulshear,Fort Bend,HOU
+77444,Guy,Fort Bend,HOU
+77447,Hockley,Harris,HOU
+77449,Katy,Harris,HOU
+77450,Katy,Harris,HOU
+77451,Kendleton,Fort Bend,HOU
+77459,Missouri City,Fort Bend,HOU
+77461,Needville,Fort Bend,HOU
+77464,Orchard,Fort Bend,HOU
+77469,Richmond,Fort Bend,HOU
+77471,Rosenberg,Fort Bend,HOU
+77476,Simonton,Fort Bend,HOU
+77477,Stafford,Fort Bend,HOU
+77478,Sugar Land,Fort Bend,HOU
+77479,Sugar Land,Fort Bend,HOU
+77480,Sweeny,Brazoria,HOU
+77481,Thompsons,Fort Bend,HOU
+77486,West Columbia,Brazoria,HOU
+77489,Missouri City,Fort Bend,HOU
+77493,Katy,Harris,HOU
+77494,Katy,Fort Bend,HOU
+77498,Sugar Land,Fort Bend,HOU
+77502,Pasadena,Harris,HOU
+77503,Pasadena,Harris,HOU
+77504,Pasadena,Harris,HOU
+77505,Pasadena,Harris,HOU
+77506,Pasadena,Harris,HOU
+77507,Pasadena,Harris,HOU
+77510,Santa Fe,Galveston,HOU
+77511,Alvin,Brazoria,HOU
+77515,Angleton,Brazoria,HOU
+77517,Santa Fe,Galveston,HOU
+77518,Bacliff,Galveston,HOU
+77520,Baytown,Harris,HOU
+77521,Baytown,Harris,HOU
+77530,Channelview,Harris,HOU
+77531,Clute,Brazoria,HOU
+77532,Crosby,Harris,HOU
+77534,Danbury,Brazoria,HOU
+77536,Deer Park,Harris,HOU
+77539,Dickinson,Galveston,HOU
+77541,Freeport,Brazoria,HOU
+77545,Fresno,Fort Bend,HOU
+77546,Friendswood,Galveston,HOU
+77547,Galena Park,Harris,HOU
+77550,Galveston,Galveston,HOU
+77551,Galveston,Galveston,HOU
+77554,Galveston,Galveston,HOU
+77555,Galveston,Galveston,HOU
+77562,Highlands,Harris,HOU
+77563,Hitchcock,Galveston,HOU
+77565,Kemah,Galveston,HOU
+77566,Lake Jackson,Brazoria,HOU
+77568,La Marque,Galveston,HOU
+77571,La Porte,Harris,HOU
+77573,League City,Galveston,HOU
+77577,Liverpool,Brazoria,HOU
+77578,Manvel,Brazoria,HOU
+77581,Pearland,Brazoria,HOU
+77583,Rosharon,Brazoria,HOU
+77584,Pearland,Brazoria,HOU
+77586,Seabrook,Harris,HOU
+77587,South Houston,Harris,HOU
+77590,Texas City,Galveston,HOU
+77591,Texas City,Galveston,HOU
+77598,Webster,Harris,HOU
+77617,Gilchrist,Galveston,HOU
+77623,High Island,Galveston,HOU
+77650,Port Bolivar,Galveston,HOU
+77873,Richards,Montgomery,HOU

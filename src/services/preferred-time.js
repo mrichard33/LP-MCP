@@ -262,7 +262,8 @@ function weekdayOfIso(iso) {
 export function extractPreferredTime(messages, opts = {}) {
   if (!Array.isArray(messages) || messages.length === 0) return null;
   const nowDate = opts.now != null ? new Date(opts.now) : new Date();
-  const today = civilTodayInTz(TZ, nowDate);
+  // 2026-10-01: "tomorrow" resolves in the contact's zone when one is passed.
+  const today = civilTodayInTz(opts.timeZone || TZ, nowDate);
 
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i] || {};

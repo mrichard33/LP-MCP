@@ -460,8 +460,8 @@ export const todayIs = (today, tomorrow) => [
 
 // Opens the date frame, naming the timezone the whole prompt works in.
 // Was response-generator.js:928.
-export const currentDateHeader = (promptTimezone) => [
-  `\n═══════ CURRENT DATE — Florida / ${promptTimezone} ═══════`,
+export const currentDateHeader = (promptTimezone, place = 'Florida') => [
+  `\n═══════ CURRENT DATE — ${place} / ${promptTimezone} ═══════`,
 ];
 
 // How an appointment date is qualified in the LP line. The past wording carries
@@ -496,8 +496,9 @@ export const appointmentPhaseLinesDateOnly = (appointmentDate) => ({
 // clock is stated alongside the date, ahead of every appointment block, and
 // framed as binding.
 // Was response-generator.js:940-944.
-export const timeNowHardRule = (timeHuman, dateHuman) => [
-  `TIME NOW: It is ${timeHuman} on ${dateHuman} (Eastern).\n` +
+// 2026-10-01: the zone name is a parameter — Houston contacts read Central.
+export const timeNowHardRule = (timeHuman, dateHuman, zoneName = 'Eastern') => [
+  `TIME NOW: It is ${timeHuman} on ${dateHuman} (${zoneName}).\n` +
   `HARD RULE: every clock time you write must be LATER than ${timeHuman}. ` +
   `Before writing any time, compare it to the current time. Never offer a callback ` +
   `window, a deadline, or a "if you haven't heard by X" that has already passed. ` +

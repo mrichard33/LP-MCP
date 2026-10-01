@@ -62,10 +62,10 @@ function quietEndMinutes() {
   return parseHHMM(process.env.QUIET_HOURS_END, 8 * 60);    // 8:00 AM ET
 }
 
-/** ET wall-clock parts + UTC offset (minutes) for an instant. */
-function etParts(date) {
+/** Wall-clock parts + UTC offset (minutes) for an instant, in `timeZone` (ET by default). */
+function etParts(date, timeZone = TZ) {
   const fmt = new Intl.DateTimeFormat('en-US', {
-    timeZone: TZ,
+    timeZone,
     year: 'numeric', month: '2-digit', day: '2-digit',
     hour: '2-digit', minute: '2-digit', hour12: false,
     timeZoneName: 'shortOffset',
@@ -92,11 +92,14 @@ function etParts(date) {
  * (e.g. 21:00 → 08:00). A degenerate config where start === end disables
  * quiet hours entirely (never quiet).
  */
-export function isInQuietHours(now = new Date()) {
+// 2026-10-01: `{ timeZone }` is the CONTACT's zone. A Houston contact's quiet
+// hours are 9 PM–8 AM Central, not Eastern — 8 AM ET is 7 AM in Houston.
+// Omitted, it is ET, exactly as before.
+export function isInQuietHours(now = new Date(), { timeZone = TZ } = {}) {
   const start = quietStartMinutes();
   const end = quietEndMinutes();
   if (start === end) return false;
-  const { minutesOfDay } = etParts(now);
+  const { minutesOfDay } = etParts(now, timeZone);
   if (start > end) {
     // wraps midnight: quiet if >= start OR < end
     return minutesOfDay >= start || minutesOfDay < end;
@@ -109,9 +112,9 @@ export function isInQuietHours(now = new Date()) {
  * QUIET_HOURS_END ET today or tomorrow, whichever is next. Only meaningful
  * when isInQuietHours(now) is true, but safe to call anytime.
  */
-export function nextSendWindowOpenAt(now = new Date()) {
+export function nextSendWindowOpenAt(now = new Date(), { timeZone = TZ } = {}) {
   const end = quietEndMinutes();
-  const { year, month, day, minutesOfDay, offsetMin } = etParts(now);
+  const { year, month, day, minutesOfDay, offsetMin } = etParts(now, timeZone);
 
   // Candidate: today at END (ET). If we're already past it, tomorrow at END.
   const dayShift = minutesOfDay < end ? 0 : 1;
@@ -122,7 +125,7 @@ export function nextSendWindowOpenAt(now = new Date()) {
   // DST edge: the offset at the TARGET instant may differ from the offset
   // now (spring-forward/fall-back night). One correction pass lands within
   // the correct hour.
-  const check = etParts(openAt);
+  const check = etParts(openAt, timeZone);
   if (check.offsetMin !== offsetMin) {
     openAt = new Date(target.getTime() - check.offsetMin * 60 * 1000);
   }

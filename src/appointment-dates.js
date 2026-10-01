@@ -51,24 +51,33 @@ export function appointmentDelta(apptDate, now = new Date()) {
   return { is_past: days_delta < 0, days_delta };
 }
 
-/** Human current date in ET, e.g. "Wednesday, June 24, 2026". */
-export function formatDateHuman(date = new Date()) {
+/**
+ * Human current date, e.g. "Wednesday, June 24, 2026". ET unless a market
+ * zone is passed (2026-10-01: Houston contacts read Central time — see
+ * src/config/market-timezones.js).
+ */
+export function formatDateHuman(date = new Date(), timeZone = TZ) {
   return new Intl.DateTimeFormat('en-US', {
-    timeZone: TZ, weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
+    timeZone, weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
   }).format(date);
 }
 
 /** ET UTC-offset in minutes (DST-correct) for an instant, e.g. -240 in July, -300 in January. */
 export function etOffsetMinutes(date = new Date()) {
+  return tzOffsetMinutes(date, TZ);
+}
+
+/** UTC offset in minutes (DST-correct) of any IANA zone at an instant. Chicago in July is -300. */
+export function tzOffsetMinutes(date = new Date(), timeZone = TZ) {
   const parts = new Intl.DateTimeFormat('en-US', {
-    timeZone: TZ, year: 'numeric', month: '2-digit', day: '2-digit',
+    timeZone, year: 'numeric', month: '2-digit', day: '2-digit',
     hour: '2-digit', minute: '2-digit', hour12: false,
     timeZoneName: 'shortOffset',
   }).formatToParts(date);
   const tzName = parts.find((p) => p.type === 'timeZoneName')?.value || '';
   // 'GMT-4' / 'GMT-04:00' → minutes east of UTC (negative for ET)
   const m = /GMT([+-])(\d{1,2})(?::(\d{2}))?/.exec(tzName);
-  if (!m) return -300;
+  if (!m) return timeZone === TZ ? -300 : 0;
   return (m[1] === '-' ? -1 : 1) * (Number(m[2]) * 60 + Number(m[3] || 0));
 }
 
@@ -111,6 +120,28 @@ export function lpWallClockToGhlStartTime(lpTimestamp) {
 }
 
 /**
+ * Wall-clock date + time in a zone → ISO 8601 with that zone's DST-correct
+ * offset at that moment. '2026-12-03', '14:00', 'America/Chicago' →
+ * '2026-12-03T14:00:00-06:00'.
+ *
+ * 2026-10-01: replaces a hard-coded '-04:00' in buildAppointmentBody, which
+ * was EDT-only (an hour off every winter) and would have booked every Houston
+ * visit an hour early. Returns null on unparseable input.
+ */
+export function wallClockToIso(isoDate, hhmm, timeZone = TZ) {
+  const dm = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(isoDate || ''));
+  const tm = /^(\d{2}):(\d{2})$/.exec(String(hhmm || ''));
+  if (!dm || !tm) return null;
+  const wallUtcMs = Date.UTC(Number(dm[1]), Number(dm[2]) - 1, Number(dm[3]), Number(tm[1]), Number(tm[2]));
+  let off = tzOffsetMinutes(new Date(wallUtcMs), timeZone);
+  const refined = tzOffsetMinutes(new Date(wallUtcMs - off * 60000), timeZone);
+  if (refined !== off) off = refined;
+  const sign = off < 0 ? '-' : '+';
+  const abs = Math.abs(off);
+  return `${dm[1]}-${dm[2]}-${dm[3]}T${tm[1]}:${tm[2]}:00${sign}${String(Math.floor(abs / 60)).padStart(2, '0')}:${String(abs % 60).padStart(2, '0')}`;
+}
+
+/**
  * Split a GHL appointment start time into the ET calendar date and ET
  * wall-clock time that GHL's own appointment webhooks carry.
  *
@@ -149,10 +180,10 @@ export function etAppointmentParts(startTime) {
   return { startDate, startTime12h };
 }
 
-/** Human wall-clock time in ET, e.g. "6:37 PM". */
-export function formatTimeHuman(date = new Date()) {
+/** Human wall-clock time, e.g. "6:37 PM". ET unless a market zone is passed. */
+export function formatTimeHuman(date = new Date(), timeZone = TZ) {
   return new Intl.DateTimeFormat('en-US', {
-    timeZone: TZ, hour: 'numeric', minute: '2-digit', hour12: true,
+    timeZone, hour: 'numeric', minute: '2-digit', hour12: true,
   }).format(date).replace(/\s+/g, ' ').trim().toUpperCase();
 }
 
@@ -174,7 +205,7 @@ export function formatTimeHuman(date = new Date()) {
  *
  * Returns null when there is no parseable appointment date at all.
  */
-export function appointmentPhase(apptDate, now = new Date()) {
+export function appointmentPhase(apptDate, now = new Date(), { timeZone = TZ } = {}) {
   if (!apptDate) return null;
 
   const iso = lpWallClockToGhlStartTime(apptDate);
@@ -208,7 +239,7 @@ export function appointmentPhase(apptDate, now = new Date()) {
     phase,
     minutes_delta,
     time_known: true,
-    appointment_time_human: formatTimeHuman(new Date(iso)),
+    appointment_time_human: formatTimeHuman(new Date(iso), timeZone),
     days_delta: appointmentDelta(apptDate, now)?.days_delta ?? null,
   };
 }

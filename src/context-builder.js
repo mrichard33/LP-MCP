@@ -98,7 +98,8 @@
  */
 
 import supabase from './supabase.js';
-import { appointmentDelta, appointmentPhase, formatDateHuman, formatTimeHuman, APPOINTMENT_TZ } from './appointment-dates.js';
+import { appointmentDelta, appointmentPhase, formatDateHuman, formatTimeHuman } from './appointment-dates.js';
+import { timezoneForZip } from './services/contact-timezone.js';
 import { stripQuotedEmail } from './email-thread.js';
 import { channelOfMessage } from './agentic/reply-sender.js';
 // v2.9: the canonical five-signal "is this person a customer" test. Reused
@@ -1008,7 +1009,7 @@ export async function buildLeadContext(ghlContactId, options = {}) {
   }
 
   const lpLeadId = lpLead?.lp_lead_id || null;
-  const [conversation, lpNotes, lpCalls, pipelineStageInfo, nurtureHistory, openObjectionState, ghlNotes, lpProspectHistory] = await Promise.all([
+  const [conversation, lpNotes, lpCalls, pipelineStageInfo, nurtureHistory, openObjectionState, ghlNotes, lpProspectHistory, market] = await Promise.all([
     (includeConversation && ghlContact) ? fetchConversation(ghlContactId, 10, degraded) : [],
     fetchLPNotes(lpLeadId),
     fetchLPCalls(lpLeadId),
@@ -1018,6 +1019,9 @@ export async function buildLeadContext(ghlContactId, options = {}) {
     fetchGHLNotes(ghlContactId, 6, degraded),
     // v2.9: whole-prospect history for customer_relationship.
     fetchLPProspectHistory(lpLead?.lp_prospect_id || cfProspectId || null),
+    // 2026-10-01: the contact's market zone (Houston → Central). Fail-soft to
+    // Eastern; see src/services/contact-timezone.js.
+    timezoneForZip(ghlContact?.postalCode || lpLead?.zip || null),
   ]);
 
   const tags = ghlContact?.tags || [];
@@ -1030,7 +1034,7 @@ export async function buildLeadContext(ghlContactId, options = {}) {
   const apptDelta = appointmentDelta(lpLead?.appointment_date, nowInstant);
   // 2026-08-29 (Myron Thorner): minute-grain phase. appointmentDelta is day
   // grain and reported "not past" 37 minutes after the appointment started.
-  const apptPhase = appointmentPhase(lpLead?.appointment_date, nowInstant);
+  const apptPhase = appointmentPhase(lpLead?.appointment_date, nowInstant, { timeZone: market.timezone });
 
   // 2026-07-06: effective appointment state. The snapshot flag is stale
   // after a cancellation (never reset by any cancel path), so treat the
@@ -1055,13 +1059,16 @@ export async function buildLeadContext(ghlContactId, options = {}) {
   const context = {
     now: {
       iso: nowInstant.toISOString(),
-      date_human: formatDateHuman(nowInstant),
+      date_human: formatDateHuman(nowInstant, market.timezone),
       // 2026-08-29: the current WALL CLOCK, not just the date. Without this
       // the prompt could reason about days but never about hours, and the
       // responder offered callback windows that had already passed.
-      time_human: formatTimeHuman(nowInstant),
-      tz: APPOINTMENT_TZ,
+      time_human: formatTimeHuman(nowInstant, market.timezone),
+      tz: market.timezone,
+      tz_label: market.label,
     },
+    // 2026-10-01: { timezone, label, market_code } from the contact's zip.
+    market,
     lead: {
       ghl_contact_id: ghlContactId,
       name: ghlContact?.name || lpName || 'Unknown',

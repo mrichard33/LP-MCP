@@ -80,10 +80,26 @@ import { matchSuppressionTags } from '../services/suppression-check.js';
 import { buildMessageKey } from '../services/consumed-messages.js';
 import { isDNCSignal } from '../behavioral-emitter.js';
 import { resolveTimeout } from '../llm-client.js';
+import {
+  planServiceAreaTurn,
+  resolveCoverage,
+  guardCoverageDraft,
+  serviceAreaRecord,
+} from '../agentic/service-area-turn.js';
+import { formatDateHuman, formatTimeHuman } from '../appointment-dates.js';
+import { marketTimezone, tzLabel } from '../config/market-timezones.js';
 
 export const LIVE_CHAT_RULE = 'LIVE_CHAT_FAST_LANE';
 export const LIVE_CHAT_FALLBACK_MESSAGE = 'Thanks. Let me grab the right person for that, one moment.';
 export const LIVE_CHAT_MODES = Object.freeze(['off', 'shadow', 'live']);
+/**
+ * The coverage lookup's own cap (Mark's ruling 4, 2026-10-01). It runs beside
+ * classification and the KB pack, so a healthy lookup adds nothing; a hung
+ * one costs at most this and the reply says a team member will confirm.
+ */
+export const SERVICE_AREA_LOOKUP_MS = 800;
+/** One "rows not saving" alert per process per hour at most. */
+export const ROW_ALERT_INTERVAL_MS = 60 * 60 * 1000;
 
 /** Read the mode from env. Anything unrecognised is `off` — the safe value. */
 export function liveChatMode(env = process.env) {
@@ -186,7 +202,8 @@ You are answering in the website chat, live, with the visitor watching the scree
 - If what they typed looks like an email but is not a valid one (no @, or nothing after the @), say so kindly and ask for it again: "That doesn't look quite right — could you check the email address?" Never say you do not have enough information. Never dead-end.
 - Never promise to send anything unless an email is on file. No email → ask for the email instead.
 - A large job (eight or more openings, commercial, church, HOA, property manager, a building) → answer, offer the next step, and a person will follow up; say that plainly.
-- Everything else in this prompt still binds: the discovery discipline, the decision-maker rules, no insurance predictions, no exclamation marks.`;
+- Everything else in this prompt still binds: the discovery discipline, the decision-maker rules, no insurance predictions, no exclamation marks.
+- A SERVICE AREA instruction in this prompt outranks the collection order above for this reply: when it says ask only for the zip, or stop, do exactly that.`;
 
 export const LIVE_CHAT_OUTPUT_CONTRACT = `
 ADDITIONAL OUTPUT (live chat): alongside the fields above, include a top-level "live_chat" object:
@@ -357,6 +374,9 @@ export function createLiveChatFastLane(deps) {
     fingerprint: () => {},
     markSent: () => {},
     captureIdentity: async () => null,
+    checkServiceArea: async () => ({ checked: false }),
+    lookupPlace: async () => ({ checked: false }),
+    zoneForZip: async () => null,
     acquireSlot: async () => ({ acquired: true, holder_token: null, reason: 'no_lock_dep' }),
     commitSend: async () => {},
     releaseSlot: async () => {},
@@ -424,10 +444,13 @@ export function createLiveChatFastLane(deps) {
       rule_applied: LIVE_CHAT_RULE,
       status: 'executing',
       reasoning: 'Live chat fast lane: synchronous agentic reply to a website chat message',
-      action_payload: { channel: 'livechat', trigger_message: body.slice(0, 1000), message_id: messageKey, conversation_id: conversationId, mode },
-      idempotency_key: `livechat_${messageKey}`,
+      // idempotency_key lives in the payload, NOT as a column: agent_actions
+      // has no such column in production (see agent-actions-columns.js), and
+      // naming it dropped every live chat row until 2026-10-01.
+      action_payload: { channel: 'livechat', trigger_message: body.slice(0, 1000), message_id: messageKey, conversation_id: conversationId, mode, idempotency_key: `livechat_${messageKey}` },
     });
     const actionId = action?.id ?? null;
+    if (actionId == null) rowNotSaved(contactId, action?.error);
     timing.t2_action_created = new Date(tAction).toISOString();
     timing.t3_action_claimed = timing.t2_action_created;
 
@@ -467,6 +490,22 @@ export function createLiveChatFastLane(deps) {
     return { ...outcome, mode, action_id: actionId };
   }
 
+  // A row that does not save is invisible: no draft, no timing, nothing in Bot
+  // Review, and the reply still goes out (live) so nobody notices. 21 replies
+  // were lost that way before anyone read the logs. Say it in #ops-alerts, at
+  // most once an hour per process so a broken insert does not page per chat.
+  let lastRowAlertAt = null;
+  function rowNotSaved(contactId, error) {
+    const reason = String(error || 'insert returned no id').slice(0, 300);
+    d.warn(`[LiveChat] no agent_actions row for ${contactId}: ${reason}`);
+    const now = d.now();
+    if (lastRowAlertAt !== null && now - lastRowAlertAt < ROW_ALERT_INTERVAL_MS) return;
+    lastRowAlertAt = now;
+    Promise.resolve()
+      .then(() => d.opsAlert(`🚨 live chat rows not saving: ${reason}\nLast contact: ${contactId}\n→ Replies are going out (or drafting, in shadow) with no agent_actions row, so nothing reaches Bot Review. Next alert in an hour at most.`))
+      .catch(() => {});
+  }
+
   async function finishAction(actionId, patch) {
     if (actionId == null) return;
     try {
@@ -504,12 +543,42 @@ export function createLiveChatFastLane(deps) {
     const handoffPending = contactTags.includes('intent:callback-requested');
     const discipline = buildDiscipline({ triggerMessage: body, conversation: context.conversation_recent, established, handoffPending, nowMs: d.now() });
 
+    // ── service area, zip first (Mark's ruling 4, 2026-10-01) ──
+    // The plan is pure; the lookup runs beside classification and the KB pack
+    // under its own 800ms cap, fail-soft to "a team member will confirm".
+    const saPlan = planServiceAreaTurn({ trigger: body, conversation: context.conversation_recent });
+    const capped = (p) => raceWithBudget(Promise.resolve().then(p), SERVICE_AREA_LOOKUP_MS).then(r => (r.timedOut || r.error) ? null : r.value);
+    const coverageLookup = !saPlan.active ? Promise.resolve({})
+      : saPlan.zip ? capped(() => d.checkServiceArea(saPlan.zip)).then(zipResult => ({ zipResult }))
+        : (saPlan.refused_zip && saPlan.place) ? capped(() => d.lookupPlace(saPlan.place)).then(placeResult => ({ placeResult }))
+          : Promise.resolve({});
+    // The visitor's local time when the contact record's zip is known but the
+    // full context did not arrive (the full context resolves its own market).
+    const recordZone = (context._minimal && context.lead?.postal_code)
+      ? capped(() => d.zoneForZip(context.lead.postal_code))
+      : Promise.resolve(null);
+
     // ── classification without a model call; KB pack with the exemplar tier ──
-    const [classification, kbPack] = await Promise.all([
+    const [classification, kbPack, coverageLookups, minimalZone] = await Promise.all([
       d.classify(body, { conversationContext: context.conversation_recent, ghlContactId: contactId, channel: 'livechat', contactTags, noLLM: true }).catch(() => ({ intent_class: 'UNCLEAR', confidence: 0, classification_method: 'fallback', reasoning: 'classifier error' })),
       raceWithBudget(d.buildKbPack({ getQueryEmbedding, intentClass: 'UNCLEAR', messageText: body, channel: 'livechat', buyerStage: Number(context.intelligence?.buyer_stage) || null, contactTags, hasExistingAppt: !!context.lp?.appointment_set, lpDisposition: context.lp?.disposition || null, objectionTags: context.lead?.objection_tags || [] }), d.contextCapMs() * 2)
         .then(r => (r.timedOut || r.error) ? null : r.value),
+      coverageLookup,
+      recordZone,
     ]);
+    const coverage = resolveCoverage(saPlan, coverageLookups || {});
+    // The market the visitor asked about (or is on record in) sets the prompt's
+    // clock: a Houston visitor reads Central time (Mark's ruling 3).
+    const zoneMarket = coverage?.market_code || minimalZone?.market_code || null;
+    if (zoneMarket && zoneMarket !== context.market?.market_code) {
+      const tz = marketTimezone(zoneMarket);
+      const at = new Date(d.now());
+      context = {
+        ...context,
+        market: { timezone: tz, label: tzLabel(tz), market_code: zoneMarket },
+        now: { ...context.now, date_human: formatDateHuman(at, tz), time_human: formatTimeHuman(at, tz), tz, tz_label: tzLabel(tz) },
+      };
+    }
 
     // ── one model call: reply + classification ──
     const malformed = looksLikeMalformedEmail(body);
@@ -518,7 +587,9 @@ export function createLiveChatFastLane(deps) {
       malformed ? `EMAIL LOOKS MALFORMED: the visitor typed "${body.slice(0, 120)}", which is not a valid email address. Say so kindly and ask them to check it. Never say you lack information.` : null,
       largeJob ? `LARGE JOB SIGNAL: "${largeJob}". Answer, offer the next step, and say a person will follow up.` : null,
     ].filter(Boolean).join('\n') || null;
-    const opts = { established, loopBreak, spouseAdvocacy, handoffPending, discipline, promptHint, threadSenderType: 'team' };
+    // serviceAreaTurn renders the zip-first instruction in buildResponsePrompt,
+    // the same block the SMS path gets (src/agentic/service-area-turn.js).
+    const opts = { established, loopBreak, spouseAdvocacy, handoffPending, discipline, promptHint, threadSenderType: 'team', serviceAreaTurn: coverage ? { plan: saPlan, coverage } : null };
     const userPrompt = buildResponsePrompt(context, 'livechat', body, kbPack, classification, false, 'warm', null, opts) + LIVE_CHAT_OUTPUT_CONTRACT;
     const systemPrompt = getResponseSystemPrompt() + LIVE_CHAT_ADDENDUM;
 
@@ -537,13 +608,22 @@ export function createLiveChatFastLane(deps) {
       return { validated, live: parsed?.live_chat && typeof parsed.live_chat === 'object' ? parsed.live_chat : null };
     };
 
+    // The coverage guard runs on top of guardDraft: its notes join the same
+    // single regeneration inside the 5s window, and past the window its
+    // deterministic sentence is used (prepended, or the whole reply for a
+    // zip ask or an out-of-area answer).
+    const runGuards = (message) => {
+      const base = guardDraft(message, { discipline, established, loopBreak, spouseAdvocacy, leadFirstName });
+      const cov = guardCoverageDraft(base.fixed, coverage);
+      return { ...base, notes: [...base.notes, ...cov.notes], fixed: cov.fixed, coverage_notes: cov.notes.length };
+    };
     let gen = await generate(null);
     timing.t4_analysis_done = new Date(d.now()).toISOString();
-    let guard = guardDraft(gen.validated.message, { discipline, established, loopBreak, spouseAdvocacy, leadFirstName });
+    let guard = runGuards(gen.validated.message);
     if (guard.notes.length && (d.now() - started) < 5000) {
       regenerated = true;
       gen = await generate(guard.notes.join('\n\n'));
-      guard = guardDraft(gen.validated.message, { discipline, established, loopBreak, spouseAdvocacy, leadFirstName });
+      guard = runGuards(gen.validated.message);
     }
     draft = guard.fixed;
     liveChatFields = gen.live;
@@ -551,7 +631,9 @@ export function createLiveChatFastLane(deps) {
 
     // ── side channels: large job, contact capture ──
     const capture = liveChatFields?.contact_capture || {};
-    const isLarge = !!largeJob || liveChatFields?.large_job_signal === true;
+    // Out of area: no large-job event either — nobody is going to follow up on
+    // a job Reece cannot do.
+    const isLarge = (!!largeJob || liveChatFields?.large_job_signal === true) && coverage?.status !== 'out';
     if (isLarge) {
       await d.emitEvent({
         event_type: 'agentic.live_chat_large_job', source: 'live_chat_fast_lane', entity_type: 'contact', entity_id: contactId, ghl_contact_id: contactId,
@@ -589,6 +671,7 @@ export function createLiveChatFastLane(deps) {
       large_job: isLarge,
       regenerated,
       discipline_notes: guard.notes.length,
+      service_area: serviceAreaRecord(saPlan, coverage),
       context_minimal: !!context._minimal,
       kb_pack_used: !!kbPack,
       model,

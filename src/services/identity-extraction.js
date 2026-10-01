@@ -669,6 +669,44 @@ export async function checkServiceAreaCity(city) {
   }
 }
 
+/**
+ * Which markets a named place (city or county) falls in — for a visitor who
+ * asked "do you serve X?" and would rather not give a zip (2026-10-01, Mark's
+ * ruling 4). Returns every distinct market_code over matching city OR county
+ * rows; the caller answers only when exactly ONE market comes back, and
+ * otherwise has a team member confirm. Like checkServiceAreaCity it never
+ * returns or infers a zip. checked=false means "could not tell".
+ */
+export async function checkServiceAreaPlace(place, { client = supabase } = {}) {
+  const p = String(place || '').trim().replace(/\s+county$/i, '');
+  if (!p || !client) return { checked: false, place: p || null };
+  // ilike patterns: escape the wildcard characters a visitor could type.
+  const safe = p.replace(/[%_,()"\\]/g, ' ').trim();
+  if (!safe) return { checked: false, place: p };
+  try {
+    const { data, error } = await client
+      .from('service_area_zips')
+      .select('market_code, city, county')
+      .or(`city.ilike."${safe}",county.ilike."${safe}"`)
+      .limit(500);
+    if (error) {
+      console.warn(`[IdentityExtraction] service_area_zips place lookup error for "${p}": ${error.message}`);
+      return { checked: false, place: p };
+    }
+    const rows = Array.isArray(data) ? data : [];
+    const cityRow = rows.find((r) => String(r.city || '').toLowerCase() === safe.toLowerCase());
+    return {
+      checked: true,
+      place: p,
+      market_codes: [...new Set(rows.map((r) => r.market_code).filter(Boolean))],
+      city: cityRow?.city || null,
+    };
+  } catch (err) {
+    console.warn(`[IdentityExtraction] service_area_zips place lookup threw for "${p}": ${err.message}`);
+    return { checked: false, place: p };
+  }
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // 4c. GEOCODING — street address → zip (US Census Bureau, free, no key)
 // ═══════════════════════════════════════════════════════════════════
