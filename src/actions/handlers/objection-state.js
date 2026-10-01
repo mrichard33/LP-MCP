@@ -394,7 +394,7 @@ export async function executeTransitionObjectionState(action) {
   if (insErr) throw new Error(`insert new state: ${insErr.message}`);
 
   // 7. Mirror state_code + ensure reschedule URL is set.
-  const mirrorResult = await mirrorToGhlCustomFields(contact_id, proposed_state, proposedPolicy.parent_state);
+  let mirrorResult = await mirrorToGhlCustomFields(contact_id, proposed_state, proposedPolicy.parent_state);
 
   // 8. Workflow enrollment with chained routing notification (v1.8).
   //
@@ -444,7 +444,37 @@ export async function executeTransitionObjectionState(action) {
     }
   }
 
+  // 2026-10-01 — the state-code field must be written BEFORE the enrollment.
+  // S5.2 v2 branches on the GHL "Objection State Code" field, so a contact
+  // enrolled with a stale or blank field takes the wrong branch (Mark: make
+  // sure the field our branches route on is updated before sending). The
+  // write is retried once; if it still did not land, the contact is NOT
+  // enrolled and #ops-alerts is told. Verified 2026-10-01: 1,030 of 1,030
+  // enrollments in 30 days had the field written first, so this only bites
+  // on a real GHL write failure or a missing GHL_FIELD_OBJECTION_STATE_CODE.
+  let mirrorGateOk = true;
   if (wantsEnrollment && appointmentGateOk) {
+    if (!mirrorResult.state_set) {
+      mirrorResult = await mirrorToGhlCustomFields(contact_id, proposed_state, proposedPolicy.parent_state);
+    }
+    mirrorGateOk = enrollmentAllowedAfterMirror(mirrorResult);
+    reportMirrorGate(mirrorGateOk, { contact_id, state_code: proposed_state });
+    if (!mirrorGateOk) {
+      await emitTransitionEvent('state_enrollment_suppressed_mirror_failed', {
+        contact_id,
+        state_code: proposed_state,
+        parent_state: proposedPolicy.parent_state,
+        recovery_workflow_id: proposedPolicy.recovery_workflow_id,
+        trigger_source,
+        triggering_event_id,
+        reason: GHL_FIELD_OBJECTION_STATE_CODE ? 'state_code_field_write_failed' : 'state_code_field_not_configured',
+        source_action_id: action.id,
+      });
+      enrollment = { enrolled: false, route: null, action_id: null, skip_reason: 'state_code_field_not_written' };
+    }
+  }
+
+  if (wantsEnrollment && appointmentGateOk && mirrorGateOk) {
     // Route is deterministic from policy: webhook_url present → Route B,
     // otherwise Route A. Pre-compute so the notification text can reference it.
     const route = proposedPolicy.recovery_webhook_url ? 'B' : 'A';
@@ -644,6 +674,30 @@ async function emitTransitionEvent(event_type, payload) {
     console.warn(`[ObjectionState] emit ${event_type} failed: ${err.message}`);
     return null;
   }
+}
+
+/** Pure. A workflow enrollment may go only once the state-code field was written. */
+export function enrollmentAllowedAfterMirror(mirrorResult) {
+  return mirrorResult?.state_set === true;
+}
+
+// Edge-triggered (src/alert-state.js): one #ops-alerts card when enrollments
+// start being held back, cleared by the next one whose field write lands.
+// Best-effort and never awaited by the caller's outcome.
+function reportMirrorGate(ok, { contact_id, state_code }) {
+  import('../../alert-state.js')
+    .then(({ reportAlertCondition }) => reportAlertCondition({
+      key: 's52-state-code-mirror',
+      active: !ok,
+      label: 'S5.2 state-code field write',
+      text: `⚠️ S5.2 enrollment held back: the GHL "Objection State Code" field could not be written for ${contact_id} (${state_code}). `
+        + 'Contacts are NOT being sent to S5.2 until the field write works again'
+        + (GHL_FIELD_OBJECTION_STATE_CODE ? '.' : ' — GHL_FIELD_OBJECTION_STATE_CODE is not set.'),
+      recoveredText: '✅ S5.2 state-code field writes are landing again; enrollments resumed.',
+      channel: 'ops',
+      remindMs: 6 * 60 * 60 * 1000,
+    }))
+    .catch((err) => console.warn(`[ObjectionState] mirror-gate alert failed: ${err.message}`));
 }
 
 async function mirrorToGhlCustomFields(contact_id, state_code, parent_state) {
