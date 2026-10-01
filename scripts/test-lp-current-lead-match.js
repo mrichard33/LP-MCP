@@ -250,3 +250,34 @@ test('S5.2 cancel gate: an April CXL that is the only lead still fails appointme
   const fresh = [{ ...rows[0], appointment_date: daysAgo(-2) }];
   assert.equal(await evaluateContextConditions(cond, {}, ev, { ruleKey: 'T', deps: { supabase: fakeSupabase(fresh), nowMs: NOW } }), true);
 });
+
+// 2026-10-01 — lp_had_demo (Mark: a lead that had a demo does not go to S5.2
+// via 1Leg or "ghost after booking"). LP demo truth, not the lagging tag.
+test('lp_had_demo:false blocks a contact with a demo on any lead or appointment; passes one without', async () => {
+  const ev = (cid) => ({ id: 3, ghl_contact_id: cid, event_type: 'confirmation_unacknowledged', payload: {} });
+  const rows = [
+    // Van De Velde: 1Leg on one lead, demo (OPPFDN) on the next.
+    { ghl_contact_id: 'demoed', disposition_code: '1Leg' },
+    { ghl_contact_id: 'demoed', disposition_code: 'OPPFDN' },
+    // A NoRehash demo, then a rebooked appointment on the same lead.
+    { ghl_contact_id: 'appt-demo', disposition_code: 'Set', appts: [{ disposition: 'NoRehash' }, { disposition: 'Set' }] },
+    // NOC is not a demo (src/demo-truth.js).
+    { ghl_contact_id: 'no-demo', disposition_code: '1Leg', appts: [{ disposition: 'NOC' }] },
+  ];
+  const deps = { supabase: fakeSupabase(rows) };
+  const cond = { lp_had_demo: false };
+  assert.equal(await evaluateContextConditions(cond, {}, ev('demoed'), { ruleKey: 'T', deps }), false);
+  assert.equal(await evaluateContextConditions(cond, {}, ev('appt-demo'), { ruleKey: 'T', deps }), false);
+  assert.equal(await evaluateContextConditions(cond, {}, ev('no-demo'), { ruleKey: 'T', deps }), true);
+  assert.equal(await evaluateContextConditions(cond, {}, ev('no-leads'), { ruleKey: 'T', deps }), true, 'no LP lead = no demo');
+  assert.equal(await evaluateContextConditions({ lp_had_demo: true }, {}, ev('demoed'), { ruleKey: 'T', deps }), true);
+});
+
+test('lp_had_demo: a failed LP read fails closed', async () => {
+  const broken = { from: () => { const q = { select: () => q, eq: () => q, is: () => q, limit: () => q,
+    then: (res) => Promise.resolve({ data: null, error: { message: 'boom' } }).then(res) }; return q; } };
+  const emitted = [];
+  const deps = { supabase: broken, emitEvent: async (e) => { emitted.push(e); } };
+  const ev = { id: 4, ghl_contact_id: 'c-x', event_type: 'lp.disposition_changed', payload: {} };
+  assert.equal(await evaluateContextConditions({ lp_had_demo: false }, {}, ev, { ruleKey: 'T', deps }), false);
+});

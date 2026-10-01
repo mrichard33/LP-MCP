@@ -1019,7 +1019,7 @@ const IO_BACKED_CONDITION_KEYS = new Set([
   'has_tag_prefix', 'not_has_tag_prefix', 'not_has_any_tag_prefix',
   'custom_field_eq', 'custom_field_in',
   // lp_leads / demo state
-  'lp_disposition_in', 'demo_state_eq', 'lp_current_lead_match',
+  'lp_disposition_in', 'demo_state_eq', 'lp_current_lead_match', 'lp_had_demo',
   // appointment lookups
   'not_active_in_home_appointment', 'not_reschedule_inflight',
   'not_duplicate_lead_live_appointment', 'no_future_appointment',
@@ -1602,6 +1602,32 @@ async function evaluateContextConditions(conditions, intelligence, event, opts =
         const verdict = evaluateCurrentLeadMatch(currentLead, spec, event, opts.deps?.nowMs ?? Date.now());
         if (!verdict.pass) {
           console.log(`[lp_current_lead_match] BLOCKED ${clContactId}: ${verdict.reason} (rule ${ruleKey || '?'})`);
+          return false;
+        }
+        break;
+      }
+
+      // 2026-10-01 — lp_had_demo: true|false. LP demo truth only
+      // (src/demo-truth.js, every lead and every appointment), never the
+      // lp-demo-completed tag: the tag is stamped by field sync and lagged a
+      // day behind the demo, so "ghost after booking" and 1Leg sent contacts
+      // who had already demoed to S5.2 (Mark: a lead that had a demo does not
+      // go to S5.2). A contact with no LP lead has no demo; a failed read
+      // fails closed.
+      case 'lp_had_demo': {
+        const hdContactId = event?.ghl_contact_id;
+        if (!hdContactId) return notApplicableNoContact(key);
+        const hdDb = opts.deps?.supabase !== undefined ? opts.deps.supabase : supabase;
+        if (!hdDb) return failClosed(key, 'LP Supabase not configured');
+        const { data: hdLeads, error: hdErr } = await hdDb.from('lp_leads')
+          .select('disposition_code, closed_won, appts:raw_lp_data->appointments')
+          .eq('ghl_contact_id', hdContactId)
+          .is('lp_deleted_at', null)
+          .limit(DEMO_STATE_LEAD_LIMIT);
+        if (hdErr) return failClosed(key, `lp_leads lookup failed: ${hdErr.message}`);
+        const hadDemo = contactHadDemo(hdLeads || []);
+        if (hadDemo !== (expected === true)) {
+          console.log(`[Context] BLOCKED: lp_had_demo is ${hadDemo}, rule wants ${expected === true} (rule ${ruleKey || '?'})`);
           return false;
         }
         break;
