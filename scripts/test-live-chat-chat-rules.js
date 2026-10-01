@@ -81,3 +81,12 @@ test('named days are offers too: the browser-test draft "Friday afternoon or Sat
     assert.equal(findTimeOffers(t).length, 0, t);
   }
 });
+
+test('replies sent through I.LVO come back wrapped in HTML; the thread reads plain text', async () => {
+  const { normalizeThread, plainMessageText } = await import('../src/live-chat/fast-lane.js');
+  const ghl = '<p style="margin:0px; padding-left: 0px!important;"><span data-cv-variable="inboundWebhookRequest.message" data-cv-token="true">Happy to check that for you. What&#39;s your zip code?</span></p>';
+  assert.equal(plainMessageText(ghl), "Happy to check that for you. What's your zip code?");
+  const t = normalizeThread([{ direction: 'outbound', body: ghl, dateAdded: '2026-10-01T19:32:20Z' }, { direction: 'inbound', body: '32137', dateAdded: '2026-10-01T19:33:33Z' }]);
+  assert.equal(t[0].text, "Happy to check that for you. What's your zip code?");
+  assert.equal(plainMessageText('Plain & simple'), 'Plain & simple');
+});
