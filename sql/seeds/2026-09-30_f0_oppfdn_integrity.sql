@@ -6,6 +6,12 @@
 -- A) Agentic F.0 entry: current lead OPPFDN, appointment in last 14 days, real change only.
 --    Posts to F.0's "Inbound Agentic Trigger" webhook (4e3a9178…), the same form-post
 --    pattern the E.2 / S1.1 entry rules use, so the contact enters on F.0's webhook path.
+--    2026-10-01: FIRST writes LP Disposition = OPPFDN to GHL. F.0's gate ("Check if Workflow
+--    Active and is OPPFDN") reads that field, and field sync only pushes it every 15 minutes, so
+--    the webhook landed seconds before the field caught up and 4 of the first 5 entries exited at
+--    the gate (Flora M, LDaOXXm81ZfMSKrXU8EL). A rule's actions run serially in sequence_order
+--    and a failed field write stops the batch, so nobody is enrolled with a stale field. Both
+--    actions carry priority 50 so they are claimed together.
 INSERT INTO agent_rules (rule_key, rule_name, category, event_pattern, conditions, context_conditions,
   action_template, requires_approval, enabled, priority, rule_type, created_by, notes)
 VALUES (
@@ -14,7 +20,9 @@ VALUES (
  NULL,
  '{"lp_current_lead_match":{"disposition_in":["OPPFDN"],"max_days_since_appointment":14,"allow_synthetic":false},
    "not_has_any_tag":["active-f.0","customer","lp-sale","deal-won","dnc","lp-dnc","stage:dnc","stop-bot","suppress-outbound"]}'::jsonb,
- '[{"action_type":"add_to_workflow","target_entity":"contact","target_system":"ghl",
+ '[{"action_type":"update_custom_fields","target_entity":"contact","target_system":"ghl","priority":50,
+    "params":{"fields":[{"id":"URWTGtobi9a9Y7gwGxC8","field_value":"OPPFDN"}]}},
+   {"action_type":"add_to_workflow","target_entity":"contact","target_system":"ghl","priority":50,
     "params":{"webhook_url":"https://services.leadconnectorhq.com/hooks/SsBG7j5KQAIP1SFP2Sca/webhook-trigger/4e3a9178-6f67-4889-b3bb-02cc35aca17d",
               "format":"form","payload":{"source":"f0_agentic","entry_route_rule":"F0_ENROLL_CURRENT_OPPFDN"},
               "workflow_name":"F.0 Post-Appointment Follow-Up","canonical_code":"F.0","canonical_name":"F.0 Post-Appointment Follow-Up"}}]'::jsonb,
