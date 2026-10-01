@@ -262,13 +262,29 @@ export function minimalContext({ contactId, contact = null, nowMs = Date.now(), 
 }
 
 /** GHL /conversations/{id}/messages rows → the turn shape the prompt builder reads. Pure. */
+/**
+ * Plain text from a GHL message body. Replies sent through the I.LVO workflow
+ * come back from GHL wrapped in the step editor's HTML
+ * (<p style=…><span data-cv-variable=…>text</span></p>, seen 2026-10-01); the
+ * widget renders it, but the model would read the markup. Pure.
+ */
+export function plainMessageText(body) {
+  return String(body ?? '')
+    .replace(/<br\s*\/?>/gi, ' ')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"').replace(/&#39;|&apos;/g, "'")
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 export function normalizeThread(messages, limit = 10) {
   const rows = Array.isArray(messages) ? messages : (messages?.messages?.messages || messages?.messages || []);
   return rows
     .map(m => ({
       direction: m.direction === 1 || m.direction === 'inbound' ? 'inbound' : 'outbound',
       channel: 'livechat',
-      text: String(m.body ?? m.message ?? m.text ?? '').trim(),
+      text: plainMessageText(m.body ?? m.message ?? m.text ?? ''),
       type: m.contentType || m.type || 'text',
       timestamp: m.dateAdded || m.createdAt || m.sent_at || m.timestamp || null,
     }))

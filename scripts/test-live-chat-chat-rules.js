@@ -67,3 +67,26 @@ test('sendViaWebhook posts JSON, returns the GHL execution id, and throws on a n
   const bad = async () => ({ ok: false, status: 404, text: async () => 'not found' });
   await assert.rejects(sendViaWebhook('https://hook', { contactId: 'C1', message: 'x' }, { fetchImpl: bad }), /live chat webhook 404/);
 });
+
+test('named days are offers too: the browser-test draft "Friday afternoon or Saturday morning" is caught', () => {
+  const draft = "Got it. We'll set up an in-home estimate where our specialist measures everything to Florida code and leaves you exact pricing valid for a full year. Two options coming up — which works better, Friday afternoon or Saturday morning?";
+  const g = guardTimeOffers(draft);
+  assert.equal(g.notes.length, 1);
+  assert.doesNotMatch(g.fixed, /Friday|Saturday|Two options/);
+  assert.match(g.fixed, /A team member will call you to set up a time that works/);
+  for (const t of ['Would tomorrow morning work?', 'We can come out this weekend or next week.', 'I have availability on Tuesday.', 'How about Saturday at 10?', 'Does Monday or Wednesday work better?']) {
+    assert.equal(findTimeOffers(t).length, 1, t);
+  }
+  for (const t of ['Would mornings or afternoons work better?', 'What day of the week is best for a call?', 'Our office is open Monday through Friday.', 'The visit takes about an hour and a half.']) {
+    assert.equal(findTimeOffers(t).length, 0, t);
+  }
+});
+
+test('replies sent through I.LVO come back wrapped in HTML; the thread reads plain text', async () => {
+  const { normalizeThread, plainMessageText } = await import('../src/live-chat/fast-lane.js');
+  const ghl = '<p style="margin:0px; padding-left: 0px!important;"><span data-cv-variable="inboundWebhookRequest.message" data-cv-token="true">Happy to check that for you. What&#39;s your zip code?</span></p>';
+  assert.equal(plainMessageText(ghl), "Happy to check that for you. What's your zip code?");
+  const t = normalizeThread([{ direction: 'outbound', body: ghl, dateAdded: '2026-10-01T19:32:20Z' }, { direction: 'inbound', body: '32137', dateAdded: '2026-10-01T19:33:33Z' }]);
+  assert.equal(t[0].text, "Happy to check that for you. What's your zip code?");
+  assert.equal(plainMessageText('Plain & simple'), 'Plain & simple');
+});
