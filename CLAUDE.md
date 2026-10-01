@@ -131,7 +131,9 @@ transaction. `CONSENT_MODEL_MODE` is `shadow`: nothing gates a send on these tab
   source `ghl_tag`. Plain `dnc` blocks nothing: rule 241 `TAG_DNC_TO_HARDLOSS` only moves the objection
   state. `TAG_DNC_MANUAL_OPTOUT` made it a full opt-out for 15 minutes and was disabled by the user's
   ruling — do not re-enable it. The sms/voice rules are guarded on `suppress:dnc-reply` /
-  `suppress:dnc-voice` so an automatic opt-out is not run twice.
+  `suppress:dnc-voice` so an automatic opt-out is not run twice, and all three on `has_tag` of their
+  own tag (read live): a stale GHL webhook snapshot reports a tag "added" right after a lift removed
+  it, and on 2026-09-30 that re-blocked a customer with a confirmed appointment.
 - **ActiveProspect re-entries reach review only through `POST /webhook/ap/dnc-reentry`**, which
   n8n I.AP calls on its "link" branch (the lead's phone matched an existing contact). E.0's
   `reentry` event covers first-party consent only. The endpoint asks; it never lifts.
