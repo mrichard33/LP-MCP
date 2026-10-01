@@ -87,8 +87,20 @@ import {
   serviceAreaRecord,
 } from '../agentic/service-area-turn.js';
 import { formatDateHuman, formatTimeHuman } from '../appointment-dates.js';
-import { guardTimeOffers, planLanguageHandoff } from './chat-rules.js';
+import {
+  guardTimeOffers,
+  planLanguageHandoff,
+  planPriceTurn,
+  priceTransitionReply,
+  priceHint,
+  isFrustratedRepeat,
+  frustrationHint,
+  guardChatFlow,
+  isRealName,
+  phoneInThread,
+} from './chat-rules.js';
 import { marketTimezone, tzLabel } from '../config/market-timezones.js';
+import { phoneFromText } from './missed-replies.js';
 
 export const LIVE_CHAT_RULE = 'LIVE_CHAT_FAST_LANE';
 export const LIVE_CHAT_FALLBACK_MESSAGE = 'Thanks. Let me grab the right person for that, one moment.';
@@ -206,7 +218,10 @@ You are answering in the website chat, live, with the visitor watching the scree
 - Everything else in this prompt still binds: the discovery discipline, the decision-maker rules, no insurance predictions, no exclamation marks.
 - A SERVICE AREA instruction in this prompt outranks the collection order above for this reply: when it says ask only for the zip, or stop, do exactly that.
 - You CANNOT see the calendar in this chat. Never name a day or a time for a visit or a call. When they want a visit or a quote, say a team member will call to set a time that works, and ask for the best phone number if we do not have one.
-- Answer the question they asked, in their words. Do not repeat an answer you already gave in this conversation, and do not ask a question they already answered above.`;
+- Answer the question they asked, in their words. Do not repeat an answer you already gave in this conversation, and do not ask a question they already answered above.
+- Before you say a team member will call, you must have their first name AND phone number. Ask for whichever is missing in that same reply. "Guest Visitor" is not a name.
+- When they ask for a price or a quote, do not keep asking discovery questions. Say exact pricing comes from the free in-home measurement and move to setting it up.
+- Every reply ends with one question or a clear next step. Never join two questions with "or".`;
 
 export const LIVE_CHAT_OUTPUT_CONTRACT = `
 ADDITIONAL OUTPUT (live chat): alongside the fields above, include a top-level "live_chat" object:
@@ -602,6 +617,27 @@ export function createLiveChatFastLane(deps) {
     // The plan is pure; the lookup runs beside classification and the KB pack
     // under its own 800ms cap, fail-soft to "a team member will confirm".
     const saPlan = planServiceAreaTurn({ trigger: body, conversation: context.conversation_recent });
+
+    // ── who we can call (Mark, 2026-10-01): a first name AND a phone ──
+    const hasNameOnRecord = isRealName(context.lead?.name || context.lead?.first_name);
+    const hasPhoneOnRecord = !!context.lead?.phone || phoneInThread(context.conversation_recent, body);
+
+    // ── a price request goes to the in-home visit (NEPQ Transition) ──
+    // The second ask (or "I just want a price") gets the Transition as a fixed
+    // line, no model call: the first live chat asked for a price three times
+    // and was answered with discovery questions twice (2026-10-01).
+    const pricePlan = saPlan.active ? null : planPriceTurn({ body, thread: context.conversation_recent });
+    const frustrated = isFrustratedRepeat(body);
+    if (pricePlan?.insist) {
+      timing.t4_analysis_done = new Date(d.now()).toISOString();
+      timing.t5_generation_done = timing.t4_analysis_done;
+      return deliver({
+        contactId, conversationId, body, mode, actionId, timing,
+        draft: priceTransitionReply({ hasName: hasNameOnRecord, hasPhone: hasPhoneOnRecord }),
+        capture: phoneFromText(body) ? { phone: phoneFromText(body) } : {},
+        extras: { price_turn: { asks: pricePlan.asks, insist: true, deterministic: true }, context_minimal: !!context._minimal, model: null },
+      });
+    }
     const capped = (p) => raceWithBudget(Promise.resolve().then(p), SERVICE_AREA_LOOKUP_MS).then(r => (r.timedOut || r.error) ? null : r.value);
     const coverageLookup = !saPlan.active ? Promise.resolve({})
       : saPlan.zip ? capped(() => d.checkServiceArea(saPlan.zip)).then(zipResult => ({ zipResult }))
@@ -641,6 +677,8 @@ export function createLiveChatFastLane(deps) {
     const promptHint = [
       malformed ? `EMAIL LOOKS MALFORMED: the visitor typed "${body.slice(0, 120)}", which is not a valid email address. Say so kindly and ask them to check it. Never say you lack information.` : null,
       largeJob ? `LARGE JOB SIGNAL: "${largeJob}". Answer, offer the next step, and say a person will follow up.` : null,
+      pricePlan ? priceHint({ hasName: hasNameOnRecord, hasPhone: hasPhoneOnRecord }) : null,
+      frustrated && !pricePlan ? frustrationHint({ hasName: hasNameOnRecord, hasPhone: hasPhoneOnRecord }) : null,
     ].filter(Boolean).join('\n') || null;
     // serviceAreaTurn renders the zip-first instruction in buildResponsePrompt,
     // the same block the SMS path gets (src/agentic/service-area-turn.js).
@@ -667,20 +705,26 @@ export function createLiveChatFastLane(deps) {
     // single regeneration inside the 5s window, and past the window its
     // deterministic sentence is used (prepended, or the whole reply for a
     // zip ask or an out-of-area answer).
-    const runGuards = (message) => {
+    const runGuards = (message, live) => {
+      // A name or phone typed in THIS message counts (the model reports it).
+      const hasName = hasNameOnRecord || isRealName(live?.contact_capture?.name);
+      const hasPhone = hasPhoneOnRecord || !!live?.contact_capture?.phone;
       const base = guardDraft(message, { discipline, established, loopBreak, spouseAdvocacy, leadFirstName });
       // No calendar in this lane: any named day/time is invented (2026-10-01).
-      const times = guardTimeOffers(base.fixed, { hasPhone: !!(context.lead?.phone) });
+      const times = guardTimeOffers(base.fixed, { hasPhone, hasName });
       const cov = guardCoverageDraft(times.fixed, coverage);
-      return { ...base, notes: [...base.notes, ...times.notes, ...cov.notes], fixed: cov.fixed, coverage_notes: cov.notes.length, time_offers_removed: times.notes.length > 0 };
+      // A coverage turn is the zip-first script (ask for the zip, or stop);
+      // the conversation guards would talk over it.
+      const flow = saPlan.active ? { notes: [], fixed: cov.fixed } : guardChatFlow(cov.fixed, { thread: context.conversation_recent, hasName, hasPhone, body, bookingAllowed: !!discipline?.booking?.allowed || !!pricePlan || frustrated });
+      return { ...base, notes: [...base.notes, ...times.notes, ...cov.notes, ...flow.notes], fixed: flow.fixed, coverage_notes: cov.notes.length, time_offers_removed: times.notes.length > 0, flow_notes: flow.notes.length };
     };
     let gen = await generate(null);
     timing.t4_analysis_done = new Date(d.now()).toISOString();
-    let guard = runGuards(gen.validated.message);
+    let guard = runGuards(gen.validated.message, gen.live);
     if (guard.notes.length && (d.now() - started) < 5000) {
       regenerated = true;
       gen = await generate(guard.notes.join('\n\n'));
-      guard = runGuards(gen.validated.message);
+      guard = runGuards(gen.validated.message, gen.live);
     }
     draft = guard.fixed;
     liveChatFields = gen.live;
@@ -712,6 +756,9 @@ export function createLiveChatFastLane(deps) {
         regenerated,
         discipline_notes: guard.notes.length,
         time_offers_removed: !!guard.time_offers_removed,
+        flow_notes: guard.flow_notes || 0,
+        price_turn: pricePlan ? { asks: pricePlan.asks, insist: false, deterministic: false } : null,
+        frustrated,
         service_area: serviceAreaRecord(saPlan, coverage),
         context_minimal: !!context._minimal,
         kb_pack_used: !!kbPack,

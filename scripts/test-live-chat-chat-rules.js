@@ -90,3 +90,81 @@ test('replies sent through I.LVO come back wrapped in HTML; the thread reads pla
   assert.equal(t[0].text, "Happy to check that for you. What's your zip code?");
   assert.equal(plainMessageText('Plain & simple'), 'Plain & simple');
 });
+
+// ── 2026-10-01 live chat: name + phone, price → visit, repeats, dead ends ──
+const R = await import('../src/live-chat/chat-rules.js');
+
+test('isRealName: GHL guest placeholders, phones and blanks are not names', () => {
+  for (const n of ['Guest Visitor ljloa', 'guest', 'Visitor', '', null, '9543792151', 'a@b.com']) assert.equal(R.isRealName(n), false, String(n));
+  for (const n of ['Mark', 'Mark Test', "Tim O'Connor", 'Lori']) assert.equal(R.isRealName(n), true, n);
+});
+
+test('contactAskLine asks for exactly what is missing, as one question', () => {
+  assert.equal(R.contactAskLine({}), "What's your first name and the best number to reach you?");
+  assert.equal(R.contactAskLine({ hasName: true }), "What's the best phone number to reach you?");
+  assert.match(R.contactAskLine({ hasPhone: true }), /first name/);
+  assert.equal(R.contactAskLine({ hasName: true, hasPhone: true }), null);
+  for (const a of [R.contactAskLine({}), R.contactAskLine({ hasPhone: true })]) assert.equal((a.match(/\?/g) || []).length, 1);
+});
+
+test('bookingHandoffLine keeps its old output when the name is known', () => {
+  assert.equal(R.bookingHandoffLine({ hasPhone: false }), "A team member will call you to set up a time that works. What's the best phone number to reach you?");
+  assert.equal(R.bookingHandoffLine({ hasPhone: false, hasName: false }), "A team member will call you to set up a time that works. What's your first name and the best number to reach you?");
+});
+
+test('guardCallPromise: no call promise without a name and a phone', () => {
+  const live = 'Got you—thanks for confirming the number. A team member will call you shortly to go over the details. Sound good?';
+  const g = R.guardCallPromise(live, { hasName: false, hasPhone: true });
+  assert.equal(g.notes.length, 1);
+  assert.match(g.fixed, /first name/);
+  assert.doesNotMatch(g.fixed, /Sound good\?/);
+  assert.deepEqual(R.guardCallPromise(live, { hasName: true, hasPhone: true }).notes, []);
+  const ok = "A team member will call to set a time. What's your first name and the best number to reach you?";
+  assert.deepEqual(R.guardCallPromise(ok, {}).notes, [], 'already asks for both');
+  assert.deepEqual(R.guardCallPromise('Our crews are factory trained.', {}).notes, [], 'no promise, nothing to do');
+});
+
+test('planPriceTurn: first ask, second ask, "I just want a price", financing is not a price ask', () => {
+  const t = (dir, text) => ({ direction: dir, text });
+  assert.equal(R.planPriceTurn({ body: 'Who installs them?' }), null);
+  assert.deepEqual(R.planPriceTurn({ body: 'Can you give me a price on 12 new windows?', thread: [t('inbound', 'Can you give me a price on 12 new windows?')] }), { asks: 1, insist: false });
+  assert.deepEqual(R.planPriceTurn({ body: 'Yes, how much?', thread: [t('inbound', 'price on 12 windows?'), t('outbound', 'x'), t('inbound', 'Yes, how much?')] }), { asks: 2, insist: true });
+  assert.equal(R.planPriceTurn({ body: 'I just want to get a price. They look old.' }).insist, true);
+  assert.equal(R.planPriceTurn({ body: 'Do you offer financing? How much a month?' }), null);
+  const reply = R.priceTransitionReply({});
+  assert.match(reply, /free in-home measurement/);
+  assert.equal((reply.match(/\?/g) || []).length, 1);
+  assert.doesNotMatch(reply, /!/);
+});
+
+test('guardChatFlow: the live drafts from the ljloa chat', () => {
+  const thread = [
+    { direction: 'outbound', text: 'Yes, we serve Winston-Salem (27101). What got you looking at windows right now?' },
+    { direction: 'inbound', text: 'My windows are really old.' },
+  ];
+  // the "or" double question
+  const a = R.guardChatFlow('Got it—old windows. How long have they been that way, or what bothers you most about them right now?', { thread: [], hasName: false, hasPhone: false });
+  assert.equal(a.fixed, 'Got it—old windows. How long have they been that way?');
+  // the repeated why-now
+  const b = R.guardChatFlow('No cost, no obligation. What made you decide to replace them now?', { thread, hasName: false, hasPhone: false });
+  assert.ok(b.notes.some(n => /already asked/.test(n)));
+  assert.doesNotMatch(b.fixed, /decide to replace/);
+  assert.match(b.fixed, /What's your first name and the best number to reach you\?$/);
+  // the dead end
+  const c = R.guardChatFlow("Got it—they look old and don't feel right to you.", { thread, hasName: false, hasPhone: false });
+  assert.match(c.fixed, /free in-home measurement/);
+  assert.match(c.fixed, /\?$/);
+  // a dead end when the booking ask is held back: a regen note, no pitch
+  const d = R.guardChatFlow('Our own factory-trained crews handle every install.', { hasName: false, hasPhone: false, bookingAllowed: false });
+  assert.equal(d.fixed, 'Our own factory-trained crews handle every install.');
+  assert.equal(d.notes.length, 1);
+  // after a "no thanks", no pitch
+  assert.deepEqual(R.guardChatFlow('No problem at all.', { body: 'no thanks', hasName: false, hasPhone: false }).notes, []);
+  // a clean one-question reply passes untouched
+  assert.deepEqual(R.guardChatFlow('How long have they been that way?', { thread, hasName: false, hasPhone: false }), { notes: [], fixed: 'How long have they been that way?' });
+});
+
+test('isFrustratedRepeat', () => {
+  for (const t of ['I just told you they are old.', 'like I said, 12 windows', 'I already said that', 'you asked me that']) assert.equal(R.isFrustratedRepeat(t), true, t);
+  for (const t of ['They are old.', 'I told my wife']) assert.equal(R.isFrustratedRepeat(t), false, t);
+});
