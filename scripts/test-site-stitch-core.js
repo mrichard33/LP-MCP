@@ -17,7 +17,7 @@ import assert from 'node:assert/strict';
 
 import {
   buildAggregateSql, buildSiteFieldUpdates, exactMatches, pickContact, buildMappedContactsSql,
-  buildSummaryUpsertSql, buildRefreshCandidatesSql, refreshNoteReason, buildRetentionDeleteSql,
+  buildSummaryUpsertSql, buildRefreshCandidatesSql, refreshNoteReason, buildRetentionDeleteSql, refreshChanged,
 } from '../src/site-stitch-core.js';
 import { runSiteEventsRetention, retentionDays } from '../src/jobs/site-events-retention.js';
 
@@ -136,7 +136,7 @@ test('summary upsert: one row per contact, keyed on contact_id, values escaped',
   assert.match(sql, /on conflict \(contact_id\) do update/);
   assert.match(sql, /array\['b292','v''2'\]::text\[\]/);
   assert.match(sql, /, 64, 4,/);
-  assert.match(sql, /'2026-09-16T22:00:00\.000Z'::timestamptz/);
+  assert.match(sql, /'2026-09-16T22:00:00Z'::timestamptz/);       // ISO passes through as-is
   assert.match(sql, /"\/o''brien":1/);           // jsonb text escaped
   assert.match(sql, /array\['\/','\/about\/'\]::text\[\]/);
 });
@@ -157,7 +157,7 @@ test('refresh candidates: backfill rows with no summary AND newer page views, ca
   const sql = buildRefreshCandidatesSql(50);
   assert.match(sql, /left join public\.site_lead_summary s on s\.contact_id = m\.contact_id/);
   assert.match(sql, /where s\.contact_id is null/);
-  assert.match(sql, /e\.created_at > coalesce\(s\.last_visit, '-infinity'::timestamptz\)/);
+  assert.match(sql, /e\.created_at\) > coalesce\(s\.last_visit, '-infinity'::timestamptz\)/);
   assert.match(sql, /distinct on \(m\.contact_id\)/);
   assert.match(sql, /limit 50$/);
   assert.match(buildRefreshCandidatesSql(99999), /limit 500$/);
@@ -229,4 +229,36 @@ test('retention run: nothing old enough means no delete at all; disabled does no
   const off = await runSiteEventsRetention({ days: 0, deps });
   assert.equal(off.skipped, true);
   assert.equal(calls.length, 1);
+});
+
+// ─── 2026-10-01 regression: the refresh rebuilt all 19 leads every batch ────
+// last_visit went through a JS Date (milliseconds) while site_events keeps
+// microseconds, so "a page view newer than last_visit" matched every lead.
+
+test('summary upsert keeps microseconds on an ISO timestamp from Postgres', () => {
+  const sql = buildSummaryUpsertSql({ contactId: 'C', score: 1, topPages: [], agg: {
+    first_visit: '2026-09-15T21:38:44.237123+00:00', last_visit: '2026-10-01T14:59:18.650182+00:00' } });
+  assert.match(sql, /'2026-09-15T21:38:44\.237123\+00:00'::timestamptz/);
+  assert.match(sql, /'2026-10-01T14:59:18\.650182\+00:00'::timestamptz/);
+  assert.doesNotMatch(sql, /14:59:18\.650Z/);
+});
+
+test('summary upsert: a Postgres-style space-separated timestamp also passes through', () => {
+  const sql = buildSummaryUpsertSql({ contactId: 'C', score: 1, topPages: [], agg: { last_visit: '2026-10-01 14:59:18.650182+00' } });
+  assert.match(sql, /'2026-10-01 14:59:18\.650182\+00'::timestamptz/);
+});
+
+test('refresh candidates compare page views truncated to milliseconds', () => {
+  const sql = buildRefreshCandidatesSql(50);
+  assert.match(sql, /date_trunc\('milliseconds', e\.created_at\) > coalesce\(s\.last_visit, '-infinity'::timestamptz\)/);
+  assert.match(sql, /s\.pages_viewed as prev_pages, s\.last_visit as prev_last_visit/);
+});
+
+test('refreshChanged: identical totals are no change; any moved total, or a backfill, is', () => {
+  const prev = { has_summary: true, prev_pages: 64, prev_score: 100, prev_last_visit: '2026-10-01T14:59:18.650+00:00' };
+  assert.equal(refreshChanged(prev, { pageviews: '64', score: 100, last_visit: '2026-10-01T14:59:18.650182+00:00' }), false);
+  assert.equal(refreshChanged(prev, { pageviews: 66, score: 100, last_visit: '2026-10-01T15:10:00+00:00' }), true);
+  assert.equal(refreshChanged(prev, { pageviews: 64, score: 90, last_visit: '2026-10-01T14:59:18.650+00:00' }), true);
+  assert.equal(refreshChanged({ has_summary: false }, { pageviews: 1, score: 3 }), true);
+  assert.equal(refreshChanged(null, { pageviews: 1 }), true);
 });

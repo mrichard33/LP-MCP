@@ -39,7 +39,7 @@ import { updateGHLContactFields, addGHLNote } from './ghl.js';
 import { withGhlToken } from './ghl-rate-limiter.js';
 import {
   buildAggregateSql, buildSiteFieldUpdates, exactMatches, pickContact, buildMappedContactsSql,
-  buildSummaryUpsertSql, buildRefreshCandidatesSql, refreshNoteReason,
+  buildSummaryUpsertSql, buildRefreshCandidatesSql, refreshNoteReason, refreshChanged,
 } from './site-stitch-core.js';
 
 // ─── Config (env with safe fallbacks — no n8n env dependency) ──────────────
@@ -392,6 +392,10 @@ async function refreshContact(cand, fields) {
   const { score, top_pages } = scoreIntent(agg);
   if (!(await upsertSummary(contactId, agg, score, top_pages))) return { ok: false };
 
+  // Row always rewritten above; GHL only when something it shows moved.
+  if (!refreshChanged(cand, { pageviews: agg.pageviews, score, last_visit: agg.last_visit })) {
+    return { ok: true, noted: false, unchanged: true };
+  }
   const cf = buildSiteFieldUpdates(fields, agg, score);
   if (cf.length) await updateGHLContactFields(contactId, cf);
 
@@ -416,7 +420,7 @@ async function refreshReturningVisitors(fields) {
   for (const cand of candidates) {
     try {
       const r = await refreshContact(cand, fields);
-      if (r.ok) { refreshed++; if (r.noted) noted++; }
+      if (r.ok && !r.unchanged) { refreshed++; if (r.noted) noted++; }
     } catch (err) {
       console.error(`[I.STITCH] refresh ${cand.contact_id} failed: ${err.message}`);
     }

@@ -140,9 +140,18 @@ export function buildMappedContactsSql(ids, visitorId) {
 // the same aggregate it writes to GHL, so the two always agree.
 
 const sqlText = (v) => (v == null || String(v).trim() === '' ? 'null' : `'${q(String(v).trim())}'`);
+// 2026-10-01: an ISO string from Postgres is passed through untouched.
+// site_events.created_at has MICROsecond precision and a JS Date keeps only
+// milliseconds, so round-tripping last_visit through Date stored
+// 14:59:18.650 for a page view at 14:59:18.650182 — and the refresh check
+// (page view newer than last_visit) then matched every lead on every batch.
+const ISO_TS = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(\.\d{1,6})?(Z|[+-]\d{2}(:?\d{2})?)?$/;
 const sqlTs = (v) => {
   if (v == null || v === '') return 'null';
-  const t = Date.parse(v);
+  const str = String(v).trim();
+  // Digits and separators only, so it is safe to quote as-is; Postgres parses it.
+  if (ISO_TS.test(str)) return `'${str}'::timestamptz`;
+  const t = Date.parse(str);
   return Number.isFinite(t) ? `'${new Date(t).toISOString()}'::timestamptz` : 'null';
 };
 const sqlInt = (v) => (Number.isFinite(Number(v)) ? String(Math.trunc(Number(v))) : '0');
@@ -192,13 +201,16 @@ export function buildRefreshCandidatesSql(limit) {
   return `select distinct on (m.contact_id)
         m.contact_id, m.visitor_id,
         (s.contact_id is not null) as has_summary,
-        s.intent_score as prev_score, s.page_counts as prev_page_counts
+        s.intent_score as prev_score, s.page_counts as prev_page_counts,
+        s.pages_viewed as prev_pages, s.last_visit as prev_last_visit
       from public.visitor_identity_map m
       left join public.site_lead_summary s on s.contact_id = m.contact_id
       where s.contact_id is null
          or exists (select 1 from public.site_events e
                     where e.visitor_id = m.visitor_id and e.event_type = 'pageview'
-                      and e.created_at > coalesce(s.last_visit, '-infinity'::timestamptz))
+                      -- truncated so a row stored at millisecond precision
+                      -- (every row before 2026-10-01's fix) cannot re-match forever
+                      and date_trunc('milliseconds', e.created_at) > coalesce(s.last_visit, '-infinity'::timestamptz))
       order by m.contact_id
       limit ${n}`;
 }
@@ -238,4 +250,18 @@ export function buildRetentionDeleteSql(days, batch) {
     count: `select count(*)::int as n from (select e.id from public.site_events e where ${where} limit ${b}) x`,
     delete: `delete from public.site_events where id in (select e.id from public.site_events e where ${where} limit ${b})`,
   };
+}
+
+/**
+ * Did a refresh change anything GHL shows? If pages, score and last visit are
+ * all the same as the stored row, the GHL write is skipped — a refresh must
+ * never touch a contact (and wake any "contact changed" workflow) for nothing.
+ * A backfill (no stored row) always counts as a change.
+ */
+export function refreshChanged(prev, next) {
+  if (!prev || !prev.has_summary) return true;
+  const ms = (v) => { const t = Date.parse(v); return Number.isFinite(t) ? t : null; };
+  return Number(prev.prev_pages) !== Number(next.pageviews)
+    || Number(prev.prev_score) !== Number(next.score)
+    || ms(prev.prev_last_visit) !== ms(next.last_visit);
 }
