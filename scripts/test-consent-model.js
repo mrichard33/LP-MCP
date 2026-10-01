@@ -719,7 +719,8 @@ test('channel tags: dnc-sms and dnc-voice block calls + texts only, with Five9 a
                                    ['TAG_DNC_VOICE_OPTOUT', 'dnc-voice', 'suppress:dnc-voice']]) {
     const { pattern, context, template } = channelRule(key);
     assert.deepEqual(pattern, { event_type: 'ghl.tag_added', event_subtype: tag });
-    assert.deepEqual(context, { not_has_tag: guard }, `${key} must not re-run the automatic opt-out`);
+    assert.equal(context.not_has_tag, guard, `${key} must not re-run the automatic opt-out`);
+    assert.equal(context.has_tag, tag, `${key} must re-read the tag live — a stale webhook snapshot can report it "added" after a lift removed it`);
     assert.deepEqual(dndChannels(template), ['Call', 'RCS', 'SMS'], `${key} must leave email open`);
     assert.ok(types(template).includes('five9_add_numbers_to_dnc'));
     assert.deepEqual(template.filter((s) => s.action_type === 'update_lp_dnc_status').map((s) => s.params.dnc_code), ['C'],
@@ -729,8 +730,9 @@ test('channel tags: dnc-sms and dnc-voice block calls + texts only, with Five9 a
 });
 
 test('channel tags: dnc-email blocks email only — no Five9, no LP', () => {
-  const { pattern, template } = channelRule('TAG_DNC_EMAIL_OPTOUT');
+  const { pattern, context, template } = channelRule('TAG_DNC_EMAIL_OPTOUT');
   assert.deepEqual(pattern, { event_type: 'ghl.tag_added', event_subtype: 'dnc-email' });
+  assert.deepEqual(context, { has_tag: 'dnc-email' });
   assert.deepEqual(dndChannels(template), ['Email']);
   assert.deepEqual(types(template), ['set_dnd', 'record_consent_change']);
 });
