@@ -13,7 +13,8 @@
  *      LIVE_CHAT_WEBHOOK_SECRET, LIVE_CHAT_MODEL (a NON-thinking model — the
  *      lane deadline is 10s and the client's thinking-model timeout floor is
  *      60s, so a thinking model would fall back on every reply), optional
- *      LIVE_CHAT_PROVIDER, LIVE_CHAT_HARD_TIMEOUT_MS, LIVE_CHAT_CONTEXT_CAP_MS.
+ *      LIVE_CHAT_PROVIDER, LIVE_CHAT_HARD_TIMEOUT_MS, LIVE_CHAT_CONTEXT_CAP_MS,
+ *      LIVE_CHAT_SEND_WEBHOOK_URL (live sends go to the I.LVO GHL workflow; unset → Conversations API).
  */
 
 import supabase from '../supabase.js';
@@ -43,7 +44,62 @@ async function fetchMessages(conversationId) {
   return res?.messages?.messages || res?.messages || res || [];
 }
 
-async function sendMessage({ contactId, conversationId, message }) {
+/**
+ * The contact's live-chat conversation, newest first. GHL's inbound workflow
+ * does not send a conversation id (2026-10-01), and without one the lane has
+ * no thread to read.
+ */
+async function findConversation(contactId) {
+  const search = await ghlFetch('GET', `/conversations/search?locationId=${GHL_LOCATION_ID}&contactId=${contactId}`, null, { priority: 'high', maxWaitMs: 1500 });
+  const conversations = Array.isArray(search) ? search : (search?.conversations || []);
+  return conversations[0]?.id || null;
+}
+
+/**
+ * The live-chat send path, chosen by env.
+ *
+ * 2026-10-01 (Mark): with LIVE_CHAT_SEND_WEBHOOK_URL set, a reply is POSTed to
+ * the GHL Inbound Webhook of "I.LVO Live Chat Outbound", whose one step is
+ * "Send live chat message" with {{inboundWebhookRequest.message}}. GHL's own
+ * live-chat action is the delivery path GHL supports for the widget. The
+ * trade-off: GHL answers 200 when it QUEUES the workflow, not when the visitor
+ * sees the message, so a 200 is "accepted", and the id is GHL's execution id,
+ * not a message id. Unset → the Conversations API, exactly as before.
+ *
+ * Payload contract (keep in step with I.LVO's field mapping):
+ *   contact_id, conversation_id, message, inbound_message, action_id,
+ *   channel ('livechat'), source ('lp-mcp-live-chat'), sent_at (ISO)
+ */
+export function liveChatWebhookPayload({ contactId, conversationId, message, actionId = null, inboundMessage = null, nowMs = Date.now() }) {
+  return {
+    contact_id: contactId,
+    conversation_id: conversationId || null,
+    message,
+    inbound_message: inboundMessage != null ? String(inboundMessage).slice(0, 1000) : null,
+    action_id: actionId ?? null,
+    channel: 'livechat',
+    source: 'lp-mcp-live-chat',
+    sent_at: new Date(nowMs).toISOString(),
+  };
+}
+
+export async function sendViaWebhook(url, args, { fetchImpl = fetch, timeoutMs = 5000 } = {}) {
+  const res = await fetchImpl(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(liveChatWebhookPayload(args)),
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  const text = await res.text().catch(() => '');
+  if (!res.ok) throw new Error(`live chat webhook ${res.status}: ${text.slice(0, 200)}`);
+  let json = null;
+  try { json = JSON.parse(text); } catch { /* GHL answers JSON; anything else is still a 2xx */ }
+  return { messageId: json?.id || null, conversationId: args.conversationId || null, method: 'ghl_webhook' };
+}
+
+async function sendMessage({ contactId, conversationId, message, actionId = null, inboundMessage = null }) {
+  const webhookUrl = (process.env.LIVE_CHAT_SEND_WEBHOOK_URL || '').trim();
+  if (webhookUrl) return sendViaWebhook(webhookUrl, { contactId, conversationId, message, actionId, inboundMessage });
   let convId = conversationId;
   if (!convId) {
     const search = await ghlFetch('GET', `/conversations/search?locationId=${GHL_LOCATION_ID}&contactId=${contactId}`, null, { priority: 'high' });
@@ -52,7 +108,7 @@ async function sendMessage({ contactId, conversationId, message }) {
     if (!convId) throw new Error('no conversation found for contact');
   }
   const result = await ghlFetch('POST', '/conversations/messages', livechatSendBody({ contactId, conversationId: convId, message }), { priority: 'high' });
-  return { messageId: result?.messageId || result?.id || null, conversationId: convId };
+  return { messageId: result?.messageId || result?.id || null, conversationId: convId, method: 'conversations_api' };
 }
 
 async function insertAction(row) {
@@ -92,6 +148,7 @@ export function buildProductionLane() {
   return createLiveChatFastLane({
     fetchContact,
     fetchMessages,
+    findConversation,
     buildContext: (contactId) => buildLeadContext(contactId, { includeConversation: false, skipCache: true }),
     prewarmEmbedding: prewarmQueryEmbedding,
     buildKbPack,
@@ -124,5 +181,5 @@ export function registerLiveChatRoutes(app) {
   const { model, provider } = resolveLLM('live_chat');
   const warning = liveChatModelWarning({ model, provider, deadlineMs: liveChatHardTimeoutMs() });
   if (mode !== 'off' && warning) console.warn(warning);
-  console.log(`[LiveChat] fast lane mounted at POST /webhooks/live-chat-inbound (mode=${mode}, model=${model}, secret=${process.env.LIVE_CHAT_WEBHOOK_SECRET ? 'set' : 'UNSET — route refuses everything'})`);
+  console.log(`[LiveChat] fast lane mounted at POST /webhooks/live-chat-inbound (mode=${mode}, model=${model}, secret=${process.env.LIVE_CHAT_WEBHOOK_SECRET ? 'set' : 'UNSET — route refuses everything'}, send=${process.env.LIVE_CHAT_SEND_WEBHOOK_URL ? 'ghl_webhook' : 'conversations_api'})`);
 }

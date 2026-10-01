@@ -87,6 +87,7 @@ import {
   serviceAreaRecord,
 } from '../agentic/service-area-turn.js';
 import { formatDateHuman, formatTimeHuman } from '../appointment-dates.js';
+import { guardTimeOffers, planLanguageHandoff } from './chat-rules.js';
 import { marketTimezone, tzLabel } from '../config/market-timezones.js';
 
 export const LIVE_CHAT_RULE = 'LIVE_CHAT_FAST_LANE';
@@ -203,7 +204,9 @@ You are answering in the website chat, live, with the visitor watching the scree
 - Never promise to send anything unless an email is on file. No email → ask for the email instead.
 - A large job (eight or more openings, commercial, church, HOA, property manager, a building) → answer, offer the next step, and a person will follow up; say that plainly.
 - Everything else in this prompt still binds: the discovery discipline, the decision-maker rules, no insurance predictions, no exclamation marks.
-- A SERVICE AREA instruction in this prompt outranks the collection order above for this reply: when it says ask only for the zip, or stop, do exactly that.`;
+- A SERVICE AREA instruction in this prompt outranks the collection order above for this reply: when it says ask only for the zip, or stop, do exactly that.
+- You CANNOT see the calendar in this chat. Never name a day or a time for a visit or a call. When they want a visit or a quote, say a team member will call to set a time that works, and ask for the best phone number if we do not have one.
+- Answer the question they asked, in their words. Do not repeat an answer you already gave in this conversation, and do not ask a question they already answered above.`;
 
 export const LIVE_CHAT_OUTPUT_CONTRACT = `
 ADDITIONAL OUTPUT (live chat): alongside the fields above, include a top-level "live_chat" object:
@@ -347,7 +350,8 @@ export function guardDraft(draft, { discipline, established, loopBreak, spouseAd
  *   buildKbPack(params)                    → kb pack or null
  *   classify(text, opts)                   → intent classification (no LLM)
  *   callLLM({fn, system, user, maxTokens, json}) → { text, model }
- *   sendMessage({contactId, conversationId, message}) → { messageId }
+ *   sendMessage({contactId, conversationId, message, actionId, inboundMessage}) → { messageId, method }
+ *   findConversation(contactId)            → GHL conversation id or null (capped)
  *   insertAction(row) → { id }             agent_actions insert
  *   updateAction(id, patch)
  *   claimMessages(contactId, keys) → { fresh, consumed }
@@ -374,6 +378,7 @@ export function createLiveChatFastLane(deps) {
     fingerprint: () => {},
     markSent: () => {},
     captureIdentity: async () => null,
+    findConversation: async () => null,
     checkServiceArea: async () => ({ checked: false }),
     lookupPlace: async () => ({ checked: false }),
     zoneForZip: async () => null,
@@ -409,7 +414,8 @@ export function createLiveChatFastLane(deps) {
   async function processInbound(inbound, { mode = d.mode() } = {}) {
     const t0Ms = Date.parse(inbound.dateAdded || '') || d.now();
     const tReceived = d.now();
-    const { contactId, conversationId, body } = inbound;
+    const { contactId, body } = inbound;
+    let conversationId = inbound.conversationId || null;
     const messageKey = inbound.messageId || buildMessageKey(contactId, null, body, tReceived);
     const timing = { t0_inbound_received: new Date(t0Ms).toISOString(), t1_event_written: null };
 
@@ -425,8 +431,21 @@ export function createLiveChatFastLane(deps) {
       d.log(`[LiveChat] opt-out signal from ${contactId} — no reply`);
       return { outcome: 'dnc_signal', mode };
     }
-    let contact = null;
-    try { contact = await d.fetchContact(contactId); } catch (err) { d.warn(`[LiveChat] contact fetch failed for ${contactId}: ${err.message}`); }
+    // 2026-10-01 go-live check: GHL's "I.LVI Live Chat Inbound" sends only
+    // contactId + body, so every reply ran with NO conversation history — the
+    // bot asked "what got you looking?" five times in one chat and forgot a
+    // quote request one message later. When the payload has no conversation
+    // id, look it up by contact, beside the contact fetch, capped.
+    const [contactRes, convRes] = await Promise.all([
+      Promise.resolve().then(() => d.fetchContact(contactId)).then(value => ({ value }), error => ({ error })),
+      conversationId ? Promise.resolve({ value: conversationId }) : raceWithBudget(Promise.resolve().then(() => d.findConversation(contactId)), d.contextCapMs()),
+    ]);
+    const contact = contactRes.error ? null : (contactRes.value || null);
+    if (contactRes.error) d.warn(`[LiveChat] contact fetch failed for ${contactId}: ${contactRes.error.message}`);
+    if (!conversationId) {
+      conversationId = (!convRes.timedOut && !convRes.error && convRes.value) ? String(convRes.value) : null;
+      if (!conversationId) d.warn(`[LiveChat] no conversation found for ${contactId} — replying without the thread`);
+    }
     const tags = (Array.isArray(contact?.tags) ? contact.tags : []).map(t => String(t).trim().toLowerCase());
     const suppression = matchSuppressionTags(tags, { mode: 'direct_reply', logContact: contactId });
     if (suppression.suppressed) {
@@ -535,6 +554,26 @@ export function createLiveChatFastLane(deps) {
       context.lead = { ...context.lead, current_tags: context.lead?.current_tags?.length ? context.lead.current_tags : tags, phone: context.lead?.phone || contact.phone || null, email: context.lead?.email || contact.email || null };
     }
 
+    // ── Spanish → a person (2026-10-01): a fixed hand-off, no model call ──
+    const langHandoff = planLanguageHandoff({ body, thread: context.conversation_recent });
+    if (langHandoff) {
+      if (langHandoff.first) {
+        d.emitEvent({
+          event_type: 'agentic.live_chat_language_handoff', source: 'live_chat_fast_lane', entity_type: 'contact', entity_id: contactId, ghl_contact_id: contactId,
+          priority: 'high', bypass_filter: true, idempotency_key: `livechat_lang_${contactId}`,
+          payload: { contact_id: contactId, language: langHandoff.language, inbound_preview: body.slice(0, 300), mode, action_id: actionId },
+        }).catch(err => d.warn(`[LiveChat] language hand-off event failed: ${err.message}`));
+        d.opsAlert(`🌎 LIVE CHAT — SPANISH SPEAKER\nContact: ${contactId}\nThey said: "${body.slice(0, 200)}"\n→ Needs a Spanish-speaking person to follow up.`).catch(() => {});
+      }
+      timing.t4_analysis_done = new Date(d.now()).toISOString();
+      timing.t5_generation_done = timing.t4_analysis_done;
+      return deliver({
+        contactId, conversationId, body, mode, actionId, timing, draft: langHandoff.reply,
+        capture: langHandoff.phone ? { phone: langHandoff.phone } : {},
+        extras: { language_handoff: langHandoff.language, context_minimal: !!context._minimal, model: null },
+      });
+    }
+
     // ── the same turn state generateResponse builds ──
     const established = buildEstablishedFacts({ conversation: context.conversation_recent, lead: context.lead, lp: context.lp, intelligence: context.intelligence, estimate: context.estimate });
     const contactTags = (context.lead?.current_tags || []).map(t => String(t).toLowerCase());
@@ -614,8 +653,10 @@ export function createLiveChatFastLane(deps) {
     // zip ask or an out-of-area answer).
     const runGuards = (message) => {
       const base = guardDraft(message, { discipline, established, loopBreak, spouseAdvocacy, leadFirstName });
-      const cov = guardCoverageDraft(base.fixed, coverage);
-      return { ...base, notes: [...base.notes, ...cov.notes], fixed: cov.fixed, coverage_notes: cov.notes.length };
+      // No calendar in this lane: any named day/time is invented (2026-10-01).
+      const times = guardTimeOffers(base.fixed, { hasPhone: !!(context.lead?.phone) });
+      const cov = guardCoverageDraft(times.fixed, coverage);
+      return { ...base, notes: [...base.notes, ...times.notes, ...cov.notes], fixed: cov.fixed, coverage_notes: cov.notes.length, time_offers_removed: times.notes.length > 0 };
     };
     let gen = await generate(null);
     timing.t4_analysis_done = new Date(d.now()).toISOString();
@@ -643,12 +684,40 @@ export function createLiveChatFastLane(deps) {
       d.opsAlert(`🏢 LIVE CHAT — LARGE JOB SIGNAL\nContact: ${contactId}\nThey said: "${body.slice(0, 200)}"\nSignal: ${largeJob || 'model-flagged'}\n→ Needs a person to follow up.`).catch(() => {});
     }
 
-    // ── send (live) or record (shadow) ──
+    return deliver({
+      contactId, conversationId, body, mode, actionId, timing, draft, capture,
+      extras: {
+        intent_class: classification?.intent_class || null,
+        classifier_method: classification?.classification_method || null,
+        buyer_stage: Number(liveChatFields?.buyer_stage) || null,
+        live_chat: liveChatFields,
+        email_malformed: malformed,
+        large_job: isLarge,
+        regenerated,
+        discipline_notes: guard.notes.length,
+        time_offers_removed: !!guard.time_offers_removed,
+        service_area: serviceAreaRecord(saPlan, coverage),
+        context_minimal: !!context._minimal,
+        kb_pack_used: !!kbPack,
+        model,
+        _bot_context: { core_prompt_version: 'live_chat_fast_lane', model, discipline, established_closed: established.closed_questions },
+      },
+      fingerprintExtras: {
+        intent_class: classification?.intent_class || null, buyer_stage: Number(liveChatFields?.buyer_stage) || null, model,
+        input_snapshot: { mode, discipline, established_closed: established.closed_questions, context_minimal: !!context._minimal },
+      },
+    });
+  }
+
+  /** Send (live) or record (shadow) one finished reply. */
+  async function deliver({ contactId, conversationId, body, mode, actionId, timing, draft, capture = {}, extras = {}, fingerprintExtras = {} }) {
     let ghlMessageId = null;
+    let sendMethod = null;
     let sent = false;
     if (mode === 'live') {
-      const res = await d.sendMessage({ contactId, conversationId, message: draft });
+      const res = await d.sendMessage({ contactId, conversationId, message: draft, actionId, inboundMessage: body });
       ghlMessageId = res?.messageId || null;
+      sendMethod = res?.method || null;
       sent = true;
       timing.t6_ghl_sent = new Date(d.now()).toISOString();
       if (capture.phone || capture.email) {
@@ -662,38 +731,26 @@ export function createLiveChatFastLane(deps) {
       send_status: sent ? 'sent' : 'shadow',
       ...(sent ? { sent_body: draft.slice(0, 500) } : { draft_body: draft.slice(0, 500) }),
       message_id: ghlMessageId,
+      send_method: sendMethod,
       conversation_id: conversationId,
-      intent_class: classification?.intent_class || null,
-      classifier_method: classification?.classification_method || null,
-      buyer_stage: Number(liveChatFields?.buyer_stage) || null,
-      live_chat: liveChatFields,
-      email_malformed: malformed,
-      large_job: isLarge,
-      regenerated,
-      discipline_notes: guard.notes.length,
-      service_area: serviceAreaRecord(saPlan, coverage),
-      context_minimal: !!context._minimal,
-      kb_pack_used: !!kbPack,
-      model,
+      ...extras,
       timing: finished,
-      _bot_context: { core_prompt_version: 'live_chat_fast_lane', model, discipline, established_closed: established.closed_questions },
     };
     await finishAction(actionId, { status: 'completed', execution_result: executionResult });
     if (actionId != null) {
       d.fingerprint({
         message_type: 'reply', message_ref: String(actionId), ghl_contact_id: contactId, channel: 'livechat',
-        intent_class: classification?.intent_class || null, buyer_stage: Number(liveChatFields?.buyer_stage) || null,
-        rule_applied: LIVE_CHAT_RULE, model, inbound_text: body, reply_text: draft,
-        input_snapshot: { mode, discipline, established_closed: established.closed_questions, context_minimal: !!context._minimal },
+        rule_applied: LIVE_CHAT_RULE, inbound_text: body, reply_text: draft,
+        ...fingerprintExtras,
       });
       if (sent) d.markSent(actionId);
     }
     d.log(
       `[ReplyTiming] contact=${contactId} action=${actionId ?? 'n/a'} rule=${LIVE_CHAT_RULE} channel=livechat ` +
       `total_ms=${finished.total_ms ?? 'n/a'} queue_ms=${finished.queue_ms ?? 'n/a'} analyze_ms=${finished.analyze_ms ?? 'n/a'} ` +
-      `generate_ms=${finished.generate_ms ?? 'n/a'} send_ms=${finished.send_ms ?? 'n/a'} mode=${mode}`
+      `generate_ms=${finished.generate_ms ?? 'n/a'} send_ms=${finished.send_ms ?? 'n/a'} mode=${mode}${sendMethod ? ` via=${sendMethod}` : ''}`
     );
-    return { outcome: sent ? 'sent' : 'shadow', sent, message: draft, ghl_message_id: ghlMessageId, timing: finished, large_job: isLarge, email_malformed: malformed };
+    return { outcome: sent ? 'sent' : 'shadow', sent, message: draft, ghl_message_id: ghlMessageId, timing: finished, large_job: !!extras.large_job, email_malformed: !!extras.email_malformed, language_handoff: extras.language_handoff || null };
   }
 
   async function fallback({ contactId, conversationId, mode, actionId, timing, reason, body }) {
@@ -701,7 +758,7 @@ export function createLiveChatFastLane(deps) {
     let sent = false;
     if (mode === 'live') {
       try {
-        const res = await d.sendMessage({ contactId, conversationId, message: LIVE_CHAT_FALLBACK_MESSAGE });
+        const res = await d.sendMessage({ contactId, conversationId, message: LIVE_CHAT_FALLBACK_MESSAGE, actionId, inboundMessage: body });
         ghlMessageId = res?.messageId || null;
         sent = true;
         timing.t6_ghl_sent = new Date(d.now()).toISOString();
