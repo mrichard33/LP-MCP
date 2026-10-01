@@ -39,9 +39,9 @@ function makeReq(body, secret = SECRET) {
 function makeLane({
   mode = 'live', tags = [], llm = () => ({ message: 'Sure. What made you start looking at this now?' }),
   llmDelayMs = 5, hardTimeoutMs = 2000, contextCapMs = 300, buildContext = null, messages = [],
-  insertAction = null, now = null, checkServiceArea = null, lookupPlace = null,
+  insertAction = null, now = null, checkServiceArea = null, lookupPlace = null, findConversation = null, phone = null,
 } = {}) {
-  const state = { sends: [], actions: [], updates: [], events: [], ops: [], claimed: new Set(), llmCalls: [], captured: [], fingerprints: [], slots: [], lookups: [], places: [] };
+  const state = { sends: [], actions: [], updates: [], events: [], ops: [], claimed: new Set(), llmCalls: [], captured: [], fingerprints: [], slots: [], lookups: [], places: [], fetchedConversations: [], lookedUp: [] };
   let nextId = 1000;
   const lane = createLiveChatFastLane({
     now: now || (() => Date.now()),
@@ -51,8 +51,9 @@ function makeLane({
     contextCapMs: () => contextCapMs,
     log: () => {},
     warn: () => {},
-    fetchContact: async () => ({ id: 'C1', firstName: 'Alyce', tags, phone: null, email: null }),
-    fetchMessages: async () => messages,
+    fetchContact: async () => ({ id: 'C1', firstName: 'Alyce', tags, phone, email: null }),
+    fetchMessages: async (convId) => { state.fetchedConversations.push(convId); return messages; },
+    findConversation: async (cid) => { state.lookedUp.push(cid); return findConversation ? findConversation(cid) : null; },
     buildContext: buildContext || (async () => { throw new Error('no lead context in tests'); }),
     prewarmEmbedding: () => null,
     buildKbPack: async () => null,
@@ -63,7 +64,7 @@ function makeLane({
       const out = llm(user, system, state.llmCalls.length);
       return { text: JSON.stringify({ story_arc: 'none', ...out }), model: 'fake-model' };
     },
-    sendMessage: async ({ contactId, conversationId, message }) => { state.sends.push({ contactId, conversationId, message }); return { messageId: `m${state.sends.length}` }; },
+    sendMessage: async ({ contactId, conversationId, message, actionId, inboundMessage }) => { state.sends.push({ contactId, conversationId, message, actionId, inboundMessage }); return { messageId: `m${state.sends.length}`, method: 'ghl_webhook' }; },
     insertAction: insertAction
       ? async (row) => { state.actions.push({ id: null, ...row }); return insertAction(row); }
       : async (row) => { const id = nextId++; state.actions.push({ id, ...row }); return { id }; },
@@ -452,4 +453,67 @@ test('a visitor who will not give a zip is not asked twice; one-market place ans
   assert.deepEqual(state.places, ['Palm Coast']);
   assert.equal(firstSentence(out.message), 'Yes, we serve the Palm Coast area.');
   assert.doesNotMatch(out.message, /zip code\?/i);
+});
+
+// ── 2026-10-01 go-live check fixes ──────────────────────────────────────────
+
+const { SPANISH_HANDOFF_LINE } = await import('../src/live-chat/chat-rules.js');
+
+test('no conversation id in the payload → found by contact, and the thread is read (the bot remembers)', async () => {
+  const messages = [
+    { direction: 'inbound', body: "I'd like someone to come out and give me a quote", dateAdded: '2026-10-01T15:24:40Z' },
+    { direction: 'outbound', body: "Happy to set that up. What's your name?", dateAdded: '2026-10-01T15:24:46Z' },
+    { direction: 'inbound', body: 'My name is Mark', dateAdded: '2026-10-01T15:25:00Z' },
+  ];
+  const { lane, state } = makeLane({ mode: 'shadow', messages, findConversation: async () => 'convFound' });
+  await lane.processInbound({ contactId: 'C1', messageId: 'm-x', body: 'My name is Mark' });
+  assert.deepEqual(state.lookedUp, ['C1']);
+  assert.deepEqual(state.fetchedConversations, ['convFound']);
+  assert.match(state.llmCalls[0].user, /give me a quote/, 'the earlier quote request is in the prompt');
+  assert.equal(state.actions[0].action_payload.conversation_id, 'convFound');
+});
+
+test('a conversation id in the payload is used as is, with no lookup', async () => {
+  const { lane, state } = makeLane({ mode: 'shadow' });
+  await lane.processInbound(INBOUND('hi'));
+  assert.deepEqual(state.lookedUp, []);
+  assert.deepEqual(state.fetchedConversations, ['conv1']);
+});
+
+test('a lookup that hangs costs at most the context cap and the reply still goes out', async () => {
+  const { lane, state } = makeLane({ mode: 'shadow', contextCapMs: 100, findConversation: () => new Promise(() => {}) });
+  const out = await lane.processInbound({ contactId: 'C1', messageId: 'm-y', body: 'Who does the install?' });
+  assert.equal(out.outcome, 'shadow');
+  assert.deepEqual(state.fetchedConversations, []);
+});
+
+test('the invented weekend slots never reach the visitor', async () => {
+  const { lane } = makeLane({
+    mode: 'live',
+    llm: () => ({ message: "Perfect. I have two openings this weekend — Saturday at 10 AM or Sunday at 2 PM. Which works better for you?" }),
+  });
+  const out = await lane.processInbound(INBOUND("I'd like someone to come out and give me a quote"));
+  assert.doesNotMatch(out.message, /\b(?:10 AM|2 PM|Saturday|Sunday)\b/);
+  assert.match(out.message, /A team member will call you to set up a time/);
+});
+
+test('a Spanish visitor gets the Spanish hand-off with no model call, and #ops-alerts is told once', async () => {
+  const { lane, state } = makeLane({ mode: 'live' });
+  const out = await lane.processInbound(INBOUND('hola dime que debo de haser'));
+  assert.equal(out.message, SPANISH_HANDOFF_LINE);
+  assert.equal(out.language_handoff, 'es');
+  assert.equal(state.llmCalls.length, 0);
+  assert.equal(state.sends.length, 1);
+  await new Promise(r => setImmediate(r));
+  assert.equal(state.ops.filter(t => t.includes('SPANISH')).length, 1);
+  assert.equal(state.events.filter(e => e.event_type === 'agentic.live_chat_language_handoff').length, 1);
+  assert.equal(state.updates.find(u => u.status === 'completed').execution_result.language_handoff, 'es');
+});
+
+test('live sends carry the action id and the visitor message for the I.LVO webhook', async () => {
+  const { lane, state } = makeLane({ mode: 'live' });
+  const out = await lane.processInbound(INBOUND('Who does the install?'));
+  assert.equal(state.sends[0].actionId, out.action_id);
+  assert.equal(state.sends[0].inboundMessage, 'Who does the install?');
+  assert.equal(state.updates.find(u => u.status === 'completed').execution_result.send_method, 'ghl_webhook');
 });

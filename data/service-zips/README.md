@@ -11,3 +11,12 @@ replaces them through `scripts/import-service-zips.js --replace`.
   CC BY 4.0.
 - **Known gap:** zips used only for PO boxes are not in the Census file, so this list leaves them
   out.
+
+## `houston_60mi.csv` — Houston's real list (Mark, 2026-10-01)
+
+- **Scope:** 253 zips whose Census zip area has its centre point within 60 straight-line miles of Houston City Hall. Taken from Mark's `Houston_TX_Zip_Codes.xlsx`.
+- **Checked against** the Census 2025 ZCTA Gazetteer before loading. The same 253 zips fall inside 60 miles: none missing, none extra.
+- **City and county** come from the same sources as the default list.
+- **Load it with:**
+  `node scripts/import-service-zips.js --market HOU --file data/service-zips/houston_60mi.csv --replace`
+  This adds 45 zips and removes 1 default zip, 77873 Richards, which sits 62 miles out.
