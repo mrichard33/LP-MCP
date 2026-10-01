@@ -38,7 +38,7 @@ const EXPRESS_MODULE = JSON.stringify(join(ROOT, 'node_modules/express/index.js'
 // only the env (SHUTDOWN_GRACE_MS) and the route exercised differ.
 const CHILD_APP = `
 import express from ${EXPRESS_MODULE};
-import { trackInflight, trackBackground, installGracefulShutdown } from ${SHUTDOWN_MODULE};
+import { trackInflight, trackBackground, trackAction, installGracefulShutdown } from ${SHUTDOWN_MODULE};
 
 const app = express();
 app.use(trackInflight);
@@ -55,6 +55,15 @@ app.get('/slow', async (req, res) => {
 app.get('/ack-then-work', (req, res) => {
   res.json({ ok: true, route: 'ack-then-work' });
   trackBackground(sleep(1500).then(() => console.log('BACKGROUND_DONE')));
+});
+
+// 2b. The reply fast path's shape (2026-10-01, Dan H.): the decision engine
+// starts executeActionById WITHOUT awaiting it, after the request that
+// triggered it has already answered. src/actions/index.js wraps every action
+// run in trackAction.
+app.get('/fire-and-forget-action', (req, res) => {
+  res.json({ ok: true, route: 'fire-and-forget-action' });
+  trackAction(sleep(1500).then(() => console.log('ACTION_DONE')));
 });
 
 // 3. Never finishes — must be cut off by the grace timer.
@@ -211,4 +220,22 @@ test('an open long-lived /mcp stream does not delay exit', async () => {
   // Without the isLongLived() exemption this pins to the full 5s grace.
   assert.ok(drainMs < 2000, `open stream must not pin the drain, took ${drainMs}ms`);
   assert.match(out(), /Drained cleanly/, 'stream must not be counted as in-flight');
+});
+
+test('a fire-and-forget action (the reply fast path) keeps the drain open until it finishes', async () => {
+  const { child, ready, exited, out } = startChild({ SHUTDOWN_GRACE_MS: '5000' });
+  const port = await ready;
+
+  const res = await get(port, '/fire-and-forget-action');
+  assert.equal(res.status, 200);
+  await sleep(200);
+  child.kill('SIGTERM');
+
+  const { code } = await exited;
+  assert.equal(code, 0);
+  // Action 532106: the drain said "cleanly" 1.5s after SIGTERM with a reply
+  // still being written. Now it names the action and waits for it.
+  assert.match(out(), /draining \(inflight=0, background=1, actions=1,/);
+  assert.match(out(), /ACTION_DONE/, 'the action must run to completion');
+  assert.ok(out().indexOf('ACTION_DONE') < out().indexOf('Drained cleanly'), 'the action finishes before the drain reports clean');
 });

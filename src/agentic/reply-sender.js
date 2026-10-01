@@ -125,11 +125,18 @@ export function decideReplyChannel({
     return asResult('email', 'email_passthrough');
   }
 
+  // 2026-10-01 (Mark) — the website live chat belongs to the live-chat fast
+  // lane (src/live-chat/), which sends through its own path and never calls
+  // this function. The normal pipeline therefore NEVER answers inside the
+  // chat: a visitor who is no longer in front of it is answered by text.
+  // Before this, a GHL "Chat Widget" message (type 5, the SMS-style widget,
+  // which behavioral-emitter correctly treats as SMS) read here as webchat →
+  // 'livechat_fresh', and the normal bot replied inside the chat widget six
+  // times in 14 days (action 531618, iUsgBlDcwqRS0U9boAdX, 2026-10-01 20:02Z).
   if (inboundOrigin === 'livechat') {
     const fresh = livechatAgeMin !== null && livechatAgeMin < ttlMin;
-    if (fresh) return asResult('livechat', 'livechat_fresh');
-    if (hasPhone) return asResult('sms', 'livechat_stale_downgrade', true);
-    return asResult(null, 'livechat_stale_no_phone');
+    if (hasPhone) return asResult('sms', fresh ? 'livechat_owned_by_fast_lane' : 'livechat_stale_downgrade', true);
+    return asResult(null, fresh ? 'livechat_owned_by_fast_lane_no_phone' : 'livechat_stale_no_phone');
   }
 
   if (inboundOrigin === 'sms') {

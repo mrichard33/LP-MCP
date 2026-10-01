@@ -16,6 +16,7 @@ const GRACE_MS = parseInt(process.env.SHUTDOWN_GRACE_MS || '90000', 10);
 let shuttingDown = false;
 let inflight = 0;
 const background = new Set();
+let actionsInFlight = 0;
 const hooks = { start: [], exit: [] };
 
 export function isShuttingDown() { return shuttingDown; }
@@ -39,6 +40,19 @@ export function trackBackground(promise) {
   const p = Promise.resolve(promise).catch(() => {}).finally(() => background.delete(p));
   background.add(p);
   return promise;
+}
+
+// 2026-10-01 (Dan H., bMidLh3nDpWadrf7X8bG) — an agent action that is running
+// (a customer reply being written, a tag, an LP write). The decision engine's
+// reply fast path starts executeActionById fire-and-forget, so a deploy's
+// SIGTERM saw "nothing running", logged "Drained cleanly after 1502ms" and
+// exited three seconds into the reply. src/actions/index.js wraps every
+// executeSingleAction run in this, so the drain waits for it.
+export function trackAction(promise) {
+  actionsInFlight++;
+  const done = () => { actionsInFlight--; };
+  Promise.resolve(promise).then(done, done);
+  return trackBackground(promise);
 }
 
 // Same intent as trackBackground, for the `setImmediate(async () => {...})` shape
@@ -65,14 +79,14 @@ export function installGracefulShutdown(server) {
     if (shuttingDown) return;
     shuttingDown = true;
     const started = Date.now();
-    console.log(`[Shutdown] ${signal} received — draining (inflight=${inflight}, background=${background.size}, grace=${GRACE_MS}ms)`);
+    console.log(`[Shutdown] ${signal} received — draining (inflight=${inflight}, background=${background.size}, actions=${actionsInFlight}, grace=${GRACE_MS}ms)`);
     try { server.close(() => console.log('[Shutdown] HTTP server closed to new connections')); } catch (_) {}
     await runHooks('start', signal);
     while ((inflight > 0 || background.size > 0) && Date.now() - started < GRACE_MS) {
       await new Promise((r) => setTimeout(r, 250));
     }
     const clean = inflight === 0 && background.size === 0;
-    console.log(`[Shutdown] ${clean ? 'Drained cleanly' : `GRACE EXPIRED with inflight=${inflight}, background=${background.size}`} after ${Date.now() - started}ms`);
+    console.log(`[Shutdown] ${clean ? 'Drained cleanly' : `GRACE EXPIRED with inflight=${inflight}, background=${background.size}, actions=${actionsInFlight}`} after ${Date.now() - started}ms`);
     await runHooks('exit', signal);
     process.exit(0);
   };
@@ -81,4 +95,4 @@ export function installGracefulShutdown(server) {
 }
 
 // test-only
-export function _stateForTests() { return { shuttingDown, inflight, background: background.size }; }
+export function _stateForTests() { return { shuttingDown, inflight, background: background.size, actions: actionsInFlight }; }

@@ -83,6 +83,32 @@ import { emitEvent } from '../event-emitter.js';
 // 10 minutes is generous — longest legitimate handler (set_lp_appointment
 // with full LP API roundtrip) finishes in <30s. Anything 20× that is dead.
 const REAPER_AGE_MINUTES = 10;
+export const REAPER_AGE_MS = REAPER_AGE_MINUTES * 60 * 1000;
+
+// 2026-10-01 (Dan H., action 532106) — a customer reply killed by a deploy sat
+// in 'executing' for the full 10 minutes before this reaper retried it, while
+// the customer waited mid-conversation. send_message gets its own, shorter
+// age: its handler watchdog (passed in by the executor, which owns it — see
+// resolveHandlerTimeoutMs in src/actions/index.js) plus this margin. By then
+// the watchdog has already ended any live handler, so the row can only be a
+// zombie, and the retry's verifyPriorSendLanded check plus the outbound lock
+// keep a reaped reply from double-texting.
+export const SEND_MESSAGE_REAP_MARGIN_MS = 60 * 1000;
+
+/** How long a row of this type may sit in 'executing' before it is reaped. Pure. */
+export function reaperAgeMsFor(actionType, { sendMessageWatchdogMs = null } = {}) {
+  if (actionType === 'send_message' && Number.isFinite(sendMessageWatchdogMs) && sendMessageWatchdogMs > 0) {
+    return Math.min(REAPER_AGE_MS, sendMessageWatchdogMs + SEND_MESSAGE_REAP_MARGIN_MS);
+  }
+  return REAPER_AGE_MS;
+}
+
+/** Is this 'executing' row stuck? Pure. An unreadable updated_at is not. */
+export function isStuckExecuting(row, nowMs, opts = {}) {
+  const at = Date.parse(row?.updated_at || '');
+  if (!Number.isFinite(at)) return false;
+  return nowMs - at > reaperAgeMsFor(row?.action_type, opts);
+}
 
 // Actions in 'approved' status older than this are pathological orphans.
 // 2 minutes is well past any plausible transitional use (the executor
@@ -163,14 +189,19 @@ async function emitDroppedReply(action, errorMsg) {
  * requeued like idempotent ones — the handler verifies externally
  * before resending. They still respect the retry budget.
  */
-async function reapStuckExecuting() {
-  const cutoff = new Date(Date.now() - REAPER_AGE_MINUTES * 60 * 1000).toISOString();
+async function reapStuckExecuting({ sendMessageWatchdogMs = null } = {}) {
+  const nowMs = Date.now();
+  // The read uses the SHORTEST age any type can have; each row is then held
+  // to its own type's age.
+  const minAgeMs = Math.min(REAPER_AGE_MS, reaperAgeMsFor('send_message', { sendMessageWatchdogMs }));
+  const cutoff = new Date(nowMs - minAgeMs).toISOString();
 
-  const { data: stuck, error } = await supabase
+  const { data: candidates, error } = await supabase
     .from('agent_actions')
     .select('id, action_type, retry_count, max_retries, rule_applied, updated_at')
     .eq('status', 'executing')
     .lt('updated_at', cutoff);
+  const stuck = (candidates || []).filter((row) => isStuckExecuting(row, nowMs, { sendMessageWatchdogMs }));
 
   if (error) {
     console.error(`[Reaper:executing] fetch failed: ${error.message}`);
@@ -196,21 +227,21 @@ async function reapStuckExecuting() {
       // Requeue within retry budget. Handler verifies before resending.
       if (retriesExhausted) {
         newStatus = 'failed';
-        errorMsg = `Reaped: stuck in executing >${REAPER_AGE_MINUTES}min; recovery attempts exhausted (${newRetryCount}/${max}) for ${action.action_type}`;
+        errorMsg = `Reaped: stuck in executing >${Math.round(reaperAgeMsFor(action.action_type, { sendMessageWatchdogMs }) / 1000)}s; recovery attempts exhausted (${newRetryCount}/${max}) for ${action.action_type}`;
       } else {
         newStatus = 'pending';
-        errorMsg = `Reaped: stuck in executing >${REAPER_AGE_MINUTES}min; requeued for recovery-verified retry (${newRetryCount}/${max}, ${action.action_type})`;
+        errorMsg = `Reaped: stuck in executing >${Math.round(reaperAgeMsFor(action.action_type, { sendMessageWatchdogMs }) / 1000)}s; requeued for recovery-verified retry (${newRetryCount}/${max}, ${action.action_type})`;
       }
     } else if (isStrictNonIdempotent) {
       // Drop. No external verification path exists for this type.
       newStatus = 'failed';
-      errorMsg = `Reaped: stuck in executing >${REAPER_AGE_MINUTES}min; not retried (non-idempotent ${action.action_type} would duplicate side effects)`;
+      errorMsg = `Reaped: stuck in executing >${Math.round(reaperAgeMsFor(action.action_type, { sendMessageWatchdogMs }) / 1000)}s; not retried (non-idempotent ${action.action_type} would duplicate side effects)`;
     } else if (retriesExhausted) {
       newStatus = 'failed';
-      errorMsg = `Reaped: stuck in executing >${REAPER_AGE_MINUTES}min; retries exhausted (${newRetryCount}/${max})`;
+      errorMsg = `Reaped: stuck in executing >${Math.round(reaperAgeMsFor(action.action_type, { sendMessageWatchdogMs }) / 1000)}s; retries exhausted (${newRetryCount}/${max})`;
     } else {
       newStatus = 'pending';
-      errorMsg = `Reaped: stuck in executing >${REAPER_AGE_MINUTES}min; requeued for retry (${newRetryCount}/${max})`;
+      errorMsg = `Reaped: stuck in executing >${Math.round(reaperAgeMsFor(action.action_type, { sendMessageWatchdogMs }) / 1000)}s; requeued for retry (${newRetryCount}/${max})`;
     }
 
     const { error: updateErr } = await supabase
@@ -327,8 +358,8 @@ async function reapStuckApproved() {
  * to work. `.approved_recovered`, `.approved_skipped`, and the
  * 2026-05-13 `.recovery_requeued` fields are additive.
  */
-export async function reapStuckActions() {
-  const exec = await reapStuckExecuting();
+export async function reapStuckActions({ sendMessageWatchdogMs = null } = {}) {
+  const exec = await reapStuckExecuting({ sendMessageWatchdogMs });
   const appr = await reapStuckApproved();
 
   return {

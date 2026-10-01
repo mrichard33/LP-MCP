@@ -315,7 +315,7 @@ import { checkApptEventDedup } from './services/appt-event-dedup.js';
 // real ai.analysis_completed for this contact exists inside this window.
 import { recentAnalysisExists, DEDUP_CONFIRM_WINDOW_MS } from './services/analysis-confirm.js';
 import { stripQuotedEmail } from './email-thread.js';
-import { trackBackground } from './graceful-shutdown.js';
+import { trackBackground, onShutdown } from './graceful-shutdown.js';
 import { withGhlToken } from './ghl-rate-limiter.js';
 
 const GHL_WEBHOOK_SECRET = process.env.GHL_WEBHOOK_SECRET || '';
@@ -528,7 +528,12 @@ function scheduleBufferedPipeline(contactId, trimmed, emittedEventId, messageTyp
   // most recent inbound, so dedup keys on its message_id.
   if (messageId) buf.latestMessageId = messageId;
 
-  buf.timeoutId = setTimeout(async () => {
+  // 2026-10-01 — the fire logic is a named function so the shutdown hook below
+  // can run it early. A buffer that is fired is removed from the map first,
+  // so the timer and the hook can never both run it.
+  buf.fire = async () => {
+    if (replyBuffers.get(contactId) !== buf) return;
+    if (buf.timeoutId) clearTimeout(buf.timeoutId);
     // Snapshot before deleting; any messages that arrive AFTER this point
     // start a fresh buffer.
     const messages = buf.messages.slice();
@@ -587,10 +592,32 @@ function scheduleBufferedPipeline(contactId, trimmed, emittedEventId, messageTyp
     // retry deterministic). PRE-v2.12 these events were marked processed=true
     // BEFORE the pipeline ran, so a failed/hung analysis silently dropped the
     // reply with no retry.
-    runBufferedPipelineWithRetry(contactId, combined, channel, freshMessages, eventIds, 0, latestMessageId, freshKeys, firstInbound)
-      .catch(err => console.error(`[ReplyBuffer] Runner error for ${contactId}: ${err.message}`));
-  }, REPLY_DEBOUNCE_MS);
+    // 2026-10-01 — tracked, so a deploy's SIGTERM waits for the reply.
+    trackBackground(runBufferedPipelineWithRetry(contactId, combined, channel, freshMessages, eventIds, 0, latestMessageId, freshKeys, firstInbound)
+      .catch(err => console.error(`[ReplyBuffer] Runner error for ${contactId}: ${err.message}`)));
+  };
+  buf.timeoutId = setTimeout(() => { trackBackground(buf.fire()); }, REPLY_DEBOUNCE_MS);
 }
+
+/**
+ * 2026-10-01 (Dan H., bMidLh3nDpWadrf7X8bG) — fire every pending reply buffer
+ * NOW. A message that lands seconds before a deploy otherwise waits in an
+ * in-memory 15s timer that dies with the process, and the customer waits for
+ * the ~5-minute decision-engine backstop instead. Run from the graceful
+ * shutdown 'start' hook, so the reply is analysed and sent inside the drain.
+ * Returns how many buffers it fired.
+ */
+export function flushReplyBuffersNow() {
+  const pending = [...replyBuffers.values()].filter((b) => typeof b.fire === 'function');
+  for (const b of pending) trackBackground(b.fire());
+  if (pending.length) console.log(`[ReplyBuffer] Shutdown — fired ${pending.length} pending buffer(s) early so their replies go out during the drain`);
+  return pending.length;
+}
+onShutdown(() => { flushReplyBuffersNow(); });
+
+/** test-only: queue a message exactly as handleReply does. */
+export function _scheduleBufferedPipelineForTests(...args) { return scheduleBufferedPipeline(...args); }
+export function _replyBufferCountForTests() { return replyBuffers.size; }
 
 // 2026-07-03 — terminal marker for a fully-deduped buffer window: the events
 // are processed (nothing left to analyze) with an explicit audit trail.
@@ -633,10 +660,10 @@ async function runBufferedPipelineWithRetry(contactId, combined, channel, messag
   }
   if (attempt + 1 < BUFFER_MAX_RETRIES) {
     console.warn(`[ReplyBuffer] Analysis failed for ${contactId} (attempt ${attempt + 1}/${BUFFER_MAX_RETRIES}) — retrying in ${BUFFER_RETRY_DELAY_MS}ms`);
-    setTimeout(() => {
-      runBufferedPipelineWithRetry(contactId, combined, channel, messages, eventIds, attempt + 1, messageId, messageKeys, inbound)
-        .catch(err => console.error(`[ReplyBuffer] Retry runner error for ${contactId}: ${err.message}`));
-    }, BUFFER_RETRY_DELAY_MS);
+    // Tracked, so a drain waits for the retry too (2026-10-01).
+    trackBackground(new Promise((resolve) => setTimeout(resolve, BUFFER_RETRY_DELAY_MS))
+      .then(() => runBufferedPipelineWithRetry(contactId, combined, channel, messages, eventIds, attempt + 1, messageId, messageKeys, inbound))
+      .catch(err => console.error(`[ReplyBuffer] Retry runner error for ${contactId}: ${err.message}`)));
     return;
   }
   // Exhausted in-process retries. Leave the source events processed=false on
