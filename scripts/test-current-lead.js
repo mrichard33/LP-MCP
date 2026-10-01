@@ -27,6 +27,55 @@ test('pickCurrentLead: empty / missing input → null', () => {
   assert.equal(pickCurrentLead(null), null);
 });
 
+// 2026-10-01 — a blank Data lead must not hide a real appointment.
+test('pickCurrentLead (Sharyn Blake): Data lead made 4 min after the demo lead does not win', () => {
+  const demo = { lp_lead_id: '579801', disposition_code: 'OPPFDN', appointment_date: '2026-10-01T14:00:00Z',
+    created_at_lp: '2026-09-30T10:10:40Z', updated_at_lp: '2026-10-01T15:44:26Z' };
+  const data = { lp_lead_id: '579804', disposition_code: 'Data', appointment_date: null,
+    created_at_lp: '2026-09-30T10:14:53Z', updated_at_lp: '2026-09-30T10:14:53Z' };
+  const old = { lp_lead_id: '524525', disposition_code: 'CXL', appointment_date: '2026-04-16T14:00:00Z',
+    created_at_lp: '2026-04-07T13:45:10Z', updated_at_lp: '2026-04-15T19:58:50Z' };
+  assert.equal(pickCurrentLead([old, demo, data]).lp_lead_id, '579801');
+  assert.equal(buildMergedLead([old, demo, data]).disposition_code, 'OPPFDN');
+});
+
+test('pickCurrentLead: Data lead within 15 days AFTER an appointment still yields', () => {
+  const demo = { lp_lead_id: 'demo', disposition_code: 'OPPFDN', appointment_date: '2026-09-20T14:00:00Z',
+    created_at_lp: '2026-09-01T00:00:00Z' };
+  const data = { lp_lead_id: 'data', disposition_code: 'Data', created_at_lp: '2026-10-01T00:00:00Z' };
+  assert.equal(pickCurrentLead([demo, data]).lp_lead_id, 'demo');
+});
+
+test('pickCurrentLead: Data lead 16+ days after the last appointment stays current (15-day window)', () => {
+  const demo = { lp_lead_id: 'demo', disposition_code: 'OPPFDN', appointment_date: '2026-09-14T14:00:00Z',
+    created_at_lp: '2026-09-10T00:00:00Z' };
+  const data = { lp_lead_id: 'data', disposition_code: 'Data', created_at_lp: '2026-10-01T00:00:00Z' };
+  assert.equal(pickCurrentLead([demo, data]).lp_lead_id, 'data');
+});
+
+test('pickCurrentLead: Data lead long after the last appointment is a new cycle and stays current', () => {
+  const demo = { lp_lead_id: 'demo', disposition_code: 'OPPFDN', appointment_date: '2026-03-01T14:00:00Z',
+    created_at_lp: '2026-02-20T00:00:00Z' };
+  const data = { lp_lead_id: 'data', disposition_code: 'Data', created_at_lp: '2026-10-01T00:00:00Z' };
+  assert.equal(pickCurrentLead([demo, data]).lp_lead_id, 'data');
+});
+
+test('pickCurrentLead: only Data is skipped — a newer DNC or worked lead still wins', () => {
+  const demo = { lp_lead_id: 'demo', disposition_code: 'OPPFDN', appointment_date: '2026-09-30T14:00:00Z',
+    created_at_lp: '2026-09-29T00:00:00Z' };
+  for (const code of ['DNC', 'ND', 'Set']) {
+    const newer = { lp_lead_id: code, disposition_code: code, created_at_lp: '2026-10-01T00:00:00Z' };
+    assert.equal(pickCurrentLead([demo, newer]).lp_lead_id, code, code);
+  }
+});
+
+test('pickCurrentLead: a Data lead with no other appointment, or the only lead, stays current', () => {
+  const data = { lp_lead_id: 'data', disposition_code: 'Data', created_at_lp: '2026-10-01T00:00:00Z' };
+  const noAppt = { lp_lead_id: 'na', disposition_code: 'NIS', created_at_lp: '2026-09-29T00:00:00Z' };
+  assert.equal(pickCurrentLead([data]).lp_lead_id, 'data');
+  assert.equal(pickCurrentLead([noAppt, data]).lp_lead_id, 'data');
+});
+
 test('buildMergedLead (Napoly): newer-created OPPFDN lead beats the later-updated CXL lead', () => {
   const cxl = { lp_lead_id: '578728', ghl_contact_id: 'zxyqXazWZa0h3hrNodq8', disposition_code: 'CXL',
     created_at_lp: '2026-09-25T10:00:00Z', updated_at_lp: '2026-09-30T12:00:00Z' };

@@ -76,7 +76,7 @@ async function loadLeads(deps, contactIds) {
   const byContact = new Map();
   for (let i = 0; i < contactIds.length; i += LP_CHUNK) {
     const { data, error } = await deps.supabase.from('lp_leads')
-      .select('ghl_contact_id, lp_lead_id, disposition_code, closed_won, created_at_lp, updated_at_lp, appts:raw_lp_data->appointments')
+      .select('ghl_contact_id, lp_lead_id, disposition_code, closed_won, appointment_date, created_at_lp, updated_at_lp, appts:raw_lp_data->appointments')
       .in('ghl_contact_id', contactIds.slice(i, i + LP_CHUNK))
       .is('lp_deleted_at', null);
     if (error) throw new Error(`lp_leads read failed: ${error.message}`);
