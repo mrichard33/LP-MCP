@@ -27,9 +27,18 @@ const SLOT_RX = /\b(?:openings?|time\s*slots?|slots?\s+(?:open|available|left)|a
 
 const splitSentences = (t) => String(t || '').split(/(?<=[.!?])\s+/).map((s) => s.trim()).filter(Boolean);
 
+// A named day paired with a part of the day or a choice: "Friday afternoon or
+// Saturday morning", "tomorrow morning", "this weekend". 2026-10-01 browser
+// test: the clock-time check above let "which works better, Friday afternoon or
+// Saturday morning?" through, and that is the same invented offer in words.
+// A bare preference question ("do mornings or afternoons suit you?") names no
+// day and is left alone.
+const DAY = '(?:mon|tues|wednes|thurs|fri|satur|sun)day|tomorrow|tonight|this\\s+weekend|next\\s+(?:week|weekend)';
+const DAY_OFFER_RX = new RegExp(`\\b(?:${DAY})\\b[^.?!]{0,40}?\\b(?:morning|afternoon|evening|night|at\\s+\\d+|or\\s+(?:${DAY}))\\b|\\b(?:morning|afternoon|evening)\\s+(?:on\\s+)?(?:${DAY})\\b|\\b(?:openings?|slots?|availability)\\b[^.?!]{0,30}\\b(?:${DAY})\\b`, 'i');
+
 /** Sentences that offer a specific appointment time. Pure. */
 export function findTimeOffers(text) {
-  return splitSentences(text).filter((s) => CLOCK_RX.test(s) || SLOT_RX.test(s));
+  return splitSentences(text).filter((s) => CLOCK_RX.test(s) || SLOT_RX.test(s) || DAY_OFFER_RX.test(s));
 }
 
 /** The next step the bot CAN promise: a person calls to set the time. */

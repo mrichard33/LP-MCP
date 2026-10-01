@@ -67,3 +67,17 @@ test('sendViaWebhook posts JSON, returns the GHL execution id, and throws on a n
   const bad = async () => ({ ok: false, status: 404, text: async () => 'not found' });
   await assert.rejects(sendViaWebhook('https://hook', { contactId: 'C1', message: 'x' }, { fetchImpl: bad }), /live chat webhook 404/);
 });
+
+test('named days are offers too: the browser-test draft "Friday afternoon or Saturday morning" is caught', () => {
+  const draft = "Got it. We'll set up an in-home estimate where our specialist measures everything to Florida code and leaves you exact pricing valid for a full year. Two options coming up — which works better, Friday afternoon or Saturday morning?";
+  const g = guardTimeOffers(draft);
+  assert.equal(g.notes.length, 1);
+  assert.doesNotMatch(g.fixed, /Friday|Saturday|Two options/);
+  assert.match(g.fixed, /A team member will call you to set up a time that works/);
+  for (const t of ['Would tomorrow morning work?', 'We can come out this weekend or next week.', 'I have availability on Tuesday.', 'How about Saturday at 10?', 'Does Monday or Wednesday work better?']) {
+    assert.equal(findTimeOffers(t).length, 1, t);
+  }
+  for (const t of ['Would mornings or afternoons work better?', 'What day of the week is best for a call?', 'Our office is open Monday through Friday.', 'The visit takes about an hour and a half.']) {
+    assert.equal(findTimeOffers(t).length, 0, t);
+  }
+});
