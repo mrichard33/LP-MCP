@@ -365,6 +365,8 @@ import { resolveServicePhone } from './services/market-phone.js';
 // Every prompt string this file assembles. Copy only — no logic, no env reads.
 // See src/prompts/response-generator/index.js.
 import * as P from './prompts/response-generator/index.js';
+import { isRehashContact, normalizeRehashCall, stripOfferTalk, REHASH_NUMBER_DEFAULT, REHASH_REP_CUSTOM_VALUE } from './agentic/rehash.js';
+import { getCustomValue } from './services/ghl-custom-values.js';
 import { dialWindowPromptLine, canPromiseImmediateCall } from './dial-window.js';
 import { normalizeRepNote } from './agentic/rep-note.js';
 import { findUndeliveredSendPromise, undeliveredPromiseNote, rewriteUndeliveredPromise, validateInfoEmailPayload } from './agentic/send-promise.js';
@@ -608,11 +610,26 @@ export function last10Digits(raw) {
  * @returns {{persona:'mark'|'team', signature:string, shared:boolean,
  *            nameIfAsked:string, matched:boolean}}
  */
-export function resolveSmsSenderIdentity(fromNumber) {
+export function resolveSmsSenderIdentity(fromNumber, { rehash = null } = {}) {
   // Reuses resolveReplySenderName so the Randy guard applies here too and the
   // name stays consistent with the email path.
   const personName = resolveReplySenderName() || 'Mark';
   const n = last10Digits(fromNumber);
+
+  // 2026-10-01 (Mark) — a post-demo lead in F.0 (tag active-f.0, line
+  // 727-800-4578) is talking to the rehash rep, whose name is the GHL custom
+  // value rehash_rep_name, resolved before the prompt is built. That line is
+  // the rep's own, so it is a direct line. No resolved name → fall through to
+  // the team identity below: a wrong name is worse than "Reece Team".
+  if (rehash?.active && rehash.repName) {
+    return {
+      persona: 'rehash',
+      signature: rehash.repName,
+      shared: false,
+      nameIfAsked: rehash.repName,
+      matched: Boolean(n && n === last10Digits(process.env.AGENTIC_SMS_NUMBER_REHASH || REHASH_NUMBER_DEFAULT)),
+    };
+  }
 
   const markNumber = last10Digits(process.env.AGENTIC_SMS_NUMBER_MARK || SMS_NUMBER_MARK_DEFAULT);
   if (n && markNumber && n === markNumber) {
@@ -1088,7 +1105,8 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
   // in-office rep. Field reps named later in this prompt are people the
   // customer has met — they own the deal, they do not author this message.
   {
-    const authorName = resolveReplySenderName();
+    // 2026-10-01: a post-demo F.0 reply is written by the rehash rep.
+    const authorName = (opts.rehash?.active && opts.rehash.repName) || resolveReplySenderName();
     parts.push(...P.authorship(authorName));
   }
 
@@ -1097,7 +1115,7 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
   // pinned in validateResponse — so this only decides the sign-off and what
   // the bot says when a customer asks who they are talking to.
   if (channel === 'sms') {
-    const ident = resolveSmsSenderIdentity(opts.fromNumber);
+    const ident = resolveSmsSenderIdentity(opts.fromNumber, { rehash: opts.rehash || null });
     const alreadySigned = threadCarriesSignOff(context.conversation_recent, ident.signature);
     parts.push(...P.LINE_IDENTITY_HEADER);
     if (ident.shared) {
@@ -1116,7 +1134,7 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
     } else {
       parts.push(...P.signOffNotYetSigned(ident.signature));
     }
-    parts.push(...P.signOffFooter(ident.signature));
+    parts.push(...(ident.persona === 'rehash' ? P.signOffFooterRehash(ident.signature) : P.signOffFooter(ident.signature)));
   }
   // 2026-09-26 — livechat is a short-message channel; before this it fell to
   // the email constraints (the pipeline never generated for it, so nothing
@@ -1363,7 +1381,18 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
     if (hasRealFutureAppt) {
       parts.push(...P.POST_APPOINTMENT_FUTURE_APPT_EXCEPTION);
     }
-    parts.push(...P.POST_APPOINTMENT_CLOSE);
+    // 2026-10-01: in F.0 the next step IS a call with the rehash rep, so the
+    // generic "the rep is sending your proposal" close does not apply.
+    if (!opts.rehash?.active) parts.push(...P.POST_APPOINTMENT_CLOSE);
+    else parts.push(...P.POST_APPOINTMENT_CONDUCT_END);
+  }
+  // ─── POST-DEMO REHASH (2026-10-01, Mark) ───
+  // An F.0 lead (tag active-f.0) is talking to the rehash rep, and the one goal
+  // is a phone call with that rep. Rendered AFTER the post-appointment ban: it
+  // carves out exactly one exception (a phone call with the rep) and keeps the
+  // rest of the ban (no visit, no slot, no link). See src/agentic/rehash.js.
+  if (opts.rehash?.active) {
+    parts.push(...P.postDemoRehash(opts.rehash.repName || null));
   }
 
   if (fastTrack && !postAppt.post && !ackOnly) {
@@ -2290,6 +2319,8 @@ export function validateResponse(parsed, channel, knownAppointments = null) {
     rep_note: repNote,
     reasoning: String(parsed.reasoning || '').slice(0, 500),
     companion_action: companionAction,
+    // 2026-10-01: post-demo rehash — did the lead agree to a call, and when.
+    rehash_call: normalizeRehashCall(parsed.rehash_call),
   };
 }
 
@@ -3208,7 +3239,35 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   const handoffNote = guideResend
     ? guideResendReplyNote(guideResend.type)
     : (handoff ? handoffReplyNote(classification.intent_class) : null);
-  const promptHint = [opts.promptHint, handoffNote]
+  // ─── POST-DEMO REHASH (2026-10-01, Mark) ───
+  // An F.0 lead (tag active-f.0, or the 727-800-4578 line) talks to the rehash
+  // rep. The rep's name is the GHL custom value rehash_rep_name, read here
+  // (cached 1h, null on failure → team identity) and written into the prompt
+  // as a literal: a merge tag can never ship (assertNoUnresolvedTokens).
+  // SMS only: the rehash rep's line is a phone number, and an email reply
+  // carries the in-office sender (resolveEmailSender) whatever the stage.
+  const rehashActive = channel === 'sms' && isRehashContact({ tags: context.lead?.current_tags || [], fromNumber: opts.fromNumber || null });
+  let rehashRepName = null;
+  if (rehashActive) {
+    try {
+      const raw = opts.rehashRepNameResolver ? await opts.rehashRepNameResolver() : await getCustomValue(REHASH_REP_CUSTOM_VALUE);
+      const first = formatRepFirstName(raw);
+      rehashRepName = first && !isRandyName(first) ? first : null;
+    } catch (err) {
+      console.warn(`[ResponseGenerator] rehash rep name unresolved for ${contactId}: ${err.message}`);
+    }
+    if (!rehashRepName) console.warn(`[ResponseGenerator] rehash reply for ${contactId} with no rep name — signing as the team`);
+  }
+  const rehash = rehashActive ? { active: true, repName: rehashRepName } : null;
+
+  // Every layer3 SCRIPT DIRECTIVE is written for a lead BEFORE the demo
+  // ("pricing needs the in-home measurement", Confirmation Call slots, the
+  // Five9 phone room). For a post-demo rehash lead each one fights the one
+  // goal, so it is dropped and the POST-DEMO REHASH block leads.
+  if (rehash && opts.promptHint) {
+    console.log(`[ResponseGenerator] rehash reply for ${contactId}: layer3 script directive dropped (pre-demo copy)`);
+  }
+  const promptHint = [rehash ? null : opts.promptHint, handoffNote]
     .filter(Boolean).join('\n\n') || null;
 
   const buyerStage    = inferBuyerStage(context);
@@ -3533,6 +3592,8 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       // (Mark's line vs the shared team line) — see resolveSmsSenderIdentity.
       // Null is safe: it resolves to the shared-team identity.
       fromNumber: opts.fromNumber || null,
+      // 2026-10-01: post-demo F.0 lead → the rehash rep's identity and goal.
+      rehash,
       // 2026-07-29: decision-time state — outranks the live read for stage tag,
       // buyer stage, and the post-appointment verdict.
       contextSnapshot,
@@ -3640,6 +3701,17 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // then-safe-fallback loop in send-message-handler: the lead still gets a
   // reply, and it is never one with raw template syntax in it.
   assertNoUnresolvedTokens(validated.message, contactId);
+
+  // ─── Rehash offer guard (2026-10-01, Mark) ───
+  // The offer is hinted at, never named: a price, a percentage, a discount or
+  // "a deal" from the rehash line is a promise the rep has not made.
+  if (rehash) {
+    const offer = stripOfferTalk(validated.message);
+    if (offer.stripped.length) {
+      console.warn(`[ResponseGenerator] rehash offer talk stripped for ${contactId}: ${offer.stripped.join(' | ').slice(0, 200)}`);
+      validated.message = offer.text;
+    }
+  }
 
   // ─── Randy bridge guard (2026-09-18 — Catherine Crosier incident) ───
   //
@@ -4234,6 +4306,9 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     resolved_service_phone: servicePhone?.phone_display || null,
     // 2026-10-01: { zip, place, result, market_code } on a coverage turn.
     service_area: serviceAreaRecord(serviceAreaTurn?.plan, serviceAreaTurn?.coverage),
+    // 2026-10-01: { active, rep_name } on a post-demo F.0 reply; the send
+    // handler posts the #contact-rehash card when rehash_call.agreed.
+    rehash: rehash ? { active: true, rep_name: rehash.repName } : null,
     contact_known_phone: identityState?.identity?.phone || context?.lead?.phone || null,
     // v2.7.14 — Bot Review Phase 0 replay context. Assembled from values already
     // in scope; nothing is fetched and nothing is written here. The send handler
