@@ -4,32 +4,36 @@ First-party visitor tracking for Reece across the **main site**, **GHL pages**, 
 **Weakest Point LP**. Feeds `public.site_events` (LP Supabase, sql/025 schema), which the
 **I.STITCH** workflow stitches to GHL contacts every 5 minutes.
 
+> **2026-10-01 — where the tracker lives now.** The script and its collector are a separate
+> Railway service, **`reece-tracker`** (repo `mrichard33/reece-tracker`), on
+> `https://track.getreecewindows.com`. Edit the tracker there; LP-MCP no longer holds a copy.
+> LP-MCP still owns **I.STITCH** (`src/site-stitch.js`), which reads `site_events`.
+
 ## How it flows
 
 ```
 reece-tracker.js (browser, text/plain beacon)
-  → n8n Webhook   POST https://n8n-main-instance-production-981e.up.railway.app/webhook/reece-track
-                  (responds 200 immediately — fire-and-forget)
-  → n8n HTTP Request → LP-MCP  POST /n8n/site/collect   (src/site-collect.js)
-                  · whitelists fields to the 025 columns
-                  · folds client IP (x-forwarded-for) into raw.ip
-                  · inserts into public.site_events via the service-role client
-  → I.STITCH (5-min cron) claims new `identify` rows → GHL custom fields + intent signals
+  → reece-tracker service   POST https://track.getreecewindows.com/collect
+                  · whitelists fields to the 025 columns, folds client IP into raw.ip
+                  · inserts into public.site_events (LP Supabase)
+  → I.STITCH (LP-MCP, 5-min cron) claims new `identify` rows → GHL custom fields + note + intent signals
 ```
+
+The older path (n8n `/webhook/reece-track` → LP-MCP `POST /n8n/site/collect`) still works
+for any page that sets `data-collector` to it.
 
 The tracker posts the body as **`text/plain`** on purpose: that makes it a CORS "simple"
 request, so **no preflight/CORS config** is needed on any of the three surfaces.
 
 ## 1. Embed snippet (identical on all three surfaces)
 
-Add this once per page/site (replace `YOURHOST` with wherever Kyle hosts the file):
+Add this once per page/site:
 
 ```html
-<script src="https://YOURHOST/reece-tracker.js"
-        data-reece-tracker
-        data-collector="https://n8n-main-instance-production-981e.up.railway.app/webhook/reece-track"
-        defer></script>
+<script src="https://track.getreecewindows.com/reece-tracker.js" data-reece-tracker defer></script>
 ```
+
+With no `data-collector`, the tracker sends to `https://track.getreecewindows.com/collect`.
 
 Optional attributes (defaults shown):
 - `data-cookie="_reece_vid"` — visitor cookie name.
@@ -37,13 +41,22 @@ Optional attributes (defaults shown):
 - `data-sister-domains="reecewindows.com,getreecewindows.com"` — domains that get `?vid=`
   decoration for cross-domain stitching. **Update this to the real sister domains.**
 - `data-track-spa="true"` — also fire a pageview on SPA route changes (pushState/popstate).
+- `data-auto-identify="true"` — identify automatically on form submit (see §2). Set
+  `"false"` to turn that off for the page.
 
 A pageview is sent automatically on load (and on SPA navigations). The tracker sets a
 first-party visitor cookie and a per-session cookie, and exposes `window.ReeceTrack`.
 
 ## 2. Identify known leads on form / chatbot submit
 
-When a visitor submits a form or chatbot (any surface), call:
+**Automatic since 2026-10-01.** Any form with an email or phone field fires `identify` on
+submit — the Wufoo forms on reecewindows.com included (they have no `<label>`s, so the
+tracker matches on `type=`, placeholder, name/id and label text). Phone is sent as 10 digits;
+a ZIP in a `type=tel` box is ignored. It never blocks or delays the form, and fires once per
+form for the same email/phone within 10 seconds. To skip one form, add
+`data-reece-no-identify` to its `<form>` tag.
+
+Manual calls still work — use them for chatbots or anything that is not a `<form>`:
 
 ```js
 ReeceTrack.identify({ email: "jane@example.com", phone: "+15551234567", name: "Jane Doe" });
@@ -51,6 +64,16 @@ ReeceTrack.identify({ email: "jane@example.com", phone: "+15551234567", name: "J
 
 This emits an `identify` event. I.STITCH resolves it to a GHL contact **match-only**
 (never creates) in this priority order: `raw.cid` → exact email → normalized phone.
+
+When several GHL contacts share the email or phone (duplicates), I.STITCH picks one in this
+order: the contact this visitor is already stitched to → a contact whose phone matches the
+submitted phone → a contact another visitor is stitched to → the most complete record
+(has a phone and a name) → the most recently updated.
+
+A contact's totals (`site_pages_viewed`, `site_intent_score`, `last_site_visit`,
+`first_touch_source`) cover **every** visitor ever stitched to them, so a return visit from
+a new browser or device adds to the totals instead of replacing them. An unknown first touch
+is never written, so it cannot erase one GHL already holds.
 
 You can also send custom events:
 
@@ -78,14 +101,17 @@ on form submission). Confirm this is covered before go-live.
 
 ## Operational notes
 
-- **Collector workflow:** n8n "I.TRACK — Site Event Collector" (active). Public path
-  `/webhook/reece-track`. It is fire-and-forget — `neverError` + continue-on-error mean a
-  malformed payload never breaks the beacon.
-- **Ingest route:** `POST /n8n/site/collect` (LP-MCP, `src/site-collect.js`). No auth,
-  write-only to `site_events`. **Goes live only after LP-MCP is deployed** (Railway tracks
-  `main`) — until then the n8n webhook still returns 200 but the forward 404s.
+- **Collector (live):** the `reece-tracker` service, `POST https://track.getreecewindows.com/collect`.
+  See that repo's README for redeploys and the health check.
+- **Legacy collector:** n8n "I.TRACK — Site Event Collector" (`/webhook/reece-track`) →
+  LP-MCP `POST /n8n/site/collect` (`src/site-collect.js`). No auth, write-only to `site_events`.
+- **Browser cache:** the tracker is served with `max-age=3600`, so a tracker change reaches a
+  returning browser up to an hour later. Test changes in a fresh incognito window.
 - **Schema:** `site_events` columns — `event_type, visitor_id, session_id, page_path,
   utm_source, fbclid, identity_email, identity_phone, raw`. The IP has no column; it lives
   in `raw.ip`. Other secondary signals (referrer, utm_medium/campaign/term/content, gclid,
   msclkid, screen, tz, cid, alias_id) also live in `raw`.
 - **Tuning intent scoring / page tiers:** edit the `RUBRIC` object in `src/site-stitch.js`.
+- **Stitch decisions** (which visitors a contact's totals cover, which fields are written,
+  which duplicate wins) live in `src/site-stitch-core.js`, tested by
+  `scripts/test-site-stitch-core.js`.

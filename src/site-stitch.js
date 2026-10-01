@@ -12,8 +12,10 @@
  *   2. ensureGhlFields() — resolve/create the 4 GHL custom field IDs.
  *   3. Claim a batch of unprocessed `identify` events (FOR UPDATE SKIP LOCKED).
  *   4. Resolve GHL contact, match-only: raw.cid > email > phone. Never creates.
+ *      Several exact matches (GHL duplicates) → pickContact() chooses one.
  *      Misses → unmatched_identities (+attempts) with re-queue backoff.
- *   5. Aggregate cross-domain history via visitor_links.
+ *   5. Aggregate history over EVERY visitor known for the contact (this one,
+ *      visitor_identity_map, and visitor_links partners) — totals never shrink.
  *   6. Score intent 0–100 (recency ×2 within 7d, cap 100) — one editable rubric.
  *   7. Enrich GHL: updateGHLContactFields (customFields ONLY — never tags) +
  *      addGHLNote (deduped). NO tag writes whatsoever.
@@ -31,6 +33,9 @@ import { runSQL } from './admin/supabase-admin.js';
 import { emitEvent } from './event-emitter.js';
 import { updateGHLContactFields, addGHLNote } from './ghl.js';
 import { withGhlToken } from './ghl-rate-limiter.js';
+import {
+  buildAggregateSql, buildSiteFieldUpdates, exactMatches, pickContact, buildMappedContactsSql,
+} from './site-stitch-core.js';
 
 // ─── Config (env with safe fallbacks — no n8n env dependency) ──────────────
 const BATCH_SIZE = parseInt(process.env.STITCH_BATCH_SIZE || '50', 10);
@@ -198,19 +203,34 @@ async function resolveContactId(ev) {
   const raw = ev.raw || {};
   if (raw.cid) return raw.cid; // (1) highest confidence — no search
 
-  if (ev.identity_email) {       // (2) exact email
-    const want = String(ev.identity_email).toLowerCase();
-    const hit = (await ghlSearchContacts(ev.identity_email)).find(c => (c.email || '').toLowerCase() === want);
-    if (hit) return hit.id;
+  // (2) exact email, then (3) normalized phone (last 10). Each step can return
+  // several exact matches when GHL holds duplicates; pickContact decides.
+  let hits = [];
+  if (ev.identity_email) {
+    hits = exactMatches(await ghlSearchContacts(ev.identity_email), { email: ev.identity_email });
   }
-  if (ev.identity_phone) {       // (3) normalized phone (last 10)
-    const want = digits(ev.identity_phone).slice(-10);
-    if (want.length >= 10) {
-      const hit = (await ghlSearchContacts(ev.identity_phone)).find(c => digits(c.phone).endsWith(want));
-      if (hit) return hit.id;
+  if (hits.length === 0 && ev.identity_phone && digits(ev.identity_phone).length >= 10) {
+    hits = exactMatches(await ghlSearchContacts(ev.identity_phone), { phone: ev.identity_phone });
+  }
+  if (hits.length === 0) return null;
+  if (hits.length === 1) return hits[0].id;
+
+  let mappedContactIds = [];
+  let visitorContactId = null;
+  try {
+    const rows = await runSQL(buildMappedContactsSql(hits.map(c => c.id), ev.visitor_id));
+    for (const r of Array.isArray(rows) ? rows : []) {
+      mappedContactIds.push(r.contact_id);
+      if (r.this_visitor === true || r.this_visitor === 't') visitorContactId = r.contact_id;
     }
+  } catch (err) {
+    // The map only sharpens the choice; without it the record-quality ranking still applies.
+    console.warn(`[I.STITCH] visitor_identity_map lookup failed: ${err.message}`);
   }
-  return null;
+  const chosen = pickContact(hits, { phone: ev.identity_phone, visitorContactId, mappedContactIds });
+  // Count and id only — never the email/phone that matched.
+  console.log(`[I.STITCH] ${hits.length} GHL contacts share this identity — chose ${chosen.id}`);
+  return chosen.id;
 }
 
 // ─── Unmatched backoff ─────────────────────────────────────────────────────
@@ -240,38 +260,11 @@ async function recordUnmatched(ev) {
   return { attempts, requeued };
 }
 
-// ─── Cross-domain aggregation (visitor_links + site_events) ────────────────
+// ─── History aggregation (every visitor known for the contact) ─────────────
 async function aggregateHistory(visitorId, contactId, maxEventId) {
-  const vid = String(visitorId).replace(/'/g, "''");
-  const cid = String(contactId).replace(/'/g, "''");
-  const sql = `
-    with linked as (
-      select distinct unnest(array[id_a, id_b]) as vid from public.visitor_links
-      where id_a = '${vid}' or id_b = '${vid}'
-      union select '${vid}'
-    ),
-    ev as (
-      select * from public.site_events
-      where visitor_id in (select vid from linked) and event_type = 'pageview'
-    ),
-    perpage as (
-      select page_path,
-             count(*) as cnt,
-             count(*) filter (where created_at >= now() - interval '${RUBRIC.recency_days} days') as recent_cnt
-      from ev where page_path is not null group by page_path
-    )
-    select
-      '${cid}'::text as contact_id,
-      ${Number(maxEventId)}::bigint as max_site_event_id,
-      (select array_agg(vid) from linked) as visitor_ids,
-      (select string_agg(vid, ',') from linked) as visitor_ids_csv,
-      (select count(*) from ev) as pageviews,
-      (select count(distinct session_id) from ev) as sessions,
-      (select max(created_at) from ev) as last_visit,
-      (select coalesce(utm_source, fbclid) from ev where coalesce(utm_source, fbclid) is not null order by created_at asc limit 1) as first_touch_source,
-      coalesce((select jsonb_object_agg(page_path, cnt) from perpage), '{}'::jsonb) as page_counts,
-      coalesce((select jsonb_object_agg(page_path, recent_cnt) from perpage where recent_cnt > 0), '{}'::jsonb) as recent_page_counts`;
-  const rows = await runSQL(sql);
+  const rows = await runSQL(buildAggregateSql({
+    visitorId, contactId, maxEventId, recencyDays: RUBRIC.recency_days,
+  }));
   return Array.isArray(rows) ? rows[0] : null;
 }
 
@@ -324,11 +317,7 @@ async function processEvent(ev, fields) {
   const { score, top_pages } = scoreIntent(agg);
 
   // Enrich GHL — customFields ONLY (never tags) + deduped note.
-  const cf = [];
-  if (fields.last_site_visit && agg.last_visit) cf.push({ id: fields.last_site_visit, field_value: agg.last_visit });
-  if (fields.site_intent_score) cf.push({ id: fields.site_intent_score, field_value: score });
-  if (fields.site_pages_viewed) cf.push({ id: fields.site_pages_viewed, field_value: Number(agg.pageviews) || 0 });
-  if (fields.first_touch_source) cf.push({ id: fields.first_touch_source, field_value: agg.first_touch_source || '' });
+  const cf = buildSiteFieldUpdates(fields, agg, score);
   if (cf.length) await updateGHLContactFields(contactId, cf);
 
   const note = `Site activity: ${agg.pageviews || 0} pageviews / ${agg.sessions || 0} sessions. `
