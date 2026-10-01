@@ -22,6 +22,10 @@
  *   8. Upsert visitor_identity_map for every linked visitor_id.
  *   9. emitEvent (bypass_filter) site.identity_stitched always; site.high_intent_signal
  *      when score >= threshold.
+ *  10. Upsert site_lead_summary — ONE row per lead (sql/142, 2026-10-01).
+ *  11. Returning-visit refresh: rebuild up to STITCH_REFRESH_LIMIT known leads
+ *      with newer page views (and backfill any without a row) — summary row +
+ *      GHL fields, a note only when something a rep would act on changed.
  *
  * Scope guardrail: ENRICH + SIGNAL ONLY. No messaging, no routing, no
  * stage/buyer/active-entry tag writes. The consuming agent_rule + event-intake
@@ -35,12 +39,15 @@ import { updateGHLContactFields, addGHLNote } from './ghl.js';
 import { withGhlToken } from './ghl-rate-limiter.js';
 import {
   buildAggregateSql, buildSiteFieldUpdates, exactMatches, pickContact, buildMappedContactsSql,
+  buildSummaryUpsertSql, buildRefreshCandidatesSql, refreshNoteReason,
 } from './site-stitch-core.js';
 
 // ─── Config (env with safe fallbacks — no n8n env dependency) ──────────────
 const BATCH_SIZE = parseInt(process.env.STITCH_BATCH_SIZE || '50', 10);
 const MAX_MATCH_ATTEMPTS = parseInt(process.env.STITCH_MAX_MATCH_ATTEMPTS || '3', 10);
 const HIGH_THRESHOLD = parseInt(process.env.SITE_INTENT_HIGH_THRESHOLD || '50', 10);
+// Returning-visit refresh: contacts rebuilt per 5-minute batch. 0 turns it off.
+const REFRESH_LIMIT = parseInt(process.env.STITCH_REFRESH_LIMIT || '50', 10);
 const GHL_LOCATION_ID = process.env.GHL_LOCATION_ID || 'SsBG7j5KQAIP1SFP2Sca';
 const GHL_API_KEY = process.env.GHL_API_KEY || '';
 const GHL_BASE = 'https://services.leadconnectorhq.com';
@@ -301,6 +308,26 @@ async function persistMap(visitorIdsCsv, contactId) {
       set contact_id = excluded.contact_id, last_enriched_at = now()`);
 }
 
+// ─── One row per lead (site_lead_summary, sql/142) ─────────────────────────
+// Returns true only when the row was written. A missing table (sql/142 not yet
+// applied) logs and returns false; the GHL write on the identify path does not
+// depend on it, but the returning-visit refresh does (see refreshContact).
+async function upsertSummary(contactId, agg, score, topPages) {
+  try {
+    await runSQL(buildSummaryUpsertSql({ contactId, agg, score, topPages }));
+    return true;
+  } catch (err) {
+    console.warn(`[I.STITCH] site_lead_summary upsert failed for ${contactId}: ${err.message}`);
+    return false;
+  }
+}
+
+function activityNote(agg, score, topPages, prefix = '') {
+  return `${prefix}Site activity: ${agg.pageviews || 0} pageviews / ${agg.sessions || 0} sessions. `
+    + `Last visit ${agg.last_visit || 'n/a'}. Top pages: ${(topPages || []).join(', ') || 'n/a'}. `
+    + `First touch: ${agg.first_touch_source || 'unknown'}. Intent score ${score}.`;
+}
+
 // ─── Per-item processing ───────────────────────────────────────────────────
 async function processEvent(ev, fields) {
   const contactId = await resolveContactId(ev);
@@ -320,13 +347,11 @@ async function processEvent(ev, fields) {
   const cf = buildSiteFieldUpdates(fields, agg, score);
   if (cf.length) await updateGHLContactFields(contactId, cf);
 
-  const note = `Site activity: ${agg.pageviews || 0} pageviews / ${agg.sessions || 0} sessions. `
-    + `Last visit ${agg.last_visit || 'n/a'}. Top pages: ${(top_pages || []).join(', ') || 'n/a'}. `
-    + `First touch: ${agg.first_touch_source || 'unknown'}. Intent score ${score}.`;
-  await addGHLNote(contactId, note, { dedupe: true });
+  await addGHLNote(contactId, activityNote(agg, score, top_pages), { dedupe: true });
 
   // Persist mapping for every linked visitor_id.
   await persistMap(agg.visitor_ids_csv || ev.visitor_id, contactId);
+  await upsertSummary(contactId, agg, score, top_pages);
 
   // Emit to the agentic brain (bypass the intake filter — consumers are a
   // documented post-deploy step; we want these to land now).
@@ -352,6 +377,53 @@ async function processEvent(ev, fields) {
   return { matched: true, contact_id: contactId, score, high };
 }
 
+// ─── Returning-visit refresh (2026-10-01) ───────────────────────────────────
+// I.STITCH used to run only on a form submit, so a known lead who came back
+// and just browsed never moved their GHL totals. Each batch now also rebuilds
+// up to REFRESH_LIMIT contacts whose stitched browsers have newer page views
+// than their summary row — and every stitched contact with no row yet, which
+// is how the table backfills itself. GHL is written only after the row is, so
+// a missing table cannot turn this into a GHL write every five minutes.
+// No agent events from here: emitting on refresh is a separate decision.
+async function refreshContact(cand, fields) {
+  const contactId = cand.contact_id;
+  const agg = await aggregateHistory(cand.visitor_id, contactId, 0);
+  if (!agg) return { ok: false };
+  const { score, top_pages } = scoreIntent(agg);
+  if (!(await upsertSummary(contactId, agg, score, top_pages))) return { ok: false };
+
+  const cf = buildSiteFieldUpdates(fields, agg, score);
+  if (cf.length) await updateGHLContactFields(contactId, cf);
+
+  const reason = refreshNoteReason(cand, { score, page_counts: agg.page_counts },
+    { threshold: HIGH_THRESHOLD, highPaths: RUBRIC.high.paths });
+  if (reason) await addGHLNote(contactId, activityNote(agg, score, top_pages, 'Return visit — '), { dedupe: true });
+  return { ok: true, noted: !!reason };
+}
+
+async function refreshReturningVisitors(fields) {
+  if (!(REFRESH_LIMIT > 0)) return { refreshed: 0, noted: 0 };
+  let candidates = [];
+  try {
+    const rows = await runSQL(buildRefreshCandidatesSql(REFRESH_LIMIT));
+    candidates = Array.isArray(rows) ? rows : [];
+  } catch (err) {
+    // Most likely sql/142 is not applied yet — nothing to refresh into.
+    console.warn(`[I.STITCH] refresh candidates unavailable: ${err.message}`);
+    return { refreshed: 0, noted: 0 };
+  }
+  let refreshed = 0, noted = 0;
+  for (const cand of candidates) {
+    try {
+      const r = await refreshContact(cand, fields);
+      if (r.ok) { refreshed++; if (r.noted) noted++; }
+    } catch (err) {
+      console.error(`[I.STITCH] refresh ${cand.contact_id} failed: ${err.message}`);
+    }
+  }
+  return { refreshed, noted };
+}
+
 // ─── Batch handler ─────────────────────────────────────────────────────────
 export async function stitchBatch() {
   if (!supabase) return { ok: false, error: 'supabase_not_configured' };
@@ -363,9 +435,6 @@ export async function stitchBatch() {
   // that run_sql can safely wrap and return as rows.
   const claimed = await runSQL(`select * from public.claim_site_identify_events(${BATCH_SIZE})`);
   const rows = Array.isArray(claimed) ? claimed : [];
-  if (rows.length === 0) {
-    return { ok: true, claimed: 0, matched: 0, unmatched: 0, emitted: 0, high_intent: 0, elapsed_ms: Date.now() - startedAt };
-  }
 
   let matched = 0, unmatched = 0, high = 0;
   for (const ev of rows) {
@@ -376,8 +445,11 @@ export async function stitchBatch() {
       console.error(`[I.STITCH] event ${ev.id} failed: ${err.message}`);
     }
   }
-  const summary = { ok: true, claimed: rows.length, matched, unmatched, emitted: matched, high_intent: high, elapsed_ms: Date.now() - startedAt };
-  console.log(`[I.STITCH] batch: ${JSON.stringify(summary)}`);
+  // After the identify events, so a lead stitched this batch is not rebuilt twice.
+  const { refreshed, noted } = await refreshReturningVisitors(fields);
+  const summary = { ok: true, claimed: rows.length, matched, unmatched, emitted: matched, high_intent: high, refreshed, refresh_notes: noted, elapsed_ms: Date.now() - startedAt };
+  // Quiet on an idle tick, as before; one line whenever anything happened.
+  if (rows.length || refreshed) console.log(`[I.STITCH] batch: ${JSON.stringify(summary)}`);
   return summary;
 }
 

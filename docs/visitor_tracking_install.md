@@ -115,3 +115,26 @@ on form submission). Confirm this is covered before go-live.
 - **Stitch decisions** (which visitors a contact's totals cover, which fields are written,
   which duplicate wins) live in `src/site-stitch-core.js`, tested by
   `scripts/test-site-stitch-core.js`.
+
+## Where the data lives (2026-10-01)
+
+| Table | One row per | What it is |
+|---|---|---|
+| `site_events` | page view / form submit | The raw log. Kept because visits made **before** a form submit are credited to the lead afterwards. |
+| `visitor_identity_map` | browser | Which GHL contact each stitched browser belongs to. |
+| `site_lead_summary` (sql/142) | **lead (GHL contact)** | Totals: pages viewed, sessions, first/last visit, first touch, intent score, top pages, per-page counts. |
+
+- **Kept current both ways.** I.STITCH upserts `site_lead_summary` when someone submits a
+  form, and each 5-minute run also rebuilds up to `STITCH_REFRESH_LIMIT` (default 50) known
+  leads who came back and browsed without submitting. Those runs update the row and the 4 GHL
+  fields, and add a GHL note only when something a rep would act on changed: the score crossed
+  50, a first visit to a pricing/estimate/financing page, or the score jumped 20+.
+  `STITCH_REFRESH_LIMIT=0` turns the refresh off.
+- **Retention.** `site-events-retention` (daily 04:00 ET) deletes page views older than
+  `SITE_EVENTS_RETENTION_DAYS` (default 180, Mark's ruling) **only** for browsers that never
+  identified. Stitched leads keep everything; `identify` rows are never deleted.
+- **GHL's Activity panel stays empty for Wufoo leads.** GHL's own External Tracking script
+  (installed through GTM) records page views, but Wufoo's form sends the browser to wufoo.com
+  before GHL's script can capture the submission (tested 2026-10-01), so GHL never learns who
+  the visitor is. Our data reaches GHL as the 4 site fields and the "Site activity" note.
+  Only switching to native GHL forms would fill that panel (Mark chose not to, 2026-10-01).
