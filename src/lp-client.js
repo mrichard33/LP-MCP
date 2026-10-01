@@ -102,7 +102,11 @@ export const lpPost = async (endpoint, fields = {}, retries = 3, opts = {}) => {
   // it — refreshNoteToken() would throw on the missing credentials.
   const useNote = opts.useNoteIdentity === true && hasNoteIdentity();
   const token = useNote ? await getNoteToken() : await getToken();
-  const body  = new URLSearchParams(fields);
+  // A string is a body the caller already encoded, and it goes out byte for
+  // byte. URLSearchParams writes a space as '+', and LP's UpdateDNCStatus
+  // rejected that '+' (2026-10-01) — see encodeDncBody below. Never feed a
+  // string back through URLSearchParams: it decodes %20 and re-encodes '+'.
+  const body  = typeof fields === 'string' ? fields : new URLSearchParams(fields).toString();
   const base  = LP_BASE();
 
   if (!base) {
@@ -126,7 +130,7 @@ export const lpPost = async (endpoint, fields = {}, retries = 3, opts = {}) => {
           'Authorization':  `Bearer ${token}`,
           'Content-Type':   'application/x-www-form-urlencoded',
         },
-        body: body.toString(),
+        body,
         signal: controller.signal,
       });
 
@@ -159,7 +163,7 @@ export const lpPost = async (endpoint, fields = {}, retries = 3, opts = {}) => {
             'Authorization':  `Bearer ${newToken}`,
             'Content-Type':   'application/x-www-form-urlencoded',
           },
-          body: body.toString(),
+          body,
           signal: retryCtrl.signal,
         });
         clearTimeout(retryTimeout);
@@ -877,6 +881,17 @@ const VALID_DNC_CODES = new Set(['C', 'M', 'T', 'E', 'P']);
 // do not try a fourth value on a live record.
 export const LP_DNC_CLEAR_CODE = ' ';
 
+// 2026-10-01 — the third value above never reached LP as a space. lpPost built
+// every body with URLSearchParams, which encodes ' ' as '+', so LP saw '+' and
+// answered "Invalid DNC value." for Mark Test and for all 26 Slack lifts that
+// night. LP's docs say "blank", so the space now goes out percent-encoded
+// (%20) in a body we build ourselves. encodeURIComponent never emits '+'.
+export function encodeDncBody(fields) {
+  return Object.entries(fields)
+    .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
+    .join('&');
+}
+
 export async function updateDncStatus({ custid, newDncStatus, empid = LP_EMP.GHL_INTEGRATION, phone }, deps = {}) {
   if (!custid) {
     throw new Error('updateDncStatus: custid (LP prospect ID) is required');
@@ -902,7 +917,7 @@ export async function updateDncStatus({ custid, newDncStatus, empid = LP_EMP.GHL
   };
   if (phone) fields.phone = String(phone);
 
-  const result = await post('/api/Customers/UpdateDNCStatus', fields);
+  const result = await post('/api/Customers/UpdateDNCStatus', encodeDncBody(fields));
 
   // LP returns array-wrapped responses for this endpoint — unwrap.
   const item = Array.isArray(result) ? (result[0] || {}) : (result || {});
