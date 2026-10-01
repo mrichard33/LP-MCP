@@ -21,7 +21,10 @@ const {
   liveChatMode,
   LIVE_CHAT_FALLBACK_MESSAGE,
   LIVE_CHAT_RULE,
+  ROW_ALERT_INTERVAL_MS,
 } = await import('../src/live-chat/fast-lane.js');
+const { AGENT_ACTIONS_COLUMNS } = await import('../src/live-chat/agent-actions-columns.js');
+const { ZIP_ASK_LINE } = await import('../src/agentic/service-area-turn.js');
 
 const SECRET = 'test-live-chat-secret';
 
@@ -36,11 +39,12 @@ function makeReq(body, secret = SECRET) {
 function makeLane({
   mode = 'live', tags = [], llm = () => ({ message: 'Sure. What made you start looking at this now?' }),
   llmDelayMs = 5, hardTimeoutMs = 2000, contextCapMs = 300, buildContext = null, messages = [],
+  insertAction = null, now = null, checkServiceArea = null, lookupPlace = null,
 } = {}) {
-  const state = { sends: [], actions: [], updates: [], events: [], ops: [], claimed: new Set(), llmCalls: [], captured: [], fingerprints: [], slots: [] };
+  const state = { sends: [], actions: [], updates: [], events: [], ops: [], claimed: new Set(), llmCalls: [], captured: [], fingerprints: [], slots: [], lookups: [], places: [] };
   let nextId = 1000;
   const lane = createLiveChatFastLane({
-    now: () => Date.now(),
+    now: now || (() => Date.now()),
     mode: () => mode,
     secret: () => SECRET,
     hardTimeoutMs: () => hardTimeoutMs,
@@ -60,7 +64,11 @@ function makeLane({
       return { text: JSON.stringify({ story_arc: 'none', ...out }), model: 'fake-model' };
     },
     sendMessage: async ({ contactId, conversationId, message }) => { state.sends.push({ contactId, conversationId, message }); return { messageId: `m${state.sends.length}` }; },
-    insertAction: async (row) => { const id = nextId++; state.actions.push({ id, ...row }); return { id }; },
+    insertAction: insertAction
+      ? async (row) => { state.actions.push({ id: null, ...row }); return insertAction(row); }
+      : async (row) => { const id = nextId++; state.actions.push({ id, ...row }); return { id }; },
+    checkServiceArea: async (zip) => { state.lookups.push(zip); return checkServiceArea ? checkServiceArea(zip) : { checked: false, zip }; },
+    lookupPlace: async (place) => { state.places.push(place); return lookupPlace ? lookupPlace(place) : { checked: false }; },
     updateAction: async (id, patch) => { state.updates.push({ id, ...patch }); },
     claimMessages: async (_c, keys) => {
       const fresh = keys.filter(k => !state.claimed.has(k));
@@ -293,4 +301,155 @@ test('startup model check: Haiku 4.5 meets the deadline, a thinking model does n
   assert.equal(liveChatModelWarning({ model: 'gpt-5.4-mini', provider: 'openai', deadlineMs: 10000 }), null);
   const w = liveChatModelWarning({ model: 'claude-sonnet-5', provider: 'anthropic', deadlineMs: 10000 });
   assert.match(w, /claude-sonnet-5 \(anthropic\) is a thinking model with a \d+ms timeout floor, above the 10000ms lane deadline/);
+});
+
+// ── 2026-10-01: the action row actually saves ───────────────────────────────
+
+test('the agent_actions insert names only columns that exist in production', async () => {
+  const { lane, state } = makeLane({ mode: 'shadow' });
+  await lane.processInbound(INBOUND('Who does the install?'));
+  assert.equal(state.actions.length, 1);
+  const extra = Object.keys(state.actions[0]).filter(k => k !== 'id' && !AGENT_ACTIONS_COLUMNS.includes(k));
+  assert.deepEqual(extra, [], `insert row carries non-columns: ${extra.join(', ')}`);
+  assert.equal('idempotency_key' in state.actions[0], false, 'idempotency_key is not an agent_actions column (it broke every insert until 2026-10-01)');
+  assert.match(state.actions[0].action_payload.idempotency_key, /^livechat_msg-/, 'the key is kept inside the payload');
+});
+
+test('shadow mode: one row with a numeric id, completed with send_status shadow, draft_body and timing', async () => {
+  const { lane, state } = makeLane({ mode: 'shadow' });
+  const out = await lane.processInbound(INBOUND('Do you do sliding doors too?'));
+  assert.equal(state.actions.length, 1);
+  assert.equal(typeof out.action_id, 'number');
+  const done = state.updates.find(u => u.status === 'completed');
+  assert.equal(done.id, out.action_id);
+  assert.equal(done.execution_result.send_status, 'shadow');
+  assert.ok(done.execution_result.draft_body);
+  assert.ok(done.execution_result.timing?.t0_inbound_received);
+  assert.equal(state.ops.length, 0, 'a saved row raises no alarm');
+});
+
+test('a row that does not save → one ops alert naming the error, then quiet for an hour', async () => {
+  let clock = Date.parse('2026-10-01T15:00:00Z');
+  const { lane, state } = makeLane({
+    mode: 'shadow',
+    now: () => clock,
+    insertAction: async () => ({ id: null, error: "Could not find the 'idempotency_key' column of 'agent_actions' in the schema cache" }),
+  });
+  await lane.processInbound(INBOUND('hello'));
+  await new Promise(r => setImmediate(r));
+  const alerts = () => state.ops.filter(t => t.includes('live chat rows not saving'));
+  assert.equal(alerts().length, 1);
+  assert.match(alerts()[0], /live chat rows not saving: Could not find the 'idempotency_key' column/);
+  clock += 10 * 60 * 1000;
+  await lane.processInbound(INBOUND('still there?'));
+  await new Promise(r => setImmediate(r));
+  assert.equal(alerts().length, 1, 'rate-limited: no second alert inside the hour');
+  clock += ROW_ALERT_INTERVAL_MS;
+  await lane.processInbound(INBOUND('hello again'));
+  await new Promise(r => setImmediate(r));
+  assert.equal(alerts().length, 2, 'alerts again once the hour is up');
+});
+
+// ── 2026-10-01: service-area answers, zip first (Mark's ruling 4) ───────────
+
+const firstSentence = (t) => String(t).split(/(?<=[.!?])\s+/)[0];
+const ASKS_CONTACT = /\b(?:name|phone|number|email|address)\b/i;
+const IGNORES_COVERAGE = () => ({ message: 'Thanks for reaching out. What made you start looking at windows?' });
+const ZIPS = {
+  32137: { checked: true, zip: '32137', in_service_area: true, city: 'Palm Coast', county: 'Flagler', market_code: 'JAX' },
+  32136: { checked: true, zip: '32136', in_service_area: true, city: 'Flagler Beach', county: 'Flagler', market_code: 'JAX' },
+  77002: { checked: true, zip: '77002', in_service_area: true, city: 'Houston', county: 'Harris', market_code: 'HOU' },
+  27101: { checked: true, zip: '27101', in_service_area: true, city: 'Winston-Salem', county: 'Forsyth', market_code: 'WSNC' },
+  75233: { checked: true, zip: '75233', in_service_area: false },
+};
+const fakeLookup = async (zip) => ZIPS[zip] || { checked: true, zip, in_service_area: false };
+const coverageRow = (state) => state.updates.find(u => u.status === 'completed')?.execution_result?.service_area;
+
+test('"do you service palm coast fl area?" with no zip → asks for the zip, one question, no name/phone ask', async () => {
+  // The model tries to collect the name too; the guard replaces it.
+  const { lane, state } = makeLane({ mode: 'shadow', checkServiceArea: fakeLookup, llm: () => ({ message: "Good question! We'd love to help. What's your name and zip code?" }) });
+  const out = await lane.processInbound(INBOUND('do you service palm coast fl area?'));
+  assert.equal(out.message, ZIP_ASK_LINE);
+  assert.equal((out.message.match(/\?/g) || []).length, 1);
+  assert.doesNotMatch(out.message, ASKS_CONTACT);
+  assert.doesNotMatch(out.message, /good question/i);
+  assert.match(state.llmCalls[0].user, /ZIP FIRST/);
+  assert.equal(state.lookups.length, 0, 'no lookup without a zip');
+  assert.deepEqual(coverageRow(state), { zip: null, place: 'Palm Coast', result: 'ask_zip', market_code: null });
+});
+
+test('then "32137" → the first sentence confirms coverage for Palm Coast', async () => {
+  const messages = [
+    { direction: 'inbound', body: 'do you service palm coast fl area?', dateAdded: '2026-10-01T14:00:00Z' },
+    { direction: 'outbound', body: ZIP_ASK_LINE, dateAdded: '2026-10-01T14:00:05Z' },
+    { direction: 'inbound', body: '32137', dateAdded: '2026-10-01T14:00:30Z' },
+  ];
+  const { lane, state } = makeLane({ mode: 'shadow', messages, checkServiceArea: fakeLookup, llm: IGNORES_COVERAGE });
+  const out = await lane.processInbound(INBOUND('32137'));
+  assert.equal(firstSentence(out.message), 'Yes, we serve Palm Coast (32137).');
+  assert.deepEqual(state.lookups, ['32137']);
+  assert.equal(state.llmCalls.length, 2, 'regenerated once inside the 5s window, then the sentence was prepended');
+  assert.deepEqual(coverageRow(state), { zip: '32137', place: 'Palm Coast', result: 'in', market_code: 'JAX' });
+});
+
+test('"32136" → confirms coverage for Flagler Beach (the corrected row)', async () => {
+  const { lane } = makeLane({ mode: 'shadow', checkServiceArea: fakeLookup, llm: IGNORES_COVERAGE });
+  const out = await lane.processInbound(INBOUND('32136'));
+  assert.equal(firstSentence(out.message), 'Yes, we serve Flagler Beach (32136).');
+});
+
+test('"Do you serve Houston? 77002" → confirms coverage, and the prompt clock is Central', async () => {
+  const { lane, state } = makeLane({ mode: 'shadow', checkServiceArea: fakeLookup, llm: IGNORES_COVERAGE });
+  const out = await lane.processInbound(INBOUND('Do you serve Houston? 77002'));
+  assert.equal(firstSentence(out.message), 'Yes, we serve Houston (77002).');
+  assert.match(state.llmCalls[0].user, /TIME NOW: It is .* \(Central\)/);
+  assert.match(state.llmCalls[0].user, /CURRENT DATE — Houston \/ America\/Chicago/);
+  assert.equal(coverageRow(state).market_code, 'HOU');
+});
+
+test('"27101" → confirms coverage for Winston-Salem, Eastern clock', async () => {
+  const { lane, state } = makeLane({ mode: 'shadow', checkServiceArea: fakeLookup, llm: IGNORES_COVERAGE });
+  const out = await lane.processInbound(INBOUND('27101'));
+  assert.equal(firstSentence(out.message), 'Yes, we serve Winston-Salem (27101).');
+  assert.match(state.llmCalls[0].user, /\(Eastern\)/);
+  assert.equal(coverageRow(state).market_code, 'WSNC');
+});
+
+test('"75233" (Dallas) → out of area: plain no, no question, no address/phone/booking ask, no large-job event', async () => {
+  const { lane, state } = makeLane({
+    mode: 'live', checkServiceArea: fakeLookup,
+    llm: () => ({ message: "We may not cover Dallas yet. What's your street address so we can check?", live_chat: { large_job_signal: true } }),
+  });
+  const out = await lane.processInbound(INBOUND('Do you service Dallas TX? 75233'));
+  assert.match(firstSentence(out.message), /doesn't serve the 75233 area/);
+  assert.equal(out.message.includes('?'), false);
+  assert.doesNotMatch(out.message, ASKS_CONTACT);
+  assert.doesNotMatch(out.message, /\b(?:visit|appointment|schedule|book)\b/i);
+  assert.equal(state.events.filter(e => e.event_type === 'agentic.live_chat_large_job').length, 0);
+  assert.equal(out.large_job, false);
+  assert.equal(coverageRow(state).result, 'out');
+});
+
+test('a lookup that never answers → "a team member will confirm", inside the hard timeout', async () => {
+  const { lane, state } = makeLane({ mode: 'shadow', hardTimeoutMs: 2500, checkServiceArea: () => new Promise(() => {}), llm: IGNORES_COVERAGE });
+  const t0 = Date.now();
+  const out = await lane.processInbound(INBOUND('Do you serve Houston? 77002'));
+  const took = Date.now() - t0;
+  assert.equal(out.outcome, 'shadow', 'not the fallback');
+  assert.equal(firstSentence(out.message), 'Let me have a team member confirm coverage for 77002.');
+  assert.ok(took < 2500, `took ${took}ms`);
+  assert.equal(coverageRow(state).result, 'unknown');
+});
+
+test('a visitor who will not give a zip is not asked twice; one-market place answers', async () => {
+  const messages = [
+    { direction: 'inbound', body: 'do you serve palm coast?', dateAdded: '2026-10-01T14:00:00Z' },
+    { direction: 'outbound', body: ZIP_ASK_LINE, dateAdded: '2026-10-01T14:00:05Z' },
+    { direction: 'inbound', body: "I'd rather not say", dateAdded: '2026-10-01T14:00:30Z' },
+  ];
+  const { lane, state } = makeLane({ mode: 'shadow', messages, lookupPlace: async () => ({ checked: true, market_codes: ['JAX'], city: 'Palm Coast' }), llm: IGNORES_COVERAGE });
+  const out = await lane.processInbound(INBOUND("I'd rather not say"));
+  assert.deepEqual(state.places, ['Palm Coast']);
+  assert.equal(firstSentence(out.message), 'Yes, we serve the Palm Coast area.');
+  assert.doesNotMatch(out.message, /zip code\?/i);
 });

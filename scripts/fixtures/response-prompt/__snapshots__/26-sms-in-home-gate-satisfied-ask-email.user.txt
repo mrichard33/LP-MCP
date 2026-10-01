@@ -160,9 +160,9 @@ BOOKING CONTEXT (v1.7):
 ═══════ CALENDAR AVAILABILITY ═══════
 CALENDAR AVAILABILITY (real openings — pick from THIS list, never invent dates):
   Calendar ID: cal_we_0001
-  Timezone: America/New_York
-  Thursday, September 3: 10:00 AM, 2:00 PM
-  Friday, September 4: 11:00 AM
+  Timezone: America/New_York (ET) — write every time with "ET"
+  Thursday, September 3: 10:00 AM ET, 2:00 PM ET
+  Friday, September 4: 11:00 AM ET
   (6 additional later slots not shown — link reveals all)
 ═══════ END CALENDAR AVAILABILITY ═══════
 

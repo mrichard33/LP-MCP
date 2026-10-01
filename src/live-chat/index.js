@@ -29,6 +29,8 @@ import { emitEvent } from '../event-emitter.js';
 import { sendAlertMessage } from '../alert-state.js';
 import { recordMessageContextDetached, markSentDetached } from '../bot-feedback/fingerprint.js';
 import { livechatSendBody } from '../send-message-handler.js';
+import { checkServiceAreaZip, checkServiceAreaPlace } from '../services/identity-extraction.js';
+import { timezoneForZip } from '../services/contact-timezone.js';
 import { createLiveChatFastLane, liveChatMode, liveChatHardTimeoutMs, liveChatModelWarning } from './fast-lane.js';
 
 async function fetchContact(contactId) {
@@ -54,13 +56,15 @@ async function sendMessage({ contactId, conversationId, message }) {
 }
 
 async function insertAction(row) {
-  if (!supabase) return { id: null };
+  if (!supabase) return { id: null, error: 'supabase client not configured' };
   const { data, error } = await supabase.from('agent_actions').insert(row).select('id').single();
   if (error) {
-    // A retried webhook hits the idempotency key; the first insert owns it.
-    if (String(error.code) === '23505') throw new Error(`duplicate live-chat action for ${row.idempotency_key}`);
+    // 2026-10-01: no 23505 branch any more. The row carries no unique key
+    // (idempotency_key lives inside action_payload), so a duplicate cannot
+    // be raised here — claimMessages, which runs first, is the duplicate
+    // guard. The error goes back to the lane, which alerts ops.
     console.warn(`[LiveChat] agent_actions insert failed: ${error.message} — continuing without a row`);
-    return { id: null };
+    return { id: null, error: error.message };
   }
   return { id: data?.id ?? null };
 }
@@ -105,6 +109,9 @@ export function buildProductionLane() {
     fingerprint: recordMessageContextDetached,
     markSent: (actionId) => markSentDetached('reply', String(actionId)),
     captureIdentity,
+    checkServiceArea: checkServiceAreaZip,
+    lookupPlace: (place) => checkServiceAreaPlace(place),
+    zoneForZip: (zip) => timezoneForZip(zip),
   });
 }
 

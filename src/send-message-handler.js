@@ -314,6 +314,7 @@ import {
   isInQuietHours, nextSendWindowOpenAt, isQuietHoursBypassed,
   isHourGatedChannel, shouldHoldForQuietHours,
 } from './services/quiet-hours.js';
+import { timezoneForZip } from './services/contact-timezone.js';
 import { findNearDuplicate } from './services/message-similarity.js';
 import { checkNotSuperseded, commitAgenticSend } from './services/agentic-reply-locks.js';
 import { emitEvent } from './event-emitter.js';
@@ -736,6 +737,22 @@ async function fetchContactTags(contactId) {
     if (!res.ok) return null;
     const data = await res.json();
     return data?.contact?.tags || [];
+  } catch {
+    return null;
+  }
+}
+
+/** The contact's zip, for the quiet-hours zone. Fail-soft: null on any error. */
+async function fetchContactPostalCode(contactId) {
+  if (!contactId || !GHL_API_KEY) return null;
+  try {
+    const res = await withGhlToken(() => fetch(`https://services.leadconnectorhq.com/contacts/${contactId}`, {
+      headers: { 'Authorization': `Bearer ${GHL_API_KEY}`, 'Version': '2021-07-28', 'Accept': 'application/json' },
+      signal: AbortSignal.timeout(5000),
+    }));
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data?.contact?.postalCode || null;
   } catch {
     return null;
   }
@@ -3134,7 +3151,17 @@ export async function executeSendMessage(action, context) {
   // choose, so holding one overnight bought no courtesy and only made the bot
   // look slow — action 313727 was an email reply deferred to 12:00 UTC.
   // SMS and livechat are unchanged: they still hold outside 8AM–9PM ET.
-  const inQuietHours = isInQuietHours();
+  // 2026-10-01: quiet hours are the CONTACT's local 9 PM–8 AM (Houston is
+  // Central, Mark's ruling 3). The zone only changes the answer in the hour
+  // where Eastern and Central disagree, so the contact's zip is read only
+  // then — every other hour costs nothing. Unknown zone → Eastern, as before.
+  const nowForQuiet = new Date();
+  let quietZone = null;
+  if (isInQuietHours(nowForQuiet) !== isInQuietHours(nowForQuiet, { timeZone: 'America/Chicago' })) {
+    quietZone = (await timezoneForZip(await fetchContactPostalCode(contactId)).catch(() => null))?.timezone || null;
+  }
+  const quietOpts = quietZone ? { timeZone: quietZone } : {};
+  const inQuietHours = isInQuietHours(nowForQuiet, quietOpts);
   const hourGated = isHourGatedChannel(channel);
   const wouldHold = shouldHoldForQuietHours({
     channel, inQuietHours, freshInboundReply, bypassed: false,
@@ -3146,7 +3173,7 @@ export async function executeSendMessage(action, context) {
   if (wouldHold && quietHoursBypassed) {
     console.log(`[SendMessage] 🌙 QUIET HOURS BYPASSED for test contact ${contactId} (QUIET_HOURS_BYPASS_CONTACT_IDS) — sending now`);
   } else if (wouldHold) {
-    const retryAt = nextSendWindowOpenAt();
+    const retryAt = nextSendWindowOpenAt(nowForQuiet, quietOpts);
     console.log(`[SendMessage] 🌙 QUIET HOURS: ${contactId} send is bot-initiated (source: ${sourceEventMeta?.event_type || 'unknown'}) or reply-to-stale-inbound — holding until ${retryAt}`);
     return {
       deferred: true,
@@ -4199,6 +4226,8 @@ export async function executeSendMessage(action, context) {
     ai_generated: !!generated,
     intent_class: generated?.intent_class || null,
     classifier_method: generated?.classification_method || null,
+    // 2026-10-01: the coverage turn, when there was one.
+    service_area: generated?.service_area || null,
     story_arc: generated?.story_arc || null,
     trust_level_targeted: generated?.trust_level_targeted || null,
     voice_used: generated?.voice_used || null,

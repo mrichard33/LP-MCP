@@ -161,9 +161,9 @@ INSERT INTO kb_faqs (kb_key, question_pattern, canonical_answer, channel, tier, 
 
 ('LIB-C03',
  $$What areas do you serve? | Do you come to my area? | Do you work in Orlando? | Where are you located?$$,
- $$We're based in St. Petersburg and serve Fort Lauderdale, Tampa, St. Petersburg, Sarasota, Fort Myers, Lakeland, Orlando, and Jacksonville. Send me your zip code and I'll confirm we cover your home.$$,
+ $$We're based in St. Petersburg and serve Fort Lauderdale, Tampa, St. Petersburg, Sarasota, Fort Myers, Lakeland, Orlando, and Jacksonville in Florida, plus Houston, Texas and Winston-Salem, North Carolina. Send me your zip code and I'll confirm we cover your home.$$,
  'both', 'factual', true,
- $$Bot should run the zip through check_service_area before confirming. Replaces #4 and #58.$$),
+ $$Bot should run the zip through check_service_area before confirming. Replaces #4 and #58. Houston + Winston-Salem added 2026-10-01 (sql/141).$$),
 
 ('LIB-C04',
  $$Are you a local company? | Are you a national chain? | Is this a franchise? | Is Reece family-owned?$$,

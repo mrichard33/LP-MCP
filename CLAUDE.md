@@ -371,6 +371,16 @@ prints branch `LAKE`, and it stays raw wherever a raw branch is stored (`branch_
 leaderboard). Never write `LAKE_MKT` again, and never re-apply `sql/037` or `sql/017` by hand — both
 re-seed the pre-merge Lakeland rows.
 
+**Houston (HOU) and Winston-Salem (WSNC) are service markets too (2026-10-01, sql/141).** Their zips
+are TEMPORARY defaults generated from Census county data; `scripts/import-service-zips.js` swaps in
+Mark's real lists. Both use the general phone until their own is known. Houston is the one market on
+**Central time**: `src/config/market-timezones.js` maps the market, `src/services/contact-timezone.js`
+resolves a contact's zone from their zip, and customer-facing times (slots, appointment text, the
+prompt's TIME NOW, that contact's quiet hours) follow it. Office/dialer hours stay ET with an "ET"
+label. Never tell a visitor Reece serves only Florida. Coverage questions are zip-first
+(`src/agentic/service-area-turn.js`, both reply paths): ask for the zip, then answer in the first
+sentence. Not yet wired for the new markets: `lp_branch_market_map`, `slack_market_slugs`.
+
 **Rep names do not match across the LP/GHL boundary.** LP stores `"Last, First"` (`O'Connor, Tim`);
 GHL's Rep Display Name (`yxOTDIT7Um0JxkOPUbPo`) holds `"First Last"` (`Tim O'Connor`). An exact
 compare finds ZERO rows for every rep on the floor and fails silently — a metric that reads "no sales"

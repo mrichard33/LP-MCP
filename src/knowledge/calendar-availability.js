@@ -33,6 +33,7 @@
  */
 
 import { acquireToken, report429 } from '../ghl-rate-limiter.js';
+import { tzLabel } from '../config/market-timezones.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY || '';
 const GHL_API_VERSION = '2021-04-15';
@@ -213,9 +214,14 @@ export function formatSlotsForPrompt(availability) {
   const lines = [];
   lines.push('CALENDAR AVAILABILITY (real openings — pick from THIS list, never invent dates):');
   lines.push('  Calendar ID: ' + availability.calendar_id);
-  lines.push('  Timezone: ' + availability.timezone);
+  // 2026-10-01: times carry their zone label. Houston contacts get slots in
+  // Central time (fetchFreeSlots is called with their market zone), and an
+  // unlabelled "10:00 AM" next to an Eastern-time office is how a visit gets
+  // missed by an hour. Write the label the customer sees.
+  const label = tzLabel(availability.timezone);
+  lines.push('  Timezone: ' + availability.timezone + ' (' + label + ') — write every time with "' + label + '"');
   for (const [day, times] of byDay) {
-    lines.push('  ' + day + ': ' + times.join(', '));
+    lines.push('  ' + day + ': ' + times.map((t) => t + ' ' + label).join(', '));
   }
   if (availability.slots_total_count > availability.slots.length) {
     const more = availability.slots_total_count - availability.slots.length;

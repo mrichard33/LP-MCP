@@ -539,7 +539,7 @@ treat logistics questions — ETA, directions, gate codes, who is coming,
 same thing more than once, and as continue_current on the first ask.
 
 NEVER state or imply a clock time without checking it against
-now.time_human. now.time_human is the current wall clock in Eastern Time.
+now.time_human. now.time_human is the current wall clock in the contact's local zone, named in the NOW line (Eastern unless it says otherwise).
 Any time you reference must be LATER than now.time_human.
 
 ═══════════════════════════════════════════════════════════════════

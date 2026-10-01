@@ -99,7 +99,8 @@ import { executeCreateTask } from './tasks.js';
 import { getContactCached } from '../contact-cache.js';
 import { isPlaceholderName, EMAIL_ASKED_TAG } from '../../services/identity-extraction.js';
 import { emitEvent } from '../../event-emitter.js';
-import { etAppointmentParts } from '../../appointment-dates.js';
+import { etAppointmentParts, wallClockToIso } from '../../appointment-dates.js';
+import { normalizeTimezone } from '../../config/market-timezones.js';
 import supabase from '../../supabase.js';
 import { syncCancelledAppointmentState, reconcileGhlOnlyApptTag } from './appointment-field-sync.js';
 import { findExistingAppointment, emitSlotCheckEvent, isSlotCheckEnabled } from '../../appointments/slot-check.js';
@@ -476,7 +477,10 @@ function buildAppointmentBody(payload, contactId) {
       if (p === 'PM' && h !== 12) h += 12;
       time = `${String(h).padStart(2, '0')}:${min}`;
     }
-    startTime = `${isoDate}T${time}:00-04:00`;
+    // 2026-10-01: the zone's real offset, not a fixed -04:00 (EDT-only, an
+    // hour off all winter, and wrong for Houston). payload.timezone is the
+    // contact's market zone when the caller knows it; Eastern otherwise.
+    startTime = wallClockToIso(isoDate, time.padStart(5, '0'), normalizeTimezone(payload.timezone)) || `${isoDate}T${time}:00-04:00`;
   }
   if (!startTime) throw new Error('Missing start_time or appointment_date+appointment_time');
 

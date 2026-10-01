@@ -352,6 +352,7 @@ import {
   assertBookingPrerequisites,
   promoteIdentityToGHL,
   checkServiceAreaZip,
+  checkServiceAreaPlace,
   checkServiceAreaCity,
   geocodeStreetToZip,
   enrichIdentityFromServiceArea,
@@ -370,6 +371,10 @@ import { findUndeliveredSendPromise, undeliveredPromiseNote, rewriteUndeliveredP
 import { findUnbackedEstimatePromise, estimatePromiseNote, rewriteEstimatePromise, calculatorFallbackAllowed } from './agentic/estimate-promise.js';
 // v2.7.14 — Bot Review Phase 0. Pure shaping helpers only: no I/O, no writes.
 import { buildInputSnapshot, extractKbModes, extractKbSources } from './bot-feedback/fingerprint-core.js';
+import { normalizeTimezone, tzLongName } from './config/market-timezones.js';
+import {
+  planServiceAreaTurn, resolveCoverage, coverageHint, guardCoverageDraft, serviceAreaRecord,
+} from './agentic/service-area-turn.js';
 
 /**
  * v2.7.14 — the header version above, as a value. Stamped (with the deployed
@@ -978,9 +983,9 @@ function companyInboxAllowlist() {
   return [resolveCompanyInbox(), ...extra];
 }
 
-function formatTodayForPrompt() {
+function formatTodayForPrompt(timeZone = PROMPT_TIMEZONE) {
   return new Intl.DateTimeFormat('en-US', {
-    timeZone: PROMPT_TIMEZONE,
+    timeZone,
     weekday: 'long',
     year: 'numeric',
     month: 'long',
@@ -1004,12 +1009,12 @@ function formatTodayForPrompt() {
 // formatTodayForPrompt() returns "Tuesday, September 23, 2026". Passing that to
 // a YYYY-MM-DD parser returns null, which renders NO season block and looks
 // exactly like working code — the silent-noop failure this repo keeps paying for.
-function todayIsoInPromptTz() {
-  return new Intl.DateTimeFormat('en-CA', { timeZone: PROMPT_TIMEZONE }).format(new Date());
+function todayIsoInPromptTz(timeZone = PROMPT_TIMEZONE) {
+  return new Intl.DateTimeFormat('en-CA', { timeZone }).format(new Date());
 }
 
-function formatTomorrowForPrompt() {
-  const [y, m, d] = new Intl.DateTimeFormat('en-CA', { timeZone: PROMPT_TIMEZONE })
+function formatTomorrowForPrompt(timeZone = PROMPT_TIMEZONE) {
+  const [y, m, d] = new Intl.DateTimeFormat('en-CA', { timeZone })
     .format(new Date())
     .split('-')
     .map(Number);
@@ -1020,6 +1025,23 @@ function formatTomorrowForPrompt() {
     month: 'long',
     day: 'numeric',
   }).format(new Date(Date.UTC(y, m - 1, d + 1)));
+}
+
+/**
+ * The zone this contact's prompt is written in. A market zone resolved from
+ * the contact's zip (context.market, src/services/contact-timezone.js) wins;
+ * without one, the process zone — every contact before 2026-10-01.
+ */
+export function promptTimezoneFor(context) {
+  const tz = context?.market?.market_code ? context.market.timezone : null;
+  return tz ? normalizeTimezone(tz) : PROMPT_TIMEZONE;
+}
+
+// The place named in the date header. "Florida" for the Florida markets (the
+// header every prompt has carried), the market itself for the two others.
+const MARKET_PLACES = Object.freeze({ HOU: 'Houston', WSNC: 'Winston-Salem' });
+function marketPlaceFor(context) {
+  return MARKET_PLACES[String(context?.market?.market_code || '').toUpperCase()] || 'Florida';
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1101,15 +1123,18 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
   // noticed). The live-chat fast lane does.
   parts.push(channel === 'email' ? P.EMAIL_CONSTRAINTS : P.SMS_CONSTRAINTS);
 
-  parts.push(...P.currentDateHeader(PROMPT_TIMEZONE));
-  parts.push(...P.todayIs(formatTodayForPrompt(), formatTomorrowForPrompt()));
+  // 2026-10-01: the contact's market zone when it is known (Houston →
+  // Central, Mark's ruling 3); otherwise the process zone, exactly as before.
+  const promptTz = promptTimezoneFor(context);
+  parts.push(...P.currentDateHeader(promptTz, marketPlaceFor(context)));
+  parts.push(...P.todayIs(formatTodayForPrompt(promptTz), formatTomorrowForPrompt(promptTz)));
 
   // Seasonal awareness sits WITH the date, not elsewhere: a date the model is
   // given but not told the meaning of is how "before storm season" survived
   // into September. Null (unparseable date) renders nothing — a wrong season
   // is worse than no season.
   {
-    const season = stormSeasonBlock(todayIsoInPromptTz());
+    const season = stormSeasonBlock(todayIsoInPromptTz(promptTz));
     if (season) parts.push(...season);
   }
 
@@ -1121,7 +1146,7 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
   // ahead of every appointment-specific block in this prompt, and framed as
   // binding.
   if (context.now?.time_human) {
-    parts.push(...P.timeNowHardRule(context.now.time_human, context.now.date_human));
+    parts.push(...P.timeNowHardRule(context.now.time_human, context.now.date_human, tzLongName(promptTz)));
   }
   // ── PHONE ROOM OPEN/CLOSED (2026-09-04, Robert Pederson) ──────────────
   // Stated unconditionally and immediately after TIME NOW: a promise of an
@@ -1422,7 +1447,15 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
   parts.push(...P.companyInbox(resolveCompanyInbox()));
 
   // ─── v1.1 SERVICE AREA STATUS (zip-verified against service_area_zips) ───
-  if (opts.serviceArea?.checked) {
+  // 2026-10-01 (Mark's ruling 4): a turn about coverage — "do you serve my
+  // area?", or the zip that answers it — gets the zip-first instruction from
+  // src/agentic/service-area-turn.js INSTEAD of the generic status lines,
+  // which could confirm coverage from the CRM record's zip before the visitor
+  // had said where they are asking about.
+  const coverageLine = coverageHint(opts.serviceAreaTurn?.coverage || null);
+  if (coverageLine) {
+    parts.push(`\n${coverageLine}`);
+  } else if (opts.serviceArea?.checked) {
     if (opts.serviceArea.in_service_area === true) {
       parts.push(...P.serviceAreaVerified(opts.serviceArea.zip, opts.serviceArea.city));
     } else {
@@ -1677,7 +1710,7 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
   // and [] (no active appts) both result in no block — the AI's prompt
   // tells it that absence of the block means no appointments on file.
   if (Array.isArray(opts.upcomingAppointments) && opts.upcomingAppointments.length > 0) {
-    const formatted = formatAppointmentsForPrompt(opts.upcomingAppointments);
+    const formatted = formatAppointmentsForPrompt(opts.upcomingAppointments, { timeZone: context.market?.market_code ? promptTimezoneFor(context) : null });
     if (formatted) {
       parts.push(...P.EXISTING_APPOINTMENTS_HEADER);
       parts.push(formatted);
@@ -2987,7 +3020,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       lp: context.lp,
       intelligence: context.intelligence,
       estimate: context.estimate,
-      timezone: PROMPT_TIMEZONE,
+      timezone: promptTimezoneFor(context),
     });
   } catch (err) {
     // A malformed transcript must never cost the lead a reply. The prompt
@@ -3269,7 +3302,8 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   const calendarId = getCalendarIdFromKbPack(kbPack);
   if (calendarId) {
     try {
-      availability = await fetchFreeSlots(calendarId);
+      // 2026-10-01: in the contact's market zone (Houston → Central).
+      availability = await fetchFreeSlots(calendarId, { timezone: promptTimezoneFor(context) });
     } catch (err) {
       console.warn(`[ResponseGenerator] Calendar availability fetch threw for ${contactId} (cal ${calendarId}): ${err.message} — proceeding without`);
       availability = null;
@@ -3285,7 +3319,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   let offerSelection = null;
   let preferredMatch = null;
   try {
-    preferred = extractPreferredTime(context.conversation_recent || []);
+    preferred = extractPreferredTime(context.conversation_recent || [], { timeZone: promptTimezoneFor(context) });
     if (availability) {
       offerSelection = selectOfferableSlots(availability, preferred, {
         // Phone-only calendars could warrant a shorter floor; default single
@@ -3424,6 +3458,32 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     console.warn(`[ResponseGenerator] identity state build failed for ${contactId}: ${err.message} — proceeding without gate`);
   }
 
+  // ─── 2026-10-01 SERVICE AREA, ZIP FIRST (Mark's ruling 4) ─────────────
+  // Same plan as the live-chat lane. The zip the visitor TYPED is the zip this
+  // turn is about (the CRM record's zip may be a different property, and
+  // mergeIdentity lets the record win), so a coverage turn checks it directly,
+  // capped at 800ms, fail-soft to "a team member will confirm".
+  let serviceAreaTurn = null;
+  try {
+    const saPlan = planServiceAreaTurn({ trigger: triggerMessage, conversation: context.conversation_recent || [] });
+    if (saPlan.active) {
+      const capped = (p) => Promise.race([p, new Promise((r) => setTimeout(() => r(null), 800).unref?.())]).catch(() => null);
+      let zipResult = null;
+      let placeResult = null;
+      if (saPlan.zip) {
+        zipResult = (serviceArea?.checked && serviceArea.zip === saPlan.zip) ? serviceArea : await capped(checkServiceAreaZip(saPlan.zip));
+        // The booking suppression and the market phone below follow it.
+        if (zipResult?.checked) serviceArea = zipResult;
+      } else if (saPlan.refused_zip && saPlan.place) {
+        placeResult = await capped(checkServiceAreaPlace(saPlan.place));
+      }
+      serviceAreaTurn = { plan: saPlan, coverage: resolveCoverage(saPlan, { zipResult, placeResult }) };
+      console.log(`[ResponseGenerator] service-area turn for ${contactId}: ${serviceAreaTurn.coverage?.status} zip=${saPlan.zip || 'none'} place=${saPlan.place || 'none'}`);
+    }
+  } catch (err) {
+    console.warn(`[ResponseGenerator] service-area turn failed for ${contactId}: ${err.message} — proceeding without`);
+  }
+
   // ─── 2026-08-18 (invented-phone incident): resolve the market dispatch
   // phone for this contact so the prompt can pin the ONLY number the model is
   // allowed to state. Market comes from the verified zip (or the tentative
@@ -3495,6 +3555,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       discipline,
       serviceArea,
       serviceAreaTentative,
+      serviceAreaTurn,
       // 2026-08-18 (invented-phone incident): the only phone number the model
       // may state — resolved from zip → service_area_zips → service_markets.
       servicePhoneDisplay: servicePhone?.phone_display || null,
@@ -3921,6 +3982,26 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     }
   }
 
+  // ─── Service-area guard (2026-10-01, Mark's ruling 4) ─────────────────
+  // A coverage turn must lead with the result: the zip ask as its only
+  // question, "Yes, we serve <city> (<zip>).", a plain out-of-area answer with
+  // no ask, or "a team member will confirm". Regenerate once through the same
+  // retry loop; after that, the deterministic sentence ships.
+  if (serviceAreaTurn?.coverage) {
+    const cov = guardCoverageDraft(validated.message, serviceAreaTurn.coverage);
+    if (cov.notes.length) {
+      if (opts.regenerationNote) {
+        console.warn(`[ResponseGenerator] ⚠️ service-area answer survived regeneration for ${contactId} (${serviceAreaTurn.coverage.status}) — using the deterministic sentence`);
+        validated.message = cov.fixed;
+        if (serviceAreaTurn.coverage.status === 'out' || serviceAreaTurn.coverage.status === 'ask_zip') validated.companion_action = null;
+      } else {
+        const err = new Error(`service_area: ${serviceAreaTurn.coverage.status}`);
+        err.regenerationNote = cov.notes.join('\n\n');
+        throw err;
+      }
+    }
+  }
+
   // ─── Carrier-block guard (2026-09-22 — message ghmZnX5TZjeFeagYwaaR) ───
   //
   // The prompt rule above prevents the common case; this makes the failure
@@ -4151,6 +4232,8 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     // (a reply may legitimately echo it back — "we'll call you at …"). The
     // send handler passes both to the outbound phone guard as allowed numbers.
     resolved_service_phone: servicePhone?.phone_display || null,
+    // 2026-10-01: { zip, place, result, market_code } on a coverage turn.
+    service_area: serviceAreaRecord(serviceAreaTurn?.plan, serviceAreaTurn?.coverage),
     contact_known_phone: identityState?.identity?.phone || context?.lead?.phone || null,
     // v2.7.14 — Bot Review Phase 0 replay context. Assembled from values already
     // in scope; nothing is fetched and nothing is written here. The send handler

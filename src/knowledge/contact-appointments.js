@@ -27,6 +27,7 @@
  *     auto-cancel" and falls through to a clarifying message.
  */
 
+import { tzLabel } from '../config/market-timezones.js';
 import { CALENDAR_MAP } from '../actions/constants.js';
 import { lpWallClockToGhlStartTime } from '../appointment-dates.js';
 import { withGhlToken } from '../ghl-rate-limiter.js';
@@ -78,7 +79,12 @@ export function toEpochMsEt(value) {
   return Date.parse(lpWallClockToGhlStartTime(str) || str);
 }
 
-function formatStartTimeForPrompt(iso) {
+/**
+ * 2026-10-01: exported and zone-aware. A Houston contact's appointment is
+ * rendered in Central with a "CT" label (Mark's ruling 3); everyone else
+ * keeps ET exactly as before.
+ */
+export function formatStartTimeForPrompt(iso, timeZone = PROMPT_TIMEZONE) {
   if (!iso) return 'unknown time';
   try {
     // toEpochMsEt, not `new Date(iso)`: the raw naive string would render 4-5h
@@ -87,7 +93,7 @@ function formatStartTimeForPrompt(iso) {
     const d = new Date(toEpochMsEt(iso));
     if (Number.isNaN(d.getTime())) return iso;
     const formatted = new Intl.DateTimeFormat('en-US', {
-      timeZone: PROMPT_TIMEZONE,
+      timeZone,
       weekday: 'short',
       month: 'short',
       day: 'numeric',
@@ -95,7 +101,7 @@ function formatStartTimeForPrompt(iso) {
       minute: '2-digit',
       hour12: true,
     }).format(d);
-    return `${formatted} ET`;
+    return `${formatted} ${tzLabel(timeZone)}`;
   } catch {
     return iso;
   }
@@ -284,15 +290,18 @@ export async function hasPriorCompletedAppointment(contactId, calendarId) {
  * The caller decides whether to inject the block — typically only when
  * non-null AND non-empty.
  */
-export function formatAppointmentsForPrompt(appointments) {
+export function formatAppointmentsForPrompt(appointments, { timeZone = null } = {}) {
   if (!Array.isArray(appointments) || appointments.length === 0) return null;
   const lines = [];
   appointments.forEach((a, i) => {
     const idx = i + 1;
+    // A contact's market zone re-renders the time; without one, the ET text
+    // computed at fetch time is used unchanged.
+    const human = timeZone && a.start_time ? formatStartTimeForPrompt(a.start_time, timeZone) : a.start_time_human;
     lines.push(
       `  [${idx}] appointment_id="${a.appointment_id || '?'}" | ` +
       `calendar="${a.calendar_name}" | ` +
-      `start="${a.start_time_human}" (${a.start_time || '?'}) | ` +
+      `start="${human}" (${a.start_time || '?'}) | ` +
       `status="${a.status}"` +
       (a.already_ended ? ' | ALREADY PASSED (still cancellable)' : '') +
       (a.title ? ` | title="${a.title.slice(0, 60)}"` : '')
