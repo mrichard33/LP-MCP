@@ -5,9 +5,11 @@
  * 2026-09-25: LP's webhook to GHL I.LP-IN stopped delivering sales on 09-24,
  * so 15 of 16 sales never reached the board. The backstop announces from our
  * own sync. What matters here:
- *   - it never races a healthy GHL path (30-minute grace, same idempotency key);
+ *   - it waits a short grace (10 minutes since 2026-10-02) and uses the same
+ *     idempotency key as the GHL path;
  *   - it never announces twice (anything with a row is skipped; claim first);
- *   - old sales go in ONE catch-up message, not a burst of celebrations;
+ *   - old sales (first seen 6h+ ago) go in ONE catch-up message, not a burst of
+ *     celebrations — and a server restart never makes a fresh sale "old";
  *   - GroupMe goes only to the sales board bot, and never mirrors to Slack.
  */
 
@@ -38,6 +40,10 @@ const lead = (id, over = {}) => ({
 
 // ─── finding missed sales ────────────────────────────────────────
 
+test('the grace period is 10 minutes', () => {
+  assert.equal(GRACE_MS, 10 * 60 * 1000);
+});
+
 test('finds a won sale nobody announced, and skips the ones that were', async () => {
   let window = null;
   const out = await findMissedSales({
@@ -56,7 +62,7 @@ test('finds a won sale nobody announced, and skips the ones that were', async ()
       return [lead('578357')];
     },
   });
-  assert.equal(window.untilIso, new Date(NOW.getTime() - GRACE_MS).toISOString(), '30 minutes of grace');
+  assert.equal(window.untilIso, new Date(NOW.getTime() - GRACE_MS).toISOString(), 'grace window applied');
   assert.deepEqual(out.map((s) => [s.leadId, s.repDisplayName, s.amount, s.firstSeenAt]), [
     ['578357', 'Donte Wheeler', 28002, '2026-09-25T19:48:00Z'],
   ]);
@@ -110,7 +116,7 @@ test('a fresh sale is announced through the normal pipeline, with GroupMe as the
   const completed = [];
   const groupMe = [];
   const out = await runSaleBackstop({
-    now: () => NOW, logger: quiet, supabase: {}, startedAt: 0,
+    now: () => NOW, logger: quiet, supabase: {},
     find: async () => [{ leadId: '578357', repDisplayName: 'Donte Wheeler', amount: 28002, branch: 'JAX', firstSeenAt: '2026-09-25T19:48:00Z' }],
     claim: async (row) => ({ claimed: true, row: { id: 92, ...row } }),
     complete: async (ctx, deps) => { completed.push(ctx); await deps.mirror('celebration text'); return { ok: true }; },
@@ -126,7 +132,7 @@ test('a fresh sale is announced through the normal pipeline, with GroupMe as the
 test('a sale someone else already claimed is left alone', async () => {
   let completed = 0;
   const out = await runSaleBackstop({
-    now: () => NOW, logger: quiet, supabase: {}, startedAt: 0,
+    now: () => NOW, logger: quiet, supabase: {},
     find: async () => [{ leadId: '1', repDisplayName: 'A B', amount: 5, firstSeenAt: '2026-09-25T20:00:00Z' }],
     claim: async () => ({ claimed: false, duplicate: true, row: { id: 1 } }),
     complete: async () => { completed += 1; return { ok: true }; },
@@ -140,7 +146,7 @@ test('sales older than 6 hours go in one digest, not individual celebrations', a
   let digested = null;
   let completed = 0;
   const out = await runSaleBackstop({
-    now: () => NOW, logger: quiet, supabase: {}, startedAt: 0,
+    now: () => NOW, logger: quiet, supabase: {},
     find: async () => [
       { leadId: 'old1', repDisplayName: 'Joel Pignotti', amount: 99160, branch: 'FTMYR', firstSeenAt: '2026-09-25T12:10:40Z' },
       { leadId: 'old2', repDisplayName: 'Andy Cox', amount: 44500, branch: 'STPET', firstSeenAt: '2026-09-24T17:21:48Z' },
@@ -155,22 +161,24 @@ test('sales older than 6 hours go in one digest, not individual celebrations', a
   assert.equal(out.digested, 2);
 });
 
-test('everything already waiting when the process starts goes in ONE catch-up digest', async () => {
-  let digested = null;
+test('a server restart does not turn a fresh sale into a catch-up digest', async () => {
+  // 2026-10-02: Sean Griffin (579245) was seen at 01:59Z, a deploy restarted
+  // the server ~02:25Z, and his 35-minute-old sale posted as "didn't reach the
+  // board". A sale is stale by age only.
   let completed = 0;
-  await runSaleBackstop({
+  const out = await runSaleBackstop({
     now: () => NOW, logger: quiet, supabase: {},
-    startedAt: new Date('2026-09-25T20:45:00Z').getTime(), // deployed after these were seen
+    startedAt: new Date('2026-09-25T20:45:00Z').getTime(), // ignored now
     find: async () => [
       { leadId: 'a', repDisplayName: 'Donte Wheeler', amount: 28002, firstSeenAt: '2026-09-25T19:48:00Z' },
       { leadId: 'b', repDisplayName: 'Beverly Dorsett', amount: 25895, firstSeenAt: '2026-09-25T20:07:32Z' },
     ],
     claim: async (row) => ({ claimed: true, row: { id: row.lp_lead_id } }),
     complete: async () => { completed += 1; return { ok: true }; },
-    digest: async (stale) => { digested = stale.map((x) => x.leadId); return { ok: true, posted: stale.length }; },
+    digest: async () => { throw new Error('no digest expected for fresh sales'); },
   });
-  assert.deepEqual(digested, ['a', 'b']);
-  assert.equal(completed, 0, 'no burst of individual celebrations on deploy');
+  assert.equal(completed, 2, 'both fresh sales get their normal celebration');
+  assert.equal(out.digested, 0);
 });
 
 test('an unreadable source fails the run rather than guessing', async () => {
