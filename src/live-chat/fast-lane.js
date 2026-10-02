@@ -101,6 +101,7 @@ import { formatDateHuman, formatTimeHuman } from '../appointment-dates.js';
 import {
   guardTimeOffers,
   planLanguageHandoff,
+  SPANISH_REPLY_MARKER,
   planPriceTurn,
   priceTransitionReply,
   priceHint,
@@ -128,6 +129,8 @@ import {
   pickSlot,
   movedLine,
   HANDOFF_LINE as CANCEL_HANDOFF_LINE,
+  CANCEL_MARKERS,
+  cancelMarkerKey,
 } from './cancel-flow.js';
 
 export const LIVE_CHAT_RULE = 'LIVE_CHAT_FAST_LANE';
@@ -732,7 +735,8 @@ export function createLiveChatFastLane(deps) {
         const reason = raced.timedOut ? 'hard_timeout' : `error: ${String(raced.error.message || raced.error).slice(0, 160)}`;
         if (raced.error) d.warn(`[LiveChat] reply failed for ${contactId}: ${raced.error.message}`);
         if (turn.claim('fallback')) {
-          outcome = await fallback({ contactId, conversationId, mode, actionId, timing, reason, body, isSuperseded, backupReply: backup.reply });
+          // After a cancel or a move the visitor is told, whatever came next (Part 8).
+          outcome = await fallback({ contactId, conversationId, mode, actionId, timing, reason, body, isSuperseded: backup.mustDeliver ? () => false : isSuperseded, backupReply: backup.reply });
         } else if (raced.timedOut) {
           // The real reply already claimed the turn and is mid-send: wait for
           // it (bounded) rather than send the holding line on top of it.
@@ -820,7 +824,14 @@ export function createLiveChatFastLane(deps) {
       context.lead = { ...context.lead, current_tags: context.lead?.current_tags?.length ? context.lead.current_tags : tags, phone: context.lead?.phone || contact.phone || null, email: context.lead?.email || contact.email || null };
     }
 
-    // ── Spanish → a person (2026-10-01): a fixed hand-off, no model call ──
+    // What code decided for this turn (Parts 7-8): a reference line the model
+    // writes its own version of (plus booking facts when a booking step ran),
+    // and, for the cancel flow and the Spanish hand-off, the plan itself.
+    let reference = null;
+    let planOverride = null;
+    let langHint = null;
+
+    // ── Spanish → a person (2026-10-01; Part 8: the model writes it, in Spanish) ──
     const langHandoff = planLanguageHandoff({ body, thread: context.conversation_recent });
     if (langHandoff) {
       if (langHandoff.first) {
@@ -831,13 +842,17 @@ export function createLiveChatFastLane(deps) {
         }).catch(err => d.warn(`[LiveChat] language hand-off event failed: ${err.message}`));
         d.opsAlert(`🌎 LIVE CHAT — SPANISH SPEAKER\nContact: ${contactId}\nThey said: "${body.slice(0, 200)}"\n→ Needs a Spanish-speaking person to follow up.`).catch(() => {});
       }
-      timing.t4_analysis_done = new Date(d.now()).toISOString();
-      timing.t5_generation_done = timing.t4_analysis_done;
-      return deliver({
-        contactId, conversationId, body, mode, actionId, timing, isSuperseded, turn, visitorTexts, turn, draft: langHandoff.reply,
+      reference = {
+        reply: langHandoff.reply, slots: [], record: { language_handoff: langHandoff.language },
         capture: langHandoff.phone ? { phone: langHandoff.phone } : {},
-        extras: { language_handoff: langHandoff.language, context_minimal: !!context._minimal, model: null },
-      });
+        extras: { language_handoff: langHandoff.language },
+      };
+      backup.reply = langHandoff.reply;
+      planOverride = {
+        required_move: 'language_handoff', step: 'language_handoff', counters: {}, booking: { allowed: false },
+        reference_line: langHandoff.reply, reference_slots: [], reference_markers: [SPANISH_REPLY_MARKER],
+      };
+      langHint = 'LANGUAGE: the visitor writes in Spanish. Reply ONLY in Spanish, warmly, in one or two short sentences. A Spanish-speaking member of our team will reach out to them; ask nothing else.';
     }
 
     // ── the same turn state generateResponse builds ──
@@ -852,6 +867,8 @@ export function createLiveChatFastLane(deps) {
     // The plan is pure; the lookup runs beside classification and the KB pack
     // under its own 800ms cap, fail-soft to "a team member will confirm".
     let saPlan = planServiceAreaTurn({ trigger: body, conversation: context.conversation_recent });
+    // A cancel or Spanish turn is that flow's, never a coverage question.
+    if (planOverride) saPlan = { ...saPlan, active: false };
     // 2026-10-02: an address typed for a held visit is the answer we asked
     // for, not a coverage question. Only an out-of-area zip stops the booking.
     if (saPlan.active && d.nepqMode() === 'live' && heldSlot(context.conversation_recent)) {
@@ -876,25 +893,34 @@ export function createLiveChatFastLane(deps) {
       thread: context.conversation_recent,
       known: { phone: context.lead?.phone || contact?.phone || null, hasName: hasNameOnRecord },
     });
-    if (cancelPlan) {
+    if (cancelPlan && !reference) {
       // A newer message already arrived: let that turn run the flow, so an
       // appointment is never cancelled or moved on a stale reading of the chat.
       if (isSuperseded()) return deliver({ contactId, conversationId, body, mode, actionId, timing, isSuperseded, turn, draft: '' });
       const outcome = await runCancelFlow({ plan: cancelPlan, contactId, contact, body, mode });
-      timing.t4_analysis_done = new Date(d.now()).toISOString();
-      timing.t5_generation_done = timing.t4_analysis_done;
-      // No isSuperseded here: the flow may already have cancelled or moved the
-      // appointment, and the visitor must be told. Superseded turns are
-      // dropped BEFORE the flow runs instead (above).
-      return deliver({
-        contactId, conversationId, body, mode, actionId, timing, turn, skipCapture: true, draft: outcome.reply,
-        extras: { cancel_flow: outcome.record, context_minimal: !!context._minimal, model: null },
-      });
+      // Part 8 (Mark, 2026-10-02: "Each message should be custom"): code did
+      // the matching and the cancel or move; the model words the reply, with
+      // the flow's line as its reference and backup. The step's read-back
+      // phrase (CANCEL_MARKERS) must survive, or the next turn loses the flow.
+      const key = cancelMarkerKey(outcome.record);
+      reference = {
+        reply: outcome.reply, slots: outcome.slots || [], record: outcome.record, skipCapture: true,
+        // The flow may already have cancelled or moved the appointment: the
+        // visitor must be told even if a newer message arrived. Superseded
+        // turns are dropped BEFORE the flow runs instead (above).
+        mustDeliver: true,
+        booked: key === 'rescheduled',
+        extras: { cancel_flow: outcome.record },
+      };
+      backup.reply = outcome.reply;
+      backup.mustDeliver = true;
+      planOverride = {
+        required_move: 'cancel_flow', step: 'cancel_flow', counters: {}, booking: { allowed: true },
+        reference_line: outcome.reply, reference_slots: outcome.slots || [], reference_markers: CANCEL_MARKERS[key] || [],
+        allow_multi_ask: key === 'ask_identity',
+      };
     }
 
-    // What code decided for this turn (Part 7): a reference line the model
-    // writes its own version of, plus booking facts when a booking step ran.
-    let reference = null;
     let recheckRef = null;
     // ── a phone or email that cannot be right: ask once more (Mark, 2026-10-02) ──
     // "Mark 954 379 215" (nine digits) was thanked and taken. A friendly
@@ -903,7 +929,7 @@ export function createLiveChatFastLane(deps) {
       const recentOut = (context.conversation_recent || []).filter(m => String(m?.direction || '').toLowerCase() === 'outbound').slice(-8).map(m => String(m?.text ?? m?.body ?? ''));
       const typedName = chatIdentity({ visitorTexts: [body] }).first_name || nameFromReply(body) || (String(body).match(/^\s*([A-Z][a-z'’-]{1,20})[\s,]+\+?\(?\d/) || [])[1] || null;
       const recheck = contactRecheckLine({ text: body, recentOutbound: recentOut, firstName: typedName });
-      if (recheck) {
+      if (recheck && !reference) {
         // Part 7: the model words the re-check (CONTACT RE-CHECK hint); the
         // line is the reference and the backup.
         recheckRef = recheck;
@@ -924,7 +950,7 @@ export function createLiveChatFastLane(deps) {
     const nepqMode = d.nepqMode();
     let nepqPlan = null;
     let nepqSlots = null;
-    if (nepqMode !== 'off' && !saPlan.active) {
+    if (nepqMode !== 'off' && !saPlan.active && !planOverride) {
       const realFirst = hasNameOnRecord ? String(context.lead?.first_name || context.lead?.name || '').trim().split(/\s+/)[0] || null : null;
       const planInput = {
         channel: 'livechat', trigger: body, conversation: context.conversation_recent, firstName: realFirst,
@@ -967,12 +993,14 @@ export function createLiveChatFastLane(deps) {
       }
     }
 
+    // The cancel flow or the Spanish hand-off owns this turn (Part 8).
+    if (planOverride) nepqPlan = planOverride;
     // The re-check is this turn's job whatever the plan says (Part 7).
     if (recheckRef && nepqPlan) nepqPlan = { ...nepqPlan, reference_line: recheckRef.line, reference_slots: [] };
 
     // Live NEPQ owns the price turn (clarify once, then a person); the old
     // fixed Transition stays for mode off/shadow.
-    const pricePlan = (saPlan.active || (nepqMode === 'live' && nepqPlan)) ? null : planPriceTurn({ body, thread: context.conversation_recent });
+    const pricePlan = (saPlan.active || reference || (nepqMode === 'live' && nepqPlan)) ? null : planPriceTurn({ body, thread: context.conversation_recent });
     const frustrated = isFrustratedRepeat(body);
     if (pricePlan?.insist) {
       timing.t4_analysis_done = new Date(d.now()).toISOString();
@@ -1021,6 +1049,7 @@ export function createLiveChatFastLane(deps) {
     const malformed = looksLikeMalformedEmail(body);
     const largeJob = largeJobSignal(body);
     const promptHint = [
+      langHint,
       malformed ? `EMAIL LOOKS MALFORMED: the visitor typed "${body.slice(0, 120)}", which is not a valid email address. Say so kindly and ask them to check it. Never say you lack information.` : null,
       looksLikeShortPhone(body) ? 'PHONE LOOKS INCOMPLETE: the number they typed has fewer than 10 digits. Ask them, kindly, for the full number with area code. Never say you have it.' : null,
       largeJob ? `LARGE JOB SIGNAL: "${largeJob}". Answer, offer the next step, and say a person will follow up.` : null,
@@ -1031,7 +1060,7 @@ export function createLiveChatFastLane(deps) {
     // the same block the SMS path gets (src/agentic/service-area-turn.js).
     // Live NEPQ owns the booking-ask decision and is rendered last.
     const turnDiscipline = (nepqMode === 'live' && nepqPlan && discipline) ? { ...discipline, booking: nepqPlan.booking } : discipline;
-    const opts = { established, loopBreak, spouseAdvocacy, handoffPending, discipline: turnDiscipline, promptHint, threadSenderType: 'team', serviceAreaTurn: coverage ? { plan: saPlan, coverage } : null, nepqPlan: nepqMode === 'live' ? nepqPlan : null, upcomingAppointments };
+    const opts = { established, loopBreak, spouseAdvocacy, handoffPending, discipline: turnDiscipline, promptHint, threadSenderType: 'team', serviceAreaTurn: coverage ? { plan: saPlan, coverage } : null, nepqPlan: (nepqMode === 'live' || planOverride) ? nepqPlan : null, upcomingAppointments };
     const userPrompt = buildResponsePrompt(context, 'livechat', body, kbPack, classification, false, 'warm', null, opts) + LIVE_CHAT_OUTPUT_CONTRACT;
     const systemPrompt = getResponseSystemPrompt() + LIVE_CHAT_ADDENDUM;
 
@@ -1067,7 +1096,7 @@ export function createLiveChatFastLane(deps) {
         const voiced = humanizeReply(restoreQuestionMark(message).text, { keepText: userPrompt });
         const facts = reference.facts || null;
         const hasApptRef = context.lp?.appointment_set === true && context.lp?.appointment_is_past !== true;
-        const claimRef = rewriteBookingClaims(voiced.text, { booked: !!facts?.book, held: !!facts && (facts.kind === 'hold' || facts.kind === 'collect'), hasAppointment: hasApptRef, replacement: nextStepLine({ bridgeUsed: !!nepqPlan?.counters?.bridge_used }) });
+        const claimRef = rewriteBookingClaims(voiced.text, { booked: !!facts?.book || !!reference.booked, held: !!facts && (facts.kind === 'hold' || facts.kind === 'collect'), hasAppointment: hasApptRef, replacement: nextStepLine({ bridgeUsed: !!nepqPlan?.counters?.bridge_used }) });
         if (claimRef.changed) d.log(`[LiveChat] false_schedule_claim_fixed ${contactId}: unbacked booking or hold claim rewritten`);
         const typedRef = visitorTexts.join(' \n ');
         const knownRef = {
@@ -1176,9 +1205,13 @@ export function createLiveChatFastLane(deps) {
     }
 
     return deliver({
-      contactId, conversationId, body, mode, actionId, timing, draft, capture, isSuperseded, turn, visitorTexts,
+      contactId, conversationId, body, mode, actionId, timing, draft, turn, visitorTexts,
+      capture: { ...capture, ...(reference?.capture || {}) },
+      // A reply after a cancel or a move goes out whatever arrives next (Part 8).
+      isSuperseded: reference?.mustDeliver ? () => false : isSuperseded,
       skipCapture: !!reference?.skipCapture,
       extras: {
+        ...(reference?.extras || {}),
         intent_class: classification?.intent_class || null,
         classifier_method: classification?.classification_method || null,
         buyer_stage: Number(liveChatFields?.buyer_stage) || null,
@@ -1283,7 +1316,7 @@ export function createLiveChatFastLane(deps) {
       const chosen = pickSlot(body, offered);
       record.slots_offered = offered.map(x => x.iso);
       if (!chosen) return personReschedules(offered.length ? 'slot_pick_unclear' : 'offered_slots_gone');
-      if (!live) return { reply: movedLine(chosen, free.tzLabel), record: { ...record, outcome: 'would_reschedule', new_start: chosen.iso } };
+      if (!live) return { reply: movedLine(chosen, free.tzLabel), slots: [chosen], record: { ...record, outcome: 'would_reschedule', new_start: chosen.iso } };
       let res = null;
       try {
         res = await d.rescheduleAppointment({ contactId: target.id, oldAppointmentId: appt.appointment_id, calendarId: appt.calendar_id, startIso: chosen.iso });
@@ -1296,7 +1329,7 @@ export function createLiveChatFastLane(deps) {
         return personReschedules('reschedule_failed');
       }
       card('rescheduled', false, { newTimeHuman: `${chosen.day} at ${chosen.time} ${free.tzLabel}` });
-      return { reply: movedLine(chosen, free.tzLabel), record: { ...record, outcome: 'rescheduled', new_start: chosen.iso } };
+      return { reply: movedLine(chosen, free.tzLabel), slots: [chosen], record: { ...record, outcome: 'rescheduled', new_start: chosen.iso } };
     }
 
     // after_offer
@@ -1305,7 +1338,7 @@ export function createLiveChatFastLane(deps) {
       const two = (free.slots || []).slice(0, 2);
       if (!two.length || !appt.calendar_id) return personReschedules('no_open_slots');
       record.slots_offered = two.map(x => x.iso);
-      return { reply: slotsOfferLine(two, free.tzLabel), record: { ...record, outcome: 'offered_slots' } };
+      return { reply: slotsOfferLine(two, free.tzLabel), slots: two.map(x => ({ ...x, tz: x.tz || free.tzLabel })), record: { ...record, outcome: 'offered_slots' } };
     }
     if (plan.answer !== 'cancel') return handoff();
     if (!live) return { reply: doneLine(apptHuman), record: { ...record, outcome: 'would_cancel' } };

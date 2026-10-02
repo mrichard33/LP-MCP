@@ -233,7 +233,11 @@ fire-and-forget work that matters to a customer goes through `trackBackground`/`
 never returns `livechat` for the normal pipeline: a chat-widget origin goes out by SMS, or (no phone) is
 not sent and #ops-alerts is told. GHL's "Chat Widget" (type 5, `TYPE_WEBCHAT`) reads as livechat there.
 
-**A live-chat cancel request is a fixed flow, not a model reply (Mark, 2026-10-02).**
+**A live-chat cancel request is a fixed flow in code, worded by the model (Mark, 2026-10-02; Part 8).**
+Code makes every decision; since Part 8 the model words each reply from the flow's line (the reference and
+backup), and each step is read back by meaning (`ID_ASK_RX`, `OFFER_RX`, `SLOTS_RX`, `DONE_RX`, `MOVED_RX`, …), so
+the model's version must keep its step's phrase (`CANCEL_MARKERS`, checked like every Part 7 reference). A reply
+after a cancel or a move always goes out (`mustDeliver`), the timeout backup included.
 `src/live-chat/cancel-flow.js`: ask for the name and phone the appointment is under, match them (phone
 AND name — never phone alone), offer another day once, then cancel in GHL through `cancel_appointment`
 and say "Done" only after GHL confirms. "Yes, another day" offers two real open slots from the
@@ -349,7 +353,7 @@ Mark: "I don't think we need any static messages sent by the bot. Each message s
 - **No more skipping the model.** The SMS `nepqDirect` path is gone. Live chat's `runNepqFixedMove` still decides and books, then returns `{ reply, facts | slots }` and the lane goes on to the model.
 - **A live chat that times out sends the move's backup line, not the holding line** (`fallback({ backupReply })`).
 - **Wording:** Mark's wordings keep their MEANING, not their exact words.
-- **Still fixed, as backups or operational flows:** the generation-failure fallback (`buildAiFallback`, `LIVE_CHAT_FALLBACK_MESSAGE` when nothing was decided), the booking hold/prerequisite lines after a failed inline booking, the slot-taken line, the cancel flow, the Spanish hand-off and the out-of-area exit.
+- **Still fixed, as backups only:** the generation-failure fallback (`buildAiFallback`, `LIVE_CHAT_FALLBACK_MESSAGE` when nothing was decided), the booking hold/prerequisite lines after a failed inline booking, the slot-taken line and the out-of-area exit. Part 8 made the cancel flow and the Spanish hand-off model-written too: the Spanish reply must be Spanish and say our team will reach out (`SPANISH_REPLY_MARKER`), and "after our hand-off" is read by `SPANISH_TEAM_RX`. A plan may carry its own read-back phrases (`reference_markers`) and allow one two-item ask (`allow_multi_ask`, the cancel identity ask only).
 - **Lead knowledge:**
   - The SMS context reads 30 messages across every channel (was 10) and shows 30 turns.
   - `HISTORY WITH REECE` (`lpRelationship`) says when the lead is a past or returning customer.

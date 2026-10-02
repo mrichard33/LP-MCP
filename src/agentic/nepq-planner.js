@@ -773,7 +773,7 @@ const MARKERS = [
 
 export function referenceRules(line, slots = [], plan = null) {
   const ref = String(line || '').trim();
-  const markers = MARKERS.filter(m => m.rx.test(ref));
+  const markers = [...MARKERS.filter(m => m.rx.test(ref)), ...(Array.isArray(plan?.reference_markers) ? plan.reference_markers : [])];
   // A price reply always says why there is no number (the quote → times →
   // person count reads it), even where the reference words it differently.
   if (plan?.objection?.type === 'price' && !markers.some(m => m.rx === PRICE_PLAY_RX)) markers.push(MARKERS.find(m => m.rx === PRICE_PLAY_RX));
@@ -988,7 +988,9 @@ export function enforceNepqPlan(draft, plan, { allowFigures = false, known = {} 
   // example: "Yes, it's completely free. What day works best for you?").
   const reask = plan.reask_line ? reaskAfterAnswer(plan.reask_line) : null;
   const protect = [plan.booking_facts?.ask_line, reask, plan.reask_line, plan.offer_line, COLLECT_ASK.dm];
-  const oneAsk = enforceOneAsk(sentences.join(' '), { ask: planAsk, timePicked, protect });
+  // The cancel flow asks for the name AND phone the appointment is under in
+  // one question (Mark's cancel ruling), so its plan allows that one ask.
+  const oneAsk = plan.allow_multi_ask ? { changed: false } : enforceOneAsk(sentences.join(' '), { ask: planAsk, timePicked, protect });
   if (oneAsk.changed) {
     sentences = splitSentences(oneAsk.text);
     changes.push('multi_ask_trimmed');

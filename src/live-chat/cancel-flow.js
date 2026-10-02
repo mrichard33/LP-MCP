@@ -41,6 +41,42 @@ export const SLOTS_MARK = 'Which one works better for you?';
 export const ONE_SLOT_MARK = 'Does that time work for you?';
 const MOVED_MARK = "You're now set for";
 
+// ── Part 8 (Mark, 2026-10-02: "Each message should be custom") ────────────
+// The model words every cancel-flow reply now; the lines above are its
+// reference and backup. So each step is read back from what the line MEANS,
+// and the model's version must keep the phrase its step is read by
+// (CANCEL_MARKERS, checked by checkAgainstReference).
+export const ID_ASK_RX = /\bname\b[^?]*\b(?:phone|number)\b[^?]*\bappointment\s+is\s+(?:under|booked\s+under|in)\b[^?]*\?/i;
+export const PHONE_ASK_RX = /\b(?:phone|number)\b[^?]*\bappointment\s+is\s+(?:under|booked\s+under|in)\b[^?]*\?/i;
+export const OFFER_RX = /\b(?:different|another|other|new)\s+(?:day|time|date)\b[^?]*\binstead\s+of\s+cancel+ing\b[^?]*\?/i;
+export const SLOTS_RX = /\bmove\s+(?:it|your\s+(?:appointment|visit))\s+to\b|\b(?:which\s+one\s+works\s+better|does\s+that\s+time\s+work)\b/i;
+export const DONE_RX = /\bis\s+(?:now\s+)?cancel+ed\b|\bhave\s+cancel+ed\b/i;
+export const MOVED_RX = /\byou(?:'|’)?re\s+now\s+set\s+for\b|\bmoved\s+(?:it|your\s+(?:appointment|visit))\s+to\b/i;
+export const RESCHEDULE_RX = /\bset\s+up\s+a\s+new\s+time\b/i;
+export const HANDOFF_RX = /\bscheduling\s+team\b/i;
+
+/** Which CANCEL_MARKERS entry a runCancelFlow outcome needs. Pure. */
+export function cancelMarkerKey(record = {}) {
+  const outcome = record?.outcome || null;
+  if (!outcome) return record?.step === 'ask_phone' ? 'ask_phone' : 'ask_identity';
+  if (outcome === 'offered_reschedule' || outcome === 'offered_slots' || outcome === 'handoff') return outcome;
+  if (outcome === 'rescheduled' || outcome === 'would_reschedule') return 'rescheduled';
+  if (outcome === 'cancelled' || outcome === 'would_cancel') return 'cancelled';
+  return 'reschedule';
+}
+
+/** What each step's reply must keep, for the model's version of it. */
+export const CANCEL_MARKERS = Object.freeze({
+  ask_identity: [{ rx: ID_ASK_RX, say: 'ask for the full name and phone number the appointment is under, in one question' }],
+  ask_phone: [{ rx: PHONE_ASK_RX, say: 'ask for the phone number the appointment is under' }],
+  offered_reschedule: [{ rx: OFFER_RX, say: 'ask if a different day would work instead of cancelling' }],
+  offered_slots: [{ rx: SLOTS_RX, say: 'offer to move it to these times and ask which one works better' }],
+  cancelled: [{ rx: DONE_RX, say: 'say the appointment is cancelled' }],
+  rescheduled: [{ rx: MOVED_RX, say: "say they're now set for the new time" }],
+  reschedule: [{ rx: RESCHEDULE_RX, say: 'say a team member will call to set up a new time' }],
+  handoff: [{ rx: HANDOFF_RX, say: 'say the scheduling team has it and will confirm with them' }],
+});
+
 // "cancel", "call it off", and the ways the tzuzq visitor actually said it.
 const CANCEL_RX = /\bcancel(?:l?ing|l?ed)?\b|\bcall\s+(?:it|this|the\s+(?:visit|appointment))\s+off\b|\b(?:don'?t|do\s+not|dont)\s+(?:come|bother\s+coming|send\s+(?:anyone|someone|anybody))\b|\bwaste\s+your\s+time\s+coming\b|\bwon'?t\s+be\s+allowed\s+in\b/i;
 
@@ -109,7 +145,8 @@ export function planCancelTurn({ body, thread = [], known = {} }) {
   // Inbound since the flow began carries the name and phone. The flow begins at
   // the FIRST cancel request after any earlier finished flow — a later
   // "no, just cancel it" is an answer inside the flow, not a new start.
-  const isFinishLine = (m) => m?.direction === 'outbound' && (String(m.text || '').includes(DONE_MARK) || m.text === HANDOFF_LINE || String(m.text || '').includes(RESCHEDULE_MARK) || String(m.text || '').includes(MOVED_MARK));
+  const isFinish = (text) => DONE_RX.test(text) || HANDOFF_RX.test(text) || RESCHEDULE_RX.test(text) || MOVED_RX.test(text);
+  const isFinishLine = (m) => m?.direction === 'outbound' && isFinish(String(m.text || ''));
   const lastFinish = lastIndexWhere(all, isFinishLine);
   const flowStart = all.findIndex((m, i) => i > lastFinish && m?.direction === 'inbound' && isCancelRequest(m.text));
   const flowInbound = (flowStart >= 0 ? all.slice(flowStart) : all).filter((m) => m?.direction === 'inbound').map((m) => String(m.text || ''));
@@ -117,24 +154,26 @@ export function planCancelTurn({ body, thread = [], known = {} }) {
   const words = nameWords(flowInbound);
 
   // 0. Picking one of the open times we offered.
-  if (lastOutText.includes(SLOTS_MARK) || lastOutText.includes(ONE_SLOT_MARK)) {
+  if (SLOTS_RX.test(lastOutText) && !MOVED_RX.test(lastOutText)) {
     return { step: 'pick_slot', offerText: lastOutText, phone, words };
   }
   // 1. Answering our reschedule offer.
-  if (lastOutText.includes(OFFER_MARK)) {
+  if (OFFER_RX.test(lastOutText)) {
     return { step: 'after_offer', answer: classifyOfferAnswer(body), phone, words };
   }
   // 2. Answering our name/phone ask.
-  if (lastOutText === ASK_IDENTITY_LINE || lastOutText === ASK_PHONE_LINE) {
+  const askedId = ID_ASK_RX.test(lastOutText);
+  const askedPhone = !askedId && PHONE_ASK_RX.test(lastOutText);
+  if (askedId || askedPhone) {
     if (phone) return { step: 'lookup', phone, words };
     // Asked twice and still no number: a person takes it from here.
-    if (lastOutText === ASK_PHONE_LINE) return { step: 'handoff', phone: null, words };
+    if (askedPhone) return { step: 'handoff', phone: null, words };
     return { step: 'ask_phone', reply: ASK_PHONE_LINE };
   }
   // 3. A fresh cancel request. A flow that already finished does not restart
   //    on the visitor's next "do not come" — they were answered.
   if (!isCancelRequest(body)) return null;
-  const finished = outs.some((t) => t.includes(DONE_MARK) || t === HANDOFF_LINE || t.includes(RESCHEDULE_MARK) || t.includes(MOVED_MARK));
+  const finished = outs.some(isFinish);
   if (finished) return null;
   if (phone && known.hasName) return { step: 'lookup', phone, words, known: true };
   if (phone && words.length) return { step: 'lookup', phone, words };

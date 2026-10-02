@@ -499,17 +499,26 @@ test('the invented weekend slots never reach the visitor', async () => {
   assert.match(out.message, /A team member will call you to set up a time/);
 });
 
-test('a Spanish visitor gets the Spanish hand-off with no model call, and #ops-alerts is told once', async () => {
+// Part 8: the model writes the Spanish hand-off; an English draft (the stub's)
+// misses it, so the Spanish line ships as the backup.
+test('a Spanish visitor gets the Spanish hand-off (backup when the draft is not Spanish), and #ops-alerts is told once', async () => {
   const { lane, state } = makeLane({ mode: 'live' });
   const out = await lane.processInbound(INBOUND('hola dime que debo de haser'));
   assert.equal(out.message, SPANISH_HANDOFF_LINE);
-  assert.equal(out.language_handoff, 'es');
-  assert.equal(state.llmCalls.length, 0);
+  assert.ok(state.llmCalls.length >= 1, 'the model is asked');
+  assert.match(state.llmCalls[0].user, /Reply ONLY in Spanish/);
   assert.equal(state.sends.length, 1);
   await new Promise(r => setImmediate(r));
   assert.equal(state.ops.filter(t => t.includes('SPANISH')).length, 1);
   assert.equal(state.events.filter(e => e.event_type === 'agentic.live_chat_language_handoff').length, 1);
   assert.equal(state.updates.find(u => u.status === 'completed').execution_result.language_handoff, 'es');
+});
+
+test('a Spanish draft that says our team will reach out is sent as the model wrote it', async () => {
+  const draft = 'Hola, gracias por escribir. Un miembro de nuestro equipo que habla español se comunicará con usted pronto. ¿Cuál es el mejor número para llamarle?';
+  const { lane, state } = makeLane({ mode: 'live', llm: () => ({ message: draft }) });
+  await lane.processInbound(INBOUND('hola necesito ventanas nuevas para mi casa'));
+  assert.equal(state.sends[0].message, draft);
 });
 
 test('live sends carry the action id and the visitor message for the I.LVO webhook', async () => {
@@ -617,15 +626,20 @@ function laneWithCancel(messages, opts = {}) {
   // The deps record into the lane's own state object, filled in once it exists.
   const box = {};
   const proxy = new Proxy({}, { get: (_t, k) => box.state[k], set: (_t, k, v) => { box.state[k] = v; return true; } });
-  const made = makeLane({ firstName: 'Guest Visitor tzuzq', messages, extra: cancelDeps(proxy, opts), llm: () => { throw new Error('the model must not be called in the cancel flow'); } });
+  const made = makeLane({ firstName: 'Guest Visitor tzuzq', messages, extra: cancelDeps(proxy, opts),
+    // Part 8: the model words the cancel flow now. This stub's off-topic draft
+    // misses every step, so the flow's own lines ship as the backup.
+    llm: opts.llm || (() => ({ message: 'Sure. What made you start looking at this now?' })) });
   box.state = made.state;
   return { lane: made.lane, state: made.state };
 }
 
-test('tzuzq: "cancel my appt" from an unknown visitor asks for the name and phone — no model, no "no appointment on file"', async () => {
+// Part 8: the model words every cancel-flow reply; the stub's off-topic draft
+// misses the step, so the flow's own line ships as the backup.
+test('tzuzq: "cancel my appt" from an unknown visitor asks for the name and phone, never "no appointment on file"', async () => {
   const { lane, state } = laneWithCancel([TZ('inbound', 'cancel my appt please. not buying g anything', 0)]);
   await lane.processInbound(INBOUND('cancel my appt please. not buying g anything'));
-  assert.equal(state.llmCalls.length, 0);
+  assert.ok(state.llmCalls.length >= 1, 'the model is asked');
   assert.equal(state.sends[0].message, "I can help with that. What's the full name and phone number the appointment is under?");
 });
 
@@ -1165,4 +1179,18 @@ test('normalizeThread keeps each turn\'s own channel (texts and emails sit in th
     { direction: 'inbound', body: 'no type', dateAdded: '2026-10-02T13:00:00Z' },
   ]);
   assert.deepEqual(t.map(m => m.channel), ['sms', 'livechat', 'email', 'livechat']);
+});
+
+
+// Part 8: a cancel-flow draft that keeps its step's phrase is sent as written,
+// and the next turn still reads the step back from it.
+test('cancel flow: the model words the identity ask, and the next turn still finds the step', async () => {
+  const draft = "Sorry to hear that, I can take care of it. What's the full name and phone number the appointment is under?";
+  const { lane, state } = laneWithCancel([TZ('inbound', 'please cancel my appointment', 0)], { llm: () => ({ message: draft }) });
+  await lane.processInbound(INBOUND('please cancel my appointment'));
+  assert.equal(state.sends[0].message, draft, 'two asks in one question are allowed for this step');
+  const { planCancelTurn } = await import('../src/live-chat/cancel-flow.js');
+  const t = (direction, text) => ({ direction, text });
+  const next = planCancelTurn({ body: 'Rick Fox 352-555-0188', thread: [t('inbound', 'please cancel my appointment'), t('outbound', draft), t('inbound', 'Rick Fox 352-555-0188')] });
+  assert.equal(next.step, 'lookup');
 });
