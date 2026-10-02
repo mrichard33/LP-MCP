@@ -332,7 +332,12 @@ export function plainMessageText(body) {
     .trim();
 }
 
-export function normalizeThread(messages, limit = 10) {
+// 2026-10-02 (Mark's 5:22 PM chat replay): with 10, "I will need to check
+// with my wife" had scrolled out by the time the booking details were
+// collected, so the bot asked "anyone else?" instead of about his wife. A
+// booking chat runs 20+ messages; the planner and collect read all of it.
+export const LIVE_CHAT_THREAD_LIMIT = 30;
+export function normalizeThread(messages, limit = LIVE_CHAT_THREAD_LIMIT) {
   const rows = Array.isArray(messages) ? messages : (messages?.messages?.messages || messages?.messages || []);
   return rows
     .map(m => ({

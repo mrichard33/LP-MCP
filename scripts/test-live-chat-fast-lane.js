@@ -1098,3 +1098,19 @@ test('turnsFromRows: the visitor message and what was sent, oldest first', async
   ]);
   assert.deepEqual(t.map(x => x.direction), ['inbound', 'outbound', 'inbound']);
 });
+
+// 2026-10-02 (Mark's 5:22 PM chat replay): a wife mentioned 12 messages back
+// had scrolled out of a 10-message window, so the bot asked "anyone else?".
+test('a long booking chat keeps the early mention of a spouse in view', async () => {
+  const offer = 'I have Tue, Oct 6 at 10:00 AM ET or Wed, Oct 7 at 2:00 PM ET. Which works better?';
+  const msgs = [
+    M('inbound', 'I will need to check with my wife', 20), M('outbound', 'Makes sense. How does your spouse feel about getting this done?', 19),
+    M('inbound', 'we both want it done', 18), M('outbound', offer, 17),
+    M('inbound', 'the first one', 16), M('outbound', "Great, I'm holding Tue, Oct 6 at 10:00 AM ET for you. What's your first name?", 15),
+    M('inbound', 'Mark', 14), M('outbound', "Thanks, Mark. What's the best phone number to reach you?", 13),
+    M('inbound', '3525550188', 12), M('outbound', "Got it. What's the street address for the visit, including the zip code?", 11),
+  ];
+  const { lane, state } = nepqLane({ phone: null, contact: { firstName: 'Guest Visitor x1', phone: null }, messages: msgs });
+  await lane.processInbound(INBOUND('12 Main St, Ocala FL 34470'));
+  assert.match(state.sends[0].message, /Will your wife be able to be there then\?$/);
+});
