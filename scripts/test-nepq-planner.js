@@ -382,3 +382,10 @@ test('funnel audit: invented scarcity and a re-worded consequence question are c
   const asked = T(['outbound', 'What happens if another storm hits before they are fixed?'], ['inbound', 'more leaks i guess'], ['outbound', "That's a lot. What's another year of that worth to you?"], ['inbound', 'not much']);
   assert.notEqual(plan({ trigger: 'not much', conversation: asked }).required_move, 'consequence');
 });
+
+test('re-run: a pressure clause is cut and the rest of the sentence kept', () => {
+  const p = plan({ trigger: 'ok the first one' });
+  const out = enforceNepqPlan("Our calendar's tight right now, so the quickest way to grab a day that works is here: {{trigger_link.x}}", p);
+  assert.ok(out.changes.includes('fake_urgency'));
+  assert.equal(out.text, 'The quickest way to grab a day that works is here: {{trigger_link.x}}');
+});
