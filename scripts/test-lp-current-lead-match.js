@@ -214,6 +214,9 @@ test('runF0IntegrityAudit: reports a demo that is missing from F.0 and posts not
   const deps = {
     supabase: fakeSupabase(rows),
     nowMs: NOW,
+    // 2026-10-02 — the audit now ignores demos before F0_AUDIT_SINCE; these
+    // fixtures sit on 9/28–9/29, so open the window for this test.
+    sinceMs: Date.parse('2026-09-01T00:00:00Z'),
     hlRunSQL: async (sql) => (/unnest\(tags\)/.test(sql)
       ? [{ ghl_contact_id: 'in-f0' }]
       : Object.entries(hl).filter(([id]) => sql.includes(`'${id}'`)).map(([id, tags]) => ({ ghl_contact_id: id, tags }))),

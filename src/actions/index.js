@@ -67,9 +67,11 @@
  *     layer3_dispatch, emit_event, check_eligibility, check_throttle,
  *     compute_risk_score, calculate_time_lapse_tier, classify_bucket,
  *     reanalyze_reply
- *   State machines (5):
+ *   State machines (6):
  *     compute_rescission_dispatch, transition_objection_state,
- *     resolve_objection_state, classify_lead_state, end_agentic_handoff
+ *     resolve_objection_state, classify_lead_state, end_agentic_handoff,
+ *     s52_cancel_recheck (2026-10-02 — the one 30-minute re-check of a cancel
+ *       that not_reschedule_inflight suppressed; src/s52-cancel-recheck.js)
  *   Five9 gated writes (37 — every one behind FIVE9_WRITES_ENABLED, and all
  *   but one behind approve_action too; see src/five9/admin-writes.js).
  *   THE EXCEPTIONS ARE THREE, each its own named constant in
@@ -276,6 +278,7 @@ import { executeCheckThrottle } from './handlers/throttle.js';
 import { executeClassifyBucket } from './handlers/classify-bucket.js';
 // S5.2 v2 (Spec v1.2) — objection-state substrate writer
 import { executeTransitionObjectionState, executeResolveObjectionState } from './handlers/objection-state.js';
+import { executeS52CancelRecheck } from '../s52-cancel-recheck.js';
 // Phase 2 lead-state — reactive classifier + S4.5 enrollment invoker
 import { executeClassifyLeadState } from './handlers/lead-state.js';
 // 2026-07-06 (Bot 2/3/4 consolidation) — GHL contact-note writer (escalation
@@ -628,6 +631,7 @@ export const ACTION_HANDLERS = {
   classify_bucket: executeClassifyBucket,        // 2026-05-13 — Phase 1 #56 bucket→workflow resolver
   transition_objection_state: executeTransitionObjectionState, // 2026-05-14 — S5.2 v2 objection-state substrate writer (Spec v1.2)
   resolve_objection_state: executeResolveObjectionState, // 2026-07-11 — close an open loss state (hard_loss is transition-terminal) on re-engagement
+  s52_cancel_recheck: (action) => executeS52CancelRecheck(action), // 2026-10-02 — re-check a cancel suppressed by not_reschedule_inflight (Maria, lead 580116)
   classify_lead_state: executeClassifyLeadState, // 2026-06-02 — Phase 2 lead-state classifier + S4.5 enrollment (reactive invoker)
   end_agentic_handoff: (action) => endAgenticHandoff(action.target_id), // 2026-06-16 — silent agentic-active teardown on terminal closeout
   // 2026-07-21 Phase C — Five9 gated writes. Ships dark (FIVE9_WRITES_ENABLED
