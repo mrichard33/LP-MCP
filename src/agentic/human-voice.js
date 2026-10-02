@@ -182,7 +182,7 @@ export function humanizeReply(text, { keepText = '' } = {}) {
 // check counts "?", so the period also hid those questions from the guards.
 // The LAST sentence only: that is where the bot's one question sits, and a
 // statement mid-reply is far likelier to start with "when" or "how".
-const QUESTION_START_RX = /^(?:what(?:'s|’s)?|how|when|which|where|who|why|is|are|do|does|did|can|could|would|will|should|want|have|has)\b/i;
+const QUESTION_START_RX = /^(?:what(?:'s|’s)?|how|when|which|where|who|why|is|are|do|does|did|can|could|would|will|should|want|have|has)\b|^(?:sound\s+good|make\s+sense|work\s+for\s+you)\s*\.?$/i;
 // Statements that start like a question: "What I can do is…", "When you're
 // ready, …", "Would love to help.", "Will do.", "Have a great day."
 const NOT_A_QUESTION_RX = /^(?:(?:what|how|when|where|why)\s+(?:i|we|you|you're|you’re|they|it|it's|that's|there's|our|your|this|these|those)\b|would\s+(?:love|be\s+(?:happy|glad))\b|will\s+do\b|have\s+(?:a|an|the|fun)\b|which\s+(?:means|is\s+why)\b)/i;

@@ -242,3 +242,11 @@ test('claims nobody approved are stripped', () => {
   assert.ok(r.changes.includes('unapproved_claim'));
   assert.ok(enforceNepqPlan('With us at the peak of hurricane season, how is that sitting with you?', p).changes.includes('unapproved_claim'));
 });
+
+test('spouse turn 2: the answer to "how does your spouse feel" gets the both-home time, whoever it names', () => {
+  const thread = T(['inbound', "I'm interested but I need to talk to my wife first"], ['outbound', LINES.spouse_1]);
+  const p = planNepqTurn({ channel: 'livechat', trigger: 'She has to see it before we decide', conversation: thread, slots: SLOTS, tzLabel: 'ET' });
+  assert.equal(p.objection?.type, 'spouse');
+  assert.match(p.fixed_line, /both home\? I have Tue, Oct 6/);
+  assert.equal(planNepqTurn({ channel: 'livechat', trigger: 'she wants to know the price first, how much?', conversation: thread }).objection?.type, 'price');
+});
