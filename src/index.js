@@ -310,6 +310,7 @@ import { registerFreshnessRefreshRoutes, startFreshnessRefreshScheduler } from '
 import { registerLinkLeakRoutes, startLinkLeakScheduler } from './jobs/link-leak-monitor.js';
 import { registerP2UnresolvableRoutes, startP2UnresolvableScheduler } from './jobs/p2-unresolvable-monitor.js';
 import { registerTagHygieneRoutes, startTagHygieneScheduler } from './jobs/tag-hygiene-sweep.js';  // 2026-09-22
+import { registerCleanup20261002Routes } from './admin/cleanup-2026-10-02-f0-s52.js';  // 2026-10-02 — one-time F.0 / S5.2 cleanup
 import { startSiteEventsRetentionScheduler } from './jobs/site-events-retention.js';  // 2026-10-01
 import { startF0IntegrityAuditScheduler } from './jobs/f0-integrity-audit.js';  // 2026-09-30
 import { startOfficePowerRankingScheduler } from './jobs/office-power-ranking.js';  // 2026-09-24
@@ -867,6 +868,7 @@ registerLeadLeakRoutes(app);
 registerInboundCaptureRoutes(app);
 registerP2UnresolvableRoutes(app);
 registerTagHygieneRoutes(app, authenticate);
+registerCleanup20261002Routes(app, authenticate);
 registerCiRoutes(app, authenticate);            // 2026-08-21 — Call Intelligence ingest (PR 2; worker ships disarmed)
 
 const server = app.listen(PORT, async () => {

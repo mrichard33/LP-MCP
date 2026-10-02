@@ -2531,4 +2531,29 @@ export const STARTUP_MIRRORS = [
     fail: '[Migration] site_lead_summary (sql/142) skipped — apply sql/142 from the dashboard; I.STITCH keeps writing GHL but has no per-lead row and no returning-visit refresh until it exists:',
     level: 'warn',
   },
+  // audit_posted_items (sql/143, 2026-10-02 — the file is the source of
+  // truth). What the F.0 / S5.2 integrity audit already posted, so it posts
+  // only new problems. Until it exists the audit posts everything it finds.
+  {
+    name: 'sql/143',
+    expects: {
+      tables: ['audit_posted_items'],
+      indexes: ['idx_audit_posted_items_key', 'idx_audit_posted_items_posted_at'],
+    },
+    sql: [
+      `CREATE TABLE IF NOT EXISTS audit_posted_items (
+              id bigserial PRIMARY KEY,
+              audit text NOT NULL,
+              contact_id text NOT NULL,
+              reason text NOT NULL,
+              posted_at timestamptz NOT NULL DEFAULT now()
+            );`,
+      `CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_posted_items_key ON audit_posted_items (audit, contact_id, reason);`,
+      `CREATE INDEX IF NOT EXISTS idx_audit_posted_items_posted_at ON audit_posted_items (posted_at);`,
+      `ALTER TABLE audit_posted_items ENABLE ROW LEVEL SECURITY;`,
+    ],
+    ready: '[Migration] audit_posted_items (sql/143) ready',
+    fail: '[Migration] audit_posted_items (sql/143) skipped — apply sql/143 from the dashboard; the F.0 / S5.2 audit posts every problem it finds (no repeat filter) until it exists:',
+    level: 'warn',
+  },
 ];

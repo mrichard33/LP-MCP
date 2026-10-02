@@ -283,7 +283,7 @@ export async function checkNoDuplicateWorkflowEnrollment(action, ctx = {}) {
   const contactId = action.target_id;
   if (!contactId) return { passed: true, reason: 'no_contact_id_open' };
 
-  const tags = await loadContactTags(contactId);
+  const tags = await (ctx.deps?.loadContactTags || loadContactTags)(contactId);
   if (tags === null) return { passed: true, reason: 'infra_error_open' };
 
   const candidates = activeWorkflowTagCandidates(canonicalCode);
@@ -294,9 +294,26 @@ export async function checkNoDuplicateWorkflowEnrollment(action, ctx = {}) {
 
   // Check if the batch removes the conflicting active-* tag first.
   const batchRemoved = ctx.batchPriorTagsRemoved || new Set();
-  const stillActive = found.filter((t) => !batchRemoved.has(t));
+  let stillActive = found.filter((t) => !batchRemoved.has(t));
   if (stillActive.length === 0) {
     return { passed: true, reason: 'batch_removed_active_tag' };
+  }
+
+  // 2026-10-02 — confirm with GHL before rejecting. The snapshot can be stale:
+  // action 535417 (Gaby, zPSEN55i7yCjbjlnSoKu) was refused for "already has
+  // active-f.0" while a live GHL read showed no such tag, so a real F.0 entry
+  // never happened. The snapshot still decides when GHL cannot be read — a
+  // failed live read keeps the block (it is the duplicate-messaging guard).
+  const liveTags = await readLiveTagsForSI3(contactId, ctx.deps);
+  if (liveTags) {
+    const live = new Set(liveTags.map((t) => String(t).toLowerCase()));
+    const gone = stillActive.filter((t) => !live.has(t));
+    if (gone.length) await fixStaleSnapshot(contactId, gone, ctx.deps);
+    stillActive = stillActive.filter((t) => live.has(t));
+    if (stillActive.length === 0) {
+      console.log(`[avg:stage-integrity] SI-3 ${contactId}: snapshot said [${gone.join(', ')}] but GHL live does not — passing`);
+      return { passed: true, reason: 'snapshot_stale_live_clear' };
+    }
   }
 
   return {
@@ -317,6 +334,27 @@ export async function checkNoDuplicateWorkflowEnrollment(action, ctx = {}) {
       batch_removed_in_session: [...batchRemoved].filter((t) => t.startsWith('active-')),
     },
   };
+}
+
+// Live GHL tags, or null when they cannot be read (the snapshot then decides).
+async function readLiveTagsForSI3(contactId, deps = {}) {
+  try {
+    const ghlFetch = deps.ghlFetch || (await import('../../../actions/helpers.js')).ghlFetch;
+    const res = await ghlFetch('GET', `/contacts/${contactId}`);
+    return Array.isArray(res?.contact?.tags) ? res.contact.tags : null;
+  } catch (e) {
+    console.warn(`[avg:stage-integrity] SI-3 live tag read failed for ${contactId} (snapshot decides): ${e.message}`);
+    return null;
+  }
+}
+
+async function fixStaleSnapshot(contactId, tags, deps = {}) {
+  try {
+    const apply = deps.applyTagsToSnapshot || (await import('../../tag-snapshot.js')).applyTagsToSnapshot;
+    await apply(contactId, { remove: tags });
+  } catch (e) {
+    console.warn(`[avg:stage-integrity] SI-3 snapshot repair failed for ${contactId}: ${e.message}`);
+  }
 }
 
 // Exported for unit tests

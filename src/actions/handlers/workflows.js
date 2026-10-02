@@ -208,6 +208,7 @@ import {
 // write-through) rather than a raw DELETE from here.
 import { executeRemoveTag } from './tags.js';
 import { withGhlToken } from '../../ghl-rate-limiter.js';
+import { gateS52Enrollment } from '../../s52-entry-gate.js';
 
 // ── Universal Dynamic Hold (2026-06-12) ────────────────────────────────
 // One GHL "dumb clock" workflow (dfd3ffaa) parks a contact for hold_hours and
@@ -638,6 +639,14 @@ export async function executeAddToWorkflow(action) {
   const postSuccessAction = payload._post_success_action || null;
 
   if (!contactId) throw new Error('Missing contactId');
+
+  // ── 2026-10-02 S5.2 entry gate ─────────────────────────────────
+  // Every cancel / no-show / 1Leg / be-back / ghost-after-booking S5.2 entry
+  // stops here first, whichever rule queued it (src/s52-entry-gate.js). Reads
+  // LP live and fails closed; a block is a `skipped` row plus an
+  // s52.entry_blocked event, never a Slack post.
+  const s52Block = await gateS52Enrollment(action);
+  if (s52Block) return s52Block;
 
   // ── v2.0 Idempotency guard ────────────────────────────────────
   // Skip the enrollment entirely when the contact is already in the

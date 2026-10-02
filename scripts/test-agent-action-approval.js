@@ -211,7 +211,9 @@ test('D1 — the registry holds exactly the 78 documented action types', async (
   // 2026-09-28 (Consent Model v1): 78 → 81 and five9_* 38 → 39 —
   // record_consent_change, request_dnc_lift_review, and
   // five9_remove_numbers_from_dnc_approved (the Slack-approved lift).
-  assert.equal(types.length, 81);
+  // 2026-10-02 (Maria, lead 580116): 81 → 82, s52_cancel_recheck — the one
+  // 30-minute re-check of a cancel that not_reschedule_inflight suppressed.
+  assert.equal(types.length, 82);
   assert.equal(types.filter(t => t.startsWith('five9_')).length, 39);
   // Every type the coercion loop covers must actually be dispatchable.
   for (const actionType of FIVE9_WRITE_TYPES) {

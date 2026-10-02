@@ -926,17 +926,22 @@ async function enqueueWorkflowEnrollment({ contact_id, workflow_id, webhook_url,
   }
 
   const useRouteB = !!webhook_url;
+  // 2026-10-02 — state_code rides on the row so the S5.2 entry gate
+  // (src/s52-entry-gate.js, run in executeAddToWorkflow) knows whether this is
+  // a cancel/no-show entry it must check or a pre-demo friction entry it leaves alone.
   const basePayload = useRouteB
     ? {
         webhook_url,
         workflow_id,         // kept for audit even on Route B
         format: 'json',
         payload,             // forwarded as JSON body to the inbound webhook URL
+        state_code,
       }
     : {
         workflow_id,
         format: 'json',
         payload,             // ignored by Route A (no payload delivery)
+        state_code,
       };
 
   // v1.8 — bundle the routing notification as _post_success_action.

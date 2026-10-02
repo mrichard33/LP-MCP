@@ -224,6 +224,7 @@ import { emitEvent } from './event-emitter.js';
 // escalation/objection/callback rules can opt out while a booking is in flight.
 import { isInHomeCalendarId } from './knowledge/booking-calendar-router.js';
 import { isRescheduleInflight } from './services/reschedule-inflight.js';
+import { queueS52CancelRecheck, RECHECK_RULE_KEYS } from './s52-cancel-recheck.js';
 import { findBlockingLiveLead, blockingReason } from './duplicate-lead-guard.js';
 // 2026-08-03 — one rank scale, shared with the contact-scoped appointment
 // claim. See the BOOKING_AUTHORITY_RANK note below.
@@ -1453,6 +1454,14 @@ async function evaluateContextConditions(conditions, intelligence, event, opts =
         if (!expected) break; // only gate when set truthy
         if (await isRescheduleInflight(event.ghl_contact_id)) {
           console.log(`[Context] BLOCKED: not_reschedule_inflight — contact ${event.ghl_contact_id} has an agent reschedule in flight`);
+          // 2026-10-02 (Maria, lead 580116) — suppress, don't drop. A cancel
+          // rule blocked here gets ONE re-check in 30 minutes
+          // (src/s52-cancel-recheck.js); the re-check itself passes
+          // opts.recheck so it can never queue another.
+          if (!opts.recheck && RECHECK_RULE_KEYS.includes(ruleKey) && !isSyntheticEvent(event)) {
+            queueS52CancelRecheck(event, ruleKey).catch((err) =>
+              console.warn(`[DecisionEngine] cancel re-check queue failed: ${err.message}`));
+          }
           return false;
         }
         break;
@@ -2318,6 +2327,37 @@ async function responderStandDownActions(deps = {}) {
     return Array.isArray(nin) && nin.length > 0 ? nin : RESPONDER_STAND_DOWN_FALLBACK;
   } catch {
     return RESPONDER_STAND_DOWN_FALLBACK;
+  }
+}
+
+/**
+ * 2026-10-02 — re-run ONE rule against an event that already happened, for
+ * the S5.2 cancel re-check (src/s52-cancel-recheck.js). Same steps as
+ * findMatchingRules + createActionsFromRule for that single rule: conditions
+ * (with opts.recheck so not_reschedule_inflight cannot queue another
+ * re-check), the stage gate, then the actions. Never throws.
+ * @returns {Promise<{ fired: boolean, reason: string, created_action_ids?: number[] }>}
+ */
+export async function recheckRuleForEvent(eventId, ruleKey, deps = {}) {
+  try {
+    const db = deps.supabase || supabase;
+    const { data: event, error } = await db.from('system_events').select('*').eq('id', eventId).maybeSingle();
+    if (error) return { fired: false, reason: `event_read_failed: ${error.message}` };
+    if (!event) return { fired: false, reason: 'event_not_found' };
+    const rule = (await (deps.loadRules || loadRules)()).find((r) => r.rule_key === ruleKey);
+    if (!rule) return { fired: false, reason: 'rule_not_enabled' };
+    const conds = { ...(rule.conditions || {}), ...(rule.context_conditions || {}) };
+    const intelligence = Object.keys(conds).length ? await fetchLeadIntelligence(event.ghl_contact_id) : null;
+    if (Object.keys(conds).length
+      && !(await evaluateContextConditions(conds, intelligence, event, { ruleKey, recheck: true }))) {
+      return { fired: false, reason: 'conditions_not_met' };
+    }
+    if (!(await passesStageGate(event, rule, intelligence))) return { fired: false, reason: 'stage_gate' };
+    const created = await createActionsFromRule(event, rule);
+    return { fired: created.length > 0, reason: created.length ? 'actions_created' : 'deduped_or_none', created_action_ids: created.map((a) => a.id) };
+  } catch (err) {
+    console.warn(`[DecisionEngine] recheckRuleForEvent ${ruleKey} on event ${eventId} failed: ${err.message}`);
+    return { fired: false, reason: `error: ${err.message}` };
   }
 }
 
