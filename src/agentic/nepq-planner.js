@@ -47,7 +47,9 @@ export const DECLINE_RX = /\b(?:no\s+thanks?|no\s+thank\s+you|not\s+interested|l
 const CLOSE_RX = /\b(?:good\s*bye|bye|leave\s+me\s+alone|never\s*mind|nevermind)\b/i;
 const BARE_NO_RX = /^\s*(?:no|nope|nah|no\s+thanks?|not\s+really|not\s+now|no\s+sir|no\s+ma'?am|neither)\s*[.!]*\s*$/i;
 
-const COMPLAINT_RX = /\b(?:complain\w*|ripped\s+off|rip[-\s]?off|scam\w*|refund|lawyer|attorney|sue\b|bbb|better\s+business|manager|supervisor|no[-\s]?show(?:ed)?|never\s+showed|(?:nobody|no\s+one)\s+(?:came|showed|called|answered)|unprofessional|rude|terrible\s+service|worst)\b/i;
+// 2026-10-02 (ymnwp): "someone was supposed to come to my house today" is a
+// missed visit and goes to a person; the bot pitched a measurement instead.
+const COMPLAINT_RX = /\b(?:supposed\s+to\s+(?:come|show|be\s+(?:here|there)|call|arrive)|never\s+(?:came|showed(?:\s+up)?|arrived|called(?:\s+(?:me\s+)?back)?)|(?:didn'?t|did\s+not)\s+(?:come|show(?:\s+up)?|arrive|call(?:\s+(?:me\s+)?back)?)|stood\s+(?:me|us)\s+up|waited\s+all\s+(?:day|morning|afternoon)|(?:nobody|no\s+one|no-one)\s+(?:showed|came|called|answered)|complain\w*|ripped\s+off|rip[-\s]?off|scam\w*|refund|lawyer|attorney|sue\b|bbb|better\s+business|manager|supervisor|no[-\s]?show(?:ed)?|never\s+showed|(?:nobody|no\s+one)\s+(?:came|showed|called|answered)|unprofessional|rude|terrible\s+service|worst)\b/i;
 
 const SPOUSE_RX = /\b(?:wife|husband|spouse|partner|fianc[ée]e?)\b/i;
 const SPOUSE_OBJECTION_RX = /\b(?:talk|check|ask|discuss|run\s+(?:it|this))\b[^.?!]{0,40}\b(?:wife|husband|spouse|partner)\b|\b(?:wife|husband|spouse|partner)\b[^.?!]{0,40}\b(?:decides?|has\s+to|needs?\s+to|wants?\s+to|would\s+have\s+to|isn'?t\s+(?:here|home|sure))\b/i;
@@ -129,8 +131,26 @@ function splitSentences(text) {
   return String(text || '').split(/(?<=[.!?])\s+/).map(s => s.trim()).filter(Boolean);
 }
 
+// A visitor back after this long starts a new visit (2026-10-02, ymnwp: a
+// "hello" 34 hours later got the bridge, because yesterday's three questions
+// still counted toward the discovery cap).
+export const SESSION_GAP_MS = 6 * 3600 * 1000;
+
+/** The turns of the current visit: everything after the last gap longer than SESSION_GAP_MS. Pure. */
+export function currentSession(conversation = [], gapMs = SESSION_GAP_MS) {
+  const list = Array.isArray(conversation) ? conversation : [];
+  const at = (m) => Date.parse(m?.timestamp || m?.sent_at || m?.dateAdded || m?.created_at || '');
+  let start = 0;
+  for (let i = 1; i < list.length; i++) {
+    const a = at(list[i - 1]);
+    const b = at(list[i]);
+    if (Number.isFinite(a) && Number.isFinite(b) && b - a > gapMs) start = i;
+  }
+  return list.slice(start);
+}
+
 function normalizeThread(conversation, trigger) {
-  const turns = (Array.isArray(conversation) ? conversation : [])
+  const turns = currentSession(conversation)
     .map(m => ({ direction: String(m?.direction || '').toLowerCase() === 'outbound' ? 'outbound' : 'inbound', text: String(m?.text ?? m?.body ?? '') }))
     .filter(m => m.text.trim());
   const last = turns[turns.length - 1];

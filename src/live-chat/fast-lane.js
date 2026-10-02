@@ -927,7 +927,7 @@ export function createLiveChatFastLane(deps) {
       // the conversation guards would talk over it.
       const nepqLive = nepqMode === 'live' && nepqPlan;
       const bookingAllowed = nepqLive ? !!nepqPlan.booking.allowed : (!!discipline?.booking?.allowed || !!pricePlan || frustrated);
-      const flow = saPlan.active ? { notes: [], fixed: cov.fixed } : guardChatFlow(cov.fixed, { thread: context.conversation_recent, hasName, hasPhone, body, bookingAllowed, declined: live?.recommended_action === 'suppress' });
+      const flow = saPlan.active ? { notes: [], fixed: cov.fixed } : guardChatFlow(cov.fixed, { thread: context.conversation_recent, hasName, hasPhone, body, bookingAllowed, declined: live?.recommended_action === 'suppress', serviceTurn: live?.recommended_action === 'escalate_to_rep' || /existing_customer|service|complaint/i.test(String(live?.escalation_category || '')) });
       // The NEPQ plan, enforced last: no money figures, no pressure, no
       // booking ask it does not allow, one question, the bridge when due.
       const typed = visitorTexts.join(' \n ');
