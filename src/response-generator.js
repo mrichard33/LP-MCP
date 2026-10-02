@@ -3042,10 +3042,15 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // (and costs nothing) when every semantic mode is off.
   const getQueryEmbedding = prewarmQueryEmbedding(triggerMessage);
 
-  const context = await buildLeadContext(contactId, {
-    includeConversation: true,
-    skipCache: true,
-  });
+  // 2026-10-02: the bot simulator (src/simulator/bot-simulator.js) hands in
+  // a made-up lead and thread; it always runs with dryRun, so nothing is
+  // written for the made-up contact id.
+  const context = opts.simulatedContext && opts.dryRun === true
+    ? structuredClone(opts.simulatedContext)
+    : await buildLeadContext(contactId, {
+      includeConversation: true,
+      skipCache: true,
+    });
 
   // ─── ESTABLISHED FACTS (2026-09-11 — Alfredo Fontan) ──────────────────
   // Built immediately after the context and BEFORE the prompt, so every block
@@ -3589,7 +3594,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // ─── NEPQ backbone (2026-10-02, Mark): one planned move per turn ───────
   // shadow: planned and recorded only; live: rendered last in the prompt,
   // owns the booking-ask decision, and is enforced on the draft below.
-  const nepqMode = nepqBackboneMode();
+  const nepqMode = (opts.dryRun === true && opts.nepqModeOverride) ? opts.nepqModeOverride : nepqBackboneMode();
   let nepqPlan = null;
   // SMS only: email replies are long-form and keep their own rules.
   if (nepqMode !== 'off' && channel === 'sms' && !serviceAreaTurn?.plan?.active) {

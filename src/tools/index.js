@@ -15,6 +15,7 @@ import { registerFive9Tools } from './five9-tools.js';
 import { registerMemoryTools } from './memory-tools.js';
 import { registerSalesBoardTools } from './sales-board-tools.js';
 import { registerPayrollTools } from './payroll/index.js';
+import { registerSimulatorTools } from './simulator-tools.js';
 import { withSanitizedResults } from '../text-sanitize.js';
 
 export function registerAllTools(rawServer) {
@@ -75,6 +76,10 @@ export function registerAllTools(rawServer) {
   //   For a board or a sale that fell outside the automatic windows (the 9/25
   //   8 PM board lost to the switchover, lead 577880 outside the 48h lookback).
   registerSalesBoardTools(server);
+  // Bot simulator (2) — 2026-10-02
+  //   simulate_bot_conversation, get_bot_simulation. Real bots, nothing sent
+  //   or written (src/simulator/bot-simulator.js).
+  registerSimulatorTools(server);
   // Payroll engine tools (6) — 2026-09-26
   //   payroll_run (dry run by default), payroll_get_run, payroll_resolve_line,
   //   payroll_mark_paid (confirm-gated), payroll_export, payroll_list_rules.
