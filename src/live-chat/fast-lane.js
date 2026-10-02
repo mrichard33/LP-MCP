@@ -50,6 +50,7 @@ import {
 } from '../response-generator.js';
 import { buildEstablishedFacts } from '../agentic/established-facts.js';
 import { humanizeReply } from '../agentic/human-voice.js';
+import { planNepqTurn, enforceNepqPlan, nepqBackboneMode, LINES as NEPQ_LINES } from '../agentic/nepq-planner.js';
 import {
   loopBreakState,
   spouseAdvocacyState,
@@ -99,6 +100,7 @@ import {
   guardChatFlow,
   isRealName,
   phoneInThread,
+  contactAskLine,
 } from './chat-rules.js';
 import { marketTimezone, tzLabel } from '../config/market-timezones.js';
 import { phoneFromText } from './missed-replies.js';
@@ -324,6 +326,59 @@ export function normalizeThread(messages, limit = 10) {
 }
 
 /** Race work against a deadline; the loser is never cancelled, only ignored. */
+/**
+ * One answer per turn (2026-10-02, vnazu). The reply and the holding line
+ * race; whichever claims first is the only one that sends. Pure.
+ */
+export function newTurnClaim() {
+  let by = null;
+  return {
+    claim(who) { if (by) return false; by = who || 'unknown'; return true; },
+    get claimedBy() { return by; },
+  };
+}
+
+/**
+ * Real times for a NEPQ move (Calendar Commitment), under their own cap so a
+ * slow calendar read can never take the reply past the deadline.
+ */
+export const NEPQ_SLOT_LOOKUP_MS = 1200;
+
+/** The pre-deadline contact read's cap, and the supersede map's size before a prune. */
+export const CONTACT_FETCH_CAP_MS = 4000;
+const LATEST_INBOUND_MAX = 500;
+
+/** Does this NEPQ plan need real slots to make its move? Pure. */
+export function wantsSlots(plan) {
+  if (!plan) return false;
+  if (plan.objection?.type === 'think') return true;
+  if (plan.objection?.type === 'spouse' && plan.objection.attempt >= 2) return true;
+  return plan.step === 'offer_slots' || plan.step === 'confirm';
+}
+
+/** What the row records about the plan. Pure. */
+export function nepqSummary(plan) {
+  if (!plan) return null;
+  return { step: plan.step, move: plan.required_move, objection: plan.objection?.type || null, handoff: plan.handoff?.reason || null, counters: plan.counters };
+}
+
+const NEPQ_FIXED_MOVES = new Set(['handoff', 'objection_play', 'ask_day', 'close', 'reveal', 'offer_slots']);
+
+/** How long a reply that already claimed the turn gets to finish sending. */
+export const LATE_SEND_WAIT_MS = 20000;
+/** What a send needs after the draft: the webhook send is capped at 5s, ~1s typical. */
+export const SEND_RESERVE_MS = 2000;
+
+/**
+ * Can a second draft finish before the deadline? Assumes it takes as long as
+ * the first one plus 30%, and keeps room for the send (2s, or a fifth of a
+ * smaller budget). Pure.
+ */
+export function redraftFits({ elapsedMs, firstDraftMs, budgetMs }) {
+  const reserve = Math.min(SEND_RESERVE_MS, budgetMs * 0.2);
+  return elapsedMs + firstDraftMs * 1.3 + reserve < budgetMs;
+}
+
 export function raceWithBudget(work, budgetMs) {
   let timer;
   const deadline = new Promise(resolve => { timer = setTimeout(() => resolve({ timedOut: true }), budgetMs); });
@@ -404,7 +459,7 @@ export function guardDraft(draft, { discipline, established, loopBreak, spouseAd
  *   acquireSlot({contact_id, job_id, trigger_id, holder}) / commitSend / releaseSlot
  *   emitEvent(opts), opsAlert(text)
  *   fingerprint(input), markSent(actionId)
- *   captureIdentity(contactId, {phone, email})   fail-soft, live mode only
+ *   captureIdentity(contactId, {visitorTexts, capture})   fail-soft, live mode only, fill-if-empty
  *   log(line)
  */
 export function createLiveChatFastLane(deps) {
@@ -442,6 +497,14 @@ export function createLiveChatFastLane(deps) {
     // and the move itself (reschedule_appointment). Defaults offer nothing, so
     // an unwired lane hands the reschedule to a person.
     offerSlots: async () => ({ slots: [], tzLabel: 'ET' }),
+    // 2026-10-02 NEPQ backbone. Defaults: mode from env, no slots, no
+    // booking, no hand-off side effects (an unwired lane plans and talks
+    // but never books or tags).
+    nepqMode: () => nepqBackboneMode(),
+    shadowModelEnabled: () => !!process.env.LIVE_CHAT_SHADOW_MODEL,
+    offerBookingSlots: async () => ({ slots: [], tzLabel: 'ET' }),
+    bookSlot: async () => ({ ok: false, error: 'no book dep' }),
+    nepqHandoff: async () => null,
     rescheduleAppointment: async () => ({ ok: false, error: 'no reschedule dep' }),
     contactUrl: () => null,
     ...deps,
@@ -493,6 +556,12 @@ export function createLiveChatFastLane(deps) {
     const turnSeq = { at: tReceived, key: messageKey };
     const prevLatest = latestInbound.get(contactId);
     if (!prevLatest || prevLatest.at <= tReceived) latestInbound.set(contactId, turnSeq);
+    // Never cleaned before (2026-10-02 review): one entry per visitor for the
+    // life of the process. A turn older than an hour can no longer be
+    // superseded by anything in flight.
+    if (latestInbound.size > LATEST_INBOUND_MAX) {
+      for (const [id, t] of latestInbound) if (tReceived - t.at > 60 * 60 * 1000) latestInbound.delete(id);
+    }
 
     // ── gates: opt-out first, on the text and on the contact ──
     if (isDNCSignal(body)) {
@@ -505,7 +574,11 @@ export function createLiveChatFastLane(deps) {
     // quote request one message later. When the payload has no conversation
     // id, look it up by contact, beside the contact fetch, capped.
     const [contactRes, convRes] = await Promise.all([
-      Promise.resolve().then(() => d.fetchContact(contactId)).then(value => ({ value }), error => ({ error })),
+      // Capped (2026-10-02 review): uncapped, a slow GHL read could take 15s
+      // before the reply deadline even started. A miss reads like a failed
+      // fetch, which the lane already handles.
+      raceWithBudget(Promise.resolve().then(() => d.fetchContact(contactId)), CONTACT_FETCH_CAP_MS)
+        .then(r => (r.timedOut ? { error: new Error(`contact fetch exceeded ${CONTACT_FETCH_CAP_MS}ms`) } : r.error ? { error: r.error } : { value: r.value })),
       conversationId ? Promise.resolve({ value: conversationId }) : raceWithBudget(Promise.resolve().then(() => d.findConversation(contactId)), d.contextCapMs()),
     ]);
     const contact = contactRes.error ? null : (contactRes.value || null);
@@ -556,15 +629,32 @@ export function createLiveChatFastLane(deps) {
     }
 
     const isSuperseded = () => latestInbound.get(contactId) !== turnSeq;
-    const deadline = raceWithBudget(replyOnce({ contactId, conversationId, body, contact, tags, mode, actionId, timing, isSuperseded }), d.hardTimeoutMs());
+    // 2026-10-02 (Guest Visitor vnazu, row 532893): raceWithBudget gives up on
+    // the reply at the deadline but cannot STOP it. The second draft was ready
+    // at 9.7s, the holding line went at 10s, and the real reply went out too:
+    // two messages for one question. Exactly one of the two may send. The
+    // first to claim the turn sends; the other stays silent.
+    const turn = newTurnClaim();
+    const work = replyOnce({ contactId, conversationId, body, contact, tags, mode, actionId, timing, isSuperseded, turn });
     let outcome;
     try {
-      const raced = await deadline;
-      if (raced.timedOut) {
-        outcome = await fallback({ contactId, conversationId, mode, actionId, timing, reason: 'hard_timeout', body });
-      } else if (raced.error) {
-        d.warn(`[LiveChat] reply failed for ${contactId}: ${raced.error.message}`);
-        outcome = await fallback({ contactId, conversationId, mode, actionId, timing, reason: `error: ${String(raced.error.message || raced.error).slice(0, 160)}`, body });
+      const raced = await raceWithBudget(work, d.hardTimeoutMs());
+      if (raced.timedOut || raced.error) {
+        const reason = raced.timedOut ? 'hard_timeout' : `error: ${String(raced.error.message || raced.error).slice(0, 160)}`;
+        if (raced.error) d.warn(`[LiveChat] reply failed for ${contactId}: ${raced.error.message}`);
+        if (turn.claim('fallback')) {
+          outcome = await fallback({ contactId, conversationId, mode, actionId, timing, reason, body });
+        } else if (raced.timedOut) {
+          // The real reply already claimed the turn and is mid-send: wait for
+          // it (bounded) rather than send the holding line on top of it.
+          d.log(`[LiveChat] deadline passed while the reply for ${contactId} was sending — no holding line`);
+          const late = await raceWithBudget(work, LATE_SEND_WAIT_MS);
+          outcome = late.value || { outcome: 'sent_late_unconfirmed', sent: false, reason: late.timedOut ? 'late_send_wait_exceeded' : 'late_send_error' };
+        } else {
+          // The send itself failed after the claim: never follow it with a
+          // second message we cannot prove the first did not deliver.
+          outcome = { outcome: 'send_failed', sent: false, reason };
+        }
       } else {
         outcome = raced.value;
       }
@@ -603,7 +693,7 @@ export function createLiveChatFastLane(deps) {
     }
   }
 
-  async function replyOnce({ contactId, conversationId, body, contact, tags, mode, actionId, timing, isSuperseded = () => false }) {
+  async function replyOnce({ contactId, conversationId, body, contact, tags, mode, actionId, timing, isSuperseded = () => false, turn = newTurnClaim() }) {
     const started = d.now();
     // ── context, in parallel, LP/lead state capped ──
     const getQueryEmbedding = d.prewarmEmbedding(body);
@@ -619,6 +709,8 @@ export function createLiveChatFastLane(deps) {
       thread.push({ direction: 'inbound', channel: 'livechat', text: body, type: 'text', timestamp: timing.t0_inbound_received });
     }
     context = { ...context, conversation_recent: thread.length ? thread : [{ direction: 'inbound', channel: 'livechat', text: body, type: 'text', timestamp: timing.t0_inbound_received }] };
+    // What the visitor has typed in this chat, for the GHL field capture.
+    const visitorTexts = context.conversation_recent.filter(m => m.direction === 'inbound').map(m => m.text).filter(Boolean).slice(-10);
     if (contact) {
       context.lead = { ...context.lead, current_tags: context.lead?.current_tags?.length ? context.lead.current_tags : tags, phone: context.lead?.phone || contact.phone || null, email: context.lead?.email || contact.email || null };
     }
@@ -637,7 +729,7 @@ export function createLiveChatFastLane(deps) {
       timing.t4_analysis_done = new Date(d.now()).toISOString();
       timing.t5_generation_done = timing.t4_analysis_done;
       return deliver({
-        contactId, conversationId, body, mode, actionId, timing, draft: langHandoff.reply,
+        contactId, conversationId, body, mode, actionId, timing, isSuperseded, turn, visitorTexts, turn, draft: langHandoff.reply,
         capture: langHandoff.phone ? { phone: langHandoff.phone } : {},
         extras: { language_handoff: langHandoff.language, context_minimal: !!context._minimal, model: null },
       });
@@ -670,11 +762,17 @@ export function createLiveChatFastLane(deps) {
       known: { phone: context.lead?.phone || contact?.phone || null, hasName: hasNameOnRecord },
     });
     if (cancelPlan) {
+      // A newer message already arrived: let that turn run the flow, so an
+      // appointment is never cancelled or moved on a stale reading of the chat.
+      if (isSuperseded()) return deliver({ contactId, conversationId, body, mode, actionId, timing, isSuperseded, turn, draft: '' });
       const outcome = await runCancelFlow({ plan: cancelPlan, contactId, contact, body, mode });
       timing.t4_analysis_done = new Date(d.now()).toISOString();
       timing.t5_generation_done = timing.t4_analysis_done;
+      // No isSuperseded here: the flow may already have cancelled or moved the
+      // appointment, and the visitor must be told. Superseded turns are
+      // dropped BEFORE the flow runs instead (above).
       return deliver({
-        contactId, conversationId, body, mode, actionId, timing, draft: outcome.reply,
+        contactId, conversationId, body, mode, actionId, timing, turn, skipCapture: true, draft: outcome.reply,
         extras: { cancel_flow: outcome.record, context_minimal: !!context._minimal, model: null },
       });
     }
@@ -683,13 +781,52 @@ export function createLiveChatFastLane(deps) {
     // The second ask (or "I just want a price") gets the Transition as a fixed
     // line, no model call: the first live chat asked for a price three times
     // and was answered with discovery questions twice (2026-10-01).
-    const pricePlan = saPlan.active ? null : planPriceTurn({ body, thread: context.conversation_recent });
+    // ── NEPQ backbone (2026-10-02, Mark): one planned move per turn ──
+    // Live mode: fixed moves (hand-offs, objection plays, a day ask, the
+    // Reveal, two real times) ship their line with no model call; a picked
+    // time is booked; every other move is rendered last in the prompt and
+    // enforced on the draft. Shadow mode only records the plan.
+    const nepqMode = d.nepqMode();
+    let nepqPlan = null;
+    let nepqSlots = null;
+    if (nepqMode !== 'off' && !saPlan.active) {
+      const realFirst = hasNameOnRecord ? String(context.lead?.first_name || context.lead?.name || '').trim().split(/\s+/)[0] || null : null;
+      const planInput = {
+        channel: 'livechat', trigger: body, conversation: context.conversation_recent, firstName: realFirst,
+        hasAppointment: context.lp?.appointment_set === true && context.lp?.appointment_is_past !== true,
+        nextStepLabel: 'a visit at your home', discipline,
+      };
+      nepqPlan = planNepqTurn(planInput);
+      if (wantsSlots(nepqPlan)) {
+        // Real times only when the move can use them, under their own cap.
+        const got = await raceWithBudget(Promise.resolve().then(() => d.offerBookingSlots({ contact })), NEPQ_SLOT_LOOKUP_MS);
+        nepqSlots = (!got.timedOut && !got.error && got.value?.slots?.length >= 2) ? got.value : null;
+        if (nepqSlots) nepqPlan = planNepqTurn({ ...planInput, slots: nepqSlots.slots, tzLabel: nepqSlots.tzLabel });
+      }
+      if (nepqMode === 'live') {
+        const lastOutbound = [...context.conversation_recent].reverse().find(m => m.direction === 'outbound')?.text || '';
+        const nepqOut = await runNepqFixedMove({ plan: nepqPlan, slots: nepqSlots, contactId, body, hasName: hasNameOnRecord, hasPhone: hasPhoneOnRecord, firstName: realFirst, mode, lastOutbound });
+        if (nepqOut) {
+          timing.t4_analysis_done = new Date(d.now()).toISOString();
+          timing.t5_generation_done = timing.t4_analysis_done;
+          return deliver({
+            contactId, conversationId, body, mode, actionId, timing, isSuperseded, turn, visitorTexts, draft: nepqOut.reply,
+            capture: phoneFromText(body) ? { phone: phoneFromText(body) } : {},
+            extras: { nepq: { ...nepqSummary(nepqPlan), ...nepqOut.record }, context_minimal: !!context._minimal, model: null },
+          });
+        }
+      }
+    }
+
+    // Live NEPQ owns the price turn (clarify once, then a person); the old
+    // fixed Transition stays for mode off/shadow.
+    const pricePlan = (saPlan.active || (nepqMode === 'live' && nepqPlan)) ? null : planPriceTurn({ body, thread: context.conversation_recent });
     const frustrated = isFrustratedRepeat(body);
     if (pricePlan?.insist) {
       timing.t4_analysis_done = new Date(d.now()).toISOString();
       timing.t5_generation_done = timing.t4_analysis_done;
       return deliver({
-        contactId, conversationId, body, mode, actionId, timing, isSuperseded,
+        contactId, conversationId, body, mode, actionId, timing, isSuperseded, turn, visitorTexts,
         draft: priceTransitionReply({ hasName: hasNameOnRecord, hasPhone: hasPhoneOnRecord }),
         capture: phoneFromText(body) ? { phone: phoneFromText(body) } : {},
         extras: { price_turn: { asks: pricePlan.asks, insist: true, deterministic: true }, context_minimal: !!context._minimal, model: null },
@@ -739,7 +876,9 @@ export function createLiveChatFastLane(deps) {
     ].filter(Boolean).join('\n') || null;
     // serviceAreaTurn renders the zip-first instruction in buildResponsePrompt,
     // the same block the SMS path gets (src/agentic/service-area-turn.js).
-    const opts = { established, loopBreak, spouseAdvocacy, handoffPending, discipline, promptHint, threadSenderType: 'team', serviceAreaTurn: coverage ? { plan: saPlan, coverage } : null };
+    // Live NEPQ owns the booking-ask decision and is rendered last.
+    const turnDiscipline = (nepqMode === 'live' && nepqPlan && discipline) ? { ...discipline, booking: nepqPlan.booking } : discipline;
+    const opts = { established, loopBreak, spouseAdvocacy, handoffPending, discipline: turnDiscipline, promptHint, threadSenderType: 'team', serviceAreaTurn: coverage ? { plan: saPlan, coverage } : null, nepqPlan: nepqMode === 'live' ? nepqPlan : null };
     const userPrompt = buildResponsePrompt(context, 'livechat', body, kbPack, classification, false, 'warm', null, opts) + LIVE_CHAT_OUTPUT_CONTRACT;
     const systemPrompt = getResponseSystemPrompt() + LIVE_CHAT_ADDENDUM;
 
@@ -750,7 +889,7 @@ export function createLiveChatFastLane(deps) {
     const leadFirstName = String(context.lead?.name || '').split(/\s+/)[0] || null;
     const generate = async (regenerationNote) => {
       const user = regenerationNote ? `${userPrompt}\n\n═══════ REGENERATION NOTE ═══════\n${regenerationNote}` : userPrompt;
-      const out = await d.callLLM({ fn: 'live_chat', system: systemPrompt, user, maxTokens: 1200, json: true });
+      const out = await d.callLLM({ fn: 'live_chat', system: systemPrompt, user, maxTokens: 1200, json: true, cacheSystem: true });
       model = out?.model || model;
       const parsed = parseJsonFromResponse(String(out?.text || ''));
       const validated = validateResponse(parsed, 'sms');
@@ -778,13 +917,44 @@ export function createLiveChatFastLane(deps) {
       const cov = guardCoverageDraft(times.fixed, coverage);
       // A coverage turn is the zip-first script (ask for the zip, or stop);
       // the conversation guards would talk over it.
-      const flow = saPlan.active ? { notes: [], fixed: cov.fixed } : guardChatFlow(cov.fixed, { thread: context.conversation_recent, hasName, hasPhone, body, bookingAllowed: !!discipline?.booking?.allowed || !!pricePlan || frustrated, declined: live?.recommended_action === 'suppress' });
-      return { ...base, notes: [...base.notes, ...times.notes, ...cov.notes, ...flow.notes], fixed: flow.fixed, coverage_notes: cov.notes.length, time_offers_removed: times.notes.length > 0, flow_notes: flow.notes.length };
+      const nepqLive = nepqMode === 'live' && nepqPlan;
+      const bookingAllowed = nepqLive ? !!nepqPlan.booking.allowed : (!!discipline?.booking?.allowed || !!pricePlan || frustrated);
+      const flow = saPlan.active ? { notes: [], fixed: cov.fixed } : guardChatFlow(cov.fixed, { thread: context.conversation_recent, hasName, hasPhone, body, bookingAllowed, declined: live?.recommended_action === 'suppress' });
+      // The NEPQ plan, enforced last: no money figures, no pressure, no
+      // booking ask it does not allow, one question, the bridge when due.
+      const typed = visitorTexts.join(' \n ');
+      const known = {
+        name: hasName, phone: hasPhone,
+        email: !!context.lead?.email || /\b[^\s@]+@[^\s@]+\.[a-z]{2,}\b/i.test(typed) || !!live?.contact_capture?.email,
+        zip: !!(context.lead?.postal_code) || /(?:^|\s)\d{5}(?:\s|$)/.test(typed),
+      };
+      const nepqFix = (nepqLive && !saPlan.active) ? enforceNepqPlan(flow.fixed, nepqPlan, { known }) : { text: flow.fixed, changes: [] };
+      if (nepqFix.changes.length) d.log(`[NEPQ] live chat ${contactId} ${nepqPlan.required_move}: ${nepqFix.changes.join(',')}`);
+      return { ...base, notes: [...base.notes, ...times.notes, ...cov.notes, ...flow.notes], fixed: nepqFix.text, coverage_notes: cov.notes.length, time_offers_removed: times.notes.length > 0, flow_notes: flow.notes.length, nepq_changes: nepqFix.changes };
     };
+    const tGen = d.now();
+    // A stronger model, side by side, never sent (Mark, 2026-10-02: test it
+    // in shadow before switching). Same prompt, detached; its draft and its
+    // latency land in one event for comparison. LIVE_CHAT_SHADOW_MODEL unset
+    // → nothing runs.
+    if (d.shadowModelEnabled()) {
+      const tShadow = d.now();
+      Promise.resolve()
+        .then(() => d.callLLM({ fn: 'live_chat_shadow', system: systemPrompt, user: userPrompt, maxTokens: 1200, json: true, cacheSystem: true }))
+        .then(out => d.emitEvent({
+          event_type: 'agentic.live_chat_shadow_model', source: 'live_chat_fast_lane', entity_type: 'contact', entity_id: contactId, ghl_contact_id: contactId,
+          priority: 'low', bypass_filter: true, idempotency_key: `livechat_shadow_model_${actionId ?? contactId}_${tShadow}`,
+          payload: { action_id: actionId, model: out?.model || null, latency_ms: d.now() - tShadow, draft: String(parseJsonFromResponse(String(out?.text || ''))?.message || '').slice(0, 800), inbound_preview: body.slice(0, 300) },
+        }))
+        .catch(err => d.warn(`[LiveChat] shadow model failed for ${contactId}: ${err.message}`));
+    }
     let gen = await generate(null);
     timing.t4_analysis_done = new Date(d.now()).toISOString();
     let guard = runGuards(gen.validated.message, gen.live);
-    if (guard.notes.length && (d.now() - started) < 5000) {
+    // A second draft only when it can finish inside the deadline (2026-10-02,
+    // vnazu): the old fixed "under 5s" rule started a ~5s Haiku redraft at
+    // 4.9s and ran past 10s. Otherwise the guards' deterministic text ships.
+    if (guard.notes.length && redraftFits({ elapsedMs: d.now() - started, firstDraftMs: d.now() - tGen, budgetMs: d.hardTimeoutMs() })) {
       regenerated = true;
       gen = await generate(guard.notes.join('\n\n'));
       guard = runGuards(gen.validated.message, gen.live);
@@ -808,7 +978,7 @@ export function createLiveChatFastLane(deps) {
     }
 
     return deliver({
-      contactId, conversationId, body, mode, actionId, timing, draft, capture, isSuperseded,
+      contactId, conversationId, body, mode, actionId, timing, draft, capture, isSuperseded, turn, visitorTexts,
       extras: {
         intent_class: classification?.intent_class || null,
         classifier_method: classification?.classification_method || null,
@@ -826,6 +996,7 @@ export function createLiveChatFastLane(deps) {
         context_minimal: !!context._minimal,
         kb_pack_used: !!kbPack,
         model,
+        nepq: nepqPlan ? { mode: nepqMode, ...nepqSummary(nepqPlan), changes: guard.nepq_changes || [], ...(nepqMode === 'shadow' ? { would_send: enforceNepqPlan(draft, nepqPlan).text.slice(0, 500) } : {}) } : null,
         _bot_context: { core_prompt_version: 'live_chat_fast_lane', model, discipline, established_closed: established.closed_questions },
       },
       fingerprintExtras: {
@@ -954,8 +1125,48 @@ export function createLiveChatFastLane(deps) {
     return { reply: doneLine(apptHuman), record: { ...record, outcome: 'cancelled' } };
   }
 
+  /**
+   * A NEPQ move that does not need the model: a hand-off, an objection play,
+   * a day ask, a close, the Reveal, two real times, or booking a picked time.
+   * Returns { reply, record } or null (the model writes this turn).
+   */
+  async function runNepqFixedMove({ plan, slots, contactId, body, hasName, hasPhone, firstName, mode, lastOutbound = '' }) {
+    if (!plan) return null;
+    const live = mode === 'live';
+    const ask = contactAskLine({ hasName, hasPhone });
+
+    // A picked time: book it, then confirm (Mark's line), or hand it to a person.
+    if (plan.required_move === 'confirm' && slots?.slots?.length) {
+      const offered = offeredSlots(lastOutbound || '', slots.slots);
+      const chosen = pickSlot(body, offered.length ? offered : []);
+      if (!chosen) return null;
+      const when = `${chosen.day} at ${chosen.time} ${slots.tzLabel || ''}`.trim();
+      if (!live) return { reply: NEPQ_LINES.confirm(chosen, slots.tzLabel, firstName), record: { booking: 'would_book', start: chosen.iso } };
+      let res = null;
+      try {
+        res = await d.bookSlot({ contactId, startIso: chosen.iso, calendarId: slots.calendarId || null });
+      } catch (err) {
+        res = { ok: false, error: err.message };
+      }
+      if (res?.ok) return { reply: NEPQ_LINES.confirm(chosen, slots.tzLabel, firstName), record: { booking: 'booked', start: chosen.iso, action_id: res.action_id || null } };
+      // Booking needs what we do not have yet (address, decision-makers) or
+      // GHL refused: a person locks it in. Never "you're set" without GHL.
+      d.warn(`[LiveChat] booking ${when} for ${contactId} not made: ${res?.error || 'unknown'} — handing to a person`);
+      Promise.resolve(d.nepqHandoff({ contactId, reason: 'booking_request', inbound: `${body} (asked for ${when})`, firstName })).catch(() => {});
+      return { reply: [`Got it, ${when}. Our team will call to go over the details and lock it in.`, ask].filter(Boolean).join(' '), record: { booking: 'handed_to_person', start: chosen.iso, error: String(res?.error || '').slice(0, 200) } };
+    }
+
+    if (!plan.fixed_line || !NEPQ_FIXED_MOVES.has(plan.required_move)) return null;
+    if (plan.handoff) {
+      if (live) Promise.resolve(d.nepqHandoff({ contactId, reason: plan.handoff.reason, inbound: body, firstName })).catch(err => d.warn(`[LiveChat] NEPQ hand-off failed for ${contactId}: ${err.message}`));
+      // A person can only reach out with a way to reach them.
+      return { reply: [plan.fixed_line, ask].filter(Boolean).join(' '), record: { fixed: plan.required_move } };
+    }
+    return { reply: plan.fixed_line, record: { fixed: plan.required_move } };
+  }
+
   /** Send (live) or record (shadow) one finished reply. */
-  async function deliver({ contactId, conversationId, body, mode, actionId, timing, draft, capture = {}, extras = {}, fingerprintExtras = {}, isSuperseded = () => false }) {
+  async function deliver({ contactId, conversationId, body, mode, actionId, timing, draft, capture = {}, extras = {}, fingerprintExtras = {}, isSuperseded = () => false, turn = newTurnClaim(), visitorTexts = [], skipCapture = false }) {
     // A newer message from this visitor arrived while this reply was being
     // written: the newer turn answers both (2026-10-02, tzuzq double reply).
     if (isSuperseded()) {
@@ -967,6 +1178,12 @@ export function createLiveChatFastLane(deps) {
       });
       return { outcome: 'superseded', sent: false, message: null, timing: finalizeTiming(timing) };
     }
+    // The holding line already answered this turn (the deadline passed while
+    // this draft was being written): stay silent and leave its row alone.
+    if (!turn.claim('reply')) {
+      d.log(`[LiveChat] reply for ${contactId} finished after the holding line — not sent`);
+      return { outcome: 'late_dropped', sent: false, message: null, timing: finalizeTiming(timing) };
+    }
     let ghlMessageId = null;
     let sendMethod = null;
     let sent = false;
@@ -976,9 +1193,14 @@ export function createLiveChatFastLane(deps) {
       sendMethod = res?.method || null;
       sent = true;
       timing.t6_ghl_sent = new Date(d.now()).toISOString();
-      if (capture.phone || capture.email) {
-        d.captureIdentity(contactId, { phone: capture.phone || null, email: capture.email || null, name: capture.name || null }).catch(err => d.warn(`[LiveChat] identity capture failed for ${contactId}: ${err.message}`));
-      }
+      // Every sent turn: the capture decides (no I/O when the visitor's words
+      // and the model's report carry nothing). A name typed alone, a zip, an
+      // address count too (2026-10-02 review).
+      // The cancel flow's name and phone identify the APPOINTMENT holder, who
+      // may be another contact: never written onto this chat's contact.
+      if (!skipCapture) Promise.resolve()
+        .then(() => d.captureIdentity(contactId, { visitorTexts: visitorTexts.length ? visitorTexts : [body], capture }))
+        .catch(err => d.warn(`[LiveChat] identity capture failed for ${contactId}: ${err.message}`));
     }
     const finished = finalizeTiming(timing);
     const executionResult = {

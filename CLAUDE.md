@@ -231,6 +231,31 @@ and the live-chat guards. It only deletes or swaps punctuation and stock phrases
 sign-off, and leaves any sentence quoting a LOCKED KB line (found in the prompt) verbatim. Look for
 `[HumanVoice]` log lines.
 
+**NEPQ is enforced in code, not only in the prompt (Mark, 2026-10-02).** `src/agentic/nepq-planner.js`
+plans ONE move per turn for both bots (`planNepqTurn`): a person takes over on a complaint, a price asked
+again after the price play, two no's, or a repeated objection (`src/agentic/nepq-handoff.js`: `hdl:callback-sales`
++ `nepq:handoff:<reason>`, a rep note, an event, an #ops-alerts card); the objection plays, the
+think-it-over Calendar Commitment (two REAL slots, exempt from the booking-ask cap), "what day works best",
+the Reveal and the confirm line ("You're set for [day] at [time], [name]. Our team will call to go over the
+details." — never a rep name, never "see you then") are Mark's fixed wording. Discovery is short (2 questions
+in live chat, 3 on SMS, then the bridge). `renderPlanBlock` is the LAST prompt section and `enforceNepqPlan`
+strips money/financing figures (the customer's own estimate excepted), fake urgency, unallowed booking asks,
+re-asks for a name/phone/email/zip we have, and extra questions. `NEPQ_BACKBONE_MODE` off|shadow|live
+(default off; shadow records `nepq_plan` / `would_send` only). Live chat books a picked slot through an
+awaited `book_appointment` row and says "You're set" only on `appointment_booked`; a blocked booking is
+handed to a person.
+
+**A live-chat turn answers exactly once (2026-10-02, vnazu).** `raceWithBudget` abandons work, it does not
+stop it: the reply and the holding line share one `newTurnClaim()`, a second draft starts only when
+`redraftFits`, and a reply that claimed the turn is waited for instead of sending the fallback on top.
+Live chat writes GHL fields through `src/live-chat/identity-capture.js` — the SMS path's fill-if-empty
+`promoteIdentityToGHL`, never an overwrite, never onto a merged-away contact.
+
+**Static system prompts are cached** (`callLLM({ cacheSystem: true })`: reply writer, analyzer, live chat).
+Only for a system prompt that is byte-identical across calls — a varying one pays the write premium every
+time. Look for `[LLMClient:<fn>] cache read=` lines. `LIVE_CHAT_SHADOW_MODEL` runs a second model beside the
+live chat (never sent; `agentic.live_chat_shadow_model` events) for the model comparison.
+
 **Connection probes are read-only and never post.** `GET /health/integrations`
 (`src/integrations-health.js`) answers "can we reach LP / Five9 / Slack / GroupMe right now?"
 for the dashboard. A probe that cannot tell reports `unknown`, never `connected`; a GroupMe bot

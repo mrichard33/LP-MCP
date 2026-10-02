@@ -319,6 +319,7 @@ import { timezoneForZip } from './services/contact-timezone.js';
 import { findNearDuplicate } from './services/message-similarity.js';
 import { checkNotSuperseded, commitAgenticSend } from './services/agentic-reply-locks.js';
 import { emitEvent } from './event-emitter.js';
+import { routeNepqHandoff } from './agentic/nepq-handoff.js';
 // 2026-09-18 — the decision-maker handoff writes its rep task as a GHL note
 // (GHL has no task API; see src/actions/handlers/tasks.js).
 import { addGHLNote } from './ghl.js';
@@ -3407,6 +3408,23 @@ export async function executeSendMessage(action, context) {
       }).catch(err => console.warn(`[SendMessage] decision-maker handoff side effects failed for ${contactId} (fail-soft): ${err.message}`));
     }
 
+    // 2026-10-02 — NEPQ hand-off (complaint, price insisted after one ask,
+    // two no's, a repeated objection). The reply says someone from our team
+    // will reach out; this makes it true. Same shape as the decision-maker
+    // hand-off above. Fail-soft: the reply matters more.
+    if (!generationErr && generated?.nepq_handoff) {
+      await routeNepqHandoff({
+        contactId, reason: generated.nepq_handoff.reason, channel,
+        inbound: replyTriggerMessage || triggerMessage,
+        firstName: context?.lead?.first_name || null,
+      }, {
+        applyTags: applyContactTags,
+        addNote: addGHLNote,
+        emitEvent,
+        alert: (text) => import('./alert-state.js').then(({ sendAlertMessage }) => sendAlertMessage(text, { channel: 'ops' })),
+      }).catch(err => console.warn(`[SendMessage] NEPQ hand-off side effects failed for ${contactId} (fail-soft): ${err.message}`));
+    }
+
     // 2026-09-25 — "didn't get it" on a guide: re-fire the delivery tag so GHL
     // sends it again (src/agentic/guide-delivery.js guideResendOps). Remove
     // first, then add, so the tag-added trigger fires even if the tag stuck,
@@ -4258,6 +4276,9 @@ export async function executeSendMessage(action, context) {
     kb_pack_used: generated?.kb_pack_used || false,
     fast_track: generated?.fast_track || false,
     buyer_stage: generated?.buyer_stage || null,
+    // 2026-10-02: the NEPQ move this reply was planned around (and, in
+    // shadow, what the guard would have changed).
+    nepq_plan: generated?.nepq_plan || null,
     ai_reasoning: generated?.reasoning || null,
     // v3.13/2026-07-03: companion queueing moved to the async post-send tail;
     // its outcome is reported in the GroupMe card, not this result.

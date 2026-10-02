@@ -52,8 +52,23 @@
 
 import crypto from 'crypto';
 import supabase from '../supabase.js';
+import { llmBudgetMs } from '../llm-client.js';
 
-export const LOCK_TTL_SEC = parseInt(process.env.LOCK_TTL_SEC || '120', 10);
+/**
+ * 2026-10-02 review: the 120s literal was shorter than one healthy SMS turn
+ * on a thinking model (the send budget is ~172s), so a slow-but-healthy turn
+ * could be reclaimed and superseded mid-generation and its work wasted.
+ * Derived from the reply writer's own budget, never below the old 120s
+ * (CLAUDE.md: a timeout around an LLM call adds llmBudgetMs, it is not
+ * guessed). LOCK_TTL_SEC still overrides.
+ */
+export function lockTtlSec(env = process.env, budgetMs = () => llmBudgetMs('response_generator')) {
+  const fromEnv = parseInt(env.LOCK_TTL_SEC || '', 10);
+  if (Number.isFinite(fromEnv) && fromEnv > 0) return fromEnv;
+  return Math.max(120, Math.ceil((2 * budgetMs()) / 1000) + 30);
+}
+
+export const LOCK_TTL_SEC = lockTtlSec();
 export const MIN_AGENTIC_SEND_GAP_SEC = parseInt(process.env.MIN_AGENTIC_SEND_GAP_SEC || '90', 10);
 
 // Matches the claim_agent_actions fallback detection in src/actions/index.js.

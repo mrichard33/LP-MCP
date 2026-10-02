@@ -119,6 +119,9 @@ const FUNCTION_GROUPS = {
   // ANTHROPIC model; point it at OpenAI with MEMORY_RECOMMEND_PROVIDER +
   // MEMORY_RECOMMEND_MODEL_OPENAI. See src/jobs/memory-recommend.js.
   memory_recommend: 'decision_engine',   // src/jobs/memory-recommend.js
+  // 2026-10-02 review: was unmapped, so it fell through to the GLOBAL model
+  // instead of the analysis group every other extractor rides.
+  identity_extraction: 'decision_engine', // src/services/identity-extraction.js
   // customer-facing — text a human reads
   response_generator: 'customer_facing', // src/response-generator.js
   // 2026-09-26 — website live chat, one merged classify+reply call under a
@@ -293,10 +296,14 @@ function withTimeout(promise, ms, label) {
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
-async function callAnthropic({ model, system, messages, maxTokens, temperature, fn, timeoutMs = LLM_TIMEOUT_MS }) {
+async function callAnthropic({ model, system, messages, maxTokens, temperature, fn, timeoutMs = LLM_TIMEOUT_MS, cacheSystem = false }) {
   if (!ANTHROPIC_API_KEY) throw new Error(`[LLMClient:${fn}] ANTHROPIC_API_KEY not set`);
   const body = { model, max_tokens: maxTokens, messages };
-  if (system) body.system = system;
+  // 2026-10-02 review: the reply writer's ~20k-token system prompt (and the
+  // analyzer's ~9k) went uncached on every call. Opt-in per call site, for
+  // system prompts that are byte-identical across calls: a varying prompt
+  // would pay the cache-write premium every time and never read it back.
+  if (system) body.system = cacheSystem ? [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }] : system;
   if (temperature != null && !anthropicRejectsSampling(model)) body.temperature = temperature;
 
   const post = () => fetch('https://api.anthropic.com/v1/messages', {
@@ -350,6 +357,10 @@ async function callAnthropic({ model, system, messages, maxTokens, temperature, 
       `(stop_reason=${data.stop_reason || 'unknown'}, blocks=[${kinds}], ` +
       `max_tokens=${maxTokens}) — raise maxTokens or check the model id`
     );
+  }
+  if (cacheSystem && data.usage) {
+    const u = data.usage;
+    console.log(`[LLMClient:${fn}] cache read=${u.cache_read_input_tokens || 0} write=${u.cache_creation_input_tokens || 0} uncached=${u.input_tokens || 0}`);
   }
   return { text, provider: 'anthropic', model, usage: data.usage || null, raw: data };
 }
@@ -409,9 +420,10 @@ async function callOpenAI({ model, system, messages, maxTokens, temperature, jso
  * @param {number} [opts.maxTokens]   Max output tokens (default 500)
  * @param {number} [opts.temperature] Optional; omitted for GPT-5/o-series
  * @param {boolean}[opts.json]        Hint JSON output (sets OpenAI response_format)
+ * @param {boolean}[opts.cacheSystem] Anthropic only: cache a STATIC system prompt (cache_control)
  * @returns {Promise<{text,provider,model,usage,raw}>}
  */
-export async function callLLM({ fn, system = null, user = null, messages = null, maxTokens = 500, temperature = null, json = false }) {
+export async function callLLM({ fn, system = null, user = null, messages = null, maxTokens = 500, temperature = null, json = false, cacheSystem = false }) {
   const { provider, model } = resolveLLM(fn);
   const msgs = messages || (user != null ? [{ role: 'user', content: user }] : []);
   if (!msgs.length) throw new Error(`[LLMClient:${fn}] no messages/user provided`);
@@ -428,7 +440,7 @@ export async function callLLM({ fn, system = null, user = null, messages = null,
 
   const args = {
     model, system, messages: msgs, maxTokens: effectiveMaxTokens,
-    temperature, json, fn, timeoutMs: effectiveTimeoutMs,
+    temperature, json, fn, timeoutMs: effectiveTimeoutMs, cacheSystem,
   };
   return withTimeout(
     provider === 'openai' ? callOpenAI(args) : callAnthropic(args),

@@ -380,3 +380,32 @@ test('phone normalization to E.164', () => {
   assert.equal(normalizePhoneE164('1-561-323-0334'), '+15613230334');
   assert.equal(normalizePhoneE164('12345'), null);
 });
+
+// ── 2026-10-02: Houston / Winston-Salem, and the newest value wins ──
+
+test('a bare Houston or Winston-Salem zip is captured; a window count is not', async () => {
+  const { heuristicExtract } = await import('../src/services/identity-extraction.js');
+  assert.equal(heuristicExtract(['77494']).postal_code, '77494');
+  assert.equal(heuristicExtract(['27101']).postal_code, '27101');
+  assert.equal(heuristicExtract(['12000']).postal_code, null);
+});
+
+test('a Texas street address keeps TX and its trailing zip', async () => {
+  const { heuristicExtract } = await import('../src/services/identity-extraction.js');
+  const id = heuristicExtract(['1200 Main Street, Katy, TX 77494']);
+  assert.equal(id.address_line1, '1200 Main Street');
+  assert.equal(id.state, 'TX');
+  assert.equal(id.postal_code, '77494');
+});
+
+test('a zip typed after an address with no commas is captured', async () => {
+  const { heuristicExtract } = await import('../src/services/identity-extraction.js');
+  assert.equal(heuristicExtract(['9822 Quinta Artesa Way Apt 101 fort Myers 33908']).postal_code, '33908');
+});
+
+test('a corrected email or phone replaces the earlier one', async () => {
+  const { heuristicExtract } = await import('../src/services/identity-extraction.js');
+  const id = heuristicExtract(['lori@gmial.com', 'sorry, it is lori@gmail.com', 'call 508-208-9802', 'actually 508-208-9803']);
+  assert.equal(id.email, 'lori@gmail.com');
+  assert.equal(id.phone, '+15082089803');
+});

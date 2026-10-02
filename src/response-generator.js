@@ -374,7 +374,8 @@ import { findUndeliveredSendPromise, undeliveredPromiseNote, rewriteUndeliveredP
 import { findUnbackedEstimatePromise, estimatePromiseNote, rewriteEstimatePromise, calculatorFallbackAllowed } from './agentic/estimate-promise.js';
 // v2.7.14 — Bot Review Phase 0. Pure shaping helpers only: no I/O, no writes.
 import { buildInputSnapshot, extractKbModes, extractKbSources } from './bot-feedback/fingerprint-core.js';
-import { normalizeTimezone, tzLongName } from './config/market-timezones.js';
+import { normalizeTimezone, tzLongName, tzLabel } from './config/market-timezones.js';
+import { planNepqTurn, enforceNepqPlan, nepqBackboneMode } from './agentic/nepq-planner.js';
 import {
   planServiceAreaTurn, resolveCoverage, coverageHint, guardCoverageDraft, serviceAreaRecord,
 } from './agentic/service-area-turn.js';
@@ -1862,6 +1863,9 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
     parts.push(...P.PRIORITY_PREREQS_NOT_SATISFIED);
   }
   parts.push(...P.PRIORITY_ORDER_TAIL);
+  // 2026-10-02: the NEPQ turn plan is the last word before the output
+  // contract (later text wins). Absent unless NEPQ_BACKBONE_MODE=live.
+  if (opts.nepqPlan) parts.push(...P.renderPlanBlock(opts.nepqPlan));
   parts.push(...P.OUTPUT_CONTRACT);
 
   return parts.join('\n');
@@ -1879,6 +1883,8 @@ async function callClaude(userPrompt) {
   const { text } = await callLLM({
     fn: 'response_generator',
     system: SYSTEM_PROMPT,
+    // Static for the life of the process: cache it (2026-10-02).
+    cacheSystem: true,
     user: userPrompt,
     maxTokens: MAX_TOKENS,
     json: true,
@@ -3580,6 +3586,35 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     if (!dryRun) applyGHLTag(contactId, EMAIL_ASKED_TAG).catch(() => {});
   }
 
+  // ─── NEPQ backbone (2026-10-02, Mark): one planned move per turn ───────
+  // shadow: planned and recorded only; live: rendered last in the prompt,
+  // owns the booking-ask decision, and is enforced on the draft below.
+  const nepqMode = nepqBackboneMode();
+  let nepqPlan = null;
+  // SMS only: email replies are long-form and keep their own rules.
+  if (nepqMode !== 'off' && channel === 'sms' && !serviceAreaTurn?.plan?.active) {
+    try {
+      const firstWord = String(context.lead?.first_name || context.lead?.name || '').trim().split(/\s+/)[0] || '';
+      const hasAppointment = (Array.isArray(upcomingAppointments) && upcomingAppointments.some(a => !a.already_ended))
+        || (context.lp?.appointment_set === true && context.lp?.appointment_is_past !== true);
+      nepqPlan = planNepqTurn({
+        channel: 'sms',
+        trigger: triggerMessage,
+        conversation: context.conversation_recent || [],
+        slots: offerSelection?.slots || [],
+        tzLabel: tzLabel(promptTimezoneFor(context)),
+        firstName: firstWord && !/^guest$/i.test(firstWord) ? firstWord : null,
+        hasAppointment,
+        nextStepLabel: kbPack?.booking_context?.requires_in_home_gate === true ? 'a visit at your home' : 'a quick call with our team',
+        discipline,
+      });
+      if (nepqMode === 'live' && discipline) discipline = { ...discipline, booking: nepqPlan.booking };
+    } catch (err) {
+      console.warn(`[ResponseGenerator] NEPQ plan failed for ${contactId} (continuing without it): ${err.message}`);
+      nepqPlan = null;
+    }
+  }
+
   const userPrompt = buildResponsePrompt(
     context, channel, triggerMessage, kbPack, classification,
     fastTrack, trafficTemp, availability,
@@ -3637,6 +3672,8 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       callPurpose: opts.callPurpose || null,
       // Canvassing Pilot v2: pre-computed conf-flow merge values.
       confFlowContext,
+      // 2026-10-02: the binding NEPQ move, rendered last (live mode only).
+      nepqPlan: nepqMode === 'live' ? nepqPlan : null,
     }
   );
   const raw = await callClaude(userPrompt);
@@ -4065,6 +4102,40 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
         relation: dm.relation || null,
       };
       console.log(`[ResponseGenerator] 🤝 decision-maker handoff for ${contactId}: ${dm.name || dm.relation || 'the named person'} refused twice — no booking, a person takes it`);
+    }
+  }
+
+  // ─── NEPQ backbone enforcement (2026-10-02, Mark) ──────────────────────
+  // The plan's move, enforced in code: fixed lines for hand-offs and the
+  // objection plays, no money figures (the estimate block excepted), no
+  // pressure, no booking ask the plan does not allow, one question.
+  if (nepqPlan) {
+    validated.nepq_plan = {
+      mode: nepqMode, step: nepqPlan.step, move: nepqPlan.required_move,
+      objection: nepqPlan.objection?.type || null, handoff: nepqPlan.handoff?.reason || null,
+      counters: nepqPlan.counters,
+    };
+    const idf = identityState?.identity || {};
+    const knownFirst = idf.first_name || context.lead?.first_name || null;
+    const enforced = enforceNepqPlan(validated.message, nepqPlan, {
+      allowFigures: context.estimate?.has_data === true,
+      known: {
+        name: !!knownFirst && !/^guest$/i.test(String(knownFirst)),
+        phone: !!(idf.phone || context.lead?.phone),
+        email: !!(idf.email || context.lead?.email),
+        zip: !!(idf.postal_code || context.lead?.postal_code),
+      },
+    });
+    if (nepqMode === 'live') {
+      if (enforced.changes.length) {
+        console.log(`[NEPQ] ${contactId} ${nepqPlan.required_move}: ${enforced.changes.join(',')}`);
+        validated.message = enforced.text;
+      }
+      if (!nepqPlan.booking.allowed && validated.companion_action?.action_type === 'book_appointment') validated.companion_action = null;
+      if (nepqPlan.handoff) validated.nepq_handoff = { reason: nepqPlan.handoff.reason };
+    } else if (enforced.changes.length) {
+      validated.nepq_plan.would_change = enforced.changes;
+      validated.nepq_plan.would_send = enforced.text.slice(0, 500);
     }
   }
 

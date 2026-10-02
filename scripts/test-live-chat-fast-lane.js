@@ -783,3 +783,101 @@ test('human voice: a model draft with an em dash and stacked openers goes out cl
   assert.match(sent, /failed seal\. They are not repairable/);
   assert.ok(sent.includes('?'));
 });
+
+// ── one answer per turn (2026-10-02, Guest Visitor vnazu, row 532893) ──
+
+test('vnazu: the reply finishing after the holding line is NOT sent', async () => {
+  const { lane, state } = makeLane({ hardTimeoutMs: 150, llmDelayMs: 300, llm: () => ({ message: 'Old windows can let in drafts. How long have they been like that?' }) });
+  const out = await lane.processInbound(INBOUND('They are old'));
+  assert.equal(out.outcome, 'fallback');
+  await new Promise(r => setTimeout(r, 400));   // let the abandoned draft finish
+  assert.equal(state.sends.length, 1, state.sends.map(x => x.message).join(' | '));
+  assert.equal(state.sends[0].message, LIVE_CHAT_FALLBACK_MESSAGE);
+  const writes = state.updates.filter(u => u.execution_result);
+  assert.equal(writes.length, 1, 'one row write, the holding line\'s');
+});
+
+test('vnazu: a reply already sending at the deadline is not followed by the holding line', async () => {
+  const slowSend = async ({ message }) => { await new Promise(r => setTimeout(r, 200)); box.state.sends.push({ message }); return { messageId: 'm1', method: 'ghl_webhook' }; };
+  const box = {};
+  const { lane, state } = makeLane({ hardTimeoutMs: 150, llmDelayMs: 5, llm: () => ({ message: 'Old windows can let in drafts. How long have they been like that?' }), extra: { sendMessage: slowSend } });
+  box.state = state;
+  const out = await lane.processInbound(INBOUND('They are old'));
+  assert.equal(state.sends.length, 1);
+  assert.notEqual(state.sends[0].message, LIVE_CHAT_FALLBACK_MESSAGE);
+  assert.equal(out.sent, true);
+});
+
+test('a second draft starts only when it can finish inside the deadline', async () => {
+  const { redraftFits } = await import('../src/live-chat/fast-lane.js');
+  assert.equal(redraftFits({ elapsedMs: 4900, firstDraftMs: 4700, budgetMs: 10000 }), false, 'the vnazu timing');
+  assert.equal(redraftFits({ elapsedMs: 2600, firstDraftMs: 2300, budgetMs: 10000 }), true);
+});
+
+// ── NEPQ backbone, live (2026-10-02, Mark) ────────────────────────────
+
+const NEPQ_SLOTS = [{ iso: '2026-10-06T14:00:00Z', day: 'Tue, Oct 6', time: '10:00 AM', dayOfWeek: 'Tuesday' }, { iso: '2026-10-07T18:00:00Z', day: 'Wed, Oct 7', time: '2:00 PM', dayOfWeek: 'Wednesday' }];
+function nepqLane({ messages = [], llm, bookOk = true, phone = '+13525550188' } = {}) {
+  const box = {};
+  const extra = {
+    nepqMode: () => 'live',
+    offerBookingSlots: async () => { box.state.slotReads = (box.state.slotReads || 0) + 1; return { slots: NEPQ_SLOTS, tzLabel: 'ET', calendarId: 'CALWE' }; },
+    bookSlot: async (a) => { box.state.bookings = [...(box.state.bookings || []), a]; return bookOk ? { ok: true, action_id: 77 } : { ok: false, error: 'appointment_blocked_prerequisites' }; },
+    nepqHandoff: async (a) => { box.state.handoffs = [...(box.state.handoffs || []), a]; },
+  };
+  const made = makeLane({ messages, llm, extra, phone });
+  box.state = made.state;
+  return made;
+}
+const M = (direction, body, minsAgo) => ({ direction, body, dateAdded: new Date(Date.now() - minsAgo * 60000).toISOString() });
+
+test('NEPQ live: a second price ask goes to a person, with no model call', async () => {
+  const { lane, state } = nepqLane({ messages: [M('inbound', 'how much for 12 windows?', 3), M('outbound', 'Totally fair. Every home is different, so any number I gave you now would be a guess. What are you hoping to see, so the estimate actually fits your home?', 2)] });
+  await lane.processInbound(INBOUND('just give me a number'));
+  assert.equal(state.llmCalls.length, 0);
+  assert.match(state.sends[0].message, /^Understood\. I'll have someone from our team call you to talk it through\./);
+  await new Promise(r => setImmediate(r));
+  assert.equal(state.handoffs[0].reason, 'price_insist');
+});
+
+test('NEPQ live: "let me think about it" gets two REAL times, no model call', async () => {
+  const { lane, state } = nepqLane();
+  await lane.processInbound(INBOUND('let me think about it'));
+  assert.equal(state.llmCalls.length, 0);
+  assert.equal(state.sends[0].message, "No problem at all. Want to grab a time now so you don't have to chase us down later? I have Tue, Oct 6 at 10:00 AM ET or Wed, Oct 7 at 2:00 PM ET.");
+});
+
+test('NEPQ live: a picked time is booked, then confirmed with Mark\'s line', async () => {
+  const offer = "No problem at all. Want to grab a time now so you don't have to chase us down later? I have Tue, Oct 6 at 10:00 AM ET or Wed, Oct 7 at 2:00 PM ET.";
+  const { lane, state } = nepqLane({ messages: [M('inbound', 'let me think about it', 3), M('outbound', offer, 2)] });
+  await lane.processInbound(INBOUND('wednesday works'));
+  assert.deepEqual(state.bookings, [{ contactId: 'C1', startIso: '2026-10-07T18:00:00Z', calendarId: 'CALWE' }]);
+  assert.equal(state.sends[0].message, "You're set for Wed, Oct 7 at 2:00 PM ET, Alyce. Our team will call to go over the details.");
+});
+
+test('NEPQ live: a blocked booking is never "you\'re set": a person locks it in', async () => {
+  const offer = 'I have Tue, Oct 6 at 10:00 AM ET or Wed, Oct 7 at 2:00 PM ET. Which works better?';
+  const { lane, state } = nepqLane({ bookOk: false, messages: [M('outbound', offer, 2)] });
+  await lane.processInbound(INBOUND('the first one'));
+  assert.match(state.sends[0].message, /^Got it, Tue, Oct 6 at 10:00 AM ET\. Our team will call to go over the details and lock it in\./);
+  await new Promise(r => setImmediate(r));
+  assert.equal(state.handoffs[0].reason, 'booking_request');
+});
+
+test('NEPQ live: a financing figure in the model\'s draft never reaches the visitor', async () => {
+  const { lane, state } = nepqLane({ llm: () => ({ message: 'Yes, we do. Financing runs $89–$149 per month, no money down for most homes. What made you start looking?' }) });
+  await lane.processInbound(INBOUND('Do you offer financing?'));
+  assert.ok(!/\$|per month|money down/i.test(state.sends[0].message), state.sends[0].message);
+  assert.match(state.llmCalls[0].user, /NEPQ TURN PLAN/);
+});
+
+test('shadow model: a stronger model runs beside, is recorded, and is never sent', async () => {
+  const { lane, state } = makeLane({ extra: { shadowModelEnabled: () => true } });
+  await lane.processInbound(INBOUND('my windows are drafty'));
+  await new Promise(r => setTimeout(r, 30));
+  assert.equal(state.sends.length, 1);
+  assert.ok(state.llmCalls.length >= 2, 'the primary and the shadow call');
+  const ev = state.events.find(e => e.event_type === 'agentic.live_chat_shadow_model');
+  assert.ok(ev, 'shadow draft recorded');
+  assert.equal(typeof ev.payload.latency_ms, 'number');
+});
