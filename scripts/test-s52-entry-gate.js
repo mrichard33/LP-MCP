@@ -132,10 +132,19 @@ test('gate: an old lead stuck at "Set" with a past date does not block forever',
   assert.equal(gate.evaluateS52Entry({ leads, tags: [], nowMs: NOW }).allow, true);
 });
 
-test('gate: blocks a canvassing contact even with a prior inbound (any of the three markers, any case)', () => {
+test('gate: an ACTIVE canvassing entry is blocked, even with a prior inbound (any case)', () => {
   const leads = [row('1', 'CXL', '2026-09-30T14:00:00+00:00', '2026-09-25T10:00:00+00:00')];
-  for (const tag of ['active-entry:canvassing', 'Entry:Canvassing', 'source:canvass']) {
+  for (const tag of ['active-entry:canvassing', 'Active-Entry:Canvassing']) {
     assert.equal(gate.evaluateS52Entry({ leads, tags: [tag, 'has-inbound'], nowMs: NOW }).reason, 'canvassing', tag);
+  }
+});
+
+// 2026-10-02 (user ruling): only the ACTIVE entry counts. A contact whose
+// active entry is something else is allowed in despite old canvassing markers.
+test('gate: an old entry:canvassing / source:canvass marker alone does not block', () => {
+  const leads = [row('1', 'CXL', '2026-09-30T14:00:00+00:00', '2026-09-25T10:00:00+00:00')];
+  for (const tag of ['entry:canvassing', 'source:canvass']) {
+    assert.equal(gate.evaluateS52Entry({ leads, tags: [tag, 'active-entry:chatbot'], nowMs: NOW }).allow, true, tag);
   }
 });
 
@@ -303,6 +312,17 @@ test('audit S5.2: a cancel blocked only because a read FAILED is still listed as
   assert.deepEqual(r.s52.missed.map((m) => m.contact_id), ['m-rf']);
 });
 
+// 2026-10-02 (Antonino Paone, Mike Plant): a cancel minutes after booking was
+// dropped by the LP_DISP_% 30-minute group dedup because LP_DISP_SET had just
+// fired. That case now gets the re-check; an exact repeat does not.
+test('recheck on dedup: a cancel blocked by a DIFFERENT rule in its group is re-checked; a repeat is not', () => {
+  assert.equal(recheck.shouldRecheckOnDedup('LP_DISP_CANCEL_COLD_TO_S5_2', { blockedBy: 'LP_DISP_SET', group: true }), true);
+  assert.equal(recheck.shouldRecheckOnDedup('LP_DISP_CANCEL_COLD_TO_S5_2', { blockedBy: 'LP_DISP_CANCEL_COLD_TO_S5_2', group: true }), false);
+  assert.equal(recheck.shouldRecheckOnDedup('LP_DISP_SET', { blockedBy: 'LP_DISP_CANCEL_COLD_TO_S5_2', group: true }), false, 'only cancel rules');
+  assert.equal(recheck.shouldRecheckOnDedup('LP_DISP_CANCEL_COLD_TO_S5_2', false), false);
+  assert.equal(recheck.shouldRecheckOnDedup('LP_DISP_CANCEL_COLD_TO_S5_2', { blockedBy: 'X', group: false }), false);
+});
+
 test('recheck queue: one row per event + rule, held 30 minutes, only for the three cancel rules', async () => {
   const db = fakeDb({ agent_actions: [] });
   const ev = { id: 500, ghl_contact_id: 'C1' };
@@ -434,14 +454,17 @@ test('audit S5.2: a new no-demo cancel that never reached S5.2 is listed; one bl
 
 // ── Cleanup planner ───────────────────────────────────────────────────
 
-test('cleanup S5.2 planner: demo / Issue / live appt out; friction kept; canvassing out only when it is a cancel', () => {
+test('cleanup S5.2 planner: demo / Issue / live appt / active canvassing out; friction and old markers kept', () => {
   const cxl = [row('1', 'CXL', '2026-09-30T14:00:00+00:00', '2026-09-25T10:00:00+00:00')];
   const plan = (o) => cleanup.planS52Contact({ nowMs: NOW, stateCode: 'APPOINTMENT_DISRUPTION.cancelled', tags: [], leads: cxl, ...o });
   assert.deepEqual(plan({ leads: [row('1', 'OPPFDN', '2026-09-20T14:00:00+00:00', '2026-09-10T10:00:00+00:00')] }), { remove: true, reason: 'demo_on_any_lead' });
   assert.equal(plan({ leads: [row('1', 'Issue', '2026-09-30T14:00:00+00:00', '2026-09-25T10:00:00+00:00')] }).reason, 'current_lead_issue');
   assert.equal(plan({ stateCode: 'APPOINTMENT_FRICTION.timing_delay', leads: [row('1', 'Set', '2026-10-05T14:00:00+00:00', '2026-09-25T10:00:00+00:00')] }).reason, 'friction_state_kept');
-  assert.deepEqual(plan({ tags: ['active-entry:canvassing', 'appt-cancelled'] }), { remove: true, reason: 'canvassing_cancel' });
-  assert.deepEqual(plan({ tags: ['active-entry:canvassing'] }), { remove: false, reason: 'canvassing_not_cancel_kept' });
+  assert.deepEqual(plan({ tags: ['active-entry:canvassing', 'appt-cancelled'] }), { remove: true, reason: 'canvassing' });
+  assert.deepEqual(plan({ stateCode: 'APPOINTMENT_DISRUPTION.no_show', tags: ['active-entry:canvassing'] }), { remove: true, reason: 'canvassing' },
+    'an active-canvassing no-show comes out too (user ruling 2026-10-02)');
+  assert.deepEqual(plan({ tags: ['entry:canvassing', 'source:canvass', 'active-entry:other'] }), { remove: false, reason: 'passes_gate' },
+    'old canvassing markers alone do not remove anyone');
   assert.deepEqual(plan({}), { remove: false, reason: 'passes_gate' });
 });
 

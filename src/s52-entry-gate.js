@@ -13,7 +13,7 @@
 // passes, so no rule — today's or the next one — can route around it.
 //
 // Mark's rules, in the order checked (first hit wins):
-//   1. canvassing            — canvassing contacts never enter S5.2
+//   1. canvassing            — a contact whose ACTIVE entry is canvassing never enters S5.2
 //   2. demo_on_any_lead      — S5.2 is no demo ever, on ANY lead (NOC is not a demo)
 //   3. live_appointment      — no lead may hold Set/Cnf/Verif/Issue with an
 //                              appointment today or later (ET). The date rule
@@ -42,7 +42,10 @@ export const S52_WORKFLOW_IDS = Object.freeze([
 export const S52_WEBHOOK_MARKER = 'ZXz0xlpBilGAkbJEbDHy';
 export const S52_TAGS = Object.freeze(['active-s5.2', 'active-w5.2', 's52-task-created']);
 
-export const CANVASSING_TAGS = Object.freeze(['active-entry:canvassing', 'entry:canvassing', 'source:canvass']);
+// 2026-10-02 (user ruling): only an ACTIVE canvassing entry blocks S5.2. A
+// contact whose active entry is something else (chatbot, other, …) is allowed
+// in even if an older entry:canvassing / source:canvass marker is still on it.
+export const CANVASSING_TAGS = Object.freeze(['active-entry:canvassing']);
 export const LIVE_APPOINTMENT_DISPOSITIONS = Object.freeze(['Set', 'Cnf', 'Verif', 'Issue']);
 export const NO_DEMO_DISPOSITIONS = Object.freeze(['No Demo', 'ND', 'NOC']);
 const MAX_PROSPECTS = 5; // a phone on more prospects than this is a data problem
