@@ -533,12 +533,13 @@ const LJLOA = [
   T('inbound', 'My windows are really old. Can you give me a price on 12 new windows?', 130),
 ];
 
-test('ljloa: a first price ask tells the model to bridge to the visit and ask name + phone', async () => {
-  const { lane, state } = makeLane({ firstName: 'Guest Visitor ljloa', messages: LJLOA, llm: () => ({ message: "Exact pricing comes from a free in-home measurement, and you keep written pricing good for a year. A team member will call to set a time that works. What's your first name and the best number to reach you?" }) });
+// 2026-10-02 (Mark): one ask per message, so the name first; the phone next turn.
+test('ljloa: a first price ask tells the model to bridge to the visit and ask for the name', async () => {
+  const { lane, state } = makeLane({ firstName: 'Guest Visitor ljloa', messages: LJLOA, llm: () => ({ message: "Exact pricing comes from a free in-home measurement, and you keep written pricing good for a year. A team member will call to set a time that works. What's your first name?" }) });
   const out = await lane.processInbound(INBOUND('My windows are really old. Can you give me a price on 12 new windows?'));
   assert.equal(out.outcome, 'sent');
   assert.match(state.llmCalls[0].user, /PRICE REQUEST/);
-  assert.match(state.llmCalls[0].user, /What's your first name and the best number to reach you\?/);
+  assert.match(state.llmCalls[0].user, /What's your first name\?/);
   assert.equal(state.llmCalls.length, 1, 'a compliant draft needs no regeneration');
 });
 
@@ -547,7 +548,7 @@ test('ljloa: a call promise with no name or phone is never sent as is', async ()
   await lane.processInbound(INBOUND('ok sounds good'));
   assert.equal(state.llmCalls.length, 2, 'one regeneration was asked for');
   assert.match(state.llmCalls[1].user, /first name and phone number/);
-  assert.match(state.sends[0].message, /What's your first name and the best number to reach you\?$/);
+  assert.match(state.sends[0].message, /What's your first name\?$/);
 });
 
 test('ljloa: the second price ask gets the fixed Transition with no model call', async () => {
@@ -561,7 +562,7 @@ test('ljloa: the second price ask gets the fixed Transition with no model call',
   assert.equal(state.llmCalls.length, 0);
   assert.match(state.sends[0].message, /^Understood, you want a real number\./);
   assert.match(state.sends[0].message, /free in-home measurement/);
-  assert.match(state.sends[0].message, /What's your first name and the best number to reach you\?$/);
+  assert.match(state.sends[0].message, /What's your first name\?$/);
   assert.doesNotMatch(state.sends[0].message, /\$\d/, 'never a price');
   const done = state.updates.find(u => u.execution_result);
   assert.deepEqual(done.execution_result.price_turn, { asks: 2, insist: true, deterministic: true });

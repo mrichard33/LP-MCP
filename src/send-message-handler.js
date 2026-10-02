@@ -250,6 +250,8 @@
  *   7. GroupMe notification (rich format with resolved name + LP context)
  */
 
+import { recheckSlot } from './agentic/slot-recheck.js';
+import { fetchFreeSlots } from './knowledge/calendar-availability.js';
 import supabase from './supabase.js';
 import { sendGroupMeMessage } from './groupme.js';
 import { acquireToken, report429, withGhlToken } from './ghl-rate-limiter.js';
@@ -3230,6 +3232,12 @@ export async function executeSendMessage(action, context) {
   const generationChannel = channel === 'livechat' ? 'sms' : channel;
 
   // ── AI Response Generation ─────────────────────────────────────
+  // Part 6 (2026-10-02, Mark: "we loop through the flow too many times"):
+  // one prepare cache per action. Every generation attempt and the quality-
+  // pass regeneration reuse the reads made for this turn (context,
+  // classification, KB pack, calendar, appointments, identity), so a
+  // re-write costs one model call.
+  const prepared = {};
   let generated = null;
   // Issue #99: track whether we fell back to a safe templated reply after AI
   // generation failed. Function-scoped so the final return (outside the
@@ -3304,6 +3312,7 @@ export async function executeSendMessage(action, context) {
     for (let attempt = 1; attempt <= MAX_GENERATION_ATTEMPTS; attempt++) {
       try {
         generated = await generateResponse(contactId, generationChannel, triggerMessage, {
+          prepared,
           threadSenderType: threadSenderType ?? 'rep',
           regenerationNote: carriedRegenNote,
           // 2026-08-14 — the line this reply goes out from decides the sign-off
@@ -3809,7 +3818,12 @@ export async function executeSendMessage(action, context) {
       } else {
         try {
           bumpContactCache(contactId);
+          // Every reason here means the conversation moved on: the thread,
+          // the appointments and what the lead has told us are read fresh;
+          // the classification, KB pack and calendar are reused (Part 6).
+          if (prepared.memo) for (const k of ['context', 'appointments', 'identity']) delete prepared.memo[k];
           const regenerated = await generateResponse(contactId, generationChannel, freshTrigger, {
+            prepared,
             threadSenderType: 'rep',
             fromNumber: replyContext?.fromNumber || null,
             promptHint: payload.prompt_hint || null,
@@ -3887,6 +3901,26 @@ export async function executeSendMessage(action, context) {
   // decide what the lead is actually told. See bookInlineBeforeConfirm for the
   // trace this fixes and why reversing v4.10's ordering is safe.
   let inlineBooking = null;
+  // ── The picked time, read again right before booking (Part 6) ──
+  // A slot offered minutes ago may be taken by now. Taken → no booking, and
+  // the reply offers the two nearest open times (slot-recheck.js). A read
+  // that cannot tell lets the booking go ahead; GHL's answer decides.
+  if (generated?.companion_action?.action_type === 'book_appointment' && generated.companion_action.action_payload?.start_time) {
+    const cap = generated.companion_action.action_payload;
+    const check = await recheckSlot({
+      calendarId: cap.calendar_id || null,
+      startIso: cap.start_time,
+      timezone: generated.slot_timezone || 'America/New_York',
+      tzLabel: generated.slot_tz_label || 'ET',
+    }, { fetchFreeSlots }).catch(err => ({ open: null, reason: err.message }));
+    if (check.open === false) {
+      console.warn(`[SendMessage] slot_taken_before_book: ${contactId} ${cap.start_time} on ${cap.calendar_id} is no longer open — offering ${check.alternatives.length} other time(s), no booking`);
+      message = check.message;
+      generated = { ...generated, companion_action: null, slot_taken_before_book: { start_time: cap.start_time, alternatives: check.alternatives.map(s => s.iso) } };
+    } else if (check.open === null) {
+      console.log(`[SendMessage] slot re-check could not tell for ${contactId} (${check.reason}) — booking goes ahead`);
+    }
+  }
   if (generated?.companion_action?.action_type === 'book_appointment') {
     try {
       // Pass `message`, not generated.message: by this point the disclosure

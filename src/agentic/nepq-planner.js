@@ -28,6 +28,8 @@ import { isNotInterested } from './not-interested.js';
 import { isLeadQuestion, findBookingAsks } from './discovery-discipline.js';
 import { isTeamOpen, nextTeamOpenLabel, requestedCallTime } from './team-hours.js';
 import { heldSlot, COLLECT_ASK } from './booking-collect.js';
+import { parseDayPreference, slotsForPreference, slotMatches, preferenceOfferLine } from './day-preference.js';
+import { enforceOneAsk } from './one-ask.js';
 
 export const NEPQ_PLANNER_VERSION = '1.0';
 
@@ -99,7 +101,8 @@ function vagueRun(inbound = []) {
 // A bare pick: "first", "2nd", "the earlier one", "either".
 const BARE_PICK_RX = /^\s*(?:ok(?:ay)?,?\s+|yes,?\s+|sure,?\s+)?(?:the\s+)?(?:first|second|1st|2nd|earlier|later|either)(?:\s+one)?(?:\s+(?:works|please|is\s+good))?\s*[.!]*\s*$/i;
 const NEITHER_RX = /\b(?:neither|none\s+of\s+(?:those|them)|(?:those|that)\s+(?:times?\s+)?(?:don'?t|won'?t|doesn'?t)\s+work|can'?t\s+do\s+(?:either|those|that)|not\s+(?:those|that)\s+(?:days?|times?))\b/i;
-const DAY_OR_TIME_RX = /\b(?:mon|tues?|wed(?:nes)?|thurs?|fri|sat(?:ur)?|sun)(?:day)?\b|\btomorrow\b|\btoday\b|\b\d{1,2}(?::\d{2})?\s*(?:am|pm|a\.m\.|p\.m\.)\b|\b(?:morning|afternoon|evening)\b|\bthe\s+(?:first|second|earlier|later)\s+one\b|\beither\b/i;
+// "Wednesdays" too (Oct 2 6:12 PM chat: the plural missed this and the day ask was not read as answered).
+const DAY_OR_TIME_RX = /\b(?:mon|tues?|wed(?:nes)?|thurs?|fri|sat(?:ur)?|sun)(?:day)?s?\b|\bweekends?\b|\btomorrow\b|\btoday\b|\b\d{1,2}(?::\d{2})?\s*(?:am|pm|a\.m\.|p\.m\.)\b|\b(?:morning|afternoon|evening)\b|\bthe\s+(?:first|second|earlier|later)\s+one\b|\beither\b/i;
 
 // The problem in their words, for the echo and the bridge.
 const PROBLEM_RX = /\b(drafty|drafts?|fogg(?:y|ing)|fogged|condensation|moisture|leak(?:s|ing|y)?|noisy|noise|hot|heat|old|ugly|stuck|sticks?|sticking|broken|cracked|rott?(?:ed|ing)?|seals?|hurricanes?|storms?|insurance|electric\s+bill|energy\s+bills?|security|break-?ins?)\b/gi;
@@ -377,6 +380,7 @@ export function problemEcho(inbound = []) {
 export function planNepqTurn({
   channel = 'sms', trigger = '', conversation = [], slots = [], tzLabel = '', firstName = null,
   hasAppointment = false, nextStepLabel = 'a free visit at your home', discipline = null, nowMs = Date.now(),
+  allSlots = null,
 } = {}) {
   const turns = normalizeThread(conversation, trigger);
   const inbound = turns.filter(t => t.direction === 'inbound');
@@ -560,10 +564,43 @@ export function planNepqTurn({
     return fixed('objection_play', line, { objection: { type: 'think', attempt, line } });
   }
 
+  // 4a. A day or part of the day is a filter, not a pick (Mark, Oct 2 6:12 PM
+  // chat: "Usually on Wednesdays" got "We have Wednesdays blocked for you").
+  // Two real openings that match, the next matching day first; none in two
+  // weeks → say so and offer the nearest two (day-preference.js). Only in a
+  // scheduling moment, and never over a pick of a time already offered.
+  const pref = parseDayPreference(now);
+  const pool = (Array.isArray(allSlots) && allSlots.length ? allSlots : []).map(s => ({ ...s, tz: s.tz || tzLabel || '' }));
+  const prefScheduling = !!pref && (ASK_DAY_RX.test(lastOut) || /\b(?:what|which)\s+day\b|\bwhen\s+(?:works|would|is\s+good)\b/i.test(lastOut)
+    || !!lastOfferOut || BRIDGE_RX.test(lastOut) || counters.bridge_used || SCHEDULE_ASK_RX.test(now));
+  // The caller loads the calendar for this (wantsSlots) and plans again.
+  if (prefScheduling && pool.length < 2) plan.day_preference_pending = true;
+  if (prefScheduling && pool.length >= 2) {
+    const offeredNow = lastOfferOut ? pool.filter(s => lastOfferOut.includes(`${s.day} at ${s.time}`) || (s.rel && lastOfferOut.includes(`${s.rel} at ${s.time}`))) : [];
+    if (!offeredNow.some(s => slotMatches(s, pref))) {
+      const picked = slotsForPreference(pool, pref, { nowMs });
+      const line = preferenceOfferLine(pref, picked, tzLabel);
+      if (line) {
+        plan.slots_to_offer = picked.slots;
+        plan.allowed.slot_offer = true;
+        plan.day_preference = { label: pref.label, matched: picked.matched };
+        return fixed('offer_slots', line, { step: 'offer_slots', booking: { allowed: true, reason: 'nepq:day_preference' } });
+      }
+    }
+  }
+
   // 4b. They typed a day and a time with no offer on the table: two real
   // times near it. A question in the same burst is answered first.
   if (timeRequest) {
     const asked = isLeadQuestion(now) && !TIME_REQUEST_RX.test(now);
+    // 2026-10-02 (Mark's 5:22 PM chat, SMS replay): "Fine lets book for 2 PM"
+    // got two times back instead of the 2 PM it asked for. A typed time that
+    // IS one of the real openings is the pick.
+    const exact = !asked && offerSlots.length ? exactSlotFor(timeRequest, offerSlots) : null;
+    if (exact) {
+      plan.slots_to_offer = offerSlots;
+      return Object.assign(plan, { step: 'confirm', required_move: 'confirm', last_offer: LINES.offer_slots(offerSlots), booking: { allowed: true, reason: 'nepq:typed_time' } });
+    }
     if (offerSlots.length === 2 && !asked) return fixed('offer_slots', withSlots(LINES.offer_slots(offerSlots, counters.slot_offers)), { step: 'offer_slots' });
     if (offerSlots.length === 2) {
       withSlots(null);
@@ -663,6 +700,13 @@ export function planNepqTurn({
   if (counters.discovery_questions_asked >= cap && !counters.bridge_used) {
     Object.assign(plan, { step: 'bridge', required_move: 'bridge', booking: { allowed: false, reason: 'nepq:bridge_first' } }); plan.bridge_line = bridgeLine(plan); return plan;
   }
+  // Times are already on the table (an objection play offered them): never
+  // back to the bridge; ask which, or for a day (2026-10-02 SMS replay: the
+  // bot re-asked "Would that help?" after offering two times).
+  if (!counters.bridge_used && counters.slot_offers > 0) {
+    if (offerSlots.length === 2) return fixed('offer_slots', withSlots(vary(LINES.which(offerSlots), ALT_LINES.which(offerSlots))), { step: 'offer_slots' });
+    return fixed('ask_day', vary(LINES.ask_day, ALT_LINES.ask_day), { step: 'ask_day', booking: { allowed: true, reason: 'nepq:ask_day' } });
+  }
   if (counters.bridge_used) {
     // Bridged already and they did not say yes: answer and keep it soft.
     plan.required_move = 'answer';
@@ -715,6 +759,22 @@ const ASK_FIELD_RX = {
 /** Does this question ask for a field we already have? Pure. */
 export function asksForKnown(sentence, known = {}) {
   return Object.entries(ASK_FIELD_RX).some(([field, rx]) => known[field] && rx.test(sentence));
+}
+
+const FILLER_ONLY_RX = /^(?:no\s+problem|sure(?:\s+thing)?|okay|ok|got\s+it|great|perfect|sounds\s+good)[.!]?$/i;
+/** A re-ask after an answer: its filler opener ("No problem.") dropped. Pure. */
+export function reaskAfterAnswer(line) {
+  const parts = splitSentences(line);
+  return parts.length > 1 && FILLER_ONLY_RX.test(parts[0]) ? parts.slice(1).join(' ') : String(line || '');
+}
+
+/** The one real opening a typed time names ("2 PM", "tomorrow at 10"), or null. Pure. */
+export function exactSlotFor(text, slots = []) {
+  const m = String(text || '').match(/\b(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?)/i);
+  if (!m) return null;
+  const want = `${Number(m[1])}:${m[2] || '00'} ${m[3].replace(/\./g, '').toUpperCase()}`;
+  const hits = slots.filter(s => String(s.time || '').replace(/^0/, '').toUpperCase() === want);
+  return hits.length === 1 ? hits[0] : null;
 }
 
 /** The bridge in their words, when the draft skipped it. Pure. */
@@ -821,19 +881,32 @@ export function enforceNepqPlan(draft, plan, { allowFigures = false, known = {} 
     const lostQuestion = sentences.some(s => s.includes('?')) && !kept.some(s => s.includes('?'));
     if (kept.length && kept.length !== sentences.length && !lostQuestion) { sentences = kept; changes.push('repeat_sentence'); }
   }
-  // 5. One question: keep the last one.
+  // 5. One ask, ending the message (one-ask.js, Mark 2026-10-02): a statement
+  // that asks ("I'll need your first name and a phone number") counts, a
+  // day/time comes before any detail, and the plan's ask wins.
   const questions = sentences.filter(s => s.includes('?'));
-  if (questions.length > 1) {
-    const keep = questions[questions.length - 1];
-    sentences = sentences.filter(s => !s.includes('?') || s === keep);
-    changes.push('one_question');
+  const planAsk = plan.booking_facts?.ask || (plan.step === 'ask_day' ? 'day' : null);
+  const timePicked = !!(plan.held_slot || plan.step === 'collect' || plan.required_move === 'confirm');
+  // After an answer, a re-ask's own opener ("No problem.") is filler (Mark's
+  // example: "Yes, it's completely free. What day works best for you?").
+  const reask = plan.reask_line ? reaskAfterAnswer(plan.reask_line) : null;
+  const protect = [plan.booking_facts?.ask_line, reask, plan.reask_line, plan.offer_line, COLLECT_ASK.dm];
+  const oneAsk = enforceOneAsk(sentences.join(' '), { ask: planAsk, timePicked, protect });
+  if (oneAsk.changed) {
+    sentences = splitSentences(oneAsk.text);
+    changes.push('multi_ask_trimmed');
+    if (questions.length > 1) changes.push('one_question');
   }
   body = sentences.join(' ').trim();
 
   // 5a. Holding a time: their question answered, then the same ask again.
   if (plan.reask_line && !body.includes(plan.reask_line)) {
-    body = [...splitSentences(body).filter(s => !s.includes('?')), plan.reask_line].join(' ').trim();
-    changes.push('reask_line');
+    const answer = splitSentences(body).filter(s => !s.includes('?') && !FILLER_ONLY_RX.test(s));
+    const line = answer.length ? reaskAfterAnswer(plan.reask_line) : plan.reask_line;
+    if (!body.endsWith(line)) {
+      body = [...answer, line].join(' ').trim();
+      changes.push('reask_line');
+    }
   }
 
   // 5b. A time they typed, with a question in the same burst: the answer, then

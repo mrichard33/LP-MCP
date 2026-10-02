@@ -205,6 +205,7 @@
 
 import supabase from './supabase.js';
 import { analyzeMessage } from './message-analyzer.js';
+import { claimConsumedMessages, releaseConsumedMessages } from './services/consumed-messages.js';
 import { scoreIntent } from './intent-scorer.js';
 // Fast-path: run customer-facing replies inline at enqueue instead of waiting
 // for the ~60s executor sweep. Re-exported from actions/index.js.
@@ -2532,24 +2533,68 @@ async function emitResponderSilenceIfUnanswered(event, allActions, deps = {}) {
   }).catch(err => console.warn(`[ResponderSilence] telemetry emit failed: ${err.message}`));
 }
 
+/**
+ * Part 6 (2026-10-02, Mark: "we loop through the flow too many times"): a
+ * pending reply is claimed BEFORE it is analysed, as analyzePendingReplies
+ * does. A message the reply buffer (or the poller) already analysed is not
+ * analysed a second time here; that second pass was a second reply to one
+ * burst. An analysis that fails after the claim gives the message back
+ * (`claim_released_on_failure`), so the backstop can still answer it.
+ *
+ * The analysis itself stays fire-and-forget (it takes seconds and must not
+ * block the event loop); `deps.wait` lets a test await it. Returns
+ * { deduped } as soon as the claim is decided.
+ */
+export async function routePendingReply(event, { inboundChannel = null } = {}, deps = {}) {
+  const claim = deps.claim || claimConsumedMessages;
+  const release = deps.release || releaseConsumedMessages;
+  const analyze = deps.analyze || analyzeMessage;
+  const backstop = deps.backstop || runReplyBackstopIfAnalyzerSilent;
+  const db = deps.supabase || supabase;
+  const contactId = event.ghl_contact_id;
+  const messageText = event.payload?.message_text || '';
+  const messageKey = event.payload?.message_id || null;
+  if (messageKey) {
+    const { consumed } = await claim(contactId, [messageKey]);
+    if (consumed.length) {
+      await db.from('system_events').update({
+        processed: true, processed_by: 'decision_engine',
+        processed_at: new Date().toISOString(), action_taken: 'deduped',
+      }).eq('id', event.id);
+      console.log(`[DecisionEngine] ${contactId} message ${messageKey} already analysed — not analysed again (event ${event.id})`);
+      return { deduped: true };
+    }
+  }
+  const releaseClaim = () => (messageKey
+    ? Promise.resolve(release(contactId, [messageKey]))
+      .then(() => console.warn(`[DecisionEngine] claim_released_on_failure ${contactId} message ${messageKey}`))
+      .catch(() => {})
+    : Promise.resolve());
+  // Whatever the analyzer does or fails to do, runReplyBackstopIfAnalyzerSilent
+  // decides whether this lead still gets an answer (2026-08-03).
+  const run = Promise.resolve()
+    .then(() => analyze(contactId, messageText, event.id, inboundChannel, messageKey))
+    .then(async (result) => {
+      if (!result) await releaseClaim();
+      return backstop(event, result);
+    })
+    .catch(async (err) => {
+      console.error(`[DecisionEngine] Analysis failed for ${contactId}:`, err.message);
+      await releaseClaim();
+      return backstop(event, null);
+    });
+  if (deps.wait) await run;
+  return { deduped: false };
+}
+
 async function processSingleEventInner(event) {
   if (event.event_type === 'ghl.reply_received' && event.event_subtype === 'pending_analysis') {
     const contactId = event.ghl_contact_id;
     const messageText = event.payload?.message_text || '';
     if (contactId && messageText) {
       const inboundChannel = inferChannelFromEvent(event);
-      // Still fire-and-forget — analysis takes ~7-9s and must not block the
-      // event loop. But the outcome is no longer discarded: whatever the
-      // analyzer does or fails to do, runReplyBackstopIfAnalyzerSilent decides
-      // whether this lead still gets an answer. Before 2026-08-03 a rejected
-      // promise was logged and the reply was simply lost, with the source event
-      // already marked processed so analyzePendingReplies would never retry it.
-      analyzeMessage(contactId, messageText, event.id, inboundChannel, event.payload?.message_id || null)
-        .then(result => runReplyBackstopIfAnalyzerSilent(event, result))
-        .catch(err => {
-          console.error(`[DecisionEngine] Analysis failed for ${contactId}:`, err.message);
-          return runReplyBackstopIfAnalyzerSilent(event, null);
-        });
+      const routed = await routePendingReply(event, { inboundChannel });
+      if (routed.deduped) return { event_id: event.id, matched_rules: 0, actions_created: 0, skipped_reason: 'message_already_analyzed' };
     }
     await supabase.from('system_events').update({
       processed: true, processed_by: 'decision_engine',

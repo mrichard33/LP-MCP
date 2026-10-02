@@ -53,6 +53,7 @@ import { humanizeReply, restoreQuestionMark } from '../agentic/human-voice.js';
 import { enforceTeamVoice } from '../agentic/team-voice.js';
 import { enforceCallTiming } from '../agentic/team-hours.js';
 import { rewriteBookingClaims } from '../agentic/booking-claim.js';
+import { enforceOneAsk } from '../agentic/one-ask.js';
 import { looksLikeShortPhone } from '../agentic/contact-typos.js';
 import { planNepqTurn, enforceNepqPlan, nepqBackboneMode, pickFresh, LINES as NEPQ_LINES } from '../agentic/nepq-planner.js';
 import { COLLECT_ASK, COLLECT_ASK_AGAIN, dmAsk, holdLine, missingItems, parseDecisionMakers, heldSlot, nameFromReply, addressConfirmAsk, addressConfirmState, mentionedPartner, dmAnswerFromThread } from '../agentic/booking-collect.js';
@@ -248,7 +249,7 @@ You are answering in the website chat, live, with the visitor watching the scree
 - You are the Reece Team. Asked who you are or for your name: "This is the Reece Team." Never give a personal name, never "I'm Mark".
 - Reece was founded in North Carolina in 1972 by Randy's father; Florida since 2005. Never say Randy founded it.
 - ONE or TWO short sentences. ONE question at a time, one question mark. No lists, no links.
-- Collect, in this order and only what is missing: their name, the best phone number, their email. One at a time, woven into the answer, never as a form.
+- Ask for ONE thing per message, as a question, and end the message on it. Before a time is picked the only ask is the day or time. After a time is picked, ask for what is missing in this order, one per message: first name, phone number, street address with zip, who else is part of the decision; email only if they offer it. Never ask for two details in one message, and never ask with a statement ("We just need your name and number").
 - If what they typed looks like an email but is not a valid one (no @, or nothing after the @), say so kindly and ask for it again: "That doesn't look quite right. Could you check the email address?" Never say you do not have enough information. Never dead-end.
 - Never promise to send anything unless an email is on file. No email → ask for the email instead.
 - A large job (eight or more openings, commercial, church, HOA, property manager, a building) → answer, offer the next step, and a person will follow up; say that plainly.
@@ -258,7 +259,8 @@ You are answering in the website chat, live, with the visitor watching the scree
 - Never say a visit is set, booked, confirmed or on the schedule yourself (no "You're all set"). Nothing is final until a team member confirms.
 - Never repeat a sentence or an opener you already sent in this chat (no second "Based on what you told me", "Great question" or "Happy to help"). Say it a new way.
 - Answer the question they asked, in their words. Do not repeat an answer you already gave in this conversation, and do not ask a question they already answered above.
-- Before you say a team member will call, you must have their first name AND phone number. Ask for whichever is missing in that same reply. "Guest Visitor" is not a name.
+- Before you say a team member will call, you must have their first name AND phone number. Ask for the first one missing (first name, then phone) as the one question in that reply. "Guest Visitor" is not a name.
+- Never say a day or time is blocked, reserved, held or saved for them: only real times offered for you are, and holding one is done for you.
 - When they ask for a price or a quote: every home is different, so a number now would just be a guess. Follow the NEPQ TURN PLAN for what comes next.
 - Every reply ends with one question or a clear next step. Never join two questions with "or".`;
 
@@ -396,6 +398,8 @@ export function dmOnContact(contact) {
 export function wantsSlots(plan) {
   if (!plan) return false;
   if (plan.objection?.type === 'think') return true;
+  // "Usually Wednesdays": two real times that day (day-preference.js).
+  if (plan.day_preference_pending) return true;
   if (plan.objection?.type === 'spouse' && plan.objection.attempt >= 2) return true;
   return plan.step === 'offer_slots' || plan.step === 'confirm' || plan.step === 'collect'
     // A yes to the bridge plans a day ask only for want of times (2026-10-02).
@@ -906,7 +910,7 @@ export function createLiveChatFastLane(deps) {
         const got = await raceWithBudget(Promise.resolve().then(() => d.offerBookingSlots({ contact, preferredText })), NEPQ_SLOT_LOOKUP_MS);
         nepqSlots = (!got.timedOut && !got.error && got.value?.slots?.length >= 2) ? got.value : null;
         if (!nepqSlots) d.log(`[NEPQ] live chat ${contactId} no slots for ${nepqPlan.required_move}: ${got.timedOut ? 'timed out' : got.error ? got.error.message : `${got.value?.slots?.length || 0} slot(s)`}`);
-        if (nepqSlots) nepqPlan = planNepqTurn({ ...planInput, slots: nepqSlots.slots, tzLabel: nepqSlots.tzLabel });
+        if (nepqSlots) nepqPlan = planNepqTurn({ ...planInput, slots: nepqSlots.slots, allSlots: nepqSlots.all || null, tzLabel: nepqSlots.tzLabel });
       }
       if (nepqMode === 'live') {
         const lastOutbound = [...context.conversation_recent].reverse().find(m => m.direction === 'outbound')?.text || '';
@@ -1038,15 +1042,21 @@ export function createLiveChatFastLane(deps) {
         email: !!context.lead?.email || /\b[^\s@]+@[^\s@]+\.[a-z]{2,}\b/i.test(typed) || !!live?.contact_capture?.email,
         zip: !!(context.lead?.postal_code) || /(?:^|\s)\d{5}(?:\s|$)/.test(typed),
       };
-      const nepqFix = (nepqLive && !saPlan.active) ? enforceNepqPlan(flow.fixed, nepqPlan, { known }) : { text: flow.fixed, changes: [] };
-      if (nepqFix.changes.length) d.log(`[NEPQ] live chat ${contactId} ${nepqPlan.required_move}: ${nepqFix.changes.join(',')}`);
-      // Never "you're all set" from a model reply: this lane books only through
-      // a picked offered time (runNepqFixedMove), never here (2026-10-02, Mark
-      // Test). A claim naming the appointment already on file stands.
+      // Never "you're all set" (or "we have Wednesdays blocked for you") from
+      // a model reply: this lane books and holds only through a picked offered
+      // time (runNepqFixedMove), never here (2026-10-02, Mark Test; Oct 2 6:12
+      // PM chat). A claim naming the appointment already on file stands. Runs
+      // before the one-ask pass so its replacement line is the one ask left.
       const hasAppt = context.lp?.appointment_set === true && context.lp?.appointment_is_past !== true;
-      const claim = rewriteBookingClaims(nepqFix.text, { booked: false, hasAppointment: hasAppt, ...(nepqLive ? { replacement: nextStepLine({ bridgeUsed: !!nepqPlan?.counters?.bridge_used }) } : {}) });
-      if (claim.changed) d.log(`[LiveChat] ${contactId} unbacked booking claim rewritten`);
-      return { ...base, notes: [...base.notes, ...times.notes, ...cov.notes, ...flow.notes], fixed: claim.text, booking_claim_rewritten: claim.changed, coverage_notes: cov.notes.length, time_offers_removed: times.notes.length > 0, flow_notes: flow.notes.length, nepq_changes: nepqFix.changes };
+      const claim = rewriteBookingClaims(flow.fixed, { booked: false, held: false, hasAppointment: hasAppt, ...(nepqLive ? { replacement: nextStepLine({ bridgeUsed: !!nepqPlan?.counters?.bridge_used }) } : {}) });
+      if (claim.changed) d.log(`[LiveChat] false_schedule_claim_fixed ${contactId}: unbacked booking or hold claim rewritten`);
+      const nepqFix = (nepqLive && !saPlan.active) ? enforceNepqPlan(claim.text, nepqPlan, { known }) : { text: claim.text, changes: [] };
+      if (nepqFix.changes.length) d.log(`[NEPQ] live chat ${contactId} ${nepqPlan.required_move}: ${nepqFix.changes.join(',')}`);
+      // One ask per message on every live-chat draft (Mark, 2026-10-02); the
+      // NEPQ guard above already did it when the plan is live.
+      const oneAsk = (nepqLive || saPlan.active) ? { text: nepqFix.text, changed: false } : enforceOneAsk(nepqFix.text);
+      if (oneAsk.changed) d.log(`[LiveChat] multi_ask_trimmed ${contactId}`);
+      return { ...base, notes: [...base.notes, ...times.notes, ...cov.notes, ...flow.notes], fixed: oneAsk.text, booking_claim_rewritten: claim.changed, coverage_notes: cov.notes.length, time_offers_removed: times.notes.length > 0, flow_notes: flow.notes.length, nepq_changes: nepqFix.changes };
     };
     const tGen = d.now();
     // A stronger model, side by side, never sent (Mark, 2026-10-02: test it

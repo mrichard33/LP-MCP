@@ -265,7 +265,8 @@ import {
 import { notInterestedTurn } from './agentic/not-interested.js';
 import { humanizeReply, restoreQuestionMark } from './agentic/human-voice.js';
 import { enforceTeamVoice } from './agentic/team-voice.js';
-import { enforceCallTiming, isTeamOpen } from './agentic/team-hours.js';
+import { enforceCallTiming, softenCallTiming, isTeamOpen } from './agentic/team-hours.js';
+import { enforceOneAsk } from './agentic/one-ask.js';
 import { findUnbackedBookingClaim, rewriteBookingClaims, bookingClaimNote } from './agentic/booking-claim.js';
 import { BOOKING_CALENDARS } from './knowledge/booking-calendar-router.js';
 import { contactTypoHint } from './agentic/contact-typos.js';
@@ -386,6 +387,7 @@ import { normalizeTimezone, tzLongName, tzLabel } from './config/market-timezone
 import { offeredSlots, pickSlot } from './live-chat/cancel-flow.js';
 import { holdLine, COLLECT_ASK, dmAsk, parseDecisionMakers } from './agentic/booking-collect.js';
 import { contactRecheckLine } from './agentic/contact-check.js';
+import { smsBookingTurn, enforceBookingFacts } from './agentic/sms-booking-turn.js';
 import { LINES as NEPQ_LINES } from './agentic/nepq-planner.js';
 import { planNepqTurn, enforceNepqPlan, nepqBackboneMode, nepqFixedLineWins, prefersCall as nepqPrefersCall, objectionType as nepqObjectionType, TIME_REQUEST_RX as NEPQ_TIME_REQUEST_RX, SCHEDULE_ASK_RX as NEPQ_SCHEDULE_ASK_RX,REPEAT_COMPLAINT_RX as NEPQ_REPEAT_COMPLAINT_RX } from './agentic/nepq-planner.js';
 import {
@@ -941,9 +943,59 @@ function extractActiveEntryTag(context) {
  * answered with a phone number after the bridge got "a team member will call
  * to set up the visit" instead of two real times.
  */
+/**
+ * A copy of a prepared read for one generation attempt (Part 6 prepare
+ * cache): the turn mutates the KB pack, the identity state and the context,
+ * and a re-write must start from what the read returned. Falls back to the
+ * value itself when it cannot be cloned (a function inside).
+ */
+export function copyPrepared(value) {
+  if (value == null || typeof value !== 'object') return value;
+  try { return structuredClone(value); } catch { return value; }
+}
+
+/**
+ * The Part 6 prepare cache over one `prepared` object (the send handler makes
+ * one per action). `memo(name, fn)` runs `fn` once per name while the key
+ * (channel + trigger) is unchanged, hands each caller its own copy, and does
+ * not keep a read that failed. A new key starts over. Without a `prepared`
+ * object every call simply runs. Pure apart from the object it is handed.
+ */
+export function preparedMemo(prepared, key) {
+  const prep = (prepared && typeof prepared === 'object') ? prepared : null;
+  if (prep && prep.key !== key) { prep.key = key; prep.memo = {}; prep.hits = 0; }
+  const memo = (name, fn) => {
+    if (!prep) return Promise.resolve().then(fn);
+    if (name in prep.memo) prep.hits += 1;
+    else {
+      const pending = Promise.resolve().then(fn);
+      prep.memo[name] = pending;
+      pending.catch(() => { if (prep.memo[name] === pending) delete prep.memo[name]; });
+    }
+    return prep.memo[name].then(copyPrepared);
+  };
+  return { prep, memo };
+}
+
+/**
+ * Part 6 patch budget: one deterministic fix on a first draft ships; two or
+ * more ask for ONE writer-only re-write carrying every note. A re-write, or a
+ * draft a fixed line replaces anyway, always ships. Pure.
+ */
+export function decidePatchBudget(patches = [], { regenerating = false, replaced = false } = {}) {
+  const list = Array.isArray(patches) ? patches : [];
+  const rewrite = list.length >= 2 && !regenerating && !replaced;
+  return { rewrite, note: rewrite ? list.map(p => p.note).filter(Boolean).join('\n\n') : null };
+}
+
+// Every opening in the 14-day read (GHL's default cap of 12 is about four days).
+const FULL_SLOT_READ = 120;
+
 function nepqBookingTurn(conversation = []) {
   const outs = (conversation || []).filter(m => String(m?.direction || '').toLowerCase() === 'outbound').slice(-4).map(m => String(m?.text ?? m?.body ?? ''));
-  return outs.some(t => /\bbased\s+on\s+what\s+you\s+(?:told|said|mentioned)\b|\b(?:the\s+)?(?:easiest\s+|best\s+)?next\s+step\s+(?:would\s+be|is)\b|\bI'm\s+holding\b/i.test(t)
+  // 2026-10-02 (Part 6): "what day works best?" too, so a day preference
+  // ("usually Wednesdays") gets two real times that day.
+  return outs.some(t => /\bbased\s+on\s+what\s+you\s+(?:told|said|mentioned)\b|\b(?:the\s+)?(?:easiest\s+|best\s+)?next\s+step\s+(?:would\s+be|is)\b|\bI'm\s+holding\b|\bwhat\s+day\s+(?:works|would)\b|\bwhich\s+day\s+is\s+best\b/i.test(t)
     || /\bI\s+have\b[^?]{0,140}\b\d{1,2}(?::\d{2})?\s*(?:AM|PM)\b[^?]*\bor\b/i.test(t));
 }
 
@@ -3077,17 +3129,32 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // days. Everything between here and buildKbPack — the context build, and
   // classifyInbound's LLM call — now runs while it is in flight. Returns null
   // (and costs nothing) when every semantic mode is off.
-  const getQueryEmbedding = prewarmQueryEmbedding(triggerMessage);
+  //
+  // ─── Prepare cache (Part 6, 2026-10-02, Mark: "we loop through the flow
+  // too many times") ───
+  // The send handler hands in one `opts.prepared` object per action and
+  // passes it to every attempt and to the quality-pass regeneration. Every
+  // read below (context, classification, KB pack, calendar, appointments,
+  // identity, edits) is made once per action and trigger; a re-write is then
+  // ONE model call, not the 30-60s of reads before it. A failed read is not
+  // kept, and each attempt gets its own copy (the turn mutates some of them).
+  const { prep, memo } = preparedMemo(opts.prepared, `${channel}|${String(triggerMessage || '')}`);
+  if (prep?.memo && Object.keys(prep.memo).length) console.log(`[ResponseGenerator] prepared reads reused for ${contactId}: ${Object.keys(prep.memo).join(',')}`);
+  const getQueryEmbedding = prep?.memo?.kbPack ? null : prewarmQueryEmbedding(triggerMessage);
 
   // 2026-10-02: the bot simulator (src/simulator/bot-simulator.js) hands in
   // a made-up lead and thread; it always runs with dryRun, so nothing is
   // written for the made-up contact id.
   const context = opts.simulatedContext && opts.dryRun === true
     ? structuredClone(opts.simulatedContext)
-    : await buildLeadContext(contactId, {
+    : await memo('context', () => buildLeadContext(contactId, {
       includeConversation: true,
       skipCache: true,
-    });
+    }));
+  // Started now, awaited where they are used (Part 6: run independent reads
+  // alongside the classifier and the KB pack).
+  const appointmentsRead = memo('appointments', () => fetchRecentAndUpcomingAppointments(contactId));
+  appointmentsRead.catch(() => {});
 
   // ─── ESTABLISHED FACTS (2026-09-11 — Alfredo Fontan) ──────────────────
   // Built immediately after the context and BEFORE the prompt, so every block
@@ -3221,7 +3288,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
 
   let classification;
   try {
-    classification = await classifyInbound(triggerMessage, {
+    classification = await memo('classification', () => classifyInbound(triggerMessage, {
       conversationContext: context.conversation_recent || [],
       ghlContactId: contactId,
       channel,
@@ -3231,7 +3298,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       // threaded through, a bare "yeah"/"I will be" mid-booking no longer gets
       // hijacked by CUSTOMER_STATUS_AFFIRMATIVE → hdl:callback-service.
       contactTags: context.lead?.current_tags || [],
-    });
+    }));
   } catch (err) {
     console.error(`[ResponseGenerator] Classifier threw, defaulting to UNCLEAR: ${err.message}`);
     classification = {
@@ -3336,7 +3403,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   const confFlowTags = context.lead?.current_tags || [];
   if (confFlowTags.includes('conf-flow-active') && confFlowTags.includes('canvass-v2')) {
     try {
-      confFlowContext = await buildConfFlowContext(contactId, context);
+      confFlowContext = await memo('confFlow', () => buildConfFlowContext(contactId, context));
       if (!confFlowContext) {
         console.log(`[ResponseGenerator] conf-flow active for ${contactId} but no appointment resolvable — merge keys not injected`);
       }
@@ -3346,9 +3413,12 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     }
   }
 
+  // Edits for this intent: needed only by the prompt, read alongside the rest.
+  const recentEditsRead = memo('recentEdits', () => getRecentEdits(classification.intent_class, RECENT_EDITS_LIMIT));
+  recentEditsRead.catch(() => {});
   let kbPack = null;
   try {
-    kbPack = await buildKbPack({
+    kbPack = await memo('kbPack', () => buildKbPack({
       getQueryEmbedding,
       intentClass: classification.intent_class,
       messageText: triggerMessage,
@@ -3361,7 +3431,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       hasExistingAppt,
       lpDisposition,
       contactTags: context.lead?.current_tags || [],
-    });
+    }));
   } catch (err) {
     console.warn(`[ResponseGenerator] KB pack build failed for ${contactId}: ${err.message} — proceeding without`);
     kbPack = null;
@@ -3378,7 +3448,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   let bookingResolution = null;
   if (kbPack?.booking_context) {
     try {
-      bookingResolution = await resolveBookingCalendar(
+      bookingResolution = await memo('bookingResolution', () => resolveBookingCalendar(
         { id: contactId, tags: context.lead?.current_tags || [] },
         // 2026-07-06 (Bot 2/3/4 consolidation): request-first routing. The
         // analyzer's requested_fulfillment (the lead's OWN explicit ask,
@@ -3394,7 +3464,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
           buyerStage,
           isGenericCallRequest: false,
         },
-      );
+      ));
       stampBookingResolution(kbPack.booking_context, bookingResolution, context);
       // Mark the in-flow state so the §3 affirmative-gate bypass keeps the lead
       // in BOOK on the next turn (e.g. a bare "yeah" answering the DM question).
@@ -3416,7 +3486,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   const nepqModeEarly = (opts.dryRun === true && opts.nepqModeOverride) ? opts.nepqModeOverride : nepqBackboneMode();
   const nepqWantsSlots = nepqModeEarly !== 'off' && channel === 'sms'
     // 2026-10-02 (Mark): a quote/price ask and "you just said that" offer two times too.
-    && (['think', 'price'].includes(nepqObjectionType(triggerMessage)) || NEPQ_TIME_REQUEST_RX.test(String(triggerMessage || '')) || NEPQ_SCHEDULE_ASK_RX.test(String(triggerMessage || '')) || NEPQ_REPEAT_COMPLAINT_RX.test(String(triggerMessage || ''))
+    && (['think', 'price', 'spouse'].includes(nepqObjectionType(triggerMessage)) || NEPQ_TIME_REQUEST_RX.test(String(triggerMessage || '')) || NEPQ_SCHEDULE_ASK_RX.test(String(triggerMessage || '')) || NEPQ_REPEAT_COMPLAINT_RX.test(String(triggerMessage || ''))
       // 2026-10-02 funnel audit: "yes" to the bridge, and a pick after our two
       // times, loaded no calendar on SMS, so the bot sent the self-booking link
       // instead of two real times (0 of 12 journeys booked).
@@ -3432,12 +3502,96 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     stampBookingResolution(kbPack.booking_context, bookingResolution, context);
     console.log(`[ResponseGenerator] NEPQ visit-first: ${contactId} books ${bookingResolution.calendar_key}`);
   }
+  // ─── Identity read (Part 6: started here, alongside the calendar read;
+  // after the visit-first calendar switch, which decides the LLM pass) ───
+  const identityRead = memo('identity', async () => {
+    let st = null;
+    let sa = null;
+    let saT = null;
+    st = await buildIdentityState(context, {
+      // LLM pass only at booking intent — every other turn runs heuristics.
+      useLLM: kbPack?.booking_context?.requires_in_home_gate === true,
+    });
+    // Street known but zip missing → try the Census geocoder (free,
+    // single-unambiguous-match rule). On success the zip is treated like
+    // extraction; on any ambiguity/failure the gate simply keeps asking
+    // the customer. NEVER inferred from city alone (Mark 2026-07-04).
+    if (st.identity.address_line1 && !st.identity.postal_code) {
+      const geo = await geocodeStreetToZip(st.identity.address_line1, {
+        city: st.identity.city,
+        state: st.identity.state || 'FL',
+      });
+      if (geo?.zip) {
+        st.identity.postal_code = geo.zip;
+        st.identity._source.postal_code = 'geocoded';
+      }
+    }
+    // Service-area check the moment a zip is known (address+zip outrank
+    // city/state — the zip is what proves the home is serviceable, and it
+    // backfills city/FL from service_area_zips for promotion). When only a
+    // city is known, a match against served markets gives a TENTATIVE
+    // positive signal — never used to deny service or infer a zip.
+    if (st.identity.postal_code) {
+      sa = await checkServiceAreaZip(st.identity.postal_code);
+      enrichIdentityFromServiceArea(st.identity, sa);
+      // 2026-07-06 (Bot 2/3/4 consolidation — the Thomas rule): a VERIFIED
+      // out-of-area zip fires the exit event the moment it's known, so the
+      // SERVICE_AREA_EXIT agent rule can send the polite exit + suppress +
+      // P3-route BEFORE any further qualification or nurture. Idempotent per
+      // contact+zip (a re-generation for the same contact/zip re-emits the
+      // same key and dedups). Fire-and-forget — never blocks generation; the
+      // prompt-level suppression below still governs this reply either way.
+      if (sa?.checked && sa.in_service_area === false && !dryRun) {
+        // The literal exit script is pre-resolved HERE (name included) because
+        // literal rule sends do not resolve merge tags — the SERVICE_AREA_EXIT
+        // rule's send_message picks this up as context.message. Guide §3.7
+        // wording with the em-dash→comma SMS voice fix.
+        const oaFirstName = context.lead?.first_name || null;
+        const oaMessage = `Thanks${oaFirstName ? `, ${oaFirstName}` : ''}, it looks like your area's outside our current service footprint, so I can't set up a visit there. Wish we could help!`;
+        emitEvent({
+          event_type: 'agentic.out_of_area_detected',
+          source: 'response_generator',
+          entity_type: 'contact',
+          entity_id: String(contactId),
+          ghl_contact_id: contactId,
+          payload: {
+            zip: sa.zip || st.identity.postal_code,
+            city: sa.city || st.identity.city || null,
+            first_name: oaFirstName,
+            message: oaMessage,
+          },
+          priority: 'high',
+          idempotency_key: `out_of_area_${contactId}_${sa.zip || st.identity.postal_code}`,
+        }).catch((err) => console.warn(`[ResponseGenerator] out-of-area event emit failed for ${contactId}: ${err.message}`));
+      }
+    } else if (st.identity.city) {
+      saT = await checkServiceAreaCity(st.identity.city);
+    }
+    if (!dryRun) promoteIdentityToGHL(contactId, st, {
+      current: {
+        firstName: context.lead?.first_name,
+        lastName: context.lead?.last_name,
+        email: context.lead?.email,
+        phone: context.lead?.phone,
+        address1: context.lead?.address1,
+        city: context.lead?.city,
+        state: context.lead?.state,
+        postalCode: context.lead?.postal_code,
+      },
+      trigger: 'response_generation',
+    }).catch(err => console.warn(`[ResponseGenerator] identity promotion failed for ${contactId}: ${err.message}`));
+    return { identityState: st, serviceArea: sa, serviceAreaTentative: saT };
+  });
+  identityRead.catch(() => {});
+
   const calendarId = getCalendarIdFromKbPack(kbPack)
     || (nepqWantsSlots ? (nepqVisitFirst ? inHomeCalendarFor(context.lead?.current_tags || []).calendar_id : BOOKING_CALENDARS.PROTECTION_PROFILE_REVIEW) : null);
   if (calendarId) {
     try {
       // 2026-10-01: in the contact's market zone (Houston → Central).
-      availability = await fetchFreeSlots(calendarId, { timezone: promptTimezoneFor(context), ...(calendarId === BOOKING_CALENDARS.PROTECTION_PROFILE_REVIEW ? { minNoticeHours: CALL_MIN_NOTICE_HOURS } : {}) });
+      // Two weeks of openings, not the first 12 (about four days): a day
+      // preference ("usually Wednesdays") needs next week too (Part 6).
+      availability = await memo(`slots:${calendarId}`, () => fetchFreeSlots(calendarId, { timezone: promptTimezoneFor(context), maxSlots: FULL_SLOT_READ, ...(calendarId === BOOKING_CALENDARS.PROTECTION_PROFILE_REVIEW ? { minNoticeHours: CALL_MIN_NOTICE_HOURS } : {}) }));
     } catch (err) {
       console.warn(`[ResponseGenerator] Calendar availability fetch threw for ${contactId} (cal ${calendarId}): ${err.message} — proceeding without`);
       availability = null;
@@ -3451,6 +3605,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // acknowledgment / walk-back prompt blocks below.
   let preferred = null;
   let fullSlotsForPick = [];
+  let preferencePool = [];
   let offerSelection = null;
   let preferredMatch = null;
   try {
@@ -3468,6 +3623,12 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       // Every real opening, kept for resolving a pick or a held time below
       // (the narrowed list may no longer hold the time they picked).
       fullSlotsForPick = Array.isArray(availability?.slots) ? availability.slots : [];
+      // Every offerable opening for two weeks (notice floor applied), for a
+      // stated day preference ("usually Wednesdays", day-preference.js).
+      preferencePool = selectOfferableSlots(availability, null, {
+        offerWindowHours: 24 * 14, maxOffer: 500,
+        ...(calendarId === BOOKING_CALENDARS.PROTECTION_PROFILE_REVIEW ? { call: true, isOpen: isTeamOpen } : {}),
+      })?.slots || [];
       availability = offerSelection.availability;
     }
   } catch (err) {
@@ -3489,13 +3650,16 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // guards keep using the strict future-only fetch.
   let upcomingAppointments = null;
   try {
-    upcomingAppointments = await fetchRecentAndUpcomingAppointments(contactId);
+    upcomingAppointments = await appointmentsRead;
   } catch (err) {
     console.warn(`[ResponseGenerator] fetchRecentAndUpcomingAppointments threw for ${contactId}: ${err.message} — proceeding without`);
     upcomingAppointments = null;
   }
 
-  const recentEdits = await getRecentEdits(classification.intent_class, RECENT_EDITS_LIMIT);
+  const recentEdits = await recentEditsRead.catch((err) => {
+    console.warn(`[ResponseGenerator] recent edits read failed for ${contactId}: ${err.message}`);
+    return [];
+  });
 
   // ─── v1.1 identity hydration + booking prerequisites (Victor Lopez incident 2026-07-04) ───
   // R5: hydrate the known-fields state (GHL record + conversation extraction)
@@ -3509,66 +3673,14 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   let bookingGate = null;
   let serviceArea = null;
   let serviceAreaTentative = null;
+  // Part 6: one prepared read (the identity, the geocode, the service-area
+  // check, the out-of-area event and the promotion to GHL happen once per
+  // action), started before the calendar read and awaited here.
   try {
-    identityState = await buildIdentityState(context, {
-      // LLM pass only at booking intent — every other turn runs heuristics.
-      useLLM: kbPack?.booking_context?.requires_in_home_gate === true,
-    });
-    // Street known but zip missing → try the Census geocoder (free,
-    // single-unambiguous-match rule). On success the zip is treated like
-    // extraction; on any ambiguity/failure the gate simply keeps asking
-    // the customer. NEVER inferred from city alone (Mark 2026-07-04).
-    if (identityState.identity.address_line1 && !identityState.identity.postal_code) {
-      const geo = await geocodeStreetToZip(identityState.identity.address_line1, {
-        city: identityState.identity.city,
-        state: identityState.identity.state || 'FL',
-      });
-      if (geo?.zip) {
-        identityState.identity.postal_code = geo.zip;
-        identityState.identity._source.postal_code = 'geocoded';
-      }
-    }
-    // Service-area check the moment a zip is known (address+zip outrank
-    // city/state — the zip is what proves the home is serviceable, and it
-    // backfills city/FL from service_area_zips for promotion). When only a
-    // city is known, a match against served markets gives a TENTATIVE
-    // positive signal — never used to deny service or infer a zip.
-    if (identityState.identity.postal_code) {
-      serviceArea = await checkServiceAreaZip(identityState.identity.postal_code);
-      enrichIdentityFromServiceArea(identityState.identity, serviceArea);
-      // 2026-07-06 (Bot 2/3/4 consolidation — the Thomas rule): a VERIFIED
-      // out-of-area zip fires the exit event the moment it's known, so the
-      // SERVICE_AREA_EXIT agent rule can send the polite exit + suppress +
-      // P3-route BEFORE any further qualification or nurture. Idempotent per
-      // contact+zip (a re-generation for the same contact/zip re-emits the
-      // same key and dedups). Fire-and-forget — never blocks generation; the
-      // prompt-level suppression below still governs this reply either way.
-      if (serviceArea?.checked && serviceArea.in_service_area === false && !dryRun) {
-        // The literal exit script is pre-resolved HERE (name included) because
-        // literal rule sends do not resolve merge tags — the SERVICE_AREA_EXIT
-        // rule's send_message picks this up as context.message. Guide §3.7
-        // wording with the em-dash→comma SMS voice fix.
-        const oaFirstName = context.lead?.first_name || null;
-        const oaMessage = `Thanks${oaFirstName ? `, ${oaFirstName}` : ''}, it looks like your area's outside our current service footprint, so I can't set up a visit there. Wish we could help!`;
-        emitEvent({
-          event_type: 'agentic.out_of_area_detected',
-          source: 'response_generator',
-          entity_type: 'contact',
-          entity_id: String(contactId),
-          ghl_contact_id: contactId,
-          payload: {
-            zip: serviceArea.zip || identityState.identity.postal_code,
-            city: serviceArea.city || identityState.identity.city || null,
-            first_name: oaFirstName,
-            message: oaMessage,
-          },
-          priority: 'high',
-          idempotency_key: `out_of_area_${contactId}_${serviceArea.zip || identityState.identity.postal_code}`,
-        }).catch((err) => console.warn(`[ResponseGenerator] out-of-area event emit failed for ${contactId}: ${err.message}`));
-      }
-    } else if (identityState.identity.city) {
-      serviceAreaTentative = await checkServiceAreaCity(identityState.identity.city);
-    }
+    const got = await identityRead;
+    identityState = got.identityState;
+    serviceArea = got.serviceArea;
+    serviceAreaTentative = got.serviceAreaTentative;
     // v1.1 (2026-07-24 Engelke incident) — the email ask must never share a turn
     // with slot selection. `bookingInFlight` is true when an in-home calendar is
     // resolved for this turn AND no appointment has landed yet — using the same
@@ -3579,19 +3691,6 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     const bookingInFlight =
       kbPack?.booking_context?.requires_in_home_gate === true && !hasActiveBooking(context);
     bookingGate = assertBookingPrerequisites(identityState, { bookingInFlight });
-    if (!dryRun) promoteIdentityToGHL(contactId, identityState, {
-      current: {
-        firstName: context.lead?.first_name,
-        lastName: context.lead?.last_name,
-        email: context.lead?.email,
-        phone: context.lead?.phone,
-        address1: context.lead?.address1,
-        city: context.lead?.city,
-        state: context.lead?.state,
-        postalCode: context.lead?.postal_code,
-      },
-      trigger: 'response_generation',
-    }).catch(err => console.warn(`[ResponseGenerator] identity promotion failed for ${contactId}: ${err.message}`));
   } catch (err) {
     console.warn(`[ResponseGenerator] identity state build failed for ${contactId}: ${err.message} — proceeding without gate`);
   }
@@ -3629,9 +3728,8 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // GENERAL line. Never blocks generation.
   let servicePhone = null;
   try {
-    servicePhone = await resolveServicePhone(
-      serviceArea?.market_code || serviceAreaTentative?.market_code || null
-    );
+    const marketCode = serviceArea?.market_code || serviceAreaTentative?.market_code || null;
+    servicePhone = await memo(`servicePhone:${marketCode}`, () => resolveServicePhone(marketCode));
   } catch (err) {
     console.warn(`[ResponseGenerator] service phone resolve failed for ${contactId}: ${err.message}`);
   }
@@ -3676,6 +3774,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
         trigger: triggerMessage,
         conversation: context.conversation_recent || [],
         slots: offerSelection?.slots || [],
+        allSlots: preferencePool,
         tzLabel: tzLabel(promptTimezoneFor(context)),
         firstName: firstWord && !/^guest$/i.test(firstWord) ? firstWord : null,
         hasAppointment,
@@ -3686,6 +3785,43 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     } catch (err) {
       console.warn(`[ResponseGenerator] NEPQ plan failed for ${contactId} (continuing without it): ${err.message}`);
       nepqPlan = null;
+    }
+  }
+
+  // ─── Booking facts (Part 6, 2026-10-02): code decides, AI writes ───
+  // A pick or a held time is resolved against the real slots, and the ONE
+  // thing to ask next (or "book it now") is worked out here. The facts are
+  // rendered into the plan block; the model writes the reply; the draft is
+  // checked against them right after it comes back (enforceBookingFacts).
+  let bookingFacts = null;
+  if (nepqMode === 'live' && channel === 'sms' && nepqPlan && (nepqPlan.required_move === 'confirm' || nepqPlan.step === 'collect')) {
+    try {
+      const idn = identityState?.identity || {};
+      const thread = (context.conversation_recent || []).map(m => ({ direction: String(m?.direction || '').toLowerCase() === 'outbound' ? 'outbound' : 'inbound', text: String(m?.text ?? m?.body ?? '') }));
+      if (!thread.length || thread[thread.length - 1].direction === 'outbound' || thread[thread.length - 1].text !== triggerMessage) thread.push({ direction: 'inbound', text: String(triggerMessage || '') });
+      const inHomeGate = kbPack?.booking_context?.requires_in_home_gate === true;
+      const firstName = (() => { const f = String(idn.first_name || context.lead?.first_name || '').trim().split(/\s+/)[0]; return f && !/^guest$/i.test(f) ? f : null; })();
+      const tzl = tzLabel(promptTimezoneFor(context));
+      bookingFacts = smsBookingTurn({
+        plan: nepqPlan, trigger: triggerMessage, thread, slots: fullSlotsForPick,
+        tz: tzl,
+        gateMissing: inHomeGate && bookingGate && !bookingGate.ok ? (bookingGate.missing || []) : [],
+        onFileAddress: inHomeGate && idn.address_line1 && idn._source?.address_line1 === 'ghl_record' ? { address1: idn.address_line1, city: idn.city || null } : null,
+        firstName,
+        calendar: { calendar_id: bookingResolution?.calendar_id || null, calendar_name: bookingResolution?.calendar_key ? calendarNameForKey(bookingResolution.calendar_key) : null },
+        spread: (list) => spreadOffer(list.filter(x => Date.parse(x.iso) >= Date.now() + 4 * 3600_000), 2, { timezone: promptTimezoneFor(context) }),
+      });
+      if (bookingFacts) {
+        nepqPlan.booking_facts = {
+          kind: bookingFacts.kind, label: bookingFacts.label, ask: bookingFacts.ask, ask_line: bookingFacts.ask_line,
+          first_name: firstName,
+          alternatives_text: bookingFacts.alternatives.length === 2 ? bookingFacts.alternatives.map(x => `${x.day} at ${x.time} ${x.tz || tzl}`.trim()).join(' or ') : null,
+        };
+        console.log(`[NEPQ] ${contactId} SMS booking facts: ${JSON.stringify(bookingFacts.record)}`);
+      }
+    } catch (err) {
+      console.warn(`[ResponseGenerator] booking facts failed for ${contactId} (the model writes the turn): ${err.message}`);
+      bookingFacts = null;
     }
   }
 
@@ -3750,7 +3886,16 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       nepqPlan: nepqMode === 'live' ? nepqPlan : null,
     }
   );
-  const raw = await callClaude(userPrompt);
+  // 2026-10-02 (Mark: "look into the text bot speed"): a fixed move's line
+  // replaces any draft (enforceNepqPlan), so the model is not asked for one.
+  // Booking turns are NOT fixed: the model writes them from the facts above
+  // (Part 6, "I want there to be AI-generated replies").
+  let nepqDirect = null;
+  if (nepqMode === 'live' && channel === 'sms' && nepqPlan && !bookingFacts && nepqFixedLineWins(nepqPlan)) {
+    nepqDirect = { message: nepqPlan.fixed_line, _record: { fixed: nepqPlan.required_move } };
+    console.log(`[NEPQ] ${contactId} SMS fixed line (${nepqPlan.required_move}), no model call`);
+  }
+  const raw = nepqDirect || await callClaude(userPrompt);
 
   const validated = validateResponse(raw, channel, upcomingAppointments);
   if (!validated) {
@@ -3758,6 +3903,23 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   }
 
   validated.message = sanitizeMessageUrls(validated.message, channel, kbPack);
+
+  // Part 6 (2026-10-02, Mark: "we loop through the flow too many times"):
+  // a guard with a deterministic fix applies it to the first draft and
+  // records a patch here, instead of throwing for a whole new generation.
+  const draftPatches = [];
+  const draftPatch = (tag, note) => draftPatches.push({ tag, note });
+
+  // Booking facts, enforced on the model's draft (Part 6): the right time, the
+  // one ask in the plan's words, and the book_appointment with the pinned
+  // slot. A draft that misses one ships the deterministic line instead.
+  if (bookingFacts) {
+    const checked = enforceBookingFacts(validated.message, bookingFacts, { companion: validated.companion_action });
+    validated.message = checked.message;
+    validated.companion_action = checked.companion;
+    validated.sms_booking = checked.record;
+    console.log(`[NEPQ] ${contactId} SMS booking ${bookingFacts.kind}: ${checked.fallback_used ? `fixed line (${checked.problems.join(',')})` : 'AI-written'}${checked.notes.length ? ` fixes=${checked.notes.join(',')}` : ''}`);
+  }
 
   // v1.1 (2026-07-24 Engelke incident) §5b — if THIS reply accepted a specific
   // time ("Monday at 3 PM works great"), persist it now so the commitment
@@ -3898,7 +4060,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // regenerationNote carries THE ANSWER rather than just the prohibition —
   // a retry told only "don't ask that" has to guess what to say instead,
   // which is how a repeat-ask becomes an invented question.
-  if (established?.closed_questions?.length) {
+  if (established?.closed_questions?.length && !nepqDirect && !bookingFacts) {
     // 2026-10-02 post-merge run: "My wife works then" made a new time the
     // right question, the guard called it a repeat twice, and the lead got
     // no reply. A decision-maker conflict reopens the time.
@@ -3941,17 +4103,15 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       objectionOpen: !!context.objection_state?.state_code,
     });
     if (pivots.length) {
-      if (opts.regenerationNote) {
-        console.warn(`[ResponseGenerator] ⚠️ concession-then-pivot survived regeneration for ${contactId}: ${pivots.join(', ')} — sending anyway`);
-      } else {
-        console.warn(`[ResponseGenerator] ⚠️ concession-then-pivot for ${contactId}: ${pivots.join(', ')} — regenerating once`);
-        const err = new Error(`concession_pivot: ${pivots.join(', ')}`);
-        err.regenerationNote =
-          `Your previous draft conceded the customer's objection and then changed the subject: ${pivots.join(', ')}. ` +
-          `Do not open by agreeing with an objection and then asking for something else. Ask a question back about ` +
-          `THEIR position instead, using their own words — see the NEPQ objection block.`;
-        throw err;
-      }
+      // Part 6 (2026-10-02): fixed on the first draft. The conceding sentence
+      // goes; what follows it stays.
+      const conceded = pivots.map(p => (p.match(/"(.+)"$/) || [])[1]).filter(Boolean);
+      const kept = stripSentences(validated.message, s => conceded.includes(s));
+      if (kept.trim()) validated.message = kept;
+      draftPatch('concession_pivot',
+        `Your previous draft conceded the customer's objection and then changed the subject: ${pivots.join(', ')}. ` +
+        `Do not open by agreeing with an objection and then asking for something else. Ask a question back about ` +
+        `THEIR position instead, using their own words — see the NEPQ objection block.`);
     }
   }
 
@@ -4002,16 +4162,11 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     ];
     const promise = findUndeliveredSendPromise(validated.message, validated.companion_action, { channel, deliveryTags });
     if (promise) {
-      if (opts.regenerationNote) {
-        validated.message = rewriteUndeliveredPromise(validated.message, promise, { email: context.lead?.email || null });
-        console.warn(`[ResponseGenerator] ⚠️ undelivered send promise survived regeneration for ${contactId}: "${promise}" — rewritten to a team send, flagged for a rep`);
-        validated.undelivered_promise = promise;
-      } else {
-        console.warn(`[ResponseGenerator] ⚠️ undelivered send promise for ${contactId}: "${promise}" — regenerating once`);
-        const err = new Error(`undelivered_send_promise: ${promise.slice(0, 120)}`);
-        err.regenerationNote = undeliveredPromiseNote(promise);
-        throw err;
-      }
+      // Part 6: rewritten on the first draft and flagged; a rep keeps it.
+      validated.message = rewriteUndeliveredPromise(validated.message, promise, { email: context.lead?.email || null });
+      console.warn(`[ResponseGenerator] ⚠️ undelivered send promise for ${contactId}: "${promise}" — rewritten to a team send, flagged for a rep`);
+      validated.undelivered_promise = promise;
+      draftPatch('undelivered_promise', undeliveredPromiseNote(promise));
     }
   }
 
@@ -4024,18 +4179,22 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   if (nepqModeEarly === 'live' && channel === 'sms') {
     const onFile = (Array.isArray(upcomingAppointments) && upcomingAppointments.some(a => !a.already_ended))
       || (context.lp?.appointment_set === true && context.lp?.appointment_is_past !== true);
-    const claimOpts = { booked: validated.companion_action?.action_type === 'book_appointment', hasAppointment: onFile };
+    // A hold stands only when code held the slot this turn (booking facts).
+    const held = !!bookingFacts && (bookingFacts.kind === 'hold' || bookingFacts.kind === 'collect');
+    const claimOpts = { booked: validated.companion_action?.action_type === 'book_appointment', hasAppointment: onFile, held };
     const claim = findUnbackedBookingClaim(validated.message, claimOpts);
     if (claim) {
-      if (opts.regenerationNote) {
-        validated.message = rewriteBookingClaims(validated.message, claimOpts).text;
-        console.warn(`[ResponseGenerator] ⚠️ unbacked booking claim survived regeneration for ${contactId}: "${claim}" — rewritten`);
-      } else {
-        console.warn(`[ResponseGenerator] ⚠️ unbacked booking claim for ${contactId}: "${claim}" — regenerating once`);
-        const err = new Error(`unbacked_booking_claim: ${claim.slice(0, 120)}`);
-        err.regenerationNote = bookingClaimNote(claim);
-        throw err;
-      }
+      // Part 6 (Mark, Oct 2 6:12 PM chat: "We have Wednesdays blocked for
+      // you"): rewritten on the first draft. With times in hand the claim
+      // becomes the two real times, otherwise the day question.
+      const two = (nepqPlan?.slots_to_offer || []).length === 2 ? nepqPlan.slots_to_offer : (offerSelection?.slots || []).slice(0, 2);
+      const replacement = nepqPlan
+        ? (two.length === 2 ? NEPQ_LINES.offer_slots(two.map(x => ({ ...x, tz: x.tz || tzLabel(promptTimezoneFor(context)) })), nepqPlan.counters?.slot_offers || 0) : NEPQ_LINES.ask_day)
+        : undefined;
+      validated.message = rewriteBookingClaims(validated.message, { ...claimOpts, ...(replacement ? { replacement } : {}) }).text;
+      console.warn(`[ResponseGenerator] false_schedule_claim_fixed for ${contactId}: "${claim}"`);
+      validated.false_schedule_claim_fixed = true;
+      draftPatch('booking_claim', bookingClaimNote(claim));
     }
   }
 
@@ -4060,16 +4219,11 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       calculatorOffered: calculatorFallbackAllowed(context.objection_state),
     });
     if (promise) {
-      if (opts.regenerationNote) {
-        validated.message = rewriteEstimatePromise(validated.message, promise);
-        console.warn(`[ResponseGenerator] ⚠️ estimate promise survived regeneration for ${contactId}: "${promise}" — rewritten to the honest boundary, flagged for a rep`);
-        validated.estimate_promise = promise;
-      } else {
-        console.warn(`[ResponseGenerator] ⚠️ estimate promised without the in-home visit for ${contactId}: "${promise}" — regenerating once`);
-        const err = new Error(`estimate_promise_without_visit: ${promise.slice(0, 120)}`);
-        err.regenerationNote = estimatePromiseNote(promise);
-        throw err;
-      }
+      // Part 6: rewritten to the honest boundary on the first draft, flagged.
+      validated.message = rewriteEstimatePromise(validated.message, promise);
+      console.warn(`[ResponseGenerator] ⚠️ estimate promise for ${contactId}: "${promise}" — rewritten to the honest boundary, flagged for a rep`);
+      validated.estimate_promise = promise;
+      draftPatch('estimate_promise', estimatePromiseNote(promise));
     }
   }
 
@@ -4086,7 +4240,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // enforceNepqPlan's (it keeps the last question, no model call), and the
   // discipline rewrites run at once instead of after a second draft.
   const nepqLiveTurn = nepqMode === 'live' && !!nepqPlan;
-  const nepqDraftReplaced = nepqLiveTurn && nepqFixedLineWins(nepqPlan);
+  const nepqDraftReplaced = nepqLiveTurn && (nepqFixedLineWins(nepqPlan) || !!nepqDirect || !!bookingFacts);
   {
     const offences = [];
 
@@ -4113,17 +4267,27 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     if (offences.length) {
       if (nepqDraftReplaced) {
         console.log(`[ResponseGenerator] repetition in a draft the NEPQ fixed line replaces for ${contactId} — no redraft`);
-      } else if (opts.regenerationNote) {
-        console.warn(`[ResponseGenerator] ⚠️ repetition survived regeneration for ${contactId}: ${offences.join('; ')} — sending anyway`);
       } else {
-        console.warn(`[ResponseGenerator] ⚠️ repetition for ${contactId}: ${offences.join('; ')} — regenerating once`);
-        const err = new Error(`conversation_repetition: ${offences.length} offence(s)`);
-        err.regenerationNote =
+        // Part 6: fixed on the first draft. The repeated close and a second
+        // both-owners pitch go (when something is left), and the draft keeps
+        // one ask (one-ask.js).
+        let fixedText = validated.message;
+        if (draftClose && priorCloses.some(c => closesRepeat(draftClose, c, { drop: dropName }))) {
+          const without = stripSentences(fixedText, s => s === draftClose);
+          if (without.trim()) fixedText = without;
+        }
+        if (spouseAdvocacy.used && isSpousePitch(fixedText)) {
+          const without = stripSentences(fixedText, s => isSpousePitch(s));
+          if (without.trim()) fixedText = without;
+        }
+        if (questions > 1) fixedText = enforceOneAsk(fixedText).text;
+        validated.message = fixedText;
+        console.warn(`[ResponseGenerator] ⚠️ repetition for ${contactId}: ${offences.join('; ')} — fixed on the draft`);
+        draftPatch('repetition',
           `Your previous draft ${offences.join(', and ')}. ` +
           `Keep the part that answered their question — that was right. Rewrite only the ending: ` +
           `${priorCloses.length ? `do not ask for a day, a time, a call, or who will be home, because that ask has already been made ${priorCloses.length} time(s) and ignored. ` : ''}` +
-          `End with exactly ONE question, or with no question at all. A short, useful answer that asks nothing is a better message than a fourth version of the same request.`;
-        throw err;
+          `End with exactly ONE question, or with no question at all. A short, useful answer that asks nothing is a better message than a fourth version of the same request.`);
       }
     }
   }
@@ -4197,17 +4361,12 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     }
 
     if (notes.length) {
-      if (opts.regenerationNote || nepqLiveTurn) {
-        console.warn(`[ResponseGenerator] ⚠️ discipline offences ${nepqLiveTurn && !opts.regenerationNote ? '(NEPQ live, no redraft)' : 'survived regeneration'} for ${contactId} (${notes.length}) — applying deterministic rewrites`);
-        for (const fix of fixes) fix();
-        if (!validated.message.trim()) validated.message = holdingLine(leadFirstName);
-        validated.discipline_rewrites = notes.length;
-      } else {
-        console.warn(`[ResponseGenerator] ⚠️ discipline offence(s) for ${contactId}: ${notes.length} — regenerating once`);
-        const err = new Error(`discovery_discipline: ${notes.length} offence(s)`);
-        err.regenerationNote = notes.join('\n\n');
-        throw err;
-      }
+      // Part 6: the deterministic rewrites run on the first draft.
+      console.warn(`[ResponseGenerator] ⚠️ discipline offences for ${contactId} (${notes.length}) — applying deterministic rewrites`);
+      for (const fix of fixes) fix();
+      if (!validated.message.trim()) validated.message = holdingLine(leadFirstName);
+      validated.discipline_rewrites = notes.length;
+      draftPatch('discipline', notes.join('\n\n'));
     }
 
     // Fix 3, step 3b — the named person was refused twice. A human sorts the
@@ -4269,7 +4428,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       // A held time the spouse cannot make: two other real times, as in chat.
       const held = nepqPlan.step === 'collect' && nepqPlan.held_slot?.text ? (offeredSlots(nepqPlan.held_slot.text, fullSlotsForPick)[0] || null) : null;
       const others = held && parseDecisionMakers(triggerMessage) === 'conflict' ? spreadOffer(fullSlotsForPick.filter(x => x.iso !== held.iso && Date.parse(x.iso) >= Date.now() + 4 * 3600_000), 2, { timezone: promptTimezoneFor(context) }) : [];
-      if (others.length === 2) {
+      if (others.length === 2 && !bookingFacts) {
         validated.message = `No problem, let's find a time when you can both be there. ${NEPQ_LINES.offer_slots(others.map(x => ({ ...x, tz: x.tz || tzLabel(promptTimezoneFor(context)) })), nepqPlan.counters?.slot_offers || 0)}`;
         validated.companion_action = null;
         validated.nepq_plan.dm_conflict = true;
@@ -4285,7 +4444,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
         let pinned = null;
         if (nepqPlan.required_move === 'confirm') pinned = pickSlot(triggerMessage, offeredSlots(nepqPlan.last_offer || '', fullSlotsForPick));
         else if (nepqPlan.step === 'collect' && nepqPlan.held_slot?.text) pinned = offeredSlots(nepqPlan.held_slot.text, fullSlotsForPick)[0] || null;
-        if (pinned) {
+        if (pinned && !bookingFacts) {
           const gateMissing = (kbPack?.booking_context?.requires_in_home_gate === true && bookingGate && !bookingGate.ok) ? (bookingGate.missing || []) : [];
           if (nepqPlan.required_move === 'confirm' && gateMissing.length) {
             const next = resolveNextMissing(gateMissing) || gateMissing[0];
@@ -4316,15 +4475,11 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   if (serviceAreaTurn?.coverage) {
     const cov = guardCoverageDraft(validated.message, serviceAreaTurn.coverage);
     if (cov.notes.length) {
-      if (opts.regenerationNote) {
-        console.warn(`[ResponseGenerator] ⚠️ service-area answer survived regeneration for ${contactId} (${serviceAreaTurn.coverage.status}) — using the deterministic sentence`);
-        validated.message = cov.fixed;
-        if (serviceAreaTurn.coverage.status === 'out' || serviceAreaTurn.coverage.status === 'ask_zip') validated.companion_action = null;
-      } else {
-        const err = new Error(`service_area: ${serviceAreaTurn.coverage.status}`);
-        err.regenerationNote = cov.notes.join('\n\n');
-        throw err;
-      }
+      // Part 6: the deterministic sentence on the first draft.
+      console.warn(`[ResponseGenerator] ⚠️ service-area answer for ${contactId} (${serviceAreaTurn.coverage.status}) — using the deterministic sentence`);
+      validated.message = cov.fixed;
+      if (serviceAreaTurn.coverage.status === 'out' || serviceAreaTurn.coverage.status === 'ask_zip') validated.companion_action = null;
+      draftPatch('service_area', cov.notes.join('\n\n'));
     }
   }
 
@@ -4342,7 +4497,14 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // silently dropped either way.
   if (channel === 'sms') {
     const risks = carrierRisks(validated.message);
-    if (risks.length) {
+    // Part 6: the sentence carrying the term goes when something is left;
+    // only a draft that IS the term is redrafted.
+    const riskFree = risks.length ? stripSentences(validated.message, s => carrierRisks(s).length > 0) : '';
+    if (risks.length && riskFree.trim()) {
+      console.warn(`[ResponseGenerator] carrier-risk sentence dropped for ${contactId}: ${risks.join(', ')}`);
+      validated.message = riskFree;
+      draftPatch('carrier_risk', carrierRiskNote(risks));
+    } else if (risks.length) {
       if (opts.regenerationNote) {
         console.error(`[ResponseGenerator] \u26d4 carrier-risk survived regeneration for ${contactId}: ${risks.join(', ')} — sending anyway, delivery may be blocked`);
       } else {
@@ -4378,8 +4540,13 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     if (!canPromiseImmediateCall(nowMs)) {
       const promises = findImmediateCallPromises(validated.message);
       if (promises.length) {
-        console.error(`[ResponseGenerator] ⛔ immediate call promise while the phone room is closed for ${contactId}: ${promises.join(', ')}`);
-        throw new Error(`immediate_call_promise_while_closed: ${promises.join(', ')}`);
+        // Part 6: rewritten, not thrown. Outside team hours enforceCallTiming
+        // names the next opening; inside them (the phone room closed early)
+        // the immediacy goes ("soon").
+        const timed = enforceCallTiming(validated.message, nowMs);
+        validated.message = findImmediateCallPromises(timed.text).length ? softenCallTiming(timed.text) : timed.text;
+        console.warn(`[ResponseGenerator] immediate call promise while the phone room is closed for ${contactId}: ${promises.join(', ')} — rewritten`);
+        draftPatch('immediate_call', `Your previous draft promised a call right away (${promises.join(', ')}) while the phone room is closed. Do not promise when a call will happen.`);
       }
     }
   }
@@ -4394,10 +4561,28 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   if (opts.recommendedAction === 'escalate_to_rep') {
     const promises = findTimelinePromises(validated.message);
     if (promises.length) {
-      console.error(`[ResponseGenerator] ⛔ timeline promise in escalation acknowledgment for ${contactId}: ${promises.join(', ')}`);
-      throw new Error(`timeline_promise_in_acknowledgment: ${promises.join(', ')}`);
+      // Part 6: the deadline phrase goes; the acknowledgment stays.
+      let cut = validated.message;
+      for (const p of promises) cut = cut.replace(p, '');
+      validated.message = cut.replace(/\s+([.,!?])/g, '$1').replace(/\s{2,}/g, ' ').trim();
+      console.warn(`[ResponseGenerator] timeline promise in escalation acknowledgment for ${contactId}: ${promises.join(', ')} — removed`);
+      draftPatch('timeline_promise', `Your previous draft promised when a person would respond (${promises.join(', ')}). Acknowledge without any timeline.`);
     }
   }
+
+  // ─── Patch budget (Part 6, 2026-10-02) ───
+  // One fix on a first draft ships the fixed draft. Two or more and the
+  // stacked patches read badly: ONE writer-only re-write instead (the send
+  // handler's next attempt reuses everything prepared for this turn, so it is
+  // a single model call), with every note. A re-write ships as patched.
+  const budget = decidePatchBudget(draftPatches, { regenerating: !!opts.regenerationNote, replaced: nepqDraftReplaced });
+  if (budget.rewrite) {
+    console.warn(`[ResponseGenerator] ${draftPatches.length} patches on the first draft for ${contactId} (${draftPatches.map(p => p.tag).join(',')}) — one re-write`);
+    const err = new Error(`draft_patches: ${draftPatches.map(p => p.tag).join(',')}`);
+    err.regenerationNote = budget.note;
+    throw err;
+  }
+  if (draftPatches.length) validated.draft_patches = draftPatches.map(p => p.tag);
 
   const mergeTagInMessage = BARE_MERGE_TAG_RX.test(validated.message);
   const availSummary = availability
@@ -4436,6 +4621,9 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // We enforce all three here from the resolver result.
   if (validated.companion_action?.action_type === 'book_appointment') {
     const cap = validated.companion_action.action_payload || {};
+    // For the re-check right before booking (send handler, slot-recheck.js).
+    validated.slot_timezone = promptTimezoneFor(context);
+    validated.slot_tz_label = tzLabel(promptTimezoneFor(context));
 
     // (a) authoritative calendar id — decoupled from bookingResolution so this
     //     fires even when the resolver was skipped (e.g. an ack/status turn that

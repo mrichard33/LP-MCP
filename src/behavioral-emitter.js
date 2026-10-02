@@ -212,7 +212,7 @@
  *   FIX: In-process Map-based debounce. Each substantive reply joins
  *   a buffer keyed on contactId; the buffer's timer is reset on every
  *   new message; when the timer expires (REPLY_DEBOUNCE_MS, default
- *   35s) the buffered messages are combined with newlines and the
+ *   15s since 2026-10-02, was 35s) the buffered messages are combined with newlines and the
  *   combined text is passed to the agentic pipeline as a single
  *   analyzer call. Each individual message is still emitted into
  *   system_events for audit, and those event rows are marked processed
@@ -347,7 +347,11 @@ function normalizeSubtype(s) {
 const SELF_BASE_URL = `http://localhost:${process.env.PORT || 8080}`;
 
 // v2.7 — Reply buffer config and state
-const REPLY_DEBOUNCE_MS = parseInt(process.env.REPLY_DEBOUNCE_MS || '35000', 10);
+// 2026-10-02 (Mark: the text bot is slow): 35s of every ~100s reply was this
+// wait. A message that lands after the buffer fires no longer gets its own
+// reply on top (burst-yield.js drops the older draft), so 15s is enough to
+// gather a burst.
+const REPLY_DEBOUNCE_MS = parseInt(process.env.REPLY_DEBOUNCE_MS || '15000', 10);
 // v2.12 — On analyze failure, retry the pipeline in-process a bounded number of
 // times before giving up and leaving the source events unprocessed (so the
 // decision-engine processing cycle re-runs them). Prevents a transient analyzer
@@ -363,7 +367,7 @@ const replyBuffers = new Map();
  * Runs after GHL webhook response is already sent. Uses internal HTTP
  * calls to reuse existing endpoint logic without circular imports.
  *
- * Timeline: the reply buffer waits REPLY_DEBOUNCE_MS (35s default) for a
+ * Timeline: the reply buffer waits REPLY_DEBOUNCE_MS (15s default, 35s before 2026-10-02) for a
  * burst to finish first; measured 2026-10-02, a reply took ~90s median end to
  * end (analysis ~35s, generation ~31s on a thinking model).
  */
@@ -609,7 +613,7 @@ function scheduleBufferedPipeline(contactId, trimmed, emittedEventId, messageTyp
 /**
  * 2026-10-01 (Dan H., bMidLh3nDpWadrf7X8bG) — fire every pending reply buffer
  * NOW. A message that lands seconds before a deploy otherwise waits in an
- * in-memory reply-buffer timer (REPLY_DEBOUNCE_MS, 35s) that dies with the process, and the customer waits for
+ * in-memory reply-buffer timer (REPLY_DEBOUNCE_MS, 15s) that dies with the process, and the customer waits for
  * the ~5-minute decision-engine backstop instead. Run from the graceful
  * shutdown 'start' hook, so the reply is analysed and sent inside the drain.
  * Returns how many buffers it fired.
