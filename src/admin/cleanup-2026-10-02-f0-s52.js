@@ -10,8 +10,8 @@
 //      LP LIVE + cache) → removed from F.0 and the active-f.0 tag removed.
 //   b) S5.2 — every active-s5.2 / active-w5.2 contact the entry gate would
 //      refuse (demo on any lead, live appointment, current lead Issue, current
-//      lead No Demo/ND/NOC, or a canvassing contact tagged rebook-reason:cancelled
-//      or appt-cancelled) → removed from both S5.2 workflows and the tags
+//      lead No Demo/ND/NOC, or an ACTIVE canvassing entry — cancel or no-show,
+//      user ruling 2026-10-02) → removed from both S5.2 workflows and the tags
 //      active-s5.2, active-w5.2, s52-task-created removed. A contact in S5.2 for
 //      a pre-demo worry (APPOINTMENT_FRICTION other than ghost) is left alone:
 //      it belongs there with a live appointment.
@@ -27,7 +27,7 @@ import { contactHadDemo } from '../demo-truth.js';
 import { lpStoredToUtcMs } from '../lp-dates.js';
 import { flagF0Contact, F0_ACTIVE_TAG } from '../jobs/f0-integrity-audit.js';
 import {
-  evaluateS52Entry, isGatedState, loadS52GateInputs, S52_WORKFLOW_IDS, S52_TAGS, CANVASSING_TAGS,
+  evaluateS52Entry, isGatedState, loadS52GateInputs, S52_WORKFLOW_IDS, S52_TAGS,
 } from '../s52-entry-gate.js';
 
 export const CLEANUP_EVENT = 'cleanup.2026-10-02';
@@ -35,28 +35,23 @@ export const F0_WORKFLOW_ID = '15f47572-9ffc-453d-995d-a1890441f290';
 export const F0_WEBHOOK_URL = 'https://services.leadconnectorhq.com/hooks/SsBG7j5KQAIP1SFP2Sca/webhook-trigger/4e3a9178-6f67-4889-b3bb-02cc35aca17d';
 export const GABY_CONTACT_ID = 'zPSEN55i7yCjbjlnSoKu';
 export const GABY_LEAD_ID = '579452';
-const CANCEL_TAGS = ['rebook-reason:cancelled', 'appt-cancelled'];
 const GHL_MIN_INTERVAL_MS = 200; // ≤ 5 GHL calls a second
 const CHUNK = 200;
 
 const lower = (tags) => (tags || []).map((t) => String(t).trim().toLowerCase());
 
 /**
- * Pure. Should this S5.2 contact come out? Mirrors the gate, except that a
- * canvassing contact comes out only when it is a CANCEL (the handoff's group b).
+ * Pure. Should this S5.2 contact come out? Mirrors the gate exactly; a
+ * pre-demo friction contact is the one exception (it is kept).
  * @returns {{ remove: boolean, reason: string }}
  */
 export function planS52Contact({ leads, tags, stateCode, nowMs = Date.now() }) {
   if (stateCode && !isGatedState(stateCode)) return { remove: false, reason: 'friction_state_kept' };
   const verdict = evaluateS52Entry({ leads, tags, nowMs });
   if (verdict.allow) return { remove: false, reason: 'passes_gate' };
-  if (verdict.reason === 'canvassing') {
-    const t = lower(tags);
-    if (CANCEL_TAGS.some((c) => t.includes(c))) return { remove: true, reason: 'canvassing_cancel' };
-    // Not a cancel: judge it on everything else the gate checks.
-    const rest = evaluateS52Entry({ leads, tags: (tags || []).filter((x) => !CANVASSING_TAGS.includes(String(x).trim().toLowerCase())), nowMs });
-    return rest.allow ? { remove: false, reason: 'canvassing_not_cancel_kept' } : { remove: true, reason: rest.reason };
-  }
+  // 2026-10-02 (user ruling): an ACTIVE canvassing entry comes out whether it
+  // is a cancel or a no-show; older canvassing markers alone do not (the gate's
+  // CANVASSING_TAGS is active-entry:canvassing only).
   return { remove: true, reason: verdict.reason };
 }
 

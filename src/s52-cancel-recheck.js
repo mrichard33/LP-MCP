@@ -98,6 +98,16 @@ export async function queueS52CancelRecheck(event, ruleKey, deps = {}) {
 }
 
 /**
+ * Pure. A cancel rule dropped by its dedup GROUP because a DIFFERENT rule fired
+ * inside the window (LP_DISP_SET minutes before LP_DISP_CANCEL_COLD_TO_S5_2)
+ * gets the re-check. An exact repeat of the same rule does not.
+ * `dup` is hasDuplicatePendingActions' result: { blockedBy, group } or false.
+ */
+export function shouldRecheckOnDedup(ruleKey, dup) {
+  return !!(dup && dup.group && dup.blockedBy && dup.blockedBy !== ruleKey && RECHECK_RULE_KEYS.includes(ruleKey));
+}
+
+/**
  * Pure: should the cancel go ahead now?
  * @returns {{ run: boolean, reason: string }}
  */

@@ -224,7 +224,7 @@ import { emitEvent } from './event-emitter.js';
 // escalation/objection/callback rules can opt out while a booking is in flight.
 import { isInHomeCalendarId } from './knowledge/booking-calendar-router.js';
 import { isRescheduleInflight } from './services/reschedule-inflight.js';
-import { queueS52CancelRecheck, RECHECK_RULE_KEYS } from './s52-cancel-recheck.js';
+import { queueS52CancelRecheck, RECHECK_RULE_KEYS, shouldRecheckOnDedup } from './s52-cancel-recheck.js';
 import { planRuleActions } from './alert-noise.js';
 import { findBlockingLiveLead, blockingReason } from './duplicate-lead-guard.js';
 // 2026-08-03 — one rank scale, shared with the contact-scoped appointment
@@ -619,7 +619,9 @@ async function hasDuplicatePendingActions(ruleKey, targetId) {
       } else {
         console.log(`[Dedup] BLOCKED ${ruleKey} for ${targetId}: already has actions in ${DEDUP_WINDOW_MINUTES}min window`);
       }
-      return true;
+      // 2026-10-02 — truthy as before; says WHICH rule blocked, so a cancel
+      // blocked by a different rule in its group can be re-checked, not dropped.
+      return { blockedBy: existingRule, group: !!policy.group };
     }
     return false;
   } catch (err) {
@@ -2079,8 +2081,18 @@ async function shouldRequireApproval(rule /*, event */) {
 
 async function createActionsFromRule(event, rule) {
   const targetId = event.ghl_contact_id || event.entity_id || '';
-  if (await hasDuplicatePendingActions(rule.rule_key, targetId)) {
+  const dup = await hasDuplicatePendingActions(rule.rule_key, targetId);
+  if (dup) {
     console.log(`[DecisionEngine] Dedup: skipping ${rule.rule_key} for ${targetId}`);
+    // 2026-10-02 (Antonino Paone, Mike Plant) — a cancel minutes after the
+    // booking was dropped because LP_DISP_SET had fired inside the LP_DISP_%
+    // 30-minute group window, so a real no-demo cancel never reached S5.2.
+    // Suppress, don't drop: one re-check in 30 minutes, after the Set has left
+    // the window. An exact repeat of the same rule is still just dropped.
+    if (shouldRecheckOnDedup(rule.rule_key, dup) && !isSyntheticEvent(event)) {
+      queueS52CancelRecheck(event, rule.rule_key).catch((err) =>
+        console.warn(`[DecisionEngine] cancel re-check queue failed: ${err.message}`));
+    }
     return [];
   }
 

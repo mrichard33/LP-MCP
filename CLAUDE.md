@@ -436,12 +436,15 @@ intent to the nin list is therefore safe; removing the fallback is not. Audit:
 **Every cancel / no-show S5.2 entry passes ONE gate (Mark, 2026-10-02).** `src/s52-entry-gate.js` runs at
 the top of `executeAddToWorkflow` for either S5.2 workflow when the row's `state_code` is
 `APPOINTMENT_DISRUPTION.*` or `APPOINTMENT_FRICTION.ghost_after_booking` (pre-demo friction states need a live
-appointment and pass untouched). It refuses canvassing, a demo on ANY lead, a live appointment on any lead
+appointment and pass untouched). It refuses an ACTIVE canvassing entry (`active-entry:canvassing` only — older
+`entry:canvassing` / `source:canvass` markers do not block, user 2026-10-02), a demo on ANY lead, a live appointment on any lead
 (Set/Cnf/Verif/Issue dated today or later ET), current-lead Issue and current-lead No Demo/ND/NOC, reading LP
 LIVE (every prospect by lead, prospect id and phone) merged with `lp_leads`. A failed read blocks. A block is a
 `skipped` row plus `s52.entry_blocked` (no Slack). Do not add a per-rule S5.2 guard instead of using it.
 A cancel rule (271/171/107) suppressed by `not_reschedule_inflight` gets ONE `s52_cancel_recheck` 30 minutes
-later (`src/s52-cancel-recheck.js`) — unless a sibling cancel rule already routed it.
+later (`src/s52-cancel-recheck.js`) — unless a sibling cancel rule already routed it. The same re-check runs when
+271 is dropped by the `LP_DISP_%` 30-minute group dedup because LP_DISP_SET fired just before (a cancel minutes
+after booking — Antonino Paone and Mike Plant, 2026-10-02).
 
 ## The FAQ corpus (`kb_faqs`)
 
