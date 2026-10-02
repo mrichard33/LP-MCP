@@ -350,7 +350,7 @@ async function offerBookingSlots({ contact, preferredText = null }) {
  * missing address, decision-makers not confirmed) returns, it does not throw,
  * and the visitor must never hear "you're set" for it.
  */
-async function bookSlot({ contactId, startIso, calendarId, decisionMakers = null }) {
+async function bookSlot({ contactId, startIso, calendarId, decisionMakers = null, address = null }) {
   if (!supabase) return { ok: false, error: 'supabase client not configured' };
   const { data, error } = await supabase.from('agent_actions').insert({
     action_type: 'book_appointment', target_system: 'ghl', target_entity: 'contact', target_id: contactId,
@@ -361,6 +361,8 @@ async function bookSlot({ contactId, startIso, calendarId, decisionMakers = null
       // The visitor's answer to "will anyone else be part of the decision?"
       // satisfies the in-home gate's decision-maker check (2026-10-02).
       ...(decisionMakers ? { qualifying_data: { decision_makers_present: decisionMakers } } : {}),
+      // 2026-10-02 (Mark): the visit address on the appointment itself.
+      ...(address ? { address } : {}),
     },
   }).select('id').single();
   if (error || data?.id == null) return { ok: false, error: error?.message || 'insert returned no id' };

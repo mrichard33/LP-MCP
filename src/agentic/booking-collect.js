@@ -61,7 +61,8 @@ export function slotLabel(slot, tz) {
 }
 
 const HOLD_RX = /\bI'm holding (.+?) for you\./i;
-const ASK_KEYS = [...Object.entries(COLLECT_ASK), ...Object.entries(COLLECT_ASK_AGAIN), ['dm', ' be able to be there then?']];
+const ADDRESS_CONFIRM_LEAD = 'Is the visit at ';
+const ASK_KEYS = [...Object.entries(COLLECT_ASK), ...Object.entries(COLLECT_ASK_AGAIN), ['dm', ' be able to be there then?'], ['address_confirm', ADDRESS_CONFIRM_LEAD]];
 
 /**
  * The time we are holding, and which detail we asked for last, from the
@@ -89,13 +90,61 @@ export function heldSlot(thread = []) {
 }
 
 /** What the gate still needs, in the order we ask for it. Pure. */
-export function missingItems({ hasName = false, hasPhone = false, hasAddress = false, dmKnown = false, channel = 'livechat' } = {}) {
+export function missingItems({ hasName = false, hasPhone = false, hasAddress = false, confirmAddress = false, dmKnown = false, channel = 'livechat' } = {}) {
   const out = [];
   if (!hasName) out.push('name');
   if (!hasPhone && channel === 'livechat') out.push('phone');
   if (!hasAddress) out.push('address');
+  else if (confirmAddress) out.push('address_confirm');
   if (!dmKnown) out.push('dm');
   return out;
+}
+
+// 2026-10-02 (Mark's 5:22 PM chat): the visitor's chat merged into an older
+// contact that already had an address, so the visit was booked on it without
+// a word. A merged or old record can be stale. An address the visitor did not
+// type in this chat is read back once: "Is the visit at 12 Main St, Ocala?"
+const ADDRESS_NO_RX = /^\s*(?:no|nope|nah|not\s+(?:that|there|quite|anymore|any\s*more)|wrong|different|that'?s\s+(?:old|wrong)|we\s+moved|i\s+moved)\b/i;
+
+/** "Is the visit at 12 Main St, Ocala?" for an on-file address. Pure. */
+export function addressConfirmAsk(contact = {}) {
+  const street = String(contact.address1 || '').trim();
+  const city = String(contact.city || '').trim();
+  return `${ADDRESS_CONFIRM_LEAD}${street}${city ? `, ${city}` : ''}?`;
+}
+
+/**
+ * Where the read-back stands in this chat: 'unasked', 'confirmed' (any reply
+ * that is not a no), 'rejected' (a no with no new address) or 'pending' (asked,
+ * no reply yet). `turns` is the thread with this message last. Pure.
+ */
+export function addressConfirmState(turns = []) {
+  const list = Array.isArray(turns) ? turns : [];
+  let i = -1;
+  for (let k = list.length - 1; k >= 0; k--) {
+    if (list[k].direction === 'outbound' && String(list[k].text || '').includes(ADDRESS_CONFIRM_LEAD)) { i = k; break; }
+  }
+  if (i < 0) return 'unasked';
+  const reply = list.slice(i + 1).find(m => m.direction !== 'outbound');
+  if (!reply) return 'pending';
+  return ADDRESS_NO_RX.test(String(reply.text || '')) ? 'rejected' : 'confirmed';
+}
+
+/**
+ * The decision-maker answer given in this chat (to our question), or null.
+ * An unclear answer is 'Uncertain' (asked once, never asked again). Pure.
+ */
+export function dmAnswerFromThread(turns = []) {
+  const list = Array.isArray(turns) ? turns : [];
+  const isDmAsk = (t) => [COLLECT_ASK.dm, COLLECT_ASK_AGAIN.dm, ' be able to be there then?'].some(q => String(t || '').includes(q));
+  for (let k = list.length - 1; k >= 0; k--) {
+    if (list[k].direction !== 'outbound' || !isDmAsk(list[k].text)) continue;
+    const reply = list.slice(k + 1).find(m => m.direction !== 'outbound');
+    if (!reply) return null;
+    const dm = parseDecisionMakers(reply.text);
+    return dm === 'conflict' ? 'conflict' : (dm || 'Uncertain');
+  }
+  return null;
 }
 
 const SPOUSE = String.raw`(?:wife|husband|spouse|partner|fianc[eé]e?|boyfriend|girlfriend|mom|mother|dad|father|son|daughter|they|he|she)`;

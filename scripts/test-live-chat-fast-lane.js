@@ -879,14 +879,48 @@ test('NEPQ live: "let me think about it" gets two REAL times, no model call', as
 });
 
 // A contact with everything the in-home gate needs (address, decision-maker answer).
-const READY_CONTACT = { address1: '123 Main St', postalCode: '33601', tags: ['booking:dm-asked'] };
+const READY_CONTACT = { address1: '123 Main St', city: 'Tampa', state: 'FL', postalCode: '33601', tags: ['booking:dm-asked'] };
 
-test('NEPQ live: a picked time with nothing missing is booked, and they hear they are all set', async () => {
+// 2026-10-02 (Mark's 5:22 PM chat): an address already on the contact (a
+// merged or older record) is read back once before the booking.
+test('NEPQ live: an on-file address is read back once, then the visit is booked with it', async () => {
   const offer = "No problem at all. Want to grab a time now so you don't have to chase us down later? I have Tue, Oct 6 at 10:00 AM ET or Wed, Oct 7 at 2:00 PM ET.";
-  const { lane, state } = nepqLane({ contact: READY_CONTACT, messages: [M('inbound', 'let me think about it', 3), M('outbound', offer, 2)] });
-  await lane.processInbound(INBOUND('wednesday works'));
-  assert.deepEqual(state.bookings, [{ contactId: 'C1', startIso: '2026-10-07T18:00:00Z', calendarId: 'CALWE', decisionMakers: null }]);
-  assert.equal(state.sends[0].message, "You're all set for Wed, Oct 7 at 2:00 PM ET, Alyce. Our team will reach out to confirm the details.");
+  const one = nepqLane({ contact: READY_CONTACT, messages: [M('inbound', 'let me think about it', 3), M('outbound', offer, 2)] });
+  await one.lane.processInbound(INBOUND('wednesday works'));
+  assert.equal(one.state.bookings, undefined);
+  const hold = one.state.sends[0].message;
+  assert.equal(hold, "Great, I'm holding Wed, Oct 7 at 2:00 PM ET for you. Is the visit at 123 Main St, Tampa?");
+  const two = nepqLane({ contact: READY_CONTACT, messages: [M('inbound', 'let me think about it', 4), M('outbound', offer, 3), M('inbound', 'wednesday works', 2), M('outbound', hold, 1)] });
+  await two.lane.processInbound(INBOUND('yes'));
+  assert.deepEqual(two.state.bookings, [{ contactId: 'C1', startIso: '2026-10-07T18:00:00Z', calendarId: 'CALWE', decisionMakers: null, address: '123 Main St, Tampa, FL 33601' }]);
+  assert.equal(two.state.sends[0].message, "You're all set for Wed, Oct 7 at 2:00 PM ET, Alyce. Our team will reach out to confirm the details.");
+});
+
+test('NEPQ live: a "no" to the on-file address asks for it, and the typed one goes on the booking', async () => {
+  const offer = 'I have Tue, Oct 6 at 10:00 AM ET or Wed, Oct 7 at 2:00 PM ET. Which works better?';
+  const hold = "Great, I'm holding Tue, Oct 6 at 10:00 AM ET for you. Is the visit at 123 Main St, Tampa?";
+  const t = [M('outbound', offer, 5), M('inbound', 'the first one', 4), M('outbound', hold, 3)];
+  const a = nepqLane({ contact: READY_CONTACT, messages: t });
+  await a.lane.processInbound(INBOUND('no, we moved'));
+  assert.match(a.state.sends[0].message, /street address for the visit/);
+  const b = nepqLane({ contact: READY_CONTACT, messages: [...t, M('inbound', 'no, we moved', 2), M('outbound', a.state.sends[0].message, 1)] });
+  await b.lane.processInbound(INBOUND('45 Oak Ave, Ocala FL 34471'));
+  assert.equal(b.state.bookings[0].address, '45 Oak Ave, Ocala, FL 34471');
+});
+
+// 2026-10-02 (Mark's 5:22 PM chat): "I will need to check with my wife" and
+// the old record's decision-maker answer skipped the question.
+test('NEPQ live: a wife mentioned in this chat is asked about once, and the answer rides on the booking', async () => {
+  const offer = 'I have Tue, Oct 6 at 10:00 AM ET or Wed, Oct 7 at 2:00 PM ET. Which works better?';
+  const t = [M('inbound', 'I will need to check with my wife', 6), M('outbound', offer, 5)];
+  const contact = { ...READY_CONTACT };
+  const confirmed = "Great, I'm holding Tue, Oct 6 at 10:00 AM ET for you. Is the visit at 123 Main St, Tampa?";
+  const a = nepqLane({ contact, messages: [...t, M('inbound', 'the first one', 4), M('outbound', confirmed, 3)] });
+  await a.lane.processInbound(INBOUND('yes'));
+  assert.match(a.state.sends[0].message, /Will your wife be able to be there then\?$/);
+  const b = nepqLane({ contact, messages: [...t, M('inbound', 'the first one', 4), M('outbound', confirmed, 3), M('inbound', 'yes', 2), M('outbound', a.state.sends[0].message, 1)] });
+  await b.lane.processInbound(INBOUND('not sure yet'));
+  assert.equal(b.state.bookings[0].decisionMakers, 'Uncertain');
 });
 
 test('NEPQ live (Mark, 2026-10-02): a pick with the address missing is held, the address and decision-maker asked, then booked', async () => {
@@ -906,7 +940,7 @@ test('NEPQ live (Mark, 2026-10-02): a pick with the address missing is held, the
   // 3. "Just me": booked on the held time with Solo Owner.
   const three = nepqLane({ contact: { address1: '123 Main St', postalCode: '33601' }, messages: [M('outbound', offer, 4), M('inbound', 'the first one', 3), M('outbound', hold, 2), M('inbound', '123 Main St, Tampa FL 33601', 1), M('outbound', dmAsk, 0.5)] });
   await three.lane.processInbound(INBOUND('just me'));
-  assert.deepEqual(three.state.bookings, [{ contactId: 'C1', startIso: '2026-10-06T14:00:00Z', calendarId: 'CALWE', decisionMakers: 'Solo Owner' }]);
+  assert.deepEqual(three.state.bookings, [{ contactId: 'C1', startIso: '2026-10-06T14:00:00Z', calendarId: 'CALWE', decisionMakers: 'Solo Owner', address: '123 Main St, Tampa, FL 33601' }]);
   assert.match(three.state.sends[0].message, /^You're all set for Tue, Oct 6 at 10:00 AM ET, Alyce\. Our team will reach out to confirm the details\.$/);
 });
 
@@ -937,7 +971,7 @@ test('NEPQ live: a guest who types their name, phone, address and "just me" is b
   assert.match(c.state.sends[0].message, /anyone else be part of the decision/);
   const t4 = [...t3, M('inbound', '12 Main St, Ocala FL 34470', 2), M('outbound', c.state.sends[0].message, 1)];
   const e = lane(t4); await e.lane.processInbound(INBOUND('No, just me'));
-  assert.deepEqual(e.state.bookings, [{ contactId: 'C1', startIso: '2026-10-06T14:00:00Z', calendarId: 'CALWE', decisionMakers: 'Solo Owner' }]);
+  assert.deepEqual(e.state.bookings, [{ contactId: 'C1', startIso: '2026-10-06T14:00:00Z', calendarId: 'CALWE', decisionMakers: 'Solo Owner', address: '12 Main St, Ocala, FL 34470' }]);
   assert.equal(e.state.sends[0].message, "You're all set for Tue, Oct 6 at 10:00 AM ET, Mark. Our team will reach out to confirm the details.");
 });
 
@@ -981,8 +1015,9 @@ test('a yes to the bridge with no times in hand asks the day, never the bridge a
 
 test('NEPQ live: GHL refusing a complete booking is the only hand-off, and nothing sounds final', async () => {
   const offer = 'I have Tue, Oct 6 at 10:00 AM ET or Wed, Oct 7 at 2:00 PM ET. Which works better?';
-  const { lane, state } = nepqLane({ bookOk: false, contact: READY_CONTACT, messages: [M('outbound', offer, 2)] });
-  await lane.processInbound(INBOUND('the first one'));
+  const hold = "Great, I'm holding Tue, Oct 6 at 10:00 AM ET for you. Is the visit at 123 Main St, Tampa?";
+  const { lane, state } = nepqLane({ bookOk: false, contact: READY_CONTACT, messages: [M('outbound', offer, 4), M('inbound', 'the first one', 3), M('outbound', hold, 2)] });
+  await lane.processInbound(INBOUND('yes'));
   assert.equal(state.sends[0].message, 'Got it, Tue, Oct 6 at 10:00 AM ET. A team member will reach out to confirm the details.');
   await new Promise(r => setImmediate(r));
   assert.equal(state.handoffs[0].reason, 'booking_request');
