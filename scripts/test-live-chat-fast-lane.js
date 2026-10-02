@@ -744,9 +744,11 @@ test('picking "Wednesday" moves it in GHL, says so, and posts a RESCHEDULED card
   const { lane, state } = laneWithCancel([...UP_TO_OFFER, TZ('inbound', 'yes', 70), TZ('outbound', offerLine, 80), TZ('inbound', 'wednesday works', 100)], { freeSlots: SLOTS });
   await lane.processInbound(INBOUND('wednesday works'));
   assert.deepEqual(state.moves, [{ contactId: 'RICK1', oldAppointmentId: 'APPT9', calendarId: 'CAL1', startIso: '2026-10-07T18:00:00Z' }]);
-  assert.equal(state.sends[0].message, "Done. You're now set for Wed, Oct 7 at 2:00 PM ET, and your old time is cancelled. See you then.");
+  assert.equal(state.sends[0].message, "Done. You're now set for Wed, Oct 7 at 2:00 PM ET instead. Our team will call to go over the details.");
   await new Promise(r => setImmediate(r));
-  assert.match(state.cards[0].text, /LIVE CHAT RESCHEDULED — move it in LP/);
+  assert.match(state.cards[0].text, /LIVE CHAT RESCHEDULED — change the time in LP to Wed, Oct 7 at 2:00 PM/);
+  assert.match(state.cards[0].text, /same appointment was moved/);
+  assert.match(state.cards[0].text, /no LP lead was created/);
   assert.match(state.cards[0].text, /moved the appointment on Thu, Oct 2, 6:00 PM ET to Wed, Oct 7 at 2:00 PM ET/);
   assert.equal(state.cancels, undefined, 'a reschedule is not a cancel');
 });

@@ -205,7 +205,7 @@ export function pickSlot(text, offered) {
 }
 
 export function movedLine(slot, tzLabelText = 'ET') {
-  return `Done. ${MOVED_MARK} ${slotText(slot)} ${tzLabelText}, and your old time is cancelled. See you then.`;
+  return `Done. ${MOVED_MARK} ${slotText(slot)} ${tzLabelText} instead. Our team will call to go over the details.`;
 }
 
 export function rescheduleLine(phone) {
@@ -213,8 +213,8 @@ export function rescheduleLine(phone) {
 }
 
 /**
- * The sales-channel card. LP has no cancel API (Mark, 2026-10-02), so every
- * outcome tells a person what to do in LP. Plain English, first name, no
+ * The #dispatch card. LP has no cancel or move API here (Mark, 2026-10-02),
+ * so every outcome tells a person what to do in LP. Plain English, first name, no
  * pronouns (CLAUDE.md). Pure.
  */
 export function formatCancelCard({ kind, name, phone, apptHuman, newTimeHuman, ghlCancelled, visitorWords, contactUrl, marketNote }) {
@@ -222,9 +222,9 @@ export function formatCancelCard({ kind, name, phone, apptHuman, newTimeHuman, g
   const appt = apptHuman ? `the appointment on ${apptHuman}` : 'an appointment (not matched, see below)';
   const lines = {
     rescheduled: [
-      '📅 LIVE CHAT RESCHEDULED — move it in LP',
+      `📅 LIVE CHAT RESCHEDULED — change the time in LP to ${newTimeHuman}`,
       `${who} moved ${appt} to ${newTimeHuman}.`,
-      'GHL: ✅ new time booked and the old one cancelled by the bot. → Move it in LP.',
+      'GHL: ✅ the same appointment was moved to the new time (no new booking). LP was NOT changed and no LP lead was created. → Change the appointment time in LP.',
     ],
     reschedule: [
       '📅 LIVE CHAT RESCHEDULE — call to set a new time',

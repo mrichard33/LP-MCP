@@ -276,6 +276,11 @@ test('every action the sync modules can RETURN is enumerated in classifyHealResu
     // src/lp-appointment-sync.js — res.json({...}) on the GHL-only calendar
     // branch, where LP SetAppointment is intentionally skipped
     'five9_direct_dispatch',
+    // src/lp-appointment-sync.js — res.json({ success: true, action:
+    // 'lp_sync_held_dispatch_reschedule', ... }) when a website-chat move is
+    // held for #dispatch (2026-10-02); the hold sits in the route, before
+    // syncAppointmentToLP is ever called
+    'lp_sync_held_dispatch_reschedule',
   ]);
 
   // Comments are stripped first. The doc comment at the top of

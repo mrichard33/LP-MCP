@@ -169,7 +169,10 @@ async function cancelAppointment({ contactId, appointmentId, reason }) {
   if (error || data?.id == null) return { ok: false, error: error?.message || 'insert returned no id' };
   const { executeActionById } = await import('../actions/index.js');
   const res = await executeActionById(data.id);
-  return { ok: res?.status === 'completed', action_id: data.id, error: res?.error || (res?.status !== 'completed' ? `status ${res?.status}` : null) };
+  // The handler RETURNS (does not throw) a failed move, so a 'completed' row
+  // is not enough: only `appointment_moved` means GHL now holds the new time.
+  const moved = res?.status === 'completed' && res?.result?.action === 'appointment_moved';
+  return { ok: moved, action_id: data.id, error: moved ? null : (res?.result?.error || res?.error || `status ${res?.status} / ${res?.result?.action || 'no result'}`) };
 }
 
 // One card per contact, kind and Eastern day, per process: a visitor who
@@ -229,9 +232,12 @@ async function offerSlots({ calendarId, contact }) {
 }
 
 /**
- * Move the appointment in GHL through the existing reschedule_appointment
- * handler (books the new time FIRST, then cancels the old one) and wait for
- * the answer: "You're now set for…" is said only when GHL confirms.
+ * Move the SAME appointment in GHL to the new time through the
+ * reschedule_appointment handler (moveAppointmentInPlace: one PUT, no new
+ * object — Mark, 2026-10-02) and wait for the answer: "You're now set for…"
+ * is said only when GHL confirms the move. `lp_sync: 'dispatch'` holds the
+ * automatic LP sync (src/services/lp-sync-hold.js) so LP is changed by a
+ * person from the #dispatch card and no new LP lead is created.
  */
 async function rescheduleAppointment({ contactId, oldAppointmentId, calendarId, startIso }) {
   if (!supabase) return { ok: false, error: 'supabase client not configured' };
@@ -239,12 +245,15 @@ async function rescheduleAppointment({ contactId, oldAppointmentId, calendarId, 
     action_type: 'reschedule_appointment', target_system: 'ghl', target_entity: 'contact', target_id: contactId,
     rule_applied: 'LIVE_CHAT_RESCHEDULE', status: 'executing', requires_approval: false, max_retries: 1,
     reasoning: 'Live chat: the visitor picked a new time from two real open slots',
-    action_payload: { old_appointment_id: oldAppointmentId, new_calendar_id: calendarId, new_start_time: startIso, source: 'live_chat' },
+    action_payload: { old_appointment_id: oldAppointmentId, new_calendar_id: calendarId, new_start_time: startIso, source: 'live_chat', lp_sync: 'dispatch' },
   }).select('id').single();
   if (error || data?.id == null) return { ok: false, error: error?.message || 'insert returned no id' };
   const { executeActionById } = await import('../actions/index.js');
   const res = await executeActionById(data.id);
-  return { ok: res?.status === 'completed', action_id: data.id, error: res?.error || (res?.status !== 'completed' ? `status ${res?.status}` : null) };
+  // The handler RETURNS (does not throw) a failed move, so a 'completed' row
+  // is not enough: only `appointment_moved` means GHL now holds the new time.
+  const moved = res?.status === 'completed' && res?.result?.action === 'appointment_moved';
+  return { ok: moved, action_id: data.id, error: moved ? null : (res?.result?.error || res?.error || `status ${res?.status} / ${res?.result?.action || 'no result'}`) };
 }
 
 export function buildProductionLane() {

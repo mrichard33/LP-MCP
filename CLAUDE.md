@@ -210,10 +210,14 @@ not sent and #ops-alerts is told. GHL's "Chat Widget" (type 5, `TYPE_WEBCHAT`) r
 `src/live-chat/cancel-flow.js`: ask for the name and phone the appointment is under, match them (phone
 AND name — never phone alone), offer another day once, then cancel in GHL through `cancel_appointment`
 and say "Done" only after GHL confirms. "Yes, another day" offers two real open slots from the
-appointment's own calendar (contact's zone) and books the pick through `reschedule_appointment` (new
-first, then the old one cancelled); "You're now set for" only after GHL confirms. Every outcome posts to
-**#dispatch** (`SLACK_CHANNEL_DISPATCH`, default C0C19GRS8FJ) through `postToSlack`, because LP has no
-cancel or move API and a person changes it there; a failed post is an #ops-alerts line. Anything
+appointment's own calendar (contact's zone) and MOVES THE SAME GHL appointment to the pick
+(`moveAppointmentInPlace`, one PUT — never a new object, Mark 2026-10-02); "You're now set for" only
+after GHL confirms. The row carries `lp_sync: 'dispatch'`, and `/webhook/ghl/set-lp-appointment` holds
+the automatic LP sync for 30 minutes on it (`src/services/lp-sync-hold.js`, fails open): A.WE's LP
+Appointment Sync would otherwise re-set LP, and enrol lead creation (a NEW LP lead) when it cannot
+resolve the lead. Same-calendar reschedules from the SMS bot move in place too. Every outcome posts to
+**#dispatch** (`SLACK_CHANNEL_DISPATCH`, default C0C19GRS8FJ) through `postToSlack`, and a person changes
+LP from that card; a failed post is an #ops-alerts line. Anything
 unmatched goes to the team; the bot never
 says "no appointment on file" to a guest it never identified. A "no" (`isDecline`, or the model's
 `recommended_action: suppress`) gets a close with no pitch, and a reply overtaken by a newer message
