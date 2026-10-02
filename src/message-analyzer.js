@@ -82,8 +82,8 @@
  *        /n8n/analyze-message over loopback HTTP (intended path).
  *     b. analyzePendingReplies polling unprocessed ghl.reply_received
  *        events (called by an external n8n cron). The buffer marks
- *        events processed AT FIRE TIME (35s after emission), so during
- *        the 35-second debounce window the event is still processed=false
+ *        events processed AT FIRE TIME (REPLY_DEBOUNCE_MS after emission, 15s since 2026-10-02), so during
+ *        the debounce window the event is still processed=false
  *        and analyzePendingReplies will pick it up if scheduled.
  *
  *   FIX: Move markAnalyzed() from the end of the function to immediately
@@ -1277,7 +1277,7 @@ export async function analyzeMessage(ghlContactId, messageText, eventId = null, 
   // them). When two callers race through analyzeMessage simultaneously
   // (e.g. behavioral-emitter's buffer-triggered /n8n/analyze-message
   // and analyzePendingReplies polling the same unprocessed event during
-  // the 35s debounce window), the first to enter wins the cache, the
+  // the reply-buffer debounce window), the first to enter wins the cache, the
   // second sees the hit and skips. See v1.8 changelog above.
   if (wasRecentlyAnalyzed(ghlContactId, messageText)) {
     console.log(`[MessageAnalyzer] Skipping ${ghlContactId} — identical message already analyzed within ${Math.round(ANALYSIS_CACHE_TTL_MS / 1000)}s (likely retry)`);

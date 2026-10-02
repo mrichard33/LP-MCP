@@ -44,13 +44,27 @@ const MOVE_TEXT = {
   confirm: () => 'This turn\'s move: they picked a time. Book it now (book_appointment) and confirm it as: "You\'re all set for [day] at [time], [first name]. Our team will reach out to confirm the details." Say "all set" only when you book it in this reply. Never "confirmed" or "see you then". Never name a rep.',
 };
 
+// 2026-10-02 Part 6 (Mark: "I want there to be AI-generated replies"): on a
+// booking turn code works out the facts (sms-booking-turn.js) and the model
+// writes the words around them. enforceBookingFacts checks the draft after.
+const FACTS_TEXT = {
+  hold: (f) => `This turn's move: they picked ${f.label}. Hold it: say "I'm holding ${f.label} for you." (a few words of thanks before it are fine), then ask exactly: "${f.ask_line}" Do not book yet, do not offer other times, do not ask for anything else.`,
+  collect: (f) => `This turn's move: we are holding ${f.label} for them and they just answered. Thank them in a few words (answer any question they asked in one short sentence), then ask exactly: "${f.ask_line}" Do not book yet, do not mention other times, do not ask for anything else.`,
+  book: (f) => `This turn's move: nothing the visit needs is missing. It is booked now for ${f.label} (the booking is added for you). Confirm it in one or two sentences that say they're all set for ${f.label}${f.first_name ? `, using their first name (${f.first_name})` : ''}, and that our team will reach out to confirm the details. No question, never "see you then", never a rep's name.`,
+  dm_conflict: (f) => (f.alternatives_text
+    ? `This turn's move: the person they named can't make ${f.label}. Say no problem, let's find a time when they can both be there, then offer exactly these two times and ask which works better: ${f.alternatives_text}.`
+    : `This turn's move: the person they named can't make ${f.label}. Say no problem, and ask what day works best when they can both be there.`),
+};
+
 function cap(w) { return String(w || '').charAt(0).toUpperCase() + String(w || '').slice(1); }
 
 /** The binding block for one plan. Pure. */
 export function renderPlanBlock(plan) {
   if (!plan) return [];
   const lines = [`\n${NEPQ_PLAN_HEADER}`];
-  if (plan.fixed_line) {
+  if (plan.booking_facts && FACTS_TEXT[plan.booking_facts.kind]) {
+    lines.push(FACTS_TEXT[plan.booking_facts.kind](plan.booking_facts));
+  } else if (plan.fixed_line) {
     lines.push(`This turn's move: ${plan.required_move.replace(/_/g, ' ')}. Send exactly this, nothing before or after it (a sign-off is fine): "${plan.fixed_line}"`);
   } else if (MOVE_TEXT[plan.required_move]) {
     lines.push(MOVE_TEXT[plan.required_move](plan));

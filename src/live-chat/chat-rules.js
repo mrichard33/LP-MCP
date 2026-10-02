@@ -172,7 +172,8 @@ export function phoneInThread(thread = [], body = '') {
 
 /** The one question that collects what is missing, or null when nothing is. Pure. */
 export function contactAskLine({ hasName = false, hasPhone = false } = {}) {
-  if (!hasName && !hasPhone) return "What's your first name and the best number to reach you?";
+  // 2026-10-02 (Mark): one ask per message. The name first; the phone next turn.
+  if (!hasName && !hasPhone) return "What's your first name?";
   if (!hasPhone) return "What's the best phone number to reach you?";
   if (!hasName) return 'And what is your first name, so the team knows who to ask for?';
   return null;
@@ -203,13 +204,14 @@ export function guardCallPromise(draft, { hasName = false, hasPhone = false } = 
   const ask = contactAskLine({ hasName, hasPhone });
   if (!ask || !promisesCall(text)) return { notes: [], fixed: text };
   const questions = splitSentences(text).filter((s) => s.includes('?'));
+  // One ask per message (2026-10-02): the question must ask for the FIRST
+  // missing item (the name, then the phone).
   const covered = questions.length === 1
-    && (hasPhone || asksForPhone(questions[0]))
-    && (hasName || asksForName(questions[0]));
+    && (hasName ? asksForPhone(questions[0]) : asksForName(questions[0]));
   if (covered) return { notes: [], fixed: text };
   const missing = [!hasName && 'first name', !hasPhone && 'phone number'].filter(Boolean).join(' and ');
   return {
-    notes: [`Your previous draft said a team member will call, but we do not have the visitor's ${missing} yet. Before any call is promised we must have their first name and phone number. End with exactly this one question: "${ask}"`],
+    notes: [`Your previous draft said a team member will call, but we do not have the visitor's ${missing} yet. Before any call is promised we must have their first name and phone number, asked one at a time. End with exactly this one question: "${ask}"`],
     fixed: [...splitSentences(text).filter((s) => !s.includes('?')), ask].join(' ').trim(),
   };
 }

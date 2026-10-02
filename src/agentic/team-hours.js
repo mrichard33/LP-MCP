@@ -132,3 +132,19 @@ export function enforceCallTiming(text, nowMs = Date.now()) {
   }
   return { text: out, changed: out !== body };
 }
+
+/**
+ * The immediacy taken out of a promised call ("will call you right now" →
+ * "will call you soon"), whatever the hour. For the phone room closing
+ * earlier than the team (Part 6, 2026-10-02: rewritten instead of a whole
+ * new draft). Pure.
+ */
+export function softenCallTiming(text) {
+  const body = String(text || '');
+  let out = body;
+  for (const s of body.split(/(?<=[.!?])\s+/)) {
+    if (!CALL_PROMISE_RX.test(s)) continue;
+    out = out.replace(s, s.replace(new RegExp(IMMEDIATE, 'i'), 'soon'));
+  }
+  return out;
+}

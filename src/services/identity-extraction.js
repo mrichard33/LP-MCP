@@ -190,7 +190,10 @@ const DM_PENDING_RE = /\b(?:talk(?:ing)?|check(?:ing)?|speak(?:ing)?|discuss(?:i
 const DM_UNSURE_RE = /\b(?:i(?:'|’)?ll see if (?:she|he|they) can|maybe (?:she|he|they)|not sure if (?:she|he|they)|i think (?:she|he|they)(?:'|’)?ll be)\b/i;
 const DM_CONFIRMED_RE = /\b(?:we(?:'|’)?(?:ll| will)? both be (?:there|home)|both of us will|yes,?\s*we(?:'|’)?ll both|we(?:'|’)?re both good|everyone(?:\s+\w+){0,4}\s+will be (?:there|home)|i(?:'|’)?m the only (?:one|decision[- ]?maker)|i live alone|it(?:'|’)?s just me|i make all the decisions)\b/i;
 // Did the BOT ask the decision-maker question? (scanned over outbound turns)
-const DM_QUESTION_RE = /\b(?:decision[- ]?makers?|will (?:you both|everyone)|both (?:of you )?(?:be|going to be) (?:there|home)|everyone (?:who(?:'|’)?s |who is )?part of the decision)\b/i;
+// 2026-10-02: our own asks count too ("Will anyone else be part of the
+// decision?", "Will your wife be able to be there then?"), or the gate never
+// saw the question as asked and the text bot asked it again.
+const DM_QUESTION_RE = /\b(?:decision[- ]?makers?|will (?:you both|everyone)|both (?:of you )?(?:be|going to be) (?:there|home)|everyone (?:who(?:'|’)?s |who is )?part of the decision|anyone else (?:be )?part of the decision|be able to be there then)\b/i;
 
 // A message that is likely a bare name reply ("Victor Lopez").
 const NAME_WORD = "[A-Za-z][A-Za-z'’-]{1,20}";

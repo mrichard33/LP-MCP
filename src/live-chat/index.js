@@ -263,7 +263,8 @@ export function cachedFreeSlots(calendarId, timezone, { fetch = fetchFreeSlots, 
   const key = `${calendarId}|${timezone}`;
   const hit = slotCache.get(key);
   if (hit && now() - hit.at < SLOT_CACHE_MS) return hit.promise;
-  const promise = Promise.resolve().then(() => fetch(calendarId, { timezone }));
+  // Two weeks of openings, not the first 12 (day preferences, Part 6).
+  const promise = Promise.resolve().then(() => fetch(calendarId, { timezone, maxSlots: 120 }));
   slotCache.set(key, { at: now(), promise });
   // A failed or empty read is not kept: the next turn reads again.
   promise.then((av) => { if (!av?.slots?.length) slotCache.delete(key); }, () => slotCache.delete(key));
@@ -292,7 +293,10 @@ async function offerSlots({ calendarId, contact, preferredText = null }) {
     if ((wider?.slots || []).length > (sel?.slots || []).length) sel = wider;
   }
   const slots = nearestFirst(sel?.slots || [], preferred);
-  return { slots: slots.slice(0, 2), tzLabel: zone.label || 'ET' };
+  // Every offerable opening in the next two weeks (past the notice floor), for
+  // a stated day preference ("usually Wednesdays", day-preference.js).
+  const all = selectOfferableSlots(av, null, { offerWindowHours: 24 * 14, maxOffer: 500 })?.slots || [];
+  return { slots: slots.slice(0, 2), all, tzLabel: zone.label || 'ET' };
 }
 
 /** Slots ordered by closeness to a parsed preferred day/time (kept in time order within the pair). Pure. */

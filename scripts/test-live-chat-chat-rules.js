@@ -99,8 +99,9 @@ test('isRealName: GHL guest placeholders, phones and blanks are not names', () =
   for (const n of ['Mark', 'Mark Test', "Tim O'Connor", 'Lori']) assert.equal(R.isRealName(n), true, n);
 });
 
+// 2026-10-02 (Mark): one ask per message. Both missing → the name first.
 test('contactAskLine asks for exactly what is missing, as one question', () => {
-  assert.equal(R.contactAskLine({}), "What's your first name and the best number to reach you?");
+  assert.equal(R.contactAskLine({}), "What's your first name?");
   assert.equal(R.contactAskLine({ hasName: true }), "What's the best phone number to reach you?");
   assert.match(R.contactAskLine({ hasPhone: true }), /first name/);
   assert.equal(R.contactAskLine({ hasName: true, hasPhone: true }), null);
@@ -109,7 +110,7 @@ test('contactAskLine asks for exactly what is missing, as one question', () => {
 
 test('bookingHandoffLine keeps its old output when the name is known', () => {
   assert.equal(R.bookingHandoffLine({ hasPhone: false }), "A team member will call you to set up a time that works. What's the best phone number to reach you?");
-  assert.equal(R.bookingHandoffLine({ hasPhone: false, hasName: false }), "A team member will call you to set up a time that works. What's your first name and the best number to reach you?");
+  assert.equal(R.bookingHandoffLine({ hasPhone: false, hasName: false }), "A team member will call you to set up a time that works. What's your first name?");
 });
 
 test('guardCallPromise: no call promise without a name and a phone', () => {
@@ -149,7 +150,7 @@ test('guardChatFlow: the live drafts from the ljloa chat', () => {
   const b = R.guardChatFlow('No cost, no obligation. What made you decide to replace them now?', { thread, hasName: false, hasPhone: false });
   assert.ok(b.notes.some(n => /already asked/.test(n)));
   assert.doesNotMatch(b.fixed, /decide to replace/);
-  assert.match(b.fixed, /What's your first name and the best number to reach you\?$/);
+  assert.match(b.fixed, /What's your first name\?$/);
   // the dead end
   const c = R.guardChatFlow("Got it—they look old and don't feel right to you.", { thread, hasName: false, hasPhone: false });
   assert.match(c.fixed, /free in-home measurement/);
@@ -187,7 +188,7 @@ test('guardChatFlow: a service turn never gets the visit pitch; "connected with 
   assert.equal(promisesCall('Let me get you connected with our team right away so we can sort this out.'), true);
   const r = guardChatFlow('I apologize for that. We will sort this out today.', { body: 'someone was supposed to come today', bookingAllowed: true, serviceTurn: true });
   assert.ok(!r.fixed.includes(VISIT_NEXT_STEP_LINE), r.fixed);
-  assert.match(r.fixed, /name and the best number/);
+  assert.match(r.fixed, /What's your first name\?$/);
 });
 
 // 2026-10-02 break test: "Sunday morning then" after "I have Sat 10 AM or Sun 10 AM".
