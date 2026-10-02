@@ -189,3 +189,10 @@ test('guardChatFlow: a service turn never gets the visit pitch; "connected with 
   assert.ok(!r.fixed.includes(VISIT_NEXT_STEP_LINE), r.fixed);
   assert.match(r.fixed, /name and the best number/);
 });
+
+// 2026-10-02 break test: "Sunday morning then" after "I have Sat 10 AM or Sun 10 AM".
+test('pickSlot: a weekday name picks that day from the offer', async () => {
+  const { pickSlot } = await import('../src/live-chat/cancel-flow.js');
+  const offered = [{ iso: '2026-10-03T10:00:00-04:00', day: 'Sat, Oct 3', time: '10:00 AM', dayOfWeek: 'Saturday' }, { iso: '2026-10-04T10:00:00-04:00', day: 'Sun, Oct 4', time: '10:00 AM', dayOfWeek: 'Sunday' }];
+  assert.equal(pickSlot('Sunday morning then', offered)?.iso, '2026-10-04T10:00:00-04:00');
+});

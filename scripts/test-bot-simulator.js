@@ -48,7 +48,7 @@ test('live chat: every turn and reply, a fixed price move needs no model call', 
   const { calls, deps } = fakeProduction();
   const r = await simulateLiveChat(resolveScenario({ scenario: 'price' }), { nepqMode: 'live', productionDeps: deps });
   assert.equal(r.transcript.length, 2);
-  assert.match(r.transcript[0].bot[0], /^Happy to get you a quote/);
+  assert.match(r.transcript[0].bot[0], /^Happy to help with the 12 windows\. We can't give a fair price on the spot/);
   assert.match(r.transcript[1].bot[0], /^Totally fair\. Every home is different/);
   assert.equal(calls.llm, 0);
 });

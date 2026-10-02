@@ -266,6 +266,7 @@ import { notInterestedTurn } from './agentic/not-interested.js';
 import { humanizeReply, restoreQuestionMark } from './agentic/human-voice.js';
 import { findUnbackedBookingClaim, rewriteBookingClaims, bookingClaimNote } from './agentic/booking-claim.js';
 import { BOOKING_CALENDARS } from './knowledge/booking-calendar-router.js';
+import { contactTypoHint } from './agentic/contact-typos.js';
 import {
   buildKbPack,
   prewarmQueryEmbedding,
@@ -3282,7 +3283,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   if (rehash && opts.promptHint) {
     console.log(`[ResponseGenerator] rehash reply for ${contactId}: layer3 script directive dropped (pre-demo copy)`);
   }
-  const promptHint = [rehash ? null : opts.promptHint, handoffNote]
+  const promptHint = [rehash ? null : opts.promptHint, handoffNote, contactTypoHint(triggerMessage)]
     .filter(Boolean).join('\n\n') || null;
 
   const buyerStage    = inferBuyerStage(context);
