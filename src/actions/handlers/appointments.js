@@ -1435,6 +1435,94 @@ export async function executeUpdateAppointmentStatus(action /*, context */) {
 }
 
 /**
+ * Move an existing appointment to a new time ON ITS OWN CALENDAR — one PUT,
+ * same object, same status (2026-10-02, Mark). Returns the handler result, or
+ * null to let executeRescheduleAppointment fall back to book-then-cancel (a
+ * different calendar, or the old appointment could not be read). A live-chat
+ * move (`payload.source === 'live_chat'`) never falls back: it returns a
+ * clean failure and the bot hands the visitor to a person, because a new
+ * object is the one thing Mark ruled out.
+ */
+export async function moveAppointmentInPlace({ contactId, oldId, payload }, deps = {}) {
+  const fetchUpcoming = deps.fetchUpcomingAppointments || fetchUpcomingAppointments;
+  const put = deps.ghlFetch || ghlFetch;
+  const noFallback = payload?.source === 'live_chat';
+  const fail = (reason) => (noFallback
+    ? { action: 'reschedule_move_failed', old_appointment_id: oldId, moved: false, new_appointment_booked: false, contact_id: contactId, error: reason }
+    : null);
+
+  let old = null;
+  try {
+    const list = await fetchUpcoming(contactId);
+    old = (Array.isArray(list) ? list : []).find((a) => a.appointment_id === oldId) || null;
+  } catch (err) {
+    console.warn(`[ActionExecutor] reschedule: could not read ${oldId} for ${contactId} (${err.message})`);
+  }
+  if (!old?.calendar_id) return fail('old appointment not found among upcoming appointments');
+
+  // Keep the appointment's own length unless the caller set one.
+  const startMs = Date.parse(old.start_time);
+  const endMs = Date.parse(old.end_time);
+  const ownMinutes = Number.isFinite(startMs) && Number.isFinite(endMs) && endMs > startMs && endMs - startMs <= 6 * 3600_000
+    ? Math.round((endMs - startMs) / 60_000) : undefined;
+  let built;
+  try {
+    built = buildAppointmentBody({
+      calendar_name: payload.new_calendar_name,
+      // A named calendar must win: defaulting the id would silently keep a
+      // move the caller asked to make to ANOTHER calendar on the old one.
+      calendar_id: payload.new_calendar_id || (payload.new_calendar_name ? undefined : old.calendar_id),
+      start_time: payload.new_start_time,
+      end_time: payload.new_end_time,
+      duration_minutes: payload.duration_minutes ?? ownMinutes,
+      appointment_date: payload.appointment_date,
+      appointment_time: payload.appointment_time,
+      timezone: payload.timezone,
+      ignore_free_slot_validation: payload.ignore_free_slot_validation,
+    }, contactId);
+  } catch (err) {
+    return fail(`new time unreadable: ${err.message}`);
+  }
+  if (built.calendarId !== old.calendar_id) return fail(`target calendar ${built.calendarId} differs from the appointment's own ${old.calendar_id}`);
+
+  const body = { calendarId: old.calendar_id, startTime: built.startTime, endTime: built.endTime };
+  if (built.ignoreFreeSlotValidation) body.ignoreFreeSlotValidation = true;
+  try {
+    await put('PUT', `/calendars/events/appointments/${oldId}`, body);
+  } catch (err) {
+    // The old time is untouched: a failed PUT changes nothing.
+    console.warn(`[ActionExecutor] ⚠️ in-place reschedule of ${oldId} for ${contactId} failed (old time left intact): ${err.message}`);
+    if (noFallback) return fail(err.message);
+    throw err;
+  }
+  console.log(`[ActionExecutor] ♻️  Rescheduled IN PLACE: ${oldId} for ${contactId} ${old.start_time} → ${built.startTime} (same appointment, no new object)`);
+  if (isSlotCheckEnabled()) {
+    void emitSlotCheckEvent('updated', {
+      contactId, calendarId: old.calendar_id, startTime: built.startTime, matched: old,
+      extra: { site: 'executeRescheduleAppointment', reason: 'rescheduled_in_place', previousStartTime: old.start_time, source: payload?.source || null },
+    });
+  }
+  let qualifyingDataFieldsWritten = 0;
+  if (payload.qualifying_data) {
+    qualifyingDataFieldsWritten = await persistQualifyingData(contactId, payload.qualifying_data).catch(() => 0);
+  }
+  return {
+    action: 'appointment_moved',
+    appointment_id: oldId,
+    old_appointment_id: oldId,
+    old_cancelled: false,
+    new_appointment_booked: false,
+    moved: true,
+    calendar_id: old.calendar_id,
+    previous_start_time: old.start_time,
+    new_start_time: built.startTime,
+    status: old.status,
+    contact_id: contactId,
+    qualifying_data_fields_written: qualifyingDataFieldsWritten,
+  };
+}
+
+/**
  * v2 — reschedule_appointment: book new + cancel old in one operation.
  *
  * Why a combined action instead of two companions:
@@ -1487,6 +1575,19 @@ export async function executeRescheduleAppointment(action, context) {
     }
   }
   if (!oldId) throw new Error('Missing old_appointment_id and live appointments API returned no active appointment');
+
+  // ─── Same calendar → move the SAME appointment (2026-10-02, Mark) ──
+  // "Reschedule the same appointment in GHL, do not create a brand new one."
+  // A new GHL object is born `new`, which fires A.WE's "New" branch and its
+  // LP Appointment Sync — and when LP cannot resolve the lead, that sync
+  // enrols lead creation: a second LP lead for a customer who only changed
+  // the day. A time change on the appointment's own calendar is therefore a
+  // PUT on the existing object (the precedent: executeBookAppointment's
+  // idempotent reschedule and the LP→GHL reconciler). Book-then-cancel below
+  // is kept only for a move to a DIFFERENT calendar, which GHL cannot do in
+  // place. A live-chat move never falls through to it.
+  const inPlace = await moveAppointmentInPlace({ contactId, oldId, payload });
+  if (inPlace) return inPlace;
 
   // ─── Step 1/2: book the new appointment FIRST ──────────────────────
   const bookPayload = {

@@ -33,6 +33,11 @@ import { livechatSendBody } from '../send-message-handler.js';
 import { checkServiceAreaZip, checkServiceAreaPlace } from '../services/identity-extraction.js';
 import { timezoneForZip } from '../services/contact-timezone.js';
 import { createLiveChatFastLane, liveChatMode, liveChatHardTimeoutMs, liveChatModelWarning } from './fast-lane.js';
+import { searchByPhone } from '../services/ghl-contact-resolve.js';
+import { fetchRecentAndUpcomingAppointments } from '../knowledge/contact-appointments.js';
+import { resolveMarket } from '../actions/enrichment.js';
+import { postToSlack } from '../slack.js';
+import { fetchFreeSlots, selectOfferableSlots } from '../knowledge/calendar-availability.js';
 
 async function fetchContact(contactId) {
   const res = await ghlFetch('GET', `/contacts/${contactId}`, null, { priority: 'high', maxWaitMs: 1500 });
@@ -144,6 +149,113 @@ async function captureIdentity(contactId, { phone, email, name }) {
   return ghlFetch('PUT', `/contacts/${contactId}`, patch, { priority: 'normal' });
 }
 
+// ── 2026-10-02 cancel flow deps (src/live-chat/cancel-flow.js) ────────────
+
+/**
+ * Cancel one appointment in GHL through the existing cancel_appointment
+ * handler, and wait for the answer: the visitor is only told "Done" when GHL
+ * confirmed. The row is inserted 'executing' so the sweep never claims it
+ * too, and with max_retries 1 so a failure is not retried behind the
+ * visitor's back after they were told the team will handle it.
+ */
+async function cancelAppointment({ contactId, appointmentId, reason }) {
+  if (!supabase) return { ok: false, error: 'supabase client not configured' };
+  const { data, error } = await supabase.from('agent_actions').insert({
+    action_type: 'cancel_appointment', target_system: 'ghl', target_entity: 'contact', target_id: contactId,
+    rule_applied: 'LIVE_CHAT_CANCEL', status: 'executing', requires_approval: false, max_retries: 1,
+    reasoning: 'Live chat: the visitor asked to cancel and declined another day',
+    action_payload: { appointment_id: appointmentId, reason, source: 'live_chat' },
+  }).select('id').single();
+  if (error || data?.id == null) return { ok: false, error: error?.message || 'insert returned no id' };
+  const { executeActionById } = await import('../actions/index.js');
+  const res = await executeActionById(data.id);
+  // The handler RETURNS (does not throw) a failed move, so a 'completed' row
+  // is not enough: only `appointment_moved` means GHL now holds the new time.
+  const moved = res?.status === 'completed' && res?.result?.action === 'appointment_moved';
+  return { ok: moved, action_id: data.id, error: moved ? null : (res?.result?.error || res?.error || `status ${res?.status} / ${res?.result?.action || 'no result'}`) };
+}
+
+// One card per contact, kind and Eastern day, per process: a visitor who
+// repeats "cancel" does not post twice.
+const cancelCardsPosted = new Set();
+
+/** #dispatch (Mark, 2026-10-02). Env-overridable; the code default is the live channel. */
+export const SLACK_CHANNEL_DISPATCH_DEFAULT = 'C0C19GRS8FJ';
+
+/**
+ * The #dispatch card (Mark, 2026-10-02: LP has no cancel or reschedule API, so
+ * dispatch makes the change in LP). Slack is the destination of record here,
+ * so it goes through postToSlack and a failed post is visible in #ops-alerts
+ * (CLAUDE.md), never silent. The card names the market so dispatch knows
+ * which office's LP calendar to touch.
+ */
+async function postCancelCard({ text, contactId, kind }) {
+  const day = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' }).format(new Date());
+  const key = `${contactId}:${kind}:${day}`;
+  if (cancelCardsPosted.has(key)) return { ok: false, reason: 'already_posted_today' };
+  cancelCardsPosted.add(key);
+  let market = null;
+  try {
+    const full = contactId ? await fetchContact(contactId) : null;
+    market = full ? await resolveMarket({ ghlContact: full }) : null;
+  } catch (err) {
+    console.warn(`[LiveChat] market lookup for dispatch card failed (${contactId}): ${err.message}`);
+  }
+  const channel = (process.env.SLACK_CHANNEL_DISPATCH || SLACK_CHANNEL_DISPATCH_DEFAULT).trim();
+  const body = text.replace(/\nPhone:/, `\nMarket: ${market || 'unknown'}\nPhone:`);
+  const res = await postToSlack(body, channel);
+  if (res?.ok) {
+    console.log(`[LiveChat] dispatch card (${kind}) for ${contactId} posted (ts ${res.ts})`);
+  } else {
+    cancelCardsPosted.delete(key);
+    console.warn(`[LiveChat] dispatch card (${kind}) for ${contactId} NOT posted: ${res?.error || 'unknown'}`);
+    await sendAlertMessage(`🚨 LIVE CHAT ${String(kind).toUpperCase()} CARD NOT POSTED TO #dispatch\nContact: ${contactId}\nSlack said: ${res?.error || 'unknown'}${res?.error === 'not_in_channel' ? '\nFix: add the Reece Slack app to #dispatch.' : ''}\n\n${body}`, { channel: 'ops' }).catch(() => {});
+  }
+  return res;
+}
+
+/**
+ * Up to two real open times on the appointment's own calendar, in the
+ * visitor's zone (Houston reads Central). selectOfferableSlots applies the
+ * same notice floor and 48h-first offer window the SMS bot uses.
+ */
+async function offerSlots({ calendarId, contact }) {
+  if (!calendarId) return { slots: [], tzLabel: 'ET' };
+  let zone = { timezone: 'America/New_York', label: 'ET' };
+  const zip = contact?.postalCode || contact?.postal_code || null;
+  if (zip) {
+    try { zone = { ...zone, ...(await timezoneForZip(zip)) }; } catch { /* Eastern */ }
+  }
+  const av = await fetchFreeSlots(calendarId, { timezone: zone.timezone });
+  const sel = selectOfferableSlots(av, null);
+  return { slots: (sel?.slots || []).slice(0, 2), tzLabel: zone.label || 'ET' };
+}
+
+/**
+ * Move the SAME appointment in GHL to the new time through the
+ * reschedule_appointment handler (moveAppointmentInPlace: one PUT, no new
+ * object — Mark, 2026-10-02) and wait for the answer: "You're now set for…"
+ * is said only when GHL confirms the move. `lp_sync: 'dispatch'` holds the
+ * automatic LP sync (src/services/lp-sync-hold.js) so LP is changed by a
+ * person from the #dispatch card and no new LP lead is created.
+ */
+async function rescheduleAppointment({ contactId, oldAppointmentId, calendarId, startIso }) {
+  if (!supabase) return { ok: false, error: 'supabase client not configured' };
+  const { data, error } = await supabase.from('agent_actions').insert({
+    action_type: 'reschedule_appointment', target_system: 'ghl', target_entity: 'contact', target_id: contactId,
+    rule_applied: 'LIVE_CHAT_RESCHEDULE', status: 'executing', requires_approval: false, max_retries: 1,
+    reasoning: 'Live chat: the visitor picked a new time from two real open slots',
+    action_payload: { old_appointment_id: oldAppointmentId, new_calendar_id: calendarId, new_start_time: startIso, source: 'live_chat', lp_sync: 'dispatch' },
+  }).select('id').single();
+  if (error || data?.id == null) return { ok: false, error: error?.message || 'insert returned no id' };
+  const { executeActionById } = await import('../actions/index.js');
+  const res = await executeActionById(data.id);
+  // The handler RETURNS (does not throw) a failed move, so a 'completed' row
+  // is not enough: only `appointment_moved` means GHL now holds the new time.
+  const moved = res?.status === 'completed' && res?.result?.action === 'appointment_moved';
+  return { ok: moved, action_id: data.id, error: moved ? null : (res?.result?.error || res?.error || `status ${res?.status} / ${res?.result?.action || 'no result'}`) };
+}
+
 export function buildProductionLane() {
   return createLiveChatFastLane({
     fetchContact,
@@ -169,6 +281,13 @@ export function buildProductionLane() {
     checkServiceArea: checkServiceAreaZip,
     lookupPlace: (place) => checkServiceAreaPlace(place),
     zoneForZip: (zip) => timezoneForZip(zip),
+    findContactByPhone: (digits) => searchByPhone(digits, { priority: 'high' }),
+    fetchAppointments: (contactId) => fetchRecentAndUpcomingAppointments(contactId),
+    cancelAppointment,
+    postCancelCard,
+    offerSlots,
+    rescheduleAppointment,
+    contactUrl: (id) => (id ? `https://app.gohighlevel.com/v2/location/${GHL_LOCATION_ID}/contacts/detail/${id}` : null),
   });
 }
 

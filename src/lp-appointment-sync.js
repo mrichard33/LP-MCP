@@ -249,6 +249,7 @@ import { lpStoredAgeMinutes } from './lp-dates.js';
 import { LP_EMP } from './lp-source-ids.js';
 import { buildLpAppointmentCard } from './services/appointment-card.js';
 import { trackBackground } from './graceful-shutdown.js';
+import { lpSyncHeldForDispatch } from './services/lp-sync-hold.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY;
 // GHL_LOCATION_ID removed 2026-07-28: its only consumer was the locationId
@@ -2370,6 +2371,20 @@ export function registerLPAppointmentSyncRoutes(app) {
       if (!contactId) {
         return res.status(400).json({ success: false, error: 'contact_id is required' });
       }
+
+      // 2026-10-02 (Mark): a time change the website chat made is changed in
+      // LP by a PERSON (#dispatch card), never by this sync — which re-sets
+      // LP and, when it cannot resolve the lead, creates a new LP lead. See
+      // src/services/lp-sync-hold.js. Fails open on a read error.
+      const hold = await lpSyncHeldForDispatch(contactId);
+      if (hold.held) {
+        console.log(`[LP-APPT] ⏸️ LP sync held for ${contactId}: chat reschedule (action ${hold.action_id}) — #dispatch changes LP, no SetAppointment, no lead creation`);
+        trackBackground(addGHLNote(contactId,
+          `[LP SYNC] Held: this appointment time was changed in the website chat (action ${hold.action_id}). #dispatch was asked to change the time in LP. No automatic LP update and no new LP lead.`
+        ).catch(() => {}));
+        return res.json({ success: true, action: 'lp_sync_held_dispatch_reschedule', contact_id: contactId, held_by_action: hold.action_id, elapsed_ms: Date.now() - startTime });
+      }
+      if (hold.reason !== 'none') console.warn(`[LP-APPT] LP sync hold check for ${contactId} could not tell (${hold.reason}) — proceeding`);
 
       let appointmentDate = cleanGHLValue(body.appointment_date || body.appointmentDate || body.start_date || body.startDate);
       let appointmentTime = cleanGHLValue(body.appointment_time || body.appointmentTime || body.start_time || body.startTime);

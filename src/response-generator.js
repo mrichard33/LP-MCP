@@ -263,6 +263,7 @@ import {
   lastOutboundOfferedGuide, isGuideAcceptance,
 } from './agentic/guide-delivery.js';
 import { notInterestedTurn } from './agentic/not-interested.js';
+import { humanizeReply } from './agentic/human-voice.js';
 import {
   buildKbPack,
   prewarmQueryEmbedding,
@@ -467,6 +468,7 @@ const SYSTEM_PROMPT =
   P.ANTI_PATTERNS +
   P.GUIDE_OFFER_BOOKING_FAILURE_EXIT +
   P.HARD_PROHIBITIONS +
+  P.HUMAN_VOICE_RULES +
   P.SYSTEM_CHANNEL_AND_RESPONSE_FORMAT;
 
 /**
@@ -3700,6 +3702,18 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // resolver has already had its turn. Throwing hands control to the retry-
   // then-safe-fallback loop in send-message-handler: the lead still gets a
   // reply, and it is never one with raw template syntax in it.
+  // ─── Human voice (2026-10-02, Mark: "sounds very human") ───
+  // Em dashes shipped despite HARD_PROHIBITIONS, plus stacked "Got it. Great
+  // question." openers and "Just to understand… —" lead-ins. Deletes only;
+  // the user prompt is passed as keepText so a LOCKED KB line the model quoted
+  // keeps its em dashes verbatim (banned.js). Runs before the token guard so
+  // that guard still sees the final text.
+  const voice = humanizeReply(validated.message, { keepText: userPrompt });
+  if (voice.changes.length) {
+    console.log(`[HumanVoice] ${contactId} ${voice.changes.join(',')}`);
+    validated.message = voice.text;
+  }
+
   assertNoUnresolvedTokens(validated.message, contactId);
 
   // ─── Rehash offer guard (2026-10-01, Mark) ───

@@ -39,7 +39,7 @@ function makeReq(body, secret = SECRET) {
 function makeLane({
   mode = 'live', tags = [], llm = () => ({ message: 'Sure. What made you start looking at this now?' }),
   llmDelayMs = 5, hardTimeoutMs = 2000, contextCapMs = 300, buildContext = null, messages = [],
-  insertAction = null, now = null, checkServiceArea = null, lookupPlace = null, findConversation = null, phone = null, firstName = 'Alyce',
+  insertAction = null, now = null, checkServiceArea = null, lookupPlace = null, findConversation = null, phone = null, firstName = 'Alyce', extra = {},
 } = {}) {
   const state = { sends: [], actions: [], updates: [], events: [], ops: [], claimed: new Set(), llmCalls: [], captured: [], fingerprints: [], slots: [], lookups: [], places: [], fetchedConversations: [], lookedUp: [] };
   let nextId = 1000;
@@ -84,6 +84,7 @@ function makeLane({
     fingerprint: (f) => { state.fingerprints.push(f); },
     markSent: () => {},
     captureIdentity: async (id, fields) => { state.captured.push({ id, ...fields }); },
+    ...extra,
   });
   return { lane, state };
 }
@@ -590,4 +591,195 @@ test('a phone typed in this message counts; only the name is asked', async () =>
   await lane.processInbound(INBOUND('9543792151'));
   assert.match(state.sends[0].message, /what is your first name/i);
   assert.doesNotMatch(state.sends[0].message, /phone number/);
+});
+
+// ── 2026-10-02 "Guest Visitor tzuzq" (Ng329AzYVAT7wBlpNagS) ────────────────
+// A cancel request from an unknown visitor, two quick messages answered twice,
+// and a "do not come" that kept getting the in-home pitch.
+
+const RICK = { id: 'RICK1', firstName: 'Rick', lastName: 'Fox', phone: '+13525550188' };
+const APPT = { appointment_id: 'APPT9', calendar_id: 'CAL1', status: 'confirmed', start_time: '2026-10-02T22:00:00Z', start_time_human: 'Thu, Oct 2, 6:00 PM ET' };
+const SLOTS = [{ iso: '2026-10-06T14:00:00Z', day: 'Tue, Oct 6', time: '10:00 AM', dayOfWeek: 'Tuesday' }, { iso: '2026-10-07T18:00:00Z', day: 'Wed, Oct 7', time: '2:00 PM', dayOfWeek: 'Wednesday' }];
+const cancelDeps = (state, { found = RICK, appts = [APPT], cancelOk = true, freeSlots = [], moveOk = true } = {}) => ({
+  findContactByPhone: async (d) => { state.lookedUpPhones = [...(state.lookedUpPhones || []), d]; return found; },
+  fetchAppointments: async (id) => { state.apptReads = [...(state.apptReads || []), id]; return appts; },
+  cancelAppointment: async (a) => { state.cancels = [...(state.cancels || []), a]; return cancelOk ? { ok: true } : { ok: false, error: 'GHL 400' }; },
+  offerSlots: async (a) => { state.slotReads = [...(state.slotReads || []), a.calendarId]; return { slots: freeSlots, tzLabel: 'ET' }; },
+  rescheduleAppointment: async (a) => { state.moves = [...(state.moves || []), a]; return moveOk ? { ok: true } : { ok: false, error: 'GHL 422' }; },
+  postCancelCard: async (c) => { state.cards = [...(state.cards || []), c]; },
+  contactUrl: (id) => `https://ghl/${id}`,
+});
+const TZ = (direction, body, sec) => ({ direction, body, dateAdded: new Date(Date.parse('2026-10-01T23:03:11Z') + sec * 1000).toISOString() });
+
+function laneWithCancel(messages, opts = {}) {
+  // The deps record into the lane's own state object, filled in once it exists.
+  const box = {};
+  const proxy = new Proxy({}, { get: (_t, k) => box.state[k], set: (_t, k, v) => { box.state[k] = v; return true; } });
+  const made = makeLane({ firstName: 'Guest Visitor tzuzq', messages, extra: cancelDeps(proxy, opts), llm: () => { throw new Error('the model must not be called in the cancel flow'); } });
+  box.state = made.state;
+  return { lane: made.lane, state: made.state };
+}
+
+test('tzuzq: "cancel my appt" from an unknown visitor asks for the name and phone — no model, no "no appointment on file"', async () => {
+  const { lane, state } = laneWithCancel([TZ('inbound', 'cancel my appt please. not buying g anything', 0)]);
+  await lane.processInbound(INBOUND('cancel my appt please. not buying g anything'));
+  assert.equal(state.llmCalls.length, 0);
+  assert.equal(state.sends[0].message, "I can help with that. What's the full name and phone number the appointment is under?");
+});
+
+test('tzuzq: name without a phone asks for the phone only', async () => {
+  const thread = [TZ('inbound', 'cancel my appt please', 0), TZ('outbound', "I can help with that. What's the full name and phone number the appointment is under?", 13), TZ('inbound', 'tomorrow evening 6 pm Rick fox', 43)];
+  const { lane, state } = laneWithCancel(thread);
+  await lane.processInbound(INBOUND('tomorrow evening 6 pm Rick fox'));
+  assert.equal(state.sends[0].message, "Thanks. What's the phone number the appointment is under?");
+});
+
+test('name + phone that match → one reschedule offer; "no" → cancelled in GHL, "Done", and one sales card', async () => {
+  const asked = [TZ('inbound', 'cancel my appt please', 0), TZ('outbound', "I can help with that. What's the full name and phone number the appointment is under?", 13), TZ('inbound', 'Rick Fox 352-555-0188', 40)];
+  const a = laneWithCancel(asked);
+  await a.lane.processInbound(INBOUND('Rick Fox 352-555-0188'));
+  assert.deepEqual(a.state.lookedUpPhones, ['3525550188']);
+  assert.equal(a.state.sends[0].message, 'Thanks, Rick. I found your appointment for Thu, Oct 2, 6:00 PM ET. Would a different day work better instead of cancelling?');
+  assert.equal(a.state.cancels, undefined, 'nothing is cancelled before the offer is answered');
+
+  const offered = [...asked, TZ('outbound', a.state.sends[0].message, 50), TZ('inbound', 'no just cancel it', 70)];
+  const b = laneWithCancel(offered);
+  await b.lane.processInbound(INBOUND('no just cancel it'));
+  assert.deepEqual(b.state.cancels, [{ contactId: 'RICK1', appointmentId: 'APPT9', reason: 'live chat: visitor asked to cancel' }]);
+  assert.equal(b.state.sends[0].message, "Done. Your Thu, Oct 2, 6:00 PM ET appointment is cancelled. If anything changes, we're here.");
+  await new Promise(r => setImmediate(r));
+  assert.equal(b.state.cards.length, 1);
+  assert.match(b.state.cards[0].text, /LIVE CHAT CANCEL — cancel it in LP/);
+  assert.match(b.state.cards[0].text, /GHL: ✅ cancelled by the bot\. → Cancel it in LP\./);
+  assert.match(b.state.cards[0].text, /\(352\) 555-0188/);
+  assert.equal(b.state.cards[0].contactId, 'RICK1');
+});
+
+test('"yes, a different day" → a person calls to reschedule, nothing cancelled, a RESCHEDULE card', async () => {
+  const offered = [TZ('inbound', 'cancel my appointment', 0), TZ('outbound', "I can help with that. What's the full name and phone number the appointment is under?", 13), TZ('inbound', 'Rick Fox 3525550188', 40), TZ('outbound', 'Thanks, Rick. I found your appointment for Thu, Oct 2, 6:00 PM ET. Would a different day work better instead of cancelling?', 50), TZ('inbound', 'yes next week', 70)];
+  const { lane, state } = laneWithCancel(offered);
+  await lane.processInbound(INBOUND('yes next week'));
+  assert.equal(state.cancels, undefined);
+  assert.equal(state.sends[0].message, 'A team member will call you at (352) 555-0188 to set up a new time.');
+  await new Promise(r => setImmediate(r));
+  assert.match(state.cards[0].text, /LIVE CHAT RESCHEDULE/);
+});
+
+test('a phone that belongs to someone else (name mismatch) is never cancelled — the team takes it', async () => {
+  const asked = [TZ('inbound', 'cancel my appt', 0), TZ('outbound', "I can help with that. What's the full name and phone number the appointment is under?", 13), TZ('inbound', 'Jane Doe 3525550188', 40)];
+  const { lane, state } = laneWithCancel(asked);
+  await lane.processInbound(INBOUND('Jane Doe 3525550188'));
+  assert.equal(state.sends[0].message, "Thanks. I've passed this to our scheduling team to cancel, and they'll confirm with you.");
+  await new Promise(r => setImmediate(r));
+  assert.match(state.cards[0].text, /GHL: ❌ NOT cancelled/);
+  assert.doesNotMatch(state.sends[0].message, /no appointment|don't see/i);
+});
+
+test('a GHL cancel that fails is never reported as done', async () => {
+  const offered = [TZ('inbound', 'cancel my appointment', 0), TZ('outbound', "I can help with that. What's the full name and phone number the appointment is under?", 13), TZ('inbound', 'Rick Fox 3525550188', 40), TZ('outbound', 'Thanks, Rick. I found your appointment for Thu, Oct 2, 6:00 PM ET. Would a different day work better instead of cancelling?', 50), TZ('inbound', 'no', 70)];
+  const { lane, state } = laneWithCancel(offered, { cancelOk: false });
+  await lane.processInbound(INBOUND('no'));
+  assert.doesNotMatch(state.sends[0].message, /^Done/);
+  assert.match(state.sends[0].message, /scheduling team/);
+});
+
+test('shadow mode looks up but never cancels and never posts', async () => {
+  const offered = [TZ('inbound', 'cancel my appointment', 0), TZ('outbound', "I can help with that. What's the full name and phone number the appointment is under?", 13), TZ('inbound', 'Rick Fox 3525550188', 40), TZ('outbound', 'Thanks, Rick. I found your appointment for Thu, Oct 2, 6:00 PM ET. Would a different day work better instead of cancelling?', 50), TZ('inbound', 'no', 70)];
+  const s0 = {};
+  const { lane, state } = makeLane({ mode: 'shadow', firstName: 'Guest Visitor tzuzq', messages: offered, extra: cancelDeps(s0) });
+  await lane.processInbound(INBOUND('no'));
+  assert.equal(s0.cancels, undefined);
+  assert.equal(s0.cards, undefined);
+  assert.equal(state.sends.length, 0);
+});
+
+test('tzuzq: "you won\'t be allowed in" after a no gets a close — never the in-home pitch', async () => {
+  const thread = [TZ('inbound', 'slick sales people but I dont need new windows', 0), TZ('outbound', 'Understood.', 10), TZ('inbound', 'good bye', 30)];
+  const { lane, state } = makeLane({ firstName: 'Guest Visitor tzuzq', messages: thread, llm: () => ({ message: 'Take care. If that changes, we\'re here.', live_chat: { recommended_action: 'suppress' } }) });
+  await lane.processInbound(INBOUND('good bye'));
+  assert.equal(state.sends[0].message, "Take care. If that changes, we're here.");
+  const t2 = [TZ('inbound', 'no thanks, not interested', 0)];
+  const m2 = makeLane({ firstName: 'Guest Visitor tzuzq', messages: t2, llm: () => ({ message: 'I get it. No pressure at all. The next step is a free in-home measurement, and a team member will call to set it up. What\'s your first name and the best number to reach you?', live_chat: { recommended_action: 'suppress' } }) });
+  await m2.lane.processInbound(INBOUND('no thanks, not interested'));
+  assert.equal(m2.state.sends[0].message, 'I get it. No pressure at all.');
+});
+
+test('tzuzq: two messages 28s apart → only the newer one is answered; the older row reads superseded', async () => {
+  let release;
+  const gate = new Promise(r => { release = r; });
+  let call = 0;
+  const { lane, state } = makeLane({
+    firstName: 'Guest Visitor tzuzq',
+    llm: () => ({ message: ++call === 1 ? 'First reply.' : 'Second reply.' }),
+    extra: {},
+  });
+  // Hold the first turn's model call until the second message has arrived.
+  const slowFirst = lane.processInbound(INBOUND('tomorrow evening 6 pm Rick fox'));
+  await new Promise(r => setTimeout(r, 1));
+  const second = lane.processInbound(INBOUND('slick sales people but I dont need new windows'));
+  release();
+  const [o1, o2] = await Promise.all([slowFirst, second]);
+  void gate;
+  assert.equal(state.sends.length, 1, 'one reply, not two');
+  assert.equal(o1.outcome, 'superseded');
+  assert.equal(o2.outcome, 'sent');
+  const skipped = state.updates.find(u => u.status === 'skipped');
+  assert.equal(skipped.error_message, 'superseded_by_newer_message');
+});
+
+// ── 2026-10-02 (Mark): "yes, a different day" books a real open time ───────
+const OFFER = 'Thanks, Rick. I found your appointment for Thu, Oct 2, 6:00 PM ET. Would a different day work better instead of cancelling?';
+const UP_TO_OFFER = [TZ('inbound', 'cancel my appointment', 0), TZ('outbound', "I can help with that. What's the full name and phone number the appointment is under?", 13), TZ('inbound', 'Rick Fox 3525550188', 40), TZ('outbound', OFFER, 50)];
+
+test('"yes, a different day" → two real open times from that appointment\'s calendar', async () => {
+  const { lane, state } = laneWithCancel([...UP_TO_OFFER, TZ('inbound', 'yes', 70)], { freeSlots: SLOTS });
+  await lane.processInbound(INBOUND('yes'));
+  assert.deepEqual(state.slotReads, ['CAL1']);
+  assert.equal(state.sends[0].message, 'Sure. I have Tue, Oct 6 at 10:00 AM or Wed, Oct 7 at 2:00 PM ET open. Which one works better for you?');
+  assert.equal(state.moves, undefined, 'nothing moves before they pick');
+});
+
+test('picking "Wednesday" moves it in GHL, says so, and posts a RESCHEDULED card for #dispatch', async () => {
+  const offerLine = 'Sure. I have Tue, Oct 6 at 10:00 AM or Wed, Oct 7 at 2:00 PM ET open. Which one works better for you?';
+  const { lane, state } = laneWithCancel([...UP_TO_OFFER, TZ('inbound', 'yes', 70), TZ('outbound', offerLine, 80), TZ('inbound', 'wednesday works', 100)], { freeSlots: SLOTS });
+  await lane.processInbound(INBOUND('wednesday works'));
+  assert.deepEqual(state.moves, [{ contactId: 'RICK1', oldAppointmentId: 'APPT9', calendarId: 'CAL1', startIso: '2026-10-07T18:00:00Z' }]);
+  assert.equal(state.sends[0].message, "Done. You're now set for Wed, Oct 7 at 2:00 PM ET instead. Our team will call to go over the details.");
+  await new Promise(r => setImmediate(r));
+  assert.match(state.cards[0].text, /LIVE CHAT RESCHEDULED — change the time in LP to Wed, Oct 7 at 2:00 PM/);
+  assert.match(state.cards[0].text, /same appointment was moved/);
+  assert.match(state.cards[0].text, /no LP lead was created/);
+  assert.match(state.cards[0].text, /moved the appointment on Thu, Oct 2, 6:00 PM ET to Wed, Oct 7 at 2:00 PM ET/);
+  assert.equal(state.cancels, undefined, 'a reschedule is not a cancel');
+});
+
+test('no open times, an unclear pick, or a failed move → a person calls to set it, with a card', async () => {
+  const none = laneWithCancel([...UP_TO_OFFER, TZ('inbound', 'yes', 70)], { freeSlots: [] });
+  await none.lane.processInbound(INBOUND('yes'));
+  assert.equal(none.state.sends[0].message, 'A team member will call you at (352) 555-0188 to set up a new time.');
+
+  const offerLine = 'Sure. I have Tue, Oct 6 at 10:00 AM or Wed, Oct 7 at 2:00 PM ET open. Which one works better for you?';
+  const unclear = laneWithCancel([...UP_TO_OFFER, TZ('inbound', 'yes', 70), TZ('outbound', offerLine, 80), TZ('inbound', 'neither of those', 100)], { freeSlots: SLOTS });
+  await unclear.lane.processInbound(INBOUND('neither of those'));
+  assert.match(unclear.state.sends[0].message, /team member will call you/);
+  assert.equal(unclear.state.moves, undefined);
+
+  const failed = laneWithCancel([...UP_TO_OFFER, TZ('inbound', 'yes', 70), TZ('outbound', offerLine, 80), TZ('inbound', 'the first one', 100)], { freeSlots: SLOTS, moveOk: false });
+  await failed.lane.processInbound(INBOUND('the first one'));
+  assert.match(failed.state.sends[0].message, /team member will call you/);
+  assert.doesNotMatch(failed.state.sends[0].message, /now set/);
+});
+
+// ── human voice (2026-10-02) ──────────────────────────────────────────
+
+test('human voice: a model draft with an em dash and stacked openers goes out clean', async () => {
+  const { lane, state } = makeLane({ llm: () => ({ message: 'Got it. Great question. Fogging is usually a failed seal — they are not repairable. How long has it been fogged?' }) });
+  const res = makeRes();
+  await lane.handle(makeReq(INBOUND('my window is foggy inside')), res);
+  assert.equal(state.sends.length, 1);
+  const sent = state.sends[0].message;
+  assert.ok(!sent.includes('—'), sent);
+  assert.ok(!/Great question/.test(sent), sent);
+  assert.match(sent, /failed seal\. They are not repairable/);
+  assert.ok(sent.includes('?'));
 });

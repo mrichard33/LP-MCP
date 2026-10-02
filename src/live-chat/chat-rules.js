@@ -36,9 +36,25 @@ const splitSentences = (t) => String(t || '').split(/(?<=[.!?])\s+/).map((s) => 
 const DAY = '(?:mon|tues|wednes|thurs|fri|satur|sun)day|tomorrow|tonight|this\\s+weekend|next\\s+(?:week|weekend)';
 const DAY_OFFER_RX = new RegExp(`\\b(?:${DAY})\\b[^.?!]{0,40}?\\b(?:morning|afternoon|evening|night|at\\s+\\d+|or\\s+(?:${DAY}))\\b|\\b(?:morning|afternoon|evening)\\s+(?:on\\s+)?(?:${DAY})\\b|\\b(?:openings?|slots?|availability)\\b[^.?!]{0,30}\\b(?:${DAY})\\b`, 'i');
 
-/** Sentences that offer a specific appointment time. Pure. */
-export function findTimeOffers(text) {
-  return splitSentences(text).filter((s) => CLOCK_RX.test(s) || SLOT_RX.test(s) || DAY_OFFER_RX.test(s));
+// The day/time words of a sentence: day names, parts of day, numbers.
+const TIME_TOKEN_RX = /\b(?:(?:mon|tues|wednes|thurs|fri|satur|sun)day|tomorrow|tonight|weekend|morning|afternoon|evening|night|\d{1,2})\b/gi;
+
+/**
+ * Sentences that offer a specific appointment time. Pure.
+ *
+ * 2026-10-02 ("Guest Visitor tzuzq"): a sentence that only repeats a time the
+ * VISITOR typed ("your appointment tomorrow evening at 6") is an echo, not an
+ * invented slot. Stripping it removed the one useful line and appended "a team
+ * member will call to set up a time" to someone who was cancelling.
+ */
+export function findTimeOffers(text, { visitorText = '' } = {}) {
+  const said = String(visitorText || '').toLowerCase();
+  const echoes = (s) => {
+    if (!said) return false;
+    const tokens = (s.toLowerCase().match(TIME_TOKEN_RX) || []);
+    return tokens.length > 0 && tokens.every((t) => new RegExp(`\\b${t}\\b`).test(said));
+  };
+  return splitSentences(text).filter((s) => (CLOCK_RX.test(s) || SLOT_RX.test(s) || DAY_OFFER_RX.test(s)) && !echoes(s));
 }
 
 /**
@@ -62,13 +78,18 @@ export const TIME_OFFER_NOTE =
  * a deterministic fix (offers stripped, the call-to-schedule line appended).
  * Pure.
  */
-export function guardTimeOffers(draft, { hasPhone = false, hasName = true } = {}) {
-  const offers = findTimeOffers(draft);
+export function guardTimeOffers(draft, { hasPhone = false, hasName = true, visitorText = '' } = {}) {
+  const offers = findTimeOffers(draft, { visitorText });
   if (!offers.length) return { notes: [], fixed: String(draft || '') };
   const kept = splitSentences(draft).filter((s) => !offers.includes(s));
   // Drop a dangling question that only made sense with the times ("Which works better for you?").
   const cleaned = kept.filter((s) => !/\b(?:which|what)\s+(?:one\s+)?(?:works|time|day)\b/i.test(s));
-  return { notes: [TIME_OFFER_NOTE], fixed: [...cleaned.filter((s) => !s.includes('?')), bookingHandoffLine({ hasPhone, hasName })].join(' ').trim() };
+  // 2026-10-02: an existing name/phone ask — with or without its "?" — goes
+  // too, or the appended line asks for the number a second time (tzuzq:
+  // "...best phone number to reach you on. A team member will call you...
+  // What's the best phone number to reach you?").
+  const noAsk = cleaned.filter((s) => !s.includes('?') && !asksForPhone(s));
+  return { notes: [TIME_OFFER_NOTE], fixed: [...noAsk, bookingHandoffLine({ hasPhone, hasName })].join(' ').trim() };
 }
 
 // ── 2. Spanish → a person ───────────────────────────────────────────────────
@@ -305,11 +326,53 @@ export const VISIT_NEXT_STEP_LINE = 'The next step is a free in-home measurement
  */
 // "No thanks", "not interested", "bye": the dead-end rule never pitches the
 // visit after a no (NEPQ: two no's in a row go to a person, never a third ask).
-const DECLINE_RX = /\b(?:no\s+thanks?|no\s+thank\s+you|not\s+interested|leave\s+me\s+alone|good\s*bye|bye|never\s*mind|nevermind)\b/i;
+// 2026-10-02 ("Guest Visitor tzuzq"): "don't waste your time coming", "no
+// time. do not come", "you won't be allowed in" each got the in-home pitch
+// bolted on, because this list did not know them. The model had already
+// flagged the chat recommended_action=suppress; that signal counts too
+// (`declined` below).
+const DECLINE_RX = /\b(?:no\s+thanks?|no\s+thank\s+you|not\s+interested|leave\s+me\s+alone|good\s*bye|bye|never\s*mind|nevermind|(?:don'?t|do\s+not|dont)\s+(?:come|need|want|bother|call|text)|not\s+buying|waste\s+(?:your|my)\s+time|won'?t\s+be\s+allowed|stop\s+(?:texting|messaging|contacting)|not\s+for\s+me|no\s+time)\b/i;
 
-export function guardChatFlow(draft, { thread = [], hasName = false, hasPhone = false, body = '', bookingAllowed = true } = {}) {
+/** Is the visitor saying no / go away? Pure. */
+export function isDecline(text) {
+  return DECLINE_RX.test(String(text || ''));
+}
+
+// What a reply to a "no" must not carry: the visit pitch and the number ask.
+const PITCH_RX = /\bin-home\b|\bmeasurement\b|\bteam\s+member\s+will\s+call\b|\bset\s+(?:it|that|a\s+time)\s+up\b|\bset\s+up\s+a\s+time\b|\b(?:phone\s+)?number\b|\bfirst\s+name\b/i;
+
+/** Remove sentences that pitch the visit or ask for contact details. Pure. */
+export function stripPitch(text) {
+  return splitSentences(text).filter((s) => !PITCH_RX.test(s)).join(' ').trim();
+}
+
+/** A reply never says the same thing twice, nor asks for the number twice. Pure. */
+export function dedupeSentences(text) {
+  const seen = new Set();
+  let phoneAsks = 0;
+  const out = [];
+  for (const s of splitSentences(text).reverse()) {
+    const key = s.toLowerCase().replace(/[^a-z0-9 ]/g, '').replace(/\s+/g, ' ').trim();
+    if (seen.has(key)) continue;
+    if (asksForPhone(s) && /\?|\bwhat'?s\b|\bbest\b/i.test(s)) { if (phoneAsks++) continue; }
+    seen.add(key);
+    out.unshift(s);
+  }
+  return out.join(' ');
+}
+
+export const DECLINE_CLOSE_LINE = "Understood. Take care, and if anything changes, we're here.";
+
+export function guardChatFlow(draft, { thread = [], hasName = false, hasPhone = false, body = '', bookingAllowed = true, declined = false } = {}) {
   const notes = [];
   let fixed = String(draft || '');
+
+  // A "no" gets a polite close: no pitch, no ask, nothing appended.
+  if (declined || isDecline(body)) {
+    const kept = dedupeSentences(stripPitch(cutSecondQuestion(fixed)));
+    if (kept !== fixed.trim()) notes.push('The visitor said no. Acknowledge it in a few words and close politely. Do not pitch the visit or ask for a name or number.');
+    return { notes, fixed: kept || DECLINE_CLOSE_LINE };
+  }
 
   if (OR_SECOND_QUESTION_RX.test(fixed)) {
     notes.push('Your previous draft joined two questions with "or". Ask ONE question.');
@@ -339,5 +402,5 @@ export function guardChatFlow(draft, { thread = [], hasName = false, hasPhone = 
   }
   // Everything was a repeat and nothing is missing: the next step itself.
   if (!fixed.trim()) fixed = bookingHandoffLine({ hasName, hasPhone });
-  return { notes, fixed };
+  return { notes, fixed: dedupeSentences(fixed) };
 }
