@@ -55,7 +55,7 @@ import { enforceCallTiming } from '../agentic/team-hours.js';
 import { rewriteBookingClaims } from '../agentic/booking-claim.js';
 import { looksLikeShortPhone } from '../agentic/contact-typos.js';
 import { planNepqTurn, enforceNepqPlan, nepqBackboneMode, pickFresh, LINES as NEPQ_LINES } from '../agentic/nepq-planner.js';
-import { COLLECT_ASK, COLLECT_ASK_AGAIN, dmAsk, holdLine, missingItems, parseDecisionMakers, heldSlot, nameFromReply } from '../agentic/booking-collect.js';
+import { COLLECT_ASK, COLLECT_ASK_AGAIN, dmAsk, holdLine, missingItems, parseDecisionMakers, heldSlot, nameFromReply, addressConfirmAsk, addressConfirmState, mentionedPartner, dmAnswerFromThread } from '../agentic/booking-collect.js';
 import { contactRecheckLine } from '../agentic/contact-check.js';
 import { chatIdentity } from './identity-capture.js';
 import {
@@ -1299,17 +1299,28 @@ export function createLiveChatFastLane(deps) {
         // An unclear answer still counts as asked: never loop on it.
         decisionMakers = dm || 'Uncertain';
       }
+      // An answer given earlier in this chat travels to the booking too.
+      if (!decisionMakers) { const earlier = dmAnswerFromThread(threadTurns); if (earlier && earlier !== 'conflict') decisionMakers = earlier; }
       const name = typed.first_name || firstName || null;
+      // 2026-10-02 (Mark's 5:22 PM chat): an address the visitor did not type
+      // here (a merged or older contact's) is read back once; a "no" asks for
+      // it. A spouse named in THIS chat is asked about once, whatever an old
+      // record says, and the answer rides on the booking.
+      const typedAddress = !!(typed.address_line1 && (typed.postal_code || contact?.postalCode));
+      const onFileAddress = !typedAddress && !!(contact?.address1 && contact?.postalCode);
+      const addrState = addressConfirmState([...threadTurns, ...(threadTurns.length && threadTurns[threadTurns.length - 1]?.text === body ? [] : [{ direction: 'inbound', text: body }])]);
+      const partner = mentionedPartner(allTexts);
       const missing = missingItems({
         hasName: hasName || !!typed.first_name,
         hasPhone: hasPhone || !!typed.phone,
-        hasAddress: !!((contact?.address1 || typed.address_line1) && (contact?.postalCode || typed.postal_code)),
-        dmKnown: !!decisionMakers || dmOnContact(contact),
+        hasAddress: typedAddress || (onFileAddress && addrState !== 'rejected'),
+        confirmAddress: onFileAddress && (addrState === 'unasked' || addrState === 'pending'),
+        dmKnown: !!decisionMakers || (!partner && dmOnContact(contact)),
         channel: 'livechat',
       });
       if (missing.length) {
         // Asked before in this chat: the second wording (never the same question twice).
-        const firstAsk = missing[0] === 'dm' ? dmAsk(allTexts) : COLLECT_ASK[missing[0]];
+        const firstAsk = missing[0] === 'dm' ? dmAsk(allTexts) : missing[0] === 'address_confirm' ? addressConfirmAsk(contact) : COLLECT_ASK[missing[0]];
         const askLine = pickFresh([firstAsk, COLLECT_ASK_AGAIN[missing[0]]].filter(Boolean), plan.recent_outbound || [], 0);
         // 2026-10-02 (Mark): no opener twice in a row ("Got it." … "Got it.").
         const ack = (typed.first_name && plan.held_slot?.asked === 'name') ? `Thanks, ${typed.first_name}.` : pickFresh(['Got it.', 'Perfect, thanks.', 'Great, thank you.'], plan.recent_outbound || [], 0);
@@ -1323,7 +1334,15 @@ export function createLiveChatFastLane(deps) {
       const when = `${chosen.day} at ${chosen.time} ${tz}`.trim();
       let res = null;
       try {
-        res = await d.bookSlot({ contactId, startIso: chosen.iso, calendarId: slots.calendarId || null, decisionMakers });
+        // The visit address rides on the appointment itself (Mark: every
+        // booking carries the address), typed here or confirmed on file.
+        const address = typedAddress
+          ? [typed.address_line1, typed.city, [typed.state, typed.postal_code || contact?.postalCode].filter(Boolean).join(' ')].filter(Boolean).join(', ')
+          : [contact?.address1, contact?.city, [contact?.state, contact?.postalCode].filter(Boolean).join(' ')].filter(Boolean).join(', ');
+        if (typedAddress && contact?.address1 && !String(contact.address1).toLowerCase().includes(String(typed.address_line1).toLowerCase().split(' ').slice(0, 2).join(' '))) {
+          d.warn(`[LiveChat] ${contactId} gave a visit address that differs from the contact's (${contact.address1}); the appointment carries the new one`);
+        }
+        res = await d.bookSlot({ contactId, startIso: chosen.iso, calendarId: slots.calendarId || null, decisionMakers, address: address || null });
       } catch (err) {
         res = { ok: false, error: err.message };
       }

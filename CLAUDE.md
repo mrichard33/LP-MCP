@@ -279,7 +279,11 @@ handed to a person.
 status `new` (the handler forces it). **Ask about decision makers ONCE, then book** (supersedes 2026-09-18):
 the text bot booked 12 visits 08-03..09-07 and none after the 09-18 "all decision makers attend" block, and
 a lead who asked for "tomorrow" three times gave up. `decision_maker_unresolved` is no longer reported; only
-"my wife can't make that time" moves the time. A visit goes on `inHomeCalendarFor(tags)`: Measurement Verification for a
+"my wife can't make that time" moves the time. **Every booking carries the visit address** (`payload.address` →
+the GHL appointment's `address`): an address the visitor did not type in this chat (a merged or older contact's)
+is read back once ("Is the visit at 12 Main St, Ocala?", `addressConfirmState`), a "no" asks for it, and a spouse
+named in THIS chat is asked about once whatever an old record says (`mentionedPartner` / `dmAnswerFromThread`), the
+answer riding on the booking as `decision_makers_present`. A visit goes on `inHomeCalendarFor(tags)`: Measurement Verification for a
 calculator lead (`active-entry:estimate-calculator` / `active-entry:calculator`), Window Estimate for everyone
 else; with NEPQ live the SMS bot books a visit too, and the 15-minute call (PPR) is only the backup when the lead
 asks for a call or turns the visit down (`prefersCall`). A yes to the bridge, even "yeah, how long does it take?",

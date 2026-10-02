@@ -4455,6 +4455,13 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
 
     const inHome = isInHomeCalendarId(targetCalId);
     if (inHome) {
+      // 2026-10-02 (Mark: every booking carries the address): the visit
+      // address on the GHL appointment, from what we know of the lead.
+      const idn = identityState?.identity || {};
+      const visitAddress = idn.address_line1
+        ? [idn.address_line1, idn.city, [idn.state, idn.postal_code].filter(Boolean).join(' ')].filter(Boolean).join(', ')
+        : null;
+      if (visitAddress && !cap.address) cap.address = visitAddress;
       // In-home: status tracks decision-maker confirmation. 'confirmed' only
       // when decision-makers are confirmed (Yes | Solo Owner), else 'new'
       // (tentative; a human confirms).

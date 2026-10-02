@@ -520,6 +520,10 @@ function buildAppointmentBody(payload, contactId) {
   };
   if (assignedUserId) body.assignedUserId = assignedUserId;
   if (ignoreFreeSlotValidation) body.ignoreFreeSlotValidation = true;
+  // 2026-10-02 (Mark: every booking carries the address): the visit address
+  // shows on the GHL appointment, so the team sees where the visit is even
+  // when the contact record holds an older one.
+  if (typeof payload.address === 'string' && payload.address.trim()) body.address = payload.address.trim().slice(0, 300);
 
   return { body, calendarId, startTime, endTime, title, status, ignoreFreeSlotValidation };
 }
