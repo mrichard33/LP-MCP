@@ -271,21 +271,14 @@ async function clearLPDNC({ contactId, ghlContact, payload, empId, prospectId, l
         phone,
       });
     } catch (err) {
-      const { name } = await resolveContactInfo(contactId, {});
+      // No group card (2026-10-02, the user's ruling). LP refuses every clear
+      // value tried so far, so this fired on every lift — and once per executor
+      // retry, three times each: 34 of the last 100 posts in Reece Lead
+      // Intelligence were this card. The tag, the log line and the failed
+      // action row stay; the DNC-lift thread reply tells the approver LP needs
+      // a manual clear.
       await applyGHLTag(contactId, 'lp-dnc-clear-failed').catch(() => {});
-      const failMsg = buildRichNotification({
-        baseMessage: `LP DNC CLEAR FAILED: could not wipe LP DNC (single-space newDncStatus)`,
-        name,
-        phone,
-        contactId,
-        prospectId,
-        enrichment: { lpLeadId: lpLeadId || null, empId },
-      });
-      await sendGroupMeMessage(
-        `${failMsg}\nError: ${String(err.message).slice(0, 250)}\n` +
-        `Check the prospect ID and empid in LP. Manual recovery may be required.`,
-        { flushNow: true },
-      ).catch(() => {});
+      console.warn(`[LP-DNC] CLEAR failed for contact ${contactId} (prospect ${prospectId}, empid ${empId}): ${String(err.message).slice(0, 250)}`);
       throw err;
     }
   }
