@@ -29,7 +29,7 @@ export function startSaleBackstopScheduler() {
     console.log('[SaleBackstop] disabled (SALE_ANNOUNCE_BACKSTOP_ENABLED=false)');
     return;
   }
-  console.log('[SaleBackstop] Scheduler started — every 10 min, 30 min grace after LP shows a Sale');
+  console.log('[SaleBackstop] Scheduler started — every 10 min, 10 min grace after LP shows a Sale');
   const tick = async () => {
     try {
       await runJob(JOB_ID, () => runSaleBackstop());
