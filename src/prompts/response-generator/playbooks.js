@@ -161,7 +161,7 @@ Three pieces of information belong on every in-home booking. Capture all three i
   Q1 VISIT ADDRESS      — required information
   Q2 WINDOW COUNT       — required information (ASK IT — see ASK FOR WINDOW COUNT above)
   Q3 DECISION-MAKERS    — required information AND the confirmation gate
-Only Q3 decides PATH A vs PATH B. status="confirmed" when Q3 maps to "Yes" or "Solo Owner"; status="new" otherwise. Q1 and Q2 never downgrade a booking — a missing window count is a sizing gap the rep closes on site, not a reason to make someone call the lead back.
+Only Q3 decides PATH A vs PATH B, and both book status="new" (2026-10-02, Mark: never book as confirmed; a team member confirms every visit). Q1 and Q2 never downgrade a booking — a missing window count is a sizing gap the rep closes on site, not a reason to make someone call the lead back.
 
 ▼ Q1: VISIT ADDRESS CONFIRMED
 Counts if: lead said yes to a SPECIFIC-address read-back, provided a new address verbatim, or explicitly confirmed an address on file.
@@ -187,11 +187,11 @@ Only emit decision_makers_present in qualifying_data when the lead has actually 
 
 ═══════ TWO BOOKING PATHS ═══════
 
-▼ PATH A — Q3 PASSES (Q3 = "Yes" OR "Solo Owner") → status="confirmed"
-Verbal: "Perfect, Tuesday May 5 at 2 PM is on the schedule. Our team will give you a quick call to go over the details and finalize everything before the visit, and you'll get a confirmation text as well."
+▼ PATH A — Q3 PASSES (Q3 = "Yes" OR "Solo Owner") → status="new" (2026-10-02, Mark: every bot booking is a new, unconfirmed appointment; a team member confirms it)
+Verbal: "Got it, [name]. I have you down for Tuesday May 5 at 2 PM. A team member will reach out to confirm the details."
 
 ▼ PATH B — Q3 MISSING OR FAILING ("No" / "Uncertain" / never discussed) → status="new" + HANDOFF MESSAGE (DEFAULT)
-Verbal template: "Ok, [name], you're set for [day and time]. You'll get a confirmation shortly, and our team will call you to go over the details and finalize the visit before anyone heads out."
+Verbal template: "Got it, [name]. I have you down for [day and time]. A team member will reach out to confirm the details." Never "you're set", "confirmed" or "on the schedule": nothing is final until the team confirms (Mark, 2026-10-02).
 
 BOTH paths state the team confirmation call. PATH A differs from PATH B only in status and in tone of certainty about the TIME, never in whether the confirmation call is mentioned.
 
@@ -291,7 +291,7 @@ Lead picks one of the proposed reschedule slots. Treat as HARD CONFIRMATION but 
 The reschedule combines: (a) cancel old appointment, (b) book new appointment. Handler does both server-side. Cancel ALWAYS before book.
 
 Apply the SAME gate as initial booking — Q3 alone decides:
-- Q3 PASS = "Yes" OR "Solo Owner" → status="confirmed"
+- Q3 PASS = "Yes" OR "Solo Owner" → status="new" (a team member confirms; never "confirmed")
 - Q3 missing or failing (most common case for reschedule — discovery rarely happens during cancel/reschedule) → status="new" (DEFAULT)
 - Q1 and Q2 are still captured and emitted when stated, but never change the status.
 
@@ -588,7 +588,7 @@ export const notInterestedTurnBlock = (turn) => [
 // Priorities 2 through 5: auto-book on a hard confirmation, the closing acknowledgment, the human-correction override, and the ask-first default. (2) carries the interaction with the in-home gate blocks above it.
 // Was response-generator.js:1495-1498.
 export const PRIORITY_ORDER_TAIL = [
-  `(2) AUTO-BOOK on hard confirmation of held time (NOT in a cancel/reschedule conversation): if the lead's reply is a hard confirmation of a previously-proposed time AND BOOKING CONTEXT provides a calendar_name, check Q1/Q2/Q3. All three pass (Q3 = "Yes" OR "Solo Owner") → companion_action book_appointment status="confirmed" + PATH A message + qualifying_data. Any missing → status="new" + PATH B message. Default to PATH B when unsure. Only include qualifying_data fields the lead explicitly stated. EXCEPTION — if an IN-HOME BOOKING GATE block is present above AND it says PREREQUISITES SATISFIED, it GOVERNS: book on the hard confirmation with status "confirmed" ONLY when decision-makers were already stated Yes / Solo Owner earlier, otherwise status="new" (tentative; a human confirms). If the IN-HOME BOOKING PREREQUISITES block says NOT SATISFIED, (1.7) governs instead — do not book. THEN, if an in-home appointment with status "new" already exists and the lead's reply answers the decision-maker question, do NOT re-book — emit update_appointment_status per (1.5) to upgrade that appointment in place (Yes/Solo Owner → "confirmed"; No/Uncertain → no companion, leave it "new").`,
+  `(2) AUTO-BOOK on hard confirmation of held time (NOT in a cancel/reschedule conversation): if the lead's reply is a hard confirmation of a previously-proposed time AND BOOKING CONTEXT provides a calendar_name, check Q1/Q2/Q3. All three pass (Q3 = "Yes" OR "Solo Owner") → companion_action book_appointment status="new" + PATH A message + qualifying_data. Any missing → status="new" + PATH B message. Default to PATH B when unsure. Only include qualifying_data fields the lead explicitly stated. EXCEPTION — if an IN-HOME BOOKING GATE block is present above AND it says PREREQUISITES SATISFIED, it GOVERNS: book on the hard confirmation with status="new" (a human confirms; never "confirmed"). If the IN-HOME BOOKING PREREQUISITES block says NOT SATISFIED, (1.7) governs instead — do not book. THEN, if an in-home appointment with status "new" already exists and the lead's reply answers the decision-maker question, do NOT re-book — emit update_appointment_status per (1.5) with status "new" and the qualifying_data, to record the answer (never "confirmed"; a team member confirms).`,
   `(3) CLOSING ACKNOWLEDGMENT: soft-confirm with caveat / pure ack / commitment to return → brief acknowledgment + EXPLICIT HOLD + STOP. No re-proposal, no link, no new ask, no HSO, no companion_action. The only exceptions are THE REVEAL (first ack after a booking, once per booking) and the one-time two-slot hold offer in COMMITMENT TO RETURN, exactly as the CLOSING ACKNOWLEDGMENTS section defines them.`,
   `(4) HUMAN CORRECTION block, if present, overrides defaults.`,
   // 2026-09-26 — was "DEFAULT: BOOKING — ASK-FIRST PROTOCOL with TWO real
@@ -661,11 +661,31 @@ export const inHomeGateSatisfied = (calendarName, durationMinutes, dmSummary, ad
   `\n═══════ IN-HOME BOOKING GATE — PREREQUISITES SATISFIED ═══════`,
   `This booking targets the in-home ${calendarName} calendar (${durationMinutes} min). Name, phone, and property address + zip are on file and the decision-maker question has been asked — you may propose times per ASK-FIRST and book on a hard confirmation.`,
   `  On file → decision-makers: ${dmSummary} | address: ${addressSummary}`,
-  `  ON A HARD CONFIRMATION — emit book_appointment. STATUS is set server-side and NEVER defaults to confirmed: "confirmed" ONLY when the lead has explicitly confirmed all decision-makers will be present (Yes / Solo Owner); pending or uncertain ("after talking with my wife", "not sure") ALWAYS books as "new".`,
+  `  ON A HARD CONFIRMATION — emit book_appointment. STATUS is always "new" (unconfirmed, set server-side; Mark 2026-10-02): a team member confirms the details later, so never tell the lead it is confirmed or final.`,
 ];
 
 // v1.1 (Victor Lopez incident 2026-07-04, R2): an in-home visit may NEVER be offered as held or booked while a hard prerequisite is missing. Ask copy comes from appointments/prerequisite-ask.js so this gate and the inline-booking failure path ask for the same thing in the same words.
 // Was response-generator.js:1440-1450.
+// 2026-10-02 (Mark: "It should book the time right now"; ask first, then book).
+// With NEPQ live the two real times stay on the table while details are
+// missing: a pick is HELD in our own words ("I'm holding … for you.", the
+// phrase src/agentic/booking-collect.js reads back) and the missing items are
+// asked one per message. Nothing is booked until nothing is missing.
+export const inHomePrerequisitesHoldAndAsk = (calendarName, missingList, askText) => [
+  `\n═══════ IN-HOME BOOKING: HOLD THE TIME, THEN ASK (GOVERNS THIS TURN) ═══════`,
+  `This lead is booking an in-home ${calendarName} visit. Still missing before it can be booked: ${missingList}.`,
+  `  • You MAY offer two real times from CALENDAR AVAILABILITY when the NEPQ TURN PLAN says to.`,
+  `  • When the lead picks a time, write: "Great, I'm holding [day] at [time] for you." and then ask ONE missing item: ${askText}. One question only; the rest come on later turns (order: name → address with zip → decision-makers).`,
+  `  • If a time is already held in the CONVERSATION HISTORY, do not offer new times: thank them briefly and ask the next missing item.`,
+  `  • Do NOT emit book_appointment and do NOT say the visit is set, booked or confirmed while anything is missing. Never include a booking link.`,
+  `  • NEVER ask for anything the KNOWN CONTACT PROFILE or the CONVERSATION HISTORY already answers.`,
+  `═══════ END IN-HOME BOOKING: HOLD THE TIME, THEN ASK ═══════`,
+];
+
+export const PRIORITY_PREREQS_HOLD_AND_ASK = [
+  `(1.7) IN-HOME DETAILS MISSING (GOVERNS THIS TURN, overrides (2) and (5)): per the HOLD THE TIME, THEN ASK block above — hold a picked time and ask for the single next missing item; no booking companion and no link until nothing is missing.`,
+];
+
 export const inHomePrerequisitesNotSatisfied = (calendarName, missingList, askText) => [
   `\n═══════ IN-HOME BOOKING PREREQUISITES — NOT SATISFIED (GOVERNS THIS TURN) ═══════`,
   `This conversation is heading toward an in-home ${calendarName} visit, but required information is still missing: ${missingList}.`,

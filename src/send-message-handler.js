@@ -318,6 +318,7 @@ import {
 import { timezoneForZip } from './services/contact-timezone.js';
 import { findNearDuplicate } from './services/message-similarity.js';
 import { checkNotSuperseded, commitAgenticSend } from './services/agentic-reply-locks.js';
+import { findNewerInbound } from './agentic/burst-yield.js';
 import { emitEvent } from './event-emitter.js';
 import { routeNepqHandoff } from './agentic/nepq-handoff.js';
 // 2026-09-18 — the decision-maker handoff writes its rep task as a GHL note
@@ -3859,6 +3860,25 @@ export async function executeSendMessage(action, context) {
     }
   } catch (qualityErr) {
     console.warn(`[SendMessage] quality-pass checks threw for ${contactId} (fail-open): ${qualityErr.message}`);
+  }
+
+  // ── One reply per burst (2026-10-02, Mark) ──
+  // After any regeneration and before the inline booking: a newer real
+  // message from the lead, past the last one this reply answers, has its own
+  // reply job, and that job answers everything since our last reply. Read
+  // from our event log, not GHL's lagging thread. See burst-yield.js.
+  if (sourceEventMeta?.event_type === 'ai.analysis_completed') {
+    const newer = await findNewerInbound({ contactId, payload: sourceEventMeta.payload || {} }, { supabase });
+    if (newer) {
+      console.log(`[SendMessage] ⏭️ superseded_by_newer_message: ${contactId} action ${action.id} — inbound event ${newer.id} came after this reply's batch; its own job answers both`);
+      return {
+        skipped: true,
+        reason: 'superseded_by_newer_message',
+        newer_reply_event_id: newer.id,
+        contact_id: contactId,
+        channel,
+      };
+    }
   }
 
   // ── Book BEFORE we promise (2026-08-13) ────────────────────────

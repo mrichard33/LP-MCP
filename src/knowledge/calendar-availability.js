@@ -48,6 +48,10 @@ const FETCH_TIMEOUT_MS = 10_000;
 // named a specific day. See selectOfferableSlots below.
 const OFFER_WINDOW_HOURS = parseInt(process.env.BOOKING_OFFER_WINDOW_HOURS || '48', 10);
 const MIN_NOTICE_HOURS = parseInt(process.env.BOOKING_MIN_NOTICE_HOURS || '4', 10);
+// 2026-10-02 (Mark): "if someone needs a call back … this can happen anytime
+// during business hours." A phone call needs no drive time, so the call
+// calendar (PPR) floors at 30 minutes, not the 4 hours a home visit needs.
+export const CALL_MIN_NOTICE_HOURS = Number.parseFloat(process.env.BOOKING_CALL_MIN_NOTICE_HOURS || '0.5');
 const ESCALATION_LADDER = (process.env.BOOKING_ESCALATION_LADDER || '48,72,96,168')
   .split(',').map((s) => parseInt(s.trim(), 10)).filter((n) => Number.isFinite(n) && n > 0)
   .sort((a, b) => a - b);
@@ -93,6 +97,19 @@ export function spreadOffer(slots, maxOffer = MAX_OFFER_SLOTS, { pool = null, ti
   }
   const second = candidates.find((s) => t(s) - t(first) >= OFFER_GAP_MS) || candidates[0];
   return second ? [first, second] : [first];
+}
+
+/**
+ * The two call times to offer: the soonest, then the first one at least an
+ * hour after it (the same day allowed). Pure.
+ */
+export function spreadCallOffer(slots, maxOffer = MAX_OFFER_SLOTS) {
+  const list = Array.isArray(slots) ? slots : [];
+  if (maxOffer !== 2 || list.length < 2) return list.slice(0, maxOffer);
+  const t = (s) => new Date(s.iso).getTime();
+  const first = list[0];
+  const second = list.find((s) => t(s) - t(first) >= 3600_000) || list[1];
+  return [first, second];
 }
 
 /**
@@ -340,7 +357,8 @@ export function selectOfferableSlots(availability, preferred, opts = {}) {
   if (!availability || !Array.isArray(availability.slots)) return none(availability || null);
 
   const tz = availability.timezone || DEFAULT_TIMEZONE;
-  const minNotice = Number.isFinite(opts.minNoticeHours) ? opts.minNoticeHours : MIN_NOTICE_HOURS;
+  const call = opts.call === true;
+  const minNotice = Number.isFinite(opts.minNoticeHours) ? opts.minNoticeHours : (call ? CALL_MIN_NOTICE_HOURS : MIN_NOTICE_HOURS);
   const offerWindow = Number.isFinite(opts.offerWindowHours) ? opts.offerWindowHours : OFFER_WINDOW_HOURS;
   const maxOffer = Number.isFinite(opts.maxOffer) ? opts.maxOffer : MAX_OFFER_SLOTS;
 
@@ -349,19 +367,25 @@ export function selectOfferableSlots(availability, preferred, opts = {}) {
   const ms = (s) => new Date(s.iso).getTime();
 
   // 1. Floor — a 90-min in-home visit cannot be offered for 40 min from now.
+  // A call is offered only while the team is in (opts.isOpen, team-hours.js),
+  // whatever the calendar itself allows.
+  const isOpen = call && typeof opts.isOpen === 'function' ? opts.isOpen : () => true;
   const afterFloor = availability.slots
-    .filter((s) => Number.isFinite(ms(s)) && ms(s) >= floorMs)
+    .filter((s) => Number.isFinite(ms(s)) && ms(s) >= floorMs && isOpen(ms(s)))
     .sort((a, b) => ms(a) - ms(b));
 
   // `pool`: where the second offered time may come from. A day the lead named
   // keeps both times on that day; otherwise the next open day, up to a week.
+  // A call: the soonest time and the next one an hour or more later, the same
+  // day if it has one (no next-day spread: the visit rule is about drive days).
+  const pick = (slots, pool) => (call ? spreadCallOffer(slots, maxOffer) : spreadOffer(slots, maxOffer, { pool, timezone: tz }));
   const pack = (slots, window, extra = {}, pool = slots) => ({
-    slots: spreadOffer(slots, maxOffer, { pool, timezone: tz }),
+    slots: pick(slots, pool),
     window,
     escalated_to_hours: null,
     preferred_honored: false,
     availability: {
-      slots: spreadOffer(slots, maxOffer, { pool, timezone: tz }),
+      slots: pick(slots, pool),
       calendar_id: availability.calendar_id,
       timezone: tz,
       slots_total_count: slots.length,

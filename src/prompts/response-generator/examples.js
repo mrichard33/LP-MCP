@@ -82,7 +82,7 @@ EXAMPLE B1 (PATH B — zero qualifiers — the action 30435 case):
     [inbound]  "2 works"  ← TRIGGER
   →
   {
-    "message": "Ok, Mark, you're set for Tuesday May 5 at 2 PM. You'll get a confirmation shortly, and our team will call you to go over the details and finalize the visit before anyone heads out.",
+    "message": "Got it, Mark. I have you down for Tuesday May 5 at 2 PM. A team member will reach out to confirm the details.",
     "companion_action": {
       "action_type": "book_appointment",
       "action_payload": {

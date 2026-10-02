@@ -49,6 +49,7 @@ function makeLane({
     secret: () => SECRET,
     hardTimeoutMs: () => hardTimeoutMs,
     contextCapMs: () => contextCapMs,
+    quietMs: () => 0,
     log: () => {},
     warn: () => {},
     fetchContact: async () => ({ id: 'C1', firstName, tags, phone, email: null }),
@@ -727,6 +728,34 @@ test('tzuzq: two messages 28s apart → only the newer one is answered; the olde
   assert.equal(skipped.error_message, 'superseded_by_newer_message');
 });
 
+// 2026-10-02 (Mark): "when a lead rapidly fires multiple messages … the reply
+// should be combined." Three messages inside the quiet period → one reply,
+// written once, after the last; no model call for the first two.
+test('burst: three quick messages → one reply, written after the last one', async () => {
+  const { lane, state } = makeLane({ extra: { quietMs: () => 60 }, llm: () => ({ message: 'Got all of that. Which rooms bother you most?' }) });
+  const a = lane.processInbound(INBOUND('hi'));
+  await new Promise(r => setTimeout(r, 10));
+  const b = lane.processInbound(INBOUND('my windows are old'));
+  await new Promise(r => setTimeout(r, 10));
+  const c = lane.processInbound(INBOUND('and the slider sticks'));
+  const outs = await Promise.all([a, b, c]);
+  assert.deepEqual(outs.map(o => o.outcome), ['superseded', 'superseded', 'sent']);
+  assert.equal(state.sends.length, 1, 'one reply, not three');
+  assert.equal(state.llmCalls.length, 1, 'the first two never reach the model');
+  assert.equal(state.updates.filter(u => u.error_message === 'superseded_by_newer_message').length, 2);
+});
+
+test('burst: a superseded turn that times out sends no holding line', async () => {
+  let n = 0;
+  const { lane, state } = makeLane({ hardTimeoutMs: 40, llmDelayMs: 200, llm: () => ({ message: `Reply ${++n}.` }) });
+  const first = lane.processInbound(INBOUND('first message'));
+  await new Promise(r => setTimeout(r, 10));
+  const second = lane.processInbound(INBOUND('second message'));
+  await Promise.all([first, second]);
+  const holding = state.sends.filter(x => x.inboundMessage === 'first message');
+  assert.equal(holding.length, 0, 'the older turn stays silent');
+});
+
 // ── 2026-10-02 (Mark): "yes, a different day" books a real open time ───────
 const OFFER = 'Thanks, Rick. I found your appointment for Thu, Oct 2, 6:00 PM ET. Would a different day work better instead of cancelling?';
 const UP_TO_OFFER = [TZ('inbound', 'cancel my appointment', 0), TZ('outbound', "I can help with that. What's the full name and phone number the appointment is under?", 13), TZ('inbound', 'Rick Fox 3525550188', 40), TZ('outbound', OFFER, 50)];
@@ -817,9 +846,10 @@ test('a second draft starts only when it can finish inside the deadline', async 
 // ── NEPQ backbone, live (2026-10-02, Mark) ────────────────────────────
 
 const NEPQ_SLOTS = [{ iso: '2026-10-06T14:00:00Z', day: 'Tue, Oct 6', time: '10:00 AM', dayOfWeek: 'Tuesday' }, { iso: '2026-10-07T18:00:00Z', day: 'Wed, Oct 7', time: '2:00 PM', dayOfWeek: 'Wednesday' }];
-function nepqLane({ messages = [], llm, bookOk = true, phone = '+13525550188', recentTurns = null } = {}) {
+function nepqLane({ messages = [], llm, bookOk = true, phone = '+13525550188', recentTurns = null, contact = null } = {}) {
   const box = {};
   const extra = {
+    ...(contact ? { fetchContact: async () => ({ id: 'C1', firstName: 'Alyce', tags: [], phone, email: null, ...contact }) } : {}),
     nepqMode: () => 'live',
     offerBookingSlots: async () => { box.state.slotReads = (box.state.slotReads || 0) + 1; return { slots: NEPQ_SLOTS, tzLabel: 'ET', calendarId: 'CALWE' }; },
     bookSlot: async (a) => { box.state.bookings = [...(box.state.bookings || []), a]; return bookOk ? { ok: true, action_id: 77 } : { ok: false, error: 'appointment_blocked_prerequisites' }; },
@@ -848,21 +878,63 @@ test('NEPQ live: "let me think about it" gets two REAL times, no model call', as
   assert.equal(state.sends[0].message, "No problem at all. Want to grab a time now so you don't have to chase us down later? I have Tue, Oct 6 at 10:00 AM ET or Wed, Oct 7 at 2:00 PM ET.");
 });
 
-test('NEPQ live: a picked time is booked, then confirmed with Mark\'s line', async () => {
+// A contact with everything the in-home gate needs (address, decision-maker answer).
+const READY_CONTACT = { address1: '123 Main St', postalCode: '33601', tags: ['booking:dm-asked'] };
+
+test('NEPQ live: a picked time with nothing missing is booked, and nothing sounds final', async () => {
   const offer = "No problem at all. Want to grab a time now so you don't have to chase us down later? I have Tue, Oct 6 at 10:00 AM ET or Wed, Oct 7 at 2:00 PM ET.";
-  const { lane, state } = nepqLane({ messages: [M('inbound', 'let me think about it', 3), M('outbound', offer, 2)] });
+  const { lane, state } = nepqLane({ contact: READY_CONTACT, messages: [M('inbound', 'let me think about it', 3), M('outbound', offer, 2)] });
   await lane.processInbound(INBOUND('wednesday works'));
-  assert.deepEqual(state.bookings, [{ contactId: 'C1', startIso: '2026-10-07T18:00:00Z', calendarId: 'CALWE' }]);
-  assert.equal(state.sends[0].message, "You're set for Wed, Oct 7 at 2:00 PM ET, Alyce. Our team will call to go over the details.");
+  assert.deepEqual(state.bookings, [{ contactId: 'C1', startIso: '2026-10-07T18:00:00Z', calendarId: 'CALWE', decisionMakers: null }]);
+  assert.equal(state.sends[0].message, 'Got it, Alyce. I have you down for Wed, Oct 7 at 2:00 PM ET. A team member will reach out to confirm the details.');
 });
 
-test('NEPQ live: a blocked booking is never "you\'re set": a person locks it in', async () => {
+test('NEPQ live (Mark, 2026-10-02): a pick with the address missing is held, the address and decision-maker asked, then booked', async () => {
   const offer = 'I have Tue, Oct 6 at 10:00 AM ET or Wed, Oct 7 at 2:00 PM ET. Which works better?';
-  const { lane, state } = nepqLane({ bookOk: false, messages: [M('outbound', offer, 2)] });
+  // 1. The pick: held, and the address asked. Nothing booked yet.
+  const one = nepqLane({ messages: [M('outbound', offer, 3)] });
+  await one.lane.processInbound(INBOUND('the first one'));
+  assert.equal(one.state.bookings, undefined);
+  const hold = one.state.sends[0].message;
+  assert.equal(hold, "Great, I'm holding Tue, Oct 6 at 10:00 AM ET for you. What's the street address for the visit, including the zip code?");
+  // 2. The address: the decision-maker question next.
+  const two = nepqLane({ messages: [M('outbound', offer, 3), M('inbound', 'the first one', 2), M('outbound', hold, 1)] });
+  await two.lane.processInbound(INBOUND('123 Main St, Tampa FL 33601'));
+  assert.equal(two.state.bookings, undefined);
+  const dmAsk = two.state.sends[0].message;
+  assert.equal(dmAsk, 'Got it. Will anyone else be part of the decision, like a spouse or partner?');
+  // 3. "Just me": booked on the held time with Solo Owner.
+  const three = nepqLane({ contact: { address1: '123 Main St', postalCode: '33601' }, messages: [M('outbound', offer, 4), M('inbound', 'the first one', 3), M('outbound', hold, 2), M('inbound', '123 Main St, Tampa FL 33601', 1), M('outbound', dmAsk, 0.5)] });
+  await three.lane.processInbound(INBOUND('just me'));
+  assert.deepEqual(three.state.bookings, [{ contactId: 'C1', startIso: '2026-10-06T14:00:00Z', calendarId: 'CALWE', decisionMakers: 'Solo Owner' }]);
+  assert.match(three.state.sends[0].message, /^Got it, Alyce\. I have you down for Tue, Oct 6 at 10:00 AM ET\. A team member will reach out to confirm the details\.$/);
+});
+
+test('NEPQ live: a spouse who cannot make the held time gets two other times', async () => {
+  const offer = 'I have Tue, Oct 6 at 10:00 AM ET or Wed, Oct 7 at 2:00 PM ET. Which works better?';
+  const hold = "Great, I'm holding Tue, Oct 6 at 10:00 AM ET for you. Will anyone else be part of the decision, like a spouse or partner?";
+  const { lane, state } = nepqLane({ contact: { address1: '123 Main St', postalCode: '33601' }, messages: [M('outbound', offer, 3), M('inbound', 'the first one', 2), M('outbound', hold, 1)] });
+  await lane.processInbound(INBOUND('my husband works then'));
+  assert.equal(state.bookings, undefined);
+  assert.match(state.sends[0].message, /^No problem[,.] .*both be there/);
+});
+
+test('NEPQ live: GHL refusing a complete booking is the only hand-off, and nothing sounds final', async () => {
+  const offer = 'I have Tue, Oct 6 at 10:00 AM ET or Wed, Oct 7 at 2:00 PM ET. Which works better?';
+  const { lane, state } = nepqLane({ bookOk: false, contact: READY_CONTACT, messages: [M('outbound', offer, 2)] });
   await lane.processInbound(INBOUND('the first one'));
-  assert.match(state.sends[0].message, /^Got it, Tue, Oct 6 at 10:00 AM ET\. Our team will call to go over the details and lock it in\./);
+  assert.equal(state.sends[0].message, 'Got it, Tue, Oct 6 at 10:00 AM ET. A team member will reach out to confirm the details.');
   await new Promise(r => setImmediate(r));
   assert.equal(state.handoffs[0].reason, 'booking_request');
+});
+
+test("NEPQ live (Mark's test chat): yes to the visit with a question gets the answer and two times, not a call", async () => {
+  const bridge = 'Based on what you told me, this could work for you, since you mentioned the heat. The next step would be a visit at your home. Would that help?';
+  const { lane, state } = nepqLane({ messages: [M('outbound', bridge, 1)], llm: () => ({ message: 'About an hour and a half. A team member will call you to set up a time that works.' }) });
+  await lane.processInbound(INBOUND("Yeah, how long does that take? I don't have much time right now."));
+  const sent = state.sends[0].message;
+  assert.doesNotMatch(sent, /will call you to set up/);
+  assert.match(sent, /I have Tue, Oct 6 at 10:00 AM ET or Wed, Oct 7 at 2:00 PM ET\. Which works better\?$/);
 });
 
 test('NEPQ live: a financing figure in the model\'s draft never reaches the visitor', async () => {
@@ -879,7 +951,7 @@ test('a model reply never tells the visitor a visit is set when nothing was book
   await lane.processInbound(INBOUND('Yes, that would help'));
   assert.ok(!/all set|booked|confirmed/i.test(state.sends[0].message), state.sends[0].message);
   assert.match(state.sends[0].message, /team will call/i);
-  assert.match(state.llmCalls[0].system, /You cannot book from here/);
+  assert.match(state.llmCalls[0].system, /Never say a visit is set, booked, confirmed or on the schedule yourself/);
 });
 
 test('a question the model ended with a period gets its question mark back', async () => {

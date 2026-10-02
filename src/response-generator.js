@@ -265,7 +265,7 @@ import {
 import { notInterestedTurn } from './agentic/not-interested.js';
 import { humanizeReply, restoreQuestionMark } from './agentic/human-voice.js';
 import { enforceTeamVoice } from './agentic/team-voice.js';
-import { enforceCallTiming } from './agentic/team-hours.js';
+import { enforceCallTiming, isTeamOpen } from './agentic/team-hours.js';
 import { findUnbackedBookingClaim, rewriteBookingClaims, bookingClaimNote } from './agentic/booking-claim.js';
 import { BOOKING_CALENDARS } from './knowledge/booking-calendar-router.js';
 import { contactTypoHint } from './agentic/contact-typos.js';
@@ -281,6 +281,7 @@ import {
   fetchFreeSlots,
   formatSlotsForPrompt,
   selectOfferableSlots,
+  CALL_MIN_NOTICE_HOURS,
   buildOfferWindowPrompt,
 } from './knowledge/calendar-availability.js';
 import {
@@ -343,6 +344,7 @@ import {
   calendarNameForKey,
   customerFramingForKey,
   isInHomeCalendarId,
+  inHomeCalendarFor,
 } from './knowledge/booking-calendar-router.js';
 import { CALENDAR_MAP } from './actions/constants.js';
 import { applyGHLTag, getGHLContact } from './ghl.js';
@@ -380,7 +382,7 @@ import { findUnbackedEstimatePromise, estimatePromiseNote, rewriteEstimatePromis
 // v2.7.14 — Bot Review Phase 0. Pure shaping helpers only: no I/O, no writes.
 import { buildInputSnapshot, extractKbModes, extractKbSources } from './bot-feedback/fingerprint-core.js';
 import { normalizeTimezone, tzLongName, tzLabel } from './config/market-timezones.js';
-import { planNepqTurn, enforceNepqPlan, nepqBackboneMode, nepqFixedLineWins, objectionType as nepqObjectionType, TIME_REQUEST_RX as NEPQ_TIME_REQUEST_RX, SCHEDULE_ASK_RX as NEPQ_SCHEDULE_ASK_RX,REPEAT_COMPLAINT_RX as NEPQ_REPEAT_COMPLAINT_RX } from './agentic/nepq-planner.js';
+import { planNepqTurn, enforceNepqPlan, nepqBackboneMode, nepqFixedLineWins, prefersCall as nepqPrefersCall, objectionType as nepqObjectionType, TIME_REQUEST_RX as NEPQ_TIME_REQUEST_RX, SCHEDULE_ASK_RX as NEPQ_SCHEDULE_ASK_RX,REPEAT_COMPLAINT_RX as NEPQ_REPEAT_COMPLAINT_RX } from './agentic/nepq-planner.js';
 import {
   planServiceAreaTurn, resolveCoverage, coverageHint, guardCoverageDraft, serviceAreaRecord,
 } from './agentic/service-area-turn.js';
@@ -1846,7 +1848,7 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
     // thing in the same words. Behavior here is unchanged by the extraction.
     const nextMissing = resolveNextMissing(idGate.missing) || idGate.missing[0];
     const askText = PREREQUISITE_ASK_INSTRUCTION[nextMissing];
-    parts.push(...P.inHomePrerequisitesNotSatisfied(bcg.resolved_calendar_name, idGate.missing.join(', '), askText));
+    parts.push(...(opts.nepqPlan ? P.inHomePrerequisitesHoldAndAsk : P.inHomePrerequisitesNotSatisfied)(bcg.resolved_calendar_name, idGate.missing.join(', '), askText));
   } else if (bcg && bcg.requires_in_home_gate === true) {
     parts.push(...P.inHomeGateSatisfied(bcg.resolved_calendar_name, bcg.booking_duration_minutes, bcg.dm_present_value || (idGate ? String(idGate.decision_maker_confirmed) : 'not yet captured'), bcg.address_on_file || (idGate?.known?.address || '(none on file)')));
     if (idGate?.should_ask_email) {
@@ -1878,7 +1880,7 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
     parts.push(...P.priorityCancelledAppointment(when));
   }
   if (opts.bookingGate && !opts.bookingGate.ok && kbPack?.booking_context?.requires_in_home_gate === true) {
-    parts.push(...P.PRIORITY_PREREQS_NOT_SATISFIED);
+    parts.push(...(opts.nepqPlan ? P.PRIORITY_PREREQS_HOLD_AND_ASK : P.PRIORITY_PREREQS_NOT_SATISFIED));
   }
   parts.push(...P.PRIORITY_ORDER_TAIL);
   // 2026-10-02: the NEPQ turn plan is the last word before the output
@@ -2196,7 +2198,12 @@ function validateUpdateAppointmentStatusCompanion(cap, ca) {
     console.warn(`[ResponseGenerator] Dropping update_appointment_status: missing appointment_id`);
     return null;
   }
-  const status = normalizeBookingStatus(cap.status);
+  // 2026-10-02 (Mark): "Do not book it as confirmed." A team member confirms
+  // every bot booking; the bot may record the decision-maker answer, never
+  // upgrade the appointment to 'confirmed'.
+  const requested = normalizeBookingStatus(cap.status);
+  if (requested === 'confirmed') console.log(`[ResponseGenerator] update_appointment_status 'confirmed' held at 'new' (a team member confirms)`);
+  const status = 'new';
   const qualifying_data = normalizeQualifyingData(cap.qualifying_data);
 
   const payload = { appointment_id: appointmentId, status };
@@ -3402,12 +3409,23 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       // times, loaded no calendar on SMS, so the bot sent the self-booking link
       // instead of two real times (0 of 12 journeys booked).
       || nepqBookingTurn(context.conversation_recent));
+  // 2026-10-02 (Mark): with NEPQ live every text lead books a home visit:
+  // Measurement Verification for a calculator lead, Window Estimate for
+  // everyone else. The 15-minute call (PPR) is the backup, only when the lead
+  // asks for a call or turns the visit down. The rehash line keeps its call.
+  const nepqWantsCall = nepqPrefersCall(context.conversation_recent, triggerMessage) || opts.requestedFulfillment === 'phone_call';
+  const nepqVisitFirst = nepqModeEarly === 'live' && channel === 'sms' && !rehash && !nepqWantsCall;
+  if (nepqVisitFirst && kbPack?.booking_context && bookingResolution && !isInHomeCalendarId(bookingResolution.calendar_id)) {
+    bookingResolution = inHomeCalendarFor(context.lead?.current_tags || []);
+    stampBookingResolution(kbPack.booking_context, bookingResolution, context);
+    console.log(`[ResponseGenerator] NEPQ visit-first: ${contactId} books ${bookingResolution.calendar_key}`);
+  }
   const calendarId = getCalendarIdFromKbPack(kbPack)
-    || (nepqWantsSlots ? BOOKING_CALENDARS.PROTECTION_PROFILE_REVIEW : null);
+    || (nepqWantsSlots ? (nepqVisitFirst ? inHomeCalendarFor(context.lead?.current_tags || []).calendar_id : BOOKING_CALENDARS.PROTECTION_PROFILE_REVIEW) : null);
   if (calendarId) {
     try {
       // 2026-10-01: in the contact's market zone (Houston → Central).
-      availability = await fetchFreeSlots(calendarId, { timezone: promptTimezoneFor(context) });
+      availability = await fetchFreeSlots(calendarId, { timezone: promptTimezoneFor(context), ...(calendarId === BOOKING_CALENDARS.PROTECTION_PROFILE_REVIEW ? { minNoticeHours: CALL_MIN_NOTICE_HOURS } : {}) });
     } catch (err) {
       console.warn(`[ResponseGenerator] Calendar availability fetch threw for ${contactId} (cal ${calendarId}): ${err.message} — proceeding without`);
       availability = null;
@@ -3425,10 +3443,10 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   try {
     preferred = extractPreferredTime(context.conversation_recent || [], { timeZone: promptTimezoneFor(context) });
     if (availability) {
-      offerSelection = selectOfferableSlots(availability, preferred, {
-        // Phone-only calendars could warrant a shorter floor; default single
-        // floor for now (BOOKING_MIN_NOTICE_HOURS). See §7b.
-      });
+      // 2026-10-02 (Mark): a call back can happen any time in team hours, so
+      // the call calendar floors at 30 minutes and offers only team hours.
+      offerSelection = selectOfferableSlots(availability, preferred,
+        calendarId === BOOKING_CALENDARS.PROTECTION_PROFILE_REVIEW ? { call: true, isOpen: isTeamOpen } : {});
       preferredMatch = matchPreferredToSlots(preferred, availability);
       // Narrow the availability the prompt will show to the offerable window.
       // For window 'none' this is an empty-slots object, so formatSlotsForPrompt
@@ -3608,7 +3626,10 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     // a prerequisite is missing. booking_url=null flips the prompt to the
     // NO BOOKING LINK AUTHORIZED block; availability=null suppresses slots.
     console.log(`[ResponseGenerator] in-home booking gate BLOCKED for ${contactId}: missing ${bookingGate.missing.join(', ')}`);
-    availability = null;
+    // 2026-10-02 (Mark: ask first, then book): with NEPQ live the two real
+    // times stay; a pick is held and the missing items are asked one at a
+    // time before any booking (the handler's gate still backstops).
+    if (nepqModeEarly !== 'live') availability = null;
     kbPack.booking_context.booking_url = null;
   }
   if (inHomeGateRequired && serviceArea?.checked && serviceArea.in_service_area === false) {
@@ -3642,7 +3663,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
         tzLabel: tzLabel(promptTimezoneFor(context)),
         firstName: firstWord && !/^guest$/i.test(firstWord) ? firstWord : null,
         hasAppointment,
-        nextStepLabel: kbPack?.booking_context?.requires_in_home_gate === true ? 'a visit at your home' : 'a quick call with our team',
+        nextStepLabel: (kbPack?.booking_context?.requires_in_home_gate === true || nepqVisitFirst) ? 'a visit at your home' : 'a quick call with our team',
         discipline,
       });
       if (nepqMode === 'live' && discipline) discipline = { ...discipline, booking: nepqPlan.booking };

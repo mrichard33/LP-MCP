@@ -255,19 +255,44 @@ again after the price play, two no's, or a repeated objection (`src/agentic/nepq
 + `nepq:handoff:<reason>`, a rep note, an event, and a card in **#contact-center** (`SLACK_CHANNEL_SERVICE`), plus
 **#dispatch** for a complaint or an unbookable pick, via `postToSlack`; a failed post is an #ops-alerts line); the objection plays, the
 think-it-over Calendar Commitment (two REAL slots, exempt from the booking-ask cap), "what day works best",
-the Reveal and the confirm line ("You're set for [day] at [time], [name]. Our team will call to go over the
-details." — never a rep name, never "see you then") are Mark's fixed wording. Discovery is short (2 questions
+the Reveal and the confirm line ("Got it, [name]. I have you down for [day] at [time]. A team member will reach
+out to confirm the details." — nothing sounds final, never a rep name, never "see you then") are Mark's fixed
+wording. Discovery is short (2 questions
 in live chat, 3 on SMS, then the bridge). `renderPlanBlock` is the LAST prompt section and `enforceNepqPlan`
 strips money/financing figures (the customer's own estimate excepted), fake urgency, unallowed booking asks,
 re-asks for a name/phone/email/zip we have, and extra questions. `NEPQ_BACKBONE_MODE` off|shadow|live
 (default off; shadow records `nepq_plan` / `would_send` only). Live chat books a picked slot through an
-awaited `book_appointment` row and says "You're set" only on `appointment_booked`; a blocked booking is
-handed to a person. The simulator run (2026-10-02) added: `src/agentic/booking-claim.js` rewrites any
+awaited `book_appointment` row and confirms only on `appointment_booked`; GHL still refusing is the one case
+handed to a person.
+
+**Book in the conversation, unconfirmed, on the right calendar (Mark, 2026-10-02).** Every bot booking is
+status `new` (the handler forces it). A visit goes on `inHomeCalendarFor(tags)`: Measurement Verification for a
+calculator lead (`active-entry:estimate-calculator` / `active-entry:calculator`), Window Estimate for everyone
+else; with NEPQ live the SMS bot books a visit too, and the 15-minute call (PPR) is only the backup when the lead
+asks for a call or turns the visit down (`prefersCall`). A yes to the bridge, even "yeah, how long does it take?",
+or "can you set up a time?" gets two real times. A pick is HELD ("Great, I'm holding [day] at [time] for you.",
+read back by `heldSlot` in `src/agentic/booking-collect.js`) while the in-home gate's missing items are asked one
+per message (name, phone on chat, street address with zip, "will anyone else be part of the decision?"); the
+answer is passed as `qualifying_data.decision_makers_present`, and a spouse who cannot make it gets two other
+times. Call slots (PPR) floor at 30 minutes, only inside team hours, two times an hour apart the same day
+(`selectOfferableSlots({ call: true })`): a call back can happen any time the team is in.
+
+**No line twice, one reply per burst (Mark, 2026-10-02).** Lines that recur in a thread come in variants
+(`bridgeLine`, `LINES.offer_slots(slots, n)`, `ALT_LINES`); `pickFresh` never picks one whose opening words were
+already sent, and `enforceNepqPlan` drops a sentence already sent word for word. Every offer variant keeps
+"I have … or …?" because `SLOT_OFFER_RX`, `offeredSlots` and `heldSlot` read it. Rapid-fire messages get ONE
+reply: live chat waits `LIVE_CHAT_QUIET_MS` (default 3000) after each message (after the action row, so the
+message stays in `recentTurns`) and the newest answers all; SMS drops a draft right before sending when
+`system_events` holds a newer real `ghl.reply_received` past the batch's last one (`src/agentic/burst-yield.js`;
+never for a `trivial` event, a bare "ok"/"thanks", or a retry of a batch message). Both log
+`superseded_by_newer_message`.
+
+The simulator run (2026-10-02) added: `src/agentic/booking-claim.js` rewrites any
 "you're all set / booked / on the schedule" a model reply makes without a booking (live chat always; SMS
 when NEPQ is live), `restoreQuestionMark` puts back a "?" the model wrote as "." (every one-question check
 counts "?"), and a day + time the lead types with no offer on the table gets two real times near it.
-**A quote or price ask books a visit (Mark, 2026-10-02):** two real times at once (`LINES.quote_slots`), asked
-again "every home is different" + the same times, a third time a person; "you just said that" ends the
+**A quote or price ask (Mark, 2026-10-02):** first one short line and the NEPQ connection question, no times
+(`LINES.quote_first`); asked again, "every home is different" + two real times; a third time a person; "you just said that" ends the
 questions with the times. Live chat often gets NO conversation id (GHL's I.LVI sends none and a new chat is
 not searchable yet: 44 of 68 turns in two days), so the thread falls back to our own `agent_actions` rows
 (`recentTurns`, last 6h); never assume `conversation_recent` came from GHL.

@@ -187,6 +187,19 @@ const NURTURE_COHORT_TAGS = new Set([
  *        kept for back-compat; superseded by requestedFulfillment==='phone_call'.
  * @returns {Promise<{calendar_id:string, calendar_key:string, reason:string}>}
  */
+/**
+ * The in-home calendar both bots book on (Mark, 2026-10-02): window-estimate
+ * calculator leads go to Measurement Verification, every other lead to the
+ * Window Estimate. Pure. Tags may be a contact's tag array.
+ */
+export function inHomeCalendarFor(tags = []) {
+  const list = (Array.isArray(tags) ? tags : []).map((t) => String(t || '').toLowerCase());
+  const calculator = list.includes('active-entry:estimate-calculator') || list.includes('active-entry:calculator');
+  return calculator
+    ? { calendar_id: BOOKING_CALENDARS.MEASUREMENT_VERIFICATION, calendar_key: 'MEASUREMENT_VERIFICATION', reason: 'calculator_lead' }
+    : { calendar_id: BOOKING_CALENDARS.WINDOW_ESTIMATE, calendar_key: 'WINDOW_ESTIMATE', reason: 'default_in_home' };
+}
+
 export async function resolveBookingCalendar(contact, opts = {}) {
   const tags = Array.isArray(contact?.tags) ? contact.tags : [];
   const has = (t) => tags.includes(t);

@@ -17,6 +17,7 @@ export const NEPQ_PLAN_HEADER = '═══════ NEPQ TURN PLAN (binding: 
 export const NEPQ_ALWAYS = [
   'Never in this reply: a price, a range, a savings figure, a monthly payment or any financing figure; pressure or fake urgency; a stat that is not in the KB PACK; more than one question.',
   'Write it in their words. One short question at most.',
+  'Never repeat a sentence or an opener you already sent in this conversation (no second "Based on what you told me", "Great question", "Happy to help"); say it a new way.',
 ];
 
 const MOVE_TEXT = {
@@ -24,7 +25,9 @@ const MOVE_TEXT = {
   // 2026-10-02 simulation: "(hurricane season makes it natural)" produced "with
   // us at the peak of hurricane season", pressure Mark ruled out.
   consequence: (p) => `This turn's move: ONE gentle "what happens if you wait?" question about ${p.echo?.phrase || 'the problem they mentioned'}. No deadlines, no season or storm talk, no danger talk, no pressure.`,
-  bridge: (p) => `This turn's move: the bridge, in their words: "Based on what you told me, this could work for you${p.echo?.phrase ? `, since you mentioned ${p.echo.phrase}` : ''}. The next step would be ${p.next_step_label}. Would that help?" Nothing else.`,
+  // 2026-10-02 (Mark): no line word for word twice; the planner picks a bridge
+  // variant we have not sent yet (bridgeLine / pickFresh).
+  bridge: (p) => `This turn's move: the bridge, in their words: "${p.bridge_line || `Based on what you told me, this could work for you${p.echo?.phrase ? `, since you mentioned ${p.echo.phrase}` : ''}. The next step would be ${p.next_step_label}. Would that help?`}" Nothing else.`,
   // 2026-10-02 (Mark): short, and no times on the first price ask.
   answer: (p) => (p.price_note
     ? 'This turn\'s move: answer their other questions in one short sentence each. On price, one short sentence: every home is different, so a number now would just be a guess (never a number or range). Then ONE question: what\'s got them looking into this now. No times, no visit pitch, nothing else.'
@@ -34,7 +37,9 @@ const MOVE_TEXT = {
   offer_slots: (p) => (p.offer_line
     ? `This turn's move: answer their question in ONE sentence, then send exactly: "${p.offer_line}" Nothing after it.`
     : 'This turn\'s move: offer exactly two real times from CALENDAR AVAILABILITY and ask which works better. Never invent a time.'),
-  confirm: () => 'This turn\'s move: they picked a time. If you book it, confirm it as: "You\'re set for [day] at [time], [first name]. Our team will call to go over the details." Never name a rep. Never say "see you then".',
+  // 2026-10-02 (Mark: ask first, then book). A time is held (booking-collect.js).
+  collect: (p) => `This turn's move: we are holding ${p.held_slot?.text || 'their picked time'} for them. If their reply gives the last missing detail (name, street address with zip, or who else is part of the decision), book it and confirm as: "Got it, [first name]. I have you down for [day] at [time]. A team member will reach out to confirm the details." Otherwise thank them in a few words and ask the ONE next missing item. Never offer new times unless they asked to change the time.`,
+  confirm: () => 'This turn\'s move: they picked a time. If you book it, confirm it as: "Got it, [first name]. I have you down for [day] at [time]. A team member will reach out to confirm the details." Nothing final: never "you\'re set", "confirmed", "locked in" or "see you then". Never name a rep.',
 };
 
 function cap(w) { return String(w || '').charAt(0).toUpperCase() + String(w || '').slice(1); }

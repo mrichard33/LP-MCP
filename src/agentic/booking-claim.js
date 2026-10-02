@@ -68,14 +68,17 @@ export function rewriteBookingClaims(message, opts = {}) {
   }
   if (!claims.size) return { text: String(message || ''), changed: false };
   const saysCall = rest.some(s => /\b(?:team|someone|specialist|we)\b[^.?!]{0,40}\bcall\b/i.test(s));
+  // 2026-10-02: the live chat books real times itself, so its replacement is
+  // the visit question (opts.replacement), not a promised call.
+  const replacement = opts.replacement || BOOKING_CLAIM_REPLACEMENT;
   const out = [];
   let replaced = false;
   for (const s of parts) {
     if (!claims.has(s)) { out.push(s); continue; }
-    if (!replaced && !saysCall) out.push(BOOKING_CLAIM_REPLACEMENT);
+    if (!replaced && (!saysCall || opts.replacement)) out.push(replacement);
     replaced = true;
   }
-  return { text: out.join(' ').trim() || BOOKING_CLAIM_REPLACEMENT, changed: true };
+  return { text: out.join(' ').trim() || replacement, changed: true };
 }
 
 /** The regeneration instruction for a draft that claimed a booking. */
