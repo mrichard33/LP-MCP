@@ -44,13 +44,15 @@ function fakeProduction() {
   };
 }
 
-test('live chat: every turn and reply, a fixed price move needs no model call', async () => {
+// Part 7: the model is asked for every reply; the fake model's draft misses
+// the price move's job, so the reference lines ship as the backup.
+test('live chat: every turn and reply; a price move whose draft misses its job sends the backup line', async () => {
   const { calls, deps } = fakeProduction();
   const r = await simulateLiveChat(resolveScenario({ scenario: 'price' }), { nepqMode: 'live', productionDeps: deps });
   assert.equal(r.transcript.length, 2);
   assert.equal(r.transcript[0].bot[0], "Happy to help with the 12 windows. What's got you looking into them now?");
   assert.match(r.transcript[1].bot[0], /^Fair question\. Every home is different/);
-  assert.equal(calls.llm, 0);
+  assert.ok(calls.llm > 0, 'the model is asked');
 });
 
 test('live chat: cancel → reschedule moves nothing, it records "would move the same appointment"', async () => {

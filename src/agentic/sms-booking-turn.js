@@ -174,7 +174,8 @@ export function enforceBookingFacts(draft, facts, { companion = null } = {}) {
       // cannot find it next turn: the model's when it does, else ours.
       const own = body.find(p => /\bI'?m\s+holding\b/i.test(p) && exact && p.includes(exact));
       body = body.filter(p => p === own || (!/\bI'?m\s+holding\b/i.test(p) && !clockTimes(p).length));
-      if (!own) { body = [holdLine(slot, slot.tz || '', '').trim(), ...body]; notes.push('hold_sentence_fixed'); }
+      // Their acknowledgement first, then the hold ("Sure. I'm holding … for you.").
+      if (!own) { body = body.length ? [...body, `I'm holding ${slotLabel(slot, slot.tz || '')} for you.`] : [holdLine(slot, slot.tz || '', '').trim()]; notes.push('hold_sentence_fixed'); }
     } else if (body.some(p => clockTimes(p).length)) {
       // Collecting: no time talk (the held time stands; a change is the lead's to ask).
       body = body.filter(p => !clockTimes(p).length);
@@ -192,6 +193,19 @@ export function enforceBookingFacts(draft, facts, { companion = null } = {}) {
     problems,
     notes,
   };
+}
+
+/** The re-write instruction after a booking draft failed its checks (Part 7). Pure. */
+export function bookingFactsNote(facts, problems = []) {
+  const what = {
+    hold: `say "I'm holding ${facts.label} for you." and then ask exactly: "${facts.ask_line}"`,
+    collect: `thank them in a few words, then ask exactly: "${facts.ask_line}". Mention no other time`,
+    book: `say they're all set for ${facts.label} and that our team will reach out to confirm the details. No question`,
+    dm_conflict: facts.alternatives?.length === 2
+      ? `offer exactly these two times and ask which works better: ${facts.alternatives.map(s => `${s.day} at ${s.time}`).join(' or ')}`
+      : 'ask what day works best when they can both be there',
+  }[facts.kind] || 'follow the turn plan';
+  return `Your previous draft got the booking facts wrong (${problems.join(', ')}). Write it again in your own words for this lead: ${what}. Name no other time.`;
 }
 
 // The model's companion may carry useful extras (a note, a duration); the

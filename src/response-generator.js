@@ -386,10 +386,10 @@ import { buildInputSnapshot, extractKbModes, extractKbSources } from './bot-feed
 import { normalizeTimezone, tzLongName, tzLabel } from './config/market-timezones.js';
 import { offeredSlots, pickSlot } from './live-chat/cancel-flow.js';
 import { holdLine, COLLECT_ASK, dmAsk, parseDecisionMakers } from './agentic/booking-collect.js';
-import { contactRecheckLine } from './agentic/contact-check.js';
-import { smsBookingTurn, enforceBookingFacts } from './agentic/sms-booking-turn.js';
+import { contactRecheckLine, recheckHint, RECHECK_RX } from './agentic/contact-check.js';
+import { smsBookingTurn, enforceBookingFacts, bookingFactsNote } from './agentic/sms-booking-turn.js';
 import { LINES as NEPQ_LINES } from './agentic/nepq-planner.js';
-import { planNepqTurn, enforceNepqPlan, nepqBackboneMode, nepqFixedLineWins, prefersCall as nepqPrefersCall, objectionType as nepqObjectionType, TIME_REQUEST_RX as NEPQ_TIME_REQUEST_RX, SCHEDULE_ASK_RX as NEPQ_SCHEDULE_ASK_RX,REPEAT_COMPLAINT_RX as NEPQ_REPEAT_COMPLAINT_RX } from './agentic/nepq-planner.js';
+import { planNepqTurn, enforceNepqPlan, referenceRetryNote, nepqBackboneMode, prefersCall as nepqPrefersCall, objectionType as nepqObjectionType, TIME_REQUEST_RX as NEPQ_TIME_REQUEST_RX, SCHEDULE_ASK_RX as NEPQ_SCHEDULE_ASK_RX,REPEAT_COMPLAINT_RX as NEPQ_REPEAT_COMPLAINT_RX } from './agentic/nepq-planner.js';
 import {
   planServiceAreaTurn, resolveCoverage, coverageHint, guardCoverageDraft, serviceAreaRecord,
 } from './agentic/service-area-turn.js';
@@ -424,7 +424,8 @@ const RECENT_EDITS_LIMIT = parseInt(process.env.RESPONSE_GENERATOR_EDITS_LIMIT |
 // inbound (V6UhgTGpcjHKUjGWkkEv, 19:54:44Z) entered the prompt as its first
 // third. All four are optional with working defaults; an unset env is already
 // the intended configuration.
-const RESPONSE_GEN_HISTORY_TURNS = parseInt(process.env.RESPONSE_GEN_HISTORY_TURNS || '20', 10);
+// Part 7: 30 messages, the whole recent story (was 20 of a 10-message fetch).
+const RESPONSE_GEN_HISTORY_TURNS = parseInt(process.env.RESPONSE_GEN_HISTORY_TURNS || '30', 10);
 // How many of those turns count as RECENT and render at the larger cap.
 const RESPONSE_GEN_HISTORY_RECENT_TURNS = parseInt(process.env.RESPONSE_GEN_HISTORY_RECENT_TURNS || '8', 10);
 const RESPONSE_GEN_HISTORY_CHARS_RECENT = parseInt(process.env.RESPONSE_GEN_HISTORY_CHARS_RECENT || '1000', 10);
@@ -1737,6 +1738,12 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
     }
     parts.push(...P.lpDemoAndAppointment(context.lp.demo_completed ? 'YES' : 'no', apptStatus));
     if (context.lp.closed_won) parts.push(...P.lpClosedWon(context.lp.job_value));
+    if (context.lp.has_prior_sale || (context.lp.lead_history_count || 0) > 1) {
+      parts.push(...P.lpRelationship({
+        relationship: context.lp.customer_relationship, priorSaleDate: context.lp.prior_sale_date,
+        leadCount: context.lp.lead_history_count || 1, latestDisposition: context.lp.latest_lead_disposition,
+      }));
+    }
     if (context.lp.lost_reason) parts.push(...P.lpLostReason(context.lp.lost_reason));
 
     if (context.lp.data_stale_active) {
@@ -3384,7 +3391,13 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   if (rehash && opts.promptHint) {
     console.log(`[ResponseGenerator] rehash reply for ${contactId}: layer3 script directive dropped (pre-demo copy)`);
   }
-  const promptHint = [rehash ? null : opts.promptHint, handoffNote, contactTypoHint(triggerMessage)]
+  // Part 7: a bad email gets a re-check the model words itself (SMS has their number).
+  const recheckEarly = (() => {
+    const recentOut = (context.conversation_recent || []).filter(m => String(m?.direction || '').toLowerCase() === 'outbound').slice(-8).map(m => String(m?.text ?? m?.body ?? ''));
+    const r = contactRecheckLine({ text: triggerMessage, recentOutbound: recentOut });
+    return r?.kind === 'email' ? r : null;
+  })();
+  const promptHint = [rehash ? null : opts.promptHint, handoffNote, contactTypoHint(triggerMessage), recheckHint(recheckEarly)]
     .filter(Boolean).join('\n\n') || null;
 
   const buyerStage    = inferBuyerStage(context);
@@ -3886,16 +3899,11 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       nepqPlan: nepqMode === 'live' ? nepqPlan : null,
     }
   );
-  // 2026-10-02 (Mark: "look into the text bot speed"): a fixed move's line
-  // replaces any draft (enforceNepqPlan), so the model is not asked for one.
-  // Booking turns are NOT fixed: the model writes them from the facts above
-  // (Part 6, "I want there to be AI-generated replies").
-  let nepqDirect = null;
-  if (nepqMode === 'live' && channel === 'sms' && nepqPlan && !bookingFacts && nepqFixedLineWins(nepqPlan)) {
-    nepqDirect = { message: nepqPlan.fixed_line, _record: { fixed: nepqPlan.required_move } };
-    console.log(`[NEPQ] ${contactId} SMS fixed line (${nepqPlan.required_move}), no model call`);
-  }
-  const raw = nepqDirect || await callClaude(userPrompt);
+  // Part 7 (Mark, 2026-10-02: "I don't think we need any static messages"):
+  // every reply is written by the model, a fixed move's line included (it is
+  // the reference in the plan block, and the backup if the model's version
+  // fails twice).
+  const raw = await callClaude(userPrompt);
 
   const validated = validateResponse(raw, channel, upcomingAppointments);
   if (!validated) {
@@ -3915,6 +3923,13 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // slot. A draft that misses one ships the deterministic line instead.
   if (bookingFacts) {
     const checked = enforceBookingFacts(validated.message, bookingFacts, { companion: validated.companion_action });
+    // Part 7: the backup line ships only after one re-write also fails.
+    if (checked.fallback_used && !opts.regenerationNote) {
+      console.warn(`[NEPQ] ${contactId} SMS booking ${bookingFacts.kind} draft failed (${checked.problems.join(',')}) — one re-write`);
+      const err = new Error(`booking_facts: ${checked.problems.join(',')}`);
+      err.regenerationNote = bookingFactsNote(bookingFacts, checked.problems);
+      throw err;
+    }
     validated.message = checked.message;
     validated.companion_action = checked.companion;
     validated.sms_booking = checked.record;
@@ -4060,7 +4075,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // regenerationNote carries THE ANSWER rather than just the prohibition —
   // a retry told only "don't ask that" has to guess what to say instead,
   // which is how a repeat-ask becomes an invented question.
-  if (established?.closed_questions?.length && !nepqDirect && !bookingFacts) {
+  if (established?.closed_questions?.length && !bookingFacts) {
     // 2026-10-02 post-merge run: "My wife works then" made a new time the
     // right question, the guard called it a repeat twice, and the lead got
     // no reply. A decision-maker conflict reopens the time.
@@ -4240,7 +4255,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // enforceNepqPlan's (it keeps the last question, no model call), and the
   // discipline rewrites run at once instead of after a second draft.
   const nepqLiveTurn = nepqMode === 'live' && !!nepqPlan;
-  const nepqDraftReplaced = nepqLiveTurn && (nepqFixedLineWins(nepqPlan) || !!nepqDirect || !!bookingFacts);
+  const nepqDraftReplaced = nepqLiveTurn && !!bookingFacts;
   {
     const offences = [];
 
@@ -4374,6 +4389,12 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     // the tag, the rep note, the event and the ops card (routeDecisionMakerHandoff).
     if (dm?.status === 'handoff') {
       const saysTeamWillCall = /\b(?:someone|somebody|a\s+(?:team\s+)?member|one\s+of\s+(?:our|the)\s+team|our\s+team)\b[^.?!]{0,60}\b(?:call|reach\s+out|give\s+you\s+a\s+(?:call|ring))\b/i;
+      if (!saysTeamWillCall.test(validated.message) && !opts.regenerationNote) {
+        // Part 7: the model words it; one re-write before the backup line.
+        const err = new Error('dm_handoff: no team call in the draft');
+        err.regenerationNote = 'The person they named has said twice they need not be involved, so a team member will take this over. In your own words, tied to what they said: say someone from our team will call them to sort out the visit. Ask no question and offer no times.';
+        throw err;
+      }
       if (!saysTeamWillCall.test(validated.message)) {
         validated.message = leadFirstName
           ? `Understood, ${leadFirstName}. I'll have someone from our team call you to sort out the visit.`
@@ -4414,6 +4435,16 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       },
     });
     if (nepqMode === 'live') {
+      // Part 7: the model's version of a reference line failed its checks.
+      // One re-write (one model call, the reads are prepared); the reference
+      // ships as the backup only if that fails too.
+      if (enforced.failed?.length && !opts.regenerationNote) {
+        console.warn(`[NEPQ] ${contactId} ${nepqPlan.required_move} draft failed (${enforced.failed.join(',')}) — one re-write`);
+        const err = new Error(`nepq_reference: ${enforced.failed.join(',')}`);
+        err.regenerationNote = referenceRetryNote(nepqPlan, enforced.failed);
+        throw err;
+      }
+      if (enforced.failed?.length) console.warn(`[NEPQ] ${contactId} ${nepqPlan.required_move}: nepq_backup_line (${enforced.failed.join(',')})`);
       if (enforced.changes.length) {
         console.log(`[NEPQ] ${contactId} ${nepqPlan.required_move}: ${enforced.changes.join(',')}`);
         validated.message = enforced.text;
@@ -4432,8 +4463,18 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
         validated.message = `No problem, let's find a time when you can both be there. ${NEPQ_LINES.offer_slots(others.map(x => ({ ...x, tz: x.tz || tzLabel(promptTimezoneFor(context)) })), nepqPlan.counters?.slot_offers || 0)}`;
         validated.companion_action = null;
         validated.nepq_plan.dm_conflict = true;
-      } else if (recheck?.kind === 'email') {
+      } else if (recheck?.kind === 'email' && !RECHECK_RX.test(validated.message)) {
+        // Part 7: the model was told (CONTACT RE-CHECK hint); one re-write,
+        // then the reference line.
+        if (!opts.regenerationNote) {
+          const err = new Error('contact_recheck: the draft did not ask them to re-check the email');
+          err.regenerationNote = recheckHint(recheck);
+          throw err;
+        }
         validated.message = recheck.line;
+        validated.companion_action = null;
+        validated.nepq_plan.recheck = recheck.kind;
+      } else if (recheck?.kind === 'email') {
         validated.companion_action = null;
         validated.nepq_plan.recheck = recheck.kind;
       } else {

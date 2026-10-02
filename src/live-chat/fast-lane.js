@@ -55,8 +55,9 @@ import { enforceCallTiming } from '../agentic/team-hours.js';
 import { rewriteBookingClaims } from '../agentic/booking-claim.js';
 import { enforceOneAsk } from '../agentic/one-ask.js';
 import { looksLikeShortPhone } from '../agentic/contact-typos.js';
-import { planNepqTurn, enforceNepqPlan, nepqBackboneMode, pickFresh, LINES as NEPQ_LINES } from '../agentic/nepq-planner.js';
-import { COLLECT_ASK, COLLECT_ASK_AGAIN, dmAsk, holdLine, missingItems, parseDecisionMakers, heldSlot, nameFromReply, addressConfirmAsk, addressConfirmState, mentionedPartner, dmAnswerFromThread } from '../agentic/booking-collect.js';
+import { planNepqTurn, enforceNepqPlan, referenceRetryNote, nepqBackboneMode, pickFresh, LINES as NEPQ_LINES } from '../agentic/nepq-planner.js';
+import { COLLECT_ASK, COLLECT_ASK_AGAIN, dmAsk, holdLine, missingItems, parseDecisionMakers, heldSlot, nameFromReply, addressConfirmAsk, addressConfirmState, mentionedPartner, dmAnswerFromThread, slotLabel } from '../agentic/booking-collect.js';
+import { enforceBookingFacts, bookingFactsNote } from '../agentic/sms-booking-turn.js';
 import { contactRecheckLine } from '../agentic/contact-check.js';
 import { chatIdentity } from './identity-capture.js';
 import {
@@ -85,7 +86,7 @@ import {
   stripSentences,
   holdingLine,
 } from '../agentic/discovery-discipline.js';
-import { guardDisclosure } from '../agentic/reply-sender.js';
+import { guardDisclosure, channelOfMessage } from '../agentic/reply-sender.js';
 import { matchSuppressionTags } from '../services/suppression-check.js';
 import { buildMessageKey } from '../services/consumed-messages.js';
 import { isDNCSignal } from '../behavioral-emitter.js';
@@ -149,7 +150,9 @@ export function liveChatMode(env = process.env) {
 
 export function liveChatHardTimeoutMs(env = process.env) {
   const raw = parseInt(env.LIVE_CHAT_HARD_TIMEOUT_MS || '', 10);
-  return Number.isFinite(raw) && raw > 0 ? raw : 10000;
+  // Part 7 (Mark, 2026-10-02: "custom is worth it", 5-8s replies are fine):
+  // every reply is model-written with the full lead context now.
+  return Number.isFinite(raw) && raw > 0 ? raw : 15000;
 }
 
 // 2026-10-02 (Mark): "when a lead rapidly fires multiple messages … the reply
@@ -163,7 +166,11 @@ export function liveChatQuietMs(env = process.env) {
 
 export function liveChatContextCapMs(env = process.env) {
   const raw = parseInt(env.LIVE_CHAT_CONTEXT_CAP_MS || '', 10);
-  return Number.isFinite(raw) && raw > 0 ? raw : 1500;
+  // Part 7: the full lead context (LP history, notes, calls, appointments),
+  // read in the background from the moment the message lands (prefetched,
+  // so the quiet wait hides most of it). 1.5s left most turns with the
+  // contact record only.
+  return Number.isFinite(raw) && raw > 0 ? raw : 5000;
 }
 
 /**
@@ -344,7 +351,10 @@ export function normalizeThread(messages, limit = LIVE_CHAT_THREAD_LIMIT) {
   return rows
     .map(m => ({
       direction: m.direction === 1 || m.direction === 'inbound' ? 'inbound' : 'outbound',
-      channel: 'livechat',
+      // Part 7: GHL keeps one conversation per contact, so texts and emails
+      // sit in this thread too. Each turn keeps its own channel (it was all
+      // labelled chat), so the bot knows what was texted and what was typed here.
+      channel: channelOfMessage(m) || 'livechat',
       text: plainMessageText(m.body ?? m.message ?? m.text ?? ''),
       type: m.contentType || m.type || 'text',
       timestamp: m.dateAdded || m.createdAt || m.sent_at || m.timestamp || null,
@@ -645,6 +655,14 @@ export function createLiveChatFastLane(deps) {
     // Warm the calendar read while the rest of the turn is built: the NEPQ
     // offer below reuses it (cachedFreeSlots shares the in-flight read).
     if (d.nepqMode() === 'live') Promise.resolve().then(() => d.offerBookingSlots({ contact })).catch(() => null);
+    // Part 7: the full lead context and the appointments start now too, so
+    // the quiet wait below hides most of their time (the reply waits for them
+    // up to LIVE_CHAT_CONTEXT_CAP_MS from here, not from the reply's start).
+    const tReads = d.now();
+    const contextRead = Promise.resolve().then(() => d.buildContext(contactId));
+    contextRead.catch(() => {});
+    const appointmentsRead = Promise.resolve().then(() => d.fetchAppointments(contactId));
+    appointmentsRead.catch(() => {});
     const suppression = matchSuppressionTags(tags, { mode: 'direct_reply', logContact: contactId });
     if (suppression.suppressed) {
       d.log(`[LiveChat] ${contactId} blocked by ${suppression.matched_tag} — no reply`);
@@ -703,7 +721,10 @@ export function createLiveChatFastLane(deps) {
     // two messages for one question. Exactly one of the two may send. The
     // first to claim the turn sends; the other stays silent.
     const turn = newTurnClaim();
-    const work = replyOnce({ contactId, conversationId, body, contact, tags, mode, actionId, timing, isSuperseded, turn });
+    // The backup a timed-out reply falls back to (Part 7): the move's own
+    // reference line once it is known, the holding line before that.
+    const backup = { reply: null };
+    const work = replyOnce({ contactId, conversationId, body, contact, tags, mode, actionId, timing, isSuperseded, turn, contextRead, appointmentsRead, tReads, backup });
     let outcome;
     try {
       const raced = await raceWithBudget(work, d.hardTimeoutMs());
@@ -711,7 +732,7 @@ export function createLiveChatFastLane(deps) {
         const reason = raced.timedOut ? 'hard_timeout' : `error: ${String(raced.error.message || raced.error).slice(0, 160)}`;
         if (raced.error) d.warn(`[LiveChat] reply failed for ${contactId}: ${raced.error.message}`);
         if (turn.claim('fallback')) {
-          outcome = await fallback({ contactId, conversationId, mode, actionId, timing, reason, body, isSuperseded });
+          outcome = await fallback({ contactId, conversationId, mode, actionId, timing, reason, body, isSuperseded, backupReply: backup.reply });
         } else if (raced.timedOut) {
           // The real reply already claimed the turn and is mid-send: wait for
           // it (bounded) rather than send the holding line on top of it.
@@ -761,19 +782,25 @@ export function createLiveChatFastLane(deps) {
     }
   }
 
-  async function replyOnce({ contactId, conversationId, body, contact, tags, mode, actionId, timing, isSuperseded = () => false, turn = newTurnClaim() }) {
+  async function replyOnce({ contactId, conversationId, body, contact, tags, mode, actionId, timing, isSuperseded = () => false, turn = newTurnClaim(), contextRead = null, appointmentsRead = null, tReads = null, backup = { reply: null } }) {
     const started = d.now();
     // ── context, in parallel, LP/lead state capped ──
     const getQueryEmbedding = d.prewarmEmbedding(body);
-    const [threadRes, ctxRes, ownRes] = await Promise.all([
+    // The cap runs from when the reads started (processInbound), so the quiet
+    // wait counts toward it.
+    const readCap = Math.max(Math.min(250, d.contextCapMs()), d.contextCapMs() - (tReads != null ? d.now() - tReads : 0));
+    const [threadRes, ctxRes, ownRes, apptRes] = await Promise.all([
       raceWithBudget(conversationId ? d.fetchMessages(conversationId) : Promise.resolve([]), d.contextCapMs() * 2),
-      raceWithBudget(d.buildContext(contactId), d.contextCapMs()),
+      raceWithBudget(contextRead || Promise.resolve().then(() => d.buildContext(contactId)), readCap),
       // Our own record of this chat (2026-10-02, 5i59G): GHL's I.LVI webhook
       // sends no conversation id and a brand-new chat is not searchable yet,
       // so 44 of 68 turns in two days ran with no history and the bot sent
       // the same price line three times. Our rows always know the chat.
       raceWithBudget(Promise.resolve().then(() => d.recentTurns(contactId)), RECENT_TURNS_CAP_MS),
+      // Part 7: the chat sees the lead's appointments too (EXISTING APPOINTMENTS).
+      raceWithBudget(appointmentsRead || Promise.resolve().then(() => d.fetchAppointments(contactId)), readCap),
     ]);
+    const upcomingAppointments = (!apptRes.timedOut && !apptRes.error && Array.isArray(apptRes.value)) ? apptRes.value : null;
     let context = (!ctxRes.timedOut && !ctxRes.error && ctxRes.value) ? ctxRes.value : minimalContext({ contactId, contact, nowMs: d.now() });
     if (ctxRes.timedOut) d.log(`[LiveChat] lead context exceeded ${d.contextCapMs()}ms for ${contactId} — continuing with the contact record only`);
     if (ctxRes.error) d.warn(`[LiveChat] lead context failed for ${contactId}: ${ctxRes.error.message} — continuing with the contact record only`);
@@ -865,6 +892,10 @@ export function createLiveChatFastLane(deps) {
       });
     }
 
+    // What code decided for this turn (Part 7): a reference line the model
+    // writes its own version of, plus booking facts when a booking step ran.
+    let reference = null;
+    let recheckRef = null;
     // ── a phone or email that cannot be right: ask once more (Mark, 2026-10-02) ──
     // "Mark 954 379 215" (nine digits) was thanked and taken. A friendly
     // re-check, once; the next answer is taken as it is.
@@ -873,14 +904,11 @@ export function createLiveChatFastLane(deps) {
       const typedName = chatIdentity({ visitorTexts: [body] }).first_name || nameFromReply(body) || (String(body).match(/^\s*([A-Z][a-z'’-]{1,20})[\s,]+\+?\(?\d/) || [])[1] || null;
       const recheck = contactRecheckLine({ text: body, recentOutbound: recentOut, firstName: typedName });
       if (recheck) {
-        if (isSuperseded()) return deliver({ contactId, conversationId, body, mode, actionId, timing, isSuperseded, turn, draft: '' });
-        timing.t4_analysis_done = new Date(d.now()).toISOString();
-        timing.t5_generation_done = timing.t4_analysis_done;
-        return deliver({
-          contactId, conversationId, body, mode, actionId, timing, isSuperseded, turn, visitorTexts, draft: recheck.line,
-          capture: typedName ? { name: typedName } : {},
-          extras: { contact_recheck: recheck.kind, context_minimal: !!context._minimal, model: null },
-        });
+        // Part 7: the model words the re-check (CONTACT RE-CHECK hint); the
+        // line is the reference and the backup.
+        recheckRef = recheck;
+        reference = { reply: recheck.line, slots: [], record: { contact_recheck: recheck.kind } };
+        backup.reply = recheck.line;
       }
     }
 
@@ -914,19 +942,33 @@ export function createLiveChatFastLane(deps) {
       }
       if (nepqMode === 'live') {
         const lastOutbound = [...context.conversation_recent].reverse().find(m => m.direction === 'outbound')?.text || '';
-        const nepqOut = await runNepqFixedMove({ plan: nepqPlan, slots: nepqSlots, contactId, body, hasName: hasNameOnRecord, hasPhone: hasPhoneOnRecord, firstName: realFirst, mode, lastOutbound: nepqPlan.last_offer || lastOutbound, contact, visitorTexts,
+        const nepqOut = reference ? null : await runNepqFixedMove({ plan: nepqPlan, slots: nepqSlots, contactId, body, hasName: hasNameOnRecord, hasPhone: hasPhoneOnRecord, firstName: realFirst, mode, lastOutbound: nepqPlan.last_offer || lastOutbound, contact, visitorTexts,
           threadTurns: (context.conversation_recent || []).map(m => ({ direction: String(m?.direction || '').toLowerCase() === 'outbound' ? 'outbound' : 'inbound', text: String(m?.text ?? m?.body ?? '') })) });
         if (nepqOut) {
-          timing.t4_analysis_done = new Date(d.now()).toISOString();
-          timing.t5_generation_done = timing.t4_analysis_done;
-          return deliver({
-            contactId, conversationId, body, mode, actionId, timing, isSuperseded, turn, visitorTexts, draft: nepqOut.reply,
-            capture: phoneFromText(body) ? { phone: phoneFromText(body) } : {}, skipCapture: !!nepqOut.skipCapture,
-            extras: { nepq: { ...nepqSummary(nepqPlan), ...nepqOut.record }, context_minimal: !!context._minimal, model: null },
-          });
+          // Part 7 (Mark, 2026-10-02: "Each message should be custom"): the
+          // move's line is not sent. Code did the deciding (and any booking);
+          // the model writes the reply from it below, with everything we know
+          // about the lead, and the line is the reference and the backup.
+          reference = nepqOut;
+          backup.reply = nepqOut.reply;
+          if (nepqOut.facts) {
+            nepqPlan = {
+              ...nepqPlan,
+              booking_facts: {
+                kind: nepqOut.facts.kind, label: nepqOut.facts.label, ask: nepqOut.facts.ask, ask_line: nepqOut.facts.ask_line,
+                first_name: nepqOut.firstName || realFirst || null,
+                alternatives_text: nepqOut.facts.alternatives.length === 2 ? nepqOut.facts.alternatives.map(x => `${x.day} at ${x.time} ${x.tz || ''}`.trim()).join(' or ') : null,
+              },
+            };
+          } else {
+            nepqPlan = { ...nepqPlan, reference_line: nepqOut.reply, reference_slots: nepqOut.slots || [] };
+          }
         }
       }
     }
+
+    // The re-check is this turn's job whatever the plan says (Part 7).
+    if (recheckRef && nepqPlan) nepqPlan = { ...nepqPlan, reference_line: recheckRef.line, reference_slots: [] };
 
     // Live NEPQ owns the price turn (clarify once, then a person); the old
     // fixed Transition stays for mode off/shadow.
@@ -989,7 +1031,7 @@ export function createLiveChatFastLane(deps) {
     // the same block the SMS path gets (src/agentic/service-area-turn.js).
     // Live NEPQ owns the booking-ask decision and is rendered last.
     const turnDiscipline = (nepqMode === 'live' && nepqPlan && discipline) ? { ...discipline, booking: nepqPlan.booking } : discipline;
-    const opts = { established, loopBreak, spouseAdvocacy, handoffPending, discipline: turnDiscipline, promptHint, threadSenderType: 'team', serviceAreaTurn: coverage ? { plan: saPlan, coverage } : null, nepqPlan: nepqMode === 'live' ? nepqPlan : null };
+    const opts = { established, loopBreak, spouseAdvocacy, handoffPending, discipline: turnDiscipline, promptHint, threadSenderType: 'team', serviceAreaTurn: coverage ? { plan: saPlan, coverage } : null, nepqPlan: nepqMode === 'live' ? nepqPlan : null, upcomingAppointments };
     const userPrompt = buildResponsePrompt(context, 'livechat', body, kbPack, classification, false, 'warm', null, opts) + LIVE_CHAT_OUTPUT_CONTRACT;
     const systemPrompt = getResponseSystemPrompt() + LIVE_CHAT_ADDENDUM;
 
@@ -1016,6 +1058,36 @@ export function createLiveChatFastLane(deps) {
       // A name or phone typed in THIS message counts (the model reports it).
       const hasName = hasNameOnRecord || isRealName(live?.contact_capture?.name);
       const hasPhone = hasPhoneOnRecord || !!live?.contact_capture?.phone;
+      // Part 7: a turn code already decided (a booking step, a hand-off, an
+      // objection play, two real times). The free-turn guards below would
+      // strip the very times and asks the turn is about; this checks the
+      // model's words against the facts or the reference instead, and the
+      // reference is the backup.
+      if (reference) {
+        const voiced = humanizeReply(restoreQuestionMark(message).text, { keepText: userPrompt });
+        const facts = reference.facts || null;
+        const hasApptRef = context.lp?.appointment_set === true && context.lp?.appointment_is_past !== true;
+        const claimRef = rewriteBookingClaims(voiced.text, { booked: !!facts?.book, held: !!facts && (facts.kind === 'hold' || facts.kind === 'collect'), hasAppointment: hasApptRef, replacement: nextStepLine({ bridgeUsed: !!nepqPlan?.counters?.bridge_used }) });
+        if (claimRef.changed) d.log(`[LiveChat] false_schedule_claim_fixed ${contactId}: unbacked booking or hold claim rewritten`);
+        const typedRef = visitorTexts.join(' \n ');
+        const knownRef = {
+          name: hasName, phone: hasPhone,
+          email: !!context.lead?.email || /\b[^\s@]+@[^\s@]+\.[a-z]{2,}\b/i.test(typedRef) || !!live?.contact_capture?.email,
+          zip: !!(context.lead?.postal_code) || /(?:^|\s)\d{5}(?:\s|$)/.test(typedRef),
+        };
+        const planRef = facts ? nepqPlan : { ...(nepqPlan || { required_move: 'answer', counters: {}, booking: { allowed: true } }), reference_line: reference.reply, reference_slots: reference.slots || [] };
+        const fixRef = enforceNepqPlan(claimRef.text, planRef, { known: knownRef });
+        let fixedRef = fixRef.text;
+        const notesRef = [];
+        if (fixRef.failed?.length) notesRef.push(referenceRetryNote(planRef, fixRef.failed));
+        if (facts) {
+          const chk = enforceBookingFacts(fixRef.text, facts);
+          fixedRef = chk.message;
+          if (chk.fallback_used) notesRef.push(bookingFactsNote(facts, chk.problems));
+        }
+        if (notesRef.length) d.log(`[NEPQ] live chat ${contactId} draft missed the turn's job: ${notesRef.length} note(s)`);
+        return { notes: notesRef, fixed: fixedRef, booking_claim_rewritten: claimRef.changed, nepq_changes: fixRef.changes, reference_failed: notesRef.length > 0 };
+      }
       // Human voice first (2026-10-02): the guards below append only clean
       // fixed lines, and dedupeSentences at the end sees the cleaned text.
       // A question written with a period hides from every check that counts
@@ -1105,6 +1177,7 @@ export function createLiveChatFastLane(deps) {
 
     return deliver({
       contactId, conversationId, body, mode, actionId, timing, draft, capture, isSuperseded, turn, visitorTexts,
+      skipCapture: !!reference?.skipCapture,
       extras: {
         intent_class: classification?.intent_class || null,
         classifier_method: classification?.classification_method || null,
@@ -1122,7 +1195,7 @@ export function createLiveChatFastLane(deps) {
         context_minimal: !!context._minimal,
         kb_pack_used: !!kbPack,
         model,
-        nepq: nepqPlan ? { mode: nepqMode, ...nepqSummary(nepqPlan), changes: guard.nepq_changes || [], ...(nepqMode === 'shadow' ? { would_send: enforceNepqPlan(draft, nepqPlan).text.slice(0, 500) } : {}) } : null,
+        nepq: nepqPlan ? { mode: nepqMode, ...nepqSummary(nepqPlan), ...(reference?.record || {}), ...(reference ? { ai_written: !guard.reference_failed } : {}), changes: guard.nepq_changes || [], ...(nepqMode === 'shadow' ? { would_send: enforceNepqPlan(draft, nepqPlan).text.slice(0, 500) } : {}) } : null,
         _bot_context: { core_prompt_version: 'live_chat_fast_lane', model, discipline, established_closed: established.closed_questions },
       },
       fingerprintExtras: {
@@ -1280,9 +1353,15 @@ export function createLiveChatFastLane(deps) {
         chosen = offeredSlots(plan.held_slot?.text || '', slots.slots)[0] || null;
         if (!chosen) {
           const two = slots.slots.slice(0, 2);
-          return { reply: `That time just filled up. ${NEPQ_LINES.offer_slots(two, plan.counters?.slot_offers || 0)}`, record: { collect: 'held_slot_gone' } };
+          return { reply: `That time just filled up. ${NEPQ_LINES.offer_slots(two, plan.counters?.slot_offers || 0)}`, slots: two, record: { collect: 'held_slot_gone' } };
         }
       }
+      // Part 7: the facts of this booking turn, for the model to write the
+      // reply from (enforceBookingFacts checks it; `fallback` is the backup).
+      const factsFor = (kind, { ask = null, ask_line = null, alternatives = [], book = false, fallback, record }) => ({
+        kind, slot: { ...chosen, tz: chosen.tz || tz }, label: slotLabel(chosen, tz), ask, ask_line, book,
+        alternatives: alternatives.map(x => ({ ...x, tz: x.tz || tz })), fallback, companion: null, record,
+      });
       // What the visitor has typed in this chat (name, phone, street, zip),
       // and the decision-maker answer when that was our question.
       // 2026-10-02 post-merge simulator run: reading only THIS message, the
@@ -1308,7 +1387,10 @@ export function createLiveChatFastLane(deps) {
         const dm = dmNow;
         if (dm === 'conflict') {
           const others = slots.slots.filter(x => x.iso !== chosen.iso).slice(0, 2);
-          if (others.length === 2) return { reply: `No problem, let's find a time when you can both be there. ${NEPQ_LINES.offer_slots(others, plan.counters?.slot_offers || 0)}`, record: { collect: 'dm_conflict' } };
+          if (others.length === 2) {
+            const reply = `No problem, let's find a time when you can both be there. ${NEPQ_LINES.offer_slots(others, plan.counters?.slot_offers || 0)}`;
+            return { reply, record: { collect: 'dm_conflict' }, facts: factsFor('dm_conflict', { ask: 'day', alternatives: others, fallback: reply, record: { collect: 'dm_conflict' } }) };
+          }
           return { reply: "No problem. What day works best when you can both be there?", record: { collect: 'dm_conflict' } };
         }
         // An unclear answer still counts as asked: never loop on it.
@@ -1340,9 +1422,14 @@ export function createLiveChatFastLane(deps) {
         // 2026-10-02 (Mark): no opener twice in a row ("Got it." … "Got it.").
         const ack = (typed.first_name && plan.held_slot?.asked === 'name') ? `Thanks, ${typed.first_name}.` : pickFresh(['Got it.', 'Perfect, thanks.', 'Great, thank you.'], plan.recent_outbound || [], 0);
         const reply = isConfirm ? holdLine(chosen, tz, askLine) : `${ack} ${askLine}`;
-        return { reply, record: { collect: missing[0], held: chosen.iso } };
+        const record = { collect: missing[0], held: chosen.iso };
+        return { reply, record, facts: factsFor(isConfirm ? 'hold' : 'collect', { ask: missing[0], ask_line: askLine, fallback: reply, record }) };
       }
-      if (!live) return { reply: NEPQ_LINES.confirm(chosen, tz, name), record: { booking: 'would_book', start: chosen.iso, calendar_id: slots.calendarId || null, decision_makers: decisionMakers } };
+      if (!live) {
+        const reply = NEPQ_LINES.confirm(chosen, tz, name);
+        const record = { booking: 'would_book', start: chosen.iso, calendar_id: slots.calendarId || null, decision_makers: decisionMakers };
+        return { reply, record, facts: factsFor('book', { book: true, fallback: reply, record }), firstName: name };
+      }
       // Save what they typed BEFORE booking: the booking gate reads the
       // contact (address, name, phone) from GHL.
       try { await d.captureIdentity(contactId, { visitorTexts: allTexts, capture: typed.first_name ? { name: typed.first_name } : {} }); } catch { /* the gate decides */ }
@@ -1361,23 +1448,27 @@ export function createLiveChatFastLane(deps) {
       } catch (err) {
         res = { ok: false, error: err.message };
       }
-      if (res?.ok) return { reply: NEPQ_LINES.confirm(chosen, tz, name), record: { booking: 'booked', start: chosen.iso, action_id: res.action_id || null }, skipCapture: true };
+      if (res?.ok) {
+        const reply = NEPQ_LINES.confirm(chosen, tz, name);
+        const record = { booking: 'booked', start: chosen.iso, action_id: res.action_id || null };
+        return { reply, record, skipCapture: true, facts: factsFor('book', { book: true, fallback: reply, record }), firstName: name };
+      }
       // GHL still refused (a real failure, not a missing detail): a person
       // locks it in, and nothing sounds final.
       d.warn(`[LiveChat] booking ${when} for ${contactId} not made: ${res?.error || 'unknown'} — handing to a person`);
       Promise.resolve(d.nepqHandoff({ contactId, reason: 'booking_request', inbound: `${body} (asked for ${when})`, firstName: name })).catch(() => {});
-      return { reply: `Got it, ${when}. A team member will reach out to confirm the details.`, record: { booking: 'handed_to_person', start: chosen.iso, error: String(res?.error || '').slice(0, 200) }, skipCapture: true };
+      return { reply: `Got it, ${when}. A team member will reach out to confirm the details.`, slots: [{ ...chosen, tz }], record: { booking: 'handed_to_person', start: chosen.iso, error: String(res?.error || '').slice(0, 200) }, skipCapture: true };
     }
 
     if (!plan.fixed_line || !NEPQ_FIXED_MOVES.has(plan.required_move)) return null;
     if (plan.handoff) {
       if (live) Promise.resolve(d.nepqHandoff({ contactId, reason: plan.handoff.reason, inbound: body, firstName })).catch(err => d.warn(`[LiveChat] NEPQ hand-off failed for ${contactId}: ${err.message}`));
       // A person can only reach out with a way to reach them.
-      return { reply: [plan.fixed_line, ask].filter(Boolean).join(' '), record: { fixed: plan.required_move } };
+      return { reply: [plan.fixed_line, ask].filter(Boolean).join(' '), slots: plan.slots_to_offer || [], record: { fixed: plan.required_move } };
     }
     // No real times to offer: the team calls, so it needs a way to reach them.
-    if (plan.ask_contact) return { reply: [plan.fixed_line, ask].filter(Boolean).join(' '), record: { fixed: plan.required_move } };
-    return { reply: plan.fixed_line, record: { fixed: plan.required_move } };
+    if (plan.ask_contact) return { reply: [plan.fixed_line, ask].filter(Boolean).join(' '), slots: plan.slots_to_offer || [], record: { fixed: plan.required_move } };
+    return { reply: plan.fixed_line, slots: plan.slots_to_offer || [], record: { fixed: plan.required_move } };
   }
 
   /** Send (live) or record (shadow) one finished reply. */
@@ -1457,7 +1548,11 @@ export function createLiveChatFastLane(deps) {
     return { outcome: sent ? 'sent' : 'shadow', sent, message: draft, ghl_message_id: ghlMessageId, timing: finished, large_job: !!extras.large_job, email_malformed: !!extras.email_malformed, language_handoff: extras.language_handoff || null };
   }
 
-  async function fallback({ contactId, conversationId, mode, actionId, timing, reason, body, isSuperseded = () => false }) {
+  async function fallback({ contactId, conversationId, mode, actionId, timing, reason, body, isSuperseded = () => false, backupReply = null }) {
+    // Part 7: when code already decided this turn (a booking step, a hand-off,
+    // two real times), its own reference line is the backup: it answers the
+    // visitor, where the holding line would only stall them.
+    const message = backupReply || LIVE_CHAT_FALLBACK_MESSAGE;
     let ghlMessageId = null;
     let sent = false;
     // A newer message took over: its own turn answers (or holds) for both.
@@ -1468,7 +1563,7 @@ export function createLiveChatFastLane(deps) {
     }
     if (mode === 'live') {
       try {
-        const res = await d.sendMessage({ contactId, conversationId, message: LIVE_CHAT_FALLBACK_MESSAGE, actionId, inboundMessage: body });
+        const res = await d.sendMessage({ contactId, conversationId, message, actionId, inboundMessage: body });
         ghlMessageId = res?.messageId || null;
         sent = true;
         timing.t6_ghl_sent = new Date(d.now()).toISOString();
@@ -1479,20 +1574,20 @@ export function createLiveChatFastLane(deps) {
     await d.emitEvent({
       event_type: 'agentic.live_chat_fallback', source: 'live_chat_fast_lane', entity_type: 'contact', entity_id: contactId, ghl_contact_id: contactId,
       priority: 'high', bypass_filter: true, idempotency_key: `livechat_fallback_${actionId ?? contactId}_${Date.now()}`,
-      payload: { contact_id: contactId, reason, mode, action_id: actionId, inbound_preview: String(body || '').slice(0, 300), fallback_sent: sent },
+      payload: { contact_id: contactId, reason, mode, action_id: actionId, inbound_preview: String(body || '').slice(0, 300), fallback_sent: sent, backup_line: !!backupReply },
     }).catch(err => d.warn(`[LiveChat] fallback event failed: ${err.message}`));
-    d.opsAlert(`⚠️ LIVE CHAT FALLBACK (${reason})\nContact: ${contactId}\nThey said: "${String(body || '').slice(0, 200)}"\n→ ${sent ? 'The holding line was sent; a person needs to pick this up now.' : `Mode ${mode}: nothing sent; a person needs to pick this up now.`}`).catch(() => {});
+    d.opsAlert(`⚠️ LIVE CHAT FALLBACK (${reason})\nContact: ${contactId}\nThey said: "${String(body || '').slice(0, 200)}"\n→ ${sent ? (backupReply ? `The AI reply ran out of time; the backup line went: "${backupReply.slice(0, 160)}". Check the chat.` : 'The holding line was sent; a person needs to pick this up now.') : `Mode ${mode}: nothing sent; a person needs to pick this up now.`}`).catch(() => {});
     const finished = finalizeTiming(timing);
     await finishAction(actionId, {
       status: 'completed',
       error_message: `live chat fallback: ${reason}`,
-      execution_result: { action: 'message_sent', channel: 'livechat', send_status: sent ? 'fallback' : 'fallback_not_sent', ...(sent ? { sent_body: LIVE_CHAT_FALLBACK_MESSAGE } : {}), message_id: ghlMessageId, conversation_id: conversationId, reason, timing: finished },
+      execution_result: { action: 'message_sent', channel: 'livechat', send_status: sent ? 'fallback' : 'fallback_not_sent', ...(sent ? { sent_body: message } : {}), message_id: ghlMessageId, conversation_id: conversationId, reason, timing: finished },
     });
     if (actionId != null) {
-      d.fingerprint({ message_type: 'reply', message_ref: String(actionId), ghl_contact_id: contactId, channel: 'livechat', rule_applied: LIVE_CHAT_RULE, inbound_text: body, reply_text: sent ? LIVE_CHAT_FALLBACK_MESSAGE : null, input_snapshot: { mode, fallback_reason: reason } });
+      d.fingerprint({ message_type: 'reply', message_ref: String(actionId), ghl_contact_id: contactId, channel: 'livechat', rule_applied: LIVE_CHAT_RULE, inbound_text: body, reply_text: sent ? message : null, input_snapshot: { mode, fallback_reason: reason } });
       if (sent) d.markSent(actionId);
     }
-    return { outcome: 'fallback', sent, message: sent ? LIVE_CHAT_FALLBACK_MESSAGE : null, ghl_message_id: ghlMessageId, reason, timing: finished };
+    return { outcome: 'fallback', sent, message: sent ? message : null, ghl_message_id: ghlMessageId, reason, timing: finished };
   }
 
   function finalizeTiming(t) {

@@ -55,8 +55,17 @@ const RECHECK = Object.freeze({
 const ALL_RECHECK = Object.values(RECHECK).flat();
 
 /** True when we already asked them to re-check a phone or email in this thread. Pure. */
+// Part 7: the bot words its own re-check now, so any re-check counts.
+export const RECHECK_RX = /\bmissing\s+a\s+digit\b|\bdigits?\s+(?:got\s+)?cut\s+off\b|\bextra\s+digit\b|\bdouble[-\s]?check\b|\bdoesn'?t\s+look\s+(?:quite\s+)?right\b|\bsomething'?s\s+missing\s+from\b|\b(?:send|type)\s+it\s+again\b/i;
 export function alreadyRechecked(recentOutbound = []) {
-  return (recentOutbound || []).some((t) => ALL_RECHECK.some((line) => String(t || '').includes(line)));
+  return (recentOutbound || []).some((t) => ALL_RECHECK.some((line) => String(t || '').includes(line)) || RECHECK_RX.test(String(t || '')));
+}
+
+/** The prompt instruction for a re-check the model writes itself (Part 7). Pure. */
+export function recheckHint(recheck) {
+  if (!recheck) return null;
+  const what = recheck.kind === 'email' ? 'email address' : 'phone number';
+  return `CONTACT RE-CHECK: the ${what} they just typed cannot be right (${recheck.kind === 'short' ? 'a digit is missing' : recheck.kind === 'long' ? 'there is an extra digit' : 'it is not a valid email'}). Kindly ask them to double-check it and send it again, in your own words, as the ONE question of this reply. A reference: "${recheck.line}" Never say you have it.`;
 }
 
 /**
