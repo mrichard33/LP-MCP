@@ -595,8 +595,8 @@ NEVER name a phone number, an area code, or say which line the call will
 come from. We do not control which number places it, so any number we name
 is a promise we cannot keep.
 
-Example shape: "You're set for [day] at [time]. Someone from our team will
-call before then to go over the details and finalize the visit."`,
+Example shape: "I have you down for [day] at [time]. A team member will
+reach out to confirm the details."`,
     // Empty sections (a suppressed v1.2 block, a stage with nothing to add)
     // are dropped rather than joined as blank lines — the snapshot guard reads
     // this text byte for byte.

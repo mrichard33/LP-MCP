@@ -508,13 +508,16 @@ function scheduleBufferedPipeline(contactId, trimmed, emittedEventId, messageTyp
     // forward into ai.analysis_completed.
     // Fix 3: latestMessageId — the inbound message_id of the most recent
     // message in the window; the outbound reply dedups against this.
-    buf = { messages: [], messageKeys: [], eventIds: [], firstSeenAt: Date.now(), timeoutId: null, latestType: null, latestMessageId: null, firstInbound: null };
+    buf = { messages: [], messageKeys: [], eventIds: [], firstSeenAt: Date.now(), timeoutId: null, latestType: null, latestMessageId: null, firstInbound: null, lastInbound: null };
     replyBuffers.set(contactId, buf);
   }
   buf.messages.push(trimmed);
   // 2026-09-26 (reply timing): the FIRST inbound in the window is when the
   // customer started waiting, so its provenance is what the analysis carries.
   if (inbound && !buf.firstInbound) buf.firstInbound = inbound;
+  // 2026-10-02 (burst-yield.js): the LAST inbound is the boundary the send
+  // checks against: a newer message after it has its own reply job.
+  if (inbound) buf.lastInbound = inbound;
   // 2026-07-03 — per-message dedup key, parallel to buf.messages. handleReply
   // synthesizes a key when GHL omits message_id, so this is always non-null.
   buf.messageKeys.push(messageId || buildMessageKey(contactId, null, trimmed));
@@ -544,7 +547,9 @@ function scheduleBufferedPipeline(contactId, trimmed, emittedEventId, messageTyp
     const firstSeenAt = buf.firstSeenAt;
     const latestType = buf.latestType;
     const latestMessageId = buf.latestMessageId;
-    const firstInbound = buf.firstInbound;
+    const firstInbound = buf.firstInbound
+      ? { ...buf.firstInbound, last_event_id: buf.lastInbound?.event_id ?? null, last_event_created_at: buf.lastInbound?.event_created_at ?? null, message_keys: buf.messageKeys.slice(-20) }
+      : null;
     replyBuffers.delete(contactId);
 
     // 2026-07-03 — hard dedup: atomically claim every buffered message key.

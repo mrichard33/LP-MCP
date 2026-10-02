@@ -765,7 +765,7 @@
     "label": "Hard confirmation status is set server-side",
     "target": "playbooks",
     "kind": "static",
-    "probe": "ON A HARD CONFIRMATION — emit book_appointment. STATUS is set server-side and NEVER defaults to confirmed: \"co"
+    "probe": "ON A HARD CONFIRMATION — emit book_appointment. STATUS is always \"new\""
   },
   {
     "id": "L2265",

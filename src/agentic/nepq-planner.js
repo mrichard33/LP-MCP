@@ -27,6 +27,7 @@
 import { isNotInterested } from './not-interested.js';
 import { isLeadQuestion, findBookingAsks } from './discovery-discipline.js';
 import { isTeamOpen, nextTeamOpenLabel, requestedCallTime } from './team-hours.js';
+import { heldSlot, COLLECT_ASK } from './booking-collect.js';
 
 export const NEPQ_PLANNER_VERSION = '1.0';
 
@@ -38,9 +39,22 @@ export function nepqBackboneMode(env = process.env) {
 
 // ── signals in the lead's words ──────────────────────────────────────────
 
+// The lead would rather talk than have a visit: the 15-minute call is the
+// backup (Mark, 2026-10-02: "Home visit for everyone. Use the call as a back
+// up or secondary option").
+export const VISIT_DECLINE_RX = /\b(?:just\s+)?call\s+me\s+instead\b|\brather\s+(?:do|have|get|just\s+do)\s+a\s+(?:phone\s+)?call\b|\bover\s+the\s+phone\b|\bon\s+the\s+phone\s+(?:instead|first)\b|\bphone\s+call\s+(?:instead|first|only)\b|\b(?:don'?t|do\s+not)\s+want\s+(?:anyone|someone|somebody|people|a\s+visit|a\s+rep|a\s+salesman)\b|\bno\s+(?:home\s+)?visits?\b/i;
+/** Did the lead, anywhere in this conversation, ask for a call instead of a visit? Pure. */
+export function prefersCall(conversation = [], trigger = '') {
+  const texts = (Array.isArray(conversation) ? conversation : [])
+    .filter(m => String(m?.direction || '').toLowerCase() !== 'outbound').map(m => String(m?.text ?? m?.body ?? ''));
+  return [...texts, String(trigger || '')].some(t => VISIT_DECLINE_RX.test(t));
+}
+
 // "I want to schedule an estimate": a booking request, not a price ask
 // (2026-10-02: it got the quote line). Two real times, no discovery needed.
-export const SCHEDULE_ASK_RX = /\b(?:schedule|book|set\s+up|make|get)\s+(?:an?\s+|the\s+|my\s+)?(?:free\s+|in[-\s]home\s+)?(?:estimate|appointment|consultation|visit|measure(?:ment)?|assessment)\b|\b(?:can|could)\s+(?:someone|you|somebody)\s+come\s+(?:out|by|over)\b/i;
+// 2026-10-02 (Mark's test chat): "you're not able to set up a time now?" is a
+// schedule ask too.
+export const SCHEDULE_ASK_RX = /\b(?:schedule|book|set\s+up|make|get)\s+(?:an?\s+|the\s+|my\s+)?(?:free\s+|in[-\s]home\s+)?(?:estimate|appointment|consultation|visit|measure(?:ment)?|assessment)\b|\b(?:can|could)\s+(?:someone|you|somebody)\s+come\s+(?:out|by|over)\b|\bset\s+up\s+(?:a\s+)?time\b|\bset\s+(?:it|one|that)\s+up\b|\b(?:book|schedule)\s+(?:it|me|that|one|a\s+time|something)\b|\b(?:pick|grab|lock\s+in)\s+a\s+time\b/i;
 export const PRICE_RX = /\b(?:how\s+much|price[sd]?|pricing|costs?|quotes?|estimates?|ballpark|rough\s+(?:number|idea|figure)|what\s+(?:would|does|will)\s+(?:it|that|this)\s+(?:cost|run))\b/i;
 export const INSIST_RX = /\b(?:just|only)\s+(?:want|need)\s+(?:a|the|to\s+(?:get|know)(?:\s+(?:a|the))?)\s+(?:price|quote|number|cost|estimate)\b|\b(?:give|tell|send|text)\s+me\s+(?:a|the|your)\s+(?:price|number|quote|ballpark|figure|estimate)\b/i;
 // "how much a month" asks for a figure; "do you offer financing?" does not.
@@ -115,7 +129,8 @@ export function problemPhrase(word) {
 // that been sitting with you", "if those stay as is through this season"), and
 // the narrow pattern missed it, so it was asked twice. These count too.
 export const CONSEQUENCE_RX = /\bwhat\s+happens\s+if\b|\bif\s+you\s+(?:wait|hold\s+off|held\s+off|put\s+(?:it|this)\s+off)\b|\banother\s+(?:hurricane\s+)?season\b|\bpush\s+(?:it|this)\s+(?:off|down\s+the\s+road)\b|\bsitting\s+with\s+you\b|\bif\s+(?:those|they|it|that|this|nothing|things)\s+(?:stays?|changes?|keeps?|goes|go|gets?\s+worse)\b|\bthrough\s+(?:this|another|the)\s+(?:hurricane\s+|storm\s+)?season\b|\baffecting\s+you\b|\bwhat\s+would\s+(?:it|that)\s+mean\s+for\s+you\b|\bif\s+another\s+(?:one|storm|hurricane)\b|\banother\s+year\s+(?:with|of)\b|\bwhat'?s\s+another\s+year\b|\bwhat\s+does\s+that\s+(?:end\s+up\s+)?cost(?:ing)?\s+you\b|\bsit\s+as[- ]is\b/i;
-const BRIDGE_RX = /\bbased\s+on\s+what\s+you\s+(?:told|said|mentioned)\b|\bthis\s+could\s+work\s+for\s+you\b|\bthe\s+next\s+step\s+would\s+be\b/i;
+// Every bridge variant (bridgeLine) names "the next step" and must match here.
+const BRIDGE_RX = /\bbased\s+on\s+what\s+you\s+(?:told|said|mentioned)\b|\bthis\s+could\s+work\s+for\s+you\b|\b(?:the\s+)?(?:easiest\s+|best\s+)?next\s+step\s+(?:would\s+be|is)\b/i;
 const STATUS_FRAME_RX = /\bpretty\s+simple\b|\bsee\s+what\s+you\s+have\s+now\b|\bif\s+it\s+might\s+be\s+a\s+fit\b/i;
 const REVEAL_RX = /\banything\s+you'?re\s+wondering\s+about\b|\bbefore\s+your\s+visit\b/i;
 const SLOT_OFFER_RX = /\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b[^?]{0,80}\bor\b|\bI\s+have\s+[^?]{0,80}\bor\b[^?]*\?/i;
@@ -152,11 +167,20 @@ export const LINES = Object.freeze({
   not_interested: (name) => `No problem${name ? `, ${name}` : ''}. What changed?`,
   ask_day: 'No problem. What day works best for you?',
   close: "Understood. Take care, and if anything changes, we're here.",
-  offer_slots: (slots) => `I have ${slotPair(slots)}. Which works better?`,
+  // 2026-10-02 (Mark): "We shouldn't be repeating the same message." Lines
+  // that recur in one thread come in variants (pickFresh); every offer keeps
+  // "I have … or …?" because SLOT_OFFER_RX, offeredSlots and heldSlot read it.
+  offer_slots: (slots, v = 0) => [
+    `I have ${slotPair(slots)}. Which works better?`,
+    `I have ${slotPair(slots)} open. Which one works for you?`,
+    `I have ${slotPair(slots)}. Which would you like?`,
+  ][v % 3],
   which: (slots) => `Great. Which works better, ${slotPair(slots)}?`,
   financing_yes: 'Yes, we offer financing. The details depend on your home, and our team walks you through them.',
   reveal: "Before your visit, is there anything you're wondering about that I can pass along?",
-  confirm: (slot, tz, name) => `You're set for ${slot.day} at ${slot.time}${tz ? ` ${tz}` : ''}${name ? `, ${name}` : ''}. Our team will call to go over the details.`,
+  // 2026-10-02 (Mark): nothing sounds final. The visit is booked as a new,
+  // unconfirmed appointment, and a team member confirms it.
+  confirm: (slot, tz, name) => `Got it${name ? `, ${name}` : ''}. I have you down for ${slot.day} at ${slot.time}${tz ? ` ${tz}` : ''}. A team member will reach out to confirm the details.`,
   handoff: {
     complaint: "I'm sorry about that. I'm getting someone from our team on this now.",
     emergency: "That's urgent. I'm getting someone from our team on this right now.",
@@ -173,6 +197,19 @@ export const LINES = Object.freeze({
     service: (when) => `Sorry about that. I've passed this to our service team, and someone will call you ${when}.`,
   },
   callback_outside_hours: (when) => `Got it. That's outside our team's hours, so I'll have someone call you ${when}.`,
+});
+
+// Second wordings for lines that can come up twice in one thread (Mark,
+// 2026-10-02: "There needs to be variation in each comment"). Variant 0 is
+// always the LINES wording; `vary` in planNepqTurn picks one not yet sent.
+// Each keeps the phrase other code reads ("every home is different",
+// "I have … or …", the "?").
+export const ALT_LINES = Object.freeze({
+  ask_day: ['Sure thing. What day would be easiest for you?', 'Okay. Which day is best for you?'],
+  which: (slots) => [`Sounds good. Which one works for you, ${slotPair(slots)}?`],
+  price_again_slots: (slots) => [`I hear you. Since every home is different, any number now would be a guess. I have ${slotPair(slots)} open to measure. Which one works for you?`],
+  price_again_no_slots: ['I hear you. Since every home is different, any number now would be a guess. A team member will call to set up a free measure.'],
+  think_slots: (slots) => [`Totally fine. If it helps, I can hold a time so you don't have to chase us later. I have ${slotPair(slots)}. Which works better?`],
 });
 
 function slotPair(slots = []) {
@@ -401,8 +438,12 @@ export function planNepqTurn({
     criteria_reply: isCriteriaReply(now, lastOut),
     time_request: timeRequest,
     answer_first: false,
+    // For pickFresh: what we already said, so a line is never sent twice.
+    recent_outbound: outbound.slice(-8).map(m => m.text),
+    variant_seed: outbound.length,
   };
   plan.echo.phrase = problemPhrase(echoWord);
+  const vary = (primary, alts = []) => pickFresh([primary, ...alts], plan.recent_outbound, 0);
   const fixed = (move, line, extra = {}) => Object.assign(plan, { required_move: move, fixed_line: line }, extra);
   const teamOpen = isTeamOpen(nowMs);
   const handoffLine = (reason) => (!teamOpen && LINES.handoff_closed[reason]) ? LINES.handoff_closed[reason](nextTeamOpenLabel(nowMs)) : LINES.handoff[reason];
@@ -430,7 +471,7 @@ export function planNepqTurn({
   // 2. A first "no". To our two times → ask for a day. A goodbye → a warm
   // close with no question. Not interested / don't come → ONE question.
   if (nos === 1 && SLOT_OFFER_RX.test(lastOut) && !isNotInterested(now)) {
-    return fixed('ask_day', LINES.ask_day, { step: 'ask_day', booking: { allowed: true, reason: 'nepq:ask_day' } });
+    return fixed('ask_day', vary(LINES.ask_day, ALT_LINES.ask_day), { step: 'ask_day', booking: { allowed: true, reason: 'nepq:ask_day' } });
   }
   if (CLOSE_RX.test(now)) {
     return fixed('close', LINES.close, { step: 'close', booking: { allowed: false, reason: 'nepq:close' } });
@@ -457,6 +498,18 @@ export function planNepqTurn({
     return Object.assign(plan, { step: 'discover', required_move: 'answer', booking: { allowed: false, reason: 'nepq:discover_first' } });
   }
 
+  // 3a. A picked time is held while we collect what the booking needs
+  // (booking-collect.js, Mark 2026-10-02: ask first, then book). Their reply
+  // is the detail we asked for; a question in between is answered, then the
+  // same ask again.
+  const held = heldSlot(turns);
+  if (held && !isNotInterested(now) && !NEITHER_RX.test(now)) {
+    if (isLeadQuestion(now) && held.asked) {
+      return Object.assign(plan, { step: 'collect', required_move: 'answer', held_slot: held, reask_line: COLLECT_ASK[held.asked], booking: { allowed: true, reason: 'nepq:collect' } });
+    }
+    return Object.assign(plan, { step: 'collect', required_move: 'collect', held_slot: held, booking: { allowed: true, reason: 'nepq:collect' } });
+  }
+
   // 3b. "You just said that": stop asking, offer the next step.
   if (REPEAT_COMPLAINT_RX.test(now) && !hasAppointment) {
     const line = offerSlots.length === 2 ? withSlots(LINES.repeat_slots(offerSlots)) : LINES.repeat_no_slots;
@@ -471,7 +524,7 @@ export function planNepqTurn({
       return fixed('objection_play', line, { step: 'discover', objection: { type: 'price', attempt, line }, booking: { allowed: false, reason: 'nepq:discover_first' } });
     }
     // Asked again: why there is no number, then two real times.
-    const line = offerSlots.length === 2 ? withSlots(LINES.price_again_slots(offerSlots)) : LINES.price_again_no_slots;
+    const line = offerSlots.length === 2 ? withSlots(vary(LINES.price_again_slots(offerSlots), ALT_LINES.price_again_slots(offerSlots))) : vary(LINES.price_again_no_slots, ALT_LINES.price_again_no_slots);
     return fixed('objection_play', line, {
       step: 'offer_slots', objection: { type: 'price', attempt, line },
       ask_contact: offerSlots.length !== 2,
@@ -489,7 +542,7 @@ export function planNepqTurn({
   if (objType === 'think') {
     // The Calendar Commitment. Exempt from the booking-ask cap: it is the one
     // booking ask NEPQ wants here (the review found it stripped).
-    const line = offerSlots.length === 2 ? withSlots(LINES.think_slots(offerSlots)) : LINES.think_no_slots;
+    const line = offerSlots.length === 2 ? withSlots(vary(LINES.think_slots(offerSlots), ALT_LINES.think_slots(offerSlots))) : LINES.think_no_slots;
     return fixed('objection_play', line, { objection: { type: 'think', attempt, line } });
   }
 
@@ -497,10 +550,10 @@ export function planNepqTurn({
   // times near it. A question in the same burst is answered first.
   if (timeRequest) {
     const asked = isLeadQuestion(now) && !TIME_REQUEST_RX.test(now);
-    if (offerSlots.length === 2 && !asked) return fixed('offer_slots', withSlots(LINES.offer_slots(offerSlots)), { step: 'offer_slots' });
+    if (offerSlots.length === 2 && !asked) return fixed('offer_slots', withSlots(LINES.offer_slots(offerSlots, counters.slot_offers)), { step: 'offer_slots' });
     if (offerSlots.length === 2) {
       withSlots(null);
-      return Object.assign(plan, { step: 'offer_slots', required_move: 'offer_slots', answer_first: true, offer_line: LINES.offer_slots(offerSlots) });
+      return Object.assign(plan, { step: 'offer_slots', required_move: 'offer_slots', answer_first: true, offer_line: LINES.offer_slots(offerSlots, counters.slot_offers) });
     }
     return Object.assign(plan, { step: 'offer_slots', required_move: asked ? 'answer' : 'offer_slots', booking: { allowed: true, reason: 'nepq:time_request' } });
   }
@@ -511,15 +564,15 @@ export function planNepqTurn({
 
   // 5. Answering our slot offer.
   if (lastOfferOut) {
-    if (NEITHER_RX.test(now)) return fixed('ask_day', LINES.ask_day, { step: 'ask_day', booking: { allowed: true, reason: 'nepq:ask_day' } });
+    if (NEITHER_RX.test(now)) return fixed('ask_day', vary(LINES.ask_day, ALT_LINES.ask_day), { step: 'ask_day', booking: { allowed: true, reason: 'nepq:ask_day' } });
     const picked = DAY_OR_TIME_RX.test(now) || BARE_PICK_RX.test(now);
     // "Sure" / "yes" to two times picks neither: ask which, with the times.
-    if (!picked && YES_RX.test(now) && offerSlots.length === 2) return fixed('offer_slots', withSlots(LINES.which(offerSlots)), { step: 'offer_slots' });
+    if (!picked && YES_RX.test(now) && offerSlots.length === 2) return fixed('offer_slots', withSlots(vary(LINES.which(offerSlots), ALT_LINES.which(offerSlots))), { step: 'offer_slots' });
     if (picked || YES_RX.test(now)) return Object.assign(plan, { step: 'confirm', required_move: 'confirm', last_offer: lastOfferOut, booking: { allowed: true, reason: 'nepq:confirm' } });
   }
   // They named a day after "what day works best?": offer two times that day.
   if (/\bwhat\s+day\s+works\s+best\b/i.test(lastOut) && DAY_OR_TIME_RX.test(now)) {
-    if (offerSlots.length === 2) return fixed('offer_slots', withSlots(LINES.offer_slots(offerSlots)), { step: 'offer_slots' });
+    if (offerSlots.length === 2) return fixed('offer_slots', withSlots(LINES.offer_slots(offerSlots, counters.slot_offers)), { step: 'offer_slots' });
     return Object.assign(plan, { step: 'offer_slots', required_move: 'offer_slots', booking: { allowed: true, reason: 'nepq:offer_slots' } });
   }
 
@@ -528,8 +581,19 @@ export function planNepqTurn({
   // stops asking once the lead has done their own convincing.
   const READY = /^(?:lead_asked_about_scheduling|lead_answered_booking_prerequisite|lead_answered_decision_maker_ask|urgent_deadline_stated|recommended_action:)/;
   if (discipline?.booking?.allowed && READY.test(String(discipline.booking.reason || ''))) {
-    if (offerSlots.length === 2 && !isLeadQuestion(now)) return fixed('offer_slots', withSlots(LINES.offer_slots(offerSlots)), { step: 'offer_slots' });
+    if (offerSlots.length === 2 && !isLeadQuestion(now)) return fixed('offer_slots', withSlots(LINES.offer_slots(offerSlots, counters.slot_offers)), { step: 'offer_slots' });
     return Object.assign(plan, { step: 'offer_slots', required_move: isLeadQuestion(now) ? 'answer' : 'offer_slots', booking: { allowed: true, reason: discipline.booking.reason } });
+  }
+
+  // 6a. Yes to the bridge with a question in the same message ("Yeah, how
+  // long does that take?"): answer it in one sentence, then the two times.
+  // Mark's test chat (2026-10-02) got "a team member will call you" here.
+  if (BRIDGE_RX.test(lastOut) && YES_RX.test(now) && isLeadQuestion(now)) {
+    if (offerSlots.length === 2) {
+      withSlots(null);
+      return Object.assign(plan, { step: 'offer_slots', required_move: 'offer_slots', answer_first: true, offer_line: LINES.offer_slots(offerSlots, counters.slot_offers) });
+    }
+    return Object.assign(plan, { step: 'offer_slots', required_move: 'offer_slots', booking: { allowed: true, reason: 'nepq:offer_slots' } });
   }
 
   // 6. They asked us something: answer it first (one question after, at most).
@@ -541,14 +605,14 @@ export function planNepqTurn({
 
   // 7. Said yes to the bridge → two real times.
   if (BRIDGE_RX.test(lastOut) && YES_RX.test(now)) {
-    if (offerSlots.length === 2) return fixed('offer_slots', withSlots(LINES.offer_slots(offerSlots)), { step: 'offer_slots' });
+    if (offerSlots.length === 2) return fixed('offer_slots', withSlots(LINES.offer_slots(offerSlots, counters.slot_offers)), { step: 'offer_slots' });
     return Object.assign(plan, { step: 'offer_slots', required_move: 'offer_slots', booking: { allowed: true, reason: 'nepq:offer_slots' } });
   }
 
   // 7b. A soft "maybe" / "I guess" to the bridge: two real times, no pressure
   // (2026-10-02 funnel re-test: a vague lead stalled for five turns on SMS).
   if (BRIDGE_RX.test(lastOut) && MAYBE_RX.test(now)) {
-    if (offerSlots.length === 2) return fixed('offer_slots', withSlots(LINES.offer_slots(offerSlots)), { step: 'offer_slots' });
+    if (offerSlots.length === 2) return fixed('offer_slots', withSlots(LINES.offer_slots(offerSlots, counters.slot_offers)), { step: 'offer_slots' });
     return Object.assign(plan, { step: 'offer_slots', required_move: 'offer_slots', booking: { allowed: true, reason: 'nepq:offer_slots' } });
   }
 
@@ -556,10 +620,10 @@ export function planNepqTurn({
   // Two non-answers in a row ("idk", "maybe") end discovery early: more
   // questions only stall a lead who has nothing more to say (Mark, 2026-10-02).
   if (!counters.bridge_used && counters.discovery_questions_asked >= 1 && vagueRun(inbound) >= 2) {
-    return Object.assign(plan, { step: 'bridge', required_move: 'bridge', vague_lead: true, booking: { allowed: false, reason: 'nepq:bridge_vague' } });
+    Object.assign(plan, { step: 'bridge', required_move: 'bridge', vague_lead: true, booking: { allowed: false, reason: 'nepq:bridge_vague' } }); plan.bridge_line = bridgeLine(plan); return plan;
   }
   if (counters.discovery_questions_asked >= cap && !counters.bridge_used) {
-    return Object.assign(plan, { step: 'bridge', required_move: 'bridge', booking: { allowed: false, reason: 'nepq:bridge_first' } });
+    Object.assign(plan, { step: 'bridge', required_move: 'bridge', booking: { allowed: false, reason: 'nepq:bridge_first' } }); plan.bridge_line = bridgeLine(plan); return plan;
   }
   if (counters.bridge_used) {
     // Bridged already and they did not say yes: answer and keep it soft.
@@ -618,7 +682,31 @@ export function asksForKnown(sentence, known = {}) {
 /** The bridge in their words, when the draft skipped it. Pure. */
 export function bridgeLine(plan) {
   const phrase = plan.echo?.phrase || problemPhrase(plan.echo?.word);
-  return `Based on what you told me, this could work for you${phrase ? `, since you mentioned ${phrase}` : ''}. The next step would be ${plan.next_step_label || 'a visit at your home'}. Would that help?`;
+  const since = phrase ? `, since you mentioned ${phrase}` : '';
+  const label = plan.next_step_label || 'a visit at your home';
+  // 2026-10-02 (Mark): the same bridge word for word in every chat read as a
+  // script. Variants, chosen so none repeats one already sent (pickFresh).
+  const variants = [
+    `Based on what you told me, this could work for you${since}. The next step would be ${label}. Would that help?`,
+    `Thanks for walking me through that. It sounds like we could help${since}. The next step would be ${label}. Would that work for you?`,
+    `From what you've shared, I think we can help${since}. The easiest next step is ${label}. Would that help?`,
+    `Got it. We can likely help${since}. The best next step is ${label}. Would that be useful?`,
+  ];
+  return pickFresh(variants, plan.recent_outbound || [], plan.variant_seed || 0);
+}
+
+/**
+ * One of `variants`, never one whose opening words we already sent in this
+ * thread (Mark, 2026-10-02: "There needs to be variation in each comment").
+ * The seed spreads the choice across conversations; it is the outbound count,
+ * so a test is deterministic. Pure.
+ */
+export function pickFresh(variants, recentOutbound = [], seed = 0) {
+  const sent = recentOutbound.map(t => norm(t));
+  const opener = (v) => norm(v).split(' ').slice(0, 4).join(' ');
+  const fresh = variants.filter(v => !sent.some(t => t.includes(opener(v))));
+  const pool = fresh.length ? fresh : variants;
+  return pool[Math.abs(seed) % pool.length];
 }
 
 /**
@@ -679,6 +767,14 @@ export function enforceNepqPlan(draft, plan, { allowFigures = false, known = {} 
   // re-asked for a first name the visitor had typed). A question that asks
   // for a known name, phone, email or zip goes.
   drop(s => s.includes('?') && asksForKnown(s, known), 'reask_known');
+  // 4c. Never the same sentence twice in one conversation (Mark, 2026-10-02:
+  // "We shouldn't be repeating the same message"). Only when something else
+  // is left; the required lines below are put back by their own steps.
+  const sentBefore = new Set((plan.recent_outbound || []).flatMap(t => splitSentences(t)).map(norm).filter(x => x.split(' ').length >= 4));
+  if (sentBefore.size && sentences.length > 1) {
+    const kept = sentences.filter(s => !sentBefore.has(norm(s)));
+    if (kept.length && kept.length !== sentences.length) { sentences = kept; changes.push('repeat_sentence'); }
+  }
   // 5. One question: keep the last one.
   const questions = sentences.filter(s => s.includes('?'));
   if (questions.length > 1) {
@@ -687,6 +783,12 @@ export function enforceNepqPlan(draft, plan, { allowFigures = false, known = {} 
     changes.push('one_question');
   }
   body = sentences.join(' ').trim();
+
+  // 5a. Holding a time: their question answered, then the same ask again.
+  if (plan.reask_line && !body.includes(plan.reask_line)) {
+    body = [...splitSentences(body).filter(s => !s.includes('?')), plan.reask_line].join(' ').trim();
+    changes.push('reask_line');
+  }
 
   // 5b. A time they typed, with a question in the same burst: the answer, then
   // the two real times verbatim (the model's own times never survive).
@@ -700,7 +802,7 @@ export function enforceNepqPlan(draft, plan, { allowFigures = false, known = {} 
 
   // 6. The required move, when the draft skipped it.
   if (plan.required_move === 'bridge' && !BRIDGE_RX.test(body)) {
-    body = bridgeLine(plan);
+    body = plan.bridge_line || bridgeLine(plan);
     changes.push('bridge');
   }
   if (!body) {

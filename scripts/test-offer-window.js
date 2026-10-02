@@ -29,6 +29,7 @@ const {
   selectOfferableSlots,
   buildOfferWindowPrompt,
   parseSlots,
+  spreadCallOffer,
 } = await import('../src/knowledge/calendar-availability.js');
 
 const TZ = 'America/New_York';
@@ -181,4 +182,50 @@ test('offer wording: "tomorrow" in the two-times line, and "tomorrow" picks that
   assert.equal(LINES.offer_slots([a, b]), 'I have tomorrow at 10:00 AM ET or Mon, Oct 5 at 6:00 PM ET. Which works better?');
   assert.equal(pickSlot('tomorrow works', [a, b]), a);
   assert.equal(pickSlot('monday', [a, b]), b);
+});
+
+test('regression 2026-10-02: "the first one" after a "tomorrow at …" offer books the FIRST time', async () => {
+  const { LINES } = await import('../src/agentic/nepq-planner.js');
+  const { offeredSlots, pickSlot } = await import('../src/live-chat/cancel-flow.js');
+  const a = { iso: '2026-10-03T10:00:00-04:00', day: 'Sat, Oct 3', time: '10:00 AM', dayOfWeek: 'Saturday', rel: 'tomorrow', tz: 'ET' };
+  const b = { iso: '2026-10-04T14:00:00-04:00', day: 'Sun, Oct 4', time: '2:00 PM', dayOfWeek: 'Sunday', rel: null, tz: 'ET' };
+  const offer = LINES.offer_slots([a, b]);
+  const offered = offeredSlots(offer, [b, a]);
+  assert.deepEqual(offered, [a, b], 'both times found, in the order offered');
+  assert.equal(pickSlot('The first one', offered), a);
+  assert.equal(pickSlot('the second', offered), b);
+  // Only one of two matched: an ordinal is not trusted.
+  assert.equal(pickSlot('The first one', [b]), null);
+});
+
+// ─── 2026-10-02 (Mark): a call back can happen any time in team hours ───
+
+test('call calendar: 30-minute floor, soonest time plus one an hour later, same day', () => {
+  const a = avail([slotAt(0.25), slotAt(0.75), slotAt(1.25), slotAt(2), slotAt(26)]);
+  const sel = selectOfferableSlots(a, null, { call: true });
+  assert.equal(sel.slots.length, 2);
+  const t = sel.slots.map(x => new Date(x.iso).getTime());
+  assert.ok(t[0] >= Date.now() + 0.5 * HOUR - 1000, 'nothing inside 30 minutes');
+  assert.ok(t[0] < Date.now() + HOUR, 'the soonest call time, not 4 hours out');
+  assert.ok(t[1] - t[0] >= HOUR, 'an hour apart');
+  assert.ok(t[1] < Date.now() + 3 * HOUR, 'same day, no next-day spread');
+});
+
+test('call calendar: only times the team is in', () => {
+  const a = avail([slotAt(1), slotAt(2), slotAt(3), slotAt(4)]);
+  const openFrom3h = (ms) => ms >= Date.now() + 2.5 * HOUR;
+  const sel = selectOfferableSlots(a, null, { call: true, isOpen: openFrom3h });
+  assert.ok(sel.slots.length >= 1);
+  assert.ok(sel.slots.every(x => openFrom3h(new Date(x.iso).getTime())));
+});
+
+test('visit calendar keeps the 4-hour floor', () => {
+  const sel = selectOfferableSlots(avail([slotAt(1), slotAt(2), slotAt(6)]), null);
+  assert.ok(sel.slots.every(x => new Date(x.iso).getTime() >= Date.now() + 4 * HOUR - 1000));
+});
+
+test('spreadCallOffer: the next time an hour on, else the next one', () => {
+  const s = [slotAt(1), slotAt(1.5), slotAt(2.5)];
+  assert.deepEqual(spreadCallOffer(s), [s[0], s[2]]);
+  assert.deepEqual(spreadCallOffer(s.slice(0, 2)), [s[0], s[1]]);
 });

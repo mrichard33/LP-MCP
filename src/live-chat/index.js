@@ -40,7 +40,7 @@ import { resolveMarket } from '../actions/enrichment.js';
 import { postToSlack } from '../slack.js';
 import { fetchFreeSlots, selectOfferableSlots } from '../knowledge/calendar-availability.js';
 import { extractPreferredTime } from '../services/preferred-time.js';
-import { BOOKING_CALENDARS } from '../knowledge/booking-calendar-router.js';
+import { BOOKING_CALENDARS, inHomeCalendarFor } from '../knowledge/booking-calendar-router.js';
 import { routeNepqHandoff } from '../agentic/nepq-handoff.js';
 import { addGHLNote } from '../ghl.js';
 
@@ -319,7 +319,8 @@ async function rescheduleAppointment({ contactId, oldAppointmentId, calendarId, 
  * flow's offer (notice floor, 48h-first window).
  */
 async function offerBookingSlots({ contact, preferredText = null }) {
-  const calendarId = BOOKING_CALENDARS.WINDOW_ESTIMATE;
+  // 2026-10-02 (Mark): calculator leads → Measurement Verification, else Window Estimate.
+  const calendarId = inHomeCalendarFor(contact?.tags).calendar_id;
   const res = await offerSlots({ calendarId, contact, preferredText });
   return { ...res, calendarId };
 }
@@ -330,13 +331,18 @@ async function offerBookingSlots({ contact, preferredText = null }) {
  * missing address, decision-makers not confirmed) returns, it does not throw,
  * and the visitor must never hear "you're set" for it.
  */
-async function bookSlot({ contactId, startIso, calendarId }) {
+async function bookSlot({ contactId, startIso, calendarId, decisionMakers = null }) {
   if (!supabase) return { ok: false, error: 'supabase client not configured' };
   const { data, error } = await supabase.from('agent_actions').insert({
     action_type: 'book_appointment', target_system: 'ghl', target_entity: 'contact', target_id: contactId,
     rule_applied: 'LIVE_CHAT_BOOK', status: 'executing', requires_approval: false, max_retries: 1,
     reasoning: 'Live chat: the visitor picked one of two real open times (NEPQ Calendar Commitment)',
-    action_payload: { calendar_id: calendarId || BOOKING_CALENDARS.WINDOW_ESTIMATE, start_time: startIso, source: 'live_chat' },
+    action_payload: {
+      calendar_id: calendarId || BOOKING_CALENDARS.WINDOW_ESTIMATE, start_time: startIso, source: 'live_chat',
+      // The visitor's answer to "will anyone else be part of the decision?"
+      // satisfies the in-home gate's decision-maker check (2026-10-02).
+      ...(decisionMakers ? { qualifying_data: { decision_makers_present: decisionMakers } } : {}),
+    },
   }).select('id').single();
   if (error || data?.id == null) return { ok: false, error: error?.message || 'insert returned no id' };
   const { executeActionById } = await import('../actions/index.js');

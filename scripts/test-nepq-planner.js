@@ -15,7 +15,7 @@ process.env.SUPABASE_SERVICE_ROLE_KEY ||= 'test-key';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-const { planNepqTurn, enforceNepqPlan, nepqBackboneMode, objectionType, isNo, LINES } = await import('../src/agentic/nepq-planner.js');
+const { planNepqTurn, enforceNepqPlan, nepqBackboneMode, objectionType, isNo, LINES, pickFresh, bridgeLine } = await import('../src/agentic/nepq-planner.js');
 const { routeNepqHandoff } = await import('../src/agentic/nepq-handoff.js');
 const { renderPlanBlock } = await import('../src/prompts/response-generator/nepq-backbone.js');
 
@@ -102,7 +102,7 @@ test('booking sequence: neither → day ask; a pick → confirm; yes to the brid
   assert.equal(plan({ trigger: 'wednesday', conversation: offer }).required_move, 'confirm');
   const bridged = T(['outbound', 'Based on what you told me, this could work for you, since you mentioned drafts. The next step would be a visit at your home. Would that help?']);
   assert.equal(plan({ trigger: 'yes', conversation: bridged, slots: SLOTS }).fixed_line, LINES.offer_slots(SLOTS));
-  assert.match(LINES.confirm(SLOTS[0], 'ET', 'Dana'), /^You're set for Tue, Oct 6 at 10:00 AM ET, Dana\. Our team will call to go over the details\.$/);
+  assert.equal(LINES.confirm(SLOTS[0], 'ET', 'Dana'), 'Got it, Dana. I have you down for Tue, Oct 6 at 10:00 AM ET. A team member will reach out to confirm the details.');
 });
 
 test('discovery is short: after the cap the bridge is required', () => {
@@ -155,7 +155,39 @@ test('guard: one question, no unallowed booking ask, no "see you then", no fake 
 test('guard: a skipped bridge is written in their words', () => {
   const thread = T(['inbound', 'they are drafty'], ['outbound', 'Drafty? Which rooms?'], ['inbound', 'kitchen'], ['outbound', 'How long has that been going on?']);
   const p = planNepqTurn({ nowMs: OPEN_MS, channel: 'livechat', trigger: 'about 10 years', conversation: thread });
-  assert.match(enforceNepqPlan('Ten years is a long time. What made you start looking now?', p).text, /^Based on what you told me, this could work for you, since you mentioned the drafts\. The next step would be a visit at your home\. Would that help\?$/);
+  const out = enforceNepqPlan('Ten years is a long time. What made you start looking now?', p).text;
+  assert.equal(out, p.bridge_line);
+  assert.match(out, /, since you mentioned the drafts\. The (?:easiest |best )?next step (?:would be|is) a visit at your home\. Would that (?:help|work for you|be useful)\?$/);
+});
+
+// 2026-10-02 (Mark): "We shouldn't be repeating the same message."
+test('variation: a line already sent in the thread is never picked again', () => {
+  const variants = ['Based on what you told me, A.', 'Thanks for walking me through that, B.', 'From what you have shared, C.'];
+  assert.equal(pickFresh(variants, [], 0), variants[0]);
+  assert.equal(pickFresh(variants, ['Based on what you told me, this could work for you.'], 0), variants[1]);
+  assert.equal(pickFresh(variants, ['Based on what you told me, x', 'Thanks for walking me through that, y'], 5), variants[2]);
+  // Everything used: still answers.
+  assert.ok(variants.includes(pickFresh(variants, variants, 1)));
+});
+
+test('variation: the bridge never repeats one already sent', () => {
+  const first = 'Based on what you told me, this could work for you, since you mentioned the drafts. The next step would be a visit at your home. Would that help?';
+  const p = planNepqTurn({ nowMs: OPEN_MS, channel: 'livechat', trigger: 'idk', conversation: T(['inbound', 'they are drafty'], ['outbound', first], ['inbound', 'not sure'], ['outbound', 'What would make it easier to decide?'], ['inbound', 'idk']) });
+  assert.doesNotMatch(bridgeLine({ ...p, next_step_label: 'a visit at your home' }), /^Based on what you told me/);
+});
+
+test('variation: a second offer of times is worded differently', () => {
+  const slots = [{ day: 'Sat, Oct 3', rel: 'tomorrow', time: '10:00 AM' }, { day: 'Mon, Oct 5', time: '6:00 PM' }];
+  assert.equal(LINES.offer_slots(slots), 'I have tomorrow at 10:00 AM or Mon, Oct 5 at 6:00 PM. Which works better?');
+  assert.notEqual(LINES.offer_slots(slots, 1), LINES.offer_slots(slots, 0));
+  assert.match(LINES.offer_slots(slots, 1), /^I have .* or .*\?$/);
+});
+
+test('guard: a sentence already sent word for word is dropped', () => {
+  const p = planNepqTurn({ nowMs: OPEN_MS, channel: 'sms', trigger: 'the kitchen mostly', conversation: T(['inbound', 'my windows leak'], ['outbound', 'Happy to help with that. How long has that been going on?']) });
+  const out = enforceNepqPlan('Happy to help with that. Which room bothers you most?', p);
+  assert.equal(out.text, 'Which room bothers you most?');
+  assert.ok(out.changes.includes('repeat_sentence'));
 });
 
 // ── hand-off side effects and the prompt block ──

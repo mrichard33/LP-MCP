@@ -78,7 +78,7 @@ export const TIME_OFFER_NOTE =
  * a deterministic fix (offers stripped, the call-to-schedule line appended).
  * Pure.
  */
-export function guardTimeOffers(draft, { hasPhone = false, hasName = true, visitorText = '' } = {}) {
+export function guardTimeOffers(draft, { hasPhone = false, hasName = true, visitorText = '', nepqLive = false } = {}) {
   const offers = findTimeOffers(draft, { visitorText });
   if (!offers.length) return { notes: [], fixed: String(draft || '') };
   const kept = splitSentences(draft).filter((s) => !offers.includes(s));
@@ -89,7 +89,8 @@ export function guardTimeOffers(draft, { hasPhone = false, hasName = true, visit
   // "...best phone number to reach you on. A team member will call you...
   // What's the best phone number to reach you?").
   const noAsk = cleaned.filter((s) => !s.includes('?') && !asksForPhone(s));
-  return { notes: [TIME_OFFER_NOTE], fixed: [...noAsk, bookingHandoffLine({ hasPhone, hasName })].join(' ').trim() };
+  // NEPQ live: the real times come from the planner after a yes to the bridge.
+  return { notes: [TIME_OFFER_NOTE], fixed: [...noAsk, nepqLive ? VISIT_BRIDGE_LINE : bookingHandoffLine({ hasPhone, hasName })].join(' ').trim() };
 }
 
 // ── 2. Spanish → a person ───────────────────────────────────────────────────
@@ -324,6 +325,10 @@ export function cutSecondQuestion(text) {
 }
 
 export const VISIT_NEXT_STEP_LINE = 'The next step is a free in-home measurement, and a team member will call to set it up.';
+// 2026-10-02 (Mark: "It should book the time right now"): with NEPQ live the
+// chat offers real times itself, so the next step is the bridge question; a
+// yes gets two real times from the planner.
+export const VISIT_BRIDGE_LINE = 'The next step would be a free visit at your home to measure. Would that help?';
 
 /**
  * The live-chat conversation guards, run after the shared ones. Pure.
@@ -369,7 +374,7 @@ export function dedupeSentences(text) {
 
 export const DECLINE_CLOSE_LINE = "Understood. Take care, and if anything changes, we're here.";
 
-export function guardChatFlow(draft, { thread = [], hasName = false, hasPhone = false, body = '', bookingAllowed = true, declined = false, serviceTurn = false } = {}) {
+export function guardChatFlow(draft, { thread = [], hasName = false, hasPhone = false, body = '', bookingAllowed = true, declined = false, serviceTurn = false, nepqLive = false } = {}) {
   const notes = [];
   let fixed = String(draft || '');
 
@@ -405,12 +410,15 @@ export function guardChatFlow(draft, { thread = [], hasName = false, hasPhone = 
       // An existing customer's problem (a missed visit, a question about their
       // job) is never answered with a sales pitch (2026-10-02, ymnwp).
       fixed = [fixed, ask].filter(Boolean).join(' ').trim();
+    } else if (nepqLive && !serviceTurn) {
+      notes.push(`Your previous draft ended with no question and no next step. End with exactly: "${VISIT_BRIDGE_LINE}"`);
+      fixed = [fixed, VISIT_BRIDGE_LINE].filter(Boolean).join(' ').trim();
     } else if (ask) {
       notes.push(`Your previous draft ended with no question and no next step. Offer the free in-home measurement and end with exactly this question: "${ask}"`);
       fixed = [fixed, VISIT_NEXT_STEP_LINE, ask].filter(Boolean).join(' ').trim();
     }
   }
   // Everything was a repeat and nothing is missing: the next step itself.
-  if (!fixed.trim()) fixed = bookingHandoffLine({ hasName, hasPhone });
+  if (!fixed.trim()) fixed = nepqLive ? VISIT_BRIDGE_LINE : bookingHandoffLine({ hasName, hasPhone });
   return { notes, fixed: dedupeSentences(fixed) };
 }
