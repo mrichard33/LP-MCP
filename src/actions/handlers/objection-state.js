@@ -474,11 +474,17 @@ export async function executeTransitionObjectionState(action) {
     }
   }
 
+  let notificationSpec = null;
   if (wantsEnrollment && appointmentGateOk && mirrorGateOk) {
     // Route is deterministic from policy: webhook_url present → Route B,
     // otherwise Route A. Pre-compute so the notification text can reference it.
     const route = proposedPolicy.recovery_webhook_url ? 'B' : 'A';
-    const notificationSpec = buildRoutingNotificationSpec({
+    // 2026-10-02 (Mark, alert noise cut) — the "ROUTED TO S5.2 — BRANCH X"
+    // card is gone: 179 a week, none needing action. The transition is still
+    // recorded (contact_objection_states + state events); only the chained
+    // send_notification stops. routingNotificationSpecFor() returns null while
+    // ROUTING_NOTIFICATION_CARDS is false — flip it to bring the card back.
+    notificationSpec = routingNotificationSpecFor({
       contact_id,
       state_code: proposed_state,
       parent_state: proposedPolicy.parent_state,
@@ -527,7 +533,7 @@ export async function executeTransitionObjectionState(action) {
     enrollment_route: enrollment.route,
     enrollment_action_id: enrollment.action_id,
     enrollment_skip_reason: enrollment.skip_reason || null,
-    routing_notification_chained: enrollment.enrolled,
+    routing_notification_chained: !!(enrollment.enrolled && notificationSpec),
     mirror_state_set: mirrorResult.state_set,
     rebook_field_action: mirrorResult.rebook_field_action,
     rebook_url_source: mirrorResult.rebook_url_source,
@@ -980,6 +986,14 @@ async function enqueueWorkflowEnrollment({ contact_id, workflow_id, webhook_url,
     console.warn(`[ObjectionState] enqueue workflow enrollment threw: ${err.message}`);
     return { enrolled: false, route: null, action_id: null, skip_reason: 'db_error' };
   }
+}
+
+// 2026-10-02 (Mark, alert noise cut): routing cards are off. Exported so the
+// tests can pin it; the builder below stays for the day they come back.
+export const ROUTING_NOTIFICATION_CARDS = false;
+
+export function routingNotificationSpecFor(args) {
+  return ROUTING_NOTIFICATION_CARDS ? buildRoutingNotificationSpec(args) : null;
 }
 
 /**

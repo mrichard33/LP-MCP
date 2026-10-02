@@ -416,6 +416,11 @@ test('an oversized body is replaced by a marker, not stored whole', () => {
 
 const orphan = (id, route, received_at) => ({ id, route, received_at });
 
+// 2026-10-02 — these pin the per-alert path, which is what ALERT_DIGEST_ENABLED=false
+// restores. The digest-era path (card only after 60 min, once per row) is covered in
+// scripts/test-alert-noise-cut.js.
+process.env.ALERT_DIGEST_ENABLED = 'false';
+
 test('live mode fires ONE card for 3 orphans and stays silent while they persist', async () => {
   reset();
   process.env.INTAKE_JOURNAL_MODE = 'live';

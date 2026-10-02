@@ -2556,4 +2556,19 @@ export const STARTUP_MIRRORS = [
     fail: '[Migration] audit_posted_items (sql/143) skipped — apply sql/143 from the dashboard; the F.0 / S5.2 audit posts every problem it finds (no repeat filter) until it exists:',
     level: 'warn',
   },
+  // audit_posted_items.permanent (sql/144, 2026-10-02). A drift card posts once
+  // per contact, ever; its row must never age out. Until the column exists the
+  // shared dedupe (src/alert-posted.js) cannot read and posts everything.
+  {
+    name: 'sql/144',
+    expects: {
+      columns: [['audit_posted_items', 'permanent']],
+    },
+    sql: [
+      `ALTER TABLE audit_posted_items ADD COLUMN IF NOT EXISTS permanent boolean NOT NULL DEFAULT false;`,
+    ],
+    ready: '[Migration] audit_posted_items.permanent (sql/144) ready',
+    fail: '[Migration] audit_posted_items.permanent (sql/144) skipped — apply sql/144 from the dashboard; alert dedupe treats every item as new until it exists:',
+    level: 'warn',
+  },
 ];

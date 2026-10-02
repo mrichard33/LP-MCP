@@ -49,6 +49,7 @@
 //   GET|POST /api/lp/link-leak    → run now, return the sample (no alert)
 // SCHEDULER (startLinkLeakScheduler): daily at 06:00 ET.
 
+import { alertDigestEnabled } from '../alert-posted.js';
 import { getHlSupabase } from '../admin/hl-client.js';
 import { runSQL } from '../admin/supabase-admin.js';
 import { reportAlertCondition } from '../alert-state.js';
@@ -187,8 +188,12 @@ export async function measureLinkLeak({ hours = WINDOW_HOURS } = {}) {
   return { windowHours: hours, readOk: errors.length === 0, tables, errors };
 }
 
-/** One monitored pass: measure, decide, deliver. Returns the job-runner verdict. */
-export async function runLinkLeakMonitor() {
+/**
+ * One monitored pass: measure, decide, deliver. Returns the job-runner verdict.
+ * 2026-10-02 — `post: false` is the 8 AM digest calling: measure and decide
+ * only; the digest posts what is new (src/jobs/ops-morning-digest.js).
+ */
+export async function runLinkLeakMonitor({ post = true } = {}) {
   const sample = await measureLinkLeak();
   const decision = shouldAlertLinkLeak(sample);
 
@@ -199,7 +204,7 @@ export async function runLinkLeakMonitor() {
     : decision.verdict === 'healthy' ? false
       : null;
 
-  await reportAlertCondition({
+  if (post) await reportAlertCondition({
     key: ALERT_KEY,
     active,
     label: 'LP↔GHL link leak',
@@ -222,6 +227,7 @@ export async function runLinkLeakMonitor() {
     ok: decision.verdict !== 'insufficient_evidence',
     unknown: decision.verdict === 'insufficient_evidence',
     verdict: decision.verdict,
+    offenders: decision.offenders,
     sample,
   };
 }
@@ -251,6 +257,11 @@ export function startLinkLeakScheduler() {
   if (leakTimer) return;
   if (!ENABLED) {
     console.log('[LinkLeak] disabled (LINK_LEAK_MONITOR_ENABLED=false)');
+    return;
+  }
+  // 2026-10-02 — the 8 AM digest runs this job and posts only what is new.
+  if (alertDigestEnabled()) {
+    console.log('[LinkLeak] runs inside ops-morning-digest at 08:00 ET (ALERT_DIGEST_ENABLED) — own scheduler not started');
     return;
   }
   console.log('[LinkLeak] Scheduler started — daily run at 06:00 ET');

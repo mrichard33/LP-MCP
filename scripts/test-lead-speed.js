@@ -292,10 +292,14 @@ test('hourly check, shadow: finds the waiting lead, sends nothing', async () => 
   assert.equal(r.mode, 'shadow');
 });
 
+// 2026-10-02 — the next three pin the edge-triggered card that
+// ALERT_DIGEST_ENABLED=false restores; the digest-era card (new leads only) follows.
+const OLD_PATH = { LEAD_LEAK_ALERT_MODE: 'live', ALERT_DIGEST_ENABLED: 'false' };
+
 test('hourly check, live: reports ONE card on ops that names the lead', async () => {
   const calls = [];
   const deps = baseDeps({ reportAlertCondition: async (args) => { calls.push(args); return { action: 'fired' }; } });
-  const r = await runLeadUncalledCheck({ env: { LEAD_LEAK_ALERT_MODE: 'live' }, nowMs: NOW, deps });
+  const r = await runLeadUncalledCheck({ env: OLD_PATH, nowMs: NOW, deps });
   assert.equal(r.verdict, 'alert');
   assert.equal(calls.length, 1);
   assert.equal(calls[0].key, 'lead_uncalled_fresh');
@@ -311,7 +315,7 @@ test('hourly check: a lead Five9 already rang is not waiting → healthy (clears
     runSQL: stubSQL({ leads: [lpLead()], callPhones: ['3524453161'] }),
     reportAlertCondition: async (args) => { calls.push(args); return { action: 'recovered' }; },
   });
-  const r = await runLeadUncalledCheck({ env: { LEAD_LEAK_ALERT_MODE: 'live' }, nowMs: NOW, deps });
+  const r = await runLeadUncalledCheck({ env: OLD_PATH, nowMs: NOW, deps });
   assert.equal(r.verdict, 'healthy');
   assert.equal(calls[0].active, false);
 });
@@ -322,9 +326,51 @@ test('hourly check: a failed Five9 read is "could not tell" — active null, nev
     runSQL: stubSQL({ five9Fails: true }),
     reportAlertCondition: async (args) => { calls.push(args); return { action: 'noop' }; },
   });
-  const r = await runLeadUncalledCheck({ env: { LEAD_LEAK_ALERT_MODE: 'live' }, nowMs: NOW, deps });
+  const r = await runLeadUncalledCheck({ env: OLD_PATH, nowMs: NOW, deps });
   assert.equal(r.readFailed, true);
   assert.equal(calls[0].active, null);
+});
+
+// 2026-10-02 (Mark, alert noise cut) — digest era: name only leads never posted
+// in the last 7 days, and post nothing when there is no new one.
+function postedStore() {
+  const posted = new Map();
+  return {
+    posted,
+    filterNew: async ({ audit, items, ttlDays }) => {
+      assert.equal(audit, 'lead_uncalled');
+      assert.equal(ttlDays, 7);
+      return { fresh: items.filter((i) => !posted.has(i.key)), dedupe: 'ok' };
+    },
+    recordPosted: async ({ items }) => { for (const i of items) posted.set(i.key, true); return { ok: true }; },
+  };
+}
+
+test('hourly check, digest era: posts the new lead once, then never re-lists it', async () => {
+  const store = postedStore();
+  const sent = [];
+  const deps = baseDeps({ ...store, sendAlertMessage: async (text, opts) => { sent.push([text, opts]); return { sent: true }; } });
+  const env = { LEAD_LEAK_ALERT_MODE: 'live' };
+  const r1 = await runLeadUncalledCheck({ env, nowMs: NOW, deps });
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0][1].channel, 'ops');
+  assert.match(sent[0][0], /Jane D\. · …3161/);
+  assert.match(r1.summary, /new=1 posted/);
+  const r2 = await runLeadUncalledCheck({ env, nowMs: NOW + 3_600_000, deps });
+  assert.equal(sent.length, 1, 'the same lead is not posted again');
+  assert.match(r2.summary, /new=0/);
+});
+
+test('hourly check, digest era: nothing waiting → no post, no store write', async () => {
+  const store = postedStore();
+  const deps = baseDeps({
+    ...store,
+    runSQL: stubSQL({ leads: [lpLead()], callPhones: ['3524453161'] }),
+    sendAlertMessage: async () => { throw new Error('must not post'); },
+  });
+  const r = await runLeadUncalledCheck({ env: { LEAD_LEAK_ALERT_MODE: 'live' }, nowMs: NOW, deps });
+  assert.equal(r.verdict, 'healthy');
+  assert.equal(store.posted.size, 0);
 });
 
 test('a lead that arrived overnight is not "waiting" before the call center opens', async () => {

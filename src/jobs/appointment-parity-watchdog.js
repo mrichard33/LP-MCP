@@ -294,6 +294,7 @@
  *   PARITY_GHL_LIVE_CHECK_MAX=40        per-sweep cap on those live reads
  */
 
+import { alertDigestEnabled } from '../alert-posted.js';
 import supabase from '../supabase.js';
 import { getHlSupabase } from '../admin/hl-client.js';
 import { emitEvent } from '../event-emitter.js';
@@ -1069,6 +1070,15 @@ async function maybeAlertParityGaps(summary, { dryRun, deps = {} } = {}) {
   if (claimed.newlyFiring.length === 0) {
     console.log(`[ApptParity] ${verdict.gaps.length} standing gap(s), none new — silent`);
     return { action: 'silent', newly: 0 };
+  }
+
+  // 2026-10-02 (Mark, alert noise cut): no per-key card. New gaps go into the
+  // 8 AM digest (src/jobs/ops-morning-digest.js reads these alert_conditions
+  // rows by first_seen_at); the claim here is state only.
+  if (deps.digestEnabled ?? alertDigestEnabled()) {
+    await confirm(claimed.newlyFiring, { client });
+    console.log(`[ApptParity] ${claimed.newlyFiring.length} new gap(s) — held for the morning digest`);
+    return { action: 'digest', newly: claimed.newlyFiring.length };
   }
 
   const newGaps = claimed.newlyFiring.map((k) => byKey.get(k)).filter(Boolean);
