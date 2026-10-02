@@ -305,6 +305,37 @@ export async function postToSlack(text, channelId, opts = {}) {
 }
 
 /**
+ * Replace an existing message in place (chat.update). Added 2026-10-02 for the
+ * DNC-lift card: the server now finishes a lift in the background and has to
+ * swap the card's "⏳ Lifting" line for the result itself, long after n8n's
+ * response_url flow has moved on. Same return shape and never-throws contract
+ * as postToSlack.
+ */
+export async function updateSlackMessage(channelId, ts, text, opts = {}) {
+  if (!channelId || !ts) return { ok: false, ts: ts || null, channel: channelId || null, error: 'no_channel_or_ts', threw: false };
+  const token = opts.token ?? SLACK_BOT_TOKEN;
+  if (!token) return { ok: false, ts, channel: channelId, error: 'no_token', threw: false };
+  try {
+    const res = await (opts.fetchImpl || fetch)('https://slack.com/api/chat.update', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json; charset=utf-8', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({
+        channel: channelId,
+        ts: String(ts),
+        text: String(text || ''),
+        ...(Array.isArray(opts.blocks) ? { blocks: opts.blocks } : {}),
+      }),
+      signal: AbortSignal.timeout(10000),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (body?.ok) return { ok: true, ts: body.ts || ts, channel: body.channel || channelId, error: null, threw: false };
+    return { ok: false, ts, channel: channelId, error: String(body?.error || res.status), threw: false };
+  } catch (err) {
+    return { ok: false, ts, channel: channelId, error: err.message, threw: true };
+  }
+}
+
+/**
  * A Slack member's email via users.info, or null. Added 2026-09-26 for the
  * payroll Approve button, which is authorised against lf_report_approvers
  * EMAILS, not Slack member ids. Needs the bot's `users:read.email` scope.

@@ -319,6 +319,7 @@ import { registerLeadLeakRoutes, startLeadLeakScheduler, startLeadUncalledSchedu
 import { startChatLeadIntakeScheduler } from './jobs/chat-lead-intake-sweep.js';  // 2026-09-28
 import { startCanvassBackstopScheduler } from './jobs/canvass-lead-backstop.js';  // 2026-09-28
 import { startDncReentryScheduler } from './jobs/dnc-reentry-sweep.js';  // 2026-10-01
+import { startDncLiftReportScheduler } from './consent/dnc-lift-report.js';  // 2026-10-02
 import { registerInboundCaptureRoutes, startInboundCaptureScheduler } from './jobs/inbound-caller-capture.js';  // 2026-09-27
 import { startPayrollEngineScheduler } from './jobs/payroll-engine.js';  // 2026-09-26
 import { registerCiRoutes } from './ci/routes.js';
@@ -938,6 +939,7 @@ const server = app.listen(PORT, async () => {
   startLiveChatMissedReplyScheduler();
   startCanvassBackstopScheduler();
   startDncReentryScheduler();
+  startDncLiftReportScheduler();
   startInboundCaptureScheduler();
   startPayrollEngineScheduler();
   // Probe ffmpeg, which transcodes Five9's GSM 6.10 recordings to a format a
