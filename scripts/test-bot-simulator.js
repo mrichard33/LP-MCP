@@ -79,13 +79,16 @@ test('SMS: always dry-run, the simulated thread, the NEPQ override, one redraft 
   let first = true;
   const generate = async (contactId, channel, msg, opts) => {
     seen.push({ contactId, channel, msg, opts });
-    if (first) { first = false; const e = new Error('guard'); e.regenerationNote = 'fix it'; throw e; }
+    if (first) { first = false; const e = new Error('conversation_repetition: two questions'); e.regenerationNote = 'fix it'; throw e; }
     return { message: `Reply to: ${msg}`, nepq_plan: { move: 'probe' }, nepq_handoff: msg === 'No' ? { reason: 'two_nos' } : null };
   };
   const r = await simulateSms(resolveScenario({ scenario: 'not_interested' }), { nepqMode: 'live', generate });
   assert.ok(seen.every(s => s.opts.dryRun === true && s.opts.nepqModeOverride === 'live' && s.contactId.startsWith('sim-')));
   assert.equal(seen[1].opts.regenerationNote, 'fix it');
   assert.equal(r.transcript[0].redrafted, true);
+  assert.equal(r.transcript[0].redraft_guard, 'conversation_repetition');
+  assert.equal(r.transcript[0].attempts.length, 2);
+  assert.match(formatTranscript(r), /redraft=conversation_repetition \(\d+(?:\.\d)?s \+ \d+(?:\.\d)?s\)/);
   const last = seen[seen.length - 1].opts.simulatedContext.conversation_recent;
   assert.deepEqual(last.map(m => m.direction), ['inbound', 'outbound', 'inbound'], 'the bot\'s own reply is in the next turn\'s thread');
   assert.ok(r.transcript[1].would_do.some(w => w.reason === 'two_nos'));

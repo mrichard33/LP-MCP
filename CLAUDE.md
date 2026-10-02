@@ -243,7 +243,10 @@ strips money/financing figures (the customer's own estimate excepted), fake urge
 re-asks for a name/phone/email/zip we have, and extra questions. `NEPQ_BACKBONE_MODE` off|shadow|live
 (default off; shadow records `nepq_plan` / `would_send` only). Live chat books a picked slot through an
 awaited `book_appointment` row and says "You're set" only on `appointment_booked`; a blocked booking is
-handed to a person.
+handed to a person. The simulator run (2026-10-02) added: `src/agentic/booking-claim.js` rewrites any
+"you're all set / booked / on the schedule" a model reply makes without a booking (live chat always; SMS
+when NEPQ is live), `restoreQuestionMark` puts back a "?" the model wrote as "." (every one-question check
+counts "?"), and a day + time the lead types with no offer on the table gets two real times near it.
 
 **A live-chat turn answers exactly once (2026-10-02, vnazu).** `raceWithBudget` abandons work, it does not
 stop it: the reply and the holding line share one `newTurnClaim()`, a second draft starts only when

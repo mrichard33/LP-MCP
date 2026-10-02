@@ -49,7 +49,8 @@ import {
   findRepeatedQuestions,
 } from '../response-generator.js';
 import { buildEstablishedFacts } from '../agentic/established-facts.js';
-import { humanizeReply } from '../agentic/human-voice.js';
+import { humanizeReply, restoreQuestionMark } from '../agentic/human-voice.js';
+import { rewriteBookingClaims } from '../agentic/booking-claim.js';
 import { planNepqTurn, enforceNepqPlan, nepqBackboneMode, LINES as NEPQ_LINES } from '../agentic/nepq-planner.js';
 import {
   loopBreakState,
@@ -235,6 +236,7 @@ You are answering in the website chat, live, with the visitor watching the scree
 - Everything else in this prompt still binds: the discovery discipline, the decision-maker rules, no insurance predictions, no exclamation marks.
 - A SERVICE AREA instruction in this prompt outranks the collection order above for this reply: when it says ask only for the zip, or stop, do exactly that.
 - You CANNOT see the calendar in this chat. Never name a day or a time for a visit or a call. When they want a visit or a quote, say a team member will call to set a time that works, and ask for the best phone number if we do not have one.
+- You cannot book from here. Never say a visit is set, booked, confirmed or on the schedule (no "You're all set").
 - Answer the question they asked, in their words. Do not repeat an answer you already gave in this conversation, and do not ask a question they already answered above.
 - Before you say a team member will call, you must have their first name AND phone number. Ask for whichever is missing in that same reply. "Guest Visitor" is not a name.
 - When they ask for a price or a quote, do not keep asking discovery questions. Say exact pricing comes from the free in-home measurement and move to setting it up.
@@ -342,7 +344,9 @@ export function newTurnClaim() {
  * Real times for a NEPQ move (Calendar Commitment), under their own cap so a
  * slow calendar read can never take the reply past the deadline.
  */
-export const NEPQ_SLOT_LOOKUP_MS = 1200;
+// 2026-10-02 simulation: 1.2s was too tight for the zone lookup plus the GHL
+// free-slots read, so "let me think about it" fell back to a day question.
+export const NEPQ_SLOT_LOOKUP_MS = 2500;
 
 /** The pre-deadline contact read's cap, and the supersede map's size before a prune. */
 export const CONTACT_FETCH_CAP_MS = 4000;
@@ -799,8 +803,9 @@ export function createLiveChatFastLane(deps) {
       nepqPlan = planNepqTurn(planInput);
       if (wantsSlots(nepqPlan)) {
         // Real times only when the move can use them, under their own cap.
-        const got = await raceWithBudget(Promise.resolve().then(() => d.offerBookingSlots({ contact })), NEPQ_SLOT_LOOKUP_MS);
+        const got = await raceWithBudget(Promise.resolve().then(() => d.offerBookingSlots({ contact, preferredText: nepqPlan.time_request || null })), NEPQ_SLOT_LOOKUP_MS);
         nepqSlots = (!got.timedOut && !got.error && got.value?.slots?.length >= 2) ? got.value : null;
+        if (!nepqSlots) d.log(`[NEPQ] live chat ${contactId} no slots for ${nepqPlan.required_move}: ${got.timedOut ? 'timed out' : got.error ? got.error.message : `${got.value?.slots?.length || 0} slot(s)`}`);
         if (nepqSlots) nepqPlan = planNepqTurn({ ...planInput, slots: nepqSlots.slots, tzLabel: nepqSlots.tzLabel });
       }
       if (nepqMode === 'live') {
@@ -907,7 +912,10 @@ export function createLiveChatFastLane(deps) {
       const hasPhone = hasPhoneOnRecord || !!live?.contact_capture?.phone;
       // Human voice first (2026-10-02): the guards below append only clean
       // fixed lines, and dedupeSentences at the end sees the cleaned text.
-      const voice = humanizeReply(message, { keepText: userPrompt });
+      // A question written with a period hides from every check that counts
+      // "?" (2026-10-02 simulation), so the mark goes back first.
+      const marked = restoreQuestionMark(message);
+      const voice = humanizeReply(marked.text, { keepText: userPrompt });
       if (voice.changes.length) console.log(`[HumanVoice] live chat ${contactId} ${voice.changes.join(',')}`);
       const base = guardDraft(voice.text, { discipline, established, loopBreak, spouseAdvocacy, leadFirstName });
       // No calendar in this lane: any named day/time is invented (2026-10-01).
@@ -930,7 +938,13 @@ export function createLiveChatFastLane(deps) {
       };
       const nepqFix = (nepqLive && !saPlan.active) ? enforceNepqPlan(flow.fixed, nepqPlan, { known }) : { text: flow.fixed, changes: [] };
       if (nepqFix.changes.length) d.log(`[NEPQ] live chat ${contactId} ${nepqPlan.required_move}: ${nepqFix.changes.join(',')}`);
-      return { ...base, notes: [...base.notes, ...times.notes, ...cov.notes, ...flow.notes], fixed: nepqFix.text, coverage_notes: cov.notes.length, time_offers_removed: times.notes.length > 0, flow_notes: flow.notes.length, nepq_changes: nepqFix.changes };
+      // Never "you're all set" from a model reply: this lane books only through
+      // a picked offered time (runNepqFixedMove), never here (2026-10-02, Mark
+      // Test). A claim naming the appointment already on file stands.
+      const hasAppt = context.lp?.appointment_set === true && context.lp?.appointment_is_past !== true;
+      const claim = rewriteBookingClaims(nepqFix.text, { booked: false, hasAppointment: hasAppt });
+      if (claim.changed) d.log(`[LiveChat] ${contactId} unbacked booking claim rewritten`);
+      return { ...base, notes: [...base.notes, ...times.notes, ...cov.notes, ...flow.notes], fixed: claim.text, booking_claim_rewritten: claim.changed, coverage_notes: cov.notes.length, time_offers_removed: times.notes.length > 0, flow_notes: flow.notes.length, nepq_changes: nepqFix.changes };
     };
     const tGen = d.now();
     // A stronger model, side by side, never sent (Mark, 2026-10-02: test it

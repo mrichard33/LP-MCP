@@ -194,3 +194,16 @@ test('no walk-back when the accepted time is still available', () => {
 test('null preferred yields a null prompt block', () => {
   assert.equal(formatPreferredTimeForPrompt(null, null), null);
 });
+
+// 2026-10-02 simulation: "tomorrow evening 6 pm" parsed with no date.
+test('relative days: tomorrow / tonight resolve in the zone; a negated day is not a preference', async () => {
+  const { extractPreferredTime } = await import('../src/services/preferred-time.js');
+  const now = new Date('2026-10-02T02:30:00Z'); // Thu Oct 1, 10:30 PM ET
+  const tz = { now, timeZone: 'America/New_York' };
+  const t = extractPreferredTime([{ direction: 'inbound', text: 'tomorrow evening 6 pm' }], tz);
+  assert.equal(t.date_iso, '2026-10-02');
+  assert.equal(t.time_24h, '18:00');
+  assert.equal(t.specificity, 'day_and_time');
+  assert.equal(extractPreferredTime([{ direction: 'inbound', text: 'tonight' }], tz).date_iso, '2026-10-01');
+  assert.equal(extractPreferredTime([{ direction: 'inbound', text: 'busy tomorrow' }], tz), null);
+});

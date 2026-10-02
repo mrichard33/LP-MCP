@@ -21,10 +21,16 @@ export const NEPQ_ALWAYS = [
 
 const MOVE_TEXT = {
   probe: (p) => `This turn's move: ONE short question about what they just told you, in their own words${p.echo?.word ? ` (an echo like "${cap(p.echo.word)}?" is fine)` : ''}. No booking ask, no pitch, no "why now" question if one was already asked.`,
-  consequence: (p) => `This turn's move: ONE gentle "what happens if you wait?" question about the ${p.echo?.word || 'problem'} they mentioned (hurricane season makes it natural). No deadlines, no danger talk, no pressure.`,
-  bridge: (p) => `This turn's move: the bridge, in their words: "Based on what you told me, this could work for you, since you mentioned ${p.echo?.word || '[their problem]'}. The next step would be ${p.next_step_label}. Would that help?" Nothing else.`,
-  answer: (p) => `This turn's move: answer their question plainly in your first sentence. Then at most ONE question about what they told you.${p.booking?.allowed ? '' : ' No booking ask this turn.'}`,
-  offer_slots: () => 'This turn\'s move: offer exactly two real times from CALENDAR AVAILABILITY and ask which works better. Never invent a time.',
+  // 2026-10-02 simulation: "(hurricane season makes it natural)" produced "with
+  // us at the peak of hurricane season", pressure Mark ruled out.
+  consequence: (p) => `This turn's move: ONE gentle "what happens if you wait?" question about ${p.echo?.phrase || 'the problem they mentioned'}. No deadlines, no season or storm talk, no danger talk, no pressure.`,
+  bridge: (p) => `This turn's move: the bridge, in their words: "Based on what you told me, this could work for you${p.echo?.phrase ? `, since you mentioned ${p.echo.phrase}` : ''}. The next step would be ${p.next_step_label}. Would that help?" Nothing else.`,
+  answer: (p) => (p.criteria_reply
+    ? `This turn's move: they told you what they will decide on. Speak to what they named in one or two sentences, using only the KB PACK (for price: exact pricing comes from the visit; never a number). Then: "The next step would be ${p.next_step_label}. Would that help?"`
+    : `This turn's move: answer their question plainly in your first sentence. Then at most ONE question about what they told you.${p.booking?.allowed ? '' : ' No booking ask this turn.'}`),
+  offer_slots: (p) => (p.offer_line
+    ? `This turn's move: answer their question in ONE sentence, then send exactly: "${p.offer_line}" Nothing after it.`
+    : 'This turn\'s move: offer exactly two real times from CALENDAR AVAILABILITY and ask which works better. Never invent a time.'),
   confirm: () => 'This turn\'s move: they picked a time. If you book it, confirm it as: "You\'re set for [day] at [time], [first name]. Our team will call to go over the details." Never name a rep. Never say "see you then".',
 };
 

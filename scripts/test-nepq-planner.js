@@ -132,7 +132,7 @@ test('guard: one question, no unallowed booking ask, no "see you then", no fake 
 test('guard: a skipped bridge is written in their words', () => {
   const thread = T(['inbound', 'they are drafty'], ['outbound', 'Drafty? Which rooms?'], ['inbound', 'kitchen'], ['outbound', 'How long has that been going on?']);
   const p = planNepqTurn({ channel: 'livechat', trigger: 'about 10 years', conversation: thread });
-  assert.match(enforceNepqPlan('Ten years is a long time. What made you start looking now?', p).text, /^Based on what you told me, this could work for you, since you mentioned drafty\. The next step would be a visit at your home\. Would that help\?$/);
+  assert.match(enforceNepqPlan('Ten years is a long time. What made you start looking now?', p).text, /^Based on what you told me, this could work for you, since you mentioned the drafts\. The next step would be a visit at your home\. Would that help\?$/);
 });
 
 // ── hand-off side effects and the prompt block ──
@@ -180,4 +180,65 @@ test('guard: never asks for a name, phone, email or zip we already have', () => 
   assert.equal(r.text, 'Drafts are no fun.');
   assert.ok(r.changes.includes('reask_known'));
   assert.equal(enforceNepqPlan("What's your zip code?", p, { known: { name: true } }).text, "What's your zip code?", 'an unknown zip may still be asked');
+});
+
+// ── 2026-10-02 simulation regressions ──
+
+test('echo: the most specific problem wins and the bridge names it as a phrase', () => {
+  const thread = T(['inbound', 'My windows are old and drafty'], ['outbound', 'How long has that been going on?'], ['inbound', 'Mostly the kitchen'], ['outbound', 'What happens if you wait on it?']);
+  const p = planNepqTurn({ channel: 'livechat', trigger: 'About 10 years', conversation: thread });
+  assert.equal(p.echo.word, 'drafty');
+  assert.equal(p.echo.phrase, 'the drafts');
+  assert.match(enforceNepqPlan('Ten years is a while.', p).text, /since you mentioned the drafts\./);
+  assert.ok(!/mentioned old/.test(renderPlanBlock(p).join('\n')));
+});
+
+test('consequence: the model\'s own paraphrase counts, and a second one is stripped', () => {
+  const thread = T(['inbound', 'my windows are drafty'], ['outbound', "Drafty is no fun. How's that been sitting with you?"]);
+  const p = plan({ trigger: 'Mostly the kitchen and living room', conversation: thread });
+  assert.equal(p.counters.consequence_used, true);
+  assert.notEqual(p.required_move, 'consequence');
+  const r = enforceNepqPlan('Kitchen and living room get the sun. If those stay as is through this season, what does that look like for you?', p);
+  assert.ok(r.changes.includes('consequence_repeat'), r.changes.join(','));
+  assert.ok(!/stay as is/.test(r.text), r.text);
+});
+
+test('shopping follow-up: "price and the warranty" is what they decide on, not a price ask', () => {
+  const thread = T(['inbound', "We're getting 3 quotes"], ['outbound', LINES.shopping]);
+  const p = plan({ trigger: 'Probably price and the warranty', conversation: thread });
+  assert.equal(p.objection, null);
+  assert.equal(p.required_move, 'answer');
+  assert.equal(p.criteria_reply, true);
+  assert.match(renderPlanBlock(p).join('\n'), /told you what they will decide on/);
+  // A later real price ask is the FIRST price ask, so it gets the play, not a hand-off.
+  const later = plan({ trigger: 'how much would it be?', conversation: [...thread, ...T(['inbound', 'Probably price and the warranty'], ['outbound', 'Our warranty is in writing. Would that help?'])] });
+  assert.equal(later.fixed_line, LINES.price_play);
+  assert.equal(objectionType('price and warranty matter most'), null);
+  assert.equal(objectionType('how much is it'), 'price');
+});
+
+test('financing: the yes survives the figure strip', () => {
+  const p = plan({ trigger: 'Do you offer financing?' });
+  assert.equal(p.financing_ask, true);
+  const r = enforceNepqPlan("Yes, we offer 0% APR financing, so you can spread the cost out. What's got you looking into windows now?", p);
+  assert.equal(r.text, `${LINES.financing_yes} What's got you looking into windows now?`);
+  assert.ok(r.changes.includes('financing_yes'));
+});
+
+test('a typed day and time with no offer → two real times; with a question, the answer first', () => {
+  const p = planNepqTurn({ channel: 'livechat', trigger: 'tomorrow evening 6 pm', conversation: [], slots: SLOTS, tzLabel: 'ET' });
+  assert.equal(p.fixed_line, LINES.offer_slots(p.slots_to_offer));
+  const q = planNepqTurn({ channel: 'livechat', trigger: "actually, what's the warranty?", conversation: T(['inbound', 'tomorrow evening 6 pm']), slots: SLOTS, tzLabel: 'ET' });
+  assert.equal(q.required_move, 'offer_slots');
+  assert.equal(q.fixed_line, null);
+  assert.equal(enforceNepqPlan('It covers parts and labor for life. What got you looking?', q).text, `It covers parts and labor for life. ${q.offer_line}`);
+  assert.equal(planNepqTurn({ channel: 'livechat', trigger: 'how about saturday morning', conversation: [] }).booking.allowed, true);
+});
+
+test('claims nobody approved are stripped', () => {
+  const p = plan({ trigger: 'they are drafty' });
+  const r = enforceNepqPlan("In storm season, that's right at the edge of when Florida code tightened up. How long has it been drafty?", p);
+  assert.equal(r.text, 'How long has it been drafty?');
+  assert.ok(r.changes.includes('unapproved_claim'));
+  assert.ok(enforceNepqPlan('With us at the peak of hurricane season, how is that sitting with you?', p).changes.includes('unapproved_claim'));
 });

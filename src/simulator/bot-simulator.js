@@ -20,8 +20,9 @@
  * move (and, with NEPQ off, what it would have sent), and every side effect
  * the bot WOULD have taken.
  *
- * It costs real model calls: one per live-chat turn (two on a redraft), two to
- * four per SMS turn.
+ * It costs real model calls: one per live-chat turn (two on a redraft). An SMS
+ * turn is up to three per attempt (classifier, identity pass, reply writer)
+ * and a guard redraft is a second attempt, so up to six.
  */
 
 import { createLiveChatFastLane, minimalContext } from '../live-chat/fast-lane.js';
@@ -186,11 +187,17 @@ export async function simulateSms(plan, { nepqMode = 'live', generate, buildReal
     let generated = null;
     let error = null;
     let note = null;
+    // Per attempt: how long it took and which guard asked for the redraft
+    // (2026-10-02: a 107s turn could not be explained from the transcript).
+    const attempts = [];
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const ta = Date.now();
       try {
         generated = await generate(contactId, 'sms', text, { dryRun: true, simulatedContext: context, nepqModeOverride: nepqMode, ...(note ? { regenerationNote: note } : {}) });
+        attempts.push({ seconds: Math.round((Date.now() - ta) / 100) / 10, guard: null });
         break;
       } catch (err) {
+        attempts.push({ seconds: Math.round((Date.now() - ta) / 100) / 10, guard: String(err?.message || err).split(':')[0].slice(0, 60) });
         if (err?.regenerationNote && attempt < maxAttempts) { note = err.regenerationNote; continue; }
         error = String(err?.message || err).slice(0, 300);
       }
@@ -203,7 +210,7 @@ export async function simulateSms(plan, { nepqMode = 'live', generate, buildReal
     if (generated?.companion_action) wouldDo.push({ kind: `would_${generated.companion_action.action_type}`, payload: generated.companion_action.action_payload || null });
     transcript.push({
       turn: i + 1, customer: text, bot: reply ? [reply] : null, error,
-      redrafted: !!note, intent: generated?.intent_class || null, nepq: generated?.nepq_plan || null,
+      redrafted: !!note, redraft_guard: attempts.find(a => a.guard)?.guard || null, attempts, intent: generated?.intent_class || null, nepq: generated?.nepq_plan || null,
       would_do: wouldDo, seconds: Math.round((Date.now() - t0) / 100) / 10,
     });
   }
@@ -241,6 +248,7 @@ export function formatTranscript(result) {
     if (t.nepq?.objection) notes.push(`objection=${t.nepq.objection}`);
     if (t.nepq?.handoff) notes.push(`handoff=${t.nepq.handoff}`);
     if (t.nepq?.changes?.length || t.nepq?.would_change?.length) notes.push(`guard=${(t.nepq.changes || t.nepq.would_change).join(',')}`);
+    if (t.redraft_guard) notes.push(`redraft=${t.redraft_guard} (${(t.attempts || []).map(a => `${a.seconds}s`).join(' + ')})`);
     if (t.flow) notes.push(`flow=${t.flow}`);
     for (const w of t.would_do || []) notes.push(`${w.kind}${w.reason ? `:${w.reason}` : ''}`);
     notes.push(`${t.seconds}s`);

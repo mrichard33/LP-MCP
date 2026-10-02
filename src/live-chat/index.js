@@ -39,6 +39,7 @@ import { fetchRecentAndUpcomingAppointments } from '../knowledge/contact-appoint
 import { resolveMarket } from '../actions/enrichment.js';
 import { postToSlack } from '../slack.js';
 import { fetchFreeSlots, selectOfferableSlots } from '../knowledge/calendar-availability.js';
+import { extractPreferredTime } from '../services/preferred-time.js';
 import { BOOKING_CALENDARS } from '../knowledge/booking-calendar-router.js';
 import { routeNepqHandoff } from '../agentic/nepq-handoff.js';
 import { addGHLNote } from '../ghl.js';
@@ -221,7 +222,7 @@ async function postCancelCard({ text, contactId, kind }) {
  * visitor's zone (Houston reads Central). selectOfferableSlots applies the
  * same notice floor and 48h-first offer window the SMS bot uses.
  */
-async function offerSlots({ calendarId, contact }) {
+async function offerSlots({ calendarId, contact, preferredText = null }) {
   if (!calendarId) return { slots: [], tzLabel: 'ET' };
   let zone = { timezone: 'America/New_York', label: 'ET' };
   const zip = contact?.postalCode || contact?.postal_code || null;
@@ -229,8 +230,32 @@ async function offerSlots({ calendarId, contact }) {
     try { zone = { ...zone, ...(await timezoneForZip(zip)) }; } catch { /* Eastern */ }
   }
   const av = await fetchFreeSlots(calendarId, { timezone: zone.timezone });
-  const sel = selectOfferableSlots(av, null);
-  return { slots: (sel?.slots || []).slice(0, 2), tzLabel: zone.label || 'ET' };
+  // A day/time the visitor typed ("tomorrow evening 6 pm") picks the times
+  // nearest it (2026-10-02 simulation: it was ignored).
+  const preferred = preferredText ? extractPreferredTime([{ direction: 'inbound', text: preferredText }], { timeZone: zone.timezone }) : null;
+  // With a stated time, look at every opening that day, then keep the two nearest.
+  let sel = selectOfferableSlots(av, preferred, preferred?.time_24h ? { maxOffer: 50 } : {});
+  // Two real times, not one: with a single opening inside 48h, the next real
+  // opening within a week fills the pair (2026-10-02 simulation: "let me
+  // think about it" fell back to "what day works best?" for want of a second).
+  if ((sel?.slots || []).length < 2) {
+    const wider = selectOfferableSlots(av, null, { offerWindowHours: 168 });
+    if ((wider?.slots || []).length > (sel?.slots || []).length) sel = wider;
+  }
+  const slots = nearestFirst(sel?.slots || [], preferred);
+  return { slots: slots.slice(0, 2), tzLabel: zone.label || 'ET' };
+}
+
+/** Slots ordered by closeness to a parsed preferred day/time (kept in time order within the pair). Pure. */
+export function nearestFirst(slots, preferred) {
+  if (!preferred?.time_24h || slots.length <= 2) return slots;
+  const [h, m] = preferred.time_24h.split(':').map(Number);
+  const target = h * 60 + m;
+  const minutes = (s) => { const d = new Date(s.iso); return d.getUTCHours() * 60 + d.getUTCMinutes(); };
+  // Compare on wall-clock minutes in the slot's own offset (ISO strings carry it).
+  const wall = (s) => { const mm = String(s.iso).match(/T(\d{2}):(\d{2})/); return mm ? Number(mm[1]) * 60 + Number(mm[2]) : minutes(s); };
+  const picked = [...slots].sort((a, b) => Math.abs(wall(a) - target) - Math.abs(wall(b) - target)).slice(0, 2);
+  return picked.sort((a, b) => new Date(a.iso) - new Date(b.iso));
 }
 
 /**
@@ -265,9 +290,9 @@ async function rescheduleAppointment({ contactId, oldAppointmentId, calendarId, 
  * visitor's zone, for the Calendar Commitment. Same selection as the cancel
  * flow's offer (notice floor, 48h-first window).
  */
-async function offerBookingSlots({ contact }) {
+async function offerBookingSlots({ contact, preferredText = null }) {
   const calendarId = BOOKING_CALENDARS.WINDOW_ESTIMATE;
-  const res = await offerSlots({ calendarId, contact });
+  const res = await offerSlots({ calendarId, contact, preferredText });
   return { ...res, calendarId };
 }
 
