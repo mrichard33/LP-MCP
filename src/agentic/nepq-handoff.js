@@ -25,7 +25,7 @@ import { GHL_LOCATION_ID } from '../actions/constants.js';
 
 /** #dispatch's live channel; SLACK_CHANNEL_DISPATCH overrides (same default as the cancel cards). */
 export const DISPATCH_CHANNEL_DEFAULT = 'C0C19GRS8FJ';
-const DISPATCH_REASONS = new Set(['complaint', 'booking_request']);
+const DISPATCH_REASONS = new Set(['complaint', 'booking_request', 'emergency']);
 
 /** The Slack channels a hand-off card goes to. Pure. */
 export function handoffSlackChannels(reason, env = process.env) {
@@ -43,6 +43,9 @@ const WHY = {
   price_insist: 'The lead asked for a price again after the bot explained every home is different. Call to talk it through; exact pricing comes from the visit.',
   two_nos: 'The lead said no twice. Check in once, personally; do not push.',
   repeat_objection: 'The lead raised the same objection again. Call so they get a straight answer.',
+  emergency: 'URGENT: damage happening now (e.g. a broken window, water coming in). Call them right away.',
+  service: 'An existing customer has a problem with an install (a leak, a stuck or broken unit). Service should call and set up a repair visit.',
+  callback_request: 'The lead asked for a phone call at a specific time. Call them then.',
   booking_request: 'The lead picked a time in the website chat, but the bot could not book it (usually a missing address). Call to confirm the details and book that time.',
 };
 

@@ -51,6 +51,7 @@ import {
 import { buildEstablishedFacts } from '../agentic/established-facts.js';
 import { humanizeReply, restoreQuestionMark } from '../agentic/human-voice.js';
 import { rewriteBookingClaims } from '../agentic/booking-claim.js';
+import { looksLikeShortPhone } from '../agentic/contact-typos.js';
 import { planNepqTurn, enforceNepqPlan, nepqBackboneMode, LINES as NEPQ_LINES } from '../agentic/nepq-planner.js';
 import {
   loopBreakState,
@@ -817,14 +818,14 @@ export function createLiveChatFastLane(deps) {
       nepqPlan = planNepqTurn(planInput);
       if (wantsSlots(nepqPlan)) {
         // Real times only when the move can use them, under their own cap.
-        const got = await raceWithBudget(Promise.resolve().then(() => d.offerBookingSlots({ contact, preferredText: nepqPlan.time_request || null })), NEPQ_SLOT_LOOKUP_MS);
+        const got = await raceWithBudget(Promise.resolve().then(() => d.offerBookingSlots({ contact, preferredText: nepqPlan.time_request || (nepqPlan.step === 'confirm' ? body : null) })), NEPQ_SLOT_LOOKUP_MS);
         nepqSlots = (!got.timedOut && !got.error && got.value?.slots?.length >= 2) ? got.value : null;
         if (!nepqSlots) d.log(`[NEPQ] live chat ${contactId} no slots for ${nepqPlan.required_move}: ${got.timedOut ? 'timed out' : got.error ? got.error.message : `${got.value?.slots?.length || 0} slot(s)`}`);
         if (nepqSlots) nepqPlan = planNepqTurn({ ...planInput, slots: nepqSlots.slots, tzLabel: nepqSlots.tzLabel });
       }
       if (nepqMode === 'live') {
         const lastOutbound = [...context.conversation_recent].reverse().find(m => m.direction === 'outbound')?.text || '';
-        const nepqOut = await runNepqFixedMove({ plan: nepqPlan, slots: nepqSlots, contactId, body, hasName: hasNameOnRecord, hasPhone: hasPhoneOnRecord, firstName: realFirst, mode, lastOutbound });
+        const nepqOut = await runNepqFixedMove({ plan: nepqPlan, slots: nepqSlots, contactId, body, hasName: hasNameOnRecord, hasPhone: hasPhoneOnRecord, firstName: realFirst, mode, lastOutbound: nepqPlan.last_offer || lastOutbound });
         if (nepqOut) {
           timing.t4_analysis_done = new Date(d.now()).toISOString();
           timing.t5_generation_done = timing.t4_analysis_done;
@@ -889,6 +890,7 @@ export function createLiveChatFastLane(deps) {
     const largeJob = largeJobSignal(body);
     const promptHint = [
       malformed ? `EMAIL LOOKS MALFORMED: the visitor typed "${body.slice(0, 120)}", which is not a valid email address. Say so kindly and ask them to check it. Never say you lack information.` : null,
+      looksLikeShortPhone(body) ? 'PHONE LOOKS INCOMPLETE: the number they typed has fewer than 10 digits. Ask them, kindly, for the full number with area code. Never say you have it.' : null,
       largeJob ? `LARGE JOB SIGNAL: "${largeJob}". Answer, offer the next step, and say a person will follow up.` : null,
       pricePlan ? priceHint({ hasName: hasNameOnRecord, hasPhone: hasPhoneOnRecord }) : null,
       frustrated && !pricePlan ? frustrationHint({ hasName: hasNameOnRecord, hasPhone: hasPhoneOnRecord }) : null,

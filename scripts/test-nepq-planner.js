@@ -34,11 +34,12 @@ test('mode switch: off unless shadow or live', () => {
 test('price: two times first, again with the times, a person on the third ask', () => {
   const p1 = plan({ trigger: 'Hi, I would like to get a quote on 12 windows and 2 sliding glass doors.', slots: SLOTS, tzLabel: 'ET' });
   assert.equal(p1.required_move, 'objection_play');
-  assert.equal(p1.fixed_line, "Happy to get you a quote on the 12 windows and 2 sliding glass doors. Exact pricing comes from a quick visit to measure, and you keep the written quote. I have Tue, Oct 6 at 10:00 AM ET or Wed, Oct 7 at 2:00 PM ET. Which works better?");
+  assert.equal(p1.fixed_line, "Happy to help with the 12 windows and 2 sliding glass doors. We can't give a fair price on the spot because every opening gets measured and the glass and frames are matched to your home, so any number now would be a guess. What's got you looking into this now? If you'd like a quick visit to measure, I have Tue, Oct 6 at 10:00 AM ET or Wed, Oct 7 at 2:00 PM ET, and you keep the written quote.");
+  assert.equal((p1.fixed_line.match(/\?/g) || []).length, 1, 'one question: the times are an offer');
   assert.equal(p1.booking.allowed, true);
   const noSlots = plan({ trigger: 'How much for 12 windows?' });
   assert.equal(noSlots.fixed_line, LINES.quote_no_slots('12 windows'));
-  assert.equal(noSlots.ask_contact, true);
+  assert.equal(noSlots.ask_contact, false, 'the quote line ends on its own question');
   const t1 = T(['inbound', 'quote on 12 windows'], ['outbound', p1.fixed_line]);
   const p2 = plan({ trigger: 'I just want a good price.', conversation: t1, slots: SLOTS, tzLabel: 'ET' });
   assert.equal(p2.fixed_line, LINES.price_again_slots(p2.slots_to_offer));
@@ -222,7 +223,7 @@ test('shopping follow-up: "price and the warranty" is what they decide on, not a
   assert.match(renderPlanBlock(p).join('\n'), /told you what they will decide on/);
   // A later real price ask is the FIRST price ask, so it gets the play, not a hand-off.
   const later = plan({ trigger: 'how much would it be?', conversation: [...thread, ...T(['inbound', 'Probably price and the warranty'], ['outbound', 'Our warranty is in writing. Would that help?'])] });
-  assert.match(later.fixed_line, /^Happy to get you a quote/);
+  assert.match(later.fixed_line, /^Happy to help with that\. We can't give a fair price on the spot/);
   assert.equal(objectionType('price and warranty matter most'), null);
   assert.equal(objectionType('how much is it'), 'price');
 });
@@ -312,4 +313,72 @@ test('"you just said that" ends the questions: two times, or the team calls', ()
   const p = plan({ trigger: 'you just said that.', conversation: thread, slots: SLOTS, tzLabel: 'ET' });
   assert.equal(p.fixed_line, LINES.repeat_slots(p.slots_to_offer));
   assert.equal(plan({ trigger: 'I already told you', conversation: thread }).fixed_line, LINES.repeat_no_slots);
+});
+
+test('quote follow-up: they answer the question, the bot echoes them and offers the same times', () => {
+  const quote = plan({ trigger: 'Can I get a quote for my sliding door?', slots: SLOTS, tzLabel: 'ET' }).fixed_line;
+  const p = plan({ trigger: "It's old and hard to open", conversation: T(['inbound', 'Can I get a quote for my sliding door?'], ['outbound', quote]), slots: SLOTS, tzLabel: 'ET' });
+  assert.equal(p.required_move, 'offer_slots');
+  assert.equal(p.offer_line, LINES.offer_slots(p.slots_to_offer));
+  assert.equal(enforceNepqPlan("That sticking door gets old fast. What's the main issue?", p).text, `That sticking door gets old fast. ${p.offer_line}`);
+  // A pick goes to the booking flow, not the follow-up.
+  assert.equal(plan({ trigger: 'the first one', conversation: T(['outbound', quote]), slots: SLOTS }).required_move, 'confirm');
+});
+
+// ── 2026-10-02 break test (40 scenarios through both bots) ──
+
+test('break test: abuse closes, emergencies, service issues and call requests go to a person', () => {
+  assert.equal(plan({ trigger: 'f*** off', conversation: T(['outbound', 'I have Sat at 10 AM or 2 PM. Which works better?']) }).fixed_line, LINES.close);
+  assert.equal(plan({ trigger: 'A storm broke my window and water is coming in right now!' }).handoff?.reason, 'emergency');
+  assert.equal(plan({ trigger: 'You installed my windows last month and one is leaking' }).handoff?.reason, 'service');
+  const cb = plan({ trigger: 'Just call me at 5pm today, 813-555-0142', slots: SLOTS });
+  assert.equal(cb.handoff?.reason, 'callback_request');
+  assert.equal(cb.fixed_line, "Got it. I'll have someone from our team call you around 5pm today.");
+  assert.equal(plan({ trigger: 'please do not call me' }).handoff?.reason === 'callback_request', false);
+});
+
+test('break test: a price ask with other questions, or inside a long story, gets a real answer and then the times', () => {
+  const multi = plan({ trigger: 'How much is it, how long does install take, and do you do doors too?', slots: SLOTS, tzLabel: 'ET' });
+  assert.equal(multi.required_move, 'offer_slots');
+  assert.equal(multi.price_note, true);
+  assert.equal(multi.fixed_line, null);
+  assert.match(renderPlanBlock(multi).join('\n'), /can't give a fair price on the spot/);
+  assert.equal(plan({ trigger: 'Do you price match?' }).price_note, true);
+  const story = 'Hi so we bought this house in 2019 and the windows were already old then, and every summer the AC runs nonstop, plus during Ian we had to put up plywood, so we want impact windows but we are worried about cost because we just redid the roof. What do you think we should do?';
+  assert.equal(plan({ trigger: story }).price_note, true);
+  assert.notEqual(plan({ trigger: 'How much for 12 windows?' }).price_note, true, 'a plain price ask keeps the fixed line');
+});
+
+test('break test: invented urgency and competitor knocks are stripped', () => {
+  const p = plan({ trigger: 'they are drafty' });
+  assert.ok(enforceNepqPlan("I'm not a weather service, but we're in peak hurricane season right now. What got you looking?", p).changes.includes('unapproved_claim'));
+  assert.ok(enforceNepqPlan('Storm season has us slammed, so grab a time. What got you looking?', p).changes.includes('unapproved_claim'));
+  assert.ok(enforceNepqPlan('Renewal by Andersen uses standard low-E glass. What got you looking?', p).changes.includes('unapproved_claim'));
+});
+
+test('break test: a typo in an email or phone is flagged, not accepted', async () => {
+  const { contactTypoHint, looksLikeShortPhone, looksLikeMalformedEmail } = await import('../src/agentic/contact-typos.js');
+  assert.equal(looksLikeMalformedEmail('email is john@gmail'), true);
+  assert.equal(looksLikeMalformedEmail('john@gmail.com'), false);
+  assert.equal(looksLikeShortPhone('My name is John, my number is 123'), true);
+  assert.equal(looksLikeShortPhone('call me at 813-555-0142'), false);
+  assert.match(contactTypoHint('email is john@gmail'), /Never say you have it on file/);
+});
+
+test('funnel audit: "first", a pick after one more line, and "sure" to two times', () => {
+  const offer = LINES.offer_slots(SLOTS);
+  assert.equal(plan({ trigger: 'first', conversation: T(['outbound', offer]), slots: SLOTS }).required_move, 'confirm');
+  assert.equal(plan({ trigger: 'the 2nd one please', conversation: T(['outbound', offer]), slots: SLOTS }).required_move, 'confirm');
+  const p = plan({ trigger: 'tuesday works', conversation: T(['outbound', offer], ['inbound', 'is it free?'], ['outbound', 'Yes, the visit is free.']), slots: SLOTS });
+  assert.equal(p.required_move, 'confirm');
+  assert.equal(p.last_offer, offer);
+  assert.equal(plan({ trigger: 'Sure', conversation: T(['outbound', offer]), slots: SLOTS }).fixed_line, LINES.which(SLOTS));
+});
+
+test('funnel audit: invented scarcity and a re-worded consequence question are caught', () => {
+  const p = plan({ trigger: 'they are drafty' });
+  assert.ok(enforceNepqPlan("Our calendar's tight right now. What got you looking?", p).changes.includes('fake_urgency'));
+  assert.ok(enforceNepqPlan('Calls are booking up fast. What got you looking?', p).changes.includes('fake_urgency'));
+  const asked = T(['outbound', 'What happens if another storm hits before they are fixed?'], ['inbound', 'more leaks i guess'], ['outbound', "That's a lot. What's another year of that worth to you?"], ['inbound', 'not much']);
+  assert.notEqual(plan({ trigger: 'not much', conversation: asked }).required_move, 'consequence');
 });

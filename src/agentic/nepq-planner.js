@@ -44,11 +44,20 @@ const MONEY_FIGURE_ASK_RX = /\bhow\s+much\b[^?]{0,30}\b(?:a|per)\s+month\b|\bmon
 const FINANCING_ONLY_RX = /\b(?:financ\w*|payment\s+plans?)\b/i;
 
 export const DECLINE_RX = /\b(?:no\s+thanks?|no\s+thank\s+you|not\s+interested|leave\s+me\s+alone|good\s*bye|bye|never\s*mind|nevermind|(?:don'?t|do\s+not|dont)\s+(?:come|need|want|bother|call|text)|not\s+buying|waste\s+(?:your|my)\s+time|won'?t\s+be\s+allowed|stop\s+(?:texting|messaging|contacting)|not\s+for\s+me|no\s+time)\b/i;
-const CLOSE_RX = /\b(?:good\s*bye|bye|leave\s+me\s+alone|never\s*mind|nevermind)\b/i;
+// 2026-10-02 break test: "f*** off" got two appointment times. Abuse closes.
+const CLOSE_RX = /\b(?:good\s*bye|bye|leave\s+me\s+alone|never\s*mind|nevermind|go\s+away|get\s+lost|piss\s+off|shut\s+up)\b|\bf[\W_]*(?:u|\*)[\W_]*(?:c|\*)[\W_]*(?:k|\*)\w*\s+(?:off|you|u)\b|\bf\*+\s*(?:off|you)\b/i;
 const BARE_NO_RX = /^\s*(?:no|nope|nah|no\s+thanks?|not\s+really|not\s+now|no\s+sir|no\s+ma'?am|neither)\s*[.!]*\s*$/i;
 
 // 2026-10-02 (ymnwp): "someone was supposed to come to my house today" is a
 // missed visit and goes to a person; the bot pitched a measurement instead.
+// 2026-10-02 break test: "a storm broke my window and water is coming in"
+// got a probing question. Damage happening now goes straight to a person.
+const EMERGENCY_RX = /\bwater\s+(?:is\s+)?(?:coming|pouring|leaking|getting)\s+in\b|\b(?:broke|broken|shattered|smashed|cracked)\s+(?:my\s+|the\s+|a\s+)?(?:window|glass|door|slider)s?\b|\b(?:window|glass|door)\s+(?:is\s+|got\s+)?(?:broken|shattered|smashed)\b|\bemergency\b/i;
+// An existing customer's problem with OUR install is service, not a sale.
+const SERVICE_RX = /\b(?:you|you\s+guys|reece|your\s+(?:team|crew|company|installers?))\s+(?:installed|put\s+in|replaced|did)\b[^.?!]{0,80}\b(?:leak\w*|broken|crack\w*|won'?t|doesn'?t|not\s+(?:working|closing|opening|locking|sealing)|problem|issue|stuck|draft\w*|fogg\w*)\b|\bwarranty\s+(?:claim|issue|repair|work)\b|\b(?:needs?|need\s+a)\s+(?:a\s+)?(?:repair|service\s+call)\b/i;
+// "Just call me at 5pm" is a call request, not a visit (2026-10-02 break test:
+// it got two visit times on another day).
+const CALLBACK_RX = /\b(?:call|ring|phone)\s+(?:me|us)\b[^.?!]{0,30}\b(?:at|around|after|before|tomorrow|today|tonight|this\s+(?:morning|afternoon|evening)|in\s+the\s+(?:morning|afternoon|evening)|anytime|any\s+time)\b|\b(?:call\s+me\s+back|give\s+me\s+a\s+call|have\s+someone\s+call\s+me)\b/i;
 const COMPLAINT_RX = /\b(?:supposed\s+to\s+(?:come|show|be\s+(?:here|there)|call|arrive)|never\s+(?:came|showed(?:\s+up)?|arrived|called(?:\s+(?:me\s+)?back)?)|(?:didn'?t|did\s+not)\s+(?:come|show(?:\s+up)?|arrive|call(?:\s+(?:me\s+)?back)?)|stood\s+(?:me|us)\s+up|waited\s+all\s+(?:day|morning|afternoon)|(?:nobody|no\s+one|no-one)\s+(?:showed|came|called|answered)|complain\w*|ripped\s+off|rip[-\s]?off|scam\w*|refund|lawyer|attorney|sue\b|bbb|better\s+business|manager|supervisor|no[-\s]?show(?:ed)?|never\s+showed|(?:nobody|no\s+one)\s+(?:came|showed|called|answered)|unprofessional|rude|terrible\s+service|worst)\b/i;
 
 const SPOUSE_RX = /\b(?:wife|husband|spouse|partner|fianc[ée]e?)\b/i;
@@ -56,6 +65,8 @@ const SPOUSE_OBJECTION_RX = /\b(?:talk|check|ask|discuss|run\s+(?:it|this))\b[^.
 const SHOPPING_RX = /\b(?:(?:\d|two|three|four|few|couple(?:\s+of)?|multiple|other|more)\s+(?:quotes|estimates|bids|companies|contractors)|shopping\s+around|comparing|getting\s+(?:other\s+)?(?:quotes|estimates|bids))\b/i;
 const THINK_RX = /\b(?:think\s+(?:it\s+over|about\s+it|on\s+it)|sleep\s+on\s+it|get\s+back\s+to\s+you|let\s+me\s+(?:think|see|check)|maybe\s+later|not\s+(?:right\s+)?now|need\s+(?:some\s+)?time)\b/i;
 const YES_RX = /^\s*(?:y(?:es|eah|ep|up)|sure|ok(?:ay)?|sounds\s+good|that\s+works|please|absolutely|definitely|why\s+not|let'?s\s+do\s+it|i'?d\s+like\s+that)\b/i;
+// A bare pick: "first", "2nd", "the earlier one", "either".
+const BARE_PICK_RX = /^\s*(?:ok(?:ay)?,?\s+|yes,?\s+|sure,?\s+)?(?:the\s+)?(?:first|second|1st|2nd|earlier|later|either)(?:\s+one)?(?:\s+(?:works|please|is\s+good))?\s*[.!]*\s*$/i;
 const NEITHER_RX = /\b(?:neither|none\s+of\s+(?:those|them)|(?:those|that)\s+(?:times?\s+)?(?:don'?t|won'?t|doesn'?t)\s+work|can'?t\s+do\s+(?:either|those|that)|not\s+(?:those|that)\s+(?:days?|times?))\b/i;
 const DAY_OR_TIME_RX = /\b(?:mon|tues?|wed(?:nes)?|thurs?|fri|sat(?:ur)?|sun)(?:day)?\b|\btomorrow\b|\btoday\b|\b\d{1,2}(?::\d{2})?\s*(?:am|pm|a\.m\.|p\.m\.)\b|\b(?:morning|afternoon|evening)\b|\bthe\s+(?:first|second|earlier|later)\s+one\b|\beither\b/i;
 
@@ -86,7 +97,7 @@ export function problemPhrase(word) {
 // 2026-10-02 simulation: the model paraphrases the consequence question ("how's
 // that been sitting with you", "if those stay as is through this season"), and
 // the narrow pattern missed it, so it was asked twice. These count too.
-export const CONSEQUENCE_RX = /\bwhat\s+happens\s+if\b|\bif\s+you\s+(?:wait|hold\s+off|held\s+off|put\s+(?:it|this)\s+off)\b|\banother\s+(?:hurricane\s+)?season\b|\bpush\s+(?:it|this)\s+(?:off|down\s+the\s+road)\b|\bsitting\s+with\s+you\b|\bif\s+(?:those|they|it|that|this|nothing|things)\s+(?:stays?|changes?|keeps?|goes|go|gets?\s+worse)\b|\bthrough\s+(?:this|another|the)\s+(?:hurricane\s+|storm\s+)?season\b|\baffecting\s+you\b|\bwhat\s+would\s+(?:it|that)\s+mean\s+for\s+you\b/i;
+export const CONSEQUENCE_RX = /\bwhat\s+happens\s+if\b|\bif\s+you\s+(?:wait|hold\s+off|held\s+off|put\s+(?:it|this)\s+off)\b|\banother\s+(?:hurricane\s+)?season\b|\bpush\s+(?:it|this)\s+(?:off|down\s+the\s+road)\b|\bsitting\s+with\s+you\b|\bif\s+(?:those|they|it|that|this|nothing|things)\s+(?:stays?|changes?|keeps?|goes|go|gets?\s+worse)\b|\bthrough\s+(?:this|another|the)\s+(?:hurricane\s+|storm\s+)?season\b|\baffecting\s+you\b|\bwhat\s+would\s+(?:it|that)\s+mean\s+for\s+you\b|\bif\s+another\s+(?:one|storm|hurricane)\b|\banother\s+year\s+(?:with|of)\b|\bwhat'?s\s+another\s+year\b|\bwhat\s+does\s+that\s+(?:end\s+up\s+)?cost(?:ing)?\s+you\b|\bsit\s+as[- ]is\b/i;
 const BRIDGE_RX = /\bbased\s+on\s+what\s+you\s+(?:told|said|mentioned)\b|\bthis\s+could\s+work\s+for\s+you\b|\bthe\s+next\s+step\s+would\s+be\b/i;
 const STATUS_FRAME_RX = /\bpretty\s+simple\b|\bsee\s+what\s+you\s+have\s+now\b|\bif\s+it\s+might\s+be\s+a\s+fit\b/i;
 const REVEAL_RX = /\banything\s+you'?re\s+wondering\s+about\b|\bbefore\s+your\s+visit\b/i;
@@ -102,13 +113,17 @@ export const LINES = Object.freeze({
   // Mark, 2026-10-02 (5i59G): a quote or price request goes straight to booking.
   // The old price play asked "what are you hoping to see?" and, with the bot's
   // memory lost, repeated it three times without ever offering a visit.
-  quote_slots: (slots, what) => `Happy to get you a quote${what ? ` on the ${what}` : ''}. Exact pricing comes from a quick visit to measure, and you keep the written quote. I have ${slotPair(slots)}. Which works better?`,
-  quote_no_slots: (what) => `Happy to get you a quote${what ? ` on the ${what}` : ''}. Exact pricing comes from a quick visit to measure, and you keep the written quote. A team member will call to set a time.`,
+  // Mark, 2026-10-02 (second ruling): still engage. Say why there is no price
+  // on the spot, ask ONE question about them, and put the two real times
+  // beside it (no second question mark: the times are an offer, not a quiz).
+  quote_slots: (slots, what) => `Happy to help with ${what ? `the ${what}` : 'that'}. We can't give a fair price on the spot because every opening gets measured and the glass and frames are matched to your home, so any number now would be a guess. What's got you looking into this now? If you'd like a quick visit to measure, I have ${slotPair(slots)}, and you keep the written quote.`,
+  quote_no_slots: (what) => `Happy to help with ${what ? `the ${what}` : 'that'}. We can't give a fair price on the spot because every opening gets measured and the glass and frames are matched to your home, so any number now would be a guess. What's got you looking into this now?`,
   price_again_slots: (slots) => `Totally fair. Every home is different, so any number I gave you now would be a guess. The visit gets you the exact number in writing. I have ${slotPair(slots)}. Which works better?`,
   price_again_no_slots: 'Totally fair. Every home is different, so any number I gave you now would be a guess. The visit gets you the exact number in writing, and a team member will call to set a time.',
   // "You just said that": no more questions, the next step.
   repeat_slots: (slots) => `You're right, sorry about that. Let's get you a time instead. I have ${slotPair(slots)}. Which works better?`,
   repeat_no_slots: "You're right, sorry about that. A team member will call to set a time for the visit.",
+  callback: (when) => `Got it. I'll have someone from our team call you${when ? ` ${when}` : ''}.`,
   spouse_1: 'Makes sense. How does your spouse feel about getting this done?',
   spouse_2_slots: (slots) => `Would it be easier to pick a time when you're both home? I have ${slotPair(slots)}.`,
   spouse_2_no_slots: "Would it be easier to pick a time when you're both home? What day works best for you both?",
@@ -119,11 +134,14 @@ export const LINES = Object.freeze({
   ask_day: 'No problem. What day works best for you?',
   close: "Understood. Take care, and if anything changes, we're here.",
   offer_slots: (slots) => `I have ${slotPair(slots)}. Which works better?`,
+  which: (slots) => `Great. Which works better, ${slotPair(slots)}?`,
   financing_yes: 'Yes, we offer financing. The details depend on your home, and our team walks you through them.',
   reveal: "Before your visit, is there anything you're wondering about that I can pass along?",
   confirm: (slot, tz, name) => `You're set for ${slot.day} at ${slot.time}${tz ? ` ${tz}` : ''}${name ? `, ${name}` : ''}. Our team will call to go over the details.`,
   handoff: {
     complaint: "I'm sorry about that. I'm getting someone from our team on this now.",
+    emergency: "That's urgent. I'm getting someone from our team on this right now.",
+    service: "Sorry about that. I'm getting our service team on this now.",
     price_insist: "Understood. I'll have someone from our team call you to talk it through.",
     two_nos: "No problem, I'll stop here. Someone from our team will check in with you directly.",
     repeat_objection: "Understood. I'll have someone from our team call you so you get a straight answer.",
@@ -190,9 +208,25 @@ export function isNo(text, lastOutbound = '') {
 // (2026-10-02 simulation: it fired the price play, and the next "price"
 // would have handed the lead to a person).
 // The bot's own quote line (see LINES.quote_*).
-const QUOTE_LINE_RX = /\bhappy\s+to\s+get\s+you\s+a\s+quote\b|\bexact\s+pricing\s+comes\s+from\s+a\s+quick\s+visit\b/i;
+const QUOTE_LINE_RX = /\bhappy\s+to\s+get\s+you\s+a\s+quote\b|\bexact\s+pricing\s+comes\s+from\s+a\s+quick\s+visit\b|\bcan'?t\s+give\s+a\s+fair\s+price\s+on\s+the\s+spot\b/i;
 // The visitor says the bot is repeating itself (2026-10-02, 5i59G).
 export const REPEAT_COMPLAINT_RX = /\byou\s+(?:just|already)\s+(?:said|asked)(?:\s+(?:that|this))?\b|\bi\s+(?:just|already)\s+(?:said|told\s+you|answered)\b|\bstop\s+asking\b|\byou(?:'re|\s+are)\s+repeating\b|\bsame\s+(?:thing|question)\s+again\b/i;
+
+/** A price ask that also asks other things, or sits inside a long message. Pure. */
+export function isComplexPriceAsk(text) {
+  const t = String(text || '');
+  if (t.length > 220) return true;
+  if ((t.match(/\?/g) || []).length >= 2) return true;
+  return /\b(?:how\s+long|price\s*match|match\s+(?:a|their|the)\s+(?:price|quote)|beat\s+(?:that|their|it)|discounts?|deals?|warranty|financ\w*|do\s+you\s+(?:do|offer|have|sell|install|work))\b/i.test(t);
+}
+
+/** "at 5pm today" from a call request, for the confirm line. Pure. */
+export function callbackWhen(text) {
+  const m = String(text || '').match(/\b(?:at|around)\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm|a\.m\.|p\.m\.)?)(?:\s+(today|tomorrow|tonight))?/i);
+  if (m) return `around ${m[1].replace(/\s+/g, ' ').trim()}${m[2] ? ` ${m[2].toLowerCase()}` : ''}`;
+  const d = String(text || '').match(/\b(tomorrow|today|tonight)(?:\s+(morning|afternoon|evening))?\b/i);
+  return d ? `${d[1].toLowerCase()}${d[2] ? ` ${d[2].toLowerCase()}` : ''}` : null;
+}
 
 /** What they want quoted, from their own words ("12 windows and 2 sliding glass doors"), or null. Pure. */
 export function quoteItems(text) {
@@ -277,6 +311,9 @@ export function planNepqTurn({
   const inbound = turns.filter(t => t.direction === 'inbound');
   const outbound = turns.filter(t => t.direction === 'outbound');
   const lastOut = outbound[outbound.length - 1]?.text || '';
+  // The times we offered most recently (this turn or the one before): "the
+  // first one" often comes after one more line from us (2026-10-02 audit).
+  const lastOfferOut = outbound.slice(-2).reverse().find(m => SLOT_OFFER_RX.test(m.text))?.text || '';
   const now = String(trigger || inbound[inbound.length - 1]?.text || '');
   const offerSlots = (Array.isArray(slots) ? slots : []).slice(0, 2).map(s => ({ ...s, tz: s.tz || tzLabel || '' }));
 
@@ -342,7 +379,13 @@ export function planNepqTurn({
   const withSlots = (line) => { plan.slots_to_offer = offerSlots; plan.allowed.slot_offer = true; plan.booking = { allowed: true, reason: 'nepq:slot_offer' }; return line; };
 
   // 1. A person takes over: complaint, price insisted after the play, two no's.
+  if (EMERGENCY_RX.test(now)) return handoff('emergency');
+  if (SERVICE_RX.test(now)) return handoff('service');
   if (COMPLAINT_RX.test(now)) return handoff('complaint');
+  if (CALLBACK_RX.test(now) && !isNotInterested(now)) {
+    const line = LINES.callback(callbackWhen(now));
+    return fixed('handoff', line, { step: 'handoff', handoff: { reason: 'callback_request', line }, booking: { allowed: false, reason: 'nepq:callback_request' } });
+  }
   if (objType === 'price' && priceLines >= 2) return handoff('price_insist');
   if (nos >= 2) return handoff('two_nos');
   if ((objType === 'shopping') && attempt >= 2) return handoff('repeat_objection');
@@ -365,6 +408,20 @@ export function planNepqTurn({
     return Object.assign(plan, { step: 'booked', required_move: 'answer', booking: { allowed: false, reason: 'nepq:booked' } });
   }
 
+  // 3a. A price ask wrapped in a story or with other questions ("how much,
+  // how long does install take, and do you do doors?"; a 600-character
+  // message about cost worries): the canned line would ignore them. They get
+  // a real answer that says why there is no price on the spot, then the times.
+  if (objType === 'price' && priceLines === 0 && isComplexPriceAsk(now)) {
+    plan.price_note = true;
+    plan.objection = { type: 'price', attempt, line: null };
+    if (offerSlots.length === 2) {
+      withSlots(null);
+      return Object.assign(plan, { step: 'offer_slots', required_move: 'offer_slots', answer_first: true, offer_line: LINES.offer_slots(offerSlots) });
+    }
+    return Object.assign(plan, { step: 'offer_slots', required_move: 'answer', booking: { allowed: true, reason: 'nepq:price_complex' } });
+  }
+
   // 3b. "You just said that": stop asking, offer the next step.
   if (REPEAT_COMPLAINT_RX.test(now) && !hasAppointment) {
     const line = offerSlots.length === 2 ? withSlots(LINES.repeat_slots(offerSlots)) : LINES.repeat_no_slots;
@@ -380,7 +437,8 @@ export function planNepqTurn({
       : (first ? LINES.quote_no_slots(what) : LINES.price_again_no_slots);
     return fixed('objection_play', line, {
       step: 'offer_slots', objection: { type: 'price', attempt, line },
-      ask_contact: offerSlots.length !== 2,
+      // The first quote line ends on its own question; contact details wait a turn.
+      ask_contact: offerSlots.length !== 2 && !first,
       booking: { allowed: true, reason: first ? 'nepq:quote_to_visit' : 'nepq:price_again' },
     });
   }
@@ -416,9 +474,21 @@ export function planNepqTurn({
   }
 
   // 5. Answering our slot offer.
-  if (SLOT_OFFER_RX.test(lastOut)) {
+  if (lastOfferOut) {
     if (NEITHER_RX.test(now)) return fixed('ask_day', LINES.ask_day, { step: 'ask_day', booking: { allowed: true, reason: 'nepq:ask_day' } });
-    if (DAY_OR_TIME_RX.test(now) || YES_RX.test(now)) return Object.assign(plan, { step: 'confirm', required_move: 'confirm', booking: { allowed: true, reason: 'nepq:confirm' } });
+    const picked = DAY_OR_TIME_RX.test(now) || BARE_PICK_RX.test(now);
+    // "Sure" / "yes" to two times picks neither: ask which, with the times.
+    if (!picked && YES_RX.test(now) && offerSlots.length === 2) return fixed('offer_slots', withSlots(LINES.which(offerSlots)), { step: 'offer_slots' });
+    if (picked || YES_RX.test(now)) return Object.assign(plan, { step: 'confirm', required_move: 'confirm', last_offer: lastOfferOut, booking: { allowed: true, reason: 'nepq:confirm' } });
+  }
+  // They answered the quote line's question instead of picking a time: echo
+  // them in one sentence, then the two times as the only question.
+  if (QUOTE_LINE_RX.test(lastOut) && !objType) {
+    if (offerSlots.length === 2) {
+      withSlots(null);
+      return Object.assign(plan, { step: 'offer_slots', required_move: 'offer_slots', answer_first: true, offer_line: LINES.offer_slots(offerSlots), quote_followup: true });
+    }
+    return Object.assign(plan, { step: 'offer_slots', required_move: 'answer', quote_followup: true, booking: { allowed: true, reason: 'nepq:quote_followup' } });
   }
   // They named a day after "what day works best?": offer two times that day.
   if (/\bwhat\s+day\s+works\s+best\b/i.test(lastOut) && DAY_OR_TIME_RX.test(now)) {
@@ -470,11 +540,13 @@ export function planNepqTurn({
 // figures). The live chat sent "$89–$149 per month, no money down" — that
 // sentence goes, whatever its source.
 const MONEY_RX = /\$\s?\d|\b\d[\d,]*\s*(?:dollars|bucks)\b|\b(?:per|a)\s+month\b|\/\s?mo\b|\bmonthly\s+payments?\b|\bno\s+money\s+down\b|\b0\s?%|\bapr\b|\b\d+\s?%\s+off\b|\bsave\s+(?:up\s+to\s+)?\d/i;
-const URGENCY_RX = /\bonly\s+\d+\s+(?:spots?|slots?|openings?)\s+left\b|\bspots?\s+(?:are\s+)?filling\b|\bprices?\s+(?:are\s+)?going\s+up\b|\bact\s+(?:now|fast)\b|\blimited\s+time\b|\bbefore\s+(?:it'?s|its)\s+too\s+late\b|\bdon'?t\s+miss\b/i;
+const URGENCY_RX = /\bonly\s+\d+\s+(?:spots?|slots?|openings?)\s+left\b|\bspots?\s+(?:are\s+)?filling\b|\bprices?\s+(?:are\s+)?going\s+up\b|\bact\s+(?:now|fast)\b|\blimited\s+time\b|\bbefore\s+(?:it'?s|its)\s+too\s+late\b|\bdon'?t\s+miss\b|\b(?:calendar|schedule|calls?)(?:'s|\s+is|\s+are)?\s+(?:tight|packed|full|filling(?:\s+up)?|booking\s+up(?:\s+fast)?|moving\s+fast)\b|\bpeak\s+season\b|\bspeeding\s+up\s+these\s+decisions\b/i;
+// 2026-10-02 funnel audit: the SMS bot leaned on "our calendar's tight right
+// now" / "calls are booking up fast" in most booking turns. Invented scarcity.
 // Claims nobody approved (2026-10-02 simulation: "that's right at the edge of
 // when Florida code tightened up", "with us at the peak of hurricane season").
 // Code history and season-peak talk are pressure dressed as fact.
-const CLAIMS_RX = /\bcode\s+(?:changed|tightened|got\s+(?:stricter|tighter)|was\s+(?:updated|changed))\b|\b(?:after|since|before)\s+(?:the\s+)?(?:19|20)\d\d\b[^.?!]{0,40}\bcode\b|\bcode\b[^.?!]{0,40}\b(?:after|since|before)\s+(?:19|20)\d\d\b|\bpeak\s+of\s+(?:the\s+)?(?:hurricane|storm)\s+season\b|\bmost\s+active\s+(?:stretch|part|time)\b/i;
+const CLAIMS_RX = /\bcode\s+(?:changed|tightened|got\s+(?:stricter|tighter)|was\s+(?:updated|changed))\b|\b(?:after|since|before)\s+(?:the\s+)?(?:19|20)\d\d\b[^.?!]{0,40}\bcode\b|\bcode\b[^.?!]{0,40}\b(?:after|since|before)\s+(?:19|20)\d\d\b|\bpeak\s+(?:of\s+)?(?:the\s+)?(?:hurricane|storm)\s+season\b|\bmost\s+active\s+(?:stretch|part|time)\b|\b(?:storm\s+season|we)\s+(?:has|have)\s+(?:us\s+)?(?:slammed|swamped)\b|\bcalendar\s+(?:is\s+)?(?:tight|filling|full)\b|\b(?:andersen|renewal|pgt|pella|lowe'?s|home\s+depot|es\s+windows|cgi)\b[^.?!]{0,60}\b(?:uses?|only|standard|cheap\w*|worse|inferior|lower|basic)\b/i;
 const SEE_YOU_RX = /\bsee\s+you\s+(?:then|soon|there)\b/i;
 const SIGNOFF_RX = /(?:^|\s)([—–-]\s*[A-Z][A-Za-z.'’ ]{0,40})\s*$/;
 const FIXED_MOVES = new Set(['handoff', 'objection_play', 'ask_day', 'close', 'reveal', 'offer_slots']);
