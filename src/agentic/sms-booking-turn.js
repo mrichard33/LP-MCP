@@ -22,7 +22,7 @@
  * writes the turn as before).
  */
 
-import { offeredSlots, pickSlot } from '../live-chat/cancel-flow.js';
+import { offeredSlots, pickSlot, slotMentionIndex } from '../live-chat/cancel-flow.js';
 import {
   COLLECT_ASK, COLLECT_ASK_AGAIN, holdLine, dmAsk, parseDecisionMakers, mentionedPartner,
   addressConfirmAsk, addressConfirmState, dmAnswerFromThread, slotLabel,
@@ -172,7 +172,7 @@ export function enforceBookingFacts(draft, facts, { companion = null } = {}) {
     if (facts.kind === 'hold') {
       // The hold sentence names the slot exactly as offered, or heldSlot
       // cannot find it next turn: the model's when it does, else ours.
-      const own = body.find(p => /\bI'?m\s+holding\b/i.test(p) && exact && p.includes(exact));
+      const own = body.find(p => /\bI'?m\s+holding\b/i.test(p) && exact && slotMentionIndex(p, slot) >= 0);
       body = body.filter(p => p === own || (!/\bI'?m\s+holding\b/i.test(p) && !clockTimes(p).length));
       // Their acknowledgement first, then the hold ("Sure. I'm holding … for you.").
       if (!own) { body = body.length ? [...body, `I'm holding ${slotLabel(slot, slot.tz || '')} for you.`] : [holdLine(slot, slot.tz || '', '').trim()]; notes.push('hold_sentence_fixed'); }

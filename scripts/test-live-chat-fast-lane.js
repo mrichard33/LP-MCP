@@ -1194,3 +1194,18 @@ test('cancel flow: the model words the identity ask, and the next turn still fin
   const next = planCancelTurn({ body: 'Rick Fox 352-555-0188', thread: [t('inbound', 'please cancel my appointment'), t('outbound', draft), t('inbound', 'Rick Fox 352-555-0188')] });
   assert.equal(next.step, 'lookup');
 });
+
+// Part 7 replay: an offer of Wednesday times (not the next two openings) is
+// still found when they pick one, so the time is held, not lost.
+test('NEPQ live: a pick from a day-preference offer (Wednesday) is held', async () => {
+  const wed = [{ iso: '2026-10-07T14:00:00Z', day: 'Wed, Oct 7', time: '10:00 AM', dayOfWeek: 'Wednesday' }, { iso: '2026-10-07T23:00:00Z', day: 'Wed, Oct 7', time: '7:00 PM', dayOfWeek: 'Wednesday' }];
+  const offer = 'Wednesdays work great. I have Wed, Oct 7 at 10:00 AM ET or Wed, Oct 7 at 7:00 PM ET. Which one fits better?';
+  const made = makeLane({ messages: [M('inbound', 'Usually on Wednesdays', 2), M('outbound', offer, 1)], extra: {
+    nepqMode: () => 'live',
+    offerBookingSlots: async () => ({ slots: NEPQ_SLOTS, all: [...NEPQ_SLOTS, ...wed], tzLabel: 'ET', calendarId: 'CALWE' }),
+    bookSlot: async () => ({ ok: true, action_id: 1 }),
+    nepqHandoff: async () => {},
+  } });
+  await made.lane.processInbound(INBOUND('The first one'));
+  assert.match(made.state.sends[0].message, /I'm holding Wed, Oct 7 at 10:00 AM ET for you/);
+});

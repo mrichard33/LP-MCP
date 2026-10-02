@@ -203,6 +203,43 @@ export function doneLine(apptHuman) {
 }
 const slotText = (s) => `${s.day} at ${s.time}`;
 
+const MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
+const esc = (x) => String(x).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/**
+ * Where a real opening is named in a text, or -1. The exact label first
+ * ("Sun, Oct 4 at 10:00 AM", "tomorrow at 10:00 AM"), then the way people and
+ * the model write it: the weekday, "tomorrow"/"today" or "Oct 4" within a few
+ * words before the clock time ("Sunday at 10 AM", "Sun the 4th, 10am"). Part 7
+ * (2026-10-02 replay): the model's own wording of real times failed the exact
+ * check and cost a 15-35s re-write per text. Pure.
+ */
+export function slotMentionIndex(text, s) {
+  const t = String(text || '');
+  const exact = [slotText(s), s?.rel ? `${s.rel} at ${s.time}` : null].filter(Boolean)
+    .map((form) => t.indexOf(form)).filter((i) => i >= 0);
+  if (exact.length) return Math.min(...exact);
+  const hm = String(s?.time || '').match(/^(\d{1,2})(?::(\d{2}))?\s*([AP])M/i);
+  if (!hm) return -1;
+  const mins = hm[2] && hm[2] !== '00' ? `:${hm[2]}` : '(?::00)?';
+  const clock = `\\b${hm[1]}${mins}\\s*${hm[3]}\\.?\\s?m\\.?(?![a-z])`;
+  const dow = String(s?.dayOfWeek || '').toLowerCase();
+  const [, mon, dd] = String(s?.day || '').toLowerCase().match(/(\w{3})\s+(\d{1,2})$/) || [];
+  const dayWords = [
+    dow ? `${esc(dow)}|${esc(dow.slice(0, 3))}` : null,
+    s?.rel ? esc(String(s.rel).toLowerCase()) : null,
+    mon && dd && MONTHS.includes(mon) ? `${mon}[a-z]*\\.?\\s+${dd}(?:st|nd|rd|th)?` : null,
+  ].filter(Boolean).join('|');
+  if (!dayWords) return -1;
+  // The day word must be the nearest one before THIS time: no other clock
+  // time in between ("Sunday at 10 AM or tomorrow at 2 PM" is not Sunday 2 PM).
+  const gap = '(?:(?!\\d{1,2}(?::\\d{2})?\\s*[ap]\\.?\\s?m)[^.?!]){0,30}?';
+  const rx = new RegExp(`\\b(?:${dayWords})\\b${gap}(${clock})`, 'i');
+  const m = t.match(rx);
+  // Ordered by where the time itself sits, so "the first one" is the first time named.
+  return m ? m.index + m[0].length - m[1].length : -1;
+}
+
 /** Two (or one) real open times, one question. Pure. */
 export function slotsOfferLine(slots, tzLabelText = 'ET') {
   const [a, b] = slots;
@@ -216,11 +253,8 @@ export function offeredSlots(offerText, freeSlots) {
   // 2026-10-02: the NEPQ offer reads "tomorrow at 10:00 AM" (slot.rel), not
   // "Sat, Oct 3 at 10:00 AM". Matching only the date form found one of the two
   // times, and "the first one" booked the SECOND (simulator, never live).
-  const at = (s) => {
-    const hits = [slotText(s), s.rel ? `${s.rel} at ${s.time}` : null]
-      .filter(Boolean).map((form) => text.indexOf(form)).filter((i) => i >= 0);
-    return hits.length ? Math.min(...hits) : -1;
-  };
+  // Part 7 replay: the model writes "Sunday at 10 AM", so a mention counts too.
+  const at = (s) => slotMentionIndex(text, s);
   return (Array.isArray(freeSlots) ? freeSlots : [])
     .filter((s) => at(s) >= 0)
     .sort((x, y) => at(x) - at(y));

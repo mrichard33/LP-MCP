@@ -29,6 +29,7 @@ import { isLeadQuestion, findBookingAsks } from './discovery-discipline.js';
 import { isTeamOpen, nextTeamOpenLabel, requestedCallTime } from './team-hours.js';
 import { heldSlot, COLLECT_ASK } from './booking-collect.js';
 import { RECHECK_RX } from './contact-check.js';
+import { slotMentionIndex } from '../live-chat/cancel-flow.js';
 import { parseDayPreference, slotsForPreference, slotMatches, preferenceOfferLine } from './day-preference.js';
 import { enforceOneAsk } from './one-ask.js';
 
@@ -569,6 +570,18 @@ export function planNepqTurn({
     return fixed('objection_play', line, { objection: { type: 'think', attempt, line } });
   }
 
+  // 4a0. A clock time that names exactly one of our real openings is the
+  // pick, whatever we asked last (Part 7 SMS replay: "Fine lets book for
+  // 2 PM" after "what day works best for you both?" got two times back).
+  // "after 2", "before noon" and "around 2" are preferences, not picks.
+  if (offerSlots.length && !isLeadQuestion(now) && !/\b(?:after|before|until|around|by|usually|earliest|latest)\b/i.test(now) && !SLOT_OFFER_RX.test(lastOut)) {
+    const exactPick = exactSlotFor(now, offerSlots);
+    if (exactPick) {
+      plan.slots_to_offer = offerSlots;
+      return Object.assign(plan, { step: 'confirm', required_move: 'confirm', last_offer: LINES.offer_slots(offerSlots), booking: { allowed: true, reason: 'nepq:typed_time' } });
+    }
+  }
+
   // 4a. A day or part of the day is a filter, not a pick (Mark, Oct 2 6:12 PM
   // chat: "Usually on Wednesdays" got "We have Wednesdays blocked for you").
   // Two real openings that match, the next matching day first; none in two
@@ -702,15 +715,16 @@ export function planNepqTurn({
   if (!counters.bridge_used && counters.discovery_questions_asked >= 1 && vagueRun(inbound) >= 2) {
     Object.assign(plan, { step: 'bridge', required_move: 'bridge', vague_lead: true, booking: { allowed: false, reason: 'nepq:bridge_vague' } }); plan.bridge_line = bridgeLine(plan); return plan;
   }
-  if (counters.discovery_questions_asked >= cap && !counters.bridge_used) {
-    Object.assign(plan, { step: 'bridge', required_move: 'bridge', booking: { allowed: false, reason: 'nepq:bridge_first' } }); plan.bridge_line = bridgeLine(plan); return plan;
-  }
   // Times are already on the table (an objection play offered them): never
   // back to the bridge; ask which, or for a day (2026-10-02 SMS replay: the
-  // bot re-asked "Would that help?" after offering two times).
+  // bot re-asked "Would that help?" after offering two times). Checked before
+  // the discovery cap: the Part 7 replay bridged again after times were offered.
   if (!counters.bridge_used && counters.slot_offers > 0) {
     if (offerSlots.length === 2) return fixed('offer_slots', withSlots(vary(LINES.which(offerSlots), ALT_LINES.which(offerSlots))), { step: 'offer_slots' });
     return fixed('ask_day', vary(LINES.ask_day, ALT_LINES.ask_day), { step: 'ask_day', booking: { allowed: true, reason: 'nepq:ask_day' } });
+  }
+  if (counters.discovery_questions_asked >= cap && !counters.bridge_used) {
+    Object.assign(plan, { step: 'bridge', required_move: 'bridge', booking: { allowed: false, reason: 'nepq:bridge_first' } }); plan.bridge_line = bridgeLine(plan); return plan;
   }
   if (counters.bridge_used) {
     // Bridged already and they did not say yes: answer and keep it soft.
@@ -822,7 +836,10 @@ export function checkAgainstReference(draft, line, slots = [], plan = null) {
   const r = referenceRules(line, slots, plan);
   const problems = [];
   for (const m of r.markers) if (!m.rx.test(text)) problems.push(`missing:${m.say}`);
-  for (const label of r.slots) if (!text.includes(label)) problems.push(`missing_time:${label}`);
+  // A real time counts however it is written ("Sun, Oct 4 at 10:00 AM" or
+  // "Sunday at 10 AM"): offeredSlots reads both back (Part 7 replay).
+  const refSlots = (Array.isArray(slots) ? slots : []).filter(s => r.slots.some(l => l === `${s.day} at ${s.time}` || (s.rel && l === `${s.rel} at ${s.time}`)));
+  for (const s of refSlots) if (slotMentionIndex(text, s) < 0) problems.push(`missing_time:${s.day} at ${s.time}`);
   const allowed = new Set([...r.times, ...clockMinutes(r.slots.join(' '))]);
   if (clockMinutes(text).some(t => !allowed.has(t))) problems.push('other_time');
   if (r.endsWithQuestion && !/\?\s*$/.test(text)) problems.push('no_question');

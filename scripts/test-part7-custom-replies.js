@@ -77,3 +77,41 @@ test('a re-check the model words itself still counts as asked (ask once only)', 
   assert.equal(alreadyRechecked(['What day works best for you?']), false);
   assert.match(recheckHint({ kind: 'email', line: "That email doesn't look quite right. Could you double-check it for me?" }), /CONTACT RE-CHECK/);
 });
+
+// ── 2026-10-02 replay fixes (Part 7 live) ───────────────────────────────
+
+test('a real time written the human way still counts ("Sunday at 10 AM"), and never the wrong one', async () => {
+  const { slotMentionIndex, offeredSlots } = await import('../src/live-chat/cancel-flow.js');
+  const sun10 = { iso: 'a', day: 'Sun, Oct 4', time: '10:00 AM', dayOfWeek: 'Sunday' };
+  const sat2 = { iso: 'b', day: 'Sat, Oct 3', time: '2:00 PM', dayOfWeek: 'Saturday', rel: 'tomorrow' };
+  const sun2 = { iso: 'c', day: 'Sun, Oct 4', time: '2:00 PM', dayOfWeek: 'Sunday' };
+  assert.deepEqual(offeredSlots('How about Sunday at 10 AM or tomorrow at 2pm?', [sun10, sat2, sun2]).map(s => s.iso), ['a', 'b']);
+  assert.equal(slotMentionIndex('Sunday at 10:30 AM', sun10), -1, 'a different time is not this slot');
+  const offer = LINES.offer_slots([{ ...sun10, tz: 'ET' }, { ...sat2, tz: 'ET' }], 0);
+  assert.deepEqual(checkAgainstReference('Since weekends are easier, how about Sunday at 10 AM or tomorrow at 2 PM?', offer, [sun10, sat2]), []);
+});
+
+test('a typed time that is one of our real openings is the pick, even after a day question', async () => {
+  const { planNepqTurn } = await import('../src/agentic/nepq-planner.js');
+  const two = [{ iso: '2026-10-03T14:00:00-04:00', day: 'Sat, Oct 3', time: '2:00 PM', dayOfWeek: 'Saturday' }, { iso: '2026-10-04T10:00:00-04:00', day: 'Sun, Oct 4', time: '10:00 AM', dayOfWeek: 'Sunday' }];
+  const conv = [{ direction: 'inbound', text: 'I need to check with my wife' }, { direction: 'outbound', text: "Would it be easier to pick a time when you're both home? What day works best for you both?" }, { direction: 'inbound', text: 'Fine lets book for 2 PM.' }];
+  const plan = planNepqTurn({ channel: 'sms', trigger: 'Fine lets book for 2 PM.', conversation: conv, slots: two, tzLabel: 'ET' });
+  assert.equal(plan.required_move, 'confirm');
+  const after = planNepqTurn({ channel: 'sms', trigger: 'We are usually home after 2 PM', conversation: [...conv.slice(0, 2), { direction: 'inbound', text: 'We are usually home after 2 PM' }], slots: two, tzLabel: 'ET' });
+  assert.notEqual(after.required_move, 'confirm', '"after 2 PM" is a preference, not a pick');
+});
+
+test('once times were offered the bot never goes back to the visit pitch, even past the discovery cap', async () => {
+  const { planNepqTurn } = await import('../src/agentic/nepq-planner.js');
+  const two = [{ iso: 'x', day: 'Sat, Oct 3', time: '2:00 PM', dayOfWeek: 'Saturday' }, { iso: 'y', day: 'Sun, Oct 4', time: '10:00 AM', dayOfWeek: 'Sunday' }];
+  const conv = [
+    { direction: 'inbound', text: 'I need new windows' }, { direction: 'outbound', text: "What's going on with them?" },
+    { direction: 'inbound', text: 'old' }, { direction: 'outbound', text: 'How long has that been going on?' },
+    { direction: 'inbound', text: 'years' }, { direction: 'outbound', text: 'What made you start looking now?' },
+    { direction: 'inbound', text: 'moving' }, { direction: 'outbound', text: 'I have Sat, Oct 3 at 2:00 PM ET or Sun, Oct 4 at 10:00 AM ET. Which works better?' },
+    { direction: 'inbound', text: 'hmm' }, { direction: 'outbound', text: 'No rush at all.' },
+    { direction: 'inbound', text: 'Mark' },
+  ];
+  const plan = planNepqTurn({ channel: 'sms', trigger: 'Mark', conversation: conv, slots: two, tzLabel: 'ET' });
+  assert.notEqual(plan.required_move, 'bridge');
+});

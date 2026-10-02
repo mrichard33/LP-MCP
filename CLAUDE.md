@@ -354,6 +354,12 @@ Mark: "I don't think we need any static messages sent by the bot. Each message s
 - **A live chat that times out sends the move's backup line, not the holding line** (`fallback({ backupReply })`).
 - **Wording:** Mark's wordings keep their MEANING, not their exact words.
 - **Still fixed, as backups only:** the generation-failure fallback (`buildAiFallback`, `LIVE_CHAT_FALLBACK_MESSAGE` when nothing was decided), the booking hold/prerequisite lines after a failed inline booking, the slot-taken line and the out-of-area exit. Part 8 made the cancel flow and the Spanish hand-off model-written too: the Spanish reply must be Spanish and say our team will reach out (`SPANISH_REPLY_MARKER`), and "after our hand-off" is read by `SPANISH_TEAM_RX`. A plan may carry its own read-back phrases (`reference_markers`) and allow one two-item ask (`allow_multi_ask`, the cancel identity ask only).
+- **Replay fixes (2026-10-02, after #1139 went live):**
+  - A real time counts however it is written: "Sun, Oct 4 at 10:00 AM" or "Sunday at 10 AM" (`slotMentionIndex` in `cancel-flow.js`, used by `offeredSlots` and the reference check). Before this, an exact-label check failed the model's natural wording and cost a 15–35s SMS re-write.
+  - A typed time that is one of our two real openings is the pick, whatever we asked last ("Fine lets book for 2 PM"). "After 2" or "around 2" is a preference, not a pick.
+  - Once times are offered, the bot never returns to the bridge, even past the discovery cap.
+  - With NEPQ live, the SMS calendar is read every turn. The prompt shows the times only when the plan allows a booking ask (`slotsForPlannerOnly`).
+  - The live chat resolves a pick against every opening (`slots.all`), not just the next two.
 - **Lead knowledge:**
   - The SMS context reads 30 messages across every channel (was 10) and shows 30 turns.
   - `HISTORY WITH REECE` (`lpRelationship`) says when the lead is a past or returning customer.

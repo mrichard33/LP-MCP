@@ -1375,15 +1375,19 @@ export function createLiveChatFastLane(deps) {
     const isCollect = plan.required_move === 'collect';
     if (isConfirm || isCollect) {
       const tz = slots?.tzLabel || '';
+      // Every real opening, not just the two nearest: an offer can name any of
+      // them (Part 7 replay: "usually Wednesdays" offered Wed, Oct 7, and "the
+      // first one" was lost because only the next two openings were searched).
+      const pool = [...(slots?.slots || []), ...((slots?.all || []).filter(a => !(slots?.slots || []).some(x => x.iso === a.iso)))];
       let chosen = null;
       if (isConfirm) {
-        const offered = offeredSlots(lastOutbound || '', slots.slots);
+        const offered = offeredSlots(lastOutbound || '', pool);
         chosen = pickSlot(body, offered.length ? offered : []);
         if (!chosen) return null;
       } else {
-        // The held time has to be found among today's real openings.
-        if (!slots?.slots?.length) return null;
-        chosen = offeredSlots(plan.held_slot?.text || '', slots.slots)[0] || null;
+        // The held time has to be found among the real openings.
+        if (!pool.length) return null;
+        chosen = offeredSlots(plan.held_slot?.text || '', pool)[0] || null;
         if (!chosen) {
           const two = slots.slots.slice(0, 2);
           return { reply: `That time just filled up. ${NEPQ_LINES.offer_slots(two, plan.counters?.slot_offers || 0)}`, slots: two, record: { collect: 'held_slot_gone' } };
