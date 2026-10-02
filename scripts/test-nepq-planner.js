@@ -478,3 +478,10 @@ test('the bridge after the opener never asks "Would that help?" a second time, a
   assert.match(line, /a free visit at your home/);
   assert.doesNotMatch(line, /Would that help\?$/);
 });
+
+test('guard: a repeated question that is the only question stays (no reply of just "Got it.")', () => {
+  const p = planNepqTurn({ nowMs: OPEN_MS, channel: 'livechat', trigger: 'I need new windows.', conversation: T(['inbound', 'do you sell aluminum?'], ['outbound', 'We sell vinyl impact windows. What got you looking at windows right now?']) });
+  const out = enforceNepqPlan('Got it. What got you looking at windows right now?', p);
+  assert.match(out.text, /\?$/);
+  assert.ok(!out.changes.includes('repeat_sentence'));
+});

@@ -816,7 +816,10 @@ export function enforceNepqPlan(draft, plan, { allowFigures = false, known = {} 
   const sentBefore = new Set((plan.recent_outbound || []).flatMap(t => splitSentences(t)).map(norm).filter(x => x.split(' ').length >= 4));
   if (sentBefore.size && sentences.length > 1) {
     const kept = sentences.filter(s => !sentBefore.has(norm(s)));
-    if (kept.length && kept.length !== sentences.length) { sentences = kept; changes.push('repeat_sentence'); }
+    // Never strip a reply down to an acknowledgement: when the repeat was the
+    // only question, it stays (2026-10-02 replay: "Got it." was all that went).
+    const lostQuestion = sentences.some(s => s.includes('?')) && !kept.some(s => s.includes('?'));
+    if (kept.length && kept.length !== sentences.length && !lostQuestion) { sentences = kept; changes.push('repeat_sentence'); }
   }
   // 5. One question: keep the last one.
   const questions = sentences.filter(s => s.includes('?'));
