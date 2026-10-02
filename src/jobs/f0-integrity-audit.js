@@ -215,13 +215,13 @@ export function formatF0AuditReport({ total, flagged, missing = [], s52 = null, 
 }
 
 async function defaultDeps() {
-  const [{ default: supabase }, { hlRunSQL }, { sendAlertMessage }, { checkS52Entry }] = await Promise.all([
+  const [{ default: supabase }, { hlRunSQL }, { sendAlertMessage }, { checkS52Entry, loadS52GateInputs }] = await Promise.all([
     import('../supabase.js'),
     import('../admin/hl-client.js'),
     import('../alert-state.js'),
     import('../s52-entry-gate.js'),
   ]);
-  return { supabase, hlRunSQL, sendAlertMessage, checkS52Entry };
+  return { supabase, hlRunSQL, sendAlertMessage, checkS52Entry, loadS52GateInputs };
 }
 
 async function loadActiveF0Contacts(deps) {
@@ -402,6 +402,31 @@ async function recordPosted(deps, items, nowMs) {
   await recordPostedItems({ audit: AUDIT_KEY, items: items.map((i) => ({ ...i, key: i.contact_id })), nowMs, deps });
 }
 
+// 2026-10-02: lp_leads is a copy and some rows stop updating. After the
+// cleanup, four contacts the live check had just kept in F.0 were flagged
+// here as Issue / Cnf: their lp_leads rows were last synced in June-July,
+// while LP live said OPPFDN with a demo (David Banks, lead 561330). So a
+// cache flag is re-read from LP live (the S5.2 gate's loader) before it is
+// listed, exactly as the S5.2 section already does. Live says it belongs →
+// dropped. A live read that fails keeps the cache flag, marked unconfirmed.
+async function confirmF0Flags(deps, cacheFlags) {
+  const out = [];
+  let liveChecks = 0;
+  for (const { id, flag } of cacheFlags) {
+    if (liveChecks < LIVE_CONFIRM_CAP && deps.loadS52GateInputs) {
+      liveChecks++;
+      const live = await deps.loadS52GateInputs(id);
+      if (!live?.error) {
+        const liveFlag = flagF0Contact(live.leads);
+        if (liveFlag) out.push({ contact_id: id, ...liveFlag, confirmed: true });
+        continue;
+      }
+    }
+    out.push({ contact_id: id, ...flag, confirmed: false });
+  }
+  return out;
+}
+
 /**
  * Run the audit. `post: true` sends a card of NEW problems to #ops-alerts
  * (Slack only, via sendAlertMessage — CLAUDE.md: operational alarms never go
@@ -418,11 +443,7 @@ export async function runF0IntegrityAudit({ post = true, deps: depsArg } = {}) {
   try {
     const ids = await loadActiveF0Contacts(deps);
     const leads = await loadLeads(deps, ids);
-    const flagged = [];
-    for (const id of ids.sort()) {
-      const flag = flagF0Contact(leads.get(id));
-      if (flag) flagged.push({ contact_id: id, ...flag });
-    }
+    const flagged = await confirmF0Flags(deps, ids.sort().map((id) => ({ id, flag: flagF0Contact(leads.get(id)) })).filter((x) => x.flag));
     if (flagged.length) await loadTags(deps, flagged.map((f) => f.contact_id), names);
     const candidates = await loadRecentOppfdnContacts(deps, nowMs);
     const [candLeads, candTags] = await Promise.all([loadLeads(deps, candidates), loadTags(deps, candidates, names)]);
