@@ -42,8 +42,10 @@
 import crypto from 'node:crypto';
 import supabase from '../supabase.js';
 import { ghlFetch } from '../actions/helpers.js';
-import { getConsent, detectCarrierStop, blockingTags, isMissingSchemaError } from './consent-store.js';
-import { normalizePhone10 } from '../lead-leak-classify.js';
+import { getConsent, detectCarrierStop, blockingTags, isMissingSchemaError, recordConsentChange } from './consent-store.js';
+import { normalizePhone10, contactRecordRows } from '../lead-leak-classify.js';
+import { FIVE9_DNC_DISPOSITIONS } from './dnc-reentry.js';
+import { lpLocalToUtcMs } from '../lead-speed.js';
 
 export const REVIEW_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 export const FIRST_PARTY_CONSENT_TAG = 'consent:new-submission';
@@ -57,6 +59,172 @@ export const SMS_CARRIER_STOP_WARNING =
 export function phoneLast4(phone) {
   const digits = String(phone || '').replace(/\D/g, '');
   return digits.length >= 4 ? digits.slice(-4) : null;
+}
+
+/** "(954) 379-2151", or null when the phone is not a valid US 10-digit. Pure. */
+export function formatPhoneFull(phone) {
+  const p = normalizePhone10(phone);
+  return p ? `(${p.slice(0, 3)}) ${p.slice(3, 6)}-${p.slice(6)}` : null;
+}
+
+// ─── Pre-consent block history (2026-10-02) ─────────────────────────────────
+// 30 of 32 review cards read "Recent consent history: none recorded yet". Every
+// one was blocked only on Five9's DNC list, set before the consent model existed
+// (2026-09-28), so consent_events has nothing to show. When it is empty the card
+// gets what we CAN see instead: the last Five9 DNC result for the number, the
+// last Five9 call, and LP's disposition. Each piece is best-effort — a lookup
+// that fails or is slow is null, never a missing card.
+
+export const LEGACY_BLOCK_NOTE = 'Blocked on Five9 DNC before the consent system (pre-2026-09-28)';
+export const FIVE9_LEGACY_SOURCE = 'five9_legacy';
+export const LP_PROSPECT_FIELD_ID = 'ZRQAVrzhtzApzLlHmT87';
+// Every lookup is capped so a slow read costs one line, not the card.
+export const LEGACY_LOOKUP_TIMEOUT_MS = 8000;
+
+/** LP's "Unset" until the clear works (see .env.example). Pure. */
+export function lpManualClearRequired(env = process.env) {
+  return String(env.LP_DNC_CLEAR_WORKING || '').trim().toLowerCase() !== 'true';
+}
+
+function readCustomField(contact, fieldId) {
+  const f = (contact?.customFields || []).find((x) => x && x.id === fieldId);
+  const v = f?.value;
+  return v === undefined || v === null || String(v).trim() === '' ? null : String(v).trim();
+}
+
+function five9Entry(row) {
+  if (!row) return null;
+  return {
+    name: row.disposition_name || null,
+    date: row.call_end_at || row.call_start_at || row.created_at || null,
+    agent: row.agent_name || null,
+    campaign: row.campaign || null,
+  };
+}
+
+/**
+ * Newest Five9 DNC result and newest call of any kind, from
+ * five9.disposition_set rows ordered newest first. Pure.
+ */
+export function pickFive9History(rows) {
+  const list = Array.isArray(rows) ? rows : [];
+  const dnc = new Set(FIVE9_DNC_DISPOSITIONS);
+  return {
+    five9_last_dnc_dispo: five9Entry(list.find((r) => dnc.has(String(r?.disposition_name || '').trim()))),
+    five9_last_call: five9Entry(list[0]),
+  };
+}
+
+/**
+ * The card's legacy_block. `five9` is pickFive9History's answer (null = the
+ * lookup failed); `contactRecord` is the Five9 contact-DB fallback used when
+ * ESS had no call; `lpLead` is the newest LP lead. Pure.
+ */
+export function buildLegacyBlock({ five9 = null, contactRecord = null, lpLead = null } = {}) {
+  let lastCall = five9?.five9_last_call || null;
+  if (!lastCall && contactRecord && (contactRecord.date || contactRecord.campaign)) {
+    lastCall = { name: null, date: contactRecord.date || null, agent: null, campaign: contactRecord.campaign || null };
+  }
+  return {
+    five9_last_dnc_dispo: five9?.five9_last_dnc_dispo || null,
+    five9_last_call: lastCall,
+    lp_disposition: lpLead?.label ? { label: lpLead.label, date: lpLead.date || null } : null,
+    note: LEGACY_BLOCK_NOTE,
+  };
+}
+
+/** Resolve to the promise's value, or null on a throw or after `ms`. Never rejects. */
+async function bestEffort(label, fn, ms) {
+  let timer;
+  try {
+    return await Promise.race([
+      Promise.resolve().then(fn),
+      new Promise((resolve) => { timer = setTimeout(() => { console.warn(`[DncLiftReview] ${label} timed out after ${ms}ms`); resolve(null); }, ms); }),
+    ]);
+  } catch (err) {
+    console.warn(`[DncLiftReview] ${label} failed: ${err.message}`);
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * five9.disposition_set rows for this person, newest first. Matched on the
+ * indexed ghl_contact_id / lp_lead_id columns (the event stamps both from its
+ * contact match), with the person's LP lead ids found by contact OR phone.
+ * Matching the phone inside the payload instead (dnis/ani) has no index: 47s
+ * for one number on 2026-10-02, so it would always hit the cap. The id route
+ * took milliseconds and found MORE rows for Mark Test (56 vs 52).
+ */
+async function defaultReadFive9History(contactId, phone10, db) {
+  const leads = await db.from('lp_leads').select('lp_lead_id')
+    .or(phone10 ? `ghl_contact_id.eq.${contactId},phone.eq.${phone10}` : `ghl_contact_id.eq.${contactId}`)
+    .limit(200);
+  if (leads.error) throw new Error(leads.error.message);
+  const ids = [...new Set((leads.data || []).map((r) => String(r.lp_lead_id || '')).filter((id) => /^\d+$/.test(id)))];
+  const { data, error } = await db.from('system_events')
+    .select('created_at, disposition_name:payload->>disposition_name, campaign:payload->>campaign, agent_name:payload->>agent_name, call_end_at:payload->>call_end_at, call_start_at:payload->>call_start_at')
+    .eq('event_type', 'five9.disposition_set')
+    .or(ids.length ? `ghl_contact_id.eq.${contactId},lp_lead_id.in.(${ids.join(',')})` : `ghl_contact_id.eq.${contactId}`)
+    .order('created_at', { ascending: false })
+    .limit(200);
+  if (error) throw new Error(error.message);
+  return data || [];
+}
+
+async function defaultReadContactRecord(phone10) {
+  const { getContactRecords } = await import('../five9-admin.js');
+  const rows = contactRecordRows(await getContactRecords({ criteria: [{ field: 'number1', value: phone10 }] }));
+  const withDate = rows
+    .map((r) => ({ date: String(r.f9_last_dispo_date_time || '').trim() || null, campaign: String(r.f9_last_campaign || '').trim() || null }))
+    .filter((r) => r.date || r.campaign)
+    .sort((a, b) => String(b.date || '').localeCompare(String(a.date || '')));
+  return withDate[0] || null;
+}
+
+async function defaultReadLpLead(contactId, phone10, db) {
+  // disposition_label is never filled (0 of 7,768 leads in 30 days, measured
+  // 2026-10-02); the LP disposition lives in disposition_code ('DNC', 'Set', …).
+  const pick = 'lp_prospect_id, disposition_code, disposition_label, created_at_lp';
+  let { data, error } = await db.from('lp_leads').select(pick)
+    .eq('ghl_contact_id', contactId).order('created_at_lp', { ascending: false, nullsFirst: false }).limit(20);
+  if (error) throw new Error(error.message);
+  if (!(data || []).length && phone10) {
+    ({ data, error } = await db.from('lp_leads').select(pick)
+      .eq('phone', phone10).order('created_at_lp', { ascending: false, nullsFirst: false }).limit(20));
+    if (error) throw new Error(error.message);
+  }
+  return pickLpLead(data || []);
+}
+
+/**
+ * LP prospect id (newest lead) and the disposition worth showing, from
+ * lp_leads rows newest first. Pure.
+ * The newest lead is usually the re-entry that triggered this card, still on
+ * LP's default 'Data' (all three live cards checked 2026-10-02). The block's
+ * story is on the newest lead LP actually dispositioned; 'Data' only when that
+ * is all there is.
+ */
+export function pickLpLead(rows) {
+  if (!Array.isArray(rows) || !rows.length) return null;
+  const dispo = (r) => String(r?.disposition_label || r?.disposition_code || '').trim();
+  const chosen = rows.find((r) => dispo(r) && dispo(r).toLowerCase() !== 'data') || rows.find((r) => dispo(r)) || null;
+  // created_at_lp holds Eastern wall-clock digits under a UTC label.
+  const ms = chosen ? lpLocalToUtcMs(chosen.created_at_lp) : null;
+  return {
+    prospect_id: rows[0].lp_prospect_id ? String(rows[0].lp_prospect_id) : null,
+    label: chosen ? dispo(chosen) : null,
+    date: Number.isFinite(ms) ? new Date(ms).toISOString() : null,
+  };
+}
+
+/** Has this contact already been seeded from its old Five9 block? */
+async function defaultHasLegacySeed(contactId, db) {
+  const { data, error } = await db.from('consent_events').select('id')
+    .eq('ghl_contact_id', contactId).eq('source', FIVE9_LEGACY_SOURCE).limit(1);
+  if (error) throw new Error(error.message);
+  return (data || []).length > 0;
 }
 
 /** First tag with the prefix, minus the prefix. Pure. */
@@ -97,7 +265,7 @@ export function consentBlocks(consentRead) {
  * The payload n8n turns into the Slack card. Pure — everything it needs is
  * passed in, so the card's content is unit-tested.
  */
-export function buildReviewPayload({ requestId, contactId, contact, context = {}, trigger, consentRead, carrier, reenteredAt, vendor = null, leadSource = null, blockedElsewhere = [] }) {
+export function buildReviewPayload({ requestId, contactId, contact, context = {}, trigger, consentRead, carrier, reenteredAt, vendor = null, leadSource = null, blockedElsewhere = [], lpProspectId = null, legacyBlock = null, env = process.env }) {
   const tags = contact?.tags || [];
   const name = [contact?.firstName, contact?.lastName].filter(Boolean).join(' ').trim()
     || contact?.contactName || contact?.name || 'Unknown';
@@ -107,6 +275,11 @@ export function buildReviewPayload({ requestId, contactId, contact, context = {}
     ghl_contact_id: contactId,
     contact_name: name,
     phone_last4: phoneLast4(contact?.phone),
+    phone_full: formatPhoneFull(contact?.phone),
+    lp_prospect_id: lpProspectId || null,
+    // LP refuses every clear value tried (2026-10-01). Until one is verified on
+    // a real record, the card tells the approver to clear LP by hand.
+    lp_manual_clear_required: lpManualClearRequired(env),
     // An ActiveProspect re-entry names the channel and the vendor that just
     // sent the lead — the contact's own source is from whenever it FIRST
     // arrived, which is not what the reviewer is deciding on.
@@ -127,6 +300,7 @@ export function buildReviewPayload({ requestId, contactId, contact, context = {}
     consent: consentRead?.consent || null,
     consent_read_status: consentRead?.status || 'error',
     last_consent_events: consentRead?.events || [],
+    legacy_block: legacyBlock || null,
     ghl_contact_url: `https://app.gohighlevel.com/v2/location/${GHL_LOCATION_ID}/contacts/detail/${contactId}`,
   };
 }
@@ -188,13 +362,65 @@ export async function executeRequestDncLiftReview(action, context = {}, deps = {
   const carrier = detectCarrierStop({ consent: consentRead.consent, tags: contact.tags, dndSettings: contact.dndSettings });
   const requestId = deps.newRequestId ? deps.newRequestId() : `dnc-lift-${crypto.randomUUID()}`;
   const trigger = action.action_payload?.trigger || (context?.source === 'reentry' ? 'reentry' : 'manual_tag');
+
+  // ── LP prospect id + pre-consent history (best-effort; never blocks the card) ──
+  const phone10 = normalizePhone10(contact.phone);
+  const noHistory = (consentRead?.events || []).length === 0;
+  const readLpLead = deps.readLpLead || ((id, p) => defaultReadLpLead(id, p, db));
+  const capMs = deps.lookupTimeoutMs ?? LEGACY_LOOKUP_TIMEOUT_MS;
+  const [five9Rows, lpLead] = await Promise.all([
+    noHistory
+      ? bestEffort('Five9 history lookup', () => (deps.readFive9History || ((id, p) => defaultReadFive9History(id, p, db)))(contactId, phone10), capMs)
+      : null,
+    bestEffort('LP lead lookup', () => readLpLead(contactId, phone10), capMs),
+  ]);
+  const lpProspectId = readCustomField(contact, LP_PROSPECT_FIELD_ID) || lpLead?.prospect_id || null;
+  let legacyBlock = null;
+  if (noHistory) {
+    const five9 = Array.isArray(five9Rows) ? pickFive9History(five9Rows) : null;
+    // ESS starts 2026-07-03; an older call is only on Five9's contact record.
+    const contactRecord = !five9?.five9_last_call && phone10
+      ? await bestEffort('Five9 contact record lookup', () => (deps.readContactRecord || defaultReadContactRecord)(phone10), capMs)
+      : null;
+    legacyBlock = buildLegacyBlock({ five9, contactRecord, lpLead });
+  }
+
   const payload = buildReviewPayload({
     requestId, contactId, contact, context, trigger, consentRead, carrier,
     reenteredAt: context?.occurred_at || action.created_at || new Date(now).toISOString(),
     vendor: action.action_payload?.vendor || null,
     leadSource: action.action_payload?.lead_source || null,
     blockedElsewhere,
+    lpProspectId,
+    legacyBlock,
+    env,
   });
+
+  // ── one-time seed (2026-10-02) ──
+  // AFTER the payload is built, so THIS card still shows the legacy lines; the
+  // next card for the contact shows the seeded row as real history. Only for a
+  // Five9-only block, and only when the consent read worked (an unreadable
+  // record is not "no history"). Failure logs, never throws.
+  if (legacyBlock && blockedElsewhere.includes(BLOCKED_IN_FIVE9) && consentRead?.status === 'ok') {
+    try {
+      const seeded = await (deps.hasLegacySeed || ((id) => defaultHasLegacySeed(id, db)))(contactId);
+      if (!seeded) {
+        await (deps.recordConsentChange || ((p) => recordConsentChange(p, { env, supabase: db })))({
+          ghlContactId: contactId,
+          channel: 'phone',
+          change: 'revoked',
+          source: FIVE9_LEGACY_SOURCE,
+          actor: 'system',
+          reason: 'On Five9 DNC before the consent system',
+          evidence: { five9_last_dnc_dispo: legacyBlock.five9_last_dnc_dispo, five9_last_call: legacyBlock.five9_last_call },
+          lpProspectId,
+        });
+        console.log(`[DncLiftReview] seeded five9_legacy consent history for ${contactId}`);
+      }
+    } catch (err) {
+      console.warn(`[DncLiftReview] five9_legacy seed failed for ${contactId}: ${err.message}`);
+    }
+  }
 
   const ins = await db.from('dnc_lift_requests').insert({
     request_id: requestId,

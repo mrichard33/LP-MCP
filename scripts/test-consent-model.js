@@ -529,6 +529,30 @@ test('applyConsentChange touches only the column a change names', () => {
   }
 });
 
+test('approve response carries the LP manual-clear line (LP_DNC_CLEAR_WORKING unset) and the prospect #', async () => {
+  const h = liftHarness({
+    requestRow: { request_id: 'req-1', ghl_contact_id: CONTACT, status: 'awaiting_decision', review_payload: { lp_prospect_id: '458487' } },
+  });
+  const out = await decision.handleDncLiftDecision({ body: body(), headers }, h.deps);
+  assert.equal(out.status, 200, JSON.stringify(out.json));
+  assert.equal(out.json.lp_manual_clear_required, true);
+  assert.equal(out.json.lp_prospect_id, '458487');
+
+  const kept = liftHarness();
+  const k = await decision.handleDncLiftDecision({ body: body({ decision: 'keep_blocked' }) , headers }, kept.deps);
+  assert.equal(k.json.lp_manual_clear_required, undefined, 'keep-blocked never touches LP');
+});
+
+test('approve response: flag on + LP clear done with a prospect id → no manual line', async () => {
+  const h = liftHarness({
+    runResult: (row) => (row.action_type === 'update_lp_dnc_status' ? { result: { lp_prospect_id: '462126' } } : {}),
+  });
+  h.deps.env = { ...h.deps.env, LP_DNC_CLEAR_WORKING: 'true' };
+  const out = await decision.handleDncLiftDecision({ body: body(), headers }, h.deps);
+  assert.equal(out.json.lp_manual_clear_required, false);
+  assert.equal(out.json.lp_prospect_id, '462126');
+});
+
 // ── review card ──────────────────────────────────────────────────────────────
 
 test('review: E0 owns first-party re-entries, a STOP goes to a person, 24h dedup', () => {
@@ -547,7 +571,9 @@ test('review: card payload carries last-4, blocking tags, and the STOP warning v
   });
   assert.equal(p.contact_name, 'Jane Doe');
   assert.equal(p.phone_last4, '6946');
-  assert.ok(!JSON.stringify(p).includes('8134166946'), 'the card never carries the full number');
+  // 2026-10-02 (handoff): the card now shows the full number so the approver
+  // can find the lead in LP and Five9; phone_last4 stays for older n8n code.
+  assert.equal(p.phone_full, '(813) 416-6946');
   assert.deepEqual(p.blocking_tags, ['dnc', 'dnc-sms', 'suppress:dnc-reply']);
   assert.equal(p.sms_warning, 'This lead texted STOP. Approving restores calls only. Texts stay off until they text START or submit a new form with SMS consent.');
   assert.equal(p.sub_source, 'high-intent-digital');

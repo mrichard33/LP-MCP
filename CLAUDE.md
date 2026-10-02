@@ -134,6 +134,17 @@ transaction. `CONSENT_MODEL_MODE` is `shadow`: nothing gates a send on these tab
   step after it.
 - `POST /slack/dnc-lift/decision` is idempotent on `request_id` through `dnc_lift_requests`
   (sql/140) and refuses (503) without it.
+- **LP's clear is still broken, so the lift card says so (2026-10-02).** `%20` was rejected too on
+  2026-10-01. Until `LP_DNC_CLEAR_WORKING=true` (set only after a clear is verified with a GetLead
+  read-back), the review payload and the approve response carry `lp_manual_clear_required` and
+  `lp_prospect_id`, and n8n tells the approver to clear LP by hand. A clear skipped for want of a
+  prospect id counts as NOT cleared (`lpClearOutcome` in `dnc-lift-decision.js`).
+- **A card with no consent history shows the old Five9 block instead (2026-10-02).** `legacy_block`
+  (last Five9 DNC result, last call, LP disposition) is built when `consent_events` is empty, every
+  lookup best-effort. A Five9-only block is then seeded ONCE as `phone/revoked`, source
+  `five9_legacy`. That row is old history, not a fresh opt-out: the re-entry sweep's
+  "opted out after arrival" check excludes it, and anything new that reads consent_events for
+  recency must too.
 - **A tag blocks only its own channel (2026-09-29).** `dnc-sms` / `dnc-voice` → calls + texts
   (`TAG_DNC_SMS_OPTOUT` / `TAG_DNC_VOICE_OPTOUT`), `dnc-email` → email (`TAG_DNC_EMAIL_OPTOUT`), consent
   source `ghl_tag`. Plain `dnc` blocks nothing: rule 241 `TAG_DNC_TO_HARDLOSS` only moves the objection

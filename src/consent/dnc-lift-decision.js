@@ -52,6 +52,7 @@ import { ghlFetch } from '../actions/helpers.js';
 import { approveAgentAction } from '../actions/approve-action.js';
 import { getConsent, detectCarrierStop, blockingTags, isMissingSchemaError } from './consent-store.js';
 import { APPROVED_DNC_LIFT_RULE_KEY, isSlackUserId } from '../five9/admin-writes.js';
+import { lpManualClearRequired } from './dnc-lift-review.js';
 
 export const KEEP_BLOCKED_RULE_KEY = 'SLACK_DNC_KEEP_BLOCKED';
 export const LIFT_TAGS = Object.freeze([
@@ -221,6 +222,26 @@ export function summarizeBatch(results) {
   return { any_failed: anyFailed, systems, actions };
 }
 
+/**
+ * The LP half of an approve, for n8n's thread reply (2026-10-02). LP refuses
+ * every clear value tried so far, so until LP_DNC_CLEAR_WORKING=true the
+ * approver is always told to clear LP by hand. Even with the flag on, a clear
+ * that failed, is still retrying, or was SKIPPED for want of a prospect id
+ * (clearLPDNC reports that as done) left LP showing DNC. Pure.
+ *
+ * @returns {{lp_prospect_id: string|null, lp_manual_clear_required: boolean}}
+ */
+export function lpClearOutcome(results, { env = process.env, reviewPayload = null } = {}) {
+  const lp = (results || []).find((r) => r?.action_type === 'update_lp_dnc_status') || null;
+  const fromResult = lp?.result?.lp_prospect_id ? String(lp.result.lp_prospect_id) : null;
+  const lpProspectId = fromResult || (reviewPayload?.lp_prospect_id ? String(reviewPayload.lp_prospect_id) : null);
+  const cleared = !!lp && outcomeOf(lp) === 'done' && !!fromResult;
+  return {
+    lp_prospect_id: lpProspectId,
+    lp_manual_clear_required: lpManualClearRequired(env) || !cleared,
+  };
+}
+
 // ─── the route ───────────────────────────────────────────────────────────────
 
 async function defaultReadContact(contactId) {
@@ -352,6 +373,7 @@ export async function handleDncLiftDecision({ body = {}, headers = {} }, deps = 
       sms_warning: decision === 'approve' && carrier.carrierStop
         ? 'Texts stay OFF: the lead texted STOP. They reopen only when the lead texts START or submits a new form with SMS consent.'
         : null,
+      ...(decision === 'approve' ? lpClearOutcome(results, { env, reviewPayload: found.data.review_payload }) : {}),
       ...summary,
     };
     const finalStatus = summary.any_failed ? 'failed' : (decision === 'approve' ? 'approved' : 'kept_blocked');
