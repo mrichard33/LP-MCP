@@ -234,7 +234,8 @@ sign-off, and leaves any sentence quoting a LOCKED KB line (found in the prompt)
 **NEPQ is enforced in code, not only in the prompt (Mark, 2026-10-02).** `src/agentic/nepq-planner.js`
 plans ONE move per turn for both bots (`planNepqTurn`): a person takes over on a complaint, a price asked
 again after the price play, two no's, or a repeated objection (`src/agentic/nepq-handoff.js`: `hdl:callback-sales`
-+ `nepq:handoff:<reason>`, a rep note, an event, an #ops-alerts card); the objection plays, the
++ `nepq:handoff:<reason>`, a rep note, an event, and a card in **#contact-center** (`SLACK_CHANNEL_SERVICE`), plus
+**#dispatch** for a complaint or an unbookable pick, via `postToSlack`; a failed post is an #ops-alerts line); the objection plays, the
 think-it-over Calendar Commitment (two REAL slots, exempt from the booking-ask cap), "what day works best",
 the Reveal and the confirm line ("You're set for [day] at [time], [name]. Our team will call to go over the
 details." — never a rep name, never "see you then") are Mark's fixed wording. Discovery is short (2 questions

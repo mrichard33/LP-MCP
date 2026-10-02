@@ -323,7 +323,8 @@ function nepqHandoff({ contactId, reason, inbound, firstName }) {
     applyTags: (id, tags) => ghlFetch('POST', `/contacts/${id}/tags`, { tags }, { priority: 'normal' }),
     addNote: (id, note) => addGHLNote(id, note),
     emitEvent,
-    alert: (text) => sendAlertMessage(text, { channel: 'ops' }),
+    post: (text, channelId) => postToSlack(text, channelId),
+    opsAlert: (text) => sendAlertMessage(text, { channel: 'ops' }),
   });
 }
 

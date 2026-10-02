@@ -148,7 +148,7 @@ test('hand-off: callback tag + reason tag, a rep note, one idempotent event, a c
   assert.deepEqual(seen.tags, ['hdl:callback-sales', 'nepq:handoff:price_insist']);
   assert.match(seen.note, /\[AGENT TASK\]/);
   assert.equal(seen.event.idempotency_key, 'nepq_handoff_C1_price_insist_2026-10-02');
-  assert.match(seen.card, /NEPQ HAND-OFF \(price insist\)/);
+  assert.match(seen.card, /A PERSON IS NEEDED \(price insist\)/);
 });
 
 test('prompt block: the fixed line verbatim, and the never-list', () => {
@@ -276,4 +276,23 @@ test('a missed visit is a complaint: a person takes over, no pitch', () => {
     assert.equal(plan({ trigger: t }).handoff?.reason, 'complaint', t);
   }
   assert.equal(plan({ trigger: 'never call me again' }).handoff?.reason === 'complaint', false);
+});
+
+// Mark, 2026-10-02: hand-off cards go to #contact-center, and a complaint to #dispatch too.
+test('hand-off card: #contact-center always, #dispatch for a complaint; a failed post is an ops line', async () => {
+  const { handoffSlackChannels } = await import('../src/agentic/nepq-handoff.js');
+  const env = { SLACK_CHANNEL_SERVICE: 'CSERVICE' };
+  assert.deepEqual(handoffSlackChannels('complaint', env).map(c => c.name), ['contact-center', 'dispatch']);
+  assert.deepEqual(handoffSlackChannels('price_insist', env).map(c => c.name), ['contact-center']);
+  const posts = [];
+  const ops = [];
+  await routeNepqHandoff({ contactId: 'C9', reason: 'complaint', channel: 'livechat', inbound: 'someone was supposed to come today', firstName: null }, {
+    env, applyTags: async () => {}, addNote: async () => {}, emitEvent: async () => {},
+    post: async (text, ch) => { posts.push({ text, ch }); return ch === 'CSERVICE' ? { ok: true } : { ok: false, error: 'not_in_channel' }; },
+    opsAlert: async (t) => { ops.push(t); },
+  });
+  assert.deepEqual(posts.map(p => p.ch), ['CSERVICE', 'C0C19GRS8FJ']);
+  assert.match(posts[0].text, /WEBSITE CHAT[\s\S]*supposed to come today[\s\S]*contacts\/detail\/C9/);
+  assert.equal(ops.length, 1);
+  assert.match(ops[0], /NOT POSTED TO #dispatch[\s\S]*add the Reece Slack app/);
 });
