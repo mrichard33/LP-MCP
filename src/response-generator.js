@@ -380,7 +380,7 @@ import { findUnbackedEstimatePromise, estimatePromiseNote, rewriteEstimatePromis
 // v2.7.14 — Bot Review Phase 0. Pure shaping helpers only: no I/O, no writes.
 import { buildInputSnapshot, extractKbModes, extractKbSources } from './bot-feedback/fingerprint-core.js';
 import { normalizeTimezone, tzLongName, tzLabel } from './config/market-timezones.js';
-import { planNepqTurn, enforceNepqPlan, nepqBackboneMode, objectionType as nepqObjectionType, TIME_REQUEST_RX as NEPQ_TIME_REQUEST_RX, REPEAT_COMPLAINT_RX as NEPQ_REPEAT_COMPLAINT_RX } from './agentic/nepq-planner.js';
+import { planNepqTurn, enforceNepqPlan, nepqBackboneMode, nepqFixedLineWins, objectionType as nepqObjectionType, TIME_REQUEST_RX as NEPQ_TIME_REQUEST_RX, REPEAT_COMPLAINT_RX as NEPQ_REPEAT_COMPLAINT_RX } from './agentic/nepq-planner.js';
 import {
   planServiceAreaTurn, resolveCoverage, coverageHint, guardCoverageDraft, serviceAreaRecord,
 } from './agentic/service-area-turn.js';
@@ -4040,6 +4040,12 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // a lead who gets a slightly repetitive reply is in a worse conversation, a
   // lead who gets the safe fallback is in a dead one, and always-respond
   // (PR #486) means the message goes out either way.
+  // 2026-10-02 re-test (Mark: replies took 20–60s): with NEPQ live, a turn whose
+  // fixed line replaces the draft is never redrafted, the one-question rule is
+  // enforceNepqPlan's (it keeps the last question, no model call), and the
+  // discipline rewrites run at once instead of after a second draft.
+  const nepqLiveTurn = nepqMode === 'live' && !!nepqPlan;
+  const nepqDraftReplaced = nepqLiveTurn && nepqFixedLineWins(nepqPlan);
   {
     const offences = [];
 
@@ -4056,15 +4062,17 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       offences.push('re-pitched both owners attending after that attempt was already spent');
     }
 
-    // 3. NEPQ: one question, one ask.
-    const questions = countQuestions(validated.message);
+    // 3. NEPQ: one question, one ask. (NEPQ live: enforceNepqPlan trims it.)
+    const questions = nepqLiveTurn ? 0 : countQuestions(validated.message);
     if (questions > 1) offences.push(`asked ${questions} questions (the cap is one)`);
-    else if (isDoubleBarrelled(validated.message)) {
+    else if (!nepqLiveTurn && isDoubleBarrelled(validated.message)) {
       offences.push('used a stacked either/or close — two asks in one question mark');
     }
 
     if (offences.length) {
-      if (opts.regenerationNote) {
+      if (nepqDraftReplaced) {
+        console.log(`[ResponseGenerator] repetition in a draft the NEPQ fixed line replaces for ${contactId} — no redraft`);
+      } else if (opts.regenerationNote) {
         console.warn(`[ResponseGenerator] ⚠️ repetition survived regeneration for ${contactId}: ${offences.join('; ')} — sending anyway`);
       } else {
         console.warn(`[ResponseGenerator] ⚠️ repetition for ${contactId}: ${offences.join('; ')} — regenerating once`);
@@ -4148,8 +4156,8 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     }
 
     if (notes.length) {
-      if (opts.regenerationNote) {
-        console.warn(`[ResponseGenerator] ⚠️ discipline offences survived regeneration for ${contactId} (${notes.length}) — applying deterministic rewrites`);
+      if (opts.regenerationNote || nepqLiveTurn) {
+        console.warn(`[ResponseGenerator] ⚠️ discipline offences ${nepqLiveTurn && !opts.regenerationNote ? '(NEPQ live, no redraft)' : 'survived regeneration'} for ${contactId} (${notes.length}) — applying deterministic rewrites`);
         for (const fix of fixes) fix();
         if (!validated.message.trim()) validated.message = holdingLine(leadFirstName);
         validated.discipline_rewrites = notes.length;

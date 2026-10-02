@@ -68,6 +68,15 @@ const SPOUSE_OBJECTION_RX = /\b(?:talk|check|ask|discuss|run\s+(?:it|this))\b[^.
 const SHOPPING_RX = /\b(?:(?:\d|two|three|four|few|couple(?:\s+of)?|multiple|other|more)\s+(?:quotes|estimates|bids|companies|contractors)|shopping\s+around|comparing|getting\s+(?:other\s+)?(?:quotes|estimates|bids))\b/i;
 const THINK_RX = /\b(?:think\s+(?:it\s+over|about\s+it|on\s+it)|sleep\s+on\s+it|get\s+back\s+to\s+you|let\s+me\s+(?:think|see|check)|maybe\s+later|not\s+(?:right\s+)?now|need\s+(?:some\s+)?time)\b/i;
 const YES_RX = /^\s*(?:y(?:es|eah|ep|up)|sure|ok(?:ay)?|sounds\s+good|that\s+works|please|absolutely|definitely|why\s+not|let'?s\s+do\s+it|i'?d\s+like\s+that)\b/i;
+// A non-answer to a discovery question. "no" is not here: it is counted as a no.
+const VAGUE_ANSWER_RX = /^\s*(?:idk|i\s+(?:don'?t|dont)\s+know|not\s+(?:sure|really)|dunno|no\s+idea|maybe|i\s+guess|possibly|eh+|hm+|meh|ok(?:ay)?|k|yes|yeah|yep|sure|nothing(?:\s+really)?|whatever|first|\?+)\s*[.!?]*\s*$/i;
+const MAYBE_RX = /^\s*(?:maybe|i\s+guess|possibly|probably|not\s+sure|perhaps|could\s+be)\b[^?]*$/i;
+/** How many of the newest inbound messages, in a row, are non-answers. Pure. */
+function vagueRun(inbound = []) {
+  let n = 0;
+  for (let i = inbound.length - 1; i >= 0 && VAGUE_ANSWER_RX.test(String(inbound[i]?.text || '')); i--) n++;
+  return n;
+}
 // A bare pick: "first", "2nd", "the earlier one", "either".
 const BARE_PICK_RX = /^\s*(?:ok(?:ay)?,?\s+|yes,?\s+|sure,?\s+)?(?:the\s+)?(?:first|second|1st|2nd|earlier|later|either)(?:\s+one)?(?:\s+(?:works|please|is\s+good))?\s*[.!]*\s*$/i;
 const NEITHER_RX = /\b(?:neither|none\s+of\s+(?:those|them)|(?:those|that)\s+(?:times?\s+)?(?:don'?t|won'?t|doesn'?t)\s+work|can'?t\s+do\s+(?:either|those|that)|not\s+(?:those|that)\s+(?:days?|times?))\b/i;
@@ -537,7 +546,19 @@ export function planNepqTurn({
     return Object.assign(plan, { step: 'offer_slots', required_move: 'offer_slots', booking: { allowed: true, reason: 'nepq:offer_slots' } });
   }
 
+  // 7b. A soft "maybe" / "I guess" to the bridge: two real times, no pressure
+  // (2026-10-02 funnel re-test: a vague lead stalled for five turns on SMS).
+  if (BRIDGE_RX.test(lastOut) && MAYBE_RX.test(now)) {
+    if (offerSlots.length === 2) return fixed('offer_slots', withSlots(LINES.offer_slots(offerSlots)), { step: 'offer_slots' });
+    return Object.assign(plan, { step: 'offer_slots', required_move: 'offer_slots', booking: { allowed: true, reason: 'nepq:offer_slots' } });
+  }
+
   // 8. Discovery, short: probe in their words, one consequence question, then bridge.
+  // Two non-answers in a row ("idk", "maybe") end discovery early: more
+  // questions only stall a lead who has nothing more to say (Mark, 2026-10-02).
+  if (!counters.bridge_used && counters.discovery_questions_asked >= 1 && vagueRun(inbound) >= 2) {
+    return Object.assign(plan, { step: 'bridge', required_move: 'bridge', vague_lead: true, booking: { allowed: false, reason: 'nepq:bridge_vague' } });
+  }
   if (counters.discovery_questions_asked >= cap && !counters.bridge_used) {
     return Object.assign(plan, { step: 'bridge', required_move: 'bridge', booking: { allowed: false, reason: 'nepq:bridge_first' } });
   }
@@ -569,6 +590,16 @@ const CLAIMS_RX = /\bcode\s+(?:changed|tightened|got\s+(?:stricter|tighter)|was\
 const SEE_YOU_RX = /\bsee\s+you\s+(?:then|soon|there)\b/i;
 const SIGNOFF_RX = /(?:^|\s)([—–-]\s*[A-Z][A-Za-z.'’ ]{0,40})\s*$/;
 const FIXED_MOVES = new Set(['handoff', 'objection_play', 'ask_day', 'close', 'reveal', 'offer_slots']);
+
+/**
+ * True when the plan ships its own fixed line, so whatever the model drafts is
+ * replaced. A redraft for such a turn is time spent on text nobody sees
+ * (2026-10-02 re-test: the SMS quote reply took 58s, 42s of it a redraft of a
+ * draft the fixed quote line then replaced). Pure.
+ */
+export function nepqFixedLineWins(plan) {
+  return !!(plan?.fixed_line && FIXED_MOVES.has(plan.required_move));
+}
 const NO_FIGURES_LINE = 'Exact numbers come from the visit, since every home is different.';
 
 const norm = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();

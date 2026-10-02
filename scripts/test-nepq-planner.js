@@ -398,3 +398,15 @@ test('live chat 2026-10-02: a referral fee or refund never received goes to a pe
   assert.equal(plan({ trigger: "I never got my refund for the deposit" }).handoff?.reason, 'service');
   assert.equal(plan({ trigger: 'do you have a referral program?' }).handoff, null);
 });
+
+test('vague lead: two non-answers end discovery; "maybe" to the bridge gets two times', () => {
+  const thread = T(['inbound', 'hi'], ['outbound', "What's going on with your windows that got you looking?"], ['inbound', 'idk'], ['outbound', 'Are they drafty, or something else?']);
+  const p = plan({ trigger: 'maybe', conversation: thread });
+  assert.equal(p.required_move, 'bridge');
+  assert.equal(p.vague_lead, true);
+  // One non-answer is not enough: keep asking.
+  assert.notEqual(plan({ trigger: 'idk', conversation: T(['inbound', 'hi'], ['outbound', "What's going on with your windows?"]) }).required_move, 'bridge');
+  const bridged = T(['outbound', 'Based on what you told me, this could work for you. The next step would be a quick call with our team. Would that help?']);
+  assert.equal(plan({ trigger: 'maybe', conversation: bridged, slots: SLOTS }).fixed_line, LINES.offer_slots(SLOTS));
+  assert.equal(plan({ trigger: 'I guess so', conversation: bridged, slots: SLOTS }).required_move, 'offer_slots');
+});
