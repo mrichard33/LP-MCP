@@ -169,7 +169,8 @@ export const LINES = Object.freeze({
 });
 
 function slotPair(slots = []) {
-  const s = slots.slice(0, 2).map(x => `${x.day} at ${x.time}${x.tz ? ` ${x.tz}` : ''}`);
+  // "tomorrow at 10:00 AM ET or Mon, Oct 5 at 6:00 PM ET" (Mark, 2026-10-02).
+  const s = slots.slice(0, 2).map(x => `${x.rel || x.day} at ${x.time}${x.tz ? ` ${x.tz}` : ''}`);
   return s.length === 2 ? `${s[0]} or ${s[1]}` : (s[0] || '');
 }
 

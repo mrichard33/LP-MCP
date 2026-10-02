@@ -141,22 +141,44 @@ test('parseSlots: the 4h floor applies BEFORE the 12-slot cap (dense quick-call 
   assert.equal(sel.slots.length, 2);
 });
 
-test('spread: a dense calendar offers two times 3+ hours apart, a sparse one is unchanged', async () => {
-  const { spreadOffer } = await import('../src/knowledge/calendar-availability.js');
+test('spread: a dense calendar is thinned to one slot an hour, and the two offers fall on two days', () => {
   // Every 15 minutes for 3 days: the parse keeps one per hour.
   const iso = Array.from({ length: 288 }, (_, i) => new Date(Date.now() + (i + 1) * 15 * 60_000).toISOString());
-  const av = parseSlots({ day: { slots: iso } }, 'cal', TZ, 12);
+  const av = parseSlots({ day: { slots: iso } }, 'cal', TZ, 30);
   const gaps = av.slots.slice(1).map((s, i) => new Date(s.iso) - new Date(av.slots[i].iso));
   assert.ok(gaps.every((g) => g >= HOUR), 'no two parsed slots inside the same hour');
   const sel = selectOfferableSlots(av, null);
   assert.equal(sel.slots.length, 2);
-  assert.ok(new Date(sel.slots[1].iso) - new Date(sel.slots[0].iso) >= 3 * HOUR);
-  // Sparse (10 AM, 2 PM): already a real choice, kept as is.
-  const sparse = [slotAt(20), slotAt(24), slotAt(44)];
-  assert.deepEqual(spreadOffer(sparse, 2), [sparse[0], sparse[1]]);
-  // Nothing 3h later: the next one.
-  const tight = [slotAt(20), slotAt(21)];
-  assert.deepEqual(spreadOffer([...tight, slotAt(22)], 2).length, 2);
+  assert.notEqual(civilDate(sel.slots[0].iso), civilDate(sel.slots[1].iso), 'two different days');
+});
+
+test('spread (Mark, 2026-10-02): visits at 10, 2 and 6, the next two open days, a different time of day', async () => {
+  const { spreadOffer } = await import('../src/knowledge/calendar-availability.js');
+  const s = (when) => ({ iso: `${when}:00-04:00` });
+  // Sat 10/2/6, no Sunday visits, Mon 10/2/6.
+  const sat = [s('2026-10-03T10:00'), s('2026-10-03T14:00'), s('2026-10-03T18:00')];
+  const mon = [s('2026-10-05T10:00'), s('2026-10-05T14:00'), s('2026-10-05T18:00')];
+  // "I have tomorrow at 10, or Monday at 6 PM": the 48h window holds only
+  // Saturday, and the pool rolls past the closed Sunday.
+  assert.deepEqual(spreadOffer(sat, 2, { pool: [...sat, ...mon], timezone: TZ }), [sat[0], mon[2]]);
+  // First at 6 PM: the next day's morning.
+  assert.deepEqual(spreadOffer([sat[2]], 2, { pool: [sat[2], ...mon], timezone: TZ }), [sat[2], mon[0]]);
+  // First at 2 PM: 10 AM and 6 PM are equally far, the earlier wins.
+  assert.deepEqual(spreadOffer([sat[1], sat[2]], 2, { pool: [sat[1], sat[2], ...mon], timezone: TZ }), [sat[1], mon[0]]);
+  // A day the lead named keeps both times on that day (pool = that day).
+  assert.deepEqual(spreadOffer(sat, 2, { timezone: TZ }), [sat[0], sat[1]]);
+  // Nothing more than a week out is used for the second time.
+  assert.deepEqual(spreadOffer([sat[0]], 2, { pool: [sat[0], s('2026-10-12T10:00')], timezone: TZ }), [sat[0]]);
   // Any other cap is untouched.
-  assert.equal(spreadOffer(sparse, 50).length, 3);
+  assert.equal(spreadOffer(sat, 50).length, 3);
+});
+
+test('offer wording: "tomorrow" in the two-times line, and "tomorrow" picks that time', async () => {
+  const { LINES } = await import('../src/agentic/nepq-planner.js');
+  const { pickSlot } = await import('../src/live-chat/cancel-flow.js');
+  const a = { iso: 'x', day: 'Sat, Oct 3', time: '10:00 AM', dayOfWeek: 'Saturday', rel: 'tomorrow', tz: 'ET' };
+  const b = { iso: 'y', day: 'Mon, Oct 5', time: '6:00 PM', dayOfWeek: 'Monday', rel: null, tz: 'ET' };
+  assert.equal(LINES.offer_slots([a, b]), 'I have tomorrow at 10:00 AM ET or Mon, Oct 5 at 6:00 PM ET. Which works better?');
+  assert.equal(pickSlot('tomorrow works', [a, b]), a);
+  assert.equal(pickSlot('monday', [a, b]), b);
 });
