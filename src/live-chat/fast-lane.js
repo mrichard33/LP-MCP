@@ -50,6 +50,8 @@ import {
 } from '../response-generator.js';
 import { buildEstablishedFacts } from '../agentic/established-facts.js';
 import { humanizeReply, restoreQuestionMark } from '../agentic/human-voice.js';
+import { enforceTeamVoice } from '../agentic/team-voice.js';
+import { enforceCallTiming } from '../agentic/team-hours.js';
 import { rewriteBookingClaims } from '../agentic/booking-claim.js';
 import { looksLikeShortPhone } from '../agentic/contact-typos.js';
 import { planNepqTurn, enforceNepqPlan, nepqBackboneMode, LINES as NEPQ_LINES } from '../agentic/nepq-planner.js';
@@ -229,6 +231,8 @@ export const LIVE_CHAT_ADDENDUM = `
 ═══════ LIVE CHAT (website widget) — THIS REPLY ═══════
 You are answering in the website chat, live, with the visitor watching the screen.
 - Team voice ("we", "our team"). Never Randy, never a personal name you were not given.
+- You are the Reece Team. Asked who you are or for your name: "This is the Reece Team." Never give a personal name, never "I'm Mark".
+- Reece was founded in North Carolina in 1972 by Randy's father; Florida since 2005. Never say Randy founded it.
 - ONE or TWO short sentences. ONE question at a time, one question mark. No lists, no links.
 - Collect, in this order and only what is missing: their name, the best phone number, their email. One at a time, woven into the answer, never as a form.
 - If what they typed looks like an email but is not a valid one (no @, or nothing after the @), say so kindly and ask for it again: "That doesn't look quite right. Could you check the email address?" Never say you do not have enough information. Never dead-end.
@@ -813,7 +817,7 @@ export function createLiveChatFastLane(deps) {
       const planInput = {
         channel: 'livechat', trigger: body, conversation: context.conversation_recent, firstName: realFirst,
         hasAppointment: context.lp?.appointment_set === true && context.lp?.appointment_is_past !== true,
-        nextStepLabel: 'a visit at your home', discipline,
+        nextStepLabel: 'a visit at your home', discipline, nowMs: d.now(),
       };
       nepqPlan = planNepqTurn(planInput);
       if (wantsSlots(nepqPlan)) {
@@ -1215,6 +1219,17 @@ export function createLiveChatFastLane(deps) {
     if (!turn.claim('reply')) {
       d.log(`[LiveChat] reply for ${contactId} finished after the holding line — not sent`);
       return { outcome: 'late_dropped', sent: false, message: null, timing: finalizeTiming(timing) };
+    }
+    // 2026-10-02 (Mark): every reply, fixed line or model draft, speaks as the
+    // Reece Team, says Randy's father founded Reece, and promises a call
+    // "today" / "right now" only inside team hours (team-hours.js).
+    {
+      const team = enforceTeamVoice(draft);
+      const callTiming = enforceCallTiming(team.text, d.now());
+      if (team.changes.length || callTiming.changed) {
+        d.log(`[TeamVoice] live chat ${contactId} ${[...team.changes, ...(callTiming.changed ? ['call_timing'] : [])].join(',')}`);
+        draft = callTiming.text;
+      }
     }
     let ghlMessageId = null;
     let sendMethod = null;

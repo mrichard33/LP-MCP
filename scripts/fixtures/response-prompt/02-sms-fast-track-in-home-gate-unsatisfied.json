@@ -1,6 +1,6 @@
 {
   "name": "02-sms-fast-track-in-home-gate-unsatisfied",
-  "covers": "sms · fast_track_booking · WINDOW_ESTIMATE · in-home prerequisites missing · Mark direct line",
+  "covers": "sms · fast_track_booking · WINDOW_ESTIMATE · in-home prerequisites missing · Mark's number (answers as the Reece Team)",
   "env": {},
   "channel": "sms",
   "triggerMessage": "Can someone come out this week?",

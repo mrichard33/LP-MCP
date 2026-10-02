@@ -264,6 +264,8 @@ import {
 } from './agentic/guide-delivery.js';
 import { notInterestedTurn } from './agentic/not-interested.js';
 import { humanizeReply, restoreQuestionMark } from './agentic/human-voice.js';
+import { enforceTeamVoice } from './agentic/team-voice.js';
+import { enforceCallTiming } from './agentic/team-hours.js';
 import { findUnbackedBookingClaim, rewriteBookingClaims, bookingClaimNote } from './agentic/booking-claim.js';
 import { BOOKING_CALENDARS } from './knowledge/booking-calendar-router.js';
 import { contactTypoHint } from './agentic/contact-typos.js';
@@ -602,6 +604,9 @@ export function resolveReplySenderName() {
 const SMS_NUMBER_MARK_DEFAULT = '9542808890';
 const SMS_NUMBER_TEAM_DEFAULT = '9543710083';
 const TEAM_SIGNATURE = 'Reece Team';
+// 2026-10-02 (Mark): "the bot should act as the Reece Team". Asked who it is,
+// the bot says this, on every line but the rehash rep's own.
+const TEAM_NAME_IF_ASKED = 'the Reece Team';
 
 /** Last 10 digits of any phone format, or null. "+1 (954) 280-8890" → "9542808890". */
 export function last10Digits(raw) {
@@ -639,11 +644,12 @@ export function resolveSmsSenderIdentity(fromNumber, { rehash = null } = {}) {
 
   const markNumber = last10Digits(process.env.AGENTIC_SMS_NUMBER_MARK || SMS_NUMBER_MARK_DEFAULT);
   if (n && markNumber && n === markNumber) {
+    // Mark's own number, answered by the bot: still the Reece Team.
     return {
       persona: 'mark',
-      signature: personName,
-      shared: false,
-      nameIfAsked: personName,
+      signature: TEAM_SIGNATURE,
+      shared: true,
+      nameIfAsked: TEAM_NAME_IF_ASKED,
       matched: true,
     };
   }
@@ -653,7 +659,7 @@ export function resolveSmsSenderIdentity(fromNumber, { rehash = null } = {}) {
     persona: 'team',
     signature: TEAM_SIGNATURE,
     shared: true,
-    nameIfAsked: personName,
+    nameIfAsked: TEAM_NAME_IF_ASKED,
     matched: Boolean(n && teamNumber && n === teamNumber),
   };
 }
@@ -1119,7 +1125,9 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
   // customer has met — they own the deal, they do not author this message.
   {
     // 2026-10-01: a post-demo F.0 reply is written by the rehash rep.
-    const authorName = (opts.rehash?.active && opts.rehash.repName) || resolveReplySenderName();
+    // 2026-10-02 (Mark): texts and chat are "the Reece Team", never a person;
+    // the email sender is unchanged.
+    const authorName = (opts.rehash?.active && opts.rehash.repName) || (channel === 'email' ? resolveReplySenderName() : null);
     parts.push(...P.authorship(authorName));
   }
 
@@ -3782,6 +3790,19 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   if (voice.changes.length) {
     console.log(`[HumanVoice] ${contactId} ${voice.changes.join(',')}`);
     validated.message = voice.text;
+  }
+
+  // ─── Team voice + call timing (2026-10-02, Mark) ───
+  // The bot is "the Reece Team", never "I'm Mark" (the rehash line keeps its
+  // rep's name); Randy's father founded Reece; and a call "today" / "in the
+  // next few minutes" is promised only inside team hours (team-hours.js).
+  if (channel !== 'email') {
+    const team = enforceTeamVoice(validated.message, { allowName: rehash?.repName || null });
+    const timing = enforceCallTiming(team.text);
+    if (team.changes.length || timing.changed) {
+      console.log(`[TeamVoice] ${contactId} ${[...team.changes, ...(timing.changed ? ['call_timing'] : [])].join(',')}`);
+      validated.message = timing.text;
+    }
   }
 
   assertNoUnresolvedTokens(validated.message, contactId);

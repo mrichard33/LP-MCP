@@ -6,6 +6,10 @@
  *   (954) 371-0083 — the shared Reece team line → "— Reece Team", and when a
  *     customer asks for a name: give Mark AND say it is a shared team number.
  *
+ * 2026-10-02 (Mark): "the bot should act as the Reece Team." Both lines now
+ * sign "— Reece Team" and, asked who it is, the bot says "the Reece Team";
+ * no configured name reaches a text. The rehash rep's line is separate.
+ *
  * The properties under test:
  *   - the number match is format-agnostic (+1, dashes, parens all normalize);
  *   - an UNKNOWN or missing number resolves to the TEAM identity, never to a
@@ -67,11 +71,11 @@ test('last10Digits rejects anything too short to be a number', () => {
 
 // ── identity resolution ─────────────────────────────────────────────
 
-test("Mark's line resolves to the Mark identity", () => {
+test("Mark's line is recognised, and the bot still answers as the Reece Team", () => {
   const id = resolveSmsSenderIdentity(MARK_LINE);
   assert.equal(id.persona, 'mark');
-  assert.equal(id.signature, 'Mark');
-  assert.equal(id.shared, false);
+  assert.equal(id.signature, 'Reece Team');
+  assert.equal(id.nameIfAsked, 'the Reece Team');
   assert.equal(id.matched, true);
 });
 
@@ -86,7 +90,7 @@ test('the team line resolves to the shared Reece Team identity', () => {
   assert.equal(id.persona, 'team');
   assert.equal(id.signature, 'Reece Team');
   assert.equal(id.shared, true);
-  assert.equal(id.nameIfAsked, 'Mark', 'a name is still available when asked');
+  assert.equal(id.nameIfAsked, 'the Reece Team', 'asked who it is, the bot is the Reece Team');
   assert.equal(id.matched, true);
 });
 
@@ -118,20 +122,16 @@ test('the numbers are env-tunable without a redeploy', () => {
   });
 });
 
-test('the Randy guard applies to the SMS signature too', () => {
-  withEnv({ AGENTIC_REPLY_SENDER_NAME: 'Randy' }, () => {
-    const id = resolveSmsSenderIdentity(MARK_LINE);
-    assert.equal(id.signature, 'Mark', 'Randy must never reach a customer-facing signature');
-    assert.equal(resolveSmsSenderIdentity(TEAM_LINE).nameIfAsked, 'Mark');
-  });
-});
-
-test('a configured in-office rep other than Mark flows through', () => {
-  withEnv({ AGENTIC_REPLY_SENDER_NAME: 'Dana' }, () => {
-    assert.equal(resolveSmsSenderIdentity(MARK_LINE).signature, 'Dana');
-    assert.equal(resolveSmsSenderIdentity(TEAM_LINE).signature, 'Reece Team', 'the team signature is not a person');
-    assert.equal(resolveSmsSenderIdentity(TEAM_LINE).nameIfAsked, 'Dana');
-  });
+test('no configured name reaches a text: Randy, Mark or anyone else', () => {
+  for (const name of ['Randy', 'Mark', 'Dana']) {
+    withEnv({ AGENTIC_REPLY_SENDER_NAME: name }, () => {
+      for (const line of [MARK_LINE, TEAM_LINE]) {
+        const id = resolveSmsSenderIdentity(line);
+        assert.equal(id.signature, 'Reece Team', `${name} reached the signature`);
+        assert.equal(id.nameIfAsked, 'the Reece Team', `${name} reached the asked-for name`);
+      }
+    });
+  }
 });
 
 // ── sign-off detection (drives "sign once, then stop") ──────────────
@@ -200,12 +200,12 @@ const SIGNED_TEAM_THREAD = [{ direction: 'outbound', text: 'Happy to help. — R
 test('UNSIGNED thread: sign the substantive reply, skip the pleasantry', () => {
   const p = prompt('sms', { fromNumber: MARK_LINE });
   assert.ok(/Nothing in this thread has been signed yet/.test(p));
-  assert.ok(/If this reply is SUBSTANTIVE .* end it with "— Mark"/s.test(p), 'substantive-sign rule missing');
+  assert.ok(/If this reply is SUBSTANTIVE .* end it with "— Reece Team"/s.test(p), 'substantive-sign rule missing');
   assert.ok(/only a short acknowledgment or a pleasantry .* DO NOT sign it/s.test(p), 'pleasantry carve-out missing');
 });
 
 test('ALREADY-SIGNED thread: do not sign again', () => {
-  const p = prompt('sms', { fromNumber: MARK_LINE }, SIGNED_THREAD);
+  const p = prompt('sms', { fromNumber: MARK_LINE }, SIGNED_TEAM_THREAD);
   assert.ok(/DO NOT SIGN THIS MESSAGE/.test(p));
   assert.ok(/reads like a form letter/.test(p));
   assert.ok(!/Nothing in this thread has been signed yet/.test(p));
@@ -229,16 +229,17 @@ test('a Mark-signed thread does not suppress the TEAM sign-off (different identi
 test('the customer-asks answer is present in BOTH sign-off states and is body copy', () => {
   for (const convo of [[], SIGNED_TEAM_THREAD]) {
     const p = prompt('sms', { fromNumber: TEAM_LINE }, convo);
-    assert.ok(/give the name Mark, AND tell them plainly that this is a shared team number/.test(p),
+    assert.ok(/give the name the Reece Team, AND tell them plainly that this is a shared team number/.test(p),
       'asking who you are must be answerable even when we are not signing');
     assert.ok(/Answer that in the BODY of the message; it is not a sign-off/.test(p));
   }
 });
 
-test('direct line: asked-for-name answer is body copy and carries no shared-line claim', () => {
-  const p = prompt('sms', { fromNumber: MARK_LINE }, SIGNED_THREAD);
-  assert.ok(/the answer is Mark — say it in the BODY/.test(p));
-  assert.ok(/Do not describe this as a shared or team number/.test(p));
+test("Mark's line: asked who it is, the answer is the Reece Team, never Mark", () => {
+  const p = prompt('sms', { fromNumber: MARK_LINE }, SIGNED_TEAM_THREAD);
+  assert.ok(/give the name the Reece Team/.test(p));
+  assert.ok(!/the answer is Mark/.test(p));
+  assert.ok(!/Mark is the ONLY name you may sign/.test(p), 'the SMS prompt names no person as the author');
 });
 
 test('the caveat is still answer-only, never volunteered', () => {
@@ -260,7 +261,7 @@ test('a missing number still produces the team block, never a named signature', 
 
 test('no name other than the resolved one may ever be signed', () => {
   const p = prompt('sms', { fromNumber: MARK_LINE });
-  assert.ok(/Never sign with any name other than "Mark"/.test(p));
+  assert.ok(/Never sign with any name other than "Reece Team"/.test(p));
 });
 
 test('body voice is explicitly left alone', () => {

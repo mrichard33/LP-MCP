@@ -260,6 +260,14 @@ stop it: the reply and the holding line share one `newTurnClaim()`, a second dra
 Live chat writes GHL fields through `src/live-chat/identity-capture.js` — the SMS path's fill-if-empty
 `promoteIdentityToGHL`, never an overwrite, never onto a merged-away contact.
 
+**Both bots are "the Reece Team" and promise same-day calls only in team hours (Mark, 2026-10-02).** No
+text or chat reply gives a personal name, on Mark's number too (`resolveSmsSenderIdentity` signs "— Reece Team"; only
+the rehash rep's line keeps a name, and emails keep their sender). Randy's FATHER founded Reece in 1972; Randy did
+not. `enforceTeamVoice` (`src/agentic/team-voice.js`) corrects both after the model, and `enforceCallTiming`
+(`src/agentic/team-hours.js`) turns a promised call "today" / "right now" / "in the next few minutes" into the next
+opening outside 9–8 weekdays, 9–5 Saturday, 9–3 Sunday (ET). The planner's hand-off and callback lines use the same
+hours (`nowMs`). Look for `[TeamVoice]` log lines.
+
 **Static system prompts are cached** (`callLLM({ cacheSystem: true })`: reply writer, analyzer, live chat).
 Only for a system prompt that is byte-identical across calls — a varying one pays the write premium every
 time. Look for `[LLMClient:<fn>] cache read=` lines. `LIVE_CHAT_SHADOW_MODEL` runs a second model beside the
