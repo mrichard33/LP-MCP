@@ -140,3 +140,23 @@ test('parseSlots: the 4h floor applies BEFORE the 12-slot cap (dense quick-call 
   assert.equal(sel.window, 'standard_48h');
   assert.equal(sel.slots.length, 2);
 });
+
+test('spread: a dense calendar offers two times 3+ hours apart, a sparse one is unchanged', async () => {
+  const { spreadOffer } = await import('../src/knowledge/calendar-availability.js');
+  // Every 15 minutes for 3 days: the parse keeps one per hour.
+  const iso = Array.from({ length: 288 }, (_, i) => new Date(Date.now() + (i + 1) * 15 * 60_000).toISOString());
+  const av = parseSlots({ day: { slots: iso } }, 'cal', TZ, 12);
+  const gaps = av.slots.slice(1).map((s, i) => new Date(s.iso) - new Date(av.slots[i].iso));
+  assert.ok(gaps.every((g) => g >= HOUR), 'no two parsed slots inside the same hour');
+  const sel = selectOfferableSlots(av, null);
+  assert.equal(sel.slots.length, 2);
+  assert.ok(new Date(sel.slots[1].iso) - new Date(sel.slots[0].iso) >= 3 * HOUR);
+  // Sparse (10 AM, 2 PM): already a real choice, kept as is.
+  const sparse = [slotAt(20), slotAt(24), slotAt(44)];
+  assert.deepEqual(spreadOffer(sparse, 2), [sparse[0], sparse[1]]);
+  // Nothing 3h later: the next one.
+  const tight = [slotAt(20), slotAt(21)];
+  assert.deepEqual(spreadOffer([...tight, slotAt(22)], 2).length, 2);
+  // Any other cap is untouched.
+  assert.equal(spreadOffer(sparse, 50).length, 3);
+});

@@ -54,6 +54,21 @@ const ESCALATION_LADDER = (process.env.BOOKING_ESCALATION_LADDER || '48,72,96,16
 // Cap on how many slots the bot puts in front of the lead, matching the
 // current outbound copy ("two openings").
 const MAX_OFFER_SLOTS = 2;
+// 2026-10-02 (Mark): two times half an hour apart are not a real choice. The
+// parse keeps at most one slot per hour, and the second offered time is the
+// first one at least 3 hours after the first (else the next one).
+const SLOT_SPACING_MS = 60 * 60_000;
+const OFFER_GAP_MS = 3 * 3600_000;
+
+/** The two times to offer: the earliest, and the first one 3+ hours later. Pure. */
+export function spreadOffer(slots, maxOffer = MAX_OFFER_SLOTS) {
+  const list = Array.isArray(slots) ? slots : [];
+  if (maxOffer !== 2 || list.length <= 2) return list.slice(0, maxOffer);
+  const t = (s) => new Date(s.iso).getTime();
+  const first = list[0];
+  const second = list.find((s) => t(s) - t(first) >= OFFER_GAP_MS) || list[1];
+  return [first, second];
+}
 
 /**
  * Fetch available booking slots for a GHL calendar.
@@ -166,7 +181,17 @@ export function parseSlots(data, calendarId, timezone, maxSlots, minNoticeHours)
   });
   future.sort((a, b) => new Date(a).getTime() - new Date(b).getTime());
 
-  const slots = future.slice(0, maxSlots).map(iso => formatSlot(iso, timezone));
+  // 2026-10-02 (Mark): on a calendar with a slot every 15 minutes the first 12
+  // covered one afternoon, and the text bot offered "3:45 PM or 4:15 PM". At
+  // most one slot per hour keeps the 12 spread across the next day or two.
+  const spaced = [];
+  for (const iso of future) {
+    const t = new Date(iso).getTime();
+    if (spaced.length && t - new Date(spaced[spaced.length - 1]).getTime() < SLOT_SPACING_MS) continue;
+    spaced.push(iso);
+    if (spaced.length >= maxSlots) break;
+  }
+  const slots = spaced.map(iso => formatSlot(iso, timezone));
   return {
     slots,
     calendar_id: calendarId,
@@ -296,12 +321,12 @@ export function selectOfferableSlots(availability, preferred, opts = {}) {
     .sort((a, b) => ms(a) - ms(b));
 
   const pack = (slots, window, extra = {}) => ({
-    slots: slots.slice(0, maxOffer),
+    slots: spreadOffer(slots, maxOffer),
     window,
     escalated_to_hours: null,
     preferred_honored: false,
     availability: {
-      slots: slots.slice(0, maxOffer),
+      slots: spreadOffer(slots, maxOffer),
       calendar_id: availability.calendar_id,
       timezone: tz,
       slots_total_count: slots.length,
