@@ -21,7 +21,9 @@ const { renderPlanBlock } = await import('../src/prompts/response-generator/nepq
 
 const SLOTS = [{ iso: '2026-10-06T14:00:00Z', day: 'Tue, Oct 6', time: '10:00 AM' }, { iso: '2026-10-07T18:00:00Z', day: 'Wed, Oct 7', time: '2:00 PM' }];
 const T = (...pairs) => pairs.map(([d, t]) => ({ direction: d, text: t }));
-const plan = (a) => planNepqTurn({ channel: 'sms', ...a });
+// A Monday at 11 AM ET: the team is in, so hand-offs read as daytime lines.
+const OPEN_MS = Date.parse('2026-10-05T15:00:00Z');
+const plan = (a) => planNepqTurn({ channel: 'sms', nowMs: OPEN_MS, ...a });
 
 test('mode switch: off unless shadow or live', () => {
   assert.equal(nepqBackboneMode({}), 'off');
@@ -95,10 +97,10 @@ test('booking sequence: neither → day ask; a pick → confirm; yes to the brid
 
 test('discovery is short: after the cap the bridge is required', () => {
   const thread = T(['inbound', 'they are drafty'], ['outbound', 'Drafty? Which rooms?'], ['inbound', 'kitchen'], ['outbound', 'How long has that been going on?']);
-  const p = planNepqTurn({ channel: 'livechat', trigger: 'about 10 years', conversation: thread });
+  const p = planNepqTurn({ nowMs: OPEN_MS, channel: 'livechat', trigger: 'about 10 years', conversation: thread });
   assert.equal(p.required_move, 'bridge');
   assert.equal(p.echo.word, 'drafty');
-  const early = planNepqTurn({ channel: 'livechat', trigger: 'they are drafty', conversation: [] });
+  const early = planNepqTurn({ nowMs: OPEN_MS, channel: 'livechat', trigger: 'they are drafty', conversation: [] });
   assert.equal(early.required_move, 'probe');
   assert.equal(early.booking.allowed, false);
 });
@@ -133,7 +135,7 @@ test('guard: fixed moves ship their line and keep the sign-off', () => {
 });
 
 test('guard: one question, no unallowed booking ask, no "see you then", no fake urgency', () => {
-  const p = planNepqTurn({ channel: 'livechat', trigger: 'they are drafty', conversation: [] });
+  const p = planNepqTurn({ nowMs: OPEN_MS, channel: 'livechat', trigger: 'they are drafty', conversation: [] });
   const r = enforceNepqPlan('Drafts are no fun. Spots are filling fast. Would Tuesday at 10 work for a visit? How long has it been drafty?', p);
   assert.equal(r.text, 'Drafts are no fun. How long has it been drafty?');
   const c = enforceNepqPlan("You're all set for Tuesday. See you then.", { ...p, booking: { allowed: true } });
@@ -142,7 +144,7 @@ test('guard: one question, no unallowed booking ask, no "see you then", no fake 
 
 test('guard: a skipped bridge is written in their words', () => {
   const thread = T(['inbound', 'they are drafty'], ['outbound', 'Drafty? Which rooms?'], ['inbound', 'kitchen'], ['outbound', 'How long has that been going on?']);
-  const p = planNepqTurn({ channel: 'livechat', trigger: 'about 10 years', conversation: thread });
+  const p = planNepqTurn({ nowMs: OPEN_MS, channel: 'livechat', trigger: 'about 10 years', conversation: thread });
   assert.match(enforceNepqPlan('Ten years is a long time. What made you start looking now?', p).text, /^Based on what you told me, this could work for you, since you mentioned the drafts\. The next step would be a visit at your home\. Would that help\?$/);
 });
 
@@ -186,7 +188,7 @@ test('SMS prompt: the plan block renders last (before the output contract) only 
 });
 
 test('guard: never asks for a name, phone, email or zip we already have', () => {
-  const p = planNepqTurn({ channel: 'livechat', trigger: 'they are drafty', conversation: [] });
+  const p = planNepqTurn({ nowMs: OPEN_MS, channel: 'livechat', trigger: 'they are drafty', conversation: [] });
   const r = enforceNepqPlan("Drafts are no fun. What's your first name?", p, { known: { name: true } });
   assert.equal(r.text, 'Drafts are no fun.');
   assert.ok(r.changes.includes('reask_known'));
@@ -197,7 +199,7 @@ test('guard: never asks for a name, phone, email or zip we already have', () => 
 
 test('echo: the most specific problem wins and the bridge names it as a phrase', () => {
   const thread = T(['inbound', 'My windows are old and drafty'], ['outbound', 'How long has that been going on?'], ['inbound', 'Mostly the kitchen'], ['outbound', 'What happens if you wait on it?']);
-  const p = planNepqTurn({ channel: 'livechat', trigger: 'About 10 years', conversation: thread });
+  const p = planNepqTurn({ nowMs: OPEN_MS, channel: 'livechat', trigger: 'About 10 years', conversation: thread });
   assert.equal(p.echo.word, 'drafty');
   assert.equal(p.echo.phrase, 'the drafts');
   assert.match(enforceNepqPlan('Ten years is a while.', p).text, /since you mentioned the drafts\./);
@@ -237,13 +239,13 @@ test('financing: the yes survives the figure strip', () => {
 });
 
 test('a typed day and time with no offer → two real times; with a question, the answer first', () => {
-  const p = planNepqTurn({ channel: 'livechat', trigger: 'tomorrow evening 6 pm', conversation: [], slots: SLOTS, tzLabel: 'ET' });
+  const p = planNepqTurn({ nowMs: OPEN_MS, channel: 'livechat', trigger: 'tomorrow evening 6 pm', conversation: [], slots: SLOTS, tzLabel: 'ET' });
   assert.equal(p.fixed_line, LINES.offer_slots(p.slots_to_offer));
-  const q = planNepqTurn({ channel: 'livechat', trigger: "actually, what's the warranty?", conversation: T(['inbound', 'tomorrow evening 6 pm']), slots: SLOTS, tzLabel: 'ET' });
+  const q = planNepqTurn({ nowMs: OPEN_MS, channel: 'livechat', trigger: "actually, what's the warranty?", conversation: T(['inbound', 'tomorrow evening 6 pm']), slots: SLOTS, tzLabel: 'ET' });
   assert.equal(q.required_move, 'offer_slots');
   assert.equal(q.fixed_line, null);
   assert.equal(enforceNepqPlan('It covers parts and labor for life. What got you looking?', q).text, `It covers parts and labor for life. ${q.offer_line}`);
-  assert.equal(planNepqTurn({ channel: 'livechat', trigger: 'how about saturday morning', conversation: [] }).booking.allowed, true);
+  assert.equal(planNepqTurn({ nowMs: OPEN_MS, channel: 'livechat', trigger: 'how about saturday morning', conversation: [] }).booking.allowed, true);
 });
 
 test('claims nobody approved are stripped', () => {
@@ -256,10 +258,10 @@ test('claims nobody approved are stripped', () => {
 
 test('spouse turn 2: the answer to "how does your spouse feel" gets the both-home time, whoever it names', () => {
   const thread = T(['inbound', "I'm interested but I need to talk to my wife first"], ['outbound', LINES.spouse_1]);
-  const p = planNepqTurn({ channel: 'livechat', trigger: 'She has to see it before we decide', conversation: thread, slots: SLOTS, tzLabel: 'ET' });
+  const p = planNepqTurn({ nowMs: OPEN_MS, channel: 'livechat', trigger: 'She has to see it before we decide', conversation: thread, slots: SLOTS, tzLabel: 'ET' });
   assert.equal(p.objection?.type, 'spouse');
   assert.match(p.fixed_line, /both home\? I have Tue, Oct 6/);
-  assert.equal(planNepqTurn({ channel: 'livechat', trigger: 'she wants to know the price first, how much?', conversation: thread }).objection?.type, 'price');
+  assert.equal(planNepqTurn({ nowMs: OPEN_MS, channel: 'livechat', trigger: 'she wants to know the price first, how much?', conversation: thread }).objection?.type, 'price');
 });
 
 // ── 2026-10-02 live chat (Guest Visitor ymnwp) ──
@@ -276,7 +278,7 @@ test('a visitor back after a day starts a new visit: "hello" is not bridged on y
     { direction: 'inbound', text: '32137', timestamp: at(day1, 7) },
     { direction: 'inbound', text: 'hello', timestamp: '2026-10-02T12:11:54Z' },
   ];
-  const p = planNepqTurn({ channel: 'livechat', trigger: 'hello', conversation: thread });
+  const p = planNepqTurn({ nowMs: OPEN_MS, channel: 'livechat', trigger: 'hello', conversation: thread });
   assert.notEqual(p.required_move, 'bridge');
   assert.equal(p.counters.discovery_questions_asked, 0);
   assert.equal(p.step, 'open');

@@ -26,6 +26,7 @@
 
 import { isNotInterested } from './not-interested.js';
 import { isLeadQuestion, findBookingAsks } from './discovery-discipline.js';
+import { isTeamOpen, nextTeamOpenLabel, requestedCallTime } from './team-hours.js';
 
 export const NEPQ_PLANNER_VERSION = '1.0';
 
@@ -146,6 +147,14 @@ export const LINES = Object.freeze({
     two_nos: "No problem, I'll stop here. Someone from our team will check in with you directly.",
     repeat_objection: "Understood. I'll have someone from our team call you so you get a straight answer.",
   },
+  // 2026-10-02 (Mark): "right now" only while the team is in (team-hours.js).
+  // After hours the same hand-off names when someone will call.
+  handoff_closed: {
+    complaint: (when) => `I'm sorry about that. I've passed this to our team, and someone will call you ${when}.`,
+    emergency: (when) => `That's urgent. I've flagged it for our team, and someone will call you ${when}.`,
+    service: (when) => `Sorry about that. I've passed this to our service team, and someone will call you ${when}.`,
+  },
+  callback_outside_hours: (when) => `Got it. That's outside our team's hours, so I'll have someone call you ${when}.`,
 });
 
 function slotPair(slots = []) {
@@ -305,7 +314,7 @@ export function problemEcho(inbound = []) {
  */
 export function planNepqTurn({
   channel = 'sms', trigger = '', conversation = [], slots = [], tzLabel = '', firstName = null,
-  hasAppointment = false, nextStepLabel = 'a visit at your home', discipline = null,
+  hasAppointment = false, nextStepLabel = 'a visit at your home', discipline = null, nowMs = Date.now(),
 } = {}) {
   const turns = normalizeThread(conversation, trigger);
   const inbound = turns.filter(t => t.direction === 'inbound');
@@ -375,7 +384,9 @@ export function planNepqTurn({
   };
   plan.echo.phrase = problemPhrase(echoWord);
   const fixed = (move, line, extra = {}) => Object.assign(plan, { required_move: move, fixed_line: line }, extra);
-  const handoff = (reason) => fixed('handoff', LINES.handoff[reason], { step: 'handoff', handoff: { reason, line: LINES.handoff[reason] }, booking: { allowed: false, reason: `nepq:handoff_${reason}` } });
+  const teamOpen = isTeamOpen(nowMs);
+  const handoffLine = (reason) => (!teamOpen && LINES.handoff_closed[reason]) ? LINES.handoff_closed[reason](nextTeamOpenLabel(nowMs)) : LINES.handoff[reason];
+  const handoff = (reason) => { const line = handoffLine(reason); return fixed('handoff', line, { step: 'handoff', handoff: { reason, line }, booking: { allowed: false, reason: `nepq:handoff_${reason}` } }); };
   const withSlots = (line) => { plan.slots_to_offer = offerSlots; plan.allowed.slot_offer = true; plan.booking = { allowed: true, reason: 'nepq:slot_offer' }; return line; };
 
   // 1. A person takes over: complaint, price insisted after the play, two no's.
@@ -383,7 +394,13 @@ export function planNepqTurn({
   if (SERVICE_RX.test(now)) return handoff('service');
   if (COMPLAINT_RX.test(now)) return handoff('complaint');
   if (CALLBACK_RX.test(now) && !isNotInterested(now)) {
-    const line = LINES.callback(callbackWhen(now));
+    // A call asked for outside team hours gets the next opening instead, and
+    // after hours "call me back" names when (2026-10-02, Mark).
+    const asked = requestedCallTime(now, nowMs);
+    let line;
+    if (asked && !asked.ok && !asked.past) line = LINES.callback_outside_hours(nextTeamOpenLabel(nowMs, { fromDow: asked.dow, fromHour: asked.hour, dayOffset: asked.dayOffset }));
+    else if (asked?.ok) line = LINES.callback(callbackWhen(now));
+    else line = LINES.callback(teamOpen ? (asked ? null : callbackWhen(now)) : nextTeamOpenLabel(nowMs));
     return fixed('handoff', line, { step: 'handoff', handoff: { reason: 'callback_request', line }, booking: { allowed: false, reason: 'nepq:callback_request' } });
   }
   if (objType === 'price' && priceLines >= 2) return handoff('price_insist');

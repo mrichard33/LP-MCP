@@ -13,7 +13,7 @@
 // The words the brand does not use for its own product.
 // Was response-generator.js:607-610.
 export const BRAND_LANGUAGE_RULE = `═══════ BRAND-LANGUAGE RULE ═══════
-Founded in North Carolina in 1972. Florida operations since 2005. NEVER conflate "founded 1972" with Florida.
+Founded in North Carolina in 1972 by Randy's father. Florida operations since 2005. NEVER conflate "founded 1972" with Florida, and NEVER say Randy founded Reece (2026-10-02, Mark).
 Approved (the only line): "Family-owned since 1972, serving Florida since 2005."
 
 `;
