@@ -23,22 +23,30 @@
  * announced from here, through the same completeAnnouncement() the GHL path
  * uses (same message, rankings, threads, market channel).
  *
- * WHY 30 MINUTES OF GRACE
+ * WHY 10 MINUTES OF GRACE
  * -----------------------
  * When the GHL path works it is fast: Bugbee's sale (09-25) was seen by our
- * sync at 18:49:05 and announced at 18:49:42. Waiting 30 minutes means the
- * backstop never races a healthy GHL path — it only speaks when GHL has
+ * sync at 18:49:05 and announced at 18:49:42. Waiting 10 minutes means the
+ * backstop does not race a healthy GHL path — it only speaks when GHL has
  * clearly not. The idempotency key is the same one the endpoint builds for a
  * lead_id sale (lp_lead_id + rounded amount), so a GHL call that arrives even
  * later is a replay, not a second Slack post. (GroupMe is posted by GHL's own
  * steps, which we cannot dedupe; that late double is the accepted cost.)
  *
+ * 2026-10-02: cut from 30 to 10 minutes. The GHL path has announced 0-1 sales
+ * a day since 09-24, so the 30-minute wait was pure delay on nearly every sale.
+ *
  * STALE SALES GO IN ONE DIGEST, NOT N CELEBRATIONS
  * ------------------------------------------------
  * A sale first seen more than STALE_MS ago is not "just closed", and a burst of
  * fifteen day-old celebrations reads as a malfunction. Those are claimed and
- * posted together as one catch-up message. That is also how the 09-24/25 gap
- * is cleared on the first pass after deploy — no manual repost.
+ * posted together as one catch-up message.
+ *
+ * Staleness is age only. Until 2026-10-02 anything seen before the process
+ * started also counted as backlog, so every deploy during selling hours sent
+ * minutes-old sales out as "didn't reach the board" (Sean Griffin, 579245:
+ * seen 01:59Z, server restarted ~02:25Z, posted as a digest 35 minutes after
+ * the sale). A restart is not a reason to call a fresh sale missed.
  *
  * ONLY A REAL TRANSITION INTO SALE, ON A RECENT APPOINTMENT
  * --------------------------------------------------------
@@ -71,20 +79,12 @@ import {
   isUsableRepName,
 } from './sale-announcement.js';
 
-export const GRACE_MS = 30 * 60 * 1000;
+export const GRACE_MS = 10 * 60 * 1000;
 export const STALE_MS = 6 * 60 * 60 * 1000;
 export const LOOKBACK_MS = 48 * 60 * 60 * 1000;
 export const EVENT_ROW_LIMIT = 1000;
 /** A sale whose appointment is older than this is not today's news. */
 export const RECENT_APPT_MS = 7 * 24 * 60 * 60 * 1000;
-
-/**
- * When this process started. Anything already waiting at startup is a backlog,
- * not a sale that just closed, so it goes in the one catch-up digest rather
- * than N back-to-back celebrations (the first deploy clears the 09-23..25 gap
- * as a single message, as requested).
- */
-const PROCESS_STARTED_AT = Date.now();
 
 export function backstopEnabled() {
   return String(process.env.SALE_ANNOUNCE_BACKSTOP_ENABLED || 'true').toLowerCase() !== 'false';
@@ -296,7 +296,6 @@ export async function runSaleBackstop(deps = {}) {
     logger = console,
     now = () => new Date(),
     staleMs = STALE_MS,
-    startedAt = PROCESS_STARTED_AT,
     find = findMissedSales,
     claim = claimAnnouncement,
     complete = completeAnnouncement,
@@ -319,10 +318,8 @@ export async function runSaleBackstop(deps = {}) {
   if (!missed.length) return { ok: true, missed: 0 };
 
   const at = new Date(now()).getTime();
-  const isStale = (s) => {
-    const seen = new Date(s.firstSeenAt).getTime();
-    return at - seen > staleMs || seen < startedAt;
-  };
+  // Age only — a server restart does not make a fresh sale "missed" (header).
+  const isStale = (s) => at - new Date(s.firstSeenAt).getTime() > staleMs;
   const fresh = missed.filter((s) => !isStale(s));
   const stale = missed.filter(isStale);
   logger.warn?.(
