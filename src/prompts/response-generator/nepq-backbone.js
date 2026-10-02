@@ -38,8 +38,10 @@ const MOVE_TEXT = {
     ? `This turn's move: answer their question in ONE sentence, then send exactly: "${p.offer_line}" Nothing after it.`
     : 'This turn\'s move: offer exactly two real times from CALENDAR AVAILABILITY and ask which works better. Never invent a time.'),
   // 2026-10-02 (Mark: ask first, then book). A time is held (booking-collect.js).
-  collect: (p) => `This turn's move: we are holding ${p.held_slot?.text || 'their picked time'} for them. If their reply gives the last missing detail (name, street address with zip, or who else is part of the decision), book it and confirm as: "Got it, [first name]. I have you down for [day] at [time]. A team member will reach out to confirm the details." Otherwise thank them in a few words and ask the ONE next missing item. Never offer new times unless they asked to change the time.`,
-  confirm: () => 'This turn\'s move: they picked a time. If you book it, confirm it as: "Got it, [first name]. I have you down for [day] at [time]. A team member will reach out to confirm the details." Nothing final: never "you\'re set", "confirmed", "locked in" or "see you then". Never name a rep.',
+  collect: (p) => `This turn's move: we are holding ${p.held_slot?.text || 'their picked time'} for them. If their reply gives the last missing detail (name, street address with zip, or who else is part of the decision), book it and confirm as: "You're all set for [day] at [time], [first name]. Our team will reach out to confirm the details." Otherwise thank them in a few words and ask the ONE next missing item. Never offer new times unless they asked to change the time.`,
+  // 2026-10-02 (Mark): "They tell the lead that they're all set and that our
+  // team will be reaching out to confirm the details."
+  confirm: () => 'This turn\'s move: they picked a time. Book it now (book_appointment) and confirm it as: "You\'re all set for [day] at [time], [first name]. Our team will reach out to confirm the details." Say "all set" only when you book it in this reply. Never "confirmed" or "see you then". Never name a rep.',
 };
 
 function cap(w) { return String(w || '').charAt(0).toUpperCase() + String(w || '').slice(1); }

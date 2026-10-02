@@ -164,8 +164,8 @@ test('gate: all present but decision_maker=false → BLOCKED, status new', () =>
     address_line1: '2885 S Oasis Dr', city: 'Boynton Beach', postal_code: '33435',
     decision_maker_confirmed: false,
   }));
-  assert.equal(gate.ok, false, 'an answered-No must not clear the way to a slot offer');
-  assert.deepEqual(gate.missing, ['decision_maker_unresolved']);
+  // 2026-10-02 (Mark): asked once, then book; an answered-No books as `new`.
+  assert.equal(gate.ok, true, gate.missing.join(','));
   assert.equal(gate.appointment_status, 'new');
 });
 
