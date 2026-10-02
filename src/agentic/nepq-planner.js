@@ -598,6 +598,16 @@ export function enforceNepqPlan(draft, plan, { allowFigures = false, known = {} 
   };
   // 2. No money, no pressure.
   if (!allowFigures) drop(s => MONEY_RX.test(s), 'money_figures');
+  // 2026-10-02 re-run: "Our calendar's tight right now, so the quickest way
+  // to grab a day is here: <link>" was the whole reply, so dropping it left
+  // nothing and the original shipped. Cut the pressure clause and keep the rest.
+  sentences = sentences.map(s => {
+    if (!URGENCY_RX.test(s)) return s;
+    const rest = s.replace(/^[^,;]*?,\s*(?:so\s+|and\s+)?/, '');
+    if (rest === s || URGENCY_RX.test(rest) || rest.split(/\s+/).length < 4) return s;
+    changes.push('fake_urgency');
+    return rest.charAt(0).toUpperCase() + rest.slice(1);
+  });
   drop(s => URGENCY_RX.test(s), 'fake_urgency');
   drop(s => CLAIMS_RX.test(s), 'unapproved_claim');
   // 2b. "Do you offer financing?" keeps its yes when the figure strip took the

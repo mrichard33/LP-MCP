@@ -28,6 +28,7 @@ process.env.BOOKING_ESCALATION_LADDER = '48,72,96,168';
 const {
   selectOfferableSlots,
   buildOfferWindowPrompt,
+  parseSlots,
 } = await import('../src/knowledge/calendar-availability.js');
 
 const TZ = 'America/New_York';
@@ -127,4 +128,15 @@ test('offer-window prompt copy per window', () => {
   );
   assert.equal(buildOfferWindowPrompt({ window: 'none' }), null);
   assert.equal(buildOfferWindowPrompt(null), null);
+});
+
+test('parseSlots: the 4h floor applies BEFORE the 12-slot cap (dense quick-call calendar)', () => {
+  // A slot every 15 minutes for 3 days: the first 16 are inside the floor.
+  const iso = Array.from({ length: 288 }, (_, i) => new Date(Date.now() + (i + 1) * 15 * 60_000).toISOString());
+  const av = parseSlots({ day: { slots: iso } }, 'cal', TZ, 12);
+  assert.equal(av.slots.length, 12);
+  assert.ok(new Date(av.slots[0].iso).getTime() >= Date.now() + 4 * HOUR - 1000);
+  const sel = selectOfferableSlots(av, null);
+  assert.equal(sel.window, 'standard_48h');
+  assert.equal(sel.slots.length, 2);
 });

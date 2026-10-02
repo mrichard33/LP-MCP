@@ -110,7 +110,7 @@ export async function fetchFreeSlots(calendarId, opts = {}) {
     }
 
     const data = await res.json();
-    return parseSlots(data, calendarId, tz, maxSlots);
+    return parseSlots(data, calendarId, tz, maxSlots, opts.minNoticeHours);
   } catch (err) {
     console.warn('[CalAvail] ' + calendarId + ' threw: ' + err.message);
     return null;
@@ -130,7 +130,7 @@ export async function fetchFreeSlots(calendarId, opts = {}) {
  *
  * Defensive against alternate shapes (slots as bare array, missing keys).
  */
-function parseSlots(data, calendarId, timezone, maxSlots) {
+export function parseSlots(data, calendarId, timezone, maxSlots, minNoticeHours) {
   if (!data || typeof data !== 'object') return null;
 
   const allIso = [];
@@ -152,10 +152,17 @@ function parseSlots(data, calendarId, timezone, maxSlots) {
   }
 
   // Defense-in-depth: filter past slots even though GHL should already do this.
+  // 2026-10-02 funnel audit: also drop slots inside the minimum-notice floor
+  // BEFORE the cap. The quick-call calendar (PPR) has a slot every few
+  // minutes, so its first 12 all fell inside the next 4 hours; the offer
+  // window then floored them all away and logged "window=none" on every SMS
+  // turn. The text bot sent the booking link instead of two real times.
   const now = Date.now();
+  const notice = Number.isFinite(minNoticeHours) ? minNoticeHours : MIN_NOTICE_HOURS;
+  const floorMs = now + notice * 3600_000;
   const future = allIso.filter(iso => {
     const t = new Date(iso).getTime();
-    return Number.isFinite(t) && t > now;
+    return Number.isFinite(t) && t >= floorMs;
   });
   future.sort((a, b) => new Date(a).getTime() - new Date(b).getTime());
 
