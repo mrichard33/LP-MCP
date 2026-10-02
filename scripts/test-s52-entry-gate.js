@@ -513,6 +513,41 @@ test('cleanup run (report): flags without writing; a failed read is skipped, nev
   assert.equal(s.gaby.action, 'none');
 });
 
+// 2026-10-02 — Railway redeploys killed three apply runs inside F.0. A re-run
+// skips contacts already removed (or checked ok) in the same mode, and `groups`
+// runs only the groups asked for.
+test('cleanup run (apply): resumes past contacts already removed, and runs only the groups asked for', async () => {
+  const writes = [];
+  const deps = {
+    __noDefaults: true,
+    nowMs: NOW,
+    sleep: async () => {},
+    supabase: fakeDb({
+      contact_objection_states: [],
+      lp_leads: [{ ...row('1', 'Sale', '2026-09-20T14:00:00+00:00', '2026-09-10T10:00:00+00:00', { closed_won: true }), ghl_contact_id: 'f-done', lp_deleted_at: null },
+        { ...row('2', 'CXL', '2026-09-20T14:00:00+00:00', '2026-09-10T10:00:00+00:00'), ghl_contact_id: 'f-todo', lp_deleted_at: null }],
+      system_events: [{ event_type: 'cleanup.2026-10-02', event_subtype: 'f0', ghl_contact_id: 'f-done', created_at: new Date(NOW - 3_600_000).toISOString(),
+        payload: { mode: 'apply', action: 'removed' } }],
+    }),
+    hlRunSQL: async (sql) => (sql.includes("'active-f.0'") ? [{ ghl_contact_id: 'f-done' }, { ghl_contact_id: 'f-todo' }] : [{ ghl_contact_id: 's-x' }]),
+    ghlFetch: async (method, path) => {
+      if (method !== 'GET') { writes.push([method, path]); return {}; }
+      return { contact: { tags: ['active-f.0'], phone: '' } };
+    },
+    getCustomers3: async () => [],
+    getProspectByCstId: async () => [],
+    emitEvent: async () => ({}),
+    applyTagsToSnapshot: async () => {},
+    fetch: async () => { throw new Error('gaby not selected'); },
+  };
+  const s = await cleanup.runCleanup({ mode: 'apply', groups: ['f0'], deps });
+  assert.equal(s.resumed_skipped.f0, 1, 'the contact removed by the killed run is skipped');
+  assert.equal(s.f0.removed, 1);
+  assert.ok(writes.every(([, path]) => path.includes('f-todo')), 'only the remaining contact is touched');
+  assert.equal(s.s52.candidates, 0, 's52 not selected');
+  assert.equal(s.gaby.action, 'not_run');
+});
+
 // ── SI-3: confirm the snapshot with GHL before rejecting (Gaby, action 535417) ──
 
 test('SI-3: snapshot says active-f.0 but GHL live does not → passes and fixes the snapshot', async () => {
