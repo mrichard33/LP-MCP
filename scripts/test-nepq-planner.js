@@ -364,3 +364,21 @@ test('break test: a typo in an email or phone is flagged, not accepted', async (
   assert.equal(looksLikeShortPhone('call me at 813-555-0142'), false);
   assert.match(contactTypoHint('email is john@gmail'), /Never say you have it on file/);
 });
+
+test('funnel audit: "first", a pick after one more line, and "sure" to two times', () => {
+  const offer = LINES.offer_slots(SLOTS);
+  assert.equal(plan({ trigger: 'first', conversation: T(['outbound', offer]), slots: SLOTS }).required_move, 'confirm');
+  assert.equal(plan({ trigger: 'the 2nd one please', conversation: T(['outbound', offer]), slots: SLOTS }).required_move, 'confirm');
+  const p = plan({ trigger: 'tuesday works', conversation: T(['outbound', offer], ['inbound', 'is it free?'], ['outbound', 'Yes, the visit is free.']), slots: SLOTS });
+  assert.equal(p.required_move, 'confirm');
+  assert.equal(p.last_offer, offer);
+  assert.equal(plan({ trigger: 'Sure', conversation: T(['outbound', offer]), slots: SLOTS }).fixed_line, LINES.which(SLOTS));
+});
+
+test('funnel audit: invented scarcity and a re-worded consequence question are caught', () => {
+  const p = plan({ trigger: 'they are drafty' });
+  assert.ok(enforceNepqPlan("Our calendar's tight right now. What got you looking?", p).changes.includes('fake_urgency'));
+  assert.ok(enforceNepqPlan('Calls are booking up fast. What got you looking?', p).changes.includes('fake_urgency'));
+  const asked = T(['outbound', 'What happens if another storm hits before they are fixed?'], ['inbound', 'more leaks i guess'], ['outbound', "That's a lot. What's another year of that worth to you?"], ['inbound', 'not much']);
+  assert.notEqual(plan({ trigger: 'not much', conversation: asked }).required_move, 'consequence');
+});

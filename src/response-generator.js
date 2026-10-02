@@ -920,6 +920,13 @@ function extractActiveEntryTag(context) {
   return tags.find(t => typeof t === 'string' && t.startsWith('active-entry:')) || null;
 }
 
+/** Our last message was the bridge or two times: this turn books. Pure. */
+function nepqBookingTurn(conversation = []) {
+  const lastOut = [...(conversation || [])].reverse().find(m => String(m?.direction || '').toLowerCase() === 'outbound');
+  const t = String(lastOut?.text ?? lastOut?.body ?? '');
+  return /\bbased\s+on\s+what\s+you\s+(?:told|said|mentioned)\b|\bthe\s+next\s+step\s+would\s+be\b/i.test(t) || /\bI\s+have\s+[^.?!]*\b\d{1,2}(?::\d{2})?\s*(?:AM|PM)\b[^.?!]*\bor\b/i.test(t);
+}
+
 function getCalendarIdFromKbPack(kbPack) {
   if (!kbPack || !kbPack.booking_context) return null;
   const bc = kbPack.booking_context;
@@ -3382,7 +3389,11 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   const nepqModeEarly = (opts.dryRun === true && opts.nepqModeOverride) ? opts.nepqModeOverride : nepqBackboneMode();
   const nepqWantsSlots = nepqModeEarly !== 'off' && channel === 'sms'
     // 2026-10-02 (Mark): a quote/price ask and "you just said that" offer two times too.
-    && (['think', 'price'].includes(nepqObjectionType(triggerMessage)) || NEPQ_TIME_REQUEST_RX.test(String(triggerMessage || '')) || NEPQ_REPEAT_COMPLAINT_RX.test(String(triggerMessage || '')));
+    && (['think', 'price'].includes(nepqObjectionType(triggerMessage)) || NEPQ_TIME_REQUEST_RX.test(String(triggerMessage || '')) || NEPQ_REPEAT_COMPLAINT_RX.test(String(triggerMessage || ''))
+      // 2026-10-02 funnel audit: "yes" to the bridge, and a pick after our two
+      // times, loaded no calendar on SMS, so the bot sent the self-booking link
+      // instead of two real times (0 of 12 journeys booked).
+      || nepqBookingTurn(context.conversation_recent));
   const calendarId = getCalendarIdFromKbPack(kbPack)
     || (nepqWantsSlots ? BOOKING_CALENDARS.PROTECTION_PROFILE_REVIEW : null);
   if (calendarId) {
