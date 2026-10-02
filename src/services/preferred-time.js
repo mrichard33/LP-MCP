@@ -164,6 +164,25 @@ function parseTimeExpr(text, todayCivil) {
     }
   }
 
+  // 1b. Relative day: "today", "tonight", "tomorrow" (2026-10-02: the
+  // simulator's "tomorrow evening 6 pm" parsed as time-only, no date).
+  let relativeEvening = false;
+  if (!date_iso) {
+    const rel = lower.match(/\b(today|tonight|tomorrow|tmrw|tmr)\b/i);
+    // "Can't do today" / "busy tomorrow" is not a preference.
+    const negated = rel && /\b(?:not|can'?t|cannot|won'?t|busy|no)\b[^.?!]{0,15}$/.test(lower.slice(0, rel.index));
+    if (rel && !negated) {
+      const word = rel[1].toLowerCase();
+      const add = (word === 'today' || word === 'tonight') ? 0 : 1;
+      date_iso = civilDatePlus(todayCivil, add);
+      weekday = weekdayOfIso(date_iso);
+      // The weekday, not "Tomorrow": the label is stored on the contact
+      // (Preferred Estimate Time) and read again on later days.
+      dayLabel = cap(weekday);
+      relativeEvening = word === 'tonight';
+    }
+  }
+
   // 2. Weekday: "monday", "next tues", "mon"
   if (!date_iso) {
     const wd = lower.match(/\b(next\s+)?(sunday|monday|tuesday|wednesday|thursday|friday|saturday|sun|mon|tues?|weds?|thur?s?|fri|sat)\b/i);
@@ -200,7 +219,7 @@ function parseTimeExpr(text, todayCivil) {
   const clock = parseClock(lower);
 
   // Time-of-day words contribute a rough window but no hh24.
-  const partOfDay = lower.match(/\b(morning|afternoon|evening|midday|noon)\b/i);
+  const partOfDay = lower.match(/\b(morning|afternoon|evening|midday|noon)\b/i) || (relativeEvening ? [null, 'evening'] : null);
 
   if (!date_iso && !clock && !partOfDay) return null;
 

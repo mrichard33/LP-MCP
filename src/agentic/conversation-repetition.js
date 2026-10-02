@@ -306,7 +306,9 @@ export function countQuestions(message) {
  * second NOUN is one ask offering two values ("morning or afternoon?") and
  * stays legal forever; banning it would make the bot stilted for no gain.
  */
-const SECOND_CLAUSE_RX = /\bor\s+(?:just\s+)?(?:is|are|was|were|am|would|will|can|could|should|shall|may|might|do|does|did|have|has|had|if|find|pick|grab|book|schedule|set|go|try|start|take|use|want|prefer|we|you|i)\b/i;
+const SECOND_CLAUSE_RX = /\bor\s+(?:just\s+)?(?:is|are|was|were|am|would|will|can|could|should|shall|may|might|do|does|did|have|has|had|if|find|pick|grab|book|schedule|set|go|try|start|take|use|want|prefer|we|you|i)\b|,\s*and\s+(?:is|are|was|were|do|does|did|have|has|what|how|which|where|when|who|why)\b/i;
+// 2026-10-02 simulation: "How long have they been like that, and is the
+// drafting mostly from certain windows…?" is two questions behind one mark.
 
 // 2026-09-26 — the ONE approved decision-maker question, "Is this your call,
 // or is anyone else weighing in on it?" (Mark's discovery-discipline ruling),

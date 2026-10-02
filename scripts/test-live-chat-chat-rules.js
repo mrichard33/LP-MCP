@@ -168,3 +168,9 @@ test('isFrustratedRepeat', () => {
   for (const t of ['I just told you they are old.', 'like I said, 12 windows', 'I already said that', 'you asked me that']) assert.equal(R.isFrustratedRepeat(t), true, t);
   for (const t of ['They are old.', 'I told my wife']) assert.equal(R.isFrustratedRepeat(t), false, t);
 });
+
+// 2026-10-02 simulation: ", and is …?" hung a second question on the first.
+test('cutSecondQuestion: ", and is …?" is cut back to one question', async () => {
+  const { cutSecondQuestion } = await import('../src/live-chat/chat-rules.js');
+  assert.equal(cutSecondQuestion('How long have they been like that, and is the drafting mostly from certain windows?'), 'How long have they been like that?');
+});

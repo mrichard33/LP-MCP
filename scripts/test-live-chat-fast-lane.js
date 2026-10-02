@@ -871,6 +871,29 @@ test('NEPQ live: a financing figure in the model\'s draft never reaches the visi
   assert.match(state.llmCalls[0].user, /NEPQ TURN PLAN/);
 });
 
+// ── 2026-10-02 simulation regressions ──
+
+test('a model reply never tells the visitor a visit is set when nothing was booked (Mark Test)', async () => {
+  const { lane, state } = nepqLane({ llm: () => ({ message: "Perfect. You're all set for a measurement visit at 16828 Crown Bridge Drive. Our team will call you before then to go over the details and finalize the time." }) });
+  await lane.processInbound(INBOUND('Yes, that would help'));
+  assert.ok(!/all set|booked|confirmed/i.test(state.sends[0].message), state.sends[0].message);
+  assert.match(state.sends[0].message, /team will call/i);
+  assert.match(state.llmCalls[0].system, /You cannot book from here/);
+});
+
+test('a question the model ended with a period gets its question mark back', async () => {
+  const { lane, state } = makeLane({ llm: () => ({ message: "Got it. What's giving you the most trouble with the windows right now." }) });
+  await lane.processInbound(INBOUND('my windows are drafty'));
+  assert.match(state.sends[0].message, /right now\?$/);
+});
+
+test('NEPQ live: a typed day and time with a question gets the answer, then two real times near it', async () => {
+  const { lane, state } = nepqLane({ messages: [M('inbound', 'tomorrow evening 6 pm', 0.2)], llm: () => ({ message: 'Our warranty covers parts and labor for life. What made you start looking?' }) });
+  await lane.processInbound(INBOUND("actually, what's the warranty?"));
+  assert.equal(state.slotReads, 1);
+  assert.equal(state.sends[0].message, 'Our warranty covers parts and labor for life. I have Tue, Oct 6 at 10:00 AM ET or Wed, Oct 7 at 2:00 PM ET. Which works better?');
+});
+
 test('shadow model: a stronger model runs beside, is recorded, and is never sent', async () => {
   const { lane, state } = makeLane({ extra: { shadowModelEnabled: () => true } });
   await lane.processInbound(INBOUND('my windows are drafty'));

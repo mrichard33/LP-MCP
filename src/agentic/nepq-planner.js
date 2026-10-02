@@ -58,11 +58,33 @@ const NEITHER_RX = /\b(?:neither|none\s+of\s+(?:those|them)|(?:those|that)\s+(?:
 const DAY_OR_TIME_RX = /\b(?:mon|tues?|wed(?:nes)?|thurs?|fri|sat(?:ur)?|sun)(?:day)?\b|\btomorrow\b|\btoday\b|\b\d{1,2}(?::\d{2})?\s*(?:am|pm|a\.m\.|p\.m\.)\b|\b(?:morning|afternoon|evening)\b|\bthe\s+(?:first|second|earlier|later)\s+one\b|\beither\b/i;
 
 // The problem in their words, for the echo and the bridge.
-const PROBLEM_RX = /\b(drafty|drafts?|fogg(?:y|ing)|fogged|condensation|moisture|leak(?:s|ing|y)?|noisy|noise|hot|heat|old|ugly|stuck|sticks?|sticking|broken|cracked|rott?(?:ed|ing)?|seals?|hurricanes?|storms?|insurance|electric\s+bill|energy\s+bills?|security|break-?ins?)\b/i;
+const PROBLEM_RX = /\b(drafty|drafts?|fogg(?:y|ing)|fogged|condensation|moisture|leak(?:s|ing|y)?|noisy|noise|hot|heat|old|ugly|stuck|sticks?|sticking|broken|cracked|rott?(?:ed|ing)?|seals?|hurricanes?|storms?|insurance|electric\s+bill|energy\s+bills?|security|break-?ins?)\b/gi;
+// 2026-10-02 simulation: "My windows are old and drafty" bridged as "since you
+// mentioned old". The most specific problem wins (old/ugly come last), and the
+// bridge names it as a phrase, never a bare adjective.
+const PROBLEM_PHRASES = [
+  [/^leak/, 'the leaks'], [/^condensation$/, 'the condensation'], [/^moisture$/, 'the moisture'], [/^fog/, 'the fogging'],
+  [/^draft/, 'the drafts'], [/^nois/, 'the noise'], [/^(?:hot|heat)$/, 'the heat'], [/bill/, 'the bills'],
+  [/^(?:hurricane|storm)/, 'storm protection'], [/^insurance$/, 'insurance'], [/^(?:security|break)/, 'security'],
+  [/^(?:stuck|stick)/, 'them sticking'], [/^broken$/, 'the broken ones'], [/^cracked$/, 'the cracks'], [/^rot/, 'the rot'], [/^seals?$/, 'the seals'],
+  [/^old$/, 'how old they are'], [/^ugly$/, 'how they look'],
+];
+function problemRank(word) {
+  const i = PROBLEM_PHRASES.findIndex(([rx]) => rx.test(word));
+  return i < 0 ? PROBLEM_PHRASES.length : i;
+}
+/** The bridge phrase for a problem word ("drafty" → "the drafts"), or null. Pure. */
+export function problemPhrase(word) {
+  const w = String(word || '').toLowerCase();
+  return PROBLEM_PHRASES.find(([rx]) => rx.test(w))?.[1] || null;
+}
 
 // ── what the bot already did (read from its own words) ───────────────────
 
-const CONSEQUENCE_RX = /\bwhat\s+happens\s+if\b|\bif\s+you\s+(?:wait|hold\s+off|put\s+(?:it|this)\s+off)\b|\banother\s+(?:hurricane\s+)?season\b|\bpush\s+(?:it|this)\s+(?:off|down\s+the\s+road)\b/i;
+// 2026-10-02 simulation: the model paraphrases the consequence question ("how's
+// that been sitting with you", "if those stay as is through this season"), and
+// the narrow pattern missed it, so it was asked twice. These count too.
+export const CONSEQUENCE_RX = /\bwhat\s+happens\s+if\b|\bif\s+you\s+(?:wait|hold\s+off|held\s+off|put\s+(?:it|this)\s+off)\b|\banother\s+(?:hurricane\s+)?season\b|\bpush\s+(?:it|this)\s+(?:off|down\s+the\s+road)\b|\bsitting\s+with\s+you\b|\bif\s+(?:those|they|it|that|this|nothing|things)\s+(?:stays?|changes?|keeps?|goes|go|gets?\s+worse)\b|\bthrough\s+(?:this|another|the)\s+(?:hurricane\s+|storm\s+)?season\b|\baffecting\s+you\b|\bwhat\s+would\s+(?:it|that)\s+mean\s+for\s+you\b/i;
 const BRIDGE_RX = /\bbased\s+on\s+what\s+you\s+(?:told|said|mentioned)\b|\bthis\s+could\s+work\s+for\s+you\b|\bthe\s+next\s+step\s+would\s+be\b/i;
 const STATUS_FRAME_RX = /\bpretty\s+simple\b|\bsee\s+what\s+you\s+have\s+now\b|\bif\s+it\s+might\s+be\s+a\s+fit\b/i;
 const REVEAL_RX = /\banything\s+you'?re\s+wondering\s+about\b|\bbefore\s+your\s+visit\b/i;
@@ -85,6 +107,7 @@ export const LINES = Object.freeze({
   ask_day: 'No problem. What day works best for you?',
   close: "Understood. Take care, and if anything changes, we're here.",
   offer_slots: (slots) => `I have ${slotPair(slots)}. Which works better?`,
+  financing_yes: 'Yes, we offer financing. The details depend on your home, and our team walks you through them.',
   reveal: "Before your visit, is there anything you're wondering about that I can pass along?",
   confirm: (slot, tz, name) => `You're set for ${slot.day} at ${slot.time}${tz ? ` ${tz}` : ''}${name ? `, ${name}` : ''}. Our team will call to go over the details.`,
   handoff: {
@@ -132,9 +155,32 @@ export function isNo(text, lastOutbound = '') {
   return BRIDGE_RX.test(lastOutbound) || SLOT_OFFER_RX.test(lastOutbound) || /\bwould\s+that\s+help\b|\bgrab\s+a\s+time\b|\bpick\s+a\s+time\b|\bvisit\b|\bset\s+(?:it|that|a\s+time)\s+up\b/i.test(lastOutbound) || /\bwhat\s+changed\b/i.test(lastOutbound);
 }
 
-/** The objection family in this text, or null. Pure. */
-export function objectionType(text) {
+// The shopping play's question. The reply to it names what they decide on
+// ("probably price and the warranty"): that is an answer, not a price ask
+// (2026-10-02 simulation: it fired the price play, and the next "price"
+// would have handed the lead to a person).
+const DECIDE_Q_RX = /\bhow\s+would\s+you\s+(?:then\s+)?decide\b/i;
+// Price named alongside other criteria is a list of what matters, not an ask.
+const CRITERIA_LIST_RX = /\b(?:price|pricing|cost)\b[^.?!]{0,30}\b(?:and|or|plus|&)\b[^.?!]{0,30}\b(?:warranty|quality|reviews?|service|install\w*|reputation|brand|company|timeline|product)\b|\b(?:warranty|quality|reviews?|service|install\w*|reputation|brand|company|timeline|product)\b[^.?!]{0,30}\b(?:and|or|plus|&)\b[^.?!]{0,30}\b(?:price|pricing|cost)\b/i;
+// A day AND a time of day the lead typed ("tomorrow evening 6 pm", "Saturday
+// morning"): a booking request even when we never offered times (2026-10-02
+// simulation: a live-chat visitor's "tomorrow evening 6 pm" was ignored).
+const DAY_WORD = String.raw`(?:today|tonight|tomorrow|tmrw|this\s+(?:weekend|week)|(?:mon|tues?|wed(?:nes)?|thur?s?|fri|sat(?:ur)?|sun)(?:day)?)`;
+const TIME_WORD = String.raw`(?:\d{1,2}(?::\d{2})?\s*(?:am|pm|a\.m\.|p\.m\.)|morning|afternoon|evening|night|noon)`;
+export const TIME_REQUEST_RX = new RegExp(String.raw`\b${DAY_WORD}\b[^.?!]{0,30}\b${TIME_WORD}|\b${TIME_WORD}\b[^.?!]{0,30}\b${DAY_WORD}\b|\btonight\b`, 'i');
+
+/** Did the lead answer the shopping play's "how would you decide?". Pure. */
+export function isCriteriaReply(text, lastOutbound = '') {
   const t = String(text || '');
+  // "Still comparing companies" after the play is the same objection again.
+  return DECIDE_Q_RX.test(String(lastOutbound || '')) && !SHOPPING_RX.test(t) && !INSIST_RX.test(t) && !/\bhow\s+much\b/i.test(t);
+}
+
+/** The objection family in this text, or null. Pure. */
+export function objectionType(text, lastOutbound = '') {
+  const t = String(text || '');
+  if (isCriteriaReply(t, lastOutbound)) return null;
+  if (CRITERIA_LIST_RX.test(t) && !INSIST_RX.test(t) && !/\bhow\s+much\b/i.test(t)) return null;
   // Shopping before price: "getting 3 quotes" is about deciding, not a price ask.
   if (SHOPPING_RX.test(t)) return 'shopping';
   if (isPriceAsk(t)) return 'price';
@@ -150,11 +196,11 @@ export function discoveryQuestions(outbound = []) {
     .filter(s => !findBookingAsks(s).length && !CONTACT_ASK_RX.test(s) && !DM_ASK_RX.test(s) && !SLOT_OFFER_RX.test(s) && !REVEAL_RX.test(s) && !STATUS_FRAME_RX.test(s));
 }
 
-/** The lead's problem word, newest first. Pure. */
+/** The lead's problem word: the newest message that names one, its most specific word. Pure. */
 export function problemEcho(inbound = []) {
   for (let i = inbound.length - 1; i >= 0; i--) {
-    const m = String(inbound[i].text || '').match(PROBLEM_RX);
-    if (m) return m[1].toLowerCase();
+    const words = [...String(inbound[i].text || '').matchAll(PROBLEM_RX)].map(m => m[1].toLowerCase());
+    if (words.length) return words.sort((a, b) => problemRank(a) - problemRank(b))[0];
   }
   return null;
 }
@@ -193,7 +239,10 @@ export function planNepqTurn({
     if (isNo(t.text, prevOut)) nos++;
     else break;
   }
-  const priceAsks = inbound.filter(m => objectionType(m.text) === 'price').length;
+  // Each inbound read against the bot message before it.
+  const prevOutOf = (i) => [...turns.slice(0, i)].reverse().find(x => x.direction === 'outbound')?.text || '';
+  const inboundTypes = turns.map((t, i) => (t.direction === 'inbound' ? objectionType(t.text, prevOutOf(i)) : undefined)).filter(x => x !== undefined);
+  const priceAsks = inboundTypes.filter(x => x === 'price').length;
   const pricePlayed = outbound.some(m => /every\s+home\s+is\s+different|any\s+number\s+i\s+gave/i.test(m.text));
   const counters = {
     nos_in_a_row: nos,
@@ -207,8 +256,12 @@ export function planNepqTurn({
   };
   const cap = channel === 'livechat' ? 2 : 3;
   const echoWord = problemEcho(inbound);
-  const objType = objectionType(now);
-  const attempt = objType ? inbound.filter(m => objectionType(m.text) === objType).length : 0;
+  const objType = objectionType(now, lastOut);
+  const attempt = objType ? inboundTypes.filter(x => x === objType).length : 0;
+  // Everything the lead sent since our last message (a live-chat burst).
+  const lastOutIdx = turns.map(t => t.direction).lastIndexOf('outbound');
+  const pending = turns.slice(lastOutIdx + 1).filter(t => t.direction === 'inbound').map(t => t.text);
+  const timeRequest = !SLOT_OFFER_RX.test(lastOut) ? (pending.find(t => TIME_REQUEST_RX.test(t)) || null) : null;
 
   const plan = {
     version: NEPQ_PLANNER_VERSION,
@@ -225,7 +278,13 @@ export function planNepqTurn({
     fixed_line: null,
     discovery_cap: cap,
     next_step_label: nextStepLabel,
+    // "Do you offer financing?" must still get its yes after the money strip.
+    financing_ask: FINANCING_ONLY_RX.test(now) && !isPriceAsk(now),
+    criteria_reply: isCriteriaReply(now, lastOut),
+    time_request: timeRequest,
+    answer_first: false,
   };
+  plan.echo.phrase = problemPhrase(echoWord);
   const fixed = (move, line, extra = {}) => Object.assign(plan, { required_move: move, fixed_line: line }, extra);
   const handoff = (reason) => fixed('handoff', LINES.handoff[reason], { step: 'handoff', handoff: { reason, line: LINES.handoff[reason] }, booking: { allowed: false, reason: `nepq:handoff_${reason}` } });
   const withSlots = (line) => { plan.slots_to_offer = offerSlots; plan.allowed.slot_offer = true; plan.booking = { allowed: true, reason: 'nepq:slot_offer' }; return line; };
@@ -269,6 +328,22 @@ export function planNepqTurn({
     // booking ask NEPQ wants here (the review found it stripped).
     const line = offerSlots.length === 2 ? withSlots(LINES.think_slots(offerSlots)) : LINES.think_no_slots;
     return fixed('objection_play', line, { objection: { type: 'think', attempt, line } });
+  }
+
+  // 4b. They typed a day and a time with no offer on the table: two real
+  // times near it. A question in the same burst is answered first.
+  if (timeRequest) {
+    const asked = isLeadQuestion(now) && !TIME_REQUEST_RX.test(now);
+    if (offerSlots.length === 2 && !asked) return fixed('offer_slots', withSlots(LINES.offer_slots(offerSlots)), { step: 'offer_slots' });
+    if (offerSlots.length === 2) {
+      withSlots(null);
+      return Object.assign(plan, { step: 'offer_slots', required_move: 'offer_slots', answer_first: true, offer_line: LINES.offer_slots(offerSlots) });
+    }
+    return Object.assign(plan, { step: 'offer_slots', required_move: asked ? 'answer' : 'offer_slots', booking: { allowed: true, reason: 'nepq:time_request' } });
+  }
+  // 4c. They answered "how would you decide?": speak to it, then the bridge.
+  if (plan.criteria_reply) {
+    return Object.assign(plan, { step: 'bridge', required_move: 'answer', booking: { allowed: false, reason: 'nepq:criteria' } });
   }
 
   // 5. Answering our slot offer.
@@ -327,6 +402,10 @@ export function planNepqTurn({
 // sentence goes, whatever its source.
 const MONEY_RX = /\$\s?\d|\b\d[\d,]*\s*(?:dollars|bucks)\b|\b(?:per|a)\s+month\b|\/\s?mo\b|\bmonthly\s+payments?\b|\bno\s+money\s+down\b|\b0\s?%|\bapr\b|\b\d+\s?%\s+off\b|\bsave\s+(?:up\s+to\s+)?\d/i;
 const URGENCY_RX = /\bonly\s+\d+\s+(?:spots?|slots?|openings?)\s+left\b|\bspots?\s+(?:are\s+)?filling\b|\bprices?\s+(?:are\s+)?going\s+up\b|\bact\s+(?:now|fast)\b|\blimited\s+time\b|\bbefore\s+(?:it'?s|its)\s+too\s+late\b|\bdon'?t\s+miss\b/i;
+// Claims nobody approved (2026-10-02 simulation: "that's right at the edge of
+// when Florida code tightened up", "with us at the peak of hurricane season").
+// Code history and season-peak talk are pressure dressed as fact.
+const CLAIMS_RX = /\bcode\s+(?:changed|tightened|got\s+(?:stricter|tighter)|was\s+(?:updated|changed))\b|\b(?:after|since|before)\s+(?:the\s+)?(?:19|20)\d\d\b[^.?!]{0,40}\bcode\b|\bcode\b[^.?!]{0,40}\b(?:after|since|before)\s+(?:19|20)\d\d\b|\bpeak\s+of\s+(?:the\s+)?(?:hurricane|storm)\s+season\b|\bmost\s+active\s+(?:stretch|part|time)\b/i;
 const SEE_YOU_RX = /\bsee\s+you\s+(?:then|soon|there)\b/i;
 const SIGNOFF_RX = /(?:^|\s)([—–-]\s*[A-Z][A-Za-z.'’ ]{0,40})\s*$/;
 const FIXED_MOVES = new Set(['handoff', 'objection_play', 'ask_day', 'close', 'reveal', 'offer_slots']);
@@ -348,7 +427,8 @@ export function asksForKnown(sentence, known = {}) {
 
 /** The bridge in their words, when the draft skipped it. Pure. */
 export function bridgeLine(plan) {
-  return `Based on what you told me, this could work for you${plan.echo?.word ? `, since you mentioned ${plan.echo.word}` : ''}. The next step would be ${plan.next_step_label || 'a visit at your home'}. Would that help?`;
+  const phrase = plan.echo?.phrase || problemPhrase(plan.echo?.word);
+  return `Based on what you told me, this could work for you${phrase ? `, since you mentioned ${phrase}` : ''}. The next step would be ${plan.next_step_label || 'a visit at your home'}. Would that help?`;
 }
 
 /**
@@ -378,6 +458,16 @@ export function enforceNepqPlan(draft, plan, { allowFigures = false, known = {} 
   // 2. No money, no pressure.
   if (!allowFigures) drop(s => MONEY_RX.test(s), 'money_figures');
   drop(s => URGENCY_RX.test(s), 'fake_urgency');
+  drop(s => CLAIMS_RX.test(s), 'unapproved_claim');
+  // 2b. "Do you offer financing?" keeps its yes when the figure strip took the
+  // answer sentence (2026-10-02 simulation: "Yes, we offer 0% APR financing"
+  // went, and only "What's got you looking into windows now?" was left).
+  if (plan.financing_ask && changes.includes('money_figures') && !sentences.some(s => /^(?:yes|yep|yeah|absolutely|we\s+(?:do|offer|have))\b/i.test(s) || /\bfinanc/i.test(s))) {
+    sentences.unshift(LINES.financing_yes);
+    changes.push('financing_yes');
+  }
+  // 2c. The consequence question once per conversation, however it is worded.
+  if (plan.required_move !== 'consequence' && plan.counters?.consequence_used) drop(s => s.includes('?') && CONSEQUENCE_RX.test(s), 'consequence_repeat');
   // 3. No booking ask the plan does not allow.
   if (!plan.booking?.allowed) {
     const asks = new Set(findBookingAsks(sentences.join(' ')));
@@ -398,13 +488,22 @@ export function enforceNepqPlan(draft, plan, { allowFigures = false, known = {} 
   }
   body = sentences.join(' ').trim();
 
+  // 5b. A time they typed, with a question in the same burst: the answer, then
+  // the two real times verbatim (the model's own times never survive).
+  if (plan.required_move === 'offer_slots' && plan.offer_line && !body.includes(plan.offer_line)) {
+    body = [...sentences.filter(s => !s.includes('?') && !SLOT_OFFER_RX.test(s) && !/\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b/i.test(s)), plan.offer_line].join(' ').trim();
+    changes.push('offer_line');
+  }
+
   // 6. The required move, when the draft skipped it.
   if (plan.required_move === 'bridge' && !BRIDGE_RX.test(body)) {
     body = bridgeLine(plan);
     changes.push('bridge');
   }
   if (!body) {
-    body = changes.includes('money_figures') ? NO_FIGURES_LINE : (original.trim() || NO_FIGURES_LINE);
+    body = changes.includes('money_figures') ? NO_FIGURES_LINE
+      : (changes.includes('consequence_repeat') || changes.includes('unapproved_claim')) ? bridgeLine(plan)
+        : (original.trim() || NO_FIGURES_LINE);
   }
   return { text: changes.length ? withSignOff(body) : original, changes };
 }

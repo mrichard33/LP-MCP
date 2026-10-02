@@ -175,3 +175,27 @@ export function humanizeReply(text, { keepText = '' } = {}) {
   if (!out || (original.includes('?') && !out.includes('?'))) return { text: original, changes: [] };
   return { text: out, changes: [...new Set(changes)] };
 }
+
+// 2026-10-02 simulation: the live chat ended questions with a period ("What's
+// giving you the most trouble with the windows right now."). No guard removes
+// a "?"; the model writes the period, and every one-question and booking-ask
+// check counts "?", so the period also hid those questions from the guards.
+// The LAST sentence only: that is where the bot's one question sits, and a
+// statement mid-reply is far likelier to start with "when" or "how".
+const QUESTION_START_RX = /^(?:what(?:'s|’s)?|how|when|which|where|who|why|is|are|do|does|did|can|could|would|will|should|want|have|has)\b/i;
+// Statements that start like a question: "What I can do is…", "When you're
+// ready, …", "Would love to help.", "Will do.", "Have a great day."
+const NOT_A_QUESTION_RX = /^(?:(?:what|how|when|where|why)\s+(?:i|we|you|you're|you’re|they|it|it's|that's|there's|our|your|this|these|those)\b|would\s+(?:love|be\s+(?:happy|glad))\b|will\s+do\b|have\s+(?:a|an|the|fun)\b|which\s+(?:means|is\s+why)\b)/i;
+
+/** The last sentence starts like a question and ends in "." → "?". Pure. */
+export function restoreQuestionMark(text) {
+  const original = String(text ?? '');
+  const signOff = original.match(/(\s*[—–-]\s*[A-Z][A-Za-z.'’ ]{0,40})\s*$/);
+  const body = signOff ? original.slice(0, signOff.index) : original;
+  const m = body.match(/(^|[.!?]\s+)([^.!?]+)\.\s*$/);
+  if (!m) return { text: original, changed: false };
+  const last = m[2].trim();
+  if (!QUESTION_START_RX.test(last) || NOT_A_QUESTION_RX.test(last)) return { text: original, changed: false };
+  const fixed = body.replace(/\.\s*$/, '?') + (signOff ? signOff[1] : '');
+  return { text: fixed, changed: true };
+}

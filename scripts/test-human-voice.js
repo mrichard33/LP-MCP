@@ -74,3 +74,14 @@ test('the prompt rules carry the same bans', () => {
   }
   assert.ok(!HUMAN_VOICE_RULES.includes('—'), 'the rules do not model the habit they ban');
 });
+
+// 2026-10-02 simulation: questions ended with a period.
+test('restoreQuestionMark: the last sentence gets its "?" back; statements stay', async () => {
+  const { restoreQuestionMark } = await import('../src/agentic/human-voice.js');
+  assert.equal(restoreQuestionMark("What's giving you the most trouble with the windows right now.").text, "What's giving you the most trouble with the windows right now?");
+  assert.equal(restoreQuestionMark('Got it. When works better for you, a weekday or the weekend.').text, 'Got it. When works better for you, a weekday or the weekend?');
+  assert.equal(restoreQuestionMark('Is that right. — Reece Team').text, 'Is that right? — Reece Team');
+  for (const keep of ['Our team will call. What I can do is set that up.', "When you're ready, our team will call.", 'Would love to help.', 'Have a great day.', 'Thanks for reaching out.']) {
+    assert.equal(restoreQuestionMark(keep).changed, false, keep);
+  }
+});

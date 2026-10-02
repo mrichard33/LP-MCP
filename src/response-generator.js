@@ -263,7 +263,9 @@ import {
   lastOutboundOfferedGuide, isGuideAcceptance,
 } from './agentic/guide-delivery.js';
 import { notInterestedTurn } from './agentic/not-interested.js';
-import { humanizeReply } from './agentic/human-voice.js';
+import { humanizeReply, restoreQuestionMark } from './agentic/human-voice.js';
+import { findUnbackedBookingClaim, rewriteBookingClaims, bookingClaimNote } from './agentic/booking-claim.js';
+import { BOOKING_CALENDARS } from './knowledge/booking-calendar-router.js';
 import {
   buildKbPack,
   prewarmQueryEmbedding,
@@ -375,7 +377,7 @@ import { findUnbackedEstimatePromise, estimatePromiseNote, rewriteEstimatePromis
 // v2.7.14 — Bot Review Phase 0. Pure shaping helpers only: no I/O, no writes.
 import { buildInputSnapshot, extractKbModes, extractKbSources } from './bot-feedback/fingerprint-core.js';
 import { normalizeTimezone, tzLongName, tzLabel } from './config/market-timezones.js';
-import { planNepqTurn, enforceNepqPlan, nepqBackboneMode } from './agentic/nepq-planner.js';
+import { planNepqTurn, enforceNepqPlan, nepqBackboneMode, objectionType as nepqObjectionType, TIME_REQUEST_RX as NEPQ_TIME_REQUEST_RX } from './agentic/nepq-planner.js';
 import {
   planServiceAreaTurn, resolveCoverage, coverageHint, guardCoverageDraft, serviceAreaRecord,
 } from './agentic/service-area-turn.js';
@@ -3371,7 +3373,16 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   }
 
   let availability = null;
-  const calendarId = getCalendarIdFromKbPack(kbPack);
+  // 2026-10-02 simulation: "let me think about it" (and a typed day + time)
+  // loads no calendar on SMS, so the NEPQ Calendar Commitment fell back to
+  // "what day works best?". With the backbone on, those turns read the
+  // calendar the next step names: the quick call (PPR) unless the in-home
+  // gate applies. Mode off is unchanged.
+  const nepqModeEarly = (opts.dryRun === true && opts.nepqModeOverride) ? opts.nepqModeOverride : nepqBackboneMode();
+  const nepqWantsSlots = nepqModeEarly !== 'off' && channel === 'sms'
+    && (nepqObjectionType(triggerMessage) === 'think' || NEPQ_TIME_REQUEST_RX.test(String(triggerMessage || '')));
+  const calendarId = getCalendarIdFromKbPack(kbPack)
+    || (nepqWantsSlots ? BOOKING_CALENDARS.PROTECTION_PROFILE_REVIEW : null);
   if (calendarId) {
     try {
       // 2026-10-01: in the contact's market zone (Houston → Central).
@@ -3750,6 +3761,10 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // the user prompt is passed as keepText so a LOCKED KB line the model quoted
   // keeps its em dashes verbatim (banned.js). Runs before the token guard so
   // that guard still sees the final text.
+  // A question written with a period hides from every check that counts "?"
+  // (2026-10-02 simulation), so the mark goes back first.
+  const marked = channel === 'email' ? { changed: false } : restoreQuestionMark(validated.message);
+  if (marked.changed) validated.message = marked.text;
   const voice = humanizeReply(validated.message, { keepText: userPrompt });
   if (voice.changes.length) {
     console.log(`[HumanVoice] ${contactId} ${voice.changes.join(',')}`);
@@ -3920,6 +3935,30 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
         console.warn(`[ResponseGenerator] ⚠️ undelivered send promise for ${contactId}: "${promise}" — regenerating once`);
         const err = new Error(`undelivered_send_promise: ${promise.slice(0, 120)}`);
         err.regenerationNote = undeliveredPromiseNote(promise);
+        throw err;
+      }
+    }
+  }
+
+  // ─── Booking-claim guard (2026-10-02 simulation, NEPQ live only) ───
+  // "You're all set for a measurement visit" with nothing booked. A reply may
+  // say a visit is set only when it carries the book_appointment that books
+  // it, or names the appointment already on file. Regenerate once, then the
+  // claim becomes "our team will call to set up a time". Gated on the NEPQ
+  // backbone so production SMS is unchanged until it goes live.
+  if (nepqModeEarly === 'live' && channel === 'sms') {
+    const onFile = (Array.isArray(upcomingAppointments) && upcomingAppointments.some(a => !a.already_ended))
+      || (context.lp?.appointment_set === true && context.lp?.appointment_is_past !== true);
+    const claimOpts = { booked: validated.companion_action?.action_type === 'book_appointment', hasAppointment: onFile };
+    const claim = findUnbackedBookingClaim(validated.message, claimOpts);
+    if (claim) {
+      if (opts.regenerationNote) {
+        validated.message = rewriteBookingClaims(validated.message, claimOpts).text;
+        console.warn(`[ResponseGenerator] ⚠️ unbacked booking claim survived regeneration for ${contactId}: "${claim}" — rewritten`);
+      } else {
+        console.warn(`[ResponseGenerator] ⚠️ unbacked booking claim for ${contactId}: "${claim}" — regenerating once`);
+        const err = new Error(`unbacked_booking_claim: ${claim.slice(0, 120)}`);
+        err.regenerationNote = bookingClaimNote(claim);
         throw err;
       }
     }
@@ -4119,6 +4158,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       mode: nepqMode, step: nepqPlan.step, move: nepqPlan.required_move,
       objection: nepqPlan.objection?.type || null, handoff: nepqPlan.handoff?.reason || null,
       counters: nepqPlan.counters,
+      booking: nepqPlan.booking, slots: (nepqPlan.slots_to_offer || []).length,
     };
     const idf = identityState?.identity || {};
     const knownFirst = idf.first_name || context.lead?.first_name || null;
@@ -4135,6 +4175,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       if (enforced.changes.length) {
         console.log(`[NEPQ] ${contactId} ${nepqPlan.required_move}: ${enforced.changes.join(',')}`);
         validated.message = enforced.text;
+        validated.nepq_plan.changes = enforced.changes;
       }
       if (!nepqPlan.booking.allowed && validated.companion_action?.action_type === 'book_appointment') validated.companion_action = null;
       if (nepqPlan.handoff) validated.nepq_handoff = { reason: nepqPlan.handoff.reason };

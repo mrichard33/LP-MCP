@@ -290,3 +290,11 @@ test('the approved decision-maker ask is a single ask, not a double-barrelled cl
   // Everything else with "or is" stays caught.
   assert.equal(isDoubleBarrelled('Would Tuesday work, or is Thursday easier?'), true);
 });
+
+// 2026-10-02 simulation: two questions behind one question mark.
+test('isDoubleBarrelled: ", and is …?" is two questions', async () => {
+  const { isDoubleBarrelled } = await import('../src/agentic/conversation-repetition.js');
+  assert.equal(isDoubleBarrelled('How long have they been like that, and is the drafting mostly from certain windows?'), true);
+  assert.equal(isDoubleBarrelled('Is this your call, or is anyone else weighing in on it?'), false);
+  assert.equal(isDoubleBarrelled('Is it the kitchen and living room?'), false);
+});
