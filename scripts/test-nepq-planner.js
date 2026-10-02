@@ -29,13 +29,23 @@ test('mode switch: off unless shadow or live', () => {
   assert.equal(nepqBackboneMode({ NEPQ_BACKBONE_MODE: 'yes' }), 'off');
 });
 
-test('price: the play first, a person on the second ask', () => {
-  const p1 = plan({ trigger: 'How much for 12 windows?' });
+// Mark, 2026-10-02 (5i59G): a quote or price ask goes straight to two real
+// times; asked again, every home is different + the same times; a third, a person.
+test('price: two times first, again with the times, a person on the third ask', () => {
+  const p1 = plan({ trigger: 'Hi, I would like to get a quote on 12 windows and 2 sliding glass doors.', slots: SLOTS, tzLabel: 'ET' });
   assert.equal(p1.required_move, 'objection_play');
-  assert.equal(p1.fixed_line, LINES.price_play);
-  assert.equal(p1.booking.allowed, false);
-  const p2 = plan({ trigger: 'just give me a number', conversation: T(['inbound', 'how much?'], ['outbound', LINES.price_play]) });
-  assert.equal(p2.handoff?.reason, 'price_insist');
+  assert.equal(p1.fixed_line, "Happy to get you a quote on the 12 windows and 2 sliding glass doors. Exact pricing comes from a quick visit to measure, and you keep the written quote. I have Tue, Oct 6 at 10:00 AM ET or Wed, Oct 7 at 2:00 PM ET. Which works better?");
+  assert.equal(p1.booking.allowed, true);
+  const noSlots = plan({ trigger: 'How much for 12 windows?' });
+  assert.equal(noSlots.fixed_line, LINES.quote_no_slots('12 windows'));
+  assert.equal(noSlots.ask_contact, true);
+  const t1 = T(['inbound', 'quote on 12 windows'], ['outbound', p1.fixed_line]);
+  const p2 = plan({ trigger: 'I just want a good price.', conversation: t1, slots: SLOTS, tzLabel: 'ET' });
+  assert.equal(p2.fixed_line, LINES.price_again_slots(p2.slots_to_offer));
+  const t2 = [...t1, ...T(['inbound', 'I just want a good price.'], ['outbound', p2.fixed_line])];
+  const p3 = plan({ trigger: 'how much?', conversation: t2, slots: SLOTS });
+  assert.equal(p3.handoff?.reason, 'price_insist');
+  assert.equal(plan({ trigger: 'just give me a number', conversation: T(['inbound', 'how much?'], ['outbound', LINES.price_play]) }).fixed_line, LINES.price_again_no_slots, 'the old play counts as the first price line');
   assert.equal(plan({ trigger: 'do you offer financing?' }).objection, null, 'a financing question is not a price ask');
   assert.equal(plan({ trigger: 'how much a month would it be?' }).objection.type, 'price');
 });
@@ -118,7 +128,7 @@ test('guard: the live-chat financing quote is stripped', () => {
 
 test('guard: fixed moves ship their line and keep the sign-off', () => {
   const p = plan({ trigger: 'How much?' });
-  assert.equal(enforceNepqPlan('Great question! It depends. — Reece Team', p).text, `${LINES.price_play} — Reece Team`);
+  assert.equal(enforceNepqPlan('Great question! It depends. — Reece Team', p).text, `${p.fixed_line} — Reece Team`);
 });
 
 test('guard: one question, no unallowed booking ask, no "see you then", no fake urgency', () => {
@@ -154,7 +164,7 @@ test('hand-off: callback tag + reason tag, a rep note, one idempotent event, a c
 test('prompt block: the fixed line verbatim, and the never-list', () => {
   const lines = renderPlanBlock(plan({ trigger: 'How much?' })).join('\n');
   assert.match(lines, /NEPQ TURN PLAN/);
-  assert.ok(lines.includes(LINES.price_play));
+  assert.ok(lines.includes(LINES.quote_no_slots(null)));
   assert.match(lines, /Never in this reply: a price/);
   assert.deepEqual(renderPlanBlock(null), []);
 });
@@ -212,7 +222,7 @@ test('shopping follow-up: "price and the warranty" is what they decide on, not a
   assert.match(renderPlanBlock(p).join('\n'), /told you what they will decide on/);
   // A later real price ask is the FIRST price ask, so it gets the play, not a hand-off.
   const later = plan({ trigger: 'how much would it be?', conversation: [...thread, ...T(['inbound', 'Probably price and the warranty'], ['outbound', 'Our warranty is in writing. Would that help?'])] });
-  assert.equal(later.fixed_line, LINES.price_play);
+  assert.match(later.fixed_line, /^Happy to get you a quote/);
   assert.equal(objectionType('price and warranty matter most'), null);
   assert.equal(objectionType('how much is it'), 'price');
 });
@@ -295,4 +305,11 @@ test('hand-off card: #contact-center always, #dispatch for a complaint; a failed
   assert.match(posts[0].text, /WEBSITE CHAT[\s\S]*supposed to come today[\s\S]*contacts\/detail\/C9/);
   assert.equal(ops.length, 1);
   assert.match(ops[0], /NOT POSTED TO #dispatch[\s\S]*add the Reece Slack app/);
+});
+
+test('"you just said that" ends the questions: two times, or the team calls', () => {
+  const thread = T(['inbound', 'quote please'], ['outbound', 'What brought you to look at impact windows today?']);
+  const p = plan({ trigger: 'you just said that.', conversation: thread, slots: SLOTS, tzLabel: 'ET' });
+  assert.equal(p.fixed_line, LINES.repeat_slots(p.slots_to_offer));
+  assert.equal(plan({ trigger: 'I already told you', conversation: thread }).fixed_line, LINES.repeat_no_slots);
 });

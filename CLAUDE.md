@@ -248,6 +248,11 @@ handed to a person. The simulator run (2026-10-02) added: `src/agentic/booking-c
 "you're all set / booked / on the schedule" a model reply makes without a booking (live chat always; SMS
 when NEPQ is live), `restoreQuestionMark` puts back a "?" the model wrote as "." (every one-question check
 counts "?"), and a day + time the lead types with no offer on the table gets two real times near it.
+**A quote or price ask books a visit (Mark, 2026-10-02):** two real times at once (`LINES.quote_slots`), asked
+again "every home is different" + the same times, a third time a person; "you just said that" ends the
+questions with the times. Live chat often gets NO conversation id (GHL's I.LVI sends none and a new chat is
+not searchable yet: 44 of 68 turns in two days), so the thread falls back to our own `agent_actions` rows
+(`recentTurns`, last 6h); never assume `conversation_recent` came from GHL.
 
 **A live-chat turn answers exactly once (2026-10-02, vnazu).** `raceWithBudget` abandons work, it does not
 stop it: the reply and the holding line share one `newTurnClaim()`, a second draft starts only when

@@ -48,10 +48,9 @@ test('live chat: every turn and reply, a fixed price move needs no model call', 
   const { calls, deps } = fakeProduction();
   const r = await simulateLiveChat(resolveScenario({ scenario: 'price' }), { nepqMode: 'live', productionDeps: deps });
   assert.equal(r.transcript.length, 2);
-  assert.match(r.transcript[0].bot[0], /^Totally fair\. Every home is different/);
-  assert.match(r.transcript[1].bot[0], /someone from our team call you/);
+  assert.match(r.transcript[0].bot[0], /^Happy to get you a quote/);
+  assert.match(r.transcript[1].bot[0], /^Totally fair\. Every home is different/);
   assert.equal(calls.llm, 0);
-  assert.ok(r.would_do.some(w => w.kind === 'would_hand_off_to_person' && w.reason === 'price_insist'));
 });
 
 test('live chat: cancel → reschedule moves nothing, it records "would move the same appointment"', async () => {

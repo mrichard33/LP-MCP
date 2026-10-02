@@ -817,13 +817,14 @@ test('a second draft starts only when it can finish inside the deadline', async 
 // ── NEPQ backbone, live (2026-10-02, Mark) ────────────────────────────
 
 const NEPQ_SLOTS = [{ iso: '2026-10-06T14:00:00Z', day: 'Tue, Oct 6', time: '10:00 AM', dayOfWeek: 'Tuesday' }, { iso: '2026-10-07T18:00:00Z', day: 'Wed, Oct 7', time: '2:00 PM', dayOfWeek: 'Wednesday' }];
-function nepqLane({ messages = [], llm, bookOk = true, phone = '+13525550188' } = {}) {
+function nepqLane({ messages = [], llm, bookOk = true, phone = '+13525550188', recentTurns = null } = {}) {
   const box = {};
   const extra = {
     nepqMode: () => 'live',
     offerBookingSlots: async () => { box.state.slotReads = (box.state.slotReads || 0) + 1; return { slots: NEPQ_SLOTS, tzLabel: 'ET', calendarId: 'CALWE' }; },
     bookSlot: async (a) => { box.state.bookings = [...(box.state.bookings || []), a]; return bookOk ? { ok: true, action_id: 77 } : { ok: false, error: 'appointment_blocked_prerequisites' }; },
     nepqHandoff: async (a) => { box.state.handoffs = [...(box.state.handoffs || []), a]; },
+    ...(recentTurns ? { recentTurns } : {}),
   };
   const made = makeLane({ messages, llm, extra, phone });
   box.state = made.state;
@@ -831,8 +832,8 @@ function nepqLane({ messages = [], llm, bookOk = true, phone = '+13525550188' } 
 }
 const M = (direction, body, minsAgo) => ({ direction, body, dateAdded: new Date(Date.now() - minsAgo * 60000).toISOString() });
 
-test('NEPQ live: a second price ask goes to a person, with no model call', async () => {
-  const { lane, state } = nepqLane({ messages: [M('inbound', 'how much for 12 windows?', 3), M('outbound', 'Totally fair. Every home is different, so any number I gave you now would be a guess. What are you hoping to see, so the estimate actually fits your home?', 2)] });
+test('NEPQ live: a price ask after two price lines goes to a person, with no model call', async () => {
+  const { lane, state } = nepqLane({ messages: [M('inbound', 'how much for 12 windows?', 5), M('outbound', 'Happy to get you a quote on the 12 windows. Exact pricing comes from a quick visit to measure, and you keep the written quote. I have Tue, Oct 6 at 10:00 AM ET or Wed, Oct 7 at 2:00 PM ET. Which works better?', 4), M('inbound', 'I just want a good price', 3), M('outbound', 'Totally fair. Every home is different, so any number I gave you now would be a guess. The visit gets you the exact number in writing. I have Tue, Oct 6 at 10:00 AM ET or Wed, Oct 7 at 2:00 PM ET. Which works better?', 2)] });
   await lane.processInbound(INBOUND('just give me a number'));
   assert.equal(state.llmCalls.length, 0);
   assert.match(state.sends[0].message, /^Understood\. I'll have someone from our team call you to talk it through\./);
@@ -903,4 +904,27 @@ test('shadow model: a stronger model runs beside, is recorded, and is never sent
   const ev = state.events.find(e => e.event_type === 'agentic.live_chat_shadow_model');
   assert.ok(ev, 'shadow draft recorded');
   assert.equal(typeof ev.payload.latency_ms, 'number');
+});
+
+// 2026-10-02 (5i59G): GHL sent no conversation id, so every turn ran with no
+// history and the same price line went out three times.
+test('no conversation id: the thread comes from our own rows, and the second price ask moves on', async () => {
+  const at = (mins) => new Date(Date.now() - mins * 60000).toISOString();
+  const first = 'Happy to get you a quote on the 12 windows and 2 sliding glass doors. Exact pricing comes from a quick visit to measure, and you keep the written quote. I have Tue, Oct 6 at 10:00 AM ET or Wed, Oct 7 at 2:00 PM ET. Which works better?';
+  const { lane, state } = nepqLane({ recentTurns: async () => [
+    { direction: 'inbound', text: 'Hi, I would like to get a quote on 12 windows and 2 sliding glass doors.', timestamp: at(2) },
+    { direction: 'outbound', text: first, timestamp: at(1.9) },
+  ] });
+  await lane.processInbound({ contactId: 'C1', messageId: 'm-good-price', body: 'I just want a good price.' });
+  assert.equal(state.llmCalls.length, 0);
+  assert.match(state.sends[0].message, /^Totally fair\. Every home is different[\s\S]*exact number in writing\. I have Tue, Oct 6/);
+});
+
+test('turnsFromRows: the visitor message and what was sent, oldest first', async () => {
+  const { turnsFromRows } = await import('../src/live-chat/index.js');
+  const t = turnsFromRows([
+    { created_at: '2026-10-02T13:46:12Z', status: 'completed', action_payload: { trigger_message: 'quote please' }, execution_result: { sent_body: 'Happy to get you a quote.', timing: { t6_ghl_sent: '2026-10-02T13:46:14Z' } } },
+    { created_at: '2026-10-02T13:46:44Z', status: 'executing', action_payload: { trigger_message: 'I just want a good price.' }, execution_result: null },
+  ]);
+  assert.deepEqual(t.map(x => x.direction), ['inbound', 'outbound', 'inbound']);
 });

@@ -37,6 +37,8 @@ const RICK = { firstName: 'Rick', lastName: 'Fox', phone: '+13525550188', email:
 export const SCENARIOS = Object.freeze({
   discovery: { title: 'New lead, discovery', persona: GUEST, turns: ['Hi there', 'My windows are old and drafty', 'Mostly the kitchen and living room', 'About 10 years', 'Yes, that would help'] },
   price: { title: 'Price asked twice', persona: GUEST, turns: ['How much for 12 windows?', 'Just give me a number'] },
+  // 2026-10-02 (5i59G): the live chat that repeated its price line three times.
+  quote: { title: 'Quote request (live chat replay)', persona: GUEST, turns: ['Hi, I would like to get a quote on 12 windows and 2 sliding glass doors.', 'I just want a good price.', 'you just said that.', 'I just said I need new windows. I want a quote. how much?'] },
   financing: { title: 'Financing', persona: GUEST, turns: ['Do you offer financing?', 'How much a month would it be?'] },
   spouse: { title: 'Spouse', persona: GUEST, turns: ["I'm interested but I need to talk to my wife first", 'She has to see it before we decide', 'The first one works for both of us'] },
   think: { title: 'Think it over', persona: GUEST, turns: ['Your windows sound good', 'Let me think about it', 'The first one'] },

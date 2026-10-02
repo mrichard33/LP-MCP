@@ -59,6 +59,34 @@ async function fetchMessages(conversationId) {
  * does not send a conversation id (2026-10-01), and without one the lane has
  * no thread to read.
  */
+/**
+ * This chat's turns from our own agent_actions rows (2026-10-02, 5i59G): the
+ * thread when GHL gives no conversation id. Last 6 hours, the visitor's
+ * message and what we sent (or drafted, in shadow), oldest first.
+ */
+export function turnsFromRows(rows = []) {
+  const out = [];
+  for (const r of rows) {
+    const at = r.created_at;
+    const inbound = r.action_payload?.trigger_message;
+    const sent = r.execution_result?.sent_body;
+    if (inbound) out.push({ direction: 'inbound', text: String(inbound), timestamp: at });
+    if (sent && r.status === 'completed') out.push({ direction: 'outbound', text: String(sent), timestamp: r.execution_result?.timing?.t6_ghl_sent || at });
+  }
+  return out;
+}
+
+async function recentTurns(contactId) {
+  if (!supabase || !contactId) return [];
+  const since = new Date(Date.now() - 6 * 3600 * 1000).toISOString();
+  const { data, error } = await supabase.from('agent_actions')
+    .select('created_at,status,action_payload,execution_result')
+    .eq('rule_applied', 'LIVE_CHAT_FAST_LANE').eq('target_id', contactId).gte('created_at', since)
+    .order('created_at', { ascending: true }).limit(20);
+  if (error) throw new Error(error.message);
+  return turnsFromRows(data || []);
+}
+
 async function findConversation(contactId) {
   const search = await ghlFetch('GET', `/conversations/search?locationId=${GHL_LOCATION_ID}&contactId=${contactId}`, null, { priority: 'high', maxWaitMs: 1500 });
   const conversations = Array.isArray(search) ? search : (search?.conversations || []);
@@ -338,6 +366,7 @@ export function productionLaneDeps() {
     fetchContact,
     fetchMessages,
     findConversation,
+    recentTurns,
     buildContext: (contactId) => buildLeadContext(contactId, { includeConversation: false, skipCache: true }),
     prewarmEmbedding: prewarmQueryEmbedding,
     buildKbPack,
