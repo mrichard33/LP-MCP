@@ -50,7 +50,7 @@ async function fetchContact(contactId) {
 }
 
 async function fetchMessages(conversationId) {
-  const res = await ghlFetch('GET', `/conversations/${conversationId}/messages?limit=10`, null, { priority: 'high', maxWaitMs: 1500 });
+  const res = await ghlFetch('GET', `/conversations/${conversationId}/messages?limit=30`, null, { priority: 'high', maxWaitMs: 1500 });
   return res?.messages?.messages || res?.messages || res || [];
 }
 
@@ -82,9 +82,11 @@ async function recentTurns(contactId) {
   const { data, error } = await supabase.from('agent_actions')
     .select('created_at,status,action_payload,execution_result')
     .eq('rule_applied', 'LIVE_CHAT_FAST_LANE').eq('target_id', contactId).gte('created_at', since)
-    .order('created_at', { ascending: true }).limit(20);
+    // The NEWEST 20 rows (oldest first after the reverse): ascending + limit
+    // kept the first 20 of a long chat and dropped its latest turns.
+    .order('created_at', { ascending: false }).limit(20);
   if (error) throw new Error(error.message);
-  return turnsFromRows(data || []);
+  return turnsFromRows((data || []).slice().reverse());
 }
 
 async function findConversation(contactId) {
