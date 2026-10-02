@@ -391,3 +391,10 @@ test('re-run: a pressure clause is cut and the rest of the sentence kept', () =>
   assert.ok(out.changes.includes('fake_urgency'));
   assert.equal(out.text, 'The quickest way to grab a day that works is here: {{trigger_link.x}}');
 });
+
+test('live chat 2026-10-02: a referral fee or refund never received goes to a person', () => {
+  const msg = 'I had windows installed by Reece. I referred my sister and was offered a referral fee. She had her windows installed by Reece and I have not received my referral fee that was promised.';
+  assert.equal(plan({ trigger: msg }).handoff?.reason, 'service');
+  assert.equal(plan({ trigger: "I never got my refund for the deposit" }).handoff?.reason, 'service');
+  assert.equal(plan({ trigger: 'do you have a referral program?' }).handoff, null);
+});
