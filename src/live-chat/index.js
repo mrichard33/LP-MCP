@@ -302,8 +302,13 @@ function nepqHandoff({ contactId, reason, inbound, firstName }) {
   });
 }
 
-export function buildProductionLane() {
-  return createLiveChatFastLane({
+/**
+ * Every production dependency of the lane, as one object. The bot simulator
+ * (src/simulator/bot-simulator.js) takes the real model, knowledge and
+ * read-only lookups from here and swaps every write and send for a recorder.
+ */
+export function productionLaneDeps() {
+  return {
     fetchContact,
     fetchMessages,
     findConversation,
@@ -337,7 +342,11 @@ export function buildProductionLane() {
     bookSlot,
     nepqHandoff,
     contactUrl: (id) => (id ? `https://app.gohighlevel.com/v2/location/${GHL_LOCATION_ID}/contacts/detail/${id}` : null),
-  });
+  };
+}
+
+export function buildProductionLane() {
+  return createLiveChatFastLane(productionLaneDeps());
 }
 
 /** Mount the route and say, loudly, whether the configured model can meet the deadline. */
