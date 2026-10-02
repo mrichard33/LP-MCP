@@ -917,7 +917,7 @@ test('no conversation id: the thread comes from our own rows, and the second pri
   ] });
   await lane.processInbound({ contactId: 'C1', messageId: 'm-good-price', body: 'I just want a good price.' });
   assert.equal(state.llmCalls.length, 0);
-  assert.match(state.sends[0].message, /^Totally fair\. Every home is different[\s\S]*exact number in writing\. I have Tue, Oct 6/);
+  assert.match(state.sends[0].message, /^Fair question\. Every home is different, so a number now would just be a guess\. I have Tue, Oct 6/);
 });
 
 test('turnsFromRows: the visitor message and what was sent, oldest first', async () => {

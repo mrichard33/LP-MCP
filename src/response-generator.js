@@ -380,7 +380,7 @@ import { findUnbackedEstimatePromise, estimatePromiseNote, rewriteEstimatePromis
 // v2.7.14 — Bot Review Phase 0. Pure shaping helpers only: no I/O, no writes.
 import { buildInputSnapshot, extractKbModes, extractKbSources } from './bot-feedback/fingerprint-core.js';
 import { normalizeTimezone, tzLongName, tzLabel } from './config/market-timezones.js';
-import { planNepqTurn, enforceNepqPlan, nepqBackboneMode, nepqFixedLineWins, objectionType as nepqObjectionType, TIME_REQUEST_RX as NEPQ_TIME_REQUEST_RX, REPEAT_COMPLAINT_RX as NEPQ_REPEAT_COMPLAINT_RX } from './agentic/nepq-planner.js';
+import { planNepqTurn, enforceNepqPlan, nepqBackboneMode, nepqFixedLineWins, objectionType as nepqObjectionType, TIME_REQUEST_RX as NEPQ_TIME_REQUEST_RX, SCHEDULE_ASK_RX as NEPQ_SCHEDULE_ASK_RX,REPEAT_COMPLAINT_RX as NEPQ_REPEAT_COMPLAINT_RX } from './agentic/nepq-planner.js';
 import {
   planServiceAreaTurn, resolveCoverage, coverageHint, guardCoverageDraft, serviceAreaRecord,
 } from './agentic/service-area-turn.js';
@@ -3397,7 +3397,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   const nepqModeEarly = (opts.dryRun === true && opts.nepqModeOverride) ? opts.nepqModeOverride : nepqBackboneMode();
   const nepqWantsSlots = nepqModeEarly !== 'off' && channel === 'sms'
     // 2026-10-02 (Mark): a quote/price ask and "you just said that" offer two times too.
-    && (['think', 'price'].includes(nepqObjectionType(triggerMessage)) || NEPQ_TIME_REQUEST_RX.test(String(triggerMessage || '')) || NEPQ_REPEAT_COMPLAINT_RX.test(String(triggerMessage || ''))
+    && (['think', 'price'].includes(nepqObjectionType(triggerMessage)) || NEPQ_TIME_REQUEST_RX.test(String(triggerMessage || '')) || NEPQ_SCHEDULE_ASK_RX.test(String(triggerMessage || '')) || NEPQ_REPEAT_COMPLAINT_RX.test(String(triggerMessage || ''))
       // 2026-10-02 funnel audit: "yes" to the bridge, and a pick after our two
       // times, loaded no calendar on SMS, so the bot sent the self-booking link
       // instead of two real times (0 of 12 journeys booked).
