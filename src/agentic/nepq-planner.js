@@ -68,6 +68,8 @@ const SPOUSE_OBJECTION_RX = /\b(?:talk|check|ask|discuss|run\s+(?:it|this))\b[^.
 const SHOPPING_RX = /\b(?:(?:\d|two|three|four|few|couple(?:\s+of)?|multiple|other|more)\s+(?:quotes|estimates|bids|companies|contractors)|shopping\s+around|comparing|getting\s+(?:other\s+)?(?:quotes|estimates|bids))\b/i;
 const THINK_RX = /\b(?:think\s+(?:it\s+over|about\s+it|on\s+it)|sleep\s+on\s+it|get\s+back\s+to\s+you|let\s+me\s+(?:think|see|check)|maybe\s+later|not\s+(?:right\s+)?now|need\s+(?:some\s+)?time)\b/i;
 const YES_RX = /^\s*(?:y(?:es|eah|ep|up)|sure|ok(?:ay)?|sounds\s+good|that\s+works|please|absolutely|definitely|why\s+not|let'?s\s+do\s+it|i'?d\s+like\s+that)\b/i;
+// "A team member will call you to set up a time" — wrong next to two real times.
+const CALL_TO_SET_RX = /\b(?:a\s+(?:team\s+)?member(?:\s+of\s+our\s+team)?|someone(?:\s+from\s+our\s+team)?|our\s+team|we)(?:'ll|\s+will)\s+(?:give\s+you\s+a\s+)?call(?:\s+you)?\s+to\s+(?:set\s+(?:up\s+)?|schedule|book|find|pick|line\s+up)\b/i;
 // A non-answer to a discovery question. "no" is not here: it is counted as a no.
 const VAGUE_ANSWER_RX = /^\s*(?:idk|i\s+(?:don'?t|dont)\s+know|not\s+(?:sure|really)|dunno|no\s+idea|maybe|i\s+guess|possibly|eh+|hm+|meh|ok(?:ay)?|k|yes|yeah|yep|sure|nothing(?:\s+really)?|whatever|first|\?+)\s*[.!?]*\s*$/i;
 const MAYBE_RX = /^\s*(?:maybe|i\s+guess|possibly|probably|not\s+sure|perhaps|could\s+be)\b[^?]*$/i;
@@ -692,8 +694,11 @@ export function enforceNepqPlan(draft, plan, { allowFigures = false, known = {} 
 
   // 5b. A time they typed, with a question in the same burst: the answer, then
   // the two real times verbatim (the model's own times never survive).
+  // 2026-10-02 break test: "A team member will call you to set up a time that
+  // works. I have Sat 10 AM or Sat 2 PM." The times ARE the time; the
+  // call-to-set-a-time promise goes when they are offered.
   if (plan.required_move === 'offer_slots' && plan.offer_line && !body.includes(plan.offer_line)) {
-    body = [...sentences.filter(s => !s.includes('?') && !SLOT_OFFER_RX.test(s) && !/\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b/i.test(s)), plan.offer_line].join(' ').trim();
+    body = [...sentences.filter(s => !s.includes('?') && !SLOT_OFFER_RX.test(s) && !/\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b/i.test(s) && !CALL_TO_SET_RX.test(s)), plan.offer_line].join(' ').trim();
     changes.push('offer_line');
   }
 

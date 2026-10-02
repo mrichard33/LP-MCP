@@ -410,3 +410,11 @@ test('vague lead: two non-answers end discovery; "maybe" to the bridge gets two 
   assert.equal(plan({ trigger: 'maybe', conversation: bridged, slots: SLOTS }).fixed_line, LINES.offer_slots(SLOTS));
   assert.equal(plan({ trigger: 'I guess so', conversation: bridged, slots: SLOTS }).required_move, 'offer_slots');
 });
+
+test('break test: offered times replace "a team member will call you to set up a time"', () => {
+  const p = plan({ trigger: 'How much is it, how long does install take, and do you do doors too?', slots: SLOTS });
+  assert.equal(p.required_move, 'offer_slots');
+  const out = enforceNepqPlan('We do doors, and most installs run 1 to 2 days. A team member will call you to set up a time that works. What is your first name?', p);
+  assert.doesNotMatch(out.text, /will call you to set up/);
+  assert.match(out.text, /^We do doors, and most installs run 1 to 2 days\. I have /);
+});
