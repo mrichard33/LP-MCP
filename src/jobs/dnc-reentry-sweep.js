@@ -77,6 +77,9 @@ export function buildOptedOutAfterSql(leads) {
   const dispos = FIVE9_DNC_DISPOSITIONS.map(q).join(',');
   // The Five9 side is cut to the window's DNC dispositions once (tens of
   // rows) rather than range-scanned per lead.
+  // A 'five9_legacy' consent row (2026-10-02, dnc-lift-review.js) records a
+  // block OLDER than the consent model, written when its review card posts. It
+  // is not a fresh opt-out, so it must never settle a later lead silently.
   return `
     WITH v(id, cid, p, at) AS (VALUES ${values}),
          f AS MATERIALIZED (
@@ -88,6 +91,7 @@ export function buildOptedOutAfterSql(leads) {
      WHERE EXISTS (SELECT 1 FROM consent_events e
                     WHERE e.ghl_contact_id = v.cid AND v.cid <> ''
                       AND e.change IN ('revoked','dnc_full_on','carrier_stop_on')
+                      AND e.source <> 'five9_legacy'
                       AND e.created_at > v.at)
         OR EXISTS (SELECT 1 FROM f
                     WHERE f.received_at > v.at AND v.p <> ''
