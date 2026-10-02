@@ -55,7 +55,7 @@ import { enforceCallTiming } from '../agentic/team-hours.js';
 import { rewriteBookingClaims } from '../agentic/booking-claim.js';
 import { looksLikeShortPhone } from '../agentic/contact-typos.js';
 import { planNepqTurn, enforceNepqPlan, nepqBackboneMode, pickFresh, LINES as NEPQ_LINES } from '../agentic/nepq-planner.js';
-import { COLLECT_ASK, holdLine, missingItems, parseDecisionMakers, heldSlot, nameFromReply } from '../agentic/booking-collect.js';
+import { COLLECT_ASK, COLLECT_ASK_AGAIN, dmAsk, holdLine, missingItems, parseDecisionMakers, heldSlot, nameFromReply } from '../agentic/booking-collect.js';
 import { contactRecheckLine } from '../agentic/contact-check.js';
 import { chatIdentity } from './identity-capture.js';
 import {
@@ -403,7 +403,7 @@ export function nepqSummary(plan) {
   return { step: plan.step, move: plan.required_move, objection: plan.objection?.type || null, handoff: plan.handoff?.reason || null, counters: plan.counters };
 }
 
-const NEPQ_FIXED_MOVES = new Set(['handoff', 'objection_play', 'ask_day', 'close', 'reveal', 'offer_slots']);
+const NEPQ_FIXED_MOVES = new Set(['handoff', 'objection_play', 'ask_day', 'close', 'reveal', 'offer_slots', 'status_frame']);
 
 /** How long a reply that already claimed the turn gets to finish sending. */
 export const LATE_SEND_WAIT_MS = 20000;
@@ -892,7 +892,7 @@ export function createLiveChatFastLane(deps) {
       const planInput = {
         channel: 'livechat', trigger: body, conversation: context.conversation_recent, firstName: realFirst,
         hasAppointment: context.lp?.appointment_set === true && context.lp?.appointment_is_past !== true,
-        nextStepLabel: 'a visit at your home', discipline, nowMs: d.now(),
+        nextStepLabel: 'a free visit at your home', discipline, nowMs: d.now(),
       };
       nepqPlan = planNepqTurn(planInput);
       if (wantsSlots(nepqPlan)) {
@@ -1308,7 +1308,9 @@ export function createLiveChatFastLane(deps) {
         channel: 'livechat',
       });
       if (missing.length) {
-        const askLine = COLLECT_ASK[missing[0]];
+        // Asked before in this chat: the second wording (never the same question twice).
+        const firstAsk = missing[0] === 'dm' ? dmAsk(allTexts) : COLLECT_ASK[missing[0]];
+        const askLine = pickFresh([firstAsk, COLLECT_ASK_AGAIN[missing[0]]].filter(Boolean), plan.recent_outbound || [], 0);
         // 2026-10-02 (Mark): no opener twice in a row ("Got it." … "Got it.").
         const ack = (typed.first_name && plan.held_slot?.asked === 'name') ? `Thanks, ${typed.first_name}.` : pickFresh(['Got it.', 'Perfect, thanks.', 'Great, thank you.'], plan.recent_outbound || [], 0);
         const reply = isConfirm ? holdLine(chosen, tz, askLine) : `${ack} ${askLine}`;

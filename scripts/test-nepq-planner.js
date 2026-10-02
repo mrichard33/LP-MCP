@@ -102,7 +102,7 @@ test('booking sequence: neither → day ask; a pick → confirm; yes to the brid
   assert.equal(plan({ trigger: 'wednesday', conversation: offer }).required_move, 'confirm');
   const bridged = T(['outbound', 'Based on what you told me, this could work for you, since you mentioned drafts. The next step would be a visit at your home. Would that help?']);
   assert.equal(plan({ trigger: 'yes', conversation: bridged, slots: SLOTS }).fixed_line, LINES.offer_slots(SLOTS));
-  assert.equal(LINES.confirm(SLOTS[0], 'ET', 'Dana'), 'Got it, Dana. I have you down for Tue, Oct 6 at 10:00 AM ET. A team member will reach out to confirm the details.');
+  assert.equal(LINES.confirm(SLOTS[0], 'ET', 'Dana'), "You're all set for Tue, Oct 6 at 10:00 AM ET, Dana. Our team will reach out to confirm the details.");
 });
 
 test('discovery is short: after the cap the bridge is required', () => {
@@ -157,7 +157,7 @@ test('guard: a skipped bridge is written in their words', () => {
   const p = planNepqTurn({ nowMs: OPEN_MS, channel: 'livechat', trigger: 'about 10 years', conversation: thread });
   const out = enforceNepqPlan('Ten years is a long time. What made you start looking now?', p).text;
   assert.equal(out, p.bridge_line);
-  assert.match(out, /, since you mentioned the drafts\. The (?:easiest |best )?next step (?:would be|is) a visit at your home\. Would that (?:help|work for you|be useful)\?$/);
+  assert.match(out, /, since you mentioned the drafts\. The (?:easiest |best )?next step (?:would be|is) a free visit at your home\. Would that (?:help|work for you|be useful)\?$/);
 });
 
 // 2026-10-02 (Mark): "We shouldn't be repeating the same message."
@@ -452,4 +452,29 @@ test('break test: offered times replace "a team member will call you to set up a
   const out = enforceNepqPlan('We do doors, and most installs run 1 to 2 days. A team member will call you to set up a time that works. What is your first name?', p);
   assert.doesNotMatch(out.text, /will call you to set up/);
   assert.match(out.text, /^We do doors, and most installs run 1 to 2 days\. I have /);
+});
+
+// ── Mark's NEPQ spec (2026-10-02): the Status Frame opener ──
+test('opener: a vague first chat message gets the Status Frame once, no model needed', () => {
+  for (const t of ['hi', 'Hi there', 'I need new windows.', 'looking for impact windows']) {
+    const p = planNepqTurn({ nowMs: OPEN_MS, channel: 'livechat', trigger: t, conversation: [] });
+    assert.equal(p.required_move, 'status_frame', t);
+    assert.equal(p.fixed_line, LINES.status_frame);
+  }
+  const again = planNepqTurn({ nowMs: OPEN_MS, channel: 'livechat', trigger: 'hello?', conversation: T(['inbound', 'hi'], ['outbound', LINES.status_frame]) });
+  assert.notEqual(again.required_move, 'status_frame');
+});
+
+test('opener: a question, a detail, or SMS skips it', () => {
+  for (const t of ['Do you sell aluminum windows?', 'my windows are old and drafty', 'how much for 12 windows?']) {
+    assert.notEqual(planNepqTurn({ nowMs: OPEN_MS, channel: 'livechat', trigger: t, conversation: [] }).required_move, 'status_frame', t);
+  }
+  assert.notEqual(planNepqTurn({ nowMs: OPEN_MS, channel: 'sms', trigger: 'hi', conversation: [] }).required_move, 'status_frame');
+});
+
+test('the bridge after the opener never asks "Would that help?" a second time, and says "free visit"', () => {
+  const p = planNepqTurn({ nowMs: OPEN_MS, channel: 'livechat', trigger: 'idk', conversation: T(['inbound', 'hi'], ['outbound', LINES.status_frame], ['inbound', 'sure'], ['outbound', 'What made you start looking into this now?'], ['inbound', 'idk'], ['outbound', 'No worries. Are they drafty?'], ['inbound', 'idk']) });
+  const line = bridgeLine(p);
+  assert.match(line, /a free visit at your home/);
+  assert.doesNotMatch(line, /Would that help\?$/);
 });

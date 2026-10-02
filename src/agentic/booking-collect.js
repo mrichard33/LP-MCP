@@ -21,8 +21,34 @@ export const COLLECT_ASK = Object.freeze({
   name: "What's your first name?",
   phone: "What's the best phone number to reach you?",
   address: "What's the street address for the visit, including the zip code?",
-  dm: 'Will anyone else be part of the decision, like a spouse or partner?',
+  // Mark's spec: the reason travels with the question.
+  dm: "Will anyone else be part of the decision? We'll want them there too so nobody has to repeat anything.",
 });
+
+// Second wordings, for an item asked again (Mark, 2026-10-02: the same
+// "What's the best phone number to reach you?" went out three times in one
+// chat). The first ask is always COLLECT_ASK; heldSlot reads both back.
+export const COLLECT_ASK_AGAIN = Object.freeze({
+  name: 'Who should I put the visit under?',
+  phone: "We'll need a number so the team can confirm the visit. What's the best one to reach you?",
+  address: 'What address should the team come to? The street and zip are all I need.',
+  dm: 'Is anyone else part of the decision, so we can pick a time that works for everyone?',
+});
+
+/** The spouse or partner they mentioned ("my wife works then"), or null. Pure. */
+export function mentionedPartner(texts = []) {
+  for (const t of [...texts].reverse()) {
+    const m = String(t || '').match(/\bmy\s+(wife|husband|spouse|partner|fianc[eé]e?|boyfriend|girlfriend)\b/i);
+    if (m) return m[1].toLowerCase();
+  }
+  return null;
+}
+
+/** The decision-maker question, about the person they already named when there is one. Pure. */
+export function dmAsk(texts = []) {
+  const who = mentionedPartner(texts);
+  return who ? `Will your ${who} be able to be there then?` : COLLECT_ASK.dm;
+}
 
 // The hold line. The phrase "I'm holding … for you." is what heldSlotText reads back.
 export function holdLine(slot, tz, ask) {
@@ -35,7 +61,7 @@ export function slotLabel(slot, tz) {
 }
 
 const HOLD_RX = /\bI'm holding (.+?) for you\./i;
-const ASK_KEYS = Object.entries(COLLECT_ASK);
+const ASK_KEYS = [...Object.entries(COLLECT_ASK), ...Object.entries(COLLECT_ASK_AGAIN), ['dm', ' be able to be there then?']];
 
 /**
  * The time we are holding, and which detail we asked for last, from the
@@ -51,7 +77,7 @@ export function heldSlot(thread = []) {
     // A booking line, or a new offer of two times (the spouse-conflict and
     // "that time just filled up" re-offers). "PM." inside an offer is not a
     // sentence end, so the offer is read up to its "?" (2026-10-02 test).
-    if (/\bI have you down for\b|\bI have\b[^?]{0,140}\bor\b[^?]*\?/i.test(text) && !HOLD_RX.test(text)) return null;
+    if (/\bI have you down for\b|\byou'?re all set for\b|\bI have\b[^?]{0,140}\bor\b[^?]*\?/i.test(text) && !HOLD_RX.test(text)) return null;
     const m = text.match(HOLD_RX);
     if (m) {
       const last = outbound[outbound.length - 1];

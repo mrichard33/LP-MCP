@@ -21,7 +21,7 @@ test('the held time and the last thing we asked are read back from the thread', 
 
 test('nothing is held once booked or after a new offer', () => {
   const held = OUT(holdLine(SLOT, 'ET', COLLECT_ASK.address));
-  assert.equal(heldSlot([held, OUT('Got it. I have you down for Sat, Oct 3 at 10:00 AM ET. A team member will reach out to confirm the details.')]), null);
+  assert.equal(heldSlot([held, OUT("You're all set for Sat, Oct 3 at 10:00 AM ET. Our team will reach out to confirm the details.")]), null);
   assert.equal(heldSlot([held, OUT('I have Tue, Oct 6 at 2:00 PM or Wed, Oct 7 at 6:00 PM. Which works better?')]), null);
   assert.equal(heldSlot([]), null);
 });

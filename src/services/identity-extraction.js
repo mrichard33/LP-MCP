@@ -594,8 +594,13 @@ export function assertBookingPrerequisites(state, opts = {}) {
   // the alternative the policy offers when schedules will not line up, and
   // gating it would remove the way out of the very problem it solves.
   const dmAsked = id.decision_maker_question_asked || id.decision_maker_confirmed !== 'unknown';
+  // 2026-10-02 (Mark, superseding 2026-09-18): ask once, then BOOK. Since the
+  // 09-18 rule the text bot booked nothing (12 bookings 08-03..09-07, then 0);
+  // on 09-21 a lead asked for "tomorrow" three times, was held on "whoever
+  // else is deciding", and gave up. An unclear or missing answer no longer
+  // blocks: the visit books as `new` and the team sorts out who attends when
+  // it confirms. Only "my wife can't make that time" moves the time.
   if (!dmAsked) missing.push('decision_maker_question');
-  else if (id.decision_maker_confirmed !== true) missing.push('decision_maker_unresolved');
   if (!id.phone) missing.push('phone');
 
   const emailAsked = tags.includes(EMAIL_ASKED_TAG);

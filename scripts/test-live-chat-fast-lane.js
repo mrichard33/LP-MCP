@@ -881,12 +881,12 @@ test('NEPQ live: "let me think about it" gets two REAL times, no model call', as
 // A contact with everything the in-home gate needs (address, decision-maker answer).
 const READY_CONTACT = { address1: '123 Main St', postalCode: '33601', tags: ['booking:dm-asked'] };
 
-test('NEPQ live: a picked time with nothing missing is booked, and nothing sounds final', async () => {
+test('NEPQ live: a picked time with nothing missing is booked, and they hear they are all set', async () => {
   const offer = "No problem at all. Want to grab a time now so you don't have to chase us down later? I have Tue, Oct 6 at 10:00 AM ET or Wed, Oct 7 at 2:00 PM ET.";
   const { lane, state } = nepqLane({ contact: READY_CONTACT, messages: [M('inbound', 'let me think about it', 3), M('outbound', offer, 2)] });
   await lane.processInbound(INBOUND('wednesday works'));
   assert.deepEqual(state.bookings, [{ contactId: 'C1', startIso: '2026-10-07T18:00:00Z', calendarId: 'CALWE', decisionMakers: null }]);
-  assert.equal(state.sends[0].message, 'Got it, Alyce. I have you down for Wed, Oct 7 at 2:00 PM ET. A team member will reach out to confirm the details.');
+  assert.equal(state.sends[0].message, "You're all set for Wed, Oct 7 at 2:00 PM ET, Alyce. Our team will reach out to confirm the details.");
 });
 
 test('NEPQ live (Mark, 2026-10-02): a pick with the address missing is held, the address and decision-maker asked, then booked', async () => {
@@ -902,17 +902,17 @@ test('NEPQ live (Mark, 2026-10-02): a pick with the address missing is held, the
   await two.lane.processInbound(INBOUND('123 Main St, Tampa FL 33601'));
   assert.equal(two.state.bookings, undefined);
   const dmAsk = two.state.sends[0].message;
-  assert.equal(dmAsk, 'Got it. Will anyone else be part of the decision, like a spouse or partner?');
+  assert.equal(dmAsk, "Got it. Will anyone else be part of the decision? We'll want them there too so nobody has to repeat anything.");
   // 3. "Just me": booked on the held time with Solo Owner.
   const three = nepqLane({ contact: { address1: '123 Main St', postalCode: '33601' }, messages: [M('outbound', offer, 4), M('inbound', 'the first one', 3), M('outbound', hold, 2), M('inbound', '123 Main St, Tampa FL 33601', 1), M('outbound', dmAsk, 0.5)] });
   await three.lane.processInbound(INBOUND('just me'));
   assert.deepEqual(three.state.bookings, [{ contactId: 'C1', startIso: '2026-10-06T14:00:00Z', calendarId: 'CALWE', decisionMakers: 'Solo Owner' }]);
-  assert.match(three.state.sends[0].message, /^Got it, Alyce\. I have you down for Tue, Oct 6 at 10:00 AM ET\. A team member will reach out to confirm the details\.$/);
+  assert.match(three.state.sends[0].message, /^You're all set for Tue, Oct 6 at 10:00 AM ET, Alyce\. Our team will reach out to confirm the details\.$/);
 });
 
 test('NEPQ live: a spouse who cannot make the held time gets two other times', async () => {
   const offer = 'I have Tue, Oct 6 at 10:00 AM ET or Wed, Oct 7 at 2:00 PM ET. Which works better?';
-  const hold = "Great, I'm holding Tue, Oct 6 at 10:00 AM ET for you. Will anyone else be part of the decision, like a spouse or partner?";
+  const hold = "Great, I'm holding Tue, Oct 6 at 10:00 AM ET for you. Will anyone else be part of the decision? We'll want them there too so nobody has to repeat anything.";
   const { lane, state } = nepqLane({ contact: { address1: '123 Main St', postalCode: '33601' }, messages: [M('outbound', offer, 3), M('inbound', 'the first one', 2), M('outbound', hold, 1)] });
   await lane.processInbound(INBOUND('my husband works then'));
   assert.equal(state.bookings, undefined);
@@ -938,7 +938,7 @@ test('NEPQ live: a guest who types their name, phone, address and "just me" is b
   const t4 = [...t3, M('inbound', '12 Main St, Ocala FL 34470', 2), M('outbound', c.state.sends[0].message, 1)];
   const e = lane(t4); await e.lane.processInbound(INBOUND('No, just me'));
   assert.deepEqual(e.state.bookings, [{ contactId: 'C1', startIso: '2026-10-06T14:00:00Z', calendarId: 'CALWE', decisionMakers: 'Solo Owner' }]);
-  assert.equal(e.state.sends[0].message, 'Got it, Mark. I have you down for Tue, Oct 6 at 10:00 AM ET. A team member will reach out to confirm the details.');
+  assert.equal(e.state.sends[0].message, "You're all set for Tue, Oct 6 at 10:00 AM ET, Mark. Our team will reach out to confirm the details.");
 });
 
 test('NEPQ live: "My wife works then" is a conflict even when we asked something else', async () => {
@@ -1051,7 +1051,8 @@ test('no conversation id: the thread comes from our own rows, and the second pri
   ] });
   await lane.processInbound({ contactId: 'C1', messageId: 'm-good-price', body: 'I just want a good price.' });
   assert.equal(state.llmCalls.length, 0);
-  assert.match(state.sends[0].message, /^Fair question\. Every home is different, so a number now would just be a guess\. I have Tue, Oct 6/);
+  // Worded differently from our last message (no closing question twice).
+  assert.match(state.sends[0].message, /^(?:Fair question|I hear you)\. (?:Since every|Every) home is different, (?:so )?(?:a|any) number now would (?:just )?be a guess\. I have Tue, Oct 6/);
 });
 
 test('turnsFromRows: the visitor message and what was sent, oldest first', async () => {

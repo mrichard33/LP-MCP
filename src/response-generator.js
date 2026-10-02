@@ -384,7 +384,7 @@ import { findUnbackedEstimatePromise, estimatePromiseNote, rewriteEstimatePromis
 import { buildInputSnapshot, extractKbModes, extractKbSources } from './bot-feedback/fingerprint-core.js';
 import { normalizeTimezone, tzLongName, tzLabel } from './config/market-timezones.js';
 import { offeredSlots, pickSlot } from './live-chat/cancel-flow.js';
-import { holdLine, COLLECT_ASK, parseDecisionMakers } from './agentic/booking-collect.js';
+import { holdLine, COLLECT_ASK, dmAsk, parseDecisionMakers } from './agentic/booking-collect.js';
 import { contactRecheckLine } from './agentic/contact-check.js';
 import { LINES as NEPQ_LINES } from './agentic/nepq-planner.js';
 import { planNepqTurn, enforceNepqPlan, nepqBackboneMode, nepqFixedLineWins, prefersCall as nepqPrefersCall, objectionType as nepqObjectionType, TIME_REQUEST_RX as NEPQ_TIME_REQUEST_RX, SCHEDULE_ASK_RX as NEPQ_SCHEDULE_ASK_RX,REPEAT_COMPLAINT_RX as NEPQ_REPEAT_COMPLAINT_RX } from './agentic/nepq-planner.js';
@@ -3679,7 +3679,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
         tzLabel: tzLabel(promptTimezoneFor(context)),
         firstName: firstWord && !/^guest$/i.test(firstWord) ? firstWord : null,
         hasAppointment,
-        nextStepLabel: (kbPack?.booking_context?.requires_in_home_gate === true || nepqVisitFirst) ? 'a visit at your home' : 'a quick call with our team',
+        nextStepLabel: (kbPack?.booking_context?.requires_in_home_gate === true || nepqVisitFirst) ? 'a free visit at your home' : 'a quick call with our team',
         discipline,
       });
       if (nepqMode === 'live' && discipline) discipline = { ...discipline, booking: nepqPlan.booking };
@@ -4290,7 +4290,10 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
           if (nepqPlan.required_move === 'confirm' && gateMissing.length) {
             const next = resolveNextMissing(gateMissing) || gateMissing[0];
             const key = /^decision/.test(String(next)) ? 'dm' : (next === 'zip' ? 'address' : next);
-            validated.message = holdLine(pinned, tzLabel(promptTimezoneFor(context)), COLLECT_ASK[key] || COLLECT_ASK.address);
+            const inboundTexts = (context.conversation_recent || []).filter(m => String(m?.direction || '').toLowerCase() !== 'outbound').map(m => String(m?.text ?? m?.body ?? ''));
+            // "My wife works then" earlier: ask about her, not "anyone else".
+            const ask = key === 'dm' ? dmAsk([...inboundTexts, triggerMessage]) : (COLLECT_ASK[key] || COLLECT_ASK.address);
+            validated.message = holdLine(pinned, tzLabel(promptTimezoneFor(context)), ask);
             validated.companion_action = null;
             validated.nepq_plan.held = pinned.iso;
           } else if (validated.companion_action?.action_type === 'book_appointment') {
@@ -4471,10 +4474,9 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       // instead. The phone-call calendars are untouched (they take the `else`
       // branch) because the 15-minute call with both on speaker is the
       // alternative this policy offers, not something it blocks.
-      if (bookingGate && bookingGate.missing.includes('decision_maker_unresolved')) {
-        console.log(`[ResponseGenerator] ⛔ in-home book_appointment dropped for ${contactId} — decision-maker question unresolved (dm="${dm ?? 'absent'}")`);
-        validated.companion_action = null;
-      }
+      // 2026-10-02 (Mark): superseded. The question is asked once and an
+      // unclear answer books as `new` (identity-extraction.js no longer
+      // reports decision_maker_unresolved), so nothing is dropped here.
     } else {
       // Phone calendars (PPR, Confirmation Call): no decision-maker concept —
       // strip qualifying_data so we never write a spurious DM value for a call.

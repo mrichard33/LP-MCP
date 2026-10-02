@@ -131,6 +131,9 @@ export function problemPhrase(word) {
 export const CONSEQUENCE_RX = /\bwhat\s+happens\s+if\b|\bif\s+you\s+(?:wait|hold\s+off|held\s+off|put\s+(?:it|this)\s+off)\b|\banother\s+(?:hurricane\s+)?season\b|\bpush\s+(?:it|this)\s+(?:off|down\s+the\s+road)\b|\bsitting\s+with\s+you\b|\bif\s+(?:those|they|it|that|this|nothing|things)\s+(?:stays?|changes?|keeps?|goes|go|gets?\s+worse)\b|\bthrough\s+(?:this|another|the)\s+(?:hurricane\s+|storm\s+)?season\b|\baffecting\s+you\b|\bwhat\s+would\s+(?:it|that)\s+mean\s+for\s+you\b|\bif\s+another\s+(?:one|storm|hurricane)\b|\banother\s+year\s+(?:with|of)\b|\bwhat'?s\s+another\s+year\b|\bwhat\s+does\s+that\s+(?:end\s+up\s+)?cost(?:ing)?\s+you\b|\bsit\s+as[- ]is\b/i;
 // Every bridge variant (bridgeLine) names "the next step" and must match here.
 const BRIDGE_RX = /\bbased\s+on\s+what\s+you\s+(?:told|said|mentioned)\b|\bthis\s+could\s+work\s+for\s+you\b|\b(?:the\s+)?(?:easiest\s+|best\s+)?next\s+step\s+(?:would\s+be|is)\b/i;
+// A vague opener: a greeting, or "I need new windows" with nothing else to go on.
+const OPENER_RX = /^\s*(?:(?:hi|hello|hey|howdy|good\s+(?:morning|afternoon|evening))(?:\s+there)?[\s!.,]*|(?:hi|hello|hey)?[\s,!.]*(?:i\s+(?:need|want|am\s+looking\s+for|'m\s+looking\s+for)|looking\s+(?:for|into)|interested\s+in)\s+(?:some\s+|new\s+|a\s+few\s+)*(?:impact\s+)?(?:windows?|doors?|windows?\s+and\s+doors?)[\s!.]*)$/i;
+const ASK_DAY_RX = /\bwhat\s+day\s+(?:works\s+best|would\s+be\s+easiest)\b|\bwhich\s+day\s+is\s+best\b/i;
 const STATUS_FRAME_RX = /\bpretty\s+simple\b|\bsee\s+what\s+you\s+have\s+now\b|\bif\s+it\s+might\s+be\s+a\s+fit\b/i;
 const REVEAL_RX = /\banything\s+you'?re\s+wondering\s+about\b|\bbefore\s+your\s+visit\b/i;
 const SLOT_OFFER_RX = /\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b[^?]{0,80}\bor\b|\bI\s+have\s+[^?]{0,80}\bor\b[^?]*\?/i;
@@ -180,7 +183,9 @@ export const LINES = Object.freeze({
   reveal: "Before your visit, is there anything you're wondering about that I can pass along?",
   // 2026-10-02 (Mark): nothing sounds final. The visit is booked as a new,
   // unconfirmed appointment, and a team member confirms it.
-  confirm: (slot, tz, name) => `Got it${name ? `, ${name}` : ''}. I have you down for ${slot.day} at ${slot.time}${tz ? ` ${tz}` : ''}. A team member will reach out to confirm the details.`,
+  // 2026-10-02 (Mark, later ruling): book in real time and tell them they are
+  // all set, with the team reaching out to confirm the details.
+  confirm: (slot, tz, name) => `You're all set for ${slot.day} at ${slot.time}${tz ? ` ${tz}` : ''}${name ? `, ${name}` : ''}. Our team will reach out to confirm the details.`,
   handoff: {
     complaint: "I'm sorry about that. I'm getting someone from our team on this now.",
     emergency: "That's urgent. I'm getting someone from our team on this right now.",
@@ -371,7 +376,7 @@ export function problemEcho(inbound = []) {
  */
 export function planNepqTurn({
   channel = 'sms', trigger = '', conversation = [], slots = [], tzLabel = '', firstName = null,
-  hasAppointment = false, nextStepLabel = 'a visit at your home', discipline = null, nowMs = Date.now(),
+  hasAppointment = false, nextStepLabel = 'a free visit at your home', discipline = null, nowMs = Date.now(),
 } = {}) {
   const turns = normalizeThread(conversation, trigger);
   const inbound = turns.filter(t => t.direction === 'inbound');
@@ -379,7 +384,16 @@ export function planNepqTurn({
   const lastOut = outbound[outbound.length - 1]?.text || '';
   // The times we offered most recently (this turn or the one before): "the
   // first one" often comes after one more line from us (2026-10-02 audit).
-  const lastOfferOut = outbound.slice(-2).reverse().find(m => SLOT_OFFER_RX.test(m.text))?.text || '';
+  // 2026-10-02 replay: a pick came two messages after the offer (a phone
+  // re-check in between) and was not read as a pick. The offer stays open for
+  // four of our messages, until a time is held or booked.
+  const lastOfferOut = (() => {
+    for (const m of outbound.slice(-4).reverse()) {
+      if (/\bI'm\s+holding\b|\bI\s+have\s+you\s+down\s+for\b|\byou'?re\s+all\s+set\s+for\b/i.test(m.text)) return '';
+      if (SLOT_OFFER_RX.test(m.text)) return m.text;
+    }
+    return '';
+  })();
   const now = String(trigger || inbound[inbound.length - 1]?.text || '');
   const offerSlots = (Array.isArray(slots) ? slots : []).slice(0, 2).map(s => ({ ...s, tz: s.tz || tzLabel || '' }));
 
@@ -569,6 +583,16 @@ export function planNepqTurn({
     // "Sure" / "yes" to two times picks neither: ask which, with the times.
     if (!picked && YES_RX.test(now) && offerSlots.length === 2) return fixed('offer_slots', withSlots(vary(LINES.which(offerSlots), ALT_LINES.which(offerSlots))), { step: 'offer_slots' });
     if (picked || YES_RX.test(now)) return Object.assign(plan, { step: 'confirm', required_move: 'confirm', last_offer: lastOfferOut, booking: { allowed: true, reason: 'nepq:confirm' } });
+    // Something else came between (a corrected phone, a name): back to the
+    // times they have not picked yet, in other words.
+    if (lastOut !== lastOfferOut && !isLeadQuestion(now) && !objType && offerSlots.length === 2) {
+      return fixed('offer_slots', withSlots(vary(LINES.which(offerSlots), ALT_LINES.which(offerSlots))), { step: 'offer_slots' });
+    }
+  }
+  // "ok" / "sure" to "what day works best?": the two real times, not more questions.
+  if (ASK_DAY_RX.test(lastOut) && !DAY_OR_TIME_RX.test(now) && (YES_RX.test(now) || MAYBE_RX.test(now) || VAGUE_ANSWER_RX.test(now))) {
+    if (offerSlots.length === 2) return fixed('offer_slots', withSlots(LINES.offer_slots(offerSlots, counters.slot_offers)), { step: 'offer_slots' });
+    return Object.assign(plan, { step: 'offer_slots', required_move: 'offer_slots', booking: { allowed: true, reason: 'nepq:offer_slots' } });
   }
   // They named a day after "what day works best?": offer two times that day.
   if (/\bwhat\s+day\s+works\s+best\b/i.test(lastOut) && DAY_OR_TIME_RX.test(now)) {
@@ -621,6 +645,15 @@ export function planNepqTurn({
     return Object.assign(plan, { step: 'offer_slots', required_move: 'offer_slots', booking: { allowed: true, reason: 'nepq:offer_slots' } });
   }
 
+  // 7c. The Status Frame (Mark's NEPQ spec, 2026-10-02): a visitor who opens
+  // vaguely ("hi", "I need new windows") hears, once, that this is simple and
+  // low-pressure before any discovery. Live chat only: the SMS first touch
+  // comes from the GHL workflow. A question, an objection or a detail skips it.
+  if (channel === 'livechat' && !counters.status_frame_used && !counters.bridge_used && !counters.slot_offers
+    && inbound.length <= 2 && counters.discovery_questions_asked === 0 && OPENER_RX.test(now)) {
+    return fixed('status_frame', LINES.status_frame, { step: 'open', booking: { allowed: false, reason: 'nepq:status_frame' } });
+  }
+
   // 8. Discovery, short: probe in their words, one consequence question, then bridge.
   // Two non-answers in a row ("idk", "maybe") end discovery early: more
   // questions only stall a lead who has nothing more to say (Mark, 2026-10-02).
@@ -657,7 +690,7 @@ const URGENCY_RX = /\bonly\s+\d+\s+(?:spots?|slots?|openings?)\s+left\b|\bspots?
 const CLAIMS_RX = /\bcode\s+(?:changed|tightened|got\s+(?:stricter|tighter)|was\s+(?:updated|changed))\b|\b(?:after|since|before)\s+(?:the\s+)?(?:19|20)\d\d\b[^.?!]{0,40}\bcode\b|\bcode\b[^.?!]{0,40}\b(?:after|since|before)\s+(?:19|20)\d\d\b|\bpeak\s+(?:of\s+)?(?:the\s+)?(?:hurricane|storm)\s+season\b|\bmost\s+active\s+(?:stretch|part|time)\b|\b(?:storm\s+season|we)\s+(?:has|have)\s+(?:us\s+)?(?:slammed|swamped)\b|\bcalendar\s+(?:is\s+)?(?:tight|filling|full)\b|\b(?:andersen|renewal|pgt|pella|lowe'?s|home\s+depot|es\s+windows|cgi)\b[^.?!]{0,60}\b(?:uses?|only|standard|cheap\w*|worse|inferior|lower|basic)\b/i;
 const SEE_YOU_RX = /\bsee\s+you\s+(?:then|soon|there)\b/i;
 const SIGNOFF_RX = /(?:^|\s)([—–-]\s*[A-Z][A-Za-z.'’ ]{0,40})\s*$/;
-const FIXED_MOVES = new Set(['handoff', 'objection_play', 'ask_day', 'close', 'reveal', 'offer_slots']);
+const FIXED_MOVES = new Set(['handoff', 'objection_play', 'ask_day', 'close', 'reveal', 'offer_slots', 'status_frame']);
 
 /**
  * True when the plan ships its own fixed line, so whatever the model drafts is
@@ -688,7 +721,8 @@ export function asksForKnown(sentence, known = {}) {
 export function bridgeLine(plan) {
   const phrase = plan.echo?.phrase || problemPhrase(plan.echo?.word);
   const since = phrase ? `, since you mentioned ${phrase}` : '';
-  const label = plan.next_step_label || 'a visit at your home';
+  // Mark's spec: "a free visit at your home".
+  const label = plan.next_step_label || 'a free visit at your home';
   // 2026-10-02 (Mark): the same bridge word for word in every chat read as a
   // script. Variants, chosen so none repeats one already sent (pickFresh).
   const variants = [
@@ -709,8 +743,12 @@ export function bridgeLine(plan) {
 export function pickFresh(variants, recentOutbound = [], seed = 0) {
   const sent = recentOutbound.map(t => norm(t));
   const opener = (v) => norm(v).split(' ').slice(0, 4).join(' ');
-  const fresh = variants.filter(v => !sent.some(t => t.includes(opener(v))));
-  const pool = fresh.length ? fresh : variants;
+  // The closing question too: the opener and the bridge both ended "Would
+  // that help?" (Mark, 2026-10-02: "asked 'Would that help?' twice").
+  const closing = (v) => norm((String(v).match(/[^.!?]*\?\s*$/) || [''])[0]);
+  const freshOpen = variants.filter(v => !sent.some(t => t.includes(opener(v))));
+  const fresh = freshOpen.filter(v => !closing(v) || !sent.some(t => t.endsWith(closing(v)) || t.includes(`${closing(v)} `)));
+  const pool = fresh.length ? fresh : freshOpen.length ? freshOpen : variants;
   return pool[Math.abs(seed) % pool.length];
 }
 

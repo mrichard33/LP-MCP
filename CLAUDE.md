@@ -264,9 +264,10 @@ again after the price play, two no's, or a repeated objection (`src/agentic/nepq
 + `nepq:handoff:<reason>`, a rep note, an event, and a card in **#contact-center** (`SLACK_CHANNEL_SERVICE`), plus
 **#dispatch** for a complaint or an unbookable pick, via `postToSlack`; a failed post is an #ops-alerts line); the objection plays, the
 think-it-over Calendar Commitment (two REAL slots, exempt from the booking-ask cap), "what day works best",
-the Reveal and the confirm line ("Got it, [name]. I have you down for [day] at [time]. A team member will reach
-out to confirm the details." — nothing sounds final, never a rep name, never "see you then") are Mark's fixed
-wording. Discovery is short (2 questions
+the Reveal and the confirm line ("You're all set for [day] at [time], [name]. Our team will reach out to
+confirm the details." — said only when the booking landed in that turn, never a rep name, never "see you
+then") are Mark's fixed wording. A vague live-chat opener ("hi", "I need new windows") gets the Status Frame
+once (`LINES.status_frame`), and a variant never repeats a closing question already asked (`pickFresh`). Discovery is short (2 questions
 in live chat, 3 on SMS, then the bridge). `renderPlanBlock` is the LAST prompt section and `enforceNepqPlan`
 strips money/financing figures (the customer's own estimate excepted), fake urgency, unallowed booking asks,
 re-asks for a name/phone/email/zip we have, and extra questions. `NEPQ_BACKBONE_MODE` off|shadow|live
@@ -275,7 +276,10 @@ awaited `book_appointment` row and confirms only on `appointment_booked`; GHL st
 handed to a person.
 
 **Book in the conversation, unconfirmed, on the right calendar (Mark, 2026-10-02).** Every bot booking is
-status `new` (the handler forces it). A visit goes on `inHomeCalendarFor(tags)`: Measurement Verification for a
+status `new` (the handler forces it). **Ask about decision makers ONCE, then book** (supersedes 2026-09-18):
+the text bot booked 12 visits 08-03..09-07 and none after the 09-18 "all decision makers attend" block, and
+a lead who asked for "tomorrow" three times gave up. `decision_maker_unresolved` is no longer reported; only
+"my wife can't make that time" moves the time. A visit goes on `inHomeCalendarFor(tags)`: Measurement Verification for a
 calculator lead (`active-entry:estimate-calculator` / `active-entry:calculator`), Window Estimate for everyone
 else; with NEPQ live the SMS bot books a visit too, and the 15-minute call (PPR) is only the backup when the lead
 asks for a call or turns the visit down (`prefersCall`). A yes to the bridge, even "yeah, how long does it take?",

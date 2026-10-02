@@ -46,11 +46,10 @@ const ready = (dm) => ({
 test('CASE 1 — "I\'m the main decision maker, my husband doesn\'t need to be there"', () => {
   // Maps to "No" per the Q3 SOLE-AUTHORITY rule: a partner exists and will not
   // attend. Under the OLD policy this booked one person on the spot.
+  // 2026-10-02 (Mark): asked once, then book. The answer no longer holds the
+  // slot; the visit books as `new` and the team confirms who attends.
   const gate = assertBookingPrerequisites(ready({ asked: true, confirmed: false }));
-  assert.equal(gate.ok, false, 'the gate must hold');
-  assert.ok(gate.missing.includes('decision_maker_unresolved'), gate.missing.join(','));
-  // response-generator nulls availability and booking_url on !gate.ok, so no
-  // slot and no booking link reach the model this turn.
+  assert.equal(gate.ok, true, gate.missing.join(','));
   assert.equal(gate.appointment_status, 'new');
 });
 
@@ -67,12 +66,13 @@ test('never discussed still holds, and asks the FIRST question', () => {
   const gate = assertBookingPrerequisites(ready({ asked: false, confirmed: 'unknown' }));
   assert.equal(gate.ok, false);
   assert.ok(gate.missing.includes('decision_maker_question'));
-  assert.ok(!gate.missing.includes('decision_maker_unresolved'), 'only one DM key at a time');
+  assert.ok(!gate.missing.includes('decision_maker_unresolved'), 'an open answer never blocks');
 });
 
-test('"Uncertain" is not a pass — "I\'ll see if she can make it" holds the slot', () => {
+test('"I\'ll see if she can make it" books as new (Mark, 2026-10-02: ask once, then book)', () => {
   const gate = assertBookingPrerequisites(ready({ asked: true, confirmed: false }));
-  assert.equal(gate.ok, false);
+  assert.equal(gate.ok, true);
+  assert.equal(gate.appointment_status, 'new');
 });
 
 test('exactly ONE decision-maker key is ever missing, so the next ask is unambiguous', () => {
@@ -89,14 +89,9 @@ test('exactly ONE decision-maker key is ever missing, so the next ask is unambig
 
 // ─── the ask ─────────────────────────────────────────────────────────────
 
-test('an unresolved answer asks ONE clarifying question and offers no slot', () => {
+test('an unresolved answer asks nothing more: the visit books (Mark, 2026-10-02)', () => {
   const missing = assertBookingPrerequisites(ready({ asked: true, confirmed: false })).missing;
-  assert.equal(resolveNextMissing(missing), 'decision_maker_unresolved');
-
-  const msg = prerequisiteAskMessage(missing);
-  assert.equal((msg.match(/\?/g) || []).length, 1, `one question mark: ${msg}`);
-  assert.doesNotMatch(msg, /\d{1,2}\s*(am|pm)|monday|tuesday|wednesday|thursday|friday/i,
-    'no slot may be offered while the question is open');
+  assert.deepEqual(missing.filter(k => k.startsWith('decision_maker')), []);
 });
 
 test('the instruction tells the model to acknowledge, not argue, and offers the phone call', () => {
