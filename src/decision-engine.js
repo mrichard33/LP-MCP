@@ -225,6 +225,7 @@ import { emitEvent } from './event-emitter.js';
 import { isInHomeCalendarId } from './knowledge/booking-calendar-router.js';
 import { isRescheduleInflight } from './services/reschedule-inflight.js';
 import { queueS52CancelRecheck, RECHECK_RULE_KEYS } from './s52-cancel-recheck.js';
+import { planRuleActions } from './alert-noise.js';
 import { findBlockingLiveLead, blockingReason } from './duplicate-lead-guard.js';
 // 2026-08-03 — one rank scale, shared with the contact-scoped appointment
 // claim. See the BOOKING_AUTHORITY_RANK note below.
@@ -2083,7 +2084,13 @@ async function createActionsFromRule(event, rule) {
     return [];
   }
 
-  const actions = Array.isArray(rule.action_template) ? rule.action_template : [rule.action_template];
+  // 2026-10-02 (Mark, alert noise cut) — planRuleActions drops the P2 Won /
+  // Lost send_notification while the 8 AM digest owns them (ALERT_DIGEST_ENABLED).
+  const allActions = Array.isArray(rule.action_template) ? rule.action_template : [rule.action_template];
+  const actions = planRuleActions(rule);
+  if (actions.length < allActions.length) {
+    console.log(`[DecisionEngine] ${rule.rule_key}: send_notification held for the morning digest (event ${event.id})`);
+  }
   const batchId = `evt_${event.id}_rule_${rule.rule_key}_${Date.now()}`;
   const created = [];
 

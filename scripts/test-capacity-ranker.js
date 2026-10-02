@@ -2309,7 +2309,8 @@ test('GATE: cycling OFF → heal does not restart, but STILL reports the dark ca
   assert.match(fired[0].text, /is NOT_RUNNING during dial hours and heal will NOT restart it/);
   assert.match(fired[0].text, /out of dialable records/, 'the card names the likeliest cause, so it is actionable at 6pm');
   assert.equal(fired[0].key, `capacity_ranker:heal_not_acting:${CAMPAIGNS.warm}`);
-  assert.ok(fired[0].remindMs > 0, 'and it re-reminds while the campaign stays dark');
+  // 2026-10-02 (Mark, alert noise cut): outages post on state change only — no reminder.
+  assert.equal(fired[0].remindMs, 0, 'no re-remind while the campaign stays dark');
 });
 
 test('GATE: force:true overrides it for a deliberate manual repair', async () => {

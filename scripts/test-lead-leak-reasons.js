@@ -280,7 +280,9 @@ test('hourly pass: lookups only for leads the card names, capped by LEAD_UNCALLE
     reportAlertCondition: async (args) => { calls.push(args); return { action: 'fired' }; },
   });
   const r = await runLeadUncalledCheck({
-    env: { LEAD_LEAK_ALERT_MODE: 'live', LEAD_UNCALLED_LOOKUP_CAP: '2' }, nowMs: NOW, deps: d,
+    // 2026-10-02 — reads the card through the edge-triggered path that
+    // ALERT_DIGEST_ENABLED=false restores; the lookup cap is the same on both.
+    env: { LEAD_LEAK_ALERT_MODE: 'live', LEAD_UNCALLED_LOOKUP_CAP: '2', ALERT_DIGEST_ENABLED: 'false' }, nowMs: NOW, deps: d,
   });
   assert.equal(r.verdict, 'alert');
   assert.ok(!looked.includes('3525550200'), 'not looked up — it is not on the card');

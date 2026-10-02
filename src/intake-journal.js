@@ -50,8 +50,8 @@
  */
 
 import supabase from './supabase.js';
-import { sendGroupMeMessage } from './groupme.js';
-import { claimAlertConditionSet, confirmAlertSend } from './alert-state.js';
+import { claimAlertConditionSet, confirmAlertSend, sendAlertMessage } from './alert-state.js';
+import { alertDigestEnabled, filterNew, recordPosted } from './alert-posted.js';
 import { trackBackground, isShuttingDown } from './graceful-shutdown.js';
 
 const TABLE = 'intake_journal';
@@ -407,7 +407,63 @@ export async function reclassifyInterruptedRows({ client: clientArg, deploymentI
   }
 }
 
-export async function sweepIntakeJournal({ client: clientArg, send = sendGroupMeMessage, nowMs } = {}) {
+// 2026-10-02 — an operational alarm goes to #ops-alerts only (CLAUDE.md), not
+// GroupMe, which is where this used to post.
+const sendToOps = (text, opts = {}) => sendAlertMessage(text, { ...opts, channel: 'ops' });
+
+// 2026-10-02 (Mark, alert noise cut): a request is worth a card only if it is
+// STILL unfinished an hour after it was first seen unfinished — most "orphans"
+// finish or turn out to have landed. Posted once per journal row, ever
+// (audit_posted_items, audit='intake_journal').
+export const INTAKE_ALERT_AFTER_MIN = 60;
+const INTAKE_AUDIT = 'intake_journal';
+
+async function postAgedOrphans({ client, orphanRows, orphans, failureCount, routes, oldest, send, now, summary }) {
+  const keys = orphanRows.map((r) => `${ALERT_PREFIX}${r.id}`);
+  let rows;
+  try {
+    const { data, error } = await client.from('alert_conditions').select('alert_key, first_seen_at').in('alert_key', keys);
+    if (error) throw new Error(error.message);
+    rows = data || [];
+  } catch (err) {
+    console.warn(`[IntakeJournal] could not read first_seen_at (no card this sweep): ${err.message}`);
+    return { orphans, failures: failureCount, routes, oldest, action: 'read_failed' };
+  }
+  const dueBefore = new Date(now - INTAKE_ALERT_AFTER_MIN * 60_000).toISOString();
+  const dueIds = new Set(rows.filter((r) => r.first_seen_at && new Date(r.first_seen_at).toISOString() <= dueBefore)
+    .map((r) => r.alert_key.slice(ALERT_PREFIX.length)));
+  const items = orphanRows.filter((r) => dueIds.has(String(r.id))).map((r) => ({ ...r, key: String(r.id), reason: 'unfinished' }));
+  if (!items.length) {
+    console.log(`${summary} [none unfinished ${INTAKE_ALERT_AFTER_MIN}+ min — silent]`);
+    return { orphans, failures: failureCount, routes, oldest, action: 'silent', newly: 0 };
+  }
+  const { fresh, dedupe } = await filterNew({ audit: INTAKE_AUDIT, items, nowMs: now, deps: { supabase: client } });
+  // A broken dedupe store here would repeat the card every 5 minutes; hold it.
+  if (dedupe === 'unavailable') return { orphans, failures: failureCount, routes, oldest, action: 'dedupe_unavailable' };
+  if (!fresh.length) {
+    console.log(`${summary} [already posted — silent]`);
+    return { orphans, failures: failureCount, routes, oldest, action: 'silent', newly: 0 };
+  }
+  const newRoutes = [...new Set(fresh.map((r) => r.route))].sort();
+  const text =
+    `🚨 SYSTEM — ${fresh.length} lead request(s) still unfinished ${INTAKE_ALERT_AFTER_MIN}+ minutes after they stalled.\n`
+    + `Routes: ${newRoutes.join(', ')}\n`
+    + `Oldest of these: ${fresh[0].received_at}\n`
+    + `Unfinished backlog: ${orphans} total | failures (24h): ${failureCount}\n`
+    + 'Payloads saved in intake_journal — check whether the work landed anyway before treating these as lost.';
+  let sent = false;
+  try {
+    const r = await send(text, { noDedup: true });
+    sent = r?.sent !== false;
+  } catch (err) {
+    console.error(`[IntakeJournal] alert send failed: ${err.message}`);
+  }
+  if (sent) await recordPosted({ audit: INTAKE_AUDIT, items: fresh, permanent: true, nowMs: now, deps: { supabase: client } });
+  console.log(`${summary} [${sent ? 'alerted' : 'send failed'} on ${fresh.length} aged]`);
+  return { orphans, failures: failureCount, routes, oldest, action: sent ? 'fired' : 'send_failed', newly: sent ? fresh.length : 0 };
+}
+
+export async function sweepIntakeJournal({ client: clientArg, send = sendToOps, nowMs } = {}) {
   const mode = journalMode();
   const idle = { orphans: 0, failures: 0, routes: [], oldest: null, action: 'skipped' };
   if (mode === 'off') return idle;
@@ -491,6 +547,12 @@ export async function sweepIntakeJournal({ client: clientArg, send = sendGroupMe
   if (!claim.ok) {
     console.warn(`[IntakeJournal] alert claim unavailable (${claim.reason}) — not alerting this sweep`);
     return { orphans, failures: failureCount, routes, oldest, action: 'claim_failed' };
+  }
+
+  // Digest era: the claim is state only; the card waits an hour (postAgedOrphans).
+  if (alertDigestEnabled()) {
+    if (claim.newlyFiring.length) await confirmAlertSend(claim.newlyFiring, { client, nowMs: now });
+    return postAgedOrphans({ client, orphanRows, orphans, failureCount, routes, oldest, send, now, summary });
   }
 
   if (claim.newlyFiring.length === 0) {

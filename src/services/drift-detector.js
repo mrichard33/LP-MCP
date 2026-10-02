@@ -7,9 +7,10 @@
  * GHL (e.g., carrying stage:long-term-nurture for >24h) and joins them
  * against lp_leads to find any whose LP disposition is still active.
  *
- * On mismatch, emits ONE system.drift_batch_detected event carrying the
- * contacts that just started drifting. An agent_rule routes that to
- * GroupMe as a single summary notification. Never auto-overwrites LP.
+ * On mismatch, posts ONE #ops-alerts card per contact the first time it is
+ * seen, never again (2026-10-02, see postDriftCards). It still emits the
+ * system.drift_batch_detected event for the record, but that event is not on
+ * the intake allowlist and routes nowhere. Never auto-overwrites LP.
  *
  * Cron: 30-min interval, kicks 5 min after boot. Killable via
  *   DRIFT_DETECTOR_DISABLED=true.
@@ -58,6 +59,7 @@
 import supabase from '../supabase.js';
 import { emitEvent } from '../event-emitter.js';
 import { claimAlertConditionSet, confirmAlertSend } from '../alert-state.js';
+import { filterNew, recordPosted } from '../alert-posted.js';
 
 const ACTIVE_LP_DISPOSITIONS = ['Issued', 'Set', 'Cnf', 'Data', 'NOC', 'OPPFDN', '1Leg', 'BO'];
 const DRIFT_THRESHOLD_HOURS = 24;
@@ -160,6 +162,101 @@ async function fetchDriftCandidates(closureTag, closedForHours, limit) {
   }
 }
 
+// ── 2026-10-02 (Mark): ONE card per drifted contact, ever ──────────────
+// The batch event above never reached anyone: system.drift_batch_detected is
+// not on the intake allowlist, so emitEvent filtered it while the keys were
+// still marked announced. Now each contact gets its own #ops-alerts card the
+// first time it is seen, recorded PERMANENTLY in audit_posted_items
+// (audit='drift'). It never posts again for that contact — not after it
+// clears and drifts back, not after a redeploy. Not part of the morning digest
+// and not behind ALERT_DIGEST_ENABLED.
+//
+// Two guards against a flood, because the backlog is ~150 contacts:
+//   - posting waits until backfillDriftPosted() has marked every contact the
+//     alert table already knows (firing or cleared) as posted;
+//   - an unreadable audit_posted_items posts NOTHING this scan (the shared
+//     helper's "treat all as new" is the wrong default here), and at most
+//     DRIFT_CARDS_PER_SCAN cards go out per scan — the rest wait, unrecorded.
+export const DRIFT_AUDIT = 'drift';
+const DRIFT_REASON = 'drift';
+const DRIFT_CARDS_PER_SCAN = 20;
+let driftBackfillDone = false;
+
+/** TESTS ONLY. */
+export function __resetDriftBackfill(done = false) { driftBackfillDone = done; }
+
+/**
+ * Mark every contact alert_conditions already holds under the drift prefix as
+ * posted for good. Idempotent. Returns { ok, marked }.
+ */
+export async function backfillDriftPosted(deps = {}) {
+  const db = deps.supabase || supabase;
+  try {
+    const { data, error } = await db.from('alert_conditions')
+      .select('alert_key')
+      .like('alert_key', `${DRIFT_ALERT_PREFIX}%`);
+    if (error) throw new Error(error.message);
+    const items = (data || []).map((r) => ({ key: r.alert_key.slice(DRIFT_ALERT_PREFIX.length), reason: DRIFT_REASON }))
+      .filter((i) => i.key);
+    const res = await recordPosted({ audit: DRIFT_AUDIT, items, permanent: true, deps: { supabase: db } });
+    if (!res.ok) throw new Error(res.error || 'record failed');
+    driftBackfillDone = true;
+    console.log(`[drift-detector] backfill: ${items.length} drift contact(s) marked as already posted (permanent)`);
+    return { ok: true, marked: items.length };
+  } catch (err) {
+    console.warn(`[drift-detector] backfill failed — drift cards held until it succeeds: ${err.message}`);
+    return { ok: false, marked: 0, error: err.message };
+  }
+}
+
+/** Pure. The card for one drifted contact. */
+export function formatDriftCard(d, name) {
+  return `🔁 GHL closed / LP active — ${name || '(no name)'} · ${d.contact_id} · LP lead ${d.lp_lead_id ?? '?'} still ${d.lp_disposition} · ` +
+    'close the LP lead, or reopen the contact in GHL';
+}
+
+async function lookupNames(ids) {
+  if (!ids.length) return new Map();
+  try {
+    const { hlRunSQL, esc } = await import('../admin/hl-client.js');
+    const rows = await hlRunSQL(
+      `SELECT ghl_contact_id, first_name, last_name FROM contacts WHERE ghl_contact_id IN (${ids.map((id) => `'${esc(id)}'`).join(',')})`,
+    );
+    return new Map((rows || []).map((r) => [r.ghl_contact_id, [r.first_name, r.last_name].filter(Boolean).join(' ').trim()]));
+  } catch {
+    return new Map();
+  }
+}
+
+/**
+ * Post the once-ever card for each drifted contact not yet posted.
+ * deps: { supabase, send, lookupNames, backfill }
+ */
+export async function postDriftCards(driftDetails, deps = {}) {
+  if (!driftDetails.length) return { posted: 0, held: 0, reason: 'no_drift' };
+  const db = deps.supabase || supabase;
+  if (!driftBackfillDone) {
+    const bf = await (deps.backfill || backfillDriftPosted)({ supabase: db });
+    if (!bf.ok) return { posted: 0, held: driftDetails.length, reason: 'backfill_pending' };
+  }
+  const items = driftDetails.map((d) => ({ ...d, key: d.contact_id, reason: DRIFT_REASON }));
+  const { fresh, dedupe } = await filterNew({ audit: DRIFT_AUDIT, items, deps: { supabase: db } });
+  if (dedupe === 'unavailable') return { posted: 0, held: items.length, reason: 'dedupe_unavailable' };
+  const batch = fresh.slice(0, DRIFT_CARDS_PER_SCAN);
+  if (!batch.length) return { posted: 0, held: 0, reason: 'nothing_new' };
+  const send = deps.send || (await import('../alert-state.js')).sendAlertMessage;
+  const names = await (deps.lookupNames || lookupNames)(batch.map((d) => d.contact_id));
+  let posted = 0;
+  for (const d of batch) {
+    const res = await send(formatDriftCard(d, names.get(d.contact_id)), { channel: 'ops' });
+    if (res?.sent === false) continue; // not recorded → tried again next scan
+    await recordPosted({ audit: DRIFT_AUDIT, items: [d], permanent: true, deps: { supabase: db } });
+    posted++;
+  }
+  console.log(`[drift-detector] drift cards: ${posted} posted, ${fresh.length - posted} waiting`);
+  return { posted, held: fresh.length - posted, reason: 'ok' };
+}
+
 async function getLpDisposition(lp_prospect_id) {
   if (!supabase || !lp_prospect_id) return null;
   const { data } = await supabase
@@ -179,6 +276,8 @@ export async function runDriftScan({
   // bindings are read-only, so this is how a test observes what would have been
   // announced without reaching system_events.
   emit = emitEvent,
+  // 2026-10-02 — the once-per-contact card; injectable for tests.
+  postCards = postDriftCards,
 } = {}) {
   const startedAt = Date.now();
   const result = await fetchDriftCandidates(closure_tag, closed_for_hours);
@@ -231,7 +330,16 @@ export async function runDriftScan({
     }, {}),
   ).sort((a, b) => b[1] - a[1]).map(([disp, n]) => `${disp}=${n}`).join(', ');
 
+  // Once-per-contact cards first: they do not depend on the claim set below.
+  let cards = { posted: 0, held: 0, reason: 'not_run' };
+  try {
+    cards = await postCards(driftDetails);
+  } catch (err) {
+    console.warn(`[drift-detector] drift cards failed: ${err.message}`);
+  }
+
   const baseResult = {
+    drift_cards: cards,
     success: true,
     scanned: candidates.length,
     drift: driftCount,

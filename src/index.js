@@ -313,6 +313,7 @@ import { registerTagHygieneRoutes, startTagHygieneScheduler } from './jobs/tag-h
 import { registerCleanup20261002Routes } from './admin/cleanup-2026-10-02-f0-s52.js';  // 2026-10-02 — one-time F.0 / S5.2 cleanup
 import { startSiteEventsRetentionScheduler } from './jobs/site-events-retention.js';  // 2026-10-01
 import { startF0IntegrityAuditScheduler } from './jobs/f0-integrity-audit.js';  // 2026-09-30
+import { startOpsMorningDigestScheduler } from './jobs/ops-morning-digest.js';  // 2026-10-02 — alert noise cut
 import { startOfficePowerRankingScheduler } from './jobs/office-power-ranking.js';  // 2026-09-24
 import { startSaleBackstopScheduler } from './jobs/sale-announce-backstop.js';  // 2026-09-25
 import { startMissedCallerRecoveryScheduler } from './jobs/missed-caller-recovery.js';  // 2026-09-24
@@ -932,6 +933,7 @@ const server = app.listen(PORT, async () => {
   startTagHygieneScheduler();
   startSiteEventsRetentionScheduler();
   startF0IntegrityAuditScheduler();
+  startOpsMorningDigestScheduler();
   startOfficePowerRankingScheduler();
   startSaleBackstopScheduler();
   startMissedCallerRecoveryScheduler();

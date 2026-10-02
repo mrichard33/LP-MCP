@@ -211,15 +211,29 @@ export const JOBS = Object.freeze([
   },
   {
     // 2026-09-30 (fix/f0-oppfdn-integrity): read-only report of anyone in F.0
-    // whose current LP lead is not OPPFDN or who never really demoed. Posts to
-    // #ops-alerts every day, clean or not.
+    // whose current LP lead is not OPPFDN or who never really demoed.
+    // 2026-10-02: runs inside ops-morning-digest (ALERT_DIGEST_ENABLED) and
+    // posts only new problems; it no longer posts a clean day.
     id: 'f0-integrity-audit',
     label: 'F.0 integrity audit',
     group: 'ghl',
-    cadence: 'daily 08:00 ET',
+    cadence: 'daily 08:00 ET (in the ops morning digest)',
     enabledEnv: 'F0_AUDIT_ENABLED',
     enabledDefault: true,
     isEnabled: (env) => String(env.F0_AUDIT_ENABLED || 'true').toLowerCase() !== 'false',
+  },
+  {
+    // 2026-10-02 (Mark, alert noise cut): the one 08:00 ET post to #ops-alerts —
+    // P2 won/lost, new appointment parity gaps, and the morning checks (F.0/S5.2,
+    // lead leak, link leak, P2 unresolvable) listing only items never posted.
+    // Mirrors alertDigestEnabled() in src/alert-posted.js.
+    id: 'ops-morning-digest',
+    label: 'Ops morning digest',
+    group: 'notifications',
+    cadence: 'daily 08:00 ET',
+    enabledEnv: 'ALERT_DIGEST_ENABLED',
+    enabledDefault: true,
+    isEnabled: (env) => String(env.ALERT_DIGEST_ENABLED ?? 'true').trim().toLowerCase() !== 'false',
   },
   {
     id: 'office-power-ranking',
@@ -279,7 +293,8 @@ export const JOBS = Object.freeze([
     id: 'lead-leak-monitor',
     label: 'Lead leak monitor (uncalled LP leads)',
     group: 'five9',
-    cadence: 'daily 07:00 ET',
+    // 2026-10-02: 08:00 ET inside ops-morning-digest while ALERT_DIGEST_ENABLED.
+    cadence: 'daily 08:00 ET (in the ops morning digest; 07:00 ET when ALERT_DIGEST_ENABLED=false)',
     enabledEnv: 'LEAD_LEAK_MONITOR_MODE',
     // A MODE, not a boolean (2026-09-26): off | shadow | live, default shadow.
     // Shadow measures and stores every morning, so a silent shadow run is a
