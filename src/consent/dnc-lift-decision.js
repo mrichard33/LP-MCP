@@ -44,6 +44,12 @@
  * The batch runs IMMEDIATELY (runActionsNow) so the response carries real
  * per-action outcomes; rows are inserted with retry_at in the future so the
  * queue executor cannot race the route for them.
+ *
+ * ASYNC (2026-10-02): with `async: true` + the card's `channel` (and
+ * `card_blocks`), the route answers 202 at once, runs the batch in the
+ * background (MAX_PARALLEL_LIFTS at a time), and dnc-lift-report.js updates
+ * the card and posts the thread itself. 41 approvals in two minutes outran
+ * n8n's 120s wait and left 40 cards on "⏳ Lifting" with the work done.
  */
 
 import crypto from 'node:crypto';
@@ -53,6 +59,7 @@ import { approveAgentAction } from '../actions/approve-action.js';
 import { getConsent, detectCarrierStop, blockingTags, isMissingSchemaError } from './consent-store.js';
 import { APPROVED_DNC_LIFT_RULE_KEY, isSlackUserId } from '../five9/admin-writes.js';
 import { lpManualClearRequired } from './dnc-lift-review.js';
+import { trackBackground } from '../graceful-shutdown.js';
 
 export const KEEP_BLOCKED_RULE_KEY = 'SLACK_DNC_KEEP_BLOCKED';
 export const LIFT_TAGS = Object.freeze([
@@ -242,6 +249,30 @@ export function lpClearOutcome(results, { env = process.env, reviewPayload = nul
   };
 }
 
+// ─── background lifts (2026-10-02) ───────────────────────────────────────────
+//
+// 41 approvals in two minutes ran 41 batches at once; GHL slowed under the
+// load, set_dnd timed out on most first tries, and every batch took 2–2.5
+// minutes — past n8n's 120s wait, so 40 cards stuck on "⏳ Lifting". With
+// `async: true` the route answers 202 at once and the batch runs here, a few at
+// a time; dnc-lift-report.js posts the result to the card and its thread.
+export const MAX_PARALLEL_LIFTS = 3;
+let liftsActive = 0;
+const liftsWaiting = [];
+export function runLimited(fn, max = MAX_PARALLEL_LIFTS) {
+  return new Promise((resolve, reject) => {
+    const go = () => {
+      liftsActive += 1;
+      Promise.resolve().then(fn).then(resolve, reject).finally(() => {
+        liftsActive -= 1;
+        const next = liftsWaiting.shift();
+        if (next) next();
+      });
+    };
+    if (liftsActive < max) go(); else liftsWaiting.push(go);
+  });
+}
+
 // ─── the route ───────────────────────────────────────────────────────────────
 
 async function defaultReadContact(contactId) {
@@ -287,6 +318,20 @@ export async function handleDncLiftDecision({ body = {}, headers = {} }, deps = 
   const slackUserName = typeof body.slack_user_name === 'string' ? body.slack_user_name.trim() : '';
   const slackTs = body.slack_ts.trim();
   const decision = body.decision;
+  // async (2026-10-02): n8n sends the card's channel and blocks so the server
+  // can post the result itself; without it the route answers as before.
+  const asyncMode = body.async === true;
+  const slackChannel = typeof body.channel === 'string' ? body.channel.trim() : '';
+  if (asyncMode && !/^[CGD][A-Z0-9]{6,}$/.test(slackChannel)) {
+    return { status: 400, json: { ok: false, errors: ['async requires channel (a Slack channel id)'] } };
+  }
+  const reportMeta = asyncMode
+    ? {
+      report_mode: 'server',
+      slack_channel: slackChannel,
+      card_blocks: Array.isArray(body.card_blocks) ? body.card_blocks.slice(0, 40) : null,
+    }
+    : null;
 
   // ── the idempotency record ──
   const found = await db.from('dnc_lift_requests').select('*').eq('request_id', requestId).maybeSingle();
@@ -315,6 +360,7 @@ export async function handleDncLiftDecision({ body = {}, headers = {} }, deps = 
     .update({
       status: 'processing', decision, slack_user_id: slackUserId,
       slack_user_name: slackUserName || null, slack_ts: slackTs, decided_at: nowIso,
+      ...(reportMeta ? { batch_result: reportMeta } : {}),
     })
     .eq('request_id', requestId)
     .eq('status', 'awaiting_decision')
@@ -327,11 +373,11 @@ export async function handleDncLiftDecision({ body = {}, headers = {} }, deps = 
 
   const finish = async (status, batchResult) => {
     await db.from('dnc_lift_requests')
-      .update({ status, batch_result: batchResult, completed_at: new Date(deps.now ? deps.now() : Date.now()).toISOString() })
+      .update({ status, batch_result: reportMeta ? { ...reportMeta, ...batchResult } : batchResult, completed_at: new Date(deps.now ? deps.now() : Date.now()).toISOString() })
       .eq('request_id', requestId);
   };
 
-  try {
+  const work = async () => { try {
     // ── what blocks them, and did they text STOP? ──
     const readContact = deps.readContact || defaultReadContact;
     const [contact, consentRead] = await Promise.all([
@@ -390,7 +436,18 @@ export async function handleDncLiftDecision({ body = {}, headers = {} }, deps = 
     await finish('failed', { decision, error: err.message }).catch(() => {});
     console.error(`[DncLiftDecision] ${decision} for ${contactId} failed: ${err.message}`);
     return { status: 500, json: { ok: false, request_id: requestId, error: err.message } };
-  }
+  } };
+
+  if (!asyncMode) return work();
+
+  trackBackground(runLimited(work).then(async () => {
+    const report = deps.report || (await import('./dnc-lift-report.js')).reportDncLiftResult;
+    await report(requestId, { supabase: db, env, now: deps.now });
+  }).catch((err) => console.error(`[DncLiftDecision] background ${decision} for ${requestId} threw: ${err.message}`)));
+  return {
+    status: 202,
+    json: { ok: true, accepted: true, request_id: requestId, status: 'processing', decision, decided_by: slackUserName || slackUserId },
+  };
 }
 
 export function registerDncLiftDecisionRoutes(app) {

@@ -134,6 +134,13 @@ transaction. `CONSENT_MODEL_MODE` is `shadow`: nothing gates a send on these tab
   step after it.
 - `POST /slack/dnc-lift/decision` is idempotent on `request_id` through `dnc_lift_requests`
   (sql/140) and refuses (503) without it.
+- **The lift result is posted by the server, not by n8n's wait (2026-10-02).** 41 approvals in two
+  minutes took 2–2.5 min each and outran n8n's 120s timeout, leaving 40 cards on "⏳ Lifting" with the
+  work done. n8n now sends `async: true` + `channel` + `card_blocks`; the route answers 202, runs the
+  batch three at a time, and `src/consent/dnc-lift-report.js` updates the card and posts the thread. A
+  step still retrying reads "retrying" and gets one follow-up when it settles (the sweep, every 5 min,
+  also corrects the request's status). It reports only rows with `report_mode='server'`, so an
+  old-flow click is never posted twice.
 - **LP's clear is still broken, so the lift card says so (2026-10-02).** `%20` was rejected too on
   2026-10-01. Until `LP_DNC_CLEAR_WORKING=true` (set only after a clear is verified with a GetLead
   read-back), the review payload and the approve response carry `lp_manual_clear_required` and

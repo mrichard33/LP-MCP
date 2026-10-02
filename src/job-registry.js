@@ -336,6 +336,17 @@ export const JOBS = Object.freeze([
     isEnabled: (env) => String(env.DNC_REENTRY_SWEEP_MODE || 'live').toLowerCase().trim() !== 'off',
   },
   {
+    id: 'dnc-lift-report-sweep',
+    label: 'DNC-lift results → Slack card + thread (safety net)',
+    group: 'five9',
+    cadence: 'every 5 min',
+    enabledEnv: null,
+    // No switch (2026-10-02): it only posts results for requests the decision
+    // route marked report_mode='server', and never twice (slack_report_final).
+    enabledDefault: true,
+    isEnabled: () => true,
+  },
+  {
     id: 'payroll-engine',
     label: 'Payroll engine (LightFire + call center)',
     group: 'payroll',
