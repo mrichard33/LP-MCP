@@ -593,7 +593,9 @@ export function planNepqTurn({
       withSlots(null);
       return Object.assign(plan, { step: 'offer_slots', required_move: 'offer_slots', answer_first: true, offer_line: LINES.offer_slots(offerSlots, counters.slot_offers) });
     }
-    return Object.assign(plan, { step: 'offer_slots', required_move: 'offer_slots', booking: { allowed: true, reason: 'nepq:offer_slots' } });
+    // No real times to hand (a calendar read that failed): answer, then the
+    // day, never the bridge again (2026-10-02, Mark's 4:16 PM chat).
+    return Object.assign(plan, { step: 'ask_day', required_move: 'answer', reask_line: vary(LINES.ask_day, ALT_LINES.ask_day), booking: { allowed: true, reason: 'nepq:ask_day' } });
   }
 
   // 6. They asked us something: answer it first (one question after, at most).
@@ -606,7 +608,10 @@ export function planNepqTurn({
   // 7. Said yes to the bridge → two real times.
   if (BRIDGE_RX.test(lastOut) && YES_RX.test(now)) {
     if (offerSlots.length === 2) return fixed('offer_slots', withSlots(LINES.offer_slots(offerSlots, counters.slot_offers)), { step: 'offer_slots' });
-    return Object.assign(plan, { step: 'offer_slots', required_move: 'offer_slots', booking: { allowed: true, reason: 'nepq:offer_slots' } });
+    // 2026-10-02 (Mark's 4:16 PM chat): with the calendar read timed out, the
+    // model asked for a name and number and the guard re-sent the bridge.
+    // A yes with no times in hand gets the day question, varied.
+    return fixed('ask_day', vary(LINES.ask_day, ALT_LINES.ask_day), { step: 'ask_day', booking: { allowed: true, reason: 'nepq:ask_day' } });
   }
 
   // 7b. A soft "maybe" / "I guess" to the bridge: two real times, no pressure

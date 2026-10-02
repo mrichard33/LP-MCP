@@ -281,6 +281,7 @@ import {
   fetchFreeSlots,
   formatSlotsForPrompt,
   selectOfferableSlots,
+  spreadOffer,
   CALL_MIN_NOTICE_HOURS,
   buildOfferWindowPrompt,
 } from './knowledge/calendar-availability.js';
@@ -382,6 +383,10 @@ import { findUnbackedEstimatePromise, estimatePromiseNote, rewriteEstimatePromis
 // v2.7.14 — Bot Review Phase 0. Pure shaping helpers only: no I/O, no writes.
 import { buildInputSnapshot, extractKbModes, extractKbSources } from './bot-feedback/fingerprint-core.js';
 import { normalizeTimezone, tzLongName, tzLabel } from './config/market-timezones.js';
+import { offeredSlots, pickSlot } from './live-chat/cancel-flow.js';
+import { holdLine, COLLECT_ASK, parseDecisionMakers } from './agentic/booking-collect.js';
+import { contactRecheckLine } from './agentic/contact-check.js';
+import { LINES as NEPQ_LINES } from './agentic/nepq-planner.js';
 import { planNepqTurn, enforceNepqPlan, nepqBackboneMode, nepqFixedLineWins, prefersCall as nepqPrefersCall, objectionType as nepqObjectionType, TIME_REQUEST_RX as NEPQ_TIME_REQUEST_RX, SCHEDULE_ASK_RX as NEPQ_SCHEDULE_ASK_RX,REPEAT_COMPLAINT_RX as NEPQ_REPEAT_COMPLAINT_RX } from './agentic/nepq-planner.js';
 import {
   planServiceAreaTurn, resolveCoverage, coverageHint, guardCoverageDraft, serviceAreaRecord,
@@ -928,11 +933,18 @@ function extractActiveEntryTag(context) {
   return tags.find(t => typeof t === 'string' && t.startsWith('active-entry:')) || null;
 }
 
-/** Our last message was the bridge or two times: this turn books. Pure. */
+/**
+ * The visit is on the table: one of our recent messages was the bridge, two
+ * times, or a held time. This turn may book, so the calendar is read. Pure.
+ * 2026-10-02 post-merge run: only the LAST message counted, and the bridge
+ * variants ("The easiest next step is…") did not match, so a lead who
+ * answered with a phone number after the bridge got "a team member will call
+ * to set up the visit" instead of two real times.
+ */
 function nepqBookingTurn(conversation = []) {
-  const lastOut = [...(conversation || [])].reverse().find(m => String(m?.direction || '').toLowerCase() === 'outbound');
-  const t = String(lastOut?.text ?? lastOut?.body ?? '');
-  return /\bbased\s+on\s+what\s+you\s+(?:told|said|mentioned)\b|\bthe\s+next\s+step\s+would\s+be\b/i.test(t) || /\bI\s+have\s+[^.?!]*\b\d{1,2}(?::\d{2})?\s*(?:AM|PM)\b[^.?!]*\bor\b/i.test(t);
+  const outs = (conversation || []).filter(m => String(m?.direction || '').toLowerCase() === 'outbound').slice(-4).map(m => String(m?.text ?? m?.body ?? ''));
+  return outs.some(t => /\bbased\s+on\s+what\s+you\s+(?:told|said|mentioned)\b|\b(?:the\s+)?(?:easiest\s+|best\s+)?next\s+step\s+(?:would\s+be|is)\b|\bI'm\s+holding\b/i.test(t)
+    || /\bI\s+have\b[^?]{0,140}\b\d{1,2}(?::\d{2})?\s*(?:AM|PM)\b[^?]*\bor\b/i.test(t));
 }
 
 function getCalendarIdFromKbPack(kbPack) {
@@ -3438,6 +3450,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // lead's OWN stated time (deterministic, no LLM); it also drives the §4
   // acknowledgment / walk-back prompt blocks below.
   let preferred = null;
+  let fullSlotsForPick = [];
   let offerSelection = null;
   let preferredMatch = null;
   try {
@@ -3452,6 +3465,9 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       // For window 'none' this is an empty-slots object, so formatSlotsForPrompt
       // emits the "calendar full → send the booking link" CTA (no dead air, no
       // invented far date).
+      // Every real opening, kept for resolving a pick or a held time below
+      // (the narrowed list may no longer hold the time they picked).
+      fullSlotsForPick = Array.isArray(availability?.slots) ? availability.slots : [];
       availability = offerSelection.availability;
     }
   } catch (err) {
@@ -3883,7 +3899,11 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // a retry told only "don't ask that" has to guess what to say instead,
   // which is how a repeat-ask becomes an invented question.
   if (established?.closed_questions?.length) {
-    const repeats = findRepeatedQuestions(validated.message, established);
+    // 2026-10-02 post-merge run: "My wife works then" made a new time the
+    // right question, the guard called it a repeat twice, and the lead got
+    // no reply. A decision-maker conflict reopens the time.
+    const timeReopened = parseDecisionMakers(triggerMessage) === 'conflict';
+    const repeats = findRepeatedQuestions(validated.message, established).filter(k => !(timeReopened && /time|day|date/i.test(k)));
     if (repeats.length) {
       const answers = repeats.map(k => {
         const f = established.facts.find(x => x.key === k);
@@ -4242,6 +4262,43 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       }
       if (!nepqPlan.booking.allowed && validated.companion_action?.action_type === 'book_appointment') validated.companion_action = null;
       if (nepqPlan.handoff) validated.nepq_handoff = { reason: nepqPlan.handoff.reason };
+      const recentOut = (context.conversation_recent || []).filter(m => String(m?.direction || '').toLowerCase() === 'outbound').slice(-8).map(m => String(m?.text ?? m?.body ?? ''));
+      // 2026-10-02 (Mark): an email that cannot be right gets one friendly
+      // re-check (contact-check.js). SMS already has their number.
+      const recheck = contactRecheckLine({ text: triggerMessage, recentOutbound: recentOut });
+      // A held time the spouse cannot make: two other real times, as in chat.
+      const held = nepqPlan.step === 'collect' && nepqPlan.held_slot?.text ? (offeredSlots(nepqPlan.held_slot.text, fullSlotsForPick)[0] || null) : null;
+      const others = held && parseDecisionMakers(triggerMessage) === 'conflict' ? spreadOffer(fullSlotsForPick.filter(x => x.iso !== held.iso && Date.parse(x.iso) >= Date.now() + 4 * 3600_000), 2, { timezone: promptTimezoneFor(context) }) : [];
+      if (others.length === 2) {
+        validated.message = `No problem, let's find a time when you can both be there. ${NEPQ_LINES.offer_slots(others.map(x => ({ ...x, tz: x.tz || tzLabel(promptTimezoneFor(context)) })), nepqPlan.counters?.slot_offers || 0)}`;
+        validated.companion_action = null;
+        validated.nepq_plan.dm_conflict = true;
+      } else if (recheck?.kind === 'email') {
+        validated.message = recheck.line;
+        validated.companion_action = null;
+        validated.nepq_plan.recheck = recheck.kind;
+      } else {
+        // 2026-10-02 post-merge run: the model held "Sunday at 2:00 PM" for a
+        // lead who picked "Sun, Oct 4 at 10:00 AM". The pick (or the held
+        // time) is resolved here from our own offer, and the hold line and
+        // the booking time come from it, never from the model.
+        let pinned = null;
+        if (nepqPlan.required_move === 'confirm') pinned = pickSlot(triggerMessage, offeredSlots(nepqPlan.last_offer || '', fullSlotsForPick));
+        else if (nepqPlan.step === 'collect' && nepqPlan.held_slot?.text) pinned = offeredSlots(nepqPlan.held_slot.text, fullSlotsForPick)[0] || null;
+        if (pinned) {
+          const gateMissing = (kbPack?.booking_context?.requires_in_home_gate === true && bookingGate && !bookingGate.ok) ? (bookingGate.missing || []) : [];
+          if (nepqPlan.required_move === 'confirm' && gateMissing.length) {
+            const next = resolveNextMissing(gateMissing) || gateMissing[0];
+            const key = /^decision/.test(String(next)) ? 'dm' : (next === 'zip' ? 'address' : next);
+            validated.message = holdLine(pinned, tzLabel(promptTimezoneFor(context)), COLLECT_ASK[key] || COLLECT_ASK.address);
+            validated.companion_action = null;
+            validated.nepq_plan.held = pinned.iso;
+          } else if (validated.companion_action?.action_type === 'book_appointment') {
+            validated.companion_action.action_payload = { ...(validated.companion_action.action_payload || {}), start_time: pinned.iso };
+            validated.nepq_plan.pinned = pinned.iso;
+          }
+        }
+      }
     } else if (enforced.changes.length) {
       validated.nepq_plan.would_change = enforced.changes;
       validated.nepq_plan.would_send = enforced.text.slice(0, 500);

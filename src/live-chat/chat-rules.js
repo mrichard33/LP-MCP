@@ -78,7 +78,7 @@ export const TIME_OFFER_NOTE =
  * a deterministic fix (offers stripped, the call-to-schedule line appended).
  * Pure.
  */
-export function guardTimeOffers(draft, { hasPhone = false, hasName = true, visitorText = '', nepqLive = false } = {}) {
+export function guardTimeOffers(draft, { hasPhone = false, hasName = true, visitorText = '', nepqLive = false, bridgeUsed = false } = {}) {
   const offers = findTimeOffers(draft, { visitorText });
   if (!offers.length) return { notes: [], fixed: String(draft || '') };
   const kept = splitSentences(draft).filter((s) => !offers.includes(s));
@@ -90,7 +90,7 @@ export function guardTimeOffers(draft, { hasPhone = false, hasName = true, visit
   // What's the best phone number to reach you?").
   const noAsk = cleaned.filter((s) => !s.includes('?') && !asksForPhone(s));
   // NEPQ live: the real times come from the planner after a yes to the bridge.
-  return { notes: [TIME_OFFER_NOTE], fixed: [...noAsk, nepqLive ? VISIT_BRIDGE_LINE : bookingHandoffLine({ hasPhone, hasName })].join(' ').trim() };
+  return { notes: [TIME_OFFER_NOTE], fixed: [...noAsk, nepqLive ? nextStepLine({ bridgeUsed }) : bookingHandoffLine({ hasPhone, hasName })].join(' ').trim() };
 }
 
 // ── 2. Spanish → a person ───────────────────────────────────────────────────
@@ -329,6 +329,13 @@ export const VISIT_NEXT_STEP_LINE = 'The next step is a free in-home measurement
 // chat offers real times itself, so the next step is the bridge question; a
 // yes gets two real times from the planner.
 export const VISIT_BRIDGE_LINE = 'The next step would be a free visit at your home to measure. Would that help?';
+// 2026-10-02 (Mark's 4:16 PM chat): after a yes to the bridge, the guard sent
+// the bridge AGAIN ("Would that help?" twice). Once the bridge has been
+// asked, the next step is the day, never the same question.
+export const VISIT_DAY_LINE = 'What day works best for the visit?';
+export function nextStepLine({ bridgeUsed = false } = {}) {
+  return bridgeUsed ? VISIT_DAY_LINE : VISIT_BRIDGE_LINE;
+}
 
 /**
  * The live-chat conversation guards, run after the shared ones. Pure.
@@ -374,7 +381,7 @@ export function dedupeSentences(text) {
 
 export const DECLINE_CLOSE_LINE = "Understood. Take care, and if anything changes, we're here.";
 
-export function guardChatFlow(draft, { thread = [], hasName = false, hasPhone = false, body = '', bookingAllowed = true, declined = false, serviceTurn = false, nepqLive = false } = {}) {
+export function guardChatFlow(draft, { thread = [], hasName = false, hasPhone = false, body = '', bookingAllowed = true, declined = false, serviceTurn = false, nepqLive = false, bridgeUsed = false } = {}) {
   const notes = [];
   let fixed = String(draft || '');
 
@@ -411,14 +418,15 @@ export function guardChatFlow(draft, { thread = [], hasName = false, hasPhone = 
       // job) is never answered with a sales pitch (2026-10-02, ymnwp).
       fixed = [fixed, ask].filter(Boolean).join(' ').trim();
     } else if (nepqLive && !serviceTurn) {
-      notes.push(`Your previous draft ended with no question and no next step. End with exactly: "${VISIT_BRIDGE_LINE}"`);
-      fixed = [fixed, VISIT_BRIDGE_LINE].filter(Boolean).join(' ').trim();
+      const step = nextStepLine({ bridgeUsed });
+      notes.push(`Your previous draft ended with no question and no next step. End with exactly: "${step}"`);
+      fixed = [fixed, step].filter(Boolean).join(' ').trim();
     } else if (ask) {
       notes.push(`Your previous draft ended with no question and no next step. Offer the free in-home measurement and end with exactly this question: "${ask}"`);
       fixed = [fixed, VISIT_NEXT_STEP_LINE, ask].filter(Boolean).join(' ').trim();
     }
   }
   // Everything was a repeat and nothing is missing: the next step itself.
-  if (!fixed.trim()) fixed = nepqLive ? VISIT_BRIDGE_LINE : bookingHandoffLine({ hasName, hasPhone });
+  if (!fixed.trim()) fixed = nepqLive ? nextStepLine({ bridgeUsed }) : bookingHandoffLine({ hasName, hasPhone });
   return { notes, fixed: dedupeSentences(fixed) };
 }
