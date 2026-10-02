@@ -1010,7 +1010,9 @@ export async function buildLeadContext(ghlContactId, options = {}) {
 
   const lpLeadId = lpLead?.lp_lead_id || null;
   const [conversation, lpNotes, lpCalls, pipelineStageInfo, nurtureHistory, openObjectionState, ghlNotes, lpProspectHistory, market] = await Promise.all([
-    (includeConversation && ghlContact) ? fetchConversation(ghlContactId, 10, degraded) : [],
+    // Part 7 (Mark, 2026-10-02): 30 messages across every channel, not 10, so
+    // the bot knows the whole recent story (texts, chats, emails).
+    (includeConversation && ghlContact) ? fetchConversation(ghlContactId, 30, degraded) : [],
     fetchLPNotes(lpLeadId),
     fetchLPCalls(lpLeadId),
     opportunity?.pipelineStageId ? resolvePipelineStage(opportunity.pipelineStageId) : null,

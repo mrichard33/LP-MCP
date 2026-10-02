@@ -12,6 +12,8 @@
  * second "need to think" play); the code guard enforceNepqPlan backs it up.
  */
 
+import { referenceRules, referenceRulesText } from '../../agentic/nepq-planner.js';
+
 export const NEPQ_PLAN_HEADER = '═══════ NEPQ TURN PLAN (binding: overrides any earlier formula, offer mandate or objection play) ═══════';
 
 export const NEPQ_ALWAYS = [
@@ -27,7 +29,9 @@ const MOVE_TEXT = {
   consequence: (p) => `This turn's move: ONE gentle "what happens if you wait?" question about ${p.echo?.phrase || 'the problem they mentioned'}. No deadlines, no season or storm talk, no danger talk, no pressure.`,
   // 2026-10-02 (Mark): no line word for word twice; the planner picks a bridge
   // variant we have not sent yet (bridgeLine / pickFresh).
-  bridge: (p) => `This turn's move: the bridge, in their words: "${p.bridge_line || `Based on what you told me, this could work for you${p.echo?.phrase ? `, since you mentioned ${p.echo.phrase}` : ''}. The next step would be ${p.next_step_label}. Would that help?`}" Nothing else.`,
+  // Part 7: a reference, written fresh for this lead; it must still name "the
+  // next step" (the planner reads that back) or the reference ships.
+  bridge: (p) => `This turn's move: the bridge. A reference: "${p.bridge_line || `Based on what you told me, this could work for you${p.echo?.phrase ? `, since you mentioned ${p.echo.phrase}` : ''}. The next step would be ${p.next_step_label}. Would that help?`}" Write your own version for THIS lead, tied to what they told you. It must say "the next step" is ${p.next_step_label}, and end asking if that would help. Never copy the reference word for word. Nothing else.`,
   // 2026-10-02 (Mark): short, and no times on the first price ask.
   answer: (p) => (p.price_note
     ? 'This turn\'s move: answer their other questions in one short sentence each. On price, one short sentence: every home is different, so a number now would just be a guess (never a number or range). Then ONE question: what\'s got them looking into this now. No times, no visit pitch, nothing else.'
@@ -64,8 +68,12 @@ export function renderPlanBlock(plan) {
   const lines = [`\n${NEPQ_PLAN_HEADER}`];
   if (plan.booking_facts && FACTS_TEXT[plan.booking_facts.kind]) {
     lines.push(FACTS_TEXT[plan.booking_facts.kind](plan.booking_facts));
-  } else if (plan.fixed_line) {
-    lines.push(`This turn's move: ${plan.required_move.replace(/_/g, ' ')}. Send exactly this, nothing before or after it (a sign-off is fine): "${plan.fixed_line}"`);
+  } else if (plan.reference_line || plan.fixed_line) {
+    // Part 7 (Mark, 2026-10-02: "Each message should be custom"): the line is
+    // a reference, never sent as written unless the model's version fails.
+    const ref = plan.reference_line || plan.fixed_line;
+    const keep = referenceRulesText(referenceRules(ref, plan.reference_slots || plan.slots_to_offer || [], plan));
+    lines.push(`This turn's move: ${String(plan.required_move || 'reply').replace(/_/g, ' ')}. A reference line that does this job: "${ref}" Write your own version for THIS lead: their words, what they told you, what you know about them from the profile above. Never copy the reference word for word. Keep its job${keep ? `: ${keep}` : ''}. Short, warm, one or two sentences.`);
   } else if (MOVE_TEXT[plan.required_move]) {
     lines.push(MOVE_TEXT[plan.required_move](plan));
   }

@@ -266,7 +266,7 @@ again after the price play, two no's, or a repeated objection (`src/agentic/nepq
 think-it-over Calendar Commitment (two REAL slots, exempt from the booking-ask cap), "what day works best",
 the Reveal and the confirm line ("You're all set for [day] at [time], [name]. Our team will reach out to
 confirm the details." — said only when the booking landed in that turn, never a rep name, never "see you
-then") are Mark's fixed wording. A vague live-chat opener ("hi", "I need new windows") gets the Status Frame
+then") are Mark's wording — since Part 7 a reference the model rewrites for the lead (meaning kept, see below). A vague live-chat opener ("hi", "I need new windows") gets the Status Frame
 once (`LINES.status_frame`), and a variant never repeats a closing question already asked (`pickFresh`). Discovery is short (2 questions
 in live chat, 3 on SMS, then the bridge). `renderPlanBlock` is the LAST prompt section and `enforceNepqPlan`
 strips money/financing figures (the customer's own estimate excepted), fake urgency, unallowed booking asks,
@@ -335,6 +335,27 @@ not searchable yet: 44 of 68 turns in two days), so the thread falls back to our
 - **Claim before analyse:** a `pending_analysis` event claims its message (`routePendingReply` in `decision-engine.js`) and is not re-analysed when the buffer or the poller already did. A failed analysis releases the claim (`claim_released_on_failure`).
 - **Slot re-check before booking:** the picked time is read again from GHL right before `book_appointment` (`src/agentic/slot-recheck.js`: no notice floor, no count cap). If it was taken: no booking, and the reply offers the two nearest open times (`slot_taken_before_book`). If the read cannot tell, the booking goes ahead.
 - **Burst wait:** the SMS reply buffer waits 15s (`REPLY_DEBOUNCE_MS`), not 35s.
+
+**Part 7: no static messages; every reply is AI-written with the whole lead in view (Mark, 2026-10-02).**
+Mark: "I don't think we need any static messages sent by the bot. Each message should be custom."
+- **Fixed lines are references and backups, never the first choice.** The planner still decides the move. Its line (`LINES`, `bridgeLine`, the live chat's hold, collect, confirm and hand-off lines, the contact re-check) goes into the plan block as a REFERENCE (`renderPlanBlock`), and the model writes its own version for that lead.
+- **Code checks the model's version against the reference** (`checkAgainstReference` in `nepq-planner.js`; `enforceBookingFacts` for booking turns). It checks:
+  - the real times, written exactly as offered
+  - no other clock time
+  - the closing question, or no question
+  - the promise of a person
+  - the phrases the next turn reads back (`MARKERS`: status frame, Reveal, day ask, "every home is different", "the next step", the re-check, spouse, decide, chase)
+- **Failing the check:** one re-write (SMS: thrown with `referenceRetryNote` / `bookingFactsNote`; live chat: the regen inside `redraftFits`). If that also fails, the reference ships (`backup_line`, `nepq_backup_line`).
+- **No more skipping the model.** The SMS `nepqDirect` path is gone. Live chat's `runNepqFixedMove` still decides and books, then returns `{ reply, facts | slots }` and the lane goes on to the model.
+- **A live chat that times out sends the move's backup line, not the holding line** (`fallback({ backupReply })`).
+- **Wording:** Mark's wordings keep their MEANING, not their exact words.
+- **Still fixed, as backups or operational flows:** the generation-failure fallback (`buildAiFallback`, `LIVE_CHAT_FALLBACK_MESSAGE` when nothing was decided), the booking hold/prerequisite lines after a failed inline booking, the slot-taken line, the cancel flow, the Spanish hand-off and the out-of-area exit.
+- **Lead knowledge:**
+  - The SMS context reads 30 messages across every channel (was 10) and shows 30 turns.
+  - `HISTORY WITH REECE` (`lpRelationship`) says when the lead is a past or returning customer.
+  - The live chat starts the full lead context and the appointments when the message lands, so the quiet wait hides the read. Defaults: `LIVE_CHAT_CONTEXT_CAP_MS` 5000 and `LIVE_CHAT_HARD_TIMEOUT_MS` 15000 (Mark: 5–8s replies are fine).
+  - The live chat passes `upcomingAppointments` to the prompt.
+  - `normalizeThread` labels each turn by its own channel, because texts and emails sit in the same GHL conversation.
 
 **A live-chat turn answers exactly once (2026-10-02, vnazu).** `raceWithBudget` abandons work, it does not
 stop it: the reply and the holding line share one `newTurnClaim()`, a second draft starts only when

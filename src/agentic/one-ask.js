@@ -29,7 +29,8 @@ const ITEM_RX = {
   address: /(?<!e-?mail\s)\b(?:street\s+)?address\b|\bzip(?:\s*code)?\b/i,
   address_confirm: /\bis\s+the\s+visit\s+(?:still\s+)?at\b/i,
   dm: /\bpart\s+of\s+the\s+decision\b|\banyone\s+else\b|\bbe\s+able\s+to\s+be\s+there\b/i,
-  day: /\b(?:what|which)\s+(?:day|time|one)\b|\bwhich\s+(?:works|would)\b|\bwhen\s+(?:works|would|is\s+(?:a\s+)?good)\b|\b(?:day|time)\s+(?:works|would\s+work)\b|\bgood\s+(?:day|time)\b/i,
+  // A question offering two clock times ("how about 10 AM or 6 PM?") is a day ask (Part 7).
+  day: /\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b[^?]{0,80}\bor\b|\b(?:what|which)\s+(?:day|time|one)\b|\bwhich\s+(?:works|would)\b|\bwhen\s+(?:works|would|is\s+(?:a\s+)?good)\b|\b(?:day|time)\s+(?:works|would\s+work)\b|\bgood\s+(?:day|time)\b/i,
 };
 // A statement that asks: "I'll need…", "we just need…", "can you send…".
 const REQUEST_RX = /\b(?:i|we)(?:'ll|’ll|\s+will)?\s+(?:just\s+|also\s+|still\s+)?need\b|\b(?:can|could)\s+(?:you|i\s+(?:get|grab|have))\b|\bplease\s+(?:send|share|provide|reply|text|let)\b|\b(?:send|share|text)\s+(?:me|us)\s+(?:your|the)\b|\bif\s+you\s+(?:can\s+)?(?:send|share)\b/i;

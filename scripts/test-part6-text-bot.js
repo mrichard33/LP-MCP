@@ -70,10 +70,12 @@ test('approved lines are never trimmed or reordered (snapshot)', () => {
     ...ALT_LINES.ask_day, ...Object.values(LINES.handoff),
   ];
   for (const line of fixed) assert.equal(enforceOneAsk(line).text, line, line);
-  // A fixed move ships its line verbatim through the NEPQ guard.
+  // Part 7: a fixed move's line is the backup when the model's draft misses its point.
   for (const line of [LINES.spouse_1, LINES.shopping, LINES.think_no_slots]) {
-    const plan = { fixed_line: line, required_move: 'objection_play', counters: {} };
-    assert.equal(enforceNepqPlan('anything the model wrote? and more?', plan).text, line);
+    const plan = { fixed_line: line, required_move: 'objection_play', counters: {}, booking: { allowed: true } };
+    const out = enforceNepqPlan('Sounds good. What else can I tell you about our windows?', plan);
+    assert.equal(out.text, line, line);
+    assert.ok(out.failed.length);
   }
   // The decision-maker ask keeps its reason after the question.
   assert.equal(enforceOneAsk(`Thanks. What's your first name? ${COLLECT_ASK.dm}`, { protect: [COLLECT_ASK.dm] }).text, `Thanks. ${COLLECT_ASK.dm}`);

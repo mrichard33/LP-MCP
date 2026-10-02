@@ -260,6 +260,18 @@ export const lpLostReason = (lostReason) => [
 
 // Closed-won and the job value.
 // Was response-generator.js:1273.
+// Part 7 (Mark, 2026-10-02: "our bot should have a good understanding of
+// everything that is going on with the lead"): their history with Reece, from
+// every LP lead on the prospect, not just this one.
+export const lpRelationship = ({ relationship, priorSaleDate, leadCount, latestDisposition }) => {
+  const who = relationship === 'returning_customer' ? 'a RETURNING CUSTOMER (bought from us before, now asking again)'
+    : relationship === 'service_customer' ? 'an EXISTING CUSTOMER (bought from us; this is likely about that job)'
+      : 'not a customer yet';
+  return [
+    `HISTORY WITH REECE: ${who}${priorSaleDate ? `; last sale ${String(priorSaleDate).slice(0, 10)}` : ''}; ${leadCount} lead record(s) on file${latestDisposition ? `; newest disposition ${latestDisposition}` : ''}. Speak to them as someone we know; never pitch a customer as if they were new.`,
+  ];
+};
+
 export const lpClosedWon = (jobValue) => [
   `CLOSED WON — $${jobValue}`,
 ];

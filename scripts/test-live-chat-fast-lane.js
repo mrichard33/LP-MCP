@@ -863,19 +863,22 @@ function nepqLane({ messages = [], llm, bookOk = true, phone = '+13525550188', r
 }
 const M = (direction, body, minsAgo) => ({ direction, body, dateAdded: new Date(Date.now() - minsAgo * 60000).toISOString() });
 
-test('NEPQ live: a price ask after two price lines goes to a person, with no model call', async () => {
+// Part 7 (Mark, 2026-10-02: "Each message should be custom"): the model is
+// always asked now. These stubs answer "Sure." to everything, which misses
+// the move's job twice, so the reference line ships as the backup.
+test('NEPQ live: a price ask after two price lines goes to a person; a draft that misses it gets the backup line', async () => {
   const { lane, state } = nepqLane({ messages: [M('inbound', 'how much for 12 windows?', 5), M('outbound', 'Happy to get you a quote on the 12 windows. Exact pricing comes from a quick visit to measure, and you keep the written quote. I have Tue, Oct 6 at 10:00 AM ET or Wed, Oct 7 at 2:00 PM ET. Which works better?', 4), M('inbound', 'I just want a good price', 3), M('outbound', 'Totally fair. Every home is different, so any number I gave you now would be a guess. The visit gets you the exact number in writing. I have Tue, Oct 6 at 10:00 AM ET or Wed, Oct 7 at 2:00 PM ET. Which works better?', 2)] });
   await lane.processInbound(INBOUND('just give me a number'));
-  assert.equal(state.llmCalls.length, 0);
+  assert.equal(state.llmCalls.length, 2, 'the draft, one re-write, then the backup');
   assert.match(state.sends[0].message, /^Understood\. I'll have someone from our team call you to talk it through\./);
   await new Promise(r => setImmediate(r));
   assert.equal(state.handoffs[0].reason, 'price_insist');
 });
 
-test('NEPQ live: "let me think about it" gets two REAL times, no model call', async () => {
+test('NEPQ live: "let me think about it" gets two REAL times (backup when the draft drops them)', async () => {
   const { lane, state } = nepqLane();
   await lane.processInbound(INBOUND('let me think about it'));
-  assert.equal(state.llmCalls.length, 0);
+  assert.equal(state.llmCalls.length, 2);
   assert.equal(state.sends[0].message, "No problem at all. Want to grab a time now so you don't have to chase us down later? I have Tue, Oct 6 at 10:00 AM ET or Wed, Oct 7 at 2:00 PM ET.");
 });
 
@@ -890,7 +893,8 @@ test('NEPQ live: an on-file address is read back once, then the visit is booked 
   await one.lane.processInbound(INBOUND('wednesday works'));
   assert.equal(one.state.bookings, undefined);
   const hold = one.state.sends[0].message;
-  assert.equal(hold, "Great, I'm holding Wed, Oct 7 at 2:00 PM ET for you. Is the visit at 123 Main St, Tampa?");
+  // The model's own words stand ("Sure."); code adds the hold and the ask.
+  assert.match(hold, /I'm holding Wed, Oct 7 at 2:00 PM ET for you\. Is the visit at 123 Main St, Tampa\?$/);
   const two = nepqLane({ contact: READY_CONTACT, messages: [M('inbound', 'let me think about it', 4), M('outbound', offer, 3), M('inbound', 'wednesday works', 2), M('outbound', hold, 1)] });
   await two.lane.processInbound(INBOUND('yes'));
   assert.deepEqual(two.state.bookings, [{ contactId: 'C1', startIso: '2026-10-07T18:00:00Z', calendarId: 'CALWE', decisionMakers: null, address: '123 Main St, Tampa, FL 33601' }]);
@@ -931,13 +935,13 @@ test('NEPQ live (Mark, 2026-10-02): a pick with the address missing is held, the
   await one.lane.processInbound(INBOUND('the first one'));
   assert.equal(one.state.bookings, undefined);
   const hold = one.state.sends[0].message;
-  assert.equal(hold, "Great, I'm holding Tue, Oct 6 at 10:00 AM ET for you. What's the street address for the visit, including the zip code?");
+  assert.match(hold, /I'm holding Tue, Oct 6 at 10:00 AM ET for you\. What's the street address for the visit, including the zip code\?$/);
   // 2. The address: the decision-maker question next.
   const two = nepqLane({ messages: [M('outbound', offer, 3), M('inbound', 'the first one', 2), M('outbound', hold, 1)] });
   await two.lane.processInbound(INBOUND('123 Main St, Tampa FL 33601'));
   assert.equal(two.state.bookings, undefined);
   const dmAsk = two.state.sends[0].message;
-  assert.equal(dmAsk, "Got it. Will anyone else be part of the decision? We'll want them there too so nobody has to repeat anything.");
+  assert.match(dmAsk, /Will anyone else be part of the decision\? We'll want them there too so nobody has to repeat anything\.$/);
   // 3. "Just me": booked on the held time with Solo Owner.
   const three = nepqLane({ contact: { address1: '123 Main St', postalCode: '33601' }, messages: [M('outbound', offer, 4), M('inbound', 'the first one', 3), M('outbound', hold, 2), M('inbound', '123 Main St, Tampa FL 33601', 1), M('outbound', dmAsk, 0.5)] });
   await three.lane.processInbound(INBOUND('just me'));
@@ -963,7 +967,7 @@ test('NEPQ live: a guest who types their name, phone, address and "just me" is b
   const lane = (msgs) => nepqLane({ phone: null, contact: guest, messages: msgs });
   const t1 = [M('outbound', offer, 9), M('inbound', 'the first one', 8), M('outbound', hold, 7)];
   const a = lane(t1); await a.lane.processInbound(INBOUND('Mark'));
-  assert.equal(a.state.sends[0].message, "Thanks, Mark. What's the best phone number to reach you?");
+  assert.match(a.state.sends[0].message, /What's the best phone number to reach you\?$/);
   const t2 = [...t1, M('inbound', 'Mark', 6), M('outbound', a.state.sends[0].message, 5)];
   const b = lane(t2); await b.lane.processInbound(INBOUND('352-555-0188'));
   assert.match(b.state.sends[0].message, /street address/);
@@ -991,7 +995,7 @@ test('a phone missing a digit gets one friendly re-check, then the next answer i
   const a = nepqLane({ phone: null, messages: [M('outbound', ask, 1)] });
   await a.lane.processInbound(INBOUND('Mark 954 379 215'));
   assert.match(a.state.sends[0].message, /^Thanks, Mark\. (?:That number looks like it's missing a digit\. Could you send it again\?|I think a digit got cut off there\. What's the full number, area code first\?)$/);
-  assert.equal(a.state.llmCalls.length, 0);
+  assert.equal(a.state.llmCalls.length, 2, 'the model is asked; "Sure." misses the re-check twice, so the backup ships');
   const b = nepqLane({ phone: null, messages: [M('outbound', ask, 3), M('inbound', 'Mark 954 379 215', 2), M('outbound', a.state.sends[0].message, 1)] });
   await b.lane.processInbound(INBOUND('954 379 215'));
   assert.doesNotMatch(b.state.sends[0].message, /missing a digit|cut off/);
@@ -1086,7 +1090,7 @@ test('no conversation id: the thread comes from our own rows, and the second pri
     { direction: 'outbound', text: first, timestamp: at(1.9) },
   ] });
   await lane.processInbound({ contactId: 'C1', messageId: 'm-good-price', body: 'I just want a good price.' });
-  assert.equal(state.llmCalls.length, 0);
+  assert.equal(state.llmCalls.length, 2);
   // Worded differently from our last message (no closing question twice).
   assert.match(state.sends[0].message, /^(?:Fair question|I hear you)\. (?:Since every|Every) home is different, (?:so )?(?:a|any) number now would (?:just )?be a guess\. I have Tue, Oct 6/);
 });
@@ -1114,4 +1118,51 @@ test('a long booking chat keeps the early mention of a spouse in view', async ()
   const { lane, state } = nepqLane({ phone: null, contact: { firstName: 'Guest Visitor x1', phone: null }, messages: msgs });
   await lane.processInbound(INBOUND('12 Main St, Ocala FL 34470'));
   assert.match(state.sends[0].message, /Will your wife be able to be there then\?$/);
+});
+
+
+// Part 7: a draft that does the move's job is sent as the model wrote it.
+test('NEPQ live: a model draft that keeps the real times is sent as written (no backup)', async () => {
+  const draft = 'Totally get it, no rush. If it helps, I can grab Tue, Oct 6 at 10:00 AM or Wed, Oct 7 at 2:00 PM so you don\'t have to chase us down later. Which works better?';
+  const { lane, state } = nepqLane({ llm: () => ({ message: draft }) });
+  await lane.processInbound(INBOUND('let me think about it'));
+  assert.equal(state.llmCalls.length, 1);
+  assert.equal(state.sends[0].message, draft);
+});
+
+test('NEPQ live: a booked visit is confirmed in the model\'s words when they carry the facts', async () => {
+  const offer = 'I have Tue, Oct 6 at 10:00 AM ET or Wed, Oct 7 at 2:00 PM ET. Which works better?';
+  const hold = "Great, I'm holding Tue, Oct 6 at 10:00 AM ET for you. What's the street address for the visit, including the zip code?";
+  const dmAsk = "Got it. Will anyone else be part of the decision? We'll want them there too so nobody has to repeat anything.";
+  const draft = "Perfect, Alyce, you're all set for Tue, Oct 6 at 10:00 AM ET. Our team will reach out to confirm the details.";
+  const { lane, state } = nepqLane({ llm: () => ({ message: draft }), contact: { address1: '123 Main St', postalCode: '33601' }, messages: [M('outbound', offer, 4), M('inbound', 'the first one', 3), M('outbound', hold, 2), M('inbound', '123 Main St, Tampa FL 33601', 1), M('outbound', dmAsk, 0.5)] });
+  await lane.processInbound(INBOUND('just me'));
+  assert.equal(state.bookings.length, 1);
+  assert.equal(state.sends[0].message, draft);
+});
+
+// Part 7: a reply that runs out of time sends the move's own reference line
+// (it answers the visitor) instead of the generic holding line.
+test('NEPQ live: a timed-out reply on a decided turn sends that turn\'s backup line, not the holding line', async () => {
+  const made = nepqLane();
+  const { lane, state } = makeLane({ llmDelayMs: 500, hardTimeoutMs: 150, extra: {
+    nepqMode: () => 'live',
+    offerBookingSlots: async () => ({ slots: NEPQ_SLOTS, tzLabel: 'ET', calendarId: 'CALWE' }),
+  } });
+  void made;
+  const out = await lane.processInbound(INBOUND('let me think about it'));
+  assert.equal(out.outcome, 'fallback');
+  assert.match(state.sends[0].message, /^No problem at all\. Want to grab a time now/);
+  assert.ok(state.events.some(e => e.event_type === 'agentic.live_chat_fallback' && e.payload.backup_line === true));
+});
+
+test('normalizeThread keeps each turn\'s own channel (texts and emails sit in the same GHL conversation)', async () => {
+  const { normalizeThread } = await import('../src/live-chat/fast-lane.js');
+  const t = normalizeThread([
+    { direction: 'inbound', body: 'texted you earlier', messageType: 'TYPE_SMS', dateAdded: '2026-10-02T10:00:00Z' },
+    { direction: 'inbound', body: 'hi from the site', messageType: 'TYPE_LIVE_CHAT', dateAdded: '2026-10-02T11:00:00Z' },
+    { direction: 'outbound', body: 'email reply', messageType: 'TYPE_EMAIL', dateAdded: '2026-10-02T12:00:00Z' },
+    { direction: 'inbound', body: 'no type', dateAdded: '2026-10-02T13:00:00Z' },
+  ]);
+  assert.deepEqual(t.map(m => m.channel), ['sms', 'livechat', 'email', 'livechat']);
 });

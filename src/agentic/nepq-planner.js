@@ -28,6 +28,7 @@ import { isNotInterested } from './not-interested.js';
 import { isLeadQuestion, findBookingAsks } from './discovery-discipline.js';
 import { isTeamOpen, nextTeamOpenLabel, requestedCallTime } from './team-hours.js';
 import { heldSlot, COLLECT_ASK } from './booking-collect.js';
+import { RECHECK_RX } from './contact-check.js';
 import { parseDayPreference, slotsForPreference, slotMatches, preferenceOfferLine } from './day-preference.js';
 import { enforceOneAsk } from './one-ask.js';
 
@@ -136,7 +137,8 @@ export const CONSEQUENCE_RX = /\bwhat\s+happens\s+if\b|\bif\s+you\s+(?:wait|hold
 const BRIDGE_RX = /\bbased\s+on\s+what\s+you\s+(?:told|said|mentioned)\b|\bthis\s+could\s+work\s+for\s+you\b|\b(?:the\s+)?(?:easiest\s+|best\s+)?next\s+step\s+(?:would\s+be|is)\b/i;
 // A vague opener: a greeting, or "I need new windows" with nothing else to go on.
 const OPENER_RX = /^\s*(?:(?:hi|hello|hey|howdy|good\s+(?:morning|afternoon|evening))(?:\s+there)?[\s!.,]*|(?:hi|hello|hey)?[\s,!.]*(?:i\s+(?:need|want|am\s+looking\s+for|'m\s+looking\s+for)|looking\s+(?:for|into)|interested\s+in)\s+(?:some\s+|new\s+|a\s+few\s+)*(?:impact\s+)?(?:windows?|doors?|windows?\s+and\s+doors?)[\s!.]*)$/i;
-const ASK_DAY_RX = /\bwhat\s+day\s+(?:works\s+best|would\s+be\s+easiest)\b|\bwhich\s+day\s+is\s+best\b/i;
+// Part 7: the bot words its own day ask now, so any day/time question counts.
+const ASK_DAY_RX = /\bwhat\s+day\s+(?:works\s+best|would\s+be\s+easiest)\b|\bwhich\s+day\s+is\s+best\b|\b(?:what|which)\s+(?:day|days|time\s+of\s+day)\b[^.?!]*\?|\bwhen\s+(?:works|would\s+work|is\s+(?:a\s+)?good)\b[^.?!]*\?/i;
 const STATUS_FRAME_RX = /\bpretty\s+simple\b|\bsee\s+what\s+you\s+have\s+now\b|\bif\s+it\s+might\s+be\s+a\s+fit\b/i;
 const REVEAL_RX = /\banything\s+you'?re\s+wondering\s+about\b|\bbefore\s+your\s+visit\b/i;
 const SLOT_OFFER_RX = /\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b[^?]{0,80}\bor\b|\bI\s+have\s+[^?]{0,80}\bor\b[^?]*\?/i;
@@ -282,6 +284,9 @@ export function isNo(text, lastOutbound = '') {
 // (2026-10-02 simulation: it fired the price play, and the next "price"
 // would have handed the lead to a person).
 // The bot's own quote line (see LINES.quote_*).
+// Every price reply says why there is no number yet; the next turn counts
+// these to decide quote → times → a person (Part 7: the model words them).
+const PRICE_PLAY_RX = /\bevery\s+home\s+is\s+different\b|\bany\s+number\s+i\s+gave\b|\ba\s+number\s+(?:right\s+)?now\s+would\s+(?:just\s+)?be\s+a\s+guess\b/i;
 const QUOTE_LINE_RX = /\bhappy\s+to\s+get\s+you\s+a\s+quote\b|\bexact\s+pricing\s+comes\s+from\s+a\s+quick\s+visit\b|\bcan'?t\s+give\s+a\s+fair\s+price\s+on\s+the\s+spot\b|\bhappy\s+to\s+help\s+with\b[^.?!]*\.\s+what'?s\s+got\s+you\s+looking\s+into\s+(?:them|it|this)\s+now\?|\ba\s+number\s+now\s+would\s+(?:just\s+)?be\s+a\s+guess\b/i;
 // The visitor says the bot is repeating itself (2026-10-02, 5i59G).
 export const REPEAT_COMPLAINT_RX = /\byou\s+(?:just|already)\s+(?:said|asked)(?:\s+(?:that|this))?\b|\bi\s+(?:just|already)\s+(?:said|told\s+you|answered)\b|\bstop\s+asking\b|\byou(?:'re|\s+are)\s+repeating\b|\bsame\s+(?:thing|question)\s+again\b/i;
@@ -414,9 +419,9 @@ export function planNepqTurn({
   const prevOutOf = (i) => [...turns.slice(0, i)].reverse().find(x => x.direction === 'outbound')?.text || '';
   const inboundTypes = turns.map((t, i) => (t.direction === 'inbound' ? objectionType(t.text, prevOutOf(i)) : undefined)).filter(x => x !== undefined);
   const priceAsks = inboundTypes.filter(x => x === 'price').length;
-  const pricePlayed = outbound.some(m => /every\s+home\s+is\s+different|any\s+number\s+i\s+gave/i.test(m.text));
+  const pricePlayed = outbound.some(m => PRICE_PLAY_RX.test(m.text));
   // How many price/quote lines the bot already sent (quote → again → a person).
-  const priceLines = outbound.filter(m => QUOTE_LINE_RX.test(m.text) || /every\s+home\s+is\s+different|any\s+number\s+i\s+gave/i.test(m.text)).length;
+  const priceLines = outbound.filter(m => QUOTE_LINE_RX.test(m.text) || PRICE_PLAY_RX.test(m.text)).length;
   const counters = {
     nos_in_a_row: nos,
     price_asks: priceAsks,
@@ -632,7 +637,7 @@ export function planNepqTurn({
     return Object.assign(plan, { step: 'offer_slots', required_move: 'offer_slots', booking: { allowed: true, reason: 'nepq:offer_slots' } });
   }
   // They named a day after "what day works best?": offer two times that day.
-  if (/\bwhat\s+day\s+works\s+best\b/i.test(lastOut) && DAY_OR_TIME_RX.test(now)) {
+  if (ASK_DAY_RX.test(lastOut) && DAY_OR_TIME_RX.test(now)) {
     if (offerSlots.length === 2) return fixed('offer_slots', withSlots(LINES.offer_slots(offerSlots, counters.slot_offers)), { step: 'offer_slots' });
     return Object.assign(plan, { step: 'offer_slots', required_move: 'offer_slots', booking: { allowed: true, reason: 'nepq:offer_slots' } });
   }
@@ -736,11 +741,100 @@ const SEE_YOU_RX = /\bsee\s+you\s+(?:then|soon|there)\b/i;
 const SIGNOFF_RX = /(?:^|\s)([—–-]\s*[A-Z][A-Za-z.'’ ]{0,40})\s*$/;
 const FIXED_MOVES = new Set(['handoff', 'objection_play', 'ask_day', 'close', 'reveal', 'offer_slots', 'status_frame']);
 
+// ── Part 7 (Mark, 2026-10-02): "I don't think we need any static messages
+// sent by the bot. Each message should be custom." A fixed line is now a
+// REFERENCE the model writes its own version of, and the BACKUP that ships
+// only when the model's version fails these checks twice. The checks are
+// read from the reference itself, so every line in LINES is covered without
+// a per-move table: its real times, whether it ends on a question, whether
+// it promises a person, and which clock times it may name.
+const TEAM_RX = /\b(?:someone|somebody|a\s+(?:team\s+)?member|(?:our|the)\s+(?:service\s+)?team|one\s+of\s+(?:our|us)|a\s+person|specialist)\b/i;
+const CLOCK_RX = /\b(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?)/gi;
+const clockMinutes = (text) => [...String(text || '').matchAll(CLOCK_RX)].map(m => (Number(m[1]) % 12 + (/p/i.test(m[3]) ? 12 : 0)) * 60 + Number(m[2] || 0));
+
 /**
- * True when the plan ships its own fixed line, so whatever the model drafts is
- * replaced. A redraft for such a turn is time spent on text nobody sees
- * (2026-10-02 re-test: the SMS quote reply took 58s, 42s of it a redraft of a
- * draft the fixed quote line then replaced). Pure.
+ * What a reply for this move has to keep, read from the reference line. Pure.
+ * @returns {{ slots: string[], endsWithQuestion: boolean, noQuestion: boolean, promisesTeam: boolean, times: number[] }}
+ */
+// Phrases the planner reads back from our own messages next turn. A reply
+// for a move whose reference carries one must carry it too.
+const MARKERS = [
+  { rx: STATUS_FRAME_RX, say: 'say this is pretty simple' },
+  { rx: REVEAL_RX, say: "ask if there's anything they're wondering about before the visit" },
+  { rx: ASK_DAY_RX, say: 'ask what day works best' },
+  { rx: PRICE_PLAY_RX, say: 'say every home is different, so a number now would just be a guess' },
+  { rx: BRIDGE_RX, say: 'name "the next step"' },
+  { rx: RECHECK_RX, say: 'kindly ask them to double-check it and send it again' },
+  // The objection plays keep their point, whatever the words.
+  { rx: /\b(?:spouse|wife|husband|partner|both\s+home)\b/i, say: 'speak to their spouse or partner' },
+  { rx: /\bdecide\b/i, say: 'ask how they will decide' },
+  { rx: /\bchase\b/i, say: "say a time now saves them chasing us down later" },
+];
+
+export function referenceRules(line, slots = [], plan = null) {
+  const ref = String(line || '').trim();
+  const markers = MARKERS.filter(m => m.rx.test(ref));
+  // A price reply always says why there is no number (the quote → times →
+  // person count reads it), even where the reference words it differently.
+  if (plan?.objection?.type === 'price' && !markers.some(m => m.rx === PRICE_PLAY_RX)) markers.push(MARKERS.find(m => m.rx === PRICE_PLAY_RX));
+  // The real times, written as offered: offeredSlots/heldSlot read them back.
+  const labels = (Array.isArray(slots) ? slots : [])
+    .map(s => [s.rel ? `${s.rel} at ${s.time}` : null, `${s.day} at ${s.time}`].filter(Boolean))
+    .filter(forms => forms.some(f => ref.includes(f)))
+    .map(forms => forms.find(f => ref.includes(f)));
+  return {
+    slots: labels,
+    endsWithQuestion: /\?\s*$/.test(ref),
+    noQuestion: !ref.includes('?'),
+    promisesTeam: TEAM_RX.test(ref),
+    times: clockMinutes(ref),
+    markers,
+  };
+}
+
+/** The rules as one line of prompt text (rendered under the reference). Pure. */
+export function referenceRulesText(rules) {
+  const out = [];
+  if (rules.slots.length) out.push(`name these times exactly as written: ${rules.slots.join(' or ')} (no other times)`);
+  else if (!rules.times.length) out.push('name no day or clock time');
+  if (rules.promisesTeam) out.push('say someone from our team will reach out');
+  for (const m of rules.markers || []) out.push(m.say);
+  if (rules.endsWithQuestion) out.push('end with exactly one question');
+  if (rules.noQuestion) out.push('ask no question');
+  return out.join('; ');
+}
+
+/** The re-write instruction after a draft missed its reference's job (Part 7). Pure. */
+export function referenceRetryNote(plan, failed = []) {
+  const line = plan?.reference_line || plan?.fixed_line || '';
+  const keep = referenceRulesText(referenceRules(line, plan?.reference_slots || plan?.slots_to_offer || [], plan));
+  return `Your previous draft did not do this turn's job (${failed.join(', ')}). Write it again, in your own words for this lead, ` +
+    `using the reference only as a guide: "${line}". It must ${keep || 'do what the reference does'}.`;
+}
+
+/**
+ * Problems with a model draft for a move that has a reference line, or [].
+ * Pure. An empty list means the draft does the reference's job.
+ */
+export function checkAgainstReference(draft, line, slots = [], plan = null) {
+  const text = String(draft || '').trim();
+  if (!text) return ['empty'];
+  const r = referenceRules(line, slots, plan);
+  const problems = [];
+  for (const m of r.markers) if (!m.rx.test(text)) problems.push(`missing:${m.say}`);
+  for (const label of r.slots) if (!text.includes(label)) problems.push(`missing_time:${label}`);
+  const allowed = new Set([...r.times, ...clockMinutes(r.slots.join(' '))]);
+  if (clockMinutes(text).some(t => !allowed.has(t))) problems.push('other_time');
+  if (r.endsWithQuestion && !/\?\s*$/.test(text)) problems.push('no_question');
+  if (r.noQuestion && text.includes('?')) problems.push('asks_a_question');
+  if (r.promisesTeam && !TEAM_RX.test(text)) problems.push('no_team_follow_up');
+  return problems;
+}
+
+/**
+ * True when the plan's move has a reference line (Part 7: the model writes
+ * its own version; the line is the backup when that version fails
+ * checkAgainstReference). Pure.
  */
 export function nepqFixedLineWins(plan) {
   return !!(plan?.fixed_line && FIXED_MOVES.has(plan.required_move));
@@ -824,11 +918,14 @@ export function enforceNepqPlan(draft, plan, { allowFigures = false, known = {} 
   let body = signOff ? original.slice(0, signOff.index).trim() : original.trim();
   const withSignOff = (t) => (signOff ? `${t} ${signOff[1].trim()}` : t);
 
-  // 1. A fixed move ships its line (the model's wording is not trusted here).
-  if (plan.fixed_line && FIXED_MOVES.has(plan.required_move)) {
-    if (norm(body) !== norm(plan.fixed_line)) changes.push(`fixed_line:${plan.required_move}`);
-    return { text: withSignOff(plan.fixed_line), changes };
-  }
+  // 1. A fixed move: the model wrote its own version of the reference line
+  // (Part 7). It goes through every step below and is checked against the
+  // reference at the end; the reference is the backup.
+  // `reference_line` is a caller's own reference for this turn (the live
+  // chat's booking and hand-off lines); it wins over the planner's.
+  const referenceMove = !!plan.reference_line || !!(plan.fixed_line && FIXED_MOVES.has(plan.required_move));
+  const refLine = plan.reference_line || plan.fixed_line;
+  const refSlots = plan.reference_slots || plan.slots_to_offer || [];
 
   let sentences = splitSentences(body);
   const drop = (pred, tag) => {
@@ -924,10 +1021,18 @@ export function enforceNepqPlan(draft, plan, { allowFigures = false, known = {} 
     body = plan.bridge_line || bridgeLine(plan);
     changes.push('bridge');
   }
+  if (referenceMove) {
+    const failed = checkAgainstReference(body, refLine, refSlots, plan);
+    if (failed.length) {
+      changes.push('backup_line');
+      return { text: withSignOff(refLine), changes, failed };
+    }
+    return { text: changes.length ? withSignOff(body) : original, changes, failed: [] };
+  }
   if (!body) {
     body = changes.includes('money_figures') ? NO_FIGURES_LINE
       : (changes.includes('consequence_repeat') || changes.includes('unapproved_claim')) ? bridgeLine(plan)
         : (original.trim() || NO_FIGURES_LINE);
   }
-  return { text: changes.length ? withSignOff(body) : original, changes };
+  return { text: changes.length ? withSignOff(body) : original, changes, failed: [] };
 }
