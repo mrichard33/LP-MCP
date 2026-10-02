@@ -38,6 +38,9 @@ export function nepqBackboneMode(env = process.env) {
 
 // ── signals in the lead's words ──────────────────────────────────────────
 
+// "I want to schedule an estimate": a booking request, not a price ask
+// (2026-10-02: it got the quote line). Two real times, no discovery needed.
+export const SCHEDULE_ASK_RX = /\b(?:schedule|book|set\s+up|make|get)\s+(?:an?\s+|the\s+|my\s+)?(?:free\s+|in[-\s]home\s+)?(?:estimate|appointment|consultation|visit|measure(?:ment)?|assessment)\b|\b(?:can|could)\s+(?:someone|you|somebody)\s+come\s+(?:out|by|over)\b/i;
 export const PRICE_RX = /\b(?:how\s+much|price[sd]?|pricing|costs?|quotes?|estimates?|ballpark|rough\s+(?:number|idea|figure)|what\s+(?:would|does|will)\s+(?:it|that|this)\s+(?:cost|run))\b/i;
 export const INSIST_RX = /\b(?:just|only)\s+(?:want|need)\s+(?:a|the|to\s+(?:get|know)(?:\s+(?:a|the))?)\s+(?:price|quote|number|cost|estimate)\b|\b(?:give|tell|send|text)\s+me\s+(?:a|the|your)\s+(?:price|number|quote|ballpark|figure|estimate)\b/i;
 // "how much a month" asks for a figure; "do you offer financing?" does not.
@@ -130,10 +133,12 @@ export const LINES = Object.freeze({
   // Mark, 2026-10-02 (second ruling): still engage. Say why there is no price
   // on the spot, ask ONE question about them, and put the two real times
   // beside it (no second question mark: the times are an offer, not a quiz).
-  quote_slots: (slots, what) => `Happy to help with ${what ? `the ${what}` : 'that'}. We can't give a fair price on the spot because every opening gets measured and the glass and frames are matched to your home, so any number now would be a guess. What's got you looking into this now? If you'd like a quick visit to measure, I have ${slotPair(slots)}, and you keep the written quote.`,
-  quote_no_slots: (what) => `Happy to help with ${what ? `the ${what}` : 'that'}. We can't give a fair price on the spot because every opening gets measured and the glass and frames are matched to your home, so any number now would be a guess. What's got you looking into this now?`,
-  price_again_slots: (slots) => `Totally fair. Every home is different, so any number I gave you now would be a guess. The visit gets you the exact number in writing. I have ${slotPair(slots)}. Which works better?`,
-  price_again_no_slots: 'Totally fair. Every home is different, so any number I gave you now would be a guess. The visit gets you the exact number in writing, and a team member will call to set a time.',
+  // 2026-10-02 (Mark): "way too long … too quick to ask for an appointment
+  // time". A quote ask is a reason to talk, not to book: one short line and
+  // the NEPQ connection question; the times come after discovery.
+  quote_first: (what) => (what ? `Happy to help with the ${what}. What's got you looking into them now?` : "Happy to help with that. What's got you looking into it now?"),
+  price_again_slots: (slots) => `Fair question. Every home is different, so a number now would just be a guess. I have ${slotPair(slots)} to measure. Which works better?`,
+  price_again_no_slots: 'Fair question. Every home is different, so a number now would just be a guess. A team member will call to set up a free measure.',
   // "You just said that": no more questions, the next step.
   repeat_slots: (slots) => `You're right, sorry about that. Let's get you a time instead. I have ${slotPair(slots)}. Which works better?`,
   repeat_no_slots: "You're right, sorry about that. A team member will call to set a time for the visit.",
@@ -214,6 +219,7 @@ export function isPriceAsk(text) {
   const t = String(text || '');
   if (MONEY_FIGURE_ASK_RX.test(t)) return true;
   if (FINANCING_ONLY_RX.test(t) && !/\bhow\s+much\b/i.test(t)) return false;
+  if (SCHEDULE_ASK_RX.test(t) && !/\b(?:how\s+much|cost|price|pricing|ballpark)\b/i.test(t)) return false;
   return PRICE_RX.test(t) || INSIST_RX.test(t);
 }
 
@@ -231,7 +237,7 @@ export function isNo(text, lastOutbound = '') {
 // (2026-10-02 simulation: it fired the price play, and the next "price"
 // would have handed the lead to a person).
 // The bot's own quote line (see LINES.quote_*).
-const QUOTE_LINE_RX = /\bhappy\s+to\s+get\s+you\s+a\s+quote\b|\bexact\s+pricing\s+comes\s+from\s+a\s+quick\s+visit\b|\bcan'?t\s+give\s+a\s+fair\s+price\s+on\s+the\s+spot\b/i;
+const QUOTE_LINE_RX = /\bhappy\s+to\s+get\s+you\s+a\s+quote\b|\bexact\s+pricing\s+comes\s+from\s+a\s+quick\s+visit\b|\bcan'?t\s+give\s+a\s+fair\s+price\s+on\s+the\s+spot\b|\bhappy\s+to\s+help\s+with\b[^.?!]*\.\s+what'?s\s+got\s+you\s+looking\s+into\s+(?:them|it|this)\s+now\?|\ba\s+number\s+now\s+would\s+(?:just\s+)?be\s+a\s+guess\b/i;
 // The visitor says the bot is repeating itself (2026-10-02, 5i59G).
 export const REPEAT_COMPLAINT_RX = /\byou\s+(?:just|already)\s+(?:said|asked)(?:\s+(?:that|this))?\b|\bi\s+(?:just|already)\s+(?:said|told\s+you|answered)\b|\bstop\s+asking\b|\byou(?:'re|\s+are)\s+repeating\b|\bsame\s+(?:thing|question)\s+again\b/i;
 
@@ -373,7 +379,7 @@ export function planNepqTurn({
   // Everything the lead sent since our last message (a live-chat burst).
   const lastOutIdx = turns.map(t => t.direction).lastIndexOf('outbound');
   const pending = turns.slice(lastOutIdx + 1).filter(t => t.direction === 'inbound').map(t => t.text);
-  const timeRequest = !SLOT_OFFER_RX.test(lastOut) ? (pending.find(t => TIME_REQUEST_RX.test(t)) || null) : null;
+  const timeRequest = !SLOT_OFFER_RX.test(lastOut) ? (pending.find(t => TIME_REQUEST_RX.test(t) || SCHEDULE_ASK_RX.test(t)) || null) : null;
 
   const plan = {
     version: NEPQ_PLANNER_VERSION,
@@ -443,14 +449,12 @@ export function planNepqTurn({
   // how long does install take, and do you do doors?"; a 600-character
   // message about cost worries): the canned line would ignore them. They get
   // a real answer that says why there is no price on the spot, then the times.
+  // 2026-10-02 (Mark): no times on the first ask; the answer ends on the NEPQ
+  // connection question instead.
   if (objType === 'price' && priceLines === 0 && isComplexPriceAsk(now)) {
     plan.price_note = true;
     plan.objection = { type: 'price', attempt, line: null };
-    if (offerSlots.length === 2) {
-      withSlots(null);
-      return Object.assign(plan, { step: 'offer_slots', required_move: 'offer_slots', answer_first: true, offer_line: LINES.offer_slots(offerSlots) });
-    }
-    return Object.assign(plan, { step: 'offer_slots', required_move: 'answer', booking: { allowed: true, reason: 'nepq:price_complex' } });
+    return Object.assign(plan, { step: 'discover', required_move: 'answer', booking: { allowed: false, reason: 'nepq:discover_first' } });
   }
 
   // 3b. "You just said that": stop asking, offer the next step.
@@ -461,16 +465,17 @@ export function planNepqTurn({
 
   // 4. Objection plays (Mark's wording).
   if (objType === 'price') {
-    const what = quoteItems(inbound.map(m => m.text).join(' \n '));
-    const first = priceLines === 0;
-    const line = offerSlots.length === 2
-      ? withSlots(first ? LINES.quote_slots(offerSlots, what) : LINES.price_again_slots(offerSlots))
-      : (first ? LINES.quote_no_slots(what) : LINES.price_again_no_slots);
+    // First ask: the short line and one question, no times (discovery first).
+    if (priceLines === 0) {
+      const line = LINES.quote_first(quoteItems(inbound.map(m => m.text).join(' \n ')));
+      return fixed('objection_play', line, { step: 'discover', objection: { type: 'price', attempt, line }, booking: { allowed: false, reason: 'nepq:discover_first' } });
+    }
+    // Asked again: why there is no number, then two real times.
+    const line = offerSlots.length === 2 ? withSlots(LINES.price_again_slots(offerSlots)) : LINES.price_again_no_slots;
     return fixed('objection_play', line, {
       step: 'offer_slots', objection: { type: 'price', attempt, line },
-      // The first quote line ends on its own question; contact details wait a turn.
-      ask_contact: offerSlots.length !== 2 && !first,
-      booking: { allowed: true, reason: first ? 'nepq:quote_to_visit' : 'nepq:price_again' },
+      ask_contact: offerSlots.length !== 2,
+      booking: { allowed: true, reason: 'nepq:price_again' },
     });
   }
   if (objType === 'spouse') {
@@ -511,15 +516,6 @@ export function planNepqTurn({
     // "Sure" / "yes" to two times picks neither: ask which, with the times.
     if (!picked && YES_RX.test(now) && offerSlots.length === 2) return fixed('offer_slots', withSlots(LINES.which(offerSlots)), { step: 'offer_slots' });
     if (picked || YES_RX.test(now)) return Object.assign(plan, { step: 'confirm', required_move: 'confirm', last_offer: lastOfferOut, booking: { allowed: true, reason: 'nepq:confirm' } });
-  }
-  // They answered the quote line's question instead of picking a time: echo
-  // them in one sentence, then the two times as the only question.
-  if (QUOTE_LINE_RX.test(lastOut) && !objType) {
-    if (offerSlots.length === 2) {
-      withSlots(null);
-      return Object.assign(plan, { step: 'offer_slots', required_move: 'offer_slots', answer_first: true, offer_line: LINES.offer_slots(offerSlots), quote_followup: true });
-    }
-    return Object.assign(plan, { step: 'offer_slots', required_move: 'answer', quote_followup: true, booking: { allowed: true, reason: 'nepq:quote_followup' } });
   }
   // They named a day after "what day works best?": offer two times that day.
   if (/\bwhat\s+day\s+works\s+best\b/i.test(lastOut) && DAY_OR_TIME_RX.test(now)) {
