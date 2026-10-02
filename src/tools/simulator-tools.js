@@ -22,10 +22,12 @@ const text = (obj) => ({ content: [{ type: 'text', text: typeof obj === 'string'
 export const simulatorDeps = {
   productionDeps: () => import('../live-chat/index.js').then(m => m.productionLaneDeps()),
   generate: () => import('../response-generator.js').then(m => m.generateResponse),
+  // READ ONLY: a real contact's record for a more realistic run.
+  buildRealContext: (contactId) => import('../context-builder.js').then(m => m.buildLeadContext(contactId, { includeConversation: false, skipCache: true })),
 };
 
 /** Validate and normalise a run request. Pure; throws a readable error. */
-export function parseSimRequest({ scenario = null, messages_json = null, channel = 'both', nepq_mode = 'live', persona_json = null, title = null } = {}) {
+export function parseSimRequest({ scenario = null, messages_json = null, channel = 'both', nepq_mode = 'live', persona_json = null, title = null, contact_id = null } = {}) {
   let turns = null;
   if (messages_json) {
     try { turns = JSON.parse(messages_json); } catch { throw new Error('messages_json must be a JSON array of strings'); }
@@ -38,7 +40,8 @@ export function parseSimRequest({ scenario = null, messages_json = null, channel
   if (!turns && scenario !== 'all' && !SCENARIOS[scenario]) throw new Error(`scenario must be one of: all, ${Object.keys(SCENARIOS).join(', ')} (or pass messages_json)`);
   if (!['both', 'livechat', 'sms'].includes(channel)) throw new Error('channel must be both, livechat or sms');
   if (!['live', 'off'].includes(nepq_mode)) throw new Error('nepq_mode must be live or off');
-  return { scenario: turns ? null : scenario, turns, persona, title, channel, nepqMode: nepq_mode };
+  if (contact_id && !/^[A-Za-z0-9]{10,40}$/.test(String(contact_id))) throw new Error('contact_id must be a GHL contact id');
+  return { scenario: turns ? null : scenario, turns, persona, title, channel, nepqMode: nepq_mode, contactId: contact_id || null };
 }
 
 async function waitFor(job, seconds) {
@@ -63,6 +66,7 @@ export function registerSimulatorTools(server, deps = simulatorDeps) {
       scenario: z.string().optional().describe('Named scenario, or "all".'),
       messages_json: z.string().optional().describe('Your own customer messages, as a JSON array of strings (max 12).'),
       persona_json: z.string().optional().describe('Optional customer record, e.g. {"firstName":"Dana","phone":"+13525550101","postalCode":"33908"}.'),
+      contact_id: z.string().optional().describe('Optional real GHL contact (e.g. Mark Test hZOcPk6XmMvWVvjZJ7mz) whose record is READ for realism. Nothing is sent or written to it.'),
       channel: z.string().optional().describe('both (default), livechat or sms.'),
       nepq_mode: z.string().optional().describe('live (default: the NEPQ backbone answers) or off (today\'s production replies).'),
       wait_seconds: z.number().optional().describe('Wait up to this many seconds (max 100) for the result before returning.'),

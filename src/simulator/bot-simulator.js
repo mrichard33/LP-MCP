@@ -52,13 +52,13 @@ export const SCENARIOS = Object.freeze({
 });
 
 /** Parse a message list or a scenario name into one plan. Pure. */
-export function resolveScenario({ scenario = null, turns = null, persona = null, title = null } = {}) {
+export function resolveScenario({ scenario = null, turns = null, persona = null, title = null, contactId = null } = {}) {
   if (Array.isArray(turns) && turns.length) {
-    return { key: 'custom', title: title || 'Custom conversation', persona: { ...GUEST, ...(persona || {}) }, turns: turns.map(String).slice(0, 12) };
+    return { key: 'custom', title: title || 'Custom conversation', persona: { ...GUEST, ...(persona || {}) }, turns: turns.map(String).slice(0, 12), contactId };
   }
   const s = SCENARIOS[scenario];
   if (!s) throw new Error(`unknown scenario "${scenario}". Known: ${Object.keys(SCENARIOS).join(', ')}`);
-  return { key: scenario, ...s, persona: { ...s.persona, ...(persona || {}) } };
+  return { key: scenario, ...s, persona: { ...s.persona, ...(persona || {}) }, contactId };
 }
 
 function tomorrowAt(hourUtc, nowMs) {
@@ -73,7 +73,10 @@ function tomorrowAt(hourUtc, nowMs) {
  * @param {object} opts     { nepqMode, productionDeps, nowMs }
  */
 export async function simulateLiveChat(plan, { nepqMode = 'live', productionDeps, nowMs = Date.now() } = {}) {
-  const contactId = `${SIM_CONTACT_PREFIX}${plan.key}-${nowMs}`;
+  // A real contact (e.g. Mark Test) supplies its GHL/LP record, READ ONLY;
+  // the conversation is still the script and every write is still recorded.
+  const realContact = plan.contactId || null;
+  const contactId = realContact || `${SIM_CONTACT_PREFIX}${plan.key}-${nowMs}`;
   const persona = plan.persona;
   const thread = [];
   const effects = [];
@@ -97,10 +100,10 @@ export async function simulateLiveChat(plan, { nepqMode = 'live', productionDeps
     log: () => {},
     // The missing lead record is the simulation's own doing, not a finding.
     warn: (line) => { if (!/simulated: no lead record/.test(String(line))) record('warning', { line: String(line).slice(0, 300) }); },
-    fetchContact: async () => ({ id: contactId, firstName: persona.firstName, lastName: persona.lastName, phone: persona.phone, email: persona.email, postalCode: persona.postalCode, tags: [] }),
+    fetchContact: realContact ? productionDeps.fetchContact : async () => ({ id: contactId, firstName: persona.firstName, lastName: persona.lastName, phone: persona.phone, email: persona.email, postalCode: persona.postalCode, tags: [] }),
     fetchMessages: async () => thread.map(m => ({ direction: m.direction, body: m.text, dateAdded: m.at })),
     findConversation: async () => 'sim-conversation',
-    buildContext: async () => { throw new Error('simulated: no lead record'); },
+    buildContext: realContact ? productionDeps.buildContext : async () => { throw new Error('simulated: no lead record'); },
     sendMessage: async ({ message }) => { sent.push(message); return { messageId: `sim-msg-${sent.length}`, method: 'simulated' }; },
     insertAction: async () => { rowId++; rows.set(rowId, {}); return { id: rowId }; },
     updateAction: async (id, patch) => { rows.set(id, { ...(rows.get(id) || {}), ...patch }); },
@@ -113,8 +116,8 @@ export async function simulateLiveChat(plan, { nepqMode = 'live', productionDeps
     fingerprint: () => {},
     markSent: () => {},
     captureIdentity: async (_id, input) => { record('ghl_field_capture', { capture: input?.capture || {}, visitor_text_count: (input?.visitorTexts || []).length }); return null; },
-    findContactByPhone: async (digits) => (holder && String(holder.phone).endsWith(String(digits).slice(-10)) ? { id: 'sim-holder', firstName: holder.firstName, lastName: holder.lastName, phone: holder.phone } : null),
-    fetchAppointments: async () => (holderAppt ? [holderAppt] : []),
+    findContactByPhone: (realContact && !holder) ? productionDeps.findContactByPhone : async (digits) => (holder && String(holder.phone).endsWith(String(digits).slice(-10)) ? { id: 'sim-holder', firstName: holder.firstName, lastName: holder.lastName, phone: holder.phone } : null),
+    fetchAppointments: (realContact && !holder) ? productionDeps.fetchAppointments : async () => (holderAppt ? [holderAppt] : []),
     cancelAppointment: async (a) => { record('would_cancel_in_ghl', { appointment_id: a.appointmentId }); return { ok: true }; },
     rescheduleAppointment: async (a) => { record('would_move_same_appointment_in_ghl', { appointment_id: a.oldAppointmentId, new_start: a.startIso }); return { ok: true }; },
     postCancelCard: async (a) => { record('would_post_dispatch_card', { card: a.kind, text: String(a.text || '').slice(0, 400) }); return { ok: true }; },
@@ -158,7 +161,7 @@ export async function simulateLiveChat(plan, { nepqMode = 'live', productionDeps
   } else {
     for (let i = 0; i < plan.turns.length; i++) await runTurn(plan.turns[i], i);
   }
-  return { channel: 'livechat', scenario: plan.key, title: plan.title, nepq_mode: nepqMode, transcript, would_do: effects.filter(e => e.kind !== 'event'), events: effects.filter(e => e.kind === 'event').map(e => e.event_type) };
+  return { channel: 'livechat', scenario: plan.key, title: plan.title, nepq_mode: nepqMode, contact_id: realContact, transcript, would_do: effects.filter(e => e.kind !== 'event'), events: effects.filter(e => e.kind === 'event').map(e => e.event_type) };
 }
 
 /**
@@ -166,8 +169,10 @@ export async function simulateLiveChat(plan, { nepqMode = 'live', productionDeps
  * The send handler's side effects are reported from the generator's flags
  * (hand-off, booking companion), never run.
  */
-export async function simulateSms(plan, { nepqMode = 'live', generate, nowMs = Date.now(), maxAttempts = 2 } = {}) {
-  const contactId = `${SIM_CONTACT_PREFIX}sms-${plan.key}-${nowMs}`;
+export async function simulateSms(plan, { nepqMode = 'live', generate, buildRealContext = null, nowMs = Date.now(), maxAttempts = 2 } = {}) {
+  const contactId = plan.contactId || `${SIM_CONTACT_PREFIX}sms-${plan.key}-${nowMs}`;
+  // A real contact's record, read once (dry run: nothing is written to it).
+  const realBase = plan.contactId && buildRealContext ? await buildRealContext(plan.contactId) : null;
   const p = plan.persona;
   const contact = { firstName: /^guest$/i.test(p.firstName || '') ? null : p.firstName, lastName: /^guest$/i.test(p.firstName || '') ? null : p.lastName, phone: p.phone || '+15555550100', email: p.email, postalCode: p.postalCode, tags: [] };
   const thread = [];
@@ -176,7 +181,7 @@ export async function simulateSms(plan, { nepqMode = 'live', generate, nowMs = D
     const text = plan.turns[i];
     const at = new Date(nowMs + i * 60000).toISOString();
     thread.push({ direction: 'inbound', channel: 'sms', text, type: 'text', timestamp: at });
-    const context = { ...minimalContext({ contactId, contact, nowMs: nowMs + i * 60000 }), conversation_recent: thread.slice(-20) };
+    const context = { ...(realBase || minimalContext({ contactId, contact, nowMs: nowMs + i * 60000 })), conversation_recent: thread.slice(-20) };
     const t0 = Date.now();
     let generated = null;
     let error = null;
@@ -202,12 +207,12 @@ export async function simulateSms(plan, { nepqMode = 'live', generate, nowMs = D
       would_do: wouldDo, seconds: Math.round((Date.now() - t0) / 100) / 10,
     });
   }
-  return { channel: 'sms', scenario: plan.key, title: plan.title, nepq_mode: nepqMode, transcript };
+  return { channel: 'sms', scenario: plan.key, title: plan.title, nepq_mode: nepqMode, contact_id: plan.contactId || null, transcript };
 }
 
 /** Run one scenario on the channels it applies to. */
-export async function runSimulation({ scenario, turns, persona, title, channel = 'both', nepqMode = 'live' }, deps) {
-  const plan = resolveScenario({ scenario, turns, persona, title });
+export async function runSimulation({ scenario, turns, persona, title, contactId = null, channel = 'both', nepqMode = 'live' }, deps) {
+  const plan = resolveScenario({ scenario, turns, persona, title, contactId });
   const allowed = plan.channels || ['livechat', 'sms'];
   const want = channel === 'both' ? allowed : [channel].filter(c => allowed.includes(c));
   const results = [];
@@ -215,7 +220,7 @@ export async function runSimulation({ scenario, turns, persona, title, channel =
     try {
       results.push(ch === 'livechat'
         ? await simulateLiveChat(plan, { nepqMode, productionDeps: await deps.productionDeps() })
-        : await simulateSms(plan, { nepqMode, generate: await deps.generate() }));
+        : await simulateSms(plan, { nepqMode, generate: await deps.generate(), buildRealContext: deps.buildRealContext || null }));
     } catch (err) {
       results.push({ channel: ch, scenario: plan.key, title: plan.title, error: String(err?.message || err).slice(0, 300) });
     }
@@ -226,7 +231,7 @@ export async function runSimulation({ scenario, turns, persona, title, channel =
 /** One readable block per conversation, for a person. Pure. */
 export function formatTranscript(result) {
   if (result.error) return `■ ${result.title} [${result.channel}] FAILED: ${result.error}`;
-  const lines = [`■ ${result.title} [${result.channel === 'livechat' ? 'LIVE CHAT' : 'SMS'}] (NEPQ ${result.nepq_mode})`];
+  const lines = [`■ ${result.title} [${result.channel === 'livechat' ? 'LIVE CHAT' : 'SMS'}] (NEPQ ${result.nepq_mode}${result.contact_id ? `, record ${result.contact_id}` : ''})`];
   for (const t of result.transcript) {
     lines.push(`  Customer: ${t.customer}`);
     if (t.bot?.length) for (const b of t.bot) lines.push(`  Bot:      ${b}`);
