@@ -250,6 +250,25 @@ async function postCancelCard({ text, contactId, kind }) {
  * visitor's zone (Houston reads Central). selectOfferableSlots applies the
  * same notice floor and 48h-first offer window the SMS bot uses.
  */
+// 2026-10-02 (Mark's 4:16 PM chat, kXTsIKYwzQ8Kau9xUzTc): the calendar read
+// timed out twice under the 2.5s cap, so "Yes" to the visit got a name/phone
+// ask and then the bridge AGAIN ("Would that help?" twice). One read per
+// calendar and zone serves every turn for a minute; a read still in flight is
+// shared, so the prefetch at the top of a turn and the offer reuse it.
+const SLOT_CACHE_MS = 60_000;
+const slotCache = new Map();
+export function cachedFreeSlots(calendarId, timezone, { fetch = fetchFreeSlots, now = Date.now } = {}) {
+  const key = `${calendarId}|${timezone}`;
+  const hit = slotCache.get(key);
+  if (hit && now() - hit.at < SLOT_CACHE_MS) return hit.promise;
+  const promise = Promise.resolve().then(() => fetch(calendarId, { timezone }));
+  slotCache.set(key, { at: now(), promise });
+  // A failed or empty read is not kept: the next turn reads again.
+  promise.then((av) => { if (!av?.slots?.length) slotCache.delete(key); }, () => slotCache.delete(key));
+  if (slotCache.size > 50) for (const [k, v] of slotCache) if (now() - v.at >= SLOT_CACHE_MS) slotCache.delete(k);
+  return promise;
+}
+
 async function offerSlots({ calendarId, contact, preferredText = null }) {
   if (!calendarId) return { slots: [], tzLabel: 'ET' };
   let zone = { timezone: 'America/New_York', label: 'ET' };
@@ -257,7 +276,7 @@ async function offerSlots({ calendarId, contact, preferredText = null }) {
   if (zip) {
     try { zone = { ...zone, ...(await timezoneForZip(zip)) }; } catch { /* Eastern */ }
   }
-  const av = await fetchFreeSlots(calendarId, { timezone: zone.timezone });
+  const av = await cachedFreeSlots(calendarId, zone.timezone);
   // A day/time the visitor typed ("tomorrow evening 6 pm") picks the times
   // nearest it (2026-10-02 simulation: it was ignored).
   const preferred = preferredText ? extractPreferredTime([{ direction: 'inbound', text: preferredText }], { timeZone: zone.timezone }) : null;

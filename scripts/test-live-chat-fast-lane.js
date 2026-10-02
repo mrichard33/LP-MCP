@@ -919,6 +919,66 @@ test('NEPQ live: a spouse who cannot make the held time gets two other times', a
   assert.match(state.sends[0].message, /^No problem[,.] .*both be there/);
 });
 
+// 2026-10-02 post-merge simulator run: a guest typed "Mark" and was asked for
+// a first name four more times. Every detail typed in the chat counts.
+test('NEPQ live: a guest who types their name, phone, address and "just me" is booked, never re-asked', async () => {
+  const offer = 'I have Tue, Oct 6 at 10:00 AM ET or Wed, Oct 7 at 2:00 PM ET. Which works better?';
+  const hold = "Great, I'm holding Tue, Oct 6 at 10:00 AM ET for you. What's your first name?";
+  const guest = { firstName: 'Guest Visitor sim01', phone: null };
+  const lane = (msgs) => nepqLane({ phone: null, contact: guest, messages: msgs });
+  const t1 = [M('outbound', offer, 9), M('inbound', 'the first one', 8), M('outbound', hold, 7)];
+  const a = lane(t1); await a.lane.processInbound(INBOUND('Mark'));
+  assert.equal(a.state.sends[0].message, "Thanks, Mark. What's the best phone number to reach you?");
+  const t2 = [...t1, M('inbound', 'Mark', 6), M('outbound', a.state.sends[0].message, 5)];
+  const b = lane(t2); await b.lane.processInbound(INBOUND('352-555-0188'));
+  assert.match(b.state.sends[0].message, /street address/);
+  const t3 = [...t2, M('inbound', '352-555-0188', 4), M('outbound', b.state.sends[0].message, 3)];
+  const c = lane(t3); await c.lane.processInbound(INBOUND('12 Main St, Ocala FL 34470'));
+  assert.match(c.state.sends[0].message, /anyone else be part of the decision/);
+  const t4 = [...t3, M('inbound', '12 Main St, Ocala FL 34470', 2), M('outbound', c.state.sends[0].message, 1)];
+  const e = lane(t4); await e.lane.processInbound(INBOUND('No, just me'));
+  assert.deepEqual(e.state.bookings, [{ contactId: 'C1', startIso: '2026-10-06T14:00:00Z', calendarId: 'CALWE', decisionMakers: 'Solo Owner' }]);
+  assert.equal(e.state.sends[0].message, 'Got it, Mark. I have you down for Tue, Oct 6 at 10:00 AM ET. A team member will reach out to confirm the details.');
+});
+
+test('NEPQ live: "My wife works then" is a conflict even when we asked something else', async () => {
+  const offer = 'I have Tue, Oct 6 at 10:00 AM ET or Wed, Oct 7 at 2:00 PM ET. Which works better?';
+  const hold = "Great, I'm holding Tue, Oct 6 at 10:00 AM ET for you. What's the street address for the visit, including the zip code?";
+  const { lane, state } = nepqLane({ messages: [M('outbound', offer, 3), M('inbound', 'the first one', 2), M('outbound', hold, 1)] });
+  await lane.processInbound(INBOUND('My wife works then'));
+  assert.equal(state.bookings, undefined);
+  assert.match(state.sends[0].message, /^No problem[,.] .*both be there/);
+});
+
+// 2026-10-02 (Mark's 4:16 PM chat): "Mark 954 379 215" was taken as it was.
+test('a phone missing a digit gets one friendly re-check, then the next answer is taken', async () => {
+  const ask = "Perfect. To get you set up, what's your first name and the best phone number to reach you?";
+  const a = nepqLane({ phone: null, messages: [M('outbound', ask, 1)] });
+  await a.lane.processInbound(INBOUND('Mark 954 379 215'));
+  assert.match(a.state.sends[0].message, /^Thanks, Mark\. (?:That number looks like it's missing a digit\. Could you send it again\?|I think a digit got cut off there\. What's the full number, area code first\?)$/);
+  assert.equal(a.state.llmCalls.length, 0);
+  const b = nepqLane({ phone: null, messages: [M('outbound', ask, 3), M('inbound', 'Mark 954 379 215', 2), M('outbound', a.state.sends[0].message, 1)] });
+  await b.lane.processInbound(INBOUND('954 379 215'));
+  assert.doesNotMatch(b.state.sends[0].message, /missing a digit|cut off/);
+});
+
+test('an email that cannot be right gets one friendly re-check', async () => {
+  const { lane, state } = nepqLane({ messages: [M('outbound', "What's the best email for you?", 1)] });
+  await lane.processInbound(INBOUND('mark@gmail'));
+  assert.match(state.sends[0].message, /email (?:doesn't look quite right|address)/);
+});
+
+// 2026-10-02 (Mark's 4:16 PM chat): the calendar read timed out, and the
+// guard re-sent the bridge after the visitor had said yes.
+test('a yes to the bridge with no times in hand asks the day, never the bridge again', async () => {
+  const bridge = 'From what you have shared, I think we can help. The easiest next step is a visit at your home. Would that help?';
+  const noSlots = makeLane({ messages: [M('outbound', bridge, 1)], extra: { nepqMode: () => 'live', offerBookingSlots: async () => ({ slots: [], tzLabel: 'ET' }) } });
+  await noSlots.lane.processInbound(INBOUND('Yes'));
+  const sent = noSlots.state.sends[0].message;
+  assert.doesNotMatch(sent, /Would that (?:help|work|be useful)/);
+  assert.match(sent, /what day|which day/i);
+});
+
 test('NEPQ live: GHL refusing a complete booking is the only hand-off, and nothing sounds final', async () => {
   const offer = 'I have Tue, Oct 6 at 10:00 AM ET or Wed, Oct 7 at 2:00 PM ET. Which works better?';
   const { lane, state } = nepqLane({ bookOk: false, contact: READY_CONTACT, messages: [M('outbound', offer, 2)] });
@@ -963,7 +1023,9 @@ test('a question the model ended with a period gets its question mark back', asy
 test('NEPQ live: a typed day and time with a question gets the answer, then two real times near it', async () => {
   const { lane, state } = nepqLane({ messages: [M('inbound', 'tomorrow evening 6 pm', 0.2)], llm: () => ({ message: 'Our warranty covers parts and labor for life. What made you start looking?' }) });
   await lane.processInbound(INBOUND("actually, what's the warranty?"));
-  assert.equal(state.slotReads, 1);
+  // The prefetch at the top of the turn plus the offer; in production both
+  // share one cached calendar read (cachedFreeSlots).
+  assert.equal(state.slotReads, 2);
   assert.equal(state.sends[0].message, 'Our warranty covers parts and labor for life. I have Tue, Oct 6 at 10:00 AM ET or Wed, Oct 7 at 2:00 PM ET. Which works better?');
 });
 

@@ -296,6 +296,18 @@ message stays in `recentTurns`) and the newest answers all; SMS drops a draft ri
 never for a `trivial` event, a bare "ok"/"thanks", or a retry of a batch message). Both log
 `superseded_by_newer_message`.
 
+**Post-merge fixes (2026-10-02, Mark's 4:16 PM chat and the simulator).** The chat's calendar read is
+started at the top of the turn and cached for a minute (`cachedFreeSlots`, `src/live-chat/index.js`):
+twice it timed out under the 2.5s cap, so a "Yes" to the bridge got a name/phone ask and then the bridge
+again. Once the bridge was asked, a no-times fallback asks the DAY (`nextStepLine`, `LINES.ask_day`),
+never "Would that help?" twice. Collect reads name/phone/address from the WHOLE chat thread, and a bare
+reply to our "first name?" is the name (`nameFromReply`); a guest was asked for it five times. A phone
+with too few or too many digits, or an email that cannot be right, gets ONE friendly re-check
+(`src/agentic/contact-check.js`), then the next answer is taken as it is. On SMS the hold line and the
+booking time come from the real slot the lead picked (`offeredSlots` / `pickSlot`), never the model's
+words, a spouse who cannot make the held time gets two other times, and the calendar is read whenever
+the bridge, an offer or a hold is in the last four messages.
+
 The simulator run (2026-10-02) added: `src/agentic/booking-claim.js` rewrites any
 "you're all set / booked / on the schedule" a model reply makes without a booking (live chat always; SMS
 when NEPQ is live), `restoreQuestionMark` puts back a "?" the model wrote as "." (every one-question check

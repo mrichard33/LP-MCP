@@ -89,3 +89,26 @@ export function parseDecisionMakers(text) {
   if (DM_YES_RX.test(t)) return 'Yes';
   return null;
 }
+
+// 2026-10-02 post-merge simulator run: a guest typed "Mark" to "What's your
+// first name?" and was asked again four times. The identity heuristics need
+// two capitalised words for a bare name (rightly, unprompted: "never mind"),
+// and a single "My name is Mark, and…" fails the same test. When WE asked
+// for the name, one or two plain words are the answer.
+const NAME_WORD = "[A-Za-z][A-Za-z'’-]{1,20}";
+const STATED_ONE_RX = new RegExp(String.raw`\bmy\s+name(?:\s+is|'?s)\s+(${NAME_WORD})`, 'i');
+const ASKED_NAME_RX = new RegExp(String.raw`^\s*(?:(?:it'?s|my\s+name\s+is|my\s+name'?s|name'?s|this\s+is|i'?m)\s+)?(${NAME_WORD})(?:\s+(${NAME_WORD}))?\s*[.!]?\s*$`, 'i');
+const NOT_A_NAME = new Set(['yes', 'no', 'yeah', 'yep', 'nope', 'ok', 'okay', 'sure', 'thanks', 'thank', 'hi', 'hello', 'hey', 'idk', 'maybe', 'fine', 'good', 'great', 'the', 'first', 'second', 'one', 'just', 'me', 'and', 'not', 'why', 'what', 'who', 'guest', 'visitor']);
+const capName = (w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase();
+
+/** A first name from "my name is X" anywhere, or from a bare reply to our name question. Pure. */
+export function nameFromReply(text, { asked = false } = {}) {
+  const t = String(text || '');
+  const stated = t.match(STATED_ONE_RX);
+  if (stated && !NOT_A_NAME.has(stated[1].toLowerCase())) return capName(stated[1]);
+  if (!asked) return null;
+  const m = t.match(ASKED_NAME_RX);
+  if (!m || /\d/.test(t)) return null;
+  if ([m[1], m[2]].filter(Boolean).some(w => NOT_A_NAME.has(w.toLowerCase()))) return null;
+  return capName(m[1]);
+}

@@ -55,7 +55,8 @@ import { enforceCallTiming } from '../agentic/team-hours.js';
 import { rewriteBookingClaims } from '../agentic/booking-claim.js';
 import { looksLikeShortPhone } from '../agentic/contact-typos.js';
 import { planNepqTurn, enforceNepqPlan, nepqBackboneMode, pickFresh, LINES as NEPQ_LINES } from '../agentic/nepq-planner.js';
-import { COLLECT_ASK, holdLine, missingItems, parseDecisionMakers, heldSlot } from '../agentic/booking-collect.js';
+import { COLLECT_ASK, holdLine, missingItems, parseDecisionMakers, heldSlot, nameFromReply } from '../agentic/booking-collect.js';
+import { contactRecheckLine } from '../agentic/contact-check.js';
 import { chatIdentity } from './identity-capture.js';
 import {
   loopBreakState,
@@ -108,6 +109,7 @@ import {
   phoneInThread,
   contactAskLine,
   VISIT_BRIDGE_LINE,
+  nextStepLine,
 } from './chat-rules.js';
 import { marketTimezone, tzLabel } from '../config/market-timezones.js';
 import { phoneFromText } from './missed-replies.js';
@@ -364,7 +366,10 @@ export function newTurnClaim() {
  */
 // 2026-10-02 simulation: 1.2s was too tight for the zone lookup plus the GHL
 // free-slots read, so "let me think about it" fell back to a day question.
-export const NEPQ_SLOT_LOOKUP_MS = 2500;
+// 2026-10-02 (Mark's 4:16 PM chat): 2.5s timed out twice in a row on a cold
+// calendar read. The read now starts at the top of the turn (prefetch below)
+// and is cached for a minute (cachedFreeSlots), so this cap rarely binds.
+export const NEPQ_SLOT_LOOKUP_MS = 4500;
 
 /** The pre-deadline contact read's cap, and the supersede map's size before a prune. */
 export const CONTACT_FETCH_CAP_MS = 4000;
@@ -387,7 +392,9 @@ export function wantsSlots(plan) {
   if (!plan) return false;
   if (plan.objection?.type === 'think') return true;
   if (plan.objection?.type === 'spouse' && plan.objection.attempt >= 2) return true;
-  return plan.step === 'offer_slots' || plan.step === 'confirm' || plan.step === 'collect';
+  return plan.step === 'offer_slots' || plan.step === 'confirm' || plan.step === 'collect'
+    // A yes to the bridge plans a day ask only for want of times (2026-10-02).
+    || plan.step === 'ask_day';
 }
 
 /** What the row records about the plan. Pure. */
@@ -626,6 +633,9 @@ export function createLiveChatFastLane(deps) {
       if (!conversationId) d.warn(`[LiveChat] no conversation found for ${contactId} — replying without the thread`);
     }
     const tags = (Array.isArray(contact?.tags) ? contact.tags : []).map(t => String(t).trim().toLowerCase());
+    // Warm the calendar read while the rest of the turn is built: the NEPQ
+    // offer below reuses it (cachedFreeSlots shares the in-flight read).
+    if (d.nepqMode() === 'live') Promise.resolve().then(() => d.offerBookingSlots({ contact })).catch(() => null);
     const suppression = matchSuppressionTags(tags, { mode: 'direct_reply', logContact: contactId });
     if (suppression.suppressed) {
       d.log(`[LiveChat] ${contactId} blocked by ${suppression.matched_tag} — no reply`);
@@ -846,6 +856,25 @@ export function createLiveChatFastLane(deps) {
       });
     }
 
+    // ── a phone or email that cannot be right: ask once more (Mark, 2026-10-02) ──
+    // "Mark 954 379 215" (nine digits) was thanked and taken. A friendly
+    // re-check, once; the next answer is taken as it is.
+    {
+      const recentOut = (context.conversation_recent || []).filter(m => String(m?.direction || '').toLowerCase() === 'outbound').slice(-8).map(m => String(m?.text ?? m?.body ?? ''));
+      const typedName = chatIdentity({ visitorTexts: [body] }).first_name || nameFromReply(body) || (String(body).match(/^\s*([A-Z][a-z'’-]{1,20})[\s,]+\+?\(?\d/) || [])[1] || null;
+      const recheck = contactRecheckLine({ text: body, recentOutbound: recentOut, firstName: typedName });
+      if (recheck) {
+        if (isSuperseded()) return deliver({ contactId, conversationId, body, mode, actionId, timing, isSuperseded, turn, draft: '' });
+        timing.t4_analysis_done = new Date(d.now()).toISOString();
+        timing.t5_generation_done = timing.t4_analysis_done;
+        return deliver({
+          contactId, conversationId, body, mode, actionId, timing, isSuperseded, turn, visitorTexts, draft: recheck.line,
+          capture: typedName ? { name: typedName } : {},
+          extras: { contact_recheck: recheck.kind, context_minimal: !!context._minimal, model: null },
+        });
+      }
+    }
+
     // ── a price request goes to the in-home visit (NEPQ Transition) ──
     // The second ask (or "I just want a price") gets the Transition as a fixed
     // line, no model call: the first live chat asked for a price three times
@@ -876,7 +905,8 @@ export function createLiveChatFastLane(deps) {
       }
       if (nepqMode === 'live') {
         const lastOutbound = [...context.conversation_recent].reverse().find(m => m.direction === 'outbound')?.text || '';
-        const nepqOut = await runNepqFixedMove({ plan: nepqPlan, slots: nepqSlots, contactId, body, hasName: hasNameOnRecord, hasPhone: hasPhoneOnRecord, firstName: realFirst, mode, lastOutbound: nepqPlan.last_offer || lastOutbound, contact, visitorTexts });
+        const nepqOut = await runNepqFixedMove({ plan: nepqPlan, slots: nepqSlots, contactId, body, hasName: hasNameOnRecord, hasPhone: hasPhoneOnRecord, firstName: realFirst, mode, lastOutbound: nepqPlan.last_offer || lastOutbound, contact, visitorTexts,
+          threadTurns: (context.conversation_recent || []).map(m => ({ direction: String(m?.direction || '').toLowerCase() === 'outbound' ? 'outbound' : 'inbound', text: String(m?.text ?? m?.body ?? '') })) });
         if (nepqOut) {
           timing.t4_analysis_done = new Date(d.now()).toISOString();
           timing.t5_generation_done = timing.t4_analysis_done;
@@ -988,13 +1018,13 @@ export function createLiveChatFastLane(deps) {
       // No calendar in this lane: any named day/time is invented (2026-10-01).
       // A time the visitor typed is an echo, never an invented slot (2026-10-02).
       const visitorText = (context.conversation_recent || []).filter(m => m.direction === 'inbound').map(m => m.text).join(' \n ');
-      const times = guardTimeOffers(base.fixed, { hasPhone, hasName, visitorText, nepqLive: nepqMode === 'live' && !!nepqPlan });
+      const times = guardTimeOffers(base.fixed, { hasPhone, hasName, visitorText, nepqLive: nepqMode === 'live' && !!nepqPlan, bridgeUsed: !!nepqPlan?.counters?.bridge_used });
       const cov = guardCoverageDraft(times.fixed, coverage);
       // A coverage turn is the zip-first script (ask for the zip, or stop);
       // the conversation guards would talk over it.
       const nepqLive = nepqMode === 'live' && nepqPlan;
       const bookingAllowed = nepqLive ? !!nepqPlan.booking.allowed : (!!discipline?.booking?.allowed || !!pricePlan || frustrated);
-      const flow = saPlan.active ? { notes: [], fixed: cov.fixed } : guardChatFlow(cov.fixed, { thread: context.conversation_recent, hasName, hasPhone, body, bookingAllowed, nepqLive: !!nepqLive, declined: live?.recommended_action === 'suppress', serviceTurn: live?.recommended_action === 'escalate_to_rep' || /existing_customer|service|complaint/i.test(String(live?.escalation_category || '')) });
+      const flow = saPlan.active ? { notes: [], fixed: cov.fixed } : guardChatFlow(cov.fixed, { thread: context.conversation_recent, hasName, hasPhone, body, bookingAllowed, nepqLive: !!nepqLive, bridgeUsed: !!nepqPlan?.counters?.bridge_used, declined: live?.recommended_action === 'suppress', serviceTurn: live?.recommended_action === 'escalate_to_rep' || /existing_customer|service|complaint/i.test(String(live?.escalation_category || '')) });
       // The NEPQ plan, enforced last: no money figures, no pressure, no
       // booking ask it does not allow, one question, the bridge when due.
       const typed = visitorTexts.join(' \n ');
@@ -1009,7 +1039,7 @@ export function createLiveChatFastLane(deps) {
       // a picked offered time (runNepqFixedMove), never here (2026-10-02, Mark
       // Test). A claim naming the appointment already on file stands.
       const hasAppt = context.lp?.appointment_set === true && context.lp?.appointment_is_past !== true;
-      const claim = rewriteBookingClaims(nepqFix.text, { booked: false, hasAppointment: hasAppt, ...(nepqLive ? { replacement: VISIT_BRIDGE_LINE } : {}) });
+      const claim = rewriteBookingClaims(nepqFix.text, { booked: false, hasAppointment: hasAppt, ...(nepqLive ? { replacement: nextStepLine({ bridgeUsed: !!nepqPlan?.counters?.bridge_used }) } : {}) });
       if (claim.changed) d.log(`[LiveChat] ${contactId} unbacked booking claim rewritten`);
       return { ...base, notes: [...base.notes, ...times.notes, ...cov.notes, ...flow.notes], fixed: claim.text, booking_claim_rewritten: claim.changed, coverage_notes: cov.notes.length, time_offers_removed: times.notes.length > 0, flow_notes: flow.notes.length, nepq_changes: nepqFix.changes };
     };
@@ -1211,7 +1241,7 @@ export function createLiveChatFastLane(deps) {
    * a day ask, a close, the Reveal, two real times, or booking a picked time.
    * Returns { reply, record } or null (the model writes this turn).
    */
-  async function runNepqFixedMove({ plan, slots, contactId, body, hasName, hasPhone, firstName, mode, lastOutbound = '', contact = null, visitorTexts = [] }) {
+  async function runNepqFixedMove({ plan, slots, contactId, body, hasName, hasPhone, firstName, mode, lastOutbound = '', contact = null, visitorTexts = [], threadTurns = [] }) {
     if (!plan) return null;
     const live = mode === 'live';
     const ask = contactAskLine({ hasName, hasPhone });
@@ -1238,12 +1268,29 @@ export function createLiveChatFastLane(deps) {
           return { reply: `That time just filled up. ${NEPQ_LINES.offer_slots(two, plan.counters?.slot_offers || 0)}`, record: { collect: 'held_slot_gone' } };
         }
       }
-      // What this message carries (name, phone, street, zip), and the
-      // decision-maker answer when that was our question.
-      const typed = chatIdentity({ visitorTexts: visitorTexts.length ? visitorTexts : [body] });
+      // What the visitor has typed in this chat (name, phone, street, zip),
+      // and the decision-maker answer when that was our question.
+      // 2026-10-02 post-merge simulator run: reading only THIS message, the
+      // name typed one turn earlier was forgotten and asked for four times
+      // (the contact is not re-read before GHL has the capture). The whole
+      // thread counts, newest value winning.
+      const threadTexts = threadTurns.filter(m => m.direction !== 'outbound').map(m => m.text);
+      const allTexts = [...threadTexts, ...(visitorTexts.length ? visitorTexts : [body])];
+      const typed = chatIdentity({ visitorTexts: allTexts });
+      if (!typed.first_name) {
+        // A reply to our own "what's your first name?" is the name; so is
+        // "my name is …" anywhere.
+        const askedNameNow = isCollect && plan.held_slot?.asked === 'name';
+        const fromThread = threadTurns.map((m, i) => (m.direction === 'outbound' ? null
+          : nameFromReply(m.text, { asked: /\bfirst name\b/i.test(threadTurns.slice(0, i).reverse().find(x => x.direction === 'outbound')?.text || '') })));
+        const named = nameFromReply(body, { asked: askedNameNow }) || fromThread.filter(Boolean).pop() || null;
+        if (named) { typed.first_name = named; (typed._source ||= {}).first_name = 'extracted'; }
+      }
       let decisionMakers = null;
-      if (isCollect && plan.held_slot?.asked === 'dm') {
-        const dm = parseDecisionMakers(body);
+      // "My wife works then" is a conflict whatever we asked last.
+      const dmNow = isCollect ? parseDecisionMakers(body) : null;
+      if (isCollect && (plan.held_slot?.asked === 'dm' || dmNow === 'conflict')) {
+        const dm = dmNow;
         if (dm === 'conflict') {
           const others = slots.slots.filter(x => x.iso !== chosen.iso).slice(0, 2);
           if (others.length === 2) return { reply: `No problem, let's find a time when you can both be there. ${NEPQ_LINES.offer_slots(others, plan.counters?.slot_offers || 0)}`, record: { collect: 'dm_conflict' } };
@@ -1263,14 +1310,14 @@ export function createLiveChatFastLane(deps) {
       if (missing.length) {
         const askLine = COLLECT_ASK[missing[0]];
         // 2026-10-02 (Mark): no opener twice in a row ("Got it." … "Got it.").
-        const ack = typed.first_name ? `Thanks, ${typed.first_name}.` : pickFresh(['Got it.', 'Perfect, thanks.', 'Great, thank you.'], plan.recent_outbound || [], 0);
+        const ack = (typed.first_name && plan.held_slot?.asked === 'name') ? `Thanks, ${typed.first_name}.` : pickFresh(['Got it.', 'Perfect, thanks.', 'Great, thank you.'], plan.recent_outbound || [], 0);
         const reply = isConfirm ? holdLine(chosen, tz, askLine) : `${ack} ${askLine}`;
         return { reply, record: { collect: missing[0], held: chosen.iso } };
       }
       if (!live) return { reply: NEPQ_LINES.confirm(chosen, tz, name), record: { booking: 'would_book', start: chosen.iso, calendar_id: slots.calendarId || null, decision_makers: decisionMakers } };
       // Save what they typed BEFORE booking: the booking gate reads the
       // contact (address, name, phone) from GHL.
-      try { await d.captureIdentity(contactId, { visitorTexts: visitorTexts.length ? visitorTexts : [body], capture: {} }); } catch { /* the gate decides */ }
+      try { await d.captureIdentity(contactId, { visitorTexts: allTexts, capture: typed.first_name ? { name: typed.first_name } : {} }); } catch { /* the gate decides */ }
       const when = `${chosen.day} at ${chosen.time} ${tz}`.trim();
       let res = null;
       try {
