@@ -179,11 +179,14 @@ export function contactAskLine({ hasName = false, hasPhone = false } = {}) {
 
 // "A team member will call you", "someone will reach out", "we'll set up the
 // visit": any line that commits a person to contacting the visitor.
+// 2026-10-02 (ymnwp): "Let me get you connected with our team right away" is a
+// next step too; missing it appended the visit pitch to a missed-visit reply.
+const HANDOFF_PROMISE_RX = /\b(?:get|getting)\s+(?:you\s+)?(?:connected|in\s+touch)\s+with\s+(?:our|the|a|someone)\b|\bconnect\s+you\s+with\s+(?:our|the|a|someone)\b|\bget(?:ting)?\s+someone\s+(?:from\s+our\s+team\s+)?(?:on\s+this|to\s+(?:call|reach))\b/i;
 const CALL_PROMISE_RX = /\b(?:team\s+member|someone|specialist|one\s+of\s+(?:our|us)|our\s+team|we)\b[^.?!]{0,40}?\b(?:will|'ll|can|is\s+going\s+to)\s+(?:call|reach\s+out|give\s+you\s+a\s+call|contact\s+you|be\s+in\s+touch|follow\s+up|set\s+(?:that|it|this|a\s+time|the\s+visit)\s+up|set\s+up)\b/i;
 
 /** Does this draft promise that a person will call or set something up? Pure. */
 export function promisesCall(text) {
-  return CALL_PROMISE_RX.test(String(text || ''));
+  return CALL_PROMISE_RX.test(String(text || '')) || HANDOFF_PROMISE_RX.test(String(text || ''));
 }
 
 const asksForPhone = (s) => /\b(?:phone|number|reach\s+you|call\s+you\s+at)\b/i.test(s);
@@ -366,7 +369,7 @@ export function dedupeSentences(text) {
 
 export const DECLINE_CLOSE_LINE = "Understood. Take care, and if anything changes, we're here.";
 
-export function guardChatFlow(draft, { thread = [], hasName = false, hasPhone = false, body = '', bookingAllowed = true, declined = false } = {}) {
+export function guardChatFlow(draft, { thread = [], hasName = false, hasPhone = false, body = '', bookingAllowed = true, declined = false, serviceTurn = false } = {}) {
   const notes = [];
   let fixed = String(draft || '');
 
@@ -398,6 +401,10 @@ export function guardChatFlow(draft, { thread = [], hasName = false, hasPhone = 
     const ask = contactAskLine({ hasName, hasPhone });
     if (!bookingAllowed) {
       notes.push('Your previous draft ended with no question. Keep the answer and end with ONE short question about their situation (no booking ask yet).');
+    } else if (ask && serviceTurn) {
+      // An existing customer's problem (a missed visit, a question about their
+      // job) is never answered with a sales pitch (2026-10-02, ymnwp).
+      fixed = [fixed, ask].filter(Boolean).join(' ').trim();
     } else if (ask) {
       notes.push(`Your previous draft ended with no question and no next step. Offer the free in-home measurement and end with exactly this question: "${ask}"`);
       fixed = [fixed, VISIT_NEXT_STEP_LINE, ask].filter(Boolean).join(' ').trim();

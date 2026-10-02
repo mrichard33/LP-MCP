@@ -250,3 +250,30 @@ test('spouse turn 2: the answer to "how does your spouse feel" gets the both-hom
   assert.match(p.fixed_line, /both home\? I have Tue, Oct 6/);
   assert.equal(planNepqTurn({ channel: 'livechat', trigger: 'she wants to know the price first, how much?', conversation: thread }).objection?.type, 'price');
 });
+
+// ── 2026-10-02 live chat (Guest Visitor ymnwp) ──
+
+test('a visitor back after a day starts a new visit: "hello" is not bridged on yesterday\'s questions', () => {
+  const day1 = '2026-10-01T02:14:00Z';
+  const at = (iso, mins) => new Date(Date.parse(iso) + mins * 60000).toISOString();
+  const thread = [
+    { direction: 'inbound', text: 'Do you service Palm Coast?', timestamp: at(day1, 0) },
+    { direction: 'outbound', text: 'What kind of project are you thinking about?', timestamp: at(day1, 1) },
+    { direction: 'inbound', text: 'both', timestamp: at(day1, 2) },
+    { direction: 'outbound', text: 'What is happening with your current windows?', timestamp: at(day1, 3) },
+    { direction: 'outbound', text: 'Any specific concerns with your windows?', timestamp: at(day1, 6) },
+    { direction: 'inbound', text: '32137', timestamp: at(day1, 7) },
+    { direction: 'inbound', text: 'hello', timestamp: '2026-10-02T12:11:54Z' },
+  ];
+  const p = planNepqTurn({ channel: 'livechat', trigger: 'hello', conversation: thread });
+  assert.notEqual(p.required_move, 'bridge');
+  assert.equal(p.counters.discovery_questions_asked, 0);
+  assert.equal(p.step, 'open');
+});
+
+test('a missed visit is a complaint: a person takes over, no pitch', () => {
+  for (const t of ['Yes, someone was supposed to come to my house today.', 'nobody came', 'the rep never showed up', 'you guys stood me up', 'I waited all day']) {
+    assert.equal(plan({ trigger: t }).handoff?.reason, 'complaint', t);
+  }
+  assert.equal(plan({ trigger: 'never call me again' }).handoff?.reason === 'complaint', false);
+});

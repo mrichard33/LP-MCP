@@ -180,3 +180,12 @@ test('cutSecondQuestion: ", or is it…?" is cut; the approved decision-maker as
   assert.equal(cutSecondQuestion("How long have they been like that, or is it just something you've noticed recently?"), 'How long have they been like that?');
   assert.equal(cutSecondQuestion('Is this your call, or is anyone else weighing in on it?'), 'Is this your call, or is anyone else weighing in on it?');
 });
+
+// 2026-10-02 (ymnwp): a missed-visit reply got "The next step is a free in-home measurement".
+test('guardChatFlow: a service turn never gets the visit pitch; "connected with our team" is a next step', async () => {
+  const { guardChatFlow, VISIT_NEXT_STEP_LINE, promisesCall } = await import('../src/live-chat/chat-rules.js');
+  assert.equal(promisesCall('Let me get you connected with our team right away so we can sort this out.'), true);
+  const r = guardChatFlow('I apologize for that. We will sort this out today.', { body: 'someone was supposed to come today', bookingAllowed: true, serviceTurn: true });
+  assert.ok(!r.fixed.includes(VISIT_NEXT_STEP_LINE), r.fixed);
+  assert.match(r.fixed, /name and the best number/);
+});
