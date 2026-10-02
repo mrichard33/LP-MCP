@@ -192,6 +192,10 @@ export function pickSlot(text, offered) {
   if (list.length === 1 && /\b(?:yes|yeah|yep|sure|ok(?:ay)?|works|perfect|that\s+one|sounds\s+good)\b/.test(s)) return list[0];
   if (/\b(?:first|1st|earlier|former)\b|^\s*(?:#?\s*1|one)\s*[.!]?\s*$/.test(s)) return list[0];
   if (/\b(?:second|2nd|later|latter|last)\b|^\s*(?:#?\s*2|two)\s*[.!]?\s*$/.test(s)) return list[1] || null;
+  // "tomorrow" / "today" pick the offered time labelled so (2026-10-02 offers
+  // read "tomorrow at 10:00 AM ET or Mon, Oct 5 at 6:00 PM ET").
+  const rel = list.filter((slot) => slot.rel && new RegExp(`\\b${slot.rel}\\b`).test(s));
+  if (rel.length === 1) return rel[0];
   const hits = list.filter((slot) => {
     const dow = String(slot.dayOfWeek || '').toLowerCase();
     const [, mon, day] = String(slot.day || '').toLowerCase().match(/(\w{3})\s+(\d{1,2})$/) || [];

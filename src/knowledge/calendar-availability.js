@@ -55,19 +55,44 @@ const ESCALATION_LADDER = (process.env.BOOKING_ESCALATION_LADDER || '48,72,96,16
 // current outbound copy ("two openings").
 const MAX_OFFER_SLOTS = 2;
 // 2026-10-02 (Mark): two times half an hour apart are not a real choice. The
-// parse keeps at most one slot per hour, and the second offered time is the
-// first one at least 3 hours after the first (else the next one).
+// parse keeps at most one slot per hour.
 const SLOT_SPACING_MS = 60 * 60_000;
 const OFFER_GAP_MS = 3 * 3600_000;
+const OFFER_DAYS_AHEAD_MS = 7 * 24 * 3600_000;
 
-/** The two times to offer: the earliest, and the first one 3+ hours later. Pure. */
-export function spreadOffer(slots, maxOffer = MAX_OFFER_SLOTS) {
+/**
+ * The two times to offer (Mark, 2026-10-02: "we only run appointments at 10,
+ * 2, or 6 pm … suggest the next 2 days — I have an appointment tomorrow at
+ * 10, or I have an appointment on Monday at 6 pm"):
+ *   1. the earliest open time;
+ *   2. the next open DAY after it (a closed day is skipped, up to a week out),
+ *      at a different time of day where that day allows (3+ hours apart).
+ * With no later day, the first time 3+ hours later, else the next one.
+ * `pool` is where the second time may come from (wider than the 48h window,
+ * so a Sunday with no visits rolls to Monday). Pure.
+ */
+export function spreadOffer(slots, maxOffer = MAX_OFFER_SLOTS, { pool = null, timezone = DEFAULT_TIMEZONE } = {}) {
   const list = Array.isArray(slots) ? slots : [];
-  if (maxOffer !== 2 || list.length <= 2) return list.slice(0, maxOffer);
+  if (maxOffer !== 2 || !list.length) return list.slice(0, maxOffer);
   const t = (s) => new Date(s.iso).getTime();
+  const wall = (s) => { const m = String(s.iso).match(/T(\d{2}):(\d{2})/); return m ? Number(m[1]) * 60 + Number(m[2]) : 0; };
   const first = list[0];
-  const second = list.find((s) => t(s) - t(first) >= OFFER_GAP_MS) || list[1];
-  return [first, second];
+  const firstDay = isoCivilDate(first.iso, timezone);
+  const candidates = (Array.isArray(pool) && pool.length ? pool : list)
+    .filter((s) => t(s) > t(first) && t(s) - t(first) <= OFFER_DAYS_AHEAD_MS)
+    .sort((a, b) => t(a) - t(b));
+  const later = candidates.filter((s) => isoCivilDate(s.iso, timezone) > firstDay);
+  if (later.length) {
+    const nextDay = isoCivilDate(later[0].iso, timezone);
+    const sameDay = later.filter((s) => isoCivilDate(s.iso, timezone) === nextDay);
+    // The time of day furthest from the first one: 10 AM pairs with 6 PM, so
+    // someone at work all day still has an option (ties go to the earlier).
+    const gap = (s) => Math.abs(wall(s) - wall(first));
+    const best = sameDay.reduce((a, b) => (gap(b) > gap(a) ? b : a), sameDay[0]);
+    return [first, gap(best) >= OFFER_GAP_MS / 60_000 ? best : sameDay[0]];
+  }
+  const second = candidates.find((s) => t(s) - t(first) >= OFFER_GAP_MS) || candidates[0];
+  return second ? [first, second] : [first];
 }
 
 /**
@@ -214,11 +239,18 @@ function formatSlot(iso, timezone) {
   const dowFmt = new Intl.DateTimeFormat('en-US', {
     timeZone: timezone, weekday: 'long',
   });
+  // "today" / "tomorrow" for how the offer reads ("I have tomorrow at 10:00
+  // AM ET or Mon, Oct 5 at 6:00 PM ET", Mark 2026-10-02). `day` keeps the
+  // date: picks and confirmations match on it.
+  const civil = isoCivilDate(iso, timezone);
+  const rel = civil === isoCivilDate(new Date().toISOString(), timezone) ? 'today'
+    : civil === isoCivilDate(new Date(Date.now() + 24 * 3600_000).toISOString(), timezone) ? 'tomorrow' : null;
   return {
     iso,
     day: dayFmt.format(d),         // "Sat, May 3"
     time: timeFmt.format(d),       // "10:00 AM"
     dayOfWeek: dowFmt.format(d),   // "Saturday"
+    rel,                           // "today" | "tomorrow" | null
   };
 }
 
@@ -252,8 +284,9 @@ export function formatSlotsForPrompt(availability) {
   // missed by an hour. Write the label the customer sees.
   const label = tzLabel(availability.timezone);
   lines.push('  Timezone: ' + availability.timezone + ' (' + label + ') — write every time with "' + label + '"');
+  const relOf = new Map(availability.slots.filter((s) => s.rel).map((s) => [s.day, s.rel]));
   for (const [day, times] of byDay) {
-    lines.push('  ' + day + ': ' + times.map((t) => t + ' ' + label).join(', '));
+    lines.push('  ' + day + (relOf.has(day) ? ` (${relOf.get(day)})` : '') + ': ' + times.map((t) => t + ' ' + label).join(', '));
   }
   if (availability.slots_total_count > availability.slots.length) {
     const more = availability.slots_total_count - availability.slots.length;
@@ -320,13 +353,15 @@ export function selectOfferableSlots(availability, preferred, opts = {}) {
     .filter((s) => Number.isFinite(ms(s)) && ms(s) >= floorMs)
     .sort((a, b) => ms(a) - ms(b));
 
-  const pack = (slots, window, extra = {}) => ({
-    slots: spreadOffer(slots, maxOffer),
+  // `pool`: where the second offered time may come from. A day the lead named
+  // keeps both times on that day; otherwise the next open day, up to a week.
+  const pack = (slots, window, extra = {}, pool = slots) => ({
+    slots: spreadOffer(slots, maxOffer, { pool, timezone: tz }),
     window,
     escalated_to_hours: null,
     preferred_honored: false,
     availability: {
-      slots: spreadOffer(slots, maxOffer),
+      slots: spreadOffer(slots, maxOffer, { pool, timezone: tz }),
       calendar_id: availability.calendar_id,
       timezone: tz,
       slots_total_count: slots.length,
@@ -356,7 +391,7 @@ export function selectOfferableSlots(availability, preferred, opts = {}) {
   const standard = afterFloor.filter((s) => ms(s) <= windowEndMs);
   if (standard.length) {
     console.log(`[OfferWindow] cal=${availability.calendar_id} window=standard_48h n=${standard.length}`);
-    return pack(standard, 'standard_48h');
+    return pack(standard, 'standard_48h', {}, afterFloor);
   }
 
   // 4. Escalated — nothing inside 48h, but real openings exist later. Offer the
