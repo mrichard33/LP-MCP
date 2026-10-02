@@ -3421,7 +3421,8 @@ export async function executeSendMessage(action, context) {
         applyTags: applyContactTags,
         addNote: addGHLNote,
         emitEvent,
-        alert: (text) => import('./alert-state.js').then(({ sendAlertMessage }) => sendAlertMessage(text, { channel: 'ops' })),
+        post: (text, channelId) => import('./slack.js').then(({ postToSlack }) => postToSlack(text, channelId)),
+        opsAlert: (text) => import('./alert-state.js').then(({ sendAlertMessage }) => sendAlertMessage(text, { channel: 'ops' })),
       }).catch(err => console.warn(`[SendMessage] NEPQ hand-off side effects failed for ${contactId} (fail-soft): ${err.message}`));
     }
 

@@ -350,6 +350,8 @@ export const NEPQ_SLOT_LOOKUP_MS = 2500;
 
 /** The pre-deadline contact read's cap, and the supersede map's size before a prune. */
 export const CONTACT_FETCH_CAP_MS = 4000;
+/** Our own rows for this chat: one indexed read, capped well inside the turn. */
+export const RECENT_TURNS_CAP_MS = 800;
 const LATEST_INBOUND_MAX = 500;
 
 /** Does this NEPQ plan need real slots to make its move? Pure. */
@@ -457,6 +459,7 @@ export function guardDraft(draft, { discipline, established, loopBreak, spouseAd
  *   callLLM({fn, system, user, maxTokens, json}) → { text, model }
  *   sendMessage({contactId, conversationId, message, actionId, inboundMessage}) → { messageId, method }
  *   findConversation(contactId)            → GHL conversation id or null (capped)
+ *   recentTurns(contactId)                 → this chat's turns from our own agent_actions rows [{direction, text, timestamp}]
  *   insertAction(row) → { id }             agent_actions insert
  *   updateAction(id, patch)
  *   claimMessages(contactId, keys) → { fresh, consumed }
@@ -484,6 +487,7 @@ export function createLiveChatFastLane(deps) {
     markSent: () => {},
     captureIdentity: async () => null,
     findConversation: async () => null,
+    recentTurns: async () => [],
     checkServiceArea: async () => ({ checked: false }),
     lookupPlace: async () => ({ checked: false }),
     zoneForZip: async () => null,
@@ -701,14 +705,24 @@ export function createLiveChatFastLane(deps) {
     const started = d.now();
     // ── context, in parallel, LP/lead state capped ──
     const getQueryEmbedding = d.prewarmEmbedding(body);
-    const [threadRes, ctxRes] = await Promise.all([
+    const [threadRes, ctxRes, ownRes] = await Promise.all([
       raceWithBudget(conversationId ? d.fetchMessages(conversationId) : Promise.resolve([]), d.contextCapMs() * 2),
       raceWithBudget(d.buildContext(contactId), d.contextCapMs()),
+      // Our own record of this chat (2026-10-02, 5i59G): GHL's I.LVI webhook
+      // sends no conversation id and a brand-new chat is not searchable yet,
+      // so 44 of 68 turns in two days ran with no history and the bot sent
+      // the same price line three times. Our rows always know the chat.
+      raceWithBudget(Promise.resolve().then(() => d.recentTurns(contactId)), RECENT_TURNS_CAP_MS),
     ]);
     let context = (!ctxRes.timedOut && !ctxRes.error && ctxRes.value) ? ctxRes.value : minimalContext({ contactId, contact, nowMs: d.now() });
     if (ctxRes.timedOut) d.log(`[LiveChat] lead context exceeded ${d.contextCapMs()}ms for ${contactId} — continuing with the contact record only`);
     if (ctxRes.error) d.warn(`[LiveChat] lead context failed for ${contactId}: ${ctxRes.error.message} — continuing with the contact record only`);
-    const thread = (!threadRes.timedOut && !threadRes.error) ? normalizeThread(threadRes.value) : [];
+    let thread = (!threadRes.timedOut && !threadRes.error) ? normalizeThread(threadRes.value) : [];
+    if (!thread.length) {
+      const own = (!ownRes.timedOut && !ownRes.error && Array.isArray(ownRes.value)) ? ownRes.value : [];
+      thread = normalizeThread(own.map(t => ({ direction: t.direction, body: t.text, dateAdded: t.timestamp })));
+      if (thread.length) d.log(`[LiveChat] thread from our own rows for ${contactId} (${thread.length} turns)`);
+    }
     if (thread.length && (thread[thread.length - 1].direction !== 'inbound' || thread[thread.length - 1].text !== body)) {
       thread.push({ direction: 'inbound', channel: 'livechat', text: body, type: 'text', timestamp: timing.t0_inbound_received });
     }
@@ -1176,6 +1190,8 @@ export function createLiveChatFastLane(deps) {
       // A person can only reach out with a way to reach them.
       return { reply: [plan.fixed_line, ask].filter(Boolean).join(' '), record: { fixed: plan.required_move } };
     }
+    // No real times to offer: the team calls, so it needs a way to reach them.
+    if (plan.ask_contact) return { reply: [plan.fixed_line, ask].filter(Boolean).join(' '), record: { fixed: plan.required_move } };
     return { reply: plan.fixed_line, record: { fixed: plan.required_move } };
   }
 

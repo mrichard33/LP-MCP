@@ -99,6 +99,16 @@ const DM_ASK_RX = /\b(?:decision|anyone\s+else|both\s+(?:of\s+you|home|there)|we
 export const LINES = Object.freeze({
   status_frame: "This is pretty simple. I just want to see what you have now and what you're hoping for, and if it might be a fit we can talk about next steps. Would that help?",
   price_play: "Totally fair. Every home is different, so any number I gave you now would be a guess. What are you hoping to see, so the estimate actually fits your home?",
+  // Mark, 2026-10-02 (5i59G): a quote or price request goes straight to booking.
+  // The old price play asked "what are you hoping to see?" and, with the bot's
+  // memory lost, repeated it three times without ever offering a visit.
+  quote_slots: (slots, what) => `Happy to get you a quote${what ? ` on the ${what}` : ''}. Exact pricing comes from a quick visit to measure, and you keep the written quote. I have ${slotPair(slots)}. Which works better?`,
+  quote_no_slots: (what) => `Happy to get you a quote${what ? ` on the ${what}` : ''}. Exact pricing comes from a quick visit to measure, and you keep the written quote. A team member will call to set a time.`,
+  price_again_slots: (slots) => `Totally fair. Every home is different, so any number I gave you now would be a guess. The visit gets you the exact number in writing. I have ${slotPair(slots)}. Which works better?`,
+  price_again_no_slots: 'Totally fair. Every home is different, so any number I gave you now would be a guess. The visit gets you the exact number in writing, and a team member will call to set a time.',
+  // "You just said that": no more questions, the next step.
+  repeat_slots: (slots) => `You're right, sorry about that. Let's get you a time instead. I have ${slotPair(slots)}. Which works better?`,
+  repeat_no_slots: "You're right, sorry about that. A team member will call to set a time for the visit.",
   spouse_1: 'Makes sense. How does your spouse feel about getting this done?',
   spouse_2_slots: (slots) => `Would it be easier to pick a time when you're both home? I have ${slotPair(slots)}.`,
   spouse_2_no_slots: "Would it be easier to pick a time when you're both home? What day works best for you both?",
@@ -179,6 +189,20 @@ export function isNo(text, lastOutbound = '') {
 // ("probably price and the warranty"): that is an answer, not a price ask
 // (2026-10-02 simulation: it fired the price play, and the next "price"
 // would have handed the lead to a person).
+// The bot's own quote line (see LINES.quote_*).
+const QUOTE_LINE_RX = /\bhappy\s+to\s+get\s+you\s+a\s+quote\b|\bexact\s+pricing\s+comes\s+from\s+a\s+quick\s+visit\b/i;
+// The visitor says the bot is repeating itself (2026-10-02, 5i59G).
+export const REPEAT_COMPLAINT_RX = /\byou\s+(?:just|already)\s+(?:said|asked)(?:\s+(?:that|this))?\b|\bi\s+(?:just|already)\s+(?:said|told\s+you|answered)\b|\bstop\s+asking\b|\byou(?:'re|\s+are)\s+repeating\b|\bsame\s+(?:thing|question)\s+again\b/i;
+
+/** What they want quoted, from their own words ("12 windows and 2 sliding glass doors"), or null. Pure. */
+export function quoteItems(text) {
+  const items = [...String(text || '').matchAll(/\b(\d{1,3})\s+((?:sliding\s+glass\s+|sliding\s+|french\s+|entry\s+|front\s+|patio\s+|impact\s+)?(?:windows?|doors?|sliders?))\b/gi)]
+    .map(m => `${m[1]} ${m[2].toLowerCase().replace(/\s+/g, ' ')}`);
+  const unique = [...new Set(items)].slice(0, 3);
+  if (!unique.length) return null;
+  return unique.length === 1 ? unique[0] : `${unique.slice(0, -1).join(', ')} and ${unique[unique.length - 1]}`;
+}
+
 const SPOUSE_FEEL_Q_RX = /\bhow\s+does\s+your\s+(?:spouse|wife|husband|partner)\s+feel\b/i;
 const DECIDE_Q_RX = /\bhow\s+would\s+you\s+(?:then\s+)?decide\b/i;
 // Price named alongside other criteria is a list of what matters, not an ask.
@@ -270,6 +294,8 @@ export function planNepqTurn({
   const inboundTypes = turns.map((t, i) => (t.direction === 'inbound' ? objectionType(t.text, prevOutOf(i)) : undefined)).filter(x => x !== undefined);
   const priceAsks = inboundTypes.filter(x => x === 'price').length;
   const pricePlayed = outbound.some(m => /every\s+home\s+is\s+different|any\s+number\s+i\s+gave/i.test(m.text));
+  // How many price/quote lines the bot already sent (quote → again → a person).
+  const priceLines = outbound.filter(m => QUOTE_LINE_RX.test(m.text) || /every\s+home\s+is\s+different|any\s+number\s+i\s+gave/i.test(m.text)).length;
   const counters = {
     nos_in_a_row: nos,
     price_asks: priceAsks,
@@ -317,7 +343,7 @@ export function planNepqTurn({
 
   // 1. A person takes over: complaint, price insisted after the play, two no's.
   if (COMPLAINT_RX.test(now)) return handoff('complaint');
-  if (objType === 'price' && (pricePlayed || priceAsks >= 2)) return handoff('price_insist');
+  if (objType === 'price' && priceLines >= 2) return handoff('price_insist');
   if (nos >= 2) return handoff('two_nos');
   if ((objType === 'shopping') && attempt >= 2) return handoff('repeat_objection');
 
@@ -339,8 +365,25 @@ export function planNepqTurn({
     return Object.assign(plan, { step: 'booked', required_move: 'answer', booking: { allowed: false, reason: 'nepq:booked' } });
   }
 
+  // 3b. "You just said that": stop asking, offer the next step.
+  if (REPEAT_COMPLAINT_RX.test(now) && !hasAppointment) {
+    const line = offerSlots.length === 2 ? withSlots(LINES.repeat_slots(offerSlots)) : LINES.repeat_no_slots;
+    return fixed('objection_play', line, { step: 'offer_slots', objection: { type: 'repeat', attempt: 1, line }, ask_contact: offerSlots.length !== 2, booking: { allowed: true, reason: 'nepq:repeat_complaint' } });
+  }
+
   // 4. Objection plays (Mark's wording).
-  if (objType === 'price') return fixed('objection_play', LINES.price_play, { objection: { type: 'price', attempt, line: LINES.price_play }, booking: { allowed: false, reason: 'nepq:price_clarify' } });
+  if (objType === 'price') {
+    const what = quoteItems(inbound.map(m => m.text).join(' \n '));
+    const first = priceLines === 0;
+    const line = offerSlots.length === 2
+      ? withSlots(first ? LINES.quote_slots(offerSlots, what) : LINES.price_again_slots(offerSlots))
+      : (first ? LINES.quote_no_slots(what) : LINES.price_again_no_slots);
+    return fixed('objection_play', line, {
+      step: 'offer_slots', objection: { type: 'price', attempt, line },
+      ask_contact: offerSlots.length !== 2,
+      booking: { allowed: true, reason: first ? 'nepq:quote_to_visit' : 'nepq:price_again' },
+    });
+  }
   if (objType === 'spouse') {
     if (attempt >= 2) {
       const line = offerSlots.length === 2 ? withSlots(LINES.spouse_2_slots(offerSlots)) : LINES.spouse_2_no_slots;
