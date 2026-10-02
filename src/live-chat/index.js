@@ -35,8 +35,9 @@ import { timezoneForZip } from '../services/contact-timezone.js';
 import { createLiveChatFastLane, liveChatMode, liveChatHardTimeoutMs, liveChatModelWarning } from './fast-lane.js';
 import { searchByPhone } from '../services/ghl-contact-resolve.js';
 import { fetchRecentAndUpcomingAppointments } from '../knowledge/contact-appointments.js';
-import { resolveMarketCode } from '../actions/enrichment.js';
-import { sendGroupMeMessage } from '../groupme.js';
+import { resolveMarket } from '../actions/enrichment.js';
+import { postToSlack } from '../slack.js';
+import { fetchFreeSlots, selectOfferableSlots } from '../knowledge/calendar-availability.js';
 
 async function fetchContact(contactId) {
   const res = await ghlFetch('GET', `/contacts/${contactId}`, null, { priority: 'high', maxWaitMs: 1500 });
@@ -175,25 +176,75 @@ async function cancelAppointment({ contactId, appointmentId, reason }) {
 // repeats "cancel" does not post twice.
 const cancelCardsPosted = new Set();
 
+/** #dispatch (Mark, 2026-10-02). Env-overridable; the code default is the live channel. */
+export const SLACK_CHANNEL_DISPATCH_DEFAULT = 'C0C19GRS8FJ';
+
 /**
- * The sales-channel card (Mark, 2026-10-02: LP has no cancel API, so a person
- * cancels it in LP). Routed by the market CODE (CLAUDE.md), resolved from the
- * full GHL contact; no market → the all-markets rollup, and the card says so.
+ * The #dispatch card (Mark, 2026-10-02: LP has no cancel or reschedule API, so
+ * dispatch makes the change in LP). Slack is the destination of record here,
+ * so it goes through postToSlack and a failed post is visible in #ops-alerts
+ * (CLAUDE.md), never silent. The card names the market so dispatch knows
+ * which office's LP calendar to touch.
  */
 async function postCancelCard({ text, contactId, kind }) {
   const day = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' }).format(new Date());
   const key = `${contactId}:${kind}:${day}`;
-  if (cancelCardsPosted.has(key)) return { sent: false, reason: 'already_posted_today' };
+  if (cancelCardsPosted.has(key)) return { ok: false, reason: 'already_posted_today' };
   cancelCardsPosted.add(key);
   let market = null;
   try {
     const full = contactId ? await fetchContact(contactId) : null;
-    market = full ? await resolveMarketCode({ ghlContact: full }) : null;
+    market = full ? await resolveMarket({ ghlContact: full }) : null;
   } catch (err) {
-    console.warn(`[LiveChat] market lookup for cancel card failed (${contactId}): ${err.message}`);
+    console.warn(`[LiveChat] market lookup for dispatch card failed (${contactId}): ${err.message}`);
   }
-  const body = market ? text : `${text}\n(Market unknown: posted to the all-markets channel.)`;
-  return sendGroupMeMessage(body, { channel: 'sales', market: market || undefined, flushNow: true });
+  const channel = (process.env.SLACK_CHANNEL_DISPATCH || SLACK_CHANNEL_DISPATCH_DEFAULT).trim();
+  const body = text.replace(/\nPhone:/, `\nMarket: ${market || 'unknown'}\nPhone:`);
+  const res = await postToSlack(body, channel);
+  if (res?.ok) {
+    console.log(`[LiveChat] dispatch card (${kind}) for ${contactId} posted (ts ${res.ts})`);
+  } else {
+    cancelCardsPosted.delete(key);
+    console.warn(`[LiveChat] dispatch card (${kind}) for ${contactId} NOT posted: ${res?.error || 'unknown'}`);
+    await sendAlertMessage(`🚨 LIVE CHAT ${String(kind).toUpperCase()} CARD NOT POSTED TO #dispatch\nContact: ${contactId}\nSlack said: ${res?.error || 'unknown'}${res?.error === 'not_in_channel' ? '\nFix: add the Reece Slack app to #dispatch.' : ''}\n\n${body}`, { channel: 'ops' }).catch(() => {});
+  }
+  return res;
+}
+
+/**
+ * Up to two real open times on the appointment's own calendar, in the
+ * visitor's zone (Houston reads Central). selectOfferableSlots applies the
+ * same notice floor and 48h-first offer window the SMS bot uses.
+ */
+async function offerSlots({ calendarId, contact }) {
+  if (!calendarId) return { slots: [], tzLabel: 'ET' };
+  let zone = { timezone: 'America/New_York', label: 'ET' };
+  const zip = contact?.postalCode || contact?.postal_code || null;
+  if (zip) {
+    try { zone = { ...zone, ...(await timezoneForZip(zip)) }; } catch { /* Eastern */ }
+  }
+  const av = await fetchFreeSlots(calendarId, { timezone: zone.timezone });
+  const sel = selectOfferableSlots(av, null);
+  return { slots: (sel?.slots || []).slice(0, 2), tzLabel: zone.label || 'ET' };
+}
+
+/**
+ * Move the appointment in GHL through the existing reschedule_appointment
+ * handler (books the new time FIRST, then cancels the old one) and wait for
+ * the answer: "You're now set for…" is said only when GHL confirms.
+ */
+async function rescheduleAppointment({ contactId, oldAppointmentId, calendarId, startIso }) {
+  if (!supabase) return { ok: false, error: 'supabase client not configured' };
+  const { data, error } = await supabase.from('agent_actions').insert({
+    action_type: 'reschedule_appointment', target_system: 'ghl', target_entity: 'contact', target_id: contactId,
+    rule_applied: 'LIVE_CHAT_RESCHEDULE', status: 'executing', requires_approval: false, max_retries: 1,
+    reasoning: 'Live chat: the visitor picked a new time from two real open slots',
+    action_payload: { old_appointment_id: oldAppointmentId, new_calendar_id: calendarId, new_start_time: startIso, source: 'live_chat' },
+  }).select('id').single();
+  if (error || data?.id == null) return { ok: false, error: error?.message || 'insert returned no id' };
+  const { executeActionById } = await import('../actions/index.js');
+  const res = await executeActionById(data.id);
+  return { ok: res?.status === 'completed', action_id: data.id, error: res?.error || (res?.status !== 'completed' ? `status ${res?.status}` : null) };
 }
 
 export function buildProductionLane() {
@@ -225,6 +276,8 @@ export function buildProductionLane() {
     fetchAppointments: (contactId) => fetchRecentAndUpcomingAppointments(contactId),
     cancelAppointment,
     postCancelCard,
+    offerSlots,
+    rescheduleAppointment,
     contactUrl: (id) => (id ? `https://app.gohighlevel.com/v2/location/${GHL_LOCATION_ID}/contacts/detail/${id}` : null),
   });
 }

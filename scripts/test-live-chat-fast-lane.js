@@ -598,11 +598,14 @@ test('a phone typed in this message counts; only the name is asked', async () =>
 // and a "do not come" that kept getting the in-home pitch.
 
 const RICK = { id: 'RICK1', firstName: 'Rick', lastName: 'Fox', phone: '+13525550188' };
-const APPT = { appointment_id: 'APPT9', status: 'confirmed', start_time: '2026-10-02T22:00:00Z', start_time_human: 'Thu, Oct 2, 6:00 PM ET' };
-const cancelDeps = (state, { found = RICK, appts = [APPT], cancelOk = true } = {}) => ({
+const APPT = { appointment_id: 'APPT9', calendar_id: 'CAL1', status: 'confirmed', start_time: '2026-10-02T22:00:00Z', start_time_human: 'Thu, Oct 2, 6:00 PM ET' };
+const SLOTS = [{ iso: '2026-10-06T14:00:00Z', day: 'Tue, Oct 6', time: '10:00 AM', dayOfWeek: 'Tuesday' }, { iso: '2026-10-07T18:00:00Z', day: 'Wed, Oct 7', time: '2:00 PM', dayOfWeek: 'Wednesday' }];
+const cancelDeps = (state, { found = RICK, appts = [APPT], cancelOk = true, freeSlots = [], moveOk = true } = {}) => ({
   findContactByPhone: async (d) => { state.lookedUpPhones = [...(state.lookedUpPhones || []), d]; return found; },
   fetchAppointments: async (id) => { state.apptReads = [...(state.apptReads || []), id]; return appts; },
   cancelAppointment: async (a) => { state.cancels = [...(state.cancels || []), a]; return cancelOk ? { ok: true } : { ok: false, error: 'GHL 400' }; },
+  offerSlots: async (a) => { state.slotReads = [...(state.slotReads || []), a.calendarId]; return { slots: freeSlots, tzLabel: 'ET' }; },
+  rescheduleAppointment: async (a) => { state.moves = [...(state.moves || []), a]; return moveOk ? { ok: true } : { ok: false, error: 'GHL 422' }; },
   postCancelCard: async (c) => { state.cards = [...(state.cards || []), c]; },
   contactUrl: (id) => `https://ghl/${id}`,
 });
@@ -722,4 +725,59 @@ test('tzuzq: two messages 28s apart → only the newer one is answered; the olde
   assert.equal(o2.outcome, 'sent');
   const skipped = state.updates.find(u => u.status === 'skipped');
   assert.equal(skipped.error_message, 'superseded_by_newer_message');
+});
+
+// ── 2026-10-02 (Mark): "yes, a different day" books a real open time ───────
+const OFFER = 'Thanks, Rick. I found your appointment for Thu, Oct 2, 6:00 PM ET. Would a different day work better instead of cancelling?';
+const UP_TO_OFFER = [TZ('inbound', 'cancel my appointment', 0), TZ('outbound', "I can help with that. What's the full name and phone number the appointment is under?", 13), TZ('inbound', 'Rick Fox 3525550188', 40), TZ('outbound', OFFER, 50)];
+
+test('"yes, a different day" → two real open times from that appointment\'s calendar', async () => {
+  const { lane, state } = laneWithCancel([...UP_TO_OFFER, TZ('inbound', 'yes', 70)], { freeSlots: SLOTS });
+  await lane.processInbound(INBOUND('yes'));
+  assert.deepEqual(state.slotReads, ['CAL1']);
+  assert.equal(state.sends[0].message, 'Sure. I have Tue, Oct 6 at 10:00 AM or Wed, Oct 7 at 2:00 PM ET open. Which one works better for you?');
+  assert.equal(state.moves, undefined, 'nothing moves before they pick');
+});
+
+test('picking "Wednesday" moves it in GHL, says so, and posts a RESCHEDULED card for #dispatch', async () => {
+  const offerLine = 'Sure. I have Tue, Oct 6 at 10:00 AM or Wed, Oct 7 at 2:00 PM ET open. Which one works better for you?';
+  const { lane, state } = laneWithCancel([...UP_TO_OFFER, TZ('inbound', 'yes', 70), TZ('outbound', offerLine, 80), TZ('inbound', 'wednesday works', 100)], { freeSlots: SLOTS });
+  await lane.processInbound(INBOUND('wednesday works'));
+  assert.deepEqual(state.moves, [{ contactId: 'RICK1', oldAppointmentId: 'APPT9', calendarId: 'CAL1', startIso: '2026-10-07T18:00:00Z' }]);
+  assert.equal(state.sends[0].message, "Done. You're now set for Wed, Oct 7 at 2:00 PM ET, and your old time is cancelled. See you then.");
+  await new Promise(r => setImmediate(r));
+  assert.match(state.cards[0].text, /LIVE CHAT RESCHEDULED — move it in LP/);
+  assert.match(state.cards[0].text, /moved the appointment on Thu, Oct 2, 6:00 PM ET to Wed, Oct 7 at 2:00 PM ET/);
+  assert.equal(state.cancels, undefined, 'a reschedule is not a cancel');
+});
+
+test('no open times, an unclear pick, or a failed move → a person calls to set it, with a card', async () => {
+  const none = laneWithCancel([...UP_TO_OFFER, TZ('inbound', 'yes', 70)], { freeSlots: [] });
+  await none.lane.processInbound(INBOUND('yes'));
+  assert.equal(none.state.sends[0].message, 'A team member will call you at (352) 555-0188 to set up a new time.');
+
+  const offerLine = 'Sure. I have Tue, Oct 6 at 10:00 AM or Wed, Oct 7 at 2:00 PM ET open. Which one works better for you?';
+  const unclear = laneWithCancel([...UP_TO_OFFER, TZ('inbound', 'yes', 70), TZ('outbound', offerLine, 80), TZ('inbound', 'neither of those', 100)], { freeSlots: SLOTS });
+  await unclear.lane.processInbound(INBOUND('neither of those'));
+  assert.match(unclear.state.sends[0].message, /team member will call you/);
+  assert.equal(unclear.state.moves, undefined);
+
+  const failed = laneWithCancel([...UP_TO_OFFER, TZ('inbound', 'yes', 70), TZ('outbound', offerLine, 80), TZ('inbound', 'the first one', 100)], { freeSlots: SLOTS, moveOk: false });
+  await failed.lane.processInbound(INBOUND('the first one'));
+  assert.match(failed.state.sends[0].message, /team member will call you/);
+  assert.doesNotMatch(failed.state.sends[0].message, /now set/);
+});
+
+// ── human voice (2026-10-02) ──────────────────────────────────────────
+
+test('human voice: a model draft with an em dash and stacked openers goes out clean', async () => {
+  const { lane, state } = makeLane({ llm: () => ({ message: 'Got it. Great question. Fogging is usually a failed seal — they are not repairable. How long has it been fogged?' }) });
+  const res = makeRes();
+  await lane.handle(makeReq(INBOUND('my window is foggy inside')), res);
+  assert.equal(state.sends.length, 1);
+  const sent = state.sends[0].message;
+  assert.ok(!sent.includes('—'), sent);
+  assert.ok(!/Great question/.test(sent), sent);
+  assert.match(sent, /failed seal\. They are not repairable/);
+  assert.ok(sent.includes('?'));
 });

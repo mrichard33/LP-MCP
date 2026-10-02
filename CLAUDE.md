@@ -209,11 +209,23 @@ not sent and #ops-alerts is told. GHL's "Chat Widget" (type 5, `TYPE_WEBCHAT`) r
 **A live-chat cancel request is a fixed flow, not a model reply (Mark, 2026-10-02).**
 `src/live-chat/cancel-flow.js`: ask for the name and phone the appointment is under, match them (phone
 AND name — never phone alone), offer another day once, then cancel in GHL through `cancel_appointment`
-and say "Done" only after GHL confirms. Every outcome posts to the market's `sales` channel because
-LP has no cancel API — a person cancels it there. Anything unmatched goes to the team; the bot never
+and say "Done" only after GHL confirms. "Yes, another day" offers two real open slots from the
+appointment's own calendar (contact's zone) and books the pick through `reschedule_appointment` (new
+first, then the old one cancelled); "You're now set for" only after GHL confirms. Every outcome posts to
+**#dispatch** (`SLACK_CHANNEL_DISPATCH`, default C0C19GRS8FJ) through `postToSlack`, because LP has no
+cancel or move API and a person changes it there; a failed post is an #ops-alerts line. Anything
+unmatched goes to the team; the bot never
 says "no appointment on file" to a guest it never identified. A "no" (`isDecline`, or the model's
 `recommended_action: suppress`) gets a close with no pitch, and a reply overtaken by a newer message
 from the same visitor is not sent (`superseded_by_newer_message`).
+
+**Both bots sound like a person: rules in the prompt AND a pass after it (2026-10-02).** The SMS prompt
+banned em dashes for months and they shipped anyway, with "Got it. Great question." openers and "Just to
+understand… —" lead-ins. `HUMAN_VOICE_RULES` (`src/prompts/response-generator/banned.js`) tells the
+model; `humanizeReply` (`src/agentic/human-voice.js`) cleans what slips through, in the SMS generator
+and the live-chat guards. It only deletes or swaps punctuation and stock phrases, keeps a "— Name"
+sign-off, and leaves any sentence quoting a LOCKED KB line (found in the prompt) verbatim. Look for
+`[HumanVoice]` log lines.
 
 **Connection probes are read-only and never post.** `GET /health/integrations`
 (`src/integrations-health.js`) answers "can we reach LP / Five9 / Slack / GroupMe right now?"

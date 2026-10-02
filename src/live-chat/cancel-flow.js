@@ -17,8 +17,13 @@
  *   3. Offer a different day ONCE. Still cancel → cancel it in GHL
  *      (cancel_appointment, the existing handler) and say "Done" only after
  *      GHL confirms.
- *   4. Every outcome posts one card to the market's sales channel: LP has no
- *      cancel API, so a person cancels it in LP.
+ *   4. Every outcome posts one card to #dispatch: LP has no cancel or
+ *      reschedule API, so a person makes the change in LP.
+ *   5. "Yes, a different day" (Mark, 2026-10-02): the bot offers two real open
+ *      times from that appointment's own GHL calendar, books the one the
+ *      visitor picks (reschedule_appointment: book the new one, then cancel
+ *      the old), and #dispatch moves it in LP. No open time, an unclear pick,
+ *      or a failed booking → a person calls to set the time.
  *   Anything that cannot be matched goes to the team; the bot never says
  *   "no appointment on file".
  *
@@ -32,6 +37,9 @@ export const OFFER_MARK = 'Would a different day work better instead of cancelli
 export const HANDOFF_LINE = "Thanks. I've passed this to our scheduling team to cancel, and they'll confirm with you.";
 const DONE_MARK = 'is cancelled. If anything changes';
 const RESCHEDULE_MARK = 'to set up a new time.';
+export const SLOTS_MARK = 'Which one works better for you?';
+export const ONE_SLOT_MARK = 'Does that time work for you?';
+const MOVED_MARK = "You're now set for";
 
 // "cancel", "call it off", and the ways the tzuzq visitor actually said it.
 const CANCEL_RX = /\bcancel(?:l?ing|l?ed)?\b|\bcall\s+(?:it|this|the\s+(?:visit|appointment))\s+off\b|\b(?:don'?t|do\s+not|dont)\s+(?:come|bother\s+coming|send\s+(?:anyone|someone|anybody))\b|\bwaste\s+your\s+time\s+coming\b|\bwon'?t\s+be\s+allowed\s+in\b/i;
@@ -101,13 +109,17 @@ export function planCancelTurn({ body, thread = [], known = {} }) {
   // Inbound since the flow began carries the name and phone. The flow begins at
   // the FIRST cancel request after any earlier finished flow — a later
   // "no, just cancel it" is an answer inside the flow, not a new start.
-  const isFinishLine = (m) => m?.direction === 'outbound' && (String(m.text || '').includes(DONE_MARK) || m.text === HANDOFF_LINE || String(m.text || '').includes(RESCHEDULE_MARK));
+  const isFinishLine = (m) => m?.direction === 'outbound' && (String(m.text || '').includes(DONE_MARK) || m.text === HANDOFF_LINE || String(m.text || '').includes(RESCHEDULE_MARK) || String(m.text || '').includes(MOVED_MARK));
   const lastFinish = lastIndexWhere(all, isFinishLine);
   const flowStart = all.findIndex((m, i) => i > lastFinish && m?.direction === 'inbound' && isCancelRequest(m.text));
   const flowInbound = (flowStart >= 0 ? all.slice(flowStart) : all).filter((m) => m?.direction === 'inbound').map((m) => String(m.text || ''));
   const phone = known.phone ? String(known.phone).replace(/\D/g, '').slice(-10) : (flowInbound.map(phoneDigits).filter(Boolean).pop() || null);
   const words = nameWords(flowInbound);
 
+  // 0. Picking one of the open times we offered.
+  if (lastOutText.includes(SLOTS_MARK) || lastOutText.includes(ONE_SLOT_MARK)) {
+    return { step: 'pick_slot', offerText: lastOutText, phone, words };
+  }
   // 1. Answering our reschedule offer.
   if (lastOutText.includes(OFFER_MARK)) {
     return { step: 'after_offer', answer: classifyOfferAnswer(body), phone, words };
@@ -122,7 +134,7 @@ export function planCancelTurn({ body, thread = [], known = {} }) {
   // 3. A fresh cancel request. A flow that already finished does not restart
   //    on the visitor's next "do not come" — they were answered.
   if (!isCancelRequest(body)) return null;
-  const finished = outs.some((t) => t.includes(DONE_MARK) || t === HANDOFF_LINE || t.includes(RESCHEDULE_MARK));
+  const finished = outs.some((t) => t.includes(DONE_MARK) || t === HANDOFF_LINE || t.includes(RESCHEDULE_MARK) || t.includes(MOVED_MARK));
   if (finished) return null;
   if (phone && known.hasName) return { step: 'lookup', phone, words, known: true };
   if (phone && words.length) return { step: 'lookup', phone, words };
@@ -150,6 +162,52 @@ export function offerLine(firstName, apptHuman) {
 export function doneLine(apptHuman) {
   return `Done. Your ${apptHuman} appointment ${DONE_MARK}, we're here.`;
 }
+const slotText = (s) => `${s.day} at ${s.time}`;
+
+/** Two (or one) real open times, one question. Pure. */
+export function slotsOfferLine(slots, tzLabelText = 'ET') {
+  const [a, b] = slots;
+  if (!b) return `Sure. I can move it to ${slotText(a)} ${tzLabelText}. ${ONE_SLOT_MARK}`;
+  return `Sure. I have ${slotText(a)} or ${slotText(b)} ${tzLabelText} open. ${SLOTS_MARK}`;
+}
+
+/** The slots that our own offer line named, in the order we named them. Pure. */
+export function offeredSlots(offerText, freeSlots) {
+  const text = String(offerText || '');
+  return (Array.isArray(freeSlots) ? freeSlots : [])
+    .filter((s) => text.includes(slotText(s)))
+    .sort((x, y) => text.indexOf(slotText(x)) - text.indexOf(slotText(y)));
+}
+
+/**
+ * Which offered slot the visitor picked, or null. Pure.
+ * "the first one", "2", "Tuesday", "Oct 6", "10am", and for a single offer
+ * "yes" / "that works".
+ */
+export function pickSlot(text, offered) {
+  const s = String(text || '').toLowerCase();
+  const list = Array.isArray(offered) ? offered : [];
+  if (!list.length) return null;
+  if (/\b(?:neither|none|no(?:pe)?|not\s+(?:those|that|either))\b/.test(s)) return null;
+  if (list.length === 1 && /\b(?:yes|yeah|yep|sure|ok(?:ay)?|works|perfect|that\s+one|sounds\s+good)\b/.test(s)) return list[0];
+  if (/\b(?:first|1st|earlier|former)\b|^\s*(?:#?\s*1|one)\s*[.!]?\s*$/.test(s)) return list[0];
+  if (/\b(?:second|2nd|later|latter|last)\b|^\s*(?:#?\s*2|two)\s*[.!]?\s*$/.test(s)) return list[1] || null;
+  const hits = list.filter((slot) => {
+    const dow = String(slot.dayOfWeek || '').toLowerCase();
+    const [, mon, day] = String(slot.day || '').toLowerCase().match(/(\w{3})\s+(\d{1,2})$/) || [];
+    const hour = String(slot.time || '').toLowerCase().match(/^(\d{1,2})(?::(\d{2}))?\s*([ap])m/);
+    return (dow && s.includes(dow))
+      || (dow && s.includes(dow.slice(0, 3)) && /\b(?:mon|tue|wed|thu|fri|sat|sun)\b/.test(s))
+      || (mon && day && new RegExp(`\\b${mon}\\w*\\s+${day}\\b`).test(s))
+      || (hour && new RegExp(`\\b${hour[1]}(?::${hour[2] || '00'})?\\s*${hour[3]}\\.?m?\\b|\\b${hour[1]}\\s*o'?clock\\b`).test(s));
+  });
+  return hits.length === 1 ? hits[0] : null;
+}
+
+export function movedLine(slot, tzLabelText = 'ET') {
+  return `Done. ${MOVED_MARK} ${slotText(slot)} ${tzLabelText}, and your old time is cancelled. See you then.`;
+}
+
 export function rescheduleLine(phone) {
   return `A team member will call you at ${formatPhone(phone)} ${RESCHEDULE_MARK}`;
 }
@@ -159,21 +217,32 @@ export function rescheduleLine(phone) {
  * outcome tells a person what to do in LP. Plain English, first name, no
  * pronouns (CLAUDE.md). Pure.
  */
-export function formatCancelCard({ kind, name, phone, apptHuman, ghlCancelled, visitorWords, contactUrl, marketNote }) {
-  const title = kind === 'reschedule'
-    ? '📅 LIVE CHAT RESCHEDULE — call to set a new time'
-    : '📅 LIVE CHAT CANCEL — cancel it in LP';
+export function formatCancelCard({ kind, name, phone, apptHuman, newTimeHuman, ghlCancelled, visitorWords, contactUrl, marketNote }) {
   const who = name || 'A website chat visitor';
-  return [
-    title,
-    `${who} ${kind === 'reschedule' ? 'wants a different day for' : 'asked to cancel'} ${apptHuman ? `the appointment on ${apptHuman}` : 'an appointment (not matched — see below)'}.`,
-    `Phone: ${phone ? formatPhone(phone) : 'not given'}`,
-    kind === 'reschedule' ? null
-      : ghlCancelled ? 'GHL: ✅ cancelled by the bot. → Cancel it in LP.'
+  const appt = apptHuman ? `the appointment on ${apptHuman}` : 'an appointment (not matched, see below)';
+  const lines = {
+    rescheduled: [
+      '📅 LIVE CHAT RESCHEDULED — move it in LP',
+      `${who} moved ${appt} to ${newTimeHuman}.`,
+      'GHL: ✅ new time booked and the old one cancelled by the bot. → Move it in LP.',
+    ],
+    reschedule: [
+      '📅 LIVE CHAT RESCHEDULE — call to set a new time',
+      `${who} wants a different day for ${appt}.`,
+      '→ Call them to set a new time; the GHL appointment is still on the calendar.',
+    ],
+    cancel: [
+      '📅 LIVE CHAT CANCEL — cancel it in LP',
+      `${who} asked to cancel ${appt}.`,
+      ghlCancelled ? 'GHL: ✅ cancelled by the bot. → Cancel it in LP.'
         : 'GHL: ❌ NOT cancelled (could not match or the cancel failed). → Cancel it in GHL and LP, and confirm with them.',
-    kind === 'reschedule' ? '→ Call them to set a new time; the GHL appointment is still on the calendar.' : null,
+    ],
+  }[kind === 'rescheduled' || kind === 'reschedule' ? kind : 'cancel'];
+  return [
+    ...lines,
+    `Phone: ${phone ? formatPhone(phone) : 'not given'}`,
+    marketNote || null,
     visitorWords ? `They said: "${String(visitorWords).slice(0, 300)}"` : null,
     contactUrl ? `Contact: ${contactUrl}` : null,
-    marketNote || null,
   ].filter(Boolean).join('\n');
 }

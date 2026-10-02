@@ -49,6 +49,7 @@ import {
   findRepeatedQuestions,
 } from '../response-generator.js';
 import { buildEstablishedFacts } from '../agentic/established-facts.js';
+import { humanizeReply } from '../agentic/human-voice.js';
 import {
   loopBreakState,
   spouseAdvocacyState,
@@ -109,6 +110,10 @@ import {
   doneLine,
   rescheduleLine,
   formatCancelCard,
+  slotsOfferLine,
+  offeredSlots,
+  pickSlot,
+  movedLine,
   HANDOFF_LINE as CANCEL_HANDOFF_LINE,
 } from './cancel-flow.js';
 
@@ -222,7 +227,7 @@ You are answering in the website chat, live, with the visitor watching the scree
 - Team voice ("we", "our team"). Never Randy, never a personal name you were not given.
 - ONE or TWO short sentences. ONE question at a time, one question mark. No lists, no links.
 - Collect, in this order and only what is missing: their name, the best phone number, their email. One at a time, woven into the answer, never as a form.
-- If what they typed looks like an email but is not a valid one (no @, or nothing after the @), say so kindly and ask for it again: "That doesn't look quite right — could you check the email address?" Never say you do not have enough information. Never dead-end.
+- If what they typed looks like an email but is not a valid one (no @, or nothing after the @), say so kindly and ask for it again: "That doesn't look quite right. Could you check the email address?" Never say you do not have enough information. Never dead-end.
 - Never promise to send anything unless an email is on file. No email → ask for the email instead.
 - A large job (eight or more openings, commercial, church, HOA, property manager, a building) → answer, offer the next step, and a person will follow up; say that plainly.
 - Everything else in this prompt still binds: the discovery discipline, the decision-maker rules, no insurance predictions, no exclamation marks.
@@ -433,6 +438,11 @@ export function createLiveChatFastLane(deps) {
     fetchAppointments: async () => null,
     cancelAppointment: async () => ({ ok: false, error: 'no cancel dep' }),
     postCancelCard: async () => null,
+    // 2026-10-02 reschedule: real open times on the appointment's own calendar,
+    // and the move itself (reschedule_appointment). Defaults offer nothing, so
+    // an unwired lane hands the reschedule to a person.
+    offerSlots: async () => ({ slots: [], tzLabel: 'ET' }),
+    rescheduleAppointment: async () => ({ ok: false, error: 'no reschedule dep' }),
     contactUrl: () => null,
     ...deps,
   };
@@ -756,7 +766,11 @@ export function createLiveChatFastLane(deps) {
       // A name or phone typed in THIS message counts (the model reports it).
       const hasName = hasNameOnRecord || isRealName(live?.contact_capture?.name);
       const hasPhone = hasPhoneOnRecord || !!live?.contact_capture?.phone;
-      const base = guardDraft(message, { discipline, established, loopBreak, spouseAdvocacy, leadFirstName });
+      // Human voice first (2026-10-02): the guards below append only clean
+      // fixed lines, and dedupeSentences at the end sees the cleaned text.
+      const voice = humanizeReply(message, { keepText: userPrompt });
+      if (voice.changes.length) console.log(`[HumanVoice] live chat ${contactId} ${voice.changes.join(',')}`);
+      const base = guardDraft(voice.text, { discipline, established, loopBreak, spouseAdvocacy, leadFirstName });
       // No calendar in this lane: any named day/time is invented (2026-10-01).
       // A time the visitor typed is an echo, never an invented slot (2026-10-02).
       const visitorText = (context.conversation_recent || []).filter(m => m.direction === 'inbound').map(m => m.text).join(' \n ');
@@ -857,9 +871,9 @@ export function createLiveChatFastLane(deps) {
     const firstName = target?.firstName || target?.first_name || null;
     const apptHuman = appt?.start_time_human || null;
     Object.assign(record, { matched_contact_id: target?.id || null, appointment_id: appt?.appointment_id || null });
-    const card = (kind, ghlCancelled) => {
+    const card = (kind, ghlCancelled, more = {}) => {
       const text = formatCancelCard({
-        kind, ghlCancelled,
+        kind, ghlCancelled, ...more,
         name: [firstName, target?.lastName || target?.last_name].filter(Boolean).join(' ') || words.map(w => w[0].toUpperCase() + w.slice(1)).join(' ') || null,
         phone: plan.phone, apptHuman, visitorWords: body,
         contactUrl: d.contactUrl(target?.id || contactId),
@@ -871,13 +885,57 @@ export function createLiveChatFastLane(deps) {
     };
     const handoff = () => { card('cancel', false); return { reply: CANCEL_HANDOFF_LINE, record: { ...record, outcome: 'handoff' } }; };
 
+    if (plan.step === 'pick_slot' && (!target || !appt)) {
+      card('reschedule', false);
+      return { reply: rescheduleLine(plan.phone), record: { ...record, outcome: 'reschedule_lookup_failed' } };
+    }
     if (plan.step === 'handoff' || !target || !appt) return handoff();
     if (plan.step === 'lookup') return { reply: offerLine(firstName, apptHuman), record: { ...record, outcome: 'offered_reschedule' } };
 
+    // A person calls to set the time: no open slot, an unclear pick, a failed move.
+    const personReschedules = (outcome) => {
+      card('reschedule', false);
+      return { reply: rescheduleLine(plan.phone), record: { ...record, outcome } };
+    };
+    const openSlots = async () => {
+      try {
+        return await d.offerSlots({ calendarId: appt.calendar_id, contact: target, appointment: appt });
+      } catch (err) {
+        d.warn(`[LiveChat] open-slot read failed for ${target.id}: ${err.message}`);
+        return { slots: [], tzLabel: 'ET' };
+      }
+    };
+
+    // The visitor is picking one of the open times we offered.
+    if (plan.step === 'pick_slot') {
+      const free = await openSlots();
+      const offered = offeredSlots(plan.offerText, free.slots);
+      const chosen = pickSlot(body, offered);
+      record.slots_offered = offered.map(x => x.iso);
+      if (!chosen) return personReschedules(offered.length ? 'slot_pick_unclear' : 'offered_slots_gone');
+      if (!live) return { reply: movedLine(chosen, free.tzLabel), record: { ...record, outcome: 'would_reschedule', new_start: chosen.iso } };
+      let res = null;
+      try {
+        res = await d.rescheduleAppointment({ contactId: target.id, oldAppointmentId: appt.appointment_id, calendarId: appt.calendar_id, startIso: chosen.iso });
+      } catch (err) {
+        res = { ok: false, error: err.message };
+      }
+      if (!res?.ok) {
+        d.warn(`[LiveChat] reschedule failed for ${target.id} (${appt.appointment_id} → ${chosen.iso}): ${res?.error || 'unknown'}`);
+        record.reschedule_error = String(res?.error || 'unknown').slice(0, 200);
+        return personReschedules('reschedule_failed');
+      }
+      card('rescheduled', false, { newTimeHuman: `${chosen.day} at ${chosen.time} ${free.tzLabel}` });
+      return { reply: movedLine(chosen, free.tzLabel), record: { ...record, outcome: 'rescheduled', new_start: chosen.iso } };
+    }
+
     // after_offer
     if (plan.answer === 'reschedule') {
-      card('reschedule', false);
-      return { reply: rescheduleLine(plan.phone), record: { ...record, outcome: 'reschedule_requested' } };
+      const free = await openSlots();
+      const two = (free.slots || []).slice(0, 2);
+      if (!two.length || !appt.calendar_id) return personReschedules('no_open_slots');
+      record.slots_offered = two.map(x => x.iso);
+      return { reply: slotsOfferLine(two, free.tzLabel), record: { ...record, outcome: 'offered_slots' } };
     }
     if (plan.answer !== 'cancel') return handoff();
     if (!live) return { reply: doneLine(apptHuman), record: { ...record, outcome: 'would_cancel' } };
