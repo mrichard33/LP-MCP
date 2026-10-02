@@ -817,6 +817,8 @@ async function callClaude(messageText, context) {
   const { text } = await callLLM({
     fn: 'message_analyzer',
     system: SYSTEM_PROMPT,
+    // Static for the life of the process: cache it (2026-10-02).
+    cacheSystem: true,
     user: userPrompt,
     maxTokens: ANALYZER_MAX_TOKENS,
     json: true,

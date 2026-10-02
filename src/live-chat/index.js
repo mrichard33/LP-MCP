@@ -32,12 +32,16 @@ import { recordMessageContextDetached, markSentDetached } from '../bot-feedback/
 import { livechatSendBody } from '../send-message-handler.js';
 import { checkServiceAreaZip, checkServiceAreaPlace } from '../services/identity-extraction.js';
 import { timezoneForZip } from '../services/contact-timezone.js';
+import { captureChatIdentity } from './identity-capture.js';
 import { createLiveChatFastLane, liveChatMode, liveChatHardTimeoutMs, liveChatModelWarning } from './fast-lane.js';
 import { searchByPhone } from '../services/ghl-contact-resolve.js';
 import { fetchRecentAndUpcomingAppointments } from '../knowledge/contact-appointments.js';
 import { resolveMarket } from '../actions/enrichment.js';
 import { postToSlack } from '../slack.js';
 import { fetchFreeSlots, selectOfferableSlots } from '../knowledge/calendar-availability.js';
+import { BOOKING_CALENDARS } from '../knowledge/booking-calendar-router.js';
+import { routeNepqHandoff } from '../agentic/nepq-handoff.js';
+import { addGHLNote } from '../ghl.js';
 
 async function fetchContact(contactId) {
   const res = await ghlFetch('GET', `/contacts/${contactId}`, null, { priority: 'high', maxWaitMs: 1500 });
@@ -136,17 +140,15 @@ async function updateAction(id, patch) {
   if (error) console.warn(`[LiveChat] agent_actions update failed for ${id}: ${error.message}`);
 }
 
-async function captureIdentity(contactId, { phone, email, name }) {
-  const patch = {};
-  if (phone) patch.phone = phone;
-  if (email) patch.email = email;
-  if (name) {
-    const [first, ...rest] = String(name).trim().split(/\s+/);
-    if (first) patch.firstName = first;
-    if (rest.length) patch.lastName = rest.join(' ');
-  }
-  if (!Object.keys(patch).length) return null;
-  return ghlFetch('PUT', `/contacts/${contactId}`, patch, { priority: 'normal' });
+/**
+ * Fill-if-empty, merge-safe (2026-10-02 review): see src/live-chat/identity-capture.js.
+ * The read is fresh, not the turn's cached contact, so a value typed a moment
+ * ago in another turn is seen and not written twice.
+ */
+async function captureIdentity(contactId, input) {
+  return captureChatIdentity(contactId, input, {
+    fetchContact: (id) => ghlFetch('GET', `/contacts/${id}`, null, { priority: 'normal' }).then(res => res?.contact || null),
+  });
 }
 
 // ── 2026-10-02 cancel flow deps (src/live-chat/cancel-flow.js) ────────────
@@ -256,6 +258,50 @@ async function rescheduleAppointment({ contactId, oldAppointmentId, calendarId, 
   return { ok: moved, action_id: data.id, error: moved ? null : (res?.result?.error || res?.error || `status ${res?.status} / ${res?.result?.action || 'no result'}`) };
 }
 
+// ── 2026-10-02 NEPQ backbone deps (src/agentic/nepq-planner.js) ───────────
+
+/**
+ * Two real times on the default in-home calendar (Window Estimate), in the
+ * visitor's zone, for the Calendar Commitment. Same selection as the cancel
+ * flow's offer (notice floor, 48h-first window).
+ */
+async function offerBookingSlots({ contact }) {
+  const calendarId = BOOKING_CALENDARS.WINDOW_ESTIMATE;
+  const res = await offerSlots({ calendarId, contact });
+  return { ...res, calendarId };
+}
+
+/**
+ * Book a picked time through the existing book_appointment handler and wait
+ * for GHL's answer. Only `appointment_booked` counts: a blocked booking (a
+ * missing address, decision-makers not confirmed) returns, it does not throw,
+ * and the visitor must never hear "you're set" for it.
+ */
+async function bookSlot({ contactId, startIso, calendarId }) {
+  if (!supabase) return { ok: false, error: 'supabase client not configured' };
+  const { data, error } = await supabase.from('agent_actions').insert({
+    action_type: 'book_appointment', target_system: 'ghl', target_entity: 'contact', target_id: contactId,
+    rule_applied: 'LIVE_CHAT_BOOK', status: 'executing', requires_approval: false, max_retries: 1,
+    reasoning: 'Live chat: the visitor picked one of two real open times (NEPQ Calendar Commitment)',
+    action_payload: { calendar_id: calendarId || BOOKING_CALENDARS.WINDOW_ESTIMATE, start_time: startIso, source: 'live_chat' },
+  }).select('id').single();
+  if (error || data?.id == null) return { ok: false, error: error?.message || 'insert returned no id' };
+  const { executeActionById } = await import('../actions/index.js');
+  const res = await executeActionById(data.id);
+  const booked = res?.status === 'completed' && res?.result?.action === 'appointment_booked';
+  return { ok: booked, action_id: data.id, error: booked ? null : (res?.result?.action || res?.error || `status ${res?.status}`) };
+}
+
+/** Hand-off side effects (tag, note, event, #ops-alerts card). Fail-soft. */
+function nepqHandoff({ contactId, reason, inbound, firstName }) {
+  return routeNepqHandoff({ contactId, reason, channel: 'livechat', inbound, firstName }, {
+    applyTags: (id, tags) => ghlFetch('POST', `/contacts/${id}/tags`, { tags }, { priority: 'normal' }),
+    addNote: (id, note) => addGHLNote(id, note),
+    emitEvent,
+    alert: (text) => sendAlertMessage(text, { channel: 'ops' }),
+  });
+}
+
 export function buildProductionLane() {
   return createLiveChatFastLane({
     fetchContact,
@@ -287,6 +333,9 @@ export function buildProductionLane() {
     postCancelCard,
     offerSlots,
     rescheduleAppointment,
+    offerBookingSlots,
+    bookSlot,
+    nepqHandoff,
     contactUrl: (id) => (id ? `https://app.gohighlevel.com/v2/location/${GHL_LOCATION_ID}/contacts/detail/${id}` : null),
   });
 }

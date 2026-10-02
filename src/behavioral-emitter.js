@@ -363,7 +363,9 @@ const replyBuffers = new Map();
  * Runs after GHL webhook response is already sent. Uses internal HTTP
  * calls to reuse existing endpoint logic without circular imports.
  *
- * Timeline target: ~10-15 seconds end-to-end.
+ * Timeline: the reply buffer waits REPLY_DEBOUNCE_MS (35s default) for a
+ * burst to finish first; measured 2026-10-02, a reply took ~90s median end to
+ * end (analysis ~35s, generation ~31s on a thinking model).
  */
 async function triggerAgenticPipeline(contactId, messageText, channel = null, messageId = null, inbound = null) {
   const start = Date.now();
@@ -602,7 +604,7 @@ function scheduleBufferedPipeline(contactId, trimmed, emittedEventId, messageTyp
 /**
  * 2026-10-01 (Dan H., bMidLh3nDpWadrf7X8bG) — fire every pending reply buffer
  * NOW. A message that lands seconds before a deploy otherwise waits in an
- * in-memory 15s timer that dies with the process, and the customer waits for
+ * in-memory reply-buffer timer (REPLY_DEBOUNCE_MS, 35s) that dies with the process, and the customer waits for
  * the ~5-minute decision-engine backstop instead. Run from the graceful
  * shutdown 'start' hook, so the reply is analysed and sent inside the drain.
  * Returns how many buffers it fired.

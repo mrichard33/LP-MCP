@@ -163,7 +163,7 @@ const ADDRESS_RE = new RegExp(
   `\\b(\\d{1,6}\\s+(?:[NSEW]\\.?\\s+)?[A-Za-z0-9'.]+(?:\\s+[A-Za-z0-9'.]+){0,3}?\\s+${STREET_SUFFIX})\\.?\\b` +
   `(?:\\s*,?\\s*(?:Apt|Unit|Ste|Suite|#)\\s*[\\w-]+)?` +
   `(?:\\s*,\\s*([A-Za-z][A-Za-z .'-]{2,30}))?` +
-  `(?:\\s*,?\\s*(FL|Florida)\\b)?` +
+  `(?:\\s*,?\\s*(FL|Florida|TX|Texas|NC|North Carolina)\\b)?` +
   `(?:\\s*,?\\s*(\\d{5})(?:-\\d{4})?)?`,
   'i'
 );
@@ -171,10 +171,19 @@ const EMAIL_RE = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/;
 const PHONE_RE = /(?:\+?1[\s\-.]*)?\(?(\d{3})\)?[\s\-.]*(\d{3})[\s\-.]*(\d{4})\b/;
 // Zip capture OUTSIDE the address regex — the zip is what determines service
 // area, so it must be caught even when given on its own ("33435") or with a
-// keyword ("zip is 33435"). Bare 5-digit tokens are only accepted in the FL
-// range (3xxxx) to avoid eating window counts / prices.
+// keyword ("zip is 33435"). Bare 5-digit tokens are only accepted in the
+// service-market ranges below, to avoid eating window counts / prices.
 const ZIP_KEYWORD_RE = /\bzip(?:\s*code)?\s*(?:is|:)?\s*(\d{5})(?:-\d{4})?\b/i;
-const BARE_FL_ZIP_RE = /^\s*(3[0-4]\d{3})(?:-\d{4})?\s*$/;
+// 2026-10-02: Houston (77xxx, TX 75–79) and Winston-Salem (27xxx, NC 27–28)
+// are service markets too (sql/141). The Florida-only range above dropped
+// every zip they typed, so a Houston lead was asked for it again. Still a
+// whole-message match only, so window counts and prices are not eaten.
+const BARE_SERVICE_ZIP_RE = /^\s*((?:3[0-4]|2[78]|7[5-9])\d{3})(?:-\d{4})?\s*$/;
+// A zip at the END of a message that also carried a street address
+// ("9822 Quinta Artesa Way Apt 101 fort Myers 33908" — no commas).
+const TRAILING_ZIP_RE = /\b(\d{5})(?:-\d{4})?\s*[.!]?\s*$/;
+const STATE_CODE = { fl: 'FL', florida: 'FL', tx: 'TX', texas: 'TX', nc: 'NC', 'north carolina': 'NC' };
+const stateCode = (raw) => STATE_CODE[String(raw || '').trim().toLowerCase()] || null;
 
 // Decision-maker signals (R3 mapping).
 const DM_PENDING_RE = /\b(?:talk(?:ing)?|check(?:ing)?|speak(?:ing)?|discuss(?:ing)?|run (?:it|this))\s+(?:it\s+|this\s+|things\s+)?(?:over\s+)?with\s+my\s+(wife|husband|spouse|partner)\b|\bafter\s+talking\s+(?:to|with)\s+my\s+(wife|husband|spouse|partner)\b|\bask\s+my\s+(wife|husband|spouse|partner)\b/i;
@@ -267,38 +276,46 @@ export function heuristicExtract(messages = []) {
     // name or address inside a chat-transcript custom field is still seen.
     const segments = scrubbed.split(/\s*\/\s*|\n+/).map(s => s.trim()).filter(Boolean);
     for (const seg of segments) {
+      // 2026-10-02: the NEWEST value wins for phone, email, zip and address —
+      // a lead who corrects a typo ("sorry, it's lori.b@…") was ignored
+      // because the first match was kept. GHL writes stay fill-if-empty
+      // (buildPromotionPayload); a changed value surfaces as a conflict event.
       const phoneM = seg.match(PHONE_RE);
-      if (phoneM && !id.phone) {
+      if (phoneM) {
         const e164 = normalizePhoneE164(`${phoneM[1]}${phoneM[2]}${phoneM[3]}`);
         if (e164) { id.phone = e164; id._source.phone = 'extracted'; }
       }
 
       const emailM = seg.match(EMAIL_RE);
-      if (emailM && !id.email) { id.email = emailM[0].toLowerCase(); id._source.email = 'extracted'; }
+      if (emailM) { id.email = emailM[0].toLowerCase(); id._source.email = 'extracted'; }
 
-      if (!id.postal_code) {
+      {
         const zipKw = seg.match(ZIP_KEYWORD_RE);
-        const zipBare = seg.match(BARE_FL_ZIP_RE);
+        const zipBare = seg.match(BARE_SERVICE_ZIP_RE);
         const zip = zipKw ? zipKw[1] : (zipBare ? zipBare[1] : null);
         if (zip) { id.postal_code = zip; id._source.postal_code = 'extracted'; }
       }
 
       const addrM = seg.match(ADDRESS_RE);
-      if (addrM && !id.address_line1) {
+      if (addrM) {
         id.address_line1 = addrM[1].replace(/\s+/g, ' ').trim();
         id._source.address_line1 = 'extracted';
         if (addrM[2]) {
           // Greedy city capture may swallow a trailing state token — strip it.
-          const cityRaw = addrM[2].trim().replace(/[\s,]+(FL|Florida)$/i, '');
-          const strippedState = cityRaw.length !== addrM[2].trim().length;
+          const stateM = addrM[2].trim().match(/[\s,]+(FL|Florida|TX|Texas|NC|North Carolina)$/i);
+          const cityRaw = stateM ? addrM[2].trim().slice(0, stateM.index) : addrM[2].trim();
           if (cityRaw && looksLikeName(cityRaw.split(/\s+/))) {
             id.city = cityRaw;
             id._source.city = 'extracted';
           }
-          if (strippedState) { id.state = 'FL'; id._source.state = 'extracted'; }
+          if (stateM) { id.state = stateCode(stateM[1]); id._source.state = 'extracted'; }
         }
-        if (addrM[3]) { id.state = 'FL'; id._source.state = 'extracted'; }
+        if (addrM[3]) { id.state = stateCode(addrM[3]); id._source.state = 'extracted'; }
         if (addrM[4]) { id.postal_code = addrM[4]; id._source.postal_code = 'extracted'; }
+        else {
+          const tail = seg.match(TRAILING_ZIP_RE);
+          if (tail) { id.postal_code = tail[1]; id._source.postal_code = 'extracted'; }
+        }
       }
 
       if (!id.first_name) {
