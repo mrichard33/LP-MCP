@@ -174,3 +174,9 @@ test('cutSecondQuestion: ", and is …?" is cut back to one question', async () 
   const { cutSecondQuestion } = await import('../src/live-chat/chat-rules.js');
   assert.equal(cutSecondQuestion('How long have they been like that, and is the drafting mostly from certain windows?'), 'How long have they been like that?');
 });
+
+test('cutSecondQuestion: ", or is it…?" is cut; the approved decision-maker ask stays', async () => {
+  const { cutSecondQuestion } = await import('../src/live-chat/chat-rules.js');
+  assert.equal(cutSecondQuestion("How long have they been like that, or is it just something you've noticed recently?"), 'How long have they been like that?');
+  assert.equal(cutSecondQuestion('Is this your call, or is anyone else weighing in on it?'), 'Is this your call, or is anyone else weighing in on it?');
+});

@@ -81,6 +81,7 @@ test('restoreQuestionMark: the last sentence gets its "?" back; statements stay'
   assert.equal(restoreQuestionMark("What's giving you the most trouble with the windows right now.").text, "What's giving you the most trouble with the windows right now?");
   assert.equal(restoreQuestionMark('Got it. When works better for you, a weekday or the weekend.').text, 'Got it. When works better for you, a weekday or the weekend?');
   assert.equal(restoreQuestionMark('Is that right. — Reece Team').text, 'Is that right? — Reece Team');
+  assert.equal(restoreQuestionMark('We will call you at 657-242-0815. Sound good.').text, 'We will call you at 657-242-0815. Sound good?');
   for (const keep of ['Our team will call. What I can do is set that up.', "When you're ready, our team will call.", 'Would love to help.', 'Have a great day.', 'Thanks for reaching out.']) {
     assert.equal(restoreQuestionMark(keep).changed, false, keep);
   }

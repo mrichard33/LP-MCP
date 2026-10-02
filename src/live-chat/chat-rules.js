@@ -311,8 +311,10 @@ export function findRepeatedBotQuestions(draft, thread = []) {
 // ", or what bothers you most…?" — a second question hung on the first.
 // conversation-repetition.js isDoubleBarrelled catches the auxiliary-verb
 // shape ("or is…"); a question word after "or" escaped it.
-// 2026-10-02: ", and is the drafting mostly…?" is the same shape.
-const OR_SECOND_QUESTION_RX = /,?\s+or\s+(?:what|how|why|when|where|which|who)\b[^?]*\?|,\s*and\s+(?:is|are|was|were|do|does|did|have|has|what|how|which|where|when|who|why)\b[^?]*\?/i;
+// 2026-10-02: ", and is the drafting mostly…?" and ", or is it just something
+// you've noticed recently?" are the same shape (the approved "…or is anyone
+// else weighing in?" stays).
+const OR_SECOND_QUESTION_RX = /,?\s+or\s+(?:what|how|why|when|where|which|who)\b[^?]*\?|,\s*or\s+(?:is|are|was|were|do|does|did|has|have)\s+(?!anyone|anybody|someone|it\s+your\s+call)[^?]*\?|,\s*and\s+(?:is|are|was|were|do|does|did|have|has|what|how|which|where|when|who|why)\b[^?]*\?/i;
 
 export function cutSecondQuestion(text) {
   return String(text || '').replace(OR_SECOND_QUESTION_RX, '?');

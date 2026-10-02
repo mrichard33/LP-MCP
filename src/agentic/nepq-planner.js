@@ -159,6 +159,7 @@ export function isNo(text, lastOutbound = '') {
 // ("probably price and the warranty"): that is an answer, not a price ask
 // (2026-10-02 simulation: it fired the price play, and the next "price"
 // would have handed the lead to a person).
+const SPOUSE_FEEL_Q_RX = /\bhow\s+does\s+your\s+(?:spouse|wife|husband|partner)\s+feel\b/i;
 const DECIDE_Q_RX = /\bhow\s+would\s+you\s+(?:then\s+)?decide\b/i;
 // Price named alongside other criteria is a list of what matters, not an ask.
 const CRITERIA_LIST_RX = /\b(?:price|pricing|cost)\b[^.?!]{0,30}\b(?:and|or|plus|&)\b[^.?!]{0,30}\b(?:warranty|quality|reviews?|service|install\w*|reputation|brand|company|timeline|product)\b|\b(?:warranty|quality|reviews?|service|install\w*|reputation|brand|company|timeline|product)\b[^.?!]{0,30}\b(?:and|or|plus|&)\b[^.?!]{0,30}\b(?:price|pricing|cost)\b/i;
@@ -184,6 +185,11 @@ export function objectionType(text, lastOutbound = '') {
   // Shopping before price: "getting 3 quotes" is about deciding, not a price ask.
   if (SHOPPING_RX.test(t)) return 'shopping';
   if (isPriceAsk(t)) return 'price';
+  // The answer to Mark's spouse question is the spouse objection's second
+  // turn, whoever it names (2026-10-02 re-test: "She has to see it before we
+  // decide" read as discovery, the both-home time was stripped as a booking
+  // ask, and the visitor got "Got it." alone).
+  if (SPOUSE_FEEL_Q_RX.test(String(lastOutbound || '')) && !isNotInterested(t) && !DECLINE_RX.test(t)) return 'spouse';
   if (SPOUSE_OBJECTION_RX.test(t)) return 'spouse';
   if (THINK_RX.test(t)) return 'think';
   return null;
