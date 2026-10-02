@@ -206,6 +206,15 @@ fire-and-forget work that matters to a customer goes through `trackBackground`/`
 never returns `livechat` for the normal pipeline: a chat-widget origin goes out by SMS, or (no phone) is
 not sent and #ops-alerts is told. GHL's "Chat Widget" (type 5, `TYPE_WEBCHAT`) reads as livechat there.
 
+**A live-chat cancel request is a fixed flow, not a model reply (Mark, 2026-10-02).**
+`src/live-chat/cancel-flow.js`: ask for the name and phone the appointment is under, match them (phone
+AND name — never phone alone), offer another day once, then cancel in GHL through `cancel_appointment`
+and say "Done" only after GHL confirms. Every outcome posts to the market's `sales` channel because
+LP has no cancel API — a person cancels it there. Anything unmatched goes to the team; the bot never
+says "no appointment on file" to a guest it never identified. A "no" (`isDecline`, or the model's
+`recommended_action: suppress`) gets a close with no pitch, and a reply overtaken by a newer message
+from the same visitor is not sent (`superseded_by_newer_message`).
+
 **Connection probes are read-only and never post.** `GET /health/integrations`
 (`src/integrations-health.js`) answers "can we reach LP / Five9 / Slack / GroupMe right now?"
 for the dashboard. A probe that cannot tell reports `unknown`, never `connected`; a GroupMe bot

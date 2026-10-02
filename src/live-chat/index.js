@@ -33,6 +33,10 @@ import { livechatSendBody } from '../send-message-handler.js';
 import { checkServiceAreaZip, checkServiceAreaPlace } from '../services/identity-extraction.js';
 import { timezoneForZip } from '../services/contact-timezone.js';
 import { createLiveChatFastLane, liveChatMode, liveChatHardTimeoutMs, liveChatModelWarning } from './fast-lane.js';
+import { searchByPhone } from '../services/ghl-contact-resolve.js';
+import { fetchRecentAndUpcomingAppointments } from '../knowledge/contact-appointments.js';
+import { resolveMarketCode } from '../actions/enrichment.js';
+import { sendGroupMeMessage } from '../groupme.js';
 
 async function fetchContact(contactId) {
   const res = await ghlFetch('GET', `/contacts/${contactId}`, null, { priority: 'high', maxWaitMs: 1500 });
@@ -144,6 +148,54 @@ async function captureIdentity(contactId, { phone, email, name }) {
   return ghlFetch('PUT', `/contacts/${contactId}`, patch, { priority: 'normal' });
 }
 
+// ── 2026-10-02 cancel flow deps (src/live-chat/cancel-flow.js) ────────────
+
+/**
+ * Cancel one appointment in GHL through the existing cancel_appointment
+ * handler, and wait for the answer: the visitor is only told "Done" when GHL
+ * confirmed. The row is inserted 'executing' so the sweep never claims it
+ * too, and with max_retries 1 so a failure is not retried behind the
+ * visitor's back after they were told the team will handle it.
+ */
+async function cancelAppointment({ contactId, appointmentId, reason }) {
+  if (!supabase) return { ok: false, error: 'supabase client not configured' };
+  const { data, error } = await supabase.from('agent_actions').insert({
+    action_type: 'cancel_appointment', target_system: 'ghl', target_entity: 'contact', target_id: contactId,
+    rule_applied: 'LIVE_CHAT_CANCEL', status: 'executing', requires_approval: false, max_retries: 1,
+    reasoning: 'Live chat: the visitor asked to cancel and declined another day',
+    action_payload: { appointment_id: appointmentId, reason, source: 'live_chat' },
+  }).select('id').single();
+  if (error || data?.id == null) return { ok: false, error: error?.message || 'insert returned no id' };
+  const { executeActionById } = await import('../actions/index.js');
+  const res = await executeActionById(data.id);
+  return { ok: res?.status === 'completed', action_id: data.id, error: res?.error || (res?.status !== 'completed' ? `status ${res?.status}` : null) };
+}
+
+// One card per contact, kind and Eastern day, per process: a visitor who
+// repeats "cancel" does not post twice.
+const cancelCardsPosted = new Set();
+
+/**
+ * The sales-channel card (Mark, 2026-10-02: LP has no cancel API, so a person
+ * cancels it in LP). Routed by the market CODE (CLAUDE.md), resolved from the
+ * full GHL contact; no market → the all-markets rollup, and the card says so.
+ */
+async function postCancelCard({ text, contactId, kind }) {
+  const day = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' }).format(new Date());
+  const key = `${contactId}:${kind}:${day}`;
+  if (cancelCardsPosted.has(key)) return { sent: false, reason: 'already_posted_today' };
+  cancelCardsPosted.add(key);
+  let market = null;
+  try {
+    const full = contactId ? await fetchContact(contactId) : null;
+    market = full ? await resolveMarketCode({ ghlContact: full }) : null;
+  } catch (err) {
+    console.warn(`[LiveChat] market lookup for cancel card failed (${contactId}): ${err.message}`);
+  }
+  const body = market ? text : `${text}\n(Market unknown: posted to the all-markets channel.)`;
+  return sendGroupMeMessage(body, { channel: 'sales', market: market || undefined, flushNow: true });
+}
+
 export function buildProductionLane() {
   return createLiveChatFastLane({
     fetchContact,
@@ -169,6 +221,11 @@ export function buildProductionLane() {
     checkServiceArea: checkServiceAreaZip,
     lookupPlace: (place) => checkServiceAreaPlace(place),
     zoneForZip: (zip) => timezoneForZip(zip),
+    findContactByPhone: (digits) => searchByPhone(digits, { priority: 'high' }),
+    fetchAppointments: (contactId) => fetchRecentAndUpcomingAppointments(contactId),
+    cancelAppointment,
+    postCancelCard,
+    contactUrl: (id) => (id ? `https://app.gohighlevel.com/v2/location/${GHL_LOCATION_ID}/contacts/detail/${id}` : null),
   });
 }
 

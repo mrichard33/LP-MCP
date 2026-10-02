@@ -101,6 +101,16 @@ import {
 } from './chat-rules.js';
 import { marketTimezone, tzLabel } from '../config/market-timezones.js';
 import { phoneFromText } from './missed-replies.js';
+import {
+  planCancelTurn,
+  pickAppointment,
+  nameMatches,
+  offerLine,
+  doneLine,
+  rescheduleLine,
+  formatCancelCard,
+  HANDOFF_LINE as CANCEL_HANDOFF_LINE,
+} from './cancel-flow.js';
 
 export const LIVE_CHAT_RULE = 'LIVE_CHAT_FAST_LANE';
 export const LIVE_CHAT_FALLBACK_MESSAGE = 'Thanks. Let me grab the right person for that, one moment.';
@@ -417,8 +427,22 @@ export function createLiveChatFastLane(deps) {
     commitSend: async () => {},
     releaseSlot: async () => {},
     claimMessages: async (_c, keys) => ({ fresh: keys, consumed: [] }),
+    // 2026-10-02 cancel flow (src/live-chat/cancel-flow.js). Defaults find
+    // nothing and do nothing, so an unwired lane hands every cancel to a person.
+    findContactByPhone: async () => null,
+    fetchAppointments: async () => null,
+    cancelAppointment: async () => ({ ok: false, error: 'no cancel dep' }),
+    postCancelCard: async () => null,
+    contactUrl: () => null,
     ...deps,
   };
+
+  // 2026-10-02 ("Guest Visitor tzuzq") — the newest message received per
+  // visitor. Two messages 28s apart each got their own reply, written without
+  // seeing the other, and both landed at 7:04:38 PM. A reply whose message has
+  // been overtaken by a newer one is not sent; the newer turn reads the whole
+  // thread and answers both.
+  const latestInbound = new Map();
 
   /** Express handler. Always answers 200 once past auth/validation. */
   async function handle(req, res) {
@@ -456,6 +480,9 @@ export function createLiveChatFastLane(deps) {
       d.log(`[LiveChat] duplicate message ${messageKey} for ${contactId} — no-op`);
       return { outcome: 'duplicate', mode, message_id: messageKey };
     }
+    const turnSeq = { at: tReceived, key: messageKey };
+    const prevLatest = latestInbound.get(contactId);
+    if (!prevLatest || prevLatest.at <= tReceived) latestInbound.set(contactId, turnSeq);
 
     // ── gates: opt-out first, on the text and on the contact ──
     if (isDNCSignal(body)) {
@@ -518,7 +545,8 @@ export function createLiveChatFastLane(deps) {
       lockHeld = false;
     }
 
-    const deadline = raceWithBudget(replyOnce({ contactId, conversationId, body, contact, tags, mode, actionId, timing }), d.hardTimeoutMs());
+    const isSuperseded = () => latestInbound.get(contactId) !== turnSeq;
+    const deadline = raceWithBudget(replyOnce({ contactId, conversationId, body, contact, tags, mode, actionId, timing, isSuperseded }), d.hardTimeoutMs());
     let outcome;
     try {
       const raced = await deadline;
@@ -565,7 +593,7 @@ export function createLiveChatFastLane(deps) {
     }
   }
 
-  async function replyOnce({ contactId, conversationId, body, contact, tags, mode, actionId, timing }) {
+  async function replyOnce({ contactId, conversationId, body, contact, tags, mode, actionId, timing, isSuperseded = () => false }) {
     const started = d.now();
     // ── context, in parallel, LP/lead state capped ──
     const getQueryEmbedding = d.prewarmEmbedding(body);
@@ -622,6 +650,25 @@ export function createLiveChatFastLane(deps) {
     const hasNameOnRecord = isRealName(context.lead?.name || context.lead?.first_name);
     const hasPhoneOnRecord = !!context.lead?.phone || phoneInThread(context.conversation_recent, body);
 
+    // ── a cancel request (2026-10-02, "Guest Visitor tzuzq") ──
+    // Fixed wording, no model call: ask who the appointment is under, look it
+    // up (phone AND name must agree), offer another day once, then cancel in
+    // GHL and tell the market's sales channel to cancel it in LP.
+    const cancelPlan = planCancelTurn({
+      body,
+      thread: context.conversation_recent,
+      known: { phone: context.lead?.phone || contact?.phone || null, hasName: hasNameOnRecord },
+    });
+    if (cancelPlan) {
+      const outcome = await runCancelFlow({ plan: cancelPlan, contactId, contact, body, mode });
+      timing.t4_analysis_done = new Date(d.now()).toISOString();
+      timing.t5_generation_done = timing.t4_analysis_done;
+      return deliver({
+        contactId, conversationId, body, mode, actionId, timing, draft: outcome.reply,
+        extras: { cancel_flow: outcome.record, context_minimal: !!context._minimal, model: null },
+      });
+    }
+
     // ── a price request goes to the in-home visit (NEPQ Transition) ──
     // The second ask (or "I just want a price") gets the Transition as a fixed
     // line, no model call: the first live chat asked for a price three times
@@ -632,7 +679,7 @@ export function createLiveChatFastLane(deps) {
       timing.t4_analysis_done = new Date(d.now()).toISOString();
       timing.t5_generation_done = timing.t4_analysis_done;
       return deliver({
-        contactId, conversationId, body, mode, actionId, timing,
+        contactId, conversationId, body, mode, actionId, timing, isSuperseded,
         draft: priceTransitionReply({ hasName: hasNameOnRecord, hasPhone: hasPhoneOnRecord }),
         capture: phoneFromText(body) ? { phone: phoneFromText(body) } : {},
         extras: { price_turn: { asks: pricePlan.asks, insist: true, deterministic: true }, context_minimal: !!context._minimal, model: null },
@@ -711,11 +758,13 @@ export function createLiveChatFastLane(deps) {
       const hasPhone = hasPhoneOnRecord || !!live?.contact_capture?.phone;
       const base = guardDraft(message, { discipline, established, loopBreak, spouseAdvocacy, leadFirstName });
       // No calendar in this lane: any named day/time is invented (2026-10-01).
-      const times = guardTimeOffers(base.fixed, { hasPhone, hasName });
+      // A time the visitor typed is an echo, never an invented slot (2026-10-02).
+      const visitorText = (context.conversation_recent || []).filter(m => m.direction === 'inbound').map(m => m.text).join(' \n ');
+      const times = guardTimeOffers(base.fixed, { hasPhone, hasName, visitorText });
       const cov = guardCoverageDraft(times.fixed, coverage);
       // A coverage turn is the zip-first script (ask for the zip, or stop);
       // the conversation guards would talk over it.
-      const flow = saPlan.active ? { notes: [], fixed: cov.fixed } : guardChatFlow(cov.fixed, { thread: context.conversation_recent, hasName, hasPhone, body, bookingAllowed: !!discipline?.booking?.allowed || !!pricePlan || frustrated });
+      const flow = saPlan.active ? { notes: [], fixed: cov.fixed } : guardChatFlow(cov.fixed, { thread: context.conversation_recent, hasName, hasPhone, body, bookingAllowed: !!discipline?.booking?.allowed || !!pricePlan || frustrated, declined: live?.recommended_action === 'suppress' });
       return { ...base, notes: [...base.notes, ...times.notes, ...cov.notes, ...flow.notes], fixed: flow.fixed, coverage_notes: cov.notes.length, time_offers_removed: times.notes.length > 0, flow_notes: flow.notes.length };
     };
     let gen = await generate(null);
@@ -745,7 +794,7 @@ export function createLiveChatFastLane(deps) {
     }
 
     return deliver({
-      contactId, conversationId, body, mode, actionId, timing, draft, capture,
+      contactId, conversationId, body, mode, actionId, timing, draft, capture, isSuperseded,
       extras: {
         intent_class: classification?.intent_class || null,
         classifier_method: classification?.classification_method || null,
@@ -772,8 +821,94 @@ export function createLiveChatFastLane(deps) {
     });
   }
 
+  /**
+   * The I/O half of the cancel flow (src/live-chat/cancel-flow.js is the pure
+   * half). Shadow mode looks things up but never cancels and never posts.
+   * Returns { reply, record }.
+   */
+  async function runCancelFlow({ plan, contactId, contact, body, mode }) {
+    const record = { step: plan.step };
+    if (plan.reply) return { reply: plan.reply, record };
+    const live = mode === 'live';
+    const words = plan.words || [];
+
+    // Who is this, and which appointment? Phone AND name must agree, unless
+    // the chat's own contact is already known by name and phone.
+    let target = null;
+    let appt = null;
+    if (plan.step !== 'handoff') {
+      try {
+        if (plan.known) {
+          target = { id: contactId, firstName: contact?.firstName || contact?.first_name || null, lastName: contact?.lastName || null, ...contact, id: contactId };
+        } else if (plan.phone) {
+          const found = await d.findContactByPhone(plan.phone);
+          if (found?.id && nameMatches(words, found)) target = found;
+          else record.match = found?.id ? 'name_mismatch' : 'phone_not_found';
+        }
+        if (target) {
+          appt = pickAppointment(await d.fetchAppointments(target.id));
+          if (!appt) record.match = 'no_active_appointment';
+        }
+      } catch (err) {
+        d.warn(`[LiveChat] cancel lookup failed for ${contactId}: ${err.message}`);
+        record.match = 'lookup_failed';
+      }
+    }
+    const firstName = target?.firstName || target?.first_name || null;
+    const apptHuman = appt?.start_time_human || null;
+    Object.assign(record, { matched_contact_id: target?.id || null, appointment_id: appt?.appointment_id || null });
+    const card = (kind, ghlCancelled) => {
+      const text = formatCancelCard({
+        kind, ghlCancelled,
+        name: [firstName, target?.lastName || target?.last_name].filter(Boolean).join(' ') || words.map(w => w[0].toUpperCase() + w.slice(1)).join(' ') || null,
+        phone: plan.phone, apptHuman, visitorWords: body,
+        contactUrl: d.contactUrl(target?.id || contactId),
+      });
+      record.card = kind;
+      if (!live) return;
+      Promise.resolve(d.postCancelCard({ text, contactId: target?.id || contactId, contact: target, kind }))
+        .catch(err => d.warn(`[LiveChat] cancel card failed for ${contactId}: ${err.message}`));
+    };
+    const handoff = () => { card('cancel', false); return { reply: CANCEL_HANDOFF_LINE, record: { ...record, outcome: 'handoff' } }; };
+
+    if (plan.step === 'handoff' || !target || !appt) return handoff();
+    if (plan.step === 'lookup') return { reply: offerLine(firstName, apptHuman), record: { ...record, outcome: 'offered_reschedule' } };
+
+    // after_offer
+    if (plan.answer === 'reschedule') {
+      card('reschedule', false);
+      return { reply: rescheduleLine(plan.phone), record: { ...record, outcome: 'reschedule_requested' } };
+    }
+    if (plan.answer !== 'cancel') return handoff();
+    if (!live) return { reply: doneLine(apptHuman), record: { ...record, outcome: 'would_cancel' } };
+    let res = null;
+    try {
+      res = await d.cancelAppointment({ contactId: target.id, appointmentId: appt.appointment_id, reason: 'live chat: visitor asked to cancel' });
+    } catch (err) {
+      res = { ok: false, error: err.message };
+    }
+    if (!res?.ok) {
+      d.warn(`[LiveChat] cancel failed for ${target.id} (${appt.appointment_id}): ${res?.error || 'unknown'}`);
+      record.cancel_error = String(res?.error || 'unknown').slice(0, 200);
+      return handoff();
+    }
+    card('cancel', true);
+    return { reply: doneLine(apptHuman), record: { ...record, outcome: 'cancelled' } };
+  }
+
   /** Send (live) or record (shadow) one finished reply. */
-  async function deliver({ contactId, conversationId, body, mode, actionId, timing, draft, capture = {}, extras = {}, fingerprintExtras = {} }) {
+  async function deliver({ contactId, conversationId, body, mode, actionId, timing, draft, capture = {}, extras = {}, fingerprintExtras = {}, isSuperseded = () => false }) {
+    // A newer message from this visitor arrived while this reply was being
+    // written: the newer turn answers both (2026-10-02, tzuzq double reply).
+    if (isSuperseded()) {
+      d.log(`[LiveChat] reply for ${contactId} superseded by a newer message — not sent`);
+      await finishAction(actionId, {
+        status: 'skipped',
+        error_message: 'superseded_by_newer_message',
+        execution_result: { action: 'send_message_skipped', channel: 'livechat', reason: 'superseded_by_newer_message', draft_body: String(draft || '').slice(0, 500), ...extras, timing: finalizeTiming(timing) },
+      });
+      return { outcome: 'superseded', sent: false, message: null, timing: finalizeTiming(timing) };
+    }
     let ghlMessageId = null;
     let sendMethod = null;
     let sent = false;
