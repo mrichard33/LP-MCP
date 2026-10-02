@@ -406,6 +406,24 @@ test('audit: an already-posted item is not re-posted; a new one is, one line per
   assert.deepEqual(again.sent, []);
 });
 
+test('audit F.0: a stale cache flag is re-read live — dropped when LP says OPPFDN, kept (unconfirmed) when the read fails', async () => {
+  // 2026-10-02: lp_leads still said Issue for David Banks; LP live said OPPFDN.
+  const lp = { lp_leads: [
+    lpRow('f-stale', 'A', 'Issue', '2026-07-30T14:00:00+00:00', '2026-07-24T10:00:00+00:00'),
+    lpRow('f-real', 'B', 'Sale', '2026-09-25T14:00:00+00:00', '2026-09-12T10:00:00+00:00', { closed_won: true }),
+    lpRow('f-down', 'C', 'CXL', '2026-09-20T14:00:00+00:00', '2026-09-10T10:00:00+00:00'),
+  ] };
+  const live = {
+    'f-stale': { leads: [{ ...row('A', 'OPPFDN', '2026-07-30T14:00:00+00:00', '2026-07-24T10:00:00+00:00'), appts: [{ disposition: 'OPPFDN', sat: 'true', apptdate: '2026-07-30T14:00:00' }] }] },
+    'f-real': { leads: [row('B', 'Sale', '2026-09-25T14:00:00+00:00', '2026-09-12T10:00:00+00:00', { closed_won: true })] },
+    'f-down': { error: 'read_failed:lp_phone' },
+  };
+  const { deps } = auditDeps({ hl: { 'f-stale': ['active-f.0'], 'f-real': ['active-f.0'], 'f-down': ['active-f.0'] }, lp });
+  deps.loadS52GateInputs = async (id) => live[id];
+  const r = await audit.runF0IntegrityAudit({ post: false, deps });
+  assert.deepEqual(r.flagged.map((f) => [f.contact_id, f.confirmed]), [['f-down', false], ['f-real', true]]);
+});
+
 test('audit: a read failure still posts "could not run"', async () => {
   const { deps, sent } = auditDeps({ hlFails: true });
   const r = await audit.runF0IntegrityAudit({ post: true, deps });
