@@ -1259,7 +1259,8 @@ async function reportArchiveOutage({ db, cfg, tally, breaker = archiveBreaker, n
       active: decision.active,
       label: 'Call-recording archive unreachable',
       channel: 'ops',
-      remindMs: 24 * 60 * 60 * 1000,
+      // 2026-10-02 (Mark, alert noise cut): down once, up once — no daily reminder.
+      remindMs: 0,
       text: async () => {
         let waiting = null;
         try {

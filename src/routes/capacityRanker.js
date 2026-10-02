@@ -260,8 +260,11 @@ export function healStandDownKey(campaign) {
   return `capacity_ranker:heal_not_acting:${campaign}`;
 }
 
-/** Re-remind daily while a campaign stays dark and heal stays hands-off. */
-const HEAL_STAND_DOWN_REMIND_MS = 24 * 60 * 60 * 1000;
+/**
+ * 2026-10-02 (Mark, alert noise cut): no reminder — a campaign heal will not
+ * touch posts once when it goes dark and once when it comes back.
+ */
+const HEAL_STAND_DOWN_REMIND_MS = 0;
 
 /**
  * CAP THE BLAST RADIUS. Any run that ends with a restart failure stamps

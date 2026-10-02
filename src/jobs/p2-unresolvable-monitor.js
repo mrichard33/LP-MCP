@@ -46,6 +46,7 @@
 //                                        no snapshot row)
 // SCHEDULER (startP2UnresolvableScheduler): daily at 06:30 ET.
 
+import { alertDigestEnabled } from '../alert-posted.js';
 import { getHlSupabase } from '../admin/hl-client.js';
 import { runSQL } from '../admin/supabase-admin.js';
 import { reportAlertCondition } from '../alert-state.js';
@@ -203,8 +204,12 @@ async function writeSnapshot(sample, verdict) {
   `);
 }
 
-/** One monitored pass: measure, record, decide, deliver. */
-export async function runP2UnresolvableMonitor() {
+/**
+ * One monitored pass: measure, record, decide, deliver.
+ * 2026-10-02 — `post: false` is the 8 AM digest calling: measure, record and
+ * decide only; the digest posts what is new.
+ */
+export async function runP2UnresolvableMonitor({ post = true } = {}) {
   const sample = await measureUnresolvableP2();
   const decision = shouldAlertUnresolvableP2(sample);
 
@@ -227,7 +232,7 @@ export async function runP2UnresolvableMonitor() {
     : decision.verdict === 'healthy' ? false
       : null;
 
-  await reportAlertCondition({
+  if (post) await reportAlertCondition({
     key: ALERT_KEY,
     active,
     label: 'P2 opportunities with no LP job',
@@ -256,6 +261,7 @@ export async function runP2UnresolvableMonitor() {
     ok: decision.verdict !== 'insufficient_evidence',
     unknown: decision.verdict === 'insufficient_evidence',
     verdict: decision.verdict,
+    reasons: decision.reasons,
     snapshotError,
     sample,
   };
@@ -287,6 +293,11 @@ export function startP2UnresolvableScheduler() {
   if (p2Timer) return;
   if (!ENABLED) {
     console.log('[P2Unresolvable] disabled (P2_UNRESOLVABLE_MONITOR_ENABLED=false)');
+    return;
+  }
+  // 2026-10-02 — the 8 AM digest runs this job and posts only what is new.
+  if (alertDigestEnabled()) {
+    console.log('[P2Unresolvable] runs inside ops-morning-digest at 08:00 ET (ALERT_DIGEST_ENABLED) — own scheduler not started');
     return;
   }
   console.log('[P2Unresolvable] Scheduler started — daily run at 06:30 ET');

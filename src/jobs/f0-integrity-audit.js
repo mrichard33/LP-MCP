@@ -46,6 +46,7 @@ import { lpStoredToUtcMs } from '../lp-dates.js';
 import { runJob } from '../job-runner.js';
 import { hourET, todayET } from './lp-report-common.js';
 import { evaluateS52Entry, isGatedState, isS52Target } from '../s52-entry-gate.js';
+import { alertDigestEnabled, filterNew, recordPosted as recordPostedItems } from '../alert-posted.js';
 
 export const JOB_ID = 'f0-integrity-audit';
 export const F0_ACTIVE_TAG = 'active-f.0';
@@ -390,42 +391,15 @@ async function loadS52Decisions(deps, ids, sinceIso) {
   return out;
 }
 
-/**
- * Drop items already posted in the last POSTED_TTL_DAYS. Also deletes rows
- * past the TTL. A failed read posts everything (never silence a real problem).
- */
+// 2026-10-02 — the dedupe store is shared (src/alert-posted.js); these two
+// keep the audit's own call shape.
 async function filterNewItems(deps, items, nowMs) {
-  if (!items.length) return { fresh: [], dedupe: 'none' };
-  const cutoffIso = new Date(nowMs - POSTED_TTL_DAYS * 86_400_000).toISOString();
-  try {
-    await deps.supabase.from('audit_posted_items').delete().eq('audit', AUDIT_KEY).lt('posted_at', cutoffIso);
-    const ids = [...new Set(items.map((i) => i.contact_id))];
-    const seen = new Set();
-    for (let i = 0; i < ids.length; i += LP_CHUNK) {
-      const { data, error } = await deps.supabase.from('audit_posted_items')
-        .select('contact_id, reason')
-        .eq('audit', AUDIT_KEY)
-        .in('contact_id', ids.slice(i, i + LP_CHUNK))
-        .gte('posted_at', cutoffIso);
-      if (error) throw new Error(error.message);
-      for (const r of data || []) seen.add(`${r.contact_id}|${r.reason}`);
-    }
-    return { fresh: items.filter((i) => !seen.has(`${i.contact_id}|${i.reason}`)), dedupe: 'ok' };
-  } catch (err) {
-    console.warn(`[F0Audit] audit_posted_items unreadable — posting everything: ${err.message}`);
-    return { fresh: items, dedupe: 'unavailable' };
-  }
+  const res = await filterNew({ audit: AUDIT_KEY, items: items.map((i) => ({ ...i, key: i.contact_id })), ttlDays: POSTED_TTL_DAYS, nowMs, deps });
+  return res;
 }
 
 async function recordPosted(deps, items, nowMs) {
-  if (!items.length) return;
-  try {
-    const rows = items.map((i) => ({ audit: AUDIT_KEY, contact_id: i.contact_id, reason: i.reason, posted_at: new Date(nowMs).toISOString() }));
-    const { error } = await deps.supabase.from('audit_posted_items').upsert(rows, { onConflict: 'audit,contact_id,reason' });
-    if (error) throw new Error(error.message);
-  } catch (err) {
-    console.warn(`[F0Audit] could not record posted items (they may repeat tomorrow): ${err.message}`);
-  }
+  await recordPostedItems({ audit: AUDIT_KEY, items: items.map((i) => ({ ...i, key: i.contact_id })), nowMs, deps });
 }
 
 /**
@@ -502,6 +476,11 @@ export function startF0IntegrityAuditScheduler() {
   if (timer) return;
   if (!auditEnabled()) {
     console.log('[F0Audit] disabled (F0_AUDIT_ENABLED=false)');
+    return;
+  }
+  // 2026-10-02 — the 8 AM digest runs the audit and posts its new items.
+  if (alertDigestEnabled()) {
+    console.log('[F0Audit] runs inside ops-morning-digest at 08:00 ET (ALERT_DIGEST_ENABLED) — own scheduler not started');
     return;
   }
   console.log('[F0Audit] Scheduler started — daily run at 08:00 ET');

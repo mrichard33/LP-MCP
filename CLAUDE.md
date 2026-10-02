@@ -206,6 +206,15 @@ on "I could not tell" announces a recovery nobody earned. This is why the `shoul
 return a `verdict` (`alert` / `healthy` / `insufficient_evidence`) rather than just a boolean — the
 boolean cannot distinguish "healthy" from "too quiet to conclude".
 
+**Ops alerts post only new items, mostly once a morning (Mark, 2026-10-02).** `src/jobs/ops-morning-digest.js`
+posts ONE 08:00 ET card to #ops-alerts: P2 Won/Lost (24h), new appt-parity gaps, and the morning checks
+(f0-integrity-audit, lead-leak, link-leak, p2-unresolvable), which now run inside it and no longer post their own
+card unless they FAIL. "Already posted" lives in ONE store, `audit_posted_items` via `src/alert-posted.js` —
+do not build another. Drift posts one card per contact, ever (`permanent`); intake journal waits 60 min; the
+uncalled-leads card names only leads not posted in 7 days; outages post on state change only (`remindMs: 0`).
+`ALERT_DIGEST_ENABLED=false` restores the per-alert cards (drift stays once-per-contact). Info-only rule cards
+are listed in `src/alert-noise.js`; a new informational card belongs in the digest, not its own post.
+
 **A job that never throws must still be able to fail.** `runJob` in `src/job-runner.js`
 records one row per scheduled pass, and it classifies from the RETURN VALUE, not just from a
 thrown error — `runMemoryNightly` and friends catch everything internally and report failure as

@@ -29,6 +29,9 @@ import {
   formatParityGapCard,
 } from '../src/jobs/appointment-parity-alerts.js';
 
+// 2026-10-02 — these pin the per-key card that ALERT_DIGEST_ENABLED=false restores.
+// With the digest on, new gaps go to the 8 AM digest instead (scripts/test-alert-noise-cut.js).
+process.env.ALERT_DIGEST_ENABLED = 'false';
 const { __testing } = await import('../src/jobs/appointment-parity-watchdog.js');
 const { maybeAlertParityGaps, ALERT_PREFIX } = __testing;
 

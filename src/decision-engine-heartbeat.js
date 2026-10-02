@@ -156,8 +156,10 @@ const SILENCE_ALERT_COOLDOWN_MS = parseInt(
 // 2026-09-04 — how long an UNRESOLVED silence waits before it re-reminds. The
 // cooldown above no longer paces the alert (alert-state.js is edge-triggered);
 // it survives only as the degraded path when the state table is unusable.
+// 2026-10-02 (Mark, alert noise cut): an outage posts when it starts and when
+// it ends, never in between. Default 0 = no reminder; the env still sets one.
 const SILENCE_REMIND_MS = parseInt(
-  process.env.AGENTIC_SILENCE_REMIND_MS || `${24 * 60 * 60 * 1000}`, 10
+  process.env.AGENTIC_SILENCE_REMIND_MS || '0', 10
 );
 
 const DRAIN_BATCH_LIMIT = parseInt(
@@ -184,8 +186,9 @@ const FAIL_CLOSED_SCAN_LIMIT = Math.max(
 );
 // A dead rule does not self-resolve — it stays dead until somebody edits it —
 // so an unresolved card re-reminds daily, like the agentic-silence key.
+// 2026-10-02 (Mark, alert noise cut): state changes only — default 0.
 const FAIL_CLOSED_REMIND_MS = parseInt(
-  process.env.RULE_FAIL_CLOSED_REMIND_MS || `${24 * 60 * 60 * 1000}`, 10
+  process.env.RULE_FAIL_CLOSED_REMIND_MS || '0', 10
 );
 const FAIL_CLOSED_ALERT_COOLDOWN_MS = parseInt(
   process.env.RULE_FAIL_CLOSED_ALERT_COOLDOWN_MS || `${6 * 60 * 60 * 1000}`, 10

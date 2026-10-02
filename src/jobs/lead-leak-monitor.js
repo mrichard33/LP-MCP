@@ -92,7 +92,8 @@ import {
 } from '../five9-admin.js';
 import { postToSlack as defaultPostToSlack, opsChannelId, officeMarketCode } from '../slack.js';
 import { explainUncalled } from '../lead-leak-explain.js';
-import { reportAlertCondition as defaultReportAlertCondition } from '../alert-state.js';
+import { reportAlertCondition as defaultReportAlertCondition, sendAlertMessage as defaultSendAlertMessage } from '../alert-state.js';
+import { alertDigestEnabled, filterNew as defaultFilterNew, recordPosted as defaultRecordPosted } from '../alert-posted.js';
 import { runJob } from '../job-runner.js';
 import { hourET, todayET } from './lp-report-common.js';
 import {
@@ -140,6 +141,9 @@ const MAX_CONSECUTIVE_LOOKUP_ERRORS = 5;
 const REMIND_SPEED_MS = 24 * HOUR_MS;
 const REMIND_INTAKE_MS = 24 * HOUR_MS;
 const REMIND_UNCALLED_MS = 3 * HOUR_MS;
+// 2026-10-02 — digest era: a lead is named on the waiting card once per week.
+export const UNCALLED_AUDIT = 'lead_uncalled';
+export const UNCALLED_TTL_DAYS = 7;
 
 /* --- config, read per pass ---------------------------------------------- */
 
@@ -893,7 +897,11 @@ export async function cleanupOldRows({ db = defaultSupabase, runDate, env = proc
 }
 
 /** One scheduled daily pass. Returns the runJob verdict shape. */
-export async function runLeadLeakMonitor({ env = process.env, nowMs = Date.now(), deps = {} } = {}) {
+// 2026-10-02 (Mark, alert noise cut) — `digest: true` is the 8 AM digest
+// calling (src/jobs/ops-morning-digest.js). The pass measures and stores
+// exactly as before, but delivers no card of its own: it returns the named
+// leads as `digestItems` and the digest posts only the ones never posted.
+export async function runLeadLeakMonitor({ env = process.env, nowMs = Date.now(), deps = {}, digest = false } = {}) {
   const cfg = leadLeakConfig(env);
   if (cfg.mode === 'off') return { skipped: true, reason: 'LEAD_LEAK_MONITOR_MODE=off' };
   const db = deps.supabase || defaultSupabase;
@@ -938,6 +946,26 @@ export async function runLeadLeakMonitor({ env = process.env, nowMs = Date.now()
   // Alarms: time to first call getting worse, and GHL leads that never
   // reached LP. The waiting-leads alarm is the hourly pass's job.
   const speedDecision = m.speed.decision;
+  const intakeDecision = shouldAlertIntakeGap(m.intake?.rows ?? null, { readOk: !!m.intake });
+  const retiredDecision = shouldAlertRetiredCode(m.retiredFresh);
+  if (digest) {
+    const hardFailure = errors.some((e) => / write: /.test(e));
+    console.log(`[LeadLeak] digest pass — speed=${speedDecision.verdict} never_reached_lp=${intakeDecision.count ?? '?'} retired=${retiredDecision.count ?? '?'}`);
+    return {
+      ok: !hardFailure,
+      mode: cfg.mode,
+      alertMode: aMode,
+      verdict: m.verdict,
+      stored,
+      digestItems: {
+        speedSlow: speedDecision.verdict === 'alert' ? m.offenders : [],
+        intakeMissing: intakeDecision.verdict === 'alert' ? intakeDecision.missing : [],
+        retired: retiredDecision.verdict === 'alert' ? m.retiredFresh : [],
+        intakeUnreadable: intakeDecision.verdict === 'insufficient_evidence',
+      },
+      ...(hardFailure ? { errors } : { notes: errors }),
+    };
+  }
   await deliverAlert({
     mode: aMode, report, key: 'lead_speed_slow', label: 'Time to first call',
     verdict: speedDecision.verdict, remindMs: REMIND_SPEED_MS,
@@ -945,7 +973,6 @@ export async function runLeadLeakMonitor({ env = process.env, nowMs = Date.now()
     recoveredText: () => formatSpeedRecovered(speedDecision),
     detail: JSON.stringify({ recent: speedDecision.recent, baseline: speedDecision.baseline }),
   });
-  const intakeDecision = shouldAlertIntakeGap(m.intake?.rows ?? null, { readOk: !!m.intake });
   await deliverAlert({
     mode: aMode, report, key: 'lead_intake_gap', label: 'Leads never reached LP',
     verdict: intakeDecision.verdict, remindMs: REMIND_INTAKE_MS,
@@ -954,7 +981,6 @@ export async function runLeadLeakMonitor({ env = process.env, nowMs = Date.now()
     detail: `missing=${intakeDecision.count}`,
   });
 
-  const retiredDecision = shouldAlertRetiredCode(m.retiredFresh);
   await deliverAlert({
     mode: aMode, report, key: 'lead_retired_code', label: 'Retired disposition code used',
     verdict: retiredDecision.verdict, remindMs: REMIND_INTAKE_MS,
@@ -1021,6 +1047,46 @@ export async function runLeadUncalledCheck({ env = process.env, nowMs = Date.now
     env, nowMs, deps, opts: { windowDays: UNCALLED_WINDOW_DAYS, lookups: 'card', rates: false, intake: false, queues: false },
   });
   const decision = shouldAlertUncalled(m.offenders, { readOk: m.verdict !== 'insufficient_evidence' });
+
+  // 2026-10-02 (Mark, alert noise cut): name only leads never posted before
+  // (7 days, audit 'lead_uncalled'), and stay silent when there is none. No
+  // 3-hour re-list of the same leads. ALERT_DIGEST_ENABLED=false restores the
+  // edge-triggered card below.
+  if (alertDigestEnabled(env)) {
+    if (decision.verdict === 'insufficient_evidence') {
+      console.log(`[LeadLeak] uncalled check — could not read (${m.errors.join('; ')})`);
+      return { checked: false, readFailed: true, reason: m.errors.join('; ') };
+    }
+    const offenders = decision.verdict === 'alert' ? m.offenders : [];
+    const filterNew = deps.filterNew || defaultFilterNew;
+    const recordPosted = deps.recordPosted || defaultRecordPosted;
+    const items = offenders.filter((o) => o.lp_lead_id).map((o) => ({ ...o, key: String(o.lp_lead_id), reason: 'uncalled' }));
+    const { fresh, dedupe } = items.length
+      ? await filterNew({ audit: UNCALLED_AUDIT, items, ttlDays: UNCALLED_TTL_DAYS, nowMs, deps: { supabase: deps.supabase } })
+      : { fresh: [], dedupe: 'none' };
+    if (dedupe === 'unavailable') {
+      console.warn('[LeadLeak] uncalled check — posted-leads store unreadable, holding the card (it would re-list every lead hourly)');
+      return { ok: true, mode: aMode, verdict: decision.verdict, summary: `waiting=${decision.count} dedupe_unavailable` };
+    }
+    if (!fresh.length) {
+      console.log(`[LeadLeak] uncalled check ${aMode} — waiting=${decision.count ?? 0}, none new — no card`);
+      return { ok: true, mode: aMode, verdict: decision.verdict, summary: `waiting=${decision.count} new=0` };
+    }
+    const text = formatUncalledAlert(fresh, { cfg: acfg, dashboardUrl: cfg.dashboardUrl, nowMs });
+    if (aMode === 'shadow') {
+      console.log(`[LeadLeak] shadow uncalled — would send ${fresh.length} new:\n${text}`);
+      return { ok: true, mode: aMode, verdict: decision.verdict, summary: `waiting=${decision.count} new=${fresh.length} shadow` };
+    }
+    const send = deps.sendAlertMessage || defaultSendAlertMessage;
+    const sent = await send(text, { channel: 'ops' });
+    if (sent?.sent === false) {
+      return { ok: false, mode: aMode, verdict: decision.verdict, errors: [`slack: ${sent?.reason || 'not sent'}`] };
+    }
+    await recordPosted({ audit: UNCALLED_AUDIT, items: fresh, nowMs, deps: { supabase: deps.supabase } });
+    console.log(`[LeadLeak] uncalled check — posted ${fresh.length} new of ${decision.count} waiting`);
+    return { ok: true, mode: aMode, verdict: decision.verdict, summary: `waiting=${decision.count} new=${fresh.length} posted` };
+  }
+
   const res = await deliverAlert({
     mode: aMode, report, key: 'lead_uncalled_fresh', label: 'Leads waiting with no call',
     verdict: decision.verdict, remindMs: REMIND_UNCALLED_MS,
@@ -1092,6 +1158,11 @@ export function startLeadLeakScheduler() {
     console.log('[LeadLeak] disabled (LEAD_LEAK_MONITOR_MODE=off)');
     return;
   }
+  // 2026-10-02 — the 8 AM digest runs the daily pass and posts its new leads.
+  if (alertDigestEnabled()) {
+    console.log('[LeadLeak] daily pass runs inside ops-morning-digest at 08:00 ET (ALERT_DIGEST_ENABLED) — own scheduler not started');
+    return;
+  }
   console.log(`[LeadLeak] Scheduler started — daily run at 07:00 ET (mode=${leadLeakMode()})`);
   const checkAndRun = async () => {
     const today = todayET();
@@ -1105,6 +1176,13 @@ export function startLeadLeakScheduler() {
     }
   };
   timer = setInterval(checkAndRun, 5 * 60 * 1000);
+}
+
+/** The digest's call: one guarded daily pass that returns its leads instead of posting. */
+export async function runLeadLeakForDigest(opts = {}) {
+  if (leadLeakMode() === 'off') return { skipped: true, reason: 'LEAD_LEAK_MONITOR_MODE=off' };
+  const r = await guarded(() => runLeadLeakMonitor({ ...opts, digest: true }));
+  return r?.busy ? { skipped: true, reason: 'a manual pass was running' } : r;
 }
 
 export function stopLeadLeakScheduler() {
