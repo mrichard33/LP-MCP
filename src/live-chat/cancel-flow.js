@@ -174,9 +174,17 @@ export function slotsOfferLine(slots, tzLabelText = 'ET') {
 /** The slots that our own offer line named, in the order we named them. Pure. */
 export function offeredSlots(offerText, freeSlots) {
   const text = String(offerText || '');
+  // 2026-10-02: the NEPQ offer reads "tomorrow at 10:00 AM" (slot.rel), not
+  // "Sat, Oct 3 at 10:00 AM". Matching only the date form found one of the two
+  // times, and "the first one" booked the SECOND (simulator, never live).
+  const at = (s) => {
+    const hits = [slotText(s), s.rel ? `${s.rel} at ${s.time}` : null]
+      .filter(Boolean).map((form) => text.indexOf(form)).filter((i) => i >= 0);
+    return hits.length ? Math.min(...hits) : -1;
+  };
   return (Array.isArray(freeSlots) ? freeSlots : [])
-    .filter((s) => text.includes(slotText(s)))
-    .sort((x, y) => text.indexOf(slotText(x)) - text.indexOf(slotText(y)));
+    .filter((s) => at(s) >= 0)
+    .sort((x, y) => at(x) - at(y));
 }
 
 /**
@@ -190,8 +198,13 @@ export function pickSlot(text, offered) {
   if (!list.length) return null;
   if (/\b(?:neither|none|no(?:pe)?|not\s+(?:those|that|either))\b/.test(s)) return null;
   if (list.length === 1 && /\b(?:yes|yeah|yep|sure|ok(?:ay)?|works|perfect|that\s+one|sounds\s+good)\b/.test(s)) return list[0];
-  if (/\b(?:first|1st|earlier|former)\b|^\s*(?:#?\s*1|one)\s*[.!]?\s*$/.test(s)) return list[0];
-  if (/\b(?:second|2nd|later|latter|last)\b|^\s*(?:#?\s*2|two)\s*[.!]?\s*$/.test(s)) return list[1] || null;
+  // "first" / "second" only mean something with both times in hand: with one
+  // matched, "the first one" may be the time that did not match.
+  const ordinalFirst = /\b(?:first|1st|earlier|former)\b|^\s*(?:#?\s*1|one)\s*[.!]?\s*$/.test(s);
+  const ordinalSecond = /\b(?:second|2nd|later|latter|last)\b|^\s*(?:#?\s*2|two)\s*[.!]?\s*$/.test(s);
+  if ((ordinalFirst || ordinalSecond) && list.length < 2) return null;
+  if (ordinalFirst) return list[0];
+  if (ordinalSecond) return list[1] || null;
   // "tomorrow" / "today" pick the offered time labelled so (2026-10-02 offers
   // read "tomorrow at 10:00 AM ET or Mon, Oct 5 at 6:00 PM ET").
   const rel = list.filter((slot) => slot.rel && new RegExp(`\\b${slot.rel}\\b`).test(s));

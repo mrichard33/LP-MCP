@@ -182,3 +182,17 @@ test('offer wording: "tomorrow" in the two-times line, and "tomorrow" picks that
   assert.equal(pickSlot('tomorrow works', [a, b]), a);
   assert.equal(pickSlot('monday', [a, b]), b);
 });
+
+test('regression 2026-10-02: "the first one" after a "tomorrow at …" offer books the FIRST time', async () => {
+  const { LINES } = await import('../src/agentic/nepq-planner.js');
+  const { offeredSlots, pickSlot } = await import('../src/live-chat/cancel-flow.js');
+  const a = { iso: '2026-10-03T10:00:00-04:00', day: 'Sat, Oct 3', time: '10:00 AM', dayOfWeek: 'Saturday', rel: 'tomorrow', tz: 'ET' };
+  const b = { iso: '2026-10-04T14:00:00-04:00', day: 'Sun, Oct 4', time: '2:00 PM', dayOfWeek: 'Sunday', rel: null, tz: 'ET' };
+  const offer = LINES.offer_slots([a, b]);
+  const offered = offeredSlots(offer, [b, a]);
+  assert.deepEqual(offered, [a, b], 'both times found, in the order offered');
+  assert.equal(pickSlot('The first one', offered), a);
+  assert.equal(pickSlot('the second', offered), b);
+  // Only one of two matched: an ordinal is not trusted.
+  assert.equal(pickSlot('The first one', [b]), null);
+});
