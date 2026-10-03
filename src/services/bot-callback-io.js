@@ -41,10 +41,25 @@ export function botCallbackDeps({ applyTags, addNote }) {
       const { executeActionById } = await import('../actions/index.js');
       return executeActionById(data.id);
     },
-    routeHandoff: (args) => routeNepqHandoff(args, {
-      applyTags, addNote, emitEvent,
-      post: (text, channelId) => import('../slack.js').then(({ postToSlack }) => postToSlack(text, channelId)),
-      opsAlert: (text) => import('../alert-state.js').then(({ sendAlertMessage }) => sendAlertMessage(text, { channel: 'ops' })),
-    }),
+    routeHandoff: (args) => routeNepqHandoff(args, nepqHandoffDeps({ applyTags, addNote })),
+  };
+}
+
+/** The contact's market #service channel(s); #contact-center when no market resolves. */
+export async function serviceChannelsFor(contactId) {
+  const [{ resolveServiceMarketForContact }, { resolveSlackChannels }] = await Promise.all([
+    import('../actions/service-card.js'), import('../slack.js'),
+  ]);
+  const market = await resolveServiceMarketForContact(contactId, null, null).catch(() => null);
+  return resolveSlackChannels('service', { market: market || undefined });
+}
+
+/** Production deps for routeNepqHandoff (src/agentic/nepq-handoff.js), shared by both bots. */
+export function nepqHandoffDeps({ applyTags, addNote }) {
+  return {
+    applyTags, addNote, emitEvent,
+    post: (text, channelId) => import('../slack.js').then(({ postToSlack }) => postToSlack(text, channelId)),
+    opsAlert: (text) => import('../alert-state.js').then(({ sendAlertMessage }) => sendAlertMessage(text, { channel: 'ops' })),
+    serviceChannels: serviceChannelsFor,
   };
 }

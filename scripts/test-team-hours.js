@@ -66,7 +66,8 @@ test('planner: after hours the hand-offs name when someone will call', () => {
   const day = planNepqTurn({ channel: 'livechat', trigger: 'A storm broke my window and water is coming in!', nowMs: MON_11AM });
   assert.equal(day.fixed_line, LINES.handoff.emergency);
   const service = planNepqTurn({ channel: 'sms', trigger: 'You installed my windows last month and one is leaking', nowMs: SUN_4PM });
-  assert.equal(service.fixed_line, "Sorry about that. I've passed this to our service team, and someone will call you tomorrow at 9 AM ET.");
+  // 2026-10-03 (Mark): service tells the lead a team member will reach out.
+  assert.equal(service.fixed_line, "Sorry about that. I've passed this to our service team, and a team member will reach out tomorrow at 9 AM ET.");
 });
 
 test('planner: a call asked for outside hours gets the next opening', () => {

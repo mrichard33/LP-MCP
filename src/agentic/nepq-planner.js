@@ -114,6 +114,25 @@ export const CALL_OFFER_RX = /\b(?:want|would\s+you\s+like|should\s+i\s+have|can
 // let us figure out what's happening" next to the visit ask). Dropped unless
 // the lead asked for a call or turned the visit down (dropUnaskedCallOffer).
 const CALL_OFFER_SENTENCE_RX = /\b(?:(?:quick|short|brief|15[\s-]*min(?:ute)?|fifteen[\s-]*min(?:ute)?|phone)\s+(?:call|chat)|give\s+you\s+a\s+(?:call|ring)|(?:call|ring|phone)\s+you\b|hop\s+on\s+(?:a\s+)?(?:call|the\s+phone)|(?:talk|chat|go\s+over\s+it)\s+(?:on|over)\s+the\s+phone)\b/i;
+// 2026-10-03 (Mark): "only sales related callbacks go [to Five9 and
+// #contact-center]. Anything related to service should let the lead know a
+// team member will reach out and send to the Slack service channel." A call
+// asked for about an install, an order, a repair or a warranty is service.
+const SERVICE_TOPIC_RX = /\b(?:warrant(?:y|ies)|repairs?|service\s+(?:call|request|visit|appointment|team|department)|my\s+(?:install(?:ation)?|installers?|order|job|project|contract|permit|account)|install(?:ation)?\s+(?:date|day|status|time|schedule|issue|problem)|(?:when|what\s+(?:day|time))\s+(?:are|is|will|do)\s+(?:you|they|y'?all|the\s+(?:crew|installers?|team))\s+(?:coming|come|start|install|be\s+(?:here|there|out))|(?:already|existing)\s+(?:a\s+)?customer|(?:you|reece|y'?all|your\s+(?:team|crew|company))\s+(?:guys\s+)?(?:installed|put\s+in|replaced)|(?:bought|purchased|got)\s+(?:my\s+|our\s+|the\s+)?(?:windows?|doors?)?\s*(?:from|through)\s+(?:you|reece))\b/i;
+// A known customer asking about NEW work is a sales call ("more windows").
+const SALES_TOPIC_RX = /\b(?:quote|estimate|price|pricing|cost|new\s+(?:windows?|doors?)|more\s+(?:windows?|doors?)|another\s+(?:window|door|room|house|home|project)|additional|replace\s+(?:more|the\s+rest|other)|rest\s+of\s+(?:the\s+)?(?:house|home|windows))\b/i;
+/**
+ * Is a call request a SERVICE call rather than a sales call? Pure.
+ * Service when the lead's own words are about an install, order, repair or
+ * warranty, or when a known customer asks without naming new work.
+ */
+export function isServiceCallback({ conversation = [], trigger = '', isCustomer = false } = {}) {
+  const texts = [...(Array.isArray(conversation) ? conversation : [])
+    .filter(m => String(m?.direction || '').toLowerCase() !== 'outbound').map(m => String(m?.text ?? m?.body ?? '')).slice(-6), String(trigger || '')];
+  if (texts.some(t => SERVICE_TOPIC_RX.test(t) || SERVICE_RX.test(t))) return true;
+  return !!isCustomer && !texts.some(t => SALES_TOPIC_RX.test(t));
+}
+
 const COMPLAINT_RX = /\b(?:supposed\s+to\s+(?:come|show|be\s+(?:here|there)|call|arrive)|never\s+(?:came|showed(?:\s+up)?|arrived|called(?:\s+(?:me\s+)?back)?)|(?:didn'?t|did\s+not)\s+(?:come|show(?:\s+up)?|arrive|call(?:\s+(?:me\s+)?back)?)|stood\s+(?:me|us)\s+up|waited\s+all\s+(?:day|morning|afternoon)|(?:nobody|no\s+one|no-one)\s+(?:showed|came|called|answered)|complain\w*|ripped\s+off|rip[-\s]?off|scam\w*|refund|lawyer|attorney|sue\b|bbb|better\s+business|manager|supervisor|no[-\s]?show(?:ed)?|never\s+showed|(?:nobody|no\s+one)\s+(?:came|showed|called|answered)|unprofessional|rude|terrible\s+service|worst)\b/i;
 
 const SPOUSE_RX = /\b(?:wife|husband|spouse|partner|fianc[ée]e?)\b/i;
@@ -230,7 +249,9 @@ export const LINES = Object.freeze({
   handoff: {
     complaint: "I'm sorry about that. I'm getting someone from our team on this now.",
     emergency: "That's urgent. I'm getting someone from our team on this right now.",
-    service: "Sorry about that. I'm getting our service team on this now.",
+    // 2026-10-03 (Mark): service tells the lead a team member will reach out.
+    service: "Sorry about that. I'm passing this to our service team, and a team member will reach out.",
+    service_callback: "Got it. I'm passing this to our service team, and a team member will reach out.",
     price_insist: "Understood. I'll have someone from our team call you to talk it through.",
     two_nos: "No problem, I'll stop here. Someone from our team will check in with you directly.",
     repeat_objection: "Understood. I'll have someone from our team call you so you get a straight answer.",
@@ -240,7 +261,8 @@ export const LINES = Object.freeze({
   handoff_closed: {
     complaint: (when) => `I'm sorry about that. I've passed this to our team, and someone will call you ${when}.`,
     emergency: (when) => `That's urgent. I've flagged it for our team, and someone will call you ${when}.`,
-    service: (when) => `Sorry about that. I've passed this to our service team, and someone will call you ${when}.`,
+    service: (when) => `Sorry about that. I've passed this to our service team, and a team member will reach out ${when}.`,
+    service_callback: (when) => `Got it. I've passed this to our service team, and a team member will reach out ${when}.`,
   },
   callback_outside_hours: (when) => `Got it. That's outside our team's hours, so I'll have someone call you ${when}.`,
 });
@@ -460,7 +482,7 @@ export function discoveryEarned(conversation = [], trigger = '') {
 export function planNepqTurn({
   channel = 'sms', trigger = '', conversation = [], slots = [], tzLabel = '', firstName = null,
   hasAppointment = false, nextStepLabel = 'a free visit at your home', discipline = null, nowMs = Date.now(),
-  allSlots = null,
+  allSlots = null, isCustomer = false,
 } = {}) {
   const turns = normalizeThread(conversation, trigger);
   const inbound = turns.filter(t => t.direction === 'inbound');
@@ -562,6 +584,14 @@ export function planNepqTurn({
   if (EMERGENCY_RX.test(now)) return handoff('emergency');
   if (SERVICE_RX.test(now)) return handoff('service');
   if (COMPLAINT_RX.test(now)) return handoff('complaint');
+  // A call asked for about service (an install, an order, a repair) goes to
+  // the service team, never the sales callback list (Mark, 2026-10-03).
+  const serviceCall = () => isServiceCallback({ conversation, trigger, isCustomer });
+  const serviceHandoff = () => {
+    const line = (!teamOpen ? LINES.handoff_closed.service_callback(nextTeamOpenLabel(nowMs)) : LINES.handoff.service_callback);
+    return fixed('handoff', line, { step: 'handoff', handoff: { reason: 'service', line }, booking: { allowed: false, reason: 'nepq:handoff_service' } });
+  };
+  if (CALLBACK_RX.test(now) && !isNotInterested(now) && serviceCall()) return serviceHandoff();
   if (CALLBACK_RX.test(now) && !isNotInterested(now)) {
     // A call asked for outside team hours gets the next opening instead, and
     // after hours "call me back" names when (2026-10-02, Mark).
@@ -575,6 +605,7 @@ export function planNepqTurn({
   // A yes to our own offer of a call (2026-10-03): the call is now promised,
   // so it is a callback request like any other (Five9 + #contact-center).
   if (CALL_OFFER_RX.test(lastOut) && (YES_RX.test(now) || MAYBE_RX.test(now)) && !isNo(now, lastOut)) {
+    if (serviceCall()) return serviceHandoff();
     const line = LINES.callback(teamOpen ? callbackWhen('') : nextTeamOpenLabel(nowMs));
     return fixed('handoff', line, { step: 'handoff', handoff: { reason: 'callback_request', line }, booking: { allowed: false, reason: 'nepq:callback_accepted' } });
   }
@@ -1288,6 +1319,11 @@ export function enforceNepqPlan(draft, plan, { allowFigures = false, known = {} 
   if (plan.required_move === 'bridge' && !BRIDGE_RX.test(body)) {
     body = plan.bridge_line || bridgeLine(plan);
     changes.push('bridge');
+  } else if (plan.required_move === 'bridge' && !body.includes('?')) {
+    // The bridge asks (2026-10-03 replay: "The next step would be a free look at
+    // your home to see what's letting that cold in." and nothing to answer).
+    body = `${body.replace(/[.!\s]+$/, '')}. Would that help?`;
+    changes.push('bridge_question_added');
   }
   if (referenceMove) {
     let failed = checkAgainstReference(body, refLine, refSlots, plan);
@@ -1325,11 +1361,18 @@ export function enforceNepqPlan(draft, plan, { allowFigures = false, known = {} 
   // booking confirmation, or a turn where a booking ask is allowed.
   const actionable = /\{\{|\bhttps?:\/\/|\ball set\b/i.test(body) || plan.booking?.allowed === true;
   if ((plan.required_move === 'probe' || plan.required_move === 'consequence') && !body.includes('?') && !actionable) {
+    // A discovery turn collects no details: "Let me get your zip code so I can
+    // confirm…" next to the question was two asks, and a zip asked twice
+    // (2026-10-03 replay). The statement goes; the discovery question stays.
+    const kept = splitSentences(body).filter(x => !DETAIL_REQUEST_RX.test(x));
+    if (kept.length && kept.length < splitSentences(body).length) { body = kept.join(' '); changes.push('detail_request_dropped'); }
     body = `${body.replace(/\s+$/, '')} ${discoveryQuestion(plan)}`.trim();
     changes.push('discovery_question_added');
   }
   return { text: changes.length ? withSignOff(body) : original, changes, failed: [] };
 }
+
+const DETAIL_REQUEST_RX = /\b(?:let\s+me\s+(?:get|grab|have)|(?:i|we)(?:'ll|’ll|\s+will)?\s+(?:just\s+|also\s+)?need|(?:can|could)\s+(?:you|i\s+get))\b[^.?!]*\b(?:zip|address|phone|number|e-?mail|name)\b/i;
 
 const DISCOVERY_QUESTIONS = {
   problem: [

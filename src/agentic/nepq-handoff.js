@@ -44,7 +44,7 @@ const WHY = {
   two_nos: 'The lead said no twice. Check in once, personally; do not push.',
   repeat_objection: 'The lead raised the same objection again. Call so they get a straight answer.',
   emergency: 'URGENT: damage happening now (e.g. a broken window, water coming in). Call them right away.',
-  service: 'An existing customer has a problem with an install (a leak, a stuck or broken unit). Service should call and set up a repair visit.',
+  service: 'An existing customer needs service (an install, an order, a repair or a warranty question). Service should reach out.',
   callback_request: 'The lead asked for a phone call (or said yes to one). Call them, at the time they named if they gave one.',
   booking_request: 'The lead picked a time in the website chat, but the bot could not book it (usually a missing address). Call to confirm the details and book that time.',
 };
@@ -70,7 +70,12 @@ export async function routeNepqHandoff({ contactId, reason, channel, inbound, fi
   const { note, card } = formatNepqHandoff({ reason, channel, inbound, contactId, firstName, extra });
   const day = new Date(nowMs).toISOString().slice(0, 10);
   const results = await Promise.allSettled([
-    Promise.resolve().then(() => deps.applyTags(contactId, [CALLBACK_TAG_SALES, `${NEPQ_HANDOFF_TAG_PREFIX}${reason}`])),
+    // Service never takes the sales callback tag (I.HDL-1 rings the lead through
+    // the call center). It takes no hdl:* tag at all: hdl:callback-service fires
+    // I.HDL-2, which texts "they're picking up now" and bridges a call, while
+    // Mark's ruling (2026-10-03) is our "a team member will reach out" plus the
+    // #service card.
+    Promise.resolve().then(() => deps.applyTags(contactId, reason === 'service' ? [`${NEPQ_HANDOFF_TAG_PREFIX}${reason}`] : [CALLBACK_TAG_SALES, `${NEPQ_HANDOFF_TAG_PREFIX}${reason}`])),
     Promise.resolve().then(() => deps.addNote(contactId, note)),
     Promise.resolve().then(() => deps.emitEvent({
       event_type: 'agentic.nepq_handoff', source: 'nepq_backbone', entity_type: 'contact', entity_id: contactId, ghl_contact_id: contactId,
@@ -87,7 +92,14 @@ export async function routeNepqHandoff({ contactId, reason, channel, inbound, fi
 /** The card to #contact-center (and #dispatch); a failed post is an #ops-alerts line. */
 async function postCard({ card, reason, contactId }, deps) {
   if (!deps.post) return deps.alert?.(card);
-  const channels = handoffSlackChannels(reason, deps.env || process.env);
+  // 2026-10-03 (Mark): "Anything related to service should … send to the Slack
+  // service channel": the contact's market #service-<market> channel
+  // (resolveSlackChannels('service'), whose fallback is #contact-center).
+  let channels = handoffSlackChannels(reason, deps.env || process.env);
+  if (reason === 'service' && deps.serviceChannels) {
+    const ids = await Promise.resolve().then(() => deps.serviceChannels(contactId)).catch(() => []);
+    if (Array.isArray(ids) && ids.length) channels = ids.map(id => ({ name: 'service', id }));
+  }
   if (!channels.length) {
     await deps.opsAlert?.(`🚨 HAND-OFF CARD HAS NO CHANNEL (SLACK_CHANNEL_SERVICE unset)\n\n${card}`);
     return;

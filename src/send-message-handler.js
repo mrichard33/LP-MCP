@@ -309,6 +309,7 @@ import {
   CUSTOMER_STATUS_PENDING_TAG,
   CUSTOMER_STATUS_GATE_INTENT_SET,
   CALLBACK_TAG_SALES,
+  CALLBACK_TAG_SERVICE,
 } from './knowledge/callback-resolver.js';
 // Conversation Quality Pass v1.0 (2026-07-07): quiet-hours hold for
 // bot-initiated sends, near-duplicate suppression, stale/mid-generation
@@ -324,7 +325,7 @@ import { findNewerInbound } from './agentic/burst-yield.js';
 import { emitEvent } from './event-emitter.js';
 import { routeNepqHandoff } from './agentic/nepq-handoff.js';
 import { fileBotCallback, callbackDecision } from './agentic/bot-callback.js';
-import { botCallbackDeps } from './services/bot-callback-io.js';
+import { botCallbackDeps, nepqHandoffDeps } from './services/bot-callback-io.js';
 // 2026-09-18 — the decision-maker handoff writes its rep task as a GHL note
 // (GHL has no task API; see src/actions/handlers/tasks.js).
 import { addGHLNote } from './ghl.js';
@@ -2127,6 +2128,21 @@ async function handleShortCircuit(contactId, generated, action, context, opts = 
     tagApplied = await applyContactTags(contactId, tagsToApply);
   }
 
+  // ── A callback is filed for real (Mark, 2026-10-03) ───────────────
+  // The classifier's CALLBACK short-circuit is how most texted "can someone
+  // call me?" arrive, ahead of the NEPQ planner. Sales: the Five9 Callback
+  // Request list + the #contact-center card. Service: the market's #service
+  // channel, never Five9. The hdl:* tag above still starts its GHL workflow.
+  // Detached and fail-soft.
+  if (!opts.dryRun && generated.intent_class === 'CALLBACK' && (handoffTag === CALLBACK_TAG_SALES || handoffTag === CALLBACK_TAG_SERVICE)) {
+    const inbound = generated.trigger_message_preview || context?.trigger_message || '';
+    const deps = botCallbackDeps({ applyTags: applyContactTags, addNote: addGHLNote });
+    fileBotCallback({
+      contactId, channel: generated.channel || 'sms', inbound, why: 'classifier_callback',
+      kind: handoffTag === CALLBACK_TAG_SERVICE ? 'service' : 'sales',
+    }, deps).catch(err => console.warn(`[SendMessage] classifier callback filing failed for ${contactId} (fail-soft): ${err.message}`));
+  }
+
   // ── Customer-status probe answered → clear the pending tag ────────
   // The CUSTOMER_STATUS_* gates only fire while pending:customer-status-
   // check is on the contact (intent-classifier v1.2 precondition). Once
@@ -3429,17 +3445,12 @@ export async function executeSendMessage(action, context) {
     // A callback_request hand-off is filed after the send instead (below,
     // fileBotCallback): Five9 + #contact-center, only for a reply that went out.
     if (!generationErr && generated?.nepq_handoff && generated.nepq_handoff.reason !== 'callback_request') {
+      // A service hand-off posts to the market's #service channel (Mark, 2026-10-03).
       await routeNepqHandoff({
         contactId, reason: generated.nepq_handoff.reason, channel,
         inbound: replyTriggerMessage || triggerMessage,
         firstName: context?.lead?.first_name || null,
-      }, {
-        applyTags: applyContactTags,
-        addNote: addGHLNote,
-        emitEvent,
-        post: (text, channelId) => import('./slack.js').then(({ postToSlack }) => postToSlack(text, channelId)),
-        opsAlert: (text) => import('./alert-state.js').then(({ sendAlertMessage }) => sendAlertMessage(text, { channel: 'ops' })),
-      }).catch(err => console.warn(`[SendMessage] NEPQ hand-off side effects failed for ${contactId} (fail-soft): ${err.message}`));
+      }, nepqHandoffDeps({ applyTags: applyContactTags, addNote: addGHLNote })).catch(err => console.warn(`[SendMessage] NEPQ hand-off side effects failed for ${contactId} (fail-soft): ${err.message}`));
     }
 
     // 2026-09-25 — "didn't get it" on a guide: re-fire the delivery tag so GHL
@@ -4007,6 +4018,8 @@ export async function executeSendMessage(action, context) {
       fileBotCallback({
         contactId, channel, inbound: replyTriggerMessage || context?.message_text || '',
         firstName: context?.lead?.first_name || null, why: callbackReason,
+        // A service conversation goes to the service channel, never Five9 (Mark, 2026-10-03).
+        kind: generated?.service_conversation ? 'service' : 'sales',
       }, botCallbackDeps({ applyTags: applyContactTags, addNote: addGHLNote }))
         .catch(err => console.warn(`[SendMessage] bot callback failed for ${contactId} (fail-soft): ${err.message}`));
     }
