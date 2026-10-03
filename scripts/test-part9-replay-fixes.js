@@ -163,3 +163,53 @@ test('a re-ask names the same two times we just offered', () => {
   assert.match(plan.fixed_line, /Sun, Oct 4 at 2:00 PM ET or Mon, Oct 5 at 2:00 PM ET/);
   assert.deepEqual(plan.slots_to_offer.map(s => s.day), ['Sun, Oct 4', 'Mon, Oct 5']);
 });
+
+// 2026-10-03 replay (#1143 live): a booking offer ending "Which one works
+// better?" read as the cancel flow's slot offer; "She should be able to make
+// it" became a failed reschedule and a #dispatch card.
+test('the cancel flow answers only inside a flow a cancel request started', async () => {
+  const { planCancelTurn } = await import('../src/live-chat/cancel-flow.js');
+  const thread = [
+    { direction: 'inbound', text: '12 Main St, Ocala FL 34470' },
+    { direction: 'outbound', text: "So we're looking at Sunday, Oct 4 at 2:00 PM ET or Monday, Oct 5 at 2:00 PM ET for you and your wife. Which one works better?" },
+    { direction: 'inbound', text: 'She should be able to make it' },
+  ];
+  assert.equal(planCancelTurn({ body: 'She should be able to make it', thread, known: {} }), null);
+  // Inside a real flow the same offer is still read as the flow's.
+  const flow = [
+    { direction: 'inbound', text: 'I need to cancel my appointment' },
+    { direction: 'outbound', text: 'Sure. I have Sat, Oct 3 at 6:00 PM or Sun, Oct 4 at 10:00 AM ET open. Which one works better for you?' },
+    { direction: 'inbound', text: 'The first one' },
+  ];
+  assert.equal(planCancelTurn({ body: 'The first one', thread: flow, known: {} }).step, 'pick_slot');
+});
+
+// 2026-10-03 logs: the model often wrote only an acknowledgment, and each such
+// SMS turn cost a 10-35s re-write that often missed too.
+test('a draft that only acknowledges keeps its words and gets the planned ask', async () => {
+  const { enforceNepqPlan, appendReferenceAsk } = await import('../src/agentic/nepq-planner.js');
+  const conv = [
+    { direction: 'outbound', text: 'Sure. For 2 PM, I have Sun, Oct 4 at 2:00 PM ET or Mon, Oct 5 at 2:00 PM ET. Which works better?' },
+    { direction: 'inbound', text: 'She should be able to make it' },
+  ];
+  const plan = planNepqTurn({ channel: 'sms', trigger: 'She should be able to make it', conversation: conv, slots: [ALL[3], ALL[4]], allSlots: ALL, tzLabel: 'ET', nowMs: NOW });
+  assert.equal(plan.required_move, 'offer_slots');
+  const out = enforceNepqPlan('Good to hear she can make it.', plan);
+  assert.deepEqual(out.failed, []);
+  assert.ok(out.changes.includes('reference_ask_appended'));
+  assert.match(out.text, /^Good to hear she can make it\. .*Sun, Oct 4 at 2:00 PM ET or Mon, Oct 5 at 2:00 PM ET\?$/);
+  // Never over a draft that asks its own question or names another time.
+  assert.equal(appendReferenceAsk('Does 3 PM work?', 'Which works better, Sun at 2:00 PM or Mon at 2:00 PM?', ['other_time']), null);
+  assert.equal(appendReferenceAsk('I can do 3 PM.', 'Which works better, Sun at 2:00 PM or Mon at 2:00 PM?', ['missing_time:x']), null);
+  // A bridge draft that misses "the next step" is not saved by half a line:
+  // the patched text still fails the check, so the backup ships instead.
+  const { checkAgainstReference } = await import('../src/agentic/nepq-planner.js');
+  const bridge = 'Based on what you told me, this could work. The next step would be a free visit. Would that help?';
+  const half = appendReferenceAsk('Thanks.', bridge, ['missing:name "the next step"']);
+  assert.ok(checkAgainstReference(half, bridge).length > 0);
+});
+
+test('spouse and price plays read naturally worded drafts', async () => {
+  const { checkAgainstReference, LINES } = await import('../src/agentic/nepq-planner.js');
+  assert.deepEqual(checkAgainstReference('Makes sense. How does she feel about swapping out the old ones?', LINES.spouse_1), []);
+});
