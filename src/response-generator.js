@@ -3129,6 +3129,17 @@ export function applyConfFlowMergeKeys(text, confFlowContext) {
 // MAIN EXPORT (v2.7.8 — fetches upcoming appointments for cancel flow)
 // ═══════════════════════════════════════════════════════════════════
 
+/**
+ * True when this turn's NEPQ plan asks the lead for a day or time (an offer,
+ * the day ask, a confirm). The repeat-ask guard then treats the time as open
+ * (2026-10-03 replay: a typed "2 PM" that was not open closed the question,
+ * and three planned "which works better?" turns were refused and unsent). Pure.
+ */
+export function planAsksForTime(plan, mode) {
+  if (!plan || mode !== 'live') return false;
+  return ['offer_slots', 'ask_day', 'confirm'].includes(plan.required_move) || (plan.slots_to_offer || []).length > 0;
+}
+
 export async function generateResponse(contactId, channel, triggerMessage, opts = {}) {
   // 2026-09-16 — start the KB query embedding BEFORE the first await. It costs
   // ~770ms against a 1500ms per-tier budget when left to fire lazily inside
@@ -4086,7 +4097,11 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     // 2026-10-02 post-merge run: "My wife works then" made a new time the
     // right question, the guard called it a repeat twice, and the lead got
     // no reply. A decision-maker conflict reopens the time.
-    const timeReopened = parseDecisionMakers(triggerMessage) === 'conflict';
+    // 2026-10-03 replay (#1141 live): "book for 2 PM" closed preferred_time,
+    // 2 PM was not open, and every later turn's planned "which works better?"
+    // was refused as a repeat twice; three messages in a row got no reply.
+    // A time the plan is asking for is open, whatever the lead said before.
+    const timeReopened = parseDecisionMakers(triggerMessage) === 'conflict' || planAsksForTime(nepqPlan, nepqMode);
     const repeats = findRepeatedQuestions(validated.message, established).filter(k => !(timeReopened && /time|day|date/i.test(k)));
     if (repeats.length) {
       const answers = repeats.map(k => {
