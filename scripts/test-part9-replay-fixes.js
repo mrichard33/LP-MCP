@@ -55,6 +55,20 @@ test('a typed time we do not have: say so, offer the two openings nearest it', (
   assert.notEqual(cant.step === 'offer_slots' && /2 PM isn't open/.test(cant.fixed_line || ''), true);
 });
 
+// 2026-10-03 replay (#1141 live): the live chat loads the two slots nearest
+// the typed time, so "2 PM" WAS among them and read as a pick of an offer
+// that never named 2 PM.
+test('the typed time is checked against the times we offered, not the ones loaded near it', () => {
+  const conv = [
+    { direction: 'outbound', text: "Would it be easier to pick a time when you're both home? I have tomorrow at 6:00 PM ET or Sun, Oct 4 at 10:00 AM ET." },
+    { direction: 'inbound', text: 'Fine lets book for 2 PM.' },
+  ];
+  const nearTwo = [ALL[2], ALL[3]]; // Sun 10 AM and Sun 2 PM: one 2 PM among them
+  const plan = planNepqTurn({ channel: 'livechat', trigger: 'Fine lets book for 2 PM.', conversation: conv, slots: nearTwo, allSlots: ALL, tzLabel: 'ET', nowMs: NOW });
+  assert.equal(plan.required_move, 'offer_slots');
+  assert.equal(plan.fixed_line, 'Sure. For 2 PM, I have Sun, Oct 4 at 2:00 PM ET or Mon, Oct 5 at 2:00 PM ET. Which works better?');
+});
+
 test('a day and time they typed that is open is the pick, even when we offered others', () => {
   const conv = [
     { direction: 'outbound', text: 'I have tomorrow at 6:00 PM ET or Sun, Oct 4 at 10:00 AM ET. Which works better?' },
@@ -125,4 +139,27 @@ test('a detail instead of a pick goes back to the times; the third time asks the
   ];
   const p3 = planNepqTurn({ channel: 'sms', trigger: '12 Main St, Ocala FL 34470', conversation: three, slots: OFFERED, allSlots: ALL, tzLabel: 'ET', nowMs: NOW });
   assert.equal(p3.required_move, 'ask_day');
+});
+
+// 2026-10-03 replay (#1141 live): three SMS turns in a row got no reply
+// because a planned "which works better?" was refused as a repeat of the
+// already-"answered" time question.
+test('a turn whose plan asks for a time reopens the time question', async () => {
+  const { planAsksForTime } = await import('../src/response-generator.js');
+  assert.equal(planAsksForTime({ required_move: 'offer_slots' }, 'live'), true);
+  assert.equal(planAsksForTime({ required_move: 'ask_day' }, 'live'), true);
+  assert.equal(planAsksForTime({ required_move: 'probe', slots_to_offer: [] }, 'live'), false);
+  assert.equal(planAsksForTime({ required_move: 'offer_slots' }, 'shadow'), false);
+  assert.equal(planAsksForTime(null, 'live'), false);
+});
+
+test('a re-ask names the same two times we just offered', () => {
+  const conv = [
+    { direction: 'outbound', text: "Sure. For 2 PM, I have Sun, Oct 4 at 2:00 PM ET or Mon, Oct 5 at 2:00 PM ET. Which works better?" },
+    { direction: 'inbound', text: 'Mark' },
+  ];
+  const plan = planNepqTurn({ channel: 'sms', trigger: 'Mark', conversation: conv, slots: [ALL[2], ALL[3]], allSlots: ALL, tzLabel: 'ET', nowMs: NOW });
+  assert.equal(plan.required_move, 'offer_slots');
+  assert.match(plan.fixed_line, /Sun, Oct 4 at 2:00 PM ET or Mon, Oct 5 at 2:00 PM ET/);
+  assert.deepEqual(plan.slots_to_offer.map(s => s.day), ['Sun, Oct 4', 'Mon, Oct 5']);
 });

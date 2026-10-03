@@ -365,6 +365,8 @@ Mark: "I don't think we need any static messages sent by the bot. Each message s
   - A typed time that is none of the offered times gets the real openings nearest it, never a pick. With 2 PM open on other days the line is "For 2 PM, I have …". With no 2 PM at all it is "2 PM isn't open, but I have …". A typed day AND time that is open ("Sunday at 2 PM") is the pick. Both need the whole calendar (`allSlots`).
   - A short message that is only a day ("Usually on Wednesdays") gets two real times that day, whatever we asked last.
   - A detail sent instead of a pick goes back to the times. After three offers with no pick, the bot asks the day.
+  - A typed time is checked against the times OFFERED in the thread (`offeredInThread`), never against the two the live chat loads near it. A re-ask names the same two times we just offered.
+  - When the plan asks for a time, the repeat-ask guard treats the time as open (`planAsksForTime`). Before this, a typed "2 PM" that was not open closed the time question, and three planned re-asks were refused and never sent.
   - Hurricane and storm language is allowed (Mark, 2026-10-03: core to what we sell). Only the false urgency claims in `CLAIMS_RX` ("peak of hurricane season", "storm season has us slammed") are stripped.
   - `enforceCallTiming` rewrites only a call WE promise (`FROM_US_RX`): "What made you reach out today?" had become "…reach out tomorrow at 9 AM ET?".
   - A failed reference check logs the draft (`| draft="…"`), so the next slow turn can be read from the logs.

@@ -591,8 +591,14 @@ export function planNepqTurn({
   // booked. Say it is not open and offer the two real openings nearest it.
   // Only with the whole calendar in hand: two offerable times alone cannot
   // say a time is not open.
-  if (offerSlots.length && Array.isArray(allSlots) && allSlots.length >= 2 && !isLeadQuestion(now) && !PREF_WORD_RX.test(now) && !/\b(?:can'?t|cannot|not|won'?t|busy|except)\b/i.test(now) && typedClock(now) != null && !exactSlotFor(now, offerSlots)) {
-    const all = allSlots.map(s => ({ ...s, tz: s.tz || tzLabel || '' }));
+  // Checked against the times actually OFFERED in the thread, not the two
+  // the caller loaded near the typed time (2026-10-03 replay: the live chat
+  // loads slots near "2 PM", found a 2 PM among them, and took it as a pick
+  // of an offer that never named it).
+  const allPool = Array.isArray(allSlots) ? allSlots.map(s => ({ ...s, tz: s.tz || tzLabel || '' })) : [];
+  const offeredInThread = lastOfferOut ? allPool.filter(s => slotMentionIndex(lastOfferOut, s) >= 0) : offerSlots;
+  if (offerSlots.length && allPool.length >= 2 && !isLeadQuestion(now) && !PREF_WORD_RX.test(now) && !/\b(?:can'?t|cannot|not|won'?t|busy|except)\b/i.test(now) && typedClock(now) != null && !exactSlotFor(now, offeredInThread)) {
+    const all = allPool;
     // A day AND time they typed that is open ("Sunday at 2 PM") is the pick.
     const named = all.filter(s => slotMentionIndex(now, s) >= 0);
     if (named.length === 1) {
@@ -679,7 +685,12 @@ export function planNepqTurn({
     if (!isLeadQuestion(now) && !objType && offerSlots.length === 2) {
       const offersInARow = outbound.slice(-3).filter(t => SLOT_OFFER_RX.test(t.text || '')).length;
       if (offersInARow >= 3) return fixed('ask_day', vary(LINES.ask_day, ALT_LINES.ask_day), { step: 'ask_day', booking: { allowed: true, reason: 'nepq:ask_day' } });
-      return fixed('offer_slots', withSlots(vary(LINES.which(offerSlots), ALT_LINES.which(offerSlots))), { step: 'offer_slots' });
+      // The same two times we just offered, not a fresh pair (2026-10-03
+      // replay: "Sun 2 PM or Mon 2 PM", then "Sun 10 AM or Sun 2 PM").
+      const pair = offeredInThread.length >= 2 ? offeredInThread.slice(0, 2) : offerSlots;
+      const line = withSlots(vary(LINES.which(pair), ALT_LINES.which(pair)));
+      plan.slots_to_offer = pair;
+      return fixed('offer_slots', line, { step: 'offer_slots' });
     }
   }
   // "ok" / "sure" to "what day works best?": the two real times, not more questions.
