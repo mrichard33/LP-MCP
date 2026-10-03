@@ -257,3 +257,36 @@ test('a day preference with no calendar read asks the time of day, then uses bot
   assert.equal(first.day_preference_pending, true);
   assert.notEqual(first.required_move, 'ask_day');
 });
+
+// 2026-10-03 replay (#1146 live): the SMS gate read the name as missing after
+// a bare "Mark" and asked "Who should I put the visit under?" instead of booking.
+test('SMS booking reads a typed name from the thread', async () => {
+  const { smsBookingTurn, nameFromThread } = await import('../src/agentic/sms-booking-turn.js');
+  const thread = [
+    { direction: 'outbound', text: "Great, I'm holding Wed, Oct 7 at 10:00 AM ET for you. What's your first name?" },
+    { direction: 'inbound', text: 'Mark' },
+    { direction: 'outbound', text: "Thanks, Mark. What's the street address for the visit, including the zip code?" },
+    { direction: 'inbound', text: '12 Main St, Ocala FL 34470' },
+    { direction: 'outbound', text: 'Will anyone else be part of the decision?' },
+    { direction: 'inbound', text: 'Just me' },
+  ];
+  assert.equal(nameFromThread(thread), 'Mark');
+  const wed = { iso: '2026-10-07T10:00:00-04:00', day: 'Wed, Oct 7', time: '10:00 AM', dayOfWeek: 'Wednesday' };
+  const plan = { required_move: 'answer', step: 'collect', held_slot: { text: "Great, I'm holding Wed, Oct 7 at 10:00 AM ET for you." }, counters: {} };
+  const facts = smsBookingTurn({ plan, trigger: 'Just me', thread, slots: [wed], gateMissing: ['name'] });
+  assert.equal(facts.kind, 'book');
+  assert.match(facts.fallback, /, Mark\./);
+  // A bare word that was not an answer to our name ask is not a name.
+  assert.equal(nameFromThread([{ direction: 'outbound', text: 'Which works better?' }, { direction: 'inbound', text: 'Mark' }]), null);
+});
+
+test('an open offer makes the live chat load times before it plans', async () => {
+  const { wantsSlots } = await import('../src/live-chat/fast-lane.js');
+  const conv = [
+    { direction: 'outbound', text: "Sure. For 2 PM, I have tomorrow at 2:00 PM ET or Mon, Oct 5 at 2:00 PM ET. Which works better?" },
+    { direction: 'inbound', text: 'Mark' },
+  ];
+  const first = planNepqTurn({ channel: 'livechat', trigger: 'Mark', conversation: conv, nowMs: NOW });
+  assert.equal(first.offer_slots_pending, true);
+  assert.equal(wantsSlots(first), true);
+});
