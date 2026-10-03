@@ -325,7 +325,9 @@ problem, not its weight. Not earned at the old cap (2 chat / 3 SMS): keep discov
 matters, or the consequence question); two vague answers or `cap + 2` questions bridge anyway. The shortcuts are
 unchanged (Mark: "keep how we had"): quote/price (one question, then times), a schedule or come-out ask, a typed day
 and time, the objection plays. With no plan (planner error, coverage turn) a booking ask goes unless the thread already
-earned it (`bookingOpenInThread`).
+earned it (`bookingOpenInThread`). A probe or consequence turn always ends on a question: when the draft (or a guard)
+lost it, `enforceNepqPlan` appends a fresh one (`discoveryQuestion`, logged `discovery_question_added`), unless the reply
+carries a link, a confirmation or an allowed booking ask ("Oh my wife filled out some form" got "That makes sense.", 2026-10-03).
 
 **Book in the conversation, unconfirmed, on the right calendar (Mark, 2026-10-02).** Every bot booking is
 status `new` (the handler forces it). **Ask about decision makers ONCE, then book** (supersedes 2026-09-18):

@@ -134,3 +134,18 @@ test('SMS identity: a one-word reply to our name ask is the first name', () => {
   assert.equal(heuristicExtract(T(['outbound', 'Which works better?'], ['inbound', 'Tuesday'])).first_name, null);
   assert.equal(heuristicExtract(T(['outbound', "What's your first name?"], ['inbound', 'ok'])).first_name, null);
 });
+
+// 2026-10-03 replay after #1153: "Oh my wife filled out some form" got "That
+// makes sense." with no question on both bots.
+const { enforceNepqPlan, discoveryQuestion } = await import('../src/agentic/nepq-planner.js');
+test('a discovery turn always ends on a question, never one already sent', () => {
+  const conv = T(['inbound', 'Huh?'], ['outbound', 'Sorry for the mix-up, this is Reece Windows & Doors. What got you looking into new windows or doors recently?']);
+  const p = plan({ trigger: 'Oh my wife filled out some form a a while ago.', conversation: conv });
+  assert.equal(p.required_move, 'probe');
+  const out = enforceNepqPlan('That makes sense.', p);
+  assert.match(out.text, /^That makes sense\. .+\?$/);
+  assert.ok(out.changes.includes('discovery_question_added'));
+  // A draft that already asks is left alone.
+  assert.equal(enforceNepqPlan('That makes sense. What was she hoping to fix?', p).text, 'That makes sense. What was she hoping to fix?');
+  assert.notEqual(discoveryQuestion({ required_move: 'consequence', recent_outbound: ['What happens if you leave them as they are another season?'] }), 'What happens if you leave them as they are another season?');
+});
