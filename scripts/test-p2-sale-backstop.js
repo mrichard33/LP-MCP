@@ -57,15 +57,15 @@ test('plan: an open card, or a closed card for THIS job, means leave it alone', 
   }
 });
 
-test('plan: a repeat customer whose only card is an older job\'s gets a card made directly, never deal-won', () => {
+test('plan: a repeat customer whose only card is an older job\'s is listed, never written (GHL allows one P2 card per contact)', () => {
   const oldWon = [{ id: 'o', status: 'won', customFields: stamp('59380'), monetaryValue: 17645, createdAt: '2026-08-01T15:00:00Z' }];
   const job = { lp_job_id: '60124', job_status: 'Awaiting Paperwork', job_value: 9250, contractdate: '2026-10-02T00:00:00', payments: [] };
   const allJobs = [{ lp_job_id: '59380', job_status: 'Paid In Full', job_value: 17645, contractdate: '2026-08-01T00:00:00' }, job];
   assert.deepEqual(planForSale({ verdict: 'live', job, p2Opps: oldWon, contact: null, nowMs: NOW, allJobs }),
-    { action: 'create_open', reason: 'repeat_customer_new_job' });
+    { action: 'report', reason: 'repeat_customer_one_card_limit' });
   // Unstamped old card, made before this job was written: still not this job's.
   const unstamped = [{ id: 'o', status: 'won', createdAt: '2026-08-01T15:00:00Z' }];
-  assert.equal(planForSale({ verdict: 'live', job, p2Opps: unstamped, contact: null, nowMs: NOW, allJobs }).action, 'create_open');
+  assert.equal(planForSale({ verdict: 'live', job, p2Opps: unstamped, contact: null, nowMs: NOW, allJobs }).reason, 'repeat_customer_one_card_limit');
 });
 
 test('plan: a terminal job never gets a second card on a contact that already has one', () => {
@@ -219,7 +219,6 @@ function world() {
     jobsForContact: async (cid) => ({ jobs: jobs.filter((j) => j.ghl_contact_id === cid || (cid === 'c-lead' && j.lp_lead_id === 'L5')), leads: [], error: null }),
     applyGHLTag: async (cid, tag) => { ghlCalls.push({ method: 'TAG', path: cid, body: tag }); return true; },
     emitEvent: async (e) => { ghlCalls.push({ method: 'EVENT', path: e.event_subtype, body: e }); },
-    moveOpportunity: async (action) => { ghlCalls.push({ method: 'MOVE', path: action.target_id, body: action.action_payload }); return { action: 'created', opportunity_id: 'moved-opp' }; },
     postL6: async (args) => { ghlCalls.push({ method: 'L6', path: args.contactId, body: args }); return { action: 'posted_l6' }; },
     loadP2CreateContext: async () => ({ source: 'Internet, Modernize' }),
   };
@@ -263,7 +262,7 @@ test('find: a placeholder copy is never the job that decides', async () => {
   assert.deepEqual(sales, []);
 });
 
-test('find: a repeat customer with only a closed card is read live and gets a direct create', async () => {
+test('find: a repeat customer with only a closed card is read live and listed for a person', async () => {
   const { deps } = world();
   const newJob = { lp_job_id: '60124', lp_lead_id: 'L8', ghl_contact_id: 'c-repeat', job_status: 'Awaiting Paperwork',
     job_value: 9250, contractdate: '2026-10-02T00:00:00', payments: [] };
@@ -275,7 +274,7 @@ test('find: a repeat customer with only a closed card is read live and gets a di
     ? { opportunities: [{ id: 'old', status: 'won', monetaryValue: 17645, customFields: [{ id: 'sMZfcWAdoqh88pghLsNQ', fieldValueString: '59380' }] }] }
     : { contact: contact(['deal-won']) });
   const sales = await findSalesMissingP2({ ...deps, nowMs: NOW, logger: quiet });
-  assert.deepEqual(sales.map((x) => [x.contactId, x.plan.action, x.plan.reason]), [['c-repeat', 'create_open', 'repeat_customer_new_job']]);
+  assert.deepEqual(sales.map((x) => [x.contactId, x.plan.action, x.plan.reason]), [['c-repeat', 'report', 'repeat_customer_one_card_limit']]);
 });
 
 test('run: shadow decides and writes nothing to GHL', async () => {
@@ -284,7 +283,7 @@ test('run: shadow decides and writes nothing to GHL', async () => {
   assert.equal(r.ok, true);
   assert.equal(r.missing, 4);
   assert.equal(r.writes, 0);
-  const writes = ghlCalls.filter((c) => ['TAG', 'MOVE', 'POST', 'PUT', 'L6'].includes(c.method));
+  const writes = ghlCalls.filter((c) => ['TAG', 'POST', 'PUT', 'L6'].includes(c.method));
   assert.deepEqual(writes, []);
   // The no-price sale is still recorded for the morning digest.
   assert.ok(ghlCalls.some((c) => c.method === 'EVENT' && c.path === 'needs_review'));
@@ -297,10 +296,14 @@ test('run: live tags, creates directly, and closes a cancelled sale Lost with it
   assert.equal(r.writes, 3);
 
   assert.ok(ghlCalls.some((c) => c.method === 'TAG' && c.path === 'c-tag' && c.body === 'deal-won'));
-  assert.ok(!ghlCalls.some((c) => c.method === 'MOVE' && c.path === 'c-tag'), 'the tag path never also makes its own card');
-  assert.ok(ghlCalls.some((c) => c.method === 'MOVE' && c.path === 'c-lead' && c.body.pipeline === 'P2' && c.body.stage === 'Contract Signed'));
+  assert.ok(!ghlCalls.some((c) => c.method === 'POST' && c.body?.contactId === 'c-tag'), 'the tag path never also makes its own card');
+  // create_open is a plain POST, open, at Contract Signed, stamped with the job.
+  const open = ghlCalls.find((c) => c.method === 'POST' && c.body.contactId === 'c-lead');
+  assert.equal(open.body.status, 'open');
+  assert.equal(open.body.pipelineId, P2_PIPELINE_ID);
+  assert.ok(!ghlCalls.some((c) => c.method === 'PUT' && c.path !== '/opportunities/new-opp'), 'no other card is ever updated');
 
-  const post = ghlCalls.find((c) => c.method === 'POST');
+  const post = ghlCalls.find((c) => c.method === 'POST' && c.body.contactId === 'c-lost');
   assert.equal(post.body.contactId, 'c-lost');
   assert.equal(post.body.pipelineId, P2_PIPELINE_ID);
   assert.equal(post.body.status, 'lost');
@@ -313,16 +316,33 @@ test('run: live tags, creates directly, and closes a cancelled sale Lost with it
   const l6 = ghlCalls.find((c) => c.method === 'L6');
   assert.equal(l6.body.opportunityId, 'new-opp');
 
-  assert.ok(!ghlCalls.some((c) => ['TAG', 'MOVE', 'POST'].includes(c.method) && c.path === 'c-noprice'), 'no price → no write');
+  assert.ok(!ghlCalls.some((c) => ['TAG', 'POST'].includes(c.method) && (c.path === 'c-noprice' || c.body?.contactId === 'c-noprice')), 'no price → no write');
   const subtypes = ghlCalls.filter((c) => c.method === 'EVENT').map((c) => c.path).sort();
   assert.deepEqual(subtypes, ['created_lost', 'created_open', 'needs_review', 'tagged_deal_won']);
+});
+
+test('run: a GHL duplicate-card refusal on create_open fails the write and touches no other card', async () => {
+  // 2026-10-03: executeMoveOpportunity's duplicate recovery reopened four Won
+  // cards. The backstop's own create must leave a collision alone.
+  const { deps, ghlCalls } = world();
+  const inner = deps.ghlFetch;
+  deps.ghlFetch = async (method, path, body) => {
+    if (method === 'POST' && body?.contactId === 'c-lead') {
+      ghlCalls.push({ method, path, body });
+      throw new Error('GHL 400: {"message":"Can not create duplicate opportunity","meta":{"existingId":"old-won"}}');
+    }
+    return inner(method, path, body);
+  };
+  const r = await runSaleP2Backstop({ mode: 'live', deps, nowMs: NOW, logger: quiet });
+  assert.equal(r.failures, 1);
+  assert.ok(!ghlCalls.some((c) => c.method === 'PUT' && c.path.includes('old-won')), 'the collided card is never written');
 });
 
 test('run: the per-pass cap holds, and a failed write is a failed pass', async () => {
   const { deps, ghlCalls } = world();
   const r1 = await runSaleP2Backstop({ mode: 'live', deps, nowMs: NOW, logger: quiet, maxActions: 1 });
   assert.equal(r1.writes, 1);
-  assert.equal(ghlCalls.filter((c) => ['TAG', 'MOVE', 'POST'].includes(c.method)).length, 1);
+  assert.equal(ghlCalls.filter((c) => ['TAG', 'POST'].includes(c.method)).length, 1);
 
   const w = world();
   w.deps.applyGHLTag = async () => false;
@@ -336,7 +356,7 @@ test('run: onlyActions writes just the chosen kinds and leaves the rest listed',
   const r = await runSaleP2Backstop({ mode: 'live', deps, nowMs: NOW, logger: quiet, onlyActions: ['tag_deal_won'] });
   assert.equal(r.writes, 1);
   assert.ok(ghlCalls.some((c) => c.method === 'TAG' && c.path === 'c-tag'));
-  assert.ok(!ghlCalls.some((c) => ['MOVE', 'POST', 'PUT', 'L6'].includes(c.method)), 'create_open / create_lost were not selected');
+  assert.ok(!ghlCalls.some((c) => ['POST', 'PUT', 'L6'].includes(c.method)), 'create_open / create_lost were not selected');
 });
 
 test('run: a failed bulk read is { ok: false }, never a throw', async () => {
