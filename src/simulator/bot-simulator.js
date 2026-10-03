@@ -27,7 +27,7 @@
 
 import { createLiveChatFastLane, minimalContext } from '../live-chat/fast-lane.js';
 import { BOOKING_CALENDARS } from '../knowledge/booking-calendar-router.js';
-import { callbackDecision } from '../agentic/bot-callback.js';
+import { callbackDecision, NO_DIAL_REASONS } from '../agentic/bot-callback.js';
 
 export const SIM_CONTACT_PREFIX = 'sim-';
 
@@ -131,6 +131,8 @@ export async function simulateLiveChat(plan, { nepqMode = 'live', productionDeps
       // Part 14: every hand-off but service is a Five9 call + its card.
       if (a.reason === 'service' || a.kind === 'service') record('would_hand_off_to_service_channel', { reason: a.why || 'service' });
       else if (a.reason === 'callback_request' && a.hasPhone === false && !a.phone) record('would_ask_for_callback_number', { reason: a.why || 'planned' });
+      // Part 15: two no's and do-not-knock are reviewed by a person, never dialed.
+      else if (NO_DIAL_REASONS.has(a.reason)) record('would_post_review_card_no_five9', { reason: a.reason, extra: a.extra || null });
       else record('would_file_callback_five9_and_contact_center', { reason: `${a.reason}, ${a.why || 'planned'}` });
     },
   });
@@ -225,6 +227,7 @@ export async function simulateSms(plan, { nepqMode = 'live', generate, buildReal
       const service = cb.kind ? cb.kind === 'service' : !!generated?.service_conversation;
       wouldDo.push(service
         ? { kind: 'would_hand_off_to_service_channel', reason: cb.why }
+        : NO_DIAL_REASONS.has(cb.reason) ? { kind: 'would_post_review_card_no_five9', reason: cb.reason }
         : { kind: cb.card === false ? 'would_file_callback_five9' : 'would_file_callback_five9_and_contact_center', reason: `${cb.reason}, ${cb.why}` });
     }
     if (generated?.companion_action) wouldDo.push({ kind: `would_${generated.companion_action.action_type}`, payload: generated.companion_action.action_payload || null });

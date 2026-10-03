@@ -594,7 +594,10 @@ test('a known name and phone: the call promise goes out with no extra ask', asyn
   const { lane, state } = makeLane({ firstName: 'Mark', phone: '+19543792151', messages: LJLOA, llm: () => ({ message: 'Thanks for confirming the number. A team member will call you shortly to set up the in-home measurement.' }) });
   await lane.processInbound(INBOUND('Hello?'));
   assert.equal(state.llmCalls.length, 1);
-  assert.equal(state.sends[0].message, 'Thanks for confirming the number. A team member will call you shortly to set up the in-home measurement.');
+  // No extra ask. "shortly" is rewritten to the next opening outside team
+  // hours (enforceCallTiming, 2026-10-03), so the time words depend on the clock.
+  assert.match(state.sends[0].message, /^Thanks for confirming the number\. A team member will call you (?:shortly|.+ ET) to set up the in-home measurement\.$/);
+  assert.ok(!state.sends[0].message.includes('?'));
 });
 
 test('a phone typed in this message counts; only the name is asked', async () => {

@@ -20,8 +20,10 @@
  *   reply     everything else. The bot answers, and the handoff note below
  *             tells it what this moment calls for.
  *
- * Pure and dependency-free, unit-tested in scripts/test-handoff-policy.js.
+ * Pure, unit-tested in scripts/test-handoff-policy.js.
  */
+
+import { isKnockNotOptOut } from './do-not-knock.js';
 
 
 /** Intents that end the conversation. Everything else keeps the bot talking. */
@@ -44,6 +46,18 @@ export function handoffReplyPolicy(classification = {}) {
   // (bot-callback.js). The hdl:callback-* workflows bridged a GHL call from a
   // GHL number, so nothing here hands the reply to them any more.
   return 'reply';
+}
+
+/**
+ * A STOP that is really a door complaint (Mark, 2026-10-03): "Please stop
+ * knocking on my door" is answered with the do-not-knock flow, not silence.
+ * Only STOP is cleared, and only when the text names no texts, calls, email or
+ * contact (isKnockNotOptOut). Pure.
+ */
+export function classificationAfterKnock(classification, text) {
+  if (String(classification?.intent_class || '').toUpperCase() !== 'STOP') return classification;
+  if (!isKnockNotOptOut(text)) return classification;
+  return { ...classification, intent_class: 'UNCLEAR', ghl_handoff_tag: null, action_type: 'generate_response', reasoning: `knock_not_opt_out (was STOP): ${classification.reasoning || ''}`.slice(0, 300) };
 }
 
 const NOTES = {
