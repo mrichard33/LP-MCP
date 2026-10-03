@@ -198,9 +198,14 @@ export function planForSale({ verdict, job, p2Opps, contact, taggedAtMs = null, 
     if (verdict !== 'live' || p2CoversJob(p2Opps, job)) return { action: 'skip', reason: 'has_p2' };
     if (jobValue(job) === null) return { action: 'report', reason: 'no_price_yet' };
     if (looksLikeDuplicateOfPaidJob(job, allJobs, p2Opps)) return { action: 'report', reason: 'possible_duplicate_of_paid_job' };
-    // Never `deal-won` here: it is already on the contact (C.0-IN will not fire),
-    // and C.0-IN's own find-opportunity step could pick the OLD closed card.
-    return { action: 'create_open', reason: 'repeat_customer_new_job' };
+    // Listed for a person, never written (2026-10-03). This GHL account allows ONE
+    // P2 card per contact: the create came back "Can not create duplicate
+    // opportunity", and the duplicate recovery in executeMoveOpportunity then
+    // REOPENED the customer's old Won card (Nancy Bill, Michael Blackford, Jeffrey
+    // Gallager, Dianne Ferwerda: all four moved from Won / Referral & Expansion
+    // back to open / Contract Signed). `deal-won` is no answer either: it is
+    // already on the contact, and C.0-IN's find-opportunity step picks the old card.
+    return { action: 'report', reason: 'repeat_customer_one_card_limit' };
   }
 
   if (verdict === 'terminal_lost') {
@@ -321,19 +326,17 @@ async function liveContact({ ghlFetch, contactId }) {
 }
 
 async function defaultDeps() {
-  const [{ default: supabase }, { hlRunSQL, esc }, { ghlFetch }, { applyGHLTag }, { emitEvent }, opps, l6, p2ctx] = await Promise.all([
+  const [{ default: supabase }, { hlRunSQL, esc }, { ghlFetch }, { applyGHLTag }, { emitEvent }, l6, p2ctx] = await Promise.all([
     import('./supabase.js'),
     import('./admin/hl-client.js'),
     import('./actions/helpers.js'),
     import('./ghl.js'),
     import('./event-emitter.js'),
-    import('./actions/handlers/opportunities.js'),
     import('./loss-routing/l6.js'),
     import('./p2-opportunity-context.js'),
   ]);
   return {
     supabase, hlRunSQL, esc, ghlFetch, applyGHLTag, emitEvent,
-    moveOpportunity: opps.executeMoveOpportunity,
     postL6: l6.maybePostL6,
     loadP2CreateContext: p2ctx.loadP2CreateContext,
     jobsForContact: (await import('./lp-job-value.js')).jobsForContact,
@@ -410,7 +413,7 @@ export async function findSalesMissingP2(deps) {
 
 // ─── Writes ──────────────────────────────────────────────────────
 
-async function createClosed({ deps, sale, status }) {
+async function createCard({ deps, sale, status }) {
   const { ghlFetch, loadP2CreateContext } = deps;
   const ctx = await loadP2CreateContext(sale.contactId, { eventJobId: sale.job.lp_job_id });
   const contact = await liveContact({ ghlFetch, contactId: sale.contactId });
@@ -442,25 +445,22 @@ async function act(sale, deps, { runId }) {
       return { ok: true };
     }
     case 'create_open': {
-      const res = await deps.moveOpportunity({
-        id: null,
-        target_id: sale.contactId,
-        rule_applied: RULE_KEY,
-        action_payload: { pipeline: 'P2', stage: CONTRACT_SIGNED_STAGE },
-      });
-      const action = String(res?.action || '');
-      if (!['created', 'updated', 'updated_existing_on_duplicate'].includes(action)) return { ok: false, error: `move_opportunity: ${action || 'no result'}` };
-      await emit(deps, sale, 'created_open', { opportunity_id: res.opportunity_id || null, result: action });
-      return { ok: true, opportunityId: res.opportunity_id || null };
+      // A plain create, never executeMoveOpportunity (2026-10-03): its
+      // duplicate-opportunity recovery PUTs onto whatever card GHL collided
+      // with, which reopened four Won cards. Here a collision is a failed write
+      // that touches nothing.
+      const { opportunityId } = await createCard({ deps, sale, status: 'open' });
+      await emit(deps, sale, 'created_open', { opportunity_id: opportunityId });
+      return { ok: true, opportunityId };
     }
     case 'create_won': {
-      const { opportunityId } = await createClosed({ deps, sale, status: 'won' });
+      const { opportunityId } = await createCard({ deps, sale, status: 'won' });
       await emit(deps, sale, 'created_won', { opportunity_id: opportunityId });
       return { ok: true, opportunityId };
     }
     case 'create_lost': {
       const lostReasonId = lostReasonIdForJobStatus(sale.job.job_status);
-      const { opportunityId, contact } = await createClosed({ deps, sale, status: 'lost' });
+      const { opportunityId, contact } = await createCard({ deps, sale, status: 'lost' });
       // GHL's create does not take a lost reason; set it on the card we just made.
       await deps.ghlFetch('PUT', `/opportunities/${opportunityId}`, { status: 'lost', lostReasonId });
       // Same as every other P2 loss (src/actions/index.js): it must reach L.6.

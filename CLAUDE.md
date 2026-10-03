@@ -209,12 +209,14 @@ LP job with a contract in the last 45 days. If the contact has no P2 card in ANY
 after a 30-minute grace:
 - a live sale gets `deal-won`, so C.0-IN does the rest;
 - a sale that already has `deal-won`, or a do-not-contact sale, gets the card directly through
-  `executeMoveOpportunity`;
+  a plain create (never `executeMoveOpportunity`: its duplicate recovery PUTs onto whatever card GHL collided with);
 - a cancelled or credit-declined sale is created Lost and goes to L.6;
 - a sale with no price yet is named once in the 08:00 digest.
 - **a repeat customer counts too (2026-10-03):** a card "covers" a job only if it is open, stamped with that LP Job ID,
-  or unstamped and made on/after the contract (`p2CoversJob`). A live job whose only cards are an older job's gets its
-  own card directly (never `deal-won`, which C.0-IN would apply to the old card). A no-payment job that a paid job
+  or unstamped and made on/after the contract (`p2CoversJob`). A live job whose only cards are an older job's is
+  LISTED in the digest (`repeat_customer_one_card_limit`), never written: this GHL account allows one P2 card per contact,
+  and on 2026-10-03 the "duplicate" recovery reopened four Won cards. Never `deal-won` either (C.0-IN would pick the
+  old card). A no-payment job that a paid job
   replaced (written later, or within 10% in value within 60 days) is listed for review, never added
   (`looksLikeDuplicateOfPaidJob`). A terminal job on a contact that already has a card never gets a second one.
 

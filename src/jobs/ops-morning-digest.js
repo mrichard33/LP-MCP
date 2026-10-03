@@ -157,6 +157,7 @@ async function p2BackstopSection(deps, nowMs) {
       const REVIEW_TEXT = {
         no_price_yet: ['LP job has no price yet', 'price the job in LP'],
         possible_duplicate_of_paid_job: ['looks like an old quote a paid job replaced', 'close it in LP if it is dead'],
+        repeat_customer_one_card_limit: ['repeat customer: GHL allows one P2 card per person and the old one is closed', 'decide by hand; do not reopen the old card'],
       };
       const text = (r) => REVIEW_TEXT[r] || [r || 'needs a look', 'check the job in LP'];
       lines.push(...capLines(fresh.map((i) => {

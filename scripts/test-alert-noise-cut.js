@@ -225,6 +225,8 @@ test('digest: Sale → P2 backstop fixes are counted; a no-price sale is named o
         payload: { job_id: '59882', job_status: 'Awaiting Paperwork', reason: 'no_price_yet' } },
       { event_type: 'p2.sale_backstop', event_subtype: 'needs_review', ghl_contact_id: 's4', created_at: iso(NOW - 4 * HOUR),
         payload: { job_id: '58338', job_status: 'Awaiting Paperwork', reason: 'possible_duplicate_of_paid_job' } },
+      { event_type: 'p2.sale_backstop', event_subtype: 'needs_review', ghl_contact_id: 's5', created_at: iso(NOW - 4 * HOUR),
+        payload: { job_id: '60074', job_status: 'RTP Await recission', reason: 'repeat_customer_one_card_limit' } },
       { event_type: 'p2.sale_backstop', event_subtype: 'tagged_deal_won', ghl_contact_id: 'old', created_at: iso(NOW - 30 * HOUR), payload: {} },
     ],
   };
@@ -236,6 +238,7 @@ test('digest: Sale → P2 backstop fixes are counted; a no-price sale is named o
   assert.match(t, /card created as Lost: 1 — Cara Cancel/);
   assert.match(t, /Nora Noprice \(s3\) · LP job 59882 "Awaiting Paperwork" · LP job has no price yet — not in P2 · price the job in LP/);
   assert.match(t, /\(s4\) · LP job 58338 "Awaiting Paperwork" · looks like an old quote a paid job replaced — not in P2 · close it in LP if it is dead/);
+  assert.match(t, /\(s5\) · LP job 60074 "RTP Await recission" · repeat customer: GHL allows one P2 card per person and the old one is closed — not in P2 · decide by hand; do not reopen the old card/);
   assert.ok(db.tables.audit_posted_items.some((r) => r.audit === 'p2_sale_backstop' && r.contact_id === 's3'));
 
   // Next morning: the no-price sale is not named again; with no new fixes, All clear.
