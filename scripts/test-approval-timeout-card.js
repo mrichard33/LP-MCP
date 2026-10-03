@@ -77,14 +77,24 @@ const DEPS = {
 
 // ─── describeTimeoutOutcome ──────────────────────────────────────
 
+// 2026-10-03: closing an opportunity WON/LOST no longer auto-runs (it is the
+// #486315 incident itself), so the auto-run wording is exercised with an action
+// that still does: adding an ordinary tag.
+const AUTO_SAFE = { id: 7, action_type: 'add_tag', action_payload: { tags: ['nurture:s2'] }, confidence: 1 };
+
 test('an action the sweep will auto-run says so, with the minutes left', () => {
-  const out = describeTimeoutOutcome([{ ...ACTION_486315, created_at: minsAgo(34) }], NOW);
+  const out = describeTimeoutOutcome([{ ...AUTO_SAFE, created_at: minsAgo(34) }], NOW);
   assert.equal(out, 'If nobody decides: it runs AUTOMATICALLY at the 60-minute mark (in about 26 min). Reject now to stop it.');
 });
 
 test('past the 60-minute mark it says the next check, never a negative count', () => {
-  const out = describeTimeoutOutcome([{ ...ACTION_486315, created_at: minsAgo(75) }], NOW);
+  const out = describeTimeoutOutcome([{ ...AUTO_SAFE, created_at: minsAgo(75) }], NOW);
   assert.match(out, /runs AUTOMATICALLY on the next check/);
+});
+
+test('#486315 (mark WON) now waits for a person instead of auto-running', () => {
+  const out = describeTimeoutOutcome([{ ...ACTION_486315, created_at: minsAgo(34) }], NOW);
+  assert.equal(out, 'If nobody decides: nothing happens — it keeps waiting for you.');
 });
 
 test('a pending reply is dropped at 4 hours', () => {
@@ -114,7 +124,8 @@ test('the reminder is the plain-English card, with a timeout header and outcome 
   assert.match(card, /^If you approve: Stacey's Pipeline 2 opportunity is marked WON \(\$116,000\)\.$/m);
   assert.match(card, /^If you reject: /m);
   assert.match(card, /^Contact: Stacey Wheeler · \(561\) 373-9673 · Rep: Michael Carr · Branch: Fort Myers · Source: Internet$/m);
-  assert.match(card, /^If nobody decides: it runs AUTOMATICALLY/m);
+  // A WON close never auto-runs since 2026-10-03, and the card says so.
+  assert.match(card, /^If nobody decides: nothing happens/m);
   // Old reminder content must be gone: the raw contact id, the bare action
   // type, and the rule code anywhere but the ref line.
   assert.ok(!card.includes('KHI08xNpaUax4wOmzFEE'));

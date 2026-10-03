@@ -1,3 +1,5 @@
+import { timingSafeEqual } from 'node:crypto';
+
 /**
  * auth — the standard operator bearer-token middleware.
  *
@@ -13,12 +15,25 @@
  * @param {{ token?: string|null, softLaunch?: boolean, log?: (msg: string) => void }} opts
  * @returns {(req, res, next) => void}
  */
+/**
+ * Constant-time string compare (2026-10-03, security review). A plain `===`
+ * returns as soon as one character differs, which leaks how much of a guess
+ * was right through response timing. Different lengths are simply unequal.
+ */
+export function safeEqual(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  const ab = Buffer.from(a);
+  const bb = Buffer.from(b);
+  if (ab.length !== bb.length) return false;
+  return timingSafeEqual(ab, bb);
+}
+
 export function makeAuthenticate({ token = null, softLaunch = false, log = (m) => console.warn(m) } = {}) {
   return function authenticate(req, res, next) {
     if (!token) return next();
 
     const authHeader = req.headers.authorization;
-    if (authHeader === `Bearer ${token}`) return next();
+    if (safeEqual(authHeader, `Bearer ${token}`)) return next();
 
     if (softLaunch) {
       log(`[Auth] SOFT_LAUNCH: unauthenticated ${req.method} ${req.path} from ${req.ip} ua="${req.headers['user-agent'] || 'none'}" — would reject in enforce mode`);

@@ -713,7 +713,7 @@ registerLpAddressBackfillRoutes(app);
 registerFallthroughSweepRoutes(app);
 
 // ─── GroupMe Two-Way Integration ─────────────────────────────────
-registerGroupMeRoutes(app);
+registerGroupMeRoutes(app, authenticate);
 registerSlackApprovalRoutes(app);
 // 2026-09-28 — Consent Model v1: n8n's OPS.DNC-LIFT posts Slack decisions here.
 // Own fail-closed header secret (DNC_LIFT_WEBHOOK_SECRET), not the MCP token.

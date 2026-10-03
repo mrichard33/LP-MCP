@@ -309,7 +309,9 @@ test('renderApprovalCard: live #486315 through the loader, GroupMe keeps its rep
     [ACTION_486315], 'Stacey Wheeler', '+15613739673', ENRICHMENT_486315, deps,
   );
   assert.equal(slackCardText, EXPECTED_486315);
-  assert.equal(groupmeText, `${EXPECTED_486315}\n\nReply: Yes 486315  •  No 486315  •  Edit 486315 <describe change>`);
+  // 2026-10-03: GroupMe replies no longer decide (unsigned webhook), so the
+  // footer points to Slack instead of advertising Yes / No / Edit.
+  assert.equal(groupmeText, `${EXPECTED_486315}\n\nApprove or reject in Slack (approval #486315). GroupMe replies no longer decide.`);
 });
 
 test('a failed rule read still produces a card — it falls back, never throws', async () => {

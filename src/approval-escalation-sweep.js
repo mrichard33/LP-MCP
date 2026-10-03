@@ -44,6 +44,7 @@ import { buildApprovalCardText, stripRulePrefix } from './approval-card.js';
 import { loadApprovalCardContext } from './approval-card-context.js';
 import { resolveContactInfo, getEventContext } from './actions/resolvers.js';
 import { buildNotificationEnrichment } from './actions/enrichment.js';
+import { PROTECTED_TAGS } from './tag-hygiene/rules.js';
 
 // ═══════════════════════════════════════════════════════════════════
 // CONSTANTS
@@ -114,11 +115,38 @@ async function postGroupMe(text) {
  * Same gates as the Phase 2 loop below — kept in one place so the reminder
  * card cannot promise an auto-run the sweep will not actually do.
  */
-function isAutoExecutable(action) {
+export function isAutoExecutable(action) {
   if (!SAFE_ACTION_TYPES.has(action.action_type)) return false;
   if ((action.confidence || 0) < MIN_CONFIDENCE_FOR_AUTO_EXECUTE) return false;
   if (action.action_type === 'send_notification' && action.target_system !== 'groupme') return false;
+  if (needsAHuman(action)) return false;
   return true;
+}
+
+// 2026-10-03 (security review): two kinds of "safe" action must never run just
+// because nobody answered in 60 minutes.
+//   - Removing a DNC / suppression tag re-opens contact with someone who asked
+//     not to be contacted (TCPA). PROTECTED_TAGS is the tag sweep's own list.
+//   - Closing an opportunity won/lost. #486315 (a $116,000 WON update) auto-ran
+//     this way on 2026-09-22.
+const OPEN_STATUSES = new Set(['', 'open']);
+function isProtectedTag(tag) {
+  const t = String(tag || '').trim().toLowerCase();
+  return PROTECTED_TAGS.includes(t) || t.startsWith('dnc') || t.startsWith('suppress:') || t.startsWith('suppress-');
+}
+function needsAHuman(action) {
+  const p = action.action_payload || {};
+  if (action.action_type === 'remove_tag') {
+    const tags = Array.isArray(p.tags) ? p.tags : (p.tag ? [p.tag] : []);
+    return tags.some(isProtectedTag);
+  }
+  if (action.action_type === 'update_opportunity' || action.action_type === 'move_opportunity') {
+    const status = String(p.status || '').trim().toLowerCase();
+    if (!OPEN_STATUSES.has(status)) return true;
+    if (p.lostReasonId) return true;
+    if (/\b(won|lost|abandon)/i.test(String(p.stage || ''))) return true;
+  }
+  return false;
 }
 
 /**
