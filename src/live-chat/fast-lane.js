@@ -413,6 +413,7 @@ export function wantsSlots(plan) {
   if (plan.objection?.type === 'think') return true;
   // "Usually Wednesdays": two real times that day (day-preference.js).
   if (plan.day_preference_pending) return true;
+  if (plan.offer_slots_pending) return true;
   if (plan.objection?.type === 'spouse' && plan.objection.attempt >= 2) return true;
   return plan.step === 'offer_slots' || plan.step === 'confirm' || plan.step === 'collect'
     // A yes to the bridge plans a day ask only for want of times (2026-10-02).

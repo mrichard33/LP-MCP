@@ -3862,7 +3862,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       if (bookingFacts) {
         nepqPlan.booking_facts = {
           kind: bookingFacts.kind, label: bookingFacts.label, ask: bookingFacts.ask, ask_line: bookingFacts.ask_line,
-          first_name: firstName,
+          first_name: firstName || bookingFacts.thread_name || null,
           alternatives_text: bookingFacts.alternatives.length === 2 ? bookingFacts.alternatives.map(x => `${x.day} at ${x.time} ${x.tz || tzl}`.trim()).join(' or ') : null,
         };
         console.log(`[NEPQ] ${contactId} SMS booking facts: ${JSON.stringify(bookingFacts.record)}`);

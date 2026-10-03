@@ -25,7 +25,7 @@
 import { offeredSlots, pickSlot, slotMentionIndex } from '../live-chat/cancel-flow.js';
 import {
   COLLECT_ASK, COLLECT_ASK_AGAIN, holdLine, dmAsk, parseDecisionMakers, mentionedPartner,
-  addressConfirmAsk, addressConfirmState, dmAnswerFromThread, slotLabel,
+  addressConfirmAsk, addressConfirmState, dmAnswerFromThread, slotLabel, nameFromReply,
 } from './booking-collect.js';
 import { LINES, pickFresh } from './nepq-planner.js';
 import { asksIn, enforceOneAsk } from './one-ask.js';
@@ -68,7 +68,7 @@ export function smsBookingTurn({ plan, trigger, thread = [], slots = [], tz = 'E
   const slot = { ...pinned, tz: pinned.tz || tz };
   const recentOut = thread.filter(m => m.direction === 'outbound').slice(-8).map(m => m.text);
   const inboundTexts = thread.filter(m => m.direction !== 'outbound').map(m => m.text);
-  const base = { slot, label: slotLabel(slot, tz), alternatives: [], companion: null };
+  const base = { slot, label: slotLabel(slot, tz), alternatives: [], companion: null, thread_name: nameFromThread(thread) };
 
   // "My wife works then": two other real times, never a booking for one person.
   if (isCollect && parseDecisionMakers(trigger) === 'conflict') {
@@ -83,6 +83,11 @@ export function smsBookingTurn({ plan, trigger, thread = [], slots = [], tz = 'E
   const dmAnswer = dmAnswerFromThread(thread);
   const partner = mentionedPartner(inboundTexts);
   const keys = new Set((gateMissing || []).map(askKey).filter(Boolean));
+  // A name typed in this thread counts, like the live chat's collect: a bare
+  // "Mark" answering our "first name?" (2026-10-03 replay: the gate still read
+  // the name as missing and asked "Who should I put the visit under?").
+  const threadName = nameFromThread(thread);
+  if (threadName) keys.delete('name');
   if (dmAnswer && dmAnswer !== 'conflict') keys.delete('dm');
   // A spouse named in this text thread is asked about once, whatever an old record says.
   if (partner && !dmAnswer) keys.add('dm');
@@ -103,7 +108,7 @@ export function smsBookingTurn({ plan, trigger, thread = [], slots = [], tz = 'E
   return {
     ...base,
     kind: 'book', ask: null, ask_line: null, book: true,
-    fallback: LINES.confirm(pinned, tz, firstName),
+    fallback: LINES.confirm(pinned, tz, firstName || threadName),
     companion: {
       action_type: 'book_appointment',
       action_payload: {
@@ -117,6 +122,20 @@ export function smsBookingTurn({ plan, trigger, thread = [], slots = [], tz = 'E
     },
     record: { sms_booking: 'book', slot: pinned.iso },
   };
+}
+
+const NAME_ASK_RX = /\b(?:first|full|your)\s+name\b|\bwho\s+should\s+i\s+put\b/i;
+/** The name the lead typed in this thread, or null. Pure. */
+export function nameFromThread(thread = []) {
+  let found = null;
+  for (let i = 0; i < thread.length; i++) {
+    const m = thread[i];
+    if (m?.direction === 'outbound') continue;
+    const prev = thread.slice(0, i).reverse().find(x => x?.direction === 'outbound');
+    const got = nameFromReply(m?.text, { asked: !!prev && NAME_ASK_RX.test(prev.text || '') && /\?/.test(prev.text || '') });
+    if (got) found = got;
+  }
+  return found;
 }
 
 // ── after the model ──────────────────────────────────────────────────────
