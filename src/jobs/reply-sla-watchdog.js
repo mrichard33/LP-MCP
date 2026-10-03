@@ -31,13 +31,20 @@
  *
  * Idempotent per source event (idempotency_key reply_sla_<event id>), so
  * flipping shadow → live never re-flags replies already recorded.
+ *
+ * 2026-10-03 (Mark: "the bot needs to always respond"). A text the bot dropped
+ * by mistake ("Well we have hurricane shutters now.", burst-yield.js) waited
+ * the full 10 minutes for this backstop. The SLA is now 3 minutes. A reply
+ * that is still being written (a send_message row pending/approved/executing,
+ * younger than the send path's own budget) is `in_flight`, not unanswered,
+ * so a slow 60–100s reply is waited for and never answered twice.
  */
 
 import supabase from '../supabase.js';
 import { emitEvent } from '../event-emitter.js';
 
 const MODE = String(process.env.REPLY_SLA_WATCHDOG_MODE || 'shadow').toLowerCase();
-const SLA_MINUTES = Math.max(1, parseInt(process.env.REPLY_SLA_MINUTES || '10', 10));
+const SLA_MINUTES = Math.max(1, parseInt(process.env.REPLY_SLA_MINUTES || '3', 10));
 const LOOKBACK_HOURS = Math.max(1, parseInt(process.env.REPLY_SLA_LOOKBACK_HOURS || '24', 10));
 
 // Mirrors guardrail #8 (always-respond policy): a direct reply is blocked ONLY
@@ -53,10 +60,11 @@ function normTags(tags) {
 /**
  * Pure classifier. `tags` = null means the snapshot was unreadable.
  */
-export function classifyReply({ actionTaken, tags, hasCompletedSend }) {
+export function classifyReply({ actionTaken, tags, hasCompletedSend, hasInFlightSend = false }) {
   const at = typeof actionTaken === 'string' ? actionTaken : '';
   if (at.startsWith('bot_silenced:') || at.startsWith('skipped:')) return 'silenced';
   if (hasCompletedSend) return 'answered';
+  if (hasInFlightSend) return 'in_flight';
   const t = normTags(tags);
   if (t === null) return 'unknown';
   if (!t.includes('agentic-active')) return 'not_agentic';
@@ -82,17 +90,42 @@ async function readTags(db, contactId) {
   }
 }
 
-async function hasCompletedSendSince(db, contactId, sinceIso) {
+const IN_FLIGHT_STATUSES = new Set(['pending', 'approved', 'executing']);
+
+/**
+ * Pure: from the contact's send_message rows since the reply, was it answered,
+ * or is a reply still being written? A row older than `inFlightMs` is stuck,
+ * not in flight (the reaper owns it), so it no longer holds the backstop off.
+ */
+export function sendStateFromRows(rows, { now, inFlightMs }) {
+  const list = Array.isArray(rows) ? rows : [];
+  const hasCompletedSend = list.some((r) => r?.status === 'completed');
+  const hasInFlightSend = !hasCompletedSend && list.some((r) => IN_FLIGHT_STATUSES.has(r?.status)
+    && Number.isFinite(Date.parse(r?.created_at)) && (now - Date.parse(r.created_at)) < inFlightMs);
+  return { hasCompletedSend, hasInFlightSend };
+}
+
+async function sendRowsSince(db, contactId, sinceIso) {
   const { data, error } = await db
     .from('agent_actions')
-    .select('id')
+    .select('id, status, created_at')
     .eq('target_id', contactId)
     .eq('action_type', 'send_message')
-    .eq('status', 'completed')
     .gte('created_at', sinceIso)
-    .limit(1);
+    .order('created_at', { ascending: false })
+    .limit(10);
   if (error) throw new Error(`agent_actions read failed: ${error.message}`);
-  return Array.isArray(data) && data.length > 0;
+  return Array.isArray(data) ? data : [];
+}
+
+// The send path's own ceiling (the executor's send_message watchdog derives
+// from the same budget). Loaded lazily: only a pass that finds an unfinished
+// row needs it, and the module is heavy.
+async function defaultInFlightMs() {
+  const fromEnv = parseInt(process.env.REPLY_SLA_IN_FLIGHT_MS || '', 10);
+  if (Number.isFinite(fromEnv) && fromEnv > 0) return fromEnv;
+  const { sendMessageBudgetMs } = await import('../send-message-handler.js');
+  return Math.max(120_000, sendMessageBudgetMs());
 }
 
 /**
@@ -128,22 +161,25 @@ export async function runReplySlaWatchdog(deps = {}) {
     return { error: err.message };
   }
 
-  const counts = { scanned: replies.length, answered: 0, silenced: 0, not_agentic: 0, consent_blocked: 0, unknown: 0, unanswered: 0, emitted: 0 };
+  const counts = { scanned: replies.length, answered: 0, in_flight: 0, silenced: 0, not_agentic: 0, consent_blocked: 0, unknown: 0, unanswered: 0, emitted: 0 };
+  let inFlightMs = deps.inFlightMs || null;
   const flagged = [];
 
   for (const r of replies) {
     const contactId = r.ghl_contact_id || null;
     if (!contactId) { counts.unknown++; continue; }
-    let hasSend = false;
+    let state;
     try {
-      hasSend = await hasCompletedSendSince(db, contactId, r.created_at);
+      const rows = await sendRowsSince(db, contactId, r.created_at);
+      if (!inFlightMs && rows.some((x) => IN_FLIGHT_STATUSES.has(x?.status))) inFlightMs = await defaultInFlightMs();
+      state = sendStateFromRows(rows, { now, inFlightMs: inFlightMs || 0 });
     } catch (err) {
       console.warn(`[ReplySLA] send read failed for ${contactId}: ${err.message}`);
       counts.unknown++;
       continue;
     }
-    const tags = hasSend ? [] : await readTags(db, contactId);
-    const cls = classifyReply({ actionTaken: r.action_taken, tags, hasCompletedSend: hasSend });
+    const tags = (state.hasCompletedSend || state.hasInFlightSend) ? [] : await readTags(db, contactId);
+    const cls = classifyReply({ actionTaken: r.action_taken, tags, ...state });
     counts[cls]++;
     if (cls !== 'unanswered') continue;
 
@@ -190,7 +226,7 @@ export async function runReplySlaWatchdog(deps = {}) {
       flagged.map((f) => `${f.contact_id} (evt ${f.event_id}, ${f.age_min}m)`).join('; ')
     );
   } else {
-    console.log(`[ReplySLA] ${mode}: ${counts.scanned} scanned, 0 unanswered (answered=${counts.answered}, silenced=${counts.silenced}, not_agentic=${counts.not_agentic}, consent=${counts.consent_blocked}, unknown=${counts.unknown})`);
+    console.log(`[ReplySLA] ${mode}: ${counts.scanned} scanned, 0 unanswered (answered=${counts.answered}, in_flight=${counts.in_flight}, silenced=${counts.silenced}, not_agentic=${counts.not_agentic}, consent=${counts.consent_blocked}, unknown=${counts.unknown})`);
   }
   return { mode, sla_minutes: SLA_MINUTES, ...counts, flagged };
 }

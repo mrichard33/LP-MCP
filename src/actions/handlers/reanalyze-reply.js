@@ -26,6 +26,7 @@
 
 import supabase from '../../supabase.js';
 import { analyzeMessage } from '../../message-analyzer.js';
+import { inboundFromReplyEvent } from '../../agentic/burst-yield.js';
 
 export async function executeReanalyzeReply(action, context = {}, deps = {}) {
   const db = deps.supabase || supabase;
@@ -47,7 +48,7 @@ export async function executeReanalyzeReply(action, context = {}, deps = {}) {
   // exactly what the person sent.
   const { data: evt, error } = await db
     .from('system_events')
-    .select('id, event_type, ghl_contact_id, payload')
+    .select('id, event_type, ghl_contact_id, created_at, payload')
     .eq('id', sourceEventId)
     .maybeSingle();
   if (error) throw new Error(`reanalyze_reply could not read event ${sourceEventId}: ${error.message}`);
@@ -68,6 +69,9 @@ export async function executeReanalyzeReply(action, context = {}, deps = {}) {
     evt.id,
     evt.payload?.channel || null,
     evt.payload?.message_id || null,
+    // 2026-10-03: the batch boundary the send-time burst yield reads
+    // (burst-yield.js), so the recovered reply is never dropped for an older message.
+    inboundFromReplyEvent(evt),
   );
 
   // analyzeMessage returns null on a genuine failure or a rate limit. That is
