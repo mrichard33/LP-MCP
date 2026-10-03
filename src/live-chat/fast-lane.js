@@ -55,7 +55,8 @@ import { enforceCallTiming, promisedCallback } from '../agentic/team-hours.js';
 import { rewriteBookingClaims } from '../agentic/booking-claim.js';
 import { enforceOneAsk } from '../agentic/one-ask.js';
 import { looksLikeShortPhone } from '../agentic/contact-typos.js';
-import { planNepqTurn, enforceNepqPlan, referenceRetryNote, nepqBackboneMode, pickFresh, LINES as NEPQ_LINES } from '../agentic/nepq-planner.js';
+import { planNepqTurn, enforceNepqPlan, referenceRetryNote, nepqBackboneMode, pickFresh, LINES as NEPQ_LINES, isServiceCallback } from '../agentic/nepq-planner.js';
+import { isCustomerP2 } from '../agentic/lead-state/signals/context-reader.js';
 import { COLLECT_ASK, COLLECT_ASK_AGAIN, dmAsk, holdLine, missingItems, parseDecisionMakers, heldSlot, nameFromReply, addressConfirmAsk, addressConfirmState, mentionedPartner, dmAnswerFromThread, slotLabel } from '../agentic/booking-collect.js';
 import { enforceBookingFacts, bookingFactsNote } from '../agentic/sms-booking-turn.js';
 import { contactRecheckLine } from '../agentic/contact-check.js';
@@ -963,6 +964,8 @@ export function createLiveChatFastLane(deps) {
         channel: 'livechat', trigger: body, conversation: context.conversation_recent, firstName: realFirst,
         hasAppointment: context.lp?.appointment_set === true && context.lp?.appointment_is_past !== true,
         nextStepLabel: 'a free visit at your home', discipline, nowMs: d.now(),
+        // A customer's call request goes to service (Mark, 2026-10-03).
+        isCustomer: isCustomerP2(context),
       };
       nepqPlan = planNepqTurn(planInput);
       if (!saPlan.active && wantsSlots(nepqPlan)) {
@@ -1228,7 +1231,9 @@ export function createLiveChatFastLane(deps) {
       const backed = !planOverride && !nepqPlan?.handoff && promisedCallback(draft);
       if (phoneArrived || backed) {
         d.log(`[LiveChat] ${phoneArrived ? 'callback_phone_arrived' : 'call_promise_backed'} ${contactId}`);
-        Promise.resolve(d.nepqHandoff({ contactId, reason: 'callback_request', inbound: body, firstName: leadFirstName, hasPhone: hasPhoneOnRecord, phone: typedPhone || null, why: phoneArrived ? 'phone_arrived' : 'promise_backed' }))
+        // A service conversation goes to the service channel, never Five9 (Mark, 2026-10-03).
+        const kind = isServiceCallback({ conversation: context.conversation_recent || [], trigger: body, isCustomer: isCustomerP2(context) }) ? 'service' : 'sales';
+        Promise.resolve(d.nepqHandoff({ contactId, reason: 'callback_request', inbound: body, firstName: leadFirstName, hasPhone: hasPhoneOnRecord, phone: typedPhone || null, why: phoneArrived ? 'phone_arrived' : 'promise_backed', kind }))
           .catch(err => d.warn(`[LiveChat] callback filing failed for ${contactId}: ${err.message}`));
       }
     }

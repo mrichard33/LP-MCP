@@ -342,6 +342,13 @@ asked for a call or turned the visit down (`leadWantsCall`), with or without a p
 (`NEPQ_NO_CALL_OFFER`). A coverage turn is planned too unless its reply is the whole script (`coverageOwnsReply`: the zip
 ask, the out-of-area close), and more detail right after the bridge gets the visit question once more (`bridge_followup`),
 not a bare `answer` (the shutters thread and the drafty chat, 2026-10-03).
+**Only SALES callbacks go to Five9 + #contact-center (Mark, 2026-10-03).** "Anything related to service should let the lead
+know a team member will reach out and send to the Slack service channel." `isServiceCallback` (the lead's words are about an
+install, an order, a repair or a warranty, or a known customer, `isCustomerP2`, asks without naming new work) turns a call
+request into the `service` hand-off: the line says "a team member will reach out" (`LINES.handoff.service_callback`), the tag
+is `hdl:callback-service` (I.HDL-2), and the card goes to the contact's market `#service-<market>` channel
+(`serviceChannelsFor` → `resolveSlackChannels('service')`, falling back to #contact-center). Never Five9: `fileBotCallback`
+with `kind: 'service'` skips the requeue. Both bots' hand-offs use one production deps object, `nepqHandoffDeps`.
 
 **Book in the conversation, unconfirmed, on the right calendar (Mark, 2026-10-02).** Every bot booking is
 status `new` (the handler forces it). **Ask about decision makers ONCE, then book** (supersedes 2026-09-18):

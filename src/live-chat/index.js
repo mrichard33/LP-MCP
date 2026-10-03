@@ -39,7 +39,7 @@ import { fetchRecentAndUpcomingAppointments } from '../knowledge/contact-appoint
 import { resolveMarket } from '../actions/enrichment.js';
 import { postToSlack } from '../slack.js';
 import { fileBotCallback } from '../agentic/bot-callback.js';
-import { botCallbackDeps } from '../services/bot-callback-io.js';
+import { botCallbackDeps, nepqHandoffDeps } from '../services/bot-callback-io.js';
 import { fetchFreeSlots, selectOfferableSlots } from '../knowledge/calendar-availability.js';
 import { extractPreferredTime } from '../services/preferred-time.js';
 import { BOOKING_CALENDARS, inHomeCalendarFor } from '../knowledge/booking-calendar-router.js';
@@ -386,20 +386,16 @@ async function bookSlot({ contactId, startIso, calendarId, decisionMakers = null
  * list too (src/agentic/bot-callback.js). A number typed this turn is written
  * to the contact first (fill-if-empty), because the Five9 record reads it.
  */
-async function nepqHandoff({ contactId, reason, inbound, firstName, hasPhone = true, phone = null, why = 'planned' }) {
+async function nepqHandoff({ contactId, reason, inbound, firstName, hasPhone = true, phone = null, why = 'planned', kind = 'sales' }) {
   const applyTags = (id, tags) => ghlFetch('POST', `/contacts/${id}/tags`, { tags }, { priority: 'normal' });
+  const addNote = (id, note) => addGHLNote(id, note);
   if (reason === 'callback_request') {
     if (phone) await captureIdentity(contactId, { visitorTexts: [phone], capture: { phone } }).catch(() => null);
-    return fileBotCallback({ contactId, channel: 'livechat', inbound, firstName, hasPhone: hasPhone || !!phone, why },
-      botCallbackDeps({ applyTags, addNote: (id, note) => addGHLNote(id, note) }));
+    return fileBotCallback({ contactId, channel: 'livechat', inbound, firstName, hasPhone: hasPhone || !!phone, why, kind },
+      botCallbackDeps({ applyTags, addNote }));
   }
-  return routeNepqHandoff({ contactId, reason, channel: 'livechat', inbound, firstName }, {
-    applyTags: (id, tags) => ghlFetch('POST', `/contacts/${id}/tags`, { tags }, { priority: 'normal' }),
-    addNote: (id, note) => addGHLNote(id, note),
-    emitEvent,
-    post: (text, channelId) => postToSlack(text, channelId),
-    opsAlert: (text) => sendAlertMessage(text, { channel: 'ops' }),
-  });
+  // A service hand-off posts to the market's #service channel (Mark, 2026-10-03).
+  return routeNepqHandoff({ contactId, reason, channel: 'livechat', inbound, firstName }, nepqHandoffDeps({ applyTags, addNote }));
 }
 
 /**

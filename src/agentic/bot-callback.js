@@ -64,13 +64,21 @@ export function readRequeueResult(res) {
 }
 
 /**
- * @param {{ contactId, channel, inbound, firstName?, hasPhone?, why?, nowMs? }} args
+ * @param {{ contactId, channel, inbound, firstName?, hasPhone?, why?, kind?: 'sales'|'service', nowMs? }} args
  * @param {{ alreadyFiled(contactId, key) → Promise<boolean>, claim(contactId, key, payload) → Promise<any>,
  *           queueRequeue(contactId, notes) → Promise<any>, routeHandoff(args) → Promise<any>, log? }} deps
  */
-export async function fileBotCallback({ contactId, channel = 'sms', inbound = '', firstName = null, hasPhone = true, why = 'planned', nowMs = Date.now() } = {}, deps = {}) {
+export async function fileBotCallback({ contactId, channel = 'sms', inbound = '', firstName = null, hasPhone = true, why = 'planned', kind = 'sales', nowMs = Date.now() } = {}, deps = {}) {
   const log = deps.log || ((m) => console.log(m));
   if (!contactId) return { filed: false, reason: 'no_contact' };
+  // A service call never goes on the sales callback list (Mark, 2026-10-03):
+  // the service hand-off (the market's #service channel, hdl:callback-service).
+  if (kind === 'service') {
+    await Promise.resolve().then(() => deps.routeHandoff?.({ contactId, reason: 'service', channel, inbound, firstName, nowMs }))
+      .catch(err => log(`[BotCallback] ${contactId} service hand-off failed: ${err.message}`));
+    log(`[BotCallback] ${contactId} (${channel}, ${why}) is a service call: service channel, no Five9`);
+    return { filed: true, kind: 'service' };
+  }
   if (!hasPhone) {
     log(`[BotCallback] ${contactId} (${channel}) no phone yet: the bot asks for it; filed when it arrives`);
     return { filed: false, reason: 'no_phone' };

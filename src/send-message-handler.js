@@ -324,7 +324,7 @@ import { findNewerInbound } from './agentic/burst-yield.js';
 import { emitEvent } from './event-emitter.js';
 import { routeNepqHandoff } from './agentic/nepq-handoff.js';
 import { fileBotCallback, callbackDecision } from './agentic/bot-callback.js';
-import { botCallbackDeps } from './services/bot-callback-io.js';
+import { botCallbackDeps, nepqHandoffDeps } from './services/bot-callback-io.js';
 // 2026-09-18 — the decision-maker handoff writes its rep task as a GHL note
 // (GHL has no task API; see src/actions/handlers/tasks.js).
 import { addGHLNote } from './ghl.js';
@@ -3429,17 +3429,12 @@ export async function executeSendMessage(action, context) {
     // A callback_request hand-off is filed after the send instead (below,
     // fileBotCallback): Five9 + #contact-center, only for a reply that went out.
     if (!generationErr && generated?.nepq_handoff && generated.nepq_handoff.reason !== 'callback_request') {
+      // A service hand-off posts to the market's #service channel (Mark, 2026-10-03).
       await routeNepqHandoff({
         contactId, reason: generated.nepq_handoff.reason, channel,
         inbound: replyTriggerMessage || triggerMessage,
         firstName: context?.lead?.first_name || null,
-      }, {
-        applyTags: applyContactTags,
-        addNote: addGHLNote,
-        emitEvent,
-        post: (text, channelId) => import('./slack.js').then(({ postToSlack }) => postToSlack(text, channelId)),
-        opsAlert: (text) => import('./alert-state.js').then(({ sendAlertMessage }) => sendAlertMessage(text, { channel: 'ops' })),
-      }).catch(err => console.warn(`[SendMessage] NEPQ hand-off side effects failed for ${contactId} (fail-soft): ${err.message}`));
+      }, nepqHandoffDeps({ applyTags: applyContactTags, addNote: addGHLNote })).catch(err => console.warn(`[SendMessage] NEPQ hand-off side effects failed for ${contactId} (fail-soft): ${err.message}`));
     }
 
     // 2026-09-25 — "didn't get it" on a guide: re-fire the delivery tag so GHL
@@ -4007,6 +4002,8 @@ export async function executeSendMessage(action, context) {
       fileBotCallback({
         contactId, channel, inbound: replyTriggerMessage || context?.message_text || '',
         firstName: context?.lead?.first_name || null, why: callbackReason,
+        // A service conversation goes to the service channel, never Five9 (Mark, 2026-10-03).
+        kind: generated?.service_conversation ? 'service' : 'sales',
       }, botCallbackDeps({ applyTags: applyContactTags, addNote: addGHLNote }))
         .catch(err => console.warn(`[SendMessage] bot callback failed for ${contactId} (fail-soft): ${err.message}`));
     }

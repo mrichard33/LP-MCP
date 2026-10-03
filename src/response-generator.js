@@ -391,7 +391,8 @@ import { holdLine, COLLECT_ASK, dmAsk, parseDecisionMakers } from './agentic/boo
 import { contactRecheckLine, recheckHint, RECHECK_RX } from './agentic/contact-check.js';
 import { smsBookingTurn, enforceBookingFacts, bookingFactsNote } from './agentic/sms-booking-turn.js';
 import { LINES as NEPQ_LINES } from './agentic/nepq-planner.js';
-import { planNepqTurn, enforceNepqPlan, referenceRetryNote, nepqBackboneMode, prefersCall as nepqPrefersCall, objectionType as nepqObjectionType, TIME_REQUEST_RX as NEPQ_TIME_REQUEST_RX, SCHEDULE_ASK_RX as NEPQ_SCHEDULE_ASK_RX,REPEAT_COMPLAINT_RX as NEPQ_REPEAT_COMPLAINT_RX, bookingOpenInThread as nepqBookingOpenInThread, dropUnaskedCallOffer, leadWantsCall as nepqLeadWantsCall } from './agentic/nepq-planner.js';
+import { isCustomerP2 } from './agentic/lead-state/signals/context-reader.js';
+import { planNepqTurn, enforceNepqPlan, referenceRetryNote, nepqBackboneMode, prefersCall as nepqPrefersCall, objectionType as nepqObjectionType, TIME_REQUEST_RX as NEPQ_TIME_REQUEST_RX, SCHEDULE_ASK_RX as NEPQ_SCHEDULE_ASK_RX,REPEAT_COMPLAINT_RX as NEPQ_REPEAT_COMPLAINT_RX, bookingOpenInThread as nepqBookingOpenInThread, dropUnaskedCallOffer, leadWantsCall as nepqLeadWantsCall, isServiceCallback as nepqIsServiceCallback } from './agentic/nepq-planner.js';
 import {
   planServiceAreaTurn, resolveCoverage, coverageHint, guardCoverageDraft, serviceAreaRecord, coverageOwnsReply,
 } from './agentic/service-area-turn.js';
@@ -3856,6 +3857,8 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
         hasAppointment,
         nextStepLabel: (kbPack?.booking_context?.requires_in_home_gate === true || nepqVisitFirst) ? 'a free visit at your home' : 'a quick call with our team',
         discipline,
+        // A customer's call request goes to service (Mark, 2026-10-03).
+        isCustomer: isCustomerP2(context),
       });
       if (nepqMode === 'live' && discipline) discipline = { ...discipline, booking: nepqPlan.booking };
     } catch (err) {
@@ -4513,6 +4516,10 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       validated.message = noCall.text;
     }
   }
+
+  // A call promised on a service conversation goes to the service channel,
+  // never the sales callback list (Mark, 2026-10-03). The send handler reads it.
+  validated.service_conversation = nepqIsServiceCallback({ conversation: context.conversation_recent || [], trigger: triggerMessage, isCustomer: isCustomerP2(context) });
 
   // ─── NEPQ backbone enforcement (2026-10-02, Mark) ──────────────────────
   // The plan's move, enforced in code: fixed lines for hand-offs and the
