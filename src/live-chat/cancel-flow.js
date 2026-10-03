@@ -219,25 +219,76 @@ export function slotMentionIndex(text, s) {
   const exact = [slotText(s), s?.rel ? `${s.rel} at ${s.time}` : null].filter(Boolean)
     .map((form) => t.indexOf(form)).filter((i) => i >= 0);
   if (exact.length) return Math.min(...exact);
-  const hm = String(s?.time || '').match(/^(\d{1,2})(?::(\d{2}))?\s*([AP])M/i);
-  if (!hm) return -1;
-  const mins = hm[2] && hm[2] !== '00' ? `:${hm[2]}` : '(?::00)?';
-  const clock = `\\b${hm[1]}${mins}\\s*${hm[3]}\\.?\\s?m\\.?(?![a-z])`;
+  const want = clockOf(s?.time);
+  if (want == null) return -1;
+  const days = slotDayKeys(s);
+  if (!days.size) return -1;
+  // Every clock time in the text, with the day it belongs to (2026-10-03
+  // replay: "6 or 7 PM tomorrow" and "tomorrow at 6 or 7" failed the
+  // day-then-time pattern, cost a 15-35s re-write, then shipped the backup).
+  const hit = clockMentions(t).find((m) => m.minutes === want && m.days.some((d) => days.has(d)));
+  return hit ? hit.index : -1;
+}
+
+const DAY_TOKEN_RX = /\b(?:(sun|mon|tue|tues|wed|weds|thu|thur|thurs|fri|sat)(?:day|nesday|rsday|urday|sday)?|(today|tonight|tomorrow)|(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?\s+(\d{1,2})(?:st|nd|rd|th)?)\b/gi;
+const DOW = { sun: 'sunday', mon: 'monday', tue: 'tuesday', tues: 'tuesday', wed: 'wednesday', weds: 'wednesday', thu: 'thursday', thur: 'thursday', thurs: 'thursday', fri: 'friday', sat: 'saturday' };
+// "6:00 PM", "6 pm", and a bare "6" / "6:00" that shares the meridiem of the
+// next time in "6 or 7 PM" / "6:00 and 7:00 PM".
+const CLOCK_TOKEN_RX = /\b(\d{1,2})(?::(\d{2}))?\s*(?:([ap])\.?\s?m\b\.?|(?=\s*(?:or|and|,|&)\s*\d{1,2}(?::\d{2})?\s*[ap]\.?\s?m\b))/gi;
+
+function clockOf(label) {
+  const m = String(label || '').match(/^(\d{1,2})(?::(\d{2}))?\s*([AP])M/i);
+  return m ? (Number(m[1]) % 12 + (/p/i.test(m[3]) ? 12 : 0)) * 60 + Number(m[2] || 0) : null;
+}
+
+/** The day keys a slot answers to: weekday, today/tomorrow, "oct 4". Pure. */
+function slotDayKeys(s) {
+  const keys = new Set();
   const dow = String(s?.dayOfWeek || '').toLowerCase();
+  if (dow) keys.add(dow);
+  const rel = String(s?.rel || '').toLowerCase();
+  if (rel) { keys.add(rel); if (rel === 'today') keys.add('tonight'); }
   const [, mon, dd] = String(s?.day || '').toLowerCase().match(/(\w{3})\s+(\d{1,2})$/) || [];
-  const dayWords = [
-    dow ? `${esc(dow)}|${esc(dow.slice(0, 3))}` : null,
-    s?.rel ? esc(String(s.rel).toLowerCase()) : null,
-    mon && dd && MONTHS.includes(mon) ? `${mon}[a-z]*\\.?\\s+${dd}(?:st|nd|rd|th)?` : null,
-  ].filter(Boolean).join('|');
-  if (!dayWords) return -1;
-  // The day word must be the nearest one before THIS time: no other clock
-  // time in between ("Sunday at 10 AM or tomorrow at 2 PM" is not Sunday 2 PM).
-  const gap = '(?:(?!\\d{1,2}(?::\\d{2})?\\s*[ap]\\.?\\s?m)[^.?!]){0,30}?';
-  const rx = new RegExp(`\\b(?:${dayWords})\\b${gap}(${clock})`, 'i');
-  const m = t.match(rx);
-  // Ordered by where the time itself sits, so "the first one" is the first time named.
-  return m ? m.index + m[0].length - m[1].length : -1;
+  if (mon && dd && MONTHS.includes(mon)) keys.add(`${mon} ${Number(dd)}`);
+  const lead = String(s?.day || '').toLowerCase().match(/^(sun|mon|tue|wed|thu|fri|sat)/);
+  if (lead) keys.add(DOW[lead[1]]);
+  return keys;
+}
+
+/**
+ * Clock times in a text, each with the day words it belongs to: the nearest
+ * day word before it in the same sentence, else the nearest after it ("6 PM
+ * tomorrow"). A bare hour takes the meridiem of the time right after it. Pure.
+ */
+export function clockMentions(text) {
+  const t = String(text || '');
+  const sentences = [];
+  let from = 0;
+  for (const m of t.matchAll(/[.?!](?:\s|$)/g)) { sentences.push([from, m.index + 1]); from = m.index + 1; }
+  if (from < t.length) sentences.push([from, t.length]);
+  const out = [];
+  for (const [a, b] of sentences) {
+    const seg = t.slice(a, b);
+    const dayToks = [...seg.matchAll(DAY_TOKEN_RX)].map((m) => {
+      const key = m[1] ? DOW[m[1].toLowerCase()] : m[2] ? m[2].toLowerCase() : `${m[3].toLowerCase().slice(0, 3)} ${Number(m[4])}`;
+      return { at: m.index, end: m.index + m[0].length, key };
+    });
+    const clocks = [...seg.matchAll(CLOCK_TOKEN_RX)].map((m) => ({ at: m.index, end: m.index + m[0].length, h: Number(m[1]), min: Number(m[2] || 0), mer: m[3] ? m[3].toLowerCase() : null }));
+    // A bare hour borrows the next stated meridiem.
+    for (let i = clocks.length - 1; i >= 0; i--) if (!clocks[i].mer) clocks[i].mer = clocks.slice(i + 1).find((c) => c.mer)?.mer || null;
+    for (const c of clocks) {
+      if (!c.mer || c.h < 1 || c.h > 12) continue;
+      // A day right after the time is its own ("6 PM tomorrow or 10 AM on
+      // Sunday"); else the nearest day before it ("tomorrow at 6 or 7 PM");
+      // else the nearest after ("6 or 7 PM tomorrow").
+      const attached = dayToks.find((d) => d.at >= c.end && /^\s*(?:on\s+|this\s+|,\s*)?$/i.test(seg.slice(c.end, d.at)));
+      const before = dayToks.filter((d) => d.end <= c.at).pop();
+      const after = dayToks.find((d) => d.at > c.at);
+      const day = attached || before || after;
+      out.push({ index: a + c.at, minutes: (c.h % 12 + (c.mer === 'p' ? 12 : 0)) * 60 + c.min, days: day ? [day.key] : [] });
+    }
+  }
+  return out;
 }
 
 /** Two (or one) real open times, one question. Pure. */

@@ -915,7 +915,7 @@ export function createLiveChatFastLane(deps) {
       backup.reply = outcome.reply;
       backup.mustDeliver = true;
       planOverride = {
-        required_move: 'cancel_flow', step: 'cancel_flow', counters: {}, booking: { allowed: true },
+        required_move: 'cancel_flow', step: 'cancel_flow', counters: {}, booking: { allowed: true, reason: 'cancel_flow' },
         reference_line: outcome.reply, reference_slots: outcome.slots || [], reference_markers: CANCEL_MARKERS[key] || [],
         allow_multi_ask: key === 'ask_identity',
       };
@@ -1104,7 +1104,7 @@ export function createLiveChatFastLane(deps) {
           email: !!context.lead?.email || /\b[^\s@]+@[^\s@]+\.[a-z]{2,}\b/i.test(typedRef) || !!live?.contact_capture?.email,
           zip: !!(context.lead?.postal_code) || /(?:^|\s)\d{5}(?:\s|$)/.test(typedRef),
         };
-        const planRef = facts ? nepqPlan : { ...(nepqPlan || { required_move: 'answer', counters: {}, booking: { allowed: true } }), reference_line: reference.reply, reference_slots: reference.slots || [] };
+        const planRef = facts ? nepqPlan : { ...(nepqPlan || { required_move: 'answer', counters: {}, booking: { allowed: true, reason: 'reference' } }), reference_line: reference.reply, reference_slots: reference.slots || [] };
         const fixRef = enforceNepqPlan(claimRef.text, planRef, { known: knownRef });
         let fixedRef = fixRef.text;
         const notesRef = [];
@@ -1114,7 +1114,7 @@ export function createLiveChatFastLane(deps) {
           fixedRef = chk.message;
           if (chk.fallback_used) notesRef.push(bookingFactsNote(facts, chk.problems));
         }
-        if (notesRef.length) d.log(`[NEPQ] live chat ${contactId} draft missed the turn's job: ${notesRef.length} note(s)`);
+        if (notesRef.length) d.log(`[NEPQ] live chat ${contactId} draft missed the turn's job: ${notesRef.length} note(s) (${(fixRef.failed || []).join(',')}) | draft="${String(message || '').replace(/\s+/g, ' ').slice(0, 200)}"`);
         return { notes: notesRef, fixed: fixedRef, booking_claim_rewritten: claimRef.changed, nepq_changes: fixRef.changes, reference_failed: notesRef.length > 0 };
       }
       // Human voice first (2026-10-02): the guards below append only clean

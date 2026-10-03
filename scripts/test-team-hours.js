@@ -78,6 +78,15 @@ test('planner: a call asked for outside hours gets the next opening', () => {
     "Got it. I'll have someone from our team call you tomorrow at 9 AM ET.");
 });
 
+// 2026-10-03 replay: the lead's own "reach out today" is not our promise.
+test('after hours, a question about why THEY reached out is left alone', () => {
+  for (const t of ["What's going on with them that made you reach out today?", 'Thanks for calling today. What got you looking?', 'Did you call us today?']) {
+    assert.equal(enforceCallTiming(t, MON_9PM).changed, false, t);
+  }
+  assert.equal(enforceCallTiming("I'll have someone call you today.", MON_9PM).text, "I'll have someone call you tomorrow at 9 AM ET.");
+  assert.equal(enforceCallTiming('A team member will reach out tonight.', MON_9PM).text, 'A team member will reach out tomorrow at 9 AM ET.');
+});
+
 test('a sign-off on its own line survives the rewrite', () => {
   const out = enforceCallTiming('Someone will call you in the next few minutes.\n\n— Reece Team', SAT_6PM);
   assert.equal(out.text, 'Someone will call you tomorrow at 9 AM ET.\n\n— Reece Team');

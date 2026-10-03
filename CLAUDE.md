@@ -360,6 +360,14 @@ Mark: "I don't think we need any static messages sent by the bot. Each message s
   - Once times are offered, the bot never returns to the bridge, even past the discovery cap.
   - With NEPQ live, the SMS calendar is read every turn. The prompt shows the times only when the plan allows a booking ask (`slotsForPlannerOnly`).
   - The live chat resolves a pick against every opening (`slots.all`), not just the next two.
+- **Replay fixes (2026-10-03, after #1140 went live):**
+  - `slotMentionIndex` reads every clock time with the day it belongs to (`clockMentions`): "6 or 7 PM tomorrow", "tomorrow at 6 or 7", "6 PM tomorrow or 10 AM on Sunday".
+  - A typed time that is none of the offered times gets the real openings nearest it, never a pick. With 2 PM open on other days the line is "For 2 PM, I have …". With no 2 PM at all it is "2 PM isn't open, but I have …". A typed day AND time that is open ("Sunday at 2 PM") is the pick. Both need the whole calendar (`allSlots`).
+  - A short message that is only a day ("Usually on Wednesdays") gets two real times that day, whatever we asked last.
+  - A detail sent instead of a pick goes back to the times. After three offers with no pick, the bot asks the day.
+  - No storm-season sentences (`STORM_SEASON_RX`).
+  - `enforceCallTiming` rewrites only a call WE promise (`FROM_US_RX`): "What made you reach out today?" had become "…reach out tomorrow at 9 AM ET?".
+  - A failed reference check logs the draft (`| draft="…"`), so the next slow turn can be read from the logs.
 - **Lead knowledge:**
   - The SMS context reads 30 messages across every channel (was 10) and shows 30 turns.
   - `HISTORY WITH REECE` (`lpRelationship`) says when the lead is a past or returning customer.

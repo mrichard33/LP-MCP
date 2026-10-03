@@ -457,7 +457,10 @@ export function disciplineBlock(d, established = null) {
   if (d.booking?.allowed) {
     parts.push(`BOOKING ASK: ALLOWED this turn (${d.booking.reason === 'lead_asked_about_scheduling'
       ? 'they asked about scheduling or next steps, or picked a time'
-      : d.booking.reason.startsWith('recommended_action')
+      // A plan built in code (the live-chat cancel flow, Part 8) may carry no
+      // reason: reading it unguarded threw and every cancel reply fell to
+      // the timeout backup (simulator, 2026-10-03).
+      : String(d.booking.reason || '').startsWith('recommended_action')
         ? 'the analyzer marked this a fast-track turn'
         : 'nothing blocks it'}). Answer first, then ONE offer, one question mark.`);
   } else {

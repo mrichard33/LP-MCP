@@ -185,6 +185,9 @@ export const LINES = Object.freeze({
     `I have ${slotPair(slots)}. Which would you like?`,
   ][v % 3],
   which: (slots) => `Great. Which works better, ${slotPair(slots)}?`,
+  // A typed time we do not have (2026-10-03 replay). Keeps "I have … or …?".
+  same_time_other_days: (label, slots) => `Sure. For ${label || 'that time'}, I have ${slotPair(slots)}. Which works better?`,
+  not_open: (label, slots) => `${label ? `${label} isn't open` : "That time isn't open"}, but I have ${slotPair(slots)}. Which works better?`,
   financing_yes: 'Yes, we offer financing. The details depend on your home, and our team walks you through them.',
   reveal: "Before your visit, is there anything you're wondering about that I can pass along?",
   // 2026-10-02 (Mark): nothing sounds final. The visit is booked as a new,
@@ -217,7 +220,7 @@ export const LINES = Object.freeze({
 // "I have … or …", the "?").
 export const ALT_LINES = Object.freeze({
   ask_day: ['Sure thing. What day would be easiest for you?', 'Okay. Which day is best for you?'],
-  which: (slots) => [`Sounds good. Which one works for you, ${slotPair(slots)}?`],
+  which: (slots) => [`Sounds good. Which one works for you, ${slotPair(slots)}?`, `Thanks. Should I hold ${slotPair(slots)} for you?`],
   price_again_slots: (slots) => [`I hear you. Since every home is different, any number now would be a guess. I have ${slotPair(slots)} open to measure. Which one works for you?`],
   price_again_no_slots: ['I hear you. Since every home is different, any number now would be a guess. A team member will call to set up a free measure.'],
   think_slots: (slots) => [`Totally fine. If it helps, I can hold a time so you don't have to chase us later. I have ${slotPair(slots)}. Which works better?`],
@@ -574,11 +577,37 @@ export function planNepqTurn({
   // pick, whatever we asked last (Part 7 SMS replay: "Fine lets book for
   // 2 PM" after "what day works best for you both?" got two times back).
   // "after 2", "before noon" and "around 2" are preferences, not picks.
-  if (offerSlots.length && !isLeadQuestion(now) && !/\b(?:after|before|until|around|by|usually|earliest|latest)\b/i.test(now) && !SLOT_OFFER_RX.test(lastOut)) {
+  const PREF_WORD_RX = /\b(?:after|before|until|around|by|usually|earliest|latest)\b/i;
+  if (offerSlots.length && !isLeadQuestion(now) && !PREF_WORD_RX.test(now) && !SLOT_OFFER_RX.test(lastOut)) {
     const exactPick = exactSlotFor(now, offerSlots);
     if (exactPick) {
       plan.slots_to_offer = offerSlots;
       return Object.assign(plan, { step: 'confirm', required_move: 'confirm', last_offer: LINES.offer_slots(offerSlots), booking: { allowed: true, reason: 'nepq:typed_time' } });
+    }
+  }
+  // 4a0b. A clock time that names NONE of the times on the table (2026-10-03
+  // replay: "Fine lets book for 2 PM" with 6 PM and Sun 10 AM offered). The
+  // live chat took it as a pick, asked for a name, an email, and never
+  // booked. Say it is not open and offer the two real openings nearest it.
+  // Only with the whole calendar in hand: two offerable times alone cannot
+  // say a time is not open.
+  if (offerSlots.length && Array.isArray(allSlots) && allSlots.length >= 2 && !isLeadQuestion(now) && !PREF_WORD_RX.test(now) && !/\b(?:can'?t|cannot|not|won'?t|busy|except)\b/i.test(now) && typedClock(now) != null && !exactSlotFor(now, offerSlots)) {
+    const all = allSlots.map(s => ({ ...s, tz: s.tz || tzLabel || '' }));
+    // A day AND time they typed that is open ("Sunday at 2 PM") is the pick.
+    const named = all.filter(s => slotMentionIndex(now, s) >= 0);
+    if (named.length === 1) {
+      const other = nearestToClock(all.filter(s => s !== named[0]), typedClock(now), '', nowMs)[0];
+      plan.slots_to_offer = other ? [named[0], other] : [named[0]];
+      return Object.assign(plan, { step: 'confirm', required_move: 'confirm', last_offer: LINES.offer_slots(plan.slots_to_offer), booking: { allowed: true, reason: 'nepq:typed_time' } });
+    }
+    const near = nearestToClock(all, typedClock(now), now, nowMs);
+    if (near.length === 2) {
+      plan.slots_to_offer = near;
+      plan.allowed.slot_offer = true;
+      // 2 PM open on other days: those, plainly. Not open at all: say so.
+      const sameClock = near.every(sl => slotClock(sl) === typedClock(now));
+      const line = sameClock ? LINES.same_time_other_days(typedClockLabel(now), near) : LINES.not_open(typedClockLabel(now), near);
+      return fixed('offer_slots', line, { step: 'offer_slots', booking: { allowed: true, reason: 'nepq:typed_time_not_offered' } });
     }
   }
 
@@ -589,8 +618,12 @@ export function planNepqTurn({
   // scheduling moment, and never over a pick of a time already offered.
   const pref = parseDayPreference(now);
   const pool = (Array.isArray(allSlots) && allSlots.length ? allSlots : []).map(s => ({ ...s, tz: s.tz || tzLabel || '' }));
+  // A short message that is only a day ("Usually on Wednesdays") is their
+  // availability whatever we asked (2026-10-03 SMS replay: it got the bridge,
+  // then "we don't have a Wednesday slot", which was not true).
+  const bareDay = !!pref?.days && String(now).trim().split(/\s+/).length <= 6 && !isLeadQuestion(now);
   const prefScheduling = !!pref && (ASK_DAY_RX.test(lastOut) || /\b(?:what|which)\s+day\b|\bwhen\s+(?:works|would|is\s+good)\b/i.test(lastOut)
-    || !!lastOfferOut || BRIDGE_RX.test(lastOut) || counters.bridge_used || SCHEDULE_ASK_RX.test(now));
+    || !!lastOfferOut || BRIDGE_RX.test(lastOut) || counters.bridge_used || SCHEDULE_ASK_RX.test(now) || bareDay);
   // The caller loads the calendar for this (wantsSlots) and plans again.
   if (prefScheduling && pool.length < 2) plan.day_preference_pending = true;
   if (prefScheduling && pool.length >= 2) {
@@ -638,9 +671,14 @@ export function planNepqTurn({
     // "Sure" / "yes" to two times picks neither: ask which, with the times.
     if (!picked && YES_RX.test(now) && offerSlots.length === 2) return fixed('offer_slots', withSlots(vary(LINES.which(offerSlots), ALT_LINES.which(offerSlots))), { step: 'offer_slots' });
     if (picked || YES_RX.test(now)) return Object.assign(plan, { step: 'confirm', required_move: 'confirm', last_offer: lastOfferOut, booking: { allowed: true, reason: 'nepq:confirm' } });
-    // Something else came between (a corrected phone, a name): back to the
-    // times they have not picked yet, in other words.
-    if (lastOut !== lastOfferOut && !isLeadQuestion(now) && !objType && offerSlots.length === 2) {
+    // Something else came between (a corrected phone, a name), or they
+    // answered the offer with a detail instead of a pick (2026-10-03 SMS
+    // replay: an address after the offer got "Good news, 12 Main St is in our
+    // service area." and no question). Back to the times, in other words.
+    // Asked three times with no pick: ask the day instead of a fourth time.
+    if (!isLeadQuestion(now) && !objType && offerSlots.length === 2) {
+      const offersInARow = outbound.slice(-3).filter(t => SLOT_OFFER_RX.test(t.text || '')).length;
+      if (offersInARow >= 3) return fixed('ask_day', vary(LINES.ask_day, ALT_LINES.ask_day), { step: 'ask_day', booking: { allowed: true, reason: 'nepq:ask_day' } });
       return fixed('offer_slots', withSlots(vary(LINES.which(offerSlots), ALT_LINES.which(offerSlots))), { step: 'offer_slots' });
     }
   }
@@ -750,6 +788,7 @@ const URGENCY_RX = /\bonly\s+\d+\s+(?:spots?|slots?|openings?)\s+left\b|\bspots?
 // Claims nobody approved (2026-10-02 simulation: "that's right at the edge of
 // when Florida code tightened up", "with us at the peak of hurricane season").
 // Code history and season-peak talk are pressure dressed as fact.
+const STORM_SEASON_RX = /\b(?:hurricane|storm)\s+season\b|\bhurricanes?\s+(?:come|hit|are\s+coming)\b/i;
 const CLAIMS_RX = /\bcode\s+(?:changed|tightened|got\s+(?:stricter|tighter)|was\s+(?:updated|changed))\b|\b(?:after|since|before)\s+(?:the\s+)?(?:19|20)\d\d\b[^.?!]{0,40}\bcode\b|\bcode\b[^.?!]{0,40}\b(?:after|since|before)\s+(?:19|20)\d\d\b|\bpeak\s+(?:of\s+)?(?:the\s+)?(?:hurricane|storm)\s+season\b|\bmost\s+active\s+(?:stretch|part|time)\b|\b(?:storm\s+season|we)\s+(?:has|have)\s+(?:us\s+)?(?:slammed|swamped)\b|\bcalendar\s+(?:is\s+)?(?:tight|filling|full)\b|\b(?:andersen|renewal|pgt|pella|lowe'?s|home\s+depot|es\s+windows|cgi)\b[^.?!]{0,60}\b(?:uses?|only|standard|cheap\w*|worse|inferior|lower|basic)\b/i;
 const SEE_YOU_RX = /\bsee\s+you\s+(?:then|soon|there)\b/i;
 const SIGNOFF_RX = /(?:^|\s)([—–-]\s*[A-Z][A-Za-z.'’ ]{0,40})\s*$/;
@@ -879,6 +918,39 @@ export function reaskAfterAnswer(line) {
   return parts.length > 1 && FILLER_ONLY_RX.test(parts[0]) ? parts.slice(1).join(' ') : String(line || '');
 }
 
+const TYPED_CLOCK_RX = /\b(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?)/i;
+/** Minutes after midnight of the first clock time typed, or null. Pure. */
+export function typedClock(text) {
+  const m = String(text || '').match(TYPED_CLOCK_RX);
+  if (!m) return null;
+  return (Number(m[1]) % 12 + (/p/i.test(m[3]) ? 12 : 0)) * 60 + Number(m[2] || 0);
+}
+/** "2 PM" / "2:30 PM", as the lead typed it. Pure. */
+export function typedClockLabel(text) {
+  const m = String(text || '').match(TYPED_CLOCK_RX);
+  return m ? `${Number(m[1])}${m[2] && m[2] !== '00' ? `:${m[2]}` : ''} ${m[3].replace(/\./g, '').toUpperCase()}` : '';
+}
+const slotClock = (s) => {
+  const m = String(s?.time || '').match(/^(\d{1,2})(?::(\d{2}))?\s*([AP])M/i);
+  return m ? (Number(m[1]) % 12 + (/p/i.test(m[3]) ? 12 : 0)) * 60 + Number(m[2] || 0) : null;
+};
+/**
+ * The two openings nearest a typed clock time: that time on another day
+ * first (soonest first), then the closest times of day. A day they typed
+ * ("Sunday at 2 PM") narrows the pool to that day when it has openings. Pure.
+ */
+export function nearestToClock(slots, minutes, text = '', nowMs = Date.now()) {
+  const list = (Array.isArray(slots) ? slots : []).filter(s => slotClock(s) != null && (!s.iso || Date.parse(s.iso) >= nowMs));
+  const t = String(text || '').toLowerCase();
+  const dayHit = list.filter(s => [s.dayOfWeek, s.rel].filter(Boolean).some(d => new RegExp(`\\b${String(d).toLowerCase()}\\b`).test(t)));
+  const pool = dayHit.length >= 2 ? dayHit : list;
+  const when = (s) => (s.iso ? Date.parse(s.iso) : 0);
+  return [...pool]
+    .sort((a, b) => Math.abs(slotClock(a) - minutes) - Math.abs(slotClock(b) - minutes) || when(a) - when(b))
+    .slice(0, 2)
+    .sort((a, b) => when(a) - when(b));
+}
+
 /** The one real opening a typed time names ("2 PM", "tomorrow at 10"), or null. Pure. */
 export function exactSlotFor(text, slots = []) {
   const m = String(text || '').match(/\b(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?)/i);
@@ -964,6 +1036,10 @@ export function enforceNepqPlan(draft, plan, { allowFigures = false, known = {} 
   });
   drop(s => URGENCY_RX.test(s), 'fake_urgency');
   drop(s => CLAIMS_RX.test(s), 'unapproved_claim');
+  // 2b0. No storm-season framing (Mark's NEPQ ruling: no hurricane-season
+  // talk; 2026-10-03 replay, the SMS opener was "Hurricane season tends to be
+  // when that call comes in for a lot of folks."). Only when something else is left.
+  if (sentences.length > 1 && sentences.some(s => STORM_SEASON_RX.test(s)) && sentences.some(s => !STORM_SEASON_RX.test(s))) drop(s => STORM_SEASON_RX.test(s), 'storm_season');
   // 2b. "Do you offer financing?" keeps its yes when the figure strip took the
   // answer sentence (2026-10-02 simulation: "Yes, we offer 0% APR financing"
   // went, and only "What's got you looking into windows now?" was left).
