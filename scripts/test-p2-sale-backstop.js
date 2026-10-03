@@ -26,6 +26,7 @@ process.env.GHL_API_KEY = process.env.GHL_API_KEY || 'test-ghl-key';
 
 const {
   planForSale, firstSeenMs, findSalesMissingP2, runSaleP2Backstop, backstopMode,
+  p2CoversJob, looksLikeDuplicateOfPaidJob,
   GRACE_MS, RETAG_WAIT_MS, P2_PIPELINE_ID,
 } = await import('../src/p2-sale-backstop.js');
 const { lostReasonIdForJobStatus } = await import('../src/lp-lost-reasons.js');
@@ -40,11 +41,66 @@ const contact = (tags = []) => ({ id: 'c', firstName: 'Ann', lastName: 'Buyer', 
 
 // ── planForSale (pure) ──────────────────────────────────────────────────
 
-test('plan: any P2 card (open, won or lost) means leave it alone', () => {
-  for (const status of ['open', 'won', 'lost']) {
-    const p = planForSale({ verdict: 'live', job: liveJob, p2Opps: [{ id: 'o', status }], contact: contact(), nowMs: NOW });
-    assert.deepEqual(p, { action: 'skip', reason: 'has_p2' });
+// 2026-10-03: "any P2 card" stopped meaning "covered" — a returning customer's
+// closed card from an EARLIER job hid their new job (7 live jobs, ~$76k). The
+// rule is now p2CoversJob; these replace the old any-status assertion.
+const stamp = (id) => [{ id: 'sMZfcWAdoqh88pghLsNQ', fieldValueString: id }];
+
+test('plan: an open card, or a closed card for THIS job, means leave it alone', () => {
+  const cases = [
+    [{ id: 'o', status: 'open' }],
+    [{ id: 'o', status: 'won', customFields: stamp('60111') }],
+    [{ id: 'o', status: 'lost', createdAt: '2026-10-01T18:00:00Z' }],   // unstamped, made at the sale (C.0-IN)
+  ];
+  for (const p2Opps of cases) {
+    assert.deepEqual(planForSale({ verdict: 'live', job: liveJob, p2Opps, contact: contact(), nowMs: NOW }), { action: 'skip', reason: 'has_p2' });
   }
+});
+
+test('plan: a repeat customer whose only card is an older job\'s gets a card made directly, never deal-won', () => {
+  const oldWon = [{ id: 'o', status: 'won', customFields: stamp('59380'), monetaryValue: 17645, createdAt: '2026-08-01T15:00:00Z' }];
+  const job = { lp_job_id: '60124', job_status: 'Awaiting Paperwork', job_value: 9250, contractdate: '2026-10-02T00:00:00', payments: [] };
+  const allJobs = [{ lp_job_id: '59380', job_status: 'Paid In Full', job_value: 17645, contractdate: '2026-08-01T00:00:00' }, job];
+  assert.deepEqual(planForSale({ verdict: 'live', job, p2Opps: oldWon, contact: null, nowMs: NOW, allJobs }),
+    { action: 'create_open', reason: 'repeat_customer_new_job' });
+  // Unstamped old card, made before this job was written: still not this job's.
+  const unstamped = [{ id: 'o', status: 'won', createdAt: '2026-08-01T15:00:00Z' }];
+  assert.equal(planForSale({ verdict: 'live', job, p2Opps: unstamped, contact: null, nowMs: NOW, allJobs }).action, 'create_open');
+});
+
+test('plan: a terminal job never gets a second card on a contact that already has one', () => {
+  const oldWon = [{ id: 'o', status: 'won', customFields: stamp('1') }];
+  for (const verdict of ['terminal_won', 'terminal_lost']) {
+    assert.deepEqual(planForSale({ verdict, job: { ...liveJob, job_status: 'Cancelled' }, p2Opps: oldWon, contact: null, nowMs: NOW }),
+      { action: 'skip', reason: 'has_p2' });
+  }
+});
+
+test('plan: a no-payment job that a paid job replaced is listed, never added', () => {
+  // 58338 ($74,536, no payment) next to 58102 Paid In Full ($80,191): within 10%.
+  const job = { lp_job_id: '58338', job_status: 'Awaiting Paperwork', job_value: 74536, contractdate: '2026-05-26T00:00:00', payments: [] };
+  const allJobs = [{ lp_job_id: '58102', job_status: 'Paid In Full', job_value: 80191, contractdate: '2026-05-14T00:00:00' }, job];
+  const oldWon = [{ id: 'o', status: 'won', customFields: stamp('58102'), monetaryValue: 80191 }];
+  assert.deepEqual(planForSale({ verdict: 'live', job, p2Opps: oldWon, contact: null, nowMs: NOW, allJobs }),
+    { action: 'report', reason: 'possible_duplicate_of_paid_job' });
+});
+
+test('p2CoversJob / looksLikeDuplicateOfPaidJob: the edges', () => {
+  assert.equal(p2CoversJob([], liveJob), false);
+  assert.equal(p2CoversJob([{ status: 'won', customFields: stamp('999') }], liveJob), false, 'stamped for another job');
+  assert.equal(p2CoversJob([{ status: 'won', createdAt: '2026-09-30T23:00:00Z' }], liveJob), false, 'made the day before the contract');
+  const job = { lp_job_id: '2', job_value: 10000, contractdate: '2026-07-01', payments: [] };
+  // A paid job written LATER means this one was the quote it replaced.
+  assert.equal(looksLikeDuplicateOfPaidJob(job, [{ lp_job_id: '3', job_status: 'Paid In Full', job_value: 30000, contractdate: '2026-07-20' }]), true);
+  // An older paid job at a different price is a real second sale.
+  assert.equal(looksLikeDuplicateOfPaidJob(job, [{ lp_job_id: '1', job_status: 'Paid In Full', job_value: 30000, contractdate: '2026-01-01' }]), false);
+  // Similar price a year apart is a returning customer, not a copy (60104: $14,000 in
+  // Oct 2026 after $13,192 Paid In Full in Apr 2025).
+  assert.equal(looksLikeDuplicateOfPaidJob({ lp_job_id: '60104', job_value: 14000, contractdate: '2026-10-01', payments: [] },
+    [{ lp_job_id: '52098', job_status: 'PIF Survey Ready', job_value: 13192, contractdate: '2025-04-11' }]), false);
+  // A payment on this job makes it real, whatever else is there.
+  assert.equal(looksLikeDuplicateOfPaidJob({ ...job, payments: [{ pmtamount: '500' }] },
+    [{ lp_job_id: '3', job_status: 'Paid In Full', job_value: 10000, contractdate: '2026-07-20' }]), false);
 });
 
 test('plan: an unreadable P2 search or contact writes nothing', () => {
@@ -149,6 +205,8 @@ function world() {
     supabase: fakeDb(tables),
     hlRunSQL: async (sql) => {
       assert.match(sql, new RegExp(P2_PIPELINE_ID));
+      // Only an OPEN card lets the mirror drop a contact (2026-10-03).
+      assert.match(sql, /status = 'open'/);
       return sql.includes("'c-has'") ? [{ ghl_contact_id: 'c-has' }] : [];
     },
     ghlFetch: async (method, path, body) => {
@@ -205,6 +263,21 @@ test('find: a placeholder copy is never the job that decides', async () => {
   assert.deepEqual(sales, []);
 });
 
+test('find: a repeat customer with only a closed card is read live and gets a direct create', async () => {
+  const { deps } = world();
+  const newJob = { lp_job_id: '60124', lp_lead_id: 'L8', ghl_contact_id: 'c-repeat', job_status: 'Awaiting Paperwork',
+    job_value: 9250, contractdate: '2026-10-02T00:00:00', payments: [] };
+  const oldJob = { lp_job_id: '59380', lp_lead_id: 'L8', ghl_contact_id: 'c-repeat', job_status: 'Paid In Full',
+    job_value: 17645, contractdate: '2026-08-01T00:00:00', payments: [{ pmtamount: '17645', pmtdate: '2026-08-20' }] };
+  deps.supabase = fakeDb({ lp_jobs: [newJob], lp_leads: [], system_events: [] });
+  deps.jobsForContact = async () => ({ jobs: [oldJob, newJob], leads: [], error: null });
+  deps.ghlFetch = async (method, path) => (path.startsWith('/opportunities/search')
+    ? { opportunities: [{ id: 'old', status: 'won', monetaryValue: 17645, customFields: [{ id: 'sMZfcWAdoqh88pghLsNQ', fieldValueString: '59380' }] }] }
+    : { contact: contact(['deal-won']) });
+  const sales = await findSalesMissingP2({ ...deps, nowMs: NOW, logger: quiet });
+  assert.deepEqual(sales.map((x) => [x.contactId, x.plan.action, x.plan.reason]), [['c-repeat', 'create_open', 'repeat_customer_new_job']]);
+});
+
 test('run: shadow decides and writes nothing to GHL', async () => {
   const { deps, ghlCalls } = world();
   const r = await runSaleP2Backstop({ mode: 'shadow', deps, nowMs: NOW, logger: quiet });
@@ -256,6 +329,14 @@ test('run: the per-pass cap holds, and a failed write is a failed pass', async (
   const r2 = await runSaleP2Backstop({ mode: 'live', deps: w.deps, nowMs: NOW, logger: quiet });
   assert.equal(r2.ok, false);
   assert.equal(r2.failures, 1);
+});
+
+test('run: onlyActions writes just the chosen kinds and leaves the rest listed', async () => {
+  const { deps, ghlCalls } = world();
+  const r = await runSaleP2Backstop({ mode: 'live', deps, nowMs: NOW, logger: quiet, onlyActions: ['tag_deal_won'] });
+  assert.equal(r.writes, 1);
+  assert.ok(ghlCalls.some((c) => c.method === 'TAG' && c.path === 'c-tag'));
+  assert.ok(!ghlCalls.some((c) => ['MOVE', 'POST', 'PUT', 'L6'].includes(c.method)), 'create_open / create_lost were not selected');
 });
 
 test('run: a failed bulk read is { ok: false }, never a throw', async () => {
