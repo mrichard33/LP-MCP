@@ -26,7 +26,9 @@ const MOVE_TEXT = {
   probe: (p) => `This turn's move: ONE short question about what they just told you, in their own words${p.echo?.word ? ` (an echo like "${cap(p.echo.word)}?" is fine)` : ''}. No booking ask, no pitch, no "why now" question if one was already asked.`,
   // 2026-10-02 simulation: "(hurricane season makes it natural)" produced "with
   // us at the peak of hurricane season", pressure Mark ruled out.
-  consequence: (p) => `This turn's move: ONE gentle "what happens if you wait?" question about ${p.echo?.phrase || 'the problem they mentioned'}. No deadlines, no season or storm talk, no danger talk, no pressure.`,
+  // 2026-10-03 (Mark): hurricane and storm language is allowed, it is core to
+  // what we sell. Still no deadlines, fake urgency or scare talk.
+  consequence: (p) => `This turn's move: ONE gentle "what happens if you wait?" question about ${p.echo?.phrase || 'the problem they mentioned'}. Hurricanes and storms may come into it where they fit. No deadlines, no fake urgency, no scare talk, no pressure.`,
   // 2026-10-02 (Mark): no line word for word twice; the planner picks a bridge
   // variant we have not sent yet (bridgeLine / pickFresh).
   // Part 7: a reference, written fresh for this lead; it must still name "the

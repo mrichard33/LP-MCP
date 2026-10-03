@@ -788,7 +788,6 @@ const URGENCY_RX = /\bonly\s+\d+\s+(?:spots?|slots?|openings?)\s+left\b|\bspots?
 // Claims nobody approved (2026-10-02 simulation: "that's right at the edge of
 // when Florida code tightened up", "with us at the peak of hurricane season").
 // Code history and season-peak talk are pressure dressed as fact.
-const STORM_SEASON_RX = /\b(?:hurricane|storm)\s+season\b|\bhurricanes?\s+(?:come|hit|are\s+coming)\b/i;
 const CLAIMS_RX = /\bcode\s+(?:changed|tightened|got\s+(?:stricter|tighter)|was\s+(?:updated|changed))\b|\b(?:after|since|before)\s+(?:the\s+)?(?:19|20)\d\d\b[^.?!]{0,40}\bcode\b|\bcode\b[^.?!]{0,40}\b(?:after|since|before)\s+(?:19|20)\d\d\b|\bpeak\s+(?:of\s+)?(?:the\s+)?(?:hurricane|storm)\s+season\b|\bmost\s+active\s+(?:stretch|part|time)\b|\b(?:storm\s+season|we)\s+(?:has|have)\s+(?:us\s+)?(?:slammed|swamped)\b|\bcalendar\s+(?:is\s+)?(?:tight|filling|full)\b|\b(?:andersen|renewal|pgt|pella|lowe'?s|home\s+depot|es\s+windows|cgi)\b[^.?!]{0,60}\b(?:uses?|only|standard|cheap\w*|worse|inferior|lower|basic)\b/i;
 const SEE_YOU_RX = /\bsee\s+you\s+(?:then|soon|there)\b/i;
 const SIGNOFF_RX = /(?:^|\s)([—–-]\s*[A-Z][A-Za-z.'’ ]{0,40})\s*$/;
@@ -1036,10 +1035,6 @@ export function enforceNepqPlan(draft, plan, { allowFigures = false, known = {} 
   });
   drop(s => URGENCY_RX.test(s), 'fake_urgency');
   drop(s => CLAIMS_RX.test(s), 'unapproved_claim');
-  // 2b0. No storm-season framing (Mark's NEPQ ruling: no hurricane-season
-  // talk; 2026-10-03 replay, the SMS opener was "Hurricane season tends to be
-  // when that call comes in for a lot of folks."). Only when something else is left.
-  if (sentences.length > 1 && sentences.some(s => STORM_SEASON_RX.test(s)) && sentences.some(s => !STORM_SEASON_RX.test(s))) drop(s => STORM_SEASON_RX.test(s), 'storm_season');
   // 2b. "Do you offer financing?" keeps its yes when the figure strip took the
   // answer sentence (2026-10-02 simulation: "Yes, we offer 0% APR financing"
   // went, and only "What's got you looking into windows now?" was left).

@@ -85,11 +85,13 @@ test('a real time counts however the reply words it', async () => {
   assert.deepEqual(offeredSlots('6 PM tomorrow or 10 AM on Sunday?', [sun10, sat6]).map(s => s.time), ['6:00 PM', '10:00 AM']);
 });
 
-test('no hurricane-season pressure in a reply', async () => {
+// 2026-10-03 (Mark): hurricane and storm language is allowed; it is core to
+// what we sell. Only false urgency claims ("peak of hurricane season") go.
+test('hurricane and storm language is kept in a reply', async () => {
   const { enforceNepqPlan } = await import('../src/agentic/nepq-planner.js');
   const plan = planNepqTurn({ channel: 'sms', trigger: 'I need new windows', conversation: [{ direction: 'inbound', text: 'I need new windows' }], nowMs: NOW });
-  const out = enforceNepqPlan("Hurricane season tends to be when that call comes in for a lot of folks. What's going on with your current windows that got you looking?", plan);
-  assert.equal(out.text, "What's going on with your current windows that got you looking?");
+  const draft = "Hurricane season tends to be when that call comes in for a lot of folks. What's going on with your current windows that got you looking?";
+  assert.equal(enforceNepqPlan(draft, plan).text, draft);
 });
 
 const WED = [
