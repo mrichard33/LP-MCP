@@ -108,6 +108,11 @@ export function requestedCallTime(text, nowMs = Date.now()) {
 
 // A sentence that promises a call or a person reaching out.
 const CALL_PROMISE_RX = /\b(?:call|calls|calling|phone|reach\s+out|reach\s+you|get\s+back\s+to\s+you|be\s+in\s+touch|contact\s+you|on\s+the\s+phone|on\s+this)\b/i;
+// …made BY US. 2026-10-03 replay: "What made you reach out today?" read as a
+// promised call and went out as "…made you reach out tomorrow at 9 AM ET?".
+// The call has to come from us, someone on the team, or to the lead.
+const FROM_US_RX = /\b(?:we|i|our\s+(?:\w+\s+)?(?:team|rep|office|specialist)|someone|somebody|a\s+(?:team\s+member|rep|specialist|member\s+of\s+(?:our|the)\s+team)|they|he|she)(?:'ll|’ll|'m|’m|\s+will|\s+(?:is|are|am)\s+(?:going\s+to|getting)|\s+can|\s+should|\s+would|\s+have)\b|\byou(?:'ll|’ll|\s+will|\s+should)\s+(?:get|receive|hear)\b|\bexpect\s+(?:a\s+call|to\s+hear)\b|\b(?:i'?ve|we'?ve)\s+(?:passed|flagged)\b/i;
+const promisesCall = (s) => CALL_PROMISE_RX.test(s) && FROM_US_RX.test(s);
 // The same-day / immediate part of that promise. "now" alone is left out: it
 // reads as "I'm passing this on now", which stays true after hours.
 const IMMEDIATE = String.raw`\b(?:right\s+now|right\s+away|immediately|in\s+the\s+next\s+(?:few|couple(?:\s+of)?|\d+|several)\s+(?:minutes|hours?)|within\s+the\s+(?:next\s+)?(?:hour|few\s+minutes|\d+\s+minutes)|in\s+a\s+few\s+minutes|today|tonight|this\s+(?:morning|afternoon|evening))\b`;
@@ -127,7 +132,7 @@ export function enforceCallTiming(text, nowMs = Date.now()) {
   // Sentence by sentence, in place, so line breaks (a sign-off) survive.
   let out = body;
   for (const s of body.split(/(?<=[.!?])\s+/)) {
-    if (!CALL_PROMISE_RX.test(s) || !hasImmediate.test(s)) continue;
+    if (!promisesCall(s) || !hasImmediate.test(s)) continue;
     out = out.replace(s, s.replace(new RegExp(IMMEDIATE, 'i'), label));
   }
   return { text: out, changed: out !== body };
@@ -143,7 +148,7 @@ export function softenCallTiming(text) {
   const body = String(text || '');
   let out = body;
   for (const s of body.split(/(?<=[.!?])\s+/)) {
-    if (!CALL_PROMISE_RX.test(s)) continue;
+    if (!promisesCall(s)) continue;
     out = out.replace(s, s.replace(new RegExp(IMMEDIATE, 'i'), 'soon'));
   }
   return out;

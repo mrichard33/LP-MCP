@@ -1114,7 +1114,7 @@ export function createLiveChatFastLane(deps) {
           fixedRef = chk.message;
           if (chk.fallback_used) notesRef.push(bookingFactsNote(facts, chk.problems));
         }
-        if (notesRef.length) d.log(`[NEPQ] live chat ${contactId} draft missed the turn's job: ${notesRef.length} note(s)`);
+        if (notesRef.length) d.log(`[NEPQ] live chat ${contactId} draft missed the turn's job: ${notesRef.length} note(s) (${(fixRef.failed || []).join(',')}) | draft="${String(message || '').replace(/\s+/g, ' ').slice(0, 200)}"`);
         return { notes: notesRef, fixed: fixedRef, booking_claim_rewritten: claimRef.changed, nepq_changes: fixRef.changes, reference_failed: notesRef.length > 0 };
       }
       // Human voice first (2026-10-02): the guards below append only clean

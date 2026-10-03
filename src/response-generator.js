@@ -4446,12 +4446,14 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       // One re-write (one model call, the reads are prepared); the reference
       // ships as the backup only if that fails too.
       if (enforced.failed?.length && !opts.regenerationNote) {
-        console.warn(`[NEPQ] ${contactId} ${nepqPlan.required_move} draft failed (${enforced.failed.join(',')}) — one re-write`);
+        // The draft itself, so a failed check can be read from the logs
+        // (2026-10-03: the replay could show only the failure codes).
+        console.warn(`[NEPQ] ${contactId} ${nepqPlan.required_move} draft failed (${enforced.failed.join(',')}) — one re-write | draft="${String(validated.message || '').replace(/\s+/g, ' ').slice(0, 200)}"`);
         const err = new Error(`nepq_reference: ${enforced.failed.join(',')}`);
         err.regenerationNote = referenceRetryNote(nepqPlan, enforced.failed);
         throw err;
       }
-      if (enforced.failed?.length) console.warn(`[NEPQ] ${contactId} ${nepqPlan.required_move}: nepq_backup_line (${enforced.failed.join(',')})`);
+      if (enforced.failed?.length) console.warn(`[NEPQ] ${contactId} ${nepqPlan.required_move}: nepq_backup_line (${enforced.failed.join(',')}) | draft="${String(validated.message || '').replace(/\s+/g, ' ').slice(0, 200)}"`);
       if (enforced.changes.length) {
         console.log(`[NEPQ] ${contactId} ${nepqPlan.required_move}: ${enforced.changes.join(',')}`);
         validated.message = enforced.text;
