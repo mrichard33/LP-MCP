@@ -3859,6 +3859,8 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
         discipline,
         // A customer's call request goes to service (Mark, 2026-10-03).
         isCustomer: isCustomerP2(context),
+        // The classifier read a call request: the planner's callback hand-off.
+        callbackRequested: String(classification?.intent_class || '').toUpperCase() === 'CALLBACK',
       });
       if (nepqMode === 'live' && discipline) discipline = { ...discipline, booking: nepqPlan.booking };
     } catch (err) {
@@ -4520,6 +4522,11 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // A call promised on a service conversation goes to the service channel,
   // never the sales callback list (Mark, 2026-10-03). The send handler reads it.
   validated.service_conversation = nepqIsServiceCallback({ conversation: context.conversation_recent || [], trigger: triggerMessage, isCustomer: isCustomerP2(context) });
+  // A call request the planner did not hand off (NEPQ off, or the plan failed)
+  // is still filed after the send: Five9 for sales, #service for service.
+  if (String(classification?.intent_class || '').toUpperCase() === 'CALLBACK' && !nepqPlan?.handoff) {
+    validated.callback_requested = validated.service_conversation ? 'service' : 'callback_request';
+  }
 
   // ─── NEPQ backbone enforcement (2026-10-02, Mark) ──────────────────────
   // The plan's move, enforced in code: fixed lines for hand-offs and the
@@ -4562,7 +4569,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
         validated.nepq_plan.changes = enforced.changes;
       }
       if (!nepqPlan.booking.allowed && validated.companion_action?.action_type === 'book_appointment') validated.companion_action = null;
-      if (nepqPlan.handoff) validated.nepq_handoff = { reason: nepqPlan.handoff.reason };
+      if (nepqPlan.handoff) validated.nepq_handoff = { reason: nepqPlan.handoff.reason, extra: nepqPlan.handoff.extra || null };
       const recentOut = (context.conversation_recent || []).filter(m => String(m?.direction || '').toLowerCase() === 'outbound').slice(-8).map(m => String(m?.text ?? m?.body ?? ''));
       // 2026-10-02 (Mark): an email that cannot be right gets one friendly
       // re-check (contact-check.js). SMS already has their number.

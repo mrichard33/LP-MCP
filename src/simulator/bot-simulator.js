@@ -128,10 +128,10 @@ export async function simulateLiveChat(plan, { nepqMode = 'live', productionDeps
     bookSlot: async (a) => { record('would_book', { start: a.startIso }); return { ok: true, action_id: 0 }; },
     nepqHandoff: async (a) => {
       // 2026-10-03: a callback (with a number to call) files to Five9 + #contact-center.
-      if (a.reason === 'callback_request' && a.kind === 'service') record('would_hand_off_to_service_channel', { reason: a.why || 'planned' });
-      else if (a.reason === 'callback_request') record(a.hasPhone === false && !a.phone ? 'would_ask_for_callback_number' : 'would_file_callback_five9_and_contact_center', { reason: a.why || 'planned' });
-      else if (a.reason === 'service') record('would_hand_off_to_service_channel', { reason: 'service' });
-      else record('would_hand_off_to_person', { reason: a.reason });
+      // Part 14: every hand-off but service is a Five9 call + its card.
+      if (a.reason === 'service' || a.kind === 'service') record('would_hand_off_to_service_channel', { reason: a.why || 'service' });
+      else if (a.reason === 'callback_request' && a.hasPhone === false && !a.phone) record('would_ask_for_callback_number', { reason: a.why || 'planned' });
+      else record('would_file_callback_five9_and_contact_center', { reason: `${a.reason}, ${a.why || 'planned'}` });
     },
   });
 
@@ -214,13 +214,19 @@ export async function simulateSms(plan, { nepqMode = 'live', generate, buildReal
     const reply = generated?.message || null;
     if (reply) thread.push({ direction: 'outbound', channel: 'sms', text: reply, type: 'text', timestamp: new Date(Date.parse(at) + 30000).toISOString() });
     const wouldDo = [];
-    if (generated?.nepq_handoff) wouldDo.push({ kind: 'would_hand_off_to_person', reason: generated.nepq_handoff.reason });
     if (generated?.dm_handoff) wouldDo.push({ kind: 'would_hand_off_decision_maker', reason: generated.dm_handoff.reason });
     // 2026-10-03: the send handler files the callback (Five9 + #contact-center).
-    const cb = reply ? callbackDecision({ handoffReason: generated?.nepq_handoff?.reason || null, otherHandoff: !!generated?.dm_handoff, text: reply }) : null;
-    if (cb) wouldDo.push(generated?.service_conversation && cb !== 'planned'
-      ? { kind: 'would_hand_off_to_service_channel', reason: cb }
-      : { kind: 'would_file_callback_five9_and_contact_center', reason: cb });
+    // Part 14: the send handler's decision, one shape (no GHL ring; Five9 calls).
+    const cb = !reply ? null
+      : (generated?.nepq_handoff || generated?.dm_handoff) ? callbackDecision({ handoffReason: generated?.nepq_handoff?.reason || null, otherHandoff: !!generated?.dm_handoff, text: reply })
+        : generated?.callback_requested ? { why: 'classifier_callback', reason: generated.callback_requested, kind: generated.callback_requested === 'service' ? 'service' : 'sales' }
+          : callbackDecision({ text: reply });
+    if (cb) {
+      const service = cb.kind ? cb.kind === 'service' : !!generated?.service_conversation;
+      wouldDo.push(service
+        ? { kind: 'would_hand_off_to_service_channel', reason: cb.why }
+        : { kind: cb.card === false ? 'would_file_callback_five9' : 'would_file_callback_five9_and_contact_center', reason: `${cb.reason}, ${cb.why}` });
+    }
     if (generated?.companion_action) wouldDo.push({ kind: `would_${generated.companion_action.action_type}`, payload: generated.companion_action.action_payload || null });
     transcript.push({
       turn: i + 1, customer: text, bot: reply ? [reply] : null, error,

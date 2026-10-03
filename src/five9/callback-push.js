@@ -241,4 +241,48 @@ export async function findContactInOtherLists(number1, { listName = null, deps =
   }
 }
 
-export default { buildCallbackRecord, findContactInOtherLists, callbackListName };
+/**
+ * Is this number on Five9's DNC list? (2026-10-03)
+ *
+ * Five9 accepts a DNC number onto the Callback Request list and then never
+ * dials it, without an error anywhere: of 18 callback pushes in the 30 days
+ * to 2026-10-03, 4 were numbers on Five9's DNC list, and none of those four
+ * ever got a call. The lead had just asked us to call, so the push is pointless
+ * and the promise is silently broken. A lead reaching back out is the case
+ * the DNC lift exists for (decision #2560), but a lift is a person's call
+ * (#dnc-lift-approval), never ours, so the caller asks for the review instead.
+ *
+ * Fails OPEN: a failed read pushes anyway (Five9 still enforces its own list
+ * at dial time, so the worst case is today's behaviour).
+ *
+ * @returns {Promise<{ onDnc: boolean, failedOpen?: boolean, error?: string }>}
+ */
+export async function checkCallbackDnc(number1, { deps = {} } = {}) {
+  const n = normalizeNumber1(number1);
+  if (!n) return { onDnc: false };
+  try {
+    const check = deps.checkDnc || (await import('../five9-admin.js')).checkDncForNumbers;
+    const res = await check([n]);
+    return { onDnc: (res?.on_dnc || []).map(String).includes(n) };
+  } catch (err) {
+    return { onDnc: false, failedOpen: true, error: String(err?.message || err) };
+  }
+}
+
+/** The review row that asks a person to lift a blocked number that asked for a call. Pure. */
+export function buildCallbackDncReviewAction({ contactId, number1, reason = 'callback_request' }) {
+  return {
+    action_type: 'request_dnc_lift_review',
+    target_system: 'lp',
+    target_entity: 'contact',
+    target_id: String(contactId),
+    action_payload: { trigger: 'callback_request', blocked_in: ['five9'], number_last4: String(number1 || '').slice(-4), reason },
+    rule_applied: 'CALLBACK_DNC_REVIEW',
+    reasoning: 'The lead asked us to call, but the number is on the Five9 DNC list, so the dialer would skip it. Asking a person in #dnc-lift-approval (2026-10-03).',
+    status: 'pending',
+    requires_approval: false,
+    priority: 20,
+  };
+}
+
+export default { buildCallbackRecord, findContactInOtherLists, callbackListName, checkCallbackDnc };

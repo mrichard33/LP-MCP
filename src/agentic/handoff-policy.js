@@ -14,24 +14,18 @@
  *
  *   silent    an opt-out. STOP, and WRONG_NUMBER, which Mark ruled is treated
  *             as one (a stranger, and texting them on is a compliance risk).
- *   workflow  a live GHL workflow answers the tag (hdl:callback-sales /
- *             hdl:callback-service, and the CALLBACK placeholder that
- *             send-message-handler resolves to one of them or answers with
- *             the HDL.3 probe). Replying too would double-text the lead.
+ *   workflow  (retired 2026-10-03) a GHL workflow answered hdl:callback-*.
+ *             Those workflows bridged a GHL call; the bot now replies and
+ *             Five9 makes the call (bot-callback.js).
  *   reply     everything else. The bot answers, and the handoff note below
  *             tells it what this moment calls for.
  *
  * Pure and dependency-free, unit-tested in scripts/test-handoff-policy.js.
  */
 
-import { WORKFLOW_ANSWERED_HANDOFF_TAGS } from '../human-handoff-alert.js';
 
 /** Intents that end the conversation. Everything else keeps the bot talking. */
 export const OPT_OUT_HANDOFF_INTENTS = new Set(['STOP', 'WRONG_NUMBER']);
-
-// The CALLBACK placeholder never reaches GHL: handleShortCircuit resolves it
-// to a workflow tag, or answers with the customer-status probe itself.
-const CALLBACK_PLACEHOLDER_TAG = 'hdl:callback-pending-classification';
 
 // A person has to act on these, even though the bot replied: an upset lead
 // asking for a manager, and a lead chasing something we promised and did not
@@ -40,17 +34,30 @@ export const HUMAN_FOLLOW_UP_INTENTS = new Set(['ANGRY', 'FULFILLMENT_NOT_RECEIV
 
 /**
  * @param {{ intent_class?: string, ghl_handoff_tag?: string }} classification
- * @returns {'silent' | 'workflow' | 'reply'}
+ * @returns {'silent' | 'reply'}
  */
 export function handoffReplyPolicy(classification = {}) {
   const intent = String(classification.intent_class || '').toUpperCase();
   if (OPT_OUT_HANDOFF_INTENTS.has(intent)) return 'silent';
-  const tag = String(classification.ghl_handoff_tag || '').trim().toLowerCase();
-  if (tag === CALLBACK_PLACEHOLDER_TAG || WORKFLOW_ANSWERED_HANDOFF_TAGS.has(tag)) return 'workflow';
+  // 2026-10-03 (Mark: "The GHL instant call center ring should not happen"):
+  // a call request is answered by the bot, and Five9 makes the call
+  // (bot-callback.js). The hdl:callback-* workflows bridged a GHL call from a
+  // GHL number, so nothing here hands the reply to them any more.
   return 'reply';
 }
 
 const NOTES = {
+  // 2026-10-03: a call request is answered by the bot; Five9 makes the call.
+  CALLBACK:
+    'The lead asked for a phone call. Say, in one or two sentences, that someone from our team will call them ' +
+    '(at the time they named if they gave one and it is inside team hours; otherwise the next opening). ' +
+    'No booking question, no pitch.',
+  CUSTOMER_STATUS_AFFIRMATIVE:
+    'The lead says they are already a Reece customer. Thank them and say a team member will reach out about it. ' +
+    'No pitch, no booking question.',
+  CUSTOMER_STATUS_NEGATIVE:
+    'The lead says they are not a customer yet and wants a call. Say someone from our team will call them, in one ' +
+    'or two sentences. No booking question.',
   ANGRY:
     'The lead is upset or asked for a manager. Apologize once, plainly, in one or two sentences, ' +
     'and say a manager has been told and will reach out to them personally. Do not sell, do not ' +

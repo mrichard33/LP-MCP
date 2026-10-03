@@ -258,6 +258,7 @@
  * Paired with sql/008_approval_queue_ttl.sql (48h auto-expiry).
  */
 
+import { CALLBACK_MARKER_TAG } from '../agentic/bot-callback.js';
 import supabase from '../supabase.js';
 import { sendApprovalRequest, sendGroupMeMessage } from '../groupme.js';
 import { resolveContactInfo, resolveLPProspectId, getEventContext } from './resolvers.js';
@@ -677,11 +678,12 @@ async function applyHandoffInline({
   // human callback beats silence (sales can transfer a customer). That
   // matches the hot path's own fallback whenever the probe can't be sent.
   let callbackBasis = null;
-  if (generated.intent_class === 'CALLBACK') {
-    const resolution = await resolveCallbackHandoff(contactId);
-    handoffTag = resolution.tag || CALLBACK_TAG_SALES;
-    callbackBasis = resolution.tag ? resolution.basis : 'ambiguous_approval_path_default_sales';
-    console.log(`[ApprovalPath] CALLBACK resolved for ${contactId}: ${handoffTag} (${callbackBasis})`);
+  // 2026-10-03 (Mark): no GHL instant ring. hdl:callback-* started GHL call
+  // bridges from a GHL number; a call request now leaves only the trace tag,
+  // and the approved reply's send files the Five9 callback (fileBotCallback).
+  if (generated.intent_class === 'CALLBACK' || /^hdl:callback-/.test(String(handoffTag || ''))) {
+    handoffTag = CALLBACK_MARKER_TAG;
+    callbackBasis = 'bot_reply_then_five9';
   }
 
   const tagsToApply = [];
@@ -862,7 +864,9 @@ export async function processApprovalQueue() {
           // reviewing this card.
           if (generated.handoff) {
             const h = generated.handoff;
-            const handoffTags = [h.handoff_tag, h.is_disqualifier ? 'suppress-automation' : null].filter(Boolean);
+            // Never an hdl:callback-* tag: those start GHL call bridges (2026-10-03).
+            const tag = /^hdl:callback-/.test(String(h.handoff_tag || '')) ? CALLBACK_MARKER_TAG : h.handoff_tag;
+            const handoffTags = [tag, h.is_disqualifier ? 'suppress-automation' : null].filter(Boolean);
             if (handoffTags.length) {
               await applyContactTagsInline(sendAction.target_id, handoffTags)
                 .catch(err => console.warn(`[ActionExecutor] handoff tag failed for ${sendAction.target_id} (fail-soft): ${err.message}`));

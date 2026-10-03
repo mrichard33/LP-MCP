@@ -135,6 +135,33 @@ export function isServiceCallback({ conversation = [], trigger = '', isCustomer 
 
 const COMPLAINT_RX = /\b(?:supposed\s+to\s+(?:come|show|be\s+(?:here|there)|call|arrive)|never\s+(?:came|showed(?:\s+up)?|arrived|called(?:\s+(?:me\s+)?back)?)|(?:didn'?t|did\s+not)\s+(?:come|show(?:\s+up)?|arrive|call(?:\s+(?:me\s+)?back)?)|stood\s+(?:me|us)\s+up|waited\s+all\s+(?:day|morning|afternoon)|(?:nobody|no\s+one|no-one)\s+(?:showed|came|called|answered)|complain\w*|ripped\s+off|rip[-\s]?off|scam\w*|refund|lawyer|attorney|sue\b|bbb|better\s+business|manager|supervisor|no[-\s]?show(?:ed)?|never\s+showed|(?:nobody|no\s+one)\s+(?:came|showed|called|answered)|unprofessional|rude|terrible\s+service|worst)\b/i;
 
+// Do-not-knock (2026-10-03, review of Part 14): a complaint about a canvasser
+// at the door is not a sales lead. Door words only: "come to my house" is how a
+// lead turns the VISIT down, and "nobody came" is a missed visit (a complaint).
+const KNOCK_RX = /\b(?:knock(?:ed|ing|s)?|door[-\s]?to[-\s]?door|canvass\w*|solicit\w*|(?:at|on|to|by)\s+(?:my|our)\s+(?:front\s+)?door)\b/i;
+const KNOCK_UPSET_RX = /\b(?:stop|don'?t|do\s+not|never|no\s+more|again|keeps?\s+(?:coming|knocking)|harass\w*|trespass\w*|no\s+soliciting|annoy\w*|bother\w*|rude|aggressive|pushy|leave\s+(?:me|us)\s+alone|not\s+welcome|sign|complain\w*|unprofessional|ridiculous|private\s+property|woke|scared)\b/i;
+const MISSED_VISIT_RX = /\b(?:nobody|no\s+one|no-one|never|didn'?t|did\s+not)\s+(?:came|come|showed|show|arrived?)\b/i;
+export const DNK_ASK_RX = /\bdo[-\s]not[-\s]knock\s+list\b/i;
+// What the next turn reads back from the model's version (Part 7 check).
+const DNK_MARKERS = {
+  address: [{ rx: DNK_ASK_RX, say: 'name "our do-not-knock list"' }, { rx: /\baddress\b/i, say: 'ask for the address' }],
+  name: [{ rx: /\bwhat\s+name\b/i, say: 'ask "what name" to put with it' }],
+  done: [{ rx: DNK_ASK_RX, say: 'say they are on "our do-not-knock list"' }],
+};
+
+/** A bare name reply ("Linda", "It's Linda Moore") or null. Pure. */
+function nameFromDnkReply(text) {
+  const m = String(text || '').trim().match(/^(?:(?:it'?s|this\s+is|my\s+name\s+is|i'?m)\s+)?([A-Za-z][A-Za-z'-]{1,30})(?:\s+[A-Za-z][A-Za-z'-]{1,30})?[.!]?$/i);
+  return m ? m[1].charAt(0).toUpperCase() + m[1].slice(1).toLowerCase() : null;
+}
+
+/** A homeowner upset about a canvasser at the door. Pure. */
+export function isKnockComplaint(text) {
+  const t = String(text || '');
+  if (!KNOCK_RX.test(t) || MISSED_VISIT_RX.test(t)) return false;
+  return KNOCK_UPSET_RX.test(t) || COMPLAINT_RX.test(t);
+}
+
 const SPOUSE_RX = /\b(?:wife|husband|spouse|partner|fianc[ée]e?)\b/i;
 const SPOUSE_OBJECTION_RX = /\b(?:talk|check|ask|discuss|run\s+(?:it|this))\b[^.?!]{0,40}\b(?:wife|husband|spouse|partner)\b|\b(?:wife|husband|spouse|partner)\b[^.?!]{0,40}\b(?:decides?|has\s+to|needs?\s+to|wants?\s+to|would\s+have\s+to|isn'?t\s+(?:here|home|sure))\b/i;
 const SHOPPING_RX = /\b(?:(?:\d|two|three|four|few|couple(?:\s+of)?|multiple|other|more)\s+(?:quotes|estimates|bids|companies|contractors)|shopping\s+around|comparing|getting\s+(?:other\s+)?(?:quotes|estimates|bids))\b/i;
@@ -253,7 +280,9 @@ export const LINES = Object.freeze({
     service: "Sorry about that. I'm passing this to our service team, and a team member will reach out.",
     service_callback: "Got it. I'm passing this to our service team, and a team member will reach out.",
     price_insist: "Understood. I'll have someone from our team call you to talk it through.",
-    two_nos: "No problem, I'll stop here. Someone from our team will check in with you directly.",
+    // 2026-10-03 (review of Part 14): two no's is a card for a person to
+    // review, never an auto-dial, so the line promises no contact.
+    two_nos: "No problem, I'll stop here. If anything changes, just reply here.",
     repeat_objection: "Understood. I'll have someone from our team call you so you get a straight answer.",
   },
   // 2026-10-02 (Mark): "right now" only while the team is in (team-hours.js).
@@ -265,6 +294,13 @@ export const LINES = Object.freeze({
     service_callback: (when) => `Got it. I've passed this to our service team, and a team member will reach out ${when}.`,
   },
   callback_outside_hours: (when) => `Got it. That's outside our team's hours, so I'll have someone call you ${when}.`,
+  // 2026-10-03: a complaint about a canvasser at the door. No sales call;
+  // collect the address (and a name if we have none) for the do-not-knock list.
+  dnk: {
+    ask_address: "I'm sorry about that. I'll make sure our team doesn't knock on your door again. What's the address, so I can add it to our do-not-knock list?",
+    ask_name: 'Thank you. And what name should I put with it?',
+    done: (name) => `Thank you${name ? `, ${name}` : ''}. You're on our do-not-knock list, and our team won't knock on your door again.`,
+  },
 });
 
 // Second wordings for lines that can come up twice in one thread (Mark,
@@ -482,7 +518,7 @@ export function discoveryEarned(conversation = [], trigger = '') {
 export function planNepqTurn({
   channel = 'sms', trigger = '', conversation = [], slots = [], tzLabel = '', firstName = null,
   hasAppointment = false, nextStepLabel = 'a free visit at your home', discipline = null, nowMs = Date.now(),
-  allSlots = null, isCustomer = false,
+  allSlots = null, isCustomer = false, callbackRequested = false,
 } = {}) {
   const turns = normalizeThread(conversation, trigger);
   const inbound = turns.filter(t => t.direction === 'inbound');
@@ -580,6 +616,34 @@ export function planNepqTurn({
   const handoff = (reason) => { const line = handoffLine(reason); return fixed('handoff', line, { step: 'handoff', handoff: { reason, line }, booking: { allowed: false, reason: `nepq:handoff_${reason}` } }); };
   const withSlots = (line) => { plan.slots_to_offer = offerSlots; plan.allowed.slot_offer = true; plan.booking = { allowed: true, reason: 'nepq:slot_offer' }; return line; };
 
+  // 0. Do-not-knock (2026-10-03): ask for the address once (and a name if we
+  //    have none), then the card goes to the canvass team. Never a sales call,
+  //    never a visit ask.
+  const dnk = (() => {
+    const askIdx = turns.map(t => t.direction === 'outbound' && DNK_ASK_RX.test(t.text) && /\baddress\b/i.test(t.text)).lastIndexOf(true);
+    // Done once we said anything else about the list (the model words it).
+    if (askIdx < 0 || turns.slice(askIdx + 1).some(t => t.direction === 'outbound' && DNK_ASK_RX.test(t.text) && !/\baddress\b/i.test(t.text))) return null;
+    const after = turns.slice(askIdx + 1);
+    const complaint = [...turns.slice(0, askIdx)].reverse().find(t => t.direction === 'inbound' && isKnockComplaint(t.text))?.text || '';
+    const address = after.find(t => t.direction === 'inbound')?.text || '';
+    const nameAskIdx = after.findIndex(t => t.direction === 'outbound' && /\bwhat\s+name\b/i.test(t.text));
+    const nameReply = nameAskIdx >= 0 ? (after.slice(nameAskIdx + 1).find(t => t.direction === 'inbound')?.text || '') : '';
+    return { complaint, address, askedName: nameAskIdx >= 0, nameReply };
+  })();
+  if (dnk) {
+    const dnkFixed = (step, line) => fixed('dnk', line, { step, booking: { allowed: false, reason: `nepq:${step}` }, reference_markers: DNK_MARKERS.name });
+    if (!firstName && !dnk.askedName) return dnkFixed('dnk_ask_name', LINES.dnk.ask_name);
+    const name = firstName || nameFromDnkReply(dnk.nameReply);
+    const line = LINES.dnk.done(name);
+    return fixed('handoff', line, {
+      step: 'handoff', booking: { allowed: false, reason: 'nepq:handoff_do_not_knock' }, reference_markers: DNK_MARKERS.done,
+      handoff: { reason: 'do_not_knock', line, extra: `Do-not-knock address: ${dnk.address.slice(0, 200) || 'not given'}\nName: ${name || dnk.nameReply.slice(0, 60) || 'not given'}\nTheir complaint: "${dnk.complaint.slice(0, 200)}"\nFive9: NOT added. No sales call.` },
+    });
+  }
+  if (isKnockComplaint(now)) {
+    return fixed('dnk', LINES.dnk.ask_address, { step: 'dnk_ask_address', booking: { allowed: false, reason: 'nepq:dnk_ask_address' }, reference_markers: DNK_MARKERS.address });
+  }
+
   // 1. A person takes over: complaint, price insisted after the play, two no's.
   if (EMERGENCY_RX.test(now)) return handoff('emergency');
   if (SERVICE_RX.test(now)) return handoff('service');
@@ -591,8 +655,11 @@ export function planNepqTurn({
     const line = (!teamOpen ? LINES.handoff_closed.service_callback(nextTeamOpenLabel(nowMs)) : LINES.handoff.service_callback);
     return fixed('handoff', line, { step: 'handoff', handoff: { reason: 'service', line }, booking: { allowed: false, reason: 'nepq:handoff_service' } });
   };
-  if (CALLBACK_RX.test(now) && !isNotInterested(now) && serviceCall()) return serviceHandoff();
-  if (CALLBACK_RX.test(now) && !isNotInterested(now)) {
+  // The intent classifier read a call request the regex missed ("can I talk
+  // to a real person on the phone"): same hand-off (2026-10-03).
+  const askedForCall = (CALLBACK_RX.test(now) || callbackRequested) && !isNotInterested(now);
+  if (askedForCall && serviceCall()) return serviceHandoff();
+  if (askedForCall) {
     // A call asked for outside team hours gets the next opening instead, and
     // after hours "call me back" names when (2026-10-02, Mark).
     const asked = requestedCallTime(now, nowMs);
@@ -955,7 +1022,7 @@ const URGENCY_RX = /\bonly\s+\d+\s+(?:spots?|slots?|openings?)\s+left\b|\bspots?
 const CLAIMS_RX = /\bcode\s+(?:changed|tightened|got\s+(?:stricter|tighter)|was\s+(?:updated|changed))\b|\b(?:after|since|before)\s+(?:the\s+)?(?:19|20)\d\d\b[^.?!]{0,40}\bcode\b|\bcode\b[^.?!]{0,40}\b(?:after|since|before)\s+(?:19|20)\d\d\b|\bpeak\s+(?:of\s+)?(?:the\s+)?(?:hurricane|storm)\s+season\b|\bmost\s+active\s+(?:stretch|part|time)\b|\b(?:storm\s+season|we)\s+(?:has|have)\s+(?:us\s+)?(?:slammed|swamped)\b|\bcalendar\s+(?:is\s+)?(?:tight|filling|full)\b|\b(?:andersen|renewal|pgt|pella|lowe'?s|home\s+depot|es\s+windows|cgi)\b[^.?!]{0,60}\b(?:uses?|only|standard|cheap\w*|worse|inferior|lower|basic)\b/i;
 const SEE_YOU_RX = /\bsee\s+you\s+(?:then|soon|there)\b/i;
 const SIGNOFF_RX = /(?:^|\s)([—–-]\s*[A-Z][A-Za-z.'’ ]{0,40})\s*$/;
-const FIXED_MOVES = new Set(['handoff', 'objection_play', 'ask_day', 'close', 'reveal', 'offer_slots', 'status_frame']);
+const FIXED_MOVES = new Set(['handoff', 'objection_play', 'ask_day', 'close', 'reveal', 'offer_slots', 'status_frame', 'dnk']);
 
 // ── Part 7 (Mark, 2026-10-02): "I don't think we need any static messages
 // sent by the bot. Each message should be custom." A fixed line is now a

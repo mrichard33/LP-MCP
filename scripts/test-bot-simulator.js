@@ -103,7 +103,8 @@ test('SMS: always dry-run, the simulated thread, the NEPQ override, one redraft 
   assert.match(formatTranscript(r), /redraft=conversation_repetition \(\d+(?:\.\d)?s \+ \d+(?:\.\d)?s\)/);
   const last = seen[seen.length - 1].opts.simulatedContext.conversation_recent;
   assert.deepEqual(last.map(m => m.direction), ['inbound', 'outbound', 'inbound'], 'the bot\'s own reply is in the next turn\'s thread');
-  assert.ok(r.transcript[1].would_do.some(w => w.reason === 'two_nos'));
+  // Part 14: a hand-off is a Five9 call + its card, recorded under its reason.
+  assert.ok(r.transcript[1].would_do.some(w => /^two_nos\b/.test(String(w.reason || ''))));
 });
 
 test('live-chat-only scenarios skip SMS; request parsing refuses bad input', async () => {

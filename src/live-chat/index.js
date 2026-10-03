@@ -386,16 +386,16 @@ async function bookSlot({ contactId, startIso, calendarId, decisionMakers = null
  * list too (src/agentic/bot-callback.js). A number typed this turn is written
  * to the contact first (fill-if-empty), because the Five9 record reads it.
  */
-async function nepqHandoff({ contactId, reason, inbound, firstName, hasPhone = true, phone = null, why = 'planned', kind = 'sales' }) {
+async function nepqHandoff({ contactId, reason, inbound, firstName, hasPhone = true, phone = null, why = 'planned', kind = 'sales', extra = null }) {
   const applyTags = (id, tags) => ghlFetch('POST', `/contacts/${id}/tags`, { tags }, { priority: 'normal' });
   const addNote = (id, note) => addGHLNote(id, note);
-  if (reason === 'callback_request') {
-    if (phone) await captureIdentity(contactId, { visitorTexts: [phone], capture: { phone } }).catch(() => null);
-    return fileBotCallback({ contactId, channel: 'livechat', inbound, firstName, hasPhone: hasPhone || !!phone, why, kind },
-      botCallbackDeps({ applyTags, addNote }));
-  }
   // A service hand-off posts to the market's #service channel (Mark, 2026-10-03).
-  return routeNepqHandoff({ contactId, reason, channel: 'livechat', inbound, firstName }, nepqHandoffDeps({ applyTags, addNote }));
+  if (reason === 'service') return routeNepqHandoff({ contactId, reason, channel: 'livechat', inbound, firstName }, nepqHandoffDeps({ applyTags, addNote }));
+  // Every other hand-off a person follows up on is a call: Five9's call-now
+  // list plus its card, never a GHL call bridge (Mark, 2026-10-03).
+  if (phone) await captureIdentity(contactId, { visitorTexts: [phone], capture: { phone } }).catch(() => null);
+  return fileBotCallback({ contactId, channel: 'livechat', inbound, firstName, hasPhone: hasPhone || !!phone, why, kind, reason, extra },
+    botCallbackDeps({ applyTags, addNote }));
 }
 
 /**

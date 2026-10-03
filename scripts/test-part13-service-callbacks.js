@@ -79,11 +79,13 @@ test('the service card goes to the market #service channel, with no callback wor
   posted.length = 0;
   await routeNepqHandoff({ contactId: 'C1', reason: 'service', channel: 'sms', inbound: 'x' }, { ...deps, serviceChannels: async () => [] });
   assert.deepEqual(posted, ['C_CONTACT_CENTER']);
-  // A sales callback still goes to #contact-center with the sales tag.
+  // A sales callback still goes to #contact-center, with the trace tag only:
+  // hdl:callback-sales started GHL's instant ring (Part 14, Mark 2026-10-03).
   posted.length = 0; tags.length = 0;
   await routeNepqHandoff({ contactId: 'C1', reason: 'callback_request', channel: 'sms', inbound: 'call me' }, deps);
   assert.deepEqual(posted, ['C_CONTACT_CENTER']);
-  assert.ok(tags.includes('hdl:callback-sales'));
+  assert.ok(!tags.some(t => t.startsWith('hdl:')), tags.join(','));
+  assert.ok(tags.includes('callback:requested'));
 });
 
 // ── 2026-10-03 replay after #1156 ──

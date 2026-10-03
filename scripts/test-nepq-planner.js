@@ -198,7 +198,7 @@ test('guard: a sentence already sent word for word is dropped', () => {
 
 // ── hand-off side effects and the prompt block ──
 
-test('hand-off: callback tag + reason tag, a rep note, one idempotent event, a card', async () => {
+test('hand-off: trace tag + reason tag, a rep note, one idempotent event, a card', async () => {
   const seen = { tags: null, note: null, event: null, card: null };
   await routeNepqHandoff({ contactId: 'C1', reason: 'price_insist', channel: 'sms', inbound: 'just give me a number', nowMs: Date.parse('2026-10-02T12:00:00Z') }, {
     applyTags: async (_id, tags) => { seen.tags = tags; },
@@ -206,7 +206,8 @@ test('hand-off: callback tag + reason tag, a rep note, one idempotent event, a c
     emitEvent: async (e) => { seen.event = e; },
     alert: async (t) => { seen.card = t; },
   });
-  assert.deepEqual(seen.tags, ['hdl:callback-sales', 'nepq:handoff:price_insist']);
+  // 2026-10-03 (Mark): no GHL instant ring, so a trace tag, never hdl:callback-sales.
+  assert.deepEqual(seen.tags, ['callback:requested', 'nepq:handoff:price_insist']);
   assert.match(seen.note, /\[AGENT TASK\]/);
   assert.equal(seen.event.idempotency_key, 'nepq_handoff_C1_price_insist_2026-10-02');
   assert.match(seen.card, /A PERSON IS NEEDED \(price insist\)/);
