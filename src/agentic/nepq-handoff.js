@@ -20,7 +20,7 @@
  * the card are cheap to repeat but the event is the record.
  */
 
-import { CALLBACK_TAG_SALES, CALLBACK_TAG_SERVICE } from '../knowledge/callback-resolver.js';
+import { CALLBACK_TAG_SALES } from '../knowledge/callback-resolver.js';
 import { GHL_LOCATION_ID } from '../actions/constants.js';
 
 /** #dispatch's live channel; SLACK_CHANNEL_DISPATCH overrides (same default as the cancel cards). */
@@ -70,8 +70,12 @@ export async function routeNepqHandoff({ contactId, reason, channel, inbound, fi
   const { note, card } = formatNepqHandoff({ reason, channel, inbound, contactId, firstName, extra });
   const day = new Date(nowMs).toISOString().slice(0, 10);
   const results = await Promise.allSettled([
-    // Service goes to the service queue (I.HDL-2), never the sales one (Mark, 2026-10-03).
-    Promise.resolve().then(() => deps.applyTags(contactId, [reason === 'service' ? CALLBACK_TAG_SERVICE : CALLBACK_TAG_SALES, `${NEPQ_HANDOFF_TAG_PREFIX}${reason}`])),
+    // Service never takes the sales callback tag (I.HDL-1 rings the lead through
+    // the call center). It takes no hdl:* tag at all: hdl:callback-service fires
+    // I.HDL-2, which texts "they're picking up now" and bridges a call, while
+    // Mark's ruling (2026-10-03) is our "a team member will reach out" plus the
+    // #service card.
+    Promise.resolve().then(() => deps.applyTags(contactId, reason === 'service' ? [`${NEPQ_HANDOFF_TAG_PREFIX}${reason}`] : [CALLBACK_TAG_SALES, `${NEPQ_HANDOFF_TAG_PREFIX}${reason}`])),
     Promise.resolve().then(() => deps.addNote(contactId, note)),
     Promise.resolve().then(() => deps.emitEvent({
       event_type: 'agentic.nepq_handoff', source: 'nepq_backbone', entity_type: 'contact', entity_id: contactId, ghl_contact_id: contactId,

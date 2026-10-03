@@ -61,7 +61,7 @@ test('a service callback never reaches Five9: it is the service hand-off', async
   assert.equal(calls.handoff[1].reason, 'callback_request');
 });
 
-test('the service card goes to the market #service channel with the service tag', async () => {
+test('the service card goes to the market #service channel, with no callback workflow tag', async () => {
   const posted = []; const tags = [];
   const deps = {
     applyTags: async (_id, t) => { tags.push(...t); }, addNote: async () => {}, emitEvent: async () => {},
@@ -72,8 +72,9 @@ test('the service card goes to the market #service channel with the service tag'
   };
   await routeNepqHandoff({ contactId: 'C1', reason: 'service', channel: 'sms', inbound: 'my install date?' }, deps);
   assert.deepEqual(posted, ['C_SERVICE_ORLANDO']);
-  assert.ok(tags.includes('hdl:callback-service'));
-  assert.ok(!tags.includes('hdl:callback-sales'));
+  // No hdl:* tag: hdl:callback-service would fire I.HDL-2's own text and call.
+  assert.ok(!tags.some(t => t.startsWith('hdl:')), tags.join(','));
+  assert.ok(tags.includes('nepq:handoff:service'));
   // No market channel: the service rollup (#contact-center), never nowhere.
   posted.length = 0;
   await routeNepqHandoff({ contactId: 'C1', reason: 'service', channel: 'sms', inbound: 'x' }, { ...deps, serviceChannels: async () => [] });
@@ -83,4 +84,24 @@ test('the service card goes to the market #service channel with the service tag'
   await routeNepqHandoff({ contactId: 'C1', reason: 'callback_request', channel: 'sms', inbound: 'call me' }, deps);
   assert.deepEqual(posted, ['C_CONTACT_CENTER']);
   assert.ok(tags.includes('hdl:callback-sales'));
+});
+
+// ── 2026-10-03 replay after #1156 ──
+const { enforceNepqPlan } = await import('../src/agentic/nepq-planner.js');
+test('a discovery turn asks one thing: a "let me get your zip" statement goes', () => {
+  const p = plan({ trigger: 'they leak', conversation: T(['outbound', 'What got you looking?']) });
+  const out = enforceNepqPlan('Got it. Let me get your zip code so I can confirm we serve your area.', p);
+  assert.ok(out.changes.includes('detail_request_dropped'));
+  assert.ok(!/zip/i.test(out.text), out.text);
+  assert.equal((out.text.match(/\?/g) || []).length, 1);
+});
+
+test('the bridge always ends on its question', () => {
+  const th = T(['inbound', 'drafty'], ['outbound', 'Which rooms?'], ['inbound', 'bedrooms'], ['outbound', 'How is that affecting you?'], ['inbound', 'getting worse'],
+    ['outbound', 'Based on what you told me, this could work for you. The next step would be a free visit at your home. Would that help?']);
+  const p = plan({ trigger: 'the kids are cold all winter', conversation: th });
+  assert.equal(p.required_move, 'bridge');
+  const out = enforceNepqPlan("Kids cold every winter is what we check for. The next step would be a free look at your home to see what's letting that cold in.", p);
+  assert.match(out.text, /next step[^?]*\. Would that help\?$/);
+  assert.ok(out.changes.includes('bridge_question_added'));
 });

@@ -309,6 +309,7 @@ import {
   CUSTOMER_STATUS_PENDING_TAG,
   CUSTOMER_STATUS_GATE_INTENT_SET,
   CALLBACK_TAG_SALES,
+  CALLBACK_TAG_SERVICE,
 } from './knowledge/callback-resolver.js';
 // Conversation Quality Pass v1.0 (2026-07-07): quiet-hours hold for
 // bot-initiated sends, near-duplicate suppression, stale/mid-generation
@@ -2125,6 +2126,21 @@ async function handleShortCircuit(contactId, generated, action, context, opts = 
   let tagApplied = false;
   if (tagsToApply.length > 0) {
     tagApplied = await applyContactTags(contactId, tagsToApply);
+  }
+
+  // ── A callback is filed for real (Mark, 2026-10-03) ───────────────
+  // The classifier's CALLBACK short-circuit is how most texted "can someone
+  // call me?" arrive, ahead of the NEPQ planner. Sales: the Five9 Callback
+  // Request list + the #contact-center card. Service: the market's #service
+  // channel, never Five9. The hdl:* tag above still starts its GHL workflow.
+  // Detached and fail-soft.
+  if (!opts.dryRun && generated.intent_class === 'CALLBACK' && (handoffTag === CALLBACK_TAG_SALES || handoffTag === CALLBACK_TAG_SERVICE)) {
+    const inbound = generated.trigger_message_preview || context?.trigger_message || '';
+    const deps = botCallbackDeps({ applyTags: applyContactTags, addNote: addGHLNote });
+    fileBotCallback({
+      contactId, channel: generated.channel || 'sms', inbound, why: 'classifier_callback',
+      kind: handoffTag === CALLBACK_TAG_SERVICE ? 'service' : 'sales',
+    }, deps).catch(err => console.warn(`[SendMessage] classifier callback filing failed for ${contactId} (fail-soft): ${err.message}`));
   }
 
   // ── Customer-status probe answered → clear the pending tag ────────

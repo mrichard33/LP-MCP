@@ -346,9 +346,12 @@ not a bare `answer` (the shutters thread and the drafty chat, 2026-10-03).
 know a team member will reach out and send to the Slack service channel." `isServiceCallback` (the lead's words are about an
 install, an order, a repair or a warranty, or a known customer, `isCustomerP2`, asks without naming new work) turns a call
 request into the `service` hand-off: the line says "a team member will reach out" (`LINES.handoff.service_callback`), the tag
-is `hdl:callback-service` (I.HDL-2), and the card goes to the contact's market `#service-<market>` channel
+is only `nepq:handoff:service` (no hdl:* tag: `hdl:callback-service` fires I.HDL-2's own text and call bridge), and the card
+goes to the contact's market `#service-<market>` channel
 (`serviceChannelsFor` → `resolveSlackChannels('service')`, falling back to #contact-center). Never Five9: `fileBotCallback`
-with `kind: 'service'` skips the requeue. Both bots' hand-offs use one production deps object, `nepqHandoffDeps`.
+with `kind: 'service'` skips the requeue. Both bots' hand-offs use one production deps object, `nepqHandoffDeps`. The
+classifier's CALLBACK short-circuit (`handleShortCircuit`, most texted "can someone call me?") files the same way after
+`resolveCallbackHandoff`: sales → Five9 + #contact-center, service → #service; its hdl:* tag still starts I.HDL-1 / I.HDL-2.
 
 **Book in the conversation, unconfirmed, on the right calendar (Mark, 2026-10-02).** Every bot booking is
 status `new` (the handler forces it). **Ask about decision makers ONCE, then book** (supersedes 2026-09-18):

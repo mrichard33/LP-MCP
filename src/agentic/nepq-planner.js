@@ -1319,6 +1319,11 @@ export function enforceNepqPlan(draft, plan, { allowFigures = false, known = {} 
   if (plan.required_move === 'bridge' && !BRIDGE_RX.test(body)) {
     body = plan.bridge_line || bridgeLine(plan);
     changes.push('bridge');
+  } else if (plan.required_move === 'bridge' && !body.includes('?')) {
+    // The bridge asks (2026-10-03 replay: "The next step would be a free look at
+    // your home to see what's letting that cold in." and nothing to answer).
+    body = `${body.replace(/[.!\s]+$/, '')}. Would that help?`;
+    changes.push('bridge_question_added');
   }
   if (referenceMove) {
     let failed = checkAgainstReference(body, refLine, refSlots, plan);
@@ -1356,11 +1361,18 @@ export function enforceNepqPlan(draft, plan, { allowFigures = false, known = {} 
   // booking confirmation, or a turn where a booking ask is allowed.
   const actionable = /\{\{|\bhttps?:\/\/|\ball set\b/i.test(body) || plan.booking?.allowed === true;
   if ((plan.required_move === 'probe' || plan.required_move === 'consequence') && !body.includes('?') && !actionable) {
+    // A discovery turn collects no details: "Let me get your zip code so I can
+    // confirm…" next to the question was two asks, and a zip asked twice
+    // (2026-10-03 replay). The statement goes; the discovery question stays.
+    const kept = splitSentences(body).filter(x => !DETAIL_REQUEST_RX.test(x));
+    if (kept.length && kept.length < splitSentences(body).length) { body = kept.join(' '); changes.push('detail_request_dropped'); }
     body = `${body.replace(/\s+$/, '')} ${discoveryQuestion(plan)}`.trim();
     changes.push('discovery_question_added');
   }
   return { text: changes.length ? withSignOff(body) : original, changes, failed: [] };
 }
+
+const DETAIL_REQUEST_RX = /\b(?:let\s+me\s+(?:get|grab|have)|(?:i|we)(?:'ll|’ll|\s+will)?\s+(?:just\s+|also\s+)?need|(?:can|could)\s+(?:you|i\s+get))\b[^.?!]*\b(?:zip|address|phone|number|e-?mail|name)\b/i;
 
 const DISCOVERY_QUESTIONS = {
   problem: [
