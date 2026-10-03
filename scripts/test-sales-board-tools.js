@@ -167,4 +167,6 @@ test('sale_p2_backstop_run: dry run is shadow mode; a real run is live with the 
   assert.equal(dry.sales[0].contract_date, '2026-10-01');
   await tool({ dry_run: false, since: '2026-08-01', max_actions: 100 });
   assert.deepEqual(calls[1], { mode: 'live', sinceDay: '2026-08-01', maxActions: 100 });
+  await tool({ dry_run: false, since: '2025-09-01', only: ['tag_deal_won', 'create_open'] });
+  assert.deepEqual(calls[2].onlyActions, ['tag_deal_won', 'create_open']);
 });

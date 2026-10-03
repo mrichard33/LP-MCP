@@ -223,6 +223,8 @@ test('digest: Sale → P2 backstop fixes are counted; a no-price sale is named o
       { event_type: 'p2.sale_backstop', event_subtype: 'created_lost', ghl_contact_id: 's2', created_at: iso(NOW - 3 * HOUR), payload: {} },
       { event_type: 'p2.sale_backstop', event_subtype: 'needs_review', ghl_contact_id: 's3', created_at: iso(NOW - 4 * HOUR),
         payload: { job_id: '59882', job_status: 'Awaiting Paperwork', reason: 'no_price_yet' } },
+      { event_type: 'p2.sale_backstop', event_subtype: 'needs_review', ghl_contact_id: 's4', created_at: iso(NOW - 4 * HOUR),
+        payload: { job_id: '58338', job_status: 'Awaiting Paperwork', reason: 'possible_duplicate_of_paid_job' } },
       { event_type: 'p2.sale_backstop', event_subtype: 'tagged_deal_won', ghl_contact_id: 'old', created_at: iso(NOW - 30 * HOUR), payload: {} },
     ],
   };
@@ -232,7 +234,8 @@ test('digest: Sale → P2 backstop fixes are counted; a no-price sale is named o
   assert.match(t, /Sales put into P2 by the backstop \(24h\)/);
   assert.match(t, /deal-won added \(C\.0 builds the card\): 1 — Sam Sale/);
   assert.match(t, /card created as Lost: 1 — Cara Cancel/);
-  assert.match(t, /Nora Noprice \(s3\) · LP job 59882 "Awaiting Paperwork" · LP job has no price yet/);
+  assert.match(t, /Nora Noprice \(s3\) · LP job 59882 "Awaiting Paperwork" · LP job has no price yet — not in P2 · price the job in LP/);
+  assert.match(t, /\(s4\) · LP job 58338 "Awaiting Paperwork" · looks like an old quote a paid job replaced — not in P2 · close it in LP if it is dead/);
   assert.ok(db.tables.audit_posted_items.some((r) => r.audit === 'p2_sale_backstop' && r.contact_id === 's3'));
 
   // Next morning: the no-price sale is not named again; with no new fixes, All clear.

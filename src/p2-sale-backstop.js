@@ -57,7 +57,8 @@
  * logs `[SaleP2Backstop]` lines; only live writes.
  */
 
-import { decidingJob, OPP_CF_LP_JOB_ID } from './p2-opportunity-context.js';
+import { decidingJob, OPP_CF_LP_JOB_ID, readOppJobId } from './p2-opportunity-context.js';
+import { WON_JOB_STATUSES } from './lp-job-terminal.js';
 import { lostReasonIdForJobStatus } from './lp-lost-reasons.js';
 import { PIPELINE_IDS, STAGE_MAP, GHL_LOCATION_ID } from './actions/constants.js';
 
@@ -112,6 +113,69 @@ export function firstSeenMs({ saleEventAt = null, contractDate = null } = {}) {
   return Date.parse(`${day}T04:00:00Z`) + DAY_MS;
 }
 
+const dayMs = (d) => {
+  const day = String(d || '').slice(0, 10);
+  return /^\d{4}-\d{2}-\d{2}$/.test(day) ? Date.parse(`${day}T00:00:00Z`) : NaN;
+};
+const hasPayment = (job) => Array.isArray(job?.payments) && job.payments.some((p) => parseFloat(p?.pmtamount) > 0);
+const within10pct = (a, b) => {
+  const x = parseFloat(a);
+  const y = parseFloat(b);
+  return Number.isFinite(x) && Number.isFinite(y) && x > 0 && y > 0 && Math.abs(x - y) <= 0.1 * Math.max(x, y);
+};
+
+/**
+ * Pure. Does a P2 card already stand for THIS job? (2026-10-03, repeat customers)
+ *
+ * "The contact has a P2 card" was the first rule, and it skipped every returning
+ * customer: their earlier job's card is closed Won, `deal-won` is already on the
+ * contact so C.0-IN never builds another, and the new job had no card at all
+ * (7 live jobs, ~$76k, on 2026-10-03 — e.g. 60124 after 59380 Paid In Full).
+ *
+ * Covered when: any card is OPEN; or a closed card is stamped with this job's
+ * LP Job ID; or a closed card has no stamp and was created on/after the job's
+ * contract day (C.0-IN's own cards carry no stamp, and are made at the sale).
+ */
+export function p2CoversJob(opps = [], job = {}) {
+  const list = (opps || []).filter(Boolean);
+  if (list.some((o) => String(o.status || 'open').toLowerCase() === 'open')) return true;
+  const jobId = String(job?.lp_job_id ?? '').trim();
+  const contract = dayMs(job?.contractdate);
+  return list.some((o) => {
+    const stamped = readOppJobId(o);
+    if (stamped) return stamped === jobId;
+    const created = Date.parse(o.createdAt || o.date_added || '');
+    return Number.isFinite(created) && Number.isFinite(contract) && created >= contract;
+  });
+}
+
+/**
+ * Pure. Is this live job probably an earlier quote that a PAID job replaced,
+ * rather than a second sale? (2026-10-03, user ruling: list these, never add.)
+ * True when the job has no payment AND the contact has a paid job (WON status)
+ * that was written later, or whose value — or a closed P2 card's value — is
+ * within 10% of this job's. 58338 ($74,536, no payment) beside 58102 Paid In
+ * Full ($80,191) is the case; adding it would put $74k of dead quote in pipeline.
+ */
+export const DUPLICATE_WINDOW_DAYS = 60;
+export function looksLikeDuplicateOfPaidJob(job, allJobs = [], p2Opps = []) {
+  if (!job || hasPayment(job)) return false;
+  const id = String(job.lp_job_id);
+  const contract = dayMs(job.contractdate);
+  // "Similar price" counts only near in time: a customer who paid $13,192 in
+  // April 2025 and bought again for $14,000 in October 2026 (60104) is a real
+  // second sale, not a copy.
+  const near = (ms) => Number.isFinite(ms) && Number.isFinite(contract) && Math.abs(ms - contract) <= DUPLICATE_WINDOW_DAYS * DAY_MS;
+  const paid = (allJobs || []).filter((j) => j && String(j.lp_job_id) !== id && WON_JOB_STATUSES.has(String(j.job_status || '').trim()));
+  if (paid.some((j) => {
+    const written = dayMs(j.contractdate);
+    return (Number.isFinite(contract) && written > contract) || (near(written) && within10pct(j.job_value, job.job_value));
+  })) return true;
+  return (p2Opps || []).some((o) => String(o?.status || '').toLowerCase() !== 'open'
+    && near(Date.parse(o?.createdAt || o?.date_added || ''))
+    && within10pct(o?.monetaryValue ?? o?.monetary_value, job.job_value));
+}
+
 /**
  * Pure. What to do for one contact.
  *
@@ -124,10 +188,20 @@ export function firstSeenMs({ saleEventAt = null, contractDate = null } = {}) {
  * @param {number} c.nowMs
  * @returns {{ action: string, reason: string }}
  */
-export function planForSale({ verdict, job, p2Opps, contact, taggedAtMs = null, nowMs }) {
+export function planForSale({ verdict, job, p2Opps, contact, taggedAtMs = null, nowMs, allJobs = [] }) {
   if (p2Opps === null || p2Opps === undefined) return { action: 'skip', reason: 'p2_unreadable' };
-  if (p2Opps.length > 0) return { action: 'skip', reason: 'has_p2' };
   if (!job || verdict === 'no_job') return { action: 'skip', reason: 'no_job' };
+  if (p2Opps.length > 0) {
+    // Only a LIVE job can be a repeat customer's uncovered sale. A terminal job
+    // on a contact that already has a card is left alone: a second Won/Lost card
+    // would double-count history.
+    if (verdict !== 'live' || p2CoversJob(p2Opps, job)) return { action: 'skip', reason: 'has_p2' };
+    if (jobValue(job) === null) return { action: 'report', reason: 'no_price_yet' };
+    if (looksLikeDuplicateOfPaidJob(job, allJobs, p2Opps)) return { action: 'report', reason: 'possible_duplicate_of_paid_job' };
+    // Never `deal-won` here: it is already on the contact (C.0-IN will not fire),
+    // and C.0-IN's own find-opportunity step could pick the OLD closed card.
+    return { action: 'create_open', reason: 'repeat_customer_new_job' };
+  }
 
   if (verdict === 'terminal_lost') {
     return lostReasonIdForJobStatus(job.job_status)
@@ -137,6 +211,7 @@ export function planForSale({ verdict, job, p2Opps, contact, taggedAtMs = null, 
   if (verdict === 'terminal_won') return { action: 'create_won', reason: `job ${String(job.job_status).trim()}` };
 
   if (jobValue(job) === null) return { action: 'report', reason: 'no_price_yet' };
+  if (looksLikeDuplicateOfPaidJob(job, allJobs, p2Opps)) return { action: 'report', reason: 'possible_duplicate_of_paid_job' };
   if (!contact) return { action: 'skip', reason: 'contact_unreadable' };
 
   const tags = tagsOf(contact);
@@ -193,14 +268,18 @@ async function readSaleEventTimes({ supabase, leadIds, sinceIso }) {
   return map;
 }
 
-/** Contacts the HL mirror shows WITH a P2 card (any status, not deleted). */
+/**
+ * Contacts the HL mirror shows with an OPEN P2 card. A contact whose cards are
+ * all closed still goes to the live read: its new job may be uncovered
+ * (p2CoversJob). 2026-10-03 — was "any status", which hid repeat customers.
+ */
 async function readMirrorP2Contacts({ hlRunSQL, esc, contactIds }) {
   const has = new Set();
   for (let i = 0; i < contactIds.length; i += CHUNK) {
     const ids = contactIds.slice(i, i + CHUNK).map((id) => `'${esc(id)}'`).join(',');
     const rows = await hlRunSQL(
       `SELECT DISTINCT ghl_contact_id FROM opportunities WHERE deleted_at IS NULL `
-      + `AND ghl_pipeline_id = '${esc(P2_PIPELINE_ID)}' AND ghl_contact_id IN (${ids})`,
+      + `AND status = 'open' AND ghl_pipeline_id = '${esc(P2_PIPELINE_ID)}' AND ghl_contact_id IN (${ids})`,
     );
     for (const r of rows || []) has.add(r.ghl_contact_id);
   }
@@ -291,7 +370,7 @@ export async function findSalesMissingP2(deps) {
   if (unlinked) logger.log?.(`[SaleP2Backstop] ${unlinked} recent job(s) have no GHL contact — not checked (see the link-leak monitor)`);
   if (!byContact.size) return [];
 
-  // Cheap first pass: drop every contact the mirror already shows with a P2 card.
+  // Cheap first pass: drop every contact the mirror already shows with an OPEN P2 card.
   const withP2 = await readMirrorP2Contacts({ hlRunSQL, esc, contactIds: [...byContact.keys()] });
   const suspects = [...byContact.keys()].filter((cid) => !withP2.has(cid));
   if (!suspects.length) return [];
@@ -316,7 +395,7 @@ export async function findSalesMissingP2(deps) {
 
     const p2Opps = await liveP2Opps({ ghlFetch, contactId: cid });
     const contact = p2Opps && p2Opps.length === 0 ? await liveContact({ ghlFetch, contactId: cid }) : null;
-    const plan = planForSale({ verdict, job: { ...recent, ...job }, p2Opps, contact, taggedAtMs: taggedAt.get(cid) ?? null, nowMs });
+    const plan = planForSale({ verdict, job: { ...recent, ...job }, p2Opps, contact, taggedAtMs: taggedAt.get(cid) ?? null, nowMs, allJobs: all.jobs });
     out.push({
       contactId: cid,
       contactName: [contact?.firstName, contact?.lastName].filter(Boolean).join(' ') || contact?.contactName || null,
@@ -434,6 +513,10 @@ export async function runSaleP2Backstop(opts = {}) {
   const deps = { ...(opts.deps?.__noDefaults ? {} : await defaultDeps()), ...(opts.deps || {}) };
   const nowMs = opts.nowMs ?? Date.now();
   const maxActions = opts.maxActions ?? MAX_ACTIONS;
+  // A one-time backfill may want only some write kinds (2026-10-03: the older
+  // live jobs and repeat sales, without minting Won/Lost cards for every sale
+  // finished before P2 existed). Absent = every kind.
+  const only = Array.isArray(opts.onlyActions) && opts.onlyActions.length ? new Set(opts.onlyActions) : null;
   const runId = `p2_sale_backstop:${new Date(nowMs).toISOString()}`;
 
   let sales;
@@ -456,8 +539,10 @@ export async function runSaleP2Backstop(opts = {}) {
     const line = `${sale.contactName || '(no name)'} (${sale.contactId}) job ${sale.job.lp_job_id} `
       + `"${sale.job.job_status}" $${Math.round(sale.job.job_value || 0).toLocaleString('en-US')} `
       + `contract ${String(sale.job.contractdate).slice(0, 10)} → ${sale.plan.action} (${sale.plan.reason})`;
-    if (!WRITES.has(sale.plan.action) || mode !== 'live' || writes >= maxActions) {
-      if (sale.plan.action !== 'skip') logger.log?.(`[SaleP2Backstop] ${mode === 'live' && WRITES.has(sale.plan.action) ? 'deferred (cap)' : mode}: ${line}`);
+    const filteredOut = only && WRITES.has(sale.plan.action) && !only.has(sale.plan.action);
+    if (!WRITES.has(sale.plan.action) || mode !== 'live' || writes >= maxActions || filteredOut) {
+      const why = filteredOut ? 'not selected' : (mode === 'live' && WRITES.has(sale.plan.action) ? 'deferred (cap)' : mode);
+      if (sale.plan.action !== 'skip') logger.log?.(`[SaleP2Backstop] ${why}: ${line}`);
       results.push({ ...sale, done: false });
       continue;
     }

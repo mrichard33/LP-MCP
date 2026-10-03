@@ -131,8 +131,11 @@ export function makeAnnounceMissedSale(deps = {}) {
  */
 export function makeSaleP2BackstopRun(deps = {}) {
   const { run = runSaleP2Backstop } = deps;
-  return async ({ dry_run = true, since = null, max_actions = 25 } = {}) => {
-    const res = await run({ mode: dry_run ? 'shadow' : 'live', sinceDay: since || null, maxActions: max_actions });
+  return async ({ dry_run = true, since = null, max_actions = 25, only = null } = {}) => {
+    const res = await run({
+      mode: dry_run ? 'shadow' : 'live', sinceDay: since || null, maxActions: max_actions,
+      ...(Array.isArray(only) && only.length ? { onlyActions: only } : {}),
+    });
     return {
       ok: res.ok, dry_run, summary: res.summary || res.skipped || res.error || null,
       counts: res.counts || {}, writes: res.writes ?? 0, failures: res.failures ?? 0,
@@ -156,6 +159,8 @@ export function registerSalesBoardTools(server, deps = {}) {
       dry_run: z.boolean().optional().default(true).describe('true (default) previews only; false writes to GHL'),
       since: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe('contract dates on or after this day (default: last 45 days)'),
       max_actions: z.number().int().min(1).max(500).optional().default(25),
+      only: z.array(z.enum(['tag_deal_won', 'create_open', 'create_won', 'create_lost'])).optional()
+        .describe('write only these kinds (e.g. a backfill of live jobs: ["tag_deal_won","create_open"]); default all'),
     },
     async (args) => text(await makeSaleP2BackstopRun(deps)(args)),
   );

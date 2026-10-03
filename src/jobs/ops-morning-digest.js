@@ -153,8 +153,16 @@ async function p2BackstopSection(deps, nowMs) {
     const { fresh } = await deps.filterNew({ audit: 'p2_sale_backstop', items: review, ttlDays: 30, nowMs, deps: { supabase: deps.supabase } });
     if (fresh.length) {
       const names = await loadNames(deps, fresh.map((i) => i.key));
-      const why = (r) => (r === 'no_price_yet' ? 'LP job has no price yet' : r || 'needs a look');
-      lines.push(...capLines(fresh.map((i) => `${nameOf(names, i.key)} (${i.key}) · LP job ${i.job.job_id} "${i.job.job_status}" · ${why(i.job.reason)} — not in P2 · price the job in LP`), SECTION_MAX));
+      // [what's wrong, what to do] per backstop report reason (src/p2-sale-backstop.js).
+      const REVIEW_TEXT = {
+        no_price_yet: ['LP job has no price yet', 'price the job in LP'],
+        possible_duplicate_of_paid_job: ['looks like an old quote a paid job replaced', 'close it in LP if it is dead'],
+      };
+      const text = (r) => REVIEW_TEXT[r] || [r || 'needs a look', 'check the job in LP'];
+      lines.push(...capLines(fresh.map((i) => {
+        const [wrong, todo] = text(i.job.reason);
+        return `${nameOf(names, i.key)} (${i.key}) · LP job ${i.job.job_id} "${i.job.job_status}" · ${wrong} — not in P2 · ${todo}`;
+      }), SECTION_MAX));
       record = { audit: 'p2_sale_backstop', items: fresh };
     }
   }

@@ -212,8 +212,14 @@ after a 30-minute grace:
   `executeMoveOpportunity`;
 - a cancelled or credit-declined sale is created Lost and goes to L.6;
 - a sale with no price yet is named once in the 08:00 digest.
+- **a repeat customer counts too (2026-10-03):** a card "covers" a job only if it is open, stamped with that LP Job ID,
+  or unstamped and made on/after the contract (`p2CoversJob`). A live job whose only cards are an older job's gets its
+  own card directly (never `deal-won`, which C.0-IN would apply to the old card). A no-payment job that a paid job
+  replaced (written later, or within 10% in value within 60 days) is listed for review, never added
+  (`looksLikeDuplicateOfPaidJob`). A terminal job on a contact that already has a card never gets a second one.
 
-The on-demand run is the MCP tool `sale_p2_backstop_run` (dry run by default). Do not revive the `deal-won`
+The on-demand run is the MCP tool `sale_p2_backstop_run` (dry run by default; `only` limits a backfill to some write
+kinds, so a wide `since` can fill live jobs without minting Won/Lost cards for sales finished before P2 existed). Do not revive the `deal-won`
 half of `checkLeadTriggers`: its filter never matched, and a "fixed" one would onboard every historical
 sale.
 
