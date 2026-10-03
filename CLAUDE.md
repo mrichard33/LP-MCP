@@ -59,6 +59,13 @@ handled or dropped, never forwarded, and it is gated on `PAYROLL_ENGINE_MODE=liv
 `SLACK_APPROVALS_ENABLED`. It authorises by active `lf_report_approvers` EMAIL (Slack `users.info`,
 bot scope `users:read.email`), not `SLACK_APPROVER_IDS`.
 
+**GroupMe cannot decide an approval (security review, 2026-10-03).** The GroupMe bot callback is
+unsigned, so `/webhook/groupme` ignores `yes/no/approve/reject/deny <id>` and `Edit <id>` (logged, never
+answered) and the card footer sends people to Slack. Slack's signed buttons are the only approval path.
+`/groupme/send` and `/groupme/pending` need the operator token. Do not re-add a text-command approval
+on any unsigned channel. The 60-minute auto-run also never removes a `PROTECTED_TAGS` / `dnc*` /
+`suppress:*` tag and never closes an opportunity won/lost (`needsAHuman` in `approval-escalation-sweep.js`).
+
 **Approval cards speak plain English; the rule code lives only in the `ref:` line.** A card that
 printed `P2_JOB_TERMINAL_WON` and `update_opportunity` could not be decided from (#486315). The body
 is built once, purely, in `src/approval-card.js` (What happened / If you approve / If you reject /

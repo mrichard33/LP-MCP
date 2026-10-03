@@ -150,13 +150,14 @@
  * v1.1 — Fix: rejection uses status='rejected' (was 'cancelled').
  *
  * Routes:
- *   POST /webhook/groupme — Callback URL for GroupMe bot
- *   POST /groupme/send    — Manual send (for testing)
- *   GET  /groupme/pending — View pending approval requests
+ *   POST /webhook/groupme — Callback URL for GroupMe bot (approvals OFF, 2026-10-03)
+ *   POST /groupme/send    — Manual send (operator token required)
+ *   GET  /groupme/pending — View pending approval requests (operator token required)
  *   GET  /groupme/queue-state — View in-flight debounce buffers (v1.7)
  */
 
 import { createHash } from 'node:crypto';
+import { denyAll } from './auth.js';
 import supabase from './supabase.js';
 import { generateResponse } from './response-generator.js';
 // GroupMe → Slack migration (2026-09-09). Every card that POSTs to GroupMe is
@@ -692,10 +693,11 @@ const RULE_DISPLAY_NAMES = {
   'AGENTIC_RESPOND_POST_CHATBOT': '🤖 AGENTIC RESPONSE',
 };
 
-// v1.6: standardized footer line so all approval cards advertise the
-// Yes / No / Edit options consistently.
+// v1.6: standardized footer line on every GroupMe approval card.
+// 2026-10-03 (security): GroupMe text replies no longer approve, reject or edit
+// anything — see handleGroupMeCallback — so the footer sends people to Slack.
 function approvalFooter(shortRef) {
-  return `Reply: Yes ${shortRef}  •  No ${shortRef}  •  Edit ${shortRef} <describe change>`;
+  return `Approve or reject in Slack (approval #${shortRef}). GroupMe replies no longer decide.`;
 }
 
 /**
@@ -921,8 +923,9 @@ async function sendRegeneratedApprovalCard({
   else { lines.push('If you approve:'); for (const e of effects) lines.push(`• ${e}`); }
   lines.push(`If you reject: ${describeReject(batchActions, { contactName: request.contact_name })}`);
   if (request.rule_applied) lines.push(`ref: ${request.rule_applied}`);
-  // v1.9: Edit X stays GroupMe-only, so the Slack card says where to go for it.
-  const slackCardText = `${lines.join('\n')}\n(To change the message again, use GroupMe: Edit ${shortRef} <change>)`;
+  // 2026-10-03: the GroupMe "Edit X" command is off (unauthenticated webhook), so
+  // the Slack card no longer points there.
+  const slackCardText = lines.join('\n');
   lines.push('');
   lines.push(approvalFooter(shortRef));
 
@@ -979,6 +982,8 @@ async function sendRegeneratedApprovalCard({
  *
  * Mark can edit again (recursive) or Yes/No the new card.
  */
+// 2026-10-03: no caller since the GroupMe "Edit" command was switched off (see
+// handleGroupMeCallback). Kept for a future signed Slack edit path.
 async function editApprovalRequest(shortRef, editInstruction, senderName) {
   // 1. Look up the pending approval
   const { data: request, error: reqErr } = await supabase
@@ -1247,8 +1252,24 @@ export async function resolveApproval({ shortRef, approve, resolverName, via = '
   return { ok: true, outcome: approve ? 'approved' : 'rejected', shortRef: ref, actionCount, ruleApplied: request.rule_applied };
 }
 
-async function handleGroupMeCallback(payload) {
-  if (payload.sender_type === 'bot') return { handled: false, reason: 'bot_message' };
+/**
+ * 2026-10-03 (security): GroupMe approvals, rejections and "Edit" are OFF.
+ *
+ * GroupMe bot callbacks carry no signature, so /webhook/groupme cannot tell a
+ * real group member from anyone on the internet who knows the group id. A POST
+ * of {"group_id":…, "text":"yes 12345"} approved a pending action, and
+ * "Edit 12345 <text>" rewrote a customer message (and fed the rewrite into
+ * agent_response_edits). Short refs are sequential agent_actions ids, so they
+ * were guessable. Slack buttons are HMAC-signed and check SLACK_APPROVER_IDS,
+ * so Slack is now the only place an approval is decided.
+ *
+ * Commands are logged and ignored. Nothing is posted back: a reply would turn
+ * this open endpoint into a way to make the bot talk in the group.
+ */
+const GROUPME_COMMAND_RX = /^(?:(?:yes|no|approve|reject|deny)\s+\d+\s*$|edit\s+\d+\b)/i;
+
+export async function handleGroupMeCallback(payload) {
+  if (!payload || payload.sender_type === 'bot') return { handled: false, reason: 'bot_message' };
 
   if (GROUPME_GROUP_ID && String(payload.group_id) !== GROUPME_GROUP_ID) {
     return { handled: false, reason: 'wrong_group' };
@@ -1257,49 +1278,23 @@ async function handleGroupMeCallback(payload) {
   const text = (payload.text || '').trim();
   const senderName = payload.name || 'Unknown';
 
-  // v1.6: Edit pattern checked FIRST (before approval pattern). Format:
-  //   "Edit 1234 propose specific times not just days"
-  // The description after the ID is captured greedily.
-  const editMatch = text.match(/^edit\s+(\d+)\s+(.+)$/is);
-  if (editMatch) {
-    const shortRef = editMatch[1];
-    const editInstruction = editMatch[2].trim();
-    if (!editInstruction) {
-      await sendGroupMeMessage(`❓ Edit ${shortRef} requires a description. Format: Edit ${shortRef} <describe what to change>`);
-      return { handled: true, action: 'edit_no_description' };
-    }
-    console.log(`[GroupMe] Edit command for #${shortRef} by ${senderName}: "${editInstruction.slice(0, 100)}"`);
-    return await editApprovalRequest(shortRef, editInstruction, senderName);
+  if (GROUPME_COMMAND_RX.test(text)) {
+    console.warn(`[GroupMe] Ignored approval/edit command from "${senderName.slice(0, 40)}" — GroupMe approvals are disabled; decide in Slack`);
+    return { handled: false, reason: 'groupme_approvals_disabled' };
   }
 
-  // Standard Yes/No approval pattern
-  const approvalMatch = text.match(/^(yes|no|approve|reject|deny)\s+(\d+)\s*$/i);
-  if (!approvalMatch) {
-    console.log(`[GroupMe] Non-approval message from ${senderName}: "${text.slice(0, 50)}"`);
-    return { handled: false, reason: 'not_approval_command' };
-  }
-
-  const decision = approvalMatch[1].toLowerCase();
-  const shortRef = approvalMatch[2];
-  const isApproved = ['yes', 'approve'].includes(decision);
-
-  console.log(`[GroupMe] Approval ${isApproved ? 'YES' : 'NO'} for #${shortRef} by ${senderName}`);
-
-  const result = await resolveApproval({ shortRef, approve: isApproved, resolverName: senderName, via: 'groupme' });
-
-  if (result.outcome === 'not_found' || result.outcome === 'already_resolved') {
-    await sendGroupMeMessage(`❓ No pending approval found for #${shortRef}. It may have already been processed.`);
-    return { handled: true, action: 'not_found', shortRef };
-  }
-  if (!result.ok) return { handled: true, action: 'error', error: result.error };
-  return { handled: true, action: result.outcome, shortRef, actionCount: result.actionCount };
+  return { handled: false, reason: 'not_approval_command' };
 }
 
 // ═══════════════════════════════════════════════════════════════════
 // EXPRESS ROUTES
 // ═══════════════════════════════════════════════════════════════════
 
-export function registerGroupMeRoutes(app) {
+export function registerGroupMeRoutes(app, authenticate) {
+  // 2026-10-03 (security): /groupme/send let anyone post as the bot and
+  // /groupme/pending listed the approval refs. Both now need the operator
+  // token. Registered without a middleware, they refuse everything.
+  const guard = typeof authenticate === 'function' ? authenticate : denyAll;
 
   app.post('/webhook/groupme', async (req, res) => {
     res.status(200).json({ ok: true });
@@ -1310,14 +1305,14 @@ export function registerGroupMeRoutes(app) {
     }
   });
 
-  app.post('/groupme/send', async (req, res) => {
+  app.post('/groupme/send', guard, async (req, res) => {
     const { message } = req.body || {};
     if (!message) return res.status(400).json({ error: 'message required' });
     const result = await sendGroupMeMessage(message);
     res.json(result);
   });
 
-  app.get('/groupme/pending', async (req, res) => {
+  app.get('/groupme/pending', guard, async (req, res) => {
     try {
       const { data, error } = await supabase
         .from('groupme_approval_requests')

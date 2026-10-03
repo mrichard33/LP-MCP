@@ -192,7 +192,17 @@ export function parseNetReportRtp(csvText, brnMap, reportAsOfOverride) {
  * @param {string} [throughMonthStart]  YYYY-MM-01 exclusive upper bound; default current month.
  * @returns {{ restated:number }}
  */
+// 2026-10-03 (security): `throughMonthStart` arrives from the query string and is
+// written into the SQL text, which runs through run_sql with the service role. An
+// unvalidated value was a SQL injection on a public route. Only YYYY-MM-01 passes.
+export const MONTH_START_RX = /^\d{4}-(0[1-9]|1[0-2])-01$/;
+
 export async function restateClosedFromReport({ throughMonthStart } = {}) {
+  if (throughMonthStart !== undefined && !MONTH_START_RX.test(String(throughMonthStart))) {
+    const err = new Error('through must be a month start like 2026-09-01');
+    err.statusCode = 400;
+    throw err;
+  }
   const bound = throughMonthStart
     ? `DATE '${throughMonthStart}'`
     : `date_trunc('month', CURRENT_DATE)`;
@@ -295,6 +305,7 @@ export function registerNetReportRoutes(app) {
       const result = await restateClosedFromReport({ throughMonthStart: through });
       res.json({ success: true, ...result, through: through || 'current_month' });
     } catch (err) {
+      if (err.statusCode === 400) return res.status(400).json({ success: false, error: err.message });
       console.error('[NetReport] restate error:', err.message);
       res.status(500).json({ success: false, error: err.message });
     }
