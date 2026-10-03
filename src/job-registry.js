@@ -263,6 +263,19 @@ export const JOBS = Object.freeze([
     isEnabled: (env) => String(env.SALE_ANNOUNCE_BACKSTOP_ENABLED || 'true').toLowerCase() !== 'false',
   },
   {
+    // 2026-10-03: every recent LP sale must have a P2 (Client Lifecycle)
+    // opportunity. LP's webhook to I.LP-IN stopped on 09-24, so `deal-won` —
+    // and with it C.0-IN's P2 card — stopped too. Mirrors backstopMode() in
+    // src/p2-sale-backstop.js: off | shadow (default) | live.
+    id: 'sale-p2-backstop',
+    label: 'Sale → P2 opportunity backstop',
+    group: 'notifications',
+    cadence: 'every 15 min',
+    enabledEnv: 'SALE_P2_BACKSTOP_MODE',
+    enabledDefault: true,
+    isEnabled: (env) => String(env.SALE_P2_BACKSTOP_MODE || 'shadow').toLowerCase().trim() !== 'off',
+  },
+  {
     // 2026-09-25: last month's final standings, 08:00 ET on the 1st, before
     // every office starts again at $0. Same gate as the daily board, and only
     // in month-to-date mode — the rolling board has no month to close.

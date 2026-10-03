@@ -5,6 +5,9 @@
  *                              month's final standings) to #sales-all now
  *   announce_missed_sale       post ONE sale the backstop could not reach, as
  *                              the same one-line catch-up the digest uses
+ *   sale_p2_backstop_run       (2026-10-03) put every recent LP sale with no P2
+ *                              opportunity into P2 — the one-time backfill and
+ *                              an on-demand pass of src/p2-sale-backstop.js
  *
  * WHY THESE EXIST. Both automatic paths have a window, and on 2026-09-25 a
  * post fell outside each one:
@@ -38,6 +41,8 @@ import {
   postDigest,
   RECENT_APPT_MS,
 } from '../notifications/sale-backstop.js';
+
+import { runSaleP2Backstop } from '../p2-sale-backstop.js';
 
 const text = (obj) => ({ content: [{ type: 'text', text: JSON.stringify(obj, null, 2) }] });
 
@@ -118,7 +123,43 @@ export function makeAnnounceMissedSale(deps = {}) {
   };
 }
 
+/**
+ * 2026-10-03: run the Sale → P2 backstop on demand. Same code as the 15-minute
+ * job; `since` widens the lookback for the one-time backfill (LP's webhook
+ * stopped on 2026-09-24, and older gaps exist). Dry run by default: shadow mode
+ * decides every sale and writes nothing to GHL.
+ */
+export function makeSaleP2BackstopRun(deps = {}) {
+  const { run = runSaleP2Backstop } = deps;
+  return async ({ dry_run = true, since = null, max_actions = 25 } = {}) => {
+    const res = await run({ mode: dry_run ? 'shadow' : 'live', sinceDay: since || null, maxActions: max_actions });
+    return {
+      ok: res.ok, dry_run, summary: res.summary || res.skipped || res.error || null,
+      counts: res.counts || {}, writes: res.writes ?? 0, failures: res.failures ?? 0,
+      sales: (res.results || []).filter((r) => r.plan?.action !== 'skip' || r.plan?.reason !== 'has_p2').map((r) => ({
+        contact_id: r.contactId, name: r.contactName, lp_job_id: r.job?.lp_job_id, job_status: r.job?.job_status,
+        job_value: r.job?.job_value, contract_date: String(r.job?.contractdate || '').slice(0, 10),
+        action: r.plan?.action, reason: r.plan?.reason, done: r.done === true, error: r.error || r.result?.error || null,
+      })),
+    };
+  };
+}
+
 export function registerSalesBoardTools(server, deps = {}) {
+  server.tool(
+    'sale_p2_backstop_run',
+    'Find every recent LP sale with no GHL Pipeline 2 (Client Lifecycle) opportunity and put it there: adds deal-won '
+      + '(GHL C.0 builds the card), creates the card directly when deal-won is already on the contact, and creates '
+      + 'cancelled sales as Lost. Dry run by default — lists each sale and the planned step, writes nothing. '
+      + '`since` (YYYY-MM-DD) widens the lookback for a backfill; max_actions caps writes per run.',
+    {
+      dry_run: z.boolean().optional().default(true).describe('true (default) previews only; false writes to GHL'),
+      since: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe('contract dates on or after this day (default: last 45 days)'),
+      max_actions: z.number().int().min(1).max(500).optional().default(25),
+    },
+    async (args) => text(await makeSaleP2BackstopRun(deps)(args)),
+  );
+
   server.tool(
     'post_office_power_ranking',
     'Post the office power ranking to #sales-all now: the month-to-date board (kind "daily") or last month\'s '

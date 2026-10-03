@@ -184,6 +184,23 @@ who types a phone number that already has a contact is MERGED by GHL, and that m
 never fires). Keep any I/O before a webhook's response capped — the
 `findRecentCanvassMark` pre-check is held to 3s for that reason.
 
+**Every LP sale gets a P2 card, even when LP's webhook does not arrive (2026-10-03).** A P2 (Client
+Lifecycle) card is built only by LP's outbound webhook → GHL I.LP-IN (adds `deal-won`) → C.0-IN (P1 Sale
+Recorded + P2 Contract Signed, valued from LP Gross Sale Amount). LP's webhook all but stopped on 2026-09-24,
+so 41 sales (~$1.1M) never reached P2 and the GHL Pipeline Value tile fell. `src/p2-sale-backstop.js`
+(job `sale-p2-backstop`, every 15 min, `SALE_P2_BACKSTOP_MODE` off|shadow|live, default shadow) checks every
+LP job with a contract in the last 45 days. If the contact has no P2 card in ANY status, read live from GHL
+after a 30-minute grace:
+- a live sale gets `deal-won`, so C.0-IN does the rest;
+- a sale that already has `deal-won`, or a do-not-contact sale, gets the card directly through
+  `executeMoveOpportunity`;
+- a cancelled or credit-declined sale is created Lost and goes to L.6;
+- a sale with no price yet is named once in the 08:00 digest.
+
+The on-demand run is the MCP tool `sale_p2_backstop_run` (dry run by default). Do not revive the `deal-won`
+half of `checkLeadTriggers`: its filter never matched, and a "fixed" one would onboard every historical
+sale.
+
 ## Alerting
 
 Alert modules are **pure and dependency-free** so they unit-test without importing supabase, GroupMe

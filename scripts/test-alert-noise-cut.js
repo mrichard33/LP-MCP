@@ -215,6 +215,32 @@ test('digest: P2 won/lost with names, new parity keys only, and the morning chec
   assert.match(again.sent[0].text, /All clear\./);
 });
 
+// 2026-10-03: the Sale → P2 backstop's work is a digest section, not its own card.
+test('digest: Sale → P2 backstop fixes are counted; a no-price sale is named once', async () => {
+  const tables = {
+    system_events: [
+      { event_type: 'p2.sale_backstop', event_subtype: 'tagged_deal_won', ghl_contact_id: 's1', created_at: iso(NOW - 2 * HOUR), payload: {} },
+      { event_type: 'p2.sale_backstop', event_subtype: 'created_lost', ghl_contact_id: 's2', created_at: iso(NOW - 3 * HOUR), payload: {} },
+      { event_type: 'p2.sale_backstop', event_subtype: 'needs_review', ghl_contact_id: 's3', created_at: iso(NOW - 4 * HOUR),
+        payload: { job_id: '59882', job_status: 'Awaiting Paperwork', reason: 'no_price_yet' } },
+      { event_type: 'p2.sale_backstop', event_subtype: 'tagged_deal_won', ghl_contact_id: 'old', created_at: iso(NOW - 30 * HOUR), payload: {} },
+    ],
+  };
+  const { deps, sent, db } = digestDeps({ tables, names: { s1: 'Sam Sale', s2: 'Cara Cancel', s3: 'Nora Noprice' } });
+  await digest.runOpsMorningDigest({ post: true, deps });
+  const t = sent[0].text;
+  assert.match(t, /Sales put into P2 by the backstop \(24h\)/);
+  assert.match(t, /deal-won added \(C\.0 builds the card\): 1 — Sam Sale/);
+  assert.match(t, /card created as Lost: 1 — Cara Cancel/);
+  assert.match(t, /Nora Noprice \(s3\) · LP job 59882 "Awaiting Paperwork" · LP job has no price yet/);
+  assert.ok(db.tables.audit_posted_items.some((r) => r.audit === 'p2_sale_backstop' && r.contact_id === 's3'));
+
+  // Next morning: the no-price sale is not named again; with no new fixes, All clear.
+  const again = digestDeps({ tables: { system_events: [{ ...tables.system_events[2], created_at: iso(NOW + 20 * HOUR) }], audit_posted_items: db.tables.audit_posted_items } });
+  await digest.runOpsMorningDigest({ post: true, deps: { ...again.deps, nowMs: NOW + 24 * HOUR } });
+  assert.match(again.sent[0].text, /All clear\./);
+});
+
 test('digest: a sub-job that fails posts its own "could not run" card; the digest still posts', async () => {
   const jobs = { 'lead-leak-monitor': { status: 'failed', error: 'Five9 history read failed' } };
   const { deps, sent } = digestDeps({ jobs });

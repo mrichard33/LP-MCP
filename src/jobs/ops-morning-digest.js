@@ -19,6 +19,8 @@
 //   4. Lead leak + never-reached-LP  (lead-leak-monitor daily pass)
 //   5. LP↔GHL link leak  (link-leak-monitor)
 //   6. P2 with no LP job  (p2-unresolvable-monitor)
+//   (2026-10-03) Sales the Sale → P2 backstop put into P2 in the last 24h, and
+//   the ones it could not (no price yet) — src/p2-sale-backstop.js.
 // Sections 3–6 run their job here, each under its own runJob so job_runs keeps
 // one row per job. A job that FAILS posts its own "could not run" card
 // straight away — silence must never hide a failure — and its section is left
@@ -114,6 +116,50 @@ async function p2Section(deps, nowMs) {
     lines.push(`${label}: ${byKind[kind].size} — ${shown}${who.length > SECTION_MAX ? ` +${who.length - SECTION_MAX} more` : ''}`);
   }
   return { title: `P2 closed in the last 24h (${byKind.won.size} won, ${byKind.lost.size} lost)`, lines };
+}
+
+// 2026-10-03: what the Sale → P2 backstop (src/p2-sale-backstop.js) did in the
+// last 24h, and the sales it could not place on its own. A fix is an event, not
+// a problem, so fixes are counted every day; a needs-review sale is named once.
+const P2_BACKSTOP_FIXES = {
+  tagged_deal_won: 'deal-won added (C.0 builds the card)',
+  created_open: 'card created',
+  created_won: 'card created as Won',
+  created_lost: 'card created as Lost',
+};
+
+async function p2BackstopSection(deps, nowMs) {
+  const since = new Date(nowMs - DAY_MS).toISOString();
+  const { data, error } = await deps.supabase.from('system_events')
+    .select('ghl_contact_id, event_subtype, payload')
+    .eq('event_type', 'p2.sale_backstop')
+    .gte('created_at', since);
+  if (error) throw new Error(`P2 backstop read failed: ${error.message}`);
+  const rows = data || [];
+  if (!rows.length) return null;
+  const lines = [];
+  const fixed = rows.filter((r) => P2_BACKSTOP_FIXES[r.event_subtype]);
+  if (fixed.length) {
+    const names = await loadNames(deps, fixed.map((r) => r.ghl_contact_id));
+    for (const [sub, label] of Object.entries(P2_BACKSTOP_FIXES)) {
+      const who = [...new Set(fixed.filter((r) => r.event_subtype === sub).map((r) => nameOf(names, r.ghl_contact_id)))];
+      if (who.length) lines.push(`${label}: ${who.length} — ${who.slice(0, SECTION_MAX).join(', ')}${who.length > SECTION_MAX ? ` +${who.length - SECTION_MAX} more` : ''}`);
+    }
+  }
+  const review = rows.filter((r) => r.event_subtype === 'needs_review')
+    .map((r) => ({ key: r.ghl_contact_id, reason: `needs_review:${r.payload?.job_id ?? ''}`, job: r.payload || {} }));
+  let record = null;
+  if (review.length) {
+    const { fresh } = await deps.filterNew({ audit: 'p2_sale_backstop', items: review, ttlDays: 30, nowMs, deps: { supabase: deps.supabase } });
+    if (fresh.length) {
+      const names = await loadNames(deps, fresh.map((i) => i.key));
+      const why = (r) => (r === 'no_price_yet' ? 'LP job has no price yet' : r || 'needs a look');
+      lines.push(...capLines(fresh.map((i) => `${nameOf(names, i.key)} (${i.key}) · LP job ${i.job.job_id} "${i.job.job_status}" · ${why(i.job.reason)} — not in P2 · price the job in LP`), SECTION_MAX));
+      record = { audit: 'p2_sale_backstop', items: fresh };
+    }
+  }
+  if (!lines.length) return null;
+  return { title: `Sales put into P2 by the backstop (24h)`, lines, record };
 }
 
 async function paritySection(deps, nowMs) {
@@ -232,7 +278,7 @@ export async function runOpsMorningDigest({ post = true, deps: depsArg } = {}) {
     if (post) await deps.sendAlertMessage(`⚠️ ${label} could not run: ${error}`, { channel: 'ops' });
   };
 
-  for (const [label, build] of [['P2 won/lost summary', p2Section], ['Appointment parity summary', paritySection]]) {
+  for (const [label, build] of [['P2 won/lost summary', p2Section], ['Sale → P2 backstop summary', p2BackstopSection], ['Appointment parity summary', paritySection]]) {
     try { sections.push(await build(deps, nowMs)); } catch (err) { await couldNotRun(label, err.message); }
   }
 
