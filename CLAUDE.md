@@ -215,6 +215,12 @@ uncalled-leads card names only leads not posted in 7 days; outages post on state
 `ALERT_DIGEST_ENABLED=false` restores the per-alert cards (drift stays once-per-contact). Info-only rule cards
 are listed in `src/alert-noise.js`; a new informational card belongs in the digest, not its own post.
 
+**The reply SLA backstop is 3 minutes (2026-10-03).** `src/jobs/reply-sla-watchdog.js` (live) emits
+`agentic.reply_unanswered` for a text with no completed reply after `REPLY_SLA_MINUTES` (default 3, was 10), and
+rules 371–374 re-analyse, recover, alert. A reply still being written (a send row pending/approved/executing,
+younger than the send path's budget) is `in_flight` and is waited for, so a slow reply is never answered twice.
+A skipped send is not an answer.
+
 **A job that never throws must still be able to fail.** `runJob` in `src/job-runner.js`
 records one row per scheduled pass, and it classifies from the RETURN VALUE, not just from a
 thrown error — `runMemoryNightly` and friends catch everything internally and report failure as
@@ -339,6 +345,7 @@ not searchable yet: 44 of 68 turns in two days), so the thread falls back to our
 - **Claim before analyse:** a `pending_analysis` event claims its message (`routePendingReply` in `decision-engine.js`) and is not re-analysed when the buffer or the poller already did. A failed analysis releases the claim (`claim_released_on_failure`).
 - **Slot re-check before booking:** the picked time is read again from GHL right before `book_appointment` (`src/agentic/slot-recheck.js`: no notice floor, no count cap). If it was taken: no booking, and the reply offers the two nearest open times (`slot_taken_before_book`). If the read cannot tell, the booking goes ahead.
 - **Burst wait:** the SMS reply buffer waits 15s (`REPLY_DEBOUNCE_MS`), not 35s.
+- **A yield needs a real boundary (2026-10-03, Mark: "the bot needs to always respond").** "Well we have hurricane shutters now." got no reply: `findNewerInbound` read a null `last_inbound_event_id` as `Number(null) === 0` and gave the reply away to the lead's OLDER "Huh?". The boundary is now only a positive id or a real timestamp (falling back to `inbound_event_id`), a reply never yields to its own message or anything before it, and every analysis path carries the boundary (`inboundFromReplyEvent`: `routePendingReply`, the pending-replies poller, `reanalyze_reply`). With no boundary, the reply is sent.
 
 **Part 7: no static messages; every reply is AI-written with the whole lead in view (Mark, 2026-10-02).**
 Mark: "I don't think we need any static messages sent by the bot. Each message should be custom."

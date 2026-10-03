@@ -248,6 +248,7 @@ import { emitEvent } from './event-emitter.js';
 import { claimConsumedMessages, releaseConsumedMessages } from './services/consumed-messages.js';
 import { runInboundIdentityPass } from './services/identity-extraction.js';
 import { callLLM, resolveLLM, llmBudgetMs } from './llm-client.js';
+import { inboundFromReplyEvent } from './agentic/burst-yield.js';
 // Booking-flow ownership guard (2026-06-03). When a booking is in flight the
 // booking flow owns the turn — the analyzer must not divert it into objection-
 // handling or rep escalation (that produced a duplicate "a rep will call" send
@@ -1765,12 +1766,9 @@ export async function analyzePendingReplies({ limit = 10 } = {}) {
                          : (rawType.includes('live_chat') || rawType.includes('livechat') || rawType.includes('webchat')) ? 'livechat'
                          : rawType.includes('sms')   ? 'sms'
                          : null;
-    const result = await analyzeMessage(contactId, messageText, event.id, inboundChannel, event.payload?.message_id || null, {
-      event_id: event.id,
-      received_at: event.payload?.inbound_at || null,
-      webhook_received_at: event.payload?.webhook_received_at || null,
-      event_created_at: event.created_at || null,
-    });
+    // 2026-10-03: inboundFromReplyEvent adds the batch boundary (last_event_id,
+    // message_keys) the send-time burst yield needs. See burst-yield.js.
+    const result = await analyzeMessage(contactId, messageText, event.id, inboundChannel, event.payload?.message_id || null, inboundFromReplyEvent(event));
     // 2026-07-03: the dedup sentinel ({skipped:true, reason:'recently_analyzed'})
     // is a terminal no-op — count it skipped, keep the consumed-message claim
     // (the message WAS handled by whoever analyzed it first).

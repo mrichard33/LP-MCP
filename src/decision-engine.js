@@ -252,6 +252,7 @@ import { withGhlToken } from './ghl-rate-limiter.js';
 import { contactHadDemo } from './demo-truth.js';
 import { fetchCurrentLead } from './current-lead.js';
 import { lpStoredToUtcMs } from './lp-dates.js';
+import { inboundFromReplyEvent } from './agentic/burst-yield.js';
 
 // ═══════════════════════════════════════════════════════════════════
 // CONSTANTS
@@ -2573,7 +2574,10 @@ export async function routePendingReply(event, { inboundChannel = null } = {}, d
   // Whatever the analyzer does or fails to do, runReplyBackstopIfAnalyzerSilent
   // decides whether this lead still gets an answer (2026-08-03).
   const run = Promise.resolve()
-    .then(() => analyze(contactId, messageText, event.id, inboundChannel, messageKey))
+    // 2026-10-03: the inbound carries the batch boundary the send-time burst
+    // yield reads. Without it the yield compared against id 0 and dropped the
+    // reply for an OLDER message (burst-yield.js).
+    .then(() => analyze(contactId, messageText, event.id, inboundChannel, messageKey, inboundFromReplyEvent(event)))
     .then(async (result) => {
       if (!result) await releaseClaim();
       return backstop(event, result);

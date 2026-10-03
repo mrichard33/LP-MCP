@@ -39,7 +39,10 @@ const PRODUCT_OBJECT_RX = /^(?:the\s+|my\s+|our\s+|your\s+|existing\s+|old\s+)?(
 // "do you service/serve/cover/come to/work in …" and friends.
 const VERB_PLACE_RX = /\b(?:do|does|can|will|would|are|r)\s+(?:you|y'?all|u|reece|your\s+(?:company|team|crews?|guys))(?:\s+guys)?(?:\s+(?:still|also|even|currently|guys))?\s+(service|serve|serving|servicing|cover|covering|come|coming|travel|go|going|work|working|install|installing|operate|operating|available|located|based|in|near|around|out)\b\s*(?:(to|in|into|out\s+to|out\s+in|near|around|at|on|for|the|by)\b\s*)?([^?.!\n]{0,60})/i;
 
-const AREA_PHRASE_RX = /\b(?:service|coverage)\s+areas?\b|\b(?:in|within|inside|part\s+of)\s+your\s+(?:service\s+)?area\b|\bareas?\s+(?:do\s+)?(?:you|y'?all)\s+(?:serve|service|cover|work)\b|\bwhere\s+(?:do|does)\s+(?:you|reece)\s+(?:serve|service|cover|work|install)\b|\bis\s+(?:my|our|this|that)\s+(?:area|zip|town|city|county|neighborhood)\s+(?:covered|served|serviced|included)\b|\bcover\s+(?:my|our)\s+(?:area|zip|town|city|county)\b/i;
+// 2026-10-03 (Mark's thread): "But I don't think your service our area." is a
+// coverage question too. It was not one, so the bot answered "good chance you're
+// covered" with no zip ask. Any "serve/service/cover … our area" now counts.
+const AREA_PHRASE_RX = /\b(?:service|coverage)\s+areas?\b|\b(?:in|within|inside|part\s+of)\s+your\s+(?:service\s+)?area\b|\bareas?\s+(?:do\s+)?(?:you|y'?all)\s+(?:serve|service|cover|work)\b|\bwhere\s+(?:do|does)\s+(?:you|reece)\s+(?:serve|service|cover|work|install)\b|\bis\s+(?:my|our|this|that)\s+(?:area|zip|town|city|county|neighborhood)\s+(?:covered|served|serviced|included)\b|\b(?:cover|covering|serve|serving|service|servicing|come\s+(?:out\s+)?to)\s+(?:my|our|this|that)\s+(?:area|zip|town|city|county|neighborhood)\b/i;
 
 // Verbs that only mean "coverage" with a locative preposition after them
 // ("work in Dallas" yes, "work on weekends" no).
