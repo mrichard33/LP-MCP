@@ -27,6 +27,7 @@
 
 import { createLiveChatFastLane, minimalContext } from '../live-chat/fast-lane.js';
 import { BOOKING_CALENDARS } from '../knowledge/booking-calendar-router.js';
+import { callbackDecision } from '../agentic/bot-callback.js';
 
 export const SIM_CONTACT_PREFIX = 'sim-';
 
@@ -125,7 +126,11 @@ export async function simulateLiveChat(plan, { nepqMode = 'live', productionDeps
     rescheduleAppointment: async (a) => { record('would_move_same_appointment_in_ghl', { appointment_id: a.oldAppointmentId, new_start: a.startIso }); return { ok: true }; },
     postCancelCard: async (a) => { record('would_post_dispatch_card', { card: a.kind, text: String(a.text || '').slice(0, 400) }); return { ok: true }; },
     bookSlot: async (a) => { record('would_book', { start: a.startIso }); return { ok: true, action_id: 0 }; },
-    nepqHandoff: async (a) => { record('would_hand_off_to_person', { reason: a.reason }); },
+    nepqHandoff: async (a) => {
+      // 2026-10-03: a callback (with a number to call) files to Five9 + #contact-center.
+      if (a.reason === 'callback_request') record(a.hasPhone === false && !a.phone ? 'would_ask_for_callback_number' : 'would_file_callback_five9_and_contact_center', { reason: a.why || 'planned' });
+      else record('would_hand_off_to_person', { reason: a.reason });
+    },
   });
 
   const transcript = [];
@@ -209,6 +214,9 @@ export async function simulateSms(plan, { nepqMode = 'live', generate, buildReal
     const wouldDo = [];
     if (generated?.nepq_handoff) wouldDo.push({ kind: 'would_hand_off_to_person', reason: generated.nepq_handoff.reason });
     if (generated?.dm_handoff) wouldDo.push({ kind: 'would_hand_off_decision_maker', reason: generated.dm_handoff.reason });
+    // 2026-10-03: the send handler files the callback (Five9 + #contact-center).
+    const cb = reply ? callbackDecision({ handoffReason: generated?.nepq_handoff?.reason || null, otherHandoff: !!generated?.dm_handoff, text: reply }) : null;
+    if (cb) wouldDo.push({ kind: 'would_file_callback_five9_and_contact_center', reason: cb });
     if (generated?.companion_action) wouldDo.push({ kind: `would_${generated.companion_action.action_type}`, payload: generated.companion_action.action_payload || null });
     transcript.push({
       turn: i + 1, customer: text, bot: reply ? [reply] : null, error,

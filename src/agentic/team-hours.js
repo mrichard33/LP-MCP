@@ -113,6 +113,18 @@ const CALL_PROMISE_RX = /\b(?:call|calls|calling|phone|reach\s+out|reach\s+you|g
 // The call has to come from us, someone on the team, or to the lead.
 const FROM_US_RX = /\b(?:we|i|our\s+(?:\w+\s+)?(?:team|rep|office|specialist)|someone|somebody|a\s+(?:team\s+member|rep|specialist|member\s+of\s+(?:our|the)\s+team)|they|he|she)(?:'ll|’ll|'m|’m|\s+will|\s+(?:is|are|am)\s+(?:going\s+to|getting)|\s+can|\s+should|\s+would|\s+have)\b|\byou(?:'ll|’ll|\s+will|\s+should)\s+(?:get|receive|hear)\b|\bexpect\s+(?:a\s+call|to\s+hear)\b|\b(?:i'?ve|we'?ve)\s+(?:passed|flagged)\b/i;
 const promisesCall = (s) => CALL_PROMISE_RX.test(s) && FROM_US_RX.test(s);
+
+// A phone call from us, promised as a statement (2026-10-03, Mark's shutters
+// thread: "someone from our team will call you shortly" with nothing filed).
+// Narrower than promisesCall: a CALL verb, said by us, not a question, and not
+// the booking confirm ("Our team will reach out to confirm the details").
+const CALL_VERB_RX = /\b(?:call|calls|calling|ring|phone)\s+(?:you|you\s+back)\b|\bgive\s+you\s+a\s+(?:call|ring)\b|\bget\s+a\s+call\b|\bexpect\s+a\s+call\b|\bcall\s+(?:to\s+)?(?:set|schedule|go\s+over|talk|walk|follow\s+up|confirm)/i;
+const NOT_A_CALLBACK_RX = /\b(?:confirm\s+(?:the\s+|your\s+)?(?:details|appointment|visit|time))\b|\ball\s+set\b/i;
+/** Does this reply promise that we will phone the lead? Pure. */
+export function promisedCallback(text) {
+  return String(text || '').split(/(?<=[.!?])\s+/).some(s =>
+    !s.trim().endsWith('?') && CALL_VERB_RX.test(s) && FROM_US_RX.test(s) && !NOT_A_CALLBACK_RX.test(s));
+}
 // The same-day / immediate part of that promise. "now" alone is left out: it
 // reads as "I'm passing this on now", which stays true after hours.
 const IMMEDIATE = String.raw`\b(?:right\s+now|right\s+away|immediately|in\s+the\s+next\s+(?:few|couple(?:\s+of)?|\d+|several)\s+(?:minutes|hours?)|within\s+the\s+(?:next\s+)?(?:hour|few\s+minutes|\d+\s+minutes)|in\s+a\s+few\s+minutes|today|tonight|this\s+(?:morning|afternoon|evening))\b`;

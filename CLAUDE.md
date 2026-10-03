@@ -329,6 +329,20 @@ earned it (`bookingOpenInThread`). A probe or consequence turn always ends on a 
 lost it, `enforceNepqPlan` appends a fresh one (`discoveryQuestion`, logged `discovery_question_added`), unless the reply
 carries a link, a confirmation or an allowed booking ask ("Oh my wife filled out some form" got "That makes sense.", 2026-10-03).
 
+**A promised call is filed for real; no call the lead did not ask for (Mark, 2026-10-03).** "When someone needs a
+callback, our system should be pushing it to the Five9 callback list, along with a notification in the contact center
+Slack group." `fileBotCallback` (`src/agentic/bot-callback.js`, production deps `src/services/bot-callback-io.js`) runs an
+`lp_callback_requeue` row (rule `BOT_CALLBACK`: its dedup, LP-lead creation and the Five9 Callback Request push) AND the
+NEPQ hand-off card in #contact-center, which names the Five9 result; once per contact per day (`agentic.bot_callback`).
+Both bots file on the planner's `callback_request` (`CALLBACK_RX`, now also "can someone call me" / "I'd rather talk on the
+phone", or a yes to our own call offer, `CALL_OFFER_RX`) and on any sent reply that promises we will call
+(`promisedCallback` in `team-hours.js`, logged `call_promise_backed`). Live chat with no number asks for it and files on
+the turn it arrives (`callback_phone_arrived`). The other side: `dropUnaskedCallOffer` strips a call offer unless the lead
+asked for a call or turned the visit down (`leadWantsCall`), with or without a plan, and the plan block says so
+(`NEPQ_NO_CALL_OFFER`). A coverage turn is planned too unless its reply is the whole script (`coverageOwnsReply`: the zip
+ask, the out-of-area close), and more detail right after the bridge gets the visit question once more (`bridge_followup`),
+not a bare `answer` (the shutters thread and the drafty chat, 2026-10-03).
+
 **Book in the conversation, unconfirmed, on the right calendar (Mark, 2026-10-02).** Every bot booking is
 status `new` (the handler forces it). **Ask about decision makers ONCE, then book** (supersedes 2026-09-18):
 the text bot booked 12 visits 08-03..09-07 and none after the 09-18 "all decision makers attend" block, and

@@ -16,6 +16,8 @@ import { referenceRules, referenceRulesText } from '../../agentic/nepq-planner.j
 
 export const NEPQ_PLAN_HEADER = '═══════ NEPQ TURN PLAN (binding: overrides any earlier formula, offer mandate or objection play) ═══════';
 
+export const NEPQ_NO_CALL_OFFER = 'Never offer or suggest a phone call (no "quick call", no "want someone to give you a call?"): the free visit at their home is the next step. A call only if they ask for one.';
+
 export const NEPQ_ALWAYS = [
   'Never in this reply: a price, a range, a savings figure, a monthly payment or any financing figure; pressure or fake urgency; a stat that is not in the KB PACK; more than one question.',
   'Write it in their words. One short question at most.',
@@ -80,5 +82,8 @@ export function renderPlanBlock(plan) {
     lines.push(MOVE_TEXT[plan.required_move](plan));
   }
   lines.push(...NEPQ_ALWAYS);
+  // 2026-10-03 (Mark): the visit is the next step; a phone call only when the
+  // lead asks for one. The guard (dropUnaskedCallOffer) backs this up.
+  if (!plan.lead_wants_call && !plan.handoff) lines.push(NEPQ_NO_CALL_OFFER);
   return lines;
 }

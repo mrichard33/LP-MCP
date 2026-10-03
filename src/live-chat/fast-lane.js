@@ -51,7 +51,7 @@ import {
 import { buildEstablishedFacts } from '../agentic/established-facts.js';
 import { humanizeReply, restoreQuestionMark } from '../agentic/human-voice.js';
 import { enforceTeamVoice } from '../agentic/team-voice.js';
-import { enforceCallTiming } from '../agentic/team-hours.js';
+import { enforceCallTiming, promisedCallback } from '../agentic/team-hours.js';
 import { rewriteBookingClaims } from '../agentic/booking-claim.js';
 import { enforceOneAsk } from '../agentic/one-ask.js';
 import { looksLikeShortPhone } from '../agentic/contact-typos.js';
@@ -96,6 +96,7 @@ import {
   resolveCoverage,
   guardCoverageDraft,
   serviceAreaRecord,
+  coverageOwnsReply,
 } from '../agentic/service-area-turn.js';
 import { formatDateHuman, formatTimeHuman } from '../appointment-dates.js';
 import {
@@ -951,7 +952,12 @@ export function createLiveChatFastLane(deps) {
     const nepqMode = d.nepqMode();
     let nepqPlan = null;
     let nepqSlots = null;
-    if (nepqMode !== 'off' && !saPlan.active && !planOverride) {
+    // A coverage turn is planned too unless its reply is the whole script (the
+    // zip ask; the out-of-area close is dropped below once the lookup lands).
+    // It gets no fixed move and no times: the coverage sentence opens the reply
+    // and the plan steers the rest (2026-10-03, the shutters thread).
+    const coveragePlanned = saPlan.active && (!!saPlan.zip || !!saPlan.refused_zip);
+    if (nepqMode !== 'off' && (!saPlan.active || coveragePlanned) && !planOverride) {
       const realFirst = hasNameOnRecord ? String(context.lead?.first_name || context.lead?.name || '').trim().split(/\s+/)[0] || null : null;
       const planInput = {
         channel: 'livechat', trigger: body, conversation: context.conversation_recent, firstName: realFirst,
@@ -959,7 +965,7 @@ export function createLiveChatFastLane(deps) {
         nextStepLabel: 'a free visit at your home', discipline, nowMs: d.now(),
       };
       nepqPlan = planNepqTurn(planInput);
-      if (wantsSlots(nepqPlan)) {
+      if (!saPlan.active && wantsSlots(nepqPlan)) {
         // Real times only when the move can use them, under their own cap.
         const preferredText = nepqPlan.time_request || (nepqPlan.step === 'confirm' ? body : nepqPlan.step === 'collect' ? nepqPlan.held_slot?.text : null);
         const got = await raceWithBudget(Promise.resolve().then(() => d.offerBookingSlots({ contact, preferredText })), NEPQ_SLOT_LOOKUP_MS);
@@ -967,7 +973,7 @@ export function createLiveChatFastLane(deps) {
         if (!nepqSlots) d.log(`[NEPQ] live chat ${contactId} no slots for ${nepqPlan.required_move}: ${got.timedOut ? 'timed out' : got.error ? got.error.message : `${got.value?.slots?.length || 0} slot(s)`}`);
         if (nepqSlots) nepqPlan = planNepqTurn({ ...planInput, slots: nepqSlots.slots, allSlots: nepqSlots.all || null, tzLabel: nepqSlots.tzLabel });
       }
-      if (nepqMode === 'live') {
+      if (nepqMode === 'live' && !saPlan.active) {
         const lastOutbound = [...context.conversation_recent].reverse().find(m => m.direction === 'outbound')?.text || '';
         const nepqOut = reference ? null : await runNepqFixedMove({ plan: nepqPlan, slots: nepqSlots, contactId, body, hasName: hasNameOnRecord, hasPhone: hasPhoneOnRecord, firstName: realFirst, mode, lastOutbound: nepqPlan.last_offer || lastOutbound, contact, visitorTexts,
           threadTurns: (context.conversation_recent || []).map(m => ({ direction: String(m?.direction || '').toLowerCase() === 'outbound' ? 'outbound' : 'inbound', text: String(m?.text ?? m?.body ?? '') })) });
@@ -1033,6 +1039,7 @@ export function createLiveChatFastLane(deps) {
       recordZone,
     ]);
     const coverage = resolveCoverage(saPlan, coverageLookups || {});
+    if (saPlan.active && coverageOwnsReply({ plan: saPlan, coverage }) && !planOverride) nepqPlan = null;
     // The market the visitor asked about (or is on record in) sets the prompt's
     // clock: a Houston visitor reads Central time (Mark's ruling 3).
     const zoneMarket = coverage?.market_code || minimalZone?.market_code || null;
@@ -1152,7 +1159,9 @@ export function createLiveChatFastLane(deps) {
       const hasAppt = context.lp?.appointment_set === true && context.lp?.appointment_is_past !== true;
       const claim = rewriteBookingClaims(flow.fixed, { booked: false, held: false, hasAppointment: hasAppt, ...(nepqLive ? { replacement: nextStepLine({ bridgeUsed: !!nepqPlan?.counters?.bridge_used }) } : {}) });
       if (claim.changed) d.log(`[LiveChat] false_schedule_claim_fixed ${contactId}: unbacked booking or hold claim rewritten`);
-      const nepqFix = (nepqLive && !saPlan.active) ? enforceNepqPlan(claim.text, nepqPlan, { known }) : { text: claim.text, changes: [] };
+      const nepqFix0 = nepqLive ? enforceNepqPlan(claim.text, nepqPlan, { known }) : { text: claim.text, changes: [] };
+      // A planned coverage turn still opens with the coverage sentence.
+      const nepqFix = (nepqLive && saPlan.active && coverage) ? { ...nepqFix0, text: guardCoverageDraft(nepqFix0.text, coverage).fixed } : nepqFix0;
       if (nepqFix.changes.length) d.log(`[NEPQ] live chat ${contactId} ${nepqPlan.required_move}: ${nepqFix.changes.join(',')}`);
       // One ask per message on every live-chat draft (Mark, 2026-10-02); the
       // NEPQ guard above already did it when the plan is live.
@@ -1203,6 +1212,25 @@ export function createLiveChatFastLane(deps) {
         payload: { contact_id: contactId, signal: largeJob || 'model', inbound_preview: body.slice(0, 300), mode, action_id: actionId },
       }).catch(err => d.warn(`[LiveChat] large-job event failed: ${err.message}`));
       d.opsAlert(`🏢 LIVE CHAT — LARGE JOB SIGNAL\nContact: ${contactId}\nThey said: "${body.slice(0, 200)}"\nSignal: ${largeJob || 'model-flagged'}\n→ Needs a person to follow up.`).catch(() => {});
+    }
+
+    // ── a promised call is filed for real (Mark, 2026-10-03) ──
+    // The Five9 Callback Request list + #contact-center (bot-callback.js).
+    // A promise the planner did not choose is backed; a callback promised
+    // before we had their number is filed on the turn the number arrives.
+    if (mode === 'live') {
+      const typedPhone = phoneFromText(body);
+      const recentOut = (context.conversation_recent || []).filter(m => String(m?.direction || '').toLowerCase() === 'outbound').slice(-2).map(m => String(m?.text ?? m?.body ?? ''));
+      const phoneArrived = !!typedPhone && !context.lead?.phone && recentOut.some(t => promisedCallback(t));
+      // The cancel flow and the Spanish hand-off own their turn (their own
+      // #dispatch / #contact-center cards): "Our team will call to go over the
+      // details" after a move is not a callback request.
+      const backed = !planOverride && !nepqPlan?.handoff && promisedCallback(draft);
+      if (phoneArrived || backed) {
+        d.log(`[LiveChat] ${phoneArrived ? 'callback_phone_arrived' : 'call_promise_backed'} ${contactId}`);
+        Promise.resolve(d.nepqHandoff({ contactId, reason: 'callback_request', inbound: body, firstName: leadFirstName, hasPhone: hasPhoneOnRecord, phone: typedPhone || null, why: phoneArrived ? 'phone_arrived' : 'promise_backed' }))
+          .catch(err => d.warn(`[LiveChat] callback filing failed for ${contactId}: ${err.message}`));
+      }
     }
 
     return deliver({
@@ -1500,7 +1528,7 @@ export function createLiveChatFastLane(deps) {
 
     if (!plan.fixed_line || !NEPQ_FIXED_MOVES.has(plan.required_move)) return null;
     if (plan.handoff) {
-      if (live) Promise.resolve(d.nepqHandoff({ contactId, reason: plan.handoff.reason, inbound: body, firstName })).catch(err => d.warn(`[LiveChat] NEPQ hand-off failed for ${contactId}: ${err.message}`));
+      if (live) Promise.resolve(d.nepqHandoff({ contactId, reason: plan.handoff.reason, inbound: body, firstName, hasPhone, why: 'planned' })).catch(err => d.warn(`[LiveChat] NEPQ hand-off failed for ${contactId}: ${err.message}`));
       // A person can only reach out with a way to reach them.
       return { reply: [plan.fixed_line, ask].filter(Boolean).join(' '), slots: plan.slots_to_offer || [], record: { fixed: plan.required_move } };
     }
