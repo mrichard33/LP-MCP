@@ -349,7 +349,9 @@ import {
   inHomeCalendarFor,
 } from './knowledge/booking-calendar-router.js';
 import { CALENDAR_MAP } from './actions/constants.js';
-import { applyGHLTag, getGHLContact } from './ghl.js';
+import { applyGHLTag, getGHLContact, removeGHLTags } from './ghl.js';
+import { ensureGuideName, deliveryTagForPending, pendingTagFor, GUIDE_PENDING_PREFIX, GUIDE_NAME_ASK, GUIDE_NAME_ASK_RX } from './agentic/guide-name.js';
+import { guideNameDeps } from './services/guide-name-io.js';
 import supabase from './supabase.js';
 // ─── Canvassing Pilot v2 (A.CV conf flow) — time-aware reschedule options ───
 import { computeRescheduleOptions } from './reschedule-options.js';
@@ -389,7 +391,7 @@ import { holdLine, COLLECT_ASK, dmAsk, parseDecisionMakers } from './agentic/boo
 import { contactRecheckLine, recheckHint, RECHECK_RX } from './agentic/contact-check.js';
 import { smsBookingTurn, enforceBookingFacts, bookingFactsNote } from './agentic/sms-booking-turn.js';
 import { LINES as NEPQ_LINES } from './agentic/nepq-planner.js';
-import { planNepqTurn, enforceNepqPlan, referenceRetryNote, nepqBackboneMode, prefersCall as nepqPrefersCall, objectionType as nepqObjectionType, TIME_REQUEST_RX as NEPQ_TIME_REQUEST_RX, SCHEDULE_ASK_RX as NEPQ_SCHEDULE_ASK_RX,REPEAT_COMPLAINT_RX as NEPQ_REPEAT_COMPLAINT_RX } from './agentic/nepq-planner.js';
+import { planNepqTurn, enforceNepqPlan, referenceRetryNote, nepqBackboneMode, prefersCall as nepqPrefersCall, objectionType as nepqObjectionType, TIME_REQUEST_RX as NEPQ_TIME_REQUEST_RX, SCHEDULE_ASK_RX as NEPQ_SCHEDULE_ASK_RX,REPEAT_COMPLAINT_RX as NEPQ_REPEAT_COMPLAINT_RX, bookingOpenInThread as nepqBookingOpenInThread } from './agentic/nepq-planner.js';
 import {
   planServiceAreaTurn, resolveCoverage, coverageHint, guardCoverageDraft, serviceAreaRecord,
 } from './agentic/service-area-turn.js';
@@ -3419,7 +3421,35 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     const r = contactRecheckLine({ text: triggerMessage, recentOutbound: recentOut });
     return r?.kind === 'email' ? r : null;
   })();
-  const promptHint = [rehash ? null : opts.promptHint, handoffNote, contactTypoHint(triggerMessage), recheckHint(recheckEarly)]
+  // ─── A guide held for a first name (2026-10-03, guide-name.js) ───
+  // The last turn held the guide tag until we had a name. This reply either
+  // releases it (a name came in and is now saved, or we asked once already),
+  // or this turn's own dispatch held it and the reply must ask for the name.
+  let guideNameAsk = opts.guideNameAsk === true;
+  const guideReleased = [];
+  const guidePending = (context.lead?.current_tags || context.lead?.tags || [])
+    .map(t => String(t).toLowerCase()).filter(t => t.startsWith(GUIDE_PENDING_PREFIX));
+  if (guidePending.length && channel === 'sms' && !dryRun && !guideNameAsk) {
+    const g = await ensureGuideName({ contactId, trigger: triggerMessage, thread: context.conversation_recent || [] }, guideNameDeps)
+      .catch(() => ({ action: 'send' }));
+    if (g.action === 'ask') {
+      guideNameAsk = true;
+    } else {
+      for (const pt of guidePending) {
+        const tag = deliveryTagForPending(pt);
+        if (tag) { await applyGHLTag(contactId, tag).catch(() => {}); guideReleased.push(tag); }
+      }
+      await removeGHLTags(contactId, guidePending).catch(() => {});
+      console.log(`[ResponseGenerator] guide released for ${contactId}: ${guideReleased.join(',')} (${g.action}${g.name ? `, name ${g.name}` : ''})`);
+      if (g.action === 'send_without_name') console.warn(`[ResponseGenerator] guide_sent_without_name: ${contactId}`);
+    }
+  }
+  if (guideReleased.length) opts = { ...opts, deliveryTags: [...(opts.deliveryTags || []), ...guideReleased] };
+  const guideHint = guideNameAsk
+    ? `GUIDE NEEDS A NAME: the guide goes out with their first name on it, and we do not have it yet. Ask for ONE thing only, their first name, e.g. "${GUIDE_NAME_ASK}" Do not say the guide is sent or on its way, and ask nothing else.`
+    : guideReleased.length ? 'The guide they asked for is being sent to their email now; you may say it is on its way.' : null;
+
+  const promptHint = [rehash ? null : opts.promptHint, handoffNote, contactTypoHint(triggerMessage), recheckHint(recheckEarly), guideHint]
     .filter(Boolean).join('\n\n') || null;
 
   const buyerStage    = inferBuyerStage(context);
@@ -3805,6 +3835,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // owns the booking-ask decision, and is enforced on the draft below.
   const nepqMode = (opts.dryRun === true && opts.nepqModeOverride) ? opts.nepqModeOverride : nepqBackboneMode();
   let nepqPlan = null;
+  let nepqPlanFailed = false;
   // SMS only: email replies are long-form and keep their own rules.
   if (nepqMode !== 'off' && channel === 'sms' && !serviceAreaTurn?.plan?.active) {
     try {
@@ -3827,6 +3858,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     } catch (err) {
       console.warn(`[ResponseGenerator] NEPQ plan failed for ${contactId} (continuing without it): ${err.message}`);
       nepqPlan = null;
+      nepqPlanFailed = true;
     }
   }
 
@@ -4451,6 +4483,23 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     }
   }
 
+  // ─── Earn the ask, fail closed (Mark, 2026-10-03) ─────────────────────
+  // With no plan (the planner threw, or a coverage turn skipped it), a reply
+  // may still ask for the appointment only when the thread already earned it:
+  // the lead asked to schedule, said yes to our bridge, or times are out.
+  if (!nepqPlan && nepqMode === 'live' && channel === 'sms' && (nepqPlanFailed || serviceAreaTurn?.plan?.active)
+    && !nepqBookingOpenInThread(context.conversation_recent || [], triggerMessage)) {
+    const asks = findBookingAsks(validated.message || '');
+    if (asks.length) {
+      const kept = stripSentences(validated.message, (x) => asks.includes(x)).trim();
+      if (kept) {
+        console.log(`[NEPQ] ${contactId} booking ask not earned (${nepqPlanFailed ? 'plan_failed' : 'coverage_turn'}) — removed`);
+        validated.message = kept;
+        if (validated.companion_action?.action_type === 'book_appointment') validated.companion_action = null;
+      }
+    }
+  }
+
   // ─── NEPQ backbone enforcement (2026-10-02, Mark) ──────────────────────
   // The plan's move, enforced in code: fixed lines for hand-offs and the
   // objection plays, no money figures (the estimate block excepted), no
@@ -4671,6 +4720,28 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     ? (availability.slots.length > 0 ? `${availability.slots.length}slots/${availability.slots_total_count}total` : 'empty')
     : (calendarId ? 'fetch_failed' : 'no_calendar');
 
+  // ─── The guide waits for a first name (2026-10-03, guide-name.js) ───
+  // An accepted guide offer gets the same rule as the layer3 dispatch: no
+  // saved first name → the tag is held and this reply asks for the name.
+  let guideHeldTag = null;
+  if (validated.companion_action?.action_type === 'guide_disposition' && validated.companion_action.action_payload?.outcome === 'accepted'
+    && !dryRun && channel === 'sms' && !guideNameAsk && !(opts.deliveryTags || []).includes(HURRICANE_GUIDE_TAG)) {
+    const g = await ensureGuideName({ contactId, trigger: triggerMessage, thread: context.conversation_recent || [] }, guideNameDeps)
+      .catch(() => ({ action: 'send' }));
+    if (g.action === 'ask') { guideNameAsk = true; guideHeldTag = pendingTagFor(HURRICANE_GUIDE_TAG); }
+  }
+  if (guideNameAsk && channel === 'sms') {
+    // One ask, and it is the name. A "sending it now" claim goes: nothing is sent yet.
+    const SEND_CLAIM_RX = /\b(?:sending|sent|on\s+(?:its|the)\s+way|in\s+your\s+inbox|headed\s+your\s+way|you'?ll\s+have\s+it)\b/i;
+    let kept = stripSentences(validated.message || '', (x) => (x.includes('?') && !GUIDE_NAME_ASK_RX.test(x)) || SEND_CLAIM_RX.test(x)).trim();
+    if (!GUIDE_NAME_ASK_RX.test(kept)) {
+      kept = [kept, GUIDE_NAME_ASK].filter(Boolean).join(' ');
+      console.log(`[ResponseGenerator] ${contactId} guide_name_ask_inserted`);
+    }
+    validated.message = kept;
+    if (validated.companion_action?.action_type === 'book_appointment') validated.companion_action = null;
+  }
+
   // ─── v2.7.11: guide_disposition — apply enrollment + guide tags inline ───
   // The lead's accept/decline is already fact by generation time (it's in
   // THEIR inbound), so tag application mirrors the generation-time
@@ -4687,7 +4758,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     const gdOutcome = validated.companion_action.action_payload.outcome;
     const alreadyQueued = (opts.deliveryTags || []).includes(HURRICANE_GUIDE_TAG);
     const gdTags = gdOutcome === 'accepted'
-      ? ['enroll:s2.2-chatbot', ...(alreadyQueued ? [] : [HURRICANE_GUIDE_TAG])]
+      ? ['enroll:s2.2-chatbot', ...(alreadyQueued ? [] : [guideHeldTag || HURRICANE_GUIDE_TAG])]
       : ['enroll:s2.2-chatbot', 'hurricane-guide-declined'];
     for (const gdTag of gdTags) {
       applyGHLTag(contactId, gdTag).catch(err =>

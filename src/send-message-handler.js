@@ -3348,6 +3348,8 @@ export async function executeSendMessage(action, context) {
           // in this same turn (services/layer3-dispatch.planLayer3SubActions).
           // The send-promise guard counts them as the delivery.
           deliveryTags: Array.isArray(payload.delivery_tags) ? payload.delivery_tags : [],
+          // 2026-10-03: the guide is held for a first name (guide-name.js); this reply asks for it.
+          guideNameAsk: payload.guide_name_ask === true,
           // 2026-07-06 — request-first routing: the analyzer's
           // requested_fulfillment (from the ai.analysis_completed payload in
           // the event context) outranks funnel defaults in the calendar router.
@@ -3828,6 +3830,8 @@ export async function executeSendMessage(action, context) {
             fromNumber: replyContext?.fromNumber || null,
             promptHint: payload.prompt_hint || null,
             deliveryTags: Array.isArray(payload.delivery_tags) ? payload.delivery_tags : [],
+          // 2026-10-03: the guide is held for a first name (guide-name.js); this reply asks for it.
+          guideNameAsk: payload.guide_name_ask === true,
             requestedFulfillment: context.requested_fulfillment || null,
             callPurpose: context.call_purpose || null,
             regenerationNote: regenNotes[regenReason],

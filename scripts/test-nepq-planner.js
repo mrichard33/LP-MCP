@@ -105,11 +105,17 @@ test('booking sequence: neither → day ask; a pick → confirm; yes to the brid
   assert.equal(LINES.confirm(SLOTS[0], 'ET', 'Dana'), "You're all set for Tue, Oct 6 at 10:00 AM ET, Dana. Our team will reach out to confirm the details.");
 });
 
-test('discovery is short: after the cap the bridge is required', () => {
+// 2026-10-03 (Mark): "earn the ask". The cap alone no longer bridges: the
+// problem in their words AND why it matters come first.
+test('earn the ask: problem but no "why it matters" yet → the consequence question, not the bridge', () => {
   const thread = T(['inbound', 'they are drafty'], ['outbound', 'Drafty? Which rooms?'], ['inbound', 'kitchen'], ['outbound', 'How long has that been going on?']);
   const p = planNepqTurn({ nowMs: OPEN_MS, channel: 'livechat', trigger: 'about 10 years', conversation: thread });
-  assert.equal(p.required_move, 'bridge');
+  assert.equal(p.required_move, 'consequence');
+  assert.equal(p.booking.allowed, false);
   assert.equal(p.echo.word, 'drafty');
+  const answered = planNepqTurn({ nowMs: OPEN_MS, channel: 'livechat', trigger: "honestly the AC bills are through the roof", conversation: [...thread, ...T(['inbound', 'about 10 years'], ['outbound', 'What happens if you wait another season?'])] });
+  assert.equal(answered.required_move, 'bridge');
+  assert.equal(answered.booking.reason, 'nepq:bridge_earned');
   const early = planNepqTurn({ nowMs: OPEN_MS, channel: 'livechat', trigger: 'they are drafty', conversation: [] });
   assert.equal(early.required_move, 'probe');
   assert.equal(early.booking.allowed, false);
@@ -153,8 +159,8 @@ test('guard: one question, no unallowed booking ask, no "see you then", no fake 
 });
 
 test('guard: a skipped bridge is written in their words', () => {
-  const thread = T(['inbound', 'they are drafty'], ['outbound', 'Drafty? Which rooms?'], ['inbound', 'kitchen'], ['outbound', 'How long has that been going on?']);
-  const p = planNepqTurn({ nowMs: OPEN_MS, channel: 'livechat', trigger: 'about 10 years', conversation: thread });
+  const thread = T(['inbound', 'they are drafty'], ['outbound', 'Drafty? Which rooms?'], ['inbound', 'kitchen'], ['outbound', 'Has that had an impact on you?']);
+  const p = planNepqTurn({ nowMs: OPEN_MS, channel: 'livechat', trigger: 'yes, the kids are always cold', conversation: thread });
   const out = enforceNepqPlan('Ten years is a long time. What made you start looking now?', p).text;
   assert.equal(out, p.bridge_line);
   assert.match(out, /, since you mentioned the drafts\. The (?:easiest |best )?next step (?:would be|is) a free visit at your home\. Would that (?:help|work for you|be useful)\?$/);
