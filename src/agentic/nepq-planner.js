@@ -1256,5 +1256,40 @@ export function enforceNepqPlan(draft, plan, { allowFigures = false, known = {} 
       : (changes.includes('consequence_repeat') || changes.includes('unapproved_claim')) ? bridgeLine(plan)
         : (original.trim() || NO_FIGURES_LINE);
   }
+  // 7. A discovery turn always ends on a question (2026-10-03 replay after the
+  // earned-ask change: "Oh my wife filled out some form" got "That makes
+  // sense." and nothing to answer). The planner chose a question this turn;
+  // when the draft or a guard lost it, a fresh one goes on the end.
+  // Not when the body already gives the lead something to act on: a link, a
+  // booking confirmation, or a turn where a booking ask is allowed.
+  const actionable = /\{\{|\bhttps?:\/\/|\ball set\b/i.test(body) || plan.booking?.allowed === true;
+  if ((plan.required_move === 'probe' || plan.required_move === 'consequence') && !body.includes('?') && !actionable) {
+    body = `${body.replace(/\s+$/, '')} ${discoveryQuestion(plan)}`.trim();
+    changes.push('discovery_question_added');
+  }
   return { text: changes.length ? withSignOff(body) : original, changes, failed: [] };
+}
+
+const DISCOVERY_QUESTIONS = {
+  problem: [
+    "What's bothering you most about your windows or doors right now?",
+    'Is it more how they look, or how they work?',
+    'What would you most like to change about them?',
+  ],
+  why_it_matters: [
+    'How has that been affecting you?',
+    'Has that had an impact on you day to day?',
+    'What would it mean for you to have that fixed?',
+  ],
+  consequence: [
+    'What happens if you leave them as they are another season?',
+    'How has that been affecting you?',
+    'What would it mean for you to have that fixed?',
+  ],
+};
+
+/** A discovery question for this plan, never one already sent. Pure. */
+export function discoveryQuestion(plan = {}) {
+  const key = plan.required_move === 'consequence' ? 'consequence' : (plan.probe_for === 'why_it_matters' ? 'why_it_matters' : 'problem');
+  return pickFresh(DISCOVERY_QUESTIONS[key], plan.recent_outbound || [], plan.variant_seed || 0);
 }

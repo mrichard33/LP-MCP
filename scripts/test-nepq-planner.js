@@ -238,7 +238,9 @@ test('SMS prompt: the plan block renders last (before the output contract) only 
 test('guard: never asks for a name, phone, email or zip we already have', () => {
   const p = planNepqTurn({ nowMs: OPEN_MS, channel: 'livechat', trigger: 'they are drafty', conversation: [] });
   const r = enforceNepqPlan("Drafts are no fun. What's your first name?", p, { known: { name: true } });
-  assert.equal(r.text, 'Drafts are no fun.');
+  // The name ask goes; a discovery question takes its place (2026-10-03).
+  assert.match(r.text, /^Drafts are no fun\. [^?]+\?$/);
+  assert.ok(!/name/i.test(r.text), r.text);
   assert.ok(r.changes.includes('reask_known'));
   assert.equal(enforceNepqPlan("What's your zip code?", p, { known: { name: true } }).text, "What's your zip code?", 'an unknown zip may still be asked');
 });
