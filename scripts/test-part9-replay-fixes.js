@@ -290,3 +290,35 @@ test('an open offer makes the live chat load times before it plans', async () =>
   assert.equal(first.offer_slots_pending, true);
   assert.equal(wantsSlots(first), true);
 });
+
+// 2026-10-03 replay (#1147 live), three gaps.
+test('a typed time with no offer on the table makes the live chat load times', async () => {
+  const { wantsSlots } = await import('../src/live-chat/fast-lane.js');
+  const conv = [
+    { direction: 'outbound', text: 'The next step would be a free visit at your home.' },
+    { direction: 'inbound', text: 'Fine lets book for 2 PM.' },
+  ];
+  const first = planNepqTurn({ channel: 'livechat', trigger: 'Fine lets book for 2 PM.', conversation: conv, nowMs: NOW });
+  assert.equal(wantsSlots(first), true);
+});
+
+test('our address ask is not a coverage question', async () => {
+  const { planServiceAreaTurn } = await import('../src/agentic/service-area-turn.js');
+  const conv = [
+    { direction: 'outbound', text: 'That looks like a phone number. What address should the team come to? The street and zip are all I need.' },
+    { direction: 'inbound', text: '12 Main St, Ocala FL 34470' },
+  ];
+  assert.equal(planServiceAreaTurn({ trigger: '12 Main St, Ocala FL 34470', conversation: conv }).active, false);
+  // A real zip ask still is.
+  const zipAsk = [{ direction: 'inbound', text: 'Do you serve Ocala?' }, { direction: 'outbound', text: "Happy to check that for you. What's your zip code?" }, { direction: 'inbound', text: '34470' }];
+  assert.equal(planServiceAreaTurn({ trigger: '34470', conversation: zipAsk }).active, true);
+});
+
+test('a decision-maker ask in the model\'s own words is read back', async () => {
+  const { dmAnswerFromThread } = await import('../src/agentic/booking-collect.js');
+  const turns = [
+    { direction: 'outbound', text: "Got it, 12 Main St. Is there anyone else on the home with you, or anyone else who'd weigh in on this?" },
+    { direction: 'inbound', text: 'Just me' },
+  ];
+  assert.equal(dmAnswerFromThread(turns), 'Solo Owner');
+});

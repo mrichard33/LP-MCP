@@ -143,7 +143,10 @@ function priorMessages(conversation, trigger) {
 
 function lastOutboundAskedZip(prior) {
   for (let i = prior.length - 1; i >= 0; i--) {
-    if (isOutbound(prior[i])) return /\bzip\b/i.test(textOf(prior[i])) && textOf(prior[i]).includes('?');
+    // Our booking ask for the visit address ("street address … zip code?")
+    // is not a coverage question (2026-10-03 replay: the address reply ran as
+    // a coverage turn, skipped the booking plan, and the visit never booked).
+    if (isOutbound(prior[i])) return /\bzip\b/i.test(textOf(prior[i])) && textOf(prior[i]).includes('?') && !/\baddress\b/i.test(textOf(prior[i]));
   }
   return false;
 }

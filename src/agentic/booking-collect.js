@@ -134,9 +134,13 @@ export function addressConfirmState(turns = []) {
  * The decision-maker answer given in this chat (to our question), or null.
  * An unclear answer is 'Uncertain' (asked once, never asked again). Pure.
  */
+const DM_ASK_RX = /(?:\b(?:anyone|anybody|someone)\s+else\b|\bpart\s+of\s+the\s+decision\b|\bweigh\s+in\b|\bable\s+to\s+(?:be\s+there|make\s+it)\b)[^?]*\?/i;
 export function dmAnswerFromThread(turns = []) {
   const list = Array.isArray(turns) ? turns : [];
-  const isDmAsk = (t) => [COLLECT_ASK.dm, COLLECT_ASK_AGAIN.dm, ' be able to be there then?'].some(q => String(t || '').includes(q));
+  // By meaning, not exact words: since Part 7 the model words the ask
+  // ("Is there anyone else on the home with you, or anyone else who'd weigh
+  // in on this?"), and the 2026-10-03 replay read "Just me" as no answer.
+  const isDmAsk = (t) => [COLLECT_ASK.dm, COLLECT_ASK_AGAIN.dm, ' be able to be there then?'].some(q => String(t || '').includes(q)) || DM_ASK_RX.test(String(t || ''));
   for (let k = list.length - 1; k >= 0; k--) {
     if (list[k].direction !== 'outbound' || !isDmAsk(list[k].text)) continue;
     const reply = list.slice(k + 1).find(m => m.direction !== 'outbound');

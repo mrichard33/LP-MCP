@@ -459,7 +459,8 @@ export function planNepqTurn({
     // An offer is open but the caller planned without the calendar (live
     // chat's first pass): it must load the times and plan again (2026-10-03
     // replay: "Mark" after the 2 PM offer got a vague answer, no times).
-    offer_slots_pending: !!lastOfferOut && offerSlots.length < 2,
+    // A typed clock time ("book for 2 PM") needs the calendar too.
+    offer_slots_pending: (!!lastOfferOut || TYPED_CLOCK_RX.test(now)) && offerSlots.length < 2,
     slots_to_offer: [],
     fixed_line: null,
     discovery_cap: cap,
