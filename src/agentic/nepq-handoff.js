@@ -5,8 +5,9 @@
  * price after one ask, says "no" twice, or repeats an objection. The bot's
  * reply (a fixed line from nepq-planner.js) says someone from our team will
  * reach out; this module makes that true. Same shape as the decision-maker
- * hand-off in send-message-handler.js: the sales callback tag (I.HDL-1 queues
- * the call), a rep note, one event, and an #ops-alerts card. The bot keeps
+ * hand-off in send-message-handler.js: a marker tag (callback:requested; since
+ * 2026-10-03 the call itself is Five9's, bot-callback.js), a rep note, one
+ * event, and the card. The bot keeps
  * answering later messages: only an opt-out silences it (CLAUDE.md).
  *
  * Where the card goes (Mark, 2026-10-02): #contact-center (SLACK_CHANNEL_SERVICE)
@@ -20,7 +21,7 @@
  * the card are cheap to repeat but the event is the record.
  */
 
-import { CALLBACK_TAG_SALES } from '../knowledge/callback-resolver.js';
+import { CALLBACK_MARKER_TAG } from './bot-callback.js';
 import { GHL_LOCATION_ID } from '../actions/constants.js';
 
 /** #dispatch's live channel; SLACK_CHANNEL_DISPATCH overrides (same default as the cancel cards). */
@@ -70,12 +71,10 @@ export async function routeNepqHandoff({ contactId, reason, channel, inbound, fi
   const { note, card } = formatNepqHandoff({ reason, channel, inbound, contactId, firstName, extra });
   const day = new Date(nowMs).toISOString().slice(0, 10);
   const results = await Promise.allSettled([
-    // Service never takes the sales callback tag (I.HDL-1 rings the lead through
-    // the call center). It takes no hdl:* tag at all: hdl:callback-service fires
-    // I.HDL-2, which texts "they're picking up now" and bridges a call, while
-    // Mark's ruling (2026-10-03) is our "a team member will reach out" plus the
-    // #service card.
-    Promise.resolve().then(() => deps.applyTags(contactId, reason === 'service' ? [`${NEPQ_HANDOFF_TAG_PREFIX}${reason}`] : [CALLBACK_TAG_SALES, `${NEPQ_HANDOFF_TAG_PREFIX}${reason}`])),
+    // 2026-10-03 (Mark): no GHL instant ring. hdl:callback-sales started
+    // I.HDL-1 → B.HC-L's GHL call bridge (the lead saw a GHL number); the call
+    // is Five9's now (bot-callback.js), so the trace is a tag no workflow reads.
+    Promise.resolve().then(() => deps.applyTags(contactId, reason === 'service' ? [`${NEPQ_HANDOFF_TAG_PREFIX}${reason}`] : [CALLBACK_MARKER_TAG, `${NEPQ_HANDOFF_TAG_PREFIX}${reason}`])),
     Promise.resolve().then(() => deps.addNote(contactId, note)),
     Promise.resolve().then(() => deps.emitEvent({
       event_type: 'agentic.nepq_handoff', source: 'nepq_backbone', entity_type: 'contact', entity_id: contactId, ghl_contact_id: contactId,

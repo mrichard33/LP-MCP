@@ -324,7 +324,7 @@ import { checkNotSuperseded, commitAgenticSend } from './services/agentic-reply-
 import { findNewerInbound } from './agentic/burst-yield.js';
 import { emitEvent } from './event-emitter.js';
 import { routeNepqHandoff } from './agentic/nepq-handoff.js';
-import { fileBotCallback, callbackDecision } from './agentic/bot-callback.js';
+import { fileBotCallback, callbackDecision, CALLBACK_MARKER_TAG } from './agentic/bot-callback.js';
 import { botCallbackDeps, nepqHandoffDeps } from './services/bot-callback-io.js';
 // 2026-09-18 — the decision-maker handoff writes its rep task as a GHL note
 // (GHL has no task API; see src/actions/handlers/tasks.js).
@@ -649,7 +649,9 @@ export function findDecisionMakerSignals(text) {
 async function routeDecisionMakerHandoff(contactId, action, {
   channel, triggerMessage, reason, signals = [], detail = '', card, generationError = null,
 } = {}) {
-  const tagsApplied = await applyContactTags(contactId, [CALLBACK_TAG_SALES]);
+  // 2026-10-03: the marker, not hdl:callback-sales (no GHL call bridge); the
+  // call is Five9's (fileBotCallback, after the send or below).
+  const tagsApplied = await applyContactTags(contactId, [CALLBACK_MARKER_TAG]);
 
   // Written here rather than queued so the task exists on merge: the event
   // below needs an agent_rule to consume it, and a rule is DB config that
@@ -2086,37 +2088,20 @@ async function handleShortCircuit(contactId, generated, action, context, opts = 
   const isDQ = !!generated.is_disqualifier;
   const contactTags = Array.isArray(opts.tags) ? opts.tags : [];
 
-  // ── CALLBACK resolution (2026-07-08 — closes the sql/017/018 gap) ──
-  // The classifier hands CALLBACK off with the placeholder tag
-  // hdl:callback-pending-classification, which NO GHL workflow listens on
-  // (verified live: only hdl:callback-sales → I.HDL-1 and
-  // hdl:callback-service → I.HDL-2 have tag triggers). sql/017 promised a
-  // gen-time rewrite that was never built — every CALLBACK inbound was
-  // applying a dead tag and going silent. Resolve it here:
-  //   known customer → hdl:callback-service
-  //   known lead     → hdl:callback-sales
-  //   ambiguous      → send the HDL.3 customer-status probe directly and
-  //                    apply pending:customer-status-check so the sql/018
-  //                    yes/no gates can interpret the answer.
+  // ── A call request (2026-10-03, Mark: "The GHL instant call center ring
+  // should not happen… the number always shows as a GHL number and then it
+  // forwards to our dialer") ──
+  // hdl:callback-sales started I.HDL-1 → B.HC-L's GHL call bridge, and
+  // hdl:callback-service I.HDL-2's. Neither goes on any more, and the
+  // customer-status probe is not sent: the bot replies (handoff-policy.js),
+  // and after the send the call is filed: Five9's call-now list for sales
+  // (Reece's own caller ID), the market #service channel for service
+  // (fileBotCallback). Only a trace tag goes on here.
   let callbackBasis = null;
-  if (generated.intent_class === 'CALLBACK') {
-    if (contactTags.includes(CUSTOMER_STATUS_PENDING_TAG)) {
-      // Probe already outstanding and the lead asked for a callback again
-      // without answering it — stop asking, default to the sales queue so
-      // a human picks it up (sales can transfer a customer).
-      handoffTag = CALLBACK_TAG_SALES;
-      callbackBasis = 'probe_pending_default_sales';
-    } else {
-      const resolution = await resolveCallbackHandoff(contactId);
-      if (resolution.tag) {
-        handoffTag = resolution.tag;
-        callbackBasis = resolution.basis;
-      } else {
-        // Ambiguous — ask the probe instead of handing off.
-        return await sendCustomerStatusProbe(contactId, generated, action, context, opts);
-      }
-    }
-    console.log(`[SendMessage] CALLBACK resolved for ${contactId}: ${handoffTag} (${callbackBasis})`);
+  if (generated.intent_class === 'CALLBACK' || handoffTag === CALLBACK_TAG_SALES || handoffTag === CALLBACK_TAG_SERVICE
+    || handoffTag === 'hdl:callback-pending-classification') {
+    callbackBasis = 'bot_reply_then_five9';
+    handoffTag = CALLBACK_MARKER_TAG;
   }
 
   const tagsToApply = [];
@@ -2126,21 +2111,6 @@ async function handleShortCircuit(contactId, generated, action, context, opts = 
   let tagApplied = false;
   if (tagsToApply.length > 0) {
     tagApplied = await applyContactTags(contactId, tagsToApply);
-  }
-
-  // ── A callback is filed for real (Mark, 2026-10-03) ───────────────
-  // The classifier's CALLBACK short-circuit is how most texted "can someone
-  // call me?" arrive, ahead of the NEPQ planner. Sales: the Five9 Callback
-  // Request list + the #contact-center card. Service: the market's #service
-  // channel, never Five9. The hdl:* tag above still starts its GHL workflow.
-  // Detached and fail-soft.
-  if (!opts.dryRun && generated.intent_class === 'CALLBACK' && (handoffTag === CALLBACK_TAG_SALES || handoffTag === CALLBACK_TAG_SERVICE)) {
-    const inbound = generated.trigger_message_preview || context?.trigger_message || '';
-    const deps = botCallbackDeps({ applyTags: applyContactTags, addNote: addGHLNote });
-    fileBotCallback({
-      contactId, channel: generated.channel || 'sms', inbound, why: 'classifier_callback',
-      kind: handoffTag === CALLBACK_TAG_SERVICE ? 'service' : 'sales',
-    }, deps).catch(err => console.warn(`[SendMessage] classifier callback filing failed for ${contactId} (fail-soft): ${err.message}`));
   }
 
   // ── Customer-status probe answered → clear the pending tag ────────
@@ -2307,16 +2277,19 @@ async function sendCustomerStatusProbe(contactId, generated, action, context, op
 
   const primed = await applyContactTags(contactId, [CUSTOMER_STATUS_PENDING_TAG]);
   if (!primed) {
-    const fallbackApplied = await applyContactTags(contactId, [CALLBACK_TAG_SALES]);
-    console.warn(`[SendMessage] probe priming failed for ${contactId} — falling back to ${CALLBACK_TAG_SALES} (applied: ${fallbackApplied})`);
+    // 2026-10-03: no GHL call bridge; Five9 makes the call.
+    const fallbackApplied = await applyContactTags(contactId, [CALLBACK_MARKER_TAG]);
+    console.warn(`[SendMessage] probe priming failed for ${contactId} — filing a Five9 callback instead (tag applied: ${fallbackApplied})`);
+    fileBotCallback({ contactId, channel, inbound: generated.trigger_message_preview || '', why: 'probe_priming_failed' },
+      botCallbackDeps({ applyTags: applyContactTags, addNote: addGHLNote })).catch(() => {});
     return {
       action: 'send_message_handed_off',
       contact_id: contactId,
       channel,
       intent_class: generated.intent_class,
       handler_code: generated.handler_code,
-      handoff_tag: CALLBACK_TAG_SALES,
-      tags_applied: fallbackApplied ? [CALLBACK_TAG_SALES] : [],
+      handoff_tag: CALLBACK_MARKER_TAG,
+      tags_applied: fallbackApplied ? [CALLBACK_MARKER_TAG] : [],
       is_disqualifier: false,
       classifier_confidence: generated.classifier_confidence,
       classification_method: generated.classification_method,
@@ -3439,19 +3412,9 @@ export async function executeSendMessage(action, context) {
     }
 
     // 2026-10-02 — NEPQ hand-off (complaint, price insisted after one ask,
-    // two no's, a repeated objection). The reply says someone from our team
-    // will reach out; this makes it true. Same shape as the decision-maker
-    // hand-off above. Fail-soft: the reply matters more.
-    // A callback_request hand-off is filed after the send instead (below,
-    // fileBotCallback): Five9 + #contact-center, only for a reply that went out.
-    if (!generationErr && generated?.nepq_handoff && generated.nepq_handoff.reason !== 'callback_request') {
-      // A service hand-off posts to the market's #service channel (Mark, 2026-10-03).
-      await routeNepqHandoff({
-        contactId, reason: generated.nepq_handoff.reason, channel,
-        inbound: replyTriggerMessage || triggerMessage,
-        firstName: context?.lead?.first_name || null,
-      }, nepqHandoffDeps({ applyTags: applyContactTags, addNote: addGHLNote })).catch(err => console.warn(`[SendMessage] NEPQ hand-off side effects failed for ${contactId} (fail-soft): ${err.message}`));
-    }
+    // two no's, a repeated objection, a call request, service): filed after
+    // the send through fileBotCallback (below), with its card and, for sales,
+    // the Five9 call (2026-10-03).
 
     // 2026-09-25 — "didn't get it" on a guide: re-fire the delivery tag so GHL
     // sends it again (src/agentic/guide-delivery.js guideResendOps). Remove
@@ -3504,6 +3467,10 @@ export async function executeSendMessage(action, context) {
             `15-minute call with both on speaker. Do not push if they have already refused.`,
           card: `🛑 DECISION-MAKER MESSAGE — AI FAILED, NO REPLY SENT`,
         });
+        // A person must call: Five9's call-now list (its own card is above).
+        fileBotCallback({ contactId, channel, inbound: replyTriggerMessage || triggerMessage, why: 'dm_generation_failed', card: false },
+          botCallbackDeps({ applyTags: applyContactTags, addNote: addGHLNote }))
+          .catch(err => console.warn(`[SendMessage] dm callback filing failed for ${contactId} (fail-soft): ${err.message}`));
 
         return {
           action: 'send_message_handed_off',
@@ -3511,8 +3478,8 @@ export async function executeSendMessage(action, context) {
           channel,
           reason: 'decision_maker_message_generation_failed',
           decision_maker_signals: dmSignals,
-          handoff_tag: CALLBACK_TAG_SALES,
-          tags_applied: handoffTags ? [CALLBACK_TAG_SALES] : [],
+          handoff_tag: CALLBACK_MARKER_TAG,
+          tags_applied: handoffTags ? [CALLBACK_MARKER_TAG] : [],
           _fallback_send: false,
           _generation_error: generationErr.message.slice(0, 300),
         };
@@ -4006,20 +3973,27 @@ export async function executeSendMessage(action, context) {
   const _tCommitted = Date.now();
 
   // ── A promised call is filed for real (Mark, 2026-10-03) ─────────
-  // The Five9 Callback Request list + the #contact-center card
-  // (src/agentic/bot-callback.js), for the planner's callback hand-off AND
-  // for any sent reply that promises we will call (Mark's shutters thread:
-  // "someone from our team will call you shortly", nothing filed). After the
-  // send, so a reply that never went out files nothing. Fail-soft, detached.
+  // Five9's call-now Callback Request list + the #contact-center card for
+  // sales; the market #service channel for service (src/agentic/bot-callback.js).
+  // Every planner hand-off a person follows up on, a classified call request,
+  // the decision-maker hand-off (its own card; Five9 only) and any sent reply
+  // that promises we will call. No GHL call bridge: none of these add an
+  // hdl:callback-* tag. After the send, so a reply that never went out files
+  // nothing. Fail-soft, detached.
   {
-    const callbackReason = callbackDecision({ handoffReason: generated?.nepq_handoff?.reason || null, otherHandoff: !!generated?.dm_handoff, text: String(message || '') });
-    if (callbackReason) {
-      if (callbackReason === 'promise_backed') console.log(`[SendMessage] call_promise_backed ${contactId}: "${String(message || '').slice(0, 160)}"`);
+    const classified = generated?.callback_requested
+      ? { why: 'classifier_callback', reason: generated.callback_requested === 'service' ? 'service' : 'callback_request', kind: generated.callback_requested === 'service' ? 'service' : 'sales' }
+      : null;
+    const decision = (generated?.nepq_handoff || generated?.dm_handoff) ? callbackDecision({ handoffReason: generated?.nepq_handoff?.reason || null, otherHandoff: !!generated?.dm_handoff, text: String(message || '') })
+      : (classified || callbackDecision({ text: String(message || '') }));
+    if (decision) {
+      if (decision.why === 'promise_backed') console.log(`[SendMessage] call_promise_backed ${contactId}: "${String(message || '').slice(0, 160)}"`);
       fileBotCallback({
         contactId, channel, inbound: replyTriggerMessage || context?.message_text || '',
-        firstName: context?.lead?.first_name || null, why: callbackReason,
+        firstName: context?.lead?.first_name || null, why: decision.why, reason: decision.reason,
         // A service conversation goes to the service channel, never Five9 (Mark, 2026-10-03).
-        kind: generated?.service_conversation ? 'service' : 'sales',
+        kind: decision.kind || (generated?.service_conversation ? 'service' : 'sales'),
+        card: decision.card !== false,
       }, botCallbackDeps({ applyTags: applyContactTags, addNote: addGHLNote }))
         .catch(err => console.warn(`[SendMessage] bot callback failed for ${contactId} (fail-soft): ${err.message}`));
     }

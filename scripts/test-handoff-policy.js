@@ -17,16 +17,18 @@ const {
 const { buildHumanHandoffAlertPayload } = await import('../src/human-handoff-alert.js');
 
 // The live kb_intent_handlers rows with action_type tag_and_handoff, 2026-09-24.
+// 2026-10-03 (Mark: no GHL instant ring): the call requests that a GHL
+// workflow used to answer are answered by the bot now; Five9 makes the call.
 const LIVE = [
   ['ANGRY', 'hdl:human-handoff', 'reply'],
   ['STOP', 'hdl:stop', 'silent'],
   ['FULFILLMENT_NOT_RECEIVED', 'hdl:fulfillment-not-received', 'reply'],
   ['WHO_IS_THIS', 'hdl:who-is-this', 'reply'],
-  ['CALLBACK', 'hdl:callback-pending-classification', 'workflow'],
+  ['CALLBACK', 'hdl:callback-pending-classification', 'reply'],
   ['RENTER', 'hdl:dq-renter', 'reply'],
-  ['CUSTOMER_STATUS_AFFIRMATIVE', 'hdl:callback-service', 'workflow'],
+  ['CUSTOMER_STATUS_AFFIRMATIVE', 'hdl:callback-service', 'reply'],
   ['MOVED', 'hdl:moved', 'reply'],
-  ['CUSTOMER_STATUS_NEGATIVE', 'hdl:callback-sales', 'workflow'],
+  ['CUSTOMER_STATUS_NEGATIVE', 'hdl:callback-sales', 'reply'],
   ['WRONG_NUMBER', 'hdl:wrong-number', 'silent'],
   ['MOBILE', 'hdl:dq-mobile', 'reply'],
 ];

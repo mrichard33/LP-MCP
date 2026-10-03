@@ -482,7 +482,7 @@ export function discoveryEarned(conversation = [], trigger = '') {
 export function planNepqTurn({
   channel = 'sms', trigger = '', conversation = [], slots = [], tzLabel = '', firstName = null,
   hasAppointment = false, nextStepLabel = 'a free visit at your home', discipline = null, nowMs = Date.now(),
-  allSlots = null, isCustomer = false,
+  allSlots = null, isCustomer = false, callbackRequested = false,
 } = {}) {
   const turns = normalizeThread(conversation, trigger);
   const inbound = turns.filter(t => t.direction === 'inbound');
@@ -591,8 +591,11 @@ export function planNepqTurn({
     const line = (!teamOpen ? LINES.handoff_closed.service_callback(nextTeamOpenLabel(nowMs)) : LINES.handoff.service_callback);
     return fixed('handoff', line, { step: 'handoff', handoff: { reason: 'service', line }, booking: { allowed: false, reason: 'nepq:handoff_service' } });
   };
-  if (CALLBACK_RX.test(now) && !isNotInterested(now) && serviceCall()) return serviceHandoff();
-  if (CALLBACK_RX.test(now) && !isNotInterested(now)) {
+  // The intent classifier read a call request the regex missed ("can I talk
+  // to a real person on the phone"): same hand-off (2026-10-03).
+  const askedForCall = (CALLBACK_RX.test(now) || callbackRequested) && !isNotInterested(now);
+  if (askedForCall && serviceCall()) return serviceHandoff();
+  if (askedForCall) {
     // A call asked for outside team hours gets the next opening instead, and
     // after hours "call me back" names when (2026-10-02, Mark).
     const asked = requestedCallTime(now, nowMs);

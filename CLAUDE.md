@@ -309,7 +309,7 @@ sign-off, and leaves any sentence quoting a LOCKED KB line (found in the prompt)
 
 **NEPQ is enforced in code, not only in the prompt (Mark, 2026-10-02).** `src/agentic/nepq-planner.js`
 plans ONE move per turn for both bots (`planNepqTurn`): a person takes over on a complaint, a price asked
-again after the price play, two no's, or a repeated objection (`src/agentic/nepq-handoff.js`: `hdl:callback-sales`
+again after the price play, two no's, or a repeated objection (`src/agentic/nepq-handoff.js`: `callback:requested`
 + `nepq:handoff:<reason>`, a rep note, an event, and a card in **#contact-center** (`SLACK_CHANNEL_SERVICE`), plus
 **#dispatch** for a complaint or an unbookable pick, via `postToSlack`; a failed post is an #ops-alerts line); the objection plays, the
 think-it-over Calendar Commitment (two REAL slots, exempt from the booking-ask cap), "what day works best",
@@ -356,8 +356,16 @@ is only `nepq:handoff:service` (no hdl:* tag: `hdl:callback-service` fires I.HDL
 goes to the contact's market `#service-<market>` channel
 (`serviceChannelsFor` → `resolveSlackChannels('service')`, falling back to #contact-center). Never Five9: `fileBotCallback`
 with `kind: 'service'` skips the requeue. Both bots' hand-offs use one production deps object, `nepqHandoffDeps`. The
-classifier's CALLBACK short-circuit (`handleShortCircuit`, most texted "can someone call me?") files the same way after
-`resolveCallbackHandoff`: sales → Five9 + #contact-center, service → #service; its hdl:* tag still starts I.HDL-1 / I.HDL-2.
+classifier's CALLBACK (most texted "can someone call me?") files the same way: sales → Five9 + #contact-center,
+service → #service.
+**No GHL instant ring; Five9 makes every bot callback (Mark, 2026-10-03).** "The GHL instant call center ring should not
+happen… the number always shows as a GHL number and then it forwards to our dialer." `hdl:callback-sales` started I.HDL-1 →
+B.HC-L's GHL call bridge and `hdl:callback-service` I.HDL-2's; no bot path adds either any more (only the trace tag
+`callback:requested`, `CALLBACK_MARKER_TAG`), and `scripts/test-part14-no-ghl-ring.js` fails if one does. A classified call
+request is answered by the bot (`handoffReplyPolicy`: only STOP / WRONG_NUMBER are silent; the customer-status probe is no
+longer sent), the planner gets `callbackRequested`, and after the send every hand-off a person follows up on files to
+Five9's call-now Callback Request list under its own reason (`callbackDecision` → `fileBotCallback`, card per reason per
+day); the decision-maker hand-off keeps its own card (`card: false`); service goes to #service only.
 
 **Book in the conversation, unconfirmed, on the right calendar (Mark, 2026-10-02).** Every bot booking is
 status `new` (the handler forces it). **Ask about decision makers ONCE, then book** (supersedes 2026-09-18):

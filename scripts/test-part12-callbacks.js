@@ -45,7 +45,7 @@ test('a callback goes to Five9 AND the #contact-center card, which names the Fiv
   assert.equal(calls.handoff.length, 1);
   assert.equal(calls.handoff[0].reason, 'callback_request');
   assert.match(calls.handoff[0].extra, /added to the Callback Request list/);
-  assert.equal(calls.claims[0], 'bot_callback_C1_2026-10-05');
+  assert.equal(calls.claims[0], 'bot_callback_C1_callback_request_2026-10-05');
 });
 
 test('once per contact per day: a second filing is skipped', async () => {
@@ -82,9 +82,12 @@ test('Five9 results read plainly', () => {
 
 // ── when a callback is due ───────────────────────────────────────────────
 test('a planned callback, or a promise the planner did not choose, is filed; nothing else', () => {
-  assert.equal(callbackDecision({ handoffReason: 'callback_request', text: 'x' }), 'planned');
-  assert.equal(callbackDecision({ text: 'Got it, someone from our team will call you shortly.' }), 'promise_backed');
-  assert.equal(callbackDecision({ handoffReason: 'complaint', text: 'Someone from our team will call you.' }), null, 'a hand-off already covers it');
+  assert.deepEqual(callbackDecision({ handoffReason: 'callback_request', text: 'x' }), { why: 'planned', reason: 'callback_request', kind: 'sales' });
+  assert.equal(callbackDecision({ text: 'Got it, someone from our team will call you shortly.' }).why, 'promise_backed');
+  // Part 14 (no GHL ring): every hand-off a person follows up on files to Five9, under its own reason.
+  assert.deepEqual(callbackDecision({ handoffReason: 'complaint', text: 'Someone from our team will call you.' }), { why: 'planned', reason: 'complaint', kind: 'sales' });
+  assert.equal(callbackDecision({ handoffReason: 'service' }).kind, 'service');
+  assert.equal(callbackDecision({ otherHandoff: true }).card, false, 'the decision-maker hand-off posts its own card');
   assert.equal(callbackDecision({ text: "You're all set for Wed at 10 AM. Our team will reach out to confirm the details." }), null);
   assert.equal(callbackDecision({ text: 'Want someone to give you a call and go over it?' }), null, 'an offer is not a promise');
   assert.equal(promisedCallback('What made you reach out today?'), false);
