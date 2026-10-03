@@ -366,6 +366,18 @@ request is answered by the bot (`handoffReplyPolicy`: only STOP / WRONG_NUMBER a
 longer sent), the planner gets `callbackRequested`, and after the send every hand-off a person follows up on files to
 Five9's call-now Callback Request list under its own reason (`callbackDecision` → `fileBotCallback`, card per reason per
 day); the decision-maker hand-off keeps its own card (`card: false`); service goes to #service only.
+**On the Five9 list is not a call (review of Part 14, 2026-10-03).** Of 18 callback pushes in 30 days, 6 got a Callback
+Request call (3 within a minute) and 12 never did: 4 were on Five9's DNC list (Five9 takes the record and never dials it,
+silently) and the campaign is PREVIEW mode with a 7-hour gap filter after any earlier call. So:
+- `pushCallbackToFive9` checks Five9's DNC list first (`checkCallbackDnc`, fails open) and, on a hit, pushes nothing and
+  queues `request_dnc_lift_review` (trigger `callback_request`): a lift is a person's call, never ours. The card says so.
+- the verify sweep (`src/jobs/lp-requeue-verify.js`) holds a push with a `number1` open until `five9.disposition_set`
+  shows a call to that number, and 15 min into the 8–8 ET dial window with none posts **⏰ PROMISED CALL NOT MADE YET**
+  to #contact-center (`src/five9/callback-dial-check.js`, naming an earlier call that explains the 7-hour wait).
+  `LP_REQUEUE_DIAL_CHECK=false` restores "pushed = done".
+- two no's and a canvasser complaint are reviewed, never dialed (`NO_DIAL_REASONS` in `bot-callback.js`): the two-no's
+  line promises no contact, and "stop knocking on my door" (`isKnockComplaint`) gets the do-not-knock flow: the address,
+  a name if none, then a **🚪 DO NOT KNOCK** card to the market's #canvass channel and the rollup. No sales call.
 
 **Book in the conversation, unconfirmed, on the right calendar (Mark, 2026-10-02).** Every bot booking is
 status `new` (the handler forces it). **Ask about decision makers ONCE, then book** (supersedes 2026-09-18):

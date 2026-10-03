@@ -54,6 +54,19 @@ export async function serviceChannelsFor(contactId) {
   return resolveSlackChannels('service', { market: market || undefined });
 }
 
+/**
+ * The contact's market #canvass channel plus the canvass rollup (2026-10-03:
+ * a do-not-knock card goes to the canvass team). Same market resolver as the
+ * service card: it returns the market CODE, which slack_market_slugs is keyed on.
+ */
+export async function canvassChannelsFor(contactId) {
+  const [{ resolveServiceMarketForContact }, { resolveSlackChannels }] = await Promise.all([
+    import('../actions/service-card.js'), import('../slack.js'),
+  ]);
+  const market = await resolveServiceMarketForContact(contactId, null, null).catch(() => null);
+  return resolveSlackChannels('canvass', { market: market || undefined });
+}
+
 /** Production deps for routeNepqHandoff (src/agentic/nepq-handoff.js), shared by both bots. */
 export function nepqHandoffDeps({ applyTags, addNote }) {
   return {
@@ -61,5 +74,6 @@ export function nepqHandoffDeps({ applyTags, addNote }) {
     post: (text, channelId) => import('../slack.js').then(({ postToSlack }) => postToSlack(text, channelId)),
     opsAlert: (text) => import('../alert-state.js').then(({ sendAlertMessage }) => sendAlertMessage(text, { channel: 'ops' })),
     serviceChannels: serviceChannelsFor,
+    canvassChannels: canvassChannelsFor,
   };
 }

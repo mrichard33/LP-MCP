@@ -4569,7 +4569,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
         validated.nepq_plan.changes = enforced.changes;
       }
       if (!nepqPlan.booking.allowed && validated.companion_action?.action_type === 'book_appointment') validated.companion_action = null;
-      if (nepqPlan.handoff) validated.nepq_handoff = { reason: nepqPlan.handoff.reason };
+      if (nepqPlan.handoff) validated.nepq_handoff = { reason: nepqPlan.handoff.reason, extra: nepqPlan.handoff.extra || null };
       const recentOut = (context.conversation_recent || []).filter(m => String(m?.direction || '').toLowerCase() === 'outbound').slice(-8).map(m => String(m?.text ?? m?.body ?? ''));
       // 2026-10-02 (Mark): an email that cannot be right gets one friendly
       // re-check (contact-check.js). SMS already has their number.

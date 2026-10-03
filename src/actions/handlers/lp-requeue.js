@@ -67,6 +67,8 @@ import {
   findContactInOtherLists,
   callbackListName,
   callbackCallNowMode,
+  checkCallbackDnc,
+  buildCallbackDncReviewAction,
 } from '../../five9/callback-push.js';
 
 import { executeCreateLPLead } from './lp-lead.js';
@@ -490,6 +492,50 @@ async function pushCallbackToFive9({
     throw err;
   }
 
+  // 1b. Five9's DNC list (2026-10-03). Five9 takes a DNC number onto the list
+  //     and never dials it, silently: 4 of 18 callback pushes in 30 days were
+  //     DNC numbers that never got a call. Do not push; ask a person to lift
+  //     it (#dnc-lift-approval), and say so where the call was promised.
+  const dnc = await checkCallbackDnc(record.number1);
+  if (dnc.failedOpen) console.warn(`[LP-REQUEUE] Five9 DNC check failed for ${contactId} — pushing anyway (fail open): ${dnc.error}`);
+  if (dnc.onDnc) {
+    let reviewId = null;
+    try {
+      const { data, error } = await supabase.from('agent_actions')
+        .insert(buildCallbackDncReviewAction({ contactId, number1: record.number1 }))
+        .select('id').single();
+      if (error) throw new Error(error.message);
+      reviewId = data?.id ?? null;
+    } catch (err) {
+      console.warn(`[LP-REQUEUE] DNC lift review could not be queued for ${contactId}: ${err.message}`);
+    }
+    await emitEvent({
+      event_type: 'lp.callback_requeue_dnc',
+      source: 'lp_mcp',
+      entity_type: 'contact',
+      entity_id: String(contactId),
+      ghl_contact_id: contactId,
+      priority: 'high',
+      payload: { reason: 'five9_dnc', number_last4: record.number1.slice(-4), dnc_review_action_id: reviewId },
+      idempotency_key: `lp_callback_requeue_dnc_${contactId}_${action.id}`,
+    }).catch(() => {});
+    await addGHLNote(contactId,
+      `[LP REQUEUE] The lead asked for a call, but this number is on the Five9 DNC list, so the dialer would skip it. ` +
+      `Not pushed to "${listName}". ${reviewId ? `A DNC lift review was requested in #dnc-lift-approval (action ${reviewId}); call only after it is approved.` : 'The DNC lift review could NOT be queued: ask for one by hand.'}`
+    ).catch(() => {});
+    console.log(`[LP-REQUEUE] ⏭️ Skip ${contactId}: number on Five9 DNC — lift review ${reviewId ?? 'NOT queued'}`);
+    return {
+      action: 'requeue_blocked_dnc',
+      // requeued:false: nothing reached a dialer, like the other skips.
+      requeued: false,
+      branch: 'five9_dnc',
+      mode: 'five9',
+      contact_id: contactId,
+      number1: record.number1,
+      dnc_review_action_id: reviewId,
+    };
+  }
+
   // 2. Cross-list suppression. Fails open — see findContactInOtherLists.
   const other = await findContactInOtherLists(record.number1, { listName });
   if (other.failed_open) {
@@ -629,6 +675,9 @@ async function pushCallbackToFive9({
     pre_inbound_id: preInboundId || null,
     five9_list: listName,
     five9_action_id: queued?.id ?? null,
+    // The verify sweep's dial check looks for a Five9 call to this number (2026-10-03).
+    number1: record.number1,
+    first_name: String(ghlContact.firstName || '').trim() || null,
     five9_field_names: record.fieldNames,
     call_now_mode: callNowMode,
     lp_rec_key: record.lpRecKey,

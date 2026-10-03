@@ -39,6 +39,16 @@ export const BOT_CALLBACK_RULE = 'BOT_CALLBACK';
 export const CALLBACK_MARKER_TAG = 'callback:requested';
 
 /**
+ * Hand-offs a person REVIEWS, never auto-dialed (2026-10-03 review of Part 14):
+ *   two_nos       — dialing someone who just said no twice annoys them and is a
+ *                   compliance risk; the card asks a person to decide.
+ *   do_not_knock  — a complaint about a canvasser at the door: no sales call,
+ *                   the bot collects the name and address for the do-not-knock
+ *                   list and the card goes to the canvass channel.
+ */
+export const NO_DIAL_REASONS = new Set(['two_nos', 'do_not_knock']);
+
+/**
  * What a sent reply needs filed, and why. Pure.
  *   { why: 'planned', reason, kind }  — a planner hand-off: every reason a person
  *     follows up on files to Five9 (sales); 'service' goes to #service only
@@ -62,6 +72,10 @@ export function five9ResultLine(result) {
     case 'new_lead': return 'Five9: no LP lead yet, so a new LP lead was created for the dialer.';
     case 'already_dialing': return 'Five9: this number is already being dialed, so it was not added twice.';
     case 'deduped': return 'Five9: already queued for a callback in the last little while.';
+    // 2026-10-03: Five9 takes a DNC number onto the list and never dials it.
+    case 'on_dnc': return result.review
+      ? 'Five9: NOT added. This number is on the Five9 do-not-call list, so the dialer would skip it. A DNC lift review was requested in #dnc-lift-approval; call them once it is approved.'
+      : 'Five9: NOT added. This number is on the Five9 do-not-call list, so the dialer would skip it, and the DNC lift review could not be queued. Ask for one in #dnc-lift-approval.';
     default: return `Five9: NOT added (${String(result?.error || 'unknown').slice(0, 120)}). Call them manually.`;
   }
 }
@@ -76,6 +90,7 @@ export function readRequeueResult(res) {
   if (action === 'requeue_lead_created') return { status: 'new_lead' };
   if (action === 'requeue_skipped_already_dialable' || action === 'requeue_suppressed_other_list') return { status: 'already_dialing' };
   if (action === 'requeue_deduped') return { status: 'deduped' };
+  if (action === 'requeue_blocked_dnc') return { status: 'on_dnc', review: (res.result || res).dnc_review_action_id != null };
   return { status: 'failed', error: action || 'unknown result' };
 }
 
@@ -84,10 +99,11 @@ export function readRequeueResult(res) {
  *           reason?: string, card?: boolean, nowMs? }} args
  *   reason — the hand-off reason on the card (callback_request, complaint, price_insist, …)
  *   card   — false when the caller already posts its own card (Five9 only)
+ *   extra  — one more card line for a reviewed hand-off (the do-not-knock details)
  * @param {{ alreadyFiled(contactId, key) → Promise<boolean>, claim(contactId, key, payload) → Promise<any>,
  *           queueRequeue(contactId, notes) → Promise<any>, routeHandoff(args) → Promise<any>, log? }} deps
  */
-export async function fileBotCallback({ contactId, channel = 'sms', inbound = '', firstName = null, hasPhone = true, why = 'planned', kind = 'sales', reason = 'callback_request', card = true, nowMs = Date.now() } = {}, deps = {}) {
+export async function fileBotCallback({ contactId, channel = 'sms', inbound = '', firstName = null, hasPhone = true, why = 'planned', kind = 'sales', reason = 'callback_request', card = true, extra = null, nowMs = Date.now() } = {}, deps = {}) {
   const log = deps.log || ((m) => console.log(m));
   if (!contactId) return { filed: false, reason: 'no_contact' };
   // A service call never goes on the sales callback list (Mark, 2026-10-03):
@@ -97,6 +113,22 @@ export async function fileBotCallback({ contactId, channel = 'sms', inbound = ''
       .catch(err => log(`[BotCallback] ${contactId} service hand-off failed: ${err.message}`));
     log(`[BotCallback] ${contactId} (${channel}, ${why}) is a service call: service channel, no Five9`);
     return { filed: true, kind: 'service' };
+  }
+  // A reviewed hand-off: the card only, nothing goes to the dialer.
+  if (NO_DIAL_REASONS.has(reason)) {
+    const reviewKey = `bot_callback_${contactId}_${reason}_${new Date(nowMs).toISOString().slice(0, 10)}`;
+    if (await Promise.resolve().then(() => deps.alreadyFiled?.(contactId, reviewKey)).catch(() => false)) {
+      log(`[BotCallback] ${contactId} ${reason} card already posted today — skipped`);
+      return { filed: false, reason: 'already_today' };
+    }
+    await Promise.resolve().then(() => deps.claim?.(contactId, reviewKey, { contact_id: contactId, channel, why, reason, inbound_preview: String(inbound || '').slice(0, 300) })).catch(() => {});
+    if (card) {
+      await Promise.resolve().then(() => deps.routeHandoff?.({
+        contactId, reason, channel, inbound, firstName, nowMs, extra: extra || 'Five9: NOT added. A person decides whether to reach out; the bot promised no call.',
+      })).catch(err => log(`[BotCallback] ${contactId} hand-off failed: ${err.message}`));
+    }
+    log(`[BotCallback] ${contactId} (${channel}, ${reason}) is reviewed, not dialed: card only`);
+    return { filed: true, five9: { status: 'not_dialed' } };
   }
   if (!hasPhone) {
     // A call request waits for the number (the bot asks for it). Any other

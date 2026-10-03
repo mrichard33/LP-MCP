@@ -35,6 +35,7 @@ import supabase from '../supabase.js';
 import { getInboundLeadInfo } from '../lp-client.js';
 import { sendGroupMeMessage } from '../groupme.js';
 import { ghlFetch } from '../actions/helpers.js';
+import { dialCheckVerdict, formatNotDialedCard } from '../five9/callback-dial-check.js';
 
 const FIELD_LP_LEAD_ID = 'GmAVmW6V9sekD7pVONKr'; // lds_id custom field
 
@@ -186,6 +187,12 @@ async function verifyFive9Push(row, res, deps = {}) {
     }
   }
 
+  // 2026-10-03: on the list is not a call. A push with a number is held open
+  // until Five9 really calls it, or #contact-center is told to (dial check).
+  if (status === 'completed' && res.number1 && String(process.env.LP_REQUEUE_DIAL_CHECK || 'true').toLowerCase() !== 'false') {
+    return verifyFive9Dial(row, res, deps);
+  }
+
   if (status === 'completed') {
     const elapsedS = Math.round((Date.now() - Date.parse(row.created_at)) / 1000);
     console.log(`[RequeueVerify] ✅ ${contactId}: five9 push (action ${five9ActionId}) completed ${elapsedS}s after re-queue`);
@@ -227,6 +234,76 @@ async function verifyFive9Push(row, res, deps = {}) {
     verified_at: new Date().toISOString(),
     five9_action_status: status,
   }, db);
+  return 'escalated';
+}
+
+/** Five9 calls to/from a number since `sinceIso`, from the disposition feed; null when unreadable. */
+async function defaultFive9Calls(number10, sinceIso, db) {
+  const n = String(number10 || '').replace(/\D/g, '').slice(-10);
+  if (n.length !== 10) return [];
+  const { data, error } = await db.from('system_events')
+    .select('created_at, payload')
+    .eq('event_type', 'five9.disposition_set')
+    .gte('created_at', sinceIso)
+    .or(`payload->>dnis.eq.${n},payload->>ani.eq.${n}`)
+    .order('created_at', { ascending: true })
+    .limit(100);
+  if (error) throw new Error(error.message);
+  return (data || []).map(r => ({
+    atMs: Date.parse(r.payload?.call_start_at || r.created_at),
+    campaign: r.payload?.campaign || null,
+  }));
+}
+
+/**
+ * Stage 2 for a five9 push (2026-10-03): wait for a real Five9 call to the
+ * number; past the window's grace with none, post the not-dialed card to
+ * #contact-center so a person calls. A read that fails is no verdict.
+ */
+async function verifyFive9Dial(row, res, deps = {}) {
+  const db = deps.supabase || supabase;
+  const contactId = row.target_id;
+  const filedMs = Date.parse(row.created_at);
+  const nowMs = deps.nowMs ?? Date.now();
+  const readCalls = deps.five9Calls || ((n, since) => defaultFive9Calls(n, since, db));
+  let calls;
+  try {
+    calls = await readCalls(res.number1, new Date(filedMs - 24 * 60 * 60 * 1000).toISOString());
+  } catch (err) {
+    console.warn(`[RequeueVerify] Five9 call read failed for ${contactId}: ${err.message}`);
+    return null;
+  }
+  const after = calls.filter(c => c.atMs >= filedMs - 60000);
+  const verdict = dialCheckVerdict({ filedMs, nowMs, calls: after });
+  if (verdict === 'dialed') {
+    const first = after.sort((a, b) => a.atMs - b.atMs)[0];
+    const dialS = Math.round((first.atMs - filedMs) / 1000);
+    console.log(`[RequeueVerify] ✅ ${contactId}: Five9 called ${dialS}s after the callback was filed (${first.campaign || 'unknown campaign'})`);
+    await stampResult(row.id, res, { verify_status: 'five9_dialed', verified_at: new Date(nowMs).toISOString(), dial_seconds: dialS, dial_campaign: first.campaign || null }, db);
+    return 'lds_issued';
+  }
+  if (verdict !== 'not_dialed') return null;
+
+  let name = res.first_name || null;
+  try {
+    const c = (await (deps.ghlFetch || ghlFetch)('GET', `/contacts/${contactId}`))?.contact || {};
+    name = `${c.firstName || ''} ${c.lastName || ''}`.trim() || name;
+  } catch {}
+  const card = formatNotDialedCard({
+    name, phone: res.number1, contactId, filedMs, nowMs,
+    priorCalls: calls.filter(c => c.atMs < filedMs - 60000),
+    locationId: process.env.GHL_LOCATION_ID,
+  });
+  const channel = String((deps.env || process.env).SLACK_CHANNEL_SERVICE || '').trim();
+  const post = deps.post || ((text, id) => import('../slack.js').then(({ postToSlack }) => postToSlack(text, id)));
+  const opsAlert = deps.opsAlert || ((text) => import('../alert-state.js').then(({ sendAlertMessage }) => sendAlertMessage(text, { channel: 'ops' })));
+  const posted = channel ? await Promise.resolve(post(card, channel)).catch(err => ({ ok: false, error: err.message })) : { ok: false, error: 'SLACK_CHANNEL_SERVICE unset' };
+  if (posted?.ok) console.log(`[RequeueVerify] ⏰ ${contactId}: not dialed — card posted to #contact-center`);
+  else {
+    console.warn(`[RequeueVerify] ⏰ ${contactId}: not dialed — #contact-center card NOT posted: ${posted?.error}`);
+    await Promise.resolve(opsAlert(`🚨 NOT-DIALED CALLBACK CARD NOT POSTED TO #contact-center (${posted?.error || 'unknown'})\n\n${card}`)).catch(() => {});
+  }
+  await stampResult(row.id, res, { verify_status: 'not_dialed_escalated', verified_at: new Date(nowMs).toISOString(), not_dialed_card_posted: !!posted?.ok }, db);
   return 'escalated';
 }
 
@@ -295,5 +372,5 @@ export function registerLpRequeueVerifyRoutes(app) {
   });
 }
 
-export const _internal = { verifyOne, stampResult };
+export const _internal = { verifyOne, stampResult, verifyFive9Dial };
 export default { runRequeueVerifySweep, startLpRequeueVerifyScheduler, registerLpRequeueVerifyRoutes };

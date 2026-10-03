@@ -21,7 +21,7 @@
  * the card are cheap to repeat but the event is the record.
  */
 
-import { CALLBACK_MARKER_TAG } from './bot-callback.js';
+import { CALLBACK_MARKER_TAG, NO_DIAL_REASONS } from './bot-callback.js';
 import { GHL_LOCATION_ID } from '../actions/constants.js';
 
 /** #dispatch's live channel; SLACK_CHANNEL_DISPATCH overrides (same default as the cancel cards). */
@@ -42,7 +42,9 @@ export const NEPQ_HANDOFF_TAG_PREFIX = 'nepq:handoff:';
 const WHY = {
   complaint: 'The lead complained (often a missed visit). Reach out, listen first, and make it right.',
   price_insist: 'The lead asked for a price again after the bot explained every home is different. Call to talk it through; exact pricing comes from the visit.',
-  two_nos: 'The lead said no twice. Check in once, personally; do not push.',
+  // 2026-10-03: reviewed, never auto-dialed (bot-callback.js NO_DIAL_REASONS).
+  two_nos: 'The lead said no twice. NOT added to the dialer. Review the thread; reach out only if something in it says they want to hear from us.',
+  do_not_knock: 'The homeowner complained about a canvasser at their door. Add this address to the do-not-knock list. No sales call.',
   repeat_objection: 'The lead raised the same objection again. Call so they get a straight answer.',
   emergency: 'URGENT: damage happening now (e.g. a broken window, water coming in). Call them right away.',
   service: 'An existing customer needs service (an install, an order, a repair or a warranty question). Service should reach out.',
@@ -50,12 +52,18 @@ const WHY = {
   booking_request: 'The lead picked a time in the website chat, but the bot could not book it (usually a missing address). Call to confirm the details and book that time.',
 };
 
+// What the bot told the lead, when it is not "someone will reach out".
+const TOLD = {
+  two_nos: ' The bot stopped asking and promised no call.',
+  do_not_knock: ' The bot apologised and told them our team will not knock again.',
+};
+
 /** The rep note and the card body. Pure. */
 export function formatNepqHandoff({ reason, channel, inbound, contactId, firstName, extra = null }) {
   const who = firstName || 'A lead';
   return {
     note: `[AGENT TASK] ${who} needs a person (NEPQ hand-off: ${reason}).\nThey said: "${String(inbound || '').slice(0, 400)}"\n${WHY[reason] || ''}`,
-    card: `🤝 A PERSON IS NEEDED (${reason.replace(/_/g, ' ')})\nContact: ${firstName || 'name not given yet'}\nChannel: ${channel === 'livechat' ? 'WEBSITE CHAT' : String(channel || 'sms').toUpperCase()}\nThey said: "${String(inbound || '').slice(0, 200)}"\n→ ${WHY[reason] || 'Needs a person.'} The bot told them someone from our team will reach out.${extra ? `\n${extra}` : ''}\nGHL: https://app.gohighlevel.com/v2/location/${GHL_LOCATION_ID}/contacts/detail/${contactId}`,
+    card: `${reason === 'do_not_knock' ? '🚪 DO NOT KNOCK' : `🤝 A PERSON IS NEEDED (${reason.replace(/_/g, ' ')})`}\nContact: ${firstName || 'name not given yet'}\nChannel: ${channel === 'livechat' ? 'WEBSITE CHAT' : String(channel || 'sms').toUpperCase()}\nThey said: "${String(inbound || '').slice(0, 200)}"\n→ ${WHY[reason] || 'Needs a person.'}${TOLD[reason] ?? ' The bot told them someone from our team will reach out.'}${extra ? `\n${extra}` : ''}\nGHL: https://app.gohighlevel.com/v2/location/${GHL_LOCATION_ID}/contacts/detail/${contactId}`,
   };
 }
 
@@ -74,7 +82,9 @@ export async function routeNepqHandoff({ contactId, reason, channel, inbound, fi
     // 2026-10-03 (Mark): no GHL instant ring. hdl:callback-sales started
     // I.HDL-1 → B.HC-L's GHL call bridge (the lead saw a GHL number); the call
     // is Five9's now (bot-callback.js), so the trace is a tag no workflow reads.
-    Promise.resolve().then(() => deps.applyTags(contactId, reason === 'service' ? [`${NEPQ_HANDOFF_TAG_PREFIX}${reason}`] : [CALLBACK_MARKER_TAG, `${NEPQ_HANDOFF_TAG_PREFIX}${reason}`])),
+    // No callback marker where no call is coming (service, and the reviewed
+    // hand-offs: two no's, do-not-knock).
+    Promise.resolve().then(() => deps.applyTags(contactId, (reason === 'service' || NO_DIAL_REASONS.has(reason)) ? [`${NEPQ_HANDOFF_TAG_PREFIX}${reason}`] : [CALLBACK_MARKER_TAG, `${NEPQ_HANDOFF_TAG_PREFIX}${reason}`])),
     Promise.resolve().then(() => deps.addNote(contactId, note)),
     Promise.resolve().then(() => deps.emitEvent({
       event_type: 'agentic.nepq_handoff', source: 'nepq_backbone', entity_type: 'contact', entity_id: contactId, ghl_contact_id: contactId,
@@ -98,6 +108,12 @@ async function postCard({ card, reason, contactId }, deps) {
   if (reason === 'service' && deps.serviceChannels) {
     const ids = await Promise.resolve().then(() => deps.serviceChannels(contactId)).catch(() => []);
     if (Array.isArray(ids) && ids.length) channels = ids.map(id => ({ name: 'service', id }));
+  }
+  // 2026-10-03: a canvasser complaint goes to the canvass team (the market's
+  // #canvass channel plus the canvass rollup); #contact-center when none resolves.
+  if (reason === 'do_not_knock' && deps.canvassChannels) {
+    const ids = await Promise.resolve().then(() => deps.canvassChannels(contactId)).catch(() => []);
+    if (Array.isArray(ids) && ids.length) channels = ids.map(id => ({ name: 'canvass', id }));
   }
   if (!channels.length) {
     await deps.opsAlert?.(`🚨 HAND-OFF CARD HAS NO CHANNEL (SLACK_CHANNEL_SERVICE unset)\n\n${card}`);

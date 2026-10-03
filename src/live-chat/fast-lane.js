@@ -56,6 +56,7 @@ import { rewriteBookingClaims } from '../agentic/booking-claim.js';
 import { enforceOneAsk } from '../agentic/one-ask.js';
 import { looksLikeShortPhone } from '../agentic/contact-typos.js';
 import { planNepqTurn, enforceNepqPlan, referenceRetryNote, nepqBackboneMode, pickFresh, LINES as NEPQ_LINES, isServiceCallback } from '../agentic/nepq-planner.js';
+import { NO_DIAL_REASONS } from '../agentic/bot-callback.js';
 import { isCustomerP2 } from '../agentic/lead-state/signals/context-reader.js';
 import { COLLECT_ASK, COLLECT_ASK_AGAIN, dmAsk, holdLine, missingItems, parseDecisionMakers, heldSlot, nameFromReply, addressConfirmAsk, addressConfirmState, mentionedPartner, dmAnswerFromThread, slotLabel } from '../agentic/booking-collect.js';
 import { enforceBookingFacts, bookingFactsNote } from '../agentic/sms-booking-turn.js';
@@ -428,7 +429,7 @@ export function nepqSummary(plan) {
   return { step: plan.step, move: plan.required_move, objection: plan.objection?.type || null, handoff: plan.handoff?.reason || null, counters: plan.counters };
 }
 
-const NEPQ_FIXED_MOVES = new Set(['handoff', 'objection_play', 'ask_day', 'close', 'reveal', 'offer_slots', 'status_frame']);
+const NEPQ_FIXED_MOVES = new Set(['handoff', 'objection_play', 'ask_day', 'close', 'reveal', 'offer_slots', 'status_frame', 'dnk']);
 
 /** How long a reply that already claimed the turn gets to finish sending. */
 export const LATE_SEND_WAIT_MS = 20000;
@@ -1533,8 +1534,10 @@ export function createLiveChatFastLane(deps) {
 
     if (!plan.fixed_line || !NEPQ_FIXED_MOVES.has(plan.required_move)) return null;
     if (plan.handoff) {
-      if (live) Promise.resolve(d.nepqHandoff({ contactId, reason: plan.handoff.reason, inbound: body, firstName, hasPhone, why: 'planned' })).catch(err => d.warn(`[LiveChat] NEPQ hand-off failed for ${contactId}: ${err.message}`));
-      // A person can only reach out with a way to reach them.
+      if (live) Promise.resolve(d.nepqHandoff({ contactId, reason: plan.handoff.reason, inbound: body, firstName, hasPhone, why: 'planned', extra: plan.handoff.extra || null })).catch(err => d.warn(`[LiveChat] NEPQ hand-off failed for ${contactId}: ${err.message}`));
+      // A person can only reach out with a way to reach them. A reviewed
+      // hand-off (two no's, do-not-knock) promises no contact, so it asks none.
+      if (NO_DIAL_REASONS.has(plan.handoff.reason)) return { reply: plan.fixed_line, slots: [], record: { fixed: plan.required_move } };
       return { reply: [plan.fixed_line, ask].filter(Boolean).join(' '), slots: plan.slots_to_offer || [], record: { fixed: plan.required_move } };
     }
     // No real times to offer: the team calls, so it needs a way to reach them.

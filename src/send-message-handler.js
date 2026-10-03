@@ -3994,6 +3994,8 @@ export async function executeSendMessage(action, context) {
         // A service conversation goes to the service channel, never Five9 (Mark, 2026-10-03).
         kind: decision.kind || (generated?.service_conversation ? 'service' : 'sales'),
         card: decision.card !== false,
+        // The do-not-knock address and name (nepq-planner.js), on the card.
+        extra: generated?.nepq_handoff?.extra || null,
       }, botCallbackDeps({ applyTags: applyContactTags, addNote: addGHLNote }))
         .catch(err => console.warn(`[SendMessage] bot callback failed for ${contactId} (fail-soft): ${err.message}`));
     }
