@@ -290,7 +290,7 @@ export function isNo(text, lastOutbound = '') {
 // The bot's own quote line (see LINES.quote_*).
 // Every price reply says why there is no number yet; the next turn counts
 // these to decide quote → times → a person (Part 7: the model words them).
-const PRICE_PLAY_RX = /\bevery\s+home\s+is\s+different\b|\bany\s+number\s+i\s+gave\b|\ba\s+number\s+(?:right\s+)?now\s+would\s+(?:just\s+)?be\s+a\s+guess\b/i;
+const PRICE_PLAY_RX = /\bevery\s+(?:home|house)(?:'s|’s|\s+is)\s+(?:a\s+little\s+)?different\b|\bany\s+number\s+i\s+gave\b|\ba\s+number\s+(?:right\s+)?now\s+would\s+(?:just\s+)?be\s+a\s+guess\b/i;
 const QUOTE_LINE_RX = /\bhappy\s+to\s+get\s+you\s+a\s+quote\b|\bexact\s+pricing\s+comes\s+from\s+a\s+quick\s+visit\b|\bcan'?t\s+give\s+a\s+fair\s+price\s+on\s+the\s+spot\b|\bhappy\s+to\s+help\s+with\b[^.?!]*\.\s+what'?s\s+got\s+you\s+looking\s+into\s+(?:them|it|this)\s+now\?|\ba\s+number\s+now\s+would\s+(?:just\s+)?be\s+a\s+guess\b/i;
 // The visitor says the bot is repeating itself (2026-10-02, 5i59G).
 export const REPEAT_COMPLAINT_RX = /\byou\s+(?:just|already)\s+(?:said|asked)(?:\s+(?:that|this))?\b|\bi\s+(?:just|already)\s+(?:said|told\s+you|answered)\b|\bstop\s+asking\b|\byou(?:'re|\s+are)\s+repeating\b|\bsame\s+(?:thing|question)\s+again\b/i;
@@ -829,7 +829,8 @@ const MARKERS = [
   { rx: BRIDGE_RX, say: 'name "the next step"' },
   { rx: RECHECK_RX, say: 'kindly ask them to double-check it and send it again' },
   // The objection plays keep their point, whatever the words.
-  { rx: /\b(?:spouse|wife|husband|partner|both\s+home)\b/i, say: 'speak to their spouse or partner' },
+  // "How does she feel about…" speaks to the spouse too (2026-10-03 logs).
+  { rx: /\b(?:spouse|wife|husband|partner|both\s+home)\b|\bhow\s+(?:does|do|would)\s+(?:she|he)\b|\b(?:she|he)\s+(?:feels?|thinks?)\b/i, say: 'speak to their spouse or partner' },
   { rx: /\bdecide\b/i, say: 'ask how they will decide' },
   { rx: /\bchase\b/i, say: "say a time now saves them chasing us down later" },
 ];
@@ -895,6 +896,25 @@ export function checkAgainstReference(draft, line, slots = [], plan = null) {
   if (r.noQuestion && text.includes('?')) problems.push('asks_a_question');
   if (r.promisesTeam && !TEAM_RX.test(text)) problems.push('no_team_follow_up');
   return problems;
+}
+
+/**
+ * A draft that does part of the job, with the reference's ask put after it:
+ * the reference from its first sentence that holds a time or a question
+ * ("Which works better, X or Y?", "What day works best for you?"). Only for
+ * a draft that asks nothing and names no clock time of its own, and only when
+ * what failed is the times, the question or a read-back phrase. Pure.
+ * @returns {string|null}
+ */
+export function appendReferenceAsk(draft, refLine, failed = []) {
+  const body = String(draft || '').trim();
+  if (!body || body.includes('?') || /\b\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?)/i.test(body)) return null;
+  if (!failed.every(f => /^(?:missing_time:|missing:|no_question$)/.test(f))) return null;
+  const parts = splitSentences(refLine);
+  const at = parts.findIndex(p => p.includes('?') || /\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b/i.test(p));
+  if (at < 0) return null;
+  const tail = parts.slice(at).join(' ').trim();
+  return `${/[.!]$/.test(body) ? body : `${body}.`} ${tail}`;
 }
 
 /**
@@ -1123,7 +1143,18 @@ export function enforceNepqPlan(draft, plan, { allowFigures = false, known = {} 
     changes.push('bridge');
   }
   if (referenceMove) {
-    const failed = checkAgainstReference(body, refLine, refSlots, plan);
+    let failed = checkAgainstReference(body, refLine, refSlots, plan);
+    // The model often writes a good acknowledgment and stops ("Good to hear
+    // she can make it."), so the times and the question are missing (2026-10-03
+    // logs). Its words stay, the reference's ask goes after them, and no
+    // re-write is needed: a re-write cost 10-35s on SMS and often missed too.
+    if (failed.length) {
+      const repaired = appendReferenceAsk(body, refLine, failed);
+      if (repaired && !checkAgainstReference(repaired, refLine, refSlots, plan).length) {
+        changes.push('reference_ask_appended');
+        return { text: withSignOff(repaired), changes, failed: [] };
+      }
+    }
     if (failed.length) {
       changes.push('backup_line');
       return { text: withSignOff(refLine), changes, failed };

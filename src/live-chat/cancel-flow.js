@@ -153,17 +153,22 @@ export function planCancelTurn({ body, thread = [], known = {} }) {
   const phone = known.phone ? String(known.phone).replace(/\D/g, '').slice(-10) : (flowInbound.map(phoneDigits).filter(Boolean).pop() || null);
   const words = nameWords(flowInbound);
 
+  // Steps 0-2 answer OUR cancel-flow questions, so they apply only inside a
+  // flow a cancel request started (2026-10-03 replay, #1143 live: a booking
+  // offer ending "Which one works better?" read as the flow's slot offer, and
+  // "She should be able to make it" posted a reschedule card to #dispatch).
+  const inFlow = flowStart >= 0;
   // 0. Picking one of the open times we offered.
-  if (SLOTS_RX.test(lastOutText) && !MOVED_RX.test(lastOutText)) {
+  if (inFlow && SLOTS_RX.test(lastOutText) && !MOVED_RX.test(lastOutText)) {
     return { step: 'pick_slot', offerText: lastOutText, phone, words };
   }
   // 1. Answering our reschedule offer.
-  if (OFFER_RX.test(lastOutText)) {
+  if (inFlow && OFFER_RX.test(lastOutText)) {
     return { step: 'after_offer', answer: classifyOfferAnswer(body), phone, words };
   }
   // 2. Answering our name/phone ask.
-  const askedId = ID_ASK_RX.test(lastOutText);
-  const askedPhone = !askedId && PHONE_ASK_RX.test(lastOutText);
+  const askedId = inFlow && ID_ASK_RX.test(lastOutText);
+  const askedPhone = inFlow && !askedId && PHONE_ASK_RX.test(lastOutText);
   if (askedId || askedPhone) {
     if (phone) return { step: 'lookup', phone, words };
     // Asked twice and still no number: a person takes it from here.

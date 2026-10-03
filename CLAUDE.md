@@ -367,6 +367,8 @@ Mark: "I don't think we need any static messages sent by the bot. Each message s
   - A detail sent instead of a pick goes back to the times. After three offers with no pick, the bot asks the day.
   - A typed time is checked against the times OFFERED in the thread (`offeredInThread`), never against the two the live chat loads near it. A re-ask names the same two times we just offered.
   - When the plan asks for a time, the repeat-ask guard treats the time as open (`planAsksForTime`). Before this, a typed "2 PM" that was not open closed the time question, and three planned re-asks were refused and never sent.
+  - The cancel flow answers only inside a flow that a cancel request started (`inFlow` in `planCancelTurn`). Before this, a booking offer ending "Which one works better?" read as the flow's slot offer, and "She should be able to make it" posted a reschedule card to #dispatch.
+  - A draft that only acknowledges ("Good to hear she can make it.") keeps its words, and the reference's ask goes after it (`appendReferenceAsk`, logged `reference_ask_appended`). This happens only when the draft asks nothing and names no clock time, and the result must pass the check. Before this, each such SMS turn cost a 10–35s re-write that often missed too.
   - Hurricane and storm language is allowed (Mark, 2026-10-03: core to what we sell). Only the false urgency claims in `CLAIMS_RX` ("peak of hurricane season", "storm season has us slammed") are stripped.
   - `enforceCallTiming` rewrites only a call WE promise (`FROM_US_RX`): "What made you reach out today?" had become "…reach out tomorrow at 9 AM ET?".
   - A failed reference check logs the draft (`| draft="…"`), so the next slow turn can be read from the logs.
