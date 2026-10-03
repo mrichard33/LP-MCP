@@ -62,6 +62,37 @@ const MAX_OFFER_SLOTS = 2;
 // parse keeps at most one slot per hour.
 const SLOT_SPACING_MS = 60 * 60_000;
 const OFFER_GAP_MS = 3 * 3600_000;
+
+// 2026-10-03 (Mark): "We only offer appointments at 10 AM, 2 PM, or 6 PM.
+// Although our calendar shows the option for 6:30 PM or 7 PM I do not want the
+// bot to book 6:30 or 7." The text bot had offered "Mon, Oct 5 at 7:00 PM ET".
+// Every in-home calendar read keeps only those start times, on the hour, in the
+// office zone the calendar is laid out in. A phone call (PPR, the confirmation
+// call) keeps every open time: a call back can happen any time the team is in.
+export const IN_HOME_START_HOURS = Object.freeze((process.env.IN_HOME_START_HOURS || '10,14,18')
+  .split(',').map((h) => parseInt(h.trim(), 10)).filter((h) => Number.isInteger(h) && h >= 0 && h < 24));
+const IN_HOME_CALENDARS = new Set([
+  'aJj14ONxh1oFyDcQ706O', // Window Estimate
+  'zEdPmkNccR2ovo3rQAd3', // Measurement Verification
+  'zS1wg0JqQ1zsszJyJqKX', // Home Protection Assessment
+]);
+const OFFICE_TIMEZONE = DEFAULT_TIMEZONE;
+
+/** The start hours a calendar may be offered at, or null for "any". Pure. */
+export function allowedStartHours(calendarId) {
+  return IN_HOME_CALENDARS.has(calendarId) && IN_HOME_START_HOURS.length ? IN_HOME_START_HOURS : null;
+}
+
+/** True when `iso` starts on one of `hours`, on the hour, in the office zone. Pure. */
+export function startsAtAllowedHour(iso, hours, timezone = OFFICE_TIMEZONE) {
+  if (!Array.isArray(hours)) return true;
+  const d = new Date(iso);
+  if (!Number.isFinite(d.getTime())) return false;
+  const parts = new Intl.DateTimeFormat('en-US', { timeZone: timezone, hour: 'numeric', minute: 'numeric', hourCycle: 'h23' }).formatToParts(d);
+  const hour = Number(parts.find((x) => x.type === 'hour')?.value);
+  const minute = Number(parts.find((x) => x.type === 'minute')?.value);
+  return minute === 0 && hours.includes(hour);
+}
 const OFFER_DAYS_AHEAD_MS = 7 * 24 * 3600_000;
 
 /**
@@ -194,7 +225,8 @@ async function fetchFreeSlotsOnce(calendarId, opts = {}) {
     }
 
     const data = await res.json();
-    return { value: parseSlots(data, calendarId, tz, maxSlots, opts.minNoticeHours), transient: false };
+    const hours = opts.startHours !== undefined ? opts.startHours : allowedStartHours(calendarId);
+    return { value: parseSlots(data, calendarId, tz, maxSlots, opts.minNoticeHours, hours), transient: false };
   } catch (err) {
     console.warn('[CalAvail] ' + calendarId + ' threw: ' + err.message);
     return { value: null, transient: true };
@@ -214,7 +246,7 @@ async function fetchFreeSlotsOnce(calendarId, opts = {}) {
  *
  * Defensive against alternate shapes (slots as bare array, missing keys).
  */
-export function parseSlots(data, calendarId, timezone, maxSlots, minNoticeHours) {
+export function parseSlots(data, calendarId, timezone, maxSlots, minNoticeHours, startHours = null) {
   if (!data || typeof data !== 'object') return null;
 
   const allIso = [];
@@ -246,7 +278,7 @@ export function parseSlots(data, calendarId, timezone, maxSlots, minNoticeHours)
   const floorMs = now + notice * 3600_000;
   const future = allIso.filter(iso => {
     const t = new Date(iso).getTime();
-    return Number.isFinite(t) && t >= floorMs;
+    return Number.isFinite(t) && t >= floorMs && startsAtAllowedHour(iso, startHours);
   });
   future.sort((a, b) => new Date(a).getTime() - new Date(b).getTime());
 

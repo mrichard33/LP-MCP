@@ -141,3 +141,26 @@ test('"I don\'t think you service our area" asks for the zip', () => {
   assert.equal(plan.needs_zip, true);
   assert.equal(isCoverageQuestion('Do you service hurricane windows?'), false, 'a product question is not a coverage question');
 });
+
+// ── visit times: 10 AM, 2 PM or 6 PM only (Mark, 2026-10-03) ──────────────
+const { parseSlots, allowedStartHours, startsAtAllowedHour, IN_HOME_START_HOURS } = await import('../src/knowledge/calendar-availability.js');
+
+test('in-home calendars offer only 10 AM, 2 PM and 6 PM; a call calendar keeps every time', () => {
+  assert.deepEqual([...IN_HOME_START_HOURS], [10, 14, 18]);
+  const WE = 'aJj14ONxh1oFyDcQ706O';
+  const day = (d) => [`T10:00:00-04:00`, `T14:00:00-04:00`, `T18:00:00-04:00`, `T18:30:00-04:00`, `T19:00:00-04:00`].map((t) => `2030-10-${d}${t}`);
+  const data = { '2030-10-04': { slots: day('04') }, '2030-10-07': { slots: day('07') } };
+  const visit = parseSlots(data, WE, 'America/New_York', 120, 0, allowedStartHours(WE));
+  assert.deepEqual(visit.slots.map((s) => s.time), ['10:00 AM', '2:00 PM', '6:00 PM', '10:00 AM', '2:00 PM', '6:00 PM']);
+  assert.ok(!visit.slots.some((s) => /7:00 PM|6:30 PM/.test(s.time)), 'no 6:30 or 7 PM visit, ever');
+  for (const id of ['zEdPmkNccR2ovo3rQAd3', 'zS1wg0JqQ1zsszJyJqKX']) assert.deepEqual(allowedStartHours(id), [10, 14, 18]);
+  assert.equal(allowedStartHours('DQYMaJ22N6zL4SXjHukw'), null, 'the call calendar is not limited');
+  const call = parseSlots(data, 'DQYMaJ22N6zL4SXjHukw', 'America/New_York', 120, 0, allowedStartHours('DQYMaJ22N6zL4SXjHukw'));
+  assert.ok(call.slots.some((s) => s.time === '7:00 PM'));
+});
+
+test('the hour is read in the office zone, standard time included', () => {
+  assert.equal(startsAtAllowedHour('2030-12-05T18:00:00-05:00', [10, 14, 18]), true);
+  assert.equal(startsAtAllowedHour('2030-12-05T17:00:00-06:00', [10, 14, 18]), true, '5 PM Central is 6 PM Eastern');
+  assert.equal(startsAtAllowedHour('2030-10-05T18:15:00-04:00', [10, 14, 18]), false);
+});

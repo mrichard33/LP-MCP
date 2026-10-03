@@ -301,7 +301,10 @@ or "can you set up a time?" gets two real times. A pick is HELD ("Great, I'm hol
 read back by `heldSlot` in `src/agentic/booking-collect.js`) while the in-home gate's missing items are asked one
 per message (name, phone on chat, street address with zip, "will anyone else be part of the decision?"); the
 answer is passed as `qualifying_data.decision_makers_present`, and a spouse who cannot make it gets two other
-times. Call slots (PPR) floor at 30 minutes, only inside team hours, two times an hour apart the same day
+times. **Visits start at 10 AM, 2 PM or 6 PM only (Mark, 2026-10-03)**: the GHL calendars also show 6:30 and 7 PM, so every
+in-home calendar read (Window Estimate, Measurement Verification, Home Protection Assessment) keeps only those start
+times, on the hour, in the office zone (`allowedStartHours` / `IN_HOME_START_HOURS` in `calendar-availability.js`,
+applied in `parseSlots`). Call slots (PPR) floor at 30 minutes, only inside team hours, two times an hour apart the same day
 (`selectOfferableSlots({ call: true })`): a call back can happen any time the team is in.
 
 **No line twice, one reply per burst (Mark, 2026-10-02).** Lines that recur in a thread come in variants
