@@ -507,8 +507,13 @@ export function planNepqTurn({
     return fixed('objection_play', LINES.not_interested(firstName), { step: 'not_interested', objection: { type: 'not_interested', attempt: 1, line: LINES.not_interested(firstName) }, booking: { allowed: false, reason: 'nepq:not_interested' } });
   }
 
-  // 3. Already booked: the Reveal once, otherwise just answer.
-  if (hasAppointment) {
+  // 3. Already booked: the Reveal once, otherwise just answer. Our own
+  // "You're all set for…" counts too, until a later cancel (2026-10-03
+  // replay: the appointment had not reached the read yet, and the next two
+  // texts offered times again).
+  const lastIdx = (rx) => { for (let i = outbound.length - 1; i >= 0; i--) if (rx.test(outbound[i].text || '')) return i; return -1; };
+  const bookedInThread = lastIdx(/\byou(?:'|’)?re\s+all\s+set\s+for\b/i) > lastIdx(/\bis\s+(?:now\s+)?cancel+ed\b|\bhave\s+cancel+ed\b/i);
+  if (hasAppointment || bookedInThread) {
     if (!counters.reveal_used && !isLeadQuestion(now)) return fixed('reveal', LINES.reveal, { step: 'booked', booking: { allowed: false, reason: 'nepq:booked' } });
     return Object.assign(plan, { step: 'booked', required_move: 'answer', booking: { allowed: false, reason: 'nepq:booked' } });
   }
