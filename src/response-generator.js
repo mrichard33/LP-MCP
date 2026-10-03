@@ -3497,13 +3497,20 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // calendar the next step names: the quick call (PPR) unless the in-home
   // gate applies. Mode off is unchanged.
   const nepqModeEarly = (opts.dryRun === true && opts.nepqModeOverride) ? opts.nepqModeOverride : nepqBackboneMode();
-  const nepqWantsSlots = nepqModeEarly !== 'off' && channel === 'sms'
+  const nepqWantsSlotsByTrigger = nepqModeEarly !== 'off' && channel === 'sms'
     // 2026-10-02 (Mark): a quote/price ask and "you just said that" offer two times too.
     && (['think', 'price', 'spouse'].includes(nepqObjectionType(triggerMessage)) || NEPQ_TIME_REQUEST_RX.test(String(triggerMessage || '')) || NEPQ_SCHEDULE_ASK_RX.test(String(triggerMessage || '')) || NEPQ_REPEAT_COMPLAINT_RX.test(String(triggerMessage || ''))
       // 2026-10-02 funnel audit: "yes" to the bridge, and a pick after our two
       // times, loaded no calendar on SMS, so the bot sent the self-booking link
       // instead of two real times (0 of 12 journeys booked).
       || nepqBookingTurn(context.conversation_recent));
+  // Part 7 replay (2026-10-02): with NEPQ live the calendar is read on every
+  // SMS turn. Reading it only on trigger words left "Fine lets book for 2 PM"
+  // and the second spouse turn with no real times, so the pick was lost.
+  const nepqWantsSlots = (nepqModeEarly === 'live' && channel === 'sms') || nepqWantsSlotsByTrigger;
+  // Read only for the planner (a typed time, a later pick): the prompt shows
+  // these times only on a turn whose plan allows a booking ask.
+  const slotsForPlannerOnly = nepqWantsSlots && !nepqWantsSlotsByTrigger && !getCalendarIdFromKbPack(kbPack);
   // 2026-10-02 (Mark): with NEPQ live every text lead books a home visit:
   // Measurement Verification for a calculator lead, Window Estimate for
   // everyone else. The 15-minute call (PPR) is the backup, only when the lead
@@ -3840,7 +3847,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
 
   const userPrompt = buildResponsePrompt(
     context, channel, triggerMessage, kbPack, classification,
-    fastTrack, trafficTemp, availability,
+    fastTrack, trafficTemp, (slotsForPlannerOnly && !nepqPlan?.booking?.allowed) ? null : availability,
     {
       editInstruction: opts.editInstruction || null,
       previousMessage: opts.previousMessage || null,

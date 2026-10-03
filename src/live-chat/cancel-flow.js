@@ -41,6 +41,42 @@ export const SLOTS_MARK = 'Which one works better for you?';
 export const ONE_SLOT_MARK = 'Does that time work for you?';
 const MOVED_MARK = "You're now set for";
 
+// ── Part 8 (Mark, 2026-10-02: "Each message should be custom") ────────────
+// The model words every cancel-flow reply now; the lines above are its
+// reference and backup. So each step is read back from what the line MEANS,
+// and the model's version must keep the phrase its step is read by
+// (CANCEL_MARKERS, checked by checkAgainstReference).
+export const ID_ASK_RX = /\bname\b[^?]*\b(?:phone|number)\b[^?]*\bappointment\s+is\s+(?:under|booked\s+under|in)\b[^?]*\?/i;
+export const PHONE_ASK_RX = /\b(?:phone|number)\b[^?]*\bappointment\s+is\s+(?:under|booked\s+under|in)\b[^?]*\?/i;
+export const OFFER_RX = /\b(?:different|another|other|new)\s+(?:day|time|date)\b[^?]*\binstead\s+of\s+cancel+ing\b[^?]*\?/i;
+export const SLOTS_RX = /\bmove\s+(?:it|your\s+(?:appointment|visit))\s+to\b|\b(?:which\s+one\s+works\s+better|does\s+that\s+time\s+work)\b/i;
+export const DONE_RX = /\bis\s+(?:now\s+)?cancel+ed\b|\bhave\s+cancel+ed\b/i;
+export const MOVED_RX = /\byou(?:'|’)?re\s+now\s+set\s+for\b|\bmoved\s+(?:it|your\s+(?:appointment|visit))\s+to\b/i;
+export const RESCHEDULE_RX = /\bset\s+up\s+a\s+new\s+time\b/i;
+export const HANDOFF_RX = /\bscheduling\s+team\b/i;
+
+/** Which CANCEL_MARKERS entry a runCancelFlow outcome needs. Pure. */
+export function cancelMarkerKey(record = {}) {
+  const outcome = record?.outcome || null;
+  if (!outcome) return record?.step === 'ask_phone' ? 'ask_phone' : 'ask_identity';
+  if (outcome === 'offered_reschedule' || outcome === 'offered_slots' || outcome === 'handoff') return outcome;
+  if (outcome === 'rescheduled' || outcome === 'would_reschedule') return 'rescheduled';
+  if (outcome === 'cancelled' || outcome === 'would_cancel') return 'cancelled';
+  return 'reschedule';
+}
+
+/** What each step's reply must keep, for the model's version of it. */
+export const CANCEL_MARKERS = Object.freeze({
+  ask_identity: [{ rx: ID_ASK_RX, say: 'ask for the full name and phone number the appointment is under, in one question' }],
+  ask_phone: [{ rx: PHONE_ASK_RX, say: 'ask for the phone number the appointment is under' }],
+  offered_reschedule: [{ rx: OFFER_RX, say: 'ask if a different day would work instead of cancelling' }],
+  offered_slots: [{ rx: SLOTS_RX, say: 'offer to move it to these times and ask which one works better' }],
+  cancelled: [{ rx: DONE_RX, say: 'say the appointment is cancelled' }],
+  rescheduled: [{ rx: MOVED_RX, say: "say they're now set for the new time" }],
+  reschedule: [{ rx: RESCHEDULE_RX, say: 'say a team member will call to set up a new time' }],
+  handoff: [{ rx: HANDOFF_RX, say: 'say the scheduling team has it and will confirm with them' }],
+});
+
 // "cancel", "call it off", and the ways the tzuzq visitor actually said it.
 const CANCEL_RX = /\bcancel(?:l?ing|l?ed)?\b|\bcall\s+(?:it|this|the\s+(?:visit|appointment))\s+off\b|\b(?:don'?t|do\s+not|dont)\s+(?:come|bother\s+coming|send\s+(?:anyone|someone|anybody))\b|\bwaste\s+your\s+time\s+coming\b|\bwon'?t\s+be\s+allowed\s+in\b/i;
 
@@ -109,7 +145,8 @@ export function planCancelTurn({ body, thread = [], known = {} }) {
   // Inbound since the flow began carries the name and phone. The flow begins at
   // the FIRST cancel request after any earlier finished flow — a later
   // "no, just cancel it" is an answer inside the flow, not a new start.
-  const isFinishLine = (m) => m?.direction === 'outbound' && (String(m.text || '').includes(DONE_MARK) || m.text === HANDOFF_LINE || String(m.text || '').includes(RESCHEDULE_MARK) || String(m.text || '').includes(MOVED_MARK));
+  const isFinish = (text) => DONE_RX.test(text) || HANDOFF_RX.test(text) || RESCHEDULE_RX.test(text) || MOVED_RX.test(text);
+  const isFinishLine = (m) => m?.direction === 'outbound' && isFinish(String(m.text || ''));
   const lastFinish = lastIndexWhere(all, isFinishLine);
   const flowStart = all.findIndex((m, i) => i > lastFinish && m?.direction === 'inbound' && isCancelRequest(m.text));
   const flowInbound = (flowStart >= 0 ? all.slice(flowStart) : all).filter((m) => m?.direction === 'inbound').map((m) => String(m.text || ''));
@@ -117,24 +154,26 @@ export function planCancelTurn({ body, thread = [], known = {} }) {
   const words = nameWords(flowInbound);
 
   // 0. Picking one of the open times we offered.
-  if (lastOutText.includes(SLOTS_MARK) || lastOutText.includes(ONE_SLOT_MARK)) {
+  if (SLOTS_RX.test(lastOutText) && !MOVED_RX.test(lastOutText)) {
     return { step: 'pick_slot', offerText: lastOutText, phone, words };
   }
   // 1. Answering our reschedule offer.
-  if (lastOutText.includes(OFFER_MARK)) {
+  if (OFFER_RX.test(lastOutText)) {
     return { step: 'after_offer', answer: classifyOfferAnswer(body), phone, words };
   }
   // 2. Answering our name/phone ask.
-  if (lastOutText === ASK_IDENTITY_LINE || lastOutText === ASK_PHONE_LINE) {
+  const askedId = ID_ASK_RX.test(lastOutText);
+  const askedPhone = !askedId && PHONE_ASK_RX.test(lastOutText);
+  if (askedId || askedPhone) {
     if (phone) return { step: 'lookup', phone, words };
     // Asked twice and still no number: a person takes it from here.
-    if (lastOutText === ASK_PHONE_LINE) return { step: 'handoff', phone: null, words };
+    if (askedPhone) return { step: 'handoff', phone: null, words };
     return { step: 'ask_phone', reply: ASK_PHONE_LINE };
   }
   // 3. A fresh cancel request. A flow that already finished does not restart
   //    on the visitor's next "do not come" — they were answered.
   if (!isCancelRequest(body)) return null;
-  const finished = outs.some((t) => t.includes(DONE_MARK) || t === HANDOFF_LINE || t.includes(RESCHEDULE_MARK) || t.includes(MOVED_MARK));
+  const finished = outs.some(isFinish);
   if (finished) return null;
   if (phone && known.hasName) return { step: 'lookup', phone, words, known: true };
   if (phone && words.length) return { step: 'lookup', phone, words };
@@ -164,6 +203,43 @@ export function doneLine(apptHuman) {
 }
 const slotText = (s) => `${s.day} at ${s.time}`;
 
+const MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
+const esc = (x) => String(x).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/**
+ * Where a real opening is named in a text, or -1. The exact label first
+ * ("Sun, Oct 4 at 10:00 AM", "tomorrow at 10:00 AM"), then the way people and
+ * the model write it: the weekday, "tomorrow"/"today" or "Oct 4" within a few
+ * words before the clock time ("Sunday at 10 AM", "Sun the 4th, 10am"). Part 7
+ * (2026-10-02 replay): the model's own wording of real times failed the exact
+ * check and cost a 15-35s re-write per text. Pure.
+ */
+export function slotMentionIndex(text, s) {
+  const t = String(text || '');
+  const exact = [slotText(s), s?.rel ? `${s.rel} at ${s.time}` : null].filter(Boolean)
+    .map((form) => t.indexOf(form)).filter((i) => i >= 0);
+  if (exact.length) return Math.min(...exact);
+  const hm = String(s?.time || '').match(/^(\d{1,2})(?::(\d{2}))?\s*([AP])M/i);
+  if (!hm) return -1;
+  const mins = hm[2] && hm[2] !== '00' ? `:${hm[2]}` : '(?::00)?';
+  const clock = `\\b${hm[1]}${mins}\\s*${hm[3]}\\.?\\s?m\\.?(?![a-z])`;
+  const dow = String(s?.dayOfWeek || '').toLowerCase();
+  const [, mon, dd] = String(s?.day || '').toLowerCase().match(/(\w{3})\s+(\d{1,2})$/) || [];
+  const dayWords = [
+    dow ? `${esc(dow)}|${esc(dow.slice(0, 3))}` : null,
+    s?.rel ? esc(String(s.rel).toLowerCase()) : null,
+    mon && dd && MONTHS.includes(mon) ? `${mon}[a-z]*\\.?\\s+${dd}(?:st|nd|rd|th)?` : null,
+  ].filter(Boolean).join('|');
+  if (!dayWords) return -1;
+  // The day word must be the nearest one before THIS time: no other clock
+  // time in between ("Sunday at 10 AM or tomorrow at 2 PM" is not Sunday 2 PM).
+  const gap = '(?:(?!\\d{1,2}(?::\\d{2})?\\s*[ap]\\.?\\s?m)[^.?!]){0,30}?';
+  const rx = new RegExp(`\\b(?:${dayWords})\\b${gap}(${clock})`, 'i');
+  const m = t.match(rx);
+  // Ordered by where the time itself sits, so "the first one" is the first time named.
+  return m ? m.index + m[0].length - m[1].length : -1;
+}
+
 /** Two (or one) real open times, one question. Pure. */
 export function slotsOfferLine(slots, tzLabelText = 'ET') {
   const [a, b] = slots;
@@ -177,11 +253,8 @@ export function offeredSlots(offerText, freeSlots) {
   // 2026-10-02: the NEPQ offer reads "tomorrow at 10:00 AM" (slot.rel), not
   // "Sat, Oct 3 at 10:00 AM". Matching only the date form found one of the two
   // times, and "the first one" booked the SECOND (simulator, never live).
-  const at = (s) => {
-    const hits = [slotText(s), s.rel ? `${s.rel} at ${s.time}` : null]
-      .filter(Boolean).map((form) => text.indexOf(form)).filter((i) => i >= 0);
-    return hits.length ? Math.min(...hits) : -1;
-  };
+  // Part 7 replay: the model writes "Sunday at 10 AM", so a mention counts too.
+  const at = (s) => slotMentionIndex(text, s);
   return (Array.isArray(freeSlots) ? freeSlots : [])
     .filter((s) => at(s) >= 0)
     .sort((x, y) => at(x) - at(y));

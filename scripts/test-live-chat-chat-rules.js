@@ -197,3 +197,14 @@ test('pickSlot: a weekday name picks that day from the offer', async () => {
   const offered = [{ iso: '2026-10-03T10:00:00-04:00', day: 'Sat, Oct 3', time: '10:00 AM', dayOfWeek: 'Saturday' }, { iso: '2026-10-04T10:00:00-04:00', day: 'Sun, Oct 4', time: '10:00 AM', dayOfWeek: 'Sunday' }];
   assert.equal(pickSlot('Sunday morning then', offered)?.iso, '2026-10-04T10:00:00-04:00');
 });
+
+
+// Part 8: the Spanish hand-off is model-written; it is read back by meaning.
+test('Spanish hand-off: a reworded line still counts as ours, and the marker wants Spanish + our team', () => {
+  const ours = 'Hola, gracias. Un miembro de nuestro equipo que habla español le llamará pronto. ¿Cuál es su número?';
+  const next = R.planLanguageHandoff({ body: '352-555-0188', thread: [{ direction: 'inbound', text: 'hola' }, { direction: 'outbound', text: ours }, { direction: 'inbound', text: '352-555-0188' }] });
+  assert.equal(next.reply, R.SPANISH_THANKS_LINE);
+  assert.equal(R.SPANISH_REPLY_MARKER.rx.test(ours), true);
+  assert.equal(R.SPANISH_REPLY_MARKER.rx.test('Thanks, a team member will reach out.'), false);
+  assert.equal(R.SPANISH_REPLY_MARKER.rx.test(R.SPANISH_HANDOFF_LINE), true);
+});

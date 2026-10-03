@@ -126,6 +126,15 @@ export function looksSpanish(text) {
 export const SPANISH_HANDOFF_LINE = 'Hola, gracias por escribirnos. Un miembro de nuestro equipo se comunicará con usted. ¿Cuál es el mejor número de teléfono para llamarle?';
 export const SPANISH_THANKS_LINE = 'Gracias. Un miembro de nuestro equipo le llamará pronto.';
 
+// Part 8 (Mark, 2026-10-02: "Each message should be custom"): the two lines
+// above are the model's reference and backup. Its version must be Spanish and
+// say our team will reach out (that phrase is how the next turn knows).
+export const SPANISH_TEAM_RX = /\bse\s+comunicar[áa]\b|\ble\s+llamar[áa]\b|\bnuestro\s+equipo\b/i;
+export const SPANISH_REPLY_MARKER = Object.freeze({
+  rx: { test: (text) => looksSpanish(text) && SPANISH_TEAM_RX.test(String(text || '')) },
+  say: 'write it in Spanish and say a member of our team will reach out',
+});
+
 const PHONE_RX = /(?:\+?1[\s.-]*)?\(?\d{3}\)?[\s.-]*\d{3}[\s.-]*\d{4}\b/;
 
 /**
@@ -138,7 +147,8 @@ const PHONE_RX = /(?:\+?1[\s.-]*)?\(?\d{3}\)?[\s.-]*\d{3}[\s.-]*\d{4}\b/;
 export function planLanguageHandoff({ body, thread = [] }) {
   const prior = Array.isArray(thread) ? thread.slice(0, -1) : [];
   const lastOut = [...prior].reverse().find((m) => m.direction === 'outbound');
-  const afterOurHandoff = !!lastOut && String(lastOut.text || '').includes('se comunicará con usted');
+  // Part 8: the model words the hand-off now, so it is read back by meaning.
+  const afterOurHandoff = !!lastOut && SPANISH_TEAM_RX.test(String(lastOut.text || ''));
   const phone = (String(body || '').match(PHONE_RX) || [null])[0];
   if (afterOurHandoff && phone) return { language: 'es', reply: SPANISH_THANKS_LINE, phone, first: false };
   if (!looksSpanish(body)) return null; // an English reply after the hand-off goes to the model as usual

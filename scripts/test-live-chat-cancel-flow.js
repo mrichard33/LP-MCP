@@ -67,3 +67,26 @@ test('the sales card tells a person what to do in LP', () => {
   assert.match(notDone, /Phone: not given/);
   assert.match(C.formatCancelCard({ kind: 'reschedule', name: 'Rick', phone: '3525550188', apptHuman: 'x' }), /RESCHEDULE/);
 });
+
+
+// Part 8 (Mark, 2026-10-02): the model words every cancel-flow reply, so each
+// step is read back by meaning. Today's lines and AI-worded ones both count.
+test('planCancelTurn reads every step from an AI-worded line too', () => {
+  const ask = "Sorry about that, I can help. What's the full name and phone number the appointment is under?";
+  assert.equal(C.planCancelTurn({ body: 'Rick Fox', thread: [t('inbound', 'cancel'), t('outbound', ask), t('inbound', 'Rick Fox')] }).step, 'ask_phone');
+  const phoneAsk = 'Got it, Rick. And the phone number the appointment is under?';
+  assert.equal(C.planCancelTurn({ body: 'why', thread: [t('inbound', 'cancel'), t('outbound', phoneAsk), t('inbound', 'why')] }).step, 'handoff');
+  const offer = 'Found it, Rick: Thu, Oct 2 at 6:00 PM ET. Would another day work instead of cancelling?';
+  assert.equal(C.planCancelTurn({ body: 'yes', thread: [t('inbound', 'cancel'), t('outbound', offer), t('inbound', 'yes')] }).step, 'after_offer');
+  const slots = 'Happy to. I can move it to Tue, Oct 6 at 10:00 AM or Wed, Oct 7 at 2:00 PM ET. Which one works better?';
+  assert.equal(C.planCancelTurn({ body: 'the first', thread: [t('inbound', 'cancel'), t('outbound', slots), t('inbound', 'the first')] }).step, 'pick_slot');
+  for (const fin of ['All done, Rick. Your Thu, Oct 2 visit is cancelled.', "You're now set for Tue, Oct 6 at 10:00 AM ET.", 'A team member will call you to set up a new time.', 'Our scheduling team has it and will confirm with you.']) {
+    assert.equal(C.planCancelTurn({ body: 'do not come', thread: [t('inbound', 'cancel'), t('outbound', fin), t('inbound', 'do not come')] }), null, fin);
+  }
+  // Every step has the phrase its reply must keep, and today's lines carry it.
+  assert.equal(C.cancelMarkerKey({ step: 'ask_identity' }), 'ask_identity');
+  assert.equal(C.cancelMarkerKey({ outcome: 'would_reschedule' }), 'rescheduled');
+  assert.equal(C.cancelMarkerKey({ outcome: 'reschedule_failed' }), 'reschedule');
+  const lines = { ask_identity: C.ASK_IDENTITY_LINE, ask_phone: C.ASK_PHONE_LINE, offered_reschedule: C.offerLine('Rick', 'x'), cancelled: C.doneLine('x'), rescheduled: C.movedLine({ day: 'Tue, Oct 6', time: '10:00 AM' }), reschedule: C.rescheduleLine('3525550188'), handoff: C.HANDOFF_LINE, offered_slots: C.slotsOfferLine([{ day: 'Tue, Oct 6', time: '10:00 AM' }, { day: 'Wed, Oct 7', time: '2:00 PM' }]) };
+  for (const [k, line] of Object.entries(lines)) assert.ok(C.CANCEL_MARKERS[k].every(m => m.rx.test(line)), k);
+});
