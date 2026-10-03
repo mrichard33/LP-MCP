@@ -62,16 +62,17 @@ export async function checkLeadTriggers() {
       .select('lp_lead_id, ghl_contact_id')
       .eq('demo_completed', true).not('ghl_contact_id', 'is', null)
       .not('raw_lp_data->demo_tag_fired', 'eq', true);
-    const { data: wonLeads } = await supabase.from('lp_leads')
-      .select('lp_lead_id, ghl_contact_id')
-      .eq('closed_won', true).not('ghl_contact_id', 'is', null)
-      .not('raw_lp_data->won_tag_fired', 'eq', true);
     for (const lead of (demoLeads || [])) {
       await applyGHLTag(lead.ghl_contact_id, 'lp-demo-completed');
     }
-    for (const lead of (wonLeads || [])) {
-      await applyGHLTag(lead.ghl_contact_id, 'deal-won');
-    }
+    // 2026-10-03 — the `deal-won` half of this function is GONE. It filtered on
+    // raw_lp_data->won_tag_fired, a key no lp_leads row has ever carried, so it
+    // matched 0 of 3,377 won leads and never tagged anyone: `deal-won` came only
+    // from GHL I.LP-IN, and when LP's webhook stopped on 2026-09-24 the P2 cards
+    // stopped with it. Do NOT "fix" the filter: it would tag every historical
+    // won lead and start C.0 customer onboarding for years-old sales. Recent
+    // sales are covered by src/p2-sale-backstop.js (bounded lookback, grace,
+    // per-pass cap, live GHL check).
   } catch (err) {
     console.warn('[Sync] Lead trigger checks failed:', err.message);
   }

@@ -11,6 +11,7 @@ import {
   makePostOfficePowerRanking,
   makeAnnounceMissedSale,
   registerSalesBoardTools,
+  makeSaleP2BackstopRun,
 } from '../src/tools/sales-board-tools.js';
 import { RECENT_APPT_MS } from '../src/notifications/sale-backstop.js';
 
@@ -140,11 +141,30 @@ test('missing lead id is refused', async () => {
 
 // ── registration ────────────────────────────────────────────────────────────
 
-test('both tools register and default to dry run', async () => {
+test('every tool registers and defaults to dry run', async () => {
   const tools = {};
   registerSalesBoardTools({ tool: (name, _d, schema) => { tools[name] = schema; } });
-  assert.deepEqual(Object.keys(tools).sort(), ['announce_missed_sale', 'post_office_power_ranking']);
+  // 2026-10-03: sale_p2_backstop_run added (the Sale → P2 backfill).
+  assert.deepEqual(Object.keys(tools).sort(), ['announce_missed_sale', 'post_office_power_ranking', 'sale_p2_backstop_run']);
   assert.equal(tools.post_office_power_ranking.dry_run.parse(undefined), true);
   assert.equal(tools.announce_missed_sale.dry_run.parse(undefined), true);
+  assert.equal(tools.sale_p2_backstop_run.dry_run.parse(undefined), true);
+  assert.throws(() => tools.sale_p2_backstop_run.since.parse('Aug 1'));
   assert.equal(tools.post_office_power_ranking.kind.parse(undefined), 'daily');
+});
+
+test('sale_p2_backstop_run: dry run is shadow mode; a real run is live with the asked lookback and cap', async () => {
+  const calls = [];
+  const run = async (opts) => { calls.push(opts); return { ok: true, summary: 's', counts: { tag_deal_won: 1 }, writes: 0, failures: 0,
+    results: [
+      { contactId: 'c1', contactName: 'Ann B', job: { lp_job_id: '60111', job_status: 'HOLD - HOA', job_value: 9000, contractdate: '2026-10-01T00:00:00' }, plan: { action: 'tag_deal_won', reason: 'no_deal_won' } },
+      { contactId: 'c2', job: {}, plan: { action: 'skip', reason: 'has_p2' } },
+    ] }; };
+  const tool = makeSaleP2BackstopRun({ run });
+  const dry = await tool({});
+  assert.equal(calls[0].mode, 'shadow');
+  assert.deepEqual(dry.sales.map((s) => s.contact_id), ['c1'], 'contacts that already have a card are not listed');
+  assert.equal(dry.sales[0].contract_date, '2026-10-01');
+  await tool({ dry_run: false, since: '2026-08-01', max_actions: 100 });
+  assert.deepEqual(calls[1], { mode: 'live', sinceDay: '2026-08-01', maxActions: 100 });
 });

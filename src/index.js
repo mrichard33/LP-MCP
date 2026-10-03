@@ -316,6 +316,7 @@ import { startF0IntegrityAuditScheduler } from './jobs/f0-integrity-audit.js';  
 import { startOpsMorningDigestScheduler } from './jobs/ops-morning-digest.js';  // 2026-10-02 — alert noise cut
 import { startOfficePowerRankingScheduler } from './jobs/office-power-ranking.js';  // 2026-09-24
 import { startSaleBackstopScheduler } from './jobs/sale-announce-backstop.js';  // 2026-09-25
+import { startSaleP2BackstopScheduler } from './jobs/sale-p2-backstop.js';  // 2026-10-03 — every LP sale gets a P2 card
 import { startMissedCallerRecoveryScheduler } from './jobs/missed-caller-recovery.js';  // 2026-09-24
 import { registerLeadLeakRoutes, startLeadLeakScheduler, startLeadUncalledScheduler } from './jobs/lead-leak-monitor.js';  // 2026-09-26
 import { startChatLeadIntakeScheduler } from './jobs/chat-lead-intake-sweep.js';  // 2026-09-28
@@ -936,6 +937,7 @@ const server = app.listen(PORT, async () => {
   startOpsMorningDigestScheduler();
   startOfficePowerRankingScheduler();
   startSaleBackstopScheduler();
+  startSaleP2BackstopScheduler();
   startMissedCallerRecoveryScheduler();
   startLeadLeakScheduler();
   startLeadUncalledScheduler();
