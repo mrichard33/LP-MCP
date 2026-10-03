@@ -391,9 +391,9 @@ import { holdLine, COLLECT_ASK, dmAsk, parseDecisionMakers } from './agentic/boo
 import { contactRecheckLine, recheckHint, RECHECK_RX } from './agentic/contact-check.js';
 import { smsBookingTurn, enforceBookingFacts, bookingFactsNote } from './agentic/sms-booking-turn.js';
 import { LINES as NEPQ_LINES } from './agentic/nepq-planner.js';
-import { planNepqTurn, enforceNepqPlan, referenceRetryNote, nepqBackboneMode, prefersCall as nepqPrefersCall, objectionType as nepqObjectionType, TIME_REQUEST_RX as NEPQ_TIME_REQUEST_RX, SCHEDULE_ASK_RX as NEPQ_SCHEDULE_ASK_RX,REPEAT_COMPLAINT_RX as NEPQ_REPEAT_COMPLAINT_RX, bookingOpenInThread as nepqBookingOpenInThread } from './agentic/nepq-planner.js';
+import { planNepqTurn, enforceNepqPlan, referenceRetryNote, nepqBackboneMode, prefersCall as nepqPrefersCall, objectionType as nepqObjectionType, TIME_REQUEST_RX as NEPQ_TIME_REQUEST_RX, SCHEDULE_ASK_RX as NEPQ_SCHEDULE_ASK_RX,REPEAT_COMPLAINT_RX as NEPQ_REPEAT_COMPLAINT_RX, bookingOpenInThread as nepqBookingOpenInThread, dropUnaskedCallOffer, leadWantsCall as nepqLeadWantsCall } from './agentic/nepq-planner.js';
 import {
-  planServiceAreaTurn, resolveCoverage, coverageHint, guardCoverageDraft, serviceAreaRecord,
+  planServiceAreaTurn, resolveCoverage, coverageHint, guardCoverageDraft, serviceAreaRecord, coverageOwnsReply,
 } from './agentic/service-area-turn.js';
 
 /**
@@ -3837,7 +3837,10 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   let nepqPlan = null;
   let nepqPlanFailed = false;
   // SMS only: email replies are long-form and keep their own rules.
-  if (nepqMode !== 'off' && channel === 'sms' && !serviceAreaTurn?.plan?.active) {
+  // A coverage turn is planned too unless its reply is the whole script (the
+  // zip ask, or the out-of-area close): 2026-10-03, the shutters thread's
+  // unplanned coverage turn offered a call nobody asked for.
+  if (nepqMode !== 'off' && channel === 'sms' && !coverageOwnsReply(serviceAreaTurn)) {
     try {
       const firstWord = String(context.lead?.first_name || context.lead?.name || '').trim().split(/\s+/)[0] || '';
       const hasAppointment = (Array.isArray(upcomingAppointments) && upcomingAppointments.some(a => !a.already_ended))
@@ -4497,6 +4500,17 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
         validated.message = kept;
         if (validated.companion_action?.action_type === 'book_appointment') validated.companion_action = null;
       }
+    }
+  }
+
+  // No phone call the lead did not ask for, with no plan too (2026-10-03,
+  // Mark's shutters thread: "Want someone to give you a call and go over it?"
+  // on a coverage turn). With a plan, enforceNepqPlan does this.
+  if (!nepqPlan && nepqMode === 'live' && channel === 'sms') {
+    const noCall = dropUnaskedCallOffer(validated.message || '', { leadWantsCall: nepqLeadWantsCall(context.conversation_recent || [], triggerMessage) });
+    if (noCall.changed && noCall.text) {
+      console.log(`[NEPQ] ${contactId} unasked_call_offer_dropped (no plan)`);
+      validated.message = noCall.text;
     }
   }
 

@@ -45,16 +45,16 @@ const WHY = {
   repeat_objection: 'The lead raised the same objection again. Call so they get a straight answer.',
   emergency: 'URGENT: damage happening now (e.g. a broken window, water coming in). Call them right away.',
   service: 'An existing customer has a problem with an install (a leak, a stuck or broken unit). Service should call and set up a repair visit.',
-  callback_request: 'The lead asked for a phone call at a specific time. Call them then.',
+  callback_request: 'The lead asked for a phone call (or said yes to one). Call them, at the time they named if they gave one.',
   booking_request: 'The lead picked a time in the website chat, but the bot could not book it (usually a missing address). Call to confirm the details and book that time.',
 };
 
 /** The rep note and the card body. Pure. */
-export function formatNepqHandoff({ reason, channel, inbound, contactId, firstName }) {
+export function formatNepqHandoff({ reason, channel, inbound, contactId, firstName, extra = null }) {
   const who = firstName || 'A lead';
   return {
     note: `[AGENT TASK] ${who} needs a person (NEPQ hand-off: ${reason}).\nThey said: "${String(inbound || '').slice(0, 400)}"\n${WHY[reason] || ''}`,
-    card: `🤝 A PERSON IS NEEDED (${reason.replace(/_/g, ' ')})\nContact: ${firstName || 'name not given yet'}\nChannel: ${channel === 'livechat' ? 'WEBSITE CHAT' : String(channel || 'sms').toUpperCase()}\nThey said: "${String(inbound || '').slice(0, 200)}"\n→ ${WHY[reason] || 'Needs a person.'} The bot told them someone from our team will reach out.\nGHL: https://app.gohighlevel.com/v2/location/${GHL_LOCATION_ID}/contacts/detail/${contactId}`,
+    card: `🤝 A PERSON IS NEEDED (${reason.replace(/_/g, ' ')})\nContact: ${firstName || 'name not given yet'}\nChannel: ${channel === 'livechat' ? 'WEBSITE CHAT' : String(channel || 'sms').toUpperCase()}\nThey said: "${String(inbound || '').slice(0, 200)}"\n→ ${WHY[reason] || 'Needs a person.'} The bot told them someone from our team will reach out.${extra ? `\n${extra}` : ''}\nGHL: https://app.gohighlevel.com/v2/location/${GHL_LOCATION_ID}/contacts/detail/${contactId}`,
   };
 }
 
@@ -64,9 +64,10 @@ export function formatNepqHandoff({ reason, channel, inbound, contactId, firstNa
  *   post(text, channelId) → {ok, error}: postToSlack. Without it, the card
  *   goes through deps.alert (the old #ops-alerts path).
  */
-export async function routeNepqHandoff({ contactId, reason, channel, inbound, firstName = null, nowMs = Date.now() }, deps) {
+export async function routeNepqHandoff({ contactId, reason, channel, inbound, firstName = null, nowMs = Date.now(), extra = null }, deps) {
   if (!contactId || !reason) return { routed: false };
-  const { note, card } = formatNepqHandoff({ reason, channel, inbound, contactId, firstName });
+  // `extra`: one more card line (the Five9 result of a callback, bot-callback.js).
+  const { note, card } = formatNepqHandoff({ reason, channel, inbound, contactId, firstName, extra });
   const day = new Date(nowMs).toISOString().slice(0, 10);
   const results = await Promise.allSettled([
     Promise.resolve().then(() => deps.applyTags(contactId, [CALLBACK_TAG_SALES, `${NEPQ_HANDOFF_TAG_PREFIX}${reason}`])),

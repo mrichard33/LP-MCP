@@ -38,6 +38,8 @@ import { searchByPhone } from '../services/ghl-contact-resolve.js';
 import { fetchRecentAndUpcomingAppointments } from '../knowledge/contact-appointments.js';
 import { resolveMarket } from '../actions/enrichment.js';
 import { postToSlack } from '../slack.js';
+import { fileBotCallback } from '../agentic/bot-callback.js';
+import { botCallbackDeps } from '../services/bot-callback-io.js';
 import { fetchFreeSlots, selectOfferableSlots } from '../knowledge/calendar-availability.js';
 import { extractPreferredTime } from '../services/preferred-time.js';
 import { BOOKING_CALENDARS, inHomeCalendarFor } from '../knowledge/booking-calendar-router.js';
@@ -378,8 +380,19 @@ async function bookSlot({ contactId, startIso, calendarId, decisionMakers = null
   return { ok: booked, action_id: data.id, error: booked ? null : (res?.result?.action || res?.error || `status ${res?.status}`) };
 }
 
-/** Hand-off side effects (tag, note, event, #ops-alerts card). Fail-soft. */
-function nepqHandoff({ contactId, reason, inbound, firstName }) {
+/**
+ * Hand-off side effects (tag, note, event, #contact-center card). Fail-soft.
+ * A callback is filed for real (Mark, 2026-10-03): the Five9 Callback Request
+ * list too (src/agentic/bot-callback.js). A number typed this turn is written
+ * to the contact first (fill-if-empty), because the Five9 record reads it.
+ */
+async function nepqHandoff({ contactId, reason, inbound, firstName, hasPhone = true, phone = null, why = 'planned' }) {
+  const applyTags = (id, tags) => ghlFetch('POST', `/contacts/${id}/tags`, { tags }, { priority: 'normal' });
+  if (reason === 'callback_request') {
+    if (phone) await captureIdentity(contactId, { visitorTexts: [phone], capture: { phone } }).catch(() => null);
+    return fileBotCallback({ contactId, channel: 'livechat', inbound, firstName, hasPhone: hasPhone || !!phone, why },
+      botCallbackDeps({ applyTags, addNote: (id, note) => addGHLNote(id, note) }));
+  }
   return routeNepqHandoff({ contactId, reason, channel: 'livechat', inbound, firstName }, {
     applyTags: (id, tags) => ghlFetch('POST', `/contacts/${id}/tags`, { tags }, { priority: 'normal' }),
     addNote: (id, note) => addGHLNote(id, note),

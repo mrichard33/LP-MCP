@@ -222,6 +222,18 @@ export function resolveCoverage(plan, { zipResult = null, placeResult = null } =
   return { ...base, status: 'place_unknown' };
 }
 
+/**
+ * Is the coverage reply the whole reply? The zip ask and the out-of-area close
+ * are; every other coverage turn opens with the coverage sentence and the
+ * NEPQ plan steers the rest (2026-10-03: unplanned, the shutters turn offered
+ * a phone call nobody asked for). Takes { plan, coverage } or null. Pure.
+ */
+export function coverageOwnsReply(turn) {
+  if (!turn?.plan?.active) return false;
+  const status = turn.coverage?.status;
+  return !status || status === 'ask_zip' || status === 'out';
+}
+
 /** The deterministic sentence for a status — the fallback and the guard's yardstick. Pure. */
 export function coverageSentence(res) {
   if (!res) return null;

@@ -323,6 +323,8 @@ import { checkNotSuperseded, commitAgenticSend } from './services/agentic-reply-
 import { findNewerInbound } from './agentic/burst-yield.js';
 import { emitEvent } from './event-emitter.js';
 import { routeNepqHandoff } from './agentic/nepq-handoff.js';
+import { fileBotCallback, callbackDecision } from './agentic/bot-callback.js';
+import { botCallbackDeps } from './services/bot-callback-io.js';
 // 2026-09-18 — the decision-maker handoff writes its rep task as a GHL note
 // (GHL has no task API; see src/actions/handlers/tasks.js).
 import { addGHLNote } from './ghl.js';
@@ -3424,7 +3426,9 @@ export async function executeSendMessage(action, context) {
     // two no's, a repeated objection). The reply says someone from our team
     // will reach out; this makes it true. Same shape as the decision-maker
     // hand-off above. Fail-soft: the reply matters more.
-    if (!generationErr && generated?.nepq_handoff) {
+    // A callback_request hand-off is filed after the send instead (below,
+    // fileBotCallback): Five9 + #contact-center, only for a reply that went out.
+    if (!generationErr && generated?.nepq_handoff && generated.nepq_handoff.reason !== 'callback_request') {
       await routeNepqHandoff({
         contactId, reason: generated.nepq_handoff.reason, channel,
         inbound: replyTriggerMessage || triggerMessage,
@@ -3989,6 +3993,24 @@ export async function executeSendMessage(action, context) {
     });
   }
   const _tCommitted = Date.now();
+
+  // ── A promised call is filed for real (Mark, 2026-10-03) ─────────
+  // The Five9 Callback Request list + the #contact-center card
+  // (src/agentic/bot-callback.js), for the planner's callback hand-off AND
+  // for any sent reply that promises we will call (Mark's shutters thread:
+  // "someone from our team will call you shortly", nothing filed). After the
+  // send, so a reply that never went out files nothing. Fail-soft, detached.
+  {
+    const callbackReason = callbackDecision({ handoffReason: generated?.nepq_handoff?.reason || null, otherHandoff: !!generated?.dm_handoff, text: String(message || '') });
+    if (callbackReason) {
+      if (callbackReason === 'promise_backed') console.log(`[SendMessage] call_promise_backed ${contactId}: "${String(message || '').slice(0, 160)}"`);
+      fileBotCallback({
+        contactId, channel, inbound: replyTriggerMessage || context?.message_text || '',
+        firstName: context?.lead?.first_name || null, why: callbackReason,
+      }, botCallbackDeps({ applyTags: applyContactTags, addNote: addGHLNote }))
+        .catch(err => console.warn(`[SendMessage] bot callback failed for ${contactId} (fail-soft): ${err.message}`));
+    }
+  }
 
   // v3.18 — Bot Review Phase 0, post-send only. The message is already with
   // GHL and the sent marker is committed; nothing below can affect delivery.

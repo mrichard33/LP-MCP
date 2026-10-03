@@ -47,6 +47,31 @@ export function nepqBackboneMode(env = process.env) {
 // backup (Mark, 2026-10-02: "Home visit for everyone. Use the call as a back
 // up or secondary option").
 export const VISIT_DECLINE_RX = /\b(?:just\s+)?call\s+me\s+instead\b|\brather\s+(?:do|have|get|just\s+do)\s+a\s+(?:phone\s+)?call\b|\bover\s+the\s+phone\b|\bon\s+the\s+phone\s+(?:instead|first)\b|\bphone\s+call\s+(?:instead|first|only)\b|\b(?:don'?t|do\s+not)\s+want\s+(?:anyone|someone|somebody|people|a\s+visit|a\s+rep|a\s+salesman)\b|\bno\s+(?:home\s+)?visits?\b/i;
+/** Did the lead ask for a phone call, or turn the visit down, anywhere in this conversation? Pure. */
+export function leadWantsCall(conversation = [], trigger = '') {
+  const texts = (Array.isArray(conversation) ? conversation : [])
+    .filter(m => String(m?.direction || '').toLowerCase() !== 'outbound').map(m => String(m?.text ?? m?.body ?? ''));
+  return [...texts, String(trigger || '')].some(t => VISIT_DECLINE_RX.test(t) || CALLBACK_RX.test(t));
+}
+
+/**
+ * A phone call the lead did not ask for goes (2026-10-03 replay: "A quick call
+ * would let us figure out what's happening" beside "What day works best for
+ * the visit?"; on SMS "Want someone to give you a call and go over it?" became
+ * a promised call nobody filed). The visit is the next step for everyone; the
+ * call is the backup only when the lead asks for one (Mark, 2026-10-02).
+ * Sentence by sentence; a promise WE already made stays (a hand-off line).
+ * Pure. @returns {{ text, changed }}
+ */
+export function dropUnaskedCallOffer(text, { leadWantsCall: wants = false } = {}) {
+  const body = String(text || '');
+  if (wants || !body) return { text: body, changed: false };
+  const sentences = splitSentences(body);
+  const kept = sentences.filter(s => !CALL_OFFER_SENTENCE_RX.test(s));
+  if (kept.length === sentences.length) return { text: body, changed: false };
+  return { text: kept.join(' ').trim(), changed: true };
+}
+
 /** Did the lead, anywhere in this conversation, ask for a call instead of a visit? Pure. */
 export function prefersCall(conversation = [], trigger = '') {
   const texts = (Array.isArray(conversation) ? conversation : [])
@@ -81,7 +106,14 @@ const EMERGENCY_RX = /\bwater\s+(?:is\s+)?(?:coming|pouring|leaking|getting)\s+i
 const SERVICE_RX = /\b(?:you|you\s+guys|reece|your\s+(?:team|crew|company|installers?))\s+(?:installed|put\s+in|replaced|did)\b[^.?!]{0,80}\b(?:leak\w*|broken|crack\w*|won'?t|doesn'?t|not\s+(?:working|closing|opening|locking|sealing)|problem|issue|stuck|draft\w*|fogg\w*)\b|\bwarranty\s+(?:claim|issue|repair|work)\b|\b(?:needs?|need\s+a)\s+(?:a\s+)?(?:repair|service\s+call)\b|\b(?:referral|refund|rebate|reward|bonus|deposit)\b[^.?!]{0,80}\b(?:not\s+(?:been\s+)?(?:received|gotten|paid)|never\s+(?:received|got|paid|came)|haven'?t\s+(?:received|gotten|been\s+paid|seen))\b|\b(?:have\s+not|has\s+not|haven'?t|hasn'?t|never|did\s+not|didn'?t)\s+(?:received?|gotten|got|been\s+paid)\b[^.?!]{0,60}\b(?:referral|refund|rebate|reward|bonus|deposit)\b/i;
 // "Just call me at 5pm" is a call request, not a visit (2026-10-02 break test:
 // it got two visit times on another day).
-const CALLBACK_RX = /\b(?:call|ring|phone)\s+(?:me|us)\b[^.?!]{0,30}\b(?:at|around|after|before|tomorrow|today|tonight|this\s+(?:morning|afternoon|evening)|in\s+the\s+(?:morning|afternoon|evening)|anytime|any\s+time)\b|\b(?:call\s+me\s+back|give\s+me\s+a\s+call|have\s+someone\s+call\s+me)\b/i;
+const CALLBACK_RX = /\b(?:call|ring|phone)\s+(?:me|us)\b[^.?!]{0,30}\b(?:at|around|after|before|tomorrow|today|tonight|this\s+(?:morning|afternoon|evening)|in\s+the\s+(?:morning|afternoon|evening)|anytime|any\s+time)\b|\b(?:call\s+me\s+back|give\s+me\s+a\s+call|have\s+someone\s+call\s+me)\b|\b(?:can|could|would|will)\s+(?:someone|somebody|you|a\s+(?:person|rep|team\s+member))\s+(?:please\s+)?(?:call|ring|phone)\s+me\b|^\s*(?:just\s+)?(?:please\s+)?call\s+me\b|\b(?:i'?d|i\s+would)\s+(?:rather|prefer\s+to)\s+(?:talk|speak|chat)\s+(?:on\s+the\s+phone|by\s+phone|over\s+the\s+phone)\b/i;
+// 2026-10-03 (Mark's shutters thread): our own offer of a call ("Want someone
+// to give you a call and go over it?"). A yes to it is a callback request.
+export const CALL_OFFER_RX = /\b(?:want|would\s+you\s+like|should\s+i\s+have|can\s+(?:i|we)\s+have|shall\s+(?:i|we)\s+have)\s+(?:someone|somebody|us|me|a\s+(?:team\s+member|rep|specialist))\s+(?:to\s+)?(?:give\s+you\s+a\s+(?:call|ring)|call\s+you)\b|\b(?:can|could|may|should)\s+(?:we|i|someone)\s+(?:give\s+you\s+a\s+(?:call|ring)|call\s+you)\b|\bwhen'?s\s+(?:a\s+)?good\s+(?:time\s+)?for\s+a\s+(?:quick\s+)?call\b/i;
+// A sentence that offers a phone call from us (2026-10-03: "A quick call would
+// let us figure out what's happening" next to the visit ask). Dropped unless
+// the lead asked for a call or turned the visit down (dropUnaskedCallOffer).
+const CALL_OFFER_SENTENCE_RX = /\b(?:(?:quick|short|brief|15[\s-]*min(?:ute)?|fifteen[\s-]*min(?:ute)?|phone)\s+(?:call|chat)|give\s+you\s+a\s+(?:call|ring)|(?:call|ring|phone)\s+you\b|hop\s+on\s+(?:a\s+)?(?:call|the\s+phone)|(?:talk|chat|go\s+over\s+it)\s+(?:on|over)\s+the\s+phone)\b/i;
 const COMPLAINT_RX = /\b(?:supposed\s+to\s+(?:come|show|be\s+(?:here|there)|call|arrive)|never\s+(?:came|showed(?:\s+up)?|arrived|called(?:\s+(?:me\s+)?back)?)|(?:didn'?t|did\s+not)\s+(?:come|show(?:\s+up)?|arrive|call(?:\s+(?:me\s+)?back)?)|stood\s+(?:me|us)\s+up|waited\s+all\s+(?:day|morning|afternoon)|(?:nobody|no\s+one|no-one)\s+(?:showed|came|called|answered)|complain\w*|ripped\s+off|rip[-\s]?off|scam\w*|refund|lawyer|attorney|sue\b|bbb|better\s+business|manager|supervisor|no[-\s]?show(?:ed)?|never\s+showed|(?:nobody|no\s+one)\s+(?:came|showed|called|answered)|unprofessional|rude|terrible\s+service|worst)\b/i;
 
 const SPOUSE_RX = /\b(?:wife|husband|spouse|partner|fianc[ée]e?)\b/i;
@@ -497,6 +529,9 @@ export function planNepqTurn({
     handoff: null,
     echo: { word: echoWord },
     counters,
+    // The lead asked for a phone call, or turned the visit down: our own call
+    // wording stays (dropUnaskedCallOffer, 2026-10-03).
+    lead_wants_call: leadWantsCall(conversation, trigger),
     // An offer is open but the caller planned without the calendar (live
     // chat's first pass): it must load the times and plan again (2026-10-03
     // replay: "Mark" after the 2 PM offer got a vague answer, no times).
@@ -536,6 +571,12 @@ export function planNepqTurn({
     else if (asked?.ok) line = LINES.callback(callbackWhen(now));
     else line = LINES.callback(teamOpen ? (asked ? null : callbackWhen(now)) : nextTeamOpenLabel(nowMs));
     return fixed('handoff', line, { step: 'handoff', handoff: { reason: 'callback_request', line }, booking: { allowed: false, reason: 'nepq:callback_request' } });
+  }
+  // A yes to our own offer of a call (2026-10-03): the call is now promised,
+  // so it is a callback request like any other (Five9 + #contact-center).
+  if (CALL_OFFER_RX.test(lastOut) && (YES_RX.test(now) || MAYBE_RX.test(now)) && !isNo(now, lastOut)) {
+    const line = LINES.callback(teamOpen ? callbackWhen('') : nextTeamOpenLabel(nowMs));
+    return fixed('handoff', line, { step: 'handoff', handoff: { reason: 'callback_request', line }, booking: { allowed: false, reason: 'nepq:callback_accepted' } });
   }
   if (objType === 'price' && priceLines >= 2) return handoff('price_insist');
   if (nos >= 2) return handoff('two_nos');
@@ -841,6 +882,17 @@ export function planNepqTurn({
   if (!counters.bridge_used && counters.discovery_questions_asked >= 1
     && (earned.earned || counters.discovery_questions_asked >= cap + 2)) {
     Object.assign(plan, { step: 'bridge', required_move: 'bridge', booking: { allowed: false, reason: earned.earned ? 'nepq:bridge_earned' : 'nepq:bridge_ceiling' } }); plan.bridge_line = bridgeLine(plan); return plan;
+  }
+  // 2026-10-03 replay: "the kids are cold all winter" right after the bridge
+  // is more of the problem, not a yes or a no. A bare `answer` move let the
+  // prompt's call canon in ("A quick call would…" next to "What day works
+  // best for the visit?"). Their words, then the visit question once more,
+  // in a variant not sent yet. Once only: a second non-answer is `answer`.
+  const bridgesSent = outbound.filter(m => BRIDGE_RX.test(m.text)).length;
+  if (counters.bridge_used && BRIDGE_RX.test(lastOut) && bridgesSent < 2 && !counters.slot_offers && !isNo(now, lastOut)) {
+    Object.assign(plan, { step: 'bridge_followup', required_move: 'bridge', bridge_followup: true, booking: { allowed: false, reason: 'nepq:bridge_followup' } });
+    plan.bridge_line = bridgeLine(plan);
+    return plan;
   }
   if (counters.bridge_used) {
     // Bridged already and they did not say yes: answer and keep it soft.
@@ -1163,6 +1215,11 @@ export function enforceNepqPlan(draft, plan, { allowFigures = false, known = {} 
     sentences.unshift(LINES.financing_yes);
     changes.push('financing_yes');
   }
+  // 2b2. No phone call the lead did not ask for (2026-10-03). A hand-off or
+  // callback line is our own promise of a call and stays.
+  if (!plan.lead_wants_call && !plan.handoff && !(referenceMove && CALL_OFFER_SENTENCE_RX.test(refLine || ''))) {
+    drop(s => CALL_OFFER_SENTENCE_RX.test(s), 'unasked_call_offer_dropped');
+  }
   // 2c. The consequence question once per conversation, however it is worded.
   if (plan.required_move !== 'consequence' && plan.counters?.consequence_used) drop(s => s.includes('?') && CONSEQUENCE_RX.test(s), 'consequence_repeat');
   // 3. No booking ask the plan does not allow.
@@ -1250,6 +1307,10 @@ export function enforceNepqPlan(draft, plan, { allowFigures = false, known = {} 
       return { text: withSignOff(refLine), changes, failed };
     }
     return { text: changes.length ? withSignOff(body) : original, changes, failed: [] };
+  }
+  if (!body && changes.includes('unasked_call_offer_dropped')) {
+    // The call offer was the whole reply: the visit is the next step instead.
+    body = plan.counters?.bridge_used ? pickFresh([LINES.ask_day, ...ALT_LINES.ask_day], plan.recent_outbound || [], 0) : bridgeLine(plan);
   }
   if (!body) {
     body = changes.includes('money_figures') ? NO_FIGURES_LINE

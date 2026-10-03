@@ -1064,7 +1064,10 @@ test('a model reply never tells the visitor a visit is set when nothing was book
   const { lane, state } = nepqLane({ llm: () => ({ message: "Perfect. You're all set for a measurement visit at 16828 Crown Bridge Drive. Our team will call you before then to go over the details and finalize the time." }) });
   await lane.processInbound(INBOUND('Yes, that would help'));
   assert.ok(!/all set|booked|confirmed/i.test(state.sends[0].message), state.sends[0].message);
-  assert.match(state.sends[0].message, /team will call/i);
+  // 2026-10-03 (Mark): no phone call the lead did not ask for; the visit is
+  // the next step (dropUnaskedCallOffer). Was: "team will call" kept.
+  assert.ok(!/call you/i.test(state.sends[0].message), state.sends[0].message);
+  assert.match(state.sends[0].message, /visit/i);
   assert.match(state.llmCalls[0].system, /Never say a visit is set, booked, confirmed or on the schedule yourself/);
 });
 
@@ -1208,4 +1211,55 @@ test('NEPQ live: a pick from a day-preference offer (Wednesday) is held', async 
   } });
   await made.lane.processInbound(INBOUND('The first one'));
   assert.match(made.state.sends[0].message, /I'm holding Wed, Oct 7 at 10:00 AM ET for you/);
+});
+
+// ── 2026-10-03 (Mark): a promised call is filed for real; no unasked call offers ──
+
+test('callback: "can someone call me" files a callback (Five9 + #contact-center)', async () => {
+  const { lane, state } = nepqLane({ llm: () => ({ message: "Of course. I'll have someone from our team call you." }) });
+  await lane.processInbound(INBOUND('can someone call me tomorrow at 10?'));
+  assert.equal(state.handoffs?.[0]?.reason, 'callback_request');
+  assert.equal(state.handoffs[0].why, 'planned');
+  assert.equal(state.handoffs[0].hasPhone, true);
+});
+
+test('callback: promised before we had a number, filed on the turn the number arrives', async () => {
+  const { lane, state } = nepqLane({
+    phone: null,
+    messages: [M('inbound', 'can someone call me?', 3), M('outbound', "Got it. I'll have someone from our team call you. What's the best number to reach you?", 2)],
+    llm: () => ({ message: "Thanks, got it. Someone from our team will call you soon." }),
+  });
+  await lane.processInbound(INBOUND('352 555 0123'));
+  const filed = (state.handoffs || []).filter(h => h.reason === 'callback_request');
+  assert.ok(filed.some(h => h.why === 'phone_arrived' && h.phone), JSON.stringify(state.handoffs));
+});
+
+test('coverage turn with no zip: planned, opens with the coverage line, no call offer', async () => {
+  const { lane, state } = nepqLane({
+    messages: [M('inbound', "I don't think you service our area", 3), M('outbound', "Happy to check that for you. What's your zip code?", 2)],
+    llm: () => ({ message: "No problem. A team member will confirm whether we cover your area. Shutters only help if someone is home to put them up. Want someone to give you a call and go over it?" }),
+  });
+  await lane.processInbound(INBOUND('Well we have hurricane shutters now.'));
+  const sent = state.sends[0].message;
+  assert.match(sent, /^No problem\. A team member will confirm whether we cover your area\./);
+  assert.ok(!/give you a call|call you/i.test(sent), sent);
+  assert.match(state.llmCalls[0].user, /NEPQ TURN PLAN/);
+  assert.match(state.llmCalls[0].user, /Never offer or suggest a phone call/);
+  assert.ok(!(state.handoffs || []).length, 'no callback was promised');
+});
+
+test('after the bridge, more detail gets the visit question again, never a call', async () => {
+  const { lane, state } = nepqLane({
+    messages: [
+      M('inbound', 'my windows are drafty', 8), M('outbound', 'Drafty? Which rooms?', 7), M('inbound', 'the bedrooms', 6),
+      M('outbound', 'How is that affecting you?', 5), M('inbound', 'a few years now, getting worse', 4),
+      M('outbound', "From what you've shared, I think we can help, since you mentioned the drafts. The easiest next step is a free visit at your home. Would that help?", 3),
+    ],
+    llm: () => ({ message: "That makes sense. Cold bedrooms through winter are rough, especially with kids. A quick call would let us figure out what's happening. What day works best for the visit?" }),
+  });
+  await lane.processInbound(INBOUND('the kids are cold all winter'));
+  const sent = state.sends[0].message;
+  assert.ok(!/quick call|call you/i.test(sent), sent);
+  assert.match(sent, /next step/i);
+  assert.match(sent, /\?$/);
 });
