@@ -187,7 +187,20 @@ const QUESTION_START_RX = /^(?:what(?:'s|’s)?|how|when|which|where|who|why|is|
 // ready, …", "Would love to help.", "Will do.", "Have a great day."
 const NOT_A_QUESTION_RX = /^(?:(?:what|how|when|where|why)\s+(?:i|we|you|you're|you’re|they|it|it's|that's|there's|our|your|this|these|those)\b|would\s+(?:love|be\s+(?:happy|glad))\b|will\s+do\b|have\s+(?:a|an|the|fun)\b|which\s+(?:means|is\s+why)\b)/i;
 
-/** The last sentence starts like a question and ends in "." → "?". Pure. */
+// 2026-10-03 replay: the model also asks behind a lead-in, "Just so I know what
+// brought her here, what was on her mind." / "I'm curious though, with the
+// shutters you have now, what made your wife think about windows." A later
+// clause that opens with a question word makes the sentence a question too.
+// Narrower than QUESTION_START_RX on purpose: "Either way, do whatever works."
+// and "Thanks, have a great day." stay statements.
+const CLAUSE_QUESTION_RX = /^(?:what(?:'s|’s)?|how|which|where|who|why|is|are|does|did|can|could|would|should)\b/i;
+
+function asksInLaterClause(sentence) {
+  const clauses = sentence.split(/,\s+/).slice(1).map((c) => c.trim());
+  return clauses.some((c) => CLAUSE_QUESTION_RX.test(c) && !NOT_A_QUESTION_RX.test(c));
+}
+
+/** The last sentence asks (at its start or after a lead-in) and ends in "." → "?". Pure. */
 export function restoreQuestionMark(text) {
   const original = String(text ?? '');
   const signOff = original.match(/(\s*[—–-]\s*[A-Z][A-Za-z.'’ ]{0,40})\s*$/);
@@ -195,7 +208,8 @@ export function restoreQuestionMark(text) {
   const m = body.match(/(^|[.!?]\s+)([^.!?]+)\.\s*$/);
   if (!m) return { text: original, changed: false };
   const last = m[2].trim();
-  if (!QUESTION_START_RX.test(last) || NOT_A_QUESTION_RX.test(last)) return { text: original, changed: false };
+  const startsAsking = QUESTION_START_RX.test(last) && !NOT_A_QUESTION_RX.test(last);
+  if (!startsAsking && !asksInLaterClause(last)) return { text: original, changed: false };
   const fixed = body.replace(/\.\s*$/, '?') + (signOff ? signOff[1] : '');
   return { text: fixed, changed: true };
 }
