@@ -915,7 +915,7 @@ export function createLiveChatFastLane(deps) {
       backup.reply = outcome.reply;
       backup.mustDeliver = true;
       planOverride = {
-        required_move: 'cancel_flow', step: 'cancel_flow', counters: {}, booking: { allowed: true },
+        required_move: 'cancel_flow', step: 'cancel_flow', counters: {}, booking: { allowed: true, reason: 'cancel_flow' },
         reference_line: outcome.reply, reference_slots: outcome.slots || [], reference_markers: CANCEL_MARKERS[key] || [],
         allow_multi_ask: key === 'ask_identity',
       };
@@ -1104,7 +1104,7 @@ export function createLiveChatFastLane(deps) {
           email: !!context.lead?.email || /\b[^\s@]+@[^\s@]+\.[a-z]{2,}\b/i.test(typedRef) || !!live?.contact_capture?.email,
           zip: !!(context.lead?.postal_code) || /(?:^|\s)\d{5}(?:\s|$)/.test(typedRef),
         };
-        const planRef = facts ? nepqPlan : { ...(nepqPlan || { required_move: 'answer', counters: {}, booking: { allowed: true } }), reference_line: reference.reply, reference_slots: reference.slots || [] };
+        const planRef = facts ? nepqPlan : { ...(nepqPlan || { required_move: 'answer', counters: {}, booking: { allowed: true, reason: 'reference' } }), reference_line: reference.reply, reference_slots: reference.slots || [] };
         const fixRef = enforceNepqPlan(claimRef.text, planRef, { known: knownRef });
         let fixedRef = fixRef.text;
         const notesRef = [];

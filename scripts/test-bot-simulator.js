@@ -67,6 +67,17 @@ test('live chat: cancel → reschedule moves nothing, it records "would move the
   assert.ok(r.would_do.some(w => w.kind === 'would_post_dispatch_card' && w.card === 'rescheduled'));
 });
 
+// 2026-10-03 replay: a plan built in code carried no booking reason, the
+// prompt builder threw on it, and every cancel reply fell to the timeout
+// backup with an #ops-alerts line. The model's draft must be what is sent.
+test('live chat: the cancel flow reaches the model, its draft is sent, and nothing fails', async () => {
+  const { deps } = fakeProduction();
+  deps.callLLM = async () => ({ text: JSON.stringify({ message: "Sure thing. What's the full name and phone number the appointment is under?", story_arc: 'none' }), model: 'fake' });
+  const r = await simulateLiveChat(resolveScenario({ scenario: 'cancel' }), { nepqMode: 'live', productionDeps: deps });
+  assert.equal(r.transcript[0].bot[0], "Sure thing. What's the full name and phone number the appointment is under?");
+  assert.ok(!r.would_do.some(w => w.kind === 'warning' && /reply failed/.test(w.line)), 'no reply failed');
+});
+
 test('live chat: a normal turn uses the model and the thread grows with each reply', async () => {
   const { calls, deps } = fakeProduction();
   const r = await simulateLiveChat(resolveScenario({ turns: ['Hi there', 'they are drafty'] }), { nepqMode: 'off', productionDeps: deps });
