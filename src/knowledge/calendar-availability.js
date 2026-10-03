@@ -126,9 +126,36 @@ export function spreadCallOffer(slots, maxOffer = MAX_OFFER_SLOTS) {
  */
 export async function fetchFreeSlots(calendarId, opts = {}) {
   if (!calendarId) return null;
+  // 2026-10-03 replay: one GHL free-slots read timed out (10s) on the turn a
+  // lead said "Usually on Wednesdays"; with no times the text bot pitched the
+  // visit again and lost the booking. A transient failure (timeout, 429, 5xx)
+  // falls back to the last good read of the same calendar from the last 10
+  // minutes, else retries once. The picked time is re-read right before
+  // booking (slot-recheck.js), so a stale list never books a taken slot.
+  const key = `${calendarId}|${opts.timezone || DEFAULT_TIMEZONE}|${opts.windowDays || DEFAULT_WINDOW_DAYS}|${opts.maxSlots || MAX_SLOTS_RETURNED}|${opts.minNoticeHours ?? ''}`;
+  const first = await fetchFreeSlotsOnce(calendarId, opts);
+  if (first.value) { LAST_GOOD.set(key, { at: Date.now(), value: first.value }); return first.value; }
+  if (!first.transient) return null;
+  const good = LAST_GOOD.get(key);
+  if (good && Date.now() - good.at <= LAST_GOOD_MAX_AGE_MS) {
+    console.warn(`[CalAvail] ${calendarId} read failed; using the read from ${Math.round((Date.now() - good.at) / 1000)}s ago`);
+    return { ...good.value, stale: true };
+  }
+  const second = await fetchFreeSlotsOnce(calendarId, opts);
+  if (second.value) { LAST_GOOD.set(key, { at: Date.now(), value: second.value }); console.log(`[CalAvail] ${calendarId} retry succeeded`); }
+  return second.value || null;
+}
+
+const LAST_GOOD = new Map();
+const LAST_GOOD_MAX_AGE_MS = 10 * 60_000;
+/** Test seam: forget every cached read. */
+export function _resetFreeSlotsCache() { LAST_GOOD.clear(); }
+
+/** One read. `transient` marks a failure worth a cached fallback or a retry. */
+async function fetchFreeSlotsOnce(calendarId, opts = {}) {
   if (!GHL_API_KEY) {
     console.warn('[CalAvail] GHL_API_KEY not set — skipping availability lookup');
-    return null;
+    return { value: null, transient: false };
   }
 
   const windowDays = opts.windowDays || DEFAULT_WINDOW_DAYS;
@@ -157,20 +184,20 @@ export async function fetchFreeSlots(calendarId, opts = {}) {
     if (res.status === 429) {
       report429();
       console.warn('[CalAvail] ' + calendarId + ' -> 429 rate limited');
-      return null;
+      return { value: null, transient: true };
     }
 
     if (!res.ok) {
       const errBody = await res.text().catch(() => '');
       console.warn('[CalAvail] ' + calendarId + ' -> ' + res.status + ': ' + errBody.slice(0, 200));
-      return null;
+      return { value: null, transient: res.status >= 500 };
     }
 
     const data = await res.json();
-    return parseSlots(data, calendarId, tz, maxSlots, opts.minNoticeHours);
+    return { value: parseSlots(data, calendarId, tz, maxSlots, opts.minNoticeHours), transient: false };
   } catch (err) {
     console.warn('[CalAvail] ' + calendarId + ' threw: ' + err.message);
-    return null;
+    return { value: null, transient: true };
   }
 }
 

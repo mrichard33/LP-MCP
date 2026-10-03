@@ -627,7 +627,11 @@ export function planNepqTurn({
   // Two real openings that match, the next matching day first; none in two
   // weeks → say so and offer the nearest two (day-preference.js). Only in a
   // scheduling moment, and never over a pick of a time already offered.
-  const pref = parseDayPreference(now);
+  // The answer to our time-of-day question joins the day they gave just
+  // before it ("Wednesdays" … "mornings").
+  const PART_ASK_RX = /\bwhat\s+time\s+of\s+(?:the\s+)?day\b/i;
+  const prevInbound = inbound.length >= 2 ? (inbound[inbound.length - 2].text || '') : '';
+  const pref = parseDayPreference(PART_ASK_RX.test(lastOut) && prevInbound ? `${prevInbound} ${now}` : now);
   const pool = (Array.isArray(allSlots) && allSlots.length ? allSlots : []).map(s => ({ ...s, tz: s.tz || tzLabel || '' }));
   // A short message that is only a day ("Usually on Wednesdays") is their
   // availability whatever we asked (2026-10-03 SMS replay: it got the bridge,
@@ -637,6 +641,13 @@ export function planNepqTurn({
     || !!lastOfferOut || BRIDGE_RX.test(lastOut) || counters.bridge_used || SCHEDULE_ASK_RX.test(now) || bareDay);
   // The caller loads the calendar for this (wantsSlots) and plans again.
   if (prefScheduling && pool.length < 2) plan.day_preference_pending = true;
+  // The caller read the calendar and got nothing back (a GHL timeout,
+  // 2026-10-03 replay): never the bridge over a day they just gave. Their day
+  // is taken, and the time of day is asked, so the next turn has both.
+  if (prefScheduling && pool.length < 2 && Array.isArray(allSlots) && !pref.part && pref.after == null && pref.before == null && !PART_ASK_RX.test(lastOut)) {
+    const verb = /s$/i.test(pref.label) ? 'work' : 'works';
+    return fixed('ask_day', `${pref.label} ${verb}. What time of day is best for you?`, { step: 'ask_day', booking: { allowed: true, reason: 'nepq:day_preference_no_slots' } });
+  }
   if (prefScheduling && pool.length >= 2) {
     const offeredNow = lastOfferOut ? pool.filter(s => lastOfferOut.includes(`${s.day} at ${s.time}`) || (s.rel && lastOfferOut.includes(`${s.rel} at ${s.time}`))) : [];
     if (!offeredNow.some(s => slotMatches(s, pref))) {

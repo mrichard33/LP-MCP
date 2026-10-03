@@ -236,3 +236,24 @@ test('after our "You\'re all set for…" the bot never offers times again', () =
   const after = [...conv, { direction: 'outbound', text: 'Done. Your Wed, Oct 7 appointment is cancelled.' }, { direction: 'inbound', text: 'Actually can we do Thursday?' }];
   assert.notEqual(planNepqTurn({ channel: 'sms', trigger: 'Actually can we do Thursday?', conversation: after, slots: OFFERED, allSlots: ALL, tzLabel: 'ET', nowMs: NOW }).step, 'booked');
 });
+
+// 2026-10-03 replay: a GHL calendar timeout on the "Usually on Wednesdays"
+// turn sent the bridge instead, and the booking was lost.
+test('a day preference with no calendar read asks the time of day, then uses both', () => {
+  const conv = [
+    { direction: 'outbound', text: "Yes, it's free. Is it just the drafty windows, or the whole house?" },
+    { direction: 'inbound', text: 'Usually on Wednesdays' },
+  ];
+  const noRead = planNepqTurn({ channel: 'sms', trigger: 'Usually on Wednesdays', conversation: conv, slots: [], allSlots: [], tzLabel: 'ET', nowMs: NOW });
+  assert.equal(noRead.required_move, 'ask_day');
+  assert.equal(noRead.fixed_line, 'Wednesdays work. What time of day is best for you?');
+  // Next turn, calendar back: "mornings" + the Wednesday they gave.
+  const next = [...conv, { direction: 'outbound', text: noRead.fixed_line }, { direction: 'inbound', text: 'Mornings' }];
+  const plan = planNepqTurn({ channel: 'sms', trigger: 'Mornings', conversation: next, slots: OFFERED, allSlots: [...ALL, ...WED], tzLabel: 'ET', nowMs: NOW });
+  assert.equal(plan.required_move, 'offer_slots');
+  assert.match(plan.fixed_line, /Wed, Oct 7 at 10:00 AM ET/);
+  // Live chat's first pass (no calendar asked for yet) still waits for the read.
+  const first = planNepqTurn({ channel: 'livechat', trigger: 'Usually on Wednesdays', conversation: conv, nowMs: NOW });
+  assert.equal(first.day_preference_pending, true);
+  assert.notEqual(first.required_move, 'ask_day');
+});
