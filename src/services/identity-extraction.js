@@ -256,6 +256,7 @@ export function heuristicExtract(messages = []) {
     typeof m === 'string' ? { direction: 'inbound', text: m } : { direction: m?.direction || 'inbound', text: m?.text || '' }
   );
 
+  let prevOutbound = '';
   for (const turn of turns) {
     const text = String(turn.text || '');
     if (!text.trim()) continue;
@@ -263,8 +264,13 @@ export function heuristicExtract(messages = []) {
 
     if (!inbound) {
       if (DM_QUESTION_RE.test(text)) id.decision_maker_question_asked = true;
+      prevOutbound = text;
       continue;
     }
+    // 2026-10-03 (the "Hi ," guide email): a one-word reply to our own
+    // "what's your first name?" is the name ("Mark"). Without an ask, one word
+    // stays too weak to promote ("ok", "Tuesday", "Ocala").
+    const askedName = /\b(?:first|full|your)\s+name\b/i.test(prevOutbound) && prevOutbound.includes('?');
 
     // 2026-07-29 (Kelly Callahan incident): blank URLs BEFORE the segment
     // split. A URL is never a customer-supplied phone/ZIP/address, but tracked
@@ -336,6 +342,10 @@ export function heuristicExtract(messages = []) {
           if (words.every(isCapitalizedNameWord) && looksLikeName(words) && !isPlaceholderName(words.join(' '))) {
             candidate = words;
           }
+        }
+        if (!candidate && askedName) {
+          const one = seg.match(new RegExp(`^\\s*(?:it'?s\\s+|i'?m\\s+)?(${NAME_WORD})\\s*[.!]?\\s*$`, 'i'));
+          if (one && looksLikeName([one[1]]) && !isPlaceholderName(one[1])) candidate = [one[1]];
         }
         if (candidate) {
           id.first_name = titleCaseName(candidate[0]);

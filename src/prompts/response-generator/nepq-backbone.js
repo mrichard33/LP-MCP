@@ -23,7 +23,7 @@ export const NEPQ_ALWAYS = [
 ];
 
 const MOVE_TEXT = {
-  probe: (p) => `This turn's move: ONE short question about what they just told you, in their own words${p.echo?.word ? ` (an echo like "${cap(p.echo.word)}?" is fine)` : ''}. No booking ask, no pitch, no "why now" question if one was already asked.`,
+  probe: (p) => `This turn's move: ONE short question about what they just told you, in their own words${p.echo?.word ? ` (an echo like "${cap(p.echo.word)}?" is fine)` : ''}. No booking ask, no pitch, no "why now" question if one was already asked.${p.probe_for === 'problem' ? ' Aim it at what is wrong with their windows or doors, or what they want changed (NEPQ: the problem in their words comes before any next step).' : p.probe_for === 'why_it_matters' ? ' Aim it at why this matters to them now, how long it has been going on or how it affects them (NEPQ: the reason, in their words, earns the next step).' : ''}`,
   // 2026-10-02 simulation: "(hurricane season makes it natural)" produced "with
   // us at the peak of hurricane season", pressure Mark ruled out.
   // 2026-10-03 (Mark): hurricane and storm language is allowed, it is core to

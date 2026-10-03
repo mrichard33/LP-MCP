@@ -92,6 +92,15 @@ GHL Inbound Webhook workflow. Every email needs all three (Mark, 2026-09-24). Po
 workflow that sends those fields unchanged. A workflow with a ChatGPT step rewriting the text (as
 U.SEND-AI and I.AI-MAIL do today) skips every check in `src/actions/handlers/info-email.js`.
 
+**A guide goes out with a saved first name (Mark, 2026-10-03).** U.GUIDE emails the guide with `{{contact.first_name}}`
+and sent "Hi ," when nothing had saved one. `ensureGuideName` (`src/agentic/guide-name.js`) runs before any
+`send-<type>-guide` tag (the layer3 dispatch and an accepted `guide_disposition`): a name on the contact → send; a name in
+the thread (a bare reply to our name ask, "my name is X") → the fill-if-empty GHL write is AWAITED, then send; none →
+the tag is held as `guide-pending-name:<type>` and the reply asks only "What's your first name, so I can put it on the
+guide?". The next reply releases it, with the name if given; after one ask the guide goes anyway
+(`guide_sent_without_name`). The SMS identity pass now takes a one-word reply to our name ask as the first name.
+U.GUIDE also fires on S2.2's `hurricane-guide-queue`, which this gate cannot hold: its fallback greeting is Mark's to set in GHL.
+
 **Only an opt-out silences the bot (Mark, 2026-09-24).** A classifier handoff tags the contact and,
 where a person must act, pages one — and the bot still replies, unless `handoffReplyPolicy`
 (`src/agentic/handoff-policy.js`) says `silent` (STOP, WRONG_NUMBER) or `workflow` (a GHL workflow
@@ -284,6 +293,15 @@ re-asks for a name/phone/email/zip we have, and extra questions. `NEPQ_BACKBONE_
 (default off; shadow records `nepq_plan` / `would_send` only). Live chat books a picked slot through an
 awaited `book_appointment` row and confirms only on `appointment_booked`; GHL still refusing is the one case
 handed to a person.
+
+**Earn the ask (Mark, 2026-10-03).** The bridge to the free visit needs the problem in the lead's own words AND an
+answer to one "why it matters / what if you wait" question, or the lead volunteering it ("getting worse", "the bills",
+"before the next storm") — `discoveryEarned` in `nepq-planner.js`. "What's got you looking?" and "how long?" ask for the
+problem, not its weight. Not earned at the old cap (2 chat / 3 SMS): keep discovering (`probe_for` problem / why it
+matters, or the consequence question); two vague answers or `cap + 2` questions bridge anyway. The shortcuts are
+unchanged (Mark: "keep how we had"): quote/price (one question, then times), a schedule or come-out ask, a typed day
+and time, the objection plays. With no plan (planner error, coverage turn) a booking ask goes unless the thread already
+earned it (`bookingOpenInThread`).
 
 **Book in the conversation, unconfirmed, on the right calendar (Mark, 2026-10-02).** Every bot booking is
 status `new` (the handler forces it). **Ask about decision makers ONCE, then book** (supersedes 2026-09-18):

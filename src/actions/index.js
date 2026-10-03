@@ -193,6 +193,9 @@
  */
 
 import supabase from '../supabase.js';
+import { ensureGuideName, pendingTagFor } from '../agentic/guide-name.js';
+import { guideNameDeps } from '../services/guide-name-io.js';
+import { isGuideDeliveryTag } from '../agentic/guide-delivery.js';
 import { executeSendMessage, sendMessageBudgetMs } from '../send-message-handler.js';
 import { llmBudgetMs } from '../llm-client.js';
 import { registerRateLimiterRoutes } from '../ghl-rate-limiter.js';
@@ -465,6 +468,27 @@ async function executeLayer3Dispatch(action /*, context */) {
   // send_message can carry what its siblings deliver before anything inserts.
   const rows = planLayer3SubActions({ event, dispatch, result, targetId });
   const batchId = rows[0]?.batch_id || `layer3_${event.id}_${dispatch.recommended_action}_${Date.now()}`;
+
+  // 2026-10-03 (Mark): the guide email greets with the GHL first name, and it
+  // went out "Hi ,". A guide tag now waits for a saved first name: a name in
+  // the thread is written first (awaited); with none, the tag is held as
+  // guide-pending-name:<type> and the reply asks for it. See guide-name.js.
+  const guideRows = rows.filter(r => r.action_type === 'add_tag' && isGuideDeliveryTag(r.action_payload?.tag));
+  if (guideRows.length && targetId) {
+    const g = await ensureGuideName({ contactId: targetId, trigger: String(event.payload?.message_text || '') }, guideNameDeps)
+      .catch((err) => ({ action: 'send', error: err.message }));
+    if (g.action === 'ask') {
+      for (const r of guideRows) r.action_payload = { ...r.action_payload, tag: pendingTagFor(r.action_payload.tag) || r.action_payload.tag };
+      for (const r of rows.filter(x => x.action_type === 'send_message')) {
+        r.action_payload = { ...r.action_payload, delivery_tags: [], guide_name_ask: true };
+      }
+      console.log(`[ActionExecutor] guide held for a first name: ${targetId} (batch=${batchId})`);
+    } else if (g.action === 'write_then_send') {
+      console.log(`[ActionExecutor] guide: saved first name "${g.name}" for ${targetId} before the guide tag`);
+    } else if (g.action === 'send_without_name') {
+      console.warn(`[ActionExecutor] guide_sent_without_name: ${targetId}${g.write_failed ? ' (name write failed)' : ''}`);
+    }
+  }
   const queued = [];
 
   for (const insertRow of rows) {

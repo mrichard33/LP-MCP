@@ -372,6 +372,45 @@ export function problemEcho(inbound = []) {
   return null;
 }
 
+// ── Earn the ask (Mark, 2026-10-03) ───────────────────────────────────────
+// "I want the bot to earn the ask for the appointment using NEPQ." The bridge
+// to the free visit used to come after a COUNT of questions (2 on chat, 3 on
+// SMS), whatever the answers were. It now needs the problem in the lead's own
+// words AND an answer to one "why it matters / what if you wait" question
+// (NEPQ consequence), or the lead volunteering that weight on their own.
+// Shortcuts are unchanged (Mark: "keep how we had"): a quote or price ask, a
+// request to schedule or come out, a typed day and time, and the objection
+// plays still reach times on their own paths. A lead who will not engage
+// (two vague answers) is bridged anyway, and nobody is questioned past
+// cap + 2 questions.
+const WANT_PROBLEM_RX = /\b(?:impact|peeling|hard\s+to\s+(?:open|close|lock)|won'?t\s+(?:open|close|lock|seal)|(?:don'?t|doesn'?t)\s+(?:open|close|lock|seal)|single[-\s]?pane|termites?|water\s+(?:comes|coming|gets|getting)\s+in|let(?:s|ting)?\s+(?:the\s+)?(?:heat|cold|water|air)\s+in)\b/i;
+// A "why it matters" question from us, besides CONSEQUENCE_RX (NEPQ's probing
+// trio: has it had an impact, in what way, what would fixing it mean). "What's
+// got you looking?" and "how long?" ask for the problem, not its weight.
+const WHY_ASK_RX = /\b(?:had|having|has\s+(?:that|it|this)\s+had)\s+an\s+impact\b|\bhow\s+(?:is|are|has|have)\s+(?:that|it|this|those|they)\s+(?:been\s+)?(?:affect|impact|bother|feel)\w*\b|\bin\s+what\s+way\b|\bwhat\s+would\s+(?:it|that|fixing\s+\w+|getting\s+\w+(?:\s+\w+)?)\s+(?:mean|do)\b|\bwhat'?s\s+(?:that|it)\s+(?:been\s+)?cost(?:ing)?\b|\bwhy\s+(?:is\s+(?:that|it|this)\s+)?(?:important|a\s+priority)\b/i;
+// The lead volunteering why it matters: urgency, a feeling, a cost.
+const WEIGHT_RX = /\b(?:getting\s+worse|worse\s+every|worried|worry|scared|afraid|nervous|tired\s+of|sick\s+of|fed\s+up|frustrat\w*|annoy\w*|stress\w*|expensive|costing|through\s+the\s+roof|before\s+(?:the\s+)?(?:next\s+)?(?:storm|hurricane|season|summer|winter)|asap|as\s+soon\s+as|right\s+away|this\s+(?:year|season|month)|insurance\s+(?:wants|requires|dropped|went\s+up)|safety|kids?|baby|elderly|selling\s+(?:the\s+)?house)\b/i;
+
+/** Did the lead earn the visit ask? { problem, consequence, earned }. Pure. */
+export function discoveryEarned(conversation = [], trigger = '') {
+  const turns = normalizeThread(conversation, trigger);
+  const problem = turns.some(t => t.direction === 'inbound' && (new RegExp(PROBLEM_RX.source, 'i').test(t.text) || WANT_PROBLEM_RX.test(t.text)));
+  let consequence = false;
+  for (let i = 0; i < turns.length && !consequence; i++) {
+    const t = turns[i];
+    if (t.direction !== 'inbound') continue;
+    const text = String(t.text || '');
+    if (VAGUE_ANSWER_RX.test(text)) continue;
+    if (WEIGHT_RX.test(text)) { consequence = true; break; }
+    // An answer to our "why it matters" question counts once the problem was
+    // already out: the problem itself, given in reply, is not the reason.
+    const problemBefore = turns.slice(0, i).some(x => x.direction === 'inbound' && (new RegExp(PROBLEM_RX.source, 'i').test(x.text) || WANT_PROBLEM_RX.test(x.text)));
+    const prevOut = [...turns.slice(0, i)].reverse().find(x => x.direction === 'outbound')?.text || '';
+    if (problemBefore && (CONSEQUENCE_RX.test(prevOut) || WHY_ASK_RX.test(prevOut))) consequence = true;
+  }
+  return { problem, consequence, earned: problem && consequence };
+}
+
 /**
  * Plan this turn.
  *
@@ -437,6 +476,8 @@ export function planNepqTurn({
     reveal_used: outbound.some(m => REVEAL_RX.test(m.text)),
   };
   const cap = channel === 'livechat' ? 2 : 3;
+  const earned = discoveryEarned(conversation, trigger);
+  counters.earned = earned.earned;
   const echoWord = problemEcho(inbound);
   const objType = objectionType(now, lastOut);
   const attempt = objType ? inboundTypes.filter(x => x === objType).length : 0;
@@ -793,8 +834,13 @@ export function planNepqTurn({
     if (offerSlots.length === 2) return fixed('offer_slots', withSlots(vary(LINES.which(offerSlots), ALT_LINES.which(offerSlots))), { step: 'offer_slots' });
     return fixed('ask_day', vary(LINES.ask_day, ALT_LINES.ask_day), { step: 'ask_day', booking: { allowed: true, reason: 'nepq:ask_day' } });
   }
-  if (counters.discovery_questions_asked >= cap && !counters.bridge_used) {
-    Object.assign(plan, { step: 'bridge', required_move: 'bridge', booking: { allowed: false, reason: 'nepq:bridge_first' } }); plan.bridge_line = bridgeLine(plan); return plan;
+  // Earn the ask (Mark, 2026-10-03): the problem in their words AND why it
+  // matters, then the bridge. Not earned yet: keep discovering, up to a
+  // ceiling of cap + 2 questions, then bridge anyway.
+  plan.earned = earned;
+  if (!counters.bridge_used && counters.discovery_questions_asked >= 1
+    && (earned.earned || counters.discovery_questions_asked >= cap + 2)) {
+    Object.assign(plan, { step: 'bridge', required_move: 'bridge', booking: { allowed: false, reason: earned.earned ? 'nepq:bridge_earned' : 'nepq:bridge_ceiling' } }); plan.bridge_line = bridgeLine(plan); return plan;
   }
   if (counters.bridge_used) {
     // Bridged already and they did not say yes: answer and keep it soft.
@@ -802,8 +848,11 @@ export function planNepqTurn({
     return plan;
   }
   if (!outbound.length) plan.step = 'open';
-  plan.allowed.consequence = !!echoWord && !counters.consequence_used && counters.discovery_questions_asked >= 1;
+  // The problem is out but not why it matters: the consequence question
+  // (once; after that a "why now" probe). No problem yet: a probe for it.
+  plan.allowed.consequence = earned.problem && !earned.consequence && !counters.consequence_used && counters.discovery_questions_asked >= 1;
   plan.required_move = plan.allowed.consequence ? 'consequence' : 'probe';
+  if (plan.required_move === 'probe') plan.probe_for = earned.problem ? 'why_it_matters' : 'problem';
   plan.booking = { allowed: false, reason: 'nepq:discover_first' };
   return plan;
 }
@@ -1012,6 +1061,26 @@ export function exactSlotFor(text, slots = []) {
 }
 
 /** The bridge in their words, when the draft skipped it. Pure. */
+/**
+ * A booking ask is already earned in this thread: the lead asked to schedule,
+ * said yes to our bridge, or times are on the table / held / booked. Used to
+ * fail closed when there is no plan (2026-10-03). Pure.
+ */
+export function bookingOpenInThread(conversation = [], trigger = '') {
+  const turns = normalizeThread(conversation, trigger);
+  for (let i = 0; i < turns.length; i++) {
+    const t = turns[i];
+    if (t.direction === 'outbound') {
+      if (SLOT_OFFER_RX.test(t.text) || /\bI'm\s+holding\b|\byou'?re\s+all\s+set\s+for\b/i.test(t.text)) return true;
+      continue;
+    }
+    if (SCHEDULE_ASK_RX.test(t.text) || TIME_REQUEST_RX.test(t.text)) return true;
+    const prevOut = [...turns.slice(0, i)].reverse().find(x => x.direction === 'outbound')?.text || '';
+    if (BRIDGE_RX.test(prevOut) && YES_RX.test(t.text)) return true;
+  }
+  return false;
+}
+
 export function bridgeLine(plan) {
   const phrase = plan.echo?.phrase || problemPhrase(plan.echo?.word);
   const since = phrase ? `, since you mentioned ${phrase}` : '';
