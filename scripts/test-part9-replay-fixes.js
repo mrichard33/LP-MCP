@@ -213,3 +213,26 @@ test('spouse and price plays read naturally worded drafts', async () => {
   const { checkAgainstReference, LINES } = await import('../src/agentic/nepq-planner.js');
   assert.deepEqual(checkAgainstReference('Makes sense. How does she feel about swapping out the old ones?', LINES.spouse_1), []);
 });
+
+// 2026-10-03 replay (#1144 live): a bare phone number built no booking
+// context, the gate was skipped, and the SMS visit booked with no address.
+test('the SMS visit gate cannot be cleared by a turn that skipped it', async () => {
+  const { smsGateMissing } = await import('../src/response-generator.js');
+  assert.deepEqual(smsGateMissing(false, null), []);
+  assert.deepEqual(smsGateMissing(true, null), ['address']);
+  assert.deepEqual(smsGateMissing(true, { ok: false, missing: ['address', 'zip'] }), ['address', 'zip']);
+  assert.deepEqual(smsGateMissing(true, { ok: true, missing: [] }), []);
+});
+
+test('after our "You\'re all set for…" the bot never offers times again', () => {
+  const conv = [
+    { direction: 'outbound', text: "You're all set for Wed, Oct 7 at 10:00 AM ET, Mark. Our team will reach out to confirm the details." },
+    { direction: 'inbound', text: '12 Main St, Ocala FL 34470' },
+  ];
+  const plan = planNepqTurn({ channel: 'sms', trigger: '12 Main St, Ocala FL 34470', conversation: conv, slots: OFFERED, allSlots: ALL, tzLabel: 'ET', nowMs: NOW });
+  assert.equal(plan.step, 'booked');
+  assert.notEqual(plan.required_move, 'offer_slots');
+  // A cancel after it reopens booking.
+  const after = [...conv, { direction: 'outbound', text: 'Done. Your Wed, Oct 7 appointment is cancelled.' }, { direction: 'inbound', text: 'Actually can we do Thursday?' }];
+  assert.notEqual(planNepqTurn({ channel: 'sms', trigger: 'Actually can we do Thursday?', conversation: after, slots: OFFERED, allSlots: ALL, tzLabel: 'ET', nowMs: NOW }).step, 'booked');
+});

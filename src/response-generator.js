@@ -3130,6 +3130,17 @@ export function applyConfFlowMergeKeys(text, confFlowContext) {
 // ═══════════════════════════════════════════════════════════════════
 
 /**
+ * What the in-home gate says is still missing before an SMS visit books. Pure.
+ * A gate that could not be read (null) cannot clear a booking: the address,
+ * the one item every visit carries, is asked for (2026-10-03 replay).
+ */
+export function smsGateMissing(inHomeGate, bookingGate) {
+  if (!inHomeGate) return [];
+  if (!bookingGate) return ['address'];
+  return bookingGate.ok ? [] : (bookingGate.missing || []);
+}
+
+/**
  * True when this turn's NEPQ plan asks the lead for a day or time (an offer,
  * the day ask, a confirm). The repeat-ask guard then treats the time as open
  * (2026-10-03 replay: a typed "2 PM" that was not open closed the question,
@@ -3830,13 +3841,19 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       const idn = identityState?.identity || {};
       const thread = (context.conversation_recent || []).map(m => ({ direction: String(m?.direction || '').toLowerCase() === 'outbound' ? 'outbound' : 'inbound', text: String(m?.text ?? m?.body ?? '') }));
       if (!thread.length || thread[thread.length - 1].direction === 'outbound' || thread[thread.length - 1].text !== triggerMessage) thread.push({ direction: 'inbound', text: String(triggerMessage || '') });
-      const inHomeGate = kbPack?.booking_context?.requires_in_home_gate === true;
+      // A held or picked VISIT keeps its gate whatever this turn's KB pack
+      // says (2026-10-03 replay: a bare "9543792151" built no booking context,
+      // the gate was skipped, and the visit booked with no address).
+      const inHomeGate = kbPack?.booking_context?.requires_in_home_gate === true || nepqVisitFirst;
       const firstName = (() => { const f = String(idn.first_name || context.lead?.first_name || '').trim().split(/\s+/)[0]; return f && !/^guest$/i.test(f) ? f : null; })();
+      // A gate that could not be read cannot clear a booking: the address is
+      // the one item every visit must carry, so it is asked for.
+      const gateMissing = smsGateMissing(inHomeGate, bookingGate);
       const tzl = tzLabel(promptTimezoneFor(context));
       bookingFacts = smsBookingTurn({
         plan: nepqPlan, trigger: triggerMessage, thread, slots: fullSlotsForPick,
         tz: tzl,
-        gateMissing: inHomeGate && bookingGate && !bookingGate.ok ? (bookingGate.missing || []) : [],
+        gateMissing,
         onFileAddress: inHomeGate && idn.address_line1 && idn._source?.address_line1 === 'ghl_record' ? { address1: idn.address_line1, city: idn.city || null } : null,
         firstName,
         calendar: { calendar_id: bookingResolution?.calendar_id || null, calendar_name: bookingResolution?.calendar_key ? calendarNameForKey(bookingResolution.calendar_key) : null },
