@@ -164,3 +164,21 @@ test('the hour is read in the office zone, standard time included', () => {
   assert.equal(startsAtAllowedHour('2030-12-05T17:00:00-06:00', [10, 14, 18]), true, '5 PM Central is 6 PM Eastern');
   assert.equal(startsAtAllowedHour('2030-10-05T18:15:00-04:00', [10, 14, 18]), false);
 });
+
+// ── replay polish (2026-10-03, after #1149 went live) ─────────────────────
+const { restoreQuestionMark } = await import('../src/agentic/human-voice.js');
+const { guardCoverageDraft } = await import('../src/agentic/service-area-turn.js');
+
+test('a question behind a lead-in gets its "?" back; statements stay statements', () => {
+  assert.equal(restoreQuestionMark('Just so I know what brought her here, what was on her mind.').text, 'Just so I know what brought her here, what was on her mind?');
+  assert.equal(restoreQuestionMark("I'm curious though, with the shutters you have now, what made your wife think about windows.").text, "I'm curious though, with the shutters you have now, what made your wife think about windows?");
+  for (const s of ['Either way, do whatever works for you.', 'Thanks, have a great day.', "When you're ready, just text us.", 'If you have questions, what we can do is set up a visit.']) {
+    assert.equal(restoreQuestionMark(s).changed, false, s);
+  }
+});
+
+test('the coverage sentence never doubles the draft\'s own "No problem."', () => {
+  const fixed = guardCoverageDraft("No problem. I'm curious though, what made her look?", { status: 'place_unknown' }).fixed;
+  assert.equal((fixed.match(/No problem/g) || []).length, 1);
+  assert.match(fixed, /what made her look\?$/);
+});

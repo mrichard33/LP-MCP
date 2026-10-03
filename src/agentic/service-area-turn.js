@@ -330,7 +330,11 @@ export function guardCoverageDraft(draft, res) {
     notes.push(`SERVICE AREA: your previous draft's first sentence did not state the coverage result. Start with exactly: "${sentence}"`);
     // Prepend the sentence; drop any later sentence that re-states coverage
     // so the reply does not say it twice.
-    const rest = splitSentences(text).filter((s) => !/\b(?:serve|service area|cover(?:age)?)\b/i.test(s));
+    // 2026-10-03 replay: the draft's own "No problem." stayed after our
+    // "No problem. A team member will confirm…", so the reply said it twice.
+    // A bare acknowledgement goes with the coverage sentence's own.
+    const rest = splitSentences(text).filter((s) => !/\b(?:serve|service area|cover(?:age)?)\b/i.test(s)
+      && !/^(?:no\s+problem|got\s+it|sure|okay|ok|of\s+course|sounds\s+good|understood)[.!]?$/i.test(s.trim()));
     return { notes, fixed: [sentence, ...rest].join(' ').trim() };
   }
   return { notes, fixed: text };
