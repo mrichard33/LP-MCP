@@ -26,12 +26,15 @@
 
 import { isNotInterested } from './not-interested.js';
 import { isLeadQuestion, findBookingAsks } from './discovery-discipline.js';
-import { isTeamOpen, nextTeamOpenLabel, requestedCallTime } from './team-hours.js';
+import { isTeamOpen, nextTeamOpenLabel, requestedCallTime, promisedCallback } from './team-hours.js';
 import { heldSlot, COLLECT_ASK } from './booking-collect.js';
 import { RECHECK_RX } from './contact-check.js';
 import { slotMentionIndex } from '../live-chat/cancel-flow.js';
 import { parseDayPreference, slotsForPreference, slotMatches, preferenceOfferLine } from './day-preference.js';
 import { enforceOneAsk } from './one-ask.js';
+import { isKnockComplaint } from './do-not-knock.js';
+
+export { isKnockComplaint };
 
 export const NEPQ_PLANNER_VERSION = '1.0';
 
@@ -135,12 +138,8 @@ export function isServiceCallback({ conversation = [], trigger = '', isCustomer 
 
 const COMPLAINT_RX = /\b(?:supposed\s+to\s+(?:come|show|be\s+(?:here|there)|call|arrive)|never\s+(?:came|showed(?:\s+up)?|arrived|called(?:\s+(?:me\s+)?back)?)|(?:didn'?t|did\s+not)\s+(?:come|show(?:\s+up)?|arrive|call(?:\s+(?:me\s+)?back)?)|stood\s+(?:me|us)\s+up|waited\s+all\s+(?:day|morning|afternoon)|(?:nobody|no\s+one|no-one)\s+(?:showed|came|called|answered)|complain\w*|ripped\s+off|rip[-\s]?off|scam\w*|refund|lawyer|attorney|sue\b|bbb|better\s+business|manager|supervisor|no[-\s]?show(?:ed)?|never\s+showed|(?:nobody|no\s+one)\s+(?:came|showed|called|answered)|unprofessional|rude|terrible\s+service|worst)\b/i;
 
-// Do-not-knock (2026-10-03, review of Part 14): a complaint about a canvasser
-// at the door is not a sales lead. Door words only: "come to my house" is how a
-// lead turns the VISIT down, and "nobody came" is a missed visit (a complaint).
-const KNOCK_RX = /\b(?:knock(?:ed|ing|s)?|door[-\s]?to[-\s]?door|canvass\w*|solicit\w*|(?:at|on|to|by)\s+(?:my|our)\s+(?:front\s+)?door)\b/i;
-const KNOCK_UPSET_RX = /\b(?:stop|don'?t|do\s+not|never|no\s+more|again|keeps?\s+(?:coming|knocking)|harass\w*|trespass\w*|no\s+soliciting|annoy\w*|bother\w*|rude|aggressive|pushy|leave\s+(?:me|us)\s+alone|not\s+welcome|sign|complain\w*|unprofessional|ridiculous|private\s+property|woke|scared)\b/i;
-const MISSED_VISIT_RX = /\b(?:nobody|no\s+one|no-one|never|didn'?t|did\s+not)\s+(?:came|come|showed|show|arrived?)\b/i;
+// Do-not-knock (2026-10-03): detection lives in do-not-knock.js, shared with
+// the opt-out gate (a door complaint is not a text opt-out).
 export const DNK_ASK_RX = /\bdo[-\s]not[-\s]knock\s+list\b/i;
 // What the next turn reads back from the model's version (Part 7 check).
 const DNK_MARKERS = {
@@ -155,12 +154,6 @@ function nameFromDnkReply(text) {
   return m ? m[1].charAt(0).toUpperCase() + m[1].slice(1).toLowerCase() : null;
 }
 
-/** A homeowner upset about a canvasser at the door. Pure. */
-export function isKnockComplaint(text) {
-  const t = String(text || '');
-  if (!KNOCK_RX.test(t) || MISSED_VISIT_RX.test(t)) return false;
-  return KNOCK_UPSET_RX.test(t) || COMPLAINT_RX.test(t);
-}
 
 const SPOUSE_RX = /\b(?:wife|husband|spouse|partner|fianc[ée]e?)\b/i;
 const SPOUSE_OBJECTION_RX = /\b(?:talk|check|ask|discuss|run\s+(?:it|this))\b[^.?!]{0,40}\b(?:wife|husband|spouse|partner)\b|\b(?:wife|husband|spouse|partner)\b[^.?!]{0,40}\b(?:decides?|has\s+to|needs?\s+to|wants?\s+to|would\s+have\s+to|isn'?t\s+(?:here|home|sure))\b/i;
@@ -1093,7 +1086,8 @@ export function referenceRetryNote(plan, failed = []) {
   const line = plan?.reference_line || plan?.fixed_line || '';
   const keep = referenceRulesText(referenceRules(line, plan?.reference_slots || plan?.slots_to_offer || [], plan));
   return `Your previous draft did not do this turn's job (${failed.join(', ')}). Write it again, in your own words for this lead, ` +
-    `using the reference only as a guide: "${line}". It must ${keep || 'do what the reference does'}.`;
+    `using the reference only as a guide: "${line}". It must ${keep || 'do what the reference does'}.` +
+    (failed.includes('promises_a_call') ? ' Do not say anyone will call them: say a team member will reach out, as the reference does.' : '');
 }
 
 /**
@@ -1115,6 +1109,11 @@ export function checkAgainstReference(draft, line, slots = [], plan = null) {
   if (r.endsWithQuestion && !/\?\s*$/.test(text)) problems.push('no_question');
   if (r.noQuestion && text.includes('?')) problems.push('asks_a_question');
   if (r.promisesTeam && !TEAM_RX.test(text)) problems.push('no_team_follow_up');
+  // A call the reference never promised (post-#1159 replay, 2026-10-03): the
+  // service line "a team member will reach out tomorrow morning" came back as
+  // "we'll have someone … call you … shortly", at night. Service, two no's and
+  // do-not-knock promise no call, and a sent call promise files a Five9 callback.
+  if (promisedCallback(text) && !promisedCallback(line)) problems.push('promises_a_call');
   return problems;
 }
 

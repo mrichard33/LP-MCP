@@ -110,8 +110,8 @@ U.GUIDE also fires on S2.2's `hurricane-guide-queue`, which this gate cannot hol
 
 **Only an opt-out silences the bot (Mark, 2026-09-24).** A classifier handoff tags the contact and,
 where a person must act, pages one — and the bot still replies, unless `handoffReplyPolicy`
-(`src/agentic/handoff-policy.js`) says `silent` (STOP, WRONG_NUMBER) or `workflow` (a GHL workflow
-answers the tag). A new handoff class replies by default. Do not add a silent class without Mark's
+(`src/agentic/handoff-policy.js`) says `silent` (STOP, WRONG_NUMBER; a STOP that is only a door complaint is
+cleared, `classificationAfterKnock`). A new handoff class replies by default. Do not add a silent class without Mark's
 ruling, and never add `stop-bot` to a rule whose trigger is not an opt-out.
 
 **Post-demo F.0 leads talk to the rehash rep (Mark, 2026-10-01).** A contact tagged `active-f.0` (or texting
@@ -380,6 +380,12 @@ silently) and the campaign is PREVIEW mode with a 7-hour gap filter after any ea
 - two no's and a canvasser complaint are reviewed, never dialed (`NO_DIAL_REASONS` in `bot-callback.js`): the two-no's
   line promises no contact, and "stop knocking on my door" (`isKnockComplaint`) gets the do-not-knock flow: the address,
   a name if none, then a **🚪 DO NOT KNOCK** card to the market's #canvass channel and the rollup. No sales call.
+- **"Stop knocking" is not a text opt-out (Mark, 2026-10-03).** `isDNCSignal` read any "stop" as one, so "Please stop
+  knocking on my door" filed a DNC event on SMS and silenced the live chat. A door complaint that names no texts, calls,
+  email or contact (`isKnockNotOptOut`, `src/agentic/do-not-knock.js`) now passes `isDNCSignal`, and the classifier's STOP
+  on it is cleared (`classificationAfterKnock`). A bare STOP or "stop texting me" still opts out.
+- A model reply may not turn a reference's "a team member will reach out" into a promised call
+  (`checkAgainstReference` → `promises_a_call`): the SMS service hand-off said "we'll have someone call you … shortly" at night.
 
 **Book in the conversation, unconfirmed, on the right calendar (Mark, 2026-10-02).** Every bot booking is
 status `new` (the handler forces it). **Ask about decision makers ONCE, then book** (supersedes 2026-09-18):

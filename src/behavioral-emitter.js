@@ -292,6 +292,7 @@
  *   string values that GHL sends when template variables don't resolve.
  */
 
+import { isKnockNotOptOut } from './agentic/do-not-knock.js';
 import { emitEvent } from './event-emitter.js';
 import { upsertLeadIntelligence } from './context-builder.js';
 // The analyze deadline below is derived from the analyzer's own budget, not
@@ -738,8 +739,15 @@ const TRIVIAL_PATTERNS = [
 
 // 2026-09-26 — exported for the live-chat fast lane (src/live-chat/fast-lane.js),
 // which runs the same opt-out check before it answers a chat message.
+//
+// 2026-10-03 (Mark): "Please stop knocking on my door" is a complaint about a
+// canvasser, not a text opt-out. It read as one here, so the SMS webhook filed a
+// DNC event and the live chat went silent, and the do-not-knock flow (address,
+// then the canvass card) never ran. A door complaint that names no texts, calls,
+// email or contact is answered; a bare STOP or "stop texting me" still opts out.
 export function isDNCSignal(text) {
   if (!text) return false;
+  if (isKnockNotOptOut(text)) return false;
   return DNC_PATTERNS.some(p => p.test(text.trim()));
 }
 

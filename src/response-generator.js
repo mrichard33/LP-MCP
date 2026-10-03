@@ -257,7 +257,7 @@
 
 import { buildLeadContext } from './context-builder.js';
 import { classifyInbound, isShortCircuit } from './knowledge/intent-classifier.js';
-import { handoffReplyPolicy, handoffReplyNote } from './agentic/handoff-policy.js';
+import { handoffReplyPolicy, handoffReplyNote, classificationAfterKnock } from './agentic/handoff-policy.js';
 import {
   HURRICANE_GUIDE_TAG, guideAwaitingDelivery, guideResendOps, guideResendReplyNote, guideTagForType,
   lastOutboundOfferedGuide, isGuideAcceptance,
@@ -3352,6 +3352,13 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // src/agentic/handoff-policy.js. The send handler applies the tag and the
   // alert from `handoff` on the result.
   let handoff = null;
+  // A door complaint read as STOP is answered (Mark, 2026-10-03): the planner's
+  // do-not-knock flow asks for the address. Any other STOP stays silent.
+  {
+    const was = classification?.intent_class;
+    classification = classificationAfterKnock(classification, triggerMessage);
+    if (was !== classification?.intent_class) console.log(`[ResponseGenerator] knock_not_opt_out for ${contactId}: STOP cleared ("${String(triggerMessage || '').slice(0, 80)}")`);
+  }
   if (isShortCircuit(classification)) {
     const policy = handoffReplyPolicy(classification);
     if (policy !== 'reply') {

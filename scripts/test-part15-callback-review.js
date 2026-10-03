@@ -206,3 +206,40 @@ test('the sweep holds a push open until Five9 calls, then alerts #contact-center
   assert.equal(out, null);
   assert.equal(posts.length + db.stamped.length, 0);
 });
+
+// ── post-#1159 replay (2026-10-03) ──
+test('a service reply may not turn "a team member will reach out" into a promised call', async () => {
+  const { checkAgainstReference, referenceRetryNote } = await import('../src/agentic/nepq-planner.js');
+  const ref = "Got it. I've passed this to our service team, and a team member will reach out tomorrow morning.";
+  assert.deepEqual(checkAgainstReference("Got it, we'll have someone from our team call you about your install date shortly.", ref), ['promises_a_call']);
+  assert.deepEqual(checkAgainstReference('Thanks. Our service team will reach out tomorrow morning about your install date.', ref), []);
+  // A reference that promises the call allows it.
+  assert.deepEqual(checkAgainstReference('Sure, someone from our team will call you tomorrow at 10 AM ET.', "Got it. I'll have someone from our team call you tomorrow at 10 AM ET."), []);
+  assert.match(referenceRetryNote({ fixed_line: ref }, ['promises_a_call']), /Do not say anyone will call them/);
+});
+
+// ── "stop knocking" is not a text opt-out (Mark, 2026-10-03) ──
+test('a door complaint is answered; a real opt-out still silences', async () => {
+  const { isDNCSignal } = await import('../src/behavioral-emitter.js');
+  const { isKnockNotOptOut } = await import('../src/agentic/do-not-knock.js');
+  for (const t of ['Please stop knocking on my door, your guy was rude', 'stop sending people door to door', 'Your canvassers need to stop coming to my door']) {
+    assert.equal(isKnockNotOptOut(t), true, t);
+    assert.equal(isDNCSignal(t), false, t);
+  }
+  for (const t of ['STOP', 'stop', 'stop texting me', 'stop knocking and stop texting me', 'stop contacting me', 'remove me', 'stop calling me and stop knocking', 'Stop knocking. Leave me alone.']) {
+    assert.equal(isKnockNotOptOut(t), false, t);
+    assert.equal(isDNCSignal(t), true, t);
+  }
+});
+
+test('the classifier\'s STOP on a door complaint is cleared; any other STOP is kept', async () => {
+  const { classificationAfterKnock, handoffReplyPolicy } = await import('../src/agentic/handoff-policy.js');
+  const stop = { intent_class: 'STOP', ghl_handoff_tag: 'hdl:stop', reasoning: 'stop' };
+  const knock = classificationAfterKnock(stop, 'Please stop knocking on my door');
+  assert.equal(handoffReplyPolicy(knock), 'reply');
+  assert.equal(knock.ghl_handoff_tag, null);
+  assert.equal(classificationAfterKnock(stop, 'stop texting me'), stop);
+  assert.equal(classificationAfterKnock(stop, 'STOP'), stop);
+  const wrong = { intent_class: 'WRONG_NUMBER' };
+  assert.equal(classificationAfterKnock(wrong, 'stop knocking on my door'), wrong);
+});
