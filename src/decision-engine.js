@@ -636,7 +636,7 @@ async function hasDuplicatePendingActions(ruleKey, targetId) {
 // LP MULTI-LEAD GUARD — Only newest lead fires rules
 // ═══════════════════════════════════════════════════════════════════
 
-async function isNewestLeadForContact(event) {
+async function isNewestLeadForContact(event, client = supabase) {
   // 2026-09-14 (WO-4a): lp.appointment_rescheduled is guarded too. NOTE there
   // are TWO type checks for this guard — this one and the caller's in
   // processSingleEventInner. Widening only the caller leaves this early return
@@ -650,16 +650,16 @@ async function isNewestLeadForContact(event) {
   if (!ghlContactId || !lpLeadId) return true;
 
   try {
-    const { data, error } = await supabase
-      .from('lp_leads')
-      .select('lp_lead_id, disposition_code')
-      .eq('ghl_contact_id', ghlContactId)
-      .order('created_at_lp', { ascending: false })
-      .limit(1);
+    // 2026-10-04 — judge the CURRENT lead (src/current-lead.js), the same
+    // definition field sync and lp_current_lead_match use. Raw newest-created
+    // let a blank "Data" duplicate bury the lead holding the appointment
+    // (Waleid Mohamed uQSQEsGSmQPygKatHYql: 580183 Set skipped under 580312
+    // Data, so S5.2 never exited on his rebook). fetchCurrentLead throws on a
+    // read error; the catch below keeps the old fail-open behaviour.
+    const current = await fetchCurrentLead(ghlContactId, client);
+    if (!current) return true;
 
-    if (error || !data || data.length === 0) return true;
-
-    const newestLeadId = data[0].lp_lead_id;
+    const newestLeadId = current.lp_lead_id;
     if (String(newestLeadId) !== String(lpLeadId)) {
       // 2026-07-11 — DNC-duplicate carve-out. The "newest lead wins" guard
       // otherwise lets a stale duplicate lead sitting in DNC silently bury a
@@ -669,7 +669,7 @@ async function isNewestLeadForContact(event) {
       // a booking. When the newest lead is DNC and THIS event is a booking
       // disposition, let it through so the booked lead is visible to the
       // DNC-lift + booking rules.
-      const newestDisp = String(data[0].disposition_code || '');
+      const newestDisp = String(current.disposition_code || '');
       const eventDisp = String(event.event_subtype || event.payload?.disposition_code || '');
       if (olderLeadWinsOnAuthority(eventDisp, newestDisp)) {
         console.log(`[MultiLead] ALLOW older lead ${lpLeadId} (${eventDisp}) — newest ${newestLeadId} is ${newestDisp}; authority beats recency`);
@@ -2820,6 +2820,8 @@ export const _internal = {
   // 2026-08-02 — multi-lead appointment-authority policy
   olderLeadWinsOnAuthority,
   BOOKING_AUTHORITY_RANK,
+  // 2026-10-04 — newest-lead guard now reads the current lead
+  isNewestLeadForContact,
   // 2026-08-03 — agentic reply backstop (analyzer-silence incident). Takes an
   // optional deps object so the branch logic is testable without a live DB.
   runReplyBackstopIfAnalyzerSilent,
