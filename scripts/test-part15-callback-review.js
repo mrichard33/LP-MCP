@@ -257,3 +257,23 @@ test('mid do-not-knock flow, the reply is an opt-out only if it says so itself',
   // Outside the flow an address is not cleared.
   assert.equal(classificationAfterKnock(stop, '12 Main St', { lastOutbound: 'What day works best?' }), stop);
 });
+
+// ── post-#1162 replay: the model's own wording of each step ──
+test('do-not-knock reads its steps by meaning: a name ask that mentions the list or the address is still the name ask', async () => {
+  const T = (...pairs) => pairs.map(([d, t]) => ({ direction: d, text: t }));
+  const complaint = ['inbound', 'Please stop knocking on my door, your guy was rude'];
+  // Live chat: the name ask said "added to our do-not-knock list … with that address".
+  const chat = T(complaint, ['outbound', "I'm sorry to hear that. What's the address you'd like us to add to our do-not-knock list?"],
+    ['inbound', '12 Main St, Ocala FL 34470'], ['outbound', 'Got it, added to our do-not-knock list. What name should I put with that address?']);
+  const a = planNepqTurn({ trigger: 'Linda', conversation: chat, nowMs: OPEN_MS });
+  assert.equal(a.handoff?.reason, 'do_not_knock');
+  assert.match(a.handoff.extra, /12 Main St, Ocala FL 34470/);
+  assert.match(a.handoff.extra, /Name: Linda/);
+  // SMS: "that's on our do-not-knock list now. What name should I put with it?" is not the close.
+  const sms = T(complaint, ['outbound', "I'll flag this. What's the address, so I can add it to our do-not-knock list?"],
+    ['inbound', '12 Main St, Ocala FL 34470'], ['outbound', "Thank you, that's on our do-not-knock list now. What name should I put with it?"]);
+  assert.equal(planNepqTurn({ trigger: 'Linda', conversation: sms, nowMs: OPEN_MS }).handoff?.reason, 'do_not_knock');
+  // After the closing line, the flow is over.
+  const closed = [...sms, ...T(['inbound', 'Linda'], ['outbound', "Thanks, Linda. You're on our do-not-knock list for 12 Main St."])];
+  assert.notEqual(planNepqTurn({ trigger: 'thanks', conversation: closed, nowMs: OPEN_MS }).handoff?.reason, 'do_not_knock');
+});

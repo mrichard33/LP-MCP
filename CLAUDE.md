@@ -386,6 +386,9 @@ silently) and the campaign is PREVIEW mode with a 7-hour gap filter after any ea
   on it is cleared (`classificationAfterKnock`). A bare STOP or "stop texting me" still opts out. Mid-flow, the address
   sent to our do-not-knock ask was classified STOP from the thread and got silence: when our last message asked for the
   do-not-knock details, a reply is an opt-out only if it says so itself (`lastOutbound`).
+  The flow reads its own steps by meaning (`isDnkAddressAsk`, `DNK_NAME_ASK_RX`, `isDnkClose`): the model's name ask
+  ("added to our do-not-knock list. What name should I put with that address?") once read as the address ask on chat
+  (the name asked twice) and as the close on SMS (back to discovery).
 - A model reply may not turn a reference's "a team member will reach out" into a promised call
   (`checkAgainstReference` → `promises_a_call`): the SMS service hand-off said "we'll have someone call you … shortly" at night.
 

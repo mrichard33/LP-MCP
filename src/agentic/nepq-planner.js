@@ -141,6 +141,17 @@ const COMPLAINT_RX = /\b(?:supposed\s+to\s+(?:come|show|be\s+(?:here|there)|call
 // Do-not-knock (2026-10-03): detection lives in do-not-knock.js, shared with
 // the opt-out gate (a door complaint is not a text opt-out).
 export const DNK_ASK_RX = /\bdo[-\s]not[-\s]knock\s+list\b/i;
+const DNK_NAME_ASK_RX = /\bwhat\s+name\b/i;
+/** Our do-not-knock address ask (not the name ask, which may mention the address). Pure. */
+function isDnkAddressAsk(text) {
+  const t = String(text || '');
+  return DNK_ASK_RX.test(t) && /\baddress\b[^?]*\?/i.test(t) && !DNK_NAME_ASK_RX.test(t);
+}
+/** Our closing do-not-knock line: about the list, asking for nothing. Pure. */
+function isDnkClose(text) {
+  const t = String(text || '');
+  return DNK_ASK_RX.test(t) && !isDnkAddressAsk(t) && !DNK_NAME_ASK_RX.test(t);
+}
 // What the next turn reads back from the model's version (Part 7 check).
 const DNK_MARKERS = {
   address: [{ rx: DNK_ASK_RX, say: 'name "our do-not-knock list"' }, { rx: /\baddress\b/i, say: 'ask for the address' }],
@@ -613,13 +624,16 @@ export function planNepqTurn({
   //    have none), then the card goes to the canvass team. Never a sales call,
   //    never a visit ask.
   const dnk = (() => {
-    const askIdx = turns.map(t => t.direction === 'outbound' && DNK_ASK_RX.test(t.text) && /\baddress\b/i.test(t.text)).lastIndexOf(true);
-    // Done once we said anything else about the list (the model words it).
-    if (askIdx < 0 || turns.slice(askIdx + 1).some(t => t.direction === 'outbound' && DNK_ASK_RX.test(t.text) && !/\baddress\b/i.test(t.text))) return null;
+    // Our own steps, read by meaning (the model words them; post-#1162 replay,
+    // 2026-10-04): the address ask, the name ask, and the closing line. A name
+    // ask that says "added to our do-not-knock list" or "with that address" is
+    // still the name ask, not the address ask and not the close.
+    const askIdx = turns.map(t => t.direction === 'outbound' && isDnkAddressAsk(t.text)).lastIndexOf(true);
+    if (askIdx < 0 || turns.slice(askIdx + 1).some(t => t.direction === 'outbound' && isDnkClose(t.text))) return null;
     const after = turns.slice(askIdx + 1);
     const complaint = [...turns.slice(0, askIdx)].reverse().find(t => t.direction === 'inbound' && isKnockComplaint(t.text))?.text || '';
     const address = after.find(t => t.direction === 'inbound')?.text || '';
-    const nameAskIdx = after.findIndex(t => t.direction === 'outbound' && /\bwhat\s+name\b/i.test(t.text));
+    const nameAskIdx = after.findIndex(t => t.direction === 'outbound' && DNK_NAME_ASK_RX.test(t.text));
     const nameReply = nameAskIdx >= 0 ? (after.slice(nameAskIdx + 1).find(t => t.direction === 'inbound')?.text || '') : '';
     return { complaint, address, askedName: nameAskIdx >= 0, nameReply };
   })();
