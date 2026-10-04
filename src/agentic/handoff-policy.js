@@ -52,13 +52,26 @@ export function handoffReplyPolicy(classification = {}) {
  * A STOP that is really a door complaint (Mark, 2026-10-03): "Please stop
  * knocking on my door" is answered with the do-not-knock flow, not silence.
  * Only STOP is cleared, and only when the text names no texts, calls, email or
- * contact (isKnockNotOptOut). Pure.
+ * contact (isKnockNotOptOut).
+ *
+ * Mid-flow too (post-#1161 replay, 2026-10-03): the address sent in answer to
+ * our do-not-knock ask ("12 Main St, Ocala FL 34470") was classified STOP from
+ * the thread, and the text bot went silent. When our last message asked for
+ * the do-not-knock details, a reply is an opt-out only if it says so itself.
+ * Pure.
+ *
+ * @param {{ lastOutbound?: string }} [opts]
  */
-export function classificationAfterKnock(classification, text) {
+export function classificationAfterKnock(classification, text, { lastOutbound = '' } = {}) {
   if (String(classification?.intent_class || '').toUpperCase() !== 'STOP') return classification;
-  if (!isKnockNotOptOut(text)) return classification;
+  const inFlow = DNK_FLOW_RX.test(String(lastOutbound || '')) && !OWN_OPT_OUT_RX.test(String(text || ''));
+  if (!isKnockNotOptOut(text) && !inFlow) return classification;
   return { ...classification, intent_class: 'UNCLEAR', ghl_handoff_tag: null, action_type: 'generate_response', reasoning: `knock_not_opt_out (was STOP): ${classification.reasoning || ''}`.slice(0, 300) };
 }
+// Our do-not-knock asks (nepq-planner.js: the address ask, the name ask).
+const DNK_FLOW_RX = /\bdo[-\s]not[-\s]knock\s+list\b|\bwhat\s+name\s+should\s+i\s+put\b/i;
+// The reply opts out by its own words.
+const OWN_OPT_OUT_RX = /\b(?:stop|unsubscribe|opt[\s-]?out|remove\s+me|dnc|do\s+not\s+(?:text|call|contact)|don'?t\s+(?:text|call|contact)|leave\s+(?:me|us)\s+alone|lose\s+my\s+number)\b/i;
 
 const NOTES = {
   // 2026-10-03: a call request is answered by the bot; Five9 makes the call.

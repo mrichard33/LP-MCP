@@ -383,7 +383,9 @@ silently) and the campaign is PREVIEW mode with a 7-hour gap filter after any ea
 - **"Stop knocking" is not a text opt-out (Mark, 2026-10-03).** `isDNCSignal` read any "stop" as one, so "Please stop
   knocking on my door" filed a DNC event on SMS and silenced the live chat. A door complaint that names no texts, calls,
   email or contact (`isKnockNotOptOut`, `src/agentic/do-not-knock.js`) now passes `isDNCSignal`, and the classifier's STOP
-  on it is cleared (`classificationAfterKnock`). A bare STOP or "stop texting me" still opts out.
+  on it is cleared (`classificationAfterKnock`). A bare STOP or "stop texting me" still opts out. Mid-flow, the address
+  sent to our do-not-knock ask was classified STOP from the thread and got silence: when our last message asked for the
+  do-not-knock details, a reply is an opt-out only if it says so itself (`lastOutbound`).
 - A model reply may not turn a reference's "a team member will reach out" into a promised call
   (`checkAgainstReference` → `promises_a_call`): the SMS service hand-off said "we'll have someone call you … shortly" at night.
 

@@ -3356,7 +3356,8 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // do-not-knock flow asks for the address. Any other STOP stays silent.
   {
     const was = classification?.intent_class;
-    classification = classificationAfterKnock(classification, triggerMessage);
+    const lastOutbound = [...(context.conversation_recent || [])].reverse().find(m => m?.direction === 'outbound')?.text || '';
+    classification = classificationAfterKnock(classification, triggerMessage, { lastOutbound });
     if (was !== classification?.intent_class) console.log(`[ResponseGenerator] knock_not_opt_out for ${contactId}: STOP cleared ("${String(triggerMessage || '').slice(0, 80)}")`);
   }
   if (isShortCircuit(classification)) {

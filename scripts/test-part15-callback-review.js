@@ -243,3 +243,17 @@ test('the classifier\'s STOP on a door complaint is cleared; any other STOP is k
   const wrong = { intent_class: 'WRONG_NUMBER' };
   assert.equal(classificationAfterKnock(wrong, 'stop knocking on my door'), wrong);
 });
+
+// ── post-#1161 replay: the address in the do-not-knock flow was classified STOP ──
+test('mid do-not-knock flow, the reply is an opt-out only if it says so itself', async () => {
+  const { classificationAfterKnock, handoffReplyPolicy } = await import('../src/agentic/handoff-policy.js');
+  const { LINES } = await import('../src/agentic/nepq-planner.js');
+  const stop = { intent_class: 'STOP', ghl_handoff_tag: 'hdl:stop' };
+  const ask = "Sorry to hear that. What's the address so I can add it to our do-not-knock list?";
+  assert.equal(handoffReplyPolicy(classificationAfterKnock(stop, '12 Main St, Ocala FL 34470', { lastOutbound: ask })), 'reply');
+  assert.equal(handoffReplyPolicy(classificationAfterKnock(stop, 'Linda', { lastOutbound: LINES.dnk.ask_name })), 'reply');
+  assert.equal(classificationAfterKnock(stop, 'STOP', { lastOutbound: ask }), stop);
+  assert.equal(classificationAfterKnock(stop, "just don't text me", { lastOutbound: ask }), stop);
+  // Outside the flow an address is not cleared.
+  assert.equal(classificationAfterKnock(stop, '12 Main St', { lastOutbound: 'What day works best?' }), stop);
+});
