@@ -276,6 +276,18 @@ export const JOBS = Object.freeze([
     isEnabled: (env) => String(env.SALE_P2_BACKSTOP_MODE || 'shadow').toLowerCase().trim() !== 'off',
   },
   {
+    // 2026-10-04: a sale whose LP lead never got a GHL contact had nowhere for
+    // its P2 card to go (35 in-progress sales). Mirrors saleContactMode() in
+    // src/services/lp-sale-contact-backstop.js: off | shadow (default) | live.
+    id: 'sale-contact-backstop',
+    label: 'Sale → GHL contact backstop',
+    group: 'notifications',
+    cadence: 'every 15 min',
+    enabledEnv: 'SALE_CONTACT_BACKSTOP_MODE',
+    enabledDefault: true,
+    isEnabled: (env) => String(env.SALE_CONTACT_BACKSTOP_MODE || 'shadow').toLowerCase().trim() !== 'off',
+  },
+  {
     // 2026-09-25: last month's final standings, 08:00 ET on the 1st, before
     // every office starts again at $0. Same gate as the daily board, and only
     // in month-to-date mode — the rolling board has no month to close.

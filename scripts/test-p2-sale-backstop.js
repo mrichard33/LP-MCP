@@ -26,9 +26,10 @@ process.env.GHL_API_KEY = process.env.GHL_API_KEY || 'test-ghl-key';
 
 const {
   planForSale, firstSeenMs, findSalesMissingP2, runSaleP2Backstop, backstopMode,
-  p2CoversJob, looksLikeDuplicateOfPaidJob,
-  GRACE_MS, RETAG_WAIT_MS, P2_PIPELINE_ID,
+  p2CoversJob, looksLikeDuplicateOfPaidJob, newContactSettling, quietStampNeeded,
+  GRACE_MS, RETAG_WAIT_MS, P2_PIPELINE_ID, NEW_CONTACT_SETTLE_MS, DATE_CREATED_FIELD, LP_ENTRY_DATE_FIELD,
 } = await import('../src/p2-sale-backstop.js');
+const { SALE_CONTACT_TAG } = await import('../src/services/lp-sale-contact-backstop.js');
 const { lostReasonIdForJobStatus } = await import('../src/lp-lost-reasons.js');
 
 const NOW = Date.parse('2026-10-03T16:00:00Z');
@@ -159,6 +160,10 @@ function fakeDb(tables) {
         gte(k, v) { filters.push((r) => r[field(k)] != null && String(r[field(k)]) >= String(v)); return q; },
         order() { return q; },
         range() { return q; },
+        maybeSingle() {
+          const rows = (tables[table] || []).filter((r) => filters.every((f) => f(r)));
+          return Promise.resolve({ data: rows[0] || null, error: null });
+        },
         then(res, rej) {
           return Promise.resolve({ data: (tables[table] || []).filter((r) => filters.every((f) => f(r))), error: null }).then(res, rej);
         },
@@ -373,4 +378,43 @@ test('run: off does nothing at all', async () => {
 
 test('grace constant: the normal path gets at least 30 minutes', () => {
   assert.ok(GRACE_MS >= 30 * 60_000);
+});
+
+// ── 2026-10-04: contacts the sale-contact backstop created ──────────────────
+
+test('settle: a just-created sale-backstop contact is left alone for 10 minutes', () => {
+  const fresh = { ...contact([SALE_CONTACT_TAG]), dateAdded: iso(NOW - 5 * 60_000) };
+  const settled = { ...contact([SALE_CONTACT_TAG]), dateAdded: iso(NOW - NEW_CONTACT_SETTLE_MS - 1) };
+  assert.equal(newContactSettling(fresh, NOW), true);
+  assert.equal(newContactSettling(settled, NOW), false);
+  assert.equal(newContactSettling({ ...contact([]), dateAdded: iso(NOW) }, NOW), false, 'only our own new contacts wait');
+  assert.deepEqual(planForSale({ verdict: 'live', job: liveJob, p2Opps: [], contact: fresh, nowMs: NOW }), { action: 'wait', reason: 'new_contact_settling' });
+});
+
+test('quiet: only a sale-backstop contact whose sale is older than C.0\'s 90 days', () => {
+  const ours = contact([SALE_CONTACT_TAG]);
+  assert.equal(quietStampNeeded({ contact: ours, contractDate: '2026-04-08T00:00:00', nowMs: NOW }), true);
+  assert.equal(quietStampNeeded({ contact: ours, contractDate: '2026-09-20T00:00:00', nowMs: NOW }), false, 'a fresh sale still gets onboarding');
+  assert.equal(quietStampNeeded({ contact: contact([]), contractDate: '2026-04-08T00:00:00', nowMs: NOW }), false);
+});
+
+test('run: a quiet sale has its entry dates back-dated BEFORE deal-won, a normal one never', async () => {
+  const { deps, ghlCalls, tables } = world();
+  tables.lp_jobs.push({ lp_job_id: '57506', lp_lead_id: 'L9', ghl_contact_id: 'c-old', job_status: 'Awaiting Product', job_value: 121209, contractdate: '2026-04-07T00:00:00' });
+  tables.lp_leads.push({ lp_lead_id: 'L9', ghl_contact_id: 'c-old', created_at_lp: '2026-03-20T09:00:00' });
+  const inner = deps.ghlFetch;
+  deps.ghlFetch = async (method, path, body) => (method === 'GET' && path === '/contacts/c-old'
+    ? (ghlCalls.push({ method, path, body }), { contact: { ...contact([SALE_CONTACT_TAG]), dateAdded: iso(NOW - HOUR) } })
+    : inner(method, path, body));
+  const jfc = deps.jobsForContact;
+  deps.jobsForContact = async (cid) => (cid === 'c-old' ? { jobs: tables.lp_jobs.filter((j) => j.ghl_contact_id === 'c-old'), leads: [], error: null } : jfc(cid));
+  const r = await runSaleP2Backstop({ mode: 'live', deps, nowMs: NOW, sinceDay: '2026-01-01', logger: quiet });
+  assert.equal(r.ok, true);
+  const put = ghlCalls.findIndex((c) => c.method === 'PUT' && c.path === '/contacts/c-old');
+  const tag = ghlCalls.findIndex((c) => c.method === 'TAG' && c.path === 'c-old');
+  assert.ok(put >= 0 && tag > put, 'the stamp lands before the tag');
+  assert.deepEqual(ghlCalls[put].body.customFields, [
+    { id: DATE_CREATED_FIELD, field_value: '2026-03-20' }, { id: LP_ENTRY_DATE_FIELD, field_value: '2026-03-20' },
+  ]);
+  assert.ok(!ghlCalls.some((c) => c.method === 'PUT' && c.path === '/contacts/c-tag'), 'an ordinary contact is never back-dated');
 });

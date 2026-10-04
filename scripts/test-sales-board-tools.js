@@ -12,6 +12,7 @@ import {
   makeAnnounceMissedSale,
   registerSalesBoardTools,
   makeSaleP2BackstopRun,
+  makeSaleContactBackstopRun,
 } from '../src/tools/sales-board-tools.js';
 import { RECENT_APPT_MS } from '../src/notifications/sale-backstop.js';
 
@@ -145,7 +146,9 @@ test('every tool registers and defaults to dry run', async () => {
   const tools = {};
   registerSalesBoardTools({ tool: (name, _d, schema) => { tools[name] = schema; } });
   // 2026-10-03: sale_p2_backstop_run added (the Sale → P2 backfill).
-  assert.deepEqual(Object.keys(tools).sort(), ['announce_missed_sale', 'post_office_power_ranking', 'sale_p2_backstop_run']);
+  // 2026-10-04: sale_contact_backstop_run added (a GHL contact for every LP sale).
+  assert.deepEqual(Object.keys(tools).sort(), ['announce_missed_sale', 'post_office_power_ranking', 'sale_contact_backstop_run', 'sale_p2_backstop_run']);
+  assert.equal(tools.sale_contact_backstop_run.dry_run.parse(undefined), true);
   assert.equal(tools.post_office_power_ranking.dry_run.parse(undefined), true);
   assert.equal(tools.announce_missed_sale.dry_run.parse(undefined), true);
   assert.equal(tools.sale_p2_backstop_run.dry_run.parse(undefined), true);
@@ -169,4 +172,16 @@ test('sale_p2_backstop_run: dry run is shadow mode; a real run is live with the 
   assert.deepEqual(calls[1], { mode: 'live', sinceDay: '2026-08-01', maxActions: 100 });
   await tool({ dry_run: false, since: '2025-09-01', only: ['tag_deal_won', 'create_open'] });
   assert.deepEqual(calls[2].onlyActions, ['tag_deal_won', 'create_open']);
+});
+
+test('sale_contact_backstop_run: dry run is shadow; lead_ids and since pass through', async () => {
+  const calls = [];
+  const run = async (opts) => { calls.push(opts); return { ok: true, summary: 's', counts: { would_create: 1 }, deferred: 0,
+    results: [{ lp_lead_id: '474939', job_id: '55657', job_status: 'Product Received', name: 'W Perez', outcome: 'would_create' }] }; };
+  const tool = makeSaleContactBackstopRun({ run });
+  const dry = await tool({});
+  assert.equal(calls[0].mode, 'shadow');
+  assert.deepEqual(dry.sales.map((s) => [s.lp_lead_id, s.outcome]), [['474939', 'would_create']]);
+  await tool({ dry_run: false, since: '2024-11-01', lead_ids: [474939], max_actions: 40 });
+  assert.deepEqual(calls[1], { mode: 'live', sinceDay: '2024-11-01', maxPerRun: 40, leadIds: ['474939'] });
 });
