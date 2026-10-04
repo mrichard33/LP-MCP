@@ -8,6 +8,8 @@
  *   sale_p2_backstop_run       (2026-10-03) put every recent LP sale with no P2
  *                              opportunity into P2 — the one-time backfill and
  *                              an on-demand pass of src/p2-sale-backstop.js
+ *   sale_contact_backstop_run  (2026-10-04) give every LP sale with no GHL
+ *                              contact one, so its P2 card has somewhere to go
  *
  * WHY THESE EXIST. Both automatic paths have a window, and on 2026-09-25 a
  * post fell outside each one:
@@ -43,6 +45,7 @@ import {
 } from '../notifications/sale-backstop.js';
 
 import { runSaleP2Backstop } from '../p2-sale-backstop.js';
+import { runSaleContactBackstop } from '../services/lp-sale-contact-backstop.js';
 
 const text = (obj) => ({ content: [{ type: 'text', text: JSON.stringify(obj, null, 2) }] });
 
@@ -148,7 +151,45 @@ export function makeSaleP2BackstopRun(deps = {}) {
   };
 }
 
+/**
+ * 2026-10-04: give LP sales with no GHL contact one. Same code as the 15-minute
+ * job; `since` widens the window for a backfill, `lead_ids` names leads.
+ * Dry run by default: shadow searches GHL and writes nothing.
+ */
+export function makeSaleContactBackstopRun(deps = {}) {
+  const { run = runSaleContactBackstop } = deps;
+  return async ({ dry_run = true, since = null, lead_ids = null, max_actions = 25 } = {}) => {
+    const res = await run({
+      mode: dry_run ? 'shadow' : 'live', sinceDay: since || null, maxPerRun: max_actions,
+      ...(Array.isArray(lead_ids) && lead_ids.length ? { leadIds: lead_ids.map(String) } : {}),
+    });
+    return {
+      ok: res.ok, dry_run, summary: res.summary || res.skipped || res.error || null,
+      counts: res.counts || {}, deferred: res.deferred ?? 0,
+      sales: (res.results || []).map((r) => ({
+        lp_lead_id: r.lp_lead_id, lp_job_id: r.job_id, job_status: r.job_status, name: r.name,
+        outcome: r.outcome, contact_id: r.contact_id || null, email_dropped: r.email_dropped || false, error: r.error || null,
+      })),
+    };
+  };
+}
+
 export function registerSalesBoardTools(server, deps = {}) {
+  server.tool(
+    'sale_contact_backstop_run',
+    'Give every LP sale whose lead has no GHL contact a contact (find by phone first, create only if none), and link it, '
+      + 'so the Sale → P2 backstop can add its P2 card. Customer tags only (never the new-lead tags); an email another '
+      + 'contact already holds is not copied. Dry run by default. `since` (YYYY-MM-DD) widens the window (default last '
+      + '45 days); `lead_ids` limits the run to named LP leads.',
+    {
+      dry_run: z.boolean().optional().default(true).describe('true (default) previews only; false writes to GHL'),
+      since: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe('contract dates on or after this day'),
+      lead_ids: z.array(z.string()).optional().describe('only these LP lead ids'),
+      max_actions: z.number().int().min(1).max(200).optional().default(25),
+    },
+    async (args) => text(await makeSaleContactBackstopRun(deps)(args)),
+  );
+
   server.tool(
     'sale_p2_backstop_run',
     'Find every recent LP sale with no GHL Pipeline 2 (Client Lifecycle) opportunity and put it there: adds deal-won '

@@ -171,6 +171,27 @@ async function p2BackstopSection(deps, nowMs) {
   return { title: `Sales put into P2 by the backstop (24h)`, lines, record };
 }
 
+// 2026-10-04: sales the sale-contact backstop (src/services/lp-sale-contact-backstop.js)
+// gave a GHL contact in the last 24h. Their P2 card follows on the Sale → P2 pass.
+async function saleContactSection(deps, nowMs) {
+  const since = new Date(nowMs - DAY_MS).toISOString();
+  const { data, error } = await deps.supabase.from('system_events')
+    .select('ghl_contact_id, event_subtype, payload')
+    .eq('event_type', 'lp.sale_contact_backstop')
+    .gte('created_at', since);
+  if (error) throw new Error(`sale contact backstop read failed: ${error.message}`);
+  const rows = data || [];
+  if (!rows.length) return null;
+  const names = await loadNames(deps, rows.map((r) => r.ghl_contact_id));
+  const lines = [];
+  for (const [sub, label] of [['created', 'contact created'], ['linked', 'linked to an existing contact']]) {
+    const who = [...new Set(rows.filter((r) => r.event_subtype === sub).map((r) => nameOf(names, r.ghl_contact_id)))];
+    if (who.length) lines.push(`${label}: ${who.length} — ${who.slice(0, SECTION_MAX).join(', ')}${who.length > SECTION_MAX ? ` +${who.length - SECTION_MAX} more` : ''}`);
+  }
+  if (!lines.length) return null;
+  return { title: 'Sales given a GHL contact (24h)', lines };
+}
+
 async function paritySection(deps, nowMs) {
   const since = new Date(nowMs - DAY_MS).toISOString();
   const { data, error } = await deps.supabase.from('alert_conditions')
@@ -287,7 +308,7 @@ export async function runOpsMorningDigest({ post = true, deps: depsArg } = {}) {
     if (post) await deps.sendAlertMessage(`⚠️ ${label} could not run: ${error}`, { channel: 'ops' });
   };
 
-  for (const [label, build] of [['P2 won/lost summary', p2Section], ['Sale → P2 backstop summary', p2BackstopSection], ['Appointment parity summary', paritySection]]) {
+  for (const [label, build] of [['P2 won/lost summary', p2Section], ['Sale → P2 backstop summary', p2BackstopSection], ['Sale → contact backstop summary', saleContactSection], ['Appointment parity summary', paritySection]]) {
     try { sections.push(await build(deps, nowMs)); } catch (err) { await couldNotRun(label, err.message); }
   }
 

@@ -220,6 +220,20 @@ after a 30-minute grace:
   replaced (written later, or within 10% in value within 60 days) is listed for review, never added
   (`looksLikeDuplicateOfPaidJob`). A terminal job on a contact that already has a card never gets a second one.
 
+**A sale with no GHL contact gets one (2026-10-04).** 35 in-progress sales (~$900k) had no GHL contact, so the
+backstop above skipped them silently. `src/services/lp-sale-contact-backstop.js` (job `sale-contact-backstop`, every
+15 min, `SALE_CONTACT_BACKSTOP_MODE` off|shadow|live, default shadow; MCP tool `sale_contact_backstop_run`) finds or
+creates the contact for every non-cancelled sale in the window whose lead has none, through `resolveOrCreateContact`,
+and links the lead (`ghl_link_source='sale_backstop'`). It is a CUSTOMER contact: source tags + `lp-sale-backstop`,
+never `lp-backstop-created` (INTAKE_ROUTE_BACKSTOP_E0 routes those to the new-lead router) or `stage:new-lead`, no
+disposition emit, and no email another contact already holds. The P2 card then comes from the backstop above, which
+waits 10 minutes on such a contact (`newContactSettling`) and, for a sale older than 90 days, back-dates "Date
+Created" and "LP Entry Date" to the LP entry date first (`quietStampNeeded`): GHL's I.AC sets "Date Created" to
+today on every new contact, and C.0 Customer Onboarding only exits as "Stale Lead" when both are 90+ days old (user
+ruling: the old sales go in without onboarding). `matchToGHL` refuses an email-only match whose contact has a
+different phone (`emailMatchConflicts`): a canvasser's placeholder email had put LP lead 474939's sale on another
+homeowner's contact.
+
 The on-demand run is the MCP tool `sale_p2_backstop_run` (dry run by default; `only` limits a backfill to some write
 kinds, so a wide `since` can fill live jobs without minting Won/Lost cards for sales finished before P2 existed). Do not revive the `deal-won`
 half of `checkLeadTriggers`: its filter never matched, and a "fixed" one would onboard every historical

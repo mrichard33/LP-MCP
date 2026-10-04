@@ -174,6 +174,22 @@ export async function searchGHLContact(params) {
   }
 }
 
+/**
+ * 2026-10-04: an email-only match is refused when the GHL contact has a phone
+ * and it is none of the lead's numbers. Shared placeholder emails (a canvasser's
+ * own address on 32 contacts, noemail@gmail.com, fake@gmail.com) bound six sold
+ * LP leads to OTHER homeowners' contacts — LP lead 474939's in-progress sale
+ * landed on a different person's contact and started her customer onboarding.
+ * A contact with no phone still links on email: there is nothing to disagree.
+ */
+export function emailMatchConflicts(lpLead, contact) {
+  const last10 = (p) => String(p || '').replace(/\D/g, '').slice(-10);
+  const theirs = last10(contact?.phone);
+  if (theirs.length < 10) return false;
+  const ours = [lpLead?.phone, lpLead?.phone_alt].map(last10).filter((p) => p.length === 10);
+  return ours.length > 0 && !ours.includes(theirs);
+}
+
 export async function matchToGHL(lpLead) {
   if (ghlDisabled || !ghlClient) return null;
   if (lpLead.phone) {
@@ -186,6 +202,10 @@ export async function matchToGHL(lpLead) {
   }
   if (lpLead.email) {
     const contact = await searchGHLContact({ email: lpLead.email.toLowerCase() });
+    if (contact && emailMatchConflicts(lpLead, contact)) {
+      console.warn(`[GHL] REJECTED email-only match ${contact.id} for LP lead ${lpLead.lp_lead_id || '?'} — the contact's phone is not the lead's`);
+      return null;
+    }
     if (contact) return contact.id;
   }
   return null;

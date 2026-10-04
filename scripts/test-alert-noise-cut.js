@@ -247,6 +247,21 @@ test('digest: Sale → P2 backstop fixes are counted; a no-price sale is named o
   assert.match(again.sent[0].text, /All clear\./);
 });
 
+// 2026-10-04: sales the sale-contact backstop gave a GHL contact are counted in the digest.
+test('digest: sales given a GHL contact are listed', async () => {
+  const tables = {
+    system_events: [
+      { event_type: 'lp.sale_contact_backstop', event_subtype: 'created', ghl_contact_id: 'k1', created_at: iso(NOW - 2 * HOUR), payload: {} },
+      { event_type: 'lp.sale_contact_backstop', event_subtype: 'linked', ghl_contact_id: 'k2', created_at: iso(NOW - 3 * HOUR), payload: {} },
+    ],
+  };
+  const { deps, sent } = digestDeps({ tables, names: { k1: 'Walberto Perez', k2: 'John Pitzer' } });
+  await digest.runOpsMorningDigest({ post: true, deps });
+  assert.match(sent[0].text, /Sales given a GHL contact \(24h\)/);
+  assert.match(sent[0].text, /contact created: 1 — Walberto Perez/);
+  assert.match(sent[0].text, /linked to an existing contact: 1 — John Pitzer/);
+});
+
 test('digest: a sub-job that fails posts its own "could not run" card; the digest still posts', async () => {
   const jobs = { 'lead-leak-monitor': { status: 'failed', error: 'Five9 history read failed' } };
   const { deps, sent } = digestDeps({ jobs });

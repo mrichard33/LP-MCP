@@ -61,6 +61,7 @@ import { decidingJob, OPP_CF_LP_JOB_ID, readOppJobId } from './p2-opportunity-co
 import { WON_JOB_STATUSES } from './lp-job-terminal.js';
 import { lostReasonIdForJobStatus } from './lp-lost-reasons.js';
 import { PIPELINE_IDS, STAGE_MAP, GHL_LOCATION_ID } from './actions/constants.js';
+import { SALE_CONTACT_TAG } from './services/lp-sale-contact-backstop.js';
 
 export const P2_PIPELINE_ID = PIPELINE_IDS.P2;
 export const CONTRACT_SIGNED_STAGE = 'Contract Signed';
@@ -82,6 +83,39 @@ export const MAX_ACTIONS = 25;
 export const NO_ONBOARDING_TAGS = Object.freeze([
   'stop-bot', 'dnc', 'lp-dnc', 'stage:dnc', 'suppress-outbound', 'dnc-sms', 'dnc-voice', 'dnc-email',
 ]);
+
+/**
+ * 2026-10-04: a contact the sale-contact backstop just created gets this long
+ * before anything here touches it. GHL's I.AC workflow writes "Date Created" =
+ * today a few seconds after any contact is created; the quiet stamp below must
+ * land after that, never before.
+ */
+export const NEW_CONTACT_SETTLE_MS = 10 * 60 * 1000;
+/** C.0 Customer Onboarding exits when both entry dates are older than this. */
+export const QUIET_AFTER_DAYS = 90;
+// C.0 Customer Onboarding's "Stale Lead" branch reads these two contact fields.
+export const DATE_CREATED_FIELD = 'sKFUjCKYgCdD0KQiQGo2';
+export const LP_ENTRY_DATE_FIELD = '5wa3f6WZJ6xVnAklUYhC';
+
+/** Pure. A just-created sale-backstop contact that GHL is still setting up. */
+export function newContactSettling(contact, nowMs) {
+  if (!tagsOf(contact).includes(SALE_CONTACT_TAG)) return false;
+  const added = Date.parse(contact?.dateAdded || '');
+  return Number.isFinite(added) && nowMs - added < NEW_CONTACT_SETTLE_MS;
+}
+
+/**
+ * Pure. Should this sale go into P2 without onboarding? Only a contact the
+ * sale-contact backstop created (an old customer GHL never knew) for a sale
+ * older than C.0's own staleness window. User ruling 2026-10-04: the 35 sales
+ * backfilled from Nov 2024 – Apr 2026 go in quietly. A fresh sale whose
+ * contact is created late still gets onboarding, like any other sale.
+ */
+export function quietStampNeeded({ contact, contractDate, nowMs }) {
+  if (!tagsOf(contact).includes(SALE_CONTACT_TAG)) return false;
+  const signed = Date.parse(String(contractDate || '').slice(0, 10));
+  return Number.isFinite(signed) && nowMs - signed > QUIET_AFTER_DAYS * DAY_MS;
+}
 
 const MODES = new Set(['off', 'shadow', 'live']);
 export function backstopMode(env = process.env) {
@@ -207,6 +241,8 @@ export function planForSale({ verdict, job, p2Opps, contact, taggedAtMs = null, 
     // already on the contact, and C.0-IN's find-opportunity step picks the old card.
     return { action: 'report', reason: 'repeat_customer_one_card_limit' };
   }
+
+  if (newContactSettling(contact, nowMs)) return { action: 'wait', reason: 'new_contact_settling' };
 
   if (verdict === 'terminal_lost') {
     return lostReasonIdForJobStatus(job.job_status)
@@ -405,6 +441,7 @@ export async function findSalesMissingP2(deps) {
       job: { lp_job_id: String(job.lp_job_id), lp_lead_id: recent.lp_lead_id ?? null, job_status: job.job_status, job_value: jobValue(job), contractdate: recent.contractdate },
       verdict,
       plan,
+      quiet: quietStampNeeded({ contact, contractDate: recent.contractdate, nowMs }),
       firstSeenAt: new Date(seen).toISOString(),
     });
   }
@@ -435,8 +472,38 @@ async function createCard({ deps, sale, status }) {
   return { opportunityId, contact };
 }
 
+/**
+ * Back-date a quiet sale's entry dates to when the customer entered LP, so C.0
+ * Customer Onboarding takes its own "Stale Lead" exit when the P2 card appears.
+ * Both fields are true for the person; only I.AC's "today" was wrong for them.
+ */
+async function stampQuietEntryDates(sale, deps) {
+  let entered = null;
+  if (deps.supabase && sale.job.lp_lead_id != null) {
+    const { data } = await deps.supabase.from('lp_leads').select('created_at_lp')
+      .eq('lp_lead_id', String(sale.job.lp_lead_id)).maybeSingle();
+    entered = data?.created_at_lp || null;
+  }
+  const contract = String(sale.job.contractdate || '').slice(0, 10);
+  let day = String(entered || '').slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day) || day > contract) day = contract;
+  await deps.ghlFetch('PUT', `/contacts/${sale.contactId}`, {
+    customFields: [{ id: DATE_CREATED_FIELD, field_value: day }, { id: LP_ENTRY_DATE_FIELD, field_value: day }],
+  });
+  return day;
+}
+
 async function act(sale, deps, { runId }) {
   const { plan } = sale;
+  // Stamp BEFORE the write that makes the card: C.0 reads the dates the moment
+  // the card is created. A failed stamp fails the write; the next pass retries.
+  if (sale.quiet && WRITES.has(plan.action)) {
+    try {
+      await stampQuietEntryDates(sale, deps);
+    } catch (err) {
+      return { ok: false, error: `quiet stamp failed: ${err.message}` };
+    }
+  }
   switch (plan.action) {
     case 'tag_deal_won': {
       const ok = await deps.applyGHLTag(sale.contactId, DEAL_WON_TAG);
