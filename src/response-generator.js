@@ -265,6 +265,7 @@ import {
 import { notInterestedTurn } from './agentic/not-interested.js';
 import { humanizeReply, restoreQuestionMark } from './agentic/human-voice.js';
 import { enforceTeamVoice } from './agentic/team-voice.js';
+import { enforcePropertyScope } from './agentic/property-scope.js';
 import { enforceCallTiming, softenCallTiming, isTeamOpen } from './agentic/team-hours.js';
 import { enforceOneAsk } from './agentic/one-ask.js';
 import { findUnbackedBookingClaim, rewriteBookingClaims, bookingClaimNote } from './agentic/booking-claim.js';
@@ -4734,6 +4735,20 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       validated.message = cut.replace(/\s+([.,!?])/g, '$1').replace(/\s{2,}/g, ' ').trim();
       console.warn(`[ResponseGenerator] timeline promise in escalation acknowledgment for ${contactId}: ${promises.join(', ')} — removed`);
       draftPatch('timeline_promise', `Your previous draft promised when a person would respond (${promises.join(', ')}). Acknowledge without any timeline.`);
+    }
+  }
+
+  // ─── Property scope (2026-10-05) ───
+  // We do not work on manufactured or mobile homes; the live chat said we
+  // did. Last of the text guards, so no later pass (the NEPQ discovery
+  // question, a booking ask) lands on top of the "no". Every channel, email
+  // included: it is a fact, not a voice rule. A lead who asked gets no visit.
+  {
+    const scope = enforcePropertyScope(validated.message, { inbound: triggerMessage });
+    if (scope.changed) {
+      console.warn(`[PropertyScope] ${contactId} ${scope.reason}`);
+      validated.message = scope.text;
+      if (scope.reason === 'lead_asked' && validated.companion_action?.action_type === 'book_appointment') validated.companion_action = null;
     }
   }
 
