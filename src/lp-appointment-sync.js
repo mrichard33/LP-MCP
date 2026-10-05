@@ -249,7 +249,7 @@ import { lpStoredAgeMinutes, lpStoredToUtcMs } from './lp-dates.js';
 import { postToSlack } from './slack.js';
 import { sendAlertMessage } from './alert-state.js';
 import { filterNew, recordPosted } from './alert-posted.js';
-import { isTeamOpen } from './agentic/team-hours.js';
+import { openMinutesSince } from './agentic/team-hours.js';
 import { LP_EMP } from './lp-source-ids.js';
 import { buildLpAppointmentCard } from './services/appointment-card.js';
 import { trackBackground } from './graceful-shutdown.js';
@@ -1611,26 +1611,38 @@ const HELD_INBOUND_SOON_MS = 24 * 60 * 60 * 1000;
 const HELD_INBOUND_MIN_AGE_MIN = 30;
 const HELD_INBOUND_AUDIT = 'lp_inbound_held';
 
+// 2026-10-05 (the user, same day as #1166): no card the moment the team opens.
+// Staff work the overnight queue first thing — Crystal imported row 428372 at
+// 9:58 AM, 34 minutes after the 9:24 card. The card is for a row that is STILL
+// waiting after the team has been open this long (openMinutesSince).
+function heldImportAlertOpenMin(env = process.env) {
+  const n = Number(env.LP_HELD_IMPORT_ALERT_OPEN_MIN);
+  return Number.isFinite(n) && n >= 0 ? n : 60;
+}
+
 /**
  * Should a held row be put in front of a person now? PURE.
  *
  *   escalate       post the card now
- *   wait_for_team  it needs a person, but nobody is in — the next re-drive in
- *                  team hours posts it (the watchdog re-runs every 30 min)
+ *   wait_for_team  it needs a person, but the team is closed or has not been
+ *                  open `openMinNeeded` minutes since it arrived — a later
+ *                  re-drive posts it (the watchdog re-runs every 30 min)
  *   none           LP is still within its normal window, nothing to say yet
  *
  * Due when the row is stale (today's 360-min rule) OR an appointment within the
  * next 24h is waiting on a row at least 30 min old. An unknown age is never due
  * (fail-open, matching inboundDeferDecision).
  */
-function heldInboundEscalation({ ageMin, maxAgeMin, apptStartMs, nowMs = Date.now(), teamOpen }) {
+function heldInboundEscalation({
+  ageMin, maxAgeMin, apptStartMs, nowMs = Date.now(), openMin, openMinNeeded = heldImportAlertOpenMin(),
+}) {
   if (ageMin == null) return 'none';
   const stale = ageMin > maxAgeMin;
   const soon = Number.isFinite(apptStartMs)
     && ageMin >= HELD_INBOUND_MIN_AGE_MIN
     && apptStartMs - nowMs <= HELD_INBOUND_SOON_MS;
   if (!stale && !soon) return 'none';
-  return teamOpen ? 'escalate' : 'wait_for_team';
+  return Number(openMin) >= openMinNeeded ? 'escalate' : 'wait_for_team';
 }
 
 /** ET wall-clock appointment (YYYY-MM-DD + HH:MM) → epoch ms, or null. */
@@ -1998,14 +2010,15 @@ async function syncAppointmentToLP({
           );
           // A held row needs a person to import it in LP; the watchdog alone
           // retries forever. 2026-10-05 (row 428372): post ONE card to
-          // #contact-center as soon as a visit within a day waits on it, in team
-          // hours — not a GroupMe page at the 360-min mark in the middle of the
+          // #contact-center when a visit within a day still waits on it after the team
+          // has been open an hour — not a GroupMe page at the 360-min mark in the middle of the
           // night. See the "Held-row escalation" banner above. The Slack post is
           // checked (postToSlack returns ok), and a failure is an #ops-alerts line.
           const apptStartMs = apptStartMsET(incomingDateNorm, incomingTimeNorm);
           const nowMs = Date.now();
           const escalation = heldInboundEscalation({
-            ageMin: pending.ageMin, maxAgeMin, apptStartMs, nowMs, teamOpen: isTeamOpen(nowMs),
+            ageMin: pending.ageMin, maxAgeMin, apptStartMs, nowMs,
+            openMin: openMinutesSince(nowMs - (pending.ageMin ?? 0) * 60000, nowMs),
           });
           let escalated = null;
           if (escalation === 'escalate') {
@@ -2015,7 +2028,7 @@ async function syncAppointmentToLP({
               apptStartMs, timeKnown: Boolean(incomingTimeNorm), calendarName, contactId,
             }), pending.inboundId);
           } else if (escalation === 'wait_for_team') {
-            console.log(`[LP-APPT] held row ${pending.inboundId || '?'} needs importing — card waits for team hours`);
+            console.log(`[LP-APPT] held row ${pending.inboundId || '?'} needs importing — card waits until the team has been open ${heldImportAlertOpenMin()} min`);
           }
           // Deliberately NO dedup mark and NO lp-appt-synced tag: LP does not
           // hold this appointment yet, and the watchdog must be free to retry.

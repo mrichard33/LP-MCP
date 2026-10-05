@@ -44,6 +44,22 @@ export function isTeamOpen(nowMs = Date.now()) {
   return hour >= h.open && hour < h.close;
 }
 
+/**
+ * Minutes the team has been open AND this item has been waiting: the smaller of
+ * "since today's opening" and "since it arrived". 0 while the team is closed.
+ * A row that arrived overnight starts counting at opening; one that arrived at
+ * 11 AM starts counting at 11 AM. (2026-10-05, the user: a held-row card should
+ * go out only after we have been open about an hour and the row is still not
+ * imported — not the moment the doors open.)
+ */
+export function openMinutesSince(receivedMs, nowMs = Date.now()) {
+  if (!isTeamOpen(nowMs)) return 0;
+  const { dow, hour } = etClock(nowMs);
+  const sinceOpen = (hour - TEAM_HOURS[dow].open) * 60;
+  const sinceArrival = Number.isFinite(receivedMs) ? (nowMs - receivedMs) / 60000 : sinceOpen;
+  return Math.max(0, Math.floor(Math.min(sinceOpen, sinceArrival)));
+}
+
 function hourLabel(h) {
   const hh = Math.floor(h);
   return `${hh % 12 || 12} ${hh < 12 ? 'AM' : 'PM'}`;
