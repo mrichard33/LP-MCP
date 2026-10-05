@@ -704,11 +704,13 @@ single-hung** (Mark, 2026-09-26) and KB-02 now leads with it. The same trap appl
 silence. Note that `reece-product-knowledge`, the skill KB-02 was written from, still never mentions
 single-hung; that skill is synced and Mark's to edit, so it is not the place to look this up.
 
-**We do NOT work on manufactured or mobile homes (2026-10-05).** The live chat told a visitor "Yes, we work on
-manufactured homes": the fact sat only in `kb_proof_points`, which the reply writer never sees. It is now in the
-shared system prompt, FAQ `LIB-P13`, and `enforcePropertyScope` (`src/agentic/property-scope.js`), the last pass in
-both bots: a lead who mentions one gets the "no" as the whole reply, and any "we do" sentence is replaced. Modular
-homes are not ruled on and are deliberately not covered.
+**Homes we cannot work on: manufactured/mobile homes, and buildings over two stories (2026-10-05).** The live
+chat told a visitor "Yes, we work on manufactured homes" and answered "Do you service a 9 story condominium?" with
+"Yes … Is this for all nine floors?". Neither limit was in the reply writer's view (`kb_proof_points` is not, and the
+live chat never runs `DQ_ABOVE_2ND_FLOOR_INTERIM`). Both are now in the shared system prompt, FAQs `LIB-P13` /
+`LIB-P14`, and `enforcePropertyScope` (`src/agentic/property-scope.js`), the last pass in both bots: a lead who raises
+one gets the "no" as the whole reply, and any "we do" sentence is replaced. The building counts, not the unit. Modular
+homes are not ruled on and are deliberately not covered; "tower" alone and "4 floor-to-ceiling windows" do not count.
 
 **Retiring a FAQ without a replacement leaves a hole the search fills with the nearest thing.**
 Retiring `#14` (roofing) during the golden ingest left no roofing answer at all, and a live lead

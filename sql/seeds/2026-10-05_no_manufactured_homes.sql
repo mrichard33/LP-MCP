@@ -23,10 +23,18 @@
 INSERT INTO kb_faqs (kb_key, question_pattern, canonical_answer, answer_short, channel, tier, active, notes)
 SELECT 'LIB-P13',
        $$Do you work on manufactured homes? | Do you do mobile homes? | Can you put windows in a mobile home? | I have a manufactured home | Do you work on double wides? | Do you install in trailer homes?$$,
-       $$No, we don't work on manufactured or mobile homes, sorry about that. We specialize in single-family homes, townhomes, and condos.$$,
+       $$No, we don't work on manufactured or mobile homes, sorry about that. We specialize in single-family homes, townhomes, and condos in buildings up to two stories.$$,
        NULL, 'both', 'factual', true,
        $$Scope boundary (2026-10-05): Reece does NOT work on manufactured or mobile homes. Never imply we do. Added after the live chat told a visitor "Yes, we work on manufactured homes." Modular homes are not ruled on and are not covered here.$$
 WHERE NOT EXISTS (SELECT 1 FROM kb_faqs WHERE kb_key = 'LIB-P13');
+
+-- 2026-10-05 (same day): the answer names the two-story limit, so "condos"
+-- is not read as any condo.
+UPDATE kb_faqs
+   SET canonical_answer = $$No, we don't work on manufactured or mobile homes, sorry about that. We specialize in single-family homes, townhomes, and condos in buildings up to two stories.$$,
+       updated_at = now()
+ WHERE kb_key = 'LIB-P13'
+   AND canonical_answer IS DISTINCT FROM $$No, we don't work on manufactured or mobile homes, sorry about that. We specialize in single-family homes, townhomes, and condos in buildings up to two stories.$$;
 
 -- Check: expect one active row.
 SELECT json_agg(row_to_json(s)) FROM (SELECT id, kb_key, active, canonical_answer FROM kb_faqs WHERE kb_key = 'LIB-P13') s;
