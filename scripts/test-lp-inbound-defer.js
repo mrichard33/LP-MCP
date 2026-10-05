@@ -8,8 +8,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { findUnissuedInboundRow, inboundDeferMode, inboundDeferMaxAgeMin,
-         inboundDeferDecision }
+         inboundDeferDecision, heldInboundEscalation, apptStartMsET,
+         formatHeldInboundCard, escalateHeldInbound, firstHoldForRow }
   from '../src/lp-appointment-sync.js';
+import { isTeamOpen } from '../src/agentic/team-hours.js';
 import { lpStoredAgeMinutes, utcToLpStoredIso } from '../src/lp-dates.js';
 
 const stub = (rows) => ({ getInboundLeadInfo: async () => rows });
@@ -125,4 +127,103 @@ test('a lowered max age moves the boundary but not the hasAppt rule', () => {
   assert.equal(D(45, true, 30), 'hold_stale_holds_appt');
   assert.equal(D(45, false, 30), 'fall_through_stale');
   assert.equal(D(20, false, 30), 'defer');
+});
+
+// ─── Held-row escalation (2026-10-05, contact LgCeHyniTQPfrnT4Ga7j, row 428372) ──
+// The chatbot booked Mon 10/5 2:00 PM on Sun 10/4 7:36 PM ET. The row reached LP
+// with the appointment, LP did not import it, and the only card would have fired
+// at ~1:36 AM. These lock "tell a person in team hours, once, when a visit within
+// a day is waiting".
+
+const APPT_MON_2PM = apptStartMsET('2026-10-05', '14:00');
+const MON_9AM_ET = Date.parse('2026-10-05T13:00:00Z');   // 9:00 AM EDT
+const SUN_11PM_ET = Date.parse('2026-10-05T03:00:00Z');  // Sun 11:00 PM EDT
+const E = (o) => heldInboundEscalation({ maxAgeMin: 360, teamOpen: isTeamOpen(o.nowMs), ...o });
+
+test('ET appointment converts to the real instant (2:00 PM EDT = 18:00Z)', () => {
+  assert.equal(new Date(APPT_MON_2PM).toISOString(), '2026-10-05T18:00:00.000Z');
+  assert.equal(apptStartMsET(null, '14:00'), null);
+});
+
+test('visit tomorrow + row 40 min old + 9 AM ET → escalate', () => {
+  assert.equal(isTeamOpen(MON_9AM_ET), true);
+  assert.equal(E({ ageMin: 40, apptStartMs: APPT_MON_2PM, nowMs: MON_9AM_ET }), 'escalate');
+});
+
+test('same row at 11 PM ET → waits for team hours (the 428372 night)', () => {
+  assert.equal(isTeamOpen(SUN_11PM_ET), false);
+  assert.equal(E({ ageMin: 87, apptStartMs: APPT_MON_2PM, nowMs: SUN_11PM_ET }), 'wait_for_team');
+});
+
+test('visit next week + row 40 min old → nothing yet', () => {
+  const nextWeek = apptStartMsET('2026-10-12', '14:00');
+  assert.equal(E({ ageMin: 40, apptStartMs: nextWeek, nowMs: MON_9AM_ET }), 'none');
+});
+
+test('row younger than 30 min → nothing yet, even for a visit today', () => {
+  assert.equal(E({ ageMin: 10, apptStartMs: APPT_MON_2PM, nowMs: MON_9AM_ET }), 'none');
+});
+
+test('stale row still escalates whatever the visit date; unknown age never does', () => {
+  const nextWeek = apptStartMsET('2026-10-12', '14:00');
+  assert.equal(E({ ageMin: 400, apptStartMs: nextWeek, nowMs: MON_9AM_ET }), 'escalate');
+  assert.equal(E({ ageMin: 400, apptStartMs: null, nowMs: MON_9AM_ET }), 'escalate');
+  assert.equal(E({ ageMin: null, apptStartMs: APPT_MON_2PM, nowMs: MON_9AM_ET }), 'none');
+});
+
+test('card names the row, the visit, and what is blank — plain English', () => {
+  const card = formatHeldInboundCard({
+    pending: { inboundId: '428372', ageMin: 840, hasAppt: true, firstName: 'Daniel', lastName: '',
+               phone: '(239)250-0011', address1: '3418 Westclox St', email: '', branch: 'FTMYR' },
+    address: '3418 Westclox St, Immokalee, FL 34142',
+    apptStartMs: APPT_MON_2PM, calendarName: 'Window Estimate', contactId: 'LgCeHyniTQPfrnT4Ga7j',
+  });
+  assert.match(card, /inbound row 428372/);
+  assert.match(card, /Daniel · \(239\)250-0011/);
+  assert.match(card, /3418 Westclox St, Immokalee, FL 34142/);
+  assert.match(card, /Window Estimate: Mon, 10\/5, 2:00 PM ET/);
+  assert.match(card, /Blank on the row: last name, email/);
+  assert.match(card, /already on the row/);
+});
+
+// In-memory audit_posted_items stand-in with the real filterNew/recordPosted contract.
+function postedStore() {
+  const seen = new Set();
+  return {
+    filterNew: async ({ items }) => ({ fresh: items.filter((i) => !seen.has(`${i.key}|${i.reason}`)), dedupe: 'ok' }),
+    recordPosted: async ({ items }) => { items.forEach((i) => seen.add(`${i.key}|${i.reason}`)); return { ok: true }; },
+  };
+}
+
+test('card posts to #contact-center ONCE per row across re-drives', async () => {
+  const posts = [];
+  const deps = { ...postedStore(), env: { SLACK_CHANNEL_SERVICE: 'CCENTER' },
+    postToSlack: async (text, ch) => { posts.push(ch); return { ok: true, ts: '1' }; },
+    sendAlertMessage: async () => { throw new Error('should not page ops'); } };
+  assert.equal((await escalateHeldInbound('card', '428372', deps)).posted, true);
+  assert.equal((await escalateHeldInbound('card', '428372', deps)).reason, 'already_posted');
+  assert.deepEqual(posts, ['CCENTER']);
+});
+
+test('failed or unconfigured post → one ops line, not recorded, retried next re-drive', async () => {
+  const ops = [];
+  let ok = false;
+  const deps = { ...postedStore(), env: { SLACK_CHANNEL_SERVICE: 'CCENTER' },
+    postToSlack: async () => (ok ? { ok: true } : { ok: false, error: 'channel_not_found' }),
+    sendAlertMessage: async (text, opts) => { ops.push(opts.channel); return { sent: true }; } };
+  assert.equal((await escalateHeldInbound('card', '428372', deps)).reason, 'post_failed');
+  ok = true;
+  assert.equal((await escalateHeldInbound('card', '428372', deps)).posted, true);
+  assert.deepEqual(ops, ['ops']);
+
+  const unset = { ...postedStore(), env: {}, postToSlack: async () => { throw new Error('no'); },
+    sendAlertMessage: async (t, o) => { ops.push(o.channel); return { sent: true }; } };
+  assert.equal((await escalateHeldInbound('card', '1', unset)).error, 'SLACK_CHANNEL_SERVICE unset');
+});
+
+test('GHL hold note is written once per row, not every 30 minutes', async () => {
+  const deps = postedStore();
+  assert.equal(await firstHoldForRow('428372', deps), true);
+  assert.equal(await firstHoldForRow('428372', deps), false);
+  assert.equal(await firstHoldForRow('999999', deps), true);
 });
