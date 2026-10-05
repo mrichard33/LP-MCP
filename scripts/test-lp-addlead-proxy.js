@@ -361,3 +361,38 @@ test('flat body still wins over a same-named customData key', async () => {
   assert.equal(lpCalls[0].atime, '2:00 PM', 'top-level atime wins');
   assert.equal(cardCalls.length, 0, 'no strip card — the valid hour stands');
 });
+
+// ═══ 6. Rep brief (2026-10-05) ═══════════════════════════════════════════
+// LP_REP_BRIEF_MODE=live replaces the AI-written LEAD/WANTS/OPENER block with
+// the 2–3 sentence rep brief. It is fail-open: a contact that cannot be read
+// leaves the note exactly as GHL sent it, and a person's note is never touched.
+
+test('rep brief live: unreadable contact → AI note forwarded unchanged', async () => {
+  reset(); setMode('passthrough');
+  const prevRb = process.env.LP_REP_BRIEF_MODE;
+  const prevNotes = process.env.LP_ADDLEAD_NOTES_MODE;
+  process.env.LP_REP_BRIEF_MODE = 'live';
+  process.env.LP_ADDLEAD_NOTES_MODE = 'off';
+  try {
+    const notes = 'LEAD: Came in through the website chatbot | OPENER: Hi Daniel, this is [YOUR NAME]';
+    await invoke({ ...ICC_BODY(), atime: '2:00 PM', notes });
+    assert.equal(lpCalls.length, 1);
+    assert.equal(lpCalls[0].notes, notes);
+  } finally {
+    if (prevRb === undefined) delete process.env.LP_REP_BRIEF_MODE; else process.env.LP_REP_BRIEF_MODE = prevRb;
+    if (prevNotes === undefined) delete process.env.LP_ADDLEAD_NOTES_MODE; else process.env.LP_ADDLEAD_NOTES_MODE = prevNotes;
+  }
+});
+
+test('rep brief live: a person\'s note is never replaced', async () => {
+  reset(); setMode('passthrough');
+  const prevRb = process.env.LP_REP_BRIEF_MODE;
+  process.env.LP_REP_BRIEF_MODE = 'live';
+  try {
+    const notes = 'Property Type: House\nWindow Count: 7\nNotes: gate code 1234';
+    await invoke({ ...ICC_BODY(), atime: '2:00 PM', notes });
+    assert.equal(lpCalls[0].notes, notes);
+  } finally {
+    if (prevRb === undefined) delete process.env.LP_REP_BRIEF_MODE; else process.env.LP_REP_BRIEF_MODE = prevRb;
+  }
+});

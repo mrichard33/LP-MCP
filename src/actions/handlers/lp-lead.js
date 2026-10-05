@@ -117,6 +117,7 @@ import { NAME_PLACEHOLDER_TAG } from '../../services/identity-extraction.js';
 // v1.2 — the deterministic call-center brief. Pure builder + a fetch
 // wrapper that returns null on ANY failure, so this stays fail-soft.
 import { buildAgenticLeadNotes, isWeakNotes } from '../../services/agentic-lead-notes.js';
+import { fetchAndBuildRepBrief, repBriefMode } from '../../services/rep-brief-io.js';
 
 // ─── GHL custom field IDs (canonical Reece location field map) ─────
 // v1.3: SOURCE and PROMOTER were swapped here from the file's creation
@@ -542,7 +543,19 @@ export async function executeCreateLPLead(action) {
   // v1.2 — full setter brief. Resolved after the appointment so the brief's
   // header line ("appointment attached." vs "NO APPOINTMENT. Call to book.")
   // reflects what we are actually sending LP.
-  const notes = resolveNotes(payload, ghlContact, contactId, !!(adate && atime));
+  let notes = resolveNotes(payload, ghlContact, contactId, !!(adate && atime));
+
+  // 2026-10-05 — the 2–3 sentence rep brief (services/rep-brief.js) replaces
+  // the long sectioned brief when LP_REP_BRIEF_MODE=live. An explicit
+  // payload.notes is never replaced. Null (any failure) keeps the note above.
+  if (!payload.notes && repBriefMode() === 'live') {
+    const brief = await fetchAndBuildRepBrief(contactId, {
+      contact: ghlContact,
+      body: { adate, atime, address1, city, zip, firstname: firstName },
+      hasAppointment: !!(adate && atime),
+    }).catch(() => null);
+    if (brief?.notes) notes = brief.notes;
+  }
 
   // ─── Build payload ───────────────────────────────────────────────
   // Use REST-style names; lp-client's addLead translates to legacy

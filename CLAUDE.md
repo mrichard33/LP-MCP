@@ -143,6 +143,19 @@ claimed before the push). Shadow posts nothing; live posts one #contact-center c
 `findContactInOtherLists` is NOT used here: it has never worked in production (bare-array criteria) and
 `f9_last_list` keeps the last list ever, so a naive fix would block most callbacks.
 
+**The LP note is a 2–3 sentence rep brief (the user, 2026-10-05).** Prospect 462947 reached LP with 1,400
+characters: the address three times, "tomorrow" for the visit, a script with a blank ("this is [YOUR NAME]"), internal
+terms ("bot exit agentic, P1 Stage 6") and only the customer's half of the chat; the real job ("New addition") sat in
+that chat log. `src/services/rep-brief.js` builds the replacement. Sentence 1 is CODE: the visit day and time as LP
+receives them (`adate`/`atime`) and the address, or "NO APPOINTMENT. Call to book." Sentences 2–3 are the MODEL
+(`fn: 'rep_brief'`), written from both sides of the chat: what they want, and the one thing the rep should know.
+`checkRepBrief` refuses a relative day, any date or time, a script, a label, a phone, email or address, internal terms
+and a gendered pronoun; one re-write, then fixed sentences (`fallbackBrief`). It replaces only an AI note
+(`replaceableNotes`): a person's or a form's note is never touched. `LP_REP_BRIEF_MODE` off|shadow|live, default shadow
+(`[LP-PROXY] 🕶️ REP BRIEF SHADOW` logs it after the forward). Live runs in the addlead proxy, capped at
+`LP_REP_BRIEF_TIMEOUT_MS` (20s, inside GHL's 60s), and in `create_lp_lead`. Dry run:
+`node scripts/render-rep-brief.js <contact id>`. Never add a chat log, an opener or a relative day back to it.
+
 ## Consent (2026-09-28)
 
 `contact_consent` / `consent_events` (sql/136–139) are the record of who may be contacted and why not.
