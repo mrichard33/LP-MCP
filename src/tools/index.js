@@ -16,6 +16,7 @@ import { registerMemoryTools } from './memory-tools.js';
 import { registerSalesBoardTools } from './sales-board-tools.js';
 import { registerPayrollTools } from './payroll/index.js';
 import { registerSimulatorTools } from './simulator-tools.js';
+import { registerAiOsTools } from './ai-os-tools.js';
 import { withSanitizedResults } from '../text-sanitize.js';
 
 export function registerAllTools(rawServer) {
@@ -25,7 +26,7 @@ export function registerAllTools(rawServer) {
   // are invisible to every human who reviews them and fully visible to a model,
   // so anyone who can text the business could otherwise smuggle instructions
   // into an agent's context. Registration is the one choke point that covers all
-  // 126 tools, including the ones added after this line.
+  // tools, including the ones added after this line.
   const server = withSanitizedResults(rawServer);
   // LP data tools (16)
   registerLeadTools(server);
@@ -85,4 +86,9 @@ export function registerAllTools(rawServer) {
   //   payroll_mark_paid (confirm-gated), payroll_export, payroll_list_rules.
   //   None moves money; a person approves every run and marks it paid.
   registerPayrollTools(server);
+  // AI Engineering OS guidance gateway — Phase 3 (2026-10-05)
+  //   ai_os_context is read-only and uses its own Supabase project credentials.
+  //   Exact canonical IDs are preferred. Search results always carry lifecycle
+  //   and verification state. It cannot approve, activate, enforce, or deploy.
+  registerAiOsTools(server);
 }
