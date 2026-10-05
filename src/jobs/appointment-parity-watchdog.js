@@ -332,6 +332,7 @@ function classifyHealResult(result) {
       return 'dedup_suppressed';
     case 'skipped_lp_unavailable':
     case 'deferred_pending_lp_issuance':
+    case 'held_stale_inbound_holds_appointment':
     case 'past_appointment_left_asis':
       return 'not_attempted';
     case 'lp_lead_creation_enrolled':

@@ -245,7 +245,11 @@ import { five9DispatchConfigured, dispatchConfirmationCallback } from './five9/l
 // and format-helpers.js, neither of which imports anything from here.
 import { ghlFetch as sharedGhlFetch } from './actions/helpers.js';
 import { emitEvent } from './event-emitter.js';
-import { lpStoredAgeMinutes } from './lp-dates.js';
+import { lpStoredAgeMinutes, lpStoredToUtcMs } from './lp-dates.js';
+import { postToSlack } from './slack.js';
+import { sendAlertMessage } from './alert-state.js';
+import { filterNew, recordPosted } from './alert-posted.js';
+import { isTeamOpen } from './agentic/team-hours.js';
 import { LP_EMP } from './lp-source-ids.js';
 import { buildLpAppointmentCard } from './services/appointment-card.js';
 import { trackBackground } from './graceful-shutdown.js';
@@ -1585,6 +1589,147 @@ function inboundDeferDecision({ ageMin, hasAppt, maxAgeMin }) {
   return hasAppt ? 'hold_stale_holds_appt' : 'fall_through_stale';
 }
 
+// ─── Held-row escalation (2026-10-05) ───────────────────────────
+//
+// Incident: contact LgCeHyniTQPfrnT4Ga7j (Daniel, Immokalee), LP inbound row
+// 428372. The chatbot booked a Window Estimate for Mon 10/5 2:00 PM on Sunday
+// at 7:36 PM ET. The row reached LP WITH the appointment, but LP's auto-import
+// passed it over and nobody worked the queue after 6:56 PM, so it sat unissued.
+// The gate above held correctly — and told nobody:
+//   - the only card fired once the row was 360 min old, i.e. ~1:36 AM;
+//   - it ignored that the visit was the next afternoon;
+//   - past 360 min it re-posted on EVERY 30-minute re-drive, with a GHL note
+//     each time, through sendGroupMeMessage (alarms are Slack-only now).
+// LP has no API that issues an inbound row; a person must import it. So the
+// card is a work item for the people who work LP's queue: #contact-center
+// (SLACK_CHANNEL_SERVICE, the user's ruling 2026-10-05), once per row, in team
+// hours, as soon as an appointment within a day is waiting on it.
+
+const HELD_INBOUND_SOON_MS = 24 * 60 * 60 * 1000;
+// A row younger than this is still in LP's normal import window — auto-import
+// issues in seconds, and staff take minutes. Same floor inboundDeferMaxAgeMin uses.
+const HELD_INBOUND_MIN_AGE_MIN = 30;
+const HELD_INBOUND_AUDIT = 'lp_inbound_held';
+
+/**
+ * Should a held row be put in front of a person now? PURE.
+ *
+ *   escalate       post the card now
+ *   wait_for_team  it needs a person, but nobody is in — the next re-drive in
+ *                  team hours posts it (the watchdog re-runs every 30 min)
+ *   none           LP is still within its normal window, nothing to say yet
+ *
+ * Due when the row is stale (today's 360-min rule) OR an appointment within the
+ * next 24h is waiting on a row at least 30 min old. An unknown age is never due
+ * (fail-open, matching inboundDeferDecision).
+ */
+function heldInboundEscalation({ ageMin, maxAgeMin, apptStartMs, nowMs = Date.now(), teamOpen }) {
+  if (ageMin == null) return 'none';
+  const stale = ageMin > maxAgeMin;
+  const soon = Number.isFinite(apptStartMs)
+    && ageMin >= HELD_INBOUND_MIN_AGE_MIN
+    && apptStartMs - nowMs <= HELD_INBOUND_SOON_MS;
+  if (!stale && !soon) return 'none';
+  return teamOpen ? 'escalate' : 'wait_for_team';
+}
+
+/** ET wall-clock appointment (YYYY-MM-DD + HH:MM) → epoch ms, or null. */
+function apptStartMsET(dateNorm, timeNorm) {
+  if (!dateNorm) return null;
+  return lpStoredToUtcMs(`${dateNorm}T${timeNorm || '00:00'}:00`);
+}
+
+const APPT_LABEL_FMT = new Intl.DateTimeFormat('en-US', {
+  timeZone: 'America/New_York', weekday: 'short', month: 'numeric', day: 'numeric',
+  hour: 'numeric', minute: '2-digit',
+});
+
+/** The card a person works from. PURE. Plain English, no rule codes. */
+function formatHeldInboundCard({ pending = {}, contactName, contactPhone, address, apptStartMs, timeKnown = true, calendarName, contactId }) {
+  const name = [pending.firstName, pending.lastName].filter(Boolean).join(' ') || contactName || 'Unknown name';
+  const phone = pending.phone || contactPhone || 'no phone';
+  const where = address || pending.address1 || 'no address';
+  const when = Number.isFinite(apptStartMs)
+    ? (timeKnown ? APPT_LABEL_FMT.format(new Date(apptStartMs)) : APPT_LABEL_FMT.format(new Date(apptStartMs)).replace(/,\s*\d.*$/, ''))
+    : 'date unknown';
+  const blank = [
+    !pending.lastName && 'last name',
+    !pending.email && 'email',
+    !pending.address1 && 'address',
+  ].filter(Boolean);
+  return [
+    `📥 IMPORT THIS LEAD IN LP — appointment waiting on it`,
+    ``,
+    `👤 ${name} · ${phone}`,
+    `🏠 ${where}`,
+    `📅 ${calendarName || 'Appointment'}: ${when} ET`,
+    `🆔 LP inbound row ${pending.inboundId || 'unknown'} (waiting ${pending.ageMin ?? '?'} min${pending.branch ? `, branch ${pending.branch}` : ''})`,
+    blank.length ? `⚠️ Blank on the row: ${blank.join(', ')}` : null,
+    ``,
+    `LP has not imported this row, so the appointment is not on a lead yet. ` +
+      `Please import inbound row ${pending.inboundId || 'unknown'} in LP. ` +
+      (pending.hasAppt
+        ? `The appointment is already on the row, and our system confirms it on the lead within 30 minutes.`
+        : `Our system adds the appointment to the lead within 30 minutes of the import.`),
+    contactId ? `GHL contact: ${contactId}` : null,
+  ].filter((l) => l !== null).join('\n');
+}
+
+/**
+ * Post the "import this row" card once per inbound row. Never throws.
+ * `deps` is a test seam: { postToSlack, sendAlertMessage, filterNew, recordPosted, env }.
+ */
+async function escalateHeldInbound(card, inboundId, deps = {}) {
+  const post = deps.postToSlack || postToSlack;
+  const alert = deps.sendAlertMessage || sendAlertMessage;
+  const isNew = deps.filterNew || filterNew;
+  const record = deps.recordPosted || recordPosted;
+  const env = deps.env || process.env;
+  const key = String(inboundId || '').trim();
+  if (!key) return { posted: false, reason: 'no_inbound_id' };
+  try {
+    const items = [{ key, reason: 'card' }];
+    const { fresh } = await isNew({ audit: HELD_INBOUND_AUDIT, items, ttlDays: 30 });
+    if (!fresh.length) return { posted: false, reason: 'already_posted' };
+    const channel = String(env.SLACK_CHANNEL_SERVICE || '').trim();
+    const res = channel
+      ? await Promise.resolve(post(card, channel)).catch((err) => ({ ok: false, error: err.message }))
+      : { ok: false, error: 'SLACK_CHANNEL_SERVICE unset' };
+    if (res?.ok) {
+      await record({ audit: HELD_INBOUND_AUDIT, items });
+      console.log(`[LP-APPT] held-row card posted to #contact-center for in1_id ${key}`);
+      return { posted: true, reason: 'posted' };
+    }
+    // Not recorded, so the next re-drive tries again. One ops line per failure.
+    await Promise.resolve(alert(
+      `⚠️ Could not post the "import this LP row" card to #contact-center (${res?.error || 'unknown error'}). ` +
+        `LP inbound row ${key} is holding an appointment and needs importing.`,
+      { channel: 'ops' },
+    )).catch(() => {});
+    return { posted: false, reason: 'post_failed', error: res?.error || null };
+  } catch (err) {
+    console.warn(`[LP-APPT] held-row escalation failed for in1_id ${key}: ${err.message}`);
+    return { posted: false, reason: 'error', error: err.message };
+  }
+}
+
+/** True the first time a held row is seen (so its GHL note is written once). Never throws. */
+async function firstHoldForRow(inboundId, deps = {}) {
+  const isNew = deps.filterNew || filterNew;
+  const record = deps.recordPosted || recordPosted;
+  const key = String(inboundId || '').trim();
+  if (!key) return true;
+  try {
+    const items = [{ key, reason: 'note' }];
+    const { fresh } = await isNew({ audit: HELD_INBOUND_AUDIT, items, ttlDays: 30 });
+    if (!fresh.length) return false;
+    await record({ audit: HELD_INBOUND_AUDIT, items });
+    return true;
+  } catch {
+    return true;
+  }
+}
+
 /**
  * Youngest UNISSUED inbound row for this contact, or null.
  *
@@ -1623,6 +1768,15 @@ async function findUnissuedInboundRow(contactId, deps = {}) {
         inboundId: String(r.id ?? r.in1_id ?? '').trim() || null,
         ageMin,
         hasAppt: Boolean(String(r.apptdate ?? '').trim()),
+        // What LP itself holds, for the "import this row" card: the person
+        // importing it reads the row, so the card names what is on it and
+        // what is blank (2026-10-05, row 428372 had no last name or email).
+        firstName: String(r.firstname ?? '').trim(),
+        lastName: String(r.lastname ?? '').trim(),
+        phone: String(r.phone ?? '').trim(),
+        address1: String(r.address1 ?? '').trim(),
+        email: String(r.email ?? '').trim(),
+        branch: String(r.brn_id ?? '').trim(),
       };
       if (!best) { best = candidate; continue; }
       // Youngest wins. A row with no parseable age loses to one that has it.
@@ -1842,43 +1996,43 @@ async function syncAppointmentToLP({
                 `and escalating rather than minting a duplicate that rescues nothing.`
               : '')
           );
-          // A stuck row that already holds the appointment needs a human to
-          // unstick it in LP; the watchdog alone will retry forever. channel
-          // 'ops' routes to the ops bot and mirrors to Slack #ops-alerts —
-          // the house rule for operational alarms (CLAUDE.md, decision 2188).
-          // NOTE: the Slack mirror is fail-silent, so a missing card here
-          // looks exactly like a quiet night. Confirm one lands after deploy.
-          if (staleHoldsAppt) {
-            await sendGroupMeMessage(
-              `⚠️ LP INBOUND ROW STUCK — appointment HELD, no duplicate created\n\n` +
-              `👤 ${contactName || contactId}\n` +
-              `🆔 in1_id ${pending.inboundId || 'unknown'} unissued for ${pending.ageMin} min ` +
-              `(> ${maxAgeMin})\n` +
-              `📅 Appt: ${incomingDateNorm} ${incomingTimeNorm || ''}\n\n` +
-              `That row ALREADY carries this appointment — it is not at risk, LP just has not ` +
-              `issued the row. A second lead would duplicate this person and rescue nothing, ` +
-              `so nothing was created.\n` +
-              `→ In LP: issue in1_id ${pending.inboundId || 'unknown'} (or kill it if it is junk). ` +
-              `The appointment writes itself once the lead exists.`,
-              { channel: 'ops' }
-            ).catch(() => {});
+          // A held row needs a person to import it in LP; the watchdog alone
+          // retries forever. 2026-10-05 (row 428372): post ONE card to
+          // #contact-center as soon as a visit within a day waits on it, in team
+          // hours — not a GroupMe page at the 360-min mark in the middle of the
+          // night. See the "Held-row escalation" banner above. The Slack post is
+          // checked (postToSlack returns ok), and a failure is an #ops-alerts line.
+          const apptStartMs = apptStartMsET(incomingDateNorm, incomingTimeNorm);
+          const nowMs = Date.now();
+          const escalation = heldInboundEscalation({
+            ageMin: pending.ageMin, maxAgeMin, apptStartMs, nowMs, teamOpen: isTeamOpen(nowMs),
+          });
+          let escalated = null;
+          if (escalation === 'escalate') {
+            escalated = await escalateHeldInbound(formatHeldInboundCard({
+              pending, contactName, contactPhone,
+              address: [address1, city, [state, postalCode].filter(Boolean).join(' ')].filter(Boolean).join(', '),
+              apptStartMs, timeKnown: Boolean(incomingTimeNorm), calendarName, contactId,
+            }), pending.inboundId);
+          } else if (escalation === 'wait_for_team') {
+            console.log(`[LP-APPT] held row ${pending.inboundId || '?'} needs importing — card waits for team hours`);
           }
           // Deliberately NO dedup mark and NO lp-appt-synced tag: LP does not
           // hold this appointment yet, and the watchdog must be free to retry.
-          await addGHLNote(contactId,
-            `[LP SYNC] Appointment HELD — not yet written to Lead Perfection.\n` +
-            `LP already has this person in its inbound queue (in1_id ` +
-            `${pending.inboundId || 'unknown'}, ${pending.ageMin ?? '?'} min old) but has not ` +
-            `issued the lead yet. Creating a second lead to carry the appointment would ` +
-            `duplicate this person in LP, so the appointment is being held instead.\n` +
-            (staleHoldsAppt
-              ? `That row already carries this appointment, so nothing is at risk — it has been ` +
-                `stuck past ${maxAgeMin} minutes and the ops channel has been alerted to issue ` +
-                `it in LP by hand.\n`
-              : `It writes to the SAME lead automatically once LP issues it — re-checked every ` +
-                `30 minutes for up to ${maxAgeMin} minutes, then escalated.\n`) +
-            `Appt: ${incomingDateNorm} ${incomingTimeNorm || ''}`
-          ).catch(() => {});
+          // The note is written once per row (it used to land every 30 minutes).
+          if (await firstHoldForRow(pending.inboundId)) {
+            await addGHLNote(contactId,
+              `[LP SYNC] Appointment HELD — not yet written to Lead Perfection.\n` +
+              `LP already has this person in its inbound queue (in1_id ` +
+              `${pending.inboundId || 'unknown'}, ${pending.ageMin ?? '?'} min old) but has not ` +
+              `imported the lead yet. Creating a second lead to carry the appointment would ` +
+              `duplicate this person in LP, so the appointment is being held instead.\n` +
+              `It writes to the SAME lead automatically once LP imports it (re-checked every ` +
+              `30 minutes). If the visit is within a day, #contact-center is asked to import ` +
+              `the row in LP during team hours.\n` +
+              `Appt: ${incomingDateNorm} ${incomingTimeNorm || ''}`
+            ).catch(() => {});
+          }
           // Hold marker for I.LP-A's exit branch — without it I.LP-A takes its
           // fallback and enrolls I.LP-OUT, re-creating the duplicate from the
           // GHL side. See the LP_APPT_DEFERRED_TAG banner. Best-effort: if the
@@ -1898,7 +2052,8 @@ async function syncAppointmentToLP({
             appt_time: incomingTimeNorm || null,
             max_age_min: maxAgeMin,
             retry_via: 'appointment_parity_watchdog',
-            escalated: staleHoldsAppt,
+            escalated: Boolean(escalated?.posted),
+            escalation,
           };
         }
 
@@ -2583,6 +2738,11 @@ export {
   inboundDeferMode,
   inboundDeferMaxAgeMin,
   inboundDeferDecision,
+  heldInboundEscalation,
+  apptStartMsET,
+  formatHeldInboundCard,
+  escalateHeldInbound,
+  firstHoldForRow,
   probeLPForContact,
   fetchLatestAppointment,
   // Exported 2026-07-28 for the enrichment no-op regression lock — case 10 in

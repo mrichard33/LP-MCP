@@ -122,6 +122,13 @@ are dropped for these replies because every one is pre-demo copy. A "yes" to the
 to #contact-rehash (`SLACK_CHANNEL_REHASH`, default C0C5YMHNYJH) via `src/notifications/rehash-call.js`.
 No resolved name → the reply signs "Reece Team"; never guess a name. See `src/agentic/rehash.js`.
 
+**A held appointment asks a person to import its LP row (2026-10-05).** When LP already has an unimported
+inbound row for a contact, `syncAppointmentToLP` holds the appointment (`lp-appt-deferred`) rather than add a
+duplicate lead, and the parity watchdog re-drives it every 30 min. LP has no API that imports a row, so once a
+visit within 24h waits on a row 30+ min old (or the row passes `LP_INBOUND_DEFER_MAX_AGE_MIN`), ONE card per row
+goes to #contact-center (`SLACK_CHANNEL_SERVICE`) in team hours (`heldInboundEscalation`, audit `lp_inbound_held`).
+The chatbot's 7:36 PM Sunday booking (row 428372) otherwise waited for a 1:36 AM GroupMe page that repeated every 30 min.
+
 ## Consent (2026-09-28)
 
 `contact_consent` / `consent_events` (sql/136–139) are the record of who may be contacted and why not.
