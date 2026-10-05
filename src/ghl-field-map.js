@@ -3,6 +3,34 @@
 // Maps LP Supabase fields → GHL custom field IDs.
 // ALL FIELD IDS CONFIRMED via HL MCP cache — March 24, 2026
 //
+// v7 — October 5, 2026
+// - FEAT: LP's appointment now ALSO writes the "Current Appointment Date" /
+//   "Current Appointment Time" fields (x8KO5o89WPLfC7ivia3A /
+//   U67epWMNqjbf0SHAllEZ — formerly labeled "Last Appointment Start
+//   Date/Time"; same field IDs, relabeled in GHL). Mark's ruling: one set of
+//   appointment fields, with the LP Appointment Date/Time fields retired once
+//   every reader is repointed.
+//   WHY: those fields were GHL-calendar-only, so a reschedule made in LP never
+//   reached them. Audit 2026-10-05: of 159 contacts with an upcoming
+//   appointment, 15 disagreed between the two sets, and the Current field was
+//   the wrong one in 12 (e.g. 4HfqJWUx5en8x5z2pfKi held 6 PM while the GHL
+//   calendar and LP both held 5 PM).
+//   SCOPE, deliberately narrow:
+//     • DUAL-WRITE. The LP Appointment Date/Time entries below are unchanged.
+//       objection-state.js, lp-appointment-sync.js and the parity jobs still
+//       READ them; they are repointed in a follow-up, and only then are the
+//       LP fields dropped.
+//     • TODAY-OR-LATER ONLY. Current is written only when LP's appointment is
+//       today or later (ET). A past LP appointment returns null, which
+//       buildGHLFieldPayload skips (not clears), so a fresh GHL booking that LP
+//       has not taken yet is never overwritten by an older LP slot whenever
+//       some unrelated LP field (call count, disposition) changes the hash.
+//     • BEHIND A FLAG. CURRENT_APPT_FIELDS_SYNC_MODE = off (default) | live.
+//       While off, both new entries return null: no write and no hash change,
+//       so deploying this file changes nothing. Flipping to live changes the
+//       payload for contacts with an upcoming LP appointment, and those queue
+//       a push in the next cycle (bounded by FIELD_SYNC_MAX_PUSHES_PER_CYCLE).
+//
 // v6 — June 6, 2026
 // - FIX (token-starvation root cause): `lp_last_synced` is now flagged
 //   `excludeFromHash: true` and computeFieldHash() filters such fields
@@ -39,7 +67,71 @@
 // - Appointment date/time = from the lead with the MOST RECENT appointment
 // - Job value = MAX across all leads
 // - Appointment time uses UTC extraction (LP stores local time as UTC)
-// - DO NOT touch GHL-owned fields: Last Appointment Start Date/Time
+// - (Superseded by v7) previously: DO NOT touch Last Appointment Start Date/Time
+
+// ─── Appointment formatting (shared by the LP and Current entries) ──
+// LP stores ET wall-clock digits labeled as UTC, so the UTC getters read the
+// wall clock directly. No timezone conversion anywhere in this block.
+function lpApptDateParts(appointmentDate) {
+  if (!appointmentDate) return null;
+  const d = new Date(appointmentDate);
+  if (isNaN(d.getTime())) return null;
+  return d;
+}
+
+function formatLpApptDate(d) {
+  return `${d.getUTCMonth() + 1}/${d.getUTCDate()}/${d.getUTCFullYear()}`;
+}
+
+function formatLpApptTime(d) {
+  let hours = d.getUTCHours();
+  const minutes = d.getUTCMinutes();
+  const ampm = hours >= 12 ? 'PM' : 'AM';
+  hours = hours % 12 || 12;
+  return `${hours}:${minutes.toString().padStart(2, '0')} ${ampm}`;
+}
+
+// Today's date in ET as YYYY-MM-DD (Intl, so DST is handled for us).
+function etTodayYmd(now = new Date()) {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit',
+  }).format(now);
+}
+
+/**
+ * True when an LP appointment falls today or later in ET.
+ * Compares calendar days only (an appointment earlier today still counts):
+ * the field describes the day's booking, and flipping it at the minute the
+ * slot passes would just churn the sync. Exported for tests.
+ */
+export function isLpApptTodayOrLater(appointmentDate, now = new Date()) {
+  const d = lpApptDateParts(appointmentDate);
+  if (!d) return false;
+  const apptYmd = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+  return apptYmd >= etTodayYmd(now);
+}
+
+/** off (default) | live. Read on every call so an env flip needs no redeploy logic. */
+export function currentApptFieldsMode() {
+  const v = String(process.env.CURRENT_APPT_FIELDS_SYNC_MODE || 'off').trim().toLowerCase();
+  return v === 'live' ? 'live' : 'off';
+}
+
+/**
+ * Value for a Current Appointment field, or null to leave GHL untouched.
+ * null (not '') is the point: buildGHLFieldPayload drops null, so a past or
+ * missing LP appointment never clears what the GHL calendar wrote.
+ */
+export function currentApptValue(lead, format, now = new Date()) {
+  if (currentApptFieldsMode() !== 'live') return null;
+  if (!lead || !isLpApptTodayOrLater(lead.appointment_date, now)) return null;
+  const d = lpApptDateParts(lead.appointment_date);
+  // Exact midnight is LP's "date known, time not set" (same rule as
+  // parseLpApptWallClock in handlers/lp-appointment.js). Writing it would put
+  // "12:00 AM" in front of reps and customers, so leave Current alone.
+  if (d.getUTCHours() === 0 && d.getUTCMinutes() === 0) return null;
+  return format(d);
+}
 
 const GHL_FIELD_MAP = {
   // ─── IDENTITY ───────────────────────────────────────────────────
@@ -99,38 +191,36 @@ const GHL_FIELD_MAP = {
 
   // ─── APPOINTMENT ───────────────────────────────────────────────
   // From the lead with the MOST RECENT appointment_date (not necessarily newest lead).
-  // DO NOT write to GHL-owned fields:
-  //   - Last Appointment Start Date (x8KO5o89WPLfC7ivia3A)
-  //   - Last Appointment Start Time (U67epWMNqjbf0SHAllEZ)
+  // LP Appointment Date/Time: unchanged (still read by objection-state.js,
+  // lp-appointment-sync.js and the parity jobs). Retire after they move.
   appointment_date: {
     ghlFieldId: 'GL1rM4cnXBETsBkqxkZw',
     label: 'LP Appointment Date',
     transform: (lead) => {
-      if (!lead.appointment_date) return '';
-      const d = new Date(lead.appointment_date);
-      if (isNaN(d.getTime())) return '';
-      // LP stores local time as UTC — extract directly
-      const month = d.getUTCMonth() + 1;
-      const day = d.getUTCDate();
-      const year = d.getUTCFullYear();
-      return `${month}/${day}/${year}`;
+      const d = lpApptDateParts(lead.appointment_date);
+      return d ? formatLpApptDate(d) : '';
     },
   },
   appointment_time: {
     ghlFieldId: 'iRuo2towFCpyKnnIUtLH',
     label: 'LP Appointment Time',
     transform: (lead) => {
-      if (!lead.appointment_date) return '';
-      const d = new Date(lead.appointment_date);
-      if (isNaN(d.getTime())) return '';
-      // LP stores local time as UTC — extract directly, no timezone conversion
-      let hours = d.getUTCHours();
-      const minutes = d.getUTCMinutes();
-      const ampm = hours >= 12 ? 'PM' : 'AM';
-      hours = hours % 12 || 12;
-      const minStr = minutes.toString().padStart(2, '0');
-      return `${hours}:${minStr} ${ampm}`;
+      const d = lpApptDateParts(lead.appointment_date);
+      return d ? formatLpApptTime(d) : '';
     },
+  },
+  // v7 — Current Appointment Date/Time (formerly "Last Appointment Start
+  // Date/Time"). Upcoming LP appointments only, behind
+  // CURRENT_APPT_FIELDS_SYNC_MODE. See the v7 header note.
+  current_appointment_date: {
+    ghlFieldId: 'x8KO5o89WPLfC7ivia3A',
+    label: 'Current Appointment Date',
+    transform: (lead) => currentApptValue(lead, formatLpApptDate),
+  },
+  current_appointment_time: {
+    ghlFieldId: 'U67epWMNqjbf0SHAllEZ',
+    label: 'Current Appointment Time',
+    transform: (lead) => currentApptValue(lead, formatLpApptTime),
   },
   total_appointments: {
     ghlFieldId: 'nWDA6dvUmLZQA02v7LNi',
