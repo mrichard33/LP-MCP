@@ -748,6 +748,22 @@ export async function getInboundLeadInfo({ lognumber, startdate, enddate, pageSi
   }, 3, opts));
 }
 
+/**
+ * POST /api/Leads/GetInboundLeadInfo by date range — every inbound row, not one
+ * lognumber's. StartIndex is a PAGE number (page 3 of size 60 = rows 121–180,
+ * measured 2026-10-05). Dates are MM/DD/YYYY. Uses the normal (not fast)
+ * budget: a 200-row page took longer than the 12s fast path.
+ * Read by src/jobs/new-lead-dial-backstop.js.
+ */
+export async function listInboundLeads({ startdate, enddate, page = 1, pageSize = 200 } = {}, opts = {}) {
+  if (!startdate || !enddate) throw new Error('listInboundLeads: startdate and enddate are required');
+  // One try, and outside withCircuit: a slow 5-minute poller must neither
+  // triple its load on LP nor trip the shared breaker for every other LP call.
+  return lpPost('/api/Leads/GetInboundLeadInfo', {
+    startdate, enddate, PageSize: String(pageSize), StartIndex: String(page),
+  }, 1, opts);
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // Phase 2 Write Endpoints
 // ═══════════════════════════════════════════════════════════════════

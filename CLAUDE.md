@@ -126,8 +126,22 @@ No resolved name → the reply signs "Reece Team"; never guess a name. See `src/
 inbound row for a contact, `syncAppointmentToLP` holds the appointment (`lp-appt-deferred`) rather than add a
 duplicate lead, and the parity watchdog re-drives it every 30 min. LP has no API that imports a row, so once a
 visit within 24h waits on a row 30+ min old (or the row passes `LP_INBOUND_DEFER_MAX_AGE_MIN`), ONE card per row
-goes to #contact-center (`SLACK_CHANNEL_SERVICE`) in team hours (`heldInboundEscalation`, audit `lp_inbound_held`).
-The chatbot's 7:36 PM Sunday booking (row 428372) otherwise waited for a 1:36 AM GroupMe page that repeated every 30 min.
+goes to #contact-center (`SLACK_CHANNEL_SERVICE`) — but only after the team has been open
+`LP_HELD_IMPORT_ALERT_OPEN_MIN` (60) minutes and the row is still not imported (`openMinutesSince`; the user: no
+card the moment we open, staff work the overnight queue first). Audit `lp_inbound_held`, one card per row.
+
+**Every imported LP lead reaches a Five9 list (2026-10-05).** LP pushes a row to LP_ASAP only at its own
+auto-import; a row a person imports later, or one auto-imported overnight, waits for LP's 6 AM load (Sunday's 4
+hand-imported rows sat in Five9 on no list; 0 of 14 overnight rows were called at 8 AM). `src/jobs/new-lead-dial-backstop.js`
+(rules in `src/new-lead-dial-backstop.js`, every 5 min 8:00–19:45 ET, `NEW_LEAD_DIAL_BACKSTOP_MODE` off|shadow|live,
+default shadow) pushes every imported, never-called lead from the last 72h to the user's lists: visit today or
+tomorrow → "Conf - Next Day", 2+ days → "Conf - 2nd Day", no visit → "Callback Request". Never LP_ASAP
+(`executeAddRecordsToList` refuses it). Unimported rows are the held-row card's job, never pushed; dead or worked
+dispositions (read from `lp_leads`, which overrides the inbound row) and Five9 DNC numbers are skipped; a lead on
+another list gets 30 dial minutes first. Once per row per list and per phone per day (`lp_appointment_sync_marks`,
+claimed before the push). Shadow posts nothing; live posts one #contact-center card per pass only when it pushed.
+`findContactInOtherLists` is NOT used here: it has never worked in production (bare-array criteria) and
+`f9_last_list` keeps the last list ever, so a naive fix would block most callbacks.
 
 ## Consent (2026-09-28)
 

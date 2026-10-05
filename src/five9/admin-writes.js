@@ -1405,6 +1405,10 @@ export function executeAddRecordsToList(action) {
   const fieldNames = payload.field_names;
   const records = payload.records;
   if (!listName) throw new Error('five9_add_records_to_list requires action_payload.list_name');
+  // LP is the only writer of LP_ASAP; a direct write is overwritten by its feed
+  // (agent_action 330019, src/five9/list-dispatch.js banner). Last line of
+  // defence for the 2026-10-05 new-lead backstop and every other caller.
+  if (listName.toUpperCase() === 'LP_ASAP') throw new Error('REFUSED: LP_ASAP is fed by Lead Perfection only — never write to it directly');
   if (!Array.isArray(records) || !records.length) throw new Error('five9_add_records_to_list requires action_payload.records: [[values...], ...]');
   if (records.length > MAX_RECORDS_PER_ACTION) {
     throw new Error(`REFUSED: ${records.length} records > ${MAX_RECORDS_PER_ACTION} per action cap`);

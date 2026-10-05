@@ -319,6 +319,7 @@ import { startSaleBackstopScheduler } from './jobs/sale-announce-backstop.js';  
 import { startSaleP2BackstopScheduler } from './jobs/sale-p2-backstop.js';  // 2026-10-03 — every LP sale gets a P2 card
 import { startSaleContactBackstopScheduler } from './jobs/sale-contact-backstop.js';  // 2026-10-04 — every LP sale gets a GHL contact
 import { startMissedCallerRecoveryScheduler } from './jobs/missed-caller-recovery.js';  // 2026-09-24
+import { startNewLeadDialBackstopScheduler } from './jobs/new-lead-dial-backstop.js';  // 2026-10-05
 import { registerLeadLeakRoutes, startLeadLeakScheduler, startLeadUncalledScheduler } from './jobs/lead-leak-monitor.js';  // 2026-09-26
 import { startChatLeadIntakeScheduler } from './jobs/chat-lead-intake-sweep.js';  // 2026-09-28
 import { startCanvassBackstopScheduler } from './jobs/canvass-lead-backstop.js';  // 2026-09-28
@@ -941,6 +942,7 @@ const server = app.listen(PORT, async () => {
   startSaleP2BackstopScheduler();
   startSaleContactBackstopScheduler();
   startMissedCallerRecoveryScheduler();
+  startNewLeadDialBackstopScheduler();
   startLeadLeakScheduler();
   startLeadUncalledScheduler();
   startChatLeadIntakeScheduler();
