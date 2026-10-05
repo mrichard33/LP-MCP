@@ -1019,14 +1019,14 @@ export function planNepqTurn({
 // Money in chat (Mark, 2026-10-02: never prices, savings or financing
 // figures). The live chat sent "$89–$149 per month, no money down" — that
 // sentence goes, whatever its source.
-const MONEY_RX = /\$\s?\d|\b\d[\d,]*\s*(?:dollars|bucks)\b|\b(?:per|a)\s+month\b|\/\s?mo\b|\bmonthly\s+payments?\b|\bno\s+money\s+down\b|\b0\s?%|\bapr\b|\b\d+\s?%\s+off\b|\bsave\s+(?:up\s+to\s+)?\d/i;
-const URGENCY_RX = /\bonly\s+\d+\s+(?:spots?|slots?|openings?)\s+left\b|\bspots?\s+(?:are\s+)?filling\b|\bprices?\s+(?:are\s+)?going\s+up\b|\bact\s+(?:now|fast)\b|\blimited\s+time\b|\bbefore\s+(?:it'?s|its)\s+too\s+late\b|\bdon'?t\s+miss\b|\b(?:calendar|schedule|calls?)(?:'s|\s+is|\s+are)?\s+(?:tight|packed|full|filling(?:\s+up)?|booking\s+up(?:\s+fast)?|moving\s+fast)\b|\bpeak\s+season\b|\bspeeding\s+up\s+these\s+decisions\b/i;
+export const MONEY_RX = /\$\s?\d|\b\d[\d,]*\s*(?:dollars|bucks)\b|\b(?:per|a)\s+month\b|\/\s?mo\b|\bmonthly\s+payments?\b|\bno\s+money\s+down\b|\b0\s?%|\bapr\b|\b\d+\s?%\s+off\b|\bsave\s+(?:up\s+to\s+)?\d/i;
+export const URGENCY_RX = /\bonly\s+\d+\s+(?:spots?|slots?|openings?)\s+left\b|\bspots?\s+(?:are\s+)?filling\b|\bprices?\s+(?:are\s+)?going\s+up\b|\bact\s+(?:now|fast)\b|\blimited\s+time\b|\bbefore\s+(?:it'?s|its)\s+too\s+late\b|\bdon'?t\s+miss\b|\b(?:calendar|schedule|calls?)(?:'s|\s+is|\s+are)?\s+(?:tight|packed|full|filling(?:\s+up)?|booking\s+up(?:\s+fast)?|moving\s+fast)\b|\bpeak\s+season\b|\bspeeding\s+up\s+these\s+decisions\b/i;
 // 2026-10-02 funnel audit: the SMS bot leaned on "our calendar's tight right
 // now" / "calls are booking up fast" in most booking turns. Invented scarcity.
 // Claims nobody approved (2026-10-02 simulation: "that's right at the edge of
 // when Florida code tightened up", "with us at the peak of hurricane season").
 // Code history and season-peak talk are pressure dressed as fact.
-const CLAIMS_RX = /\bcode\s+(?:changed|tightened|got\s+(?:stricter|tighter)|was\s+(?:updated|changed))\b|\b(?:after|since|before)\s+(?:the\s+)?(?:19|20)\d\d\b[^.?!]{0,40}\bcode\b|\bcode\b[^.?!]{0,40}\b(?:after|since|before)\s+(?:19|20)\d\d\b|\bpeak\s+(?:of\s+)?(?:the\s+)?(?:hurricane|storm)\s+season\b|\bmost\s+active\s+(?:stretch|part|time)\b|\b(?:storm\s+season|we)\s+(?:has|have)\s+(?:us\s+)?(?:slammed|swamped)\b|\bcalendar\s+(?:is\s+)?(?:tight|filling|full)\b|\b(?:andersen|renewal|pgt|pella|lowe'?s|home\s+depot|es\s+windows|cgi)\b[^.?!]{0,60}\b(?:uses?|only|standard|cheap\w*|worse|inferior|lower|basic)\b/i;
+export const CLAIMS_RX = /\bcode\s+(?:changed|tightened|got\s+(?:stricter|tighter)|was\s+(?:updated|changed))\b|\b(?:after|since|before)\s+(?:the\s+)?(?:19|20)\d\d\b[^.?!]{0,40}\bcode\b|\bcode\b[^.?!]{0,40}\b(?:after|since|before)\s+(?:19|20)\d\d\b|\bpeak\s+(?:of\s+)?(?:the\s+)?(?:hurricane|storm)\s+season\b|\bmost\s+active\s+(?:stretch|part|time)\b|\b(?:storm\s+season|we)\s+(?:has|have)\s+(?:us\s+)?(?:slammed|swamped)\b|\bcalendar\s+(?:is\s+)?(?:tight|filling|full)\b|\b(?:andersen|renewal|pgt|pella|lowe'?s|home\s+depot|es\s+windows|cgi)\b[^.?!]{0,60}\b(?:uses?|only|standard|cheap\w*|worse|inferior|lower|basic)\b/i;
 const SEE_YOU_RX = /\bsee\s+you\s+(?:then|soon|there)\b/i;
 const SIGNOFF_RX = /(?:^|\s)([—–-]\s*[A-Z][A-Za-z.'’ ]{0,40})\s*$/;
 const FIXED_MOVES = new Set(['handoff', 'objection_play', 'ask_day', 'close', 'reveal', 'offer_slots', 'status_frame', 'dnk']);
