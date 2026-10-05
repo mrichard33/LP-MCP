@@ -56,7 +56,7 @@ import { enforceCallTiming, promisedCallback } from '../agentic/team-hours.js';
 import { rewriteBookingClaims } from '../agentic/booking-claim.js';
 import { enforceOneAsk } from '../agentic/one-ask.js';
 import { looksLikeShortPhone } from '../agentic/contact-typos.js';
-import { planNepqTurn, enforceNepqPlan, referenceRetryNote, nepqBackboneMode, pickFresh, LINES as NEPQ_LINES, isServiceCallback } from '../agentic/nepq-planner.js';
+import { planNepqTurn, enforceNepqPlan, referenceRetryNote, nepqBackboneMode, pickFresh, LINES as NEPQ_LINES, isServiceCallback, dropUnsafeLines, leadWantsCall } from '../agentic/nepq-planner.js';
 import { NO_DIAL_REASONS } from '../agentic/bot-callback.js';
 import { isCustomerP2 } from '../agentic/lead-state/signals/context-reader.js';
 import { COLLECT_ASK, COLLECT_ASK_AGAIN, dmAsk, holdLine, missingItems, parseDecisionMakers, heldSlot, nameFromReply, addressConfirmAsk, addressConfirmState, mentionedPartner, dmAnswerFromThread, slotLabel } from '../agentic/booking-collect.js';
@@ -117,6 +117,7 @@ import {
   contactAskLine,
   VISIT_BRIDGE_LINE,
   nextStepLine,
+  bookingHandoffLine,
 } from './chat-rules.js';
 import { marketTimezone, tzLabel } from '../config/market-timezones.js';
 import { phoneFromText } from './missed-replies.js';
@@ -1164,10 +1165,17 @@ export function createLiveChatFastLane(deps) {
       const hasAppt = context.lp?.appointment_set === true && context.lp?.appointment_is_past !== true;
       const claim = rewriteBookingClaims(flow.fixed, { booked: false, held: false, hasAppointment: hasAppt, ...(nepqLive ? { replacement: nextStepLine({ bridgeUsed: !!nepqPlan?.counters?.bridge_used }) } : {}) });
       if (claim.changed) d.log(`[LiveChat] false_schedule_claim_fixed ${contactId}: unbacked booking or hold claim rewritten`);
-      const nepqFix0 = nepqLive ? enforceNepqPlan(claim.text, nepqPlan, { known }) : { text: claim.text, changes: [] };
+      // With NEPQ off (the rollback switch) there is no plan, but the money,
+      // pressure and unasked-call drops still apply (2026-10-05 golden replay:
+      // "$89 to $149 per month" went out untouched with the backbone off).
+      // A reply that was nothing but a price gets the next step, never silence.
+      const offSafe = nepqLive ? null : dropUnsafeLines(claim.text, { keepCallOffer: leadWantsCall(context.conversation_recent || [], body), keepPromises: true });
+      const nepqFix0 = nepqLive
+        ? enforceNepqPlan(claim.text, nepqPlan, { known })
+        : { ...offSafe, text: offSafe.text.trim() || bookingHandoffLine({ hasName, hasPhone }) };
       // A planned coverage turn still opens with the coverage sentence.
       const nepqFix = (nepqLive && saPlan.active && coverage) ? { ...nepqFix0, text: guardCoverageDraft(nepqFix0.text, coverage).fixed } : nepqFix0;
-      if (nepqFix.changes.length) d.log(`[NEPQ] live chat ${contactId} ${nepqPlan.required_move}: ${nepqFix.changes.join(',')}`);
+      if (nepqFix.changes.length) d.log(`[NEPQ] live chat ${contactId} ${nepqLive ? nepqPlan.required_move : 'no-plan'}: ${nepqFix.changes.join(',')}`);
       // One ask per message on every live-chat draft (Mark, 2026-10-02); the
       // NEPQ guard above already did it when the plan is live.
       const oneAsk = (nepqLive || saPlan.active) ? { text: nepqFix.text, changed: false } : enforceOneAsk(nepqFix.text);

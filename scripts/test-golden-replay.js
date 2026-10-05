@@ -10,10 +10,9 @@
  * Every case runs with the NEPQ backbone live (production: 41 of 44 live-chat
  * turns 2026-10-02..05 recorded nepq.mode=live) AND off (the rollback switch,
  * NEPQ_BACKBONE_MODE), because a guard that only works in one mode is half a
- * guard. A case marked `nepqLiveOnly` names a guard that lives inside
- * enforceNepqPlan and so does not run with the backbone off; that is a known
- * gap of the rollback mode (2026-10-05 audit), stated here rather than hidden.
- * Moving the guard out of enforceNepqPlan must delete the marker.
+ * guard. (The money, pressure and call-offer drops once ran only with NEPQ
+ * live; the first run of this file found it, and dropUnsafeLines now runs on
+ * the no-plan path too.)
  *
  * Made-up contacts only. Real conversations stay in the LP database (the
  * user's ruling, 2026-10-05); scripts/eval-replay.js scores those where they
@@ -147,7 +146,6 @@ const CASES = [
     inbound: 'How much for 12 windows?',
     draft: 'Most projects run about $89 to $149 per month with no money down. What made you start looking?',
     mustNot: /\$\d/,
-    nepqLiveOnly: 'the money-figure drop is inside enforceNepqPlan',
   },
   {
     id: 'invented_scarcity',
@@ -155,7 +153,6 @@ const CASES = [
     inbound: 'Just looking for now',
     draft: 'Our calendar is filling up fast right now. What got you looking at windows?',
     mustNot: /filling up/i,
-    nepqLiveOnly: 'the urgency and unapproved-claim drops are inside enforceNepqPlan',
   },
   {
     id: 'question_written_with_period',
@@ -169,7 +166,6 @@ const CASES = [
     inbound: 'My windows are drafty',
     draft: "A quick call would let us figure out what's happening. What day works best for the visit?",
     mustNot: /quick call/i,
-    nepqLiveOnly: 'dropUnaskedCallOffer runs only inside enforceNepqPlan in the live chat',
   },
   {
     id: 'stop_knocking_is_not_an_opt_out',
@@ -189,7 +185,7 @@ const CASES = [
 const MODES = ['off', 'live'];
 const results = [];
 
-const runs = CASES.flatMap(c => MODES.filter(m => m === 'live' || !c.nepqLiveOnly).map(nepqMode => ({ c, nepqMode })));
+const runs = CASES.flatMap(c => MODES.map(nepqMode => ({ c, nepqMode })));
 
 for (const { c, nepqMode } of runs) {
   {
@@ -214,15 +210,12 @@ for (const { c, nepqMode } of runs) {
   }
 }
 
-test('golden set runs every case in the production mode', () => {
+test('golden set runs every case in both NEPQ modes', () => {
   // Runs last (node:test keeps file order): a case that stops running silently
   // must not leave the scorecard looking complete.
   const rows = summarize(results);
   assert.equal(results.length, runs.length, `ran ${results.length} of ${runs.length}`);
-  const live = rows.find(r => r.group === 'nepq live');
-  assert.equal(live?.n, CASES.length, 'every case runs in the production mode');
-  // The rollback-mode gap may shrink (a guard moved out of enforceNepqPlan), never grow unnoticed.
-  assert.ok(CASES.filter(c => c.nepqLiveOnly).length <= 3, 'a new live-only case widens the rollback-mode gap: fix the guard instead');
+  for (const r of rows) assert.equal(r.n, CASES.length, `${r.group}: ${r.n} of ${CASES.length} cases`);
   assert.match(INVARIANTS_VERSION, /^\d{4}-\d{2}-\d{2}\.\d+$/);
 });
 
@@ -254,6 +247,15 @@ test('invariants: each known bad reply is caught by its own check', () => {
   expect('Got it — we can help. What area are you in?', 'human_voice:em_dash');
   expect('', 'empty_reply');
   expect('Sorry to see you go.', 'replied_to_opt_out', { expectSilent: true });
+});
+
+test('invariants: "about a month" is time, not a price; "89 a month" is a price', () => {
+  // 2026-10-05 replay: MONEY_RX read any "a month" as a payment, so the live
+  // guard deleted "I'll check back in about a month." and the check flagged it.
+  assert.deepEqual(checkReply("Absolutely, Richard. I'll check back in about a month.", { channel: 'sms' }).violations, []);
+  for (const priced of ['It runs about 89 a month.', 'Plans start at $89 a month.', 'Most pay under 150/month.', 'It is about 100 per month.']) {
+    assert.ok(checkReply(priced, { channel: 'sms' }).violations.some(v => v.code === 'money_figure'), priced);
+  }
 });
 
 test('invariants: unknown context is skipped, never guessed', () => {

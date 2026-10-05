@@ -31,7 +31,7 @@ import { enforceOneAsk } from '../agentic/one-ask.js';
 import { dropUnaskedCallOffer, leadWantsCall, MONEY_RX, URGENCY_RX, CLAIMS_RX } from '../agentic/nepq-planner.js';
 
 /** Bump when a check is added or changed, so scorecards from two versions are not compared as one. */
-export const INVARIANTS_VERSION = '2026-10-05.1';
+export const INVARIANTS_VERSION = '2026-10-05.2';
 
 // A merge tag or a script blank that reached the customer: "{{contact.first_name}}",
 // "[YOUR NAME]" (prospect 462947's LP note, 2026-10-05).
