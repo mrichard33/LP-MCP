@@ -494,3 +494,19 @@ test('guard: a repeated question that is the only question stays (no reply of ju
   assert.match(out.text, /\?$/);
   assert.ok(!out.changes.includes('repeat_sentence'));
 });
+
+// 2026-10-05 golden replay: the money / pressure / unasked-call drops ran only
+// inside enforceNepqPlan, so the NEPQ-off live chat shipped them untouched.
+test('dropUnsafeLines: the drops every reply gets, plan or no plan', async () => {
+  const { dropUnsafeLines } = await import('../src/agentic/nepq-planner.js');
+  const r = dropUnsafeLines('Most projects run about $89 per month. Our calendar is filling up fast right now. What got you looking? — Reece Team');
+  assert.equal(r.text, 'What got you looking? — Reece Team', 'the sign-off survives');
+  assert.deepEqual(r.changes.sort(), ['fake_urgency', 'money_figures']);
+  assert.equal(dropUnsafeLines("I'll check back in about a month. Take care.").changes.length, 0, '"about a month" is not a price');
+  // An offer goes; our own promise of a call stays only when keepPromises.
+  const offer = "A quick call would let us figure out what's happening. A team member will call you to set up a time.";
+  assert.equal(dropUnsafeLines(offer).text, '', 'with a plan, enforceNepqPlan decides promises through `handoff`');
+  assert.equal(dropUnsafeLines(offer, { keepPromises: true }).text, 'A team member will call you to set up a time.');
+  assert.equal(dropUnsafeLines(offer, { keepCallOffer: true }).changes.length, 0, 'the lead asked for a call');
+  assert.equal(dropUnsafeLines('What got you looking?').text, 'What got you looking?');
+});

@@ -1019,14 +1019,14 @@ export function planNepqTurn({
 // Money in chat (Mark, 2026-10-02: never prices, savings or financing
 // figures). The live chat sent "$89–$149 per month, no money down" — that
 // sentence goes, whatever its source.
-const MONEY_RX = /\$\s?\d|\b\d[\d,]*\s*(?:dollars|bucks)\b|\b(?:per|a)\s+month\b|\/\s?mo\b|\bmonthly\s+payments?\b|\bno\s+money\s+down\b|\b0\s?%|\bapr\b|\b\d+\s?%\s+off\b|\bsave\s+(?:up\s+to\s+)?\d/i;
-const URGENCY_RX = /\bonly\s+\d+\s+(?:spots?|slots?|openings?)\s+left\b|\bspots?\s+(?:are\s+)?filling\b|\bprices?\s+(?:are\s+)?going\s+up\b|\bact\s+(?:now|fast)\b|\blimited\s+time\b|\bbefore\s+(?:it'?s|its)\s+too\s+late\b|\bdon'?t\s+miss\b|\b(?:calendar|schedule|calls?)(?:'s|\s+is|\s+are)?\s+(?:tight|packed|full|filling(?:\s+up)?|booking\s+up(?:\s+fast)?|moving\s+fast)\b|\bpeak\s+season\b|\bspeeding\s+up\s+these\s+decisions\b/i;
+export const MONEY_RX = /\$\s?\d|\b\d[\d,]*\s*(?:dollars|bucks)\b|\bper\s+month\b|\d[\d,.]*\s*(?:a|\/)\s*month\b|\/\s?mo\b|\bmonthly\s+payments?\b|\bno\s+money\s+down\b|\b0\s?%|\bapr\b|\b\d+\s?%\s+off\b|\bsave\s+(?:up\s+to\s+)?\d/i;
+export const URGENCY_RX = /\bonly\s+\d+\s+(?:spots?|slots?|openings?)\s+left\b|\bspots?\s+(?:are\s+)?filling\b|\bprices?\s+(?:are\s+)?going\s+up\b|\bact\s+(?:now|fast)\b|\blimited\s+time\b|\bbefore\s+(?:it'?s|its)\s+too\s+late\b|\bdon'?t\s+miss\b|\b(?:calendar|schedule|calls?)(?:'s|\s+is|\s+are)?\s+(?:tight|packed|full|filling(?:\s+up)?|booking\s+up(?:\s+fast)?|moving\s+fast)\b|\bpeak\s+season\b|\bspeeding\s+up\s+these\s+decisions\b/i;
 // 2026-10-02 funnel audit: the SMS bot leaned on "our calendar's tight right
 // now" / "calls are booking up fast" in most booking turns. Invented scarcity.
 // Claims nobody approved (2026-10-02 simulation: "that's right at the edge of
 // when Florida code tightened up", "with us at the peak of hurricane season").
 // Code history and season-peak talk are pressure dressed as fact.
-const CLAIMS_RX = /\bcode\s+(?:changed|tightened|got\s+(?:stricter|tighter)|was\s+(?:updated|changed))\b|\b(?:after|since|before)\s+(?:the\s+)?(?:19|20)\d\d\b[^.?!]{0,40}\bcode\b|\bcode\b[^.?!]{0,40}\b(?:after|since|before)\s+(?:19|20)\d\d\b|\bpeak\s+(?:of\s+)?(?:the\s+)?(?:hurricane|storm)\s+season\b|\bmost\s+active\s+(?:stretch|part|time)\b|\b(?:storm\s+season|we)\s+(?:has|have)\s+(?:us\s+)?(?:slammed|swamped)\b|\bcalendar\s+(?:is\s+)?(?:tight|filling|full)\b|\b(?:andersen|renewal|pgt|pella|lowe'?s|home\s+depot|es\s+windows|cgi)\b[^.?!]{0,60}\b(?:uses?|only|standard|cheap\w*|worse|inferior|lower|basic)\b/i;
+export const CLAIMS_RX = /\bcode\s+(?:changed|tightened|got\s+(?:stricter|tighter)|was\s+(?:updated|changed))\b|\b(?:after|since|before)\s+(?:the\s+)?(?:19|20)\d\d\b[^.?!]{0,40}\bcode\b|\bcode\b[^.?!]{0,40}\b(?:after|since|before)\s+(?:19|20)\d\d\b|\bpeak\s+(?:of\s+)?(?:the\s+)?(?:hurricane|storm)\s+season\b|\bmost\s+active\s+(?:stretch|part|time)\b|\b(?:storm\s+season|we)\s+(?:has|have)\s+(?:us\s+)?(?:slammed|swamped)\b|\bcalendar\s+(?:is\s+)?(?:tight|filling|full)\b|\b(?:andersen|renewal|pgt|pella|lowe'?s|home\s+depot|es\s+windows|cgi)\b[^.?!]{0,60}\b(?:uses?|only|standard|cheap\w*|worse|inferior|lower|basic)\b/i;
 const SEE_YOU_RX = /\bsee\s+you\s+(?:then|soon|there)\b/i;
 const SIGNOFF_RX = /(?:^|\s)([—–-]\s*[A-Z][A-Za-z.'’ ]{0,40})\s*$/;
 const FIXED_MOVES = new Set(['handoff', 'objection_play', 'ask_day', 'close', 'reveal', 'offer_slots', 'status_frame', 'dnk']);
@@ -1282,6 +1282,62 @@ export function pickFresh(variants, recentOutbound = [], seed = 0) {
  * Enforce a plan on a finished draft. Deterministic: no second model call.
  * @returns {{ text: string, changes: string[] }}
  */
+/**
+ * The drops every bot reply gets, plan or no plan: money figures, invented
+ * urgency, unapproved claims, and a phone call the lead did not ask for.
+ *
+ * 2026-10-05 (golden replay): these lived only inside enforceNepqPlan, so with
+ * NEPQ_BACKBONE_MODE=off (the rollback switch) the live chat sent "$89 to $149
+ * per month", "our calendar is filling up" and "a quick call would help"
+ * untouched. One copy of the rule, called by enforceNepqPlan and by the
+ * live chat's no-plan path. Pure.
+ *
+ * `keepPromises`: a statement that WE will call ("A team member will call you
+ * to set up a time", `promisedCallback`) stays and only offers go. The no-plan
+ * live chat's next step IS that promise (bookingHandoffLine), and the call is
+ * filed for real; with a plan, enforceNepqPlan decides through `handoff`.
+ *
+ * @param {string[]} sentences
+ * @param {{allowFigures?: boolean, keepCallOffer?: boolean, keepPromises?: boolean}} [opts]
+ * @returns {{sentences: string[], changes: string[]}}
+ */
+export function dropUnsafeSentences(sentences, { allowFigures = false, keepCallOffer = false, keepPromises = false } = {}) {
+  const changes = [];
+  let out = [...sentences];
+  const drop = (pred, tag) => {
+    const before = out.length;
+    out = out.filter(s => !pred(s));
+    if (out.length !== before) changes.push(tag);
+  };
+  if (!allowFigures) drop(s => MONEY_RX.test(s), 'money_figures');
+  // 2026-10-02 re-run: "Our calendar's tight right now, so the quickest way
+  // to grab a day is here: <link>" was the whole reply, so dropping it left
+  // nothing and the original shipped. Cut the pressure clause and keep the rest.
+  out = out.map(s => {
+    if (!URGENCY_RX.test(s)) return s;
+    const rest = s.replace(/^[^,;]*?,\s*(?:so\s+|and\s+)?/, '');
+    if (rest === s || URGENCY_RX.test(rest) || rest.split(/\s+/).length < 4) return s;
+    changes.push('fake_urgency');
+    return rest.charAt(0).toUpperCase() + rest.slice(1);
+  });
+  drop(s => URGENCY_RX.test(s), 'fake_urgency');
+  drop(s => CLAIMS_RX.test(s), 'unapproved_claim');
+  // No phone call the lead did not ask for (2026-10-03).
+  if (!keepCallOffer) drop(s => CALL_OFFER_SENTENCE_RX.test(s) && !(keepPromises && promisedCallback(s)), 'unasked_call_offer_dropped');
+  return { sentences: out, changes: [...new Set(changes)] };
+}
+
+/** dropUnsafeSentences over a whole reply, keeping a "— Name" sign-off. Pure. @returns {{text: string, changes: string[]}} */
+export function dropUnsafeLines(text, opts = {}) {
+  const original = String(text || '');
+  const signOff = original.match(SIGNOFF_RX);
+  const body = signOff ? original.slice(0, signOff.index).trim() : original.trim();
+  const { sentences, changes } = dropUnsafeSentences(splitSentences(body), opts);
+  if (!changes.length) return { text: original, changes };
+  const kept = sentences.join(' ').trim();
+  return { text: signOff && kept ? `${kept} ${signOff[1].trim()}` : kept, changes };
+}
+
 export function enforceNepqPlan(draft, plan, { allowFigures = false, known = {} } = {}) {
   const original = String(draft || '');
   if (!plan) return { text: original, changes: [] };
@@ -1305,31 +1361,18 @@ export function enforceNepqPlan(draft, plan, { allowFigures = false, known = {} 
     sentences = sentences.filter(s => !pred(s));
     if (sentences.length !== before) changes.push(tag);
   };
-  // 2. No money, no pressure.
-  if (!allowFigures) drop(s => MONEY_RX.test(s), 'money_figures');
-  // 2026-10-02 re-run: "Our calendar's tight right now, so the quickest way
-  // to grab a day is here: <link>" was the whole reply, so dropping it left
-  // nothing and the original shipped. Cut the pressure clause and keep the rest.
-  sentences = sentences.map(s => {
-    if (!URGENCY_RX.test(s)) return s;
-    const rest = s.replace(/^[^,;]*?,\s*(?:so\s+|and\s+)?/, '');
-    if (rest === s || URGENCY_RX.test(rest) || rest.split(/\s+/).length < 4) return s;
-    changes.push('fake_urgency');
-    return rest.charAt(0).toUpperCase() + rest.slice(1);
-  });
-  drop(s => URGENCY_RX.test(s), 'fake_urgency');
-  drop(s => CLAIMS_RX.test(s), 'unapproved_claim');
+  // 2. No money, no pressure, no call the lead did not ask for (dropUnsafeSentences).
+  // A hand-off or callback line is our own promise of a call and stays.
+  const keepCallOffer = !!plan.lead_wants_call || !!plan.handoff || !!(referenceMove && CALL_OFFER_SENTENCE_RX.test(refLine || ''));
+  const unsafe = dropUnsafeSentences(sentences, { allowFigures, keepCallOffer });
+  sentences = unsafe.sentences;
+  changes.push(...unsafe.changes);
   // 2b. "Do you offer financing?" keeps its yes when the figure strip took the
   // answer sentence (2026-10-02 simulation: "Yes, we offer 0% APR financing"
   // went, and only "What's got you looking into windows now?" was left).
   if (plan.financing_ask && changes.includes('money_figures') && !sentences.some(s => /^(?:yes|yep|yeah|absolutely|we\s+(?:do|offer|have))\b/i.test(s) || /\bfinanc/i.test(s))) {
     sentences.unshift(LINES.financing_yes);
     changes.push('financing_yes');
-  }
-  // 2b2. No phone call the lead did not ask for (2026-10-03). A hand-off or
-  // callback line is our own promise of a call and stays.
-  if (!plan.lead_wants_call && !plan.handoff && !(referenceMove && CALL_OFFER_SENTENCE_RX.test(refLine || ''))) {
-    drop(s => CALL_OFFER_SENTENCE_RX.test(s), 'unasked_call_offer_dropped');
   }
   // 2c. The consequence question once per conversation, however it is worded.
   if (plan.required_move !== 'consequence' && plan.counters?.consequence_used) drop(s => s.includes('?') && CONSEQUENCE_RX.test(s), 'consequence_repeat');

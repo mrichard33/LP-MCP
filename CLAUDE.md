@@ -824,6 +824,18 @@ and `tests` (`npm ci` + `npm test`), and `tests` **blocks**.
 If the suite goes red, fix the code or the test. Do not skip, quarantine, or restore
 `continue-on-error` — a suppressed test is worse than an ungated one, because it reads as green.
 
+**Every finished bot reply is held to one set of hard checks (2026-10-05).** `checkReply` in
+`src/eval/reply-invariants.js` checks for: a merge tag sent, a personal name or the founder slip,
+property scope, money, pressure, Florida-only, more than one ask, an unbacked booking claim, a call
+promised out of hours, and an unasked call offer. It reuses the guards (a finished reply must be a
+fixed point of each one), so a rule lives in its guard, not here. Context it cannot know is
+SKIPPED, never guessed.
+- `scripts/test-golden-replay.js` replays each known incident's real bad draft through the live-chat
+  lane, with NEPQ live and off. **When a bad reply reaches a customer, add its draft there.**
+- `node scripts/eval-replay.js --days 7 --by version` scores the replies actually sent, read-only,
+  from `bot_message_context`. Customer conversations stay in the database and are never committed
+  (the user's ruling, 2026-10-05).
+
 ## Writing code here
 
 Existing modules carry dated comments explaining *why* a thing is the way it is, usually naming the
