@@ -51,6 +51,7 @@ import {
 import { buildEstablishedFacts } from '../agentic/established-facts.js';
 import { humanizeReply, restoreQuestionMark } from '../agentic/human-voice.js';
 import { enforceTeamVoice } from '../agentic/team-voice.js';
+import { enforcePropertyScope } from '../agentic/property-scope.js';
 import { enforceCallTiming, promisedCallback } from '../agentic/team-hours.js';
 import { rewriteBookingClaims } from '../agentic/booking-claim.js';
 import { enforceOneAsk } from '../agentic/one-ask.js';
@@ -1573,6 +1574,13 @@ export function createLiveChatFastLane(deps) {
       if (team.changes.length || callTiming.changed) {
         d.log(`[TeamVoice] live chat ${contactId} ${[...team.changes, ...(callTiming.changed ? ['call_timing'] : [])].join(',')}`);
         draft = callTiming.text;
+      }
+      // We do not work on manufactured or mobile homes (2026-10-05): this
+      // lane told a visitor "Yes, we work on manufactured homes."
+      const scope = enforcePropertyScope(draft, { inbound: body });
+      if (scope.changed) {
+        d.log(`[PropertyScope] live chat ${contactId} ${scope.reason}`);
+        draft = scope.text;
       }
     }
     let ghlMessageId = null;
