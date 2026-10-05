@@ -37,6 +37,11 @@
  * replaces or extends it. Ships on 'shadow', which logs and changes nothing.
  * Contract 2 (fail-open) covers it: any error or timeout forwards unchanged.
  *
+ * REP BRIEF (2026-10-05, env LP_REP_BRIEF_MODE, default 'shadow'): on 'live'
+ * an AI-written note is replaced by the 2–3 sentence rep brief from
+ * services/rep-brief.js, and the enrichment above is skipped. A null build
+ * falls through to the enrichment above, so 'live' is fail-open too.
+ *
  * ATTRIBUTION FALLBACK (v1.1, 2026-08-18 — env LP_ATTRIBUTION_FALLBACK_MODE,
  * default 'live'): the SECOND field group this proxy may rewrite. When a
  * GHL-originated addlead arrives with no usable srs_id, the lead is stamped
@@ -55,6 +60,8 @@ import { checkDuplicateAppointment } from './services/lp-duplicate-appointment-g
 import { sendGroupMeMessage } from './groupme.js';
 import { flattenWebhookBody } from './webhook-body.js';
 import { fetchAndBuildAgenticNotes, isWeakNotes } from './services/agentic-lead-notes.js';
+import { fetchAndBuildRepBrief, repBriefMode, REP_BRIEF_TOTAL_MS } from './services/rep-brief-io.js';
+import { replaceableNotes } from './services/rep-brief.js';
 import { applyAddressGate } from './services/lp-address-gate.js';
 import { LP_SRS, LP_PRO } from './lp-source-ids.js';
 import {
@@ -430,6 +437,34 @@ export function registerLpAddleadProxyRoutes(app) {
       console.error(`[LP-PROXY] address gate threw — forwarding untouched: ${err.message}`);
     }
 
+    // ── Rep brief (2026-10-05) ──────────────────────────────────────────
+    // The 2–3 sentence note a rep reads (services/rep-brief.js), replacing the
+    // AI-written LEAD/WANTS/OPENER/HEADS UP block that reached LP for prospect
+    // 462947 as 1,400 repetitive characters with "tomorrow" and a script in it.
+    // A person's or a form's note is never replaced (replaceableNotes).
+    // 'live' builds it before the forward, capped (REP_BRIEF_TOTAL_MS); on null
+    // the old enrichment below runs exactly as before. 'shadow' (default) builds
+    // it AFTER the forward and only logs it, so it adds no time to the webhook.
+    const rbMode = repBriefMode();
+    const rbEligible = rbMode !== 'off' && !isBlank(body.lognumber) && replaceableNotes(outbound.notes);
+    const rbOpts = () => ({ body: outbound, hasAppointment: !isBlank(outbound.adate) });
+    let repBriefAction = rbEligible ? rbMode : 'skipped';
+    if (rbEligible && rbMode === 'live') {
+      try {
+        const brief = await raceWithNullTimeout(fetchAndBuildRepBrief(body.lognumber, rbOpts()), REP_BRIEF_TOTAL_MS);
+        if (brief?.notes) {
+          outbound = { ...outbound, notes: brief.notes };
+          repBriefAction = `live_${brief.source}(${brief.notes.length})`;
+        } else {
+          repBriefAction = 'live_no_build';
+        }
+      } catch (err) {
+        repBriefAction = 'live_error';
+        console.warn(`[LP-PROXY] rep brief threw — keeping the old notes path: ${err.message}`);
+      }
+    }
+    const repBriefLive = repBriefAction.startsWith('live_ai') || repBriefAction.startsWith('live_fallback');
+
     // ── Agentic notes enrichment ────────────────────────────────────────
     // A rich brief already on the body (canvassing, or a healthy ChatGPT-node
     // output) is never clobbered: 'live' only replaces a weak one, and
@@ -445,7 +480,7 @@ export function registerLpAddleadProxyRoutes(app) {
     // null build forwards the body untouched.
     const nMode = notesMode();
     let notesAction = 'skipped';
-    if (nMode !== 'off' && !isBlank(body.lognumber)) {
+    if (nMode !== 'off' && !isBlank(body.lognumber) && !repBriefLive) {
       const weak = isWeakNotes(outbound.notes);
       // 'augment' is the only mode that touches a healthy brief. 'shadow'
       // builds in both cases so the true before/after is visible in logs
@@ -483,11 +518,25 @@ export function registerLpAddleadProxyRoutes(app) {
       console.log(
         `[LP-PROXY] ${body.sender || '?'} log=${body.lognumber || '?'} mode=${mode} ` +
         `attribution=${aMode}/${attribution.reason}${attribution.applied ? `→${LP_SRS.CHATBOT}/${LP_PRO.CHATBOT}` : ''} ` +
-        `notes=${nMode}/${notesAction} ` +
+        `notes=${nMode}/${notesAction} rep_brief=${repBriefAction} ` +
         `address_gate=${gate ? `${gate.mode}/${gate.reason}${gate.would_hold ? '/WOULD_HOLD' : ''}` : 'skipped'} ` +
         `plan=${plan.action}/${plan.reason} lp=${lp.status} ${Date.now() - started}ms`
       );
       res.status(lp.status).type(lp.contentType).send(lp.raw);
+      if (rbEligible && rbMode === 'shadow') {
+        // After the response: shadow costs the webhook nothing. Log only.
+        const sentNotes = outbound.notes;
+        fetchAndBuildRepBrief(body.lognumber, rbOpts())
+          .then((brief) => {
+            if (!brief) return;
+            console.log(
+              `[LP-PROXY] 🕶️ REP BRIEF SHADOW log=${body.lognumber} source=${brief.source} — NOT sent:\n` +
+              `  would send (${brief.notes.length}): ${brief.notes}\n` +
+              `  sent (${String(sentNotes || '').length}): ${String(sentNotes || '').slice(0, 1500)}`
+            );
+          })
+          .catch(() => {});
+      }
     } catch (err) {
       // LP unreachable/slow: surface an error status so GHL's existing
       // "No Error"/Default retry branches behave exactly as they do today

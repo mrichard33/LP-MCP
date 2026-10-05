@@ -122,6 +122,11 @@ const FUNCTION_GROUPS = {
   // 2026-10-02 review: was unmapped, so it fell through to the GLOBAL model
   // instead of the analysis group every other extractor rides.
   identity_extraction: 'decision_engine', // src/services/identity-extraction.js
+  // 2026-10-05 — the 2–3 sentence note a rep reads in LP. Internal (never a
+  // customer), a summary of a chat, so it rides the analysis group. Override
+  // with REP_BRIEF_MODEL_ANTHROPIC; a slow model only costs the AI sentences
+  // (src/services/rep-brief-io.js caps it and falls back to fixed ones).
+  rep_brief: 'decision_engine',          // src/services/rep-brief.js
   // customer-facing — text a human reads
   response_generator: 'customer_facing', // src/response-generator.js
   // 2026-09-26 — website live chat, one merged classify+reply call under a
