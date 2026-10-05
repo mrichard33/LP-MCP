@@ -11,7 +11,7 @@ import { findUnissuedInboundRow, inboundDeferMode, inboundDeferMaxAgeMin,
          inboundDeferDecision, heldInboundEscalation, apptStartMsET,
          formatHeldInboundCard, escalateHeldInbound, firstHoldForRow }
   from '../src/lp-appointment-sync.js';
-import { isTeamOpen } from '../src/agentic/team-hours.js';
+import { isTeamOpen, openMinutesSince } from '../src/agentic/team-hours.js';
 import { lpStoredAgeMinutes, utcToLpStoredIso } from '../src/lp-dates.js';
 
 const stub = (rows) => ({ getInboundLeadInfo: async () => rows });
@@ -137,17 +137,38 @@ test('a lowered max age moves the boundary but not the hasAppt rule', () => {
 
 const APPT_MON_2PM = apptStartMsET('2026-10-05', '14:00');
 const MON_9AM_ET = Date.parse('2026-10-05T13:00:00Z');   // 9:00 AM EDT
+const MON_924AM_ET = Date.parse('2026-10-05T13:24:00Z'); // when #1166's card actually fired
+const MON_1005AM_ET = Date.parse('2026-10-05T14:05:00Z');
 const SUN_11PM_ET = Date.parse('2026-10-05T03:00:00Z');  // Sun 11:00 PM EDT
-const E = (o) => heldInboundEscalation({ maxAgeMin: 360, teamOpen: isTeamOpen(o.nowMs), ...o });
+// Mirrors the call site: open minutes counted from the row's arrival.
+const E = (o) => heldInboundEscalation({
+  maxAgeMin: 360, openMinNeeded: 60,
+  openMin: openMinutesSince(o.nowMs - (o.ageMin ?? 0) * 60000, o.nowMs), ...o,
+});
 
 test('ET appointment converts to the real instant (2:00 PM EDT = 18:00Z)', () => {
   assert.equal(new Date(APPT_MON_2PM).toISOString(), '2026-10-05T18:00:00.000Z');
   assert.equal(apptStartMsET(null, '14:00'), null);
 });
 
-test('visit tomorrow + row 40 min old + 9 AM ET → escalate', () => {
-  assert.equal(isTeamOpen(MON_9AM_ET), true);
-  assert.equal(E({ ageMin: 40, apptStartMs: APPT_MON_2PM, nowMs: MON_9AM_ET }), 'escalate');
+test('openMinutesSince: 0 while closed; counts from opening or arrival, whichever is later', () => {
+  assert.equal(openMinutesSince(SUN_11PM_ET - 3600_000, SUN_11PM_ET), 0);
+  assert.equal(openMinutesSince(SUN_11PM_ET, MON_924AM_ET), 24);      // overnight row: from 9 AM
+  const elevenAm = Date.parse('2026-10-05T15:00:00Z');
+  assert.equal(openMinutesSince(elevenAm, elevenAm + 30 * 60000), 30); // daytime row: from arrival
+});
+
+test('the user ruling: no card the moment we open — 9:24 AM waits, 10:05 AM still waiting posts', () => {
+  // Row 428372 arrived Sun 7:36 PM; at 9:24 AM it was 828 min old (stale and visit today).
+  assert.equal(E({ ageMin: 828, apptStartMs: APPT_MON_2PM, nowMs: MON_924AM_ET }), 'wait_for_team');
+  assert.equal(E({ ageMin: 869, apptStartMs: APPT_MON_2PM, nowMs: MON_1005AM_ET }), 'escalate');
+});
+
+test('a row that arrives at 11 AM gets no card until noon', () => {
+  const elevenAm = Date.parse('2026-10-05T15:00:00Z');
+  const tomorrow = apptStartMsET('2026-10-06', '10:00'); // within 24h of 11 AM
+  assert.equal(E({ ageMin: 40, apptStartMs: tomorrow, nowMs: elevenAm + 40 * 60000 }), 'wait_for_team');
+  assert.equal(E({ ageMin: 61, apptStartMs: tomorrow, nowMs: elevenAm + 61 * 60000 }), 'escalate');
 });
 
 test('same row at 11 PM ET → waits for team hours (the 428372 night)', () => {
@@ -157,18 +178,19 @@ test('same row at 11 PM ET → waits for team hours (the 428372 night)', () => {
 
 test('visit next week + row 40 min old → nothing yet', () => {
   const nextWeek = apptStartMsET('2026-10-12', '14:00');
-  assert.equal(E({ ageMin: 40, apptStartMs: nextWeek, nowMs: MON_9AM_ET }), 'none');
+  assert.equal(E({ ageMin: 40, apptStartMs: nextWeek, nowMs: MON_1005AM_ET }), 'none');
 });
 
 test('row younger than 30 min → nothing yet, even for a visit today', () => {
-  assert.equal(E({ ageMin: 10, apptStartMs: APPT_MON_2PM, nowMs: MON_9AM_ET }), 'none');
+  assert.equal(E({ ageMin: 10, apptStartMs: APPT_MON_2PM, nowMs: MON_1005AM_ET }), 'none');
 });
 
 test('stale row still escalates whatever the visit date; unknown age never does', () => {
   const nextWeek = apptStartMsET('2026-10-12', '14:00');
-  assert.equal(E({ ageMin: 400, apptStartMs: nextWeek, nowMs: MON_9AM_ET }), 'escalate');
-  assert.equal(E({ ageMin: 400, apptStartMs: null, nowMs: MON_9AM_ET }), 'escalate');
-  assert.equal(E({ ageMin: null, apptStartMs: APPT_MON_2PM, nowMs: MON_9AM_ET }), 'none');
+  assert.equal(E({ ageMin: 900, apptStartMs: nextWeek, nowMs: MON_1005AM_ET }), 'escalate');
+  assert.equal(E({ ageMin: 900, apptStartMs: null, nowMs: MON_1005AM_ET }), 'escalate');
+  assert.equal(E({ ageMin: 400, apptStartMs: null, nowMs: MON_9AM_ET }), 'wait_for_team');
+  assert.equal(E({ ageMin: null, apptStartMs: APPT_MON_2PM, nowMs: MON_1005AM_ET }), 'none');
 });
 
 test('card names the row, the visit, and what is blank — plain English', () => {

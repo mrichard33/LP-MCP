@@ -315,6 +315,18 @@ export const JOBS = Object.freeze([
     isEnabled: (env) => String(env.MISSED_CALLER_RECOVERY_MODE || 'shadow').toLowerCase().trim() !== 'off',
   },
   {
+    id: 'new-lead-dial-backstop',
+    label: 'New LP leads nobody called → Conf / Callback Request list',
+    group: 'five9',
+    cadence: 'every 5 min, 08:00–19:45 ET',
+    enabledEnv: 'NEW_LEAD_DIAL_BACKSTOP_MODE',
+    // A MODE (2026-10-05): off | shadow | live, default shadow. Mirrors
+    // backstopMode() in src/new-lead-dial-backstop.js — only an explicit 'off'
+    // stops it; shadow decides every pass and logs would-push.
+    enabledDefault: true,
+    isEnabled: (env) => String(env.NEW_LEAD_DIAL_BACKSTOP_MODE || 'shadow').toLowerCase().trim() !== 'off',
+  },
+  {
     id: 'lead-leak-monitor',
     label: 'Lead leak monitor (uncalled LP leads)',
     group: 'five9',
