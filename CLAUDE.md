@@ -133,13 +133,20 @@ card the moment we open, staff work the overnight queue first). Audit `lp_inboun
 **Every imported LP lead reaches a Five9 list (2026-10-05).** LP pushes a row to LP_ASAP only at its own
 auto-import; a row a person imports later, or one auto-imported overnight, waits for LP's 6 AM load (Sunday's 4
 hand-imported rows sat in Five9 on no list; 0 of 14 overnight rows were called at 8 AM). `src/jobs/new-lead-dial-backstop.js`
-(rules in `src/new-lead-dial-backstop.js`, every 5 min 8:00–19:45 ET, `NEW_LEAD_DIAL_BACKSTOP_MODE` off|shadow|live,
-default shadow) pushes every imported, never-called lead from the last 72h to the user's lists: visit today or
-tomorrow → "Conf - Next Day", 2+ days → "Conf - 2nd Day", no visit → "Callback Request". Never LP_ASAP
-(`executeAddRecordsToList` refuses it). Unimported rows are the held-row card's job, never pushed; dead or worked
-dispositions (read from `lp_leads`, which overrides the inbound row) and Five9 DNC numbers are skipped; a lead on
-another list gets 30 dial minutes first. Once per row per list and per phone per day (`lp_appointment_sync_marks`,
-claimed before the push). Shadow posts nothing; live posts one #contact-center card per pass only when it pushed.
+(rules in `src/new-lead-dial-backstop.js`, every 5 min 24/7, `NEW_LEAD_DIAL_BACKSTOP_MODE` off|shadow|live,
+default shadow) pushes every imported, never-called lead from the last 72h to the user's lists (ruling 2026-10-06):
+visit today or tomorrow → "Conf - Next Day", 2+ days → "Conf - 2nd Day"; a requested callback is left to the callback
+path; otherwise, while the Five9 record is ≤ 14h old (`NEW_LEAD_BACKSTOP_DIAL_ASAP_MAX_AGE_H`), a DIAL ASAP list:
+"Reece Chatbot" for the Reece ChatBot source, "Direct Lead Entry" for the rest; older → "Callback Request" (AddToList
+keeps Five9's create time, which DIAL ASAP's filter reads). Never LP_ASAP (`executeAddRecordsToList` refuses it) and
+never "After DIAL ASAP" (Five9's own connector fills it). **LP's inbound read pages by blocks of ids, so a page can come
+back short mid-stream: only an EMPTY page ends it** (a 199-row page 3 hid ~300 leads on 2026-10-05/06). lp_leads in
+the window is a second source. Unimported rows are the held-row card's job, never pushed; sold phones, dead or worked
+dispositions (read from `lp_leads`, which overrides the inbound row), Five9 attempts on this lead and Five9 DNC numbers
+are skipped; a failed Five9 read waits (fail closed); a lead on LP_ASAP gets 30 dial minutes first. Once per row per
+list and per phone per day (`lp_appointment_sync_marks`, claimed before the push). Every decision is in
+`job_runs.detail.by_reason`. Shadow posts nothing; live posts one #contact-center card per pass that pushed (overnight
+pushes: one card at 8:00 ET), and names in #ops, once, any lead 30+ dial minutes old with no call, push or reason.
 `findContactInOtherLists` is NOT used here: it has never worked in production (bare-array criteria) and
 `f9_last_list` keeps the last list ever, so a naive fix would block most callbacks.
 
