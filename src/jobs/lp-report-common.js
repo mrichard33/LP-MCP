@@ -10,6 +10,7 @@
 // never touches report money.
 
 import { createHash } from 'node:crypto';
+import { checkRequestSecret } from '../security/request-auth.js';
 import { resolveMarketFromBranch } from './market-resolver.js';
 
 /**
@@ -333,15 +334,38 @@ export function warnUnauthenticatedIngest(where) {
  * Logs rejections, never the supplied value — it may be a near-miss of the real
  * secret and the logs are less protected than the environment.
  */
-export function ingestAuthorized(req, where) {
-  const provided = req.headers['x-ghl-signature'] || req.headers['x-webhook-secret'] || '';
-  if (!INGEST_SECRET) {
-    warnUnauthenticatedIngest(where);
-    return true;
+export function ingestAuthDecision(req, where, opts = {}) {
+  const decision = checkRequestSecret(req, {
+    route: req.path || where,
+    secret: opts.secret ?? INGEST_SECRET,
+    headers: ['x-ghl-signature', 'x-webhook-secret'],
+    mode: opts.mode,
+    record: opts.record,
+  });
+  if (decision.reason === 'secret_unset' && decision.allow) warnUnauthenticatedIngest(where);
+  if (!decision.allow) {
+    console.warn(`[${where}] REJECTED ingest: ${req.method} ${req.originalUrl} from ${req.ip} (${decision.reason})`);
   }
-  if (provided === INGEST_SECRET) return true;
-  console.warn(`[${where}] REJECTED unauthenticated ingest: ${req.method} ${req.originalUrl} from ${req.ip} (signature ${provided ? 'mismatched' : 'absent'})`);
-  return false;
+  return decision;
+}
+
+/**
+ * Staged (2026-10-06, src/security/request-auth.js): constant-time, and an
+ * unset secret stays open only under AUTH_ENFORCE_MODE=log.
+ */
+export function ingestAuthorized(req, where, opts = {}) {
+  return ingestAuthDecision(req, where, opts).allow;
+}
+
+/**
+ * Answer the refusal for an ingest route. Returns true when it did (the
+ * caller returns). 503 when the secret is unset under enforce, else 401.
+ */
+export function refuseIngest(req, res, where) {
+  const d = ingestAuthDecision(req, where);
+  if (d.allow) return false;
+  res.status(d.status).json({ success: false, error: d.status === 503 ? 'auth_not_configured' : 'bad signature' });
+  return true;
 }
 
 /** Announce the auth posture at route registration, not on the first POST. */

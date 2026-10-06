@@ -44,6 +44,7 @@
  * sms_sent, team_acknowledged }. Stubbed for future tracking.
  */
 
+import { checkRequestSecret } from '../security/request-auth.js';
 import crypto from 'crypto';
 import supabase from '../supabase.js';
 import { loadAppointmentContext } from './appointment-intelligence.js';
@@ -575,25 +576,27 @@ function isFeatureEnabled() {
  * Lengths and booleans only. Never the token, never a prefix of it.
  */
 function checkBearerAuth(req) {
-  const token = process.env.MESSAGE_ENGINE_TOKEN;
-  if (!token) return { ok: true };
+  // Staged, constant-time (2026-10-06, src/security/request-auth.js): open
+  // when MESSAGE_ENGINE_TOKEN is unset only under AUTH_ENFORCE_MODE=log.
+  const token = process.env.MESSAGE_ENGINE_TOKEN || '';
+  const d = checkRequestSecret(req, { route: req.path || 'appointment-notifications', secret: token, bearer: true });
+  if (d.allow) return { ok: true };
+  if (d.status === 503) return { ok: false, status: 503, fingerprint: { secret_unset: true } };
   const auth = req.headers.authorization || '';
   const headerPresent = auth.length > 0;
   const scheme = auth.startsWith('Bearer ') ? 'bearer' : (headerPresent ? 'other' : 'none');
   const provided = auth.startsWith('Bearer ') ? auth.slice(7) : null;
-  if (provided !== token) {
-    return {
-      ok: false,
-      fingerprint: {
-        header_present: headerPresent,
-        scheme,
-        provided_len: provided == null ? null : provided.length,
-        expected_len: token.length,
-        provided_trimmed_len: provided == null ? null : provided.trim().length,
-      },
-    };
-  }
-  return { ok: true };
+  return {
+    ok: false,
+    status: 401,
+    fingerprint: {
+      header_present: headerPresent,
+      scheme,
+      provided_len: provided == null ? null : provided.length,
+      expected_len: token.length,
+      provided_trimmed_len: provided == null ? null : provided.trim().length,
+    },
+  };
 }
 
 export function registerAppointmentNotificationRoutes(app) {
@@ -653,9 +656,9 @@ export function registerAppointmentNotificationRoutes(app) {
         ghl_writeback_at: null,
         model_used: null,
         data_gaps: fp,
-        error: 'auth_failed:bearer_mismatch',
+        error: authCheck.status === 503 ? 'auth_failed:secret_unset' : 'auth_failed:bearer_mismatch',
       });
-      return res.status(401).json({ ok: false, error: 'unauthorized' });
+      return res.status(authCheck.status).json({ ok: false, error: authCheck.status === 503 ? 'auth_not_configured' : 'unauthorized' });
     }
 
     const { valid, errors, normalized } = validateRequest(merged);
@@ -714,7 +717,7 @@ export function registerAppointmentNotificationRoutes(app) {
   app.post('/api/agentic/notifications/engagement', async (req, res) => {
     const authCheck = checkBearerAuth(req);
     if (!authCheck.ok) {
-      return res.status(401).json({ ok: false, error: 'unauthorized' });
+      return res.status(authCheck.status).json({ ok: false, error: authCheck.status === 503 ? 'auth_not_configured' : 'unauthorized' });
     }
 
     const body = extractRequestFields(req.body || {});

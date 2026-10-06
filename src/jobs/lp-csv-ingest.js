@@ -41,7 +41,7 @@ import supabase from '../supabase.js';
 import { getMarketMaps } from './market-resolver.js';
 import {
   sha256Hex, contentSha256, resolveRowMarket, todayET, centsToDollars,
-  ingestAuthorized, assertIngestAuthConfigured,
+  refuseIngest, assertIngestAuthConfigured,
 } from './lp-report-common.js';
 import { logIngest, quarantineRows, alertGroupMe, duplicateResponse, releaseIfEmpty, extractPdfText, extractPdfBboxXml, NoTextLayerError } from './lp-report-ingest.js';
 import {
@@ -1196,7 +1196,7 @@ export async function ingestSalesEfficiencyPdf({ buffer, source = 'n8n' }) {
 }
 
 /** See ingestAuthorized in lp-report-common.js — including why it fails OPEN. */
-const authorized = (req) => ingestAuthorized(req, 'lp-csv-ingest');
+const refuse = (req, res) => refuseIngest(req, res, 'lp-csv-ingest');
 
 export function registerLpCsvRoutes(app) {
   assertIngestAuthConfigured('lp-csv-ingest');
@@ -1206,7 +1206,7 @@ export function registerLpCsvRoutes(app) {
   for (const [slug, reportType] of Object.entries(CSV_REPORT_TYPES)) {
     app.post(`/n8n/admin/lp-csv-ingest/${slug}`, csvText, async (req, res) => {
       try {
-        if (!authorized(req)) return res.status(401).json({ success: false, error: 'bad signature' });
+        if (refuse(req, res)) return;
         if (typeof req.body !== 'string' || !req.body.length) {
           return res.status(400).json({ success: false, error: 'POST the CSV text as the request body (Content-Type: text/csv)' });
         }
@@ -1270,7 +1270,7 @@ export function registerLpCsvRoutes(app) {
   // 2026-08-05 sample; column-band layout, Total-row checksum, MTD guard).
   app.post('/n8n/admin/lp-report-ingest/sales-efficiency', rawPdf, async (req, res) => {
     try {
-      if (!authorized(req)) return res.status(401).json({ success: false, error: 'bad signature' });
+      if (refuse(req, res)) return;
       if (!Buffer.isBuffer(req.body) || !req.body.length) {
         return res.status(400).json({ success: false, error: 'POST the raw PDF bytes as the request body (Content-Type: application/pdf)' });
       }
@@ -1285,7 +1285,7 @@ export function registerLpCsvRoutes(app) {
   // Report 135 — live parser (coordinate clustering over -bbox-layout).
   app.post('/n8n/admin/lp-report-ingest/lead-disposition', rawPdf, async (req, res) => {
     try {
-      if (!authorized(req)) return res.status(401).json({ success: false, error: 'bad signature' });
+      if (refuse(req, res)) return;
       if (!Buffer.isBuffer(req.body) || !req.body.length) {
         return res.status(400).json({ success: false, error: 'POST the raw PDF bytes as the request body (Content-Type: application/pdf)' });
       }
@@ -1300,7 +1300,7 @@ export function registerLpCsvRoutes(app) {
   // Report 136 — live parser (strict fifteen-cell rows, Grand Total gate).
   app.post('/n8n/admin/lp-report-ingest/source-cost', rawPdf, async (req, res) => {
     try {
-      if (!authorized(req)) return res.status(401).json({ success: false, error: 'bad signature' });
+      if (refuse(req, res)) return;
       if (!Buffer.isBuffer(req.body) || !req.body.length) {
         return res.status(400).json({ success: false, error: 'POST the raw PDF bytes as the request body (Content-Type: application/pdf)' });
       }
@@ -1318,7 +1318,7 @@ export function registerLpCsvRoutes(app) {
   for (const [slug, reportType] of Object.entries(PDF_PENDING_TYPES)) {
     app.post(`/n8n/admin/lp-report-ingest/${slug}`, rawPdf, async (req, res) => {
       try {
-        if (!authorized(req)) return res.status(401).json({ success: false, error: 'bad signature' });
+        if (refuse(req, res)) return;
         if (!Buffer.isBuffer(req.body) || !req.body.length) {
           return res.status(400).json({ success: false, error: 'POST the raw PDF bytes as the request body (Content-Type: application/pdf)' });
         }
@@ -1355,7 +1355,7 @@ export function registerLpCsvRoutes(app) {
   // than a second snapshot.
   app.post('/n8n/admin/lp-csv-ingest/reingest-archived', express.json({ limit: '64kb' }), async (req, res) => {
     try {
-      if (!authorized(req)) return res.status(401).json({ success: false, error: 'bad signature' });
+      if (refuse(req, res)) return;
       if (!supabase) return res.status(500).json({ success: false, error: 'Supabase not configured' });
       const body = req.body && typeof req.body === 'object' ? req.body : {};
       // Either address a file directly by its archive path, or name the

@@ -119,6 +119,7 @@
  *   ghl_sent_confirmed despite 5 opened + 2 clicked engagement events.
  */
 
+import { checkRequestSecret, rejectionBody } from '../security/request-auth.js';
 import supabase from '../supabase.js';
 import { emitEvent } from '../event-emitter.js';
 
@@ -552,13 +553,12 @@ export function registerEngagementRoutes(app) {
       const body = extractEngagementFields(req.body);
 
       // Optional bearer auth — matches the generate endpoint.
-      const token = process.env.MESSAGE_ENGINE_TOKEN;
-      if (token) {
-        const auth = req.headers.authorization || '';
-        const provided = auth.startsWith('Bearer ') ? auth.slice(7) : null;
-        if (provided !== token) {
-          return res.status(200).json({ ok: false, error: 'unauthorized' });
-        }
+      // Staged, constant-time (2026-10-06, src/security/request-auth.js).
+      const auth = checkRequestSecret(req, { route: req.path || 'nurture-engagement', secret: process.env.MESSAGE_ENGINE_TOKEN, bearer: true });
+      if (!auth.allow) {
+        return auth.status === 503
+          ? res.status(503).json(rejectionBody(auth))
+          : res.status(200).json({ ok: false, error: 'unauthorized' });
       }
 
       const generation_id = body.generation_id;

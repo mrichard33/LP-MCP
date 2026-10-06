@@ -14,6 +14,7 @@
 // (append-only) before doing any side-effect work, so the audit log is
 // reliable even if downstream calls fail.
 
+import { authEnforceMode, decideSecret, recordAuthWouldReject, rejectionBody } from '../security/request-auth.js';
 import supabase from '../supabase.js';
 import { sendGroupMeMessage } from '../groupme.js';
 import * as workOrders from './work-orders.js';
@@ -22,13 +23,14 @@ import { enrichWorkOrder } from './enrich-worker.js';
 const AFFILIATE_ID = parseInt(process.env.IME_AFFILIATE_ID || '17050371', 10);
 const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
 
+// Staged, constant-time (2026-10-06, src/security/request-auth.js): open when
+// MCP_AUTH_TOKEN is unset only under AUTH_ENFORCE_MODE=log.
 export function requireAuth(req, res, next) {
-  if (!MCP_AUTH_TOKEN) return next();
   const header = req.headers.authorization || '';
   const token = header.replace(/^Bearer\s+/i, '');
-  if (token !== MCP_AUTH_TOKEN) {
-    return res.status(401).json({ error: 'unauthorized' });
-  }
+  const d = decideSecret({ secret: MCP_AUTH_TOKEN, provided: token || null, mode: authEnforceMode() });
+  if (d.wouldReject) recordAuthWouldReject({ route: req.path || 'ime', reason: d.reason, mode: authEnforceMode(), method: req.method });
+  if (!d.allow) return res.status(d.status).json(d.status === 401 ? { error: 'unauthorized' } : rejectionBody(d));
   next();
 }
 

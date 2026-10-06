@@ -255,6 +255,7 @@
  * v1.0   — Initial.
  */
 
+import { cleanInboundForModel } from './security/untrusted-text.js';
 import { buildLeadContext } from './context-builder.js';
 import { classifyInbound, isShortCircuit } from './knowledge/intent-classifier.js';
 import { handoffReplyPolicy, handoffReplyNote, classificationAfterKnock } from './agentic/handoff-policy.js';
@@ -3156,6 +3157,11 @@ export function planAsksForTime(plan, mode) {
 }
 
 export async function generateResponse(contactId, channel, triggerMessage, opts = {}) {
+  // 2026-10-06 (AI OS batch 1, PR 3; src/security/untrusted-text.js): every
+  // read and the prompt below see the inbound with invisible characters
+  // removed (zero-width, bidi, TAG). The send handler stores the original.
+  const inboundClean = cleanInboundForModel(triggerMessage);
+  if (triggerMessage != null) triggerMessage = inboundClean.text;
   // 2026-09-16 — start the KB query embedding BEFORE the first await. It costs
   // ~770ms against a 1500ms per-tier budget when left to fire lazily inside
   // buildKbPack, which is what made 41 of 217 semantic lookups time out over 13
@@ -4984,6 +4990,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
         // wrong by an hour or a day without the ET wall-clock it generated at.
         nowEt: new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }),
         extra: {
+          inbound_removed_chars: inboundClean.removedCount,
           traffic_temperature: trafficTemp,
           fast_track: fastTrack,
           has_existing_appt: hasExistingAppt,
