@@ -24,10 +24,15 @@ import {
   buildContextRow,
   getFingerprintMode,
   isMissingRelation,
+  isMissingFingerprintColumn,
+  withoutFingerprintColumns,
 } from './fingerprint-core.js';
 
 /** Hard cap on how long a fingerprint write may take. Handoff §5.1. */
 const WRITE_TIMEOUT_MS = Number(process.env.BOT_FINGERPRINT_TIMEOUT_MS || 200);
+
+/** Set once a write proves sql/148's two columns are absent; later rows skip them. */
+let versionColumnsMissing = false;
 
 /** Log the missing-relation warning once per process, not once per send. */
 let missingRelationLogged = false;
@@ -59,19 +64,30 @@ export async function recordMessageContext(input) {
   if (getFingerprintMode() === 'off') return { ok: false, reason: 'mode_off' };
   if (!supabase) return { ok: false, reason: 'no_supabase' };
 
-  const row = buildContextRow(input);
+  let row = buildContextRow(input);
   if (!row) return { ok: false, reason: 'unusable_input' };
+  if (versionColumnsMissing) row = withoutFingerprintColumns(row);
 
   try {
-    const { data, error } = await withTimeout(
+    const write = (r) => withTimeout(
       supabase
         .from('bot_message_context')
-        .upsert(row, { onConflict: 'message_type,message_ref' })
+        .upsert(r, { onConflict: 'message_type,message_ref' })
         .select('id')
         .single(),
       WRITE_TIMEOUT_MS,
       'bot_message_context upsert',
     );
+    let { data, error } = await write(row);
+
+    // 2026-10-06 (AI OS batch 1 PR 2): sql/148 not applied yet. Never lose
+    // the row over the two new columns: drop them, say so once, retry.
+    if (error && isMissingFingerprintColumn(error)) {
+      if (!versionColumnsMissing) console.warn('[BotFingerprint] prompt_sha256 / resolved_model columns missing (apply sql/148); writing rows without them');
+      versionColumnsMissing = true;
+      row = withoutFingerprintColumns(row);
+      ({ data, error } = await write(row));
+    }
 
     if (error) {
       if (isMissingRelation(error)) {

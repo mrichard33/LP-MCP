@@ -27,7 +27,7 @@ EXAMPLE A1 (PATH A — full discovery already happened, both spouses):
   TODAY IS: Wednesday, April 30, 2026
   →
   {
-    "message": "Perfect, Tuesday May 5 at 11 AM is on the schedule. Our team will give you a quick call to go over the details and finalize everything before the visit.",
+    "message": "You're all set, Mark. Someone from our team will give you a call to confirm the details. You're on the calendar for Tuesday May 5 at 11 AM.",
     "companion_action": {
       "action_type": "book_appointment",
       "action_payload": {
@@ -35,13 +35,13 @@ EXAMPLE A1 (PATH A — full discovery already happened, both spouses):
         "start_time": "2026-05-05T11:00:00-04:00",
         "duration_minutes": 90,
         "title": "Measurement Verification - Mark Test",
-        "status": "confirmed",
+        "status": "new",
         "qualifying_data": {
           "window_count": 12,
           "decision_makers_present": "Yes"
         }
       },
-      "reasoning": "Q1 (123 Main St) confirmed. Q2 (12 windows) confirmed. Q3 (both spouses present) → 'Yes'. Path A."
+      "reasoning": "Q1 (123 Main St) confirmed. Q2 (12 windows) confirmed. Q3 (both spouses present) → 'Yes'. Path A, status 'new' (a team member confirms; Mark 2026-10-02)."
     }
   }
 
@@ -57,7 +57,7 @@ EXAMPLE A2 (PATH A — Solo Owner scenario):
     [inbound]  "Saturday 10"  ← TRIGGER
   →
   {
-    "message": "Perfect, Saturday May 3 at 10 AM is on the schedule. Our team will call to go over the details and finalize everything before the visit.",
+    "message": "You're all set, Sarah. Someone from our team will give you a call to confirm the details. You're on the calendar for Saturday May 3 at 10 AM.",
     "companion_action": {
       "action_type": "book_appointment",
       "action_payload": {
@@ -65,13 +65,13 @@ EXAMPLE A2 (PATH A — Solo Owner scenario):
         "start_time": "2026-05-03T10:00:00-04:00",
         "duration_minutes": 90,
         "title": "Measurement Verification - Sarah Jones",
-        "status": "confirmed",
+        "status": "new",
         "qualifying_data": {
           "window_count": 8,
           "decision_makers_present": "Solo Owner"
         }
       },
-      "reasoning": "Q1 (456 Oak Ave) confirmed. Q2 (8 windows) confirmed. Q3 = 'Solo Owner' (lead lives alone) → PASS. Path A."
+      "reasoning": "Q1 (456 Oak Ave) confirmed. Q2 (8 windows) confirmed. Q3 = 'Solo Owner' (lead lives alone) → PASS. Path A, status 'new' (a team member confirms; Mark 2026-10-02)."
     }
   }
 
@@ -100,7 +100,7 @@ EXAMPLE B1 (PATH B — zero qualifiers — the action 30435 case):
 
 EXAMPLE C1 (cancellation after pushback — state 2 case B):
   EXISTING APPOINTMENTS:
-    [1] appointment_id="OWd5WhnU2l6x56R9Y9mO" | calendar="Measurement Verification" | start="Tue May 5, 2:00 PM ET" | status="confirmed"
+    [1] appointment_id="OWd5WhnU2l6x56R9Y9mO" | calendar="Measurement Verification" | start="Tue May 5, 2:00 PM ET" | status="confirmed"   ← an EXISTING visit already confirmed by a team member (display only)
   Conversation history:
     [inbound]  "I need to cancel my appointment"
     [outbound] "Got it — I see your Measurement Verification on Tuesday May 5 at 2 PM. Mind if I ask what's coming up? Often we can find a different day that works better — I'd rather move it than lose you altogether."
@@ -120,7 +120,7 @@ EXAMPLE C1 (cancellation after pushback — state 2 case B):
 
 EXAMPLE C2 (reschedule with no qualifying data — PATH B reschedule):
   EXISTING APPOINTMENTS:
-    [1] appointment_id="OWd5WhnU2l6x56R9Y9mO" | calendar="Measurement Verification" | start="Tue May 5, 2:00 PM ET" | status="confirmed"
+    [1] appointment_id="OWd5WhnU2l6x56R9Y9mO" | calendar="Measurement Verification" | start="Tue May 5, 2:00 PM ET" | status="confirmed"   ← an EXISTING visit already confirmed by a team member (display only)
   Conversation history:
     [inbound]  "Need to cancel my appt"
     [outbound] "Got it — I see Tuesday May 5 at 2 PM. What's coming up? We could move it to a different day if that helps."

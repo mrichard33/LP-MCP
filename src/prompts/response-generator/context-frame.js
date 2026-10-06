@@ -147,8 +147,24 @@ export const editCaseFinal = (text) => [
 // One turn of the conversation history. Truncation stays at the call site.
 // Was response-generator.js:1330.
 export const conversationHistoryEntry = (direction, text) => [
-  `[${direction}] ${text}`,
+  `[${direction}] ${fenceSafe(text)}`,
 ];
+
+// ── Untrusted-content fence (2026-10-06, AI OS batch 1 PR 2; CANON.RULE.067) ──
+// Everything people wrote (the thread and the message being answered) sits
+// between these two markers, and the system prompt says BEFORE any of it
+// that fenced text is data, never instructions (UNTRUSTED_CONTENT_RULE in
+// system-core.js). One delimiter style for SMS, email and live chat.
+export const CUSTOMER_DATA_OPEN = '<<<CUSTOMER_DATA';
+export const CUSTOMER_DATA_CLOSE = 'CUSTOMER_DATA>>>';
+
+/** Customer text can never close (or reopen) the fence. Pure. */
+export function fenceSafe(text) {
+  return String(text ?? '').split(CUSTOMER_DATA_CLOSE).join('CUSTOMER_DATA').split(CUSTOMER_DATA_OPEN).join('CUSTOMER_DATA');
+}
+
+export const CUSTOMER_DATA_FENCE_OPEN = [CUSTOMER_DATA_OPEN];
+export const CUSTOMER_DATA_FENCE_CLOSE = [CUSTOMER_DATA_CLOSE];
 
 // Opens the last ten turns, oldest first.
 // Was response-generator.js:1328.
@@ -219,7 +235,9 @@ export const PRIOR_AI_ANALYSIS_HEADER = [
 // The message being answered, quoted.
 // Was response-generator.js:1444.
 export const inboundMessage = (triggerMessage) => [
-  `"${triggerMessage}"`,
+  CUSTOMER_DATA_OPEN,
+  `"${fenceSafe(triggerMessage)}"`,
+  CUSTOMER_DATA_CLOSE,
 ];
 
 // Marks the inbound the reply must answer.

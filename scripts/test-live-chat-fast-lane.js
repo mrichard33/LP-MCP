@@ -1150,6 +1150,21 @@ test('NEPQ live: a model draft that keeps the real times is sent as written (no 
   assert.equal(state.sends[0].message, draft);
 });
 
+// 2026-10-06 (AI OS batch 1 PR 2): when the model sends Mark's confirm line
+// (LINES.confirm, bd330d8) word for word on the turn the visit was booked,
+// the chat's booking-claim rewrite must leave it exactly as written. With
+// booked:false the rewrite strips "You're all set, Alyce." from this line.
+test('NEPQ live: LINES.confirm sent by the model on a booking turn reaches the visitor unchanged', async () => {
+  const offer = 'I have Tue, Oct 6 at 10:00 AM ET or Wed, Oct 7 at 2:00 PM ET. Which works better?';
+  const hold = "Great, I'm holding Tue, Oct 6 at 10:00 AM ET for you. What's the street address for the visit, including the zip code?";
+  const dmAsk = "Got it. Will anyone else be part of the decision? We'll want them there too so nobody has to repeat anything.";
+  const exact = "You're all set, Alyce. Someone from our team will give you a call to confirm the details. You're on the calendar for Tue, Oct 6 at 10:00 AM ET.";
+  const { lane, state } = nepqLane({ llm: () => ({ message: exact }), contact: { address1: '123 Main St', postalCode: '33601' }, messages: [M('outbound', offer, 4), M('inbound', 'the first one', 3), M('outbound', hold, 2), M('inbound', '123 Main St, Tampa FL 33601', 1), M('outbound', dmAsk, 0.5)] });
+  await lane.processInbound(INBOUND('just me'));
+  assert.equal(state.bookings.length, 1);
+  assert.equal(state.sends[0].message, exact);
+});
+
 test('NEPQ live: a booked visit is confirmed in the model\'s words when they carry the facts', async () => {
   const offer = 'I have Tue, Oct 6 at 10:00 AM ET or Wed, Oct 7 at 2:00 PM ET. Which works better?';
   const hold = "Great, I'm holding Tue, Oct 6 at 10:00 AM ET for you. What's the street address for the visit, including the zip code?";

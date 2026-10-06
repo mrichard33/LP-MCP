@@ -40,6 +40,7 @@
  * pattern for anything that reaches the network or the database.
  */
 
+import { promptSha256 } from '../bot-feedback/fingerprint-core.js';
 import { cleanInboundForModel } from '../security/untrusted-text.js';
 import crypto from 'node:crypto';
 import {
@@ -308,7 +309,7 @@ You are answering in the website chat, live, with the visitor watching the scree
 - Everything else in this prompt still binds: the discovery discipline, the decision-maker rules, no insurance predictions, no exclamation marks.
 - A SERVICE AREA instruction in this prompt outranks the collection order above for this reply: when it says ask only for the zip, or stop, do exactly that.
 - Never name a day or a time for a visit or a call yourself: real open times are added to the reply for you when it is time to book (2026-10-02). Never say "a team member will call to set a time": when they want a visit, ask "Would that help?" about a free visit at their home, and the times follow.
-- Never say a visit is set, booked, confirmed or on the schedule yourself (no "You're all set"). Nothing is final until a team member confirms.
+- Never say a visit is set, booked, confirmed or on the schedule yourself. Say "You're all set" only in the reply for a visit booked in that same turn, and only as the exact confirmation line the PLAN block gives you. Nothing else is final until a team member confirms.
 - Never repeat a sentence or an opener you already sent in this chat (no second "Based on what you told me", "Great question" or "Happy to help"). Say it a new way.
 - Answer the question they asked, in their words. Do not repeat an answer you already gave in this conversation, and do not ask a question they already answered above.
 - Before you say a team member will call, you must have their first name AND phone number. Ask for the first one missing (first name, then phone) as the one question in that reply. "Guest Visitor" is not a name.
@@ -1144,7 +1145,11 @@ export function createLiveChatFastLane(deps) {
     const turnDiscipline = (nepqMode === 'live' && nepqPlan && discipline) ? { ...discipline, booking: nepqPlan.booking } : discipline;
     const opts = { established, loopBreak, spouseAdvocacy, handoffPending, discipline: turnDiscipline, promptHint, threadSenderType: 'team', serviceAreaTurn: coverage ? { plan: saPlan, coverage } : null, nepqPlan: (nepqMode === 'live' || planOverride) ? nepqPlan : null, upcomingAppointments };
     const userPrompt = buildResponsePrompt(context, 'livechat', body, kbPack, classification, false, 'warm', null, opts) + LIVE_CHAT_OUTPUT_CONTRACT;
-    const systemPrompt = getResponseSystemPrompt() + LIVE_CHAT_ADDENDUM;
+    // AI OS batch 1 PR 2: the NEPQ CTA text only when a PLAN block is in
+    // this prompt (opts.nepqPlan), the legacy text otherwise (rollback).
+    const systemPrompt = getResponseSystemPrompt(opts.nepqPlan ? 'live' : 'off') + LIVE_CHAT_ADDENDUM;
+    const promptSha = promptSha256(systemPrompt);
+    let resolvedModel = null;
 
     let draft = null;
     let liveChatFields = null;
@@ -1155,6 +1160,8 @@ export function createLiveChatFastLane(deps) {
       const user = regenerationNote ? `${userPrompt}\n\n═══════ REGENERATION NOTE ═══════\n${regenerationNote}` : userPrompt;
       const out = await d.callLLM({ fn: 'live_chat', system: systemPrompt, user, maxTokens: 1200, json: true, cacheSystem: true });
       model = out?.model || model;
+      // The model named in the API response, not the configured alias (STD.026).
+      if (typeof out?.raw?.model === 'string' && out.raw.model) resolvedModel = out.raw.model;
       const parsed = parseJsonFromResponse(String(out?.text || ''));
       const validated = validateResponse(parsed, 'sms');
       if (!validated) throw new Error('live chat model returned no message');
@@ -1346,6 +1353,8 @@ export function createLiveChatFastLane(deps) {
       fingerprintExtras: {
         // The record keeps what the lead typed; the snapshot says what was removed.
         inbound_text: rawInbound,
+        prompt_sha256: promptSha,
+        resolved_model: resolvedModel,
         intent_class: classification?.intent_class || null, buyer_stage: Number(liveChatFields?.buyer_stage) || null, model,
         input_snapshot: { mode, discipline, established_closed: established.closed_questions, context_minimal: !!context._minimal, inbound_removed_chars: inboundRemovedChars, ...(kbIntent ? { kb_intent: kbIntent.intent, kb_intent_reason: kbIntent.reason } : {}) },
       },

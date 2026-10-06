@@ -1,6 +1,14 @@
 /**
- * test-decision-maker-guard.js — ALL DECISION MAKERS ATTEND (Mark's ruling,
- * 2026-09-18) is enforced, not merely written in the prompt.
+ * test-decision-maker-guard.js — the decision-maker rule is enforced in code,
+ * not merely written in the prompt.
+ *
+ * CURRENT RULE (Mark, 2026-10-02; CLAUDE.md "Book in the conversation", commit
+ * 8bbcd4d, memory decision 2667): ask about decision makers ONCE, then book.
+ * Every visit books as status "new"; only "my wife can't make that time"
+ * moves the time. AI OS batch 1 PR 2 (2026-10-06) aligned the prompt and the
+ * last two leftovers (the gate's status field, the unresolved instruction).
+ *
+ * HISTORY — ALL DECISION MAKERS ATTEND (2026-09-18, retired 2026-10-02):
  *
  * Catherine Crosier wrote: "i am the main decision maker of the house hold they
  * would not make an appointment without my husband being at the appointment.
@@ -59,7 +67,8 @@ test('CASE 2 — "It\'s just me, I own the house alone"', () => {
   const gate = assertBookingPrerequisites(ready({ asked: true, confirmed: true }));
   assert.equal(gate.ok, true, gate.missing.join(','));
   assert.deepEqual(gate.missing, []);
-  assert.equal(gate.appointment_status, 'confirmed');
+  // Always 'new' (Mark, 2026-10-02): a team member confirms every visit.
+  assert.equal(gate.appointment_status, 'new');
 });
 
 test('never discussed still holds, and asks the FIRST question', () => {
@@ -94,12 +103,12 @@ test('an unresolved answer asks nothing more: the visit books (Mark, 2026-10-02)
   assert.deepEqual(missing.filter(k => k.startsWith('decision_maker')), []);
 });
 
-test('the instruction tells the model to acknowledge, not argue, and offers the phone call', () => {
+test('the unresolved instruction is the 2026-10-02 rule: acknowledge, never hold, book as new', () => {
   const instruction = PREREQUISITE_ASK_INSTRUCTION.decision_maker_unresolved;
   assert.match(instruction, /without arguing/i);
-  assert.match(instruction, /15-minute phone call/i);
-  assert.match(instruction, /both/i);
-  assert.match(instruction, /Do NOT offer an in-home slot for one person/i);
+  assert.match(instruction, /status "new"/);
+  assert.match(instruction, /two other real times for both/i);
+  assert.doesNotMatch(instruction, /Do NOT offer an in-home slot for one person/i, 'the retired 2026-09-18 hold');
 });
 
 test('the first decision-maker ask is one plain question', () => {

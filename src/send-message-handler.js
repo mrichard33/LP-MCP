@@ -526,7 +526,8 @@ export function decideEmailSendDelay({ channel, inboundAtMs, nowMs, minDelayMs =
 // back was "Thanks for reaching out — we want to make sure we get back to you
 // properly" (agent_actions 475065), which answers nobody.
 //
-// Under ALL DECISION MAKERS ATTEND this is the single most consequential thing
+// (ALL DECISION MAKERS ATTEND was retired 2026-10-02 for "ask once, then book";
+// the fallback rule below still stands.) Under that rule this was the most consequential thing
 // a lead can raise: it decides whether a visit happens and with whom. The
 // neutral fallback cannot hold that conversation, and sending it spends the
 // lead's patience on a message that says nothing. When generation fails on one
@@ -2255,6 +2256,10 @@ function fingerprintReply({ action, contactId, message, channel, triggerMessage,
     prompt_code: generated?.handler_code || null,
     core_prompt_version: bot?.core_prompt_version || null,
     model: bot?.model || null,
+    // CANON.STD.026 (AI OS batch 1 PR 2): the system prompt hash and the model
+    // named in the API response. Absent on rule-written sends (no model call).
+    prompt_sha256: bot?.prompt_sha256 || null,
+    resolved_model: bot?.resolved_model || null,
     // 2026-10-06: a rule-written send (no generation) falls back to the
     // inbound and thread it already had in hand — see ruleSendFingerprintFields.
     inbound_text: triggerMessage || ruleFields?.inbound_text || null,

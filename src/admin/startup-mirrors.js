@@ -2615,4 +2615,20 @@ export const STARTUP_MIRRORS = [
     fail: '[Migration] match_kb_embeddings_scoped (sql/147) skipped — apply sql/147 from the dashboard; customer scope filters in code until it exists:',
     level: 'warn',
   },
+  // bot_message_context.prompt_sha256 / resolved_model (sql/148, 2026-10-06,
+  // AI OS batch 1 PR 2; CANON.STD.026). Until they exist, the fingerprint
+  // writer drops the two fields and keeps the row.
+  {
+    name: 'sql/148',
+    expects: {
+      columns: [['bot_message_context', 'prompt_sha256'], ['bot_message_context', 'resolved_model']],
+    },
+    sql: [
+      `ALTER TABLE bot_message_context ADD COLUMN IF NOT EXISTS prompt_sha256 text;`,
+      `ALTER TABLE bot_message_context ADD COLUMN IF NOT EXISTS resolved_model text;`,
+    ],
+    ready: '[Migration] bot_message_context prompt fingerprint (sql/148) ready',
+    fail: '[Migration] bot_message_context prompt fingerprint (sql/148) skipped — apply sql/148 from the dashboard; rows are written without prompt_sha256 / resolved_model until it exists:',
+    level: 'warn',
+  },
 ];

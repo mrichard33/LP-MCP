@@ -624,7 +624,9 @@ export function assertBookingPrerequisites(state, opts = {}) {
   return {
     ok: missing.length === 0,
     missing,
-    appointment_status: id.decision_maker_confirmed === true ? 'confirmed' : 'new',
+    // Always 'new' (Mark, 2026-10-02: a team member confirms every visit; the
+    // booking handler already forced it). AI OS batch 1 PR 2 aligned this field.
+    appointment_status: 'new',
     decision_maker_confirmed: id.decision_maker_confirmed,
     should_ask_email,
     known: {

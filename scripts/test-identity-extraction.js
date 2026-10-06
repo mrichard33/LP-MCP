@@ -169,14 +169,16 @@ test('gate: all present but decision_maker=false → BLOCKED, status new', () =>
   assert.equal(gate.appointment_status, 'new');
 });
 
-test('gate: decision_maker=true → status confirmed', () => {
+test('gate: decision_maker=true → books, status new (Mark, 2026-10-02: a team member confirms)', () => {
   const gate = assertBookingPrerequisites(stateFrom({
     first_name: 'Victor', last_name: 'Lopez', phone: '+15613230334',
     address_line1: '2885 S Oasis Dr', city: 'Boynton Beach', postal_code: '33435',
     decision_maker_confirmed: true,
   }));
   assert.equal(gate.ok, true);
-  assert.equal(gate.appointment_status, 'confirmed');
+  // Was 'confirmed' until AI OS batch 1 PR 2 (2026-10-06); the booking
+  // handler already forced every bot booking to 'new'.
+  assert.equal(gate.appointment_status, 'new');
 });
 
 test('gate: decision_maker unknown (never asked) → blocked AND status new', () => {
