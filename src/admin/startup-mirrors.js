@@ -2571,4 +2571,16 @@ export const STARTUP_MIRRORS = [
     fail: '[Migration] audit_posted_items.permanent (sql/144) skipped — apply sql/144 from the dashboard; alert dedupe treats every item as new until it exists:',
     level: 'warn',
   },
+  // match_kb_embeddings_scoped (sql/146, 2026-10-06, AI OS batch 1 PR 1).
+  // Customer-facing vector retrieval allows only reece_* source docs. Until
+  // the function exists, vector-search.js filters 50 old-function rows in code.
+  {
+    name: 'sql/146',
+    expects: null,
+    alwaysRunBecause: 'defines match_kb_embeddings_scoped(); presence cannot tell a changed function body',
+    sqlFile: 'sql/146_match_kb_embeddings_scoped.sql',
+    ready: '[Migration] match_kb_embeddings_scoped (sql/146) ready',
+    fail: '[Migration] match_kb_embeddings_scoped (sql/146) skipped — apply sql/146 from the dashboard; customer scope filters in code until it exists:',
+    level: 'warn',
+  },
 ];

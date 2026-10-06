@@ -38,8 +38,8 @@ const { checkReply, summarize, INVARIANTS_VERSION } = await import('../src/eval/
 const IN_HOURS_MS = Date.parse('2026-10-06T19:00:00Z');
 
 /** The live-chat lane over recording fakes; the model returns `draft`. Mirrors scripts/test-live-chat-fast-lane.js. */
-function makeLane({ draft, nepqMode, nowMs = IN_HOURS_MS }) {
-  const state = { sends: [], llmCalls: 0 };
+function makeLane({ draft, nepqMode, nowMs = IN_HOURS_MS, kbIntentMode = 'off', classify = null, buildKbPack = null }) {
+  const state = { sends: [], llmCalls: 0, prompts: [], packIntents: [] };
   let nextId = 1;
   const lane = createLiveChatFastLane({
     now: () => nowMs,
@@ -56,10 +56,12 @@ function makeLane({ draft, nepqMode, nowMs = IN_HOURS_MS }) {
     findConversation: async () => null,
     buildContext: async () => { throw new Error('no lead context in the golden replay'); },
     prewarmEmbedding: () => null,
-    buildKbPack: async () => null,
-    classify: async () => ({ intent_class: 'UNCLEAR', confidence: 0, classification_method: 'no_llm', reasoning: 'golden' }),
-    callLLM: async () => {
+    kbIntentMode: () => kbIntentMode,
+    buildKbPack: async (params) => { state.packIntents.push(params.intentClass); return buildKbPack ? buildKbPack(params) : null; },
+    classify: classify || (async () => ({ intent_class: 'UNCLEAR', confidence: 0, classification_method: 'no_llm', reasoning: 'golden' })),
+    callLLM: async ({ user }) => {
       state.llmCalls += 1;
+      state.prompts.push(user);
       return { text: JSON.stringify({ story_arc: 'none', message: draft }), model: 'golden-fake' };
     },
     sendMessage: async ({ message }) => { state.sends.push(message); return { messageId: `m${state.sends.length}`, method: 'ghl_webhook' }; },
@@ -206,6 +208,48 @@ for (const { c, nepqMode } of runs) {
       if (c.mustNot) assert.doesNotMatch(reply, c.mustNot, `the incident's own words reached the visitor: ${reply}`);
       if (c.must) assert.match(reply, c.must, `the approved answer is missing: ${reply}`);
       if (!c.silent) assert.equal(state.sends.length, 1, 'exactly one reply per turn');
+    });
+  }
+}
+
+// ── Chat KB intent (2026-10-06, AI OS batch 1 PR 1) ────────────────────────
+// Live chat passed intentClass 'UNCLEAR' to the retriever on every turn, so
+// the 2026-10-05 manufactured-home and 9-story chats were written with no
+// LIB-P13 / LIB-P14 in the prompt (only the property-scope guard saved them),
+// and price and objection turns never got the pricing anchor or the objection
+// script. With LIVE_CHAT_KB_INTENT_MODE=live the classifier's label (the real
+// no-model labels below) reaches the retriever, and the pack reaches the prompt.
+const KB_CASES = [
+  { id: 'kb_manufactured_home', inbound: 'Do you work on manufactured homes?', label: 'MOBILE', mark: 'LIB-P13',
+    draft: 'Yes, we work on manufactured homes. What prompted you to look at windows right now?' },
+  { id: 'kb_nine_story_condo', inbound: 'Do you service a 9 story condominium?', label: 'SERVICE_AREA_INQUIRY', mark: 'LIB-P14',
+    draft: 'Yes, we install impact windows and doors in condos. Is this for all nine floors, or specific units?' },
+  { id: 'kb_price', inbound: 'How much for 12 windows?', label: 'PRICING', mark: 'PRICING ANCHOR',
+    draft: 'Every home is different, so a number now would just be a guess. What got you looking at new windows?' },
+  { id: 'kb_objection', inbound: 'I need to think about it', label: 'OBJECTION', mark: 'OBJECTION SCRIPT',
+    draft: 'That makes sense. What part are you still weighing?' },
+];
+const kbPackFor = ({ intentClass }) => {
+  const pack = { intent_class: intentClass, detected_signals: {} };
+  if (intentClass === 'QUESTION') pack.faqs = [{ question_pattern: 'LIB-P13 manufactured or mobile homes / LIB-P14 buildings over two stories', answer_short: 'We do not work on manufactured or mobile homes, or on buildings over two stories.' }];
+  if (intentClass === 'PRICING') pack.pricing_anchor = { anchoring_message: 'Every home is different; the price comes from measuring.' };
+  if (intentClass === 'OBJECTION') pack.objection_script = { opener: 'Totally fair.' };
+  return pack;
+};
+for (const c of KB_CASES) {
+  for (const nepqMode of MODES) {
+    test(`golden ${c.id} [nepq ${nepqMode}] — chat KB intent reaches the prompt`, async () => {
+      const { lane, state } = makeLane({
+        draft: c.draft, nepqMode, kbIntentMode: 'live', buildKbPack: kbPackFor,
+        classify: async () => ({ intent_class: c.label, confidence: 0.95, classification_method: 'keyword', reasoning: 'golden' }),
+      });
+      await lane.processInbound({ contactId: 'G1', conversationId: 'gconv', messageId: `g-${c.id}-${nepqMode}`, body: c.inbound });
+      assert.notEqual(state.packIntents[0], 'UNCLEAR', 'chat sent UNCLEAR to the retriever');
+      assert.ok(state.prompts.some(p => p.includes(c.mark)), `the prompt is missing ${c.mark}`);
+      const reply = state.sends.join('\n');
+      const result = checkReply(reply, { channel: 'livechat', inbound: c.inbound, conversation: [{ direction: 'inbound', text: c.inbound }], booked: false, nowMs: IN_HOURS_MS });
+      assert.ok(result.pass, `finished reply broke ${result.violations.map(v => v.code).join(', ')}\n  reply: ${reply}`);
+      assert.equal(state.sends.length, 1, 'exactly one reply per turn');
     });
   }
 }
