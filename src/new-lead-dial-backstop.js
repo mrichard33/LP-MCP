@@ -14,10 +14,30 @@
 //   opened, several ~30 h later.
 //
 //   So our system puts every imported, never-called lead on a Five9 list itself.
-//   Which list is the user's ruling (2026-10-05):
-//     appointment today or tomorrow → "Conf - Next Day"
-//     appointment 2+ days out        → "Conf - 2nd Day"
-//     no appointment                 → "Callback Request"
+//
+// WHICH LIST — the user's ruling 2026-10-06 (replaces the 2026-10-05 default
+// of "Callback Request" for every lead with no appointment). First match wins:
+//   1. appointment today or tomorrow → "Conf - Next Day"; 2+ days → "Conf - 2nd Day"
+//   2. the lead asked for a callback → NOT ours: src/five9/callback-push.js files
+//      it to "Callback Request" (lp_callback_requeue). Pushing it too would put
+//      one person on two lists.
+//   3. no appointment, no callback request, Five9 record created ≤ 14h ago (or
+//      no record yet) → a DIAL ASAP list: "Reece Chatbot" for the Reece ChatBot
+//      source, "Direct Lead Entry" for everything else. DIAL ASAP (profile
+//      "DIAL ASAP V2") dials records created within its 12–16h filter, and on a
+//      miss Five9's "After DIAL ASAP" connector takes the follow-ups. So we push
+//      ONLY to the DIAL ASAP lists, never to "After DIAL ASAP".
+//   4. same, but the Five9 record is older than 14h → "Callback Request".
+//      AddToList keeps Five9's "Contact create time and date", so the DIAL ASAP
+//      filter would screen an old record out and it would sit unanswered.
+//
+// WHY THE 4 LEADS OF 10/5–10/6 WERE MISSED (in1 428728/428729/428731/428733)
+//   Not a rule: the job never saw them. GetInboundLeadInfo pages by BLOCKS OF
+//   ids (page 3 = in1 428340–428539), so a page with one missing id comes back
+//   with 199 rows. The reader took any short page as the last one and stopped,
+//   and from 10/5 ~12:30 PM every newer lead (~300) was invisible to the pass
+//   while it reported "ok". The reader now pages until an EMPTY page, and
+//   lp_leads (created in the window) is a second source of candidates.
 //
 // This module is PURE: every read happens in src/jobs/new-lead-dial-backstop.js
 // and arrives here as data, so each rule is testable offline.
@@ -66,7 +86,11 @@ export function backstopConfig(env = process.env) {
   const lists = {
     nextDay: String(env.NEW_LEAD_BACKSTOP_LIST_NEXT_DAY || 'Conf - Next Day').trim(),
     secondDay: String(env.NEW_LEAD_BACKSTOP_LIST_SECOND_DAY || 'Conf - 2nd Day').trim(),
+    // No appointment and a Five9 record too old for DIAL ASAP's filter.
     noAppt: String(env.NEW_LEAD_BACKSTOP_LIST_NO_APPT || callbackListName()).trim(),
+    // The two DIAL ASAP lists we write (2026-10-06). LP_ASAP is the third, and LP's.
+    chatbot: String(env.NEW_LEAD_BACKSTOP_LIST_CHATBOT || 'Reece Chatbot').trim(),
+    direct: String(env.NEW_LEAD_BACKSTOP_LIST_DIRECT || 'Direct Lead Entry').trim(),
   };
   for (const name of Object.values(lists)) {
     if (name.toUpperCase() === FORBIDDEN_LIST) {
@@ -75,6 +99,8 @@ export function backstopConfig(env = process.env) {
   }
   return {
     lists,
+    dialAsapMaxAgeH: num(env.NEW_LEAD_BACKSTOP_DIAL_ASAP_MAX_AGE_H, 14, 1),
+    watchdogMin: num(env.NEW_LEAD_BACKSTOP_WATCHDOG_MIN, 30, 1),
     lookbackHours: num(env.NEW_LEAD_BACKSTOP_LOOKBACK_HOURS, 72, 1),
     minAgeMin: num(env.NEW_LEAD_BACKSTOP_MIN_AGE_MIN, 10),
     queuedGraceMin: num(env.NEW_LEAD_BACKSTOP_QUEUED_GRACE_MIN, 30),
@@ -150,7 +176,46 @@ export function normalizeInboundRow(raw = {}) {
     // datereceived is Eastern wall clock with no offset — never a bare Date.parse.
     receivedMs: lpStoredToUtcMs(t(raw.datereceived) || null),
     lognumber: t(raw.lognumber),
+    source: t(raw.source),
+    sourceDetail: t(raw.sourcesubdescr),
+    origin: 'inbound',
   };
+}
+
+/**
+ * An lp_leads row the inbound read did not return → the same shape, so it is
+ * decided by the same rules (2026-10-06: the second source). Only an imported
+ * lead reaches lp_leads, so there is no kill reason to carry.
+ */
+export function rowFromLead(lead = {}) {
+  const t = (v) => String(v ?? '').trim();
+  return {
+    in1: t(lead.in1_id) || null,
+    phone: phone10(lead.phone),
+    first: t(lead.first_name),
+    last: t(lead.last_name),
+    address1: t(lead.address),
+    email: t(lead.email),
+    brn: '',
+    cstId: t(lead.lp_prospect_id) || null,
+    ldsId: t(lead.lp_lead_id) || null,
+    dsp: t(lead.disposition_code),
+    killreason: '',
+    apptDate: null,
+    apptTime: null,
+    // Both are Eastern wall clock (created_at_lp is tagged +00:00, CLAUDE.md).
+    receivedMs: lpStoredToUtcMs(t(lead.datereceived) || t(lead.created_at_lp).slice(0, 19).replace(' ', 'T') || null),
+    lognumber: t(lead.lognumber) || t(lead.ghl_contact_id),
+    source: t(lead.lead_source),
+    sourceDetail: t(lead.lead_source_detail),
+    origin: 'lp_leads',
+  };
+}
+
+/** The Reece ChatBot source (inbound sourcesubdescr, else lp_leads.lead_source_detail). */
+export function isChatbotLead(row, lead = null) {
+  const detail = row.sourceDetail || String(lead?.lead_source_detail ?? '');
+  return detail.trim().toLowerCase() === 'reece chatbot';
 }
 
 /**
@@ -180,9 +245,13 @@ export function currentState(row, lead = null) {
 
 /* --- routing ---------------------------------------------------------------- */
 
-/** { list } or { skip: 'past_appointment' }. Calendar days in Eastern time. */
+/**
+ * { list } or { skip: 'past_appointment' }. Calendar days in Eastern time.
+ * With no appointment the list is provisional (`dialAsap: true`): which one
+ * depends on the Five9 record's age, known only after the lookup (routeNoAppt).
+ */
 export function routeList({ hasAppt, apptDateEt, apptStartMs, nowMs, cfg }) {
-  if (!hasAppt) return { list: cfg.lists.noAppt, why: 'no_appointment' };
+  if (!hasAppt) return { list: cfg.lists.noAppt, why: 'no_appointment', dialAsap: true };
   if (!apptDateEt) return { list: cfg.lists.nextDay, why: 'appt_date_unknown' };
   const daysOut = daysBetween(etDateKey(nowMs), apptDateEt);
   if (daysOut < 0) return { skip: 'past_appointment' };
@@ -190,6 +259,27 @@ export function routeList({ hasAppt, apptDateEt, apptStartMs, nowMs, cfg }) {
   if (daysOut <= 1) return { list: cfg.lists.nextDay, why: daysOut === 0 ? 'appt_today' : 'appt_tomorrow' };
   return { list: cfg.lists.secondDay, why: 'appt_2plus_days' };
 }
+
+/**
+ * No appointment, no callback request: a DIAL ASAP list while the Five9 record
+ * is young enough for that campaign's filter, else "Callback Request".
+ * `recordCreatedMs` null with no record = Five9 creates it now (age 0). A
+ * record whose create time cannot be read is aged from the lead's arrival —
+ * LP's own push makes the record at arrival.
+ */
+export function routeNoAppt({ row, lead = null, contact = null, nowMs, cfg }) {
+  const createdMs = Number.isFinite(contact?.createdMs) ? contact.createdMs
+    : (contact ? row.receivedMs : nowMs);
+  const ageH = (nowMs - createdMs) / 3_600_000;
+  if (ageH > cfg.dialAsapMaxAgeH) return { list: cfg.lists.noAppt, why: 'record_too_old_for_dial_asap' };
+  return isChatbotLead(row, lead)
+    ? { list: cfg.lists.chatbot, why: 'dial_asap_chatbot' }
+    : { list: cfg.lists.direct, why: 'dial_asap_direct' };
+}
+
+/** Every list a no-appointment lead can land on — for the "already pushed" check. */
+export const noApptLists = (cfg) => [cfg.lists.chatbot, cfg.lists.direct, cfg.lists.noAppt];
+const dialAsapLists = (cfg) => [cfg.lists.chatbot, cfg.lists.direct];
 
 /* --- dedup keys --------------------------------------------------------------- */
 
@@ -205,10 +295,12 @@ export const phoneDayKey = (phone, etDate) => `dial-backstop-phone:${phone}:${et
  * @param {object} a.row          normalizeInboundRow output
  * @param {object|null} a.lead    lp_leads row for row.ldsId, if synced
  * @param {boolean} a.called      Five9 has called (or talked to) this number since it arrived
+ * @param {boolean} a.sold        an lp_leads row with this phone is closed_won
+ * @param {boolean} a.callbackRequested  the callback path owns this contact/phone (last 72h)
  * @param {Set<string>} a.marks   dedup keys already written
- * @returns {{ action: 'skip'|'wait'|'candidate', reason: string, list?: string, state?: object }}
+ * @returns {{ action: 'skip'|'wait'|'candidate', reason: string, list?: string, dialAsap?: boolean, state?: object }}
  */
-export function prefilter({ row, lead = null, called, marks = new Set(), nowMs, cfg }) {
+export function prefilter({ row, lead = null, called, sold = false, callbackRequested = false, marks = new Set(), nowMs, cfg }) {
   if (!row.phone) return { action: 'skip', reason: 'no_phone' };
   if (row.killreason) return { action: 'skip', reason: 'killed' };
   if (!Number.isFinite(row.receivedMs)) return { action: 'skip', reason: 'unknown_age' };
@@ -220,6 +312,8 @@ export function prefilter({ row, lead = null, called, marks = new Set(), nowMs, 
   // "import this row" card in src/lp-appointment-sync.js owns these.
   if (!row.ldsId) return { action: 'skip', reason: 'awaiting_import' };
   if (!(row.cstId || lead?.lp_prospect_id)) return { action: 'skip', reason: 'no_custid' };
+  // A customer who already bought is the service team's, not the phone room's.
+  if (sold) return { action: 'skip', reason: 'sold' };
 
   const state = currentState(row, lead);
   if (DEAD_DISPOSITIONS.has(state.dsp)) return { action: 'skip', reason: 'dead_disposition', state };
@@ -227,33 +321,100 @@ export function prefilter({ row, lead = null, called, marks = new Set(), nowMs, 
 
   const route = routeList({ ...state, nowMs, cfg });
   if (route.skip) return { action: 'skip', reason: route.skip, state };
-  if (marks.has(markKey(row.in1, route.list)) || marks.has(phoneDayKey(row.phone, etDateKey(nowMs)))) {
+  // An appointment wins (rule 1); without one a requested callback is the
+  // callback path's (rule 2) — never a second list for the same person.
+  if (route.dialAsap && callbackRequested) return { action: 'skip', reason: 'callback_requested', state };
+  const targets = route.dialAsap ? noApptLists(cfg) : [route.list];
+  if (targets.some((l) => marks.has(markKey(row.in1, l))) || marks.has(phoneDayKey(row.phone, etDateKey(nowMs)))) {
     return { action: 'skip', reason: 'already_pushed', list: route.list, state };
   }
-  return { action: 'candidate', reason: route.why, list: route.list, state };
+  return { action: 'candidate', reason: route.why, list: route.list, dialAsap: Boolean(route.dialAsap), state };
 }
 
 /**
  * The Five9 half.
  * @param {boolean|null} a.onDnc       null = the DNC read failed
  * @param {object|null|'error'} a.contact  summarizeContactRecord output; null = no record; 'error' = lookup failed
- * @returns {{ action: 'push'|'skip'|'wait', reason: string }}
+ * @returns {{ action: 'push'|'skip'|'wait', reason: string, list?: string, why?: string }}
  */
-export function finalDecision({ pre, row, onDnc, contact, nowMs, cfg }) {
+export function finalDecision({ pre, row, lead = null, onDnc, contact, nowMs, cfg }) {
   // Unknown DNC status is never a dial. Unmarked, so the next pass retries.
   if (onDnc === null || onDnc === undefined) return { action: 'wait', reason: 'dnc_unreadable' };
   // dnc-reentry-sweep already asks a person about every new lead on a block list.
   if (onDnc) return { action: 'skip', reason: 'dnc' };
-  if (contact === 'error') return { action: 'push', reason: 'crosslist_failed_open' };
+  // Fail closed (2026-10-06): the record's age picks the list and its attempts
+  // say whether Five9 already dialed. Unmarked, so the next pass retries, and
+  // the watchdog names the lead if it stays stuck.
+  if (contact === 'error') return { action: 'wait', reason: 'five9_record_unreadable' };
+  const target = pre.dialAsap ? routeNoAppt({ row, lead, contact, nowMs, cfg }) : { list: pre.list, why: pre.reason };
+  const out = (action, reason) => ({ action, reason, list: target.list, why: target.why });
+
+  // Attempts on THIS lead count; attempts that predate its arrival belong to an
+  // older lead on the same number (a returning homeowner) and do not.
+  const attempts = Number(contact?.attempts) || 0;
+  const attemptsAreOld = Number.isFinite(contact?.lastDispoMs) && contact.lastDispoMs < row.receivedMs - 60_000;
+  if (attempts > 0 && !attemptsAreOld) return out('skip', 'five9_attempted');
+
   const list = contact?.list || null;
-  if (!list) return { action: 'push', reason: 'not_on_dial_list' };
-  if (list === pre.list) return { action: 'skip', reason: 'already_on_target_list' };
+  if (!list) return out('push', 'not_on_dial_list');
+  if (list === target.list) return out('skip', 'already_on_target_list');
+  // Either DIAL ASAP list we write is the same campaign — moving between them is noise.
+  if (dialAsapLists(cfg).includes(target.list) && dialAsapLists(cfg).includes(list)) return out('skip', 'already_on_target_list');
   // On another list (usually LP_ASAP). Give the dialer its chance first, then
   // push: overnight rows sat on LP_ASAP and were not called at 8 AM.
   const inWindowMin = (nowMs - dialWindowStartMs(row.receivedMs)) / 60000;
-  if (inWindowMin < cfg.queuedGraceMin) return { action: 'wait', reason: 'queued_elsewhere' };
-  if (!cfg.pushStaleQueued) return { action: 'skip', reason: 'queued_elsewhere' };
-  return { action: 'push', reason: 'queued_not_dialed' };
+  if (inWindowMin < cfg.queuedGraceMin) return out('wait', 'queued_elsewhere');
+  if (!cfg.pushStaleQueued) return out('skip', 'queued_elsewhere');
+  return out('push', 'queued_not_dialed');
+}
+
+/* --- the watchdog ---------------------------------------------------------- */
+
+// A skip is a recorded reason and a push is a push. A wait, a deferral or a
+// failed push left the lead with nobody calling it.
+export const UNHANDLED_ACTIONS = Object.freeze(new Set(['wait', 'deferred', 'failed']));
+
+/**
+ * Leads a person must look at: > watchdogMin past the moment Five9 could
+ * first dial them (arrival, or 8:00 ET for an overnight lead), with no call,
+ * no push and no recorded reason. Pure.
+ * @param {Array<{ row: object, action: string, result: string }>} outcomes  one per lead
+ */
+export function unhandledLeads(outcomes, { nowMs, cfg }) {
+  return outcomes.filter(({ row, action }) => {
+    if (!UNHANDLED_ACTIONS.has(action) || !Number.isFinite(row?.receivedMs)) return false;
+    return (nowMs - dialWindowStartMs(row.receivedMs)) / 60000 > cfg.watchdogMin;
+  });
+}
+
+const REASON_TEXT = {
+  dnc_unreadable: 'Five9 DNC check failed',
+  five9_record_unreadable: 'Five9 contact lookup failed',
+  queued_elsewhere: 'waiting on LP_ASAP',
+  deferred: 'over the per-pass cap',
+  push_failed: 'push failed',
+  too_new: 'just arrived',
+};
+
+const ageText = (ms) => {
+  const min = Math.max(0, Math.round(ms / 60000));
+  return min < 60 ? `${min}m` : `${Math.floor(min / 60)}h ${min % 60}m`;
+};
+
+/** The #ops card. Plain English, one line per lead. */
+export function formatUnhandledCard(items, nowMs) {
+  const lines = items.map(({ row, result }) => {
+    const name = [row.first, row.last].filter(Boolean).join(' ') || 'No name';
+    const source = row.sourceDetail || row.source || 'unknown source';
+    return `• ${name} · …${String(row.phone ?? '').slice(-4) || '????'} · ${source} · LP lead ${row.ldsId || `inbound ${row.in1}`} · ${ageText(nowMs - row.receivedMs)} old · ${REASON_TEXT[result] || result}`;
+  });
+  return [
+    `⚠️ NEW LEADS NOBODY HAS CALLED — the dial backstop could not put them on a Five9 list`,
+    ``,
+    ...capLines(lines, 20),
+    ``,
+    `Each one is 30+ minutes past when Five9 could first dial it. Please put it on a list by hand.`,
+  ].join('\n');
 }
 
 /* --- the record and the card ------------------------------------------------- */
@@ -283,21 +444,29 @@ export function buildBackstopRecord(row, lead = null) {
 
 const VISIT_FMT = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', weekday: 'short', month: 'numeric', day: 'numeric', hour: 'numeric', minute: '2-digit' });
 
-/** One #contact-center card for a pass that pushed something. Plain English. */
-export function formatPushedCard(pushed) {
-  const lines = pushed.map((p) => {
-    const name = [p.row.first, p.row.last].filter(Boolean).join(' ') || 'No name';
-    const phone = `(${p.row.phone.slice(0, 3)}) ${p.row.phone.slice(3, 6)}-${p.row.phone.slice(6)}`;
-    const visit = p.state?.hasAppt
-      ? (Number.isFinite(p.state.apptStartMs) ? `visit ${VISIT_FMT.format(new Date(p.state.apptStartMs))}` : `visit ${p.state.apptDateEt}`)
-      : 'no appointment';
-    return `• ${name} · ${phone} · ${visit} → ${p.list} (LP lead ${p.row.ldsId})`;
-  });
+/** One card line for one push. Stored on the action row too, for the 8 AM card. */
+export function pushedLine(p) {
+  const name = [p.row.first, p.row.last].filter(Boolean).join(' ') || 'No name';
+  const phone = `(${p.row.phone.slice(0, 3)}) ${p.row.phone.slice(3, 6)}-${p.row.phone.slice(6)}`;
+  const visit = p.state?.hasAppt
+    ? (Number.isFinite(p.state.apptStartMs) ? `visit ${VISIT_FMT.format(new Date(p.state.apptStartMs))}` : `visit ${p.state.apptDateEt}`)
+    : 'no appointment';
+  return `• ${name} · ${phone} · ${visit} → ${p.list} (LP lead ${p.row.ldsId})`;
+}
+
+/**
+ * One #contact-center card for a pass that pushed something. Plain English.
+ * `overnight` is the 8:00 ET card for pushes made while the dialer was closed.
+ */
+export function formatPushedCard(pushedOrLines, { overnight = false } = {}) {
+  const lines = pushedOrLines.map((p) => (typeof p === 'string' ? p : pushedLine(p)));
   return [
-    `📞 NEW LEADS PUT ON A FIVE9 LIST — nobody had called them yet`,
+    overnight
+      ? `📞 OVERNIGHT LEADS PUT ON A FIVE9 LIST — they dial from 8:00 AM`
+      : `📞 NEW LEADS PUT ON A FIVE9 LIST — nobody had called them yet`,
     ``,
     ...capLines(lines, 15),
     ``,
-    `Lead Perfection had not sent these to the dialer (imported by hand, or after the 6 AM load), so our system added them.`,
+    `Lead Perfection had not got these dialed, so our system added them.`,
   ].join('\n');
 }

@@ -316,9 +316,10 @@ export const JOBS = Object.freeze([
   },
   {
     id: 'new-lead-dial-backstop',
-    label: 'New LP leads nobody called → Conf / Callback Request list',
+    label: 'New LP leads nobody called → Conf / DIAL ASAP / Callback Request list',
     group: 'five9',
-    cadence: 'every 5 min, 08:00–19:45 ET',
+    // 24/7 since 2026-10-06: an overnight push waits in Five9 until 8 AM.
+    cadence: 'every 5 min, 24/7',
     enabledEnv: 'NEW_LEAD_DIAL_BACKSTOP_MODE',
     // A MODE (2026-10-05): off | shadow | live, default shadow. Mirrors
     // backstopMode() in src/new-lead-dial-backstop.js — only an explicit 'off'
