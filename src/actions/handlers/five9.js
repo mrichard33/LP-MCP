@@ -189,12 +189,12 @@ const EXEC_AUTO_APPROVED_FIVE9_DNC_OP = 'five9_add_numbers_to_dnc';
 // removal ruling was protecting against.
 const EXEC_AUTO_APPROVED_REENTRY_OP = 'five9_remove_numbers_from_dnc_reentry';
 
-// 2026-10-06 — booked-lead routing removals (decision #2669). Keyed, like the
-// re-entry lift, on WHO QUEUED IT: only rows from rule BOOKED_DIAL_ROUTING, and
-// only while BOOKED_ROUTING_AUTO_REMOVE is literally 'true'. That switch stays
-// unset until Mark reviews shadow output and records a standing exception
-// (decision #1057 requires one); until then every such removal waits for a
-// person on the approval card. A literal, not an import — same two-layer rule.
+// 2026-10-06 — booked-lead routing removals (decision #2669), unarmed by
+// Mark's standing exception to #1057 ("If we're adding to one list, we should be
+// able to automatically remove it from the other list"). Keyed, like the
+// re-entry lift, on WHO QUEUED IT: only rows from rule BOOKED_DIAL_ROUTING. Any
+// other five9_delete_record_from_list still needs approval. Rollback:
+// BOOKED_ROUTING_AUTO_REMOVE=false. A literal, not an import — same two-layer rule.
 const EXEC_AUTO_APPROVED_BOOKED_REMOVE_OP = 'five9_delete_record_from_list';
 const BOOKED_ROUTING_RULE_KEY = 'BOOKED_DIAL_ROUTING';
 
@@ -202,7 +202,7 @@ function execAutoApproved(actionType, action) {
   if (actionType === EXEC_AUTO_APPROVED_FIVE9_OP) return true;
   if (actionType === EXEC_AUTO_APPROVED_BOOKED_REMOVE_OP) {
     return action?.rule_applied === BOOKED_ROUTING_RULE_KEY
-      && String(process.env.BOOKED_ROUTING_AUTO_REMOVE || '').trim().toLowerCase() === 'true';
+      && String(process.env.BOOKED_ROUTING_AUTO_REMOVE || '').trim().toLowerCase() !== 'false';
   }
   if (actionType === EXEC_AUTO_APPROVED_REENTRY_OP) {
     return action?.rule_applied === REENTRY_DNC_LIFT_RULE_KEY;

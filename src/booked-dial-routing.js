@@ -12,27 +12,38 @@
 //   "Conf - 2nd Day" when it is two days out, held until then when later.
 //
 // THE ORDER IS THE SAFETY RULE: add to Confirmation FIRST, remove SECOND.
-//   A removal is queued only once a Confirmation add for that phone has
-//   COMPLETED (ours or the new-lead dial backstop's), or the Five9 record
-//   already sits on the target Confirmation list. A failed add queues no
-//   removal. A booked lead must never end up on no list. Two consequences:
-//     - a visit 3+ days out is HELD: no add yet, and so no removal yet.
-//     - an inquiry LP has not issued (no CustID) cannot be added (the agent's
-//       screen pop keys on CustID), so it waits; the inbound-checkout watch
-//       gets it checked out.
-//   Exception, by the ruling: an appointment already confirmed (dsp "Cnf")
-//   needs no confirmation call, so it gets no add and the removal goes ahead.
+//   For a visit today, tomorrow or in two days, the removal is queued only
+//   once a Confirmation add for that phone has COMPLETED (ours or the new-lead
+//   dial backstop's), or the Five9 record already sits on the target
+//   Confirmation list. An inquiry LP has not issued (no CustID) cannot be added
+//   (the agent's screen pop keys on CustID), so it waits; the inbound-checkout
+//   watch gets it checked out.
+//   Exceptions, both Mark's rulings: an appointment already confirmed (dsp
+//   "Cnf") needs no confirmation call, so it gets no add and the removal goes
+//   ahead; and a visit 3+ days out (2026-10-06 follow-up) comes off the setter
+//   lists RIGHT AWAY and goes on Confirmation two days before the visit —
+//   nobody should call a booked person in between.
 //
-// APPROVAL (decision #1057; follows CANON.STD.015 / CANON.RULE.064, canonical
-//   candidates): five9_add_records_to_list is the only auto-approved Five9
-//   write, so the Confirmation add uses it. Removing a record from a list is
-//   NOT, so every removal is queued requires_approval=true, status
-//   pending_approval: the existing approval card names the phone, the person,
-//   the appointment, the exact lists and why. The approval is bound to that
-//   payload and expires at the appointment time (approval_expires_at; the
-//   executor refuses an expired one — CANON.EVALT.056). BOOKED_ROUTING_AUTO_REMOVE
-//   =true lifts the approval for THIS rule only; Mark sets it after reviewing
-//   shadow output and recording a standing exception.
+// A FAILED ADD IS RETRIED ONCE, then a person is told (2026-10-06 follow-up).
+//   A second failure posts the lead to #contact-center (once per visit) so
+//   someone adds it by hand — the safety net that makes the early removal of
+//   3+ day visits safe.
+//
+// A MOVE FROM "2nd Day" TO "Next Day" (2026-10-06 follow-up): once the Next
+//   Day add has completed, the number comes off "Conf - 2nd Day" too, so one
+//   visit never gets two confirmation calls. Same approval path.
+//
+// APPROVAL — none, by Mark's standing exception (2026-10-06, to decision
+//   #1057): "If we're adding to one list, we should be able to automatically
+//   remove it from the other list." Removals from THIS rule run unarmed, like
+//   the Confirmation add (five9_add_records_to_list). The exception is keyed on
+//   rule_applied = BOOKED_DIAL_ROUTING, never on the action type, so a removal
+//   queued by anything else still needs approval. Rollback:
+//   BOOKED_ROUTING_AUTO_REMOVE=false puts every removal back behind the
+//   approval card (pending_approval; the card names the phone, the person, the
+//   appointment, the exact lists and why). Either way the row carries
+//   approval_expires_at = the visit, and the executor skips a removal that runs
+//   after it (CANON.EVALT.056, canonical candidate).
 //
 // LP RE-ADDS: LP repopulates its lists at 6 AM ET and can push the inquiry
 //   back onto LP_ASAP. The removal claim is per appointment PER DAY, so each
@@ -87,8 +98,9 @@ export function routingConfig(env = process.env) {
     conf,
     removeLists: csv(env.BOOKED_ROUTING_REMOVE_LISTS, DEFAULT_REMOVE_LISTS),
     skipDsp: new Set(csv(env.BOOKED_ROUTING_SKIP_DSP, DEFAULT_SKIP_DSP)),
-    // Only the literal 'true' — anything else keeps every removal behind approval.
-    autoRemove: String(env.BOOKED_ROUTING_AUTO_REMOVE ?? '').trim().toLowerCase() === 'true',
+    // ON unless set to exactly 'false' (Mark's standing exception, 2026-10-06).
+    // Mirrored by the executor's carve-out in src/actions/handlers/five9.js.
+    autoRemove: String(env.BOOKED_ROUTING_AUTO_REMOVE ?? '').trim().toLowerCase() !== 'false',
     lookbackHours: num(env.BOOKED_ROUTING_LOOKBACK_HOURS, 72, 1),
     maxAdds: num(env.BOOKED_ROUTING_MAX_ADDS, 20, 0),
     maxRemovals: num(env.BOOKED_ROUTING_MAX_REMOVALS, 20, 0),
@@ -174,7 +186,9 @@ export function routeBooked(c, { nowMs, cfg }) {
   if (c.dsp === 'Cnf') return { addList: null, removeAllowedWithoutAdd: true, daysOut, why: 'already_confirmed' };
   if (daysOut <= 1) return { addList: cfg.conf.nextDay, removeAllowedWithoutAdd: false, daysOut, why: daysOut === 0 ? 'appt_today' : 'appt_tomorrow' };
   if (daysOut === 2) return { addList: cfg.conf.secondDay, removeAllowedWithoutAdd: false, daysOut, why: 'appt_in_2_days' };
-  return { hold: true, addList: null, removeAllowedWithoutAdd: false, daysOut, why: 'appt_3plus_days' };
+  // 3+ days (Mark, 2026-10-06 follow-up): off the setter lists now; the
+  // Confirmation add comes two days before the visit, on a later pass.
+  return { hold: true, addList: null, removeAllowedWithoutAdd: true, daysOut, why: 'appt_3plus_days' };
 }
 
 /* --- the decision ------------------------------------------------------------------ */
@@ -182,6 +196,7 @@ export function routeBooked(c, { nowMs, cfg }) {
 /**
  * Everything that needs no Five9 read. First match wins.
  * @returns {{ action: 'skip'|'hold'|'candidate', reason: string, route?: object }}
+ * A 3+ day visit is a candidate (its removal is due now); route.hold marks it.
  */
 export function prefilter(c, { nowMs, cfg, sold = false }) {
   if (!c.phone) return { action: 'skip', reason: 'no_phone' };
@@ -191,7 +206,6 @@ export function prefilter(c, { nowMs, cfg, sold = false }) {
   if (sold) return { action: 'skip', reason: 'sold' };
   const route = routeBooked(c, { nowMs, cfg });
   if (route.skip) return { action: 'skip', reason: route.skip, route };
-  if (route.hold) return { action: 'hold', reason: route.why, route };
   // An inquiry LP has not issued has no CustID: no Confirmation record can be
   // built, and removal without an add would leave it on no list.
   if (route.addList && !c.custId) return { action: 'hold', reason: 'awaiting_lp_checkout', route };
@@ -215,6 +229,11 @@ export function addState(addRows, list) {
   return 'none';
 }
 
+/** How many adds of this phone to `list` FAILED (the retry rule reads it). */
+export function failedAddCount(addRows, list) {
+  return (addRows || []).filter((r) => r.list === list && !DONE.has(r.status) && !OPEN.has(r.status)).length;
+}
+
 /**
  * The Five9 half.
  * @param {object} a
@@ -225,9 +244,11 @@ export function addState(addRows, list) {
  * @param {boolean} a.removedToday     today's removal claim exists
  * @param {boolean} a.removedBefore    a removal claim from an earlier day exists
  * @param {boolean} a.addClaimed       our add claim for this phone+appt+list exists
- * @returns {{ add: boolean, remove: boolean, reason: string, readded?: boolean }}
+ * @param {number}  a.failedAdds       failedAddCount() for the target list
+ * @param {boolean} a.retryClaimed     the one retry was already queued
+ * @returns {{ add: boolean, remove: boolean, reason: string, readded?: boolean, retry?: boolean, alert?: boolean }}
  */
-export function decide({ pre, onDnc, contact, adds, removedToday, removedBefore, addClaimed, cfg }) {
+export function decide({ pre, onDnc, contact, adds, removedToday, removedBefore, addClaimed, failedAdds = 0, retryClaimed = false, cfg }) {
   const route = pre.route;
   if (onDnc === null || onDnc === undefined) return { add: false, remove: false, reason: 'dnc_unreadable' };
   if (onDnc) return { add: false, remove: false, reason: 'dnc' };
@@ -238,7 +259,12 @@ export function decide({ pre, onDnc, contact, adds, removedToday, removedBefore,
   let reason = route.why;
   if (route.addList && !addOk) {
     if (adds === 'pending') return { add: false, remove: false, reason: 'add_in_flight' };
-    if (adds === 'failed' && addClaimed) return { add: false, remove: false, reason: 'add_failed_no_removal' };
+    if (adds === 'failed') {
+      // One retry, then a person (2026-10-06 follow-up). Never a removal on a failed add.
+      if (failedAdds >= 2 || retryClaimed) return { add: false, remove: false, reason: 'add_failed_twice', alert: true };
+      if (contact === 'error') return { add: false, remove: false, reason: 'five9_record_unreadable' };
+      return { add: true, remove: false, reason: `${reason}:add_retry`, retry: true };
+    }
     if (contact === 'error') return { add: false, remove: false, reason: 'five9_record_unreadable' };
     if (addClaimed) return { add: false, remove: false, reason: 'add_in_flight' };
     add = true;
@@ -261,6 +287,17 @@ export function decide({ pre, onDnc, contact, adds, removedToday, removedBefore,
 const slug = (s) => String(s).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
 export const addKey = (phone, apptDate, list) => `booked-conf:${phone}:${apptDate}:${slug(list)}`;
 export const removeKey = (phone, apptDate, etDate) => `booked-remove:${phone}:${apptDate}:${etDate}`;
+export const retryKey = (phone, apptDate, list) => `${addKey(phone, apptDate, list)}:retry`;
+export const moveKey = (phone, apptDate) => `booked-conf-move:${phone}:${apptDate}`;
+
+/**
+ * The visit moved from two days out to tomorrow/today: both Confirmation adds
+ * completed, so the number should come off "Conf - 2nd Day" (once per visit).
+ */
+export function confMoveDue({ route, addRows, moveClaimed, cfg }) {
+  if (moveClaimed || route?.addList !== cfg.conf.nextDay) return false;
+  return addState(addRows, cfg.conf.nextDay) === 'done' && addState(addRows, cfg.conf.secondDay) === 'done';
+}
 /** The removal keys of the previous `days` ET days (not today). */
 export function priorRemoveKeys(phone, apptDate, nowMs, days) {
   const out = [];
@@ -277,14 +314,19 @@ export function visitText(c) {
 }
 
 /**
- * The five9_delete_record_from_list row. requires_approval unless the
- * standing exception (BOOKED_ROUTING_AUTO_REMOVE) is on. The approval binds to
- * this payload and expires at the appointment.
+ * The five9_delete_record_from_list row. Runs unarmed (Mark's standing
+ * exception) unless BOOKED_ROUTING_AUTO_REMOVE=false, which queues it for
+ * approval instead. Either way it expires at the appointment.
  */
-export function buildRemovalAction(c, { reason, readded = false, confList = null, cfg, nowMs }) {
+export function buildRemovalAction(c, { reason, readded = false, confList = null, lists = null, cfg, nowMs }) {
   const expires = apptExpiryMs(c);
   const auto = cfg.autoRemove;
-  const where = confList ? `It is on "${confList}" for the confirmation call.` : 'The appointment is already confirmed.';
+  const listNames = lists && lists.length ? [...lists] : [...cfg.removeLists];
+  const where = reason === 'moved_to_next_day'
+    ? `The visit is now tomorrow or today, so the number is on "${cfg.conf.nextDay}"; this stops a second confirmation call from "${cfg.conf.secondDay}".`
+    : reason === 'appt_3plus_days'
+      ? 'The visit is 3+ days out; the number goes on a confirmation list two days before it.'
+      : confList ? `It is on "${confList}" for the confirmation call.` : 'The appointment is already confirmed.';
   return {
     event_id: null,
     action_type: 'five9_delete_record_from_list',
@@ -293,7 +335,7 @@ export function buildRemovalAction(c, { reason, readded = false, confList = null
     // The approval card resolves the contact from target_id.
     target_id: c.contactId || c.ldsId || c.phone,
     action_payload: {
-      list_names: [...cfg.removeLists],
+      list_names: listNames,
       field_names: ['number1'],
       values: [c.phone],
       list_delete_mode: 'DELETE_ALL',
@@ -310,7 +352,7 @@ export function buildRemovalAction(c, { reason, readded = false, confList = null
     },
     reasoning:
       `Booked-lead routing (decision #2669): ${c.name || 'this lead'} (…${c.phone.slice(-4)}, LP lead ${c.ldsId || `inquiry ${c.in1}`}) ` +
-      `has a visit ${visitText(c)}. A booked lead comes off the setter dial lists (${cfg.removeLists.join(', ')}). ${where}` +
+      `has a visit ${visitText(c)}. It comes off ${listNames.map((l) => `"${l}"`).join(', ')}. ${where}` +
       (readded ? ' LP put the number back on a setter list after an earlier removal.' : '') +
       ` Removing a number that is not on a list does nothing. Expires at the appointment time.`,
     rule_applied: RULE_KEY,
@@ -343,6 +385,21 @@ export function buildAddAction(c, record, list, { reason, nowMs }) {
     requires_approval: false,
     priority: 80,
   };
+}
+
+const phoneText = (p) => `(${p.slice(0, 3)}) ${p.slice(3, 6)}-${p.slice(6)}`;
+
+/** The #contact-center card for adds that failed twice. Plain English. */
+export function formatAddFailedCard(items) {
+  const lines = items.map(({ c, list }) => `• ${c.name || 'No name'} · ${phoneText(c.phone)} · visit ${visitText(c)} → "${list}" (LP lead ${c.ldsId || `inquiry ${c.in1}`})`);
+  return [
+    '⚠️ BOOKED LEADS NOT ON A CONFIRMATION LIST — please add them in Five9 by hand',
+    '',
+    ...lines.slice(0, 20),
+    ...(lines.length > 20 ? [`…and ${lines.length - 20} more`] : []),
+    '',
+    'Our system tried twice and Five9 refused. Until someone adds them, nobody will make the confirmation call.',
+  ].join('\n');
 }
 
 /** Is a queued removal past its approval window? */

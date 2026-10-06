@@ -13,7 +13,8 @@
 //           Five9 action rows, no marks, no Slack.
 //   live    claim, then queue: the Confirmation add (auto-approved carve-out,
 //           #1057) and, on a later pass once it completed, the removal
-//           (requires approval unless BOOKED_ROUTING_AUTO_REMOVE=true).
+//           (automatic, Mark's standing exception; BOOKED_ROUTING_AUTO_REMOVE=false
+//           puts it back behind approval).
 //   Anything unrecognised is `shadow`.
 //
 // FAIL CLOSED ON READS
@@ -35,22 +36,26 @@ import { readInboundRows, readLeadsSince, readSoldPhones, readDnc } from './new-
 import {
   routingMode, routingConfig, buildCandidate, onePerPhone, prefilter, decide, addState, addKey, removeKey,
   priorRemoveKeys, buildAddAction, buildRemovalAction, approvalExpired, RULE_KEY,
+  failedAddCount, retryKey, moveKey, confMoveDue, formatAddFailedCard,
 } from '../booked-dial-routing.js';
 
 export const JOB_ID = 'booked-dial-routing';
 const MARKS_TABLE = 'lp_appointment_sync_marks';
 const LOG_TABLE = 'booked_dial_routing_log';
 const ALERT_KEY = 'booked-dial-routing';
+export const ADD_FAILED_AUDIT = 'booked_conf_add_failed';
 
 const q = (x) => `'${String(x).replace(/'/g, "''")}'`;
 
 async function defaultDeps() {
-  const [{ runSQL }, supabaseMod, five9, lp, alertState] = await Promise.all([
+  const [{ runSQL }, supabaseMod, five9, lp, alertState, slack, alertPosted] = await Promise.all([
     import('../admin/supabase-admin.js'),
     import('../supabase.js'),
     import('../five9-admin.js'),
     import('../lp-client.js'),
     import('../alert-state.js'),
+    import('../slack.js'),
+    import('../alert-posted.js'),
   ]);
   return {
     runSQL,
@@ -59,6 +64,9 @@ async function defaultDeps() {
     getContactRecords: five9.getContactRecords,
     listInboundLeads: lp.listInboundLeads,
     reportAlertCondition: alertState.reportAlertCondition,
+    postToSlack: slack.postToSlack,
+    filterNew: alertPosted.filterNew,
+    recordPosted: alertPosted.recordPosted,
   };
 }
 
@@ -236,8 +244,8 @@ export async function runBookedDialRouting({ env = process.env, nowMs = Date.now
     const keys = [];
     for (const c of candidates) {
       if (!c.phone || !c.apptDate) continue;
-      for (const l of Object.values(cfg.conf)) keys.push(addKey(c.phone, c.apptDate, l));
-      keys.push(removeKey(c.phone, c.apptDate, today), ...priorRemoveKeys(c.phone, c.apptDate, nowMs, cfg.readdLookbackDays));
+      for (const l of Object.values(cfg.conf)) keys.push(addKey(c.phone, c.apptDate, l), retryKey(c.phone, c.apptDate, l));
+      keys.push(removeKey(c.phone, c.apptDate, today), moveKey(c.phone, c.apptDate), ...priorRemoveKeys(c.phone, c.apptDate, nowMs, cfg.readdLookbackDays));
     }
     marks = await readMarks(d.supabase, [...new Set(keys)]);
   } catch (err) {
@@ -261,6 +269,7 @@ export async function runBookedDialRouting({ env = process.env, nowMs = Date.now
     try { onDnc = await readDnc(d.checkDnc, live.map((x) => x.c.phone)); } catch (err) { errors.push(`dnc: ${err.message}`); }
   }
   let lookups = 0;
+  const addFailed = [];
   for (const { c, pre } of live) {
     const list = pre.route.addList;
     let contact;
@@ -274,15 +283,27 @@ export async function runBookedDialRouting({ env = process.env, nowMs = Date.now
       }
     }
     const removedBefore = priorRemoveKeys(c.phone, c.apptDate, nowMs, cfg.readdLookbackDays).some((k) => marks.has(k));
+    const addRows = adds.get(c.phone);
     const dec = decide({
       pre, contact, cfg,
       onDnc: onDnc ? onDnc.has(c.phone) : null,
-      adds: addState(adds.get(c.phone), list),
+      adds: addState(addRows, list),
       removedToday: marks.has(removeKey(c.phone, c.apptDate, today)),
       removedBefore,
       addClaimed: list ? marks.has(addKey(c.phone, c.apptDate, list)) : false,
+      failedAdds: list ? failedAddCount(addRows, list) : 0,
+      retryClaimed: list ? marks.has(retryKey(c.phone, c.apptDate, list)) : false,
     });
     if (dec.readded) lpReadded += 1;
+    // 2026-10-06 follow-up: moved from "2nd Day" to "Next Day" → off "2nd Day" too.
+    const dncKnownClear = Boolean(onDnc && !onDnc.has(c.phone));
+    const moveDue = dncKnownClear && confMoveDue({ route: pre.route, addRows, moveClaimed: marks.has(moveKey(c.phone, c.apptDate)), cfg });
+
+    if (dec.alert) {
+      addFailed.push({ c, list, key: `${c.phone}:${c.apptDate}`, reason: 'add_failed_twice' });
+      note(c, 'add_failed', dec.reason, { list });
+      continue;
+    }
 
     if (dec.add) {
       if (addsQueued >= cfg.maxAdds) { note(c, 'deferred', 'add_cap', { list }); continue; }
@@ -292,7 +313,7 @@ export async function runBookedDialRouting({ env = process.env, nowMs = Date.now
         console.log(`[BookedRouting] shadow: would add …${c.phone.slice(-4)} (LP lead ${c.ldsId || c.in1}, visit ${c.apptDate}) → "${list}"`);
         continue;
       }
-      const key = addKey(c.phone, c.apptDate, list);
+      const key = dec.retry ? retryKey(c.phone, c.apptDate, list) : addKey(c.phone, c.apptDate, list);
       let won = false;
       try {
         won = await claim(d.supabase, key, { contactId: c.contactId, ldsId: c.ldsId, apptDate: c.apptDate });
@@ -301,7 +322,7 @@ export async function runBookedDialRouting({ env = process.env, nowMs = Date.now
         const ins = await d.supabase.from('agent_actions').insert(buildAddAction(c, record, list, { reason: dec.reason, nowMs })).select('id').single();
         if (ins.error) throw new Error(ins.error.message);
         addsQueued += 1;
-        note(c, 'added', dec.reason, { list, agent_action_id: ins.data?.id ?? null });
+        note(c, dec.retry ? 'add_retried' : 'added', dec.reason, { list, agent_action_id: ins.data?.id ?? null });
         console.log(`[BookedRouting] queued add …${c.phone.slice(-4)} → "${list}" as agent_action ${ins.data?.id}`);
       } catch (err) {
         if (won) await release(d.supabase, key);
@@ -311,27 +332,38 @@ export async function runBookedDialRouting({ env = process.env, nowMs = Date.now
       continue;
     }
 
-    if (dec.remove) {
+    if (dec.remove || moveDue) {
+      // One card per phone: the setter lists, "Conf - 2nd Day", or both.
+      const lists = [...(dec.remove ? cfg.removeLists : []), ...(moveDue ? [cfg.conf.secondDay] : [])];
+      const reason = dec.remove ? dec.reason : 'moved_to_next_day';
       if (removalsQueued >= cfg.maxRemovals) { note(c, 'deferred', 'removal_cap'); continue; }
       if (mode === 'shadow') {
-        note(c, 'would_remove', dec.reason, { list: cfg.removeLists.join(', ') });
+        note(c, 'would_remove', reason, { list: lists.join(', ') });
         removalsQueued += 1;
-        console.log(`[BookedRouting] shadow: would queue removal of …${c.phone.slice(-4)} from ${cfg.removeLists.join(', ')} (${dec.reason})`);
+        console.log(`[BookedRouting] shadow: would queue removal of …${c.phone.slice(-4)} from ${lists.join(', ')} (${reason})`);
         continue;
       }
-      const key = removeKey(c.phone, c.apptDate, today);
-      let won = false;
+      const keys = [...(dec.remove ? [removeKey(c.phone, c.apptDate, today)] : []), ...(moveDue ? [moveKey(c.phone, c.apptDate)] : [])];
+      const won = [];
       try {
-        won = await claim(d.supabase, key, { contactId: c.contactId, ldsId: c.ldsId, apptDate: c.apptDate });
-        if (!won) { note(c, 'skipped', 'removal_already_claimed'); continue; }
-        const row = buildRemovalAction(c, { reason: dec.reason, readded: Boolean(dec.readded), confList: list, cfg, nowMs });
+        for (const key of keys) {
+          if (!(await claim(d.supabase, key, { contactId: c.contactId, ldsId: c.ldsId, apptDate: c.apptDate }))) break;
+          won.push(key);
+        }
+        if (won.length !== keys.length) {
+          for (const k of won) await release(d.supabase, k);
+          won.length = 0;
+          note(c, 'skipped', 'removal_already_claimed');
+          continue;
+        }
+        const row = buildRemovalAction(c, { reason, readded: Boolean(dec.readded), confList: list, lists, cfg, nowMs });
         const ins = await d.supabase.from('agent_actions').insert(row).select('id').single();
         if (ins.error) throw new Error(ins.error.message);
         removalsQueued += 1;
-        note(c, 'remove_queued', dec.reason, { list: cfg.removeLists.join(', '), agent_action_id: ins.data?.id ?? null });
-        console.log(`[BookedRouting] queued removal of …${c.phone.slice(-4)} as agent_action ${ins.data?.id} (${row.requires_approval ? 'awaiting approval' : 'auto — standing exception'})`);
+        note(c, 'remove_queued', reason, { list: lists.join(', '), agent_action_id: ins.data?.id ?? null });
+        console.log(`[BookedRouting] queued removal of …${c.phone.slice(-4)} from ${lists.join(', ')} as agent_action ${ins.data?.id} (${row.requires_approval ? 'awaiting approval' : 'auto — standing exception'})`);
       } catch (err) {
-        if (won) await release(d.supabase, key);
+        for (const k of won) await release(d.supabase, k);
         errors.push(`removal ${c.phone.slice(-4)}: ${err.message}`);
         note(c, 'failed', 'removal_queue_failed');
       }
@@ -341,8 +373,21 @@ export async function runBookedDialRouting({ env = process.env, nowMs = Date.now
     note(c, dec.reason === 'dnc' ? 'skipped' : 'waiting', dec.reason, list ? { list } : {});
   }
 
+  // 4. Adds that failed twice: ONE #contact-center card, each visit once (live).
+  if (addFailed.length && mode === 'live') {
+    const channel = String(env.SLACK_CHANNEL_SERVICE || '').trim();
+    const { fresh } = await d.filterNew({ audit: ADD_FAILED_AUDIT, items: addFailed, ttlDays: 14, nowMs, deps: { supabase: d.supabase } });
+    if (fresh.length) {
+      const res = channel
+        ? await Promise.resolve(d.postToSlack(formatAddFailedCard(fresh), channel)).catch((err) => ({ ok: false, error: err.message }))
+        : { ok: false, error: 'SLACK_CHANNEL_SERVICE unset' };
+      if (res?.ok) await d.recordPosted({ audit: ADD_FAILED_AUDIT, items: fresh, nowMs, deps: { supabase: d.supabase } });
+      else errors.push(`#contact-center add-failed card: ${res?.error || 'post failed'}`);
+    }
+  }
+
   await alarm();
-  return finish({ inbound_source: inboundSource, candidates: candidates.length, five9_lookups: lookups, approvals_expired: expired.expired });
+  return finish({ add_failed: addFailed.length, inbound_source: inboundSource, candidates: candidates.length, five9_lookups: lookups, approvals_expired: expired.expired });
 }
 
 /** One pass as its own job_runs row; called after each inbound-watch pass. */

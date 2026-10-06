@@ -123,7 +123,9 @@ test('prompt_sha256 is stable for identical input and changes when the prompt ch
 });
 
 test('buildContextRow carries prompt_sha256 and resolved_model only when given', () => {
-  const base = { message_type: 'reply', message_ref: '123', channel: 'sms' };
+  // A fixed generated_at: two rows built a millisecond apart would otherwise
+  // differ in their default timestamp and fail the deepEqual below at random.
+  const base = { message_type: 'reply', message_ref: '123', channel: 'sms', generated_at: '2026-10-06T12:00:00.000Z' };
   const without = buildContextRow(base);
   assert.ok(!('prompt_sha256' in without) && !('resolved_model' in without), 'absent stays absent (no new column in the write)');
   const withFp = buildContextRow({ ...base, prompt_sha256: 'a'.repeat(64), resolved_model: 'claude-sonnet-5-20260901' });

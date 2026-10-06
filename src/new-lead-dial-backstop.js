@@ -18,6 +18,11 @@
 // WHICH LIST — the user's ruling 2026-10-06 (replaces the 2026-10-05 default
 // of "Callback Request" for every lead with no appointment). First match wins:
 //   1. appointment today or tomorrow → "Conf - Next Day"; 2+ days → "Conf - 2nd Day"
+//      — EXCEPT while booked routing is LIVE (Mark, 2026-10-06 follow-up to
+//      decision #2669): a visit 3+ days out is then NOT pushed here; it is held
+//      and src/jobs/booked-dial-routing.js adds it two days before the visit.
+//      Tied to BOOKED_DIAL_ROUTING_MODE=live on purpose: in shadow or off,
+//      nothing else would ever put that lead on a confirmation list.
 //   2. the lead asked for a callback → NOT ours: src/five9/callback-push.js files
 //      it to "Callback Request" (lp_callback_requeue). Pushing it too would put
 //      one person on two lists.
@@ -108,6 +113,9 @@ export function backstopConfig(env = process.env) {
     maxPushes: num(env.NEW_LEAD_BACKSTOP_MAX_PUSHES, 20, 1),
     maxLookups: num(env.NEW_LEAD_BACKSTOP_MAX_LOOKUPS, 40, 1),
     callNowMode: String(env.NEW_LEAD_BACKSTOP_CALL_NOW_MODE || callbackCallNowMode()).trim().toUpperCase() || 'ANY',
+    // Read like routingMode() in src/booked-dial-routing.js (not imported: that
+    // module imports this one). Only an exact 'live' holds 3+ day visits.
+    holdThreePlusForBookedRouting: String(env.BOOKED_DIAL_ROUTING_MODE ?? '').trim().toLowerCase() === 'live',
   };
 }
 
@@ -257,6 +265,7 @@ export function routeList({ hasAppt, apptDateEt, apptStartMs, nowMs, cfg }) {
   if (daysOut < 0) return { skip: 'past_appointment' };
   if (daysOut === 0 && Number.isFinite(apptStartMs) && apptStartMs <= nowMs) return { skip: 'past_appointment' };
   if (daysOut <= 1) return { list: cfg.lists.nextDay, why: daysOut === 0 ? 'appt_today' : 'appt_tomorrow' };
+  if (daysOut >= 3 && cfg.holdThreePlusForBookedRouting) return { skip: 'appt_held_for_booked_routing' };
   return { list: cfg.lists.secondDay, why: 'appt_2plus_days' };
 }
 
