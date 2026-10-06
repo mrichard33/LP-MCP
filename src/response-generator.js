@@ -255,6 +255,7 @@
  * v1.0   — Initial.
  */
 
+import { promptSha256 } from './bot-feedback/fingerprint-core.js';
 import { cleanInboundForModel } from './security/untrusted-text.js';
 import { buildLeadContext } from './context-builder.js';
 import { classifyInbound, isShortCircuit } from './knowledge/intent-classifier.js';
@@ -477,6 +478,7 @@ const BARE_MERGE_TAG_RX = /\{\{trigger_link\.[A-Za-z0-9_-]+\}\}/;
 // prompt. Sections still written inline here have not been extracted yet.
 const SYSTEM_PROMPT =
   P.SYSTEM_IDENTITY_AND_VOICE +
+  P.UNTRUSTED_CONTENT_RULE +
   P.RANDY_ATTRACTIVE_CHARACTER +
   P.SYSTEM_QUALIFICATION_AND_COMPLIANCE +
   P.EMAIL_OPENER_THREAD_AWARENESS +
@@ -498,9 +500,23 @@ const SYSTEM_PROMPT =
  * on the system prompt the way it already can on the user prompt (which
  * buildResponsePrompt returns verbatim). Nothing in src/ calls it.
  */
-export function getResponseSystemPrompt() {
-  return SYSTEM_PROMPT;
+export function getResponseSystemPrompt(mode = 'off') {
+  return mode === 'live' ? SYSTEM_PROMPT_NEPQ : SYSTEM_PROMPT;
 }
+
+/**
+ * 2026-10-06 (AI OS batch 1 PR 2; CANON.FAIL.003 / P.001). With a NEPQ PLAN
+ * block in the prompt, the own-initiative CTA is the plan's move, not the
+ * phone Review by default. Built once at load from the same text, swapping
+ * exactly two blocks; NEPQ off keeps SYSTEM_PROMPT byte for byte. Each
+ * variant is static for the life of the process, so the system-prompt cache
+ * still hits (one entry per variant).
+ */
+function swapOnce(text, from, to) {
+  if (!text.includes(from)) throw new Error('[ResponseGenerator] NEPQ system prompt: block to swap not found');
+  return text.replace(from, () => to);
+}
+const SYSTEM_PROMPT_NEPQ = swapOnce(swapOnce(SYSTEM_PROMPT, P.PPR_GATE_LEGACY, P.PPR_GATE_NEPQ), P.VALUE_LADDER_LEGACY, P.VALUE_LADDER_NEPQ);
 
 // ═══════════════════════════════════════════════════════════════════
 // REPLY SENDER IDENTITY (2026-07-29 — Kelly Callahan incident)
@@ -1817,6 +1833,7 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
     const turns = context.conversation_recent.slice(-RESPONSE_GEN_HISTORY_TURNS);
     const recentFrom = Math.max(0, turns.length - RESPONSE_GEN_HISTORY_RECENT_TURNS);
     parts.push(...P.CONVERSATION_HISTORY_HEADER);
+    parts.push(...P.CUSTOMER_DATA_FENCE_OPEN);
     turns.forEach((m, i) => {
       const cap = i >= recentFrom ? RESPONSE_GEN_HISTORY_CHARS_RECENT : RESPONSE_GEN_HISTORY_CHARS_OLDER;
       const body = m.text?.slice(0, cap) || '(empty)';
@@ -1826,6 +1843,7 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
       const label = m.channel ? `${m.direction}/${m.channel}` : m.direction;
       parts.push(...P.conversationHistoryEntry(label, body));
     });
+    parts.push(...P.CUSTOMER_DATA_FENCE_CLOSE);
     // Quality Pass v1.0 Item 1a — anti-repetition + answered-question (hard rules).
     // Evidence: the same escalation line sent verbatim 3×, and a slot question
     // re-asked after the lead had already picked ("I said 4PM already. Why are
@@ -1971,20 +1989,26 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
 // CLAUDE API CALL
 // ═══════════════════════════════════════════════════════════════════
 
-async function callClaude(userPrompt) {
+async function callClaude(userPrompt, { system = SYSTEM_PROMPT, meta = null } = {}) {
   // Provider/model resolved from env by the shared client. json:true sets
   // OpenAI response_format=json_object (the system prompt mandates a JSON
   // object); ignored for Anthropic. parseJsonFromResponse still tolerates
   // any stray fences/preamble.
-  const { text } = await callLLM({
+  //
+  // 2026-10-06 (AI OS batch 1 PR 2; CANON.STD.026): `meta` receives what this
+  // reply actually ran on — the sha256 of the system prompt sent and the
+  // model named in the API RESPONSE (not the configured alias).
+  if (meta) meta.prompt_sha256 = promptSha256(system);
+  const { text, raw } = await callLLM({
     fn: 'response_generator',
-    system: SYSTEM_PROMPT,
+    system,
     // Static for the life of the process: cache it (2026-10-02).
     cacheSystem: true,
     user: userPrompt,
     maxTokens: MAX_TOKENS,
     json: true,
   });
+  if (meta) meta.resolved_model = (typeof raw?.model === 'string' && raw.model) || null;
 
   return parseJsonFromResponse(text);
 }
@@ -3993,7 +4017,11 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // every reply is written by the model, a fixed move's line included (it is
   // the reference in the plan block, and the backup if the model's version
   // fails twice).
-  const raw = await callClaude(userPrompt);
+  // The NEPQ system prompt only when a PLAN block is in this prompt (live
+  // mode, SMS or chat turn with a plan); email and coverage turns keep the
+  // legacy CTA text.
+  const genMeta = {};
+  const raw = await callClaude(userPrompt, { system: getResponseSystemPrompt(nepqMode === 'live' && nepqPlan ? 'live' : 'off'), meta: genMeta });
 
   const validated = validateResponse(raw, channel, upcomingAppointments);
   if (!validated) {
@@ -4860,11 +4888,10 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
         ? [idn.address_line1, idn.city, [idn.state, idn.postal_code].filter(Boolean).join(' ')].filter(Boolean).join(', ')
         : null;
       if (visitAddress && !cap.address) cap.address = visitAddress;
-      // In-home: status tracks decision-maker confirmation. 'confirmed' only
-      // when decision-makers are confirmed (Yes | Solo Owner), else 'new'
-      // (tentative; a human confirms).
-      const dm = cap.qualifying_data?.decision_makers_present;
-      cap.status = (dm === 'Yes' || dm === 'Solo Owner') ? 'confirmed' : 'new';
+      // In-home: always 'new' (Mark, 2026-10-02: a team member confirms every
+      // visit; the booking handler forces it too). The decision-maker answer
+      // rides on qualifying_data.decision_makers_present, not on the status.
+      cap.status = 'new';
 
       // 2026-09-18 — ALL DECISION MAKERS ATTEND (Mark's ruling). The model is
       // not allowed to book an in-home visit for one person while the
@@ -4974,6 +5001,9 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     _bot_context: {
       core_prompt_version: RESPONSE_GENERATOR_VERSION,
       model: resolveLLM('response_generator').model,
+      // CANON.STD.026: what this reply ran on (null before the call returns).
+      prompt_sha256: genMeta.prompt_sha256 || null,
+      resolved_model: genMeta.resolved_model || null,
       kb_modes: extractKbModes(kbPack),
       kb_sources: extractKbSources(kbPack),
       input_snapshot: buildInputSnapshot({

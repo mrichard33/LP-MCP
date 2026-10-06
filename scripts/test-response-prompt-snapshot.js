@@ -189,6 +189,13 @@ for (const fixture of fixtures) {
   });
 }
 
+// 2026-10-06 (AI OS batch 1 PR 2): with a NEPQ PLAN block in the prompt the
+// own-initiative CTA text is swapped (PPR_GATE_NEPQ, VALUE_LADDER_NEPQ). That
+// variant gets its own snapshot so its copy is reviewed the same way.
+test('snapshot: system prompt with a NEPQ PLAN block (NEPQ live)', () => {
+  compare(path.join(SNAPSHOT_DIR, 'system-nepq-live.txt'), 'system prompt (NEPQ live)', getResponseSystemPrompt('live'));
+});
+
 // ── Block coverage ───────────────────────────────────────────────────
 test('every prompt block in the split map is exercised by a fixture', () => {
   // rendered is populated by the snapshot tests above, which node:test runs in

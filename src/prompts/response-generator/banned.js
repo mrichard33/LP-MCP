@@ -25,8 +25,7 @@ export const ANTI_PATTERNS = `═══════ ANTI-PATTERNS ════�
 AUTO-BOOK:
 ❌ Emitting companion_action when no specific time was ever proposed
 ❌ Inventing a held time the bot didn't propose
-❌ Setting status="confirmed" when ANY of Q1/Q2/Q3 fails — default to "new"
-❌ Setting status to anything other than "confirmed" or "new"
+❌ Setting any status other than "new" on a booking, reschedule or update you emit (a team member confirms every visit; Mark, 2026-10-02)
 ❌ Listing missing details in the PATH B message
 ❌ Using "locked in" language in PATH B
 ❌ Confirming, rescheduling, or upgrading an IN-HOME appointment without stating that our team will call to go over the details and finalize the visit

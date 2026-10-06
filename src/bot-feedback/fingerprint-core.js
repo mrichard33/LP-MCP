@@ -10,9 +10,11 @@
  *   half — shaping and normalizing — so it is unit-testable with no I/O.
  *   All DB work lives in fingerprint.js.
  *
- * Dependency-free + pure, following the repo's *-core.js convention
+ * Pure (node:crypto for the prompt hash only), following the repo's *-core.js convention
  * (exemplars-core.js, ci-moments-core.js, vector-gate.js).
  */
+
+import { createHash } from 'node:crypto';
 
 /** Modes this feature understands. Mirrors vector-gate.js / exemplars-core.js. */
 export const BOT_FINGERPRINT_MODES = new Set(['off', 'on']);
@@ -312,7 +314,41 @@ export function buildContextRow(input = {}, env = process.env) {
     shadow_example_ids: Array.isArray(input.shadow_example_ids) ? input.shadow_example_ids : [],
     generated_at: input.generated_at ?? new Date().toISOString(),
     sent_at: input.sent_at ?? null,
+    // 2026-10-06 (AI OS batch 1 PR 2; CANON.STD.026): what the reply ran on.
+    // Only present when known, so a row written before sql/148 is applied
+    // (or by a path that has no model call) carries no new column at all.
+    ...(input.prompt_sha256 ? { prompt_sha256: clip(input.prompt_sha256, 64) } : {}),
+    ...(input.resolved_model ? { resolved_model: clip(input.resolved_model, 120) } : {}),
   };
+}
+
+/** The two STD.026 columns (sql/148). */
+export const FINGERPRINT_VERSION_COLUMNS = Object.freeze(['prompt_sha256', 'resolved_model']);
+
+/** sha256 hex of the exact prompt string sent, or null. Pure. */
+export function promptSha256(text) {
+  if (typeof text !== 'string' || !text) return null;
+  return createHash('sha256').update(text, 'utf8').digest('hex');
+}
+
+/**
+ * A write refused because prompt_sha256 / resolved_model is not a column yet
+ * (sql/148 not applied). Check this BEFORE isMissingRelation: PostgREST says
+ * "Could not find the '<col>' column … in the schema cache", which that
+ * check would read as a missing TABLE and drop the whole row.
+ */
+export function isMissingFingerprintColumn(error) {
+  if (!error) return false;
+  const msg = String(error.message ?? '');
+  const namesColumn = FINGERPRINT_VERSION_COLUMNS.some((c) => msg.includes(c));
+  return namesColumn && (error.code === 'PGRST204' || error.code === '42703' || /column/i.test(msg));
+}
+
+/** The row without the two STD.026 columns, for the retry. Pure. */
+export function withoutFingerprintColumns(row) {
+  const out = { ...row };
+  for (const c of FINGERPRINT_VERSION_COLUMNS) delete out[c];
+  return out;
 }
 
 /**
@@ -364,6 +400,10 @@ export function isMissingRelation(error) {
 
 export default {
   BOT_FINGERPRINT_MODES,
+  FINGERPRINT_VERSION_COLUMNS,
+  promptSha256,
+  isMissingFingerprintColumn,
+  withoutFingerprintColumns,
   getFingerprintMode,
   getJudgePersistMode,
   normalizeChannel,
