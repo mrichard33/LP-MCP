@@ -329,8 +329,12 @@ async function _fire({ client, key, label, text, detail, channel, remindMs, send
   const nowIso = new Date(now).toISOString();
   const trimmed = detail ? String(detail).slice(0, DETAIL_CHARS) : null;
 
-  // Claim by INSERT. The PK collision is the whole serialization mechanism.
-  const { error: insErr } = await client.from(TABLE).insert({
+  // Claim by INSERT ... ON CONFLICT DO NOTHING. The PK is still the whole
+  // serialization mechanism: a row back means we inserted it and own the edge;
+  // no row back means one already exists. 2026-10-06: this was a plain insert
+  // that caught 23505, which is the same decision but writes an ERROR line to
+  // the Postgres log on every held condition — 581 of them in under five hours.
+  const { data: claimed, error: insErr } = await client.from(TABLE).upsert({
     alert_key: key,
     state: 'firing',
     label: label ?? null,
@@ -340,16 +344,16 @@ async function _fire({ client, key, label, text, detail, channel, remindMs, send
     cleared_at: null,
     notify_count: 0,
     detail: trimmed,
-  });
+  }, { onConflict: 'alert_key', ignoreDuplicates: true }).select('alert_key');
 
-  if (!insErr) {
-    _maybePrune(client);
-    return await _sendAndStamp({ client, key, text, channel, send, now, kind: 'fired' });
-  }
-
-  if (insErr.code !== '23505') {
+  if (insErr) {
     console.warn(`[AlertState] ${key} claim failed (degrading to in-process cooldown): ${insErr.message}`);
     return await _fallbackFire({ key, text, channel, send, now, fallbackCooldownMs, reason: 'claim_failed' });
+  }
+
+  if (claimed && claimed.length > 0) {
+    _maybePrune(client);
+    return await _sendAndStamp({ client, key, text, channel, send, now, kind: 'fired' });
   }
 
   // A row exists. If it is CLEARED this is a fresh incident — re-arm it. The

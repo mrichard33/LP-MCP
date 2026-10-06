@@ -18,7 +18,9 @@
  *   upsert({ ignoreDuplicates: true }) — ON CONFLICT DO NOTHING with RETURNING:
  *               `.select()` resolves to only the rows actually INSERTED. This
  *               is what lets claimAlertConditionSet claim a whole set in one
- *               round trip and still know which keys are new.
+ *               round trip and still know which keys are new, and (since
+ *               2026-10-06) how _fire() claims one key: an empty result is the
+ *               old 23505, without the ERROR line in the Postgres log.
  *
  *   update()  — a guarded UPDATE ... RETURNING: `.select()` resolves to only
  *               the rows that matched every filter. That is what makes the
@@ -77,7 +79,7 @@ export function mockAlertConditions(rows = new Map(), { fail = null } = {}) {
         const run = () => {
           if (fail === 'throw') throw new Error('client exploded');
           if (fail === 'upsert') return { data: null, error: { message: 'upsert boom' } };
-          for (const row of batch) {
+          for (const row of [].concat(batch)) {
             if (rows.has(row.alert_key)) {
               // ON CONFLICT DO NOTHING: the existing row is left alone and is
               // NOT returned, so the caller correctly reads it as "not mine".

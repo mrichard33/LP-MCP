@@ -238,7 +238,7 @@ test('the alert body is not built when the sweep is silent', async () => {
 
 test('a broken state table degrades firing to the OLD cooldown, not to a storm', async () => {
   __resetAlertStateFallback();
-  const h = harness({ fail: 'insert' });
+  const h = harness({ fail: 'upsert' });
   const r1 = await h.call(true, { nowMs: 0, fallbackCooldownMs: 15 * 60000 });
   assert.equal(r1.action, 'fallback_fired');
   assert.equal(h.sent.length, 1, 'a missed page is the worse failure — still send');
