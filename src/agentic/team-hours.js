@@ -60,6 +60,36 @@ export function openMinutesSince(receivedMs, nowMs = Date.now()) {
   return Math.max(0, Math.floor(Math.min(sinceOpen, sinceArrival)));
 }
 
+const dateFmt = new Intl.DateTimeFormat('en-CA', { timeZone: TEAM_TIMEZONE, year: 'numeric', month: '2-digit', day: '2-digit' });
+const etDate = (ms) => dateFmt.format(new Date(ms));
+function addDays(ymd, n) {
+  const d = new Date(`${ymd}T12:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+}
+
+/**
+ * Is this home visit too early to book while the team is closed?
+ *
+ * 2026-10-06 (the user): LP lead 581084 was booked by the live chat at 7:36 PM
+ * Sunday for 2 PM Monday. LP already had his web row, so the visit waited on a
+ * person to import it (9:58 AM), and nothing could put him on a Five9 Conf list
+ * in time: he was never called before the visit. A visit booked after hours for
+ * the next MORNING cannot be imported and confirmed first. So while the team is
+ * closed, the next open day's visits start at `earliestHour` ET (2 PM: the 10 AM
+ * slot goes, 2 PM and 6 PM stay). Later days and open-hours bookings are
+ * untouched. `earliestHour` 0 turns it off. Pure.
+ */
+export function visitTooEarlyAfterHours(slotMs, nowMs = Date.now(), earliestHour = 14) {
+  if (!Number.isFinite(slotMs) || !(earliestHour > 0) || isTeamOpen(nowMs)) return false;
+  const { dow, hour } = etClock(nowMs);
+  const today = etDate(nowMs);
+  // Closed before today's opening → the next open day is today; after closing → tomorrow.
+  const nextOpenDay = hour < TEAM_HOURS[dow].open ? today : addDays(today, 1);
+  if (etDate(slotMs) > nextOpenDay) return false;
+  return etClock(slotMs).hour < earliestHour;
+}
+
 function hourLabel(h) {
   const hh = Math.floor(h);
   return `${hh % 12 || 12} ${hh < 12 ? 'AM' : 'PM'}`;

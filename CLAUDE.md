@@ -463,6 +463,11 @@ in-home calendar read (Window Estimate, Measurement Verification, Home Protectio
 times, on the hour, in the office zone (`allowedStartHours` / `IN_HOME_START_HOURS` in `calendar-availability.js`,
 applied in `parseSlots`). Call slots (PPR) floor at 30 minutes, only inside team hours, two times an hour apart the same day
 (`selectOfferableSlots({ call: true })`): a call back can happen any time the team is in.
+**A visit booked after hours starts at 2 PM on the next open day (the user, 2026-10-06).** LP lead 581084 booked
+Sunday 7:36 PM for Monday; LP already had his web row, so the visit waited on a person to import it (9:58 AM) and no
+Conf list could call him first. While the team is closed, `parseSlots` drops in-home slots on the next open day before
+`AFTER_HOURS_VISIT_EARLIEST_HOUR` (default 14, 0 = off; `visitTooEarlyAfterHours` in `team-hours.js`). Calls (PPR) and
+later days are untouched. The lead always goes to LP first; Five9 Conf lists are filled from LP by the new-lead dial backstop.
 
 **No line twice, one reply per burst (Mark, 2026-10-02).** Lines that recur in a thread come in variants
 (`bridgeLine`, `LINES.offer_slots(slots, n)`, `ALT_LINES`); `pickFresh` never picks one whose opening words were
