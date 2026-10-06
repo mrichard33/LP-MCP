@@ -2631,4 +2631,28 @@ export const STARTUP_MIRRORS = [
     fail: '[Migration] bot_message_context prompt fingerprint (sql/148) skipped — apply sql/148 from the dashboard; rows are written without prompt_sha256 / resolved_model until it exists:',
     level: 'warn',
   },
+  // lp_inbound_queue + booked_dial_routing_log + v_lp_inbound_checkout_daily
+  // (sql/149, 2026-10-06; the file is the source of truth). The mirror of LP's
+  // inbound queue and the booked-lead routing audit. Until they exist the
+  // inbound-checkout watch still alerts (no mirror) and the routing job logs to
+  // job_runs only — both fail soft.
+  {
+    name: 'sql/149',
+    expects: {
+      tables: ['lp_inbound_queue', 'booked_dial_routing_log'],
+      views: ['v_lp_inbound_checkout_daily'],
+      indexes: [
+        'idx_lp_inbound_queue_phone10',
+        'idx_lp_inbound_queue_lognumber',
+        'idx_lp_inbound_queue_received',
+        'idx_lp_inbound_queue_waiting',
+        'idx_booked_dial_routing_log_phone',
+        'idx_booked_dial_routing_log_created',
+      ],
+    },
+    sqlFile: 'sql/149_lp_inbound_queue.sql',
+    ready: '[Migration] lp_inbound_queue / booked_dial_routing_log (sql/149) ready',
+    fail: '[Migration] lp_inbound_queue / booked_dial_routing_log (sql/149) skipped — apply sql/149 from the dashboard; the inbound-checkout watch keeps no mirror and booked-lead routing logs to job_runs only until it exists:',
+    level: 'warn',
+  },
 ];
