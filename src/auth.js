@@ -1,4 +1,8 @@
 import { timingSafeEqual } from 'node:crypto';
+// Circular on purpose: request-auth reuses safeEqual from here. Each side
+// reads the other's exports only inside function bodies, never while its
+// module body runs, so the cycle is safe.
+import { authEnforceMode, recordAuthWouldReject } from './security/request-auth.js';
 
 /**
  * auth — the standard operator bearer-token middleware.
@@ -28,18 +32,35 @@ export function safeEqual(a, b) {
   return timingSafeEqual(ab, bb);
 }
 
-export function makeAuthenticate({ token = null, softLaunch = false, log = (m) => console.warn(m) } = {}) {
+/*
+ * AUTH_ENFORCE_MODE (2026-10-06, AI OS batch 1 PR 3; src/security/request-auth.js):
+ *   log (default) — the four lines above, unchanged, plus one
+ *     `security.auth_would_reject` row per route+reason per hour for an unset
+ *     token (secret_unset) and a soft-launch pass (soft_launch).
+ *   enforce — no token configured → 503; AUTH_SOFT_LAUNCH is ignored → 401.
+ * `mode` and `record` are seams for tests; production reads the env per request.
+ */
+export function makeAuthenticate({ token = null, softLaunch = false, log = (m) => console.warn(m), mode = null, record = recordAuthWouldReject } = {}) {
   return function authenticate(req, res, next) {
-    if (!token) return next();
+    const m = mode ?? authEnforceMode();
+    const route = req.path || req.originalUrl || 'unknown';
+
+    if (!token) {
+      record({ route, reason: 'secret_unset', mode: m, method: req.method });
+      if (m === 'enforce') return res.status(503).json({ error: 'auth_not_configured', detail: 'MCP_AUTH_TOKEN is not set; this endpoint refuses all requests' });
+      return next();
+    }
 
     const authHeader = req.headers.authorization;
     if (safeEqual(authHeader, `Bearer ${token}`)) return next();
 
-    if (softLaunch) {
+    if (softLaunch && m !== 'enforce') {
       log(`[Auth] SOFT_LAUNCH: unauthenticated ${req.method} ${req.path} from ${req.ip} ua="${req.headers['user-agent'] || 'none'}" — would reject in enforce mode`);
+      record({ route, reason: 'soft_launch', mode: m, method: req.method });
       return next();
     }
 
+    record({ route, reason: authHeader ? 'bad_secret' : 'missing_token', mode: m, method: req.method });
     return res.status(401).json({ error: 'Unauthorized' });
   };
 }

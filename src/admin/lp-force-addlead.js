@@ -150,6 +150,7 @@
  *     - x-admin-token header enforced ONLY when ADMIN_API_TOKEN env is set.
  */
 
+import { checkRequestSecret } from '../security/request-auth.js';
 import { sendGroupMeMessage } from '../groupme.js';
 import supabase from '../supabase.js';
 import { getGHLContact, updateGHLContactFields } from '../ghl.js';
@@ -398,11 +399,12 @@ export function registerLPForceAddLeadRoutes(app) {
   app.post('/admin/lp/force-addlead', async (req, res) => {
     const start = Date.now();
 
-    // Optional shared-secret gate — enforced only if ADMIN_API_TOKEN is set,
-    // so this is non-breaking where no token is configured.
-    const required = process.env.ADMIN_API_TOKEN;
-    if (required && req.headers['x-admin-token'] !== required) {
-      return res.status(401).json({ success: false, error: 'unauthorized' });
+    // Shared-secret gate. Staged, constant-time (2026-10-06,
+    // src/security/request-auth.js): open when ADMIN_API_TOKEN is unset only
+    // under AUTH_ENFORCE_MODE=log (enforce → 503).
+    const auth = checkRequestSecret(req, { route: '/admin/lp/force-addlead', secret: process.env.ADMIN_API_TOKEN, headers: ['x-admin-token'] });
+    if (!auth.allow) {
+      return res.status(auth.status).json({ success: false, error: auth.status === 503 ? 'auth_not_configured' : 'unauthorized' });
     }
 
     const body = req.body || {};

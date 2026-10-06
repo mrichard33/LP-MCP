@@ -42,7 +42,7 @@ import supabase from '../supabase.js';
 import { getMarketMaps } from './market-resolver.js';
 import {
   sha256Hex, contentSha256, isUniqueViolation, resolveRowMarket, todayET, centsToDollars,
-  ingestAuthorized, assertIngestAuthConfigured,
+  refuseIngest, assertIngestAuthConfigured,
 } from './lp-report-common.js';
 import { parseJobsByMilestone, validateJobsByMilestone } from './lp-report-parse-a.js';
 import { parseJobsByStatus, flagDuplicates, validateJobsByStatus } from './lp-report-parse-b.js';
@@ -577,7 +577,7 @@ export async function ingestReportPdf({ reportType, buffer, source = 'n8n', expe
  * Guards the PDF ingest routes AND /events/lp_report_ingest_{failed,succeeded}.
  * See ingestAuthorized in lp-report-common.js — including why it fails OPEN.
  */
-const authorized = (req) => ingestAuthorized(req, 'lp-report-ingest');
+const refuse = (req, res) => refuseIngest(req, res, 'lp-report-ingest');
 
 export function registerLpReportRoutes(app) {
   assertIngestAuthConfigured('lp-report-ingest');
@@ -587,7 +587,7 @@ export function registerLpReportRoutes(app) {
   for (const [slug, reportType] of Object.entries(REPORT_TYPES)) {
     app.post(`/n8n/admin/lp-report-ingest/${slug}`, rawPdf, async (req, res) => {
       try {
-        if (!authorized(req)) return res.status(401).json({ success: false, error: 'bad signature' });
+        if (refuse(req, res)) return;
         if (!Buffer.isBuffer(req.body) || !req.body.length) {
           return res.status(400).json({ success: false, error: 'POST the raw PDF bytes as the request body (Content-Type: application/pdf)' });
         }
@@ -611,7 +611,7 @@ export function registerLpReportRoutes(app) {
   for (const [slug, reportType] of Object.entries(REPORT_TYPES)) {
     app.post(`/n8n/admin/lp-report-ingest/backfill/${slug}`, rawPdf, async (req, res) => {
       try {
-        if (!authorized(req)) return res.status(401).json({ success: false, error: 'bad signature' });
+        if (refuse(req, res)) return;
         if (!Buffer.isBuffer(req.body) || !req.body.length) {
           return res.status(400).json({ success: false, error: 'POST the raw PDF bytes as the request body (Content-Type: application/pdf)' });
         }
@@ -640,7 +640,7 @@ export function registerLpReportRoutes(app) {
   // on handled errors — a failure-reporting path must never fail its caller.
   app.post('/events/lp_report_ingest_failed', express.json({ limit: '256kb' }), async (req, res) => {
     try {
-      if (!authorized(req)) return res.status(401).json({ success: false, error: 'bad signature' });
+      if (refuse(req, res)) return;
       const body = req.body && typeof req.body === 'object' ? req.body : {};
       const slug = String(body.report || '').trim();
       const reportType = canonicalReportType(slug);
@@ -688,7 +688,7 @@ export function registerLpReportRoutes(app) {
   // actually attest to. Same 200-always contract as the failure route.
   app.post('/events/lp_report_ingest_succeeded', express.json({ limit: '256kb' }), async (req, res) => {
     try {
-      if (!authorized(req)) return res.status(401).json({ success: false, error: 'bad signature' });
+      if (refuse(req, res)) return;
       const body = req.body && typeof req.body === 'object' ? req.body : {};
       const reportType = canonicalReportType(String(body.report || '').trim());
       // A duplicate is a legitimate green outcome (LP re-sends, n8n retries),
@@ -758,7 +758,7 @@ export function registerLpReportRoutes(app) {
   // manual escape hatch). Same auth as ingest.
   app.post('/n8n/admin/lp-report-facts-rebuild', async (req, res) => {
     try {
-      if (!authorized(req)) return res.status(401).json({ success: false, error: 'bad signature' });
+      if (refuse(req, res)) return;
       if (!supabase) return res.status(500).json({ success: false, error: 'Supabase not configured' });
       const snapshotId = String(req.query.snapshot_id || '').trim();
       if (!snapshotId) return res.status(400).json({ success: false, error: 'snapshot_id query param required' });

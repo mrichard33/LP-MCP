@@ -292,6 +292,7 @@
  *   string values that GHL sends when template variables don't resolve.
  */
 
+import { checkRequestSecret, rejectionBody } from './security/request-auth.js';
 import { isKnockNotOptOut } from './agentic/do-not-knock.js';
 import { emitEvent } from './event-emitter.js';
 import { upsertLeadIntelligence } from './context-builder.js';
@@ -715,13 +716,17 @@ async function markBufferEventsProcessed(eventIds, msgCount, contactId, terminal
   }
 }
 
+// Staged, constant-time (2026-10-06, src/security/request-auth.js): open
+// when GHL_WEBHOOK_SECRET is unset and `?secret=` accepted only under
+// AUTH_ENFORCE_MODE=log. Returns the decision so the route can answer 503
+// (unset, enforce) or 401.
 function validateWebhook(req) {
-  if (!GHL_WEBHOOK_SECRET) return true;
-  const provided = req.headers['x-ghl-signature']
-    || req.headers['x-webhook-secret']
-    || req.query.secret
-    || '';
-  return provided === GHL_WEBHOOK_SECRET;
+  return checkRequestSecret(req, {
+    route: req.path || 'ghl_webhook',
+    secret: GHL_WEBHOOK_SECRET,
+    headers: ['x-ghl-signature', 'x-webhook-secret'],
+    allowQuery: true,
+  });
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1667,9 +1672,10 @@ async function handleContactCreated(req, res) {
 
 export function registerBehavioralEmitterRoutes(app) {
   const validateGHL = (req, res, next) => {
-    if (!validateWebhook(req)) {
-      console.warn(`[BehavioralEmitter] Rejected webhook: invalid secret from ${req.ip}`);
-      return res.status(401).json({ error: 'Invalid webhook secret' });
+    const auth = validateWebhook(req);
+    if (!auth.allow) {
+      console.warn(`[BehavioralEmitter] Rejected: ${auth.reason} from ${req.ip}`);
+      return res.status(auth.status).json(auth.status === 401 ? { error: 'Invalid webhook secret' } : rejectionBody(auth));
     }
     next();
   };

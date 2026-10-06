@@ -19,6 +19,7 @@
  * (x-admin-token enforced when ADMIN_API_TOKEN is set, the lp-force-addlead
  * pattern). Schema uses primitive zod types only (see http-tools.js SCHEMA NOTE).
  */
+import { checkRequestSecret } from '../security/request-auth.js';
 import { z } from 'zod';
 import { SCENARIOS, startSimulationJob, getSimulationJob, formatTranscript } from '../simulator/bot-simulator.js';
 import { formatScorecard } from '../simulator/sim-scoring.js';
@@ -158,10 +159,13 @@ export function registerSimulatorTools(server, deps = simulatorDeps) {
 }
 
 export function registerSimulatorRoutes(app, deps = simulatorDeps) {
+  // Staged, constant-time (2026-10-06, src/security/request-auth.js): open
+  // when ADMIN_API_TOKEN is unset only under AUTH_ENFORCE_MODE=log.
   const authed = (req, res) => {
-    const required = process.env.ADMIN_API_TOKEN;
-    if (required && req.headers['x-admin-token'] !== required) { res.status(401).json({ error: 'x-admin-token required' }); return false; }
-    return true;
+    const d = checkRequestSecret(req, { route: req.path || 'admin-sim', secret: process.env.ADMIN_API_TOKEN, headers: ['x-admin-token'] });
+    if (d.allow) return true;
+    res.status(d.status).json(d.status === 503 ? { error: 'ADMIN_API_TOKEN is not set; this endpoint is closed' } : { error: 'x-admin-token required' });
+    return false;
   };
   app.post('/admin/bot-simulate', (req, res) => {
     if (!authed(req, res)) return;

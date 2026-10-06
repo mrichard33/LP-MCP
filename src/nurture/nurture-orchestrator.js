@@ -127,6 +127,7 @@
  *   generationRetries on top of the safety-retry increment.
  */
 
+import { checkRequestSecret, rejectionBody } from '../security/request-auth.js';
 import crypto from 'crypto';
 import supabase from '../supabase.js';
 import { buildLeadContext } from '../context-builder.js';
@@ -903,13 +904,12 @@ export function registerNurtureRoutes(app) {
         console.log(`[NurtureOrch] extracted found=[${found.join(',')}] missing=[${missing.join(',')}] cd=${cdShape}`);
       } catch { /* diagnostic must never throw */ }
 
-      const token = process.env.MESSAGE_ENGINE_TOKEN;
-      if (token) {
-        const auth = req.headers.authorization || '';
-        const provided = auth.startsWith('Bearer ') ? auth.slice(7) : null;
-        if (provided !== token) {
-          return res.status(200).json({ error: 'unauthorized', send_ready: false });
-        }
+      // Staged, constant-time (2026-10-06, src/security/request-auth.js).
+      const auth = checkRequestSecret(req, { route: req.path || 'nurture-orchestrator', secret: process.env.MESSAGE_ENGINE_TOKEN, bearer: true });
+      if (!auth.allow) {
+        return auth.status === 503
+          ? res.status(503).json({ ...rejectionBody(auth), send_ready: false })
+          : res.status(200).json({ error: 'unauthorized', send_ready: false });
       }
 
       if (!body.contact_id || typeof body.contact_id !== 'string') {

@@ -40,6 +40,7 @@
  * pattern for anything that reaches the network or the database.
  */
 
+import { cleanInboundForModel } from '../security/untrusted-text.js';
 import crypto from 'node:crypto';
 import {
   buildResponsePrompt,
@@ -340,7 +341,10 @@ export function minimalContext({ contactId, contact = null, nowMs = Date.now(), 
  * widget renders it, but the model would read the markup. Pure.
  */
 export function plainMessageText(body) {
-  return String(body ?? '')
+  // 2026-10-06 (AI OS batch 1, PR 3): invisible characters out first
+  // (zero-width, bidi, TAG; src/security/untrusted-text.js). Off with
+  // INBOUND_SANITIZE_MODE=off.
+  return cleanInboundForModel(String(body ?? '')).text
     .replace(/<br\s*\/?>/gi, ' ')
     .replace(/<[^>]+>/g, '')
     .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
@@ -615,9 +619,16 @@ export function createLiveChatFastLane(deps) {
   async function processInbound(inbound, { mode = d.mode() } = {}) {
     const t0Ms = Date.parse(inbound.dateAdded || '') || d.now();
     const tReceived = d.now();
-    const { contactId, body } = inbound;
+    const { contactId } = inbound;
+    // 2026-10-06 (AI OS batch 1, PR 3): the model, the planner and every
+    // keyword check read `body` with invisible characters removed
+    // (src/security/untrusted-text.js); the action row stores `rawBody`, the
+    // message exactly as typed, and the message key stays on it.
+    const rawBody = inbound.body;
+    const inboundClean = cleanInboundForModel(rawBody);
+    const body = inboundClean.text;
     let conversationId = inbound.conversationId || null;
-    const messageKey = inbound.messageId || buildMessageKey(contactId, null, body, tReceived);
+    const messageKey = inbound.messageId || buildMessageKey(contactId, null, rawBody, tReceived);
     const timing = { t0_inbound_received: new Date(t0Ms).toISOString(), t1_event_written: null };
 
     // ── idempotency: one reply per GHL message, whatever GHL retries ──
@@ -691,7 +702,7 @@ export function createLiveChatFastLane(deps) {
       // idempotency_key lives in the payload, NOT as a column: agent_actions
       // has no such column in production (see agent-actions-columns.js), and
       // naming it dropped every live chat row until 2026-10-01.
-      action_payload: { channel: 'livechat', trigger_message: body.slice(0, 1000), message_id: messageKey, conversation_id: conversationId, mode, idempotency_key: `livechat_${messageKey}` },
+      action_payload: { channel: 'livechat', trigger_message: rawBody.slice(0, 1000), inbound_removed_chars: inboundClean.removedCount, message_id: messageKey, conversation_id: conversationId, mode, idempotency_key: `livechat_${messageKey}` },
     });
     const actionId = action?.id ?? null;
     if (actionId == null) rowNotSaved(contactId, action?.error);
@@ -733,7 +744,7 @@ export function createLiveChatFastLane(deps) {
     // The backup a timed-out reply falls back to (Part 7): the move's own
     // reference line once it is known, the holding line before that.
     const backup = { reply: null };
-    const work = replyOnce({ contactId, conversationId, body, contact, tags, mode, actionId, timing, isSuperseded, turn, contextRead, appointmentsRead, tReads, backup });
+    const work = replyOnce({ contactId, conversationId, body, contact, tags, mode, actionId, timing, isSuperseded, turn, contextRead, appointmentsRead, tReads, backup, inboundRemovedChars: inboundClean.removedCount, rawInbound: rawBody });
     let outcome;
     try {
       const raced = await raceWithBudget(work, d.hardTimeoutMs());
@@ -742,7 +753,7 @@ export function createLiveChatFastLane(deps) {
         if (raced.error) d.warn(`[LiveChat] reply failed for ${contactId}: ${raced.error.message}`);
         if (turn.claim('fallback')) {
           // After a cancel or a move the visitor is told, whatever came next (Part 8).
-          outcome = await fallback({ contactId, conversationId, mode, actionId, timing, reason, body, isSuperseded: backup.mustDeliver ? () => false : isSuperseded, backupReply: backup.reply });
+          outcome = await fallback({ contactId, conversationId, mode, actionId, timing, reason, body, rawInbound: rawBody, isSuperseded: backup.mustDeliver ? () => false : isSuperseded, backupReply: backup.reply });
         } else if (raced.timedOut) {
           // The real reply already claimed the turn and is mid-send: wait for
           // it (bounded) rather than send the holding line on top of it.
@@ -792,7 +803,7 @@ export function createLiveChatFastLane(deps) {
     }
   }
 
-  async function replyOnce({ contactId, conversationId, body, contact, tags, mode, actionId, timing, isSuperseded = () => false, turn = newTurnClaim(), contextRead = null, appointmentsRead = null, tReads = null, backup = { reply: null } }) {
+  async function replyOnce({ contactId, conversationId, body, contact, tags, mode, actionId, timing, isSuperseded = () => false, turn = newTurnClaim(), contextRead = null, appointmentsRead = null, tReads = null, backup = { reply: null }, inboundRemovedChars = 0, rawInbound = body }) {
     const started = d.now();
     // ── context, in parallel, LP/lead state capped ──
     const getQueryEmbedding = d.prewarmEmbedding(body);
@@ -1276,8 +1287,10 @@ export function createLiveChatFastLane(deps) {
         _bot_context: { core_prompt_version: 'live_chat_fast_lane', model, discipline, established_closed: established.closed_questions },
       },
       fingerprintExtras: {
+        // The record keeps what the lead typed; the snapshot says what was removed.
+        inbound_text: rawInbound,
         intent_class: classification?.intent_class || null, buyer_stage: Number(liveChatFields?.buyer_stage) || null, model,
-        input_snapshot: { mode, discipline, established_closed: established.closed_questions, context_minimal: !!context._minimal },
+        input_snapshot: { mode, discipline, established_closed: established.closed_questions, context_minimal: !!context._minimal, inbound_removed_chars: inboundRemovedChars },
       },
     });
   }
@@ -1638,7 +1651,7 @@ export function createLiveChatFastLane(deps) {
     return { outcome: sent ? 'sent' : 'shadow', sent, message: draft, ghl_message_id: ghlMessageId, timing: finished, large_job: !!extras.large_job, email_malformed: !!extras.email_malformed, language_handoff: extras.language_handoff || null };
   }
 
-  async function fallback({ contactId, conversationId, mode, actionId, timing, reason, body, isSuperseded = () => false, backupReply = null }) {
+  async function fallback({ contactId, conversationId, mode, actionId, timing, reason, body, rawInbound = body, isSuperseded = () => false, backupReply = null }) {
     // Part 7: when code already decided this turn (a booking step, a hand-off,
     // two real times), its own reference line is the backup: it answers the
     // visitor, where the holding line would only stall them.
@@ -1674,7 +1687,7 @@ export function createLiveChatFastLane(deps) {
       execution_result: { action: 'message_sent', channel: 'livechat', send_status: sent ? 'fallback' : 'fallback_not_sent', ...(sent ? { sent_body: message } : {}), message_id: ghlMessageId, conversation_id: conversationId, reason, timing: finished },
     });
     if (actionId != null) {
-      d.fingerprint({ message_type: 'reply', message_ref: String(actionId), ghl_contact_id: contactId, channel: 'livechat', rule_applied: LIVE_CHAT_RULE, inbound_text: body, reply_text: sent ? message : null, input_snapshot: { mode, fallback_reason: reason } });
+      d.fingerprint({ message_type: 'reply', message_ref: String(actionId), ghl_contact_id: contactId, channel: 'livechat', rule_applied: LIVE_CHAT_RULE, inbound_text: rawInbound, reply_text: sent ? message : null, input_snapshot: { mode, fallback_reason: reason } });
       if (sent) d.markSent(actionId);
     }
     return { outcome: 'fallback', sent, message: sent ? message : null, ghl_message_id: ghlMessageId, reason, timing: finished };

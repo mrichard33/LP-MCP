@@ -38,6 +38,7 @@
  *   gated, for the S1.1 loop. (v1.0 — 2026-06-04, re-fire only.)
  */
 
+import { checkRequestSecret, rejectionBody } from '../security/request-auth.js';
 import { emitEvent } from '../event-emitter.js';
 import { sendGroupMeMessage } from '../groupme.js';
 
@@ -74,15 +75,14 @@ async function refireTrigger(triggerId, payload) {
 // match the nurture generate route's behavior). Responds with 200 + error body
 // on mismatch so a GHL outbound webhook never enters a retry loop.
 function checkBearer(req, res) {
-  const token = process.env.MESSAGE_ENGINE_TOKEN;
-  if (!token) return true;
-  const auth = req.headers.authorization || '';
-  const provided = auth.startsWith('Bearer ') ? auth.slice(7) : null;
-  if (provided !== token) {
-    res.status(200).json({ ok: false, error: 'unauthorized' });
-    return false;
-  }
-  return true;
+  // Staged, constant-time (2026-10-06, src/security/request-auth.js): open
+  // when MESSAGE_ENGINE_TOKEN is unset only under AUTH_ENFORCE_MODE=log
+  // (enforce → 503). A wrong token keeps this route's own answer below.
+  const d = checkRequestSecret(req, { route: req.path || 'hold-complete', secret: process.env.MESSAGE_ENGINE_TOKEN, bearer: true });
+  if (d.allow) return true;
+  if (d.status === 503) res.status(503).json(rejectionBody(d));
+  else res.status(200).json({ ok: false, error: 'unauthorized' });
+  return false;
 }
 
 export function registerHoldCompleteRoutes(app) {
