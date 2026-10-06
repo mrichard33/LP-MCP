@@ -28,6 +28,7 @@
 import { createLiveChatFastLane, minimalContext } from '../live-chat/fast-lane.js';
 import { BOOKING_CALENDARS } from '../knowledge/booking-calendar-router.js';
 import { callbackDecision, NO_DIAL_REASONS } from '../agentic/bot-callback.js';
+import { scoreRun, compareScorecards } from './sim-scoring.js';
 
 export const SIM_CONTACT_PREFIX = 'sim-';
 
@@ -298,6 +299,20 @@ export function startSimulationJob(input, deps) {
     for (const key of keys) {
       const res = await runSimulation({ ...input, scenario: key }, deps);
       job.results.push(...res);
+    }
+    // 2026-10-06 (AI audit, F1): every run is scored. A gate run (run_bot_eval)
+    // is also compared with the last gate run and saved, so a prompt or model
+    // change can be shown to be no worse before it ships. Saving and the
+    // comparison are best-effort: a failed read or write is reported on the
+    // job, never thrown, and never turns a finished run into a failed one.
+    let meta = {};
+    try { meta = (await deps.evalMeta?.()) || {}; } catch { /* meta is decoration */ }
+    job.scorecard = scoreRun(job.results, { ...meta, nepq_mode: input.nepqMode || 'live' });
+    if (input.gate) {
+      let previous = null;
+      try { previous = await deps.lastEvalRun?.({ nepqMode: input.nepqMode || 'live' }); } catch (err) { job.save_error = `last run unreadable: ${String(err?.message || err).slice(0, 200)}`; }
+      job.comparison = job.save_error ? { compared: false, worse: null, reasons: [job.save_error] } : compareScorecards(job.scorecard, previous);
+      try { await deps.recordEvalRun?.(job.scorecard, job.comparison); } catch (err) { job.save_error = `run not saved: ${String(err?.message || err).slice(0, 200)}`; }
     }
     job.status = 'done';
     job.completed_at = new Date().toISOString();
