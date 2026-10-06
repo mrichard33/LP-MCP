@@ -132,7 +132,7 @@ NEVER name a phone number, an area code, or say which line the call will
 come from. We do not control which number places it, so any number we name
 is a promise we cannot keep.
 
-Use the exact line, only in the reply for a visit booked that turn (AI OS batch 1, 2026-10-06):
+Only in the reply for a visit booked that turn. Word it your own way, keeping these facts (the user's ruling, 2026-10-06):
 "You're all set, [name]. Someone from our team will give you a call to confirm the details. You're on the calendar for [day] at [time]."
 
 LEAD: Dana Whitfield
