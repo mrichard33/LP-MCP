@@ -321,7 +321,21 @@ function classifyHealResult(result) {
   if (!action) return 'unknown_result';
   switch (action) {
     case 'lp_appointment_set':
+    // 2026-10-06 — create_lp_lead's in1-only path (lp-lead-inbound-only.js):
+    // the inquiry had been issued and the appointment was written to its lds.
+    case 'inbound_issued_appt_set':
       return 'healed';
+    // The inquiry was issued and already carried the appointment — LP has it.
+    case 'inbound_issued_appt_present':
+      return 'already_present';
+    // Still waiting in LP's inbound queue, unreadable, or LP refused the
+    // appointment on the issued lead. None of these wrote an appointment, so
+    // none may count as a heal (the v1.1 lesson). inbound-checkout-watch
+    // re-drives the waiting ones once LP issues them.
+    case 'pending_lp_checkout':
+    case 'inbound_unverified':
+    case 'inbound_issued_appt_failed':
+      return 'not_attempted';
     case 'already_set_in_lp':
     case 'already_in_lp_skipped_pre_resolve':
       // Parity read LP as MISSING this appointment while the sync path read it

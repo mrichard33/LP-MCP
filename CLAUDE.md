@@ -150,6 +150,24 @@ pushes: one card at 8:00 ET), and names in #ops, once, any lead 30+ dial minutes
 `findContactInOtherLists` is NOT used here: it has never worked in production (bare-array criteria) and
 `f9_last_list` keeps the last list ever, so a naive fix would block most callbacks.
 
+**An inquiry waiting in LP's inbound queue is watched, not assumed (2026-10-06).** Every lead we send LP is an inquiry
+(in1) until somebody checks it out into a lead (lds); ~49% wait for a person, 4–15h overnight. `create_lp_lead` no
+longer returns `already_in_lp` for an in1 with no lds (`src/actions/handlers/lp-lead-inbound-only.js`: issued → write the
+lds and set the appointment on it; waiting → `pending_lp_checkout`; never addLead). `src/jobs/inbound-checkout-watch.js`
+(`INBOUND_CHECKOUT_WATCH_MODE` off|shadow|live, default shadow) mirrors the queue into `lp_inbound_queue` (sql/149, fails
+soft until applied), cards #contact-center 08:00–19:45 ET for inquiries waiting past 10/15/30 min (appointment / GHL
+sender / other) and #ops past 45, and finishes the GHL side of issued inquiries. LP's GetInboundLeadInfo `enddate` is
+EXCLUSIVE: a range ending today returns none of today's rows (issue #490).
+**Booked leads come off the setter lists, onto Confirmation (decision #2669).** `src/jobs/booked-dial-routing.js`
+(`BOOKED_DIAL_ROUTING_MODE`, default shadow) runs after each watch pass: visit today/tomorrow → "Conf - Next Day", two
+days → "Conf - 2nd Day", later → held. ADD FIRST, REMOVE SECOND: the removal from LP_ASAP / Reece Chatbot / Direct Lead
+Entry / After DIAL ASAP is queued only once a Confirmation add for that phone COMPLETED (any rule) or Five9 already has it
+there, so a booked lead is never on no list (a held lead and an unissued inquiry are not removed yet; a Cnf lead is). The
+removal is `five9_delete_record_from_list` with `list_names`, `requires_approval` and `approval_expires_at` = the visit;
+the executor skips it after that. `BOOKED_ROUTING_AUTO_REMOVE=true` is the only way around the approval, and only for rule
+`BOOKED_DIAL_ROUTING` — Mark sets it after a recorded standing exception (#1057), never us. Every decision is in
+`booked_dial_routing_log`.
+
 **The LP note is a 2–3 sentence rep brief (the user, 2026-10-05).** Prospect 462947 reached LP with 1,400
 characters: the address three times, "tomorrow" for the visit, a script with a blank ("this is [YOUR NAME]"), internal
 terms ("bot exit agentic, P1 Stage 6") and only the customer's half of the chat; the real job ("New addition") sat in

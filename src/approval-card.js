@@ -328,6 +328,19 @@ export function describeApprove(action, { event, contactName, enrichment = {} } 
       return `${first} through "Send Lead to Lead Perfection" (8e30ff37) to create the LP lead. `
         + 'Nothing is texted or booked. It re-checks DNC and LP first and does nothing if either changed.';
     }
+    case 'five9_delete_record_from_list': {
+      // 2026-10-06 — booked-lead routing (decision #2669) queues these with a
+      // phone, the person, the appointment and the reason in the payload.
+      const lists = (Array.isArray(pl.list_names) && pl.list_names.length ? pl.list_names : [pl.list_name]).filter(Boolean);
+      const number = formatPhoneUS(pl.phone || (Array.isArray(pl.values) ? pl.values[0] : ''));
+      const visit = pl.appointment?.text || pl.appointment?.date;
+      const lines = [`Takes ${number}${pl.contact_name ? ` (${pl.contact_name})` : ''} off the Five9 list${lists.length === 1 ? '' : 's'} "${lists.join('", "')}".`];
+      const person = firstName(pl.contact_name || contactName) || 'This lead';
+      if (visit) lines.push(`Why: ${person} is booked for ${visit}, so setters should stop calling.${pl.confirmation_list ? ` The number is on "${pl.confirmation_list}" for the confirmation call.` : ' The appointment is already confirmed.'}`);
+      if (pl.lp_readded) lines.push('Lead Perfection put the number back on a setter list after an earlier removal.');
+      if (pl.approval_expires_at) lines.push(`Expires at the appointment time (${formatEt(pl.approval_expires_at) || pl.approval_expires_at}); after that approving does nothing. A list the number is not on is left as is.`);
+      return lines.join(' ');
+    }
     case 'five9_start_campaign':
       return `Starts the Five9 campaign "${pl.campaign_name}".`;
     case 'five9_stop_campaign':

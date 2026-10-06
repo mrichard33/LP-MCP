@@ -167,13 +167,14 @@ export function wasCalled(calls, phone, receivedMs) {
   });
 }
 
-const LEAD_COLS = `lp_lead_id, lp_prospect_id, disposition_code, appointment_date::text AS appointment_date,
+// Exported 2026-10-06 for src/jobs/booked-dial-routing.js (same lp_leads read).
+export const LEAD_COLS = `lp_lead_id, lp_prospect_id, disposition_code, appointment_date::text AS appointment_date,
   address, city, state, zip, ghl_contact_id, first_name, last_name, phone, email, lead_source, lead_source_detail,
   created_at_lp::text AS created_at_lp, raw_lp_data->>'in1_id' AS in1_id,
   raw_lp_data->>'datereceived' AS datereceived, raw_lp_data->>'lognumber' AS lognumber`;
 
 /** lp_leads created in the window — the second source of candidates. */
-async function readLeadsSince(runSQL, sinceMs) {
+export async function readLeadsSince(runSQL, sinceMs) {
   const rows = await runSQL(`SELECT ${LEAD_COLS} FROM lp_leads WHERE created_at_lp >= ${q(utcToLpStoredIso(sinceMs))}`);
   if (!Array.isArray(rows)) throw new Error('lp_leads window read returned no row set');
   return rows;
@@ -190,7 +191,7 @@ async function readLeads(runSQL, ldsIds) {
 }
 
 /** Phones with a sold (closed_won) LP lead, any age. */
-async function readSoldPhones(runSQL, phones) {
+export async function readSoldPhones(runSQL, phones) {
   const sold = new Set();
   for (const part of chunks(phones, 500)) {
     const rows = await runSQL(`
@@ -237,7 +238,7 @@ async function readMarks(db, keys) {
   return seen;
 }
 
-async function readDnc(checkDnc, numbers) {
+export async function readDnc(checkDnc, numbers) {
   const onDnc = new Set();
   for (const part of chunks(numbers, DNC_BATCH)) {
     const res = await checkDnc(part);

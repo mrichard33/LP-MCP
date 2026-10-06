@@ -1435,18 +1435,66 @@ export function executeAddRecordsToList(action) {
   });
 }
 
+/**
+ * Lists one five9_delete_record_from_list may name (2026-10-06): booked-lead
+ * routing removes one number from the four setter lists under ONE approval.
+ */
+export const MAX_DELETE_LISTS_PER_ACTION = 10;
+
+/** listRecordsDeleted from a deleteRecordFromList response, or null. */
+export function listRecordsDeletedFrom(xml) {
+  const m = /<listRecordsDeleted>(\d+)<\/listRecordsDeleted>/i.exec(String(xml ?? ''));
+  return m ? parseInt(m[1], 10) : null;
+}
+
+/**
+ * Single-record removal by dial key, from one list (list_name) or several
+ * (list_names, 2026-10-06). A number that is not on a list comes back
+ * listRecordsDeleted=0 with no failure (listImportResult, WSDL v13): reported
+ * per list as `not_on_list`, a no-op success.
+ *
+ * approval_expires_at (2026-10-06, CANON.EVALT.056 — canonical candidate): an
+ * approval is bound to its moment. Booked-lead routing sets it to the
+ * appointment time; executed after that, the removal is SKIPPED without a
+ * Five9 call — approving a stale card never acts on a visit that has passed.
+ */
 export function executeDeleteRecordFromList(action) {
   const payload = action.action_payload || {};
-  const listName = String(payload.list_name || '').trim();
-  if (!listName) throw new Error('five9_delete_record_from_list requires action_payload.list_name');
-  return withFive9WriteGate({ action, subtype: 'delete_record_from_list', entityType: 'five9_list', entityId: listName }, async (ctx) => {
-    const bodyXml = buildDeleteRecordFromListXml(listName, payload.field_names, payload.values, payload.list_delete_mode || 'DELETE_ALL');
-    const sizeOf = async () => (await getListsInfo()).lists.find(l => l.name === listName) ?? { name: listName, size: null };
-    ctx.previous_state = await sizeOf();
-    const xml = await ctx.soap('deleteRecordFromList', bodyXml);
-    if (xml !== null) assertNoRecordFailures('deleteRecordFromList', xml);
-    if (!ctx.dry_run) ctx.new_state = await sizeOf();
-    return { list: listName, record_deleted: !ctx.dry_run };
+  const lists = Array.isArray(payload.list_names) && payload.list_names.length
+    ? [...new Set(payload.list_names.map((l) => String(l || '').trim()).filter(Boolean))]
+    : [String(payload.list_name || '').trim()].filter(Boolean);
+  if (!lists.length) throw new Error('five9_delete_record_from_list requires action_payload.list_name or list_names');
+  if (lists.length > MAX_DELETE_LISTS_PER_ACTION) {
+    throw new Error(`REFUSED: ${lists.length} lists > ${MAX_DELETE_LISTS_PER_ACTION} per action cap`);
+  }
+  const expiresMs = Date.parse(payload.approval_expires_at || '');
+  if (Number.isFinite(expiresMs) && Date.now() >= expiresMs) {
+    console.log(`[FIVE9 WRITES] delete_record_from_list for action ${action.id ?? '?'} skipped — approval expired at ${payload.approval_expires_at}`);
+    return Promise.resolve({ skipped: true, reason: 'approval_expired', approval_expires_at: payload.approval_expires_at, lists });
+  }
+  const mode = payload.list_delete_mode || 'DELETE_ALL';
+  // Build every body first: a bad payload throws before any list is touched.
+  const bodies = lists.map((listName) => ({ listName, xml: buildDeleteRecordFromListXml(listName, payload.field_names, payload.values, mode) }));
+  const entityId = lists.join(', ');
+  return withFive9WriteGate({ action, subtype: 'delete_record_from_list', entityType: 'five9_list', entityId }, async (ctx) => {
+    const sizes = async () => {
+      const all = (await getListsInfo()).lists;
+      return lists.map((name) => all.find((l) => l.name === name) ?? { name, size: null });
+    };
+    ctx.previous_state = await sizes();
+    const perList = [];
+    for (const { listName, xml: bodyXml } of bodies) {
+      const xml = await ctx.soap('deleteRecordFromList', bodyXml);
+      if (xml !== null) assertNoRecordFailures('deleteRecordFromList', xml);
+      const deleted = xml === null ? null : listRecordsDeletedFrom(xml);
+      perList.push({ list: listName, deleted, outcome: ctx.dry_run ? 'previewed' : (deleted === 0 ? 'not_on_list' : 'deleted') });
+    }
+    if (!ctx.dry_run) ctx.new_state = await sizes();
+    if (lists.length === 1 && !Array.isArray(payload.list_names)) {
+      // The single-list shape every caller before 2026-10-06 reads, plus the count.
+      return { list: lists[0], record_deleted: !ctx.dry_run, records_deleted: perList[0].deleted };
+    }
+    return { lists, record_deleted: !ctx.dry_run, per_list: perList };
   });
 }
 

@@ -12,6 +12,21 @@ function mmddyyyy(d) {
   return `${mm}/${dd}/${d.getFullYear()}`;
 }
 
+/**
+ * check_lp_inbound's date window. LP treats enddate as EXCLUSIVE: a range
+ * ending today returns none of today's rows, so the default end is tomorrow
+ * (2026-10-06, Shelley in1 428940 read as "not in queue" while it sat there;
+ * issue #490). Pure, so the default is testable without LP.
+ */
+export function checkInboundRange(params = {}, now = new Date()) {
+  const fourteenAgo = new Date(now.getTime() - 14 * 24 * 60 * 60 * 1000);
+  const tomorrow = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+  return {
+    startdate: params.start_date || mmddyyyy(fourteenAgo),
+    enddate: params.end_date || mmddyyyy(tomorrow),
+  };
+}
+
 function ok(obj) {
   return { content: [{ type: 'text', text: JSON.stringify(obj, null, 2) }] };
 }
@@ -143,20 +158,19 @@ export function registerLPAppointmentTools(server) {
     '"lp_lead_creation_enrolled" or after force_lp_lead_creation, call this (give it ~60s) to verify the lead ' +
     'actually entered LP\'s inbound queue. Because workflow 8e30ff37 stamps lognumber = GHL contact ID, the contact ' +
     'ID is the match key. Returns the raw LP inbound rows. NOTE: this reads the INBOUND QUEUE, not issued leads — ' +
-    'an empty result after ~60s suggests the enroll did not reach LP; rows present confirm it landed.',
+    'an empty result after ~60s suggests the enroll did not reach LP; rows present confirm it landed. ' +
+    'Each row\'s checkoutdate/lds_id show whether LP has issued the inquiry; empty = still waiting in LP\'s inbound queue.',
     {
       ghl_contact_id: z.string().describe('GHL contact ID — sent as lognumber to match the inbound lead'),
       start_date: z.string().optional().describe('Range start MM/DD/YYYY (default: 14 days ago)'),
-      end_date: z.string().optional().describe('Range end MM/DD/YYYY (default: today)'),
+      end_date: z.string().optional().describe('Range end MM/DD/YYYY, EXCLUSIVE in LP (default: tomorrow, so today\'s rows are included)'),
       page_size: z.number().optional().describe('Max rows to return (default 50)'),
     },
     async (params) => {
       if (!params.ghl_contact_id) return err('ghl_contact_id is required');
 
-      const today = new Date();
-      const fourteenAgo = new Date(today.getTime() - 14 * 24 * 60 * 60 * 1000);
-      const startdate = params.start_date || mmddyyyy(fourteenAgo);
-      const enddate = params.end_date || mmddyyyy(today);
+      // enddate defaults to TOMORROW: LP's enddate is exclusive (issue #490).
+      const { startdate, enddate } = checkInboundRange(params);
 
       try {
         const result = await lpPost('/api/Leads/GetInboundLeadInfo', {

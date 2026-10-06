@@ -17,8 +17,9 @@
  * an HTML hyperlink — no actual webhook fires. Result: contact has
  * appointment in GHL only, never in LP. This handler closes the gap.
  *
- * Idempotency: handler short-circuits if either lp_inbound_lead_id or
- * lp_lead_id is already populated on the contact. Since 2026-09-28 it then
+ * Idempotency: handler short-circuits if lp_lead_id is already populated on
+ * the contact. An lp_inbound_lead_id ALONE (2026-10-06) is looked up in LP's
+ * inbound queue instead of skipped — see lp-lead-inbound-only.js. Since 2026-09-28 it then
  * asks LP by phone whether this person already has a lead from the last 15
  * days, and reuses it instead of creating a duplicate (see
  * src/services/lp-existing-lead-guard.js). The reaper marks
@@ -100,7 +101,9 @@
  */
 
 import supabase from '../../supabase.js';
-import { addLead as lpAddLead, extractInboundLeadId, getCustomers3, getLeads } from '../../lp-client.js';
+import { addLead as lpAddLead, extractInboundLeadId, getCustomers3, getLeads, getInboundLeadInfo } from '../../lp-client.js';
+import { readInboundQueueRow } from '../../lp-inbound-queue.js';
+import { resolveInboundOnly } from './lp-lead-inbound-only.js';
 import { sendGroupMeMessage } from '../../groupme.js';
 import { addGHLNote, updateGHLContactFields, applyGHLTag } from '../../ghl.js';
 import { isLPLeadId, ghlFetch } from '../helpers.js';
@@ -369,10 +372,27 @@ export async function executeCreateLPLead(action) {
 
   // ─── Idempotency guard ─────────────────────────────────────────────
   // If either LP ID is already populated, lead is already in (or about
-  // to be in) LP. Cleanly skip — never re-post.
+  // to be in) LP. Never re-post.
   const existingInbound = readCF(ghlContact, FIELD_LP_INBOUND_LEAD_ID);
   const existingLeadId  = readCF(ghlContact, FIELD_LP_LEAD_ID);
-  if (existingInbound || existingLeadId) {
+  // 2026-10-06 — an inquiry id with NO lead id is not "already in LP": the
+  // inquiry may still be waiting in LP's inbound queue (Shelley, in1 428940).
+  // Look it up; write back an issued lds and set the appointment on it, or say
+  // it is waiting. Never addLead. See lp-lead-inbound-only.js.
+  if (existingInbound && !existingLeadId) {
+    const appt = resolveAppointment(payload, eventPayload, ghlContact, payload.include_appt !== false);
+    return resolveInboundOnly({
+      action, contactId, in1: existingInbound, appt,
+      deps: {
+        readQueueRow: (in1) => readInboundQueueRow(supabase, in1),
+        getInboundLeadInfo: (params) => getInboundLeadInfo(params, { fast: true }),
+        writeLeadId: (cid, lds) => updateGHLContactFields(cid, [{ id: FIELD_LP_LEAD_ID, field_value: lds }]),
+        setAppointment: async (a) => (await import('./lp-appointment.js')).executeSetLPAppointment(a),
+        addNote: (cid, text) => addGHLNote(cid, text),
+      },
+    });
+  }
+  if (existingLeadId) {
     console.log(`[LP-CREATE] ⏭️ Skip: contact ${contactId} already in LP (in1=${existingInbound || 'none'}, lds=${existingLeadId || 'none'})`);
     return {
       action: 'already_in_lp',
