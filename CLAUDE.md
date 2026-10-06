@@ -371,7 +371,8 @@ again after the price play, two no's, or a repeated objection (`src/agentic/nepq
 **#dispatch** for a complaint or an unbookable pick, via `postToSlack`; a failed post is an #ops-alerts line); the objection plays, the
 think-it-over Calendar Commitment (two REAL slots, exempt from the booking-ask cap), "what day works best",
 the Reveal and the confirm line ("You're all set, [name]. Someone from our team will give you a call to confirm
-the details. You're on the calendar for [day] at [time]." — the user, 2026-10-06; said only when the booking
+the details. You're on the calendar for [day] at [time]." — the user, 2026-10-06; the AI words it, keeping its
+facts, never asked to send it verbatim (the user's ruling, 2026-10-06, after AI OS batch 1); said only when the booking
 landed in that turn, never a rep name, never "see you then"; the call is the phone room's confirmation, so the
 line is never a Five9 Callback Request (`NOT_A_CALLBACK_RX`) nor dropped as an offer (`isBookingConfirmCall`), and
 `BOOKED_LINE_RX` reads both the old "all set for" and the new "on the calendar for" back as booked) are Mark's wording — since Part 7 a reference the model rewrites for the lead (meaning kept, see below). A vague live-chat opener ("hi", "I need new windows") gets the Status Frame

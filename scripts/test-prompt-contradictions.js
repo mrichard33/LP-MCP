@@ -12,8 +12,10 @@
  *   - a "confirmed" status for a booking the bot makes (the handler holds every
  *     bot booking and upgrade at "new"),
  *   - "never as an in-home visit" (the PPR-phone-first default fights the plan),
- *   - an instruction to write "You're all set" anywhere but Mark's exact
- *     confirm line (LINES.confirm, bd330d8).
+ *   - "You're all set" anywhere but the confirmation line (LINES.confirm,
+ *     bd330d8) or a rule about it. The AI words the line itself, keeping its
+ *     facts, only on the turn the visit was booked (the user's ruling,
+ *     2026-10-06, which settles PR 2's open question).
  *
  *   node --test scripts/test-prompt-contradictions.js
  */
@@ -68,7 +70,7 @@ for (const [label, build] of [['SMS', () => smsSystem() + '\n' + smsUser()], ['l
     assert.ok(p.includes('Protection Profile Review'), 'the locked phrase stays');
   });
 
-  test(`${label} (NEPQ live): "You're all set" appears only as Mark's exact line or in a ban`, () => {
+  test(`${label} (NEPQ live): "You're all set" appears only as the confirmation line or in a rule about it`, () => {
     const p = build();
     for (const line of p.split('\n').filter((l) => /you're all set/i.test(l))) {
       // Mark's line with any name / day / time filled in (LINES.confirm's shape).
@@ -80,7 +82,9 @@ for (const [label, build] of [['SMS', () => smsSystem() + '\n' + smsUser()], ['l
 }
 
 test('SMS and chat say the same thing about "You\'re all set"', () => {
-  const rule = 'Say "You\'re all set" only in the reply for a visit booked in that same turn, and only as the exact confirmation line';
+  // The user's ruling (2026-10-06): the AI words the confirmation from the
+  // line, keeping its facts; only on the turn the visit was booked.
+  const rule = 'Say "You\'re all set" only in the reply for a visit booked in that same turn, worded in your own way from the confirmation line';
   assert.ok(smsSystem().includes(rule), 'SMS rule missing');
   assert.ok(chatSystem().includes(rule), 'chat rule missing');
 });
