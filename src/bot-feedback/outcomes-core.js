@@ -76,9 +76,23 @@ export function normalizeOptOutText(text) {
     .trim();
 }
 
+/**
+ * An iPhone / Android reaction to one of OUR messages: `Liked “… Reply STOP to
+ * opt out.”`, `Reacted 👍 to “…”`. The quote is our own text, so a STOP inside
+ * it is ours, not the lead's (2026-10-06: a lead who "Liked" our intro text was
+ * shown as opted out on every message in Bot Review).
+ */
+export const REACTION_PATTERN =
+  /^\s*(?:liked|loved|disliked|laughed at|emphasi[sz]ed|questioned|reacted\s+\S{1,12}\s+to|removed an?\s+\S+\s+from)\s+[“”"'‘]/iu;
+
+export function isReactionText(text) {
+  return REACTION_PATTERN.test(String(text ?? ''));
+}
+
 /** Does this inbound body read as an opt-out? */
 export function isOptOutText(text) {
   if (!text) return false;
+  if (isReactionText(text)) return false;
   const t = normalizeOptOutText(text);
   if (!t) return false;
   if (OPTOUT_WHOLE_MESSAGE.has(t)) return true;
@@ -251,6 +265,8 @@ export default {
   OPTOUT_PHRASE_PATTERN,
   DNC_TAGS,
   normalizeOptOutText,
+  REACTION_PATTERN,
+  isReactionText,
   isOptOutText,
   hasDncTag,
   findFirstReply,

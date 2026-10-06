@@ -101,3 +101,23 @@ test('normalize lowercases, trims and strips punctuation', () => {
   assert.equal(normalizeOptOutText('Opt-Out.'), 'opt out');
   assert.equal(normalizeOptOutText("Don't   text"), 'dont text');
 });
+
+// 2026-10-06: a lead who "Liked" our intro text ("… Reply STOP to opt out.")
+// was shown as opted out on every message in Bot Review. The quote is ours.
+test('a reaction quoting our own STOP line is not an opt-out', () => {
+  for (const t of [
+    'Liked “Hi Mark, this is Mark with Reece Windows & Doors about your window estimate request. Reply STOP to opt out.”',
+    'Loved "Reply STOP to opt out"',
+    'Emphasized “Reply STOP to unsubscribe”',
+    'Laughed at “stop by anytime”',
+    'Reacted 👍 to “Reply STOP to opt out.”',
+    'Removed a like from “Reply STOP to opt out.”',
+  ]) {
+    assert.equal(isOptOutText(t), false, `counted: ${JSON.stringify(t)}`);
+  }
+});
+
+test('a message that only starts like a reaction word is still read', () => {
+  assert.equal(isOptOutText('Liked your offer but please stop texting me'), true);
+  assert.equal(isOptOutText('Loved it. STOP'), true);
+});
