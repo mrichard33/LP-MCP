@@ -42,6 +42,19 @@ test('a booking claim stands only on the turn that booked', () => {
   assert.equal(scoreResult(result('think', claim, { would_do: [{ turn: 1, kind: 'would_book', start: 'x' }] })).pass, true);
 });
 
+test('a held time is not a fake booking; a "you\'re all set" with no hold or booking still is', () => {
+  // 2026-10-06 gate run: "I'm holding Tue at 6 PM for you" on a confirm move was failed three times.
+  const hold = [turn(1, 'The first one', "I'm holding Tue, Oct 6 at 6:00 PM ET for you. What's your first name?", { nepq: { move: 'confirm' } })];
+  assert.equal(scoreResult(result('think', hold)).pass, true, JSON.stringify(scoreResult(result('think', hold)).failures));
+  const claim = [turn(1, 'The first one', "I'm holding Tue, Oct 6 at 6:00 PM ET for you.", { nepq: { move: 'probe' } })];
+  assert.ok(scoreResult(result('think', claim)).failures.some(f => f.code === 'unbacked_booking_claim'), 'a hold with no hold move is still a claim');
+});
+
+test('a hand-off that promises a call passes', () => {
+  const s = scoreResult(result('complaint', [turn(1, 'Your rep never showed up yesterday', "I'm sorry. I've flagged this to our team, and someone will call you tomorrow at 9 AM ET.", { nepq: { move: 'handoff', handoff: 'complaint' } })], { would_do: [{ kind: 'would_file_callback_five9_and_contact_center' }] }));
+  assert.equal(s.pass, true, JSON.stringify(s.failures));
+});
+
 test('each scenario adds its own rule', () => {
   const codes = (r) => scoreResult(r).failures.map(f => f.code);
   assert.ok(codes(result('not_interested', [turn(1, 'Not interested', 'Understood.'), turn(2, 'No', 'No problem. The next step is a free in-home measurement.')])).includes('pitch_after_no'));

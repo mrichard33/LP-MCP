@@ -26,12 +26,12 @@ import { humanizeReply } from '../agentic/human-voice.js';
 import { enforceTeamVoice } from '../agentic/team-voice.js';
 import { enforcePropertyScope } from '../agentic/property-scope.js';
 import { findUnbackedBookingClaim } from '../agentic/booking-claim.js';
-import { enforceCallTiming } from '../agentic/team-hours.js';
+import { enforceCallTiming, promisedCallback } from '../agentic/team-hours.js';
 import { enforceOneAsk } from '../agentic/one-ask.js';
 import { dropUnaskedCallOffer, leadWantsCall, MONEY_RX, URGENCY_RX, CLAIMS_RX } from '../agentic/nepq-planner.js';
 
 /** Bump when a check is added or changed, so scorecards from two versions are not compared as one. */
-export const INVARIANTS_VERSION = '2026-10-05.2';
+export const INVARIANTS_VERSION = '2026-10-06.1';
 
 // A merge tag or a script blank that reached the customer: "{{contact.first_name}}",
 // "[YOUR NAME]" (prospect 462947's LP note, 2026-10-05).
@@ -130,7 +130,12 @@ export function checkReply(reply, ctx = {}) {
   if (email) { /* listed above */ } else if (!Array.isArray(ctx.conversation)) skipped.push('unasked_call_offer');
   else {
     const wants = leadWantsCall(ctx.conversation, ctx.inbound || '');
-    if (dropUnaskedCallOffer(text, { leadWantsCall: wants }).changed) fail('unasked_call_offer', text);
+    // Only an OFFER of a call counts ("Want someone to call you?", "A quick
+    // call would help"). A promise that WE will call is filed for real on every
+    // sent reply (promisedCallback → call_promise_backed), so it is backed, not
+    // unasked: the first gate run (2026-10-06) failed four hand-offs on it.
+    const offers = sentences(text).filter(s => !promisedCallback(s)).join(' ');
+    if (offers && dropUnaskedCallOffer(offers, { leadWantsCall: wants }).changed) fail('unasked_call_offer', text);
   }
 
   return { pass: violations.length === 0, violations, skipped, metrics };

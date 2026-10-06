@@ -18,6 +18,9 @@
 import { checkReply, INVARIANTS_VERSION } from '../eval/reply-invariants.js';
 import { stripPitch } from '../live-chat/chat-rules.js';
 
+/** The NEPQ moves on which code holds or confirms a picked time. */
+const HOLD_MOVES = new Set(['confirm', 'hold', 'collect']);
+
 const replies = (t) => (Array.isArray(t?.bot) ? t.bot.filter(Boolean) : []);
 const allReplies = (r) => (r.transcript || []).flatMap(t => replies(t).map(text => ({ turn: t.turn, text })));
 // Everything the run would have done: live chat keeps one list, SMS one per turn.
@@ -96,6 +99,10 @@ export function scoreResult(result) {
     if (!texts.length) failures.push({ code: 'no_reply', detail: t.error || t.outcome || 'no reply', turn: t.turn });
     // Whether THIS turn booked: a recorded booking in the turn's effects.
     const booked = wouldDo(result).some(w => w.turn === t.turn && /would_book/.test(String(w.kind || '')));
+    // Whether code HELD a picked time this turn: "I'm holding Tue at 6 PM" is
+    // said only on a hold/confirm move (heldSlot), never a fake booking (the
+    // first gate run, 2026-10-06, failed three of them).
+    const held = HOLD_MOVES.has(String(t.nepq?.move || t.nepq?.required_move || ''));
     conversation.push({ direction: 'inbound', text: inbound });
     for (const text of texts) {
       const check = checkReply(text, {
@@ -103,6 +110,7 @@ export function scoreResult(result) {
         inbound,
         conversation: [...conversation],
         booked,
+        held,
         // The cancel identity ask ("name and phone the appointment is under")
         // is the one approved two-item ask (allow_multi_ask, Part 8).
         allowMultiAsk: /cancel/.test(String(result.scenario || '')),
