@@ -5,17 +5,35 @@
  *                              "all", or your own messages) through the real
  *                              live-chat and/or SMS bot; nothing is sent or written
  *   get_bot_simulation         the transcript of a run, readable or as JSON
+ *   run_bot_eval               the gate: every scenario on both bots, scored,
+ *                              compared with the last gate run and saved
+ *                              (2026-10-06). Run it before and after a prompt
+ *                              or model change.
  *
  * WHY: live testing meant typing each message into the website chat or a
  * phone and waiting on every reply (Mark, 2026-10-02). See
  * src/simulator/bot-simulator.js for what is real and what is recorded.
  *
- * Also mounted as POST /admin/bot-simulate and GET /admin/bot-simulate/:id
+ * Also mounted as POST /admin/bot-simulate, POST /admin/bot-eval and
+ * GET /admin/bot-simulate/:id
  * (x-admin-token enforced when ADMIN_API_TOKEN is set, the lp-force-addlead
  * pattern). Schema uses primitive zod types only (see http-tools.js SCHEMA NOTE).
  */
 import { z } from 'zod';
 import { SCENARIOS, startSimulationJob, getSimulationJob, formatTranscript } from '../simulator/bot-simulator.js';
+import { formatScorecard } from '../simulator/sim-scoring.js';
+
+/** The event a saved gate run is stored as (system_events; no table of its own). */
+export const EVAL_RUN_EVENT = 'agentic.bot_eval_run';
+
+/** The saved form of a scorecard: codes and turns, never customer text. Pure. */
+export function evalRunPayload(scorecard, comparison) {
+  const { results = [], ...head } = scorecard || {};
+  return {
+    scorecard: { ...head, results: results.map(r => ({ key: r.key, pass: r.pass, failures: r.failures.map(f => ({ code: f.code, turn: f.turn ?? null })) })) },
+    comparison: comparison || null,
+  };
+}
 
 const text = (obj) => ({ content: [{ type: 'text', text: typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2) }] });
 
@@ -24,6 +42,30 @@ export const simulatorDeps = {
   generate: () => import('../response-generator.js').then(m => m.generateResponse),
   // READ ONLY: a real contact's record for a more realistic run.
   buildRealContext: (contactId) => import('../context-builder.js').then(m => m.buildLeadContext(contactId, { includeConversation: false, skipCache: true })),
+  // What a gate run ran on, so two runs are compared knowingly.
+  evalMeta: async () => {
+    const [{ RESPONSE_GENERATOR_VERSION }, { resolveLLM }, { corePromptVersion }] = await Promise.all([
+      import('../response-generator.js'), import('../llm-client.js'), import('../bot-feedback/fingerprint-core.js'),
+    ]);
+    return {
+      prompt_version: corePromptVersion(RESPONSE_GENERATOR_VERSION),
+      git_sha: process.env.RAILWAY_GIT_COMMIT_SHA || null,
+      models: { sms: resolveLLM('response_generator').model, livechat: resolveLLM('live_chat').model },
+    };
+  },
+  lastEvalRun: async ({ nepqMode = 'live' } = {}) => {
+    const { default: supabase } = await import('../supabase.js');
+    // The last run in the SAME NEPQ mode (compareScorecards refuses a cross-mode comparison).
+    const { data, error } = await supabase.from('system_events').select('payload').eq('event_type', EVAL_RUN_EVENT)
+      .order('created_at', { ascending: false }).limit(10);
+    if (error) throw new Error(error.message);
+    const modeOf = (m) => (m || 'live');
+    return (data || []).map(r => r?.payload?.scorecard).find(c => c && modeOf(c.nepq_mode) === modeOf(nepqMode)) || null;
+  },
+  recordEvalRun: async (scorecard, comparison) => {
+    const { emitEvent } = await import('../event-emitter.js');
+    return emitEvent({ event_type: EVAL_RUN_EVENT, source: 'bot_eval', entity_type: 'bot_eval', payload: evalRunPayload(scorecard, comparison), bypass_filter: true });
+  },
 };
 
 /** Validate and normalise a run request. Pure; throws a readable error. */
@@ -53,7 +95,8 @@ async function waitFor(job, seconds) {
 function render(job, format) {
   if (format === 'json') return text(job);
   const head = `Simulation ${job.id}: ${job.status}${job.error ? ` (${job.error})` : ''} — ${job.results.length} conversation(s)`;
-  return text([head, ...job.results.map(formatTranscript)].join('\n\n'));
+  const card = job.scorecard ? [formatScorecard(job.scorecard, job.comparison || null) + (job.save_error ? `\n(${job.save_error})` : '')] : [];
+  return text([head, ...card, ...job.results.map(formatTranscript)].join('\n\n'));
 }
 
 export function registerSimulatorTools(server, deps = simulatorDeps) {
@@ -77,6 +120,23 @@ export function registerSimulatorTools(server, deps = simulatorDeps) {
       const job = startSimulationJob(req, deps);
       if (args.wait_seconds) await waitFor(job, args.wait_seconds);
       return job.status === 'running' ? text({ job_id: job.id, status: 'running', next: 'call get_bot_simulation with this job_id' }) : render(job, 'text');
+    },
+  );
+
+  server.tool(
+    'run_bot_eval',
+    'The bot gate: runs EVERY scenario through the real live-chat and SMS bots (real model, nothing sent or written), ' +
+      'scores each conversation against the hard checks and the scenario\'s own rules, compares with the last gate run ' +
+      'and saves the result. Run it before and after any prompt or model change and ship only if it is not worse. ' +
+      'Takes 10-15 minutes and real model calls; returns a job id for get_bot_simulation.',
+    {
+      nepq_mode: z.string().optional().describe('live (default, production) or off.'),
+    },
+    async ({ nepq_mode = 'live' } = {}) => {
+      let req;
+      try { req = parseSimRequest({ scenario: 'all', channel: 'both', nepq_mode }); } catch (err) { return text({ error: err.message }); }
+      const job = startSimulationJob({ ...req, gate: true }, deps);
+      return text({ job_id: job.id, status: 'running', next: 'call get_bot_simulation with this job_id (wait_seconds up to 100, repeat until done); the scorecard is at the top' });
     },
   );
 
@@ -111,11 +171,23 @@ export function registerSimulatorRoutes(app, deps = simulatorDeps) {
     const job = startSimulationJob(parsed, deps);
     return res.status(202).json({ job_id: job.id, status_url: `/admin/bot-simulate/${job.id}` });
   });
+  // The gate spends ~130 real model turns, so unlike bot-simulate it refuses
+  // when ADMIN_API_TOKEN is unset instead of running open (2026-10-06 audit:
+  // fail-open admin secrets were finding F7).
+  app.post('/admin/bot-eval', (req, res) => {
+    if (!process.env.ADMIN_API_TOKEN) return res.status(503).json({ error: 'ADMIN_API_TOKEN is not set; the bot gate is closed' });
+    if (!authed(req, res)) return;
+    let parsed;
+    try { parsed = parseSimRequest({ scenario: 'all', channel: 'both', nepq_mode: req.body?.nepq_mode || 'live' }); }
+    catch (err) { return res.status(400).json({ error: err.message }); }
+    const job = startSimulationJob({ ...parsed, gate: true }, deps);
+    return res.status(202).json({ job_id: job.id, status_url: `/admin/bot-simulate/${job.id}` });
+  });
   app.get('/admin/bot-simulate/:id', (req, res) => {
     if (!authed(req, res)) return;
     const job = getSimulationJob(req.params.id);
     if (!job) return res.status(404).json({ error: 'not found (jobs are in memory and lost on a deploy)' });
-    if (req.query.format === 'text') return res.type('text/plain').send([`Simulation ${job.id}: ${job.status}`, ...job.results.map(formatTranscript)].join('\n\n'));
+    if (req.query.format === 'text') return res.type('text/plain').send([`Simulation ${job.id}: ${job.status}`, ...(job.scorecard ? [formatScorecard(job.scorecard, job.comparison || null)] : []), ...job.results.map(formatTranscript)].join('\n\n'));
     return res.json(job);
   });
 }

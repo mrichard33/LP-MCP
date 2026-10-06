@@ -836,6 +836,16 @@ SKIPPED, never guessed.
   from `bot_message_context`. Customer conversations stay in the database and are never committed
   (the user's ruling, 2026-10-05).
 
+**Run the bot gate before and after any prompt or model change (2026-10-06).** The MCP tool `run_bot_eval`
+(or `POST /admin/bot-eval`, closed unless `ADMIN_API_TOKEN` is set) runs every simulator scenario
+through the REAL bots on Railway, with nothing sent or written. It scores each conversation with
+`checkReply` plus the scenario's own rule (`SCENARIO_EXPECTATIONS` in `src/simulator/sim-scoring.js`:
+no pitch after a no, never "done" without the cancel, one reply to a burst, …). It compares the
+result with the last gate run and saves it as a `agentic.bot_eval_run` system event (codes and
+turns only, never customer text). **Ship only if the scorecard does not read WORSE THAN LAST RUN.**
+A run takes 10–15 minutes and about 130 real model turns. A new scenario rule must come from a
+ruling already in this file, so a failure means a regression, not a matter of taste.
+
 ## Writing code here
 
 Existing modules carry dated comments explaining *why* a thing is the way it is, usually naming the
