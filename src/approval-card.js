@@ -335,8 +335,15 @@ export function describeApprove(action, { event, contactName, enrichment = {} } 
       const number = formatPhoneUS(pl.phone || (Array.isArray(pl.values) ? pl.values[0] : ''));
       const visit = pl.appointment?.text || pl.appointment?.date;
       const lines = [`Takes ${number}${pl.contact_name ? ` (${pl.contact_name})` : ''} off the Five9 list${lists.length === 1 ? '' : 's'} "${lists.join('", "')}".`];
-      const person = firstName(pl.contact_name || contactName) || 'This lead';
-      if (visit) lines.push(`Why: ${person} is booked for ${visit}, so setters should stop calling.${pl.confirmation_list ? ` The number is on "${pl.confirmation_list}" for the confirmation call.` : ' The appointment is already confirmed.'}`);
+      const person = firstName(pl.contact_name || contactName);
+      if (visit && pl.reason === 'moved_to_next_day') {
+        lines.push(`Why: ${person}'s visit (${visit}) is now tomorrow or today and the number is on "${pl.confirmation_list || 'Conf - Next Day'}", so this stops a second confirmation call.`);
+      } else if (visit) {
+        const where = pl.reason === 'appt_3plus_days'
+          ? ' The visit is 3+ days out; the number goes on a confirmation list two days before it.'
+          : pl.confirmation_list ? ` The number is on "${pl.confirmation_list}" for the confirmation call.` : ' The appointment is already confirmed.';
+        lines.push(`Why: ${person} is booked for ${visit}, so setters should stop calling.${where}`);
+      }
       if (pl.lp_readded) lines.push('Lead Perfection put the number back on a setter list after an earlier removal.');
       if (pl.approval_expires_at) lines.push(`Expires at the appointment time (${formatEt(pl.approval_expires_at) || pl.approval_expires_at}); after that approving does nothing. A list the number is not on is left as is.`);
       return lines.join(' ');

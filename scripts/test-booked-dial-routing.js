@@ -11,7 +11,9 @@ import assert from 'node:assert/strict';
 import {
   routingConfig, routingMode, buildCandidate, routeBooked, prefilter, decide, addState, buildRemovalAction,
   buildAddAction, approvalExpired, onePerPhone, priorRemoveKeys, removeKey, RULE_KEY,
+  failedAddCount, confMoveDue, formatAddFailedCard,
 } from '../src/booked-dial-routing.js';
+import { routeList, backstopConfig } from '../src/new-lead-dial-backstop.js';
 import { normalizeInboundRow } from '../src/new-lead-dial-backstop.js';
 import { runBookedDialRouting, __resetLoggedForTests } from '../src/jobs/booked-dial-routing.js';
 import { executeDeleteRecordFromList, listRecordsDeletedFrom } from '../src/five9/admin-writes.js';
@@ -52,11 +54,15 @@ test('Shelley on 10/06 → "Conf - 2nd Day"; on 10/07 → "Conf - Next Day"', ()
   assert.equal(routeBooked(c, { nowMs: edt('2026-10-08T12:00:00'), cfg }).addList, 'Conf - Next Day', 'same day, before the visit');
 });
 
-test('5 days out → held (no add, and so no removal yet)', () => {
+test('5 days out → no add yet, but off the setter lists now (Mark, 2026-10-06 follow-up)', () => {
   const c = cand({ apptdate: '10/11/2026' });
   const p = pre(c, edt('2026-10-06T16:00:00'));
-  assert.equal(p.action, 'hold');
+  assert.equal(p.action, 'candidate');
   assert.equal(p.reason, 'appt_3plus_days');
+  assert.equal(p.route.hold, true);
+  assert.equal(p.route.addList, null);
+  const d = decide({ ...{ onDnc: false, contact: null, adds: 'not_needed', removedToday: false, removedBefore: false, addClaimed: false, cfg }, pre: p });
+  assert.deepEqual([d.add, d.remove], [false, true]);
 });
 
 test('past appointment, killed, skipped dispositions, not booked, sold → skipped', () => {
@@ -104,10 +110,51 @@ test('add completed → removal', () => {
   assert.equal(d.remove, true);
 });
 
-test('add failed → no removal queued', () => {
-  const d = decide({ ...base, pre: ok(edt('2026-10-06T16:05:00')), adds: 'failed', addClaimed: true });
-  assert.deepEqual([d.add, d.remove, d.reason], [false, false, 'add_failed_no_removal']);
-  assert.equal(decide({ ...base, pre: ok(edt('2026-10-06T16:05:00')), adds: 'pending', addClaimed: true }).remove, false);
+test('add failed once → one retry, no removal; twice → a person is told, still no removal', () => {
+  const p = ok(edt('2026-10-06T16:05:00'));
+  const once = decide({ ...base, pre: p, adds: 'failed', addClaimed: true, failedAdds: 1 });
+  assert.deepEqual([once.add, once.retry, once.remove], [true, true, false]);
+  const twice = decide({ ...base, pre: p, adds: 'failed', addClaimed: true, failedAdds: 2 });
+  assert.deepEqual([twice.add, twice.remove, twice.alert, twice.reason], [false, false, true, 'add_failed_twice']);
+  // The retry was queued but its row is gone/failed too → the person, not a third try.
+  assert.equal(decide({ ...base, pre: p, adds: 'failed', addClaimed: true, failedAdds: 1, retryClaimed: true }).alert, true);
+  assert.equal(decide({ ...base, pre: p, adds: 'pending', addClaimed: true }).remove, false);
+});
+
+test('failedAddCount counts only failed rows for that list', () => {
+  const rows = [
+    { list: 'Conf - 2nd Day', status: 'failed' }, { list: 'Conf - 2nd Day', status: 'pending' },
+    { list: 'Conf - Next Day', status: 'failed' }, { list: 'Conf - 2nd Day', status: 'skipped' },
+  ];
+  assert.equal(failedAddCount(rows, 'Conf - 2nd Day'), 2);
+});
+
+test('the add-failed card names the lead and asks for a hand add', () => {
+  const text = formatAddFailedCard([{ c: cand(), list: 'Conf - 2nd Day' }]);
+  assert.match(text, /add them in Five9 by hand/);
+  assert.match(text, /Shelley · \(941\) 467-0700 · visit .* → "Conf - 2nd Day" \(LP lead 581671\)/);
+});
+
+test('a move from 2nd Day to Next Day is due once both adds completed', () => {
+  const route = { addList: 'Conf - Next Day' };
+  const both = [{ list: 'Conf - 2nd Day', status: 'completed' }, { list: 'Conf - Next Day', status: 'completed' }];
+  assert.equal(confMoveDue({ route, addRows: both, moveClaimed: false, cfg }), true);
+  assert.equal(confMoveDue({ route, addRows: both, moveClaimed: true, cfg }), false);
+  assert.equal(confMoveDue({ route, addRows: [both[1]], moveClaimed: false, cfg }), false, 'never on 2nd Day');
+  assert.equal(confMoveDue({ route, addRows: [both[0], { list: 'Conf - Next Day', status: 'pending' }], moveClaimed: false, cfg }), false, 'Next Day add not done yet');
+  assert.equal(confMoveDue({ route: { addList: 'Conf - 2nd Day' }, addRows: both, moveClaimed: false, cfg }), false);
+});
+
+test('backstop holds 3+ day visits ONLY while booked routing is live (#2)', () => {
+  const nowMs = edt('2026-10-06T16:00:00');
+  const appt = { hasAppt: true, apptDateEt: '2026-10-11', apptStartMs: null, nowMs };
+  assert.equal(routeList({ ...appt, cfg: backstopConfig({}) }).list, 'Conf - 2nd Day', 'shadow (default): unchanged');
+  assert.equal(routeList({ ...appt, cfg: backstopConfig({ BOOKED_DIAL_ROUTING_MODE: 'shadow' }) }).list, 'Conf - 2nd Day');
+  assert.equal(routeList({ ...appt, cfg: backstopConfig({ BOOKED_DIAL_ROUTING_MODE: 'off' }) }).list, 'Conf - 2nd Day');
+  assert.equal(routeList({ ...appt, cfg: backstopConfig({ BOOKED_DIAL_ROUTING_MODE: 'live' }) }).skip, 'appt_held_for_booked_routing');
+  // Two days out is still the backstop's to push, live or not.
+  const two = { ...appt, apptDateEt: '2026-10-08' };
+  assert.equal(routeList({ ...two, cfg: backstopConfig({ BOOKED_DIAL_ROUTING_MODE: 'live' }) }).list, 'Conf - 2nd Day');
 });
 
 test('already on the target Confirmation list → no add, removal goes ahead', () => {
@@ -222,6 +269,8 @@ function harness({ inbound = [SHELLEY_RAW], soldPhones = [], dnc = [], contactLi
   const marks = new Map();
   const actions = [];
   const logs = [];
+  const posts = [];
+  const postedKeys = new Set();
   let nextId = 1000;
   const state = { addRows: [...addRows] };
   const supabase = {
@@ -262,7 +311,7 @@ function harness({ inbound = [SHELLEY_RAW], soldPhones = [], dnc = [], contactLi
   };
   const contactRes = (list) => ({ records: [{ fields: ['number1', 'lead_id', 'f9_last_list'], records: [{ values: { data: ['9414670700', '581671', list] } }] }] });
   return {
-    marks, actions, logs, state,
+    marks, actions, logs, state, posts,
     setContactList: (l) => { contactList = l; },
     deps: {
       supabase, runSQL,
@@ -270,10 +319,13 @@ function harness({ inbound = [SHELLEY_RAW], soldPhones = [], dnc = [], contactLi
       getContactRecords: async () => (contactList ? contactRes(contactList) : { records: [] }),
       listInboundLeads: async ({ page }) => (page === 1 ? inbound : []),
       reportAlertCondition: async () => {},
+      postToSlack: async (text, channel) => { posts.push({ text, channel }); return { ok: true }; },
+      filterNew: async ({ items }) => ({ fresh: items.filter((i) => !postedKeys.has(i.key)) }),
+      recordPosted: async ({ items }) => { for (const i of items) postedKeys.add(i.key); },
     },
   };
 }
-const LIVE = { BOOKED_DIAL_ROUTING_MODE: 'live' };
+const LIVE = { BOOKED_DIAL_ROUTING_MODE: 'live', SLACK_CHANNEL_SERVICE: 'C_SERVICE' };
 
 test('shadow: would_add logged, nothing queued, no marks', async () => {
   __resetLoggedForTests();
@@ -313,15 +365,63 @@ test('live: add first; removal only after the add completed; a duplicate pass ad
   assert.equal(h.actions.length, 2);
 });
 
-test('live: a failed add queues no removal', async () => {
+test('live: a failed add is retried once, then #contact-center is told once — never a removal', async () => {
   __resetLoggedForTests();
   const h = harness();
   const t1 = edt('2026-10-06T16:00:00');
   await runBookedDialRouting({ env: LIVE, nowMs: t1, deps: h.deps });
   h.actions[0].status = 'failed';
-  const res = await runBookedDialRouting({ env: LIVE, nowMs: t1 + 5 * 60_000, deps: h.deps });
+  await runBookedDialRouting({ env: LIVE, nowMs: t1 + 5 * 60_000, deps: h.deps });
+  assert.deepEqual(h.actions.map((a) => a.action_type), ['five9_add_records_to_list', 'five9_add_records_to_list'], 'one retry');
+  assert.equal(h.posts.length, 0);
+  h.actions[1].status = 'failed';
+  const res = await runBookedDialRouting({ env: LIVE, nowMs: t1 + 10 * 60_000, deps: h.deps });
+  assert.equal(h.actions.length, 2, 'no third add, no removal');
+  assert.equal(res.add_failed, 1);
+  assert.equal(h.posts.length, 1);
+  assert.equal(h.posts[0].channel, 'C_SERVICE');
+  assert.match(h.posts[0].text, /BOOKED LEADS NOT ON A CONFIRMATION LIST/);
+  await runBookedDialRouting({ env: LIVE, nowMs: t1 + 15 * 60_000, deps: h.deps });
+  assert.equal(h.posts.length, 1, 'told once');
+});
+
+test('live: a visit 5 days out comes off the setter lists right away, no add', async () => {
+  __resetLoggedForTests();
+  const h = harness({ inbound: [{ ...SHELLEY_RAW, apptdate: '10/11/2026' }] });
+  await runBookedDialRouting({ env: LIVE, nowMs: edt('2026-10-06T16:00:00'), deps: h.deps });
+  assert.deepEqual(h.actions.map((a) => a.action_type), ['five9_delete_record_from_list']);
+  assert.deepEqual(h.actions[0].action_payload.list_names, cfg.removeLists);
+  assert.equal(h.actions[0].requires_approval, true);
+  assert.equal(h.actions[0].action_payload.reason, 'appt_3plus_days');
+  assert.match(describeApprove(h.actions[0], { contactName: 'Shelley' }), /3\+ days out; the number goes on a confirmation list two days before it/);
+});
+
+test('live: moved from 2nd Day to Next Day → one removal from "Conf - 2nd Day" only', async () => {
+  __resetLoggedForTests();
+  const h = harness({ addRows: [
+    { id: 1, status: 'completed', target_id: 'Conf - 2nd Day', payload: '{"records":[["9414670700"]]}' },
+    { id: 2, status: 'completed', target_id: 'Conf - Next Day', payload: '{"records":[["9414670700"]]}' },
+  ] });
+  h.marks.set(removeKey('9414670700', '2026-10-08', '2026-10-06'), {}); // setter lists done yesterday
+  h.setContactList('Conf - Next Day');
+  await runBookedDialRouting({ env: LIVE, nowMs: edt('2026-10-07T09:00:00'), deps: h.deps });
   assert.equal(h.actions.length, 1);
-  assert.ok(res.by_reason.add_failed_no_removal);
+  assert.deepEqual(h.actions[0].action_payload.list_names, ['Conf - 2nd Day']);
+  assert.equal(h.actions[0].action_payload.reason, 'moved_to_next_day');
+  assert.match(describeApprove(h.actions[0], { contactName: 'Shelley' }), /stops a second confirmation call/);
+  await runBookedDialRouting({ env: LIVE, nowMs: edt('2026-10-07T09:05:00'), deps: h.deps });
+  assert.equal(h.actions.length, 1, 'once per visit');
+});
+
+test('live: setter removal and the 2nd Day removal due together → ONE card', async () => {
+  __resetLoggedForTests();
+  const h = harness({ addRows: [
+    { id: 1, status: 'completed', target_id: 'Conf - 2nd Day', payload: '{"records":[["9414670700"]]}' },
+    { id: 2, status: 'completed', target_id: 'Conf - Next Day', payload: '{"records":[["9414670700"]]}' },
+  ] });
+  await runBookedDialRouting({ env: LIVE, nowMs: edt('2026-10-07T09:00:00'), deps: h.deps });
+  assert.equal(h.actions.length, 1);
+  assert.deepEqual(h.actions[0].action_payload.list_names, [...cfg.removeLists, 'Conf - 2nd Day']);
 });
 
 test('live: a backstop add that completed counts — removal without a second add', async () => {

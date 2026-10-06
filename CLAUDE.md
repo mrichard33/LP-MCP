@@ -162,7 +162,10 @@ EXCLUSIVE: a range ending today returns none of today's rows (issue #490).
 (`BOOKED_DIAL_ROUTING_MODE`, default shadow) runs after each watch pass: visit today/tomorrow → "Conf - Next Day", two
 days → "Conf - 2nd Day", later → held. ADD FIRST, REMOVE SECOND: the removal from LP_ASAP / Reece Chatbot / Direct Lead
 Entry / After DIAL ASAP is queued only once a Confirmation add for that phone COMPLETED (any rule) or Five9 already has it
-there, so a booked lead is never on no list (a held lead and an unissued inquiry are not removed yet; a Cnf lead is). The
+there (an unissued inquiry waits). Mark's exceptions (2026-10-06 follow-up): a Cnf lead and a visit 3+ days out come off
+right away (the 3+ day one is added two days before). A failed add is retried ONCE, then #contact-center is told (once per
+visit). A visit that moved from "2nd Day" to "Next Day" comes off "Conf - 2nd Day" once the Next Day add completed. While
+`BOOKED_DIAL_ROUTING_MODE=live` (and only then) the new-lead backstop holds 3+ day visits instead of pushing them. The
 removal is `five9_delete_record_from_list` with `list_names`, `requires_approval` and `approval_expires_at` = the visit;
 the executor skips it after that. `BOOKED_ROUTING_AUTO_REMOVE=true` is the only way around the approval, and only for rule
 `BOOKED_DIAL_ROUTING` — Mark sets it after a recorded standing exception (#1057), never us. Every decision is in
