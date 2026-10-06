@@ -171,6 +171,25 @@ test('Cnf (already confirmed) → no add, removal yes', () => {
   assert.deepEqual([d.add, d.remove], [false, true]);
 });
 
+test('Issue is treated like confirmed (no add, removal yes); Verif is treated like Set (Mark, 2026-10-06)', () => {
+  const now = edt('2026-10-06T16:00:00');
+  const issue = pre(cand({ dsp_id: 'Issue' }), now);
+  assert.equal(issue.action, 'candidate');
+  assert.equal(issue.reason, 'appointment_issued');
+  assert.equal(issue.route.addList, null);
+  assert.deepEqual([decide({ ...base, pre: issue }).add, decide({ ...base, pre: issue }).remove], [false, true]);
+  // lp_leads says Issue even though the inquiry row said Set.
+  const lead = { lp_lead_id: '581671', disposition_code: 'Issue', appointment_date: '2026-10-08 18:00:00+00', lp_prospect_id: '463389' };
+  assert.equal(pre(cand({}, lead), now).reason, 'appointment_issued');
+  // "Verif means the same as Set": Confirmation add first, then the removal.
+  const verif = pre(cand({ dsp_id: 'Verif' }), now);
+  assert.deepEqual([verif.action, verif.reason, verif.route.addList], ['candidate', 'appt_in_2_days', 'Conf - 2nd Day']);
+  assert.deepEqual([decide({ ...base, pre: verif }).add, decide({ ...base, pre: verif }).remove], [true, false]);
+  const row = buildRemovalAction(cand({ dsp_id: 'Issue' }), { reason: 'appointment_issued', cfg, nowMs: now });
+  assert.match(row.reasoning, /already issued to a rep/);
+  assert.match(describeApprove(row, { contactName: 'Shelley' }), /already issued to a rep/);
+});
+
 test('DNC → skipped; DNC unreadable → wait; Five9 record unreadable → no add', () => {
   assert.equal(decide({ ...base, pre: ok(edt('2026-10-06T16:00:00')), onDnc: true }).reason, 'dnc');
   assert.equal(decide({ ...base, pre: ok(edt('2026-10-06T16:00:00')), onDnc: null }).reason, 'dnc_unreadable');
