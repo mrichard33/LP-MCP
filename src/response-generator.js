@@ -4971,7 +4971,9 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       kb_modes: extractKbModes(kbPack),
       kb_sources: extractKbSources(kbPack),
       input_snapshot: buildInputSnapshot({
-        conversation: context.conversation_recent || [],
+        // 2026-10-06: the unfiltered thread when CONTEXT_ACTIVITY_FILTER_MODE
+        // dropped activity rows for the model; review hides them by kind.
+        conversation: context.conversation_with_activity || context.conversation_recent || [],
         contactTags: context.lead?.current_tags || [],
         buyerStage,
         activeEntryTag,
