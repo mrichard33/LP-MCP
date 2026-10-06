@@ -182,9 +182,13 @@ test('enforceBookingFacts: the model\'s words stand when right; wrong time → t
 
   const book = smsBookingTurn({ plan: CONFIRM, trigger: 'Fine lets book for 2 PM', thread: THREAD, slots: SLOTS, gateMissing: [], firstName: 'Mark' });
   const modelCompanion = { action_type: 'book_appointment', action_payload: { start_time: '2026-10-03T10:00:00-04:00' } };
-  const ok = enforceBookingFacts("You're all set for Sat, Oct 3 at 2:00 PM ET, Mark. Our team will reach out to confirm the details.", book, { companion: modelCompanion });
+  const ok = enforceBookingFacts("You're all set, Mark. Someone from our team will give you a call to confirm the details. You're on the calendar for Sat, Oct 3 at 2:00 PM ET.", book, { companion: modelCompanion });
   assert.equal(ok.fallback_used, false);
   assert.equal(ok.companion.action_payload.start_time, '2026-10-03T14:00:00-04:00', 'the model can never move the time');
+  // 2026-10-06 (the user): the confirmation is a call; "reach out" alone ships the fixed line.
+  const reachOut = enforceBookingFacts("You're all set for Sat, Oct 3 at 2:00 PM ET, Mark. Our team will reach out to confirm the details.", book);
+  assert.equal(reachOut.fallback_used, true);
+  assert.ok(reachOut.problems.includes('no_confirmation_call'), JSON.stringify(reachOut.problems));
   const bad = enforceBookingFacts('Booked! See you Saturday.', book);
   assert.equal(bad.message, LINES.confirm(SLOTS[1], 'ET', 'Mark'));
   assert.deepEqual(clockTimes('10 AM or 2:30 pm'), [600, 870]);
@@ -195,7 +199,8 @@ test('the plan block tells the model the facts (hold, book)', () => {
   assert.match(block, /I'm holding Sat, Oct 3 at 2:00 PM ET for you\./);
   assert.ok(block.includes(COLLECT_ASK.address));
   const book = renderPlanBlock({ required_move: 'confirm', booking_facts: { kind: 'book', label: 'Sat, Oct 3 at 2:00 PM ET', first_name: 'Mark' } }).join('\n');
-  assert.match(book, /all set for Sat, Oct 3 at 2:00 PM ET/);
+  assert.match(book, /on the calendar for Sat, Oct 3 at 2:00 PM ET/);
+  assert.match(book, /give them a call to confirm the details/);
 });
 
 // ── fewer passes ─────────────────────────────────────────────────────────

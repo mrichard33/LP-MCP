@@ -133,7 +133,8 @@ const promisesCall = (s) => CALL_PROMISE_RX.test(s) && FROM_US_RX.test(s);
 // A phone call from us, promised as a statement (2026-10-03, Mark's shutters
 // thread: "someone from our team will call you shortly" with nothing filed).
 // Narrower than promisesCall: a CALL verb, said by us, not a question, and not
-// the booking confirm ("Our team will reach out to confirm the details").
+// the booking confirm ("…give you a call to confirm the details", LINES.confirm):
+// that call is the phone room's confirmation, not a Five9 Callback Request.
 const CALL_VERB_RX = /\b(?:call|calls|calling|ring|phone)\s+(?:you|you\s+back)\b|\bgive\s+you\s+a\s+(?:call|ring)\b|\bget\s+a\s+call\b|\bexpect\s+a\s+call\b|\bcall\s+(?:to\s+)?(?:set|schedule|go\s+over|talk|walk|follow\s+up|confirm)/i;
 const NOT_A_CALLBACK_RX = /\b(?:confirm\s+(?:the\s+|your\s+)?(?:details|appointment|visit|time))\b|\ball\s+set\b/i;
 /** Does this reply promise that we will phone the lead? Pure. */

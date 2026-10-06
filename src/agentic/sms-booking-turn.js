@@ -174,6 +174,8 @@ export function enforceBookingFacts(draft, facts, { companion = null } = {}) {
   if (facts.kind === 'book') {
     if (!times.length || !namesDay(text)) problems.push('no_time');
     if (!/\ball\s+set\b/i.test(text) || !/\bconfirm/i.test(text)) problems.push('not_the_confirm_line');
+    // The confirmation is a CALL (the user, 2026-10-06): "reach out" alone misses it.
+    if (!/\b(?:call|ring)\b/i.test(text)) problems.push('no_confirmation_call');
     if (text.includes('?')) problems.push('asks_after_booking');
   } else if (facts.kind === 'dm_conflict') {
     if (facts.alternatives.length === 2 && !want.every(t => times.includes(t))) problems.push('missing_alternatives');
@@ -219,7 +221,7 @@ export function bookingFactsNote(facts, problems = []) {
   const what = {
     hold: `say "I'm holding ${facts.label} for you." and then ask exactly: "${facts.ask_line}"`,
     collect: `thank them in a few words, then ask exactly: "${facts.ask_line}". Mention no other time`,
-    book: `say they're all set for ${facts.label} and that our team will reach out to confirm the details. No question`,
+    book: `say they're all set, that someone from our team will give them a call to confirm the details, and that they're on the calendar for ${facts.label}. No question`,
     dm_conflict: facts.alternatives?.length === 2
       ? `offer exactly these two times and ask which works better: ${facts.alternatives.map(s => `${s.day} at ${s.time}`).join(' or ')}`
       : 'ask what day works best when they can both be there',

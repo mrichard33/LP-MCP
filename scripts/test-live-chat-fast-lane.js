@@ -915,7 +915,7 @@ test('NEPQ live: an on-file address is read back once, then the visit is booked 
   const two = nepqLane({ contact: READY_CONTACT, messages: [M('inbound', 'let me think about it', 4), M('outbound', offer, 3), M('inbound', 'wednesday works', 2), M('outbound', hold, 1)] });
   await two.lane.processInbound(INBOUND('yes'));
   assert.deepEqual(two.state.bookings, [{ contactId: 'C1', startIso: '2026-10-07T18:00:00Z', calendarId: 'CALWE', decisionMakers: null, address: '123 Main St, Tampa, FL 33601' }]);
-  assert.equal(two.state.sends[0].message, "You're all set for Wed, Oct 7 at 2:00 PM ET, Alyce. Our team will reach out to confirm the details.");
+  assert.equal(two.state.sends[0].message, "You're all set, Alyce. Someone from our team will give you a call to confirm the details. You're on the calendar for Wed, Oct 7 at 2:00 PM ET.");
 });
 
 test('NEPQ live: a "no" to the on-file address asks for it, and the typed one goes on the booking', async () => {
@@ -963,7 +963,7 @@ test('NEPQ live (Mark, 2026-10-02): a pick with the address missing is held, the
   const three = nepqLane({ contact: { address1: '123 Main St', postalCode: '33601' }, messages: [M('outbound', offer, 4), M('inbound', 'the first one', 3), M('outbound', hold, 2), M('inbound', '123 Main St, Tampa FL 33601', 1), M('outbound', dmAsk, 0.5)] });
   await three.lane.processInbound(INBOUND('just me'));
   assert.deepEqual(three.state.bookings, [{ contactId: 'C1', startIso: '2026-10-06T14:00:00Z', calendarId: 'CALWE', decisionMakers: 'Solo Owner', address: '123 Main St, Tampa, FL 33601' }]);
-  assert.match(three.state.sends[0].message, /^You're all set for Tue, Oct 6 at 10:00 AM ET, Alyce\. Our team will reach out to confirm the details\.$/);
+  assert.match(three.state.sends[0].message, /^You're all set, Alyce\. Someone from our team will give you a call to confirm the details\. You're on the calendar for Tue, Oct 6 at 10:00 AM ET\.$/);
 });
 
 test('NEPQ live: a spouse who cannot make the held time gets two other times', async () => {
@@ -994,7 +994,7 @@ test('NEPQ live: a guest who types their name, phone, address and "just me" is b
   const t4 = [...t3, M('inbound', '12 Main St, Ocala FL 34470', 2), M('outbound', c.state.sends[0].message, 1)];
   const e = lane(t4); await e.lane.processInbound(INBOUND('No, just me'));
   assert.deepEqual(e.state.bookings, [{ contactId: 'C1', startIso: '2026-10-06T14:00:00Z', calendarId: 'CALWE', decisionMakers: 'Solo Owner', address: '12 Main St, Ocala, FL 34470' }]);
-  assert.equal(e.state.sends[0].message, "You're all set for Tue, Oct 6 at 10:00 AM ET, Mark. Our team will reach out to confirm the details.");
+  assert.equal(e.state.sends[0].message, "You're all set, Mark. Someone from our team will give you a call to confirm the details. You're on the calendar for Tue, Oct 6 at 10:00 AM ET.");
 });
 
 test('NEPQ live: "My wife works then" is a conflict even when we asked something else', async () => {
@@ -1154,7 +1154,8 @@ test('NEPQ live: a booked visit is confirmed in the model\'s words when they car
   const offer = 'I have Tue, Oct 6 at 10:00 AM ET or Wed, Oct 7 at 2:00 PM ET. Which works better?';
   const hold = "Great, I'm holding Tue, Oct 6 at 10:00 AM ET for you. What's the street address for the visit, including the zip code?";
   const dmAsk = "Got it. Will anyone else be part of the decision? We'll want them there too so nobody has to repeat anything.";
-  const draft = "Perfect, Alyce, you're all set for Tue, Oct 6 at 10:00 AM ET. Our team will reach out to confirm the details.";
+  // 2026-10-06 (the user): the confirmation is a CALL. The model's own words stand when they say so.
+  const draft = "Perfect, Alyce, you're all set. Someone from our team will give you a call to confirm the details, and you're on the calendar for Tue, Oct 6 at 10:00 AM ET.";
   const { lane, state } = nepqLane({ llm: () => ({ message: draft }), contact: { address1: '123 Main St', postalCode: '33601' }, messages: [M('outbound', offer, 4), M('inbound', 'the first one', 3), M('outbound', hold, 2), M('inbound', '123 Main St, Tampa FL 33601', 1), M('outbound', dmAsk, 0.5)] });
   await lane.processInbound(INBOUND('just me'));
   assert.equal(state.bookings.length, 1);

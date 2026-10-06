@@ -78,7 +78,7 @@ export function heldSlot(thread = []) {
     // A booking line, or a new offer of two times (the spouse-conflict and
     // "that time just filled up" re-offers). "PM." inside an offer is not a
     // sentence end, so the offer is read up to its "?" (2026-10-02 test).
-    if (/\bI have you down for\b|\byou'?re all set for\b|\bI have\b[^?]{0,140}\bor\b[^?]*\?/i.test(text) && !HOLD_RX.test(text)) return null;
+    if (/\bI have you down for\b|\byou'?re all set for\b|\byou'?re on the calendar for\b|\bI have\b[^?]{0,140}\bor\b[^?]*\?/i.test(text) && !HOLD_RX.test(text)) return null;
     const m = text.match(HOLD_RX);
     if (m) {
       const last = outbound[outbound.length - 1];

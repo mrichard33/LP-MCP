@@ -183,3 +183,13 @@ test('POST /admin/bot-eval is closed when ADMIN_API_TOKEN is unset, and needs th
   }
   assert.equal(EVAL_RUN_EVENT, 'agentic.bot_eval_run');
 });
+
+test('a hand-off promising a call in any words passes when the callback was filed', () => {
+  // 2026-10-06 baseline run: "Let me have someone from our team call you" on a
+  // price_insist hand-off was failed; promisedCallback does not read that wording.
+  const t = [turn(1, 'how much?', "Every home is different. Let me have someone from our team call you to walk through it. What's your first name?", { nepq: { move: 'handoff', handoff: 'price_insist' } })];
+  assert.equal(scoreResult(result('quote', t, { would_do: [{ turn: 1, kind: 'would_file_callback_five9_and_contact_center' }] })).pass, true);
+  // The same words with no hand-off and nothing filed are an unasked offer.
+  const offer = [turn(1, 'my windows are drafty', 'Let me have someone from our team call you to walk through it.', { nepq: { move: 'probe' } })];
+  assert.ok(scoreResult(result('discovery', offer)).failures.some(f => f.code === 'unasked_call_offer'));
+});
