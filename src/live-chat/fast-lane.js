@@ -1182,7 +1182,7 @@ export function createLiveChatFastLane(deps) {
       // model's words against the facts or the reference instead, and the
       // reference is the backup.
       if (reference) {
-        const voiced = humanizeReply(restoreQuestionMark(message).text, { keepText: userPrompt });
+        const voiced = humanizeReply(restoreQuestionMark(message).text);
         const facts = reference.facts || null;
         const hasApptRef = context.lp?.appointment_set === true && context.lp?.appointment_is_past !== true;
         const claimRef = rewriteBookingClaims(voiced.text, { booked: !!facts?.book || !!reference.booked, held: !!facts && (facts.kind === 'hold' || facts.kind === 'collect'), hasAppointment: hasApptRef, replacement: nextStepLine({ bridgeUsed: !!nepqPlan?.counters?.bridge_used }) });
@@ -1211,7 +1211,7 @@ export function createLiveChatFastLane(deps) {
       // A question written with a period hides from every check that counts
       // "?" (2026-10-02 simulation), so the mark goes back first.
       const marked = restoreQuestionMark(message);
-      const voice = humanizeReply(marked.text, { keepText: userPrompt });
+      const voice = humanizeReply(marked.text);
       if (voice.changes.length) console.log(`[HumanVoice] live chat ${contactId} ${voice.changes.join(',')}`);
       const base = guardDraft(voice.text, { discipline, established, loopBreak, spouseAdvocacy, leadFirstName });
       // No calendar in this lane: any named day/time is invented (2026-10-01).

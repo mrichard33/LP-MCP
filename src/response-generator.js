@@ -4110,15 +4110,15 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // reply, and it is never one with raw template syntax in it.
   // ─── Human voice (2026-10-02, Mark: "sounds very human") ───
   // Em dashes shipped despite HARD_PROHIBITIONS, plus stacked "Got it. Great
-  // question." openers and "Just to understand… —" lead-ins. Deletes only;
-  // the user prompt is passed as keepText so a LOCKED KB line the model quoted
-  // keeps its em dashes verbatim (banned.js). Runs before the token guard so
-  // that guard still sees the final text.
+  // question." openers and "Just to understand… —" lead-ins. Deletes only,
+  // and no em dash survives, a quoted locked line included (the user,
+  // 2026-10-06). Runs before the token guard so that guard still sees the
+  // final text.
   // A question written with a period hides from every check that counts "?"
   // (2026-10-02 simulation), so the mark goes back first.
   const marked = channel === 'email' ? { changed: false } : restoreQuestionMark(validated.message);
   if (marked.changed) validated.message = marked.text;
-  const voice = humanizeReply(validated.message, { keepText: userPrompt });
+  const voice = humanizeReply(validated.message);
   if (voice.changes.length) {
     console.log(`[HumanVoice] ${contactId} ${voice.changes.join(',')}`);
     validated.message = voice.text;

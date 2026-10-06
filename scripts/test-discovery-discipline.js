@@ -263,12 +263,12 @@ test('we asked, no answer yet → asked; nothing → unknown', () => {
 
 // ── Fix 4: tone ─────────────────────────────────────────────────────────
 
-test('"Good question" / "Great question" / "Happy to help" are banned openers; "Fair question —" and "Perfect," are not', () => {
+test('"Good question" / "Great question" / "Happy to help" are banned openers; "Fair question." and "Perfect," are not', () => {
   assert.equal(findBannedOpeners('Good question — a sash is the frame that holds the glass.').length, 1);
   assert.equal(findBannedOpeners('Great question. Most installs take 1 to 2 days.').length, 1);
   assert.equal(findBannedOpeners('Happy to help with that.').length, 1);
   assert.equal(findBannedOpeners('Great! We can do that.').length, 1);
-  assert.equal(findBannedOpeners("Fair question — yes, I'm Reece's AI assistant.").length, 0);
+  assert.equal(findBannedOpeners("Fair question. Yes, I'm Reece's AI assistant.").length, 0);
   assert.equal(findBannedOpeners("Perfect, you're confirmed for Tuesday at 10.").length, 0);
   assert.equal(stripBannedOpener('Good question — a sash is the frame that holds the glass.'), 'A sash is the frame that holds the glass.');
   assert.equal(stripBannedOpener('Great question. Most installs take 1 to 2 days.'), 'Most installs take 1 to 2 days.');

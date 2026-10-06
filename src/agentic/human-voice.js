@@ -17,11 +17,16 @@
  * never adds a claim — and it gives the original back whenever the edit would
  * leave nothing, or would lose the reply's question.
  *
- * Two things are deliberately left alone:
- *   - a trailing "— Randy" sign-off (the identity rule decides that line), and
- *   - an em dash inside a LOCKED KB line the model quoted. banned.js tells the
- *     model to reproduce those exactly, em dashes included, so `keepText` (the
- *     KB pack as the prompt showed it) is checked before any dash is touched.
+ * One thing is deliberately left alone: a trailing "— Randy" sign-off (the
+ * identity rule decides that line).
+ *
+ * 2026-10-06 (the user): no em dash survives, a quoted KB line included. Until
+ * now a dash inside any text the prompt showed (`keepText`) was kept, meant for
+ * LOCKED lines but matching any KB passage the model copied: an old price
+ * script ("Every home is different — window sizes, …") shipped with its dashes
+ * and failed the reply checks, which never had that exception. The locked lines
+ * lost their dashes at the source (sql/seeds/2026-10-06_no_dashes_locked_lines.sql),
+ * so the exception went with them. `keepText` is still accepted and ignored.
  *
  * Pure. No I/O.
  */
@@ -62,14 +67,6 @@ function sentences(text) {
   return String(text).match(/[^.!?\n]+(?:[.!?]+["')\]]*)?\s*|\n+/g) || [];
 }
 
-/** Is the dash at `idx` inside a locked line the prompt supplied? Pure. */
-function insideKept(text, idx, keepNorm) {
-  if (!keepNorm) return false;
-  const around = norm(text.slice(Math.max(0, idx - 14), idx + 15)).trim();
-  if (around.length < 8) return false;
-  return keepNorm.includes(around);
-}
-
 /** Replace em dashes with the punctuation a person would type. Pure. */
 function fixDashes(body) {
   let out = '';
@@ -103,14 +100,13 @@ function fixDashes(body) {
 /**
  * Clean the machine tells out of a finished reply.
  * @param {string} text
- * @param {{keepText?: string}} [opts]  keepText: the KB pack as shown to the model
+ * @param {object} [_opts]  accepted for old callers; nothing in it is read
  * @returns {{text: string, changes: string[]}}
  */
-export function humanizeReply(text, { keepText = '' } = {}) {
+export function humanizeReply(text, _opts = {}) {
   const original = String(text ?? '');
   if (!original.trim()) return { text: original, changes: [] };
   const changes = [];
-  const keepNorm = keepText ? norm(keepText) : '';
 
   // A trailing "— Name" sign-off stays exactly as written.
   const signOff = original.match(/([.!?]\s*|\n\s*)([—–-]\s*[A-Z][A-Za-z.'’ ]{0,40}?)\s*$/);
@@ -147,13 +143,10 @@ export function humanizeReply(text, { keepText = '' } = {}) {
   });
   body = parts.join('');
 
-  // 3. Em dashes, a sentence at a time. A sentence that quotes a locked line
-  // keeps ALL its dashes: fixing one of a pair would mangle the quote.
+  // 3. Em dashes, a sentence at a time.
   let dashChanged = false;
   body = sentences(body).map((s) => {
-    const dashes = [...s.matchAll(DASH_RX)];
-    if (!dashes.length) return s;
-    if (dashes.some((m) => insideKept(s, m.index + m[0].search(/[—–-]/), keepNorm))) return s;
+    if (!s.match(DASH_RX)) return s;
     const fixed = fixDashes(s);
     if (fixed.changed) dashChanged = true;
     return fixed.text;
