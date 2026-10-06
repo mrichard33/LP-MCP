@@ -280,8 +280,16 @@ export async function runBookedDialRouting({ env = process.env, nowMs = Date.now
   const addFailed = [];
   for (const { c, pre } of live) {
     const list = pre.route.addList;
+    const removedBefore = priorRemoveKeys(c.phone, c.apptDate, nowMs, cfg.readdLookbackDays).some((k) => marks.has(k));
+    const addRows = adds.get(c.phone);
+    // The Five9 record is read only when a decision needs it (2026-10-06): to
+    // skip an add the record already has (an add still to do) or to see LP's
+    // re-add (a removal on a later day). A removal-only lead (Cnf, Issue, 3+
+    // days, an add already done) needs none; spending the per-pass lookup cap
+    // on those deferred 121 leads a pass in the first clean shadow runs.
+    const needsRecord = (list && addState(addRows, list) !== 'done') || removedBefore;
     let contact;
-    if (onDnc && !onDnc.has(c.phone)) {
+    if (needsRecord && onDnc && !onDnc.has(c.phone)) {
       if (lookups >= cfg.maxLookups) { note(c, 'deferred', 'lookup_cap'); continue; }
       lookups += 1;
       try {
@@ -290,8 +298,6 @@ export async function runBookedDialRouting({ env = process.env, nowMs = Date.now
         contact = 'error';
       }
     }
-    const removedBefore = priorRemoveKeys(c.phone, c.apptDate, nowMs, cfg.readdLookbackDays).some((k) => marks.has(k));
-    const addRows = adds.get(c.phone);
     const dec = decide({
       pre, contact, cfg,
       onDnc: onDnc ? onDnc.has(c.phone) : null,

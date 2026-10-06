@@ -590,3 +590,19 @@ test('new-lead backstop: Verif is a booked visit, exactly like Set (Mark, 2026-1
   const cnf = backstopPrefilter({ row: normalizeInboundRow({ ...SHELLEY_RAW, dsp_id: 'Cnf' }), lead: null, called: false, nowMs, cfg: bcfg });
   assert.equal(cnf.reason, 'progressed');
 });
+
+test('a removal-only lead needs no Five9 lookup, so the lookup cap never holds it back', async () => {
+  __resetLoggedForTests();
+  const confirmed = Array.from({ length: 60 }, (_, i) => ({
+    ...SHELLEY_RAW, id: String(800000 + i), lds_id: String(810000 + i), cst_id: String(820000 + i), dsp_id: 'Cnf',
+    phone: `(941)6${String(i).padStart(6, '0')}`, datereceived: '2026-10-06T10:00:00',
+  }));
+  const h = harness({ inbound: confirmed });
+  let lookups = 0;
+  const orig = h.deps.getContactRecords;
+  h.deps.getContactRecords = async (q) => { lookups += 1; return orig(q); };
+  const res = await runBookedDialRouting({ env: { BOOKED_ROUTING_MAX_LOOKUPS: '5' }, nowMs: edt('2026-10-06T16:00:00'), deps: h.deps });
+  assert.equal(lookups, 0);
+  assert.equal(res.by_reason.lookup_cap, undefined);
+  assert.equal(res.counts.would_remove, 20, 'only the removal cap applies');
+});
