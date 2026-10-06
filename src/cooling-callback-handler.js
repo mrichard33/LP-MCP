@@ -42,6 +42,7 @@
  */
 
 import supabase from './supabase.js';
+import { safeEqual } from './auth.js';
 import { emitEvent } from './event-emitter.js';
 import { sendGroupMeMessage } from './groupme.js';
 
@@ -56,7 +57,7 @@ function validateBearer(req, res, next) {
   }
   const auth = req.headers.authorization || '';
   const expected = `Bearer ${AGENTIC_CALLBACK_TOKEN}`;
-  if (auth !== expected) {
+  if (!safeEqual(auth, expected)) { // constant-time since 2026-10-06
     console.warn(`[CoolingCallback] Rejected: invalid bearer from ${req.ip}`);
     return res.status(401).json({ error: 'unauthorized' });
   }

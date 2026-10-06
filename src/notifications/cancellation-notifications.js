@@ -49,6 +49,7 @@
  * disabling the agentic body while keeping the workflow in place.
  */
 
+import { checkRequestSecret, rejectionBody } from '../security/request-auth.js';
 import crypto from 'crypto';
 import supabase from '../supabase.js';
 import { loadCancellationContext } from './cancellation-intelligence.js';
@@ -521,13 +522,11 @@ function isFeatureEnabled() {
   return String(flag).toLowerCase() !== 'false';
 }
 
+// Staged, constant-time (2026-10-06, src/security/request-auth.js): open when
+// MESSAGE_ENGINE_TOKEN is unset only under AUTH_ENFORCE_MODE=log.
 function checkBearerAuth(req) {
-  const token = process.env.MESSAGE_ENGINE_TOKEN;
-  if (!token) return { ok: true };
-  const auth = req.headers.authorization || '';
-  const provided = auth.startsWith('Bearer ') ? auth.slice(7) : null;
-  if (provided !== token) return { ok: false };
-  return { ok: true };
+  const d = checkRequestSecret(req, { route: req.path || 'contract-cancellation', secret: process.env.MESSAGE_ENGINE_TOKEN, bearer: true });
+  return d.allow ? { ok: true } : { ok: false, status: d.status };
 }
 
 export function registerContractCancellationNotificationRoutes(app) {
@@ -563,7 +562,9 @@ export function registerContractCancellationNotificationRoutes(app) {
 
     const authCheck = checkBearerAuth(req);
     if (!authCheck.ok) {
-      return res.status(401).json({ ok: false, error: 'unauthorized' });
+      return authCheck.status === 503
+        ? res.status(503).json({ ok: false, error: 'auth_not_configured' })
+        : res.status(401).json({ ok: false, error: 'unauthorized' });
     }
 
     const merged = extractRequestFields(req.body || {});

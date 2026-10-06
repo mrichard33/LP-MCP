@@ -55,6 +55,7 @@
  * without network or DB.
  */
 
+import { checkRequestSecret, rejectionBody } from './security/request-auth.js';
 import supabase from './supabase.js';
 import { addGHLNote } from './ghl.js';
 import { sendGroupMeMessage } from './groupme.js';
@@ -631,12 +632,12 @@ export function registerCanvassConfirmationRoutes(app, routeDeps = {}) {
   app.post('/webhooks/canvass-confirmation', async (req, res) => {
     // Optional shared-secret guard (idiom: /webhooks/canvassing-lead). Open
     // when unset.
-    const secret = process.env.CANVASS_CONFIRMATION_WEBHOOK_SECRET;
-    if (secret) {
-      const provided = req.headers['x-webhook-secret'] || req.query.secret;
-      if (provided !== secret) {
-        return res.status(401).json({ error: 'unauthorized' });
-      }
+    // Staged, constant-time (2026-10-06, src/security/request-auth.js):
+    // AUTH_ENFORCE_MODE=log keeps the old behaviour (open when unset,
+    // `?secret=` accepted) and records what enforce would refuse.
+    const auth = checkRequestSecret(req, { route: '/webhooks/canvass-confirmation', secret: process.env.CANVASS_CONFIRMATION_WEBHOOK_SECRET, headers: ['x-webhook-secret'], allowQuery: true });
+    if (!auth.allow) {
+      return res.status(auth.status).json(auth.status === 401 ? { error: 'unauthorized' } : rejectionBody(auth));
     }
 
     // Unconditional shape fingerprint. A diagnostic that only fires on the

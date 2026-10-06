@@ -12,6 +12,7 @@
 // Modes (GHL_NOTE_MODE): off (kill switch) | shadow (log only) | live (write).
 // GHL-only; fully independent of Revin. Never logs the webhook token or creds.
 
+import { safeEqual } from '../auth.js';
 import supabase from '../supabase.js';
 import { sendGroupMeMessage } from '../groupme.js';
 import { getGHLContact } from '../ghl.js';
@@ -86,7 +87,8 @@ function cutoffIso(minutesAgo) {
 export function registerGhlInboundRoutes(app) {
   app.post('/ghl/inbound-message', async (req, res) => {
     // 1. Auth — never log the token.
-    if (!WEBHOOK_TOKEN || req.headers['x-webhook-token'] !== WEBHOOK_TOKEN) {
+    // Fail-closed already; constant-time compare since 2026-10-06.
+    if (!WEBHOOK_TOKEN || !safeEqual(req.headers['x-webhook-token'], WEBHOOK_TOKEN)) {
       return res.status(401).json({ error: 'unauthorized' });
     }
 

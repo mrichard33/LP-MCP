@@ -30,6 +30,8 @@
 
 import supabase from './supabase.js';
 import crypto from 'crypto';
+import { safeEqual } from './auth.js';
+import { authEnforceMode, recordAuthWouldReject, rejectionBody } from './security/request-auth.js';
 import { registerCallbackMessageRoutes } from './agentic-callback-message.js';
 import { registerNurtureRoutes } from './nurture/nurture-orchestrator.js';
 import { registerEngagementRoutes } from './nurture/nurture-engagement.js';
@@ -50,19 +52,36 @@ import { leadHadDemo } from './demo-truth.js';
 
 /**
  * Verifies HMAC-SHA256 signature from GHL Custom Webhook.
- * If WEBHOOK_SECRET is not set, verification is skipped (open mode).
  * Header: x-webhook-signature: sha256=<hex>
+ *
+ * Staged (2026-10-06, src/security/request-auth.js): with WEBHOOK_SECRET
+ * unset, AUTH_ENFORCE_MODE=log stays open (and records secret_unset) and
+ * enforce answers 503. The compare goes through safeEqual: timingSafeEqual
+ * THROWS on a length mismatch, so a short or garbage header used to surface
+ * as a 500 instead of a 401.
+ *
+ * @returns {{ allow: boolean, status: number|null, reason: string|null }}
  */
-function verifyWebhookSignature(req) {
+export function verifyWebhookSignature(req, { mode = authEnforceMode(), record = recordAuthWouldReject } = {}) {
+  const route = '/webhook/ghl-event';
   const secret = process.env.WEBHOOK_SECRET;
-  if (!secret) return true; // No secret configured — open mode
-
   const signature = req.headers['x-webhook-signature'];
-  if (!signature) return false;
-
-  const body = JSON.stringify(req.body);
-  const expected = 'sha256=' + crypto.createHmac('sha256', secret).update(body).digest('hex');
-  return crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
+  let decision;
+  if (!secret) {
+    decision = mode === 'enforce'
+      ? { allow: false, status: 503, reason: 'secret_unset' }
+      : { allow: true, status: null, reason: 'secret_unset' };
+  } else if (!signature) {
+    decision = { allow: false, status: 401, reason: 'missing_token' };
+  } else {
+    const body = JSON.stringify(req.body);
+    const expected = 'sha256=' + crypto.createHmac('sha256', secret).update(body).digest('hex');
+    decision = safeEqual(String(signature), expected)
+      ? { allow: true, status: null, reason: null }
+      : { allow: false, status: 401, reason: 'bad_secret' };
+  }
+  if (decision.reason) record({ route, reason: decision.reason, mode, method: req.method });
+  return decision;
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1274,9 +1293,10 @@ export function registerRestApiRoutes(app, authenticate) {
   app.post('/webhook/ghl-event', async (req, res) => {
     try {
       // ─── Signature verification ────────────────────────────
-      if (!verifyWebhookSignature(req)) {
-        console.warn('[Webhook] Invalid signature — rejected');
-        return res.status(401).json({ error: 'Invalid webhook signature' });
+      const sig = verifyWebhookSignature(req);
+      if (!sig.allow) {
+        console.warn(`[Webhook] ${sig.reason} — rejected`);
+        return res.status(sig.status).json(sig.status === 401 ? { error: 'Invalid webhook signature' } : rejectionBody(sig));
       }
 
       const payload = req.body;

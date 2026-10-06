@@ -27,7 +27,7 @@
  *   back. A caller that writes to a customer passes `customerScope: true`;
  *   under KB_CUSTOMER_SCOPE_MODE=live it gets ONLY `reece_*` source docs
  *   (an ALLOWLIST, deny by default: CANON.STD.017; category filter:
- *   CANON.RULE.033) through match_kb_embeddings_scoped (sql/146), or, while
+ *   CANON.RULE.033) through match_kb_embeddings_scoped (sql/147), or, while
  *   that function is not deployed, 50 rows of the old function filtered in
  *   code and capped (two-stage recall + filter). shadow (default) changes
  *   nothing and logs what it would drop, counts by source_doc only. Callers

@@ -274,6 +274,9 @@ async function contactHasPhone(contactId) {
 export async function resolveReplyContext(contactId, { requestedChannel = null, eventId = null } = {}) {
   let conversationId = null;
   let derived = { inboundOrigin: null, livechatAgeMin: null, inboundSmsTo: null };
+  // 2026-10-06: the raw newest-first messages this read already paid for, so
+  // a rule-written send can file its Bot Review thread with no second GHL call.
+  let messages = [];
 
   try {
     // 2026-07-03 hotfix: one overall deadline on the whole context fetch —
@@ -283,6 +286,7 @@ export async function resolveReplyContext(contactId, { requestedChannel = null, 
       fetchRecentMessages(contactId), REPLY_CONTEXT_DEADLINE_MS, 'resolveReplyContext',
     );
     conversationId = fetched.conversationId;
+    messages = Array.isArray(fetched.messages) ? fetched.messages : [];
     derived = deriveInboundContext(fetched.messages);
   } catch (err) {
     console.warn(`[reply-sender] resolveReplyContext fetch failed for ${contactId}: ${err.message} — falling back to requested channel`);
@@ -363,6 +367,7 @@ export async function resolveReplyContext(contactId, { requestedChannel = null, 
     inboundOrigin: derived.inboundOrigin,
     livechatAgeMin: derived.livechatAgeMin,
     newestInboundAt: derived.newestInboundAt || null,
+    messages,
   };
 }
 

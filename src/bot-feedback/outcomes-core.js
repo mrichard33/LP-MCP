@@ -17,8 +17,10 @@
  * look identical, so an outcome computed against a stale cache is recorded with
  * source_fresh=false and is NEVER marked final.
  *
- * Dependency-free + pure.
+ * Pure. The one import (do-not-knock.js) is itself dependency-free.
  */
+
+import { isKnockNotOptOut } from '../agentic/do-not-knock.js';
 
 export const REPLY_WINDOW_MS = 24 * 60 * 60 * 1000;    // 24h
 export const OPTOUT_WINDOW_MS = 24 * 60 * 60 * 1000;   // 24h
@@ -27,22 +29,63 @@ export const FRESHNESS_MAX_AGE_MS = 2 * 60 * 60 * 1000;   // 2h
 export const SCAN_LOOKBACK_MS = 8 * 24 * 60 * 60 * 1000;  // 8d
 
 /**
- * STOP family, whole-word, case-insensitive (handoff §5.1).
- * Whole-word matters: "stopped by the showroom" and "remove me from the list"
- * are opposite intents, and only the second is an opt-out. \b on both ends
- * keeps "stop" out of "stopped" and "nonstop".
+ * Opt-out keywords for the METRIC only (2026-10-06, AI OS batch 1, PR 4).
+ *
+ * The old single pattern counted "cancel", "end" and "quit" anywhere in a
+ * message, so "can we cancel tuesday" and "end of the week works" were scored
+ * as the bot driving the lead away, which inflated the opt-out rate. The rule
+ * now follows the carrier keyword set:
+ *   - a bare keyword is an opt-out only when it is the WHOLE message
+ *     (after normalizeOptOutText), and
+ *   - a phrase that cannot mean anything else counts anywhere.
+ * Whole-word still matters: "stopped by the showroom" is not "stop".
+ *
+ * Nothing on the compliance path reads this: the STOP/DNC handling lives in
+ * behavioral-emitter.js (DNC_PATTERNS), isDNCSignal and the classifier.
  */
-export const STOP_PATTERN = /\b(stop|stopall|unsubscribe|cancel|quit|end|optout|opt[\s-]?out|remove\s+me|do\s+not\s+contact)\b/i;
+export const OPTOUT_WHOLE_MESSAGE = new Set([
+  'stop', 'stopall', 'unsubscribe', 'cancel', 'end', 'quit',
+  'opt out', 'optout', 'revoke',
+]);
+
+/**
+ * Matched against the normalized text. "do not contact" is kept from the old
+ * pattern (it had a test and is unambiguous).
+ */
+export const OPTOUT_PHRASE_PATTERN = /\b(?:stop|unsubscribe|stop texting|stop messaging|remove me|do not text|dont text|do not contact)\b/;
+
+/** @deprecated kept for callers of the old export; isOptOutText is the rule. */
+export const STOP_PATTERN = OPTOUT_PHRASE_PATTERN;
 
 /** DNC-family tags (handoff §1.6). A tag in this set is an opt-out. */
 export const DNC_TAGS = new Set([
   'dnc', 'dnc-sms', 'do-not-contact', 'stage:dnc', 'unsubscribed',
 ]);
 
+/**
+ * Lowercase, trim, strip punctuation: an apostrophe is dropped ("don't" →
+ * "dont"), any other punctuation becomes a space ("opt-out" → "opt out"),
+ * and runs of whitespace collapse. Pure.
+ */
+export function normalizeOptOutText(text) {
+  return String(text ?? '')
+    .toLowerCase()
+    .replace(/['’‘`]/g, '')
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 /** Does this inbound body read as an opt-out? */
 export function isOptOutText(text) {
   if (!text) return false;
-  return STOP_PATTERN.test(String(text));
+  const t = normalizeOptOutText(text);
+  if (!t) return false;
+  if (OPTOUT_WHOLE_MESSAGE.has(t)) return true;
+  // "Please stop knocking on my door" is a door complaint, not a text
+  // opt-out (Mark, 2026-10-03). The same predicate the reply path uses.
+  if (isKnockNotOptOut(text)) return false;
+  return OPTOUT_PHRASE_PATTERN.test(t);
 }
 
 /** Does this tag list carry a DNC-family tag? */
@@ -204,7 +247,10 @@ export default {
   FRESHNESS_MAX_AGE_MS,
   SCAN_LOOKBACK_MS,
   STOP_PATTERN,
+  OPTOUT_WHOLE_MESSAGE,
+  OPTOUT_PHRASE_PATTERN,
   DNC_TAGS,
+  normalizeOptOutText,
   isOptOutText,
   hasDncTag,
   findFirstReply,

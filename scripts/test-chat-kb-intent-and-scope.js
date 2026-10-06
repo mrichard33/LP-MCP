@@ -259,11 +259,11 @@ test('the reply-writer packs ask for customer scope', () => {
 });
 
 test('the scoped SQL function is additive and mirrored at boot', () => {
-  const sql = readFileSync(new URL('../sql/146_match_kb_embeddings_scoped.sql', import.meta.url), 'utf8');
+  const sql = readFileSync(new URL('../sql/147_match_kb_embeddings_scoped.sql', import.meta.url), 'utf8');
   assert.match(sql, /CREATE OR REPLACE FUNCTION match_kb_embeddings_scoped/);
   assert.match(sql, /e\.active = true/);
   assert.match(sql, /starts_with\(e\.source_doc, allowed_prefix\)/);
   assert.ok(!/CREATE OR REPLACE FUNCTION match_kb_embeddings\s*\(/.test(sql), 'the old function is not touched');
   const mirrors = readFileSync(new URL('../src/admin/startup-mirrors.js', import.meta.url), 'utf8');
-  assert.match(mirrors, /name: 'sql\/146'/);
+  assert.match(mirrors, /name: 'sql\/147'/);
 });

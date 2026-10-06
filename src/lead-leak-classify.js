@@ -414,8 +414,16 @@ export function parseFive9Attempts(raw) {
 /** Contact-record field names Five9 uses (getContactRecords `fields`). */
 const F9 = Object.freeze({
   leadId: 'lead_id', list: 'f9_last_list', campaign: 'f9_last_campaign',
-  attempts: 'Number of attempts', created: 'Contact create time and date',
+  attempts: 'Number of attempts', created: 'Contact create time and date', lastDispo: 'f9_last_dispo_date_time',
 });
+
+/** Five9's "YYYY-MM-DD HH:MM:SS(.sss)" (UTC) → epoch ms, or null. */
+export function five9UtcMs(raw) {
+  const m = String(raw ?? '').trim().match(/^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2}(?:\.\d+)?)$/);
+  if (!m) return null;
+  const ms = Date.parse(`${m[1]}T${m[2]}Z`);
+  return Number.isFinite(ms) ? ms : null;
+}
 
 /**
  * Turn getContactRecords' answer into { fields → value } objects. Five9 returns
@@ -462,6 +470,11 @@ export function summarizeContactRecord(res, lpLeadId) {
     attempts: parseFive9Attempts(r[F9.attempts]),
     list,
     campaign: text(r[F9.campaign]),
+    // UTC wall clock, e.g. "2026-10-06 03:18:29.000" (lead 581413 arrived
+    // 23:18:28 EDT; its record says 03:18:29). Read by the new-lead backstop:
+    // the DIAL ASAP filter screens on the create time.
+    createdMs: five9UtcMs(r[F9.created]),
+    lastDispoMs: five9UtcMs(r[F9.lastDispo]),
     leadIdMatch: !!match,
     raw: { list: r[F9.list] ?? null, campaign: r[F9.campaign] ?? null, attempts: r[F9.attempts] ?? null },
   };

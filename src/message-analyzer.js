@@ -238,6 +238,7 @@
  *   - Model: claude-sonnet-4-20250514 (cost-effective)
  */
 
+import { cleanInboundForModel } from './security/untrusted-text.js';
 import crypto from 'node:crypto';
 import { buildLeadContext, upsertLeadIntelligence } from './context-builder.js';
 import { emitEvent } from './event-emitter.js';
@@ -1266,6 +1267,13 @@ function validateAnalysis(analysis) {
  *   ai.analysis_completed payload unchanged; null on legacy paths.
  */
 export async function analyzeMessage(ghlContactId, messageText, eventId = null, channel = null, messageId = null, inbound = null) {
+  // 2026-10-06 (AI OS batch 1, PR 3; src/security/untrusted-text.js): the
+  // model reads the message with invisible characters removed; the event row
+  // below keeps the original text exactly as the lead sent it.
+  const rawMessageText = messageText == null ? '' : String(messageText);
+  const cleanedInbound = cleanInboundForModel(rawMessageText);
+  messageText = cleanedInbound.text;
+  if (cleanedInbound.removedCount > 0) console.log(`[MessageAnalyzer] ${ghlContactId}: removed ${cleanedInbound.removedCount} invisible character(s) before analysis`);
   if (!checkRateLimit()) {
     console.warn(`[MessageAnalyzer] Rate limit reached (${ANALYSIS_RATE_LIMIT}/hr). Skipping ${ghlContactId}`);
     return null;
@@ -1568,8 +1576,9 @@ export async function analyzeMessage(ghlContactId, messageText, eventId = null, 
         // v1.5: Full message_text so downstream consumers (send-message-handler)
         // have the actual inbound. message_preview is kept for backward
         // compatibility with anything reading the first 100 chars.
-        message_text: messageText,
-        message_preview: messageText.slice(0, 100),
+        message_text: rawMessageText,
+        message_preview: rawMessageText.slice(0, 100),
+        inbound_removed_chars: cleanedInbound.removedCount,
         analysis_duration_ms: Date.now() - startTime,
         // 2026-09-26 (reply timing, scripts/reply-latency-report.js): where the
         // inbound came from and when. The send handler reads these off
@@ -1619,7 +1628,7 @@ export async function analyzeMessage(ghlContactId, messageText, eventId = null, 
       // bucket — dedups near-simultaneous doubles without permanently
       // suppressing a genuine repeat of the same text days later.
       idempotency_key: `ai_analysis_${ghlContactId}_${messageId
-        || `${crypto.createHash('sha1').update(messageText).digest('hex').slice(0, 16)}_${Math.floor(Date.now() / 600000)}`}`,
+        || `${crypto.createHash('sha1').update(rawMessageText).digest('hex').slice(0, 16)}_${Math.floor(Date.now() / 600000)}`}`,
     });
 
     // v1.8: markAnalyzed moved to entry-of-function (immediately after

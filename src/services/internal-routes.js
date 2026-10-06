@@ -6,15 +6,16 @@
  * the trust boundary of the deployment.
  */
 
+import { checkRequestSecret, rejectionBody } from '../security/request-auth.js';
 import { checkLock } from './outbound-locks.js';
 import { checkAgenticSlot } from './agentic-reply-locks.js';
 
+// Staged, constant-time (2026-10-06, src/security/request-auth.js): open when
+// MCP_AUTH_TOKEN is unset only under AUTH_ENFORCE_MODE=log.
 function guard(req, res) {
-  const token = process.env.MCP_AUTH_TOKEN;
-  if (!token) return true;
-  const auth = req.headers.authorization || '';
-  if (auth !== `Bearer ${token}`) {
-    res.status(401).json({ error: 'Unauthorized' });
+  const d = checkRequestSecret(req, { route: req.path || 'internal', secret: process.env.MCP_AUTH_TOKEN, bearer: true });
+  if (!d.allow) {
+    res.status(d.status).json(d.status === 401 ? { error: 'Unauthorized' } : rejectionBody(d));
     return false;
   }
   return true;

@@ -1,5 +1,5 @@
 -- ════════════════════════════════════════════════════════════════════
--- sql/146_match_kb_embeddings_scoped.sql — 2026-10-06 (AI OS batch 1, PR 1)
+-- sql/147_match_kb_embeddings_scoped.sql — 2026-10-06 (AI OS batch 1, PR 1)
 --
 -- WHAT
 --   A NEW function, match_kb_embeddings_scoped(), with the same output
@@ -22,7 +22,7 @@
 -- (the code passes KB_VECTOR_MIN_SIMILARITY, 0.35 by default), so a scoped
 -- call returns the same rows the old one would, minus the books.
 --
--- Mirrored at boot (src/admin/startup-mirrors.js, block 'sql/146'). The code
+-- Mirrored at boot (src/admin/startup-mirrors.js, block 'sql/147'). The code
 -- works before this runs: vector-search.js falls back to 50 rows from the
 -- old function, filtered in code (KB_CUSTOMER_SCOPE_MODE=live only).
 --

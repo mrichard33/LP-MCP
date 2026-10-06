@@ -783,21 +783,24 @@ test('§6 every ingest route is signature-guarded, and the fail-open is LOUD', (
 
   // Every route that writes must call the guard. Counting them stops a new
   // route being added without one.
-  const csvGuards = (csvSrc.match(/if \(!authorized\(req\)\)/g) ?? []).length;
-  const pdfGuards = (pdfSrc.match(/if \(!authorized\(req\)\)/g) ?? []).length;
+  // 2026-10-06 (staged auth): the guard is `if (refuse(req, res)) return;`,
+  // which answers 401, or 503 when the secret is unset under enforce.
+  const csvGuards = (csvSrc.match(/if \(refuse\(req, res\)\) return;/g) ?? []).length;
+  const pdfGuards = (pdfSrc.match(/if \(refuse\(req, res\)\) return;/g) ?? []).length;
   assert.ok(csvGuards >= 5, `every CSV ingest route guarded (found ${csvGuards})`);
   assert.ok(pdfGuards >= 3, `PDF ingest + /events routes guarded (found ${pdfGuards})`);
-  assert.equal((csvSrc.match(/'bad signature'/g) ?? []).length, csvGuards, 'each guard 401s');
+  const refuser = common.slice(common.indexOf('export function refuseIngest'));
+  assert.match(refuser.slice(0, refuser.indexOf('\n}')), /'bad signature'/, 'each guard 401s through the shared refusal');
 
   // Both modules share ONE implementation — two copies would drift.
   for (const [name, src] of [['csv', csvSrc], ['pdf', pdfSrc]]) {
-    assert.match(src, /ingestAuthorized\(req, '/, `${name} defers to the shared guard`);
+    assert.match(src, /refuseIngest\(req, res, '/, `${name} defers to the shared guard`);
     assert.ok(!/const INGEST_SECRET =/.test(src), `${name} does not keep its own copy of the secret`);
   }
 
   // The fail-open is deliberate — flipping it while the var is unset would 401
   // every n8n workflow at once — but it must never again be silent.
-  const guard = common.slice(common.indexOf('export function ingestAuthorized'));
+  const guard = common.slice(common.indexOf('export function ingestAuthDecision'));
   assert.match(guard.slice(0, guard.indexOf('\n}')), /warnUnauthenticatedIngest/,
     'an unconfigured secret warns rather than passing quietly');
   assert.match(common, /LP_REPORT_INGEST_STRICT/,
@@ -808,7 +811,9 @@ test('§6 every ingest route is signature-guarded, and the fail-open is LOUD', (
   // rejection line does; `${provided}` is what must never appear.
   assert.ok(!/\$\{\s*provided\s*\}/.test(common),
     'the supplied signature value is never interpolated into a log line');
-  assert.match(common, /provided \? 'mismatched' : 'absent'/,
+  // 2026-10-06: the reason (missing_token / bad_secret / secret_unset) names
+  // which, never the value.
+  assert.match(common, /REJECTED ingest:.*\$\{decision\.reason\}/,
     'the rejection log distinguishes a wrong signature from a missing one, without printing either');
 });
 

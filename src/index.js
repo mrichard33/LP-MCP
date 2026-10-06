@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import { makeAuthenticate } from './auth.js';
+import { checkRequestSecret, rejectionBody, logAuthBootReport } from './security/request-auth.js';
 import crypto from 'node:crypto';
 import express from 'express';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -409,6 +410,9 @@ const AUTH_SOFT_LAUNCH = process.env.AUTH_SOFT_LAUNCH === 'true';
 // The standard operator auth. Lives in src/auth.js so route modules can be
 // tested against the real check (2026-09-23); behaviour is unchanged.
 const authenticate = makeAuthenticate({ token: MCP_AUTH_TOKEN, softLaunch: AUTH_SOFT_LAUNCH });
+// Boot report (2026-10-06): AUTH_ENFORCE_MODE, soft launch, and the NAMES of
+// unset webhook / operator secrets (never values). See src/security/request-auth.js.
+logAuthBootReport();
 
 // Boot-time schema mirrors. The blocks live in src/admin/startup-mirrors.js
 // (moved verbatim 2026-09-26); src/admin/startup-schema.js reads the catalog
@@ -589,8 +593,10 @@ app.get('/sync/status', authenticate, async (req, res) => {
 app.get('/lp/test', authenticate, async (req, res) => { try { res.json(await testConnection()); } catch (err) { res.status(500).json({ error: err.message }); } });
 
 app.post('/webhook/lp', async (req, res) => {
-  const webhookSecret = process.env.N8N_WEBHOOK_SECRET;
-  if (webhookSecret) { const p = req.headers['x-webhook-secret'] || req.query.secret; if (p !== webhookSecret) return res.status(401).json({ error: 'Invalid webhook secret' }); }
+  // Staged auth (2026-10-06, src/security/request-auth.js): open when unset
+  // and `?secret=` accepted only under AUTH_ENFORCE_MODE=log.
+  const auth = checkRequestSecret(req, { route: '/webhook/lp', secret: process.env.N8N_WEBHOOK_SECRET, headers: ['x-webhook-secret'], allowQuery: true });
+  if (!auth.allow) return res.status(auth.status).json(auth.status === 401 ? { error: 'Invalid webhook secret' } : rejectionBody(auth));
   const event = req.body.event || req.headers['x-lp-event'] || 'lead.updated';
   const payload = req.body.data || req.body;
   res.json({ status: 'accepted', event });
