@@ -40,9 +40,11 @@ test('mode defaults to shadow; config defaults', () => {
   assert.equal(routingMode({ BOOKED_DIAL_ROUTING_MODE: 'lvie' }), 'shadow');
   assert.deepEqual(cfg.removeLists, ['LP_ASAP', 'Reece Chatbot', 'Direct Lead Entry', 'After DIAL ASAP']);
   assert.deepEqual([...cfg.skipDsp], ['CXL', 'Reset', 'NoShow']);
-  assert.equal(cfg.autoRemove, false);
-  assert.equal(routingConfig({ BOOKED_ROUTING_AUTO_REMOVE: 'yes' }).autoRemove, false, 'only the literal true');
+  // Automatic by default (Mark's standing exception, 2026-10-06); only 'false' turns approval back on.
+  assert.equal(cfg.autoRemove, true);
   assert.equal(routingConfig({ BOOKED_ROUTING_AUTO_REMOVE: 'true' }).autoRemove, true);
+  assert.equal(routingConfig({ BOOKED_ROUTING_AUTO_REMOVE: 'False' }).autoRemove, false);
+  assert.equal(routingConfig({ BOOKED_ROUTING_AUTO_REMOVE: 'no' }).autoRemove, true, 'only the literal false rolls back');
   assert.throws(() => routingConfig({ NEW_LEAD_BACKSTOP_LIST_NEXT_DAY: 'lp_asap' }), /LP owns that list/);
 });
 
@@ -193,9 +195,10 @@ test('addState reads any rule\'s Confirmation adds', () => {
 
 /* --- the actions ---------------------------------------------------------------- */
 
-test('removal requires approval unless BOOKED_ROUTING_AUTO_REMOVE=true; expires at the appointment', () => {
+test('removal runs automatically unless BOOKED_ROUTING_AUTO_REMOVE=false; expires at the appointment', () => {
   const c = cand();
-  const row = buildRemovalAction(c, { reason: 'appt_in_2_days', confList: 'Conf - 2nd Day', cfg, nowMs: edt('2026-10-06T16:05:00') });
+  const approval = routingConfig({ BOOKED_ROUTING_AUTO_REMOVE: 'false' });
+  const row = buildRemovalAction(c, { reason: 'appt_in_2_days', confList: 'Conf - 2nd Day', cfg: approval, nowMs: edt('2026-10-06T16:05:00') });
   assert.equal(row.requires_approval, true);
   assert.equal(row.status, 'pending_approval');
   assert.equal(row.rule_applied, RULE_KEY);
@@ -203,7 +206,7 @@ test('removal requires approval unless BOOKED_ROUTING_AUTO_REMOVE=true; expires 
   assert.deepEqual(row.action_payload.list_names, cfg.removeLists);
   assert.deepEqual(row.action_payload.values, ['9414670700']);
   assert.equal(row.action_payload.approval_expires_at, '2026-10-08T22:00:00.000Z');
-  const auto = buildRemovalAction(c, { reason: 'x', confList: 'Conf - 2nd Day', cfg: routingConfig({ BOOKED_ROUTING_AUTO_REMOVE: 'true' }), nowMs: 0 });
+  const auto = buildRemovalAction(c, { reason: 'x', confList: 'Conf - 2nd Day', cfg, nowMs: 0 });
   assert.equal(auto.requires_approval, false);
   assert.equal(auto.status, 'pending');
 });
@@ -236,15 +239,17 @@ test('"not on the list" is a no-op: listRecordsDeleted 0 parses as zero', () => 
   assert.equal(listRecordsDeletedFrom('<x/>'), null);
 });
 
-test('executor: a removal is refused unarmed unless it is this rule AND the standing exception is on', async () => {
+test('executor: an unarmed removal runs only for this rule, and BOOKED_ROUTING_AUTO_REMOVE=false refuses it', async () => {
   const unarmed = (rule) => ({ action_type: 'five9_delete_record_from_list', requires_approval: false, rule_applied: rule, action_payload: {} });
   const prev = process.env.BOOKED_ROUTING_AUTO_REMOVE;
   try {
+    process.env.BOOKED_ROUTING_AUTO_REMOVE = 'false';
+    await assert.rejects(() => executeFive9Write(unarmed(RULE_KEY)), /must be queued with requires_approval=true/, 'rollback switch');
     delete process.env.BOOKED_ROUTING_AUTO_REMOVE;
-    await assert.rejects(() => executeFive9Write(unarmed(RULE_KEY)), /must be queued with requires_approval=true/);
-    process.env.BOOKED_ROUTING_AUTO_REMOVE = 'true';
+    // Another rule's removal is never carved out.
     await assert.rejects(() => executeFive9Write(unarmed('SOMETHING_ELSE')), /must be queued with requires_approval=true/);
-    // Past the approval gate: fails on its own payload validation instead.
+    await assert.rejects(() => executeFive9Write(unarmed(undefined)), /must be queued with requires_approval=true/);
+    // Default: past the approval gate — fails on its own payload validation instead.
     await assert.rejects(() => executeFive9Write(unarmed(RULE_KEY)), /requires action_payload\.list_name or list_names/);
   } finally {
     if (prev === undefined) delete process.env.BOOKED_ROUTING_AUTO_REMOVE; else process.env.BOOKED_ROUTING_AUTO_REMOVE = prev;
@@ -351,13 +356,14 @@ test('live: add first; removal only after the add completed; a duplicate pass ad
   await runBookedDialRouting({ env: LIVE, nowMs: t1 + 60_000, deps: h.deps });
   assert.equal(h.actions.length, 1);
 
-  // The executor completes the add → next pass queues the removal, behind approval.
+  // The executor completes the add → next pass queues the removal, automatically (standing exception).
   h.actions[0].status = 'completed';
   await runBookedDialRouting({ env: LIVE, nowMs: t1 + 5 * 60_000, deps: h.deps });
   assert.equal(h.actions.length, 2);
   assert.equal(h.actions[1].action_type, 'five9_delete_record_from_list');
-  assert.equal(h.actions[1].requires_approval, true);
-  assert.equal(h.actions[1].status, 'pending_approval');
+  assert.equal(h.actions[1].requires_approval, false);
+  assert.equal(h.actions[1].status, 'pending');
+  assert.equal(h.actions[1].rule_applied, RULE_KEY);
   assert.deepEqual(h.logs.filter((l) => l.agent_action_id).map((l) => l.action), ['added', 'remove_queued']);
 
   // And not again that day.
@@ -385,13 +391,21 @@ test('live: a failed add is retried once, then #contact-center is told once — 
   assert.equal(h.posts.length, 1, 'told once');
 });
 
+test('rollback: BOOKED_ROUTING_AUTO_REMOVE=false queues the removal for approval', async () => {
+  __resetLoggedForTests();
+  const h = harness({ inbound: [{ ...SHELLEY_RAW, apptdate: '10/11/2026' }] });
+  await runBookedDialRouting({ env: { ...LIVE, BOOKED_ROUTING_AUTO_REMOVE: 'false' }, nowMs: edt('2026-10-06T16:00:00'), deps: h.deps });
+  assert.equal(h.actions[0].requires_approval, true);
+  assert.equal(h.actions[0].status, 'pending_approval');
+});
+
 test('live: a visit 5 days out comes off the setter lists right away, no add', async () => {
   __resetLoggedForTests();
   const h = harness({ inbound: [{ ...SHELLEY_RAW, apptdate: '10/11/2026' }] });
   await runBookedDialRouting({ env: LIVE, nowMs: edt('2026-10-06T16:00:00'), deps: h.deps });
   assert.deepEqual(h.actions.map((a) => a.action_type), ['five9_delete_record_from_list']);
   assert.deepEqual(h.actions[0].action_payload.list_names, cfg.removeLists);
-  assert.equal(h.actions[0].requires_approval, true);
+  assert.equal(h.actions[0].requires_approval, false);
   assert.equal(h.actions[0].action_payload.reason, 'appt_3plus_days');
   assert.match(describeApprove(h.actions[0], { contactName: 'Shelley' }), /3\+ days out; the number goes on a confirmation list two days before it/);
 });

@@ -33,16 +33,17 @@
 //   Day add has completed, the number comes off "Conf - 2nd Day" too, so one
 //   visit never gets two confirmation calls. Same approval path.
 //
-// APPROVAL (decision #1057; follows CANON.STD.015 / CANON.RULE.064, canonical
-//   candidates): five9_add_records_to_list is the only auto-approved Five9
-//   write, so the Confirmation add uses it. Removing a record from a list is
-//   NOT, so every removal is queued requires_approval=true, status
-//   pending_approval: the existing approval card names the phone, the person,
-//   the appointment, the exact lists and why. The approval is bound to that
-//   payload and expires at the appointment time (approval_expires_at; the
-//   executor refuses an expired one — CANON.EVALT.056). BOOKED_ROUTING_AUTO_REMOVE
-//   =true lifts the approval for THIS rule only; Mark sets it after reviewing
-//   shadow output and recording a standing exception.
+// APPROVAL — none, by Mark's standing exception (2026-10-06, to decision
+//   #1057): "If we're adding to one list, we should be able to automatically
+//   remove it from the other list." Removals from THIS rule run unarmed, like
+//   the Confirmation add (five9_add_records_to_list). The exception is keyed on
+//   rule_applied = BOOKED_DIAL_ROUTING, never on the action type, so a removal
+//   queued by anything else still needs approval. Rollback:
+//   BOOKED_ROUTING_AUTO_REMOVE=false puts every removal back behind the
+//   approval card (pending_approval; the card names the phone, the person, the
+//   appointment, the exact lists and why). Either way the row carries
+//   approval_expires_at = the visit, and the executor skips a removal that runs
+//   after it (CANON.EVALT.056, canonical candidate).
 //
 // LP RE-ADDS: LP repopulates its lists at 6 AM ET and can push the inquiry
 //   back onto LP_ASAP. The removal claim is per appointment PER DAY, so each
@@ -97,8 +98,9 @@ export function routingConfig(env = process.env) {
     conf,
     removeLists: csv(env.BOOKED_ROUTING_REMOVE_LISTS, DEFAULT_REMOVE_LISTS),
     skipDsp: new Set(csv(env.BOOKED_ROUTING_SKIP_DSP, DEFAULT_SKIP_DSP)),
-    // Only the literal 'true' — anything else keeps every removal behind approval.
-    autoRemove: String(env.BOOKED_ROUTING_AUTO_REMOVE ?? '').trim().toLowerCase() === 'true',
+    // ON unless set to exactly 'false' (Mark's standing exception, 2026-10-06).
+    // Mirrored by the executor's carve-out in src/actions/handlers/five9.js.
+    autoRemove: String(env.BOOKED_ROUTING_AUTO_REMOVE ?? '').trim().toLowerCase() !== 'false',
     lookbackHours: num(env.BOOKED_ROUTING_LOOKBACK_HOURS, 72, 1),
     maxAdds: num(env.BOOKED_ROUTING_MAX_ADDS, 20, 0),
     maxRemovals: num(env.BOOKED_ROUTING_MAX_REMOVALS, 20, 0),
@@ -312,9 +314,9 @@ export function visitText(c) {
 }
 
 /**
- * The five9_delete_record_from_list row. requires_approval unless the
- * standing exception (BOOKED_ROUTING_AUTO_REMOVE) is on. The approval binds to
- * this payload and expires at the appointment.
+ * The five9_delete_record_from_list row. Runs unarmed (Mark's standing
+ * exception) unless BOOKED_ROUTING_AUTO_REMOVE=false, which queues it for
+ * approval instead. Either way it expires at the appointment.
  */
 export function buildRemovalAction(c, { reason, readded = false, confList = null, lists = null, cfg, nowMs }) {
   const expires = apptExpiryMs(c);

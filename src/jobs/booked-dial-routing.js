@@ -13,7 +13,8 @@
 //           Five9 action rows, no marks, no Slack.
 //   live    claim, then queue: the Confirmation add (auto-approved carve-out,
 //           #1057) and, on a later pass once it completed, the removal
-//           (requires approval unless BOOKED_ROUTING_AUTO_REMOVE=true).
+//           (automatic, Mark's standing exception; BOOKED_ROUTING_AUTO_REMOVE=false
+//           puts it back behind approval).
 //   Anything unrecognised is `shadow`.
 //
 // FAIL CLOSED ON READS

@@ -166,10 +166,11 @@ there (an unissued inquiry waits). Mark's exceptions (2026-10-06 follow-up): a C
 right away (the 3+ day one is added two days before). A failed add is retried ONCE, then #contact-center is told (once per
 visit). A visit that moved from "2nd Day" to "Next Day" comes off "Conf - 2nd Day" once the Next Day add completed. While
 `BOOKED_DIAL_ROUTING_MODE=live` (and only then) the new-lead backstop holds 3+ day visits instead of pushing them. The
-removal is `five9_delete_record_from_list` with `list_names`, `requires_approval` and `approval_expires_at` = the visit;
-the executor skips it after that. `BOOKED_ROUTING_AUTO_REMOVE=true` is the only way around the approval, and only for rule
-`BOOKED_DIAL_ROUTING` — Mark sets it after a recorded standing exception (#1057), never us. Every decision is in
-`booked_dial_routing_log`.
+removal is `five9_delete_record_from_list` with `list_names` and `approval_expires_at` = the visit (the executor skips it
+after that). It runs WITHOUT approval by Mark's standing exception to #1057 (2026-10-06: "If we're adding to one list, we
+should be able to automatically remove it from the other list"), keyed on rule `BOOKED_DIAL_ROUTING` only — any other
+list removal still needs approval. `BOOKED_ROUTING_AUTO_REMOVE=false` is the rollback to approval cards. Every decision is
+in `booked_dial_routing_log`.
 
 **The LP note is a 2–3 sentence rep brief (the user, 2026-10-05).** Prospect 462947 reached LP with 1,400
 characters: the address three times, "tomorrow" for the visit, a script with a blank ("this is [YOUR NAME]"), internal
