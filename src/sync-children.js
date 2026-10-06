@@ -1021,14 +1021,31 @@ export async function syncJobAndMilestones(job, lpLeadId, ghlContactId, opts = {
     }
   }
 
-  if (msRows.length) {
+  // One bulk upsert PER KEY SHAPE (2026-10-06). A suppressed row carries
+  // ghl_tag_fired / tag_suppressed_backfill / tag_suppressed_at and a plain
+  // row does not. Sent as one array, PostgREST writes the union of the keys and
+  // fills the gaps with NULL, so a job with both kinds of row failed the
+  // tag_suppressed_backfill NOT NULL on every sync (an ERROR line in the
+  // Postgres log, then the per-row fallback below did the real work). Do NOT
+  // "fix" it by giving plain rows tag_suppressed_backfill:false — ON CONFLICT
+  // would then overwrite an existing row's true marks (and null its
+  // ghl_tag_fired), and the milestones.js sweeper re-fires those tags (#512).
+  // Grouping by shape writes exactly the columns each row sets, as the per-row
+  // path always did.
+  const msBatches = new Map();
+  for (const row of msRows) {
+    const shape = Object.keys(row).sort().join(',');
+    if (!msBatches.has(shape)) msBatches.set(shape, []);
+    msBatches.get(shape).push(row);
+  }
+  for (const batch of msBatches.values()) {
     const { error: bulkErr } = await supabase.from('lp_job_milestones')
-      .upsert(msRows, { onConflict: 'lp_job_id, mdt_id', ignoreDuplicates: false });
+      .upsert(batch, { onConflict: 'lp_job_id, mdt_id', ignoreDuplicates: false });
     if (bulkErr) {
       // Fall back to per-row upserts so one bad row can't drop the whole job's
       // milestones (preserves the pre-batch fault isolation).
       console.warn(`[Sync] Milestone bulk upsert failed for job ${jobId} (${bulkErr.message}) — falling back to per-row`);
-      for (const row of msRows) {
+      for (const row of batch) {
         try {
           await supabase.from('lp_job_milestones').upsert(row, { onConflict: 'lp_job_id, mdt_id', ignoreDuplicates: false });
         } catch (err) {

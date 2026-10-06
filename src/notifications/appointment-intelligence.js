@@ -104,6 +104,33 @@ async function loadDecodedContact(contactId) {
   };
 }
 
+// 2026-10-06: these selects named columns the tables never had (lp_notes.body,
+// lp_call_logs.outcome / duration / call_type / notes, lp_activities.notes,
+// lp_notes.rep_name). PostgREST rejects the whole query on the first unknown
+// column, so every appointment card went out with NO calls, notes or
+// activities — and, because the error was never read, that looked exactly
+// like a lead with no history. The real columns are aliased back to the keys
+// the body builders and timeline already read, so nothing downstream moves.
+// Real names: see LP_CALL_COLUMNS / LP_NOTE_COLUMNS in src/tools/lead-tools.js.
+const RECENT_CALL_COLUMNS =
+  'lp_lead_id, call_date, outcome:call_result, duration:call_duration_sec, rep_name, ' +
+  'call_type:call_direction, notes:call_notes';
+const RECENT_NOTE_COLUMNS = 'lp_lead_id, created_at_lp, note_body, rep_name:created_by_rep_name';
+const RECENT_ACTIVITY_COLUMNS = 'lp_lead_id, activity_date, activity_type, notes:activity_detail, rep_name';
+
+/**
+ * A failed child read still returns `data: null`, which `|| []` turns into
+ * "no history". Say so in the logs so a broken read is never mistaken for a
+ * quiet lead. The card still builds — the rest of the context is useful.
+ */
+function logChildReadErrors(where, contactId, results) {
+  for (const [name, res] of Object.entries(results)) {
+    if (res?.error) {
+      console.error(`[AppointmentIntel] ${where} ${name} read failed for ${contactId}: ${res.error.message}`);
+    }
+  }
+}
+
 /**
  * LP record + recent calls + recent notes + recent activities for one
  * GHL contact. Joins via lp_leads.ghl_contact_id (one prospect may
@@ -132,23 +159,24 @@ async function loadLeadSummary(contactId) {
   const [calls, notes, activities] = await Promise.all([
     supabase
       .from('lp_call_logs')
-      .select('lp_lead_id, call_date, outcome, duration, rep_name, call_type, notes')
+      .select(RECENT_CALL_COLUMNS)
       .in('lp_lead_id', leadIds)
       .order('call_date', { ascending: false })
       .limit(10),
     supabase
       .from('lp_notes')
-      .select('lp_lead_id, created_at_lp, note_body, body, rep_name')
+      .select(RECENT_NOTE_COLUMNS)
       .in('lp_lead_id', leadIds)
       .order('created_at_lp', { ascending: false })
       .limit(10),
     supabase
       .from('lp_activities')
-      .select('lp_lead_id, activity_date, activity_type, notes')
+      .select(RECENT_ACTIVITY_COLUMNS)
       .in('lp_lead_id', leadIds)
       .order('activity_date', { ascending: false })
       .limit(10),
   ]);
+  logChildReadErrors('lead_summary', contactId, { calls, notes, activities });
 
   // 2026-09-30 (fix/demo-truth): the body generators read lead.demo_completed
   // as "has this person EVER had an in-home estimate". That is demo truth
@@ -187,23 +215,24 @@ async function loadContactTimeline(contactId) {
     const [calls, notes, activities] = await Promise.all([
       supabase
         .from('lp_call_logs')
-        .select('lp_lead_id, call_date, outcome, duration, rep_name, call_type')
+        .select(RECENT_CALL_COLUMNS)
         .in('lp_lead_id', leadIds)
         .order('call_date', { ascending: false })
         .limit(TIMELINE_LIMIT),
       supabase
         .from('lp_notes')
-        .select('lp_lead_id, created_at_lp, note_body, body, rep_name')
+        .select(RECENT_NOTE_COLUMNS)
         .in('lp_lead_id', leadIds)
         .order('created_at_lp', { ascending: false })
         .limit(TIMELINE_LIMIT),
       supabase
         .from('lp_activities')
-        .select('lp_lead_id, activity_date, activity_type')
+        .select(RECENT_ACTIVITY_COLUMNS)
         .in('lp_lead_id', leadIds)
         .order('activity_date', { ascending: false })
         .limit(TIMELINE_LIMIT),
     ]);
+    logChildReadErrors('timeline', contactId, { calls, notes, activities });
 
     for (const row of calls.data || []) {
       const dur = row.duration ? ` (${row.duration}s)` : '';
@@ -215,7 +244,7 @@ async function loadContactTimeline(contactId) {
       });
     }
     for (const row of notes.data || []) {
-      const body = String(row.note_body || row.body || '').trim();
+      const body = String(row.note_body || '').trim();
       events.push({
         ts: row.created_at_lp,
         type: 'note',

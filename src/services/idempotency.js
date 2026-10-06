@@ -9,8 +9,9 @@
  *   {entity_id}:evt-{event_id}    for everything else
  *
  * Behavior:
- *   - tryClaimEvent INSERTs into processed_events. On 23505 unique-violation
- *     it returns { claimed: false, reason: 'already_processed' } — caller
+ *   - tryClaimEvent INSERTs into processed_events with ON CONFLICT DO
+ *     NOTHING. When no row comes back the key was already claimed and it
+ *     returns { claimed: false, reason: 'already_processed' } — caller
  *     should skip.
  *   - On any other DB error we fail OPEN (claimed: true) so infra issues
  *     don't block the engine. The duplicate-event risk is bounded by the
@@ -34,22 +35,27 @@ export function buildIdempotencyKey(event) {
 export async function tryClaimEvent(event) {
   if (!supabase) return { claimed: true, key: null, reason: 'no_supabase' };
   const key = buildIdempotencyKey(event);
-  const { error } = await supabase
+  // ON CONFLICT DO NOTHING rather than insert-and-catch-23505 (2026-10-06):
+  // the same claim, but a duplicate no longer writes an ERROR line to the
+  // Postgres log (409 of them in under five hours). A row back = claimed;
+  // no row back = someone already holds the key.
+  const { data, error } = await supabase
     .from('processed_events')
-    .insert({
+    .upsert({
       idempotency_key: key,
       contact_id: event.ghl_contact_id || event.entity_id || 'unknown',
       message_id: event.payload?.message_id || null,
       event_type: event.event_type,
       source_event_id: event.id,
-    });
+    }, { onConflict: 'idempotency_key', ignoreDuplicates: true })
+    .select('idempotency_key');
 
-  if (error?.code === '23505') {
-    return { claimed: false, key, reason: 'already_processed' };
-  }
   if (error) {
     console.error(`[idempotency] claim error for key=${key}: ${error.message}`);
     return { claimed: true, key, reason: 'claim_error_open' };
+  }
+  if (!data || data.length === 0) {
+    return { claimed: false, key, reason: 'already_processed' };
   }
   return { claimed: true, key };
 }

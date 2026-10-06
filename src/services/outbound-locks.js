@@ -35,14 +35,17 @@ export async function tryAcquireLock({ contact_id, trigger_id, sender, message_p
   const lock_key = `${contact_id}:${trigger_id}`;
   const expires_at = new Date(Date.now() + ttl_seconds * 1000).toISOString();
   // Recorded for observability only — which action priority holds the slot.
-  // NOT used to preempt: a live holder always wins (see 23505 branch below).
+  // NOT used to preempt: a live holder always wins (see the no-row branch below).
   // Preempt-and-resend was tried and reverted — it double-sent because an
   // already-delivered SMS cannot be recalled (Mark Test, evt-1575527).
   const holder_priority = Number.isFinite(priority) ? priority : null;
 
-  const { error } = await supabase
+  // ON CONFLICT DO NOTHING rather than insert-and-catch-23505 (2026-10-06):
+  // the same claim, without an ERROR line in the Postgres log per held key.
+  // A row back = we inserted it; no row back = the key already exists.
+  const { data: inserted, error } = await supabase
     .from('outbound_locks')
-    .insert({
+    .upsert({
       lock_key,
       contact_id: String(contact_id),
       trigger_id: String(trigger_id),
@@ -50,9 +53,10 @@ export async function tryAcquireLock({ contact_id, trigger_id, sender, message_p
       message_preview: message_preview ? String(message_preview).slice(0, 200) : null,
       holder_priority,
       expires_at,
-    });
+    }, { onConflict: 'lock_key', ignoreDuplicates: true })
+    .select('lock_key');
 
-  if (error?.code === '23505') {
+  if (!error && (!inserted || inserted.length === 0)) {
     const { data } = await supabase
       .from('outbound_locks')
       .select('sender, expires_at, released_at, acquired_at, holder_priority')
