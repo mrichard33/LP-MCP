@@ -137,6 +137,16 @@ const CASES = [
     mustNot: /—/,
   },
   {
+    // The clean-up ran before the guards, so a sentence a later guard dropped
+    // could leave two stock openers side by side. The bot gate's
+    // spouse/livechat: "Got it. That makes sense. She'll want to see…".
+    id: 'stacked_opener_after_a_guard_drop',
+    incident: '2026-10-06 bot gate: "Got it. That makes sense." shipped (human_voice:stacked_opener)',
+    inbound: 'She has to see it before we decide',
+    draft: 'Got it. Most projects run about $89 per month with no money down. That makes sense. How long have the windows been bothering you both?',
+    mustNot: /That makes sense/,
+  },
+  {
     id: 'two_asks',
     incident: '2026-10-02: one ask per message, both bots',
     inbound: 'I need new windows',

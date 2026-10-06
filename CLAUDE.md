@@ -388,6 +388,8 @@ user, 2026-10-06).** The old exception kept any dash found in the prompt, so an 
 ("Every home is different — …") shipped with its dashes and failed the gate. The locked lines (belief
 stack, category truth, the AI disclosure) lost their dashes at the source
 (`sql/seeds/2026-10-06_no_dashes_locked_lines.sql`); never add a dash back to a locked line or a fixed line.
+It runs first AND once more as the last pass before a send (`final_pass`): a sentence a later guard drops
+can leave two openers side by side ("Got it. That makes sense.", bot gate 2026-10-06).
 
 **NEPQ is enforced in code, not only in the prompt (Mark, 2026-10-02).** `src/agentic/nepq-planner.js`
 plans ONE move per turn for both bots (`planNepqTurn`): a person takes over on a complaint, a price asked

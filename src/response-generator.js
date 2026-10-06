@@ -4784,6 +4784,14 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       validated.message = scope.text;
       if (scope.reason === 'lead_asked' && validated.companion_action?.action_type === 'book_appointment') validated.companion_action = null;
     }
+    // Human voice once more, last (2026-10-06 bot gate): the first pass runs
+    // before the NEPQ and booking guards, and a sentence they drop can leave
+    // two stock openers side by side. It only deletes, so it never undoes a guard.
+    const voiceLast = humanizeReply(validated.message);
+    if (voiceLast.changes.length) {
+      console.log(`[HumanVoice] ${contactId} final_pass ${voiceLast.changes.join(',')}`);
+      validated.message = voiceLast.text;
+    }
   }
 
   // ─── Patch budget (Part 6, 2026-10-02) ───
