@@ -276,6 +276,7 @@ function harness({ inbound = [SHELLEY_RAW], soldPhones = [], dnc = [], contactLi
   const logs = [];
   const posts = [];
   const postedKeys = new Set();
+  const markReads = [];
   let nextId = 1000;
   const state = { addRows: [...addRows] };
   const supabase = {
@@ -287,7 +288,21 @@ function harness({ inbound = [SHELLEY_RAW], soldPhones = [], dnc = [], contactLi
       }
       if (name === 'lp_appointment_sync_marks') {
         return {
-          select: () => ({ in: async (_c, keys) => ({ data: keys.filter((k) => marks.has(k)).map((k) => ({ dedup_key: k })), error: null }) }),
+          // The job reads its claims by prefix + age in pages (readBookedMarks).
+          select: () => {
+            const q = { prefix: null };
+            const chain = {
+              like: (_c, pat) => { q.prefix = pat.replace(/%$/, ''); return chain; },
+              gte: () => chain,
+              order: () => chain,
+              range: async (from, to) => {
+                markReads.push({ from, to });
+                const all = [...marks.keys()].filter((k) => k.startsWith(q.prefix)).sort();
+                return { data: all.slice(from, to + 1).map((k) => ({ dedup_key: k })), error: null };
+              },
+            };
+            return chain;
+          },
           upsert: (r) => ({ select: async () => (marks.has(r.dedup_key) ? { data: [], error: null } : (marks.set(r.dedup_key, r), { data: [{ dedup_key: r.dedup_key }], error: null })) }),
           delete: () => ({ in: async (_c, keys) => { for (const k of keys) marks.delete(k); return { error: null }; } }),
         };
@@ -316,7 +331,7 @@ function harness({ inbound = [SHELLEY_RAW], soldPhones = [], dnc = [], contactLi
   };
   const contactRes = (list) => ({ records: [{ fields: ['number1', 'lead_id', 'f9_last_list'], records: [{ values: { data: ['9414670700', '581671', list] } }] }] });
   return {
-    marks, actions, logs, state, posts,
+    marks, actions, logs, state, posts, markReads,
     setContactList: (l) => { contactList = l; },
     deps: {
       supabase, runSQL,
@@ -511,4 +526,32 @@ test('a failed read queues nothing', async () => {
 test('prior removal keys cover the previous days, not today', () => {
   const keys = priorRemoveKeys('9414670700', '2026-10-08', edt('2026-10-07T08:00:00'), 2);
   assert.deepEqual(keys, ['booked-remove:9414670700:2026-10-08:2026-10-06', 'booked-remove:9414670700:2026-10-08:2026-10-05']);
+});
+
+test('claims are read in ONE small request however many leads there are (2026-10-06: ~3,000 keys by name killed every pass)', async () => {
+  __resetLoggedForTests();
+  const many = Array.from({ length: 400 }, (_, i) => ({
+    ...SHELLEY_RAW, id: String(500000 + i), lds_id: String(600000 + i), cst_id: String(700000 + i),
+    phone: `(941)5${String(i).padStart(6, '0')}`, datereceived: '2026-10-06T10:00:00',
+  }));
+  const h = harness({ inbound: many });
+  h.marks.set('dial-backstop:1:conf-next-day', {}); // another job's claim: never read
+  const res = await runBookedDialRouting({ env: {}, nowMs: edt('2026-10-06T16:00:00'), deps: h.deps });
+  assert.equal(res.ok, true, res.errors.join());
+  assert.equal(h.markReads.length, 1);
+  assert.equal(res.counts.would_add, 20, 'capped by BOOKED_ROUTING_MAX_ADDS');
+});
+
+test('the claim read pages until a short page', async () => {
+  const { readBookedMarks } = await import('../src/jobs/booked-dial-routing.js');
+  const keys = Array.from({ length: 2500 }, (_, i) => `booked-remove:${i}`);
+  const calls = [];
+  const db = { from: () => ({ select: () => {
+    const chain = { like: () => chain, gte: () => chain, order: () => chain,
+      range: async (from, to) => { calls.push(from); return { data: keys.slice(from, to + 1).map((k) => ({ dedup_key: k })), error: null }; } };
+    return chain;
+  } }) };
+  const seen = await readBookedMarks(db, Date.now());
+  assert.equal(seen.size, 2500);
+  assert.deepEqual(calls, [0, 1000, 2000]);
 });
