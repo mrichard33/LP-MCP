@@ -339,6 +339,17 @@ export const JOBS = Object.freeze([
     isEnabled: (env) => String(env.INBOUND_CHECKOUT_WATCH_MODE || 'shadow').toLowerCase().trim() !== 'off',
   },
   {
+    id: 'booked-dial-routing',
+    label: 'Booked leads → Confirmation list, then off the DIAL ASAP setter lists (decision #2669)',
+    group: 'five9',
+    cadence: 'every 5 min, 24/7 (right after inbound-checkout-watch)',
+    enabledEnv: 'BOOKED_DIAL_ROUTING_MODE',
+    // A MODE (2026-10-06): off | shadow | live, default shadow. Mirrors
+    // routingMode() in src/booked-dial-routing.js — only 'off' stops it.
+    enabledDefault: true,
+    isEnabled: (env) => String(env.BOOKED_DIAL_ROUTING_MODE || 'shadow').toLowerCase().trim() !== 'off',
+  },
+  {
     id: 'lead-leak-monitor',
     label: 'Lead leak monitor (uncalled LP leads)',
     group: 'five9',

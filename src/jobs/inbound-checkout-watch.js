@@ -30,6 +30,8 @@ import { runJob } from '../job-runner.js';
 import { upsertInboundQueue } from '../lp-inbound-queue.js';
 import { readInboundRows } from './new-lead-dial-backstop.js';
 import { etDateKey } from '../new-lead-dial-backstop.js';
+import { runBookedRoutingTick } from './booked-dial-routing.js';
+import { routingMode } from '../booked-dial-routing.js';
 import {
   watchMode, watchConfig, watchRow, classifyRow, assessWaiting, inOfficeHours, formatWaitCard, formatEscalateCard,
   writebackCandidates, writebackDecision, summarize, overnightKey, apptKey, checkedKey, GHL_FIELD_LP_LEAD_ID,
@@ -302,17 +304,26 @@ export async function runInboundCheckoutWatch({ env = process.env, nowMs = Date.
 let timer = null;
 let running = false;
 
-/** One pass, as its own job_runs row. */
+/**
+ * One watch pass, then the booked-lead routing pass right after it (it reads
+ * the mirror this pass just refreshed). Each is its own job_runs row, and a
+ * routing failure never touches the watch.
+ */
 export async function runInboundTick() {
   const { value: res } = await runJob(JOB_ID, () => runInboundCheckoutWatch());
   if (res && res.ok === false) console.warn(`[InboundWatch] pass finished with errors: ${res.errors.join('; ')}`);
   else if (res && !res.skipped && (res.due || res.posted?.wait)) console.log(`[InboundWatch] ${res.mode}: ${res.due} waiting past threshold, oldest ${res.oldest_wait_min} min`);
+  try {
+    await runBookedRoutingTick();
+  } catch (err) {
+    console.error(`[BookedRouting] pass threw: ${err.message}`);
+  }
 }
 
 export function startInboundCheckoutWatchScheduler(env = process.env) {
   if (timer) return timer;
-  if (watchMode(env) === 'off') {
-    console.log('[InboundWatch] scheduler not started (INBOUND_CHECKOUT_WATCH_MODE=off)');
+  if (watchMode(env) === 'off' && routingMode(env) === 'off') {
+    console.log('[InboundWatch] scheduler not started (INBOUND_CHECKOUT_WATCH_MODE=off and BOOKED_DIAL_ROUTING_MODE=off)');
     return null;
   }
   const tick = async () => {
@@ -328,7 +339,7 @@ export function startInboundCheckoutWatchScheduler(env = process.env) {
   };
   timer = setInterval(tick, INTERVAL_MS);
   if (typeof timer.unref === 'function') timer.unref();
-  console.log(`[InboundWatch] scheduler started — mode ${watchMode(env)}, every 5m, 24/7`);
+  console.log(`[InboundWatch] scheduler started — watch ${watchMode(env)}, booked routing ${routingMode(env)}, every 5m, 24/7`);
   return timer;
 }
 
