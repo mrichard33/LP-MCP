@@ -1270,7 +1270,7 @@ export function formatKbPackForPrompt(pack) {
   }
 
   if (Array.isArray(pack.belief_stack) && pack.belief_stack.length > 0) {
-    lines.push('LOCKED BELIEF STACK (Big Domino + Three Secrets — quote these lines VERBATIM, em-dashes included; never paraphrase):');
+    lines.push('LOCKED BELIEF STACK (Big Domino + Three Secrets: quote these lines VERBATIM; never paraphrase):');
     for (const d of pack.belief_stack) {
       lines.push(`  [${d.source_doc}]`);
       for (const ln of String(d.text).split('\n')) {

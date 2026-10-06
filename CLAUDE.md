@@ -382,9 +382,12 @@ from the same visitor is not sent (`superseded_by_newer_message`).
 banned em dashes for months and they shipped anyway, with "Got it. Great question." openers and "Just to
 understand… —" lead-ins. `HUMAN_VOICE_RULES` (`src/prompts/response-generator/banned.js`) tells the
 model; `humanizeReply` (`src/agentic/human-voice.js`) cleans what slips through, in the SMS generator
-and the live-chat guards. It only deletes or swaps punctuation and stock phrases, keeps a "— Name"
-sign-off, and leaves any sentence quoting a LOCKED KB line (found in the prompt) verbatim. Look for
-`[HumanVoice]` log lines.
+and the live-chat guards. It only deletes or swaps punctuation and stock phrases and keeps a "— Name"
+sign-off. Look for `[HumanVoice]` log lines. **No em dash survives, a quoted LOCKED line included (the
+user, 2026-10-06).** The old exception kept any dash found in the prompt, so an old KB price script
+("Every home is different — …") shipped with its dashes and failed the gate. The locked lines (belief
+stack, category truth, the AI disclosure) lost their dashes at the source
+(`sql/seeds/2026-10-06_no_dashes_locked_lines.sql`); never add a dash back to a locked line or a fixed line.
 
 **NEPQ is enforced in code, not only in the prompt (Mark, 2026-10-02).** `src/agentic/nepq-planner.js`
 plans ONE move per turn for both bots (`planNepqTurn`): a person takes over on a complaint, a price asked

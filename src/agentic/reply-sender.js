@@ -390,8 +390,9 @@ const HUMAN_CLAIM_PATTERNS = [
 // owner-approved disclosure opener (system-core.js APPROVED_DISCLOSURE_VARIANTS).
 // "Good question" is now a banned opener everywhere else; the guard's own
 // replacement body must not be the one message that still uses it.
+// 2026-10-06 (the user): no em dash in any bot line, so "Fair question." now.
 export const DISCLOSURE_FALLBACK =
-  "Fair question — I'm an AI assistant helping the Reece Windows & Doors team respond quickly. " +
+  "Fair question. I'm an AI assistant helping the Reece Windows & Doors team respond quickly. " +
   'A human team member reviews these conversations and can follow up directly.';
 
 /**

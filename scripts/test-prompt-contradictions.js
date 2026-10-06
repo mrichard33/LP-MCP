@@ -131,7 +131,11 @@ test('buildContextRow carries prompt_sha256 and resolved_model only when given',
   const withFp = buildContextRow({ ...base, prompt_sha256: 'a'.repeat(64), resolved_model: 'claude-sonnet-5-20260901' });
   assert.equal(withFp.prompt_sha256, 'a'.repeat(64));
   assert.equal(withFp.resolved_model, 'claude-sonnet-5-20260901');
-  assert.deepEqual(withoutFingerprintColumns(withFp), without);
+  // generated_at is stamped per call, and the two calls can straddle a
+  // millisecond (seen in a full `npm test` run, 2026-10-06).
+  const { generated_at: _a, ...stripped } = withoutFingerprintColumns(withFp);
+  const { generated_at: _b, ...plain } = without;
+  assert.deepEqual(stripped, plain);
 });
 
 test('a missing fingerprint column is recognised, so a send never fails on it', () => {

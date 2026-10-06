@@ -53,11 +53,18 @@ test('a "— Name" sign-off and an en dash range are left alone', () => {
   assert.equal(h('Got it — the slider. How long has it been sticking? — Randy').text, 'Got it. The slider. How long has it been sticking? — Randy');
 });
 
-test('a LOCKED KB line keeps its em dashes verbatim', () => {
+// 2026-10-06 (the user): no long dashes anywhere, locked lines included. The
+// locked lines lost their dashes at the source (sql/seeds/2026-10-06_no_dashes_locked_lines.sql),
+// so there is nothing left to protect, and a quoted KB passage no longer keeps
+// a dash the reply checks then fail (the gate's financing/livechat em_dash).
+test('an em dash is fixed even when the model quoted it from the prompt', () => {
   const keepText = 'BIG DOMINO (locked): Protected before the storm — documented after it.';
   const t = 'Here is how we put it: protected before the storm — documented after it. Want to see how?';
-  assert.equal(h(t, { keepText }).text, t);
-  assert.notEqual(h(t).text, t, 'without the locked line it is fixed');
+  assert.equal(h(t, { keepText }).text, h(t).text);
+  assert.ok(!h(t, { keepText }).text.includes('—'));
+  const price = 'Every home is different — window sizes, openings, code requirements — so a real number needs an in-home measurement. What got you looking?';
+  const kb = 'Response: "Every home is different — window sizes, openings, glass type — so we do an In-Home Assessment';
+  assert.ok(!h(price, { keepText: kb }).text.includes('—'), 'the 2026-10-06 gate failure');
 });
 
 test('never empties a reply and never loses its question', () => {
