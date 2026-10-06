@@ -258,6 +258,17 @@ test('invariants: "about a month" is time, not a price; "89 a month" is a price'
   }
 });
 
+test('invariants: a promise that WE will call is backed; only an unasked OFFER fails', () => {
+  // 2026-10-06 gate run: four hand-offs ("I'll have someone from our team call
+  // you") were failed as unasked offers. Every sent promise is filed
+  // (promisedCallback → call_promise_backed), so only an offer counts.
+  const ctx = { channel: 'sms', inbound: 'Your rep never showed up yesterday', conversation: [] };
+  assert.equal(checkReply("I'm sorry. I've flagged this, and someone from our team will call you tomorrow at 9 AM ET.", ctx).violations.some(v => v.code === 'unasked_call_offer'), false);
+  for (const offer of ['Want someone to give you a call and go over it?', "A quick call would let us figure out what's happening. What day works best for the visit?"]) {
+    assert.ok(checkReply(offer, ctx).violations.some(v => v.code === 'unasked_call_offer'), offer);
+  }
+});
+
 test('invariants: unknown context is skipped, never guessed', () => {
   const r = checkReply("You're all set for Tuesday at 2 PM.", { channel: 'sms' });
   assert.ok(r.skipped.includes('booking_claim'), 'booked unknown → the claim check is skipped');
