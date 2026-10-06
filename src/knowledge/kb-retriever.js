@@ -222,7 +222,10 @@ async function runVectorTier(messageText, pack, mode, getQueryEmbedding = null) 
     const res = await withTimeout(
       (async () => {
         const queryEmbedding = getQueryEmbedding ? await getQueryEmbedding() : null;
-        return searchKnowledge(messageText, { limit: KB_VECTOR_LIMIT, queryEmbedding });
+        // AI OS batch 1 PR 1: this tier feeds the reply writers (SMS, email,
+        // live chat), so it asks for customer scope (reece_* docs only under
+        // KB_CUSTOMER_SCOPE_MODE=live; see vector-search.js v1.3).
+        return searchKnowledge(messageText, { limit: KB_VECTOR_LIMIT, queryEmbedding, customerScope: true });
       })(),
       KB_VECTOR_TIMEOUT_MS,
       'kb vector search',

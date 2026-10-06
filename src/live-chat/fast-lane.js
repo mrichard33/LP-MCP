@@ -173,6 +173,42 @@ export function liveChatQuietMs(env = process.env) {
   return Number.isFinite(raw) && raw >= 0 ? raw : 3000;
 }
 
+// ── the KB intent for chat (2026-10-06, AI OS batch 1 PR 1) ──────────────
+//
+// fast-lane.js passed intentClass 'UNCLEAR' to buildKbPack on every turn, so
+// the live chat (72% of bot replies) never got an FAQ, an objection script or
+// a pricing anchor: "Do you work on manufactured homes?" reached the model
+// with no LIB-P13. The classifier already runs on every turn (no model call,
+// keywords from kb_intent_handlers); its label is mapped IN CODE onto the
+// closed set the retriever is fed from chat (CANON.STD.001). The no-model
+// classifier labels many plain questions with an out-of-set class
+// ("manufactured home" → MOBILE, "do you service" → SERVICE_AREA_INQUIRY), so
+// a message shaped like a question is QUESTION; anything else is UNCLEAR.
+// LIVE_CHAT_KB_INTENT_MODE=off (default) keeps today's call byte for byte.
+
+export const CHAT_KB_INTENTS = new Set(['QUESTION', 'OBJECTION', 'PRICING', 'UNCLEAR']);
+
+/** 'live' only when LIVE_CHAT_KB_INTENT_MODE says so; anything else is off. */
+export function liveChatKbIntentMode(env = process.env) {
+  return String(env.LIVE_CHAT_KB_INTENT_MODE || '').trim().toLowerCase() === 'live' ? 'live' : 'off';
+}
+
+const QUESTION_SHAPE_RX = /\?\s*$|^(?:do|does|did|can|could|will|would|is|are|was|were|have|has|should|how|what|when|where|which|who|why)\b/i;
+
+/**
+ * Classifier output → { intent, reason }. Pure. `intent` is always one of
+ * CHAT_KB_INTENTS; `reason` says which branch decided (for the log).
+ */
+export function chatKbIntent(classification, text) {
+  const label = classification?.intent_class;
+  if (typeof label !== 'string' || !label) return { intent: 'UNCLEAR', reason: 'no_classification' };
+  if (label !== 'UNCLEAR' && CHAT_KB_INTENTS.has(label)) return { intent: label, reason: 'classifier' };
+  if (QUESTION_SHAPE_RX.test(String(text || '').trim())) return { intent: 'QUESTION', reason: 'question_shape' };
+  return label === 'UNCLEAR'
+    ? { intent: 'UNCLEAR', reason: 'classifier' }
+    : { intent: 'UNCLEAR', reason: `out_of_set:${label}` };
+}
+
 export function liveChatContextCapMs(env = process.env) {
   const raw = parseInt(env.LIVE_CHAT_CONTEXT_CAP_MS || '', 10);
   // Part 7: the full lead context (LP history, notes, calls, appointments),
@@ -578,6 +614,7 @@ export function createLiveChatFastLane(deps) {
     // booking, no hand-off side effects (an unwired lane plans and talks
     // but never books or tags).
     nepqMode: () => nepqBackboneMode(),
+    kbIntentMode: () => liveChatKbIntentMode(),
     shadowModelEnabled: () => !!process.env.LIVE_CHAT_SHADOW_MODEL,
     offerBookingSlots: async () => ({ slots: [], tzLabel: 'ET' }),
     bookSlot: async () => ({ ok: false, error: 'no book dep' }),
@@ -1048,10 +1085,30 @@ export function createLiveChatFastLane(deps) {
       : Promise.resolve(null);
 
     // ── classification without a model call; KB pack with the exemplar tier ──
+    const classifyRead = d.classify(body, { conversationContext: context.conversation_recent, ghlContactId: contactId, channel: 'livechat', contactTags, noLLM: true }).catch(() => ({ intent_class: 'UNCLEAR', confidence: 0, classification_method: 'fallback', reasoning: 'classifier error' }));
+    const kbParams = (intentClass) => ({ getQueryEmbedding, intentClass, messageText: body, channel: 'livechat', buyerStage: Number(context.intelligence?.buyer_stage) || null, contactTags, hasExistingAppt: !!context.lp?.appointment_set, lpDisposition: context.lp?.disposition || null, objectionTags: context.lead?.objection_tags || [] });
+    const kbBudgetMs = d.contextCapMs() * 2;
+    let kbIntent = null;
+    const kbRead = d.kbIntentMode() !== 'live'
+      ? raceWithBudget(d.buildKbPack(kbParams('UNCLEAR')), kbBudgetMs)
+      // AI OS batch 1 PR 1: wait for the classifier, then build the pack for
+      // its intent, both inside the SAME budget the pack always had, so the
+      // turn's deadline does not move. A timeout, an error or an unknown label
+      // is UNCLEAR (today's pack) and the reply goes on (CANON.STD.013).
+      : (async () => {
+        const tKb = d.now();
+        const c = await raceWithBudget(classifyRead, kbBudgetMs);
+        kbIntent = c.timedOut ? { intent: 'UNCLEAR', reason: 'classifier_timeout' }
+          // classification_method 'fallback' = the classifier failed (the
+          // catch above, or no handlers loaded): never guess from its output.
+          : (c.error || c.value?.classification_method === 'fallback') ? { intent: 'UNCLEAR', reason: 'classifier_error' }
+            : chatKbIntent(c.value, body);
+        if (kbIntent.intent === 'UNCLEAR' && kbIntent.reason !== 'classifier') d.log(`[LiveChat] kb intent UNCLEAR for ${contactId}: ${kbIntent.reason}`);
+        return raceWithBudget(d.buildKbPack(kbParams(kbIntent.intent)), Math.max(0, kbBudgetMs - (d.now() - tKb)));
+      })();
     const [classification, kbPack, coverageLookups, minimalZone] = await Promise.all([
-      d.classify(body, { conversationContext: context.conversation_recent, ghlContactId: contactId, channel: 'livechat', contactTags, noLLM: true }).catch(() => ({ intent_class: 'UNCLEAR', confidence: 0, classification_method: 'fallback', reasoning: 'classifier error' })),
-      raceWithBudget(d.buildKbPack({ getQueryEmbedding, intentClass: 'UNCLEAR', messageText: body, channel: 'livechat', buyerStage: Number(context.intelligence?.buyer_stage) || null, contactTags, hasExistingAppt: !!context.lp?.appointment_set, lpDisposition: context.lp?.disposition || null, objectionTags: context.lead?.objection_tags || [] }), d.contextCapMs() * 2)
-        .then(r => (r.timedOut || r.error) ? null : r.value),
+      classifyRead,
+      kbRead.then(r => (r.timedOut || r.error) ? null : r.value),
       coverageLookup,
       recordZone,
     ]);
@@ -1290,7 +1347,7 @@ export function createLiveChatFastLane(deps) {
         // The record keeps what the lead typed; the snapshot says what was removed.
         inbound_text: rawInbound,
         intent_class: classification?.intent_class || null, buyer_stage: Number(liveChatFields?.buyer_stage) || null, model,
-        input_snapshot: { mode, discipline, established_closed: established.closed_questions, context_minimal: !!context._minimal, inbound_removed_chars: inboundRemovedChars },
+        input_snapshot: { mode, discipline, established_closed: established.closed_questions, context_minimal: !!context._minimal, inbound_removed_chars: inboundRemovedChars, ...(kbIntent ? { kb_intent: kbIntent.intent, kb_intent_reason: kbIntent.reason } : {}) },
       },
     });
   }

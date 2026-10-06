@@ -2603,4 +2603,16 @@ export const STARTUP_MIRRORS = [
     fail: '[Migration] bot_review_counts (sql/146) skipped — apply sql/146 from the dashboard; Bot Review falls back to six count queries until it exists:',
     level: 'warn',
   },
+  // match_kb_embeddings_scoped (sql/147, 2026-10-06, AI OS batch 1 PR 1).
+  // Customer-facing vector retrieval allows only reece_* source docs. Until
+  // the function exists, vector-search.js filters 50 old-function rows in code.
+  {
+    name: 'sql/147',
+    expects: null,
+    alwaysRunBecause: 'defines match_kb_embeddings_scoped(); presence cannot tell a changed function body',
+    sqlFile: 'sql/147_match_kb_embeddings_scoped.sql',
+    ready: '[Migration] match_kb_embeddings_scoped (sql/147) ready',
+    fail: '[Migration] match_kb_embeddings_scoped (sql/147) skipped — apply sql/147 from the dashboard; customer scope filters in code until it exists:',
+    level: 'warn',
+  },
 ];
