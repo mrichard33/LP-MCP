@@ -110,14 +110,28 @@ async function readConfAdds(runSQL, confLists, nowMs) {
   return byPhone;
 }
 
-async function readMarks(db, keys) {
+/**
+ * Every booked-routing claim from the last MARKS_LOOKBACK_DAYS, in one paged
+ * read by prefix and age (2026-10-06). The first version asked for each key by
+ * name — ~11 per lead, ~3,000 a pass, 300 per `.in()` — and every request URL
+ * came out around 20 KB, so each one died as "TypeError: fetch failed" and the
+ * job never got past its reads. Everything decide() checks (today's and the
+ * last 7 days' removal claims, the add / retry / move claims made at most a
+ * few days before a visit) falls inside the window. Uses the created_at index.
+ */
+export const MARKS_LOOKBACK_DAYS = 14;
+const MARKS_PAGE = 1000;
+export async function readBookedMarks(db, nowMs) {
+  const since = new Date(nowMs - MARKS_LOOKBACK_DAYS * 86_400_000).toISOString();
   const seen = new Set();
-  for (let i = 0; i < keys.length; i += 300) {
-    const { data, error } = await db.from(MARKS_TABLE).select('dedup_key').in('dedup_key', keys.slice(i, i + 300));
+  for (let from = 0; ; from += MARKS_PAGE) {
+    const { data, error } = await db.from(MARKS_TABLE).select('dedup_key')
+      .like('dedup_key', 'booked-%').gte('created_at', since)
+      .order('dedup_key').range(from, from + MARKS_PAGE - 1);
     if (error) throw new Error(`marks read: ${error.message}`);
     for (const r of data || []) seen.add(r.dedup_key);
+    if (!data || data.length < MARKS_PAGE) return seen;
   }
-  return seen;
 }
 
 async function claim(db, key, { contactId = null, ldsId = null, apptDate = null } = {}) {
@@ -241,13 +255,7 @@ export async function runBookedDialRouting({ env = process.env, nowMs = Date.now
     const phones = candidates.map((c) => c.phone).filter(Boolean);
     sold = await readSoldPhones(d.runSQL, phones);
     adds = await readConfAdds(d.runSQL, Object.values(cfg.conf), nowMs);
-    const keys = [];
-    for (const c of candidates) {
-      if (!c.phone || !c.apptDate) continue;
-      for (const l of Object.values(cfg.conf)) keys.push(addKey(c.phone, c.apptDate, l), retryKey(c.phone, c.apptDate, l));
-      keys.push(removeKey(c.phone, c.apptDate, today), moveKey(c.phone, c.apptDate), ...priorRemoveKeys(c.phone, c.apptDate, nowMs, cfg.readdLookbackDays));
-    }
-    marks = await readMarks(d.supabase, [...new Set(keys)]);
+    marks = await readBookedMarks(d.supabase, nowMs);
   } catch (err) {
     errors.push(`read: ${err.message}`);
     await alarm();
