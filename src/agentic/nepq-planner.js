@@ -70,7 +70,7 @@ export function dropUnaskedCallOffer(text, { leadWantsCall: wants = false } = {}
   const body = String(text || '');
   if (wants || !body) return { text: body, changed: false };
   const sentences = splitSentences(body);
-  const kept = sentences.filter(s => !CALL_OFFER_SENTENCE_RX.test(s));
+  const kept = sentences.filter(s => !isCallOffer(s));
   if (kept.length === sentences.length) return { text: body, changed: false };
   return { text: kept.join(' ').trim(), changed: true };
 }
@@ -117,6 +117,18 @@ export const CALL_OFFER_RX = /\b(?:want|would\s+you\s+like|should\s+i\s+have|can
 // let us figure out what's happening" next to the visit ask). Dropped unless
 // the lead asked for a call or turned the visit down (dropUnaskedCallOffer).
 const CALL_OFFER_SENTENCE_RX = /\b(?:(?:quick|short|brief|15[\s-]*min(?:ute)?|fifteen[\s-]*min(?:ute)?|phone)\s+(?:call|chat)|give\s+you\s+a\s+(?:call|ring)|(?:call|ring|phone)\s+you\b|hop\s+on\s+(?:a\s+)?(?:call|the\s+phone)|(?:talk|chat|go\s+over\s+it)\s+(?:on|over)\s+the\s+phone)\b/i;
+// The booking confirm's own sentence ("Someone from our team will give you a
+// call to confirm the details", LINES.confirm, the user 2026-10-06) is our
+// confirmation call for a visit just booked, not an offer of a call instead of
+// the visit: it never counts as an unasked call offer.
+const BOOKING_CONFIRM_CALL_RX = /\b(?:call|ring)\b[^.?!]*\bconfirm\s+(?:the\s+|your\s+)?(?:details|appointment|visit)\b/i;
+export function isBookingConfirmCall(sentence) {
+  return BOOKING_CONFIRM_CALL_RX.test(String(sentence || '')) && !String(sentence || '').trim().endsWith('?');
+}
+const isCallOffer = (s) => CALL_OFFER_SENTENCE_RX.test(s) && !isBookingConfirmCall(s);
+// A booking line in the thread: the old "You're all set for …" and the new
+// "You're on the calendar for …" (LINES.confirm, 2026-10-06).
+const BOOKED_LINE_RX = /\byou(?:'|’)?re\s+all\s+set\s+for\b|\byou(?:'|’)?re\s+on\s+the\s+calendar\s+for\b/i;
 // 2026-10-03 (Mark): "only sales related callbacks go [to Five9 and
 // #contact-center]. Anything related to service should let the lead know a
 // team member will reach out and send to the Slack service channel." A call
@@ -276,7 +288,14 @@ export const LINES = Object.freeze({
   // unconfirmed appointment, and a team member confirms it.
   // 2026-10-02 (Mark, later ruling): book in real time and tell them they are
   // all set, with the team reaching out to confirm the details.
-  confirm: (slot, tz, name) => `You're all set for ${slot.day} at ${slot.time}${tz ? ` ${tz}` : ''}${name ? `, ${name}` : ''}. Our team will reach out to confirm the details.`,
+  // 2026-10-06 (the user): "You're all set, someone from our team will give
+  // you a call to confirm the details and schedule you on the calendar for
+  // (requested day/time)". The visit is still booked (unconfirmed) as before;
+  // the call is the phone room's confirmation call (the Conf lists), never a
+  // Five9 Callback Request: NOT_A_CALLBACK_RX in team-hours.js keeps this line
+  // out of promisedCallback, and isBookingConfirmCall keeps it from being
+  // dropped as an unasked call offer.
+  confirm: (slot, tz, name) => `You're all set${name ? `, ${name}` : ''}. Someone from our team will give you a call to confirm the details. You're on the calendar for ${slot.day} at ${slot.time}${tz ? ` ${tz}` : ''}.`,
   handoff: {
     complaint: "I'm sorry about that. I'm getting someone from our team on this now.",
     emergency: "That's urgent. I'm getting someone from our team on this right now.",
@@ -704,7 +723,7 @@ export function planNepqTurn({
   // replay: the appointment had not reached the read yet, and the next two
   // texts offered times again).
   const lastIdx = (rx) => { for (let i = outbound.length - 1; i >= 0; i--) if (rx.test(outbound[i].text || '')) return i; return -1; };
-  const bookedInThread = lastIdx(/\byou(?:'|’)?re\s+all\s+set\s+for\b/i) > lastIdx(/\bis\s+(?:now\s+)?cancel+ed\b|\bhave\s+cancel+ed\b/i);
+  const bookedInThread = lastIdx(BOOKED_LINE_RX) > lastIdx(/\bis\s+(?:now\s+)?cancel+ed\b|\bhave\s+cancel+ed\b/i);
   if (hasAppointment || bookedInThread) {
     if (!counters.reveal_used && !isLeadQuestion(now)) return fixed('reveal', LINES.reveal, { step: 'booked', booking: { allowed: false, reason: 'nepq:booked' } });
     return Object.assign(plan, { step: 'booked', required_move: 'answer', booking: { allowed: false, reason: 'nepq:booked' } });
@@ -1323,7 +1342,7 @@ export function dropUnsafeSentences(sentences, { allowFigures = false, keepCallO
   drop(s => URGENCY_RX.test(s), 'fake_urgency');
   drop(s => CLAIMS_RX.test(s), 'unapproved_claim');
   // No phone call the lead did not ask for (2026-10-03).
-  if (!keepCallOffer) drop(s => CALL_OFFER_SENTENCE_RX.test(s) && !(keepPromises && promisedCallback(s)), 'unasked_call_offer_dropped');
+  if (!keepCallOffer) drop(s => isCallOffer(s) && !(keepPromises && promisedCallback(s)), 'unasked_call_offer_dropped');
   return { sentences: out, changes: [...new Set(changes)] };
 }
 

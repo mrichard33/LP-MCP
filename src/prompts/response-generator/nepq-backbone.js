@@ -46,10 +46,10 @@ const MOVE_TEXT = {
     ? `This turn's move: answer their question in ONE sentence, then send exactly: "${p.offer_line}" Nothing after it.`
     : 'This turn\'s move: offer exactly two real times from CALENDAR AVAILABILITY and ask which works better. Never invent a time.'),
   // 2026-10-02 (Mark: ask first, then book). A time is held (booking-collect.js).
-  collect: (p) => `This turn's move: we are holding ${p.held_slot?.text || 'their picked time'} for them. If their reply gives the last missing detail (name, street address with zip, or who else is part of the decision), book it and confirm as: "You're all set for [day] at [time], [first name]. Our team will reach out to confirm the details." Otherwise thank them in a few words and ask the ONE next missing item. Never offer new times unless they asked to change the time.`,
+  collect: (p) => `This turn's move: we are holding ${p.held_slot?.text || 'their picked time'} for them. If their reply gives the last missing detail (name, street address with zip, or who else is part of the decision), book it and confirm as: "You're all set, [first name]. Someone from our team will give you a call to confirm the details. You're on the calendar for [day] at [time]." Otherwise thank them in a few words and ask the ONE next missing item. Never offer new times unless they asked to change the time.`,
   // 2026-10-02 (Mark): "They tell the lead that they're all set and that our
   // team will be reaching out to confirm the details."
-  confirm: () => 'This turn\'s move: they picked a time. Book it now (book_appointment) and confirm it as: "You\'re all set for [day] at [time], [first name]. Our team will reach out to confirm the details." Say "all set" only when you book it in this reply. Never "confirmed" or "see you then". Never name a rep.',
+  confirm: () => 'This turn\'s move: they picked a time. Book it now (book_appointment) and confirm it as: "You\'re all set, [first name]. Someone from our team will give you a call to confirm the details. You\'re on the calendar for [day] at [time]." Say "all set" only when you book it in this reply. Never "confirmed" or "see you then". Never name a rep.',
 };
 
 // 2026-10-02 Part 6 (Mark: "I want there to be AI-generated replies"): on a
@@ -58,7 +58,7 @@ const MOVE_TEXT = {
 const FACTS_TEXT = {
   hold: (f) => `This turn's move: they picked ${f.label}. Hold it: say "I'm holding ${f.label} for you." (a few words of thanks before it are fine), then ask exactly: "${f.ask_line}" Do not book yet, do not offer other times, do not ask for anything else.`,
   collect: (f) => `This turn's move: we are holding ${f.label} for them and they just answered. Thank them in a few words (answer any question they asked in one short sentence), then ask exactly: "${f.ask_line}" Do not book yet, do not mention other times, do not ask for anything else.`,
-  book: (f) => `This turn's move: nothing the visit needs is missing. It is booked now for ${f.label} (the booking is added for you). Confirm it in one or two sentences that say they're all set for ${f.label}${f.first_name ? `, using their first name (${f.first_name})` : ''}, and that our team will reach out to confirm the details. No question, never "see you then", never a rep's name.`,
+  book: (f) => `This turn's move: nothing the visit needs is missing. It is booked now for ${f.label} (the booking is added for you). Confirm it in one or two sentences that say they're all set${f.first_name ? ` (use their first name, ${f.first_name})` : ''}, that someone from our team will give them a call to confirm the details, and that they're on the calendar for ${f.label}. No question, never "see you then", never a rep's name.`,
   dm_conflict: (f) => (f.alternatives_text
     ? `This turn's move: the person they named can't make ${f.label}. Say no problem, let's find a time when they can both be there, then offer exactly these two times and ask which works better: ${f.alternatives_text}.`
     : `This turn's move: the person they named can't make ${f.label}. Say no problem, and ask what day works best when they can both be there.`),

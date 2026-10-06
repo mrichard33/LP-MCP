@@ -102,7 +102,7 @@ test('booking sequence: neither → day ask; a pick → confirm; yes to the brid
   assert.equal(plan({ trigger: 'wednesday', conversation: offer }).required_move, 'confirm');
   const bridged = T(['outbound', 'Based on what you told me, this could work for you, since you mentioned drafts. The next step would be a visit at your home. Would that help?']);
   assert.equal(plan({ trigger: 'yes', conversation: bridged, slots: SLOTS }).fixed_line, LINES.offer_slots(SLOTS));
-  assert.equal(LINES.confirm(SLOTS[0], 'ET', 'Dana'), "You're all set for Tue, Oct 6 at 10:00 AM ET, Dana. Our team will reach out to confirm the details.");
+  assert.equal(LINES.confirm(SLOTS[0], 'ET', 'Dana'), "You're all set, Dana. Someone from our team will give you a call to confirm the details. You're on the calendar for Tue, Oct 6 at 10:00 AM ET.");
 });
 
 // 2026-10-03 (Mark): "earn the ask". The cap alone no longer bridges: the
@@ -509,4 +509,25 @@ test('dropUnsafeLines: the drops every reply gets, plan or no plan', async () =>
   assert.equal(dropUnsafeLines(offer, { keepPromises: true }).text, 'A team member will call you to set up a time.');
   assert.equal(dropUnsafeLines(offer, { keepCallOffer: true }).changes.length, 0, 'the lead asked for a call');
   assert.equal(dropUnsafeLines('What got you looking?').text, 'What got you looking?');
+});
+
+// 2026-10-06 (the user): "You're all set, someone from our team will give you a
+// call to confirm the details and schedule you on the calendar for (day/time)".
+test('the new booking confirm: kept whole, never a Callback Request, and read back as booked', async () => {
+  const { dropUnaskedCallOffer, dropUnsafeLines, isBookingConfirmCall } = await import('../src/agentic/nepq-planner.js');
+  const { promisedCallback } = await import('../src/agentic/team-hours.js');
+  const { checkReply } = await import('../src/eval/reply-invariants.js');
+  const line = LINES.confirm(SLOTS[0], 'ET', 'Dana');
+  assert.ok(isBookingConfirmCall('Someone from our team will give you a call to confirm the details.'));
+  assert.equal(isBookingConfirmCall('Want someone to give you a call to confirm the details?'), false, 'a question is still an offer');
+  // Not an unasked call offer: no guard drops it, and the gate does not fail it.
+  assert.equal(dropUnaskedCallOffer(line).changed, false);
+  assert.equal(dropUnsafeLines(line).changed ?? dropUnsafeLines(line).changes.length, 0);
+  assert.deepEqual(checkReply(line, { channel: 'livechat', inbound: 'just me', conversation: [], booked: true }).violations, []);
+  // The confirmation call is the phone room's Conf list, never a Five9 Callback Request.
+  assert.equal(promisedCallback(line), false);
+  // The next turn knows the visit is booked (no new times offered).
+  const p = planNepqTurn({ channel: 'sms', trigger: 'Thanks', conversation: [{ direction: 'outbound', text: line }, { direction: 'inbound', text: 'Thanks' }] });
+  assert.ok(['reveal', 'answer'].includes(p.required_move), p.required_move);
+  assert.equal(p.booking.allowed, false);
 });

@@ -103,6 +103,8 @@ export function scoreResult(result) {
     // said only on a hold/confirm move (heldSlot), never a fake booking (the
     // first gate run, 2026-10-06, failed three of them).
     const held = HOLD_MOVES.has(String(t.nepq?.move || t.nepq?.required_move || ''));
+    // A hand-off that filed a callback this turn (Five9 or a review card).
+    const callbackFiled = !!t.nepq?.handoff || wouldDo(result).some(w => w.turn === t.turn && /callback|hand_off|review_card/.test(String(w.kind || '')));
     conversation.push({ direction: 'inbound', text: inbound });
     for (const text of texts) {
       const check = checkReply(text, {
@@ -111,6 +113,7 @@ export function scoreResult(result) {
         conversation: [...conversation],
         booked,
         held,
+        callbackFiled,
         // The cancel identity ask ("name and phone the appointment is under")
         // is the one approved two-item ask (allow_multi_ask, Part 8).
         allowMultiAsk: /cancel/.test(String(result.scenario || '')),

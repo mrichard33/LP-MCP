@@ -34,6 +34,7 @@
 
 import { acquireToken, report429 } from '../ghl-rate-limiter.js';
 import { tzLabel } from '../config/market-timezones.js';
+import { visitTooEarlyAfterHours } from '../agentic/team-hours.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY || '';
 const GHL_API_VERSION = '2021-04-15';
@@ -77,6 +78,13 @@ const IN_HOME_CALENDARS = new Set([
   'zS1wg0JqQ1zsszJyJqKX', // Home Protection Assessment
 ]);
 const OFFICE_TIMEZONE = DEFAULT_TIMEZONE;
+// 2026-10-06 (the user): while the team is closed, the next open day's home
+// visits start at this hour ET, so a night booking can be imported into LP and
+// called from a Conf list first (visitTooEarlyAfterHours, team-hours.js). 0 = off.
+const AFTER_HOURS_VISIT_EARLIEST_HOUR = (() => {
+  const n = Number.parseInt(process.env.AFTER_HOURS_VISIT_EARLIEST_HOUR ?? '14', 10);
+  return Number.isInteger(n) && n >= 0 && n < 24 ? n : 14;
+})();
 
 /** The start hours a calendar may be offered at, or null for "any". Pure. */
 export function allowedStartHours(calendarId) {
@@ -246,7 +254,7 @@ async function fetchFreeSlotsOnce(calendarId, opts = {}) {
  *
  * Defensive against alternate shapes (slots as bare array, missing keys).
  */
-export function parseSlots(data, calendarId, timezone, maxSlots, minNoticeHours, startHours = null) {
+export function parseSlots(data, calendarId, timezone, maxSlots, minNoticeHours, startHours = null, nowMs = Date.now()) {
   if (!data || typeof data !== 'object') return null;
 
   const allIso = [];
@@ -273,12 +281,16 @@ export function parseSlots(data, calendarId, timezone, maxSlots, minNoticeHours,
   // minutes, so its first 12 all fell inside the next 4 hours; the offer
   // window then floored them all away and logged "window=none" on every SMS
   // turn. The text bot sent the booking link instead of two real times.
-  const now = Date.now();
+  const now = nowMs;
   const notice = Number.isFinite(minNoticeHours) ? minNoticeHours : MIN_NOTICE_HOURS;
   const floorMs = now + notice * 3600_000;
+  // A home visit (startHours set) booked after hours starts no earlier than
+  // 2 PM on the next open day; a call calendar is never limited.
+  const visit = Array.isArray(startHours);
   const future = allIso.filter(iso => {
     const t = new Date(iso).getTime();
-    return Number.isFinite(t) && t >= floorMs && startsAtAllowedHour(iso, startHours);
+    return Number.isFinite(t) && t >= floorMs && startsAtAllowedHour(iso, startHours)
+      && !(visit && visitTooEarlyAfterHours(t, now, AFTER_HOURS_VISIT_EARLIEST_HOUR));
   });
   future.sort((a, b) => new Date(a).getTime() - new Date(b).getTime());
 
