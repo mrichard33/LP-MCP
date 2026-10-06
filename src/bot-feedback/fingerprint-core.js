@@ -78,18 +78,114 @@ export function corePromptVersion(generatorVersion, env = process.env) {
   return sha ? `${v}+${String(sha).slice(0, 7)}` : v;
 }
 
-/** Last N thread turns, shaped small and stable for replay. */
+/**
+ * Channel from GHL's own message stamp: `messageType` ('TYPE_SMS',
+ * 'TYPE_EMAIL', 'TYPE_LIVE_CHAT', 'TYPE_WEBCHAT') or the numeric `type`
+ * (2 = SMS, 3 = Email). Mirrors channelOfMessage() in agentic/reply-sender.js,
+ * restated here because this file stays dependency-free.
+ */
+export function channelFromMessageType(m) {
+  const mt = String(m?.messageType ?? '').toUpperCase();
+  if (mt.includes('LIVE_CHAT') || mt.includes('WEBCHAT') || mt === 'TYPE_CHAT') return 'live_chat';
+  if (mt.includes('SMS') || m?.type === 2) return 'sms';
+  if (mt.includes('EMAIL') || m?.type === 3) return 'email';
+  return null;
+}
+
+export const ACTIVITY_MESSAGE_TYPE_RX = /ACTIVITY/i;
+
+/**
+ * 2026-10-06 — is this conversation row a GHL activity entry ("Opportunity
+ * created", "<Name> - Window Estimate") rather than something a person or the
+ * bot said? /conversations/{id}/messages returns both, and every non-inbound
+ * row was being read as the bot speaking.
+ *
+ * Activity = messageType contains ACTIVITY, OR a GHL-shaped row (it carries a
+ * messageType or a numeric type) with no channel and no body content type.
+ * The GHL-shaped condition keeps a bare { direction, text } turn (the live
+ * chat's own rows, test fixtures) from being called activity.
+ */
+export function isActivityMessage(m) {
+  if (!m || typeof m !== 'object') return false;
+  if (ACTIVITY_MESSAGE_TYPE_RX.test(String(m.messageType ?? ''))) return true;
+  const ghlShaped = m.messageType != null || typeof m.type === 'number';
+  if (!ghlShaped) return false;
+  // A call or voicemail row is something that happened between people, not an
+  // activity entry, even though it carries no channel or content type here.
+  if (/CALL|VOICEMAIL/i.test(String(m.messageType ?? ''))) return false;
+  const hasBodyType = Boolean(m.contentType)
+    || (typeof m.type === 'string' && m.type.includes('/'));
+  return !hasBodyType && !normalizeChannel(m.channel) && !channelFromMessageType(m);
+}
+
+/**
+ * Last N thread turns, shaped small and stable for replay.
+ *
+ * 2026-10-06 (Bot Review thread, Charles Jessup): every snapshot turn had
+ * `at: null` and `channel: null`. context-builder emits `timestamp` (not read
+ * here) and puts the CONTENT type ('text/plain') in `type`, which was read
+ * first as the channel. The review page then stamped every turn with the
+ * reply's own time and the thread rendered out of order. `timestamp` is read
+ * first now, the channel never comes from the content type, and each turn
+ * says whether it is a message or a GHL activity row (kept, so review can
+ * hide it; never dropped from the record).
+ */
 export function shapeThread(conversation, limit = 10) {
   if (!Array.isArray(conversation)) return [];
   return conversation
     .slice(-limit)
     .map((m) => ({
       direction: m?.direction === 'inbound' || m?.direction === 'outbound' ? m.direction : null,
-      channel: normalizeChannel(m?.type ?? m?.channel),
+      channel: normalizeChannel(m?.channel) ?? channelFromMessageType(m) ?? normalizeChannel(contentFreeType(m)),
       body: clip(m?.body ?? m?.message ?? m?.text, 2000),
-      at: m?.sent_at ?? m?.dateAdded ?? m?.created_at ?? m?.at ?? null,
+      at: m?.timestamp ?? m?.sent_at ?? m?.dateAdded ?? m?.created_at ?? m?.at ?? null,
+      kind: isActivityMessage(m) ? 'activity' : 'message',
     }))
     .filter((m) => m.body !== null || m.direction !== null);
+}
+
+/**
+ * `type` only when it names a channel ('Live Chat'), never a MIME content type
+ * and never context-builder's 'text' default (which would read as SMS).
+ */
+function contentFreeType(m) {
+  const t = m?.type;
+  return typeof t === 'string' && !t.includes('/') && t.toLowerCase() !== 'text' ? t : null;
+}
+
+/**
+ * 2026-10-06 — fingerprint fields for a RULE-WRITTEN send (SERVICE_AREA_EXIT
+ * and every other rule whose action carries a pre-written message). Those
+ * skip generation, so the reply row had inbound_text = null and
+ * input_snapshot = null (bot_message_context 396): a reviewer saw a reply to
+ * nothing (CANON.P.013: every run reconstructable).
+ *
+ *   inbound_text — the inbound that triggered the event (payload / event
+ *                  context), else the newest inbound in the messages the send
+ *                  already read.
+ *   thread       — those same messages, shaped by shapeThread. Never fetched
+ *                  here: no messages in hand means no thread.
+ *
+ * `messages` is GHL's raw list, NEWEST FIRST (as fetchRecentMessages returns it).
+ */
+export function ruleSendFingerprintFields({ payload = {}, context = {}, messages = [], channel = null } = {}) {
+  const list = Array.isArray(messages) ? messages : [];
+  const newestInbound = list.find((m) => m?.direction === 'inbound' && (m.body ?? m.message ?? m.text));
+  const inboundText = clip(
+    payload?.inbound_text
+      || payload?.trigger_message
+      || context?.message_text
+      || context?.messageText
+      || context?.body
+      || context?.message_preview
+      || newestInbound?.body || newestInbound?.message || newestInbound?.text
+      || null,
+    8000,
+  );
+  const inputSnapshot = list.length
+    ? buildInputSnapshot({ conversation: list.slice().reverse(), channel, extra: { snapshot_source: 'rule_send' } })
+    : null;
+  return { inbound_text: inboundText, input_snapshot: inputSnapshot };
 }
 
 /**
@@ -274,7 +370,10 @@ export default {
   clip,
   toInt,
   corePromptVersion,
+  channelFromMessageType,
+  isActivityMessage,
   shapeThread,
+  ruleSendFingerprintFields,
   shapeAvailability,
   buildInputSnapshot,
   extractKbModes,

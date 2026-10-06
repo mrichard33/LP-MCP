@@ -2571,4 +2571,36 @@ export const STARTUP_MIRRORS = [
     fail: '[Migration] audit_posted_items.permanent (sql/144) skipped — apply sql/144 from the dashboard; alert dedupe treats every item as new until it exists:',
     level: 'warn',
   },
+  // bot_review_counts() (sql/146, 2026-10-06). The Bot Review page's six count
+  // queries in one read. The dashboard falls back to the six queries without
+  // it, so a failure here costs speed, not the page. The review_thread_cutover_at
+  // setting in sql/146 is data and is NOT mirrored: apply the file for it.
+  {
+    name: 'sql/146',
+    expects: null,
+    alwaysRunBecause: 'defines bot_review_counts(); presence cannot tell a changed function body',
+    sql: [
+      `CREATE OR REPLACE FUNCTION bot_review_counts(p_since timestamptz)
+            RETURNS json
+            LANGUAGE sql
+            STABLE
+            AS $fn$
+              SELECT json_build_object(
+                'to_review',     count(*) FILTER (WHERE q.review_count = 0),
+                'week_total',    count(*) FILTER (WHERE q.generated_at >= p_since),
+                'week_reviewed', count(*) FILTER (WHERE q.generated_at >= p_since AND q.review_count > 0),
+                'must_review',   count(*) FILTER (WHERE q.review_lane = 'must_review' AND q.dismissed IS FALSE AND q.review_count = 0),
+                'spot_check',    count(*) FILTER (WHERE q.review_lane = 'spot_check'  AND q.dismissed IS FALSE AND q.review_count = 0),
+                'everything',    count(*),
+                'thread_cutover_at', (SELECT s.value #>> '{}' FROM bot_settings s WHERE s.key = 'review_thread_cutover_at')
+              )
+              FROM v_bot_review_queue q;
+            $fn$;`,
+      `REVOKE EXECUTE ON FUNCTION bot_review_counts(timestamptz) FROM PUBLIC, anon, authenticated;`,
+      `GRANT EXECUTE ON FUNCTION bot_review_counts(timestamptz) TO service_role;`,
+    ],
+    ready: '[Migration] bot_review_counts (sql/146) ready',
+    fail: '[Migration] bot_review_counts (sql/146) skipped — apply sql/146 from the dashboard; Bot Review falls back to six count queries until it exists:',
+    level: 'warn',
+  },
 ];

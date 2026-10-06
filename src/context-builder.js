@@ -102,6 +102,7 @@ import { appointmentDelta, appointmentPhase, formatDateHuman, formatTimeHuman } 
 import { timezoneForZip } from './services/contact-timezone.js';
 import { stripQuotedEmail } from './email-thread.js';
 import { channelOfMessage } from './agentic/reply-sender.js';
+import { filterConversationForModel } from './context-activity-filter.js';
 // v2.9: the canonical five-signal "is this person a customer" test. Reused
 // here so customer_relationship never disagrees with the suppression shapes.
 import { isCustomerP2 } from './agentic/lead-state/signals/context-reader.js';
@@ -532,6 +533,10 @@ async function fetchConversation(contactId, limit = 10, degraded = null) {
         : (m.body || m.message || ''),
       type: m.contentType || m.type || 'text',
       timestamp: m.dateAdded || m.createdAt || null,
+      // 2026-10-06: GHL's raw stamp ('TYPE_SMS', 'TYPE_ACTIVITY_OPPORTUNITY'),
+      // so an activity row can be told from a message. `type` above holds the
+      // CONTENT type and cannot. Read by fingerprint-core.isActivityMessage.
+      messageType: m.messageType ?? null,
     })).reverse();
   } catch (err) {
     if (err instanceof GhlUnavailableError) degraded?.push('conversation');
@@ -1026,6 +1031,7 @@ export async function buildLeadContext(ghlContactId, options = {}) {
     timezoneForZip(ghlContact?.postalCode || lpLead?.zip || null),
   ]);
 
+  const modelConversation = filterConversationForModel(conversation);
   const tags = ghlContact?.tags || [];
   const daysInStage = calculateDaysInStage(opportunity);
   const lpName = lpLead ? [lpLead.first_name, lpLead.last_name].filter(Boolean).join(' ') : null;
@@ -1238,7 +1244,12 @@ export async function buildLeadContext(ghlContactId, options = {}) {
       lead_score_velocity: intelligence?.lead_score_velocity || 0,
     },
 
-    conversation_recent: conversation,
+    // 2026-10-06: CONTEXT_ACTIVITY_FILTER_MODE=live drops GHL activity rows
+    // ("Opportunity created") from what the model reads; off (default) passes
+    // the same array through. The unfiltered list rides along for the Bot
+    // Review snapshot only when it differs, so the off path adds no key.
+    conversation_recent: modelConversation,
+    ...(modelConversation !== conversation ? { conversation_with_activity: conversation } : {}),
 
     // v2.7: Nurture history block. Populated by fetchNurtureHistory() from
     // agentic_messages rows in 'generated_ready' or 'ghl_sent_confirmed'

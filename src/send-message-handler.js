@@ -258,6 +258,7 @@ import { acquireToken, report429, withGhlToken } from './ghl-rate-limiter.js';
 import { generateResponse, getReplySenderAllowlist, isRandyName, normalizeThreadSender } from './response-generator.js';
 // v3.18 — Bot Review Phase 0. Both are detached, fire-and-forget, never awaited.
 import { recordMessageContextDetached, markSentDetached } from './bot-feedback/fingerprint.js';
+import { ruleSendFingerprintFields } from './bot-feedback/fingerprint-core.js';
 import { judgeSentReplyDetached } from './bot-feedback/judge.js';
 import { buildAiFallback } from './ai-fallback.js';
 import { llmBudgetMs } from './llm-client.js';
@@ -2240,7 +2241,7 @@ async function handleShortCircuit(contactId, generated, action, context, opts = 
  * the row is still worth having — a fallback that went out is exactly the kind
  * of message a reviewer needs to see.
  */
-function fingerprintReply({ action, contactId, message, channel, triggerMessage, generated }) {
+function fingerprintReply({ action, contactId, message, channel, triggerMessage, generated, ruleFields = null }) {
   if (action?.id == null) return;   // no stable message_ref → no row (never a duplicate key)
   const bot = generated?._bot_context || null;
   recordMessageContextDetached({
@@ -2254,9 +2255,11 @@ function fingerprintReply({ action, contactId, message, channel, triggerMessage,
     prompt_code: generated?.handler_code || null,
     core_prompt_version: bot?.core_prompt_version || null,
     model: bot?.model || null,
-    inbound_text: triggerMessage || null,
+    // 2026-10-06: a rule-written send (no generation) falls back to the
+    // inbound and thread it already had in hand — see ruleSendFingerprintFields.
+    inbound_text: triggerMessage || ruleFields?.inbound_text || null,
     reply_text: message,
-    input_snapshot: bot?.input_snapshot || null,
+    input_snapshot: bot?.input_snapshot || ruleFields?.input_snapshot || null,
     kb_modes: bot?.kb_modes || null,
     kb_sources: bot?.kb_sources || null,
     // Phase 2 fills the guidance/example id arrays; they default to '{}'.
@@ -3937,7 +3940,18 @@ export async function executeSendMessage(action, context) {
 
   // v3.18 — fingerprint after generation, before the send (handoff §5.1).
   // Detached: the send below never waits on it.
-  fingerprintReply({ action, contactId, message, channel, triggerMessage: replyTriggerMessage, generated });
+  // 2026-10-06: a rule-written send (SERVICE_AREA_EXIT, …) has no generation
+  // context, so its row also records the inbound it answered and the thread
+  // resolveReplyContext already read. No extra GHL call; never blocks the send.
+  let ruleFields = null;
+  if (!generated) {
+    try {
+      ruleFields = ruleSendFingerprintFields({ payload, context, messages: replyContext?.messages, channel });
+    } catch (err) {
+      console.warn(`[SendMessage] rule-send fingerprint fields failed for ${contactId} (fail-soft): ${err.message}`);
+    }
+  }
+  fingerprintReply({ action, contactId, message, channel, triggerMessage: replyTriggerMessage, generated, ruleFields });
 
   // ── Send (v3.3: channel-routed) ────────────────────────────────
   const _tPreSend = Date.now();
