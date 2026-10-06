@@ -64,9 +64,13 @@ export const FORBIDDEN_LIST = 'LP_ASAP';
 export const DEAD_DISPOSITIONS = Object.freeze(new Set([
   'CXL', 'ND', 'No Demo', 'NoHome', 'OPPFDN', 'CCC', '1Leg', 'NIS2', 'DNC', 'Out Of Area', 'OOA', 'Kill', 'Bad Data',
 ]));
+// "Verif" is NOT here (Mark, 2026-10-06: "Verif means the same as Set"):
+// a never-called Verif lead is routed like a Set one (currentState below).
 export const PROGRESSED_DISPOSITIONS = Object.freeze(new Set([
-  'Cnf', 'Verif', 'Issue', 'Sale', 'Reset', 'NIS', 'NOC', 'NoRehash', 'Demo',
+  'Cnf', 'Issue', 'Sale', 'Reset', 'NIS', 'NOC', 'NoRehash', 'Demo',
 ]));
+// Dispositions that mean a booked visit. Verif = Set (Mark, 2026-10-06).
+export const BOOKED_DISPOSITIONS = Object.freeze(new Set(['Set', 'Verif']));
 
 // "Nobody spoke to them" — an inbound call from the lead with one of these is
 // not contact (same list as src/jobs/missed-caller-recovery.js).
@@ -245,9 +249,10 @@ export function currentState(row, lead = null) {
     apptDateEt = row.apptDate;
     apptStartMs = row.apptTime ? lpStoredToUtcMs(`${row.apptDate}T${row.apptTime}:00`) : null;
   }
-  // "Set" is a booked visit. A blank disposition with a date is a self-booked
-  // row LP has not dispositioned yet. "Data" with a leftover date is not booked.
-  const hasAppt = dsp === 'Set' || (!dsp && Boolean(apptDateEt));
+  // "Set" (or "Verif", which means the same) is a booked visit. A blank
+  // disposition with a date is a self-booked row LP has not dispositioned yet.
+  // "Data" with a leftover date is not booked.
+  const hasAppt = BOOKED_DISPOSITIONS.has(dsp) || (!dsp && Boolean(apptDateEt));
   return { dsp, hasAppt, apptDateEt: hasAppt ? apptDateEt : null, apptStartMs: hasAppt ? apptStartMs : null };
 }
 

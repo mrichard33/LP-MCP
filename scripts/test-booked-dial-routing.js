@@ -13,7 +13,7 @@ import {
   buildAddAction, approvalExpired, onePerPhone, priorRemoveKeys, removeKey, RULE_KEY,
   failedAddCount, confMoveDue, formatAddFailedCard,
 } from '../src/booked-dial-routing.js';
-import { routeList, backstopConfig } from '../src/new-lead-dial-backstop.js';
+import { routeList, backstopConfig, currentState, prefilter as backstopPrefilter } from '../src/new-lead-dial-backstop.js';
 import { normalizeInboundRow } from '../src/new-lead-dial-backstop.js';
 import { runBookedDialRouting, __resetLoggedForTests } from '../src/jobs/booked-dial-routing.js';
 import { executeDeleteRecordFromList, listRecordsDeletedFrom } from '../src/five9/admin-writes.js';
@@ -573,4 +573,20 @@ test('the claim read pages until a short page', async () => {
   const seen = await readBookedMarks(db, Date.now());
   assert.equal(seen.size, 2500);
   assert.deepEqual(calls, [0, 1000, 2000]);
+});
+
+test('new-lead backstop: Verif is a booked visit, exactly like Set (Mark, 2026-10-06)', () => {
+  const nowMs = edt('2026-10-06T16:00:00');
+  const bcfg = backstopConfig({});
+  for (const dsp of ['Set', 'Verif']) {
+    const row = normalizeInboundRow({ ...SHELLEY_RAW, dsp_id: dsp });
+    const st = currentState(row, null);
+    assert.equal(st.hasAppt, true, dsp);
+    assert.equal(st.apptDateEt, '2026-10-08');
+    const p = backstopPrefilter({ row, lead: null, called: false, nowMs, cfg: bcfg });
+    assert.deepEqual([p.action, p.list], ['candidate', 'Conf - 2nd Day'], dsp);
+  }
+  // Cnf / Issue stay "progressed" in the backstop (booked routing owns them).
+  const cnf = backstopPrefilter({ row: normalizeInboundRow({ ...SHELLEY_RAW, dsp_id: 'Cnf' }), lead: null, called: false, nowMs, cfg: bcfg });
+  assert.equal(cnf.reason, 'progressed');
 });
