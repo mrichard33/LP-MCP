@@ -721,7 +721,10 @@ export function createLiveChatFastLane(deps) {
     contextRead.catch(() => {});
     const appointmentsRead = Promise.resolve().then(() => d.fetchAppointments(contactId));
     appointmentsRead.catch(() => {});
-    const suppression = matchSuppressionTags(tags, { mode: 'direct_reply', logContact: contactId });
+    // 2026-10-07 — goes through the one send gate (src/services/may-message.js):
+    // with SEND_GATE_MODE=live a disqualified visitor (out-of-area,
+    // hard-disqualified, suppress-outbound) gets no bot reply either.
+    const suppression = matchSuppressionTags(tags, { mode: 'direct_reply', logContact: contactId, channel: 'livechat', route: 'live_chat' });
     if (suppression.suppressed) {
       d.log(`[LiveChat] ${contactId} blocked by ${suppression.matched_tag} — no reply`);
       return { outcome: 'suppressed', mode, matched_tag: suppression.matched_tag };

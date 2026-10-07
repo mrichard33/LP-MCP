@@ -127,6 +127,8 @@
  *   generationRetries on top of the safety-retry increment.
  */
 
+// 2026-10-07 — the one send gate (src/services/may-message.js).
+import { applySendGate } from '../services/send-gate-report.js';
 import { checkRequestSecret, rejectionBody } from '../security/request-auth.js';
 import crypto from 'crypto';
 import supabase from '../supabase.js';
@@ -491,7 +493,23 @@ function checkInterrupts(context) {
     return null;
   }
 
-  if (tags.includes('dnc') || tags.includes('stop-seinfeld')) {
+  // 2026-10-07 — the one send gate (src/services/may-message.js), purpose
+  // 'outreach': nurture is unprompted. The old check here knew only `dnc`; it
+  // stays the answer while SEND_GATE_MODE=shadow. stop-seinfeld is this
+  // route's own opt-out (the Seinfeld emails) and blocks in every mode.
+  const lowered = tags.map((t) => String(t).toLowerCase());
+  const gate = applySendGate({
+    tags: lowered,
+    channel: null,
+    purpose: 'outreach',
+    legacy: { blocked: lowered.includes('dnc'), tag: lowered.includes('dnc') ? 'dnc' : null },
+    route: 'nurture',
+    contactId: context?.lead?.ghl_contact_id || null,
+  });
+  if (gate.blocked) {
+    return { status: 'suppressed_interrupt', reason: gate.source === 'may_message' ? `send_gate_${gate.decision.reason}` : 'dnc_or_stop', blocked_by: gate.tag };
+  }
+  if (lowered.includes('stop-seinfeld')) {
     return { status: 'suppressed_interrupt', reason: 'dnc_or_stop' };
   }
   if (tags.includes('stage:appt-booked')) {

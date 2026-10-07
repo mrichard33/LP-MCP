@@ -59,6 +59,10 @@
  * line at the top of the HTML, so both paths show the same inbox preview.
  */
 
+// 2026-10-07 — the one send gate.
+import { mayMessage, resolveGate, sendGateMode } from '../../services/may-message.js';
+import { reportGateDisagreement } from '../../services/send-gate-report.js';
+
 // Plain text in, minimal safe HTML out. The Conversations API sends `html`
 // for email and does not turn newlines into breaks, so a plain-text body
 // arrives as one run-on paragraph. Escape first, then paragraphs.
@@ -85,19 +89,35 @@ const HARD_OPT_OUT = new Set(['dnc', 'do-not-contact', 'dnc-email', 'stage:dnc',
  * Pure decision: may this email go out? No I/O.
  * @returns {{send: boolean, reason: string}}
  */
-export function decideInfoEmailSend({ subject, body, tags = [], email = null, priorEmailSubjects = [] } = {}) {
+export function decideInfoEmailSend({ subject, body, tags = [], email = null, priorEmailSubjects = [], gateMode = 'shadow' } = {}) {
   if (!subject || !String(subject).trim() || !body || !String(body).trim()) {
     return { send: false, reason: 'missing_subject_or_body' };
   }
   const lowered = (tags || []).map(t => String(t).toLowerCase());
-  const optOut = lowered.find(t => HARD_OPT_OUT.has(t));
-  if (optOut) return { send: false, reason: `hard_opt_out:${optOut}` };
-  if (!email || !/@/.test(String(email))) return { send: false, reason: 'no_email_on_file' };
+  const optOut = lowered.find(t => HARD_OPT_OUT.has(t)) || null;
+  // 2026-10-07 — the one send gate (src/services/may-message.js). HARD_OPT_OUT
+  // above is its shadow comparison for one release. Purpose 'reply': every
+  // info email answers a lead who asked for it ("the email the bot told the
+  // lead is on its way"), so an operational hold (canvassing, cooling) does
+  // not stop it — exactly as today. A hard DQ and stop-bot do, in live.
+  // `gate` is on the result only when the two answers disagree, for the
+  // caller to report.
+  const legacy = { blocked: !!optOut, tag: optOut };
+  const decision = mayMessage({ tags: lowered, channel: 'email', purpose: 'reply' });
+  const resolved = resolveGate({ legacy, decision, mode: gateMode });
+  const extra = resolved.disagree ? { gate: { resolved, decision, legacy, mode: gateMode } } : {};
+  if (resolved.blocked) {
+    const reason = resolved.source === 'may_message' && !optOut
+      ? `send_gate_${decision.reason}:${resolved.tag}`
+      : `hard_opt_out:${resolved.tag}`;
+    return { send: false, reason, ...extra };
+  }
+  if (!email || !/@/.test(String(email))) return { send: false, reason: 'no_email_on_file', ...extra };
   const norm = (s) => String(s || '').trim().toLowerCase().replace(/^(re|fwd?):\s*/i, '');
   if (priorEmailSubjects.some(s => norm(s) === norm(subject))) {
-    return { send: false, reason: 'already_sent' };
+    return { send: false, reason: 'already_sent', ...extra };
   }
-  return { send: true, reason: 'ok' };
+  return { send: true, reason: 'ok', ...extra };
 }
 
 /** INFO_EMAIL_WEBHOOK_URL set → 'workflow', else 'direct'. */
@@ -178,7 +198,12 @@ export async function executeSendInfoEmail(action, _context = {}, deps = null) {
     }
   }
 
-  const decision = decideInfoEmailSend({ subject, body, tags, email, priorEmailSubjects });
+  const decision = decideInfoEmailSend({ subject, body, tags, email, priorEmailSubjects, gateMode: sendGateMode() });
+  if (decision.gate) {
+    reportGateDisagreement({
+      route: 'info_email', purpose: 'reply', channel: 'email', contactId, ...decision.gate,
+    }, { emitEvent: d.emitEvent });
+  }
   if (!decision.send) {
     console.warn(`[InfoEmail] not sent for ${contactId}: ${decision.reason}`);
     if (decision.reason !== 'already_sent') {
