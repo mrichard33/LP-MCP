@@ -96,6 +96,8 @@ import { reportAlertCondition as defaultReportAlertCondition, sendAlertMessage a
 import { alertDigestEnabled, filterNew as defaultFilterNew, recordPosted as defaultRecordPosted } from '../alert-posted.js';
 import { runJob } from '../job-runner.js';
 import { hourET, todayET } from './lp-report-common.js';
+import { backstopMode, backstopConfig } from '../new-lead-dial-backstop.js';
+import { backstopView, applyBackstopHold } from '../uncalled-backstop-hold.js';
 import {
   normalizePhone10, wasCalled, needsDncCheck, isRetiredCode, holdDateUnknown,
   isNotCovered, isNewlyRetiredCode, zip5, isDataLead, summarizeContactRecord, isRetryOwedDispo,
@@ -1029,6 +1031,49 @@ export async function runLeadLeakMonitor({ env = process.env, nowMs = Date.now()
   };
 }
 
+// The backstop's own #ops watchdog audit (src/jobs/new-lead-dial-backstop.js,
+// keyed on the LP lead id). A lead it already named is not named here too.
+const BACKSTOP_WATCHDOG_AUDIT = 'dial_backstop_unhandled';
+const BACKSTOP_JOB_ID = 'new-lead-dial-backstop';
+const BACKSTOP_RULE = 'NEW_LEAD_DIAL_BACKSTOP';
+const DEAD_PUSH = new Set(['failed', 'rejected', 'cancelled', 'skipped']);
+
+/**
+ * 2026-10-07 (Mark: "make the uncalled-leads card wait for the backstop
+ * first"). Holds the leads the new-lead dial backstop still has in hand; see
+ * src/uncalled-backstop-hold.js for the rules. Any read that fails holds
+ * nothing: the card then fires exactly as it did before.
+ */
+export async function holdForBackstop(offenders, { env = process.env, nowMs = Date.now(), deps = {} } = {}) {
+  const none = (why) => ({ named: offenders, held: [], why });
+  if (!Array.isArray(offenders) || !offenders.length) return none('nothing to hold');
+  try {
+    const db = deps.supabase || defaultSupabase;
+    const runs = await db.from('job_runs').select('status, started_at, detail')
+      .eq('job_id', BACKSTOP_JOB_ID).order('started_at', { ascending: false }).limit(5);
+    if (runs.error) throw new Error(`backstop runs: ${runs.error.message}`);
+    const run = (runs.data || []).find((r) => r.status !== 'running') || null;
+    const pushes = await db.from('agent_actions').select('status, created_at, action_payload')
+      .eq('action_type', 'five9_add_records_to_list').eq('rule_applied', BACKSTOP_RULE)
+      .gte('created_at', new Date(nowMs - 72 * HOUR_MS).toISOString());
+    if (pushes.error) throw new Error(`backstop pushes: ${pushes.error.message}`);
+    const view = backstopView({
+      mode: backstopMode(env), run, nowMs,
+      pushRows: (pushes.data || []).filter((r) => !DEAD_PUSH.has(r.status)),
+    });
+    if (!view.active) return none(view.why);
+    const filterNew = deps.filterNew || defaultFilterNew;
+    const items = offenders.filter((o) => o.lp_lead_id).map((o) => ({ key: String(o.lp_lead_id), reason: 'unhandled' }));
+    const { fresh } = await filterNew({ audit: BACKSTOP_WATCHDOG_AUDIT, items, ttlDays: 3, nowMs, deps: { supabase: deps.supabase } });
+    const freshIds = new Set(fresh.map((f) => f.key));
+    const namedByBackstop = new Set(items.map((i) => i.key).filter((k) => !freshIds.has(k)));
+    return { ...applyBackstopHold(offenders, { view, namedByBackstop, nowMs, graceMin: backstopConfig(env).watchdogMin }), why: 'backstop live' };
+  } catch (err) {
+    console.warn(`[LeadLeak] uncalled check — backstop hold skipped (card unchanged): ${err.message}`);
+    return none(`read failed: ${err.message}`);
+  }
+}
+
 /**
  * The hourly pass: owed leads from the last two days that have waited more
  * than the grace (call-center hours) for a Five9 call — never called, or
@@ -1046,6 +1091,17 @@ export async function runLeadUncalledCheck({ env = process.env, nowMs = Date.now
   const m = await measureLeadLeak({
     env, nowMs, deps, opts: { windowDays: UNCALLED_WINDOW_DAYS, lookups: 'card', rates: false, intake: false, queues: false },
   });
+  // Wait for the backstop first (2026-10-07): a lead it just pushed, is still
+  // working on, or already named in #ops is not on this card.
+  if (m.verdict !== 'insufficient_evidence' && Array.isArray(m.offenders)) {
+    const hold = await (deps.holdForBackstop || holdForBackstop)(m.offenders, { env, nowMs, deps });
+    if (hold.held.length) {
+      const by = {};
+      for (const h of hold.held) by[h.hold] = (by[h.hold] || 0) + 1;
+      console.log(`[LeadLeak] uncalled check — holding ${hold.held.length} lead(s) for the backstop: ${JSON.stringify(by)}`);
+    }
+    m.offenders = hold.named;
+  }
   const decision = shouldAlertUncalled(m.offenders, { readOk: m.verdict !== 'insufficient_evidence' });
 
   // 2026-10-02 (Mark, alert noise cut): name only leads never posted before

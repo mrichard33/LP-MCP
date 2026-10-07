@@ -353,7 +353,9 @@ posts ONE 08:00 ET card to #ops-alerts: P2 Won/Lost (24h), new appt-parity gaps,
 card unless they FAIL. The nightly tag sweep (03:00) and the inbound-caller summary (07:15) post nothing either
 (2026-10-07): the digest reads their `job_runs` rows and lists a count only when it rose, or the run if it did not finish. "Already posted" lives in ONE store, `audit_posted_items` via `src/alert-posted.js` —
 do not build another. Drift posts one card per contact, ever (`permanent`); intake journal waits 60 min; the
-uncalled-leads card names only leads not posted in 7 days; outages post on state change only (`remindMs: 0`).
+uncalled-leads card names only leads not posted in 7 days, and waits for the new-lead dial backstop first (2026-10-07,
+`src/uncalled-backstop-hold.js`: a lead it pushed under 30 dial minutes ago, is still waiting on, or already named in
+#ops is held; a backstop not live or not running holds nothing); outages post on state change only (`remindMs: 0`).
 `ALERT_DIGEST_ENABLED=false` restores the per-alert cards (drift stays once-per-contact). Info-only rule cards
 are listed in `src/alert-noise.js`; a new informational card belongs in the digest, not its own post.
 

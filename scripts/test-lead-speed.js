@@ -361,6 +361,19 @@ test('hourly check, digest era: posts the new lead once, then never re-lists it'
   assert.match(r2.summary, /new=0/);
 });
 
+// 2026-10-07 (Mark): the card waits for the new-lead dial backstop first.
+test('hourly check: a lead the backstop still has in hand is not named, and not recorded as posted', async () => {
+  const store = postedStore();
+  const deps = baseDeps({
+    ...store,
+    holdForBackstop: async (offenders) => ({ named: [], held: offenders.map((o) => ({ lp_lead_id: o.lp_lead_id, hold: 'pushed_recently' })) }),
+    sendAlertMessage: async () => { throw new Error('must not post'); },
+  });
+  const r = await runLeadUncalledCheck({ env: { LEAD_LEAK_ALERT_MODE: 'live' }, nowMs: NOW, deps });
+  assert.equal(r.verdict, 'healthy');
+  assert.equal(store.posted.size, 0, 'held, not posted: named later if Five9 still has not called');
+});
+
 test('hourly check, digest era: nothing waiting → no post, no store write', async () => {
   const store = postedStore();
   const deps = baseDeps({
