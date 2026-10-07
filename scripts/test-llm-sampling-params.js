@@ -23,6 +23,9 @@
 process.env.SUPABASE_URL ||= 'http://localhost';
 process.env.SUPABASE_SERVICE_ROLE_KEY ||= 'test_dummy_key';
 process.env.ANTHROPIC_API_KEY ||= 'test_anthropic_key';
+// The usage ledger (src/llm-usage.js) inserts through the same stubbed fetch;
+// this suite counts model calls only, so keep the ledger out of the count.
+process.env.LLM_USAGE_LOG_MODE = 'off';
 
 import test from 'node:test';
 import assert from 'node:assert/strict';

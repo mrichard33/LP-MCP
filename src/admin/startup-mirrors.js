@@ -2674,4 +2674,38 @@ export const STARTUP_MIRRORS = [
     fail: '[Migration] promised_callbacks (sql/150) skipped — apply sql/150 from the dashboard; promised calls are not tracked until it exists:',
     level: 'warn',
   },
+  // LLM usage ledger (sql/151 — the file is the source of truth). One row per
+  // callLLM(); the Reece Dashboard overview reads v_llm_usage_daily. The
+  // writer is fire-and-forget and fail-open, so a missing table costs
+  // visibility, never a model call — hence warn, not error.
+  {
+    name: 'sql/151',
+    expects: {
+      tables: ['llm_usage_log'],
+      columns: [
+        ['v_llm_usage_daily', 'day_et'],
+        ['v_llm_usage_daily', 'fn'],
+        ['v_llm_usage_daily', 'provider'],
+        ['v_llm_usage_daily', 'model'],
+        ['v_llm_usage_daily', 'calls'],
+        ['v_llm_usage_daily', 'errors'],
+        ['v_llm_usage_daily', 'input_tokens'],
+        ['v_llm_usage_daily', 'output_tokens'],
+        ['v_llm_usage_daily', 'cache_read_tokens'],
+        ['v_llm_usage_daily', 'cache_write_tokens'],
+        ['v_llm_usage_daily', 'cost_usd'],
+        ['v_llm_usage_daily', 'unpriced_calls'],
+        ['v_llm_usage_daily', 'avg_latency_ms'],
+      ],
+      views: ['v_llm_usage_daily'],
+      indexes: [
+        'idx_llm_usage_log_called_at',
+        'idx_llm_usage_log_fn_called',
+      ],
+    },
+    sqlFile: 'sql/151_llm_usage_log.sql',
+    ready: '[Migration] llm usage ledger (sql/151) ready',
+    fail: '[Migration] llm usage ledger (sql/151) not applied — model calls continue, usage rows are dropped with a warning until applied from the dashboard:',
+    level: 'warn',
+  },
 ];
