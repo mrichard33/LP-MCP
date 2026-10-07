@@ -74,7 +74,7 @@ export async function executePlan(plan, opts = {}) {
   let written = 0; let tokens = 0; let cost = 0;
   for (let i = 0; i < plan.todo.length; i += EMBED_BATCH) {
     const batch = plan.todo.slice(i, i + EMBED_BATCH);
-    const result = await embedBatch(batch.map((r) => r.embedded_text));
+    const result = await embedBatch(batch.map((r) => r.embedded_text), { fn: 'embeddings:memory' });
     if (result.embeddings.length !== batch.length) {
       throw new Error(`embedBatch returned ${result.embeddings.length} vectors for ${batch.length} inputs`);
     }

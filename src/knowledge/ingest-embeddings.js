@@ -124,7 +124,7 @@ export async function ingestDocument(params) {
   // Step 3: Embed all chunks (batched)
   let embedResult;
   try {
-    embedResult = await embedBatch(chunks);
+    embedResult = await embedBatch(chunks, { fn: 'embeddings:kb_ingest' });
   } catch (err) {
     await logIngestion({
       source_doc,
@@ -495,7 +495,7 @@ export function registerKbIngestionRoutes(app, authenticate = denyAll) {
       const { matchFaqsSemantic } = await import('./tier1-semantic.js');
 
       const started = Date.now();
-      const queryEmbedding = await embed(q);
+      const queryEmbedding = await embed(q, { fn: 'embeddings:kb_ingest' });
       const rows = await matchFaqsSemantic(queryEmbedding, channel, limit, 0);
 
       const candidates = (rows || []).map(r => ({

@@ -349,7 +349,7 @@ async function runGuard(c, { db, now, env, guard, embed, threshold, out }) {
       for (const { d, i } of candidates) {
         let hits = [];
         try {
-          const q = await embed(decisionText(d));
+          const q = await embed(decisionText(d), { fn: 'embeddings:memory' });
           const res = await db.rpc('match_memory_embeddings', {
             query_embedding: q.embedding, match_threshold: threshold, match_count: 5,
             filter_area: null, filter_kind: 'decision', include_closed: false,

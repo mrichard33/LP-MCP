@@ -494,7 +494,7 @@ async function loadOpenPending(db) {
 }
 
 async function vectorHits(db, embed, text, { kind, threshold, count = 5 }) {
-  const q = await embed(text);
+  const q = await embed(text, { fn: 'embeddings:memory' });
   const res = await db.rpc('match_memory_embeddings', {
     query_embedding: q.embedding,
     match_threshold: threshold,
@@ -946,7 +946,7 @@ async function embedNewItems(db, embed, pendingIds) {
     const shaped = [];
     for (const row of rows) {
       const base = toEmbeddingRow('pending', row);
-      const q = await embed(base.embedded_text);
+      const q = await embed(base.embedded_text, { fn: 'embeddings:memory' });
       shaped.push({ ...base, embedding: q.embedding, embedded_at: new Date().toISOString() });
     }
     const up = await db.from('claude_memory_embeddings').upsert(shaped, { onConflict: 'source_table,source_id' });

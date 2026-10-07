@@ -17,6 +17,12 @@
  *                         "gpt-5.4-mini":{"in":0.75,"out":4.5,"cache_read":0.075}}
  * The current dated value is in docs/llm-price-table.md.
  * Lookup is exact model id first, then longest key prefix match.
+ *
+ * SOURCES (2026-10-07). callLLM (chat), src/knowledge/openai-embeddings.js
+ * (embeddings: input tokens only, rate key "in") and the PAID OpenAI call
+ * transcriber in src/ci/transcribe.js (billed per audio minute: rate key
+ * "per_minute", passed as `audioSeconds`). The self-hosted speech engine
+ * (CI_TRANSCRIBE_ENGINE=speech) costs nothing per call and is not logged.
  */
 
 import supabase from './supabase.js';
@@ -58,8 +64,12 @@ export function rateFor(model, table = priceTable()) {
   return best ? table[best] : null;
 }
 
-/** USD for one call, or null when the model has no rate. Pure. */
-export function computeCostUsd({ model, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens }, table = priceTable()) {
+/**
+ * USD for one call, or null when the model has no rate. Pure. A rate with
+ * `per_minute` adds audioSeconds/60 × per_minute (transcription); token keys
+ * and per_minute add together, so a model priced both ways is counted both ways.
+ */
+export function computeCostUsd({ model, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, audioSeconds }, table = priceTable()) {
   const r = rateFor(model, table);
   if (!r) return null;
   const per = (n, rate) => (Number.isFinite(n) && Number.isFinite(rate) ? (n * rate) / 1_000_000 : 0);
@@ -67,7 +77,8 @@ export function computeCostUsd({ model, inputTokens, outputTokens, cacheReadToke
     per(inputTokens, r.in) +
     per(outputTokens, r.out) +
     per(cacheReadTokens, r.cache_read ?? 0) +
-    per(cacheWriteTokens, r.cache_write ?? 0);
+    per(cacheWriteTokens, r.cache_write ?? 0) +
+    (Number.isFinite(audioSeconds) && Number.isFinite(r.per_minute) ? (audioSeconds / 60) * r.per_minute : 0);
   return Math.round(cost * 1_000_000) / 1_000_000;
 }
 
@@ -109,7 +120,7 @@ export function __setLlmUsageClientForTests(client) { _clientOverride = client; 
  * Record one call. Fire-and-forget; never throws; never awaited by callLLM.
  * Returns the row it attempted (for tests), or null when off/unavailable.
  */
-export function recordLlmUsage({ fn, group, provider, model, usage, latencyMs, ok = true, error = null }, env = process.env) {
+export function recordLlmUsage({ fn, group, provider, model, usage, latencyMs, ok = true, error = null, audioSeconds = null }, env = process.env) {
   try {
     if (llmUsageMode(env) === 'off') return null;
     const client = _clientOverride ?? supabase;
@@ -124,7 +135,7 @@ export function recordLlmUsage({ fn, group, provider, model, usage, latencyMs, o
       output_tokens: t.outputTokens,
       cache_read_tokens: t.cacheReadTokens,
       cache_write_tokens: t.cacheWriteTokens,
-      cost_usd: computeCostUsd({ model, ...t }, priceTable(env)),
+      cost_usd: computeCostUsd({ model, ...t, audioSeconds }, priceTable(env)),
       latency_ms: Number.isFinite(latencyMs) ? Math.round(latencyMs) : null,
       ok: !!ok,
       error: error ? String(error).slice(0, 500) : null,

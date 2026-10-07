@@ -93,7 +93,7 @@ export async function searchKnowledge(query, opts = {}, deps = {}) {
   try {
     queryResult = (opts.queryEmbedding && Array.isArray(opts.queryEmbedding.embedding))
       ? opts.queryEmbedding
-      : await embed(query);
+      : await embed(query, { fn: 'embeddings:kb_search' });
   } catch (err) {
     console.error('[VectorSearch] Embed failed:', err.message);
     return { matches: [], query_tokens: 0, query_cost_usd: 0, error: err.message };
