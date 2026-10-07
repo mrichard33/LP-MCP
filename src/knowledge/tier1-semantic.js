@@ -43,7 +43,7 @@ const KB_FAQ_EMBED_INTERVAL_MS    = parseInt(process.env.KB_FAQ_EMBED_INTERVAL_M
  * (and retrying) for up to ~60s after the turn had given up on it.
  */
 export function makeQueryEmbedder(messageText) {
-  return makeMemoisedEmbedder(messageText, (t) => embed(t, { fast: true }));
+  return makeMemoisedEmbedder(messageText, (t) => embed(t, { fast: true, fn: 'embeddings:faq' }));
 }
 
 // ── FAQ semantic match ─────────────────────────────────────────────
@@ -131,7 +131,7 @@ async function getObjectionTypeVectors() {
   if (!objectionVectorsPromise) {
     objectionVectorsPromise = (async () => {
       const types = Object.keys(OBJECTION_TYPE_DESCRIPTIONS);
-      const { embeddings } = await embedBatch(types.map((t) => OBJECTION_TYPE_DESCRIPTIONS[t]));
+      const { embeddings } = await embedBatch(types.map((t) => OBJECTION_TYPE_DESCRIPTIONS[t]), { fn: 'embeddings:faq' });
       return types.map((type, i) => ({ type, embedding: embeddings[i] }));
     })().catch((err) => {
       objectionVectorsPromise = null; // let the next turn retry
@@ -229,7 +229,7 @@ export async function embedFaqsSweep(reason = 'interval') {
       return { embedded: 0, skipped: (data || []).length };
     }
 
-    const { embeddings, tokens, cost_usd } = await embedBatch(stale.map((r) => r.text));
+    const { embeddings, tokens, cost_usd } = await embedBatch(stale.map((r) => r.text), { fn: 'embeddings:faq' });
     let embedded = 0;
     for (let i = 0; i < stale.length; i++) {
       const { error: upErr } = await supabase

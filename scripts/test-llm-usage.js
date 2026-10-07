@@ -51,6 +51,19 @@ test('computeCostUsd: an OpenAI cached token is billed once, at the cached rate'
   assert.equal(computeCostUsd({ model: 'gpt-5.4-mini', ...t }, rates), 0.48);
 });
 
+test('computeCostUsd: per_minute prices transcription by audio length', () => {
+  const rates = { 'whisper-1': { per_minute: 0.006 } };
+  assert.equal(computeCostUsd({ model: 'whisper-1', audioSeconds: 600 }, rates), 0.06);
+  // No duration reported → no audio cost, but the model is still priced (not NULL).
+  assert.equal(computeCostUsd({ model: 'whisper-1', audioSeconds: null }, rates), 0);
+});
+
+test('computeCostUsd: an embeddings usage object prices input tokens only', () => {
+  const t = normalizeUsage('openai', { prompt_tokens: 500_000, total_tokens: 500_000 });
+  assert.equal(t.outputTokens, null);
+  assert.equal(computeCostUsd({ model: 'text-embedding-3-small', ...t }, { 'text-embedding-3-small': { in: 0.02 } }), 0.01);
+});
+
 test('recordLlmUsage: writes one row, fire-and-forget, never throws', async () => {
   const inserted = [];
   __setLlmUsageClientForTests({ from: () => ({ insert: (row) => { inserted.push(row); return Promise.resolve({ error: null }); } }) });

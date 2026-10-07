@@ -194,7 +194,7 @@ export async function runCiMomentsSweep(reason = 'interval') {
       .from('ci_moments').select('id, customer_said').is('embedding', null).eq('active', true).limit(500);
     for (let i = 0; i < (toEmbed || []).length; i += 200) {
       const batch = toEmbed.slice(i, i + 200);
-      const { embeddings } = await embedBatch(batch.map((r) => r.customer_said));
+      const { embeddings } = await embedBatch(batch.map((r) => r.customer_said), { fn: 'embeddings:ci_moments' });
       for (let j = 0; j < batch.length; j++) {
         const { error } = await supabase.from('ci_moments')
           .update({ embedding: embeddings[j], embedding_hash: hashText(batch[j].customer_said) })

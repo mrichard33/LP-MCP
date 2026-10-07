@@ -243,7 +243,7 @@ export async function buildExemplarsSweep(reason = 'interval') {
     const { data: toEmbed } = await supabase
       .from('kb_exemplars').select('id, inbound_text, embedding_hash').is('embedding', null).eq('active', true).limit(1000);
     for (const batch of chunk(toEmbed || [], EMBED_BATCH)) {
-      const { embeddings } = await embedBatch(batch.map((r) => r.inbound_text));
+      const { embeddings } = await embedBatch(batch.map((r) => r.inbound_text), { fn: 'embeddings:exemplars' });
       for (let i = 0; i < batch.length; i++) {
         const { error } = await supabase.from('kb_exemplars')
           .update({ embedding: embeddings[i], embedding_hash: hashText(batch[i].inbound_text), updated_at: new Date().toISOString() })

@@ -20,6 +20,8 @@
  * v1.0 — Initial implementation.
  */
 
+import { recordLlmUsage } from '../llm-usage.js';
+
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
 const MODEL = process.env.OPENAI_EMBEDDING_MODEL || 'text-embedding-3-small';
 const DIMENSIONS = parseInt(process.env.OPENAI_EMBEDDING_DIMENSIONS || '1536', 10);
@@ -44,11 +46,30 @@ export const deps = { fetch: (...args) => fetch(...args) };
 // INTERNAL: HTTP call with exponential backoff
 // ═══════════════════════════════════════════════════════════════════
 
+// 2026-10-07 — usage ledger. Embeddings bypass callLLM, so until now their
+// cost was in no ledger. One llm_usage_log row per logical request, after the
+// retry loop: a 429/5xx OpenAI rejected is not billed, so retries get no row.
+// recordLlmUsage is fire-and-forget and never throws, so it cannot slow the
+// reply path (tier1-semantic runs inside a 1,500ms box). `opts.fn` names the
+// caller for the dashboard's By function table; default 'embeddings'.
 async function callOpenAI(inputArray, opts = {}) {
   if (!OPENAI_API_KEY) throw new Error('OPENAI_API_KEY not configured');
   if (!Array.isArray(inputArray) || inputArray.length === 0) {
     throw new Error('callOpenAI requires non-empty input array');
   }
+  const fn = opts.fn || 'embeddings';
+  const startedAt = Date.now();
+  try {
+    const result = await requestEmbeddings(inputArray, opts);
+    recordLlmUsage({ fn, group: 'embeddings', provider: 'openai', model: result.model, usage: result.usage, latencyMs: Date.now() - startedAt, ok: true });
+    return result;
+  } catch (err) {
+    recordLlmUsage({ fn, group: 'embeddings', provider: 'openai', model: MODEL, usage: null, latencyMs: Date.now() - startedAt, ok: false, error: err?.message });
+    throw err;
+  }
+}
+
+async function requestEmbeddings(inputArray, opts = {}) {
 
   // Reply-path callers pass { fast: true }: one attempt, short timeout. Batch
   // callers pass nothing and keep the resilient policy.
@@ -110,6 +131,7 @@ async function callOpenAI(inputArray, opts = {}) {
         tokens: tokensUsed,
         cost_usd: (tokensUsed / 1_000_000) * 0.02,
         model: data.model || MODEL,
+        usage: data.usage || null,
       };
     } catch (err) {
       if (err.name === 'AbortError' || err.name === 'TimeoutError') {
@@ -138,6 +160,7 @@ async function callOpenAI(inputArray, opts = {}) {
  * @param {string} text — Input to embed (trimmed, non-empty)
  * @param {Object} [opts]
  * @param {boolean} [opts.fast] — reply path: 1 attempt, short timeout
+ * @param {string}  [opts.fn]   — usage-ledger label for the caller (default 'embeddings')
  * @returns {Promise<{embedding: number[], tokens: number, cost_usd: number}>}
  */
 export async function embed(text, opts = {}) {
@@ -160,9 +183,11 @@ export async function embed(text, opts = {}) {
  * For larger batches, this function chunks automatically.
  *
  * @param {string[]} texts — Inputs to embed
+ * @param {Object} [opts]
+ * @param {string} [opts.fn] — usage-ledger label for the caller (default 'embeddings')
  * @returns {Promise<{embeddings: number[][], tokens: number, cost_usd: number}>}
  */
-export async function embedBatch(texts) {
+export async function embedBatch(texts, opts = {}) {
   if (!Array.isArray(texts) || texts.length === 0) {
     throw new Error('embedBatch() requires non-empty array');
   }
@@ -182,7 +207,7 @@ export async function embedBatch(texts) {
 
   for (let i = 0; i < cleaned.length; i += BATCH_SIZE) {
     const batch = cleaned.slice(i, i + BATCH_SIZE);
-    const result = await callOpenAI(batch);
+    const result = await callOpenAI(batch, { fn: opts.fn });
     allEmbeddings.push(...result.embeddings);
     totalTokens += result.tokens;
     totalCost += result.cost_usd;

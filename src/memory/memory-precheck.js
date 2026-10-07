@@ -78,7 +78,7 @@ export async function memoryPrecheck(proposalText, opts = {}) {
   let error = null;
   if (embed && typeof db.rpc === 'function') {
     try {
-      const q = await embed(text);
+      const q = await embed(text, { fn: 'embeddings:memory' });
       const res = await db.rpc('match_memory_embeddings', {
         query_embedding: q.embedding, match_threshold: Math.min(0.5, threshold), match_count: 40,
         filter_area: null, filter_kind: 'decision', include_closed: true,

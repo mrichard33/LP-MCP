@@ -60,7 +60,7 @@ export async function hybridMemorySearch(query, opts = {}) {
 
   let vec = []; let error = null; let queryCost = 0;
   try {
-    const q = await embed(query);
+    const q = await embed(query, { fn: 'embeddings:memory' });
     queryCost = q.cost_usd;
     const { data, error: rpcErr } = await supabase.rpc('match_memory_embeddings', {
       query_embedding: q.embedding,

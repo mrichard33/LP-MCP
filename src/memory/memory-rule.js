@@ -621,7 +621,7 @@ async function runRuleGuard(p, { db, embed, env, out }) {
   const threshold = getConflictThreshold(env);
   let hits = [];
   try {
-    const q = await embed(decisionText({ category: p.decision.category, decision: p.decision.text, rationale: p.decision.rationale }));
+    const q = await embed(decisionText({ category: p.decision.category, decision: p.decision.text, rationale: p.decision.rationale }), { fn: 'embeddings:memory' });
     const res = await db.rpc('match_memory_embeddings', {
       query_embedding: q.embedding, match_threshold: threshold, match_count: 5,
       filter_area: null, filter_kind: 'decision', include_closed: false,

@@ -24,6 +24,7 @@ import supabase from '../supabase.js';
 import { getConfig } from './config.js';
 import { CI_AUDIO_BUCKET } from '../../scripts/setup-ci-audio-bucket.js';
 import { channelCount, durationSeconds, extractChannel } from './wav.js';
+import { recordLlmUsage } from '../llm-usage.js';
 
 const LOG = '[CITranscribe]';
 
@@ -304,6 +305,13 @@ export function createStorageAudioLoader({ db = supabase } = {}) {
  *
  * Verbose JSON is requested so segment offsets come back; §6 stores those as
  * ci_transcripts.segments and the stereo merge is ordered by them.
+ *
+ * 2026-10-07 — usage ledger. This is the PAID path (billed per audio minute),
+ * so every request writes one llm_usage_log row: fn 'ci_transcribe', the audio
+ * duration OpenAI reports, ok:false on a rejected request. The self-hosted
+ * speech transcriber below is free per call and deliberately writes nothing
+ * (the user's ruling), so ci_transcribe rows appearing at all means the engine
+ * is back on OpenAI.
  */
 export function createOpenAITranscriber({ apiKey = process.env.OPENAI_API_KEY, fetchImpl = fetch } = {}) {
   return async function transcribe({ buffer, filename, channel, model }) {
@@ -321,16 +329,29 @@ export function createOpenAITranscriber({ apiKey = process.env.OPENAI_API_KEY, f
     form.append('model', model);
     form.append('response_format', 'verbose_json');
 
-    const res = await fetchImpl('https://api.openai.com/v1/audio/transcriptions', {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${apiKey}` },
-      body: form,
+    const startedAt = Date.now();
+    const ledger = (extra) => recordLlmUsage({
+      fn: 'ci_transcribe', group: 'call_intelligence', provider: 'openai', model,
+      usage: null, latencyMs: Date.now() - startedAt, ...extra,
     });
+    let res;
+    try {
+      res = await fetchImpl('https://api.openai.com/v1/audio/transcriptions', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${apiKey}` },
+        body: form,
+      });
+    } catch (err) {
+      ledger({ ok: false, error: err?.message });
+      throw err;
+    }
     if (!res.ok) {
       const detail = await res.text().catch(() => '');
+      ledger({ ok: false, error: `HTTP ${res.status}: ${detail.slice(0, 200)}` });
       throw new Error(`OpenAI transcription failed (${res.status}): ${detail.slice(0, 300)}`);
     }
     const json = await res.json();
+    ledger({ ok: true, audioSeconds: typeof json.duration === 'number' ? json.duration : null });
     return {
       text: String(json.text ?? '').trim(),
       segments: (json.segments || []).map((s) => ({
