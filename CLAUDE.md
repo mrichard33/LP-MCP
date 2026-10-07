@@ -159,8 +159,9 @@ the window is a second source. Unimported rows are the held-row card's job, neve
 dispositions (read from `lp_leads`, which overrides the inbound row), Five9 attempts on this lead and Five9 DNC numbers
 are skipped; a failed Five9 read waits (fail closed); a lead on LP_ASAP gets 30 dial minutes first. Once per row per
 list and per phone per day (`lp_appointment_sync_marks`, claimed before the push). Every decision is in
-`job_runs.detail.by_reason`. Shadow posts nothing; live posts one #contact-center card per pass that pushed (overnight
-pushes: one card at 8:00 ET), and names in #ops, once, any lead 30+ dial minutes old with no call, push or reason.
+`job_runs.detail.by_reason`. A push posts NOTHING (Mark, 2026-10-07: the system fixed it, nobody acts; the per-pass and
+8 AM "put on a Five9 list" cards are gone, the push stays an `agent_actions` row with its `card_line`); live names in
+#ops, once, any lead 30+ dial minutes old with no call, push or reason.
 `findContactInOtherLists` is NOT used here: it has never worked in production (bare-array criteria) and
 `f9_last_list` keeps the last list ever, so a naive fix would block most callbacks.
 
@@ -169,8 +170,11 @@ pushes: one card at 8:00 ET), and names in #ops, once, any lead 30+ dial minutes
 longer returns `already_in_lp` for an in1 with no lds (`src/actions/handlers/lp-lead-inbound-only.js`: issued → write the
 lds and set the appointment on it; waiting → `pending_lp_checkout`; never addLead). `src/jobs/inbound-checkout-watch.js`
 (`INBOUND_CHECKOUT_WATCH_MODE` off|shadow|live, default shadow) mirrors the queue into `lp_inbound_queue` (sql/149, fails
-soft until applied), cards #contact-center 08:00–19:45 ET for inquiries waiting past 10/15/30 min (appointment / GHL
-sender / other) and #ops past 45, and finishes the GHL side of issued inquiries. LP's GetInboundLeadInfo `enddate` is
+soft until applied), cards #contact-center 08:00–19:45 ET for inquiries waiting past their line (Mark, 2026-10-07; staff
+check out at a median 11 min, p90 42): visit today/tomorrow 30 min, visit 2+ days out 60 (`INBOUND_WATCH_APPT_FAR_MIN`),
+GHL sender 60, other 60, and #ops past 90. The 8 AM card lists only rows already past their line. An in1 the held-row
+"import this lead" card named is not carded again, and vice versa (`INBOUND_WAIT_AUDIT` / `HELD_IMPORT_AUDIT`). It
+finishes the GHL side of issued inquiries. LP's GetInboundLeadInfo `enddate` is
 EXCLUSIVE: a range ending today returns none of today's rows (issue #490).
 **Booked leads come off the setter lists, onto Confirmation (decision #2669).** `src/jobs/booked-dial-routing.js`
 (`BOOKED_DIAL_ROUTING_MODE`, default shadow) runs after each watch pass: visit today/tomorrow → "Conf - Next Day", two
@@ -337,6 +341,11 @@ The `null` case is the one people get wrong. A read that failed must neither pag
 on "I could not tell" announces a recovery nobody earned. This is why the `shouldAlert*` helpers
 return a `verdict` (`alert` / `healthy` / `insufficient_evidence`) rather than just a boolean — the
 boolean cannot distinguish "healthy" from "too quiet to conclude".
+
+**#contact-center gets only what a person must act on, after the system had its chance (Mark, 2026-10-07).** Never
+post "we fixed it" or an FYI there; never repeat an item (dedupe through `src/alert-posted.js`); fire a card only once
+the self-healing retry or sweep has had its cycle; batch a pass's exceptions into one card; a system-down alert only on
+down and on recovery. Hand-off cards (`routeNepqHandoff`) post once per contact per reason per day.
 
 **Ops alerts post only new items, mostly once a morning (Mark, 2026-10-02).** `src/jobs/ops-morning-digest.js`
 posts ONE 08:00 ET card to #ops-alerts: P2 Won/Lost (24h), new appt-parity gaps, and the morning checks

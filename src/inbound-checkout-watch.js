@@ -16,11 +16,22 @@
 // WHAT THE JOB DOES (src/jobs/inbound-checkout-watch.js does the I/O)
 //   1. Reads 48h of the queue and mirrors it into lp_inbound_queue (sql/149).
 //   2. Office hours (08:00–19:45 ET, the dial window): ONE #contact-center card
-//      per pass naming the NEW inquiries waiting past their threshold
-//      (appointment 10 min, GHL sender 15, anything else 30), appointment rows
-//      first; one #ops line each past 45 min.
+//      per pass naming the NEW inquiries waiting past their threshold,
+//      appointment rows first; one #ops line each past the escalation line.
 //   3. Overnight it posts nothing; the first in-hours pass posts ONE card of
-//      everything still waiting.
+//      the inquiries still waiting PAST THEIR THRESHOLD (2026-10-07: it listed
+//      every waiting row, 13- and 33-minute-old ones included). Nothing due →
+//      no card, and the day's overnight key is still claimed.
+//
+// THRESHOLDS (Mark, 2026-10-07: post only what a person must act on, after the
+// system — here, LP staff's normal checkout — has had a fair chance). Staff
+// check out at a median of 11 min and a p90 of 42 min, so the old 10/15/30
+// lines paged on the normal case. Now:
+//   appointment, visit today or tomorrow (ET)  30 min   INBOUND_WATCH_APPT_MIN
+//   appointment, visit 2+ days out             60 min   INBOUND_WATCH_APPT_FAR_MIN
+//   GHL sender, no appointment                 60 min   INBOUND_WATCH_GHL_MIN
+//   anything else                              60 min   INBOUND_WATCH_OTHER_MIN
+//   escalation to #ops                         90 min   INBOUND_WATCH_ESCALATE_MIN
 //   4. For an inquiry LP HAS issued: write the lds to the GHL contact when its
 //      LP Lead ID is empty, and set the contact's upcoming appointment on the
 //      lds when the inquiry has none — the retry set_lp_appointment never got.
@@ -33,7 +44,7 @@ import { etDateKey, daysBetween, lpDateToKey, phone10 } from './new-lead-dial-ba
 
 export const MODES = Object.freeze(['off', 'shadow', 'live']);
 export const AUTO_CHECKOUT_USER = 'Rubertone, Bob'; // LP's auto-import user
-export const PRIORITIES = Object.freeze(['appt', 'ghl', 'other']);
+export const PRIORITIES = Object.freeze(['appt', 'appt_far', 'ghl', 'other']);
 export const GHL_FIELD_LP_LEAD_ID = 'GmAVmW6V9sekD7pVONKr';
 const GHL_ID_RX = /^[A-Za-z0-9]{20}$/;
 
@@ -60,11 +71,12 @@ export function hhmmToMin(raw, dflt) {
 export function watchConfig(env = process.env) {
   return {
     thresholdMin: {
-      appt: num(env.INBOUND_WATCH_APPT_MIN, 10, 1),
-      ghl: num(env.INBOUND_WATCH_GHL_MIN, 15, 1),
-      other: num(env.INBOUND_WATCH_OTHER_MIN, 30, 1),
+      appt: num(env.INBOUND_WATCH_APPT_MIN, 30, 1),
+      appt_far: num(env.INBOUND_WATCH_APPT_FAR_MIN, 60, 1),
+      ghl: num(env.INBOUND_WATCH_GHL_MIN, 60, 1),
+      other: num(env.INBOUND_WATCH_OTHER_MIN, 60, 1),
     },
-    escalateMin: num(env.INBOUND_WATCH_ESCALATE_MIN, 45, 1),
+    escalateMin: num(env.INBOUND_WATCH_ESCALATE_MIN, 90, 1),
     // Defaults are the Five9 dial window (src/five9/callback-dial-check.js:
     // 8:00 start, 19:45 last start) — a card nobody can act on is noise.
     officeStartMin: hhmmToMin(env.INBOUND_WATCH_OFFICE_START, 8 * 60),
@@ -131,9 +143,17 @@ export function classifyRow(row) {
   return 'checked_out';
 }
 
-/** appt (date AND time on the inquiry) > ghl (sender GHL-*) > other. */
-export function priorityOf(row) {
-  if (row.apptDate && row.apptTime) return 'appt';
+/**
+ * appt (date AND time on the inquiry, visit today/tomorrow ET — or already
+ * past, or no clock to compare) > appt_far (visit 2+ days out) > ghl (sender
+ * GHL-*) > other. A visit days away leaves the confirmation lists time, so it
+ * waits the longer line (2026-10-07).
+ */
+export function priorityOf(row, nowMs) {
+  if (row.apptDate && row.apptTime) {
+    if (!Number.isFinite(nowMs)) return 'appt';
+    return daysBetween(etDateKey(nowMs), row.apptDate) >= 2 ? 'appt_far' : 'appt';
+  }
   if (/^GHL-/i.test(row.sender)) return 'ghl';
   return 'other';
 }
@@ -150,7 +170,7 @@ export function assessWaiting(rows, nowMs, cfg) {
     if (classifyRow(row) !== 'waiting') continue;
     const wait = waitMinutes(row, nowMs);
     if (wait === null) continue;
-    const priority = priorityOf(row);
+    const priority = priorityOf(row, nowMs);
     const threshold = cfg.thresholdMin[priority];
     out.push({ row, priority, waitMin: Math.floor(wait), threshold, due: wait >= threshold, escalate: wait >= cfg.escalateMin });
   }
@@ -253,6 +273,14 @@ export function writebackDecision(row, contact, nowMs) {
 /* --- dedup keys (lp_appointment_sync_marks) ------------------------------------ */
 
 export const overnightKey = (etDate) => `inbound-watch-overnight:${etDate}`;
+
+/* --- "already posted" audits (audit_posted_items, keyed on the in1) ---------
+ * Two posters name the same waiting inquiry: this watch, and the held-row
+ * "import this lead" card in src/lp-appointment-sync.js (escalateHeldInbound).
+ * Each skips an in1 the other already carded (2026-10-07, Mark: never repeat
+ * an item). The watch records reason 'waiting'; the held card reason 'card'. */
+export const INBOUND_WAIT_AUDIT = 'inbound_checkout_wait';
+export const HELD_IMPORT_AUDIT = 'lp_inbound_held';
 export const apptKey = (lds) => `inbound-watch-appt:${lds}`;
 export const checkedKey = (in1) => `inbound-watch-checked:${in1}`;
 

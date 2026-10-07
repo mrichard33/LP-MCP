@@ -10,10 +10,13 @@
 //   off     do nothing.
 //   shadow  read and decide everything; log "would push". No Five9 write, no
 //           marks, no Slack (the user, 2026-10-05: no unnecessary notifications).
-//   live    claim, push, and post ONE #contact-center card per pass that pushed
-//           something. A push made while the dialer is closed (19:45–8:00 ET)
-//           is held by Five9 until the campaign opens; its card goes out ONCE,
-//           in the first pass after 8:00 ET. Going live is the user's decision.
+//   live    claim and push. A push made while the dialer is closed (19:45–8:00
+//           ET) is held by Five9 until the campaign opens. Going live is the
+//           user's decision.
+//   NO "PUT ON A FIVE9 LIST" CARD (Mark, 2026-10-07). The per-pass and 8 AM
+//   #contact-center cards are gone: the system fixed it, nobody has to act.
+//   Every push is still an agent_actions row (rule NEW_LEAD_DIAL_BACKSTOP) and
+//   a job_runs.detail.by_reason entry. Only the #ops watchdog below pages.
 //   Anything unrecognised is `shadow`: a typo must not start dialing.
 //
 // TWO SOURCES (2026-10-06)
@@ -55,7 +58,7 @@ import { dialWindowStartMs } from '../five9/callback-dial-check.js';
 import { utcToLpStoredIso } from '../lp-dates.js';
 import {
   backstopMode, backstopConfig, normalizeInboundRow, rowFromLead, prefilter, finalDecision,
-  buildBackstopRecord, formatPushedCard, pushedLine, markKey, phoneDayKey, etDateKey, phone10,
+  buildBackstopRecord, pushedLine, markKey, phoneDayKey, etDateKey, phone10,
   unhandledLeads, formatUnhandledCard, MISSED_CALL_DISPOSITIONS,
 } from '../new-lead-dial-backstop.js';
 
@@ -77,15 +80,13 @@ const chunks = (xs, n) => { const out = []; for (let i = 0; i < xs.length; i += 
 const idOf = (row) => row.ldsId || `in1:${row.in1}`;
 // The expression idx_lp_leads_phone10 is built on — keep it byte-identical.
 const PHONE10_SQL = `right(regexp_replace(COALESCE(phone, ''::text), '[^0-9]'::text, ''::text, 'g'::text), 10)`;
-export const overnightCardKey = (etDate) => `dial-backstop-overnight-card:${etDate}`;
 
 async function defaultDeps() {
-  const [{ runSQL }, supabaseMod, five9, lp, slack, alertState, alertPosted] = await Promise.all([
+  const [{ runSQL }, supabaseMod, five9, lp, alertState, alertPosted] = await Promise.all([
     import('../admin/supabase-admin.js'),
     import('../supabase.js'),
     import('../five9-admin.js'),
     import('../lp-client.js'),
-    import('../slack.js'),
     import('../alert-state.js'),
     import('../alert-posted.js'),
   ]);
@@ -95,7 +96,6 @@ async function defaultDeps() {
     checkDnc: five9.checkDncForNumbers,
     getContactRecords: five9.getContactRecords,
     listInboundLeads: lp.listInboundLeads,
-    postToSlack: slack.postToSlack,
     reportAlertCondition: alertState.reportAlertCondition,
     sendAlertMessage: alertState.sendAlertMessage,
     filterNew: alertPosted.filterNew,
@@ -267,7 +267,9 @@ function buildAction(row, record, list, reason, callNowMode, { cardLine, held })
     target_system: 'five9',
     target_entity: 'list',
     target_id: list,
-    // card_line / card_held are read back by the 8 AM card; the executor ignores them.
+    // card_line / card_held: a readable summary of the push and whether the
+    // dialer was closed. No card reads them since 2026-10-07; kept so a push
+    // stays one query away. The executor ignores them.
     action_payload: {
       list_name: list, field_names: record.fieldNames, records: [record.values], call_now_mode: callNowMode,
       card_line: cardLine, card_held: held,
@@ -282,19 +284,6 @@ function buildAction(row, record, list, reason, callNowMode, { cardLine, held })
     requires_approval: false,
     priority: 80,
   };
-}
-
-/** Lines of the overnight pushes not yet announced (live, inside the window). */
-async function readHeldLines(runSQL, nowMs) {
-  const rows = await runSQL(`
-    SELECT action_payload->>'card_line' AS line
-      FROM agent_actions
-     WHERE action_type = 'five9_add_records_to_list' AND rule_applied = ${q(RULE_KEY)}
-       AND created_at >= ${q(new Date(nowMs - 86_400_000).toISOString())}
-       AND action_payload->>'card_held' = 'true'
-     ORDER BY created_at`);
-  if (!Array.isArray(rows)) throw new Error('held-card read returned no row set');
-  return rows.map((r) => r.line).filter(Boolean);
 }
 
 /* --- the pass ------------------------------------------------------------- */
@@ -383,7 +372,6 @@ export async function runNewLeadDialBackstop({ env = process.env, nowMs = Date.n
       for (const l of Object.values(cfg.lists)) keys.push(markKey(r.in1, l));
       keys.push(phoneDayKey(r.phone, today));
     }
-    keys.push(overnightCardKey(today));
     marks = await readMarks(d.supabase, [...new Set(keys)]);
   } catch (err) {
     errors.push(`read: ${err.message}`);
@@ -479,35 +467,9 @@ export async function runNewLeadDialBackstop({ env = process.env, nowMs = Date.n
     }
   }
 
-  // 4. Live only: the cards, the watchdog and the failure alarm.
+  // 4. Live only: the watchdog and the failure alarm. No card for the pushes
+  // themselves (Mark, 2026-10-07: never post "we fixed it").
   if (mode === 'live') {
-    const channel = String(env.SLACK_CHANNEL_SERVICE || '').trim();
-    const post = async (text) => (channel
-      ? Promise.resolve(d.postToSlack(text, channel)).catch((err) => ({ ok: false, error: err.message }))
-      : { ok: false, error: 'SLACK_CHANNEL_SERVICE unset' });
-
-    // While the dialer is closed the pushes wait in Five9, and so does their card.
-    if (dialOpen && pushed.length) {
-      const res = await post(formatPushedCard(pushed));
-      if (!res?.ok) errors.push(`#contact-center card: ${res?.error || 'post failed'}`);
-    }
-    // The overnight card: once, in the first pass after 8:00 ET.
-    const cardKey = overnightCardKey(etDateKey(nowMs));
-    if (dialOpen && !marks.has(cardKey)) {
-      try {
-        const lines = await readHeldLines(d.runSQL, nowMs);
-        if (await claim(d.supabase, cardKey) && lines.length) {
-          const res = await post(formatPushedCard(lines, { overnight: true }));
-          if (!res?.ok) {
-            await Promise.resolve(d.supabase.from(MARKS_TABLE).delete().in('dedup_key', [cardKey])).catch(() => {});
-            errors.push(`#contact-center overnight card: ${res?.error || 'post failed'}`);
-          }
-        }
-      } catch (err) {
-        errors.push(`overnight card: ${err.message}`);
-      }
-    }
-
     unhandled = unhandledLeads(outcomes, { nowMs, cfg });
     if (unhandled.length) {
       const items = unhandled.map((u) => ({ ...u, key: idOf(u.row), reason: 'unhandled' }));

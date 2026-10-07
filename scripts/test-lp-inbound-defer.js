@@ -227,6 +227,18 @@ test('card posts to #contact-center ONCE per row across re-drives', async () => 
   assert.deepEqual(posts, ['CCENTER']);
 });
 
+test('an inquiry the inbound checkout watch already carded gets no second card (2026-10-07)', async () => {
+  const posts = [];
+  const store = postedStore();
+  await store.recordPosted({ items: [{ key: '428372', reason: 'waiting' }] }); // the watch's card
+  const deps = { ...store, env: { SLACK_CHANNEL_SERVICE: 'CCENTER' },
+    postToSlack: async (text, ch) => { posts.push(ch); return { ok: true }; },
+    sendAlertMessage: async () => { throw new Error('should not page ops'); } };
+  assert.equal((await escalateHeldInbound('card', '428372', deps)).reason, 'carded_by_inbound_watch');
+  assert.equal((await escalateHeldInbound('card', '428372', deps)).reason, 'already_posted');
+  assert.deepEqual(posts, []);
+});
+
 test('failed or unconfigured post → one ops line, not recorded, retried next re-drive', async () => {
   const ops = [];
   let ok = false;

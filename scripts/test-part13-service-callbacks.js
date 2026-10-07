@@ -88,6 +88,34 @@ test('the service card goes to the market #service channel, with no callback wor
   assert.ok(tags.includes('callback:requested'));
 });
 
+test('a hand-off card posts once per contact per reason per day; tag and note still every time (2026-10-07)', async () => {
+  const posted = []; const notes = []; const seen = new Set();
+  const deps = {
+    applyTags: async () => {}, addNote: async (_id, n) => { notes.push(n); }, emitEvent: async () => {},
+    post: async (_text, id) => { posted.push(id); return { ok: true }; },
+    opsAlert: async () => {},
+    serviceChannels: async () => ['C_SERVICE_ORLANDO'],
+    env: { SLACK_CHANNEL_SERVICE: 'C_CONTACT_CENTER' },
+    filterNew: async ({ items }) => ({ fresh: items.filter((i) => !seen.has(`${i.key}|${i.reason}`)) }),
+    recordPosted: async ({ items }) => { items.forEach((i) => seen.add(`${i.key}|${i.reason}`)); },
+  };
+  const day1 = Date.parse('2026-10-07T15:00:00Z');
+  for (const msg of ['my install date?', 'hello?', 'any update']) {
+    await routeNepqHandoff({ contactId: 'C1', reason: 'service', channel: 'livechat', inbound: msg, nowMs: day1 }, deps);
+  }
+  assert.deepEqual(posted, ['C_SERVICE_ORLANDO'], 'three chat turns, one card');
+  assert.equal(notes.length, 3);
+  await routeNepqHandoff({ contactId: 'C1', reason: 'complaint', channel: 'livechat', inbound: 'nobody came', nowMs: day1 }, deps);
+  assert.equal(posted.length, 3, 'a different reason is a new item (#contact-center + #dispatch)');
+  await routeNepqHandoff({ contactId: 'C1', reason: 'service', channel: 'livechat', inbound: 'still waiting', nowMs: day1 + 86_400_000 }, deps);
+  assert.equal(posted.length, 4, 'next day: a new card');
+  // A failed post is not recorded, so the next turn tries again.
+  const failing = { ...deps, post: async () => ({ ok: false, error: 'channel_not_found' }) };
+  await routeNepqHandoff({ contactId: 'C2', reason: 'service', channel: 'sms', inbound: 'x', nowMs: day1 }, failing);
+  await routeNepqHandoff({ contactId: 'C2', reason: 'service', channel: 'sms', inbound: 'x', nowMs: day1 }, deps);
+  assert.equal(posted.length, 5);
+});
+
 // ── 2026-10-03 replay after #1156 ──
 const { enforceNepqPlan } = await import('../src/agentic/nepq-planner.js');
 test('a discovery turn asks one thing: a "let me get your zip" statement goes', () => {

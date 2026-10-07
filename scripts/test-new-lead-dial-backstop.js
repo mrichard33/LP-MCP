@@ -16,11 +16,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   backstopMode, backstopConfig, normalizeInboundRow, rowFromLead, currentState, routeList, routeNoAppt,
-  prefilter, finalDecision, buildBackstopRecord, formatPushedCard, markKey, phoneDayKey,
+  prefilter, finalDecision, buildBackstopRecord, pushedLine, markKey, phoneDayKey,
   etDateKey, lpDateToKey, lpTimeToHHMM, unhandledLeads, formatUnhandledCard, isChatbotLead,
 } from '../src/new-lead-dial-backstop.js';
 import {
-  runNewLeadDialBackstop, wasCalled, inDialWindow, readInboundRows, overnightCardKey,
+  runNewLeadDialBackstop, wasCalled, inDialWindow, readInboundRows,
 } from '../src/jobs/new-lead-dial-backstop.js';
 import { executeAddRecordsToList } from '../src/five9/admin-writes.js';
 import { summarizeContactRecord, five9UtcMs } from '../src/lead-leak-classify.js';
@@ -310,12 +310,11 @@ test('record: CustID, lead_id, LPRecKey INQ<in1>, GHL id as call_ID, no garbage 
   assert.equal(m.state, undefined, '"nu" is not a state');
 });
 
-test('card names the lead, the visit and the list — no rule codes', () => {
+test('the stored push line names the lead, the visit and the list — no rule codes', () => {
   const r = row('daniel');
-  const text = formatPushedCard([{ row: r, list: 'Conf - Next Day', state: currentState(r, null) }]);
+  const text = pushedLine({ row: r, list: 'Conf - Next Day', state: currentState(r, null) });
   assert.match(text, /Daniel · \(239\) 250-0011 · visit Mon, 10\/5, 2:00 PM → Conf - Next Day \(LP lead 581084\)/);
   assert.doesNotMatch(text, /not_on_dial_list|NEW_LEAD/);
-  assert.match(formatPushedCard(['• x'], { overnight: true }), /OVERNIGHT/);
 });
 
 /* --- the pass ------------------------------------------------------------------------------- */
@@ -363,9 +362,6 @@ function harness({
     if (sql.includes('five9_events_raw')) return calls;
     if (sql.includes('closed_won = true')) return soldPhones.map((p) => ({ phone10: p }));
     if (sql.includes('lp_callback_requeue')) return callbackRows;
-    if (sql.includes('card_held')) {
-      return state.actions.filter((a) => a.action_payload.card_held === true).map((a) => ({ line: a.action_payload.card_line }));
-    }
     if (sql.includes('created_at_lp >=')) return windowLeads;
     if (sql.includes('lp_lead_id IN')) return [];
     throw new Error(`unexpected SQL: ${sql.slice(0, 80)}`);
@@ -398,7 +394,7 @@ test('replay 10/5 10:15 ET: shadow would push all four, writes nothing, posts no
   assert.equal(h.state.alerts.length, 0);
 });
 
-test('live: pushes once, one card, and the next pass pushes nothing', async () => {
+test('live: pushes once, posts nothing to #contact-center, and the next pass pushes nothing', async () => {
   const h = harness({ mode: 'live' });
   const first = await h.run();
   assert.equal(first.pushed, 4);
@@ -407,13 +403,13 @@ test('live: pushes once, one card, and the next pass pushes nothing', async () =
   assert.equal(daniel.action_type, 'five9_add_records_to_list');
   assert.equal(daniel.requires_approval, false);
   assert.equal(daniel.action_payload.card_held, false);
-  assert.equal(h.state.posts.length, 1);
-  assert.equal(h.state.posts[0].ch, 'CCENTER');
+  assert.match(daniel.action_payload.card_line, /Daniel .* → Conf - Next Day \(LP lead 581084\)/, 'the push stays readable on its row');
+  assert.equal(h.state.posts.length, 0, 'Mark 2026-10-07: the system fixed it, nobody has to act');
   assert.equal(h.state.alerts.at(-1).active, false);
   const second = await h.run(MON_1015 + 5 * 60000);
   assert.equal(second.pushed, 0);
   assert.equal(h.state.actions.length, 4);
-  assert.equal(h.state.posts.length, 1, 'no card when nothing was pushed');
+  assert.equal(h.state.posts.length, 0);
 });
 
 test('every decision is logged by reason, including called / killed / no_phone', async () => {
@@ -440,16 +436,13 @@ test('the 4 missed leads, pushed the same night: chatbot → Reece Chatbot, Goog
     ['6623125252', 'Reece Chatbot'], ['7722374989', 'Direct Lead Entry'], ['8639446117', 'Direct Lead Entry'], ['9046798884', 'Reece Chatbot'],
   ]);
   assert.ok(h.state.actions.every((a) => a.action_payload.card_held === true));
-  assert.equal(h.state.posts.length, 0, 'overnight: the card waits for 8 AM');
+  assert.equal(h.state.posts.length, 0);
 
-  // 8:00 ET: the held card goes out once, and only once.
+  // 8:00 ET: no overnight card any more (Mark, 2026-10-07).
   await h.run(at('2026-10-06T12:00:00Z'));
-  assert.equal(h.state.posts.length, 1);
-  assert.match(h.state.posts[0].text, /OVERNIGHT/);
-  assert.match(h.state.posts[0].text, /Donna · \(662\) 312-5252 · no appointment → Reece Chatbot \(LP lead 581413\)/);
-  assert.ok(h.state.marks.has(overnightCardKey('2026-10-06')));
   await h.run(at('2026-10-06T12:05:00Z'));
-  assert.equal(h.state.posts.length, 1, 'no second overnight card');
+  assert.equal(h.state.posts.length, 0, 'no 8 AM "put on a list" card');
+  assert.ok(![...h.state.marks].some((k) => k.startsWith('dial-backstop-overnight-card:')));
 });
 
 test('evening chatbot leads not pushed overnight: > 14h old record at the morning pass → Callback Request', async () => {
@@ -568,7 +561,7 @@ test('a failed insert releases the claim so the next pass retries', async () => 
   const h = harness({ mode: 'live', insertError: 'db down' });
   const res = await h.run();
   assert.equal(res.ok, false);
-  assert.deepEqual([...h.state.marks].filter((k) => !k.startsWith('dial-backstop-overnight-card:')), [], 'no claim left behind');
+  assert.deepEqual([...h.state.marks], [], 'no claim left behind');
   assert.equal(h.state.alerts.at(-1).active, true);
 });
 
@@ -592,9 +585,11 @@ test('the pass runs at night too (24/7); the dialer holds the record until 8 AM'
   assert.equal(h.state.posts.length, 0);
 });
 
-test('a failed #contact-center post raises the ops alarm', async () => {
-  const h = harness({ mode: 'live', slackOk: false });
-  const res = await h.run();
+test('a failed #ops watchdog post raises the ops alarm', async () => {
+  const h = missedHarness({ mode: 'live', dncThrows: true });
+  h.deps.sendAlertMessage = async () => ({ sent: false, reason: 'channel_not_found' });
+  const res = await h.run(at('2026-10-06T12:31:00Z'));
   assert.equal(res.ok, false);
+  assert.ok(res.errors.some((e) => /unhandled-leads card/.test(e)));
   assert.equal(h.state.alerts.at(-1).active, true);
 });

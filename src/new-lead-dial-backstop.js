@@ -458,7 +458,7 @@ export function buildBackstopRecord(row, lead = null) {
 
 const VISIT_FMT = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', weekday: 'short', month: 'numeric', day: 'numeric', hour: 'numeric', minute: '2-digit' });
 
-/** One card line for one push. Stored on the action row too, for the 8 AM card. */
+/** One readable line for one push, stored on its action row (card_line). No card posts it since 2026-10-07. */
 export function pushedLine(p) {
   const name = [p.row.first, p.row.last].filter(Boolean).join(' ') || 'No name';
   const phone = `(${p.row.phone.slice(0, 3)}) ${p.row.phone.slice(3, 6)}-${p.row.phone.slice(6)}`;
@@ -468,19 +468,3 @@ export function pushedLine(p) {
   return `• ${name} · ${phone} · ${visit} → ${p.list} (LP lead ${p.row.ldsId})`;
 }
 
-/**
- * One #contact-center card for a pass that pushed something. Plain English.
- * `overnight` is the 8:00 ET card for pushes made while the dialer was closed.
- */
-export function formatPushedCard(pushedOrLines, { overnight = false } = {}) {
-  const lines = pushedOrLines.map((p) => (typeof p === 'string' ? p : pushedLine(p)));
-  return [
-    overnight
-      ? `📞 OVERNIGHT LEADS PUT ON A FIVE9 LIST — they dial from 8:00 AM`
-      : `📞 NEW LEADS PUT ON A FIVE9 LIST — nobody had called them yet`,
-    ``,
-    ...capLines(lines, 15),
-    ``,
-    `Lead Perfection had not got these dialed, so our system added them.`,
-  ].join('\n');
-}
