@@ -34,9 +34,21 @@ test('normalizeUsage: anthropic and openai shapes', () => {
   );
   assert.deepEqual(
     normalizeUsage('openai', { prompt_tokens: 10, completion_tokens: 5, prompt_tokens_details: { cached_tokens: 3 } }),
-    { inputTokens: 10, outputTokens: 5, cacheReadTokens: 3, cacheWriteTokens: null },
+    { inputTokens: 7, outputTokens: 5, cacheReadTokens: 3, cacheWriteTokens: null },
+  );
+  // OpenAI with no cache detail: the whole prompt is uncached input.
+  assert.deepEqual(
+    normalizeUsage('openai', { prompt_tokens: 10, completion_tokens: 5 }),
+    { inputTokens: 10, outputTokens: 5, cacheReadTokens: null, cacheWriteTokens: null },
   );
   assert.deepEqual(normalizeUsage('anthropic', null), { inputTokens: null, outputTokens: null, cacheReadTokens: null, cacheWriteTokens: null });
+});
+
+test('computeCostUsd: an OpenAI cached token is billed once, at the cached rate', () => {
+  const t = normalizeUsage('openai', { prompt_tokens: 1_000_000, completion_tokens: 0, prompt_tokens_details: { cached_tokens: 400_000 } });
+  const rates = { 'gpt-5.4-mini': { in: 0.75, out: 4.5, cache_read: 0.075 } };
+  // 600k uncached at $0.75 + 400k cached at $0.075 = $0.45 + $0.03
+  assert.equal(computeCostUsd({ model: 'gpt-5.4-mini', ...t }, rates), 0.48);
 });
 
 test('recordLlmUsage: writes one row, fire-and-forget, never throws', async () => {

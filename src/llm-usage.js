@@ -14,7 +14,8 @@
  * otherwise NULL. Rates are per 1M tokens. No rate is ever guessed in code —
  * the provider dashboards are the source of truth for pricing. Example:
  *   LLM_PRICE_TABLE_JSON={"claude-sonnet-4-6":{"in":3,"out":15,"cache_read":0.3,"cache_write":3.75},
- *                         "gpt-5.4-mini":{"in":0.25,"out":2}}
+ *                         "gpt-5.4-mini":{"in":0.75,"out":4.5,"cache_read":0.075}}
+ * The current dated value is in docs/llm-price-table.md.
  * Lookup is exact model id first, then longest key prefix match.
  */
 
@@ -71,18 +72,24 @@ export function computeCostUsd({ model, inputTokens, outputTokens, cacheReadToke
 }
 
 /**
- * Normalize a provider usage object to the four counters.
+ * Normalize a provider usage object to the four counters. inputTokens is the
+ * UNCACHED input on both providers, so each token is priced exactly once.
  * Anthropic: input_tokens / output_tokens / cache_read_input_tokens / cache_creation_input_tokens
+ *            (input_tokens already excludes the cache counters)
  * OpenAI:    prompt_tokens / completion_tokens / prompt_tokens_details.cached_tokens
+ *            (prompt_tokens INCLUDES cached_tokens — subtracted here, or a cached
+ *            token would be billed at the full input rate AND the cached rate)
  */
 export function normalizeUsage(provider, usage) {
   const u = usage || {};
   const n = (v) => (Number.isFinite(v) ? v : null);
   if (provider === 'openai') {
+    const prompt = n(u.prompt_tokens);
+    const cached = n(u.prompt_tokens_details?.cached_tokens);
     return {
-      inputTokens: n(u.prompt_tokens),
+      inputTokens: prompt === null ? null : Math.max(0, prompt - (cached ?? 0)),
       outputTokens: n(u.completion_tokens),
-      cacheReadTokens: n(u.prompt_tokens_details?.cached_tokens),
+      cacheReadTokens: cached,
       cacheWriteTokens: null,
     };
   }
