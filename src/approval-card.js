@@ -341,7 +341,9 @@ export function describeApprove(action, { event, contactName, enrichment = {} } 
       } else if (visit) {
         const where = pl.reason === 'appt_3plus_days'
           ? ' The visit is 3+ days out; the number goes on a confirmation list two days before it.'
-          : pl.confirmation_list ? ` The number is on "${pl.confirmation_list}" for the confirmation call.` : ' The appointment is already confirmed.';
+          : pl.reason === 'appointment_issued'
+            ? ' The appointment is already issued to a rep.'
+            : pl.confirmation_list ? ` The number is on "${pl.confirmation_list}" for the confirmation call.` : ' The appointment is already confirmed.';
         lines.push(`Why: ${person} is booked for ${visit}, so setters should stop calling.${where}`);
       }
       if (pl.lp_readded) lines.push('Lead Perfection put the number back on a setter list after an earlier removal.');

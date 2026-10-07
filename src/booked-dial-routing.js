@@ -18,9 +18,10 @@
 //   Confirmation list. An inquiry LP has not issued (no CustID) cannot be added
 //   (the agent's screen pop keys on CustID), so it waits; the inbound-checkout
 //   watch gets it checked out.
-//   Exceptions, both Mark's rulings: an appointment already confirmed (dsp
-//   "Cnf") needs no confirmation call, so it gets no add and the removal goes
-//   ahead; and a visit 3+ days out (2026-10-06 follow-up) comes off the setter
+//   Exceptions, all Mark's rulings: an appointment already confirmed (dsp
+//   "Cnf") or issued to a rep (dsp "Issue", 2026-10-06) needs no confirmation
+//   call, so it gets no add and the removal goes ahead ("Verif" is a Set);
+//   and a visit 3+ days out (2026-10-06 follow-up) comes off the setter
 //   lists RIGHT AWAY and goes on Confirmation two days before the visit —
 //   nobody should call a booked person in between.
 //
@@ -65,9 +66,14 @@ export const MODES = Object.freeze(['off', 'shadow', 'live']);
 export const RULE_KEY = 'BOOKED_DIAL_ROUTING';
 export const DEFAULT_REMOVE_LISTS = Object.freeze(['LP_ASAP', 'Reece Chatbot', 'Direct Lead Entry', 'After DIAL ASAP']);
 export const DEFAULT_SKIP_DSP = Object.freeze(['CXL', 'Reset', 'NoShow']);
-// Booked = a Set or confirmed appointment, or a blank disposition carrying a
-// date (a self-booked inquiry LP has not dispositioned yet).
-export const BOOKED_DSP = Object.freeze(new Set(['Set', 'Cnf']));
+// Booked = a Set, verified, confirmed or issued appointment, or a blank
+// disposition carrying a date (a self-booked inquiry LP has not dispositioned
+// yet). Mark's rulings, 2026-10-06: "Verif means the same as Set" (so it gets
+// the Confirmation add, then the removal), and "Issue" (the visit is issued to
+// a rep) is treated like confirmed (removal only, below).
+export const BOOKED_DSP = Object.freeze(new Set(['Set', 'Verif', 'Cnf', 'Issue']));
+// Booked AND past the confirmation call: off the setter lists, no Confirmation add.
+export const REMOVE_ONLY_DSP = Object.freeze({ Cnf: 'already_confirmed', Issue: 'appointment_issued' });
 
 /* --- config, read per pass ---------------------------------------------- */
 
@@ -183,7 +189,7 @@ export function routeBooked(c, { nowMs, cfg }) {
   const daysOut = daysBetween(etDateKey(nowMs), c.apptDate);
   if (daysOut < 0) return { skip: 'past_appointment' };
   if (daysOut === 0 && Number.isFinite(c.apptStartMs) && c.apptStartMs <= nowMs) return { skip: 'past_appointment' };
-  if (c.dsp === 'Cnf') return { addList: null, removeAllowedWithoutAdd: true, daysOut, why: 'already_confirmed' };
+  if (REMOVE_ONLY_DSP[c.dsp]) return { addList: null, removeAllowedWithoutAdd: true, daysOut, why: REMOVE_ONLY_DSP[c.dsp] };
   if (daysOut <= 1) return { addList: cfg.conf.nextDay, removeAllowedWithoutAdd: false, daysOut, why: daysOut === 0 ? 'appt_today' : 'appt_tomorrow' };
   if (daysOut === 2) return { addList: cfg.conf.secondDay, removeAllowedWithoutAdd: false, daysOut, why: 'appt_in_2_days' };
   // 3+ days (Mark, 2026-10-06 follow-up): off the setter lists now; the
@@ -326,7 +332,9 @@ export function buildRemovalAction(c, { reason, readded = false, confList = null
     ? `The visit is now tomorrow or today, so the number is on "${cfg.conf.nextDay}"; this stops a second confirmation call from "${cfg.conf.secondDay}".`
     : reason === 'appt_3plus_days'
       ? 'The visit is 3+ days out; the number goes on a confirmation list two days before it.'
-      : confList ? `It is on "${confList}" for the confirmation call.` : 'The appointment is already confirmed.';
+      : reason === 'appointment_issued'
+        ? 'The appointment is already issued to a rep, so no confirmation call is needed.'
+        : confList ? `It is on "${confList}" for the confirmation call.` : 'The appointment is already confirmed.';
   return {
     event_id: null,
     action_type: 'five9_delete_record_from_list',

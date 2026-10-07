@@ -13,7 +13,7 @@ import {
   buildAddAction, approvalExpired, onePerPhone, priorRemoveKeys, removeKey, RULE_KEY,
   failedAddCount, confMoveDue, formatAddFailedCard,
 } from '../src/booked-dial-routing.js';
-import { routeList, backstopConfig } from '../src/new-lead-dial-backstop.js';
+import { routeList, backstopConfig, currentState, prefilter as backstopPrefilter } from '../src/new-lead-dial-backstop.js';
 import { normalizeInboundRow } from '../src/new-lead-dial-backstop.js';
 import { runBookedDialRouting, __resetLoggedForTests } from '../src/jobs/booked-dial-routing.js';
 import { executeDeleteRecordFromList, listRecordsDeletedFrom } from '../src/five9/admin-writes.js';
@@ -169,6 +169,25 @@ test('Cnf (already confirmed) → no add, removal yes', () => {
   assert.equal(p.route.addList, null);
   const d = decide({ ...base, pre: p });
   assert.deepEqual([d.add, d.remove], [false, true]);
+});
+
+test('Issue is treated like confirmed (no add, removal yes); Verif is treated like Set (Mark, 2026-10-06)', () => {
+  const now = edt('2026-10-06T16:00:00');
+  const issue = pre(cand({ dsp_id: 'Issue' }), now);
+  assert.equal(issue.action, 'candidate');
+  assert.equal(issue.reason, 'appointment_issued');
+  assert.equal(issue.route.addList, null);
+  assert.deepEqual([decide({ ...base, pre: issue }).add, decide({ ...base, pre: issue }).remove], [false, true]);
+  // lp_leads says Issue even though the inquiry row said Set.
+  const lead = { lp_lead_id: '581671', disposition_code: 'Issue', appointment_date: '2026-10-08 18:00:00+00', lp_prospect_id: '463389' };
+  assert.equal(pre(cand({}, lead), now).reason, 'appointment_issued');
+  // "Verif means the same as Set": Confirmation add first, then the removal.
+  const verif = pre(cand({ dsp_id: 'Verif' }), now);
+  assert.deepEqual([verif.action, verif.reason, verif.route.addList], ['candidate', 'appt_in_2_days', 'Conf - 2nd Day']);
+  assert.deepEqual([decide({ ...base, pre: verif }).add, decide({ ...base, pre: verif }).remove], [true, false]);
+  const row = buildRemovalAction(cand({ dsp_id: 'Issue' }), { reason: 'appointment_issued', cfg, nowMs: now });
+  assert.match(row.reasoning, /already issued to a rep/);
+  assert.match(describeApprove(row, { contactName: 'Shelley' }), /already issued to a rep/);
 });
 
 test('DNC → skipped; DNC unreadable → wait; Five9 record unreadable → no add', () => {
@@ -554,4 +573,36 @@ test('the claim read pages until a short page', async () => {
   const seen = await readBookedMarks(db, Date.now());
   assert.equal(seen.size, 2500);
   assert.deepEqual(calls, [0, 1000, 2000]);
+});
+
+test('new-lead backstop: Verif is a booked visit, exactly like Set (Mark, 2026-10-06)', () => {
+  const nowMs = edt('2026-10-06T16:00:00');
+  const bcfg = backstopConfig({});
+  for (const dsp of ['Set', 'Verif']) {
+    const row = normalizeInboundRow({ ...SHELLEY_RAW, dsp_id: dsp });
+    const st = currentState(row, null);
+    assert.equal(st.hasAppt, true, dsp);
+    assert.equal(st.apptDateEt, '2026-10-08');
+    const p = backstopPrefilter({ row, lead: null, called: false, nowMs, cfg: bcfg });
+    assert.deepEqual([p.action, p.list], ['candidate', 'Conf - 2nd Day'], dsp);
+  }
+  // Cnf / Issue stay "progressed" in the backstop (booked routing owns them).
+  const cnf = backstopPrefilter({ row: normalizeInboundRow({ ...SHELLEY_RAW, dsp_id: 'Cnf' }), lead: null, called: false, nowMs, cfg: bcfg });
+  assert.equal(cnf.reason, 'progressed');
+});
+
+test('a removal-only lead needs no Five9 lookup, so the lookup cap never holds it back', async () => {
+  __resetLoggedForTests();
+  const confirmed = Array.from({ length: 60 }, (_, i) => ({
+    ...SHELLEY_RAW, id: String(800000 + i), lds_id: String(810000 + i), cst_id: String(820000 + i), dsp_id: 'Cnf',
+    phone: `(941)6${String(i).padStart(6, '0')}`, datereceived: '2026-10-06T10:00:00',
+  }));
+  const h = harness({ inbound: confirmed });
+  let lookups = 0;
+  const orig = h.deps.getContactRecords;
+  h.deps.getContactRecords = async (q) => { lookups += 1; return orig(q); };
+  const res = await runBookedDialRouting({ env: { BOOKED_ROUTING_MAX_LOOKUPS: '5' }, nowMs: edt('2026-10-06T16:00:00'), deps: h.deps });
+  assert.equal(lookups, 0);
+  assert.equal(res.by_reason.lookup_cap, undefined);
+  assert.equal(res.counts.would_remove, 20, 'only the removal cap applies');
 });
