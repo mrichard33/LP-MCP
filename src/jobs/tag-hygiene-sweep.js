@@ -25,6 +25,10 @@
  * line to #ops-alerts only when something was fixed or needs review. Counts
  * only, never a name or contact id. Slack is the primary destination here (the
  * handoff asked for it), so postToSlack, not the GroupMe mirror.
+ * 2026-10-07 (Mark: move the #ops summaries into the digest): with the digest
+ * on (ALERT_DIGEST_ENABLED, default on) this line is NOT posted. It re-posted
+ * "545 need review" every night. The 08:00 digest reads this run's job_runs
+ * row and lists the need-review count only when it rose (src/jobs/ops-morning-digest.js).
  *
  * Schedule: daily 03:00 ET, gated on TAG_SWEEP_ENABLED=true (ships off).
  * Manual: POST /admin/tag-hygiene/run?mode=report|apply&limit=N (authenticated).
@@ -32,6 +36,7 @@
 
 import { runJob } from '../job-runner.js';
 import { hourET, todayET } from './lp-report-common.js';
+import { alertDigestEnabled } from '../alert-posted.js';
 import { PIPELINE_IDS, GHL_LOCATION_ID } from '../actions/constants.js';
 import {
   evaluateTagRules, needsLpVerdict, needsOpenP3, tagsToRemove,
@@ -219,7 +224,9 @@ export async function runTagHygieneSweep(opts = {}, injected = null) {
 
     const counts = summarizeDecisions(all);
     let slack = null;
-    if (shouldPostSummary(counts)) {
+    if (alertDigestEnabled(env)) {
+      slack = { ok: false, skipped: 'digest' }; // the 08:00 digest reads this row
+    } else if (shouldPostSummary(counts)) {
       try { slack = await deps.postSummary(formatSweepSummary(counts, mode)); }
       catch (err) { slack = { ok: false, error: err.message }; }
     }

@@ -350,7 +350,8 @@ down and on recovery. Hand-off cards (`routeNepqHandoff`) post once per contact 
 **Ops alerts post only new items, mostly once a morning (Mark, 2026-10-02).** `src/jobs/ops-morning-digest.js`
 posts ONE 08:00 ET card to #ops-alerts: P2 Won/Lost (24h), new appt-parity gaps, and the morning checks
 (f0-integrity-audit, lead-leak, link-leak, p2-unresolvable), which now run inside it and no longer post their own
-card unless they FAIL. "Already posted" lives in ONE store, `audit_posted_items` via `src/alert-posted.js` —
+card unless they FAIL. The nightly tag sweep (03:00) and the inbound-caller summary (07:15) post nothing either
+(2026-10-07): the digest reads their `job_runs` rows and lists a count only when it rose, or the run if it did not finish. "Already posted" lives in ONE store, `audit_posted_items` via `src/alert-posted.js` —
 do not build another. Drift posts one card per contact, ever (`permanent`); intake journal waits 60 min; the
 uncalled-leads card names only leads not posted in 7 days; outages post on state change only (`remindMs: 0`).
 `ALERT_DIGEST_ENABLED=false` restores the per-alert cards (drift stays once-per-contact). Info-only rule cards

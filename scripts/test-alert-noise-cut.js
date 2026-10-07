@@ -262,6 +262,47 @@ test('digest: sales given a GHL contact are listed', async () => {
   assert.match(sent[0].text, /linked to an existing contact: 1 — John Pitzer/);
 });
 
+// 2026-10-07 (Mark: move the #ops summaries into the digest): the tag sweep and
+// the inbound-caller summary post nothing themselves; the digest reads their runs.
+test('digest: nightly tag sweep and inbound-caller counts are listed only when they rise', async () => {
+  const runs = (needs, cands) => ({ job_runs: [
+    { job_id: 'tag-hygiene-sweep', status: 'ok', occurrence_key: '2026-10-03', started_at: iso(NOW - 5 * HOUR),
+      summary: 'report: 645 fixed', detail: { mode: 'report', fixed: 645, needs_review: needs } },
+    { job_id: 'inbound-caller-capture', status: 'ok', occurrence_key: '2026-10-03T07', started_at: iso(NOW - 2 * HOUR),
+      summary: 'hourly', detail: {} },
+    { job_id: 'inbound-caller-capture', status: 'ok', occurrence_key: '2026-10-03-summary', started_at: iso(NOW - 45 * 60_000),
+      summary: 'callers=245 candidates=230', detail: { mode: 'shadow', counts: { callers: 245, candidates: cands } } },
+  ] });
+  const first = digestDeps({ tables: runs(545, 230) });
+  await digest.runOpsMorningDigest({ post: true, deps: first.deps });
+  const t = first.sent[0].text;
+  assert.match(t, /Tag sweep \(03:00\)/);
+  assert.match(t, /545 contact\(s\) need a tag review · 645 would be fixed in apply mode/);
+  assert.match(t, /Inbound callers with no LP lead \(30 days\)/);
+  assert.match(t, /230 caller\(s\) to capture · capture mode shadow/);
+
+  // Same counts the next morning: not re-listed.
+  const same = digestDeps({ tables: { ...runs(545, 230), audit_posted_items: first.db.tables.audit_posted_items } });
+  await digest.runOpsMorningDigest({ post: true, deps: same.deps });
+  assert.match(same.sent[0].text, /All clear\./);
+
+  // A rise is listed with the old number.
+  const rose = digestDeps({ tables: { ...runs(560, 230), audit_posted_items: first.db.tables.audit_posted_items } });
+  await digest.runOpsMorningDigest({ post: true, deps: rose.deps });
+  assert.match(rose.sent[0].text, /560 contact\(s\) need a tag review \(was 545\)/);
+  assert.doesNotMatch(rose.sent[0].text, /to capture/);
+});
+
+test('digest: a nightly sweep that did not finish is always listed', async () => {
+  const { deps, sent } = digestDeps({ tables: { job_runs: [
+    { job_id: 'tag-hygiene-sweep', status: 'failed', occurrence_key: '2026-10-03', started_at: iso(NOW - 5 * HOUR),
+      summary: 'candidate query failed: HL down', detail: { ok: false } },
+  ] } });
+  await digest.runOpsMorningDigest({ post: true, deps });
+  assert.equal(sent.length, 1);
+  assert.match(sent[0].text, /The tag sweep did not finish \(failed\): candidate query failed: HL down · check job_runs/);
+});
+
 test('digest: a sub-job that fails posts its own "could not run" card; the digest still posts', async () => {
   const jobs = { 'lead-leak-monitor': { status: 'failed', error: 'Five9 history read failed' } };
   const { deps, sent } = digestDeps({ jobs });

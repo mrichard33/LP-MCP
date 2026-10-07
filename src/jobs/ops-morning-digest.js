@@ -21,6 +21,11 @@
 //   6. P2 with no LP job  (p2-unresolvable-monitor)
 //   (2026-10-03) Sales the Sale → P2 backstop put into P2 in the last 24h, and
 //   the ones it could not (no price yet) — src/p2-sale-backstop.js.
+//   (2026-10-07, Mark: move the #ops summaries in) the nightly tag sweep
+//   (03:00) and the inbound-caller capture summary (07:15) no longer post their
+//   own line; their job_runs rows are read here. Each count is listed only when
+//   it ROSE past the last one posted (the sweep said "545 need review" every
+//   night), and a run that did not finish is always listed.
 // Sections 3–6 run their job here, each under its own runJob so job_runs keeps
 // one row per job. A job that FAILS posts its own "could not run" card
 // straight away — silence must never hide a failure — and its section is left
@@ -274,6 +279,56 @@ function p2UnresolvableSection(deps, value, nowMs) {
   });
 }
 
+// 2026-10-07: the nightly summaries that used to post on their own. Read from
+// job_runs (the jobs keep their own schedules; the sweep is too heavy to run at
+// 08:00). The newest row in the last 24h wins.
+const NOT_FINISHED = new Set(['failed', 'unknown', 'interrupted']);
+
+async function latestRuns(deps, nowMs) {
+  const since = new Date(nowMs - DAY_MS).toISOString();
+  const { data, error } = await deps.supabase.from('job_runs')
+    .select('job_id, status, summary, detail, occurrence_key, started_at')
+    .in('job_id', ['tag-hygiene-sweep', 'inbound-caller-capture'])
+    .gte('started_at', since)
+    .order('started_at', { ascending: false })
+    .limit(100);
+  if (error) throw new Error(`job_runs read failed: ${error.message}`);
+  const rows = data || [];
+  return {
+    tag: rows.find((r) => r.job_id === 'tag-hygiene-sweep' && r.status !== 'running' && r.status !== 'skipped') || null,
+    // Only the 07:15 summary pass; the hourly capture passes are their own thing.
+    capture: rows.find((r) => r.job_id === 'inbound-caller-capture' && String(r.occurrence_key || '').endsWith('-summary')
+      && r.status !== 'running' && r.status !== 'skipped') || null,
+  };
+}
+
+async function summaryRunSection(deps, run, { audit, title, label, key, count, render, nowMs }) {
+  if (!run) return null;
+  if (NOT_FINISHED.has(run.status)) {
+    return { title, lines: [`${label} did not finish (${run.status}): ${String(run.summary || 'no summary').slice(0, 160)} · check job_runs`] };
+  }
+  return countSection(deps, { audit, title, counts: { [key]: count }, render, nowMs });
+}
+
+async function nightlySummarySections(deps, nowMs) {
+  const runs = await latestRuns(deps, nowMs);
+  const tag = runs.tag?.detail || {};
+  const cap = runs.capture?.detail || {};
+  return [
+    await summaryRunSection(deps, runs.tag, {
+      audit: 'tag_sweep', title: 'Tag sweep (03:00)', label: 'The tag sweep', key: 'needs_review',
+      count: Number(tag.needs_review), nowMs,
+      render: (_k, n, last) => `${n} contact(s) need a tag review${last ? ` (was ${last})` : ''}`
+        + `${tag.mode === 'report' && tag.fixed ? ` · ${tag.fixed} would be fixed in apply mode` : ''} · see tag_hygiene_log`,
+    }),
+    await summaryRunSection(deps, runs.capture, {
+      audit: 'inbound_capture', title: 'Inbound callers with no LP lead (30 days)', label: 'The inbound-caller summary',
+      key: 'candidates', count: Number(cap.counts?.candidates), nowMs,
+      render: (_k, n, last) => `${n} caller(s) to capture${last ? ` (was ${last})` : ''} · capture mode ${cap.mode || '?'}`,
+    }),
+  ];
+}
+
 /** Pure. The digest text. */
 export function formatDigest(sections, { date } = {}) {
   const live = sections.filter(Boolean);
@@ -311,6 +366,7 @@ export async function runOpsMorningDigest({ post = true, deps: depsArg } = {}) {
   for (const [label, build] of [['P2 won/lost summary', p2Section], ['Sale → P2 backstop summary', p2BackstopSection], ['Sale → contact backstop summary', saleContactSection], ['Appointment parity summary', paritySection]]) {
     try { sections.push(await build(deps, nowMs)); } catch (err) { await couldNotRun(label, err.message); }
   }
+  try { sections.push(...await nightlySummarySections(deps, nowMs)); } catch (err) { await couldNotRun('Nightly summaries (tag sweep, inbound callers)', err.message); }
 
   for (const j of JOB_SECTIONS) {
     const out = await deps.runJob(j.id, () => deps[j.run](), { occurrence: today });
