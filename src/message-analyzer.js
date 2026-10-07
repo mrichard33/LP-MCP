@@ -239,6 +239,7 @@
  */
 
 import { cleanInboundForModel } from './security/untrusted-text.js';
+import { guardInBackground } from './security/injection-guard.js';
 import crypto from 'node:crypto';
 import { buildLeadContext, upsertLeadIntelligence } from './context-builder.js';
 import { emitEvent } from './event-emitter.js';
@@ -1273,6 +1274,9 @@ export async function analyzeMessage(ghlContactId, messageText, eventId = null, 
   const rawMessageText = messageText == null ? '' : String(messageText);
   const cleanedInbound = cleanInboundForModel(rawMessageText);
   messageText = cleanedInbound.text;
+  // 2026-10-07 (IT review; CANON.STD.019/EVT.009): classifier layer, recorded,
+  // never awaited. Shadow by default; SMS is not a block surface.
+  guardInBackground({ surface: 'sms_inbound', text: messageText, removedCount: cleanedInbound.removedCount, sourceRef: ghlContactId });
   if (cleanedInbound.removedCount > 0) console.log(`[MessageAnalyzer] ${ghlContactId}: removed ${cleanedInbound.removedCount} invisible character(s) before analysis`);
   if (!checkRateLimit()) {
     console.warn(`[MessageAnalyzer] Rate limit reached (${ANALYSIS_RATE_LIMIT}/hr). Skipping ${ghlContactId}`);
