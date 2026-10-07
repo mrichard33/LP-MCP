@@ -187,7 +187,7 @@ test('D1 — removed action types are absent from ACTION_HANDLERS entirely', asy
   }
 });
 
-test('D1 — the registry holds exactly the 78 documented action types', async () => {
+test('D1 — the registry holds exactly the 83 documented action types', async () => {
   const { ACTION_HANDLERS } = await import('../src/actions/index.js');
   const types = Object.keys(ACTION_HANDLERS);
   // The header comment in src/actions/index.js enumerates these by name. It
@@ -213,7 +213,9 @@ test('D1 — the registry holds exactly the 78 documented action types', async (
   // five9_remove_numbers_from_dnc_approved (the Slack-approved lift).
   // 2026-10-02 (Maria, lead 580116): 81 → 82, s52_cancel_recheck — the one
   // 30-minute re-check of a cancel that not_reschedule_inflight suppressed.
-  assert.equal(types.length, 82);
+  // 2026-10-07 (one send gate, Jessup / McKoy): 82 → 83, dq_hard_stop — adds
+  // stop-bot and takes a disqualified lead out of the sending workflows.
+  assert.equal(types.length, 83);
   assert.equal(types.filter(t => t.startsWith('five9_')).length, 39);
   // Every type the coercion loop covers must actually be dispatchable.
   for (const actionType of FIVE9_WRITE_TYPES) {

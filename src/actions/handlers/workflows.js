@@ -209,6 +209,9 @@ import {
 import { executeRemoveTag } from './tags.js';
 import { withGhlToken } from '../../ghl-rate-limiter.js';
 import { gateS52Enrollment } from '../../s52-entry-gate.js';
+// 2026-10-07 — the one send gate (src/services/may-message.js).
+import { applySendGate } from '../../services/send-gate-report.js';
+import { matchMutationSuppression } from '../../services/suppression-check.js';
 
 // ── Universal Dynamic Hold (2026-06-12) ────────────────────────────────
 // One GHL "dumb clock" workflow (dfd3ffaa) parks a contact for hold_hours and
@@ -645,6 +648,39 @@ export async function executeAddToWorkflow(action) {
   // stops here first, whichever rule queued it (src/s52-entry-gate.js). Reads
   // LP live and fails closed; a block is a `skipped` row plus an
   // s52.entry_blocked event, never a Slack post.
+  // ── 2026-10-07 One send gate (src/services/may-message.js) ─────
+  // Enrolling a contact in a workflow is how most unprompted messages start,
+  // so it asks the same question every sender asks, with purpose 'mutation':
+  // an opt-out (stop-bot, the DNC family) blocks it. The executor's mutation
+  // gate (stop-bot only) is the old answer and stays the answer while
+  // SEND_GATE_MODE=shadow. One live tag read, reused by the entry guard below;
+  // a failed read fails open, exactly like that guard.
+  const tags = await readLiveTags(contactId);
+  if (tags) {
+    const legacyTag = matchMutationSuppression(tags);
+    const gate = applySendGate({
+      tags,
+      channel: null,
+      purpose: 'mutation',
+      legacy: { blocked: !!legacyTag, tag: legacyTag },
+      route: 'add_to_workflow',
+      contactId,
+    });
+    if (gate.blocked) {
+      console.log(`[ActionExecutor] ⏭️ add_to_workflow skipped — ${contactId} carries ${gate.tag} (send gate, ${gate.decision.reason}; ${wfLabel})`);
+      return {
+        action: 'skipped_send_gate',
+        contact_id: contactId,
+        canonical_code: canonicalCode,
+        canonical_name: canonicalName,
+        guard_tag: gate.tag,
+        gate_reason: gate.decision.reason,
+        workflow_name: payload.workflow_name || null,
+        route: 'skip',
+      };
+    }
+  }
+
   const s52Block = await gateS52Enrollment(action);
   if (s52Block) return s52Block;
 
@@ -659,7 +695,6 @@ export async function executeAddToWorkflow(action) {
   // from the same single live tag fetch.
   const activeTag = deriveActiveTag(canonicalCode);
   if (activeTag || hasEntryGuard(payload)) {
-    const tags = await readLiveTags(contactId);
     const match = tags ? entryGuardMatch(tags, { activeTag, payload }) : null;
     if (match?.reason === 'already_enrolled') {
       console.log(`[ActionExecutor] ⏭️ add_to_workflow skipped — ${contactId} already has ${activeTag} (${wfLabel})`);

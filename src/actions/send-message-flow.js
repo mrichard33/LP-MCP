@@ -63,7 +63,7 @@ export function senderTagFor(actionId) {
  * @param {object} action   agent_actions row
  * @param {object} context  executor context (event payload, batch cache)
  * @param {object} deps     injected I/O:
- *   checkSuppression(contact_id) → { suppressed, matched_tag, all_matches }
+ *   checkSuppression(contact_id, action) → { suppressed, matched_tag, all_matches }
  *   resolveTriggerId(action, context) → string|null
  *   acquireSlot({contact_id, job_id, trigger_id, holder}) → see agentic-reply-locks
  *   releaseSlot(contact_id, job_id, { holderToken })
@@ -79,7 +79,8 @@ export async function runSendMessageFlow(action, context, deps) {
   const now = deps.now || Date.now;
 
   // ── 1. Universal suppression gate — before any lock is taken ──
-  const suppression = await deps.checkSuppression(contact_id);
+  // 2026-10-07 — the action rides along so the one send gate knows the channel.
+  const suppression = await deps.checkSuppression(contact_id, action);
   if (suppression.suppressed) {
     console.log(
       `[ActionExecutor] send_message suppressed: contact=${contact_id} ` +

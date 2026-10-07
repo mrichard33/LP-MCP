@@ -16,13 +16,17 @@
  * This matches the convention used by src/services/outbound-locks.js.
  *
  * Used by:
- *   - executeSendMessageWithLock in src/actions/index.js (before lock acquire)
- *   - future outbound action handlers when they ship
+ *   - executeSendMessageWithLock in src/actions/index.js (gate 1 and the
+ *     send-time live re-check)
+ *   - the live-chat fast lane (matchSuppressionTags, mode 'direct_reply')
  *
  * NOT used by:
- *   - send_notification (GroupMe to team — internal, not outbound to contact)
- *   - add_to_workflow (queueing only — workflow's own send steps run under
- *     universal suppression at agentic-send time once they migrate)
+ *   - send_notification (GroupMe/Slack to team — internal, not outbound to contact)
+ *
+ * 2026-10-07 — every answer here now also goes through the ONE send gate,
+ * src/services/may-message.js (SEND_GATE_MODE shadow|live). add_to_workflow,
+ * info emails, nurture and lead selection call that gate directly; this
+ * file's lists are its shadow comparison for one release.
  *
  * Phase principle: GHL workflows retain only timer + send. Agentic owns
  * routing, suppression, classification. Suppression must be enforced at
@@ -60,6 +64,9 @@ import supabase from '../supabase.js';
 // from GHL (checkSuppressionLive below). No cycle: helpers.js only imports
 // the rate limiter + format helpers.
 import { ghlFetch } from '../actions/helpers.js';
+// 2026-10-07 — the one send gate. See src/services/may-message.js.
+import { purposeForLegacyMode } from './may-message.js';
+import { applySendGate } from './send-gate-report.js';
 
 /**
  * The canonical list of tags that suppress agentic outbound to a contact.
@@ -140,6 +147,14 @@ const SUPPRESS_SET = new Set(SUPPRESS_TAGS);
 // today that is ONLY the send_message flow (executeSendMessageWithLock).
 // Every other caller (resurrection eligibility, future outbound handlers)
 // keeps the full list.
+//
+// 2026-10-07 — this bypass is retired for the hard-DQ tags once
+// SEND_GATE_MODE=live: out-of-area, dq-out-of-area, hard-disqualified and
+// suppress-outbound then block a reply too (one send gate,
+// src/services/may-message.js; 34 replies to 14 contacts went out after
+// suppress-outbound in 30 days). quarantined, cooling-active,
+// cannot-afford:pursuing-assistance and active-entry:canvassing still do not
+// block a reply. In shadow mode this list still decides.
 const REPLY_BLOCKING_TAGS = [
   'stop-bot',
   // Consent / compliance — legally binding opt-outs
@@ -164,7 +179,42 @@ const REPLY_BLOCKING_SET = new Set(REPLY_BLOCKING_TAGS);
  * @param {string} [opts.logContact]  contact id for the bypass log line (the
  *                                    historical log kept its context)
  */
-export function matchSuppressionTags(tags, { mode = 'default', logContact = null } = {}) {
+export function matchSuppressionTags(tags, { mode = 'default', logContact = null, channel = null, route = 'suppression_check' } = {}) {
+  const legacy = legacyMatchSuppressionTags(tags, { mode, logContact });
+  // 2026-10-07 — one send gate (src/services/may-message.js). The old answer
+  // above stays the answer while SEND_GATE_MODE=shadow (a disagreement is
+  // logged as send_gate.would_block / would_allow); with SEND_GATE_MODE=live
+  // mayMessage decides. That is also what retires the always-respond bypass
+  // for the hard-DQ tags: in live, out-of-area / suppress-outbound /
+  // hard-disqualified block a reply, and the operational holds still do not.
+  const gate = applySendGate({
+    tags: Array.isArray(tags) ? tags : [],
+    channel,
+    purpose: purposeForLegacyMode(mode, tags),
+    legacy: { blocked: !!legacy.suppressed, tag: legacy.matched_tag || null },
+    route,
+    contactId: logContact,
+  });
+  if (gate.source === 'legacy' || gate.source === 'legacy_unclassified') return legacy;
+  if (gate.blocked) {
+    return {
+      suppressed: true,
+      reason: 'suppression_tag_match',
+      matched_tag: gate.tag,
+      all_matches: gate.decision.matches,
+      gate: 'may_message',
+      gate_reason: gate.decision.reason,
+    };
+  }
+  return { suppressed: false, reason: legacy.suppressed ? 'send_gate_allowed' : 'no_match', gate: 'may_message' };
+}
+
+/**
+ * The pre-2026-10-07 predicate, unchanged. Kept for one release as the shadow
+ * comparison for the one send gate; matchSuppressionTags above decides which
+ * answer stands.
+ */
+export function legacyMatchSuppressionTags(tags, { mode = 'default', logContact = null } = {}) {
   const t = Array.isArray(tags) ? tags : [];
 
   // Always-respond policy (see REPLY_BLOCKING_TAGS above): for a direct
@@ -230,7 +280,7 @@ export function matchSuppressionTags(tags, { mode = 'default', logContact = null
  *   { suppressed: true,  reason: 'suppression_tag_match',
  *     matched_tag: 'quarantined', all_matches: ['quarantined', 'dnc'] }
  */
-export async function checkSuppression(contact_id, { mode = 'default' } = {}) {
+export async function checkSuppression(contact_id, { mode = 'default', channel = null, route = 'send_flow' } = {}) {
   if (!supabase) return { suppressed: false, reason: 'no_supabase_open' };
   if (!contact_id) return { suppressed: false, reason: 'no_contact_id_open' };
 
@@ -249,7 +299,7 @@ export async function checkSuppression(contact_id, { mode = 'default' } = {}) {
     return { suppressed: false, reason: 'no_snapshot_open' };
   }
 
-  return matchSuppressionTags(data.tags, { mode, logContact: contact_id });
+  return matchSuppressionTags(data.tags, { mode, logContact: contact_id, channel, route });
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -306,7 +356,7 @@ export async function checkSuppressionLive(contact_id, { mode = 'default', chann
     ? contact.tags.map(t => String(t).trim().toLowerCase())
     : [];
 
-  const tagResult = matchSuppressionTags(tags, { mode, logContact: contact_id });
+  const tagResult = matchSuppressionTags(tags, { mode, logContact: contact_id, channel, route: 'send_flow_live' });
   if (tagResult.suppressed) {
     return { ...tagResult, source: 'live' };
   }
@@ -414,7 +464,9 @@ export function isSuppressionAuditTag(tag) {
 //     rep who takes a contact over would have their customer's appointment
 //     auto-cancelled underneath them. Reducing contact is safe; cancelling a
 //     booked visit is not the same thing.
-const DE_ESCALATION_ACTION_TYPES = new Set(['remove_from_workflow']);
+// 2026-10-07 — dq_hard_stop (src/services/dq-hard-stop.js) adds stop-bot,
+// removes agentic-active and queues workflow removals: it only reduces contact.
+const DE_ESCALATION_ACTION_TYPES = new Set(['remove_from_workflow', 'dq_hard_stop']);
 
 // Enrollment/cohort membership only. Anchored, and narrow on purpose — a
 // pattern that accidentally matched a suppression tag would turn this

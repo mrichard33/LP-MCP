@@ -332,6 +332,9 @@ import { botCallbackDeps, nepqHandoffDeps } from './services/bot-callback-io.js'
 import { addGHLNote } from './ghl.js';
 import { prerequisiteAskMessage } from './appointments/prerequisite-ask.js';
 import { buildRepNoteAction } from './agentic/rep-note.js';
+// 2026-10-07 — the one send gate (src/services/may-message.js).
+import { purposeForLegacyMode } from './services/may-message.js';
+import { applySendGate } from './services/send-gate-report.js';
 // 2026-10-07 — a promised call is an owned task; never promised twice.
 import { guardRepeatPromise, recordPromiseIfAny } from './services/promised-callbacks-io.js';
 
@@ -889,6 +892,43 @@ function checkConversationGate(tags) {
     return { allowed: false, reason: 'stop_bot' };
   }
   return { allowed: true, reason: 'auto_respond' };
+}
+
+/**
+ * 2026-10-07 — the handler's two checks above, now thin wrappers over the one
+ * send gate (src/services/may-message.js). Their combined answer is the
+ * "legacy" side; with SEND_GATE_MODE=shadow it still decides and a
+ * disagreement is logged once; with SEND_GATE_MODE=live mayMessage decides.
+ * Before this the handler knew only the DNC family and stop-bot, so a
+ * contact SERVICE_AREA_EXIT had tagged out-of-area + suppress-outbound still
+ * got the next AI reply (Jessup, LmBvkJUNrqZ9HoVNuovP, 2026-10-05).
+ *
+ * The purpose follows the flow's gate 1 (purposeForLegacyMode): a reply while
+ * agentic-active is on, otherwise outreach. The channel is passed only when
+ * the payload named it — before resolveReplyContext it may still be a guess.
+ *
+ * Returns null (send) or { hard, tag, reason, gate } (block).
+ */
+export function decideHandlerGate(tags, { channel = null, contactId = null } = {}, deps = {}) {
+  const hard = checkSuppression(tags);
+  const convo = checkConversationGate(tags);
+  const legacyTag = hard?.hard ? hard.tag : (convo.allowed ? null : 'stop-bot');
+  const gate = applySendGate({
+    tags,
+    channel,
+    purpose: purposeForLegacyMode('agentic_reply', tags),
+    legacy: { blocked: !!legacyTag, tag: legacyTag },
+    route: 'send_handler',
+    contactId,
+  }, deps);
+  if (!gate.blocked) return null;
+  if (gate.source !== 'may_message') {
+    // The old answer stands: keep its exact result shape.
+    return hard?.hard
+      ? { hard: true, tag: hard.tag, reason: `hard_suppression_${hard.tag}`, gate: gate.source }
+      : { hard: false, tag: 'stop-bot', reason: convo.reason, gate: gate.source };
+  }
+  return { hard: true, tag: gate.tag, reason: `send_gate_${gate.decision.reason}_${gate.tag}`, gate: 'may_message' };
 }
 
 async function applyContactTags(contactId, tagList) {
@@ -2983,33 +3023,26 @@ export async function executeSendMessage(action, context) {
     console.log(`[SendMessage] tag resolution for ${contactId} used ${tagResolution.source}`);
   }
 
-  // ── Guardrail 2: Hard suppression check (v3.12 — compliance only) ──
-  // Hard suppression (dnc / do-not-contact / dnc-sms / stage:dnc) ALWAYS
-  // blocks: lead's own choice or compliance-mandated. Soft suppression
-  // (suppress-automation) is no longer evaluated here — agentic-active
-  // upstream is now the canonical "agentic bot is in charge" signal.
-  const suppression = checkSuppression(tags);
-  if (suppression?.hard) {
-    console.log(`[SendMessage] ⛔ HARD SUPPRESSION: ${contactId} has ${suppression.tag} tag — blocking agentic send (compliance / lead opt-out)`);
+  // ── Guardrails 2 + 3: the one send gate (2026-10-07) ──────────
+  // v3.12's hard suppression (dnc / do-not-contact / dnc-sms / stage:dnc) and
+  // stop-bot kill switch, now decided together with mayMessage — see
+  // decideHandlerGate. Result shapes are unchanged for the old answers.
+  const handlerGate = decideHandlerGate(tags, { channel: channelExplicit ? channel : null, contactId });
+  if (handlerGate?.hard) {
+    console.log(`[SendMessage] ⛔ SEND GATE: ${contactId} has ${handlerGate.tag} — blocking agentic send (${handlerGate.reason}, decided by ${handlerGate.gate})`);
     return {
       action: 'send_message_suppressed',
       contact_id: contactId,
-      reason: `hard_suppression_${suppression.tag}`,
+      reason: handlerGate.reason,
       channel,
     };
   }
-
-  // ── Guardrail 3: Stop-bot kill switch (v3.12 — opt-in removed) ──
-  // pause-bot opt-in REMOVED. The bot auto-responds whenever the
-  // upstream rule's conditions match (e.g. agentic-active tag for
-  // AGENTIC_RESPOND_POST_CHATBOT). Only stop-bot blocks now.
-  const gate = checkConversationGate(tags);
-  if (!gate.allowed) {
-    console.log(`[SendMessage] ⏭️ STOP-BOT: ${contactId} — gate denied (reason: ${gate.reason})`);
+  if (handlerGate) {
+    console.log(`[SendMessage] ⏭️ STOP-BOT: ${contactId} — gate denied (reason: ${handlerGate.reason})`);
     return {
-      action: `send_message_${gate.reason}`,
+      action: `send_message_${handlerGate.reason}`,
       contact_id: contactId,
-      reason: gate.reason,
+      reason: handlerGate.reason,
       channel,
     };
   }
