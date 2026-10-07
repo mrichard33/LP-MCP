@@ -84,19 +84,30 @@ function validZip(z) {
  * otherwise only "zip is 12345" or a message that is just the zip counts,
  * so window counts and prices are never mistaken for a zip. Pure.
  */
-export function extractZip(text, { loose = false } = {}) {
+export function extractZip(text, { loose = false, fileZip = null } = {}) {
   const t = String(text || '');
   const kw = ZIP_KEYWORD_RX.exec(t);
   if (kw && validZip(kw[1])) return kw[1];
   const bare = BARE_ZIP_RX.exec(t);
   if (bare && validZip(bare[1])) return bare[1];
   if (!loose) return null;
+  // 2026-10-07 (Nicholas Ferraioli): "33756" then "Sorry 33711" in one burst
+  // got "Yes, we serve Clearwater (33756)". A later zip in the same text is a
+  // correction, so the LAST one wins; one that matches the property on file
+  // (opts.fileZip) wins over both.
+  const all = allInlineZips(t);
+  if (fileZip && all.includes(fileZip)) return fileZip;
+  return all.length ? all[all.length - 1] : null;
+}
+
+function allInlineZips(t) {
+  const out = [];
   INLINE_ZIP_RX.lastIndex = 0;
   let m;
   while ((m = INLINE_ZIP_RX.exec(t)) !== null) {
-    if (validZip(m[2])) return m[2];
+    if (validZip(m[2])) out.push(m[2]);
   }
-  return null;
+  return out;
 }
 
 const NOT_A_PLACE_RX = /^(?:my|our|this|that|your|me|us|here|there|it|them|you|area|zone|region|everywhere|anywhere|all|any|which|what|where)\b/i;
@@ -163,14 +174,14 @@ function lastOutboundAskedZip(prior) {
  *             place: string|null, needs_zip: boolean, asked_before: boolean,
  *             refused_zip: boolean }}
  */
-export function planServiceAreaTurn({ trigger, conversation = [] } = {}) {
+export function planServiceAreaTurn({ trigger, conversation = [], fileZip = null } = {}) {
   const prior = priorMessages(conversation, trigger);
   const inboundPrior = prior.filter(isInbound).map(textOf);
   const coverage = isCoverageQuestion(trigger);
   const askedBefore = lastOutboundAskedZip(prior);
   // A coverage question in the last few inbound messages keeps the topic open.
   const recentCoverage = inboundPrior.slice(-4).find(isCoverageQuestion) || null;
-  const triggerZip = extractZip(trigger, { loose: coverage || !!recentCoverage || askedBefore });
+  const triggerZip = extractZip(trigger, { loose: coverage || !!recentCoverage || askedBefore, fileZip });
   const bareZip = BARE_ZIP_RX.test(String(trigger || ''));
 
   const active = coverage || (!!triggerZip && (askedBefore || !!recentCoverage || bareZip)) || (askedBefore && !!recentCoverage);
@@ -180,7 +191,7 @@ export function planServiceAreaTurn({ trigger, conversation = [] } = {}) {
   let zip = triggerZip;
   if (!zip) {
     for (let i = inboundPrior.length - 1; i >= 0 && !zip; i--) {
-      zip = extractZip(inboundPrior[i], { loose: isCoverageQuestion(inboundPrior[i]) });
+      zip = extractZip(inboundPrior[i], { loose: isCoverageQuestion(inboundPrior[i]), fileZip });
     }
   }
   const place = (coverage ? placeFromQuestion(trigger) : null)

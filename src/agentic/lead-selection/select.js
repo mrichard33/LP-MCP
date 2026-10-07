@@ -277,7 +277,7 @@ function evaluateExclusion({ stateRow, leadRow, tags, daysDormant, denylist, s11
     if (gate.blocked) {
       if (gate.source !== 'may_message') return legacyReason;
       if (gate.decision.reason === 'hard_dq') return 'out_of_area';
-      if (gate.decision.reason === 'consent_stop') return 'stop_bot';
+      if (gate.decision.reason === 'consent_stop' || gate.decision.reason === 'bot_stop') return 'stop_bot';
       return `suppressed_${gate.decision.reason}`;
     }
   }

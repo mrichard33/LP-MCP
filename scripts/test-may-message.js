@@ -100,7 +100,8 @@ test('pause-workflow, suppress-automation and pause-bot never block anything', (
 });
 
 test('consent outranks a DQ, a DQ outranks a hold; tags are case-insensitive', () => {
-  assert.equal(mayMessage({ tags: ['Out-Of-Area', 'STOP-BOT'], purpose: 'reply' }).reason, 'consent_stop');
+  assert.equal(mayMessage({ tags: ['Out-Of-Area', 'STOP-BOT'], purpose: 'reply' }).reason, 'bot_stop');
+  assert.equal(mayMessage({ tags: ['STOP-BOT', 'dnc'], purpose: 'reply' }).reason, 'consent_stop');
   assert.equal(mayMessage({ tags: ['cooling-active', 'suppress-outbound'], purpose: 'outreach' }).reason, 'hard_dq');
   assert.equal(mayMessage({ tags: [], purpose: 'outreach' }).allowed, true);
   assert.equal(mayMessage({ tags: null, purpose: 'reply' }).allowed, true);
@@ -318,4 +319,17 @@ test('executeDqHardStop: stop-bot on, agentic-active off, one removal per resolv
 
   const off = await executeDqHardStop({ target_id: 'J1' }, {}, { ...quiet, env: {} });
   assert.equal(off.reason, 'send_gate_not_live', 'a rollback to shadow stops a queued row');
+});
+
+// 2026-10-07 (the user): stop-bot stops all bot communication and is not a DNC.
+test('stop-bot is the bot-off switch: its own class, blocks every purpose on every channel', () => {
+  assert.ok(!CONSENT_STOP.includes('stop-bot'), 'stop-bot is not a consent opt-out');
+  for (const purpose of ['reply', 'outreach', 'mutation']) {
+    for (const channel of ['sms', 'email', 'livechat', null]) {
+      const d = mayMessage({ tags: ['stop-bot'], channel, purpose });
+      assert.equal(d.allowed, false);
+      assert.equal(d.reason, 'bot_stop');
+      assert.equal(d.tagClass, 'bot_stop');
+    }
+  }
 });

@@ -24,6 +24,8 @@
  *                     blocks only email (the info-email.js list, 2026-09-24,
  *                     and the consent model's "a tag blocks only its own
  *                     channel", 2026-09-29).
+ *   BOT_STOP          stop-bot: blocks every purpose on every channel. The
+ *                     bot-off switch, not an opt-out (the user, 2026-10-07).
  *   HARD_DQ           blocks 'reply' and 'outreach'. A lead the system
  *                     disqualified gets no bot message; a person may still
  *                     text from GHL (Mark's handoff, 2026-10-06).
@@ -66,8 +68,17 @@ export const CONSENT_STOP = Object.freeze([
   'p3:dnc',             // L.6 loss routing, DNC loss reason
   'suppress:dnc-reply', // BEHAVIORAL_DNC_REPLY — a texted STOP (phone)
   'suppress:dnc-voice', // voice opt-out recorded by the consent store (phone)
-  'stop-bot',           // the lead's or a rep's kill switch; the DQ hard stop adds it too
 ]);
+
+/**
+ * The bot-off switch (the user, 2026-10-07: "stop-bot should not have anything
+ * to do with dnc. This tag is intended to stop all bot communication"). It
+ * blocks every bot message on every channel, as it did inside CONSENT_STOP,
+ * but it is NOT an opt-out: it records no consent, never asks for a DNC lift,
+ * and never stops a person from calling. Set by an opt-out rule, a rep taking
+ * over, the hard DQ stop and a team note that says we cannot run the lead.
+ */
+export const BOT_STOP = Object.freeze(['stop-bot']);
 
 /** Phone-only opt-outs: they block texts, calls and live chat, never email. */
 export const PHONE_ONLY_CONSENT = Object.freeze([
@@ -100,6 +111,7 @@ export const NEVER_BLOCK = Object.freeze(['pause-workflow', 'suppress-automation
 export const PURPOSES = Object.freeze(['reply', 'outreach', 'mutation']);
 
 const CONSENT_SET = new Set(CONSENT_STOP);
+const BOT_STOP_SET = new Set(BOT_STOP);
 const PHONE_ONLY_SET = new Set(PHONE_ONLY_CONSENT);
 const EMAIL_ONLY_SET = new Set(EMAIL_ONLY_CONSENT);
 const HARD_DQ_SET = new Set(HARD_DQ);
@@ -109,6 +121,7 @@ const NEVER_SET = new Set(NEVER_BLOCK);
 /** Which purposes each class blocks. */
 const CLASS_BLOCKS = {
   consent_stop: new Set(['reply', 'outreach', 'mutation']),
+  bot_stop: new Set(['reply', 'outreach', 'mutation']),
   hard_dq: new Set(['reply', 'outreach']),
   operational_hold: new Set(['outreach']),
 };
@@ -148,7 +161,7 @@ function normChannel(channel) {
  *                              is treated as 'outreach' (the strictest message purpose)
  * @returns {{ allowed: boolean, reason: string, blockedBy: string|null,
  *             tagClass: string|null, matches: string[] }}
- *   reason: 'ok' | 'consent_stop' | 'hard_dq' | 'operational_hold'
+ *   reason: 'ok' | 'consent_stop' | 'bot_stop' | 'hard_dq' | 'operational_hold'
  */
 export function mayMessage({ tags, channel = null, purpose = 'outreach' } = {}) {
   const t = normTags(tags);
@@ -158,6 +171,10 @@ export function mayMessage({ tags, channel = null, purpose = 'outreach' } = {}) 
   const consent = t.filter(x => CONSENT_SET.has(x) && consentAppliesTo(x, ch));
   if (consent.length && CLASS_BLOCKS.consent_stop.has(p)) {
     return { allowed: false, reason: 'consent_stop', blockedBy: consent[0], tagClass: 'consent_stop', matches: consent };
+  }
+  const botStop = t.filter(x => BOT_STOP_SET.has(x));
+  if (botStop.length && CLASS_BLOCKS.bot_stop.has(p)) {
+    return { allowed: false, reason: 'bot_stop', blockedBy: botStop[0], tagClass: 'bot_stop', matches: botStop };
   }
   const dq = t.filter(x => HARD_DQ_SET.has(x));
   if (dq.length && CLASS_BLOCKS.hard_dq.has(p)) {
@@ -173,7 +190,7 @@ export function mayMessage({ tags, channel = null, purpose = 'outreach' } = {}) 
 /** Does this module have an opinion about this tag (a class, or never-block)? */
 export function isKnownGateTag(tag) {
   const x = String(tag || '').trim().toLowerCase();
-  return CONSENT_SET.has(x) || HARD_DQ_SET.has(x) || HOLD_SET.has(x) || NEVER_SET.has(x);
+  return CONSENT_SET.has(x) || BOT_STOP_SET.has(x) || HARD_DQ_SET.has(x) || HOLD_SET.has(x) || NEVER_SET.has(x);
 }
 
 /**
