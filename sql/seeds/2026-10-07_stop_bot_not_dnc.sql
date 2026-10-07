@@ -1,6 +1,7 @@
 -- 2026-10-07 — stop-bot is the bot-off switch, not a DNC (the user, 2026-10-07: "stop-bot
 -- should not have anything to do with dnc. This tag is intended to stop all bot
 -- communication").
+-- APPLIED LIVE 2026-10-07 21:55Z after the PR #1205 deploy (4 rows, verified); reload asserted 307 rules.
 --
 -- Four DNC rules treated a contact carrying ONLY stop-bot as do-not-call:
 --   368 DNC contact completed the estimate calculator again → lift DNC, E.2 v2
