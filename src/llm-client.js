@@ -35,6 +35,9 @@
  *   <FN>_MODEL_OPENAI       OpenAI model for this function
  *   <FN>_MODEL              legacy single-model var; treated as the Anthropic
  *                           model (back-compat with existing *_MODEL vars)
+ *   <FN>_EFFORT / <GROUP>_EFFORT  low|medium|high|xhigh|max — Anthropic
+ *                           `output_config.effort` (how much a thinking model
+ *                           thinks). Unset = API default. See resolveEffort().
  *
  * Resolution (per call, most specific wins):
  *   provider = <FN>_PROVIDER || <GROUP>_PROVIDER || LLM_PROVIDER || 'anthropic'
@@ -274,6 +277,48 @@ export function resolveTimeout(model, requested) {
   return Math.max(asked, THINKING_MIN_TIMEOUT_MS);
 }
 
+// 2026-10-07 — REPLY-WRITER TIMEOUTS (Danielle, contact Tcsn6CHAYGCdPkQDvlZI).
+// Nothing here ever told a thinking model HOW MUCH to think, so every call ran
+// at the API default (effort high). On claude-sonnet-5 the reply writer spent
+// 2,500–3,900 output tokens (mostly thinking) on one SMS: 28–46s when it
+// finished, and twice in a row past the 60s floor above, so agent_actions
+// 554455 shipped the ai-fallback copy. Over 14 days ~1 reply in 30 timed out.
+//
+// <FN>_EFFORT (or <GROUP>_EFFORT) sends `output_config.effort` for that
+// function only. Unset → nothing is sent and the API default stands, so this
+// changes no call until a Railway var opts it in. Only sent to models that
+// accept it; a 400 that names effort / output_config is retried once without
+// it, the same way the temperature guard above handles a removed parameter.
+const EFFORT_LEVELS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
+
+/** Anthropic families that accept `output_config.effort`. */
+export function anthropicSupportsEffort(model) {
+  return /^claude-(opus-(4-[5-9]|5)|sonnet-(4-6|5)|fable-5|mythos-5)/i.test(String(model || ''));
+}
+
+/**
+ * Effort for a call, or null to send none. Pure. Most specific wins:
+ * <FN>_EFFORT, then <GROUP>_EFFORT. An unknown value is ignored (with a
+ * warning) rather than sent, because a typo would otherwise 400 every call.
+ */
+export function resolveEffort(fn, model, env = process.env) {
+  const P = envPrefix(fn);
+  const group = FUNCTION_GROUPS[fn] || null;
+  const G = group ? envPrefix(group) : null;
+  const raw = env[`${P}_EFFORT`] || (G ? env[`${G}_EFFORT`] : undefined);
+  if (!raw) return null;
+  const effort = String(raw).trim().toLowerCase();
+  if (!EFFORT_LEVELS.has(effort)) {
+    console.warn(`[LLMClient:${fn}] ignoring unknown effort '${raw}' (expected ${[...EFFORT_LEVELS].join('|')})`);
+    return null;
+  }
+  return anthropicSupportsEffort(model) ? effort : null;
+}
+
+function isEffortRejection(status, text) {
+  return status === 400 && /effort|output_config/i.test(String(text || ''));
+}
+
 /**
  * The wall-clock ceiling ONE callLLM(fn) can consume, race slack included.
  *
@@ -303,9 +348,10 @@ function withTimeout(promise, ms, label) {
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
-async function callAnthropic({ model, system, messages, maxTokens, temperature, fn, timeoutMs = LLM_TIMEOUT_MS, cacheSystem = false }) {
+async function callAnthropic({ model, system, messages, maxTokens, temperature, fn, timeoutMs = LLM_TIMEOUT_MS, cacheSystem = false, effort = null }) {
   if (!ANTHROPIC_API_KEY) throw new Error(`[LLMClient:${fn}] ANTHROPIC_API_KEY not set`);
   const body = { model, max_tokens: maxTokens, messages };
+  if (effort) body.output_config = { effort };
   // 2026-10-02 review: the reply writer's ~20k-token system prompt (and the
   // analyzer's ~9k) went uncached on every call. Opt-in per call site, for
   // system prompts that are byte-identical across calls: a varying prompt
@@ -334,6 +380,16 @@ async function callAnthropic({ model, system, messages, maxTokens, temperature, 
     if (isSamplingRejection(res.status, t)) {
       console.warn(`[LLMClient:${fn}] ${model} rejected temperature — retrying without it. Add it to anthropicRejectsSampling().`);
       delete body.temperature;
+      res = await post();
+    } else {
+      throw new Error(`Anthropic API ${res.status}: ${t.slice(0, 300)}`);
+    }
+  }
+  if (!res.ok && 'output_config' in body) {
+    const t = await res.text().catch(() => '');
+    if (isEffortRejection(res.status, t)) {
+      console.warn(`[LLMClient:${fn}] ${model} rejected effort '${effort}' — retrying without it. Fix <FN>_EFFORT or anthropicSupportsEffort().`);
+      delete body.output_config;
       res = await post();
     } else {
       throw new Error(`Anthropic API ${res.status}: ${t.slice(0, 300)}`);
@@ -445,9 +501,10 @@ export async function callLLM({ fn, system = null, user = null, messages = null,
     console.log(`[LLMClient:${fn}] ${model} thinks before it writes — timeout raised ${LLM_TIMEOUT_MS} → ${effectiveTimeoutMs}ms`);
   }
 
+  const effort = provider === 'anthropic' ? resolveEffort(fn, model) : null;
   const args = {
     model, system, messages: msgs, maxTokens: effectiveMaxTokens,
-    temperature, json, fn, timeoutMs: effectiveTimeoutMs, cacheSystem,
+    temperature, json, fn, timeoutMs: effectiveTimeoutMs, cacheSystem, effort,
   };
   // 2026-10-07 — usage ledger (IT security review; CANON.STD.025 / SEC.012).
   // One llm_usage_log row per call, success or failure. recordLlmUsage is
