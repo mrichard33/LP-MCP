@@ -108,11 +108,25 @@ guide?". The next reply releases it, with the name if given; after one ask the g
 (`guide_sent_without_name`). The SMS identity pass now takes a one-word reply to our name ask as the first name.
 U.GUIDE also fires on S2.2's `hurricane-guide-queue`, which this gate cannot hold: its fallback greeting is Mark's to set in GHL.
 
+**One send gate decides who we may message (2026-10-07).** `mayMessage({ tags, channel, purpose })` in
+`src/services/may-message.js` is the one answer, pure: CONSENT_STOP (the DNC family + stop-bot) blocks every purpose
+(a phone-only opt-out spares email; dnc-email blocks only email), HARD_DQ (out-of-area, dq-out-of-area, hard-disqualified,
+suppress-outbound) blocks `reply` and `outreach`, OPERATIONAL_HOLD (quarantined, cooling-active, cannot-afford, canvassing)
+blocks `outreach` only, and pause-workflow / suppress-automation / pause-bot never block (pause-workflow is a GHL drip
+signal). Every sender calls it through `applySendGate` (`src/services/send-gate-report.js`): the send flow and its live
+re-check, the send handler, the live chat, info emails, nurture, lead selection and `add_to_workflow` (purpose `mutation`).
+`SEND_GATE_MODE` shadow (default) keeps each route's old answer and records `send_gate.would_block` / `would_allow`; live
+lets the gate decide (a legacy block on a tag the gate does not know still stands). Do not add a sixth list: add the tag
+to a class. In live, a completed add_tag of out-of-area / dq-out-of-area / hard-disqualified queues ONE `dq_hard_stop`
+(`src/services/dq-hard-stop.js`, 60s later): stop-bot on, agentic-active off, remove_from_workflow for every active
+S5.x / S4.5 / W-series workflow (codes the HL registry cannot resolve go through Remove All Marketing).
+
 **Only an opt-out silences the bot (Mark, 2026-09-24).** A classifier handoff tags the contact and,
 where a person must act, pages one — and the bot still replies, unless `handoffReplyPolicy`
 (`src/agentic/handoff-policy.js`) says `silent` (STOP, WRONG_NUMBER; a STOP that is only a door complaint is
 cleared, `classificationAfterKnock`). A new handoff class replies by default. Do not add a silent class without Mark's
-ruling, and never add `stop-bot` to a rule whose trigger is not an opt-out.
+ruling, and never add `stop-bot` to a rule whose trigger is not an opt-out. Mark's ruling of 2026-10-06 is the one
+exception: a lead the system DISQUALIFIED gets no bot message and gets stop-bot (the one send gate, above).
 
 **Post-demo F.0 leads talk to the rehash rep (Mark, 2026-10-01).** A contact tagged `active-f.0` (or texting
 727-800-4578) gets SMS replies written AS the rep in the GHL custom value `rehash_rep_name`, read by

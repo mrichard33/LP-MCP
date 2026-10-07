@@ -70,6 +70,7 @@
  *   State machines (6):
  *     compute_rescission_dispatch, transition_objection_state,
  *     resolve_objection_state, classify_lead_state, end_agentic_handoff,
+ *     dq_hard_stop (2026-10-07),
  *     s52_cancel_recheck (2026-10-02 — the one 30-minute re-check of a cancel
  *       that not_reschedule_inflight suppressed; src/s52-cancel-recheck.js)
  *   Five9 gated writes (37 — every one behind FIVE9_WRITES_ENABLED, and all
@@ -292,6 +293,10 @@ import { executeSendInfoEmail } from './handlers/info-email.js';
 // five9_* action types; guardrails + audit live in src/five9/admin-writes.js)
 import { executeFive9Write } from './handlers/five9.js';
 import { trackAction } from '../graceful-shutdown.js';
+// 2026-10-07 — hard DQ stop (stop-bot + leave the sending workflows).
+import { isDqTriggerTag, scheduleDqHardStop, executeDqHardStop } from '../services/dq-hard-stop.js';
+import { resolveWorkflowIdByCanonicalCode } from '../tools/admin/hl-fallback.js';
+import { ghlFetch } from './helpers.js';
 
 // MVI v2.5 — fetch the source event for a given action. The shared
 // getEventContext returns ONLY the spread payload (no event_id /
@@ -320,12 +325,22 @@ async function fetchSourceEvent(action) {
 // + re-entrant, delivered-but-timed-out sends dedup via the sent marker,
 // and the slot is released in a finally on every path. See the flow module
 // header for the full story.
+/** The send channel a send_message row names, or null when it names none we know. */
+function sendGateChannel(action) {
+  const raw = String(action?.action_payload?.channel || '').toLowerCase();
+  return raw === 'sms' || raw === 'email' ? raw : null;
+}
+
 async function executeSendMessageWithLock(action, context) {
   return runSendMessageFlow(action, context, {
     // 2026-07-07 always-respond policy: a direct reply on an agentic-active
     // contact is blocked only by stop-bot + the consent/DNC family;
     // operational suppressors gate campaigns and re-enrollment, not answers.
-    checkSuppression: (contact_id) => checkSuppression(contact_id, { mode: 'agentic_reply' }),
+    //
+    // 2026-10-07 — the channel now rides along: the one send gate
+    // (src/services/may-message.js) lets a phone-only opt-out through on email
+    // and reads an unknown channel as "any" (every opt-out applies).
+    checkSuppression: (contact_id, a) => checkSuppression(contact_id, { mode: 'agentic_reply', channel: sendGateChannel(a), route: 'send_flow' }),
     // 2026-07-23 Phase 5 — LIVE re-check immediately before the GHL send.
     // Same agentic_reply mode as gate 1, but read straight from GHL (fresh
     // tags + channel dndSettings). Kill switch: SEND_TIME_RECHECK_ENABLED
@@ -346,8 +361,7 @@ async function executeSendMessageWithLock(action, context) {
       // SMS DND setting: the wrong channel's suppression, either blocking a
       // legitimate email or letting one through on a stale SMS check. Falling
       // back to tags-only is the honest read when we genuinely do not know.
-      const raw = String(a.action_payload?.channel || '').toLowerCase();
-      const channel = raw === 'sms' || raw === 'email' ? raw : null;
+      const channel = sendGateChannel(a);
       const result = await checkSuppressionLive(a.target_id, { mode: 'agentic_reply', channel });
       if (result.suppressed) {
         // Silent drops are how the original nine-month gap hid — record every
@@ -610,12 +624,41 @@ async function executeUpdateOpportunityWithLostReason(action, context) {
   return result;
 }
 
+// ─── 2026-10-07 Hard DQ stop (src/services/dq-hard-stop.js) ────────
+// A completed add_tag of out-of-area / dq-out-of-area / hard-disqualified
+// schedules ONE dq_hard_stop 60s later (after the rest of the rule's own
+// actions). Done here, not in the rule templates, so every DQ rule — and the
+// next one written — is covered. Shadow (SEND_GATE_MODE unset) only records
+// send_gate.would_hard_stop. A scheduling failure never fails the add_tag.
+function dqHardStopDeps() {
+  return {
+    supabase,
+    ghlFetch,
+    executeAddTag,
+    executeRemoveTag,
+    emitEvent,
+    resolveWorkflowId: resolveWorkflowIdByCanonicalCode,
+  };
+}
+
+async function executeAddTagWithDqStop(action, context) {
+  const result = await executeAddTag(action, context);
+  const tag = action.action_payload?.tag;
+  if (isDqTriggerTag(tag) && !result?.rejected && !result?.error) {
+    await scheduleDqHardStop(
+      { contactId: action.target_id, tag: String(tag).trim().toLowerCase(), sourceActionId: action.id || null, rule: action.rule_applied || null },
+      dqHardStopDeps(),
+    );
+  }
+  return result;
+}
+
 // ─── Handler registry ──────────────────────────────────────────────
 // Exported so scripts/test-agent-action-approval.js can assert the registry's
 // exact membership offline — specifically that five9_remove_numbers_from_dnc
 // is absent and therefore resolves to "Unknown action type".
 export const ACTION_HANDLERS = {
-  add_tag: executeAddTag,
+  add_tag: executeAddTagWithDqStop,             // 2026-10-07 — a DQ tag schedules the hard stop
   remove_tag: executeRemoveTag,
   add_note: executeAddNote,
   send_info_email: (action, context) => executeSendInfoEmail(action, context), // 2026-09-24 — the email the bot told the lead is on its way                     // 2026-07-06 — escalation context summaries (Sentinel §7)
@@ -658,6 +701,7 @@ export const ACTION_HANDLERS = {
   s52_cancel_recheck: (action) => executeS52CancelRecheck(action), // 2026-10-02 — re-check a cancel suppressed by not_reschedule_inflight (Maria, lead 580116)
   classify_lead_state: executeClassifyLeadState, // 2026-06-02 — Phase 2 lead-state classifier + S4.5 enrollment (reactive invoker)
   end_agentic_handoff: (action) => endAgenticHandoff(action.target_id), // 2026-06-16 — silent agentic-active teardown on terminal closeout
+  dq_hard_stop: (action, context) => executeDqHardStop(action, context, dqHardStopDeps()), // 2026-10-07 — stop-bot + leave workflows after a DQ
   // 2026-07-21 Phase C — Five9 gated writes. Ships dark (FIVE9_WRITES_ENABLED
   // unset → every one of these skips). Must be queued requires_approval=true.
   five9_start_campaign: executeFive9Write,

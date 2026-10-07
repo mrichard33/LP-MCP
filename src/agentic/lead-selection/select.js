@@ -29,6 +29,8 @@
  * v1.0 — 2026-06-15.
  */
 
+// 2026-10-07 — the one send gate (src/services/may-message.js).
+import { applySendGate } from '../../services/send-gate-report.js';
 import supabase from '../../supabase.js';
 import { STATES, SUPPRESSION_STATES } from '../lead-state/states.js';
 import { AUTO_EXECUTE_THRESHOLD } from '../lead-state/confidence.js';
@@ -255,9 +257,29 @@ function evaluateExclusion({ stateRow, leadRow, tags, daysDormant, denylist, s11
 
   // Consent kill-switch / unreachable tags.
   if (tags) {
-    for (const t of STOP_TAGS) if (tags.has(t)) return 'stop_bot';
+    // 2026-10-07 — the one send gate (src/services/may-message.js), purpose
+    // 'outreach'. STOP_TAGS / OUT_OF_AREA_TAGS are its shadow comparison for
+    // one release; dnc-canvass (do not knock) is this route's own extra and
+    // stands in every mode. The returned reason codes are unchanged.
+    let legacyTag = null;
+    let legacyReason = null;
+    for (const t of STOP_TAGS) if (!legacyTag && tags.has(t)) { legacyTag = t; legacyReason = 'stop_bot'; }
     // ── NEW: out-of-area / disqualified-reach ──
-    for (const t of OUT_OF_AREA_TAGS) if (tags.has(t)) return 'out_of_area';
+    for (const t of OUT_OF_AREA_TAGS) if (!legacyTag && tags.has(t)) { legacyTag = t; legacyReason = 'out_of_area'; }
+    const gate = applySendGate({
+      tags: [...tags],
+      channel: null,
+      purpose: 'outreach',
+      legacy: { blocked: !!legacyTag, tag: legacyTag },
+      route: 'lead_selection',
+      contactId: leadRow?.ghl_contact_id || null,
+    });
+    if (gate.blocked) {
+      if (gate.source !== 'may_message') return legacyReason;
+      if (gate.decision.reason === 'hard_dq') return 'out_of_area';
+      if (gate.decision.reason === 'consent_stop') return 'stop_bot';
+      return `suppressed_${gate.decision.reason}`;
+    }
   }
 
   // ── NEW: channel-aware suppression registry (DNC / opt-out / converted / complaint) ──

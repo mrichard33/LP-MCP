@@ -38,7 +38,7 @@ const { checkReply, summarize, INVARIANTS_VERSION } = await import('../src/eval/
 const IN_HOURS_MS = Date.parse('2026-10-06T19:00:00Z');
 
 /** The live-chat lane over recording fakes; the model returns `draft`. Mirrors scripts/test-live-chat-fast-lane.js. */
-function makeLane({ draft, nepqMode, nowMs = IN_HOURS_MS, kbIntentMode = 'off', classify = null, buildKbPack = null }) {
+function makeLane({ draft, nepqMode, nowMs = IN_HOURS_MS, kbIntentMode = 'off', classify = null, buildKbPack = null, tags = [] }) {
   const state = { sends: [], llmCalls: 0, prompts: [], packIntents: [] };
   let nextId = 1;
   const lane = createLiveChatFastLane({
@@ -51,7 +51,7 @@ function makeLane({ draft, nepqMode, nowMs = IN_HOURS_MS, kbIntentMode = 'off', 
     quietMs: () => 0,
     log: () => {},
     warn: () => {},
-    fetchContact: async () => ({ id: 'G1', firstName: 'Alyce', tags: [], phone: null, email: null }),
+    fetchContact: async () => ({ id: 'G1', firstName: 'Alyce', tags, phone: null, email: null }),
     fetchMessages: async () => [],
     findConversation: async () => null,
     buildContext: async () => { throw new Error('no lead context in the golden replay'); },
@@ -261,6 +261,39 @@ for (const c of KB_CASES) {
       assert.ok(result.pass, `finished reply broke ${result.violations.map(v => v.code).join(', ')}\n  reply: ${reply}`);
       assert.equal(state.sends.length, 1, 'exactly one reply per turn');
     });
+  }
+}
+
+// ── the one send gate (2026-10-07) ──────────────────────────────────────
+// After SERVICE_AREA_EXIT or suppress-outbound the bot sends NOTHING; a
+// pause-workflow tag never silences it. With SEND_GATE_MODE=shadow the old
+// always-respond answer still stands, so the DQ'd visitor is still answered
+// (that is what the shadow log measures). Made-up text; the incidents are
+// Jessup (LmBvkJUNrqZ9HoVNuovP, out-of-area 2026-10-05, then an AI reply and
+// an S5.2 text) and McKoy (rRPO34Ooq0QmtSfXyqSw, pause-workflow added after
+// every reply; 16 false "sent while stopped" chips).
+const GATE_CASES = [
+  { id: 'jessup_out_of_area', tags: ['agentic-active', 'out-of-area', 'suppress-outbound'], live: 0, shadow: 1 },
+  { id: 'hard_disqualified', tags: ['hard-disqualified'], live: 0, shadow: 1 },
+  { id: 'stop_bot', tags: ['stop-bot'], live: 0, shadow: 0 },
+  { id: 'mckoy_pause_workflow', tags: ['agentic-active', 'pause-workflow'], live: 1, shadow: 1 },
+];
+for (const c of GATE_CASES) {
+  for (const gateMode of ['shadow', 'live']) {
+    for (const nepqMode of MODES) {
+      test(`golden send gate ${c.id} [gate ${gateMode}, nepq ${nepqMode}]`, async () => {
+        const prev = process.env.SEND_GATE_MODE;
+        process.env.SEND_GATE_MODE = gateMode;
+        try {
+          const { lane, state } = makeLane({ draft: 'Thanks for writing. What got you looking at windows?', nepqMode, tags: c.tags });
+          await lane.processInbound({ contactId: 'G1', conversationId: 'gconv', messageId: `gate-${c.id}-${gateMode}-${nepqMode}`, body: 'Are you still there?' });
+          assert.equal(state.sends.length, c[gateMode], `${c.id}: expected ${c[gateMode]} reply in ${gateMode}`);
+          if (c[gateMode] === 0) assert.equal(state.llmCalls, 0, 'a blocked turn never reaches the model');
+        } finally {
+          if (prev === undefined) delete process.env.SEND_GATE_MODE; else process.env.SEND_GATE_MODE = prev;
+        }
+      });
+    }
   }
 }
 
