@@ -10,6 +10,23 @@ export const REACTIVATION_CUTOFF = '2024-01-01T00:00:00Z'; // Don't trigger Day 
 
 export const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
+// 2026-10-07 — A brief network blip to Lead Perfection ("fetch failed": a
+// reset, refused or DNS miss) is worth one more try; a timeout is NOT. Used by
+// lpPost in n8n-enrichment.js and the /token request in token-manager.js.
+// Deliberately narrower than memory/with-retry.js's isTransientError, which
+// retries timeouts: a 60s LP timeout already outlasts GHL's 60s webhook wait.
+export const TRANSIENT_NET_CODES = new Set([
+  'ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EAI_AGAIN', 'ENOTFOUND',
+  'EPIPE', 'UND_ERR_SOCKET', 'UND_ERR_CONNECT_TIMEOUT',
+]);
+
+export function isTransientNetworkError(err) {
+  if (!err) return false;
+  if (err.name === 'TimeoutError' || err.name === 'AbortError') return false;
+  const code = err.cause?.code || err.code || '';
+  return err.message === 'fetch failed' || TRANSIENT_NET_CODES.has(code);
+}
+
 export function normalizePhone(phone) {
   if (!phone) return null;
   return phone.replace(/\D/g, '') || null;
