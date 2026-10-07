@@ -249,6 +249,7 @@ import { lpStoredAgeMinutes, lpStoredToUtcMs } from './lp-dates.js';
 import { postToSlack } from './slack.js';
 import { sendAlertMessage } from './alert-state.js';
 import { filterNew, recordPosted } from './alert-posted.js';
+import { HELD_IMPORT_AUDIT, INBOUND_WAIT_AUDIT } from './inbound-checkout-watch.js';
 import { openMinutesSince } from './agentic/team-hours.js';
 import { LP_EMP } from './lp-source-ids.js';
 import { buildLpAppointmentCard } from './services/appointment-card.js';
@@ -1609,7 +1610,7 @@ const HELD_INBOUND_SOON_MS = 24 * 60 * 60 * 1000;
 // A row younger than this is still in LP's normal import window — auto-import
 // issues in seconds, and staff take minutes. Same floor inboundDeferMaxAgeMin uses.
 const HELD_INBOUND_MIN_AGE_MIN = 30;
-const HELD_INBOUND_AUDIT = 'lp_inbound_held';
+const HELD_INBOUND_AUDIT = HELD_IMPORT_AUDIT; // 'lp_inbound_held'
 
 // 2026-10-05 (the user, same day as #1166): no card the moment the team opens.
 // Staff work the overnight queue first thing — Crystal imported row 428372 at
@@ -1703,6 +1704,16 @@ async function escalateHeldInbound(card, inboundId, deps = {}) {
     const items = [{ key, reason: 'card' }];
     const { fresh } = await isNew({ audit: HELD_INBOUND_AUDIT, items, ttlDays: 30 });
     if (!fresh.length) return { posted: false, reason: 'already_posted' };
+    // 2026-10-07 (Mark: never repeat an item). The inbound checkout watch
+    // (src/jobs/inbound-checkout-watch.js) cards the same waiting inquiry in
+    // #contact-center, usually first. When it has, this card would be the
+    // second post about one row: record it as handled and stay quiet.
+    const watch = await isNew({ audit: INBOUND_WAIT_AUDIT, items: [{ key, reason: 'waiting' }], ttlDays: 3 });
+    if (!watch.fresh.length) {
+      await record({ audit: HELD_INBOUND_AUDIT, items });
+      console.log(`[LP-APPT] held-row card for in1_id ${key} skipped — the inbound checkout watch already carded it`);
+      return { posted: false, reason: 'carded_by_inbound_watch' };
+    }
     const channel = String(env.SLACK_CHANNEL_SERVICE || '').trim();
     const res = channel
       ? await Promise.resolve(post(card, channel)).catch((err) => ({ ok: false, error: err.message }))

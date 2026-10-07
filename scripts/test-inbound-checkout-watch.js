@@ -4,6 +4,8 @@
  * src/inbound-checkout-watch.js (rules) and src/jobs/inbound-checkout-watch.js
  * (the pass, with fake deps). 2026-10-06: ~49% of LP inquiries wait for a
  * person to check them out (4–15h overnight) and nobody was told.
+ * 2026-10-07 (Mark): card only past the normal checkout time (median 11 min,
+ * p90 42) — visit today/tomorrow 30 min, everything else 60, #ops at 90.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -44,43 +46,57 @@ test('classification', () => {
   assert.equal(classifyRow(row({ checkoutdate: '2026-10-06T15:56:02.817' })), 'checked_out');
 });
 
-test('priority: appointment > GHL sender > other', () => {
-  assert.equal(priorityOf(row()), 'appt');
+test('priority: appointment (near) > appointment 2+ days out > GHL sender > other', () => {
+  assert.equal(priorityOf(row()), 'appt'); // no clock: the stricter line
+  assert.equal(priorityOf(row(), edt('2026-10-06T15:30:00')), 'appt_far', 'Shelley: visit 10/08, two days out');
+  assert.equal(priorityOf(row(), edt('2026-10-07T09:00:00')), 'appt', 'visit tomorrow');
+  assert.equal(priorityOf(row(), edt('2026-10-08T09:00:00')), 'appt', 'visit today');
+  assert.equal(priorityOf(row(), edt('2026-10-09T09:00:00')), 'appt', 'a visit already past stays on the strict line');
   assert.equal(priorityOf(row({ appttime: '' })), 'ghl'); // a date alone is not an appointment
   assert.equal(priorityOf(row({ apptdate: '', appttime: '' })), 'ghl');
   assert.equal(priorityOf(row({ apptdate: '', appttime: '', sender: 'Simpletext' })), 'other');
 });
 
 const dueAt = (r, minutesAfter) => assessWaiting([r], r.receivedMs + minutesAfter * 60000, cfg)[0].due;
-test('threshold edges: appointment 10 (9/11), GHL 15 (14/16), other 30 (29/31)', () => {
-  const appt = row();
-  assert.equal(dueAt(appt, 9), false);
-  assert.equal(dueAt(appt, 11), true);
+test('threshold edges: visit today/tomorrow 30, visit 2+ days 60, GHL 60, other 60; #ops 90', () => {
+  const near = row({ apptdate: '10/06/2026' });
+  assert.equal(dueAt(near, 29), false);
+  assert.equal(dueAt(near, 31), true);
+  const far = row(); // visit 10/08, received 10/06
+  assert.equal(dueAt(far, 59), false);
+  assert.equal(dueAt(far, 61), true);
   const ghl = row({ apptdate: '', appttime: '' });
-  assert.equal(dueAt(ghl, 14), false);
-  assert.equal(dueAt(ghl, 16), true);
+  assert.equal(dueAt(ghl, 59), false);
+  assert.equal(dueAt(ghl, 61), true);
   const other = row({ apptdate: '', appttime: '', sender: 'Simpletext' });
-  assert.equal(dueAt(other, 29), false);
-  assert.equal(dueAt(other, 31), true);
+  assert.equal(dueAt(other, 59), false);
+  assert.equal(dueAt(other, 61), true);
+  const escAt = (m) => assessWaiting([other], other.receivedMs + m * 60000, cfg)[0].escalate;
+  assert.equal(escAt(89), false);
+  assert.equal(escAt(91), true);
 });
 
 test('thresholds come from env', () => {
-  const c = watchConfig({ INBOUND_WATCH_APPT_MIN: '5', INBOUND_WATCH_ESCALATE_MIN: '20', INBOUND_WATCH_OFFICE_START: '09:30' });
+  assert.deepEqual(cfg.thresholdMin, { appt: 30, appt_far: 60, ghl: 60, other: 60 });
+  assert.equal(cfg.escalateMin, 90);
+  const c = watchConfig({ INBOUND_WATCH_APPT_MIN: '5', INBOUND_WATCH_APPT_FAR_MIN: '45', INBOUND_WATCH_ESCALATE_MIN: '20', INBOUND_WATCH_OFFICE_START: '09:30' });
   assert.equal(c.thresholdMin.appt, 5);
+  assert.equal(c.thresholdMin.appt_far, 45);
   assert.equal(c.escalateMin, 20);
   assert.equal(c.officeStartMin, 570);
-  assert.equal(watchConfig({ INBOUND_WATCH_APPT_MIN: 'abc' }).thresholdMin.appt, 10);
+  assert.equal(watchConfig({ INBOUND_WATCH_APPT_MIN: 'abc' }).thresholdMin.appt, 30);
 });
 
-test('Shelley: carded at 15:33, not at 15:31; escalated at 16:08, not at 16:06', () => {
+test('Shelley (visit two days out): carded at 16:23, not at 16:21; escalated at 16:53, not at 16:51', () => {
   const r = row();
   assert.equal(r.receivedMs, Date.parse('2026-10-06T19:22:04.707Z'));
   const at = (hm) => assessWaiting([r], edt(`2026-10-06T${hm}:00`), cfg)[0];
-  assert.equal(at('15:31').due, false);
-  assert.equal(at('15:33').due, true);
-  assert.equal(at('15:33').priority, 'appt');
-  assert.equal(at('16:06').escalate, false);
-  assert.equal(at('16:08').escalate, true);
+  assert.equal(at('15:33').due, false, 'the old 10-minute line paged on the normal case');
+  assert.equal(at('16:21').due, false);
+  assert.equal(at('16:23').due, true);
+  assert.equal(at('16:23').priority, 'appt_far');
+  assert.equal(at('16:51').escalate, false);
+  assert.equal(at('16:53').escalate, true);
 });
 
 test('appointment rows come first, then the longest wait', () => {
@@ -105,10 +121,10 @@ test('DST (2026-11-01, clocks fall back at 2 AM): office hours and waits follow 
   // 8:00 AM EST on 11/01 = 13:00Z.
   assert.equal(inOfficeHours(Date.parse('2026-11-01T12:59:00Z'), cfg), false);
   assert.equal(inOfficeHours(Date.parse('2026-11-01T13:00:00Z'), cfg), true);
-  const r = row({ datereceived: '2026-11-01T07:50:00', apptdate: '11/03/2026' });
+  const r = row({ datereceived: '2026-11-01T07:50:00', apptdate: '11/01/2026' });
   assert.equal(r.receivedMs, Date.parse('2026-11-01T12:50:00Z'));
-  assert.equal(assessWaiting([r], Date.parse('2026-11-01T12:59:00Z'), cfg)[0].due, false);
-  assert.equal(assessWaiting([r], Date.parse('2026-11-01T13:01:00Z'), cfg)[0].due, true);
+  assert.equal(assessWaiting([r], Date.parse('2026-11-01T13:19:00Z'), cfg)[0].due, false);
+  assert.equal(assessWaiting([r], Date.parse('2026-11-01T13:21:00Z'), cfg)[0].due, true);
 });
 
 test('the card line names everything a person needs and no full phone', () => {
@@ -210,30 +226,35 @@ test('read failure → no posts, no writes, an error and the alarm (live)', asyn
   assert.equal(h.calls.alarm.channel, 'ops');
 });
 
-test('live, in hours: Shelley carded once at 15:33 (after the morning card), never twice', async () => {
+test('live, in hours: Shelley carded once at 16:23 (after the morning card), never twice', async () => {
   const h = deps();
   // Morning already handled: mark the overnight key so only the regular card is in play.
   h.db.tables.lp_appointment_sync_marks.set('inbound-watch-overnight:2026-10-06', {});
-  const r1 = await runInboundCheckoutWatch({ env: LIVE, nowMs: edt('2026-10-06T15:33:00'), deps: h.d });
+  await runInboundCheckoutWatch({ env: LIVE, nowMs: edt('2026-10-06T15:33:00'), deps: h.d });
+  assert.equal(h.calls.posts.length, 0, 'visit two days out: 11 minutes is normal');
+  const r1 = await runInboundCheckoutWatch({ env: LIVE, nowMs: edt('2026-10-06T16:23:00'), deps: h.d });
   assert.equal(r1.ok, true, r1.errors.join());
   assert.equal(h.calls.posts.length, 1);
   assert.equal(h.calls.posts[0].channel, 'C_SERVICE');
   assert.match(h.calls.posts[0].text, /inquiry 428940/);
   assert.ok(h.db.tables.lp_inbound_queue.has('428940'), 'mirrored');
-  await runInboundCheckoutWatch({ env: LIVE, nowMs: edt('2026-10-06T15:38:00'), deps: h.d });
+  await runInboundCheckoutWatch({ env: LIVE, nowMs: edt('2026-10-06T16:28:00'), deps: h.d });
   assert.equal(h.calls.posts.length, 1, 'no repeat card');
-  assert.equal(h.calls.ops.length, 0, 'not yet 45 min');
-  await runInboundCheckoutWatch({ env: LIVE, nowMs: edt('2026-10-06T16:08:00'), deps: h.d });
-  assert.equal(h.calls.ops.length, 1, 'escalated at 16:08');
+  await runInboundCheckoutWatch({ env: LIVE, nowMs: edt('2026-10-06T16:48:00'), deps: h.d });
+  assert.equal(h.calls.ops.length, 0, 'not yet 90 min');
+  await runInboundCheckoutWatch({ env: LIVE, nowMs: edt('2026-10-06T16:53:00'), deps: h.d });
+  assert.equal(h.calls.ops.length, 1, 'escalated at 16:53');
   assert.equal(h.calls.ops[0].opts.channel, 'ops');
   assert.ok(h.calls.posted.some((p) => p.audit === ESCALATE_AUDIT));
   assert.equal(h.calls.alarm.active, false, 'clean pass clears the alarm');
 });
 
-test('overnight: nothing posts; the first in-hours pass posts ONE card of everything waiting', async () => {
+test('overnight: nothing posts; the first in-hours pass posts ONE card of what is past its threshold', async () => {
   const night = [
     { ...SHELLEY_WAITING, id: '500001', datereceived: '2026-10-06T21:10:00' },
     { ...SHELLEY_WAITING, id: '500002', apptdate: '', appttime: '', sender: 'Simpletext', datereceived: '2026-10-07T02:00:00' },
+    // 13 minutes old at 8:00, visit tomorrow: normal, not on the card (2026-10-07).
+    { ...SHELLEY_WAITING, id: '500003', datereceived: '2026-10-07T07:47:00' },
   ];
   const h = deps({ rows: night });
   await runInboundCheckoutWatch({ env: LIVE, nowMs: edt('2026-10-07T03:00:00'), deps: h.d });
@@ -247,16 +268,63 @@ test('overnight: nothing posts; the first in-hours pass posts ONE card of everyt
   assert.match(cc[0].text, /came in overnight/);
   assert.match(cc[0].text, /500001/);
   assert.match(cc[0].text, /500002/);
+  assert.doesNotMatch(cc[0].text, /500003/, 'a 13-minute-old inquiry is not on the overnight card');
   assert.ok(h.db.tables.lp_appointment_sync_marks.has('inbound-watch-overnight:2026-10-07'));
   await runInboundCheckoutWatch({ env: LIVE, nowMs: edt('2026-10-07T08:05:00'), deps: h.d });
   assert.equal(h.calls.posts.filter((p) => p.channel === 'C_SERVICE').length, 1, 'the overnight rows are not carded again');
   assert.ok(h.calls.posted.some((p) => p.audit === WAIT_AUDIT));
+  // 500003 reaches its 30 minutes at 8:17: the regular card names it, alone.
+  await runInboundCheckoutWatch({ env: LIVE, nowMs: edt('2026-10-07T08:20:00'), deps: h.d });
+  const cc2 = h.calls.posts.filter((p) => p.channel === 'C_SERVICE');
+  assert.equal(cc2.length, 2);
+  assert.doesNotMatch(cc2[1].text, /came in overnight/);
+  assert.match(cc2[1].text, /500003/);
+  assert.doesNotMatch(cc2[1].text, /500001|500002/);
+});
+
+test('overnight: nothing due at 8:00 → no card, and the day\'s key is still claimed', async () => {
+  const h = deps({ rows: [{ ...SHELLEY_WAITING, id: '510001', datereceived: '2026-10-07T07:47:00' }] });
+  const res = await runInboundCheckoutWatch({ env: LIVE, nowMs: edt('2026-10-07T08:00:00'), deps: h.d });
+  assert.equal(res.ok, true, res.errors.join());
+  assert.equal(h.calls.posts.length, 0);
+  assert.ok(h.db.tables.lp_appointment_sync_marks.has('inbound-watch-overnight:2026-10-07'));
+});
+
+test('a visit five days out does not card until 60 minutes', async () => {
+  const h = deps({ rows: [{ ...SHELLEY_WAITING, id: '520001', apptdate: '10/12/2026', datereceived: '2026-10-07T10:00:00' }] });
+  h.db.tables.lp_appointment_sync_marks.set('inbound-watch-overnight:2026-10-07', {});
+  for (const hm of ['10:30', '10:45', '10:59']) {
+    await runInboundCheckoutWatch({ env: LIVE, nowMs: edt(`2026-10-07T${hm}:00`), deps: h.d });
+  }
+  assert.equal(h.calls.posts.length, 0);
+  await runInboundCheckoutWatch({ env: LIVE, nowMs: edt('2026-10-07T11:01:00'), deps: h.d });
+  assert.equal(h.calls.posts.length, 1);
+  assert.match(h.calls.posts[0].text, /520001/);
+});
+
+test('a visit today cards at 30 minutes', async () => {
+  const h = deps({ rows: [{ ...SHELLEY_WAITING, id: '530001', apptdate: '10/07/2026', datereceived: '2026-10-07T10:00:00' }] });
+  h.db.tables.lp_appointment_sync_marks.set('inbound-watch-overnight:2026-10-07', {});
+  await runInboundCheckoutWatch({ env: LIVE, nowMs: edt('2026-10-07T10:29:00'), deps: h.d });
+  assert.equal(h.calls.posts.length, 0);
+  await runInboundCheckoutWatch({ env: LIVE, nowMs: edt('2026-10-07T10:31:00'), deps: h.d });
+  assert.equal(h.calls.posts.length, 1);
+  assert.match(h.calls.posts[0].text, /530001/);
+});
+
+test('an inquiry the held-row "import this lead" card already named is not carded again', async () => {
+  const h = deps({ rows: [{ ...SHELLEY_WAITING, id: '540001', apptdate: '10/07/2026', datereceived: '2026-10-07T10:00:00' }] });
+  h.db.tables.lp_appointment_sync_marks.set('inbound-watch-overnight:2026-10-07', {});
+  await h.d.recordPosted({ audit: 'lp_inbound_held', items: [{ key: '540001', reason: 'card' }] });
+  const res = await runInboundCheckoutWatch({ env: LIVE, nowMs: edt('2026-10-07T10:31:00'), deps: h.d });
+  assert.equal(res.ok, true, res.errors.join());
+  assert.equal(h.calls.posts.length, 0);
 });
 
 test('shadow posts nothing and writes no marks or GHL fields', async () => {
   const issued = { ...SHELLEY_WAITING, id: '600001', lds_id: '581999', checkoutdate: '2026-10-06T15:40:00', apptdate: '', appttime: '' };
   const h = deps({ rows: [SHELLEY_WAITING, issued], contact: { customFields: [], last_appointment_start_date: '2026-10-08', last_appointment_start_time: '18:00' } });
-  const res = await runInboundCheckoutWatch({ env: {}, nowMs: edt('2026-10-06T16:10:00'), deps: h.d });
+  const res = await runInboundCheckoutWatch({ env: {}, nowMs: edt('2026-10-06T16:30:00'), deps: h.d });
   assert.equal(res.mode, 'shadow');
   assert.equal(h.calls.posts.length + h.calls.ops.length, 0);
   assert.equal(h.calls.fields.length + h.calls.appts.length, 0);

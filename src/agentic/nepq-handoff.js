@@ -69,9 +69,14 @@ export function formatNepqHandoff({ reason, channel, inbound, contactId, firstNa
 
 /**
  * @param {{contactId, reason, channel, inbound, firstName?, nowMs?}} args
- * @param {{applyTags, addNote, emitEvent, post?, opsAlert?, alert?, env?}} deps
+ * @param {{applyTags, addNote, emitEvent, post?, opsAlert?, alert?, env?, filterNew?, recordPosted?}} deps
  *   post(text, channelId) → {ok, error}: postToSlack. Without it, the card
  *   goes through deps.alert (the old #ops-alerts path).
+ *   filterNew / recordPosted (src/alert-posted.js): when given, ONE card per
+ *   contact per reason per day (2026-10-07, Mark: never repeat an item). The
+ *   live chat's service hand-off called this on every planned turn, with no
+ *   daily claim of its own; the SMS path's bot-callback claim already held it
+ *   to one. The tag, note and event still run every time.
  */
 export async function routeNepqHandoff({ contactId, reason, channel, inbound, firstName = null, nowMs = Date.now(), extra = null }, deps) {
   if (!contactId || !reason) return { routed: false };
@@ -91,16 +96,35 @@ export async function routeNepqHandoff({ contactId, reason, channel, inbound, fi
       priority: 'high', bypass_filter: true, idempotency_key: `nepq_handoff_${contactId}_${reason}_${day}`,
       payload: { contact_id: contactId, reason, channel, inbound_preview: String(inbound || '').slice(0, 300) },
     })),
-    Promise.resolve().then(() => postCard({ card, reason, contactId }, deps)),
+    Promise.resolve().then(() => postCardOnce({ card, reason, contactId, day, nowMs }, deps)),
   ]);
   const failed = results.filter(r => r.status === 'rejected');
   for (const f of failed) console.warn(`[NepqHandoff] side effect failed for ${contactId} (${reason}): ${f.reason?.message || f.reason}`);
   return { routed: true, failed: failed.length };
 }
 
-/** The card to #contact-center (and #dispatch); a failed post is an #ops-alerts line. */
+export const HANDOFF_CARD_AUDIT = 'nepq_handoff_card';
+
+/** postCard, at most once per contact + reason + UTC day when the dedupe deps are given. */
+async function postCardOnce({ card, reason, contactId, day, nowMs }, deps) {
+  if (!deps.filterNew || !deps.recordPosted) return postCard({ card, reason, contactId }, deps);
+  const items = [{ key: contactId, reason: `${reason}:${day}` }];
+  const { fresh } = await deps.filterNew({ audit: HANDOFF_CARD_AUDIT, items, ttlDays: 2, nowMs });
+  if (!fresh.length) {
+    console.log(`[NepqHandoff] ${contactId} (${reason}) card already posted today — not repeated`);
+    return false;
+  }
+  const posted = await postCard({ card, reason, contactId }, deps);
+  if (posted) await deps.recordPosted({ audit: HANDOFF_CARD_AUDIT, items, nowMs });
+  return posted;
+}
+
+/**
+ * The card to #contact-center (and #dispatch); a failed post is an #ops-alerts line.
+ * Returns true when at least one channel took it.
+ */
 async function postCard({ card, reason, contactId }, deps) {
-  if (!deps.post) return deps.alert?.(card);
+  if (!deps.post) { await deps.alert?.(card); return true; }
   // 2026-10-03 (Mark): "Anything related to service should … send to the Slack
   // service channel": the contact's market #service-<market> channel
   // (resolveSlackChannels('service'), whose fallback is #contact-center).
@@ -117,12 +141,14 @@ async function postCard({ card, reason, contactId }, deps) {
   }
   if (!channels.length) {
     await deps.opsAlert?.(`🚨 HAND-OFF CARD HAS NO CHANNEL (SLACK_CHANNEL_SERVICE unset)\n\n${card}`);
-    return;
+    return false;
   }
+  let any = false;
   for (const ch of channels) {
     const res = await Promise.resolve(deps.post(card, ch.id)).catch(err => ({ ok: false, error: err.message }));
-    if (res?.ok) { console.log(`[NepqHandoff] ${contactId} (${reason}) card posted to #${ch.name}`); continue; }
+    if (res?.ok) { any = true; console.log(`[NepqHandoff] ${contactId} (${reason}) card posted to #${ch.name}`); continue; }
     console.warn(`[NepqHandoff] ${contactId} (${reason}) card NOT posted to #${ch.name}: ${res?.error || 'unknown'}`);
     await Promise.resolve(deps.opsAlert?.(`🚨 HAND-OFF CARD NOT POSTED TO #${ch.name}\nSlack said: ${res?.error || 'unknown'}${res?.error === 'not_in_channel' ? `\nFix: add the Reece Slack app to #${ch.name}.` : ''}\n\n${card}`)).catch(() => {});
   }
+  return any;
 }

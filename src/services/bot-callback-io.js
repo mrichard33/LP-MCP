@@ -75,5 +75,8 @@ export function nepqHandoffDeps({ applyTags, addNote }) {
     opsAlert: (text) => import('../alert-state.js').then(({ sendAlertMessage }) => sendAlertMessage(text, { channel: 'ops' })),
     serviceChannels: serviceChannelsFor,
     canvassChannels: canvassChannelsFor,
+    // One card per contact per reason per day (2026-10-07).
+    filterNew: (args) => import('../alert-posted.js').then(({ filterNew }) => filterNew(args)),
+    recordPosted: (args) => import('../alert-posted.js').then(({ recordPosted }) => recordPosted(args)),
   };
 }

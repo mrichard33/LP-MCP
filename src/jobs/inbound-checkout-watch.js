@@ -35,13 +35,14 @@ import { routingMode } from '../booked-dial-routing.js';
 import {
   watchMode, watchConfig, watchRow, classifyRow, assessWaiting, inOfficeHours, formatWaitCard, formatEscalateCard,
   writebackCandidates, writebackDecision, summarize, overnightKey, apptKey, checkedKey, GHL_FIELD_LP_LEAD_ID,
+  INBOUND_WAIT_AUDIT, HELD_IMPORT_AUDIT,
 } from '../inbound-checkout-watch.js';
 
 export const JOB_ID = 'inbound-checkout-watch';
 export const INTERVAL_MS = 5 * 60 * 1000;
 const MARKS_TABLE = 'lp_appointment_sync_marks';
 const ALERT_KEY = 'inbound-checkout-watch';
-export const WAIT_AUDIT = 'inbound_checkout_wait';
+export const WAIT_AUDIT = INBOUND_WAIT_AUDIT;
 export const ESCALATE_AUDIT = 'inbound_checkout_escalate';
 export const ISSUED_TAG = 'lp-issued-via-watch';
 
@@ -158,11 +159,24 @@ export async function runInboundCheckoutWatch({ env = process.env, nowMs = Date.
     ? Promise.resolve(d.postToSlack(text, channel)).catch((err) => ({ ok: false, error: err.message }))
     : { ok: false, error: 'SLACK_CHANNEL_SERVICE unset' });
   const asItems = (list, reason) => list.map((a) => ({ ...a, key: a.row.in1, reason }));
+  // An in1 the held-row "import this lead" card already named is not carded
+  // again here (2026-10-07). A failed read keeps them all (filterNew is fail-open).
+  const notHeldCarded = async (items) => {
+    if (mode !== 'live' || !items.length) return items;
+    const { fresh } = await d.filterNew({
+      audit: HELD_IMPORT_AUDIT, items: items.map((a) => ({ key: a.key, reason: 'card' })), ttlDays: 30, nowMs, deps: { supabase: d.supabase },
+    });
+    const open = new Set(fresh.map((f) => f.key));
+    return items.filter((a) => open.has(a.key));
+  };
 
   if (office) {
-    // 2a. The overnight card, once, in the first in-hours pass.
+    // 2a. The overnight card, once, in the first in-hours pass — only the
+    // inquiries past their threshold (2026-10-07: it listed every waiting row,
+    // 13-minute-old ones included). Nothing due: no card, the key is still
+    // claimed so a row that turns due later goes on the regular card.
     if (marks && !marks.has(overnightKey(today))) {
-      const all = asItems(assessed, 'waiting');
+      const all = await notHeldCarded(asItems(due, 'waiting'));
       if (mode === 'shadow') {
         would.overnight = all.map((a) => a.row.in1);
         if (all.length) console.log(`[InboundWatch] shadow: would post the overnight card (${all.length} waiting)`);
@@ -186,7 +200,7 @@ export async function runInboundCheckoutWatch({ env = process.env, nowMs = Date.
     }
 
     // 2b. The regular card: new inquiries past their threshold.
-    const dueItems = asItems(due.filter((a) => !a.row._announced), 'waiting');
+    const dueItems = await notHeldCarded(asItems(due.filter((a) => !a.row._announced), 'waiting'));
     if (dueItems.length) {
       const { fresh } = mode === 'live'
         ? await d.filterNew({ audit: WAIT_AUDIT, items: dueItems, ttlDays: 3, nowMs, deps: { supabase: d.supabase } })
