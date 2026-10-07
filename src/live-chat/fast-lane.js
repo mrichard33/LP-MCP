@@ -620,6 +620,10 @@ export function createLiveChatFastLane(deps) {
     offerBookingSlots: async () => ({ slots: [], tzLabel: 'ET' }),
     bookSlot: async () => ({ ok: false, error: 'no book dep' }),
     nepqHandoff: async () => null,
+    // 2026-10-07 — promised calls (src/services/promised-callbacks-io.js).
+    // Defaults change nothing and record nothing.
+    guardRepeatPromise: async ({ text }) => ({ text, action: 'none' }),
+    recordPromise: async () => ({ recorded: false }),
     rescheduleAppointment: async () => ({ ok: false, error: 'no reschedule dep' }),
     contactUrl: () => null,
     ...deps,
@@ -1678,6 +1682,18 @@ export function createLiveChatFastLane(deps) {
         d.log(`[HumanVoice] live chat ${contactId} final_pass ${voiceLast.changes.join(',')}`);
         draft = voiceLast.text;
       }
+      // The bot never promises a person twice (2026-10-07, McKoy): with an
+      // OPEN promised_callbacks row, a reply that promises a call again becomes
+      // "{Rep} still owes you that call. I've flagged it again." (live only).
+      try {
+        const guard = await d.guardRepeatPromise({ contactId, text: draft });
+        if (guard?.action === 'replace' && guard.text) {
+          draft = guard.text;
+          extras = { ...extras, repeat_promise_blocked: true };
+        }
+      } catch (err) {
+        d.warn(`[LiveChat] repeat-promise guard failed for ${contactId} (reply unchanged): ${err.message}`);
+      }
     }
     let ghlMessageId = null;
     let sendMethod = null;
@@ -1696,6 +1712,12 @@ export function createLiveChatFastLane(deps) {
       if (!skipCapture) Promise.resolve()
         .then(() => d.captureIdentity(contactId, { visitorTexts: visitorTexts.length ? visitorTexts : [body], capture }))
         .catch(err => d.warn(`[LiveChat] identity capture failed for ${contactId}: ${err.message}`));
+      // A sent call promise becomes an owned task (promised_callbacks, 2026-10-07).
+      // The cancel flow's "our team will call to go over the details" after a
+      // move is #dispatch's, not a callback (skipCapture marks those turns).
+      if (!extras.repeat_promise_blocked && !skipCapture) Promise.resolve()
+        .then(() => d.recordPromise({ contactId, text: draft, channel: 'livechat', phone: phoneFromText(visitorTexts.join(' ') || body) || null, rule: LIVE_CHAT_RULE, actionId }))
+        .catch(err => d.warn(`[LiveChat] promise record failed for ${contactId}: ${err.message}`));
     }
     const finished = finalizeTiming(timing);
     const executionResult = {

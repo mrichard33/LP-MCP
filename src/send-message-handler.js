@@ -332,6 +332,8 @@ import { botCallbackDeps, nepqHandoffDeps } from './services/bot-callback-io.js'
 import { addGHLNote } from './ghl.js';
 import { prerequisiteAskMessage } from './appointments/prerequisite-ask.js';
 import { buildRepNoteAction } from './agentic/rep-note.js';
+// 2026-10-07 — a promised call is an owned task; never promised twice.
+import { guardRepeatPromise, recordPromiseIfAny } from './services/promised-callbacks-io.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY || '';
 const GHL_LOCATION_ID = process.env.GHL_LOCATION_ID || 'SsBG7j5KQAIP1SFP2Sca';
@@ -2305,6 +2307,22 @@ async function sendCustomerStatusProbe(contactId, generated, action, context, op
     };
   }
 
+  // ── The bot never promises a person twice (2026-10-07) ──────────
+  // McKoy (rRPO34Ooq0QmtSfXyqSw) was told Brian would call on 10-01 and again
+  // on 10-02; nobody called. While a promised_callbacks row is OPEN for this
+  // contact, an AI reply that promises a call again becomes the one fixed
+  // line "{Rep} still owes you that call. I've flagged it again." and the
+  // promise is re-flagged in #contact-center. PROMISED_CALLBACK_MODE=live
+  // only; shadow logs would_block_repeat_promise and sends the reply as is.
+  // Only AI-written replies: a rule's own fixed text is never rewritten here.
+  if (generated && message) {
+    const guard = await guardRepeatPromise({ contactId, text: message, name: context?.lead?.first_name || null });
+    if (guard.action === 'replace') {
+      message = guard.text;
+      generated = { ...generated, repeat_promise_blocked: true };
+    }
+  }
+
   // v3.18 — fingerprint after generation, before the send (handoff §5.1).
   fingerprintReply({
     action, contactId, message, channel,
@@ -4018,6 +4036,19 @@ export async function executeSendMessage(action, context) {
       }, botCallbackDeps({ applyTags: applyContactTags, addNote: addGHLNote }))
         .catch(err => console.warn(`[SendMessage] bot callback failed for ${contactId} (fail-soft): ${err.message}`));
     }
+  }
+
+  // ── A sent call promise becomes an owned task (2026-10-07) ─────
+  // promised_callbacks (sql/150): due next business day 12:00 ET, swept to
+  // kept / expired by src/jobs/promised-callback-sweep.js. A service hand-off
+  // is never recorded (it goes to #service). Detached and fail-soft.
+  if (!generated?.repeat_promise_blocked) {
+    recordPromiseIfAny({
+      contactId, text: String(message || ''), channel,
+      phone: generated?.contact_known_phone || context?.lead?.phone || null,
+      rule: action.rule_applied || null, actionId: action.id ?? null,
+      kind: generated?.callback_requested === 'service' || generated?.nepq_handoff?.reason === 'service' || generated?.service_conversation ? 'service' : 'sales',
+    }).catch(err => console.warn(`[SendMessage] promise record failed for ${contactId} (fail-soft): ${err.message}`));
   }
 
   // v3.18 — Bot Review Phase 0, post-send only. The message is already with

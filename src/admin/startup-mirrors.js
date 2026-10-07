@@ -2655,4 +2655,23 @@ export const STARTUP_MIRRORS = [
     fail: '[Migration] lp_inbound_queue / booked_dial_routing_log (sql/149) skipped — apply sql/149 from the dashboard; the inbound-checkout watch keeps no mirror and booked-lead routing logs to job_runs only until it exists:',
     level: 'warn',
   },
+  // promised_callbacks (sql/150, 2026-10-07; the file is the source of truth).
+  // One row per call the bot promised, owned until kept or expired
+  // (src/jobs/promised-callback-sweep.js). Until it exists no promise is
+  // recorded and the repeat-promise guard never fires — both fail soft.
+  {
+    name: 'sql/150',
+    expects: {
+      tables: ['promised_callbacks'],
+      indexes: [
+        'uq_promised_callbacks_open_contact',
+        'idx_promised_callbacks_status_due',
+        'idx_promised_callbacks_contact',
+      ],
+    },
+    sqlFile: 'sql/150_promised_callbacks.sql',
+    ready: '[Migration] promised_callbacks (sql/150) ready',
+    fail: '[Migration] promised_callbacks (sql/150) skipped — apply sql/150 from the dashboard; promised calls are not tracked until it exists:',
+    level: 'warn',
+  },
 ];
