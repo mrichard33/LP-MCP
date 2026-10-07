@@ -1669,6 +1669,15 @@ export function createLiveChatFastLane(deps) {
         d.log(`[PropertyScope] live chat ${contactId} ${scope.reason}`);
         draft = scope.text;
       }
+      // Human voice once more, last (2026-10-06 bot gate, spouse/livechat):
+      // the first pass runs before the guards, and a sentence a guard drops can
+      // leave two stock openers side by side ("Got it. That makes sense.").
+      // It only deletes, so it never undoes a guard.
+      const voiceLast = humanizeReply(draft);
+      if (voiceLast.changes.length) {
+        d.log(`[HumanVoice] live chat ${contactId} final_pass ${voiceLast.changes.join(',')}`);
+        draft = voiceLast.text;
+      }
     }
     let ghlMessageId = null;
     let sendMethod = null;
