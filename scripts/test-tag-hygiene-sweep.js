@@ -91,9 +91,18 @@ test('Slack is silent when nothing was fixed and nothing needs review', async ()
   assert.equal(calls.slack.length, 0);
 });
 
-test('Slack gets one PII-free line when there is something to report', async () => {
+test('digest on (the default): no Slack line; the counts stay on the run for the 08:00 digest (2026-10-07)', async () => {
   const { deps, calls } = fakes({ contactXYZ: ['dq-needs-type'], other: ['stage:a', 'stage:b'] });
-  await runTagHygieneSweep({ mode: 'report', env: {} }, deps);
+  const out = await runTagHygieneSweep({ mode: 'report', env: {} }, deps);
+  assert.equal(calls.slack.length, 0);
+  assert.equal(out.slack.skipped, 'digest');
+  assert.equal(out.needs_review, 1);
+  assert.equal(out.fixed, 1);
+});
+
+test('digest off: Slack gets one PII-free line when there is something to report', async () => {
+  const { deps, calls } = fakes({ contactXYZ: ['dq-needs-type'], other: ['stage:a', 'stage:b'] });
+  await runTagHygieneSweep({ mode: 'report', env: { ALERT_DIGEST_ENABLED: 'false' } }, deps);
   assert.equal(calls.slack.length, 1);
   assert.match(calls.slack[0], /^🧹 Tag sweep \(report\): 1 fixed · 1 need review/);
   assert.ok(!calls.slack[0].includes('contactXYZ'));

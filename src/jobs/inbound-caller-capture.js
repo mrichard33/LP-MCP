@@ -75,6 +75,7 @@ import { searchByPhone, resolveOrCreateContact, DEFAULT_DEPS as GHL_RESOLVE_DEPS
 import { enrollLpLeadCreation as defaultEnroll } from '../admin/lp-force-addlead.js';
 import { runJob } from '../job-runner.js';
 import { hourET, todayET } from './lp-report-common.js';
+import { alertDigestEnabled } from '../alert-posted.js';
 import {
   classifyCaller, isCandidate, normalizeCallerPhone, summarizeCallers, formatDailySummary, isAppointmentSet,
 } from '../inbound-caller-classify.js';
@@ -614,7 +615,13 @@ async function readRecentActions(db, sinceIso) {
   return out;
 }
 
-/** The 07:15 ET summary: the whole 30-day view, labelled, posted. Never acts, never stores. */
+/**
+ * The 07:15 ET summary: the whole 30-day view, labelled. Never acts, never stores.
+ * 2026-10-07 (Mark: move the #ops summaries into the digest): with the digest on
+ * (ALERT_DIGEST_ENABLED, default on) nothing is posted here — the same ~230
+ * "to capture" went out every morning. The counts go back in the return value
+ * (job_runs.detail.counts) and the 08:00 digest lists them only when they rose.
+ */
 export async function runInboundCaptureSummary({ env = process.env, nowMs = Date.now(), deps = {} } = {}) {
   const cfg = captureConfig(env);
   if (cfg.mode === 'off') return { skipped: true, reason: 'INBOUND_CAPTURE_MODE=off' };
@@ -628,6 +635,14 @@ export async function runInboundCaptureSummary({ env = process.env, nowMs = Date
   const actioned = cfg.mode === 'shadow' ? null
     : await readRecentActions(d.db, new Date(nowMs - 24 * HOUR_MS).toISOString());
   const text = formatDailySummary({ runDate: todayET(new Date(nowMs)), mode: cfg.mode, summary: m.summary, actioned });
+  const counts = {
+    callers: m.summary.callers, calls: m.summary.calls, candidates: m.summary.candidates,
+    appointments_set: m.summary.appointments_set, actioned,
+  };
+  if (alertDigestEnabled(env)) {
+    d.log.log(`[InboundCapture] summary ${cfg.mode} — callers=${m.summary.callers} candidates=${m.summary.candidates} (digest)`);
+    return { ok: true, mode: cfg.mode, posted: false, to: 'digest', counts, summary: `callers=${m.summary.callers} candidates=${m.summary.candidates}`, notes: m.errors };
+  }
   const res = await d.postToSlack(text, cfg.slackChannel);
   const posted = !!res?.ok;
   // postToSlack never throws: a bad channel or token must be surfaced here, or
@@ -635,7 +650,7 @@ export async function runInboundCaptureSummary({ env = process.env, nowMs = Date
   const errors = [...m.errors, ...(posted ? [] : [`slack: ${res?.error || 'post failed'}`])];
   d.log.log(`[InboundCapture] summary ${cfg.mode} — callers=${m.summary.callers} candidates=${m.summary.candidates}`
     + ` appts_set=${m.summary.appointments_set}${posted ? ' posted' : ' NOT posted'}`);
-  return { ok: posted, mode: cfg.mode, posted, summary: `callers=${m.summary.callers} candidates=${m.summary.candidates}`, ...(posted ? { notes: errors } : { errors }) };
+  return { ok: posted, mode: cfg.mode, posted, counts, summary: `callers=${m.summary.callers} candidates=${m.summary.candidates}`, ...(posted ? { notes: errors } : { errors }) };
 }
 
 /* --- endpoint ----------------------------------------------------------- */

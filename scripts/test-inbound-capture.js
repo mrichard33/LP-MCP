@@ -521,9 +521,9 @@ test('dry run: hours=all reads the whole view; junk falls back to 48h', async ()
   assert.equal(junk.window, '48h');
 });
 
-test('daily summary: posts to the ops channel in shadow and creates nothing', async () => {
+test('daily summary (digest off): posts to the ops channel in shadow and creates nothing', async () => {
   const w = mixedWorld();
-  const out = await runInboundCaptureSummary({ env: env('shadow'), nowMs: NOW, deps: w.deps });
+  const out = await runInboundCaptureSummary({ env: { ...env('shadow'), ALERT_DIGEST_ENABLED: 'false' }, nowMs: NOW, deps: w.deps });
   assert.equal(out.ok, true);
   assert.equal(w.posts.length, 1);
   assert.equal(w.posts[0].channel, 'COPS');
@@ -532,12 +532,24 @@ test('daily summary: posts to the ops channel in shadow and creates nothing', as
   assert.equal(w.db.tables[TABLE].length, 0);
 });
 
-test('daily summary: a failed Slack post is a failed run, not a quiet morning', async () => {
+test('daily summary (digest off): a failed Slack post is a failed run, not a quiet morning', async () => {
   const w = mixedWorld();
   w.deps.postToSlack = async () => ({ ok: false, error: 'channel_not_found' });
-  const out = await runInboundCaptureSummary({ env: env('shadow'), nowMs: NOW, deps: w.deps });
+  const out = await runInboundCaptureSummary({ env: { ...env('shadow'), ALERT_DIGEST_ENABLED: 'false' }, nowMs: NOW, deps: w.deps });
   assert.equal(out.ok, false);
   assert.ok(out.errors.some((e) => /channel_not_found/.test(e)));
+});
+
+test('daily summary (digest on, the default): posts nothing, hands the counts to the 08:00 digest (2026-10-07)', async () => {
+  const w = mixedWorld();
+  w.deps.postToSlack = async () => { throw new Error('must not post'); };
+  const out = await runInboundCaptureSummary({ env: env('shadow'), nowMs: NOW, deps: w.deps });
+  assert.equal(out.ok, true);
+  assert.equal(out.posted, false);
+  assert.equal(out.to, 'digest');
+  assert.equal(out.counts.callers, 5);
+  assert.ok(Number.isFinite(out.counts.candidates));
+  assert.equal(w.posts.length, 0);
 });
 
 /* --- the approval handler + card ------------------------------------------- */
