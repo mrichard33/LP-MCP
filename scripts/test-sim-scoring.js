@@ -42,6 +42,13 @@ test('a booking claim stands only on the turn that booked', () => {
   assert.equal(scoreResult(result('think', claim, { would_do: [{ turn: 1, kind: 'would_book', start: 'x' }] })).pass, true);
 });
 
+test('a moved appointment backs "You\'re now set for" (the cancel flow\'s reschedule)', () => {
+  // 2026-10-07 gate run: cancel_reschedule/livechat failed once booking-claim.js read "now set for".
+  const moved = [turn(1, 'The first one', "Done. You're now set for Thu, Oct 8 at 2:00 PM ET instead. Our team will call to go over the details.")];
+  assert.equal(scoreResult(result('cancel_reschedule', moved, { would_do: [{ turn: 1, kind: 'would_move_same_appointment_in_ghl', new_start: 'x' }] })).failures.filter(f => f.code === 'unbacked_booking_claim').length, 0);
+  assert.ok(scoreResult(result('think', moved)).failures.some(f => f.code === 'unbacked_booking_claim'), 'no move, still a claim');
+});
+
 test('a held time is not a fake booking; a "you\'re all set" with no hold or booking still is', () => {
   // 2026-10-06 gate run: "I'm holding Tue at 6 PM for you" on a confirm move was failed three times.
   const hold = [turn(1, 'The first one', "I'm holding Tue, Oct 6 at 6:00 PM ET for you. What's your first name?", { nepq: { move: 'confirm' } })];

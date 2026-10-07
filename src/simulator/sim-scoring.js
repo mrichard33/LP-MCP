@@ -116,7 +116,10 @@ export function scoreResult(result) {
     // off (stop-bot) and a person owns the lead (2026-10-07).
     if (!texts.length && t.intent !== 'LP_NOTE_DQ') failures.push({ code: 'no_reply', detail: t.error || t.outcome || 'no reply', turn: t.turn });
     // Whether THIS turn booked: a recorded booking in the turn's effects.
-    const booked = wouldDo(result).some(w => w.turn === t.turn && /would_book/.test(String(w.kind || '')));
+    // A move of the same appointment (the cancel flow's reschedule) counts:
+    // "You're now set for …" is backed by it (2026-10-07 gate run, after
+    // booking-claim.js learned to read "now set for").
+    const booked = wouldDo(result).some(w => w.turn === t.turn && /would_book|would_move_same_appointment/.test(String(w.kind || '')));
     // Whether code HELD a picked time this turn: "I'm holding Tue at 6 PM" is
     // said only on a hold/confirm move (heldSlot), never a fake booking (the
     // first gate run, 2026-10-06, failed three of them).
