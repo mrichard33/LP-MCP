@@ -339,6 +339,17 @@ export const JOBS = Object.freeze([
     isEnabled: (env) => String(env.INBOUND_CHECKOUT_WATCH_MODE || 'shadow').toLowerCase().trim() !== 'off',
   },
   {
+    id: 'promised-callback-sweep',
+    label: 'Calls the bot promised: kept (Five9 call / rep text) or expired → #contact-center',
+    group: 'agentic',
+    cadence: 'every 15 min, in team hours',
+    enabledEnv: 'PROMISED_CALLBACK_MODE',
+    // A MODE (2026-10-07): off | shadow | live, default shadow. Mirrors
+    // promisedCallbackMode() in src/agentic/promised-callbacks.js — only 'off' stops it.
+    enabledDefault: true,
+    isEnabled: (env) => String(env.PROMISED_CALLBACK_MODE || 'shadow').toLowerCase().trim() !== 'off',
+  },
+  {
     id: 'booked-dial-routing',
     label: 'Booked leads → Confirmation list, then off the DIAL ASAP setter lists (decision #2669)',
     group: 'five9',

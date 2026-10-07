@@ -172,6 +172,17 @@ export function promisedCallback(text) {
   return String(text || '').split(/(?<=[.!?])\s+/).some(s =>
     !s.trim().endsWith('?') && CALL_VERB_RX.test(s) && FROM_US_RX.test(s) && !NOT_A_CALLBACK_RX.test(s));
 }
+/**
+ * Does this reply promise that a person will contact the lead (a call, or
+ * "reach out" / "be in touch")? Broader than promisedCallback, which wants a
+ * call verb: McKoy's second promise (2026-10-02) was "Brian will be reaching
+ * out shortly". Used by the repeat-promise guard (src/agentic/promised-callbacks.js),
+ * never to file a callback. Pure.
+ */
+export function promisesPersonContact(text) {
+  return String(text || '').split(/(?<=[.!?])\s+/).some(s =>
+    !s.trim().endsWith('?') && promisesCall(s) && !NOT_A_CALLBACK_RX.test(s));
+}
 // The same-day / immediate part of that promise. "now" alone is left out: it
 // reads as "I'm passing this on now", which stays true after hours.
 const IMMEDIATE = String.raw`\b(?:right\s+now|right\s+away|immediately|in\s+the\s+next\s+(?:few|couple(?:\s+of)?|\d+|several)\s+(?:minutes|hours?)|within\s+the\s+(?:next\s+)?(?:hour|few\s+minutes|\d+\s+minutes)|in\s+a\s+few\s+minutes|shortly|today|tonight|this\s+(?:morning|afternoon|evening))\b`;

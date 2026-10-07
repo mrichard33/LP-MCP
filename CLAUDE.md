@@ -449,6 +449,18 @@ asked for a call or turned the visit down (`leadWantsCall`), with or without a p
 (`NEPQ_NO_CALL_OFFER`). A coverage turn is planned too unless its reply is the whole script (`coverageOwnsReply`: the zip
 ask, the out-of-area close), and more detail right after the bridge gets the visit question once more (`bridge_followup`),
 not a bare `answer` (the shutters thread and the drafty chat, 2026-10-03).
+**A promised call is an owned task, and never promised twice (2026-10-07).** McKoy (rRPO34Ooq0QmtSfXyqSw) was told
+"I'll have Brian call you" on 10-01 and again on 10-02; nobody called; "Stop text" on 10-04. `promisedCallback` saw
+neither (a "?" at the end, a name instead of "we"), so `readCallPromise` (`src/agentic/promised-callbacks.js`) reads
+both. Every sent reply that promises a call (both bots, never a service hand-off) is a `promised_callbacks` row (sql/150,
+one open per contact), due the next business day at 12:00 ET. `src/jobs/promised-callback-sweep.js` (15 min, team hours)
+marks it KEPT on a Five9 call to the phone (`five9_events_raw`, the only source for a call) or a rep's GHL text (an
+outbound message that no workflow sent and whose id is not one of ours: GHL marks the bot's sends `source: app` too), or
+EXPIRED past due: one #contact-center card and `needs-rep-review`, never a text to the lead. While a row is open, a reply
+that promises again becomes "{Rep} still owes you that call. I've flagged it again." (the handoff's line, pending Mark's
+approval; "Our team" when no name) and the re-flag posts once a day. `PROMISED_CALLBACK_MODE` off|shadow|live, default
+shadow (rows written, no Slack, no tag, reply unchanged).
+
 **Only SALES callbacks go to Five9 + #contact-center (Mark, 2026-10-03).** "Anything related to service should let the lead
 know a team member will reach out and send to the Slack service channel." `isServiceCallback` (the lead's words are about an
 install, an order, a repair or a warranty, or a known customer, `isCustomerP2`, asks without naming new work) turns a call
