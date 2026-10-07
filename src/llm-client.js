@@ -69,6 +69,8 @@
  * before setting it in production.
  */
 
+import { recordLlmUsage } from './llm-usage.js';
+
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const ANTHROPIC_VERSION = process.env.ANTHROPIC_VERSION || '2023-06-01';
@@ -429,7 +431,7 @@ async function callOpenAI({ model, system, messages, maxTokens, temperature, jso
  * @returns {Promise<{text,provider,model,usage,raw}>}
  */
 export async function callLLM({ fn, system = null, user = null, messages = null, maxTokens = 500, temperature = null, json = false, cacheSystem = false }) {
-  const { provider, model } = resolveLLM(fn);
+  const { provider, model, group } = resolveLLM(fn);
   const msgs = messages || (user != null ? [{ role: 'user', content: user }] : []);
   if (!msgs.length) throw new Error(`[LLMClient:${fn}] no messages/user provided`);
 
@@ -447,13 +449,25 @@ export async function callLLM({ fn, system = null, user = null, messages = null,
     model, system, messages: msgs, maxTokens: effectiveMaxTokens,
     temperature, json, fn, timeoutMs: effectiveTimeoutMs, cacheSystem,
   };
-  return withTimeout(
-    provider === 'openai' ? callOpenAI(args) : callAnthropic(args),
-    // Derived, not a literal: the race must always sit OUTSIDE the abort, or a
-    // raised inner timeout silently starts losing to a stale outer one.
-    effectiveTimeoutMs + RACE_SLACK_MS,
-    `callLLM:${fn}`,
-  );
+  // 2026-10-07 — usage ledger (IT security review; CANON.STD.025 / SEC.012).
+  // One llm_usage_log row per call, success or failure. recordLlmUsage is
+  // fire-and-forget and never throws, so it cannot change what this function
+  // returns or how long it takes. LLM_USAGE_LOG_MODE=off disables it.
+  const startedAt = Date.now();
+  try {
+    const result = await withTimeout(
+      provider === 'openai' ? callOpenAI(args) : callAnthropic(args),
+      // Derived, not a literal: the race must always sit OUTSIDE the abort, or a
+      // raised inner timeout silently starts losing to a stale outer one.
+      effectiveTimeoutMs + RACE_SLACK_MS,
+      `callLLM:${fn}`,
+    );
+    recordLlmUsage({ fn, group, provider, model, usage: result.usage, latencyMs: Date.now() - startedAt, ok: true });
+    return result;
+  } catch (err) {
+    recordLlmUsage({ fn, group, provider, model, usage: null, latencyMs: Date.now() - startedAt, ok: false, error: err?.message });
+    throw err;
+  }
 }
 
 /**
