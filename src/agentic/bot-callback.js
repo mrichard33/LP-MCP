@@ -65,6 +65,27 @@ export function callbackDecision({ handoffReason = null, otherHandoff = false, t
   return promisedCallback(text) ? { why: 'promise_backed', reason: 'callback_request' } : null;
 }
 
+/**
+ * 2026-10-07 (Nicholas Ferraioli, I5x7zltORikAxdEJ6nyD): a scheduling turn the
+ * bot could not book is a callback, whatever the route. Only rule 324
+ * (callback_request + phone_call) used to requeue, so his continue_current
+ * turn ("Okay 👍") queued nothing. Pure.
+ *   bookingClaimBlocked  the booking-truth guard replaced a time claim
+ *   recommendedAction    the analyzer's route (ai.analysis_completed payload)
+ *   requestedFulfillment the analyzer's 'phone_call' / 'in_home' / …
+ *   booked               this turn's booking landed
+ *   onFile               an appointment is still on the calendar
+ * A real future appointment means no callback: the visit is the next step.
+ */
+export const CALLBACK_ROUTES = new Set(['callback_request', 'busy_callback', 'frustrated_fast_track', 'escalate_to_rep']);
+export function schedulingCallbackDecision({ bookingClaimBlocked = false, recommendedAction = null, requestedFulfillment = null, booked = false, onFile = false } = {}) {
+  if (booked || onFile) return null;
+  if (bookingClaimBlocked) return { why: 'booking_claim_blocked', reason: 'callback_request', kind: 'sales' };
+  if (CALLBACK_ROUTES.has(String(recommendedAction || ''))) return { why: 'callback_route', reason: 'callback_request', kind: 'sales' };
+  if (String(requestedFulfillment || '') === 'phone_call') return { why: 'scheduling_no_booking', reason: 'callback_request', kind: 'sales' };
+  return null;
+}
+
 /** The card line for the Five9 result. Pure. */
 export function five9ResultLine(result) {
   switch (result?.status) {
@@ -157,7 +178,8 @@ export async function fileBotCallback({ contactId, channel = 'sms', inbound = ''
   }
   if (card) {
     await Promise.resolve().then(() => deps.routeHandoff?.({
-      contactId, reason, channel, inbound, firstName, nowMs, extra: five9ResultLine(five9),
+      // 2026-10-07: a caller's own context (the LP-note DQ package) rides above the Five9 line.
+      contactId, reason, channel, inbound, firstName, nowMs, extra: [extra, five9ResultLine(five9)].filter(Boolean).join('\n'),
     })).catch(err => log(`[BotCallback] ${contactId} hand-off failed: ${err.message}`));
   }
   log(`[BotCallback] ${contactId} (${channel}, ${reason}, ${why}) filed: five9=${five9.status}${five9.error ? ` (${five9.error})` : ''}`);

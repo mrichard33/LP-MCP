@@ -423,7 +423,11 @@ const RESOLVED_DISPOSITIONS = new Set(['CXL', 'CCC', 'NoHome', 'NG']);
 const OPERATIONAL_DNC_TAGS = ['dnc', 'dnc-related', 'stage:dnc', 'lp-dnc'];
 
 // Consent-level opt-out — NEVER liftable. See the DNC block above.
-const CONSENT_OPTOUT_TAGS = ['unsubscribed', 'optedOut', 'stop-bot'];
+// 2026-10-07: stop-bot is the bot-off switch, not a consent opt-out (the
+// user's ruling); it is still never lifted by a booking, so it keeps its
+// own list with the same treatment.
+const BOT_OFF_TAGS = ['stop-bot'];
+const CONSENT_OPTOUT_TAGS = ['unsubscribed', 'optedOut', ...BOT_OFF_TAGS];
 
 /* ------------------------------------------------------------------ */
 

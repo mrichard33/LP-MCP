@@ -325,7 +325,10 @@ import { checkNotSuperseded, commitAgenticSend } from './services/agentic-reply-
 import { findNewerInbound } from './agentic/burst-yield.js';
 import { emitEvent } from './event-emitter.js';
 import { routeNepqHandoff } from './agentic/nepq-handoff.js';
-import { fileBotCallback, callbackDecision, CALLBACK_MARKER_TAG } from './agentic/bot-callback.js';
+import { fileBotCallback, callbackDecision, schedulingCallbackDecision, CALLBACK_MARKER_TAG } from './agentic/bot-callback.js';
+import { applyBookingTruth, bookingResult } from './agentic/booking-claim.js';
+import { isTeamOpen } from './agentic/team-hours.js';
+import { noteDqPackage } from './agentic/lp-note-dq.js';
 import { botCallbackDeps, nepqHandoffDeps } from './services/bot-callback-io.js';
 // 2026-09-18 — the decision-maker handoff writes its rep task as a GHL note
 // (GHL has no task API; see src/actions/handlers/tasks.js).
@@ -3444,6 +3447,14 @@ export async function executeSendMessage(action, context) {
 
     _tGenerated = Date.now(); // 2026-09-26 reply timing: t5
 
+    // 2026-10-07 (Nicholas): a team note says we cannot run this lead and the
+    // no-promise hand-off is already in the thread. Nothing new to say; the
+    // callback, the card and the bot-off step were filed with that reply.
+    if (!generationErr && generated?.lp_note_dq?.already_handed_off) {
+      console.log(`[SendMessage] ⏭️ lp_note_dq_already_handed_off: ${contactId} action ${action.id} — not sent`);
+      return { skipped: true, reason: 'lp_note_dq_already_handed_off', contact_id: contactId, channel, lp_note_dq: { signal: generated.lp_note_dq.signal } };
+    }
+
     // 2026-09-24 — a handoff the bot also answers (handoff-policy.js): apply
     // the handoff tag, card and, where a person must act, the alert, then
     // carry on and send the reply. Fail-soft: the reply matters more.
@@ -3994,6 +4005,55 @@ export async function executeSendMessage(action, context) {
     }
   }
 
+  // ── Booking truth: the last check before an AI-written send (2026-10-07) ──
+  // Nicholas Ferraioli (I5x7zltORikAxdEJ6nyD) was told "Thursday … 10:00 AM
+  // ET works.", "… is holding for you." and "You're all set" with nothing
+  // booked: the mid-pipeline guard trusted a companion the NEPQ plan later
+  // dropped. Here, after every rewrite and the inline booking, the reply may
+  // confirm a time only with this turn's real appointment id or the
+  // appointment still on the calendar at that time (booking-claim.js
+  // checkBookingTruth). Anything else becomes the no-promise hand-off, and
+  // the callback block below files the Five9 Callback Request. Every NEPQ
+  // mode, every channel. Fixed rule templates are operator copy and pass.
+  if (generated) {
+    const landed = inlineBooking?.landed ? (inlineBooking.execResult || {}) : null;
+    const result = landed ? bookingResult({
+      booked: true,
+      // create_claim_held: another worker is creating this exact slot (no id yet).
+      appointment_id: landed.appointment_id || (landed.action === 'appointment_book_skipped_existing' && inlineBooking.actionId ? `claim_held:${inlineBooking.actionId}` : null),
+      start_time: landed.start_time || null,
+      calendar_id: landed.calendar_id || null,
+      source: landed.action || 'inline_booking',
+    }) : null;
+    const truth = applyBookingTruth(message, generated, { result, teamOpen: isTeamOpen() });
+    const verdict = truth.blocked ? { allowed: false, ...truth.blocked } : { allowed: true };
+    if (!verdict.allowed) {
+      const blockedText = String(message || '');
+      message = truth.message;
+      generated = { ...generated, companion_action: null, booking_claim_blocked: { reason: verdict.reason, sentence: verdict.sentence } };
+      console.warn(`[SendMessage] 🚫 booking_claim_blocked ${contactId} action ${action.id}: ${verdict.reason} — "${String(verdict.sentence || '').slice(0, 160)}" → no-promise hand-off`);
+      emitEvent({
+        event_type: 'agentic.booking_claim_blocked',
+        source: 'lp_mcp',
+        entity_type: 'contact',
+        entity_id: String(contactId),
+        ghl_contact_id: String(contactId),
+        priority: 'high',
+        idempotency_key: `booking_claim_blocked_${action.id ?? contactId}`,
+        payload: {
+          contact_id: contactId,
+          action_id: action.id ?? null,
+          rule: action.rule_applied || null,
+          channel,
+          reason: verdict.reason,
+          sentence: String(verdict.sentence || '').slice(0, 300),
+          blocked_text: blockedText.slice(0, 500),
+          existing_appointment_id: generated.appointment_on_file?.appointment_id || null,
+        },
+      }).catch?.(() => {});
+    }
+  }
+
   // v3.18 — fingerprint after generation, before the send (handoff §5.1).
   // Detached: the send below never waits on it.
   // 2026-10-06: a rule-written send (SERVICE_AREA_EXIT, …) has no generation
@@ -4054,8 +4114,23 @@ export async function executeSendMessage(action, context) {
     const classified = generated?.callback_requested
       ? { why: 'classifier_callback', reason: generated.callback_requested === 'service' ? 'service' : 'callback_request', kind: generated.callback_requested === 'service' ? 'service' : 'sales' }
       : null;
-    const decision = (generated?.nepq_handoff || generated?.dm_handoff) ? callbackDecision({ handoffReason: generated?.nepq_handoff?.reason || null, otherHandoff: !!generated?.dm_handoff, text: String(message || '') })
-      : (classified || callbackDecision({ text: String(message || '') }));
+    // 2026-10-07 (Nicholas): a blocked time claim, a callback route or a
+    // phone-call ask that booked nothing files too, unless a real future
+    // appointment exists. Service conversations keep their own path.
+    const analysis = sourceEventMeta?.event_type === 'ai.analysis_completed' ? (sourceEventMeta.payload || {}) : {};
+    const scheduling = generated && !generated.service_conversation ? schedulingCallbackDecision({
+      bookingClaimBlocked: !!generated.booking_claim_blocked,
+      recommendedAction: analysis.recommended_action || payload.recommended_action || null,
+      requestedFulfillment: analysis.requested_fulfillment || null,
+      booked: !!inlineBooking?.landed,
+      onFile: !!generated.appointment_on_file,
+    }) : null;
+    // A team note says we cannot run the lead: Five9 + the #contact-center
+    // card carrying the note, the appointment, the last messages and what the
+    // bot said (lp-note-dq.js noteDqPackage).
+    const noteDq = generated?.lp_note_dq ? { why: 'lp_note_dq', reason: 'lp_note_dq', kind: 'sales' } : null;
+    const decision = noteDq || ((generated?.nepq_handoff || generated?.dm_handoff) ? callbackDecision({ handoffReason: generated?.nepq_handoff?.reason || null, otherHandoff: !!generated?.dm_handoff, text: String(message || '') })
+      : (classified || scheduling || callbackDecision({ text: String(message || '') })));
     if (decision) {
       if (decision.why === 'promise_backed') console.log(`[SendMessage] call_promise_backed ${contactId}: "${String(message || '').slice(0, 160)}"`);
       fileBotCallback({
@@ -4064,11 +4139,25 @@ export async function executeSendMessage(action, context) {
         // A service conversation goes to the service channel, never Five9 (Mark, 2026-10-03).
         kind: decision.kind || (generated?.service_conversation ? 'service' : 'sales'),
         card: decision.card !== false,
-        // The do-not-knock address and name (nepq-planner.js), on the card.
-        extra: generated?.nepq_handoff?.extra || null,
+        // The do-not-knock address and name (nepq-planner.js), on the card;
+        // for a team-note DQ, the whole context package.
+        extra: noteDq
+          ? noteDqPackage({ noteDq: generated.lp_note_dq, facts: generated.lead_facts || null, conversation: generated.lp_note_dq.conversation_tail || [], sent: message })
+          : (generated?.nepq_handoff?.extra || null),
       }, botCallbackDeps({ applyTags: applyContactTags, addNote: addGHLNote }))
         .catch(err => console.warn(`[SendMessage] bot callback failed for ${contactId} (fail-soft): ${err.message}`));
     }
+  }
+
+  // ── A team note says we cannot run the lead: bot off (2026-10-07) ──
+  // dq_hard_stop 60s later: stop-bot on, agentic-active off, out of the
+  // S5.x / S4.5 / W-series workflows (the S5.2 rescue texts included). The
+  // user's ruling that day: stop-bot is the bot-off switch, not a DNC.
+  if (generated?.lp_note_dq) {
+    import('./actions/index.js')
+      .then(m => m.scheduleLpNoteDqStop(contactId, { sourceActionId: action.id ?? null, rule: action.rule_applied || null }))
+      .then(r => console.log(`[SendMessage] lp_note_dq stop for ${contactId}: ${r?.reason || 'unknown'}${r?.action_id ? ` #${r.action_id}` : ''}`))
+      .catch(err => console.warn(`[SendMessage] lp_note_dq stop failed for ${contactId} (fail-soft): ${err.message}`));
   }
 
   // ── A sent call promise becomes an owned task (2026-10-07) ─────

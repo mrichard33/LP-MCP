@@ -33,6 +33,7 @@
 import { contactHadDemo } from './demo-truth.js';
 import { pickCurrentLead } from './current-lead.js';
 import { lpDateToEastern, lpCreatedDate, sanitizeLpApptDate } from './lp-dates.js';
+import { detectNoteDq } from './agentic/lp-note-dq.js';
 
 export const S52_WORKFLOW_IDS = Object.freeze([
   '0a6a1349-0b44-429b-91e1-4c5be264cd9f', // S5.2 v2 (active-s5.2)
@@ -48,6 +49,8 @@ export const S52_TAGS = Object.freeze(['active-s5.2', 'active-w5.2', 's52-task-c
 export const CANVASSING_TAGS = Object.freeze(['active-entry:canvassing']);
 export const LIVE_APPOINTMENT_DISPOSITIONS = Object.freeze(['Set', 'Cnf', 'Verif', 'Issue']);
 export const NO_DEMO_DISPOSITIONS = Object.freeze(['No Demo', 'ND', 'NOC']);
+/** 2026-10-07: a text from the lead this recent means they are mid-conversation. */
+export const MID_CONVERSATION_MS = 2 * 60 * 60 * 1000;
 const MAX_PROSPECTS = 5; // a phone on more prospects than this is a data problem
 
 const norm = (s) => String(s ?? '').trim();
@@ -92,10 +95,22 @@ export function isLiveAppointmentLead(lead, nowMs = Date.now()) {
  * `tags` the contact's live GHL tags.
  * @returns {{ allow: boolean, reason: string, detail?: object }}
  */
-export function evaluateS52Entry({ leads, tags, nowMs = Date.now() } = {}) {
+export function evaluateS52Entry({ leads, tags, notes = [], lastInboundMs = null, nowMs = Date.now() } = {}) {
   const tagSet = lowerSet(tags);
   const canvass = CANVASSING_TAGS.find((t) => tagSet.has(t));
   if (canvass) return { allow: false, reason: 'canvassing', detail: { tag: canvass } };
+
+  // 2026-10-07 (Nicholas Ferraioli): we cancelled his visit because a team
+  // note said we cannot run it, and S5.2 still texted him "Ninety minutes in
+  // your home was the wrong first step". A rescue sequence is for a lead we
+  // want back; a team-note DQ is not one (src/agentic/lp-note-dq.js).
+  const dq = detectNoteDq(notes);
+  if (dq.dq) return { allow: false, reason: 'lp_note_dq', detail: { signal: dq.signal, note: String(dq.text || '').slice(0, 200) } };
+  // A lead who texted us in the last 2 hours is mid-conversation and waiting
+  // on a reply, not on generic sequence copy.
+  if (Number.isFinite(lastInboundMs) && nowMs - lastInboundMs >= 0 && nowMs - lastInboundMs < MID_CONVERSATION_MS) {
+    return { allow: false, reason: 'mid_conversation', detail: { last_inbound_at: new Date(lastInboundMs).toISOString() } };
+  }
 
   const rows = Array.isArray(leads) ? leads : [];
   if (contactHadDemo(rows)) return { allow: false, reason: 'demo_on_any_lead' };
@@ -222,7 +237,36 @@ export async function loadS52GateInputs(contactId, deps = {}) {
     } catch (err) { return fail(`lp_prospect:${pid}`, err); }
   }
 
-  return { leads: mergeLeads(cacheRows, liveRows), tags: contact.tags || [], contact };
+  // 2026-10-07: the current leads' LP notes and the lead's last text. Both
+  // fail OPEN: they add two refusals to a gate whose own reads fail closed,
+  // and an outage here must not stop every rescue.
+  let notes = [];
+  const leadIds = [...new Set(cacheRows.map((r) => norm(r.lp_lead_id)).filter(Boolean))];
+  if (leadIds.length) {
+    try {
+      const { data, error } = await d.supabase.from('lp_notes')
+        .select('note_body, created_at_lp')
+        .in('lp_lead_id', leadIds)
+        .not('note_body', 'is', null)
+        .order('created_at_lp', { ascending: false })
+        .limit(20);
+      if (error) throw new Error(error.message);
+      notes = (data || []).map((n) => ({ text: n.note_body, date: n.created_at_lp }));
+    } catch (err) { console.warn(`[S52Gate] ${contactId}: lp_notes read failed (fail open): ${err?.message || err}`); }
+  }
+  let lastInboundMs = null;
+  try {
+    const { data, error } = await d.supabase.from('system_events')
+      .select('created_at')
+      .eq('event_type', 'ghl.reply_received')
+      .eq('ghl_contact_id', String(contactId))
+      .order('created_at', { ascending: false })
+      .limit(1);
+    if (error) throw new Error(error.message);
+    if (data?.[0]?.created_at) lastInboundMs = Date.parse(data[0].created_at);
+  } catch (err) { console.warn(`[S52Gate] ${contactId}: last-inbound read failed (fail open): ${err?.message || err}`); }
+
+  return { leads: mergeLeads(cacheRows, liveRows), tags: contact.tags || [], contact, notes, lastInboundMs };
 }
 
 /** Load + decide for one contact. Read failures block. */

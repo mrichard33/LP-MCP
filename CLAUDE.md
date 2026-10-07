@@ -126,7 +126,43 @@ where a person must act, pages one — and the bot still replies, unless `handof
 (`src/agentic/handoff-policy.js`) says `silent` (STOP, WRONG_NUMBER; a STOP that is only a door complaint is
 cleared, `classificationAfterKnock`). A new handoff class replies by default. Do not add a silent class without Mark's
 ruling, and never add `stop-bot` to a rule whose trigger is not an opt-out. Mark's ruling of 2026-10-06 is the one
-exception: a lead the system DISQUALIFIED gets no bot message and gets stop-bot (the one send gate, above).
+exception: a lead the system DISQUALIFIED gets no bot message and gets stop-bot (the one send gate, above). A team
+note in LP that says we cannot run the lead is such a disqualification (2026-10-07, below).
+
+**`stop-bot` turns the bot off; it is NOT a DNC (the user, 2026-10-07).** "This tag is intended to stop all bot
+communication." It is its own send-gate class (`BOT_STOP` in `may-message.js`: every purpose, every channel, reason
+`bot_stop`), it is not in `DNC_FAMILY_TAGS` (no DNC-lift card), not in the inbound caller's `DNC_TAGS` (a stop-bot
+caller is still captured and dialed), and rules 368/369/387/388 no longer fire on it alone
+(`sql/seeds/2026-10-07_stop_bot_not_dnc.sql`). Never write a consent row, a Five9/LP DNC or a DNC-lift card
+because of stop-bot. Open question for Mark: rule 14 still adds stop-bot on an LP DNC, which is why a DNC lift
+removes it (`LIFT_TAGS`).
+
+**No confirmed time without a booking (Nicholas Ferraioli, 2026-10-07).** The bot told a lead "Thursday … 10:00
+AM ET works.", "… is holding for you." and "You're all set" and booked nothing: a stale `booking:active` tag made
+his LP-cancelled visit read as on file, and the mid-pipeline guard trusted a `book_appointment` companion that the
+NEPQ plan dropped later. Now:
+- `checkBookingTruth` (`src/agentic/booking-claim.js`) is the LAST check on every AI-written send (send handler,
+  after the inline booking; live chat before `deliver`), every NEPQ mode and channel. A time claim stands only with
+  this turn's real appointment id (`bookingResult`) or the appointment still on the calendar at that day and time
+  (`appointmentOnFile`: GHL first, then LP not CXL/CCC; `booking:active` alone is never an appointment). Otherwise
+  the reply becomes "Thanks, {name}. A team member will call you shortly to confirm a time that works." (no day, no
+  time; "as soon as we open" out of hours), logs `booking_claim_blocked` and emits `agentic.booking_claim_blocked`.
+  The simulator mirrors it (`applyBookingTruth`). Add a new confirm wording to `CLAIM_PATTERNS`, never a second guard.
+- A blocked claim, a callback route (`callback_request`, `busy_callback`, `frustrated_fast_track`,
+  `escalate_to_rep`) or a `phone_call` ask that booked nothing files the Five9 Callback Request through
+  `fileBotCallback` (`schedulingCallbackDecision`), unless a real future appointment exists.
+- `context-builder.js`: an LP CXL/CCC outranks `booking:active` (that tag only overrides the `appt-cancelled` tag).
+- Both prompts render the same `LEAD FACTS` block (`src/agentic/lead-facts.js`): the appointment's real status and
+  cancel note, every LP note in full, the property ZIP on file (LP first). `enforceCancelledVisit`
+  (`src/agentic/cancelled-visit.js`) replaces "before your visit" after a cancel; a later typed ZIP is a correction
+  ("33756" then "Sorry 33711" → 33711), and the property ZIP wins when it was typed.
+- **A team note that says we cannot run the lead stops the bot.** `LP_NOTE_DQ_SIGNALS` (`src/agentic/lp-note-dq.js`,
+  one list: not the owner, renter, a housing program, "not something we can run", out of area, mobile home). The
+  reply writer books nothing and sends the no-promise hand-off once; the send handler files the Five9 callback,
+  posts a ⛔ card to #contact-center with the note, the appointment, the last 5 messages and what the bot said
+  (`routeNepqHandoff` reason `lp_note_dq`), and queues `dq_hard_stop` (stop-bot, out of S5.x/S4.5/W). S5.2 entry
+  is refused on such a note and for a lead who texted in the last 2 hours (`s52-entry-gate.js`).
+  `LP_NOTE_DQ_MODE` off|shadow|live, default live.
 
 **Post-demo F.0 leads talk to the rehash rep (Mark, 2026-10-01).** A contact tagged `active-f.0` (or texting
 727-800-4578) gets SMS replies written AS the rep in the GHL custom value `rehash_rep_name`, read by
