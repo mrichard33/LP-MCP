@@ -131,3 +131,62 @@ test('candidate SQL targets the HL contacts table, excludes deleted rows and sor
   assert.match(sql, /ORDER BY CASE WHEN/);
   assert.match(sql, /LIMIT 50$/);
 });
+
+// ─── R7: retired drip tags (2026-10-08) ─────────────────────────────────────
+
+const { applyRulesFromEnv, buildRetiredDripTagsSql, loadRetiredDripTags, MIN_LIVE_DRIP_TAGS } = await import('../src/jobs/tag-hygiene-sweep.js');
+
+test('R7 writes in report mode (default apply list), R1 still only reports', async () => {
+  const { deps, calls } = fakes({
+    a: ['active-w03', 'active-e.3', 'stage:entry-bridge'],
+    b: ['dq-needs-type'],
+  });
+  deps.loadRetiredDripTags = async () => new Set(['active-w03', 'active-w11.2']);
+  const out = await runTagHygieneSweep({ mode: 'report', env: {} }, deps);
+  const del = deletes(calls);
+  assert.equal(del.length, 1);
+  assert.deepEqual(del[0].body.tags, ['active-w03']);
+  assert.ok(del[0].path.includes('/contacts/a/'));
+  assert.deepEqual(out.retired_drip_tags, ['active-w03', 'active-w11.2']);
+  const r7 = calls.logs.find((l) => l.rule === 'R7');
+  assert.equal(r7.mode, 'apply');
+  assert.equal(calls.logs.find((l) => l.rule === 'R1').mode, 'report');
+});
+
+test('a dry run writes nothing, R7 included', async () => {
+  const { deps, calls } = fakes({ a: ['active-w03'] });
+  deps.loadRetiredDripTags = async () => new Set(['active-w03']);
+  const out = await runTagHygieneSweep({ mode: 'report', env: {}, dryRun: true }, deps);
+  assert.equal(deletes(calls).length, 0);
+  assert.equal(out.dry_run, true);
+  assert.equal(out.fixed, 1);
+});
+
+test('TAG_SWEEP_APPLY_RULES=none keeps R7 report-only; an unreadable set skips R7', async () => {
+  assert.deepEqual([...applyRulesFromEnv({})], ['R7']);
+  assert.deepEqual([...applyRulesFromEnv({ TAG_SWEEP_APPLY_RULES: 'none' })], []);
+  const { deps, calls } = fakes({ a: ['active-w03'] });
+  deps.loadRetiredDripTags = async () => new Set(['active-w03']);
+  await runTagHygieneSweep({ mode: 'report', env: { TAG_SWEEP_APPLY_RULES: 'none' } }, deps);
+  assert.equal(deletes(calls).length, 0);
+  const f2 = fakes({ a: ['active-w03'] });
+  f2.deps.loadRetiredDripTags = async () => null;
+  const out = await runTagHygieneSweep({ mode: 'report', env: {} }, f2.deps);
+  assert.equal(deletes(f2.calls).length, 0);
+  assert.equal(out.retired_drip_tags, null);
+});
+
+test('the retired-tag read fails closed when the workflow mirror looks empty', async () => {
+  assert.match(buildRetiredDripTagsSql(), /add_contact_tag/);
+  assert.match(buildRetiredDripTagsSql(), /status = 'published'/);
+  const read = (row) => loadRetiredDripTags({ hlRunSQL: async () => [row] });
+  assert.equal(await read({ live_count: MIN_LIVE_DRIP_TAGS - 1, retired: ['active-w03'] }), null);
+  const set = await read({ live_count: 60, retired: ['active-w03', 'active-entry:chatbot', 'Active-W5.2'] });
+  assert.deepEqual([...set].sort(), ['active-w03', 'active-w5.2']);
+  assert.equal(await loadRetiredDripTags({ hlRunSQL: async () => { throw new Error('down'); } }), null);
+});
+
+test('the candidate query picks up contacts carrying a retired drip tag', () => {
+  assert.match(buildCandidateSql(10, undefined, ['active-w03']), /lower\(t\) = ANY\(ARRAY\['active-w03'\]/);
+  assert.doesNotMatch(buildCandidateSql(10), /lower\(t\) = ANY/);
+});

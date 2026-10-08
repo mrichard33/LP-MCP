@@ -140,3 +140,21 @@ test('summary counts and Slack gating', () => {
   const line = formatSweepSummary(c, 'report');
   assert.equal(line, '🧹 Tag sweep (report): 2 fixed · 1 need review · top rules: R1 2, R6 1');
 });
+
+// ─── R7: retired drip tags (2026-10-08) ─────────────────────────────────────
+{
+  const { evaluateTagRules: ev, DRIP_TAG_RE } = await import('../src/tag-hygiene/rules.js');
+  const t = (await import('node:test')).default;
+  const a = (await import('node:assert/strict')).default;
+  t('R7 removes only a drip tag no live workflow adds, and only with a known set', () => {
+    const retired = new Set(['active-w03', 'active-w11.2']);
+    const d = ev({ tags: ['active-w03', 'active-e.3', 'Active-W11.2', 'active-entry:chatbot'], retiredDripTags: retired });
+    const r7 = d.find((x) => x.rule === 'R7');
+    a.deepEqual(r7.tags, ['active-w03', 'Active-W11.2']);
+    a.equal(r7.action, 'remove');
+    a.equal(ev({ tags: ['active-w03'], retiredDripTags: null }).length, 0);
+    a.equal(ev({ tags: ['active-w03'], retiredDripTags: new Set() }).length, 0);
+    a.equal(DRIP_TAG_RE.test('active-entry:chatbot'), false);
+    a.equal(DRIP_TAG_RE.test('agentic-active'), false);
+  });
+}
