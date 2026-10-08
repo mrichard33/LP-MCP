@@ -917,6 +917,20 @@ write. Only about 40% of LP lead ids 530k–542k (April–May 2026) are present.
 `scripts/repair-p2-missing-lp-jobs.js` recovers them per P2 opportunity. "No LP job" on a P2
 opportunity is a copy gap far more often than a job LP never created.
 
+**The holes are biased toward UNSOLD leads, so never take a rate from `lp_leads` before late July 2026
+(2026-10-08).** Sold leads are pulled in by the job sync; unsold ones are not. `lp_leads` holds 3,149
+February leads against LP's 12,444, and February's sales-per-lead read .097 from it against LP's real
+.026. Coverage passes ~95% only from late July. For an older month use LP report 136 per sub-source
+(`lp_source_cost_history`, by lead entry month; it ties to report 135's lead count), as
+`tallySourceCost` in `src/batting-average.js` does for the LightFire scorecard
+(`node scripts/lightfire-scorecard.js`).
+
+**137 By Setter comes in two shapes, both into `lp_sales_efficiency_setter_history` (2026-10-08).** The emailed
+data export (the same header as By Market, told apart by `xGrouper`) and the PRINTED page LP's viewer saves as
+.xls, read by column and checked against its own printed Total (`parseSalesEfficiencySetterLayout`; the
+CSV route recognises it by title). Jan–Sep 2026 came in as .xls: `scripts/lp-137-setter-layout-backfill.js`
+(dry run first, `--load` to write). It is MONTHLY, so the report watchdog uses `cadence: 'monthly'` for it.
+
 **Six markets, not seven — Lakeland is Orlando (2026-09-28, `sql/135_lake_orl_merge.sql`).** LP still
 prints branch `LAKE`, and it stays raw wherever a raw branch is stored (`branch_code_raw`,
 `lp_branch_id`, `rep_home_market`), exactly like BOCA/MIAMI for Fort Lauderdale. The fold happens in

@@ -38,7 +38,7 @@
 // CSV carries cents and asserts exactly.
 
 import { parseMoneyCents, parseDateMDY } from './lp-report-common.js';
-import { csvToObjects, parseCsvDate, parseCount , parseCsvDateTimeET } from './lp-report-csv-common.js';
+import { csvToObjects, parseCsvDate, parseCount, parseCsvDateTimeET, parseCsv } from './lp-report-csv-common.js';
 import { resolveMarketFromBranch } from './market-resolver.js';
 
 // Verbatim branch labels 137 prints (Grouper / row label). RFED appears when
@@ -270,6 +270,143 @@ export function parseSalesEfficiencyPdf(text) {
   });
 
   return { rows, header: { periodStart, periodEnd, asOf: printedAt }, mode, totals, misaligned };
+}
+
+// ── Printed-layout parsing (By Setter, Excel export of the printed report) ──
+//
+// 2026-10-08: Mark exported "Sales Efficiency By Setter" for Jan–Sep 2026 from
+// LP's report VIEWER as .xls. That file is the printed page laid onto a grid,
+// not the data export parseSalesEfficiencyCsv reads: no header row of field
+// names, two-plus physical rows per setter (values, then percents), the first
+// setter spilling into the header rows, and the Total spread over a dozen
+// rows one cell each. Converted to CSV (LibreOffice `soffice --headless
+// --convert-to csv`, or Excel "Save As CSV"), every value keeps its grid
+// COLUMN, and the column is the same in all nine months — so fields are read
+// by column index, and the printed Total is the checksum that proves it.
+//
+// FAIL CLOSED: the header labels must sit in the columns below (a moved column
+// means a changed layout, and a guessed mapping is how March 2026's Net became
+// Hold on the PDF path), a field seen twice in one block rejects the file, and
+// validateSalesEfficiency compares every column with the printed Total.
+
+/** Grid column → field, measured on all nine 2026 exports. 46 is the printed NSLI: never ingested. */
+export const SE_LAYOUT_COLUMNS = Object.freeze({
+  1: 'num_issued', 2: 'num_net_issued', 3: 'num_sat',
+  6: 'num_sold', 10: 'gsa_cents',
+  14: 'num_working', 18: 'working_cents',
+  21: 'num_cd', 24: 'cd_cents',
+  27: 'num_cancelled', 30: 'cancelled_cents',
+  33: 'num_hold', 37: 'hold_cents',
+  40: 'num_net', 43: 'nsa_cents',
+});
+/** Header labels and the column each must occupy: the layout fingerprint. */
+const SE_LAYOUT_HEADER = Object.freeze({
+  0: 'by setter', 1: 'gross iss', 2: 'net iss', 8: 'close', 15: 'working',
+  22: 'credit decline', 28: 'canceled', 33: 'hold-hoa', 41: 'net',
+});
+export const SE_LAYOUT_PARSER_VERSION = 'se_setter_layout_v1';
+
+const LAYOUT_NUM_RE = /^-?[\d,]+(?:\.\d+)?$/;
+const LAYOUT_PCT_RE = /^-?[\d.]+%$/;
+const cell = (row, c) => String(row?.[c] ?? '').trim();
+
+/** The grid row holding the column labels, or -1. */
+function layoutHeaderRow(grid) {
+  for (let i = 0; i < Math.min(grid.length, 8); i++) {
+    if (Object.entries(SE_LAYOUT_HEADER).every(([c, label]) => cell(grid[i], c).toLowerCase() === label)) return i;
+  }
+  return -1;
+}
+
+/** Is this grid LP's printed "Sales Efficiency By Setter" page? */
+export function isSalesEfficiencySetterLayout(grid) {
+  const titled = (grid ?? []).slice(0, 4).some((r) => (r ?? []).some((v) => String(v ?? '').trim().toLowerCase() === 'sales efficiency by setter'));
+  return titled && layoutHeaderRow(grid) >= 0;
+}
+
+/**
+ * Parse the printed By Setter layout (as CSV text).
+ *
+ * @param {string|string[][]} input CSV text, or a grid already split by parseCsv
+ * @returns {{ rows, header: {periodStart, periodEnd, asOf, generatedAt}, mode, totals, misaligned, error? }}
+ */
+export function parseSalesEfficiencySetterLayout(input) {
+  const grid = typeof input === 'string' ? parseCsv(input) : input;
+  const text = grid.map((r) => (r ?? []).join(' ')).join('\n');
+  const { periodStart, periodEnd } = parseWindow(text);
+  const footer = text.match(/(\d{1,2}\/\d{1,2}\/\d{4})\s+(\d{1,2}):(\d{2})\s*([AP]M)/i);
+  const generated = footer ? parseCsvDateTimeET(`${footer[1]} ${footer[2]}:${footer[3]}:00 ${footer[4]}`) : null;
+  const header = {
+    periodStart, periodEnd,
+    asOf: footer ? parseDateMDY(footer[1]) : null,
+    generatedAt: generated?.iso ?? null,
+  };
+  const unparseable = (error, detail) => ({ rows: [], header, mode: 'unparseable', totals: null, misaligned: [], error, detail });
+
+  const headerIdx = layoutHeaderRow(grid);
+  if (headerIdx < 0) return unparseable('layout_header_not_found');
+  const totalIdx = grid.findIndex((r, i) => i > headerIdx && cell(r, 0) === 'Total:');
+  if (totalIdx < 0) return unparseable('total_row_not_found');
+
+  // A block opens on a row whose Gross Iss cell is a count. The setter's name
+  // is col 0 of that row; LP's own "no setter" bucket prints with no name at
+  // all (Feb and Mar 2026), and is kept as '' exactly as the CSV export does.
+  // The last block before 'Total:' is the Total itself.
+  const starts = [];
+  for (let i = headerIdx + 1; i < totalIdx; i++) {
+    if (/^\d+$/.test(cell(grid[i], 1))) starts.push(i);
+  }
+  if (starts.length < 2) return unparseable('no_setter_rows');
+
+  const misaligned = [];
+  const readBlock = (from, to, label) => {
+    const out = {};
+    for (let i = from; i < to; i++) {
+      const row = grid[i] ?? [];
+      // A values cell outside the known columns means the layout moved.
+      row.forEach((v, c) => {
+        const s = String(v ?? '').trim();
+        if (c > 0 && c !== 11 && c !== 46 && LAYOUT_NUM_RE.test(s) && !(c in SE_LAYOUT_COLUMNS)) {
+          misaligned.push({ label, column: c, token: s });
+        }
+      });
+      for (const [c, field] of Object.entries(SE_LAYOUT_COLUMNS)) {
+        if (Number(c) === 1 && i !== from) continue; // only the opening row's Gross Iss
+        const s = cell(row, c);
+        if (!LAYOUT_NUM_RE.test(s)) continue;
+        if (field in out) { misaligned.push({ label, column: Number(c), token: s, reason: 'field_twice' }); continue; }
+        out[field] = field.endsWith('_cents') ? parseMoneyCents(s) : parseCount(s);
+      }
+    }
+    return out;
+  };
+  const pctRowAfter = (from, limit) => {
+    for (let i = from + 1; i < limit; i++) {
+      if ((grid[i] ?? []).some((v) => LAYOUT_PCT_RE.test(String(v ?? '').trim()))) return i;
+    }
+    return -1;
+  };
+
+  const rows = [];
+  for (let k = 0; k < starts.length - 1; k++) {
+    const s = starts[k];
+    const end = pctRowAfter(s, starts[k + 1]);
+    if (end < 0) return unparseable('percent_row_not_found', { row: s });
+    const label = cell(grid[s], 0);
+    rows.push({ row_num: k + 1, setter_name_raw: label, ...readBlock(s, end, label) });
+  }
+  const totals = readBlock(starts[starts.length - 1], totalIdx, 'Total:');
+
+  // Net prints only for a closed period (the MTD guard above): no Net total
+  // means counts only, and Net stays NULL on every row, never 0.
+  const mode = totals.num_net != null && totals.nsa_cents != null ? 'full' : 'counts_only';
+  for (const r of rows) {
+    for (const f of Object.values(SE_LAYOUT_COLUMNS)) {
+      if (r[f] == null) r[f] = (mode === 'counts_only' && (f === 'num_net' || f === 'nsa_cents')) ? null : 0;
+    }
+  }
+  if (mode === 'counts_only') { delete totals.num_net; delete totals.nsa_cents; }
+  return { rows, header, mode, totals, misaligned };
 }
 
 /**

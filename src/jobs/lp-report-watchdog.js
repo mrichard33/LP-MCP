@@ -65,7 +65,11 @@ const WATCHED = [
   // below), so adding it does NOT start a daily alarm for a feed that has never
   // run. It stays in `unarmed` until the schedule exists, which is the honest
   // state and is separately reported.
-  { type: 'sales_efficiency_by_setter', label: 'Report 137 "Sales Efficiency By Setter" (call-center cohort)', schedule: '7:05 ET' },
+  //
+  // MONTHLY (Mark, 2026-10-08: "the monthly report"). A daily rule would page
+  // every morning after the first month landed, so this one is missing only
+  // when nothing has arrived this month by the MONTHLY_GRACE_DAY. See isMissing.
+  { type: 'sales_efficiency_by_setter', label: 'Report 137 "Sales Efficiency By Setter" (call-center cohort)', schedule: 'monthly, by the 3rd', cadence: 'monthly' },
   // TIER 1, not secondary. Under the v4 contract 138 owns the call-center
   // funnel outright, so its ingest has to be as reliable as 137's — same guard,
   // same alert path, no "it's only supporting data" exemption.
@@ -92,6 +96,23 @@ const WATCHED = [
 const UNARMED_SENTINEL = '__unarmed__';
 /** An unarmed type is only worth reporting if it is demonstrably still alive. */
 const RECENTLY_ACTIVE_DAYS = 7;
+
+/** A monthly report is late once this day of the month passes with nothing this month. */
+const MONTHLY_GRACE_DAY = 3;
+
+/**
+ * Pure. Is a watched report missing? Daily: nothing today (ET). Monthly:
+ * nothing since the 1st, and today is past MONTHLY_GRACE_DAY.
+ * Dates are 'YYYY-MM-DD' in ET.
+ */
+export function isMissing({ cadence = 'daily', lastEtDay, today }) {
+  if (cadence === 'monthly') {
+    const monthStart = `${today.slice(0, 7)}-01`;
+    if (Number(today.slice(8, 10)) <= MONTHLY_GRACE_DAY) return false;
+    return !lastEtDay || lastEtDay < monthStart;
+  }
+  return lastEtDay !== today;
+}
 
 let watchdogTimer = null;
 
@@ -148,7 +169,7 @@ export async function checkLpReportFreshness({ alert = true } = {}) {
   // on an `unarmed` list we could not actually verify.
   let readFailed = false;
 
-  for (const { type, label, schedule } of WATCHED) {
+  for (const { type, label, schedule, cadence = 'daily' } of WATCHED) {
     // Armed only after the first scheduled (n8n-sourced) success — see header.
     // ARMING STATUSES: 'succeeded_with_warnings' counts. Report 138
     // (appt_stats_by_rep_source) has posted with ?source=n8n since the workflow
@@ -188,8 +209,8 @@ export async function checkLpReportFreshness({ alert = true } = {}) {
       continue;
     }
 
-    const ingestedToday = lastEtDay === today;
-    if (!ingestedToday) missing.push({ type, label, last_ingested_et: lastEtDay });
+    const isLate = isMissing({ cadence, lastEtDay, today });
+    if (isLate) missing.push({ type, label, last_ingested_et: lastEtDay });
 
     // Every read failure above `continue`s before this point, so reaching here
     // is always a real observation — safe to open the condition or to clear it.
@@ -197,10 +218,10 @@ export async function checkLpReportFreshness({ alert = true } = {}) {
     if (alert) {
       await reportAlertCondition({
         key: `lp_report:missing:${type}`,
-        active: !ingestedToday,
+        active: isLate,
         label: `${label} ingested`,
         text: () =>
-          `⏰ LP report MISSING: ${label} has not ingested today (${today} ET). ` +
+          `⏰ LP report MISSING: ${label} has not ingested ${cadence === 'monthly' ? 'this month' : 'today'} (${today} ET). ` +
           `Expected via scheduled email ~${schedule}. Last ingest: ${lastEtDay ?? 'never'}. ` +
           `Check, in order: LP's scheduled email fired → Gmail received it → n8n workflow active (I.LPRA–F) → ` +
           `GET /n8n/admin/lp-report-ingest/status for a rejection.`,
