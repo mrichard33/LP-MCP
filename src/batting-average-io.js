@@ -137,7 +137,9 @@ export const SETTER_137_SQL = `SELECT s.period_start::text AS period_start, s.pe
 
 /**
  * LP report 136 rows per sub-source for each month: the current full-month
- * snapshot, and for the running month the newest month-to-date one.
+ * snapshot, and for the running month the newest month-to-date one. A
+ * full-month row is frozen at the month's last email (as_of_date), so it is
+ * stale for a recent month: the scorecard says so and prefers our live copy.
  */
 export const SOURCE_COST_SQL = `WITH snaps AS (
     SELECT DISTINCT ON (to_char(period_start, 'YYYY-MM')) id, to_char(period_start, 'YYYY-MM') AS month,
@@ -148,7 +150,7 @@ export const SOURCE_COST_SQL = `WITH snaps AS (
       AND period_start = date_trunc('month', period_start)
     ORDER BY to_char(period_start, 'YYYY-MM'), (scope = 'month') DESC, period_end DESC, as_of_date DESC NULLS LAST
   )
-  SELECT s.month, s.scope, s.period_end::text AS period_end, h.sub_source,
+  SELECT s.month, s.scope, s.period_end::text AS period_end, s.as_of_date::text AS as_of_date, h.sub_source,
     h.num_raw, h.num_set, h.num_sat, h.num_sold
   FROM snaps s JOIN lp_source_cost_history h ON h.snapshot_id = s.id`;
 

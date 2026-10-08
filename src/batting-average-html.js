@@ -185,7 +185,7 @@ footer { margin-top: 24px; font-size: 12px; color: var(--ink-3); }
     <div class="per">${per100Text(h.per100)} hits per 100 at bats</div>
     <div class="vs">Number to beat (February): <strong>${esc(h.febText)}</strong>
       ${dir ? `<span class="arrow ${dir}">${ARROW[dir]} ${gapText(h)}</span>` : ''}</div>
-    ${context ? `<div class="context">${esc(context)}</div>` : ''}
+    ${[].concat(context || []).map((c) => `<div class="context">${esc(c)}</div>`).join('')}
     <div class="span">${esc(h.span)}${h.maturedOnly ? ' · matured months only; the newest months are still collecting sales' : ' · includes months still maturing'}</div>
   </section>
 
@@ -209,7 +209,7 @@ footer { margin-top: 24px; font-size: 12px; color: var(--ink-3); }
   <section class="howto" aria-labelledby="how-title">
     <h2 id="how-title">How we keep score</h2>
     <dl>
-      <dt>At bat</dt><dd>A new incoming lead where LightFire made the first setter call. Each lead counts once.</dd>
+      <dt>At bat</dt><dd>A new incoming lead LightFire set the appointment on, or, if nobody set it, LightFire called first. Each lead counts once.</dd>
       <dt>Walk</dt><dd>Appointment set.</dd>
       <dt>On base</dt><dd>Demo.</dd>
       <dt>Hit</dt><dd>Sale.</dd>
