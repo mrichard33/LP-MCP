@@ -16,7 +16,7 @@ import assert from 'node:assert/strict';
 import {
   isDirectToYouLead, isDirectToYouSubSource, isSetterCampaign, isNoDisposition, isLightFireAgent,
   agentKey, leadOutcome, isPresetAppointment, atBatsOf, tallyLeads, tallySourceCost, battingAvg,
-  isMaturing, risingStreak, coachingLine, buildScorecard, toCsv, splitByFirstCaller, spotCheck, checkAtBat,
+  isMaturing, risingStreak, coachingLine, buildScorecard, toCsv, splitByFirstCaller, splitByOwner, lpSetterKey, isLightFireLpSetter, spotCheck, checkAtBat,
   duplicateCustomerAtBats,
   monthLabel, addMonths, NON_SETTER_CAMPAIGN_RX,
 } from '../src/batting-average.js';
@@ -294,7 +294,7 @@ test('collect + notes run end to end on stubbed reads', async () => {
   const reads = {
     roster: async () => [{ agent_name: 'Craig Deer' }],
     agentFirstCalls: async () => [{ agent_name: 'John Manieri', first_at: '2026-07-03T13:00:00Z' }, { agent_name: 'Craig Deer', first_at: '2026-07-20T14:00:00Z' }],
-    sourceCost: async () => [reportRow('2026-02', 1000, 26), reportRow('2026-04', 1000, 25), reportRow('2026-05', 1000, 25), reportRow('2026-07', 500, 14)],
+    sourceCost: async () => [reportRow('2026-02', 1000, 26), reportRow('2026-04', 1000, 25), reportRow('2026-05', 1000, 25), { ...reportRow('2026-07', 500, 14), as_of_date: '2026-08-10' }],
     leadsForMonth: async () => [lead(), lead({ closed_won: true })],
     lightfireMonth: async (m) => month[m] || [],
     setter137: async () => [],
@@ -306,11 +306,54 @@ test('collect + notes run end to end on stubbed reads', async () => {
   assert.equal(data.before['2026-06'].atBats, 2);
   assert.deepEqual(data.model.rows.this.map((r) => [r.label, r.atBats, r.hits]), [['Jul', 1, 1], ['Aug', 1, 0], ['Sep MTD', 0, 0]]);
   assert.equal(data.inHouseRows[1].atBats, 1);
-  assert.equal(data.allLeadRows.length, 1);
+  // July: report 136 (our copy holds 1 of its 500 leads); August: no report, so our copy.
+  assert.deepEqual(data.allLeadRows.map((r) => [r.month, r.source, r.atBats]), [['2026-07', 'report', 500], ['2026-08', 'copy', 3]]);
+  assert.match(data.allLeadRows[0].note, /as of 2026-08-10/);
   const notes = renderNotes(data);
   assert.match(notes, /## Numbers that may be off/);
   assert.match(notes, /Report 137 cross-check/);
   assert.match(notes, /\*\*Pending\.\*\*/);
   assert.match(notes, /## Spot check/);
   assert.match(notes, /\| Aug 2026 \| 1 \| 0 \|/);
+  assert.match(notes, /## How credit changed/);
+});
+
+test('LP setter names match the roster in either form', () => {
+  assert.equal(lpSetterKey('Deer - LF, Craig'), 'craig deer');
+  assert.equal(lpSetterKey('Deer, Craig'), 'craig deer');
+  assert.equal(lpSetterKey('Craig Deer'), 'craig deer');
+  assert.equal(isLightFireLpSetter('Deer - LF, Craig', new Set()), true);
+  assert.equal(isLightFireLpSetter('Walker, Shari', roster), true);
+  assert.equal(isLightFireLpSetter('Manieri, John', roster), false);
+  assert.equal(isLightFireLpSetter(null, roster), false);
+});
+
+test('credit goes to whoever SET the lead; an unset lead to the first caller (ruling 2026-10-08)', () => {
+  const set = { ever_set: true };
+  const rows = [
+    // in-house called first, LightFire set it: LightFire's (the first card gave it to in-house)
+    lead({ lp_lead_id: 'a', ...set, closed_won: true, set_by_name: 'Deer, Craig', first_agent: 'John Manieri' }),
+    // LightFire called first, in-house set it: in-house's
+    lead({ lp_lead_id: 'b', ...set, set_by_name: 'Manieri, John', first_agent: 'Shari Walker - LF', first_agent_dispos: ['No Disposition'] }),
+    // unset: the first caller
+    lead({ lp_lead_id: 'c', first_agent: 'Craig Deer', first_agent_dispos: ['No Disposition'] }),
+    lead({ lp_lead_id: 'd', first_agent: 'John Manieri' }),
+    // set by LightFire with no Five9 call matched: still LightFire's
+    lead({ lp_lead_id: 'e', ...set, set_by_name: 'Walker - LF, Shari' }),
+    // set with no setter name: the first caller
+    lead({ lp_lead_id: 'f', ...set, first_agent: 'Craig Deer', first_agent_dispos: ['Appointment Set'] }),
+    // pre-set: nobody's
+    lead({ lp_lead_id: 'g', ...set, set_by_name: 'No, Setter', first_agent: 'Craig Deer' }),
+    // unset, never called
+    lead({ lp_lead_id: 'h' }),
+  ];
+  const s = splitByOwner(rows, roster);
+  assert.deepEqual(s.lightfire.map((r) => [r.lp_lead_id, r.owner, r.no_dispo]),
+    [['a', 'setter', false], ['c', 'first_call', true], ['e', 'setter', false], ['f', 'first_call', false]]);
+  assert.deepEqual(s.inHouse.map((r) => r.lp_lead_id), ['b', 'd']);
+  assert.deepEqual(s.preset.map((r) => r.lp_lead_id), ['g']);
+  assert.deepEqual(s.uncalled.map((r) => r.lp_lead_id), ['h']);
+  // the first card's rule, for the change table
+  const old = splitByFirstCaller(rows, roster);
+  assert.deepEqual(old.lightfire.map((r) => r.lp_lead_id), ['b', 'c', 'f']);
 });

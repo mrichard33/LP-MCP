@@ -113,6 +113,26 @@ export function isLightFireAgent(name, roster = new Set()) {
   return roster.has(agentKey(name));
 }
 
+/**
+ * LP's set_by name in agentKey form. LP writes "Last, First" ("Deer - LF, Craig",
+ * or "Deer, Craig" before the suffix existed); Five9 and the roster write "First
+ * Last". The " - LF" tag is dropped, the comma pair is turned round, and the
+ * rest is agentKey, so one roster Set serves both sides. (repNameKey in
+ * sale-facts.js does the same job but imports supabase; this module stays pure.)
+ */
+export function lpSetterKey(setByName) {
+  const raw = String(setByName ?? '').replace(/\s*-\s*LF\b/i, '');
+  const [last, first] = raw.split(',').map((x) => x.trim());
+  return agentKey(first ? `${first} ${last}` : last);
+}
+
+/** Was this lead SET by a LightFire agent, by LP's own set_by field? */
+export function isLightFireLpSetter(setByName, roster = new Set()) {
+  if (/-\s*LF\s*,/i.test(String(setByName ?? ''))) return true;
+  const k = lpSetterKey(setByName);
+  return !!k && roster.has(k);
+}
+
 const truthy = (v) => v === true || v === 't' || v === 'true';
 const isNull = (v) => v === null || v === undefined;
 
@@ -351,12 +371,49 @@ export function toCsv(model, extraRows = []) {
 }
 
 /**
- * Sort one month's leads (lightfireMonthSql rows) by who made the first setter
- * call. Only Direct to You leads are kept, and a pre-set appointment is set
- * aside (isPresetAppointment), never anyone's at bat. A LightFire at bat whose first
- * agent's calls on that lead never got a real disposition is flagged no_dispo
- * (the open LightFire issue since July): counted, never dropped.
+ * Sort one month's leads (lightfireMonthSql rows) by who OWNS them: the person
+ * who set the appointment, and for an unset lead the person who made the first
+ * setter call (user ruling, 2026-10-08).
+ *
+ * Why not first call alone: the first card (2026-10-08) gave a lead to whoever
+ * called first, so when an in-house agent took the first call and LightFire set
+ * the visit later, the sale counted for in-house. LP's set_by said LightFire set
+ * 64 sales on September's leads; the card credited 44, and read as a slump when
+ * LightFire's sales had grown 23 → 45 → 64. LP and report 137 credit the setter.
+ *
+ * Only Direct to You leads are kept, and a pre-set appointment is set aside
+ * (isPresetAppointment), never anyone's at bat. A set lead with no setter name
+ * falls back to the first caller. A LightFire at bat that LightFire called first
+ * and whose calls never got a real disposition is flagged no_dispo (the open
+ * LightFire issue since July): counted, never dropped. `owner` says how each
+ * lead was placed: 'setter' or 'first_call'.
  */
+export function splitByOwner(rows, roster) {
+  const out = { lightfire: [], inHouse: [], uncalled: [], all: [], preset: [] };
+  for (const r of rows) {
+    if (!isDirectToYouLead(r)) continue;
+    if (isPresetAppointment(r)) { out.preset.push(r); continue; }
+    out.all.push(r);
+    const setter = leadOutcome(r).walk && String(r.set_by_name ?? '').trim() ? r.set_by_name : null;
+    const firstIsLf = !!r.first_agent && isLightFireAgent(r.first_agent, roster);
+    if (setter) {
+      const lf = isLightFireLpSetter(setter, roster);
+      (lf ? out.lightfire : out.inHouse).push({ ...r, owner: 'setter', no_dispo: lf && firstIsLf && noDispo(r) });
+      continue;
+    }
+    if (!r.first_agent) { out.uncalled.push(r); continue; }
+    if (firstIsLf) out.lightfire.push({ ...r, owner: 'first_call', no_dispo: noDispo(r) });
+    else out.inHouse.push({ ...r, owner: 'first_call' });
+  }
+  return out;
+}
+
+function noDispo(r) {
+  const dispos = Array.isArray(r.first_agent_dispos) ? r.first_agent_dispos : [r.first_dispo];
+  return dispos.length > 0 && dispos.every(isNoDisposition);
+}
+
+/** The first card's rule (first setter call only), kept for the old-vs-new credit table. */
 export function splitByFirstCaller(rows, roster) {
   const out = { lightfire: [], inHouse: [], uncalled: [], all: [], preset: [] };
   for (const r of rows) {
@@ -364,12 +421,8 @@ export function splitByFirstCaller(rows, roster) {
     if (isPresetAppointment(r)) { out.preset.push(r); continue; }
     out.all.push(r);
     if (!r.first_agent) { out.uncalled.push(r); continue; }
-    if (isLightFireAgent(r.first_agent, roster)) {
-      const dispos = Array.isArray(r.first_agent_dispos) ? r.first_agent_dispos : [r.first_dispo];
-      out.lightfire.push({ ...r, no_dispo: dispos.length > 0 && dispos.every(isNoDisposition) });
-    } else {
-      out.inHouse.push(r);
-    }
+    if (isLightFireAgent(r.first_agent, roster)) out.lightfire.push({ ...r, no_dispo: noDispo(r) });
+    else out.inHouse.push(r);
   }
   return out;
 }
@@ -432,7 +485,7 @@ export function checkAtBat(r, siblings = []) {
   }
   return {
     lp_lead_id: r.lp_lead_id, phone_last4: r.phone_last4 || '', first_call_at: r.first_call_at,
-    first_agent: r.first_agent, first_campaign: r.first_campaign, matched_by: r.matched_by,
+    first_agent: r.first_agent || '', first_campaign: r.first_campaign || '', matched_by: r.matched_by || 'no Five9 call',
     five9_set: five9Set, lp_set: o.walk, lp_demo: o.onBase, lp_sale: o.hit, set_by: r.set_by_name || '',
     verdict, why,
   };
