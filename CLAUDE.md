@@ -135,6 +135,15 @@ PostgREST's newest 1,000 rows and never released anyone. `CONVERSATION_PAUSE_MOD
 `POST /n8n/pause-workflow/sweep {"dryRun":true}` reports who live would release. S1.0, S1.1, S1.3, S1.6 and S4.5 have
 no gate yet, and S5.2 exits on the tag; those are GHL edits, not code.
 
+**Drip tags cannot go stale (the user, 2026-10-08).** `active-<code>` tags are added only by GHL workflows (our code
+only removes them; the n8n ports of the drips are inactive). Rule R7 in the daily tag sweep
+(`src/tag-hygiene/rules.js`, `src/jobs/tag-hygiene-sweep.js`) removes a drip tag that no PUBLISHED workflow adds any
+more (`buildRetiredDripTagsSql` over the HL mirror's `workflow_actions`; old W-names such as `active-w03`,
+`active-w5.2`, `active-w11.2`). A read that fails, or finds fewer than `MIN_LIVE_DRIP_TAGS` live tags, skips R7.
+`TAG_SWEEP_APPLY_RULES` (default `R7`) lets a rule write while `TAG_SWEEP_MODE` stays `report` for R1–R6; `none` turns
+it off. `POST /admin/tag-hygiene/run?dryRun=true` writes nothing. Current tags left behind by a pause gate's 30-day
+timeout are a GHL fix, not a guess in code: `docs/ghl-drip-tag-timeout-fixes.md`.
+
 **Only an opt-out silences the bot (Mark, 2026-09-24).** A classifier handoff tags the contact and,
 where a person must act, pages one — and the bot still replies, unless `handoffReplyPolicy`
 (`src/agentic/handoff-policy.js`) says `silent` (STOP, WRONG_NUMBER; a STOP that is only a door complaint is
