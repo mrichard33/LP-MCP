@@ -32,6 +32,7 @@ function mockClient(rows = []) {
         select() { return api; },
         eq(k, v) { st.filters.push((r) => String(r[k]) === String(v)); return api; },
         neq(k, v) { st.filters.push((r) => String(r[k]) !== String(v)); return api; },
+        in(k, vs) { st.filters.push((r) => vs.map(String).includes(String(r[k]))); return api; },
         gte(k, v) { st.filters.push((r) => r[k] && new Date(r[k]).getTime() >= new Date(v).getTime()); return api; },
         order(k, o) { st.order = { k, asc: o?.ascending === true }; return api; },
         limit(n) { st.limit = n; return api; },
@@ -52,7 +53,7 @@ function mockClient(rows = []) {
 
 function throwingClient() {
   return { from: () => ({
-    select() { return this; }, eq() { return this; }, neq() { return this; },
+    select() { return this; }, eq() { return this; }, neq() { return this; }, in() { return this; },
     gte() { return this; }, order() { return this; }, limit() { return this; },
     then(_res, rej) { return Promise.reject(new Error('boom')).then(_res, rej); },
   }) };
@@ -123,4 +124,40 @@ test('no resolvable workflow identity → fail-open', async () => {
   const res = await findPriorEnrollment({ id: 200, target_id: 'C1', action_payload: {} }, { client: mockClient([]), windowHours: 6 });
   assert.equal(res.duplicate, false);
   assert.equal(res.reason, 'no_workflow_identity_open');
+});
+
+// ═══ 2026-10-08: two rows running at the same moment ══════════════════
+// The LP and GHL views of one cancellation were claimed ~2s apart; neither had
+// completed when the other looked, so both entered S5.2.
+const executingRow = (id) => ({ ...priorRow(ago(2000), S52, id), status: 'executing' });
+
+test('an EARLIER row still executing → duplicate (the earlier one wins)', async () => {
+  const res = await findPriorEnrollment(incoming(S52), { client: mockClient([executingRow(150)]), windowHours: 6 });
+  assert.equal(res.duplicate, true);
+  assert.equal(res.prior_action_id, 150);
+});
+
+test('a LATER row still executing → not a duplicate (so the pair never both skip)', async () => {
+  const res = await findPriorEnrollment(incoming(S52), { client: mockClient([executingRow(250)]), windowHours: 6 });
+  assert.equal(res.duplicate, false);
+});
+
+test('both rows of a racing pair: exactly one enrolls', async () => {
+  const rows = [executingRow(200), executingRow(201)];
+  const a = await findPriorEnrollment({ id: 200, target_id: 'C1', action_payload: { workflow_id: S52 } }, { client: mockClient(rows), windowHours: 6 });
+  const b = await findPriorEnrollment({ id: 201, target_id: 'C1', action_payload: { workflow_id: S52 } }, { client: mockClient(rows), windowHours: 6 });
+  assert.deepEqual([a.duplicate, b.duplicate], [false, true]);
+});
+
+test('a row this gate deduped is not an enrollment', async () => {
+  const deduped = { ...priorRow(ago(3600_000), S52, 100), execution_result: { action: 'deduped', skipped: true } };
+  const res = await findPriorEnrollment(incoming(S52), { client: mockClient([deduped]), windowHours: 6 });
+  assert.equal(res.duplicate, false);
+});
+
+test('a pending or failed earlier row does not count', async () => {
+  for (const status of ['pending', 'failed', 'skipped']) {
+    const res = await findPriorEnrollment(incoming(S52), { client: mockClient([{ ...priorRow(ago(60_000), S52, 100), status }]), windowHours: 6 });
+    assert.equal(res.duplicate, false, status);
+  }
 });
