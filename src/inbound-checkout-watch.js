@@ -32,6 +32,10 @@
 //   GHL sender, no appointment                 60 min   INBOUND_WATCH_GHL_MIN
 //   anything else                              60 min   INBOUND_WATCH_OTHER_MIN
 //   escalation to #ops                         90 min   INBOUND_WATCH_ESCALATE_MIN
+//     counted from when the office opened for that inquiry, not from arrival
+//     (2026-10-08): the 12 overnight rows on the 8:05 #contact-center card were
+//     all "90 min late" at 8:00 and went to #ops in the same minute. Staff get
+//     90 minutes to work the overnight queue before #ops hears about it.
 //   4. For an inquiry LP HAS issued: write the lds to the GHL contact when its
 //      LP Lead ID is empty, and set the contact's upcoming appointment on the
 //      lds when the inquiry has none — the retry set_lp_appointment never got.
@@ -158,6 +162,22 @@ export function priorityOf(row, nowMs) {
   return 'other';
 }
 
+/**
+ * When the office clock started for an inquiry: its arrival if the office was
+ * open (start inclusive, end exclusive, ET), else the next office opening.
+ * Same shape as dialWindowStartMs (src/five9/callback-dial-check.js), but on
+ * this job's own office hours so INBOUND_WATCH_OFFICE_* moves both together.
+ */
+export function officeClockStartMs(receivedMs, cfg) {
+  if (!Number.isFinite(receivedMs)) return null;
+  const m = etMinuteOfDay(receivedMs);
+  if (m >= cfg.officeStartMin && m < cfg.officeEndMin) return receivedMs;
+  const floor = receivedMs - (receivedMs % 60000);
+  return m < cfg.officeStartMin
+    ? floor + (cfg.officeStartMin - m) * 60000
+    : floor + (24 * 60 - m + cfg.officeStartMin) * 60000;
+}
+
 export const waitMinutes = (row, nowMs) => (Number.isFinite(row.receivedMs) ? (nowMs - row.receivedMs) / 60000 : null);
 
 /**
@@ -172,7 +192,12 @@ export function assessWaiting(rows, nowMs, cfg) {
     if (wait === null) continue;
     const priority = priorityOf(row, nowMs);
     const threshold = cfg.thresholdMin[priority];
-    out.push({ row, priority, waitMin: Math.floor(wait), threshold, due: wait >= threshold, escalate: wait >= cfg.escalateMin });
+    const openWait = (nowMs - officeClockStartMs(row.receivedMs, cfg)) / 60000;
+    out.push({
+      row, priority, waitMin: Math.floor(wait), openWaitMin: Math.max(0, Math.floor(openWait)), threshold,
+      due: wait >= threshold,
+      escalate: openWait >= cfg.escalateMin,
+    });
   }
   const rank = (p) => PRIORITIES.indexOf(p);
   return out.sort((a, b) => rank(a.priority) - rank(b.priority) || b.waitMin - a.waitMin);
@@ -205,7 +230,7 @@ export function formatWaitCard(items, { overnight = false } = {}) {
 
 export function formatEscalateCard(items, cfg) {
   return [
-    `⚠️ LP inquiries waiting ${cfg.escalateMin}+ minutes to be checked out`,
+    `⚠️ LP inquiries still not checked out ${cfg.escalateMin}+ minutes into office hours`,
     '',
     ...capLines(items.map(waitLine), 20),
     '',
@@ -301,7 +326,7 @@ export function summarize(rows, assessed, nowMs) {
     waiting_by_priority: byPriority,
     oldest_wait_min: assessed.length ? Math.max(...assessed.map((a) => a.waitMin)) : 0,
     waiting: assessed.slice(0, 50).map((a) => ({
-      in1: a.row.in1, priority: a.priority, wait_min: a.waitMin, due: a.due, escalate: a.escalate,
+      in1: a.row.in1, priority: a.priority, wait_min: a.waitMin, open_wait_min: a.openWaitMin, due: a.due, escalate: a.escalate,
       sender: a.row.sender, brn: a.row.brn, appt: a.row.apptDate,
     })),
     today: { rows: todays.length, auto, manual, waiting: todays.filter((r) => classifyRow(r) === 'waiting').length },

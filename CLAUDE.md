@@ -208,7 +208,8 @@ lds and set the appointment on it; waiting → `pending_lp_checkout`; never addL
 (`INBOUND_CHECKOUT_WATCH_MODE` off|shadow|live, default shadow) mirrors the queue into `lp_inbound_queue` (sql/149, fails
 soft until applied), cards #contact-center 08:00–19:45 ET for inquiries waiting past their line (Mark, 2026-10-07; staff
 check out at a median 11 min, p90 42): visit today/tomorrow 30 min, visit 2+ days out 60 (`INBOUND_WATCH_APPT_FAR_MIN`),
-GHL sender 60, other 60, and #ops past 90. The 8 AM card lists only rows already past their line. An in1 the held-row
+GHL sender 60, other 60, and #ops past 90 minutes of OFFICE time (2026-10-08: counted from 8:00 ET for an overnight
+row, `officeClockStartMs`, so the 8 AM card's rows do not hit #ops the same minute). The 8 AM card lists only rows already past their line. An in1 the held-row
 "import this lead" card named is not carded again, and vice versa (`INBOUND_WAIT_AUDIT` / `HELD_IMPORT_AUDIT`). It
 finishes the GHL side of issued inquiries. LP's GetInboundLeadInfo `enddate` is
 EXCLUSIVE: a range ending today returns none of today's rows (issue #490).
