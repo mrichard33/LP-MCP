@@ -241,10 +241,13 @@ test('after stop-bot, add_to_workflow is blocked; a DQ alone does not block a mu
 
 test('planDqHardStop: add stop-bot, drop agentic-active, leave S5.x / S4.5 / W-series only', () => {
   const plan = planDqHardStop(['agentic-active', 'active-s5.2', 'active-s4.5', 'active-w1.1', 'active-e.0', 'active-p2', 'out-of-area']);
-  assert.deepEqual(plan.addTags, ['stop-bot']);
+  // 2026-10-08: with its reason tag, so a DNC lift keeps stop-bot (stop-bot-origin.js).
+  assert.deepEqual(plan.addTags, ['stop-bot', 'bot-off:dq']);
   assert.deepEqual(plan.removeTags, ['agentic-active']);
   assert.deepEqual(plan.leaveWorkflows, ['S5.2', 'S4.5', 'W1.1']);
-  assert.deepEqual(planDqHardStop(['stop-bot']), { addTags: [], removeTags: [], leaveWorkflows: [] });
+  assert.deepEqual(planDqHardStop(['stop-bot', 'bot-off:dq']), { addTags: [], removeTags: [], leaveWorkflows: [] });
+  assert.deepEqual(planDqHardStop(['stop-bot']).addTags, ['bot-off:dq'], 'an older stop has its reason added');
+  assert.deepEqual(planDqHardStop([], { trigger: 'lp_note_dq' }).addTags, ['stop-bot', 'bot-off:lp-note']);
   assert.deepEqual(workflowCodesToLeave(['ACTIVE-S5', 'active-s5.20']), ['S5', 'S5.20']);
   assert.equal(isDqTriggerTag('Out-Of-Area'), true);
   assert.equal(isDqTriggerTag('suppress-outbound'), false, 'suppress-outbound alone is not a DQ trigger');
@@ -310,7 +313,7 @@ test('executeDqHardStop: stop-bot on, agentic-active off, one removal per resolv
     executeRemoveTag: async (a) => { removed.push(...a.action_payload.tags); },
     resolveWorkflowId: async (code) => (code === 'S5.2' ? '0a6a1349-0b44-429b-91e1-4c5be264cd9f' : null),
   });
-  assert.deepEqual(added, ['stop-bot']);
+  assert.deepEqual(added, ['stop-bot', 'bot-off:dq']);
   assert.deepEqual(removed, ['agentic-active']);
   assert.equal(sb.inserts.length, 2);
   assert.deepEqual(sb.inserts[0].action_payload.workflow_id, '0a6a1349-0b44-429b-91e1-4c5be264cd9f');

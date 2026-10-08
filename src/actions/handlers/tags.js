@@ -114,6 +114,8 @@ import { applyTagsToSnapshot } from '../../services/tag-snapshot.js';
 // does not cover this path. Both producers must normalize or a rule-authored
 // `objection-confirmed:competitor` still lands dead on the contact.
 import { normalizeTag } from '../../ghl.js';
+import supabase from '../../supabase.js';
+import { STOP_BOT, isDncLiftRemoval, filterLiftRemoval, readStopBotAdds } from '../../consent/stop-bot-origin.js';
 
 // TAG-WRITE CONTRACT (do not break): tag mutations are ADDITIVE.
 //   add    → POST /contacts/{id}/tags { tags: [...] }   (GHL appends)
@@ -612,6 +614,23 @@ export async function executeRemoveTag(action, context = {}) {
       tags = present;
     } catch (err) {
       console.error(`[executeRemoveTag] contact read failed for ${contactId}: ${err.message} — proceeding with blind DELETE`);
+    }
+  }
+
+  // 2026-10-08 — a DNC lift removes only a stop-bot a DNC put there
+  // (src/consent/stop-bot-origin.js). A stop-bot from a person, the hard-DQ
+  // stop, an LP-note DQ, Bot Review or rule 356 stays; the rest of the lift
+  // goes ahead.
+  if (contactId && isDncLiftRemoval(action) && tags.some(t => String(t).trim().toLowerCase() === STOP_BOT)) {
+    let currentTags = [];
+    try { currentTags = (await getContactCached(contactId, cache))?.tags || []; } catch { currentTags = []; }
+    const lift = filterLiftRemoval(action, tags, { currentTags, adds: await readStopBotAdds(contactId, { supabase }) });
+    if (lift.kept) {
+      console.log(`[executeRemoveTag] stop_bot_kept_on_lift ${contactId} (${action.rule_applied || 'lift'}): ${lift.reason}`);
+      tags = lift.tags;
+      if (tags.length === 0) {
+        return { action: 'no_op', reason: 'stop_bot_kept_on_lift', detail: lift.reason, contact_id: contactId };
+      }
     }
   }
 
