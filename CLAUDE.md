@@ -239,7 +239,7 @@ Entry / After DIAL ASAP is queued only once a Confirmation add for that phone CO
 there (an unissued inquiry waits). Mark's exceptions (2026-10-06 follow-up): a Cnf or Issue lead (Verif counts as Set) and a visit 3+ days out come off
 right away (the 3+ day one is added two days before). A failed add is retried ONCE, then #contact-center is told (once per
 visit). A visit that moved from "2nd Day" to "Next Day" comes off "Conf - 2nd Day" once the Next Day add completed. While
-`BOOKED_DIAL_ROUTING_MODE=live` (and only then) the new-lead backstop holds 3+ day visits instead of pushing them. The
+`BOOKED_DIAL_ROUTING_MODE=live` (and only then) the new-lead backstop pushes NO booked visit (2026-10-08: both jobs had added the same lead to the same Conf list). The
 removal is `five9_delete_record_from_list` with `list_names` and `approval_expires_at` = the visit (the executor skips it
 after that). It runs WITHOUT approval by Mark's standing exception to #1057 (2026-10-06: "If we're adding to one list, we
 should be able to automatically remove it from the other list"), keyed on rule `BOOKED_DIAL_ROUTING` only — any other
