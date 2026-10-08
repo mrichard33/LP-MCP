@@ -906,6 +906,12 @@ February leads against LP's 12,444, and February's sales-per-lead read .097 from
 `tallySourceCost` in `src/batting-average.js` does for the LightFire scorecard
 (`node scripts/lightfire-scorecard.js`).
 
+**137 By Setter comes in two shapes, both into `lp_sales_efficiency_setter_history` (2026-10-08).** The emailed
+data export (the same header as By Market, told apart by `xGrouper`) and the PRINTED page LP's viewer saves as
+.xls, read by column and checked against its own printed Total (`parseSalesEfficiencySetterLayout`; the
+CSV route recognises it by title). Jan–Sep 2026 came in as .xls: `scripts/lp-137-setter-layout-backfill.js`
+(dry run first, `--load` to write). It is MONTHLY, so the report watchdog uses `cadence: 'monthly'` for it.
+
 **Six markets, not seven — Lakeland is Orlando (2026-09-28, `sql/135_lake_orl_merge.sql`).** LP still
 prints branch `LAKE`, and it stays raw wherever a raw branch is stored (`branch_code_raw`,
 `lp_branch_id`, `rep_home_market`), exactly like BOCA/MIAMI for Fort Lauderdale. The fold happens in

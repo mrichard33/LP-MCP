@@ -36,7 +36,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
-import { WATCHED } from '../src/jobs/lp-report-watchdog.js';
+import { WATCHED, isMissing } from '../src/jobs/lp-report-watchdog.js';
 import { REPORT_FINGERPRINTS, REPORT_VARIANTS } from '../src/jobs/lp-report-csv-common.js';
 
 const WATCHDOG = readFileSync('src/jobs/lp-report-watchdog.js', 'utf8');
@@ -167,8 +167,12 @@ test('a report that finally lands CLEARS its alert instead of just going quiet',
   // Report 134 was missing from 2026-09-01 and re-announced 6 times over two
   // days. Under the old code the healthy branch was a bare `continue`, so the
   // alert had no way to resolve and nobody was ever told it came back.
-  assert.match(WATCHDOG_CODE, /const ingestedToday = lastEtDay === today/);
-  assert.match(WATCHDOG_CODE, /active: !ingestedToday/);
+  // 2026-10-08: the daily test moved into isMissing (monthly cadence for 137
+  // By Setter); the alert's `active` is still that one observation, so a
+  // report that lands flips it false and the condition clears.
+  assert.match(WATCHDOG_CODE, /const isLate = isMissing\(\{ cadence, lastEtDay, today \}\)/);
+  assert.match(WATCHDOG_CODE, /active: isLate/);
+  assert.equal(isMissing({ lastEtDay: '2026-09-03', today: '2026-09-03' }), false);
 });
 
 test('an unverified sweep never clears the blind-spot alert', () => {
@@ -282,4 +286,16 @@ test('the remediation line names the workflows that exist', () => {
   // workflow that does not exist costs real minutes mid-incident.
   assert.match(WATCHDOG, /I\.LPRA–F/);
   assert.ok(!/I\.LPR router/.test(WATCHDOG));
+});
+
+test('a daily report is missing unless it landed today; a monthly one only after the 3rd with nothing this month', () => {
+  assert.equal(isMissing({ lastEtDay: '2026-10-08', today: '2026-10-08' }), false);
+  assert.equal(isMissing({ lastEtDay: '2026-10-07', today: '2026-10-08' }), true);
+  assert.equal(isMissing({ lastEtDay: null, today: '2026-10-08' }), true);
+  // Monthly (137 By Setter, 2026-10-08): no daily page after the first month lands.
+  assert.equal(isMissing({ cadence: 'monthly', lastEtDay: '2026-10-01', today: '2026-10-20' }), false);
+  assert.equal(isMissing({ cadence: 'monthly', lastEtDay: '2026-09-01', today: '2026-10-02' }), false);
+  assert.equal(isMissing({ cadence: 'monthly', lastEtDay: '2026-09-01', today: '2026-10-04' }), true);
+  assert.equal(isMissing({ cadence: 'monthly', lastEtDay: null, today: '2026-10-04' }), true);
+  assert.equal(WATCHED.find((w) => w.type === 'sales_efficiency_by_setter').cadence, 'monthly');
 });
