@@ -131,3 +131,36 @@ export function buildGuardCheck({ mode, decision, existing = null, error = null 
     ...(error ? { error: String(error).slice(0, 200) } : {}),
   };
 }
+
+// ─── Calculator lane (2026-10-08) ─────────────────────────────────────
+// RULE (Mark, 2026-10-08): no duplicate calculator leads, but a person whose
+// existing LP lead came from a DIFFERENT source gets a NEW calculator-source
+// lead. So the reuse check only looks at the person's CALCULATOR leads.
+export const CALC_SRS_ID = '842';   // LP SubSource "Website Estimate Calculator"
+export const CALC_PRO_ID = '5862';  // calculator-landing pseudo-promoter
+const CALC_SUBSOURCE_RE = /estimate\s*calculator/i;
+
+/** live (default) | shadow | off — env LP_CALC_LEAD_GUARD_MODE. */
+export function calculatorLeadGuardMode() {
+  const m = String(process.env.LP_CALC_LEAD_GUARD_MODE || 'live').toLowerCase();
+  return m === 'shadow' || m === 'off' ? m : 'live';
+}
+
+/** Deterministic idempotency key for a calculator push (CANON.STD.014). */
+export function calcDedupeKey(phone) {
+  const d = String(phone || '').replace(/\D/g, '').slice(-10);
+  return d.length === 10 ? `calc:${d}` : null;
+}
+
+/** True when an LP lead record is calculator-source. */
+export function isCalculatorLead(l) {
+  if (!l) return false;
+  const srs = String(l.srs_id ?? l.SrsID ?? l.subsourceid ?? l.SubSourceID ?? '').trim();
+  if (srs === CALC_SRS_ID) return true;
+  return CALC_SUBSOURCE_RE.test(String(l.sourcesubdescr || l.SourceSubDescr || ''));
+}
+
+/** Newest CALCULATOR-source lead (same shape as pickNewestLead), or null. */
+export function pickNewestCalculatorLead(leads) {
+  return pickNewestLead((Array.isArray(leads) ? leads : []).filter(isCalculatorLead));
+}

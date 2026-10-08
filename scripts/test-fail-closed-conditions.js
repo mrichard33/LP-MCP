@@ -93,6 +93,14 @@ test('dedupPolicy: appointment-sync rules dedup on IN-FLIGHT statuses only (not 
   assert.deepEqual(p.statuses, ['pending', 'pending_approval', 'approved', 'executing']);
 });
 
+// 2026-10-08 — I.WE + I.WC can both fire calc:lead-captured for one submission.
+test('dedupPolicy: calculator LP rule dedups on IN-FLIGHT statuses only', () => {
+  const p = dedupPolicy('CALC_LEAD_CAPTURED_NEEDS_LP_LEAD');
+  assert.ok(p, 'calculator rule must be deduped');
+  assert.equal(p.group, null);
+  assert.deepEqual(p.statuses, ['pending', 'pending_approval', 'approved', 'executing']);
+});
+
 test('dedupPolicy: LP_DISP rules group across the family and block on completed', () => {
   const p = dedupPolicy('LP_DISP_CNF');
   assert.equal(p.group, 'LP_DISP_%');
