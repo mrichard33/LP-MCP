@@ -88,7 +88,13 @@ export function releaseDecision({ tags = [], lastActivityMs = null, pausedAtMs =
   // Cancellation Routing adds it with suppress-automation) and mean it; a
   // pause with no add on our record is theirs to lift.
   if (!pausedAtMs) return { release: false, reason: 'pause_not_ours' };
-  const since = Math.max(Number(lastActivityMs) || 0, Number(pausedAtMs) || 0);
+  const lastMs = Number(lastActivityMs) || 0;
+  const since = Math.max(lastMs, Number(pausedAtMs) || 0);
+  // A text inside the window holds the pause even past 28 days (dry run,
+  // 2026-10-08): a lead who is already paused gets no fresh add, so an old
+  // pause and a live conversation can coexist, and the safety release must not
+  // restart the drips mid-conversation.
+  if (lastMs && nowMs - lastMs < quiet) return { release: false, reason: 'conversation_active' };
   if (pausedAtMs && nowMs - pausedAtMs >= SAFETY_RELEASE_DAYS * DAY_MS) return { release: true, reason: 'safety_before_ghl_timeout' };
   if (nowMs - since < quiet) return { release: false, reason: 'conversation_active' };
   if (openPromise) return { release: false, reason: 'promised_callback_open' };

@@ -61,8 +61,11 @@ test('a pause a GHL workflow set is not ours to lift', () => {
 test('an open promised call holds the drips; 28 days releases before GHL times out', () => {
   const base = { tags: ['pause-workflow'], lastActivityMs: NOW - 48 * H, nowMs: NOW, quiet: QUIET };
   assert.equal(releaseDecision({ ...base, pausedAtMs: NOW - 48 * H, openPromise: true }).reason, 'promised_callback_open');
-  const old = releaseDecision({ ...base, pausedAtMs: NOW - SAFETY_RELEASE_DAYS * 24 * H, lastActivityMs: NOW - H });
+  const old = releaseDecision({ ...base, pausedAtMs: NOW - SAFETY_RELEASE_DAYS * 24 * H, lastActivityMs: NOW - 30 * H });
   assert.deepEqual(old, { release: true, reason: 'safety_before_ghl_timeout' });
+  // …but never in the middle of a live conversation.
+  const chatting = releaseDecision({ ...base, pausedAtMs: NOW - 60 * 24 * H, lastActivityMs: NOW - H });
+  assert.deepEqual(chatting, { release: false, reason: 'conversation_active' });
 });
 
 test('mode and window come from the environment', () => {
