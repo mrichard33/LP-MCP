@@ -121,6 +121,20 @@ to a class. In live, a completed add_tag of out-of-area / dq-out-of-area / hard-
 (`src/services/dq-hard-stop.js`, 60s later): stop-bot on, agentic-active off, remove_from_workflow for every active
 S5.x / S4.5 / W-series workflow (codes the HL registry cannot resolve go through Remove All Marketing).
 
+**A live conversation pauses the GHL drips; 24 quiet hours resume them (the user, 2026-10-08).** `pause-workflow`
+holds a contact at the "Pause Workflow Active?" wait gate in E.2–E.7, F.0, O.0, S1.2, S2.1, S2.2, S2.5, S3.1 and S4.1;
+removing it resumes at that step, and GHL's 30-day gate timeout exits a contact still parked. It is added on the
+lead's own text (`behavioral-emitter.js`, before the trivial filter) and on any outbound text no workflow, bulk action
+or campaign sent (HL-MCP's `contact.outbound_message`; GHL marks the bot's sends `source: app` like a rep's, and either
+way the conversation is live). `src/pause-workflow-sweep.js` (job `pause-workflow-sweep`, every 5 min) releases a pause
+WE added (rule `CONVERSATION_PAUSE`) after `PAUSE_QUIET_HOURS` (24) with no text either way and no open promised call,
+and any of ours at 28 days, before GHL's timeout. Never a contact the bot must not talk to (stop-bot, a DNC, a hard DQ:
+they stay parked) and never a pause a GHL workflow set. Rules in `src/agentic/conversation-pause.js`, reads in
+`src/services/conversation-pause-io.js`, chunked per contact: the old sweep read every add_tag in one query, got
+PostgREST's newest 1,000 rows and never released anyone. `CONVERSATION_PAUSE_MODE` off|shadow|live, default shadow;
+`POST /n8n/pause-workflow/sweep {"dryRun":true}` reports who live would release. S1.0, S1.1, S1.3, S1.6 and S4.5 have
+no gate yet, and S5.2 exits on the tag; those are GHL edits, not code.
+
 **Only an opt-out silences the bot (Mark, 2026-09-24).** A classifier handoff tags the contact and,
 where a person must act, pages one — and the bot still replies, unless `handoffReplyPolicy`
 (`src/agentic/handoff-policy.js`) says `silent` (STOP, WRONG_NUMBER; a STOP that is only a door complaint is
@@ -134,8 +148,13 @@ communication." It is its own send-gate class (`BOT_STOP` in `may-message.js`: e
 `bot_stop`), it is not in `DNC_FAMILY_TAGS` (no DNC-lift card), not in the inbound caller's `DNC_TAGS` (a stop-bot
 caller is still captured and dialed), and rules 368/369/387/388 no longer fire on it alone
 (`sql/seeds/2026-10-07_stop_bot_not_dnc.sql`). Never write a consent row, a Five9/LP DNC or a DNC-lift card
-because of stop-bot. Open question for Mark: rule 14 still adds stop-bot on an LP DNC, which is why a DNC lift
-removes it (`LIFT_TAGS`).
+because of stop-bot. Rule 14 still adds stop-bot on an LP DNC (it must: stop-bot is what the mutation gate, the
+analyzer skip and the ownership stamp read), so **a DNC lift removes only a stop-bot a DNC put there (2026-10-08)**:
+`filterLiftRemoval` (`src/consent/stop-bot-origin.js`, called in `executeRemoveTag`) keeps stop-bot when the contact
+carries a `bot-off:<reason>` tag (`bot-off:dq`, `bot-off:lp-note` from `dq_hard_stop`, `bot-off:review` from Bot
+Review), when our newest record of a stop-bot add is not a DNC rule (`DNC_STOP_BOT_RULES`), when there is no record
+(a person added it in GHL), or when the read fails. The rest of the lift goes ahead; the log is `stop_bot_kept_on_lift`.
+A new non-DNC stop adds its own `bot-off:` tag next to stop-bot.
 
 **No confirmed time without a booking (Nicholas Ferraioli, 2026-10-07).** The bot told a lead "Thursday … 10:00
 AM ET works.", "… is holding for you." and "You're all set" and booked nothing: a stale `booking:active` tag made

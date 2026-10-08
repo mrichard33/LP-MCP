@@ -141,7 +141,7 @@ test('dq_hard_stop: the queued LP-note row runs with SEND_GATE_MODE in shadow', 
     },
   );
   assert.equal(res.action, 'dq_hard_stop_done');
-  assert.deepEqual(added, ['stop-bot']);
+  assert.deepEqual(added, ['stop-bot', 'bot-off:lp-note']);
   assert.deepEqual(res.workflows_queued.map(w => w.code), ['S5.2']);
 });
 

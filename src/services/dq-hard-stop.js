@@ -38,6 +38,7 @@
 
 import { sendGateMode } from './may-message.js';
 import { lpNoteDqMode } from '../agentic/lp-note-dq.js';
+import { botOffTag } from '../consent/stop-bot-origin.js';
 
 // 2026-10-07 (Nicholas Ferraioli): a team note in LP that says we cannot run
 // the lead (lp-note-dq.js) stops the bot the same way. It carries no trigger
@@ -82,10 +83,13 @@ export function workflowCodesToLeave(tags) {
 }
 
 /** Pure plan over the contact's current tags. */
-export function planDqHardStop(tags) {
+export function planDqHardStop(tags, { trigger = null } = {}) {
   const t = (Array.isArray(tags) ? tags : []).map(x => String(x || '').trim().toLowerCase());
+  // 2026-10-08: with its reason tag, so a later DNC lift keeps stop-bot
+  // (src/consent/stop-bot-origin.js).
+  const reason = botOffTag(trigger === LP_NOTE_DQ_TRIGGER ? 'lp-note' : 'dq');
   return {
-    addTags: t.includes('stop-bot') ? [] : ['stop-bot'],
+    addTags: [...(t.includes('stop-bot') ? [] : ['stop-bot']), ...(t.includes(reason) ? [] : [reason])],
     removeTags: t.includes('agentic-active') ? ['agentic-active'] : [],
     leaveWorkflows: workflowCodesToLeave(t),
   };
@@ -166,7 +170,7 @@ export async function executeDqHardStop(action, context = {}, deps = {}) {
   }
   const res = await deps.ghlFetch('GET', `/contacts/${contactId}`);
   const tags = res?.contact?.tags || res?.tags || [];
-  const plan = planDqHardStop(tags);
+  const plan = planDqHardStop(tags, { trigger });
   const rule = action.rule_applied || DQ_HARD_STOP_RULE;
 
   for (const tag of plan.addTags) {

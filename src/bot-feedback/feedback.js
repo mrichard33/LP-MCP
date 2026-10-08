@@ -48,6 +48,7 @@
  */
 
 import supabase from '../supabase.js';
+import { botOffTag } from '../consent/stop-bot-origin.js';
 import { sendGroupMeMessage } from '../groupme.js';
 import { isMissingRelation } from './fingerprint-core.js';
 import {
@@ -212,7 +213,7 @@ export async function submitFeedback(actorEmail, body, { supersedesId = null } =
       return { ok: false, error: 'Bot Review is not migrated yet — apply sql/103.', status: 503 };
     }
     console.error(`[BotFeedback] insert failed: ${insertError.message}`);
-    return { ok: false, error: insertError.message, status: 500 };
+    return { ok: false, error: insertError?.message || 'no row returned', status: 500 };
   }
 
   await logChange({
@@ -406,25 +407,29 @@ export async function stopBot(actorEmail, contactId, reason) {
     }
   } catch { /* no snapshot — queue the tag anyway; add_tag is itself idempotent in GHL */ }
 
-  const { data: action, error: insertError } = await supabase
+  // 2026-10-08: with its reason tag (src/consent/stop-bot-origin.js), so a
+  // later DNC lift does not turn the bot back on for this lead.
+  const row = (tag, order) => ({
+    action_type: 'add_tag',
+    target_system: 'ghl',
+    target_entity: 'contact',
+    target_id: target,
+    action_payload: { tag },
+    reasoning: `Bot Review: ${actor.email} stopped the bot for this lead${reason ? ` — ${reason}` : ''}`,
+    confidence: 1.0,
+    rule_applied: 'BOT_REVIEW_STOP_BOT',
+    status: 'pending',
+    requires_approval: false,
+    sequence_order: order,
+  });
+  const { data: rows, error: insertError } = await supabase
     .from('agent_actions')
-    .insert({
-      action_type: 'add_tag',
-      target_system: 'ghl',
-      target_entity: 'contact',
-      target_id: target,
-      action_payload: { tag: STOP_BOT_TAG },
-      reasoning: `Bot Review: ${actor.email} stopped the bot for this lead${reason ? ` — ${reason}` : ''}`,
-      confidence: 1.0,
-      rule_applied: 'BOT_REVIEW_STOP_BOT',
-      status: 'pending',
-      requires_approval: false,
-      sequence_order: 0,
-    })
-    .select('id').single();
+    .insert([row(STOP_BOT_TAG, 0), row(botOffTag('review'), 1)])
+    .select('id, action_payload');
+  const action = (rows || []).find(r => r?.action_payload?.tag === STOP_BOT_TAG) || (rows || [])[0] || null;
 
-  if (insertError) {
-    console.error(`[BotFeedback] stop-bot queue failed for ${target}: ${insertError.message}`);
+  if (insertError || !action) {
+    console.error(`[BotFeedback] stop-bot queue failed for ${target}: ${insertError?.message || 'no row returned'}`);
     return { ok: false, error: insertError.message, status: 500 };
   }
 
