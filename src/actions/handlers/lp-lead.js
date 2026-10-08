@@ -114,6 +114,7 @@ import { LP_SRS, assertNotTransposed, resolvePromoterForSource } from '../../lp-
 import {
   existingLeadGuardMode, existingLeadWindowDays, decideExistingLeadAction,
   flattenLpLeads, pickNewestLead, formatGuardDecisionLine, buildGuardCheck,
+  calculatorLeadGuardMode, calcDedupeKey, pickNewestCalculatorLead,
 } from '../../services/lp-existing-lead-guard.js';
 import { needsNameRecovery, recoverPlaceholderName } from '../../services/placeholder-name-recovery.js';
 import { NAME_PLACEHOLDER_TAG } from '../../services/identity-extraction.js';
@@ -252,7 +253,7 @@ function resolveNotes(payload, ghlContact, contactId, hasAppointment) {
  * header of src/services/lp-existing-lead-guard.js. Throws on an LP error so
  * the caller fails open.
  */
-async function findExistingLpLead(phone) {
+async function findExistingLpLead(phone, { calculatorOnly = false } = {}) {
   const prospects = await getCustomers3({ phone }, { fast: true });
   const list = (Array.isArray(prospects) ? prospects : [prospects]).filter(Boolean);
   const leads = [];
@@ -264,7 +265,7 @@ async function findExistingLpLead(phone) {
     const res = await getLeads({ cst_id: pid, PageSize: 50 }, { fast: true });
     for (const l of flattenLpLeads(res)) leads.push({ ...l, _prospectId: l._prospectId || String(pid) });
   }
-  const newest = pickNewestLead(leads);
+  const newest = calculatorOnly ? pickNewestCalculatorLead(leads) : pickNewestLead(leads);
   if (newest && !newest.createdAtLp) {
     // LP gave no entry time — fall back to our cache. Still nothing means the
     // lead is too new to be synced, which decideExistingLeadAction reads as new.
@@ -333,6 +334,96 @@ async function reuseExistingLpLead(action, contactId, existing, appt) {
   };
 }
 
+/**
+ * 2026-10-08 — calculator lane gate (payload.lead_lane === 'calculator').
+ * Order: (1) idempotency ledger: a completed calculator push for this phone
+ * in the last N days → stop; (2) LP by phone: a CALCULATOR-source lead in the
+ * last N days → reuse it (no new lead); (3) otherwise create a new
+ * calculator-source lead, even when the person has leads from other sources.
+ * The contact's LP Lead ID field is ignored here on purpose: enrichment fills
+ * it with whatever lead is newest, regardless of source or age (Nancy Marin,
+ * Annie, 2026-10). FAIL-OPEN on lookup errors (create), matching the house
+ * posture: a duplicate is repairable, a lost lead is not.
+ * Returns { stop, response, check }.
+ */
+async function runCalculatorLaneGate(action, contactId, ghlContact) {
+  const mode = calculatorLeadGuardMode();
+  const windowDays = existingLeadWindowDays();
+  const phone = normalizePhone(ghlContact.phone);
+  const key = calcDedupeKey(phone);
+  const check = { mode, key, window_days: windowDays, decision: 'none' };
+  if (mode === 'off' || !key) {
+    check.decision = mode === 'off' ? 'off' : 'no_phone';
+    return { stop: false, check };
+  }
+
+  // (1) Ledger
+  try {
+    const since = new Date(Date.now() - windowDays * 86400000).toISOString();
+    let q = supabase
+      .from('agent_actions')
+      .select('id, created_at, target_id, execution_result')
+      .eq('action_type', 'create_lp_lead')
+      .eq('status', 'completed')
+      .eq('execution_result->>calc_dedupe_key', key)
+      .gte('created_at', since)
+      .order('created_at', { ascending: false })
+      .limit(1);
+    if (action.id) q = q.neq('id', action.id);
+    const { data } = await q;
+    const prior = data?.[0];
+    if (prior) {
+      check.decision = mode === 'live' ? 'ledger_hit' : 'would_ledger_hit';
+      check.prior_action_id = prior.id;
+      check.prior_lp_lead_id = prior.execution_result?.lp_lead_id || null;
+      check.prior_in1_id = prior.execution_result?.lp_inbound_lead_id || null;
+      console.log(`[LP-CREATE] CALC-LANE decision=${check.decision} contact=${contactId} key=${key} prior_action=${prior.id}`);
+      if (mode === 'live') {
+        await addGHLNote(contactId,
+          `[LP CREATE calc] Did NOT create a new LP lead — a calculator lead for this phone was already sent ` +
+          `on ${prior.created_at} (action ${prior.id}${check.prior_lp_lead_id ? `, LP lead ${check.prior_lp_lead_id}` : ''}).`
+        ).catch(() => {});
+        return {
+          stop: true,
+          check,
+          response: { action: 'calculator_already_sent', contact_id: contactId, calc_dedupe_key: key, calculator_check: check },
+        };
+      }
+    }
+  } catch (err) {
+    check.ledger_error = String(err.message).slice(0, 200);
+    console.warn(`[LP-CREATE] CALC-LANE ledger lookup failed for ${contactId} (fail-open): ${err.message}`);
+  }
+
+  // (2) LP by phone — calculator-source leads only
+  try {
+    const existing = await findExistingLpLead(phone, { calculatorOnly: true });
+    if (existing) {
+      const verdict = decideExistingLeadAction({ createdAtLp: existing.createdAtLp, now: new Date(), windowDays });
+      check.existing_calc_lead = existing.ldsId;
+      check.existing_created_at_lp = existing.createdAtLp || null;
+      if (verdict === 'reuse') {
+        check.decision = mode === 'live' ? 'reused_calc_lead' : 'would_reuse_calc_lead';
+        console.log(`[LP-CREATE] CALC-LANE decision=${check.decision} contact=${contactId} lds=${existing.ldsId}`);
+        if (mode === 'live') {
+          const reused = await reuseExistingLpLead(action, contactId, existing, null);
+          return { stop: true, check, response: { ...reused, calc_dedupe_key: key, calculator_check: check } };
+        }
+      } else {
+        check.decision = 'create_calc_lead_older_than_window';
+      }
+    } else {
+      check.decision = 'create_no_calc_lead';
+    }
+  } catch (err) {
+    check.decision = 'create_lookup_error';
+    check.lookup_error = String(err.message).slice(0, 200);
+    console.warn(`[LP-CREATE] CALC-LANE LP lookup failed for ${contactId} (fail-open → create): ${err.message}`);
+  }
+  console.log(`[LP-CREATE] CALC-LANE decision=${check.decision} contact=${contactId} key=${key}`);
+  return { stop: false, check };
+}
+
 export async function executeCreateLPLead(action) {
   const contactId = action.target_id;
   const payload = action.action_payload || {};
@@ -370,11 +461,24 @@ export async function executeCreateLPLead(action) {
     throw new Error(`create_lp_lead: GHL contact ${contactId} not found`);
   }
 
+  // ─── Calculator lane (2026-10-08) ──────────────────────────────────
+  // Source-aware dedupe replaces the contact-field checks below for
+  // calculator pushes. See runCalculatorLaneGate.
+  const isCalcLane = payload.lead_lane === 'calculator';
+  let calcCheck = null;
+  if (isCalcLane) {
+    const gate = await runCalculatorLaneGate(action, contactId, ghlContact);
+    calcCheck = gate.check;
+    if (gate.stop) return gate.response;
+  }
+
   // ─── Idempotency guard ─────────────────────────────────────────────
   // If either LP ID is already populated, lead is already in (or about
-  // to be in) LP. Never re-post.
-  const existingInbound = readCF(ghlContact, FIELD_LP_INBOUND_LEAD_ID);
-  const existingLeadId  = readCF(ghlContact, FIELD_LP_LEAD_ID);
+  // to be in) LP. Never re-post. (Skipped for the calculator lane — its
+  // gate above already decided, and these fields may hold another
+  // source's old lead.)
+  const existingInbound = isCalcLane ? '' : readCF(ghlContact, FIELD_LP_INBOUND_LEAD_ID);
+  const existingLeadId  = isCalcLane ? '' : readCF(ghlContact, FIELD_LP_LEAD_ID);
   // 2026-10-06 — an inquiry id with NO lead id is not "already in LP": the
   // inquiry may still be waiting in LP's inbound queue (Shelley, in1 428940).
   // Look it up; write back an issued lds and set the appointment on it, or say
@@ -410,7 +514,7 @@ export async function executeCreateLPLead(action) {
   // 2026-09-29: every evaluation logs ONE "EXISTING-LEAD decision=" line and
   // returns the same decision as execution_result.existing_lead_check — see
   // formatGuardDecisionLine for why (the first shadow review had no count).
-  const guardMode = existingLeadGuardMode();
+  const guardMode = isCalcLane ? 'off' : existingLeadGuardMode();
   const guardPhone = normalizePhone(ghlContact.phone);
   const windowDays = existingLeadWindowDays();
   let guard = { decision: guardMode === 'off' ? 'off' : 'no_phone', existing: null, error: null };
@@ -722,6 +826,7 @@ export async function executeCreateLPLead(action) {
     appt_included: !!(adate && atime),
     name_recovery: nameRecovery,
     existing_lead_check: existingLeadCheck,
+    ...(isCalcLane ? { calc_dedupe_key: calcCheck?.key || null, calculator_check: calcCheck } : {}),
     lp_response: lpResponse,
   };
 }

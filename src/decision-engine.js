@@ -430,6 +430,7 @@ const DEDUP_STATUSES_INFLIGHT = ['pending', 'pending_approval', 'approved', 'exe
 // contact.created could pass both — and E.5 has no double-entry guard. One
 // group, blocking on completed too, makes them mutually exclusive per contact.
 const INTAKE_ROUTE_PREFIX = 'INTAKE_ROUTE_BACKSTOP_';
+const CALC_LEAD_RULE_KEY = 'CALC_LEAD_CAPTURED_NEEDS_LP_LEAD';
 export function dedupPolicy(ruleKey) {
   if (isLpDispRule(ruleKey)) return { statuses: DEDUP_STATUSES_WITH_COMPLETED, group: 'LP_DISP_%' };
   if (ruleKey && ruleKey.startsWith(INTAKE_ROUTE_PREFIX)) {
@@ -437,6 +438,12 @@ export function dedupPolicy(ruleKey) {
   }
   if (isBehavioralRule(ruleKey)) return { statuses: DEDUP_STATUSES_WITH_COMPLETED, group: null };
   if (isAppointmentSyncRule(ruleKey)) return { statuses: DEDUP_STATUSES_INFLIGHT, group: null };
+  // 2026-10-08 — calculator lane. GHL I.WE and I.WC can both post
+  // calc:lead-captured for one submission seconds apart. create_lp_lead's
+  // ledger only sees COMPLETED pushes, so two in-flight pushes would each
+  // pass it and LP would get two leads. In-flight only: once the first push
+  // completes, the 15-day calc_dedupe_key ledger takes over.
+  if (ruleKey === CALC_LEAD_RULE_KEY) return { statuses: DEDUP_STATUSES_INFLIGHT, group: null };
   return null;
 }
 
