@@ -54,10 +54,11 @@ export async function readRehashCallSlots({ contactId, timezone, tzLabel = 'ET',
       const { getContactCached } = await import('../actions/contact-cache.js');
       d.getOwner = async (id) => (await getContactCached(id, null, { maxWaitMs: 2000 }))?.assignedTo || null;
     }
-    if (!d.fetchFreeSlots || !d.selectOfferableSlots) {
+    if (!d.fetchFreeSlots || !d.selectOfferableSlots || !d.spreadCallOffer) {
       const cal = await import('../knowledge/calendar-availability.js');
       d.fetchFreeSlots ||= cal.fetchFreeSlots;
       d.selectOfferableSlots ||= cal.selectOfferableSlots;
+      d.spreadCallOffer ||= cal.spreadCallOffer;
     }
     if (!d.isOpen) d.isOpen = (await import('./team-hours.js')).isTeamOpen;
     const cap = (p) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), READ_CAP_MS))]);
@@ -69,7 +70,13 @@ export async function readRehashCallSlots({ contactId, timezone, tzLabel = 'ET',
     const sel = d.selectOfferableSlots(av, null, { call: true, isOpen: d.isOpen });
     const all = d.selectOfferableSlots(av, null, { call: true, isOpen: d.isOpen, offerWindowHours: 24 * 14, maxOffer: 500 })?.slots || [];
     const withTz = (s) => ({ ...s, tz: s.tz || tzLabel });
-    return { calendarId, rep, offer: (sel?.slots || []).slice(0, 2).map(withTz), all: all.map(withTz), tz: tzLabel };
+    // 2026-10-09 first live read: John's Rehash Call calendar had 1 opening in
+    // the next 48 hours and 28 in 14 days, so the 48-hour window alone offered
+    // nothing and the lead got the card. Fewer than two inside 48 hours → the
+    // two soonest real openings in the 14 days (an hour apart, same day allowed).
+    let offer = (sel?.slots || []).slice(0, 2);
+    if (offer.length < 2 && all.length >= 2) offer = d.spreadCallOffer(all, 2);
+    return { calendarId, rep, offer: offer.map(withTz), all: all.map(withTz), tz: tzLabel };
   } catch (err) {
     console.warn(`[RehashSlots] ${contactId}: Rehash Call read failed (${err.message}) — the reply asks for their time instead`);
     return null;
