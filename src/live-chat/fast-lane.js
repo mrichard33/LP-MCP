@@ -42,6 +42,7 @@
 
 import { promptSha256 } from '../bot-feedback/fingerprint-core.js';
 import { cleanInboundForModel } from '../security/untrusted-text.js';
+import { guardInBackground } from '../security/injection-guard.js';
 import crypto from 'node:crypto';
 import {
   buildResponsePrompt,
@@ -671,6 +672,8 @@ export function createLiveChatFastLane(deps) {
     const rawBody = inbound.body;
     const inboundClean = cleanInboundForModel(rawBody);
     const body = inboundClean.text;
+    // 2026-10-07 (IT review): classifier layer, recorded, never awaited.
+    guardInBackground({ surface: 'live_chat', text: body, removedCount: inboundClean.removedCount, sourceRef: contactId });
     let conversationId = inbound.conversationId || null;
     const messageKey = inbound.messageId || buildMessageKey(contactId, null, rawBody, tReceived);
     const timing = { t0_inbound_received: new Date(t0Ms).toISOString(), t1_event_written: null };

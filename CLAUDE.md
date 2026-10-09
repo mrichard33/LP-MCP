@@ -728,6 +728,16 @@ could otherwise smuggle instructions into an agent's context. The wrapper sits a
 registration because that is the one place that covers all 126 tools and the next
 one added.
 
+**Every inbound text is screened and the decision recorded (2026-10-07, IT review).** After
+`cleanInboundForModel`, `src/security/injection-guard.js` classifies the text: a no-I/O heuristic first, then
+an optional LLM Guard sidecar (`INJECTION_CLASSIFIER_URL`, 1.5s cap, fails open). Every check writes one
+`guardrail_decisions` row (sql/152) with a hash, never the text. Surfaces: `sms_inbound` (analyzer), `live_chat`
+(fast lane), `ci_transcript` (call analysis, which also now runs the sanitizer). `INJECTION_GUARD_MODE` off|shadow|live,
+default shadow; live blocks only surfaces in `INJECTION_GUARD_BLOCK_SURFACES` (default `ci_transcript` → the call goes
+to review). Never add a customer chat surface to that list without Mark's ruling and a `run_bot_eval`. Hot paths call
+`guardInBackground` and never wait. The attack + benign corpus is `scripts/fixtures/redteam-corpus.js`: a new attack
+seen live goes in ATTACKS, a misflagged customer message in BENIGN. Live red-team runs: `redteam/README.md`.
+
 **UNREADABLE is not down (dialer watchdog and heal, 2026-09-28).** A Five9 status read that fails is
 retried (`readCampaignState` in `src/routes/capacityRanker.js`, 3 reads over ~6s) and its reason is
 logged. Still unreadable, the watchdog pages with honest wording ("may not be dialing"), because a real
