@@ -282,3 +282,54 @@ test('guardRepeatPromise: live replaces, re-flags and posts once; shadow sends t
   assert.equal(s.action, 'would_replace');
   assert.equal(s.text, 'Dana will call you.');
 });
+
+// ── 2026-10-09: the three bugs from the first 48 hours of shadow data ──────
+
+test('an invitation to reach out is not a promise (live rows T54JTkmi…, kzlXGqKb…)', () => {
+  for (const t of [
+    "We'll leave it there for now, reach out whenever the timing's right.",
+    "We'll hold off and be here whenever you're ready to reach out.",
+    "Feel free to reach out anytime, we're here.",
+  ]) assert.equal(isCallPromise(t), false, t);
+});
+
+test('the real promises from the same 48 hours still read as promises', () => {
+  for (const t of [
+    'Someone from our team will be reaching out to you shortly.',
+    'A member of our team will follow up with you directly to make this right.',
+    'Expect a call from our team shortly, or reply here anytime.',
+    "I'll have someone from our team reach out to walk through it with you.",
+    'We are looking into the details on your appointment and someone from our team will reach out to you directly.',
+    'Our team will follow up and get you accurate pricing for it.',
+  ]) assert.equal(isCallPromise(t), true, t);
+});
+
+test('a simulator contact is never recorded or guarded (four sim-quote-* rows reached the live table)', async () => {
+  const db = ioDb({ open: OPEN });
+  const r = await recordPromiseIfAny({ contactId: 'sim-quote-1791392956332', text: "I'll have someone from our team call you to talk it through." }, { ...quiet, supabase: db, env: {} });
+  assert.equal(r.recorded, false);
+  assert.equal(r.reason, 'simulated');
+  assert.equal(db.inserts.length, 0);
+  const g = await guardRepeatPromise({ contactId: 'sim-quote-1', text: 'Dana will call you.' }, { ...quiet, supabase: db, env: { PROMISED_CALLBACK_MODE: 'live' } });
+  assert.equal(g.action, 'none');
+  assert.equal(db.updates.length, 0);
+});
+
+test("the bot's own email under a different GHL id is not a rep's text (kOrbvKKQD6e8D5tptOuX)", () => {
+  const promise = { ...OPEN, promised_at: iso('2026-10-07T14:30:38.488Z'), promise_text: 'A member of our team will follow up with you directly to make this right.' };
+  const botBody = 'Cindi, we read exactly what you described, and being left without a call after that appointment is not okay. A member of our team will follow up with you directly to make this right.';
+  const ownEmail = { id: '7ZwYJEPmNdnJ1scimf5a', direction: 'outbound', messageType: 'TYPE_EMAIL', source: 'app', dateAdded: iso('2026-10-07T14:30:37.634Z'), body: `A member of our team is looking into this directly\n${botBody}` };
+  // Before the fix this read as kept: the id is not one we recorded.
+  assert.deepEqual(keptVerdict({ promise, five9Calls: [], ghlMessages: [ownEmail], botMessageIds: new Set(['GEKEK9kveQ14YZNLy7Q6']), botBodies: [botBody] }), { kept: false });
+  // The same email a minute later still is not a rep: its text is ours.
+  const later = { ...ownEmail, dateAdded: iso('2026-10-07T14:31:40Z') };
+  assert.deepEqual(keptVerdict({ promise, five9Calls: [], ghlMessages: [later], botMessageIds: new Set(), botBodies: [botBody] }), { kept: false });
+});
+
+test("a person's text after the promise still keeps it, even a short one", () => {
+  const promise = { ...OPEN, promised_at: iso('2026-10-08T14:21:50Z'), promise_text: "I'll have someone from our team reach out to walk through it with you." };
+  const repOk = { id: '0V6UUZHhoa0z8UTxtXS1', direction: 'outbound', messageType: 'TYPE_SMS', source: 'app', dateAdded: iso('2026-10-08T14:22:41Z'), body: 'ok' };
+  const v = keptVerdict({ promise, five9Calls: [], ghlMessages: [repOk], botMessageIds: new Set(), botBodies: ['Rodney, makes sense, that is exactly how we would want you deciding too.'] });
+  assert.equal(v.kept, true);
+  assert.equal(v.evidence.source, 'ghl_rep_message');
+});
