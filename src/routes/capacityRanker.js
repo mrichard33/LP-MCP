@@ -84,7 +84,9 @@ import {
 } from '../five9/admin-writes.js';
 import { tryAcquireLock, releaseLock } from '../services/outbound-locks.js';
 import { reportAlertCondition, sendAlertMessage } from '../alert-state.js';
-import { rankMarkets, isMaterialChange, DEFAULT_SWAP_MARGIN, MARKET_CODES } from '../capacity/rankMarkets.js';
+import {
+  rankMarkets, isMaterialChange, DEFAULT_SWAP_MARGIN, DEFAULT_HOPPER_WEIGHT, MARKET_CODES,
+} from '../capacity/rankMarkets.js';
 import {
   applyDialPriority, CAMPAIGNS, TIERS, isCycling, restartCampaignVerified, DEFAULT_RESTART,
 } from '../capacity/applyDialPriority.js';
@@ -114,6 +116,15 @@ export function resolveMode(raw = process.env.CAPACITY_RANKER_MODE) {
 export function resolveSwapMargin(raw = process.env.CAPACITY_RANKER_SWAP_MARGIN) {
   const n = parseFloat(raw);
   return Number.isFinite(n) && n >= 0 ? n : DEFAULT_SWAP_MARGIN;
+}
+
+/**
+ * How much one hopper appointment fills a slot (2026-10-09: 0.5, the user's
+ * ruling — a confirmed appointment counts 1). See rankMarkets.js.
+ */
+export function resolveHopperWeight(raw = process.env.RANKER_HOPPER_WEIGHT) {
+  const n = parseFloat(raw);
+  return Number.isFinite(n) && n >= 0 ? n : DEFAULT_HOPPER_WEIGHT;
 }
 
 const MISSING_TABLE_RE = /does not exist|could not find the table|schema cache|42P01|PGRST205/i;
@@ -459,6 +470,7 @@ async function runRankerLocked(slotDate, deps = {}) {
     mode = resolveMode(),
     swapMargin = resolveSwapMargin(),
     perfWeight = resolvePerfWeight(),
+    hopperWeight = resolveHopperWeight(),
     now = new Date(),
     log = console.log,
   } = deps;
@@ -484,7 +496,7 @@ async function runRankerLocked(slotDate, deps = {}) {
     warnings.push(`starvation history unavailable (${err.message}) — no starvation promotion this run`);
   }
 
-  const { ranking, unknown } = rankMarkets(capacity.rows, { performance, starvationStreaks });
+  const { ranking, unknown } = rankMarkets(capacity.rows, { performance, starvationStreaks, hopperWeight });
   const rankResult = { ranking, unknown };
 
   const starved = ranking.filter((r) => r.starvation_promoted).map((r) => r.market);
@@ -566,7 +578,7 @@ async function runRankerLocked(slotDate, deps = {}) {
   }
 
   const summary = ranking.map((r) => `${r.rank}.${r.market}(${r.open_true}open×${r.perf_multiplier.toFixed(3)}=${r.score}${r.flags.length ? ' ' + r.flags.join('+') : ''})`).join(' ');
-  log(`[CapacityRanker] slot_date=${slotDate} mode=${mode} changed=${changed} applied=${applied} ranking=${summary} unknown=${unknown.map((u) => u.market).join(',') || '-'}`);
+  log(`[CapacityRanker] slot_date=${slotDate} mode=${mode} hopper_weight=${hopperWeight} changed=${changed} applied=${applied} ranking=${summary} unknown=${unknown.map((u) => u.market).join(',') || '-'}`);
 
   const logId = await insertLog({
     slot_date: slotDate,
@@ -613,6 +625,7 @@ async function runRankerLocked(slotDate, deps = {}) {
       mode,
       scoring_basis: 'open_true_weighted',
       perf_weight: perfWeight,
+      hopper_weight: hopperWeight,
       perf_baseline: performance?._company
         ? { set_to_sale: performance._company.set_to_sale, sets: performance._company.sets, sales: performance._company.sales }
         : null,

@@ -17,9 +17,11 @@
  *   market happens to have slots, regardless of whether those slots convert.
  *   But capacity must still DOMINATE: the dialer's job is to fill slots, and a
  *   market that converts well with nothing open is worth nothing tonight.
- *   At W=0.25 the multiplier spans 0.91–1.05, so it can break a near-tie
- *   (Fort Myers over St. Pete when both have 7 open) and can NEVER flip a
- *   7-vs-4 gap. W is an env var so it can be tuned without a deploy; the
+ *   At W=0.125 the multiplier spans about 0.96–1.03, so it can break a
+ *   near-tie (Fort Myers over St. Pete when both have 7 open) and can NEVER
+ *   flip a 7-vs-4 gap. Was 0.25 (0.91–1.05) until 2026-10-09: on top of the
+ *   full-weight hopper it kept Jacksonville (0 confirmed, 7 hopper) fifth, and
+ *   the user halved it so performance only breaks near-ties. W is an env var so it can be tuned without a deploy; the
  *   ±0.15 clamp holds regardless. DO NOT RAISE THE CLAMP.
  *
  * ── THE TWO WAYS THIS QUERY GOES WRONG ──────────────────────────────────────
@@ -56,7 +58,7 @@
 
 import { runSQL } from '../admin/supabase-admin.js';
 
-export const DEFAULT_PERF_WEIGHT = 0.25;
+export const DEFAULT_PERF_WEIGHT = 0.125;
 export const DEFAULT_PERF_WINDOW_DAYS = 90;
 export const DEFAULT_PERF_MIN_SETS = 100;
 
