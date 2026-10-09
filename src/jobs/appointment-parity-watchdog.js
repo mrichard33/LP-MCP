@@ -301,6 +301,7 @@ import { emitEvent } from '../event-emitter.js';
 import { syncAppointmentToLP } from '../lp-appointment-sync.js';
 import { fetchUpcomingAppointments } from '../knowledge/contact-appointments.js';
 import { normalizeGhlStartTime } from '../services/lp-ghl-appointment-reconciler.js';
+import { isGhlOnlyCalendarId } from '../knowledge/booking-calendar-router.js';
 import { getGHLContact } from '../ghl.js';
 import { utcToLpStoredIso, lpStoredAgeMinutes } from '../lp-dates.js';
 import { claimAlertConditionSet, confirmAlertSend, sendAlertMessage } from '../alert-state.js';
@@ -344,6 +345,11 @@ function classifyHealResult(result) {
       return 'already_present';
     case 'duplicate_sync_suppressed':
       return 'dedup_suppressed';
+    // 2026-10-08: refused by syncAppointmentToLP — a GHL-only calendar (the
+    // book already drops those, so this is defence in depth) or, on an
+    // auto-heal, a lead that is not bookable. Nothing was written.
+    case 'skipped_ghl_only_calendar':
+    case 'skipped_terminal_disposition':
     case 'skipped_lp_unavailable':
     case 'deferred_pending_lp_issuance':
     case 'held_stale_inbound_holds_appointment':
@@ -441,11 +447,26 @@ async function readGhlBook(from, to) {
     .gte('start_time', from.toISOString())
     .lt('start_time', to.toISOString());
   if (error) throw new Error(`GHL appointment read: ${error.message}`);
+  return bucketGhlBook(data);
+}
 
+/**
+ * Split GHL appointment rows into active / cancelled, earliest per contact.
+ * Pure (exported for tests).
+ *
+ * 2026-10-08 (contact 5YGVd3kh5IcY6pUJVcs4, LP lead 581695): GHL-only calendar
+ * rows (Confirmation Call) are dropped. They are phone calls, not the estimate
+ * appointment LP holds, so they must never reach any class: Class A "healed" a
+ * Confirmation Call into LP, flipped an OPPFDN lead to Set, and the reconciler
+ * then created a Window Estimate at the same slot. Dropping them here also stops
+ * an earlier phone call from hiding a later estimate as the "earliest active".
+ */
+function bucketGhlBook(rows) {
   const active = new Map();   // cid -> earliest active appointment
   const cancelled = new Map();
-  for (const row of data || []) {
+  for (const row of rows || []) {
     if (!row.ghl_contact_id) continue;
+    if (isGhlOnlyCalendarId(row.ghl_calendar_id)) continue;
     const bucket = ACTIVE_GHL_STATUSES.includes(row.status) ? active : cancelled;
     const prev = bucket.get(row.ghl_contact_id);
     if (!prev || new Date(row.start_time) < new Date(prev.start_time)) {
@@ -766,8 +787,12 @@ export async function runAppointmentParityWatchdog({ dryRun = !PARITY_AUTOHEAL, 
       }
 
       const start = new Date(appt.start_time);
+      // calendarId + requireBookable (2026-10-08): an automatic repair never
+      // writes a GHL-only calendar, nor onto a lead LP has not left bookable.
       const result = await _syncAppointmentToLP({
         contactId: cid,
+        calendarId: appt.ghl_calendar_id || null,
+        requireBookable: true,
         appointmentDate: start.toISOString().slice(0, 10),
         appointmentTime: start.toLocaleTimeString('en-US', {
           timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hour12: true,
@@ -895,6 +920,8 @@ export async function runAppointmentParityWatchdog({ dryRun = !PARITY_AUTOHEAL, 
           if (Array.isArray(live)) {
             const hit = live.find((a) => {
               if (NON_ACTIVE_GHL_LIVE_STATUSES.has(String(a?.status || '').toLowerCase())) return false;
+              // A Confirmation Call is not the estimate LP holds (see bucketGhlBook).
+              if (isGhlOnlyCalendarId(a?.calendar_id)) return false;
               const ms = Date.parse(normalizeGhlStartTime(a?.start_time) || '');
               return Number.isFinite(ms) && ms >= asOf.getTime() && ms < windowEnd.getTime();
             });
@@ -1137,7 +1164,7 @@ async function maybeAlertParityGaps(summary, { dryRun, deps = {} } = {}) {
 export const __testing = {
   classifyHealResult, classifyEmit, maybeAlertParityGaps, ALERT_PREFIX,
   lpRowAgeMinutes, PARITY_GHL_MISSING_MIN_AGE_MIN,
-  isSentinelAppointmentDate, readLpBook,
+  isSentinelAppointmentDate, readLpBook, bucketGhlBook,
 };
 
 let handle = null;

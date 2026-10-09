@@ -361,11 +361,29 @@ test('DNC-lift: Cnf on a DNC-stacked contact CONFIRMS despite the consent block 
   assert.equal(verifBlocked.reason, 'dnc_consent');
 });
 
-test('appt on a NON-in-home calendar (Conf Call) → does not block; other calendar untouched', async () => {
-  reset({ upcoming: [weAppt({ calendarId: 'gFWoSQrlKIdfRbAPV842', id: 'conf-call-1' })] }); // Conf Call (GHL-only, phone)
+test('appt on a NON-in-home calendar (Conf Call) at ANOTHER time → does not block; other calendar untouched', async () => {
+  // Was the same slot until 2026-10-08; that case is now the incident below.
+  reset({ upcoming: [weAppt({ calendarId: 'gFWoSQrlKIdfRbAPV842', id: 'conf-call-1', startTime: OTHER_TIME_GHL })] }); // Conf Call (GHL-only, phone)
   const res = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('Set') });
   assert.equal(res.outcome, 'created');
   assert.equal(calls.filter((c) => c.method === 'PUT').length, 0); // never touched conf-call-1
+});
+
+test('2026-10-08: LP Set at the SAME minute as an active Conf Call → noop ghl_only_same_slot, no Window Estimate', async () => {
+  // Contact 5YGVd3kh5IcY6pUJVcs4: the Conf Call leaked into LP as a Set and
+  // this path then created Window Estimate B9V4v7uknpoNoPpKjufI at its slot.
+  reset({ upcoming: [weAppt({ calendarId: 'gFWoSQrlKIdfRbAPV842', id: 'conf-call-1' })] });
+  const res = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('Set') });
+  assert.equal(res.outcome, 'noop');
+  assert.equal(res.reason, 'ghl_only_same_slot');
+  assert.equal(res.other_appointment_id, 'conf-call-1');
+  assert.equal(mutations().length, 0);
+});
+
+test('a CANCELLED Conf Call at the same minute does not block the estimate', async () => {
+  reset({ upcoming: [weAppt({ calendarId: 'gFWoSQrlKIdfRbAPV842', id: 'conf-call-1', appointmentStatus: 'cancelled' })] });
+  const res = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('Set') });
+  assert.equal(res.outcome, 'created');
 });
 
 test('MV and HPA are the same appointment as WE: reconciled in place on their own calendar', async () => {

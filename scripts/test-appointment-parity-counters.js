@@ -30,7 +30,7 @@ import assert from 'node:assert/strict';
 
 const { runAppointmentParityWatchdog, __testing } =
   await import('../src/jobs/appointment-parity-watchdog.js');
-const { classifyHealResult, classifyEmit, readLpBook } = __testing;
+const { classifyHealResult, classifyEmit, readLpBook, bucketGhlBook } = __testing;
 
 const { shouldAllowEvent } = (await import('../src/services/event-intake-filter.js')).__testing;
 
@@ -64,6 +64,10 @@ test('every other sync outcome is NOT a heal', () => {
     // create_lead_already_enrolled above — one function, two return values, and
     // only one of them had been enumerated.
     enrolled_lead_creation_workflow: 'heal_enrolled',
+    // 2026-10-08: syncAppointmentToLP refuses a GHL-only calendar, and on an
+    // auto-heal a lead that is not bookable. Nothing was written to LP.
+    skipped_ghl_only_calendar: 'not_attempted',
+    skipped_terminal_disposition: 'not_attempted',
   };
 
   for (const [action, expected] of Object.entries(notHeals)) {
@@ -306,4 +310,75 @@ test('every action the sync modules can RETURN is enumerated in classifyHealResu
     'these actions fall into unknown_result — add each to the classifyHealResult switch '
     + '(or to ROUTE_ONLY above, with the route line quoted, if it is an HTTP response '
     + 'the watchdog can never receive): ' + unenumerated.join(', '));
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// 6. GHL-only calendars never reach the parity book — 2026-10-08
+// ═══════════════════════════════════════════════════════════════════
+//
+// Contact 5YGVd3kh5IcY6pUJVcs4: a Confirmation Call (calendar
+// gFWoSQrlKIdfRbAPV842) read as "GHL has it, LP does not", Class A "healed" it
+// into LP lead 581695 (OPPFDN → Set), and the reconciler then created a Window
+// Estimate at the same slot. A phone call is not the estimate LP holds.
+
+const CONF_CALL = 'gFWoSQrlKIdfRbAPV842';
+const WINDOW_ESTIMATE = 'aJj14ONxh1oFyDcQ706O';
+const inDays = (d) => new Date(Date.now() + d * 86400000).toISOString();
+
+test('bucketGhlBook drops Confirmation Call rows, active or cancelled', () => {
+  const { active, cancelled } = bucketGhlBook([
+    { ghl_contact_id: 'c-conf', ghl_appointment_id: 'JrH56gkBz5uluIHqRUor', status: 'new', start_time: inDays(1), ghl_calendar_id: CONF_CALL },
+    { ghl_contact_id: 'c-conf-x', ghl_appointment_id: 'x1', status: 'cancelled', start_time: inDays(1), ghl_calendar_id: CONF_CALL },
+    { ghl_contact_id: 'c-we', ghl_appointment_id: 'we1', status: 'new', start_time: inDays(2), ghl_calendar_id: WINDOW_ESTIMATE },
+  ]);
+  assert.equal(active.has('c-conf'), false, 'a Confirmation Call is not an appointment LP should hold');
+  assert.equal(cancelled.has('c-conf-x'), false, 'nor a cancelled one (no false cancellation drift)');
+  assert.equal(active.get('c-we')?.ghl_appointment_id, 'we1', 'the estimate is still read');
+});
+
+test('an earlier Confirmation Call does not hide the later estimate as "earliest active"', () => {
+  const { active } = bucketGhlBook([
+    { ghl_contact_id: 'c1', ghl_appointment_id: 'conf', status: 'new', start_time: inDays(1), ghl_calendar_id: CONF_CALL },
+    { ghl_contact_id: 'c1', ghl_appointment_id: 'we', status: 'confirmed', start_time: inDays(3), ghl_calendar_id: WINDOW_ESTIMATE },
+  ]);
+  assert.equal(active.get('c1')?.ghl_appointment_id, 'we');
+});
+
+async function sweepWithGhlRows(rows, syncImpl) {
+  const syncCalls = [];
+  const summary = await runAppointmentParityWatchdog({
+    dryRun: false,
+    deps: {
+      readGhlBook: async () => bucketGhlBook(rows),
+      readLpBook: async () => ({ active: new Map(), resolved: new Map() }),
+      getGHLContact: async () => ({ tags: [] }),
+      syncAppointmentToLP: async (args) => { syncCalls.push(args); return syncImpl ? syncImpl(args) : { success: true, action: 'lp_appointment_set' }; },
+      emitEvent: async () => ({ id: 1 }),
+      claimAlertConditionSet: async () => ({ ok: true, newlyFiring: [], cleared: [] }),
+      confirmAlertSend: async () => ({ ok: true }),
+      send: async () => ({ sent: true }),
+    },
+  });
+  return { summary, syncCalls };
+}
+
+test('watchdog: a contact whose only GHL appointment is a Confirmation Call is never synced to LP', async () => {
+  const { summary, syncCalls } = await sweepWithGhlRows([
+    { ghl_contact_id: '5YGVd3kh5IcY6pUJVcs4', ghl_appointment_id: 'JrH56gkBz5uluIHqRUor', status: 'new', start_time: inDays(1), ghl_calendar_id: CONF_CALL },
+  ]);
+  assert.equal(syncCalls.length, 0, 'syncAppointmentToLP must not be called for a phone call');
+  assert.equal(summary.counts.lp_missing_appointment, 0);
+  assert.equal(summary.counts.confirmation_drift, 0);
+});
+
+test('watchdog Class A passes the calendar and requires a bookable lead', async () => {
+  const { syncCalls, summary } = await sweepWithGhlRows(
+    [{ ghl_contact_id: 'c-we', ghl_appointment_id: 'we1', status: 'new', start_time: inDays(2), ghl_calendar_id: WINDOW_ESTIMATE }],
+    () => ({ success: true, action: 'skipped_terminal_disposition' }),
+  );
+  assert.equal(syncCalls.length, 1);
+  assert.equal(syncCalls[0].calendarId, WINDOW_ESTIMATE);
+  assert.equal(syncCalls[0].requireBookable, true);
+  assert.equal(summary.outcomes.healed, 0, 'a refused write is not a heal');
+  assert.equal(summary.outcomes.not_attempted, 1);
 });

@@ -756,6 +756,20 @@ function isBookableDisposition(disp) {
   return BOOKABLE_DISPOSITIONS.has(String(disp).trim().toUpperCase());
 }
 
+/**
+ * Why syncAppointmentToLP must not write this appointment to LP, or null.
+ * Pure. 2026-10-08 incident (LP lead 581695): a Confirmation Call reached LP
+ * through the parity watchdog and set an OPPFDN lead.
+ *   'ghl_only_calendar'    the appointment is on a GHL-only calendar
+ *   'terminal_disposition' requireBookable and the lead is not bookable
+ *                          (an unknown disposition is not bookable)
+ */
+function lpWriteRefusal({ calendarId = null, disposition, requireBookable = false } = {}) {
+  if (calendarId && isGhlOnlyCalendarId(calendarId)) return 'ghl_only_calendar';
+  if (requireBookable && !isBookableDisposition(disposition)) return 'terminal_disposition';
+  return null;
+}
+
 function extractHLCID(leadRecord) {
   if (!leadRecord) return null;
   const v = leadRecord.lognumber
@@ -1006,7 +1020,8 @@ async function resolveLPLeadId(ghlContactId, contactInfo = {}, opts = {}) {
             const pid = String(prospect.ProspectID || prospect.prospectid || prospect.CstID || prospect.cst_id || candidate.lp_prospect_id || '');
             const { source: lpSource, detail: lpSourceDetail } = extractLpSource(target);
             console.log(`[LP-RESOLVE] ✅ Step 0a Supabase+lognumber: lds_id=${candidate.lp_lead_id}, prospect=${pid}, disp=${candidate.disposition_code}`);
-            return { ldsId: String(candidate.lp_lead_id), prospectId: pid, source: 'supabase_hlcid_validated', step: 0, lpSource, lpSourceDetail };
+            const disp = target.Disposition || target.disposition || target.disp_code || candidate.disposition_code || '';
+            return { ldsId: String(candidate.lp_lead_id), prospectId: pid, source: 'supabase_hlcid_validated', step: 0, lpSource, lpSourceDetail, disp };
           }
         }
       }
@@ -1032,7 +1047,7 @@ async function resolveLPLeadId(ghlContactId, contactInfo = {}, opts = {}) {
           const liveLognumber = extractHLCID(target);
           const { source: lpSource, detail: lpSourceDetail } = extractLpSource(target);
           console.log(`[LP-RESOLVE] ✅ Step 0b Supabase-link-trusted (no lognumber match required): lds_id=${candidate.lp_lead_id}, prospect=${pid}, disp=${disp}, lp_lognumber=${liveLognumber || '(empty)'} — trusting Supabase ghl_contact_id link`);
-          return { ldsId: String(candidate.lp_lead_id), prospectId: pid, source: 'supabase_link_trusted_bookable', step: 0, lpSource, lpSourceDetail };
+          return { ldsId: String(candidate.lp_lead_id), prospectId: pid, source: 'supabase_link_trusted_bookable', step: 0, lpSource, lpSourceDetail, disp };
         }
       }
     }
@@ -1067,7 +1082,8 @@ async function resolveLPLeadId(ghlContactId, contactInfo = {}, opts = {}) {
             const pid = String(prospect.ProspectID || prospect.prospectid || prospect.CstID || prospect.cst_id || '');
             const { source: lpSource, detail: lpSourceDetail } = extractLpSource(target);
             console.log(`[LP-RESOLVE] ✅ Step 1 GHL field+lognumber: lds_id=${ghlLeadId}, prospect=${pid}`);
-            return { ldsId: ghlLeadId, prospectId: pid, source: 'ghl_field_plus_hlcid', step: 1, lpSource, lpSourceDetail };
+            const disp = target.Disposition || target.disposition || target.disp_code || '';
+            return { ldsId: ghlLeadId, prospectId: pid, source: 'ghl_field_plus_hlcid', step: 1, lpSource, lpSourceDetail, disp };
           }
           console.warn(`[LP-RESOLVE] Step 1: GHL field lds_id=${ghlLeadId} lognumber mismatch (got ${hlcid || 'null'}, want ${ghlContactId})`);
         }
@@ -1109,6 +1125,7 @@ async function resolveLPLeadId(ghlContactId, contactInfo = {}, opts = {}) {
           step: 2,
           lpSource: best.lpSource || null,
           lpSourceDetail: best.lpSourceDetail || null,
+          disp: best.disp || '',
         };
       }
       // Step 2b — prospect-keyed link-trusted fallback. No lognumber match, but
@@ -1125,6 +1142,7 @@ async function resolveLPLeadId(ghlContactId, contactInfo = {}, opts = {}) {
           step: 2,
           lpSource: trusted.lpSource || null,
           lpSourceDetail: trusted.lpSourceDetail || null,
+          disp: trusted.disp || '',
         };
       }
       console.warn(`[LP-RESOLVE] Step 2: prospect ${webhookProspectId} has no lead with matching lognumber or bookable lead — falling through`);
@@ -1159,6 +1177,7 @@ async function resolveLPLeadId(ghlContactId, contactInfo = {}, opts = {}) {
           step: 3,
           lpSource: best.lpSource || null,
           lpSourceDetail: best.lpSourceDetail || null,
+          disp: best.disp || '',
         };
       }
     }
@@ -1192,6 +1211,7 @@ async function resolveLPLeadId(ghlContactId, contactInfo = {}, opts = {}) {
           step: 4,
           lpSource: best.lpSource || null,
           lpSourceDetail: best.lpSourceDetail || null,
+          disp: best.disp || '',
         };
       }
     }
@@ -1894,8 +1914,26 @@ async function syncAppointmentToLP({
   address1, city, state, postalCode,
   prospectId: webhookProspectId, inboundId, ghlLeadIdField,
   appointmentDate, appointmentTime, calendarName,
+  calendarId = null, requireBookable = false,
 }) {
   if (!contactId) throw new Error('contact_id is required');
+
+  // 2026-10-08 (contact 5YGVd3kh5IcY6pUJVcs4, LP lead 581695): a Confirmation
+  // Call the executor had correctly skipped reached LP anyway, through the
+  // parity watchdog's auto-heal, and flipped an OPPFDN lead to Set. A GHL-only
+  // calendar is never an LP appointment, so refuse it here before any I/O.
+  // The /webhook/ghl/set-lp-appointment route deliberately does NOT pass its
+  // calendarId: while FIVE9_DIRECT_DISPATCH is off, that route's LP write is the
+  // Dial-ASAP fallback for Confirmation Calls (see the dispatch gate there).
+  if (lpWriteRefusal({ calendarId }) === 'ghl_only_calendar') {
+    console.log(`[LP-APPT] skipped_ghl_only_calendar for ${contactId} (calendar=${calendarId}) — no LP write`);
+    return {
+      success: true,
+      action: 'skipped_ghl_only_calendar',
+      contact_id: contactId,
+      calendar_id: calendarId,
+    };
+  }
 
   // ── Early idempotency: LP already holds this exact appointment ──
   // Catches field-set (SalesRabbit/canvassing) leads whose LP appt was
@@ -2163,7 +2201,26 @@ async function syncAppointmentToLP({
     };
   }
 
-  const { ldsId, prospectId, source, step, lpSource, lpSourceDetail } = resolution;
+  const { ldsId, prospectId, source, step, lpSource, lpSourceDetail, disp } = resolution;
+
+  // 2026-10-08: Step 0a accepts a lognumber match in ANY disposition, so the
+  // watchdog's auto-heal set an appointment on an OPPFDN lead. An automatic
+  // repair (requireBookable) writes only onto a bookable lead; an unknown
+  // disposition counts as not bookable. A person or GHL booking (the webhook,
+  // the MCP tool) still re-sets a CXL/NS lead, which is a normal reschedule.
+  if (requireBookable && lpWriteRefusal({ disposition: disp, requireBookable }) === 'terminal_disposition') {
+    console.warn(`[LP-APPT] skipped_terminal_disposition for ${contactId}: lds_id=${ldsId} disp=${disp || '(unknown)'} is not bookable — no SetAppointment`);
+    return {
+      success: true,
+      action: 'skipped_terminal_disposition',
+      contact_id: contactId,
+      lp_lead_id: ldsId,
+      lp_prospect_id: prospectId,
+      disposition: disp || null,
+      resolution_source: source,
+      resolution_step: step,
+    };
+  }
 
   try {
     const fields = [{ id: LP_LEAD_ID_FIELD, field_value: ldsId }];
@@ -2676,6 +2733,10 @@ export function registerLPAppointmentSyncRoutes(app) {
       }
 
       // The work runs to completion either way; only the WAIT is bounded.
+      // calendarId is NOT passed on purpose (user ruling, 2026-10-09): while
+      // FIVE9_DIRECT_DISPATCH is off, this LP write is how a Confirmation Call
+      // gets dialed (LP Dial-ASAP). The watchdog and the MCP tool pass it and
+      // are refused for a GHL-only calendar.
       const work = syncAppointmentToLP({
         contactId, contactPhone, contactEmail, contactName,
         address1, city, state, postalCode,
@@ -2755,6 +2816,7 @@ export {
   extractLpSource,
   findLeadByHLCID,
   isBookableDisposition,
+  lpWriteRefusal,
   lpAlreadyHasAppointment,
   claimFailureNotice,
   releaseFailureNotices,

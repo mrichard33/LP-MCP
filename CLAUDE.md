@@ -208,6 +208,17 @@ goes to #contact-center (`SLACK_CHANNEL_SERVICE`) — but only after the team ha
 `LP_HELD_IMPORT_ALERT_OPEN_MIN` (60) minutes and the row is still not imported (`openMinutesSince`; the user: no
 card the moment we open, staff work the overnight queue first). Audit `lp_inbound_held`, one card per row.
 
+**A Confirmation Call is not an LP appointment, and an automatic repair writes only onto a bookable lead
+(2026-10-08).** The parity watchdog "healed" a Confirmation Call (GHL-only calendar gFWoSQrlKIdfRbAPV842) into
+LP lead 581695, flipping OPPFDN to Set, and the LP→GHL reconciler then created a Window Estimate at the same
+slot. Now `readGhlBook` drops GHL-only calendar rows (`bucketGhlBook`), `syncAppointmentToLP` refuses a GHL-only
+`calendarId` before any I/O (`skipped_ghl_only_calendar`) and, with `requireBookable` (the watchdog only), a lead
+that is not `isBookableDisposition` (`skipped_terminal_disposition`); the reconciler will not create an estimate
+on the minute of an active GHL-only appointment (`ghl_only_same_slot`); and SetAppointment is sent ONCE (LP logs
+every call). The `/webhook/ghl/set-lp-appointment` route still sends a Confirmation Call to LP on purpose: while
+`FIVE9_DIRECT_DISPATCH` is off, that write is how the call gets dialed (user ruling, 2026-10-09). A person or GHL
+booking still re-sets a CXL/NS lead; only the automatic repair needs a bookable one.
+
 **Every imported LP lead reaches a Five9 list (2026-10-05).** LP pushes a row to LP_ASAP only at its own
 auto-import; a row a person imports later, or one auto-imported overnight, waits for LP's 6 AM load (Sunday's 4
 hand-imported rows sat in Five9 on no list; 0 of 14 overnight rows were called at 8 AM). `src/jobs/new-lead-dial-backstop.js`

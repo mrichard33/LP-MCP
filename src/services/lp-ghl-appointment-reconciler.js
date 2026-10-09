@@ -50,7 +50,7 @@ import { claimAppointmentCreate, releaseAppointmentCreate } from './appointment-
 import { GHL_LOCATION_ID } from '../actions/constants.js';
 import { getContactCached } from '../actions/contact-cache.js';
 import { fetchUpcomingAppointments } from '../knowledge/contact-appointments.js';
-import { BOOKING_CALENDARS, isInHomeCalendarId } from '../knowledge/booking-calendar-router.js';
+import { BOOKING_CALENDARS, isInHomeCalendarId, isGhlOnlyCalendarId } from '../knowledge/booking-calendar-router.js';
 import { syncCancelledAppointmentState } from '../actions/handlers/appointment-field-sync.js';
 import { lpWallClockToGhlStartTime } from '../appointment-dates.js';
 // NOTE: slot-check.js imports normalizeGhlStartTime from THIS module, so this
@@ -338,6 +338,21 @@ export async function reconcileLpAppointmentToGhl({ contactId, lead, toNotify = 
         other_calendar_id: otherInHome.calendar_id,
         other_appointment_id: otherInHome.appointment_id,
         other_start_time: otherInHome.start_time,
+      });
+    }
+
+    // 2026-10-08 (contact 5YGVd3kh5IcY6pUJVcs4, LP lead 581695): a Confirmation
+    // Call leaked into LP as a Set, and this path then created a Window Estimate
+    // at the very same minute. An LP appointment that sits exactly on an active
+    // GHL-only (phone) appointment is that phone call echoed back, not a home
+    // visit, so do not mint an estimate over it.
+    const samePhoneSlot = active.find((a) =>
+      isGhlOnlyCalendarId(a.calendar_id) && sameStartTime(a.start_time, startTime));
+    if (samePhoneSlot) {
+      console.warn(`[LpGhlApptSync] contact ${contactId} has GHL-only appointment ${samePhoneSlot.appointment_id} at ${startTime} — not creating a Window Estimate over it`);
+      return noop('ghl_only_same_slot', {
+        other_calendar_id: samePhoneSlot.calendar_id,
+        other_appointment_id: samePhoneSlot.appointment_id,
       });
     }
   }

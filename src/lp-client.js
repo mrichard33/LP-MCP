@@ -798,12 +798,16 @@ export async function setAppointment({ ldsId, setBy = LP_EMP.GHL_INTEGRATION, ap
 
   console.log(`[LP] SetAppointment: lds_id=${ldsId}, date=${apptDate}, time=${apptTime}, set_by=${setBy}`);
 
+  // ONE attempt (retries = 1). SetAppointment is not idempotent in LP's audit
+  // trail: a call that timed out on our side may still have landed, and a
+  // retry logs a second SetAppointment on the lead (LP lead 581695 logged two
+  // on 2026-10-08). A throw here is already a failure to every caller.
   const result = await withCircuit(() => lpPost('/api/Leads/SetAppointment', {
     lds_id:    String(ldsId),
     set_by:    String(setBy),
     appt_date: apptDate,
     appt_time: apptTime,
-  }));
+  }, 1));
 
   // Check for LP error response
   if (result?.error) {

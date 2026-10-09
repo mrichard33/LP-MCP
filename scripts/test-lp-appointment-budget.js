@@ -174,3 +174,50 @@ test('the dedup mark and the I.LP-A signal tag stay synchronous [source-level]',
   assert.match(upto, /await writeApptSyncMark\(/, 'the duplicate guard must not lag the response');
   assert.match(upto, /await applyApptSyncedTag\(/, "I.LP-A's success signal must not lag the response");
 });
+
+// ════════════════════════════════════════════════════════════════════
+// GHL-only calendars and non-bookable leads — 2026-10-08
+// ════════════════════════════════════════════════════════════════════
+//
+// Contact 5YGVd3kh5IcY6pUJVcs4: the parity watchdog wrote a Confirmation Call
+// into LP lead 581695 (disp OPPFDN), flipping it to Set.
+
+const { syncAppointmentToLP, lpWriteRefusal } = await import('../src/lp-appointment-sync.js');
+
+test('syncAppointmentToLP refuses a GHL-only calendarId before any LP or GHL call', async () => {
+  const realFetch = globalThis.fetch;
+  let fetches = 0;
+  globalThis.fetch = async () => { fetches++; throw new Error('no network in this test'); };
+  try {
+    const res = await syncAppointmentToLP({
+      contactId: '5YGVd3kh5IcY6pUJVcs4',
+      appointmentDate: '2026-10-09',
+      appointmentTime: '10:00 AM',
+      calendarId: 'gFWoSQrlKIdfRbAPV842',
+    });
+    assert.equal(res.action, 'skipped_ghl_only_calendar');
+    assert.equal(fetches, 0, 'the refusal must come before any I/O');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('lpWriteRefusal: a GHL-only calendar is always refused', () => {
+  assert.equal(lpWriteRefusal({ calendarId: 'gFWoSQrlKIdfRbAPV842' }), 'ghl_only_calendar');
+  assert.equal(lpWriteRefusal({ calendarId: 'aJj14ONxh1oFyDcQ706O' }), null, 'Window Estimate still syncs');
+  assert.equal(lpWriteRefusal({}), null, 'no calendar → no opinion');
+});
+
+test('lpWriteRefusal: an auto-heal refuses an OPPFDN (or unknown) lead, not a bookable one', () => {
+  assert.equal(lpWriteRefusal({ disposition: 'OPPFDN', requireBookable: true }), 'terminal_disposition');
+  assert.equal(lpWriteRefusal({ disposition: '', requireBookable: true }), 'terminal_disposition');
+  assert.equal(lpWriteRefusal({ disposition: undefined, requireBookable: true }), 'terminal_disposition');
+  for (const d of ['SET', 'Data', 'Cnf', 'nis']) {
+    assert.equal(lpWriteRefusal({ disposition: d, requireBookable: true }), null, `${d} is bookable`);
+  }
+});
+
+test('lpWriteRefusal: without requireBookable (webhook, tool) a CXL lead may still be re-set', () => {
+  assert.equal(lpWriteRefusal({ disposition: 'CXL' }), null);
+  assert.equal(lpWriteRefusal({ disposition: 'OPPFDN' }), null);
+});

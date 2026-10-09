@@ -71,6 +71,7 @@ export function registerLPAppointmentTools(server) {
       appt_date: z.string().optional().describe('Appointment date. Accepts MM/DD/YYYY, YYYY-MM-DD, ISO, or "Month D, YYYY". Required if an LP lead already exists.'),
       appt_time: z.string().optional().describe('Appointment time. Accepts 24h "HH:MM" or 12h "H:MM AM/PM". Required if an LP lead already exists.'),
       calendar_name: z.string().optional().describe('Calendar name for the notification (e.g. "Window Estimate", "MV", "HPA").'),
+      calendar_id: z.string().optional().describe('GHL calendar id of the appointment. A GHL-only calendar (Confirmation Call) is refused: skipped_ghl_only_calendar, no LP write.'),
       confirm: z.boolean().optional().describe('Must be true to execute. Omit or false for a dry-run preview (no write).'),
     },
     async (params) => {
@@ -95,6 +96,7 @@ export function registerLPAppointmentTools(server) {
           appointmentDate: params.appt_date,
           appointmentTime: params.appt_time,
           calendarName: params.calendar_name,
+          calendarId: params.calendar_id || null,
         });
         return ok(result);
       } catch (e) {
