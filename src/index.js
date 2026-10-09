@@ -326,6 +326,7 @@ import { startNewLeadDialBackstopScheduler } from './jobs/new-lead-dial-backstop
 import { startInboundCheckoutWatchScheduler } from './jobs/inbound-checkout-watch.js';  // 2026-10-06
 import { startPromisedCallbackScheduler } from './jobs/promised-callback-sweep.js';  // 2026-10-07
 import { startRehashTagScheduler } from './jobs/rehash-tag-sweep.js';  // 2026-10-09
+import { startPostIssueRetryScheduler } from './jobs/post-issue-rebook-retry.js';  // 2026-10-09
 import { registerLeadLeakRoutes, startLeadLeakScheduler, startLeadUncalledScheduler } from './jobs/lead-leak-monitor.js';  // 2026-09-26
 import { startChatLeadIntakeScheduler } from './jobs/chat-lead-intake-sweep.js';  // 2026-09-28
 import { startCanvassBackstopScheduler } from './jobs/canvass-lead-backstop.js';  // 2026-09-28
@@ -963,6 +964,7 @@ const server = app.listen(PORT, async () => {
   startInboundCheckoutWatchScheduler();
   startPromisedCallbackScheduler();
   startRehashTagScheduler();
+  startPostIssueRetryScheduler();
   startLeadLeakScheduler();
   startLeadUncalledScheduler();
   startChatLeadIntakeScheduler();

@@ -266,6 +266,17 @@ same rep right before booking (`recheckSlot({ userId })`), and LP is never touch
 open times or a failed read: the old reply and the #contact-rehash card, which is now skipped when times were offered or
 the call booked. A follow-up date still wins ("Call me in November" → `defer`). `REHASH_CALL_SLOTS_MODE` off|shadow|live,
 default shadow (`[RehashSlots] shadow … would offer/book`); live also needs `POST_DEMO_PLANNER_MODE=live`.
+**An issued LP lead never takes another appointment (call-center manual pp. 22–24, 2026-10-09).** `postIssueGate`
+(`src/lp-post-issue-rebook.js`, rules in `src/lp-post-issue.js`) runs before both LP SetAppointment calls. Post-issue =
+LP's issued flag on any appointment row (or `everissued`), else a `POST_ISSUE_DISPOSITIONS` disposition (CCC and Reset
+included: 933/938 and 126/126 of those with history were issued). Live: a newer non-issued lead on the prospect takes the
+appointment; a waiting inquiry for the phone is left to inbound-checkout-watch; otherwise a NEW lead goes straight to LP's
+`addLead` from LP's own prospect record, never through 8e30ff37 (Mark: limit the leads a person must enter). Promoter
+matched exactly once in LP's promoter list (`GetLeadsSourceSubPromoter p`) or sent blank (Mark's ruling), never 830/5574;
+Sub-Source from the lead, else `lp_source_catalog` by name, else the issued lead's inbound row. A failed read or send is
+retried by `post-issue-rebook-retry`; #contact-center hears after 3 tries or 2 hours, or at once when no Sub-Source or no
+name/phone exists. The same date+time already on the issued lead is a re-sync, not a rebook; the parity watchdog never
+creates a lead. `LP_POST_ISSUE_NEW_LEAD_MODE` off|shadow|live, default shadow (`lp.post_issue_rebook` events).
 **Only the automatic repair needs an open lead (the user, 2026-10-09).** `terminalDispositionDecision` refuses a
 post-demo or sold lead (`isDemoDisposition`: Sale, OPPFDN, NoRehash, FDNS, SW, PM) for every caller; with
 `requireBookable` (the parity watchdog only) it also refuses any non-bookable lead. A person or GHL booking re-sets a

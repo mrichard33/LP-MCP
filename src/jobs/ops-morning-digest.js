@@ -197,6 +197,31 @@ async function saleContactSection(deps, nowMs) {
   return { title: 'Sales given a GHL contact (24h)', lines };
 }
 
+// 2026-10-09 (Mark: limit how often a person enters a lead). A post-issue
+// rebook (src/lp-post-issue-rebook.js) sends the new LP lead itself, with no
+// promoter when the issued lead's could not be matched and with a fallback
+// Sub-Source when its own was blank. Nobody has to act, so it is a digest line,
+// never a #contact-center card.
+async function postIssueSection(deps, nowMs) {
+  const since = new Date(nowMs - DAY_MS).toISOString();
+  const { data, error } = await deps.supabase.from('system_events')
+    .select('ghl_contact_id, payload')
+    .eq('event_type', 'lp.post_issue_rebook')
+    .eq('event_subtype', 'post_issue_new_lead_sent')
+    .gte('created_at', since);
+  if (error) throw new Error(`post-issue rebook read failed: ${error.message}`);
+  const rows = data || [];
+  if (!rows.length) return null;
+  const names = await loadNames(deps, rows.map((r) => r.ghl_contact_id).filter(Boolean));
+  const who = (r) => (r.ghl_contact_id ? nameOf(names, r.ghl_contact_id) : `LP lead ${r.payload?.issued_lead_id}`);
+  const lines = [`new LP leads sent for issued leads: ${rows.length}`];
+  const noPromoter = rows.filter((r) => r.payload?.promoter_status && r.payload.promoter_status !== 'matched');
+  if (noPromoter.length) lines.push(`sent without a promoter: ${noPromoter.map((r) => `${who(r)} (${r.payload.promoter_status})`).slice(0, SECTION_MAX).join(', ')}`);
+  const fallback = rows.filter((r) => r.payload?.srs_source && r.payload.srs_source !== 'lead');
+  if (fallback.length) lines.push(`Sub-Source from a fallback: ${fallback.map((r) => `${who(r)} (${r.payload.srs_source} ${r.payload.srs_id})`).slice(0, SECTION_MAX).join(', ')}`);
+  return { title: 'Post-issue rebooks (24h)', lines };
+}
+
 async function paritySection(deps, nowMs) {
   const since = new Date(nowMs - DAY_MS).toISOString();
   const { data, error } = await deps.supabase.from('alert_conditions')
@@ -363,7 +388,7 @@ export async function runOpsMorningDigest({ post = true, deps: depsArg } = {}) {
     if (post) await deps.sendAlertMessage(`⚠️ ${label} could not run: ${error}`, { channel: 'ops' });
   };
 
-  for (const [label, build] of [['P2 won/lost summary', p2Section], ['Sale → P2 backstop summary', p2BackstopSection], ['Sale → contact backstop summary', saleContactSection], ['Appointment parity summary', paritySection]]) {
+  for (const [label, build] of [['P2 won/lost summary', p2Section], ['Sale → P2 backstop summary', p2BackstopSection], ['Sale → contact backstop summary', saleContactSection], ['Appointment parity summary', paritySection], ['Post-issue rebook summary', postIssueSection]]) {
     try { sections.push(await build(deps, nowMs)); } catch (err) { await couldNotRun(label, err.message); }
   }
   try { sections.push(...await nightlySummarySections(deps, nowMs)); } catch (err) { await couldNotRun('Nightly summaries (tag sweep, inbound callers)', err.message); }

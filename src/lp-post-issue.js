@@ -205,38 +205,116 @@ export function parsePromoterCatalog(resp) {
 
 const nameKey = (s) => clean(s).replace(/\s+/g, ' ').toLowerCase();
 
+const isSrs = (v) => /^\d{3}$/.test(clean(v)) && clean(v) !== '000';
+
 /**
- * Mirror the issued lead's attribution. CERTAIN or nothing: an srs_id that is
- * not a 3-digit LP SubSource, a promoter that LP's own catalog does not name
- * exactly once, or a pro_id that is not 4 digits all stop the new lead. Never
- * the chatbot fallbacks (830 / 5574) that ensureLpSourceAndProId would supply:
- * a lead written under the wrong source can only be fixed by hand in LP.
+ * The issued lead's Sub-Source (srs_id). Three sources, first good one wins:
+ *   1. the lead's own srs_id (LP's GetLead / raw_lp_data.srs_id)
+ *   2. lp_source_catalog: exactly one active row whose source and sub-source
+ *      names match the lead's lead_source / lead_source_detail
+ *   3. the issued lead's own inbound row (lp_inbound_queue.srs_id)
+ * Only a 3-digit, non-zero id counts (LP SubSource ids are 3-digit; a 4-digit
+ * one is a promoter, src/lp-source-ids.js). 108 leads in 60 days carried
+ * srs_id 0, which is why one source is not enough (2026-10-09).
  *
- * @param {object} o
- * @param {string} o.srsId          the issued lead's srs_id (raw_lp_data.srs_id)
- * @param {string} o.promoterName   the issued lead's promoter, as LP prints it
- * @param {Array<{id,name}>|null} o.catalog  parsePromoterCatalog output; null = unreadable
- * @param {Function} o.assertNotTransposed   from src/lp-source-ids.js
- * @returns {{ ok: true, srsId, proId } | { ok: false, reason }}
+ * @returns {{ srsId: string, srsSource: 'lead'|'source_catalog'|'inbound_row' } | null}
  */
-export function resolveAttribution({ srsId, promoterName, catalog, assertNotTransposed }) {
-  const srs = clean(srsId);
-  if (!/^\d{3}$/.test(srs) || srs === '000') return { ok: false, reason: 'srs_id_missing_or_not_3_digit' };
-  const promoter = clean(promoterName);
-  if (!promoter) return { ok: false, reason: 'no_promoter_on_issued_lead' };
-  if (!Array.isArray(catalog)) return { ok: false, reason: 'promoter_catalog_unreadable' };
-  const hits = catalog.filter((p) => nameKey(p.name) === nameKey(promoter));
-  const ids = [...new Set(hits.map((h) => h.id))];
-  if (!ids.length) return { ok: false, reason: 'promoter_not_in_lp_catalog' };
-  if (ids.length > 1) return { ok: false, reason: 'promoter_name_ambiguous' };
-  const pro = ids[0];
-  if (!/^\d{4}$/.test(pro)) return { ok: false, reason: 'pro_id_not_4_digit' };
-  try {
-    assertNotTransposed?.(srs, pro);
-  } catch {
-    return { ok: false, reason: 'attribution_transposed' };
+export function resolveSubSource({ srsId, leadSource, leadSourceDetail, sourceCatalog, inboundSrs }) {
+  if (isSrs(srsId)) return { srsId: clean(srsId), srsSource: 'lead' };
+  if (Array.isArray(sourceCatalog) && clean(leadSource) && clean(leadSourceDetail)) {
+    const ids = [...new Set(sourceCatalog
+      .filter((r) => r?.active !== false)
+      .filter((r) => nameKey(r?.lp_source_raw) === nameKey(leadSource)
+        && nameKey(r?.lp_source_subdetail) === nameKey(leadSourceDetail))
+      .map((r) => clean(r.lp_source_id)))];
+    if (ids.length === 1 && isSrs(ids[0])) return { srsId: ids[0], srsSource: 'source_catalog' };
   }
-  return { ok: true, srsId: srs, proId: pro };
+  if (isSrs(inboundSrs)) return { srsId: clean(inboundSrs), srsSource: 'inbound_row' };
+  return null;
+}
+
+/**
+ * The issued lead's Promoter (pro_id), or none. Mark's ruling (2026-10-09): a
+ * promoter we cannot match with certainty goes out BLANK and the lead is still
+ * sent; unattributed beats misattributed (src/services/canvasser-roster.js), and
+ * a person is not asked. Never the chatbot pair 830 / 5574.
+ *
+ * @returns {{ proId: string|null, promoterStatus: string }}
+ */
+export function resolvePromoter({ srsId, promoterName, catalog, assertNotTransposed }) {
+  const promoter = clean(promoterName);
+  if (!promoter) return { proId: null, promoterStatus: 'no_promoter_on_issued_lead' };
+  if (!Array.isArray(catalog)) return { proId: null, promoterStatus: 'promoter_catalog_unreadable' };
+  const ids = [...new Set(catalog.filter((p) => nameKey(p.name) === nameKey(promoter)).map((h) => h.id))];
+  if (!ids.length) return { proId: null, promoterStatus: 'promoter_not_in_lp_catalog' };
+  if (ids.length > 1) return { proId: null, promoterStatus: 'promoter_name_ambiguous' };
+  if (!/^\d{4}$/.test(ids[0])) return { proId: null, promoterStatus: 'pro_id_not_4_digit' };
+  try {
+    assertNotTransposed?.(srsId, ids[0]);
+  } catch {
+    return { proId: null, promoterStatus: 'attribution_transposed' };
+  }
+  return { proId: ids[0], promoterStatus: 'matched' };
+}
+
+/**
+ * Both halves. Only an unresolvable Sub-Source stops the new lead (LP's addLead
+ * requires srs_id); a promoter never does.
+ * @returns {{ ok: true, srsId, srsSource, proId, promoterStatus } | { ok: false, reason }}
+ */
+export function resolveAttribution(o) {
+  const srs = resolveSubSource(o);
+  if (!srs) return { ok: false, reason: 'srs_id_unresolvable' };
+  return { ok: true, ...srs, ...resolvePromoter({ ...o, srsId: srs.srsId }) };
+}
+
+/** MM/DD/YYYY from YYYY-MM-DD. */
+function lpDate(dateYmd) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(clean(dateYmd));
+  return m ? `${m[2]}/${m[3]}/${m[1]}` : null;
+}
+
+/**
+ * The addLead body for the new lead, from LP's own prospect record (2026-10-09:
+ * sent straight to LP, not through GHL workflow 8e30ff37, so the workflow's
+ * "Source ID and Pro ID" gate and its GHL field writes are out of the path).
+ * null when LP cannot take it: addLead requires a first name and a phone.
+ *
+ * No consent flags: create_lp_lead asserts TextOptIn / HasConsent for a fresh
+ * opt-in, but a returning prospect's consent is not ours to restate here.
+ */
+export function buildRebookLeadFields({ prospect, srsId, proId, dateYmd, timeHHMM, contactId, issuedLeadId, issuedDisposition, product }) {
+  const firstname = clean(prospect?.firstname);
+  const phone = clean(prospect?.phone1 ?? prospect?.phone).replace(/\D/g, '').slice(-10);
+  if (!firstname || phone.length !== 10) return null;
+  const apptdate = lpDate(dateYmd);
+  const appttime = ghlTime12h(timeHHMM);
+  const fields = {
+    firstname,
+    lastname: clean(prospect?.lastname),
+    address1: clean(prospect?.address1),
+    city: clean(prospect?.city),
+    state: clean(prospect?.state),
+    zip: clean(prospect?.zip),
+    phone,
+    email: clean(prospect?.email),
+    sender: 'GHL-PostIssueRebook',
+    srs_id: clean(srsId),
+    pro_id: clean(proId),
+    productID: clean(product) || 'Win',
+    proddescr: clean(product) || 'Win',
+    notes: `Rebook: LP lead ${issuedLeadId} was already issued (${clean(issuedDisposition) || 'issued'}). ` +
+      'New lead per call-center rule; Source, Sub-Source and Promoter carried from that lead.',
+  };
+  if (contactId && !/^\d+$/.test(String(contactId))) {
+    fields.lognumber = String(contactId);
+    fields.User1 = String(contactId);
+  }
+  if (apptdate && appttime) {
+    fields.apptdate = apptdate;
+    fields.appttime = appttime;
+  }
+  return fields;
 }
 
 /** 'h:mm AM' — the shape GHL's own calendar writes into the appointment time field. */

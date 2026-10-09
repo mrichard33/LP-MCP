@@ -374,6 +374,17 @@ export const JOBS = Object.freeze([
     isEnabled: (env) => String(env.REHASH_ROUTING_MODE || 'shadow').toLowerCase().trim() !== 'off',
   },
   {
+    id: 'post-issue-rebook-retry',
+    label: 'Post-issue LP rebooks: retry a failed read or send before #contact-center is asked',
+    group: 'lp-intake',
+    cadence: 'every 15 min',
+    enabledEnv: 'LP_POST_ISSUE_NEW_LEAD_MODE',
+    // Runs only in live (2026-10-09): shadow writes nothing, so there is
+    // nothing to retry. Mirrors postIssueMode() in src/lp-post-issue.js.
+    enabledDefault: false,
+    isEnabled: (env) => String(env.LP_POST_ISSUE_NEW_LEAD_MODE || 'shadow').toLowerCase().trim() === 'live',
+  },
+  {
     id: 'booked-dial-routing',
     label: 'Booked leads → Confirmation list, then off the DIAL ASAP setter lists (decision #2669)',
     group: 'five9',

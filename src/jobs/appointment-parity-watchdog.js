@@ -360,7 +360,7 @@ function classifyHealResult(result) {
     case 'post_issue_check_failed':
     case 'post_issue_needs_manual_lead':
     case 'newer_lead_pending_in_inbound_queue':
-    case 'post_issue_enroll_failed':
+    case 'post_issue_send_failed':
     case 'post_issue_rebook_duplicate':
       return 'not_attempted';
     case 'lp_lead_creation_enrolled':
