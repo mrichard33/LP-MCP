@@ -1996,9 +1996,13 @@ export async function executeRemoveNumbersFromDncReentry(action, deps = {}) {
 
       if (ctx.dry_run) return { numbers_submitted: numbers.length, event_id: evt.id, resolved_from: sources };
       ctx.new_state = await checkDnc(numbers); // read-back proves the removal
+      // 2026-10-09: a number still on DNC after the removal used to complete
+      // the step anyway, and the Slack card read "Five9: ✅ done". It fails now,
+      // so the card says the lift did not land (the executor retries it).
+      assertDncRemoved(numbers, ctx.new_state);
       return {
         numbers_submitted: numbers.length,
-        still_on_dnc: ctx.new_state.on_dnc.length,
+        still_on_dnc: 0,
         event_id: evt.id,
         resolved_from: sources,
       };
@@ -2154,6 +2158,17 @@ export async function executeRemoveNumbersFromDncApproved(action, deps = {}) {
       };
     }
   );
+}
+
+/**
+ * Throws when the read-back after removeNumbersFromDnc still lists a number on
+ * Five9's DNC (2026-10-09: that used to complete as "✅ done"). Pure.
+ */
+export function assertDncRemoved(numbers, newState) {
+  const still = newState?.on_dnc || [];
+  if (still.length) {
+    throw new Error(`Five9 still lists ${still.length} of ${(numbers || []).length} number(s) on DNC after removeNumbersFromDnc (${still.map((n) => `…${String(n).slice(-4)}`).join(', ')})`);
+  }
 }
 
 // The approved-lift contract, named so a reader sees it without the body.

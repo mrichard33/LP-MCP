@@ -223,7 +223,7 @@ const byType = (rows, t) => rows.filter((r) => r.action_type === t);
 
 // ── 4. approve with a carrier STOP ───────────────────────────────────────────
 
-test('4. Slack approve with carrier STOP → SMS/RCS DND stays on, dnc-sms stays, Five9 + LP cleared', async () => {
+test('4. Slack approve with carrier STOP → SMS/RCS DND stays on, dnc-sms stays, Five9 cleared, LP left to a person', async () => {
   const h = liftHarness({ tags: ['dnc', 'dnc-sms', 'suppress:dnc-reply', 'stop-bot'] });
   const out = await decision.handleDncLiftDecision({ body: body(), headers }, h.deps);
   assert.equal(out.status, 200, JSON.stringify(out.json));
@@ -240,7 +240,10 @@ test('4. Slack approve with carrier STOP → SMS/RCS DND stays on, dnc-sms stays
   assert.ok(!dnd.channels.includes('SMS') && !dnd.channels.includes('RCS'), 'SMS/RCS DND stays ON');
   assert.deepEqual([...dnd.channels].sort(), ['Call', 'Email', 'FB', 'GMB', 'WhatsApp']);
 
-  assert.equal(byType(rows, 'update_lp_dnc_status')[0].action_payload.mode, 'clear');
+  // 2026-10-09: LP rejects every clear value, so no LP step is queued until
+  // LP_DNC_CLEAR_WORKING=true; the result asks for a manual clear instead.
+  assert.equal(byType(rows, 'update_lp_dnc_status').length, 0, 'no LP clear while LP_DNC_CLEAR_WORKING is unset');
+  assert.equal(out.json.lp_manual_clear_required, true);
   const five9 = byType(rows, 'five9_remove_numbers_from_dnc_approved')[0];
   assert.equal(five9.requires_approval, true);
   assert.equal(five9.action_payload.clear_sms, false);
@@ -254,7 +257,7 @@ test('4. Slack approve with carrier STOP → SMS/RCS DND stays on, dnc-sms stays
   // The Five9 row was approved through approve_action AS the Slack user.
   assert.deepEqual(h.calls.approved, [{ actionId: 1000 + rows.indexOf(five9), decision: 'approve', approvedBy: SLACK_USER }]);
   assert.equal(out.json.systems.five9.status, 'done');
-  assert.equal(out.json.systems.lp.status, 'done');
+  assert.equal(out.json.systems.lp, undefined, 'LP was not called');
   assert.equal(out.json.systems.ghl.status, 'done');
   assert.equal(h.reqRows.get('req-1').status, 'approved');
 });
@@ -279,8 +282,8 @@ test('5. Slack approve without carrier STOP → all channels restored', async ()
   const rows = h.calls.inserted;
   assert.deepEqual(rows.map((r) => r.action_type), [
     'record_consent_change', 'record_consent_change', 'record_consent_change', 'remove_tag', 'set_dnd',
-    'update_lp_dnc_status', 'five9_remove_numbers_from_dnc_approved', 'add_tag', 'emit_event',
-  ], 'the handoff\'s order');
+    'five9_remove_numbers_from_dnc_approved', 'add_tag', 'emit_event',
+  ], 'the handoff\'s order, without the LP clear while LP_DNC_CLEAR_WORKING is unset');
   assert.ok(rows.every((r) => r.batch_id === 'req-1'), 'one batch, batch_id = request_id');
   assert.deepEqual(rows.slice(0, 3).map((r) => `${r.action_payload.channel}/${r.action_payload.change}`), ['all/dnc_full_off', 'phone/granted', 'email/granted']);
   assert.ok(byType(rows, 'remove_tag')[0].action_payload.tags.includes('dnc-sms'));
@@ -297,11 +300,22 @@ test('5. Slack approve without carrier STOP → all channels restored', async ()
   for (const r of byType(rows, 'record_consent_change')) assert.match(r.action_payload.actor, /Mark Richard \(U04ABCDEF12\)/);
 });
 
+test('5a. LP_DNC_CLEAR_WORKING=true puts the LP clear back, before Five9', async () => {
+  const h = liftHarness();
+  h.deps.env = { ...h.deps.env, LP_DNC_CLEAR_WORKING: 'true' };
+  await decision.handleDncLiftDecision({ body: body(), headers }, h.deps);
+  const types = h.calls.inserted.map((r) => r.action_type);
+  assert.deepEqual(types.slice(5, 7), ['update_lp_dnc_status', 'five9_remove_numbers_from_dnc_approved']);
+  assert.equal(byType(h.calls.inserted, 'update_lp_dnc_status')[0].action_payload.mode, 'clear');
+  assert.deepEqual(h.calls.inserted.map((r) => r.sequence_order), [1, 2, 3, 4, 5, 6, 7, 8, 9]);
+});
+
 test('5b. a failed step is reported per system and the request is marked failed', async () => {
   const h = liftHarness({
     runResult: (row) => (row.action_type === 'update_lp_dnc_status'
       ? { status: 'failed', error: 'LP Result:0 Invalid DNC value' } : {}),
   });
+  h.deps.env = { ...h.deps.env, LP_DNC_CLEAR_WORKING: 'true' };
   const out = await decision.handleDncLiftDecision({ body: body(), headers }, h.deps);
   assert.equal(out.json.ok, false);
   assert.equal(out.json.systems.lp.status, 'failed');
@@ -413,6 +427,11 @@ test('6d. refuses any other rule, a free-form number list, and an SMS clear for 
     getConsent: async () => { throw new Error('must not be read'); },
   }));
   assert.equal(res.numbers_submitted, 1);
+});
+
+test('6f. a number still on Five9 DNC after the removal fails the step, never "done"', () => {
+  assert.throws(() => writes.assertDncRemoved(['8134166946'], { on_dnc: ['8134166946'], not_on_dnc: [] }), /still lists 1 of 1 number\(s\) on DNC.*…6946/);
+  assert.doesNotThrow(() => writes.assertDncRemoved(['8134166946'], { on_dnc: [], not_on_dnc: ['8134166946'] }));
 });
 
 test('6e. the five9_ prefix still forces approval for the approved op — no carve-out', async () => {

@@ -6,8 +6,9 @@
  *   - the route answers 202 at once in async mode and runs the batch after;
  *   - lifts run a few at a time (runLimited);
  *   - the result goes to the card and its thread, from the actions' real state;
- *   - a step still retrying reads "retrying", and one follow-up is posted when
- *     it settles, with the request's status corrected;
+ *   - a step still retrying reads "retrying", and when it settles the SAME
+ *     thread reply is edited (2026-10-09: it used to be a second reply), with
+ *     the request's status corrected;
  *   - the known-broken LP clear is the manual-clear line, never a page to Mark;
  *   - a request from the old n8n flow (no report_mode) is never double-posted.
  */
@@ -86,7 +87,7 @@ test('formatLiftThread: retrying reads as retrying, LP is the manual line, LP al
   assert.match(bad.threadText, /<@U0BU7TZPY82> something did not complete/);
 });
 
-test('report: interim while a step retries, then ONE follow-up when it settles, status corrected', async () => {
+test('report: interim while a step retries, then the SAME reply is edited when it settles, status corrected', async () => {
   const actions = [act('set_dnd', 'pending'), act('five9_remove_numbers_from_dnc_approved', 'completed'), lpFailed, act('record_consent_change', 'completed')];
   const { db, state } = fakeDb({ row: baseRow(), actions });
   const s = slack();
@@ -101,6 +102,7 @@ test('report: interim while a step retries, then ONE follow-up when it settles, 
   assert.match(s.posts[0].text, /GHL: ⏳ retrying/);
   assert.equal(s.posts[0].opts.threadTs, '1727.000100');
   assert.equal(state.row.batch_result.slack_report_final, false);
+  assert.equal(state.row.batch_result.slack_reply_ts, '9.9', 'the reply ts is kept so a follow-up can edit it');
 
   assert.equal((await report.reportDncLiftResult(REQ, deps)).skipped, 'still_retrying', 'nothing new to say yet');
   assert.equal(s.posts.length, 1);
@@ -108,12 +110,48 @@ test('report: interim while a step retries, then ONE follow-up when it settles, 
   state.actions[0].status = 'completed';
   const last = await report.reportDncLiftResult(REQ, deps);
   assert.equal(last.final, true);
-  assert.match(s.posts[1].text, /^\*Update:\* every step has now finished/);
-  assert.match(s.posts[1].text, /GHL: ✅ done/);
+  assert.equal(last.edited, true);
+  assert.equal(s.posts.length, 1, 'ONE thread reply per lift — the follow-up edits it');
+  const edit = s.updates.at(-1);
+  assert.equal(edit.ts, '9.9', 'the edit targets the thread reply, not the card');
+  assert.match(edit.text, /GHL: ✅ done/);
+  assert.doesNotMatch(edit.text, /retrying/);
   assert.equal(state.row.status, 'approved', 'the known LP step does not make the lift "failed"');
   assert.equal(state.row.batch_result.slack_report_final, true);
   assert.equal((await report.reportDncLiftResult(REQ, deps)).skipped, 'already_final');
-  assert.equal(s.posts.length, 2);
+  assert.equal(s.posts.length, 1);
+});
+
+test('report: a row posted before slack_reply_ts existed still gets its one follow-up as a new reply', async () => {
+  const row = baseRow({ batch_result: { report_mode: 'server', slack_channel: CH, slack_reported_at: '2026-10-02T15:41:30Z', slack_report_final: false } });
+  const { db } = fakeDb({ row, actions: [act('set_dnd', 'completed'), lpFailed] });
+  const s = slack();
+  const out = await report.reportDncLiftResult(REQ, { supabase: db, env: {}, now: () => NOW, ...s });
+  assert.equal(out.final, true);
+  assert.equal(s.posts.length, 1);
+  assert.match(s.posts[0].text, /^\*Update:\* every step has now finished/);
+});
+
+test('report: an edit Slack refuses falls back to one new reply', async () => {
+  const row = baseRow({ batch_result: { report_mode: 'server', slack_channel: CH, slack_reported_at: '2026-10-02T15:41:30Z', slack_reply_ts: '5.5', slack_report_final: false } });
+  const { db, state } = fakeDb({ row, actions: [act('set_dnd', 'completed')] });
+  const s = slack();
+  s.updateSlackMessage = async (channel, ts, text, opts) => { s.updates.push({ channel, ts, text, opts }); return ts === '5.5' ? { ok: false, error: 'message_not_found' } : { ok: true }; };
+  const out = await report.reportDncLiftResult(REQ, { supabase: db, env: {}, now: () => NOW, ...s });
+  assert.equal(out.edited, false);
+  assert.equal(s.posts.length, 1);
+  assert.equal(state.row.batch_result.slack_reply_ts, '9.9');
+});
+
+test('formatLiftThread: the LP manual line shows even when no LP step ran (2026-10-09)', () => {
+  const out = report.formatLiftThread({
+    decision: 'approve', slackUserId: 'U1',
+    systems: { ghl: { status: 'done', errors: [] }, five9: { status: 'done', errors: [] } },
+    lpManual: true, lpProspectId: '399873', final: true,
+  });
+  assert.match(out.threadText, /• LP: :warning: still shows DNC — clear it manually in Lead Perfection \(Prospect #399873\)/);
+  assert.match(out.threadText, /• Five9: ✅ done/);
+  assert.equal(out.hardFailure, false);
 });
 
 test('report: a request from the old n8n flow is never posted twice', async () => {
@@ -207,6 +245,26 @@ test('decision route: async answers 202 at once, records the channel, then runs 
     body: { ghl_contact_id: 'C1', decision: 'approve', slack_user_id: 'U0BU7TZPY82', slack_ts: '1', request_id: REQ, async: true },
   }, deps);
   assert.equal(bad.status, 400);
+
+  // 2026-10-09: a second click on the same card is a 202 too, so n8n prints
+  // no second result into the thread; nothing runs again.
+  ran = false;
+  const again = await decision.handleDncLiftDecision({
+    headers: { 'x-dnc-lift-secret': 's' },
+    body: { ghl_contact_id: 'C1', decision: 'approve', slack_user_id: 'U0BU7TZPY82', slack_ts: '1727.000100', request_id: REQ,
+      async: true, channel: CH },
+  }, deps);
+  assert.equal(again.status, 202);
+  assert.equal(again.json.accepted, true);
+  assert.equal(again.json.idempotent, true);
+  assert.equal(ran, false, 'a replay runs nothing');
+  // The old synchronous flow still gets the stored result to print.
+  const sync = await decision.handleDncLiftDecision({
+    headers: { 'x-dnc-lift-secret': 's' },
+    body: { ghl_contact_id: 'C1', decision: 'approve', slack_user_id: 'U0BU7TZPY82', slack_ts: '1727.000100', request_id: REQ },
+  }, deps);
+  assert.equal(sync.status, 200);
+  assert.equal(sync.json.idempotent, true);
 });
 
 test('sweep: reports only server-mode rows that are not final and not just finished', async () => {

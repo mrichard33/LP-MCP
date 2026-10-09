@@ -28,7 +28,8 @@
  *   2. remove_tag  the DNC family — NOT dnc-sms when the lead texted STOP
  *   3. set_dnd inactive  Call, Email, WhatsApp, GMB, FB (+ SMS, RCS only
  *      without a carrier STOP)
- *   4. update_lp_dnc_status  mode: clear
+ *   4. update_lp_dnc_status  mode: clear — ONLY when LP_DNC_CLEAR_WORKING=true
+ *      (2026-10-09: LP rejects every clear value; the card asks for a manual clear)
  *   5. five9_remove_numbers_from_dnc_approved, then approve_action with the
  *      Slack approver (the op refuses any other kind of approval)
  *   6. add_tag recovery:dnc-lifted-manual
@@ -108,7 +109,7 @@ function actorLabel({ slackUserId, slackUserName }) {
  * only three differences: dnc-sms stays, SMS/RCS DND stays, and phone consent
  * is recorded as granted-for-calls with a reason that says so.
  */
-export function buildLiftBatch({ contactId, requestId, slackUserId, slackUserName, slackTs, carrierStop, carrierBasis = [], blocking = [] }) {
+export function buildLiftBatch({ contactId, requestId, slackUserId, slackUserName, slackTs, carrierStop, carrierBasis = [], blocking = [], lpClear = false }) {
   const actor = actorLabel({ slackUserId, slackUserName });
   const evidence = {
     slack_ts: slackTs, request_id: requestId, slack_user_id: slackUserId,
@@ -144,7 +145,12 @@ export function buildLiftBatch({ contactId, requestId, slackUserId, slackUserNam
       status: 'inactive', channels: dnd,
       reason: `Manual DNC lift approved in Slack by ${actor}${carrierStop ? ' — SMS/RCS left ON (lead texted STOP)' : ''}`,
     }),
-    base('update_lp_dnc_status', 'lp', { mode: 'clear', source: `slack_lift by ${actor}` }),
+    // LP's clear has been rejected on every value tried ("Invalid DNC value",
+    // still on 2026-10-09), and each lift retried it three times. Those retries
+    // are what posted a second Slack reply. Until a clear is verified
+    // (LP_DNC_CLEAR_WORKING=true) the step is not queued; lpClearOutcome then
+    // reports the manual LP clear, and the thread says so.
+    ...(lpClear ? [base('update_lp_dnc_status', 'lp', { mode: 'clear', source: `slack_lift by ${actor}` })] : []),
     base('five9_remove_numbers_from_dnc_approved', 'lp', {
       numbers_from_contact: true,
       approved_by: slackUserId,
@@ -345,15 +351,27 @@ export async function handleDncLiftDecision({ body = {}, headers = {} }, deps = 
   if (found.data.ghl_contact_id !== contactId) {
     return { status: 409, json: { ok: false, error: `request ${requestId} is for a different contact` } };
   }
-  const replay = (row) => ({
-    status: 200,
-    json: {
-      ok: row.status !== 'failed', idempotent: true, request_id: requestId,
-      status: row.status, decision: row.decision,
-      decided_by: row.slack_user_name || row.slack_user_id || null,
-      ...(row.batch_result || {}),
-    },
-  });
+  const replay = (row) => (asyncMode && row.batch_result?.report_mode === 'server'
+    // 2026-10-09: n8n posts its own thread result for anything but a 202. A
+    // second click on a card this service reports itself got a 200 replay, so
+    // the thread showed two results. The first click's report is the one reply.
+    ? {
+      status: 202,
+      json: {
+        ok: true, accepted: true, idempotent: true, request_id: requestId,
+        status: row.status, decision: row.decision,
+        decided_by: row.slack_user_name || row.slack_user_id || null,
+      },
+    }
+    : {
+      status: 200,
+      json: {
+        ok: row.status !== 'failed', idempotent: true, request_id: requestId,
+        status: row.status, decision: row.decision,
+        decided_by: row.slack_user_name || row.slack_user_id || null,
+        ...(row.batch_result || {}),
+      },
+    });
   if (found.data.status !== 'awaiting_decision') return replay(found.data);
 
   const claim = await db.from('dnc_lift_requests')
@@ -394,7 +412,7 @@ export async function handleDncLiftDecision({ body = {}, headers = {} }, deps = 
     const who = { contactId, requestId, slackUserId, slackUserName, slackTs, blocking };
 
     const rows = decision === 'approve'
-      ? buildLiftBatch({ ...who, carrierStop: carrier.carrierStop, carrierBasis: carrier.basis })
+      ? buildLiftBatch({ ...who, carrierStop: carrier.carrierStop, carrierBasis: carrier.basis, lpClear: !lpManualClearRequired(env) })
       : buildKeepBlockedBatch(who);
 
     const holdUntil = new Date(now + ROUTE_HOLD_MS).toISOString();
