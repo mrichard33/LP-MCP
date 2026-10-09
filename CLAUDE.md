@@ -208,6 +208,18 @@ goes to #contact-center (`SLACK_CHANNEL_SERVICE`) — but only after the team ha
 `LP_HELD_IMPORT_ALERT_OPEN_MIN` (60) minutes and the row is still not imported (`openMinutesSince`; the user: no
 card the moment we open, staff work the overnight queue first). Audit `lp_inbound_held`, one card per row.
 
+**A confirmation call is never an LP appointment (the user, 2026-10-09).** "We should never create a calendar event in
+Lead Perfection for a confirmation call." A GHL-only calendar (`GHL_ONLY_CALENDAR_KEYS`: Confirmation Call
+`gFWoSQrlKIdfRbAPV842`) lives only in GHL; LP holds the estimate visit. On 2026-10-08 the parity watchdog wrote a
+Confirmation Call onto LP lead 581695 (OPPFDN → Set) and the reconciler minted a Window Estimate at the same slot (#1218).
+Every path that can put an appointment in LP refuses one: by calendar id where it has one (`syncAppointmentToLP`,
+`executeSetLPAppointment`, the watchdog's `bucketGhlBook`), and by time where it has only a date and a time copied
+from GHL's `last_appointment_start_date/time`, which ANY calendar fills (`checkConfirmationCallSlot` in
+`src/services/confirmation-call-slot.js`: the addlead proxy, which every live I.LP-OUT send goes through, create_lp_lead
+for new, reused and issued-inquiry leads, set_lp_appointment and the sync with no calendar named). The lead still goes
+to LP, without the appointment. A failed GHL read fails open. The reconciler never creates a Window Estimate over an
+active GHL-only appointment at the same time. A new LP write that carries a date and time goes through the same check.
+
 **Every imported LP lead reaches a Five9 list (2026-10-05).** LP pushes a row to LP_ASAP only at its own
 auto-import; a row a person imports later, or one auto-imported overnight, waits for LP's 6 AM load (Sunday's 4
 hand-imported rows sat in Five9 on no list; 0 of 14 overnight rows were called at 8 AM). `src/jobs/new-lead-dial-backstop.js`

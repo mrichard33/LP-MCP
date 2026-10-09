@@ -57,6 +57,7 @@
 
 import supabase from './supabase.js';
 import { checkDuplicateAppointment } from './services/lp-duplicate-appointment-guard.js';
+import { checkConfirmationCallSlot } from './services/confirmation-call-slot.js';
 import { sendGroupMeMessage } from './groupme.js';
 import { flattenWebhookBody } from './webhook-body.js';
 import { fetchAndBuildAgenticNotes, isWeakNotes } from './services/agentic-lead-notes.js';
@@ -336,6 +337,31 @@ export function registerLpAddleadProxyRoutes(app) {
       try {
         plan = planAddleadValidation(body);
 
+        // 2026-10-09 (the user: "We should never create a calendar event in
+        // Lead Perfection for a confirmation call"). I.LP-OUT sends adate/atime
+        // from GHL's last_appointment fields, which a Confirmation Call fills
+        // like any booking. When that time is the contact's active GHL-only
+        // appointment (and nothing else starts then), the lead still goes to
+        // LP but without the appointment. lognumber is the GHL contact id. A
+        // failed GHL read forwards unchanged (contract 2). No card: the system
+        // handled it, nobody has to act (Mark, 2026-10-07).
+        if (plan.action === 'forward' && body.adate && body.atime && body.lognumber) {
+          const slot = await checkConfirmationCallSlot({
+            contactId: String(body.lognumber), apptDate: body.adate, apptTime: body.atime,
+          });
+          if (slot.blocked) {
+            plan = {
+              action: 'strip',
+              reason: 'confirmation_call_slot',
+              hour: null,
+              ghl_appointment_id: slot.appointment?.appointment_id || null,
+            };
+            console.log(`[LP-PROXY] ${mode === 'validate' ? 'stripped' : 'would strip'} appointment ${body.adate} ${body.atime} for ${body.lognumber}: GHL-only appointment ${plan.ghl_appointment_id} (Confirmation Call)`);
+          } else if (slot.reason === 'lookup_failed') {
+            console.warn(`[LP-PROXY] Confirmation Call slot check could not read GHL for ${body.lognumber} — forwarding the appointment (fail open)`);
+          }
+        }
+
         // 2026-09-14 (Change C, PREVENT half) — a body that survives the hour
         // checks can still be a SECOND live appointment on a day this contact
         // already holds, which double-counts one person across confirmed and
@@ -363,7 +389,9 @@ export function registerLpAddleadProxyRoutes(app) {
           }
         }
 
-        if (plan.action === 'strip') {
+        if (plan.action === 'strip' && plan.reason === 'confirmation_call_slot') {
+          if (mode === 'validate') outbound = stripAppointmentKeys(body);
+        } else if (plan.action === 'strip') {
           if (await claimAddleadNotice({ lognumber: body.lognumber, adate: body.adate, atime: body.atime, reason: plan.reason })) {
             await sendStripCard({ body, plan, mode });
           }
