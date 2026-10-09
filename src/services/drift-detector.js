@@ -61,7 +61,9 @@ import { emitEvent } from '../event-emitter.js';
 import { claimAlertConditionSet, confirmAlertSend } from '../alert-state.js';
 import { filterNew, recordPosted } from '../alert-posted.js';
 
-const ACTIVE_LP_DISPOSITIONS = ['Issued', 'Set', 'Cnf', 'Data', 'NOC', 'OPPFDN', '1Leg', 'BO'];
+// Exported (2026-10-07) so src/stale-lead-refresh.js's test can prove its open
+// set covers every code this detector reads as LP-active.
+export const ACTIVE_LP_DISPOSITIONS = ['Issued', 'Set', 'Cnf', 'Data', 'NOC', 'OPPFDN', '1Leg', 'BO'];
 const DRIFT_THRESHOLD_HOURS = 24;
 const SCAN_INTERVAL_MS = 30 * 60 * 1000;
 const INITIAL_DELAY_MS = 5 * 60 * 1000;

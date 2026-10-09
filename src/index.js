@@ -319,6 +319,7 @@ import { startOpsMorningDigestScheduler } from './jobs/ops-morning-digest.js';  
 import { startOfficePowerRankingScheduler } from './jobs/office-power-ranking.js';  // 2026-09-24
 import { startSaleBackstopScheduler } from './jobs/sale-announce-backstop.js';  // 2026-09-25
 import { startSaleP2BackstopScheduler } from './jobs/sale-p2-backstop.js';  // 2026-10-03 — every LP sale gets a P2 card
+import { startStaleLeadRefreshScheduler } from './jobs/stale-lead-refresh.js';  // 2026-10-07 — re-read open leads whose appointment passed
 import { startSaleContactBackstopScheduler } from './jobs/sale-contact-backstop.js';  // 2026-10-04 — every LP sale gets a GHL contact
 import { startMissedCallerRecoveryScheduler } from './jobs/missed-caller-recovery.js';  // 2026-09-24
 import { startNewLeadDialBackstopScheduler } from './jobs/new-lead-dial-backstop.js';  // 2026-10-05
@@ -954,6 +955,7 @@ const server = app.listen(PORT, async () => {
   startOfficePowerRankingScheduler();
   startSaleBackstopScheduler();
   startSaleP2BackstopScheduler();
+  startStaleLeadRefreshScheduler();
   startSaleContactBackstopScheduler();
   startMissedCallerRecoveryScheduler();
   startNewLeadDialBackstopScheduler();
