@@ -63,6 +63,18 @@ test('readRehashCallSlots: read for the rep the booking will name', async () => 
   assert.equal(seen[1].userId, 'rep2');
 });
 
+test('readRehashCallSlots: one opening in 48 hours → the two soonest in the 14 days', async () => {
+  const { spreadCallOffer } = await import('../src/knowledge/calendar-availability.js');
+  const r = await readRehashCallSlots({ contactId: 'c1', timezone: 'America/New_York', env: ENV }, {
+    getOwner: async () => null,
+    fetchFreeSlots: async () => ({ slots: ALL, timezone: 'America/New_York' }),
+    // The 48-hour window holds one time; the 14-day pool holds all four.
+    selectOfferableSlots: (av, _p, opts) => ({ slots: opts.maxOffer ? av.slots : av.slots.slice(0, 1) }),
+    spreadCallOffer, isOpen: () => true,
+  });
+  assert.deepEqual(r.offer.map(s => s.iso), [ALL[0].iso, ALL[1].iso]);
+});
+
 test('readRehashCallSlots: a failed read is null (the old reply), never a guess', async () => {
   const r = await readRehashCallSlots({ contactId: 'c1', timezone: 'America/New_York', env: ENV }, {
     getOwner: async () => null, fetchFreeSlots: async () => { throw new Error('GHL 500'); }, selectOfferableSlots: () => null, isOpen: () => true,
