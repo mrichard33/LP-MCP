@@ -756,6 +756,13 @@ function isBookableDisposition(disp) {
   return BOOKABLE_DISPOSITIONS.has(String(disp).trim().toUpperCase());
 }
 
+// The live LP disposition on a lead record (casing differs between LP's REST
+// and legacy shapes, same as findLeadByHLCID reads it). '' when absent.
+function leadDisposition(lead) {
+  if (!lead) return '';
+  return String(lead.Disposition || lead.disposition || lead.disp_code || '').trim();
+}
+
 function extractHLCID(leadRecord) {
   if (!leadRecord) return null;
   const v = leadRecord.lognumber
@@ -1006,7 +1013,7 @@ async function resolveLPLeadId(ghlContactId, contactInfo = {}, opts = {}) {
             const pid = String(prospect.ProspectID || prospect.prospectid || prospect.CstID || prospect.cst_id || candidate.lp_prospect_id || '');
             const { source: lpSource, detail: lpSourceDetail } = extractLpSource(target);
             console.log(`[LP-RESOLVE] ✅ Step 0a Supabase+lognumber: lds_id=${candidate.lp_lead_id}, prospect=${pid}, disp=${candidate.disposition_code}`);
-            return { ldsId: String(candidate.lp_lead_id), prospectId: pid, source: 'supabase_hlcid_validated', step: 0, lpSource, lpSourceDetail };
+            return { ldsId: String(candidate.lp_lead_id), prospectId: pid, source: 'supabase_hlcid_validated', step: 0, lpSource, lpSourceDetail, disp: leadDisposition(target) || candidate.disposition_code || '' };
           }
         }
       }
@@ -1032,7 +1039,7 @@ async function resolveLPLeadId(ghlContactId, contactInfo = {}, opts = {}) {
           const liveLognumber = extractHLCID(target);
           const { source: lpSource, detail: lpSourceDetail } = extractLpSource(target);
           console.log(`[LP-RESOLVE] ✅ Step 0b Supabase-link-trusted (no lognumber match required): lds_id=${candidate.lp_lead_id}, prospect=${pid}, disp=${disp}, lp_lognumber=${liveLognumber || '(empty)'} — trusting Supabase ghl_contact_id link`);
-          return { ldsId: String(candidate.lp_lead_id), prospectId: pid, source: 'supabase_link_trusted_bookable', step: 0, lpSource, lpSourceDetail };
+          return { ldsId: String(candidate.lp_lead_id), prospectId: pid, source: 'supabase_link_trusted_bookable', step: 0, lpSource, lpSourceDetail, disp: leadDisposition(target) || disp };
         }
       }
     }
@@ -1067,7 +1074,7 @@ async function resolveLPLeadId(ghlContactId, contactInfo = {}, opts = {}) {
             const pid = String(prospect.ProspectID || prospect.prospectid || prospect.CstID || prospect.cst_id || '');
             const { source: lpSource, detail: lpSourceDetail } = extractLpSource(target);
             console.log(`[LP-RESOLVE] ✅ Step 1 GHL field+lognumber: lds_id=${ghlLeadId}, prospect=${pid}`);
-            return { ldsId: ghlLeadId, prospectId: pid, source: 'ghl_field_plus_hlcid', step: 1, lpSource, lpSourceDetail };
+            return { ldsId: ghlLeadId, prospectId: pid, source: 'ghl_field_plus_hlcid', step: 1, lpSource, lpSourceDetail, disp: leadDisposition(target) };
           }
           console.warn(`[LP-RESOLVE] Step 1: GHL field lds_id=${ghlLeadId} lognumber mismatch (got ${hlcid || 'null'}, want ${ghlContactId})`);
         }
@@ -1109,6 +1116,7 @@ async function resolveLPLeadId(ghlContactId, contactInfo = {}, opts = {}) {
           step: 2,
           lpSource: best.lpSource || null,
           lpSourceDetail: best.lpSourceDetail || null,
+          disp: best.disp || '',
         };
       }
       // Step 2b — prospect-keyed link-trusted fallback. No lognumber match, but
@@ -1125,6 +1133,7 @@ async function resolveLPLeadId(ghlContactId, contactInfo = {}, opts = {}) {
           step: 2,
           lpSource: trusted.lpSource || null,
           lpSourceDetail: trusted.lpSourceDetail || null,
+          disp: trusted.disp || '',
         };
       }
       console.warn(`[LP-RESOLVE] Step 2: prospect ${webhookProspectId} has no lead with matching lognumber or bookable lead — falling through`);
@@ -1159,6 +1168,7 @@ async function resolveLPLeadId(ghlContactId, contactInfo = {}, opts = {}) {
           step: 3,
           lpSource: best.lpSource || null,
           lpSourceDetail: best.lpSourceDetail || null,
+          disp: best.disp || '',
         };
       }
     }
@@ -1192,6 +1202,7 @@ async function resolveLPLeadId(ghlContactId, contactInfo = {}, opts = {}) {
           step: 4,
           lpSource: best.lpSource || null,
           lpSourceDetail: best.lpSourceDetail || null,
+          disp: best.disp || '',
         };
       }
     }
@@ -1889,13 +1900,66 @@ async function lpAlreadyHasAppointment(contactId, incomingDateNorm, incomingTime
   return false;
 }
 
+/**
+ * True when this appointment lives on a GHL-only calendar (Confirmation Call)
+ * and so must never become an LP appointment. calendar_id is authoritative; the
+ * name is the same best-effort fallback executeSetLPAppointment uses for
+ * callers that only carry the name.
+ */
+export function isGhlOnlyAppointment({ calendarId, calendarName } = {}) {
+  if (calendarId && isGhlOnlyCalendarId(String(calendarId).trim())) return true;
+  return String(calendarName || '').trim().toLowerCase() === 'confirmation call';
+}
+
+/**
+ * Pure. Decide whether the resolved LP lead may take a SetAppointment.
+ *
+ * 2026-10-08 (contact 5YGVd3kh5IcY6pUJVcs4, LP lead 581695): Step 0a accepts a
+ * lognumber-matched lead in ANY disposition, so the parity watchdog wrote a
+ * phone call's time onto a post-demo OPPFDN lead and LP flipped it to Set.
+ * A lead whose disposition is known and not bookable (OPPFDN, Sale, CXL, DNC…)
+ * is a person's call, never ours. A BLANK disposition is unknown, not terminal:
+ * a lead minted minutes ago may not carry one in lp_leads yet, and refusing it
+ * would strand a real booking, so it proceeds as before.
+ */
+export function terminalDispositionDecision(disp) {
+  const d = disp == null ? '' : String(disp).trim();
+  if (!d) return { allow: true, reason: 'disposition_unknown' };
+  if (isBookableDisposition(d)) return { allow: true, reason: 'bookable' };
+  return { allow: false, reason: 'terminal_disposition', disposition: d };
+}
+
 async function syncAppointmentToLP({
   contactId, contactPhone, contactEmail, contactName,
   address1, city, state, postalCode,
   prospectId: webhookProspectId, inboundId, ghlLeadIdField,
-  appointmentDate, appointmentTime, calendarName,
-}) {
+  appointmentDate, appointmentTime, calendarName, calendarId,
+}, deps = {}) {
   if (!contactId) throw new Error('contact_id is required');
+
+  // deps seam (CLAUDE.md): the two guards below are tested without LP or GHL.
+  const _lpAlreadyHasAppointment = deps.lpAlreadyHasAppointment || lpAlreadyHasAppointment;
+  const _resolveLPLeadId = deps.resolveLPLeadId || resolveLPLeadId;
+  const _lpSetAppointment = deps.lpSetAppointment || lpSetAppointment;
+
+  // ── GHL-only calendar: never an LP appointment (2026-10-08) ──
+  // Confirmation Call is a phone touch, not the estimate visit. The executor
+  // already refused it (skipped_ghl_only_calendar), but this function had three
+  // callers that did not check, and the parity watchdog's auto-heal wrote the
+  // call's time onto LP lead 581695 (OPPFDN → Set); the LP→GHL reconciler then
+  // minted a Window Estimate at the same slot. Refuse here, before any LP read,
+  // so every caller is covered.
+  if (isGhlOnlyAppointment({ calendarId, calendarName })) {
+    console.log(`[LP-APPT] skipped_ghl_only_calendar for ${contactId} (calendar=${calendarId || calendarName}) — never synced to LP`);
+    return {
+      success: true,
+      action: 'skipped_ghl_only_calendar',
+      contact_id: contactId,
+      calendar_id: calendarId || null,
+      calendar_name: calendarName || null,
+      reason: 'GHL-only calendar — appointments on this calendar are never synced to LP',
+    };
+  }
 
   // ── Early idempotency: LP already holds this exact appointment ──
   // Catches field-set (SalesRabbit/canvassing) leads whose LP appt was
@@ -1904,7 +1968,7 @@ async function syncAppointmentToLP({
   // would fail every step and fire a false "manual action" card.
   const incomingDateNorm = normalizeDateForComparison(appointmentDate);
   const incomingTimeNorm = parseApptTime(appointmentTime);
-  if (await lpAlreadyHasAppointment(contactId, incomingDateNorm, incomingTimeNorm)) {
+  if (await _lpAlreadyHasAppointment(contactId, incomingDateNorm, incomingTimeNorm)) {
     console.log(`[LP-APPT] ⏭️ LP already holds appt on ${incomingDateNorm} for ${contactId} (per GHL LP-synced fields) — skipping resolver + SetAppointment`);
     // BOOKKEEPING ONLY — a tag, a tag-clear and a note. Nothing downstream
     // reads them synchronously, every one is idempotent, and the decision has
@@ -1933,7 +1997,7 @@ async function syncAppointmentToLP({
     };
   }
 
-  const resolution = await resolveLPLeadId(contactId, {
+  const resolution = await _resolveLPLeadId(contactId, {
     phone: contactPhone,
     email: contactEmail,
     address1,
@@ -2163,7 +2227,25 @@ async function syncAppointmentToLP({
     };
   }
 
-  const { ldsId, prospectId, source, step, lpSource, lpSourceDetail } = resolution;
+  const { ldsId, prospectId, source, step, lpSource, lpSourceDetail, disp } = resolution;
+
+  // ── Terminal-disposition guard (2026-10-08) — see terminalDispositionDecision.
+  // Before any write: no GHL field writeback, no dedup mark, no lp-appt-synced
+  // tag, no SetAppointment. The parity watchdog reads this as not_attempted.
+  const dispDecision = terminalDispositionDecision(disp);
+  if (!dispDecision.allow) {
+    console.warn(`[LP-APPT] ⛔ skipped_terminal_disposition for ${contactId}: lds_id=${ldsId} disp=${dispDecision.disposition} is not bookable — no SetAppointment (via ${source}, step ${step})`);
+    return {
+      success: false,
+      action: 'skipped_terminal_disposition',
+      contact_id: contactId,
+      lp_lead_id: ldsId,
+      lp_prospect_id: prospectId,
+      disposition: dispDecision.disposition,
+      resolution_source: source,
+      resolution_step: step,
+    };
+  }
 
   try {
     const fields = [{ id: LP_LEAD_ID_FIELD, field_value: ldsId }];
@@ -2255,7 +2337,7 @@ async function syncAppointmentToLP({
   }
 
   console.log(`[LP-APPT] Setting: lds_id=${ldsId}, date=${apptDate}, time=${apptTime}, via=${source} (step ${step})${lpSourceLine ? `, lpSrc="${lpSourceLine}"` : ', lpSrc=(absent)'}, calendar="${calendarName || '(absent)'}"`);
-  const result = await lpSetAppointment({ ldsId, setBy: LP_EMP.GHL_INTEGRATION, apptDate, apptTime });
+  const result = await _lpSetAppointment({ ldsId, setBy: LP_EMP.GHL_INTEGRATION, apptDate, apptTime });
 
   await writeApptSyncMark({ dedupKey, contactId, ldsId, apptDate, apptTime });
   await applyApptSyncedTag(contactId);
@@ -2633,8 +2715,9 @@ export function registerLPAppointmentSyncRoutes(app) {
       // Call): the "LP appointment" this webhook sets — A.CC-1 step 107 fires
       // it at call time — was only ever a Dial-ASAP queue entry. When enabled,
       // queue the callback in Five9 directly and skip lpSetAppointment
-      // entirely. Any Five9 failure falls back to the LP path below — a
-      // promised call is never silently dropped. Flag off / non-GHL-only
+      // entirely. Since 2026-10-08 a GHL-only calendar never reaches LP (see
+      // syncAppointmentToLP), so a Five9 failure pages #ops-alerts to queue the
+      // call by hand rather than falling back to LP. Flag off / non-GHL-only
       // calendar (A.WE / A.MV in-home syncs) → this block is inert and the
       // legacy path is byte-identical.
       if (calendarId && isGhlOnlyCalendarId(calendarId) && five9DispatchConfigured()) {
@@ -2663,15 +2746,21 @@ export function registerLPAppointmentSyncRoutes(app) {
             elapsed_ms: Date.now() - startTime,
           });
         } catch (err) {
-          console.error(`[LP-APPT] 🚨 FIVE9 DISPATCH FAILED for ${contactId} — falling back to LP Dial-ASAP path: ${err.message}`);
-          await sendGroupMeMessage(
-            `🚨 FIVE9 DISPATCH FAILED — fell back to LP Dial-ASAP\n` +
+          // 2026-10-08: there is no LP fallback any more. syncAppointmentToLP
+          // refuses every GHL-only calendar (a Confirmation Call written to LP
+          // flipped lead 581695 OPPFDN → Set), so a person must queue the call.
+          // Operational alarm → Slack #ops-alerts only (CLAUDE.md).
+          console.error(`[LP-APPT] 🚨 FIVE9 DISPATCH FAILED for ${contactId} — no LP fallback for GHL-only calendars: ${err.message}`);
+          await sendAlertMessage(
+            `🚨 FIVE9 DISPATCH FAILED — confirmation call NOT queued\n` +
             `👤 ${contactName || contactId}\n` +
+            `📅 ${appointmentDate} ${appointmentTime}\n` +
             `⚠️ ${String(err.message).slice(0, 300)}\n` +
-            `Callback WILL still fire via LP. Check Five9 permissions/config (FIVE9_CALLBACK_LIST/CAMPAIGN).`,
-            { flushNow: true }
+            `Confirmation calls are never written to LP, so nothing else will dial this. ` +
+            `Queue the call in Five9 by hand and check FIVE9_CALLBACK_LIST/CAMPAIGN.`,
+            { channel: 'ops' }
           ).catch(() => {});
-          // fall through to syncAppointmentToLP — the LP path is the safety net
+          // falls through to syncAppointmentToLP, which returns skipped_ghl_only_calendar
         }
       }
 
@@ -2680,7 +2769,7 @@ export function registerLPAppointmentSyncRoutes(app) {
         contactId, contactPhone, contactEmail, contactName,
         address1, city, state, postalCode,
         prospectId, inboundId, ghlLeadIdField,
-        appointmentDate, appointmentTime, calendarName,
+        appointmentDate, appointmentTime, calendarName, calendarId,
       });
 
       const budgetMs = apptSyncBudgetMs();

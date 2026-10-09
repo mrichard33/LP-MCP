@@ -245,30 +245,49 @@ function findLeadByLdsId(resp, ldsId) {
   return null;
 }
 
-export async function checkFieldDrift({ sample = FIELD_DRIFT_SAMPLE } = {}) {
+// 2026-10-07 — Only real leads go to LP, one short try each. Two junk rows
+// (lp_lead_id 'null' and 'test-smoke', no created_at_lp) sorted FIRST under
+// `created_at_lp DESC` (Postgres puts NULLs first), so every 30-minute run
+// opened with GetLead for ids LP cannot find. LP answers those with 500
+// "Execution Timeout Expired", not an empty result, and lpPost tried each
+// three times: ~95s of LP time per id, twice an hour, around the clock, all
+// swallowed by `errors++`. The rows are deleted
+// (sql/seeds/2026-10-07_remove_junk_lp_leads.sql); this keeps the next one
+// from doing the same, and names the unreadable ids so it cannot hide again.
+const LP_LEAD_ID_RX = /^\d+$/;
+
+export async function checkFieldDrift({ sample = FIELD_DRIFT_SAMPLE, deps = {} } = {}) {
+  const db = deps.supabase || supabase;
+  const fetchLead = deps.getLeadByLdsId || getLeadByLdsId;
+  const circuit = deps.getCircuitStatus || getCircuitStatus;
   try {
-    const { data: rows, error } = await supabase
+    const { data: fetched, error } = await db
       .from('lp_leads')
       .select('lp_lead_id, demo_completed, appointment_set, closed_won')
       // sql/135: a lead LP deleted can only time out on a live fetch.
       .is('lp_deleted_at', null)
-      .order('created_at_lp', { ascending: false })
+      .not('created_at_lp', 'is', null)
+      .order('created_at_lp', { ascending: false, nullsFirst: false })
       .limit(sample);
 
     if (error) return { status: 'error', error_message: error.message };
-    if (!rows || rows.length === 0) return { status: 'empty', sampled: 0, drifted: 0 };
+    const rows = (fetched || []).filter((r) => LP_LEAD_ID_RX.test(String(r.lp_lead_id ?? '')));
+    if (rows.length === 0) return { status: 'empty', sampled: 0, drifted: 0 };
 
     let sampled = 0;
     let drifted = 0;
     let errors = 0;
+    const unreadable = [];
     const examples = [];
 
     for (const row of rows) {
-      if (getCircuitStatus().circuitOpen) break; // LP failing — stop probing
+      if (circuit().circuitOpen) break; // LP failing — stop probing
       try {
-        const resp = await getLeadByLdsId(row.lp_lead_id);
+        // fast: one attempt with a short timeout. A spot-check can skip a
+        // lead; it must not spend LP's time retrying one LP cannot find.
+        const resp = await fetchLead(row.lp_lead_id, { fast: true });
         const lead = findLeadByLdsId(resp, row.lp_lead_id);
-        if (!lead) { errors++; continue; }
+        if (!lead) { errors++; unreadable.push(row.lp_lead_id); continue; }
         sampled++;
 
         const liveDemo    = deriveFlag(getField(lead, 'sat', 'Sat'));
@@ -292,7 +311,12 @@ export async function checkFieldDrift({ sample = FIELD_DRIFT_SAMPLE } = {}) {
         }
       } catch (err) {
         errors++;
+        unreadable.push(row.lp_lead_id);
       }
+    }
+
+    if (unreadable.length) {
+      console.warn(`[Freshness] drift probe: ${unreadable.length} lead(s) unreadable in LP — ids ${unreadable.join(', ')}`);
     }
 
     const drift_pct = sampled > 0 ? Math.round((drifted / sampled) * 100) : 0;
@@ -302,6 +326,7 @@ export async function checkFieldDrift({ sample = FIELD_DRIFT_SAMPLE } = {}) {
       drifted,
       drift_pct,
       errors,
+      unreadable,
       threshold: FIELD_DRIFT_LIMIT,
       examples,
     };

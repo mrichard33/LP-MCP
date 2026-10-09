@@ -43,6 +43,11 @@
 // timeout-bounded. The timeout is not optional garnish — with single-flight, a
 // hung login blocks every LP call in the process, so it must be able to fail.
 
+import { isTransientNetworkError, sleep } from './sync-utils.js';
+
+const TOKEN_RETRY_DELAYS_MS = [1000, 3000];
+const TOKEN_RETRYABLE_STATUS = new Set([502, 503, 504]);
+
 let cachedToken = null;
 let tokenExpiry = null;
 let refreshTimer = null;
@@ -122,21 +127,40 @@ const requestToken = async ({ username, password, label }) => {
 
   console.log(`[Token] Requesting ${label} token from ${baseUrl}/token...`);
 
+  // 2026-10-07 — A brief network blip ("fetch failed") or a 502/503/504 gets
+  // two more tries (1s, 3s). /n8n/enrich-lead failed outright on such blips,
+  // and a cold token cache puts this request in front of every LP call. A
+  // timeout is still NOT retried: under single-flight, every LP caller is
+  // waiting on this one request, and the timeout bound exists so it can fail.
   let res;
-  try {
-    res = await fetch(`${baseUrl}/token`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: params.toString(),
-      signal: AbortSignal.timeout(TOKEN_TIMEOUT_MS),
-    });
-  } catch (err) {
-    // A timeout/abort must surface as a normal failure so the breaker counts
-    // it and the next caller can retry, rather than hanging forever.
-    const reason = err?.name === 'TimeoutError' || err?.name === 'AbortError'
-      ? `timed out after ${TOKEN_TIMEOUT_MS}ms`
-      : err.message;
-    throw new Error(`[Token] ${label} request failed: ${reason}`);
+  for (let attempt = 0; ; attempt++) {
+    const canRetry = attempt < TOKEN_RETRY_DELAYS_MS.length;
+    try {
+      res = await fetch(`${baseUrl}/token`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: params.toString(),
+        signal: AbortSignal.timeout(TOKEN_TIMEOUT_MS),
+      });
+    } catch (err) {
+      if (canRetry && isTransientNetworkError(err)) {
+        console.warn(`[Token] ${label} network error (${err.cause?.code || err.message}) — retry ${attempt + 1}/${TOKEN_RETRY_DELAYS_MS.length} in ${TOKEN_RETRY_DELAYS_MS[attempt]}ms`);
+        await sleep(TOKEN_RETRY_DELAYS_MS[attempt]);
+        continue;
+      }
+      // A timeout/abort must surface as a normal failure so the breaker counts
+      // it and the next caller can retry, rather than hanging forever.
+      const reason = err?.name === 'TimeoutError' || err?.name === 'AbortError'
+        ? `timed out after ${TOKEN_TIMEOUT_MS}ms`
+        : err.message;
+      throw new Error(`[Token] ${label} request failed: ${reason}`, { cause: err.cause || err });
+    }
+    if (canRetry && TOKEN_RETRYABLE_STATUS.has(res.status)) {
+      console.warn(`[Token] ${label} returned ${res.status} — retry ${attempt + 1}/${TOKEN_RETRY_DELAYS_MS.length} in ${TOKEN_RETRY_DELAYS_MS[attempt]}ms`);
+      await sleep(TOKEN_RETRY_DELAYS_MS[attempt]);
+      continue;
+    }
+    break;
   }
 
   if (!res.ok) {

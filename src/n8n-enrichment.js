@@ -88,7 +88,7 @@
  */
 
 import { getToken } from './token-manager.js';
-import { normalizePhone, getField, extractArray } from './sync-utils.js';
+import { normalizePhone, getField, extractArray, isTransientNetworkError } from './sync-utils.js';
 import { latestJobValue } from './lp-job-value.js';
 import { contactHadDemo } from './demo-truth.js';
 import { withGhlToken } from './ghl-rate-limiter.js';
@@ -98,19 +98,45 @@ const GHL_API_KEY = process.env.GHL_API_KEY;
 
 // ─── LP API helpers ──────────────────────────────────────────────
 
-async function lpPost(path, params, token) {
+// 2026-10-07 — Retry transient network failures. Every LP call made here is a
+// read (GetCustomers3 / GetLead / GetLeadInfo), so retrying is safe.
+// Timeouts are NOT retried: one 60s timeout already exceeds GHL's 60s webhook
+// wait, so a retry could never finish in time and would only add load.
+// Defends against: 4 contacts failing "fetch failed" within 3s on 2026-10-06
+// 8:08 pm ET — one LP blip, and each contact was left unenriched.
+const LP_RETRY_DELAYS_MS = [1000, 3000];
+const LP_RETRYABLE_STATUS = new Set([502, 503, 504]);
+
+async function lpPost(path, params, token, { fetchImpl = fetch, delays = LP_RETRY_DELAYS_MS } = {}) {
   const body = new URLSearchParams(params).toString();
-  // rate-limiter-exempt: Lead Perfection API, not GHL.
-  const res = await fetch(`${LP_API_BASE}${path}`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/x-www-form-urlencoded',
-      'Authorization': `Bearer ${token}`,
-    },
-    body,
-    signal: AbortSignal.timeout(60000),
-  });
-  return res.json();
+  for (let attempt = 0; ; attempt++) {
+    const canRetry = attempt < delays.length;
+    try {
+      // rate-limiter-exempt: Lead Perfection API, not GHL.
+      const res = await fetchImpl(`${LP_API_BASE}${path}`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'Authorization': `Bearer ${token}`,
+        },
+        body,
+        signal: AbortSignal.timeout(60000),
+      });
+      if (canRetry && LP_RETRYABLE_STATUS.has(res.status)) {
+        console.warn(`[n8n/enrich] LP ${path} returned ${res.status} — retry ${attempt + 1}/${delays.length} in ${delays[attempt]}ms`);
+        await new Promise((r) => setTimeout(r, delays[attempt]));
+        continue;
+      }
+      return await res.json();
+    } catch (err) {
+      if (canRetry && isTransientNetworkError(err)) {
+        console.warn(`[n8n/enrich] LP ${path} network error (${err.cause?.code || err.message}) — retry ${attempt + 1}/${delays.length} in ${delays[attempt]}ms`);
+        await new Promise((r) => setTimeout(r, delays[attempt]));
+        continue;
+      }
+      throw err;
+    }
+  }
 }
 
 async function ghlGet(contactId) {
@@ -779,6 +805,7 @@ export function registerN8nEnrichRoute(app) {
       res.status(500).json({
         success: false,
         error: err.message,
+        error_cause: err.cause?.code || err.cause?.message || null,
         contact_id: req.body?.contact_id || '',
       });
     }
@@ -787,6 +814,8 @@ export function registerN8nEnrichRoute(app) {
 
 // Exported for unit tests + introspection (scripts/test-enrichment-prospect-verification.js)
 export const __testing = {
+  lpPost,
+  isTransientNetworkError,
   phoneKey,
   prospectPhoneKeys,
   prospectEmail,

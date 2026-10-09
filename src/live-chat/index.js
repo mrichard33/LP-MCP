@@ -378,7 +378,9 @@ async function bookSlot({ contactId, startIso, calendarId, decisionMakers = null
   const { executeActionById } = await import('../actions/index.js');
   const res = await executeActionById(data.id);
   const booked = res?.status === 'completed' && res?.result?.action === 'appointment_booked';
-  return { ok: booked, action_id: data.id, error: booked ? null : (res?.result?.action || res?.error || `status ${res?.status}`) };
+  // 2026-10-07: the GHL appointment id rides back, so the booking-truth check
+  // (booking-claim.js) reads a real id, not "ok".
+  return { ok: booked, action_id: data.id, appointment_id: booked ? (res?.result?.appointment_id || null) : null, error: booked ? null : (res?.result?.action || res?.error || `status ${res?.status}`) };
 }
 
 /**

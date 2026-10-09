@@ -69,6 +69,7 @@ import {
 import {
   parseSalesEfficiencyCsv, parseSalesEfficiencyPdf, resolveSalesEfficiencyMarkets,
   computeSalesEfficiencyTotals, validateSalesEfficiency,
+  isSalesEfficiencySetterLayout, parseSalesEfficiencySetterLayout, SE_LAYOUT_PARSER_VERSION,
 } from './lp-report-parse-sales-efficiency.js';
 import {
   parseApptStatsCsv, validateApptStatsCsv, sitRateBy, APPT_STATS_PARSER_VERSION,
@@ -361,7 +362,7 @@ export async function archiveUnstoredVariant({ reportType, variant, text, source
  * ingestReportPdf: content problems are logged + returned (never thrown),
  * infra failures throw and the route maps them to 5xx.
  */
-export async function ingestCsv({ reportType, text, source = 'manual', expectedTotals = null, expectedPeriod = null }) {
+export async function ingestCsv({ reportType, text, source = 'manual', expectedTotals = null, expectedPeriod = null, layout = false }) {
   const started = Date.now();
   if (!supabase) throw new Error('Supabase not configured');
   const buffer = Buffer.from(text, 'utf8');
@@ -565,7 +566,13 @@ export async function ingestCsv({ reportType, text, source = 'manual', expectedT
       // totals are identical — only the row label differs, and only By Market
       // gets resolved to a market. See REPORT_VARIANTS in lp-report-csv-common.
       const bySetter = reportType === 'sales_efficiency_by_setter';
-      parsed = parseSalesEfficiencyCsv(text, { variant: reportType });
+      // `layout`: the PRINTED By Setter page saved as CSV (LP's viewer exports
+      // it as .xls), not the data export. Same rows out, checked against the
+      // page's own printed Total. See parseSalesEfficiencySetterLayout.
+      parsed = layout && bySetter
+        ? parseSalesEfficiencySetterLayout(text)
+        : parseSalesEfficiencyCsv(text, { variant: reportType });
+      if (layout && bySetter) parserVersion = SE_LAYOUT_PARSER_VERSION;
       const v = validateSalesEfficiency(parsed, { expectedTotals, todayIso: todayET() });
       if (!v.ok) {
         return await fail(v.violations[0].rule, { violations: v.violations },
@@ -595,7 +602,10 @@ export async function ingestCsv({ reportType, text, source = 'manual', expectedT
       }
       rows = parsed.rows;
       controlTotals = expectedTotals ?? computeSalesEfficiencyTotals(parsed.rows, parsed.mode);
-      extraDetail = { ...extraDetail, mode: parsed.mode, reconciliations: v.reconciliations };
+      extraDetail = {
+        ...extraDetail, mode: parsed.mode, reconciliations: v.reconciliations,
+        ...(layout && bySetter ? { format: 'printed_layout' } : {}),
+      };
     } else if (reportType === 'jobs_by_milestone') {
       parsed = parseMilestoneCsv(text);
       const v = validateMilestoneCsv(parsed);
@@ -1223,8 +1233,18 @@ export function registerLpCsvRoutes(app) {
         // pass, and a 20MB export should not be tokenised twice to learn two
         // things about it.
         let resolved, variant;
+        let grid;
+        try { grid = parseCsv(req.body); } catch { grid = []; }
+        // The PRINTED By Setter page has no field-name header to fingerprint:
+        // it is recognised by its title and column labels instead. Outside the
+        // try below, so an infrastructure throw stays a 5xx (n8n replays it)
+        // instead of reading as an unknown fingerprint.
+        if (isSalesEfficiencySetterLayout(grid)) {
+          const source = String(req.query.source || 'manual');
+          const result = await ingestCsv({ reportType: 'sales_efficiency_by_setter', text: req.body, source, layout: true });
+          return res.json({ ...result, report_type: 'sales_efficiency_by_setter', lp_report_id: '137', variant: 'by setter', format: 'printed_layout' });
+        }
         try {
-          const grid = parseCsv(req.body);
           resolved = detectReportFromHeader(grid[0] ?? []);
           variant = resolveVariant(resolved.reportType, grid[0] ?? [], grid[1] ?? []);
         } catch (err) {

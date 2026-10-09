@@ -471,6 +471,21 @@ export const JOBS = Object.freeze([
     enabledDefault: true,
     isEnabled: (env) => String(env.INBOUND_CAPTURE_MODE || 'shadow').toLowerCase().trim() !== 'off',
   },
+  {
+    // 2026-10-08 (the user): a live conversation pauses the GHL drips
+    // (pause-workflow), and 24 quiet hours resume them. Rewritten from the
+    // old fizzle sweep, which never released anyone. A MODE: off | shadow |
+    // live, default shadow (shadow reports what it would pause and release).
+    // Mirrors conversationPauseMode() in src/agentic/conversation-pause.js:
+    // anything but 'off' runs.
+    id: 'pause-workflow-sweep',
+    label: 'Conversation pause: release quiet drips',
+    group: 'ghl',
+    cadence: 'every 5 min',
+    enabledEnv: 'CONVERSATION_PAUSE_MODE',
+    enabledDefault: true,
+    isEnabled: (env) => String(env.CONVERSATION_PAUSE_MODE || 'shadow').toLowerCase().trim() !== 'off',
+  },
 ]);
 
 /** Ids only — handy for tests and for asserting the wiring matches the roster. */
