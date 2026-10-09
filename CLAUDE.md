@@ -219,6 +219,18 @@ and an LP re-set. Now:
   (`skipped_rehash_no_calendar`). A lead not in rehash is never booked on Rehash Call (`skipped_not_rehash`).
 - `REHASH_ROUTING_MODE` off|shadow|live, default shadow (`rehash.would_*` events only). The LP lock is not behind it.
 
+**A post-demo lead is planned as post-demo, never as a new lead (Mark, 2026-10-09).** Five rehash threads got a stock
+discovery question after "Thank you I will.", two slot offers to "Follow up in November please.", a question after "Enjoy
+your week." and "Congratulations" to a lead who signed elsewhere: `planNepqTurn` never knew, and `enforceNepqPlan` step 7
+appended `DISCOVERY_QUESTIONS`. Now `planNepqTurn({ postDemo, rehashRep })` (rehash, or `derivePostAppointment`) plans,
+after the hand-offs: `competitor_signed` (`PURCHASED_ELSEWHERE_RX`, `src/agentic/purchased-elsewhere.js`, the same text as
+rules 173/356, which own the routing: change them together), `defer` (`detectDeferral` in `src/agentic/post-demo-turn.js`:
+confirm the date, no question, no time), a pending deferral (no times until it is due), `post_demo_ack` (at most one
+`POST_DEMO_QUESTIONS` question) or `post_demo`; booking is off and the rep call stays allowed. The enforcer drops the
+pre-demo questions on a post-demo plan and never appends a question after a sign-off line (`isSignOffLine`). A confirmed
+date is filed after the send (`src/services/post-demo-followup-io.js`: GHL task for the first `REHASH_TEAM_USER_IDS` id,
+`followup-requested`, a note; once per date). `POST_DEMO_PLANNER_MODE` off|shadow|live, default shadow (`[PostDemo] shadow`).
+
 **A held appointment asks a person to import its LP row (2026-10-05).** When LP already has an unimported
 inbound row for a contact, `syncAppointmentToLP` holds the appointment (`lp-appt-deferred`) rather than add a
 duplicate lead, and the parity watchdog re-drives it every 30 min. LP has no API that imports a row, so once a

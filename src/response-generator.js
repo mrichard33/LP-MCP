@@ -398,6 +398,7 @@ import { contactRecheckLine, recheckHint, RECHECK_RX } from './agentic/contact-c
 import { smsBookingTurn, enforceBookingFacts, bookingFactsNote } from './agentic/sms-booking-turn.js';
 import { LINES as NEPQ_LINES } from './agentic/nepq-planner.js';
 import { isCustomerP2 } from './agentic/lead-state/signals/context-reader.js';
+import { postDemoPlannerMode } from './agentic/post-demo-turn.js';
 import { planNepqTurn, enforceNepqPlan, referenceRetryNote, nepqBackboneMode, prefersCall as nepqPrefersCall, objectionType as nepqObjectionType, TIME_REQUEST_RX as NEPQ_TIME_REQUEST_RX, SCHEDULE_ASK_RX as NEPQ_SCHEDULE_ASK_RX,REPEAT_COMPLAINT_RX as NEPQ_REPEAT_COMPLAINT_RX, bookingOpenInThread as nepqBookingOpenInThread, dropUnaskedCallOffer, leadWantsCall as nepqLeadWantsCall, isServiceCallback as nepqIsServiceCallback } from './agentic/nepq-planner.js';
 import {
   planServiceAreaTurn, resolveCoverage, coverageHint, guardCoverageDraft, serviceAreaRecord, coverageOwnsReply,
@@ -3931,7 +3932,13 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       // 2026-10-07 (Nicholas): one definition of "on the calendar" for the
       // planner and both booking-claim checks (booking-claim.js).
       const hasAppointment = !!appointmentOnFile({ upcomingAppointments, lp: context.lp });
-      nepqPlan = planNepqTurn({
+      // 2026-10-09 (Mark): a post-demo lead (rehash, or past the appointment)
+      // is planned as post-demo, never as a new lead. POST_DEMO_PLANNER_MODE
+      // shadow plans it both ways and logs; live uses the post-demo plan.
+      const pdMode = (opts.dryRun === true && opts.postDemoModeOverride) ? opts.postDemoModeOverride : postDemoPlannerMode();
+      const postDemoLead = pdMode !== 'off' && (!!rehash || derivePostAppointment(context, opts.contextSnapshot).post);
+      const rehashRep = rehash?.repName || null;
+      const planArgs = {
         channel: 'sms',
         trigger: triggerMessage,
         conversation: context.conversation_recent || [],
@@ -3946,7 +3953,16 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
         isCustomer: isCustomerP2(context),
         // The classifier read a call request: the planner's callback hand-off.
         callbackRequested: String(classification?.intent_class || '').toUpperCase() === 'CALLBACK',
-      });
+      };
+      nepqPlan = planNepqTurn({ ...planArgs, postDemo: pdMode === 'live' && postDemoLead, rehashRep });
+      if (pdMode === 'shadow' && postDemoLead) {
+        try {
+          const would = planNepqTurn({ ...planArgs, postDemo: true, rehashRep });
+          console.log(`[PostDemo] shadow ${contactId}: would plan ${would.step}${would.deferral ? ` (follow up ${would.deferral.label})` : ''} (live plan ${nepqPlan.step})`);
+        } catch (pdErr) {
+          console.warn(`[PostDemo] shadow plan failed for ${contactId}: ${pdErr.message}`);
+        }
+      }
       if (nepqMode === 'live' && discipline) discipline = { ...discipline, booking: nepqPlan.booking };
     } catch (err) {
       console.warn(`[ResponseGenerator] NEPQ plan failed for ${contactId} (continuing without it): ${err.message}`);
@@ -4658,6 +4674,10 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       }
       if (!nepqPlan.booking.allowed && validated.companion_action?.action_type === 'book_appointment') validated.companion_action = null;
       if (nepqPlan.handoff) validated.nepq_handoff = { reason: nepqPlan.handoff.reason, extra: nepqPlan.handoff.extra || null };
+      // A confirmed follow-up date is filed for a person after the send
+      // (post-demo-followup-io.js). Never on a dry run.
+      if (nepqPlan.post_demo) validated.nepq_plan.post_demo = true;
+      if (nepqPlan.deferral && !dryRun) validated.post_demo_deferral = { ...nepqPlan.deferral };
       const recentOut = (context.conversation_recent || []).filter(m => String(m?.direction || '').toLowerCase() === 'outbound').slice(-8).map(m => String(m?.text ?? m?.body ?? ''));
       // 2026-10-02 (Mark): an email that cannot be right gets one friendly
       // re-check (contact-check.js). SMS already has their number.
