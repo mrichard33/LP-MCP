@@ -307,3 +307,82 @@ test('every action the sync modules can RETURN is enumerated in classifyHealResu
     + '(or to ROUTE_ONLY above, with the route line quoted, if it is an HTTP response '
     + 'the watchdog can never receive): ' + unenumerated.join(', '));
 });
+
+// ═══════════════════════════════════════════════════════════════════
+// 6. GHL-only calendars are not in the book — 2026-10-08
+// ═══════════════════════════════════════════════════════════════════
+//
+// Contact 5YGVd3kh5IcY6pUJVcs4's only GHL appointment was a Confirmation Call
+// (JrH56gkBz5uluIHqRUor, calendar gFWoSQrlKIdfRbAPV842). Class A read it as "LP
+// is missing the estimate" and auto-healed it into LP lead 581695, flipping
+// OPPFDN → Set. These run the real bucketGhlBook and feed it to a real sweep.
+
+const { bucketGhlBook } = __testing;
+const CONF_CALL_CAL = 'gFWoSQrlKIdfRbAPV842';
+const WE_CAL = 'aJj14ONxh1oFyDcQ706O';
+
+test('bucketGhlBook drops Confirmation Call rows, active or cancelled', () => {
+  const t = soon();
+  const { active, cancelled } = bucketGhlBook([
+    { ghl_contact_id: '5YGVd3kh5IcY6pUJVcs4', ghl_appointment_id: 'JrH56gkBz5uluIHqRUor', status: 'new', start_time: t, ghl_calendar_id: CONF_CALL_CAL },
+    { ghl_contact_id: 'c-cancelled-call', ghl_appointment_id: 'x', status: 'cancelled', start_time: t, ghl_calendar_id: CONF_CALL_CAL },
+  ]);
+  assert.equal(active.size, 0, 'a phone call is never the appointment LP should hold');
+  assert.equal(cancelled.size, 0, 'nor a cancellation LP should mirror');
+});
+
+test('an earlier Confirmation Call never stands in for the estimate', () => {
+  const early = new Date(Date.now() + 1 * 86400000).toISOString();
+  const later = new Date(Date.now() + 3 * 86400000).toISOString();
+  const { active } = bucketGhlBook([
+    { ghl_contact_id: 'c1', ghl_appointment_id: 'call', status: 'new', start_time: early, ghl_calendar_id: CONF_CALL_CAL },
+    { ghl_contact_id: 'c1', ghl_appointment_id: 'we', status: 'new', start_time: later, ghl_calendar_id: WE_CAL },
+  ]);
+  assert.equal(active.get('c1').ghl_appointment_id, 'we');
+});
+
+test('the watchdog ignores a Confirmation Call: no Class A sync, no confirmation_drift', async () => {
+  const t = soon();
+  const old = new Date(Date.now() - 2 * 86400000).toISOString(); // past the Class B grace period
+  const ghl = bucketGhlBook([
+    { ghl_contact_id: '5YGVd3kh5IcY6pUJVcs4', ghl_appointment_id: 'JrH56gkBz5uluIHqRUor', status: 'new', start_time: t, ghl_calendar_id: CONF_CALL_CAL },
+    { ghl_contact_id: 'c-confirmed-lp', ghl_appointment_id: 'call-2', status: 'new', start_time: t, ghl_calendar_id: CONF_CALL_CAL },
+  ]);
+  // LP holds a CONFIRMED estimate for the second contact. Its only GHL row is a
+  // call, so comparing the two would be confirmation_drift against a phone call.
+  const lpActive = new Map([['c-confirmed-lp', {
+    ghl_contact_id: 'c-confirmed-lp', lp_lead_id: '1', disposition_code: 'Cnf',
+    appointment_confirmed: true, appointment_date: t, created_at_lp: old, updated_at_lp: old,
+  }]]);
+
+  let syncCalls = 0;
+  const summary = await runAppointmentParityWatchdog({
+    dryRun: false,
+    deps: {
+      readGhlBook: async () => ghl,
+      readLpBook: async () => ({ active: lpActive, resolved: new Map() }),
+      getGHLContact: async () => ({ tags: [] }),
+      syncAppointmentToLP: async () => { syncCalls++; return { action: 'lp_appointment_set' }; },
+      fetchUpcomingAppointments: async () => [
+        { appointment_id: 'call-2', status: 'new', start_time: t, calendar_id: CONF_CALL_CAL },
+      ],
+      emitEvent: async () => ({ id: 1 }),
+      claimAlertConditionSet: async () => ({ ok: true, newlyFiring: [], cleared: [] }),
+      confirmAlertSend: async () => ({ ok: true }),
+      send: async () => ({ sent: true }),
+    },
+  });
+
+  assert.equal(syncCalls, 0, 'the incident: Class A wrote the call into LP');
+  assert.equal(summary.counts.lp_missing_appointment, 0);
+  assert.equal(summary.counts.confirmation_drift, 0);
+  assert.equal(summary.counts.ghl_missing_cache_stale, 0,
+    'a live Confirmation Call is not the estimate GHL is missing');
+  assert.equal(summary.counts.ghl_missing_appointment, 1,
+    'GHL really is missing the estimate LP holds, so it still escalates');
+});
+
+test('the new sync refusals count as not_attempted, never a heal', () => {
+  assert.equal(classifyHealResult({ action: 'skipped_ghl_only_calendar' }), 'not_attempted');
+  assert.equal(classifyHealResult({ action: 'skipped_terminal_disposition' }), 'not_attempted');
+});

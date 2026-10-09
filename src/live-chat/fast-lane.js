@@ -55,8 +55,10 @@ import { buildEstablishedFacts } from '../agentic/established-facts.js';
 import { humanizeReply, restoreQuestionMark } from '../agentic/human-voice.js';
 import { enforceTeamVoice } from '../agentic/team-voice.js';
 import { enforcePropertyScope } from '../agentic/property-scope.js';
-import { enforceCallTiming, promisedCallback } from '../agentic/team-hours.js';
-import { rewriteBookingClaims } from '../agentic/booking-claim.js';
+import { enforceCallTiming, promisedCallback, isTeamOpen } from '../agentic/team-hours.js';
+import { rewriteBookingClaims, appointmentOnFile, checkBookingTruth, bookingResult, noPromiseHandoffLine } from '../agentic/booking-claim.js';
+import { enforceCancelledVisit } from '../agentic/cancelled-visit.js';
+import { lpNoteDqMode } from '../agentic/lp-note-dq.js';
 import { enforceOneAsk } from '../agentic/one-ask.js';
 import { looksLikeShortPhone } from '../agentic/contact-typos.js';
 import { planNepqTurn, enforceNepqPlan, referenceRetryNote, nepqBackboneMode, pickFresh, LINES as NEPQ_LINES, isServiceCallback, dropUnsafeLines, leadWantsCall } from '../agentic/nepq-planner.js';
@@ -931,7 +933,7 @@ export function createLiveChatFastLane(deps) {
     // ── service area, zip first (Mark's ruling 4, 2026-10-01) ──
     // The plan is pure; the lookup runs beside classification and the KB pack
     // under its own 800ms cap, fail-soft to "a team member will confirm".
-    let saPlan = planServiceAreaTurn({ trigger: body, conversation: context.conversation_recent });
+    let saPlan = planServiceAreaTurn({ trigger: body, conversation: context.conversation_recent, fileZip: context.lead_facts?.property?.zip || null });
     // A cancel or Spanish turn is that flow's, never a coverage question.
     if (planOverride) saPlan = { ...saPlan, active: false };
     // 2026-10-02: an address typed for a held visit is the answer we asked
@@ -1024,7 +1026,7 @@ export function createLiveChatFastLane(deps) {
       const realFirst = hasNameOnRecord ? String(context.lead?.first_name || context.lead?.name || '').trim().split(/\s+/)[0] || null : null;
       const planInput = {
         channel: 'livechat', trigger: body, conversation: context.conversation_recent, firstName: realFirst,
-        hasAppointment: context.lp?.appointment_set === true && context.lp?.appointment_is_past !== true,
+        hasAppointment: !!appointmentOnFile({ upcomingAppointments, lp: context.lp }),
         nextStepLabel: 'a free visit at your home', discipline, nowMs: d.now(),
         // A customer's call request goes to service (Mark, 2026-10-03).
         isCustomer: isCustomerP2(context),
@@ -1194,7 +1196,7 @@ export function createLiveChatFastLane(deps) {
       if (reference) {
         const voiced = humanizeReply(restoreQuestionMark(message).text);
         const facts = reference.facts || null;
-        const hasApptRef = context.lp?.appointment_set === true && context.lp?.appointment_is_past !== true;
+        const hasApptRef = !!appointmentOnFile({ upcomingAppointments, lp: context.lp });
         const claimRef = rewriteBookingClaims(voiced.text, { booked: !!facts?.book || !!reference.booked, held: !!facts && (facts.kind === 'hold' || facts.kind === 'collect'), hasAppointment: hasApptRef, replacement: nextStepLine({ bridgeUsed: !!nepqPlan?.counters?.bridge_used }) });
         if (claimRef.changed) d.log(`[LiveChat] false_schedule_claim_fixed ${contactId}: unbacked booking or hold claim rewritten`);
         const typedRef = visitorTexts.join(' \n ');
@@ -1247,7 +1249,7 @@ export function createLiveChatFastLane(deps) {
       // time (runNepqFixedMove), never here (2026-10-02, Mark Test; Oct 2 6:12
       // PM chat). A claim naming the appointment already on file stands. Runs
       // before the one-ask pass so its replacement line is the one ask left.
-      const hasAppt = context.lp?.appointment_set === true && context.lp?.appointment_is_past !== true;
+      const hasAppt = !!appointmentOnFile({ upcomingAppointments, lp: context.lp });
       const claim = rewriteBookingClaims(flow.fixed, { booked: false, held: false, hasAppointment: hasAppt, ...(nepqLive ? { replacement: nextStepLine({ bridgeUsed: !!nepqPlan?.counters?.bridge_used }) } : {}) });
       if (claim.changed) d.log(`[LiveChat] false_schedule_claim_fixed ${contactId}: unbacked booking or hold claim rewritten`);
       // With NEPQ off (the rollback switch) there is no plan, but the money,
@@ -1312,6 +1314,52 @@ export function createLiveChatFastLane(deps) {
       d.opsAlert(`🏢 LIVE CHAT — LARGE JOB SIGNAL\nContact: ${contactId}\nThey said: "${body.slice(0, 200)}"\nSignal: ${largeJob || 'model-flagged'}\n→ Needs a person to follow up.`).catch(() => {});
     }
 
+    // ── booking truth + cancelled visit (2026-10-07, Nicholas) ──
+    // The last word on a time claim: only this turn's real booking, or the
+    // appointment still on the calendar at that time (booking-claim.js). A
+    // blocked claim becomes the no-promise hand-off, which the promise check
+    // below files to Five9. Then a cancelled visit is never "your visit".
+    {
+      const rec = reference?.facts?.record || null;
+      const bookedNow = !!reference?.facts?.book || !!reference?.booked;
+      const result = bookedNow ? bookingResult({
+        booked: true,
+        // The cancel flow's move and a shadow would_book carry no GHL id; both
+        // are code-confirmed outcomes (appointment_moved / not sent at all).
+        appointment_id: rec?.appointment_id || (rec?.action_id ? `action:${rec.action_id}` : (reference?.booked ? 'moved' : (rec?.booking === 'would_book' ? 'shadow' : null))),
+        start_time: rec?.start || null,
+        source: 'live_chat',
+      }) : null;
+      const verdict = checkBookingTruth(draft, {
+        result,
+        existing: appointmentOnFile({ upcomingAppointments, lp: context.lp, nowMs: d.now() }),
+        held: !!reference?.facts && (reference.facts.kind === 'hold' || reference.facts.kind === 'collect'),
+        nowMs: d.now(),
+      });
+      if (!verdict.allowed) {
+        d.warn(`[LiveChat] booking_claim_blocked ${contactId}: ${verdict.reason} — "${String(verdict.sentence || '').slice(0, 160)}" → no-promise hand-off`);
+        draft = noPromiseHandoffLine(leadFirstName, { teamOpen: isTeamOpen(d.now()) });
+        guard.booking_claim_blocked = { reason: verdict.reason, sentence: String(verdict.sentence || '').slice(0, 300) };
+      }
+      // A team note says we cannot run this lead (lp-note-dq.js): no time,
+      // no booking, the no-promise hand-off; the promise check below files
+      // the Five9 callback and the #contact-center card.
+      if (context.lead_facts?.note_dq && lpNoteDqMode() === 'live' && !bookedNow) {
+        d.warn(`[LpNoteDq] live chat ${contactId}: note says ${context.lead_facts.note_dq.signal} — no-promise hand-off`);
+        draft = noPromiseHandoffLine(leadFirstName, { teamOpen: isTeamOpen(d.now()) });
+        guard.lp_note_dq = context.lead_facts.note_dq.signal;
+      }
+      const cancelled = enforceCancelledVisit(draft, {
+        facts: context.lead_facts || null,
+        booked: bookedNow,
+        outboundTexts: (context.conversation_recent || []).filter(m => String(m?.direction || '').toLowerCase() === 'outbound').map(m => String(m?.text ?? m?.body ?? '')),
+      });
+      if (cancelled.changed) {
+        d.log(`[CancelledVisit] live chat ${contactId} upcoming-visit sentence replaced`);
+        draft = cancelled.text;
+      }
+    }
+
     // ── a promised call is filed for real (Mark, 2026-10-03) ──
     // The Five9 Callback Request list + #contact-center (bot-callback.js).
     // A promise the planner did not choose is backed; a callback promised
@@ -1350,6 +1398,8 @@ export function createLiveChatFastLane(deps) {
         regenerated,
         discipline_notes: guard.notes.length,
         time_offers_removed: !!guard.time_offers_removed,
+        booking_claim_blocked: guard.booking_claim_blocked || null,
+        lp_note_dq: guard.lp_note_dq || null,
         flow_notes: guard.flow_notes || 0,
         price_turn: pricePlan ? { asks: pricePlan.asks, insist: false, deterministic: false } : null,
         frustrated,
@@ -1620,7 +1670,7 @@ export function createLiveChatFastLane(deps) {
       }
       if (res?.ok) {
         const reply = NEPQ_LINES.confirm(chosen, tz, name);
-        const record = { booking: 'booked', start: chosen.iso, action_id: res.action_id || null };
+        const record = { booking: 'booked', start: chosen.iso, action_id: res.action_id || null, appointment_id: res.appointment_id || null };
         return { reply, record, skipCapture: true, facts: factsFor('book', { book: true, fallback: reply, record }), firstName: name };
       }
       // GHL still refused (a real failure, not a missing detail): a person

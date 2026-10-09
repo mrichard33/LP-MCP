@@ -62,9 +62,14 @@ const CHANGE_CHANNELS = {
  * because it blocks — whether a lift may clear it is a separate question
  * (detectCarrierStop).
  */
+// 2026-10-07: stop-bot is NOT here (the user: "stop-bot should not have
+// anything to do with dnc. This tag is intended to stop all bot
+// communication"). A contact with only stop-bot is not blocked from calls,
+// so it never gets a DNC-lift card; mayMessage's BOT_STOP class keeps the
+// bot quiet.
 export const DNC_FAMILY_TAGS = Object.freeze([
   'dnc', 'dnc-sms', 'dnc-voice', 'dnc-email', 'stage:dnc', 'p3:dnc', 'lp-dnc', 'do-not-contact',
-  'loss-reason:dnc', 'stop-bot', 'suppress:dnc-reply', 'suppress:dnc-voice',
+  'loss-reason:dnc', 'suppress:dnc-reply', 'suppress:dnc-voice',
 ]);
 
 export function consentModelMode(env = process.env) {

@@ -71,7 +71,13 @@ export const P3_STAGE_TAGS = Object.freeze({
 const KNOWN_P3 = new Set(Object.values(P3_STAGE_TAGS).flatMap((s) => s.p3));
 const KNOWN_LOSS = new Set(Object.values(P3_STAGE_TAGS).flatMap((s) => s.lossReason));
 
-export const RULE_IDS = Object.freeze(['R1', 'R2', 'R3', 'R4', 'R4b', 'R5', 'R6']);
+export const RULE_IDS = Object.freeze(['R1', 'R2', 'R3', 'R4', 'R4b', 'R5', 'R6', 'R7']);
+
+/**
+ * A drip enrollment tag: `active-<code>` (active-f.0, active-w8.0, active-s2.2).
+ * `active-entry:*` is an entry-source marker, not a drip, and never matches.
+ */
+export const DRIP_TAG_RE = /^active-(?!entry:)[a-z0-9][a-z0-9.\-]*$/i;
 
 const norm = (t) => (typeof t === 'string' ? t.trim().toLowerCase() : '');
 
@@ -118,7 +124,7 @@ function resolveFamily(familyTags, allowed, known, label) {
 }
 
 /**
- * Evaluate R1–R6 against a contact's LIVE tags.
+ * Evaluate R1–R7 against a contact's LIVE tags.
  *
  * @param {object} input
  * @param {string[]} input.tags            live tags
@@ -127,9 +133,11 @@ function resolveFamily(familyTags, allowed, known, label) {
  *        Only consulted when needsLpVerdict(tags).
  * @param {Array<{id: string, pipelineStageId: string}>|null} [input.openP3Opps]
  *        open P3 opportunities, or null = could not read. Only consulted when needsOpenP3(tags).
+ * @param {Set<string>|null} [input.retiredDripTags]
+ *        lower-cased drip tags no published workflow adds (R7). null = unknown, R7 skipped.
  * @returns {Array<{ rule: string, action: 'remove'|'needs_review'|'skipped', tags: string[], reason?: string }>}
  */
-export function evaluateTagRules({ tags, lp = null, openP3Opps = null } = {}) {
+export function evaluateTagRules({ tags, lp = null, openP3Opps = null, retiredDripTags = null } = {}) {
   const list = (tags || []).filter((t) => typeof t === 'string' && t.trim());
   const has = (tag) => list.some((t) => norm(t) === tag);
   const decisions = [];
@@ -199,6 +207,18 @@ export function evaluateTagRules({ tags, lp = null, openP3Opps = null } = {}) {
     if (fam.length > 1) {
       decisions.push({ rule: 'R6', action: 'needs_review', tags: fam, reason: `multiple_${prefix.slice(0, -1)}` });
     }
+  }
+
+  // R7 — a retired drip tag (2026-10-08, the user: "our leads are not carrying
+  // stale tags"). The caller passes the drip tags no PUBLISHED GHL workflow adds
+  // any more (old names from before the W→E/F/O/S rename: active-w03,
+  // active-w5.2, active-w11.1, active-w11.2). Nothing can be running under a tag
+  // nothing adds, so it is deterministic. null = the caller could not build the
+  // set: R7 does nothing (fail closed — an empty read must never retire a live
+  // drip's tag).
+  if (retiredDripTags instanceof Set && retiredDripTags.size) {
+    const retired = list.filter((t) => DRIP_TAG_RE.test(t.trim()) && retiredDripTags.has(norm(t)));
+    if (retired.length) decisions.push({ rule: 'R7', action: 'remove', tags: retired, reason: 'retired_drip_tag' });
   }
 
   // Protected tags are never removed — final filter, applied to every rule.

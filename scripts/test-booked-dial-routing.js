@@ -147,16 +147,24 @@ test('a move from 2nd Day to Next Day is due once both adds completed', () => {
   assert.equal(confMoveDue({ route: { addList: 'Conf - 2nd Day' }, addRows: both, moveClaimed: false, cfg }), false);
 });
 
-test('backstop holds 3+ day visits ONLY while booked routing is live (#2)', () => {
+test('backstop leaves EVERY booked visit to booked routing ONLY while it is live (2026-10-08)', () => {
   const nowMs = edt('2026-10-06T16:00:00');
   const appt = { hasAppt: true, apptDateEt: '2026-10-11', apptStartMs: null, nowMs };
+  const live = backstopConfig({ BOOKED_DIAL_ROUTING_MODE: 'live' });
   assert.equal(routeList({ ...appt, cfg: backstopConfig({}) }).list, 'Conf - 2nd Day', 'shadow (default): unchanged');
   assert.equal(routeList({ ...appt, cfg: backstopConfig({ BOOKED_DIAL_ROUTING_MODE: 'shadow' }) }).list, 'Conf - 2nd Day');
   assert.equal(routeList({ ...appt, cfg: backstopConfig({ BOOKED_DIAL_ROUTING_MODE: 'off' }) }).list, 'Conf - 2nd Day');
-  assert.equal(routeList({ ...appt, cfg: backstopConfig({ BOOKED_DIAL_ROUTING_MODE: 'live' }) }).skip, 'appt_held_for_booked_routing');
-  // Two days out is still the backstop's to push, live or not.
-  const two = { ...appt, apptDateEt: '2026-10-08' };
-  assert.equal(routeList({ ...two, cfg: backstopConfig({ BOOKED_DIAL_ROUTING_MODE: 'live' }) }).list, 'Conf - 2nd Day');
+  // Live: today, tomorrow, two days and 3+ days all go to booked routing —
+  // LP leads 582143 / 582149 were added to the same Conf list by both jobs.
+  for (const d of ['2026-10-06', '2026-10-07', '2026-10-08', '2026-10-11']) {
+    assert.equal(routeList({ ...appt, apptDateEt: d, cfg: live }).skip, 'appt_owned_by_booked_routing', d);
+  }
+  assert.equal(routeList({ ...appt, apptDateEt: null, cfg: live }).skip, 'appt_owned_by_booked_routing', 'date unknown');
+  // In shadow the backstop still pushes the near visits itself.
+  assert.equal(routeList({ ...appt, apptDateEt: '2026-10-07', cfg: backstopConfig({}) }).list, 'Conf - Next Day');
+  assert.equal(routeList({ ...appt, apptDateEt: '2026-10-08', cfg: backstopConfig({}) }).list, 'Conf - 2nd Day');
+  // No appointment is never booked routing's.
+  assert.equal(routeList({ hasAppt: false, nowMs, cfg: live }).dialAsap, true);
 });
 
 test('already on the target Confirmation list → no add, removal goes ahead', () => {

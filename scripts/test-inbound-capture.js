@@ -196,7 +196,13 @@ test('label: Five9 DNC → dnc, even with a GHL contact (first match wins)', () 
   assert.equal(r.label, 'dnc');
 });
 
-for (const tag of ['dnc', 'dnc-sms', 'stage:dnc', 'stop-bot', 'do-not-contact', 'DNC']) {
+// 2026-10-07: stop-bot turns the bot off; it is not a DNC (the user's ruling).
+test('label: stop-bot alone is not dnc — the caller is still captured and dialed', () => {
+  const r = classifyCaller({ caller: P }, { five9Dnc: new Set(), lpPhones: new Set(), ghl: found({ tags: ['stop-bot'] }), lpJob: noJob });
+  assert.notEqual(r.label, 'dnc');
+});
+
+for (const tag of ['dnc', 'dnc-sms', 'stage:dnc', 'do-not-contact', 'DNC']) {
   test(`label: GHL tag ${tag} → dnc, and beats already_in_lp and existing_customer`, () => {
     const r = classifyCaller({ caller: P }, {
       five9Dnc: new Set(), lpPhones: new Set([P]), ghl: found({ tags: [tag, 'customer'] }), lpJob: { status: 'yes' },
@@ -555,7 +561,7 @@ test('daily summary (digest on, the default): posts nothing, hands the counts to
 /* --- the approval handler + card ------------------------------------------- */
 
 test('approved action: re-checks first — a caller who opted out since is skipped, not enrolled', async () => {
-  const w = world({ contacts: { 8130000002: { id: 'c2', tags: ['stop-bot'] } } });
+  const w = world({ contacts: { 8130000002: { id: 'c2', tags: ['dnc'] } } });
   const act = buildApprovalAction({ ...call('8130000002'), caller_phone: '8130000002', label: 'has_ghl_contact', ghl_contact_id: 'c2' }, { runAt: NOW });
   const res = await executeCaptureInboundCaller({ id: 1, ...act }, { deps: w.deps });
   assert.equal(res.skipped, true);

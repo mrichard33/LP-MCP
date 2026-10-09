@@ -270,7 +270,10 @@ import { enforceTeamVoice } from './agentic/team-voice.js';
 import { enforcePropertyScope } from './agentic/property-scope.js';
 import { enforceCallTiming, softenCallTiming, isTeamOpen } from './agentic/team-hours.js';
 import { enforceOneAsk } from './agentic/one-ask.js';
-import { findUnbackedBookingClaim, rewriteBookingClaims, bookingClaimNote } from './agentic/booking-claim.js';
+import { findUnbackedBookingClaim, rewriteBookingClaims, bookingClaimNote, appointmentOnFile, noPromiseHandoffLine, NO_PROMISE_HANDOFF_RX } from './agentic/booking-claim.js';
+import { lpNoteDqMode } from './agentic/lp-note-dq.js';
+import { renderLeadFacts } from './agentic/lead-facts.js';
+import { enforceCancelledVisit } from './agentic/cancelled-visit.js';
 import { BOOKING_CALENDARS } from './knowledge/booking-calendar-router.js';
 import { contactTypoHint } from './agentic/contact-typos.js';
 import {
@@ -1728,6 +1731,11 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
     parts.push(...P.ESTIMATE_FOOTER);
   }
 
+  // 2026-10-07 (Nicholas): the verified facts first, the same block the
+  // analyzer reads (lead-facts.js): cancel and reason, every LP note, the
+  // property ZIP on file, a note that says we cannot run the lead.
+  if (context.lead_facts) parts.push(...renderLeadFacts(context.lead_facts));
+
   if (context.lp?.matched || context.lp?.disposition) {
     parts.push(...P.LP_CRM_HEADER);
     parts.push(...P.lpDisposition(context.lp.disposition || 'none', context.lp.disposition_label));
@@ -1771,7 +1779,8 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
       parts.push(...P.lpDataStale(context.lp.data_age_minutes));
     }
 
-    if (context.lp.notes?.length) {
+    // 2026-10-07: with LEAD FACTS above, every note is already there in full.
+    if (context.lp.notes?.length && !context.lead_facts) {
       parts.push(...P.LP_NOTES_HEADER);
       context.lp.notes.slice(0, 5).forEach(n => {
         const by = n.entered_by || 'System';
@@ -3219,6 +3228,42 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   const appointmentsRead = memo('appointments', () => fetchRecentAndUpcomingAppointments(contactId));
   appointmentsRead.catch(() => {});
 
+  // ─── A team note says we cannot run this lead (2026-10-07, Nicholas) ───
+  // Kaley's CXL note ("does not appear to own the home … not something we can
+  // run") reached the analyzer, and the bot still offered, held and confirmed
+  // a time. A person has decided; the bot does not book, offer or confirm. It
+  // sends ONE no-promise hand-off; the send handler then files the Five9
+  // callback, pages #contact-center with the note and turns the bot off
+  // (dq_hard_stop). LP_NOTE_DQ_MODE off|shadow|live (lp-note-dq.js).
+  {
+    const noteDq = context.lead_facts?.note_dq || null;
+    const noteDqMode = lpNoteDqMode();
+    if (noteDq && noteDqMode === 'shadow') {
+      console.log(`[LpNoteDq] shadow ${contactId}: note says ${noteDq.signal} — live would hand off and stop the bot`);
+    } else if (noteDq && noteDqMode === 'live' && channel !== 'livechat') {
+      const outboundTexts = (context.conversation_recent || []).filter(m => String(m?.direction || '').toLowerCase() === 'outbound').map(m => String(m?.text ?? m?.body ?? ''));
+      const alreadyHandedOff = outboundTexts.some(t => NO_PROMISE_HANDOFF_RX.test(t));
+      const line = noPromiseHandoffLine(context.lead?.first_name || null, { teamOpen: isTeamOpen() });
+      console.warn(`[LpNoteDq] ${contactId}: note says ${noteDq.signal} — ${alreadyHandedOff ? 'hand-off already sent, nothing to say' : 'no-promise hand-off'}, no booking`);
+      return {
+        short_circuit: false,
+        message: alreadyHandedOff ? null : line,
+        subject: null,
+        story_arc: 'none',
+        voice_used: 'we',
+        intent_class: 'LP_NOTE_DQ',
+        kb_pack_used: false,
+        fast_track: false,
+        companion_action: null,
+        lp_note_dq: { signal: noteDq.signal, text: noteDq.text, already_handed_off: alreadyHandedOff, conversation_tail: (context.conversation_recent || []).slice(-5).map(m => ({ direction: m?.direction || null, text: String(m?.text ?? m?.body ?? '').slice(0, 300) })) },
+        appointment_on_file: null,
+        lead_first_name: context.lead?.first_name || null,
+        contact_known_phone: context.lead?.phone || null,
+        lead_facts: context.lead_facts,
+      };
+    }
+  }
+
   // ─── ESTABLISHED FACTS (2026-09-11 — Alfredo Fontan) ──────────────────
   // Built immediately after the context and BEFORE the prompt, so every block
   // that follows can be chosen against what is already settled. Pure and
@@ -3814,7 +3859,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // capped at 800ms, fail-soft to "a team member will confirm".
   let serviceAreaTurn = null;
   try {
-    const saPlan = planServiceAreaTurn({ trigger: triggerMessage, conversation: context.conversation_recent || [] });
+    const saPlan = planServiceAreaTurn({ trigger: triggerMessage, conversation: context.conversation_recent || [], fileZip: context.lead_facts?.property?.zip || null });
     if (saPlan.active) {
       const capped = (p) => Promise.race([p, new Promise((r) => setTimeout(() => r(null), 800).unref?.())]).catch(() => null);
       let zipResult = null;
@@ -3883,8 +3928,9 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   if (nepqMode !== 'off' && channel === 'sms' && !coverageOwnsReply(serviceAreaTurn)) {
     try {
       const firstWord = String(context.lead?.first_name || context.lead?.name || '').trim().split(/\s+/)[0] || '';
-      const hasAppointment = (Array.isArray(upcomingAppointments) && upcomingAppointments.some(a => !a.already_ended))
-        || (context.lp?.appointment_set === true && context.lp?.appointment_is_past !== true);
+      // 2026-10-07 (Nicholas): one definition of "on the calendar" for the
+      // planner and both booking-claim checks (booking-claim.js).
+      const hasAppointment = !!appointmentOnFile({ upcomingAppointments, lp: context.lp });
       nepqPlan = planNepqTurn({
         channel: 'sms',
         trigger: triggerMessage,
@@ -4314,8 +4360,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // claim becomes "our team will call to set up a time". Gated on the NEPQ
   // backbone so production SMS is unchanged until it goes live.
   if (nepqModeEarly === 'live' && channel === 'sms') {
-    const onFile = (Array.isArray(upcomingAppointments) && upcomingAppointments.some(a => !a.already_ended))
-      || (context.lp?.appointment_set === true && context.lp?.appointment_is_past !== true);
+    const onFile = !!appointmentOnFile({ upcomingAppointments, lp: context.lp });
     // A hold stands only when code held the slot this turn (booking facts).
     const held = !!bookingFacts && (bookingFacts.kind === 'hold' || bookingFacts.kind === 'collect');
     const claimOpts = { booked: validated.companion_action?.action_type === 'book_appointment', hasAppointment: onFile, held };
@@ -4784,6 +4829,17 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       validated.message = scope.text;
       if (scope.reason === 'lead_asked' && validated.companion_action?.action_type === 'book_appointment') validated.companion_action = null;
     }
+    // 2026-10-07 (Nicholas): a cancelled visit is never "your visit" (cancelled-visit.js).
+    const cancelled = enforceCancelledVisit(validated.message, {
+      facts: context.lead_facts || null,
+      booked: validated.companion_action?.action_type === 'book_appointment',
+      outboundTexts: (context.conversation_recent || []).filter(m => String(m?.direction || '').toLowerCase() === 'outbound').map(m => String(m?.text ?? m?.body ?? '')),
+    });
+    if (cancelled.changed) {
+      console.warn(`[CancelledVisit] ${contactId} upcoming-visit sentence replaced: "${String(cancelled.sentence).slice(0, 120)}"`);
+      validated.message = cancelled.text;
+      validated.cancelled_visit_fixed = true;
+    }
     // Human voice once more, last (2026-10-06 bot gate): the first pass runs
     // before the NEPQ and booking guards, and a sentence they drop can leave
     // two stock openers side by side. It only deletes, so it never undoes a guard.
@@ -5003,6 +5059,14 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     // handler posts the #contact-rehash card when rehash_call.agreed.
     rehash: rehash ? { active: true, rep_name: rehash.repName } : null,
     contact_known_phone: identityState?.identity?.phone || context?.lead?.phone || null,
+    // 2026-10-07 (Nicholas): what the send handler's final booking-truth
+    // check needs (booking-claim.js checkBookingTruth). The appointment still
+    // on the calendar, whether code held a real offered slot this turn, and
+    // the zone a named day/time is read in.
+    appointment_on_file: appointmentOnFile({ upcomingAppointments, lp: context.lp }),
+    booking_hold_backed: (!!bookingFacts && (bookingFacts.kind === 'hold' || bookingFacts.kind === 'collect')) || !!validated.nepq_plan?.held,
+    slot_timezone_for_truth: promptTimezoneFor(context),
+    lead_first_name: context.lead?.first_name || null,
     // v2.7.14 — Bot Review Phase 0 replay context. Assembled from values already
     // in scope; nothing is fetched and nothing is written here. The send handler
     // hands it to recordMessageContext() with the action id as message_ref.

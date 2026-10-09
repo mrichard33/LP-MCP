@@ -362,7 +362,10 @@ test('DNC-lift: Cnf on a DNC-stacked contact CONFIRMS despite the consent block 
 });
 
 test('appt on a NON-in-home calendar (Conf Call) → does not block; other calendar untouched', async () => {
-  reset({ upcoming: [weAppt({ calendarId: 'gFWoSQrlKIdfRbAPV842', id: 'conf-call-1' })] }); // Conf Call (GHL-only, phone)
+  // At a DIFFERENT time. A Conf Call at LP's exact time is LP echoing the call,
+  // not an estimate, and no longer creates one (2026-10-08 — see the
+  // ghl_only_appointment_same_slot tests at the end of this file).
+  reset({ upcoming: [weAppt({ calendarId: 'gFWoSQrlKIdfRbAPV842', id: 'conf-call-1', startTime: OTHER_TIME_GHL })] }); // Conf Call (GHL-only, phone)
   const res = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('Set') });
   assert.equal(res.outcome, 'created');
   assert.equal(calls.filter((c) => c.method === 'PUT').length, 0); // never touched conf-call-1
@@ -526,4 +529,34 @@ test('impossible hour: midnight is null upstream → no_appointment_date, not im
   reset();
   const res = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('Set', '2027-07-08T00:00:00+00:00') });
   assert.equal(res.reason, 'no_appointment_date');
+});
+
+// ═══ GHL-only calendar at the same slot — 2026-10-08 ════════════════════
+// The parity watchdog wrote Confirmation Call JrH56gkBz5uluIHqRUor onto LP
+// lead 581695 (OPPFDN → Set), and one minute later this reconciler created
+// Window Estimate B9V4v7uknpoNoPpKjufI at the same slot. LP was only echoing
+// the phone call, so no estimate may be minted over it.
+
+const CONF_CALL = 'gFWoSQrlKIdfRbAPV842';
+
+test('Set + active Confirmation Call at the SAME time → no Window Estimate created', async () => {
+  reset({ upcoming: [{ id: 'JrH56gkBz5uluIHqRUor', calendarId: CONF_CALL, startTime: FUTURE_GHL, appointmentStatus: 'new' }] });
+  const res = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('Set') });
+  assert.equal(res.outcome, 'noop');
+  assert.equal(res.reason, 'ghl_only_appointment_same_slot');
+  assert.equal(res.ghl_only_appointment_id, 'JrH56gkBz5uluIHqRUor');
+  assert.equal(mutations().length, 0, 'the incident POSTed a Window Estimate here');
+});
+
+test('Set + Confirmation Call at a DIFFERENT time → the estimate is still created', async () => {
+  reset({ upcoming: [{ id: 'call-1', calendarId: CONF_CALL, startTime: OTHER_TIME_GHL, appointmentStatus: 'new' }] });
+  const res = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('Set') });
+  assert.equal(res.outcome, 'created');
+  assert.equal(calls.filter((c) => c.method === 'POST').length, 1);
+});
+
+test('Set + CANCELLED Confirmation Call at the same time → estimate created (only an active call blocks)', async () => {
+  reset({ upcoming: [{ id: 'call-1', calendarId: CONF_CALL, startTime: FUTURE_GHL, appointmentStatus: 'invalid' }] });
+  const res = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('Set') });
+  assert.equal(res.outcome, 'created');
 });
