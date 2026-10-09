@@ -60,7 +60,7 @@ export function registerAiOsTools(server) {
       query: z.string().min(2).max(1000).optional().describe('Concept, exact term, protocol name, or ID fragment to discover relevant canonical guidance.'),
       ids: z.array(z.string().regex(CANON_ID)).min(1).max(20).optional().describe('Exact canonical IDs. When supplied, direct ID lookup takes precedence over search.'),
       object_types: z.array(z.string().regex(/^[A-Z]+$/)).min(1).max(20).optional().describe('Optional canonical type filters such as STD, K, RULE, SEC, SK, MCP.'),
-      lifecycle_states: z.array(z.enum(['canonical_candidate', 'verified', 'approved', 'active', 'enforced', 'retired'])).min(1).max(6).optional().describe('Optional lifecycle filters. Current v0.2.1 content is candidate or verified only.'),
+      lifecycle_states: z.array(z.enum(['canonical_candidate', 'verified', 'approved', 'active', 'enforced', 'retired'])).min(1).max(6).optional().describe('Optional lifecycle filters. Current v0.3.5 content is candidate or verified only.'),
       limit: z.number().int().min(1).max(20).optional().describe('Maximum results. Default 5.'),
       include_full: z.boolean().optional().describe('Return full object content. Default false returns compact context.'),
     },
