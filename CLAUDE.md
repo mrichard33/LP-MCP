@@ -257,6 +257,15 @@ team would get pre-demo calls. Now a rehash call goes on "Rehash Call" (a GHL Ro
 owner when that owner is on the rehash team (`REHASH_TEAM_USER_IDS`), else the Rehash rep (John Manieri
 `TYcZ9DcNkuPCFYsFxRFV`, `CONFIRMATION_CALL_ASSIGNED_USER_ID`). A Confirmation Call names only an assignee the booking
 named (`callAssigneeFor`, `src/config/rehash-assignee.js`).
+**A rehash call is offered only at times the Rehash Call calendar shows open (the user, 2026-10-09).** Calendar
+`ncDzLgzbfKJRfhmtlWtB` (`REHASH_CALENDAR_ID`). `readRehashCallSlots` (`src/agentic/rehash-slots.js`) reads it for the rep
+the booking will name (`callAssigneeFor`; `fetchFreeSlots({ userId })`), team hours, 30+ minutes out. In the post-demo
+planner a yes to the call, a call request or a schedule ask gets two of those times (`rehash_offer`); a pick or a typed
+open time is booked from the plan (`rehash_confirm` → `rehashCallBooking`, never the model's words), re-checked for the
+same rep right before booking (`recheckSlot({ userId })`), and LP is never touched (GHL-only calendar). No calendar, no
+open times or a failed read: the old reply and the #contact-rehash card, which is now skipped when times were offered or
+the call booked. A follow-up date still wins ("Call me in November" → `defer`). `REHASH_CALL_SLOTS_MODE` off|shadow|live,
+default shadow (`[RehashSlots] shadow … would offer/book`); live also needs `POST_DEMO_PLANNER_MODE=live`.
 **Only the automatic repair needs an open lead (the user, 2026-10-09).** `terminalDispositionDecision` refuses a
 post-demo or sold lead (`isDemoDisposition`: Sale, OPPFDN, NoRehash, FDNS, SW, PM) for every caller; with
 `requireBookable` (the parity watchdog only) it also refuses any non-bookable lead. A person or GHL booking re-sets a

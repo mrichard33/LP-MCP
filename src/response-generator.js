@@ -399,6 +399,7 @@ import { smsBookingTurn, enforceBookingFacts, bookingFactsNote } from './agentic
 import { LINES as NEPQ_LINES } from './agentic/nepq-planner.js';
 import { isCustomerP2 } from './agentic/lead-state/signals/context-reader.js';
 import { postDemoPlannerMode } from './agentic/post-demo-turn.js';
+import { rehashCallSlotsMode, readRehashCallSlots, rehashCallBooking } from './agentic/rehash-slots.js';
 import { planNepqTurn, enforceNepqPlan, referenceRetryNote, nepqBackboneMode, prefersCall as nepqPrefersCall, objectionType as nepqObjectionType, TIME_REQUEST_RX as NEPQ_TIME_REQUEST_RX, SCHEDULE_ASK_RX as NEPQ_SCHEDULE_ASK_RX,REPEAT_COMPLAINT_RX as NEPQ_REPEAT_COMPLAINT_RX, bookingOpenInThread as nepqBookingOpenInThread, dropUnaskedCallOffer, leadWantsCall as nepqLeadWantsCall, isServiceCallback as nepqIsServiceCallback } from './agentic/nepq-planner.js';
 import {
   planServiceAreaTurn, resolveCoverage, coverageHint, guardCoverageDraft, serviceAreaRecord, coverageOwnsReply,
@@ -1505,7 +1506,7 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
   // carves out exactly one exception (a phone call with the rep) and keeps the
   // rest of the ban (no visit, no slot, no link). See src/agentic/rehash.js.
   if (opts.rehash?.active) {
-    parts.push(...P.postDemoRehash(opts.rehash.repName || null));
+    parts.push(...P.postDemoRehash(opts.rehash.repName || null, { callTimes: opts.rehash.callTimes === true }));
   }
 
   if (fastTrack && !postAppt.post && !ackOnly) {
@@ -3922,6 +3923,8 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   const nepqMode = (opts.dryRun === true && opts.nepqModeOverride) ? opts.nepqModeOverride : nepqBackboneMode();
   let nepqPlan = null;
   let nepqPlanFailed = false;
+  // The rep's real Rehash Call openings (rehash-slots.js), when read.
+  let rehashCallSlots = null;
   // SMS only: email replies are long-form and keep their own rules.
   // A coverage turn is planned too unless its reply is the whole script (the
   // zip ask, or the out-of-area close): 2026-10-03, the shutters thread's
@@ -3938,6 +3941,13 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       const pdMode = (opts.dryRun === true && opts.postDemoModeOverride) ? opts.postDemoModeOverride : postDemoPlannerMode();
       const postDemoLead = pdMode !== 'off' && (!!rehash || derivePostAppointment(context, opts.contextSnapshot).post);
       const rehashRep = rehash?.repName || null;
+      // 2026-10-09 (the user): a rehash call is offered only at times the
+      // Rehash Call calendar really shows open, for the rep it will be booked with.
+      const slotsMode = rehashCallSlotsMode();
+      if (rehash && postDemoLead && slotsMode !== 'off') {
+        const tz = promptTimezoneFor(context);
+        rehashCallSlots = await memo('rehash_call_slots', () => readRehashCallSlots({ contactId, timezone: tz, tzLabel: tzLabel(tz) }));
+      }
       const planArgs = {
         channel: 'sms',
         trigger: triggerMessage,
@@ -3954,7 +3964,20 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
         // The classifier read a call request: the planner's callback hand-off.
         callbackRequested: String(classification?.intent_class || '').toUpperCase() === 'CALLBACK',
       };
-      nepqPlan = planNepqTurn({ ...planArgs, postDemo: pdMode === 'live' && postDemoLead, rehashRep });
+      nepqPlan = planNepqTurn({ ...planArgs, postDemo: pdMode === 'live' && postDemoLead, rehashRep, callSlots: slotsMode === 'live' ? rehashCallSlots : null });
+      if (slotsMode === 'shadow' && rehash && postDemoLead) {
+        try {
+          const would = planNepqTurn({ ...planArgs, postDemo: true, rehashRep, callSlots: rehashCallSlots });
+          const say = (x) => `${x.rel || x.day} at ${x.time}`;
+          if (would.step === 'rehash_offer') console.log(`[RehashSlots] shadow ${contactId}: would offer ${(would.slots_to_offer || []).map(say).join(' or ')} (rep ${rehashCallSlots?.rep || '?'})`);
+          else if (would.step === 'rehash_confirm') console.log(`[RehashSlots] shadow ${contactId}: would book ${say(would.rehash_pick)} on Rehash Call (rep ${rehashCallSlots?.rep || '?'})`);
+          else if (would.handoff?.reason === 'callback_request') console.log(`[RehashSlots] shadow ${contactId}: call wanted but ${rehashCallSlots ? `${rehashCallSlots.offer.length} open time(s)` : 'no calendar read'} — the card goes instead`);
+        } catch (rsErr) {
+          console.warn(`[RehashSlots] shadow plan failed for ${contactId}: ${rsErr.message}`);
+        }
+      }
+      // The rehash prompt may name the real times this plan offers or books.
+      if (rehash && nepqPlan?.rehash_call_slots) rehash.callTimes = true;
       if (pdMode === 'shadow' && postDemoLead) {
         try {
           const would = planNepqTurn({ ...planArgs, postDemo: true, rehashRep });
@@ -3977,7 +4000,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // rendered into the plan block; the model writes the reply; the draft is
   // checked against them right after it comes back (enforceBookingFacts).
   let bookingFacts = null;
-  if (nepqMode === 'live' && channel === 'sms' && nepqPlan && (nepqPlan.required_move === 'confirm' || nepqPlan.step === 'collect')) {
+  if (nepqMode === 'live' && channel === 'sms' && nepqPlan && !nepqPlan.rehash_call_slots && (nepqPlan.required_move === 'confirm' || nepqPlan.step === 'collect')) {
     try {
       const idn = identityState?.identity || {};
       const thread = (context.conversation_recent || []).map(m => ({ direction: String(m?.direction || '').toLowerCase() === 'outbound' ? 'outbound' : 'inbound', text: String(m?.text ?? m?.body ?? '') }));
@@ -4728,6 +4751,13 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
           }
         }
       }
+      // A picked Rehash Call time is booked from the plan, never from the
+      // model's words: that exact slot, the rep it was read for, GHL-only.
+      if (nepqPlan.rehash_pick && rehashCallSlots?.calendarId) {
+        validated.companion_action = rehashCallBooking({ slot: nepqPlan.rehash_pick, calendarId: rehashCallSlots.calendarId, rep: rehashCallSlots.rep });
+        validated.nepq_plan.pinned = nepqPlan.rehash_pick.iso;
+      }
+      if (nepqPlan.step === 'rehash_offer') validated.rehash_slots_offered = true;
     } else if (enforced.changes.length) {
       validated.nepq_plan.would_change = enforced.changes;
       validated.nepq_plan.would_send = enforced.text.slice(0, 500);
@@ -4953,13 +4983,15 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     //     Prefer the resolver, then any id the model echoed, then map the name.
     //     NEVER trust the name to route: CALENDAR_MAP maps the PPR id to
     //     "Review Session", so a name lookup can misroute.
-    const targetCalId = bookingResolution?.calendar_id
+    // A Rehash Call (2026-10-09) was built by code on its own calendar: the
+    // resolver's PPR/visit calendar never replaces it.
+    const targetCalId = cap.rehash_call ? cap.calendar_id : (bookingResolution?.calendar_id
       || cap.calendar_id
-      || CALENDAR_MAP[cap.calendar_name];
+      || CALENDAR_MAP[cap.calendar_name]);
     cap.calendar_id = targetCalId;
     // (b) per-calendar duration when the resolver ran (phone calls are short);
     //     otherwise leave whatever the model/handler will derive.
-    if (bookingResolution) {
+    if (bookingResolution && !cap.rehash_call) {
       cap.duration_minutes = durationForCalendar(bookingResolution.calendar_key);
     }
 

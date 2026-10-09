@@ -171,7 +171,9 @@ export async function fetchFreeSlots(calendarId, opts = {}) {
   // falls back to the last good read of the same calendar from the last 10
   // minutes, else retries once. The picked time is re-read right before
   // booking (slot-recheck.js), so a stale list never books a taken slot.
-  const key = `${calendarId}|${opts.timezone || DEFAULT_TIMEZONE}|${opts.windowDays || DEFAULT_WINDOW_DAYS}|${opts.maxSlots || MAX_SLOTS_RETURNED}|${opts.minNoticeHours ?? ''}`;
+  // 2026-10-09: `userId` reads one rep's openings on a team (Round Robin)
+  // calendar: the Rehash Call slots we offer are the rep the booking names.
+  const key = `${calendarId}|${opts.timezone || DEFAULT_TIMEZONE}|${opts.windowDays || DEFAULT_WINDOW_DAYS}|${opts.maxSlots || MAX_SLOTS_RETURNED}|${opts.minNoticeHours ?? ''}|${opts.userId || ''}`;
   const first = await fetchFreeSlotsOnce(calendarId, opts);
   if (first.value) { LAST_GOOD.set(key, { at: Date.now(), value: first.value }); return first.value; }
   if (!first.transient) return null;
@@ -208,6 +210,7 @@ async function fetchFreeSlotsOnce(calendarId, opts = {}) {
   url.searchParams.set('startDate', String(startMs));
   url.searchParams.set('endDate', String(endMs));
   url.searchParams.set('timezone', tz);
+  if (opts.userId) url.searchParams.set('userId', String(opts.userId));
 
   try {
     await acquireToken();

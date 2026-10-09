@@ -3970,6 +3970,8 @@ export async function executeSendMessage(action, context) {
       startIso: cap.start_time,
       timezone: generated.slot_timezone || 'America/New_York',
       tzLabel: generated.slot_tz_label || 'ET',
+      // A Rehash Call is checked for the rep it is booked with (2026-10-09).
+      ...(cap.rehash_call ? { userId: cap.assigned_user_id || null, noticeMs: 30 * 60_000 } : {}),
     }, { fetchFreeSlots }).catch(err => ({ open: null, reason: err.message }));
     if (check.open === false) {
       console.warn(`[SendMessage] slot_taken_before_book: ${contactId} ${cap.start_time} on ${cap.calendar_id} is no longer open — offering ${check.alternatives.length} other time(s), no booking`);
@@ -4354,7 +4356,9 @@ export async function executeSendMessage(action, context) {
     // 2026-10-01 — REHASH CALL: a post-demo F.0 lead said yes to a call with
     // the rehash rep. Tell the rep in #contact-rehash, or "<rep> will call
     // you" is a promise nobody keeps. Failure-soft: the send already happened.
-    if (generated?.rehash?.active && generated?.rehash_call?.agreed) {
+    // 2026-10-09: not when real Rehash Call times were just offered, or the
+    // call is now booked on the Rehash Call calendar (GHL tells the rep).
+    if (generated?.rehash?.active && generated?.rehash_call?.agreed && !generated?.rehash_slots_offered && !inlineBooking?.landed) {
       try {
         const { name, phone, lpLead, ghlContact } = await resolveContactInfo(contactId, context);
         let market = null;
