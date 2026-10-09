@@ -73,6 +73,7 @@ import {
   checkCallbackDnc,
   buildCallbackDncReviewAction,
 } from '../../five9/callback-push.js';
+import { rearmCallbackEntry } from '../../five9/callback-rearm.js';
 
 import { executeCreateLPLead } from './lp-lead.js';
 
@@ -605,7 +606,13 @@ async function pushCallbackToFive9({
     };
   }
 
-  // 3. Queue the write.
+  // 3. Re-arm (2026-10-09): take the number's existing entry off the callback
+  //    list and WAIT for it, so the add below is a fresh call-now entry rather
+  //    than an in-place update that never dials (David Strehlow). Never in
+  //    parallel with the add, and never throws: see src/five9/callback-rearm.js.
+  const rearm = await rearmCallbackEntry({ contactId, number1: record.number1, listName, eventId: action?.event_id || null });
+
+  // 4. Queue the write.
   const callNowMode = callbackCallNowMode();
   const { data: queued, error } = await supabase.from('agent_actions').insert({
     event_id: action?.event_id || null,
@@ -618,13 +625,18 @@ async function pushCallbackToFive9({
       field_names: record.fieldNames,
       records: [record.values],
       call_now_mode: callNowMode,
+      // Read by checkCallbackRearm after the add runs (not sent to Five9).
+      rearm,
+      contact_id: contactId,
+      contact_name: `${ghlContact.firstName || ''} ${ghlContact.lastName || ''}`.trim() || null,
+      number1: record.number1,
     },
     // The inverse of this push, ready to paste if a record needs pulling back.
     rollback_payload: {
       action_type: 'five9_delete_record_from_list',
       list_name: listName,
       field_names: ['number1'],
-      records: [[record.number1]],
+      values: [record.number1],
     },
     reasoning:
       `Agentic callback re-queue for GHL contact ${contactId} (LP prospect ${record.custId}). ` +
@@ -669,6 +681,8 @@ async function pushCallbackToFive9({
       address_repaired: !!addressRepair,
       verify_deadline: verifyDeadline,
       cross_list_check_failed_open: other.failed_open,
+      callback_requested_at: record.callbackRequestedAt,
+      rearm,
     },
     idempotency_key: `lp_callback_requeue_${contactId}_five9_${queued?.id ?? action.id}`,
   }).catch((err) => console.warn(`[LP-REQUEUE] event emit failed: ${err.message}`));
@@ -678,6 +692,7 @@ async function pushCallbackToFive9({
     `CustID (LP prospect): ${record.custId} | lead_id: ${lpRows[0]?.lp_lead_id || 'none'}\n` +
     `${record.lpRecKey ? `LPRecKey: ${record.lpRecKey}\n` : ''}` +
     `callNowMode: ${callNowMode} | five9 action: ${queued?.id ?? 'unknown'}\n` +
+    `${(rearm.records_deleted ?? 0) > 0 ? `The number was already on the list; that entry was removed first so this push dials (re-arm ${rearm.delete_action_id}).\n` : ''}` +
     `${addressRepair ? 'Prospect address was repaired from GHL before the push.\n' : ''}` +
     `No new LP lead was created — LP stays the system of record and this is a dialing copy only. ` +
     `The agent's screen pop opens LP by CustID; the AI BRIEF note on this contact carries the call context.`
@@ -709,6 +724,8 @@ async function pushCallbackToFive9({
     lp_rec_type: record.lpRecType,
     address_repaired: !!addressRepair,
     cross_list_check_failed_open: other.failed_open,
+    callback_requested_at: record.callbackRequestedAt,
+    rearm,
     verify_deadline: verifyDeadline,
   };
 }

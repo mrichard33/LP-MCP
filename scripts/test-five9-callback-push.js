@@ -34,6 +34,7 @@ import {
   callbackListName,
   callbackCallNowMode,
   callbackLpRecType,
+  formatFive9DateTime,
   FIVE9_OWNED_FIELDS,
 } from '../src/five9/callback-push.js';
 
@@ -151,6 +152,25 @@ test('no Five9-owned field is ever written', () => {
   }
 });
 
+test('every push stamps callback_requested_at, in Five9 format and UTC (2026-10-09)', () => {
+  // Profile "Callback Request V2" rule 3 reads Contact Record Created, which an
+  // update never moves, so a repeat requester aged out 48h after the FIRST
+  // record (David Strehlow). This field is the request time of THIS push.
+  const nowMs = Date.parse('2026-10-09T17:30:05.123Z');
+  const rec = buildCallbackRecord({ contactId: CONTACT_ID, ghlContact, lpRow, nowMs });
+  const m = asMap(rec);
+  assert.equal(m.callback_requested_at, '2026-10-09 17:30:05.123', 'yyyy-MM-dd HH:mm:ss.SSS, UTC (Five9 date fields read as UTC)');
+  assert.equal(rec.callbackRequestedAt, m.callback_requested_at);
+  assert.equal(rec.fieldNames.length, rec.values.length);
+  assert.ok(!FIVE9_OWNED_FIELDS.includes('callback_requested_at'), 'ours, not Five9\'s');
+});
+
+test('formatFive9DateTime pads every part and keeps milliseconds', () => {
+  assert.equal(formatFive9DateTime(Date.parse('2026-01-02T03:04:05.006Z')), '2026-01-02 03:04:05.006');
+  assert.equal(formatFive9DateTime(Date.parse('2026-12-31T23:59:59Z')), '2026-12-31 23:59:59.000');
+  assert.match(formatFive9DateTime(Date.now()), /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}$/);
+});
+
 test('cqd_id is never sent', () => {
   const rec = buildCallbackRecord({ contactId: CONTACT_ID, ghlContact, lpRow });
   assert.ok(!rec.fieldNames.includes('cqd_id'));
@@ -179,7 +199,7 @@ test('blank optional fields are dropped, not sent as empty strings', () => {
   for (const f of ['email', 'street', 'city', 'state', 'zip', 'lead_id']) {
     assert.ok(!rec.fieldNames.includes(f), `${f} should be dropped when blank`);
   }
-  assert.deepEqual(rec.fieldNames, ['number1', 'first_name', 'last_name', 'CustID', 'call_ID']);
+  assert.deepEqual(rec.fieldNames, ['number1', 'first_name', 'last_name', 'CustID', 'call_ID', 'callback_requested_at']);
   assert.equal(rec.values.length, rec.fieldNames.length);
 });
 

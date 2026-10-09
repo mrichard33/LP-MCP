@@ -637,6 +637,14 @@ silently) and the campaign is PREVIEW mode with a 7-hour gap filter after any ea
   shows a call to that number, and 15 min into the 8–8 ET dial window with none posts **⏰ PROMISED CALL NOT MADE YET**
   to #contact-center (`src/five9/callback-dial-check.js`, naming an earlier call that explains the 7-hour wait).
   `LP_REQUEUE_DIAL_CHECK=false` restores "pushed = done".
+- **a repeat request is re-armed, and every push is stamped (2026-10-09).** A second push for a number already on
+  "Callback Request" was an in-place update (UPDATE_FIRST): never call-now, and profile V2's 48h rule reads the
+  ORIGINAL create time (David Strehlow, list 63 → 63). `pushCallbackToFive9` now runs `rearmCallbackEntry`
+  (`src/five9/callback-rearm.js`) first: an unarmed `five9_delete_record_from_list` (rule `LP_CALLBACK_REARM_FIVE9`,
+  the callback list ONLY, `isCallbackRearmDelete`), run inline and awaited; one that did not finish is cancelled
+  before the add is queued. After the add, `checkCallbackRearm` (in the Five9 write handler) posts
+  "PROMISED CALL AT RISK" to #contact-center at once when the list did not grow. Every record carries
+  `callback_requested_at` (UTC, `yyyy-MM-dd HH:mm:ss.SSS`), which rule 3 moves onto once the pushes are verified.
 - two no's and a canvasser complaint are reviewed, never dialed (`NO_DIAL_REASONS` in `bot-callback.js`): the two-no's
   line promises no contact, and "stop knocking on my door" (`isKnockComplaint`) gets the do-not-knock flow: the address,
   a name if none, then a **🚪 DO NOT KNOCK** card to the market's #canvass channel and the rollup. No sales call.

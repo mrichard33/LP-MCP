@@ -85,6 +85,14 @@ export function five9DncAutoApproveEnabled() {
 const AUTO_APPROVED_REENTRY_OP = 'five9_remove_numbers_from_dnc_reentry';
 export const REENTRY_DNC_LIFT_RULE_KEY = 'DNC_LIFT_ON_REENTRY_E0';
 
+// NOT HERE, ON PURPOSE (2026-10-09): the callback re-arm delete
+// (five9_delete_record_from_list, rule LP_CALLBACK_REARM_FIVE9, "Callback
+// Request" list only). lp-requeue inserts that row itself and runs it inline;
+// it never comes through create_agent_action. Its exemption lives only at
+// execution (execAutoApproved in src/actions/handlers/five9.js), like the
+// BOOKED_DIAL_ROUTING removal, so a delete queued through this tool stays
+// armed whatever rule it names.
+
 export function resolveRequiresApproval(actionType, requested, ruleApplied = null) {
   const type = String(actionType || '');
   const isFive9Write = type.startsWith('five9_');

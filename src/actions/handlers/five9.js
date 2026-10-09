@@ -66,6 +66,7 @@ import {
   REENTRY_DNC_LIFT_RULE_KEY,
   executeRemoveNumbersFromDncApproved,
 } from '../../five9/admin-writes.js';
+import { isCallbackRearmDelete, checkCallbackRearm } from '../../five9/callback-rearm.js';
 
 const FIVE9_WRITE_OPS = {
   five9_start_campaign: executeStartCampaign,
@@ -198,9 +199,17 @@ const EXEC_AUTO_APPROVED_REENTRY_OP = 'five9_remove_numbers_from_dnc_reentry';
 const EXEC_AUTO_APPROVED_BOOKED_REMOVE_OP = 'five9_delete_record_from_list';
 const BOOKED_ROUTING_RULE_KEY = 'BOOKED_DIAL_ROUTING';
 
+// 2026-10-09 — the callback re-arm delete (src/five9/callback-rearm.js). A repeat
+// callback push over an entry already on "Callback Request" updates it in place
+// and never dials, so lp-requeue removes that entry first. Unarmed for the same
+// reason the push is: a promised call cannot wait on a click. Welded to rule
+// LP_CALLBACK_REARM_FIVE9 AND to the callback list alone (isCallbackRearmDelete:
+// one list, callbackListName(), never LP_ASAP). The same op from any other rule,
+// or naming any other list, is still armed.
 function execAutoApproved(actionType, action) {
   if (actionType === EXEC_AUTO_APPROVED_FIVE9_OP) return true;
   if (actionType === EXEC_AUTO_APPROVED_BOOKED_REMOVE_OP) {
+    if (isCallbackRearmDelete(action)) return true;
     return action?.rule_applied === BOOKED_ROUTING_RULE_KEY
       && String(process.env.BOOKED_ROUTING_AUTO_REMOVE || '').trim().toLowerCase() !== 'false';
   }
@@ -220,5 +229,9 @@ export async function executeFive9Write(action) {
   if (action.requires_approval !== true && !execAutoApproved(action.action_type, action)) {
     throw new Error(`REFUSED: ${action.action_type} must be queued with requires_approval=true (approve_action gate)`);
   }
-  return fn(action);
+  const result = await fn(action);
+  // 2026-10-09 — a callback push that did not grow the list updated an entry in
+  // place and will not dial: say so now, not at the 15-minute verify sweep.
+  const rearm = await checkCallbackRearm(action, result);
+  return rearm ? { ...result, rearm } : result;
 }
