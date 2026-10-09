@@ -237,6 +237,7 @@ import { isGhlOnlyCalendarId } from './knowledge/booking-calendar-router.js';
 import { checkConfirmationCallSlot } from './services/confirmation-call-slot.js';
 import { isDemoDisposition } from './demo-truth.js';
 import { postDemoLock } from './lp-post-demo-lock.js';
+import { postIssueGate } from './lp-post-issue-rebook.js';
 import { five9DispatchConfigured, dispatchConfirmationCallback } from './five9/list-dispatch.js';
 // 2026-07-28 appt-enrichment repoint: the CANONICAL rate-limited GHL client.
 // Byte-identical to the private ghlFetch below EXCEPT it calls report429() on a
@@ -1955,6 +1956,7 @@ async function syncAppointmentToLP({
   const _lpSetAppointment = deps.lpSetAppointment || lpSetAppointment;
   const _checkConfirmationCallSlot = deps.checkConfirmationCallSlot || checkConfirmationCallSlot;
   const _postDemoLock = deps.postDemoLock || postDemoLock;
+  const _postIssueGate = deps.postIssueGate || postIssueGate;
 
   // ── GHL-only calendar: never an LP appointment (2026-10-08) ──
   // Confirmation Call is a phone touch, not the estimate visit. The executor
@@ -2266,7 +2268,28 @@ async function syncAppointmentToLP({
     };
   }
 
-  const { ldsId, prospectId, source, step, lpSource, lpSourceDetail, disp } = resolution;
+  const { prospectId, source, step, lpSource, lpSourceDetail } = resolution;
+  let { ldsId, disp } = resolution;
+
+  // ── Post-issue rule (call-center manual pp. 22–24) — src/lp-post-issue-rebook.js.
+  // A lead LP has issued to a rep never takes another appointment: live creates
+  // a new LP lead under the prospect (or uses a newer one) and returns here;
+  // shadow (the default) records what live would do and carries on unchanged.
+  // Ahead of the terminal guard on purpose: an OPPFDN or Sale lead is
+  // post-issue too, and live must reach the new-lead path for it.
+  const postIssue = await _postIssueGate({
+    caller: requireBookable ? 'parity_watchdog' : 'sync_appointment_to_lp',
+    contactId, ldsId, prospectId, knownDisposition: disp,
+    appointmentDate: incomingDateNorm, appointmentTime: incomingTimeNorm,
+    requireBookable, contactName, phone: contactPhone,
+  });
+  if (!postIssue.proceed) return postIssue.result;
+  if (postIssue.ldsId && postIssue.ldsId !== ldsId) {
+    // A newer lead was inbounded since the issued one: it takes the appointment,
+    // through every guard below, as if the resolver had found it.
+    ldsId = postIssue.ldsId;
+    disp = null;
+  }
 
   // ── Terminal-disposition guard (2026-10-08) — see terminalDispositionDecision.
   // Before any write: no GHL field writeback, no dedup mark, no lp-appt-synced

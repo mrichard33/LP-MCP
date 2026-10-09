@@ -353,6 +353,15 @@ function classifyHealResult(result) {
     case 'deferred_pending_lp_issuance':
     case 'held_stale_inbound_holds_appointment':
     case 'past_appointment_left_asis':
+    // 2026-10-09 — the post-issue rule (src/lp-post-issue-rebook.js) in live
+    // mode. The watchdog never creates a lead: an issued lead is refused, and
+    // an unreadable one fails closed. Neither wrote anything.
+    case 'skipped_post_issue_lead':
+    case 'post_issue_check_failed':
+    case 'post_issue_needs_manual_lead':
+    case 'newer_lead_pending_in_inbound_queue':
+    case 'post_issue_enroll_failed':
+    case 'post_issue_rebook_duplicate':
       return 'not_attempted';
     case 'lp_lead_creation_enrolled':
     case 'create_lead_already_enrolled':

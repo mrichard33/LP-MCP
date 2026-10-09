@@ -153,6 +153,7 @@
 import supabase from '../../supabase.js';
 import { setAppointment as lpSetAppointment, getLeadByLdsId, getCircuitStatus } from '../../lp-client.js';
 import { postDemoLock } from '../../lp-post-demo-lock.js';
+import { postIssueGate } from '../../lp-post-issue-rebook.js';
 import { extractArray, getField } from '../../sync-utils.js';
 import { resolveLPLeadId } from '../../lp-appointment-sync.js';
 import { sendGroupMeMessage } from '../../groupme.js';
@@ -582,6 +583,25 @@ export async function executeSetLPAppointment(action, context = {}) {
         reason: 'time matches a GHL-only appointment (Confirmation Call) — never synced to LP',
       };
     }
+  }
+
+  // ─── Post-issue rule (call-center manual pp. 22–24) ────────────────
+  // src/lp-post-issue-rebook.js. A lead LP has issued to a rep never takes
+  // another appointment. Live: a new LP lead (or a newer one) and return;
+  // shadow (the default): recorded, then the path below runs unchanged. Ahead
+  // of the live pre-check and the authority claim, so a refused write leaves no
+  // conflict card and no authority row behind.
+  const postIssue = await (context?.deps?.postIssueGate || postIssueGate)({
+    caller: action.rule_applied ? `set_lp_appointment:${action.rule_applied}` : 'set_lp_appointment',
+    contactId, ldsId: lpLeadId, prospectId: resolvedProspectId, knownDisposition: resolutionDisp,
+    appointmentDate: normalizeDateForComparison(rawDate), appointmentTime: apptTime,
+    ghlContact: !isLPLeadId(contactId),
+  });
+  if (!postIssue.proceed) return postIssue.result;
+  if (postIssue.ldsId && postIssue.ldsId !== lpLeadId) {
+    lpLeadId = postIssue.ldsId;
+    resolutionDisp = null;
+    resolutionSource = `${resolutionSource}+post_issue_newer_lead`;
   }
 
   const setBy = payload.set_by || LP_EMP.GHL_INTEGRATION;
