@@ -11,8 +11,10 @@
  *   - the card is updated in place (chat.update), buttons already gone;
  *   - the per-system result goes into the card's thread (postToSlack).
  * A step the executor is still retrying is shown as "⏳ retrying"; the sweep
- * below posts one follow-up once it settles, and corrects the request's
- * status, which used to stay 'failed' after a retry succeeded.
+ * below EDITS that same thread reply once it settles (2026-10-09: it used to
+ * post a second reply, and the LP clear's three retries made that happen on
+ * every lift), and corrects the request's status, which used to stay 'failed'
+ * after a retry succeeded.
  *
  * Only rows marked batch_result.report_mode = 'server' are reported here. A
  * click from the older n8n flow (which prints the result itself) is never
@@ -87,16 +89,18 @@ export function formatLiftThread({ decision, slackUserId, decidedAtIso, systems,
   let hardFailure = false;
   for (const key of Object.keys(LABEL)) {
     const s = systems?.[key];
-    if (!s) continue;
+    // LP is shown whenever it still needs a manual clear, even with no LP step
+    // in the batch (2026-10-09: the step is skipped until LP's clear works).
     if (key === 'lp' && approve && lpManual) {
       lines.push(`• LP: :warning: still shows DNC — clear it manually in Lead Perfection (${lpProspectId ? `Prospect #${esc(lpProspectId)}` : 'find the prospect by phone'})`);
       continue;
     }
+    if (!s) continue;
     if (s.status === 'failed') {
       hardFailure = true;
       lines.push(`• ${LABEL[key]}: ❌ failed — ${esc((s.errors || []).join('; ').slice(0, 400))}`);
     } else if (s.status === 'retrying') {
-      lines.push(`• ${LABEL[key]}: ⏳ retrying automatically — an update will follow here`);
+      lines.push(`• ${LABEL[key]}: ⏳ retrying automatically — this message will update when it finishes`);
     } else {
       lines.push(`• ${LABEL[key]}: ✅ done`);
     }
@@ -178,8 +182,20 @@ export async function reportDncLiftResult(requestId, deps = {}) {
 
     const card = buildResultCard({ cardBlocks: br.card_blocks, reviewPayload: row.review_payload, requestId, headline: fmt.headline });
     const upd = await update(channel, row.slack_ts, fmt.headline, { blocks: card });
-    const text = br.slack_reported_at ? `*Update:* every step has now finished.\n${fmt.threadText}` : fmt.threadText;
-    const reply = await post(text, channel, { threadTs: row.slack_ts });
+    // ONE thread reply per lift (2026-10-09). A follow-up edits the reply we
+    // already posted; only a row from before slack_reply_ts was stored, or an
+    // edit Slack refused (the reply was deleted), posts a new one.
+    let reply = null;
+    let edited = false;
+    if (br.slack_reported_at && br.slack_reply_ts) {
+      const ed = await update(channel, br.slack_reply_ts, fmt.threadText);
+      if (ed.ok) { reply = { ok: true, ts: br.slack_reply_ts }; edited = true; }
+      else console.warn(`[DncLiftReport] could not edit the reply for ${requestId} (${ed.error}) — posting it instead`);
+    }
+    if (!reply) {
+      const text = br.slack_reported_at && !br.slack_reply_ts ? `*Update:* every step has now finished.\n${fmt.threadText}` : fmt.threadText;
+      reply = await post(text, channel, { threadTs: row.slack_ts });
+    }
     if (!reply.ok) {
       console.warn(`[DncLiftReport] thread reply failed for ${requestId}: ${reply.error}`);
       return { ok: false, error: `thread reply: ${reply.error}`, card_updated: upd.ok };
@@ -197,11 +213,12 @@ export async function reportDncLiftResult(requestId, deps = {}) {
         any_failed: hard,
         ...lp,
         slack_reported_at: br.slack_reported_at || new Date(now).toISOString(),
+        slack_reply_ts: reply.ts || br.slack_reply_ts || null,
         slack_report_final: final,
       },
     }).eq('request_id', requestId);
-    console.log(`[DncLiftReport] ${final ? 'final' : 'interim'} result posted for ${requestId} (card ${upd.ok ? 'updated' : `not updated: ${upd.error}`})`);
-    return { ok: true, posted: true, final, card_updated: upd.ok };
+    console.log(`[DncLiftReport] ${final ? 'final' : 'interim'} result ${edited ? 'edited into the reply' : 'posted'} for ${requestId} (card ${upd.ok ? 'updated' : `not updated: ${upd.error}`})`);
+    return { ok: true, posted: true, edited, final, card_updated: upd.ok };
   } catch (err) {
     console.warn(`[DncLiftReport] ${requestId} failed: ${err.message}`);
     return { ok: false, error: err.message };

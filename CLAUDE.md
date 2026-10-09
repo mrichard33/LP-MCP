@@ -328,6 +328,12 @@ transaction. `CONSENT_MODEL_MODE` is `shadow`: nothing gates a send on these tab
   read-back), the review payload and the approve response carry `lp_manual_clear_required` and
   `lp_prospect_id`, and n8n tells the approver to clear LP by hand. A clear skipped for want of a
   prospect id counts as NOT cleared (`lpClearOutcome` in `dnc-lift-decision.js`).
+- **The lift does not call LP at all until its clear works, and the thread gets ONE reply (2026-10-09).** LP still
+  answered "Invalid DNC value" to every clear, and the step's three retries made the report post a second thread reply
+  ("*Update:* every step has now finished") on every lift. `buildLiftBatch` now queues `update_lp_dnc_status` only when
+  `LP_DNC_CLEAR_WORKING=true`; the thread still prints the manual LP line. A follow-up EDITS the stored reply
+  (`batch_result.slack_reply_ts`), never posts a second one, and a repeat async click gets a 202 replay so n8n prints
+  nothing. Five9's read-back now fails the step when a number is still on DNC (`assertDncRemoved`); it used to read ✅.
 - **A card with no consent history shows the old Five9 block instead (2026-10-02).** `legacy_block`
   (last Five9 DNC result, last call, LP disposition) is built when `consent_events` is empty, every
   lookup best-effort. A Five9-only block is then seeded ONCE as `phone/revoked`, source
