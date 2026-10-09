@@ -52,7 +52,7 @@
 import { alertDigestEnabled } from '../alert-posted.js';
 import { getHlSupabase } from '../admin/hl-client.js';
 import { runSQL } from '../admin/supabase-admin.js';
-import { reportAlertCondition } from '../alert-state.js';
+import { reportAlertCondition, observeAlertCondition } from '../alert-state.js';
 import { runJob } from '../job-runner.js';
 import {
   shouldAlertLinkLeak, formatLinkLeakAlert, formatLinkLeakRecovered,
@@ -212,6 +212,14 @@ export async function runLinkLeakMonitor({ post = true } = {}) {
     remindMs: REMIND_MS,
     text: formatLinkLeakAlert(sample, decision.offenders, decision.unreadable),
     recoveredText: formatLinkLeakRecovered(sample),
+    detail: { tables: sample.tables, errors: sample.errors },
+  });
+  // 2026-10-07: the digest pass (post:false) still keeps the row true, or a
+  // leak that fired on 10-02 reads "firing" forever (observeAlertCondition).
+  else await observeAlertCondition({
+    key: ALERT_KEY,
+    active,
+    label: 'LP↔GHL link leak',
     detail: { tables: sample.tables, errors: sample.errors },
   });
 
