@@ -163,6 +163,7 @@ import { toLpApptDate, toLpApptTime, normalizeDateForComparison } from '../date-
 import { resolveContactInfo } from '../resolvers.js';
 import { buildRichNotification } from '../enrichment.js';
 import { isGhlOnlyCalendarId } from '../../knowledge/booking-calendar-router.js';
+import { checkConfirmationCallSlot } from '../../services/confirmation-call-slot.js';
 import { appointmentDelta, lpWallClockToGhlStartTime } from '../../appointment-dates.js';
 import { LP_EMP } from '../../lp-source-ids.js';
 // 2026-05-27 v2's hasMeaningfulCalendar now lives beside the card builder that
@@ -561,6 +562,24 @@ export async function executeSetLPAppointment(action, context = {}) {
   // rationale as appt_date above).
   const apptTime = toLpApptTime(rawTime);
   if (!apptTime) throw new Error(`Appointment time did not resolve to HH:MM 24h (raw="${rawTime}")`);
+
+  // 2026-10-09 (the user: never an LP appointment for a confirmation call). The
+  // calendar check at the top only works when the payload names a calendar;
+  // without one the time may have come from GHL's last_appointment fields,
+  // which a Confirmation Call fills too. Fails open on a GHL read failure.
+  if (!evtCalendarId && contactId && !isLPLeadId(contactId)) {
+    const slot = await checkConfirmationCallSlot({ contactId, apptDate, apptTime });
+    if (slot.blocked) {
+      console.log(`[LP-APPT] skipped_ghl_only_calendar for ${contactId}: ${apptDate} ${apptTime} is GHL-only appointment ${slot.appointment?.appointment_id}`);
+      return {
+        action: 'skipped_ghl_only_calendar',
+        contact_id: contactId,
+        calendar_id: slot.appointment?.calendar_id || null,
+        ghl_appointment_id: slot.appointment?.appointment_id || null,
+        reason: 'time matches a GHL-only appointment (Confirmation Call) — never synced to LP',
+      };
+    }
+  }
 
   const setBy = payload.set_by || LP_EMP.GHL_INTEGRATION;
   // v2: don't default to literal 'N/A' — keep null so the conditional

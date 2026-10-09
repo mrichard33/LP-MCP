@@ -108,6 +108,8 @@ import { sendGroupMeMessage } from '../../groupme.js';
 import { addGHLNote, updateGHLContactFields, applyGHLTag } from '../../ghl.js';
 import { isLPLeadId, ghlFetch } from '../helpers.js';
 import { parseLongDate } from '../date-parsers.js';
+import { isGhlOnlyCalendarId } from '../../knowledge/booking-calendar-router.js';
+import { checkConfirmationCallSlot } from '../../services/confirmation-call-slot.js';
 import { resolveContactInfo } from '../resolvers.js';
 import { buildRichNotification } from '../enrichment.js';
 import { LP_SRS, assertNotTransposed, resolvePromoterForSource } from '../../lp-source-ids.js';
@@ -214,6 +216,38 @@ function resolveAppointment(payload, eventPayload, ghlContact, includeAppt) {
   const atime = String(rawTime).trim();
 
   return { adate, atime };
+}
+
+/**
+ * resolveAppointment, minus a Confirmation Call (the user, 2026-10-09: never an
+ * LP appointment for a confirmation call). The lead still goes to LP, with no
+ * appointment. resolveAppointment falls back to GHL's last_appointment fields,
+ * which a booking on ANY calendar fills, so a contact whose last booking is a
+ * Confirmation Call would otherwise send the call's time as the LP visit. A
+ * payload or event that names an in-home calendar is trusted; one naming a
+ * GHL-only calendar is refused; with no calendar, the time is checked against
+ * the contact's GHL calendar (fails open on a read failure). Covers all three
+ * callers below: a new lead, a reused lead, and an issued inquiry.
+ */
+async function resolveLpAppointment(payload, eventPayload, ghlContact, includeAppt, contactId, deps = {}) {
+  const appt = resolveAppointment(payload, eventPayload, ghlContact, includeAppt);
+  if (!appt) return null;
+  const calendarId = payload.calendar_id || payload.calendarId || eventPayload.calendar_id || eventPayload.calendarId || null;
+  if (calendarId && isGhlOnlyCalendarId(calendarId)) {
+    console.log(`[LP-CREATE] ${contactId}: appointment ${appt.adate} ${appt.atime} is on GHL-only calendar ${calendarId} — lead goes to LP without it`);
+    return null;
+  }
+  if (calendarId || !contactId || isLPLeadId(contactId)) return appt;
+  const check = deps.checkConfirmationCallSlot || checkConfirmationCallSlot;
+  const slot = await check({ contactId, apptDate: appt.adate, apptTime: appt.atime });
+  if (slot.blocked) {
+    console.log(`[LP-CREATE] ${contactId}: ${appt.adate} ${appt.atime} is GHL-only appointment ${slot.appointment?.appointment_id} (Confirmation Call) — lead goes to LP without it`);
+    return null;
+  }
+  if (slot.reason === 'lookup_failed') {
+    console.warn(`[LP-CREATE] ${contactId}: Confirmation Call slot check could not read GHL — keeping ${appt.adate} ${appt.atime} (fail open)`);
+  }
+  return appt;
 }
 
 /**
@@ -424,6 +458,8 @@ async function runCalculatorLaneGate(action, contactId, ghlContact) {
   return { stop: false, check };
 }
 
+export { resolveLpAppointment };
+
 export async function executeCreateLPLead(action) {
   const contactId = action.target_id;
   const payload = action.action_payload || {};
@@ -484,7 +520,7 @@ export async function executeCreateLPLead(action) {
   // Look it up; write back an issued lds and set the appointment on it, or say
   // it is waiting. Never addLead. See lp-lead-inbound-only.js.
   if (existingInbound && !existingLeadId) {
-    const appt = resolveAppointment(payload, eventPayload, ghlContact, payload.include_appt !== false);
+    const appt = await resolveLpAppointment(payload, eventPayload, ghlContact, payload.include_appt !== false, contactId);
     return resolveInboundOnly({
       action, contactId, in1: existingInbound, appt,
       deps: {
@@ -538,7 +574,7 @@ export async function executeCreateLPLead(action) {
   }
   const existingLeadCheck = buildGuardCheck({ mode: guardMode, ...guard });
   if (guard.decision === 'reused') {
-    const appt = resolveAppointment(payload, eventPayload, ghlContact, payload.include_appt !== false);
+    const appt = await resolveLpAppointment(payload, eventPayload, ghlContact, payload.include_appt !== false, contactId);
     const reused = await reuseExistingLpLead(action, contactId, guard.existing, appt);
     return { ...reused, existing_lead_check: existingLeadCheck };
   }
@@ -660,7 +696,7 @@ export async function executeCreateLPLead(action) {
 
   // ─── Resolve appointment (optional, default include) ──────────────
   const includeAppt = payload.include_appt !== false;
-  const appt = resolveAppointment(payload, eventPayload, ghlContact, includeAppt);
+  const appt = await resolveLpAppointment(payload, eventPayload, ghlContact, includeAppt, contactId);
   const adate = appt?.adate || '';
   const atime = appt?.atime || '';
 

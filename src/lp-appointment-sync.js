@@ -234,6 +234,7 @@ import { enrollLpLeadCreation } from './admin/lp-force-addlead.js';
 // 2026-07-07 call-dispatch-integrity: Five9 direct dispatch gate for GHL-only
 // calendars (dormant unless FIVE9_DIRECT_DISPATCH=true — see five9/list-dispatch.js).
 import { isGhlOnlyCalendarId } from './knowledge/booking-calendar-router.js';
+import { checkConfirmationCallSlot } from './services/confirmation-call-slot.js';
 import { five9DispatchConfigured, dispatchConfirmationCallback } from './five9/list-dispatch.js';
 // 2026-07-28 appt-enrichment repoint: the CANONICAL rate-limited GHL client.
 // Byte-identical to the private ghlFetch below EXCEPT it calls report429() on a
@@ -1941,6 +1942,7 @@ async function syncAppointmentToLP({
   const _lpAlreadyHasAppointment = deps.lpAlreadyHasAppointment || lpAlreadyHasAppointment;
   const _resolveLPLeadId = deps.resolveLPLeadId || resolveLPLeadId;
   const _lpSetAppointment = deps.lpSetAppointment || lpSetAppointment;
+  const _checkConfirmationCallSlot = deps.checkConfirmationCallSlot || checkConfirmationCallSlot;
 
   // ── GHL-only calendar: never an LP appointment (2026-10-08) ──
   // Confirmation Call is a phone touch, not the estimate visit. The executor
@@ -1959,6 +1961,31 @@ async function syncAppointmentToLP({
       calendar_name: calendarName || null,
       reason: 'GHL-only calendar — appointments on this calendar are never synced to LP',
     };
+  }
+
+  // ── No calendar named: is this time the contact's Confirmation Call? ──
+  // (the user, 2026-10-09: never an LP appointment for a confirmation call.)
+  // A caller that names no calendar (the set_lp_appointment tool, a webhook
+  // whose enrichment found none) usually took the time from GHL's
+  // last_appointment fields, which any calendar fills. A named calendar is
+  // trusted as is. Fails open on a GHL read failure; see confirmation-call-slot.js.
+  if (!calendarId) {
+    const slot = await _checkConfirmationCallSlot({ contactId, apptDate: appointmentDate, apptTime: appointmentTime });
+    if (slot.blocked) {
+      console.log(`[LP-APPT] skipped_ghl_only_calendar for ${contactId}: ${appointmentDate} ${appointmentTime} is GHL-only appointment ${slot.appointment?.appointment_id} (calendar ${slot.appointment?.calendar_id}) — never synced to LP`);
+      return {
+        success: true,
+        action: 'skipped_ghl_only_calendar',
+        contact_id: contactId,
+        calendar_id: slot.appointment?.calendar_id || null,
+        calendar_name: calendarName || null,
+        ghl_appointment_id: slot.appointment?.appointment_id || null,
+        reason: 'time matches a GHL-only appointment (Confirmation Call) — never synced to LP',
+      };
+    }
+    if (slot.reason === 'lookup_failed') {
+      console.warn(`[LP-APPT] Confirmation Call slot check could not read GHL for ${contactId} — proceeding (fail open)`);
+    }
   }
 
   // ── Early idempotency: LP already holds this exact appointment ──
