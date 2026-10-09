@@ -418,7 +418,7 @@ export async function executeSetLPAppointment(action, context = {}) {
   // all → proceed unchanged (defense-in-depth, not a gate).
   const evtCalendarId = payload.calendar_id || eventPayload.calendar_id || null;
   const evtCalendarName = String(payload.calendar_name || eventPayload.calendar_name || eventPayload.title || '').trim().toLowerCase();
-  if ((evtCalendarId && isGhlOnlyCalendarId(evtCalendarId)) || evtCalendarName === 'confirmation call') {
+  if ((evtCalendarId && isGhlOnlyCalendarId(evtCalendarId)) || evtCalendarName === 'confirmation call' || evtCalendarName === 'rehash call') {
     console.log(`[LP-APPT] skipped_ghl_only_calendar for ${contactId} (calendar=${evtCalendarId || evtCalendarName})`);
     return {
       action: 'skipped_ghl_only_calendar',

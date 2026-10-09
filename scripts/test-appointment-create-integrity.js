@@ -317,18 +317,39 @@ const confAction = (payload = {}) => action({
   calendar_name: 'Confirmation Call', calendar_id: CONFIRMATION_CALL, ...payload,
 });
 
-test('(7) Confirmation Call, contact has no owner → assigned to the Rehash rep (John Manieri)', async () => {
+// 2026-10-09 (the user, after #1223): pre-demo leads use Confirmation Call
+// too, so it names nobody again; rehash calls have their own Rehash Call
+// calendar (REHASH_CALENDAR_ID), which goes to the rehash rep.
+test('(7) a pre-demo Confirmation Call names nobody — not the Rehash rep', async () => {
   reset({ contact: fullContact({ assignedTo: null }) });
   await executeBookAppointment(confAction(), {});
   assert.equal(createPosts().length, 1);
   assert.equal(createPosts()[0].body.calendarId, CONFIRMATION_CALL);
-  assert.equal(createPosts()[0].body.assignedUserId, 'TYcZ9DcNkuPCFYsFxRFV');
+  assert.equal(createPosts()[0].body.assignedUserId, undefined);
 });
 
-test('(7b) Confirmation Call → the contact owner wins over the default', async () => {
+test('(7b) a Confirmation Call does not take the contact owner either', async () => {
   reset({ contact: fullContact({ assignedTo: 'ownerUser123' }) });
   await executeBookAppointment(confAction(), {});
-  assert.equal(createPosts()[0].body.assignedUserId, 'ownerUser123');
+  assert.equal(createPosts()[0].body.assignedUserId, undefined);
+});
+
+test('(7e) a Rehash Call goes to a rehash-team owner, else the Rehash rep', async () => {
+  const prev = { cal: process.env.REHASH_CALENDAR_ID, team: process.env.REHASH_TEAM_USER_IDS };
+  process.env.REHASH_CALENDAR_ID = 'rehashCal1';
+  process.env.REHASH_TEAM_USER_IDS = 'TYcZ9DcNkuPCFYsFxRFV,rep2';
+  try {
+    reset({ contact: fullContact({ assignedTo: 'rep2' }) });
+    await executeBookAppointment(action({ calendar_name: 'Rehash Call', calendar_id: 'rehashCal1' }), {});
+    assert.equal(createPosts()[0].body.assignedUserId, 'rep2');
+    reset({ contact: fullContact({ assignedTo: 'salesRep' }) });
+    await executeBookAppointment(action({ calendar_name: 'Rehash Call', calendar_id: 'rehashCal1' }), {});
+    assert.equal(createPosts()[0].body.assignedUserId, 'TYcZ9DcNkuPCFYsFxRFV');
+  } finally {
+    for (const [k, v] of [['REHASH_CALENDAR_ID', prev.cal], ['REHASH_TEAM_USER_IDS', prev.team]]) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  }
 });
 
 test('(7c) an assignee named on the payload wins over the owner', async () => {

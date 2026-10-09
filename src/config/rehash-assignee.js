@@ -26,7 +26,28 @@ export function confirmationCallAssignee(env = process.env) {
 }
 
 /**
+ * Pure. The GHL user a call booking goes to (the user, 2026-10-09, after the
+ * clash: pre-demo leads use Confirmation Call too, so the rehash default must
+ * not touch it).
+ *   Rehash Call calendar  the named assignee → the contact's owner when that
+ *                         owner is on the rehash team → the Rehash rep.
+ *   Confirmation Call     the named assignee only; otherwise nobody, as before
+ *                         #1223 (GHL assigns it).
+ *   any other calendar    the named assignee only.
+ */
+export function callAssigneeFor({ isRehashCalendar = false, explicit, contactOwner, team = null } = {}, env = process.env) {
+  const clean = (v) => (typeof v === 'string' && v.trim() ? v.trim() : null);
+  if (clean(explicit)) return clean(explicit);
+  if (!isRehashCalendar) return null;
+  const owner = clean(contactOwner);
+  if (owner && team && team.has(owner)) return owner;
+  return confirmationCallAssignee(env);
+}
+
+/**
  * Pure. The GHL user a Confirmation Call goes to.
+ * @deprecated 2026-10-09 — assigned every Confirmation Call to the Rehash rep,
+ * pre-demo ones included. Use callAssigneeFor.
  *   explicit      an assignee the caller named on the booking
  *   contactOwner  the contact's owner in GHL (contact.assignedTo)
  */

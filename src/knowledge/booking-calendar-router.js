@@ -73,6 +73,24 @@ export function requiresInHomeGate(calendarKey) {
   return IN_HOME_CALENDAR_KEYS.has(calendarKey);
 }
 
+/**
+ * The rehash team's own "Rehash Call" calendar (the user, 2026-10-09): a GHL
+ * Round Robin calendar of the rehash reps, so a rehash call never lands on the
+ * pre-demo Confirmation Call calendar. Its id comes from REHASH_CALENDAR_ID
+ * (created in GHL by a person); unset = no rehash calendar yet. GHL-only like
+ * Confirmation Call: every LP guard that reads isGhlOnlyCalendarId refuses it.
+ */
+export function rehashCalendarId(env = process.env) {
+  const id = String(env.REHASH_CALENDAR_ID || '').trim();
+  return id || null;
+}
+
+/** True if `calendarId` is the Rehash Call calendar. */
+export function isRehashCalendarId(calendarId, env = process.env) {
+  const id = rehashCalendarId(env);
+  return !!id && String(calendarId || '').trim() === id;
+}
+
 /** True if `calendarId` is one of the in-home (rep-visits) calendars. */
 export function isInHomeCalendarId(calendarId) {
   return IN_HOME_CALENDAR_IDS.has(calendarId);
@@ -80,7 +98,7 @@ export function isInHomeCalendarId(calendarId) {
 
 /** True if `calendarId` is a GHL-only (never-sync-to-LP) calendar. */
 export function isGhlOnlyCalendarId(calendarId) {
-  return GHL_ONLY_CALENDAR_IDS.has(calendarId);
+  return GHL_ONLY_CALENDAR_IDS.has(calendarId) || isRehashCalendarId(calendarId);
 }
 
 /** Default appointment duration (minutes) for a resolved calendar key. */

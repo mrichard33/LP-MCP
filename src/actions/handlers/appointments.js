@@ -93,9 +93,10 @@ import { ghlFetch, interpolatePayload } from '../helpers.js';
 import { CALENDAR_MAP, GHL_LOCATION_ID } from '../constants.js';
 import { updateGHLContactFields, applyGHLTag, removeGHLTags } from '../../ghl.js';
 import { fetchUpcomingAppointments } from '../../knowledge/contact-appointments.js';
-import { isInHomeCalendarId, isGhlOnlyCalendarId } from '../../knowledge/booking-calendar-router.js';
-import { confirmationCallAssigneeFor } from '../../config/rehash-assignee.js';
-import { isInRehash, rehashRoutingMode } from '../../agentic/rehash-state.js';
+import { isInHomeCalendarId, isGhlOnlyCalendarId, isRehashCalendarId, rehashCalendarId, BOOKING_CALENDARS } from '../../knowledge/booking-calendar-router.js';
+import { callAssigneeFor } from '../../config/rehash-assignee.js';
+import { isInRehash, rehashRoutingMode, rehashTeamUserIds } from '../../agentic/rehash-state.js';
+import { notifyRehashCall } from '../../notifications/rehash-call.js';
 import { fetchCurrentLead } from '../../current-lead.js';
 import { markRescheduleInflight } from '../../services/reschedule-inflight.js';
 import { executeCreateTask } from './tasks.js';
@@ -596,7 +597,11 @@ async function findExistingAppointments(contactId, calendarId) {
   }
 }
 
-/** 'live' | 'shadow' when this contact is in rehash (per REHASH_ROUTING_MODE), else null. */
+/**
+ * 'live' | 'shadow' when this contact is in rehash (per REHASH_ROUTING_MODE),
+ * null when it is not (or the mode is off). Throws on a failed read; the
+ * caller reads that as 'unknown', which neither refuses nor redirects.
+ */
 async function rehashVisitBlocked(contactId) {
   const mode = rehashRoutingMode();
   if (mode === 'off') return null;
@@ -612,18 +617,38 @@ export async function executeBookAppointment(action, context) {
   let { body, calendarId, startTime, endTime, title, status, ignoreFreeSlotValidation } = buildAppointmentBody(payload, contactId);
 
   // 2026-10-09 (the user): a rehash lead (post-demo OPPFDN) is a phone call
-  // with the rehash team on the GHL-only Confirmation Call calendar, assigned
-  // to the rep (src/config/rehash-assignee.js) — never a visit, never moved
-  // onto an in-home calendar. Monica (581695) had her old appointment moved
-  // and an LP re-set followed. A failed read books as before (fail-open): the
-  // LP lock (src/lp-post-demo-lock.js) still stands behind it.
-  if (!isGhlOnlyCalendarId(calendarId)) {
-    const rehashGate = await rehashVisitBlocked(contactId).catch(() => null);
-    if (rehashGate === 'live') {
-      console.log(`[ActionExecutor] ⛔ skipped_rehash_visit: ${contactId} is in rehash — no visit on ${calendarId}`);
-      return { action: 'skipped_rehash_visit', contact_id: contactId, calendar_id: calendarId, start_time: startTime, reason: 'rehash lead: phone call with the rehash team only (2026-10-09)' };
+  // with the rehash team on THEIR calendar, "Rehash Call" (REHASH_CALENDAR_ID,
+  // GHL-only) — never a visit, never the pre-demo Confirmation Call calendar,
+  // whose calls must not reach the rehash team. Monica (581695) had her old
+  // appointment moved and an LP re-set followed. A failed read books as before
+  // (fail-open): the LP lock (src/lp-post-demo-lock.js) stands behind it.
+  const rehashGate = await rehashVisitBlocked(contactId).catch(() => 'unknown');
+  const rehashCal = rehashCalendarId();
+  if (rehashGate === 'live') {
+    if (calendarId === BOOKING_CALENDARS.CONFIRMATION_CALL && rehashCal) {
+      console.log(`[ActionExecutor] ↪️ ${contactId} is in rehash — call moved from Confirmation Call to Rehash Call (${rehashCal})`);
+      calendarId = rehashCal;
+      body.calendarId = rehashCal;
+    } else if (!isRehashCalendarId(calendarId)) {
+      const reason = isGhlOnlyCalendarId(calendarId) ? 'skipped_rehash_no_calendar' : 'skipped_rehash_visit';
+      console.log(`[ActionExecutor] ⛔ ${reason}: ${contactId} is in rehash — nothing booked on ${calendarId}`);
+      if (reason === 'skipped_rehash_no_calendar') {
+        await notifyRehashCall({
+          contactId,
+          generated: { rehash: { active: true, rep_name: null }, rehash_call: { agreed: true, preferred_time: startTime || null } },
+          triggerMessage: null,
+          contact: {},
+        }).catch(() => {});
+      }
+      return { action: reason, contact_id: contactId, calendar_id: calendarId, start_time: startTime, reason: 'rehash lead: a call on the Rehash Call calendar only (2026-10-09)' };
     }
-    if (rehashGate === 'shadow') console.log(`[ActionExecutor] 🕶️ ${contactId} is in rehash — live would refuse this visit on ${calendarId}`);
+  } else if (rehashGate === 'shadow' && !isRehashCalendarId(calendarId)) {
+    console.log(`[ActionExecutor] 🕶️ ${contactId} is in rehash — live would book only on Rehash Call, not ${calendarId}`);
+  }
+  // The other way round: a pre-demo lead never lands with the rehash team.
+  if (isRehashCalendarId(calendarId) && rehashGate === null && rehashRoutingMode() === 'live') {
+    console.log(`[ActionExecutor] ⛔ skipped_not_rehash: ${contactId} is not in rehash — nothing booked on Rehash Call`);
+    return { action: 'skipped_not_rehash', contact_id: contactId, calendar_id: calendarId, start_time: startTime, reason: 'Rehash Call is for rehash leads only (2026-10-09)' };
   }
 
   // v3.4 / 2026-06-24: idempotent-booking guard. The executor reaps stuck
@@ -889,15 +914,15 @@ export async function executeBookAppointment(action, context) {
     console.warn(`[ActionExecutor] appointment title rebuild failed for ${contactId}: ${err.message} — leaving payload title.`);
   }
 
-  // 2026-10-09 (the user): a Confirmation Call stays in GHL and goes to the
-  // Rehash rep — the contact's owner when one is set, else the Rehash rep.
-  // An assignee named on the payload still wins. A failed contact read falls
-  // back to the Rehash rep, never to "no assignee".
-  if (isGhlOnlyCalendarId(calendarId)) {
+  // 2026-10-09 (the user): a Rehash Call goes to the rehash rep — the contact's
+  // owner when that owner is on the rehash team, else the Rehash rep. A
+  // pre-demo Confirmation Call names nobody, as before #1223 (the rehash
+  // default had sent those to John Manieri). A named assignee always wins.
+  if (isRehashCalendarId(calendarId)) {
     const owner = await getContactCached(contactId, context?._contactCache, { maxWaitMs: BOOKING_TOKEN_WAIT_MS })
       .then((c) => c?.assignedTo || null)
       .catch(() => null);
-    const assignee = confirmationCallAssigneeFor({ explicit: payload.assigned_user_id, contactOwner: owner });
+    const assignee = callAssigneeFor({ isRehashCalendar: true, explicit: payload.assigned_user_id, contactOwner: owner, team: rehashTeamUserIds() });
     if (assignee) body.assignedUserId = assignee;
   }
 

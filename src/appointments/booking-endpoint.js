@@ -70,8 +70,9 @@ import { GHL_LOCATION_ID } from '../actions/constants.js';
 import { findExistingAppointment, emitSlotCheckEvent, isSlotCheckEnabled, readStatus } from './slot-check.js';
 import { applyAppointmentFormat } from './format.js';
 import { claimAppointmentCreate, releaseAppointmentCreate } from '../services/appointment-sync-claim.js';
-import { isGhlOnlyCalendarId } from '../knowledge/booking-calendar-router.js';
-import { confirmationCallAssigneeFor } from '../config/rehash-assignee.js';
+import { isRehashCalendarId } from '../knowledge/booking-calendar-router.js';
+import { callAssigneeFor } from '../config/rehash-assignee.js';
+import { rehashTeamUserIds } from '../agentic/rehash-state.js';
 
 const APPOINTMENT_DURATION_MS = 90 * 60_000;
 const DEFAULT_BUDGET_MS = 8000;
@@ -270,13 +271,16 @@ export async function createAppointmentFromLpHandler(req, res) {
   const calendarId = String(src.calendarId || src.calendar_id || '').trim();
   const startTime = String(src.startTime || src.start_time || '').trim();
   let assignedUserId = String(src.assignedUserId || src.assigned_user_id || '').trim();
-  // 2026-10-09 (the user): a Confirmation Call goes to the Rehash rep — the
-  // named assignee, else the contact's owner if the workflow sent it, else the
-  // Rehash rep. No GHL read here: this route sits inside a workflow's budget.
-  if (isGhlOnlyCalendarId(String(src.calendarId || src.calendar_id || '').trim())) {
-    assignedUserId = confirmationCallAssigneeFor({
+  // 2026-10-09 (the user): a Rehash Call goes to the rehash rep (the named
+  // assignee, else the owner when on the rehash team, else the Rehash rep). A
+  // pre-demo Confirmation Call names nobody but a named assignee, as before
+  // #1223. No GHL read here: this route sits inside a workflow's budget.
+  if (isRehashCalendarId(calendarId)) {
+    assignedUserId = callAssigneeFor({
+      isRehashCalendar: true,
       explicit: assignedUserId,
       contactOwner: src.contactOwner || src.contact_owner || src.assignedTo || null,
+      team: rehashTeamUserIds(),
     }) || '';
   }
   const title = src.title || 'Appointment';
