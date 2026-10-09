@@ -30,6 +30,15 @@ const DEFAULT_WINDOW_HOURS = Math.max(
   parseInt(process.env.WORKFLOW_REENROLL_WINDOW_HOURS || '6', 10),
 );
 
+// 2026-10-08: a still-'executing' row counts too, but only an EARLIER one (lower
+// id). The two views of one cancellation can be claimed in the same executor pass,
+// about 2 seconds apart, and then neither had COMPLETED when the other looked: both
+// sent (ZIHD0my624CBMUbVkFoI on 09-30, SAOiPqzuQMSQDGqAJi2U on 10-07; 2 of 82 pairs
+// in 30 days). The earlier row wins and the later one is deduped, so the pair can
+// never both pass. Rows are flipped to 'executing' before this gate runs, so the
+// earlier one is always visible. A row this gate deduped is not an enrollment.
+const COUNTED_STATUSES = ['completed', 'executing'];
+
 // How many recent completed enrollments to scan for a destination match. Small:
 // a contact enrolled into many distinct workflows inside the window is rare, and
 // we only need to find one matching the incoming destination.
@@ -50,8 +59,8 @@ export function workflowIdentity(payload) {
 }
 
 /**
- * Find a prior completed enrollment of the same contact into the same workflow
- * within the window.
+ * Find a prior enrollment (completed, or an earlier row still executing) of the
+ * same contact into the same workflow within the window.
  *
  * @param {object} action  the add_to_workflow agent_action row (target_id,
  *   action_payload, id)
@@ -74,10 +83,10 @@ export async function findPriorEnrollment(action, { client, windowHours = DEFAUL
     const windowStart = new Date(Date.now() - windowHours * 60 * 60 * 1000).toISOString();
     let query = supabase
       .from('agent_actions')
-      .select('id, action_payload, created_at')
+      .select('id, status, action_payload, execution_result, created_at')
       .eq('target_id', contactId)
       .eq('action_type', 'add_to_workflow')
-      .eq('status', 'completed')
+      .in('status', COUNTED_STATUSES)
       .gte('created_at', windowStart)
       .order('created_at', { ascending: false })
       .limit(SCAN_LIMIT);
@@ -89,7 +98,10 @@ export async function findPriorEnrollment(action, { client, windowHours = DEFAUL
     if (error) throw error;
 
     const rows = Array.isArray(data) ? data : [];
+    const ownId = Number(action?.id);
     for (const row of rows) {
+      if (row.execution_result?.action === 'deduped') continue;
+      if (row.status === 'executing' && !(Number.isFinite(ownId) && Number(row.id) < ownId)) continue;
       if (workflowIdentity(row.action_payload) === identity) {
         const age_ms = row.created_at ? Date.now() - new Date(row.created_at).getTime() : null;
         return { duplicate: true, prior_action_id: row.id, age_ms, reason: 'duplicate_enrollment_window' };
