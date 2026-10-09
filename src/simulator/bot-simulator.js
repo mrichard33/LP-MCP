@@ -27,13 +27,47 @@
 
 import { createLiveChatFastLane, minimalContext } from '../live-chat/fast-lane.js';
 import { BOOKING_CALENDARS } from '../knowledge/booking-calendar-router.js';
-import { callbackDecision, NO_DIAL_REASONS } from '../agentic/bot-callback.js';
+import { callbackDecision, schedulingCallbackDecision, NO_DIAL_REASONS } from '../agentic/bot-callback.js';
+import { applyBookingTruth } from '../agentic/booking-claim.js';
+import { buildLeadFacts } from '../agentic/lead-facts.js';
 import { scoreRun, compareScorecards } from './sim-scoring.js';
 
 export const SIM_CONTACT_PREFIX = 'sim-';
 
 const GUEST = { firstName: 'Guest', lastName: 'Visitor sim01', phone: null, email: null, postalCode: null };
 const RICK = { firstName: 'Rick', lastName: 'Fox', phone: '+13525550188', email: null, postalCode: '34470' };
+// 2026-10-07 (Nicholas Ferraioli, GHL I5x7zltORikAxdEJ6nyD): his visit was
+// cancelled on our end with a "not something we can run" note; he asked to
+// reschedule and was told "You're all set" with nothing booked.
+const NICK = {
+  firstName: 'Nicholas', lastName: 'Sim', phone: '+17275550142', email: null, postalCode: '33711',
+  lp: {
+    disposition: 'CXL', appointment_cancelled: true, last_appointment_date: '2026-10-07T15:00:00+00:00',
+    zip: '33711', city: 'Saint Petersburg', address: '747 38th St S',
+    notes: [{ text: 'CXL: This CX does not appear to own the home as of now, it looks like its a program to help veterans with affordable housing. This is not something we can run.', entered_by: 'Massingill, Kaley', date: '2026-10-07T13:29:58Z' }],
+  },
+};
+
+/**
+ * The persona's LP record (persona.lp) laid onto a minimal context: the
+ * simulator's seam for LP notes, a disposition and the property ZIP. Pure.
+ */
+export function withPersonaLp(context, persona) {
+  const lp = persona?.lp;
+  if (!lp) return context;
+  const ctxLp = {
+    ...(context.lp || {}), matched: true, lead_id: lp.lead_id || 'sim-lead',
+    disposition: lp.disposition || null,
+    appointment_set: lp.appointment_cancelled ? false : !!lp.appointment_date,
+    appointment_cancelled: !!lp.appointment_cancelled,
+    appointment_date: lp.appointment_cancelled ? null : (lp.appointment_date || null),
+    last_appointment_date: lp.last_appointment_date || null,
+    notes: lp.notes || [],
+  };
+  const next = { ...context, lp: ctxLp };
+  next.lead_facts = buildLeadFacts({ lp: ctxLp, lpLead: { zip: lp.zip, city: lp.city, address: lp.address }, lead: context.lead });
+  return next;
+}
 
 /** The test conversations (the "good test messages" list). Customer side only. */
 export const SCENARIOS = Object.freeze({
@@ -54,6 +88,8 @@ export const SCENARIOS = Object.freeze({
   cancel_reschedule: { title: 'Cancel → reschedule (live chat)', persona: GUEST, channels: ['livechat'], appointmentHolder: RICK, turns: ['I need to cancel my appointment', 'Rick Fox 352-555-0188', 'Yes, a different day', 'The first one'] },
   cancel: { title: 'Cancel (live chat)', persona: GUEST, channels: ['livechat'], appointmentHolder: RICK, turns: ['I need to cancel my appointment', 'Rick Fox 352-555-0188', 'No, just cancel it'] },
   spanish: { title: 'Spanish (live chat)', persona: GUEST, channels: ['livechat'], turns: ['Hola, necesito ventanas para mi casa'] },
+  // 2026-10-07 (Nicholas Ferraioli): cancelled on our end, a "can't run" note, then a reschedule ask.
+  cancelled_cant_run_reschedule: { title: "Cancelled, can't-run note, reschedule ask (SMS)", persona: NICK, channels: ['sms'], turns: ['R U going to reschedule, or should I continue to wait', 'Okay, can we schedule for tomorrow morning around 10:00', 'Okay 👍', 'Perfect'] },
 });
 
 /** Parse a message list or a scenario name into one plan. Pure. */
@@ -194,7 +230,7 @@ export async function simulateSms(plan, { nepqMode = 'live', generate, buildReal
     const text = plan.turns[i];
     const at = new Date(nowMs + i * 60000).toISOString();
     thread.push({ direction: 'inbound', channel: 'sms', text, type: 'text', timestamp: at });
-    const context = { ...(realBase || minimalContext({ contactId, contact, nowMs: nowMs + i * 60000 })), conversation_recent: thread.slice(-20) };
+    const context = { ...(realBase || withPersonaLp(minimalContext({ contactId, contact, nowMs: nowMs + i * 60000 }), p)), conversation_recent: thread.slice(-20) };
     const t0 = Date.now();
     let generated = null;
     let error = null;
@@ -214,16 +250,29 @@ export async function simulateSms(plan, { nepqMode = 'live', generate, buildReal
         error = String(err?.message || err).slice(0, 300);
       }
     }
+    // The send handler's last pass (2026-10-07): a time claim with no real
+    // booking becomes the no-promise hand-off. A simulated booking companion
+    // counts as booked; nothing on file is ever "held" here unless code held it.
+    let truthBlocked = null;
+    if (generated?.message) {
+      const simBooked = generated.companion_action?.action_type === 'book_appointment';
+      const truth = applyBookingTruth(generated.message, generated, { result: simBooked ? { booked: true, appointment_id: 'sim' } : null, nowMs: nowMs + i * 60000 });
+      if (truth.blocked) { generated = { ...generated, message: truth.message, companion_action: null }; truthBlocked = truth.blocked; }
+    }
     const reply = generated?.message || null;
     if (reply) thread.push({ direction: 'outbound', channel: 'sms', text: reply, type: 'text', timestamp: new Date(Date.parse(at) + 30000).toISOString() });
     const wouldDo = [];
     if (generated?.dm_handoff) wouldDo.push({ kind: 'would_hand_off_decision_maker', reason: generated.dm_handoff.reason });
     // 2026-10-03: the send handler files the callback (Five9 + #contact-center).
     // Part 14: the send handler's decision, one shape (no GHL ring; Five9 calls).
+    if (truthBlocked) wouldDo.push({ kind: 'booking_claim_blocked', reason: truthBlocked.reason });
+    if (generated?.lp_note_dq) wouldDo.push({ kind: 'would_stop_bot_lp_note_dq', reason: generated.lp_note_dq.signal });
+    const scheduling = generated && !generated.service_conversation ? schedulingCallbackDecision({ bookingClaimBlocked: !!truthBlocked, onFile: !!generated.appointment_on_file }) : null;
     const cb = !reply ? null
+      : generated?.lp_note_dq ? { why: 'lp_note_dq', reason: 'lp_note_dq', kind: 'sales' }
       : (generated?.nepq_handoff || generated?.dm_handoff) ? callbackDecision({ handoffReason: generated?.nepq_handoff?.reason || null, otherHandoff: !!generated?.dm_handoff, text: reply })
         : generated?.callback_requested ? { why: 'classifier_callback', reason: generated.callback_requested, kind: generated.callback_requested === 'service' ? 'service' : 'sales' }
-          : callbackDecision({ text: reply });
+          : scheduling || callbackDecision({ text: reply });
     if (cb) {
       const service = cb.kind ? cb.kind === 'service' : !!generated?.service_conversation;
       wouldDo.push(service

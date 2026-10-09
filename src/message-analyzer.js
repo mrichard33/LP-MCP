@@ -239,6 +239,7 @@
  */
 
 import { cleanInboundForModel } from './security/untrusted-text.js';
+import { renderLeadFacts } from './agentic/lead-facts.js';
 import crypto from 'node:crypto';
 import { buildLeadContext, upsertLeadIntelligence } from './context-builder.js';
 import { emitEvent } from './event-emitter.js';
@@ -864,6 +865,11 @@ function buildContextSummary(context) {
     }
   }
 
+  // ─── Lead facts (2026-10-07, Nicholas) ─────────────────────
+  // The same block the reply writer renders (lead-facts.js), so the two
+  // prompts can no longer disagree about the cancel, the notes or the ZIP.
+  if (context.lead_facts) parts.push(...renderLeadFacts(context.lead_facts));
+
   // ─── LeadPerfection CRM Data ───────────────────────────────
   if (context.lp?.matched || context.lp?.disposition) {
     parts.push(`\nLP CRM DATA:`);
@@ -886,7 +892,8 @@ function buildContextSummary(context) {
     if (context.lp.call_count) parts.push(`Call Count: ${context.lp.call_count}`);
 
     // v1.1: Show up to 5 LP notes (increased from 3) with full 200-char text
-    if (context.lp.notes?.length) {
+    // 2026-10-07: with LEAD FACTS above, every note is already there in full.
+    if (context.lp.notes?.length && !context.lead_facts) {
       parts.push(`\nLP REP/SYSTEM NOTES (read these carefully — they are ground truth):`);
       const noteLines = context.lp.notes.slice(0, 5).map(n => {
         const byLine = n.entered_by ? `[${n.entered_by}]` : '[System]';

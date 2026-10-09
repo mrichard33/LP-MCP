@@ -294,7 +294,7 @@ import { executeSendInfoEmail } from './handlers/info-email.js';
 import { executeFive9Write } from './handlers/five9.js';
 import { trackAction } from '../graceful-shutdown.js';
 // 2026-10-07 — hard DQ stop (stop-bot + leave the sending workflows).
-import { isDqTriggerTag, scheduleDqHardStop, executeDqHardStop } from '../services/dq-hard-stop.js';
+import { isDqTriggerTag, scheduleDqHardStop, executeDqHardStop, LP_NOTE_DQ_TRIGGER } from '../services/dq-hard-stop.js';
 import { resolveWorkflowIdByCanonicalCode } from '../tools/admin/hl-fallback.js';
 import { ghlFetch } from './helpers.js';
 
@@ -639,6 +639,15 @@ function dqHardStopDeps() {
     emitEvent,
     resolveWorkflowId: resolveWorkflowIdByCanonicalCode,
   };
+}
+
+/**
+ * 2026-10-07 (Nicholas Ferraioli): a team note says we cannot run the lead
+ * (src/agentic/lp-note-dq.js). The same dq_hard_stop, 60s after the
+ * hand-off reply, behind LP_NOTE_DQ_MODE. Never throws.
+ */
+export async function scheduleLpNoteDqStop(contactId, { sourceActionId = null, rule = null } = {}) {
+  return scheduleDqHardStop({ contactId, trigger: LP_NOTE_DQ_TRIGGER, sourceActionId, rule }, dqHardStopDeps());
 }
 
 async function executeAddTagWithDqStop(action, context) {

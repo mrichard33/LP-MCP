@@ -18,9 +18,15 @@
 // WHICH LIST — the user's ruling 2026-10-06 (replaces the 2026-10-05 default
 // of "Callback Request" for every lead with no appointment). First match wins:
 //   1. appointment today or tomorrow → "Conf - Next Day"; 2+ days → "Conf - 2nd Day"
-//      — EXCEPT while booked routing is LIVE (Mark, 2026-10-06 follow-up to
-//      decision #2669): a visit 3+ days out is then NOT pushed here; it is held
-//      and src/jobs/booked-dial-routing.js adds it two days before the visit.
+//      — EXCEPT while booked routing is LIVE: then NO booked visit is pushed
+//      here; src/jobs/booked-dial-routing.js owns them all (decision #2669).
+//      2026-10-06: it took the 3+ day visits (added two days before the visit).
+//      2026-10-08: it takes every visit. In its first live hours both jobs
+//      added LP leads 582143 and 582149 to the same Conf list, 4 s and 10 min
+//      apart: booked routing checks for an earlier Conf add of the phone, this
+//      job could not see one (Five9's "last list" only moves on a dial). Five9
+//      kept one entry, but the second add was wasted and set call-now, which
+//      booked routing leaves off on purpose. One owner means no race.
 //      Tied to BOOKED_DIAL_ROUTING_MODE=live on purpose: in shadow or off,
 //      nothing else would ever put that lead on a confirmation list.
 //   2. the lead asked for a callback → NOT ours: src/five9/callback-push.js files
@@ -118,8 +124,8 @@ export function backstopConfig(env = process.env) {
     maxLookups: num(env.NEW_LEAD_BACKSTOP_MAX_LOOKUPS, 40, 1),
     callNowMode: String(env.NEW_LEAD_BACKSTOP_CALL_NOW_MODE || callbackCallNowMode()).trim().toUpperCase() || 'ANY',
     // Read like routingMode() in src/booked-dial-routing.js (not imported: that
-    // module imports this one). Only an exact 'live' holds 3+ day visits.
-    holdThreePlusForBookedRouting: String(env.BOOKED_DIAL_ROUTING_MODE ?? '').trim().toLowerCase() === 'live',
+    // module imports this one). Only an exact 'live' hands booked visits over.
+    bookedRoutingLive: String(env.BOOKED_DIAL_ROUTING_MODE ?? '').trim().toLowerCase() === 'live',
   };
 }
 
@@ -265,12 +271,13 @@ export function currentState(row, lead = null) {
  */
 export function routeList({ hasAppt, apptDateEt, apptStartMs, nowMs, cfg }) {
   if (!hasAppt) return { list: cfg.lists.noAppt, why: 'no_appointment', dialAsap: true };
+  // Booked routing live: every booked visit is its job (2026-10-08, above).
+  if (cfg.bookedRoutingLive) return { skip: 'appt_owned_by_booked_routing' };
   if (!apptDateEt) return { list: cfg.lists.nextDay, why: 'appt_date_unknown' };
   const daysOut = daysBetween(etDateKey(nowMs), apptDateEt);
   if (daysOut < 0) return { skip: 'past_appointment' };
   if (daysOut === 0 && Number.isFinite(apptStartMs) && apptStartMs <= nowMs) return { skip: 'past_appointment' };
   if (daysOut <= 1) return { list: cfg.lists.nextDay, why: daysOut === 0 ? 'appt_today' : 'appt_tomorrow' };
-  if (daysOut >= 3 && cfg.holdThreePlusForBookedRouting) return { skip: 'appt_held_for_booked_routing' };
   return { list: cfg.lists.secondDay, why: 'appt_2plus_days' };
 }
 

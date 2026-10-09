@@ -10,7 +10,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  watchMode, watchConfig, watchRow, classifyRow, priorityOf, assessWaiting, inOfficeHours, formatWaitCard,
+  watchMode, watchConfig, watchRow, classifyRow, priorityOf, assessWaiting, inOfficeHours, formatWaitCard, officeClockStartMs,
   writebackDecision, upcomingContactAppt, contactApptKey, WAIT_HEADER, GHL_FIELD_LP_LEAD_ID,
 } from '../src/inbound-checkout-watch.js';
 import { runInboundCheckoutWatch, WAIT_AUDIT, ESCALATE_AUDIT } from '../src/jobs/inbound-checkout-watch.js';
@@ -319,6 +319,43 @@ test('an inquiry the held-row "import this lead" card already named is not carde
   const res = await runInboundCheckoutWatch({ env: LIVE, nowMs: edt('2026-10-07T10:31:00'), deps: h.d });
   assert.equal(res.ok, true, res.errors.join());
   assert.equal(h.calls.posts.length, 0);
+});
+
+// 2026-10-08: the 12 overnight rows on the 8:05 #contact-center card went to
+// #ops in the same minute. The escalation clock now starts at office open.
+test('officeClockStartMs: arrival in hours, else the next 8:00 ET', () => {
+  assert.equal(officeClockStartMs(edt('2026-10-08T10:15:00'), cfg), edt('2026-10-08T10:15:00'));
+  assert.equal(officeClockStartMs(edt('2026-10-08T02:30:00'), cfg), edt('2026-10-08T08:00:00'));
+  assert.equal(officeClockStartMs(edt('2026-10-07T21:00:00'), cfg), edt('2026-10-08T08:00:00'));
+  assert.equal(officeClockStartMs(edt('2026-10-07T19:45:00'), cfg), edt('2026-10-08T08:00:00'), 'end is exclusive');
+});
+
+test('overnight rows: carded at 8:00, but #ops only once they are still waiting 90 min into the day', async () => {
+  const night = [
+    { ...SHELLEY_WAITING, id: '550001', apptdate: '', appttime: '', sender: 'Simpletext', datereceived: '2026-10-07T23:10:00' },
+    { ...SHELLEY_WAITING, id: '550002', apptdate: '10/08/2026', datereceived: '2026-10-08T03:00:00' },
+  ];
+  const h = deps({ rows: night });
+  await runInboundCheckoutWatch({ env: LIVE, nowMs: edt('2026-10-08T08:05:00'), deps: h.d });
+  assert.equal(h.calls.posts.length, 1, 'the overnight card');
+  assert.match(h.calls.posts[0].text, /came in overnight/);
+  assert.equal(h.calls.ops.length, 0, 'not the same minute in #ops');
+  await runInboundCheckoutWatch({ env: LIVE, nowMs: edt('2026-10-08T09:25:00'), deps: h.d });
+  assert.equal(h.calls.ops.length, 0, '85 minutes into the day');
+  const res = await runInboundCheckoutWatch({ env: LIVE, nowMs: edt('2026-10-08T09:31:00'), deps: h.d });
+  assert.equal(h.calls.ops.length, 1, '91 minutes into the day: still waiting → #ops, once');
+  assert.match(h.calls.ops[0].text, /90\+ minutes into office hours/);
+  assert.match(h.calls.ops[0].text, /550001/);
+  assert.match(h.calls.ops[0].text, /550002/);
+  assert.ok(res.waiting.every((w) => w.open_wait_min === 91));
+  await runInboundCheckoutWatch({ env: LIVE, nowMs: edt('2026-10-08T09:36:00'), deps: h.d });
+  assert.equal(h.calls.ops.length, 1);
+});
+
+test('a row that arrives in office hours still escalates 90 minutes after it arrived', () => {
+  const r = row({ apptdate: '', appttime: '', sender: 'Simpletext', datereceived: '2026-10-08T10:00:00' });
+  assert.equal(assessWaiting([r], edt('2026-10-08T11:29:00'), cfg)[0].escalate, false);
+  assert.equal(assessWaiting([r], edt('2026-10-08T11:31:00'), cfg)[0].escalate, true);
 });
 
 test('shadow posts nothing and writes no marks or GHL fields', async () => {

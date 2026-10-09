@@ -108,6 +108,7 @@ import { filterConversationForModel } from './context-activity-filter.js';
 import { isCustomerP2 } from './agentic/lead-state/signals/context-reader.js';
 import { withGhlToken } from './ghl-rate-limiter.js';
 import { leadHadDemo } from './demo-truth.js';
+import { buildLeadFacts } from './agentic/lead-facts.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY;
 const GHL_LOCATION_ID = process.env.GHL_LOCATION_ID || 'SsBG7j5KQAIP1SFP2Sca';
@@ -184,7 +185,9 @@ const LP_ACTIVE_DISPOSITIONS = new Set([
 // cancelled visit as still on the calendar (Mark Test "your visit
 // Wednesday" incident). Effective-appointment derivation lives where
 // the lp context block is assembled.
-const LP_CANCELLED_APPT_DISPOSITIONS = new Set(['CXL']);
+// 2026-10-07: CCC (customer called to cancel) too; it used to read as
+// cancelled only once rule 271's appt-cancelled tag landed.
+const LP_CANCELLED_APPT_DISPOSITIONS = new Set(['CXL', 'CCC']);
 
 // v2.9: dispositions that mark an lp_leads row as POST-SALE / service-side.
 // Any other non-closed_won row is a sales-side record (Data, Set, Cnf, Issue,
@@ -568,7 +571,7 @@ async function fetchLeadIntelligence(contactId) {
 
 // appts (2026-09-30, fix/demo-truth): the lead's appointment list, so
 // lp.demo_completed can come from src/demo-truth.js instead of LP's sat flag.
-const LP_LEAD_COLUMNS = 'id, lp_lead_id, lp_prospect_id, first_name, last_name, disposition_code, disposition_label, rep_name, promoter_name, lead_source, lead_source_detail, call_count, last_call_date, appointment_set, appointment_date, demo_completed, demo_date, days_to_demo, closed_won, job_value, created_at_lp, ghl_contact_id, synced_at, appts:raw_lp_data->appointments';
+const LP_LEAD_COLUMNS = 'id, lp_lead_id, lp_prospect_id, first_name, last_name, disposition_code, disposition_label, rep_name, promoter_name, lead_source, lead_source_detail, call_count, last_call_date, appointment_set, appointment_date, demo_completed, demo_date, days_to_demo, closed_won, job_value, created_at_lp, ghl_contact_id, synced_at, address, city, state, zip, appts:raw_lp_data->appointments';
 
 function backfillGhlContactId(lpLeadRow, ghlContactId) {
   if (!lpLeadRow || !ghlContactId || lpLeadRow.ghl_contact_id) return;
@@ -668,7 +671,8 @@ async function fetchLPProspectHistory(prospectId, limit = 25) {
   }
 }
 
-async function fetchLPNotes(lpLeadId, limit = 8) {
+// 2026-10-07: 20, not 8 — every note reaches both prompts (lead-facts.js).
+async function fetchLPNotes(lpLeadId, limit = 20) {
   if (!lpLeadId) return [];
   try {
     const { data, error } = await withTimeout(
@@ -1049,10 +1053,17 @@ export async function buildLeadContext(ghlContactId, options = {}) {
   // appointment as cancelled when the LP disposition says so OR the GHL
   // cancel flow tagged the contact — unless a fresh booking is active
   // (booking:active), which always wins.
-  const apptCancelled = !tags.includes('booking:active') && (
-    (!!lpLead?.appointment_set && LP_CANCELLED_APPT_DISPOSITIONS.has(lpLead?.disposition_code))
-    || tags.includes('appt-cancelled')
-  );
+  //
+  // 2026-10-07 (Nicholas Ferraioli, I5x7zltORikAxdEJ6nyD): booking:active
+  // outlived his booking. LP was CXL'd at 9:29 AM ("not something we can run")
+  // and the tag still made the cancelled 3 PM visit read as set, so the
+  // planner called him booked and the bot confirmed a time nobody booked. A
+  // tag no longer outranks LP: booking:active only overrides the
+  // appt-cancelled TAG. A fresh bot booking after a cancel is read from the
+  // GHL appointments (fetchRecentAndUpcomingAppointments), not this LP row,
+  // whose date is the cancelled one until LP re-syncs.
+  const lpCancelled = !!lpLead?.appointment_set && LP_CANCELLED_APPT_DISPOSITIONS.has(lpLead?.disposition_code);
+  const apptCancelled = lpCancelled || (!tags.includes('booking:active') && tags.includes('appt-cancelled'));
 
   // v2.9: customer relationship — person-level (has_prior_sale) and
   // conversation-level (open_sales_lead) resolved separately. See
@@ -1293,6 +1304,11 @@ export async function buildLeadContext(ghlContactId, options = {}) {
       ],
     },
   };
+
+  // 2026-10-07 (Nicholas): the facts both prompts render the same way and the
+  // guards read: the appointment's real status and cancel note, every LP note,
+  // the property ZIP on file, and a note that says we cannot run the lead.
+  context.lead_facts = buildLeadFacts({ lp: context.lp, lpLead, lead: context.lead });
 
   setCache(ghlContactId, context);
   return context;
