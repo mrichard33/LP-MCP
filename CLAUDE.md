@@ -200,6 +200,24 @@ are dropped for these replies because every one is pre-demo copy. A "yes" to the
 to #contact-rehash (`SLACK_CHANNEL_REHASH`, default C0C5YMHNYJH) via `src/notifications/rehash-call.js`.
 No resolved name → the reply signs "Reece Team"; never guess a name. See `src/agentic/rehash.js`.
 
+**A post-demo lead is in REHASH: the rehash team calls it, LP is never touched (the user, 2026-10-09).** Monica (LP
+lead 581695, OPPFDN after her 10/7 demo, outside F.0's 14-day window) got a Five9 sales callback, a moved appointment
+and an LP re-set. Now:
+- **LP lock:** `postDemoLock` (`src/lp-post-demo-lock.js`) runs right before both LP SetAppointment calls
+  (`executeSetLPAppointment`, `syncAppointmentToLP`). It reads the caller's disposition, `lp_leads`, then LP live, and
+  any `isDemoDisposition` answer (Sale, OPPFDN, NoRehash, FDNS, SW, PM) refuses. A lead neither source knows is a new
+  lead; both reads failing refuses. "We should never modify a lead marked OPP FDN."
+- **The stage:** `src/agentic/rehash-state.js`. The current lead OPPFDN with a demo in the last `REHASH_DAYS` (30) → tags
+  `rehash` + `rehash-lead:<lds>` + `rehash-since:<demo date>`. It ends on a NEWER lead, when the lead leaves OPPFDN, or at
+  30 days: the tags come off, `rehash-done:<lds>` stays, and a GHL owner in `REHASH_TEAM_USER_IDS` (default John Manieri)
+  is cleared by `release_rehash_owner` (read back). Job `rehash-tag-sweep` (15 min) writes through agent_actions rows
+  (rule `REHASH_TAG_SWEEP`). `isRehashContact` counts `rehash` like `active-f.0`.
+- **Calls, not visits:** a rehash call request (`lp_callback_requeue`, so `fileBotCallback` and `HOT_CALL_IMMEDIATE` too)
+  skips Five9 and posts one #contact-rehash card a day (`skipped_rehash_lead`); no #contact-center card. A
+  `book_appointment` on any calendar that is not GHL-only is refused for a rehash lead (`skipped_rehash_visit`); the
+  Confirmation Call, assigned to the rep, is the rehash call calendar.
+- `REHASH_ROUTING_MODE` off|shadow|live, default shadow (`rehash.would_*` events only). The LP lock is not behind it.
+
 **A held appointment asks a person to import its LP row (2026-10-05).** When LP already has an unimported
 inbound row for a contact, `syncAppointmentToLP` holds the appointment (`lp-appt-deferred`) rather than add a
 duplicate lead, and the parity watchdog re-drives it every 30 min. LP has no API that imports a row, so once a

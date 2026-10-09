@@ -95,6 +95,8 @@ import { updateGHLContactFields, applyGHLTag, removeGHLTags } from '../../ghl.js
 import { fetchUpcomingAppointments } from '../../knowledge/contact-appointments.js';
 import { isInHomeCalendarId, isGhlOnlyCalendarId } from '../../knowledge/booking-calendar-router.js';
 import { confirmationCallAssigneeFor } from '../../config/rehash-assignee.js';
+import { isInRehash, rehashRoutingMode } from '../../agentic/rehash-state.js';
+import { fetchCurrentLead } from '../../current-lead.js';
 import { markRescheduleInflight } from '../../services/reschedule-inflight.js';
 import { executeCreateTask } from './tasks.js';
 import { getContactCached } from '../contact-cache.js';
@@ -594,12 +596,35 @@ async function findExistingAppointments(contactId, calendarId) {
   }
 }
 
+/** 'live' | 'shadow' when this contact is in rehash (per REHASH_ROUTING_MODE), else null. */
+async function rehashVisitBlocked(contactId) {
+  const mode = rehashRoutingMode();
+  if (mode === 'off') return null;
+  const [res, currentLead] = await Promise.all([ghlFetch('GET', `/contacts/${contactId}`), fetchCurrentLead(contactId)]);
+  return isInRehash({ tags: res?.contact?.tags || [], currentLead }) ? mode : null;
+}
+
 export async function executeBookAppointment(action, context) {
   const contactId = action.target_id;
   const payload = interpolatePayload(action.action_payload, context);
   if (!contactId) throw new Error('Missing contactId');
 
   let { body, calendarId, startTime, endTime, title, status, ignoreFreeSlotValidation } = buildAppointmentBody(payload, contactId);
+
+  // 2026-10-09 (the user): a rehash lead (post-demo OPPFDN) is a phone call
+  // with the rehash team on the GHL-only Confirmation Call calendar, assigned
+  // to the rep (src/config/rehash-assignee.js) — never a visit, never moved
+  // onto an in-home calendar. Monica (581695) had her old appointment moved
+  // and an LP re-set followed. A failed read books as before (fail-open): the
+  // LP lock (src/lp-post-demo-lock.js) still stands behind it.
+  if (!isGhlOnlyCalendarId(calendarId)) {
+    const rehashGate = await rehashVisitBlocked(contactId).catch(() => null);
+    if (rehashGate === 'live') {
+      console.log(`[ActionExecutor] ⛔ skipped_rehash_visit: ${contactId} is in rehash — no visit on ${calendarId}`);
+      return { action: 'skipped_rehash_visit', contact_id: contactId, calendar_id: calendarId, start_time: startTime, reason: 'rehash lead: phone call with the rehash team only (2026-10-09)' };
+    }
+    if (rehashGate === 'shadow') console.log(`[ActionExecutor] 🕶️ ${contactId} is in rehash — live would refuse this visit on ${calendarId}`);
+  }
 
   // v3.4 / 2026-06-24: idempotent-booking guard. The executor reaps stuck
   // actions and can re-run a book_appointment, and the model can emit a

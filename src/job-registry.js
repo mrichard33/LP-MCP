@@ -363,6 +363,17 @@ export const JOBS = Object.freeze([
     isEnabled: (env) => String(env.PROMISED_CALLBACK_MODE || 'shadow').toLowerCase().trim() !== 'off',
   },
   {
+    id: 'rehash-tag-sweep',
+    label: 'Rehash stage: tag OPPFDN demos, release the tag and the rehash rep after 30 days or a newer lead',
+    group: 'agentic',
+    cadence: 'every 15 min',
+    enabledEnv: 'REHASH_ROUTING_MODE',
+    // A MODE (2026-10-09): off | shadow | live, default shadow. Mirrors
+    // rehashRoutingMode() in src/agentic/rehash-state.js — only 'off' stops it.
+    enabledDefault: true,
+    isEnabled: (env) => String(env.REHASH_ROUTING_MODE || 'shadow').toLowerCase().trim() !== 'off',
+  },
+  {
     id: 'booked-dial-routing',
     label: 'Booked leads → Confirmation list, then off the DIAL ASAP setter lists (decision #2669)',
     group: 'five9',
