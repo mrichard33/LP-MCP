@@ -386,3 +386,26 @@ test('the new sync refusals count as not_attempted, never a heal', () => {
   assert.equal(classifyHealResult({ action: 'skipped_ghl_only_calendar' }), 'not_attempted');
   assert.equal(classifyHealResult({ action: 'skipped_terminal_disposition' }), 'not_attempted');
 });
+
+test('watchdog Class A asks for a bookable lead and passes the calendar (the user, 2026-10-09)', async () => {
+  const t = soon();
+  const calls = [];
+  await runAppointmentParityWatchdog({
+    dryRun: false,
+    deps: {
+      readGhlBook: async () => bucketGhlBook([
+        { ghl_contact_id: 'c-we', ghl_appointment_id: 'we1', status: 'new', start_time: t, ghl_calendar_id: WE_CAL },
+      ]),
+      readLpBook: async () => ({ active: new Map(), resolved: new Map() }),
+      getGHLContact: async () => ({ tags: [] }),
+      syncAppointmentToLP: async (args) => { calls.push(args); return { action: 'skipped_terminal_disposition' }; },
+      emitEvent: async () => ({ id: 1 }),
+      claimAlertConditionSet: async () => ({ ok: true, newlyFiring: [], cleared: [] }),
+      confirmAlertSend: async () => ({ ok: true }),
+      send: async () => ({ sent: true }),
+    },
+  });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].requireBookable, true, 'only the automatic repair needs an open lead');
+  assert.equal(calls[0].calendarId, WE_CAL);
+});

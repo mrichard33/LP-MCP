@@ -94,6 +94,7 @@ import { CALENDAR_MAP, GHL_LOCATION_ID } from '../constants.js';
 import { updateGHLContactFields, applyGHLTag, removeGHLTags } from '../../ghl.js';
 import { fetchUpcomingAppointments } from '../../knowledge/contact-appointments.js';
 import { isInHomeCalendarId, isGhlOnlyCalendarId } from '../../knowledge/booking-calendar-router.js';
+import { confirmationCallAssigneeFor } from '../../config/rehash-assignee.js';
 import { markRescheduleInflight } from '../../services/reschedule-inflight.js';
 import { executeCreateTask } from './tasks.js';
 import { getContactCached } from '../contact-cache.js';
@@ -861,6 +862,18 @@ export async function executeBookAppointment(action, context) {
     }
   } catch (err) {
     console.warn(`[ActionExecutor] appointment title rebuild failed for ${contactId}: ${err.message} — leaving payload title.`);
+  }
+
+  // 2026-10-09 (the user): a Confirmation Call stays in GHL and goes to the
+  // Rehash rep — the contact's owner when one is set, else the Rehash rep.
+  // An assignee named on the payload still wins. A failed contact read falls
+  // back to the Rehash rep, never to "no assignee".
+  if (isGhlOnlyCalendarId(calendarId)) {
+    const owner = await getContactCached(contactId, context?._contactCache, { maxWaitMs: BOOKING_TOKEN_WAIT_MS })
+      .then((c) => c?.assignedTo || null)
+      .catch(() => null);
+    const assignee = confirmationCallAssigneeFor({ explicit: payload.assigned_user_id, contactOwner: owner });
+    if (assignee) body.assignedUserId = assignee;
   }
 
   // Title + address. No-op unless APPT_FORMAT_ENABLED, and fails open.

@@ -235,6 +235,7 @@ import { enrollLpLeadCreation } from './admin/lp-force-addlead.js';
 // calendars (dormant unless FIVE9_DIRECT_DISPATCH=true — see five9/list-dispatch.js).
 import { isGhlOnlyCalendarId } from './knowledge/booking-calendar-router.js';
 import { checkConfirmationCallSlot } from './services/confirmation-call-slot.js';
+import { isDemoDisposition } from './demo-truth.js';
 import { five9DispatchConfigured, dispatchConfirmationCallback } from './five9/list-dispatch.js';
 // 2026-07-28 appt-enrichment repoint: the CANONICAL rate-limited GHL client.
 // Byte-identical to the private ghlFetch below EXCEPT it calls report429() on a
@@ -1918,16 +1919,24 @@ export function isGhlOnlyAppointment({ calendarId, calendarName } = {}) {
  * 2026-10-08 (contact 5YGVd3kh5IcY6pUJVcs4, LP lead 581695): Step 0a accepts a
  * lognumber-matched lead in ANY disposition, so the parity watchdog wrote a
  * phone call's time onto a post-demo OPPFDN lead and LP flipped it to Set.
- * A lead whose disposition is known and not bookable (OPPFDN, Sale, CXL, DNC…)
- * is a person's call, never ours. A BLANK disposition is unknown, not terminal:
- * a lead minted minutes ago may not carry one in lp_leads yet, and refusing it
- * would strand a real booking, so it proceeds as before.
+ *
+ * Two tiers (the user, 2026-10-09: "allow rebooks again"):
+ *   - a post-demo or sold lead (isDemoDisposition: Sale, OPPFDN, NoRehash,
+ *     FDNS, SW, PM) is refused for EVERY caller. That is the incident.
+ *   - requireBookable (the watchdog's automatic repair only) also refuses any
+ *     lead that is not bookable (CXL, CCC, NoHome, DNC, No Demo…).
+ * Without requireBookable, a person or GHL booking re-sets a cancelled or
+ * no-show lead: that is a normal reschedule, and refusing it left LP blind to
+ * the new visit. A BLANK disposition is unknown, not terminal: a lead minted
+ * minutes ago may not carry one in lp_leads yet, so it proceeds.
  */
-export function terminalDispositionDecision(disp) {
+export function terminalDispositionDecision(disp, { requireBookable = false } = {}) {
   const d = disp == null ? '' : String(disp).trim();
   if (!d) return { allow: true, reason: 'disposition_unknown' };
   if (isBookableDisposition(d)) return { allow: true, reason: 'bookable' };
-  return { allow: false, reason: 'terminal_disposition', disposition: d };
+  if (isDemoDisposition(d)) return { allow: false, reason: 'terminal_disposition', disposition: d };
+  if (requireBookable) return { allow: false, reason: 'terminal_disposition', disposition: d };
+  return { allow: true, reason: 'rebook_closed_lead' };
 }
 
 async function syncAppointmentToLP({
@@ -1935,6 +1944,7 @@ async function syncAppointmentToLP({
   address1, city, state, postalCode,
   prospectId: webhookProspectId, inboundId, ghlLeadIdField,
   appointmentDate, appointmentTime, calendarName, calendarId,
+  requireBookable = false,
 }, deps = {}) {
   if (!contactId) throw new Error('contact_id is required');
 
@@ -2259,7 +2269,7 @@ async function syncAppointmentToLP({
   // ── Terminal-disposition guard (2026-10-08) — see terminalDispositionDecision.
   // Before any write: no GHL field writeback, no dedup mark, no lp-appt-synced
   // tag, no SetAppointment. The parity watchdog reads this as not_attempted.
-  const dispDecision = terminalDispositionDecision(disp);
+  const dispDecision = terminalDispositionDecision(disp, { requireBookable });
   if (!dispDecision.allow) {
     console.warn(`[LP-APPT] ⛔ skipped_terminal_disposition for ${contactId}: lds_id=${ldsId} disp=${dispDecision.disposition} is not bookable — no SetAppointment (via ${source}, step ${step})`);
     return {
