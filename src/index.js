@@ -7,6 +7,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { registerAllTools } from './tools/index.js';
+import { attachOperatorAuth } from './security/infra-guard.js';
 import { startSyncScheduler, fullSync, incrementalSync, handleWebhookEvent } from './sync-engine.js';
 import { trackInflight, trackBackground, installGracefulShutdown } from './graceful-shutdown.js';
 import { intakeJournal, startIntakeJournalSweeper, registerIntakeJournalRoutes } from './intake-journal.js';
@@ -518,6 +519,11 @@ app.get('/diag/llm', (req, res) => {
 
 const streamableSessions = {};
 
+// 2026-10-07: attachOperatorAuth (src/security/infra-guard.js) stamps req.auth
+// on every MCP request from THAT request's Authorization / X-Operator-Token
+// header. The SDK passes it to each tool call as extra.authInfo, so the infra
+// tools and the audit log know per call whether the operator asked.
+
 function isInitializeRequest(body) {
   if (Array.isArray(body)) return body.some(msg => msg.method === 'initialize');
   return body?.method === 'initialize';
@@ -537,7 +543,7 @@ function registerSession(sessionId, transport, server) {
   transport.onclose = () => { delete streamableSessions[sessionId]; console.log(`[MCP] Session closed: ${sessionId}`); };
 }
 
-app.post('/mcp', authenticate, async (req, res) => {
+app.post('/mcp', authenticate, attachOperatorAuth, async (req, res) => {
   try {
     const sessionId = req.headers['mcp-session-id'];
     if (sessionId && streamableSessions[sessionId]) { await streamableSessions[sessionId].transport.handleRequest(req, res, req.body); return; }
@@ -550,8 +556,8 @@ app.post('/mcp', authenticate, async (req, res) => {
   } catch (err) { console.error('[MCP] Error:', err.stack); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
-app.get('/mcp', authenticate, async (req, res) => { const s = req.headers['mcp-session-id']; if (s && streamableSessions[s]) { await streamableSessions[s].transport.handleRequest(req, res); } else { res.status(404).json({ error: 'Session not found' }); } });
-app.delete('/mcp', authenticate, async (req, res) => { const s = req.headers['mcp-session-id']; if (s && streamableSessions[s]) { await streamableSessions[s].transport.handleRequest(req, res); delete streamableSessions[s]; } else { res.status(404).json({ error: 'Session not found' }); } });
+app.get('/mcp', authenticate, attachOperatorAuth, async (req, res) => { const s = req.headers['mcp-session-id']; if (s && streamableSessions[s]) { await streamableSessions[s].transport.handleRequest(req, res); } else { res.status(404).json({ error: 'Session not found' }); } });
+app.delete('/mcp', authenticate, attachOperatorAuth, async (req, res) => { const s = req.headers['mcp-session-id']; if (s && streamableSessions[s]) { await streamableSessions[s].transport.handleRequest(req, res); delete streamableSessions[s]; } else { res.status(404).json({ error: 'Session not found' }); } });
 
 const sseSessions = {};
 app.get('/sse', authenticate, async (req, res) => {
@@ -560,7 +566,7 @@ app.get('/sse', authenticate, async (req, res) => {
   registerAllTools(ss); sseSessions[transport.sessionId] = { transport, server: ss };
   res.on('close', () => { delete sseSessions[transport.sessionId]; }); await ss.connect(transport);
 });
-app.post('/messages', authenticate, async (req, res) => { const s = sseSessions[req.query.sessionId]; if (!s) return res.status(404).json({ error: 'Session not found' }); await s.transport.handlePostMessage(req, res); });
+app.post('/messages', authenticate, attachOperatorAuth, async (req, res) => { const s = sseSessions[req.query.sessionId]; if (!s) return res.status(404).json({ error: 'Session not found' }); await s.transport.handlePostMessage(req, res); });
 
 app.post('/sync/full', authenticate, async (req, res) => { res.json({ status: 'started', type: 'full' }); fullSync().catch(e => console.error('[Sync]', e.message)); });
 app.post('/sync/incremental', authenticate, async (req, res) => { res.json({ status: 'started', type: 'incremental' }); incrementalSync().catch(e => console.error('[Sync]', e.message)); });

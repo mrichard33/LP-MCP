@@ -187,6 +187,22 @@ export async function sendAlertMessage(text, opts = {}) {
 const TABLE = 'alert_conditions';
 const DETAIL_CHARS = 500;
 
+/**
+ * 2026-10-07: callers pass objects as `detail` (appt-prospect-dupe-sweep,
+ * link-leak-monitor), and String({...}) stored the literal "[object Object]",
+ * which the dashboard's live-alerts card then showed. Objects are stored as
+ * JSON; strings pass through; everything is capped at DETAIL_CHARS.
+ */
+export function formatDetail(detail) {
+  if (detail === null || detail === undefined || detail === '') return null;
+  let out;
+  if (typeof detail === 'string') out = detail;
+  else {
+    try { out = JSON.stringify(detail); } catch { out = String(detail); }
+  }
+  return out ? out.slice(0, DETAIL_CHARS) : null;
+}
+
 /** Safe default, same idiom as groupme.js: only the literal 'false' disables,
  *  so an unset or mistyped var still edge-triggers. */
 const ALERT_STATE_ENABLED = process.env.ALERT_STATE_ENABLED !== 'false';
@@ -324,10 +340,42 @@ export async function reportAlertCondition(args = {}) {
   }
 }
 
+/**
+ * Keep the alert_conditions row TRUE without posting anything (2026-10-07).
+ *
+ * Since 2026-10-02 the morning checks (lead-leak, link-leak) run inside the
+ * 08:00 digest with `post: false`, and the uncalled-leads check posts through
+ * its own dedupe path. Both skipped reportAlertCondition entirely, so a row
+ * that was firing on 10-02 stayed "firing" forever with last_seen_at frozen —
+ * the dashboard's live-alerts card showed three alerts nobody had re-checked
+ * in five days. The digest (or the dedupe card) is the notification; this only
+ * records state. Same tri-state as reportAlertCondition: null touches nothing.
+ * Never sends: text is null (no body → no send) and recovery is not announced.
+ */
+export async function observeAlertCondition({ key, active, label, detail, client, nowMs } = {}) {
+  // No state table → nothing to keep true. Never fall through to the degraded
+  // in-process path: it would arm a cooldown a real alert then trips over.
+  if (!ALERT_STATE_ENABLED || !(client ?? _clientOverride ?? supabase)) {
+    return { action: 'skipped', sent: false, reason: 'no_state_table' };
+  }
+  return reportAlertCondition({
+    key,
+    active,
+    label,
+    detail,
+    client,
+    nowMs,
+    text: null,
+    remindMs: 0,
+    notifyRecovery: false,
+    send: async () => ({ sent: false, reason: 'observe_only' }),
+  });
+}
+
 /** The condition is bad. Claim the firing edge, or stay silent if it is held. */
 async function _fire({ client, key, label, text, detail, channel, remindMs, send, now, fallbackCooldownMs }) {
   const nowIso = new Date(now).toISOString();
-  const trimmed = detail ? String(detail).slice(0, DETAIL_CHARS) : null;
+  const trimmed = formatDetail(detail);
 
   // Claim by INSERT ... ON CONFLICT DO NOTHING. The PK is still the whole
   // serialization mechanism: a row back means we inserted it and own the edge;
@@ -611,7 +659,7 @@ export async function claimAlertConditionSet(args = {}) {
 
   const now = nowMs ?? Date.now();
   const nowIso = new Date(now).toISOString();
-  const trimmed = detail ? String(detail).slice(0, DETAIL_CHARS) : null;
+  const trimmed = formatDetail(detail);
   const wanted = Array.from(new Set(activeKeys.filter(Boolean)));
 
   try {
