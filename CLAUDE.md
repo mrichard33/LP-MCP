@@ -740,6 +740,16 @@ could otherwise smuggle instructions into an agent's context. The wrapper sits a
 registration because that is the one place that covers all 126 tools and the next
 one added.
 
+**Every inbound text is screened and the decision recorded (2026-10-07, IT review).** After
+`cleanInboundForModel`, `src/security/injection-guard.js` classifies the text: a no-I/O heuristic first, then
+an optional LLM Guard sidecar (`INJECTION_CLASSIFIER_URL`, 1.5s cap, fails open). Every check writes one
+`guardrail_decisions` row (sql/152) with a hash, never the text. Surfaces: `sms_inbound` (analyzer), `live_chat`
+(fast lane), `ci_transcript` (call analysis, which also now runs the sanitizer). `INJECTION_GUARD_MODE` off|shadow|live,
+default shadow; live blocks only surfaces in `INJECTION_GUARD_BLOCK_SURFACES` (default `ci_transcript` → the call goes
+to review). Never add a customer chat surface to that list without Mark's ruling and a `run_bot_eval`. Hot paths call
+`guardInBackground` and never wait. The attack + benign corpus is `scripts/fixtures/redteam-corpus.js`: a new attack
+seen live goes in ATTACKS, a misflagged customer message in BENIGN. Live red-team runs: `redteam/README.md`.
+
 **UNREADABLE is not down (dialer watchdog and heal, 2026-09-28).** A Five9 status read that fails is
 retried (`readCampaignState` in `src/routes/capacityRanker.js`, 3 reads over ~6s) and its reason is
 logged. Still unreadable, the watchdog pages with honest wording ("may not be dialing"), because a real
@@ -886,6 +896,25 @@ answer still has to exist (`LIB-P12`).
 - Deleting from `system_events` can trip `agent_actions_event_id_fkey`. Guard with
   `AND NOT EXISTS (SELECT 1 FROM agent_actions a WHERE a.event_id = e.id)` and delete in batches — a
   single large statement is atomic, so one FK violation rolls the whole thing back.
+
+**The MCP SQL tool is splitting into a read tool and an audited write tool (2026-10-07, IT/GoCloud
+review).** `run_sql` is SECURITY DEFINER, so `supabase_run_query` could write anything as postgres.
+- `SQL_TOOL_MODE` readwrite (default, today) | shadow | readonly. Readonly lets `supabase_run_query` and
+  `hl_query` run ONE `SELECT` / `WITH…SELECT` / `EXPLAIN` only. `src/security/sql-guard.js` tokenizes
+  (strings, `$$`, comments, quoted identifiers are skipped). It refuses chained statements,
+  data-modifying CTEs, `SELECT … INTO`, `FOR UPDATE/SHARE`, `run_sql(…)`, `set_config`, `dblink`, `lo_*`,
+  `net.*`, `vault.*` and every `pg_*` function outside a short read list. Quote a column named `update`.
+- Writes go through `supabase_write_query` (only when `SQL_WRITE_TOOL_ENABLED=true`). It needs `reason` +
+  `confirm: true`, and `confirm_destructive` for DROP/TRUNCATE anywhere (incl. `ALTER … DROP COLUMN`).
+  Every call writes a `tool_audit_log` row first. Row-count assertions work as before.
+- The guard cannot see a user-defined function that writes. `SQL_READONLY_RPC=run_sql_readonly` (after
+  `sql/154`) makes the database refuse those too, because the transaction is read-only.
+- `tool_audit_log` (`sql/153`) is append-only by trigger. Never add an UPDATE/DELETE path to it.
+  `INFRA_TOOLS_MODE` (open | shadow | operator) gates `set_railway_env_var`, `redeploy_railway_service`,
+  `rollback_railway_deployment` and `http_request` per call on the operator token (`src/security/infra-guard.js`).
+  `HTTP_EGRESS_MODE` (off | shadow default | enforce) with `HTTP_EGRESS_ALLOWLIST` is default-deny egress.
+- Rollout: shadow → read the would_deny rows → `SQL_WRITE_TOOL_ENABLED=true` → readonly. Set the variables
+  in one batch.
 
 **Boot-time schema mirrors check before they touch anything (2026-09-26).** The blocks live in
 `src/admin/startup-mirrors.js` and `src/admin/startup-schema.js` runs them: one catalog read, then DDL

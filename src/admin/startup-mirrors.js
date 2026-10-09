@@ -2707,5 +2707,48 @@ export const STARTUP_MIRRORS = [
     ready: '[Migration] llm usage ledger (sql/151) ready',
     fail: '[Migration] llm usage ledger (sql/151) not applied — model calls continue, usage rows are dropped with a warning until applied from the dashboard:',
     level: 'warn',
+  },  {
+    name: 'sql/152',
+    expects: {
+      tables: ['guardrail_decisions'],
+      columns: [
+        ['v_guardrail_daily', 'day_et'],
+        ['v_guardrail_daily', 'surface'],
+        ['v_guardrail_daily', 'verdict'],
+        ['v_guardrail_daily', 'action'],
+        ['v_guardrail_daily', 'checks'],
+        ['v_guardrail_daily', 'avg_latency_ms'],
+        ['v_guardrail_daily', 'classifier_errors'],
+      ],
+      views: ['v_guardrail_daily'],
+      indexes: [
+        'idx_guardrail_decisions_decided_at',
+        'idx_guardrail_decisions_flagged',
+      ],
+    },
+    sqlFile: 'sql/152_guardrail_decisions.sql',
+    ready: '[Migration] guardrail decision record (sql/152) ready',
+    fail: '[Migration] guardrail decision record (sql/152) not applied — checks still run, decision rows are dropped with a warning until applied from the dashboard:',
+    level: 'warn',
+  },
+  // tool_audit_log (sql/153, 2026-10-07 — the file is the source of truth).
+  // Append-only trail of privileged MCP tool calls (src/security/tool-audit.js).
+  // The writer is fire-and-forget and fail-open, so a missing table costs the
+  // audit rows, never a tool call — hence warn. The trigger function is part of
+  // the file; presence of the table means the whole file was applied.
+  {
+    name: 'sql/153',
+    expects: {
+      tables: ['tool_audit_log'],
+      indexes: [
+        'idx_tool_audit_log_at',
+        'idx_tool_audit_log_tool_at',
+        'idx_tool_audit_log_decision_at',
+      ],
+    },
+    sqlFile: 'sql/153_tool_audit_log.sql',
+    ready: '[Migration] tool_audit_log (sql/153) ready',
+    fail: '[Migration] tool_audit_log (sql/153) not applied — tools keep working, audit rows are dropped with a warning until applied from the dashboard:',
+    level: 'warn',
   },
 ];

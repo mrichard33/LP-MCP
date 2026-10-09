@@ -339,6 +339,19 @@ export const JOBS = Object.freeze([
     isEnabled: (env) => String(env.INBOUND_CHECKOUT_WATCH_MODE || 'shadow').toLowerCase().trim() !== 'off',
   },
   {
+    // 2026-10-07: lp_leads kept `Set` on leads LP had long since resulted (LP
+    // lead 542473: CXL since 5/26). Mirrors refreshMode() in
+    // src/stale-lead-refresh.js: off | shadow (default) | live — only 'off'
+    // stops it. Works only inside LP_STALE_LEAD_REFRESH_HOURS_ET (default 21-6).
+    id: 'lp-stale-lead-refresh',
+    label: 'Re-read open LP leads whose appointment passed (missed results: Set → CXL/Sale/…)',
+    group: 'sync',
+    cadence: 'every 30 min, 21:00–06:00 ET',
+    enabledEnv: 'LP_STALE_LEAD_REFRESH_MODE',
+    enabledDefault: true,
+    isEnabled: (env) => String(env.LP_STALE_LEAD_REFRESH_MODE || 'shadow').toLowerCase().trim() !== 'off',
+  },
+  {
     id: 'promised-callback-sweep',
     label: 'Calls the bot promised: kept (Five9 call / rep text) or expired → #contact-center',
     group: 'agentic',
