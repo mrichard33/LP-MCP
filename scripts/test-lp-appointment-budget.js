@@ -142,7 +142,7 @@ test('the handler bounds its wait and acks 202 rather than letting GHL time out 
 });
 
 test('the already-in-LP hot path makes no bookkeeping GHL calls inside the request [source-level]', () => {
-  const start = SRC.indexOf('if (await lpAlreadyHasAppointment(');
+  const start = SRC.indexOf('if (await _lpAlreadyHasAppointment(');
   const branch = SRC.slice(start, SRC.indexOf("action: 'already_in_lp_skipped_pre_resolve'", start));
 
   // This branch is what ~all production traffic takes. Each of these is a GHL
@@ -168,9 +168,101 @@ test('the already-in-LP hot path makes no bookkeeping GHL calls inside the reque
 test('the dedup mark and the I.LP-A signal tag stay synchronous [source-level]', () => {
   // Deferring these two would widen the duplicate window and delay the exact
   // signal I.LP-A gates its native fallback on. They must stay awaited.
-  const tail = SRC.slice(SRC.indexOf('const result = await lpSetAppointment('));
+  const tail = SRC.slice(SRC.indexOf('const result = await _lpSetAppointment('));
   const upto = tail.slice(0, tail.indexOf("action: 'lp_appointment_set'"));
 
   assert.match(upto, /await writeApptSyncMark\(/, 'the duplicate guard must not lag the response');
   assert.match(upto, /await applyApptSyncedTag\(/, "I.LP-A's success signal must not lag the response");
+});
+
+// ════════════════════════════════════════════════════════════════════
+// GHL-only calendars and terminal dispositions never reach SetAppointment
+// ════════════════════════════════════════════════════════════════════
+//
+// 2026-10-08 (contact 5YGVd3kh5IcY6pUJVcs4, LP lead 581695, prospect 463408):
+// a Confirmation Call (calendar gFWoSQrlKIdfRbAPV842) was auto-healed into LP by
+// the parity watchdog. Step 0a matched the lead by lognumber in ANY disposition,
+// so LP's post-demo OPPFDN lead flipped to Set. These run the REAL
+// syncAppointmentToLP through its deps seam and count SetAppointment calls.
+
+const { syncAppointmentToLP, terminalDispositionDecision, isGhlOnlyAppointment } =
+  await import('../src/lp-appointment-sync.js');
+
+const CONFIRMATION_CALL = 'gFWoSQrlKIdfRbAPV842';
+
+function syncDeps({ disp = 'Data' } = {}) {
+  const seen = { precheck: 0, resolve: 0, setAppointment: 0 };
+  return {
+    seen,
+    deps: {
+      lpAlreadyHasAppointment: async () => { seen.precheck++; return false; },
+      resolveLPLeadId: async () => {
+        seen.resolve++;
+        return { ldsId: '581695', prospectId: '463408', source: 'supabase_hlcid_validated', step: 0, disp };
+      },
+      lpSetAppointment: async () => { seen.setAppointment++; return { Result: 0 }; },
+    },
+  };
+}
+
+test('syncAppointmentToLP refuses a GHL-only calendarId before any LP read', async () => {
+  const { seen, deps } = syncDeps();
+  const res = await syncAppointmentToLP({
+    contactId: '5YGVd3kh5IcY6pUJVcs4',
+    appointmentDate: '2026-10-09', appointmentTime: '06:00 PM',
+    calendarId: CONFIRMATION_CALL,
+  }, deps);
+
+  assert.equal(res.action, 'skipped_ghl_only_calendar');
+  assert.deepEqual(seen, { precheck: 0, resolve: 0, setAppointment: 0 },
+    'a Confirmation Call must not even be looked up in LP');
+});
+
+test('a Confirmation Call named but not id-tagged is refused too', async () => {
+  const { seen, deps } = syncDeps();
+  const res = await syncAppointmentToLP({
+    contactId: '5YGVd3kh5IcY6pUJVcs4',
+    appointmentDate: '2026-10-09', appointmentTime: '06:00 PM',
+    calendarName: 'Confirmation Call',
+  }, deps);
+  assert.equal(res.action, 'skipped_ghl_only_calendar');
+  assert.equal(seen.setAppointment, 0);
+});
+
+test('syncAppointmentToLP refuses an OPPFDN lead: no SetAppointment', async () => {
+  const { seen, deps } = syncDeps({ disp: 'OPPFDN' });
+  const res = await syncAppointmentToLP({
+    contactId: '5YGVd3kh5IcY6pUJVcs4',
+    appointmentDate: '2026-10-09', appointmentTime: '06:00 PM',
+  }, deps);
+
+  assert.equal(res.action, 'skipped_terminal_disposition');
+  assert.equal(res.disposition, 'OPPFDN');
+  assert.equal(res.lp_lead_id, '581695');
+  assert.equal(seen.resolve, 1);
+  assert.equal(seen.setAppointment, 0, 'the incident wrote Set over OPPFDN — never again');
+});
+
+test('terminalDispositionDecision: bookable passes, terminal stops, blank is unknown (passes)', () => {
+  for (const d of ['Data', 'SET', 'Cnf', 'ccc', ' Verif ', 'NIS']) {
+    assert.equal(terminalDispositionDecision(d).allow, true, `${d} is bookable`);
+  }
+  for (const d of ['OPPFDN', 'Sale', 'CXL', 'DNC', 'No Demo']) {
+    const r = terminalDispositionDecision(d);
+    assert.equal(r.allow, false, `${d} must be refused`);
+    assert.equal(r.reason, 'terminal_disposition');
+  }
+  // A lead minted minutes ago may not carry a disposition yet; refusing it
+  // would strand a real booking.
+  for (const d of [null, undefined, '', '  ']) {
+    assert.deepEqual(terminalDispositionDecision(d), { allow: true, reason: 'disposition_unknown' });
+  }
+});
+
+test('isGhlOnlyAppointment: only the Confirmation Call calendar', () => {
+  assert.equal(isGhlOnlyAppointment({ calendarId: CONFIRMATION_CALL }), true);
+  assert.equal(isGhlOnlyAppointment({ calendarName: ' confirmation CALL ' }), true);
+  assert.equal(isGhlOnlyAppointment({ calendarId: 'aJj14ONxh1oFyDcQ706O', calendarName: 'Window Estimate' }), false);
+  assert.equal(isGhlOnlyAppointment({}), false);
+  assert.equal(isGhlOnlyAppointment(), false);
 });

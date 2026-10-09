@@ -798,12 +798,20 @@ export async function setAppointment({ ldsId, setBy = LP_EMP.GHL_INTEGRATION, ap
 
   console.log(`[LP] SetAppointment: lds_id=${ldsId}, date=${apptDate}, time=${apptTime}, set_by=${setBy}`);
 
+  // ONE attempt (2026-10-08). SetAppointment is not idempotent in LP's audit
+  // trail: a retry after a slow or 500 reply that LP had in fact applied logs
+  // another SetAppointment on the lead. (Lead 581695 showed two entries for
+  // what our logs show was ONE call, so LP may log twice on its own; a retry
+  // would only add more.) A failure throws
+  // to the caller, and the parity watchdog re-drives a real gap 30 min later.
+  // (A 401/403 still gets its one token-refresh resend inside lpPost: LP
+  // rejected that request, so nothing was applied.)
   const result = await withCircuit(() => lpPost('/api/Leads/SetAppointment', {
     lds_id:    String(ldsId),
     set_by:    String(setBy),
     appt_date: apptDate,
     appt_time: apptTime,
-  }));
+  }, 1));
 
   // Check for LP error response
   if (result?.error) {

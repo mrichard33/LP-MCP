@@ -50,7 +50,7 @@ import { claimAppointmentCreate, releaseAppointmentCreate } from './appointment-
 import { GHL_LOCATION_ID } from '../actions/constants.js';
 import { getContactCached } from '../actions/contact-cache.js';
 import { fetchUpcomingAppointments } from '../knowledge/contact-appointments.js';
-import { BOOKING_CALENDARS, isInHomeCalendarId } from '../knowledge/booking-calendar-router.js';
+import { BOOKING_CALENDARS, isInHomeCalendarId, isGhlOnlyCalendarId } from '../knowledge/booking-calendar-router.js';
 import { syncCancelledAppointmentState } from '../actions/handlers/appointment-field-sync.js';
 import { lpWallClockToGhlStartTime } from '../appointment-dates.js';
 // NOTE: slot-check.js imports normalizeGhlStartTime from THIS module, so this
@@ -345,6 +345,25 @@ export async function reconcileLpAppointmentToGhl({ contactId, lead, toNotify = 
   const plan = planReconciliation({ kind, startTime, existing });
 
   if (plan.op === 'noop') return noop(plan.reason);
+
+  // ── LP is only echoing a GHL-only call (2026-10-08) ──
+  // When LP's "appointment" sits exactly on an active Confirmation Call, LP
+  // learned that time from the call (contact 5YGVd3kh5IcY6pUJVcs4: the parity
+  // watchdog wrote call JrH56gkBz5uluIHqRUor onto LP lead 581695, and a minute
+  // later this path created Window Estimate B9V4v7uknpoNoPpKjufI at the same
+  // slot). It is not an estimate visit, so never mint one over it. A different
+  // time still creates as before.
+  if (plan.op === 'create') {
+    const ghlOnlySameSlot = active.find((a) =>
+      isGhlOnlyCalendarId(a.calendar_id) && sameStartTime(a.start_time, startTime));
+    if (ghlOnlySameSlot) {
+      console.warn(`[LpGhlApptSync] contact ${contactId}: LP ${kind} at ${startTime} matches GHL-only appointment ${ghlOnlySameSlot.appointment_id} (calendar ${ghlOnlySameSlot.calendar_id}) — not creating a Window Estimate over a phone call`);
+      return noop('ghl_only_appointment_same_slot', {
+        ghl_only_appointment_id: ghlOnlySameSlot.appointment_id,
+        ghl_only_calendar_id: ghlOnlySameSlot.calendar_id,
+      });
+    }
+  }
 
   if (dryRun) {
     return {
