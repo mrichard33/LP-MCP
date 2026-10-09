@@ -143,6 +143,16 @@ export function deriveLpRecKey(in1Id) {
 }
 
 /**
+ * A Five9 Date/Time contact field value: `yyyy-MM-dd HH:mm:ss.SSS`, in UTC.
+ * Five9's own date fields read as UTC: f9_last_dispo_date_time
+ * 2026-10-07 15:44:46.213 matched five9_events_raw received_at 15:44:46Z for
+ * the same call. Pure.
+ */
+export function formatFive9DateTime(ms) {
+  return new Date(ms).toISOString().replace('T', ' ').replace(/Z$/, '');
+}
+
+/**
  * Build the field/value pair of arrays for one callback record.
  *
  * Pure and offline — every Five9 and GHL read happens before this is called,
@@ -150,7 +160,7 @@ export function deriveLpRecKey(in1Id) {
  *
  * @throws when CustID cannot be resolved. Deliberately loud: see the header.
  */
-export function buildCallbackRecord({ contactId, ghlContact = {}, lpRow = {} }) {
+export function buildCallbackRecord({ contactId, ghlContact = {}, lpRow = {}, nowMs = Date.now() }) {
   const custId = String(lpRow.lp_prospect_id ?? '').trim();
   if (!custId) {
     throw new Error(
@@ -193,6 +203,13 @@ export function buildCallbackRecord({ contactId, ghlContact = {}, lpRow = {} }) 
   const lpRecType = callbackLpRecType();
   if (lpRecType) pairs.push(['LPRecType', lpRecType]);
 
+  // Every push stamps when THIS request was made (2026-10-09). Profile
+  // "Callback Request V2" rule 3 reads Contact Record Created, which an update
+  // never moves, so a repeat requester aged out 48h after their FIRST record
+  // (David Strehlow). Mark's Five9 field callback_requested_at is ours, unlike
+  // the create time above; rule 3 moves onto it once the pushes are verified.
+  pairs.push(['callback_requested_at', formatFive9DateTime(nowMs)]);
+
   const kept = pairs.filter(([, v]) => v !== '' && v != null);
   return {
     fieldNames: kept.map(([k]) => k),
@@ -201,6 +218,7 @@ export function buildCallbackRecord({ contactId, ghlContact = {}, lpRow = {} }) 
     number1,
     lpRecKey,
     lpRecType,
+    callbackRequestedAt: formatFive9DateTime(nowMs),
   };
 }
 
