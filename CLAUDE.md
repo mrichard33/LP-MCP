@@ -580,10 +580,13 @@ neither (a "?" at the end, a name instead of "we"), so `readCallPromise` (`src/a
 both. Every sent reply that promises a call (both bots, never a service hand-off) is a `promised_callbacks` row (sql/150,
 one open per contact), due the next business day at 12:00 ET. `src/jobs/promised-callback-sweep.js` (15 min, team hours)
 marks it KEPT on a Five9 call to the phone (`five9_events_raw`, the only source for a call) or a rep's GHL text (an
-outbound message that no workflow sent and whose id is not one of ours: GHL marks the bot's sends `source: app` too), or
+outbound message after the promise that no workflow sent and that is not ours by id OR by text, `isOurText`: GHL marks
+the bot's sends `source: app` too, and a bot email can reach GHL under another id, 2026-10-09), or
 EXPIRED past due: one #contact-center card and `needs-rep-review`, never a text to the lead. While a row is open, a reply
 that promises again becomes "{Rep} still owes you that call. I've flagged it again." (the handoff's line, pending Mark's
-approval; "Our team" when no name) and the re-flag posts once a day. `PROMISED_CALLBACK_MODE` off|shadow|live, default
+approval; "Our team" when no name) and the re-flag posts once a day. A promise needs a doer on our side next to "will"
+(2026-10-09): "We'll leave it there, reach out whenever…" is an invitation, not a promise. The simulator never records
+one (`sim-` contacts are refused and the simulator swaps the deps). `PROMISED_CALLBACK_MODE` off|shadow|live, default
 shadow (rows written, no Slack, no tag, reply unchanged).
 
 **Only SALES callbacks go to Five9 + #contact-center (Mark, 2026-10-03).** "Anything related to service should let the lead

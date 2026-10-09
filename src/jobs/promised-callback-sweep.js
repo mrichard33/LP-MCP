@@ -67,7 +67,13 @@ async function readGhlMessages(d, contactId) {
   return Array.isArray(messages) ? messages : [];
 }
 
-async function readBotMessageIds(d, contactId, sinceIso) {
+/**
+ * What WE sent this contact around the promise: GHL message ids and the text.
+ * 2026-10-09: ids alone are not enough. A bot email reached GHL under a
+ * different id than the one the send recorded (kOrbvKKQD6e8D5tptOuX, 10-07),
+ * so the sweep read our own email as a rep's and marked the promise kept.
+ */
+async function readBotSends(d, contactId, sinceIso) {
   const { data, error } = await d.supabase.from('agent_actions')
     .select('execution_result')
     .eq('target_id', contactId)
@@ -76,13 +82,16 @@ async function readBotMessageIds(d, contactId, sinceIso) {
     .limit(200);
   if (error) throw new Error(error.message);
   const ids = new Set();
+  const bodies = [];
   for (const r of data || []) {
     for (const k of ['message_id', 'email_message_id']) {
       const v = r?.execution_result?.[k];
       if (v) ids.add(String(v));
     }
+    const body = r?.execution_result?.sent_body;
+    if (body) bodies.push(String(body));
   }
-  return ids;
+  return { ids, bodies };
 }
 
 /** One pass. Returns a summary for job_runs. */
@@ -105,16 +114,16 @@ export async function runPromisedCallbackSweep(deps = {}) {
     summary.checked += 1;
     let five9Calls = null;
     let ghlMessages = null;
-    let botIds = new Set();
+    let botSends = { ids: new Set(), bodies: [] };
     try { five9Calls = await readFive9Calls(d, promise.phone10, new Date(Date.parse(promise.promised_at) - 60000).toISOString()); } catch (err) { summary.errors.push(`five9 ${promise.id}: ${err.message}`); }
     try {
       ghlMessages = await readGhlMessages(d, promise.ghl_contact_id);
-      botIds = await readBotMessageIds(d, promise.ghl_contact_id, promise.promised_at);
+      botSends = await readBotSends(d, promise.ghl_contact_id, promise.promised_at);
     } catch (err) {
       ghlMessages = null;
       summary.errors.push(`ghl ${promise.id}: ${err.message}`);
     }
-    const verdict = keptVerdict({ promise, five9Calls, ghlMessages, botMessageIds: botIds });
+    const verdict = keptVerdict({ promise, five9Calls, ghlMessages, botMessageIds: botSends.ids, botBodies: botSends.bodies });
     const decision = sweepDecision({ promise, verdict, nowMs });
     const stamp = new Date(nowMs).toISOString();
 

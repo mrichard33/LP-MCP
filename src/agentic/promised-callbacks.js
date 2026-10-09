@@ -25,7 +25,7 @@
  *           expired promise tags needs-rep-review.
  */
 
-import { promisedCallback, promisesPersonContact, TEAM_TIMEZONE } from './team-hours.js';
+import { promisedCallback, TEAM_TIMEZONE } from './team-hours.js';
 
 export const PROMISE_STATUSES = Object.freeze(['open', 'kept', 'expired', 'cancelled']);
 export const NEEDS_REVIEW_TAG = 'needs-rep-review';
@@ -47,8 +47,12 @@ const NOT_A_NAME = new Set([
 const HAVE_NAME_RX = /\b(?:[Ii]['’]?ll|[Ii]\s+will|[Ww]e['’]?ll|[Ww]e\s+will|[Ii]['’]?m\s+going\s+to|[Ll]et\s+me)\s+(?:have|get|ask)\s+([A-Z][a-z]+)\s+(?:to\s+)?(?:call|ring|reach\s+out|get\s+in\s+touch|follow\s+up|give\s+you\s+a\s+(?:call|ring))/;
 // "Brian will be reaching out", "Brian from our team will follow up", "Dana's going to call"
 const NAME_WILL_RX = /\b([A-Z][a-z]+)(?:\s+from\s+(?:our|the)\s+(?:\w+\s+)?team)?\s*(?:'ll|’ll|\s+will|'s\s+going\s+to|\s+is\s+going\s+to|\s+is\s+gonna)\s+(?:be\s+)?(?:call(?:ing)?\b|ring(?:ing)?\b|reach(?:ing)?\s+out|follow(?:ing)?\s+up|get(?:ting)?\s+in\s+touch|giv(?:e|ing)\s+you\s+a\s+(?:call|ring)|contact(?:ing)?\s+you)/;
-// "someone / a team member / our team will be reaching out" (the "-ing" form team-hours misses)
-const SOMEONE_WILL_RX = /\b(?:we|someone|somebody|a\s+(?:team\s+member|rep|specialist|member\s+of\s+(?:our|the)\s+team)|our\s+(?:\w+\s+)?(?:team|rep|specialist|office))(?:'ll|’ll|\s+will|\s+(?:is|are)\s+going\s+to)\s+(?:be\s+)?(?:call(?:ing)?\b|reach(?:ing)?\s+out|follow(?:ing)?\s+up|get(?:ting)?\s+in\s+touch|contact(?:ing)?\s+you)/i;
+// "someone (from our team) / a team member / our team will be reaching out" (the "-ing"
+// form team-hours misses). The doer and "will" sit next to each other (bar "from our
+// team"), so "We'll leave it there for now, reach out whenever…" is not a promise.
+const SOMEONE_WILL_RX = /\b(?:we|someone|somebody|a\s+(?:team\s+member|rep|specialist|member\s+of\s+(?:our|the)\s+team)|our\s+(?:\w+\s+)?(?:team|rep|specialist|office))(?:\s+(?:from|on)\s+(?:our|the)\s+(?:\w+\s+)?team)?(?:'ll|’ll|\s+will|\s+(?:is|are)\s+going\s+to)\s+(?:be\s+)?(?:call(?:ing)?\b|reach(?:ing)?\s+out|follow(?:ing)?\s+up|get(?:ting)?\s+in\s+touch|contact(?:ing)?\s+you)/i;
+// "I'll have someone from our team reach out", "we'll get a rep to call you"
+const HAVE_SOMEONE_RX = /\b(?:i['’]?ll|i\s+will|we['’]?ll|we\s+will|i['’]?m\s+going\s+to|let\s+me)\s+(?:have|get|ask)\s+(?:someone|somebody|a\s+(?:team\s+member|rep|specialist|member\s+of\s+(?:our|the)\s+team)|our\s+(?:\w+\s+)?(?:team|rep|specialist|office))(?:\s+(?:from|on)\s+(?:our|the)\s+(?:\w+\s+)?team)?\s+(?:to\s+)?(?:call|ring|reach\s+out|get\s+in\s+touch|follow\s+up|give\s+you\s+a\s+(?:call|ring)|contact\s+you)/i;
 // The booking confirm is the phone room's confirmation, never a callback (team-hours.js).
 const NOT_A_CALLBACK_RX = /\b(?:confirm\s+(?:the\s+|your\s+)?(?:details|appointment|visit|time))\b|\ball\s+set\b/i;
 
@@ -85,7 +89,11 @@ export function readCallPromise(text) {
     if (have && nameFrom(have)) return { promised: true, rep: nameFrom(have), sentence: c };
     const named = c.match(NAME_WILL_RX);
     if (named && nameFrom(named)) return { promised: true, rep: nameFrom(named), sentence: c };
-    if (SOMEONE_WILL_RX.test(c) || promisedCallback(c) || promisesPersonContact(c)) {
+    // 2026-10-09: no loose fallback. promisesPersonContact read any "we'll" + "reach out"
+    // in one sentence as a promise, so "We'll leave it there for now, reach out whenever
+    // the timing's right" and "We'll hold off and be here whenever you're ready to reach
+    // out" became promises that would have posted false "not kept" cards.
+    if (SOMEONE_WILL_RX.test(c) || HAVE_SOMEONE_RX.test(c) || promisedCallback(c)) {
       return { promised: true, rep: null, sentence: c };
     }
   }
@@ -170,15 +178,18 @@ export function phone10(n) {
  *                                  promised_at; null = could not read
  * @param {Array|null} a.ghlMessages GHL conversation messages; null = could not read
  * @param {Set<string>} a.botMessageIds GHL ids of messages WE sent (agent_actions)
+ * @param {string[]} [a.botBodies]  the text of what WE sent (agent_actions sent_body)
  * @returns {{ kept: true, evidence }|{ kept: false }|null}  null = could not tell
  *
  * Five9 is the only source of truth for a call (never LP call logs). A rep's
- * text counts too: an outbound SMS or email in GHL that no workflow sent and
- * whose id is not one of ours. (GHL marks the bot's API sends source 'app'
- * exactly like a person's, so "not one of ours" is the only reliable test.)
+ * text counts too: an outbound SMS or email in GHL that no workflow sent,
+ * sent AFTER the promise, and that is not one of ours by id OR by text. (GHL
+ * marks the bot's API sends source 'app' exactly like a person's, and a bot
+ * email can reach GHL under a different id than the send recorded, 2026-10-09.)
  */
-export function keptVerdict({ promise, five9Calls, ghlMessages, botMessageIds = new Set() }) {
-  const since = Date.parse(promise?.promised_at || '') - 60000;
+export function keptVerdict({ promise, five9Calls, ghlMessages, botMessageIds = new Set(), botBodies = [] }) {
+  const promisedMs = Date.parse(promise?.promised_at || '');
+  const since = promisedMs - 60000;
   const phone = phone10(promise?.phone10);
   if (Array.isArray(five9Calls) && phone) {
     const call = five9Calls.find(c => phone10(c?.dnis) === phone && (Date.parse(c.call_start_at || c.received_at || '') || 0) >= since);
@@ -190,12 +201,32 @@ export function keptVerdict({ promise, five9Calls, ghlMessages, botMessageIds = 
       && (m.messageType === 'TYPE_SMS' || m.messageType === 'TYPE_EMAIL' || m.type === 2 || m.type === 3)
       && !['workflow', 'bulk_actions', 'campaign'].includes(String(m.source || '').toLowerCase())
       && m.id && !botMessageIds.has(String(m.id))
-      && (Date.parse(m.dateAdded || '') || 0) >= since);
+      // Strictly after the promise: the promise is written once its own
+      // message has gone out, so that message is always before promised_at.
+      && (Date.parse(m.dateAdded || '') || 0) > promisedMs
+      && !isOurText(m.body, botBodies, promise?.promise_text));
     if (rep) return { kept: true, evidence: { source: 'ghl_rep_message', at: rep.dateAdded, message_id: rep.id, user_id: rep.userId || null } };
   }
   // Could not read one side: no verdict, touch nothing (CLAUDE.md, three-way active).
   if ((phone && !Array.isArray(five9Calls)) || !Array.isArray(ghlMessages)) return null;
   return { kept: false };
+}
+
+function normText(s) {
+  return String(s || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+/**
+ * Is this GHL message one WE sent? Its text holds the start of one of our
+ * sends (an email arrives with its subject line in front), or the promise
+ * sentence itself. 40 characters is long enough that a rep's own words do not
+ * match by chance.
+ */
+export function isOurText(body, botBodies = [], promiseText = null) {
+  const b = normText(body);
+  if (!b) return false;
+  const probes = [...botBodies, promiseText].map(t => normText(t).slice(0, 40)).filter(p => p.length >= 20);
+  return probes.some(p => b.includes(p));
 }
 
 /** What the sweep does with one open row. Pure. */

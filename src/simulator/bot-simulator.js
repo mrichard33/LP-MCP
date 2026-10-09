@@ -163,6 +163,11 @@ export async function simulateLiveChat(plan, { nepqMode = 'live', productionDeps
     rescheduleAppointment: async (a) => { record('would_move_same_appointment_in_ghl', { appointment_id: a.oldAppointmentId, new_start: a.startIso }); return { ok: true }; },
     postCancelCard: async (a) => { record('would_post_dispatch_card', { card: a.kind, text: String(a.text || '').slice(0, 400) }); return { ok: true }; },
     bookSlot: async (a) => { record('would_book', { start: a.startIso }); return { ok: true, action_id: 0 }; },
+    // 2026-10-09: the production deps write a promised_callbacks row and can
+    // re-flag one in #contact-center. Four sim-quote-* rows reached the live
+    // table on 2026-10-07. Recorded here, never done.
+    recordPromise: async (a) => { record('would_record_promised_call', { text: String(a?.text || '').slice(0, 200) }); return { recorded: false, reason: 'simulated' }; },
+    guardRepeatPromise: async ({ text }) => ({ text, action: 'none' }),
     nepqHandoff: async (a) => {
       // 2026-10-03: a callback (with a number to call) files to Five9 + #contact-center.
       // Part 14: every hand-off but service is a Five9 call + its card.
