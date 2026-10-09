@@ -152,6 +152,7 @@
 
 import supabase from '../../supabase.js';
 import { setAppointment as lpSetAppointment, getLeadByLdsId, getCircuitStatus } from '../../lp-client.js';
+import { postDemoLock } from '../../lp-post-demo-lock.js';
 import { extractArray, getField } from '../../sync-utils.js';
 import { resolveLPLeadId } from '../../lp-appointment-sync.js';
 import { sendGroupMeMessage } from '../../groupme.js';
@@ -417,7 +418,7 @@ export async function executeSetLPAppointment(action, context = {}) {
   // all → proceed unchanged (defense-in-depth, not a gate).
   const evtCalendarId = payload.calendar_id || eventPayload.calendar_id || null;
   const evtCalendarName = String(payload.calendar_name || eventPayload.calendar_name || eventPayload.title || '').trim().toLowerCase();
-  if ((evtCalendarId && isGhlOnlyCalendarId(evtCalendarId)) || evtCalendarName === 'confirmation call') {
+  if ((evtCalendarId && isGhlOnlyCalendarId(evtCalendarId)) || evtCalendarName === 'confirmation call' || evtCalendarName === 'rehash call') {
     console.log(`[LP-APPT] skipped_ghl_only_calendar for ${contactId} (calendar=${evtCalendarId || evtCalendarName})`);
     return {
       action: 'skipped_ghl_only_calendar',
@@ -436,6 +437,7 @@ export async function executeSetLPAppointment(action, context = {}) {
   // haven't been swept into lp_leads yet.
   let resolutionLpSource = null;
   let resolutionLpSourceDetail = null;
+  let resolutionDisp = null;
 
   if (isLPLeadId(contactId)) {
     lpLeadId = contactId;
@@ -507,6 +509,7 @@ export async function executeSetLPAppointment(action, context = {}) {
     // succeeded — pulled from the live LP lead record at match time.
     resolutionLpSource = resolution.lpSource || null;
     resolutionLpSourceDetail = resolution.lpSourceDetail || null;
+    resolutionDisp = resolution.disp || null;
 
     try {
       const writebackFields = [
@@ -886,6 +889,23 @@ export async function executeSetLPAppointment(action, context = {}) {
         resolution_source: resolutionSource,
       };
     }
+  }
+
+  // ─── Post-demo lock (the user, 2026-10-09) ─────────────────────────
+  // "We should never modify a lead marked OPP FDN." Rule 112 sent a rehash
+  // phone call's time onto OPPFDN lead 581695 and LP flipped it to Set.
+  // src/lp-post-demo-lock.js holds the rule; a locked lead gets no appointment.
+  const demoLock = await postDemoLock(lpLeadId, { knownDisposition: resolutionDisp });
+  if (demoLock.locked) {
+    console.log(`[LP-APPT] skipped_post_demo_lead for ${contactId}: lds_id=${lpLeadId} disposition=${demoLock.disposition || '?'} (${demoLock.source})`);
+    return {
+      action: 'skipped_post_demo_lead',
+      contact_id: contactId,
+      lp_lead_id: lpLeadId,
+      disposition: demoLock.disposition,
+      lock_source: demoLock.source,
+      reason: 'post-demo or sold LP lead: never re-set (the user, 2026-10-09)',
+    };
   }
 
   // ─── Write to LP ──────────────────────────────────────────────────

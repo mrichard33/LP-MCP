@@ -200,6 +200,25 @@ are dropped for these replies because every one is pre-demo copy. A "yes" to the
 to #contact-rehash (`SLACK_CHANNEL_REHASH`, default C0C5YMHNYJH) via `src/notifications/rehash-call.js`.
 No resolved name → the reply signs "Reece Team"; never guess a name. See `src/agentic/rehash.js`.
 
+**A post-demo lead is in REHASH: the rehash team calls it, LP is never touched (the user, 2026-10-09).** Monica (LP
+lead 581695, OPPFDN after her 10/7 demo, outside F.0's 14-day window) got a Five9 sales callback, a moved appointment
+and an LP re-set. Now:
+- **LP lock:** `postDemoLock` (`src/lp-post-demo-lock.js`) runs right before both LP SetAppointment calls
+  (`executeSetLPAppointment`, `syncAppointmentToLP`). It reads the caller's disposition, `lp_leads`, then LP live, and
+  any `isDemoDisposition` answer (Sale, OPPFDN, NoRehash, FDNS, SW, PM) refuses. A lead neither source knows is a new
+  lead; both reads failing refuses. "We should never modify a lead marked OPP FDN."
+- **The stage:** `src/agentic/rehash-state.js`. The current lead OPPFDN with a demo in the last `REHASH_DAYS` (30) → tags
+  `rehash` + `rehash-lead:<lds>` + `rehash-since:<demo date>`. It ends on a NEWER lead, when the lead leaves OPPFDN, or at
+  30 days: the tags come off, `rehash-done:<lds>` stays, and a GHL owner in `REHASH_TEAM_USER_IDS` (default John Manieri)
+  is cleared by `release_rehash_owner` (read back). Job `rehash-tag-sweep` (15 min) writes through agent_actions rows
+  (rule `REHASH_TAG_SWEEP`). `isRehashContact` counts `rehash` like `active-f.0`.
+- **Calls, not visits:** a rehash call request (`lp_callback_requeue`, so `fileBotCallback` and `HOT_CALL_IMMEDIATE` too)
+  skips Five9 and posts one #contact-rehash card a day (`skipped_rehash_lead`); no #contact-center card. A
+  `book_appointment` for a rehash lead goes only on Rehash Call: a Confirmation Call is moved there at the same time, a visit
+  is refused (`skipped_rehash_visit`), and with no `REHASH_CALENDAR_ID` nothing is booked and #contact-rehash is told
+  (`skipped_rehash_no_calendar`). A lead not in rehash is never booked on Rehash Call (`skipped_not_rehash`).
+- `REHASH_ROUTING_MODE` off|shadow|live, default shadow (`rehash.would_*` events only). The LP lock is not behind it.
+
 **A held appointment asks a person to import its LP row (2026-10-05).** When LP already has an unimported
 inbound row for a contact, `syncAppointmentToLP` holds the appointment (`lp-appt-deferred`) rather than add a
 duplicate lead, and the parity watchdog re-drives it every 30 min. LP has no API that imports a row, so once a
@@ -219,10 +238,13 @@ from GHL's `last_appointment_start_date/time`, which ANY calendar fills (`checkC
 for new, reused and issued-inquiry leads, set_lp_appointment and the sync with no calendar named). The lead still goes
 to LP, without the appointment. A failed GHL read fails open. The reconciler never creates a Window Estimate over an
 active GHL-only appointment at the same time. A new LP write that carries a date and time goes through the same check.
-**The call is made from GHL, by the Rehash rep (the user, 2026-10-09).** Every Confirmation Call we book (the
-booking handler and the delegated booking endpoint) is assigned to: a named assignee, else the contact's owner, else
-John Manieri (`TYcZ9DcNkuPCFYsFxRFV`, `CONFIRMATION_CALL_ASSIGNED_USER_ID`, `off` = no default;
-`src/config/rehash-assignee.js`). The rehash entry should make the rep the contact's OWNER, not only a follower.
+**Rehash calls have their own calendar; pre-demo Confirmation Calls name nobody (the user, 2026-10-09).** #1223 sent
+every Confirmation Call to the contact's owner or John Manieri, but pre-demo leads use that calendar too, so the rehash
+team would get pre-demo calls. Now a rehash call goes on "Rehash Call" (a GHL Round Robin of the rehash reps,
+`REHASH_CALENDAR_ID`, GHL-only like Confirmation Call, so no LP path takes it): the named assignee, else the contact's
+owner when that owner is on the rehash team (`REHASH_TEAM_USER_IDS`), else the Rehash rep (John Manieri
+`TYcZ9DcNkuPCFYsFxRFV`, `CONFIRMATION_CALL_ASSIGNED_USER_ID`). A Confirmation Call names only an assignee the booking
+named (`callAssigneeFor`, `src/config/rehash-assignee.js`).
 **Only the automatic repair needs an open lead (the user, 2026-10-09).** `terminalDispositionDecision` refuses a
 post-demo or sold lead (`isDemoDisposition`: Sale, OPPFDN, NoRehash, FDNS, SW, PM) for every caller; with
 `requireBookable` (the parity watchdog only) it also refuses any non-bookable lead. A person or GHL booking re-sets a

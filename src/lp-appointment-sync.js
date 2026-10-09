@@ -236,6 +236,7 @@ import { enrollLpLeadCreation } from './admin/lp-force-addlead.js';
 import { isGhlOnlyCalendarId } from './knowledge/booking-calendar-router.js';
 import { checkConfirmationCallSlot } from './services/confirmation-call-slot.js';
 import { isDemoDisposition } from './demo-truth.js';
+import { postDemoLock } from './lp-post-demo-lock.js';
 import { five9DispatchConfigured, dispatchConfirmationCallback } from './five9/list-dispatch.js';
 // 2026-07-28 appt-enrichment repoint: the CANONICAL rate-limited GHL client.
 // Byte-identical to the private ghlFetch below EXCEPT it calls report429() on a
@@ -1953,6 +1954,7 @@ async function syncAppointmentToLP({
   const _resolveLPLeadId = deps.resolveLPLeadId || resolveLPLeadId;
   const _lpSetAppointment = deps.lpSetAppointment || lpSetAppointment;
   const _checkConfirmationCallSlot = deps.checkConfirmationCallSlot || checkConfirmationCallSlot;
+  const _postDemoLock = deps.postDemoLock || postDemoLock;
 
   // ── GHL-only calendar: never an LP appointment (2026-10-08) ──
   // Confirmation Call is a phone touch, not the estimate visit. The executor
@@ -2279,6 +2281,26 @@ async function syncAppointmentToLP({
       lp_lead_id: ldsId,
       lp_prospect_id: prospectId,
       disposition: dispDecision.disposition,
+      resolution_source: source,
+      resolution_step: step,
+    };
+  }
+
+  // ── Post-demo lock (the user, 2026-10-09) — src/lp-post-demo-lock.js.
+  // The guard above trusts the resolver's disposition, and a blank one passes
+  // as "unknown". This asks lp_leads and LP live too: an OPPFDN / sold lead is
+  // never re-set, whoever asked.
+  const demoLock = await _postDemoLock(ldsId, { knownDisposition: disp });
+  if (demoLock.locked) {
+    console.warn(`[LP-APPT] ⛔ skipped_post_demo_lead for ${contactId}: lds_id=${ldsId} disposition=${demoLock.disposition || '?'} (${demoLock.source}) — no SetAppointment`);
+    return {
+      success: false,
+      action: 'skipped_terminal_disposition',
+      contact_id: contactId,
+      lp_lead_id: ldsId,
+      lp_prospect_id: prospectId,
+      disposition: demoLock.disposition,
+      lock_source: demoLock.source,
       resolution_source: source,
       resolution_step: step,
     };

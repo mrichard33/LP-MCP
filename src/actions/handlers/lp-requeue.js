@@ -55,6 +55,9 @@ import { sendGroupMeMessage } from '../../groupme.js';
 import { addGHLNote } from '../../ghl.js';
 import { isLPLeadId, ghlFetch } from '../helpers.js';
 import { emitEvent } from '../../event-emitter.js';
+import { pickCurrentLead } from '../../current-lead.js';
+import { isInRehash, rehashRoutingMode } from '../../agentic/rehash-state.js';
+import { notifyRehashCall } from '../../notifications/rehash-call.js';
 import {
   REQUEUE_SENDER,
   buildRequeueUser2,
@@ -222,7 +225,7 @@ export async function executeLpCallbackRequeue(action) {
   try {
     const { data } = await supabase
       .from('lp_leads')
-      .select('lp_lead_id, lp_prospect_id, address, city, state, zip, raw_lp_data, created_at_lp')
+      .select('lp_lead_id, lp_prospect_id, address, city, state, zip, raw_lp_data, created_at_lp, updated_at_lp, disposition_code, appointment_date')
       .eq('ghl_contact_id', contactId)
       .order('created_at_lp', { ascending: false })
       .limit(10);
@@ -230,6 +233,28 @@ export async function executeLpCallbackRequeue(action) {
   } catch (err) {
     console.warn(`[LP-REQUEUE] lp_leads lookup failed for ${contactId} (falling back to GHL fields): ${err.message}`);
   }
+  // ── Rehash leads belong to the rehash team (the user, 2026-10-09) ──
+  // A post-demo OPPFDN lead (Monica, LP lead 581695) was pushed to Five9's SALES
+  // Callback Request list. Rehash leads are called by the rehash team from GHL:
+  // one #contact-rehash card a day (src/notifications/rehash-call.js), no Five9,
+  // no LP. REHASH_ROUTING_MODE: shadow records what live would do.
+  const rehashMode = rehashRoutingMode();
+  if (rehashMode !== 'off' && isInRehash({ tags: ghlContact.tags || [], currentLead: pickCurrentLead(lpRows) })) {
+    const evt = { event_type: rehashMode === 'live' ? 'rehash.callback_rerouted' : 'rehash.would_reroute_callback', source: 'lp_requeue', entity_type: 'contact', entity_id: contactId, ghl_contact_id: contactId, priority: 'low', bypass_filter: true, payload: { contact_id: contactId, action_id: action.id || null, mode: rehashMode } };
+    await emitEvent(evt).catch(() => {});
+    if (rehashMode === 'live') {
+      const card = await notifyRehashCall({
+        contactId,
+        generated: { rehash: { active: true, rep_name: null }, rehash_call: { agreed: true, preferred_time: payload.preferred_time || null } },
+        triggerMessage: payload.notes || null,
+        contact: { firstName: ghlContact.firstName || null, phone: ghlContact.phone || null },
+      });
+      console.log(`[LP-REQUEUE] ⏭️ ${contactId} is in rehash — no Five9 push; #contact-rehash card ${card.posted ? 'posted' : card.reason}`);
+      return { action: 'skipped_rehash_lead', requeued: false, contact_id: contactId, rehash_card: card.reason };
+    }
+    console.log(`[LP-REQUEUE] 🕶️ ${contactId} is in rehash — live would skip Five9 and card #contact-rehash`);
+  }
+
   const cfLdsId = readCF(ghlContact, FIELD_LP_LEAD_ID);
   const prospectId = lpRows[0]?.lp_prospect_id || null;
   const ldsIds = [...new Set([...lpRows.map((r) => r.lp_lead_id), cfLdsId].filter(Boolean))];

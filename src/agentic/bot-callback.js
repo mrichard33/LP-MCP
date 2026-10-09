@@ -93,6 +93,8 @@ export function five9ResultLine(result) {
     case 'new_lead': return 'Five9: no LP lead yet, so a new LP lead was created for the dialer.';
     case 'already_dialing': return 'Five9: this number is already being dialed, so it was not added twice.';
     case 'deduped': return 'Five9: already queued for a callback in the last little while.';
+    // 2026-10-09: a rehash lead is the rehash team's call, from GHL.
+    case 'rehash': return 'Five9: NOT added. This is a post-demo rehash lead; the rehash team was told in #contact-rehash.';
     // 2026-10-03: Five9 takes a DNC number onto the list and never dials it.
     case 'on_dnc': return result.review
       ? 'Five9: NOT added. This number is on the Five9 do-not-call list, so the dialer would skip it. A DNC lift review was requested in #dnc-lift-approval; call them once it is approved.'
@@ -111,6 +113,7 @@ export function readRequeueResult(res) {
   if (action === 'requeue_lead_created') return { status: 'new_lead' };
   if (action === 'requeue_skipped_already_dialable' || action === 'requeue_suppressed_other_list') return { status: 'already_dialing' };
   if (action === 'requeue_deduped') return { status: 'deduped' };
+  if (action === 'skipped_rehash_lead') return { status: 'rehash' };
   if (action === 'requeue_blocked_dnc') return { status: 'on_dnc', review: (res.result || res).dnc_review_action_id != null };
   return { status: 'failed', error: action || 'unknown result' };
 }
@@ -176,7 +179,10 @@ export async function fileBotCallback({ contactId, channel = 'sms', inbound = ''
   } catch (err) {
     five9 = { status: 'failed', error: err.message };
   }
-  if (card) {
+  // A rehash lead's call request already went to #contact-rehash (the user,
+  // 2026-10-09: "These leads will be handled by John Manieri or other rehash
+  // team members"): no #contact-center card on top.
+  if (card && five9.status !== 'rehash') {
     await Promise.resolve().then(() => deps.routeHandoff?.({
       // 2026-10-07: a caller's own context (the LP-note DQ package) rides above the Five9 line.
       contactId, reason, channel, inbound, firstName, nowMs, extra: [extra, five9ResultLine(five9)].filter(Boolean).join('\n'),

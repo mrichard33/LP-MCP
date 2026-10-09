@@ -49,7 +49,12 @@ export function rehashSlackChannel(env = process.env) {
  * number catches a lead whose tag write lags the text. Pure.
  */
 export function isRehashContact({ tags = [], fromNumber = null, env = process.env } = {}) {
-  const hasTag = (Array.isArray(tags) ? tags : []).some((t) => String(t).trim().toLowerCase() === F0_ACTIVE_TAG);
+  // 2026-10-09: the `rehash` tag (src/agentic/rehash-state.js) counts too: an
+  // OPPFDN demo outside F.0's 14-day entry window is still a rehash lead.
+  const hasTag = (Array.isArray(tags) ? tags : []).some((t) => {
+    const v = String(t).trim().toLowerCase();
+    return v === F0_ACTIVE_TAG || v === 'rehash';
+  });
   const n = last10(fromNumber);
   return hasTag || (!!n && n === rehashNumber(env));
 }

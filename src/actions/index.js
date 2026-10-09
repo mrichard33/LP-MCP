@@ -67,10 +67,12 @@
  *     layer3_dispatch, emit_event, check_eligibility, check_throttle,
  *     compute_risk_score, calculate_time_lapse_tier, classify_bucket,
  *     reanalyze_reply
- *   State machines (6):
+ *   State machines (8):
  *     compute_rescission_dispatch, transition_objection_state,
  *     resolve_objection_state, classify_lead_state, end_agentic_handoff,
  *     dq_hard_stop (2026-10-07),
+ *     release_rehash_owner (2026-10-09 — the rehash stage ended; the rehash
+ *       rep stops owning the contact; src/actions/handlers/rehash-owner.js)
  *     s52_cancel_recheck (2026-10-02 — the one 30-minute re-check of a cancel
  *       that not_reschedule_inflight suppressed; src/s52-cancel-recheck.js)
  *   Five9 gated writes (37 — every one behind FIVE9_WRITES_ENABLED, and all
@@ -266,6 +268,7 @@ import { executeSetDND } from './handlers/dnd.js';
 import { executeCreateTask } from './handlers/tasks.js';
 import { executeSendNotification } from './handlers/notifications.js';
 import { executeUpdateCustomFields, executeUpdateContactEmail } from './handlers/custom-fields.js';
+import { executeReleaseRehashOwner } from './handlers/rehash-owner.js';
 // 2026-09-11 (Alfredo Fontan) — persist what the analyzer established from the
 // lead's own words, at the moment it knows. See the handler header for why this
 // is a dedicated action type and not an update_custom_fields template.
@@ -695,6 +698,7 @@ export const ACTION_HANDLERS = {
   update_custom_fields: executeUpdateCustomFields,
   persist_established_facts: executePersistEstablishedFacts, // 2026-09-11 — analyzer-time fact persistence
   update_contact_email: executeUpdateContactEmail,
+  release_rehash_owner: executeReleaseRehashOwner,   // 2026-10-09 — rehash ends: the rehash rep stops owning the contact
   calculate_time_lapse_tier: executeCalculateTimeLapseTier,
   send_message: executeSendMessageWithLock,      // MVI v2.5 — outbound_locks wrap; 2026-05-13 — + suppression gate
   layer3_dispatch: executeLayer3Dispatch,        // MVI v2.5 — Layer 3 fan-out
