@@ -29,7 +29,7 @@ import { isLeadQuestion, findBookingAsks } from './discovery-discipline.js';
 import { isTeamOpen, nextTeamOpenLabel, requestedCallTime, promisedCallback } from './team-hours.js';
 import { heldSlot, COLLECT_ASK } from './booking-collect.js';
 import { RECHECK_RX } from './contact-check.js';
-import { slotMentionIndex } from '../live-chat/cancel-flow.js';
+import { slotMentionIndex, offeredSlots as offeredIn, pickSlot } from '../live-chat/cancel-flow.js';
 import { parseDayPreference, slotsForPreference, slotMatches, preferenceOfferLine } from './day-preference.js';
 import { enforceOneAsk } from './one-ask.js';
 import { isKnockComplaint } from './do-not-knock.js';
@@ -547,6 +547,9 @@ export function planNepqTurn({
   // 2026-10-09 (Mark): the lead already had the in-home demo (rehash, or past
   // the appointment). rehashRep is the rep the reply is written as, if named.
   postDemo = false, rehashRep = null,
+  // 2026-10-09 (the user): the rep's real Rehash Call openings
+  // ({ offer: [2], all: [...] }, rehash-slots.js), or null for none.
+  callSlots = null,
 } = {}) {
   const turns = normalizeThread(conversation, trigger);
   const inbound = turns.filter(t => t.direction === 'inbound');
@@ -690,6 +693,16 @@ export function planNepqTurn({
   // to a real person on the phone"): same hand-off (2026-10-03).
   const askedForCall = (CALLBACK_RX.test(now) || callbackRequested) && !isNotInterested(now);
   if (askedForCall && serviceCall()) return serviceHandoff();
+  // 1a. A rehash call on the Rehash Call calendar (the user, 2026-10-09): two
+  // REAL openings when they want the call, the pick booked, never a time the
+  // calendar does not show. No openings → the hand-off below, as before.
+  // A follow-up date or "we signed elsewhere" from a post-demo lead outranks
+  // a call request ("Call me in November"): confirm the date, file it.
+  if (postDemo && (PURCHASED_ELSEWHERE_RX.test(now) || detectDeferral(now, nowMs))) return planPostDemo();
+  if (postDemo && callSlots) {
+    const r = planRehashCall();
+    if (r) return r;
+  }
   if (askedForCall) {
     // A call asked for outside team hours gets the next opening instead, and
     // after hours "call me back" names when (2026-10-02, Mark).
@@ -713,6 +726,57 @@ export function planNepqTurn({
   // stock first-contact question, slots offered twice to "Follow up in
   // November please", and "Congratulations" to a lead who signed elsewhere.
   if (postDemo) return planPostDemo();
+  // The lead's earlier messages, each with its own time when the thread has
+  // one, so "by Friday" said last week is read against last week.
+  function earlierInbound() {
+    return (Array.isArray(conversation) ? conversation : [])
+      .filter(m => String(m?.direction || '').toLowerCase() !== 'outbound')
+      .map(m => ({ text: String(m?.text ?? m?.body ?? ''), atMs: Date.parse(m?.timestamp || m?.sent_at || m?.dateAdded || m?.created_at || '') }))
+      .filter(m => m.text.trim() && m.text !== now);
+  }
+  function planRehashCall() {
+    // A follow-up date or "we signed elsewhere" is the post-demo plan's job.
+    if (PURCHASED_ELSEWHERE_RX.test(now) || detectDeferral(now, nowMs)) return null;
+    const scheduleAsk = SCHEDULE_ASK_RX.test(now) || TIME_REQUEST_RX.test(now);
+    if (pendingDeferral(earlierInbound(), nowMs) && !scheduleAsk && !askedForCall) return null;
+    const all = Array.isArray(callSlots.all) ? callSlots.all : [];
+    const offer = Array.isArray(callSlots.offer) ? callSlots.offer : [];
+    const hi = firstName ? `, ${firstName}` : '';
+    const base = { post_demo: true, call_offer_ok: true, rehash_call_slots: true };
+    const offerPlan = (two, line) => Object.assign(plan, base, {
+      step: 'rehash_offer', required_move: 'offer_slots', fixed_line: line, slots_to_offer: two,
+      allowed: { ...plan.allowed, slot_offer: true }, booking: { allowed: true, reason: 'nepq:rehash_offer' },
+    });
+    const confirmPlan = (picked) => {
+      const label = `${picked.rel || picked.day} at ${picked.time}${picked.tz ? ` ${picked.tz}` : ''}`;
+      return Object.assign(plan, base, {
+        step: 'rehash_confirm', required_move: 'confirm', rehash_pick: picked,
+        reference_line: `You're all set${hi}. You're on the calendar for a quick call ${label}.`,
+        reference_slots: [picked], booking: { allowed: true, reason: 'nepq:rehash_confirm' },
+      });
+    };
+    // A pick from the times we offered (the last four of our messages).
+    if (lastOfferOut) {
+      const offered = offeredIn(lastOfferOut, all);
+      const picked = pickSlot(now, offered) || exactSlotFor(now, offered);
+      if (picked) return confirmPlan(picked);
+    }
+    // A time they typed: the one opening it names is the pick; otherwise the
+    // two openings nearest it. Never a time the calendar does not show.
+    const typed = typedClock(now);
+    if (typed != null && all.length) {
+      const exact = exactSlotFor(now, all);
+      if (exact) return confirmPlan(exact);
+      const near = nearestToClock(all, typed, now, nowMs);
+      if (near.length === 2) return offerPlan(near, LINES.offer_slots(near, counters.slot_offers));
+    }
+    // Yes to our call offer, a call asked for, or "can we set up a time".
+    const yesToCall = CALL_OFFER_SENTENCE_RX.test(lastOut) && (YES_RX.test(now) || MAYBE_RX.test(now)) && !isNo(now, lastOut);
+    if ((askedForCall || yesToCall || scheduleAsk) && offer.length === 2) {
+      return offerPlan(offer, LINES.offer_slots(offer, counters.slot_offers));
+    }
+    return null;
+  }
   function planPostDemo() {
     const hi = firstName ? `, ${firstName}` : '';
     const pd = (extra) => Object.assign(plan, { post_demo: true, booking: { allowed: false, reason: 'nepq:post_demo' }, call_offer_ok: true }, extra);
@@ -721,12 +785,7 @@ export function planNepqTurn({
     const all = (Array.isArray(conversation) ? conversation : [])
       .map(m => ({ direction: String(m?.direction || '').toLowerCase() === 'outbound' ? 'outbound' : 'inbound', text: String(m?.text ?? m?.body ?? '') }))
       .filter(m => m.text.trim());
-    // Each with its own time when the thread has one, so "by Friday" said
-    // last week is read against last week.
-    const earlierIn = (Array.isArray(conversation) ? conversation : [])
-      .filter(m => String(m?.direction || '').toLowerCase() !== 'outbound')
-      .map(m => ({ text: String(m?.text ?? m?.body ?? ''), atMs: Date.parse(m?.timestamp || m?.sent_at || m?.dateAdded || m?.created_at || '') }))
-      .filter(m => m.text.trim() && m.text !== now);
+    const earlierIn = earlierInbound();
     const lastThreeOut = all.filter(m => m.direction === 'outbound').slice(-3).map(m => m.text);
     // 1. Signed with someone else (the same words rules 173/356 read; they own
     //    the routing and stop-bot). No congratulations, no question, no

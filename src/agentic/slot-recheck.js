@@ -37,14 +37,16 @@ export function nearestTwo(slots, wantIso, { nowMs = Date.now(), noticeMs = NOTI
  * @param {object} deps             { fetchFreeSlots(calendarId, { timezone }) }
  * @returns {Promise<{open: true}|{open: false, alternatives: Array, message: string}|{open: null, reason: string}>}
  */
-export async function recheckSlot({ calendarId, startIso, timezone = 'America/New_York', tzLabel = 'ET', nowMs = Date.now() } = {}, deps = {}) {
+// 2026-10-09: a Rehash Call is read for the rep the booking names (`userId`),
+// and a call's alternatives may be 30 minutes out, not a visit's 4 hours.
+export async function recheckSlot({ calendarId, startIso, timezone = 'America/New_York', tzLabel = 'ET', nowMs = Date.now(), userId = null, noticeMs = NOTICE_MS } = {}, deps = {}) {
   if (!calendarId || !startIso || typeof deps.fetchFreeSlots !== 'function') return { open: null, reason: 'nothing_to_check' };
   let av;
   try {
     // Every opening up to the picked day, with no notice floor and no count
     // cap: a later or sooner slot must never read as "taken".
     const days = Math.max(14, Math.ceil((Date.parse(startIso) - nowMs) / 86_400_000) + 1);
-    av = await deps.fetchFreeSlots(calendarId, { timezone, windowDays: days, maxSlots: 1000, minNoticeHours: 0 });
+    av = await deps.fetchFreeSlots(calendarId, { timezone, windowDays: days, maxSlots: 1000, minNoticeHours: 0, ...(userId ? { userId } : {}) });
   } catch (err) {
     return { open: null, reason: `read_failed: ${err.message}` };
   }
@@ -52,7 +54,7 @@ export async function recheckSlot({ calendarId, startIso, timezone = 'America/Ne
   if (!slots) return { open: null, reason: 'no_slots_read' };
   const want = Date.parse(startIso);
   if (slots.some(s => Date.parse(s.iso) === want)) return { open: true };
-  const two = nearestTwo(slots, startIso, { nowMs }).map(s => ({ ...s, tz: s.tz || tzLabel }));
+  const two = nearestTwo(slots, startIso, { nowMs, noticeMs }).map(s => ({ ...s, tz: s.tz || tzLabel }));
   const message = two.length === 2
     ? `Sorry, that time was just taken. ${LINES.offer_slots(two, 1)}`
     : 'Sorry, that time was just taken. What other day works best for you?';

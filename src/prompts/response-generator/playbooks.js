@@ -483,7 +483,9 @@ export const POST_APPOINTMENT_CONDUCT_END = [
 ];
 
 // 2026-10-01 (Mark): a lead in F.0 (tag active-f.0) already had the in-home demo and texts the rehash rep's line (727-800-4578). The one goal is a phone call with that rep to see what we can do for them. The offer is hinted at, never named. One exception to the post-appointment ban: a phone call with the rep. Everything else in the ban stands.
-export const postDemoRehash = (repName) => {
+// 2026-10-09 (the user): with `callTimes`, this turn's plan offers or books
+// REAL Rehash Call openings (rehash-slots.js), so the reply may name them.
+export const postDemoRehash = (repName, { callTimes = false } = {}) => {
   const rep = repName || 'someone from our follow-up team';
   const subj = repName || 'we';
   const Subj = repName || 'We';
@@ -494,10 +496,12 @@ export const postDemoRehash = (repName) => {
     `THE ONE GOAL: get them on a short PHONE CALL with ${rep} to go over their proposal and see what we can do for them.`,
     `  · If they raise a concern or a question, answer it briefly and honestly, then clarify ONCE what is holding them back ("What's holding you back, just so I understand?").`,
     `  · Then bridge to the call: ${subj} may be able to do something for them, and it is easier to go over on a quick call. Ask if a quick call would help.`,
-    `  · When they say yes, ask ONE question: what is a good time today or tomorrow for ${obj} to give them a quick call. You cannot see a calendar: never offer a specific day or time yourself.`,
+    callTimes
+      ? `  · This turn the plan below holds REAL open call times from ${repName ? `${repName}'s` : 'our'} calendar. Name only those times, exactly as the plan gives them; never any other day or time.`
+      : `  · When they say yes, ask ONE question: what is a good time today or tomorrow for ${obj} to give them a quick call. You cannot see a calendar: never offer a specific day or time yourself.`,
     `  · When they give a time, confirm it in THEIR words ("${Subj} will call you [their words].") and do not ask anything else about timing. Never change the time they gave.`,
     `THE OFFER: say only that ${subj} may be able to do something for them. NEVER name a price, a discount, a percentage, an amount, a promotion, a financing figure, or "a deal", and never promise a specific offer. What is possible is decided on the call.`,
-    `EXCEPTION TO THE POST-APPOINTMENT BAN ABOVE: offering a PHONE CALL with ${rep} is allowed and is the goal. Everything else in that ban still holds: no in-home visit, no re-measure, nobody "coming out", no calendar slot, no booking link, no decision-maker question.`,
+    `EXCEPTION TO THE POST-APPOINTMENT BAN ABOVE: offering a PHONE CALL with ${rep} is allowed and is the goal${callTimes ? ', at the call times the plan below gives' : ''}. Everything else in that ban still holds: no in-home visit, no re-measure, nobody "coming out", ${callTimes ? 'no visit slot' : 'no calendar slot'}, no booking link, no decision-maker question.`,
     `No pressure. If they say no or are not interested, acknowledge it, leave the door open, and do not pitch the call again in the same message. After two no's in a row, stop asking.`,
     // 2026-10-09 (Mark): five live rehash threads got pre-demo discovery
     // questions, invented problems, slots after "follow up in November" and
