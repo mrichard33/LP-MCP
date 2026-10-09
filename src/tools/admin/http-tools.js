@@ -28,6 +28,12 @@
 //      "lp":{"headers":{"X-Api-Key":"xxxx"}}}
 //   HTTP_TOOL_ALLOWED_HOSTS  Comma-separated hostnames. If set, only these pass.
 //   HTTP_TOOL_ALLOW_PRIVATE  "true" to permit private/link-local targets.
+//   HTTP_EGRESS_MODE         off | shadow (default) | enforce — default-deny
+//                            egress, resolved-IP and redirect checks
+//                            (2026-10-07, src/security/egress-guard.js). In
+//                            enforce, HTTP_TOOL_ALLOW_PRIVATE does NOT
+//                            unblock a private address.
+//   HTTP_EGRESS_ALLOWLIST    comma hostnames; ".example.com" = suffix match.
 //
 //   A synthetic "five9" profile is injected server-side from FIVE9_USERNAME /
 //   FIVE9_PASSWORD (Basic auth + text/xml + SOAPAction, base_url the Admin
@@ -37,6 +43,8 @@
 //   which this tool never reflects back.
 
 import { z } from 'zod';
+import { httpEgressMode, checkEgress, fetchWithEgressChecks } from '../../security/egress-guard.js';
+import { recordToolAudit, actorFromExtra } from '../../security/tool-audit.js';
 
 const ALLOWED_METHODS = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD']);
 const MUTATING = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
@@ -170,7 +178,7 @@ export function registerHttpTools(server) {
         .optional()
         .describe('Required true for POST/PUT/PATCH/DELETE. Ignored for GET/HEAD.'),
     },
-    async ({ url, method, headers_json, query_json, body, content_type, auth_profile, timeout_ms, confirm }) => {
+    async ({ url, method, headers_json, query_json, body, content_type, auth_profile, timeout_ms, confirm }, extra) => {
       const m = (method || 'GET').toUpperCase();
       const timeout = Math.min(timeout_ms || DEFAULT_TIMEOUT, MAX_TIMEOUT);
 
@@ -226,6 +234,28 @@ export function registerHttpTools(server) {
         // SSRF / allowlist guard
         checkHost(finalUrl);
 
+        // Default-deny egress (2026-10-07). shadow: check + audit, then carry
+        // on exactly as before. enforce: refuse here, and follow redirects by
+        // hand below so every hop is checked too.
+        const egressMode = httpEgressMode();
+        if (egressMode !== 'off') {
+          const eg = await checkEgress(finalUrl);
+          if (!eg.ok) {
+            const who = actorFromExtra(extra);
+            const decision = egressMode === 'enforce' ? 'deny' : 'would_deny';
+            console.warn(`[EgressGuard] ${decision} ${m} ${eg.host} reasons=${eg.reasons.join(',')} (HTTP_EGRESS_MODE=${egressMode})`);
+            recordToolAudit({
+              tool: 'http_request', actor: who.actor, mode: `egress:${egressMode}`, decision,
+              reason: eg.reasons.join(','),
+              detail: { session_id: who.session_id, host: eg.host, addresses: eg.addresses, method: m, auth_profile: auth_profile || null },
+            });
+            if (egressMode === 'enforce') {
+              return fail(`Egress blocked for ${eg.host}: ${eg.reasons.join(', ')}. ` +
+                'Add the host to HTTP_EGRESS_ALLOWLIST (a public vendor host only) or use a dedicated tool.');
+            }
+          }
+        }
+
         // Headers: profile first, content_type convenience, explicit overrides win
         const hdrs = { ...(profile?.headers || {}) };
         if (content_type) hdrs['Content-Type'] = content_type;
@@ -251,8 +281,43 @@ export function registerHttpTools(server) {
         const started = Date.now();
         let res;
         try {
-          // rate-limiter-exempt: operator-driven generic HTTP tool; must stay usable while the bucket is paused.
-          res = await fetch(finalUrl, { method: m, headers: hdrs, body: payload, signal: controller.signal });
+          if (egressMode === 'enforce') {
+            // Same exemption as the plain fetch below: one operator request, by hand.
+            const r = await fetchWithEgressChecks(finalUrl, { method: m, headers: hdrs, body: payload, signal: controller.signal }, {
+              credentialHeaders: Object.keys(profile?.headers || {}),
+            });
+            if (r.denied) {
+              const who = actorFromExtra(extra);
+              recordToolAudit({
+                tool: 'http_request', actor: who.actor, mode: 'egress:enforce', decision: 'deny',
+                reason: `redirect:${r.denied.reasons.join(',')}`,
+                detail: { session_id: who.session_id, hops: r.hops.map((h) => h.split('?')[0]), blocked: r.denied.url.split('?')[0] },
+              });
+              return fail(`Egress blocked on redirect to ${r.denied.url.split('?')[0]}: ${r.denied.reasons.join(', ')}.`);
+            }
+            res = r.res;
+          } else {
+            // rate-limiter-exempt: operator-driven generic HTTP tool; must stay usable while the bucket is paused.
+            res = await fetch(finalUrl, { method: m, headers: hdrs, body: payload, signal: controller.signal });
+            // shadow: a followed redirect that lands somewhere the guard would
+            // refuse is recorded (the hop itself already happened).
+            if (egressMode === 'shadow' && res.redirected && res.url) {
+              let landed = null;
+              try { landed = new URL(res.url); } catch { /* ignore */ }
+              if (landed && landed.hostname !== finalUrl.hostname) {
+                const eg2 = await checkEgress(landed);
+                if (!eg2.ok) {
+                  const who = actorFromExtra(extra);
+                  console.warn(`[EgressGuard] would_deny redirect ${finalUrl.hostname} -> ${eg2.host} reasons=${eg2.reasons.join(',')}`);
+                  recordToolAudit({
+                    tool: 'http_request', actor: who.actor, mode: 'egress:shadow', decision: 'would_deny',
+                    reason: `redirect:${eg2.reasons.join(',')}`,
+                    detail: { session_id: who.session_id, from: finalUrl.hostname, to: eg2.host, addresses: eg2.addresses },
+                  });
+                }
+              }
+            }
+          }
         } finally {
           clearTimeout(timer);
         }

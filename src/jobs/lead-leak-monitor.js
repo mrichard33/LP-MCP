@@ -92,7 +92,11 @@ import {
 } from '../five9-admin.js';
 import { postToSlack as defaultPostToSlack, opsChannelId, officeMarketCode } from '../slack.js';
 import { explainUncalled } from '../lead-leak-explain.js';
-import { reportAlertCondition as defaultReportAlertCondition, sendAlertMessage as defaultSendAlertMessage } from '../alert-state.js';
+import {
+  reportAlertCondition as defaultReportAlertCondition,
+  sendAlertMessage as defaultSendAlertMessage,
+  observeAlertCondition as defaultObserveAlertCondition,
+} from '../alert-state.js';
 import { alertDigestEnabled, filterNew as defaultFilterNew, recordPosted as defaultRecordPosted } from '../alert-posted.js';
 import { runJob } from '../job-runner.js';
 import { hourET, todayET } from './lp-report-common.js';
@@ -951,6 +955,17 @@ export async function runLeadLeakMonitor({ env = process.env, nowMs = Date.now()
   const intakeDecision = shouldAlertIntakeGap(m.intake?.rows ?? null, { readOk: !!m.intake });
   const retiredDecision = shouldAlertRetiredCode(m.retiredFresh);
   if (digest) {
+    // 2026-10-07: the digest posts these, but the alert rows must still track
+    // the truth — otherwise 'Leads never reached LP' stayed firing from 10-02.
+    if (aMode === 'live') {
+      const observe = deps.observeAlertCondition || defaultObserveAlertCondition;
+      await observe({ key: 'lead_speed_slow', label: 'Time to first call', active: verdictToActive(speedDecision.verdict),
+        detail: { recent: speedDecision.recent, baseline: speedDecision.baseline } });
+      await observe({ key: 'lead_intake_gap', label: 'Leads never reached LP', active: verdictToActive(intakeDecision.verdict),
+        detail: `missing=${intakeDecision.count}` });
+      await observe({ key: 'lead_retired_code', label: 'Retired disposition code used', active: verdictToActive(retiredDecision.verdict),
+        detail: `fresh=${retiredDecision.count}` });
+    }
     const hardFailure = errors.some((e) => / write: /.test(e));
     console.log(`[LeadLeak] digest pass — speed=${speedDecision.verdict} never_reached_lp=${intakeDecision.count ?? '?'} retired=${retiredDecision.count ?? '?'}`);
     return {
@@ -1109,6 +1124,13 @@ export async function runLeadUncalledCheck({ env = process.env, nowMs = Date.now
   // 3-hour re-list of the same leads. ALERT_DIGEST_ENABLED=false restores the
   // edge-triggered card below.
   if (alertDigestEnabled(env)) {
+    // 2026-10-07: this path posts through its own dedupe, so keep the alert row
+    // true here too — it had sat 'firing' (waiting=30) since 10-02.
+    if (aMode === 'live') {
+      const observe = deps.observeAlertCondition || defaultObserveAlertCondition;
+      await observe({ key: 'lead_uncalled_fresh', label: 'Leads waiting with no call',
+        active: verdictToActive(decision.verdict), detail: `waiting=${decision.count}` });
+    }
     if (decision.verdict === 'insufficient_evidence') {
       console.log(`[LeadLeak] uncalled check — could not read (${m.errors.join('; ')})`);
       return { checked: false, readFailed: true, reason: m.errors.join('; ') };

@@ -18,6 +18,7 @@ import { registerPayrollTools } from './payroll/index.js';
 import { registerSimulatorTools } from './simulator-tools.js';
 import { registerAiOsTools } from './ai-os-tools.js';
 import { withSanitizedResults } from '../text-sanitize.js';
+import { withInfraGuard } from '../security/infra-guard.js';
 
 export function registerAllTools(rawServer) {
   // 2026-09-16 — every tool's text output passes through the invisible-character
@@ -27,7 +28,12 @@ export function registerAllTools(rawServer) {
   // so anyone who can text the business could otherwise smuggle instructions
   // into an agent's context. Registration is the one choke point that covers all
   // tools, including the ones added after this line.
-  const server = withSanitizedResults(rawServer);
+  //
+  // 2026-10-07 (IT/GoCloud review, CANON.SEC.003): the four infra tools
+  // (set_railway_env_var, redeploy/rollback_railway_*, http_request) run a
+  // per-call operator check first — INFRA_TOOLS_MODE open|shadow|operator,
+  // src/security/infra-guard.js. Same choke point, same reason.
+  const server = withInfraGuard(withSanitizedResults(rawServer));
   // LP data tools (16)
   registerLeadTools(server);
   registerPipelineTools(server);

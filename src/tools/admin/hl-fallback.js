@@ -20,6 +20,37 @@
 
 import { z } from 'zod';
 import { getHlSupabase, assertReadOnly, hlRunSQL, esc } from '../../admin/hl-client.js';
+import { decideReadQuery, sqlToolMode } from '../../security/sql-guard.js';
+import { recordToolAudit, sqlFingerprint, actorFromExtra } from '../../security/tool-audit.js';
+
+/**
+ * hl_query's handler (2026-10-07). assertReadOnly stays first — it is the
+ * guard this tool has always had, so nothing that was refused gets through.
+ * The tokenizer guard (src/security/sql-guard.js) then follows SQL_TOOL_MODE,
+ * like supabase_run_query: readwrite = not consulted, shadow = would_deny
+ * logged + audited, readonly = refused. It catches what the keyword grep
+ * cannot (set_config, pg_terminate_backend, SELECT run_sql('…'), dblink).
+ */
+export function makeHlQueryHandler({ run = hlRunSQL, audit = recordToolAudit, env = process.env, log = (m) => console.warn(m) } = {}) {
+  return async ({ query }, extra) => {
+    const safe = assertReadOnly(query);
+    const mode = sqlToolMode(env);
+    const d = decideReadQuery(safe, mode);
+    if (d.decision !== 'allow') {
+      const who = actorFromExtra(extra);
+      audit({
+        tool: 'hl_query', actor: who.actor, mode, decision: d.decision, reason: d.analysis.reason,
+        detail: { session_id: who.session_id, first_keyword: d.analysis.firstKeyword, ...sqlFingerprint(safe) },
+      }, env);
+      log(`[SQLGuard] ${d.decision === 'deny' ? 'blocked' : 'would_block'} hl_query reason=${d.analysis.reason} actor=${who.actor} (SQL_TOOL_MODE=${mode})`);
+    }
+    if (!d.run) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: 'read_only_tool', reason: d.analysis.reason, detail: 'hl_query runs one read-only SELECT / WITH statement; no admin functions, no SELECT … INTO.' }, null, 2) }] };
+    }
+    const result = await run(safe);
+    return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+  };
+}
 
 // Re-exported so existing importers of this module keep working unchanged.
 export { hlRunSQL, esc };
@@ -96,11 +127,7 @@ export function registerHlFallbackTools(server) {
     {
       query: z.string().describe('SQL SELECT query against HL Supabase. Example: "SELECT id, name, status FROM workflows LIMIT 20"'),
     },
-    async ({ query }) => {
-      const safe = assertReadOnly(query);
-      const result = await hlRunSQL(safe);
-      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
-    }
+    makeHlQueryHandler()
   );
 
   // hl_list_tables [READ]

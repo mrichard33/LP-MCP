@@ -263,9 +263,14 @@ async function getLpDisposition(lp_prospect_id) {
   if (!supabase || !lp_prospect_id) return null;
   const { data } = await supabase
     .from('lp_leads')
-    .select('lp_lead_id, disposition_code, synced_at')
+    .select('lp_lead_id, disposition_code, synced_at, created_at_lp')
     .eq('lp_prospect_id', String(lp_prospect_id))
-    .order('synced_at', { ascending: false })
+    // 2026-10-07: newest LEAD, not newest SYNC. The 2026-08-14 bulk resync
+    // stamped old "Data" leads with a fresh synced_at, so 22 drift alerts read
+    // a years-old inquiry while the real current lead was already CXL/NoHome.
+    // Same rule the backfill and reconciler use; lp_lead_id breaks ties.
+    .order('created_at_lp', { ascending: false, nullsFirst: false })
+    .order('lp_lead_id', { ascending: false })
     .limit(1)
     .maybeSingle();
   return data;
