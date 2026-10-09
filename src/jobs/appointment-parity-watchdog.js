@@ -797,6 +797,9 @@ export async function runAppointmentParityWatchdog({ dryRun = !PARITY_AUTOHEAL, 
           timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hour12: true,
         }),
         calendarId: appt.ghl_calendar_id || undefined,
+        // An automatic repair writes only onto a bookable lead (the user,
+        // 2026-10-09); a person's rebook of a cancelled lead is allowed.
+        requireBookable: true,
       });
       writes++;
 

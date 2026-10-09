@@ -309,3 +309,36 @@ test('(6e) title falls back to the calendar id lookup when no calendar_name is g
   // DQYMaJ22N6zL4SXjHukw maps to "Review Session" in CALENDAR_MAP.
   assert.equal(createPosts()[0].body.title, 'Review Session - Maria');
 });
+
+// ═══ 7. Confirmation Calls go to the Rehash rep (the user, 2026-10-09) ═══
+
+const CONFIRMATION_CALL = 'gFWoSQrlKIdfRbAPV842';
+const confAction = (payload = {}) => action({
+  calendar_name: 'Confirmation Call', calendar_id: CONFIRMATION_CALL, ...payload,
+});
+
+test('(7) Confirmation Call, contact has no owner → assigned to the Rehash rep (John Manieri)', async () => {
+  reset({ contact: fullContact({ assignedTo: null }) });
+  await executeBookAppointment(confAction(), {});
+  assert.equal(createPosts().length, 1);
+  assert.equal(createPosts()[0].body.calendarId, CONFIRMATION_CALL);
+  assert.equal(createPosts()[0].body.assignedUserId, 'TYcZ9DcNkuPCFYsFxRFV');
+});
+
+test('(7b) Confirmation Call → the contact owner wins over the default', async () => {
+  reset({ contact: fullContact({ assignedTo: 'ownerUser123' }) });
+  await executeBookAppointment(confAction(), {});
+  assert.equal(createPosts()[0].body.assignedUserId, 'ownerUser123');
+});
+
+test('(7c) an assignee named on the payload wins over the owner', async () => {
+  reset({ contact: fullContact({ assignedTo: 'ownerUser123' }) });
+  await executeBookAppointment(confAction({ assigned_user_id: 'explicitUser9' }), {});
+  assert.equal(createPosts()[0].body.assignedUserId, 'explicitUser9');
+});
+
+test('(7d) a Window Estimate is not touched by the Rehash rule', async () => {
+  reset({ contact: fullContact({ assignedTo: 'ownerUser123' }) });
+  await executeBookAppointment(action(), {});
+  assert.equal(createPosts()[0].body.assignedUserId, undefined);
+});

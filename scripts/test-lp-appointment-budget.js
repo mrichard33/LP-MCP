@@ -243,20 +243,47 @@ test('syncAppointmentToLP refuses an OPPFDN lead: no SetAppointment', async () =
   assert.equal(seen.setAppointment, 0, 'the incident wrote Set over OPPFDN — never again');
 });
 
-test('terminalDispositionDecision: bookable passes, terminal stops, blank is unknown (passes)', () => {
+test('terminalDispositionDecision: bookable passes, post-demo stops for everyone, blank is unknown (passes)', () => {
   for (const d of ['Data', 'SET', 'Cnf', 'ccc', ' Verif ', 'NIS']) {
     assert.equal(terminalDispositionDecision(d).allow, true, `${d} is bookable`);
+    assert.equal(terminalDispositionDecision(d, { requireBookable: true }).allow, true, `${d} is bookable for the watchdog too`);
   }
-  for (const d of ['OPPFDN', 'Sale', 'CXL', 'DNC', 'No Demo']) {
-    const r = terminalDispositionDecision(d);
-    assert.equal(r.allow, false, `${d} must be refused`);
-    assert.equal(r.reason, 'terminal_disposition');
+  // Post-demo / sold: refused whoever asks (the 2026-10-08 incident).
+  for (const d of ['OPPFDN', 'Sale', 'NoRehash']) {
+    for (const opts of [{}, { requireBookable: true }]) {
+      const r = terminalDispositionDecision(d, opts);
+      assert.equal(r.allow, false, `${d} must be refused (${JSON.stringify(opts)})`);
+      assert.equal(r.reason, 'terminal_disposition');
+    }
   }
   // A lead minted minutes ago may not carry a disposition yet; refusing it
   // would strand a real booking.
   for (const d of [null, undefined, '', '  ']) {
     assert.deepEqual(terminalDispositionDecision(d), { allow: true, reason: 'disposition_unknown' });
   }
+});
+
+test('terminalDispositionDecision: a cancelled / no-show lead may be rebooked by a person, never by the auto-repair', () => {
+  // The user, 2026-10-09 ("allow rebooks again"): a GHL or person booking on a
+  // CXL lead is a normal reschedule; only the watchdog needs an open lead.
+  for (const d of ['CXL', 'NOC', 'DNC', 'No Demo']) {
+    assert.deepEqual(terminalDispositionDecision(d), { allow: true, reason: 'rebook_closed_lead' }, `${d} rebook allowed`);
+    const auto = terminalDispositionDecision(d, { requireBookable: true });
+    assert.equal(auto.allow, false, `${d} refused for the auto-repair`);
+    assert.equal(auto.reason, 'terminal_disposition');
+  }
+});
+
+test('syncAppointmentToLP with requireBookable refuses a CXL lead: no SetAppointment', async () => {
+  const { seen, deps } = syncDeps({ disp: 'CXL' });
+  const res = await syncAppointmentToLP({
+    contactId: '5YGVd3kh5IcY6pUJVcs4',
+    appointmentDate: '2026-10-09', appointmentTime: '06:00 PM',
+    requireBookable: true,
+  }, deps);
+  assert.equal(res.action, 'skipped_terminal_disposition');
+  assert.equal(res.disposition, 'CXL');
+  assert.equal(seen.setAppointment, 0);
 });
 
 test('isGhlOnlyAppointment: only the Confirmation Call calendar', () => {

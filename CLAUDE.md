@@ -219,6 +219,14 @@ from GHL's `last_appointment_start_date/time`, which ANY calendar fills (`checkC
 for new, reused and issued-inquiry leads, set_lp_appointment and the sync with no calendar named). The lead still goes
 to LP, without the appointment. A failed GHL read fails open. The reconciler never creates a Window Estimate over an
 active GHL-only appointment at the same time. A new LP write that carries a date and time goes through the same check.
+**The call is made from GHL, by the Rehash rep (the user, 2026-10-09).** Every Confirmation Call we book (the
+booking handler and the delegated booking endpoint) is assigned to: a named assignee, else the contact's owner, else
+John Manieri (`TYcZ9DcNkuPCFYsFxRFV`, `CONFIRMATION_CALL_ASSIGNED_USER_ID`, `off` = no default;
+`src/config/rehash-assignee.js`). The rehash entry should make the rep the contact's OWNER, not only a follower.
+**Only the automatic repair needs an open lead (the user, 2026-10-09).** `terminalDispositionDecision` refuses a
+post-demo or sold lead (`isDemoDisposition`: Sale, OPPFDN, NoRehash, FDNS, SW, PM) for every caller; with
+`requireBookable` (the parity watchdog only) it also refuses any non-bookable lead. A person or GHL booking re-sets a
+CXL / no-show lead (`rebook_closed_lead`): refusing that left LP blind to a real rebooked visit.
 
 **Every imported LP lead reaches a Five9 list (2026-10-05).** LP pushes a row to LP_ASAP only at its own
 auto-import; a row a person imports later, or one auto-imported overnight, waits for LP's 6 AM load (Sunday's 4
