@@ -33,6 +33,8 @@ import { slotMentionIndex } from '../live-chat/cancel-flow.js';
 import { parseDayPreference, slotsForPreference, slotMatches, preferenceOfferLine } from './day-preference.js';
 import { enforceOneAsk } from './one-ask.js';
 import { isKnockComplaint } from './do-not-knock.js';
+import { detectDeferral, pendingDeferral, isAcknowledgment, isSignOffLine, POST_DEMO_QUESTIONS } from './post-demo-turn.js';
+import { PURCHASED_ELSEWHERE_RX } from './purchased-elsewhere.js';
 
 export { isKnockComplaint };
 
@@ -542,6 +544,9 @@ export function planNepqTurn({
   channel = 'sms', trigger = '', conversation = [], slots = [], tzLabel = '', firstName = null,
   hasAppointment = false, nextStepLabel = 'a free visit at your home', discipline = null, nowMs = Date.now(),
   allSlots = null, isCustomer = false, callbackRequested = false,
+  // 2026-10-09 (Mark): the lead already had the in-home demo (rehash, or past
+  // the appointment). rehashRep is the rep the reply is written as, if named.
+  postDemo = false, rehashRep = null,
 } = {}) {
   const turns = normalizeThread(conversation, trigger);
   const inbound = turns.filter(t => t.direction === 'inbound');
@@ -702,6 +707,65 @@ export function planNepqTurn({
     const line = LINES.callback(teamOpen ? callbackWhen('') : nextTeamOpenLabel(nowMs));
     return fixed('handoff', line, { step: 'handoff', handoff: { reason: 'callback_request', line }, booking: { allowed: false, reason: 'nepq:callback_accepted' } });
   }
+  // 1b. Post-demo (Mark, 2026-10-09). A lead who already had the full in-home
+  // visit and holds a proposal is never planned as a new lead: no discovery
+  // question, no visit, no slots. Five live threads on the rehash line got a
+  // stock first-contact question, slots offered twice to "Follow up in
+  // November please", and "Congratulations" to a lead who signed elsewhere.
+  if (postDemo) return planPostDemo();
+  function planPostDemo() {
+    const hi = firstName ? `, ${firstName}` : '';
+    const pd = (extra) => Object.assign(plan, { post_demo: true, booking: { allowed: false, reason: 'nepq:post_demo' }, call_offer_ok: true }, extra);
+    // The whole thread, not just this visit: a deferral asked for yesterday
+    // still stands today (currentSession drops turns past a 6-hour gap).
+    const all = (Array.isArray(conversation) ? conversation : [])
+      .map(m => ({ direction: String(m?.direction || '').toLowerCase() === 'outbound' ? 'outbound' : 'inbound', text: String(m?.text ?? m?.body ?? '') }))
+      .filter(m => m.text.trim());
+    // Each with its own time when the thread has one, so "by Friday" said
+    // last week is read against last week.
+    const earlierIn = (Array.isArray(conversation) ? conversation : [])
+      .filter(m => String(m?.direction || '').toLowerCase() !== 'outbound')
+      .map(m => ({ text: String(m?.text ?? m?.body ?? ''), atMs: Date.parse(m?.timestamp || m?.sent_at || m?.dateAdded || m?.created_at || '') }))
+      .filter(m => m.text.trim() && m.text !== now);
+    const lastThreeOut = all.filter(m => m.direction === 'outbound').slice(-3).map(m => m.text);
+    // 1. Signed with someone else (the same words rules 173/356 read; they own
+    //    the routing and stop-bot). No congratulations, no question, no
+    //    rescission or deadline talk (ESC_CONTRACT_CHANGE).
+    if (PURCHASED_ELSEWHERE_RX.test(now)) {
+      const line = rehashRep
+        ? `Thanks for letting me know${hi}. I'll take a look in case there's anything worth comparing side by side.`
+        : `Thanks for letting me know${hi}. I'll pass this to our team, in case there's anything worth comparing side by side.`;
+      return pd({ step: 'competitor_signed', required_move: 'handoff', fixed_line: line, call_offer_ok: false });
+    }
+    // 2. A dated follow-up in this message: confirm the date and stop.
+    const deferral = detectDeferral(now, nowMs);
+    if (deferral) {
+      return pd({
+        step: 'defer', required_move: 'close', fixed_line: `That works${hi}. I'll check back ${deferral.label}.`,
+        deferral: { untilIso: deferral.untilIso, label: deferral.label }, call_offer_ok: false,
+        // The model's version must still name the date they gave.
+        reference_markers: [{ rx: new RegExp(deferral.marker, 'i'), say: `confirm the follow-up as ${deferral.label}` }],
+      });
+    }
+    // 3. A deferral asked for earlier and not yet due: no times unless they ask
+    //    to schedule now (Melissa: the second "November" still got two slots).
+    const pending = pendingDeferral(earlierIn, nowMs);
+    if (pending && !(SCHEDULE_ASK_RX.test(now) || TIME_REQUEST_RX.test(now))) {
+      plan.pending_deferral = { untilIso: pending.untilIso, label: pending.label };
+      plan.slots_to_offer = [];
+    }
+    // 4. A thank-you: thanks back, and at most one question about the
+    //    proposal (none if one went out in our last three, or they asked us to wait).
+    if (isAcknowledgment(now)) {
+      const askedRecently = lastThreeOut.some(t => POST_DEMO_QUESTIONS.some(q => norm(t).includes(norm(q))));
+      const question = (askedRecently || plan.pending_deferral) ? null : pickFresh([...POST_DEMO_QUESTIONS], plan.recent_outbound, plan.variant_seed);
+      return pd({ step: 'post_demo_ack', required_move: 'answer', post_demo_question: question, ack_line: `Of course${hi}.` });
+    }
+    // 5. Anything else: answer it. The rehash goal (a call with the rep) and its
+    //    rehash_call companion are unchanged.
+    return pd({ step: 'post_demo', required_move: 'answer' });
+  }
+
   if (objType === 'price' && priceLines >= 2) return handoff('price_insist');
   if (nos >= 2) return handoff('two_nos');
   if ((objType === 'shopping') && attempt >= 2) return handoff('repeat_objection');
@@ -1099,6 +1163,8 @@ export function referenceRules(line, slots = [], plan = null) {
     promisesTeam: TEAM_RX.test(ref),
     times: clockMinutes(ref),
     markers,
+    // A post-demo follow-up date (2026-10-09): the day or month is the point.
+    dated: !!plan?.deferral,
   };
 }
 
@@ -1106,6 +1172,7 @@ export function referenceRules(line, slots = [], plan = null) {
 export function referenceRulesText(rules) {
   const out = [];
   if (rules.slots.length) out.push(`name these times exactly as written: ${rules.slots.join(' or ')} (no other times)`);
+  else if (rules.dated) out.push('name no clock time');
   else if (!rules.times.length) out.push('name no day or clock time');
   if (rules.promisesTeam) out.push('say someone from our team will reach out');
   for (const m of rules.markers || []) out.push(m.say);
@@ -1382,10 +1449,31 @@ export function enforceNepqPlan(draft, plan, { allowFigures = false, known = {} 
   };
   // 2. No money, no pressure, no call the lead did not ask for (dropUnsafeSentences).
   // A hand-off or callback line is our own promise of a call and stays.
-  const keepCallOffer = !!plan.lead_wants_call || !!plan.handoff || !!(referenceMove && CALL_OFFER_SENTENCE_RX.test(refLine || ''));
+  // A post-demo lead's next step IS a call with the rep (rehash), so the call
+  // offer stays (2026-10-09).
+  const keepCallOffer = !!plan.lead_wants_call || !!plan.handoff || !!plan.call_offer_ok || !!(referenceMove && CALL_OFFER_SENTENCE_RX.test(refLine || ''));
   const unsafe = dropUnsafeSentences(sentences, { allowFigures, keepCallOffer });
   sentences = unsafe.sentences;
   changes.push(...unsafe.changes);
+  // 2a. Post-demo (Mark, 2026-10-09): they already had the visit and hold a
+  // proposal. No pre-demo discovery question, even one the model copied from
+  // the thread; nothing after a goodbye; and a follow-up date or a "we signed
+  // elsewhere" gets no question and no time at all.
+  if (plan.post_demo) {
+    const stock = Object.values(DISCOVERY_QUESTIONS).flat().map(norm);
+    drop(s => { const n = norm(s); return stock.some(q => n === q || (n.split(' ').length >= 4 && (n.includes(q) || q.includes(n)))); }, 'discovery_question_dropped');
+    const signOffAt = sentences.findIndex(isSignOffLine);
+    if (signOffAt >= 0 && sentences.slice(signOffAt + 1).some(x => x.includes('?'))) {
+      sentences = sentences.filter((x, i) => i <= signOffAt || !x.includes('?'));
+      changes.push('question_after_sign_off');
+    }
+    if (plan.step === 'competitor_signed') drop(s => /\bcongrat/i.test(s), 'no_congratulations');
+    if (plan.step === 'defer' || plan.step === 'competitor_signed') {
+      drop(s => s.includes('?') || SLOT_OFFER_RX.test(s) || clockMinutes(s).length > 0, 'post_demo_no_question');
+    } else if (plan.step === 'post_demo_ack' && !plan.post_demo_question) {
+      drop(s => s.includes('?'), 'post_demo_no_question');
+    }
+  }
   // 2b. "Do you offer financing?" keeps its yes when the figure strip took the
   // answer sentence (2026-10-02 simulation: "Yes, we offer 0% APR financing"
   // went, and only "What's got you looking into windows now?" was left).
@@ -1436,6 +1524,8 @@ export function enforceNepqPlan(draft, plan, { allowFigures = false, known = {} 
     if (questions.length > 1) changes.push('one_question');
   }
   body = sentences.join(' ').trim();
+  // A post-demo thank-you that lost everything to the drops: thanks back.
+  if (!body && plan.post_demo && plan.ack_line) { body = plan.ack_line; changes.push('ack_line'); }
 
   // 5a. Holding a time: their question answered, then the same ask again.
   if (plan.reask_line && !body.includes(plan.reask_line)) {
@@ -1502,7 +1592,11 @@ export function enforceNepqPlan(draft, plan, { allowFigures = false, known = {} 
   // Not when the body already gives the lead something to act on: a link, a
   // booking confirmation, or a turn where a booking ask is allowed.
   const actionable = /\{\{|\bhttps?:\/\/|\ball set\b/i.test(body) || plan.booking?.allowed === true;
-  if ((plan.required_move === 'probe' || plan.required_move === 'consequence') && !body.includes('?') && !actionable) {
+  // Never on a post-demo plan, a deferral, a close or after a goodbye
+  // (2026-10-09: "Enjoy your week. Is it more how they look, or how they work?").
+  const endsOnSignOff = isSignOffLine(splitSentences(body).slice(-1)[0] || '');
+  const noDiscovery = plan.post_demo || ['defer', 'close', 'competitor_signed', 'post_demo_ack'].includes(plan.step) || endsOnSignOff;
+  if ((plan.required_move === 'probe' || plan.required_move === 'consequence') && !body.includes('?') && !actionable && !noDiscovery) {
     // A discovery turn collects no details: "Let me get your zip code so I can
     // confirm…" next to the question was two asks, and a zip asked twice
     // (2026-10-03 replay). The statement goes; the discovery question stays.

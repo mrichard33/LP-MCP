@@ -297,6 +297,8 @@ import { bumpContactCache } from './context-builder.js';
 // notifications handlers, so all four GroupMe surfaces share one format.
 import { resolveContactInfo, resolveLPProspectId } from './actions/resolvers.js';
 import { notifyRehashCall } from './notifications/rehash-call.js';
+import { filePostDemoFollowUp } from './services/post-demo-followup-io.js';
+import { trackBackground } from './graceful-shutdown.js';
 import { buildNotificationEnrichment, buildRichNotification, resolveMarket } from './actions/enrichment.js';
 // 2026-07-03 rebuild (Steve Nkzhm incident) — channel/identity inheritance,
 // AI-disclosure hard guard, per-contact supersession check.
@@ -4362,6 +4364,16 @@ export async function executeSendMessage(action, context) {
       } catch (rcErr) {
         console.warn(`[SendMessage] rehash call card failed for ${contactId} (fail-soft): ${rcErr.message}`);
       }
+    }
+
+    // 2026-10-09 (Mark): a post-demo lead's follow-up date the bot just
+    // confirmed is filed for the rehash rep (task, tag, note), once per date.
+    // Fire-and-forget: the send already happened.
+    if (generated?.post_demo_deferral) {
+      const firstWord = String(generated?.lead_first_name || '').trim().split(/\s+/)[0] || null;
+      trackBackground(filePostDemoFollowUp({
+        contactId, deferral: generated.post_demo_deferral, firstName: firstWord, triggerMessage: replyTriggerMessage,
+      }).catch(err => console.warn(`[SendMessage] post-demo follow-up filing failed for ${contactId}: ${err.message}`)));
     }
 
     // GroupMe notification (v3.6: rich format). If any resolver fails,

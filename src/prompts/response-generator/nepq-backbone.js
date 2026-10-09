@@ -37,7 +37,13 @@ const MOVE_TEXT = {
   // next step" (the planner reads that back) or the reference ships.
   bridge: (p) => `This turn's move: the bridge. A reference: "${p.bridge_line || `Based on what you told me, this could work for you${p.echo?.phrase ? `, since you mentioned ${p.echo.phrase}` : ''}. The next step would be ${p.next_step_label}. Would that help?`}" Write your own version for THIS lead, tied to what they told you. It must say "the next step" is ${p.next_step_label}, and end asking if that would help. Never copy the reference word for word. Nothing else.`,
   // 2026-10-02 (Mark): short, and no times on the first price ask.
-  answer: (p) => (p.price_note
+  // 2026-10-09 (Mark): a post-demo lead holds a proposal; never the pre-demo
+  // discovery set, never a visit or a time (post-demo-turn.js).
+  answer: (p) => (p.post_demo
+    ? (p.step === 'post_demo_ack'
+      ? `This turn's move: they thanked you. Thank them back in a few words${p.post_demo_question ? `, then you may end with this one question about their proposal: "${p.post_demo_question}"` : '. Ask no question.'} Never ask what bothers them about their windows or doors or what they would change: they already had the visit.`
+      : `This turn's move: answer what they said plainly, in one or two sentences. They already had the in-home visit and have a proposal: ask about the proposal or nothing, never a discovery question about their windows or doors, never a visit, a measure or a time.${p.pending_deferral ? ` They asked us to follow up ${p.pending_deferral.label}: do not push for anything sooner.` : ''}`)
+    : p.price_note
     ? 'This turn\'s move: answer their other questions in one short sentence each. On price, one short sentence: every home is different, so a number now would just be a guess (never a number or range). Then ONE question: what\'s got them looking into this now. No times, no visit pitch, nothing else.'
     : p.criteria_reply
     ? `This turn's move: they told you what they will decide on. Speak to what they named in one or two sentences, using only the KB PACK (for price: exact pricing comes from the visit; never a number). Then: "The next step would be ${p.next_step_label}. Would that help?"`
@@ -84,6 +90,7 @@ export function renderPlanBlock(plan) {
   lines.push(...NEPQ_ALWAYS);
   // 2026-10-03 (Mark): the visit is the next step; a phone call only when the
   // lead asks for one. The guard (dropUnaskedCallOffer) backs this up.
-  if (!plan.lead_wants_call && !plan.handoff) lines.push(NEPQ_NO_CALL_OFFER);
+  // A post-demo lead's next step is a call with the rep, not a visit (2026-10-09).
+  if (!plan.lead_wants_call && !plan.handoff && !plan.post_demo) lines.push(NEPQ_NO_CALL_OFFER);
   return lines;
 }
