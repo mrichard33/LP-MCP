@@ -38,8 +38,11 @@ export const LABELS = Object.freeze([
 ]);
 export const CANDIDATE_LABELS = Object.freeze(['has_ghl_contact', 'no_ghl_contact']);
 
+// 2026-10-07: stop-bot left this list. It turns the BOT off; it is not a
+// DNC (the user's ruling), so a caller who carries it is still captured and
+// dialed like anyone else.
 export const DNC_TAGS = Object.freeze([
-  'dnc', 'dnc-sms', 'stage:dnc', 'stop-bot',
+  'dnc', 'dnc-sms', 'stage:dnc',
   'dnc-related', 'do-not-contact', 'unsubscribed', 'lp-dnc',
 ]);
 // src/actions/service-card.js SOLD_TAGS — the tags that mean "already bought".

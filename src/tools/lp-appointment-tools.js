@@ -63,7 +63,9 @@ export function registerLPAppointmentTools(server) {
     'RETURN CONTRACT (the `action` field): "lp_appointment_set" = set now; "already_in_lp"/"already_set_in_lp"/' +
     '"duplicate_sync_suppressed" = LP already had it, no-op; "lp_lead_creation_enrolled" = ASYNC — lead+appt are ' +
     'being created in the workflow, NOT yet confirmed (verify with check_lp_inbound after ~60s); ' +
-    '"skipped_no_valid_lead_id"/"duplicate_failure_suppressed" = could not resolve and fell to the manual-action card. ' +
+    '"skipped_no_valid_lead_id"/"duplicate_failure_suppressed" = could not resolve and fell to the manual-action card; ' +
+    '"skipped_ghl_only_calendar" = a Confirmation Call, never an LP appointment; "skipped_terminal_disposition" = the ' +
+    'LP lead is in a non-bookable disposition (e.g. OPPFDN, Sale) and a person must decide. ' +
     'appt_date/appt_time are required when a lead already exists (SetAppointment needs them); for the no-lead enroll ' +
     'path the workflow reads date/time off the contact, but pass them when known for the best result.',
     {
@@ -71,6 +73,7 @@ export function registerLPAppointmentTools(server) {
       appt_date: z.string().optional().describe('Appointment date. Accepts MM/DD/YYYY, YYYY-MM-DD, ISO, or "Month D, YYYY". Required if an LP lead already exists.'),
       appt_time: z.string().optional().describe('Appointment time. Accepts 24h "HH:MM" or 12h "H:MM AM/PM". Required if an LP lead already exists.'),
       calendar_name: z.string().optional().describe('Calendar name for the notification (e.g. "Window Estimate", "MV", "HPA").'),
+      calendar_id: z.string().optional().describe('GHL calendar id of the appointment. A GHL-only calendar (Confirmation Call) is refused: it is never an LP appointment.'),
       confirm: z.boolean().optional().describe('Must be true to execute. Omit or false for a dry-run preview (no write).'),
     },
     async (params) => {
@@ -80,6 +83,7 @@ export function registerLPAppointmentTools(server) {
         return ok({
           dry_run: true,
           would_execute: 'set_lp_appointment',
+          calendar_id: params.calendar_id || null,
           ghl_contact_id: params.ghl_contact_id,
           appt_date: params.appt_date || '(will read from contact / required if lead exists)',
           appt_time: params.appt_time || '(will read from contact / required if lead exists)',
@@ -95,6 +99,7 @@ export function registerLPAppointmentTools(server) {
           appointmentDate: params.appt_date,
           appointmentTime: params.appt_time,
           calendarName: params.calendar_name,
+          calendarId: params.calendar_id,
         });
         return ok(result);
       } catch (e) {

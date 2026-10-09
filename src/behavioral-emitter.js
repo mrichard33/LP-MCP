@@ -1003,6 +1003,14 @@ async function handleReply(req, res) {
     console.warn(`[OwnershipStamp] unexpected stamp error for ${contactId} (fail-soft): ${err.message}`);
   }
 
+  // 2026-10-08 (the user): the lead texting is a live conversation, so the GHL
+  // drips pause (pause-workflow) until 24 quiet hours pass. Before the trivial
+  // filter on purpose: "ok" mid-thread is still a conversation. Not awaited and
+  // never throws; src/pause-workflow-sweep.js releases it.
+  import('./pause-workflow-sweep.js')
+    .then(({ pauseForConversation }) => pauseForConversation({ contactId, tags: stampedContact?.tags || null, why: 'inbound' }))
+    .catch((err) => console.warn(`[ConversationPause] inbound hook failed for ${contactId} (fail-soft): ${err.message}`));
+
   // v2.11: Trivial filter has an agentic-ownership escape hatch.
   // For contacts where the agentic system owns the conversation surface
   // (signaled by EITHER `pause-bot` (legacy) OR `agentic-active`

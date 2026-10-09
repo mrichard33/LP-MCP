@@ -17,6 +17,8 @@
 
 import { checkReply, INVARIANTS_VERSION } from '../eval/reply-invariants.js';
 import { stripPitch } from '../live-chat/chat-rules.js';
+import { checkBookingTruth } from '../agentic/booking-claim.js';
+import { enforceCancelledVisit } from '../agentic/cancelled-visit.js';
 
 /** The NEPQ moves on which code holds or confirms a picked time. */
 const HOLD_MOVES = new Set(['confirm', 'hold', 'collect']);
@@ -70,6 +72,20 @@ export const SCENARIO_EXPECTATIONS = Object.freeze({
     const n = replies(r.transcript?.[0]).length;
     return n === 1 ? [] : [{ code: 'burst_not_one_reply', detail: `${n} replies to two quick messages`, turn: 1 }];
   },
+  // 2026-10-07 (Nicholas Ferraioli; CLAUDE.md "No confirmed time without a
+  // booking"): a "can't run" note means no time is confirmed, the cancelled
+  // visit is never "your visit", a callback is filed and the bot is turned off.
+  cancelled_cant_run_reschedule: (r) => {
+    const out = [];
+    const cancelled = { appointment: { status: 'cancelled', lp_disposition: 'CXL' } };
+    for (const x of allReplies(r)) {
+      if (!checkBookingTruth(x.text).allowed) out.push({ code: 'time_confirmed_without_booking', detail: x.text, turn: x.turn });
+      if (enforceCancelledVisit(x.text, { facts: cancelled }).changed) out.push({ code: 'cancelled_visit_as_upcoming', detail: x.text, turn: x.turn });
+    }
+    if (!did(r, /callback|lp_note_dq|hand_off/)) out.push({ code: 'no_callback_filed', detail: 'no Five9 callback or hand-off recorded' });
+    if (!did(r, /would_stop_bot_lp_note_dq/)) out.push({ code: 'bot_not_stopped', detail: 'no LP-note DQ stop recorded' });
+    return out;
+  },
   // Never ask again for a detail the visitor just gave (enforceNepqPlan reask_known).
   details: (r) => {
     const out = [];
@@ -96,9 +112,14 @@ export function scoreResult(result) {
   for (const t of result.transcript || []) {
     const inbound = String(t.customer || '');
     const texts = replies(t);
-    if (!texts.length) failures.push({ code: 'no_reply', detail: t.error || t.outcome || 'no reply', turn: t.turn });
+    // A turn after the LP-note DQ hand-off is silent on purpose: the bot is
+    // off (stop-bot) and a person owns the lead (2026-10-07).
+    if (!texts.length && t.intent !== 'LP_NOTE_DQ') failures.push({ code: 'no_reply', detail: t.error || t.outcome || 'no reply', turn: t.turn });
     // Whether THIS turn booked: a recorded booking in the turn's effects.
-    const booked = wouldDo(result).some(w => w.turn === t.turn && /would_book/.test(String(w.kind || '')));
+    // A move of the same appointment (the cancel flow's reschedule) counts:
+    // "You're now set for …" is backed by it (2026-10-07 gate run, after
+    // booking-claim.js learned to read "now set for").
+    const booked = wouldDo(result).some(w => w.turn === t.turn && /would_book|would_move_same_appointment/.test(String(w.kind || '')));
     // Whether code HELD a picked time this turn: "I'm holding Tue at 6 PM" is
     // said only on a hold/confirm move (heldSlot), never a fake booking (the
     // first gate run, 2026-10-06, failed three of them).

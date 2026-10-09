@@ -40,7 +40,7 @@ import { alertDigestEnabled } from '../alert-posted.js';
 import { PIPELINE_IDS, GHL_LOCATION_ID } from '../actions/constants.js';
 import {
   evaluateTagRules, needsLpVerdict, needsOpenP3, tagsToRemove,
-  summarizeDecisions, shouldPostSummary, formatSweepSummary, CUSTOMER_TAGS,
+  summarizeDecisions, shouldPostSummary, formatSweepSummary, CUSTOMER_TAGS, DRIP_TAG_RE,
 } from '../tag-hygiene/rules.js';
 
 export const JOB_ID = 'tag-hygiene-sweep';
@@ -56,6 +56,62 @@ export function sweepEnabled(env = process.env) {
 /** 'apply' only when explicitly asked for; anything else is 'report'. Pure. */
 export function resolveMode(raw) {
   return String(raw || '').trim().toLowerCase() === 'apply' ? 'apply' : 'report';
+}
+
+/**
+ * Rules that write even while the sweep is in report mode (2026-10-08). R1–R6
+ * still wait on Mark's ruling, but R7 (retired drip tags) is deterministic and
+ * the user asked for stale tags to clear on their own. TAG_SWEEP_APPLY_RULES is
+ * a comma list; 'none' turns it off. Pure.
+ */
+export function applyRulesFromEnv(env = process.env) {
+  const raw = env.TAG_SWEEP_APPLY_RULES;
+  if (raw === undefined || raw === null || raw === '') return new Set(['R7']);
+  const list = String(raw).split(',').map((r) => r.trim().toUpperCase()).filter((r) => r && r !== 'NONE');
+  return new Set(list);
+}
+
+/** Below this many live drip tags the workflow read is treated as broken (R7 off). */
+export const MIN_LIVE_DRIP_TAGS = 20;
+
+/**
+ * Drip tags contacts carry that no PUBLISHED, non-deleted GHL workflow adds.
+ * Read from the HL mirror: `workflow_actions` (add_contact_tag targets are a
+ * comma-joined list) and `contacts.tags`. Only GHL workflows add active-<code>
+ * tags: our code only removes them, and the n8n ports of the drips are
+ * inactive (checked 2026-10-08). Exported for the test.
+ */
+export function buildRetiredDripTagsSql() {
+  return `WITH live AS (
+      SELECT DISTINCT lower(trim(t)) AS tag
+        FROM workflow_actions a
+        JOIN workflows w ON w.ghl_workflow_id = a.workflow_id
+       CROSS JOIN LATERAL unnest(string_to_array(a.action_target, ',')) t
+       WHERE a.action_type = 'add_contact_tag'
+         AND w.status = 'published' AND w.deleted_at IS NULL
+         AND lower(trim(t)) LIKE 'active-%'
+    ), held AS (
+      SELECT DISTINCT lower(t) AS tag
+        FROM contacts c CROSS JOIN LATERAL unnest(c.tags) t
+       WHERE c.deleted_at IS NULL AND lower(t) LIKE 'active-%' AND lower(t) NOT LIKE 'active-entry:%'
+    )
+    SELECT (SELECT count(*) FROM live) AS live_count,
+           (SELECT json_agg(tag) FROM held WHERE tag NOT IN (SELECT tag FROM live)) AS retired`;
+}
+
+/** Set of retired drip tags, or null when the read failed or looks incomplete (R7 then skips). */
+export async function loadRetiredDripTags(deps) {
+  try {
+    const rows = await deps.hlRunSQL(buildRetiredDripTagsSql());
+    const row = Array.isArray(rows) ? rows[0] : null;
+    if (!row || Number(row.live_count) < MIN_LIVE_DRIP_TAGS) return null;
+    let retired = row.retired;
+    if (typeof retired === 'string') retired = JSON.parse(retired);
+    return new Set((retired || []).map((t) => String(t).toLowerCase()).filter((t) => DRIP_TAG_RE.test(t)));
+  } catch (err) {
+    console.warn(`[TagHygiene] retired drip tag read failed (R7 skipped): ${err.message}`);
+    return null;
+  }
 }
 
 function num(value, fallback, { min = 0, max = Infinity } = {}) {
@@ -74,7 +130,7 @@ function sqlArray(values, esc) {
  * first so a limit never crowds them out behind report-only R6 rows.
  * Exported for the test.
  */
-export function buildCandidateSql(limit, esc = (s) => String(s).replace(/'/g, "''")) {
+export function buildCandidateSql(limit, esc = (s) => String(s).replace(/'/g, "''"), retiredDripTags = []) {
   const count = (like) => `(SELECT count(*) FROM unnest(c.tags) t WHERE t LIKE '${like}')`;
   const any = (likes) => `EXISTS (SELECT 1 FROM unnest(c.tags) t WHERE ${likes.map((l) => `t LIKE '${l}'`).join(' OR ')})`;
   const fixable = [
@@ -83,6 +139,10 @@ export function buildCandidateSql(limit, esc = (s) => String(s).replace(/'/g, "'
     `c.tags @> ARRAY['hard-disqualified','lp-route:deferred-standard']::text[]`,
     `(c.tags && ${sqlArray(CUSTOMER_TAGS, esc)} AND ${any(['p3:%', 'loss-reason:%'])})`,
   ];
+  const retired = [...(retiredDripTags || [])];
+  if (retired.length) {
+    fixable.push(`EXISTS (SELECT 1 FROM unnest(c.tags) t WHERE lower(t) = ANY(${sqlArray(retired, esc)}))`);
+  }
   const conflicts = [
     `${count('p3:%')} > 1`,
     `${count('loss-reason:%')} > 1`,
@@ -156,10 +216,18 @@ export async function runTagHygieneSweep(opts = {}, injected = null) {
     const maxWrites = num(opts.maxWrites ?? env.TAG_SWEEP_MAX_WRITES, DEFAULT_MAX_WRITES, { min: 0 });
     const now = deps.now ? deps.now() : new Date();
     const runId = opts.runId || `sweep:${now.toISOString()}`;
+    // dryRun writes nothing, whatever the mode or the apply list (a report a
+    // person asked for must never act).
+    const dryRun = opts.dryRun === true;
+    const applyRules = applyRulesFromEnv(env);
+    const writes_ = (d) => !dryRun && d.action === 'remove' && (mode === 'apply' || applyRules.has(d.rule));
+    const retiredDripTags = deps.loadRetiredDripTags
+      ? await deps.loadRetiredDripTags()
+      : await loadRetiredDripTags(deps);
 
     let candidates;
     try {
-      const rows = await deps.hlRunSQL(buildCandidateSql(limit, deps.esc));
+      const rows = await deps.hlRunSQL(buildCandidateSql(limit, deps.esc, retiredDripTags || []));
       candidates = [...new Set((rows || []).map((r) => r.ghl_contact_id).filter(Boolean))];
     } catch (err) {
       console.error(`[TagHygiene] candidate query failed: ${err.message}`);
@@ -187,10 +255,11 @@ export async function runTagHygieneSweep(opts = {}, injected = null) {
       const tags = Array.isArray(contact.tags) ? contact.tags : [];
       const lp = needsLpVerdict(tags) ? await deps.lpVerdict(contactId).catch((e) => ({ error: e.message })) : null;
       const openP3Opps = needsOpenP3(tags) ? await readOpenP3(contactId, deps.ghlFetch) : null;
-      const decisions = evaluateTagRules({ tags, lp, openP3Opps });
-      const remove = tagsToRemove(decisions);
+      const decisions = evaluateTagRules({ tags, lp, openP3Opps, retiredDripTags });
+      const toWrite = decisions.filter(writes_);
+      const remove = tagsToRemove(toWrite);
 
-      if (mode === 'apply' && remove.length) {
+      if (remove.length) {
         let failure = null;
         if (writes >= maxWrites) {
           writeCapHit = true;
@@ -206,16 +275,16 @@ export async function runTagHygieneSweep(opts = {}, injected = null) {
           }
         }
         if (failure) {
-          for (const d of decisions) {
-            if (d.action === 'remove') Object.assign(d, { action: 'skipped', reason: failure });
-          }
+          for (const d of toWrite) Object.assign(d, { action: 'skipped', reason: failure });
         }
       }
+      const wrote = new Set(toWrite.filter((d) => d.action === 'remove'));
 
       all.push(...decisions);
       if (decisions.length) {
         await deps.logHygiene(decisions.map((d) => ({
-          run_id: runId, run_type: 'sweep', mode, contact_id: contactId,
+          run_id: runId, run_type: 'sweep', mode: wrote.has(d) ? 'apply' : (mode === 'apply' && !dryRun ? 'apply' : 'report'),
+          contact_id: contactId,
           rule: d.rule, action: LOG_ACTION[d.action], tags: d.tags,
           detail: d.reason ? { reason: d.reason } : null,
         })));
@@ -231,7 +300,7 @@ export async function runTagHygieneSweep(opts = {}, injected = null) {
       catch (err) { slack = { ok: false, error: err.message }; }
     }
 
-    const summary = `${mode}: ${counts.fixed} fixed, ${counts.needs_review} need review, ${counts.skipped} skipped `
+    const summary = `${mode}${dryRun ? ' (dry run)' : ''}: ${counts.fixed} fixed, ${counts.needs_review} need review, ${counts.skipped} skipped `
       + `across ${candidates.length} candidates${writeCapHit ? ` (write cap ${maxWrites} hit)` : ''}`;
     console.log(`[TagHygiene] ${summary}`);
     return {
@@ -239,6 +308,9 @@ export async function runTagHygieneSweep(opts = {}, injected = null) {
       summary,
       run_id: runId,
       mode,
+      dry_run: dryRun,
+      applied_rules: mode === 'apply' ? 'all' : [...applyRules],
+      retired_drip_tags: retiredDripTags ? [...retiredDripTags].sort() : null,
       candidates: candidates.length,
       unreadable,
       fixed: counts.fixed,
@@ -267,13 +339,14 @@ export function registerTagHygieneRoutes(app, authenticate) {
       const out = await runJob(JOB_ID, () => runTagHygieneSweep({
         mode: rawMode ?? 'report',
         limit: b.limit ?? req.query.limit,
+        dryRun: b.dryRun === true || req.query.dryRun === 'true',
       }));
       res.json({ status: out.status, summary: out.summary, ...(out.value || {}), error: out.error || undefined });
     } catch (err) {
       res.status(500).json({ ok: false, error: err.message });
     }
   });
-  console.log(`[TagHygiene] Route: POST /admin/tag-hygiene/run?mode=report|apply&limit=N${guards.length ? ' (authenticated)' : ' (UNAUTHENTICATED)'}`);
+  console.log(`[TagHygiene] Route: POST /admin/tag-hygiene/run?mode=report|apply&limit=N&dryRun=true${guards.length ? ' (authenticated)' : ' (UNAUTHENTICATED)'}`);
 }
 
 // ── Scheduler — daily at 03:00 ET ───────────────────────────────────────────

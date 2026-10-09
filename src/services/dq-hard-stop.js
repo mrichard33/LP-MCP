@@ -37,6 +37,17 @@
  */
 
 import { sendGateMode } from './may-message.js';
+import { lpNoteDqMode } from '../agentic/lp-note-dq.js';
+import { botOffTag } from '../consent/stop-bot-origin.js';
+
+// 2026-10-07 (Nicholas Ferraioli): a team note in LP that says we cannot run
+// the lead (lp-note-dq.js) stops the bot the same way. It carries no trigger
+// tag, and it is behind its own switch, LP_NOTE_DQ_MODE, not SEND_GATE_MODE:
+// the user's ruling that day is that stop-bot turns the bot off.
+export const LP_NOTE_DQ_TRIGGER = 'lp_note_dq';
+function liveFor(trigger, env) {
+  return trigger === LP_NOTE_DQ_TRIGGER ? lpNoteDqMode(env) === 'live' : sendGateMode(env) === 'live';
+}
 
 export const DQ_HARD_STOP_ACTION = 'dq_hard_stop';
 export const DQ_HARD_STOP_RULE = 'DQ_HARD_STOP';
@@ -72,10 +83,13 @@ export function workflowCodesToLeave(tags) {
 }
 
 /** Pure plan over the contact's current tags. */
-export function planDqHardStop(tags) {
+export function planDqHardStop(tags, { trigger = null } = {}) {
   const t = (Array.isArray(tags) ? tags : []).map(x => String(x || '').trim().toLowerCase());
+  // 2026-10-08: with its reason tag, so a later DNC lift keeps stop-bot
+  // (src/consent/stop-bot-origin.js).
+  const reason = botOffTag(trigger === LP_NOTE_DQ_TRIGGER ? 'lp-note' : 'dq');
   return {
-    addTags: t.includes('stop-bot') ? [] : ['stop-bot'],
+    addTags: [...(t.includes('stop-bot') ? [] : ['stop-bot']), ...(t.includes(reason) ? [] : [reason])],
     removeTags: t.includes('agentic-active') ? ['agentic-active'] : [],
     leaveWorkflows: workflowCodesToLeave(t),
   };
@@ -85,10 +99,11 @@ export function planDqHardStop(tags) {
  * Called after an add_tag of a trigger tag completed. Never throws.
  * @returns {Promise<{scheduled: boolean, reason: string, action_id?: number}>}
  */
-export async function scheduleDqHardStop({ contactId, tag, sourceActionId = null, rule = null }, deps = {}) {
-  if (!contactId || !isDqTriggerTag(tag)) return { scheduled: false, reason: 'not_a_trigger' };
-  const mode = sendGateMode(deps.env || process.env);
+export async function scheduleDqHardStop({ contactId, tag = null, trigger = null, sourceActionId = null, rule = null }, deps = {}) {
+  if (!contactId || (trigger !== LP_NOTE_DQ_TRIGGER && !isDqTriggerTag(tag))) return { scheduled: false, reason: 'not_a_trigger' };
+  const mode = liveFor(trigger, deps.env || process.env) ? 'live' : 'shadow';
   const log = deps.log || console.log;
+  if (trigger === LP_NOTE_DQ_TRIGGER) tag = tag || LP_NOTE_DQ_TRIGGER;
   try {
     if (mode !== 'live') {
       log(`[DqHardStop] shadow: ${contactId} got ${tag} (${rule || 'rule?'}) — live would add stop-bot and leave the workflows`);
@@ -126,7 +141,7 @@ export async function scheduleDqHardStop({ contactId, tag, sourceActionId = null
       target_system: 'ghl',
       target_entity: 'contact',
       target_id: contactId,
-      action_payload: { claim_key: claimKeyFor(contactId), trigger_tag: tag, source_rule: rule, source_action_id: sourceActionId, not_before_seconds: DELAY_SECONDS },
+      action_payload: { claim_key: claimKeyFor(contactId), trigger_tag: tag, ...(trigger ? { trigger } : {}), source_rule: rule, source_action_id: sourceActionId, not_before_seconds: DELAY_SECONDS },
       reasoning: `Hard DQ stop: ${tag} landed (${rule || 'unknown rule'}) — add stop-bot, remove agentic-active, leave S5.x / S4.5 / W-series workflows`,
       rule_applied: DQ_HARD_STOP_RULE,
       status: 'pending',
@@ -149,12 +164,13 @@ export async function scheduleDqHardStop({ contactId, tag, sourceActionId = null
 export async function executeDqHardStop(action, context = {}, deps = {}) {
   const contactId = action.target_id;
   if (!contactId) throw new Error('dq_hard_stop: missing target_id');
-  if (sendGateMode(deps.env || process.env) !== 'live') {
-    return { skipped: true, action: 'dq_hard_stop_skipped', reason: 'send_gate_not_live', contact_id: contactId };
+  const trigger = action.action_payload?.trigger || null;
+  if (!liveFor(trigger, deps.env || process.env)) {
+    return { skipped: true, action: 'dq_hard_stop_skipped', reason: trigger === LP_NOTE_DQ_TRIGGER ? 'lp_note_dq_not_live' : 'send_gate_not_live', contact_id: contactId };
   }
   const res = await deps.ghlFetch('GET', `/contacts/${contactId}`);
   const tags = res?.contact?.tags || res?.tags || [];
-  const plan = planDqHardStop(tags);
+  const plan = planDqHardStop(tags, { trigger });
   const rule = action.rule_applied || DQ_HARD_STOP_RULE;
 
   for (const tag of plan.addTags) {
