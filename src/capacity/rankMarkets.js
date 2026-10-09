@@ -14,7 +14,8 @@
  *
  * RANKING RULES (settled — see HANDOFF, do not relitigate):
  *   Sort DESCENDING by score = open_true × perf_multiplier, where
- *   open_true = requested - confirmed - set_pending, with two guards that keep
+ *   open_true = requested - confirmed - hopper_weight × set_pending (hopper
+ *   weight 0.5 since 2026-10-09, see below), with two guards that keep
  *   their precedence and still win over score:
  *     1. UNKNOWN — FAIL OPEN. No capacity row, or requested = 0, means the
  *        market has NOT FILED YET, never that it has zero capacity. Excluded
@@ -44,10 +45,22 @@
  *
  * THE WEIGHT IS DELIBERATELY TOO SMALL TO MATTER MUCH. perf_multiplier is
  * clamped to [0.85, 1.15] (src/capacity/marketPerformance.js) and spans only
- * 0.91–1.05 at the default W=0.25 — enough to break a near-tie (Fort Myers
+ * about 0.96–1.03 at the default W=0.125 (0.91–1.05 at the old 0.25) — enough to break a near-tie (Fort Myers
  * over St. Pete when both have 7 open), never enough to flip a 7-vs-4 gap.
  * Capacity dominates; performance decides ties. Markets with no performance
  * data score exactly as their open slots.
+ *
+ * ── THE HOPPER COUNTS HALF A SLOT (the user's ruling, 2026-10-09) ───────────
+ *
+ * Counting every hopper lead as a filled slot gave the hopper too much weight.
+ * dial_priority_log #585 (slot 2026-10-10) put Jacksonville FIFTH with 0
+ * confirmed and 7 in the hopper of 15: it read as 8 open, and its low
+ * performance weight (×0.92) pushed it under Orlando. Ruling: a confirmed
+ * appointment counts 1, a hopper lead 0.5 (DEFAULT_HOPPER_WEIGHT, env
+ * RANKER_HOPPER_WEIGHT). The same number drives the score, the oversold guard
+ * and starvation, so a market reads oversold only once confirmed plus half its
+ * hopper fills it. The 2026-09-05 case above still does not put JAX first: it
+ * reads 8 open against St. Pete's 11.
  *
  * fill_pct is KEPT in the output for dashboard parity — it is no longer the
  * sort key. It is reported in PERCENTAGE POINTS (0–100, one decimal); the
@@ -55,6 +68,12 @@
  */
 
 export const DEFAULT_SMALL_DENOMINATOR = 4;
+
+/**
+ * How much one hopper (set_pending) appointment fills a slot. A confirmed
+ * appointment counts 1. 0.5 by the user's ruling of 2026-10-09 (see above).
+ */
+export const DEFAULT_HOPPER_WEIGHT = 0.5;
 
 /**
  * Minimum SCORE GAP (in slots) two adjacent markets must differ by before
@@ -116,6 +135,8 @@ function round3(n) {
  * @param {object} [opts.starvationStreaks]  { MARKET: consecutiveBottomHalf }
  *        from countBottomHalfStreaks. See the starvation guard below.
  * @param {number} [opts.starvationThreshold]
+ * @param {number} [opts.hopperWeight]  How much a hopper appointment fills a
+ *        slot (default 0.5). A non-finite or negative value falls back to it.
  * @returns {{ ranking: Array, unknown: Array }}
  */
 export function rankMarkets(rows, {
@@ -124,7 +145,9 @@ export function rankMarkets(rows, {
   performance = {},
   starvationStreaks = {},
   starvationThreshold = DEFAULT_STARVATION_THRESHOLD,
+  hopperWeight = DEFAULT_HOPPER_WEIGHT,
 } = {}) {
+  const hw = Number.isFinite(hopperWeight) && hopperWeight >= 0 ? hopperWeight : DEFAULT_HOPPER_WEIGHT;
   const byMarket = new Map();
   for (const r of rows || []) {
     const code = String(r?.market ?? '').trim();
@@ -148,7 +171,7 @@ export function rankMarkets(rows, {
       unknown.push({ market: code, reason: 'requested_zero', requested, confirmed, set_pending: setPending });
       continue;
     }
-    const openTrue = requested - confirmed - setPending;
+    const openTrue = round3(requested - confirmed - hw * setPending);
     const oversold = openTrue <= 0;
     const small = requested < smallDenominator;
     const perf = performance?.[code] || null;
@@ -163,6 +186,7 @@ export function rankMarkets(rows, {
       set_pending: setPending,
       fill_pct: pct(confirmed, requested),
       open_true: openTrue,
+      hopper_weight: hw,
       score: round3(openTrue * multiplier),
       perf_multiplier: multiplier,
       set_to_sale: Number.isFinite(perf?.set_to_sale) ? perf.set_to_sale : null,
