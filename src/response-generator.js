@@ -437,6 +437,14 @@ const SMS_LENGTH_GUARD_MODE = (() => {
   return ['off', 'shadow', 'live'].includes(v) ? v : 'shadow';
 })();
 
+// 2026-10-10 (audit 2026-10-09): off | live, default off. With NEPQ live, the
+// system prompt still carried the legacy HSO / two-times / push-to-book lines
+// that nepq-backbone.js says the PLAN block "outranks". `live` swaps in their
+// NEPQ variants (system-core.js), on the NEPQ-live prompt ONLY. Read once at
+// load like the other prompt knobs, so each prompt variant stays static for
+// the life of the process and the system-prompt cache keeps hitting.
+const PROMPT_NEPQ_CLEANUP_MODE = String(process.env.PROMPT_NEPQ_CLEANUP_MODE || 'off').trim().toLowerCase() === 'live' ? 'live' : 'off';
+
 // v2.7.4: how many recent edits to inject as in-context learning examples.
 const RECENT_EDITS_LIMIT = parseInt(process.env.RESPONSE_GENERATOR_EDITS_LIMIT || '3', 10);
 
@@ -517,8 +525,9 @@ const SYSTEM_PROMPT =
  * on the system prompt the way it already can on the user prompt (which
  * buildResponsePrompt returns verbatim). Nothing in src/ calls it.
  */
-export function getResponseSystemPrompt(mode = 'off') {
-  return mode === 'live' ? SYSTEM_PROMPT_NEPQ : SYSTEM_PROMPT;
+export function getResponseSystemPrompt(mode = 'off', { cleanup = PROMPT_NEPQ_CLEANUP_MODE } = {}) {
+  if (mode !== 'live') return SYSTEM_PROMPT;
+  return cleanup === 'live' ? SYSTEM_PROMPT_NEPQ_CLEAN : SYSTEM_PROMPT_NEPQ;
 }
 
 /**
@@ -534,6 +543,21 @@ function swapOnce(text, from, to) {
   return text.replace(from, () => to);
 }
 const SYSTEM_PROMPT_NEPQ = swapOnce(swapOnce(SYSTEM_PROMPT, P.PPR_GATE_LEGACY, P.PPR_GATE_NEPQ), P.VALUE_LADDER_LEGACY, P.VALUE_LADDER_NEPQ);
+
+// 2026-10-10 (audit 2026-10-09): six more legacy lines that argue with the PLAN
+// block (HSO on every reply, exactly two times by default, push to book on
+// FAST_TRACK). Swapped on top of SYSTEM_PROMPT_NEPQ, used only when NEPQ is
+// live AND PROMPT_NEPQ_CLEANUP_MODE=live (getResponseSystemPrompt). Built at
+// load like the other two variants, so swapOnce still fails the boot, not a
+// customer reply, when a block moves.
+const SYSTEM_PROMPT_NEPQ_CLEAN = [
+  [P.HSO_LINE_LEGACY, P.HSO_LINE_NEPQ],
+  [P.ANSWER_FIRST_LEGACY, P.ANSWER_FIRST_NEPQ],
+  [P.HSO_MANDATE_LEGACY, P.HSO_MANDATE_NEPQ],
+  [P.ASK_FIRST_DEFAULT_LEGACY, P.ASK_FIRST_DEFAULT_NEPQ],
+  [P.HYPERACTIVE_ALERT_LEGACY, P.HYPERACTIVE_ALERT_NEPQ],
+  [P.HYPERACTIVE_DETECT_LEGACY, P.HYPERACTIVE_DETECT_NEPQ],
+].reduce((text, [from, to]) => swapOnce(text, from, to), SYSTEM_PROMPT_NEPQ);
 
 // ═══════════════════════════════════════════════════════════════════
 // REPLY SENDER IDENTITY (2026-07-29 — Kelly Callahan incident)
