@@ -31,7 +31,10 @@ import { enforceOneAsk } from '../agentic/one-ask.js';
 import { dropUnaskedCallOffer, leadWantsCall, MONEY_RX, URGENCY_RX, CLAIMS_RX } from '../agentic/nepq-planner.js';
 
 /** Bump when a check is added or changed, so scorecards from two versions are not compared as one. */
-export const INVARIANTS_VERSION = '2026-10-09.1';
+export const INVARIANTS_VERSION = '2026-10-10.1';
+
+/** The prompt's own SMS ceiling (CHANNEL CONSTRAINTS: "320 max"). */
+export const SMS_MAX_CHARS = 320;
 
 // A merge tag or a script blank that reached the customer: "{{contact.first_name}}",
 // "[YOUR NAME]" (prospect 462947's LP note, 2026-10-05).
@@ -93,6 +96,10 @@ export function checkReply(reply, ctx = {}) {
   if (scope.changed) fail('property_scope', scope.reason);
 
   if (FLORIDA_ONLY_RX.test(text)) fail('florida_only_claim', text.match(FLORIDA_ONLY_RX)[0]);
+
+  // The prompt caps an SMS at 320 characters; nothing checked it (4 of 261 sent
+  // SMS in 30 days ran over, max 411; audit 2026-10-09).
+  if (ctx.channel === 'sms' && text.length > SMS_MAX_CHARS) fail('sms_too_long', `${text.length} chars (max ${SMS_MAX_CHARS})`);
 
   // ── the two bots (SMS, live chat) ─────────────────────────────────────
   // The voice, money, pressure and one-ask rules are the bots' rules: an email
