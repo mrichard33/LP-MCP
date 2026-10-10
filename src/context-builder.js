@@ -109,10 +109,19 @@ import { isCustomerP2 } from './agentic/lead-state/signals/context-reader.js';
 import { withGhlToken } from './ghl-rate-limiter.js';
 import { leadHadDemo } from './demo-truth.js';
 import { buildLeadFacts } from './agentic/lead-facts.js';
+import { normalizePhone10, leadKey } from './lead-leak-classify.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY;
 const GHL_LOCATION_ID = process.env.GHL_LOCATION_ID || 'SsBG7j5KQAIP1SFP2Sca';
 const CONTEXT_CACHE_TTL_MS = parseInt(process.env.CONTEXT_CACHE_TTL_MS || '60000', 10);
+// 2026-10-10 (audit 2026-10-09): where the prompt's "recent calls" come from.
+// Five9 is the only source of truth for calls (Mark's standing rule);
+// lp_call_logs is LP's copy of what its users logged. lp | shadow | five9,
+// default shadow. See fetchRecentCalls.
+const CONTEXT_CALLS_SOURCE = (() => {
+  const v = String(process.env.CONTEXT_CALLS_SOURCE || 'shadow').trim().toLowerCase();
+  return ['lp', 'shadow', 'five9'].includes(v) ? v : 'shadow';
+})();
 const LP_DATA_STALE_THRESHOLD_MIN = parseInt(process.env.LP_DATA_STALE_THRESHOLD_MIN || '15', 10);
 const PIPELINE_CACHE_TTL_MS = parseInt(process.env.PIPELINE_CACHE_TTL_MS || '900000', 10); // 15 min — pipelines change rarely
 
@@ -755,6 +764,128 @@ async function fetchLPCalls(lpLeadId, limit = 5) {
   }
 }
 
+// ─── Recent calls from Five9 (2026-10-10, audit 2026-10-09) ─────────────
+//
+// buildLeadContext read "recent calls" from lp_call_logs (fetchLPCalls above):
+// LP's copy of what its users logged, not the dialer. Mark's standing rule is
+// that Five9 is the only source of truth for calls, so the prompt's "last
+// calls" should be what Five9 recorded. five9_events_raw holds every Five9
+// event (several rows per call_id); a contact's calls are the rows whose ani
+// or dnis is their number, or whose lp_rec_key is their LP lead ('LDS' ||
+// lp_lead_id, 98.8% agreement by phone; see leadKey in lead-leak-classify.js).
+// The INQ key is LP's INBOUND id, never the prospect id (CLAUDE.md, measured
+// 2026-09-28), so no prospect id is matched here: the phone covers those calls.
+//
+// Same shape as fetchLPCalls returns ({ result, type, agent, date, phone }),
+// so the prompt renders either without a second format: type is the Five9
+// campaign, result the disposition name, agent the agent name.
+export const FIVE9_CALLS_WINDOW_DAYS = 90;
+
+/**
+ * Pure: Five9 event rows → the contact's recent calls, newest first.
+ * Keeps rows from the last `windowDays` that match the phone (last 10 digits of
+ * ani OR dnis) or one of `keys` (lp_rec_key), one row per call_id (the latest
+ * received_at wins), ordered by call_start_at desc, at most `limit`.
+ */
+export function mapFive9CallEvents(rows, { phone10 = null, keys = [], limit = 3, nowMs = Date.now(), windowDays = FIVE9_CALLS_WINDOW_DAYS } = {}) {
+  const keySet = new Set((keys || []).map((k) => String(k ?? '').trim()).filter(Boolean));
+  const since = nowMs - windowDays * 86400000;
+  const byCall = new Map();
+  for (const r of Array.isArray(rows) ? rows : []) {
+    if (!r) continue;
+    const startIso = r.call_start_at || r.received_at || null;
+    const startMs = Date.parse(startIso || '');
+    if (!Number.isFinite(startMs) || startMs < since) continue;
+    const ani10 = normalizePhone10(r.ani);
+    const dnis10 = normalizePhone10(r.dnis);
+    const phoneHit = !!phone10 && (ani10 === phone10 || dnis10 === phone10);
+    const keyHit = keySet.has(String(r.lp_rec_key ?? '').trim());
+    if (!phoneHit && !keyHit) continue;
+    const callKey = r.call_id ? `call:${r.call_id}` : `row:${r.id ?? startIso}`;
+    const prev = byCall.get(callKey);
+    if (prev && String(prev.row.received_at || '') >= String(r.received_at || '')) continue;
+    byCall.set(callKey, { row: r, startMs, phone: ani10 === phone10 ? (r.ani || '') : dnis10 === phone10 ? (r.dnis || '') : (r.ani || r.dnis || '') });
+  }
+  return [...byCall.values()]
+    .sort((a, b) => b.startMs - a.startMs)
+    .slice(0, limit)
+    .map(({ row, phone }) => ({
+      result: row.disposition_name || '',
+      type: row.campaign || '',
+      agent: row.agent_name || '',
+      date: row.call_start_at || row.received_at || '',
+      phone: phone || '',
+    }));
+}
+
+/**
+ * The contact's last `limit` Five9 calls (default 3, the prompt shows 3).
+ * A failed or slow read returns [] and logs one line: it never throws into the
+ * reply path and never falls back to LP (two sources by the minute would make
+ * the prompt's "last calls" mean two different things). `deps.supabase` is the
+ * test seam.
+ */
+export async function fetchFive9Calls({ phone, lpLeadId, limit = 3, nowMs = Date.now() } = {}, deps = {}) {
+  const sb = deps.supabase || supabase;
+  const phone10 = normalizePhone10(phone);
+  const keys = lpLeadId ? [leadKey(lpLeadId)] : [];
+  if (!phone10 && !keys.length) return [];
+  const since = new Date(nowMs - FIVE9_CALLS_WINDOW_DAYS * 86400000).toISOString();
+  // PostgREST `like` takes `*` as the wildcard; a suffix match reads "+1" and
+  // bare 10-digit numbers alike. The mapper re-checks the last 10 digits.
+  const ors = [];
+  if (phone10) ors.push(`ani.like.*${phone10}`, `dnis.like.*${phone10}`);
+  if (keys.length) ors.push(`lp_rec_key.in.(${keys.join(',')})`);
+  try {
+    const { data, error } = await withTimeout(
+      sb
+        .from('five9_events_raw')
+        .select('id, call_id, ani, dnis, campaign, disposition_name, agent_name, call_start_at, call_end_at, duration_sec, lp_rec_key, lp_rec_type, received_at')
+        .or(ors.join(','))
+        .gte('received_at', since)
+        .order('received_at', { ascending: false })
+        .limit(100),
+      'fetchFive9Calls',
+    );
+    if (error) throw new Error(error.message || String(error));
+    return mapFive9CallEvents(data || [], { phone10, keys, limit, nowMs });
+  } catch (err) {
+    console.warn(`[ContextCalls] five9_events_raw read failed (${phone10 ? 'phone' : ''}${phone10 && keys.length ? '+' : ''}${keys.length ? 'lead' : ''}): ${err.message}`);
+    return [];
+  }
+}
+
+/**
+ * Pure: do the LP and Five9 lists agree on the newest call? Both empty → true;
+ * one empty → false; otherwise the two newest dates fall within `toleranceMs`
+ * (LP logs the call a few minutes after Five9 timestamps it).
+ */
+export function sameLatestCall(lpCalls, five9Calls, toleranceMs = 15 * 60 * 1000) {
+  const a = lpCalls?.[0], b = five9Calls?.[0];
+  if (!a && !b) return true;
+  if (!a || !b) return false;
+  const am = Date.parse(a.date || ''), bm = Date.parse(b.date || '');
+  if (!Number.isFinite(am) || !Number.isFinite(bm)) return false;
+  return Math.abs(am - bm) <= toleranceMs;
+}
+
+/**
+ * The prompt's recent calls, by CONTEXT_CALLS_SOURCE:
+ *   lp      lp_call_logs only (the pre-2026-10-10 behaviour)
+ *   shadow  (default) the prompt still sees lp_call_logs; Five9 is read too and
+ *           ONE line compares them, so the switch to five9 is made on evidence
+ *   five9   Five9 only; lp_call_logs is not read
+ * Cached with the rest of the context (CONTEXT_CACHE_TTL_MS), nothing new.
+ */
+async function fetchRecentCalls({ ghlContactId, phone, lpLeadId }, deps = {}) {
+  const source = deps.source || CONTEXT_CALLS_SOURCE;
+  if (source === 'five9') return fetchFive9Calls({ phone, lpLeadId }, deps);
+  if (source === 'lp') return fetchLPCalls(lpLeadId);
+  const [lp, five9] = await Promise.all([fetchLPCalls(lpLeadId), fetchFive9Calls({ phone, lpLeadId }, deps)]);
+  console.log(`[ContextCalls] shadow contact=${ghlContactId} lp=${lp.length} five9=${five9.length} same_latest=${sameLatestCall(lp, five9)}`);
+  return lp;
+}
+
 async function fetchOpportunity(contactId, degraded = null) {
   let data;
   try {
@@ -1023,7 +1154,9 @@ export async function buildLeadContext(ghlContactId, options = {}) {
     // the bot knows the whole recent story (texts, chats, emails).
     (includeConversation && ghlContact) ? fetchConversation(ghlContactId, 30, degraded) : [],
     fetchLPNotes(lpLeadId),
-    fetchLPCalls(lpLeadId),
+    // 2026-10-10: Five9 is the source of truth for calls; CONTEXT_CALLS_SOURCE
+    // decides whether the prompt sees it yet (default shadow: LP + one log line).
+    fetchRecentCalls({ ghlContactId, phone: ghlContact?.phone || null, lpLeadId }),
     opportunity?.pipelineStageId ? resolvePipelineStage(opportunity.pipelineStageId) : null,
     fetchNurtureHistory(ghlContactId, workflow_code),
     fetchOpenObjectionState(ghlContactId),
