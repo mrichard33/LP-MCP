@@ -165,6 +165,55 @@ test('the inbound message and the thread sit inside the fence, and cannot close 
   assert.equal(fenceSafe('a <<<CUSTOMER_DATA b'), 'a CUSTOMER_DATA b');
 });
 
+// ─── the NEPQ cleanup variant (2026-10-10, audit 2026-10-09) ────────
+// nepq-backbone.js: the PLAN block "outranks the older formulas still in the
+// system prompt". With PROMPT_NEPQ_CLEANUP_MODE=live those formulas are gone
+// from the NEPQ-live prompt; with it off (the default) nothing changes.
+
+const LEGACY_FORMULAS = [
+  'HSO MANDATE — EVERY REPLY',
+  'Two options. Not one. Not three. Two.',
+  'push to book',
+  'propose TWO SPECIFIC TIME slots',
+];
+const cleanSms = () => getResponseSystemPrompt('live', { cleanup: 'live' });
+const cleanChat = () => cleanSms() + LIVE_CHAT_ADDENDUM;
+
+for (const [label, build] of [['SMS', () => cleanSms() + '\n' + smsUser()], ['live chat', cleanChat]]) {
+  test(`${label} (NEPQ live, cleanup live): none of the legacy formulas the PLAN block outranks`, () => {
+    const p = build();
+    for (const phrase of LEGACY_FORMULAS) {
+      assert.ok(!p.includes(phrase), `the clean prompt still carries: ${phrase}`);
+    }
+    assert.ok(p.includes('═══════ REPLY SHAPE ═══════'), 'the REPLY SHAPE section replaces the HSO mandate');
+    assert.ok(p.includes('hso_breakdown'), 'the response format still carries hso_breakdown (the parser reads it)');
+    // The earlier NEPQ swaps (PPR gate, value ladder) are still in place.
+    assert.ok(p.includes('Offer exactly the move in the PLAN block.'));
+    assert.ok(!p.includes('never as an in-home visit'));
+  });
+}
+
+test('cleanup off (the default) and NEPQ off both keep the legacy formulas, byte for byte', () => {
+  for (const sys of [smsSystem('live'), smsSystem('off')]) {
+    for (const phrase of LEGACY_FORMULAS) assert.ok(sys.includes(phrase), `legacy prompt lost: ${phrase}`);
+  }
+  assert.equal(getResponseSystemPrompt('live', { cleanup: 'off' }), smsSystem('live'));
+  assert.equal(getResponseSystemPrompt('off', { cleanup: 'live' }), smsSystem('off'));
+});
+
+test('no example SMS in examples.js carries an em dash (the prompt bans them in SMS)', () => {
+  const src = fs.readFileSync(new URL('../src/prompts/response-generator/examples.js', import.meta.url), 'utf8');
+  const offending = src.split('\n').filter((line) => (/\[outbound\]/.test(line) || /"message":/.test(line)) && line.includes('—'));
+  assert.deepEqual(offending, [], 'example SMS lines with an em dash');
+});
+
+test('the FINANCING script carries no em dash, in every prompt variant', () => {
+  for (const sys of [smsSystem('live'), smsSystem('off'), cleanSms()]) {
+    assert.ok(sys.includes('- FINANCING: "Yes, several options. The rep walks you through exactly what fits during the visit."'));
+    assert.ok(!sys.includes('"Yes — several options.'));
+  }
+});
+
 test('sql/148 is additive and mirrored at boot', () => {
   const sql = fs.readFileSync(new URL('../sql/148_bot_message_context_prompt_fingerprint.sql', import.meta.url), 'utf8');
   assert.match(sql, /ADD COLUMN IF NOT EXISTS prompt_sha256 text/);
