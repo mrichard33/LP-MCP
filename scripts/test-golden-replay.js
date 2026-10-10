@@ -309,7 +309,7 @@ test('golden set runs every case in both NEPQ modes', () => {
 // ── the checks themselves: each fires on its incident and stays quiet on a good reply ──
 
 test('invariants: a clean reply passes every check that can run', () => {
-  const r = checkReply('What made you start looking at windows now?', { channel: 'livechat', inbound: 'hi', conversation: [], booked: false, nowMs: IN_HOURS_MS });
+  const r = checkReply('What made you start looking at windows now?', { channel: 'livechat', inbound: 'hi', conversation: [], booked: false, nowMs: IN_HOURS_MS, rehash: false });
   assert.deepEqual(r.violations, []);
   assert.deepEqual(r.skipped, []);
 });

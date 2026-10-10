@@ -268,7 +268,7 @@ import { notInterestedTurn } from './agentic/not-interested.js';
 import { humanizeReply, restoreQuestionMark } from './agentic/human-voice.js';
 import { enforceTeamVoice } from './agentic/team-voice.js';
 import { enforcePropertyScope } from './agentic/property-scope.js';
-import { enforceCallTiming, softenCallTiming, isTeamOpen } from './agentic/team-hours.js';
+import { enforceCallTiming, softenCallTiming, isTeamOpen, enforceRehashCallTiming } from './agentic/team-hours.js';
 import { enforceOneAsk } from './agentic/one-ask.js';
 import { findUnbackedBookingClaim, rewriteBookingClaims, bookingClaimNote, appointmentOnFile, noPromiseHandoffLine, NO_PROMISE_HANDOFF_RX } from './agentic/booking-claim.js';
 import { lpNoteDqMode } from './agentic/lp-note-dq.js';
@@ -400,6 +400,7 @@ import { LINES as NEPQ_LINES } from './agentic/nepq-planner.js';
 import { isCustomerP2 } from './agentic/lead-state/signals/context-reader.js';
 import { postDemoPlannerMode } from './agentic/post-demo-turn.js';
 import { rehashCallSlotsMode, readRehashCallSlots, rehashCallBooking } from './agentic/rehash-slots.js';
+import { isInRehash, rehashLeadFromContext, rehashRoutingMode } from './agentic/rehash-state.js';
 import { planNepqTurn, enforceNepqPlan, referenceRetryNote, nepqBackboneMode, prefersCall as nepqPrefersCall, objectionType as nepqObjectionType, TIME_REQUEST_RX as NEPQ_TIME_REQUEST_RX, SCHEDULE_ASK_RX as NEPQ_SCHEDULE_ASK_RX,REPEAT_COMPLAINT_RX as NEPQ_REPEAT_COMPLAINT_RX, bookingOpenInThread as nepqBookingOpenInThread, dropUnaskedCallOffer, leadWantsCall as nepqLeadWantsCall, isServiceCallback as nepqIsServiceCallback } from './agentic/nepq-planner.js';
 import {
   planServiceAreaTurn, resolveCoverage, coverageHint, guardCoverageDraft, serviceAreaRecord, coverageOwnsReply,
@@ -3481,7 +3482,16 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // as a literal: a merge tag can never ship (assertNoUnresolvedTokens).
   // SMS only: the rehash rep's line is a phone number, and an email reply
   // carries the in-office sender (resolveEmailSender) whatever the stage.
-  const rehashActive = channel === 'sms' && isRehashContact({ tags: context.lead?.current_tags || [], fromNumber: opts.fromNumber || null });
+  const rehashTagged = channel === 'sms' && isRehashContact({ tags: context.lead?.current_tags || [], fromNumber: opts.fromNumber || null });
+  // 2026-10-09 (Monica, 581695): the `rehash` tag is added by a sweep that is
+  // still in shadow, so an OPPFDN lead inside the 30-day window read as a new
+  // lead here, the Rehash Call calendar was never read, and "I never got a
+  // call" got "someone will call you back right now" with the rep out until
+  // Monday. The LP lead decides too (isInRehash, the sweep's own rule).
+  const rehashByLead = channel === 'sms' && !rehashTagged && rehashRoutingMode() !== 'off'
+    && isInRehash({ tags: context.lead?.current_tags || [], currentLead: rehashLeadFromContext(context.lp) });
+  if (rehashByLead) console.log(`[Rehash] ${contactId} in rehash by LP lead ${context.lp?.lead_id} (${context.lp?.disposition}) — no rehash tag yet`);
+  const rehashActive = rehashTagged || rehashByLead;
   let rehashRepName = null;
   if (rehashActive) {
     try {
@@ -4845,6 +4855,20 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
         console.warn(`[ResponseGenerator] immediate call promise while the phone room is closed for ${contactId}: ${promises.join(', ')} — rewritten`);
         draftPatch('immediate_call', `Your previous draft promised a call right away (${promises.join(', ')}) while the phone room is closed. Do not promise when a call will happen.`);
       }
+    }
+  }
+
+  // ─── A rehash lead is never promised a call right now (2026-10-09) ───
+  // The rehash rep makes the call, and only when the Rehash Call calendar
+  // shows them free; the team being open says nothing about the rep. Monica
+  // got "We're having someone call you back right now." at 6:55 PM Friday
+  // with John out until Monday. The immediacy becomes the day of the rep's
+  // first real opening, or "soon" when none was read.
+  if (rehash) {
+    const timed = enforceRehashCallTiming(validated.message, { nextOpening: rehashCallSlots?.offer?.[0] || rehashCallSlots?.all?.[0] || null });
+    if (timed.changed) {
+      validated.message = timed.text;
+      console.warn(`[RehashSlots] ${contactId}: immediate call promise to a rehash lead rewritten (rep ${rehashCallSlots?.rep || '?'})`);
     }
   }
 

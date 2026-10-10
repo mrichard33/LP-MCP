@@ -99,6 +99,27 @@ export function isInRehash({ tags = [], currentLead = null, nowMs = Date.now(), 
 }
 
 /**
+ * The reply context's LP lead (context-builder's `context.lp`) in the shape
+ * isInRehash reads, or null when no LP lead matched. Pure.
+ *
+ * 2026-10-09 (Monica, LP lead 581695): the reply writer knew a contact was in
+ * rehash only by the `rehash` / `active-f.0` tag, and the sweep that adds
+ * `rehash` is still in shadow. Her OPPFDN lead was plainly in the window, yet
+ * "I never got a call" got "We're having someone call you back right now."
+ * while the rehash rep was out until Monday: John's Rehash Call calendar was
+ * never read. The 30-day clock runs from the demo, so demo_date wins over a
+ * later appointment date (the watchdog had re-set hers to the call time).
+ */
+export function rehashLeadFromContext(lp) {
+  if (!lp || lp.matched === false || lp.lead_id == null) return null;
+  return {
+    lp_lead_id: lp.lead_id,
+    disposition_code: lp.disposition ?? null,
+    appointment_date: lp.demo_date || lp.appointment_date || lp.last_appointment_date || null,
+  };
+}
+
+/**
  * What the sweep should do for one contact. Pure.
  * @param {object} a
  * @param {string[]} a.tags          live GHL tags

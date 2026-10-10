@@ -266,6 +266,14 @@ same rep right before booking (`recheckSlot({ userId })`), and LP is never touch
 open times or a failed read: the old reply and the #contact-rehash card, which is now skipped when times were offered or
 the call booked. A follow-up date still wins ("Call me in November" → `defer`). `REHASH_CALL_SLOTS_MODE` off|shadow|live,
 default shadow (`[RehashSlots] shadow … would offer/book`); live also needs `POST_DEMO_PLANNER_MODE=live`.
+**A rehash lead is rehash by its LP lead, and never promised a call "right now" (Monica, 2026-10-09).** "I never got a
+call" (John, the rehash rep, out until Monday) got "We're having someone call you back right now.": the reply writer knew
+rehash only by the `rehash` / `active-f.0` tag, which the shadow sweep never adds, so John's calendar was never read, and
+"we're having someone call you" did not read as a promise at all (`FROM_US_RX`). Now an OPPFDN lead in the 30-day window
+is rehash in the reply writer too (`isInRehash` over `rehashLeadFromContext(context.lp)`, log `[Rehash] … in rehash by LP
+lead`; not when `REHASH_ROUTING_MODE=off`), and `enforceRehashCallTiming` (`team-hours.js`) turns any immediate call
+promise to a rehash lead into the DAY of the rep's first Rehash Call opening ("on Monday"), or "soon" with none read.
+`checkReply` fails it as `call_promised_now_to_rehash_lead` (`ctx.rehash`).
 **An issued LP lead never takes another appointment (call-center manual pp. 22–24, 2026-10-09).** `postIssueGate`
 (`src/lp-post-issue-rebook.js`, rules in `src/lp-post-issue.js`) runs before both LP SetAppointment calls. Post-issue =
 LP's issued flag on any appointment row (or `everissued`), else a `POST_ISSUE_DISPOSITIONS` disposition (CCC and Reset
