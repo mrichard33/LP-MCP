@@ -30,7 +30,10 @@ process.env.LP_ADDLEAD_TIMEOUT_MS = '5000';
 const CONF_CALL = 'gFWoSQrlKIdfRbAPV842';
 const WINDOW_ESTIMATE = 'aJj14ONxh1oFyDcQ706O';
 const CONTACT = '5YGVd3kh5IcY6pUJVcs4';
-const CALL_START = '2026-10-09T18:00:00-04:00';
+// Fixed in the future (2036, still EDT in October): the proxy reads UPCOMING
+// appointments only, so the original 2026-10-09 dates failed every run after
+// that evening (2026-10-10).
+const CALL_START = '2036-10-09T18:00:00-04:00';
 
 let ghlEvents = [];        // served on GET /contacts/{id}/appointments
 let ghlFails = false;
@@ -73,7 +76,7 @@ const { registerLpAddleadProxyRoutes } = await import('../src/lp-addlead-proxy.j
 
 const confCall = (over = {}) => ({
   id: 'JrH56gkBz5uluIHqRUor', calendarId: CONF_CALL, startTime: CALL_START,
-  endTime: '2026-10-09T18:15:00-04:00', appointmentStatus: 'new', ...over,
+  endTime: '2036-10-09T18:15:00-04:00', appointmentStatus: 'new', ...over,
 });
 const upcomingRow = (over = {}) => ({
   appointment_id: 'JrH56gkBz5uluIHqRUor', calendar_id: CONF_CALL, start_time: CALL_START,
@@ -84,17 +87,17 @@ const upcomingRow = (over = {}) => ({
 
 test('lpSlotToStartIso reads every date/time shape the LP paths carry', () => {
   for (const [d, t] of [
-    ['10/09/2026', '6:00 PM'],
-    ['10/09/2026', '06:00 PM'],
-    ['2026-10-09', '18:00'],
-    ['October 9, 2026', '6:00 pm'],
-    ['2026-10-09T00:00:00+00:00', '18:00'],
+    ['10/09/2036', '6:00 PM'],
+    ['10/09/2036', '06:00 PM'],
+    ['2036-10-09', '18:00'],
+    ['October 9, 2036', '6:00 pm'],
+    ['2036-10-09T00:00:00+00:00', '18:00'],
   ]) {
     assert.equal(lpSlotToStartIso(d, t), CALL_START, `${d} ${t}`);
   }
   // Winter is EST.
   assert.equal(lpSlotToStartIso('01/15/2027', '10:00 AM'), '2027-01-15T10:00:00-05:00');
-  for (const [d, t] of [['', '6:00 PM'], ['10/09/2026', ''], ['garbage', '6:00 PM'], ['10/09/2026', '13:00 PM']]) {
+  for (const [d, t] of [['', '6:00 PM'], ['10/09/2036', ''], ['garbage', '6:00 PM'], ['10/09/2036', '13:00 PM']]) {
     assert.equal(lpSlotToStartIso(d, t), null, `${d} ${t} is unreadable`);
   }
 });
@@ -102,11 +105,11 @@ test('lpSlotToStartIso reads every date/time shape the LP paths carry', () => {
 test('ghlOnlyAppointmentAtSlot: an active Confirmation Call at that instant', () => {
   assert.equal(ghlOnlyAppointmentAtSlot([upcomingRow()], CALL_START)?.appointment_id, 'JrH56gkBz5uluIHqRUor');
   // Same instant written in UTC still matches.
-  assert.ok(ghlOnlyAppointmentAtSlot([upcomingRow({ start_time: '2026-10-09T22:00:00Z' })], CALL_START));
+  assert.ok(ghlOnlyAppointmentAtSlot([upcomingRow({ start_time: '2036-10-09T22:00:00Z' })], CALL_START));
 });
 
 test('ghlOnlyAppointmentAtSlot: no match for another time, a dead call, or a real visit at the same time', () => {
-  assert.equal(ghlOnlyAppointmentAtSlot([upcomingRow({ start_time: '2026-10-09T14:00:00-04:00' })], CALL_START), null);
+  assert.equal(ghlOnlyAppointmentAtSlot([upcomingRow({ start_time: '2036-10-09T14:00:00-04:00' })], CALL_START), null);
   for (const status of ['cancelled', 'canceled', 'invalid', 'no_show']) {
     assert.equal(ghlOnlyAppointmentAtSlot([upcomingRow({ status })], CALL_START), null, status);
   }
@@ -122,21 +125,21 @@ test('ghlOnlyAppointmentAtSlot: no match for another time, a dead call, or a rea
 test('checkConfirmationCallSlot: blocked / clear / fail open', async () => {
   const fetchUpcomingAppointments = async () => [upcomingRow()];
   const hit = await checkConfirmationCallSlot(
-    { contactId: CONTACT, apptDate: '10/09/2026', apptTime: '6:00 PM' }, { fetchUpcomingAppointments });
+    { contactId: CONTACT, apptDate: '10/09/2036', apptTime: '6:00 PM' }, { fetchUpcomingAppointments });
   assert.equal(hit.blocked, true);
   assert.equal(hit.reason, 'confirmation_call_slot');
 
   const other = await checkConfirmationCallSlot(
-    { contactId: CONTACT, apptDate: '10/09/2026', apptTime: '2:00 PM' }, { fetchUpcomingAppointments });
+    { contactId: CONTACT, apptDate: '10/09/2036', apptTime: '2:00 PM' }, { fetchUpcomingAppointments });
   assert.deepEqual([other.blocked, other.reason], [false, 'clear']);
 
   // A GHL read we cannot trust must not strand a real visit.
   for (const fetchUp of [async () => null, async () => { throw new Error('timeout'); }]) {
     const r = await checkConfirmationCallSlot(
-      { contactId: CONTACT, apptDate: '10/09/2026', apptTime: '6:00 PM' }, { fetchUpcomingAppointments: fetchUp });
+      { contactId: CONTACT, apptDate: '10/09/2036', apptTime: '6:00 PM' }, { fetchUpcomingAppointments: fetchUp });
     assert.deepEqual([r.blocked, r.reason], [false, 'lookup_failed']);
   }
-  assert.equal((await checkConfirmationCallSlot({ apptDate: '10/09/2026', apptTime: '6:00 PM' })).reason, 'no_contact');
+  assert.equal((await checkConfirmationCallSlot({ apptDate: '10/09/2036', apptTime: '6:00 PM' })).reason, 'no_contact');
   assert.equal((await checkConfirmationCallSlot({ contactId: CONTACT, apptDate: 'x', apptTime: 'y' })).reason, 'unreadable_slot');
 });
 
@@ -158,7 +161,7 @@ function syncDeps(slot) {
 test('syncAppointmentToLP: a time that is the contact\'s Confirmation Call never reaches LP', async () => {
   const { seen, deps } = syncDeps({ blocked: true, reason: 'confirmation_call_slot', appointment: upcomingRow() });
   const res = await syncAppointmentToLP({
-    contactId: CONTACT, appointmentDate: '2026-10-09', appointmentTime: '06:00 PM',
+    contactId: CONTACT, appointmentDate: '2036-10-09', appointmentTime: '06:00 PM',
   }, deps);
   assert.equal(res.action, 'skipped_ghl_only_calendar');
   assert.equal(res.ghl_appointment_id, 'JrH56gkBz5uluIHqRUor');
@@ -168,7 +171,7 @@ test('syncAppointmentToLP: a time that is the contact\'s Confirmation Call never
 test('syncAppointmentToLP: a named in-home calendar is trusted and not re-checked', async () => {
   const { seen, deps } = syncDeps({ blocked: true, reason: 'confirmation_call_slot' });
   await syncAppointmentToLP({
-    contactId: CONTACT, appointmentDate: '2026-10-09', appointmentTime: '06:00 PM', calendarId: WINDOW_ESTIMATE,
+    contactId: CONTACT, appointmentDate: '2036-10-09', appointmentTime: '06:00 PM', calendarId: WINDOW_ESTIMATE,
   }, deps).catch(() => {});
   assert.equal(seen.slotChecks, 0);
   assert.equal(seen.resolve, 1, 'went on to resolve the lead as before');
@@ -177,7 +180,7 @@ test('syncAppointmentToLP: a named in-home calendar is trusted and not re-checke
 test('syncAppointmentToLP: a GHL read failure proceeds (fail open)', async () => {
   const { seen, deps } = syncDeps({ blocked: false, reason: 'lookup_failed' });
   await syncAppointmentToLP({
-    contactId: CONTACT, appointmentDate: '2026-10-09', appointmentTime: '06:00 PM',
+    contactId: CONTACT, appointmentDate: '2036-10-09', appointmentTime: '06:00 PM',
   }, deps).catch(() => {});
   assert.equal(seen.resolve, 1);
 });
@@ -187,7 +190,7 @@ test('syncAppointmentToLP: a GHL read failure proceeds (fail open)', async () =>
 // GHL's built-in last_appointment fields, as a Confirmation Call fills them.
 const contactWithCallFields = () => ({
   id: CONTACT,
-  last_appointment_start_date: '2026-10-09',
+  last_appointment_start_date: '2036-10-09',
   last_appointment_start_time: '6:00 PM',
 });
 
@@ -214,7 +217,7 @@ test('create_lp_lead: a real visit time is kept; an in-home calendar is trusted;
   const clear = async () => ({ blocked: false, reason: 'clear' });
   assert.deepEqual(
     await resolveLpAppointment({}, {}, contactWithCallFields(), true, CONTACT, { checkConfirmationCallSlot: clear }),
-    { adate: '10/09/2026', atime: '6:00 PM' });
+    { adate: '10/09/2036', atime: '6:00 PM' });
 
   let reads = 0;
   const trusted = await resolveLpAppointment({ calendar_id: WINDOW_ESTIMATE }, {}, contactWithCallFields(), true, CONTACT, {
@@ -247,7 +250,7 @@ async function invoke(body) {
 const iLpOutBody = (over = {}) => ({
   firstname: 'Mocica', lastname: 'R', address1: '1 Main St', city: 'Tampa', state: 'FL',
   zip: '33601', phone1: '8135551234', lognumber: CONTACT, srs_id: '830', pro_id: '5574',
-  sender: 'I.LP-OUT', adate: '10/09/2026', atime: '6:00 PM', ...over,
+  sender: 'I.LP-OUT', adate: '10/09/2036', atime: '6:00 PM', ...over,
 });
 
 function resetProxy({ events = [], fails = false } = {}) {
@@ -265,9 +268,9 @@ test('proxy: an addlead whose time is the Confirmation Call reaches LP with NO a
 });
 
 test('proxy: a Window Estimate time is forwarded unchanged', async () => {
-  resetProxy({ events: [confCall(), { id: 'we-1', calendarId: WINDOW_ESTIMATE, startTime: '2026-10-10T14:00:00-04:00', appointmentStatus: 'new' }] });
-  await invoke(iLpOutBody({ adate: '10/10/2026', atime: '2:00 PM' }));
-  assert.equal(lpCalls[0].adate, '10/10/2026');
+  resetProxy({ events: [confCall(), { id: 'we-1', calendarId: WINDOW_ESTIMATE, startTime: '2036-10-10T14:00:00-04:00', appointmentStatus: 'new' }] });
+  await invoke(iLpOutBody({ adate: '10/10/2036', atime: '2:00 PM' }));
+  assert.equal(lpCalls[0].adate, '10/10/2036');
   assert.equal(lpCalls[0].atime, '2:00 PM');
 });
 
