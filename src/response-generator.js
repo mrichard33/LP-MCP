@@ -256,6 +256,9 @@
  */
 
 import { promptSha256 } from './bot-feedback/fingerprint-core.js';
+// 2026-10-10: the SMS ceiling lives with the reply invariants, so the guard
+// here and checkReply can never disagree on the number.
+import { SMS_MAX_CHARS } from './eval/reply-invariants.js';
 import { cleanInboundForModel } from './security/untrusted-text.js';
 import { buildLeadContext } from './context-builder.js';
 import { classifyInbound, isShortCircuit } from './knowledge/intent-classifier.js';
@@ -425,6 +428,14 @@ export const RESPONSE_GENERATOR_VERSION = 'v2.7.14';
 // for any thinking model, so this number can only ever raise the budget.
 const MAX_TOKENS = parseInt(process.env.RESPONSE_GENERATOR_MAX_TOKENS || '8000', 10);
 const PROMPT_TIMEZONE = process.env.REECE_TIMEZONE || 'America/New_York';
+
+// 2026-10-10 (audit 2026-10-09): off | shadow (default) | live. The prompt caps
+// an SMS at 320 characters ("320 max") and nothing checked it: 4 of 261 sent
+// SMS in 30 days ran over (max 411). See decideSmsLength.
+const SMS_LENGTH_GUARD_MODE = (() => {
+  const v = String(process.env.SMS_LENGTH_GUARD_MODE || 'shadow').trim().toLowerCase();
+  return ['off', 'shadow', 'live'].includes(v) ? v : 'shadow';
+})();
 
 // 2026-10-10 (audit 2026-10-09): off | live, default off. With NEPQ live, the
 // system prompt still carried the legacy HSO / two-times / push-to-book lines
@@ -3216,6 +3227,31 @@ export function planAsksForTime(plan, mode) {
   return ['offer_slots', 'ask_day', 'confirm'].includes(plan.required_move) || (plan.slots_to_offer || []).length > 0;
 }
 
+/**
+ * Pure: what the SMS length guard does with a draft (2026-10-10).
+ *   { over: false }                      at or under the cap
+ *   action 'exempt'                      over, but carries a booking link or the disclosure script
+ *   action 'off' | 'shadow'              over; the mode says ship it (shadow logs)
+ *   action 'regenerate' + note           over, live, first draft: one re-write
+ *   action 'ship_after_retry'            over, live, already the second draft: ship as written
+ * Never truncates. The link and the disclosure are exempt because both are
+ * fixed text the model may not shorten.
+ */
+export function decideSmsLength(text, { mode = SMS_LENGTH_GUARD_MODE, retry = false, max = SMS_MAX_CHARS } = {}) {
+  const s = String(text ?? '');
+  const chars = s.length;
+  if (chars <= max) return { over: false, chars, action: 'none' };
+  if (BARE_MERGE_TAG_RX.test(s) || /https?:\/\//i.test(s)) return { over: true, chars, action: 'exempt', reason: 'booking_link' };
+  if (s.includes(P.APPROVED_DISCLOSURE_VARIANTS.standard)) return { over: true, chars, action: 'exempt', reason: 'ai_disclosure' };
+  if (mode === 'off') return { over: true, chars, action: 'off' };
+  if (mode === 'shadow') return { over: true, chars, action: 'shadow' };
+  if (retry) return { over: true, chars, action: 'ship_after_retry' };
+  return {
+    over: true, chars, action: 'regenerate',
+    note: `Your SMS was ${chars} characters. Rewrite it under ${max} characters: same move, same facts, nothing added.`,
+  };
+}
+
 export async function generateResponse(contactId, channel, triggerMessage, opts = {}) {
   // 2026-10-06 (AI OS batch 1, PR 3; src/security/untrusted-text.js): every
   // read and the prompt below see the inbound with invisible characters
@@ -4844,6 +4880,28 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
         err.regenerationNote = carrierRiskNote(risks);
         throw err;
       }
+    }
+  }
+
+  // ─── SMS length (2026-10-10, audit 2026-10-09) ───
+  // The prompt says "320 max" and nothing enforced it. Same regenerate-once
+  // shape as the carrier-risk guard above: opts.regenerationNote set means this
+  // IS already the second draft, so an over-long retry ships as written and is
+  // logged. Customer text is NEVER truncated in code: a cut-off sentence reads
+  // worse than a long one. A booking link or the approved AI-disclosure script
+  // is fixed text the model may not shorten, so a reply carrying one is exempt.
+  if (channel === 'sms') {
+    const length = decideSmsLength(validated.message, { retry: !!opts.regenerationNote });
+    if (length.over) {
+      if (length.action === 'regenerate') {
+        console.warn(`[SmsLength] over chars=${length.chars} contact=${contactId} — regenerating once`);
+        const err = new Error(`sms_too_long: ${length.chars} chars (max ${SMS_MAX_CHARS})`);
+        err.regenerationNote = length.note;
+        throw err;
+      }
+      if (length.action === 'ship_after_retry') console.error(`[SmsLength] over after retry chars=${length.chars} contact=${contactId}`);
+      else if (length.action === 'shadow') console.log(`[SmsLength] shadow chars=${length.chars} contact=${contactId}`);
+      else if (length.action === 'exempt') console.log(`[SmsLength] exempt (${length.reason}) chars=${length.chars} contact=${contactId}`);
     }
   }
 
