@@ -16,13 +16,13 @@ export const EXAMPLES_AUTOBOOK_AND_CANCELLATION = `═══════ EXAMPLE
 
 EXAMPLE A1 (PATH A — full discovery already happened, both spouses):
   Conversation history:
-    [outbound] "We have your address as 123 Main St — is that where you'd like the visit?"
+    [outbound] "We have your address as 123 Main St. Is that where you'd like the visit?"
     [inbound]  "Yes that's correct"
     [outbound] "Great. Looking at about 12 windows from your calculator entry, right?"
     [inbound]  "Yeah 12 sounds about right"
     [outbound] "Will both you and your spouse be there for the visit?"
     [inbound]  "Yes we'll both be there"
-    [outbound] "Got it. Tuesday May 5 at 11 AM, or Wednesday May 6 at 2 PM — which works?"
+    [outbound] "Got it. Tuesday May 5 at 11 AM, or Wednesday May 6 at 2 PM. Which works better?"
     [inbound]  "Tuesday at 11 works"  ← TRIGGER
   TODAY IS: Wednesday, April 30, 2026
   →
@@ -53,7 +53,7 @@ EXAMPLE A2 (PATH A — Solo Owner scenario):
     [inbound]  "Yeah, 8"
     [outbound] "Perfect. Will you be the only one home for the visit, or is there a spouse or partner to plan around?"
     [inbound]  "Just me, I live alone"
-    [outbound] "Got it. Saturday May 3 at 10 AM or Monday May 5 at 2 PM — which?"
+    [outbound] "Got it. Saturday May 3 at 10 AM or Monday May 5 at 2 PM. Which works better?"
     [inbound]  "Saturday 10"  ← TRIGGER
   →
   {
@@ -78,7 +78,7 @@ EXAMPLE A2 (PATH A — Solo Owner scenario):
 EXAMPLE B1 (PATH B — zero qualifiers — the action 30435 case):
   Conversation history:
     [inbound]  "Hey can you schedule me for Tuesday next week?"
-    [outbound] "Tuesday May 5 works — 10 AM, 2 PM, or 6 PM. Which works for you?"
+    [outbound] "Tuesday May 5 at 10 AM or 2 PM. Which works better?"
     [inbound]  "2 works"  ← TRIGGER
   →
   {
@@ -103,7 +103,7 @@ EXAMPLE C1 (cancellation after pushback — state 2 case B):
     [1] appointment_id="OWd5WhnU2l6x56R9Y9mO" | calendar="Measurement Verification" | start="Tue May 5, 2:00 PM ET" | status="confirmed"   ← an EXISTING visit already confirmed by a team member (display only)
   Conversation history:
     [inbound]  "I need to cancel my appointment"
-    [outbound] "Got it — I see your Measurement Verification on Tuesday May 5 at 2 PM. Mind if I ask what's coming up? Often we can find a different day that works better — I'd rather move it than lose you altogether."
+    [outbound] "I see your Measurement Verification on Tuesday May 5 at 2 PM. Mind if I ask what's coming up? Often we can find a different day that works better. I'd rather move it than lose you altogether."
     [inbound]  "No I really just want to cancel, not reschedule"  ← TRIGGER
   →
   {
@@ -123,9 +123,9 @@ EXAMPLE C2 (reschedule with no qualifying data — PATH B reschedule):
     [1] appointment_id="OWd5WhnU2l6x56R9Y9mO" | calendar="Measurement Verification" | start="Tue May 5, 2:00 PM ET" | status="confirmed"   ← an EXISTING visit already confirmed by a team member (display only)
   Conversation history:
     [inbound]  "Need to cancel my appt"
-    [outbound] "Got it — I see Tuesday May 5 at 2 PM. What's coming up? We could move it to a different day if that helps."
+    [outbound] "I see Tuesday May 5 at 2 PM. What's coming up? We could move it to a different day if that helps."
     [inbound]  "Could we do Saturday instead?"
-    [outbound] "Sure — Saturday May 9 at 10 AM, or Monday May 11 at 2 PM. Either of those?"
+    [outbound] "Sure. Saturday May 9 at 10 AM, or Monday May 11 at 2 PM. Either of those?"
     [inbound]  "Saturday at 10 works"  ← TRIGGER
   TODAY IS: Wednesday, April 30, 2026
   →
