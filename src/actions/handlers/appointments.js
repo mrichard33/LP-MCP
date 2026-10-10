@@ -95,7 +95,7 @@ import { updateGHLContactFields, applyGHLTag, removeGHLTags } from '../../ghl.js
 import { fetchUpcomingAppointments } from '../../knowledge/contact-appointments.js';
 import { isInHomeCalendarId, isGhlOnlyCalendarId, isRehashCalendarId, rehashCalendarId, BOOKING_CALENDARS } from '../../knowledge/booking-calendar-router.js';
 import { callAssigneeFor } from '../../config/rehash-assignee.js';
-import { isInRehash, rehashRoutingMode, rehashTeamUserIds } from '../../agentic/rehash-state.js';
+import { isInRehash, rehashRoutingMode, rehashTeamUserIds, hasPostAppointmentStage } from '../../agentic/rehash-state.js';
 import { notifyRehashCall } from '../../notifications/rehash-call.js';
 import { fetchCurrentLead } from '../../current-lead.js';
 import { markRescheduleInflight } from '../../services/reschedule-inflight.js';
@@ -602,11 +602,26 @@ async function findExistingAppointments(contactId, calendarId) {
  * null when it is not (or the mode is off). Throws on a failed read; the
  * caller reads that as 'unknown', which neither refuses nor redirects.
  */
-async function rehashVisitBlocked(contactId) {
+async function rehashVisitBlocked(contactId, calendarId = null) {
   const mode = rehashRoutingMode();
   if (mode === 'off') return null;
-  const [res, currentLead] = await Promise.all([ghlFetch('GET', `/contacts/${contactId}`), fetchCurrentLead(contactId)]);
-  return isInRehash({ tags: res?.contact?.tags || [], currentLead }) ? mode : null;
+  // An LP read that fails must not hide what the GHL tags already say: the
+  // tags are still checked, and only when they say nothing does the failure
+  // surface (the caller reads a throw as 'unknown').
+  let lpErr = null;
+  const [res, currentLead] = await Promise.all([
+    ghlFetch('GET', `/contacts/${contactId}`),
+    fetchCurrentLead(contactId).catch((e) => { lpErr = e; return null; }),
+  ]);
+  const tags = res?.contact?.tags || [];
+  if (isInRehash({ tags, currentLead })) return mode;
+  // 2026-10-09 (the user): a Confirmation Call for a contact GHL has at
+  // stage:post-appointment is a post-demo call too, so it goes the rehash way
+  // (moved to Rehash Call). Only that calendar: the stage tag alone never
+  // refuses a visit (see hasPostAppointmentStage).
+  if (calendarId === BOOKING_CALENDARS.CONFIRMATION_CALL && hasPostAppointmentStage(tags)) return mode;
+  if (lpErr) throw lpErr;
+  return null;
 }
 
 export async function executeBookAppointment(action, context) {
@@ -622,7 +637,7 @@ export async function executeBookAppointment(action, context) {
   // whose calls must not reach the rehash team. Monica (581695) had her old
   // appointment moved and an LP re-set followed. A failed read books as before
   // (fail-open): the LP lock (src/lp-post-demo-lock.js) stands behind it.
-  const rehashGate = await rehashVisitBlocked(contactId).catch(() => 'unknown');
+  const rehashGate = await rehashVisitBlocked(contactId, calendarId).catch(() => 'unknown');
   const rehashCal = rehashCalendarId();
   if (rehashGate === 'live') {
     if (calendarId === BOOKING_CALENDARS.CONFIRMATION_CALL && rehashCal) {

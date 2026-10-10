@@ -217,6 +217,9 @@ and an LP re-set. Now:
   `book_appointment` for a rehash lead goes only on Rehash Call: a Confirmation Call is moved there at the same time, a visit
   is refused (`skipped_rehash_visit`), and with no `REHASH_CALENDAR_ID` nothing is booked and #contact-rehash is told
   (`skipped_rehash_no_calendar`). A lead not in rehash is never booked on Rehash Call (`skipped_not_rehash`).
+  A Confirmation Call for a contact GHL has at `stage:post-appointment` goes the same way (moved to Rehash Call;
+  the user, 2026-10-09): that tag is read ONLY for this, since GHL workflows own it (F.0 adds it, S1.1/S1.3/S4.5/A.WE
+  remove it); it never puts a contact in rehash, refuses a visit or touches Five9 (`hasPostAppointmentStage`).
 - `REHASH_ROUTING_MODE` off|shadow|live, default shadow (`rehash.would_*` events only). The LP lock is not behind it.
 
 **A post-demo lead is planned as post-demo, never as a new lead (Mark, 2026-10-09).** Five rehash threads got a stock
