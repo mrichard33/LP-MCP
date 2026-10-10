@@ -2,9 +2,10 @@
  * Message Content Scorer — src/message-content-scorer.js
  *
  * Track B confidence-scoring layer for the agentic send_message
- * pipeline. Sits between generation (GPT-4.1, in response-generator.js)
- * and the actual send. Cross-model evaluation: scorer uses Claude so a
- * generator weakness can't hide behind self-evaluation.
+ * pipeline. As of 2026-10 it runs AFTER the send (src/bot-feedback/judge.js),
+ * on the model the llm-client resolves for fn 'message_score'. It is NOT yet
+ * calibrated against human labels: see scripts/judge-calibration.js. Do not
+ * gate sends on it or quote it as a quality number until that report passes.
  *
  * Usage:
  *   import { scoreMessage } from './message-content-scorer.js';
@@ -128,7 +129,7 @@ const FAILURE_REASON_DEFINITIONS = `
 - LOW_TRUST: The reply lacks credibility — vague claims, no specifics, no reference to expertise or proof.
 - LOW_CLARITY: The reply is hard to read, ambiguous, or rambling. The contact would not know exactly what is being said or what to do.
 - NO_FORWARD_MOMENTUM: The reply does not move the conversation forward — no question, no next step, no decision being asked of the contact. Pure fluff.
-- GENERIC_LANGUAGE: The reply could have been written for any company in any industry. No South Florida specificity, no hurricane impact context, no Reece voice.
+- GENERIC_LANGUAGE: The reply could have been written for any company in any industry. No hurricane impact context, no tie to the contact's own home or market, no Reece voice.
 - PREMATURE_CTA: The reply pushes for a booking, call, or sale before the contact is ready (e.g. asking for an appointment from a stage-1 indifferent contact who just expressed initial curiosity).
 - OFF_BRAND_VOICE: The voice doesn't match the expected character (Mark, Randy, or 'we') for this stage and trust level.
 - WRONG_TRUST_TYPE: The reply demonstrates the wrong type of trust for the targeted level (e.g. demonstrating Charisma when Competence is what's required at this point in the journey).
@@ -163,7 +164,7 @@ Dimensions:
 // ─────────────────────────────────────────────────────────────────────
 
 function buildSystemPrompt() {
-  return `You are evaluating outbound replies for Reece Windows & Doors, a South Florida hurricane impact window and door company. The replies are sent via SMS and email by an AI agent representing the company.
+  return `You are evaluating outbound replies for Reece Windows & Doors, a hurricane impact window and door company serving homeowners in Florida, the Houston, TX area and the Winston-Salem, NC area. The replies are sent via SMS and email by an AI agent representing the company.
 
 Your job is to score the proposed reply on 5 dimensions and identify any failure modes from a controlled list. You do not need to suggest fixes. Your output is consumed by a downstream system that retries generation if the score is too low — so be honest, not generous.
 
