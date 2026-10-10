@@ -284,9 +284,20 @@ test('shopping follow-up: "price and the warranty" is what they decide on, not a
 test('financing: the yes survives the figure strip', () => {
   const p = plan({ trigger: 'Do you offer financing?' });
   assert.equal(p.financing_ask, true);
-  const r = enforceNepqPlan("Yes, we offer 0% APR financing, so you can spread the cost out. What's got you looking into windows now?", p);
+  // 2026-10-10: "0% APR" alone is allowed (Mark's ruling, 2026-09-25), so the
+  // strip is exercised with a term on it, which is still a figure.
+  const r = enforceNepqPlan("Yes, we offer 0% APR financing for 18 months, so you can spread the cost out. What's got you looking into windows now?", p);
   assert.equal(r.text, `${LINES.financing_yes} What's got you looking into windows now?`);
   assert.ok(r.changes.includes('financing_yes'));
+});
+
+test('financing: the ruled "0% APR" answer is kept as written (Mark, 2026-09-25)', () => {
+  const p = plan({ trigger: 'Do you offer financing?' });
+  const draft = "Yes, we offer 0% APR financing, so you can spread the cost out. What's got you looking into windows now?";
+  const r = enforceNepqPlan(draft, p);
+  assert.equal(r.text, draft);
+  assert.ok(!r.changes.includes('money_figures'));
+  assert.ok(!r.changes.includes('financing_yes'));
 });
 
 test('a typed day and time with no offer → two real times; with a question, the answer first', () => {

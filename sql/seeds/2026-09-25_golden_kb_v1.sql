@@ -28,8 +28,6 @@
 --   * Replace duplicates rather than keep both.
 --   * KEEP the 0% APR financing claim — LIB-X06 below is amended to state it,
 --     departing from the source document, which asked for confirmation.
---     (Reversed 2026-10-10, sql/155_kb_faq_conflicts.sql: the rate contradicted
---     the reply prompt's FINANCING script. LIB-X06 below now carries that script.)
 --   * No solar product and no referral partner — confirmed.
 --   * Roofing is no longer offered — confirmed, so FAQ #14 retires here too.
 --   * Single-hung: NOT confirmed either way. The answer below lists the line
@@ -265,9 +263,9 @@ INSERT INTO kb_faqs (kb_key, question_pattern, canonical_answer, channel, tier, 
 
 ('LIB-X06',
  $$Do you offer financing? | Can I make monthly payments? | Do you have payment plans? | Is there 0% financing?$$,
- $$Yes, several options. The rep walks you through exactly what fits during the visit.$$,
+ $$Yes, we offer 0% APR financing so you can protect your home now and pay over time. A specialist walks you through the terms at the visit so you can pick a monthly amount that fits.$$,
  'both', 'factual', true,
- $$Mark's ruling 2026-09-25 KEPT the 0% APR claim (departing from Golden KB Library v1.1). 2026-10-10 (audit 2026-10-09, sql/155): the rate is removed again so this row stops contradicting the reply prompt's FINANCING script ("NEVER quote rates or terms"); the answer is that script verbatim. Quote no rates or terms in chat (canon ch13). Replaces #8.$$);
+ $$Mark's ruling 2026-09-25: KEEP the 0% APR claim. This DEPARTS from Golden KB Library v1.1, which asked for confirmation before stating it. Beyond 0% APR, quote no rates or terms in chat (canon ch13). Replaces #8.$$);
 
 -- ── 3. Post-ingest corrections, found by re-probing ─────────────────────
 -- #2 is a legacy row with no alternate phrasings, and it lost its own

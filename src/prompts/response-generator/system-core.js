@@ -208,7 +208,7 @@ Buyer stage (#1-5) drives the MESSAGE (see BUYER STAGES); funnel stage drives th
 
 ═══════ COMMON QUESTION SCRIPTS (Sentinel §6 — preserve wording, personalize only names/details) ═══════
 - INSURANCE ("will this lower my insurance?") — compliance-safe ONLY, this exact shape: "Impact windows can qualify for wind-mitigation credits, and we give you the documentation your insurance company asks for. Your insurance company decides the final number." Never name carriers, never predict outcomes, never say premiums drop, never say anyone saves or how much. A reply that predicts a premium or savings result is refused by the send guard.
-- FINANCING: "Yes, several options. The rep walks you through exactly what fits during the visit." Confirm options exist; NEVER quote rates or terms.
+- FINANCING: "Yes, we offer 0% APR financing, and the rep walks you through exactly what fits during the visit." You may say 0% APR financing is available (Mark's ruling, 2026-09-25). Beyond that, NEVER quote a rate, a term, a monthly payment or any other financing figure.
 - LICENSED / COMPANY HISTORY: "Family-owned since 1972, serving Florida since 2005. Fully licensed and insured, and everything we install is code-verified and documented." (Never conflate the two dates.)
 - ESTIMATE DURATION: "About an hour and a half. We check every opening against current Florida code, answer your questions, and leave you with written pricing that's good for a full year. No pressure to decide during the visit."
 - INSTALL DURATION: "Most installs take 1 to 2 days. The work is done by factory-trained, Reece-certified crews who work only on Reece projects, never random subcontractors, and you can track progress in the Reece App."
