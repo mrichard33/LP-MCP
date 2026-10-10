@@ -363,3 +363,46 @@ test('(7d) a Window Estimate is not touched by the Rehash rule', async () => {
   await executeBookAppointment(action(), {});
   assert.equal(createPosts()[0].body.assignedUserId, undefined);
 });
+
+// ═══ 8. stage:post-appointment keeps a lead off Confirmation Call (the user, 2026-10-09) ═══
+//
+// A post-demo lead never lands on the Confirmation Call calendar, whether it
+// carries the rehash tag or only GHL's stage:post-appointment. The stage tag
+// moves a Confirmation Call to Rehash Call; it never refuses a visit.
+
+async function withRehashLive(fn) {
+  const prev = { mode: process.env.REHASH_ROUTING_MODE, cal: process.env.REHASH_CALENDAR_ID };
+  process.env.REHASH_ROUTING_MODE = 'live';
+  process.env.REHASH_CALENDAR_ID = 'rehashCal1';
+  try { await fn(); } finally {
+    for (const [k, v] of [['REHASH_ROUTING_MODE', prev.mode], ['REHASH_CALENDAR_ID', prev.cal]]) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  }
+}
+
+test('(8) stage:post-appointment + Confirmation Call → booked on Rehash Call instead', async () => {
+  await withRehashLive(async () => {
+    reset({ contact: fullContact({ tags: ['stage:post-appointment'] }) });
+    await executeBookAppointment(confAction(), {});
+    assert.equal(createPosts().length, 1);
+    assert.equal(createPosts()[0].body.calendarId, 'rehashCal1', 'never the Confirmation Call calendar');
+  });
+});
+
+test('(8b) no stage tag → a pre-demo Confirmation Call stays on Confirmation Call', async () => {
+  await withRehashLive(async () => {
+    reset({ contact: fullContact({ tags: [] }) });
+    await executeBookAppointment(confAction(), {});
+    assert.equal(createPosts()[0].body.calendarId, CONFIRMATION_CALL);
+  });
+});
+
+test('(8c) the stage tag alone never refuses a visit', async () => {
+  await withRehashLive(async () => {
+    reset({ contact: fullContact({ tags: ['stage:post-appointment'] }) });
+    await executeBookAppointment(action(), {});
+    assert.equal(createPosts().length, 1);
+    assert.equal(createPosts()[0].body.calendarId, WINDOW_ESTIMATE);
+  });
+});

@@ -99,6 +99,19 @@ export function isInRehash({ tags = [], currentLead = null, nowMs = Date.now(), 
 }
 
 /**
+ * The GHL stage tag F.0 puts on a contact after the appointment. Pure.
+ * The user, 2026-10-09: a post-demo lead never lands on the Confirmation Call
+ * calendar, whether it carries the rehash tag or only this stage tag. It is
+ * read ONLY for that block: GHL workflows own the tag (F.0 adds it; S1.1, S1.3,
+ * S4.5 and A.WE take it off), so we never write it and it never puts a contact
+ * in rehash, refuses a visit or touches Five9.
+ */
+export const POST_APPOINTMENT_STAGE_TAG = 'stage:post-appointment';
+export function hasPostAppointmentStage(tags) {
+  return tagList(tags).includes(POST_APPOINTMENT_STAGE_TAG);
+}
+
+/**
  * What the sweep should do for one contact. Pure.
  * @param {object} a
  * @param {string[]} a.tags          live GHL tags

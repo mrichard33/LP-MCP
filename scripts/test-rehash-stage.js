@@ -224,3 +224,13 @@ test('passSlice rotates so every candidate is reached', () => {
   assert.equal(seen.size, 150);
   assert.deepEqual(passSlice(['a', 'b'], NOW), ['a', 'b']);
 });
+
+// stage:post-appointment (the user, 2026-10-09): read only to keep a post-demo
+// lead off the Confirmation Call calendar; it never puts a contact in rehash.
+test('hasPostAppointmentStage reads the GHL stage tag, case-insensitive', async () => {
+  const { hasPostAppointmentStage, isInRehash } = await import('../src/agentic/rehash-state.js');
+  assert.equal(hasPostAppointmentStage(['Stage:Post-Appointment']), true);
+  assert.equal(hasPostAppointmentStage(['stage:reactivation']), false);
+  assert.equal(hasPostAppointmentStage(undefined), false);
+  assert.equal(isInRehash({ tags: ['stage:post-appointment'] }), false, 'the stage tag alone is not rehash');
+});
