@@ -23,7 +23,8 @@ const { APPROVED_DISCLOSURE_VARIANTS } = await import('../src/prompts/response-g
 const ofLength = (n) => 'We can go over that at the visit. '.repeat(20).slice(0, n).trimEnd().padEnd(n, 'x');
 
 test('the version was bumped for the new check and the cap is the prompt\'s 320', () => {
-  assert.equal(INVARIANTS_VERSION, '2026-10-10.1');
+  // 2026-10-10.2: money_figure now allows the ruled "0% APR" (scripts/test-zero-apr-ruling.js).
+  assert.equal(INVARIANTS_VERSION, '2026-10-10.2');
   assert.equal(SMS_MAX_CHARS, 320);
 });
 

@@ -28,10 +28,10 @@ import { enforcePropertyScope } from '../agentic/property-scope.js';
 import { findUnbackedBookingClaim } from '../agentic/booking-claim.js';
 import { enforceCallTiming, promisedCallback, enforceRehashCallTiming } from '../agentic/team-hours.js';
 import { enforceOneAsk } from '../agentic/one-ask.js';
-import { dropUnaskedCallOffer, leadWantsCall, MONEY_RX, URGENCY_RX, CLAIMS_RX } from '../agentic/nepq-planner.js';
+import { dropUnaskedCallOffer, leadWantsCall, isMoneyFigure, URGENCY_RX, CLAIMS_RX } from '../agentic/nepq-planner.js';
 
 /** Bump when a check is added or changed, so scorecards from two versions are not compared as one. */
-export const INVARIANTS_VERSION = '2026-10-10.1';
+export const INVARIANTS_VERSION = '2026-10-10.2';
 
 /** The prompt's own SMS ceiling (CHANNEL CONSTRAINTS: "320 max"). */
 export const SMS_MAX_CHARS = 320;
@@ -114,7 +114,9 @@ export function checkReply(reply, ctx = {}) {
     for (const change of voice.changes) fail(`human_voice:${change}`, change);
 
     if (!ctx.allowFigures) {
-      const money = sentences(text).find(s => MONEY_RX.test(s));
+      // The same predicate the plan enforcer drops on, so a finished reply is a
+      // fixed point of the guard: "0% APR" alone is allowed (Mark, 2026-09-25).
+      const money = sentences(text).find(s => isMoneyFigure(s));
       if (money) fail('money_figure', money);
     }
     const urgency = sentences(text).find(s => URGENCY_RX.test(s) || CLAIMS_RX.test(s));

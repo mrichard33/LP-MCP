@@ -1162,6 +1162,33 @@ export function planNepqTurn({
 // figures). The live chat sent "$89–$149 per month, no money down" — that
 // sentence goes, whatever its source.
 export const MONEY_RX = /\$\s?\d|\b\d[\d,]*\s*(?:dollars|bucks)\b|\bper\s+month\b|\d[\d,.]*\s*(?:a|\/)\s*month\b|\/\s?mo\b|\bmonthly\s+payments?\b|\bno\s+money\s+down\b|\b0\s?%|\bapr\b|\b\d+\s?%\s+off\b|\bsave\s+(?:up\s+to\s+)?\d/i;
+
+// 2026-10-10 (Mark's ruling of 2026-09-25, reconfirmed 2026-10-10): the bot
+// may say Reece offers "0% APR" financing, and NO other rate, term, payment or
+// financing figure. MONEY_RX matched both "0%" and "APR", so the plan enforcer
+// had been deleting "Yes, we offer 0% APR financing" since 2026-10-02 and the
+// FINANCING script could not be said. MONEY_RX itself is unchanged: the one
+// phrase is lifted out first, and the sentence is judged on what is left.
+//   - Not after a digit, a dot or a comma, so "5.0% APR" / "10% APR" are not it.
+//   - Once the phrase is gone, ANY digit left in the sentence keeps the whole
+//     sentence a figure: "0% APR for 18 months", "0% APR and $99 a month".
+//     Conservative on purpose: a false flag only drops a sentence.
+//   - "0% interest", "zero percent" and every other spelling are NOT the
+//     ruled phrase and stay figures.
+const ZERO_APR_RX = /(?<![\d.,])\b0\s?%\s?APR\b/gi;
+
+/**
+ * Pure: is this sentence a money / financing figure the bots may not send?
+ * MONEY_RX, with exactly one exception: the ruled phrase "0% APR".
+ */
+export function isMoneyFigure(sentence) {
+  const s = String(sentence ?? '');
+  if (!MONEY_RX.test(s)) return false;
+  const rest = s.replace(ZERO_APR_RX, ' ');
+  if (rest === s) return true;
+  if (/\d/.test(rest)) return true;
+  return MONEY_RX.test(rest);
+}
 export const URGENCY_RX = /\bonly\s+\d+\s+(?:spots?|slots?|openings?)\s+left\b|\bspots?\s+(?:are\s+)?filling\b|\bprices?\s+(?:are\s+)?going\s+up\b|\bact\s+(?:now|fast)\b|\blimited\s+time\b|\bbefore\s+(?:it'?s|its)\s+too\s+late\b|\bdon'?t\s+miss\b|\b(?:calendar|schedule|calls?)(?:'s|\s+is|\s+are)?\s+(?:tight|packed|full|filling(?:\s+up)?|booking\s+up(?:\s+fast)?|moving\s+fast)\b|\bpeak\s+season\b|\bspeeding\s+up\s+these\s+decisions\b/i;
 // 2026-10-02 funnel audit: the SMS bot leaned on "our calendar's tight right
 // now" / "calls are booking up fast" in most booking turns. Invented scarcity.
@@ -1454,7 +1481,8 @@ export function dropUnsafeSentences(sentences, { allowFigures = false, keepCallO
     out = out.filter(s => !pred(s));
     if (out.length !== before) changes.push(tag);
   };
-  if (!allowFigures) drop(s => MONEY_RX.test(s), 'money_figures');
+  // isMoneyFigure = MONEY_RX minus the one ruled phrase, "0% APR" (Mark, 2026-09-25).
+  if (!allowFigures) drop(s => isMoneyFigure(s), 'money_figures');
   // 2026-10-02 re-run: "Our calendar's tight right now, so the quickest way
   // to grab a day is here: <link>" was the whole reply, so dropping it left
   // nothing and the original shipped. Cut the pressure clause and keep the rest.
