@@ -26,12 +26,12 @@ import { humanizeReply } from '../agentic/human-voice.js';
 import { enforceTeamVoice } from '../agentic/team-voice.js';
 import { enforcePropertyScope } from '../agentic/property-scope.js';
 import { findUnbackedBookingClaim } from '../agentic/booking-claim.js';
-import { enforceCallTiming, promisedCallback } from '../agentic/team-hours.js';
+import { enforceCallTiming, promisedCallback, enforceRehashCallTiming } from '../agentic/team-hours.js';
 import { enforceOneAsk } from '../agentic/one-ask.js';
 import { dropUnaskedCallOffer, leadWantsCall, MONEY_RX, URGENCY_RX, CLAIMS_RX } from '../agentic/nepq-planner.js';
 
 /** Bump when a check is added or changed, so scorecards from two versions are not compared as one. */
-export const INVARIANTS_VERSION = '2026-10-06.2';
+export const INVARIANTS_VERSION = '2026-10-09.1';
 
 // A merge tag or a script blank that reached the customer: "{{contact.first_name}}",
 // "[YOUR NAME]" (prospect 462947's LP note, 2026-10-05).
@@ -58,6 +58,7 @@ function sentences(text) {
  * @param {boolean}[ctx.allowFigures]   a money figure is allowed (the customer's own estimate)
  * @param {boolean}[ctx.allowMultiAsk]  the one approved two-item ask (cancel identity ask)
  * @param {string} [ctx.allowName]      a personal name this line may use (rehash rep)
+ * @param {boolean}[ctx.rehash]         a rehash (post-demo) lead; undefined skips the rehash call-timing check
  * @param {boolean}[ctx.callbackFiled]  this turn filed a callback (a hand-off): any call it promises is backed
  * @returns {{ pass: boolean, violations: Array<{code: string, detail: string}>, skipped: string[], metrics: {chars: number, questions: number} }}
  */
@@ -127,6 +128,11 @@ export function checkReply(reply, ctx = {}) {
 
   if (ctx.nowMs === undefined) skipped.push('call_timing');
   else if (enforceCallTiming(text, ctx.nowMs).changed) fail('call_promised_outside_team_hours', text);
+
+  // A rehash (post-demo) lead is called by the rehash rep when their calendar
+  // is open, never "right now" (2026-10-09, Monica).
+  if (ctx.rehash === undefined) skipped.push('rehash_call_timing');
+  else if (ctx.rehash === true && enforceRehashCallTiming(text).changed) fail('call_promised_now_to_rehash_lead', text);
 
   // A hand-off that filed a callback this turn backs whatever call it promises,
   // however it is worded ("Let me have someone from our team call you", the

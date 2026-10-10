@@ -157,7 +157,9 @@ const CALL_PROMISE_RX = /\b(?:call|calls|calling|phone|reach\s+out|reach\s+you|g
 // …made BY US. 2026-10-03 replay: "What made you reach out today?" read as a
 // promised call and went out as "…made you reach out tomorrow at 9 AM ET?".
 // The call has to come from us, someone on the team, or to the lead.
-const FROM_US_RX = /\b(?:we|i|our\s+(?:\w+\s+)?(?:team|rep|office|specialist)|someone|somebody|a\s+(?:team\s+member|rep|specialist|member\s+of\s+(?:our|the)\s+team)|they|he|she)(?:'ll|’ll|'m|’m|\s+will|\s+(?:is|are|am)\s+(?:going\s+to|getting)|\s+can|\s+should|\s+would|\s+have)\b|\byou(?:'ll|’ll|\s+will|\s+should)\s+(?:get|receive|hear)\b|\bexpect\s+(?:a\s+call|to\s+hear)\b|\b(?:i'?ve|we'?ve)\s+(?:passed|flagged)\b/i;
+// 2026-10-09 (Monica): "We're having someone call you back right now." read
+// as no promise at all ("we're" was not a doer), so no timing guard saw it.
+const FROM_US_RX = /\b(?:we|i|our\s+(?:\w+\s+)?(?:team|rep|office|specialist)|someone|somebody|a\s+(?:team\s+member|rep|specialist|member\s+of\s+(?:our|the)\s+team)|they|he|she)(?:'ll|’ll|'m|’m|\s+will|(?:\s+(?:is|are|am)|'re|’re|'s|’s)\s+(?:going\s+to|getting|having|arranging|sending)|\s+can|\s+should|\s+would|\s+have)\b|\byou(?:'ll|’ll|\s+will|\s+should)\s+(?:get|receive|hear)\b|\bexpect\s+(?:a\s+call|to\s+hear)\b|\b(?:i'?ve|we'?ve)\s+(?:passed|flagged)\b/i;
 const promisesCall = (s) => CALL_PROMISE_RX.test(s) && FROM_US_RX.test(s);
 
 // A phone call from us, promised as a statement (2026-10-03, Mark's shutters
@@ -204,11 +206,52 @@ export function enforceCallTiming(text, nowMs = Date.now()) {
  * new draft). Pure.
  */
 export function softenCallTiming(text) {
+  return replaceCallImmediacy(text, 'soon');
+}
+
+/**
+ * The immediacy in every promised call replaced with `replacement` ("right
+ * now" → "on Monday"). softenCallTiming is this with "soon". Pure.
+ */
+export function replaceCallImmediacy(text, replacement) {
   const body = String(text || '');
   let out = body;
   for (const s of body.split(/(?<=[.!?])\s+/)) {
     if (!promisesCall(s)) continue;
-    out = out.replace(s, s.replace(new RegExp(IMMEDIATE, 'i'), 'soon'));
+    out = out.replace(s, s.replace(new RegExp(IMMEDIATE, 'i'), replacement));
   }
   return out;
+}
+
+/**
+ * When the rep is next free, as words that fit "call you back ___": "on
+ * Monday", "tomorrow", or null (no opening read, or the opening is today,
+ * which stays "soon"). The DAY only: no clock time is promised for a call
+ * nobody booked. Pure.
+ */
+export function rehashOpeningDay(slot) {
+  if (!slot) return null;
+  if (slot.rel === 'today') return null;
+  if (slot.rel === 'tomorrow') return 'tomorrow';
+  const dow = slot.dayOfWeek || (String(slot.day || '').match(/^[A-Za-z]+/) || [])[0];
+  return dow ? `on ${dow}` : null;
+}
+
+/**
+ * A post-demo lead is never promised a call "right now" (2026-10-09, Monica).
+ * The rehash rep calls, and only when the Rehash Call calendar shows them
+ * free: the team being open says nothing about the rep. Every promised call
+ * with an immediacy ("right now", "shortly", "today", "in the next few
+ * minutes") names the day of the rep's first real opening instead ("on
+ * Monday"), or "soon" when no opening was read. Pure.
+ *
+ * @param {string} text
+ * @param {{ nextOpening?: object|null }} [opts]  the first Rehash Call slot read
+ * @returns {{ text: string, changed: boolean }}
+ */
+export function enforceRehashCallTiming(text, { nextOpening = null } = {}) {
+  const body = String(text || '');
+  const day = rehashOpeningDay(nextOpening);
+  const out = day ? replaceCallImmediacy(body, day) : softenCallTiming(body);
+  return { text: out, changed: out !== body };
 }
