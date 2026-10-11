@@ -107,13 +107,13 @@ const NOW = Date.parse('2026-10-03T13:19:00Z');
 
 test('a reply still being written is in_flight, not unanswered', () => {
   const young = sendStateFromRows([{ status: 'executing', created_at: '2026-10-03T13:17:30Z' }], { now: NOW, inFlightMs: 300_000 });
-  assert.deepEqual(young, { hasCompletedSend: false, hasInFlightSend: true });
+  assert.deepEqual(young, { hasCompletedSend: false, hasInFlightSend: true, hasHeldSend: false });
   assert.equal(classifyReply({ actionTaken: 'x', tags: [], ...young }), 'in_flight');
   const stuck = sendStateFromRows([{ status: 'executing', created_at: '2026-10-03T13:10:00Z' }], { now: NOW, inFlightMs: 300_000 });
   assert.equal(stuck.hasInFlightSend, false, 'a send older than its budget is stuck, not in flight');
   assert.equal(classifyReply({ actionTaken: 'x', tags: ['agentic-active'], ...stuck }), 'unanswered');
   const skipped = sendStateFromRows([{ status: 'skipped', created_at: '2026-10-03T13:16:28Z' }], { now: NOW, inFlightMs: 300_000 });
-  assert.deepEqual(skipped, { hasCompletedSend: false, hasInFlightSend: false }, 'a dropped draft is not an answer');
+  assert.deepEqual(skipped, { hasCompletedSend: false, hasInFlightSend: false, hasHeldSend: false }, 'a dropped draft is not an answer');
 });
 
 test('the watchdog flags a reply 3 minutes old with only a skipped send (the 2026-10-03 thread)', async () => {

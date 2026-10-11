@@ -2751,4 +2751,19 @@ export const STARTUP_MIRRORS = [
     fail: '[Migration] tool_audit_log (sql/153) not applied — tools keep working, audit rows are dropped with a warning until applied from the dashboard:',
     level: 'warn',
   },
+  // agentic_no_reply_followups (sql/157, 2026-10-11 — the file is the source of
+  // truth). One row per welcome text the lead has not answered
+  // (src/jobs/no-reply-followup.js). Until it exists no row is written and no
+  // follow-up is sent; the reply path never fails on it — hence warn.
+  {
+    name: 'sql/157',
+    expects: {
+      tables: ['agentic_no_reply_followups'],
+      indexes: ['agentic_no_reply_followups_due_idx'],
+    },
+    sqlFile: 'sql/157_agentic_no_reply_followups.sql',
+    ready: '[Migration] agentic_no_reply_followups (sql/157) ready',
+    fail: '[Migration] agentic_no_reply_followups (sql/157) not applied — the opener hold logs only and no follow-up is sent until it is applied from the dashboard:',
+    level: 'warn',
+  },
 ];

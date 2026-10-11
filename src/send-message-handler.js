@@ -342,6 +342,9 @@ import { purposeForLegacyMode } from './services/may-message.js';
 import { applySendGate } from './services/send-gate-report.js';
 // 2026-10-07 — a promised call is an owned task; never promised twice.
 import { guardRepeatPromise, recordPromiseIfAny } from './services/promised-callbacks-io.js';
+// 2026-10-11 (Javier): the opener race — pre-send recheck and the held reply.
+import { openerAlreadyAsked, leadReplyState } from './agentic/discovery-discipline.js';
+import { enqueueNoReplyFollowup, openerHoldMode } from './jobs/no-reply-followup.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY || '';
 const GHL_LOCATION_ID = process.env.GHL_LOCATION_ID || 'SsBG7j5KQAIP1SFP2Sca';
@@ -3457,6 +3460,14 @@ export async function executeSendMessage(action, context) {
       return { skipped: true, reason: 'lp_note_dq_already_handed_off', contact_id: contactId, channel, lp_note_dq: { signal: generated.lp_note_dq.signal } };
     }
 
+    // 2026-10-11 (Javier): the lead's message came before the welcome text and
+    // they have not answered it (OPENER_HOLD_MODE=live). The generator queued
+    // the one follow-up (src/jobs/no-reply-followup.js); nothing goes out now.
+    if (!generationErr && generated?.opener_hold) {
+      console.log(`[SendMessage] ⏸️ opener_hold: ${contactId} action ${action.id} — reply held, follow-up queued`);
+      return { skipped: true, reason: 'opener_hold', contact_id: contactId, channel, opener_hold: generated.opener_hold };
+    }
+
     // 2026-09-24 — a handoff the bot also answers (handoff-policy.js): apply
     // the handoff tag, card and, where a person must act, the alert, then
     // carry on and send the reply. Fail-soft: the reply matters more.
@@ -3702,6 +3713,31 @@ export async function executeSendMessage(action, context) {
       ? Date.parse(newestInboundMsg.dateAdded || newestInboundMsg.dateUpdated || '')
       : NaN;
     const staleMs = (parseInt(process.env.MAX_TRIGGER_STALENESS_MIN || '10', 10)) * 60 * 1000;
+
+    // ── Opener race, pre-send recheck (2026-10-11, Javier) ──
+    // The welcome SMS can land WHILE the model writes: Javier's came 9s after
+    // his "Hi". The generator decided from the thread it read at the start;
+    // this is the fresh read, so the same typed timing fields are recomputed
+    // here (AIOS CANON.RULE.052). Only an AI reply to an inbound; never the
+    // follow-up itself, which carries a provided message and no trigger.
+    if (generated && replyTriggerMessage && channel !== 'livechat' && recentMessages.length) {
+      const holdMode = openerHoldMode();
+      if (holdMode !== 'off') {
+        const freshOpener = openerAlreadyAsked({ conversation: recentMessages, nowMs });
+        const freshReply = leadReplyState({ conversation: recentMessages, triggerMessage: replyTriggerMessage, opener: freshOpener });
+        if (freshReply.trigger_predates_opener) {
+          const held = holdMode === 'live';
+          await enqueueNoReplyFollowup({
+            contactId, conversationId: null, discipline: { reply: freshReply, opener: freshOpener },
+            mode: holdMode, surface: 'pre_send', held, triggerPreview: replyTriggerMessage,
+          }).catch(err => console.warn(`[SendMessage] opener hold enqueue failed for ${contactId}: ${err.message}`));
+          if (held) {
+            console.log(`[SendMessage] ⏸️ opener_hold (pre-send): ${contactId} action ${action.id} — the welcome text landed after the lead's message; reply held, follow-up queued`);
+            return { skipped: true, reason: 'opener_hold', contact_id: contactId, channel, opener_hold: { surface: 'pre_send', opener_at: new Date(freshReply.opener_ms).toISOString() } };
+          }
+        }
+      }
+    }
 
     // ── Outbound corpus: GHL thread (24h) MERGED with the pipeline's own
     // Supabase record of what it just sent (execution_result.sent_body).

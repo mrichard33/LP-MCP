@@ -40,6 +40,8 @@
  *   Fix 5  openerAlreadyAsked / findRepeatedOpener — do not repeat the GHL
  *          workflow's opener.
  *   Fix 6  findInsuranceOutcomeClaims — carrier decides, never a prediction.
+ *   Fix 7  leadReplyState / findFalseReplyAck — never thank a lead for a
+ *          reply they did not send (Javier, 2026-10-11).
  *
  * The established-facts ledger (src/agentic/established-facts.js) stays the
  * record of WHAT is known. This module adds what the ledger does not carry:
@@ -54,7 +56,7 @@ import {
 } from './conversation-repetition.js';
 import { isSoloOwnerStatement } from './established-facts.js';
 
-export const DISCOVERY_DISCIPLINE_VERSION = '1.0';
+export const DISCOVERY_DISCIPLINE_VERSION = '1.1';
 
 /**
  * The one approved insurance sentence (Mark, 2026-09-26 handoff). Rendered in
@@ -476,13 +478,62 @@ export function openerAlreadyAsked({ conversation = [], nowMs = null, windowMs =
     if (t.ms !== null && Number.isFinite(nowMs)) {
       const age = nowMs - t.ms;
       if (age >= 0 && age <= windowMs) {
-        return { asked: true, text: t.text.slice(0, 200), age_sec: Math.round(age / 1000) };
+        return { asked: true, text: t.text.slice(0, 200), age_sec: Math.round(age / 1000), at_ms: t.ms };
       }
       continue;
     }
-    if (t === newest) return { asked: true, text: t.text.slice(0, 200), age_sec: null };
+    if (t === newest) return { asked: true, text: t.text.slice(0, 200), age_sec: null, at_ms: t.ms };
   }
-  return { asked: false, text: null, age_sec: null };
+  return { asked: false, text: null, age_sec: null, at_ms: null };
+}
+
+// GHL activity rows ("Opportunity created") carry a timestamp and read as an
+// outbound turn; they are not a message anyone sent the lead.
+const ACTIVITY_TYPE_RX = /^TYPE_ACTIVITY/i;
+
+/**
+ * Has the lead said anything AFTER our most recent outbound?
+ * AIOS: CANON.RULE.052 — timing is a typed field decided in code, not by the model.
+ *
+ * 2026-10-11 (Javier, r5hMYoAdxhAPmj9U5Mjv): web-chat "Hi" at 20:51:40Z, GHL
+ * welcome SMS at 20:51:49Z, bot reply at 20:52:26Z said "thanks for reaching
+ * back out". He had replied to nothing. Timestamps decide, not array order
+ * (GHL lists can arrive newest-first).
+ *
+ * replied_since_outbound: true  → a real reply to our newest message exists
+ *                         false → our message is the newest turn; nobody answered it
+ *                         null  → no usable timestamps; callers FAIL OPEN (old behaviour)
+ * trigger_predates_opener: the trigger inbound is older than an opener that
+ *                          has since been sent, and nothing came in after it
+ */
+export function leadReplyState({ conversation = [], triggerMessage = '', opener = null } = {}) {
+  const raw = (Array.isArray(conversation) ? conversation : []).filter(m => !ACTIVITY_TYPE_RX.test(String(m?.messageType || '')));
+  const turns = normalizeTurns(raw).filter(t => t.ms !== null);
+  const newest = (list) => list.reduce((a, t) => (!a || t.ms > a.ms ? t : a), null);
+  const lastOut = newest(turns.filter(t => t.direction === 'outbound'));
+  const lastIn = newest(turns.filter(t => t.direction === 'inbound'));
+  let replied = null;
+  if (lastOut) replied = lastIn ? lastIn.ms > lastOut.ms : false;
+  else if (lastIn) replied = true;
+
+  const trigger = String(triggerMessage || '').trim();
+  const openerMs = opener?.asked && Number.isFinite(opener.at_ms) ? opener.at_ms : null;
+  const triggerTurn = trigger
+    ? newest(turns.filter(t => t.direction === 'inbound' && t.text === trigger))
+    : null;
+  const inboundAfterOpener = openerMs !== null
+    && turns.some(t => t.direction === 'inbound' && t.ms > openerMs);
+  const triggerPredatesOpener = openerMs !== null && !!triggerTurn
+    && triggerTurn.ms < openerMs && !inboundAfterOpener;
+
+  return {
+    replied_since_outbound: replied,
+    trigger_predates_opener: triggerPredatesOpener,
+    last_outbound_ms: lastOut?.ms ?? null,
+    last_inbound_ms: lastIn?.ms ?? null,
+    opener_ms: openerMs,
+    trigger_ms: triggerTurn?.ms ?? null,
+  };
 }
 
 // ── the bundle ──────────────────────────────────────────────────────────
@@ -510,6 +561,7 @@ export function buildDiscipline({
   const probe = problemProbeState({ triggerMessage, conversation });
   const decisionMakers = decisionMakerState({ conversation, triggerMessage, established });
   const opener = openerAlreadyAsked({ conversation, nowMs });
+  const reply = leadReplyState({ conversation, triggerMessage, opener });
   // The DM question is a booking-relevant question. It may be asked only when
   // a booking ask is allowed and it has never been asked (Fix 3, items 1 and 5).
   const dmAskAllowed = booking.allowed && decisionMakers.status === 'unknown';
@@ -519,6 +571,7 @@ export function buildDiscipline({
     probe,
     decision_makers: { ...decisionMakers, ask_allowed: dmAskAllowed },
     opener,
+    reply,
   };
 }
 
@@ -722,6 +775,55 @@ export function repeatedOpenerNote(openerText, ageSec) {
     `just a greeting or a yes, respond briefly and wait — a short line with no question is a valid message — ` +
     `or ask ONE different discovery question (which room, how long, what is the worst one).`
   );
+}
+
+// ── Fix 7: never thank a lead for a reply they did not send ─────────────
+// AIOS: CANON.RULE.019 (independent deterministic guard), CANON.RULE.060
+// (one re-prompt, then deterministic strip).
+
+const FALSE_REPLY_ACK_RX = /\bthanks?\s+(?:you\s+)?(?:so\s+much\s+)?for\s+(?:reaching|getting|writing|coming|texting|circling)\s+back\b|\bthanks?\s+(?:you\s+)?for\s+(?:the|your)\s+(?:reply|response|quick\s+reply|message\s+back)\b|\bthanks?\s+(?:you\s+)?for\s+(?:replying|responding|following\s+up)\b|\b(?:good|great|nice)\s+to\s+hear\s+(?:back\s+)?from\s+you\b|\bglad\s+you\s+(?:got|wrote|reached)\s+back\b/i;
+
+/**
+ * Sentences that thank the lead for a reply they never sent. Only fires when
+ * the reply state is KNOWN to be "no reply" — null (no timestamps) fails open.
+ * @param {string} message
+ * @param {object} reply  leadReplyState() output
+ */
+export function findFalseReplyAck(message, reply = {}) {
+  if (reply?.replied_since_outbound !== false && !reply?.trigger_predates_opener) return [];
+  return splitSentences(message).filter(s => FALSE_REPLY_ACK_RX.test(s));
+}
+
+export function falseReplyAckNote() {
+  return (
+    `Your previous draft thanked the customer for getting back to you, but they have not replied to our ` +
+    `last message. Remove the thanks. Keep a plain greeting with their first name and keep the rest of the ` +
+    `answer as it was. Do not say "reaching back out", "getting back", "your reply", or anything that ` +
+    `implies they answered.`
+  );
+}
+
+/** Deterministic: "Hi Javier, thanks for reaching back out." → "Hi Javier." */
+export function stripFalseReplyAck(message) {
+  const out = splitSentences(message).map(s => {
+    if (!FALSE_REPLY_ACK_RX.test(s)) return s;
+    const greet = s.match(/^(?:hi|hey|hello|good\s+(?:morning|afternoon|evening))\b[^,.!?]{0,30}/i);
+    return greet ? `${greet[0].trim()}.` : '';
+  }).filter(Boolean).join(' ').trim();
+  return SIGNATURE_ONLY_RX.test(out) ? '' : out;
+}
+
+/**
+ * The one no-reply follow-up (Mark, 2026-10-11). Deterministic, not generated.
+ * AIOS: CANON.RULE.052 (fixed copy removes the failure class).
+ * Stage #1, trust L1, one discovery question, no booking ask, no link.
+ * Copy reviewed under antifragile-copywriter + NEPQ discovery discipline.
+ * Ship verbatim — do not edit without Mark.
+ */
+export function buildNoReplyFollowup(firstName) {
+  const raw = String(firstName || '').trim();
+  const name = raw ? raw.charAt(0).toUpperCase() + raw.slice(1) : 'there';
+  return `Hi ${name}, just making sure our text came through. Is it more about how your windows or doors look, or something that isn't working right?`;
 }
 
 // A bare sign-off left behind once the sentences around it are gone.

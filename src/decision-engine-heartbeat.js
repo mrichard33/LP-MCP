@@ -94,6 +94,7 @@ import {
 } from './rule-fail-closed-alerts.js';
 // 2026-09-02 — per-contact reply SLA (Jacqueline Branham). Shadow by default.
 import { runReplySlaWatchdog } from './jobs/reply-sla-watchdog.js';
+import { runNoReplyFollowup } from './jobs/no-reply-followup.js';
 
 // 2026-06-05: promoted from 6-min-late FAILOVER to PRIMARY driver. The n8n
 // cron (ERnvX5hp6i90VVWc) silently went dormant on 2026-05-22 while still
@@ -525,6 +526,12 @@ export async function runDecisionEngineHeartbeat({ force = false } = {}) {
   // must run before the skip branch. Never throws into the heartbeat.
   lastReplySlaCheck = await runReplySlaWatchdog()
     .catch((err) => { console.warn(`[DecisionEngineHeartbeat] reply SLA watchdog threw (ignored): ${err.message}`); return { error: err.message }; });
+
+  // 2026-10-11 — the one no-reply follow-up after a held opener-race reply
+  // (src/jobs/no-reply-followup.js). Same placement as the reply SLA: a held
+  // reply leaves no pending event. Does nothing unless OPENER_HOLD_MODE=live.
+  await runNoReplyFollowup()
+    .catch((err) => { console.warn(`[DecisionEngineHeartbeat] no-reply follow-up threw (ignored): ${err.message}`); });
 
   // 2026-09-12 — fail-closed watchdog. Same placement reasoning again: a
   // suppressed rule leaves no pending event (the source event is processed

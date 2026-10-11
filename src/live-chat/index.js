@@ -46,6 +46,7 @@ import { extractPreferredTime } from '../services/preferred-time.js';
 import { BOOKING_CALENDARS, inHomeCalendarFor } from '../knowledge/booking-calendar-router.js';
 import { routeNepqHandoff } from '../agentic/nepq-handoff.js';
 import { addGHLNote } from '../ghl.js';
+import { enqueueNoReplyFollowup } from '../jobs/no-reply-followup.js';
 
 async function fetchContact(contactId) {
   const res = await ghlFetch('GET', `/contacts/${contactId}`, null, { priority: 'high', maxWaitMs: 1500 });
@@ -413,6 +414,7 @@ export function productionLaneDeps() {
     findConversation,
     recentTurns,
     buildContext: (contactId) => buildLeadContext(contactId, { includeConversation: false, skipCache: true }),
+    recordOpenerHold: (a) => enqueueNoReplyFollowup(a),
     prewarmEmbedding: prewarmQueryEmbedding,
     buildKbPack,
     classify: classifyInbound,
