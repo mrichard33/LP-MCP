@@ -18,7 +18,8 @@
 // leads over several years), we build a MERGED object per GHL contact:
 //   - Status fields (disposition, rep, promoter, source) → from NEWEST lead
 //   - Appointment fields → from the lead with the most recent appointment
-//   - "Ever" fields (demo completed, closed won) → true if ANY lead has flag
+//   - "Ever" fields (closed won) → true if ANY lead has flag
+//   - Demo completed → the CURRENT sales cycle only (2026-10-11, see below)
 //   - Value fields (job value) → the CURRENT job's value (see below)
 //   - Count fields (total appointments) → COUNT across all leads
 //   - Engagement (call count, last contact) → shared at prospect level
@@ -52,7 +53,7 @@ import supabase from './supabase.js';
 import { updateGHLContactFields } from './ghl.js';
 import { buildGHLFieldPayload, computeFieldHash, getConfiguredFieldCount } from './ghl-field-map.js';
 import { latestJobValue } from './lp-job-value.js';
-import { leadHadDemo } from './demo-truth.js';
+import { demoInCurrentCycle } from './demo-truth.js';
 import { pickCurrentLead } from './current-lead.js';
 import { executeAddTag } from './actions/handlers/tags.js';
 import { emitEvent, dispositionPriority } from './event-emitter.js';
@@ -73,14 +74,16 @@ const DISPOSITION_FIELD_ID = 'URWTGtobi9a9Y7gwGxC8';
 // it keeps the tag in step with the "LP Demo Completed" field it was pushed with.
 const DEMO_TAG_SYNC_MODE = String(process.env.DEMO_TAG_SYNC_MODE || 'shadow').toLowerCase();
 
-async function maybeStampDemoTag(ghlContactId, lead) {
-  if (!lead?.demo_completed || DEMO_TAG_SYNC_MODE === 'off') return;
-  if (DEMO_TAG_SYNC_MODE !== 'live') {
+async function maybeStampDemoTag(ghlContactId, lead, deps = {}) {
+  const mode = deps.demoTagMode || DEMO_TAG_SYNC_MODE;
+  const addTag = deps.executeAddTag || executeAddTag;
+  if (!lead?.demo_completed || mode === 'off') return;
+  if (mode !== 'live') {
     console.log(`[FieldSync] DEMO TAG (shadow): would add lp-demo-completed to ${ghlContactId}`);
     return;
   }
   try {
-    await executeAddTag({ target_id: ghlContactId, action_payload: { tag: 'lp-demo-completed' } });
+    await addTag({ target_id: ghlContactId, action_payload: { tag: 'lp-demo-completed' } });
   } catch (err) {
     console.warn(`[FieldSync] demo tag add failed for ${ghlContactId}: ${err.message}`);
   }
@@ -124,10 +127,16 @@ export function buildMergedLead(leads, jobs = null) {
     ? withAppt.sort((a, b) => new Date(b.appointment_date) - new Date(a.appointment_date))[0]
     : null;
 
-  // Aggregate "ever" flags across ALL leads.
   // Demo truth comes from demo-truth.js (appointment/lead dispositions), never
   // from LP's sat flag: LP marks NOC as sat=true and resets sat on rebook.
-  const everDemoCompleted = sorted.some(leadHadDemo);
+  //
+  // 2026-10-11 — the CURRENT sales cycle's demo, not any lead's ever. A 2024
+  // OPPFDN made Frances Overton (wkUjSVicxP6918ll9nHc) "LP Demo Completed = Yes"
+  // on the day she filled in the calculator, and maybeStampDemoTag (below, live)
+  // tagged her lp-demo-completed from it. A demo on an older lead still counts
+  // within DEMO_CYCLE_DAYS of the current lead (rebooks, duplicate leads).
+  // EXPECT A ONE-TIME PUSH WAVE: ~1,198 contacts' field flips Yes → No.
+  const cycleDemoCompleted = demoInCurrentCycle(leads);
   const everClosedWon = sorted.some(l => l.closed_won === true);
 
   // The CURRENT job's value — not a max, not a sum. See the v5.1 note above.
@@ -164,8 +173,8 @@ export function buildMergedLead(leads, jobs = null) {
     appointment_date: latestAppt?.appointment_date || null,
     appointment_set: totalAppointments > 0,
 
-    // "Ever" aggregates — across ALL leads
-    demo_completed: everDemoCompleted,
+    // Demo — current sales cycle only; closed_won — across ALL leads
+    demo_completed: cycleDemoCompleted,
     closed_won: everClosedWon,
 
     // Value — MAX across all leads
@@ -321,7 +330,8 @@ async function maybeEmitDispositionChanged(ghlContactId, newCode, oldCode, lead,
  * v5: Emits lp.disposition_changed when disposition_code changes.
  */
 export async function syncLeadFieldsToGHL(lead, ghlContactId, storedHash, deps = {}) {
-  // deps: test seam (updateGHLContactFields, emitEvent, supabase), per CLAUDE.md.
+  // deps: test seam (updateGHLContactFields, emitEvent, supabase, executeAddTag,
+  // demoTagMode), per CLAUDE.md.
   const pushFields = deps.updateGHLContactFields || updateGHLContactFields;
   const db = deps.supabase !== undefined ? deps.supabase : supabase;
   if (!ghlContactId || !lead) {
@@ -377,7 +387,7 @@ export async function syncLeadFieldsToGHL(lead, ghlContactId, storedHash, deps =
     // disposition as null so the event fires unconditionally for new codes.
     const priorDisposition = storedHash === null ? null : (lead.disposition_code || null);
     await maybeEmitDispositionChanged(ghlContactId, incomingDisposition, priorDisposition, lead, deps.emitEvent || emitEvent);
-    await maybeStampDemoTag(ghlContactId, lead);
+    await maybeStampDemoTag(ghlContactId, lead, deps);
 
     return { pushed: true, hash: newHash };
   } else if (result === 'not_found') {

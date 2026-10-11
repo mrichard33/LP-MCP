@@ -824,6 +824,7 @@ export async function processProspect(prospect, { skipGHL = false, payloadHash =
 
   // ─── v8.0: Track each lead's tag + creation date for active-entry resolution ──
   const leadSourceTracker = [];
+  const day15Candidates = [];
 
   for (const lead of leads) {
     const lpLeadId = String(getField(lead, 'id', 'lds_id', 'LeadID'));
@@ -1152,12 +1153,23 @@ export async function processProspect(prospect, { skipGHL = false, payloadHash =
     }
 
     if (!existing?.lp_day15_triggered && ghlId) {
-      const { checkDay15Handoff } = await import('./sync-triggers.js');
-      await checkDay15Handoff(
-        lpLeadId, ghlId,
-        getField(lead, 'entrydate', 'EntryDate'),
-        getField(lead, 'disposition', 'Disposition'),
-      );
+      day15Candidates.push({
+        lpLeadId,
+        entryDate: getField(lead, 'entrydate', 'EntryDate'),
+        disposition: getField(lead, 'disposition', 'Disposition'),
+      });
+    }
+  }
+
+  // 2026-10-11 — Day 15 runs AFTER every lead on the prospect is upserted.
+  // checkDay15Handoff asks lp_leads for the contact's current lead; checked
+  // inside the loop, an older lead could be judged before a brand-new sibling
+  // row existed and fire on a contact whose live lead is hours old (Frances
+  // Overton, wkUjSVicxP6918ll9nHc).
+  if (day15Candidates.length > 0) {
+    const { checkDay15Handoff } = await import('./sync-triggers.js');
+    for (const c of day15Candidates) {
+      await checkDay15Handoff(c.lpLeadId, ghlId, c.entryDate, c.disposition);
     }
   }
 

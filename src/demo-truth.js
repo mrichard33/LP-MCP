@@ -14,6 +14,8 @@
 // lp_leads.demo_completed is NOT this. That column keeps meaning "the current
 // appointment sat" (sync-leads.js writes it from LP's sat flag) and is left
 // alone on purpose.
+import { pickCurrentLead } from './current-lead.js';
+
 const DEFAULT_DEMO_DISPOSITIONS = 'Sale,OPPFDN,NoRehash,FDNS,SW,PM';
 
 export const DEMO_DISPOSITIONS = new Set(
@@ -52,4 +54,65 @@ export function demoEvidence(leads) {
     if (appt) return `appt:${String(appt.disposition).trim()}`;
   }
   return null;
+}
+
+// ─── 2026-10-11 — a demo counts for the CURRENT sales cycle only ────────────
+// Frances Overton (wkUjSVicxP6918ll9nHc) filled in the calculator today (LP lead
+// 582736, Data). LP sync linked her nine older leads to the same contact, one of
+// them a 2024 Canvass OPPFDN (339624), and "any lead ever had a demo" turned her
+// into a post-demo contact five minutes after checkout: lp-demo-completed, "LP
+// Demo Completed = Yes", O.0 routing, no CALL NOW for the calculator.
+//
+// The 2026-09-30 any-lead rule still stands for what it was written for: a demoed
+// lead that is rebooked, or a duplicate lead made right after the demo, must not
+// lose the demo (428 contacts had their only demo on an older lead within 30 days
+// of their newest one). So a demo counts when it is on the contact's current lead
+// (src/current-lead.js, the one definition), or on an older lead whose demo is
+// no more than DEMO_CYCLE_DAYS before the current lead was created. Older than
+// that, the current lead is a new sales cycle (the user's ruling, 2026-10-11).
+// "Ever" fields (LP Ever Sat / Ever Sold / Total Appointments) stay prospect-wide.
+
+export const DEMO_CYCLE_DAYS = 30;
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+const ms = (v) => {
+  const n = v ? new Date(v).getTime() : NaN;
+  return Number.isFinite(n) ? n : null;
+};
+
+/** When the lead's demo happened (ms), or null when no date is on record. */
+export function leadDemoAtMs(lead) {
+  if (!lead) return null;
+  const apptDates = appointmentsOf(lead)
+    .filter((a) => isDemoDisposition(a?.disposition))
+    .map((a) => ms(a?.apptdate ?? a?.appointment_date))
+    .filter((n) => n !== null);
+  if (apptDates.length) return Math.max(...apptDates);
+  return ms(lead.demo_date) ?? ms(lead.appointment_date) ?? ms(lead.created_at_lp);
+}
+
+/**
+ * The lead that carries the current cycle's demo, or null when the cycle has
+ * none. Soft-deleted leads are ignored, as fetchCurrentLead ignores them.
+ */
+export function currentCycleDemoLead(leads) {
+  if (!Array.isArray(leads) || leads.length === 0) return null;
+  const live = leads.filter((l) => l && !l.lp_deleted_at);
+  const pool = live.length ? live : leads.filter(Boolean);
+  const current = pickCurrentLead(pool);
+  if (!current) return null;
+  if (leadHadDemo(current)) return current;
+  const createdMs = ms(current.created_at_lp);
+  // No creation date on the current lead: we cannot place the cycle, so fall
+  // back to the old any-lead answer rather than drop a demo we cannot date.
+  const from = createdMs === null ? -Infinity : createdMs - DEMO_CYCLE_DAYS * DAY_MS;
+  return pool.find((l) => {
+    if (l === current || !leadHadDemo(l)) return false;
+    const at = leadDemoAtMs(l);
+    return at === null || at >= from; // undated demo: keep it (old behaviour)
+  }) || null;
+}
+
+export function demoInCurrentCycle(leads) {
+  return currentCycleDemoLead(leads) !== null;
 }
