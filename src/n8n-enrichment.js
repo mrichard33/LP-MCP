@@ -11,7 +11,16 @@
  * 5. Build enriched record (aggregate leads, appointments, jobs, calls)
  * 6. Calculate highest stage, market, sale amounts, etc.
  * 7. Apply lp-linked + lp-enriched tags via additive POST (NEVER via PUT)
- * 8. Return customFields-only payload ready for GHL contact update
+ * 8. Return a tagless payload ready for GHL contact update: customFields, plus
+ *    the empty standard fields LP can fill (v5.0)
+ *
+ * v5.0 — 2026-10-11 — Fill empty names / email / address from LP.
+ *   `ghl_update_body` now carries firstName, lastName, email, address1, city,
+ *   state and postalCode at the TOP LEVEL next to customFields, each ONLY
+ *   where the live GHL contact has nothing (src/services/lp-identity-fill.js).
+ *   n8n's "Update GHL Contact" node PUTs the whole body, so no workflow edit
+ *   is needed. The response lists what was filled in `identity_filled`.
+ *   Still no `tags` (v3.0).
  *
  * v4.0 — 2026-07-26 — Verified prospect matching (cross-linked contact fix).
  *   PROBLEM: parseGetCustomers3() returned `data[0]` — the first record LP
@@ -92,6 +101,8 @@ import { normalizePhone, getField, extractArray, isTransientNetworkError } from 
 import { latestJobValue } from './lp-job-value.js';
 import { contactHadDemo } from './demo-truth.js';
 import { withGhlToken } from './ghl-rate-limiter.js';
+import { buildIdentityFill, dropTakenEmail } from './services/lp-identity-fill.js';
+import { getHlSupabase } from './admin/hl-client.js';
 
 const LP_API_BASE = process.env.LP_API_BASE_URL || 'https://api.leadperfection.com';
 const GHL_API_KEY = process.env.GHL_API_KEY;
@@ -615,6 +626,39 @@ function enrichFromLP(enrichedRecord, rawLead) {
   };
 }
 
+// ─── Identity fill (v5.0, 2026-10-11) ────────────────────────────
+
+/** HL mirror for the email-duplicate check, or null when unset. */
+function hlOrNull() {
+  try { return getHlSupabase(); } catch { return null; }
+}
+
+/**
+ * The standard fields LP may fill on this contact: firstName, lastName,
+ * email, address1, city, state, postalCode — each only where GHL is empty.
+ * An email another contact already holds is dropped (GHL would refuse the
+ * whole PUT, customFields included). Never throws: a failed read is {}.
+ *
+ * @returns {Promise<{ fill: object, emailDropped: string|null }>}
+ */
+async function computeIdentityFill(contactId, enriched, ghlContact = null, deps = {}) {
+  const read = deps.ghlGet || ghlGet;
+  try {
+    let c = ghlContact;
+    if (!c) {
+      const res = await read(contactId);
+      c = res?.contact || null;
+    }
+    if (!c || !c.id) return { fill: {}, emailDropped: null }; // no verified read → no write
+    const raw = buildIdentityFill(c, enriched);
+    const { fill, email_dropped } = await dropTakenEmail(raw, contactId, { hl: deps.hl !== undefined ? deps.hl : hlOrNull() });
+    return { fill, emailDropped: email_dropped };
+  } catch (e) {
+    console.warn(`[n8n/enrich] identity fill skipped for ${contactId}: ${e.message}`);
+    return { fill: {}, emailDropped: null };
+  }
+}
+
 // ─── Main route handler ──────────────────────────────────────────
 
 export function registerN8nEnrichRoute(app) {
@@ -682,10 +726,12 @@ export function registerN8nEnrichRoute(app) {
       // A contact carrying NEITHER is not identifiable. We do NOT fall back to
       // a name search: that is precisely how anonymous webchat contacts
       // ("guest visitor NNN") inherited unrelated prospects. Exit to the 404.
+      let ghlContactRead = null; // reused by the identity fill below
       if (!resolvedProspectId && contact_id) {
         try {
           const ghlContact = await ghlGet(contact_id);
           const c = ghlContact?.contact || ghlContact || {};
+          ghlContactRead = c;
           const ghlPhone = c.phone || '';
           const ghlEmail = c.email || '';
           if (ghlPhone || ghlEmail) {
@@ -769,10 +815,27 @@ export function registerN8nEnrichRoute(app) {
         customFields.push({ key: 'lp_lead_id', field_value: lpFields.lp_lead_id });
       }
 
+      // v5.0 — 2026-10-11 — identity fill. The name, email and address read
+      // from LP above used to stop at `enriched_summary`; the PUT carried
+      // customFields only, so a contact created nameless by SMS / chat stayed
+      // nameless after enrichment (a9eG41qtxCqMEXxbbD2l had no name at its
+      // demo while LP lead 581424 said Andrew Marcus). They now go on the PUT
+      // as TOP-LEVEL standard fields, fill-empty-only (lp-identity-fill.js):
+      // a real value on the contact is never replaced. The prospect here is
+      // verified (prospect_id / lead_id on the contact, or a verified phone /
+      // email match — the v4.0 rules), which is what makes LP's name safe to
+      // write. A failed contact read fills nothing and enrichment goes on.
+      const { fill: identityFill, emailDropped } = await computeIdentityFill(contact_id, enriched, ghlContactRead);
+
       // v3.0 — `ghl_update_body` no longer contains `tags`. The n8n workflow's
       // downstream PUT /contacts/{id} will therefore not wipe the tag array.
       // Tags are applied above via additive POST /contacts/{id}/tags.
-      const ghlUpdateBody = { customFields };
+      const ghlUpdateBody = { ...identityFill, customFields };
+      delete ghlUpdateBody.tags; // belt — never on a PUT body
+      const identityFilled = Object.keys(identityFill);
+      if (identityFilled.length) {
+        console.log(`[n8n/enrich] identity fill for ${contact_id}: ${identityFilled.join(',')}`);
+      }
 
       const elapsed = Date.now() - startTime;
       res.json({
@@ -782,6 +845,8 @@ export function registerN8nEnrichRoute(app) {
         lp_lead_id: lpFields.lp_lead_id || null,
         resolved_via: resolvedVia,
         ghl_update_body: ghlUpdateBody,
+        identity_filled: identityFilled,
+        identity_email_dropped: emailDropped,
         lp_tags_applied: lpTagsApplied,
         lp_tags_status: lpTagsStatus,
         enriched_summary: {
@@ -821,4 +886,5 @@ export const __testing = {
   prospectEmail,
   prospectId,
   pickVerifiedProspect,
+  computeIdentityFill,
 };

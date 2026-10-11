@@ -78,6 +78,8 @@ import { appointmentDelta } from '../appointment-dates.js';
 import { emitDispositionBackfill } from '../sync-leads.js';
 import { notifyBackstopRun } from './backstop-notify.js';
 import { utcToLpStoredIso } from '../lp-dates.js';
+import { cleanName, buildIdentityFill, dropTakenEmail, putWithIdentityFill } from './lp-identity-fill.js';
+import { getHlSupabase } from '../admin/hl-client.js';
 
 // LP custom field IDs (canonical: src/actions/handlers/lp-lead.js:65,
 // src/lp-appointment-sync.js:205-207). Written as { id, field_value } —
@@ -88,6 +90,9 @@ const LP_PROSPECT_ID_FIELD = 'ZRQAVrzhtzApzLlHmT87';
 // Only live-appointment dispositions. NOT CXL — no value creating a contact
 // for a cancelled appointment; NOT DNC/Issue/others.
 const DISPOSITIONS = ['Set', 'Cnf', 'Verif'];
+// Both scans read the same columns. email/address/city/state/zip were added
+// 2026-10-11 for the identity fill on the link path (lp-identity-fill.js).
+const LEAD_COLUMNS = 'lp_lead_id, ghl_contact_id, disposition_code, appointment_date, created_at_lp, first_name, last_name, email, address, city, state, zip, phone, lead_source, lead_source_detail, lp_prospect_id';
 const DEFAULT_HORIZON_DAYS = 45;
 // Absolute upper bound enforced REGARDLESS of the caller's horizon_days. This
 // — not the caller-supplied window — is the guard that keeps garbage-dated LP
@@ -237,11 +242,9 @@ export function backstopTagsFor(leadSource, leadSourceDetail = null, { suppressO
 // ─── Name hygiene ────────────────────────────────────────────────────
 // Light only: trim + collapse whitespace, and drop pure-junk placeholders to
 // empty (the existing n8n enrich/name-normalization pipeline does the rest).
-const NAME_JUNK = new Set(['n/a', 'na', 'n\\a', '..', '...', '?', '-', '.', 'none', 'null', 'unknown', 'test']);
-export function cleanName(s) {
-  const t = String(s || '').replace(/\s+/g, ' ').trim();
-  return NAME_JUNK.has(t.toLowerCase()) ? '' : t;
-}
+// 2026-10-11: lives in lp-identity-fill.js now, so the create path here and
+// the fill-empty path on a linked contact clean a name the same way.
+export { cleanName };
 
 // ─── Window predicates ───────────────────────────────────────────────
 
@@ -341,7 +344,7 @@ export async function scanContactBackstopCandidates({
   while (true) {
     const { data, error } = await supabase
       .from('lp_leads')
-      .select('lp_lead_id, ghl_contact_id, disposition_code, appointment_date, created_at_lp, first_name, last_name, phone, lead_source, lead_source_detail, lp_prospect_id')
+      .select(LEAD_COLUMNS)
       .is('ghl_contact_id', null)
       .in('disposition_code', DISPOSITIONS)
       .gte('appointment_date', fromIso)
@@ -397,7 +400,7 @@ export async function scanIntakeBackstopCandidates({
   while (true) {
     let q = supabase
       .from('lp_leads')
-      .select('lp_lead_id, ghl_contact_id, disposition_code, appointment_date, created_at_lp, first_name, last_name, phone, lead_source, lead_source_detail, lp_prospect_id')
+      .select(LEAD_COLUMNS)
       .is('ghl_contact_id', null)
       .in('disposition_code', INTAKE_DISPOSITIONS)
       .gte('created_at_lp', fromIso);
@@ -479,6 +482,36 @@ function stampFieldsFor(lead, contact) {
   return stamp;
 }
 
+/** HL mirror client for the email-duplicate check, or null when unset. */
+function hlOrNull() {
+  try { return getHlSupabase(); } catch { return null; }
+}
+
+/**
+ * The link-path write (2026-10-11): the LP id stamp AND the identity fill in
+ * ONE PUT. The fill is fill-empty-only (lp-identity-fill.js) and the link is
+ * verified — the contact came from a last-10-digit phone match
+ * (pickPhoneMatch) — so LP's name may go onto it. Before this, a contact that
+ * Simpletext / SMS / chat had created nameless stayed nameless after the
+ * backstop linked it (a9eG41qtxCqMEXxbbD2l, LP lead 581424, demoed with no
+ * name). A dry run computes the fill and writes nothing.
+ */
+async function writeLinkFields(lead, contactId, contact, { dryRun }) {
+  const stamp = stampFieldsFor(lead, contact);
+  let fill = buildIdentityFill(contact, lead);
+  let emailDropped = null;
+  if (fill.email) ({ fill, email_dropped: emailDropped } = await dropTakenEmail(fill, contactId, { hl: hlOrNull() }));
+  if (dryRun) return { would_fill: fill, email_dropped: emailDropped };
+  const res = await putWithIdentityFill(contactId, stamp.length ? { customFields: stamp } : {}, fill, ghlFetch);
+  if (res.filled.length) {
+    console.log(`[LpContactBackstop] identity fill contact=${contactId} lead=${lead.lp_lead_id} fields=${res.filled.join(',')}`);
+  }
+  if (res.fill_error) {
+    console.warn(`[LpContactBackstop] identity fill refused for contact=${contactId} lead=${lead.lp_lead_id} (stamp kept): ${res.fill_error}`);
+  }
+  return { filled: res.filled, fill_error: res.fill_error, email_dropped: emailDropped };
+}
+
 
 /**
  * Should this lead's NEW contact be created suppressed?
@@ -535,15 +568,14 @@ export async function processOneLead({
   let action = null; // 'linked' | 'created'
   let suppression = { suppress: false, reason: null };
 
+  let identity = null; // writeLinkFields() result on the link paths
+
   if (match) {
     contactId = match.id;
     action = 'linked';
     const full = await ghlFetch('GET', `/contacts/${contactId}`);
     const contact = full?.contact || full || {};
-    if (!dryRun) {
-      const stamp = stampFieldsFor(lead, contact);
-      if (stamp.length) await ghlFetch('PUT', `/contacts/${contactId}`, { customFields: stamp });
-    }
+    identity = await writeLinkFields(lead, contactId, contact, { dryRun });
     contactCache.set(contactId, contact); // prime reconciler's DNC read
   } else if (!dryRun) {
     suppression = shouldSuppressOutbound(lead, { suppressOutbound, freshHours });
@@ -583,7 +615,11 @@ export async function processOneLead({
       action = 'linked';
       suppression = { suppress: false, reason: null }; // linked, not created
       const full = await ghlFetch('GET', `/contacts/${contactId}`);
-      contactCache.set(contactId, full?.contact || full || {});
+      const contact = full?.contact || full || {};
+      // Same write as the match branch: this contact was found by the same
+      // verified phone search, it just raced in after the first one.
+      identity = await writeLinkFields(lead, contactId, contact, { dryRun });
+      contactCache.set(contactId, contact);
     }
   } else {
     // Dry-run with no match: would create. Report what the tags WOULD be so a
@@ -654,6 +690,10 @@ export async function processOneLead({
     appointment_result: apptResult,
     suppressed: suppression.suppress || undefined,
     suppress_reason: suppression.reason || undefined,
+    identity_filled: identity?.filled?.length ? identity.filled : undefined,
+    identity_fill_error: identity?.fill_error || undefined,
+    would_fill: identity?.would_fill && Object.keys(identity.would_fill).length ? identity.would_fill : undefined,
+    email_dropped: identity?.email_dropped || undefined,
     dry_run: dryRun || undefined,
   };
 }

@@ -374,6 +374,17 @@ export const JOBS = Object.freeze([
     isEnabled: (env) => String(env.REHASH_ROUTING_MODE || 'shadow').toLowerCase().trim() !== 'off',
   },
   {
+    id: 'lp-identity-fill-sweep',
+    label: 'Nameless GHL contacts get the name (and empty email / address) from their linked LP lead',
+    group: 'lp-intake',
+    cadence: 'every 30 min',
+    enabledEnv: 'LP_IDENTITY_FILL_MODE',
+    // A MODE (2026-10-11): off | shadow | live, default live (fill-empty-only).
+    // Mirrors identityFillMode() in src/jobs/lp-identity-fill-sweep.js — only 'off' stops it.
+    enabledDefault: true,
+    isEnabled: (env) => String(env.LP_IDENTITY_FILL_MODE || 'live').toLowerCase().trim() !== 'off',
+  },
+  {
     id: 'post-issue-rebook-retry',
     label: 'Post-issue LP rebooks: retry a failed read or send before #contact-center is asked',
     group: 'lp-intake',
