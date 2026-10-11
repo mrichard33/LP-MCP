@@ -9,6 +9,7 @@
  * Run: node --test scripts/test-post-demo-turn.js
  */
 import test from 'node:test';
+import { REHASH_STAGES } from '../src/agentic/rehash-nepq.js';
 import assert from 'node:assert/strict';
 import {
   detectDeferral, isAcknowledgment, isSignOffLine, postDemoPlannerMode, POST_DEMO_QUESTIONS, pendingDeferral,
@@ -111,7 +112,9 @@ test('thread A: "Thank you I will." → a short thanks, never a discovery questi
   assert.equal(p.step, 'post_demo_ack');
   assert.equal(p.booking.allowed, false);
   assert.deepEqual(p.slots_to_offer, []);
-  assert.ok(POST_DEMO_QUESTIONS.includes(p.post_demo_question), 'at most one proposal question');
+  // 2026-10-11: a rehash lead gets the post-demo track's proposal question
+  // (rehash-nepq.js); any other post-demo lead one of POST_DEMO_QUESTIONS.
+  assert.ok(POST_DEMO_QUESTIONS.includes(p.post_demo_question) || REHASH_STAGES.some(s => s.example === p.post_demo_question), 'at most one proposal question');
   const text = enforce("Of course! What's bothering you most about your windows or doors right now?", p);
   assert.ok(noStock(text), text);
   assert.ok(text.trim().length > 0);

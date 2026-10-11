@@ -244,3 +244,45 @@ test('objections: a spouse named in passing is not one; signed elsewhere and a d
   assert.equal(rehashNepqTurn({ trigger: 'We signed with another company', nowMs: NOW }).stage, 'signed_elsewhere');
   assert.equal(rehashNepqTurn({ trigger: 'Follow up in November please', nowMs: NOW }).stage, 'follow_up_date');
 });
+
+// ── the first live simulation (2026-10-11, sim_mv3y3shp) ───────────────────
+
+test('sim: "Thanks for checking in" gets the proposal question, not "Talk soon."', () => {
+  const p = plan('Thanks for checking in', []);
+  assert.equal(p.step, 'post_demo');
+  assert.equal(p.rehash_question, 'Did you get a chance to look over the proposal?');
+  // A bare thank-you is the ack step and asks the same thing.
+  assert.equal(plan('Thank you', []).post_demo_question, 'Did you get a chance to look over the proposal?');
+  const e = enforceNepqPlan('Anytime. Talk soon.', p);
+  assert.equal(e.text, 'Anytime. Did you get a chance to look over the proposal?');
+});
+
+test('sim: "best deal" is not the answer to "we got another quote"', () => {
+  const conv = [out('Did you get a chance to look over the proposal?')];
+  const p = plan('We got another quote from a different company that was lower', conv);
+  assert.equal(p.rehash_stage, 'objection');
+  const e = enforceNepqPlan("How do they compare, out of curiosity? I want to make sure you're getting the best deal possible.", p);
+  assert.equal(e.text, 'How do they compare, out of curiosity?');
+});
+
+test('sim: the bridge turn asks for the call', () => {
+  const conv = [out('Did you get a chance to look over the proposal?'), inn('We got another quote'), out('How do they compare, out of curiosity?')];
+  const p = plan('Theirs was about 3k less', conv);
+  assert.equal(p.rehash_stage, 'bridge');
+  const e = enforceNepqPlan("That gap matters. I want to make sure you're getting the best deal possible.", p);
+  assert.match(e.text, /best deal possible\. Would a quick call help\?$/);
+});
+
+test('sim: a yes two messages after the bridge gets the real call times', () => {
+  const callSlots = { calendarId: CAL, rep: JOHN, repName: 'John', offer: ALL.slice(0, 2), all: ALL };
+  const conv = [BRIDGE, inn('Their warranty is shorter'), out('That gap matters.')];
+  const p = plan('Yes that would help', conv, callSlots);
+  assert.equal(p.step, 'rehash_offer');
+  assert.equal(p.slots_to_offer.length, 2);
+});
+
+test('a post-appointment lead that is not rehash keeps the old post-demo plan (no track)', () => {
+  const p = planNepqTurn({ channel: 'sms', trigger: 'Thanks for checking in', conversation: [], discipline: { booking: { allowed: false } }, nowMs: NOW, postDemo: true, rehashRep: null, rehash: false });
+  assert.equal(p.rehash_stage, undefined);
+  assert.notEqual(p.post_demo_question, 'Did you get a chance to look over the proposal?');
+});

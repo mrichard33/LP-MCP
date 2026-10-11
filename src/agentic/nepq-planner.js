@@ -35,7 +35,7 @@ import { enforceOneAsk } from './one-ask.js';
 import { isKnockComplaint } from './do-not-knock.js';
 import { detectDeferral, pendingDeferral, isAcknowledgment, isSignOffLine, POST_DEMO_QUESTIONS } from './post-demo-turn.js';
 import { PURCHASED_ELSEWHERE_RX } from './purchased-elsewhere.js';
-import { rehashNepqTurn } from './rehash-nepq.js';
+import { rehashNepqTurn, bridgedRecently, BEST_DEAL_RX, PRE_BRIDGE_STAGES } from './rehash-nepq.js';
 
 export { isKnockComplaint };
 
@@ -548,6 +548,9 @@ export function planNepqTurn({
   // 2026-10-09 (Mark): the lead already had the in-home demo (rehash, or past
   // the appointment). rehashRep is the rep the reply is written as, if named.
   postDemo = false, rehashRep = null,
+  // 2026-10-11: a rehash lead (not just past the appointment): the post-demo
+  // NEPQ track (rehash-nepq.js) applies. Defaults to "a rep is named".
+  rehash = null,
   // 2026-10-09 (the user): the rep's real Rehash Call openings
   // ({ offer: [2], all: [...] }, rehash-slots.js), or null for none.
   callSlots = null,
@@ -780,7 +783,11 @@ export function planNepqTurn({
       if (near.length === 2) return offerPlan(near, LINES.offer_slots(near, counters.slot_offers));
     }
     // Yes to our call offer, a call asked for, or "can we set up a time".
-    const yesToCall = CALL_OFFER_SENTENCE_RX.test(lastOut) && (YES_RX.test(now) || MAYBE_RX.test(now)) && !isNo(now, lastOut);
+    // 2026-10-11 live simulation: "Yes that would help" two messages after the
+    // "best deal possible" bridge got "I'll have John give you a quick call"
+    // and no times. A bridge in either of our last two messages counts.
+    const bridged = CALL_OFFER_SENTENCE_RX.test(lastOut) || bridgedRecently(outbound.map(m => m.text));
+    const yesToCall = bridged && (YES_RX.test(now) || MAYBE_RX.test(now)) && !isNo(now, lastOut);
     if ((askedForCall || yesToCall || scheduleAsk) && offer.length === 2) {
       return offerPlan(offer, LINES.offer_slots(offer, counters.slot_offers));
     }
@@ -826,20 +833,26 @@ export function planNepqTurn({
     //     conversation is, for the logs and the stop rule. Two no's in a row
     //     on the rehash line: one short line, no question, no call pitch.
     const track = rehashNepqTurn({ conversation, trigger: now, nowMs });
-    plan.rehash_stage = track.stage;
-    if (track.stage === 'stop') {
+    const onTrack = rehash ?? !!rehashRep;
+    if (onTrack) plan.rehash_stage = track.stage;
+    // The track's question for this stage, unless one of our last three asked it.
+    const trackQ = onTrack && ['connection', 'situation', 'problem', 'solution'].includes(track.stage) && track.example
+      && !lastThreeOut.some(t => norm(t).includes(norm(track.example))) ? track.example : null;
+    if (onTrack && track.stage === 'stop') {
       return pd({ step: 'post_demo_stop', required_move: 'close', call_offer_ok: false, fixed_line: `Understood${hi}. I'm here if anything changes.` });
     }
     // 4. A thank-you: thanks back, and at most one question about the
     //    proposal (none if one went out in our last three, or they asked us to wait).
     if (isAcknowledgment(now)) {
       const askedRecently = lastThreeOut.some(t => POST_DEMO_QUESTIONS.some(q => norm(t).includes(norm(q))));
-      const question = (askedRecently || plan.pending_deferral) ? null : pickFresh([...POST_DEMO_QUESTIONS], plan.recent_outbound, plan.variant_seed);
+      // 2026-10-11: the post-demo track's question for where they are
+      // ("Did you get a chance to look over the proposal?") when it has one.
+      const question = (askedRecently || plan.pending_deferral) ? null : (trackQ || pickFresh([...POST_DEMO_QUESTIONS], plan.recent_outbound, plan.variant_seed));
       return pd({ step: 'post_demo_ack', required_move: 'answer', post_demo_question: question, ack_line: `Of course${hi}.` });
     }
     // 5. Anything else: answer it. The rehash goal (a call with the rep) and its
     //    rehash_call companion are unchanged.
-    return pd({ step: 'post_demo', required_move: 'answer' });
+    return pd({ step: 'post_demo', required_move: 'answer', ...(trackQ && !plan.pending_deferral ? { rehash_question: trackQ } : {}) });
   }
 
   if (objType === 'price' && priceLines >= 2) return handoff('price_insist');
@@ -1577,6 +1590,13 @@ export function enforceNepqPlan(draft, plan, { allowFigures = false, known = {} 
     } else if (plan.step === 'post_demo_ack' && !plan.post_demo_question) {
       drop(s => s.includes('?'), 'post_demo_no_question');
     }
+    // 2026-10-11 (rehash NEPQ handoff): "the best deal possible" only at the
+    // bridge. The live simulation sent it as the answer to "we got another
+    // quote", in place of "How do they compare?", and the bridge turn after it
+    // then had nothing left to say.
+    if (plan.rehash_stage && PRE_BRIDGE_STAGES.has(plan.rehash_stage) && sentences.some(s => !BEST_DEAL_RX.test(s))) {
+      drop(s => BEST_DEAL_RX.test(s), 'best_deal_before_bridge');
+    }
   }
   // 2b. "Do you offer financing?" keeps its yes when the figure strip took the
   // answer sentence (2026-10-02 simulation: "Yes, we offer 0% APR financing"
@@ -1637,6 +1657,20 @@ export function enforceNepqPlan(draft, plan, { allowFigures = false, known = {} 
   body = sentences.join(' ').trim();
   // A post-demo thank-you that lost everything to the drops: thanks back.
   if (!body && plan.post_demo && plan.ack_line) { body = plan.ack_line; changes.push('ack_line'); }
+  // 2026-10-11 live simulation: "Thanks for checking in" got "Anytime. Talk
+  // soon." The planned proposal question goes on; a sign-off in its way goes.
+  const trackQuestion = plan.step === 'post_demo_ack' ? plan.post_demo_question : plan.step === 'post_demo' ? plan.rehash_question : null;
+  if (trackQuestion && plan.rehash_stage && !body.includes('?')) {
+    const kept = splitSentences(body).filter(s => !isSignOffLine(s) && !/^talk\s+soon\b/i.test(s));
+    body = [...kept, trackQuestion].join(' ').trim();
+    changes.push('post_demo_question_added');
+  }
+  // The bridge turn asks for the call (the same simulation: "Worth seeing if
+  // we can close that difference." and no question).
+  if (plan.post_demo && plan.rehash_stage === 'bridge' && plan.step === 'post_demo' && body && !body.includes('?')) {
+    body = `${body} Would a quick call help?`;
+    changes.push('rehash_bridge_ask_added');
+  }
 
   // 5a. Holding a time: their question answered, then the same ask again.
   if (plan.reask_line && !body.includes(plan.reask_line)) {

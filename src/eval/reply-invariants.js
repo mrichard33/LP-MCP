@@ -61,6 +61,7 @@ function sentences(text) {
  * @param {boolean}[ctx.allowFigures]   a money figure is allowed (the customer's own estimate)
  * @param {boolean}[ctx.allowMultiAsk]  the one approved two-item ask (cancel identity ask)
  * @param {string} [ctx.allowName]      a personal name this line may use (rehash rep)
+ * @param {boolean}[ctx.callOfferOk]    the plan's goal is a call (a post-demo lead), so an offer is never unasked
  * @param {boolean}[ctx.rehash]         a rehash (post-demo) lead; undefined skips the rehash call-timing check
  * @param {boolean}[ctx.callbackFiled]  this turn filed a callback (a hand-off): any call it promises is backed
  * @returns {{ pass: boolean, violations: Array<{code: string, detail: string}>, skipped: string[], metrics: {chars: number, questions: number} }}
@@ -146,7 +147,7 @@ export function checkReply(reply, ctx = {}) {
   // A hand-off that filed a callback this turn backs whatever call it promises,
   // however it is worded ("Let me have someone from our team call you", the
   // 2026-10-06 baseline run).
-  if (email || ctx.callbackFiled === true) { /* listed above, or backed */ } else if (!Array.isArray(ctx.conversation)) skipped.push('unasked_call_offer');
+  if (email || ctx.callbackFiled === true || ctx.callOfferOk === true) { /* listed above, backed, or the plan's goal (post-demo, 2026-10-11) */ } else if (!Array.isArray(ctx.conversation)) skipped.push('unasked_call_offer');
   else {
     const wants = leadWantsCall(ctx.conversation, ctx.inbound || '');
     // Only an OFFER of a call counts ("Want someone to call you?", "A quick
