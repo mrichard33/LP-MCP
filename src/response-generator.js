@@ -401,6 +401,7 @@ import { contactRecheckLine, recheckHint, RECHECK_RX } from './agentic/contact-c
 import { smsBookingTurn, enforceBookingFacts, bookingFactsNote } from './agentic/sms-booking-turn.js';
 import { LINES as NEPQ_LINES } from './agentic/nepq-planner.js';
 import { isCustomerP2 } from './agentic/lead-state/signals/context-reader.js';
+import { isUnsoldPostDemo, lpSold, postDemoOwnerName, replaceSalesRepFollowUp } from './agentic/post-demo-owner.js';
 import { postDemoPlannerMode } from './agentic/post-demo-turn.js';
 import { rehashCallSlotsMode, readRehashCallSlots, rehashCallBooking } from './agentic/rehash-slots.js';
 import { isInRehash, rehashLeadFromContext, rehashRoutingMode } from './agentic/rehash-state.js';
@@ -1448,6 +1449,13 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
   // acknowledgment has no room for a broadcast-handoff preamble, and pushing
   // both blocks would hand the model contradictory openers.
   const ackOnly = opts.recommendedAction === 'escalate_to_rep';
+  // 2026-10-11 (the user): after an unsold demo the rehash team owns the lead,
+  // not the sales rep. Every customer-facing owner below follows this.
+  const unsoldPostDemo = isUnsoldPostDemo({
+    postAppointment: derivePostAppointment(context, opts.contextSnapshot).post,
+    rehash: !!opts.rehash?.active,
+    sold: lpSold(context?.lp) || isCustomerP2(context),
+  });
 
   // v3.15.1: Email reply opener awareness — select the opener based on who
   // AUTHORED (signed) the email the lead is replying to (email channel only).
@@ -1509,7 +1517,9 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
     // The human who OWNS the deal — the field rep (Beverly), not the in-office
     // sender. "Beverly has your file" is the useful sentence; "Mark has your
     // file" is the bot naming itself.
-    const owner = resolveOwningRepName(context);
+    // 2026-10-11: after an unsold demo that is the rehash team, never the
+    // sales rep from the visit.
+    const owner = unsoldPostDemo ? postDemoOwnerName(opts.rehash?.repName) : resolveOwningRepName(context);
     parts.push(...P.acknowledgmentOnlyConduct(opts.escalationCategory, owner));
   }
 
@@ -1536,8 +1546,11 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
     }
     // 2026-10-01: in F.0 the next step IS a call with the rehash rep, so the
     // generic "the rep is sending your proposal" close does not apply.
-    if (!opts.rehash?.active) parts.push(...P.POST_APPOINTMENT_CLOSE);
-    else parts.push(...P.POST_APPOINTMENT_CONDUCT_END);
+    // 2026-10-11 (the user): an unsold demo belongs to the rehash team, so the
+    // close names our follow-up team, never "their rep".
+    if (opts.rehash?.active) parts.push(...P.POST_APPOINTMENT_CONDUCT_END);
+    else if (unsoldPostDemo) parts.push(...P.POST_APPOINTMENT_CLOSE_FOLLOW_UP_TEAM);
+    else parts.push(...P.POST_APPOINTMENT_CLOSE);
   }
   // ─── POST-DEMO REHASH (2026-10-01, Mark) ───
   // An F.0 lead (tag active-f.0) is talking to the rehash rep, and the one goal
@@ -1785,7 +1798,7 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
       // customer has MET; left unlabelled beside "Ground Truth", the model
       // would sign as her or open "Beverly here". She does not write these
       // emails and must never appear to. See AUTHORSHIP at the top of the prompt.
-      parts.push(...P.lpSalesRep(context.lp.rep_name));
+      parts.push(...P.lpSalesRep(context.lp.rep_name, { unsoldPostDemo }));
     }
     let apptStatus = 'no';
     if (context.lp.appointment_set || context.lp.appointment_date) {
@@ -4307,6 +4320,17 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     if (offer.stripped.length) {
       console.warn(`[ResponseGenerator] rehash offer talk stripped for ${contactId}: ${offer.stripped.join(' | ').slice(0, 200)}`);
       validated.message = offer.text;
+    }
+  }
+
+  // ─── Post-demo owner guard (2026-10-11, the user) ───
+  // After an unsold demo the rehash team owns the lead: a reply that says the
+  // sales rep will call, follow up or be in touch names our follow-up team.
+  if (isUnsoldPostDemo({ postAppointment: derivePostAppointment(context, opts.contextSnapshot).post, rehash: !!rehash, sold: lpSold(context?.lp) || isCustomerP2(context) })) {
+    const owner = replaceSalesRepFollowUp(validated.message, { salesRep: resolveOwningRepName(context), keepName: rehash?.repName || null });
+    if (owner.changed) {
+      console.warn(`[ResponseGenerator] post-demo owner: sales rep follow-up renamed to our follow-up team for ${contactId}`);
+      validated.message = owner.text;
     }
   }
 

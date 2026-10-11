@@ -210,6 +210,14 @@ Call confirms "You're all set for [day] at [time]. [first name] will give you a 
 `REHASH_TEAM_USER_NAMES`; keep "all set": `BOOKED_LINE_RX` and the promised-callback exemptions read it) and posts a
 "REHASH CALL BOOKED" card. A post-demo call-time ask is not a visit booking ask (`callTimeAsk` in `enforceNepqPlan`).
 
+**After an unsold demo the sales rep no longer owns the lead; the rehash team does (the user, 2026-10-11).** "We should
+not continue to say the sales rep will follow up." `isUnsoldPostDemo` (`src/agentic/post-demo-owner.js`: past the
+appointment or rehash, and not sold: LP closed-won / Sale / a P2 customer) switches the reply writer's close to
+`POST_APPOINTMENT_CLOSE_FOLLOW_UP_TEAM`, relabels the CRM "Sales Rep" line as the rep at the visit who no longer owns it,
+names "our follow-up team" (or the rehash rep the line speaks as) as the owner on an escalation acknowledgment, and
+`replaceSalesRepFollowUp` renames "your rep / Beverly will call / follow up / be in touch" to our follow-up team after the
+model. A SOLD lead keeps its rep (fixture 41). The customer never hears the word "rehash".
+
 **A post-demo lead is in REHASH: the rehash team calls it, LP is never touched (the user, 2026-10-09).** Monica (LP
 lead 581695, OPPFDN after her 10/7 demo, outside F.0's 14-day window) got a Five9 sales callback, a moved appointment
 and an LP re-set. Now:
