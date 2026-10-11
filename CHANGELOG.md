@@ -28,6 +28,12 @@ repo — they are recorded in `sql/seeds/` on the date they were applied live.
 - **Fix:** with no Rehash Call times read, the reply asking "What's a good time
   today or tomorrow for a quick call?" was cut down to "Good." as if it were a
   visit booking ask. It now goes out.
+- **Fixes from the first live simulations.** "Thanks for checking in" got
+  "Anytime. Talk soon." and no question; it now gets the proposal question.
+  "The best deal possible" was used to answer "we got another quote" in place
+  of "How do they compare?"; it is now held for the bridge. A bridge turn that
+  asked nothing gets "Would a quick call help?". A "yes" two messages after the
+  bridge now gets two real call times instead of a vague "John will call you".
 
 ## 2026-10-01
 

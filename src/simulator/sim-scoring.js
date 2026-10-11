@@ -138,6 +138,9 @@ export function scoreResult(result) {
         // The cancel identity ask ("name and phone the appointment is under")
         // is the one approved two-item ask (allow_multi_ask, Part 8).
         allowMultiAsk: /cancel/.test(String(result.scenario || '')),
+        // A post-demo lead's one goal is the call (rehash, 2026-10-01/10-11):
+        // offering it is the plan, not an unasked offer.
+        callOfferOk: t.nepq?.post_demo === true,
       });
       for (const v of check.violations) failures.push({ code: v.code, detail: v.detail, turn: t.turn });
       conversation.push({ direction: 'outbound', text });

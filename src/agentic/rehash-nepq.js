@@ -28,6 +28,19 @@ import { PURCHASED_ELSEWHERE_RX } from './purchased-elsewhere.js';
 
 /** The hint (Mark's framing). Said at most once per conversation, at the bridge. */
 export const BEST_DEAL_RX = /\bbest\s+deal\b/i;
+// Our bridge to the call, read back by meaning (the model words it). The
+// first live simulation (2026-10-11) bridged in one message ("best deal
+// possible") and asked nothing until the next, so a "yes" two messages later
+// still answers it.
+export const REHASH_BRIDGE_RX = /\bbest\s+deal\b|\bmay\s+be\s+able\s+to\s+do\s+something\b|\bquick\s+call\b[^.!]*\?/i;
+
+/** Did one of our last two messages bridge to the call? Pure. */
+export function bridgedRecently(outboundTexts = []) {
+  return (Array.isArray(outboundTexts) ? outboundTexts : []).slice(-2).some(t => REHASH_BRIDGE_RX.test(String(t || '')));
+}
+
+/** Stages where "best deal" may not be said yet (only at the bridge). */
+export const PRE_BRIDGE_STAGES = Object.freeze(new Set(['connection', 'situation', 'problem', 'solution', 'objection', 'door_open', 'stop', 'signed_elsewhere', 'follow_up_date']));
 
 // Each stage, the question that IS that stage, and how we recognise it in our
 // own earlier messages (the model words it, so we read it back by meaning).
@@ -161,8 +174,7 @@ export function rehashNepqTurn({ conversation = [], trigger = '', nowMs = Date.n
     return at('door_open', 'Acknowledge it, leave the door open in their words, no pitch. At most one soft question about the proposal, or none.', { label: 'NOT INTERESTED (first no)', objection });
   }
   // A yes to our bridge: the call is agreed. The schedule step is the plan's.
-  const bridge = REHASH_STAGES.find(s => s.key === 'bridge');
-  if (bridge.rx.test(lastOut) && YES_RX.test(now) && !isRehashNo(now)) {
+  if (bridgedRecently(outbound) && YES_RX.test(now) && !isRehashNo(now)) {
     return at('schedule', 'They said yes to the call. Schedule it (see SCHEDULING in the rehash block). Do not pitch again and do not say "best deal" again.', { label: 'SCHEDULE', example: null });
   }
   // They answered our ask-back: now the bridge.

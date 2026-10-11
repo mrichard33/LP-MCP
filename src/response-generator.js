@@ -4037,10 +4037,10 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
         // The classifier read a call request: the planner's callback hand-off.
         callbackRequested: String(classification?.intent_class || '').toUpperCase() === 'CALLBACK',
       };
-      nepqPlan = planNepqTurn({ ...planArgs, postDemo: pdMode === 'live' && postDemoLead, rehashRep, callSlots: slotsMode === 'live' ? rehashCallSlots : null });
+      nepqPlan = planNepqTurn({ ...planArgs, postDemo: pdMode === 'live' && postDemoLead, rehashRep, rehash: !!rehash, callSlots: slotsMode === 'live' ? rehashCallSlots : null });
       if (slotsMode === 'shadow' && rehash && postDemoLead) {
         try {
-          const would = planNepqTurn({ ...planArgs, postDemo: true, rehashRep, callSlots: rehashCallSlots });
+          const would = planNepqTurn({ ...planArgs, postDemo: true, rehashRep, rehash: !!rehash, callSlots: rehashCallSlots });
           const say = (x) => `${x.rel || x.day} at ${x.time}`;
           if (would.step === 'rehash_offer') console.log(`[RehashSlots] shadow ${contactId}: would offer ${(would.slots_to_offer || []).map(say).join(' or ')} (rep ${rehashCallSlots?.rep || '?'})`);
           else if (would.step === 'rehash_confirm') console.log(`[RehashSlots] shadow ${contactId}: would book ${say(would.rehash_pick)} on Rehash Call (rep ${rehashCallSlots?.rep || '?'})`);
@@ -4740,6 +4740,8 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       objection: nepqPlan.objection?.type || null, handoff: nepqPlan.handoff?.reason || null,
       counters: nepqPlan.counters,
       booking: nepqPlan.booking, slots: (nepqPlan.slots_to_offer || []).length,
+      // 2026-10-11: the post-demo plan and its track stage (Bot Review, the gate).
+      post_demo: !!nepqPlan.post_demo, rehash_stage: nepqPlan.rehash_stage || null,
     };
     const idf = identityState?.identity || {};
     const knownFirst = idf.first_name || context.lead?.first_name || null;
