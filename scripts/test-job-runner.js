@@ -431,7 +431,8 @@ test('the roster is unique, complete and shaped', () => {
   // 38 → 39 on 2026-10-08: pause-workflow-sweep (a live conversation pauses the drips).
   // 39 → 40 on 2026-10-09: rehash-tag-sweep (post-demo leads: rehash tag, 30-day release).
   // 40 → 41 on 2026-10-09: post-issue-rebook-retry (retry a post-issue rebook before a person).
-  assert.equal(JOBS.length, 41);
+  // 41 → 42 on 2026-10-11: lp-identity-fill-sweep (nameless contacts get the LP name).
+  assert.equal(JOBS.length, 42);
   for (const j of JOBS) {
     assert.match(j.id, /^[a-z0-9-]+$/, `${j.id} should be a slug`);
     assert.ok(j.label && j.group && j.cadence, `${j.id} needs a label, group and cadence`);

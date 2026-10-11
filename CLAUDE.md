@@ -455,6 +455,17 @@ who types a phone number that already has a contact is MERGED by GHL, and that m
 never fires). Keep any I/O before a webhook's response capped — the
 `findRecentCanvassMark` pre-check is held to 3s for that reason.
 
+**A linked contact gets its name from LP, fill-empty-only (2026-10-11).** a9eG41qtxCqMEXxbbD2l reached a demo with no
+name while LP lead 581424 said Andrew Marcus: the backstop wrote names only on create, and `/n8n/enrich-lead` read them
+and never wrote them. `buildIdentityFill` (`src/services/lp-identity-fill.js`) is the one rule: first/last name, email
+and the address block are written only where GHL is empty (a phone number or "Guest Visitor …" counts as no name), a
+real value is never replaced, couples ("Michelle/Jason") keep the first person, an email another contact holds is
+dropped, and the body never carries `tags`. It runs on the backstop link PUT, on enrichment's `ghl_update_body` (top
+level), and in job `lp-identity-fill-sweep` (30 min, `LP_IDENTITY_FILL_MODE` off|shadow|live, default live), which
+reads the HL mirror for nameless contacts and needs a VERIFIED link (LP id on the contact, or the phone). One-time run:
+`scripts/backfill-lp-contact-names.js` or `POST /admin/lp-identity-fill` (dry run default). Most nameless `lp-linked`
+contacts have no name in LP either (1,107 of 1,154 on 2026-10-11); that is not a bug here.
+
 **Every LP sale gets a P2 card, even when LP's webhook does not arrive (2026-10-03).** A P2 (Client
 Lifecycle) card is built only by LP's outbound webhook → GHL I.LP-IN (adds `deal-won`) → C.0-IN (P1 Sale
 Recorded + P2 Contract Signed, valued from LP Gross Sale Amount). LP's webhook all but stopped on 2026-09-24,

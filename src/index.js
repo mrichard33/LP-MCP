@@ -326,6 +326,8 @@ import { startNewLeadDialBackstopScheduler } from './jobs/new-lead-dial-backstop
 import { startInboundCheckoutWatchScheduler } from './jobs/inbound-checkout-watch.js';  // 2026-10-06
 import { startPromisedCallbackScheduler } from './jobs/promised-callback-sweep.js';  // 2026-10-07
 import { startRehashTagScheduler } from './jobs/rehash-tag-sweep.js';  // 2026-10-09
+import { startIdentityFillScheduler } from './jobs/lp-identity-fill-sweep.js';  // 2026-10-11
+import { registerLpIdentityFillRoutes } from './admin/lp-identity-fill.js';  // 2026-10-11
 import { startPostIssueRetryScheduler } from './jobs/post-issue-rebook-retry.js';  // 2026-10-09
 import { registerLeadLeakRoutes, startLeadLeakScheduler, startLeadUncalledScheduler } from './jobs/lead-leak-monitor.js';  // 2026-09-26
 import { startChatLeadIntakeScheduler } from './jobs/chat-lead-intake-sweep.js';  // 2026-09-28
@@ -856,6 +858,7 @@ registerLinkVerifySampleRoutes(app); // 2026-07-23 — pre-enforce cache-vs-live
 registerPendingProbeTtlSweepRoutes(app); // 2026-07-08 — stale pending:customer-status-check TTL sweep (scheduler env-gated, default off)
 registerGhlAppointmentBackfillRoutes(app); // 2026-07-07 — LP→GHL appointment backfill trigger (dry-run default)
 registerLpContactBackstopRoutes(app); // 2026-07-09 — LP contact auto-create backstop (scheduler env-gated, default off)
+registerLpIdentityFillRoutes(app, { authenticate }); // 2026-10-11 — fill nameless contacts from LP (dry-run default)
 registerLpMirrorBackfillRoutes(app); // 2026-07-10 — windowed cursor-independent mirror recovery (dry-run default)
 registerRtpJobBackfillRoutes(app); // 2026-07-10 (#512) — one-shot RTP job-axis backfill (dry-run default)
 registerGhlAppointmentDedupeRoutes(app); // 2026-07-10 — WE same-slot de-dupe (dry-run default)
@@ -964,6 +967,7 @@ const server = app.listen(PORT, async () => {
   startInboundCheckoutWatchScheduler();
   startPromisedCallbackScheduler();
   startRehashTagScheduler();
+  startIdentityFillScheduler();
   startPostIssueRetryScheduler();
   startLeadLeakScheduler();
   startLeadUncalledScheduler();
