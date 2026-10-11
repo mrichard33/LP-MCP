@@ -52,12 +52,15 @@ async function defaultDeps() {
  * @param {{firstName?, phone?, market?}} args.contact
  * @returns {Promise<{posted: boolean, reason: string}>}
  */
-export async function notifyRehashCall({ contactId, generated, triggerMessage, contact = {} }, deps = null, { env = process.env, nowMs = Date.now() } = {}) {
+export async function notifyRehashCall({ contactId, generated, triggerMessage, contact = {}, booked = null }, deps = null, { env = process.env, nowMs = Date.now() } = {}) {
   try {
     if (!generated?.rehash?.active) return { posted: false, reason: 'not_rehash' };
-    if (!generated?.rehash_call?.agreed) return { posted: false, reason: 'no_call_agreed' };
+    // 2026-10-11: a call booked on Rehash Call (`booked`: { slot_label,
+    // assignee_name }) is a yes too, whatever the model's rehash_call said.
+    if (!booked && !generated?.rehash_call?.agreed) return { posted: false, reason: 'no_call_agreed' };
     const d = deps || await defaultDeps();
-    const key = rehashCallIdempotencyKey(contactId, nowMs);
+    // A booked call has its own key: an earlier "yes" card today must not hide it.
+    const key = rehashCallIdempotencyKey(contactId, nowMs, { booked: !!booked });
     const seen = await Promise.resolve(d.alreadyRequested(key)).catch(() => null);
     if (seen === true) return { posted: false, reason: 'already_posted_today' };
 
@@ -67,7 +70,9 @@ export async function notifyRehashCall({ contactId, generated, triggerMessage, c
       phone: contact.phone || null,
       market: contact.market || null,
       repName: generated.rehash.rep_name || null,
-      preferredTime: generated.rehash_call.preferred_time || null,
+      preferredTime: generated.rehash_call?.preferred_time || null,
+      bookedSlot: booked?.slot_label || null,
+      assigneeName: booked?.assignee_name || null,
       lastMessage: triggerMessage || null,
       contactUrl: d.locationId ? ghlContactUrl(d.locationId, contactId) : null,
     });
@@ -81,7 +86,7 @@ export async function notifyRehashCall({ contactId, generated, triggerMessage, c
     await Promise.resolve(d.emitEvent({
       event_type: 'agentic.f0_rehash_call_requested', source: 'send_message', entity_type: 'contact', entity_id: contactId,
       ghl_contact_id: contactId, priority: 'normal', bypass_filter: true, idempotency_key: key,
-      payload: { contact_id: contactId, preferred_time: generated.rehash_call.preferred_time || null, rep_name: generated.rehash.rep_name || null, slack_ts: res.ts || null, inbound_preview: String(triggerMessage || '').slice(0, 300) },
+      payload: { contact_id: contactId, preferred_time: generated.rehash_call?.preferred_time || null, booked_slot: booked?.slot_label || null, booked_start: booked?.start_time || null, assignee_name: booked?.assignee_name || null, rep_name: generated.rehash.rep_name || null, slack_ts: res.ts || null, inbound_preview: String(triggerMessage || '').slice(0, 300) },
     })).catch((err) => console.warn(`[RehashCall] event for ${contactId} not recorded: ${err.message}`));
     return { posted: true, reason: 'posted' };
   } catch (err) {

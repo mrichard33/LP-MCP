@@ -107,7 +107,21 @@ test('a pick from our offer → confirm that exact slot', () => {
   const p = plan('The second one', conv);
   assert.equal(p.step, 'rehash_confirm');
   assert.equal(p.rehash_pick.iso, ALL[1].iso);
-  assert.match(p.reference_line, /on the calendar for a quick call today at 3:30 PM ET/);
+  // 2026-10-11 (rehash NEPQ handoff): "You're set for [day] at [time]. [first
+  // name] will give you a call then." ("all set" kept for the read-backs).
+  assert.match(p.reference_line, /^You're all set for today at 3:30 PM ET\. Someone from our team will give you a call then\.$/);
+});
+
+test('the confirm names the team member the call is booked with, never a guess', () => {
+  const conv = [BRIDGE, { direction: 'inbound', text: 'Yes' }, { direction: 'outbound', text: 'I have today at 2:00 PM ET or today at 3:30 PM ET. Which works better?' }];
+  // The line speaks as John; the call is booked with Tom: third person.
+  const named = plan('The second one', conv, { ...CALL_SLOTS, repName: 'Tom' });
+  assert.match(named.reference_line, /Tom will give you a call then\.$/);
+  assert.equal(named.rehash_caller, 'Tom');
+  // The line speaks as John: first person.
+  const self = planNepqTurn({ channel: 'sms', trigger: 'The second one', conversation: conv, postDemo: true, rehashRep: 'John', callSlots: { ...CALL_SLOTS, repName: 'John' }, nowMs: NOW });
+  assert.match(self.reference_line, /I'll give you a call then\.$/);
+  assert.doesNotMatch(self.reference_line, /visit|confirm the details/i);
 });
 
 test('a typed time the calendar does not show → the two nearest real openings, never a booking', () => {

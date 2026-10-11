@@ -200,6 +200,16 @@ are dropped for these replies because every one is pre-demo copy. A "yes" to the
 to #contact-rehash (`SLACK_CHANNEL_REHASH`, default C0C5YMHNYJH) via `src/notifications/rehash-call.js`.
 No resolved name → the reply signs "Reece Team"; never guess a name. See `src/agentic/rehash.js`.
 
+**A rehash lead is on the post-demo NEPQ track, never the new-lead stages (handoff, 2026-10-11).** `buildNepqBlock`
+renders `src/agentic/rehash-nepq.js` instead of the stage play, objection plays, booking discipline and visit disclosure
+for `opts.rehash.active` (fixture 40 had "What got you looking at the windows" above the ban on windows questions):
+proposal → where they are → what holds them back → what would make it work → the bridge → the call, one per turn,
+objections asked back, two no's stop (`post_demo_stop`). "The best deal possible" is the ONE allowed hint, once per
+conversation (`stripOfferTalk({ hintUsed })`); everything else in `OFFER_TALK_RX` is still stripped. A booked Rehash
+Call confirms "You're all set for [day] at [time]. [first name] will give you a call then." (`rehashRepFirstName`,
+`REHASH_TEAM_USER_NAMES`; keep "all set": `BOOKED_LINE_RX` and the promised-callback exemptions read it) and posts a
+"REHASH CALL BOOKED" card. A post-demo call-time ask is not a visit booking ask (`callTimeAsk` in `enforceNepqPlan`).
+
 **A post-demo lead is in REHASH: the rehash team calls it, LP is never touched (the user, 2026-10-09).** Monica (LP
 lead 581695, OPPFDN after her 10/7 demo, outside F.0's 14-day window) got a Five9 sales callback, a moved appointment
 and an LP re-set. Now:

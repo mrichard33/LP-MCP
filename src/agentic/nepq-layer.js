@@ -93,7 +93,14 @@
  * buildNepqBlock takes a third argument, the discipline object. Absent, the
  * section renders as "(not computed)" — visible in a Bot Review replay rather
  * than silently missing, the ESTABLISHED precedent.
+ *
+ * 2026-10-11: a fourth argument, { rehash, conversation, trigger }. A post-demo
+ * rehash lead gets the post-demo track (rehash-nepq.js) instead of the
+ * new-lead stage play, objection plays, booking discipline and visit
+ * disclosure: fixture 40 rendered "What got you looking at the windows now?"
+ * right above the rehash block that bans windows questions.
  */
+import { rehashNepqTurn, buildRehashNepqBlock } from './rehash-nepq.js';
 
 /**
  * Tonality translated to text. NEPQ tonality is a voice concept (curious,
@@ -561,8 +568,23 @@ different discovery question (which room, how long, what is the worst one).`);
  * @param {object} [discipline]  the object returned by buildDiscipline() (v1.4)
  * @returns {string}             prompt text, or '' when the layer is disabled
  */
-export function buildNepqBlock(ctx, established = null, discipline = null) {
+export function buildNepqBlock(ctx, established = null, discipline = null, { rehash = null, conversation = null, trigger = '' } = {}) {
   if (process.env.NEPQ_LAYER_MODE === 'off') return '';
+
+  // ── POST-DEMO REHASH (2026-10-11) ─────────────────────────────────────
+  // They had the demo and hold a proposal: the post-demo track replaces the
+  // new-lead stage play. No visit disclosure either: the only booking here is
+  // a phone call with the rep.
+  if (rehash?.active) {
+    const turn = rehashNepqTurn({ conversation: conversation ?? ctx?.conversation_recent ?? [], trigger });
+    return [
+      '=== CONVERSATION DISCIPLINE (NEPQ) ===',
+      buildRehashNepqBlock(turn, { repName: rehash.repName || null }),
+      establishedBlock(established),
+      TONALITY,
+      CLARIFY_AND_PROBE,
+    ].filter(Boolean).join('\n');
+  }
 
   // ── THE COMMITMENT GATE STILL WINS (Myron Thorner, 2026-08-28) ────────
   // A booked homeowner is a customer, not a prospect. stageBlock() already

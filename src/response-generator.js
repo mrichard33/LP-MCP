@@ -386,7 +386,7 @@ import { resolveServicePhone } from './services/market-phone.js';
 // Every prompt string this file assembles. Copy only — no logic, no env reads.
 // See src/prompts/response-generator/index.js.
 import * as P from './prompts/response-generator/index.js';
-import { isRehashContact, normalizeRehashCall, stripOfferTalk, REHASH_NUMBER_DEFAULT, REHASH_REP_CUSTOM_VALUE } from './agentic/rehash.js';
+import { isRehashContact, normalizeRehashCall, stripOfferTalk, bestDealHintUsed, REHASH_NUMBER_DEFAULT, REHASH_REP_CUSTOM_VALUE } from './agentic/rehash.js';
 import { getCustomValue } from './services/ghl-custom-values.js';
 import { dialWindowPromptLine, canPromiseImmediateCall } from './dial-window.js';
 import { normalizeRepNote } from './agentic/rep-note.js';
@@ -1437,7 +1437,10 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
   // play. Same object the ESTABLISHED block above was built from.
   // v1.4 (2026-09-26): the discipline object says what THIS turn may ask; the
   // closing PRIORITY ORDER (5) now defers to the section it renders.
-  const nepqBlock = buildNepqBlock(context, opts.established, opts.discipline || null);
+  // 2026-10-11: a rehash lead gets the post-demo track instead (rehash-nepq.js).
+  const nepqBlock = buildNepqBlock(context, opts.established, opts.discipline || null, {
+    rehash: opts.rehash || null, conversation: context?.conversation_recent || [], trigger: triggerMessage,
+  });
   if (nepqBlock) parts.push(nepqBlock);
 
   // Acknowledgment-only conduct is decided BEFORE the email opener, because it
@@ -4297,8 +4300,10 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // ─── Rehash offer guard (2026-10-01, Mark) ───
   // The offer is hinted at, never named: a price, a percentage, a discount or
   // "a deal" from the rehash line is a promise the rep has not made.
+  // 2026-10-11: "the best deal possible" is the one approved hint, once per
+  // conversation; a second "best deal" is stripped like any other offer talk.
   if (rehash) {
-    const offer = stripOfferTalk(validated.message);
+    const offer = stripOfferTalk(validated.message, { hintUsed: bestDealHintUsed(context?.conversation_recent || []) });
     if (offer.stripped.length) {
       console.warn(`[ResponseGenerator] rehash offer talk stripped for ${contactId}: ${offer.stripped.join(' | ').slice(0, 200)}`);
       validated.message = offer.text;
@@ -4826,6 +4831,13 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       if (nepqPlan.rehash_pick && rehashCallSlots?.calendarId) {
         validated.companion_action = rehashCallBooking({ slot: nepqPlan.rehash_pick, calendarId: rehashCallSlots.calendarId, rep: rehashCallSlots.rep });
         validated.nepq_plan.pinned = nepqPlan.rehash_pick.iso;
+        // 2026-10-11: what the #contact-rehash card says once the booking lands.
+        const p = nepqPlan.rehash_pick;
+        validated.rehash_booked = {
+          slot_label: `${p.rel || p.day} at ${p.time}${p.tz ? ` ${p.tz}` : ''}`,
+          start_time: p.iso,
+          assignee_name: rehashCallSlots.repName || null,
+        };
       }
       if (nepqPlan.step === 'rehash_offer') validated.rehash_slots_offered = true;
     } else if (enforced.changes.length) {

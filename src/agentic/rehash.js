@@ -75,21 +75,44 @@ const OFFER_TALK_RX = /\$\s?\d|\b\d{1,3}(?:\.\d+)?\s?%|\bper\s*cent\b|\bdiscount
 
 const splitSentences = (t) => String(t || '').split(/(?<=[.!?])\s+/).map((s) => s.trim()).filter(Boolean);
 
+// 2026-10-11 (rehash NEPQ handoff): the ONE approved hint. "Making sure you're
+// getting the best deal possible" says something may be possible without
+// naming it, so these exact phrasings are taken out before the offer test.
+// Anything else in the sentence still counts: "the best deal for you: $500
+// off" is stripped for the $500. "a deal", "a great deal", "a special deal"
+// stay banned. Once per conversation (hintUsed): a second time is stripped.
+const BEST_DEAL_HINT_RX = /\b(?:getting\s+)?the\s+best\s+deal\s+(?:possible|for\s+you)\b|\bgetting\s+the\s+best\s+deal\b|\bbest\s+deal\s+for\s+you\b/gi;
+
 /** Sentences that name or promise a concrete offer. Pure. */
-export function findOfferTalk(text) {
-  return splitSentences(text).filter((s) => OFFER_TALK_RX.test(s));
+export function findOfferTalk(text, { hintUsed = false } = {}) {
+  return splitSentences(text).filter((s) => {
+    if (hintUsed && /\bbest\s+deal\b/i.test(s)) return true;
+    return OFFER_TALK_RX.test(s.replace(BEST_DEAL_HINT_RX, ' '));
+  });
 }
 
-export const OFFER_HINT_LINE = 'I may be able to do something for you on that, and it is easier to go over on a quick call.';
+export const OFFER_HINT_LINE = "I want to make sure you're getting the best deal possible, and it's easier to go over on a quick call.";
+// The hint was already said once: the same line without it.
+export const OFFER_HINT_LINE_AFTER = "I may be able to do something for you, and it's easier to go over on a quick call.";
 
-/** Strip offer talk; keep the reply moving with the approved hint. Pure. */
-export function stripOfferTalk(text) {
-  const hits = findOfferTalk(text);
+/**
+ * Strip offer talk; keep the reply moving with the approved hint. Pure.
+ * @param {string} text
+ * @param {{hintUsed?: boolean}} [o]  "best deal" was already said in this conversation
+ */
+export function stripOfferTalk(text, { hintUsed = false } = {}) {
+  const hits = findOfferTalk(text, { hintUsed });
   if (!hits.length) return { text: String(text || ''), stripped: [] };
   const kept = splitSentences(text).filter((s) => !hits.includes(s));
   const hasQuestion = kept.some((s) => s.includes('?'));
-  const out = hasQuestion ? kept : [...kept, OFFER_HINT_LINE];
+  const out = hasQuestion ? kept : [...kept, hintUsed ? OFFER_HINT_LINE_AFTER : OFFER_HINT_LINE];
   return { text: out.join(' ').trim(), stripped: hits };
+}
+
+/** "best deal" already said in our earlier messages. Pure. */
+export function bestDealHintUsed(conversation = []) {
+  return (Array.isArray(conversation) ? conversation : [])
+    .some((m) => String(m?.direction || '').toLowerCase() === 'outbound' && /\bbest\s+deal\b/i.test(String(m?.text ?? m?.body ?? '')));
 }
 
 /** The GHL contact link for a card. Pure. */
@@ -101,8 +124,23 @@ export function ghlContactUrl(locationId, contactId) {
  * The #contact-rehash card. Plain English, built once (CLAUDE.md). Pure.
  * Never a pronoun for the contact — the card uses their first name.
  */
-export function formatRehashCallCard({ firstName, phone, market, repName, preferredTime, lastMessage, contactUrl }) {
+export function formatRehashCallCard({ firstName, phone, market, repName, preferredTime, lastMessage, contactUrl, bookedSlot = null, assigneeName = null }) {
   const who = firstName || 'A post-demo lead';
+  // 2026-10-11: a call booked on the Rehash Call calendar names the slot and
+  // the team member it is booked with.
+  if (bookedSlot) {
+    return [
+      `📞 REHASH CALL BOOKED`,
+      `${who} (post-demo) booked a call on the Rehash Call calendar.`,
+      `When: ${bookedSlot}`,
+      `With: ${assigneeName || 'the rehash team (no name on file for the assigned user)'}`,
+      `Phone: ${phone || 'not on file'}`,
+      market ? `Market: ${market}` : null,
+      lastMessage ? `${who} said: "${String(lastMessage).slice(0, 300)}"` : null,
+      contactUrl ? `Contact: ${contactUrl}` : null,
+      `→ ${assigneeName || 'The assigned rep'}: call ${firstName || 'them'} at that time and see what we can do.`,
+    ].filter(Boolean).join('\n');
+  }
   return [
     `📞 REHASH CALL REQUEST`,
     `${who} (post-demo, F.0) said yes to a call${repName ? ` with ${repName}` : ''}.`,
@@ -116,7 +154,7 @@ export function formatRehashCallCard({ firstName, phone, market, repName, prefer
 }
 
 /** One card per contact per Eastern day. Pure. */
-export function rehashCallIdempotencyKey(contactId, nowMs = Date.now()) {
+export function rehashCallIdempotencyKey(contactId, nowMs = Date.now(), { booked = false } = {}) {
   const day = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(nowMs));
-  return `f0_rehash_call_${contactId}_${day}`;
+  return `f0_rehash_call_${booked ? 'booked_' : ''}${contactId}_${day}`;
 }
