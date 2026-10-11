@@ -302,8 +302,12 @@ export const lpDemoAndAppointment = (demo, apptStatus) => [
 
 // 2026-07-29 — labelled explicitly. The field rep is someone the customer has MET; left unlabelled beside "Ground Truth", the model signed as her and opened "Beverly here". She does not write these emails and must never appear to.
 // Was response-generator.js:1258.
-export const lpSalesRep = (repName) => [
-  `Sales Rep (the FIELD rep who owns this deal — NOT the author of your reply): ${repName}`,
+// 2026-10-11 (the user): after an unsold demo the rehash team owns the lead, so
+// the rep is only the person who did the visit.
+export const lpSalesRep = (repName, { unsoldPostDemo = false } = {}) => [
+  unsoldPostDemo
+    ? `Sales Rep at the visit (did NOT sell it and NO LONGER owns this lead; our follow-up team does — never say this rep will call, follow up or be in touch; NOT the author of your reply): ${repName}`
+    : `Sales Rep (the FIELD rep who owns this deal — NOT the author of your reply): ${repName}`,
 ];
 
 // LP disposition code, with its human label when there is one.

@@ -470,6 +470,15 @@ export const POST_APPOINTMENT_CLOSE = [
   `═══════ END POST-APPOINTMENT CONDUCT ═══════`,
 ];
 
+// 2026-10-11 (the user): "after the appointment demos the sales rep does not
+// own the lead anymore if they did not sale it. It goes to the Rehash team so
+// we should not continue to say the sales rep will follow up."
+export const POST_APPOINTMENT_CLOSE_FOLLOW_UP_TEAM = [
+  `What TO do: acknowledge what they actually said, and be specific about the real next step: our follow-up team is the one following up on their proposal. If they are waiting on a human, say plainly that you are getting it to our follow-up team. Under-promise.`,
+  `WHO FOLLOWS UP: the sales rep who did the visit no longer owns this lead. NEVER say the sales rep (by name or as "your rep" / "the rep" / "your specialist") will call, follow up, send anything or be in touch. Say "our follow-up team" or "our team".`,
+  `═══════ END POST-APPOINTMENT CONDUCT ═══════`,
+];
+
 // A genuine future appointment on record may be discussed — that one only, and still no new one proposed.
 // Was response-generator.js:1086.
 export const POST_APPOINTMENT_FUTURE_APPT_EXCEPTION = [
@@ -512,7 +521,10 @@ export const postDemoRehash = (repName, { callTimes = false } = {}) => {
     `They already had the full in-home visit and have a proposal. Do not ask what bothers them about their windows or what they want to change. Ask about the proposal, or nothing.`,
     `Echo only problems they named in their own words. Never assume single-pane glass, sticking sashes, drafts or any condition they did not state.`,
     `If they give a date or month to follow up, confirm that exact date in plain words and stop. No times, no question.`,
-    `If they say they signed with another company, do not congratulate them and do not ask a question. Thank them and say the rep will be in touch.`,
+    // 2026-10-11 (the user): the sales rep from the visit no longer owns an
+    // unsold lead; the rehash team does.
+    `If they say they signed with another company, do not congratulate them and do not ask a question. Thank them and say our follow-up team will be in touch.`,
+    `WHO FOLLOWS UP: the sales rep who did the visit no longer owns this lead; the follow-up team does. Never say the sales rep (by name, or as "your rep" / "the rep" / "your specialist") will call, follow up or be in touch.`,
     `After a sign-off sentence (enjoy your week, take care, we're here), end the message.`,
     `OUTPUT: add a top-level "rehash_call" object to your JSON: {"agreed": true|false, "preferred_time": "<the time in their words>" | null}. "agreed" is true ONLY when the lead's latest message says yes to a call or gives a time for one.`,
     `═══════ END POST-DEMO REHASH ═══════`,

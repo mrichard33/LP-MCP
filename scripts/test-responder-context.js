@@ -331,11 +331,15 @@ test('Kelly fixture: the FAST_TRACK booking push is suppressed', () => {
   assert.ok(!/Apply BOOKING — ASK-FIRST PROTOCOL/.test(p), 'booking protocol still instructed');
 });
 
-test('Kelly fixture: escalate_to_rep adds acknowledgment-only conduct naming Beverly', () => {
+// 2026-10-11 (the user): "after the appointment demos the sales rep does not own
+// the lead anymore if they did not sale it. It goes to the Rehash team." Kelly
+// sat the demo and did not buy (OPPFDN), so the owner is our follow-up team.
+test('Kelly fixture: escalate_to_rep adds acknowledgment-only conduct naming our follow-up team, not Beverly', () => {
   const p = kellyPrompt({ recommendedAction: 'escalate_to_rep', escalationCategory: 'existing_customer_service' });
   assert.ok(/ACKNOWLEDGMENT-ONLY CONDUCT/.test(p), 'ack block missing');
   assert.ok(/NEVER COMMIT TO A TIMELINE/.test(p), 'timeline ban missing');
-  assert.ok(/name the person who now owns it \(Beverly\)/.test(p), 'owner not resolved to Beverly');
+  assert.ok(/name the person who now owns it \(our follow-up team\)/.test(p), 'owner should be our follow-up team after an unsold demo');
+  assert.ok(!/name the person who now owns it \(Beverly\)/.test(p), 'the sales rep no longer owns it');
 });
 
 test('Kelly fixture: without escalate_to_rep there is no acknowledgment block', () => {

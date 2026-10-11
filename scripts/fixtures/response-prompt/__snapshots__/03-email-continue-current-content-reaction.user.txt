@@ -113,7 +113,8 @@ ABSOLUTELY PROHIBITED in this reply — these override FAST_TRACK, the funnel st
   · Asking whether decision-makers can be present. That question belongs to pre-appointment qualification and is insulting to someone who already sat the visit.
   · Any booking link or calendar widget.
 NEVER state or imply that anyone is coming back out. Do NOT invent a follow-up visit, a second appointment, or a return trip. If the LP notes and appointment records in this prompt do not explicitly say a return visit is scheduled, then none is — say nothing about one.
-What TO do: acknowledge what they actually said, be specific about the real next step (their rep sending the estimate/proposal), and if they are waiting on a human, say plainly that you are getting it to that person. Under-promise.
+What TO do: acknowledge what they actually said, and be specific about the real next step: our follow-up team is the one following up on their proposal. If they are waiting on a human, say plainly that you are getting it to our follow-up team. Under-promise.
+WHO FOLLOWS UP: the sales rep who did the visit no longer owns this lead. NEVER say the sales rep (by name or as "your rep" / "the rep" / "your specialist") will call, follow up, send anything or be in touch. Say "our follow-up team" or "our team".
 ═══════ END POST-APPOINTMENT CONDUCT ═══════
 
 ═══════ HUMAN CORRECTION ON PRIOR ATTEMPT — INCORPORATE THIS ═══════
@@ -154,7 +155,7 @@ Per HARD PROHIBITIONS: never quote prices/estimates EXCEPT figures in this block
 
 LP CRM (Ground Truth):
 Disposition: OPPFDN (Opportunity Found)
-Sales Rep (the FIELD rep who owns this deal — NOT the author of your reply): Dorsett, Beverly
+Sales Rep at the visit (did NOT sell it and NO LONGER owns this lead; our follow-up team does — never say this rep will call, follow up or be in touch; NOT the author of your reply): Dorsett, Beverly
 Demo: no | Appointment: no
 
 LP Rep Notes (most reliable intelligence):

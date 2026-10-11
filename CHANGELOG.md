@@ -7,6 +7,12 @@ repo — they are recorded in `sql/seeds/` on the date they were applied live.
 
 ## 2026-10-11
 
+- **After an unsold demo, the bot never says the sales rep will follow up.**
+  The lead belongs to the rehash team then. Replies say "our follow-up team"
+  (or the rehash rep the line speaks as) instead of "your rep" or the visit
+  rep's name, and the escalation acknowledgment names the follow-up team. A
+  lead that bought keeps its sales rep.
+
 - **Rehash leads get a post-demo conversation, not a new-lead one.** A lead who
   already had the in-home demo (tag `active-f.0` or `rehash`, or texting the
   rehash line) was handed the new-lead "What got you looking at the windows?"

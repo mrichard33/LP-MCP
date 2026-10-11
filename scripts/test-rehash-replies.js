@@ -101,7 +101,10 @@ test('prompt: no rep name resolved → team voice, still the call goal', () => {
 test('prompt: a contact not in F.0 is unchanged', () => {
   const user = render({ fromNumber: '+19543710083' });
   assert.doesNotMatch(user, /POST-DEMO REHASH/);
-  assert.match(user, /their rep sending the estimate\/proposal/);
+  // 2026-10-11 (the user): an unsold demo belongs to the rehash team, so the
+  // close names our follow-up team, never "their rep".
+  assert.match(user, /our follow-up team is the one following up on their proposal/);
+  assert.doesNotMatch(user, /their rep sending the estimate\/proposal/);
 });
 
 // ── the model's output ─────────────────────────────────────────────────────
