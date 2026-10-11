@@ -249,7 +249,7 @@ import { getLastInboundMessageMs, hasPriorInboundMessage } from './actions/handl
 // 2026-08-13 — shared with actions/index.executeLayer3Dispatch (see module header).
 import { inferChannelFromEvent } from './channel-inference.js';
 import { withGhlToken } from './ghl-rate-limiter.js';
-import { contactHadDemo } from './demo-truth.js';
+import { contactHadDemo, demoInCurrentCycle } from './demo-truth.js';
 import { fetchCurrentLead } from './current-lead.js';
 import { lpStoredToUtcMs } from './lp-dates.js';
 import { inboundFromReplyEvent } from './agentic/burst-yield.js';
@@ -913,11 +913,15 @@ async function resolveDemoState(event, intelligence, deps = {}) {
   const ghlContactId = event?.ghl_contact_id || null;
   // 1) LP demo truth — system of record (wins when present)
   if (ghlContactId && db) {
+    // 2026-10-11 — the CURRENT sales cycle's demo only (demoInCurrentCycle).
+    // A 2024 OPPFDN routed Frances Overton (wkUjSVicxP6918ll9nHc) as post-demo
+    // the day her new calculator lead arrived. A demo on an older lead within
+    // DEMO_CYCLE_DAYS of the current one (rebook, duplicate lead) still counts.
     const { data: lpLeads } = await db.from('lp_leads')
-      .select('disposition_code, closed_won, appts:raw_lp_data->appointments')
+      .select('lp_lead_id, disposition_code, closed_won, appointment_date, demo_date, created_at_lp, updated_at_lp, lp_deleted_at, appts:raw_lp_data->appointments')
       .eq('ghl_contact_id', ghlContactId)
       .limit(DEMO_STATE_LEAD_LIMIT);
-    if (contactHadDemo(lpLeads)) return 'post';
+    if (demoInCurrentCycle(lpLeads)) return 'post';
   }
   // One GHL fetch feeds both the appointment-outcome check (1.5) and the
   // lp-demo-completed tag check (2) — and, since 2026-08-14, is shared with
