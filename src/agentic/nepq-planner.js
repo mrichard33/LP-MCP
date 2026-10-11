@@ -35,6 +35,7 @@ import { enforceOneAsk } from './one-ask.js';
 import { isKnockComplaint } from './do-not-knock.js';
 import { detectDeferral, pendingDeferral, isAcknowledgment, isSignOffLine, POST_DEMO_QUESTIONS } from './post-demo-turn.js';
 import { PURCHASED_ELSEWHERE_RX } from './purchased-elsewhere.js';
+import { rehashNepqTurn } from './rehash-nepq.js';
 
 export { isKnockComplaint };
 
@@ -749,9 +750,17 @@ export function planNepqTurn({
     });
     const confirmPlan = (picked) => {
       const label = `${picked.rel || picked.day} at ${picked.time}${picked.tz ? ` ${picked.tz}` : ''}`;
+      // 2026-10-11 (rehash NEPQ handoff): name who calls. The team member the
+      // call is booked with, in the first person when that is the rep this
+      // line speaks as; never a guessed name. "all set" keeps every read-back
+      // working (BOOKED_LINE_RX, and it is not a new promised callback).
+      const caller = callSlots.repName || null;
+      const who = caller && rehashRep && caller.toLowerCase() === String(rehashRep).toLowerCase()
+        ? "I'll give you a call then."
+        : `${caller || 'Someone from our team'} will give you a call then.`;
       return Object.assign(plan, base, {
-        step: 'rehash_confirm', required_move: 'confirm', rehash_pick: picked,
-        reference_line: `You're all set${hi}. You're on the calendar for a quick call ${label}.`,
+        step: 'rehash_confirm', required_move: 'confirm', rehash_pick: picked, rehash_caller: caller,
+        reference_line: `You're all set for ${label}. ${who}`,
         reference_slots: [picked], booking: { allowed: true, reason: 'nepq:rehash_confirm' },
       });
     };
@@ -812,6 +821,14 @@ export function planNepqTurn({
     if (pending && !(SCHEDULE_ASK_RX.test(now) || TIME_REQUEST_RX.test(now))) {
       plan.pending_deferral = { untilIso: pending.untilIso, label: pending.label };
       plan.slots_to_offer = [];
+    }
+    // 3a. The post-demo NEPQ track (rehash-nepq.js, 2026-10-11): where the
+    //     conversation is, for the logs and the stop rule. Two no's in a row
+    //     on the rehash line: one short line, no question, no call pitch.
+    const track = rehashNepqTurn({ conversation, trigger: now, nowMs });
+    plan.rehash_stage = track.stage;
+    if (track.stage === 'stop') {
+      return pd({ step: 'post_demo_stop', required_move: 'close', call_offer_ok: false, fixed_line: `Understood${hi}. I'm here if anything changes.` });
     }
     // 4. A thank-you: thanks back, and at most one question about the
     //    proposal (none if one went out in our last three, or they asked us to wait).
@@ -1555,7 +1572,7 @@ export function enforceNepqPlan(draft, plan, { allowFigures = false, known = {} 
       changes.push('question_after_sign_off');
     }
     if (plan.step === 'competitor_signed') drop(s => /\bcongrat/i.test(s), 'no_congratulations');
-    if (plan.step === 'defer' || plan.step === 'competitor_signed') {
+    if (plan.step === 'defer' || plan.step === 'competitor_signed' || plan.step === 'post_demo_stop') {
       drop(s => s.includes('?') || SLOT_OFFER_RX.test(s) || clockMinutes(s).length > 0, 'post_demo_no_question');
     } else if (plan.step === 'post_demo_ack' && !plan.post_demo_question) {
       drop(s => s.includes('?'), 'post_demo_no_question');
@@ -1573,7 +1590,14 @@ export function enforceNepqPlan(draft, plan, { allowFigures = false, known = {} 
   // 3. No booking ask the plan does not allow.
   if (!plan.booking?.allowed) {
     const asks = new Set(findBookingAsks(sentences.join(' ')));
-    drop(s => asks.has(s), 'booking_ask');
+    // 2026-10-11 (rehash NEPQ handoff): a post-demo lead who said yes to the
+    // call with no Rehash Call times read gets asked for THEIR time ("What's a
+    // good time today or tomorrow for a quick call?"). That is the call, not a
+    // visit booking ask, and it was being stripped down to "Good.". Only with
+    // no clock time of our own and no visit words.
+    const callTimeAsk = (s) => plan.post_demo && plan.call_offer_ok && /\bcall\b/i.test(s) && clockMinutes(s).length === 0
+      && !/\b(?:visit|come\s+(?:out|by)|stop\s+by|appointment|measure|estimate|in-?home)\b/i.test(s);
+    drop(s => asks.has(s) && !callTimeAsk(s), 'booking_ask');
   }
   // 4. Never "see you then", never a final-sounding confirmation.
   drop(s => SEE_YOU_RX.test(s), 'see_you_then');
@@ -1682,7 +1706,7 @@ export function enforceNepqPlan(draft, plan, { allowFigures = false, known = {} 
   // Never on a post-demo plan, a deferral, a close or after a goodbye
   // (2026-10-09: "Enjoy your week. Is it more how they look, or how they work?").
   const endsOnSignOff = isSignOffLine(splitSentences(body).slice(-1)[0] || '');
-  const noDiscovery = plan.post_demo || ['defer', 'close', 'competitor_signed', 'post_demo_ack'].includes(plan.step) || endsOnSignOff;
+  const noDiscovery = plan.post_demo || ['defer', 'close', 'competitor_signed', 'post_demo_ack', 'post_demo_stop'].includes(plan.step) || endsOnSignOff;
   if ((plan.required_move === 'probe' || plan.required_move === 'consequence') && !body.includes('?') && !actionable && !noDiscovery) {
     // A discovery turn collects no details: "Let me get your zip code so I can
     // confirm…" next to the question was two asks, and a zip asked twice

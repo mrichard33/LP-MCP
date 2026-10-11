@@ -5,6 +5,30 @@ Notable behavioral changes to the LP MCP server. Newest first.
 Rule-layer (`agent_rules`) changes ship through the database, not through this
 repo — they are recorded in `sql/seeds/` on the date they were applied live.
 
+## 2026-10-11
+
+- **Rehash leads get a post-demo conversation, not a new-lead one.** A lead who
+  already had the in-home demo (tag `active-f.0` or `rehash`, or texting the
+  rehash line) was handed the new-lead "What got you looking at the windows?"
+  step right above the rule that bans windows questions. They now get their own
+  track, one step per text: the proposal, where they are, what is holding them
+  back, what would make it work, then the call. Objections are asked back
+  ("Too expensive compared to what?", "How do they compare?"), never argued.
+  Two no's in a row and the bot stops asking (`src/agentic/rehash-nepq.js`).
+- **"The best deal possible" is the one hint allowed.** The bridge to the call
+  is "I want to make sure you're getting the best deal possible. I may be able
+  to do something for you, it's just easier on a quick call." It is said at
+  most once per conversation. Any amount, percentage, discount, promo, special
+  price or "a great deal" is still stripped.
+- **A booked rehash call names who calls and posts its card.** "You're all set
+  for [day] at [time]. John will give you a call then." (first person when the
+  bot speaks as that rep; "someone from our team" when the name is unknown,
+  never a guess; more names via `REHASH_TEAM_USER_NAMES`). The #contact-rehash
+  card now also posts for a booked call, with the time and the team member.
+- **Fix:** with no Rehash Call times read, the reply asking "What's a good time
+  today or tomorrow for a quick call?" was cut down to "Good." as if it were a
+  visit booking ask. It now goes out.
+
 ## 2026-10-01
 
 - **Blocked leads that come back now ask for a DNC lift on their own.** A new

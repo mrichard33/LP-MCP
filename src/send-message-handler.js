@@ -4358,13 +4358,16 @@ export async function executeSendMessage(action, context) {
     // you" is a promise nobody keeps. Failure-soft: the send already happened.
     // 2026-10-09: not when real Rehash Call times were just offered, or the
     // call is now booked on the Rehash Call calendar (GHL tells the rep).
-    if (generated?.rehash?.active && generated?.rehash_call?.agreed && !generated?.rehash_slots_offered && !inlineBooking?.landed) {
+    // 2026-10-11 (rehash NEPQ handoff): a call BOOKED on Rehash Call posts the
+    // card too, with the slot and the team member it is booked with.
+    const rehashBooked = generated?.rehash?.active && inlineBooking?.landed && generated?.rehash_booked ? generated.rehash_booked : null;
+    if (generated?.rehash?.active && ((generated?.rehash_call?.agreed && !generated?.rehash_slots_offered && !inlineBooking?.landed) || rehashBooked)) {
       try {
         const { name, phone, lpLead, ghlContact } = await resolveContactInfo(contactId, context);
         let market = null;
         try { market = await resolveMarket({ ghlContact, lpLead }); } catch { /* the card still goes out */ }
         const firstName = String(name || '').trim().split(/\s+/)[0] || null;
-        await notifyRehashCall({ contactId, generated, triggerMessage: replyTriggerMessage, contact: { firstName: firstName && firstName !== 'Unknown' ? firstName : null, phone, market } });
+        await notifyRehashCall({ contactId, generated, triggerMessage: replyTriggerMessage, booked: rehashBooked, contact: { firstName: firstName && firstName !== 'Unknown' ? firstName : null, phone, market } });
       } catch (rcErr) {
         console.warn(`[SendMessage] rehash call card failed for ${contactId} (fail-soft): ${rcErr.message}`);
       }

@@ -26,6 +26,31 @@ export const REHASH_CALL_SLOT_MODES = Object.freeze(['off', 'shadow', 'live']);
 export const REHASH_CALL_MINUTES = 15;
 const READ_CAP_MS = 4000;
 
+// 2026-10-11 (rehash NEPQ handoff): the booked call is confirmed with the
+// first name of the team member it is booked with ("John will give you a call
+// then"). GHL user ids carry no name here, so the names come from
+// REHASH_TEAM_USER_NAMES ("id:Name,id:Name" or a JSON object) over the one
+// default we know: TYcZ9DcNkuPCFYsFxRFV is John Manieri, the Rehash rep
+// (rehash-assignee.js). An id with no name gets none: the line then says
+// "someone from our team" and never guesses.
+const REHASH_TEAM_NAMES_DEFAULT = Object.freeze({ TYcZ9DcNkuPCFYsFxRFV: 'John' });
+
+/** The first name of a rehash team member by GHL user id, or null. Pure. */
+export function rehashRepFirstName(userId, env = process.env) {
+  const id = String(userId || '').trim();
+  if (!id) return null;
+  let map = { ...REHASH_TEAM_NAMES_DEFAULT };
+  const raw = String(env.REHASH_TEAM_USER_NAMES || '').trim();
+  if (raw) {
+    try {
+      const parsed = raw.startsWith('{') ? JSON.parse(raw) : Object.fromEntries(raw.split(',').map((p) => p.split(':').map((x) => x.trim())).filter((p) => p.length === 2 && p[0] && p[1]));
+      map = { ...map, ...parsed };
+    } catch { /* a bad value keeps the defaults */ }
+  }
+  const name = String(map[id] || '').trim().split(/\s+/)[0];
+  return name || null;
+}
+
 /** REHASH_CALL_SLOTS_MODE off|shadow|live, default shadow; a typo is shadow. */
 export function rehashCallSlotsMode(env = process.env) {
   const raw = String(env.REHASH_CALL_SLOTS_MODE ?? '').trim().toLowerCase();
@@ -41,7 +66,7 @@ export function rehashCallMinutes(env = process.env) {
 /**
  * The rep's open call times on the Rehash Call calendar, or null when there is
  * no calendar or nothing could be read. Never throws.
- * @returns {Promise<{ calendarId, rep, offer: object[], all: object[], tz } | null>}
+ * @returns {Promise<{ calendarId, rep, repName, offer: object[], all: object[], tz } | null>}
  *   offer  the two times to offer (team hours, 30+ minutes out)
  *   all    every opening read, to resolve a pick or a typed time
  */
@@ -76,7 +101,7 @@ export async function readRehashCallSlots({ contactId, timezone, tzLabel = 'ET',
     // two soonest real openings in the 14 days (an hour apart, same day allowed).
     let offer = (sel?.slots || []).slice(0, 2);
     if (offer.length < 2 && all.length >= 2) offer = d.spreadCallOffer(all, 2);
-    return { calendarId, rep, offer: offer.map(withTz), all: all.map(withTz), tz: tzLabel };
+    return { calendarId, rep, repName: rehashRepFirstName(rep, env), offer: offer.map(withTz), all: all.map(withTz), tz: tzLabel };
   } catch (err) {
     console.warn(`[RehashSlots] ${contactId}: Rehash Call read failed (${err.message}) — the reply asks for their time instead`);
     return null;
