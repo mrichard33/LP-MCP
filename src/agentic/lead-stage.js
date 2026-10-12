@@ -371,6 +371,13 @@ export function computeStage({ stored = null, conversation = [], trigger = '', r
   return done(derived.stage, derived.reason);
 }
 
+/** The reschedule step a live-chat cancel-flow outcome stands for, or null. Pure. */
+export function rescheduleStepFor(outcome) {
+  if (outcome === 'offered_slots') return 'offered';
+  if (outcome === 'rescheduled' || outcome === 'would_reschedule') return 'moved';
+  return null;
+}
+
 /** The track stage a side state returns to. Pure. */
 function returnTo(stored) {
   if (!stored?.stage) return null;
@@ -416,7 +423,7 @@ export function labelDifference(liveOptions = []) {
  */
 export function buildStageInput({
   conversation = [], trigger = '', plan = null, zip = null, market = null, tz = null,
-  outOfArea = false, rehash = false, buyerStage = null, channel = null,
+  outOfArea = false, rehash = false, buyerStage = null, channel = null, reschedule = null,
 } = {}) {
   const thread = (Array.isArray(conversation) ? conversation : []).slice(-30).map(m => ({
     direction: String(m?.direction || '').toLowerCase() === 'outbound' ? 'outbound' : 'inbound',
@@ -438,7 +445,7 @@ export function buildStageInput({
     conversation: thread,
     trigger: String(trigger || ''),
     plan: p,
-    ctx: { zip: zip || null, market: market || null, tz: tz || null, outOfArea: !!outOfArea, rehash: !!rehash, channel },
+    ctx: { zip: zip || null, market: market || null, tz: tz || null, outOfArea: !!outOfArea, rehash: !!rehash, channel, ...(RESCHEDULE_STEPS.includes(reschedule) ? { reschedule } : {}) },
     buyerStage: buyerStage ?? null,
   };
 }

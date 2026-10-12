@@ -1283,6 +1283,59 @@ test('after the bridge, more detail gets the visit question again, never a call'
   assert.match(sent, /\?$/);
 });
 
+// ── 2026-10-12 (handoff PR 5, LEAD_STAGE_MODE=live; sim reschedule_not_moved) ──
+async function withLiveStage(fn) {
+  const before = process.env.LEAD_STAGE_MODE;
+  process.env.LEAD_STAGE_MODE = 'live';
+  try { return await fn(); } finally { if (before === undefined) delete process.env.LEAD_STAGE_MODE; else process.env.LEAD_STAGE_MODE = before; }
+}
+
+test('live: an unclear answer to the offer gets ONE clarifying question, never a cancel or a cancel card', () => withLiveStage(async () => {
+  const { lane, state } = laneWithCancel([...UP_TO_OFFER, TZ('inbound', 'what color are the frames', 70)], { freeSlots: SLOTS });
+  await lane.processInbound(INBOUND('what color are the frames'));
+  assert.match(state.sends[0].message, /move your appointment to another day, or cancel it\?/);
+  assert.equal(state.cancels, undefined);
+  await new Promise(r => setImmediate(r));
+  assert.equal((state.cards || []).length, 0, 'no card on an unclear answer');
+}));
+
+test('live: still unclear after the clarifying question → a person sets the time, nothing cancelled', () => withLiveStage(async () => {
+  const clarify = 'Just to be sure I get this right, would you like to move your appointment to another day, or cancel it?';
+  const { lane, state } = laneWithCancel([...UP_TO_OFFER, TZ('inbound', 'hmm', 70), TZ('outbound', clarify, 80), TZ('inbound', 'idk', 100)], { freeSlots: SLOTS });
+  await lane.processInbound(INBOUND('idk'));
+  assert.doesNotMatch(state.sends[0].message, /cancel/i);
+  assert.match(state.sends[0].message, /scheduling team/);
+  assert.equal(state.cancels, undefined);
+  await new Promise(r => setImmediate(r));
+  assert.match(state.cards[0].text, /LIVE CHAT RESCHEDULE — call to set a new time/);
+}));
+
+test('live: "move it, a different day" → two real times right away', () => withLiveStage(async () => {
+  const { lane, state } = laneWithCancel([...UP_TO_OFFER, TZ('inbound', 'no, a different day please', 70)], { freeSlots: SLOTS });
+  await lane.processInbound(INBOUND('no, a different day please'));
+  assert.match(state.sends[0].message, /I have Tue, Oct 6 at 10:00 AM or Wed, Oct 7 at 2:00 PM/);
+  assert.equal(state.cancels, undefined, '"no, a different day" is a move, not a cancel');
+}));
+
+test('live: "the first one" after the model\'s own offer wording moves the appointment (no discovery)', () => withLiveStage(async () => {
+  const modelOffer = 'No problem, Rick. I can do Tue, Oct 6 at 10:00 AM or Wed, Oct 7 at 2:00 PM ET. Which works better?';
+  const { lane, state } = laneWithCancel([...UP_TO_OFFER, TZ('inbound', 'yes', 70), TZ('outbound', modelOffer, 80), TZ('inbound', 'The first one', 100)], { freeSlots: SLOTS });
+  await lane.processInbound(INBOUND('The first one'));
+  assert.deepEqual(state.moves, [{ contactId: 'RICK1', oldAppointmentId: 'APPT9', calendarId: 'CAL1', startIso: SLOTS[0].iso }]);
+  assert.match(state.sends[0].message, /now set for/);
+  assert.doesNotMatch(state.sends[0].message, /how many|windows/i);
+  await new Promise(r => setImmediate(r));
+  assert.match(state.cards[0].text, /earlier cancel request for this visit is WITHDRAWN/);
+}));
+
+test('live: an unclear pick gets the same two times once more, not a hand-off', () => withLiveStage(async () => {
+  const offerLine = 'Sure. I have Tue, Oct 6 at 10:00 AM or Wed, Oct 7 at 2:00 PM ET open. Which one works better for you?';
+  const { lane, state } = laneWithCancel([...UP_TO_OFFER, TZ('inbound', 'yes', 70), TZ('outbound', offerLine, 80), TZ('inbound', 'hmm let me see', 100)], { freeSlots: SLOTS });
+  await lane.processInbound(INBOUND('hmm let me see'));
+  assert.match(state.sends[0].message, /Tue, Oct 6 at 10:00 AM or Wed, Oct 7 at 2:00 PM/);
+  assert.equal(state.moves, undefined);
+}));
+
 // ── 2026-10-12 (handoff PR 4): the zip the visitor typed decides the zone ──
 test('a zip the visitor typed reaches the booking-slot read (77494 → Central, not the record\'s ET)', async () => {
   const calls = [];
