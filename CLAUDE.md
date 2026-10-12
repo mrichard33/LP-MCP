@@ -1162,7 +1162,11 @@ Mark's real lists. Both use the general phone until their own is known. Houston 
 **Central time**: `src/config/market-timezones.js` maps the market, `src/services/contact-timezone.js`
 resolves a contact's zone from their zip, and customer-facing times (slots, appointment text, the
 prompt's TIME NOW, that contact's quiet hours) follow it. Office/dialer hours stay ET with an "ET"
-label. Never tell a visitor Reece serves only Florida. Coverage questions are zip-first
+label. **A zip the lead TYPES decides the zone, not only the record's (handoff PR 4, 2026-10-12).** A
+Katy lead typed 77494 and was offered "10:00 AM ET": `typedZipFromThread` / `zoneForContact`
+(`src/services/contact-timezone.js`) set `context.market` before the SMS slot read and pass `zip` to live chat's
+`offerBookingSlots`, so the times are read and labelled CT. The allowed visit start hours (10, 2, 6) stay checked in the
+office zone the GHL calendars are laid out in. Never tell a visitor Reece serves only Florida. Coverage questions are zip-first
 (`src/agentic/service-area-turn.js`, both reply paths): ask for the zip, then answer in the first
 sentence. Not yet wired for the new markets: `lp_branch_market_map`, `slack_market_slugs`.
 

@@ -63,6 +63,7 @@ import { enforceOneAsk } from '../agentic/one-ask.js';
 import { looksLikeShortPhone } from '../agentic/contact-typos.js';
 import { planNepqTurn, enforceNepqPlan, referenceRetryNote, nepqBackboneMode, pickFresh, LINES as NEPQ_LINES, isServiceCallback, dropUnsafeLines, leadWantsCall } from '../agentic/nepq-planner.js';
 import { buildStageInput } from '../agentic/lead-stage.js';
+import { typedZipFromThread } from '../services/contact-timezone.js';
 import { NO_DIAL_REASONS } from '../agentic/bot-callback.js';
 import { isCustomerP2 } from '../agentic/lead-state/signals/context-reader.js';
 import { COLLECT_ASK, COLLECT_ASK_AGAIN, dmAsk, holdLine, missingItems, parseDecisionMakers, heldSlot, nameFromReply, addressConfirmAsk, addressConfirmState, mentionedPartner, dmAnswerFromThread, slotLabel } from '../agentic/booking-collect.js';
@@ -738,7 +739,7 @@ export function createLiveChatFastLane(deps) {
     const tags = (Array.isArray(contact?.tags) ? contact.tags : []).map(t => String(t).trim().toLowerCase());
     // Warm the calendar read while the rest of the turn is built: the NEPQ
     // offer below reuses it (cachedFreeSlots shares the in-flight read).
-    if (d.nepqMode() === 'live') Promise.resolve().then(() => d.offerBookingSlots({ contact })).catch(() => null);
+    if (d.nepqMode() === 'live') Promise.resolve().then(() => d.offerBookingSlots({ contact, zip: typedZipFromThread([], body) })).catch(() => null);
     // Part 7: the full lead context and the appointments start now too, so
     // the quiet wait below hides most of their time (the reply waits for them
     // up to LIVE_CHAT_CONTEXT_CAP_MS from here, not from the reply's start).
@@ -1060,7 +1061,9 @@ export function createLiveChatFastLane(deps) {
       if (!saPlan.active && wantsSlots(nepqPlan)) {
         // Real times only when the move can use them, under their own cap.
         const preferredText = nepqPlan.time_request || (nepqPlan.step === 'confirm' ? body : nepqPlan.step === 'collect' ? nepqPlan.held_slot?.text : null);
-        const got = await raceWithBudget(Promise.resolve().then(() => d.offerBookingSlots({ contact, preferredText })), NEPQ_SLOT_LOOKUP_MS);
+        // The zip they typed decides the zone (2026-10-12, PR 4: 77494 got "ET").
+        const typedZip = typedZipFromThread(context.conversation_recent || [], body);
+        const got = await raceWithBudget(Promise.resolve().then(() => d.offerBookingSlots({ contact, preferredText, zip: typedZip })), NEPQ_SLOT_LOOKUP_MS);
         nepqSlots = (!got.timedOut && !got.error && got.value?.slots?.length >= 2) ? got.value : null;
         if (!nepqSlots) d.log(`[NEPQ] live chat ${contactId} no slots for ${nepqPlan.required_move}: ${got.timedOut ? 'timed out' : got.error ? got.error.message : `${got.value?.slots?.length || 0} slot(s)`}`);
         if (nepqSlots) nepqPlan = planNepqTurn({ ...planInput, slots: nepqSlots.slots, allSlots: nepqSlots.all || null, tzLabel: nepqSlots.tzLabel });

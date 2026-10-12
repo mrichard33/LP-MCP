@@ -405,6 +405,7 @@ import { contactRecheckLine, recheckHint, RECHECK_RX } from './agentic/contact-c
 import { smsBookingTurn, enforceBookingFacts, bookingFactsNote } from './agentic/sms-booking-turn.js';
 import { LINES as NEPQ_LINES } from './agentic/nepq-planner.js';
 import { buildStageInput } from './agentic/lead-stage.js';
+import { typedZipFromThread, zoneForContact } from './services/contact-timezone.js';
 import { isCustomerP2 } from './agentic/lead-state/signals/context-reader.js';
 import { isUnsoldPostDemo, lpSold, postDemoOwnerName, replaceSalesRepFollowUp } from './agentic/post-demo-owner.js';
 import { postDemoPlannerMode } from './agentic/post-demo-turn.js';
@@ -3873,6 +3874,23 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     return { identityState: st, serviceArea: sa, serviceAreaTentative: saT };
   });
   identityRead.catch(() => {});
+
+  // 2026-10-12 (handoff PR 4, batch 2 #2): a Katy, TX lead typed 77494 and
+  // was offered "10:00 AM ET". The zone came only from the record's zip. A zip
+  // typed in the conversation is where the visit is: in a served market, it
+  // sets the zone the times are read, labelled and written in (Houston → CT).
+  try {
+    const typedZip = typedZipFromThread(context.conversation_recent || [], triggerMessage);
+    if (typedZip && typedZip !== String(context.lead?.postal_code || '').slice(0, 5)) {
+      const z = await zoneForContact({ typedZip });
+      if (z.market_code && z.market_code !== context.market?.market_code) {
+        console.log(`[MarketZone] ${contactId}: typed zip ${typedZip} → ${z.market_code} (${z.label})`);
+        context.market = { ...(context.market || {}), timezone: z.timezone, label: z.label, market_code: z.market_code };
+      }
+    }
+  } catch (err) {
+    console.warn(`[MarketZone] ${contactId}: typed-zip zone read failed (record zone kept): ${err.message}`);
+  }
 
   const calendarId = getCalendarIdFromKbPack(kbPack)
     || (nepqWantsSlots ? (nepqVisitFirst ? inHomeCalendarFor(context.lead?.current_tags || []).calendar_id : BOOKING_CALENDARS.PROTECTION_PROFILE_REVIEW) : null);

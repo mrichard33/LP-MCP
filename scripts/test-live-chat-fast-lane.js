@@ -1282,3 +1282,15 @@ test('after the bridge, more detail gets the visit question again, never a call'
   assert.match(sent, /next step/i);
   assert.match(sent, /\?$/);
 });
+
+// ── 2026-10-12 (handoff PR 4): the zip the visitor typed decides the zone ──
+test('a zip the visitor typed reaches the booking-slot read (77494 → Central, not the record\'s ET)', async () => {
+  const calls = [];
+  const { lane } = makeLane({ mode: 'shadow', checkServiceArea: async (zip) => ({ checked: true, zip, in_service_area: true, market_code: 'HOU', city: 'Katy' }), extra: {
+    nepqMode: () => 'live',
+    offerBookingSlots: async (a) => { calls.push(a); return { slots: [], tzLabel: 'CT' }; },
+  } });
+  await lane.processInbound(INBOUND('77494'));
+  assert.ok(calls.length >= 1, 'the calendar read was warmed');
+  assert.equal(calls[0].zip, '77494');
+});
