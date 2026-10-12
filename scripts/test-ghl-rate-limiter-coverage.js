@@ -183,7 +183,10 @@ function scanGhlFetchSites(dir = 'src') {
       if (!src.includes(GHL_V2_HOST)) continue;
       const lines = src.split('\n');
 
-      for (const m of src.matchAll(/\bfetch\s*\(/g)) {
+      // 2026-10-12: also the injected spellings (doFetch, fetchImpl, fetchFn).
+      // decision-engine.js read every event's contact through `doFetch(` for
+      // months outside the bucket, because `\bfetch` never matched it.
+      for (const m of src.matchAll(/\b(?:fetch|doFetch|fetchImpl|fetchFn)\s*\(/g)) {
         const i = m.index;
         const lineNo = src.slice(0, i).split('\n').length - 1;
         const line = lines[lineNo];
@@ -193,6 +196,7 @@ function scanGhlFetchSites(dir = 'src') {
         if (line.slice(0, col).includes('//') || line.trim().startsWith('*')) continue;
 
         if (src.slice(Math.max(0, i - 40), i).includes('withGhlToken(() => ')) continue;
+        if (src.slice(Math.max(0, i - 40), i).includes('withGhlToken(async () => ')) continue;
         if (lines.slice(Math.max(0, lineNo - 25), lineNo).join('\n').includes('acquireToken(')) continue;
         if (lineNo > 0 && lines[lineNo - 1].includes(EXEMPT_MARKER)) continue;
 

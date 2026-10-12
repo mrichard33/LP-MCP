@@ -196,6 +196,7 @@
  */
 
 import supabase from '../supabase.js';
+import { withGhlCaller } from '../ghl-caller.js';
 import { ensureGuideName, pendingTagFor } from '../agentic/guide-name.js';
 import { guideNameDeps } from '../services/guide-name-io.js';
 import { isGuideDeliveryTag } from '../agentic/guide-delivery.js';
@@ -907,7 +908,10 @@ export function decideNotBefore(action, nowMs) {
 // reaper. Wrapping here covers every path at once: the fast path,
 // executeActionById, the sweep and runActionsNow.
 function executeSingleAction(action, batchContext = {}, priorBatchResults = []) {
-  return trackAction(executeSingleActionUntracked(action, batchContext, priorBatchResults));
+  // 2026-10-12: GHL requests made by a handler are credited to its action type
+  // (src/ghl-caller.js), whichever job or route queued the row.
+  return trackAction(withGhlCaller(`action:${action?.action_type || 'unknown'}`,
+    () => executeSingleActionUntracked(action, batchContext, priorBatchResults)));
 }
 
 async function executeSingleActionUntracked(action, batchContext = {}, priorBatchResults = []) {
