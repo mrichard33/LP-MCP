@@ -396,3 +396,16 @@ FROM keys k
 LEFT JOIN leads l ON l.grain = k.grain AND l.period_start = k.period_start AND l.market = k.market AND l.lp_sub_source = k.lp_sub_source
 LEFT JOIN costs c ON c.grain = k.grain AND c.period_start = k.period_start AND c.market = k.market AND c.lp_sub_source = k.lp_sub_source
 LEFT JOIN dollars d ON k.grain = 'month' AND d.month = k.period_start AND d.market = k.market AND d.lp_sub_source = k.lp_sub_source;
+
+-- ─── Row-level security ───────────────────────────────────────────────────────
+-- The live project enables RLS on every new public table (feature_modes and
+-- lead_conversation_stage carry the same lines), and the first CI drift check
+-- (2026-10-12) read its absence here as six statements of drift. No policies:
+-- LP-MCP and the dashboard read and write these tables with the service role,
+-- which bypasses RLS; anon and authenticated keys see nothing.
+ALTER TABLE public.marketing_vendors            ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.marketing_invoice_documents  ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.marketing_expenses           ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.marketing_expense_allocations ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.marketing_cost_rules         ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.marketing_territory_map      ENABLE ROW LEVEL SECURITY;
