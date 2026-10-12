@@ -35,7 +35,7 @@ export async function loadTerritoryMap({ supabase = supabaseDefault } = {}) {
 export async function feedVendor({ supabase = supabaseDefault } = {}) {
   const { data, error } = await supabase.from('marketing_vendors').select('*').eq('vendor_name', 'Lead Gurus').maybeSingle();
   if (error) throw new Error(`vendor read failed: ${error.message}`);
-  if (!data) throw new Error('marketing_vendors has no "Lead Gurus" row — apply sql/158');
+  if (!data) throw new Error('marketing_vendors has no "Lead Gurus" row — apply migration 20261012222106_158_marketing_cost_ledger');
   return data;
 }
 

@@ -434,7 +434,7 @@ export async function runPull({ date_after, date_before } = {}) {
   const summary = await upsertSummary({ date_after, date_before });
   const leads = await pullLeads({ date_after, date_before });
 
-  // 2026-10-12 — marketing cost ledger (sql/158). Every territory day becomes
+  // 2026-10-12 — marketing cost ledger (migration 20261012222106). Every territory day becomes
   // a PROVISIONAL marketing_expenses row and the day gap goes to REECE_HOLD;
   // the last 7 days are re-synced on every pull because Lead Gurus restates
   // recent days. Best-effort: the pull's own result never depends on it.

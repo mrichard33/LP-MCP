@@ -210,7 +210,7 @@ export function isDncLiftAction(rawBody) {
   } catch { return false; }
 }
 
-// ─── Marketing invoice review buttons (2026-10-12, sql/158) ──────────────────
+// ─── Marketing invoice review buttons (2026-10-12, migration 20261012222106) ──────────────────
 // Approve / Edit / Reject on the #marketing-invoice-review card
 // (src/marketing/slack-review.js), plus the Edit MODAL's view_submission. Both
 // are ours and NEVER relayed: the onboarding workflow reads any action_id but

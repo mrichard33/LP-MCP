@@ -1,4 +1,19 @@
--- ─── sql/158 — Marketing cost ledger (invoices → allocation → cost per issued lead) ──
+-- 20261012222106_158_marketing_cost_ledger — Marketing cost ledger
+-- (invoices → allocation → cost per issued lead).
+--
+-- Written as sql/158 and applied to the live project through the Supabase MCP on
+-- 2026-10-12 (recorded as version 20261012222106, name 158_marketing_cost_ledger),
+-- the same day the migrations ledger (sql/README.md) froze sql/NNN at 157. The
+-- file keeps that version so `supabase db push` records nothing new and the
+-- ledger compare in CI agrees with the database. Every statement is idempotent
+-- (IF NOT EXISTS / OR REPLACE / ON CONFLICT DO NOTHING), so a replay is a no-op.
+--
+-- ROLLBACK: DROP VIEW v_market_subsource_cost; DROP FUNCTION mkt_sales_dollars(date),
+-- mkt_sales_snapshot(date), mkt_lead_counts(date, date), mkt_issued_counts(date, date);
+-- DROP TABLE marketing_expense_allocations, marketing_expenses, marketing_invoice_documents,
+-- marketing_cost_rules, marketing_territory_map, marketing_vendors; (export the ledger
+-- first: it is the only record of approved marketing spend). Destructive rollback only;
+-- this migration itself drops nothing.
 --
 -- 2026-10-12 (handoff "Marketing Cost Ledger, Invoice Automation & Brad-Format
 -- Reporting v2", Mark + Brad Codman). Until now marketing cost was typed into

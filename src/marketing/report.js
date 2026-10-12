@@ -1,7 +1,7 @@
 /**
  * Brad-format report model — src/marketing/report.js (handoff §9).
  *
- * Reads v_market_subsource_cost (sql/158) and shapes the three sheets Brad's
+ * Reads v_market_subsource_cost (migration 20261012222106) and shapes the three sheets Brad's
  * `September_Month_Cost_FT_Myers_Office.xlsx` carries:
  *   Campaign Summary  the selected month, one row per sub-source
  *   Monthly Results   Jan → the selected month, one row per month

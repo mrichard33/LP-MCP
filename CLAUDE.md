@@ -538,7 +538,7 @@ kinds, so a wide `since` can fill live jobs without minting Won/Lost cards for s
 half of `checkLeadTriggers`: its filter never matched, and a "fixed" one would onboard every historical
 sale.
 
-**Marketing cost is a ledger, not an LP field (Mark + Brad Codman, 2026-10-12; sql/158).** Report 136 and LP cost entry
+**Marketing cost is a ledger, not an LP field (Mark + Brad Codman, 2026-10-12; `supabase/migrations/20261012222106_158_marketing_cost_ledger.sql`).** Report 136 and LP cost entry
 are retired: nobody types a cost into LP again, and no code reads `mcost_cents` for a cost. The money lives in
 `marketing_expenses` (invoice lines, Lead Gurus feed days, commission rules) and is split per month and market in
 `marketing_expense_allocations` by GROSS ISSUED LEADS (D1: `ever_issued` by `created_at_lp`, `mkt_issued_counts`); Net /

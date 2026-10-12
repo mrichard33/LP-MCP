@@ -2,7 +2,7 @@
 /**
  * Setup the marketing Storage buckets — scripts/setup-marketing-buckets.js
  *
- * Two PRIVATE Supabase Storage buckets for the marketing cost ledger (sql/158):
+ * Two PRIVATE Supabase Storage buckets for the marketing cost ledger (migration 20261012222106):
  *   marketing-invoices  the original invoice files, <yyyy>/<mm>/<sha>.<ext>
  *   marketing-reports   the Brad-format XLSX files, <yyyy-mm>/<market>.xlsx
  * Both are read through 7-day signed URLs only. Same shape and the same LP-

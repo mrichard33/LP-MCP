@@ -321,7 +321,7 @@ import { startOpsMorningDigestScheduler } from './jobs/ops-morning-digest.js';  
 import { startOfficePowerRankingScheduler } from './jobs/office-power-ranking.js';  // 2026-09-24
 import { startSaleBackstopScheduler } from './jobs/sale-announce-backstop.js';  // 2026-09-25
 import { startSaleP2BackstopScheduler } from './jobs/sale-p2-backstop.js';  // 2026-10-03 — every LP sale gets a P2 card
-// 2026-10-12 — marketing cost ledger (sql/158): invoice ingest, nightly costs, Brad-format report.
+// 2026-10-12 — marketing cost ledger (migration 20261012222106): invoice ingest, nightly costs, Brad-format report.
 import { registerMarketingInvoiceRoutes } from './jobs/marketing-invoice-ingest.js';
 import { registerMarketingCostRoutes, startMarketingCostNightlyScheduler } from './jobs/marketing-cost-nightly.js';
 import { registerMarketingReportRoutes } from './jobs/marketing-cost-report.js';
