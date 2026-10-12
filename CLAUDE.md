@@ -879,6 +879,20 @@ again). `stageBlock` renders from the stored stage (`playForConversationStage`),
 transition default is the free home visit. The simulator and `run_bot_eval` take `lead_stage_mode` (shadow|live) to try
 it before Railway is switched.
 
+**A renter gets no visit; one out-of-area decline; quote ≠ price (handoff PR 3, 2026-10-12).** A renter was offered
+times twice (batch 3 T3). `enforceNonOwner` (`src/agentic/non-owner.js`, the last pass in both bots beside
+`enforcePropertyScope`, ACTIVE in every mode) turns a reply to a lead who says they rent into `NON_OWNER_LINE` (the
+homeowner needs to be part of the visit; the owner is welcome to reach out), drops the time offer when they said it
+earlier, drops the `book_appointment` companion, and the live chat never books one (`isNonOwner`). A landlord ("we rent
+it out") is an owner (`homeowner.js`). Zip 10001 was declined on SMS and "good chance we can help" in live chat: both
+bots now give `outOfAreaLine` (service-area-turn.js; the SMS SERVICE_AREA_EXIT text and the `serviceAreaOutside` prompt
+too, which no longer offers a team callback), and live chat checks a zip typed outside a coverage question
+(`zipInText`). With `LEAD_STAGE_MODE=live` (`planNepqTurn({ stageLive })`): a plain quote request is NEPQ's info request
+(`LINES.info_request`, once), not the price play (`isPriceAsk({ quoteIsPrice: false })`; an insist or a price word still
+is), and "we went with another company" gets `LINES.competitor` (the disarm, then how they would decide; no consequence
+move after it; a second time → `repeat_objection`). `CLAIMS_RX` strips claims that another company's work is not "up to
+code".
+
 **Every GHL request is credited to the code that made it (2026-10-12).** LP-MCP made ~127,000 GHL requests in 24h
 (~63% of GHL's 200k/day cap, peaks 268/min at 5 AM) and the rehash sweep failed 1 pass in 4 on 429s, with no way to
 say who made the calls. `src/ghl-caller.js` carries a label in AsyncLocalStorage, set where work starts: `job:<id>`

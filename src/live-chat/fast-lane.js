@@ -55,6 +55,7 @@ import { buildEstablishedFacts } from '../agentic/established-facts.js';
 import { humanizeReply, restoreQuestionMark } from '../agentic/human-voice.js';
 import { enforceTeamVoice } from '../agentic/team-voice.js';
 import { enforcePropertyScope } from '../agentic/property-scope.js';
+import { enforceNonOwner, isNonOwner, NON_OWNER_LINE } from '../agentic/non-owner.js';
 import { enforceCallTiming, promisedCallback, isTeamOpen } from '../agentic/team-hours.js';
 import { rewriteBookingClaims, appointmentOnFile, checkBookingTruth, bookingResult, noPromiseHandoffLine } from '../agentic/booking-claim.js';
 import { enforceCancelledVisit } from '../agentic/cancelled-visit.js';
@@ -62,7 +63,7 @@ import { lpNoteDqMode } from '../agentic/lp-note-dq.js';
 import { enforceOneAsk } from '../agentic/one-ask.js';
 import { looksLikeShortPhone } from '../agentic/contact-typos.js';
 import { planNepqTurn, enforceNepqPlan, referenceRetryNote, nepqBackboneMode, pickFresh, LINES as NEPQ_LINES, isServiceCallback, dropUnsafeLines, leadWantsCall } from '../agentic/nepq-planner.js';
-import { buildStageInput } from '../agentic/lead-stage.js';
+import { buildStageInput, leadStageMode } from '../agentic/lead-stage.js';
 import { NO_DIAL_REASONS } from '../agentic/bot-callback.js';
 import { isCustomerP2 } from '../agentic/lead-state/signals/context-reader.js';
 import { COLLECT_ASK, COLLECT_ASK_AGAIN, dmAsk, holdLine, missingItems, parseDecisionMakers, heldSlot, nameFromReply, addressConfirmAsk, addressConfirmState, mentionedPartner, dmAnswerFromThread, slotLabel } from '../agentic/booking-collect.js';
@@ -105,6 +106,7 @@ import { isDNCSignal } from '../behavioral-emitter.js';
 import { resolveTimeout } from '../llm-client.js';
 import {
   planServiceAreaTurn,
+  zipInText,
   resolveCoverage,
   guardCoverageDraft,
   serviceAreaRecord,
@@ -962,6 +964,21 @@ export function createLiveChatFastLane(deps) {
     let saPlan = planServiceAreaTurn({ trigger: body, conversation: context.conversation_recent, fileZip: context.lead_facts?.property?.zip || null });
     // A cancel or Spanish turn is that flow's, never a coverage question.
     if (planOverride) saPlan = { ...saPlan, active: false };
+    // 2026-10-12 (service-area parity, batch 2 #3): a zip typed outside a
+    // coverage question ("zip 10001", the end of an address) is checked like
+    // the SMS identity pass checks it. Out of area → the coverage turn's
+    // decline owns the reply; in area → nothing changes here.
+    let netZipResult = null;
+    if (!saPlan.active && !planOverride) {
+      const netZip = zipInText(body);
+      if (netZip) {
+        const r = await raceWithBudget(Promise.resolve().then(() => d.checkServiceArea(netZip)), SERVICE_AREA_LOOKUP_MS);
+        if (!r.timedOut && !r.error && r.value?.checked && r.value.in_service_area === false) {
+          netZipResult = r.value;
+          saPlan = { ...saPlan, active: true, zip: netZip, net: true };
+        }
+      }
+    }
     // 2026-10-02: an address typed for a held visit is the answer we asked
     // for, not a coverage question. Only an out-of-area zip stops the booking.
     if (saPlan.active && d.nepqMode() === 'live' && heldSlot(context.conversation_recent)) {
@@ -1061,6 +1078,8 @@ export function createLiveChatFastLane(deps) {
         nextStepLabel: 'a free visit at your home', discipline, nowMs: d.now(),
         // A customer's call request goes to service (Mark, 2026-10-03).
         isCustomer: isCustomerP2(context),
+        // 2026-10-12 (PR 3): quote ≠ price and the competitor play, live only.
+        stageLive: leadStageMode() === 'live',
         stage: leadStage,
         knownZip: context.lead?.postal_code || null,
       };
@@ -1121,6 +1140,7 @@ export function createLiveChatFastLane(deps) {
     }
     const capped = (p) => raceWithBudget(Promise.resolve().then(p), SERVICE_AREA_LOOKUP_MS).then(r => (r.timedOut || r.error) ? null : r.value);
     const coverageLookup = !saPlan.active ? Promise.resolve({})
+      : (saPlan.net && netZipResult) ? Promise.resolve({ zipResult: netZipResult })
       : saPlan.zip ? capped(() => d.checkServiceArea(saPlan.zip)).then(zipResult => ({ zipResult }))
         : (saPlan.refused_zip && saPlan.place) ? capped(() => d.lookupPlace(saPlan.place)).then(placeResult => ({ placeResult }))
           : Promise.resolve({});
@@ -1249,6 +1269,10 @@ export function createLiveChatFastLane(deps) {
           if (chk.fallback_used) notesRef.push(bookingFactsNote(facts, chk.problems));
         }
         if (notesRef.length) d.log(`[NEPQ] live chat ${contactId} draft missed the turn's job: ${notesRef.length} note(s) (${(fixRef.failed || []).join(',')}) | draft="${String(message || '').replace(/\s+/g, ' ').slice(0, 200)}"`);
+        // 2026-10-12: a coverage turn's answer stands on this path too (it
+        // returned before guardCoverageDraft, so a contact re-check on a
+        // coverage turn could ship without the decline).
+        if (saPlan.active && coverage) fixedRef = guardCoverageDraft(fixedRef, coverage).fixed;
         return { notes: notesRef, fixed: fixedRef, booking_claim_rewritten: claimRef.changed, nepq_changes: fixRef.changes, reference_failed: notesRef.length > 0 };
       }
       // Human voice first (2026-10-02): the guards below append only clean
@@ -1699,6 +1723,11 @@ export function createLiveChatFastLane(deps) {
         const record = { booking: 'would_book', start: chosen.iso, calendar_id: slots.calendarId || null, decision_makers: decisionMakers };
         return { reply, record, facts: factsFor('book', { book: true, fallback: reply, record }), firstName: name };
       }
+      // 2026-10-12 (no single-leg visits): a lead who said they rent is
+      // never booked, whatever the plan or the mode says (non-owner.js).
+      if (isNonOwner(threadTurns, body)) {
+        return { reply: NON_OWNER_LINE, record: { booking: 'refused_non_owner' } };
+      }
       // Save what they typed BEFORE booking: the booking gate reads the
       // contact (address, name, phone) from GHL.
       try { await d.captureIdentity(contactId, { visitorTexts: allTexts, capture: typed.first_name ? { name: typed.first_name } : {} }); } catch { /* the gate decides */ }
@@ -1777,6 +1806,12 @@ export function createLiveChatFastLane(deps) {
       if (scope.changed) {
         d.log(`[PropertyScope] live chat ${contactId} ${scope.reason}`);
         draft = scope.text;
+      }
+      // A renter gets no visit time (2026-10-12, batch 3 T3; active in every mode).
+      const owner = enforceNonOwner(draft, { thread: stageInput?.conversation || [], inbound: body });
+      if (owner.changed) {
+        d.log(`[NonOwner] live chat ${contactId} ${owner.reason}`);
+        draft = owner.text;
       }
       // Human voice once more, last (2026-10-06 bot gate, spouse/livechat):
       // the first pass runs before the guards, and a sentence a guard drops can

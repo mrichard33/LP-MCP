@@ -94,6 +94,13 @@ export function prefersCall(conversation = [], trigger = '') {
 // schedule ask too.
 export const SCHEDULE_ASK_RX = /\b(?:schedule|book|set\s+up|make|get)\s+(?:an?\s+|the\s+|my\s+)?(?:free\s+|in[-\s]home\s+)?(?:estimate|appointment|consultation|visit|measure(?:ment)?|assessment)\b|\b(?:can|could)\s+(?:someone|you|somebody)\s+come\s+(?:out|by|over)\b|\bset\s+up\s+(?:a\s+)?time\b|\bset\s+(?:it|one|that)\s+up\b|\b(?:book|schedule)\s+(?:it|me|that|one|a\s+time|something)\b|\b(?:pick|grab|lock\s+in)\s+a\s+time\b/i;
 export const PRICE_RX = /\b(?:how\s+much|price[sd]?|pricing|costs?|quotes?|estimates?|ballpark|rough\s+(?:number|idea|figure)|what\s+(?:would|does|will)\s+(?:it|that|this)\s+(?:cost|run))\b/i;
+// PRICE_RX without the bare quote / estimate words (LEAD_STAGE_MODE=live).
+const PRICE_WORD_RX = /\b(?:how\s+much|price[sd]?|pricing|costs?|ballpark|rough\s+(?:number|idea|figure)|what\s+(?:would|does|will)\s+(?:it|that|this)\s+(?:cost|run))\b/i;
+// A plain request for a quote or an estimate.
+export const QUOTE_REQUEST_RX = /\b(?:quotes?|estimates?)\b/i;
+// 2026-10-12 (batch 3 T4/#5): a lead who went (or is going) with another
+// company, before any demo. NEPQ's disarm, then how they would decide.
+export const COMPETITOR_RX = /\b(?:went|going|gone|go|decided\s+to\s+go|signed|signing)\s+with\s+(?:another|a\s+different|some\s+other|other|someone\s+else|a\s+competitor)\b|\balready\s+(?:have|got|hired|picked|chose|found)\s+(?:a|another|someone|somebody)\b[^.?!]{0,30}\b(?:company|contractor|installer|guy|someone|somebody)?|\b(?:another|a\s+different)\s+company\s+(?:is|will\s+be|already)\b/i;
 export const INSIST_RX = /\b(?:just|only)\s+(?:want|need)\s+(?:a|the|to\s+(?:get|know)(?:\s+(?:a|the))?)\s+(?:price|quote|number|cost|estimate)\b|\b(?:give|tell|send|text)\s+me\s+(?:a|the|your)\s+(?:price|number|quote|ballpark|figure|estimate)\b/i;
 // "how much a month" asks for a figure; "do you offer financing?" does not.
 const MONEY_FIGURE_ASK_RX = /\bhow\s+much\b[^?]{0,30}\b(?:a|per)\s+month\b|\bmonthly\s+payments?\s+(?:be|run)\b/i;
@@ -271,6 +278,11 @@ export const LINES = Object.freeze({
   spouse_2_slots: (slots) => `Would it be easier to pick a time when you're both home? I have ${slotPair(slots)}.`,
   spouse_2_no_slots: "Would it be easier to pick a time when you're both home? What day works best for you both?",
   shopping: "Smart move. Let's say everyone checks every box, price included. How would you decide?",
+  // 2026-10-12 (handoff PR 3): NEPQ's "maybe nothing" disarm for a lead who
+  // went with someone else, then the decision question. Read back by DECIDE_Q_RX.
+  competitor: "That's fair, and maybe nothing would change that. Suppose we both meet your criteria, including price. How would you then decide?",
+  // 2026-10-12: a plain quote request (NEPQ info request).
+  info_request: 'Yes, we can help with that. Just so we get you the right thing, what are you hoping to see?',
   think_slots: (slots) => `No problem at all. Want to grab a time now so you don't have to chase us down later? I have ${slotPair(slots)}.`,
   think_no_slots: "No problem at all. What day would work best if you did want someone to come out, so you don't have to chase us down later?",
   not_interested: (name) => `No problem${name ? `, ${name}` : ''}. What changed?`,
@@ -447,11 +459,16 @@ function normalizeThread(conversation, trigger) {
 }
 
 /** Is this inbound a price or figure ask? Plain "do you offer financing?" is not. Pure. */
-export function isPriceAsk(text) {
+export function isPriceAsk(text, { quoteIsPrice = true } = {}) {
   const t = String(text || '');
   if (MONEY_FIGURE_ASK_RX.test(t)) return true;
   if (FINANCING_ONLY_RX.test(t) && !/\bhow\s+much\b/i.test(t)) return false;
   if (SCHEDULE_ASK_RX.test(t) && !/\b(?:how\s+much|cost|price|pricing|ballpark)\b/i.test(t)) return false;
+  // 2026-10-12 (LEAD_STAGE_MODE=live; batch 3 #2): "can I get a quote?" asks
+  // for the thing we do (a written quote at the visit), not for a number.
+  // Only "how much", a price word or an insist ("just need a quote") is a
+  // price ask then; a plain quote request gets the info-request play.
+  if (!quoteIsPrice) return PRICE_WORD_RX.test(t) || INSIST_RX.test(t);
   return PRICE_RX.test(t) || INSIST_RX.test(t);
 }
 
@@ -472,6 +489,8 @@ export function isNo(text, lastOutbound = '') {
 // Every price reply says why there is no number yet; the next turn counts
 // these to decide quote → times → a person (Part 7: the model words them).
 const PRICE_PLAY_RX = /\bevery\s+(?:home|house)(?:'s|’s|\s+is)\s+(?:a\s+little\s+)?different\b|\bany\s+number\s+i\s+gave\b|\ba\s+number\s+(?:right\s+)?now\s+would\s+(?:just\s+)?be\s+a\s+guess\b/i;
+const COMPETITOR_PLAY_RX = /\bmaybe\s+nothing\s+would\s+change\b|\bboth\s+meet\s+your\s+criteria\b/i;
+const INFO_PLAY_RX = /\bjust\s+so\s+we\s+get\s+you\s+the\s+right\s+thing\b/i;
 const QUOTE_LINE_RX = /\bhappy\s+to\s+get\s+you\s+a\s+quote\b|\bexact\s+pricing\s+comes\s+from\s+a\s+quick\s+visit\b|\bcan'?t\s+give\s+a\s+fair\s+price\s+on\s+the\s+spot\b|\bhappy\s+to\s+help\s+with\b[^.?!]*\.\s+what'?s\s+got\s+you\s+looking\s+into\s+(?:them|it|this)\s+now\?|\ba\s+number\s+now\s+would\s+(?:just\s+)?be\s+a\s+guess\b/i;
 // The visitor says the bot is repeating itself (2026-10-02, 5i59G).
 export const REPEAT_COMPLAINT_RX = /\byou\s+(?:just|already)\s+(?:said|asked)(?:\s+(?:that|this))?\b|\bi\s+(?:just|already)\s+(?:said|told\s+you|answered)\b|\bstop\s+asking\b|\byou(?:'re|\s+are)\s+repeating\b|\bsame\s+(?:thing|question)\s+again\b/i;
@@ -516,17 +535,20 @@ export const TIME_REQUEST_RX = new RegExp(String.raw`\b${DAY_WORD}\b[^.?!]{0,30}
 export function isCriteriaReply(text, lastOutbound = '') {
   const t = String(text || '');
   // "Still comparing companies" after the play is the same objection again.
-  return DECIDE_Q_RX.test(String(lastOutbound || '')) && !SHOPPING_RX.test(t) && !INSIST_RX.test(t) && !/\bhow\s+much\b/i.test(t);
+  // "We went with another company" again is the competitor objection again (2026-10-12).
+  return DECIDE_Q_RX.test(String(lastOutbound || '')) && !SHOPPING_RX.test(t) && !COMPETITOR_RX.test(t) && !INSIST_RX.test(t) && !/\bhow\s+much\b/i.test(t);
 }
 
 /** The objection family in this text, or null. Pure. */
-export function objectionType(text, lastOutbound = '') {
+export function objectionType(text, lastOutbound = '', { quoteIsPrice = true, competitor = false } = {}) {
   const t = String(text || '');
   if (isCriteriaReply(t, lastOutbound)) return null;
   if (CRITERIA_LIST_RX.test(t) && !INSIST_RX.test(t) && !/\bhow\s+much\b/i.test(t)) return null;
+  // Another company already chosen (LEAD_STAGE_MODE=live): its own play.
+  if (competitor && COMPETITOR_RX.test(t)) return 'competitor';
   // Shopping before price: "getting 3 quotes" is about deciding, not a price ask.
   if (SHOPPING_RX.test(t)) return 'shopping';
-  if (isPriceAsk(t)) return 'price';
+  if (isPriceAsk(t, { quoteIsPrice })) return 'price';
   // The answer to Mark's spouse question is the spouse objection's second
   // turn, whoever it names (2026-10-02 re-test: "She has to see it before we
   // decide" read as discovery, the both-home time was stripped as a booking
@@ -619,6 +641,9 @@ function planNepqTurnCore({
   // 2026-10-09 (the user): the rep's real Rehash Call openings
   // ({ offer: [2], all: [...] }, rehash-slots.js), or null for none.
   callSlots = null,
+  // 2026-10-12 (LEAD_STAGE_MODE=live, PR 3): a plain quote request is the
+  // info-request play, not a price objection; the competitor play is on.
+  stageLive = false,
   // 2026-10-12 (Lead Conversation Stage): the stored stage ({ stage, facts },
   // src/agentic/lead-stage.js), passed ONLY when LEAD_STAGE_MODE=live. Null
   // leaves every step exactly as before. knownZip: the zip on file.
@@ -654,7 +679,8 @@ function planNepqTurnCore({
   }
   // Each inbound read against the bot message before it.
   const prevOutOf = (i) => [...turns.slice(0, i)].reverse().find(x => x.direction === 'outbound')?.text || '';
-  const inboundTypes = turns.map((t, i) => (t.direction === 'inbound' ? objectionType(t.text, prevOutOf(i)) : undefined)).filter(x => x !== undefined);
+  const objOpts = { quoteIsPrice: !stageLive, competitor: stageLive };
+  const inboundTypes = turns.map((t, i) => (t.direction === 'inbound' ? objectionType(t.text, prevOutOf(i), objOpts) : undefined)).filter(x => x !== undefined);
   const priceAsks = inboundTypes.filter(x => x === 'price').length;
   const pricePlayed = outbound.some(m => PRICE_PLAY_RX.test(m.text));
   // How many price/quote lines the bot already sent (quote → again → a person).
@@ -663,7 +689,9 @@ function planNepqTurnCore({
     nos_in_a_row: nos,
     price_asks: priceAsks,
     discovery_questions_asked: discoveryQuestions(outbound).length,
-    consequence_used: outbound.some(m => CONSEQUENCE_RX.test(m.text)),
+    // After the competitor play there is no consequence move (no storm fear,
+    // no "what if you wait" at a lead who chose someone else).
+    consequence_used: outbound.some(m => CONSEQUENCE_RX.test(m.text) || COMPETITOR_PLAY_RX.test(m.text)),
     bridge_used: outbound.some(m => BRIDGE_RX.test(m.text)),
     slot_offers: outbound.filter(m => SLOT_OFFER_RX.test(m.text)).length,
     status_frame_used: outbound.some(m => STATUS_FRAME_RX.test(m.text)),
@@ -673,7 +701,7 @@ function planNepqTurnCore({
   const earned = discoveryEarned(conversation, trigger);
   counters.earned = earned.earned;
   const echoWord = problemEcho(inbound);
-  const objType = objectionType(now, lastOut);
+  const objType = objectionType(now, lastOut, objOpts);
   const attempt = objType ? inboundTypes.filter(x => x === objType).length : 0;
   // Everything the lead sent since our last message (a live-chat burst).
   const lastOutIdx = turns.map(t => t.direction).lastIndexOf('outbound');
@@ -973,7 +1001,7 @@ function planNepqTurnCore({
 
   if (objType === 'price' && priceLines >= 2) return handoff('price_insist');
   if (nos >= 2) return handoff('two_nos');
-  if ((objType === 'shopping') && attempt >= 2) return handoff('repeat_objection');
+  if ((objType === 'shopping' || objType === 'competitor') && attempt >= 2) return handoff('repeat_objection');
 
   // 2. A first "no". To our two times → ask for a day. A goodbye → a warm
   // close with no question. Not interested / don't come → ONE question.
@@ -1035,7 +1063,22 @@ function planNepqTurnCore({
     return fixed('objection_play', line, { step: 'offer_slots', objection: { type: 'repeat', attempt: 1, line }, ask_contact: offerSlots.length !== 2, booking: { allowed: true, reason: 'nepq:repeat_complaint' } });
   }
 
+  // 3c. A plain quote request (LEAD_STAGE_MODE=live; batch 3 #2: "can renters
+  //     get a quote?" and a morning-run opener were read as price objections).
+  //     NEPQ's info-request play: yes, then what they are hoping to see, then
+  //     discovery as usual. Once per conversation.
+  if (stageLive && !objType && QUOTE_REQUEST_RX.test(now) && !SCHEDULE_ASK_RX.test(now) && !outbound.some(m => INFO_PLAY_RX.test(m.text))) {
+    const line = LINES.info_request;
+    return fixed('objection_play', line, { step: 'discover', info_request: true, booking: { allowed: false, reason: 'nepq:info_request' } });
+  }
+
   // 4. Objection plays (Mark's wording).
+  // The competitor play (LEAD_STAGE_MODE=live): disarm, then how they would
+  // decide; their answer goes to the bridge and the times (the criteria step).
+  // Never a consequence, a storm, or a word about the other company's work.
+  if (objType === 'competitor') {
+    return fixed('objection_play', LINES.competitor, { objection: { type: 'competitor', attempt, line: LINES.competitor }, booking: { allowed: false, reason: 'nepq:competitor' } });
+  }
   if (objType === 'price') {
     // First ask: the short line and one question, no times (discovery first).
     if (priceLines === 0) {
@@ -1436,7 +1479,7 @@ export const URGENCY_RX = /\bonly\s+\d+\s+(?:spots?|slots?|openings?)\s+left\b|\
 // Claims nobody approved (2026-10-02 simulation: "that's right at the edge of
 // when Florida code tightened up", "with us at the peak of hurricane season").
 // Code history and season-peak talk are pressure dressed as fact.
-export const CLAIMS_RX = /\bcode\s+(?:changed|tightened|got\s+(?:stricter|tighter)|was\s+(?:updated|changed))\b|\b(?:after|since|before)\s+(?:the\s+)?(?:19|20)\d\d\b[^.?!]{0,40}\bcode\b|\bcode\b[^.?!]{0,40}\b(?:after|since|before)\s+(?:19|20)\d\d\b|\bpeak\s+(?:of\s+)?(?:the\s+)?(?:hurricane|storm)\s+season\b|\bmost\s+active\s+(?:stretch|part|time)\b|\b(?:storm\s+season|we)\s+(?:has|have)\s+(?:us\s+)?(?:slammed|swamped)\b|\bcalendar\s+(?:is\s+)?(?:tight|filling|full)\b|\b(?:andersen|renewal|pgt|pella|lowe'?s|home\s+depot|es\s+windows|cgi)\b[^.?!]{0,60}\b(?:uses?|only|standard|cheap\w*|worse|inferior|lower|basic)\b/i;
+export const CLAIMS_RX = /\bcode\s+(?:changed|tightened|got\s+(?:stricter|tighter)|was\s+(?:updated|changed))\b|\b(?:after|since|before)\s+(?:the\s+)?(?:19|20)\d\d\b[^.?!]{0,40}\bcode\b|\bcode\b[^.?!]{0,40}\b(?:after|since|before)\s+(?:19|20)\d\d\b|\bpeak\s+(?:of\s+)?(?:the\s+)?(?:hurricane|storm)\s+season\b|\bmost\s+active\s+(?:stretch|part|time)\b|\b(?:storm\s+season|we)\s+(?:has|have)\s+(?:us\s+)?(?:slammed|swamped)\b|\bcalendar\s+(?:is\s+)?(?:tight|filling|full)\b|\b(?:andersen|renewal|pgt|pella|lowe'?s|home\s+depot|es\s+windows|cgi)\b[^.?!]{0,60}\b(?:uses?|only|standard|cheap\w*|worse|inferior|lower|basic)\b|\b(?:they|their|them|other\s+(?:companies|contractors|installers|guys)|competitors?|those\s+guys|that\s+(?:company|contractor|installer))\b[^.?!]{0,60}\b(?:installed\s+to\s+code|(?:up\s+)?to\s+code|code[-\s]compliant)\b|\b(?:not|never|isn'?t|aren'?t|wasn'?t|weren'?t|might\s+not\s+be|may\s+not\s+be)\s+(?:installed\s+)?(?:up\s+)?to\s+code\b/i;
 const SEE_YOU_RX = /\bsee\s+you\s+(?:then|soon|there)\b/i;
 const SIGNOFF_RX = /(?:^|\s)([—–-]\s*[A-Z][A-Za-z.'’ ]{0,40})\s*$/;
 const FIXED_MOVES = new Set(['handoff', 'objection_play', 'ask_day', 'close', 'reveal', 'offer_slots', 'status_frame', 'dnk', 'qualify']);

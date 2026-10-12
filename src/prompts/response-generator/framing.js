@@ -146,10 +146,15 @@ export const serviceAreaCityTentative = (city) => [
   `\nSERVICE AREA STATUS (TENTATIVE — city match only): ${city} is a market Reece serves, but coverage is confirmed by zip. You may speak positively about serving ${city}; when you ask for the zip, frame it as the final confirmation (e.g. "We're all over ${city} — what's the zip so I can confirm you're in our coverage?"). Do NOT state they are confirmed in the service area until the zip is verified.`,
 ];
 
-// Outside the mapped service area: no visit, no times, no link. The exception matters — a lead who explicitly asked for something gets the UNIVERSAL FALLBACK, not a bare exit.
+// Outside the mapped service area: no visit, no times, no link, no call.
 // Was response-generator.js:1473.
+// 2026-10-12 (service-area parity, batch 2 #3): zip 10001 got a decline on SMS
+// and "good chance we can help" in live chat. Both bots now give the one short
+// decline (outOfAreaLine in service-area-turn.js). The old EXCEPTION offered a
+// team callback to an out-of-area lead who asked for a visit: there is no visit
+// we can run there, so it is gone.
 export const serviceAreaOutside = (zip) => [
-  `\nSERVICE AREA STATUS: zip ${zip} is OUTSIDE Reece's mapped service area. Do NOT offer any in-home visit, do NOT propose appointment times, and do NOT include a booking link. Politely let them know their area is outside our current service footprint, thank them for their interest, and do not pitch further. EXCEPTION — if the lead EXPLICITLY asked for something this turn (an estimate, a visit, a call), apply the UNIVERSAL FALLBACK instead of a bare exit: offer to have someone from the team reach out, and ask when's a good time.`,
+  `\nSERVICE AREA STATUS: zip ${zip} is OUTSIDE Reece's mapped service area. Do NOT offer any in-home visit, a call, appointment times or a booking link, even if they asked for one. Say, in a sentence or two: "Sorry, Reece doesn't serve the ${zip} area. Thank you for checking with us." Nothing else, no question, no pitch.`,
 ];
 
 // Zip verified against service_area_zips. Confirm it once, naturally, and never repeat it on later turns.
