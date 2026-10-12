@@ -98,19 +98,28 @@ const KATY = { firstName: 'Dana', lastName: 'Sim', phone: '+13525550101', email:
  * cannot know the bot will ask for an address, ownership or who decides, and
  * a booking scenario that never gives an address can never book. Pure.
  */
-export function autoAnswerFor(reply, persona = {}) {
-  const t = String(reply || '');
+export function autoAnswerFor(reply, persona = {}, { scriptDone = false } = {}) {
+  const t = String(reply || '').replace(/\s*[—–]\s*[A-Z][A-Za-z .']{0,40}$/, '');
   if (!t.includes('?')) return null;
-  if (/\bstreet\s+address\b|\bwhat(?:'s| is)\s+the\s+address\b|\baddress\b[^?]*\bzip\b[^?]*\?/i.test(t)) return persona.address || '1200 Palm Ave, Fort Myers FL 33908';
-  if (/\bdo\s+you\s+own\b|\bhomeowner\b|\bown\s+the\s+(?:home|house)\b/i.test(t)) return 'Yes, I own it.';
-  if (/\bzip(?:\s*code)?\b[^?]*\?/i.test(t)) return (String(persona.address || '').match(/\b\d{5}\b/) || [persona.postalCode || '33908'])[0];
-  if (/\bable\s+to\s+(?:be\s+there|make\s+it)\b|\bboth\s+be\s+there\b/i.test(t)) return "Yes, she'll be there.";
-  if (/\b(?:anyone|anybody|someone)\s+else\b|\bpart\s+of\s+the\s+decision\b|\bweigh(?:ing)?\s+in\b/i.test(t)) return 'Just me.';
-  if (/\b(?:first|full|your)\s+name\b|\bwho\s+should\s+i\s+put\b/i.test(t)) return persona.firstName && !/^guest$/i.test(persona.firstName) ? persona.firstName : 'Dana';
-  if (/\bphone\s+number\b|\bbest\s+number\b/i.test(t)) return persona.phone ? String(persona.phone).replace(/^\+1/, '') : '352-555-0101';
+  // 2026-10-12 (first eval run): only the sentence that ASKS counts. The
+  // bridge "…covered as long as you own the home. … Would that help?" was
+  // answered "Yes, I own it." because the statement before it named owning.
+  const q = t.split(/(?<=[.?!])\s+/).filter(x => x.trim().endsWith('?')).join(' ');
+  if (/\bstreet\s+address\b|\bwhat(?:'s| is)\s+the\s+address\b|\baddress\b[^?]*\bzip\b[^?]*\?/i.test(q)) return persona.address || '1200 Palm Ave, Fort Myers FL 33908';
+  if (/\bdo\s+you\s+own\b|\bhomeowner\b|\bown\s+the\s+(?:home|house)\b/i.test(q)) return 'Yes, I own it.';
+  if (/\bzip(?:\s*code)?\b[^?]*\?/i.test(q)) return (String(persona.address || '').match(/\b\d{5}\b/) || [persona.postalCode || '33908'])[0];
+  if (/\bable\s+to\s+(?:be\s+there|make\s+it)\b|\bboth\s+be\s+there\b/i.test(q)) return "Yes, she'll be there.";
+  if (/\b(?:anyone|anybody|someone)\s+else\b|\bpart\s+of\s+the\s+decision\b|\bweigh(?:ing)?\s+in\b/i.test(q)) return 'Just me.';
+  if (/\b(?:first|full|your)\s+name\b|\bwho\s+should\s+i\s+put\b/i.test(q)) return persona.firstName && !/^guest$/i.test(persona.firstName) ? persona.firstName : 'Dana';
+  if (/\bphone\s+number\b|\bbest\s+number\b/i.test(q)) return persona.phone ? String(persona.phone).replace(/^\+1/, '') : '352-555-0101';
+  // Two real times on the table and the script has said all it had to: a
+  // lead who said "book it" picks one (easy_yes ended on the offer, so the
+  // run could never book and read as yes_without_booking).
+  if (scriptDone && (t.match(/\b\d{1,2}(?::\d{2})?\s*(?:AM|PM)\b/gi) || []).length >= 2 && /\bwhich\b|\bwork(?:s)?\b|\bor\b/i.test(q)) return 'The first one';
   return null;
 }
-const MAX_AUTO_ANSWERS = 5;
+// 8: owner, zip, decision maker, presence, the pick, name, phone, address.
+const MAX_AUTO_ANSWERS = 8;
 
 /** The test conversations (the "good test messages" list). Customer side only. */
 export const SCENARIOS = Object.freeze({
@@ -279,7 +288,7 @@ export async function simulateLiveChat(plan, { nepqMode = 'live', productionDeps
     for (let i = 0; queue.length; i++) {
       await runTurn(queue.shift(), i);
       const lastBot = (transcript.at(-1)?.bot || []).at(-1);
-      const auto = plan.autoAnswer && autos < MAX_AUTO_ANSWERS ? autoAnswerFor(lastBot, persona) : null;
+      const auto = plan.autoAnswer && autos < MAX_AUTO_ANSWERS ? autoAnswerFor(lastBot, persona, { scriptDone: !queue.length }) : null;
       if (auto) { autos++; queue.unshift(auto); transcript.at(-1).next_auto = true; }
     }
   }
@@ -372,7 +381,7 @@ export async function simulateSms(plan, { nepqMode = 'live', generate, buildReal
       redrafted: !!note, redraft_guard: attempts.find(a => a.guard)?.guard || null, attempts, intent: generated?.intent_class || null, nepq: generated?.nepq_plan || null,
       would_do: wouldDo, stage, seconds: Math.round((Date.now() - t0) / 100) / 10,
     });
-    const auto = plan.autoAnswer && autos < MAX_AUTO_ANSWERS ? autoAnswerFor(reply, p) : null;
+    const auto = plan.autoAnswer && autos < MAX_AUTO_ANSWERS ? autoAnswerFor(reply, p, { scriptDone: !queue.length }) : null;
     if (auto) { autos++; queue.unshift(auto); transcript.at(-1).next_auto = true; }
   }
   return { channel: 'sms', scenario: plan.key, title: plan.title, nepq_mode: nepqMode, lead_stage_mode: stageDeps.env.LEAD_STAGE_MODE, contact_id: plan.contactId || null, transcript };
