@@ -162,6 +162,33 @@ const S5_2_CLUSTERS = new Set([
   'APPOINTMENT_DISRUPTION',
 ]);
 
+// 2026-10-12 — one cancellation is one rescue attempt. LP's webhook and GHL's
+// appointment change each report the same cancel, seconds to minutes apart, and
+// each copy used to close the open row and insert a new one, so the trigger in
+// sql/migrations/2026-05-14_objection_state_substrate.sql numbered the second
+// copy "attempt 2" (60 such rows in 30 days, 8 within a minute, 32 within ten).
+// S5.2 gets that number in its payload and the bot reads it in its context.
+// A proposal of the state that is ALREADY open, entered inside this window, is
+// the same event seen twice: nothing is written. Same window as the enrollment
+// dedup (WORKFLOW_REENROLL_WINDOW_HOURS, #1217). A different state, or the same
+// state later than this, is still a real transition.
+const SAME_STATE_REPEAT_WINDOW_MS = Math.max(
+  1,
+  parseInt(process.env.SAME_STATE_REPEAT_WINDOW_HOURS || '6', 10),
+) * 60 * 60 * 1000;
+
+/**
+ * Pure: is this proposal a repeat of the state that is already open?
+ * Fails open (false) on an unreadable entered_at, so a real cancel still counts.
+ */
+export function isSameStateRepeat({ current, proposed_state, nowMs = Date.now(), windowMs = SAME_STATE_REPEAT_WINDOW_MS } = {}) {
+  if (!current || !proposed_state || current.state_code !== proposed_state) return false;
+  const enteredMs = Date.parse(current.entered_at);
+  if (!Number.isFinite(enteredMs)) return false;
+  const age = nowMs - enteredMs;
+  return age >= 0 && age < windowMs;
+}
+
 const ALLOWED_TRIGGER_SOURCES = new Set([
   'LP_WEBHOOK', 'MESSAGE_ANALYZER', 'BEHAVIORAL_RULE', 'TIMER_EXPIRY',
   'STATE_ESCALATION', 'MANUAL_OVERRIDE', 'IMPORT_BACKFILL', 'EXTERNAL_API',
@@ -252,7 +279,7 @@ export async function executeTransitionObjectionState(action) {
   // 2. Current state
   const { data: current, error: curErr } = await supabase
     .from('contact_objection_states')
-    .select('id, state_code, parent_state, entered_at, recovery_attempt_number')
+    .select('id, state_code, parent_state, entered_at, recovery_attempt_number, trigger_source')
     .eq('contact_id', contact_id)
     .is('exited_at', null)
     .maybeSingle();
@@ -350,6 +377,33 @@ export async function executeTransitionObjectionState(action) {
         blocking_disposition: blocking.disposition_code,
       };
     }
+  }
+
+  // Same state already open and fresh: the second copy of one event (see
+  // isSameStateRepeat). Checked after the guards above so a forbidden or
+  // pre-empted proposal still reports its own reason.
+  if (isSameStateRepeat({ current, proposed_state })) {
+    const age_ms = Date.now() - Date.parse(current.entered_at);
+    await emitTransitionEvent('state_transition_deduped', {
+      contact_id,
+      state_code: proposed_state,
+      open_state_row_id: current.id,
+      open_trigger_source: current.trigger_source || null,
+      trigger_source,
+      triggering_event_id,
+      age_ms,
+      source_action_id: action.id,
+      reason: 'same_state_already_open',
+    });
+    return {
+      success: false,
+      reason: 'same_state_already_open',
+      from: currentState,
+      to: proposed_state,
+      state_row_id: current.id,
+      recovery_attempt_number: current.recovery_attempt_number,
+      age_ms,
+    };
   }
 
   // 6. Atomic write.
