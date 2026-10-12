@@ -3,7 +3,7 @@
  *
  * Offline coverage for src/jobs/missed-caller-recovery.js. Every network and
  * database edge goes through deps: runSQL, supabase (an in-memory log that
- * honours the unique key), checkDnc, findOtherLists, emitEvent, queuePush.
+ * honours the unique key), checkDnc, readCallHistory, emitEvent, queuePush.
  *
  * What these guard, in order of cost if broken:
  *   - shadow never pushes (the default must never dial anyone),
@@ -28,6 +28,8 @@ import {
   recoveryCampaigns,
   buildCandidatesSql,
   buildMissedCallerRecord,
+  buildHistorySql,
+  judgeHistory,
   ELIGIBLE_DISPOSITIONS,
   DEFAULT_CAMPAIGNS,
   LOG_TABLE,
@@ -93,9 +95,9 @@ function fakeDb() {
  * Harness. `rows` is what the view returns; the stub also drops rows already
  * logged, as the real NOT EXISTS does, so a second pass behaves like prod.
  */
-function harness({ rows = [row()], dnc = [], dncThrows = false, otherLists = null } = {}) {
+function harness({ rows = [row()], dnc = [], dncThrows = false, history = [], historyThrows = false } = {}) {
   const db = fakeDb();
-  const calls = { dnc: [], pushes: [], events: [], otherLists: 0, sql: [] };
+  const calls = { dnc: [], pushes: [], events: [], history: [], sql: [] };
   const deps = {
     supabase: db,
     runSQL: async (sql) => {
@@ -108,9 +110,10 @@ function harness({ rows = [row()], dnc = [], dncThrows = false, otherLists = nul
       if (dncThrows) throw new Error('Five9 SOAP 503');
       return { checked: numbers.length, on_dnc: numbers.filter((n) => dnc.includes(n)), not_on_dnc: [] };
     },
-    findOtherLists: async () => {
-      calls.otherLists += 1;
-      return otherLists || { suppress: false, lists: [], failed_open: false, error: null };
+    readCallHistory: async (numbers) => {
+      calls.history.push(numbers);
+      if (historyThrows) throw new Error('statement timeout');
+      return history;
     },
     emitEvent: async (e) => { calls.events.push(e); return { id: 1 }; },
     queuePush: async (r) => { calls.pushes.push(r); return { actionId: 555, listName: 'Callback Request', callNowMode: 'ANY' }; },
@@ -237,7 +240,7 @@ function harnessDeps(h) {
   return {
     supabase: h.db,
     checkDnc: async (n) => ({ on_dnc: [], not_on_dnc: n }),
-    findOtherLists: async () => ({ suppress: false, lists: [] }),
+    readCallHistory: async () => [],
     emitEvent: async () => null,
     queuePush: async (r) => { h.calls.pushes.push(r); return { actionId: 1, listName: 'Callback Request', callNowMode: 'ANY' }; },
   };
@@ -336,12 +339,95 @@ test('an unreadable DNC list fails closed: no push, no log, retried next pass', 
   assert.equal(h.db.log.length, 0);
 });
 
-test('someone already live in another Five9 list is not pushed again', async () => {
-  const h = harness({ otherLists: { suppress: true, lists: ['LP_ASAP'], failed_open: false, error: null } });
+// ─── call history (2026-10-12): replaced the cross-list check that never worked ─
+
+const ev = (over = {}) => ({
+  ani10: '9415550101', dnis10: '5615592041', campaign: 'Google PPC Windows',
+  disposition_name: 'Hung Up', duration_sec: 20, received_at: '2026-09-20T15:00:00Z', ...over,
+});
+
+test('a service call on ANY line, before this one, is a customer: not pushed', async () => {
+  // 7542104616: "Service Call" on Google PPC the day before the hang-up.
+  const h = harness({ history: [ev({ disposition_name: 'Service Call', duration_sec: 140 })] });
   const res = await h.run('live');
   assert.equal(h.calls.pushes.length, 0);
-  assert.equal(res.skipped_ineligible, 1);
-  assert.match(h.db.log[0].detail, /LP_ASAP/);
+  assert.equal(res.skipped_service, 1);
+  assert.equal(h.db.log[0].action, 'skipped_service');
+  assert.match(h.db.log[0].detail, /Service Call/);
+});
+
+test('a call on a dispatch or service line marks a customer too', () => {
+  const v = judgeHistory('9415550101', '2026-09-21T15:00:00Z', [ev({ campaign: 'Dispatch', disposition_name: 'Hung Up' })]);
+  assert.equal(v.action, 'skipped_service');
+});
+
+test('a conversation on another line is not a missed call: not pushed', async () => {
+  const h = harness({ history: [ev({ campaign: 'Main Number', disposition_name: 'Kicked', duration_sec: 119 })] });
+  const res = await h.run('live');
+  assert.equal(h.calls.pushes.length, 0);
+  assert.equal(res.skipped_spoke, 1);
+});
+
+test('a disposition the list has never seen counts as a conversation (the safe side)', () => {
+  assert.equal(judgeHistory('9415550101', '2026-09-21T15:00:00Z', [ev({ disposition_name: 'Brand New Dispo' })]).action, 'skipped_spoke');
+});
+
+test('"No Disposition" is a conversation only from two minutes', () => {
+  const at = '2026-09-21T15:00:00Z';
+  assert.equal(judgeHistory('9415550101', at, [ev({ disposition_name: 'No Disposition', duration_sec: 119 })]).action, null);
+  assert.equal(judgeHistory('9415550101', at, [ev({ disposition_name: 'No Disposition', duration_sec: 120 })]).action, 'skipped_spoke');
+});
+
+test('our own outbound no-answer attempts are not a conversation', () => {
+  const out = (d) => ev({ ani10: '8555550000', dnis10: '9415550101', campaign: 'Callback Request', disposition_name: d, received_at: '2026-09-19T15:00:00Z' });
+  for (const d of ['No Answer', 'Answering Machine', 'Busy', 'Left Voicemail']) {
+    assert.equal(judgeHistory('9415550101', '2026-09-21T15:00:00Z', [out(d)]).action, null, d);
+  }
+});
+
+test('a number we already called back after its last call is not pushed again', async () => {
+  const h = harness({ rows: [row({ last_call_at: '2026-09-21T15:00:00Z' })], history: [ev({
+    ani10: '8555550000', dnis10: '9415550101', campaign: 'Main Number', disposition_name: 'No Answer', received_at: '2026-09-21T16:00:00Z',
+  })] });
+  const res = await h.run('live');
+  assert.equal(h.calls.pushes.length, 0);
+  assert.equal(res.skipped_called_back, 1);
+});
+
+test('an outbound attempt BEFORE the last call is not a call back', () => {
+  const v = judgeHistory('9415550101', '2026-09-21T15:00:00Z', [ev({
+    ani10: '8555550000', dnis10: '9415550101', disposition_name: 'No Answer', received_at: '2026-09-20T15:00:00Z',
+  })]);
+  assert.equal(v.action, null);
+});
+
+test('another number\'s history never decides this one', () => {
+  assert.equal(judgeHistory('9415550101', '2026-09-21T15:00:00Z', [ev({ ani10: '9415550199', disposition_name: 'Service Call' })]).action, null);
+});
+
+test('an unreadable call history fails closed: no push, no log, retried next pass', async () => {
+  const h = harness({ historyThrows: true });
+  const res = await h.run('live');
+  assert.equal(res.ok, false);
+  assert.equal(res.history_unknown, 1);
+  assert.equal(h.calls.pushes.length, 0);
+  assert.equal(h.db.log.length, 0);
+});
+
+test('a clean history still pushes, and no detail mentions the old cross-list check', async () => {
+  const h = harness({ history: [ev()] });
+  const res = await h.run('live');
+  assert.equal(res.pushed, 1);
+  assert.doesNotMatch(h.db.log[0].detail, /cross-list/);
+});
+
+test('the history query reads every campaign, both directions, for the eligible numbers only', () => {
+  const sql = buildHistorySql(['+1 (941) 555-0101', '9415550101']);
+  assert.match(sql, /ani10 = ANY\(ARRAY\['9415550101'\]::text\[\]\)/);
+  assert.match(sql, /dnis10 = ANY/);
+  assert.match(sql, /interval '30 days'/);
+  assert.doesNotMatch(sql, /campaign IN/);
+  assert.throws(() => buildHistorySql([]));
 });
 
 // ─── the record and the standing rule ──────────────────────────────────────
