@@ -489,7 +489,15 @@ labelled 2+ minute callers with no LP lead and never read what the call said: of
 `not_a_lead` label (`notALeadReason`, `src/inbound-caller-classify.js`) now comes right after `dnc` and before any GHL
 read: the disposition must be on `LEAD_DISPOSITIONS` (an ALLOW list: an unknown disposition is not a lead), and Main
 Number counts only for an appointment set. The caller's NEWEST call decides for every row of that caller. 50 remain,
-40 of them a 2+ minute "Hung Up"; whether those are leads is Mark's ruling before approval mode.
+40 of them a 2+ minute "Hung Up", which ARE leads (the user, 2026-10-12).
+**A captured lead's LP source comes from the NUMBER CALLED (the user, 2026-10-12).** Unfixed, every capture would have
+reached LP as the chatbot (830 / 5574): `enrollLpLeadCreation` backfills blank LP Source ID / Pro ID, and 8e30ff37 sends
+only those two fields. `src/inbound-capture-source.js` maps each tracking number (Five9 dnis, read from
+five9_events_raw by caller and call time, matched within 1s because a JS Date drops Five9's microseconds) to its
+Sub-Source; "Main Number" (hundreds of local numbers) is Reece Call In (91). The Promoter is "Integration, GoHighLevel"
+(5686) on every lead this system creates from a call. `captureCaller` overwrites the contact's two fields (the number
+called wins over an older source), reads them back, and does not enroll if they did not stick. A number not in the
+table is `unmapped_number`: listed, never sent. Add a new tracking number to the table; never widen the chatbot backfill.
 
 **Every LP sale gets a P2 card, even when LP's webhook does not arrive (2026-10-03).** A P2 (Client
 Lifecycle) card is built only by LP's outbound webhook → GHL I.LP-IN (adds `deal-won`) → C.0-IN (P1 Sale
