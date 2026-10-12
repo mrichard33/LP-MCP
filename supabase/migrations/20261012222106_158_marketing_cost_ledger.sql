@@ -8,7 +8,7 @@
 -- versions not found in local migrations directory"), starting with
 -- 20261012230000_kb_exemplars_clean.
 --
--- The SQL below is that branch's sql/158 byte for byte; with comments and
+-- The SQL below (up to the RLS lines at the end) is that branch's sql/158 byte for byte; with comments and
 -- whitespace removed it hashes the same as the statement the database recorded
 -- (md5 2a64408fee3e4218d2ac3dec368ad134, 13,879 characters). Production never
 -- runs it again (the version is already recorded); a fresh or shadow database
@@ -17,6 +17,14 @@
 --
 -- Next time: add the file under supabase/migrations/ in the PR and let the merge
 -- apply it. Never paste DDL into the dashboard (CLAUDE.md, Fix 1).
+--
+-- One addition at the END of this file: row level security on the six marketing
+-- tables. Live has it on (relrowsecurity = true, 0 policies, checked 2026-10-12),
+-- most likely the project's automatic RLS-on-create, but the hand-applied sql/158
+-- never says so, and the drift check on PR #1270 reported exactly those six
+-- tables. It lives here, not in a later file, because the drift check rebuilds
+-- only versions the database already records (a pending file is set aside), so
+-- only this file can make a shadow build match live. Production never runs it.
 
 -- ─── sql/158 — Marketing cost ledger (invoices → allocation → cost per issued lead) ──
 --
@@ -401,3 +409,11 @@ FROM keys k
 LEFT JOIN leads l ON l.grain = k.grain AND l.period_start = k.period_start AND l.market = k.market AND l.lp_sub_source = k.lp_sub_source
 LEFT JOIN costs c ON c.grain = k.grain AND c.period_start = k.period_start AND c.market = k.market AND c.lp_sub_source = k.lp_sub_source
 LEFT JOIN dollars d ON k.grain = 'month' AND d.month = k.period_start AND d.market = k.market AND d.lp_sub_source = k.lp_sub_source;
+
+-- Added 2026-10-12 (PR #1270): matches live, see the header.
+ALTER TABLE public.marketing_cost_rules ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.marketing_expense_allocations ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.marketing_expenses ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.marketing_invoice_documents ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.marketing_territory_map ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.marketing_vendors ENABLE ROW LEVEL SECURITY;
