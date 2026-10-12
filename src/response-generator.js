@@ -405,6 +405,7 @@ import { contactRecheckLine, recheckHint, RECHECK_RX } from './agentic/contact-c
 import { smsBookingTurn, enforceBookingFacts, bookingFactsNote } from './agentic/sms-booking-turn.js';
 import { LINES as NEPQ_LINES } from './agentic/nepq-planner.js';
 import { buildStageInput } from './agentic/lead-stage.js';
+import { readStageForPlanner } from './services/lead-stage-io.js';
 import { isCustomerP2 } from './agentic/lead-state/signals/context-reader.js';
 import { isUnsoldPostDemo, lpSold, postDemoOwnerName, replaceSalesRepFollowUp } from './agentic/post-demo-owner.js';
 import { postDemoPlannerMode } from './agentic/post-demo-turn.js';
@@ -1446,6 +1447,8 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
   // 2026-10-11: a rehash lead gets the post-demo track instead (rehash-nepq.js).
   const nepqBlock = buildNepqBlock(context, opts.established, opts.discipline || null, {
     rehash: opts.rehash || null, conversation: context?.conversation_recent || [], trigger: triggerMessage,
+    // 2026-10-12: the stored conversation stage (LEAD_STAGE_MODE=live only).
+    leadStage: opts.leadStage || null,
   });
   if (nepqBlock) parts.push(nepqBlock);
 
@@ -4054,6 +4057,10 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   const nepqMode = (opts.dryRun === true && opts.nepqModeOverride) ? opts.nepqModeOverride : nepqBackboneMode();
   let nepqPlan = null;
   let nepqPlanFailed = false;
+  // 2026-10-12 (Lead Conversation Stage): the stored stage, ONLY when
+  // LEAD_STAGE_MODE=live; null leaves the planner exactly as before. A dry run
+  // (the simulator) never reads a real contact's stored row: it passes its own.
+  let leadStage = null;
   // The rep's real Rehash Call openings (rehash-slots.js), when read.
   let rehashCallSlots = null;
   // SMS only: email replies are long-form and keep their own rules.
@@ -4079,6 +4086,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
         const tz = promptTimezoneFor(context);
         rehashCallSlots = await memo('rehash_call_slots', () => readRehashCallSlots({ contactId, timezone: tz, tzLabel: tzLabel(tz) }));
       }
+      leadStage = opts.dryRun === true ? (opts.leadStageOverride || null) : await readStageForPlanner(contactId);
       const planArgs = {
         channel: 'sms',
         trigger: triggerMessage,
@@ -4094,6 +4102,8 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
         isCustomer: isCustomerP2(context),
         // The classifier read a call request: the planner's callback hand-off.
         callbackRequested: String(classification?.intent_class || '').toUpperCase() === 'CALLBACK',
+        stage: leadStage,
+        knownZip: identityState?.identity?.postal_code || context.lead?.postal_code || null,
       };
       nepqPlan = planNepqTurn({ ...planArgs, postDemo: pdMode === 'live' && postDemoLead, rehashRep, rehash: !!rehash, callSlots: slotsMode === 'live' ? rehashCallSlots : null });
       if (slotsMode === 'shadow' && rehash && postDemoLead) {
@@ -4227,6 +4237,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       confFlowContext,
       // 2026-10-02: the binding NEPQ move, rendered last (live mode only).
       nepqPlan: nepqMode === 'live' ? nepqPlan : null,
+      leadStage: nepqMode === 'live' ? leadStage : null,
     }
   );
   // Part 7 (Mark, 2026-10-02: "I don't think we need any static messages"):
