@@ -90,7 +90,10 @@ export function smsBookingTurn({ plan, trigger, thread = [], slots = [], tz = 'E
   if (threadName) keys.delete('name');
   if (dmAnswer && dmAnswer !== 'conflict') keys.delete('dm');
   // A spouse named in this text thread is asked about once, whatever an old record says.
-  if (partner && !dmAnswer) keys.add('dm');
+  if (partner && !dmAnswer && !plan.dm_known) keys.add('dm');
+  // 2026-10-12 (LEAD_STAGE_MODE=live): the qualifying gate already settled the
+  // decision makers ("my wife will be there"): never asked again.
+  if (plan.dm_known) keys.delete('dm');
   const addrState = addressConfirmState(thread);
   if (onFileAddress?.address1 && !keys.has('address') && (addrState === 'unasked' || addrState === 'pending')) keys.add('address_confirm');
   if (addrState === 'rejected') keys.add('address');
@@ -116,7 +119,7 @@ export function smsBookingTurn({ plan, trigger, thread = [], slots = [], tz = 'E
         ...(calendar.calendar_id ? { calendar_id: calendar.calendar_id } : {}),
         start_time: pinned.iso,
         status: 'new',
-        qualifying_data: { decision_makers_present: dmAnswer && dmAnswer !== 'conflict' ? dmAnswer : 'Uncertain' },
+        qualifying_data: { decision_makers_present: dmAnswer && dmAnswer !== 'conflict' ? dmAnswer : (plan.dm_known || 'Uncertain') },
       },
       reasoning: 'SMS: the lead picked a real open time and nothing the visit needs is missing (sms-booking-turn)',
     },

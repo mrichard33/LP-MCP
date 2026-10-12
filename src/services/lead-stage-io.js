@@ -313,3 +313,22 @@ export async function readStageReport(contactId, rawDeps = {}) {
     ghl_field: field ? { id: field.id, options: field.options, ...labelDifference(field.options || []) } : null,
   };
 }
+
+/**
+ * The stored stage for the planner ({ stage, facts }), ONLY when
+ * LEAD_STAGE_MODE=live (PR 2); null otherwise, on a read that fails or takes
+ * longer than `timeoutMs`, and for a lead with no row yet (the planner then
+ * plans exactly as before, and this turn's record creates the row).
+ * `mode` overrides the env (the simulator's lead_stage_mode). Never throws.
+ */
+export async function readStageForPlanner(contactId, { mode = null, timeoutMs = 1500, ...rawDeps } = {}) {
+  try {
+    const deps = await defaults(rawDeps);
+    if ((mode || leadStageMode(deps.env)) !== 'live' || !contactId) return null;
+    const { row } = await withTimeout(deps.store.read(contactId), timeoutMs, 'stage read for planner');
+    return row?.stage ? { stage: row.stage, facts: row.facts || {} } : null;
+  } catch (err) {
+    console.warn(`[LeadStage] planner read failed for ${contactId} (planning without it): ${err.message}`);
+    return null;
+  }
+}

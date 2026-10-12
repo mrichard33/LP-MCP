@@ -53,11 +53,26 @@ export const SLOTS_RX = /\bmove\s+(?:it|your\s+(?:appointment|visit))\s+to\b|\b(
 export const DONE_RX = /\bis\s+(?:now\s+)?cancel+ed\b|\bhave\s+cancel+ed\b/i;
 export const MOVED_RX = /\byou(?:'|’)?re\s+now\s+set\s+for\b|\bmoved\s+(?:it|your\s+(?:appointment|visit))\s+to\b/i;
 export const RESCHEDULE_RX = /\bset\s+up\s+a\s+new\s+time\b/i;
+// 2026-10-12 (handoff PR 5, LEAD_STAGE_MODE=live; sim reschedule_not_moved,
+// batch 2 #1): the model's offer of times read "Which works better?" or "Would
+// either of those work?", which SLOTS_RX does not, so "the first one" fell out
+// of the flow into new-lead discovery ("how many windows?"). Live, any offer
+// of ours that names a clock time is the flow's slot offer.
+export const SLOTS_LIVE_RX = /\bmove\s+(?:it|your\s+(?:appointment|visit))\s+to\b|\b(?:which\s+(?:one\s+|time\s+)?works\s+(?:better|best)|does\s+that\s+time\s+work|would\s+either\s+(?:of\s+those\s+|one\s+)?work)\b|\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b[^?]*\?/i;
+// One clarifying question when the answer to our offer is unclear (live).
+// Never a cancel on an unclear answer: batch 2 #1 got "I've passed your
+// cancellation" for an unrelated reply.
+export const CLARIFY_LINE = 'Just to be sure I get this right, would you like to move your appointment to another day, or cancel it?';
+export const CLARIFY_RX = /\bmove\s+your\s+appointment\b[^?]*\bor\s+cancel\b[^?]*\?/i;
+// A person sets the time, nothing is cancelled (a second unclear answer).
+export const RESCHEDULE_HANDOFF_LINE = "Thanks. I've passed this to our scheduling team, and they'll reach out to find a time that works for you.";
 export const HANDOFF_RX = /\bscheduling\s+team\b/i;
 
 /** Which CANCEL_MARKERS entry a runCancelFlow outcome needs. Pure. */
 export function cancelMarkerKey(record = {}) {
   const outcome = record?.outcome || null;
+  if (outcome === 'clarify') return 'clarify';
+  if (outcome === 'reschedule_handoff') return 'handoff';
   if (!outcome) return record?.step === 'ask_phone' ? 'ask_phone' : 'ask_identity';
   if (outcome === 'offered_reschedule' || outcome === 'offered_slots' || outcome === 'handoff') return outcome;
   if (outcome === 'rescheduled' || outcome === 'would_reschedule') return 'rescheduled';
@@ -71,6 +86,7 @@ export const CANCEL_MARKERS = Object.freeze({
   ask_phone: [{ rx: PHONE_ASK_RX, say: 'ask for the phone number the appointment is under' }],
   offered_reschedule: [{ rx: OFFER_RX, say: 'ask if a different day would work instead of cancelling' }],
   offered_slots: [{ rx: SLOTS_RX, say: 'offer to move it to these times and ask which one works better' }],
+  clarify: [{ rx: CLARIFY_RX, say: 'ask whether they want to move the appointment to another day or cancel it' }],
   cancelled: [{ rx: DONE_RX, say: 'say the appointment is cancelled' }],
   rescheduled: [{ rx: MOVED_RX, say: "say they're now set for the new time" }],
   reschedule: [{ rx: RESCHEDULE_RX, say: 'say a team member will call to set up a new time' }],
@@ -134,7 +150,7 @@ const lastIndexWhere = (arr, fn) => { for (let i = arr.length - 1; i >= 0; i--) 
  * @returns {null | { step: 'ask_identity'|'ask_phone'|'lookup'|'after_offer'|'handoff',
  *                    reply?: string, phone?: string|null, words?: string[], answer?: 'cancel'|'reschedule'|'unclear' }}
  */
-export function planCancelTurn({ body, thread = [], known = {} }) {
+export function planCancelTurn({ body, thread = [], known = {}, stageLive = false }) {
   const all = Array.isArray(thread) ? thread : [];
   const prior = all.slice(0, -1);
   const lastOut = [...prior].reverse().find((m) => m?.direction === 'outbound');
@@ -146,6 +162,7 @@ export function planCancelTurn({ body, thread = [], known = {} }) {
   // the FIRST cancel request after any earlier finished flow — a later
   // "no, just cancel it" is an answer inside the flow, not a new start.
   const isFinish = (text) => DONE_RX.test(text) || HANDOFF_RX.test(text) || RESCHEDULE_RX.test(text) || MOVED_RX.test(text);
+  const slotsRx = stageLive ? SLOTS_LIVE_RX : SLOTS_RX;
   const isFinishLine = (m) => m?.direction === 'outbound' && isFinish(String(m.text || ''));
   const lastFinish = lastIndexWhere(all, isFinishLine);
   const flowStart = all.findIndex((m, i) => i > lastFinish && m?.direction === 'inbound' && isCancelRequest(m.text));
@@ -159,12 +176,17 @@ export function planCancelTurn({ body, thread = [], known = {} }) {
   // "She should be able to make it" posted a reschedule card to #dispatch).
   const inFlow = flowStart >= 0;
   // 0. Picking one of the open times we offered.
-  if (inFlow && SLOTS_RX.test(lastOutText) && !MOVED_RX.test(lastOutText)) {
-    return { step: 'pick_slot', offerText: lastOutText, phone, words };
+  if (inFlow && slotsRx.test(lastOutText) && !MOVED_RX.test(lastOutText) && !OFFER_RX.test(lastOutText) && !CLARIFY_RX.test(lastOutText)) {
+    const isSlotOffer = (t) => slotsRx.test(t) && !OFFER_RX.test(t) && !CLARIFY_RX.test(t) && !MOVED_RX.test(t);
+    const offersInFlow = all.slice(flowStart).filter((m) => m?.direction === 'outbound' && isSlotOffer(String(m.text || ''))).length;
+    return { step: 'pick_slot', offerText: lastOutText, phone, words, stageLive, offersInFlow };
   }
-  // 1. Answering our reschedule offer.
+  // 1. Answering our reschedule offer (or, live, our one clarifying question).
   if (inFlow && OFFER_RX.test(lastOutText)) {
-    return { step: 'after_offer', answer: classifyOfferAnswer(body), phone, words };
+    return { step: 'after_offer', answer: classifyOfferAnswer(body, { stageLive }), phone, words, stageLive };
+  }
+  if (stageLive && inFlow && CLARIFY_RX.test(lastOutText)) {
+    return { step: 'after_offer', answer: classifyOfferAnswer(body, { stageLive }), phone, words, stageLive, clarified: true };
   }
   // 2. Answering our name/phone ask.
   const askedId = inFlow && ID_ASK_RX.test(lastOutText);
@@ -186,8 +208,11 @@ export function planCancelTurn({ body, thread = [], known = {} }) {
 }
 
 /** The answer to "Would a different day work better instead of cancelling?". Pure. */
-export function classifyOfferAnswer(text) {
+export function classifyOfferAnswer(text, { stageLive = false } = {}) {
   const s = String(text || '').toLowerCase();
+  // Live: "move it", "a different day", "later this week" are a move even
+  // next to a "no" ("no, a different day"): checked first.
+  if (stageLive && /\b(?:move\s+it|move\s+(?:my|the)\s+(?:appointment|visit)|different\s+(?:day|time|date)|another\s+(?:day|time|date)|reschedule|re-schedule|later\s+(?:this|next)\s+week|next\s+week|other\s+day)\b/.test(s)) return 'reschedule';
   if (/\bcancel\b|\bno\b|\bnope\b|\bnah\b|\bnot\s+interested\b|\b(?:don'?t|do\s+not)\s+(?:come|want|need)\b|\bjust\s+cancel\b/.test(s)) return 'cancel';
   if (/\b(?:yes|yeah|yep|sure|ok(?:ay)?|please\s+do|different\s+day|another\s+day|reschedule|re-schedule|next\s+week)\b/.test(s)) return 'reschedule';
   return 'unclear';
@@ -371,6 +396,9 @@ export function formatCancelCard({ kind, name, phone, apptHuman, newTimeHuman, g
       `📅 LIVE CHAT RESCHEDULED — change the time in LP to ${newTimeHuman}`,
       `${who} moved ${appt} to ${newTimeHuman}.`,
       'GHL: ✅ the same appointment was moved to the new time (no new booking). LP was NOT changed and no LP lead was created. → Change the appointment time in LP.',
+      // 2026-10-12 (handoff PR 5): this card withdraws any cancel request
+      // posted earlier in the same chat; the visit stands at the new time.
+      '⚠️ Any earlier cancel request for this visit is WITHDRAWN: do not cancel it.',
     ],
     reschedule: [
       '📅 LIVE CHAT RESCHEDULE — call to set a new time',

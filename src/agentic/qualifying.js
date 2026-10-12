@@ -23,8 +23,36 @@ const DM_PRESENT_RX = /\b(?:wife|husband|spouse|partner|fianc[eé]e?|she|he|they
  * to our decision-maker ask wins; otherwise what the lead volunteered (newest
  * first). Turns are {direction, text}, oldest first. Pure.
  */
+// Our presence questions (PR 2's qualify lines read back by meaning): "Will
+// they be able to make it to the visit too?" and "What day works best when
+// you can both be there?". A yes or a day to either means present; a no means
+// absent. dmAnswerFromThread reads a bare "no" as "Solo Owner", which is right
+// for "anyone else?" and wrong here.
+const PRESENCE_ASK_RX = /\bable\s+to\s+(?:be\s+there|make\s+it)\b[^?]*\?|\bjoin\s+you\b[^?]*\?/i;
+const BOTH_DAY_ASK_RX = /\bboth\s+(?:of\s+you\s+)?(?:be\s+there|be\s+home|make\s+it)\b[^?]*\?/i;
+const NEGATIVE_RX = /^\s*(?:no(?:pe)?|nah|not\s+(?:really|likely|sure)|probably\s+not|(?:she|he|they)\s+(?:can'?t|won'?t|cannot))\b/i;
+
+/** The reply to our newest presence question, read as present / absent, or null. Pure. */
+function presenceAnswer(list) {
+  for (let k = list.length - 1; k >= 0; k--) {
+    if (list[k].direction !== 'outbound') continue;
+    const t = String(list[k].text || '');
+    const presence = PRESENCE_ASK_RX.test(t);
+    const bothDay = BOTH_DAY_ASK_RX.test(t);
+    if (!presence && !bothDay) continue;
+    const reply = list.slice(k + 1).find(m => m.direction !== 'outbound');
+    if (!reply) return null;
+    const r = String(reply.text || '');
+    if (parseDecisionMakers(r) === 'conflict' || NEGATIVE_RX.test(r)) return 'named_absent';
+    return 'named_present';
+  }
+  return null;
+}
+
 export function decisionMakersFromThread(turns = []) {
   const list = Array.isArray(turns) ? turns : [];
+  const presence = presenceAnswer(list);
+  if (presence) return presence;
   const ans = dmAnswerFromThread(list);
   const inbound = list.filter(t => t.direction !== 'outbound').map(t => String(t.text || ''));
   const volunteeredPresent = inbound.some(t => DM_PRESENT_RX.test(t));

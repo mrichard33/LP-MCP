@@ -183,10 +183,32 @@ words, and offer the next step. One offer, one question mark.`;
  * @param {object} ctx          buildLeadContext() output
  * @param {object} established  buildEstablishedFacts() output
  */
-function stageBlock(ctx, established) {
+// 2026-10-12 (Lead Conversation Stage, LEAD_STAGE_MODE=live): the stored
+// conversation stage picks the play; the analyzer's buyer_stage is tone only.
+// Before this, a buyer_stage of 1 told the model "Do NOT ask about ...
+// decision-makers yet" on the very turn the planner asked for them.
+const CONVERSATION_STAGE_PLAY = Object.freeze({
+  connection: 1, situation: 2, problem: 2,
+  consequence: 4, qualifying: 4, transition: 4, commitment_offered: 4, slot_held: 4,
+});
+
+/** The play number for a stored conversation stage (side states use where they return to), or null. Pure. */
+export function playForConversationStage(leadStage) {
+  if (!leadStage?.stage) return null;
+  const s = String(leadStage.stage);
+  const base = /^(?:objection|handoff|reschedule)\b/.test(s) ? String(leadStage.facts?.return_to || '') : s;
+  return CONVERSATION_STAGE_PLAY[base] ?? null;
+}
+
+function stageBlock(ctx, established, leadStage = null) {
   const booked = ctx?.lp?.appointment_set === true;
   const phase = ctx?.lp?.appointment_phase || null;
-  const stage = Number(ctx?.intelligence?.buyer_stage) || null;
+  const convPlay = playForConversationStage(leadStage);
+  const buyerStage = Number(ctx?.intelligence?.buyer_stage) || null;
+  const stage = convPlay ?? buyerStage;
+  const toneLine = convPlay != null
+    ? `\nCONVERSATION STAGE (stored): ${String(leadStage.stage).toUpperCase()}. This decides the play below.${buyerStage ? ` Buyer stage ${buyerStage}/5 is tone guidance only: how much they already know, never what to ask.` : ''}`
+    : '';
   const closed = established?.closed_questions || [];
   const trust = Number(ctx?.lead?.trust_level_score) || null;
 
@@ -251,7 +273,7 @@ attached, send that and stop.`;
       { key: null, text: 'What got you looking at the windows now, out of curiosity?' },
       { key: null, text: "What's going on with them that made you reach out?" },
     ], closed);
-    return `
+    return `${toneLine}
 STAGE: CONNECTION — they are not yet convinced this is a real problem.
 
 Take the focus off us and put it on them. No pitch, no company history, no
@@ -269,7 +291,7 @@ their own answer to those questions this early.`;
       { key: null, text: 'Which room is the worst one?' },
       { key: 'window_count', text: 'How many openings are we talking about?' },
     ], closed);
-    return `
+    return `${toneLine}
 STAGE: SITUATION → PROBLEM AWARENESS.
 
 Situation first — establish what they actually have. Age of the windows, what
@@ -296,9 +318,9 @@ Never answer the problem for them. Ask, then stop.`;
       { key: null, text: 'Besides the noise and the cooling bill, what else would need to be right\n  for you to feel good about it?' },
     ], closed);
 
-    if (past.empty && future.empty) return `\nSTAGE: SOLUTION AWARENESS.${DISCOVERY_COMPLETE}`;
+    if (past.empty && future.empty) return `${toneLine}\nSTAGE: SOLUTION AWARENESS.${DISCOVERY_COMPLETE}`;
 
-    return `
+    return `${toneLine}
 STAGE: SOLUTION AWARENESS.
 ${past.empty || future.empty ? '' : '\nTwo halves, in order.'}${past.empty ? `
 PAST: ALREADY COVERED. They have told you what they have already tried and how
@@ -318,7 +340,7 @@ Positioning against other companies may begin here — never before.`;
     { key: 'decision_makers', text: 'Is this your call, or is anyone else weighing in on it?' },
   ], closed);
 
-  return `
+  return `${toneLine}
 STAGE: CONSEQUENCE → QUALIFYING → TRANSITION.
 
 They have decided something needs to happen. They have not committed to us.
@@ -332,13 +354,17 @@ QUALIFYING IS DONE. Everything this stage would ask is already answered — see
 ESTABLISHED above. Go straight to the transition.` : `
 Qualifying — confirm it matters, and who is in the room:
 ${qualifying.lines}`}
-Transition — reflect their own words, then offer the next step. DEFAULT:
+${convPlay != null ? `Transition — reflect their own words, then offer the next step: the free
+visit at their home, for every lead (Mark, 2026-10-02: the 15-minute call is
+only a backup, when they ask for a call or turn the visit down):
+"Based on what you said about [their words], the next step is a free visit at
+your home. Would that help?"` : `Transition — reflect their own words, then offer the next step. DEFAULT:
 "Based on what you said about [their words], the next step is a quick
 15-minute Protection Profile Review. Would that help?"
 ONLY for a price shopper, a booking with every decision maker, or a BOOKING
 CONTEXT that resolves to an in-home calendar, offer the visit instead:
 "Based on what you said about [their words], the next step is having our
-specialist measure and leave you written pricing. Would that help?"
+specialist measure and leave you written pricing. Would that help?"`}
 Confident and direct. Not pushy. One offer, one question mark.`;
 }
 
@@ -568,7 +594,7 @@ different discovery question (which room, how long, what is the worst one).`);
  * @param {object} [discipline]  the object returned by buildDiscipline() (v1.4)
  * @returns {string}             prompt text, or '' when the layer is disabled
  */
-export function buildNepqBlock(ctx, established = null, discipline = null, { rehash = null, conversation = null, trigger = '' } = {}) {
+export function buildNepqBlock(ctx, established = null, discipline = null, { rehash = null, conversation = null, trigger = '', leadStage = null } = {}) {
   if (process.env.NEPQ_LAYER_MODE === 'off') return '';
 
   // ── POST-DEMO REHASH (2026-10-11) ─────────────────────────────────────
@@ -596,7 +622,8 @@ export function buildNepqBlock(ctx, established = null, discipline = null, { reh
 
   return [
     '=== CONVERSATION DISCIPLINE (NEPQ) ===',
-    stageBlock(ctx, established),
+    // leadStage only when LEAD_STAGE_MODE=live (null keeps every prompt byte-identical).
+    stageBlock(ctx, established, leadStage),
     booked ? '' : establishedBlock(established),
     booked ? '' : objectionBlock(ctx, established),
     // v1.4 — the turn's discipline. Rendered for unbooked contacts only: a
