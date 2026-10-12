@@ -275,8 +275,31 @@ export function runChecks({ root = ROOT, base = null } = {}) {
   return [...checkMigrationFiles(files), ...checkBaselineOrder(files), ...checkLegacySqlFrozen(legacy)];
 }
 
+/**
+ * The migration files the database has not applied yet (local-only versions
+ * in `supabase migration list`). 2026-10-12, the first real migration after
+ * the baseline (lead_conversation_stage): the drift check replays the WHOLE
+ * folder into a shadow database and compares it with production, so a new,
+ * not-yet-merged migration always read as drift ("drop table …"). The
+ * workflow sets these aside for the comparison; `db push` applies them on
+ * merge, and from then on they are part of the comparison like any other. Pure.
+ */
+export function pendingMigrationFiles(fileNames, localOnly) {
+  const pending = new Set(localOnly || []);
+  return (fileNames || []).filter((n) => {
+    const m = MIGRATION_NAME.exec(n);
+    return m && pending.has(m[1]);
+  });
+}
+
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const arg = (flag) => { const i = process.argv.indexOf(flag); return i > -1 ? process.argv[i + 1] : null; };
+  const pendingList = arg('--pending');
+  if (pendingList) {
+    const { localOnly } = parseMigrationList(readFileSync(pendingList, 'utf8'));
+    for (const f of pendingMigrationFiles(readdirSync(MIGRATIONS_DIR), localOnly)) console.log(f);
+    process.exit(0);
+  }
   const driftFile = arg('--drift');
   if (driftFile) {
     const { remaining, ignored } = filterDrift(readFileSync(driftFile, 'utf8'));
