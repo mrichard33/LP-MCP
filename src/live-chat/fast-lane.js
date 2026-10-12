@@ -65,6 +65,7 @@ import { looksLikeShortPhone } from '../agentic/contact-typos.js';
 import { planNepqTurn, enforceNepqPlan, referenceRetryNote, nepqBackboneMode, pickFresh, LINES as NEPQ_LINES, isServiceCallback, dropUnsafeLines, leadWantsCall } from '../agentic/nepq-planner.js';
 import { buildStageInput, leadStageMode, rescheduleStepFor } from '../agentic/lead-stage.js';
 import { typedZipFromThread } from '../services/contact-timezone.js';
+import { shouldRecordPromise } from '../agentic/sms-format.js';
 import { NO_DIAL_REASONS } from '../agentic/bot-callback.js';
 import { isCustomerP2 } from '../agentic/lead-state/signals/context-reader.js';
 import { COLLECT_ASK, COLLECT_ASK_AGAIN, dmAsk, holdLine, missingItems, parseDecisionMakers, heldSlot, nameFromReply, addressConfirmAsk, addressConfirmState, mentionedPartner, dmAnswerFromThread, slotLabel } from '../agentic/booking-collect.js';
@@ -922,7 +923,7 @@ export function createLiveChatFastLane(deps) {
     let langHint = null;
 
     // ── Spanish → a person (2026-10-01; Part 8: the model writes it, in Spanish) ──
-    const langHandoff = planLanguageHandoff({ body, thread: context.conversation_recent });
+    const langHandoff = planLanguageHandoff({ body, thread: context.conversation_recent, knownPhone: context.lead?.phone || contact?.phone || null });
     if (langHandoff) {
       if (langHandoff.first) {
         d.emitEvent({
@@ -1878,7 +1879,8 @@ export function createLiveChatFastLane(deps) {
       // A sent call promise becomes an owned task (promised_callbacks, 2026-10-07).
       // The cancel flow's "our team will call to go over the details" after a
       // move is #dispatch's, not a callback (skipCapture marks those turns).
-      if (!extras.repeat_promise_blocked && !skipCapture) Promise.resolve()
+      // Never after an opt-out or a close (2026-10-12, handoff PR 6: "leave me alone").
+      if (!extras.repeat_promise_blocked && !skipCapture && shouldRecordPromise({ trigger: body, plan: stageInput?.plan || null })) Promise.resolve()
         .then(() => d.recordPromise({ contactId, text: draft, channel: 'livechat', phone: phoneFromText(visitorTexts.join(' ') || body) || null, rule: LIVE_CHAT_RULE, actionId }))
         .catch(err => d.warn(`[LiveChat] promise record failed for ${contactId}: ${err.message}`));
     }

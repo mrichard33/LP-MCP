@@ -608,6 +608,16 @@ the time (`RESCHEDULE_HANDOFF_LINE`, a RESCHEDULE card, nothing cancelled); "no,
 same two times once more, and the RESCHEDULED card says any earlier cancel request is withdrawn. The stage records
 `reschedule:offered` / `reschedule:moved` (`rescheduleStepFor`) and returns to booked.
 
+**SMS speed and format (handoff PR 6, 2026-10-12, active).** SMS turns took 11-43s (live chat 7-13s), driven by
+redrafts. One redraft at most, and none once the turn is past `SMS_REDRAFT_BUDGET_MS` (15s) from the first attempt
+(`mayRedraft`): the guarded first draft ships. A guard's re-write no longer waits the 1.5s transient-error backoff. Over
+320 characters after the redraft (or in length shadow), whole middle sentences are dropped (`trimSmsToCap`), never a
+cut sentence. `src/agentic/sms-format.js`: a fragment opener goes, a stale "our call time passed" nobody raised goes
+(unless the call was in the last 24h), the sign-off is exactly once at the end on the reply that signs the thread
+(`normalizeSignature`), a reply nearly identical to our last one is re-written once, and no promised call is recorded
+after an opt-out or a close (`shouldRecordPromise`). Live chat's Spanish hand-off confirms a number on file
+(`SPANISH_CONFIRM_LINE`) instead of asking for one.
+
 **Both bots sound like a person: rules in the prompt AND a pass after it (2026-10-02).** The SMS prompt
 banned em dashes for months and they shipped anyway, with "Got it. Great question." openers and "Just to
 understand… —" lead-ins. `HUMAN_VOICE_RULES` (`src/prompts/response-generator/banned.js`) tells the
