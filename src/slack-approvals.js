@@ -31,6 +31,7 @@
  *              ├─ approval_approve / approval_reject  → resolveApproval()
  *              ├─ payroll_*                           → handlePayrollInteraction()
  *              ├─ dnc_lift_* (2026-09-28)             → SLACK_DNC_LIFT_FORWARD_URL only
+ *              ├─ mktinv_* + its modal (2026-10-12)   → handleMarketingInvoiceInteraction()
  *              └─ anything else → SLACK_INTERACTIONS_FORWARD_URL, raw bytes
  *                                 and Slack's signing headers unchanged
  *
@@ -60,8 +61,9 @@ import { slackApprovalsEnabled, lookupSlackUserEmail } from './slack.js';
 import { trackBackground } from './graceful-shutdown.js';
 import {
   verifySlackSignature, parseInteraction, parseApproverIds, parsePayrollInteraction, isPayrollAction,
-  isDncLiftAction,
+  isDncLiftAction, isMarketingInvoiceAction, parseMarketingInvoiceInteraction,
 } from './slack-approvals-core.js';
+import { handleMarketingInvoiceInteraction, reviewChannelId as mktInvoiceChannelId } from './marketing/review-actions.js';
 import { approvePayrollRun } from './payroll/ledger-actions.js';
 import { createPayrollStore } from './payroll/store.js';
 
@@ -268,11 +270,15 @@ export function registerSlackApprovalRoutes(app, {
   payrollLive = () => String(process.env.PAYROLL_ENGINE_MODE || '').toLowerCase().trim() === 'live',
   payrollHandler = handlePayrollInteraction,
   dncLiftUrl = DNC_LIFT_URL,
+  // 2026-10-12 — marketing invoice cards. On when the review channel is set;
+  // never on SLACK_APPROVALS_ENABLED (a different job, a different approver list).
+  mktInvoiceOn = () => !!mktInvoiceChannelId(),
+  mktInvoiceHandler = handleMarketingInvoiceInteraction,
 } = {}) {
   app.post('/webhook/slack/interactions', (req, res) => {
     const approvalsOn = slackApprovalsEnabled();
     // Nothing configured for any job — ack so Slack does not retry, and stop.
-    if (!approvalsOn && !forwardUrl && !payrollLive() && !dncLiftUrl) {
+    if (!approvalsOn && !forwardUrl && !payrollLive() && !dncLiftUrl && !mktInvoiceOn()) {
       console.log('[SlackApprovals] click received while disabled and not forwarding — ignored');
       return res.status(200).send('');
     }
@@ -337,6 +343,26 @@ export function registerSlackApprovalRoutes(app, {
         return;
       }
       trackBackground(forward(rawBody, headers, { url: dncLiftUrl }));
+      return;
+    }
+
+    // Marketing invoice clicks and the Edit modal's view_submission
+    // (2026-10-12) are ours and NEVER forwarded, on or off: the onboarding
+    // workflow would read `mktinv_approve` as "approve a team member", and a
+    // view_submission is a shape it has never seen. Malformed → dropped.
+    if (isMarketingInvoiceAction(rawBody)) {
+      const mkt = parseMarketingInvoiceInteraction(rawBody);
+      if (!mkt) {
+        console.warn('[MktReview] malformed marketing-invoice interaction — dropped, not forwarded');
+        return;
+      }
+      if (!mktInvoiceOn()) {
+        console.log(`[MktReview] ${mkt.decision} on ${mkt.documentId} while SLACK_MKT_INVOICE_CHANNEL_ID is unset — ignored`);
+        return;
+      }
+      trackBackground(
+        mktInvoiceHandler(mkt).catch((err) => console.error(`[MktReview] handler error: ${err.message}`)),
+      );
       return;
     }
 
