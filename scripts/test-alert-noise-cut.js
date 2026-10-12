@@ -303,6 +303,29 @@ test('digest: a nightly sweep that did not finish is always listed', async () =>
   assert.match(sent[0].text, /The tag sweep did not finish \(failed\): candidate query failed: HL down · check job_runs/);
 });
 
+// 2026-10-12 (F-L): the 02:10 rule-target check. A HIGH finding is listed once
+// (keyed on rule + status + target); a run that could not look is always listed.
+test('digest: a new dead rule route is listed once; a check that could not run always is', async () => {
+  const run = (findings, status = 'ok', summary = '1 high') => ({ job_runs: [
+    { job_id: 'rule-target-check', status, occurrence_key: '2026-10-03', started_at: iso(NOW - 6 * HOUR),
+      summary, detail: { checked: status === 'ok', high_findings: findings } },
+  ] });
+  const f164 = { rule_id: 164, reason: 'draft_target:0:b637c9fd-412d-4e78-9ec1-eec282c0e459',
+    line: 'Rule #164 STAGE_4_ROUTE_W2_1_TO_W3_1_V2 · add_to_workflow → "S3.1 Calculator Solution Pitch": its workflow is a draft · point it at a published workflow or disable it' };
+  const first = digestDeps({ tables: run([f164]) });
+  await digest.runOpsMorningDigest({ post: true, deps: first.deps });
+  assert.match(first.sent[0].text, /Rules pointing at dead workflows \(02:10 check\)/);
+  assert.match(first.sent[0].text, /Rule #164 STAGE_4_ROUTE_W2_1_TO_W3_1_V2 · add_to_workflow/);
+
+  const again = digestDeps({ tables: { ...run([f164]), audit_posted_items: first.db.tables.audit_posted_items } });
+  await digest.runOpsMorningDigest({ post: true, deps: again.deps });
+  assert.match(again.sent[0].text, /All clear\./);
+
+  const down = digestDeps({ tables: run([], 'unknown', 'check could not run: HL workflow mirror is 40h old (max 26h)') });
+  await digest.runOpsMorningDigest({ post: true, deps: down.deps });
+  assert.match(down.sent[0].text, /The rule target check did not finish \(unknown\): check could not run: HL workflow mirror is 40h old/);
+});
+
 test('digest: a sub-job that fails posts its own "could not run" card; the digest still posts', async () => {
   const jobs = { 'lead-leak-monitor': { status: 'failed', error: 'Five9 history read failed' } };
   const { deps, sent } = digestDeps({ jobs });

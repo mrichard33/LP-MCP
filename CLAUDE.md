@@ -1057,6 +1057,18 @@ costs the optimisation, never correctness.
 Before claiming a rule never fires, check `agent_actions.rule_applied`. One flagged as dead had fired
 47 times.
 
+**A workflow route that "completed" may have moved nobody (F-L, 2026-10-12).** GHL answers 200 to an inbound
+webhook whose trigger sits on a draft workflow or is switched off, so rule 164 logged 64 completed adds to the draft
+S3.1 v1 and enrolled no one; the old audit read `params.workflow_id` only and never resolved `params.webhook_url`.
+`src/rule-target-resolve.js` (pure) checks every enabled rule's `add_to_workflow` / `remove_from_workflow` by both
+paths, resolving a `/webhook-trigger/<id>` through the HL mirror's `workflow_triggers` (`raw_json.id`, `active`;
+triggers are NOT in `workflows.raw_json`, which is why the handoff called S4.1's live trigger "owned by nothing"),
+and every `ghl.workflow_completed` rule's `payload.workflow_id`. Job `rule-target-check` (02:10 ET,
+`RULE_TARGET_CHECK_ENABLED`, default on) writes `rule_target_checks`; a HIGH finding (an add, or a completion
+trigger, that goes nowhere) is one line in the 08:00 digest, once; a remove from a draft is LOW and never posts. A
+mirror unreadable or older than 26h is "could not run", never zero findings. On demand: MCP `check_rule_targets`.
+New rule targeting a workflow? Run that tool after the rule is live.
+
 **A stand-down is only safe if something else answers.** Rule 106 (`AGENTIC_RESPOND_POST_CHATBOT`)
 skips every intent in its `recommended_action_nin` because a `layer3_action_dispatch` row owns that
 reply — but the dispatcher drops a row under its `min_confidence`, and for months that meant nobody
