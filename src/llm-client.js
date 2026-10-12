@@ -132,6 +132,11 @@ const FUNCTION_GROUPS = {
   // with REP_BRIEF_MODEL_ANTHROPIC; a slow model only costs the AI sentences
   // (src/services/rep-brief-io.js caps it and falls back to fixed ones).
   rep_brief: 'decision_engine',          // src/services/rep-brief.js
+  // 2026-10-12 — marketing invoice analysis: extract + match on the EXTRACTED
+  // TEXT of an invoice (never the file), strict JSON. Internal, never a
+  // customer, so it rides the analysis group. Override with
+  // MKT_INVOICE_ANALYSIS_MODEL_ANTHROPIC / _PROVIDER.
+  mkt_invoice_analysis: 'decision_engine', // src/marketing/invoice-analyzer.js
   // customer-facing — text a human reads
   response_generator: 'customer_facing', // src/response-generator.js
   // 2026-09-26 — website live chat, one merged classify+reply call under a

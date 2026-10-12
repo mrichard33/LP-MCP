@@ -2766,4 +2766,24 @@ export const STARTUP_MIRRORS = [
     fail: '[Migration] agentic_no_reply_followups (sql/157) not applied — the opener hold logs only and no follow-up is sent until it is applied from the dashboard:',
     level: 'warn',
   },
+  // Marketing cost ledger (sql/158, 2026-10-12 — the file is the source of
+  // truth). Invoices → allocation → cost per issued lead by market × sub-source
+  // (src/marketing/*, src/jobs/marketing-invoice-ingest.js). Until it exists
+  // the ingest route answers 503 and the nightly job skips; nothing customer-
+  // facing depends on it — hence warn.
+  {
+    name: 'sql/158',
+    expects: {
+      tables: [
+        'marketing_vendors', 'marketing_invoice_documents', 'marketing_expenses',
+        'marketing_expense_allocations', 'marketing_cost_rules', 'marketing_territory_map',
+      ],
+      indexes: ['marketing_expenses_source_ref_uidx', 'marketing_expenses_period_idx', 'mea_month_market', 'mea_expense_idx'],
+      views: ['v_market_subsource_cost'],
+    },
+    sqlFile: 'sql/158_marketing_cost_ledger.sql',
+    ready: '[Migration] marketing cost ledger (sql/158) ready',
+    fail: '[Migration] marketing cost ledger (sql/158) not applied — invoice ingest answers 503 and the nightly cost job skips until it is applied from the dashboard:',
+    level: 'warn',
+  },
 ];

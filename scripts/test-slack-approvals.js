@@ -458,3 +458,47 @@ test('a refusing or unreachable destination never throws and never retries', asy
   assert.match(threw.reason, /ECONNRESET/);
   assert.equal(attempts, 2);
 });
+
+// ─── Marketing invoice buttons (2026-10-12) ──────────────────────────────
+import { isMarketingInvoiceAction, parseMarketingInvoiceInteraction } from '../src/slack-approvals-core.js';
+
+const DOC = '7d3f2b1a-5c4e-4f6a-9b8c-0d1e2f3a4b5c';
+const mktClick = (action_id = 'mktinv_approve', value = DOC) => formBody({
+  type: 'block_actions', user: { id: 'U_BRAD', name: 'brad' }, trigger_id: 'trig.1',
+  response_url: 'https://hooks.slack.com/actions/T/1/x', message: { ts: '1.2', text: 'card' }, channel: { id: 'C_REVIEW' },
+  actions: [{ action_id, value }],
+});
+const mktModal = (callback_id = 'mktinv_edit', private_metadata = DOC) => formBody({
+  type: 'view_submission', user: { id: 'U_BRAD', name: 'brad' },
+  view: { callback_id, private_metadata, state: { values: { amount: { mktinv_v_amount: { value: '12' } } } } },
+});
+
+test('mktinv: predicate sees the three buttons and the edit modal, nothing else', () => {
+  assert.equal(isMarketingInvoiceAction(mktClick('mktinv_approve')), true);
+  assert.equal(isMarketingInvoiceAction(mktClick('mktinv_reject')), true);
+  assert.equal(isMarketingInvoiceAction(mktClick('mktinv_edit')), true);
+  assert.equal(isMarketingInvoiceAction(mktModal()), true);
+  assert.equal(isMarketingInvoiceAction(mktClick('approve_member')), false);
+  assert.equal(isMarketingInvoiceAction(mktModal('onboarding_form')), false);
+  assert.equal(isMarketingInvoiceAction(formBody(clickPayload())), false);
+  assert.equal(isMarketingInvoiceAction('garbage'), false);
+});
+
+test('mktinv: parse — decisions, uuid document id, modal values; malformed → null', () => {
+  const p = parseMarketingInvoiceInteraction(mktClick('mktinv_approve'));
+  assert.equal(p.kind, 'mktinv');
+  assert.equal(p.decision, 'approve');
+  assert.equal(p.documentId, DOC);
+  assert.equal(p.userId, 'U_BRAD');
+  assert.equal(p.triggerId, 'trig.1');
+  assert.equal(p.responseUrl, 'https://hooks.slack.com/actions/T/1/x');
+  assert.equal(parseMarketingInvoiceInteraction(mktClick('mktinv_edit')).decision, 'edit');
+  const m = parseMarketingInvoiceInteraction(mktModal());
+  assert.equal(m.decision, 'edit_submit');
+  assert.equal(m.documentId, DOC);
+  assert.equal(m.values.amount.mktinv_v_amount.value, '12');
+  assert.equal(parseMarketingInvoiceInteraction(mktClick('mktinv_approve', 'not-a-uuid')), null);
+  assert.equal(parseMarketingInvoiceInteraction(mktClick('mktinv_delete')), null);
+  assert.equal(parseMarketingInvoiceInteraction(mktModal('mktinv_edit', '')), null);
+  assert.equal(parseMarketingInvoiceInteraction(formBody(clickPayload())), null, 'an agent-approval click is not ours');
+});

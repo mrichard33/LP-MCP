@@ -320,6 +320,10 @@ import { startOpsMorningDigestScheduler } from './jobs/ops-morning-digest.js';  
 import { startOfficePowerRankingScheduler } from './jobs/office-power-ranking.js';  // 2026-09-24
 import { startSaleBackstopScheduler } from './jobs/sale-announce-backstop.js';  // 2026-09-25
 import { startSaleP2BackstopScheduler } from './jobs/sale-p2-backstop.js';  // 2026-10-03 — every LP sale gets a P2 card
+// 2026-10-12 — marketing cost ledger (sql/158): invoice ingest, nightly costs, Brad-format report.
+import { registerMarketingInvoiceRoutes } from './jobs/marketing-invoice-ingest.js';
+import { registerMarketingCostRoutes, startMarketingCostNightlyScheduler } from './jobs/marketing-cost-nightly.js';
+import { registerMarketingReportRoutes } from './jobs/marketing-cost-report.js';
 import { startStaleLeadRefreshScheduler } from './jobs/stale-lead-refresh.js';  // 2026-10-07 — re-read open leads whose appointment passed
 import { startSaleContactBackstopScheduler } from './jobs/sale-contact-backstop.js';  // 2026-10-04 — every LP sale gets a GHL contact
 import { startMissedCallerRecoveryScheduler } from './jobs/missed-caller-recovery.js';  // 2026-09-24
@@ -887,6 +891,11 @@ registerNetReportRoutes(app);
 registerCohortReobservationRoutes(app); // 2026-08-12 — cohort re-observation staleness (§8)
 registerLpReportRoutes(app);
 registerLpCsvRoutes(app);
+// 2026-10-12 — marketing invoices from n8n I.MCIN, the CSV backfill, the
+// nightly cost run and the report run. Same ingest secret as the LP reports.
+registerMarketingInvoiceRoutes(app);
+registerMarketingCostRoutes(app);
+registerMarketingReportRoutes(app);
 registerLpReportReconRoutes(app);
 registerSourceReconcileRoutes(app);
 registerScorecardValidateRoutes(app);
@@ -964,6 +973,7 @@ const server = app.listen(PORT, async () => {
   startOfficePowerRankingScheduler();
   startSaleBackstopScheduler();
   startSaleP2BackstopScheduler();
+  startMarketingCostNightlyScheduler();
   startStaleLeadRefreshScheduler();
   startSaleContactBackstopScheduler();
   startMissedCallerRecoveryScheduler();

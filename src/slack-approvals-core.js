@@ -209,3 +209,65 @@ export function isDncLiftAction(rawBody) {
     return id.startsWith(DNC_LIFT_ACTION_PREFIX);
   } catch { return false; }
 }
+
+// ─── Marketing invoice review buttons (2026-10-12, sql/158) ──────────────────
+// Approve / Edit / Reject on the #marketing-invoice-review card
+// (src/marketing/slack-review.js), plus the Edit MODAL's view_submission. Both
+// are ours and NEVER relayed: the onboarding workflow reads any action_id but
+// deny_member as "approve a team member", and it has never seen a
+// view_submission at all. Authorised against MKT_INVOICE_APPROVER_SLACK_IDS
+// (Mark, Brad Codman — D6), empty = nobody, in src/marketing/review-actions.js.
+export const MKT_INVOICE_ACTION_PREFIX = 'mktinv_';
+
+function payloadOf(rawBody) {
+  const params = new URLSearchParams(Buffer.isBuffer(rawBody) ? rawBody.toString('utf8') : String(rawBody || ''));
+  try { return JSON.parse(params.get('payload') || 'null'); } catch { return null; }
+}
+
+/** True for ANY mktinv_* button click or mktinv_* modal submission — never forwarded. */
+export function isMarketingInvoiceAction(rawBody) {
+  const p = payloadOf(rawBody);
+  if (!p) return false;
+  if (p.type === 'block_actions') {
+    const id = Array.isArray(p.actions) ? String(p.actions[0]?.action_id || '') : '';
+    return id.startsWith(MKT_INVOICE_ACTION_PREFIX);
+  }
+  if (p.type === 'view_submission' || p.type === 'view_closed') {
+    return String(p.view?.callback_id || '').startsWith(MKT_INVOICE_ACTION_PREFIX);
+  }
+  return false;
+}
+
+/**
+ * Parse a marketing-invoice interaction. Returns null for anything malformed
+ * (which the route DROPS, never forwards): a non-uuid document id, an unknown
+ * decision, a modal without its document in private_metadata.
+ */
+export function parseMarketingInvoiceInteraction(rawBody) {
+  const p = payloadOf(rawBody);
+  if (!p) return null;
+  const user = { userId: String(p.user?.id || ''), userName: String(p.user?.name || p.user?.username || p.user?.id || 'unknown') };
+  if (p.type === 'block_actions') {
+    const action = Array.isArray(p.actions) ? p.actions[0] : null;
+    const id = String(action?.action_id || '');
+    if (!id.startsWith(MKT_INVOICE_ACTION_PREFIX)) return null;
+    const decision = id.slice(MKT_INVOICE_ACTION_PREFIX.length);
+    if (!['approve', 'reject', 'edit'].includes(decision)) return null;
+    const documentId = String(action.value ?? '').trim();
+    if (!UUID_RE.test(documentId)) return null;
+    return {
+      kind: 'mktinv', decision, documentId, ...user,
+      triggerId: String(p.trigger_id || ''),
+      responseUrl: isSlackResponseUrl(p.response_url) ? p.response_url : '',
+      channelId: String(p.channel?.id || p.container?.channel_id || ''),
+      messageTs: String(p.message?.ts || p.container?.message_ts || ''),
+    };
+  }
+  if (p.type === 'view_submission') {
+    if (!String(p.view?.callback_id || '').startsWith(MKT_INVOICE_ACTION_PREFIX)) return null;
+    const documentId = String(p.view?.private_metadata || '').trim();
+    if (!UUID_RE.test(documentId)) return null;
+    return { kind: 'mktinv', decision: 'edit_submit', documentId, ...user, values: p.view?.state?.values || {}, triggerId: '', responseUrl: '' };
+  }
+  return null;
+}

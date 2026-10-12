@@ -505,6 +505,33 @@ kinds, so a wide `since` can fill live jobs without minting Won/Lost cards for s
 half of `checkLeadTriggers`: its filter never matched, and a "fixed" one would onboard every historical
 sale.
 
+**Marketing cost is a ledger, not an LP field (Mark + Brad Codman, 2026-10-12; sql/158).** Report 136 and LP cost entry
+are retired: nobody types a cost into LP again, and no code reads `mcost_cents` for a cost. The money lives in
+`marketing_expenses` (invoice lines, Lead Gurus feed days, commission rules) and is split per month and market in
+`marketing_expense_allocations` by GROSS ISSUED LEADS (D1: `ever_issued` by `created_at_lp`, `mkt_issued_counts`); Net /
+Working / Gross $ come from report 133 (`mkt_sales_dollars`, D8). The allocator is ONE pure module,
+`src/marketing/allocation.js` (direct / proportional / equal / hold, cents reconciled or it throws); the rows are written by
+`allocation-io.js` and re-run nightly (`marketing-cost-nightly`, 02:30 ET, current + prior month). The dashboard and
+Brad's XLSX (`marketing-cost-report`, formulas never typed values) read `v_market_subsource_cost`.
+- **An invoice file never reaches a paid model (D9).** n8n `I.MCIN` POSTs the attachment to
+  `/n8n/admin/marketing-invoice-ingest`; `src/marketing/extract-client.js` gets the TEXT for free from reece-speech-api
+  `/v1/extract` (pdfplumber + Tesseract) or in-process for CSV/XLSX/body text; only that text goes to
+  `mkt_invoice_analysis` (rules first, model second, rules win on total and invoice #, `analysis-schema.js` is strict).
+  The text is untrusted: cleaned, screened (`guardrail_decisions` surface `invoice_text`), and nothing in it can run
+  anything — the only outputs are ledger rows and a Slack card.
+- **Only Mark or Brad decides (D6).** The card in `SLACK_MKT_INVOICE_CHANNEL_ID` carries `mktinv_approve` /
+  `mktinv_edit` / `mktinv_reject`; `isMarketingInvoiceAction` in `src/slack-approvals-core.js` catches those clicks AND
+  the Edit modal's `view_submission` so they are never relayed to onboarding (which would read them as a member
+  approval). Approvers are `MKT_INVOICE_APPROVER_SLACK_IDS` (empty = nobody). Auto-approve only with zero flags and
+  ≥ `MKT_AUTO_APPROVE_MIN_PRIOR` (2) prior person approvals of that vendor; a vendor with `eligible_markets='{}'`
+  cannot be approved until someone fills them in through Edit.
+- **REECE_HOLD money is never spread by code (D4).** Lead Gurus "Unknown" / "Out Of Area" and the daily territory gap
+  (09-22: $4,763.59) sit on `REECE_HOLD`; `src/marketing/holds.js` writes a RECOMMENDATION (matched LP lead → branch,
+  else zip → service area) and a person applies it. The feed is provisional until the invoice supersedes it
+  (`trueUpInvoice`, variance > `MKT_FEED_VARIANCE_PCT` posts a line).
+- Mode switches: `MKT_INVOICE_ANALYZER` rules|rules+llm, `MKT_COST_NIGHTLY_ENABLED`. Dry runs: the tests
+  (`scripts/test-marketing-*.js`) and `GET /n8n/admin/marketing-expenses/status` (reconciliation = 0 failing rows).
+
 ## Alerting
 
 Alert modules are **pure and dependency-free** so they unit-test without importing supabase, GroupMe

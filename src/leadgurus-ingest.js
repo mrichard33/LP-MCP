@@ -434,8 +434,22 @@ export async function runPull({ date_after, date_before } = {}) {
   const summary = await upsertSummary({ date_after, date_before });
   const leads = await pullLeads({ date_after, date_before });
 
+  // 2026-10-12 — marketing cost ledger (sql/158). Every territory day becomes
+  // a PROVISIONAL marketing_expenses row and the day gap goes to REECE_HOLD;
+  // the last 7 days are re-synced on every pull because Lead Gurus restates
+  // recent days. Best-effort: the pull's own result never depends on it.
+  let feed = null;
+  try {
+    const from = new Date(Date.parse(`${date_before}T00:00:00Z`) - 7 * 86400000).toISOString().slice(0, 10);
+    const { syncFeedExpenses } = await import('./marketing/leadgurus-feed.js');
+    feed = await syncFeedExpenses({ from: from < date_after ? from : date_after, to: date_before });
+  } catch (err) {
+    feed = { ok: false, error: err.message };
+    console.warn(`[I.LG] marketing feed sync failed (ledger not applied yet?): ${err.message}`);
+  }
+
   const result = {
-    ok: true, date_after, date_before, summary, leads,
+    ok: true, date_after, date_before, summary, leads, feed,
     enrich_enabled: ENRICH_ENABLED, elapsed_ms: Date.now() - startedAt,
   };
   console.log(`[I.LG] pull: ${JSON.stringify(result)}`);
