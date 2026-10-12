@@ -114,6 +114,10 @@ export async function runAddressBackfillSweep(deps = {}) {
   const db = deps.supabase || supabase;
   const { data, error } = await db
     .from('lp_leads')
+    // 2026-10-12 — the .select() was missing, so every pass threw
+    // "db.from(...).or is not a function" and the sweep never repaired one
+    // address. A query has no filters until it is a select.
+    .select('lp_prospect_id, ghl_contact_id, address, created_at_lp')
     // 2026-08-27 — was .is('address', null), which made every "undefined"
     // row invisible to this sweep. BLANKISH_SQL_OR also matches the empty
     // string and the placeholder tokens.
