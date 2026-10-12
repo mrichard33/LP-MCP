@@ -116,6 +116,19 @@ jobs:
             echo "No *_baseline_dump.sql yet; run this workflow manually with action=baseline. Skipping the drift check."
             exit 0
           fi
+          # 2026-10-12 (lead_conversation_stage, the first real migration
+          # after the baseline): the shadow database is the WHOLE folder, so a
+          # migration this PR adds (not applied until merge) always read as
+          # drift. Compare production with what production has applied: set the
+          # pending files aside for the diff and put them back after.
+          mkdir -p "$RUNNER_TEMP/pending-migrations"
+          node scripts/check-migrations.js --pending migration-list.txt > pending.txt
+          while read -r f; do
+            [ -n "$f" ] || continue
+            echo "Not applied yet, left out of the drift comparison: $f"
+            mv "supabase/migrations/$f" "$RUNNER_TEMP/pending-migrations/"
+          done < pending.txt
+          trap 'mv "$RUNNER_TEMP"/pending-migrations/*.sql supabase/migrations/ 2>/dev/null || true' EXIT
           # 2026-10-12: this line used to end in `|| true`, so when the shadow
           # rebuild failed ("type public.vector does not exist") the diff wrote
           # nothing and the step printed "No drift." with no comparison run.

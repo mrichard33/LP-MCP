@@ -17,6 +17,7 @@ import {
   checkBaselineOrder,
   checkLegacySqlFrozen,
   parseMigrationList,
+  pendingMigrationFiles,
   countLedgerRows,
   filterDrift,
   KNOWN_DRIFT_NOISE,
@@ -178,4 +179,11 @@ test('empty diff output is no drift', () => {
 
 test('every known-noise entry says why', () => {
   for (const k of KNOWN_DRIFT_NOISE) assert.ok(k.hash && k.object && k.why.length > 20, k.object);
+});
+
+test('pendingMigrationFiles: only the files the database has not applied are left out of the drift diff', () => {
+  const files = ['20261012164849_baseline_dump.sql', '20261012174130_lead_conversation_stage.sql', 'README.md'];
+  assert.deepEqual(pendingMigrationFiles(files, ['20261012174130']), ['20261012174130_lead_conversation_stage.sql']);
+  assert.deepEqual(pendingMigrationFiles(files, []), []);
+  assert.deepEqual(pendingMigrationFiles(files, null), []);
 });
