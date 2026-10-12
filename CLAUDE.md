@@ -476,6 +476,14 @@ reads the HL mirror for nameless contacts and needs a VERIFIED link (LP id on th
 `scripts/backfill-lp-contact-names.js` or `POST /admin/lp-identity-fill` (dry run default). Most nameless `lp-linked`
 contacts have no name in LP either (1,107 of 1,154 on 2026-10-11); that is not a bug here.
 
+**Inbound capture turns only a sales call into an LP lead (2026-10-12).** `INBOUND_CAPTURE_MODE` (default shadow)
+labelled 2+ minute callers with no LP lead and never read what the call said: of 128 shadow candidates, 35 had refused
+(Not Interested, Cant Do Project, Below Minimum, Kicked) and 43 rang "Main Number" (service and existing customers). The
+`not_a_lead` label (`notALeadReason`, `src/inbound-caller-classify.js`) now comes right after `dnc` and before any GHL
+read: the disposition must be on `LEAD_DISPOSITIONS` (an ALLOW list: an unknown disposition is not a lead), and Main
+Number counts only for an appointment set. The caller's NEWEST call decides for every row of that caller. 50 remain,
+40 of them a 2+ minute "Hung Up"; whether those are leads is Mark's ruling before approval mode.
+
 **Every LP sale gets a P2 card, even when LP's webhook does not arrive (2026-10-03).** A P2 (Client
 Lifecycle) card is built only by LP's outbound webhook → GHL I.LP-IN (adds `deal-won`) → C.0-IN (P1 Sale
 Recorded + P2 Contract Signed, valued from LP Gross Sale Amount). LP's webhook all but stopped on 2026-09-24,
