@@ -115,7 +115,14 @@ jobs:
             echo "No *_baseline_dump.sql yet; run this workflow manually with action=baseline. Skipping the drift check."
             exit 0
           fi
-          supabase db diff --linked --schema public,ai_os > drift.sql || true
+          # 2026-10-12: this line used to end in `|| true`, so when the shadow
+          # rebuild failed ("type public.vector does not exist") the diff wrote
+          # nothing and the step printed "No drift." with no comparison run.
+          # A diff that cannot run is a failure, never a clean bill.
+          if ! supabase db diff --linked --schema public,ai_os > drift.sql; then
+            echo "::error::The drift check could not run (see the error above), so nothing was compared. Fix the cause; do not read this as no drift."
+            exit 1
+          fi
           if [ -s drift.sql ] && grep -vqE '^\s*(--.*)?$' drift.sql; then
             echo "::error::The live schema differs from the migrations in this repo. Either add a migration for the change, or someone changed the database by hand."
             cat drift.sql
@@ -191,6 +198,12 @@ jobs:
             echo "-- by this same workflow run (supabase migration repair), so \`db push\` never"
             echo "-- executes it against production. A fresh database is built from it."
             echo "--"
+            # The dump leaves out what a fresh database needs first (2026-10-12):
+            # the vector extension (in public), pg_trgm (in extensions) and the
+            # lf_report_svc role its GRANTs name.
+            echo 'CREATE EXTENSION IF NOT EXISTS "vector" WITH SCHEMA "public";'
+            echo 'CREATE EXTENSION IF NOT EXISTS "pg_trgm" WITH SCHEMA "extensions";'
+            echo "DO \$\$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'lf_report_svc') THEN CREATE ROLE \"lf_report_svc\" NOLOGIN; END IF; END \$\$;"
             cat "$FILE"
           } > "$FILE.tmp" && mv "$FILE.tmp" "$FILE"
           supabase migration repair --linked --status applied "$VERSION"

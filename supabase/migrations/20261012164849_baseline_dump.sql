@@ -6,6 +6,21 @@
 -- by this same workflow run (supabase migration repair), so `db push` never
 -- executes it against production. A fresh database is built from it.
 --
+-- Prerequisites that `db dump --schema public,ai_os` leaves out (2026-10-12).
+-- The first drift check died rebuilding this file ("type public.vector does
+-- not exist") and its `|| true` printed "No drift." anyway. Production never
+-- runs this file (the version is recorded as applied); a shadow or preview
+-- database does, and needs these first. lf_report_svc logs in with a password
+-- set by hand (n8n/sql/lf_report_svc_role.sql); here it only has to exist for
+-- the GRANTs below.
+CREATE EXTENSION IF NOT EXISTS "vector" WITH SCHEMA "public";
+CREATE EXTENSION IF NOT EXISTS "pg_trgm" WITH SCHEMA "extensions";
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'lf_report_svc') THEN
+    CREATE ROLE "lf_report_svc" NOLOGIN;
+  END IF;
+END $$;
 
 
 
