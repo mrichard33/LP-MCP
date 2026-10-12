@@ -57,6 +57,13 @@ test('isDestructive reads SQL, not comments or function bodies', () => {
   assert.equal(isDestructive('TRUNCATE t;'), true);
   assert.equal(isDestructive('DELETE FROM t WHERE id = 1;'), true);
   assert.equal(isDestructive('ALTER TABLE t ADD COLUMN IF NOT EXISTS c text;'), false);
+  // 2026-10-12 baseline dump: a comment's TEXT and the trigger that forbids a
+  // truncate are not destructive; a real statement after them still is.
+  assert.equal(isDestructive("COMMENT ON TABLE t IS 'Safe to drop: drop table t;';"), false);
+  assert.equal(isDestructive("COMMENT ON TABLE t IS 'it''s -- fine'; CREATE TABLE y (id int);"), false);
+  assert.equal(isDestructive('CREATE TRIGGER no_trunc BEFORE TRUNCATE ON t FOR EACH STATEMENT EXECUTE FUNCTION f();'), false);
+  assert.equal(isDestructive("COMMENT ON TABLE t IS 'x';\nTRUNCATE t;"), true);
+  assert.equal(isDestructive("COMMENT ON TABLE t IS 'x'; DROP TABLE t;"), true);
 });
 
 test('until a baseline dump exists, only comment-only stubs are allowed', () => {

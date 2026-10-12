@@ -212,6 +212,11 @@ jobs:
             -m "WHY: the migrations ledger needs a true starting point; the 157 hand-applied sql/ files cannot be replayed. From this file forward every schema change is a migration in supabase/migrations/ and the drift check is meaningful." \
             -m "IMPACT: none at runtime. Nothing was executed against the database."
           git push -u origin "$BR"
+          # 2026-10-12: the repo setting "Allow GitHub Actions to create pull
+          # requests" is off, so gh pr create was refused AFTER the dump, the
+          # repair and the push had all succeeded, and the run read as failed.
+          # The branch is the deliverable; a refused PR is a notice, not a failure.
           gh pr create --base main --head "$BR" \
             --title "chore(db): baseline dump of the LP schema" \
-            --body "Produced by the db-migrate workflow (action=baseline). Review that the file is the schema you expect, then merge. The database already lists this version as applied, so merging runs nothing against production; it only makes the drift check live."
+            --body "Produced by the db-migrate workflow (action=baseline). Review that the file is the schema you expect, then merge. The database already lists this version as applied, so merging runs nothing against production; it only makes the drift check live." \
+          || echo "::notice::Branch $BR is pushed, but GitHub Actions may not open pull requests in this repo. Open one from https://github.com/${{ github.repository }}/pull/new/$BR"

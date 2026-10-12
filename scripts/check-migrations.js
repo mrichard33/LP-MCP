@@ -47,18 +47,55 @@ export const REMOTE_VERSIONS_PINNED = [
 export const MIGRATION_NAME = /^(\d{14})_([a-z0-9_]+)\.sql$/;
 export const DESTRUCTIVE_MARKER = /^\s*--\s*destructive:\s*approved by\s+\S.*\d{4}-\d{2}-\d{2}/mi;
 
-/** Strip comments and dollar-quoted bodies so a word inside a comment does not count. */
+/**
+ * Blank out comments, string literals and dollar-quoted bodies so a word
+ * inside them does not count. A tokenizer, not regexes in sequence: the
+ * baseline dump (2026-10-12) carries a COMMENT ON TABLE whose text says
+ * "Safe to drop: drop table …", and a comment can hold an apostrophe or a
+ * string can hold "--", which order-dependent regexes get wrong.
+ */
 function codeOnly(sql) {
-  return sql
-    .replace(/\$(\w*)\$[\s\S]*?\$\1\$/g, ' ')
-    .replace(/--[^\n]*/g, ' ')
-    .replace(/\/\*[\s\S]*?\*\//g, ' ');
+  let out = '';
+  let i = 0;
+  while (i < sql.length) {
+    const c = sql[i];
+    const two = sql.slice(i, i + 2);
+    if (two === '--') {
+      const end = sql.indexOf('\n', i);
+      i = end === -1 ? sql.length : end;
+      out += ' ';
+    } else if (two === '/*') {
+      const end = sql.indexOf('*/', i + 2);
+      i = end === -1 ? sql.length : end + 2;
+      out += ' ';
+    } else if (c === "'") {
+      i += 1;
+      while (i < sql.length) {
+        if (sql[i] === "'" && sql[i + 1] === "'") { i += 2; continue; }
+        if (sql[i] === "'") { i += 1; break; }
+        i += 1;
+      }
+      out += ' ';
+    } else if (c === '$') {
+      const m = /^\$(\w*)\$/.exec(sql.slice(i, i + 64));
+      if (!m) { out += c; i += 1; continue; }
+      const end = sql.indexOf(m[0], i + m[0].length);
+      i = end === -1 ? sql.length : end + m[0].length;
+      out += ' ';
+    } else {
+      out += c;
+      i += 1;
+    }
+  }
+  return out;
 }
 
 export function isDestructive(sql) {
   const s = codeOnly(sql);
   return /\bDROP\s+(TABLE|SCHEMA|VIEW|MATERIALIZED\s+VIEW|FUNCTION|INDEX|TYPE|COLUMN|POLICY|TRIGGER|ROLE)\b/i.test(s)
-    || /\bTRUNCATE\b/i.test(s)
+    // Only a TRUNCATE statement. "BEFORE TRUNCATE ON tool_audit_log" is the
+    // trigger that FORBIDS truncating the audit log (sql/153), not a truncate.
+    || /(^|;)\s*TRUNCATE\b/i.test(s)
     || /\bALTER\s+TABLE\b[\s\S]*?\bALTER\s+(COLUMN\s+)?\w+\s+(SET\s+DATA\s+)?TYPE\b/i.test(s)
     || /\bALTER\s+TABLE\b[\s\S]*?\bDROP\s+(COLUMN|CONSTRAINT)\b/i.test(s)
     || /\bDELETE\s+FROM\b/i.test(s);
