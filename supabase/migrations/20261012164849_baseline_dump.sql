@@ -24075,3 +24075,81 @@ ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON TAB
 
 
 
+
+-- Privileges the live database REVOKED that a fresh database grants by default
+-- (Supabase's default privileges give anon/authenticated/service_role ALL on
+-- every new public table). The first real drift run (2026-10-12) listed exactly
+-- these; tool_audit_log keeps service_role to INSERT/SELECT (append-only, sql/153).
+REVOKE delete on table "public"."ai_os_load_v0_3_5" from "anon";
+REVOKE insert on table "public"."ai_os_load_v0_3_5" from "anon";
+REVOKE references on table "public"."ai_os_load_v0_3_5" from "anon";
+REVOKE select on table "public"."ai_os_load_v0_3_5" from "anon";
+REVOKE trigger on table "public"."ai_os_load_v0_3_5" from "anon";
+REVOKE truncate on table "public"."ai_os_load_v0_3_5" from "anon";
+REVOKE update on table "public"."ai_os_load_v0_3_5" from "anon";
+REVOKE delete on table "public"."ai_os_load_v0_3_5" from "authenticated";
+REVOKE insert on table "public"."ai_os_load_v0_3_5" from "authenticated";
+REVOKE references on table "public"."ai_os_load_v0_3_5" from "authenticated";
+REVOKE select on table "public"."ai_os_load_v0_3_5" from "authenticated";
+REVOKE trigger on table "public"."ai_os_load_v0_3_5" from "authenticated";
+REVOKE truncate on table "public"."ai_os_load_v0_3_5" from "authenticated";
+REVOKE update on table "public"."ai_os_load_v0_3_5" from "authenticated";
+REVOKE delete on table "public"."ai_os_load_v0_3_5" from "service_role";
+REVOKE insert on table "public"."ai_os_load_v0_3_5" from "service_role";
+REVOKE references on table "public"."ai_os_load_v0_3_5" from "service_role";
+REVOKE select on table "public"."ai_os_load_v0_3_5" from "service_role";
+REVOKE trigger on table "public"."ai_os_load_v0_3_5" from "service_role";
+REVOKE truncate on table "public"."ai_os_load_v0_3_5" from "service_role";
+REVOKE update on table "public"."ai_os_load_v0_3_5" from "service_role";
+REVOKE delete on table "public"."ai_os_load_v0_3_6" from "anon";
+REVOKE insert on table "public"."ai_os_load_v0_3_6" from "anon";
+REVOKE references on table "public"."ai_os_load_v0_3_6" from "anon";
+REVOKE select on table "public"."ai_os_load_v0_3_6" from "anon";
+REVOKE trigger on table "public"."ai_os_load_v0_3_6" from "anon";
+REVOKE truncate on table "public"."ai_os_load_v0_3_6" from "anon";
+REVOKE update on table "public"."ai_os_load_v0_3_6" from "anon";
+REVOKE delete on table "public"."ai_os_load_v0_3_6" from "authenticated";
+REVOKE insert on table "public"."ai_os_load_v0_3_6" from "authenticated";
+REVOKE references on table "public"."ai_os_load_v0_3_6" from "authenticated";
+REVOKE select on table "public"."ai_os_load_v0_3_6" from "authenticated";
+REVOKE trigger on table "public"."ai_os_load_v0_3_6" from "authenticated";
+REVOKE truncate on table "public"."ai_os_load_v0_3_6" from "authenticated";
+REVOKE update on table "public"."ai_os_load_v0_3_6" from "authenticated";
+REVOKE delete on table "public"."ai_os_load_v0_3_6" from "service_role";
+REVOKE insert on table "public"."ai_os_load_v0_3_6" from "service_role";
+REVOKE references on table "public"."ai_os_load_v0_3_6" from "service_role";
+REVOKE select on table "public"."ai_os_load_v0_3_6" from "service_role";
+REVOKE trigger on table "public"."ai_os_load_v0_3_6" from "service_role";
+REVOKE truncate on table "public"."ai_os_load_v0_3_6" from "service_role";
+REVOKE update on table "public"."ai_os_load_v0_3_6" from "service_role";
+REVOKE delete on table "public"."lf_aged_lead_sent_log" from "anon";
+REVOKE insert on table "public"."lf_aged_lead_sent_log" from "anon";
+REVOKE references on table "public"."lf_aged_lead_sent_log" from "anon";
+REVOKE select on table "public"."lf_aged_lead_sent_log" from "anon";
+REVOKE trigger on table "public"."lf_aged_lead_sent_log" from "anon";
+REVOKE truncate on table "public"."lf_aged_lead_sent_log" from "anon";
+REVOKE update on table "public"."lf_aged_lead_sent_log" from "anon";
+REVOKE delete on table "public"."lf_aged_lead_sent_log" from "authenticated";
+REVOKE insert on table "public"."lf_aged_lead_sent_log" from "authenticated";
+REVOKE references on table "public"."lf_aged_lead_sent_log" from "authenticated";
+REVOKE select on table "public"."lf_aged_lead_sent_log" from "authenticated";
+REVOKE trigger on table "public"."lf_aged_lead_sent_log" from "authenticated";
+REVOKE truncate on table "public"."lf_aged_lead_sent_log" from "authenticated";
+REVOKE update on table "public"."lf_aged_lead_sent_log" from "authenticated";
+REVOKE delete on table "public"."tool_audit_log" from "anon";
+REVOKE insert on table "public"."tool_audit_log" from "anon";
+REVOKE references on table "public"."tool_audit_log" from "anon";
+REVOKE select on table "public"."tool_audit_log" from "anon";
+REVOKE trigger on table "public"."tool_audit_log" from "anon";
+REVOKE truncate on table "public"."tool_audit_log" from "anon";
+REVOKE update on table "public"."tool_audit_log" from "anon";
+REVOKE delete on table "public"."tool_audit_log" from "authenticated";
+REVOKE insert on table "public"."tool_audit_log" from "authenticated";
+REVOKE references on table "public"."tool_audit_log" from "authenticated";
+REVOKE select on table "public"."tool_audit_log" from "authenticated";
+REVOKE trigger on table "public"."tool_audit_log" from "authenticated";
+REVOKE truncate on table "public"."tool_audit_log" from "authenticated";
+REVOKE update on table "public"."tool_audit_log" from "authenticated";
+REVOKE delete on table "public"."tool_audit_log" from "service_role";
+REVOKE truncate on table "public"."tool_audit_log" from "service_role";
+REVOKE update on table "public"."tool_audit_log" from "service_role";
