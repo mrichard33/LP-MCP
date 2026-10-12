@@ -50,26 +50,38 @@
 //   1. Five9 DNC — the existing checkDncForNumbers (five9_check_dnc). FAILS
 //      CLOSED: if the check cannot be read, eligible rows are left UNLOGGED so
 //      the next pass retries them. Unknown DNC status is never a dial.
-//   2. Cross-list check (findContactInOtherLists, the lp_callback_requeue
-//      guard) — someone another campaign is already working is not pushed
-//      again. Fails open, exactly as it does there.
-//   3. Per-caller cooldown — one queued dial per number per 72 hours, however
+//   2. Per-caller cooldown — one queued dial per number per 72 hours, however
 //      many times they ring back or under how many campaigns.
+//   3. Call history, every campaign, in and out (readCallHistory, 30 days).
+//      FAILS CLOSED like the DNC read. Skipped when the number:
+//        - had a service call or rang a dispatch/service line
+//          (`skipped_service`): an existing customer, not a lost lead;
+//        - had any conversation, on any line (`skipped_spoke`): a disposition
+//          outside NO_CONTACT_DISPOSITIONS, or a 2-minute "No Disposition";
+//        - was already called back by us after its last call
+//          (`skipped_called_back`): someone is working it.
 //   4. Claim, then act — the log row is inserted ON CONFLICT DO NOTHING
 //      BEFORE the push, and the push happens only when the claim won. If the
 //      push then fails, the claim is removed so the next pass retries.
 //
 // Shadow runs steps 1–3 too (they are reads), so `would_push` means "live
 // would have pushed this", not "this passed a looser test".
+//
+// WHY STEP 3 REPLACED THE CROSS-LIST CHECK (2026-10-12)
+//   Step 3 used to be findContactInOtherLists (the lp_callback_requeue guard).
+//   Its Five9 read has never worked (bare-array criteria), so all 264
+//   would_push rows from 2026-09-24 to 2026-10-12 read "cross-list check
+//   unreadable — failed open". The view groups by (caller, campaign), so
+//   a Google PPC hang-up could not see the same number's "Service Call" on
+//   another line the day before (7542104616). The history check reads every
+//   Five9 disposition for the number across all campaigns instead. The
+//   shared helper stays unfixed on purpose: a naive fix reads f9_last_list,
+//   which keeps the last list EVER, and would block most callbacks.
 
 import { runSQL as defaultRunSQL } from '../admin/supabase-admin.js';
 import defaultSupabase from '../supabase.js';
 import { checkDncForNumbers as defaultCheckDnc } from '../five9-admin.js';
-import {
-  findContactInOtherLists as defaultFindOtherLists,
-  callbackListName,
-  callbackCallNowMode,
-} from '../five9/callback-push.js';
+import { callbackListName, callbackCallNowMode } from '../five9/callback-push.js';
 import { emitEvent as defaultEmitEvent } from '../event-emitter.js';
 import { runJob } from '../job-runner.js';
 
@@ -94,6 +106,27 @@ export const ELIGIBLE_DISPOSITIONS = Object.freeze([
   'Abandon',
   'No Disposition',
 ]);
+
+// No-contact dispositions on ANY call in the history check: ELIGIBLE_DISPOSITIONS
+// plus the outbound ones where we rang and nobody picked up. Anything else,
+// including a disposition this list has never seen, counts as a conversation:
+// the safe side of the mistake is not dialling (2026-10-12).
+export const NO_CONTACT_DISPOSITIONS = Object.freeze([
+  ...ELIGIBLE_DISPOSITIONS,
+  'Answering Machine',
+  'No Answer',
+  'Busy',
+  'Operator Intercept',
+  'Left Voicemail',
+  'Dial Error',
+  'Hangup',
+  'Fax',
+]);
+export const SERVICE_DISPOSITIONS = Object.freeze(['Service Call']);
+// "No Disposition" is in the no-contact list, but averages 404s: an agent who
+// talked and never dispositioned. Two minutes of it is a conversation.
+export const SPOKE_MIN_SEC = 120;
+export const HISTORY_DAYS = 30;
 
 // Paid, lead-generating inbound campaigns. "Main Number" is excluded: it mixes
 // service calls and existing customers (decided, 2026-09-23).
@@ -178,6 +211,61 @@ export function buildCandidatesSql(campaigns, hours = LOOKBACK_HOURS) {
            )
      ORDER BY v.last_call_at DESC
      LIMIT ${MAX_ROWS_PER_PASS}`;
+}
+
+/**
+ * Every Five9 disposition for these numbers in the last HISTORY_DAYS, on any
+ * campaign, in either direction: inbound when ani is the number, outbound when
+ * dnis is. ~3s for 50 numbers over 125k rows (2026-10-12), once per pass.
+ */
+export function buildHistorySql(numbers, days = HISTORY_DAYS) {
+  const nums = [...new Set((numbers || []).map(last10).filter(Boolean))];
+  if (!nums.length) throw new Error('no numbers to read');
+  const d = Number(days);
+  if (!Number.isFinite(d) || d <= 0) throw new Error(`bad history window: ${days}`);
+  const list = `ARRAY[${nums.map(sqlStr).join(', ')}]::text[]`;
+  return `
+    SELECT * FROM (
+      SELECT right(regexp_replace(coalesce(ani, ''), '\\D', '', 'g'), 10)  AS ani10,
+             right(regexp_replace(coalesce(dnis, ''), '\\D', '', 'g'), 10) AS dnis10,
+             campaign, disposition_name, duration_sec, received_at
+        FROM five9_events_raw
+       WHERE received_at >= now() - interval '${d} days'
+         AND event_type = 'disposition'
+    ) e
+     WHERE e.ani10 = ANY(${list}) OR e.dnis10 = ANY(${list})`;
+}
+
+/**
+ * Pure. What the number's own call history says about dialling it.
+ * @param {string} caller — 10 digits
+ * @param {string} lastCallAt — the candidate's last inbound call
+ * @param {Array} events — rows from buildHistorySql
+ * @returns {{ action: 'skipped_service'|'skipped_spoke'|'skipped_called_back'|null, detail: string|null }}
+ */
+export function judgeHistory(caller, lastCallAt, events = []) {
+  const mine = events.filter((e) => e.ani10 === caller || e.dnis10 === caller);
+  const service = mine.find((e) =>
+    SERVICE_DISPOSITIONS.includes(String(e.disposition_name ?? '').trim())
+    || /dispatch|service/i.test(String(e.campaign ?? '')));
+  if (service) {
+    return { action: 'skipped_service', detail: `service customer: "${service.disposition_name ?? ''}" on "${service.campaign ?? ''}" at ${service.received_at}` };
+  }
+  const spoke = mine.find((e) => {
+    const d = String(e.disposition_name ?? '').trim();
+    if (!NO_CONTACT_DISPOSITIONS.includes(d)) return true;
+    return d === 'No Disposition' && Number(e.duration_sec) >= SPOKE_MIN_SEC;
+  });
+  if (spoke) {
+    return { action: 'skipped_spoke', detail: `already spoke to us: "${spoke.disposition_name ?? ''}" on "${spoke.campaign ?? ''}" at ${spoke.received_at}` };
+  }
+  const since = Date.parse(lastCallAt);
+  const calledBack = Number.isFinite(since) && mine.find((e) =>
+    e.dnis10 === caller && e.ani10 !== caller && Date.parse(e.received_at) >= since);
+  if (calledBack) {
+    return { action: 'skipped_called_back', detail: `already called back on "${calledBack.campaign ?? ''}" at ${calledBack.received_at}` };
+  }
+  return { action: null, detail: null };
 }
 
 /** The Five9 record: number1 only — see "THE PUSH PATH" above. */
@@ -266,12 +354,16 @@ export async function runMissedCallerRecovery({ env = process.env, nowMs = Date.
   const runSQL = deps.runSQL || defaultRunSQL;
   const db = deps.supabase || defaultSupabase;
   const checkDnc = deps.checkDnc || defaultCheckDnc;
-  const findOtherLists = deps.findOtherLists || defaultFindOtherLists;
+  const readCallHistory = deps.readCallHistory || ((numbers) => runSQL(buildHistorySql(numbers)));
   const emitEvent = deps.emitEvent || defaultEmitEvent;
   const queuePush = deps.queuePush || queueCallbackPush;
 
   const campaigns = recoveryCampaigns(env);
-  const counts = { candidates: 0, would_push: 0, pushed: 0, skipped_dnc: 0, skipped_ineligible: 0, alert_appt_no_lp: 0, already_logged: 0, dnc_unknown: 0 };
+  const counts = {
+    candidates: 0, would_push: 0, pushed: 0, skipped_dnc: 0, skipped_ineligible: 0,
+    skipped_service: 0, skipped_spoke: 0, skipped_called_back: 0,
+    alert_appt_no_lp: 0, already_logged: 0, dnc_unknown: 0, history_unknown: 0,
+  };
   const errors = [];
   const result = () => ({ ok: errors.length === 0, mode, campaigns: campaigns.length, ...counts, errors });
 
@@ -302,6 +394,18 @@ export async function runMissedCallerRecovery({ env = process.env, nowMs = Date.
       onDnc = await readDnc(eligibleNumbers, checkDnc);
     } catch (err) {
       errors.push(`dnc: ${err.message}`);
+    }
+  }
+
+  // Call history once, for the same numbers. Fail closed, like DNC.
+  let history = null;
+  if (eligibleNumbers.length) {
+    try {
+      const rowsRead = await readCallHistory(eligibleNumbers);
+      if (!Array.isArray(rowsRead)) throw new Error('history read returned no row set');
+      history = rowsRead;
+    } catch (err) {
+      errors.push(`history: ${err.message}`);
     }
   }
 
@@ -368,27 +472,27 @@ export async function runMissedCallerRecovery({ env = process.env, nowMs = Date.
         continue;
       }
 
-      const other = await findOtherLists(row.caller, { listName: callbackListName() });
-      if (other?.suppress) {
-        await log(row, 'skipped_ineligible', `already live in Five9 list(s): ${other.lists.join(', ')}`);
+      if (!history) { counts.history_unknown += 1; continue; } // unlogged → retried next pass
+      const verdict = judgeHistory(row.caller, row.last_call_at, history);
+      if (verdict.action) {
+        await log(row, verdict.action, verdict.detail);
         continue;
       }
-      const failOpenNote = other?.failed_open ? ' (cross-list check unreadable — failed open)' : '';
 
       if (mode === 'shadow') {
-        const id = await log(row, 'would_push', `would queue to "${callbackListName()}"${failOpenNote}`);
+        const id = await log(row, 'would_push', `would queue to "${callbackListName()}"`);
         if (id) queuedThisPass.add(row.caller);
         continue;
       }
 
       // live: claim first, then push; release the claim if the push fails.
-      const id = await log(row, 'pushed', `queued to "${callbackListName()}"${failOpenNote}`);
+      const id = await log(row, 'pushed', `queued to "${callbackListName()}"`);
       if (!id) continue;
       try {
         const q = await queuePush(row, { supabase: db });
         queuedThisPass.add(row.caller);
         await db.from(LOG_TABLE)
-          .update({ detail: `queued to "${q.listName}" as agent_action ${q.actionId} (callNowMode ${q.callNowMode})${failOpenNote}` })
+          .update({ detail: `queued to "${q.listName}" as agent_action ${q.actionId} (callNowMode ${q.callNowMode})` })
           .eq('id', id);
       } catch (err) {
         counts.pushed -= 1;
@@ -421,7 +525,7 @@ export function startMissedCallerRecoveryScheduler(env = process.env) {
       const { value: res } = await runJob(JOB_ID, () => runMissedCallerRecovery());
       if (res && res.ok === false) console.warn(`[MissedCallerRecovery] pass finished with errors: ${res.errors.join('; ')}`);
       else if (res && !res.skipped) {
-        console.log(`[MissedCallerRecovery] ${res.mode}: candidates=${res.candidates} would_push=${res.would_push} pushed=${res.pushed} dnc=${res.skipped_dnc} ineligible=${res.skipped_ineligible} appt_no_lp=${res.alert_appt_no_lp}`);
+        console.log(`[MissedCallerRecovery] ${res.mode}: candidates=${res.candidates} would_push=${res.would_push} pushed=${res.pushed} dnc=${res.skipped_dnc} ineligible=${res.skipped_ineligible} service=${res.skipped_service} spoke=${res.skipped_spoke} called_back=${res.skipped_called_back} appt_no_lp=${res.alert_appt_no_lp}`);
       }
     } catch (err) {
       console.error(`[MissedCallerRecovery] pass threw: ${err.message}`);

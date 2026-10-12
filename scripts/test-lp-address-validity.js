@@ -124,11 +124,12 @@ test('{Result:1, "market is OOA."} is NOT accepted', () => {
 test('array-wrapped response unwraps', () => {
   assert.equal(inspectAppointmentResponse([{ Result: 1, Message: 'market is OOA.' }]).accepted, false);
 });
-test('Result 0 is not accepted', () => {
-  assert.equal(inspectAppointmentResponse({ Result: 0, Message: 'whatever' }).accepted, false);
+// 2026-10-12: SetAppointment says Result 0 for success, 1 for a refusal.
+test('Result 1 is not accepted, whatever the message', () => {
+  assert.equal(inspectAppointmentResponse({ Result: 1, Message: 'whatever' }).accepted, false);
 });
-test('a clean success IS accepted', () => {
-  assert.equal(inspectAppointmentResponse({ Result: 1, Message: '' }).accepted, true);
+test('LP\'s real success (Result 0) IS accepted', () => {
+  assert.equal(inspectAppointmentResponse({ Result: 0, Message: 'Appointment set successfully.' }).accepted, true);
 });
 
 console.log('\nassertAppointmentAccepted');
@@ -141,7 +142,7 @@ test('throws on OOA with an actionable message', () => {
   );
 });
 test('does not throw on success', () => {
-  assert.doesNotThrow(() => assertAppointmentAccepted({ Result: 1, Message: '' }, { ldsId: '570351' }));
+  assert.doesNotThrow(() => assertAppointmentAccepted({ Result: 0, Message: 'Appointment set successfully.' }, { ldsId: '570351' }));
 });
 
 console.log('\nassertLeadCanTakeAppointment — the pre-flight');

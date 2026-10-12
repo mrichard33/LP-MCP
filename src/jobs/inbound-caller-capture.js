@@ -74,10 +74,12 @@ import { ghlFetch as defaultGhlFetch } from '../actions/helpers.js';
 import { searchByPhone, resolveOrCreateContact, DEFAULT_DEPS as GHL_RESOLVE_DEPS } from '../services/ghl-contact-resolve.js';
 import { enrollLpLeadCreation as defaultEnroll } from '../admin/lp-force-addlead.js';
 import { runJob } from '../job-runner.js';
+import { captureSourceFor, LP_SOURCE_ID_FIELD, PRO_ID_FIELD } from '../inbound-capture-source.js';
 import { hourET, todayET } from './lp-report-common.js';
 import { alertDigestEnabled } from '../alert-posted.js';
 import {
   classifyCaller, isCandidate, normalizeCallerPhone, summarizeCallers, formatDailySummary, isAppointmentSet,
+  notALeadReason, readCustomField,
 } from '../inbound-caller-classify.js';
 
 export const JOB_ID = 'inbound-caller-capture';
@@ -232,7 +234,65 @@ function toRow(c) {
     agent_name: c.agent_name ?? null,
     disposition: c.disposition ?? null,
     minutes: c.minutes == null ? null : Number(c.minutes),
+    called_number: normalizeCallerPhone(c.called_number),
   };
+}
+
+/** The LP source line for logs and the approval card. Pure. */
+function sourceLine(src) {
+  return `${src.subSource} (srs ${src.srsId}), promoter ${src.promoter} (${src.proId})`;
+}
+
+/**
+ * The number each call DIALLED (Five9 dnis), which decides its LP source
+ * (2026-10-12). The view (sql/127, never modified here) does not carry it, so it
+ * is read from five9_events_raw for the same callers over the same time span,
+ * and matched to each view row by caller and call time. call_at is the event's
+ * received_at, but Five9 stores microseconds and a JS Date keeps milliseconds,
+ * so the match allows one second rather than demanding equality.
+ * Throws on a failed read: without the number nothing may be sent.
+ *
+ * @returns {Map<string, string>} `${caller}|${call_at ISO}` → called number
+ */
+export async function readCalledNumbers({ runSQL, rows }) {
+  const out = new Map();
+  const valid = rows.filter((r) => r.caller_phone && Number.isFinite(Date.parse(r.call_at)));
+  if (!valid.length) return out;
+  const times = valid.map((r) => Date.parse(r.call_at));
+  const from = new Date(Math.min(...times) - 1000).toISOString();
+  const to = new Date(Math.max(...times) + 1000).toISOString();
+  const callers = [...new Set(valid.map((r) => r.caller_phone))];
+  const events = [];
+  for (let i = 0; i < callers.length; i += LEAD_CHUNK) {
+    const list = sqlList(callers.slice(i, i + LEAD_CHUNK));
+    events.push(...asRows(await runSQL(`
+      SELECT * FROM (
+        SELECT right(regexp_replace(coalesce(ani, ''), '\\D', '', 'g'), 10)  AS caller,
+               received_at,
+               right(regexp_replace(coalesce(dnis, ''), '\\D', '', 'g'), 10) AS called_number
+          FROM five9_events_raw
+         WHERE event_type = 'disposition'
+           AND received_at >= '${from}' AND received_at <= '${to}'
+      ) e
+       WHERE e.caller IN (${list})
+    `), 'five9 called numbers'));
+  }
+  const byCaller = new Map();
+  for (const e of events) {
+    if (!e?.caller || !e.called_number) continue;
+    if (!byCaller.has(e.caller)) byCaller.set(e.caller, []);
+    byCaller.get(e.caller).push({ at: Date.parse(e.received_at), called: String(e.called_number) });
+  }
+  for (const r of valid) {
+    const t = Date.parse(r.call_at);
+    let best = null;
+    for (const e of byCaller.get(r.caller_phone) || []) {
+      const gap = Math.abs(e.at - t);
+      if (gap <= 1000 && (!best || gap < best.gap)) best = { gap, called: e.called };
+    }
+    if (best) out.set(`${r.caller_phone}|${new Date(t).toISOString()}`, best.called);
+  }
+  return out;
 }
 
 /**
@@ -261,13 +321,33 @@ export async function classifyCallers(viewRows, { deps = {} } = {}) {
     lpPhones = phones.length ? await readLpPhones({ runSQL: d.runSQL, phones }) : new Set();
   } catch (err) { return insufficient('lp_leads race check', err); }
 
-  // GHL, once per phone. A Five9-DNC caller is not looked up at all: nothing
-  // about GHL can change that label, and it saves the token.
+  // The caller's NEWEST call decides whether they are a lead (2026-10-12): a
+  // "Hung Up" on Monday followed by "Not Interested" on Tuesday is not one,
+  // and the other way round is.
+  const newestByPhone = new Map();
+  for (const r of calls) {
+    const prev = newestByPhone.get(r.caller_phone);
+    if (!prev || Date.parse(r.call_at) > Date.parse(prev.call_at)) newestByPhone.set(r.caller_phone, r);
+  }
+  const notALeadByPhone = new Map(
+    [...newestByPhone].map(([p, r]) => [p, notALeadReason(r) ? `newest call: ${notALeadReason(r)}` : null]),
+  );
+  // 2026-10-12: the newest call's number decides the LP source. A sales call to
+  // a number with no source on file is listed, never sent.
+  const noSourceByPhone = new Map([...newestByPhone].map(([p, r]) => [p,
+    captureSourceFor({ calledNumber: r.called_number, campaign: r.campaign })
+      ? null
+      : `newest call dialled ${r.called_number || 'an unknown number'} ("${r.campaign || 'no line'}"), which has no LP source on file`,
+  ]));
+
+  // GHL, once per phone. A Five9-DNC caller, or one whose newest call was not
+  // a lead, is not looked up at all: nothing about GHL can change that label,
+  // and it saves the token (several seconds per caller).
   const ghlByPhone = new Map();
   let consecutive = 0;
   let ghlErrors = 0;
   for (const p of phones) {
-    if (five9Dnc.has(p)) continue;
+    if (five9Dnc.has(p) || notALeadByPhone.get(p) || noSourceByPhone.get(p)) continue;
     if (consecutive >= MAX_CONSECUTIVE_GHL_ERRORS) {
       ghlByPhone.set(p, { status: 'error', error: 'skipped after repeated GHL failures' });
       ghlErrors += 1;
@@ -289,10 +369,13 @@ export async function classifyCallers(viewRows, { deps = {} } = {}) {
   }
 
   const rows = calls.map((r) => {
-    const ghl = ghlByPhone.get(r.caller_phone) || { status: five9Dnc.has(r.caller_phone) ? 'none' : 'error' };
+    const notALead = notALeadByPhone.get(r.caller_phone) || null;
+    const noSource = notALead ? null : (noSourceByPhone.get(r.caller_phone) || null);
+    const skipped = five9Dnc.has(r.caller_phone) || notALead || noSource;
+    const ghl = ghlByPhone.get(r.caller_phone) || { status: skipped ? 'none' : 'error' };
     const cid = ghl.status === 'found' ? String(ghl.contact.id) : null;
     const lpJob = !cid ? null : lpJobContacts ? { status: lpJobContacts.has(cid) ? 'yes' : 'no' } : { status: 'error' };
-    const { label, why } = classifyCaller({ caller: r.caller_phone }, { five9Dnc, lpPhones, ghl, lpJob });
+    const { label, why } = classifyCaller({ caller: r.caller_phone }, { five9Dnc, lpPhones, ghl, lpJob, notALead, noSource });
     return { ...r, label, why, ghl_contact_id: cid };
   });
 
@@ -308,7 +391,18 @@ export async function measureCallers({ nowMs = Date.now(), hours = null, deps = 
   } catch (err) {
     return { verdict: 'insufficient_evidence', rows: [], summary: null, errors: [`${VIEW}: ${err.message}`] };
   }
-  return classifyCallers(viewRows, { deps });
+  let called;
+  try {
+    const rows = viewRows.map(toRow).filter((r) => r.caller_phone && r.call_at);
+    called = rows.length ? await readCalledNumbers({ runSQL: d.runSQL, rows }) : new Map();
+  } catch (err) {
+    return { verdict: 'insufficient_evidence', rows: [], summary: null, errors: [`five9 called numbers: ${err.message}`] };
+  }
+  const withCalled = viewRows.map((v) => {
+    const r = toRow(v);
+    return { ...v, called_number: called.get(`${r.caller_phone}|${r.call_at}`) || null };
+  });
+  return classifyCallers(withCalled, { deps });
 }
 
 /* --- acting on one caller ------------------------------------------------ */
@@ -347,6 +441,14 @@ export async function captureCaller(input, { deps = {} } = {}) {
     return { ok: true, action_taken: 'not_a_candidate', label, ghl_contact_id: contactId, detail: why };
   }
 
+  // The LP source this lead carries (2026-10-12): from the number called.
+  // An old approval row may predate called_number; no number, no send.
+  const source = captureSourceFor({ calledNumber: row.called_number, campaign: row.campaign });
+  if (!source) {
+    return { ok: true, action_taken: 'not_a_candidate', label: 'unmapped_number', ghl_contact_id: contactId,
+      detail: `no LP source for number ${row.called_number || 'unknown'} ("${row.campaign || 'no line'}")` };
+  }
+
   let created = false;
   try {
     if (label === 'no_ghl_contact') {
@@ -365,6 +467,14 @@ export async function captureCaller(input, { deps = {} } = {}) {
       contactId = res.contactId;
       created = true;
     }
+    // Write the source BEFORE enrolling, overwriting whatever the contact held
+    // (the number called wins, the user's ruling), and read it back. If it did
+    // not land, do not enroll: enrollLpLeadCreation would backfill the blanks
+    // with the chatbot's 830 / 5574 and LP would credit the wrong channel.
+    const stamped = await stampLpSource(contactId, source, d);
+    if (!stamped.ok) {
+      return { ok: false, action_taken: 'failed', label, ghl_contact_id: contactId, detail: `LP source not set: ${stamped.detail}` };
+    }
     const enrolled = await d.enroll({ contactId, calendarName: `Inbound call · ${row.campaign || 'unknown'}` });
     const already = enrolled?.action === 'create_lead_already_enrolled';
     return {
@@ -376,6 +486,31 @@ export async function captureCaller(input, { deps = {} } = {}) {
     };
   } catch (err) {
     return { ok: false, action_taken: 'failed', label, ghl_contact_id: contactId || null, detail: err.message };
+  }
+}
+
+/**
+ * Set the contact's LP Source ID and Pro ID to this call's source, then read
+ * them back. Returns { ok, detail }. Never throws.
+ */
+export async function stampLpSource(contactId, source, { ghlFetch }) {
+  try {
+    await ghlFetch('PUT', `/contacts/${contactId}`, {
+      customFields: [
+        { id: LP_SOURCE_ID_FIELD, field_value: source.srsId },
+        { id: PRO_ID_FIELD, field_value: source.proId },
+      ],
+    });
+    const full = await ghlFetch('GET', `/contacts/${contactId}`);
+    const contact = full?.contact || full;
+    const srs = readCustomField(contact, LP_SOURCE_ID_FIELD);
+    const pro = readCustomField(contact, PRO_ID_FIELD);
+    if (srs !== source.srsId || pro !== source.proId) {
+      return { ok: false, detail: `read back srs ${srs || 'blank'} / pro ${pro || 'blank'}, wanted ${source.srsId} / ${source.proId}` };
+    }
+    return { ok: true, detail: sourceLine(source) };
+  } catch (err) {
+    return { ok: false, detail: err.message };
   }
 }
 
@@ -402,13 +537,18 @@ export function buildApprovalAction(row, { runAt }) {
       agent_name: row.agent_name,
       disposition: row.disposition,
       minutes: row.minutes,
+      called_number: row.called_number ?? null,
       label: row.label,
       ghl_contact_id: row.ghl_contact_id,
       queued_at: new Date(runAt).toISOString(),
     },
     reasoning: `A new caller (${phoneDisplay(row.caller_phone)}) talked ${row.minutes ?? '?'} min${who}`
       + `${team ? ` (${team})` : ''} on ${when} ET, dispositioned "${row.disposition || 'none'}", `
-      + 'and was never entered in LP.',
+      + 'and was never entered in LP.'
+      + (() => {
+        const src = captureSourceFor({ calledNumber: row.called_number, campaign: row.campaign });
+        return src ? ` LP source if approved: ${sourceLine(src)}.` : '';
+      })(),
     rule_applied: RULE_APPLIED,
     status: 'pending_approval',
     requires_approval: true,
@@ -591,7 +731,7 @@ export async function runInboundCapture({ env = process.env, nowMs = Date.now(),
   }
 
   const s = m.summary;
-  const line = `callers=${s.callers} candidates=${s.candidates} dnc=${s.by_label.dnc} in_lp=${s.by_label.already_in_lp}`
+  const line = `callers=${s.callers} candidates=${s.candidates} dnc=${s.by_label.dnc} not_lead=${s.by_label.not_a_lead} in_lp=${s.by_label.already_in_lp}`
     + ` customer=${s.by_label.existing_customer} unverified=${s.by_label.unverified} stored=${stored}`
     + ` queued=${tally.queued} created=${tally.created} already=${tally.already} failed=${tally.failed}`;
   d.log.log(`[InboundCapture] ${cfg.mode} ${cfg.lookbackHours}h — ${line}`);

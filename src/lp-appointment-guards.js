@@ -33,25 +33,28 @@
  *
  * ─── Scope ───────────────────────────────────────────────────────────────
  * Pure functions only — no I/O, no imports beyond the address normaliser.
- * Unit tested in scripts/test-lp-appointment-guards.js.
+ * Unit tested in scripts/test-lp-address-validity.js,
+ * scripts/test-lp-appointment-guard-wiring.js and scripts/test-lp-appt-guard-replay.js.
  */
 
 import { isBlankAddress } from './lp-address-validity.js';
 
 /**
- * Substrings that mark an LP SetAppointment reply as a REFUSAL, even when
- * Result is 1. Matched case-insensitively against the Message field.
+ * Substrings that mark an LP SetAppointment reply as a REFUSAL. Matched
+ * case-insensitively against the Message field.
  *
- * "market is OOA" is the confirmed one (observed live, twice, 2026-08-26/27).
- * The others are defensive: LP's soft-failure vocabulary is not documented,
- * and the failure mode of missing one is a silent false positive — the exact
- * bug this module exists to prevent. Extend this list rather than loosening
- * the check.
+ * Since 2026-10-12 the Result code decides first (see inspectAppointmentResponse);
+ * this list is the backstop for a reply with no Result, and for a Result:0 whose
+ * text says it was refused. "future appt" and "dispo is" are LP's own words and
+ * were missing until then: 29 of LP's 39 recorded refusals carried them.
+ * Extend this list rather than loosening the check.
  */
 export const LP_APPT_REFUSAL_MARKERS = Object.freeze([
   'ooa',
   'out of area',
   'market is',
+  'future appt',
+  'dispo is',
   'not found',
   'does not exist',
   'invalid',
@@ -62,6 +65,9 @@ export const LP_APPT_REFUSAL_MARKERS = Object.freeze([
   'no such lead',
   'error',
 ]);
+
+/** LP's own success wording on this endpoint ("Appointment set successfully."). */
+const SUCCESS_RX = /\bset successfully\b/i;
 
 /**
  * Unwrap LP's inconsistent reply shapes: bare object, or single-element array.
@@ -74,7 +80,44 @@ export function unwrapLpResponse(resp) {
 }
 
 /**
+ * Name the refusal from LP's message. A combined message ("market is OOA.
+ * record has future appt date …") takes the first match in this order, the
+ * one a person can least fix by waiting.
+ */
+function refusalReason(lower) {
+  if (lower.includes('ooa') || lower.includes('out of area') || lower.includes('market is')) {
+    return 'lp_market_out_of_area';
+  }
+  if (lower.includes('dispo is')) return 'lp_lead_dispo_blocked';
+  if (lower.includes('does not exist') || lower.includes('no such lead') || lower.includes('not found')) {
+    return 'lp_lead_not_found';
+  }
+  if (lower.includes('future appt')) return 'lp_lead_has_future_appt';
+  return 'lp_refused';
+}
+
+/**
  * Inspect a SetAppointment reply without throwing.
+ *
+ * LP's SetAppointment answers the OPPOSITE way to most of its endpoints
+ * (UpdateDNCStatus says Result 1 for success). Every SetAppointment reply we
+ * stored up to 2026-10-12 (agent_actions.execution_result.lp_response):
+ *
+ *   Result 0  "Appointment set successfully."                          48  success
+ *   Result 1  "record has future appt date that has not occured."      27  refused
+ *   Result 1  "market is OOA."                                          6  refused
+ *   Result 1  "dispo is Issue, DNC or Sale."                            2  refused
+ *   Result 1  "lds_id does not exist."                                  2  refused
+ *   Result 1  two of the above joined                                   2  refused
+ *
+ * The first version of this guard read Result 0 as a refusal and Result 1 as a
+ * success unless a word list matched, and the list had neither "future appt"
+ * nor "dispo is". Enforce would have refused both real bookings of the two
+ * weeks before and let 29 of the 39 refusals through. So: Result 0 is
+ * accepted (unless its text says otherwise), Result 1 is refused, and a reply
+ * with no Result is read by its words. A reply nothing recognises is accepted
+ * but named (`lp_reply_unrecognised`), so it is recorded rather than trusted
+ * silently.
  *
  * @param {*} resp — raw LP response
  * @returns {{accepted: boolean, resultCode: *, message: string, reason: string|null}}
@@ -82,28 +125,23 @@ export function unwrapLpResponse(resp) {
 export function inspectAppointmentResponse(resp) {
   const item = unwrapLpResponse(resp);
   const resultCode = item.Result ?? item.result ?? null;
+  const code = resultCode === null || resultCode === undefined ? null : String(resultCode).trim();
   const message = String(item.Message ?? item.message ?? '').trim();
   const lower = message.toLowerCase();
-
-  // Explicit failure code.
-  if (resultCode === 0 || resultCode === '0') {
-    return { accepted: false, resultCode, message, reason: 'lp_result_zero' };
-  }
-
-  // Result:1 with a refusal message — the silent killer.
   const marker = LP_APPT_REFUSAL_MARKERS.find((m) => lower.includes(m));
-  if (marker) {
-    return {
-      accepted: false,
-      resultCode,
-      message,
-      reason: lower.includes('ooa') || lower.includes('out of area') || lower.includes('market is')
-        ? 'lp_market_out_of_area'
-        : 'lp_refused',
-    };
+  const refused = (reason) => ({ accepted: false, resultCode, message, reason });
+
+  if (code === '1') return refused(refusalReason(lower));
+
+  if (code === '0') {
+    if (marker && !SUCCESS_RX.test(message)) return refused(refusalReason(lower));
+    return { accepted: true, resultCode, message, reason: null };
   }
 
-  return { accepted: true, resultCode, message, reason: null };
+  // No Result (or one LP has never sent): read the words.
+  if (SUCCESS_RX.test(message)) return { accepted: true, resultCode, message, reason: null };
+  if (marker) return refused(refusalReason(lower));
+  return { accepted: true, resultCode, message, reason: 'lp_reply_unrecognised' };
 }
 
 /**
@@ -137,6 +175,33 @@ export function assertAppointmentAccepted(resp, ctx = {}) {
   err.lpMessage = verdict.message;
   err.lpResult = verdict.resultCode;
   throw err;
+}
+
+/**
+ * The final answer a caller returns when LP refused the appointment
+ * (enforce mode only: setAppointment throws LP_APPT_REFUSED there).
+ *
+ * 2026-10-12: a refusal is LP's answer, not a passing failure. Thrown, it was
+ * re-sent by every loop above the call: the executor 3 times in ~3 minutes, the
+ * parity watchdog every 30 minutes with no limit, inbound-checkout-watch every
+ * 5, the post-issue retry for 2 hours, and each re-send is another
+ * SetAppointment entry on the LP lead. Returned, like lp_appointment_conflict,
+ * every one of them stops. Nothing is marked synced: no sync mark, no
+ * `lp-appt-synced`.
+ *
+ * @param {*} err — whatever setAppointment threw
+ * @param {Object} [extra] — fields the caller adds (contact_id, lp_lead_id, …)
+ * @returns {Object|null} the answer, or null when err is not an LP refusal
+ */
+export function refusedAppointmentAnswer(err, extra = {}) {
+  if (err?.code !== 'LP_APPT_REFUSED') return null;
+  return {
+    action: 'lp_appointment_refused',
+    ...extra,
+    reason: err.reason || 'lp_refused',
+    lp_result: err.lpResult ?? null,
+    lp_message: err.lpMessage || '',
+  };
 }
 
 /**
@@ -200,5 +265,6 @@ export default {
   unwrapLpResponse,
   inspectAppointmentResponse,
   assertAppointmentAccepted,
+  refusedAppointmentAnswer,
   assertLeadCanTakeAppointment,
 };

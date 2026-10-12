@@ -225,6 +225,41 @@ test('kept via Five9 in the sweep; closed team or off does nothing', async () =>
   assert.ok(JOB_IDS.includes(JOB_ID));
 });
 
+// 2026-10-12: a simulator row or a contact GHL no longer has made EVERY pass fail.
+test('a sim- row is cancelled without asking GHL, and the pass is ok', async () => {
+  const db = fakeDb({ promised_callbacks: [{ ...OPEN, id: 4, ghl_contact_id: 'sim-quote-1791392956332' }], five9_events_raw: [], agent_actions: [] });
+  let ghlCalls = 0;
+  const r = await runPromisedCallbackSweep({
+    ...quiet, env: { PROMISED_CALLBACK_MODE: 'live' }, now: () => IN_HOURS, supabase: db,
+    fetchRecentMessages: async () => { ghlCalls += 1; return { messages: [] }; },
+  });
+  assert.equal(ghlCalls, 0);
+  assert.equal(r.ok, true);
+  assert.equal(r.cancelled, 1);
+  assert.equal(db.updates[0].patch.status, 'cancelled');
+  assert.deepEqual(db.updates[0].patch.kept_evidence, { cancelled: 'simulated' });
+});
+
+test('a contact GHL no longer has is cancelled; any other read failure stays an error', async () => {
+  const notFound = fakeDb({ promised_callbacks: [{ ...OPEN }], five9_events_raw: [], agent_actions: [] });
+  const r = await runPromisedCallbackSweep({
+    ...quiet, env: { PROMISED_CALLBACK_MODE: 'live' }, now: () => IN_HOURS, supabase: notFound,
+    fetchRecentMessages: async () => { throw new Error('GHL GET /conversations/search?contactId=M1 → 400: {"message":"Contact not found for id:M1","canonicalCode":"CONVERSATIONS_CONTACT_NOT_FOUND"}'); },
+  });
+  assert.equal(r.ok, true);
+  assert.equal(r.cancelled, 1);
+  assert.deepEqual(notFound.updates[0].patch.kept_evidence, { cancelled: 'contact_not_found' });
+
+  const down = fakeDb({ promised_callbacks: [{ ...OPEN }], five9_events_raw: [], agent_actions: [] });
+  const s = await runPromisedCallbackSweep({
+    ...quiet, env: { PROMISED_CALLBACK_MODE: 'live' }, now: () => IN_HOURS, supabase: down,
+    fetchRecentMessages: async () => { throw new Error('GHL GET /conversations/search → 500: upstream'); },
+  });
+  assert.equal(s.ok, false);
+  assert.equal(s.cancelled, 0);
+  assert.ok(!down.updates.some((u) => u.patch.status === 'cancelled'), 'a 500 never cancels a promise');
+});
+
 // ── the I/O: record and guard ─────────────────────────────────────────────
 
 function ioDb({ open = null, insertError = null } = {}) {

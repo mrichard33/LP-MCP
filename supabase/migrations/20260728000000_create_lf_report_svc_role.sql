@@ -1,0 +1,9 @@
+-- 20260728000000_create_lf_report_svc_role
+--
+-- ALREADY APPLIED to the LP project; recorded in supabase_migrations.schema_migrations
+-- before this folder existed. This file exists so the Supabase CLI sees the same
+-- history the database does (`supabase db push` refuses to run when the database
+-- lists a version the repo does not have). It is intentionally empty: the schema
+-- it produced is captured by the baseline dump that follows it in this folder.
+--
+-- Content: n8n/sql/lf_report_svc_role.sql (role + lf_report_pdfs + policies). Applied 2026-09-09.

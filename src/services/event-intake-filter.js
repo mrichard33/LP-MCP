@@ -195,6 +195,11 @@ const ALLOWED_EVENT_TYPES = new Set([
   'appointment.parity_gap',        // GHL/LP appointment divergence, rep decides
   'appointment.confirmation_drift',// LP confirmed, GHL not
   'dnc.lift_requested',            // operational DNC lifted on an opt-back-in
+  'lp.appointment_refused',        // 2026-10-12 — LP refused a SetAppointment
+                                   // (src/lp-client.js). The only durable record of
+                                   // LP_APPT_GUARD_MODE's verdicts; no rule consumes
+                                   // it. Dropped here, the go-live evidence would be
+                                   // gone, as the parity events were on 2026-09-14.
 
   // Quiet but rule-watched (must not drop)
   'ghl.lead_score_changed',        // 4 rules (W11_1_*)

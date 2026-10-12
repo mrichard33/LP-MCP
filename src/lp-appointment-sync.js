@@ -227,6 +227,7 @@ import {
   applyGHLTag,
   removeGHLTags,
 } from './ghl.js';
+import { refusedAppointmentAnswer } from './lp-appointment-guards.js';
 import { sendGroupMeMessage } from './groupme.js';
 import { acquireToken } from './ghl-rate-limiter.js';
 import { formatLpSource, formatApptTime12h } from './format-helpers.js';
@@ -2367,6 +2368,28 @@ async function syncAppointmentToLP({
     };
   }
 
+  // ── A refusal stands for 24h (2026-10-12) ──
+  // LP refused this lead + date + time recently (LP_APPT_GUARD_MODE=enforce,
+  // below). Sending it again only adds another SetAppointment entry on the LP
+  // lead; the parity watchdog would otherwise re-send it every 30 minutes. A
+  // different date or time is a different key and goes through. No
+  // lp-appt-synced: LP does not have this appointment.
+  const refusedKey = `refused:${dedupKey}`;
+  const recentRefusal = await findRecentApptSyncMark(refusedKey);
+  if (recentRefusal) {
+    console.log(`[LP-APPT] ⏭️ LP refused ${dedupKey} at ${recentRefusal.created_at}; not re-sending within 24h`);
+    return {
+      success: false,
+      action: 'lp_refusal_recent',
+      lp_lead_id: ldsId,
+      lp_prospect_id: prospectId,
+      appt_date: apptDate,
+      appt_time: apptTime,
+      resolution_source: source,
+      resolution_step: step,
+    };
+  }
+
   let lpSourceLine = formatLpSource(lpSource, lpSourceDetail);
 
   try {
@@ -2419,7 +2442,20 @@ async function syncAppointmentToLP({
   }
 
   console.log(`[LP-APPT] Setting: lds_id=${ldsId}, date=${apptDate}, time=${apptTime}, via=${source} (step ${step})${lpSourceLine ? `, lpSrc="${lpSourceLine}"` : ', lpSrc=(absent)'}, calendar="${calendarName || '(absent)'}"`);
-  const result = await _lpSetAppointment({ ldsId, setBy: LP_EMP.GHL_INTEGRATION, apptDate, apptTime });
+  let result;
+  try {
+    result = await _lpSetAppointment({ ldsId, setBy: LP_EMP.GHL_INTEGRATION, apptDate, apptTime });
+  } catch (err) {
+    // LP refused (LP_APPT_GUARD_MODE=enforce). LP's answer, not a passing
+    // failure: no sync mark, no lp-appt-synced, and a return rather than a
+    // throw, so the webhook, the parity watchdog and the post-issue retry do
+    // not re-send it (2026-10-12).
+    const refused = refusedAppointmentAnswer(err, { success: false, contact_id: contactId, lp_lead_id: ldsId, lp_prospect_id: prospectId, date: apptDate, time: apptTime, resolution_source: source, resolution_step: step });
+    if (!refused) throw err;
+    console.warn(`[LP-APPT] LP refused the appointment for ${contactId}: lds_id=${ldsId} reason=${refused.reason} message="${refused.lp_message}"`);
+    await writeApptSyncMark({ dedupKey: refusedKey, contactId, ldsId, apptDate, apptTime });
+    return refused;
+  }
 
   await writeApptSyncMark({ dedupKey, contactId, ldsId, apptDate, apptTime });
   await applyApptSyncedTag(contactId);
@@ -2872,6 +2908,16 @@ export function registerLPAppointmentSyncRoutes(app) {
           budget_ms: budgetMs,
           elapsed_ms: Date.now() - startTime,
         });
+      }
+
+      // A refusal used to reach a person as a thrown error and the ❌ card in the
+      // catch below. It is now returned (2026-10-12) so nothing re-sends it to
+      // LP; the card stays, once, from here.
+      if (result?.action === 'lp_appointment_refused') {
+        await sendGroupMeMessage(
+          `❌ LP APPT REFUSED: LP said "${result.lp_message || '(no message)'}" (${result.reason})\n` +
+          `LP lead: ${result.lp_lead_id || '?'} | ${result.date || ''} ${result.time || ''}\nContact: ${contactId}`
+        ).catch(() => {});
       }
 
       result.elapsed_ms = Date.now() - startTime;

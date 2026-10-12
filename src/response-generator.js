@@ -271,6 +271,8 @@ import { notInterestedTurn } from './agentic/not-interested.js';
 import { humanizeReply, restoreQuestionMark } from './agentic/human-voice.js';
 import { enforceTeamVoice } from './agentic/team-voice.js';
 import { enforcePropertyScope } from './agentic/property-scope.js';
+import { dropFragmentOpener, dropStaleCallMention, normalizeSignature, isNearRepeat, replySimilarity, NEAR_REPEAT_NOTE } from './agentic/sms-format.js';
+import { enforceNonOwner } from './agentic/non-owner.js';
 import { enforceCallTiming, softenCallTiming, isTeamOpen, enforceRehashCallTiming } from './agentic/team-hours.js';
 import { enforceOneAsk } from './agentic/one-ask.js';
 import { findUnbackedBookingClaim, rewriteBookingClaims, bookingClaimNote, appointmentOnFile, noPromiseHandoffLine, NO_PROMISE_HANDOFF_RX } from './agentic/booking-claim.js';
@@ -404,6 +406,9 @@ import { holdLine, COLLECT_ASK, dmAsk, parseDecisionMakers } from './agentic/boo
 import { contactRecheckLine, recheckHint, RECHECK_RX } from './agentic/contact-check.js';
 import { smsBookingTurn, enforceBookingFacts, bookingFactsNote } from './agentic/sms-booking-turn.js';
 import { LINES as NEPQ_LINES } from './agentic/nepq-planner.js';
+import { buildStageInput, leadStageMode } from './agentic/lead-stage.js';
+import { typedZipFromThread, zoneForContact } from './services/contact-timezone.js';
+import { readStageForPlanner } from './services/lead-stage-io.js';
 import { isCustomerP2 } from './agentic/lead-state/signals/context-reader.js';
 import { isUnsoldPostDemo, lpSold, postDemoOwnerName, replaceSalesRepFollowUp } from './agentic/post-demo-owner.js';
 import { postDemoPlannerMode } from './agentic/post-demo-turn.js';
@@ -411,6 +416,7 @@ import { rehashCallSlotsMode, readRehashCallSlots, rehashCallBooking } from './a
 import { isInRehash, rehashLeadFromContext, rehashRoutingMode } from './agentic/rehash-state.js';
 import { planNepqTurn, enforceNepqPlan, referenceRetryNote, nepqBackboneMode, prefersCall as nepqPrefersCall, objectionType as nepqObjectionType, TIME_REQUEST_RX as NEPQ_TIME_REQUEST_RX, SCHEDULE_ASK_RX as NEPQ_SCHEDULE_ASK_RX,REPEAT_COMPLAINT_RX as NEPQ_REPEAT_COMPLAINT_RX, bookingOpenInThread as nepqBookingOpenInThread, dropUnaskedCallOffer, leadWantsCall as nepqLeadWantsCall, isServiceCallback as nepqIsServiceCallback } from './agentic/nepq-planner.js';
 import {
+  outOfAreaLine,
   planServiceAreaTurn, resolveCoverage, coverageHint, guardCoverageDraft, serviceAreaRecord, coverageOwnsReply,
 } from './agentic/service-area-turn.js';
 
@@ -1445,6 +1451,8 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
   // 2026-10-11: a rehash lead gets the post-demo track instead (rehash-nepq.js).
   const nepqBlock = buildNepqBlock(context, opts.established, opts.discipline || null, {
     rehash: opts.rehash || null, conversation: context?.conversation_recent || [], trigger: triggerMessage,
+    // 2026-10-12: the stored conversation stage (LEAD_STAGE_MODE=live only).
+    leadStage: opts.leadStage || null,
   });
   if (nepqBlock) parts.push(nepqBlock);
 
@@ -3257,6 +3265,42 @@ export function planAsksForTime(plan, mode) {
  * Never truncates. The link and the disclosure are exempt because both are
  * fixed text the model may not shorten.
  */
+// 2026-10-12 (handoff PR 6): SMS replies took 11-43s (live chat 7-13s), driven
+// by guard redrafts (nepq_reference above all). One redraft at most (the send
+// handler's two attempts), and none once the turn is past this budget: the
+// first draft, with every deterministic fix the guards apply, ships instead.
+export const SMS_REDRAFT_BUDGET_MS = (() => {
+  const n = Number.parseInt(process.env.SMS_REDRAFT_BUDGET_MS ?? '15000', 10);
+  return Number.isFinite(n) && n > 0 ? n : 15000;
+})();
+
+/** May this turn ask the model for a re-write? Pure. */
+export function mayRedraft({ regenerating = false, startedAtMs = null, nowMs = Date.now(), channel = 'sms', budgetMs = SMS_REDRAFT_BUDGET_MS } = {}) {
+  if (regenerating) return false;
+  if (channel !== 'sms' || !Number.isFinite(startedAtMs)) return true;
+  return nowMs - startedAtMs <= budgetMs;
+}
+
+/**
+ * Fit an over-long SMS under the cap by dropping WHOLE sentences, never by
+ * cutting one (2026-10-12, handoff PR 6; batch 3 T5 shipped over 320 after the
+ * redraft). The first sentence (the answer) and the last (the ask or the
+ * sign-off) stay; middle sentences go, newest first. A reply that cannot get
+ * under the cap that way ships as it is. Pure.
+ */
+export function trimSmsToCap(text, max = SMS_MAX_CHARS) {
+  const s = String(text ?? '').trim();
+  if (s.length <= max) return { text: s, trimmed: false };
+  const parts = s.split(/(?<=[.!?])\s+/).filter(Boolean);
+  if (parts.length < 3) return { text: s, trimmed: false };
+  const first = parts[0];
+  const last = parts[parts.length - 1];
+  const middle = parts.slice(1, -1);
+  while (middle.length && [first, ...middle, last].join(' ').length > max) middle.pop();
+  const out = [first, ...middle, last].join(' ');
+  return out.length <= max ? { text: out, trimmed: true } : { text: s, trimmed: false };
+}
+
 export function decideSmsLength(text, { mode = SMS_LENGTH_GUARD_MODE, retry = false, max = SMS_MAX_CHARS } = {}) {
   const s = String(text ?? '');
   const chars = s.length;
@@ -3273,6 +3317,13 @@ export function decideSmsLength(text, { mode = SMS_LENGTH_GUARD_MODE, retry = fa
 }
 
 export async function generateResponse(contactId, channel, triggerMessage, opts = {}) {
+  // PR 6: when this turn started (the send handler's first attempt), for the redraft budget.
+  const generationStartedAt = Number.isFinite(opts.generationStartedAt) ? opts.generationStartedAt : Date.now();
+  const redraftOk = () => {
+    const ok = mayRedraft({ regenerating: !!opts.regenerationNote, startedAtMs: generationStartedAt, channel });
+    if (!ok && !opts.regenerationNote) console.log(`[Redraft] ${contactId} past ${SMS_REDRAFT_BUDGET_MS}ms (${Date.now() - generationStartedAt}ms): shipping the guarded first draft`);
+    return ok;
+  };
   // 2026-10-06 (AI OS batch 1, PR 3; src/security/untrusted-text.js): every
   // read and the prompt below see the inbound with invisible characters
   // removed (zero-width, bidi, TAG). The send handler stores the original.
@@ -3835,8 +3886,9 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
         // literal rule sends do not resolve merge tags — the SERVICE_AREA_EXIT
         // rule's send_message picks this up as context.message. Guide §3.7
         // wording with the em-dash→comma SMS voice fix.
-        const oaFirstName = context.lead?.first_name || null;
-        const oaMessage = `Thanks${oaFirstName ? `, ${oaFirstName}` : ''}, it looks like your area's outside our current service footprint, so I can't set up a visit there. Wish we could help!`;
+        // 2026-10-12 (parity, batch 2 #3): the same short decline the live
+        // chat and the coverage turn send (outOfAreaLine); no exclamation point.
+        const oaMessage = outOfAreaLine(st.identity.postal_code);
         emitEvent({
           event_type: 'agentic.out_of_area_detected',
           source: 'response_generator',
@@ -3846,7 +3898,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
           payload: {
             zip: sa.zip || st.identity.postal_code,
             city: sa.city || st.identity.city || null,
-            first_name: oaFirstName,
+            first_name: context.lead?.first_name || null,
             message: oaMessage,
           },
           priority: 'high',
@@ -3872,6 +3924,23 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     return { identityState: st, serviceArea: sa, serviceAreaTentative: saT };
   });
   identityRead.catch(() => {});
+
+  // 2026-10-12 (handoff PR 4, batch 2 #2): a Katy, TX lead typed 77494 and
+  // was offered "10:00 AM ET". The zone came only from the record's zip. A zip
+  // typed in the conversation is where the visit is: in a served market, it
+  // sets the zone the times are read, labelled and written in (Houston → CT).
+  try {
+    const typedZip = typedZipFromThread(context.conversation_recent || [], triggerMessage);
+    if (typedZip && typedZip !== String(context.lead?.postal_code || '').slice(0, 5)) {
+      const z = await zoneForContact({ typedZip });
+      if (z.market_code && z.market_code !== context.market?.market_code) {
+        console.log(`[MarketZone] ${contactId}: typed zip ${typedZip} → ${z.market_code} (${z.label})`);
+        context.market = { ...(context.market || {}), timezone: z.timezone, label: z.label, market_code: z.market_code };
+      }
+    }
+  } catch (err) {
+    console.warn(`[MarketZone] ${contactId}: typed-zip zone read failed (record zone kept): ${err.message}`);
+  }
 
   const calendarId = getCalendarIdFromKbPack(kbPack)
     || (nepqWantsSlots ? (nepqVisitFirst ? inHomeCalendarFor(context.lead?.current_tags || []).calendar_id : BOOKING_CALENDARS.PROTECTION_PROFILE_REVIEW) : null);
@@ -4053,6 +4122,10 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   const nepqMode = (opts.dryRun === true && opts.nepqModeOverride) ? opts.nepqModeOverride : nepqBackboneMode();
   let nepqPlan = null;
   let nepqPlanFailed = false;
+  // 2026-10-12 (Lead Conversation Stage): the stored stage, ONLY when
+  // LEAD_STAGE_MODE=live; null leaves the planner exactly as before. A dry run
+  // (the simulator) never reads a real contact's stored row: it passes its own.
+  let leadStage = null;
   // The rep's real Rehash Call openings (rehash-slots.js), when read.
   let rehashCallSlots = null;
   // SMS only: email replies are long-form and keep their own rules.
@@ -4078,6 +4151,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
         const tz = promptTimezoneFor(context);
         rehashCallSlots = await memo('rehash_call_slots', () => readRehashCallSlots({ contactId, timezone: tz, tzLabel: tzLabel(tz) }));
       }
+      leadStage = opts.dryRun === true ? (opts.leadStageOverride || null) : await readStageForPlanner(contactId);
       const planArgs = {
         channel: 'sms',
         trigger: triggerMessage,
@@ -4093,6 +4167,11 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
         isCustomer: isCustomerP2(context),
         // The classifier read a call request: the planner's callback hand-off.
         callbackRequested: String(classification?.intent_class || '').toUpperCase() === 'CALLBACK',
+        // 2026-10-12 (PR 3): quote ≠ price and the competitor play, live only.
+        // The simulator's dry run plans under its own run's mode.
+        stageLive: ((opts.dryRun === true && opts.leadStageModeOverride) || leadStageMode()) === 'live',
+        stage: leadStage,
+        knownZip: identityState?.identity?.postal_code || context.lead?.postal_code || null,
       };
       nepqPlan = planNepqTurn({ ...planArgs, postDemo: pdMode === 'live' && postDemoLead, rehashRep, rehash: !!rehash, callSlots: slotsMode === 'live' ? rehashCallSlots : null });
       if (slotsMode === 'shadow' && rehash && postDemoLead) {
@@ -4226,6 +4305,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       confFlowContext,
       // 2026-10-02: the binding NEPQ move, rendered last (live mode only).
       nepqPlan: nepqMode === 'live' ? nepqPlan : null,
+      leadStage: nepqMode === 'live' ? leadStage : null,
     }
   );
   // Part 7 (Mark, 2026-10-02: "I don't think we need any static messages"):
@@ -4840,7 +4920,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       // Part 7: the model's version of a reference line failed its checks.
       // One re-write (one model call, the reads are prepared); the reference
       // ships as the backup only if that fails too.
-      if (enforced.failed?.length && !opts.regenerationNote) {
+      if (enforced.failed?.length && redraftOk()) {
         // The draft itself, so a failed check can be read from the logs
         // (2026-10-03: the replay could show only the failure codes).
         console.warn(`[NEPQ] ${contactId} ${nepqPlan.required_move} draft failed (${enforced.failed.join(',')}) — one re-write | draft="${String(validated.message || '').replace(/\s+/g, ' ').slice(0, 200)}"`);
@@ -4874,7 +4954,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       } else if (recheck?.kind === 'email' && !RECHECK_RX.test(validated.message)) {
         // Part 7: the model was told (CONTACT RE-CHECK hint); one re-write,
         // then the reference line.
-        if (!opts.regenerationNote) {
+        if (redraftOk()) {
           const err = new Error('contact_recheck: the draft did not ask them to re-check the email');
           err.regenerationNote = recheckHint(recheck);
           throw err;
@@ -4968,7 +5048,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       validated.message = riskFree;
       draftPatch('carrier_risk', carrierRiskNote(risks));
     } else if (risks.length) {
-      if (opts.regenerationNote) {
+      if (!redraftOk()) {
         console.error(`[ResponseGenerator] \u26d4 carrier-risk survived regeneration for ${contactId}: ${risks.join(', ')} — sending anyway, delivery may be blocked`);
       } else {
         console.warn(`[ResponseGenerator] \u26a0\ufe0f carrier-risk for ${contactId}: ${risks.join(', ')} — regenerating once`);
@@ -4979,6 +5059,31 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     }
   }
 
+  // ─── SMS format (2026-10-12, handoff PR 6; AIOS batch 3) ───
+  // A fragment opener goes; a stale "our call time passed" nobody raised goes;
+  // the sign-off is exactly once, at the end, on the reply that signs the
+  // thread; a reply nearly identical to our last one is re-written once (or,
+  // past the budget, ships with the verbatim repeats already dropped).
+  if (channel === 'sms' && validated.message) {
+    const frag = dropFragmentOpener(validated.message);
+    if (frag.changed) { console.warn(`[SmsFormat] ${contactId} fragment opener dropped`); validated.message = frag.text; }
+    const lpPhase = context.lp?.appointment_phase || null;
+    const recentCall = (lpPhase === 'past' || lpPhase === 'in_window') && Math.abs(Number(context.lp?.appointment_minutes_delta)) <= 1440;
+    const stale = dropStaleCallMention(validated.message, { inbound: triggerMessage, recentCall });
+    if (stale.changed) { console.warn(`[SmsFormat] ${contactId} stale call mention dropped`); validated.message = stale.text; }
+    const lastOutbound = [...(context.conversation_recent || [])].reverse().find(m => String(m?.direction || '').toLowerCase() === 'outbound');
+    const lastOutText = String(lastOutbound?.text ?? lastOutbound?.body ?? '');
+    if (isNearRepeat(validated.message, lastOutText) && redraftOk()) {
+      console.warn(`[SmsFormat] ${contactId} near repeat of the last message (${replySimilarity(validated.message, lastOutText).toFixed(2)}) — re-writing once`);
+      const err = new Error('near_repeat_of_last_message');
+      err.regenerationNote = NEAR_REPEAT_NOTE;
+      throw err;
+    }
+    const ident = resolveSmsSenderIdentity(opts.fromNumber || null, { rehash: rehash ? { active: true, repName: rehash.repName } : null });
+    const sig = normalizeSignature(validated.message, { signature: ident.signature, sign: !threadCarriesSignOff(context.conversation_recent || [], ident.signature) });
+    if (sig.changed) validated.message = sig.text;
+  }
+
   // ─── SMS length (2026-10-10, audit 2026-10-09) ───
   // The prompt says "320 max" and nothing enforced it. Same regenerate-once
   // shape as the carrier-risk guard above: opts.regenerationNote set means this
@@ -4987,13 +5092,23 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // worse than a long one. A booking link or the approved AI-disclosure script
   // is fixed text the model may not shorten, so a reply carrying one is exempt.
   if (channel === 'sms') {
-    const length = decideSmsLength(validated.message, { retry: !!opts.regenerationNote });
+    const length = decideSmsLength(validated.message, { retry: !redraftOk() });
     if (length.over) {
       if (length.action === 'regenerate') {
         console.warn(`[SmsLength] over chars=${length.chars} contact=${contactId} — regenerating once`);
         const err = new Error(`sms_too_long: ${length.chars} chars (max ${SMS_MAX_CHARS})`);
         err.regenerationNote = length.note;
         throw err;
+      }
+      // PR 6: no re-write left (or none in shadow): drop whole middle sentences
+      // to get under the cap, never cut one.
+      if (length.action === 'ship_after_retry' || length.action === 'shadow') {
+        const fit = trimSmsToCap(validated.message);
+        if (fit.trimmed) {
+          console.warn(`[SmsLength] trimmed ${length.chars} → ${fit.text.length} chars (whole sentences) contact=${contactId}`);
+          validated.message = fit.text;
+          validated.sms_trimmed = true;
+        }
       }
       if (length.action === 'ship_after_retry') console.error(`[SmsLength] over after retry chars=${length.chars} contact=${contactId}`);
       else if (length.action === 'shadow') console.log(`[SmsLength] shadow chars=${length.chars} contact=${contactId}`);
@@ -5081,6 +5196,15 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       validated.message = scope.text;
       if (scope.reason === 'lead_asked' && validated.companion_action?.action_type === 'book_appointment') validated.companion_action = null;
     }
+    // 2026-10-12 (no single-leg visits; batch 3 T3): a lead who said they
+    // rent gets no time and no booking, in every mode (non-owner.js).
+    const owner = enforceNonOwner(validated.message, { thread: context.conversation_recent || [], inbound: triggerMessage });
+    if (owner.changed) {
+      console.warn(`[NonOwner] ${contactId} ${owner.reason}`);
+      validated.message = owner.text;
+      validated.non_owner = owner.reason;
+      if (validated.companion_action?.action_type === 'book_appointment') validated.companion_action = null;
+    }
     // 2026-10-07 (Nicholas): a cancelled visit is never "your visit" (cancelled-visit.js).
     const cancelled = enforceCancelledVisit(validated.message, {
       facts: context.lead_facts || null,
@@ -5107,7 +5231,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // stacked patches read badly: ONE writer-only re-write instead (the send
   // handler's next attempt reuses everything prepared for this turn, so it is
   // a single model call), with every note. A re-write ships as patched.
-  const budget = decidePatchBudget(draftPatches, { regenerating: !!opts.regenerationNote, replaced: nepqDraftReplaced });
+  const budget = decidePatchBudget(draftPatches, { regenerating: !redraftOk(), replaced: nepqDraftReplaced });
   if (budget.rewrite) {
     console.warn(`[ResponseGenerator] ${draftPatches.length} patches on the first draft for ${contactId} (${draftPatches.map(p => p.tag).join(',')}) — one re-write`);
     const err = new Error(`draft_patches: ${draftPatches.map(p => p.tag).join(',')}`);
@@ -5321,6 +5445,21 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     booking_hold_backed: (!!bookingFacts && (bookingFacts.kind === 'hold' || bookingFacts.kind === 'collect')) || !!validated.nepq_plan?.held,
     slot_timezone_for_truth: promptTimezoneFor(context),
     lead_first_name: context.lead?.first_name || null,
+    // 2026-10-12 (Lead Conversation Stage): what the send handler hands to the
+    // stage recorder after the send (src/services/lead-stage-io.js). In memory
+    // only; the stored row holds codes and our own time labels.
+    lead_stage_input: buildStageInput({
+      conversation: context.conversation_recent || [],
+      trigger: triggerMessage,
+      plan: nepqPlan,
+      zip: serviceAreaTurn?.coverage?.zip || identityState?.identity?.postal_code || null,
+      market: serviceAreaTurn?.coverage?.market_code || context.market?.market_code || null,
+      tz: promptTimezoneFor(context),
+      outOfArea: (serviceArea?.checked && serviceArea.in_service_area === false) || serviceAreaTurn?.coverage?.status === 'out',
+      rehash: !!rehash,
+      buyerStage,
+      channel,
+    }),
     // v2.7.14 — Bot Review Phase 0 replay context. Assembled from values already
     // in scope; nothing is fetched and nothing is written here. The send handler
     // hands it to recordMessageContext() with the action id as message_ref.

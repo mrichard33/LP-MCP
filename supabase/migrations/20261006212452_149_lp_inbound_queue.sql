@@ -1,0 +1,9 @@
+-- 20261006212452_149_lp_inbound_queue
+--
+-- ALREADY APPLIED to the LP project; recorded in supabase_migrations.schema_migrations
+-- before this folder existed. This file exists so the Supabase CLI sees the same
+-- history the database does (`supabase db push` refuses to run when the database
+-- lists a version the repo does not have). It is intentionally empty: the schema
+-- it produced is captured by the baseline dump that follows it in this folder.
+--
+-- Content: sql/149_lp_inbound_queue.sql (lp_inbound_queue, booked_dial_routing_log, v_lp_inbound_checkout_daily). Applied 2026-10-06 through the Supabase MCP.

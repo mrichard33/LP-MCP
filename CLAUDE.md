@@ -252,6 +252,16 @@ pre-demo questions on a post-demo plan and never appends a question after a sign
 date is filed after the send (`src/services/post-demo-followup-io.js`: GHL task for the first `REHASH_TEAM_USER_IDS` id,
 `followup-requested`, a note; once per date). `POST_DEMO_PLANNER_MODE` off|shadow|live, default shadow (`[PostDemo] shadow`).
 
+**LP's SetAppointment says Result 0 for success, 1 for a refusal (2026-10-12).** The opposite of UpdateDNCStatus.
+All 87 stored replies: 48 × `0 "Appointment set successfully."`; 39 × `1` ("record has future appt date…", "market is
+OOA.", "dispo is Issue, DNC or Sale.", "lds_id does not exist."). `inspectAppointmentResponse`
+(`src/lp-appointment-guards.js`) had it backwards, so `LP_APPT_GUARD_MODE=enforce` would have refused every booking.
+Every refusal is an `lp.appointment_refused` event (shadow and enforce). In enforce, `executeSetLPAppointment` and
+`syncAppointmentToLP` RETURN `lp_appointment_refused` (`refusedAppointmentAnswer`) rather than throw, because a thrown
+refusal was re-sent by the executor, the parity watchdog, inbound-checkout-watch and the post-issue retry. The sync also
+holds a refused lead + date + time for 24h (`refused:<dedupKey>` mark, `lp_refusal_recent`). Replay test:
+`scripts/test-lp-appt-guard-replay.js`. Add a new LP reply there when one appears.
+
 **A held appointment asks a person to import its LP row (2026-10-05).** When LP already has an unimported
 inbound row for a contact, `syncAppointmentToLP` holds the appointment (`lp-appt-deferred`) rather than add a
 duplicate lead, and the parity watchdog re-drives it every 30 min. LP has no API that imports a row, so once a
@@ -331,6 +341,13 @@ list and per phone per day (`lp_appointment_sync_marks`, claimed before the push
 #ops, once, any lead 30+ dial minutes old with no call, push or reason.
 `findContactInOtherLists` is NOT used here: it has never worked in production (bare-array criteria) and
 `f9_last_list` keeps the last list ever, so a naive fix would block most callbacks.
+**Missed paid callers are judged by their whole call history (2026-10-12).** `src/jobs/missed-caller-recovery.js`
+(`MISSED_CALLER_RECOVERY_MODE`, default shadow) no longer uses `findContactInOtherLists` either: all 264 would_push rows
+read "cross-list check unreadable — failed open". `judgeHistory` reads every Five9 disposition for the number, any
+campaign, in and out, 30 days (`buildHistorySql`, ~3s a pass), and skips a service customer (`Service Call`, or a
+dispatch/service line), anyone we already spoke to (a disposition outside `NO_CONTACT_DISPOSITIONS`, unknown ones
+included, or a 2-minute "No Disposition") and anyone we already called back after their last call. A failed read
+fails closed, like DNC. The blank screen pop (number1 only, no LP CustID) is still a ruling for Mark before live.
 
 **An inquiry waiting in LP's inbound queue is watched, not assumed (2026-10-06).** Every lead we send LP is an inquiry
 (in1) until somebody checks it out into a lead (lds); ~49% wait for a person, 4–15h overnight. `create_lp_lead` no
@@ -339,8 +356,8 @@ lds and set the appointment on it; waiting → `pending_lp_checkout`; never addL
 (`INBOUND_CHECKOUT_WATCH_MODE` off|shadow|live, default shadow) mirrors the queue into `lp_inbound_queue` (sql/149, fails
 soft until applied), cards #contact-center 08:00–19:45 ET for inquiries waiting past their line (Mark, 2026-10-07; staff
 check out at a median 11 min, p90 42): visit today/tomorrow 30 min, visit 2+ days out 60 (`INBOUND_WATCH_APPT_FAR_MIN`),
-GHL sender 60, other 60, and #ops past 90 minutes of OFFICE time (2026-10-08: counted from 8:00 ET for an overnight
-row, `officeClockStartMs`, so the 8 AM card's rows do not hit #ops the same minute). The 8 AM card lists only rows already past their line. An in1 the held-row
+GHL sender 60, other 60, and #ops past 90 OPEN office minutes (2026-10-12, `officeMinutesBetween`: the clock stops
+at 19:45 ET and restarts at 08:00, so neither an overnight row nor one that arrived just before close hits #ops at 8 AM). The 8 AM card lists only rows already past their line. An in1 the held-row
 "import this lead" card named is not carded again, and vice versa (`INBOUND_WAIT_AUDIT` / `HELD_IMPORT_AUDIT`). It
 finishes the GHL side of issued inquiries. LP's GetInboundLeadInfo `enddate` is
 EXCLUSIVE: a range ending today returns none of today's rows (issue #490).
@@ -466,6 +483,22 @@ reads the HL mirror for nameless contacts and needs a VERIFIED link (LP id on th
 `scripts/backfill-lp-contact-names.js` or `POST /admin/lp-identity-fill` (dry run default). Most nameless `lp-linked`
 contacts have no name in LP either (1,107 of 1,154 on 2026-10-11); that is not a bug here.
 
+**Inbound capture turns only a sales call into an LP lead (2026-10-12).** `INBOUND_CAPTURE_MODE` (default shadow)
+labelled 2+ minute callers with no LP lead and never read what the call said: of 128 shadow candidates, 35 had refused
+(Not Interested, Cant Do Project, Below Minimum, Kicked) and 43 rang "Main Number" (service and existing customers). The
+`not_a_lead` label (`notALeadReason`, `src/inbound-caller-classify.js`) now comes right after `dnc` and before any GHL
+read: the disposition must be on `LEAD_DISPOSITIONS` (an ALLOW list: an unknown disposition is not a lead), and Main
+Number counts only for an appointment set. The caller's NEWEST call decides for every row of that caller. 50 remain,
+40 of them a 2+ minute "Hung Up", which ARE leads (the user, 2026-10-12).
+**A captured lead's LP source comes from the NUMBER CALLED (the user, 2026-10-12).** Unfixed, every capture would have
+reached LP as the chatbot (830 / 5574): `enrollLpLeadCreation` backfills blank LP Source ID / Pro ID, and 8e30ff37 sends
+only those two fields. `src/inbound-capture-source.js` maps each tracking number (Five9 dnis, read from
+five9_events_raw by caller and call time, matched within 1s because a JS Date drops Five9's microseconds) to its
+Sub-Source; "Main Number" (hundreds of local numbers) is Reece Call In (91). The Promoter is "Integration, GoHighLevel"
+(5686) on every lead this system creates from a call. `captureCaller` overwrites the contact's two fields (the number
+called wins over an older source), reads them back, and does not enroll if they did not stick. A number not in the
+table is `unmapped_number`: listed, never sent. Add a new tracking number to the table; never widen the chatbot backfill.
+
 **Every LP sale gets a P2 card, even when LP's webhook does not arrive (2026-10-03).** A P2 (Client
 Lifecycle) card is built only by LP's outbound webhook → GHL I.LP-IN (adds `deal-won`) → C.0-IN (P1 Sale
 Recorded + P2 Contract Signed, valued from LP Gross Sale Amount). LP's webhook all but stopped on 2026-09-24,
@@ -583,6 +616,16 @@ thrown error — `runMemoryNightly` and friends catch everything internally and 
 `{ ok: false }`. `interrupted` (a deploy killed the pass) is never `failed`, and a job that
 could not tell is `unknown`. Roster in `src/job-registry.js`; see `docs/job-runs.md`.
 
+**Every `*_MODE` flag is in `src/mode-registry.js` (Fix 2, 2026-10-12).** 92 flags, about half defaulting to shadow, and
+nothing showed which were waiting, since when, or on whose ruling. Each entry gives the default, which values mean
+live/shadow/off, the first commit that read it (`since`), the `decider`, where shadow results land (`evidence`: event
+types, a table, or a job's `job_runs.detail`; empty means logs only) and the go-live test from a ruling, or
+`NEEDS_RULING`. Never invent a go-live test. `registerModes()` (`src/mode-registry-sync.js`) upserts each flag's CURRENT
+value into `feature_modes` at boot, and that table's trigger writes `feature_mode_changes` when a value changes. That is
+the flip record: a flip is still a Railway variable a person sets. `scripts/test-mode-registry.js` scans `src/` for
+`env.X_MODE` / `env?.X_MODE` and fails on a flag with no entry or an entry with no flag. The dashboard's `/modes` page
+reads the table, and the 08:00 ops digest adds one "Shadow-mode review" section on Mondays (14+ days in shadow).
+
 **A deploy must never cut a customer reply off (2026-10-01, Dan H.).** Every Railway deploy SIGTERMs
 the old container, and `src/graceful-shutdown.js` waits only for what it can see. The reply fast path starts
 `executeActionById` without awaiting it, so the drain logged "Drained cleanly after 0ms" twice in 13 minutes
@@ -615,6 +658,25 @@ unmatched goes to the team; the bot never
 says "no appointment on file" to a guest it never identified. A "no" (`isDecline`, or the model's
 `recommended_action: suppress`) gets a close with no pitch, and a reply overtaken by a newer message
 from the same visitor is not sent (`superseded_by_newer_message`).
+
+**A live-chat reschedule never falls into a cancel or into discovery (handoff PR 5, 2026-10-12, LEAD_STAGE_MODE=live).**
+The simulator's `reschedule_not_moved`: an unrelated reply got "I've passed your cancellation", and "the first one" after
+the model's own "Which works better?" fell out of the flow into new-lead discovery. Live (`planCancelTurn({ stageLive })`):
+an unclear answer to the offer gets ONE `CLARIFY_LINE` (move or cancel?), a second unclear one goes to a person to set
+the time (`RESCHEDULE_HANDOFF_LINE`, a RESCHEDULE card, nothing cancelled); "no, a different day" is a move
+(`classifyOfferAnswer`); any offer of ours naming a time is the slot offer (`SLOTS_LIVE_RX`), an unclear pick gets the
+same two times once more, and the RESCHEDULED card says any earlier cancel request is withdrawn. The stage records
+`reschedule:offered` / `reschedule:moved` (`rescheduleStepFor`) and returns to booked.
+
+**SMS speed and format (handoff PR 6, 2026-10-12, active).** SMS turns took 11-43s (live chat 7-13s), driven by
+redrafts. One redraft at most, and none once the turn is past `SMS_REDRAFT_BUDGET_MS` (15s) from the first attempt
+(`mayRedraft`): the guarded first draft ships. A guard's re-write no longer waits the 1.5s transient-error backoff. Over
+320 characters after the redraft (or in length shadow), whole middle sentences are dropped (`trimSmsToCap`), never a
+cut sentence. `src/agentic/sms-format.js`: a fragment opener goes, a stale "our call time passed" nobody raised goes
+(unless the call was in the last 24h), the sign-off is exactly once at the end on the reply that signs the thread
+(`normalizeSignature`), a reply nearly identical to our last one is re-written once, and no promised call is recorded
+after an opt-out or a close (`shouldRecordPromise`). Live chat's Spanish hand-off confirms a number on file
+(`SPANISH_CONFIRM_LINE`) instead of asking for one.
 
 **Both bots sound like a person: rules in the prompt AND a pass after it (2026-10-02).** The SMS prompt
 banned em dashes for months and they shipped anyway, with "Got it. Great question." openers and "Just to
@@ -868,6 +930,48 @@ not. `enforceTeamVoice` (`src/agentic/team-voice.js`) corrects both after the mo
 opening outside 9–8 weekdays, 9–5 Saturday, 9–3 Sunday (ET). The planner's hand-off and callback lines use the same
 hours (`nowMs`). Look for `[TeamVoice]` log lines.
 
+**A conversation has ONE stored stage (Lead Conversation Stage, 2026-10-12).** Three test batches (~35 chats) booked
+nothing: `planNepqTurn` re-guessed the stage from the thread every turn, and `stageBlock` read the analyzer's
+`buyer_stage` and said something else. `src/agentic/lead-stage.js` (pure) is the one answer: the NEPQ track
+connection → situation → problem → consequence → qualifying → transition → commitment_offered → slot_held → booked,
+side states `objection:<type>`, `reschedule:<step>`, handoff, opted_out, disqualified_non_owner / _out_of_area, and the
+rehash track as `rehash:<stage>`. `buyer_stage` stays a separate axis (tone only). `booked` comes ONLY from the real
+booking event (`recordBookedStage` beside both `ghl.appointment_booked` emits), never from the reply's words; the track
+never moves backward without an objection or a reschedule. `src/services/lead-stage-io.js` stores it
+(`lead_conversation_stage` + `_events`, codes and our own time labels only, never customer text) after every sent turn
+(SMS send handler, live chat `deliver`, a STOP short-circuit as opted_out), and mirrors the label to the GHL "NEPQ
+Stage" dropdown (`contact.nepq_stage`, 16 labels in `STAGE_GHL_LABEL`) only when it changes and only a label the live
+dropdown carries. "Stage Last Engaged" is another field: never touch it. The simulator keeps the stage in memory and
+prints `stage: a → b (reason)` per turn. `LEAD_STAGE_MODE` off|shadow|live, default shadow (record only);
+`GET /admin/lead-stage/:contactId` (x-admin-token) shows it.
+**With `LEAD_STAGE_MODE=live` the planner and the prompt read the stage (the user, 2026-10-12).** `planNepqTurn({ stage })`
+(passed only when live; null is byte-for-byte the old plan): a yes to ANY offer of ours, a schedule ask or an address
+moves forward whatever our last message was; past the bridge (or at qualifying / offered / held, or back from an
+objection play) anything that is not a no goes to times; the bridge is sent ONCE; a pick resolves only against the
+newest offer (`latest_offered_slots`); a stated day or part of day is honored or said to be unavailable;
+"you just said that" changes the move. **The qualifying gate** (`gateForStage`, `QUALIFY_LINES`): no visit time until the
+lead owns the home, the zip is known and every decision maker is the lead alone or named AND able to be there, one item
+per message (owner → zip → decision makers), an item asked twice is not asked a third time. In live mode this
+supersedes "NEVER probe for disqualifiers" (the plan block allows the ownership question) and "ask about decision makers
+ONCE, after the hold" (asked before the times; a settled answer rides as `plan.dm_known` and the collect never asks
+again). `stageBlock` renders from the stored stage (`playForConversationStage`), buyer_stage is tone only, and the
+transition default is the free home visit. The simulator and `run_bot_eval` take `lead_stage_mode` (shadow|live) to try
+it before Railway is switched.
+
+**A renter gets no visit; one out-of-area decline; quote ≠ price (handoff PR 3, 2026-10-12).** A renter was offered
+times twice (batch 3 T3). `enforceNonOwner` (`src/agentic/non-owner.js`, the last pass in both bots beside
+`enforcePropertyScope`, ACTIVE in every mode) turns a reply to a lead who says they rent into `NON_OWNER_LINE` (the
+homeowner needs to be part of the visit; the owner is welcome to reach out), drops the time offer when they said it
+earlier, drops the `book_appointment` companion, and the live chat never books one (`isNonOwner`). A landlord ("we rent
+it out") is an owner (`homeowner.js`). Zip 10001 was declined on SMS and "good chance we can help" in live chat: both
+bots now give `outOfAreaLine` (service-area-turn.js; the SMS SERVICE_AREA_EXIT text and the `serviceAreaOutside` prompt
+too, which no longer offers a team callback), and live chat checks a zip typed outside a coverage question
+(`zipInText`). With `LEAD_STAGE_MODE=live` (`planNepqTurn({ stageLive })`): a plain quote request is NEPQ's info request
+(`LINES.info_request`, once), not the price play (`isPriceAsk({ quoteIsPrice: false })`; an insist or a price word still
+is), and "we went with another company" gets `LINES.competitor` (the disarm, then how they would decide; no consequence
+move after it; a second time → `repeat_objection`). `CLAIMS_RX` strips claims that another company's work is not "up to
+code".
+
 **Every GHL request is credited to the code that made it (2026-10-12).** LP-MCP made ~127,000 GHL requests in 24h
 (~63% of GHL's 200k/day cap, peaks 268/min at 5 AM) and the rehash sweep failed 1 pass in 4 on 429s, with no way to
 say who made the calls. `src/ghl-caller.js` carries a label in AsyncLocalStorage, set where work starts: `job:<id>`
@@ -1041,6 +1145,16 @@ walked into it — the three FAQs retrieval offered were all irrelevant (top 0.4
 model's own knowledge saved the reply. When a topic is retired because the answer CHANGED, the new
 answer still has to exist (`LIB-P12`).
 
+**Past-win examples are cleaned before a model sees them (2026-10-12).** `KB_EXEMPLAR_MODE` (shadow) served 5,670
+examples in 14 days: 24% were GHL's raw live-chat HTML, about a quarter named another lead's day and time, 222 promised
+a call "right now" (the Monica reply) and 24 were workflow drips. `prepareExemplar` (`src/knowledge/exemplars-core.js`)
+is the one cleaning pass, at write time, in place for older rows (`clean_version`), and again at serve time: HTML out;
+the contact's name, a greeting name, streets, days and times replaced by `[name]` / `[address]` / `[day]` / `[time]`;
+call immediacy softened (`softenCallTiming`) and the voice humanized; a drip, a too-short reply or one that fails
+`checkReply` is stored inactive with an `excluded_reason`. Bump `EXEMPLAR_CLEAN_VERSION` when the pass changes. The gate
+can try the mode without Railway: `run_bot_eval` / `simulate_bot_conversation` take `kb_exemplar_mode`
+(`src/simulator/sim-overrides.js`, AsyncLocalStorage; a sim's audit rows log mode `sim_<mode>`).
+
 ## Supabase
 
 **Two separate instances — LP and HL.** No cross-joins; fetch from one and filter against the other.
@@ -1048,7 +1162,21 @@ answer still has to exist (`LIB-P12`).
 - Reads: wrap in `json_agg(row_to_json(s))`.
 - Writes: assert the row count (`WITH u AS (... RETURNING 1) SELECT count(*) FROM u`). Note the MCP
   query tool reports `rows_affected: "n/a"`, so verify with a follow-up count.
-- DDL goes through the Supabase dashboard.
+- **Schema changes are migrations, applied by CI (Fix 1, 2026-10-12).** Before this, 157 numbered `sql/` files
+  were pasted into the SQL editor by hand and the database's own migration table knew about 8 of them; five
+  repos wrote tables into the LP project with no shared record. Now a schema change is ONE file
+  `supabase/migrations/<YYYYMMDDHHMMSS>_<snake_case>.sql`. `.github/workflows/db-migrate.yml` checks it on
+  the PR (`scripts/check-migrations.js`, then the repo ledger against the database's, then schema drift once
+  the baseline dump exists) and applies it on merge with `supabase db push`. `sql/NNN_*.sql` is FROZEN at 157
+  and CI fails on a 158; `sql/seeds/` (agent_rules, kb_faqs data) is unchanged. The first real file must be
+  the `*_baseline_dump.sql` the workflow's `action=baseline` run produces; until it exists, only commented
+  stubs may live in the folder (the drift check replays the folder into an empty shadow database). A
+  DROP / TRUNCATE / DELETE / column-type change carries `-- destructive: approved by <name> <YYYY-MM-DD>`.
+  Never paste DDL into the dashboard again. The boot-time mirrors (`src/admin/startup-mirrors.js`) now
+  only CHECK and page; `STARTUP_SCHEMA_APPLY=true` is the rollback. The other repos (Reece-Dashboard,
+  n8n, window-calculator, the AI OS loads) add their LP-project DDL HERE, not in their own folders. Full
+  doctrine: `sql/README.md`. This supersedes rule 7 of the `reece-code-shipping` skill ("DDL executes in
+  the Supabase dashboard only; mirror in runMigrations()"), which is Mark's to edit.
 - Deleting from `system_events` can trip `agent_actions_event_id_fkey`. Guard with
   `AND NOT EXISTS (SELECT 1 FROM agent_actions a WHERE a.event_id = e.id)` and delete in batches — a
   single large statement is atomic, so one FK violation rolls the whole thing back.
@@ -1150,7 +1278,11 @@ Mark's real lists. Both use the general phone until their own is known. Houston 
 **Central time**: `src/config/market-timezones.js` maps the market, `src/services/contact-timezone.js`
 resolves a contact's zone from their zip, and customer-facing times (slots, appointment text, the
 prompt's TIME NOW, that contact's quiet hours) follow it. Office/dialer hours stay ET with an "ET"
-label. Never tell a visitor Reece serves only Florida. Coverage questions are zip-first
+label. **A zip the lead TYPES decides the zone, not only the record's (handoff PR 4, 2026-10-12).** A
+Katy lead typed 77494 and was offered "10:00 AM ET": `typedZipFromThread` / `zoneForContact`
+(`src/services/contact-timezone.js`) set `context.market` before the SMS slot read and pass `zip` to live chat's
+`offerBookingSlots`, so the times are read and labelled CT. The allowed visit start hours (10, 2, 6) stay checked in the
+office zone the GHL calendars are laid out in. Never tell a visitor Reece serves only Florida. Coverage questions are zip-first
 (`src/agentic/service-area-turn.js`, both reply paths): ask for the zip, then answer in the first
 sentence. Not yet wired for the new markets: `lp_branch_market_map`, `slack_market_slugs`.
 
@@ -1201,6 +1333,13 @@ result with the last gate run and saves it as a `agentic.bot_eval_run` system ev
 turns only, never customer text). **Ship only if the scorecard does not read WORSE THAN LAST RUN.**
 A run takes 10–15 minutes and about 130 real model turns. A new scenario rule must come from a
 ruling already in this file, so a failure means a regression, not a matter of taste.
+**The AIOS test runs are named scenarios (handoff PR 7, 2026-10-12).** easy_yes, book_it_evening_spouse, renter,
+competitor, stop_sms, stop_chat, trick_prompt, reschedule_unclear, out_of_area_chat, houston_tz. A scenario with
+`autoAnswer` lets the persona answer the bot's address / ownership / zip / decision-maker / name / phone question
+(`autoAnswerFor`), so a booking scenario can book. Every conversation also gets `stageFlowFailures`: yes_without_booking,
+slots_offered_to_non_owner, stage_regressed, and, only when the run's `lead_stage_mode` is live, slots_without_qualifying
+and bridge_repeated (today's designed behavior in shadow). A texted STOP answered with silence is not `no_reply`. The
+scenario checks carry `SCORING_VERSION`: a run scored with new checks is a new baseline, not "worse".
 
 ## Writing code here
 

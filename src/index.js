@@ -62,6 +62,7 @@ import { runStartupSchema } from './admin/startup-schema.js';
 import { STARTUP_MIRRORS } from './admin/startup-mirrors.js';
 import { startJobRunner } from './job-runner.js';
 import { JOBS } from './job-registry.js';
+import { registerModes } from './mode-registry-sync.js';
 import { startTier1EmbedSweep } from './knowledge/tier1-semantic.js';
 import { startExemplarSweep } from './knowledge/exemplars.js';
 import { startCiMomentsSweep } from './knowledge/ci-moments.js';
@@ -350,6 +351,7 @@ import { registerHoldCompleteRoutes } from './agentic/hold-complete.js';
 // 2026-09-26 — website live chat answered synchronously (src/live-chat/).
 import { registerLiveChatRoutes } from './live-chat/index.js';
 import { registerSimulatorRoutes } from './tools/simulator-tools.js';
+import { registerLeadStageRoutes } from './admin/lead-stage-routes.js';
 // 2026-10-01 — answers a live chat message GHL never sent us (a contact merge drops the webhook).
 import { startLiveChatMissedReplyScheduler } from './jobs/live-chat-missed-reply-sweep.js';
 // ─── FB Publish Watchdog (alert on missed WF4 publish window) ────
@@ -435,11 +437,19 @@ logAuthBootReport();
 // once and runs only the blocks with something missing, so a healthy boot
 // takes no table locks and fires no DDL events. See that file's header for the
 // lock-timeout / schema-cache false alarms this replaced. Never throws.
+//
+// 2026-10-12 (Fix 1): the boot CHECKS and no longer APPLIES. Schema changes
+// are migrations in supabase/migrations/, applied by .github/workflows/
+// db-migrate.yml on merge and recorded in the database's own ledger; a boot
+// that could still write DDL would be a second, unrecorded path. A missing
+// object is still named in the log and paged once to #ops-alerts.
+// STARTUP_SCHEMA_APPLY=true restores the old self-heal (the rollback switch).
 async function runMigrations() {
   try {
     const { runSQL } = await import('./admin/supabase-admin.js');
     const { readFile } = await import('node:fs/promises');
     await runStartupSchema(STARTUP_MIRRORS, {
+      apply: String(process.env.STARTUP_SCHEMA_APPLY || '').trim().toLowerCase() === 'true',
       runSQL,
       readSqlFile: (rel) => readFile(new URL(`../${rel}`, import.meta.url), 'utf8'),
       opsAlert: async (text) => {
@@ -640,6 +650,7 @@ registerHoldCompleteRoutes(app);
 // 2026-09-26 — POST /webhooks/live-chat-inbound, behind LIVE_CHAT_FAST_LANE_MODE (default off).
 registerLiveChatRoutes(app);
 registerSimulatorRoutes(app); // 2026-10-02 — POST /admin/bot-simulate: real bots, nothing sent or written
+registerLeadStageRoutes(app); // 2026-10-12 — GET /admin/lead-stage/:contactId: the conversation stage, read only
 
 // ─── Executor Heartbeat (failover for n8n cron) ──────────────────
 registerExecutorHeartbeatRoutes(app);
@@ -926,6 +937,10 @@ const server = app.listen(PORT, async () => {
   // stop the service booting.
   await startJobRunner(JOBS).catch((err) =>
     console.error('[JobRunner] startup failed:', err.message));
+  // Every *_MODE flag's current value, for the dashboard's /modes page (Fix 2,
+  // 2026-10-12). Never throws; a missing feature_modes table only logs.
+  await registerModes().catch((err) =>
+    console.error('[ModeRegistry] startup failed:', err.message));
   startTier1EmbedSweep(); // v1.10 — no-op while KB_FAQ_SEMANTIC_MODE=off
   startExemplarSweep();   // v1.11 — no-op while KB_EXEMPLAR_MODE=off
   startCiMomentsSweep();  // v1.12 — no-op while KB_CALL_MOMENTS_MODE=off

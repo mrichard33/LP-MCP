@@ -614,7 +614,8 @@ test('a phone typed in this message counts; only the name is asked', async () =>
 const RICK = { id: 'RICK1', firstName: 'Rick', lastName: 'Fox', phone: '+13525550188' };
 const APPT = { appointment_id: 'APPT9', calendar_id: 'CAL1', status: 'confirmed', start_time: '2026-10-02T22:00:00Z', start_time_human: 'Thu, Oct 2, 6:00 PM ET' };
 const SLOTS = [{ iso: '2026-10-06T14:00:00Z', day: 'Tue, Oct 6', time: '10:00 AM', dayOfWeek: 'Tuesday' }, { iso: '2026-10-07T18:00:00Z', day: 'Wed, Oct 7', time: '2:00 PM', dayOfWeek: 'Wednesday' }];
-const cancelDeps = (state, { found = RICK, appts = [APPT], cancelOk = true, freeSlots = [], moveOk = true } = {}) => ({
+const cancelDeps = (state, { found = RICK, appts = [APPT], cancelOk = true, freeSlots = [], moveOk = true, stageMode = null } = {}) => ({
+  ...(stageMode ? { leadStageMode: () => stageMode } : {}),
   findContactByPhone: async (d) => { state.lookedUpPhones = [...(state.lookedUpPhones || []), d]; return found; },
   fetchAppointments: async (id) => { state.apptReads = [...(state.apptReads || []), id]; return appts; },
   cancelAppointment: async (a) => { state.cancels = [...(state.cancels || []), a]; return cancelOk ? { ok: true } : { ok: false, error: 'GHL 400' }; },
@@ -1281,4 +1282,105 @@ test('after the bridge, more detail gets the visit question again, never a call'
   assert.ok(!/quick call|call you/i.test(sent), sent);
   assert.match(sent, /next step/i);
   assert.match(sent, /\?$/);
+});
+
+// ── 2026-10-12 (handoff PR 5, LEAD_STAGE_MODE=live; sim reschedule_not_moved) ──
+async function withLiveStage(fn) {
+  const before = process.env.LEAD_STAGE_MODE;
+  process.env.LEAD_STAGE_MODE = 'live';
+  try { return await fn(); } finally { if (before === undefined) delete process.env.LEAD_STAGE_MODE; else process.env.LEAD_STAGE_MODE = before; }
+}
+
+// The simulator plans under its run's own mode (lead_stage_mode=live) while
+// Railway stays shadow: the lane reads the mode through its dep, not the env.
+test('the lane\'s leadStageMode dep turns the live reschedule path on with the env in shadow', async () => {
+  const before = process.env.LEAD_STAGE_MODE;
+  process.env.LEAD_STAGE_MODE = 'shadow';
+  try {
+    const { lane, state } = laneWithCancel([...UP_TO_OFFER, TZ('inbound', 'what color are the frames', 70)], { freeSlots: SLOTS, stageMode: 'live' });
+    await lane.processInbound(INBOUND('what color are the frames'));
+    assert.match(state.sends[0].message, /move your appointment to another day, or cancel it\?/);
+    assert.equal(state.cancels, undefined);
+  } finally { if (before === undefined) delete process.env.LEAD_STAGE_MODE; else process.env.LEAD_STAGE_MODE = before; }
+});
+
+test('live: an unclear answer to the offer gets ONE clarifying question, never a cancel or a cancel card', () => withLiveStage(async () => {
+  const { lane, state } = laneWithCancel([...UP_TO_OFFER, TZ('inbound', 'what color are the frames', 70)], { freeSlots: SLOTS });
+  await lane.processInbound(INBOUND('what color are the frames'));
+  assert.match(state.sends[0].message, /move your appointment to another day, or cancel it\?/);
+  assert.equal(state.cancels, undefined);
+  await new Promise(r => setImmediate(r));
+  assert.equal((state.cards || []).length, 0, 'no card on an unclear answer');
+}));
+
+test('live: still unclear after the clarifying question → a person sets the time, nothing cancelled', () => withLiveStage(async () => {
+  const clarify = 'Just to be sure I get this right, would you like to move your appointment to another day, or cancel it?';
+  const { lane, state } = laneWithCancel([...UP_TO_OFFER, TZ('inbound', 'hmm', 70), TZ('outbound', clarify, 80), TZ('inbound', 'idk', 100)], { freeSlots: SLOTS });
+  await lane.processInbound(INBOUND('idk'));
+  assert.doesNotMatch(state.sends[0].message, /cancel/i);
+  assert.match(state.sends[0].message, /scheduling team/);
+  assert.equal(state.cancels, undefined);
+  await new Promise(r => setImmediate(r));
+  assert.match(state.cards[0].text, /LIVE CHAT RESCHEDULE — call to set a new time/);
+}));
+
+test('live: "move it, a different day" → two real times right away', () => withLiveStage(async () => {
+  const { lane, state } = laneWithCancel([...UP_TO_OFFER, TZ('inbound', 'no, a different day please', 70)], { freeSlots: SLOTS });
+  await lane.processInbound(INBOUND('no, a different day please'));
+  assert.match(state.sends[0].message, /I have Tue, Oct 6 at 10:00 AM or Wed, Oct 7 at 2:00 PM/);
+  assert.equal(state.cancels, undefined, '"no, a different day" is a move, not a cancel');
+}));
+
+test('live: "the first one" after the model\'s own offer wording moves the appointment (no discovery)', () => withLiveStage(async () => {
+  const modelOffer = 'No problem, Rick. I can do Tue, Oct 6 at 10:00 AM or Wed, Oct 7 at 2:00 PM ET. Which works better?';
+  const { lane, state } = laneWithCancel([...UP_TO_OFFER, TZ('inbound', 'yes', 70), TZ('outbound', modelOffer, 80), TZ('inbound', 'The first one', 100)], { freeSlots: SLOTS });
+  await lane.processInbound(INBOUND('The first one'));
+  assert.deepEqual(state.moves, [{ contactId: 'RICK1', oldAppointmentId: 'APPT9', calendarId: 'CAL1', startIso: SLOTS[0].iso }]);
+  assert.match(state.sends[0].message, /now set for/);
+  assert.doesNotMatch(state.sends[0].message, /how many|windows/i);
+  await new Promise(r => setImmediate(r));
+  assert.match(state.cards[0].text, /earlier cancel request for this visit is WITHDRAWN/);
+}));
+
+test('live: an unclear pick gets the same two times once more, not a hand-off', () => withLiveStage(async () => {
+  const offerLine = 'Sure. I have Tue, Oct 6 at 10:00 AM or Wed, Oct 7 at 2:00 PM ET open. Which one works better for you?';
+  const { lane, state } = laneWithCancel([...UP_TO_OFFER, TZ('inbound', 'yes', 70), TZ('outbound', offerLine, 80), TZ('inbound', 'hmm let me see', 100)], { freeSlots: SLOTS });
+  await lane.processInbound(INBOUND('hmm let me see'));
+  assert.match(state.sends[0].message, /Tue, Oct 6 at 10:00 AM or Wed, Oct 7 at 2:00 PM/);
+  assert.equal(state.moves, undefined);
+}));
+
+// ── 2026-10-12 (handoff PR 4): the zip the visitor typed decides the zone ──
+test('a zip the visitor typed reaches the booking-slot read (77494 → Central, not the record\'s ET)', async () => {
+  const calls = [];
+  const { lane } = makeLane({ mode: 'shadow', checkServiceArea: async (zip) => ({ checked: true, zip, in_service_area: true, market_code: 'HOU', city: 'Katy' }), extra: {
+    nepqMode: () => 'live',
+    offerBookingSlots: async (a) => { calls.push(a); return { slots: [], tzLabel: 'CT' }; },
+  } });
+  await lane.processInbound(INBOUND('77494'));
+  assert.ok(calls.length >= 1, 'the calendar read was warmed');
+  assert.equal(calls[0].zip, '77494');
+});
+
+// ── 2026-10-12 (handoff PR 3): service-area parity and the renter guard ──
+
+test('a zip typed outside a coverage question is checked; out of area → the one decline (batch 2 #3)', async () => {
+  const { lane, state } = makeLane({ mode: 'shadow', checkServiceArea: fakeLookup, llm: () => ({ message: "There's a good chance we can help. What got you looking at windows?" }) });
+  const out = await lane.processInbound(INBOUND('I need new windows at 55 Main St, New York NY 10001'));
+  assert.deepEqual(state.lookups, ['10001']);
+  assert.equal(firstSentence(out.message), "Sorry, Reece doesn't serve the 10001 area.");
+  assert.doesNotMatch(out.message, /good chance/i);
+});
+
+test('an in-area zip typed outside a coverage question changes nothing', async () => {
+  const { lane } = makeLane({ mode: 'shadow', checkServiceArea: fakeLookup, llm: IGNORES_COVERAGE });
+  const out = await lane.processInbound(INBOUND('my zip code is 32137 and the windows are drafty'));
+  assert.doesNotMatch(out.message, /doesn't serve/);
+});
+
+test('a renter in live chat gets no times (batch 3 T3; active in every mode)', async () => {
+  const { lane } = makeLane({ mode: 'shadow', llm: () => ({ message: "Makes sense, you'll want his okay first. I have Thu, Oct 15 at 10:00 AM ET or Fri, Oct 16 at 2:00 PM ET. Which works better?" }) });
+  const out = await lane.processInbound(INBOUND("I'm renting, my landlord would have to approve it"));
+  assert.doesNotMatch(out.message, /\d{1,2}:\d{2}\s*(?:AM|PM)/);
+  assert.match(out.message, /homeowner needs to be part of the visit/);
 });

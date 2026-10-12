@@ -70,7 +70,7 @@ export const simulatorDeps = {
 };
 
 /** Validate and normalise a run request. Pure; throws a readable error. */
-export function parseSimRequest({ scenario = null, messages_json = null, channel = 'both', nepq_mode = 'live', persona_json = null, title = null, contact_id = null } = {}) {
+export function parseSimRequest({ scenario = null, messages_json = null, channel = 'both', nepq_mode = 'live', persona_json = null, title = null, contact_id = null, lead_stage_mode = null, kb_exemplar_mode = null } = {}) {
   let turns = null;
   if (messages_json) {
     try { turns = JSON.parse(messages_json); } catch { throw new Error('messages_json must be a JSON array of strings'); }
@@ -84,7 +84,12 @@ export function parseSimRequest({ scenario = null, messages_json = null, channel
   if (!['both', 'livechat', 'sms'].includes(channel)) throw new Error('channel must be both, livechat or sms');
   if (!['live', 'off'].includes(nepq_mode)) throw new Error('nepq_mode must be live or off');
   if (contact_id && !/^[A-Za-z0-9]{10,40}$/.test(String(contact_id))) throw new Error('contact_id must be a GHL contact id');
-  return { scenario: turns ? null : scenario, turns, persona, title, channel, nepqMode: nepq_mode, contactId: contact_id || null };
+  // 2026-10-12: try the stored-stage planner before Railway's LEAD_STAGE_MODE is
+  // switched (the stage is kept in memory either way; nothing is written).
+  if (lead_stage_mode != null && lead_stage_mode !== '' && !['shadow', 'live'].includes(lead_stage_mode)) throw new Error('lead_stage_mode must be shadow or live');
+  // 2026-10-12: try past-win exemplars before Railway's KB_EXEMPLAR_MODE is switched.
+  if (kb_exemplar_mode != null && kb_exemplar_mode !== '' && !['off', 'shadow', 'live'].includes(kb_exemplar_mode)) throw new Error('kb_exemplar_mode must be off, shadow or live');
+  return { scenario: turns ? null : scenario, turns, persona, title, channel, nepqMode: nepq_mode, contactId: contact_id || null, leadStageMode: lead_stage_mode || null, kbExemplarMode: kb_exemplar_mode || null };
 }
 
 async function waitFor(job, seconds) {
@@ -110,9 +115,11 @@ export function registerSimulatorTools(server, deps = simulatorDeps) {
       scenario: z.string().optional().describe('Named scenario, or "all".'),
       messages_json: z.string().optional().describe('Your own customer messages, as a JSON array of strings (max 12).'),
       persona_json: z.string().optional().describe('Optional customer record, e.g. {"firstName":"Dana","phone":"+13525550101","postalCode":"33908"}.'),
-      contact_id: z.string().optional().describe('Optional real GHL contact (e.g. Mark Test hZOcPk6XmMvWVvjZJ7mz) whose record is READ for realism. Nothing is sent or written to it.'),
+      contact_id: z.string().optional().describe('Optional real GHL contact whose record is READ for realism (e.g. the sandbox test contact s2Omf2RcK5YBISwgHHOe). Nothing is sent or written to it. Never a real lead, nor a contact tagged hard-disqualified or suppress-outbound.'),
       channel: z.string().optional().describe('both (default), livechat or sms.'),
       nepq_mode: z.string().optional().describe('live (default: the NEPQ backbone answers) or off (today\'s production replies).'),
+      lead_stage_mode: z.string().optional().describe('shadow or live: run with the stored conversation stage recorded only (shadow) or driving the planner (live). Default: Railway\'s LEAD_STAGE_MODE. Kept in memory; nothing is written.'),
+      kb_exemplar_mode: z.string().optional().describe('off, shadow or live: past-win examples for this run only (live puts them in the prompt). Default: Railway\'s KB_EXEMPLAR_MODE.'),
       wait_seconds: z.number().optional().describe('Wait up to this many seconds (max 100) for the result before returning.'),
     },
     async (args) => {
@@ -132,10 +139,12 @@ export function registerSimulatorTools(server, deps = simulatorDeps) {
       'Takes 10-15 minutes and real model calls; returns a job id for get_bot_simulation.',
     {
       nepq_mode: z.string().optional().describe('live (default, production) or off.'),
+      lead_stage_mode: z.string().optional().describe('shadow or live (default: Railway\'s LEAD_STAGE_MODE). live runs the stored-stage planner before it is switched on.'),
+      kb_exemplar_mode: z.string().optional().describe('off, shadow or live (default: Railway\'s KB_EXEMPLAR_MODE). live puts past-win examples in the prompt before it is switched on.'),
     },
-    async ({ nepq_mode = 'live' } = {}) => {
+    async ({ nepq_mode = 'live', lead_stage_mode = null, kb_exemplar_mode = null } = {}) => {
       let req;
-      try { req = parseSimRequest({ scenario: 'all', channel: 'both', nepq_mode }); } catch (err) { return text({ error: err.message }); }
+      try { req = parseSimRequest({ scenario: 'all', channel: 'both', nepq_mode, lead_stage_mode, kb_exemplar_mode }); } catch (err) { return text({ error: err.message }); }
       const job = startSimulationJob({ ...req, gate: true }, deps);
       return text({ job_id: job.id, status: 'running', next: 'call get_bot_simulation with this job_id (wait_seconds up to 100, repeat until done); the scorecard is at the top' });
     },
@@ -182,7 +191,7 @@ export function registerSimulatorRoutes(app, deps = simulatorDeps) {
     if (!process.env.ADMIN_API_TOKEN) return res.status(503).json({ error: 'ADMIN_API_TOKEN is not set; the bot gate is closed' });
     if (!authed(req, res)) return;
     let parsed;
-    try { parsed = parseSimRequest({ scenario: 'all', channel: 'both', nepq_mode: req.body?.nepq_mode || 'live' }); }
+    try { parsed = parseSimRequest({ scenario: 'all', channel: 'both', nepq_mode: req.body?.nepq_mode || 'live', lead_stage_mode: req.body?.lead_stage_mode || null, kb_exemplar_mode: req.body?.kb_exemplar_mode || null }); }
     catch (err) { return res.status(400).json({ error: err.message }); }
     const job = startSimulationJob({ ...parsed, gate: true }, deps);
     return res.status(202).json({ job_id: job.id, status_url: `/admin/bot-simulate/${job.id}` });

@@ -111,6 +111,8 @@ import { findExistingAppointment, emitSlotCheckEvent, isSlotCheckEnabled } from 
 import { applyAppointmentFormatForContact } from '../../appointments/format-contact.js';
 import { claimAppointmentCreate, releaseAppointmentCreate } from '../../services/appointment-sync-claim.js';
 import { buildApptEventIdempotencyKey } from '../../services/appt-event-dedup.js';
+import { recordBookedStage } from '../../services/lead-stage-io.js';
+import { trackBackground } from '../../graceful-shutdown.js';
 
 // Tags cleared once a booking lands (or the flow otherwise terminates) so the
 // post-qualification affirmative-gate bypass (intent-classifier.js) doesn't
@@ -1144,6 +1146,11 @@ export async function executeBookAppointment(action, context) {
   } catch (err) {
     console.warn(`[ActionExecutor] ghl.appointment_booked emit failed for ${contactId} (fail-soft, I.LP-A remains the backstop): ${err.message}`);
   }
+
+  // 2026-10-12 (Lead Conversation Stage): the appointment was read back, so it
+  // is real. The stage moves to booked here, never from the reply's wording.
+  trackBackground(recordBookedStage({ contactId, channel: payload?.channel || null, source: 'bot_booking' })
+    .catch(err => console.warn(`[ActionExecutor] lead stage (booked) failed for ${contactId}: ${err.message}`)));
 
   // 2026-08-13 — if the lead was told "text you right back" because the inline
   // booking didn't land in time, this is where that promise gets kept. Must run

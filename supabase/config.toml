@@ -1,0 +1,10 @@
+# Supabase CLI config for the LP project ("Reece Lead Perfection Sync",
+# ref rcjcgjlqzepicbwhnnjl). Only the migrations ledger is used here: the app
+# runs on Railway, not on `supabase start`. See sql/README.md.
+project_id = "lp-mcp"
+
+[db]
+major_version = 17
+
+[db.migrations]
+schema_paths = []

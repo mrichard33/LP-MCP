@@ -345,6 +345,12 @@ function classifyHealResult(result) {
       return 'already_present';
     case 'duplicate_sync_suppressed':
       return 'dedup_suppressed';
+    // 2026-10-12 — LP refused the appointment (LP_APPT_GUARD_MODE=enforce), or
+    // refused this lead + date + time in the last 24h. LP's answer, not a
+    // repair and not an error; the refusal is an lp.appointment_refused event.
+    case 'lp_appointment_refused':
+    case 'lp_refusal_recent':
+      return 'refused';
     case 'skipped_lp_unavailable':
     // 2026-10-08: syncAppointmentToLP refuses a GHL-only calendar and a lead
     // in a non-bookable disposition. Neither wrote anything.
@@ -701,6 +707,7 @@ export async function runAppointmentParityWatchdog({ dryRun = !PARITY_AUTOHEAL, 
     already_present: 0,    // sync path says LP has it; parity says it does not
     dedup_suppressed: 0,   // blocked by the 24h lp_appointment_sync_marks entry
     not_attempted: 0,      // LP unavailable / deferred / past appointment
+    refused: 0,            // LP refused the appointment (LP_APPT_GUARD_MODE=enforce)
     unknown_result: 0,     // unrecognised action — logged raw
     escalated: 0,          // parity_gap event that actually inserted
     confirm_emitted: 0,    // confirmation_drift event that actually inserted
