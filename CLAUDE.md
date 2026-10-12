@@ -599,6 +599,15 @@ says "no appointment on file" to a guest it never identified. A "no" (`isDecline
 `recommended_action: suppress`) gets a close with no pitch, and a reply overtaken by a newer message
 from the same visitor is not sent (`superseded_by_newer_message`).
 
+**A live-chat reschedule never falls into a cancel or into discovery (handoff PR 5, 2026-10-12, LEAD_STAGE_MODE=live).**
+The simulator's `reschedule_not_moved`: an unrelated reply got "I've passed your cancellation", and "the first one" after
+the model's own "Which works better?" fell out of the flow into new-lead discovery. Live (`planCancelTurn({ stageLive })`):
+an unclear answer to the offer gets ONE `CLARIFY_LINE` (move or cancel?), a second unclear one goes to a person to set
+the time (`RESCHEDULE_HANDOFF_LINE`, a RESCHEDULE card, nothing cancelled); "no, a different day" is a move
+(`classifyOfferAnswer`); any offer of ours naming a time is the slot offer (`SLOTS_LIVE_RX`), an unclear pick gets the
+same two times once more, and the RESCHEDULED card says any earlier cancel request is withdrawn. The stage records
+`reschedule:offered` / `reschedule:moved` (`rescheduleStepFor`) and returns to booked.
+
 **Both bots sound like a person: rules in the prompt AND a pass after it (2026-10-02).** The SMS prompt
 banned em dashes for months and they shipped anyway, with "Got it. Great question." openers and "Just to
 understand… —" lead-ins. `HUMAN_VOICE_RULES` (`src/prompts/response-generator/banned.js`) tells the

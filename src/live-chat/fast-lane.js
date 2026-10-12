@@ -62,7 +62,7 @@ import { lpNoteDqMode } from '../agentic/lp-note-dq.js';
 import { enforceOneAsk } from '../agentic/one-ask.js';
 import { looksLikeShortPhone } from '../agentic/contact-typos.js';
 import { planNepqTurn, enforceNepqPlan, referenceRetryNote, nepqBackboneMode, pickFresh, LINES as NEPQ_LINES, isServiceCallback, dropUnsafeLines, leadWantsCall } from '../agentic/nepq-planner.js';
-import { buildStageInput } from '../agentic/lead-stage.js';
+import { buildStageInput, leadStageMode, rescheduleStepFor } from '../agentic/lead-stage.js';
 import { NO_DIAL_REASONS } from '../agentic/bot-callback.js';
 import { isCustomerP2 } from '../agentic/lead-state/signals/context-reader.js';
 import { COLLECT_ASK, COLLECT_ASK_AGAIN, dmAsk, holdLine, missingItems, parseDecisionMakers, heldSlot, nameFromReply, addressConfirmAsk, addressConfirmState, mentionedPartner, dmAnswerFromThread, slotLabel } from '../agentic/booking-collect.js';
@@ -140,6 +140,8 @@ import {
   rescheduleLine,
   formatCancelCard,
   slotsOfferLine,
+  CLARIFY_LINE,
+  RESCHEDULE_HANDOFF_LINE,
   offeredSlots,
   pickSlot,
   movedLine,
@@ -984,6 +986,8 @@ export function createLiveChatFastLane(deps) {
       body,
       thread: context.conversation_recent,
       known: { phone: context.lead?.phone || contact?.phone || null, hasName: hasNameOnRecord },
+      // 2026-10-12 (handoff PR 5): the reschedule path, LEAD_STAGE_MODE=live only.
+      stageLive: leadStageMode() === 'live',
     });
     if (cancelPlan && !reference) {
       // A newer message already arrived: let that turn run the flow, so an
@@ -1421,6 +1425,8 @@ export function createLiveChatFastLane(deps) {
         outOfArea: coverage?.status === 'out',
         buyerStage: Number(liveChatFields?.buyer_stage) || null,
         channel: 'livechat',
+        // 2026-10-12 (PR 5): the cancel flow's reschedule step, when this turn was one.
+        reschedule: rescheduleStepFor(reference?.record?.outcome),
       }),
       capture: { ...capture, ...(reference?.capture || {}) },
       // A reply after a cancel or a move goes out whatever arrives next (Part 8).
@@ -1537,6 +1543,11 @@ export function createLiveChatFastLane(deps) {
       const offered = offeredSlots(plan.offerText, free.slots);
       const chosen = pickSlot(body, offered);
       record.slots_offered = offered.map(x => x.iso);
+      // Live (2026-10-12, handoff PR 5): an unclear pick gets the same two
+      // times once more, never discovery and never a cancel.
+      if (!chosen && plan.stageLive && offered.length === 2 && (plan.offersInFlow || 0) < 2) {
+        return { reply: slotsOfferLine(offered, free.tzLabel), slots: offered.map(x => ({ ...x, tz: x.tz || free.tzLabel })), record: { ...record, outcome: 'offered_slots', reask: true } };
+      }
       if (!chosen) return personReschedules(offered.length ? 'slot_pick_unclear' : 'offered_slots_gone');
       if (!live) return { reply: movedLine(chosen, free.tzLabel), slots: [chosen], record: { ...record, outcome: 'would_reschedule', new_start: chosen.iso } };
       let res = null;
@@ -1561,6 +1572,15 @@ export function createLiveChatFastLane(deps) {
       if (!two.length || !appt.calendar_id) return personReschedules('no_open_slots');
       record.slots_offered = two.map(x => x.iso);
       return { reply: slotsOfferLine(two, free.tzLabel), slots: two.map(x => ({ ...x, tz: x.tz || free.tzLabel })), record: { ...record, outcome: 'offered_slots' } };
+    }
+    // Live (2026-10-12, handoff PR 5; batch 2 #1 got "I've passed your
+    // cancellation" for an unrelated reply): an unclear answer gets ONE
+    // clarifying question; a second unclear one goes to a person to set the
+    // time. Nothing is cancelled and no cancel card is posted.
+    if (plan.answer === 'unclear' && plan.stageLive) {
+      if (!plan.clarified) return { reply: CLARIFY_LINE, record: { ...record, outcome: 'clarify' } };
+      card('reschedule', false);
+      return { reply: RESCHEDULE_HANDOFF_LINE, record: { ...record, outcome: 'reschedule_handoff' } };
     }
     if (plan.answer !== 'cancel') return handoff();
     if (!live) return { reply: doneLine(apptHuman), record: { ...record, outcome: 'would_cancel' } };
