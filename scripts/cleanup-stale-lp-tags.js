@@ -101,7 +101,9 @@ export function formatTable(rows) {
   return [line(head), widths.map((w) => '-'.repeat(w)).join('-+-'), ...body.map(line)].join('\n');
 }
 
-async function defaultDeps() {
+// Exported 2026-10-11 so the MCP tool stale_lp_tags_cleanup_run
+// (src/tools/maintenance-tools.js) runs this exact code, not a second copy.
+export async function defaultDeps() {
   const [{ default: supabase }, { hlRunSQL }, { ghlFetch }, tags] = await Promise.all([
     import('../src/supabase.js'),
     import('../src/admin/hl-client.js'),
@@ -165,14 +167,25 @@ export async function run(argv, deps) {
   deps.log(`\n[stale-lp-tags] calculator leads whose CALL NOW never ran (listed only, nothing fired): ${plan.callNow.length}`);
   if (plan.callNow.length) deps.log(formatTable(plan.callNow));
 
-  const result = { ok: true, live, removals: plan.removals.length, callNow: plan.callNow.length, written: { removed: 0, skipped: 0, failed: 0 } };
+  // 2026-10-11: --max=N caps the live writes in one pass (the MCP tool passes
+  // it so a large backlog cannot outrun a tool call at PACE_MS a write). The
+  // rest are reported as `remaining`; the next pass re-plans from live data.
+  const maxArg = argv.find((a) => a.startsWith('--max='));
+  const max = maxArg ? Math.max(1, Number.parseInt(maxArg.slice(6), 10) || 0) : Infinity;
+  const result = {
+    ok: true, live, removals: plan.removals.length, callNow: plan.callNow.length,
+    plan: { removals: plan.removals, callNow: plan.callNow, skipped: plan.skipped },
+    written: { removed: 0, skipped: 0, failed: 0 }, remaining: 0,
+  };
   if (!live) {
     deps.log('\nDRY RUN — nothing written. Apply with: node scripts/cleanup-stale-lp-tags.js --live');
     return result;
   }
 
-  for (let i = 0; i < plan.removals.length; i += 1) {
-    const r = plan.removals[i];
+  const batch = plan.removals.slice(0, max);
+  result.remaining = plan.removals.length - batch.length;
+  for (let i = 0; i < batch.length; i += 1) {
+    const r = batch[i];
     if (i > 0) await deps.sleep(PACE_MS);
     const tags = await liveTags(deps, r.contact_id);
     if (tags === null) { result.written.skipped += 1; deps.log(`  skip ${r.contact_id}: live contact unreadable`); continue; }
@@ -189,7 +202,7 @@ export async function run(argv, deps) {
       deps.log(`  FAILED ${r.contact_id} ${r.tag}: ${err.message}`);
     }
   }
-  deps.log(`\n[stale-lp-tags] LIVE: removed ${result.written.removed}, skipped ${result.written.skipped}, failed ${result.written.failed}`);
+  deps.log(`\n[stale-lp-tags] LIVE: removed ${result.written.removed}, skipped ${result.written.skipped}, failed ${result.written.failed}${result.remaining ? `, ${result.remaining} left for the next pass` : ''}`);
   result.ok = result.written.failed === 0;
   return result;
 }

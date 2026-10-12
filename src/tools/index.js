@@ -17,6 +17,7 @@ import { registerSalesBoardTools } from './sales-board-tools.js';
 import { registerPayrollTools } from './payroll/index.js';
 import { registerSimulatorTools } from './simulator-tools.js';
 import { registerAiOsTools } from './ai-os-tools.js';
+import { registerMaintenanceTools } from './maintenance-tools.js';
 import { withSanitizedResults } from '../text-sanitize.js';
 import { withInfraGuard } from '../security/infra-guard.js';
 
@@ -97,4 +98,8 @@ export function registerAllTools(rawServer) {
   //   Exact canonical IDs are preferred. Search results always carry lifecycle
   //   and verification state. It cannot approve, activate, enforce, or deploy.
   registerAiOsTools(server);
+  // Maintenance passes (1) — 2026-10-11
+  //   stale_lp_tags_cleanup_run: scripts/cleanup-stale-lp-tags.js run inside
+  //   the service that holds the keys. Dry run by default.
+  registerMaintenanceTools(server);
 }
