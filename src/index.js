@@ -431,11 +431,19 @@ logAuthBootReport();
 // once and runs only the blocks with something missing, so a healthy boot
 // takes no table locks and fires no DDL events. See that file's header for the
 // lock-timeout / schema-cache false alarms this replaced. Never throws.
+//
+// 2026-10-12 (Fix 1): the boot CHECKS and no longer APPLIES. Schema changes
+// are migrations in supabase/migrations/, applied by .github/workflows/
+// db-migrate.yml on merge and recorded in the database's own ledger; a boot
+// that could still write DDL would be a second, unrecorded path. A missing
+// object is still named in the log and paged once to #ops-alerts.
+// STARTUP_SCHEMA_APPLY=true restores the old self-heal (the rollback switch).
 async function runMigrations() {
   try {
     const { runSQL } = await import('./admin/supabase-admin.js');
     const { readFile } = await import('node:fs/promises');
     await runStartupSchema(STARTUP_MIRRORS, {
+      apply: String(process.env.STARTUP_SCHEMA_APPLY || '').trim().toLowerCase() === 'true',
       runSQL,
       readSqlFile: (rel) => readFile(new URL(`../${rel}`, import.meta.url), 'utf8'),
       opsAlert: async (text) => {

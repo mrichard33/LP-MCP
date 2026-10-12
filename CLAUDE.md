@@ -1021,7 +1021,21 @@ answer still has to exist (`LIB-P12`).
 - Reads: wrap in `json_agg(row_to_json(s))`.
 - Writes: assert the row count (`WITH u AS (... RETURNING 1) SELECT count(*) FROM u`). Note the MCP
   query tool reports `rows_affected: "n/a"`, so verify with a follow-up count.
-- DDL goes through the Supabase dashboard.
+- **Schema changes are migrations, applied by CI (Fix 1, 2026-10-12).** Before this, 157 numbered `sql/` files
+  were pasted into the SQL editor by hand and the database's own migration table knew about 8 of them; five
+  repos wrote tables into the LP project with no shared record. Now a schema change is ONE file
+  `supabase/migrations/<YYYYMMDDHHMMSS>_<snake_case>.sql`. `.github/workflows/db-migrate.yml` checks it on
+  the PR (`scripts/check-migrations.js`, then the repo ledger against the database's, then schema drift once
+  the baseline dump exists) and applies it on merge with `supabase db push`. `sql/NNN_*.sql` is FROZEN at 157
+  and CI fails on a 158; `sql/seeds/` (agent_rules, kb_faqs data) is unchanged. The first real file must be
+  the `*_baseline_dump.sql` the workflow's `action=baseline` run produces; until it exists, only commented
+  stubs may live in the folder (the drift check replays the folder into an empty shadow database). A
+  DROP / TRUNCATE / DELETE / column-type change carries `-- destructive: approved by <name> <YYYY-MM-DD>`.
+  Never paste DDL into the dashboard again. The boot-time mirrors (`src/admin/startup-mirrors.js`) now
+  only CHECK and page; `STARTUP_SCHEMA_APPLY=true` is the rollback. The other repos (Reece-Dashboard,
+  n8n, window-calculator, the AI OS loads) add their LP-project DDL HERE, not in their own folders. Full
+  doctrine: `sql/README.md`. This supersedes rule 7 of the `reece-code-shipping` skill ("DDL executes in
+  the Supabase dashboard only; mirror in runMigrations()"), which is Mark's to edit.
 - Deleting from `system_events` can trip `agent_actions_event_id_fkey`. Guard with
   `AND NOT EXISTS (SELECT 1 FROM agent_actions a WHERE a.event_id = e.id)` and delete in batches — a
   single large statement is atomic, so one FK violation rolls the whole thing back.

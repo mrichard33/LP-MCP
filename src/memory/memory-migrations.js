@@ -1,21 +1,21 @@
 /**
  * Memory schema presence check — src/memory/memory-migrations.js
  *
- * The "mirror in runMigrations()" promised for priority #8 (decision #1673),
- * done as a guarded self-heal: at boot, check that the objects sql/090–115
- * create are present; log one WARN line per missing object. Apply the files
- * ONLY when MEMORY_MIGRATIONS_AUTOAPPLY=true — production already has all of
- * them, and the .sql files stay the single definition (never copied into
- * index.js). Files are applied whole through runSQL(), in order, and every
- * statement in them is idempotent (IF NOT EXISTS / CREATE OR REPLACE).
+ * At boot, check that the objects sql/090–115 create are present and log one
+ * WARN line per missing file. It never applies anything.
+ *
+ * History. The "mirror in runMigrations()" promised for priority #8 (decision
+ * #1673) shipped as a guarded self-heal with MEMORY_MIGRATIONS_AUTOAPPLY. Since
+ * Fix 1 (2026-10-12) schema changes are migrations under supabase/migrations/,
+ * applied by .github/workflows/db-migrate.yml and recorded in the database's
+ * own ledger; a boot that could still write DDL would be a second, unrecorded
+ * path. The flag is retired and ignored. The checks stay: a missing memory
+ * object is exactly the kind of silent gap the ledger exists to make visible.
+ *
+ * The sql/ files remain the record of WHAT each check probes for (never copied
+ * into index.js); a new memory object gets a migration AND a row here.
  */
-import fs from 'node:fs';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { runSQL } from '../admin/supabase-admin.js';
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const SQL_DIR = path.join(__dirname, '..', '..', 'sql');
 
 export const MEMORY_MIGRATIONS = [
   { file: '090_claude_memory_context.sql',          check: "SELECT 1 FROM pg_proc WHERE proname = 'claude_memory_context'" },
@@ -48,7 +48,7 @@ export const MEMORY_MIGRATIONS = [
   { file: '115_session_project.sql',                check: "SELECT 1 FROM information_schema.columns WHERE table_name = 'claude_session_logs' AND column_name = 'project'" },
 ];
 
-export async function checkMemorySchema({ sql = runSQL, autoApply = String(process.env.MEMORY_MIGRATIONS_AUTOAPPLY || 'false') === 'true' } = {}) {
+export async function checkMemorySchema({ sql = runSQL } = {}) {
   const missing = [];
   for (const m of MEMORY_MIGRATIONS) {
     try {
@@ -59,19 +59,12 @@ export async function checkMemorySchema({ sql = runSQL, autoApply = String(proce
       missing.push(m);
     }
   }
-  if (!missing.length) { console.log('[MemorySchema] sql/090–115 present'); return { ok: true, missing: [], applied: [] }; }
+  if (!missing.length) { console.log('[MemorySchema] sql/090–115 present'); return { ok: true, missing: [] }; }
   // A file can appear more than once above (sql/101 is checked in two parts);
-  // report and apply it once.
+  // report it once.
   const missingFiles = [...new Set(missing.map((m) => m.file))];
-  for (const f of missingFiles) console.warn(`[MemorySchema] MISSING: ${f} — ${autoApply ? 'applying' : 'set MEMORY_MIGRATIONS_AUTOAPPLY=true to apply at boot, or run the file by hand'}`);
-  const applied = [];
-  if (autoApply) {
-    for (const f of missingFiles) {
-      const text = fs.readFileSync(path.join(SQL_DIR, f), 'utf8');
-      await sql(text);
-      applied.push(f);
-      console.log(`[MemorySchema] applied ${f}`);
-    }
+  for (const f of missingFiles) {
+    console.warn(`[MemorySchema] MISSING: ${f} — nothing is applied at boot; add a migration under supabase/migrations/ (sql/README.md)`);
   }
-  return { ok: applied.length === missingFiles.length, missing: missingFiles, applied };
+  return { ok: false, missing: missingFiles };
 }

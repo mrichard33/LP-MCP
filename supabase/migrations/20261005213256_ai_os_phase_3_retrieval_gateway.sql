@@ -1,0 +1,9 @@
+-- 20261005213256_ai_os_phase_3_retrieval_gateway
+--
+-- ALREADY APPLIED to the LP project; recorded in supabase_migrations.schema_migrations
+-- before this folder existed. This file exists so the Supabase CLI sees the same
+-- history the database does (`supabase db push` refuses to run when the database
+-- lists a version the repo does not have). It is intentionally empty: the schema
+-- it produced is captured by the baseline dump that follows it in this folder.
+--
+-- Schema ai_os, phase 3 (retrieval gateway behind the ai_os_context tool). Applied 2026-10-05; SQL not kept in any repo.

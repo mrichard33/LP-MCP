@@ -1,0 +1,9 @@
+-- 20261005204532_production_baseline_parity
+--
+-- ALREADY APPLIED to the LP project; recorded in supabase_migrations.schema_migrations
+-- before this folder existed. This file exists so the Supabase CLI sees the same
+-- history the database does (`supabase db push` refuses to run when the database
+-- lists a version the repo does not have). It is intentionally empty: the schema
+-- it produced is captured by the baseline dump that follows it in this folder.
+--
+-- A second baseline marker recorded on 2026-10-05. No file was kept for it.
