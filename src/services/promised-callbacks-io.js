@@ -16,7 +16,7 @@ import {
 const AUDIT_REFLAG = 'promised_call_reflag';
 // The simulator's contact id prefix (src/simulator/bot-simulator.js SIM_CONTACT_PREFIX).
 // Not imported: the simulator pulls in the whole live-chat lane.
-const SIM_CONTACT_PREFIX = 'sim-';
+export const SIM_CONTACT_PREFIX = 'sim-';
 
 async function defaults(deps) {
   const out = { ...deps };

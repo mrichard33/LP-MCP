@@ -24,6 +24,7 @@ import { isTeamOpen } from '../agentic/team-hours.js';
 import {
   promisedCallbackMode, keptVerdict, sweepDecision, formatExpiredCard, NEEDS_REVIEW_TAG,
 } from '../agentic/promised-callbacks.js';
+import { SIM_CONTACT_PREFIX } from '../services/promised-callbacks-io.js';
 
 export const JOB_ID = 'promised-callback-sweep';
 const INTERVAL_MS = 15 * 60 * 1000;
@@ -94,6 +95,24 @@ async function readBotSends(d, contactId, sinceIso) {
   return { ids, bodies };
 }
 
+// 2026-10-12 — a row whose contact is not a real GHL contact can never be
+// kept or expired, and every pass failed on it: four sim-quote-* rows from the
+// simulator (10-07, before recordPromiseIfAny refused sim- ids) made all 91
+// passes in three days read "failed" and hid any real error. A simulator row,
+// or a contact GHL no longer has (deleted or merged away), is closed as
+// cancelled. Any other read failure is still an error and changes nothing.
+export function isContactNotFound(err) {
+  const m = String(err?.message || err || '');
+  return /CONTACT_NOT_FOUND|contact not found|→ 404\b/i.test(m);
+}
+
+async function cancelRow(d, promise, reason, stamp) {
+  await d.supabase.from('promised_callbacks')
+    .update({ status: 'cancelled', kept_evidence: { cancelled: reason }, updated_at: stamp })
+    .eq('id', promise.id).eq('status', 'open');
+  d.log(`[PromisedCallbackSweep] #${promise.id} ${promise.ghl_contact_id} cancelled (${reason})`);
+}
+
 /** One pass. Returns a summary for job_runs. */
 export async function runPromisedCallbackSweep(deps = {}) {
   const d = await withDefaults(deps);
@@ -109,9 +128,14 @@ export async function runPromisedCallbackSweep(deps = {}) {
     return { ok: false, mode, errors: [`promised_callbacks unreadable: ${error.message}`] };
   }
 
-  const summary = { ok: true, mode, checked: 0, kept: 0, expired: 0, open: 0, could_not_tell: 0, cards: 0, errors: [] };
+  const summary = { ok: true, mode, checked: 0, kept: 0, expired: 0, cancelled: 0, open: 0, could_not_tell: 0, cards: 0, errors: [] };
   for (const promise of rows || []) {
     summary.checked += 1;
+    if (String(promise.ghl_contact_id || '').startsWith(SIM_CONTACT_PREFIX)) {
+      await cancelRow(d, promise, 'simulated', new Date(nowMs).toISOString());
+      summary.cancelled += 1;
+      continue;
+    }
     let five9Calls = null;
     let ghlMessages = null;
     let botSends = { ids: new Set(), bodies: [] };
@@ -120,6 +144,11 @@ export async function runPromisedCallbackSweep(deps = {}) {
       ghlMessages = await readGhlMessages(d, promise.ghl_contact_id);
       botSends = await readBotSends(d, promise.ghl_contact_id, promise.promised_at);
     } catch (err) {
+      if (isContactNotFound(err)) {
+        await cancelRow(d, promise, 'contact_not_found', new Date(nowMs).toISOString());
+        summary.cancelled += 1;
+        continue;
+      }
       ghlMessages = null;
       summary.errors.push(`ghl ${promise.id}: ${err.message}`);
     }
