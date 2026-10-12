@@ -17,6 +17,7 @@ import {
   checkBaselineOrder,
   checkLegacySqlFrozen,
   parseMigrationList,
+  countLedgerRows,
   filterDrift,
   KNOWN_DRIFT_NOISE,
   isDestructive,
@@ -100,6 +101,24 @@ test('parseMigrationList finds remote-only and local-only versions in both table
   assert.deepEqual(parseMigrationList(ascii), { localOnly: ['20261101000000'], remoteOnly: ['20261005210311'] });
   const box = '    20260728000000 │ 20260728000000 │ 2026-07-28 00:00:00\n                   │ 20261006212452 │ 2026-10-06 21:24:52\n';
   assert.deepEqual(parseMigrationList(box), { localOnly: [], remoteOnly: ['20261006212452'] });
+});
+
+// 2026-10-12: the real CLI output wraps versions in backticks, and a list that
+// could not connect prints no table at all. Both read as a pass before.
+test('parseMigrationList reads the backticked versions the CLI really prints', () => {
+  const real = [
+    '   Local            | Remote           | Time (UTC)            ',
+    '  ------------------|------------------|-----------------------',
+    '   `20260728000000` | `20260728000000` | `2026-07-28 00:00:00` ',
+    '                    | `20261012164849` | `2026-10-12 16:48:49` ',
+  ].join('\n');
+  assert.deepEqual(parseMigrationList(real), { localOnly: [], remoteOnly: ['20261012164849'] });
+  assert.equal(countLedgerRows(real), 2);
+});
+
+test('a ledger list that could not connect has no rows, so it is not a pass', () => {
+  const failed = 'Connecting to remote database...\nfailed to connect to postgres: password authentication failed for user "postgres" (SQLSTATE 28P01)\n';
+  assert.equal(countLedgerRows(failed), 0);
 });
 
 test('sql/NNN is frozen: a 158 fails, 157 and date-named files do not', () => {

@@ -155,6 +155,20 @@ export function checkBaselineOrder(files) {
 }
 
 /**
+ * Rows the ledger table actually printed (2026-10-12). A `migration list` that
+ * could not connect prints an error and no table; parsing that found no
+ * mismatch and the step printed a pass. Zero rows means "could not read".
+ */
+export function countLedgerRows(text) {
+  let n = 0;
+  for (const raw of String(text).split('\n')) {
+    const cols = raw.split(/[|│]/).map((c) => c.trim().replace(/`/g, ''));
+    if (cols.length >= 2 && (/^\d{14}$/.test(cols[0]) || /^\d{14}$/.test(cols[1]))) n += 1;
+  }
+  return n;
+}
+
+/**
  * Parse `supabase migration list --linked`. Any line with a version in the
  * REMOTE column and nothing in LOCAL is a migration the database has and the
  * repo does not: exactly the state Fix 1 exists to end.
@@ -164,7 +178,9 @@ export function parseMigrationList(text) {
   const remoteOnly = [];
   for (const raw of String(text).split('\n')) {
     if (!/\d{14}/.test(raw)) continue;
-    const cols = raw.split(/[|│]/).map((c) => c.trim());
+    // The CLI prints versions in backticks (`20260728000000`); without the
+    // strip nothing ever matched and every mismatch read as a pass (2026-10-12).
+    const cols = raw.split(/[|│]/).map((c) => c.trim().replace(/`/g, ''));
     if (cols.length < 2) continue;
     const local = /^\d{14}$/.test(cols[0]) ? cols[0] : null;
     const remote = /^\d{14}$/.test(cols[1]) ? cols[1] : null;
@@ -275,7 +291,12 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   }
   const listFile = arg('--migration-list');
   if (listFile) {
-    const { localOnly, remoteOnly } = parseMigrationList(readFileSync(listFile, 'utf8'));
+    const listText = readFileSync(listFile, 'utf8');
+    if (countLedgerRows(listText) === 0) {
+      console.error('✗ could not read the database ledger (no rows in `supabase migration list`); see the error above. This is not a pass.');
+      process.exit(1);
+    }
+    const { localOnly, remoteOnly } = parseMigrationList(listText);
     if (remoteOnly.length) {
       console.error(`✗ the database lists ${remoteOnly.length} migration(s) this repo does not: ${remoteOnly.join(', ')}. Add a commented stub for each under ${MIGRATIONS_DIR}/.`);
       process.exit(1);

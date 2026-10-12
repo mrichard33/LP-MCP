@@ -103,6 +103,7 @@ jobs:
       - name: Compare the repo ledger with the database ledger
         if: steps.secrets.outputs.ok == 'true'
         run: |
+          set -o pipefail
           supabase migration list --linked | tee migration-list.txt
           node scripts/check-migrations.js --migration-list migration-list.txt
 
