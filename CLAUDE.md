@@ -556,6 +556,16 @@ thrown error — `runMemoryNightly` and friends catch everything internally and 
 `{ ok: false }`. `interrupted` (a deploy killed the pass) is never `failed`, and a job that
 could not tell is `unknown`. Roster in `src/job-registry.js`; see `docs/job-runs.md`.
 
+**Every `*_MODE` flag is in `src/mode-registry.js` (Fix 2, 2026-10-12).** 91 flags, about half defaulting to shadow, and
+nothing showed which were waiting, since when, or on whose ruling. Each entry gives the default, which values mean
+live/shadow/off, the first commit that read it (`since`), the `decider`, where shadow results land (`evidence`: event
+types, a table, or a job's `job_runs.detail`; empty means logs only) and the go-live test from a ruling, or
+`NEEDS_RULING`. Never invent a go-live test. `registerModes()` (`src/mode-registry-sync.js`) upserts each flag's CURRENT
+value into `feature_modes` at boot, and that table's trigger writes `feature_mode_changes` when a value changes. That is
+the flip record: a flip is still a Railway variable a person sets. `scripts/test-mode-registry.js` scans `src/` for
+`env.X_MODE` / `env?.X_MODE` and fails on a flag with no entry or an entry with no flag. The dashboard's `/modes` page
+reads the table, and the 08:00 ops digest adds one "Shadow-mode review" section on Mondays (14+ days in shadow).
+
 **A deploy must never cut a customer reply off (2026-10-01, Dan H.).** Every Railway deploy SIGTERMs
 the old container, and `src/graceful-shutdown.js` waits only for what it can see. The reply fast path starts
 `executeActionById` without awaiting it, so the drain logged "Drained cleanly after 0ms" twice in 13 minutes

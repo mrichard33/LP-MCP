@@ -17,8 +17,8 @@ import {
   checkBaselineOrder,
   checkLegacySqlFrozen,
   parseMigrationList,
-  pendingMigrationFiles,
   countLedgerRows,
+  pendingMigrationFiles,
   filterDrift,
   KNOWN_DRIFT_NOISE,
   isDestructive,
@@ -181,9 +181,14 @@ test('every known-noise entry says why', () => {
   for (const k of KNOWN_DRIFT_NOISE) assert.ok(k.hash && k.object && k.why.length > 20, k.object);
 });
 
-test('pendingMigrationFiles: only the files the database has not applied are left out of the drift diff', () => {
-  const files = ['20261012164849_baseline_dump.sql', '20261012174130_lead_conversation_stage.sql', 'README.md'];
-  assert.deepEqual(pendingMigrationFiles(files, ['20261012174130']), ['20261012174130_lead_conversation_stage.sql']);
-  assert.deepEqual(pendingMigrationFiles(files, []), []);
-  assert.deepEqual(pendingMigrationFiles(files, null), []);
+// 2026-10-12 (Fix 2): a PR that adds a migration must not read its own new
+// table as drift. The files the database has not applied yet are set aside.
+test('pendingMigrationFiles names only the files the database has not applied', () => {
+  const list = [
+    '   `20261012164849` | `20261012164849` | `2026-10-12 16:48:49` ',
+    '   `20261012180000` |                  | `2026-10-12 18:00:00` ',
+  ].join('\n');
+  const files = ['20261012164849_baseline_dump.sql', '20261012180000_feature_modes.sql', 'README.md'];
+  assert.deepEqual(pendingMigrationFiles(list, files), ['20261012180000_feature_modes.sql']);
+  assert.deepEqual(pendingMigrationFiles(list.split('\n')[0], files), []);
 });
