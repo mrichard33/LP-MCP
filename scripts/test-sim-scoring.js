@@ -276,6 +276,13 @@ test('PR 7: the persona answers what the bot asks (autoAnswer scenarios only)', 
   assert.equal(B7.autoAnswerFor('Is anyone else part of the decision on this, like a spouse or partner?', p), 'Just me.');
   assert.equal(B7.autoAnswerFor('How many windows?', p), null);
   assert.equal(B7.autoAnswerFor('Thanks.', p), null);
+  // Only the asking sentence counts (first eval run: a bridge that mentioned owning the home).
+  assert.equal(B7.autoAnswerFor('Labor is covered as long as you own the home. The next step would be a free visit at your home. Would that help?', p), null);
+  assert.equal(B7.autoAnswerFor('Is anyone else part of the decision? — Reece Team', p), 'Just me.');
+  // Times on the table: picked only once the script is used up.
+  const offer = 'I have tomorrow at 2:00 PM ET or Wed, Oct 14 at 10:00 AM ET. Which works better?';
+  assert.equal(B7.autoAnswerFor(offer, p), null);
+  assert.equal(B7.autoAnswerFor(offer, p, { scriptDone: true }), 'The first one');
   for (const k of ['easy_yes', 'book_it_evening_spouse', 'renter', 'competitor', 'stop_sms', 'stop_chat', 'trick_prompt', 'reschedule_unclear', 'out_of_area_chat', 'houston_tz']) assert.ok(B7.SCENARIOS[k], k);
   assert.equal(B7.SCENARIOS.stop_sms.channels[0], 'sms');
 });
