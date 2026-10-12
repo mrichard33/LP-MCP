@@ -341,6 +341,13 @@ list and per phone per day (`lp_appointment_sync_marks`, claimed before the push
 #ops, once, any lead 30+ dial minutes old with no call, push or reason.
 `findContactInOtherLists` is NOT used here: it has never worked in production (bare-array criteria) and
 `f9_last_list` keeps the last list ever, so a naive fix would block most callbacks.
+**Missed paid callers are judged by their whole call history (2026-10-12).** `src/jobs/missed-caller-recovery.js`
+(`MISSED_CALLER_RECOVERY_MODE`, default shadow) no longer uses `findContactInOtherLists` either: all 264 would_push rows
+read "cross-list check unreadable — failed open". `judgeHistory` reads every Five9 disposition for the number, any
+campaign, in and out, 30 days (`buildHistorySql`, ~3s a pass), and skips a service customer (`Service Call`, or a
+dispatch/service line), anyone we already spoke to (a disposition outside `NO_CONTACT_DISPOSITIONS`, unknown ones
+included, or a 2-minute "No Disposition") and anyone we already called back after their last call. A failed read
+fails closed, like DNC. The blank screen pop (number1 only, no LP CustID) is still a ruling for Mark before live.
 
 **An inquiry waiting in LP's inbound queue is watched, not assumed (2026-10-06).** Every lead we send LP is an inquiry
 (in1) until somebody checks it out into a lead (lds); ~49% wait for a person, 4–15h overnight. `create_lp_lead` no
