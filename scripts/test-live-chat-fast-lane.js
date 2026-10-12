@@ -1294,3 +1294,26 @@ test('a zip the visitor typed reaches the booking-slot read (77494 → Central, 
   assert.ok(calls.length >= 1, 'the calendar read was warmed');
   assert.equal(calls[0].zip, '77494');
 });
+
+// ── 2026-10-12 (handoff PR 3): service-area parity and the renter guard ──
+
+test('a zip typed outside a coverage question is checked; out of area → the one decline (batch 2 #3)', async () => {
+  const { lane, state } = makeLane({ mode: 'shadow', checkServiceArea: fakeLookup, llm: () => ({ message: "There's a good chance we can help. What got you looking at windows?" }) });
+  const out = await lane.processInbound(INBOUND('I need new windows at 55 Main St, New York NY 10001'));
+  assert.deepEqual(state.lookups, ['10001']);
+  assert.equal(firstSentence(out.message), "Sorry, Reece doesn't serve the 10001 area.");
+  assert.doesNotMatch(out.message, /good chance/i);
+});
+
+test('an in-area zip typed outside a coverage question changes nothing', async () => {
+  const { lane } = makeLane({ mode: 'shadow', checkServiceArea: fakeLookup, llm: IGNORES_COVERAGE });
+  const out = await lane.processInbound(INBOUND('my zip code is 32137 and the windows are drafty'));
+  assert.doesNotMatch(out.message, /doesn't serve/);
+});
+
+test('a renter in live chat gets no times (batch 3 T3; active in every mode)', async () => {
+  const { lane } = makeLane({ mode: 'shadow', llm: () => ({ message: "Makes sense, you'll want his okay first. I have Thu, Oct 15 at 10:00 AM ET or Fri, Oct 16 at 2:00 PM ET. Which works better?" }) });
+  const out = await lane.processInbound(INBOUND("I'm renting, my landlord would have to approve it"));
+  assert.doesNotMatch(out.message, /\d{1,2}:\d{2}\s*(?:AM|PM)/);
+  assert.match(out.message, /homeowner needs to be part of the visit/);
+});
