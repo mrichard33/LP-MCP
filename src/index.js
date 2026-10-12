@@ -62,6 +62,7 @@ import { runStartupSchema } from './admin/startup-schema.js';
 import { STARTUP_MIRRORS } from './admin/startup-mirrors.js';
 import { startJobRunner } from './job-runner.js';
 import { JOBS } from './job-registry.js';
+import { registerModes } from './mode-registry-sync.js';
 import { startTier1EmbedSweep } from './knowledge/tier1-semantic.js';
 import { startExemplarSweep } from './knowledge/exemplars.js';
 import { startCiMomentsSweep } from './knowledge/ci-moments.js';
@@ -925,6 +926,10 @@ const server = app.listen(PORT, async () => {
   // stop the service booting.
   await startJobRunner(JOBS).catch((err) =>
     console.error('[JobRunner] startup failed:', err.message));
+  // Every *_MODE flag's current value, for the dashboard's /modes page (Fix 2,
+  // 2026-10-12). Never throws; a missing feature_modes table only logs.
+  await registerModes().catch((err) =>
+    console.error('[ModeRegistry] startup failed:', err.message));
   startTier1EmbedSweep(); // v1.10 — no-op while KB_FAQ_SEMANTIC_MODE=off
   startExemplarSweep();   // v1.11 — no-op while KB_EXEMPLAR_MODE=off
   startCiMomentsSweep();  // v1.12 — no-op while KB_CALL_MOMENTS_MODE=off

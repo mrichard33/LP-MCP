@@ -120,7 +120,19 @@ jobs:
           # rebuild failed ("type public.vector does not exist") the diff wrote
           # nothing and the step printed "No drift." with no comparison run.
           # A diff that cannot run is a failure, never a clean bill.
-          if ! supabase db diff --linked --schema public,ai_os > drift.sql; then
+          # 2026-10-12 (Fix 2): a migration this PR adds is not live yet, so it
+          # is set aside for the diff; otherwise its own new table reads as
+          # drift. `db push` applies it on merge.
+          mkdir -p "$RUNNER_TEMP/pending"
+          PENDING="$(node scripts/check-migrations.js --pending migration-list.txt)"
+          for f in $PENDING; do
+            echo "Not applied yet, left out of the drift check: $f"
+            mv "supabase/migrations/$f" "$RUNNER_TEMP/pending/"
+          done
+          DIFF_OK=true
+          supabase db diff --linked --schema public,ai_os > drift.sql || DIFF_OK=false
+          for f in $PENDING; do mv "$RUNNER_TEMP/pending/$f" supabase/migrations/; done
+          if [ "$DIFF_OK" != true ]; then
             echo "::error::The drift check could not run (see the error above), so nothing was compared. Fix the cause; do not read this as no drift."
             exit 1
           fi
