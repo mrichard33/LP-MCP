@@ -19,7 +19,7 @@ import assert from 'node:assert/strict';
 
 import {
   normalizeCallerPhone, classifyCaller, summarizeCallers, formatDailySummary, isCandidate,
-  LP_LEAD_ID_FIELD, LABELS,
+  LP_LEAD_ID_FIELD, LABELS, notALeadReason, LEAD_DISPOSITIONS,
 } from '../src/inbound-caller-classify.js';
 import {
   runInboundCapture, runInboundCaptureSummary, dryRun, captureCaller, buildApprovalAction,
@@ -180,31 +180,31 @@ const none = { status: 'none' };
 const noJob = { status: 'no' };
 
 test('label: no GHL contact, no LP lead → no_ghl_contact (a candidate)', () => {
-  const r = classifyCaller({ caller: P }, { five9Dnc: new Set(), lpPhones: new Set(), ghl: none });
+  const r = classifyCaller({ caller: P, disposition: 'Appointment Set' }, { five9Dnc: new Set(), lpPhones: new Set(), ghl: none });
   assert.equal(r.label, 'no_ghl_contact');
   assert.equal(isCandidate(r.label), true);
 });
 
 test('label: GHL contact, no LP lead, no job → has_ghl_contact (a candidate)', () => {
-  const r = classifyCaller({ caller: P }, { five9Dnc: new Set(), lpPhones: new Set(), ghl: found(), lpJob: noJob });
+  const r = classifyCaller({ caller: P, disposition: 'Appointment Set' }, { five9Dnc: new Set(), lpPhones: new Set(), ghl: found(), lpJob: noJob });
   assert.equal(r.label, 'has_ghl_contact');
   assert.equal(isCandidate(r.label), true);
 });
 
 test('label: Five9 DNC → dnc, even with a GHL contact (first match wins)', () => {
-  const r = classifyCaller({ caller: P }, { five9Dnc: new Set([P]), lpPhones: new Set(), ghl: found(), lpJob: noJob });
+  const r = classifyCaller({ caller: P, disposition: 'Appointment Set' }, { five9Dnc: new Set([P]), lpPhones: new Set(), ghl: found(), lpJob: noJob });
   assert.equal(r.label, 'dnc');
 });
 
 // 2026-10-07: stop-bot turns the bot off; it is not a DNC (the user's ruling).
 test('label: stop-bot alone is not dnc — the caller is still captured and dialed', () => {
-  const r = classifyCaller({ caller: P }, { five9Dnc: new Set(), lpPhones: new Set(), ghl: found({ tags: ['stop-bot'] }), lpJob: noJob });
+  const r = classifyCaller({ caller: P, disposition: 'Appointment Set' }, { five9Dnc: new Set(), lpPhones: new Set(), ghl: found({ tags: ['stop-bot'] }), lpJob: noJob });
   assert.notEqual(r.label, 'dnc');
 });
 
 for (const tag of ['dnc', 'dnc-sms', 'stage:dnc', 'do-not-contact', 'DNC']) {
   test(`label: GHL tag ${tag} → dnc, and beats already_in_lp and existing_customer`, () => {
-    const r = classifyCaller({ caller: P }, {
+    const r = classifyCaller({ caller: P, disposition: 'Appointment Set' }, {
       five9Dnc: new Set(), lpPhones: new Set([P]), ghl: found({ tags: [tag, 'customer'] }), lpJob: { status: 'yes' },
     });
     assert.equal(r.label, 'dnc');
@@ -212,25 +212,25 @@ for (const tag of ['dnc', 'dnc-sms', 'stage:dnc', 'do-not-contact', 'DNC']) {
 }
 
 test('label: a failed GHL read is unverified — never no_ghl_contact', () => {
-  const r = classifyCaller({ caller: P }, { five9Dnc: new Set(), lpPhones: new Set(), ghl: { status: 'error' } });
+  const r = classifyCaller({ caller: P, disposition: 'Appointment Set' }, { five9Dnc: new Set(), lpPhones: new Set(), ghl: { status: 'error' } });
   assert.equal(r.label, 'unverified');
   assert.equal(isCandidate(r.label), false);
 });
 
 test('label: a failed GHL read still loses to Five9 DNC', () => {
-  const r = classifyCaller({ caller: P }, { five9Dnc: new Set([P]), lpPhones: new Set(), ghl: { status: 'error' } });
+  const r = classifyCaller({ caller: P, disposition: 'Appointment Set' }, { five9Dnc: new Set([P]), lpPhones: new Set(), ghl: { status: 'error' } });
   assert.equal(r.label, 'dnc');
 });
 
 test('label: an LP lead that arrived since the view ran → already_in_lp, beating existing_customer', () => {
-  const r = classifyCaller({ caller: P }, {
+  const r = classifyCaller({ caller: P, disposition: 'Appointment Set' }, {
     five9Dnc: new Set(), lpPhones: new Set([P]), ghl: found({ tags: ['customer'] }), lpJob: { status: 'yes' },
   });
   assert.equal(r.label, 'already_in_lp');
 });
 
 test('label: GHL contact carrying an LP Lead ID → already_in_lp', () => {
-  const r = classifyCaller({ caller: P }, {
+  const r = classifyCaller({ caller: P, disposition: 'Appointment Set' }, {
     five9Dnc: new Set(), lpPhones: new Set(),
     ghl: found({ customFields: [{ id: LP_LEAD_ID_FIELD, value: '571234' }] }), lpJob: noJob,
   });
@@ -238,17 +238,17 @@ test('label: GHL contact carrying an LP Lead ID → already_in_lp', () => {
 });
 
 test('label: customer tag → existing_customer', () => {
-  const r = classifyCaller({ caller: P }, { five9Dnc: new Set(), lpPhones: new Set(), ghl: found({ tags: ['Customer'] }), lpJob: noJob });
+  const r = classifyCaller({ caller: P, disposition: 'Appointment Set' }, { five9Dnc: new Set(), lpPhones: new Set(), ghl: found({ tags: ['Customer'] }), lpJob: noJob });
   assert.equal(r.label, 'existing_customer');
 });
 
 test('label: an LP job → existing_customer', () => {
-  const r = classifyCaller({ caller: P }, { five9Dnc: new Set(), lpPhones: new Set(), ghl: found(), lpJob: { status: 'yes' } });
+  const r = classifyCaller({ caller: P, disposition: 'Appointment Set' }, { five9Dnc: new Set(), lpPhones: new Set(), ghl: found(), lpJob: { status: 'yes' } });
   assert.equal(r.label, 'existing_customer');
 });
 
 test('label: a failed LP job read on a contact → unverified, not a candidate', () => {
-  const r = classifyCaller({ caller: P }, { five9Dnc: new Set(), lpPhones: new Set(), ghl: found(), lpJob: { status: 'error' } });
+  const r = classifyCaller({ caller: P, disposition: 'Appointment Set' }, { five9Dnc: new Set(), lpPhones: new Set(), ghl: found(), lpJob: { status: 'error' } });
   assert.equal(r.label, 'unverified');
 });
 
@@ -386,6 +386,75 @@ test('live: enrolls each candidate once through the enroll path; a new caller ge
   // Never touched: DNC, in LP, customer.
   for (const p of ['8130000003', '8130000004', '8130000005']) assert.equal(by[p].action_taken, 'none');
   assert.equal(w.db.tables.agent_actions.length, 0);
+});
+
+/* --- not_a_lead (2026-10-12): what the call said, and the Main Number line -- */
+
+test('not a lead: refusals are never captured; the 42 shadow refusals', () => {
+  for (const d of ['Not Interested', 'Cant Do Project', 'Below Minimum', 'Kicked', 'Out of Area', 'Bought Competition', 'Renter - mobile home']) {
+    assert.match(notALeadReason({ disposition: d, campaign: 'Google PPC Windows' }) || '', /not a sales lead/, d);
+  }
+});
+
+test('not a lead: an unknown or missing disposition is not a lead (allow list, the safe side)', () => {
+  assert.ok(notALeadReason({ disposition: 'Something New', campaign: 'Google PPC Windows' }));
+  assert.ok(notALeadReason({ disposition: null, campaign: 'Google PPC Windows' }));
+});
+
+test('not a lead: every allow-listed disposition is a lead on a paid line', () => {
+  for (const d of LEAD_DISPOSITIONS) assert.equal(notALeadReason({ disposition: d, campaign: 'FTL Sticky' }), null, d);
+});
+
+test('not a lead: Main Number is left alone, except an appointment set there', () => {
+  assert.match(notALeadReason({ disposition: 'Hung Up', campaign: 'Main Number' }) || '', /Main Number/);
+  assert.equal(notALeadReason({ disposition: 'Appointment Set', campaign: 'Main Number' }), null);
+});
+
+test('not a lead: the label comes before any GHL read, and after DNC', () => {
+  const r = classifyCaller({ caller: P, disposition: 'Not Interested' }, { five9Dnc: new Set(), lpPhones: new Set(), ghl: { status: 'error' } });
+  assert.equal(r.label, 'not_a_lead');
+  assert.equal(isCandidate(r.label), false);
+  const d = classifyCaller({ caller: P, disposition: 'Not Interested' }, { five9Dnc: new Set([P]), lpPhones: new Set(), ghl: none });
+  assert.equal(d.label, 'dnc');
+});
+
+test('live: a refusal and a Main Number caller are never actioned, and never looked up in GHL', async () => {
+  const w = world({ view: [
+    call('8130000011', { disposition: 'Not Interested' }),
+    call('8130000012', { campaign: 'Main Number', disposition: 'NA' }),
+  ] });
+  const out = await runInboundCapture({ env: env('live'), nowMs: NOW, deps: w.deps });
+  assert.equal(out.ok, true, JSON.stringify(out));
+  assert.equal(w.enrolls.length, 0);
+  assert.equal(w.created.length, 0);
+  assert.equal(w.ghlCalls.length, 0, 'no GHL read for a call that is not a lead');
+  for (const r of w.db.tables[TABLE]) {
+    assert.equal(r.label, 'not_a_lead');
+    assert.equal(r.action_taken, 'none');
+  }
+});
+
+test('the newest call decides: a refusal after a hang-up is not captured; a callback after a refusal is', async () => {
+  // Newest first, as the view query orders it (ORDER BY call_at DESC).
+  const w = world({ view: [
+    call('8130000021', { disposition: 'Not Interested', call_at: '2026-09-27T12:00:00.000Z' }),
+    call('8130000022', { disposition: 'Callback', call_at: '2026-09-27T12:00:00.000Z' }),
+    call('8130000021', { disposition: 'Hung Up', call_at: '2026-09-27T10:00:00.000Z' }),
+    call('8130000022', { disposition: 'Not Interested', call_at: '2026-09-27T10:00:00.000Z' }),
+  ] });
+  await runInboundCapture({ env: env('live'), nowMs: NOW, deps: w.deps });
+  assert.equal(w.enrolls.length, 1);
+  const rows = w.db.tables[TABLE];
+  assert.ok(rows.filter((r) => r.caller_phone === '8130000021').every((r) => r.label === 'not_a_lead' && r.action_taken === 'none'));
+  assert.ok(rows.some((r) => r.caller_phone === '8130000022' && r.action_taken === 'contact_created_enrolled'));
+});
+
+test('the daily summary counts not-a-lead callers as left alone', () => {
+  assert.ok(LABELS.includes('not_a_lead'));
+  const s = summarizeCallers([{ caller_phone: P, call_at: '2026-09-27T12:00:00Z', label: 'not_a_lead', disposition: 'Kicked', team: 'lightfire' }]);
+  assert.equal(s.by_label.not_a_lead, 1);
+  assert.equal(s.candidates, 0);
+  assert.match(formatDailySummary({ runDate: '2026-09-27', mode: 'shadow', summary: s }), /not a lead 1/);
 });
 
 test('live: a caller already in LP is never actioned', async () => {

@@ -78,6 +78,7 @@ import { hourET, todayET } from './lp-report-common.js';
 import { alertDigestEnabled } from '../alert-posted.js';
 import {
   classifyCaller, isCandidate, normalizeCallerPhone, summarizeCallers, formatDailySummary, isAppointmentSet,
+  notALeadReason,
 } from '../inbound-caller-classify.js';
 
 export const JOB_ID = 'inbound-caller-capture';
@@ -261,13 +262,26 @@ export async function classifyCallers(viewRows, { deps = {} } = {}) {
     lpPhones = phones.length ? await readLpPhones({ runSQL: d.runSQL, phones }) : new Set();
   } catch (err) { return insufficient('lp_leads race check', err); }
 
-  // GHL, once per phone. A Five9-DNC caller is not looked up at all: nothing
-  // about GHL can change that label, and it saves the token.
+  // The caller's NEWEST call decides whether they are a lead (2026-10-12): a
+  // "Hung Up" on Monday followed by "Not Interested" on Tuesday is not one,
+  // and the other way round is.
+  const newestByPhone = new Map();
+  for (const r of calls) {
+    const prev = newestByPhone.get(r.caller_phone);
+    if (!prev || Date.parse(r.call_at) > Date.parse(prev.call_at)) newestByPhone.set(r.caller_phone, r);
+  }
+  const notALeadByPhone = new Map(
+    [...newestByPhone].map(([p, r]) => [p, notALeadReason(r) ? `newest call: ${notALeadReason(r)}` : null]),
+  );
+
+  // GHL, once per phone. A Five9-DNC caller, or one whose newest call was not
+  // a lead, is not looked up at all: nothing about GHL can change that label,
+  // and it saves the token (several seconds per caller).
   const ghlByPhone = new Map();
   let consecutive = 0;
   let ghlErrors = 0;
   for (const p of phones) {
-    if (five9Dnc.has(p)) continue;
+    if (five9Dnc.has(p) || notALeadByPhone.get(p)) continue;
     if (consecutive >= MAX_CONSECUTIVE_GHL_ERRORS) {
       ghlByPhone.set(p, { status: 'error', error: 'skipped after repeated GHL failures' });
       ghlErrors += 1;
@@ -289,10 +303,12 @@ export async function classifyCallers(viewRows, { deps = {} } = {}) {
   }
 
   const rows = calls.map((r) => {
-    const ghl = ghlByPhone.get(r.caller_phone) || { status: five9Dnc.has(r.caller_phone) ? 'none' : 'error' };
+    const notALead = notALeadByPhone.get(r.caller_phone) || null;
+    const skipped = five9Dnc.has(r.caller_phone) || notALead;
+    const ghl = ghlByPhone.get(r.caller_phone) || { status: skipped ? 'none' : 'error' };
     const cid = ghl.status === 'found' ? String(ghl.contact.id) : null;
     const lpJob = !cid ? null : lpJobContacts ? { status: lpJobContacts.has(cid) ? 'yes' : 'no' } : { status: 'error' };
-    const { label, why } = classifyCaller({ caller: r.caller_phone }, { five9Dnc, lpPhones, ghl, lpJob });
+    const { label, why } = classifyCaller({ caller: r.caller_phone }, { five9Dnc, lpPhones, ghl, lpJob, notALead });
     return { ...r, label, why, ghl_contact_id: cid };
   });
 
@@ -591,7 +607,7 @@ export async function runInboundCapture({ env = process.env, nowMs = Date.now(),
   }
 
   const s = m.summary;
-  const line = `callers=${s.callers} candidates=${s.candidates} dnc=${s.by_label.dnc} in_lp=${s.by_label.already_in_lp}`
+  const line = `callers=${s.callers} candidates=${s.candidates} dnc=${s.by_label.dnc} not_lead=${s.by_label.not_a_lead} in_lp=${s.by_label.already_in_lp}`
     + ` customer=${s.by_label.existing_customer} unverified=${s.by_label.unverified} stored=${stored}`
     + ` queued=${tally.queued} created=${tally.created} already=${tally.already} failed=${tally.failed}`;
   d.log.log(`[InboundCapture] ${cfg.mode} ${cfg.lookbackHours}h — ${line}`);
