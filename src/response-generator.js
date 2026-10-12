@@ -404,6 +404,7 @@ import { holdLine, COLLECT_ASK, dmAsk, parseDecisionMakers } from './agentic/boo
 import { contactRecheckLine, recheckHint, RECHECK_RX } from './agentic/contact-check.js';
 import { smsBookingTurn, enforceBookingFacts, bookingFactsNote } from './agentic/sms-booking-turn.js';
 import { LINES as NEPQ_LINES } from './agentic/nepq-planner.js';
+import { buildStageInput } from './agentic/lead-stage.js';
 import { isCustomerP2 } from './agentic/lead-state/signals/context-reader.js';
 import { isUnsoldPostDemo, lpSold, postDemoOwnerName, replaceSalesRepFollowUp } from './agentic/post-demo-owner.js';
 import { postDemoPlannerMode } from './agentic/post-demo-turn.js';
@@ -5321,6 +5322,21 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     booking_hold_backed: (!!bookingFacts && (bookingFacts.kind === 'hold' || bookingFacts.kind === 'collect')) || !!validated.nepq_plan?.held,
     slot_timezone_for_truth: promptTimezoneFor(context),
     lead_first_name: context.lead?.first_name || null,
+    // 2026-10-12 (Lead Conversation Stage): what the send handler hands to the
+    // stage recorder after the send (src/services/lead-stage-io.js). In memory
+    // only; the stored row holds codes and our own time labels.
+    lead_stage_input: buildStageInput({
+      conversation: context.conversation_recent || [],
+      trigger: triggerMessage,
+      plan: nepqPlan,
+      zip: serviceAreaTurn?.coverage?.zip || identityState?.identity?.postal_code || null,
+      market: serviceAreaTurn?.coverage?.market_code || context.market?.market_code || null,
+      tz: promptTimezoneFor(context),
+      outOfArea: (serviceArea?.checked && serviceArea.in_service_area === false) || serviceAreaTurn?.coverage?.status === 'out',
+      rehash: !!rehash,
+      buyerStage,
+      channel,
+    }),
     // v2.7.14 — Bot Review Phase 0 replay context. Assembled from values already
     // in scope; nothing is fetched and nothing is written here. The send handler
     // hands it to recordMessageContext() with the action id as message_ref.

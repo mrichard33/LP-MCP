@@ -41,6 +41,8 @@ import { postToSlack } from '../slack.js';
 import { fileBotCallback } from '../agentic/bot-callback.js';
 import { botCallbackDeps, nepqHandoffDeps } from '../services/bot-callback-io.js';
 import { guardRepeatPromise, recordPromiseIfAny } from '../services/promised-callbacks-io.js';  // 2026-10-07
+import { recordTurnStage } from '../services/lead-stage-io.js';  // 2026-10-12
+import { trackBackground } from '../graceful-shutdown.js';
 import { fetchFreeSlots, selectOfferableSlots } from '../knowledge/calendar-availability.js';
 import { extractPreferredTime } from '../services/preferred-time.js';
 import { BOOKING_CALENDARS, inHomeCalendarFor } from '../knowledge/booking-calendar-router.js';
@@ -445,6 +447,8 @@ export function productionLaneDeps() {
     nepqHandoff,
     guardRepeatPromise: (p) => guardRepeatPromise(p),
     recordPromise: (p) => recordPromiseIfAny(p),
+    // Fire-and-forget: the stage never holds up a reply (lead-stage-io.js).
+    recordLeadStage: (p) => { trackBackground(recordTurnStage(p).catch(() => {})); return null; },
     contactUrl: (id) => (id ? `https://app.gohighlevel.com/v2/location/${GHL_LOCATION_ID}/contacts/detail/${id}` : null),
   };
 }

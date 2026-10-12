@@ -31,8 +31,19 @@ import { callbackDecision, schedulingCallbackDecision, NO_DIAL_REASONS } from '.
 import { applyBookingTruth } from '../agentic/booking-claim.js';
 import { buildLeadFacts } from '../agentic/lead-facts.js';
 import { scoreRun, compareScorecards } from './sim-scoring.js';
+import { createMemoryStageStore, recordStage, recordBookedStage } from '../services/lead-stage-io.js';
+import { leadStageMode } from '../agentic/lead-stage.js';
 
 export const SIM_CONTACT_PREFIX = 'sim-';
+
+// 2026-10-12 (Lead Conversation Stage): every simulated run keeps its stage in
+// memory and never writes GHL or Supabase. With LEAD_STAGE_MODE=off the stage
+// is still computed here (as shadow), so a test run always shows it.
+function simStageDeps() {
+  const mode = leadStageMode();
+  return { store: createMemoryStageStore(), mirror: false, allowSim: true, env: { LEAD_STAGE_MODE: mode === 'off' ? 'shadow' : mode }, log: () => {}, warn: () => {} };
+}
+const stageNote = (r) => (r && r.after ? { before: r.before || null, after: r.after, reason: r.reason } : null);
 
 const GUEST = { firstName: 'Guest', lastName: 'Visitor sim01', phone: null, email: null, postalCode: null };
 const RICK = { firstName: 'Rick', lastName: 'Fox', phone: '+13525550188', email: null, postalCode: '34470' };
@@ -126,6 +137,8 @@ export async function simulateLiveChat(plan, { nepqMode = 'live', productionDeps
   let sent = [];
   const record = (kind, detail) => { effects.push({ turn: currentTurn, kind, ...detail }); };
   let currentTurn = 0;
+  const stageDeps = simStageDeps();
+  let turnStage = null;
   const holder = plan.appointmentHolder || null;
   const holderAppt = holder ? {
     appointment_id: 'sim-appt-1', calendar_id: BOOKING_CALENDARS.WINDOW_ESTIMATE,
@@ -162,7 +175,8 @@ export async function simulateLiveChat(plan, { nepqMode = 'live', productionDeps
     cancelAppointment: async (a) => { record('would_cancel_in_ghl', { appointment_id: a.appointmentId }); return { ok: true }; },
     rescheduleAppointment: async (a) => { record('would_move_same_appointment_in_ghl', { appointment_id: a.oldAppointmentId, new_start: a.startIso }); return { ok: true }; },
     postCancelCard: async (a) => { record('would_post_dispatch_card', { card: a.kind, text: String(a.text || '').slice(0, 400) }); return { ok: true }; },
-    bookSlot: async (a) => { record('would_book', { start: a.startIso }); return { ok: true, action_id: 0 }; },
+    bookSlot: async (a) => { record('would_book', { start: a.startIso }); await recordBookedStage({ contactId, channel: 'livechat', source: 'sim' }, stageDeps); return { ok: true, action_id: 0 }; },
+    recordLeadStage: async (a) => { turnStage = stageNote(await recordStage(a, stageDeps)); return turnStage; },
     // 2026-10-09: the production deps write a promised_callbacks row and can
     // re-flag one in #contact-center. Four sim-quote-* rows reached the live
     // table on 2026-10-07. Recorded here, never done.
@@ -185,6 +199,7 @@ export async function simulateLiveChat(plan, { nepqMode = 'live', productionDeps
     const at = new Date(nowMs + i * 60000).toISOString();
     thread.push({ direction: 'inbound', text, at });
     const before = sent.length;
+    turnStage = null;
     const t0 = Date.now();
     const out = await lane.processInbound({ contactId, conversationId: 'sim-conversation', messageId: `sim-${nowMs}-${i}`, body: text, dateAdded: at });
     const replies = sent.slice(before);
@@ -198,6 +213,7 @@ export async function simulateLiveChat(plan, { nepqMode = 'live', productionDeps
       outcome: out?.outcome || null,
       nepq: er.nepq || null,
       flow: er.cancel_flow?.outcome || er.cancel_flow?.step || null,
+      stage: turnStage,
       seconds: Math.round((Date.now() - t0) / 100) / 10,
     });
   };
@@ -211,7 +227,7 @@ export async function simulateLiveChat(plan, { nepqMode = 'live', productionDeps
     const t0 = Date.now();
     const outs = await Promise.all(plan.turns.slice(0, 2).map((body, i) =>
       new Promise(r => setTimeout(r, i * 50)).then(() => lane.processInbound({ contactId, conversationId: 'sim-conversation', messageId: `sim-${nowMs}-b${i}`, body, dateAdded: at }))));
-    transcript.push({ turn: 1, customer: plan.turns.slice(0, 2).join('  +  '), bot: sent.slice(), outcome: outs.map(o => o?.outcome).join(' / '), seconds: Math.round((Date.now() - t0) / 100) / 10 });
+    transcript.push({ turn: 1, customer: plan.turns.slice(0, 2).join('  +  '), bot: sent.slice(), outcome: outs.map(o => o?.outcome).join(' / '), stage: turnStage, seconds: Math.round((Date.now() - t0) / 100) / 10 });
   } else {
     for (let i = 0; i < plan.turns.length; i++) await runTurn(plan.turns[i], i);
   }
@@ -231,6 +247,7 @@ export async function simulateSms(plan, { nepqMode = 'live', generate, buildReal
   const contact = { firstName: /^guest$/i.test(p.firstName || '') ? null : p.firstName, lastName: /^guest$/i.test(p.firstName || '') ? null : p.lastName, phone: p.phone || '+15555550100', email: p.email, postalCode: p.postalCode, tags: [] };
   const thread = [];
   const transcript = [];
+  const stageDeps = simStageDeps();
   for (let i = 0; i < plan.turns.length; i++) {
     const text = plan.turns[i];
     const at = new Date(nowMs + i * 60000).toISOString();
@@ -286,10 +303,19 @@ export async function simulateSms(plan, { nepqMode = 'live', generate, buildReal
         : { kind: cb.card === false ? 'would_file_callback_five9' : 'would_file_callback_five9_and_contact_center', reason: `${cb.reason}, ${cb.why}` });
     }
     if (generated?.companion_action) wouldDo.push({ kind: `would_${generated.companion_action.action_type}`, payload: generated.companion_action.action_payload || null });
+    // The stage after this turn, as the send handler would record it. A
+    // booking companion stands in for the real booking event.
+    let stage = null;
+    if (reply && generated?.lead_stage_input) {
+      if (generated.companion_action?.action_type === 'book_appointment') await recordBookedStage({ contactId, channel: 'sms', source: 'sim' }, stageDeps);
+      stage = stageNote(await recordStage({ contactId, input: generated.lead_stage_input, reply, channel: 'sms' }, stageDeps));
+    } else if (generated?.short_circuit && String(generated.intent_class || '').toUpperCase() === 'STOP') {
+      stage = stageNote(await recordStage({ contactId, channel: 'sms', ctx: { optedOut: true } }, stageDeps));
+    }
     transcript.push({
       turn: i + 1, customer: text, bot: reply ? [reply] : null, error,
       redrafted: !!note, redraft_guard: attempts.find(a => a.guard)?.guard || null, attempts, intent: generated?.intent_class || null, nepq: generated?.nepq_plan || null,
-      would_do: wouldDo, seconds: Math.round((Date.now() - t0) / 100) / 10,
+      would_do: wouldDo, stage, seconds: Math.round((Date.now() - t0) / 100) / 10,
     });
   }
   return { channel: 'sms', scenario: plan.key, title: plan.title, nepq_mode: nepqMode, contact_id: plan.contactId || null, transcript };
@@ -331,6 +357,7 @@ export function formatTranscript(result) {
     for (const w of t.would_do || []) notes.push(`${w.kind}${w.reason ? `:${w.reason}` : ''}`);
     notes.push(`${t.seconds}s`);
     lines.push(`            [${notes.join(' | ')}]`);
+    if (t.stage) lines.push(`            stage: ${t.stage.before || '(none)'} → ${t.stage.after} (${t.stage.reason})`);
   }
   for (const w of result.would_do || []) {
     if (w.kind === 'warning') { lines.push(`  ⚠ ${w.line}`); continue; }

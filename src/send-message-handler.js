@@ -299,6 +299,7 @@ import { resolveContactInfo, resolveLPProspectId } from './actions/resolvers.js'
 import { notifyRehashCall } from './notifications/rehash-call.js';
 import { filePostDemoFollowUp } from './services/post-demo-followup-io.js';
 import { trackBackground } from './graceful-shutdown.js';
+import { recordTurnStage, recordOptOutStage } from './services/lead-stage-io.js';
 import { buildNotificationEnrichment, buildRichNotification, resolveMarket } from './actions/enrichment.js';
 // 2026-07-03 rebuild (Steve Nkzhm incident) — channel/identity inheritance,
 // AI-disclosure hard guard, per-contact supersession check.
@@ -3420,6 +3421,11 @@ export async function executeSendMessage(action, context) {
         // ── SHORT-CIRCUIT handling (compliance gate fired) ──
         // Intentional compliance gate, NOT an error — never fall back here.
         if (generated.short_circuit) {
+          // 2026-10-12 (Lead Conversation Stage): a STOP is answered with
+          // silence, so no turn is recorded; the stage is, as opted_out.
+          if (String(generated.intent_class || '').toUpperCase() === 'STOP') {
+            trackBackground(recordOptOutStage({ contactId, channel }).catch(() => {}));
+          }
           return await handleShortCircuit(contactId, generated, action, context, {
             channel,
             replyContext,
@@ -4417,6 +4423,14 @@ export async function executeSendMessage(action, context) {
       trackBackground(filePostDemoFollowUp({
         contactId, deferral: generated.post_demo_deferral, firstName: firstWord, triggerMessage: replyTriggerMessage,
       }).catch(err => console.warn(`[SendMessage] post-demo follow-up filing failed for ${contactId}: ${err.message}`)));
+    }
+
+    // 2026-10-12 (Lead Conversation Stage): where this conversation is now
+    // that the reply went out. Fire-and-forget, never fails the send.
+    if (generated?.lead_stage_input) {
+      trackBackground(recordTurnStage({
+        contactId, input: generated.lead_stage_input, reply: message, channel,
+      }).catch(err => console.warn(`[SendMessage] lead stage record failed for ${contactId}: ${err.message}`)));
     }
 
     // GroupMe notification (v3.6: rich format). If any resolver fails,
