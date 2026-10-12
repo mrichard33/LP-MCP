@@ -17,6 +17,8 @@ import {
   checkBaselineOrder,
   checkLegacySqlFrozen,
   parseMigrationList,
+  filterDrift,
+  KNOWN_DRIFT_NOISE,
   isDestructive,
   hasCode,
   runChecks,
@@ -126,4 +128,35 @@ test('every stub says why it is empty', () => {
     if (hasCode(sql)) continue;
     assert.match(sql, /ALREADY APPLIED/, `${n}: a stub must say it was already applied`);
   }
+});
+
+// 2026-10-12: the first real drift run on the baseline listed one view whose
+// definition is identical on both sides (a dropped-column attnum gap in
+// lp_leads). It is pinned by statement hash; anything else is still drift.
+const VIEW_DRIFT = readFileSync(path.join(ROOT, 'scripts/fixtures/drift-v-supabase-freshness.sql'), 'utf8');
+
+test('the pinned build artefact is ignored, and only it', () => {
+  const { remaining, ignored } = filterDrift(VIEW_DRIFT);
+  assert.equal(remaining.length, 0);
+  assert.deepEqual(ignored.map((k) => k.object), ['public.v_supabase_freshness']);
+});
+
+test('a real edit to the same view is drift again', () => {
+  const edited = VIEW_DRIFT.replace("'365 days'", "'30 days'");
+  const { remaining } = filterDrift(edited);
+  assert.equal(remaining.length, 1);
+});
+
+test('any other statement next to the artefact is reported', () => {
+  const { remaining, ignored } = filterDrift(`${VIEW_DRIFT}\nalter table "public"."lp_leads" add column "x" text;\n`);
+  assert.equal(ignored.length, 1);
+  assert.deepEqual(remaining, ['alter table "public"."lp_leads" add column "x" text']);
+});
+
+test('empty diff output is no drift', () => {
+  assert.deepEqual(filterDrift('\n\n'), { remaining: [], ignored: [] });
+});
+
+test('every known-noise entry says why', () => {
+  for (const k of KNOWN_DRIFT_NOISE) assert.ok(k.hash && k.object && k.why.length > 20, k.object);
 });

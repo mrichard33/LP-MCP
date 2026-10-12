@@ -123,12 +123,14 @@ jobs:
             echo "::error::The drift check could not run (see the error above), so nothing was compared. Fix the cause; do not read this as no drift."
             exit 1
           fi
-          if [ -s drift.sql ] && grep -vqE '^\s*(--.*)?$' drift.sql; then
+          # check-migrations.js drops only the pinned build artefacts in
+          # KNOWN_DRIFT_NOISE (each by the hash of its exact statement) and
+          # fails on anything else.
+          if ! node scripts/check-migrations.js --drift drift.sql; then
             echo "::error::The live schema differs from the migrations in this repo. Either add a migration for the change, or someone changed the database by hand."
             cat drift.sql
             exit 1
           fi
-          echo "No drift."
 
   push:
     name: Apply new migrations

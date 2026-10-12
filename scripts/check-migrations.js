@@ -25,6 +25,7 @@
 
 import { readdirSync, readFileSync, existsSync } from 'node:fs';
 import { execSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -173,6 +174,50 @@ export function parseMigrationList(text) {
   return { localOnly, remoteOnly };
 }
 
+/**
+ * Drift statements that are artefacts of how the live database was BUILT, not
+ * differences in what it IS. Each entry is pinned by the hash of the exact
+ * statement `supabase db diff` prints, so a real edit to the same object
+ * changes the hash and fails the check again. Never add an entry without the
+ * reason and the evidence.
+ */
+export const KNOWN_DRIFT_NOISE = [
+  {
+    // 2026-10-12: lp_leads once had a column that was later dropped, so live
+    // lp_verified_at is attnum 60 while a database rebuilt from the baseline
+    // has it at 59. The view text is identical on both sides; the differ
+    // reads the shifted column reference as a changed view.
+    hash: '1362b47b52e6cf4a',
+    object: 'public.v_supabase_freshness',
+    why: 'dropped-column attnum gap in lp_leads (live 60, rebuilt 59); definition identical',
+  },
+];
+
+function statementHash(stmt) {
+  return createHash('sha256').update(stmt).digest('hex').slice(0, 16);
+}
+
+/** Split `db diff` output into statements, whitespace-collapsed. */
+export function splitDriftStatements(sql) {
+  return String(sql)
+    .split(/;\s*(?:\n|$)/)
+    .map((s) => s.replace(/--[^\n]*/g, ' ').replace(/\s+/g, ' ').trim())
+    .filter(Boolean);
+}
+
+/** Separate known build artefacts from real drift. */
+export function filterDrift(sql, known = KNOWN_DRIFT_NOISE) {
+  const byHash = new Map(known.map((k) => [k.hash, k]));
+  const remaining = [];
+  const ignored = [];
+  for (const stmt of splitDriftStatements(sql)) {
+    const k = byHash.get(statementHash(stmt));
+    if (k) ignored.push(k);
+    else remaining.push(stmt);
+  }
+  return { remaining, ignored };
+}
+
 /** Rule 4: the old numbered folder is frozen. */
 export function checkLegacySqlFrozen(names, freeze = LEGACY_SQL_FREEZE) {
   const problems = [];
@@ -216,6 +261,18 @@ export function runChecks({ root = ROOT, base = null } = {}) {
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const arg = (flag) => { const i = process.argv.indexOf(flag); return i > -1 ? process.argv[i + 1] : null; };
+  const driftFile = arg('--drift');
+  if (driftFile) {
+    const { remaining, ignored } = filterDrift(readFileSync(driftFile, 'utf8'));
+    for (const k of ignored) console.log(`::notice::known build artefact, not drift: ${k.object} (${k.why})`);
+    if (remaining.length) {
+      console.error(`✗ the live schema differs from the migrations in this repo (${remaining.length} statement(s)):`);
+      for (const s of remaining) console.error(`  ${s.slice(0, 300)}`);
+      process.exit(1);
+    }
+    console.log('No drift.');
+    process.exit(0);
+  }
   const listFile = arg('--migration-list');
   if (listFile) {
     const { localOnly, remoteOnly } = parseMigrationList(readFileSync(listFile, 'utf8'));
