@@ -334,6 +334,21 @@ export function registerMarketingInvoiceRoutes(app, deps = {}) {
     }
   });
 
+  // A PERSON applies a REECE_HOLD recommendation (handoff §7.5): the dashboard's
+  // admin-only button relays here; the money never moves on its own.
+  app.post('/n8n/admin/marketing-expenses/apply-recommendation', json, async (req, res) => {
+    try {
+      if (refuse(req, res)) return;
+      const { applyRecommendation } = await import('../marketing/holds.js');
+      const expenseId = String(req.body?.expense_id || '');
+      if (!/^[0-9a-f-]{36}$/i.test(expenseId)) return res.status(400).json({ success: false, error: 'expense_id must be a uuid' });
+      const out = await applyRecommendation(expenseId, { markets: req.body?.markets || [], by: req.body?.by || null }, deps);
+      res.status(out.ok ? 200 : 400).json({ success: out.ok, ...out });
+    } catch (err) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
   app.get('/n8n/admin/marketing-expenses/status', async (req, res) => {
     try {
       if (refuse(req, res)) return;
@@ -348,5 +363,5 @@ export function registerMarketingInvoiceRoutes(app, deps = {}) {
     }
   });
 
-  console.log('[REST API] Registered: POST /n8n/admin/marketing-invoice-ingest | /marketing-expenses/import-csv | /marketing-expenses/reallocate | GET /marketing-expenses/status');
+  console.log('[REST API] Registered: POST /n8n/admin/marketing-invoice-ingest | /marketing-expenses/import-csv | /marketing-expenses/reallocate | /marketing-expenses/apply-recommendation | GET /marketing-expenses/status');
 }
