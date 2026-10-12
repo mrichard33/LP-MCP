@@ -292,7 +292,7 @@ function deriveTrackStage({ turns, plan, facts }) {
     return { stage: 'commitment_offered', reason: 'slots_offered' };
   }
   if (BRIDGE_RX.test(lastOut) || plan?.required_move === 'bridge') return { stage: 'transition', reason: 'bridge' };
-  if (OWNER_ASK_RX.test(lastOut) || DM_ASK_RX.test(lastOut) || (ZIP_ASK_RX.test(lastOut) && !/\bstreet\b/i.test(lastOut))) {
+  if (plan?.step === 'qualify' || OWNER_ASK_RX.test(lastOut) || DM_ASK_RX.test(lastOut) || (ZIP_ASK_RX.test(lastOut) && !/\bstreet\b/i.test(lastOut))) {
     return { stage: 'qualifying', reason: 'qualifying_ask' };
   }
   const ready = readySignal(turns);

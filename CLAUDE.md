@@ -865,6 +865,19 @@ Stage" dropdown (`contact.nepq_stage`, 16 labels in `STAGE_GHL_LABEL`) only when
 dropdown carries. "Stage Last Engaged" is another field: never touch it. The simulator keeps the stage in memory and
 prints `stage: a → b (reason)` per turn. `LEAD_STAGE_MODE` off|shadow|live, default shadow (record only);
 `GET /admin/lead-stage/:contactId` (x-admin-token) shows it.
+**With `LEAD_STAGE_MODE=live` the planner and the prompt read the stage (the user, 2026-10-12).** `planNepqTurn({ stage })`
+(passed only when live; null is byte-for-byte the old plan): a yes to ANY offer of ours, a schedule ask or an address
+moves forward whatever our last message was; past the bridge (or at qualifying / offered / held, or back from an
+objection play) anything that is not a no goes to times; the bridge is sent ONCE; a pick resolves only against the
+newest offer (`latest_offered_slots`); a stated day or part of day is honored or said to be unavailable;
+"you just said that" changes the move. **The qualifying gate** (`gateForStage`, `QUALIFY_LINES`): no visit time until the
+lead owns the home, the zip is known and every decision maker is the lead alone or named AND able to be there, one item
+per message (owner → zip → decision makers), an item asked twice is not asked a third time. In live mode this
+supersedes "NEVER probe for disqualifiers" (the plan block allows the ownership question) and "ask about decision makers
+ONCE, after the hold" (asked before the times; a settled answer rides as `plan.dm_known` and the collect never asks
+again). `stageBlock` renders from the stored stage (`playForConversationStage`), buyer_stage is tone only, and the
+transition default is the free home visit. The simulator and `run_bot_eval` take `lead_stage_mode` (shadow|live) to try
+it before Railway is switched.
 
 **A renter gets no visit; one out-of-area decline; quote ≠ price (handoff PR 3, 2026-10-12).** A renter was offered
 times twice (batch 3 T3). `enforceNonOwner` (`src/agentic/non-owner.js`, the last pass in both bots beside

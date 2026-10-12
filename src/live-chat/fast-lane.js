@@ -482,7 +482,7 @@ export function nepqSummary(plan) {
   return { step: plan.step, move: plan.required_move, objection: plan.objection?.type || null, handoff: plan.handoff?.reason || null, counters: plan.counters };
 }
 
-const NEPQ_FIXED_MOVES = new Set(['handoff', 'objection_play', 'ask_day', 'close', 'reveal', 'offer_slots', 'status_frame', 'dnk']);
+const NEPQ_FIXED_MOVES = new Set(['handoff', 'objection_play', 'ask_day', 'close', 'reveal', 'offer_slots', 'status_frame', 'dnk', 'qualify']);
 
 /** How long a reply that already claimed the turn gets to finish sending. */
 export const LATE_SEND_WAIT_MS = 20000;
@@ -644,6 +644,7 @@ export function createLiveChatFastLane(deps) {
     // Default records nothing; production fires it in the background, the
     // simulator records it in memory and shows it on the transcript.
     recordLeadStage: async () => null,
+    readLeadStage: async () => null,
     // 2026-10-11 opener race (src/jobs/no-reply-followup.js). Default records nothing.
     recordOpenerHold: async () => null,
     rescheduleAppointment: async () => ({ ok: false, error: 'no reschedule dep' }),
@@ -1064,7 +1065,12 @@ export function createLiveChatFastLane(deps) {
     // It gets no fixed move and no times: the coverage sentence opens the reply
     // and the plan steers the rest (2026-10-03, the shutters thread).
     const coveragePlanned = saPlan.active && (!!saPlan.zip || !!saPlan.refused_zip);
+    // 2026-10-12 (Lead Conversation Stage): the stored stage, only when
+    // LEAD_STAGE_MODE=live (the dep returns null otherwise). Same stage path
+    // as SMS: the planner and the prompt read it.
+    let leadStage = null;
     if (nepqMode !== 'off' && (!saPlan.active || coveragePlanned) && !planOverride) {
+      try { leadStage = await d.readLeadStage(contactId); } catch { leadStage = null; }
       const realFirst = hasNameOnRecord ? String(context.lead?.first_name || context.lead?.name || '').trim().split(/\s+/)[0] || null : null;
       const planInput = {
         channel: 'livechat', trigger: body, conversation: context.conversation_recent, firstName: realFirst,
@@ -1074,6 +1080,8 @@ export function createLiveChatFastLane(deps) {
         isCustomer: isCustomerP2(context),
         // 2026-10-12 (PR 3): quote ≠ price and the competitor play, live only.
         stageLive: leadStageMode() === 'live',
+        stage: leadStage,
+        knownZip: context.lead?.postal_code || null,
       };
       nepqPlan = planNepqTurn(planInput);
       if (!saPlan.active && wantsSlots(nepqPlan)) {
@@ -1200,7 +1208,7 @@ export function createLiveChatFastLane(deps) {
     // the same block the SMS path gets (src/agentic/service-area-turn.js).
     // Live NEPQ owns the booking-ask decision and is rendered last.
     const turnDiscipline = (nepqMode === 'live' && nepqPlan && discipline) ? { ...discipline, booking: nepqPlan.booking } : discipline;
-    const opts = { established, loopBreak, spouseAdvocacy, handoffPending, discipline: turnDiscipline, promptHint, threadSenderType: 'team', serviceAreaTurn: coverage ? { plan: saPlan, coverage } : null, nepqPlan: (nepqMode === 'live' || planOverride) ? nepqPlan : null, upcomingAppointments };
+    const opts = { established, loopBreak, spouseAdvocacy, handoffPending, discipline: turnDiscipline, promptHint, threadSenderType: 'team', serviceAreaTurn: coverage ? { plan: saPlan, coverage } : null, nepqPlan: (nepqMode === 'live' || planOverride) ? nepqPlan : null, leadStage: nepqMode === 'live' ? leadStage : null, upcomingAppointments };
     const userPrompt = buildResponsePrompt(context, 'livechat', body, kbPack, classification, false, 'warm', null, opts) + LIVE_CHAT_OUTPUT_CONTRACT;
     // AI OS batch 1 PR 2: the NEPQ CTA text only when a PLAN block is in
     // this prompt (opts.nepqPlan), the legacy text otherwise (rollback).
@@ -1681,6 +1689,8 @@ export function createLiveChatFastLane(deps) {
       }
       // An answer given earlier in this chat travels to the booking too.
       if (!decisionMakers) { const earlier = dmAnswerFromThread(threadTurns); if (earlier && earlier !== 'conflict') decisionMakers = earlier; }
+      // 2026-10-12 (LEAD_STAGE_MODE=live): settled by the qualifying gate ("my wife will be there").
+      if (!decisionMakers && plan.dm_known) decisionMakers = plan.dm_known;
       const name = typed.first_name || firstName || null;
       // 2026-10-02 (Mark's 5:22 PM chat): an address the visitor did not type
       // here (a merged or older contact's) is read back once; a "no" asks for
