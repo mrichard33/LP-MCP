@@ -252,6 +252,16 @@ pre-demo questions on a post-demo plan and never appends a question after a sign
 date is filed after the send (`src/services/post-demo-followup-io.js`: GHL task for the first `REHASH_TEAM_USER_IDS` id,
 `followup-requested`, a note; once per date). `POST_DEMO_PLANNER_MODE` off|shadow|live, default shadow (`[PostDemo] shadow`).
 
+**LP's SetAppointment says Result 0 for success, 1 for a refusal (2026-10-12).** The opposite of UpdateDNCStatus.
+All 87 stored replies: 48 × `0 "Appointment set successfully."`; 39 × `1` ("record has future appt date…", "market is
+OOA.", "dispo is Issue, DNC or Sale.", "lds_id does not exist."). `inspectAppointmentResponse`
+(`src/lp-appointment-guards.js`) had it backwards, so `LP_APPT_GUARD_MODE=enforce` would have refused every booking.
+Every refusal is an `lp.appointment_refused` event (shadow and enforce). In enforce, `executeSetLPAppointment` and
+`syncAppointmentToLP` RETURN `lp_appointment_refused` (`refusedAppointmentAnswer`) rather than throw, because a thrown
+refusal was re-sent by the executor, the parity watchdog, inbound-checkout-watch and the post-issue retry. The sync also
+holds a refused lead + date + time for 24h (`refused:<dedupKey>` mark, `lp_refusal_recent`). Replay test:
+`scripts/test-lp-appt-guard-replay.js`. Add a new LP reply there when one appears.
+
 **A held appointment asks a person to import its LP row (2026-10-05).** When LP already has an unimported
 inbound row for a contact, `syncAppointmentToLP` holds the appointment (`lp-appt-deferred`) rather than add a
 duplicate lead, and the parity watchdog re-drives it every 30 min. LP has no API that imports a row, so once a

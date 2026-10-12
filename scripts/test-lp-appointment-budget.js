@@ -168,7 +168,7 @@ test('the already-in-LP hot path makes no bookkeeping GHL calls inside the reque
 test('the dedup mark and the I.LP-A signal tag stay synchronous [source-level]', () => {
   // Deferring these two would widen the duplicate window and delay the exact
   // signal I.LP-A gates its native fallback on. They must stay awaited.
-  const tail = SRC.slice(SRC.indexOf('const result = await _lpSetAppointment('));
+  const tail = SRC.slice(SRC.indexOf('result = await _lpSetAppointment('));
   const upto = tail.slice(0, tail.indexOf("action: 'lp_appointment_set'"));
 
   assert.match(upto, /await writeApptSyncMark\(/, 'the duplicate guard must not lag the response');

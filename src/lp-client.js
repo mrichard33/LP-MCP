@@ -827,16 +827,20 @@ export async function setAppointment({ ldsId, setBy = LP_EMP.GHL_INTEGRATION, ap
   // q5GehRye7DNkN6jlmjl3. src/lp-appointment-guards.js was written for exactly
   // this and shipped unwired; this is the wiring.
   //
-  // SHADOW BY DEFAULT. LP_APPT_REFUSAL_MARKERS matches broad substrings
-  // ('invalid', 'cannot', 'error', 'already has'), and no real SetAppointment
-  // reply was observable in 30h of production logs to validate them against —
-  // every request took the already-in-LP early exit. Shadow mode produces that
-  // evidence without risking a false refusal. Flip to enforce once the logged
-  // verdicts are clean.
+  // SHADOW BY DEFAULT. Until 2026-10-12 the guard read LP's codes backwards
+  // (SetAppointment says Result 0 for success, 1 for a refusal; see
+  // inspectAppointmentResponse), and the only record of a shadow verdict was
+  // this log line, gone with every deploy. Every refusal is now also an
+  // `lp.appointment_refused` event (recordAppointmentRefusal), in shadow and
+  // enforce alike, so the go-live decision is made from rows, not memory.
+  // Enforce throws LP_APPT_REFUSED; the two direct callers
+  // (executeSetLPAppointment, syncAppointmentToLP) turn that into a final
+  // `lp_appointment_refused` answer so nothing re-sends a refusal to LP.
   const guardMode = String(process.env.LP_APPT_GUARD_MODE || 'shadow').toLowerCase().trim();
   if (guardMode !== 'off') {
     const verdict = inspectAppointmentResponse(result);
     if (!verdict.accepted) {
+      recordAppointmentRefusal({ ldsId, apptDate, apptTime, verdict, mode: guardMode });
       if (guardMode === 'enforce') {
         assertAppointmentAccepted(result, { ldsId, apptDate, apptTime });
       }
@@ -850,6 +854,50 @@ export async function setAppointment({ ldsId, setBy = LP_EMP.GHL_INTEGRATION, ap
 
   console.log(`[LP] SetAppointment SUCCESS: lds_id=${ldsId}, response: ${JSON.stringify(result).slice(0, 200)}`);
   return result;
+}
+
+/**
+ * Durable record of an LP SetAppointment refusal (2026-10-12). One
+ * `lp.appointment_refused` event per refused reply, carrying LP's own words and
+ * codes only (no customer text). Fire-and-forget: it never delays the
+ * SetAppointment call or makes it fail. emitEvent is imported lazily so this
+ * low-level client takes no load-time dependency on the event pipeline.
+ */
+let refusalRecorder = async (evt) => {
+  const { emitEvent } = await import('./event-emitter.js');
+  return emitEvent(evt);
+};
+
+/** Test seam: replace the event write (pass null to restore the default). */
+export function __setAppointmentRefusalRecorderForTests(fn) {
+  refusalRecorder = fn || (async (evt) => {
+    const { emitEvent } = await import('./event-emitter.js');
+    return emitEvent(evt);
+  });
+}
+
+function recordAppointmentRefusal({ ldsId, apptDate, apptTime, verdict, mode }) {
+  const evt = {
+    event_type: 'lp.appointment_refused',
+    event_subtype: verdict.reason || 'lp_refused',
+    source: 'lp_client',
+    entity_type: 'lp_lead',
+    entity_id: String(ldsId),
+    lp_lead_id: String(ldsId),
+    priority: 'low',
+    payload: {
+      lds_id: String(ldsId),
+      appt_date: apptDate,
+      appt_time: apptTime,
+      reason: verdict.reason,
+      lp_result: verdict.resultCode,
+      lp_message: verdict.message,
+      guard_mode: mode,
+    },
+  };
+  Promise.resolve()
+    .then(() => refusalRecorder(evt))
+    .catch((e) => console.warn(`[LP] could not record SetAppointment refusal for lds_id=${ldsId}: ${e?.message || e}`));
 }
 
 /**

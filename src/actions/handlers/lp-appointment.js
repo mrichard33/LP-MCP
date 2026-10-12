@@ -152,6 +152,7 @@
 
 import supabase from '../../supabase.js';
 import { setAppointment as lpSetAppointment, getLeadByLdsId, getCircuitStatus } from '../../lp-client.js';
+import { refusedAppointmentAnswer } from '../../lp-appointment-guards.js';
 import { postDemoLock } from '../../lp-post-demo-lock.js';
 import { postIssueGate } from '../../lp-post-issue-rebook.js';
 import { extractArray, getField } from '../../sync-utils.js';
@@ -930,7 +931,17 @@ export async function executeSetLPAppointment(action, context = {}) {
 
   // ─── Write to LP ──────────────────────────────────────────────────
   console.log(`[LP-APPT] Setting appointment: lds_id=${lpLeadId}, date=${apptDate}, time=${apptTime}, resolved_via=${resolutionSource}${lpSourceLine ? `, lpSrc="${lpSourceLine}"` : ', lpSrc=(absent)'}`);
-  const result = await lpSetAppointment({ ldsId: lpLeadId, setBy, apptDate, apptTime });
+  let result;
+  try {
+    result = await lpSetAppointment({ ldsId: lpLeadId, setBy, apptDate, apptTime });
+  } catch (err) {
+    // LP refused (LP_APPT_GUARD_MODE=enforce): return LP's answer so the
+    // executor does not retry it into LP three more times (2026-10-12).
+    const refused = refusedAppointmentAnswer(err, { contact_id: contactId, lp_lead_id: lpLeadId, date: apptDate, time: apptTime });
+    if (!refused) throw err;
+    console.warn(`[LP-APPT] LP refused the appointment for ${contactId}: lds_id=${lpLeadId} reason=${refused.reason} message="${refused.lp_message}"`);
+    return refused;
+  }
 
   // v2: render Calendar conditionally — only show the line/segment when
   // calendarName is meaningful (non-empty, not "N/A").
