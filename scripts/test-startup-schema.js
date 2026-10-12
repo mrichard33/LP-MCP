@@ -268,6 +268,82 @@ test('an ops alert that throws does not throw out of the boot path', async () =>
   assert.ok(lines.some((l) => /ops alert failed: groupme down/.test(l.msg)));
 });
 
+// ─── apply: false — the production default since Fix 1 (2026-10-12) ─────────
+//
+// Schema changes are migrations in supabase/migrations/, applied by CI and
+// recorded in the database's own ledger. The boot still LOOKS and PAGES, but a
+// boot that could write DDL would be a second, unrecorded path.
+
+test('apply off, all present: one catalog read, zero DDL, summary says check only', async () => {
+  const { deps, calls, lines } = harness(FULL());
+  const t = await runStartupSchema([LEADS_BLOCK], { ...deps, apply: false });
+  assert.equal(calls.ddl.length, 0);
+  assert.equal(calls.catalog, 1);
+  assert.deepEqual([t.present, t.applied, t.missing], [1, 0, 0]);
+  assert.match(summary(lines), /1 present, 0 applied, 0 missing.*\[check only\]/);
+  assert.equal(calls.alerts.length, 0);
+});
+
+test('apply off, one column missing: NO DDL, counted missing, FAILED names it, one ops card points at supabase/migrations', async () => {
+  const db = FULL();
+  db.columns = db.columns.filter((c) => c !== 'lp_prospects.verified_at');
+  const { deps, calls, lines } = harness(db);
+  const t = await runStartupSchema([LEADS_BLOCK], { ...deps, apply: false });
+  assert.equal(calls.ddl.length, 0, 'check-only must never take a table lock');
+  assert.equal(calls.catalog, 1, 'no re-probe: nothing was applied');
+  assert.deepEqual([t.present, t.applied, t.missing], [0, 0, 1]);
+  const f = failed(lines);
+  assert.equal(f.length, 1);
+  assert.ok(f[0].msg.startsWith(LEADS_BLOCK.fail));
+  assert.match(f[0].msg, /missing: lp_prospects\.verified_at — not applied at boot; add a migration under supabase\/migrations\//);
+  assert.equal(calls.alerts.length, 1, 'still exactly one ops card: silence would hide a real gap');
+  assert.match(calls.alerts[0], /sql\/121: lp_prospects\.verified_at/);
+  assert.match(calls.alerts[0], /supabase\/migrations\//);
+  assert.doesNotMatch(calls.alerts[0], /from the Supabase dashboard/);
+});
+
+test('apply off: always-run function blocks do not run either, and the summary says so', async () => {
+  const fn = {
+    name: 'sql/063', expects: null, alwaysRunBecause: 'function',
+    sql: 'CREATE OR REPLACE FUNCTION f() ...', ready: '[Migration] fn ready', fail: '[Migration] fn FAILED:', level: 'error',
+  };
+  const { deps, calls, lines } = harness(FULL());
+  const t = await runStartupSchema([LEADS_BLOCK, fn], { ...deps, apply: false });
+  assert.equal(calls.ddl.length, 0);
+  assert.deepEqual([t.present, t.alwaysRun, t.alwaysRunSkipped], [1, 0, 1]);
+  assert.match(summary(lines), /1 function block not run: apply is off/);
+});
+
+test('apply off and the catalog read fails: runs nothing, pages nobody, says so', async () => {
+  const { deps, calls, lines } = harness(FULL(), { readCatalog: async () => { throw new Error(PGRST002); } });
+  const t = await runStartupSchema([LEADS_BLOCK], { ...deps, apply: false });
+  assert.equal(t.verified, false);
+  assert.equal(calls.ddl.length, 0, 'the old fallback ran every block; check-only must not');
+  assert.equal(calls.alerts.length, 0);
+  assert.ok(lines.some((l) => /could not verify .* apply is off, so nothing ran/.test(l.msg)));
+});
+
+test('apply off over the REAL block list with everything present: zero DDL of any kind', async () => {
+  const db = fakeDb();
+  for (const b of STARTUP_MIRRORS.filter((x) => x.expects)) {
+    db.tables.push(...(b.expects.tables || []));
+    db.views.push(...(b.expects.views || []));
+    db.indexes.push(...(b.expects.indexes || []));
+    db.columns.push(...(b.expects.columns || []).map(([t, c]) => `${t}.${c}`));
+  }
+  const { deps, calls } = harness(db);
+  const t = await runStartupSchema(STARTUP_MIRRORS, { ...deps, apply: false });
+  assert.equal(calls.ddl.length, 0, 'production boot since Fix 1 writes no schema at all');
+  assert.equal(t.missing, 0);
+  assert.equal(t.alwaysRunSkipped, STARTUP_MIRRORS.filter((b) => !b.expects).length);
+});
+
+test('src/index.js wires apply to STARTUP_SCHEMA_APPLY and defaults it off', () => {
+  const src = repoFile('src/index.js');
+  assert.match(src, /apply:\s*String\(process\.env\.STARTUP_SCHEMA_APPLY \|\| ''\)\.trim\(\)\.toLowerCase\(\) === 'true'/,
+    'the boot must only apply DDL when STARTUP_SCHEMA_APPLY=true (the rollback switch)');
+});
+
 // ─── the pure helpers ────────────────────────────────────────────────────────
 
 test('parseCatalog refuses anything that could be mistaken for "everything is missing"', () => {

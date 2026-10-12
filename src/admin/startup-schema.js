@@ -131,14 +131,18 @@ export function missingObjects(expects, catalog) {
   return out;
 }
 
-export function formatMissingAlert(failures) {
+export function formatMissingAlert(failures, { apply = true } = {}) {
   const lines = [
-    `🛠️ LP-MCP startup schema: ${failures.length} block${failures.length === 1 ? '' : 's'} still missing objects after apply + retry + re-check`,
+    apply
+      ? `🛠️ LP-MCP startup schema: ${failures.length} block${failures.length === 1 ? '' : 's'} still missing objects after apply + retry + re-check`
+      : `🛠️ LP-MCP startup schema: ${failures.length} block${failures.length === 1 ? '' : 's'} missing objects (boot applies nothing; the migrations ledger owns DDL)`,
   ];
   for (const f of failures) {
     lines.push(`• ${f.name}: ${f.missing.join(', ')}${f.error ? ` (last error: ${f.error})` : ''}`);
   }
-  lines.push('Apply the named sql/ file from the Supabase dashboard. Deploy log has the full [Migration] lines.');
+  lines.push(apply
+    ? 'Apply the named sql/ file from the Supabase dashboard. Deploy log has the full [Migration] lines.'
+    : 'Add a migration under supabase/migrations/ (sql/README.md); CI applies it on merge. Deploy log has the full [Migration] lines.');
   return lines.join('\n');
 }
 
@@ -152,15 +156,25 @@ export function formatMissingAlert(failures) {
  *   opsAlert(text)                   one card when something is really missing
  *   log                              { log, warn, error }, defaults to console
  *   sleep(ms), retryDelayMs          the pause before the single retry
+ *   apply                            default true. FALSE (production since Fix 1,
+ *                                    2026-10-12: STARTUP_SCHEMA_APPLY unset) means
+ *                                    LOOK ONLY: the catalog is read, missing
+ *                                    objects are named and paged, and no DDL
+ *                                    runs — not the declared blocks, not the
+ *                                    always-run function blocks. DDL belongs to
+ *                                    supabase/migrations/ and the db-migrate
+ *                                    workflow; a boot that could still write
+ *                                    schema would be a second, unrecorded path.
  */
 export async function runStartupSchema(blocks, deps = {}) {
   const log = deps.log || console;
+  const apply = deps.apply ?? true;
   const sleep = deps.sleep || ((ms) => new Promise((r) => setTimeout(r, ms)));
   const retryDelayMs = deps.retryDelayMs ?? 3000;
   const readCatalogRaw = deps.readCatalog || ((sql) => deps.runSQL(sql));
   const catalogSql = buildCatalogSql(columnTables(blocks));
 
-  const tally = { verified: false, present: 0, applied: 0, missing: 0, alwaysRun: 0, alwaysRunFailed: 0, unverifiedOk: 0, unverifiedFailed: 0, failures: [] };
+  const tally = { verified: false, apply, present: 0, applied: 0, missing: 0, alwaysRun: 0, alwaysRunFailed: 0, alwaysRunSkipped: 0, unverifiedOk: 0, unverifiedFailed: 0, failures: [] };
 
   // One retry on a transient error for anything that goes over run_sql.
   async function withRetry(label, fn) {
@@ -206,6 +220,10 @@ export async function runStartupSchema(blocks, deps = {}) {
   let { catalog, error: readError } = await readCatalog();
 
   if (!catalog) {
+    if (!apply) {
+      log.warn(`[Migration] startup schema: could not verify (catalog read failed: ${errText(readError)}) — apply is off, so nothing ran and nobody is paged this boot`);
+      return tally;
+    }
     log.warn(`[Migration] startup schema: could not verify (catalog read failed: ${errText(readError)}) — running every block as before, no ops alert this boot`);
     for (const block of blocks) {
       if (await runUnchecked(block)) tally.unverifiedOk += 1;
@@ -218,6 +236,10 @@ export async function runStartupSchema(blocks, deps = {}) {
   tally.verified = true;
   for (const block of blocks) {
     if (!block.expects) {
+      if (!apply) {
+        tally.alwaysRunSkipped += 1;
+        continue;
+      }
       tally.alwaysRun += 1;
       if (!(await runUnchecked(block))) tally.alwaysRunFailed += 1;
       continue;
@@ -226,6 +248,13 @@ export async function runStartupSchema(blocks, deps = {}) {
     const before = missingObjects(block.expects, catalog);
     if (before.length === 0) {
       tally.present += 1;
+      continue;
+    }
+
+    if (!apply) {
+      tally.missing += 1;
+      tally.failures.push({ name: block.name, missing: before, error: null });
+      say(block.level || 'error', `${block.fail} missing: ${before.join(', ')} — not applied at boot; add a migration under supabase/migrations/`);
       continue;
     }
 
@@ -256,13 +285,15 @@ export async function runStartupSchema(blocks, deps = {}) {
 
   const always = tally.alwaysRun
     ? ` (${tally.alwaysRun} function block${tally.alwaysRun === 1 ? '' : 's'} always run, ${tally.alwaysRunFailed} failed)`
-    : '';
+    : tally.alwaysRunSkipped
+      ? ` (${tally.alwaysRunSkipped} function block${tally.alwaysRunSkipped === 1 ? '' : 's'} not run: apply is off)`
+      : '';
   say(tally.missing > 0 ? 'error' : 'log',
-    `[Migration] startup schema: ${tally.present} present, ${tally.applied} applied, ${tally.missing} missing${always}`);
+    `[Migration] startup schema: ${tally.present} present, ${tally.applied} applied, ${tally.missing} missing${always}${apply ? '' : ' [check only]'}`);
 
   if (tally.missing > 0 && deps.opsAlert) {
     try {
-      await deps.opsAlert(formatMissingAlert(tally.failures));
+      await deps.opsAlert(formatMissingAlert(tally.failures, { apply }));
     } catch (err) {
       log.warn(`[Migration] startup schema: ops alert failed: ${errText(err)}`);
     }
