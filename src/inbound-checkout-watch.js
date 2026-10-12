@@ -32,10 +32,12 @@
 //   GHL sender, no appointment                 60 min   INBOUND_WATCH_GHL_MIN
 //   anything else                              60 min   INBOUND_WATCH_OTHER_MIN
 //   escalation to #ops                         90 min   INBOUND_WATCH_ESCALATE_MIN
-//     counted from when the office opened for that inquiry, not from arrival
-//     (2026-10-08): the 12 overnight rows on the 8:05 #contact-center card were
-//     all "90 min late" at 8:00 and went to #ops in the same minute. Staff get
-//     90 minutes to work the overnight queue before #ops hears about it.
+//     counted in OPEN office minutes only (2026-10-12, officeMinutesBetween):
+//     the clock stops at 19:45 ET and restarts at 08:00. 2026-10-08: the 12
+//     overnight rows on the 8:05 #contact-center card were all "90 min late"
+//     at 8:00 and went to #ops in the same minute, so the clock started at the
+//     next opening. 2026-10-11/12: rows that arrived 18:45–19:38, before close,
+//     still hit #ops at 8:04 (45 open minutes, then the whole night counted).
 //   4. For an inquiry LP HAS issued: write the lds to the GHL contact when its
 //      LP Lead ID is empty, and set the contact's upcoming appointment on the
 //      lds when the inquiry has none — the retry set_lp_appointment never got.
@@ -163,19 +165,27 @@ export function priorityOf(row, nowMs) {
 }
 
 /**
- * When the office clock started for an inquiry: its arrival if the office was
- * open (start inclusive, end exclusive, ET), else the next office opening.
- * Same shape as dialWindowStartMs (src/five9/callback-dial-check.js), but on
- * this job's own office hours so INBOUND_WATCH_OFFICE_* moves both together.
+ * Minutes between two instants that fall inside office hours (ET, start
+ * inclusive, end exclusive). Walks open spans: jump to the next opening when
+ * closed, count up to the close (or `toMs`) when open. Wall-clock jumps, like
+ * dialWindowStartMs (src/five9/callback-dial-check.js), so a DST night can be
+ * off by an hour; the cap bounds a misconfigured window (start >= end counts
+ * nothing). On this job's own INBOUND_WATCH_OFFICE_* hours.
  */
-export function officeClockStartMs(receivedMs, cfg) {
-  if (!Number.isFinite(receivedMs)) return null;
-  const m = etMinuteOfDay(receivedMs);
-  if (m >= cfg.officeStartMin && m < cfg.officeEndMin) return receivedMs;
-  const floor = receivedMs - (receivedMs % 60000);
-  return m < cfg.officeStartMin
-    ? floor + (cfg.officeStartMin - m) * 60000
-    : floor + (24 * 60 - m + cfg.officeStartMin) * 60000;
+export function officeMinutesBetween(fromMs, toMs, cfg) {
+  if (!Number.isFinite(fromMs) || !Number.isFinite(toMs) || toMs <= fromMs) return 0;
+  let t = fromMs;
+  let total = 0;
+  for (let i = 0; i < 400 && t < toMs; i += 1) {
+    const m = etMinuteOfDay(t);
+    const floor = t - (t % 60000);
+    if (m < cfg.officeStartMin) { t = floor + (cfg.officeStartMin - m) * 60000; continue; }
+    if (m >= cfg.officeEndMin) { t = floor + (24 * 60 - m + cfg.officeStartMin) * 60000; continue; }
+    const segEnd = Math.min(toMs, floor + (cfg.officeEndMin - m) * 60000);
+    total += segEnd - t;
+    t = segEnd;
+  }
+  return total / 60000;
 }
 
 export const waitMinutes = (row, nowMs) => (Number.isFinite(row.receivedMs) ? (nowMs - row.receivedMs) / 60000 : null);
@@ -192,7 +202,7 @@ export function assessWaiting(rows, nowMs, cfg) {
     if (wait === null) continue;
     const priority = priorityOf(row, nowMs);
     const threshold = cfg.thresholdMin[priority];
-    const openWait = (nowMs - officeClockStartMs(row.receivedMs, cfg)) / 60000;
+    const openWait = officeMinutesBetween(row.receivedMs, nowMs, cfg);
     out.push({
       row, priority, waitMin: Math.floor(wait), openWaitMin: Math.max(0, Math.floor(openWait)), threshold,
       due: wait >= threshold,
