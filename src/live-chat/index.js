@@ -278,10 +278,12 @@ export function cachedFreeSlots(calendarId, timezone, { fetch = fetchFreeSlots, 
   return promise;
 }
 
-async function offerSlots({ calendarId, contact, preferredText = null }) {
+async function offerSlots({ calendarId, contact, preferredText = null, zip: typedZip = null }) {
   if (!calendarId) return { slots: [], tzLabel: 'ET' };
   let zone = { timezone: 'America/New_York', label: 'ET' };
-  const zip = contact?.postalCode || contact?.postal_code || null;
+  // 2026-10-12 (PR 4): a zip the visitor typed (77494) is where the visit is;
+  // it wins over the record's for the zone the times are read and labelled in.
+  const zip = typedZip || contact?.postalCode || contact?.postal_code || null;
   if (zip) {
     try { zone = { ...zone, ...(await timezoneForZip(zip)) }; } catch { /* Eastern */ }
   }
@@ -349,10 +351,10 @@ async function rescheduleAppointment({ contactId, oldAppointmentId, calendarId, 
  * visitor's zone, for the Calendar Commitment. Same selection as the cancel
  * flow's offer (notice floor, 48h-first window).
  */
-async function offerBookingSlots({ contact, preferredText = null }) {
+async function offerBookingSlots({ contact, preferredText = null, zip = null }) {
   // 2026-10-02 (Mark): calculator leads → Measurement Verification, else Window Estimate.
   const calendarId = inHomeCalendarFor(contact?.tags).calendar_id;
-  const res = await offerSlots({ calendarId, contact, preferredText });
+  const res = await offerSlots({ calendarId, contact, preferredText, zip });
   return { ...res, calendarId };
 }
 

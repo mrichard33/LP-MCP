@@ -12,6 +12,7 @@
 
 import { checkServiceAreaZip, normalizeZip5 } from './identity-extraction.js';
 import { DEFAULT_TIMEZONE, marketTimezone, tzLabel } from '../config/market-timezones.js';
+import { extractZip } from '../agentic/service-area-turn.js';
 
 const TTL_MS = 60 * 60 * 1000;
 const cache = new Map(); // zip → { market_code, at }
@@ -46,6 +47,39 @@ export async function timezoneForZip(zip, { lookup = checkServiceAreaZip, nowMs 
   } catch {
     return defaultMarketZone();
   }
+}
+
+/**
+ * The zip the lead TYPED, newest first: "77494", "zip 77494", or the end of an
+ * address ("…, Katy TX 77494"). Null when they typed none. Pure.
+ *
+ * 2026-10-12 (handoff PR 4, batch 2 #2): a Katy, TX lead typed 77494 and was
+ * offered "10:00 AM ET / Wed 6:00 PM ET". The zone came only from the contact
+ * record's zip, which was empty (or another market's), so a zip typed in the
+ * conversation never reached the slot read. The typed zip is the property.
+ */
+export function typedZipFromThread(conversation = [], trigger = '') {
+  const inbound = (Array.isArray(conversation) ? conversation : [])
+    .filter(m => String(m?.direction || '').toLowerCase() !== 'outbound')
+    .map(m => String(m?.text ?? m?.body ?? ''));
+  if (trigger && inbound[inbound.length - 1] !== trigger) inbound.push(String(trigger));
+  for (let i = inbound.length - 1; i >= 0; i--) {
+    const t = inbound[i];
+    const z = extractZip(t) || (t.match(/\b[A-Za-z]{2,}\.?,?\s+(?:[A-Z]{2}\s+)?(\d{5})(?:-\d{4})?\s*[.!]?\s*$/) || [])[1];
+    if (z) return z;
+  }
+  return null;
+}
+
+/**
+ * The zone for a contact's customer-facing times: the zip they typed wins over
+ * the record's (the typed one is where the visit is). Never throws.
+ * @returns {Promise<{ timezone, label, market_code, zip }>}
+ */
+export async function zoneForContact({ typedZip = null, recordZip = null } = {}, deps = {}) {
+  const zip = normalizeZip5(typedZip) || normalizeZip5(recordZip) || null;
+  const zone = await timezoneForZip(zip, deps);
+  return { ...zone, zip };
 }
 
 export function __resetContactTimezoneCacheForTest() { cache.clear(); }
