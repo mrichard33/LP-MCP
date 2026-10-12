@@ -318,6 +318,7 @@ import { checkApptEventDedup } from './services/appt-event-dedup.js';
 import { recentAnalysisExists, DEDUP_CONFIRM_WINDOW_MS } from './services/analysis-confirm.js';
 import { stripQuotedEmail } from './email-thread.js';
 import { trackBackground, onShutdown } from './graceful-shutdown.js';
+import { recordBookedStage } from './services/lead-stage-io.js';
 import { withGhlToken } from './ghl-rate-limiter.js';
 
 const GHL_WEBHOOK_SECRET = process.env.GHL_WEBHOOK_SECRET || '';
@@ -1246,6 +1247,14 @@ async function handleAppointment(req, res) {
   if (eventType === 'ghl.appointment_booked') {
     trackBackground(checkDispositionStalenessOnBooking(contactId, { calendarId, appointmentId, startTime })
       .catch(err => console.warn(`[BehavioralEmitter] disposition staleness guard failed for ${contactId}: ${err.message}`)));
+  }
+
+  // 2026-10-12 (Lead Conversation Stage): a real appointment exists, from any
+  // source (a rep, a GHL booking widget, the bot's own row arriving here too).
+  // The booking event is the ONLY thing that sets the stage to booked.
+  if (eventType === 'ghl.appointment_booked') {
+    trackBackground(recordBookedStage({ contactId, source: 'ghl_webhook' })
+      .catch(err => console.warn(`[BehavioralEmitter] lead stage (booked) failed for ${contactId}: ${err.message}`)));
   }
 
   return res.json({ status: 'accepted', event_type: eventType });

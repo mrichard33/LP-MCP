@@ -62,6 +62,7 @@ import { lpNoteDqMode } from '../agentic/lp-note-dq.js';
 import { enforceOneAsk } from '../agentic/one-ask.js';
 import { looksLikeShortPhone } from '../agentic/contact-typos.js';
 import { planNepqTurn, enforceNepqPlan, referenceRetryNote, nepqBackboneMode, pickFresh, LINES as NEPQ_LINES, isServiceCallback, dropUnsafeLines, leadWantsCall } from '../agentic/nepq-planner.js';
+import { buildStageInput } from '../agentic/lead-stage.js';
 import { NO_DIAL_REASONS } from '../agentic/bot-callback.js';
 import { isCustomerP2 } from '../agentic/lead-state/signals/context-reader.js';
 import { COLLECT_ASK, COLLECT_ASK_AGAIN, dmAsk, holdLine, missingItems, parseDecisionMakers, heldSlot, nameFromReply, addressConfirmAsk, addressConfirmState, mentionedPartner, dmAnswerFromThread, slotLabel } from '../agentic/booking-collect.js';
@@ -637,6 +638,10 @@ export function createLiveChatFastLane(deps) {
     // Defaults change nothing and record nothing.
     guardRepeatPromise: async ({ text }) => ({ text, action: 'none' }),
     recordPromise: async () => ({ recorded: false }),
+    // 2026-10-12 — the conversation stage (src/services/lead-stage-io.js).
+    // Default records nothing; production fires it in the background, the
+    // simulator records it in memory and shows it on the transcript.
+    recordLeadStage: async () => null,
     // 2026-10-11 opener race (src/jobs/no-reply-followup.js). Default records nothing.
     recordOpenerHold: async () => null,
     rescheduleAppointment: async () => ({ ok: false, error: 'no reschedule dep' }),
@@ -1409,6 +1414,14 @@ export function createLiveChatFastLane(deps) {
 
     return deliver({
       contactId, conversationId, body, mode, actionId, timing, draft, turn, visitorTexts,
+      stageInput: buildStageInput({
+        conversation: context.conversation_recent || [], trigger: body, plan: nepqPlan,
+        zip: coverage?.zip || context.lead?.postal_code || null,
+        market: coverage?.market_code || context.market?.market_code || null,
+        outOfArea: coverage?.status === 'out',
+        buyerStage: Number(liveChatFields?.buyer_stage) || null,
+        channel: 'livechat',
+      }),
       capture: { ...capture, ...(reference?.capture || {}) },
       // A reply after a cancel or a move goes out whatever arrives next (Part 8).
       isSuperseded: reference?.mustDeliver ? () => false : isSuperseded,
@@ -1720,7 +1733,7 @@ export function createLiveChatFastLane(deps) {
   }
 
   /** Send (live) or record (shadow) one finished reply. */
-  async function deliver({ contactId, conversationId, body, mode, actionId, timing, draft, capture = {}, extras = {}, fingerprintExtras = {}, isSuperseded = () => false, turn = newTurnClaim(), visitorTexts = [], skipCapture = false }) {
+  async function deliver({ contactId, conversationId, body, mode, actionId, timing, draft, capture = {}, extras = {}, fingerprintExtras = {}, isSuperseded = () => false, turn = newTurnClaim(), visitorTexts = [], skipCapture = false, stageInput = null }) {
     // A newer message from this visitor arrived while this reply was being
     // written: the newer turn answers both (2026-10-02, tzuzq double reply).
     if (isSuperseded()) {
@@ -1801,6 +1814,13 @@ export function createLiveChatFastLane(deps) {
         .then(() => d.recordPromise({ contactId, text: draft, channel: 'livechat', phone: phoneFromText(visitorTexts.join(' ') || body) || null, rule: LIVE_CHAT_RULE, actionId }))
         .catch(err => d.warn(`[LiveChat] promise record failed for ${contactId}: ${err.message}`));
     }
+    // 2026-10-12 (Lead Conversation Stage): where the conversation is now that
+    // the reply went out. Only a planned model turn carries stageInput.
+    let leadStage = null;
+    if (sent && stageInput) {
+      try { leadStage = await d.recordLeadStage({ contactId, input: stageInput, reply: draft, channel: 'livechat' }); }
+      catch (err) { d.warn(`[LiveChat] lead stage record failed for ${contactId}: ${err.message}`); }
+    }
     const finished = finalizeTiming(timing);
     const executionResult = {
       action: 'message_sent',
@@ -1827,7 +1847,7 @@ export function createLiveChatFastLane(deps) {
       `total_ms=${finished.total_ms ?? 'n/a'} queue_ms=${finished.queue_ms ?? 'n/a'} analyze_ms=${finished.analyze_ms ?? 'n/a'} ` +
       `generate_ms=${finished.generate_ms ?? 'n/a'} send_ms=${finished.send_ms ?? 'n/a'} mode=${mode}${sendMethod ? ` via=${sendMethod}` : ''}`
     );
-    return { outcome: sent ? 'sent' : 'shadow', sent, message: draft, ghl_message_id: ghlMessageId, timing: finished, large_job: !!extras.large_job, email_malformed: !!extras.email_malformed, language_handoff: extras.language_handoff || null };
+    return { outcome: sent ? 'sent' : 'shadow', sent, message: draft, ghl_message_id: ghlMessageId, timing: finished, lead_stage: leadStage, large_job: !!extras.large_job, email_malformed: !!extras.email_malformed, language_handoff: extras.language_handoff || null };
   }
 
   async function fallback({ contactId, conversationId, mode, actionId, timing, reason, body, rawInbound = body, isSuperseded = () => false, backupReply = null }) {

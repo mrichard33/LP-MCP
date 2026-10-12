@@ -556,7 +556,7 @@ thrown error — `runMemoryNightly` and friends catch everything internally and 
 `{ ok: false }`. `interrupted` (a deploy killed the pass) is never `failed`, and a job that
 could not tell is `unknown`. Roster in `src/job-registry.js`; see `docs/job-runs.md`.
 
-**Every `*_MODE` flag is in `src/mode-registry.js` (Fix 2, 2026-10-12).** 91 flags, about half defaulting to shadow, and
+**Every `*_MODE` flag is in `src/mode-registry.js` (Fix 2, 2026-10-12).** 92 flags, about half defaulting to shadow, and
 nothing showed which were waiting, since when, or on whose ruling. Each entry gives the default, which values mean
 live/shadow/off, the first commit that read it (`since`), the `decider`, where shadow results land (`evidence`: event
 types, a table, or a job's `job_runs.detail`; empty means logs only) and the go-live test from a ruling, or
@@ -850,6 +850,21 @@ not. `enforceTeamVoice` (`src/agentic/team-voice.js`) corrects both after the mo
 (`src/agentic/team-hours.js`) turns a promised call "today" / "right now" / "in the next few minutes" into the next
 opening outside 9–8 weekdays, 9–5 Saturday, 9–3 Sunday (ET). The planner's hand-off and callback lines use the same
 hours (`nowMs`). Look for `[TeamVoice]` log lines.
+
+**A conversation has ONE stored stage (Lead Conversation Stage, 2026-10-12).** Three test batches (~35 chats) booked
+nothing: `planNepqTurn` re-guessed the stage from the thread every turn, and `stageBlock` read the analyzer's
+`buyer_stage` and said something else. `src/agentic/lead-stage.js` (pure) is the one answer: the NEPQ track
+connection → situation → problem → consequence → qualifying → transition → commitment_offered → slot_held → booked,
+side states `objection:<type>`, `reschedule:<step>`, handoff, opted_out, disqualified_non_owner / _out_of_area, and the
+rehash track as `rehash:<stage>`. `buyer_stage` stays a separate axis (tone only). `booked` comes ONLY from the real
+booking event (`recordBookedStage` beside both `ghl.appointment_booked` emits), never from the reply's words; the track
+never moves backward without an objection or a reschedule. `src/services/lead-stage-io.js` stores it
+(`lead_conversation_stage` + `_events`, codes and our own time labels only, never customer text) after every sent turn
+(SMS send handler, live chat `deliver`, a STOP short-circuit as opted_out), and mirrors the label to the GHL "NEPQ
+Stage" dropdown (`contact.nepq_stage`, 16 labels in `STAGE_GHL_LABEL`) only when it changes and only a label the live
+dropdown carries. "Stage Last Engaged" is another field: never touch it. The simulator keeps the stage in memory and
+prints `stage: a → b (reason)` per turn. `LEAD_STAGE_MODE` off|shadow|live, default shadow (record only);
+`GET /admin/lead-stage/:contactId` (x-admin-token) shows it.
 
 **Every GHL request is credited to the code that made it (2026-10-12).** LP-MCP made ~127,000 GHL requests in 24h
 (~63% of GHL's 200k/day cap, peaks 268/min at 5 AM) and the rehash sweep failed 1 pass in 4 on 429s, with no way to

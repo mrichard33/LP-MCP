@@ -347,6 +347,7 @@ import { registerHoldCompleteRoutes } from './agentic/hold-complete.js';
 // 2026-09-26 — website live chat answered synchronously (src/live-chat/).
 import { registerLiveChatRoutes } from './live-chat/index.js';
 import { registerSimulatorRoutes } from './tools/simulator-tools.js';
+import { registerLeadStageRoutes } from './admin/lead-stage-routes.js';
 // 2026-10-01 — answers a live chat message GHL never sent us (a contact merge drops the webhook).
 import { startLiveChatMissedReplyScheduler } from './jobs/live-chat-missed-reply-sweep.js';
 // ─── FB Publish Watchdog (alert on missed WF4 publish window) ────
@@ -645,6 +646,7 @@ registerHoldCompleteRoutes(app);
 // 2026-09-26 — POST /webhooks/live-chat-inbound, behind LIVE_CHAT_FAST_LANE_MODE (default off).
 registerLiveChatRoutes(app);
 registerSimulatorRoutes(app); // 2026-10-02 — POST /admin/bot-simulate: real bots, nothing sent or written
+registerLeadStageRoutes(app); // 2026-10-12 — GET /admin/lead-stage/:contactId: the conversation stage, read only
 
 // ─── Executor Heartbeat (failover for n8n cron) ──────────────────
 registerExecutorHeartbeatRoutes(app);
