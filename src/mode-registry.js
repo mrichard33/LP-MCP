@@ -113,6 +113,12 @@ export const MODES = Object.freeze([
     goLive: 'rehash.would_* events name only OPPFDN leads inside the 30-day window',
     note: 'Puts post-demo leads in the rehash stage and routes their calls to the rehash team.',
   }),
+  m('LEAD_STAGE_MODE', 'bot', 'enum', OSL, 'shadow', OSL_S, {
+    since: '2026-10-12', decider: 'Mark',
+    evidence: { table: 'lead_conversation_stage' },
+    goLive: 'run_bot_eval with lead_stage_mode=live is not worse than the shadow baseline, AND easy_yes books, renter gets no slots, competitor gets slots, stop_sms passes (handoff 2026-10-12)',
+    note: 'One stored NEPQ conversation stage per lead; live lets the planner and prompt read it (the qualifying gate, one bridge, the easy yes).',
+  }),
   m('PROMISED_CALLBACK_MODE', 'bot', 'enum', OSL, 'shadow', OSL_S, {
     since: '2026-10-07',
     evidence: { table: 'promised_callbacks', job: 'promised-callback-sweep' },
