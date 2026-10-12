@@ -11,6 +11,9 @@
 //     dnc                Five9 DNC, or a GHL opt-out tag. Never touched.
 //     not_a_lead         the call said this is not a sales lead: a refusal
 //                        disposition, or the Main Number line. Never touched.
+//     unmapped_number    a sales call to a number with no LP source on file
+//                        (src/inbound-capture-source.js). Listed, never sent:
+//                        it would reach LP under the chatbot's source.
 //     unverified         a read we needed failed (GHL search, GHL contact, LP
 //                        job lookup). Could not tell — never actioned, never
 //                        counted as a candidate.
@@ -36,7 +39,7 @@
 //   for somebody who opted out. Over-matching only costs a capture.
 
 export const LABELS = Object.freeze([
-  'dnc', 'not_a_lead', 'unverified', 'already_in_lp', 'existing_customer', 'has_ghl_contact', 'no_ghl_contact',
+  'dnc', 'not_a_lead', 'unmapped_number', 'unverified', 'already_in_lp', 'existing_customer', 'has_ghl_contact', 'no_ghl_contact',
 ]);
 
 // WHY not_a_lead (2026-10-12)
@@ -167,6 +170,8 @@ export function classifyCaller(caller, ctx = {}) {
   // caller's NEWEST call to every row of that caller.
   const notLead = ctx.notALead !== undefined ? ctx.notALead : notALeadReason(caller);
   if (notLead) return { label: 'not_a_lead', why: notLead };
+  // 2026-10-12: no LP source for the number called → listed, never sent.
+  if (ctx.noSource) return { label: 'unmapped_number', why: ctx.noSource };
 
   if (ghl.status === 'error' || (ghl.status === 'found' && !contact?.id)) {
     return { label: 'unverified', why: 'GHL lookup failed' };
@@ -238,7 +243,7 @@ export function formatDailySummary({ runDate, mode, summary, actioned = null }) 
     `Mode: ${MODE_LINE[mode] || mode}`,
     `Callers found: ${s.callers} (${s.calls} calls of 2+ min) · appointments set: ${s.appointments_set}`,
     `To capture: ${s.candidates} — has GHL contact ${b.has_ghl_contact}, no GHL contact ${b.no_ghl_contact}`,
-    `Left alone: DNC ${b.dnc} · not a lead ${b.not_a_lead} · already in LP ${b.already_in_lp} · existing customer ${b.existing_customer}`
+    `Left alone: DNC ${b.dnc} · not a lead ${b.not_a_lead} · number with no LP source ${b.unmapped_number} · already in LP ${b.already_in_lp} · existing customer ${b.existing_customer}`
       + (b.unverified ? ` · could not check ${b.unverified}` : ''),
     `By team: ${teams || 'none'}`,
   ];
