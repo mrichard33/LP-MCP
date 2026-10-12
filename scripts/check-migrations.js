@@ -234,6 +234,22 @@ export function filterDrift(sql, known = KNOWN_DRIFT_NOISE) {
   return { remaining, ignored };
 }
 
+/**
+ * Migration files the database has not applied yet (2026-10-12, Fix 2). The
+ * drift check compares the live database with this folder; on a PR that adds
+ * a migration the new file is not live yet, so leaving it in would report its
+ * own table as drift and fail every such PR. These are set aside for the diff
+ * only; `db push` applies them on merge.
+ */
+export function pendingMigrationFiles(listText, fileNames) {
+  const { localOnly } = parseMigrationList(listText);
+  const pending = new Set(localOnly);
+  return fileNames.filter((n) => {
+    const m = MIGRATION_NAME.exec(n);
+    return m && pending.has(m[1]);
+  });
+}
+
 /** Rule 4: the old numbered folder is frozen. */
 export function checkLegacySqlFrozen(names, freeze = LEGACY_SQL_FREEZE) {
   const problems = [];
@@ -275,31 +291,8 @@ export function runChecks({ root = ROOT, base = null } = {}) {
   return [...checkMigrationFiles(files), ...checkBaselineOrder(files), ...checkLegacySqlFrozen(legacy)];
 }
 
-/**
- * The migration files the database has not applied yet (local-only versions
- * in `supabase migration list`). 2026-10-12, the first real migration after
- * the baseline (lead_conversation_stage): the drift check replays the WHOLE
- * folder into a shadow database and compares it with production, so a new,
- * not-yet-merged migration always read as drift ("drop table …"). The
- * workflow sets these aside for the comparison; `db push` applies them on
- * merge, and from then on they are part of the comparison like any other. Pure.
- */
-export function pendingMigrationFiles(fileNames, localOnly) {
-  const pending = new Set(localOnly || []);
-  return (fileNames || []).filter((n) => {
-    const m = MIGRATION_NAME.exec(n);
-    return m && pending.has(m[1]);
-  });
-}
-
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const arg = (flag) => { const i = process.argv.indexOf(flag); return i > -1 ? process.argv[i + 1] : null; };
-  const pendingList = arg('--pending');
-  if (pendingList) {
-    const { localOnly } = parseMigrationList(readFileSync(pendingList, 'utf8'));
-    for (const f of pendingMigrationFiles(readdirSync(MIGRATIONS_DIR), localOnly)) console.log(f);
-    process.exit(0);
-  }
   const driftFile = arg('--drift');
   if (driftFile) {
     const { remaining, ignored } = filterDrift(readFileSync(driftFile, 'utf8'));
@@ -310,6 +303,18 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
       process.exit(1);
     }
     console.log('No drift.');
+    process.exit(0);
+  }
+  const pendingFile = arg('--pending');
+  if (pendingFile) {
+    const listText = readFileSync(pendingFile, 'utf8');
+    if (countLedgerRows(listText) === 0) {
+      console.error('✗ could not read the database ledger, so the pending migrations are unknown. This is not a pass.');
+      process.exit(1);
+    }
+    const dir = path.join(ROOT, MIGRATIONS_DIR);
+    const names = existsSync(dir) ? readdirSync(dir).filter((n) => n.endsWith('.sql')).sort() : [];
+    for (const n of pendingMigrationFiles(listText, names)) console.log(n);
     process.exit(0);
   }
   const listFile = arg('--migration-list');
