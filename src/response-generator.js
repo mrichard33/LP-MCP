@@ -271,6 +271,7 @@ import { notInterestedTurn } from './agentic/not-interested.js';
 import { humanizeReply, restoreQuestionMark } from './agentic/human-voice.js';
 import { enforceTeamVoice } from './agentic/team-voice.js';
 import { enforcePropertyScope } from './agentic/property-scope.js';
+import { dropFragmentOpener, dropStaleCallMention, normalizeSignature, isNearRepeat, replySimilarity, NEAR_REPEAT_NOTE } from './agentic/sms-format.js';
 import { enforceCallTiming, softenCallTiming, isTeamOpen, enforceRehashCallTiming } from './agentic/team-hours.js';
 import { enforceOneAsk } from './agentic/one-ask.js';
 import { findUnbackedBookingClaim, rewriteBookingClaims, bookingClaimNote, appointmentOnFile, noPromiseHandoffLine, NO_PROMISE_HANDOFF_RX } from './agentic/booking-claim.js';
@@ -3258,6 +3259,42 @@ export function planAsksForTime(plan, mode) {
  * Never truncates. The link and the disclosure are exempt because both are
  * fixed text the model may not shorten.
  */
+// 2026-10-12 (handoff PR 6): SMS replies took 11-43s (live chat 7-13s), driven
+// by guard redrafts (nepq_reference above all). One redraft at most (the send
+// handler's two attempts), and none once the turn is past this budget: the
+// first draft, with every deterministic fix the guards apply, ships instead.
+export const SMS_REDRAFT_BUDGET_MS = (() => {
+  const n = Number.parseInt(process.env.SMS_REDRAFT_BUDGET_MS ?? '15000', 10);
+  return Number.isFinite(n) && n > 0 ? n : 15000;
+})();
+
+/** May this turn ask the model for a re-write? Pure. */
+export function mayRedraft({ regenerating = false, startedAtMs = null, nowMs = Date.now(), channel = 'sms', budgetMs = SMS_REDRAFT_BUDGET_MS } = {}) {
+  if (regenerating) return false;
+  if (channel !== 'sms' || !Number.isFinite(startedAtMs)) return true;
+  return nowMs - startedAtMs <= budgetMs;
+}
+
+/**
+ * Fit an over-long SMS under the cap by dropping WHOLE sentences, never by
+ * cutting one (2026-10-12, handoff PR 6; batch 3 T5 shipped over 320 after the
+ * redraft). The first sentence (the answer) and the last (the ask or the
+ * sign-off) stay; middle sentences go, newest first. A reply that cannot get
+ * under the cap that way ships as it is. Pure.
+ */
+export function trimSmsToCap(text, max = SMS_MAX_CHARS) {
+  const s = String(text ?? '').trim();
+  if (s.length <= max) return { text: s, trimmed: false };
+  const parts = s.split(/(?<=[.!?])\s+/).filter(Boolean);
+  if (parts.length < 3) return { text: s, trimmed: false };
+  const first = parts[0];
+  const last = parts[parts.length - 1];
+  const middle = parts.slice(1, -1);
+  while (middle.length && [first, ...middle, last].join(' ').length > max) middle.pop();
+  const out = [first, ...middle, last].join(' ');
+  return out.length <= max ? { text: out, trimmed: true } : { text: s, trimmed: false };
+}
+
 export function decideSmsLength(text, { mode = SMS_LENGTH_GUARD_MODE, retry = false, max = SMS_MAX_CHARS } = {}) {
   const s = String(text ?? '');
   const chars = s.length;
@@ -3274,6 +3311,13 @@ export function decideSmsLength(text, { mode = SMS_LENGTH_GUARD_MODE, retry = fa
 }
 
 export async function generateResponse(contactId, channel, triggerMessage, opts = {}) {
+  // PR 6: when this turn started (the send handler's first attempt), for the redraft budget.
+  const generationStartedAt = Number.isFinite(opts.generationStartedAt) ? opts.generationStartedAt : Date.now();
+  const redraftOk = () => {
+    const ok = mayRedraft({ regenerating: !!opts.regenerationNote, startedAtMs: generationStartedAt, channel });
+    if (!ok && !opts.regenerationNote) console.log(`[Redraft] ${contactId} past ${SMS_REDRAFT_BUDGET_MS}ms (${Date.now() - generationStartedAt}ms): shipping the guarded first draft`);
+    return ok;
+  };
   // 2026-10-06 (AI OS batch 1, PR 3; src/security/untrusted-text.js): every
   // read and the prompt below see the inbound with invisible characters
   // removed (zero-width, bidi, TAG). The send handler stores the original.
@@ -4841,7 +4885,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       // Part 7: the model's version of a reference line failed its checks.
       // One re-write (one model call, the reads are prepared); the reference
       // ships as the backup only if that fails too.
-      if (enforced.failed?.length && !opts.regenerationNote) {
+      if (enforced.failed?.length && redraftOk()) {
         // The draft itself, so a failed check can be read from the logs
         // (2026-10-03: the replay could show only the failure codes).
         console.warn(`[NEPQ] ${contactId} ${nepqPlan.required_move} draft failed (${enforced.failed.join(',')}) — one re-write | draft="${String(validated.message || '').replace(/\s+/g, ' ').slice(0, 200)}"`);
@@ -4875,7 +4919,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       } else if (recheck?.kind === 'email' && !RECHECK_RX.test(validated.message)) {
         // Part 7: the model was told (CONTACT RE-CHECK hint); one re-write,
         // then the reference line.
-        if (!opts.regenerationNote) {
+        if (redraftOk()) {
           const err = new Error('contact_recheck: the draft did not ask them to re-check the email');
           err.regenerationNote = recheckHint(recheck);
           throw err;
@@ -4969,7 +5013,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       validated.message = riskFree;
       draftPatch('carrier_risk', carrierRiskNote(risks));
     } else if (risks.length) {
-      if (opts.regenerationNote) {
+      if (!redraftOk()) {
         console.error(`[ResponseGenerator] \u26d4 carrier-risk survived regeneration for ${contactId}: ${risks.join(', ')} — sending anyway, delivery may be blocked`);
       } else {
         console.warn(`[ResponseGenerator] \u26a0\ufe0f carrier-risk for ${contactId}: ${risks.join(', ')} — regenerating once`);
@@ -4980,6 +5024,31 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     }
   }
 
+  // ─── SMS format (2026-10-12, handoff PR 6; AIOS batch 3) ───
+  // A fragment opener goes; a stale "our call time passed" nobody raised goes;
+  // the sign-off is exactly once, at the end, on the reply that signs the
+  // thread; a reply nearly identical to our last one is re-written once (or,
+  // past the budget, ships with the verbatim repeats already dropped).
+  if (channel === 'sms' && validated.message) {
+    const frag = dropFragmentOpener(validated.message);
+    if (frag.changed) { console.warn(`[SmsFormat] ${contactId} fragment opener dropped`); validated.message = frag.text; }
+    const lpPhase = context.lp?.appointment_phase || null;
+    const recentCall = (lpPhase === 'past' || lpPhase === 'in_window') && Math.abs(Number(context.lp?.appointment_minutes_delta)) <= 1440;
+    const stale = dropStaleCallMention(validated.message, { inbound: triggerMessage, recentCall });
+    if (stale.changed) { console.warn(`[SmsFormat] ${contactId} stale call mention dropped`); validated.message = stale.text; }
+    const lastOutbound = [...(context.conversation_recent || [])].reverse().find(m => String(m?.direction || '').toLowerCase() === 'outbound');
+    const lastOutText = String(lastOutbound?.text ?? lastOutbound?.body ?? '');
+    if (isNearRepeat(validated.message, lastOutText) && redraftOk()) {
+      console.warn(`[SmsFormat] ${contactId} near repeat of the last message (${replySimilarity(validated.message, lastOutText).toFixed(2)}) — re-writing once`);
+      const err = new Error('near_repeat_of_last_message');
+      err.regenerationNote = NEAR_REPEAT_NOTE;
+      throw err;
+    }
+    const ident = resolveSmsSenderIdentity(opts.fromNumber || null, { rehash: rehash ? { active: true, repName: rehash.repName } : null });
+    const sig = normalizeSignature(validated.message, { signature: ident.signature, sign: !threadCarriesSignOff(context.conversation_recent || [], ident.signature) });
+    if (sig.changed) validated.message = sig.text;
+  }
+
   // ─── SMS length (2026-10-10, audit 2026-10-09) ───
   // The prompt says "320 max" and nothing enforced it. Same regenerate-once
   // shape as the carrier-risk guard above: opts.regenerationNote set means this
@@ -4988,13 +5057,23 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // worse than a long one. A booking link or the approved AI-disclosure script
   // is fixed text the model may not shorten, so a reply carrying one is exempt.
   if (channel === 'sms') {
-    const length = decideSmsLength(validated.message, { retry: !!opts.regenerationNote });
+    const length = decideSmsLength(validated.message, { retry: !redraftOk() });
     if (length.over) {
       if (length.action === 'regenerate') {
         console.warn(`[SmsLength] over chars=${length.chars} contact=${contactId} — regenerating once`);
         const err = new Error(`sms_too_long: ${length.chars} chars (max ${SMS_MAX_CHARS})`);
         err.regenerationNote = length.note;
         throw err;
+      }
+      // PR 6: no re-write left (or none in shadow): drop whole middle sentences
+      // to get under the cap, never cut one.
+      if (length.action === 'ship_after_retry' || length.action === 'shadow') {
+        const fit = trimSmsToCap(validated.message);
+        if (fit.trimmed) {
+          console.warn(`[SmsLength] trimmed ${length.chars} → ${fit.text.length} chars (whole sentences) contact=${contactId}`);
+          validated.message = fit.text;
+          validated.sms_trimmed = true;
+        }
       }
       if (length.action === 'ship_after_retry') console.error(`[SmsLength] over after retry chars=${length.chars} contact=${contactId}`);
       else if (length.action === 'shadow') console.log(`[SmsLength] shadow chars=${length.chars} contact=${contactId}`);
@@ -5108,7 +5187,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // stacked patches read badly: ONE writer-only re-write instead (the send
   // handler's next attempt reuses everything prepared for this turn, so it is
   // a single model call), with every note. A re-write ships as patched.
-  const budget = decidePatchBudget(draftPatches, { regenerating: !!opts.regenerationNote, replaced: nepqDraftReplaced });
+  const budget = decidePatchBudget(draftPatches, { regenerating: !redraftOk(), replaced: nepqDraftReplaced });
   if (budget.rewrite) {
     console.warn(`[ResponseGenerator] ${draftPatches.length} patches on the first draft for ${contactId} (${draftPatches.map(p => p.tag).join(',')}) — one re-write`);
     const err = new Error(`draft_patches: ${draftPatches.map(p => p.tag).join(',')}`);
