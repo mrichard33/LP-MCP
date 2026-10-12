@@ -182,6 +182,8 @@ export const MODES = Object.freeze([
   }),
   m('KB_EXEMPLAR_MODE', 'knowledge', 'enum', OSL, 'off', OSL_S, {
     since: '2026-09-03',
+    // tier = 'kb_exemplars'; a bot-gate run logs mode sim_<mode>, never shadow.
+    evidence: { table: 'kb_vector_queries' },
     note: 'Adds past winning replies as examples.',
   }),
   m('KB_CALL_MOMENTS_MODE', 'knowledge', 'enum', OSL, 'off', OSL_S, {

@@ -285,6 +285,7 @@ export function scoreRun(results, meta = {}) {
     invariants_version: INVARIANTS_VERSION,
     scoring_version: SCORING_VERSION,
     lead_stage_mode: (results || []).find(r => r?.lead_stage_mode)?.lead_stage_mode || null,
+    kb_exemplar_mode: (results || []).find(r => r?.kb_exemplar_mode)?.kb_exemplar_mode || null,
     ...meta,
     conversations: scored.length,
     passed,
@@ -325,7 +326,7 @@ export function compareScorecards(current, previous) {
 
 /** One short block for a person, worst first. Pure. */
 export function formatScorecard(card, comparison = null) {
-  const lines = [`Scorecard: ${card.passed}/${card.conversations} conversations pass (${Math.round((card.pass_rate || 0) * 100)}%) · checks ${card.invariants_version}${card.prompt_version ? ` · prompt ${card.prompt_version}` : ''}${card.git_sha ? ` · ${String(card.git_sha).slice(0, 7)}` : ''}`];
+  const lines = [`Scorecard: ${card.passed}/${card.conversations} conversations pass (${Math.round((card.pass_rate || 0) * 100)}%) · checks ${card.invariants_version}${card.prompt_version ? ` · prompt ${card.prompt_version}` : ''}${card.git_sha ? ` · ${String(card.git_sha).slice(0, 7)}` : ''}${card.kb_exemplar_mode ? ` · exemplars ${card.kb_exemplar_mode}` : ''}`];
   if (comparison) lines.push(comparison.worse === true ? `WORSE THAN LAST RUN: ${comparison.reasons.join('; ')}` : comparison.worse === false ? 'Not worse than the last run.' : `Not compared: ${comparison.reasons.join('; ')}`);
   for (const r of card.results.filter(x => !x.pass)) {
     lines.push(`  ✗ ${r.key}: ${r.failures.slice(0, 4).map(f => `${f.code}${f.turn ? `@${f.turn}` : ''}`).join(', ')}${r.failures.length > 4 ? ` (+${r.failures.length - 4})` : ''}`);
