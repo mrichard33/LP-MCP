@@ -25,6 +25,7 @@
 
 import { readdirSync, readFileSync, existsSync } from 'node:fs';
 import { execSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -47,18 +48,55 @@ export const REMOTE_VERSIONS_PINNED = [
 export const MIGRATION_NAME = /^(\d{14})_([a-z0-9_]+)\.sql$/;
 export const DESTRUCTIVE_MARKER = /^\s*--\s*destructive:\s*approved by\s+\S.*\d{4}-\d{2}-\d{2}/mi;
 
-/** Strip comments and dollar-quoted bodies so a word inside a comment does not count. */
+/**
+ * Blank out comments, string literals and dollar-quoted bodies so a word
+ * inside them does not count. A tokenizer, not regexes in sequence: the
+ * baseline dump (2026-10-12) carries a COMMENT ON TABLE whose text says
+ * "Safe to drop: drop table …", and a comment can hold an apostrophe or a
+ * string can hold "--", which order-dependent regexes get wrong.
+ */
 function codeOnly(sql) {
-  return sql
-    .replace(/\$(\w*)\$[\s\S]*?\$\1\$/g, ' ')
-    .replace(/--[^\n]*/g, ' ')
-    .replace(/\/\*[\s\S]*?\*\//g, ' ');
+  let out = '';
+  let i = 0;
+  while (i < sql.length) {
+    const c = sql[i];
+    const two = sql.slice(i, i + 2);
+    if (two === '--') {
+      const end = sql.indexOf('\n', i);
+      i = end === -1 ? sql.length : end;
+      out += ' ';
+    } else if (two === '/*') {
+      const end = sql.indexOf('*/', i + 2);
+      i = end === -1 ? sql.length : end + 2;
+      out += ' ';
+    } else if (c === "'") {
+      i += 1;
+      while (i < sql.length) {
+        if (sql[i] === "'" && sql[i + 1] === "'") { i += 2; continue; }
+        if (sql[i] === "'") { i += 1; break; }
+        i += 1;
+      }
+      out += ' ';
+    } else if (c === '$') {
+      const m = /^\$(\w*)\$/.exec(sql.slice(i, i + 64));
+      if (!m) { out += c; i += 1; continue; }
+      const end = sql.indexOf(m[0], i + m[0].length);
+      i = end === -1 ? sql.length : end + m[0].length;
+      out += ' ';
+    } else {
+      out += c;
+      i += 1;
+    }
+  }
+  return out;
 }
 
 export function isDestructive(sql) {
   const s = codeOnly(sql);
   return /\bDROP\s+(TABLE|SCHEMA|VIEW|MATERIALIZED\s+VIEW|FUNCTION|INDEX|TYPE|COLUMN|POLICY|TRIGGER|ROLE)\b/i.test(s)
-    || /\bTRUNCATE\b/i.test(s)
+    // Only a TRUNCATE statement. "BEFORE TRUNCATE ON tool_audit_log" is the
+    // trigger that FORBIDS truncating the audit log (sql/153), not a truncate.
+    || /(^|;)\s*TRUNCATE\b/i.test(s)
     || /\bALTER\s+TABLE\b[\s\S]*?\bALTER\s+(COLUMN\s+)?\w+\s+(SET\s+DATA\s+)?TYPE\b/i.test(s)
     || /\bALTER\s+TABLE\b[\s\S]*?\bDROP\s+(COLUMN|CONSTRAINT)\b/i.test(s)
     || /\bDELETE\s+FROM\b/i.test(s);
@@ -117,6 +155,20 @@ export function checkBaselineOrder(files) {
 }
 
 /**
+ * Rows the ledger table actually printed (2026-10-12). A `migration list` that
+ * could not connect prints an error and no table; parsing that found no
+ * mismatch and the step printed a pass. Zero rows means "could not read".
+ */
+export function countLedgerRows(text) {
+  let n = 0;
+  for (const raw of String(text).split('\n')) {
+    const cols = raw.split(/[|│]/).map((c) => c.trim().replace(/`/g, ''));
+    if (cols.length >= 2 && (/^\d{14}$/.test(cols[0]) || /^\d{14}$/.test(cols[1]))) n += 1;
+  }
+  return n;
+}
+
+/**
  * Parse `supabase migration list --linked`. Any line with a version in the
  * REMOTE column and nothing in LOCAL is a migration the database has and the
  * repo does not: exactly the state Fix 1 exists to end.
@@ -126,7 +178,9 @@ export function parseMigrationList(text) {
   const remoteOnly = [];
   for (const raw of String(text).split('\n')) {
     if (!/\d{14}/.test(raw)) continue;
-    const cols = raw.split(/[|│]/).map((c) => c.trim());
+    // The CLI prints versions in backticks (`20260728000000`); without the
+    // strip nothing ever matched and every mismatch read as a pass (2026-10-12).
+    const cols = raw.split(/[|│]/).map((c) => c.trim().replace(/`/g, ''));
     if (cols.length < 2) continue;
     const local = /^\d{14}$/.test(cols[0]) ? cols[0] : null;
     const remote = /^\d{14}$/.test(cols[1]) ? cols[1] : null;
@@ -134,6 +188,50 @@ export function parseMigrationList(text) {
     if (remote && !local) remoteOnly.push(remote);
   }
   return { localOnly, remoteOnly };
+}
+
+/**
+ * Drift statements that are artefacts of how the live database was BUILT, not
+ * differences in what it IS. Each entry is pinned by the hash of the exact
+ * statement `supabase db diff` prints, so a real edit to the same object
+ * changes the hash and fails the check again. Never add an entry without the
+ * reason and the evidence.
+ */
+export const KNOWN_DRIFT_NOISE = [
+  {
+    // 2026-10-12: lp_leads once had a column that was later dropped, so live
+    // lp_verified_at is attnum 60 while a database rebuilt from the baseline
+    // has it at 59. The view text is identical on both sides; the differ
+    // reads the shifted column reference as a changed view.
+    hash: '1362b47b52e6cf4a',
+    object: 'public.v_supabase_freshness',
+    why: 'dropped-column attnum gap in lp_leads (live 60, rebuilt 59); definition identical',
+  },
+];
+
+function statementHash(stmt) {
+  return createHash('sha256').update(stmt).digest('hex').slice(0, 16);
+}
+
+/** Split `db diff` output into statements, whitespace-collapsed. */
+export function splitDriftStatements(sql) {
+  return String(sql)
+    .split(/;\s*(?:\n|$)/)
+    .map((s) => s.replace(/--[^\n]*/g, ' ').replace(/\s+/g, ' ').trim())
+    .filter(Boolean);
+}
+
+/** Separate known build artefacts from real drift. */
+export function filterDrift(sql, known = KNOWN_DRIFT_NOISE) {
+  const byHash = new Map(known.map((k) => [k.hash, k]));
+  const remaining = [];
+  const ignored = [];
+  for (const stmt of splitDriftStatements(sql)) {
+    const k = byHash.get(statementHash(stmt));
+    if (k) ignored.push(k);
+    else remaining.push(stmt);
+  }
+  return { remaining, ignored };
 }
 
 /** Rule 4: the old numbered folder is frozen. */
@@ -179,9 +277,26 @@ export function runChecks({ root = ROOT, base = null } = {}) {
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const arg = (flag) => { const i = process.argv.indexOf(flag); return i > -1 ? process.argv[i + 1] : null; };
+  const driftFile = arg('--drift');
+  if (driftFile) {
+    const { remaining, ignored } = filterDrift(readFileSync(driftFile, 'utf8'));
+    for (const k of ignored) console.log(`::notice::known build artefact, not drift: ${k.object} (${k.why})`);
+    if (remaining.length) {
+      console.error(`✗ the live schema differs from the migrations in this repo (${remaining.length} statement(s)):`);
+      for (const s of remaining) console.error(`  ${s.slice(0, 300)}`);
+      process.exit(1);
+    }
+    console.log('No drift.');
+    process.exit(0);
+  }
   const listFile = arg('--migration-list');
   if (listFile) {
-    const { localOnly, remoteOnly } = parseMigrationList(readFileSync(listFile, 'utf8'));
+    const listText = readFileSync(listFile, 'utf8');
+    if (countLedgerRows(listText) === 0) {
+      console.error('✗ could not read the database ledger (no rows in `supabase migration list`); see the error above. This is not a pass.');
+      process.exit(1);
+    }
+    const { localOnly, remoteOnly } = parseMigrationList(listText);
     if (remoteOnly.length) {
       console.error(`✗ the database lists ${remoteOnly.length} migration(s) this repo does not: ${remoteOnly.join(', ')}. Add a commented stub for each under ${MIGRATIONS_DIR}/.`);
       process.exit(1);

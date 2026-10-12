@@ -103,6 +103,7 @@ jobs:
       - name: Compare the repo ledger with the database ledger
         if: steps.secrets.outputs.ok == 'true'
         run: |
+          set -o pipefail
           supabase migration list --linked | tee migration-list.txt
           node scripts/check-migrations.js --migration-list migration-list.txt
 
@@ -115,13 +116,22 @@ jobs:
             echo "No *_baseline_dump.sql yet; run this workflow manually with action=baseline. Skipping the drift check."
             exit 0
           fi
-          supabase db diff --linked --schema public,ai_os > drift.sql || true
-          if [ -s drift.sql ] && grep -vqE '^\s*(--.*)?$' drift.sql; then
+          # 2026-10-12: this line used to end in `|| true`, so when the shadow
+          # rebuild failed ("type public.vector does not exist") the diff wrote
+          # nothing and the step printed "No drift." with no comparison run.
+          # A diff that cannot run is a failure, never a clean bill.
+          if ! supabase db diff --linked --schema public,ai_os > drift.sql; then
+            echo "::error::The drift check could not run (see the error above), so nothing was compared. Fix the cause; do not read this as no drift."
+            exit 1
+          fi
+          # check-migrations.js drops only the pinned build artefacts in
+          # KNOWN_DRIFT_NOISE (each by the hash of its exact statement) and
+          # fails on anything else.
+          if ! node scripts/check-migrations.js --drift drift.sql; then
             echo "::error::The live schema differs from the migrations in this repo. Either add a migration for the change, or someone changed the database by hand."
             cat drift.sql
             exit 1
           fi
-          echo "No drift."
 
   push:
     name: Apply new migrations
@@ -191,6 +201,12 @@ jobs:
             echo "-- by this same workflow run (supabase migration repair), so \`db push\` never"
             echo "-- executes it against production. A fresh database is built from it."
             echo "--"
+            # The dump leaves out what a fresh database needs first (2026-10-12):
+            # the vector extension (in public), pg_trgm (in extensions) and the
+            # lf_report_svc role its GRANTs name.
+            echo 'CREATE EXTENSION IF NOT EXISTS "vector" WITH SCHEMA "public";'
+            echo 'CREATE EXTENSION IF NOT EXISTS "pg_trgm" WITH SCHEMA "extensions";'
+            echo "DO \$\$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'lf_report_svc') THEN CREATE ROLE \"lf_report_svc\" NOLOGIN; END IF; END \$\$;"
             cat "$FILE"
           } > "$FILE.tmp" && mv "$FILE.tmp" "$FILE"
           supabase migration repair --linked --status applied "$VERSION"
@@ -212,6 +228,11 @@ jobs:
             -m "WHY: the migrations ledger needs a true starting point; the 157 hand-applied sql/ files cannot be replayed. From this file forward every schema change is a migration in supabase/migrations/ and the drift check is meaningful." \
             -m "IMPACT: none at runtime. Nothing was executed against the database."
           git push -u origin "$BR"
+          # 2026-10-12: the repo setting "Allow GitHub Actions to create pull
+          # requests" is off, so gh pr create was refused AFTER the dump, the
+          # repair and the push had all succeeded, and the run read as failed.
+          # The branch is the deliverable; a refused PR is a notice, not a failure.
           gh pr create --base main --head "$BR" \
             --title "chore(db): baseline dump of the LP schema" \
-            --body "Produced by the db-migrate workflow (action=baseline). Review that the file is the schema you expect, then merge. The database already lists this version as applied, so merging runs nothing against production; it only makes the drift check live."
+            --body "Produced by the db-migrate workflow (action=baseline). Review that the file is the schema you expect, then merge. The database already lists this version as applied, so merging runs nothing against production; it only makes the drift check live." \
+          || echo "::notice::Branch $BR is pushed, but GitHub Actions may not open pull requests in this repo. Open one from https://github.com/${{ github.repository }}/pull/new/$BR"

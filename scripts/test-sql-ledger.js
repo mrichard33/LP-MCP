@@ -17,6 +17,9 @@ import {
   checkBaselineOrder,
   checkLegacySqlFrozen,
   parseMigrationList,
+  countLedgerRows,
+  filterDrift,
+  KNOWN_DRIFT_NOISE,
   isDestructive,
   hasCode,
   runChecks,
@@ -57,6 +60,13 @@ test('isDestructive reads SQL, not comments or function bodies', () => {
   assert.equal(isDestructive('TRUNCATE t;'), true);
   assert.equal(isDestructive('DELETE FROM t WHERE id = 1;'), true);
   assert.equal(isDestructive('ALTER TABLE t ADD COLUMN IF NOT EXISTS c text;'), false);
+  // 2026-10-12 baseline dump: a comment's TEXT and the trigger that forbids a
+  // truncate are not destructive; a real statement after them still is.
+  assert.equal(isDestructive("COMMENT ON TABLE t IS 'Safe to drop: drop table t;';"), false);
+  assert.equal(isDestructive("COMMENT ON TABLE t IS 'it''s -- fine'; CREATE TABLE y (id int);"), false);
+  assert.equal(isDestructive('CREATE TRIGGER no_trunc BEFORE TRUNCATE ON t FOR EACH STATEMENT EXECUTE FUNCTION f();'), false);
+  assert.equal(isDestructive("COMMENT ON TABLE t IS 'x';\nTRUNCATE t;"), true);
+  assert.equal(isDestructive("COMMENT ON TABLE t IS 'x'; DROP TABLE t;"), true);
 });
 
 test('until a baseline dump exists, only comment-only stubs are allowed', () => {
@@ -93,6 +103,24 @@ test('parseMigrationList finds remote-only and local-only versions in both table
   assert.deepEqual(parseMigrationList(box), { localOnly: [], remoteOnly: ['20261006212452'] });
 });
 
+// 2026-10-12: the real CLI output wraps versions in backticks, and a list that
+// could not connect prints no table at all. Both read as a pass before.
+test('parseMigrationList reads the backticked versions the CLI really prints', () => {
+  const real = [
+    '   Local            | Remote           | Time (UTC)            ',
+    '  ------------------|------------------|-----------------------',
+    '   `20260728000000` | `20260728000000` | `2026-07-28 00:00:00` ',
+    '                    | `20261012164849` | `2026-10-12 16:48:49` ',
+  ].join('\n');
+  assert.deepEqual(parseMigrationList(real), { localOnly: [], remoteOnly: ['20261012164849'] });
+  assert.equal(countLedgerRows(real), 2);
+});
+
+test('a ledger list that could not connect has no rows, so it is not a pass', () => {
+  const failed = 'Connecting to remote database...\nfailed to connect to postgres: password authentication failed for user "postgres" (SQLSTATE 28P01)\n';
+  assert.equal(countLedgerRows(failed), 0);
+});
+
 test('sql/NNN is frozen: a 158 fails, 157 and date-named files do not', () => {
   assert.deepEqual(checkLegacySqlFrozen(['157_agentic_no_reply_followups.sql', 'README.md', 'seeds']), []);
   const p = checkLegacySqlFrozen(['158_new_thing.sql']);
@@ -119,4 +147,35 @@ test('every stub says why it is empty', () => {
     if (hasCode(sql)) continue;
     assert.match(sql, /ALREADY APPLIED/, `${n}: a stub must say it was already applied`);
   }
+});
+
+// 2026-10-12: the first real drift run on the baseline listed one view whose
+// definition is identical on both sides (a dropped-column attnum gap in
+// lp_leads). It is pinned by statement hash; anything else is still drift.
+const VIEW_DRIFT = readFileSync(path.join(ROOT, 'scripts/fixtures/drift-v-supabase-freshness.sql'), 'utf8');
+
+test('the pinned build artefact is ignored, and only it', () => {
+  const { remaining, ignored } = filterDrift(VIEW_DRIFT);
+  assert.equal(remaining.length, 0);
+  assert.deepEqual(ignored.map((k) => k.object), ['public.v_supabase_freshness']);
+});
+
+test('a real edit to the same view is drift again', () => {
+  const edited = VIEW_DRIFT.replace("'365 days'", "'30 days'");
+  const { remaining } = filterDrift(edited);
+  assert.equal(remaining.length, 1);
+});
+
+test('any other statement next to the artefact is reported', () => {
+  const { remaining, ignored } = filterDrift(`${VIEW_DRIFT}\nalter table "public"."lp_leads" add column "x" text;\n`);
+  assert.equal(ignored.length, 1);
+  assert.deepEqual(remaining, ['alter table "public"."lp_leads" add column "x" text']);
+});
+
+test('empty diff output is no drift', () => {
+  assert.deepEqual(filterDrift('\n\n'), { remaining: [], ignored: [] });
+});
+
+test('every known-noise entry says why', () => {
+  for (const k of KNOWN_DRIFT_NOISE) assert.ok(k.hash && k.object && k.why.length > 20, k.object);
 });
