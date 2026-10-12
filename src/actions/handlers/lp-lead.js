@@ -337,6 +337,14 @@ async function reuseExistingLpLead(action, contactId, existing, appt) {
         target_id: existing.ldsId,
         action_payload: { ...(action.action_payload || {}), appt_date: appt.adate, appt_time: appt.atime },
       });
+      // 2026-10-12: an LP refusal is now RETURNED, not thrown, so it keeps the
+      // same "set it by hand" card as a thrown failure below.
+      if (apptResult?.action === 'lp_appointment_refused') {
+        await sendGroupMeMessage(
+          `⚠️ LP APPT NOT SET on reused lead ${existing.ldsId} (contact ${contactId}, ${appt.adate} ${appt.atime}): ` +
+          `LP said "${String(apptResult.lp_message || '').slice(0, 200)}"\n👉 Set the appointment in LP by hand.`
+        ).catch(() => {});
+      }
     } catch (err) {
       apptResult = { action: 'set_appt_error', error: err.message };
       // We did not create a lead, so this appointment now exists only in GHL.

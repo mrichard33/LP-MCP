@@ -247,7 +247,8 @@ export const MODES = Object.freeze([
   }),
   m('LP_APPT_GUARD_MODE', 'lp', 'enum', OSE, 'shadow', OSE_S, {
     since: '2026-09-13',
-    note: 'Guards LP appointment writes.',
+    evidence: { events: ['lp.appointment_refused'] },
+    note: 'Refuses to mark a contact synced when LP refused the appointment (read fixed 2026-10-12).',
   }),
   m('LP_INBOUND_DEFER_MODE', 'lp', 'enum', ['off', 'shadow', 'on'], 'shadow', { live: ['on'], shadow: ['shadow'], off: ['off'] }, {
     since: '2026-09-12',
