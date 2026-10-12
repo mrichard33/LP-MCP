@@ -1118,6 +1118,16 @@ walked into it — the three FAQs retrieval offered were all irrelevant (top 0.4
 model's own knowledge saved the reply. When a topic is retired because the answer CHANGED, the new
 answer still has to exist (`LIB-P12`).
 
+**Past-win examples are cleaned before a model sees them (2026-10-12).** `KB_EXEMPLAR_MODE` (shadow) served 5,670
+examples in 14 days: 24% were GHL's raw live-chat HTML, about a quarter named another lead's day and time, 222 promised
+a call "right now" (the Monica reply) and 24 were workflow drips. `prepareExemplar` (`src/knowledge/exemplars-core.js`)
+is the one cleaning pass, at write time, in place for older rows (`clean_version`), and again at serve time: HTML out;
+the contact's name, a greeting name, streets, days and times replaced by `[name]` / `[address]` / `[day]` / `[time]`;
+call immediacy softened (`softenCallTiming`) and the voice humanized; a drip, a too-short reply or one that fails
+`checkReply` is stored inactive with an `excluded_reason`. Bump `EXEMPLAR_CLEAN_VERSION` when the pass changes. The gate
+can try the mode without Railway: `run_bot_eval` / `simulate_bot_conversation` take `kb_exemplar_mode`
+(`src/simulator/sim-overrides.js`, AsyncLocalStorage; a sim's audit rows log mode `sim_<mode>`).
+
 ## Supabase
 
 **Two separate instances — LP and HL.** No cross-joins; fetch from one and filter against the other.

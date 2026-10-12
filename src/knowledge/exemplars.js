@@ -18,6 +18,11 @@
  * so the sweep fetches from HL and joins in JS.
  *
  * v1.0 — 2026-09-03. Initial.
+ * v1.1 — 2026-10-12. Every row goes through prepareExemplar (exemplars-core.js):
+ *   HTML out, other leads' names / days / times replaced, drips and replies that
+ *   break a hard check stored inactive with an excluded_reason. Rows stored
+ *   before v1.1 are re-cleaned in place (clean_version) and re-embedded when the
+ *   lead side changed. The tier asks for 3x the matches and serves only clean ones.
  */
 
 import supabase from '../supabase.js';
@@ -34,6 +39,8 @@ import {
   dropTemplatedReplies,
   labelOutcome,
   withTimeout,
+  prepareExemplar,
+  EXEMPLAR_CLEAN_VERSION,
 } from './exemplars-core.js';
 
 const KB_EXEMPLAR_MIN_SIMILARITY      = parseFloat(process.env.KB_EXEMPLAR_MIN_SIMILARITY || '0.45');
@@ -43,6 +50,8 @@ const KB_EXEMPLAR_BACKFILL_DAYS       = parseInt(process.env.KB_EXEMPLAR_BACKFIL
 const KB_EXEMPLAR_SWEEP_INTERVAL_MS   = parseInt(process.env.KB_EXEMPLAR_SWEEP_INTERVAL_MS || '21600000', 10);
 const KB_VECTOR_TIMEOUT_MS            = parseInt(process.env.KB_VECTOR_TIMEOUT_MS || '1500', 10);
 const EMBED_BATCH = 200;
+const RECLEAN_BATCH = 500;
+const RECLEAN_MAX_PER_PASS = 5000;
 
 // ── Retrieval ──────────────────────────────────────────────────────
 
@@ -67,12 +76,20 @@ export async function runExemplarTier(messageText, pack, mode, getQueryEmbedding
   const started = Date.now();
   let rows = [];
   let error = null;
+  let dropped = 0;
   try {
-    rows = await withTimeout(
-      (async () => matchExemplars(await getQueryEmbedding()))(),
+    // v1.1: ask for 3x, serve only rows that are clean right now (a row the
+    // re-clean has not reached yet is cleaned here, or skipped).
+    const candidates = await withTimeout(
+      (async () => matchExemplars(await getQueryEmbedding(), { limit: KB_EXEMPLAR_MATCH_COUNT * 3 }))(),
       KB_VECTOR_TIMEOUT_MS,
       'kb exemplars',
     );
+    for (const r of candidates) {
+      const clean = prepareExemplar(r);
+      if (clean.excluded_reason) { dropped++; continue; }
+      if (rows.length < KB_EXEMPLAR_MATCH_COUNT) rows.push({ ...r, ...clean });
+    }
   } catch (err) {
     error = err.message;
   }
@@ -80,7 +97,7 @@ export async function runExemplarTier(messageText, pack, mode, getQueryEmbedding
   const top = typeof rows[0]?.similarity === 'number' ? rows[0].similarity : null;
   console.log(
     `[Exemplars] ${mode}: intent=${pack.intent_class} matches=${rows.length}` +
-    ` top_sim=${top === null ? 'n/a' : top.toFixed(3)} latency=${latency}ms` +
+    ` top_sim=${top === null ? 'n/a' : top.toFixed(3)} dropped_unclean=${dropped} latency=${latency}ms` +
     (error ? ` error=${error}` : ''),
   );
   logKbQuery({
@@ -158,6 +175,63 @@ async function fetchAppointmentsByContact(contactIds) {
   return byContact;
 }
 
+/** The contact's own first/last name, so prepareExemplar can scrub it. Best-effort: a failed read scrubs by pattern only. */
+async function fetchContactNames(contactIds) {
+  const byContact = new Map();
+  try {
+    for (const ids of chunk([...new Set(contactIds)], 200)) {
+      const list = ids.map((id) => `'${esc(id)}'`).join(',');
+      const rows = await hlRunSQL(`SELECT ghl_contact_id, first_name, last_name FROM contacts WHERE ghl_contact_id IN (${list})`);
+      for (const r of rows) byContact.set(r.ghl_contact_id, [r.first_name, r.last_name].filter(Boolean));
+    }
+  } catch (err) {
+    console.warn('[Exemplars] contact name read failed (names scrubbed by pattern only):', err.message);
+  }
+  return byContact;
+}
+
+/** Does kb_exemplars carry the v1.1 columns yet? The deploy can boot before CI applies the migration. */
+async function hasCleanColumns() {
+  const { error } = await supabase.from('kb_exemplars').select('clean_version').limit(1);
+  if (error) console.warn('[Exemplars] clean_version column missing (migration not applied yet); writing as before:', error.message);
+  return !error;
+}
+
+/**
+ * Re-clean rows stored before the current EXEMPLAR_CLEAN_VERSION, in place.
+ * The stored text still holds the original HTML, dates and names, so nothing is
+ * lost. A changed lead side drops its embedding; step 5 re-embeds it.
+ */
+async function recleanStoredExemplars(summary) {
+  while (summary.recleaned < RECLEAN_MAX_PER_PASS) {
+    const { data, error } = await supabase.from('kb_exemplars')
+      .select('id, ghl_contact_id, channel, inbound_text, reply_text, prior_outbound')
+      .lt('clean_version', EXEMPLAR_CLEAN_VERSION).order('id', { ascending: true }).limit(RECLEAN_BATCH);
+    if (error) { console.warn('[Exemplars] re-clean read failed:', error.message); return; }
+    if (!data || data.length === 0) return;
+    const names = await fetchContactNames(data.map((r) => r.ghl_contact_id));
+    let wrote = 0;
+    for (const r of data) {
+      const c = prepareExemplar(r, { names: names.get(r.ghl_contact_id) || [] });
+      const patch = {
+        reply_text: c.reply_text,
+        prior_outbound: c.prior_outbound,
+        active: !c.excluded_reason,
+        excluded_reason: c.excluded_reason,
+        clean_version: EXEMPLAR_CLEAN_VERSION,
+        updated_at: new Date().toISOString(),
+      };
+      if (c.inbound_text !== r.inbound_text) Object.assign(patch, { inbound_text: c.inbound_text, embedding: null, embedding_hash: null });
+      const { error: upErr } = await supabase.from('kb_exemplars').update(patch).eq('id', r.id);
+      if (upErr) { console.warn('[Exemplars] re-clean update failed:', upErr.message); continue; }
+      wrote++;
+      summary.recleaned++;
+      if (c.excluded_reason) summary.excluded[c.excluded_reason] = (summary.excluded[c.excluded_reason] || 0) + 1;
+    }
+    if (wrote === 0) return; // every update failed: stop rather than loop on the same rows
+  }
+}
+
 /** Best-effort: a reply whose body matches a scored agentic message for the same contact is 'bot'. */
 async function fetchBotBodies(contactIds) {
   const keys = new Set();
@@ -174,12 +248,13 @@ async function fetchBotBodies(contactIds) {
 
 export async function buildExemplarsSweep(reason = 'interval') {
   const started = Date.now();
-  const summary = { reason, fetched: 0, usable: 0, inserted: 0, relabeled: 0, embedded: 0, error: null };
+  const summary = { reason, fetched: 0, usable: 0, inserted: 0, relabeled: 0, embedded: 0, recleaned: 0, excluded: {}, error: null };
   try {
     // 1. Window: re-read the last 2 days so late replies get paired; first run backfills.
     const { data: maxRow, error: maxErr } = await supabase
       .from('kb_exemplars').select('inbound_sent_at').order('inbound_sent_at', { ascending: false }).limit(1);
     if (maxErr) throw new Error(`kb_exemplars read failed (sql/078 applied?): ${maxErr.message}`);
+    const cleanColumns = await hasCleanColumns();
     const since = maxRow?.[0]?.inbound_sent_at
       ? new Date(new Date(maxRow[0].inbound_sent_at).getTime() - 2 * 86_400_000)
       : new Date(Date.now() - KB_EXEMPLAR_BACKFILL_DAYS * 86_400_000);
@@ -199,11 +274,13 @@ export async function buildExemplarsSweep(reason = 'interval') {
 
     if (pairs.length > 0) {
       const contacts = pairs.map((p) => p.ghl_contact_id);
-      const [apptsByContact, botKeys] = await Promise.all([fetchAppointmentsByContact(contacts), fetchBotBodies(contacts)]);
+      const [apptsByContact, botKeys, names] = await Promise.all([
+        fetchAppointmentsByContact(contacts), fetchBotBodies(contacts), cleanColumns ? fetchContactNames(contacts) : new Map(),
+      ]);
       const now = new Date();
       const rows = pairs.map((p) => {
         const { outcome, outcome_at } = labelOutcome(apptsByContact.get(p.ghl_contact_id) || [], p.inbound_sent_at, now, KB_EXEMPLAR_OUTCOME_WINDOW_DAYS);
-        return {
+        const base = {
           inbound_message_id: p.inbound_message_id,
           ghl_contact_id: p.ghl_contact_id,
           channel: CHANNEL_BY_GHL_TYPE[p.type],
@@ -216,6 +293,18 @@ export async function buildExemplarsSweep(reason = 'interval') {
           outcome,
           outcome_at,
         };
+        if (!cleanColumns) return base;
+        const c = prepareExemplar(base, { names: names.get(p.ghl_contact_id) || [] });
+        if (c.excluded_reason) summary.excluded[c.excluded_reason] = (summary.excluded[c.excluded_reason] || 0) + 1;
+        return {
+          ...base,
+          inbound_text: c.inbound_text,
+          reply_text: c.reply_text,
+          prior_outbound: c.prior_outbound ? c.prior_outbound.slice(0, 400) : null,
+          active: !c.excluded_reason,
+          excluded_reason: c.excluded_reason,
+          clean_version: EXEMPLAR_CLEAN_VERSION,
+        };
       });
       for (const batch of chunk(rows, 500)) {
         const { error } = await supabase.from('kb_exemplars').upsert(batch, { onConflict: 'inbound_message_id', ignoreDuplicates: true });
@@ -223,6 +312,9 @@ export async function buildExemplarsSweep(reason = 'interval') {
         else summary.inserted += batch.length;
       }
     }
+
+    // 3b. Re-clean rows stored before the current cleaning version.
+    if (cleanColumns) await recleanStoredExemplars(summary);
 
     // 4. Relabel rows whose outcome window was still open.
     const { data: pending } = await supabase

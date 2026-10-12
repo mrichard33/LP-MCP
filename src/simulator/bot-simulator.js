@@ -33,6 +33,7 @@ import { buildLeadFacts } from '../agentic/lead-facts.js';
 import { scoreRun, compareScorecards } from './sim-scoring.js';
 import { createMemoryStageStore, recordStage, recordBookedStage } from '../services/lead-stage-io.js';
 import { leadStageMode } from '../agentic/lead-stage.js';
+import { runWithSimOverrides } from './sim-overrides.js';
 
 export const SIM_CONTACT_PREFIX = 'sim-';
 
@@ -379,7 +380,12 @@ export async function simulateSms(plan, { nepqMode = 'live', generate, buildReal
 }
 
 /** Run one scenario on the channels it applies to. */
-export async function runSimulation({ scenario, turns, persona, title, contactId = null, channel = 'both', nepqMode = 'live', leadStageMode = null }, deps) {
+export async function runSimulation({ scenario, turns, persona, title, contactId = null, channel = 'both', nepqMode = 'live', leadStageMode = null, kbExemplarMode = null }, deps) {
+  // KB_EXEMPLAR_MODE for this run only (2026-10-12); null = Railway's value.
+  if (kbExemplarMode) {
+    const results = await runWithSimOverrides({ kbExemplarMode }, () => runSimulation({ scenario, turns, persona, title, contactId, channel, nepqMode, leadStageMode }, deps));
+    return results.map(r => ({ ...r, kb_exemplar_mode: kbExemplarMode }));
+  }
   const plan = resolveScenario({ scenario, turns, persona, title, contactId });
   const allowed = plan.channels || ['livechat', 'sms'];
   const want = channel === 'both' ? allowed : [channel].filter(c => allowed.includes(c));

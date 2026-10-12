@@ -179,6 +179,7 @@ import { runCallMomentsTier } from './ci-moments.js';
 const KB_CALL_MOMENTS_MAX_CHARS = parseInt(process.env.KB_CALL_MOMENTS_MAX_CHARS || '1200', 10);
 import { getKbExemplarMode, shouldRunExemplars, formatExemplarsForPrompt } from './exemplars-core.js';
 import { runExemplarTier } from './exemplars.js';
+import { simKbExemplarMode } from '../simulator/sim-overrides.js';
 import {
   ESTIMATE_PDF_TRIGGER_ID,
   getEstimatePdfMergeTag,
@@ -952,7 +953,7 @@ export function prewarmQueryEmbedding(messageText) {
   if (!messageText || typeof messageText !== 'string' || !messageText.trim()) return null;
   const anySemanticOn = getKbFaqSemanticMode() !== 'off'
     || getKbVectorMode() !== 'off'
-    || getKbExemplarMode() !== 'off'
+    || (simKbExemplarMode() || getKbExemplarMode()) !== 'off'
     || getKbCallMomentsMode() !== 'off';
   if (!anySemanticOn) return null;
 
@@ -1196,10 +1197,13 @@ export async function buildKbPack(params) {
   // v1.11 — Past-win exemplars. AFTER Tier 1 (so a canonical FAQ/script is
   // already in the pack and wins on facts), BEFORE Tier 2 (approach beats
   // background). Shares the per-turn query embedding. Never blocks a reply.
-  const exemplarMode = getKbExemplarMode();
+  // 2026-10-12: the bot gate can run with a per-run mode (sim-overrides.js); its
+  // audit rows say sim_<mode>, so a gate run never reads as shadow evidence.
+  const simExemplarMode = simKbExemplarMode();
+  const exemplarMode = simExemplarMode || getKbExemplarMode();
   result.exemplar_mode = exemplarMode;
   if (exemplarMode !== 'off' && shouldRunExemplars(intentClass, messageText)) {
-    result.exemplars = await runExemplarTier(messageText, result, exemplarMode, getQueryEmbedding);
+    result.exemplars = await runExemplarTier(messageText, result, simExemplarMode ? `sim_${exemplarMode}` : exemplarMode, getQueryEmbedding);
   }
 
   // v1.12 — Call moments. AFTER Tier 1 (facts win), BEFORE Tier 2 (approach
