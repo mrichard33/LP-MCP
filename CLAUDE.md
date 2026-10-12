@@ -556,7 +556,7 @@ thrown error — `runMemoryNightly` and friends catch everything internally and 
 `{ ok: false }`. `interrupted` (a deploy killed the pass) is never `failed`, and a job that
 could not tell is `unknown`. Roster in `src/job-registry.js`; see `docs/job-runs.md`.
 
-**Every `*_MODE` flag is in `src/mode-registry.js` (Fix 2, 2026-10-12).** 91 flags, about half defaulting to shadow, and
+**Every `*_MODE` flag is in `src/mode-registry.js` (Fix 2, 2026-10-12).** 92 flags, about half defaulting to shadow, and
 nothing showed which were waiting, since when, or on whose ruling. Each entry gives the default, which values mean
 live/shadow/off, the first commit that read it (`since`), the `decider`, where shadow results land (`evidence`: event
 types, a table, or a job's `job_runs.detail`; empty means logs only) and the go-live test from a ruling, or
