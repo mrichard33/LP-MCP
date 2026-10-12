@@ -39,9 +39,16 @@ export const SIM_CONTACT_PREFIX = 'sim-';
 // 2026-10-12 (Lead Conversation Stage): every simulated run keeps its stage in
 // memory and never writes GHL or Supabase. With LEAD_STAGE_MODE=off the stage
 // is still computed here (as shadow), so a test run always shows it.
-function simStageDeps() {
-  const mode = leadStageMode();
-  return { store: createMemoryStageStore(), mirror: false, allowSim: true, env: { LEAD_STAGE_MODE: mode === 'off' ? 'shadow' : mode }, log: () => {}, warn: () => {} };
+function simStageDeps(override = null) {
+  const env = leadStageMode();
+  const mode = override || (env === 'off' ? 'shadow' : env);
+  return { store: createMemoryStageStore(), mirror: false, allowSim: true, env: { LEAD_STAGE_MODE: mode }, mode, log: () => {}, warn: () => {} };
+}
+/** The stored stage for the planner, from the run's memory store (live only). */
+async function simStageRead(stageDeps, contactId) {
+  if (stageDeps.mode !== 'live') return null;
+  const { row } = await stageDeps.store.read(contactId);
+  return row?.stage ? { stage: row.stage, facts: row.facts || {} } : null;
 }
 const stageNote = (r) => (r && r.after ? { before: r.before || null, after: r.after, reason: r.reason } : null);
 
@@ -160,7 +167,7 @@ function tomorrowAt(hourUtc, nowMs) {
  * @param {object} plan     resolveScenario() output
  * @param {object} opts     { nepqMode, productionDeps, nowMs }
  */
-export async function simulateLiveChat(plan, { nepqMode = 'live', productionDeps, nowMs = Date.now() } = {}) {
+export async function simulateLiveChat(plan, { nepqMode = 'live', productionDeps, nowMs = Date.now(), leadStageMode: stageModeOverride = null } = {}) {
   // A real contact (e.g. Mark Test) supplies its GHL/LP record, READ ONLY;
   // the conversation is still the script and every write is still recorded.
   const realContact = plan.contactId || null;
@@ -173,7 +180,7 @@ export async function simulateLiveChat(plan, { nepqMode = 'live', productionDeps
   let sent = [];
   const record = (kind, detail) => { effects.push({ turn: currentTurn, kind, ...detail }); };
   let currentTurn = 0;
-  const stageDeps = simStageDeps();
+  const stageDeps = simStageDeps(stageModeOverride);
   let turnStage = null;
   const holder = plan.appointmentHolder || null;
   const holderAppt = holder ? {
@@ -213,6 +220,8 @@ export async function simulateLiveChat(plan, { nepqMode = 'live', productionDeps
     postCancelCard: async (a) => { record('would_post_dispatch_card', { card: a.kind, text: String(a.text || '').slice(0, 400) }); return { ok: true }; },
     bookSlot: async (a) => { record('would_book', { start: a.startIso }); await recordBookedStage({ contactId, channel: 'livechat', source: 'sim' }, stageDeps); return { ok: true, action_id: 0 }; },
     recordLeadStage: async (a) => { turnStage = stageNote(await recordStage(a, stageDeps)); return turnStage; },
+    readLeadStage: async () => simStageRead(stageDeps, contactId),
+    leadStageMode: () => stageDeps.mode,
     // 2026-10-09: the production deps write a promised_callbacks row and can
     // re-flag one in #contact-center. Four sim-quote-* rows reached the live
     // table on 2026-10-07. Recorded here, never done.
@@ -282,7 +291,7 @@ export async function simulateLiveChat(plan, { nepqMode = 'live', productionDeps
  * The send handler's side effects are reported from the generator's flags
  * (hand-off, booking companion), never run.
  */
-export async function simulateSms(plan, { nepqMode = 'live', generate, buildRealContext = null, nowMs = Date.now(), maxAttempts = 2 } = {}) {
+export async function simulateSms(plan, { nepqMode = 'live', generate, buildRealContext = null, nowMs = Date.now(), maxAttempts = 2, leadStageMode: stageModeOverride = null } = {}) {
   const contactId = plan.contactId || `${SIM_CONTACT_PREFIX}sms-${plan.key}-${nowMs}`;
   // A real contact's record, read once (dry run: nothing is written to it).
   const realBase = plan.contactId && buildRealContext ? await buildRealContext(plan.contactId) : null;
@@ -290,7 +299,7 @@ export async function simulateSms(plan, { nepqMode = 'live', generate, buildReal
   const contact = { firstName: /^guest$/i.test(p.firstName || '') ? null : p.firstName, lastName: /^guest$/i.test(p.firstName || '') ? null : p.lastName, phone: p.phone || '+15555550100', email: p.email, postalCode: p.postalCode, tags: [] };
   const thread = [];
   const transcript = [];
-  const stageDeps = simStageDeps();
+  const stageDeps = simStageDeps(stageModeOverride);
   const queue = [...plan.turns];
   let autos = 0;
   for (let i = 0; queue.length; i++) {
@@ -305,10 +314,11 @@ export async function simulateSms(plan, { nepqMode = 'live', generate, buildReal
     // Per attempt: how long it took and which guard asked for the redraft
     // (2026-10-02: a 107s turn could not be explained from the transcript).
     const attempts = [];
+    const leadStageOverride = await simStageRead(stageDeps, contactId);
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       const ta = Date.now();
       try {
-        generated = await generate(contactId, 'sms', text, { dryRun: true, simulatedContext: context, nepqModeOverride: nepqMode, ...(note ? { regenerationNote: note } : {}) });
+        generated = await generate(contactId, 'sms', text, { dryRun: true, simulatedContext: context, nepqModeOverride: nepqMode, leadStageOverride, leadStageModeOverride: stageDeps.mode, ...(note ? { regenerationNote: note } : {}) });
         attempts.push({ seconds: Math.round((Date.now() - ta) / 100) / 10, guard: null });
         break;
       } catch (err) {
@@ -369,7 +379,7 @@ export async function simulateSms(plan, { nepqMode = 'live', generate, buildReal
 }
 
 /** Run one scenario on the channels it applies to. */
-export async function runSimulation({ scenario, turns, persona, title, contactId = null, channel = 'both', nepqMode = 'live' }, deps) {
+export async function runSimulation({ scenario, turns, persona, title, contactId = null, channel = 'both', nepqMode = 'live', leadStageMode = null }, deps) {
   const plan = resolveScenario({ scenario, turns, persona, title, contactId });
   const allowed = plan.channels || ['livechat', 'sms'];
   const want = channel === 'both' ? allowed : [channel].filter(c => allowed.includes(c));
@@ -377,8 +387,8 @@ export async function runSimulation({ scenario, turns, persona, title, contactId
   for (const ch of want) {
     try {
       results.push(ch === 'livechat'
-        ? await simulateLiveChat(plan, { nepqMode, productionDeps: await deps.productionDeps() })
-        : await simulateSms(plan, { nepqMode, generate: await deps.generate(), buildRealContext: deps.buildRealContext || null }));
+        ? await simulateLiveChat(plan, { nepqMode, productionDeps: await deps.productionDeps(), leadStageMode })
+        : await simulateSms(plan, { nepqMode, generate: await deps.generate(), buildRealContext: deps.buildRealContext || null, leadStageMode }));
     } catch (err) {
       results.push({ channel: ch, scenario: plan.key, title: plan.title, error: String(err?.message || err).slice(0, 300) });
     }

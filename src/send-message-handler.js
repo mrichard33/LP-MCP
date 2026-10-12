@@ -299,6 +299,7 @@ import { resolveContactInfo, resolveLPProspectId } from './actions/resolvers.js'
 import { notifyRehashCall } from './notifications/rehash-call.js';
 import { filePostDemoFollowUp } from './services/post-demo-followup-io.js';
 import { trackBackground } from './graceful-shutdown.js';
+import { shouldRecordPromise } from './agentic/sms-format.js';
 import { recordTurnStage, recordOptOutStage } from './services/lead-stage-io.js';
 import { buildNotificationEnrichment, buildRichNotification, resolveMarket } from './actions/enrichment.js';
 // 2026-07-03 rebuild (Steve Nkzhm incident) — channel/identity inheritance,
@@ -3368,10 +3369,15 @@ export async function executeSendMessage(action, context) {
     // defect. Each attempt builds a fresh opts literal, so this cannot ride on
     // a mutation; it rides on the thrown error.
     let carriedRegenNote = null;
+    // 2026-10-12 (handoff PR 6): SMS turns took 11-43s against live chat's
+    // 7-13s, driven by redrafts. generateResponse skips a redraft once the turn
+    // is past SMS_REDRAFT_BUDGET_MS from here and ships its guarded first draft.
+    const generationStartedAt = Date.now();
     for (let attempt = 1; attempt <= MAX_GENERATION_ATTEMPTS; attempt++) {
       try {
         generated = await generateResponse(contactId, generationChannel, triggerMessage, {
           prepared,
+          generationStartedAt,
           threadSenderType: threadSenderType ?? 'rep',
           regenerationNote: carriedRegenNote,
           // 2026-08-14 — the line this reply goes out from decides the sign-off
@@ -3450,7 +3456,9 @@ export async function executeSendMessage(action, context) {
         // A guard that knows HOW to fix the draft says so on the error. Carry
         // it into the next attempt as the regeneration note (2026-09-11).
         if (err.regenerationNote) carriedRegenNote = err.regenerationNote;
-        if (attempt < MAX_GENERATION_ATTEMPTS) {
+        // The backoff is for a transient failure; a guard's re-write note is
+        // not one, and waiting 1.5s only made the SMS reply later (PR 6).
+        if (attempt < MAX_GENERATION_ATTEMPTS && !err.regenerationNote) {
           await new Promise(r => setTimeout(r, 1500)); // brief backoff before retry
         }
       }
@@ -4210,7 +4218,9 @@ export async function executeSendMessage(action, context) {
   // promised_callbacks (sql/150): due next business day 12:00 ET, swept to
   // kept / expired by src/jobs/promised-callback-sweep.js. A service hand-off
   // is never recorded (it goes to #service). Detached and fail-soft.
-  if (!generated?.repeat_promise_blocked) {
+  // 2026-10-12 (handoff PR 6): never after an opt-out or a close ("leave me
+  // alone" was recorded as a promised call).
+  if (!generated?.repeat_promise_blocked && shouldRecordPromise({ trigger: replyTriggerMessage, plan: generated?.nepq_plan || null })) {
     recordPromiseIfAny({
       contactId, text: String(message || ''), channel,
       phone: generated?.contact_known_phone || context?.lead?.phone || null,

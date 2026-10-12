@@ -599,6 +599,25 @@ says "no appointment on file" to a guest it never identified. A "no" (`isDecline
 `recommended_action: suppress`) gets a close with no pitch, and a reply overtaken by a newer message
 from the same visitor is not sent (`superseded_by_newer_message`).
 
+**A live-chat reschedule never falls into a cancel or into discovery (handoff PR 5, 2026-10-12, LEAD_STAGE_MODE=live).**
+The simulator's `reschedule_not_moved`: an unrelated reply got "I've passed your cancellation", and "the first one" after
+the model's own "Which works better?" fell out of the flow into new-lead discovery. Live (`planCancelTurn({ stageLive })`):
+an unclear answer to the offer gets ONE `CLARIFY_LINE` (move or cancel?), a second unclear one goes to a person to set
+the time (`RESCHEDULE_HANDOFF_LINE`, a RESCHEDULE card, nothing cancelled); "no, a different day" is a move
+(`classifyOfferAnswer`); any offer of ours naming a time is the slot offer (`SLOTS_LIVE_RX`), an unclear pick gets the
+same two times once more, and the RESCHEDULED card says any earlier cancel request is withdrawn. The stage records
+`reschedule:offered` / `reschedule:moved` (`rescheduleStepFor`) and returns to booked.
+
+**SMS speed and format (handoff PR 6, 2026-10-12, active).** SMS turns took 11-43s (live chat 7-13s), driven by
+redrafts. One redraft at most, and none once the turn is past `SMS_REDRAFT_BUDGET_MS` (15s) from the first attempt
+(`mayRedraft`): the guarded first draft ships. A guard's re-write no longer waits the 1.5s transient-error backoff. Over
+320 characters after the redraft (or in length shadow), whole middle sentences are dropped (`trimSmsToCap`), never a
+cut sentence. `src/agentic/sms-format.js`: a fragment opener goes, a stale "our call time passed" nobody raised goes
+(unless the call was in the last 24h), the sign-off is exactly once at the end on the reply that signs the thread
+(`normalizeSignature`), a reply nearly identical to our last one is re-written once, and no promised call is recorded
+after an opt-out or a close (`shouldRecordPromise`). Live chat's Spanish hand-off confirms a number on file
+(`SPANISH_CONFIRM_LINE`) instead of asking for one.
+
 **Both bots sound like a person: rules in the prompt AND a pass after it (2026-10-02).** The SMS prompt
 banned em dashes for months and they shipped anyway, with "Got it. Great question." openers and "Just to
 understand… —" lead-ins. `HUMAN_VOICE_RULES` (`src/prompts/response-generator/banned.js`) tells the
@@ -865,6 +884,33 @@ Stage" dropdown (`contact.nepq_stage`, 16 labels in `STAGE_GHL_LABEL`) only when
 dropdown carries. "Stage Last Engaged" is another field: never touch it. The simulator keeps the stage in memory and
 prints `stage: a → b (reason)` per turn. `LEAD_STAGE_MODE` off|shadow|live, default shadow (record only);
 `GET /admin/lead-stage/:contactId` (x-admin-token) shows it.
+**With `LEAD_STAGE_MODE=live` the planner and the prompt read the stage (the user, 2026-10-12).** `planNepqTurn({ stage })`
+(passed only when live; null is byte-for-byte the old plan): a yes to ANY offer of ours, a schedule ask or an address
+moves forward whatever our last message was; past the bridge (or at qualifying / offered / held, or back from an
+objection play) anything that is not a no goes to times; the bridge is sent ONCE; a pick resolves only against the
+newest offer (`latest_offered_slots`); a stated day or part of day is honored or said to be unavailable;
+"you just said that" changes the move. **The qualifying gate** (`gateForStage`, `QUALIFY_LINES`): no visit time until the
+lead owns the home, the zip is known and every decision maker is the lead alone or named AND able to be there, one item
+per message (owner → zip → decision makers), an item asked twice is not asked a third time. In live mode this
+supersedes "NEVER probe for disqualifiers" (the plan block allows the ownership question) and "ask about decision makers
+ONCE, after the hold" (asked before the times; a settled answer rides as `plan.dm_known` and the collect never asks
+again). `stageBlock` renders from the stored stage (`playForConversationStage`), buyer_stage is tone only, and the
+transition default is the free home visit. The simulator and `run_bot_eval` take `lead_stage_mode` (shadow|live) to try
+it before Railway is switched.
+
+**A renter gets no visit; one out-of-area decline; quote ≠ price (handoff PR 3, 2026-10-12).** A renter was offered
+times twice (batch 3 T3). `enforceNonOwner` (`src/agentic/non-owner.js`, the last pass in both bots beside
+`enforcePropertyScope`, ACTIVE in every mode) turns a reply to a lead who says they rent into `NON_OWNER_LINE` (the
+homeowner needs to be part of the visit; the owner is welcome to reach out), drops the time offer when they said it
+earlier, drops the `book_appointment` companion, and the live chat never books one (`isNonOwner`). A landlord ("we rent
+it out") is an owner (`homeowner.js`). Zip 10001 was declined on SMS and "good chance we can help" in live chat: both
+bots now give `outOfAreaLine` (service-area-turn.js; the SMS SERVICE_AREA_EXIT text and the `serviceAreaOutside` prompt
+too, which no longer offers a team callback), and live chat checks a zip typed outside a coverage question
+(`zipInText`). With `LEAD_STAGE_MODE=live` (`planNepqTurn({ stageLive })`): a plain quote request is NEPQ's info request
+(`LINES.info_request`, once), not the price play (`isPriceAsk({ quoteIsPrice: false })`; an insist or a price word still
+is), and "we went with another company" gets `LINES.competitor` (the disarm, then how they would decide; no consequence
+move after it; a second time → `repeat_objection`). `CLAIMS_RX` strips claims that another company's work is not "up to
+code".
 
 **Every GHL request is credited to the code that made it (2026-10-12).** LP-MCP made ~127,000 GHL requests in 24h
 (~63% of GHL's 200k/day cap, peaks 268/min at 5 AM) and the rehash sweep failed 1 pass in 4 on 429s, with no way to
@@ -1162,7 +1208,11 @@ Mark's real lists. Both use the general phone until their own is known. Houston 
 **Central time**: `src/config/market-timezones.js` maps the market, `src/services/contact-timezone.js`
 resolves a contact's zone from their zip, and customer-facing times (slots, appointment text, the
 prompt's TIME NOW, that contact's quiet hours) follow it. Office/dialer hours stay ET with an "ET"
-label. Never tell a visitor Reece serves only Florida. Coverage questions are zip-first
+label. **A zip the lead TYPES decides the zone, not only the record's (handoff PR 4, 2026-10-12).** A
+Katy lead typed 77494 and was offered "10:00 AM ET": `typedZipFromThread` / `zoneForContact`
+(`src/services/contact-timezone.js`) set `context.market` before the SMS slot read and pass `zip` to live chat's
+`offerBookingSlots`, so the times are read and labelled CT. The allowed visit start hours (10, 2, 6) stay checked in the
+office zone the GHL calendars are laid out in. Never tell a visitor Reece serves only Florida. Coverage questions are zip-first
 (`src/agentic/service-area-turn.js`, both reply paths): ask for the zip, then answer in the first
 sentence. Not yet wired for the new markets: `lp_branch_market_map`, `slack_market_slugs`.
 

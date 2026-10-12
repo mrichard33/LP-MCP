@@ -493,7 +493,7 @@
     "label": "Zip outside service area, polite exit",
     "target": "framing",
     "kind": "interpolated",
-    "probe": "is OUTSIDE Reece's mapped service area. Do NOT offer any in-home visit, do NOT propose appointment times, and "
+    "probe": "is OUTSIDE Reece's mapped service area. Do NOT offer any in-home visit, a call, appointment times or a booking link"
   },
   {
     "id": "L1938",

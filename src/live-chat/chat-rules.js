@@ -125,6 +125,15 @@ export function looksSpanish(text) {
 
 export const SPANISH_HANDOFF_LINE = 'Hola, gracias por escribirnos. Un miembro de nuestro equipo se comunicará con usted. ¿Cuál es el mejor número de teléfono para llamarle?';
 export const SPANISH_THANKS_LINE = 'Gracias. Un miembro de nuestro equipo le llamará pronto.';
+// 2026-10-12 (handoff PR 6): with a number on file, confirm it instead of
+// asking for one. Still says our team will reach out (SPANISH_TEAM_RX).
+export const SPANISH_CONFIRM_LINE = (phoneHuman) => `Hola, gracias por escribirnos. Un miembro de nuestro equipo se comunicará con usted. ¿Le podemos llamar al ${phoneHuman}?`;
+// No \\b after an accented letter: JS reads "í" as a non-word character.
+const SPANISH_YES_RX = /^\s*(?:s[ií]|claro|ok(?:ay)?|est[aá]\s+bien|correcto|por\s+favor|perfecto)(?=$|[\s.,!¡?¿])/i;
+function phoneHuman(raw) {
+  const d = String(raw || '').replace(/\D/g, '').slice(-10);
+  return d.length === 10 ? `(${d.slice(0, 3)}) ${d.slice(3, 6)}-${d.slice(6)}` : null;
+}
 
 // Part 8 (Mark, 2026-10-02: "Each message should be custom"): the two lines
 // above are the model's reference and backup. Its version must be Spanish and
@@ -144,15 +153,20 @@ const PHONE_RX = /(?:\+?1[\s.-]*)?\(?\d{3}\)?[\s.-]*\d{3}[\s.-]*\d{4}\b/;
  *
  * @returns {null | { language: 'es', reply: string, phone: string|null, first: boolean }}
  */
-export function planLanguageHandoff({ body, thread = [] }) {
+export function planLanguageHandoff({ body, thread = [], knownPhone = null }) {
   const prior = Array.isArray(thread) ? thread.slice(0, -1) : [];
   const lastOut = [...prior].reverse().find((m) => m.direction === 'outbound');
   // Part 8: the model words the hand-off now, so it is read back by meaning.
   const afterOurHandoff = !!lastOut && SPANISH_TEAM_RX.test(String(lastOut.text || ''));
   const phone = (String(body || '').match(PHONE_RX) || [null])[0];
   if (afterOurHandoff && phone) return { language: 'es', reply: SPANISH_THANKS_LINE, phone, first: false };
+  // "Sí" to our "¿Le podemos llamar al …?" confirms the number on file.
+  const onFile = phoneHuman(knownPhone);
+  if (afterOurHandoff && onFile && SPANISH_YES_RX.test(String(body || ''))) return { language: 'es', reply: SPANISH_THANKS_LINE, phone: knownPhone, first: false };
   if (!looksSpanish(body)) return null; // an English reply after the hand-off goes to the model as usual
-  return { language: 'es', reply: SPANISH_HANDOFF_LINE, phone: phone || null, first: !afterOurHandoff };
+  // A number on file is confirmed, never asked for again (2026-10-12, PR 6).
+  const reply = !phone && onFile && !afterOurHandoff ? SPANISH_CONFIRM_LINE(onFile) : SPANISH_HANDOFF_LINE;
+  return { language: 'es', reply, phone: phone || null, first: !afterOurHandoff };
 }
 
 // ── 3. name + phone before any call promise (Mark, 2026-10-01) ─────────────
