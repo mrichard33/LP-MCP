@@ -245,13 +245,35 @@ export function coverageOwnsReply(turn) {
   return !status || status === 'ask_zip' || status === 'out';
 }
 
+/**
+ * The ONE out-of-area decline, both bots (2026-10-12, batch 2 #3: zip 10001
+ * got a decline on SMS and "good chance we can help" in live chat). The SMS
+ * SERVICE_AREA_EXIT text uses it too. No exclamation point. Pure.
+ */
+export function outOfAreaLine(zip) {
+  return zip ? `Sorry, Reece doesn't serve the ${zip} area. Thank you for checking with us.` : "Sorry, Reece doesn't serve that area. Thank you for checking with us.";
+}
+
+/**
+ * A zip the lead typed outside a coverage question: "zip 10001", a bare zip,
+ * or the end of an address ("…, New York NY 10001"). The SMS identity pass
+ * reads these the same way; live chat did not (2026-10-12 parity). Pure.
+ */
+export function zipInText(text) {
+  const t = String(text || '');
+  const z = extractZip(t);
+  if (z) return z;
+  const m = t.match(/\b[A-Za-z]{2,}\.?,?\s+(?:[A-Z]{2}\s+)?(\d{5})(?:-\d{4})?\s*[.!]?\s*$/);
+  return m ? m[1] : null;
+}
+
 /** The deterministic sentence for a status — the fallback and the guard's yardstick. Pure. */
 export function coverageSentence(res) {
   if (!res) return null;
   switch (res.status) {
     case 'ask_zip': return ZIP_ASK_LINE;
     case 'in': return res.city ? `Yes, we serve ${res.city} (${res.zip}).` : `Yes, we serve the ${res.zip} area.`;
-    case 'out': return `Sorry, Reece doesn't serve the ${res.zip} area. Thank you for checking with us.`;
+    case 'out': return outOfAreaLine(res.zip);
     case 'unknown': return `Let me have a team member confirm coverage for ${res.zip}.`;
     case 'place_in': return `Yes, we serve the ${res.city || res.place} area.`;
     case 'place_unknown': return 'No problem. A team member will confirm whether we cover your area.';

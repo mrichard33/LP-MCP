@@ -271,6 +271,7 @@ import { notInterestedTurn } from './agentic/not-interested.js';
 import { humanizeReply, restoreQuestionMark } from './agentic/human-voice.js';
 import { enforceTeamVoice } from './agentic/team-voice.js';
 import { enforcePropertyScope } from './agentic/property-scope.js';
+import { enforceNonOwner } from './agentic/non-owner.js';
 import { enforceCallTiming, softenCallTiming, isTeamOpen, enforceRehashCallTiming } from './agentic/team-hours.js';
 import { enforceOneAsk } from './agentic/one-ask.js';
 import { findUnbackedBookingClaim, rewriteBookingClaims, bookingClaimNote, appointmentOnFile, noPromiseHandoffLine, NO_PROMISE_HANDOFF_RX } from './agentic/booking-claim.js';
@@ -404,7 +405,7 @@ import { holdLine, COLLECT_ASK, dmAsk, parseDecisionMakers } from './agentic/boo
 import { contactRecheckLine, recheckHint, RECHECK_RX } from './agentic/contact-check.js';
 import { smsBookingTurn, enforceBookingFacts, bookingFactsNote } from './agentic/sms-booking-turn.js';
 import { LINES as NEPQ_LINES } from './agentic/nepq-planner.js';
-import { buildStageInput } from './agentic/lead-stage.js';
+import { buildStageInput, leadStageMode } from './agentic/lead-stage.js';
 import { isCustomerP2 } from './agentic/lead-state/signals/context-reader.js';
 import { isUnsoldPostDemo, lpSold, postDemoOwnerName, replaceSalesRepFollowUp } from './agentic/post-demo-owner.js';
 import { postDemoPlannerMode } from './agentic/post-demo-turn.js';
@@ -412,6 +413,7 @@ import { rehashCallSlotsMode, readRehashCallSlots, rehashCallBooking } from './a
 import { isInRehash, rehashLeadFromContext, rehashRoutingMode } from './agentic/rehash-state.js';
 import { planNepqTurn, enforceNepqPlan, referenceRetryNote, nepqBackboneMode, prefersCall as nepqPrefersCall, objectionType as nepqObjectionType, TIME_REQUEST_RX as NEPQ_TIME_REQUEST_RX, SCHEDULE_ASK_RX as NEPQ_SCHEDULE_ASK_RX,REPEAT_COMPLAINT_RX as NEPQ_REPEAT_COMPLAINT_RX, bookingOpenInThread as nepqBookingOpenInThread, dropUnaskedCallOffer, leadWantsCall as nepqLeadWantsCall, isServiceCallback as nepqIsServiceCallback } from './agentic/nepq-planner.js';
 import {
+  outOfAreaLine,
   planServiceAreaTurn, resolveCoverage, coverageHint, guardCoverageDraft, serviceAreaRecord, coverageOwnsReply,
 } from './agentic/service-area-turn.js';
 
@@ -3836,8 +3838,9 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
         // literal rule sends do not resolve merge tags — the SERVICE_AREA_EXIT
         // rule's send_message picks this up as context.message. Guide §3.7
         // wording with the em-dash→comma SMS voice fix.
-        const oaFirstName = context.lead?.first_name || null;
-        const oaMessage = `Thanks${oaFirstName ? `, ${oaFirstName}` : ''}, it looks like your area's outside our current service footprint, so I can't set up a visit there. Wish we could help!`;
+        // 2026-10-12 (parity, batch 2 #3): the same short decline the live
+        // chat and the coverage turn send (outOfAreaLine); no exclamation point.
+        const oaMessage = outOfAreaLine(st.identity.postal_code);
         emitEvent({
           event_type: 'agentic.out_of_area_detected',
           source: 'response_generator',
@@ -3847,7 +3850,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
           payload: {
             zip: sa.zip || st.identity.postal_code,
             city: sa.city || st.identity.city || null,
-            first_name: oaFirstName,
+            first_name: context.lead?.first_name || null,
             message: oaMessage,
           },
           priority: 'high',
@@ -4094,6 +4097,8 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
         isCustomer: isCustomerP2(context),
         // The classifier read a call request: the planner's callback hand-off.
         callbackRequested: String(classification?.intent_class || '').toUpperCase() === 'CALLBACK',
+        // 2026-10-12 (PR 3): quote ≠ price and the competitor play, live only.
+        stageLive: leadStageMode() === 'live',
       };
       nepqPlan = planNepqTurn({ ...planArgs, postDemo: pdMode === 'live' && postDemoLead, rehashRep, rehash: !!rehash, callSlots: slotsMode === 'live' ? rehashCallSlots : null });
       if (slotsMode === 'shadow' && rehash && postDemoLead) {
@@ -5081,6 +5086,15 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       console.warn(`[PropertyScope] ${contactId} ${scope.reason}`);
       validated.message = scope.text;
       if (scope.reason === 'lead_asked' && validated.companion_action?.action_type === 'book_appointment') validated.companion_action = null;
+    }
+    // 2026-10-12 (no single-leg visits; batch 3 T3): a lead who said they
+    // rent gets no time and no booking, in every mode (non-owner.js).
+    const owner = enforceNonOwner(validated.message, { thread: context.conversation_recent || [], inbound: triggerMessage });
+    if (owner.changed) {
+      console.warn(`[NonOwner] ${contactId} ${owner.reason}`);
+      validated.message = owner.text;
+      validated.non_owner = owner.reason;
+      if (validated.companion_action?.action_type === 'book_appointment') validated.companion_action = null;
     }
     // 2026-10-07 (Nicholas): a cancelled visit is never "your visit" (cancelled-visit.js).
     const cancelled = enforceCancelledVisit(validated.message, {
