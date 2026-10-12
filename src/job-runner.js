@@ -33,6 +33,7 @@
  */
 
 import os from 'node:os';
+import { withGhlCaller } from './ghl-caller.js';
 import supabase from './supabase.js';
 import { onShutdown } from './graceful-shutdown.js';
 
@@ -192,7 +193,9 @@ export async function runJob(jobId, fn, deps = {}) {
   let value;
   let error = null;
   try {
-    value = await fn();
+    // 2026-10-12: every GHL request this pass makes is credited to the job
+    // (src/ghl-caller.js), so the per-caller budget can name it.
+    value = await withGhlCaller(`job:${jobId}`, fn);
   } catch (err) {
     error = err instanceof Error ? err : new Error(String(err));
   }

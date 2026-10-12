@@ -249,6 +249,7 @@ import { getLastInboundMessageMs, hasPriorInboundMessage } from './actions/handl
 // 2026-08-13 — shared with actions/index.executeLayer3Dispatch (see module header).
 import { inferChannelFromEvent } from './channel-inference.js';
 import { withGhlToken } from './ghl-rate-limiter.js';
+import { withGhlCaller } from './ghl-caller.js';
 import { contactHadDemo, demoInCurrentCycle } from './demo-truth.js';
 import { fetchCurrentLead } from './current-lead.js';
 import { lpStoredToUtcMs } from './lp-dates.js';
@@ -819,10 +820,14 @@ async function resolveContactSnapshot(ghlContactId, deps = {}) {
 
   for (let attempt = 1; attempt <= CONTACT_SNAPSHOT_MAX_ATTEMPTS; attempt++) {
     try {
-      const res = await doFetch(`https://services.leadconnectorhq.com/contacts/${ghlContactId}`, {
+      // 2026-10-12: through the bucket. This read ran once per event (up to 3
+      // attempts) outside the limiter, so it was never throttled, never paused
+      // on a 429 and never counted; the coverage scan missed it because it is
+      // spelled doFetch( (scripts/test-ghl-rate-limiter-coverage.js now looks).
+      const res = await withGhlToken(() => doFetch(`https://services.leadconnectorhq.com/contacts/${ghlContactId}`, {
         headers: { 'Authorization': `Bearer ${GHL_API_KEY}`, 'Version': '2021-07-28', 'Accept': 'application/json' },
         signal: AbortSignal.timeout(10000),
-      });
+      }));
 
       if (res.ok) {
         const data = await res.json();
@@ -2701,7 +2706,9 @@ export async function processSingleEvent(event) {
 
   let result;
   try {
-    result = await processSingleEventInner(event);
+    // 2026-10-12: GHL reads made while evaluating rules are credited to the
+    // event type (src/ghl-caller.js), so the engine's share is measurable.
+    result = await withGhlCaller(`engine:${event?.event_type || 'unknown'}`, () => processSingleEventInner(event));
   } catch (err) {
     if (claim.key) await recordResult(claim.key, { error: err.message });
     throw err;

@@ -157,6 +157,7 @@
  */
 
 import { recordGhlRequest } from './ghl-shared-budget.js';
+import { recordGhlCallerRequest, recordGhlCaller429, ghlCallerStats } from './ghl-caller.js';
 
 /**
  * GoHighLevel's PUBLISHED ceilings, not our policy.
@@ -454,6 +455,8 @@ function ensureDrainer() {
  *   INTAKE only — a third party is on the line and the id cannot be obtained
  *   later. Batch and sweep callers must stay normal: if everything is high
  *   priority then nothing is, and the reserve protects no one.
+ * @param {string} [opts.label]  who is calling (2026-10-12). Optional: by
+ *   default the caller is read from the async context (src/ghl-caller.js).
  */
 export function acquireToken(opts = {}) {
   // Shared-budget measurement (2026-09-14). Every governed GHL call passes
@@ -462,6 +465,10 @@ export function acquireToken(opts = {}) {
   // rate. A Map increment, no I/O, and a no-op unless GHL_SHARED_BUDGET_MODE
   // is 'shadow'. It measures only; it never throttles.
   recordGhlRequest();
+  // 2026-10-12: and WHO asked (src/ghl-caller.js). The label comes from the
+  // async context (the job, action or route that started this work) unless
+  // the caller names itself. A Map increment, like the line above.
+  recordGhlCallerRequest(opts.label || undefined);
 
   refill();
   decayCycles();
@@ -545,6 +552,7 @@ export function acquireToken(opts = {}) {
  */
 export function report429() {
   stats.total429s++;
+  recordGhlCaller429();
   tokens = 0;
   paused = true;
   consecutive429Cycles++;
@@ -714,6 +722,9 @@ export function getRateLimiterStats() {
     last429At: last429At || null,
     msSinceLast429: last429At ? Date.now() - last429At : null,
     ...stats,
+    // 2026-10-12 — requests and 429s per caller (job / action / route), busiest
+    // first. The one number the totals above could never give.
+    byCaller: ghlCallerStats(),
   };
 }
 

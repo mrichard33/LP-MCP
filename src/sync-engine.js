@@ -135,6 +135,7 @@
 // scheduler, and process signal handlers.
 
 import { createHash } from 'node:crypto';
+import { withGhlCaller } from './ghl-caller.js';
 import supabase from './supabase.js';
 import { getToken, startTokenRefreshSchedule } from './token-manager.js';
 import { getLeadData, getJobStatusChanges, getLead, getLeadByLdsId, testConnection } from './lp-client.js';
@@ -1689,7 +1690,7 @@ export function startSyncScheduler() {
   }, 5000);
 
   syncTimer = setInterval(async () => {
-    try { await runWithTimeout(() => incrementalSync(), SYNC_TIMEOUT_MS, 'scheduled incrementalSync'); }
+    try { await runWithTimeout(() => withGhlCaller('job:lp-incremental-sync', incrementalSync), SYNC_TIMEOUT_MS, 'scheduled incrementalSync'); }
     catch (err) { console.error('[Sync] Scheduled sync failed:', err.message); }
   }, SYNC_INTERVAL_MS);
 }

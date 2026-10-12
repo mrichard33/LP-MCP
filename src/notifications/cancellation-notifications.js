@@ -54,6 +54,10 @@ import crypto from 'crypto';
 import supabase from '../supabase.js';
 import { loadCancellationContext } from './cancellation-intelligence.js';
 import { generateCancellationBody } from './cancellation-body-generator.js';
+import { withGhlToken } from '../ghl-rate-limiter.js';
+// 2026-10-12: these calls answer a GHL webhook (60s client timeout), so a
+// starved bucket may hold them 5s at most, never the limiter's default 30s.
+const GHL_WEBHOOK_TOKEN_WAIT = { maxWaitMs: 5000 };
 
 // ───────────────────────────────────────────────────────────────────
 // CONFIG
@@ -205,7 +209,7 @@ function resolveGhlFieldIds() {
 async function ghlPutContact(contactId, customFields, { fetchImpl = fetch } = {}) {
   const apiKey = process.env.GHL_API_KEY || '';
   if (!apiKey) throw new Error('GHL_API_KEY_not_configured');
-  const res = await fetchImpl(`${GHL_BASE}/contacts/${contactId}`, {
+  const res = await withGhlToken(() => fetchImpl(`${GHL_BASE}/contacts/${contactId}`, {
     method: 'PUT',
     headers: {
       Authorization: `Bearer ${apiKey}`,
@@ -214,7 +218,7 @@ async function ghlPutContact(contactId, customFields, { fetchImpl = fetch } = {}
     },
     body: JSON.stringify({ customFields }),
     signal: AbortSignal.timeout(GHL_TIMEOUT_MS),
-  });
+  }), GHL_WEBHOOK_TOKEN_WAIT);
   if (!res.ok) {
     const errText = await res.text().catch(() => '');
     throw new Error(`ghl_${res.status}:${errText.slice(0, 200)}`);
@@ -244,12 +248,12 @@ async function ghlPokeTag(contactId, tag, { fetchImpl = fetch } = {}) {
     'Content-Type': 'application/json',
   };
   try {
-    const addRes = await fetchImpl(`${GHL_BASE}/contacts/${contactId}/tags`, {
+    const addRes = await withGhlToken(() => fetchImpl(`${GHL_BASE}/contacts/${contactId}/tags`, {
       method: 'POST',
       headers,
       body: JSON.stringify({ tags: [tag] }),
       signal: AbortSignal.timeout(GHL_TIMEOUT_MS),
-    });
+    }), GHL_WEBHOOK_TOKEN_WAIT);
     if (!addRes.ok) {
       const errText = await addRes.text().catch(() => '');
       console.warn(
@@ -261,12 +265,12 @@ async function ghlPokeTag(contactId, tag, { fetchImpl = fetch } = {}) {
     return;
   }
   try {
-    const rmRes = await fetchImpl(`${GHL_BASE}/contacts/${contactId}/tags`, {
+    const rmRes = await withGhlToken(() => fetchImpl(`${GHL_BASE}/contacts/${contactId}/tags`, {
       method: 'DELETE',
       headers,
       body: JSON.stringify({ tags: [tag] }),
       signal: AbortSignal.timeout(GHL_TIMEOUT_MS),
-    });
+    }), GHL_WEBHOOK_TOKEN_WAIT);
     if (!rmRes.ok) {
       const errText = await rmRes.text().catch(() => '');
       console.warn(

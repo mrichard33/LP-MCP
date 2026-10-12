@@ -841,6 +841,16 @@ not. `enforceTeamVoice` (`src/agentic/team-voice.js`) corrects both after the mo
 opening outside 9–8 weekdays, 9–5 Saturday, 9–3 Sunday (ET). The planner's hand-off and callback lines use the same
 hours (`nowMs`). Look for `[TeamVoice]` log lines.
 
+**Every GHL request is credited to the code that made it (2026-10-12).** LP-MCP made ~127,000 GHL requests in 24h
+(~63% of GHL's 200k/day cap, peaks 268/min at 5 AM) and the rehash sweep failed 1 pass in 4 on 429s, with no way to
+say who made the calls. `src/ghl-caller.js` carries a label in AsyncLocalStorage, set where work starts: `job:<id>`
+(runJob, plus the capacity lead loop, the LP incremental sync and the field sync), `action:<type>` (the executor),
+`engine:<event_type>` (the decision engine) and `http:<METHOD> <path>` (Express). With no label, the first
+non-plumbing source file on the stack is used (`src:<file>`). `acquireToken` counts requests and `report429` counts
+429s per label: `/n8n/rate-limiter/stats` → `byCaller`, a `[GhlCallers]` log line every 15 min and one
+`ghl.request_budget_by_caller` event. Measures only. New GHL code needs nothing; the coverage scan
+(`scripts/test-ghl-rate-limiter-coverage.js`) now also catches `doFetch(` / `fetchImpl(` / `fetchFn(` call sites.
+
 **Static system prompts are cached** (`callLLM({ cacheSystem: true })`: reply writer, analyzer, live chat).
 Only for a system prompt that is byte-identical across calls — a varying one pays the write premium every
 time. Look for `[LLMClient:<fn>] cache read=` lines. `LIVE_CHAT_SHADOW_MODEL` runs a second model beside the

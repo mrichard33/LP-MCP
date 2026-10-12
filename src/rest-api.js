@@ -45,6 +45,10 @@ import { createAppointmentFromLpHandler } from './appointments/booking-endpoint.
 import { flattenWebhookBody } from './webhook-body.js';
 import { trackImmediate } from './graceful-shutdown.js';
 import { leadHadDemo } from './demo-truth.js';
+import { withGhlToken } from './ghl-rate-limiter.js';
+// 2026-10-12: these calls answer a GHL webhook (60s client timeout), so a
+// starved bucket may hold them 5s at most, never the limiter's default 30s.
+const GHL_WEBHOOK_TOKEN_WAIT = { maxWaitMs: 5000 };
 
 // ═══════════════════════════════════════════════════════════════════
 // WEBHOOK SIGNATURE VERIFICATION (optional but recommended)
@@ -479,7 +483,7 @@ async function _lpLookupGhlPatchContact(contactId, fields, { fetchImpl = fetch }
     return { skipped: true, reason: 'no_fields_to_update' };
   }
 
-  const res = await fetchImpl(`${_LP_LOOKUP_GHL_BASE}/contacts/${contactId}`, {
+  const res = await withGhlToken(() => fetchImpl(`${_LP_LOOKUP_GHL_BASE}/contacts/${contactId}`, {
     method: 'PUT',
     headers: {
       Authorization: `Bearer ${apiKey}`,
@@ -488,7 +492,7 @@ async function _lpLookupGhlPatchContact(contactId, fields, { fetchImpl = fetch }
     },
     body: JSON.stringify(body),
     signal: AbortSignal.timeout(_LP_LOOKUP_GHL_TIMEOUT_MS),
-  });
+  }), GHL_WEBHOOK_TOKEN_WAIT);
   if (!res.ok) {
     const errText = await res.text().catch(() => '');
     throw new Error(`ghl_${res.status}:${errText.slice(0, 200)}`);
@@ -508,7 +512,7 @@ async function _lpLookupGhlAddTag(contactId, tag, { fetchImpl = fetch } = {}) {
     return;
   }
   try {
-    const r = await fetchImpl(`${_LP_LOOKUP_GHL_BASE}/contacts/${contactId}/tags`, {
+    const r = await withGhlToken(() => fetchImpl(`${_LP_LOOKUP_GHL_BASE}/contacts/${contactId}/tags`, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${apiKey}`,
@@ -517,7 +521,7 @@ async function _lpLookupGhlAddTag(contactId, tag, { fetchImpl = fetch } = {}) {
       },
       body: JSON.stringify({ tags: [tag] }),
       signal: AbortSignal.timeout(_LP_LOOKUP_GHL_TIMEOUT_MS),
-    });
+    }), GHL_WEBHOOK_TOKEN_WAIT);
     if (!r.ok) {
       const errText = await r.text().catch(() => '');
       console.warn(`[LP Lookup+Update] tag add failed contact=${contactId} tag=${tag} status=${r.status} ${errText.slice(0, 200)}`);
@@ -535,7 +539,7 @@ async function _lpLookupGhlRemoveTag(contactId, tag, { fetchImpl = fetch } = {})
   const apiKey = process.env.GHL_API_KEY || '';
   if (!apiKey) return;
   try {
-    const r = await fetchImpl(`${_LP_LOOKUP_GHL_BASE}/contacts/${contactId}/tags`, {
+    const r = await withGhlToken(() => fetchImpl(`${_LP_LOOKUP_GHL_BASE}/contacts/${contactId}/tags`, {
       method: 'DELETE',
       headers: {
         Authorization: `Bearer ${apiKey}`,
@@ -544,7 +548,7 @@ async function _lpLookupGhlRemoveTag(contactId, tag, { fetchImpl = fetch } = {})
       },
       body: JSON.stringify({ tags: [tag] }),
       signal: AbortSignal.timeout(_LP_LOOKUP_GHL_TIMEOUT_MS),
-    });
+    }), GHL_WEBHOOK_TOKEN_WAIT);
     if (!r.ok) {
       const errText = await r.text().catch(() => '');
       console.warn(`[LP Lookup+Update] tag remove failed contact=${contactId} tag=${tag} status=${r.status} ${errText.slice(0, 200)}`);

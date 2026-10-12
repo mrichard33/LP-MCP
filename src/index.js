@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import { ghlCallerMiddleware, startGhlCallerReporter, withGhlCaller } from './ghl-caller.js';
 import { makeAuthenticate } from './auth.js';
 import { checkRequestSecret, rejectionBody, logAuthBootReport } from './security/request-auth.js';
 import crypto from 'node:crypto';
@@ -376,6 +377,9 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 // Graceful drain: count in-flight requests so SIGTERM waits for them.
 app.use(trackInflight);
+// Credit GHL requests made while serving a request to its route (2026-10-12,
+// src/ghl-caller.js). Measures only.
+app.use(ghlCallerMiddleware);
 // Write-ahead journal for lead-carrying routes. Fail-open: a journal error or
 // a slow insert never blocks or delays a lead past its 1.5s ceiling.
 app.use(intakeJournal());
@@ -995,11 +999,12 @@ const server = app.listen(PORT, async () => {
   startFbPublishWatchdog();
   startFive9SilenceWatchdog();
   startGhlNoteSweep();
+  startGhlCallerReporter();
   startGhlNoteReconciliation();
   // First field-sync ~60s after boot (was ~9.5 min), then every 15 min.
   setTimeout(async () => {
-    try { await runBulkFieldSync(); logCycleStats(); } catch (e) { console.error('[FieldSync]', e.message); }
-    setInterval(async () => { try { await runBulkFieldSync(); logCycleStats(); } catch (e) { console.error('[FieldSync]', e.message); } }, FIELD_SYNC_INTERVAL_MS);
+    try { await withGhlCaller('job:ghl-field-sync', runBulkFieldSync); logCycleStats(); } catch (e) { console.error('[FieldSync]', e.message); }
+    setInterval(async () => { try { await withGhlCaller('job:ghl-field-sync', runBulkFieldSync); logCycleStats(); } catch (e) { console.error('[FieldSync]', e.message); } }, FIELD_SYNC_INTERVAL_MS);
   }, 60000);
 });
 

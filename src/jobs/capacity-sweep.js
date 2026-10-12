@@ -99,6 +99,7 @@
 // CAPACITY_SWEEP_INTERVAL_MS + continuous lead loop + 23:50 ET snapshot.
 
 import supabase from '../supabase.js';
+import { withGhlCaller } from '../ghl-caller.js';
 import { runSQL } from '../admin/supabase-admin.js';
 import { getSalesSchedule, getLeads, getLeadByLdsId, getProspectByCstId, getCircuitStatus, resetCircuit } from '../lp-client.js';
 import { leadPresenceInProspect } from '../lp-lead-presence.js';
@@ -1378,7 +1379,7 @@ export function startCapacitySweepScheduler() {
   const leadLoop = async () => {
     let elapsed = 0;
     try {
-      const summary = await runLeadRefreshPass();
+      const summary = await withGhlCaller('job:capacity-lead-loop', runLeadRefreshPass);
       elapsed = Number(summary?.elapsed_ms) || 0;
     } catch (err) {
       console.error('[CapacitySweep] lead pass failed:', err.message);
