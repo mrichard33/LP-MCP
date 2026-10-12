@@ -271,6 +271,7 @@ import { notInterestedTurn } from './agentic/not-interested.js';
 import { humanizeReply, restoreQuestionMark } from './agentic/human-voice.js';
 import { enforceTeamVoice } from './agentic/team-voice.js';
 import { enforcePropertyScope } from './agentic/property-scope.js';
+import { enforceNonOwner } from './agentic/non-owner.js';
 import { enforceCallTiming, softenCallTiming, isTeamOpen, enforceRehashCallTiming } from './agentic/team-hours.js';
 import { enforceOneAsk } from './agentic/one-ask.js';
 import { findUnbackedBookingClaim, rewriteBookingClaims, bookingClaimNote, appointmentOnFile, noPromiseHandoffLine, NO_PROMISE_HANDOFF_RX } from './agentic/booking-claim.js';
@@ -404,7 +405,9 @@ import { holdLine, COLLECT_ASK, dmAsk, parseDecisionMakers } from './agentic/boo
 import { contactRecheckLine, recheckHint, RECHECK_RX } from './agentic/contact-check.js';
 import { smsBookingTurn, enforceBookingFacts, bookingFactsNote } from './agentic/sms-booking-turn.js';
 import { LINES as NEPQ_LINES } from './agentic/nepq-planner.js';
-import { buildStageInput } from './agentic/lead-stage.js';
+import { buildStageInput, leadStageMode } from './agentic/lead-stage.js';
+import { typedZipFromThread, zoneForContact } from './services/contact-timezone.js';
+import { readStageForPlanner } from './services/lead-stage-io.js';
 import { isCustomerP2 } from './agentic/lead-state/signals/context-reader.js';
 import { isUnsoldPostDemo, lpSold, postDemoOwnerName, replaceSalesRepFollowUp } from './agentic/post-demo-owner.js';
 import { postDemoPlannerMode } from './agentic/post-demo-turn.js';
@@ -412,6 +415,7 @@ import { rehashCallSlotsMode, readRehashCallSlots, rehashCallBooking } from './a
 import { isInRehash, rehashLeadFromContext, rehashRoutingMode } from './agentic/rehash-state.js';
 import { planNepqTurn, enforceNepqPlan, referenceRetryNote, nepqBackboneMode, prefersCall as nepqPrefersCall, objectionType as nepqObjectionType, TIME_REQUEST_RX as NEPQ_TIME_REQUEST_RX, SCHEDULE_ASK_RX as NEPQ_SCHEDULE_ASK_RX,REPEAT_COMPLAINT_RX as NEPQ_REPEAT_COMPLAINT_RX, bookingOpenInThread as nepqBookingOpenInThread, dropUnaskedCallOffer, leadWantsCall as nepqLeadWantsCall, isServiceCallback as nepqIsServiceCallback } from './agentic/nepq-planner.js';
 import {
+  outOfAreaLine,
   planServiceAreaTurn, resolveCoverage, coverageHint, guardCoverageDraft, serviceAreaRecord, coverageOwnsReply,
 } from './agentic/service-area-turn.js';
 
@@ -1446,6 +1450,8 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
   // 2026-10-11: a rehash lead gets the post-demo track instead (rehash-nepq.js).
   const nepqBlock = buildNepqBlock(context, opts.established, opts.discipline || null, {
     rehash: opts.rehash || null, conversation: context?.conversation_recent || [], trigger: triggerMessage,
+    // 2026-10-12: the stored conversation stage (LEAD_STAGE_MODE=live only).
+    leadStage: opts.leadStage || null,
   });
   if (nepqBlock) parts.push(nepqBlock);
 
@@ -3836,8 +3842,9 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
         // literal rule sends do not resolve merge tags — the SERVICE_AREA_EXIT
         // rule's send_message picks this up as context.message. Guide §3.7
         // wording with the em-dash→comma SMS voice fix.
-        const oaFirstName = context.lead?.first_name || null;
-        const oaMessage = `Thanks${oaFirstName ? `, ${oaFirstName}` : ''}, it looks like your area's outside our current service footprint, so I can't set up a visit there. Wish we could help!`;
+        // 2026-10-12 (parity, batch 2 #3): the same short decline the live
+        // chat and the coverage turn send (outOfAreaLine); no exclamation point.
+        const oaMessage = outOfAreaLine(st.identity.postal_code);
         emitEvent({
           event_type: 'agentic.out_of_area_detected',
           source: 'response_generator',
@@ -3847,7 +3854,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
           payload: {
             zip: sa.zip || st.identity.postal_code,
             city: sa.city || st.identity.city || null,
-            first_name: oaFirstName,
+            first_name: context.lead?.first_name || null,
             message: oaMessage,
           },
           priority: 'high',
@@ -3873,6 +3880,23 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     return { identityState: st, serviceArea: sa, serviceAreaTentative: saT };
   });
   identityRead.catch(() => {});
+
+  // 2026-10-12 (handoff PR 4, batch 2 #2): a Katy, TX lead typed 77494 and
+  // was offered "10:00 AM ET". The zone came only from the record's zip. A zip
+  // typed in the conversation is where the visit is: in a served market, it
+  // sets the zone the times are read, labelled and written in (Houston → CT).
+  try {
+    const typedZip = typedZipFromThread(context.conversation_recent || [], triggerMessage);
+    if (typedZip && typedZip !== String(context.lead?.postal_code || '').slice(0, 5)) {
+      const z = await zoneForContact({ typedZip });
+      if (z.market_code && z.market_code !== context.market?.market_code) {
+        console.log(`[MarketZone] ${contactId}: typed zip ${typedZip} → ${z.market_code} (${z.label})`);
+        context.market = { ...(context.market || {}), timezone: z.timezone, label: z.label, market_code: z.market_code };
+      }
+    }
+  } catch (err) {
+    console.warn(`[MarketZone] ${contactId}: typed-zip zone read failed (record zone kept): ${err.message}`);
+  }
 
   const calendarId = getCalendarIdFromKbPack(kbPack)
     || (nepqWantsSlots ? (nepqVisitFirst ? inHomeCalendarFor(context.lead?.current_tags || []).calendar_id : BOOKING_CALENDARS.PROTECTION_PROFILE_REVIEW) : null);
@@ -4054,6 +4078,10 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   const nepqMode = (opts.dryRun === true && opts.nepqModeOverride) ? opts.nepqModeOverride : nepqBackboneMode();
   let nepqPlan = null;
   let nepqPlanFailed = false;
+  // 2026-10-12 (Lead Conversation Stage): the stored stage, ONLY when
+  // LEAD_STAGE_MODE=live; null leaves the planner exactly as before. A dry run
+  // (the simulator) never reads a real contact's stored row: it passes its own.
+  let leadStage = null;
   // The rep's real Rehash Call openings (rehash-slots.js), when read.
   let rehashCallSlots = null;
   // SMS only: email replies are long-form and keep their own rules.
@@ -4079,6 +4107,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
         const tz = promptTimezoneFor(context);
         rehashCallSlots = await memo('rehash_call_slots', () => readRehashCallSlots({ contactId, timezone: tz, tzLabel: tzLabel(tz) }));
       }
+      leadStage = opts.dryRun === true ? (opts.leadStageOverride || null) : await readStageForPlanner(contactId);
       const planArgs = {
         channel: 'sms',
         trigger: triggerMessage,
@@ -4094,6 +4123,10 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
         isCustomer: isCustomerP2(context),
         // The classifier read a call request: the planner's callback hand-off.
         callbackRequested: String(classification?.intent_class || '').toUpperCase() === 'CALLBACK',
+        // 2026-10-12 (PR 3): quote ≠ price and the competitor play, live only.
+        stageLive: leadStageMode() === 'live',
+        stage: leadStage,
+        knownZip: identityState?.identity?.postal_code || context.lead?.postal_code || null,
       };
       nepqPlan = planNepqTurn({ ...planArgs, postDemo: pdMode === 'live' && postDemoLead, rehashRep, rehash: !!rehash, callSlots: slotsMode === 'live' ? rehashCallSlots : null });
       if (slotsMode === 'shadow' && rehash && postDemoLead) {
@@ -4227,6 +4260,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       confFlowContext,
       // 2026-10-02: the binding NEPQ move, rendered last (live mode only).
       nepqPlan: nepqMode === 'live' ? nepqPlan : null,
+      leadStage: nepqMode === 'live' ? leadStage : null,
     }
   );
   // Part 7 (Mark, 2026-10-02: "I don't think we need any static messages"):
@@ -5081,6 +5115,15 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       console.warn(`[PropertyScope] ${contactId} ${scope.reason}`);
       validated.message = scope.text;
       if (scope.reason === 'lead_asked' && validated.companion_action?.action_type === 'book_appointment') validated.companion_action = null;
+    }
+    // 2026-10-12 (no single-leg visits; batch 3 T3): a lead who said they
+    // rent gets no time and no booking, in every mode (non-owner.js).
+    const owner = enforceNonOwner(validated.message, { thread: context.conversation_recent || [], inbound: triggerMessage });
+    if (owner.changed) {
+      console.warn(`[NonOwner] ${contactId} ${owner.reason}`);
+      validated.message = owner.text;
+      validated.non_owner = owner.reason;
+      if (validated.companion_action?.action_type === 'book_appointment') validated.companion_action = null;
     }
     // 2026-10-07 (Nicholas): a cancelled visit is never "your visit" (cancelled-visit.js).
     const cancelled = enforceCancelledVisit(validated.message, {
