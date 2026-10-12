@@ -614,7 +614,8 @@ test('a phone typed in this message counts; only the name is asked', async () =>
 const RICK = { id: 'RICK1', firstName: 'Rick', lastName: 'Fox', phone: '+13525550188' };
 const APPT = { appointment_id: 'APPT9', calendar_id: 'CAL1', status: 'confirmed', start_time: '2026-10-02T22:00:00Z', start_time_human: 'Thu, Oct 2, 6:00 PM ET' };
 const SLOTS = [{ iso: '2026-10-06T14:00:00Z', day: 'Tue, Oct 6', time: '10:00 AM', dayOfWeek: 'Tuesday' }, { iso: '2026-10-07T18:00:00Z', day: 'Wed, Oct 7', time: '2:00 PM', dayOfWeek: 'Wednesday' }];
-const cancelDeps = (state, { found = RICK, appts = [APPT], cancelOk = true, freeSlots = [], moveOk = true } = {}) => ({
+const cancelDeps = (state, { found = RICK, appts = [APPT], cancelOk = true, freeSlots = [], moveOk = true, stageMode = null } = {}) => ({
+  ...(stageMode ? { leadStageMode: () => stageMode } : {}),
   findContactByPhone: async (d) => { state.lookedUpPhones = [...(state.lookedUpPhones || []), d]; return found; },
   fetchAppointments: async (id) => { state.apptReads = [...(state.apptReads || []), id]; return appts; },
   cancelAppointment: async (a) => { state.cancels = [...(state.cancels || []), a]; return cancelOk ? { ok: true } : { ok: false, error: 'GHL 400' }; },
@@ -1289,6 +1290,19 @@ async function withLiveStage(fn) {
   process.env.LEAD_STAGE_MODE = 'live';
   try { return await fn(); } finally { if (before === undefined) delete process.env.LEAD_STAGE_MODE; else process.env.LEAD_STAGE_MODE = before; }
 }
+
+// The simulator plans under its run's own mode (lead_stage_mode=live) while
+// Railway stays shadow: the lane reads the mode through its dep, not the env.
+test('the lane\'s leadStageMode dep turns the live reschedule path on with the env in shadow', async () => {
+  const before = process.env.LEAD_STAGE_MODE;
+  process.env.LEAD_STAGE_MODE = 'shadow';
+  try {
+    const { lane, state } = laneWithCancel([...UP_TO_OFFER, TZ('inbound', 'what color are the frames', 70)], { freeSlots: SLOTS, stageMode: 'live' });
+    await lane.processInbound(INBOUND('what color are the frames'));
+    assert.match(state.sends[0].message, /move your appointment to another day, or cancel it\?/);
+    assert.equal(state.cancels, undefined);
+  } finally { if (before === undefined) delete process.env.LEAD_STAGE_MODE; else process.env.LEAD_STAGE_MODE = before; }
+});
 
 test('live: an unclear answer to the offer gets ONE clarifying question, never a cancel or a cancel card', () => withLiveStage(async () => {
   const { lane, state } = laneWithCancel([...UP_TO_OFFER, TZ('inbound', 'what color are the frames', 70)], { freeSlots: SLOTS });

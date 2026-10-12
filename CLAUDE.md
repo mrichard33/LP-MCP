@@ -1263,6 +1263,13 @@ result with the last gate run and saves it as a `agentic.bot_eval_run` system ev
 turns only, never customer text). **Ship only if the scorecard does not read WORSE THAN LAST RUN.**
 A run takes 10–15 minutes and about 130 real model turns. A new scenario rule must come from a
 ruling already in this file, so a failure means a regression, not a matter of taste.
+**The AIOS test runs are named scenarios (handoff PR 7, 2026-10-12).** easy_yes, book_it_evening_spouse, renter,
+competitor, stop_sms, stop_chat, trick_prompt, reschedule_unclear, out_of_area_chat, houston_tz. A scenario with
+`autoAnswer` lets the persona answer the bot's address / ownership / zip / decision-maker / name / phone question
+(`autoAnswerFor`), so a booking scenario can book. Every conversation also gets `stageFlowFailures`: yes_without_booking,
+slots_offered_to_non_owner, stage_regressed, and, only when the run's `lead_stage_mode` is live, slots_without_qualifying
+and bridge_repeated (today's designed behavior in shadow). A texted STOP answered with silence is not `no_reply`. The
+scenario checks carry `SCORING_VERSION`: a run scored with new checks is a new baseline, not "worse".
 
 ## Writing code here
 

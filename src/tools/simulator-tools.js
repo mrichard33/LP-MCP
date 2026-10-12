@@ -113,7 +113,7 @@ export function registerSimulatorTools(server, deps = simulatorDeps) {
       scenario: z.string().optional().describe('Named scenario, or "all".'),
       messages_json: z.string().optional().describe('Your own customer messages, as a JSON array of strings (max 12).'),
       persona_json: z.string().optional().describe('Optional customer record, e.g. {"firstName":"Dana","phone":"+13525550101","postalCode":"33908"}.'),
-      contact_id: z.string().optional().describe('Optional real GHL contact (e.g. Mark Test hZOcPk6XmMvWVvjZJ7mz) whose record is READ for realism. Nothing is sent or written to it.'),
+      contact_id: z.string().optional().describe('Optional real GHL contact whose record is READ for realism (e.g. the sandbox test contact s2Omf2RcK5YBISwgHHOe). Nothing is sent or written to it. Never a real lead, nor a contact tagged hard-disqualified or suppress-outbound.'),
       channel: z.string().optional().describe('both (default), livechat or sms.'),
       nepq_mode: z.string().optional().describe('live (default: the NEPQ backbone answers) or off (today\'s production replies).'),
       lead_stage_mode: z.string().optional().describe('shadow or live: run with the stored conversation stage recorded only (shadow) or driving the planner (live). Default: Railway\'s LEAD_STAGE_MODE. Kept in memory; nothing is written.'),

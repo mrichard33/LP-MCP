@@ -4168,7 +4168,8 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
         // The classifier read a call request: the planner's callback hand-off.
         callbackRequested: String(classification?.intent_class || '').toUpperCase() === 'CALLBACK',
         // 2026-10-12 (PR 3): quote ≠ price and the competitor play, live only.
-        stageLive: leadStageMode() === 'live',
+        // The simulator's dry run plans under its own run's mode.
+        stageLive: ((opts.dryRun === true && opts.leadStageModeOverride) || leadStageMode()) === 'live',
         stage: leadStage,
         knownZip: identityState?.identity?.postal_code || context.lead?.postal_code || null,
       };

@@ -649,6 +649,9 @@ export function createLiveChatFastLane(deps) {
     // simulator records it in memory and shows it on the transcript.
     recordLeadStage: async () => null,
     readLeadStage: async () => null,
+    // The LEAD_STAGE_MODE this turn plans under. The simulator passes its own
+    // run's mode, so lead_stage_mode=live exercises the live-only plays.
+    leadStageMode: () => leadStageMode(),
     // 2026-10-11 opener race (src/jobs/no-reply-followup.js). Default records nothing.
     recordOpenerHold: async () => null,
     rescheduleAppointment: async () => ({ ok: false, error: 'no reschedule dep' }),
@@ -1007,7 +1010,7 @@ export function createLiveChatFastLane(deps) {
       thread: context.conversation_recent,
       known: { phone: context.lead?.phone || contact?.phone || null, hasName: hasNameOnRecord },
       // 2026-10-12 (handoff PR 5): the reschedule path, LEAD_STAGE_MODE=live only.
-      stageLive: leadStageMode() === 'live',
+      stageLive: d.leadStageMode() === 'live',
     });
     if (cancelPlan && !reference) {
       // A newer message already arrived: let that turn run the flow, so an
@@ -1085,7 +1088,7 @@ export function createLiveChatFastLane(deps) {
         // A customer's call request goes to service (Mark, 2026-10-03).
         isCustomer: isCustomerP2(context),
         // 2026-10-12 (PR 3): quote ≠ price and the competitor play, live only.
-        stageLive: leadStageMode() === 'live',
+        stageLive: d.leadStageMode() === 'live',
         stage: leadStage,
         knownZip: context.lead?.postal_code || null,
       };
