@@ -234,6 +234,22 @@ export function filterDrift(sql, known = KNOWN_DRIFT_NOISE) {
   return { remaining, ignored };
 }
 
+/**
+ * Migration files the database has not applied yet (2026-10-12, Fix 2). The
+ * drift check compares the live database with this folder; on a PR that adds
+ * a migration the new file is not live yet, so leaving it in would report its
+ * own table as drift and fail every such PR. These are set aside for the diff
+ * only; `db push` applies them on merge.
+ */
+export function pendingMigrationFiles(listText, fileNames) {
+  const { localOnly } = parseMigrationList(listText);
+  const pending = new Set(localOnly);
+  return fileNames.filter((n) => {
+    const m = MIGRATION_NAME.exec(n);
+    return m && pending.has(m[1]);
+  });
+}
+
 /** Rule 4: the old numbered folder is frozen. */
 export function checkLegacySqlFrozen(names, freeze = LEGACY_SQL_FREEZE) {
   const problems = [];
@@ -287,6 +303,18 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
       process.exit(1);
     }
     console.log('No drift.');
+    process.exit(0);
+  }
+  const pendingFile = arg('--pending');
+  if (pendingFile) {
+    const listText = readFileSync(pendingFile, 'utf8');
+    if (countLedgerRows(listText) === 0) {
+      console.error('✗ could not read the database ledger, so the pending migrations are unknown. This is not a pass.');
+      process.exit(1);
+    }
+    const dir = path.join(ROOT, MIGRATIONS_DIR);
+    const names = existsSync(dir) ? readdirSync(dir).filter((n) => n.endsWith('.sql')).sort() : [];
+    for (const n of pendingMigrationFiles(listText, names)) console.log(n);
     process.exit(0);
   }
   const listFile = arg('--migration-list');

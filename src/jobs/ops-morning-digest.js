@@ -353,6 +353,43 @@ async function nightlySummarySections(deps, nowMs) {
     }),
   ];
 }
+// 2026-10-12 (Fix 2). Features sat in shadow for weeks with nobody looking.
+// Mondays only: ONE section naming how many flags are in shadow and the ones
+// waiting longest, pointing at the dashboard's /modes page. It changes no
+// flag; a flip stays Mark's (or the user's) call.
+export const SHADOW_REVIEW_DAYS = 14;
+
+/** Pure. Days in shadow per flag, longest first; counts from state_changed_at, else since. */
+export function shadowReviewLines(rows, nowMs) {
+  const shadow = (rows || []).filter((r) => r.current_state === 'shadow');
+  if (!shadow.length) return [];
+  const days = (r) => {
+    const from = Date.parse(r.state_changed_at || `${r.since}T00:00:00Z`);
+    return Number.isFinite(from) ? Math.max(0, Math.floor((nowMs - from) / DAY_MS)) : 0;
+  };
+  const waiting = shadow.map((r) => ({ name: r.name, d: days(r), ruled: r.go_live && !/needs a ruling/.test(r.go_live) }))
+    .filter((r) => r.d >= SHADOW_REVIEW_DAYS)
+    .sort((a, b) => b.d - a.d || a.name.localeCompare(b.name));
+  const lines = [`${shadow.length} flags in shadow; ${waiting.length} for ${SHADOW_REVIEW_DAYS}+ days. Review on the dashboard's /modes page.`];
+  if (waiting.length) {
+    lines.push(`waiting longest: ${waiting.slice(0, SECTION_MAX).map((r) => `${r.name} (${r.d}d${r.ruled ? '' : ', no go-live test yet'})`).join(', ')}${waiting.length > SECTION_MAX ? ` +${waiting.length - SECTION_MAX} more` : ''}`);
+  }
+  return lines;
+}
+
+function isMondayET(nowMs) {
+  return new Date(`${todayET(new Date(nowMs))}T12:00:00Z`).getUTCDay() === 1;
+}
+
+async function shadowModesSection(deps, nowMs) {
+  if (!isMondayET(nowMs)) return null;
+  const { data, error } = await deps.supabase.from('feature_modes')
+    .select('name, current_state, state_changed_at, since, go_live')
+    .eq('current_state', 'shadow');
+  if (error) throw new Error(`feature_modes read failed: ${error.message}`);
+  const lines = shadowReviewLines(data, nowMs);
+  return lines.length ? { title: 'Shadow-mode review (Mondays)', lines } : null;
+}
 
 /** Pure. The digest text. */
 export function formatDigest(sections, { date } = {}) {
@@ -388,7 +425,7 @@ export async function runOpsMorningDigest({ post = true, deps: depsArg } = {}) {
     if (post) await deps.sendAlertMessage(`⚠️ ${label} could not run: ${error}`, { channel: 'ops' });
   };
 
-  for (const [label, build] of [['P2 won/lost summary', p2Section], ['Sale → P2 backstop summary', p2BackstopSection], ['Sale → contact backstop summary', saleContactSection], ['Appointment parity summary', paritySection], ['Post-issue rebook summary', postIssueSection]]) {
+  for (const [label, build] of [['P2 won/lost summary', p2Section], ['Sale → P2 backstop summary', p2BackstopSection], ['Sale → contact backstop summary', saleContactSection], ['Appointment parity summary', paritySection], ['Post-issue rebook summary', postIssueSection], ['Shadow-mode review', shadowModesSection]]) {
     try { sections.push(await build(deps, nowMs)); } catch (err) { await couldNotRun(label, err.message); }
   }
   try { sections.push(...await nightlySummarySections(deps, nowMs)); } catch (err) { await couldNotRun('Nightly summaries (tag sweep, inbound callers)', err.message); }
