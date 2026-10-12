@@ -341,9 +341,13 @@ import {
   replaceInsuranceClaims,
   findRepeatedOpener,
   repeatedOpenerNote,
+  findFalseReplyAck,
+  falseReplyAckNote,
+  stripFalseReplyAck,
   stripSentences,
   holdingLine,
 } from './agentic/discovery-discipline.js';
+import { enqueueNoReplyFollowup, openerHoldMode } from './jobs/no-reply-followup.js';
 // 2026-09-23 — the prompt carried today's DATE and the copy still said "before
 // storm season" in September. See src/agentic/storm-season.js.
 import { stormSeasonBlock } from './agentic/storm-season.js';
@@ -3439,6 +3443,46 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     console.warn(`[ResponseGenerator] discipline build failed for ${contactId}: ${err.message}`);
   }
 
+  // ─── Opener race hold (2026-10-11, Javier r5hMYoAdxhAPmj9U5Mjv) ───────
+  // His web-chat "Hi" (20:51:40Z) came 9s BEFORE GHL's welcome text, and the
+  // bot answered the "Hi" as if it were a reply to the welcome: "thanks for
+  // reaching back out". When the trigger predates an opener that has since
+  // been sent and nothing came in after it, the welcome already answered the
+  // greeting. AIOS CANON.RULE.052: decided here from typed timing fields, not
+  // by the model. CANON.RULE.064: OPENER_HOLD_MODE shadow (default) records the
+  // hold and still replies; live holds the reply and src/jobs/no-reply-followup.js
+  // sends ONE approved check-in if the lead stays quiet.
+  if (discipline?.reply?.trigger_predates_opener && channel !== 'livechat') {
+    const holdMode = openerHoldMode();
+    if (holdMode !== 'off') {
+      const held = holdMode === 'live';
+      if (opts.dryRun !== true) {
+        await enqueueNoReplyFollowup({
+          contactId, discipline, mode: holdMode, surface: 'sms_reply', held, triggerPreview: triggerMessage,
+        }).catch(err => console.warn(`[ResponseGenerator] opener hold enqueue failed for ${contactId}: ${err.message}`));
+      }
+      if (held) {
+        console.log(`[ResponseGenerator] ⏸️ opener_hold for ${contactId}: lead's message predates the welcome text and they have not replied — no reply, one follow-up queued`);
+        return {
+          short_circuit: false,
+          message: null,
+          subject: null,
+          story_arc: 'none',
+          voice_used: 'we',
+          intent_class: 'OPENER_HOLD',
+          kb_pack_used: false,
+          fast_track: false,
+          companion_action: null,
+          opener_hold: {
+            opener_at: new Date(discipline.reply.opener_ms).toISOString(),
+            trigger_at: Number.isFinite(discipline.reply.trigger_ms) ? new Date(discipline.reply.trigger_ms).toISOString() : null,
+          },
+          lead_first_name: context.lead?.first_name || null,
+        };
+      }
+    }
+  }
+
   // 2026-07-29 (Kelly Callahan incident) — decision-time context. See
   // DECISION-TIME CONTEXT above. When live state and the snapshot disagree
   // about the funnel stage, a sibling action rewrote the contact between
@@ -4677,6 +4721,20 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       if (repeats.length) {
         notes.push(repeatedOpenerNote(discipline.opener.text, discipline.opener.age_sec));
         fixes.push(() => { validated.message = stripSentences(validated.message, s => repeats.includes(s)); });
+      }
+    }
+
+    // Fix 7 (2026-10-11, Javier): never thank a lead for a reply they did not
+    // send. AIOS CANON.RULE.019: a regex guard, independent of the model.
+    // CANON.RULE.060: the strip runs on this draft (Part 6), the note rides
+    // the one patch-budget re-write, and that re-write is stripped again.
+    // FALSE_REPLY_ACK_GUARD=off is the kill switch.
+    if (discipline?.reply && process.env.FALSE_REPLY_ACK_GUARD !== 'off') {
+      const acks = findFalseReplyAck(validated.message, discipline.reply);
+      if (acks.length) {
+        console.warn(`[ResponseGenerator] guard false_reply_ack for ${contactId}: "${acks[0].slice(0, 80)}" — the lead has not replied to our last message`);
+        notes.push(falseReplyAckNote());
+        fixes.push(() => { validated.message = stripFalseReplyAck(validated.message); });
       }
     }
 

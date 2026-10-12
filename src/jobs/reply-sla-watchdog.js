@@ -60,10 +60,15 @@ function normTags(tags) {
 /**
  * Pure classifier. `tags` = null means the snapshot was unreadable.
  */
-export function classifyReply({ actionTaken, tags, hasCompletedSend, hasInFlightSend = false }) {
+export function classifyReply({ actionTaken, tags, hasCompletedSend, hasInFlightSend = false, hasHeldSend = false }) {
   const at = typeof actionTaken === 'string' ? actionTaken : '';
   if (at.startsWith('bot_silenced:') || at.startsWith('skipped:')) return 'silenced';
   if (hasCompletedSend) return 'answered';
+  // 2026-10-11 — a reply held by the opener race (the lead's message came
+  // before the welcome text; src/jobs/no-reply-followup.js owns the one
+  // follow-up). Deliberately quiet: paging it would make rules 371–374
+  // "recover" the exact reply the hold withheld.
+  if (hasHeldSend) return 'silenced';
   if (hasInFlightSend) return 'in_flight';
   const t = normTags(tags);
   if (t === null) return 'unknown';
@@ -91,6 +96,9 @@ async function readTags(db, contactId) {
 }
 
 const IN_FLIGHT_STATUSES = new Set(['pending', 'approved', 'executing']);
+// Skip reasons that mean the reply was withheld on purpose (result-status.js
+// writes a skipped handler's reason into error_message).
+const HELD_SKIP_REASONS = new Set(['opener_hold']);
 
 /**
  * Pure: from the contact's send_message rows since the reply, was it answered,
@@ -102,13 +110,14 @@ export function sendStateFromRows(rows, { now, inFlightMs }) {
   const hasCompletedSend = list.some((r) => r?.status === 'completed');
   const hasInFlightSend = !hasCompletedSend && list.some((r) => IN_FLIGHT_STATUSES.has(r?.status)
     && Number.isFinite(Date.parse(r?.created_at)) && (now - Date.parse(r.created_at)) < inFlightMs);
-  return { hasCompletedSend, hasInFlightSend };
+  const hasHeldSend = !hasCompletedSend && list.some((r) => r?.status === 'skipped' && HELD_SKIP_REASONS.has(r?.error_message));
+  return { hasCompletedSend, hasInFlightSend, hasHeldSend };
 }
 
 async function sendRowsSince(db, contactId, sinceIso) {
   const { data, error } = await db
     .from('agent_actions')
-    .select('id, status, created_at')
+    .select('id, status, created_at, error_message')
     .eq('target_id', contactId)
     .eq('action_type', 'send_message')
     .gte('created_at', sinceIso)
@@ -178,7 +187,7 @@ export async function runReplySlaWatchdog(deps = {}) {
       counts.unknown++;
       continue;
     }
-    const tags = (state.hasCompletedSend || state.hasInFlightSend) ? [] : await readTags(db, contactId);
+    const tags = (state.hasCompletedSend || state.hasInFlightSend || state.hasHeldSend) ? [] : await readTags(db, contactId);
     const cls = classifyReply({ actionTaken: r.action_taken, tags, ...state });
     counts[cls]++;
     if (cls !== 'unanswered') continue;

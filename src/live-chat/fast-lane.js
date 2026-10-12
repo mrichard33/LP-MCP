@@ -91,6 +91,9 @@ import {
   replaceInsuranceClaims,
   findRepeatedOpener,
   repeatedOpenerNote,
+  findFalseReplyAck,
+  falseReplyAckNote,
+  stripFalseReplyAck,
   stripSentences,
   holdingLine,
 } from '../agentic/discovery-discipline.js';
@@ -126,6 +129,7 @@ import {
 } from './chat-rules.js';
 import { marketTimezone, tzLabel } from '../config/market-timezones.js';
 import { phoneFromText } from './missed-replies.js';
+import { openerHoldMode } from '../jobs/no-reply-followup.js';
 import {
   planCancelTurn,
   pickAppointment,
@@ -530,6 +534,12 @@ export function guardDraft(draft, { discipline, established, loopBreak, spouseAd
     const rep = findRepeatedOpener(fixed, discipline.opener.text);
     if (rep.length) { notes.push(repeatedOpenerNote(discipline.opener.text, discipline.opener.age_sec)); fixed = stripSentences(fixed, s => rep.includes(s)); }
   }
+  // Fix 7 (2026-10-11, Javier): no thanks for a reply the lead never sent.
+  // AIOS CANON.RULE.019 / 060: regex guard, one redraft note, deterministic strip.
+  if (discipline?.reply && process.env.FALSE_REPLY_ACK_GUARD !== 'off') {
+    const acks = findFalseReplyAck(fixed, discipline.reply);
+    if (acks.length) { notes.push(falseReplyAckNote()); fixed = stripFalseReplyAck(fixed); }
+  }
   if (established?.closed_questions?.length) {
     const repeats = findRepeatedQuestions(fixed, established);
     if (repeats.length) notes.push(`Your previous draft re-asked a question this visitor already answered (${repeats.join(', ')}). Reference their answer; do not ask it again.`);
@@ -627,6 +637,8 @@ export function createLiveChatFastLane(deps) {
     // Defaults change nothing and record nothing.
     guardRepeatPromise: async ({ text }) => ({ text, action: 'none' }),
     recordPromise: async () => ({ recorded: false }),
+    // 2026-10-11 opener race (src/jobs/no-reply-followup.js). Default records nothing.
+    recordOpenerHold: async () => null,
     rescheduleAppointment: async () => ({ ok: false, error: 'no reschedule dep' }),
     contactUrl: () => null,
     ...deps,
@@ -929,6 +941,14 @@ export function createLiveChatFastLane(deps) {
     const spouseAdvocacy = spouseAdvocacyState({ conversation: context.conversation_recent, tags: contactTags });
     const handoffPending = contactTags.includes('intent:callback-requested');
     const discipline = buildDiscipline({ triggerMessage: body, conversation: context.conversation_recent, established, handoffPending, nowMs: d.now() });
+    // 2026-10-11 opener race (Javier). The visitor is in the chat widget
+    // waiting, and the welcome went by SMS, so the chat reply is NEVER held
+    // here: the race is recorded as shadow only (OPENER_HOLD_MODE off still
+    // turns it off). The hold itself lives in the SMS reply path.
+    if (discipline.reply?.trigger_predates_opener && openerHoldMode() !== 'off') {
+      d.recordOpenerHold({ contactId, conversationId, discipline, mode: 'shadow', surface: 'live_chat', held: false, triggerPreview: body })
+        .catch(err => d.warn(`[LiveChat] opener hold record failed for ${contactId}: ${err.message}`));
+    }
 
     // ── service area, zip first (Mark's ruling 4, 2026-10-01) ──
     // The plan is pure; the lookup runs beside classification and the KB pack
@@ -1297,6 +1317,12 @@ export function createLiveChatFastLane(deps) {
       guard = runGuards(gen.validated.message, gen.live);
     }
     draft = guard.fixed;
+    // The reference path above skips guardDraft; the false-ack strip still
+    // runs on whatever ships (CANON.RULE.060: deterministic after one redraft).
+    if (discipline?.reply && process.env.FALSE_REPLY_ACK_GUARD !== 'off' && findFalseReplyAck(draft, discipline.reply).length) {
+      d.log(`[LiveChat] guard false_reply_ack ${contactId}: thanks for a reply the visitor never sent — stripped`);
+      draft = stripFalseReplyAck(draft) || holdingLine(leadFirstName);
+    }
     liveChatFields = gen.live;
     timing.t5_generation_done = new Date(d.now()).toISOString();
 
