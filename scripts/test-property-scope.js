@@ -111,3 +111,10 @@ test('mentionsTallBuilding', () => {
   assert.equal(mentionsTallBuilding('second floor'), false);
   assert.equal(mentionsTallBuilding('one story home'), false);
 });
+
+test('leadRaisesScope reads every message the lead sent, and a denial raises nothing (2026-10-13)', async () => {
+  const { leadRaisesScope } = await import('../src/agentic/property-scope.js');
+  assert.equal(leadRaisesScope(['hi', 'we live in a double wide', 'Tuesday works']), true);
+  assert.equal(leadRaisesScope(['My condo is on the 5th floor']), true);
+  assert.equal(leadRaisesScope(["it's not a mobile home, it's a house", '2 story house']), false);
+});

@@ -53,10 +53,10 @@ UPDATE kb_faqs
 -- ── no rentals ──────────────────────────────────────────────────────────
 INSERT INTO kb_faqs (kb_key, question_pattern, canonical_answer, answer_short, channel, tier, active, notes)
 SELECT 'LIB-P16',
-       $$Do you work on rental properties? | Can you do windows on my rental? | I rent it out, can you replace the windows? | Do you work with landlords? | Do you do investment properties? | Can renters get a quote? | It's an Airbnb, can you help?$$,
-       $$No, sorry about that. We don't work on rental properties, whether you rent the home or rent it out. We only work on homes the owner isn't renting out.$$,
+       $$Do you work on rental properties? | Can you do windows on my rental? | I rent it out, can you replace the windows? | Do you work with landlords? | Do you do investment properties? | It's a flip, can you do the windows? | Can renters get a quote? | It's an Airbnb, can you help?$$,
+       $$No, sorry about that. We don't work on rental or investment properties, whether you rent the home, rent it out, or are flipping it. A second home you keep for yourself is fine.$$,
        NULL, 'both', 'factual', true,
-       $$2026-10-13 (the user): no rental properties of any kind: a tenant, a landlord, an investment rental, Airbnb or VRBO. An owner's own second home that is not rented out is fine. Guard: src/agentic/job-scope.js.$$
+       $$2026-10-13 (the user): no rental properties of any kind (a tenant, a landlord, an investment rental, Airbnb or VRBO) and no flips. An owner's own second home that is not rented out is fine. Guard: src/agentic/job-scope.js.$$
 WHERE NOT EXISTS (SELECT 1 FROM kb_faqs WHERE kb_key = 'LIB-P16');
 
 -- ── no commercial ───────────────────────────────────────────────────────

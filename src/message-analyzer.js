@@ -607,7 +607,7 @@ Set dq_detected ONLY when the lead VOLUNTEERS a disqualifying fact. Never infer 
 
 • "mobile-home" — they state the property is a mobile or manufactured home.
 • "renter" — they state they rent / are not the homeowner / "I'd have to ask my landlord".
-• "rental_property" — they state the home is rented out: a landlord, "we rent it out", an investment rental, an Airbnb or VRBO, a property manager.
+• "rental_property" — they state the home is rented out or is an investment: a landlord, "we rent it out", an investment rental, an Airbnb or VRBO, a property manager, or a flip (bought to fix and resell). An owner's own second home that is not rented out is NOT.
 • "commercial" — they state the property is not a home: a business, store, office or apartment building, church, school, or an HOA or condo association buying for the building.
 • "below_minimum" — they state the whole job is under our minimum (fewer than three windows or doors, and no sliding glass door) and confirm there is nothing else.
 • "lanai-only" — the project is ONLY a lanai, sunroom, screen enclosure, or patio screen (no main-structure windows or doors). "Windows plus the lanai" is NOT a DQ — main-home work qualifies.

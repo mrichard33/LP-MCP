@@ -15,6 +15,9 @@
 //   - RENTAL: any home that is rented out (a tenant, a landlord, an investment
 //     rental, Airbnb / VRBO). An owner's own second home that is not rented
 //     out is fine.
+//   - INVESTMENT (the user, same day, closing #1274): a flip is a no; a second
+//     home the owner keeps is a lead. "An investment property" with nothing
+//     else is read as one of the two noes (a rental or a flip).
 //   - COMMERCIAL: any property that is not a home (a business, a store, an
 //     office or apartment building, a church, an HOA or condo association
 //     buying for the building). A single condo owner is a homeowner.
@@ -51,7 +54,9 @@ export const MINIMUM_CHECK_DOORS_LINE = 'Of course, I can help with that. Are al
 // "3-opening minimum" is the user's wording (2026-10-13: "we should say there is a 3 open minimum").
 export const BELOW_MINIMUM_LINE = "Thanks for letting me know. We have a 3-opening minimum, any mix of windows and doors, or one sliding glass door on its own, so we can't set up a visit for this one. If anything else comes up, we'd be glad to help.";
 
-const LINE_FOR = { rental: RENTAL_LINE, commercial: COMMERCIAL_LINE, below_minimum: BELOW_MINIMUM_LINE };
+export const INVESTMENT_LINE = "Thanks for letting me know. We don't work on investment properties like rentals or flips, so we can't set up a visit for this one. Sorry about that.";
+
+const LINE_FOR = { rental: RENTAL_LINE, investment: INVESTMENT_LINE, commercial: COMMERCIAL_LINE, below_minimum: BELOW_MINIMUM_LINE };
 
 // ── rental ────────────────────────────────────────────────────────────────
 
@@ -68,7 +73,6 @@ const RENTAL_RX = new RegExp([
   /\btenants?\s+(?:live|living|lives|are|is)\b/.source,
   /\btenant[\s-]occupied\b/.source,
   /\b(?:i'?m|i\s+am|we'?re|we\s+are)\s+(?:the\s+)?landlords?\b/.source,
-  /\binvestment\s+propert(?:y|ies)\b/.source,
   /\b(?:airbnb|air\s+bnb|vrbo)\b/.source,
   /\b(?:short[\s-]term|vacation|long[\s-]term)\s+rentals?\b/.source,
   /\bproperty\s+manag(?:er|ers|ement|ing)\b/.source,
@@ -290,6 +294,16 @@ export function saysRentalProperty(text) {
   return sentences(text).some(s => (RENTAL_RX.test(s) || TENANT_RX.test(s)) && !RENTAL_DENIED_RX.test(s));
 }
 
+// A flip, or an investment property with nothing else said. "A second home",
+// "our vacation home" and "flip phone" never match.
+const INVESTMENT_RX = /\binvestment\s+(?:propert(?:y|ies)|homes?|houses?)\b|\b(?:flip|flipping|flipped)\s+(?:it|this|that|the|a|houses?|homes?|properties)\b|\bhouse\s+flip(?:per|ping|s)?\b|\bfix(?:\s+and\s+|\s*&\s*|\s*-\s*|\s+n\s+)flip\b|\bflipper\b|\b(?:renovat(?:e|ing)|fix(?:ing)?\s+(?:it\s+)?up)\s+(?:it\s+)?to\s+(?:re)?sell\b/i;
+const INVESTMENT_DENIED_RX = /\b(?:not|isn'?t|aren'?t|wasn'?t|never)\b[^.!?]*\b(?:investment|flip)/i;
+
+/** Does this message say the home is a flip or an investment property? Pure. */
+export function saysInvestment(text) {
+  return sentences(text).some(s => INVESTMENT_RX.test(s) && !INVESTMENT_DENIED_RX.test(s));
+}
+
 /** Does this message say the property is not a home? Pure. */
 export function saysCommercial(text) {
   return sentences(text).some(s => COMMERCIAL_RX.test(s) && !COMMERCIAL_DENIED_RX.test(s));
@@ -307,7 +321,7 @@ function normalize(thread = [], inbound = '') {
 
 /**
  * Can we take this job, by the lead's own words in the thread? Pure.
- * @returns {{ block: 'rental'|'commercial'|'below_minimum'|null, check: boolean, now: boolean }}
+ * @returns {{ block: 'rental'|'investment'|'commercial'|'below_minimum'|null, check: boolean, now: boolean }}
  *   check: a stated count is under the minimum and we have not asked yet.
  *   now:   the deciding words are in the newest inbound message.
  */
@@ -322,6 +336,12 @@ export function jobScopeFromThread(thread = [], inbound = '') {
     if (m.direction !== 'inbound') continue;
     if (saysRentalProperty(m.text)) return { block: 'rental', check: false, now: i === lastInboundIdx };
     if (saysOwner(m.text)) break;
+  }
+  for (let i = turns.length - 1; i >= 0; i--) {
+    const m = turns[i];
+    if (m.direction !== 'inbound') continue;
+    if (saysInvestment(m.text)) return { block: 'investment', check: false, now: i === lastInboundIdx };
+    if (/\b(?:we|i)\s+(?:now\s+)?live\s+(?:there|in\s+it|here)\b|\bour\s+(?:own\s+)?(?:second|vacation)\s+home\b/i.test(m.text)) break;
   }
   for (let i = turns.length - 1; i >= 0; i--) {
     const m = turns[i];
@@ -382,8 +402,8 @@ const CLAIMS = [
   },
   {
     key: 'rental_claim',
-    rx: /\b(?:we|reece)\b[^.!?]*\b(?:do|handle|work\s+(?:on|with)|service|help\s+with|install\s+(?:on|in|for))\b[^.!?]*\b(?:rental\s+propert(?:y|ies)|rentals|landlords|investment\s+propert(?:y|ies)|investors)\b/i,
-    line: "We don't work on rental properties.",
+    rx: /\b(?:we|reece)\b[^.!?]*\b(?:do|handle|work\s+(?:on|with)|service|help\s+with|install\s+(?:on|in|for))\b[^.!?]*\b(?:rental\s+propert(?:y|ies)|rentals|landlords|investment\s+propert(?:y|ies)|investors|flips?|flippers)\b/i,
+    line: "We don't work on rental or investment properties.",
   },
   {
     key: 'impact_claim',
