@@ -18,7 +18,17 @@
 // REHASH_ROUTING_MODE: off stops the job; shadow decides and records
 // `rehash.would_tag` / `rehash.would_release` events only; live queues the rows.
 //
-// deps (all optional, for tests): { supabase, getContact, emitEvent, env, now, log }
+// GHL reads (2026-10-13): a pass read every contact live from GHL, ~47 per
+// pass, 4,500 a day, and 1 pass in 4 failed on 429s (16 of LP-MCP's 65 in a
+// day, #1248's per-caller counts). Almost every answer is "none". The pass now
+// decides first from contact_tag_snapshot (it matched 527 of 537 open rehash
+// tags on 2026-10-13) and reads GHL live only when that says act, when the
+// contact is not in the snapshot, or when this contact has not been read live
+// for LIVE_RECHECK_MS. Every write is still decided from a LIVE read (the
+// stale-webhook rule, 2026-09-30): a snapshot mismatch costs one extra read,
+// never a wrong write. A snapshot that cannot be read means all live, as before.
+//
+// deps (all optional, for tests): { supabase, getContact, readSnapshotTags, liveReadAt, emitEvent, env, now, log }
 
 import { runJob } from '../job-runner.js';
 import { pickCurrentLead } from '../current-lead.js';
@@ -31,6 +41,8 @@ export const RULE_KEY = 'REHASH_TAG_SWEEP';
 const INTERVAL_MS = 15 * 60 * 1000;
 const MAX_CONTACTS = 60;
 const DAY_MS = 86_400_000;
+export const LIVE_RECHECK_MS = DAY_MS;
+const LIVE_READ_AT = new Map(); // contactId -> ms of the last live GHL read (in-process)
 
 async function withDefaults(deps) {
   const d = { ...deps };
@@ -43,7 +55,34 @@ async function withDefaults(deps) {
     d.getContact = async (id) => (await ghlFetch('GET', `/contacts/${id}`))?.contact || null;
   }
   if (!d.emitEvent) d.emitEvent = (await import('../event-emitter.js')).emitEvent;
+  d.readSnapshotTags ||= (ids) => readSnapshotTags(d.supabase, ids);
+  d.liveReadAt ||= LIVE_READ_AT;
   return d;
+}
+
+/** contactId -> tags from contact_tag_snapshot. Null when the read failed (then every contact is read live). */
+async function readSnapshotTags(supabase, ids) {
+  if (!ids.length) return new Map();
+  try {
+    const { data, error } = await supabase.from('contact_tag_snapshot')
+      .select('ghl_contact_id, tags').in('ghl_contact_id', ids);
+    if (error) return null;
+    const map = new Map();
+    for (const r of data || []) if (r?.ghl_contact_id && Array.isArray(r.tags)) map.set(r.ghl_contact_id, r.tags);
+    return map;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Pure. Can this contact's GHL read be skipped this pass? Only when the
+ * snapshot answer is "nothing to do" and a live read confirmed the contact
+ * within LIVE_RECHECK_MS. Anything to act on is always read live first.
+ */
+export function canSkipLiveRead({ snapshotDecision, lastLiveMs, nowMs, recheckMs = LIVE_RECHECK_MS }) {
+  if (!snapshotDecision || snapshotDecision.action !== 'none') return false;
+  return Number.isFinite(lastLiveMs) && nowMs - lastLiveMs < recheckMs;
 }
 
 /** Contacts to look at: recent OPPFDN demos, plus every contact we tagged and have not released. */
@@ -136,13 +175,31 @@ export async function runRehashTagSweep(deps = {}) {
     return { ok: false, mode, counts, errors: [err.message], insufficient_evidence: true };
   }
 
-  for (const contactId of passSlice(ids, nowMs)) {
+  const slice = passSlice(ids, nowMs);
+  const snapshot = await d.readSnapshotTags(slice);
+  counts.live_reads = 0;
+  counts.live_reads_skipped = 0;
+
+  for (const contactId of slice) {
     let dec;
     try {
-      const [leads, contact] = await Promise.all([readLeads(d, contactId), d.getContact(contactId)]);
+      const leads = await readLeads(d, contactId);
+      const currentLead = pickCurrentLead(leads);
+      const snapTags = snapshot?.get(contactId);
+      if (snapTags) {
+        const snapshotDecision = decideRehash({ tags: snapTags, currentLead, owner: null, rehashTeam: team, nowMs, env: d.env });
+        if (canSkipLiveRead({ snapshotDecision, lastLiveMs: d.liveReadAt.get(contactId), nowMs })) {
+          counts.live_reads_skipped++;
+          counts.none++;
+          continue;
+        }
+      }
+      const contact = await d.getContact(contactId);
+      counts.live_reads++;
       if (!contact) { counts.unreadable++; continue; }
+      d.liveReadAt.set(contactId, nowMs);
       dec = decideRehash({
-        tags: contact.tags || [], currentLead: pickCurrentLead(leads), owner: contact.assignedTo || null,
+        tags: contact.tags || [], currentLead, owner: contact.assignedTo || null,
         rehashTeam: team, nowMs, env: d.env,
       });
     } catch (err) {

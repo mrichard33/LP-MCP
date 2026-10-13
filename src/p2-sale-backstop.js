@@ -361,6 +361,50 @@ async function liveContact({ ghlFetch, contactId }) {
   }
 }
 
+// ─── Settled answers (2026-10-13) ───────────────────────────────
+//
+// Every contact the mirror shows with no OPEN P2 card was read live every 15
+// minutes, forever: repeat customers with a closed card, sales with no price
+// yet, possible duplicates. Their answer (skip / report) does not change
+// between passes, and the reads were 9,152 GHL requests a day with the most
+// 429s of any caller (28 of 65, #1248's per-caller counts). A settled answer
+// is now remembered for SETTLED_TTL_MS, keyed on the deciding job's id, status
+// and value, so any change to the job is a new key and a fresh live read. A
+// write, a wait or an unreadable read is never remembered: those contacts are
+// read live on every pass, exactly as before. In-process: a deploy starts empty.
+export const SETTLED_TTL_MS = 6 * 60 * 60 * 1000;
+export const SETTLED_ACTIONS = new Set(['skip', 'report']);
+const UNSETTLED_REASONS = new Set(['p2_unreadable', 'contact_unreadable']);
+
+/** Pure. The memo key for one contact's deciding job. */
+export function settledKey(contactId, job, verdict) {
+  return [contactId, job?.lp_job_id, String(job?.job_status ?? '').trim(), jobValue(job), verdict].join('|');
+}
+
+/** Pure. May this plan be remembered? */
+export function isSettledPlan(plan) {
+  return Boolean(plan && SETTLED_ACTIONS.has(plan.action) && !UNSETTLED_REASONS.has(plan.reason));
+}
+
+export function createSettledMemo({ ttlMs = SETTLED_TTL_MS } = {}) {
+  const map = new Map();
+  return {
+    get(key, nowMs) {
+      const hit = map.get(key);
+      if (!hit) return null;
+      if (nowMs - hit.at >= ttlMs) { map.delete(key); return null; }
+      return hit.entry;
+    },
+    set(key, entry, nowMs) {
+      for (const [k, v] of map) if (nowMs - v.at >= ttlMs) map.delete(k);
+      map.set(key, { at: nowMs, entry });
+    },
+    size: () => map.size,
+  };
+}
+
+const SETTLED_MEMO = createSettledMemo();
+
 async function defaultDeps() {
   const [{ default: supabase }, { hlRunSQL, esc }, { ghlFetch }, { applyGHLTag }, { emitEvent }, l6, p2ctx] = await Promise.all([
     import('./supabase.js'),
@@ -373,6 +417,7 @@ async function defaultDeps() {
   ]);
   return {
     supabase, hlRunSQL, esc, ghlFetch, applyGHLTag, emitEvent,
+    settledMemo: SETTLED_MEMO,
     postL6: l6.maybePostL6,
     loadP2CreateContext: p2ctx.loadP2CreateContext,
     jobsForContact: (await import('./lp-job-value.js')).jobsForContact,
@@ -389,7 +434,7 @@ export async function findSalesMissingP2(deps) {
   const {
     supabase, hlRunSQL, esc = (s) => String(s).replace(/'/g, "''"), ghlFetch, jobsForContact,
     nowMs = Date.now(), lookbackDays = LOOKBACK_DAYS, sinceDay = null, graceMs = GRACE_MS,
-    logger = console,
+    logger = console, settledMemo = null,
   } = deps;
 
   const since = sinceDay || new Date(nowMs - lookbackDays * DAY_MS).toISOString().slice(0, 10);
@@ -432,10 +477,14 @@ export async function findSalesMissingP2(deps) {
     const seen = firstSeenMs({ saleEventAt: saleAt.get(String(recent.lp_lead_id)), contractDate: recent.contractdate });
     if (!Number.isFinite(seen) || nowMs - seen < graceMs) continue;
 
+    const memoKey = settledKey(cid, job, verdict);
+    const settled = settledMemo?.get(memoKey, nowMs);
+    if (settled) { out.push(settled); continue; }
+
     const p2Opps = await liveP2Opps({ ghlFetch, contactId: cid });
     const contact = p2Opps && p2Opps.length === 0 ? await liveContact({ ghlFetch, contactId: cid }) : null;
     const plan = planForSale({ verdict, job: { ...recent, ...job }, p2Opps, contact, taggedAtMs: taggedAt.get(cid) ?? null, nowMs, allJobs: all.jobs });
-    out.push({
+    const entry = {
       contactId: cid,
       contactName: [contact?.firstName, contact?.lastName].filter(Boolean).join(' ') || contact?.contactName || null,
       job: { lp_job_id: String(job.lp_job_id), lp_lead_id: recent.lp_lead_id ?? null, job_status: job.job_status, job_value: jobValue(job), contractdate: recent.contractdate },
@@ -443,7 +492,9 @@ export async function findSalesMissingP2(deps) {
       plan,
       quiet: quietStampNeeded({ contact, contractDate: recent.contractdate, nowMs }),
       firstSeenAt: new Date(seen).toISOString(),
-    });
+    };
+    if (settledMemo && isSettledPlan(plan)) settledMemo.set(memoKey, entry, nowMs);
+    out.push(entry);
   }
   return out;
 }

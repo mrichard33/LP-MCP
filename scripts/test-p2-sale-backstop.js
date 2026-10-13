@@ -418,3 +418,40 @@ test('run: a quiet sale has its entry dates back-dated BEFORE deal-won, a normal
   ]);
   assert.ok(!ghlCalls.some((c) => c.method === 'PUT' && c.path === '/contacts/c-tag'), 'an ordinary contact is never back-dated');
 });
+
+// ── settled answers are remembered for 6h (2026-10-13) ───────────────────
+
+test('settled: a skip or report is remembered; a write, a wait or an unreadable read is not', async () => {
+  const { isSettledPlan, settledKey, createSettledMemo, SETTLED_TTL_MS } = await import('../src/p2-sale-backstop.js');
+  assert.equal(isSettledPlan({ action: 'skip', reason: 'has_p2' }), true);
+  assert.equal(isSettledPlan({ action: 'report', reason: 'no_price_yet' }), true);
+  for (const p of [{ action: 'skip', reason: 'p2_unreadable' }, { action: 'skip', reason: 'contact_unreadable' },
+    { action: 'tag_deal_won' }, { action: 'create_open' }, { action: 'wait', reason: 'c0_has_not_had_time' }]) {
+    assert.equal(isSettledPlan(p), false, JSON.stringify(p));
+  }
+  // Any change to the deciding job is a new key, so a fresh live read.
+  assert.notEqual(settledKey('c', liveJob, 'live'), settledKey('c', { ...liveJob, job_status: 'Cancelled' }, 'live'));
+  assert.notEqual(settledKey('c', liveJob, 'live'), settledKey('c', { ...liveJob, job_value: 1 }, 'live'));
+  const memo = createSettledMemo();
+  memo.set('k', { x: 1 }, NOW);
+  assert.deepEqual(memo.get('k', NOW + SETTLED_TTL_MS - 1), { x: 1 });
+  assert.equal(memo.get('k', NOW + SETTLED_TTL_MS), null, 'expires at 6h');
+});
+
+test('settled: the second pass reads GHL only for contacts still needing a write', async () => {
+  const { createSettledMemo } = await import('../src/p2-sale-backstop.js');
+  const { deps, ghlCalls } = world();
+  const settledMemo = createSettledMemo();
+  const first = await findSalesMissingP2({ ...deps, settledMemo, nowMs: NOW, logger: quiet });
+  const reads1 = ghlCalls.filter((c) => c.method === 'GET').map((c) => c.path);
+  ghlCalls.length = 0;
+  const second = await findSalesMissingP2({ ...deps, settledMemo, nowMs: NOW + 60_000, logger: quiet });
+  const reads2 = ghlCalls.filter((c) => c.method === 'GET').map((c) => c.path);
+  // c-noprice (report) is answered from memory; the write candidates are read live again.
+  assert.ok(reads1.some((p) => p.includes('c-noprice')));
+  assert.ok(!reads2.some((p) => p.includes('c-noprice')), 'a settled report is not re-read');
+  assert.ok(reads2.some((p) => p.includes('c-tag')), 'a contact still needing a write is read live');
+  // Same answers either way, so the 08:00 digest still lists the report.
+  const plans = (xs) => Object.fromEntries(xs.map((s) => [s.contactId, s.plan.action]));
+  assert.deepEqual(plans(second), plans(first));
+});
