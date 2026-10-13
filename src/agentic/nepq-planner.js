@@ -37,7 +37,7 @@ import { detectDeferral, pendingDeferral, isAcknowledgment, isSignOffLine, POST_
 import { PURCHASED_ELSEWHERE_RX } from './purchased-elsewhere.js';
 import { rehashNepqTurn, bridgedRecently, BEST_DEAL_RX, PRE_BRIDGE_STAGES } from './rehash-nepq.js';
 import { homeownerFromThread, OWNER_ASK_RX } from './homeowner.js';
-import { jobScopeFromThread, openingsKnown } from './job-scope.js';
+import { jobScopeFromThread, openingsKnown, COUNT_ASK_RX } from './job-scope.js';
 import { decisionMakersFromThread, dmSettled } from './qualifying.js';
 import { extractZip } from './service-area-turn.js';
 
@@ -1391,8 +1391,83 @@ function planNepqTurnCore({
  * Parameters: see planNepqTurnCore.
  */
 export function planNepqTurn(args = {}) {
+  if (args?.stage?.stage) return gateForStage(planNepqTurnCore(args), args);
+  return openingsGate(args);
+}
+
+/**
+ * The count question in every mode (the user, 2026-10-13: "Yes, leave the
+ * question on"). Without a stored stage the planner re-reads the thread each
+ * turn, so this gate does two things:
+ *  - a plan that would offer visit times while the count is unknown and our
+ *    count question was never asked becomes that question (once);
+ *  - the turn after it, the answer resumes the plan we set aside: the
+ *    conversation is replanned as it stood before the count question, so
+ *    "about 10" gets the times the "yes" had earned.
+ * A job we cannot take (job-scope.js) gets no times at all, and a lead who
+ * already had the visit (post-demo, rehash) is never asked again (the user,
+ * same day: "assume the lead is already qualified"). Pure.
+ */
+function openingsGate(args) {
   const plan = planNepqTurnCore(args);
-  return args?.stage?.stage ? gateForStage(plan, args) : plan;
+  if (!plan || plan.handoff || plan.post_demo || plan.step === 'booked' || args.alreadyQualified) return plan;
+  const turns = normalizeThread(args.conversation, args.trigger);
+  const js = jobScopeFromThread(turns);
+  if (js.block || js.check) return notEligible(plan, js);
+  const outbound = turns.filter(t => t.direction === 'outbound');
+  const lastOut = outbound[outbound.length - 1]?.text || '';
+  // The answer to our count question: replan from before it.
+  // A question in the answer is answered first (the core plan), never skipped.
+  if (COUNT_ASK_RX.test(lastOut) && plan.step !== 'offer_slots' && !plan.objection && !isLeadQuestion(String(args.trigger || ''))) {
+    const askIdx = turns.map(t => t.direction === 'outbound' && t.text === lastOut).lastIndexOf(true);
+    const before = turns.slice(0, askIdx);
+    const leadIdx = before.map(t => t.direction).lastIndexOf('inbound');
+    if (leadIdx >= 0) {
+      const resumed = planNepqTurnCore({ ...args, conversation: before.slice(0, leadIdx), trigger: before[leadIdx].text });
+      // offer_slots, or ask_day when the caller has not read the calendar yet
+      // (the live chat plans once without times, then again with them).
+      if (resumed && (resumed.step === 'offer_slots' || resumed.step === 'ask_day') && !resumed.handoff) return resumed;
+    }
+    return plan;
+  }
+  if (plan.step !== 'offer_slots') return plan;
+  // Asked once, before the FIRST offer: times already on the table are never
+  // interrupted by it ("you just said that" after an offer gets new times).
+  if (outbound.some(m => SLOT_OFFER_RX.test(m.text))) return plan;
+  const asked = outbound.some(m => COUNT_ASK_RX.test(m.text));
+  if (asked || args.knownOpenings || openingsKnown(turns)) return plan;
+  const ask = pickFresh(QUALIFY_LINES.openings, plan.recent_outbound || [], 0);
+  // A question in the same message is answered first, then the count is asked.
+  const answering = plan.required_move === 'answer' || (plan.answer_first && isLeadQuestion(String(args.trigger || '')));
+  plan.slots_to_offer = [];
+  plan.allowed = { ...plan.allowed, slot_offer: false };
+  plan.offer_line = null;
+  plan.answer_first = false;
+  plan.offer_slots_pending = false;
+  plan.day_preference_pending = false;
+  plan.last_offer = null;
+  const booking = { allowed: false, reason: 'nepq:qualify_openings' };
+  if (answering) return Object.assign(plan, { step: 'qualify', required_move: 'answer', fixed_line: null, reask_line: ask, qualify_item: 'openings', booking });
+  return Object.assign(plan, {
+    step: 'qualify', required_move: 'qualify', fixed_line: ask, qualify_item: 'openings',
+    reference_markers: QUALIFY_MARKERS.openings, booking,
+  });
+}
+
+// A job we do not take, or the minimum not yet checked: no times. The
+// job-scope guard words the reply; the model is not asked to match a line, so
+// no re-write is spent on it (the wasted SMS redraft, 2026-10-13 sims).
+function notEligible(plan, js) {
+  const why = js.block || 'minimum_check';
+  plan.slots_to_offer = [];
+  plan.allowed = { ...plan.allowed, slot_offer: false };
+  plan.offer_line = null;
+  plan.answer_first = false;
+  plan.offer_slots_pending = false;
+  plan.day_preference_pending = false;
+  plan.last_offer = null;
+  plan.stage = { ...(plan.stage || {}), blocked: why };
+  return Object.assign(plan, { step: 'not_eligible', required_move: 'answer', fixed_line: null, objection: null, reference_markers: null, booking: { allowed: false, reason: `nepq:job_scope_${why}` } });
 }
 
 // Steps that put a visit time in front of the lead (or a pick of one).
@@ -1407,7 +1482,8 @@ const TIME_STEPS = new Set(['offer_slots', 'confirm', 'ask_day', 'collect']);
  * address, decision maker); only ownership holds it. Pure.
  */
 function gateForStage(plan, args) {
-  if (!plan || plan.handoff || plan.post_demo || plan.step === 'booked') return plan;
+  // A lead who already had the visit is qualified (the user, 2026-10-13).
+  if (!plan || plan.handoff || plan.post_demo || plan.step === 'booked' || args.alreadyQualified) return plan;
   const offersTimes = !!plan.allowed?.slot_offer || (plan.slots_to_offer || []).length > 0 || TIME_STEPS.has(plan.step) || plan.required_move === 'bridge' || !!plan.offer_slots_pending;
   if (!offersTimes) return plan;
   const turns = normalizeThread(args.conversation, args.trigger);
@@ -1433,12 +1509,7 @@ function gateForStage(plan, args) {
   // job-scope guard words the reply (job-scope.js).
   {
     const js = jobScopeFromThread(turns);
-    if (js.block || js.check) {
-      const why = js.block || 'minimum_check';
-      clear();
-      plan.stage = { ...(plan.stage || {}), blocked: why };
-      return Object.assign(plan, { step: 'not_eligible', required_move: 'answer', fixed_line: null, booking: { allowed: false, reason: `nepq:job_scope_${why}` } });
-    }
+    if (js.block || js.check) return notEligible(plan, js);
   }
   const item = nextQualifyItem(facts, outbound);
   if (!item) return plan;

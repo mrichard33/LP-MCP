@@ -3676,6 +3676,10 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     if (!rehashRepName) console.warn(`[ResponseGenerator] rehash reply for ${contactId} with no rep name — signing as the team`);
   }
   const rehash = rehashActive ? { active: true, repName: rehashRepName } : null;
+  // 2026-10-13 (the user): a lead who already had the visit (rehash, or past
+  // the appointment) is qualified. The ownership, count and minimum questions
+  // are never asked again, whatever POST_DEMO_PLANNER_MODE says.
+  const alreadyQualified = !!rehash || derivePostAppointment(context, opts.contextSnapshot).post;
 
   // Every layer3 SCRIPT DIRECTIVE is written for a lead BEFORE the demo
   // ("pricing needs the in-home measurement", Confirmation Call slots, the
@@ -4175,6 +4179,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
         knownZip: identityState?.identity?.postal_code || context.lead?.postal_code || null,
         // A Window Count / Door Count already on the contact: the count is not asked (2026-10-13).
         knownOpenings: (Number(context.estimate?.window_count) || 0) + (Number(context.estimate?.door_count) || 0) > 0,
+        alreadyQualified,
       };
       nepqPlan = planNepqTurn({ ...planArgs, postDemo: pdMode === 'live' && postDemoLead, rehashRep, rehash: !!rehash, callSlots: slotsMode === 'live' ? rehashCallSlots : null });
       if (slotsMode === 'shadow' && rehash && postDemoLead) {
@@ -5205,7 +5210,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     // 2026-10-13 (the user): no rentals, no commercial properties, and a
     // minimum of three openings or one sliding glass door (job-scope.js).
     // Every mode, like the renter guard. A block or the minimum check books nothing.
-    const jobScope = enforceJobScope(validated.message, { thread: context.conversation_recent || [], inbound: triggerMessage });
+    const jobScope = enforceJobScope(validated.message, { thread: context.conversation_recent || [], inbound: triggerMessage, alreadyQualified });
     if (jobScope.changed) {
       console.warn(`[JobScope] ${contactId} ${jobScope.reason}`);
       validated.message = jobScope.text;

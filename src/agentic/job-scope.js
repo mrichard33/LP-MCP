@@ -325,7 +325,11 @@ function normalize(thread = [], inbound = '') {
  *   check: a stated count is under the minimum and we have not asked yet.
  *   now:   the deciding words are in the newest inbound message.
  */
-export function jobScopeFromThread(thread = [], inbound = '') {
+export function jobScopeFromThread(thread = [], inbound = '', { alreadyQualified = false } = {}) {
+  // A lead who already had the visit (post-demo, rehash) is qualified: no
+  // rental / commercial / investment no and no minimum check (the user,
+  // 2026-10-13: "assume the lead is already qualified").
+  if (alreadyQualified) return { block: null, check: false, now: false };
   const turns = normalize(thread, inbound);
   const lastInboundIdx = turns.map(t => t.direction).lastIndexOf('inbound');
 
@@ -437,9 +441,9 @@ const VISIT_OFFER_RX = /\b(?:I\s+have\b[^.?!]*\bor\b|hold(?:ing)?\s+(?:a\s+time|
  * @param {string} a.inbound  the lead's newest message
  * @returns {{ text: string, changed: boolean, reason: string|null, block: string|null }}
  */
-export function enforceJobScope(draft, { thread = [], inbound = '' } = {}) {
+export function enforceJobScope(draft, { thread = [], inbound = '', alreadyQualified = false } = {}) {
   const original = String(draft || '');
-  const scope = jobScopeFromThread(thread, inbound);
+  const scope = jobScopeFromThread(thread, inbound, { alreadyQualified });
 
   if (scope.block) {
     const line = LINE_FOR[scope.block];

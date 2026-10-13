@@ -50,7 +50,9 @@ import {
   parseJsonFromResponse,
   validateResponse,
   findRepeatedQuestions,
+  derivePostAppointment,
 } from '../response-generator.js';
+import { isInRehash, rehashLeadFromContext, rehashRoutingMode } from '../agentic/rehash-state.js';
 import { buildEstablishedFacts } from '../agentic/established-facts.js';
 import { humanizeReply, restoreQuestionMark } from '../agentic/human-voice.js';
 import { enforceTeamVoice } from '../agentic/team-voice.js';
@@ -483,6 +485,18 @@ export function wantsSlots(plan) {
   return plan.step === 'offer_slots' || plan.step === 'confirm' || plan.step === 'collect'
     // A yes to the bridge plans a day ask only for want of times (2026-10-02).
     || plan.step === 'ask_day';
+}
+
+/**
+ * A lead who already had the in-home visit (past the appointment, a post-demo
+ * disposition, or in rehash by tag or LP lead) is qualified: the bot never asks
+ * the ownership, count or minimum questions again (the user, 2026-10-13). Pure.
+ */
+export function leadAlreadyQualified(context) {
+  if (derivePostAppointment(context).post) return true;
+  const tags = (context?.lead?.current_tags || []).map(t => String(t).toLowerCase());
+  if (tags.includes('rehash') || tags.includes('active-f.0')) return true;
+  return rehashRoutingMode() !== 'off' && isInRehash({ tags: context?.lead?.current_tags || [], currentLead: rehashLeadFromContext(context?.lp) });
 }
 
 /** What the row records about the plan. Pure. */
@@ -1083,6 +1097,7 @@ export function createLiveChatFastLane(deps) {
     // LEAD_STAGE_MODE=live (the dep returns null otherwise). Same stage path
     // as SMS: the planner and the prompt read it.
     let leadStage = null;
+    const alreadyQualified = leadAlreadyQualified(context);
     if (nepqMode !== 'off' && (!saPlan.active || coveragePlanned) && !planOverride) {
       try { leadStage = await d.readLeadStage(contactId); } catch { leadStage = null; }
       const realFirst = hasNameOnRecord ? String(context.lead?.first_name || context.lead?.name || '').trim().split(/\s+/)[0] || null : null;
@@ -1098,6 +1113,8 @@ export function createLiveChatFastLane(deps) {
         knownZip: context.lead?.postal_code || null,
         // A Window Count / Door Count already on the contact (2026-10-13).
         knownOpenings: (Number(context.estimate?.window_count) || 0) + (Number(context.estimate?.door_count) || 0) > 0,
+        // Post-demo / rehash: never re-qualified (the user, 2026-10-13).
+        alreadyQualified,
       };
       nepqPlan = planNepqTurn(planInput);
       if (!saPlan.active && wantsSlots(nepqPlan)) {
@@ -1112,7 +1129,7 @@ export function createLiveChatFastLane(deps) {
       }
       if (nepqMode === 'live' && !saPlan.active) {
         const lastOutbound = [...context.conversation_recent].reverse().find(m => m.direction === 'outbound')?.text || '';
-        const nepqOut = reference ? null : await runNepqFixedMove({ plan: nepqPlan, slots: nepqSlots, contactId, body, hasName: hasNameOnRecord, hasPhone: hasPhoneOnRecord, firstName: realFirst, mode, lastOutbound: nepqPlan.last_offer || lastOutbound, contact, visitorTexts,
+        const nepqOut = reference ? null : await runNepqFixedMove({ plan: nepqPlan, slots: nepqSlots, contactId, body, hasName: hasNameOnRecord, hasPhone: hasPhoneOnRecord, firstName: realFirst, mode, lastOutbound: nepqPlan.last_offer || lastOutbound, contact, visitorTexts, alreadyQualified,
           threadTurns: (context.conversation_recent || []).map(m => ({ direction: String(m?.direction || '').toLowerCase() === 'outbound' ? 'outbound' : 'inbound', text: String(m?.text ?? m?.body ?? '') })) });
         if (nepqOut) {
           // Part 7 (Mark, 2026-10-02: "Each message should be custom"): the
@@ -1463,7 +1480,7 @@ export function createLiveChatFastLane(deps) {
     }
 
     return deliver({
-      contactId, conversationId, body, mode, actionId, timing, draft, turn, visitorTexts,
+      contactId, conversationId, body, mode, actionId, timing, draft, turn, visitorTexts, alreadyQualified,
       stageInput: buildStageInput({
         conversation: context.conversation_recent || [], trigger: body, plan: nepqPlan,
         zip: coverage?.zip || context.lead?.postal_code || null,
@@ -1650,7 +1667,7 @@ export function createLiveChatFastLane(deps) {
    * a day ask, a close, the Reveal, two real times, or booking a picked time.
    * Returns { reply, record } or null (the model writes this turn).
    */
-  async function runNepqFixedMove({ plan, slots, contactId, body, hasName, hasPhone, firstName, mode, lastOutbound = '', contact = null, visitorTexts = [], threadTurns = [] }) {
+  async function runNepqFixedMove({ plan, slots, contactId, body, hasName, hasPhone, firstName, mode, lastOutbound = '', contact = null, visitorTexts = [], threadTurns = [], alreadyQualified = false }) {
     if (!plan) return null;
     const live = mode === 'live';
     const ask = contactAskLine({ hasName, hasPhone });
@@ -1765,7 +1782,7 @@ export function createLiveChatFastLane(deps) {
       // 2026-10-13 (the user): no rentals, no commercial, and the minimum
       // (three openings or one sliding glass door) before any visit (job-scope.js).
       {
-        const js = jobScopeFromThread(threadTurns, body);
+        const js = jobScopeFromThread(threadTurns, body, { alreadyQualified });
         if (js.block || js.check) {
           const reply = js.check ? (js.doors ? MINIMUM_CHECK_DOORS_LINE : MINIMUM_CHECK_LINE) : ({ rental: RENTAL_LINE, investment: INVESTMENT_LINE, commercial: COMMERCIAL_LINE, below_minimum: BELOW_MINIMUM_LINE })[js.block];
           return { reply, record: { booking: `refused_job_scope:${js.block || 'minimum_check'}` } };
@@ -1820,7 +1837,7 @@ export function createLiveChatFastLane(deps) {
   }
 
   /** Send (live) or record (shadow) one finished reply. */
-  async function deliver({ contactId, conversationId, body, mode, actionId, timing, draft, capture = {}, extras = {}, fingerprintExtras = {}, isSuperseded = () => false, turn = newTurnClaim(), visitorTexts = [], skipCapture = false, stageInput = null }) {
+  async function deliver({ contactId, conversationId, body, mode, actionId, timing, draft, capture = {}, extras = {}, fingerprintExtras = {}, isSuperseded = () => false, turn = newTurnClaim(), visitorTexts = [], skipCapture = false, stageInput = null, alreadyQualified = false }) {
     // A newer message from this visitor arrived while this reply was being
     // written: the newer turn answers both (2026-10-02, tzuzq double reply).
     if (isSuperseded()) {
@@ -1856,7 +1873,7 @@ export function createLiveChatFastLane(deps) {
         draft = scope.text;
       }
       // No rentals, no commercial, the minimum (2026-10-13; every mode).
-      const jobScope = enforceJobScope(draft, { thread: stageInput?.conversation || [], inbound: body });
+      const jobScope = enforceJobScope(draft, { thread: stageInput?.conversation || [], inbound: body, alreadyQualified });
       if (jobScope.changed) {
         d.log(`[JobScope] live chat ${contactId} ${jobScope.reason}`);
         draft = jobScope.text;

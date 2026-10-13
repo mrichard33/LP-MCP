@@ -988,7 +988,14 @@ impact?"; "Does your home only have 1 window?" reads the same). A yes or "just t
 states the minimum; "no, the others are old" or anything else is the normal flow, and an unknown count never blocks. The
 count is asked ONCE before any time, in the user's wording ("How many windows and doors are you looking to get a quote
 on?" / "… to have us come measure?"): the qualifying gate's `openings` item (owner → zip → openings → decision makers,
-`openingsKnown`), and the prompt's ASK FOR WINDOW COUNT. A bare "1" in reply to it is read as the count (`openingsAt`). The
+`openingsKnown`), and the prompt's ASK FOR WINDOW COUNT. A bare "1" in reply to it is read as the count (`openingsAt`). It is ON IN EVERY MODE (the user, 2026-10-13: "leave the
+question on"): without a stored stage `openingsGate` (`nepq-planner.js`) turns the FIRST time offer into the count
+question once (never after times were offered), and the answer replans the conversation as it stood before the
+question, so "about 10" gets the times the "yes" had earned; a job-scope block or check is `not_eligible` in every mode
+(no wasted SMS redraft before the minimum check). **A lead who already had the visit is qualified** (the user, same day):
+`alreadyQualified` (SMS: `rehash || derivePostAppointment(...).post`, NOT gated on `POST_DEMO_PLANNER_MODE`; live chat:
+`leadAlreadyQualified`) skips the count question, the stage gate's items and every lead-side job-scope check (the
+claim fixes still run). The
 count the lead states is SAVED to the GHL fields Window Count (`h9FJTUbmUHIuD6JKmpXv`) and Door Count
 (`j7l1KWmDgoJqy7SINjQs`; a slider is a door), read by code from their newest message (`openingsToSave`), as one
 `update_custom_fields` row (rule `OPENINGS_COUNT_PERSIST`) after the send on both bots; a count already on the contact
