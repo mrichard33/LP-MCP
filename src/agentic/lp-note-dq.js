@@ -27,13 +27,14 @@ export const LP_NOTE_DQ_SIGNALS = Object.freeze([
   { id: 'housing_program', rx: /\b(?:affordable\s+housing|housing\s+(?:program|assistance|authority)|section\s*8|\bhud\b|habitat\s+for\s+humanity|(?:veterans?|va)\s+(?:housing|program))\b/i },
   { id: 'cannot_run', rx: /\b(?:not\s+something\s+we\s+can\s+run|can\s*(?:no|')?t\s+(?:be\s+)?run\b|cannot\s+(?:be\s+)?run\b|unable\s+to\s+run|do\s*n[o']?t\s+run\s+(?:these|this|that)|not\s+(?:a\s+)?(?:runnable|qualified\s+lead)|disqualif(?:y|ied))\b/i },
   { id: 'out_of_area', rx: /\b(?:out\s+of\s+(?:the\s+)?(?:service\s+)?area|outside\s+(?:of\s+)?(?:our\s+)?(?:the\s+)?service\s+area|we\s+do\s*n[o']?t\s+service)\b/i },
-  // 2026-10-13 (the user): rental properties, commercial properties and jobs
-  // under the minimum are jobs we do not take, whoever owns them. A note that
-  // the home is rented out is now a DQ even when the owner wrote in. An owner
-  // who lives there with a tenant ("a tenant that lives with him") is still
-  // living in his own home: not a rental.
-  { id: 'rental_property', rx: /\b(?:rental\s+property|investment\s+property|rents?\s+(?:it|the\s+(?:home|house|property|unit|condo))\s+out|renting\s+(?:it|the\s+(?:home|house|property|unit|condo))\s+out|tenant[\s-]occupied|(?:has|have)\s+(?:a\s+)?tenants?\s+in\s+the\s+(?:property|home|house|unit|condo)|airbnb|vrbo)\b/i },
-  { id: 'commercial', rx: /\bcommercial\s+(?:property|building|job|project|space)\b/i },
+  // 2026-10-13: a person's note that the job is under our minimum is their
+  // decision ("below minimum 2 w not open to the entire home"). A note that
+  // only DESCRIBES a rental or a commercial property is not: 60 days of LP
+  // notes read "Spoke with David, who owns a rental property ... estimate for
+  // three windows" and "we cant look at the commercial property but we can look
+  // at the rez" on leads the team booked. As a DQ signal those words would
+  // switch the bot off for live appointments (dq_hard_stop), so the rental and
+  // commercial rules stay in what the LEAD says (job-scope.js), never here.
   { id: 'below_minimum', rx: /\b(?:below|under)\s+(?:the\s+|our\s+)?minimum\b/i },
   { id: 'mobile_home', rx: /\b(?:mobile\s+home|manufactured\s+home|trailer\s+home|double[\s-]?wide|single[\s-]?wide)\b/i },
 ]);
