@@ -286,6 +286,8 @@ export const LINES = Object.freeze({
   info_request: 'Yes, we can help with that. Just so we get you the right thing, what are you hoping to see?',
   think_slots: (slots) => `No problem at all. Want to grab a time now so you don't have to chase us down later? I have ${slotPair(slots)}.`,
   think_no_slots: "No problem at all. What day would work best if you did want someone to come out, so you don't have to chase us down later?",
+  // 2026-10-13: the think play while the qualifying gate is still open (no time).
+  think_no_times: "That's fair. What's the main thing you'd want to think over?",
   not_interested: (name) => `No problem${name ? `, ${name}` : ''}. What changed?`,
   ask_day: 'No problem. What day works best for you?',
   close: "Understood. Take care, and if anything changes, we're here.",
@@ -353,7 +355,9 @@ export const LINES = Object.freeze({
 // line has a second wording (never the same question twice), and each keeps
 // the words qualifying.js / homeowner.js / booking-collect.js read back.
 export const QUALIFY_LINES = Object.freeze({
-  homeowner: ['Happy to set that up. Just so I point you the right way, do you own the home?', 'Quick question before I pull up times: are you the homeowner?'],
+  // 2026-10-13 (live eval): no "Happy to set that up." opener. It read as a
+  // yes to "let me think about it" and to a third price ask.
+  homeowner: ['Just so I point you the right way, do you own the home?', 'Quick question before I pull up times: are you the homeowner?'],
   zip: ["What's the zip code at the home?", 'And what zip code is the home in?'],
   // 2026-10-13 (the user's wording): the count, so a job under the minimum
   // (three windows or doors, or one sliding glass door) is caught before any
@@ -497,7 +501,7 @@ export function isNo(text, lastOutbound = '') {
 // Every price reply says why there is no number yet; the next turn counts
 // these to decide quote → times → a person (Part 7: the model words them).
 const PRICE_PLAY_RX = /\bevery\s+(?:home|house)(?:'s|’s|\s+is)\s+(?:a\s+little\s+)?different\b|\bany\s+number\s+i\s+gave\b|\ba\s+number\s+(?:right\s+)?now\s+would\s+(?:just\s+)?be\s+a\s+guess\b/i;
-const COMPETITOR_PLAY_RX = /\bmaybe\s+nothing\s+would\s+change\b|\bboth\s+meet\s+your\s+criteria\b/i;
+const COMPETITOR_PLAY_RX = /\bmaybe\s+nothing\s+would(?:'ve|\s+have)?\s+change[ds]?\b|\bboth\s+meet\s+your\s+criteria\b/i;
 const INFO_PLAY_RX = /\bjust\s+so\s+we\s+get\s+you\s+the\s+right\s+thing\b/i;
 const QUOTE_LINE_RX = /\bhappy\s+to\s+get\s+you\s+a\s+quote\b|\bexact\s+pricing\s+comes\s+from\s+a\s+quick\s+visit\b|\bcan'?t\s+give\s+a\s+fair\s+price\s+on\s+the\s+spot\b|\bhappy\s+to\s+help\s+with\b[^.?!]*\.\s+what'?s\s+got\s+you\s+looking\s+into\s+(?:them|it|this)\s+now\?|\ba\s+number\s+now\s+would\s+(?:just\s+)?be\s+a\s+guess\b/i;
 // The visitor says the bot is repeating itself (2026-10-02, 5i59G).
@@ -529,7 +533,10 @@ export function quoteItems(text) {
 }
 
 const SPOUSE_FEEL_Q_RX = /\bhow\s+does\s+your\s+(?:spouse|wife|husband|partner)\s+feel\b/i;
-const DECIDE_Q_RX = /\bhow\s+would\s+you\s+(?:then\s+)?decide\b/i;
+// 2026-10-13 (live eval): the model words this play, and "what would actually
+// decide it for you?" was not read back, so the criteria reply fell into
+// discovery and never reached the times.
+const DECIDE_Q_RX = /\bhow\s+would\s+you\s+(?:then\s+)?decide\b|\bwhat\s+would\s+(?:actually\s+|really\s+)?(?:decide\s+it|make\s+the\s+(?:call|difference))\b|\bwhat(?:'s|\s+is)\s+(?:actually\s+|really\s+)?going\s+to\s+decide\b/i;
 // Price named alongside other criteria is a list of what matters, not an ask.
 const CRITERIA_LIST_RX = /\b(?:price|pricing|cost)\b[^.?!]{0,30}\b(?:and|or|plus|&)\b[^.?!]{0,30}\b(?:warranty|quality|reviews?|service|install\w*|reputation|brand|company|timeline|product)\b|\b(?:warranty|quality|reviews?|service|install\w*|reputation|brand|company|timeline|product)\b[^.?!]{0,30}\b(?:and|or|plus|&)\b[^.?!]{0,30}\b(?:price|pricing|cost)\b/i;
 // A day AND a time of day the lead typed ("tomorrow evening 6 pm", "Saturday
@@ -691,6 +698,8 @@ function planNepqTurnCore({
   const inboundTypes = turns.map((t, i) => (t.direction === 'inbound' ? objectionType(t.text, prevOutOf(i), objOpts) : undefined)).filter(x => x !== undefined);
   const priceAsks = inboundTypes.filter(x => x === 'price').length;
   const pricePlayed = outbound.some(m => PRICE_PLAY_RX.test(m.text));
+  // Every money ask the lead made, a quote request included (the hand-off count).
+  const moneyAsks = turns.filter(t => t.direction === 'inbound' && isPriceAsk(t.text, { quoteIsPrice: true })).length;
   // How many price/quote lines the bot already sent (quote → again → a person).
   const priceLines = outbound.filter(m => QUOTE_LINE_RX.test(m.text) || PRICE_PLAY_RX.test(m.text)).length;
   const counters = {
@@ -1008,6 +1017,11 @@ function planNepqTurnCore({
   }
 
   if (objType === 'price' && priceLines >= 2) return handoff('price_insist');
+  // 2026-10-13 (live eval, LEAD_STAGE_MODE=live): the first answer to a quote is
+  // the info request, worded by the model, so it is not a "price line" and the
+  // count never reached two: a third "how much?" got the ownership question
+  // again. Three money asks (a quote counts) after the price play → a person.
+  if (stageLive && objType === 'price' && pricePlayed && moneyAsks >= 3) return handoff('price_insist');
   if (nos >= 2) return handoff('two_nos');
   if ((objType === 'shopping' || objType === 'competitor') && attempt >= 2) return handoff('repeat_objection');
 
@@ -1421,6 +1435,9 @@ function gateForStage(plan, args) {
     plan.offer_slots_pending = false;
     plan.day_preference_pending = false;
     plan.last_offer = null;
+    // 2026-10-13 (live eval): "…do you own the home? What's your first name?"
+    // The price play's contact ask rode along: one question per message.
+    plan.ask_contact = false;
   };
   // Not the owner: no times at all (the qualifying guard words the reply).
   if (facts.homeowner === 'no') {
@@ -1442,6 +1459,18 @@ function gateForStage(plan, args) {
   }
   const item = nextQualifyItem(facts, outbound);
   if (!item) return plan;
+  // 2026-10-13 (live eval): "Let me think about it" got "do you own the home?".
+  // The think play offers a time; with qualifying still open it asks what they
+  // want to think over instead, with no time and no qualifying question. The
+  // gate asks on the next turn that moves toward a time.
+  if (plan.objection?.type === 'think') {
+    clear();
+    plan.stage = { ...(plan.stage || {}), gate: item };
+    return Object.assign(plan, {
+      step: 'discover', required_move: 'objection_play', fixed_line: LINES.think_no_times,
+      booking: { allowed: false, reason: 'nepq:think_qualify_first' },
+    });
+  }
   if (plan.step === 'collect' && item !== 'homeowner') return plan;
   const ask = pickFresh(QUALIFY_LINES[item], plan.recent_outbound || [], 0);
   const answering = plan.required_move === 'answer' || (plan.answer_first && isLeadQuestion(args.trigger || ''));
@@ -1647,7 +1676,12 @@ const ASK_FIELD_RX = {
 
 /** Does this question ask for a field we already have? Pure. */
 export function asksForKnown(sentence, known = {}) {
-  return Object.entries(ASK_FIELD_RX).some(([field, rx]) => known[field] && rx.test(sentence));
+  // 2026-10-13 (live eval): "What's the street address for the visit, including
+  // the zip code?" asks for the ADDRESS. Read as a zip re-ask, it was deleted
+  // from the SMS hold, which then said "I'm holding Tue at 6 PM for you." and
+  // stopped: no next step, no booking.
+  const addressAsk = /\baddress\b/i.test(String(sentence || ''));
+  return Object.entries(ASK_FIELD_RX).some(([field, rx]) => known[field] && rx.test(sentence) && !(field === 'zip' && addressAsk));
 }
 
 const FILLER_ONLY_RX = /^(?:no\s+problem|sure(?:\s+thing)?|okay|ok|got\s+it|great|perfect|sounds\s+good)[.!]?$/i;
