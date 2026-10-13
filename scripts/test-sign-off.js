@@ -124,6 +124,16 @@ test('a bare "Enjoy." is a sign-off line, and no ask is glued after one', () => 
   assert.ok(appendReferenceAsk('Good to hear.', ref, ['no_question']), 'a plain acknowledgment still gets the ask');
 });
 
+test('a question written as a statement ("…, right.") is dropped before the reference ask goes on', () => {
+  // 2026-10-13 live sim, Erica's thread on chat.
+  const ref = "Fair question. Every home is different: the price depends on the size, the style and the impact glass. What style are you thinking about, and roughly how big is the opening?";
+  const draft = 'Our specialist measures everything on site and gives you exact pricing then. For now, the bay window you mentioned is 6 feet wide, right.';
+  const out = appendReferenceAsk(draft, ref, ['no_question']);
+  assert.equal(out, 'Our specialist measures everything on site and gives you exact pricing then. What style are you thinking about, and roughly how big is the opening?');
+  assert.equal(appendReferenceAsk('The opening is 6 feet wide, correct.', ref, ['no_question']), null, 'nothing left: the backup line ships');
+  assert.ok(appendReferenceAsk("That's right, it's free.", ref, ['no_question']), 'a plain statement is kept');
+});
+
 test('"We\'re here to help." after an answer leaves the offer open: the pick still books', () => {
   const offer = 'I have tomorrow at 10:00 AM ET or Thu, Oct 15 at 6:00 PM ET. Which works better?';
   const p = plan({ knownOpenings: true, knownDecisionMakers: true, trigger: 'the first one', conversation: T(['o', offer], ['i', 'is it free?'], ['o', "Yes, it's free. We're here to help."], ['i', 'the first one']) });

@@ -1829,9 +1829,19 @@ export function checkAgainstReference(draft, line, slots = [], plan = null) {
  * what failed is the times, the question or a read-back phrase. Pure.
  * @returns {string|null}
  */
+// A question the model wrote as a statement ("For now, the bay window you
+// mentioned is 6 feet wide, right."): it asks without a "?", so the appended
+// ask would make it two questions and the first reads as a dangling line.
+const TAG_STATEMENT_RX = /,\s*(?:right|correct|yeah|yes|no|is\s+that\s+(?:right|correct))\s*[.!]?$/i;
+
 export function appendReferenceAsk(draft, refLine, failed = []) {
-  const body = String(draft || '').trim();
+  let body = String(draft || '').trim();
   if (!body || body.includes('?') || /\b\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?)/i.test(body)) return null;
+  // 2026-10-13 live sim (Erica's thread, chat): "… gives you exact pricing then.
+  // For now, the bay window you mentioned is 6 feet wide, right. What style …?"
+  const kept = splitSentences(body).filter(s => !TAG_STATEMENT_RX.test(s));
+  if (!kept.length) return null;
+  body = kept.join(' ');
   // Never after a goodbye (2026-10-13, Erica Hilts): "No problem, Erica. I'll
   // check back next week. Enjoy." went out with "Which works better, …?" glued on.
   if (isSignOffLine(splitSentences(body).slice(-1)[0] || '')) return null;
