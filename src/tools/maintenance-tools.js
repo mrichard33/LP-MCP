@@ -16,6 +16,13 @@
  * right before a write and skips one whose tags changed. max_removals caps one
  * pass (writes are paced 500ms apart); anything past the cap is reported as
  * `remaining` and the next pass re-plans from live data.
+ *
+ *   check_rule_targets         (2026-10-12, F-L) read-only: does every enabled
+ *                              agent rule that adds/removes a contact from a GHL
+ *                              workflow, or fires when one completes, point at a
+ *                              PUBLISHED workflow? The same check the 02:10 job
+ *                              runs (src/jobs/rule-target-check.js), writing
+ *                              nothing.
  */
 import { z } from 'zod';
 
@@ -60,7 +67,41 @@ export function makeStaleLpTagsCleanupRun(deps = {}) {
   };
 }
 
+export function makeCheckRuleTargets(deps = {}) {
+  const { loadJob = () => import('../jobs/rule-target-check.js'), jobDeps = undefined } = deps;
+  return async ({ include_ok = false } = {}) => {
+    const mod = await loadJob();
+    const res = await mod.runRuleTargetCheck({ write: false, includeOk: include_ok, deps: jobDeps });
+    if (res.checked === false) return { ok: false, checked: false, reason: res.reason, next_step: 'The check could not run; this is NOT a clean result.' };
+    return {
+      ok: true,
+      summary: res.summary,
+      registry_synced_at: res.registry_synced_at,
+      high: res.high,
+      low: res.low,
+      findings: res.findings,
+      next_step: res.high
+        ? 'HIGH findings are routes that move nobody. Each needs a person to re-point or disable the rule; nothing was changed.'
+        : 'No HIGH findings.',
+    };
+  };
+}
+
 export function registerMaintenanceTools(server, deps = {}) {
+  server.tool(
+    'check_rule_targets',
+    'Read-only. Checks every enabled agent rule that adds or removes a contact from a GHL workflow (by workflow_id or '
+      + 'by inbound webhook_url, resolved through the HL workflow_triggers mirror), and every rule that fires on '
+      + 'ghl.workflow_completed, against the HL mirror: the target must be a PUBLISHED workflow with an active trigger. '
+      + 'Returns HIGH findings (an add or a completion trigger that goes nowhere) and LOW ones (a remove from a draft). '
+      + 'Writes nothing; the nightly job (02:10 ET) records history in rule_target_checks.',
+    {
+      include_ok: z.boolean().optional().default(false).describe('also list the targets that are fine'),
+    },
+    async (args) => text(await makeCheckRuleTargets(deps)(args)),
+  );
+
+
   server.tool(
     'stale_lp_tags_cleanup_run',
     'Remove lp-day15-handoff and lp-demo-completed from GHL contacts that an OLD LP lead tagged (the Frances Overton '

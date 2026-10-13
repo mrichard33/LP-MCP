@@ -313,7 +313,7 @@ async function latestRuns(deps, nowMs) {
   const since = new Date(nowMs - DAY_MS).toISOString();
   const { data, error } = await deps.supabase.from('job_runs')
     .select('job_id, status, summary, detail, occurrence_key, started_at')
-    .in('job_id', ['tag-hygiene-sweep', 'inbound-caller-capture'])
+    .in('job_id', ['tag-hygiene-sweep', 'inbound-caller-capture', 'rule-target-check'])
     .gte('started_at', since)
     .order('started_at', { ascending: false })
     .limit(100);
@@ -324,7 +324,31 @@ async function latestRuns(deps, nowMs) {
     // Only the 07:15 summary pass; the hourly capture passes are their own thing.
     capture: rows.find((r) => r.job_id === 'inbound-caller-capture' && String(r.occurrence_key || '').endsWith('-summary')
       && r.status !== 'running' && r.status !== 'skipped') || null,
+    ruleTarget: rows.find((r) => r.job_id === 'rule-target-check' && r.status !== 'running' && r.status !== 'skipped') || null,
   };
+}
+
+// 2026-10-12 (F-L): the nightly rule-target check (02:10). One line per rule
+// whose workflow route goes nowhere (HIGH), each only the first time it is seen
+// (30 days, keyed on rule + status + target). LOW findings never post. A run
+// that did not finish (status unknown = the HL mirror was unreadable or stale)
+// is always listed: a check that could not look must never read as "no dead
+// routes".
+async function ruleTargetSection(deps, run, nowMs) {
+  const title = 'Rules pointing at dead workflows (02:10 check)';
+  // No run in 24h is left to the job registry (a silent job shows as stale on
+  // the dashboard), like the tag sweep above.
+  if (!run) return null;
+  if (NOT_FINISHED.has(run.status)) {
+    return { title, lines: [`The rule target check did not finish (${run.status}): ${String(run.summary || 'no summary').slice(0, 160)} · check job_runs`] };
+  }
+  const items = (run.detail?.high_findings || [])
+    .filter((f) => f && f.rule_id != null && f.line)
+    .map((f) => ({ key: String(f.rule_id), reason: String(f.reason || 'high'), line: f.line }));
+  if (!items.length) return null;
+  const { fresh } = await deps.filterNew({ audit: 'rule_target', items, nowMs, deps: { supabase: deps.supabase } });
+  if (!fresh.length) return null;
+  return { title, lines: capLines(fresh.map((i) => i.line), SECTION_MAX), record: { audit: 'rule_target', items: fresh } };
 }
 
 async function summaryRunSection(deps, run, { audit, title, label, key, count, render, nowMs }) {
@@ -351,6 +375,7 @@ async function nightlySummarySections(deps, nowMs) {
       key: 'candidates', count: Number(cap.counts?.candidates), nowMs,
       render: (_k, n, last) => `${n} caller(s) to capture${last ? ` (was ${last})` : ''} · capture mode ${cap.mode || '?'}`,
     }),
+    await ruleTargetSection(deps, runs.ruleTarget, nowMs),
   ];
 }
 // 2026-10-12 (Fix 2). Features sat in shadow for weeks with nobody looking.
@@ -428,7 +453,7 @@ export async function runOpsMorningDigest({ post = true, deps: depsArg } = {}) {
   for (const [label, build] of [['P2 won/lost summary', p2Section], ['Sale → P2 backstop summary', p2BackstopSection], ['Sale → contact backstop summary', saleContactSection], ['Appointment parity summary', paritySection], ['Post-issue rebook summary', postIssueSection], ['Shadow-mode review', shadowModesSection]]) {
     try { sections.push(await build(deps, nowMs)); } catch (err) { await couldNotRun(label, err.message); }
   }
-  try { sections.push(...await nightlySummarySections(deps, nowMs)); } catch (err) { await couldNotRun('Nightly summaries (tag sweep, inbound callers)', err.message); }
+  try { sections.push(...await nightlySummarySections(deps, nowMs)); } catch (err) { await couldNotRun('Nightly summaries (tag sweep, inbound callers, rule targets)', err.message); }
 
   for (const j of JOB_SECTIONS) {
     const out = await deps.runJob(j.id, () => deps[j.run](), { occurrence: today });

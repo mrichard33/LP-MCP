@@ -193,6 +193,19 @@ export const JOBS = Object.freeze([
     isEnabled: (env) => String(env.TAG_SWEEP_ENABLED || '').toLowerCase() === 'true',
   },
   {
+    // 2026-10-12 (F-L): every enabled agent rule that adds/removes a contact
+    // from a GHL workflow, or fires when one completes, must point at a
+    // PUBLISHED workflow. Read-only (writes only rule_target_checks), so ON by
+    // default. Mirrors ruleTargetCheckEnabled() in src/jobs/rule-target-check.js.
+    id: 'rule-target-check',
+    label: 'Rule target check (published workflows)',
+    group: 'ghl',
+    cadence: 'daily 02:10 ET',
+    enabledEnv: 'RULE_TARGET_CHECK_ENABLED',
+    enabledDefault: true,
+    isEnabled: (env) => String(env.RULE_TARGET_CHECK_ENABLED ?? 'true').toLowerCase().trim() !== 'false',
+  },
+  {
     // 2026-10-01: deletes anonymous site_events page views older than
     // SITE_EVENTS_RETENTION_DAYS (180, Mark's ruling). Never a stitched lead's
     // history, never identify rows. 0 turns it off; mirrors retentionDays()

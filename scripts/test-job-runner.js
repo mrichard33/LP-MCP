@@ -433,7 +433,8 @@ test('the roster is unique, complete and shaped', () => {
   // 40 → 41 on 2026-10-09: post-issue-rebook-retry (retry a post-issue rebook before a person).
   // 41 → 42 on 2026-10-11: lp-identity-fill-sweep (nameless contacts get the LP name).
   // 42 → 44 on 2026-10-12: marketing-cost-nightly + marketing-cost-report (the marketing cost ledger, migration 20261012222106).
-  assert.equal(JOBS.length, 44);
+  // 44 → 45 on 2026-10-12: rule-target-check (rules must target published workflows, F-L).
+  assert.equal(JOBS.length, 45);
   for (const j of JOBS) {
     assert.match(j.id, /^[a-z0-9-]+$/, `${j.id} should be a slug`);
     assert.ok(j.label && j.group && j.cadence, `${j.id} needs a label, group and cadence`);
