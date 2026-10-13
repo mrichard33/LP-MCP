@@ -276,6 +276,30 @@ export const JOBS = Object.freeze([
     isEnabled: (env) => String(env.SALE_ANNOUNCE_BACKSTOP_ENABLED || 'true').toLowerCase() !== 'false',
   },
   {
+    // src/jobs/marketing-cost-nightly.js (2026-10-12): Lead Gurus feed →
+    // provisional expenses, commission costs from 133, every allocation re-run,
+    // REECE_HOLD recommendations. Current + prior month.
+    id: 'marketing-cost-nightly',
+    label: 'Marketing cost nightly',
+    group: 'marketing',
+    cadence: 'daily 02:30 ET',
+    enabledEnv: 'MKT_COST_NIGHTLY_ENABLED',
+    enabledDefault: true,
+    isEnabled: (env) => String(env.MKT_COST_NIGHTLY_ENABLED || 'true').toLowerCase() !== 'false',
+  },
+  {
+    // src/jobs/marketing-cost-report.js (2026-10-12): the Brad-format XLSX
+    // files. n8n OPS.MCRP is the scheduler (Mon 07:30 ET + the 2nd); the row
+    // is written by the route's runJob.
+    id: 'marketing-cost-report',
+    label: 'Marketing cost report (XLSX)',
+    group: 'marketing',
+    cadence: 'weekly Mon 07:30 ET + monthly on the 2nd (n8n)',
+    enabledEnv: null,
+    enabledDefault: true,
+    isEnabled: () => true,
+  },
+  {
     // 2026-10-03: every recent LP sale must have a P2 (Client Lifecycle)
     // opportunity. LP's webhook to I.LP-IN stopped on 09-24, so `deal-won` —
     // and with it C.0-IN's P2 card — stopped too. Mirrors backstopMode() in

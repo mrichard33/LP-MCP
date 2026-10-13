@@ -1,0 +1,94 @@
+/**
+ * test-marketing-allocation.js — the cent rules of src/marketing/allocation.js
+ * (handoff 2026-10-12 §11.3). Offline, no database.
+ */
+import test from 'node:test';
+import assert from 'node:assert/strict';
+
+import { allocateSlice, allocateExpense, splitPeriodByMonth, sumCents, HOLD_MARKET } from '../src/marketing/allocation.js';
+
+const byMarket = (rows) => Object.fromEntries(rows.map((r) => [r.market, r.amount]));
+
+test('$100 across FTLAU + SAR with 3/1 issued → $75 / $25', () => {
+  const rows = allocateSlice({ amount: 100, markets: ['FTLAU_MKT', 'SAR_MKT'], issuedByMarket: { FTLAU_MKT: 3, SAR_MKT: 1 } });
+  assert.deepEqual(byMarket(rows), { FTLAU_MKT: 75, SAR_MKT: 25 });
+  assert.ok(rows.every((r) => r.rule === 'proportional' && r.issued_total === 4));
+});
+
+test('$500 SAR only, 0 issued → $500 direct', () => {
+  const rows = allocateSlice({ amount: 500, markets: ['SAR_MKT'], issuedByMarket: {} });
+  assert.deepEqual(rows, [{ market: 'SAR_MKT', rule: 'direct', issued_basis: 0, issued_total: 0, amount: 500 }]);
+});
+
+test('$900 across 3 markets, 0 issued → $300 each (equal)', () => {
+  const rows = allocateSlice({ amount: 900, markets: ['ORL_MKT', 'SAR_MKT', 'JAX_MKT'] });
+  assert.deepEqual(byMarket(rows), { JAX_MKT: 300, ORL_MKT: 300, SAR_MKT: 300 });
+  assert.ok(rows.every((r) => r.rule === 'equal'));
+});
+
+test('$100 across 3 equal → 33.34 / 33.33 / 33.33, leftover cent to the alphabetical first on a tie', () => {
+  const rows = allocateSlice({ amount: 100, markets: ['SAR_MKT', 'JAX_MKT', 'ORL_MKT'] });
+  assert.deepEqual(byMarket(rows), { JAX_MKT: 33.34, ORL_MKT: 33.33, SAR_MKT: 33.33 });
+  assert.equal(sumCents(rows), 10000);
+});
+
+test('leftover cent goes to the market with the most issued', () => {
+  const rows = allocateSlice({ amount: 100, markets: ['A_MKT', 'B_MKT', 'C_MKT'], issuedByMarket: { A_MKT: 1, B_MKT: 1, C_MKT: 1 } });
+  assert.equal(sumCents(rows), 10000);
+  // 33.33 each = 99.99; the extra cent lands on the first max (alphabetical)
+  assert.equal(rows.find((r) => r.market === 'A_MKT').amount, 33.34);
+  const rows2 = allocateSlice({ amount: 100, markets: ['A_MKT', 'B_MKT', 'C_MKT'], issuedByMarket: { A_MKT: 1, B_MKT: 2, C_MKT: 1 } });
+  assert.deepEqual(byMarket(rows2), { A_MKT: 25, B_MKT: 50, C_MKT: 25 });
+});
+
+test('never a non-eligible market, even when it has issued leads', () => {
+  const rows = allocateSlice({ amount: 100, markets: ['FTMYR_MKT', 'SAR_MKT'], issuedByMarket: { FTMYR_MKT: 2, SAR_MKT: 2, STPET_MKT: 50 } });
+  assert.deepEqual(Object.keys(byMarket(rows)).sort(), ['FTMYR_MKT', 'SAR_MKT']);
+  assert.deepEqual(byMarket(rows), { FTMYR_MKT: 50, SAR_MKT: 50 });
+});
+
+test('REECE_HOLD alone → hold, never spread', () => {
+  const rows = allocateSlice({ amount: 2529.34, markets: [HOLD_MARKET], issuedByMarket: { FTMYR_MKT: 10 } });
+  assert.deepEqual(rows, [{ market: HOLD_MARKET, rule: 'hold', issued_basis: null, issued_total: null, amount: 2529.34 }]);
+});
+
+test('no eligible markets throws', () => {
+  assert.throws(() => allocateSlice({ amount: 10, markets: [] }), /no eligible markets/);
+});
+
+test('a Sep 20 – Oct 10 period splits by days (11 + 10) and the slices sum to the amount', () => {
+  const slices = splitPeriodByMonth('2026-09-20', '2026-10-10', 210);
+  assert.equal(slices.length, 2);
+  assert.deepEqual(slices.map((s) => [s.month, s.days, s.amount]), [['2026-09-01', 11, 110], ['2026-10-01', 10, 100]]);
+  // odd cents: remainder lands on the last slice
+  const odd = splitPeriodByMonth('2026-09-20', '2026-10-10', 100);
+  assert.equal(odd[0].amount + odd[1].amount, 100);
+  assert.equal(odd[0].amount, 52.38);
+  assert.equal(odd[1].amount, 47.62);
+});
+
+test('a one-day period is one slice', () => {
+  const slices = splitPeriodByMonth('2026-09-22', '2026-09-22', 12936.69);
+  assert.deepEqual(slices, [{ month: '2026-09-01', start: '2026-09-22', end: '2026-09-22', days: 1, amount: 12936.69 }]);
+});
+
+test('allocateExpense: per slice issued counts, single sub-source carried, total reconciles', () => {
+  const expense = {
+    id: 'e1', amount: 210, period_start: '2026-09-20', period_end: '2026-10-10',
+    lp_sub_sources: ['MyHomePros'], eligible_markets: ['FTMYR_MKT', 'SAR_MKT'],
+  };
+  const lookup = (month) => (month === '2026-09-01' ? { FTMYR_MKT: 1, SAR_MKT: 0 } : {});
+  const rows = allocateExpense(expense, lookup);
+  assert.equal(sumCents(rows), 21000);
+  const sep = rows.filter((r) => r.month === '2026-09-01');
+  const oct = rows.filter((r) => r.month === '2026-10-01');
+  assert.deepEqual(byMarket(sep), { FTMYR_MKT: 110, SAR_MKT: 0 });
+  assert.ok(sep.every((r) => r.rule === 'proportional' && r.lp_sub_source === 'MyHomePros'));
+  assert.deepEqual(byMarket(oct), { FTMYR_MKT: 50, SAR_MKT: 50 });
+  assert.ok(oct.every((r) => r.rule === 'equal'));
+});
+
+test('allocateExpense: several sub-sources → lp_sub_source null (the view keys on "(none)")', () => {
+  const rows = allocateExpense({ amount: 10, period_start: '2026-09-01', period_end: '2026-09-30', lp_sub_sources: ['A', 'B'], eligible_markets: ['SAR_MKT'] });
+  assert.equal(rows[0].lp_sub_source, null);
+});
