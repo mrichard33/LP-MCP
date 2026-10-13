@@ -9,9 +9,11 @@
 // back" or "have a good day", a short warm goodbye with no times and no
 // question, then stop.
 //
-// Pure. `isLeadSignOff` is read by the planner (the `sign_off` step, before
+// Pure (team-hours.js is pure too). `isLeadSignOff` is read by the planner (the `sign_off` step, before
 // any hand-off a price ask would trigger), by shouldRecordPromise, and by
 // checkReply's `times_after_sign_off`.
+
+import { promisedCallback } from './team-hours.js';
 
 // "I can call back", "I'll get back to you", "we'll reach out", "I'll be in touch".
 const WILL_REACH_OUT_RX = /\b(?:i|we)(?:'|’)?(?:ll|\s+will|\s+can|\s+could|\s+might|\s+may)\s+(?:just\s+)?(?:call\s+(?:you\s+)?back|call\s+(?:you|y'?all)\s+(?:later|another\s+time|when)|reach\s+(?:back\s+)?out|get\s+back\s+(?:to\s+you|with\s+you)|circle\s+back|be\s+in\s+touch|contact\s+(?:you|y'?all)\s+(?:later|when|if))\b/i;
@@ -89,7 +91,10 @@ export function enforceSignOff(reply, { inbound = '' } = {}) {
   if (!text.trim() || !isLeadSignOff(inbound)) return { text, changed: false };
   const theyWill = leadWillReachOut(inbound);
   const parts = sentencesOf(text);
-  const kept = parts.filter(s => !s.includes('?') && !CLOCK_RX.test(s) && !(theyWill && CHECK_BACK_RX.test(s)));
+  // 2026-10-13 (post-merge sim): "We'll have someone from our team give you a
+  // call when it's a better time." answered "I can call back". A promise of
+  // ours to a lead who will call us goes too (it would file a Five9 callback).
+  const kept = parts.filter(s => !s.includes('?') && !CLOCK_RX.test(s) && !(theyWill && (CHECK_BACK_RX.test(s) || promisedCallback(s))));
   if (kept.length === parts.length) return { text, changed: false };
   return { text: kept.length ? kept.join(' ') : SIGN_OFF_FALLBACK, changed: true };
 }

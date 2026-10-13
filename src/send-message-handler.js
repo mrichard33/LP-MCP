@@ -349,6 +349,7 @@ import { guardRepeatPromise, recordPromiseIfAny } from './services/promised-call
 // 2026-10-11 (Javier): the opener race — pre-send recheck and the held reply.
 import { openerAlreadyAsked, leadReplyState } from './agentic/discovery-discipline.js';
 import { enqueueNoReplyFollowup, openerHoldMode } from './jobs/no-reply-followup.js';
+import { leadWillReachOut } from './agentic/sign-off.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY || '';
 const GHL_LOCATION_ID = process.env.GHL_LOCATION_ID || 'SsBG7j5KQAIP1SFP2Sca';
@@ -4174,7 +4175,10 @@ export async function executeSendMessage(action, context) {
     // phone-call ask that booked nothing files too, unless a real future
     // appointment exists. Service conversations keep their own path.
     const analysis = sourceEventMeta?.event_type === 'ai.analysis_completed' ? (sourceEventMeta.payload || {}) : {};
-    const scheduling = generated && !generated.service_conversation ? schedulingCallbackDecision({
+    // 2026-10-13: "I can call back when I have more time" is the lead calling
+    // US; the analyzer's callback route is not a call we owe.
+    const leadWillCall = leadWillReachOut(replyTriggerMessage || context?.message_text || '');
+    const scheduling = generated && !generated.service_conversation && !leadWillCall ? schedulingCallbackDecision({
       bookingClaimBlocked: !!generated.booking_claim_blocked,
       recommendedAction: analysis.recommended_action || payload.recommended_action || null,
       requestedFulfillment: analysis.requested_fulfillment || null,

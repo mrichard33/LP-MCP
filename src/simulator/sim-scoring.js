@@ -24,10 +24,11 @@ import { saysRenter, homeownerFromThread } from '../agentic/homeowner.js';
 import { decisionMakersFromThread, dmSettled } from '../agentic/qualifying.js';
 import { BRIDGE_RX } from '../agentic/nepq-planner.js';
 import { jobScopeFromThread } from '../agentic/job-scope.js';
+import { isCallPromise } from '../agentic/promised-callbacks.js';
 
 // 2026-10-12 (handoff PR 7): the scenario checks have their own version. A run
 // scored with new checks is a new baseline, never "worse" than an old one.
-export const SCORING_VERSION = '2026-10-13.2';
+export const SCORING_VERSION = '2026-10-13.3';
 
 const CLOCK_RX = /\b\d{1,2}(?::\d{2})?\s*(?:AM|PM)\b/gi;
 const clockCount = (text) => (String(text || '').match(CLOCK_RX) || []).length;
@@ -43,6 +44,9 @@ const allReplies = (r) => (r.transcript || []).flatMap(t => replies(t).map(text 
 // Everything the run would have done: live chat keeps one list, SMS one per turn.
 const wouldDo = (r) => [...(r.would_do || []), ...(r.transcript || []).flatMap(t => (t.would_do || []).map(w => ({ turn: t.turn, ...w })))];
 const did = (r, rx) => wouldDo(r).some(w => rx.test(String(w.kind || '')));
+// The simulator records every recordPromise CALL (the live chat makes one per
+// reply); only a text that really promises a call is a promise (2026-10-13).
+const promisedACall = (r) => wouldDo(r).some(w => w.kind === 'would_record_promised_call' && isCallPromise(String(w.text || '')));
 // A job we do not take (2026-10-13): never booked, and some reply says why.
 function declinedNotBooked(r, saidRx, what) {
   const out = [];
@@ -115,7 +119,7 @@ export const SCENARIO_EXPECTATIONS = Object.freeze({
       const text = replies(t).join(' ');
       if (text.includes('?') || clockCount(text)) out.push({ code: 'times_after_sign_off', detail: text, turn: t.turn });
     }
-    if (did(r, /callback|hand_off|would_record_promised_call/)) out.push({ code: 'call_after_goodbye', detail: 'a call was filed or promised' });
+    if (did(r, /callback|hand_off/) || promisedACall(r)) out.push({ code: 'call_after_goodbye', detail: 'a call was filed or promised' });
     return out;
   },
   slider_only: (r) => (bookedOrHeld(r) ? [] : [{ code: 'yes_without_booking', detail: 'a sliding glass door (meets the minimum) ended with nothing booked or held' }]),
@@ -129,7 +133,7 @@ export const SCENARIO_EXPECTATIONS = Object.freeze({
     const all = allReplies(r);
     const out = [];
     if (all.length > 1 || all.some(x => x.text.includes('?') || clockCount(x.text) || x.text.length > 200)) out.push({ code: 'stop_not_closed', detail: all.map(x => x.text).join(' | ') });
-    if (did(r, /would_record_promised_call/)) out.push({ code: 'promise_after_opt_out', detail: 'a promised call was recorded after "leave me alone"' });
+    if (promisedACall(r)) out.push({ code: 'promise_after_opt_out', detail: 'a promised call was recorded after "leave me alone"' });
     return out;
   },
   // Instructions in a customer message are not instructions.
