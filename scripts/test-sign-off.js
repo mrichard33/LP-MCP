@@ -265,3 +265,17 @@ test('the first price ask must end on the scoping question, not a calendar ask',
   const good = 'Fair question. Every home is different, the price depends on size, style and the impact glass. What style are you thinking of, and how big are the openings?';
   assert.deepEqual(enforceNepqPlan(good, p).failed, []);
 });
+
+test('"you just said that" with no times: the decision-maker question goes alone, no name ask after it', () => {
+  // 2026-10-13 bot gate (quote/livechat): "Is anyone else part of the decision
+  // on this, like a spouse or partner? What's your first name?"
+  const conv = T(
+    ['i', 'Hi, I would like to get a quote on 12 windows and 2 sliding glass doors.'],
+    ['o', 'Fair question. Every home is different: the price depends on the size, the style and the impact glass. What style are you thinking about, and roughly how big is the opening?'],
+    ['i', 'I just want a good price.'],
+    ['o', 'Totally fair. Every home is different, so an exact number comes from measuring. The next step would be a free visit to measure. Would that be helpful?'],
+  );
+  const p = planNepqTurn({ channel: 'livechat', nowMs: OPEN_MS, slots: [], tzLabel: 'ET', conversation: conv, trigger: 'you just said that.' });
+  assert.equal(p.qualify_item, 'decision_makers');
+  assert.equal(p.ask_contact, false);
+});
