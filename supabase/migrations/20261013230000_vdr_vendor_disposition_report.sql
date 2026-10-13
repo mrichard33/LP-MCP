@@ -1,7 +1,8 @@
 -- 20261013230000_vdr_vendor_disposition_report.sql
 --
 -- WHAT: the whole schema of the weekly Vendor Disposition Report (n8n "06 VDR", frlZu30c88H5bnkZ, owned by
---       mrichard33/n8n, source of truth sql/vdr_vendor_disposition_report.sql in that repo, same text):
+--       mrichard33/n8n, source of truth sql/vdr_vendor_disposition_report.sql in that repo; same text except
+--       the trigger, created here only when missing instead of drop + create):
 --       vdr_vendor_config, vdr_send_log, vdr_touch_updated_at() + trigger, vdr_due_vendors(), the vendor
 --       seed, and the rev-share additions of the same day (vdr_vendor_config.rev_share, the vdr_payable_jobs
 --       ledger, vdr_rev_share_data()).
@@ -67,9 +68,14 @@ create unique index if not exists vdr_send_log_one_send_per_week
 
 create or replace function public.vdr_touch_updated_at() returns trigger language plpgsql as $$
 begin new.updated_at := now(); return new; end $$;
-drop trigger if exists vdr_vendor_config_touch on public.vdr_vendor_config;
-create trigger vdr_vendor_config_touch before update on public.vdr_vendor_config
-  for each row execute function public.vdr_touch_updated_at();
+-- Created only when missing (the n8n file drops and re-creates it; a DROP needs a destructive marker here).
+do $$ begin
+  if not exists (select 1 from pg_trigger
+                 where tgname = 'vdr_vendor_config_touch' and tgrelid = 'public.vdr_vendor_config'::regclass) then
+    create trigger vdr_vendor_config_touch before update on public.vdr_vendor_config
+      for each row execute function public.vdr_touch_updated_at();
+  end if;
+end $$;
 
 -- Who is due right now. A vendor is due once its send slot this week has passed and it has
 -- no 'sent'/'empty' row this week. Blocked/failed attempts retry hourly, max 3 per week.
