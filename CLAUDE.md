@@ -957,6 +957,12 @@ ONCE, after the hold" (asked before the times; a settled answer rides as `plan.d
 again). `stageBlock` renders from the stored stage (`playForConversationStage`), buyer_stage is tone only, and the
 transition default is the free home visit. The simulator and `run_bot_eval` take `lead_stage_mode` (shadow|live) to try
 it before Railway is switched.
+**Fixes from the first full live-mode gate (2026-10-13).** Three money asks (a quote counts) after the price play hand off
+to a person even when the model reworded our first quote line (`moneyAsks`); the gate drops the price play's contact
+ask (one question); "let me think about it" while qualifying is open gets `LINES.think_no_times`, never the ownership
+question; the model's "what would actually decide it for you?" reads as the decide question (`DECIDE_Q_RX`), so the
+criteria reply reaches the visit; and `asksForKnown` never deletes an address ask as a zip re-ask (the SMS hold that
+said "I'm holding … for you." and stopped).
 
 **A renter gets no visit; one out-of-area decline; quote ≠ price (handoff PR 3, 2026-10-12).** A renter was offered
 times twice (batch 3 T3). `enforceNonOwner` (`src/agentic/non-owner.js`, the last pass in both bots beside
