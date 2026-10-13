@@ -236,7 +236,9 @@ export async function simulateLiveChat(plan, { nepqMode = 'live', productionDeps
     cancelAppointment: async (a) => { record('would_cancel_in_ghl', { appointment_id: a.appointmentId }); return { ok: true }; },
     rescheduleAppointment: async (a) => { record('would_move_same_appointment_in_ghl', { appointment_id: a.oldAppointmentId, new_start: a.startIso }); return { ok: true }; },
     postCancelCard: async (a) => { record('would_post_dispatch_card', { card: a.kind, text: String(a.text || '').slice(0, 400) }); return { ok: true }; },
-    bookSlot: async (a) => { record('would_book', { start: a.startIso }); await recordBookedStage({ contactId, channel: 'livechat', source: 'sim' }, stageDeps); return { ok: true, action_id: 0 }; },
+    // 2026-10-13: an appointment id, or booking truth reads action_id 0 as no
+    // booking and turns the confirm into the no-promise hand-off (live gate).
+    bookSlot: async (a) => { record('would_book', { start: a.startIso }); await recordBookedStage({ contactId, channel: 'livechat', source: 'sim' }, stageDeps); return { ok: true, action_id: 0, appointment_id: 'sim-booked' }; },
     recordLeadStage: async (a) => { turnStage = stageNote(await recordStage(a, stageDeps)); return turnStage; },
     readLeadStage: async () => simStageRead(stageDeps, contactId),
     leadStageMode: () => stageDeps.mode,

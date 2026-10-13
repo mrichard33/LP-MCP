@@ -277,6 +277,8 @@ test('PR 7: the persona answers what the bot asks (autoAnswer scenarios only)', 
   // 2026-10-13: the count question is always on, so the persona answers it.
   assert.equal(B7.autoAnswerFor('How many windows and doors are you looking to get a quote on?', p), 'About 10 windows.');
   assert.equal(B7.autoAnswerFor('What color frames do you like?', p), null);
+  assert.equal(B7.autoAnswerFor('How many doors are you thinking about, or is it just the windows? — Reece Team', p), 'About 10 windows.');
+  assert.equal(B7.autoAnswerFor('How long have they been like that?', p), null);
   assert.equal(B7.autoAnswerFor('Thanks.', p), null);
   // Only the asking sentence counts (first eval run: a bridge that mentioned owning the home).
   assert.equal(B7.autoAnswerFor('Labor is covered as long as you own the home. The next step would be a free visit at your home. Would that help?', p), null);
