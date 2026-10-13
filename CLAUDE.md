@@ -1010,6 +1010,13 @@ the booking (`refused_job_scope:*`), `gateForStage` returns `not_eligible`, `che
 has `dq_detected` rental_property / commercial / below_minimum, and an LP note saying rental, commercial or below minimum
 is an LP-note DQ. FAQs LIB-P03/P15 (impact only), LIB-P16/17/18: `sql/seeds/2026-10-13_scope_rules_impact_only.sql`.
 Reminders for Set/Verif only (Cnf and Issue get none) are GHL edits in A.WE-1: `docs/ghl-we-reminders-set-only.md`.
+**A lead past its demo already meets these requirements (the user, 2026-10-13).** `isPostDemoLead`
+(`src/agentic/post-demo-lead.js`: a demo disposition (`isDemoDisposition`) or closed won, or `lp-demo-completed` /
+`stage:post-appointment` / `rehash` / `active-f.0`; never `lp.demo_completed`, which LP sets for NOC) turns off, in both
+bots and whatever `POST_DEMO_PLANNER_MODE` says: the lead-side job-scope and tenant declines (our own false claims are
+still corrected), the qualifying gate (`postDemoLead` → `gateForStage`), the live chat's job-scope booking refusal, the
+set-ND card, and an LP-note DQ whose signal is only renter / rental / commercial / below minimum
+(`REQUIREMENT_SIGNALS`). `checkReply` skips the lead-side check on `ctx.postDemoLead`.
 Also fixed: the SMS scope guard compared `scope.reason === 'lead_asked'`, which never matched `'<rule>:lead_asked'`, so a
 declined manufactured home or tall building kept its booking.
 

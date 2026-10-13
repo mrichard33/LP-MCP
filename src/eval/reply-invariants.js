@@ -100,7 +100,8 @@ export function checkReply(reply, ctx = {}) {
   // No rentals, no commercial, the minimum, impact-only (the user, 2026-10-13).
   // The lead's side needs the thread (was the minimum already asked?); with no
   // thread only our own claims are checked.
-  if (Array.isArray(ctx.conversation)) {
+  // A lead past its demo already meets the requirements (2026-10-13): only our claims.
+  if (Array.isArray(ctx.conversation) && !ctx.postDemoLead) {
     const job = enforceJobScope(text, { thread: ctx.conversation, inbound: ctx.inbound || '' });
     if (job.changed) fail('job_scope', job.reason);
   } else {

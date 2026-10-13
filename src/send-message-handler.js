@@ -4186,7 +4186,8 @@ export async function executeSendMessage(action, context) {
     // bot said (lp-note-dq.js noteDqPackage).
     const noteDq = generated?.lp_note_dq ? { why: 'lp_note_dq', reason: 'lp_note_dq', kind: 'sales' } : null;
     // 2026-10-13: a home we cannot work on gets the set-ND card below, never a sales call.
-    const scopeDq = !!scopeDqKind(replyTriggerMessage || context?.message_text || '');
+    // Never for a lead past its demo (2026-10-13; post-demo-lead.js).
+    const scopeDq = !generated?.post_demo_lead && !!scopeDqKind(replyTriggerMessage || context?.message_text || '');
     const decision = scopeDq ? null : noteDq || ((generated?.nepq_handoff || generated?.dm_handoff) ? callbackDecision({ handoffReason: generated?.nepq_handoff?.reason || null, otherHandoff: !!generated?.dm_handoff, text: String(message || '') })
       : (classified || scheduling || callbackDecision({ text: String(message || '') })));
     if (decision) {
@@ -4211,7 +4212,7 @@ export async function executeSendMessage(action, context) {
   // LP's API cannot change a disposition, so a note on the LP prospect and ONE
   // #contact-center card, once per contact per kind (src/agentic/scope-dq.js).
   {
-    const kind = scopeDqKind(replyTriggerMessage || context?.message_text || '');
+    const kind = generated?.post_demo_lead ? null : scopeDqKind(replyTriggerMessage || context?.message_text || '');
     if (kind) {
       trackBackground(runScopeDq({
         contactId, kind, channel, inbound: replyTriggerMessage || context?.message_text || '',

@@ -1407,3 +1407,11 @@ test('a stated count is queued for Window Count / Door Count, with real columns 
   const extra = Object.keys(row).filter(k => k !== 'id' && !AGENT_ACTIONS_COLUMNS.includes(k));
   assert.deepEqual(extra, []);
 });
+
+test('a lead past its demo is not declined as a rental (the user, 2026-10-13)', async () => {
+  const draft = 'Thanks for checking in. Is anything holding you back from moving forward?';
+  const { lane } = makeLane({ mode: 'shadow', tags: ['lp-demo-completed'], llm: () => ({ message: draft }) });
+  const out = await lane.processInbound(INBOUND('we rent it out, still thinking about the windows'));
+  assert.doesNotMatch(out.message, /rental propert/);
+  assert.match(out.message, /holding you back/);
+});
