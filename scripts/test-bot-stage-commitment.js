@@ -37,7 +37,8 @@ const THU_6 = slot('2026-10-15T18:00:00-04:00', 'Thu, Oct 15', '6:00 PM');
 const FRI_10 = slot('2026-10-16T10:00:00-04:00', 'Fri, Oct 16', '10:00 AM');
 const ALL = [WED_6, THU_10, THU_2, THU_6, FRI_10];
 const thread = (...xs) => xs.map(([d, t]) => ({ direction: d === 'o' ? 'outbound' : 'inbound', text: t }));
-const QUALIFIED = { homeowner: 'yes', decision_makers: 'sole', zip: '33908' };
+// openings_known: the count is the gate's third item (the user, 2026-10-13).
+const QUALIFIED = { homeowner: 'yes', decision_makers: 'sole', zip: '33908', openings_known: true };
 
 const plan = (convo, trigger, { stage = null, channel = 'sms', slots = [THU_10, THU_2], allSlots = ALL, ...rest } = {}) =>
   P.planNepqTurn({ channel, trigger, conversation: convo, slots, allSlots, tzLabel: 'ET', nowMs: NOW, stage, ...rest });
@@ -62,14 +63,18 @@ test('the easy yes asks the one missing qualifying item first (owner → zip →
   assert.match(p1.fixed_line, /own the home/);
   const p2 = plan(convo, 'yes please', { stage: { stage: 'problem', facts: { homeowner: 'yes' } } });
   assert.equal(p2.qualify_item, 'zip');
+  // 2026-10-13 (the user): the count, in the user's wording, asked once.
   const p3 = plan(convo, 'yes please', { stage: { stage: 'problem', facts: { homeowner: 'yes', zip: '33908' } } });
-  assert.equal(p3.qualify_item, 'decision_makers');
+  assert.equal(p3.qualify_item, 'openings');
+  assert.match(p3.fixed_line, /How many windows and doors are you looking to (?:get a quote on|have us come measure)\?/);
+  const p4 = plan(convo, 'yes please', { stage: { stage: 'problem', facts: { homeowner: 'yes', zip: '33908', openings_known: true } } });
+  assert.equal(p4.qualify_item, 'decision_makers');
   // One question per message.
-  for (const p of [p1, p2, p3]) assert.equal((p.fixed_line.match(/\?/g) || []).length, 1);
+  for (const p of [p1, p2, p3, p4]) assert.equal((p.fixed_line.match(/\?/g) || []).length, 1);
 });
 
 test('the zip on file counts; the answer this turn counts', () => {
-  const p = plan(thread(['o', 'Do you own the home?']), 'yes we do', { stage: { stage: 'qualifying', facts: { decision_makers: 'sole' } }, knownZip: '34470' });
+  const p = plan(thread(['o', 'Do you own the home?']), 'yes we do', { stage: { stage: 'qualifying', facts: { decision_makers: 'sole', openings_known: true } }, knownZip: '34470' });
   assert.equal(p.step, 'offer_slots', 'owner answered now, zip on file, alone → times');
 });
 
@@ -159,7 +164,7 @@ test('after an objection play the track resumes toward times (competitor criteri
 
 test('"my wife will be there" closes the spouse question for good', () => {
   const convo = thread(['i', 'my wife will be there too'], ['o', 'I have Thu, Oct 15 at 10:00 AM ET or Thu, Oct 15 at 2:00 PM ET. Which works better?']);
-  const p = plan(convo, 'the first one', { stage: { stage: 'commitment_offered', facts: { homeowner: 'yes', zip: '33908' } } });
+  const p = plan(convo, 'the first one', { stage: { stage: 'commitment_offered', facts: { homeowner: 'yes', zip: '33908', openings_known: true } } });
   assert.equal(p.step, 'confirm');
   assert.equal(p.dm_known, 'Yes');
   const facts = smsBookingTurn({ plan: p, trigger: 'the first one', thread: [...convo, { direction: 'inbound', text: 'the first one' }], slots: ALL, tz: 'ET', gateMissing: ['decision_makers'], onFileAddress: null, firstName: 'Dana', calendar: { calendar_name: 'Window Estimate' } });
@@ -167,12 +172,12 @@ test('"my wife will be there" closes the spouse question for good', () => {
 });
 
 test('a named decision maker → can they be there; can\'t → a day for both', () => {
-  const named = plan(thread(['o', 'Is anyone else part of the decision on this, like a spouse or partner?']), 'my husband', { stage: { stage: 'qualifying', facts: { homeowner: 'yes', zip: '33908' } } });
+  const named = plan(thread(['o', 'Is anyone else part of the decision on this, like a spouse or partner?']), 'my husband', { stage: { stage: 'qualifying', facts: { homeowner: 'yes', zip: '33908', openings_known: true } } });
   assert.equal(named.qualify_item, 'dm_presence');
-  const absent = plan(thread(['o', 'Will they be able to make it to the visit too?']), 'no he works days', { stage: { stage: 'qualifying', facts: { homeowner: 'yes', zip: '33908' } } });
+  const absent = plan(thread(['o', 'Will they be able to make it to the visit too?']), 'no he works days', { stage: { stage: 'qualifying', facts: { homeowner: 'yes', zip: '33908', openings_known: true } } });
   assert.equal(absent.qualify_item, 'dm_absent');
   assert.equal(absent.booking.allowed, true);
-  const present = plan(thread(['o', 'No problem. What day works best when you can both be there?']), 'Saturday', { stage: { stage: 'qualifying', facts: { homeowner: 'yes', zip: '33908', decision_makers: 'named_absent' } } });
+  const present = plan(thread(['o', 'No problem. What day works best when you can both be there?']), 'Saturday', { stage: { stage: 'qualifying', facts: { homeowner: 'yes', zip: '33908', decision_makers: 'named_absent', openings_known: true } } });
   assert.notEqual(present.step, 'qualify');
 });
 

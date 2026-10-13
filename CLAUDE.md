@@ -984,7 +984,10 @@ offer goes. The MINIMUM is three windows or doors in any mix, or one sliding gla
 (not a symptom: "my window is foggy" is never checked) gets ONE friendly check, never the rule first (`MINIMUM_CHECK_LINE`,
 the user's wording: "Of course, I can help with that. Are all the other windows in your home already hurricane
 impact?"; "Does your home only have 1 window?" reads the same). A yes or "just this one" → `BELOW_MINIMUM_LINE`, which
-states the minimum; "no, the others are old" or anything else is the normal flow, and an unknown count never blocks. A draft saying we do commercial or rental work, or
+states the minimum; "no, the others are old" or anything else is the normal flow, and an unknown count never blocks. The
+count is asked ONCE before any time, in the user's wording ("How many windows and doors are you looking to get a quote
+on?" / "… to have us come measure?"): the qualifying gate's `openings` item (owner → zip → openings → decision makers,
+`openingsKnown`), and the prompt's ASK FOR WINDOW COUNT. A bare "1" in reply to it is read as the count (`openingsAt`). A draft saying we do commercial or rental work, or
 that some windows are not impact, has that sentence replaced. Any block drops `book_appointment`, the live chat refuses
 the booking (`refused_job_scope:*`), `gateForStage` returns `not_eligible`, `checkReply` fails `job_scope`, the analyzer
 has `dq_detected` rental_property / commercial / below_minimum, and an LP note saying rental, commercial or below minimum

@@ -229,3 +229,35 @@ test('every fixed line is dash-free and has at most one question', () => {
     assert.ok((line.match(/\?/g) || []).length <= 1);
   }
 });
+
+// ── the count question (the user, 2026-10-13) ──────────────────────────────
+
+test('the gate asks the count once, in the user\'s wording, between the zip and the decision makers', async () => {
+  const P = await import('../src/agentic/nepq-planner.js');
+  assert.equal(P.nextQualifyItem({ homeowner: 'yes', zip: '33908' }, []), 'openings');
+  assert.deepEqual([...P.QUALIFY_LINES.openings], ['How many windows and doors are you looking to get a quote on?', 'How many windows and doors are you looking to have us come measure?']);
+  // Asked once and not answered: never asked again (an unknown count never blocks).
+  assert.equal(P.nextQualifyItem({ homeowner: 'yes', zip: '33908' }, [{ text: 'How many windows and doors are you looking to get a quote on?' }]), 'decision_makers');
+  // Known from the thread: skipped.
+  assert.equal(P.nextQualifyItem({ homeowner: 'yes', zip: '33908', openings_known: true }, []), 'decision_makers');
+});
+
+test('a count in any form makes it known; "we need windows" does not', () => {
+  assert.equal(J.openingsKnown([], 'about 12 windows'), true);
+  assert.equal(J.openingsKnown([], 'the whole house'), true);
+  assert.equal(J.openingsKnown([], 'just the slider'), true);
+  assert.equal(J.openingsKnown([], 'we need new windows'), false);
+  const asked = thread(['o', 'How many windows and doors are you looking to get a quote on?']);
+  assert.equal(J.openingsKnown(asked, 'about 10'), true);
+  assert.equal(J.openingsKnown(asked, 'not sure yet'), false);
+});
+
+test('"1" in reply to the count question gets the friendly check next', () => {
+  const asked = thread(['i', 'I want a quote'], ['o', 'How many windows and doors are you looking to get a quote on?']);
+  assert.equal(J.enforceJobScope(OFFER, { thread: asked, inbound: '1' }).text, J.MINIMUM_CHECK_LINE);
+  assert.equal(J.enforceJobScope(OFFER, { thread: asked, inbound: 'just 2' }).text, J.MINIMUM_CHECK_LINE);
+  assert.equal(J.enforceJobScope(OFFER, { thread: asked, inbound: 'about 10' }).changed, false);
+  assert.equal(J.enforceJobScope(OFFER, { thread: asked, inbound: '3' }).changed, false);
+  // A time is not a count.
+  assert.equal(J.enforceJobScope(OFFER, { thread: asked, inbound: '2 pm works' }).changed, false);
+});

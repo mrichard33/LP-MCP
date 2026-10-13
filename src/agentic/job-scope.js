@@ -149,9 +149,9 @@ function countValue(word) {
 export function openingsIn(text) {
   const raw = String(text || '');
   const t = raw.replace(NOT_AN_OPENING_RX, ' ');
-  const out = { windows: 0, doors: 0, slider: false, unknown: false, stated: false, explicit: false };
+  const out = { windows: 0, doors: 0, slider: false, unknown: false, stated: false, explicit: false, big: false };
   if (SLIDER_RX.test(t)) { out.slider = true; out.stated = true; }
-  if (BIG_SCOPE_RX.test(t)) { out.unknown = true; out.stated = true; }
+  if (BIG_SCOPE_RX.test(t)) { out.unknown = true; out.stated = true; out.big = true; }
   let rest = t;
   for (const m of t.matchAll(WINDOW_COUNT_RX)) {
     const n = countValue(m[1]);
@@ -180,6 +180,37 @@ export function openingsIn(text) {
   // A plural we did not count ("windows and a door") leaves the size open.
   if (BARE_PLURAL_RX.test(rest)) { out.unknown = true; out.stated = true; }
   return out;
+}
+
+// Our count question (the user's wording, 2026-10-13: "How many windows and
+// doors are you looking to get a quote on?"), read by meaning.
+export const COUNT_ASK_RX = /\bhow\s+many\s+(?:windows?|doors?|openings?)\b[^?]*\?/i;
+// A bare number in reply to it: "1", "just 2", "about 10", "maybe three".
+const BARE_COUNT_RX = /^\s*(?:(?:about|around|maybe|probably|just|only|roughly|like)\s+)?(\d{1,3}|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\b(?!\s*(?:pm|am|:|\/))/i;
+
+/**
+ * The openings the inbound message at turns[i] names, reading a bare number
+ * as windows when it answers our count question. Pure.
+ */
+export function openingsAt(turns, i) {
+  const m = turns[i];
+  const o = openingsIn(m?.text);
+  if (o.stated) return o;
+  const prevOut = turns.slice(0, i).reverse().find(t => t.direction === 'outbound')?.text || '';
+  const bare = COUNT_ASK_RX.test(prevOut) ? String(m?.text || '').match(BARE_COUNT_RX) : null;
+  if (!bare) return o;
+  const n = countValue(bare[1]);
+  return n ? { ...o, windows: n, stated: true, explicit: true } : o;
+}
+
+/** Has the lead told us how many openings (a count, a slider, "the whole house")? Pure. */
+export function openingsKnown(thread = [], inbound = '') {
+  const turns = normalize(thread, inbound);
+  return turns.some((t, i) => {
+    if (t.direction !== 'inbound') return false;
+    const o = openingsAt(turns, i);
+    return o.slider || o.big || o.windows + o.doors > 0;
+  });
 }
 
 /** Do these openings meet the minimum? true / false / null (cannot tell). Pure. */
@@ -280,7 +311,7 @@ export function jobScopeFromThread(thread = [], inbound = '') {
   for (let i = 0; i < turns.length; i++) {
     const m = turns[i];
     if (m.direction !== 'inbound') continue;
-    const o = openingsIn(m.text);
+    const o = openingsAt(turns, i);
     if (!o.stated) continue;
     // A symptom ("my window is foggy") is not a scope: count only a message
     // that names a number or says what they want done. Once a scope is

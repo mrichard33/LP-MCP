@@ -37,7 +37,7 @@ import { detectDeferral, pendingDeferral, isAcknowledgment, isSignOffLine, POST_
 import { PURCHASED_ELSEWHERE_RX } from './purchased-elsewhere.js';
 import { rehashNepqTurn, bridgedRecently, BEST_DEAL_RX, PRE_BRIDGE_STAGES } from './rehash-nepq.js';
 import { homeownerFromThread, OWNER_ASK_RX } from './homeowner.js';
-import { jobScopeFromThread } from './job-scope.js';
+import { jobScopeFromThread, openingsKnown } from './job-scope.js';
 import { decisionMakersFromThread, dmSettled } from './qualifying.js';
 import { extractZip } from './service-area-turn.js';
 
@@ -355,6 +355,10 @@ export const LINES = Object.freeze({
 export const QUALIFY_LINES = Object.freeze({
   homeowner: ['Happy to set that up. Just so I point you the right way, do you own the home?', 'Quick question before I pull up times: are you the homeowner?'],
   zip: ["What's the zip code at the home?", 'And what zip code is the home in?'],
+  // 2026-10-13 (the user's wording): the count, so a job under the minimum
+  // (three windows or doors, or one sliding glass door) is caught before any
+  // time is offered (job-scope.js). Asked ONCE: an unknown count never blocks.
+  openings: ['How many windows and doors are you looking to get a quote on?', 'How many windows and doors are you looking to have us come measure?'],
   decision_makers: ['Is anyone else part of the decision on this, like a spouse or partner?', 'Will anyone else be weighing in on this decision?'],
   dm_presence: ['Will they be able to make it to the visit too?', 'Would they be able to be there for the visit as well?'],
   dm_absent: ['No problem. What day works best when you can both be there?', 'Got it. Which day would let you both be there?'],
@@ -362,11 +366,12 @@ export const QUALIFY_LINES = Object.freeze({
 const QUALIFY_MARKERS = Object.freeze({
   homeowner: [{ rx: /\bown\b|\bhomeowner\b/i, say: 'ask if they own the home' }],
   zip: [{ rx: /\bzip\b/i, say: 'ask for the zip code' }],
+  openings: [{ rx: /\bhow\s+many\s+(?:windows?|doors?|openings?)\b/i, say: 'ask how many windows and doors they want quoted' }],
   decision_makers: [{ rx: /\b(?:anyone|anybody|someone)\s+else\b|\bpart\s+of\s+the\s+decision\b|\bweigh(?:ing)?\s+in\b/i, say: 'ask if anyone else is part of the decision' }],
   dm_presence: [{ rx: /\bable\s+to\s+(?:be\s+there|make\s+it)\b/i, say: 'ask if they will be able to be there (or make it) for the visit' }],
   dm_absent: [{ rx: /\bboth\s+(?:of\s+you\s+)?(?:be\s+there|be\s+home|make\s+it)\b/i, say: 'ask what day works when they can both be there' }],
 });
-const QUALIFY_ASK_RX = /\bdo\s+you\s+own\b|\bhomeowner\b|\bzip\s+code\b|\b(?:anyone|anybody)\s+else\b[^?]*\bdecision\b|\bweigh(?:ing)?\s+in\b|\bable\s+to\s+(?:be\s+there|make\s+it)\b|\bboth\s+be\s+there\b/i;
+const QUALIFY_ASK_RX = /\bdo\s+you\s+own\b|\bhomeowner\b|\bzip\s+code\b|\bhow\s+many\s+(?:windows?|doors?|openings?)\b|\b(?:anyone|anybody)\s+else\b[^?]*\bdecision\b|\bweigh(?:ing)?\s+in\b|\bable\s+to\s+(?:be\s+there|make\s+it)\b|\bboth\s+be\s+there\b/i;
 // A street address the lead typed (a number, then a street word): ready to book.
 const STREET_ADDRESS_RX = /\b\d{2,6}\s+(?:[NSEW]\.?\s+)?[A-Za-z0-9'.]+(?:\s+[A-Za-z0-9'.]+){0,3}\s+(?:st|street|ave|avenue|rd|road|dr|drive|ln|lane|blvd|boulevard|ct|court|cir|circle|way|pl|place|ter|terrace|pkwy|parkway|hwy|highway|trl|trail|loop)\b/i;
 
@@ -386,6 +391,7 @@ export function stageFactsNow(stage, turns = [], knownZip = null) {
     homeowner: owner !== 'unknown' ? owner : (f.homeowner || 'unknown'),
     decision_makers: dm !== 'unknown' ? dm : (f.decision_makers || 'unknown'),
     zip,
+    openings_known: !!f.openings_known || openingsKnown(turns),
   };
 }
 
@@ -398,6 +404,7 @@ export function nextQualifyItem(facts = {}, outbound = []) {
   const asked = (key) => outbound.filter(m => QUALIFY_MARKERS[key].some(k => k.rx.test(String(m.text || '')))).length;
   if (facts.homeowner !== 'yes' && facts.homeowner !== 'no' && asked('homeowner') < 2) return 'homeowner';
   if (!facts.zip && asked('zip') < 2) return 'zip';
+  if (!facts.openings_known && asked('openings') < 1) return 'openings';
   const dm = facts.decision_makers;
   if (!dmSettled(dm)) {
     if (dm === 'named' && asked('dm_presence') < 2) return 'dm_presence';
