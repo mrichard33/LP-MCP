@@ -29,9 +29,31 @@
  */
 
 export const MIN_INVOICE_CHARS = 40;
-export const SKIP_REASONS = Object.freeze({ NO_TEXT: 'no_text', TOO_LITTLE_TEXT: 'too_little_text' });
+export const SKIP_REASONS = Object.freeze({
+  NO_TEXT: 'no_text', TOO_LITTLE_TEXT: 'too_little_text',
+  // 2026-10-13: an email body with no money figure at all is not an invoice.
+  // LINKED_FILE is the case worth telling a person about: Outlook "attached"
+  // the receipt as a OneDrive link (Receipt-2757-9497.pdf), which nothing here
+  // can open, and the body became a $0 card with no vendor.
+  NO_AMOUNT: 'no_amount', LINKED_FILE: 'linked_file',
+  DUPLICATE_INVOICE: 'duplicate_invoice',
+  // An old binary Office file (.xls, .doc, Outlook .msg): nothing here can read it.
+  UNSUPPORTED_FORMAT: 'unsupported_format',
+});
 
-const MONEY_RX = /\$\s?\d[\d,]*(?:\.\d{2})?|\b\d{1,3}(?:,\d{3})+\.\d{2}\b|\b\d+\.\d{2}\b/;
+const CLOUD_LINK_RX = /https?:\/\/[^\s<>"]*(?:sharepoint\.com|onedrive\.live\.com|1drv\.ms|drive\.google\.com|docs\.google\.com|dropbox\.com|box\.com|icloud\.com)[^\s<>"]*/i;
+const LINKED_NAME_RX = /([\w\-. ]{1,120}\.(?:pdf|png|jpe?g|xlsx?|csv|docx?))\s*[<(\[]?\s*https?:\/\//i;
+
+/** The file an email linked instead of attaching (OneDrive, SharePoint, Google Drive, Dropbox), or null. */
+export function linkedFileIn(text = '') {
+  const t = String(text || '');
+  const url = CLOUD_LINK_RX.exec(t)?.[0] || null;
+  if (!url) return null;
+  const name = LINKED_NAME_RX.exec(t)?.[1]?.trim() || null;
+  return { url, name };
+}
+
+export const MONEY_RX = /\$\s?\d[\d,]*(?:\.\d{2})?|\b\d{1,3}(?:,\d{3})+\.\d{2}\b|\b\d+\.\d{2}\b/;
 const INVOICE_WORDS_RX = /\b(invoice|amount due|balance due|total due|total|statement|bill|billing|receipt|payment|subtotal)\b/i;
 
 /**
@@ -45,10 +67,19 @@ const INVOICE_WORDS_RX = /\b(invoice|amount due|balance due|total due|total|stat
 export function triageExtraction({ text = '', kind = null, meta = null, minChars = MIN_INVOICE_CHARS } = {}) {
   const t = String(text || '');
   const chars = t.replace(/\s+/g, '').length;
-  // Structured files and the person's own email body are never triaged out: a
-  // CSV backfill or a one-line "please pay $500 for September" must reach review.
-  if (kind === 'csv' || kind === 'xlsx' || kind === 'text' || meta?.format === 'email_body') {
-    return { verdict: 'invoice', reason: null, chars };
+  if (kind === 'unsupported') return { verdict: 'not_an_invoice', reason: SKIP_REASONS.UNSUPPORTED_FORMAT, chars };
+  // Structured files are never triaged out: a CSV backfill must reach review.
+  if (kind === 'csv' || kind === 'xlsx') return { verdict: 'invoice', reason: null, chars };
+  // A forwarded email, a Word file or an HTML page needs an amount, like a body.
+  if ((kind === 'eml' || kind === 'docx' || meta?.format === 'html') && !MONEY_RX.test(t)) {
+    return { verdict: 'not_an_invoice', reason: linkedFileIn(t) ? SKIP_REASONS.LINKED_FILE : SKIP_REASONS.NO_AMOUNT, chars };
+  }
+  // An email body (or a pasted text) is an invoice only if it names an amount:
+  // a one-line "please pay $500 for September" reaches review, a forward whose
+  // only content is a OneDrive link to the receipt does not (2026-10-13).
+  if (kind === 'text' || meta?.format === 'email_body') {
+    if (MONEY_RX.test(t)) return { verdict: 'invoice', reason: null, chars };
+    return { verdict: 'not_an_invoice', reason: linkedFileIn(t) ? SKIP_REASONS.LINKED_FILE : SKIP_REASONS.NO_AMOUNT, chars };
   }
   if (chars < minChars && !MONEY_RX.test(t) && !INVOICE_WORDS_RX.test(t)) {
     return { verdict: 'not_an_invoice', reason: chars === 0 ? SKIP_REASONS.NO_TEXT : SKIP_REASONS.TOO_LITTLE_TEXT, chars };

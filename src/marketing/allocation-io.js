@@ -13,7 +13,7 @@
  * insert happen only after the rows exist in memory.
  */
 import supabaseDefault from '../supabase.js';
-import { allocateExpense, splitPeriodByMonth, splitsBySource, HOLD_MARKET } from './allocation.js';
+import { allocateExpense, splitPeriodByMonth, splitsBySource, splitsEvenly, HOLD_MARKET } from './allocation.js';
 
 const LOG = '[MktAlloc]';
 
@@ -48,7 +48,7 @@ export async function previewAllocation(expense, deps = {}) {
   const slices = splitPeriodByMonth(expense.period_start, expense.period_end, expense.amount);
   const counts = {};
   const holdOnly = (expense.eligible_markets || []).length === 1 && expense.eligible_markets[0] === HOLD_MARKET;
-  if (!holdOnly && ((expense.eligible_markets || []).length > 1 || splitsBySource(expense))) {
+  if (!holdOnly && !splitsEvenly(expense) && ((expense.eligible_markets || []).length > 1 || splitsBySource(expense))) {
     for (const s of slices) {
       counts[s.month] = await issuedByMarketFor({ from: s.month, to: monthLastDay(s.month), subSources: expense.lp_sub_sources }, deps);
     }

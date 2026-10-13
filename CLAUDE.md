@@ -589,6 +589,31 @@ Brad's XLSX (`marketing-cost-report`, formulas never typed values) read `v_marke
 - **Vendors are data, not code.** JMJ Digital Marketing → Vis PPC (the user, 2026-10-13) was added straight to
   `marketing_vendors`; it bills from a gmail.com mailbox, so it matches by its printed name (the longest alias wins, so
   "JMJ Digital Marketing" beats a line item's "Google Ads").
+- **Software that serves no one office is split EVENLY over all six offices (the user, 2026-10-13: Hatch).** A line
+  whose `eligible_markets` holds `ALL_OFFICES` is allocated `equal` over `OFFICE_MARKETS` whatever the issued leads say,
+  needs no sub-source (its rows carry the typed one, else `Company-wide`), and is never blocked on one. A vendor with
+  `eligible_markets = '{ALL_OFFICES}'` makes every invoice of theirs split that way. Houston and Winston-Salem have no
+  office, so they are not in the six.
+- **The Edit form can add what is missing (the user, 2026-10-13).** "New vendor" creates the vendor on Save (or uses
+  the one with that name or alias), "How to split" is by the sub-source's issued leads / evenly across all offices /
+  only the markets picked, and "Remember" writes the sub-source and split onto the vendor for its next invoices. Picking
+  a vendor with the form's sub-source and split left blank takes the vendor's own.
+- **One invoice, one document (the user, 2026-10-13: "prevent and eliminate duplicates").** A body's sha is taken
+  after Outlook's per-send noise is stripped (`bodyShaText`: `[cid:…]`, safe-links), and after analysis
+  `findDuplicateInvoice` drops a document whose invoice number AND total match an existing one (unless both vendors are
+  known and differ; a rejected one never counts), remembered as `duplicate_invoice` in `marketing_invoice_skips`.
+- **Nothing sits on the Failed list (the user, 2026-10-13).** A failure a retry cannot fix removes the document and its
+  rows (`removeDocument`) and posts one line naming the file and the error; a service outage keeps the row for n8n's
+  retry, and `purgeStaleFailedDocuments` (nightly) removes one still failed a day later, with one line.
+- **Every email format the inbox gets is read, or named (the user, 2026-10-13: "reliably extract information and data
+  from emails in various formats").** `extract-client.js` reads PDF and images (the service), CSV, XLSX, Word `.docx`,
+  HTML (`htmlToText`: tables as " | ", entities decoded, link targets kept), a forwarded `.eml` with every attachment
+  inside it (`emlToText`, inline/small images skipped), and the email body from the plain AND the HTML part
+  (`cleanEmailBody`: the one naming an amount wins). Old `.xls` / `.doc` / `.msg` come back `unsupported` and the review
+  channel is told to resend as PDF; a body that only LINKS the file (OneDrive, SharePoint, Drive) gets the same kind of
+  note (`linked_file`), never a $0 card. The rules read receipts too ("Receipt #", "Amount paid", "Date paid", ordinals,
+  "Oct 1 – Nov 1, 2026" with one year, "Amount Due | $X" table rows, QuickBooks' "amount due on invoice 1883 is $X").
+  `scripts/test-marketing-invoice-formats.js` holds one sample per format: a new format seen live goes there first.
 - **REECE_HOLD money is never spread by code (D4).** Lead Gurus "Unknown" / "Out Of Area" and the daily territory gap
   (09-22: $4,763.59) sit on `REECE_HOLD`; `src/marketing/holds.js` writes a RECOMMENDATION (matched LP lead → branch,
   else zip → service area) and a person applies it. The feed is provisional until the invoice supersedes it
@@ -602,7 +627,7 @@ Brad's XLSX (`marketing-cost-report`, formulas never typed values) read `v_marke
   analysis saved. Now `triageExtraction` (`src/marketing/invoice-triage.js`, pure) runs right after extraction and BEFORE
   storage or the model: under 40 characters with no money figure and no invoice word is `not_an_invoice`, remembered by
   sha in `marketing_invoice_skips` (never a document; the next email answers `duplicate + skipped` with no OCR). A CSV,
-  XLSX or email body is never triaged out. `fillRowDefaults` makes every row insertable: a missing period becomes the
+  XLSX is never triaged out; an email body needs an amount (2026-10-13, below). `fillRowDefaults` makes every row insertable: a missing period becomes the
   invoice date (else the day received) and the card says "assumed from the invoice date"; a missing total becomes `$0`,
   which blocks Approve until Edit. The flags (`missing_period` / `missing_total`) still block auto-approve. The analysis
   is saved before the rows are written. A deterministic failure answers **200 + `success:false`** (n8n reports it once);

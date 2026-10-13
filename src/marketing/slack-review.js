@@ -12,6 +12,7 @@
  */
 import { escapeMrkdwn } from '../slack-approvals-core.js';
 import { FLAG_LABELS } from './expense-builder.js';
+import { ALL_OFFICES, splitKind } from './allocation.js';
 
 export const MKT_INVOICE_ACTION_PREFIX = 'mktinv_';
 export const ACTION_MKTINV_APPROVE = 'mktinv_approve';
@@ -28,8 +29,24 @@ const usd = (n) => (n == null || Number.isNaN(Number(n)) ? '—' : `$${Number(n)
 const short = (id) => String(id || '').slice(0, 8);
 
 export function marketLabel(code) {
+  if (code === ALL_OFFICES) return 'All offices, split evenly';
   return MARKET_OPTIONS.find(([c]) => c === code)?.[1] || code;
 }
+
+/** How a line's money is split, in plain words (2026-10-13). */
+export function splitLabel(row) {
+  const k = splitKind(row);
+  if (k === 'even') return '_all offices, split evenly_';
+  if (k === 'by_source') return (row.lp_sub_sources || []).length ? '_markets by issued leads_' : '_no market_';
+  return (row.eligible_markets || []).map(marketLabel).join(', ');
+}
+
+/** The three ways the Edit form can split a line. */
+export const SPLIT_OPTIONS = Object.freeze([
+  ['by_source', 'By the sub-source\'s issued leads (lead vendors)'],
+  ['even', 'Evenly across all offices (software, company-wide)'],
+  ['markets', 'Only the markets picked below'],
+]);
 
 function extractionLine(extraction) {
   if (!extraction) return 'extraction: unknown';
@@ -78,7 +95,7 @@ export function buildReviewCard({
   ].join('\n');
 
   const lineText = rows.length
-    ? rows.map((r) => `• ${usd(r.amount)} — ${escapeMrkdwn(r.description || 'line')} → ${escapeMrkdwn((r.lp_sub_sources || []).join(', ') || 'sub-source?')} · ${(r.eligible_markets || []).map(marketLabel).join(', ') || ((r.lp_sub_sources || []).length ? '_markets by issued leads_' : '_no market_')}`).join('\n')
+    ? rows.map((r) => `• ${usd(r.amount)} — ${escapeMrkdwn(r.description || 'line')} → ${escapeMrkdwn((r.lp_sub_sources || []).join(', ') || 'sub-source?')} · ${splitLabel(r)}`).join('\n')
     : '_no lines_';
 
   const allocText = allocation.length
@@ -132,6 +149,9 @@ export function buildEditView({ document, vendor, facts, rows = [], vendors = []
   const vendorInitial = vendor ? vendorOptions.find((o) => o.value === String(vendor.id)) : null;
   const marketOptions = MARKET_OPTIONS.map(([c, l]) => ({ text: { type: 'plain_text', text: l }, value: c }));
   const marketInitial = marketOptions.filter((o) => (first.eligible_markets || []).includes(o.value));
+  const splitOptions = SPLIT_OPTIONS.map(([v, l]) => ({ text: { type: 'plain_text', text: l }, value: v }));
+  const splitInitial = splitOptions.find((o) => o.value === splitKind(first));
+  const rememberOption = { text: { type: 'plain_text', text: 'Use this vendor, sub-source and split for this vendor\'s next invoices' }, value: 'remember' };
   const input = (block_id, label, element) => ({ type: 'input', block_id, label: { type: 'plain_text', text: label }, element, optional: true });
   return {
     type: 'modal',
@@ -142,12 +162,17 @@ export function buildEditView({ document, vendor, facts, rows = [], vendors = []
     close: { type: 'plain_text', text: 'Cancel' },
     blocks: [
       input('vendor', 'Vendor', { type: 'static_select', action_id: 'mktinv_v_vendor', options: vendorOptions, ...(vendorInitial ? { initial_option: vendorInitial } : {}) }),
+      // 2026-10-13 (the user): "allow editing and adding options when they
+      // don't already exist". A vendor typed here is created on Save.
+      input('new_vendor', 'New vendor (only if it is not in the list above)', { type: 'plain_text_input', action_id: 'mktinv_v_new_vendor', initial_value: vendor ? '' : String(facts?.vendor_name_hint || '').slice(0, 150) }),
       input('invoice_number', 'Invoice #', { type: 'plain_text_input', action_id: 'mktinv_v_invoice_number', initial_value: String(facts?.invoice_number || '') }),
       input('period_start', 'Period start', { type: 'datepicker', action_id: 'mktinv_v_period_start', ...(facts?.period_start ? { initial_date: facts.period_start } : {}) }),
       input('period_end', 'Period end', { type: 'datepicker', action_id: 'mktinv_v_period_end', ...(facts?.period_end ? { initial_date: facts.period_end } : {}) }),
       input('amount', rows.length > 1 ? 'Total (leave blank to keep the lines as they are)' : 'Amount', { type: 'plain_text_input', action_id: 'mktinv_v_amount', initial_value: first.amount != null ? String(first.amount) : '' }),
-      input('sub_source', 'LP sub-source (exact lead_source_detail)', { type: 'plain_text_input', action_id: 'mktinv_v_sub_source', initial_value: (first.lp_sub_sources || []).join(', ') }),
-      input('markets', 'Markets (leave empty to split by the sub-source\'s issued leads)', { type: 'multi_static_select', action_id: 'mktinv_v_markets', options: marketOptions, ...(marketInitial.length ? { initial_options: marketInitial } : {}) }),
+      input('sub_source', 'LP sub-source (type a new one if needed; leave empty for software)', { type: 'plain_text_input', action_id: 'mktinv_v_sub_source', initial_value: (first.lp_sub_sources || []).join(', ') }),
+      input('split', 'How to split the cost', { type: 'radio_buttons', action_id: 'mktinv_v_split', options: splitOptions, ...(splitInitial ? { initial_option: splitInitial } : {}) }),
+      input('markets', 'Markets (only for "Only the markets picked below")', { type: 'multi_static_select', action_id: 'mktinv_v_markets', options: marketOptions, ...(marketInitial.length ? { initial_options: marketInitial } : {}) }),
+      input('remember', 'Remember', { type: 'checkboxes', action_id: 'mktinv_v_remember', options: [rememberOption], initial_options: [rememberOption] }),
     ],
   };
 }
@@ -165,5 +190,20 @@ export function parseEditSubmission(stateValues = {}) {
     amount: num(get('amount', 'value')),
     lp_sub_sources: list(get('sub_source', 'value')),
     eligible_markets: (get('markets', 'selected_options') || []).map((o) => o.value),
+    new_vendor: String(get('new_vendor', 'value') || '').trim().slice(0, 150) || null,
+    split: get('split', 'selected_option')?.value || null,
+    remember: (get('remember', 'selected_options') || []).some((o) => o.value === 'remember'),
   };
+}
+
+/**
+ * The eligible_markets a submitted split means: [] = by the sub-source's
+ * issued leads, [ALL_OFFICES] = evenly over every office, else the markets
+ * picked. null = the form said nothing about markets (keep what the line has).
+ */
+export function marketsForSplit({ split, eligible_markets = [] }) {
+  if (split === 'even') return [ALL_OFFICES];
+  if (split === 'by_source') return [];
+  if (split === 'markets') return eligible_markets.length ? eligible_markets : null;
+  return eligible_markets.length ? eligible_markets : null;
 }
