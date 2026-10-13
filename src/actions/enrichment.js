@@ -56,7 +56,7 @@
  */
 
 import supabase from '../supabase.js';
-import { formatPhone, formatDateTime, formatLpSource } from '../format-helpers.js';
+import { formatDateTime, formatLpSource, slackPhone } from '../format-helpers.js';
 import { PROSPECT_UNASSIGNED } from './notification-classifier.js';
 import { isLPLeadId } from './helpers.js';
 
@@ -425,7 +425,8 @@ export function buildRichNotification({ baseMessage, name, phone, contactId, pro
   // v4.1: headerEmoji defaults to 🤖 for backward compat. Channel-specific
   // notifications (send-message-handler v3.6) pass 📱/📧.
   lines.push(`${headerEmoji} ${baseMessage}`);
-  const displayPhone = formatPhone(phone);
+  // Slack cards print the number as digits only (the user, 2026-10-13).
+  const displayPhone = slackPhone(phone);
   const nameLine = `👤 ${name || 'Unknown'}${displayPhone ? ` ${displayPhone}` : ''}`;
   lines.push(nameLine);
   const idLabel = isLPLeadId(contactId) ? 'LP Lead ID' : 'Contact ID';

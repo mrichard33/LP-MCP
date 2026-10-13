@@ -324,25 +324,20 @@ test('no stored stage: a yes to the bridge asks the count once, then the answer 
   assert.equal(known.step, 'offer_slots');
 });
 
-test('a lead who already had the visit (post-demo, rehash) is never asked the qualifying questions', async () => {
+test('a lead past its demo (postDemoLead) is never asked the count or the qualifying questions', async () => {
   const P = await import('../src/agentic/nepq-planner.js');
   const SL = [{ iso: '2026-10-06T14:00:00Z', day: 'Tue, Oct 6', time: '10:00 AM' }, { iso: '2026-10-07T18:00:00Z', day: 'Wed, Oct 7', time: '2:00 PM' }];
   const bridge = 'Based on what you told me, the next step would be a free visit at your home. Would that help?';
-  const p = P.planNepqTurn({ channel: 'sms', trigger: 'Yes please', conversation: thread(['o', bridge], ['i', 'Yes please']), slots: SL, tzLabel: 'ET', alreadyQualified: true });
+  const p = P.planNepqTurn({ channel: 'sms', trigger: 'Yes please', conversation: thread(['o', bridge], ['i', 'Yes please']), slots: SL, tzLabel: 'ET', postDemoLead: true });
   assert.notEqual(p.qualify_item, 'openings');
+  assert.notEqual(p.step, 'not_eligible');
+  // A stated single window is not checked either.
+  const one = P.planNepqTurn({ channel: 'sms', trigger: 'Just one window', conversation: thread(['o', bridge], ['i', 'Just one window']), slots: SL, tzLabel: 'ET', postDemoLead: true });
+  assert.notEqual(one.step, 'not_eligible');
   // Even with the stored stage driving the plan, no gate item.
-  const staged = P.planNepqTurn({ channel: 'sms', trigger: 'Yes please', conversation: thread(['o', bridge], ['i', 'Yes please']), slots: SL, tzLabel: 'ET', stage: { stage: 'problem', facts: {} }, alreadyQualified: true });
+  const staged = P.planNepqTurn({ channel: 'sms', trigger: 'Yes please', conversation: thread(['o', bridge], ['i', 'Yes please']), slots: SL, tzLabel: 'ET', stage: { stage: 'problem', facts: {} }, postDemoLead: true });
   assert.notEqual(staged.step, 'qualify');
-  // The guard asks no minimum check and declines nothing; claim fixes still run.
-  assert.equal(J.enforceJobScope(OFFER, { thread: [], inbound: 'I just need one window replaced', alreadyQualified: true }).changed, false);
-  assert.equal(J.enforceJobScope(OFFER, { thread: [], inbound: 'we rent it out', alreadyQualified: true }).changed, false);
-  assert.equal(J.enforceJobScope('We also have non-impact options.', { alreadyQualified: true }).text, 'Every window and door we sell is hurricane impact-rated.');
-});
-
-test('leadAlreadyQualified reads the demo, a post-demo disposition and the rehash tags', async () => {
-  const { leadAlreadyQualified } = await import('../src/live-chat/fast-lane.js');
-  assert.equal(leadAlreadyQualified({ lp: { demo_completed: true }, lead: { current_tags: [] } }), true);
-  assert.equal(leadAlreadyQualified({ lp: {}, lead: { current_tags: ['rehash'] } }), true);
-  assert.equal(leadAlreadyQualified({ lp: {}, lead: { current_tags: ['active-f.0'] } }), true);
-  assert.equal(leadAlreadyQualified({ lp: {}, lead: { current_tags: ['booked-estimate'] } }), false);
+  // The bots run the guard with no thread for such a lead: nothing declined, our claims still fixed.
+  assert.equal(J.enforceJobScope(OFFER, {}).changed, false);
+  assert.equal(J.enforceJobScope('We also have non-impact options.', {}).text, 'Every window and door we sell is hurricane impact-rated.');
 });

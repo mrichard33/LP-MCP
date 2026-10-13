@@ -220,7 +220,7 @@ const ageText = (min) => (min < 60 ? `${min} min` : `${Math.floor(min / 60)}h ${
 export function waitLine(item) {
   const { row } = item;
   const name = [row.first, row.last].filter(Boolean).join(' ') || 'No name';
-  const phone = row.phone ? `…${row.phone.slice(-4)}` : 'no phone';
+  const phone = row.phone ? String(row.phone).replace(/\D/g, '') : 'no phone'; // full number, digits only (2026-10-13)
   const from = [row.sender, row.sourceDetail || row.source].filter(Boolean).join(' / ') || 'unknown source';
   const appt = row.apptDate ? `appt ${row.apptDate}${row.apptTime ? ` ${row.apptTime}` : ''}` : 'no appt';
   return `• ${name} · ${phone} · inquiry ${row.in1} · ${from} · ${appt} · waiting ${ageText(item.waitMin)} · ${row.brn || 'no market'}`;

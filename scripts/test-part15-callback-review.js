@@ -155,7 +155,7 @@ test('the not-dialed card names the 7-hour gap when an earlier call explains it'
   const filed = Date.parse('2026-10-05T16:00:00Z');
   const card = formatNotDialedCard({ name: 'Linda Moore', phone: '3527741332', contactId: 'C1', filedMs: filed, nowMs: filed + 20 * 60000, priorCalls: [{ atMs: filed - 47 * 60000, campaign: 'Resets-Hot' }] });
   assert.match(card, /PROMISED CALL NOT MADE YET/);
-  assert.match(card, /\(352\) 774-1332/);
+  assert.match(card, /3527741332/);
   assert.match(card, /47 min before they asked \(Resets-Hot\).*7 hours/);
   assert.match(card, /in the 24 hours before they asked: 1/);
   assert.match(card, /Please call them now/);

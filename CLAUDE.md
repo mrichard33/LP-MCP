@@ -33,6 +33,13 @@ mirror do the rest:
 Because the mirror sits below the card builders, there is no second copy of any message format.
 Build the card once.
 
+**A customer phone on a card is 10 digits, nothing else (the user, 2026-10-13).** "List the number with numbers only
+##########": `3525550188`, the FULL number (the old last-four `…0188` cards included), no +1, dashes, dots, spaces or
+parentheses. Card builders use `slackPhone` (`src/format-helpers.js`); `normalizeSlackPhones` / `normalizeSlackBlocks`
+(`src/slack-phone-format.js`) is the safety net in `postToSlack`, `updateSlackMessage`, the approval `respond()` and the
+GroupMe send (only a phone SHAPE with a separator or a +1 is rewritten, and only block `text`, never a button `value`).
+Customer-facing texts and chat replies keep `(352) 555-0188`.
+
 **When Slack is the PRIMARY destination, not a mirror, use `postToSlack(text, channelId)`** in
 `src/slack.js` — it returns `{ ok, ts, channel, error }`. `mirrorToSlack` fans out to several channels
 and reduces the result to a count, so it cannot tell you the message `ts` or that a specific post
@@ -998,10 +1005,7 @@ on?" / "… to have us come measure?"): the qualifying gate's `openings` item (o
 question on"): without a stored stage `openingsGate` (`nepq-planner.js`) turns the FIRST time offer into the count
 question once (never after times were offered), and the answer replans the conversation as it stood before the
 question, so "about 10" gets the times the "yes" had earned; a job-scope block or check is `not_eligible` in every mode
-(no wasted SMS redraft before the minimum check). **A lead who already had the visit is qualified** (the user, same day):
-`alreadyQualified` (SMS: `rehash || derivePostAppointment(...).post`, NOT gated on `POST_DEMO_PLANNER_MODE`; live chat:
-`leadAlreadyQualified`) skips the count question, the stage gate's items and every lead-side job-scope check (the
-claim fixes still run). The
+(no wasted SMS redraft before the minimum check). A lead past its demo is never asked it (`postDemoLead`, below). The
 count the lead states is SAVED to the GHL fields Window Count (`h9FJTUbmUHIuD6JKmpXv`) and Door Count
 (`j7l1KWmDgoJqy7SINjQs`; a slider is a door), read by code from their newest message (`openingsToSave`), as one
 `update_custom_fields` row (rule `OPENINGS_COUNT_PERSIST`) after the send on both bots; a count already on the contact
@@ -1012,6 +1016,12 @@ has `dq_detected` rental_property / commercial / below_minimum, and an LP note s
 LP note that only DESCRIBES a rental or a commercial property is NOT (the team books those: "owns a rental property …
 estimate for three windows"); as a DQ it would stop-bot live appointments, so those rules read only the lead's words. FAQs LIB-P03/P15 (impact only), LIB-P16/17/18: `sql/seeds/2026-10-13_scope_rules_impact_only.sql`.
 Reminders for Set/Verif only (Cnf and Issue get none) are GHL edits in A.WE-1: `docs/ghl-we-reminders-set-only.md`.
+**A lead past its demo already meets these requirements (the user, 2026-10-13).** `isPostDemoLead`
+(`src/agentic/post-demo-lead.js`: a demo disposition (`isDemoDisposition`) or closed won, or `lp-demo-completed` /
+`stage:post-appointment` / `rehash` / `active-f.0`; never `lp.demo_completed`, which LP sets for NOC) turns off, in both
+bots and whatever `POST_DEMO_PLANNER_MODE` says: the lead-side job-scope and tenant declines (our own false claims are
+still corrected), the qualifying gate and the count question (`postDemoLead` → `gateForStage` / `openingsGate`), the live chat's job-scope booking refusal, the
+set-ND card, and an LP-note DQ whose signal is only renter or below minimum (`REQUIREMENT_SIGNALS`). `checkReply` skips the lead-side check on `ctx.postDemoLead`.
 The live chat also never books in a chat that raised a manufactured home or a 3+ story building (`leadRaisesScope`).
 #1274 (the same rules built a second way, never told the minimum) was closed by the user's ruling. Also fixed: the SMS scope guard compared `scope.reason === 'lead_asked'`, which never matched `'<rule>:lead_asked'`, so a
 declined manufactured home or tall building kept its booking.
@@ -1201,6 +1211,15 @@ live chat never runs `DQ_ABOVE_2ND_FLOOR_INTERIM`). Both are now in the shared s
 `LIB-P14`, and `enforcePropertyScope` (`src/agentic/property-scope.js`), the last pass in both bots: a lead who raises
 one gets the "no" as the whole reply, and any "we do" sentence is replaced. The building counts, not the unit. Modular
 homes are not ruled on and are deliberately not covered; "tower" alone and "4 floor-to-ceiling windows" do not count.
+
+**A commercial or rental lead is set to ND by a person (the user, 2026-10-13).** LP's API cannot change a disposition
+(no endpoint writes one). When the lead's own newest message makes `jobScopeFromThread` (`src/agentic/job-scope.js`)
+block as `commercial` or `rental` (`scopeDqKind`, `src/agentic/scope-dq.js`), the SMS send handler and the live chat
+(after the send) add a note on the LP PROSPECT (`rectype: 'cst'`; `ils` silently no-ops) and post ONE
+`⛔ SET THIS LEAD TO ND IN LP` card to #contact-center (`routeNepqHandoff` reason `scope_dq`, in `NO_DIAL_REASONS`: no
+Five9 call, no `callback:requested`, and the turn's callback decision is skipped), once per contact per kind ever (audit
+`scope_dq`, permanent). Below the minimum is not included (not asked). `SCOPE_DQ_MODE` off|shadow|live, default live.
+Production deps: `src/services/scope-dq-io.js`.
 
 **Retiring a FAQ without a replacement leaves a hole the search fills with the nearest thing.**
 Retiring `#14` (roofing) during the golden ingest left no roofing answer at all, and a live lead

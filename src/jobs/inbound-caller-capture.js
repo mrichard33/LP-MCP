@@ -408,7 +408,8 @@ export async function measureCallers({ nowMs = Date.now(), hours = null, deps = 
 /* --- acting on one caller ------------------------------------------------ */
 
 function phoneDisplay(p) {
-  return p && p.length === 10 ? `${p.slice(0, 3)}-${p.slice(3, 6)}-${p.slice(6)}` : String(p || '');
+  // Digits only on the card (the user, 2026-10-13).
+  return String(p || '').replace(/\D/g, '');
 }
 
 /** The GHL `source` a created contact carries. */

@@ -28,6 +28,7 @@
 import { createLiveChatFastLane, minimalContext } from '../live-chat/fast-lane.js';
 import { BOOKING_CALENDARS } from '../knowledge/booking-calendar-router.js';
 import { callbackDecision, schedulingCallbackDecision, NO_DIAL_REASONS } from '../agentic/bot-callback.js';
+import { scopeDqKind } from '../agentic/scope-dq.js';
 import { applyBookingTruth } from '../agentic/booking-claim.js';
 import { buildLeadFacts } from '../agentic/lead-facts.js';
 import { scoreRun, compareScorecards } from './sim-scoring.js';
@@ -253,6 +254,8 @@ export async function simulateLiveChat(plan, { nepqMode = 'live', productionDeps
       else if (NO_DIAL_REASONS.has(a.reason)) record('would_post_review_card_no_five9', { reason: a.reason, extra: a.extra || null });
       else record('would_file_callback_five9_and_contact_center', { reason: `${a.reason}, ${a.why || 'planned'}` });
     },
+    // 2026-10-13: the LP note + set-ND card. Recorded here, never done.
+    scopeDq: async (a) => { record('would_ask_nd_in_lp', { reason: a.kind }); return { done: false, reason: 'simulated' }; },
   });
 
   const transcript = [];
@@ -362,7 +365,10 @@ export async function simulateSms(plan, { nepqMode = 'live', generate, buildReal
     if (truthBlocked) wouldDo.push({ kind: 'booking_claim_blocked', reason: truthBlocked.reason });
     if (generated?.lp_note_dq) wouldDo.push({ kind: 'would_stop_bot_lp_note_dq', reason: generated.lp_note_dq.signal });
     const scheduling = generated && !generated.service_conversation ? schedulingCallbackDecision({ bookingClaimBlocked: !!truthBlocked, onFile: !!generated.appointment_on_file }) : null;
-    const cb = !reply ? null
+    // 2026-10-13: a commercial property or a rental unit → the set-ND card, never a call.
+    const scopeKind = reply ? scopeDqKind(text) : null;
+    if (scopeKind) wouldDo.push({ kind: 'would_ask_nd_in_lp', reason: scopeKind });
+    const cb = !reply || scopeKind ? null
       : generated?.lp_note_dq ? { why: 'lp_note_dq', reason: 'lp_note_dq', kind: 'sales' }
       : (generated?.nepq_handoff || generated?.dm_handoff) ? callbackDecision({ handoffReason: generated?.nepq_handoff?.reason || null, otherHandoff: !!generated?.dm_handoff, text: reply })
         : generated?.callback_requested ? { why: 'classifier_callback', reason: generated.callback_requested, kind: generated.callback_requested === 'service' ? 'service' : 'sales' }

@@ -414,7 +414,9 @@ export function formatCancelCard({ kind, name, phone, apptHuman, newTimeHuman, g
   }[kind === 'rescheduled' || kind === 'reschedule' ? kind : 'cancel'];
   return [
     ...lines,
-    `Phone: ${phone ? formatPhone(phone) : 'not given'}`,
+    // The #dispatch card prints digits only (the user, 2026-10-13); the reply to the
+    // customer keeps formatPhone.
+    `Phone: ${phone ? String(phone).replace(/\D/g, '').replace(/^1(?=\d{10}$)/, '') : 'not given'}`,
     marketNote || null,
     visitorWords ? `They said: "${String(visitorWords).slice(0, 300)}"` : null,
     contactUrl ? `Contact: ${contactUrl}` : null,

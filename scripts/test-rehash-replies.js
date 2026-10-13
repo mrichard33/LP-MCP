@@ -154,7 +154,7 @@ test('card: posted to #contact-rehash with name, time, phone and contact link; r
   assert.match(card, /REHASH CALL REQUEST/);
   assert.match(card, /Susan \(post-demo, F\.0\) said yes to a call with Alex\./);
   assert.match(card, /Best time: tomorrow after 3/);
-  assert.match(card, /Phone: \+13525550100/);
+  assert.match(card, /Phone: 3525550100$/m); // digits only (2026-10-13)
   assert.match(card, /contacts\/detail\/C1/);
   assert.match(state.events[0].idempotency_key, /^f0_rehash_call_C1_\d{4}-\d{2}-\d{2}$/);
 });

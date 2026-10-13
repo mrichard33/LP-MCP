@@ -36,6 +36,23 @@ export function formatPhone(phone) {
 }
 
 /**
+ * A customer phone as a Slack (and GroupMe) card prints it: digits only, no
+ * symbols or spacing (the user, 2026-10-13: "list the number with numbers
+ * only ##########"), the FULL number, never the last 4.
+ * +13525550188 / (352) 555-0188 / 352-555-0188 → 3525550188.
+ * Anything that is not a US number keeps its digits (never invented); empty
+ * → null, so each card keeps its own "no phone on file" text.
+ * Customer-facing texts and chat replies keep formatPhone.
+ */
+export function slackPhone(phone) {
+  if (phone === null || phone === undefined) return null;
+  const digits = String(phone).replace(/\D/g, '');
+  if (!digits) return null;
+  if (digits.length === 11 && digits[0] === '1') return digits.slice(1);
+  return digits;
+}
+
+/**
  * Format a date/time string for human display.
  * Handles multiple input formats:
  *   ISO:        2026-04-09T10:00:00+00:00 → 04/09/2026 at 10:00 AM

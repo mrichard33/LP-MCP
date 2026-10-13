@@ -2167,7 +2167,7 @@ export async function executeRemoveNumbersFromDncApproved(action, deps = {}) {
 export function assertDncRemoved(numbers, newState) {
   const still = newState?.on_dnc || [];
   if (still.length) {
-    throw new Error(`Five9 still lists ${still.length} of ${(numbers || []).length} number(s) on DNC after removeNumbersFromDnc (${still.map((n) => `…${String(n).slice(-4)}`).join(', ')})`);
+    throw new Error(`Five9 still lists ${still.length} of ${(numbers || []).length} number(s) on DNC after removeNumbersFromDnc (${still.map((n) => String(n).replace(/\D/g, '')).join(', ')})`);
   }
 }
 

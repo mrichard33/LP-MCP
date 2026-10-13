@@ -298,3 +298,14 @@ test('an address ask is never deleted as a zip re-ask (the SMS hold that stopped
   assert.equal(P.asksForKnown("What's the street address for the visit, including the zip code?", { zip: '33908' }), false);
   assert.equal(P.asksForKnown("What's the zip code at the home?", { zip: '33908' }), true);
 });
+
+test('a lead past its demo gets no qualifying question and no job-scope block (the user, 2026-10-13)', () => {
+  const convo = thread(['o', 'Would a quick visit to measure help?']);
+  const before = plan(convo, 'Yes, but we rent it out', { stage: { stage: 'problem', facts: {} } });
+  assert.equal(before.step, 'not_eligible', 'before the demo a rental is blocked');
+  const p = plan(convo, 'Yes, but we rent it out', { stage: { stage: 'problem', facts: {} }, postDemoLead: true });
+  assert.notEqual(p.step, 'qualify');
+  assert.notEqual(p.step, 'not_eligible');
+  const q = plan(convo, 'yes', { stage: { stage: 'qualifying', facts: {} }, postDemoLead: true });
+  assert.equal(q.qualify_item, undefined);
+});

@@ -43,7 +43,7 @@
  *   rep channel.
  */
 
-import { formatPhone, formatLpSource } from '../format-helpers.js';
+import { formatLpSource, slackPhone } from '../format-helpers.js';
 
 // ══════════════════════════════════════════════════════════════════════
 // CLASS DEFINITIONS
@@ -233,7 +233,8 @@ export function buildClassifiedNotification(args = {}) {
   lines.push(`${klass.emoji} ${klass.label} — ${verb}`);
   lines.push('');
 
-  const displayPhone = formatPhone(phone);
+  // Slack cards print the number as digits only (the user, 2026-10-13).
+  const displayPhone = slackPhone(phone);
   lines.push(`👤 ${name || 'Unknown'}${displayPhone ? ` | ${displayPhone}` : ''}`);
   lines.push(`Contact ID: ${contactId || 'unknown'}`);
 

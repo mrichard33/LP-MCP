@@ -47,6 +47,7 @@ import {
 } from './lp-post-issue.js';
 import { assertNotTransposed } from './lp-source-ids.js';
 import { lpStoredToUtcMs } from './lp-dates.js';
+import { slackPhone } from './format-helpers.js';
 
 export const POST_ISSUE_AUDIT = 'lp_post_issue_rebook';
 export const EVENT_TYPE = 'lp.post_issue_rebook';
@@ -274,7 +275,7 @@ export function formatPostIssueCard(r, env = process.env) {
   const t = OUTCOME_TEXT[r.outcome] || { why: r.outcome, todo: 'Check the lead in LP.' };
   const lines = [
     r.mode === 'live' ? '🧾 *LP lead needs a person: appointment on an issued lead*' : `🕶️ *Post-issue rule (shadow): live would have done ${r.would_do || r.outcome}*`,
-    `👤 ${r.contact_name || r.contact_id}${r.phone ? ` · ${r.phone}` : ''}`,
+    `👤 ${r.contact_name || r.contact_id}${r.phone ? ` · ${slackPhone(r.phone)}` : ''}`,
     `🆔 Prospect ${r.lp_prospect_id || '?'} · issued lead ${r.issued_lead_id || '?'} (${r.issued_disposition || 'no disposition'}, ${r.issued_reason || '?'})`,
     `📅 Requested: ${r.appt_date || '?'} ${r.appt_time || ''}`.trim(),
     `Reason: ${r.reason || r.outcome}`,

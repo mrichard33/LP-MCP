@@ -774,7 +774,7 @@ test('called numbers match Five9 times stored to the microsecond', async () => {
 test('card: plain English, names the phone, says nothing is texted', () => {
   const act = buildApprovalAction({ ...call('8130000001'), caller_phone: '8130000001', label: 'no_ghl_contact', ghl_contact_id: null }, { runAt: NOW });
   const line = describeApprove(act);
-  assert.match(line, /Creates a GHL contact for \(?813\)?[ -]?000-0001/);
+  assert.match(line, /Creates a GHL contact for 8130000001/);
   assert.match(line, /8e30ff37/);
   assert.match(line, /Nothing is texted or booked/);
   assert.match(act.reasoning, /talked 3.5 min with Doe, Jane - LF \(lightfire, Google PPC Windows\)/);

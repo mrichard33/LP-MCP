@@ -69,6 +69,7 @@ import {
   BUSINESS_HOUR_START_ET,
   BUSINESS_HOUR_END_ET,
 } from './services/lp-ghl-appointment-reconciler.js';
+import { slackPhone } from './format-helpers.js';
 
 const LP_ADDLEAD_URL =
   process.env.LP_ADDLEAD_URL || 'http://lppost.leadperfection.com/br27/addlead';
@@ -287,7 +288,7 @@ async function sendStripCard({ body, plan, mode }) {
   await sendGroupMeMessage(
     `🚨 ADDLEAD APPOINTMENT ${mode === 'shadow' ? 'FLAGGED' : 'STRIPPED'} — ${plan.reason}\n` +
     `👤 ${name}\n` +
-    `📞 ${body.phone1 || 'no phone'} | Sender: ${body.sender || '?'}\n` +
+    `📞 ${slackPhone(body.phone1) || 'no phone'} | Sender: ${body.sender || '?'}\n` +
     `📅 Sent time: ${body.adate || '?'} ${body.atime || '?'}${plan.hour != null ? ` (hour ${plan.hour} ET)` : ''}\n` +
     shadowLine +
     // The duplicate case needs the OTHER lead ids to be actionable at all —

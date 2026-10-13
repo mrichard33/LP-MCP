@@ -1418,13 +1418,13 @@ export function planNepqTurn(args = {}) {
  *  - the turn after it, the answer resumes the plan we set aside: the
  *    conversation is replanned as it stood before the count question, so
  *    "about 10" gets the times the "yes" had earned.
- * A job we cannot take (job-scope.js) gets no times at all, and a lead who
- * already had the visit (post-demo, rehash) is never asked again (the user,
+ * A job we cannot take (job-scope.js) gets no times at all, and a lead past
+ * its demo (`postDemoLead`, post-demo-lead.js) is never asked again (the user,
  * same day: "assume the lead is already qualified"). Pure.
  */
 function openingsGate(args) {
   const plan = planNepqTurnCore(args);
-  if (!plan || plan.handoff || plan.post_demo || plan.step === 'booked' || args.alreadyQualified) return plan;
+  if (!plan || plan.handoff || plan.post_demo || plan.step === 'booked' || args.postDemoLead) return plan;
   const turns = normalizeThread(args.conversation, args.trigger);
   const js = jobScopeFromThread(turns);
   if (js.block || js.check) return notEligible(plan, js);
@@ -1496,8 +1496,9 @@ const TIME_STEPS = new Set(['offer_slots', 'confirm', 'ask_day', 'collect']);
  * address, decision maker); only ownership holds it. Pure.
  */
 function gateForStage(plan, args) {
-  // A lead who already had the visit is qualified (the user, 2026-10-13).
-  if (!plan || plan.handoff || plan.post_demo || plan.step === 'booked' || args.alreadyQualified) return plan;
+  // A lead past its demo already meets the requirements (the user, 2026-10-13):
+  // no qualifying question and no job-scope block, whatever POST_DEMO_PLANNER_MODE says.
+  if (!plan || plan.handoff || plan.post_demo || args?.postDemoLead || plan.step === 'booked') return plan;
   const offersTimes = !!plan.allowed?.slot_offer || (plan.slots_to_offer || []).length > 0 || TIME_STEPS.has(plan.step) || plan.required_move === 'bridge' || !!plan.offer_slots_pending;
   if (!offersTimes) return plan;
   const turns = normalizeThread(args.conversation, args.trigger);

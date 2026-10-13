@@ -65,7 +65,6 @@ function sentences(text) {
  * @param {boolean}[ctx.callOfferOk]    the plan's goal is a call (a post-demo lead), so an offer is never unasked
  * @param {boolean}[ctx.rehash]         a rehash (post-demo) lead; undefined skips the rehash call-timing check
  * @param {boolean}[ctx.callbackFiled]  this turn filed a callback (a hand-off): any call it promises is backed
- * @param {boolean}[ctx.alreadyQualified] a post-demo / rehash lead: the lead-side job-scope checks do not apply
  * @returns {{ pass: boolean, violations: Array<{code: string, detail: string}>, skipped: string[], metrics: {chars: number, questions: number} }}
  */
 export function checkReply(reply, ctx = {}) {
@@ -101,8 +100,9 @@ export function checkReply(reply, ctx = {}) {
   // No rentals, no commercial, the minimum, impact-only (the user, 2026-10-13).
   // The lead's side needs the thread (was the minimum already asked?); with no
   // thread only our own claims are checked.
-  if (Array.isArray(ctx.conversation)) {
-    const job = enforceJobScope(text, { thread: ctx.conversation, inbound: ctx.inbound || '', alreadyQualified: ctx.alreadyQualified === true });
+  // A lead past its demo already meets the requirements (2026-10-13): only our claims.
+  if (Array.isArray(ctx.conversation) && !ctx.postDemoLead) {
+    const job = enforceJobScope(text, { thread: ctx.conversation, inbound: ctx.inbound || '' });
     if (job.changed) fail('job_scope', job.reason);
   } else {
     const job = enforceJobScope(text, {});

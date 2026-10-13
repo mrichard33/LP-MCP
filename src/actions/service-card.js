@@ -17,7 +17,7 @@
  * GROUPME_DEDUP_WINDOW_MIN, default 60) lets exactly one through. Fail-open.
  */
 import { sendGroupMeMessage, _isDuplicateCard } from '../groupme.js';
-import { formatDateTimeUS } from '../format-helpers.js';
+import { formatDateTimeUS, slackPhone } from '../format-helpers.js';
 import { branchName } from '../approval-card.js';
 import { ghlFetch } from './helpers.js';
 
@@ -93,11 +93,9 @@ export function pickIssueText(contact, context = {}) {
   return raw ? shorten(raw, ISSUE_MAX_CHARS) : NO_ISSUE_TEXT;
 }
 
+// Digits only on the card (the user, 2026-10-13).
 export function formatPhone(p) {
-  const digits = String(p || '').replace(/\D/g, '');
-  const n = digits.length === 11 && digits.startsWith('1') ? digits.slice(1) : digits;
-  if (n.length !== 10) return p ? String(p) : 'No phone on file';
-  return `(${n.slice(0, 3)}) ${n.slice(3, 6)}-${n.slice(6)}`;
+  return slackPhone(p) || 'No phone on file';
 }
 
 export function isSoldCustomer(contact) {

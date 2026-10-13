@@ -45,6 +45,7 @@ import {
   BUSINESS_HOUR_START_ET,
   BUSINESS_HOUR_END_ET,
 } from './services/lp-ghl-appointment-reconciler.js';
+import { slackPhone } from './format-helpers.js';
 
 const LP_ADDLEAD_URL =
   process.env.LP_ADDLEAD_URL || 'http://lppost.leadperfection.com/br27/addlead';
@@ -303,7 +304,7 @@ async function sendIntakeCard({ b, plan, mode }) {
   const name = [b.first_name, b.last_name].filter(Boolean).join(' ') || '(no name)';
   await sendGroupMeMessage(
     `🚨 CANVASS APPOINTMENT ${mode === 'shadow' ? 'FLAGGED (shadow)' : plan.action === 'omit' ? 'UNPARSEABLE' : 'STRIPPED'} — ${plan.reason}\n` +
-    `👤 ${name} | 📞 ${b.phone_raw || 'no phone'} | Canvasser: ${b.promoter || '?'}\n` +
+    `👤 ${name} | 📞 ${slackPhone(b.phone_raw) || 'no phone'} | Canvasser: ${b.promoter || '?'}\n` +
     `📅 Raw form value: ${b.preferred_estimate_time || '(blank)'}${plan.hour != null ? ` (hour ${plan.hour} ET)` : ''}\n` +
     (mode === 'shadow'
       ? '🕶️ SHADOW — old workflow chain still handled this lead; nothing was sent or written by the endpoint.\n'
