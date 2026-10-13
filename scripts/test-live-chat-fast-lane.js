@@ -25,6 +25,7 @@ const {
 } = await import('../src/live-chat/fast-lane.js');
 const { AGENT_ACTIONS_COLUMNS } = await import('../src/live-chat/agent-actions-columns.js');
 const { ZIP_ASK_LINE } = await import('../src/agentic/service-area-turn.js');
+const { COMMERCIAL_LINE } = await import('../src/agentic/job-scope.js');
 
 const SECRET = 'test-live-chat-secret';
 
@@ -200,14 +201,23 @@ test('malformed email "alycelyon.wildwoodumc.com" → asks again kindly, never "
 });
 
 test('large job signal → next step offered and a high-priority event for a person', async () => {
-  assert.equal(largeJobSignal('We have 14 windows at our church'), '14 windows');
-  assert.equal(largeJobSignal('I manage an HOA'), 'HOA');
+  assert.equal(largeJobSignal('We have 14 windows in our house'), '14 windows');
+  // 2026-10-13 (the user): an HOA, a church or a building is a commercial
+  // property we do not take, not a large job to advance (job-scope.js).
+  assert.equal(largeJobSignal('I manage an HOA'), null);
   assert.equal(largeJobSignal('two windows in the kitchen'), null);
-  const { lane, state } = makeLane({ llm: () => ({ message: 'We handle church projects. What is the best number to reach you, and someone from our team will follow up?' }) });
-  const out = await lane.processInbound(INBOUND('We have 14 windows at our church that need replacing.'));
+  const { lane, state } = makeLane({ llm: () => ({ message: 'That is a big project. What is the best number to reach you, and someone from our team will follow up?' }) });
+  const out = await lane.processInbound(INBOUND('We have 14 windows in our house that need replacing.'));
   assert.equal(out.large_job, true);
   assert.ok(state.events.some(e => e.event_type === 'agentic.live_chat_large_job' && e.priority === 'high'));
   assert.equal(state.ops.length, 1);
+});
+
+test('a commercial property gets a plain no in live chat, never a pitch (2026-10-13)', async () => {
+  const { lane, state } = makeLane({ llm: () => ({ message: 'We handle church projects. What is the best number to reach you, and someone from our team will follow up?' }) });
+  await lane.processInbound(INBOUND('We have 14 windows at our church that need replacing.'));
+  assert.equal(state.sends.length, 1);
+  assert.equal(state.sends[0].message, COMMERCIAL_LINE);
 });
 
 // ── failure ───────────────────────────────────────────────────────────
@@ -1382,5 +1392,18 @@ test('a renter in live chat gets no times (batch 3 T3; active in every mode)', a
   const { lane } = makeLane({ mode: 'shadow', llm: () => ({ message: "Makes sense, you'll want his okay first. I have Thu, Oct 15 at 10:00 AM ET or Fri, Oct 16 at 2:00 PM ET. Which works better?" }) });
   const out = await lane.processInbound(INBOUND("I'm renting, my landlord would have to approve it"));
   assert.doesNotMatch(out.message, /\d{1,2}:\d{2}\s*(?:AM|PM)/);
-  assert.match(out.message, /homeowner needs to be part of the visit/);
+  // 2026-10-13 (the user): a tenant's home is a rental, which we do not take.
+  assert.match(out.message, /don't work on rental properties/);
+});
+
+test('a stated count is queued for Window Count / Door Count, with real columns only (2026-10-13)', async () => {
+  const { lane, state } = makeLane({ llm: () => ({ message: 'Great, that is a good size project. What got you looking now?' }) });
+  await lane.processInbound(INBOUND('I need 12 windows and 2 doors replaced'));
+  await new Promise(r => setTimeout(r, 20));
+  const row = state.actions.find(a => a.rule_applied === 'OPENINGS_COUNT_PERSIST');
+  assert.ok(row, 'an update_custom_fields row was queued');
+  assert.equal(row.action_type, 'update_custom_fields');
+  assert.deepEqual(row.action_payload.fields, [{ id: 'h9FJTUbmUHIuD6JKmpXv', field_value: 12 }, { id: 'j7l1KWmDgoJqy7SINjQs', field_value: 2 }]);
+  const extra = Object.keys(row).filter(k => k !== 'id' && !AGENT_ACTIONS_COLUMNS.includes(k));
+  assert.deepEqual(extra, []);
 });

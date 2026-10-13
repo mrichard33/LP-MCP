@@ -25,13 +25,14 @@
 import { humanizeReply } from '../agentic/human-voice.js';
 import { enforceTeamVoice } from '../agentic/team-voice.js';
 import { enforcePropertyScope } from '../agentic/property-scope.js';
+import { enforceJobScope } from '../agentic/job-scope.js';
 import { findUnbackedBookingClaim } from '../agentic/booking-claim.js';
 import { enforceCallTiming, promisedCallback, enforceRehashCallTiming } from '../agentic/team-hours.js';
 import { enforceOneAsk } from '../agentic/one-ask.js';
 import { dropUnaskedCallOffer, leadWantsCall, isMoneyFigure, URGENCY_RX, CLAIMS_RX } from '../agentic/nepq-planner.js';
 
 /** Bump when a check is added or changed, so scorecards from two versions are not compared as one. */
-export const INVARIANTS_VERSION = '2026-10-10.2';
+export const INVARIANTS_VERSION = '2026-10-13.1';
 
 /** The prompt's own SMS ceiling (CHANNEL CONSTRAINTS: "320 max"). */
 export const SMS_MAX_CHARS = 320;
@@ -95,6 +96,18 @@ export function checkReply(reply, ctx = {}) {
 
   const scope = enforcePropertyScope(text, { inbound: ctx.inbound || '' });
   if (scope.changed) fail('property_scope', scope.reason);
+
+  // No rentals, no commercial, the minimum, impact-only (the user, 2026-10-13).
+  // The lead's side needs the thread (was the minimum already asked?); with no
+  // thread only our own claims are checked.
+  if (Array.isArray(ctx.conversation)) {
+    const job = enforceJobScope(text, { thread: ctx.conversation, inbound: ctx.inbound || '' });
+    if (job.changed) fail('job_scope', job.reason);
+  } else {
+    const job = enforceJobScope(text, {});
+    if (job.changed) fail('job_scope', job.reason);
+    skipped.push('job_scope_lead_side');
+  }
 
   if (FLORIDA_ONLY_RX.test(text)) fail('florida_only_claim', text.match(FLORIDA_ONLY_RX)[0]);
 

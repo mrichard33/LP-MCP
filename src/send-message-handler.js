@@ -4337,7 +4337,8 @@ export async function executeSendMessage(action, context) {
         if (qd.decision_makers_present) {
           fields.push({ id: 'GH1QGGOseMKmJAMqajiN', field_value: qd.decision_makers_present });
         }
-        if (qd.window_count) {
+        // The code's read of the lead's own words wins over the model's (below).
+        if (qd.window_count && !(generated.openings_fields || []).some(f => f.id === 'h9FJTUbmUHIuD6JKmpXv')) {
           fields.push({ id: 'h9FJTUbmUHIuD6JKmpXv', field_value: qd.window_count });
         }
         if (fields.length) {
@@ -4354,6 +4355,27 @@ export async function executeSendMessage(action, context) {
         }
       } catch (qdErr) {
         console.warn(`[SendMessage] qualifying data persist failed for ${contactId} (fail-soft): ${qdErr.message}`);
+      }
+    }
+
+    // 2026-10-13 (the user): the window / door count the lead stated is saved
+    // to the GHL Window Count and Door Count fields, read by code from their
+    // words (job-scope.js openingsToSave), on any turn. Failure-soft.
+    if (Array.isArray(generated?.openings_fields) && generated.openings_fields.length) {
+      try {
+        const fields = generated.openings_fields;
+        await supabase.from('agent_actions').insert({
+          event_id: action.event_id || null,
+          action_type: 'update_custom_fields', target_system: 'ghl', target_entity: 'contact',
+          target_id: contactId,
+          action_payload: { fields },
+          reasoning: `Lead stated the job size (${fields.map(f => `${f.id === 'h9FJTUbmUHIuD6JKmpXv' ? 'windows' : 'doors'}=${f.field_value}`).join(', ')}): saved to Window Count / Door Count`,
+          confidence: 1.0, rule_applied: 'OPENINGS_COUNT_PERSIST', status: 'pending',
+          requires_approval: false,
+        });
+        console.log(`[SendMessage] openings count queued for ${contactId}: ${fields.map(f => f.field_value).join('/')}`);
+      } catch (ocErr) {
+        console.warn(`[SendMessage] openings count persist failed for ${contactId} (fail-soft): ${ocErr.message}`);
       }
     }
 

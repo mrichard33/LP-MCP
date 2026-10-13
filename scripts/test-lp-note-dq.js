@@ -174,16 +174,23 @@ test('the #contact-center card carries the note, the appointment, the thread and
 
 // 2026-10-07 dry run over 30 days of real notes: transcripts and AI summaries
 // live in lp_notes too, and owners mention their tenants.
-test('only a person\'s statement counts: no transcripts, no questions, no landlord with a tenant', () => {
+test('only a person\'s statement counts: no transcripts, no questions, no owner living with a tenant', () => {
   for (const t of [
     'Role.ASSISTANT: Great. Is this a single family home, mobile home, or condo?',
     "Role.USER: I don't own the land though.",
     'Siro Call Summary: Customer Need & Motivation: renter wants windows',
     'Is it a mobile home?',
-    'Mr has a tenant in the property but he will be meeting us at the home',
     'he is the only h/o however he has a tenant that lives with him.',
-    'He is renting it out to students',
   ]) assert.equal(detectNoteDq([{ text: t }]).dq, false, t);
+  // 2026-10-13 (the user): a home rented out is a rental we do not take, even
+  // when its owner meets us there. These were "not a DQ" before the ruling.
+  for (const t of [
+    'Mr has a tenant in the property but he will be meeting us at the home',
+    'He is renting it out to students',
+    'Investment property, owner lives in Ohio',
+  ]) assert.equal(detectNoteDq([{ text: t }]).signal, 'rental_property', t);
+  assert.equal(detectNoteDq([{ text: 'Commercial property, a dentist office' }]).signal, 'commercial');
+  assert.equal(detectNoteDq([{ text: 'CXL - only 1 window, below minimum' }]).signal, 'below_minimum');
   assert.equal(detectNoteDq([{ text: 'DNR MOBILE HOME' }]).signal, 'mobile_home');
   assert.equal(detectNoteDq([{ text: 'DNR - low value, renter, and on 4th floor.' }]).signal, 'renter');
   assert.equal(detectNoteDq([{ text: 'They do not own the condo, can\'t do project-PCM' }]).signal, 'not_owner');
