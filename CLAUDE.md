@@ -569,8 +569,18 @@ Brad's XLSX (`marketing-cost-report`, formulas never typed values) read `v_marke
   `mktinv_edit` / `mktinv_reject`; `isMarketingInvoiceAction` in `src/slack-approvals-core.js` catches those clicks AND
   the Edit modal's `view_submission` so they are never relayed to onboarding (which would read them as a member
   approval). Approvers are `MKT_INVOICE_APPROVER_SLACK_IDS` (empty = nobody). Auto-approve only with zero flags and
-  ≥ `MKT_AUTO_APPROVE_MIN_PRIOR` (2) prior person approvals of that vendor; a vendor with `eligible_markets='{}'`
-  cannot be approved until someone fills them in through Edit.
+  ≥ `MKT_AUTO_APPROVE_MIN_PRIOR` (2) prior person approvals of that vendor.
+- **No markets picked means "by source" (the user, 2026-10-13: "we should be able to determine the markets based on
+  the gross issued leads for that source").** A line with `eligible_markets='{}'` and a sub-source is split over every
+  market where that sub-source had gross issued leads in the slice's month (`splitsBySource` / `marketsFromIssued` in
+  `allocation.js`); Edit can still pin markets. A month with none yet (JMJ / Vis PPC, October 2026) goes to `REECE_HOLD`
+  with a note in `recommendation_reason`, and the nightly re-run (current + prior month) splits it once leads issue;
+  `recommendHolds` leaves those alone. Only a line with neither markets nor a sub-source is blocked. The issued basis
+  for every slice is its WHOLE calendar month (D1), not just the days it covers: an invoice with no printed period
+  sits on its invoice date, and one day of issued leads is almost always zero.
+- **Vendors are data, not code.** JMJ Digital Marketing → Vis PPC (the user, 2026-10-13) was added straight to
+  `marketing_vendors`; it bills from a gmail.com mailbox, so it matches by its printed name (the longest alias wins, so
+  "JMJ Digital Marketing" beats a line item's "Google Ads").
 - **REECE_HOLD money is never spread by code (D4).** Lead Gurus "Unknown" / "Out Of Area" and the daily territory gap
   (09-22: $4,763.59) sit on `REECE_HOLD`; `src/marketing/holds.js` writes a RECOMMENDATION (matched LP lead → branch,
   else zip → service area) and a person applies it. The feed is provisional until the invoice supersedes it

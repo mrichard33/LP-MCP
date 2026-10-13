@@ -94,7 +94,9 @@ export async function loadReviewContext(documentId, { supabase = supabaseDefault
 export async function previewRows(rows, deps) {
   const out = [];
   for (const r of rows) {
-    if (!(r.eligible_markets || []).length || !r.period_start || !r.period_end || r.amount == null || Number(r.amount) === 0) continue;
+    // No markets picked = split by the sub-source's issued leads (2026-10-13), so
+    // such a row previews as long as it names a sub-source.
+    if ((!(r.eligible_markets || []).length && !(r.lp_sub_sources || []).length) || !r.period_start || !r.period_end || r.amount == null || Number(r.amount) === 0) continue;
     try { out.push(...(await previewAllocation(r, deps))); } catch (err) { console.warn(`${LOG} preview ${r.id}: ${err.message}`); }
   }
   return out;
@@ -110,8 +112,8 @@ export async function renderCard(ctx, { decision = null, note = null } = {}, dep
 
 async function loadAllocations(expenseIds, { supabase = supabaseDefault } = {}) {
   if (!expenseIds.length) return [];
-  const { data } = await supabase.from('marketing_expense_allocations').select('month, market, amount, rule, issued_basis, issued_total').in('expense_id', expenseIds).order('month');
-  return data || [];
+  const { data } = await supabase.from('marketing_expense_allocations').select('month, market, amount, rule, issued_basis, issued_total, recommendation_reason').in('expense_id', expenseIds).order('month');
+  return (data || []).map(({ recommendation_reason, ...r }) => (r.rule === 'hold' && recommendation_reason ? { ...r, note: recommendation_reason } : r));
 }
 
 async function updateCard(ctx, card, deps) {
@@ -209,7 +211,6 @@ export async function handleMarketingInvoiceInteraction(parsed, deps = {}) {
   // approve
   const blockers = [];
   for (const r of pending) {
-    if (!(r.eligible_markets || []).length) blockers.push(`line ${r.line_no}: no markets (vendor has none on file) — Edit first`);
     if (!r.period_start || !r.period_end) blockers.push(`line ${r.line_no}: no billing period — Edit first`);
     if (r.amount == null) blockers.push(`line ${r.line_no}: no amount — Edit first`);
     // 2026-10-13: a total the extraction could not read is stored as 0 with the

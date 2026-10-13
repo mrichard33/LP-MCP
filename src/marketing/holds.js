@@ -107,11 +107,15 @@ export async function recommendHolds(month, deps = {}) {
   if (error) throw new Error(`hold allocations read failed: ${error.message}`);
   const out = { month: start, holds: (allocs || []).length, recommended: 0, unmatched: 0 };
   if (!allocs?.length) return out;
-  const { data: expenses } = await supabase.from('marketing_expenses').select('id, source_system, source_ref, period_start').in('id', allocs.map((a) => a.expense_id));
+  const { data: expenses } = await supabase.from('marketing_expenses').select('id, source_system, source_ref, period_start, eligible_markets').in('id', allocs.map((a) => a.expense_id));
   const byId = Object.fromEntries((expenses || []).map((e) => [e.id, e]));
   const cache = {};
   for (const a of allocs) {
     const e = byId[a.expense_id];
+    // 2026-10-13: a line split by source that is waiting for its first issued
+    // lead of the month is not a held lead to place by hand; the nightly re-run
+    // splits it. Its allocation already says so.
+    if (e && !(e.eligible_markets || []).length) continue;
     let rec;
     if (e?.source_system === FEED_SOURCE && e.period_start) {
       try {

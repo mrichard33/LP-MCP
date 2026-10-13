@@ -85,7 +85,7 @@ test('holds: email, then phone, then zip; and the allocation row gets the recomm
     lp_leads: [{ lp_lead_id: '581001', lp_branch_id: 'SAR', email: 'a@x.com', phone: '+19415550100' }, { lp_lead_id: '581002', lp_branch_id: 'FTMYR', email: null, phone: '2395550200' }],
     lp_branch_market_map: [{ brn_id: 'SAR', market_code: 'SAR_MKT' }, { brn_id: 'FTMYR', market_code: 'FTMYR_MKT' }],
     service_area_zips: [{ zip: '33901', market_code: 'FTMYR' }],
-    marketing_expenses: [{ id: 'g1', source_system: 'leadgurus_feed', source_ref: '2026-09-22|__gap__', period_start: '2026-09-22' }, { id: 'i1', source_system: 'email_invoice', source_ref: 'x', period_start: '2026-09-01' }],
+    marketing_expenses: [{ id: 'g1', source_system: 'leadgurus_feed', source_ref: '2026-09-22|__gap__', period_start: '2026-09-22', eligible_markets: ['REECE_HOLD'] }, { id: 'i1', source_system: 'email_invoice', source_ref: 'x', period_start: '2026-09-01', eligible_markets: ['REECE_HOLD'] }],
     marketing_expense_allocations: [{ id: 'h1', expense_id: 'g1', month: '2026-09-01', market: 'REECE_HOLD', amount: 4653.59, rule: 'hold' }, { id: 'h2', expense_id: 'i1', month: '2026-09-01', market: 'REECE_HOLD', amount: 10, rule: 'hold' }],
   });
   const m = await matchHeldLeads('2026-09-22', { supabase });
@@ -98,6 +98,14 @@ test('holds: email, then phone, then zip; and the allocation row gets the recomm
   assert.equal(h1.recommended_market, 'FTMYR_MKT,SAR_MKT');
   assert.match(h1.recommendation_reason, /^day gap; held leads that day: FTMYR_MKT 2\/3/);
   assert.equal(supabase.tables.marketing_expense_allocations.find((a) => a.id === 'h2').recommendation_reason, 'no match — needs manual pick');
+
+  // 2026-10-13: a line split by source that is waiting for its first issued lead
+  // keeps its own note; it is not a held lead for a person to place.
+  supabase.tables.marketing_expenses.push({ id: 'bs1', source_system: 'email_invoice', source_ref: 'y', period_start: '2026-09-02', eligible_markets: [] });
+  supabase.tables.marketing_expense_allocations.push({ id: 'h3', expense_id: 'bs1', month: '2026-09-01', amount: 10, rule: 'hold', recommendation_reason: 'no Vis PPC issued leads in 2026-09 yet; split by source once there are (re-run nightly)' });
+  const again = await recommendHolds('2026-09', { supabase });
+  assert.equal(again.holds, 3);
+  assert.match(supabase.tables.marketing_expense_allocations.find((a) => a.id === 'h3').recommendation_reason, /^no Vis PPC issued leads/);
 });
 
 test('nightly: runs every step per month and reports a failing step without dying', async () => {

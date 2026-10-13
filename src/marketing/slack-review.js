@@ -78,11 +78,11 @@ export function buildReviewCard({
   ].join('\n');
 
   const lineText = rows.length
-    ? rows.map((r) => `• ${usd(r.amount)} — ${escapeMrkdwn(r.description || 'line')} → ${escapeMrkdwn((r.lp_sub_sources || []).join(', ') || 'sub-source?')} · ${(r.eligible_markets || []).map(marketLabel).join(', ') || '_no market_'}`).join('\n')
+    ? rows.map((r) => `• ${usd(r.amount)} — ${escapeMrkdwn(r.description || 'line')} → ${escapeMrkdwn((r.lp_sub_sources || []).join(', ') || 'sub-source?')} · ${(r.eligible_markets || []).map(marketLabel).join(', ') || ((r.lp_sub_sources || []).length ? '_markets by issued leads_' : '_no market_')}`).join('\n')
     : '_no lines_';
 
   const allocText = allocation.length
-    ? allocation.map((a) => `• ${a.month.slice(0, 7)} ${marketLabel(a.market)}: ${usd(a.amount)} (${a.rule}${a.issued_total != null && a.rule !== 'direct' ? `, ${a.issued_basis}/${a.issued_total} issued` : ''})`).join('\n')
+    ? allocation.map((a) => `• ${a.month.slice(0, 7)} ${marketLabel(a.market)}: ${usd(a.amount)} (${a.rule}${a.issued_total != null && a.rule !== 'direct' ? `, ${a.issued_basis}/${a.issued_total} issued` : ''})${a.note ? ` _${escapeMrkdwn(a.note)}_` : ''}`).join('\n')
     : '_cannot preview: fix the flags first_';
 
   const flagText = flags.length
@@ -147,7 +147,7 @@ export function buildEditView({ document, vendor, facts, rows = [], vendors = []
       input('period_end', 'Period end', { type: 'datepicker', action_id: 'mktinv_v_period_end', ...(facts?.period_end ? { initial_date: facts.period_end } : {}) }),
       input('amount', rows.length > 1 ? 'Total (leave blank to keep the lines as they are)' : 'Amount', { type: 'plain_text_input', action_id: 'mktinv_v_amount', initial_value: first.amount != null ? String(first.amount) : '' }),
       input('sub_source', 'LP sub-source (exact lead_source_detail)', { type: 'plain_text_input', action_id: 'mktinv_v_sub_source', initial_value: (first.lp_sub_sources || []).join(', ') }),
-      input('markets', 'Markets this invoice is for', { type: 'multi_static_select', action_id: 'mktinv_v_markets', options: marketOptions, ...(marketInitial.length ? { initial_options: marketInitial } : {}) }),
+      input('markets', 'Markets (leave empty to split by the sub-source\'s issued leads)', { type: 'multi_static_select', action_id: 'mktinv_v_markets', options: marketOptions, ...(marketInitial.length ? { initial_options: marketInitial } : {}) }),
     ],
   };
 }

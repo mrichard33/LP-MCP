@@ -13,7 +13,7 @@
  * insert happen only after the rows exist in memory.
  */
 import supabaseDefault from '../supabase.js';
-import { allocateExpense, splitPeriodByMonth, HOLD_MARKET } from './allocation.js';
+import { allocateExpense, splitPeriodByMonth, splitsBySource, HOLD_MARKET } from './allocation.js';
 
 const LOG = '[MktAlloc]';
 
@@ -31,17 +31,26 @@ export async function issuedByMarketFor({ from, to, subSources = [] }, { supabas
   return out;
 }
 
+/** Last day of the calendar month a YYYY-MM-01 starts. */
+function monthLastDay(month) {
+  const start = `${String(month).slice(0, 7)}-01`;
+  return new Date(Date.UTC(+start.slice(0, 4), +start.slice(5, 7), 0)).toISOString().slice(0, 10);
+}
+
 /**
  * Compute (not write) the allocation rows for an expense. Reads one issued
- * count set per month slice, then hands a sync lookup to the pure allocator.
+ * count set per month slice, over the slice's WHOLE calendar month (D1; see
+ * allocation.js), then hands a sync lookup to the pure allocator. An expense
+ * with no markets picked reads them too: its sub-source's issued leads pick
+ * the markets (the user, 2026-10-13).
  */
 export async function previewAllocation(expense, deps = {}) {
   const slices = splitPeriodByMonth(expense.period_start, expense.period_end, expense.amount);
   const counts = {};
   const holdOnly = (expense.eligible_markets || []).length === 1 && expense.eligible_markets[0] === HOLD_MARKET;
-  if (!holdOnly && (expense.eligible_markets || []).length > 1) {
+  if (!holdOnly && ((expense.eligible_markets || []).length > 1 || splitsBySource(expense))) {
     for (const s of slices) {
-      counts[s.month] = await issuedByMarketFor({ from: s.start, to: s.end, subSources: expense.lp_sub_sources }, deps);
+      counts[s.month] = await issuedByMarketFor({ from: s.month, to: monthLastDay(s.month), subSources: expense.lp_sub_sources }, deps);
     }
   }
   return allocateExpense(expense, (month) => counts[month] || {});
@@ -71,7 +80,7 @@ export async function allocateExpenseById(expenseId, deps = {}) {
   const insert = rows.map((r) => ({
     expense_id: expenseId, month: r.month, market: r.market, lp_sub_source: r.lp_sub_source,
     rule: r.rule, issued_basis: r.issued_basis, issued_total: r.issued_total, amount: r.amount,
-    recommended_market: null, recommendation_reason: null,
+    recommended_market: null, recommendation_reason: r.note || null,
   }));
   if (insert.length) {
     const { error: insErr } = await supabase.from('marketing_expense_allocations').insert(insert);
