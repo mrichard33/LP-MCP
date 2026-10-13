@@ -263,6 +263,24 @@ export function addState(addRows, list) {
   return 'none';
 }
 
+/**
+ * The Confirmation list this visit is on, or should go on. ONE add per visit
+ * (the user, 2026-10-13: "we need to make sure we are not double adding a
+ * lead to the confirmation campaign. It should only be sent once."). In the
+ * week before, 42 visits were added to "Conf - 2nd Day" two days out and to
+ * "Conf - Next Day" again the next day (the 2026-10-06 move). Now a visit
+ * already added (or being added) to either Conf list for the SAME visit date
+ * stays where it is. A rebooked visit (a new date) is a new add. Pure.
+ * @param {Array<{ list: string, status: string, appt?: string|null }>} addRows
+ */
+export function confListForVisit(addRows, apptDate, route, cfg) {
+  if (!route?.addList || !apptDate) return route?.addList ?? null;
+  const confLists = Object.values(cfg.conf);
+  const already = (addRows || []).find((r) => r.list !== route.addList && confLists.includes(r.list)
+    && r.appt === apptDate && (DONE.has(r.status) || OPEN.has(r.status)));
+  return already ? already.list : route.addList;
+}
+
 /** How many adds of this phone to `list` FAILED (the retry rule reads it). */
 export function failedAddCount(addRows, list) {
   return (addRows || []).filter((r) => r.list === list && !DONE.has(r.status) && !OPEN.has(r.status)).length;

@@ -11,7 +11,7 @@ import assert from 'node:assert/strict';
 import {
   routingConfig, routingMode, buildCandidate, routeBooked, prefilter, decide, addState, buildRemovalAction,
   buildAddAction, approvalExpired, onePerPhone, priorRemoveKeys, removeKey, RULE_KEY,
-  failedAddCount, confMoveDue, formatAddFailedCard, lookupPriority,
+  failedAddCount, confMoveDue, formatAddFailedCard, lookupPriority, confListForVisit,
 } from '../src/booked-dial-routing.js';
 import { routeList, backstopConfig, currentState, prefilter as backstopPrefilter } from '../src/new-lead-dial-backstop.js';
 import { normalizeInboundRow } from '../src/new-lead-dial-backstop.js';
@@ -511,6 +511,39 @@ test('live: moved from 2nd Day to Next Day → one removal from "Conf - 2nd Day"
   assert.match(describeApprove(h.actions[0], { contactName: 'Shelley' }), /stops a second confirmation call/);
   await runBookedDialRouting({ env: LIVE, nowMs: edt('2026-10-07T09:05:00'), deps: h.deps });
   assert.equal(h.actions.length, 1, 'once per visit');
+});
+
+test('2026-10-13: one Confirmation add per visit (confListForVisit)', () => {
+  const route = { addList: 'Conf - Next Day' };
+  const on2nd = [{ list: 'Conf - 2nd Day', status: 'completed', appt: '2026-10-08' }];
+  assert.equal(confListForVisit(on2nd, '2026-10-08', route, cfg), 'Conf - 2nd Day', 'already on 2nd Day for this visit');
+  assert.equal(confListForVisit([{ ...on2nd[0], status: 'executing' }], '2026-10-08', route, cfg), 'Conf - 2nd Day', 'an add in flight counts');
+  assert.equal(confListForVisit(on2nd, '2026-10-09', route, cfg), 'Conf - Next Day', 'a rebooked visit is a new add');
+  assert.equal(confListForVisit([{ ...on2nd[0], status: 'failed' }], '2026-10-08', route, cfg), 'Conf - Next Day', 'a failed add does not count');
+  assert.equal(confListForVisit([{ ...on2nd[0], appt: null }], '2026-10-08', route, cfg), 'Conf - Next Day', 'an add with no visit date does not count');
+  assert.equal(confListForVisit(on2nd, '2026-10-08', { addList: null }, cfg), null);
+});
+
+test('live 2026-10-13: a visit already on "Conf - 2nd Day" is never added to "Conf - Next Day"', async () => {
+  __resetLoggedForTests();
+  const h = harness({ addRows: [
+    { id: 1, status: 'completed', target_id: 'Conf - 2nd Day', payload: '{"records":[["9414670700"]],"appointment":{"date":"2026-10-08","time":"18:00"}}' },
+  ] });
+  h.marks.set(removeKey('9414670700', '2026-10-08', '2026-10-06'), {}); // setter lists done yesterday
+  await runBookedDialRouting({ env: LIVE, nowMs: edt('2026-10-07T09:00:00'), deps: h.deps });
+  assert.equal(h.actions.length, 0, 'no add, no move');
+  assert.equal(h.actions.length, 0, 'no add, no move');
+});
+
+test('live 2026-10-13: a rebooked visit (new date) still gets its Confirmation add', async () => {
+  __resetLoggedForTests();
+  const h = harness({ addRows: [
+    { id: 1, status: 'completed', target_id: 'Conf - 2nd Day', payload: '{"records":[["9414670700"]],"appointment":{"date":"2026-10-05","time":"18:00"}}' },
+  ] });
+  await runBookedDialRouting({ env: LIVE, nowMs: edt('2026-10-07T09:00:00'), deps: h.deps });
+  const adds = h.actions.filter((a) => a.action_type === 'five9_add_records_to_list');
+  assert.equal(adds.length, 1);
+  assert.equal(adds[0].action_payload.list_name, 'Conf - Next Day');
 });
 
 test('live: setter removal and the 2nd Day removal due together → ONE card', async () => {
