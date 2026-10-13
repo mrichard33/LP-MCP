@@ -55,7 +55,8 @@ import { buildEstablishedFacts } from '../agentic/established-facts.js';
 import { humanizeReply, restoreQuestionMark } from '../agentic/human-voice.js';
 import { enforceTeamVoice } from '../agentic/team-voice.js';
 import { enforcePropertyScope } from '../agentic/property-scope.js';
-import { enforceNonOwner, isNonOwner, NON_OWNER_LINE } from '../agentic/non-owner.js';
+import { enforceNonOwner, isNonOwner, nonOwnerLine } from '../agentic/non-owner.js';
+import { enforceJobScope, jobScopeFromThread, RENTAL_LINE, COMMERCIAL_LINE, BELOW_MINIMUM_LINE, MINIMUM_CHECK_LINE } from '../agentic/job-scope.js';
 import { enforceCallTiming, promisedCallback, isTeamOpen } from '../agentic/team-hours.js';
 import { rewriteBookingClaims, appointmentOnFile, checkBookingTruth, bookingResult, noPromiseHandoffLine } from '../agentic/booking-claim.js';
 import { enforceCancelledVisit } from '../agentic/cancelled-visit.js';
@@ -299,7 +300,10 @@ export function looksLikeMalformedEmail(text) {
   return DOMAIN_NO_AT_RX.test(s) || AT_NO_DOT_RX.test(s);
 }
 
-const LARGE_JOB_RX = /\b(?:[89]|[1-9]\d{1,2})\s*(?:\+\s*)?(?:windows?|openings?|units?|doors?|sliders?)\b|\bcommercial\b|\bchurch\b|\bhoa\b|\bproperty\s+manag(?:er|ement)\b|\bcondo\s+(?:association|board)\b|\b(?:apartment|office)\s+(?:building|complex)\b|\bwhole\s+(?:building|complex)\b|\bmulti[- ]?family\b/i;
+// 2026-10-13 (the user): commercial properties and rentals are jobs we do not
+// take (job-scope.js says no), so a church, an HOA, a property manager or a
+// building is no longer a "large job" to advance. Eight or more openings is.
+const LARGE_JOB_RX = /\b(?:[89]|[1-9]\d{1,2})\s*(?:\+\s*)?(?:windows?|openings?|doors?|sliders?)\b/i;
 
 /** A large-job signal in the visitor's own words. Pure. */
 export function largeJobSignal(text) {
@@ -319,7 +323,8 @@ You are answering in the website chat, live, with the visitor watching the scree
 - Ask for ONE thing per message, as a question, and end the message on it. Before a time is picked the only ask is the day or time. After a time is picked, ask for what is missing in this order, one per message: first name, phone number, street address with zip, who else is part of the decision; email only if they offer it. Never ask for two details in one message, and never ask with a statement ("We just need your name and number").
 - If what they typed looks like an email but is not a valid one (no @, or nothing after the @), say so kindly and ask for it again: "That doesn't look quite right. Could you check the email address?" Never say you do not have enough information. Never dead-end.
 - Never promise to send anything unless an email is on file. No email → ask for the email instead.
-- A large job (eight or more openings, commercial, church, HOA, property manager, a building) → answer, offer the next step, and a person will follow up; say that plainly.
+- A large job (eight or more openings in a home) → answer, offer the next step, and a person will follow up; say that plainly.
+- We work only on homes. A rental property (tenant or landlord), a commercial property (a business, a church, an HOA or condo association, an apartment or office building), or a job under our minimum (three windows or doors in any mix, or one sliding glass door) gets a kind, plain no and no visit.
 - Everything else in this prompt still binds: the discovery discipline, the decision-maker rules, no insurance predictions, no exclamation marks.
 - A SERVICE AREA instruction in this prompt outranks the collection order above for this reply: when it says ask only for the zip, or stop, do exactly that.
 - Never name a day or a time for a visit or a call yourself: real open times are added to the reply for you when it is time to book (2026-10-02). Never say "a team member will call to set a time": when they want a visit, ask "Would that help?" about a free visit at their home, and the times follow.
@@ -1753,7 +1758,16 @@ export function createLiveChatFastLane(deps) {
       // 2026-10-12 (no single-leg visits): a lead who said they rent is
       // never booked, whatever the plan or the mode says (non-owner.js).
       if (isNonOwner(threadTurns, body)) {
-        return { reply: NON_OWNER_LINE, record: { booking: 'refused_non_owner' } };
+        return { reply: nonOwnerLine(threadTurns, body), record: { booking: 'refused_non_owner' } };
+      }
+      // 2026-10-13 (the user): no rentals, no commercial, and the minimum
+      // (three openings or one sliding glass door) before any visit (job-scope.js).
+      {
+        const js = jobScopeFromThread(threadTurns, body);
+        if (js.block || js.check) {
+          const reply = js.check ? MINIMUM_CHECK_LINE : ({ rental: RENTAL_LINE, commercial: COMMERCIAL_LINE, below_minimum: BELOW_MINIMUM_LINE })[js.block];
+          return { reply, record: { booking: `refused_job_scope:${js.block || 'minimum_check'}` } };
+        }
       }
       // Save what they typed BEFORE booking: the booking gate reads the
       // contact (address, name, phone) from GHL.
@@ -1833,6 +1847,12 @@ export function createLiveChatFastLane(deps) {
       if (scope.changed) {
         d.log(`[PropertyScope] live chat ${contactId} ${scope.reason}`);
         draft = scope.text;
+      }
+      // No rentals, no commercial, the minimum (2026-10-13; every mode).
+      const jobScope = enforceJobScope(draft, { thread: stageInput?.conversation || [], inbound: body });
+      if (jobScope.changed) {
+        d.log(`[JobScope] live chat ${contactId} ${jobScope.reason}`);
+        draft = jobScope.text;
       }
       // A renter gets no visit time (2026-10-12, batch 3 T3; active in every mode).
       const owner = enforceNonOwner(draft, { thread: stageInput?.conversation || [], inbound: body });

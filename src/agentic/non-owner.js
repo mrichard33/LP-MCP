@@ -13,17 +13,38 @@
 //     No times, no question, no booking.
 //   - They said it earlier → any sentence that offers a time, asks to book,
 //     or names a clock time is dropped; nothing left → the line.
-//   A landlord ("we rent it out") owns the home (homeowner.js).
+//   A landlord ("we rent it out") owns the home (homeowner.js), but a rented
+//   home is a job we do not take: job-scope.js says so (the user, 2026-10-13).
+//   A TENANT therefore gets the rental line, not "the owner is welcome to reach
+//   out" (the owner of a rental is declined too); a non-owner who is not a
+//   tenant ("it's my parents' house") keeps the non-owner line.
 //
 // PURE. The callers drop the book_appointment companion when this fires.
 
 import { homeownerFromThread, saysRenter } from './homeowner.js';
 import { findBookingAsks } from './discovery-discipline.js';
+import { RENTAL_LINE, TENANT_RX } from './job-scope.js';
 
 export const NON_OWNER_LINE = "Thanks for letting me know. The homeowner needs to be part of the visit, so we can't set one up without them. The owner is welcome to reach out to us anytime.";
 
 const CLOCK_RX = /\b\d{1,2}(?::\d{2})?\s*(?:am|pm|a\.m\.|p\.m\.)\b/i;
 const VISIT_OFFER_RX = /\b(?:I\s+have\b[^.?!]*\bor\b|hold(?:ing)?\s+(?:a\s+time|that|it)|(?:schedule|book|set\s+up)\s+(?:a|the|your)\s+(?:visit|time|appointment|measure)|next\s+step\s+(?:would\s+be|is)|come\s+out\s+(?:and|to))\b/i;
+
+function toTurns(thread = [], inbound = '') {
+  const turns = (Array.isArray(thread) ? thread : []).map(m => ({
+    direction: String(m?.direction || '').toLowerCase() === 'outbound' ? 'outbound' : 'inbound',
+    text: String(m?.text ?? m?.body ?? ''),
+  }));
+  const last = turns[turns.length - 1];
+  if (inbound && !(last && last.direction === 'inbound' && last.text === String(inbound))) turns.push({ direction: 'inbound', text: String(inbound) });
+  return turns;
+}
+
+/** The line for a non-owner: a tenant's home is a rental (2026-10-13). Pure. */
+export function nonOwnerLine(thread = [], inbound = '') {
+  const tenant = toTurns(thread, inbound).some(t => t.direction === 'inbound' && TENANT_RX.test(t.text));
+  return tenant ? RENTAL_LINE : NON_OWNER_LINE;
+}
 
 function splitSentences(text) {
   return String(text || '').split(/(?<=[.!?])\s+/).map(s => s.trim()).filter(Boolean);
@@ -38,21 +59,16 @@ function splitSentences(text) {
  */
 export function enforceNonOwner(draft, { thread = [], inbound = '' } = {}) {
   const text = String(draft || '');
-  const turns = [...(Array.isArray(thread) ? thread : []).map(m => ({
-    direction: String(m?.direction || '').toLowerCase() === 'outbound' ? 'outbound' : 'inbound',
-    text: String(m?.text ?? m?.body ?? ''),
-  }))];
-  const last = turns[turns.length - 1];
-  if (inbound && !(last && last.direction === 'inbound' && last.text === inbound)) turns.push({ direction: 'inbound', text: String(inbound) });
+  const turns = toTurns(thread, inbound);
   if (homeownerFromThread(turns) !== 'no') return { text, changed: false, reason: null };
-  if (saysRenter(inbound)) {
-    return text.trim() === NON_OWNER_LINE ? { text, changed: false, reason: null } : { text: NON_OWNER_LINE, changed: true, reason: 'renter_said_now' };
-  }
+  const line = nonOwnerLine(turns);
+  if (text.trim() === line) return { text, changed: false, reason: null };
+  if (saysRenter(inbound)) return { text: line, changed: true, reason: 'renter_said_now' };
   const asks = new Set(findBookingAsks(text));
   const kept = splitSentences(text).filter(s => !asks.has(s) && !CLOCK_RX.test(s) && !VISIT_OFFER_RX.test(s));
   const out = kept.join(' ').trim();
   if (out === text.trim()) return { text, changed: false, reason: null };
-  return { text: out || NON_OWNER_LINE, changed: true, reason: out ? 'visit_offer_dropped' : 'renter_earlier' };
+  return { text: out || line, changed: true, reason: out ? 'visit_offer_dropped' : 'renter_earlier' };
 }
 
 /** Is the lead, by their own words in this thread, not the owner? Pure. */

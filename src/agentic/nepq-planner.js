@@ -37,6 +37,7 @@ import { detectDeferral, pendingDeferral, isAcknowledgment, isSignOffLine, POST_
 import { PURCHASED_ELSEWHERE_RX } from './purchased-elsewhere.js';
 import { rehashNepqTurn, bridgedRecently, BEST_DEAL_RX, PRE_BRIDGE_STAGES } from './rehash-nepq.js';
 import { homeownerFromThread, OWNER_ASK_RX } from './homeowner.js';
+import { jobScopeFromThread } from './job-scope.js';
 import { decisionMakersFromThread, dmSettled } from './qualifying.js';
 import { extractZip } from './service-area-turn.js';
 
@@ -1419,6 +1420,18 @@ function gateForStage(plan, args) {
     clear();
     plan.stage = { ...(plan.stage || {}), blocked: 'not_owner' };
     return Object.assign(plan, { step: 'not_owner', required_move: 'answer', fixed_line: null, booking: { allowed: false, reason: 'nepq:not_owner' } });
+  }
+  // A job we do not take (2026-10-13: a rental, a commercial property, under
+  // the minimum, or the minimum not yet checked): no times at all. The
+  // job-scope guard words the reply (job-scope.js).
+  {
+    const js = jobScopeFromThread(turns);
+    if (js.block || js.check) {
+      const why = js.block || 'minimum_check';
+      clear();
+      plan.stage = { ...(plan.stage || {}), blocked: why };
+      return Object.assign(plan, { step: 'not_eligible', required_move: 'answer', fixed_line: null, booking: { allowed: false, reason: `nepq:job_scope_${why}` } });
+    }
   }
   const item = nextQualifyItem(facts, outbound);
   if (!item) return plan;

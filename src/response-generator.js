@@ -273,6 +273,7 @@ import { enforceTeamVoice } from './agentic/team-voice.js';
 import { enforcePropertyScope } from './agentic/property-scope.js';
 import { dropFragmentOpener, dropStaleCallMention, normalizeSignature, isNearRepeat, replySimilarity, NEAR_REPEAT_NOTE } from './agentic/sms-format.js';
 import { enforceNonOwner } from './agentic/non-owner.js';
+import { enforceJobScope } from './agentic/job-scope.js';
 import { enforceCallTiming, softenCallTiming, isTeamOpen, enforceRehashCallTiming } from './agentic/team-hours.js';
 import { enforceOneAsk } from './agentic/one-ask.js';
 import { findUnbackedBookingClaim, rewriteBookingClaims, bookingClaimNote, appointmentOnFile, noPromiseHandoffLine, NO_PROMISE_HANDOFF_RX } from './agentic/booking-claim.js';
@@ -5194,7 +5195,22 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     if (scope.changed) {
       console.warn(`[PropertyScope] ${contactId} ${scope.reason}`);
       validated.message = scope.text;
-      if (scope.reason === 'lead_asked' && validated.companion_action?.action_type === 'book_appointment') validated.companion_action = null;
+      // reason is '<rule>:lead_asked' (property-scope.js); the bare
+      // 'lead_asked' this once compared against never matched, so a declined
+      // manufactured home or tall building kept its booking (fixed 2026-10-13).
+      if (/:lead_asked\b/.test(scope.reason || '') && validated.companion_action?.action_type === 'book_appointment') validated.companion_action = null;
+    }
+    // 2026-10-13 (the user): no rentals, no commercial properties, and a
+    // minimum of three openings or one sliding glass door (job-scope.js).
+    // Every mode, like the renter guard. A block or the minimum check books nothing.
+    const jobScope = enforceJobScope(validated.message, { thread: context.conversation_recent || [], inbound: triggerMessage });
+    if (jobScope.changed) {
+      console.warn(`[JobScope] ${contactId} ${jobScope.reason}`);
+      validated.message = jobScope.text;
+    }
+    if (jobScope.block) {
+      validated.job_scope = jobScope.block;
+      if (validated.companion_action?.action_type === 'book_appointment') validated.companion_action = null;
     }
     // 2026-10-12 (no single-leg visits; batch 3 T3): a lead who said they
     // rent gets no time and no booking, in every mode (non-owner.js).

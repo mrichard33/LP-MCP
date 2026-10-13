@@ -23,10 +23,11 @@ import { isOptOut, isAllowedTransition } from '../agentic/lead-stage.js';
 import { saysRenter, homeownerFromThread } from '../agentic/homeowner.js';
 import { decisionMakersFromThread, dmSettled } from '../agentic/qualifying.js';
 import { BRIDGE_RX } from '../agentic/nepq-planner.js';
+import { jobScopeFromThread } from '../agentic/job-scope.js';
 
 // 2026-10-12 (handoff PR 7): the scenario checks have their own version. A run
 // scored with new checks is a new baseline, never "worse" than an old one.
-export const SCORING_VERSION = '2026-10-12.1';
+export const SCORING_VERSION = '2026-10-13.1';
 
 const CLOCK_RX = /\b\d{1,2}(?::\d{2})?\s*(?:AM|PM)\b/gi;
 const clockCount = (text) => (String(text || '').match(CLOCK_RX) || []).length;
@@ -42,6 +43,13 @@ const allReplies = (r) => (r.transcript || []).flatMap(t => replies(t).map(text 
 // Everything the run would have done: live chat keeps one list, SMS one per turn.
 const wouldDo = (r) => [...(r.would_do || []), ...(r.transcript || []).flatMap(t => (t.would_do || []).map(w => ({ turn: t.turn, ...w })))];
 const did = (r, rx) => wouldDo(r).some(w => rx.test(String(w.kind || '')));
+// A job we do not take (2026-10-13): never booked, and some reply says why.
+function declinedNotBooked(r, saidRx, what) {
+  const out = [];
+  if (did(r, /would_book/)) out.push({ code: 'booked_out_of_scope', detail: `a ${what} job was booked` });
+  if (!allReplies(r).some(x => saidRx.test(x.text))) out.push({ code: 'out_of_scope_not_said', detail: `no reply said the ${what} no` });
+  return out;
+}
 
 /**
  * What each named scenario must do beyond the hard checks. Each returns a list
@@ -91,6 +99,12 @@ export const SCENARIO_EXPECTATIONS = Object.freeze({
   },
   // No single-leg visits (the no-single-leg rule, 2026-10-12): never booked.
   renter: (r) => (did(r, /would_book/) ? [{ code: 'booked_non_owner', detail: 'a renter was booked' }] : []),
+  // ── 2026-10-13 (the user): jobs we do not take are never booked, and the
+  // no is said. One sliding glass door meets the minimum and books.
+  landlord: (r) => declinedNotBooked(r, /rental/i, 'rental'),
+  commercial: (r) => declinedNotBooked(r, /commercial/i, 'commercial'),
+  one_window: (r) => declinedNotBooked(r, /minimum/i, 'below_minimum'),
+  slider_only: (r) => (bookedOrHeld(r) ? [] : [{ code: 'yes_without_booking', detail: 'a sliding glass door (meets the minimum) ended with nothing booked or held' }]),
   // Live: the competitor reaches times (disarm → criteria → bridge → times).
   competitor: (r) => (r.lead_stage_mode === 'live' && !allReplies(r).some(x => clockCount(x.text) >= 2)
     ? [{ code: 'competitor_no_times', detail: 'the competitor case never reached two real times' }] : []),
@@ -174,7 +188,7 @@ function bookedOrHeld(r) {
 
 /**
  * The stage-flow checks every conversation gets (2026-10-12, handoff PR 7).
- * Generic: yes_without_booking, slots_offered_to_non_owner, stage_regressed.
+ * Generic: yes_without_booking, slots_offered_to_non_owner, slots_offered_out_of_scope, stage_regressed.
  * With the stored stage driving the bot (lead_stage_mode live) also:
  * slots_without_qualifying and bridge_repeated, which are today's designed
  * behavior in shadow and would only make the shadow baseline red. Pure.
@@ -186,6 +200,7 @@ export function stageFlowFailures(result) {
   const conv = [];
   let renterAt = null;
   let flaggedRenter = false;
+  let flaggedScope = false;
   let flaggedQualify = false;
   let acceptedAt = null;
   let lastBotHadTimes = false;
@@ -201,6 +216,12 @@ export function stageFlowFailures(result) {
     for (const text of replies(t)) {
       const times = clockCount(text);
       if (renterAt != null && times && !flaggedRenter) { flaggedRenter = true; out.push({ code: 'slots_offered_to_non_owner', detail: text, turn: t.turn }); }
+      // A rental, a commercial property or a job under the minimum (or one
+      // not yet checked) is never offered a time (job-scope.js, 2026-10-13).
+      if (times && !flaggedScope) {
+        const js = jobScopeFromThread(conv);
+        if (js.block || js.check) { flaggedScope = true; out.push({ code: 'slots_offered_out_of_scope', detail: `${js.block || 'minimum_check'}: ${text}`, turn: t.turn }); }
+      }
       if (live && times >= 2 && !flaggedQualify && (homeownerFromThread(conv) !== 'yes' || !dmSettled(decisionMakersFromThread(conv)))) {
         flaggedQualify = true;
         out.push({ code: 'slots_without_qualifying', detail: text, turn: t.turn });

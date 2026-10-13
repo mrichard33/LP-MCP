@@ -154,6 +154,11 @@ export const SCENARIOS = Object.freeze({
   reschedule_unclear: { title: 'Reschedule with an unclear answer (batch 2 #1)', persona: GUEST, channels: ['livechat'], appointmentHolder: RICK, turns: ['I need to cancel my appointment', 'Rick Fox 352-555-0188', 'what color are the frames?', 'A different day please', 'The first one'] },
   out_of_area_chat: { title: 'Out of area, zip 10001 (batch 2 #3)', persona: GUEST, channels: ['livechat'], turns: ['Do you service zip 10001?'] },
   houston_tz: { title: 'Houston lead, Central time (batch 2 #2)', persona: KATY, autoAnswer: true, turns: ['Hi, I need impact windows for my house. My zip is 77494', 'Yes, please set up a visit'] },
+  // ── 2026-10-13 (the user): no rentals, no commercial, the minimum ──
+  landlord: { title: 'Landlord asks about a rental (no rentals)', persona: DANA, turns: ['Hi, I need new windows on a house I rent out to tenants', 'Can you just set something up anyway?'] },
+  commercial: { title: 'Commercial property (no commercial)', persona: GUEST, turns: ['Do you do commercial buildings? We need windows for our office building', 'Can someone come take a look?'] },
+  one_window: { title: 'One window only (under the minimum)', persona: DANA, turns: ['I just need one window replaced in the bathroom', 'No, just that one'] },
+  slider_only: { title: 'One sliding glass door (meets the minimum)', persona: DANA, autoAnswer: true, turns: ['I need to replace our sliding glass door', 'Yes, please set up a visit'] },
 });
 
 /** Parse a message list or a scenario name into one plan. Pure. */

@@ -963,7 +963,8 @@ times twice (batch 3 T3). `enforceNonOwner` (`src/agentic/non-owner.js`, the las
 `enforcePropertyScope`, ACTIVE in every mode) turns a reply to a lead who says they rent into `NON_OWNER_LINE` (the
 homeowner needs to be part of the visit; the owner is welcome to reach out), drops the time offer when they said it
 earlier, drops the `book_appointment` companion, and the live chat never books one (`isNonOwner`). A landlord ("we rent
-it out") is an owner (`homeowner.js`). Zip 10001 was declined on SMS and "good chance we can help" in live chat: both
+it out") owns the home (`homeowner.js`), but a rental is declined by `job-scope.js` (2026-10-13, below), and a TENANT
+now gets `RENTAL_LINE` (`nonOwnerLine`); only a non-tenant non-owner keeps `NON_OWNER_LINE`. Zip 10001 was declined on SMS and "good chance we can help" in live chat: both
 bots now give `outOfAreaLine` (service-area-turn.js; the SMS SERVICE_AREA_EXIT text and the `serviceAreaOutside` prompt
 too, which no longer offers a team callback), and live chat checks a zip typed outside a coverage question
 (`zipInText`). With `LEAD_STAGE_MODE=live` (`planNepqTurn({ stageLive })`): a plain quote request is NEPQ's info request
@@ -971,6 +972,24 @@ too, which no longer offers a team callback), and live chat checks a zip typed o
 is), and "we went with another company" gets `LINES.competitor` (the disarm, then how they would decide; no consequence
 move after it; a second time → `repeat_objection`). `CLAIMS_RX` strips claims that another company's work is not "up to
 code".
+
+**No rentals, no commercial, a three-opening minimum, impact only (the user, 2026-10-13).** A landlord was booked like
+any owner, the prompt said "Investment properties are NOT a disqualifier", commercial work was "route to the team" (live
+chat pitched it as a LARGE JOB), no code knew a minimum, and two FAQs said "not every window in our line is
+impact-rated". `src/agentic/job-scope.js` (pure, both bots, EVERY mode, run right before `enforceNonOwner`) reads the
+thread: a RENTAL (tenant, landlord, investment, Airbnb/VRBO, property manager; an owner's un-rented second home is fine)
+or COMMERCIAL property (business, office/apartment building, church, HOA or condo association for the building; a single
+condo owner is a homeowner) said now → the whole reply is `RENTAL_LINE` / `COMMERCIAL_LINE`, said earlier → the time
+offer goes. The MINIMUM is three windows or doors in any mix, or one sliding glass door alone: a stated count under it
+(not a symptom: "my window is foggy" is never checked) gets `MINIMUM_CHECK_LINE` once; a no to it → `BELOW_MINIMUM_LINE`;
+anything else is the normal flow, and an unknown count never blocks. A draft saying we do commercial or rental work, or
+that some windows are not impact, has that sentence replaced. Any block drops `book_appointment`, the live chat refuses
+the booking (`refused_job_scope:*`), `gateForStage` returns `not_eligible`, `checkReply` fails `job_scope`, the analyzer
+has `dq_detected` rental_property / commercial / below_minimum, and an LP note saying rental, commercial or below minimum
+is an LP-note DQ. FAQs LIB-P03/P15 (impact only), LIB-P16/17/18: `sql/seeds/2026-10-13_scope_rules_impact_only.sql`.
+Reminders for Set/Verif only (Cnf and Issue get none) are GHL edits in A.WE-1: `docs/ghl-we-reminders-set-only.md`.
+Also fixed: the SMS scope guard compared `scope.reason === 'lead_asked'`, which never matched `'<rule>:lead_asked'`, so a
+declined manufactured home or tall building kept its booking.
 
 **Every GHL request is credited to the code that made it (2026-10-12).** LP-MCP made ~127,000 GHL requests in 24h
 (~63% of GHL's 200k/day cap, peaks 268/min at 5 AM) and the rehash sweep failed 1 pass in 4 on 429s, with no way to

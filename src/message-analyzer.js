@@ -476,7 +476,7 @@ Required JSON structure:
   "fast_track_eligible": <boolean>,
   "recommended_story_arc": <null | "SA1" | "SA2" | "SA3" | "SA4" | "SA5">,
   "recommended_action": <"advance_stage" | "deploy_objection_handler" | "fast_track_booking" | "continue_current" | "escalate_to_rep" | "suppress" | "objection_price" | "busy_callback" | "wrong_person" | "frustrated_fast_track" | "callback_request" | "guide_send" | "follow_up_scheduled">,
-  "dq_detected": <null | "mobile-home" | "renter" | "lanai-only">,
+  "dq_detected": <null | "mobile-home" | "renter" | "lanai-only" | "rental_property" | "commercial" | "below_minimum">,
   "requested_fulfillment": <"in_home_estimate" | "phone_call" | "info_only" | "unspecified">,
   "escalation_category": <null | "existing_customer_service" | "legal_media" | "identity_ambiguous" | "commercial_hoa" | "contract_change" | "billing" | "vendor_recruiting" | "language" | "compliance_adjacent" | "rep_promise_unfulfilled" | "document_request">,
   "guide_type": <null | "dhp" | "hurricane" | "energy" | "security" | "warranty" | "financing" | "reviews" | "credentials" | "booking-link" | "process">,
@@ -607,9 +607,12 @@ Set dq_detected ONLY when the lead VOLUNTEERS a disqualifying fact. Never infer 
 
 • "mobile-home" — they state the property is a mobile or manufactured home.
 • "renter" — they state they rent / are not the homeowner / "I'd have to ask my landlord".
+• "rental_property" — they state the home is rented out: a landlord, "we rent it out", an investment rental, an Airbnb or VRBO, a property manager.
+• "commercial" — they state the property is not a home: a business, store, office or apartment building, church, school, or an HOA or condo association buying for the building.
+• "below_minimum" — they state the whole job is under our minimum (fewer than three windows or doors, and no sliding glass door) and confirm there is nothing else.
 • "lanai-only" — the project is ONLY a lanai, sunroom, screen enclosure, or patio screen (no main-structure windows or doors). "Windows plus the lanai" is NOT a DQ — main-home work qualifies.
 
-INVESTMENT PROPERTIES ARE NOT A DISQUALIFIER. "It's an investment property", "it's a rental I own", "it's not my primary residence" → dq_detected stays null and the conversation proceeds completely normally. There is no investment-property routing of any kind.
+RENTAL PROPERTIES ARE A DISQUALIFIER (the user's ruling, 2026-10-13; this replaces "investment properties are not a disqualifier"). "It's an investment property", "it's a rental I own", "we rent it out" → dq_detected "rental_property". An owner's own second home that is NOT rented out ("it's not my primary residence", "our vacation home") is not a rental: dq_detected stays null.
 
 When dq_detected is set, recommended_action should usually be "continue_current" — a dedicated rule handles the exit; do not also route to suppress.
 
@@ -652,7 +655,7 @@ A deterministic gate enforces the PROSPECT rule after you answer; do not rely on
   ("Mark Follen" signing for a lead named "Mark Test", a personal vs work
   email) is data hygiene, NOT identity_ambiguous. Leave escalation_category
   null and keep the conversation going.
-• "commercial_hoa" — commercial, multi-property, HOA, or condo-association projects.
+• "commercial_hoa" — commercial, multi-property, HOA, or condo-association projects (also set dq_detected "commercial": we do not take these, 2026-10-13).
 • "contract_change" — requests to change or CANCEL A SIGNED CONTRACT (a purchase agreement they already signed). Humans only — rescission-sensitive.
   NEGATIVE EXAMPLE: cancelling or rescheduling an APPOINTMENT ("cancel my appointment", "cancel that", "I can't make Wednesday") is NOT contract_change — appointment changes are handled conversationally by the cancellation flow; leave escalation_category null for them. contract_change requires an actual signed contract/purchase being referenced (deposit, contract, paperwork, "cancel my order").
 • "billing" — billing, payment, or refund matters.
@@ -1232,7 +1235,7 @@ function validateAnalysis(analysis) {
     ].includes(analysis.recommended_action) ? analysis.recommended_action : 'continue_current',
     // 2026-07-06 — DQ detection (volunteered-only; investment property is
     // deliberately NOT a value — investment mentions are a normal flow).
-    dq_detected: ['mobile-home', 'renter', 'lanai-only'].includes(analysis.dq_detected) ? analysis.dq_detected : null,
+    dq_detected: ['mobile-home', 'renter', 'lanai-only', 'rental_property', 'commercial', 'below_minimum'].includes(analysis.dq_detected) ? analysis.dq_detected : null,
     // 2026-07-06 — the lead's explicit ask this turn; outranks funnel
     // defaults in resolveBookingCalendar. Never inferred.
     requested_fulfillment: ['in_home_estimate', 'phone_call', 'info_only', 'unspecified'].includes(analysis.requested_fulfillment) ? analysis.requested_fulfillment : 'unspecified',
