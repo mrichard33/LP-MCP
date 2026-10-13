@@ -1395,3 +1395,15 @@ test('a renter in live chat gets no times (batch 3 T3; active in every mode)', a
   // 2026-10-13 (the user): a tenant's home is a rental, which we do not take.
   assert.match(out.message, /don't work on rental properties/);
 });
+
+test('a stated count is queued for Window Count / Door Count, with real columns only (2026-10-13)', async () => {
+  const { lane, state } = makeLane({ llm: () => ({ message: 'Great, that is a good size project. What got you looking now?' }) });
+  await lane.processInbound(INBOUND('I need 12 windows and 2 doors replaced'));
+  await new Promise(r => setTimeout(r, 20));
+  const row = state.actions.find(a => a.rule_applied === 'OPENINGS_COUNT_PERSIST');
+  assert.ok(row, 'an update_custom_fields row was queued');
+  assert.equal(row.action_type, 'update_custom_fields');
+  assert.deepEqual(row.action_payload.fields, [{ id: 'h9FJTUbmUHIuD6JKmpXv', field_value: 12 }, { id: 'j7l1KWmDgoJqy7SINjQs', field_value: 2 }]);
+  const extra = Object.keys(row).filter(k => k !== 'id' && !AGENT_ACTIONS_COLUMNS.includes(k));
+  assert.deepEqual(extra, []);
+});

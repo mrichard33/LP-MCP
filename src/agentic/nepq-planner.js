@@ -379,7 +379,7 @@ const STREET_ADDRESS_RX = /\b\d{2,6}\s+(?:[NSEW]\.?\s+)?[A-Za-z0-9'.]+(?:\s+[A-Z
  * What the gate knows THIS turn: the stored facts, updated by the thread (the
  * lead may have just answered). Pure.
  */
-export function stageFactsNow(stage, turns = [], knownZip = null) {
+export function stageFactsNow(stage, turns = [], knownZip = null, knownOpenings = false) {
   const f = stage?.facts || {};
   const owner = homeownerFromThread(turns);
   const dm = decisionMakersFromThread(turns);
@@ -391,7 +391,7 @@ export function stageFactsNow(stage, turns = [], knownZip = null) {
     homeowner: owner !== 'unknown' ? owner : (f.homeowner || 'unknown'),
     decision_makers: dm !== 'unknown' ? dm : (f.decision_makers || 'unknown'),
     zip,
-    openings_known: !!f.openings_known || openingsKnown(turns),
+    openings_known: !!f.openings_known || !!knownOpenings || openingsKnown(turns),
   };
 }
 
@@ -1412,7 +1412,7 @@ function gateForStage(plan, args) {
   if (!offersTimes) return plan;
   const turns = normalizeThread(args.conversation, args.trigger);
   const outbound = turns.filter(t => t.direction === 'outbound');
-  const facts = stageFactsNow(args.stage, turns, args.knownZip);
+  const facts = stageFactsNow(args.stage, turns, args.knownZip, args.knownOpenings);
   const clear = () => {
     plan.slots_to_offer = [];
     plan.allowed = { ...plan.allowed, slot_offer: false };

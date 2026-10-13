@@ -987,7 +987,11 @@ impact?"; "Does your home only have 1 window?" reads the same). A yes or "just t
 states the minimum; "no, the others are old" or anything else is the normal flow, and an unknown count never blocks. The
 count is asked ONCE before any time, in the user's wording ("How many windows and doors are you looking to get a quote
 on?" / "… to have us come measure?"): the qualifying gate's `openings` item (owner → zip → openings → decision makers,
-`openingsKnown`), and the prompt's ASK FOR WINDOW COUNT. A bare "1" in reply to it is read as the count (`openingsAt`). A draft saying we do commercial or rental work, or
+`openingsKnown`), and the prompt's ASK FOR WINDOW COUNT. A bare "1" in reply to it is read as the count (`openingsAt`). The
+count the lead states is SAVED to the GHL fields Window Count (`h9FJTUbmUHIuD6JKmpXv`) and Door Count
+(`j7l1KWmDgoJqy7SINjQs`; a slider is a door), read by code from their newest message (`openingsToSave`), as one
+`update_custom_fields` row (rule `OPENINGS_COUNT_PERSIST`) after the send on both bots; a count already on the contact
+(`context.estimate.window_count` / `door_count`) skips the question (`knownOpenings`). A draft saying we do commercial or rental work, or
 that some windows are not impact, has that sentence replaced. Any block drops `book_appointment`, the live chat refuses
 the booking (`refused_job_scope:*`), `gateForStage` returns `not_eligible`, `checkReply` fails `job_scope`, the analyzer
 has `dq_detected` rental_property / commercial / below_minimum, and an LP note saying rental, commercial or below minimum

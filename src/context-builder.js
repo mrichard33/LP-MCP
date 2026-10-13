@@ -166,6 +166,7 @@ const CF_LP_LOST_REASON = 'I9CbRV0dKMfwaSlge9uU';
 // the actual estimate must outrank rep notes.
 const CF_ESTIMATE_TOTAL = 'PqUYMgBojosjSGMBEUqX';   // dollar amount, e.g. "15775.17"
 const CF_WINDOW_COUNT   = 'h9FJTUbmUHIuD6JKmpXv';   // integer count, e.g. "12"
+const CF_DOOR_COUNT     = 'j7l1KWmDgoJqy7SINjQs';   // integer count (a slider is a door)
 const CF_DECISION_MAKERS_PRESENT = 'GH1QGGOseMKmJAMqajiN'; // select: Yes|No|Solo Owner|Uncertain
 // 2026-07-06 (Bot 2/3/4 consolidation) — Trust Level Score. Bot 2's pricing,
 // discovery, and value-first scripts branch on this (low 1-2 / neutral 3 /
@@ -1086,6 +1087,10 @@ export async function buildLeadContext(ghlContactId, options = {}) {
     : null;
   const estimateTotal = coerceMoney(cfEstimateTotalRaw);
   const windowCount = coerceCount(cfWindowCountRaw);
+  // 2026-10-13: the door count too, so the bot does not ask a count already on
+  // file (job-scope.js / the qualifying gate's openings item). Not in has_data:
+  // that flag drives the estimate block, which is about a quote.
+  const doorCount = ghlContact?.customFields ? coerceCount(getCustomFieldValue(ghlContact.customFields, CF_DOOR_COUNT)) : null;
   // Decision-maker presence (for the in-home booking gate). Raw select value:
   // 'Yes' | 'No' | 'Solo Owner' | 'Uncertain' | null.
   const decisionMakersPresent = ghlContact?.customFields
@@ -1289,6 +1294,7 @@ export async function buildLeadContext(ghlContactId, options = {}) {
     estimate: {
       total: estimateTotal,
       window_count: windowCount,
+      door_count: doorCount,
       has_data: estimateTotal !== null || windowCount !== null,
     },
 

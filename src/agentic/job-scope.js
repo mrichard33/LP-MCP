@@ -149,7 +149,7 @@ function countValue(word) {
 export function openingsIn(text) {
   const raw = String(text || '');
   const t = raw.replace(NOT_AN_OPENING_RX, ' ');
-  const out = { windows: 0, doors: 0, slider: false, unknown: false, stated: false, explicit: false, big: false };
+  const out = { windows: 0, doors: 0, sliders: 0, slider: false, unknown: false, stated: false, explicit: false, big: false };
   if (SLIDER_RX.test(t)) { out.slider = true; out.stated = true; }
   if (BIG_SCOPE_RX.test(t)) { out.unknown = true; out.stated = true; out.big = true; }
   let rest = t;
@@ -161,7 +161,12 @@ export function openingsIn(text) {
     rest = rest.replace(m[0], ' ');
   }
   for (const m of rest.matchAll(DOOR_COUNT_RX)) {
-    if (/\bslid/i.test(m[0])) continue;
+    if (/\bslid/i.test(m[0])) {
+      // "two sliding glass doors": counted as sliders (doors for the field).
+      const k = countValue(m[1]);
+      if (k != null) { out.sliders += k; rest = rest.replace(m[0], ' '); }
+      continue;
+    }
     const n = countValue(m[1]);
     if (n == null) continue;
     out.doors += n; out.stated = true;
@@ -177,6 +182,7 @@ export function openingsIn(text) {
     out.windows += 1; out.stated = true;
     rest = rest.replace(m[0], ' ');
   }
+  if (out.slider && !out.sliders) out.sliders = 1;
   // A plural we did not count ("windows and a door") leaves the size open.
   if (BARE_PLURAL_RX.test(rest)) { out.unknown = true; out.stated = true; }
   return out;
@@ -211,6 +217,32 @@ export function openingsKnown(thread = [], inbound = '') {
     const o = openingsAt(turns, i);
     return o.slider || o.big || o.windows + o.doors > 0;
   });
+}
+
+// The GHL contact fields the count is saved to (the user, 2026-10-13: "We have
+// a custom field in GHL already for this"). The canvassing form, the
+// calculator and the rep brief already use them; a slider is a door.
+export const WINDOW_COUNT_FIELD_ID = 'h9FJTUbmUHIuD6JKmpXv';
+export const DOOR_COUNT_FIELD_ID = 'j7l1KWmDgoJqy7SINjQs';
+
+/**
+ * The counts the lead stated in their NEWEST message, as GHL field writes:
+ * [{ id, field_value }], or [] when the message states no job size (a symptom
+ * like "my window is foggy", a bare "we need windows", "the whole house").
+ * A bare number answering our count question is the window count. Pure.
+ */
+export function openingsToSave(thread = [], inbound = '') {
+  const turns = normalize(thread, inbound);
+  const i = turns.map(t => t.direction).lastIndexOf('inbound');
+  if (i < 0) return [];
+  const o = openingsAt(turns, i);
+  if (!o.stated) return [];
+  if (!o.explicit && !o.slider && !SCOPE_INTENT_RX.test(turns[i].text)) return [];
+  const out = [];
+  if (o.windows > 0 && o.windows < 1000) out.push({ id: WINDOW_COUNT_FIELD_ID, field_value: o.windows });
+  const doors = o.doors + o.sliders;
+  if (doors > 0 && doors < 1000) out.push({ id: DOOR_COUNT_FIELD_ID, field_value: doors });
+  return out;
 }
 
 /** Do these openings meet the minimum? true / false / null (cannot tell). Pure. */

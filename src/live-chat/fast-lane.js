@@ -56,7 +56,7 @@ import { humanizeReply, restoreQuestionMark } from '../agentic/human-voice.js';
 import { enforceTeamVoice } from '../agentic/team-voice.js';
 import { enforcePropertyScope } from '../agentic/property-scope.js';
 import { enforceNonOwner, isNonOwner, nonOwnerLine } from '../agentic/non-owner.js';
-import { enforceJobScope, jobScopeFromThread, RENTAL_LINE, COMMERCIAL_LINE, BELOW_MINIMUM_LINE, MINIMUM_CHECK_LINE, MINIMUM_CHECK_DOORS_LINE } from '../agentic/job-scope.js';
+import { enforceJobScope, jobScopeFromThread, openingsToSave, RENTAL_LINE, COMMERCIAL_LINE, BELOW_MINIMUM_LINE, MINIMUM_CHECK_LINE, MINIMUM_CHECK_DOORS_LINE } from '../agentic/job-scope.js';
 import { enforceCallTiming, promisedCallback, isTeamOpen } from '../agentic/team-hours.js';
 import { rewriteBookingClaims, appointmentOnFile, checkBookingTruth, bookingResult, noPromiseHandoffLine } from '../agentic/booking-claim.js';
 import { enforceCancelledVisit } from '../agentic/cancelled-visit.js';
@@ -1096,6 +1096,8 @@ export function createLiveChatFastLane(deps) {
         stageLive: d.leadStageMode() === 'live',
         stage: leadStage,
         knownZip: context.lead?.postal_code || null,
+        // A Window Count / Door Count already on the contact (2026-10-13).
+        knownOpenings: (Number(context.estimate?.window_count) || 0) + (Number(context.estimate?.door_count) || 0) > 0,
       };
       nepqPlan = planNepqTurn(planInput);
       if (!saPlan.active && wantsSlots(nepqPlan)) {
@@ -1899,6 +1901,19 @@ export function createLiveChatFastLane(deps) {
       if (!skipCapture) Promise.resolve()
         .then(() => d.captureIdentity(contactId, { visitorTexts: visitorTexts.length ? visitorTexts : [body], capture }))
         .catch(err => d.warn(`[LiveChat] identity capture failed for ${contactId}: ${err.message}`));
+      // The window / door count the visitor stated → GHL Window Count / Door
+      // Count (the user, 2026-10-13), the same row the SMS path queues.
+      if (!skipCapture) {
+        const openingsFields = openingsToSave(stageInput?.conversation || [], body);
+        if (openingsFields.length) Promise.resolve()
+          .then(() => d.insertAction({
+            action_type: 'update_custom_fields', target_system: 'ghl', target_entity: 'contact', target_id: contactId,
+            action_payload: { fields: openingsFields },
+            reasoning: `Visitor stated the job size (${openingsFields.map(f => f.field_value).join('/')}): saved to Window Count / Door Count`,
+            confidence: 1.0, rule_applied: 'OPENINGS_COUNT_PERSIST', status: 'pending', requires_approval: false,
+          }))
+          .catch(err => d.warn(`[LiveChat] openings count persist failed for ${contactId}: ${err.message}`));
+      }
       // A sent call promise becomes an owned task (promised_callbacks, 2026-10-07).
       // The cancel flow's "our team will call to go over the details" after a
       // move is #dispatch's, not a callback (skipCapture marks those turns).

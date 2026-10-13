@@ -261,3 +261,29 @@ test('"1" in reply to the count question gets the friendly check next', () => {
   // A time is not a count.
   assert.equal(J.enforceJobScope(OFFER, { thread: asked, inbound: '2 pm works' }).changed, false);
 });
+
+// ── saving the count (the user, 2026-10-13: "We have a custom field in GHL") ──
+
+test('the stated count becomes Window Count / Door Count writes (a slider is a door)', () => {
+  const W = J.WINDOW_COUNT_FIELD_ID, D = J.DOOR_COUNT_FIELD_ID;
+  assert.deepEqual(J.openingsToSave([], 'I would like a quote on replacing 1 24x36 window'), [{ id: W, field_value: 1 }]);
+  assert.deepEqual(J.openingsToSave([], '12 windows and 2 doors'), [{ id: W, field_value: 12 }, { id: D, field_value: 2 }]);
+  assert.deepEqual(J.openingsToSave([], 'I need to replace our sliding glass door'), [{ id: D, field_value: 1 }]);
+  assert.deepEqual(J.openingsToSave([], 'two sliding glass doors and 3 windows'), [{ id: W, field_value: 3 }, { id: D, field_value: 2 }]);
+  const asked = thread(['o', 'How many windows and doors are you looking to get a quote on?']);
+  assert.deepEqual(J.openingsToSave(asked, 'about 10'), [{ id: W, field_value: 10 }]);
+  // Nothing to save: a symptom, a bare plural, the whole house, a time.
+  for (const t of ['my window is foggy', 'we need new windows', 'all the windows in the house']) assert.deepEqual(J.openingsToSave([], t), [], t);
+  assert.deepEqual(J.openingsToSave(asked, '2 pm works'), []);
+  // Only the NEWEST message: an earlier count is not written again.
+  assert.deepEqual(J.openingsToSave(thread(['i', '5 windows'], ['o', 'Got it.']), 'what time works?'), []);
+  assert.equal(W, 'h9FJTUbmUHIuD6JKmpXv');
+  assert.equal(D, 'j7l1KWmDgoJqy7SINjQs');
+});
+
+test('a count already on the contact skips the count question', async () => {
+  const P = await import('../src/agentic/nepq-planner.js');
+  const f = P.stageFactsNow({ stage: 'problem', facts: { homeowner: 'yes', zip: '33908' } }, [], null, true);
+  assert.equal(f.openings_known, true);
+  assert.equal(P.nextQualifyItem(f, []), 'decision_makers');
+});
