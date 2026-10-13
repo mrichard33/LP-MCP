@@ -1001,7 +1001,11 @@ impact?"; "Does your home only have 1 window?" reads the same). A yes or "just t
 states the minimum; "no, the others are old" or anything else is the normal flow, and an unknown count never blocks. The
 count is asked ONCE before any time, in the user's wording ("How many windows and doors are you looking to get a quote
 on?" / "… to have us come measure?"): the qualifying gate's `openings` item (owner → zip → openings → decision makers,
-`openingsKnown`), and the prompt's ASK FOR WINDOW COUNT. A bare "1" in reply to it is read as the count (`openingsAt`). The
+`openingsKnown`), and the prompt's ASK FOR WINDOW COUNT. A bare "1" in reply to it is read as the count (`openingsAt`). It is ON IN EVERY MODE (the user, 2026-10-13: "leave the
+question on"): without a stored stage `openingsGate` (`nepq-planner.js`) turns the FIRST time offer into the count
+question once (never after times were offered), and the answer replans the conversation as it stood before the
+question, so "about 10" gets the times the "yes" had earned; a job-scope block or check is `not_eligible` in every mode
+(no wasted SMS redraft before the minimum check). A lead past its demo is never asked it (`postDemoLead`, below). The
 count the lead states is SAVED to the GHL fields Window Count (`h9FJTUbmUHIuD6JKmpXv`) and Door Count
 (`j7l1KWmDgoJqy7SINjQs`; a slider is a door), read by code from their newest message (`openingsToSave`), as one
 `update_custom_fields` row (rule `OPENINGS_COUNT_PERSIST`) after the send on both bots; a count already on the contact
@@ -1016,7 +1020,7 @@ Reminders for Set/Verif only (Cnf and Issue get none) are GHL edits in A.WE-1: `
 (`src/agentic/post-demo-lead.js`: a demo disposition (`isDemoDisposition`) or closed won, or `lp-demo-completed` /
 `stage:post-appointment` / `rehash` / `active-f.0`; never `lp.demo_completed`, which LP sets for NOC) turns off, in both
 bots and whatever `POST_DEMO_PLANNER_MODE` says: the lead-side job-scope and tenant declines (our own false claims are
-still corrected), the qualifying gate (`postDemoLead` → `gateForStage`), the live chat's job-scope booking refusal, the
+still corrected), the qualifying gate and the count question (`postDemoLead` → `gateForStage` / `openingsGate`), the live chat's job-scope booking refusal, the
 set-ND card, and an LP-note DQ whose signal is only renter or below minimum (`REQUIREMENT_SIGNALS`). `checkReply` skips the lead-side check on `ctx.postDemoLead`.
 The live chat also never books in a chat that raised a manufactured home or a 3+ story building (`leadRaisesScope`).
 #1274 (the same rules built a second way, never told the minimum) was closed by the user's ruling. Also fixed: the SMS scope guard compared `scope.reason === 'lead_asked'`, which never matched `'<rule>:lead_asked'`, so a

@@ -109,6 +109,8 @@ export function autoAnswerFor(reply, persona = {}, { scriptDone = false } = {}) 
   const q = t.split(/(?<=[.?!])\s+/).filter(x => x.trim().endsWith('?')).join(' ');
   if (/\bstreet\s+address\b|\bwhat(?:'s| is)\s+the\s+address\b|\baddress\b[^?]*\bzip\b[^?]*\?/i.test(q)) return persona.address || '1200 Palm Ave, Fort Myers FL 33908';
   if (/\bdo\s+you\s+own\b|\bhomeowner\b|\bown\s+the\s+(?:home|house)\b/i.test(q)) return 'Yes, I own it.';
+  // 2026-10-13: the count question (always on).
+  if (/\bhow\s+many\s+(?:windows?|doors?|openings?)\b/i.test(q)) return persona.openings || 'About 10 windows.';
   if (/\bzip(?:\s*code)?\b[^?]*\?/i.test(q)) return (String(persona.address || '').match(/\b\d{5}\b/) || [persona.postalCode || '33908'])[0];
   if (/\bable\s+to\s+(?:be\s+there|make\s+it)\b|\bboth\s+be\s+there\b/i.test(q)) return "Yes, she'll be there.";
   if (/\b(?:anyone|anybody|someone)\s+else\b|\bpart\s+of\s+the\s+decision\b|\bweigh(?:ing)?\s+in\b/i.test(q)) return 'Just me.';
@@ -120,8 +122,8 @@ export function autoAnswerFor(reply, persona = {}, { scriptDone = false } = {}) 
   if (scriptDone && (t.match(/\b\d{1,2}(?::\d{2})?\s*(?:AM|PM)\b/gi) || []).length >= 2 && /\bwhich\b|\bwork(?:s)?\b|\bor\b/i.test(q)) return 'The first one';
   return null;
 }
-// 8: owner, zip, decision maker, presence, the pick, name, phone, address.
-const MAX_AUTO_ANSWERS = 8;
+// 9: owner, zip, the count, decision maker, presence, the pick, name, phone, address.
+const MAX_AUTO_ANSWERS = 9;
 
 /** The test conversations (the "good test messages" list). Customer side only. */
 export const SCENARIOS = Object.freeze({

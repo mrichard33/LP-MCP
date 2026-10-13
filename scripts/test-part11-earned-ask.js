@@ -8,6 +8,8 @@
 process.env.SUPABASE_URL ||= 'http://localhost:54321';
 process.env.SUPABASE_SERVICE_ROLE_KEY ||= 'test-key';
 
+// 2026-10-13: these cases fix the window/door count as already known (knownOpenings),
+// so the count question (openingsGate, nepq-planner.js) stays out of their way.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
@@ -18,7 +20,7 @@ const { heuristicExtract } = await import('../src/services/identity-extraction.j
 const SLOTS = [{ iso: '2026-10-06T14:00:00Z', day: 'Tue, Oct 6', time: '10:00 AM' }, { iso: '2026-10-07T18:00:00Z', day: 'Wed, Oct 7', time: '2:00 PM' }];
 const T = (...pairs) => pairs.map(([d, t]) => ({ direction: d, text: t }));
 const OPEN_MS = Date.parse('2026-10-05T15:00:00Z');
-const plan = (a) => planNepqTurn({ channel: 'sms', nowMs: OPEN_MS, ...a });
+const plan = (a) => planNepqTurn({ knownOpenings: true, channel: 'sms', nowMs: OPEN_MS, ...a });
 
 // ── earn the ask ──────────────────────────────────────────────────────────
 test('earned = the problem in their words AND why it matters', () => {

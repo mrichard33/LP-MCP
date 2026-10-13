@@ -40,8 +40,10 @@ const thread = (...xs) => xs.map(([d, t]) => ({ direction: d === 'o' ? 'outbound
 // openings_known: the count is the gate's third item (the user, 2026-10-13).
 const QUALIFIED = { homeowner: 'yes', decision_makers: 'sole', zip: '33908', openings_known: true };
 
-const plan = (convo, trigger, { stage = null, channel = 'sms', slots = [THU_10, THU_2], allSlots = ALL, ...rest } = {}) =>
-  P.planNepqTurn({ channel, trigger, conversation: convo, slots, allSlots, tzLabel: 'ET', nowMs: NOW, stage, ...rest });
+// knownOpenings: the count is known unless a case says otherwise (2026-10-13:
+// the count question runs in every mode; these cases test other moves).
+const plan = (convo, trigger, { stage = null, channel = 'sms', slots = [THU_10, THU_2], allSlots = ALL, knownOpenings = true, ...rest } = {}) =>
+  P.planNepqTurn({ channel, trigger, conversation: convo, slots, allSlots, tzLabel: 'ET', nowMs: NOW, stage, knownOpenings, ...rest });
 
 // ── the easy yes ─────────────────────────────────────────────────────────
 
@@ -64,7 +66,7 @@ test('the easy yes asks the one missing qualifying item first (owner → zip →
   const p2 = plan(convo, 'yes please', { stage: { stage: 'problem', facts: { homeowner: 'yes' } } });
   assert.equal(p2.qualify_item, 'zip');
   // 2026-10-13 (the user): the count, in the user's wording, asked once.
-  const p3 = plan(convo, 'yes please', { stage: { stage: 'problem', facts: { homeowner: 'yes', zip: '33908' } } });
+  const p3 = plan(convo, 'yes please', { stage: { stage: 'problem', facts: { homeowner: 'yes', zip: '33908' } }, knownOpenings: false });
   assert.equal(p3.qualify_item, 'openings');
   assert.match(p3.fixed_line, /How many windows and doors are you looking to (?:get a quote on|have us come measure)\?/);
   const p4 = plan(convo, 'yes please', { stage: { stage: 'problem', facts: { homeowner: 'yes', zip: '33908', openings_known: true } } });
