@@ -386,7 +386,8 @@ again").** Of 80 Set/Verif visits for today..+2 on 2026-10-13, 36 had no Conf ad
 window (a rebook, a re-set, a bot booking on an existing lead, or a visit booked 4+ days ahead), 9 sat on `lookup_cap`
 every pass, 2 lost their phone to a newer form row with no visit. Now the job also reads every lead with a visit
 today..+2 (`readLeadsByAppointment`), spends the Five9 lookups on adds first, soonest visit first (`lookupPriority`),
-and a row holding a visit wins its phone (`onePerPhone`).
+and a row holding a visit wins its phone (`onePerPhone`). A killed inbound row never wins a phone, and a row LP checked
+out into a lead beats an inbound-only one (583074 lost its Thursday visit to in1 430305, a self-book killed "Duplicate").
 
 **The LP note is a 2–3 sentence rep brief (the user, 2026-10-05).** Prospect 462947 reached LP with 1,400
 characters: the address three times, "tomorrow" for the visit, a script with a blank ("this is [YOUR NAME]"), internal

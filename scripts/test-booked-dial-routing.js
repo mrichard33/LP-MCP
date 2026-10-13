@@ -104,6 +104,29 @@ test('2026-10-13: the row holding the visit wins its phone over a newer row with
   }
 });
 
+test('2026-10-13: a killed duplicate never takes the phone from the real booked lead (583074)', () => {
+  // in1 430304 → lds 583074 (Set, Thu 2 PM); in1 430305 a minute later, killed "Duplicate", carrying the appt date.
+  const lead = { lp_lead_id: '583074', disposition_code: 'Set', appointment_date: '2026-10-15 14:00:00+00', lp_prospect_id: '464427' };
+  const real = cand({ id: '430304', datereceived: '2026-10-12T16:48:02.817', apptdate: '', appttime: '', lds_id: '583074', cst_id: '464427' }, lead);
+  const dup = cand({ id: '430305', datereceived: '2026-10-12T16:49:09.53', apptdate: '10/15/2026', appttime: '2:00 PM', lds_id: '', cst_id: '', dsp_id: '', killreason: 'Duplicate' });
+  for (const order of [[dup, real], [real, dup]]) {
+    const { winners, dropped } = onePerPhone(order);
+    assert.deepEqual(winners.map((c) => c.ldsId), ['583074']);
+    assert.deepEqual(dropped.map((c) => c.in1), ['430305']);
+  }
+  assert.equal(routeBooked(real, { nowMs: edt('2026-10-13T15:00:00'), cfg }).addList, 'Conf - 2nd Day');
+});
+
+test('2026-10-13: between two live rows with a visit, the one LP checked out wins; else the newest', () => {
+  const lead = { lp_lead_id: '583074', disposition_code: 'Set', appointment_date: '2026-10-15 14:00:00+00' };
+  const checkedOut = cand({ id: '1', datereceived: '2026-10-05T10:00:00', lds_id: '583074' }, lead);
+  const inboundOnly = cand({ id: '2', datereceived: '2026-10-06T10:00:00', lds_id: '', cst_id: '' });
+  assert.deepEqual(onePerPhone([inboundOnly, checkedOut]).winners.map((c) => c.in1), ['1']);
+  const a = cand({ id: '3', datereceived: '2026-10-05T10:00:00' });
+  const b = cand({ id: '4', datereceived: '2026-10-06T10:00:00' });
+  assert.deepEqual(onePerPhone([a, b]).winners.map((c) => c.in1), ['4']);
+});
+
 test('2026-10-13: Five9 lookups go to adds first, soonest visit first; removal re-checks last', () => {
   const at = (iso) => ({ c: { apptStartMs: Date.parse(iso) } });
   const items = [
