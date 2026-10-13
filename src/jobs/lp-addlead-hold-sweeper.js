@@ -32,6 +32,7 @@ import {
   holdMaxRetries,
   looksLikeGhlContactId,
 } from '../services/lp-address-gate.js';
+import { slackPhone } from '../format-helpers.js';
 
 const FIELD_LP_INBOUND_LEAD_ID = '3YMxheIlPyhACB8zyc3W'; // in1_id custom field
 
@@ -128,7 +129,7 @@ export async function runAddleadHoldSweep(deps = {}) {
           sendGroupMeMessage(
             `⚠️ ADDLEAD FORWARDED WITH INCOMPLETE ADDRESS\n` +
             `👤 ${name}\n` +
-            `📞 ${stamped.phone1 || stamped.phone || 'no phone'} | Contact: ${hold.ghl_contact_id}\n` +
+            `📞 ${slackPhone(stamped.phone1 || stamped.phone) || 'no phone'} | Contact: ${hold.ghl_contact_id}\n` +
             `Missing after ${attempts} enrichment attempts: ${missing.join(', ')}\n` +
             `LP notes are stamped "INCOMPLETE ADDRESS ON FILE" — collect the address on the first call ` +
             `and it will backfill to the prospect via UpdateProspectInfo.`,

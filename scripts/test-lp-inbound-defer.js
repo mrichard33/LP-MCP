@@ -201,7 +201,7 @@ test('card names the row, the visit, and what is blank — plain English', () =>
     apptStartMs: APPT_MON_2PM, calendarName: 'Window Estimate', contactId: 'LgCeHyniTQPfrnT4Ga7j',
   });
   assert.match(card, /inbound row 428372/);
-  assert.match(card, /Daniel · \(239\)250-0011/);
+  assert.match(card, /Daniel · 2392500011/);
   assert.match(card, /3418 Westclox St, Immokalee, FL 34142/);
   assert.match(card, /Window Estimate: Mon, 10\/5, 2:00 PM ET/);
   assert.match(card, /Blank on the row: last name, email/);

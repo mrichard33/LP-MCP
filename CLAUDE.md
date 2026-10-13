@@ -33,6 +33,13 @@ mirror do the rest:
 Because the mirror sits below the card builders, there is no second copy of any message format.
 Build the card once.
 
+**A customer phone on a card is 10 digits, nothing else (the user, 2026-10-13).** "List the number with numbers only
+##########": `3525550188`, the FULL number (the old last-four `…0188` cards included), no +1, dashes, dots, spaces or
+parentheses. Card builders use `slackPhone` (`src/format-helpers.js`); `normalizeSlackPhones` / `normalizeSlackBlocks`
+(`src/slack-phone-format.js`) is the safety net in `postToSlack`, `updateSlackMessage`, the approval `respond()` and the
+GroupMe send (only a phone SHAPE with a separator or a +1 is rewritten, and only block `text`, never a button `value`).
+Customer-facing texts and chat replies keep `(352) 555-0188`.
+
 **When Slack is the PRIMARY destination, not a mirror, use `postToSlack(text, channelId)`** in
 `src/slack.js` — it returns `{ ok, ts, channel, error }`. `mirrorToSlack` fans out to several channels
 and reduces the result to a count, so it cannot tell you the message `ts` or that a specific post
@@ -1191,6 +1198,15 @@ live chat never runs `DQ_ABOVE_2ND_FLOOR_INTERIM`). Both are now in the shared s
 `LIB-P14`, and `enforcePropertyScope` (`src/agentic/property-scope.js`), the last pass in both bots: a lead who raises
 one gets the "no" as the whole reply, and any "we do" sentence is replaced. The building counts, not the unit. Modular
 homes are not ruled on and are deliberately not covered; "tower" alone and "4 floor-to-ceiling windows" do not count.
+
+**A commercial or rental lead is set to ND by a person (the user, 2026-10-13).** LP's API cannot change a disposition
+(no endpoint writes one). When the lead's own newest message makes `jobScopeFromThread` (`src/agentic/job-scope.js`)
+block as `commercial` or `rental` (`scopeDqKind`, `src/agentic/scope-dq.js`), the SMS send handler and the live chat
+(after the send) add a note on the LP PROSPECT (`rectype: 'cst'`; `ils` silently no-ops) and post ONE
+`⛔ SET THIS LEAD TO ND IN LP` card to #contact-center (`routeNepqHandoff` reason `scope_dq`, in `NO_DIAL_REASONS`: no
+Five9 call, no `callback:requested`, and the turn's callback decision is skipped), once per contact per kind ever (audit
+`scope_dq`, permanent). Below the minimum is not included (not asked). `SCOPE_DQ_MODE` off|shadow|live, default live.
+Production deps: `src/services/scope-dq-io.js`.
 
 **Retiring a FAQ without a replacement leaves a hole the search fills with the nearest thing.**
 Retiring `#14` (roofing) during the golden ingest left no roofing answer at all, and a live lead

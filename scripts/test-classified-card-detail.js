@@ -56,7 +56,7 @@ test('an existing caller passing none of the new args renders the expected forma
   assert.equal(card, [
     '🤖 SYSTEM EVENT — LP APPOINTMENT SET',
     '',
-    '👤 Myron Thorner | (727) 555-1234',
+    '👤 Myron Thorner | 7275551234',
     'Contact ID: q5GehRye7DNkN6jlmjl3',
     'Prospect: Not yet assigned',
     '🌍 Market: Unknown',
@@ -191,7 +191,7 @@ test('buildLpAppointmentCard renders one card carrying LP ref, address, email an
   });
 
   assert.match(card, /🤖 SYSTEM EVENT — LP APPOINTMENT SET/);
-  assert.match(card, /👤 Myron Thorner \| \(727\) 555-1234/);
+  assert.match(card, /👤 Myron Thorner \| 7275551234/);
   assert.match(card, /Prospect: 454810/);
   assert.match(card, /📍 123 Main St, Trinity FL 34655/);
   assert.match(card, /✉️ myron@example\.com/);

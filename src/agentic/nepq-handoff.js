@@ -51,12 +51,15 @@ const WHY = {
   callback_request: 'The lead asked for a phone call (or said yes to one). Call them, at the time they named if they gave one.',
   booking_request: 'The lead picked a time in the website chat, but the bot could not book it (usually a missing address). Call to confirm the details and book that time.',
   // 2026-10-07 (Nicholas Ferraioli): a team note says we cannot run the lead.
+  // 2026-10-13 (the user): a commercial property or a rental unit (scope-dq.js).
+  scope_dq: "The lead said the home is one we do not work on. LP's API cannot change a disposition: open the lead in LP and set it to ND. No sales call.",
   lp_note_dq: 'A team note in LP says we cannot run this lead. The bot is now OFF for this contact (stop-bot) and booked nothing. Call them, explain plainly, and settle what happens next. Remove stop-bot only if the bot should talk to them again.',
 };
 
 // What the bot told the lead, when it is not "someone will reach out".
 const TOLD = {
   lp_note_dq: ' The bot told them a team member will call to confirm a time, and named no day or time.',
+  scope_dq: " The bot told them we can't help with this home and offered no visit.",
   two_nos: ' The bot stopped asking and promised no call.',
   do_not_knock: ' The bot apologised and told them our team will not knock again.',
 };
@@ -66,7 +69,7 @@ export function formatNepqHandoff({ reason, channel, inbound, contactId, firstNa
   const who = firstName || 'A lead';
   return {
     note: `[AGENT TASK] ${who} needs a person (NEPQ hand-off: ${reason}).\nThey said: "${String(inbound || '').slice(0, 400)}"\n${WHY[reason] || ''}`,
-    card: `${reason === 'do_not_knock' ? '🚪 DO NOT KNOCK' : reason === 'lp_note_dq' ? '⛔ TEAM NOTE: WE CAN\'T RUN THIS LEAD, BOT STOPPED' : `🤝 A PERSON IS NEEDED (${reason.replace(/_/g, ' ')})`}\nContact: ${firstName || 'name not given yet'}\nChannel: ${channel === 'livechat' ? 'WEBSITE CHAT' : String(channel || 'sms').toUpperCase()}\nThey said: "${String(inbound || '').slice(0, 200)}"\n→ ${WHY[reason] || 'Needs a person.'}${TOLD[reason] ?? ' The bot told them someone from our team will reach out.'}${extra ? `\n${extra}` : ''}\nGHL: https://app.gohighlevel.com/v2/location/${GHL_LOCATION_ID}/contacts/detail/${contactId}`,
+    card: `${reason === 'do_not_knock' ? '🚪 DO NOT KNOCK' : reason === 'lp_note_dq' ? '⛔ TEAM NOTE: WE CAN\'T RUN THIS LEAD, BOT STOPPED' : reason === 'scope_dq' ? '⛔ SET THIS LEAD TO ND IN LP' : `🤝 A PERSON IS NEEDED (${reason.replace(/_/g, ' ')})`}\nContact: ${firstName || 'name not given yet'}\nChannel: ${channel === 'livechat' ? 'WEBSITE CHAT' : String(channel || 'sms').toUpperCase()}\nThey said: "${String(inbound || '').slice(0, 200)}"\n→ ${WHY[reason] || 'Needs a person.'}${TOLD[reason] ?? ' The bot told them someone from our team will reach out.'}${extra ? `\n${extra}` : ''}\nGHL: https://app.gohighlevel.com/v2/location/${GHL_LOCATION_ID}/contacts/detail/${contactId}`,
   };
 }
 

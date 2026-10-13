@@ -430,7 +430,7 @@ test('6d. refuses any other rule, a free-form number list, and an SMS clear for 
 });
 
 test('6f. a number still on Five9 DNC after the removal fails the step, never "done"', () => {
-  assert.throws(() => writes.assertDncRemoved(['8134166946'], { on_dnc: ['8134166946'], not_on_dnc: [] }), /still lists 1 of 1 number\(s\) on DNC.*…6946/);
+  assert.throws(() => writes.assertDncRemoved(['8134166946'], { on_dnc: ['8134166946'], not_on_dnc: [] }), /still lists 1 of 1 number\(s\) on DNC.*8134166946/);
   assert.doesNotThrow(() => writes.assertDncRemoved(['8134166946'], { on_dnc: [], not_on_dnc: ['8134166946'] }));
 });
 
@@ -592,7 +592,7 @@ test('review: card payload carries last-4, blocking tags, and the STOP warning v
   assert.equal(p.phone_last4, '6946');
   // 2026-10-02 (handoff): the card now shows the full number so the approver
   // can find the lead in LP and Five9; phone_last4 stays for older n8n code.
-  assert.equal(p.phone_full, '(813) 416-6946');
+  assert.equal(p.phone_full, '8134166946'); // digits only on the card (2026-10-13)
   assert.deepEqual(p.blocking_tags, ['dnc', 'dnc-sms', 'suppress:dnc-reply']);
   assert.equal(p.sms_warning, 'This lead texted STOP. Approving restores calls only. Texts stay off until they text START or submit a new form with SMS consent.');
   assert.equal(p.sub_source, 'high-intent-digital');

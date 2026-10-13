@@ -158,6 +158,7 @@
 
 import { createHash } from 'node:crypto';
 import { denyAll } from './auth.js';
+import { normalizeSlackPhones } from './slack-phone-format.js';
 import supabase from './supabase.js';
 import { generateResponse } from './response-generator.js';
 // GroupMe → Slack migration (2026-09-09). Every card that POSTs to GroupMe is
@@ -491,7 +492,8 @@ async function _sendRawGroupMeMessage(text, botId = GROUPME_BOT_ID, mirror = {})
     const res = await fetch('https://api.groupme.com/v3/bots/post', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ bot_id: botId, text: text.slice(0, 1000) }),
+      // Digits-only phones, like the Slack copy (the user, 2026-10-13).
+      body: JSON.stringify({ bot_id: botId, text: normalizeSlackPhones(String(text)).slice(0, 1000) }),
       signal: AbortSignal.timeout(10000),
     });
     if (!res.ok) {

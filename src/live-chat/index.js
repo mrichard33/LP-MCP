@@ -40,6 +40,8 @@ import { resolveMarket } from '../actions/enrichment.js';
 import { postToSlack } from '../slack.js';
 import { fileBotCallback } from '../agentic/bot-callback.js';
 import { botCallbackDeps, nepqHandoffDeps } from '../services/bot-callback-io.js';
+import { runScopeDq } from '../agentic/scope-dq.js';
+import { scopeDqDeps } from '../services/scope-dq-io.js';
 import { guardRepeatPromise, recordPromiseIfAny } from '../services/promised-callbacks-io.js';  // 2026-10-07
 import { recordTurnStage, readStageForPlanner } from '../services/lead-stage-io.js';  // 2026-10-12
 import { trackBackground } from '../graceful-shutdown.js';
@@ -406,6 +408,12 @@ async function nepqHandoff({ contactId, reason, inbound, firstName, hasPhone = t
     botCallbackDeps({ applyTags, addNote }));
 }
 
+/** A commercial property or a rental unit: the LP note + set-ND card (2026-10-13). */
+async function scopeDq({ contactId, kind, inbound, phone = null }) {
+  const applyTags = (id, tags) => ghlFetch('POST', `/contacts/${id}/tags`, { tags }, { priority: 'normal' });
+  return runScopeDq({ contactId, kind, channel: 'livechat', inbound, phone }, scopeDqDeps({ applyTags, addNote: (id, note) => addGHLNote(id, note) }));
+}
+
 /**
  * Every production dependency of the lane, as one object. The bot simulator
  * (src/simulator/bot-simulator.js) takes the real model, knowledge and
@@ -447,6 +455,7 @@ export function productionLaneDeps() {
     offerBookingSlots,
     bookSlot,
     nepqHandoff,
+    scopeDq,
     guardRepeatPromise: (p) => guardRepeatPromise(p),
     recordPromise: (p) => recordPromiseIfAny(p),
     // Fire-and-forget: the stage never holds up a reply (lead-stage-io.js).

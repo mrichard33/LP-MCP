@@ -340,7 +340,7 @@ export async function runBookedDialRouting({ env = process.env, nowMs = Date.now
         console.log(`[BookedRouting] queued add …${c.phone.slice(-4)} → "${list}" as agent_action ${ins.data?.id}`);
       } catch (err) {
         if (won) await release(d.supabase, key);
-        errors.push(`add ${c.phone.slice(-4)}: ${err.message}`);
+        errors.push(`add ${c.phone}: ${err.message}`);
         note(c, 'failed', 'add_queue_failed', { list });
       }
       continue;
@@ -378,7 +378,7 @@ export async function runBookedDialRouting({ env = process.env, nowMs = Date.now
         console.log(`[BookedRouting] queued removal of …${c.phone.slice(-4)} from ${lists.join(', ')} as agent_action ${ins.data?.id} (${row.requires_approval ? 'awaiting approval' : 'auto — standing exception'})`);
       } catch (err) {
         for (const k of won) await release(d.supabase, k);
-        errors.push(`removal ${c.phone.slice(-4)}: ${err.message}`);
+        errors.push(`removal ${c.phone}: ${err.message}`);
         note(c, 'failed', 'removal_queue_failed');
       }
       continue;

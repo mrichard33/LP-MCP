@@ -24,6 +24,7 @@
  */
 import supabase from './supabase.js';
 import { buildApprovalBlocks } from './slack-approvals-core.js';
+import { normalizeSlackPhones, normalizeSlackBlocks } from './slack-phone-format.js';
 
 const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN || '';
 const MIRROR_ENABLED = String(process.env.SLACK_MIRROR_ENABLED || 'false') === 'true';
@@ -278,13 +279,14 @@ export async function postToSlack(text, channelId, opts = {}) {
       },
       body: JSON.stringify({
         channel: channelId,
-        text: String(text),
+        // Phone numbers go out as digits only (the user, 2026-10-13).
+        text: normalizeSlackPhones(String(text)),
         // A reply, when the caller has a parent ts. Slack ignores the key when
         // it is absent, so the ordinary post path is byte-identical to before.
         ...(opts.threadTs ? { thread_ts: String(opts.threadTs) } : {}),
         // Interactive cards (approval buttons). `text` stays as the
         // notification fallback Slack requires alongside blocks.
-        ...(Array.isArray(opts.blocks) && opts.blocks.length ? { blocks: opts.blocks } : {}),
+        ...(Array.isArray(opts.blocks) && opts.blocks.length ? { blocks: normalizeSlackBlocks(opts.blocks) } : {}),
       }),
       signal: AbortSignal.timeout(10000),
     });
@@ -322,8 +324,8 @@ export async function updateSlackMessage(channelId, ts, text, opts = {}) {
       body: JSON.stringify({
         channel: channelId,
         ts: String(ts),
-        text: String(text || ''),
-        ...(Array.isArray(opts.blocks) ? { blocks: opts.blocks } : {}),
+        text: normalizeSlackPhones(String(text || '')),
+        ...(Array.isArray(opts.blocks) ? { blocks: normalizeSlackBlocks(opts.blocks) } : {}),
       }),
       signal: AbortSignal.timeout(10000),
     });

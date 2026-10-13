@@ -180,7 +180,7 @@ test('uncalled / intake alarms are three-way, and verdicts map onto `active`', (
   assert.equal(alertConfig({ LEAD_UNCALLED_GRACE_HOURS: '4' }).graceHours, 4);
 });
 
-test('cards name the leads — first name + initial, last four digits only', () => {
+test('cards name the leads — first name + initial, the full phone as digits (2026-10-13)', () => {
   const offenders = [{
     first_name: 'Jane', last_name: 'Doe', phone10: '3524453161', lead_source: 'Google PPC',
     reason: 'routing_or_automation_failure', lp_lead_id: '578472', waitingMs: 3 * 3600000 + 600000,
@@ -188,9 +188,8 @@ test('cards name the leads — first name + initial, last four digits only', () 
   const text = formatUncalledAlert(offenders, { dashboardUrl: 'https://dash.example/lead-leaks' });
   assert.match(text, /1 lead waiting more than 2h for a Five9 call/);
   assert.match(text, /\*Never dialled — Five9 has the number — 1\*/, 'grouped under its reason');
-  assert.match(text, /Jane D\. · …3161 · Google PPC · waiting 3h 10m · Never dialled — Five9 has the number · LP 578472/);
+  assert.match(text, /Jane D\. · 3524453161 · Google PPC · waiting 3h 10m · Never dialled — Five9 has the number · LP 578472/);
   assert.match(text, /https:\/\/dash\.example\/lead-leaks/);
-  assert.ok(!text.includes('3524453161'), 'never the full number');
 
   const speed = formatSpeedAlert({ reasons: ['slower'], recent: { median_min: 90 }, baseline: { median_min: 20 } }, offenders);
   assert.match(speed, /1h 30m over the last 3 days, up from 20m/);
@@ -198,7 +197,7 @@ test('cards name the leads — first name + initial, last four digits only', () 
   const gap = formatIntakeGapAlert([{ first_name: 'Sam', last_name: '', phone10: '9415550101', source: 'Modernize',
     date_added: '2026-09-20T12:00:00Z', ghl_contact_id: 'abc' }]);
   assert.match(gap, /1 lead in GHL never reached LP/);
-  assert.match(gap, /Sam · …0101 · Modernize · in GHL since 2026-09-20 · GHL abc/);
+  assert.match(gap, /Sam · 9415550101 · Modernize · in GHL since 2026-09-20 · GHL abc/);
   assert.equal(displayName('', ''), 'No name');
   assert.equal(phoneTail(null), 'no phone');
   assert.equal(formatWait(3 * 86400000), '3d 0h');
@@ -306,7 +305,7 @@ test('hourly check, live: reports ONE card on ops that names the lead', async ()
   assert.equal(calls[0].channel, 'ops');
   assert.equal(calls[0].active, true);
   const text = calls[0].text();
-  assert.match(text, /Jane D\. · …3161/);
+  assert.match(text, /Jane D\. · 3524453161/);
 });
 
 test('hourly check: a lead Five9 already rang is not waiting → healthy (clears)', async () => {
@@ -354,7 +353,7 @@ test('hourly check, digest era: posts the new lead once, then never re-lists it'
   const r1 = await runLeadUncalledCheck({ env, nowMs: NOW, deps });
   assert.equal(sent.length, 1);
   assert.equal(sent[0][1].channel, 'ops');
-  assert.match(sent[0][0], /Jane D\. · …3161/);
+  assert.match(sent[0][0], /Jane D\. · 3524453161/);
   assert.match(r1.summary, /new=1 posted/);
   const r2 = await runLeadUncalledCheck({ env, nowMs: NOW + 3_600_000, deps });
   assert.equal(sent.length, 1, 'the same lead is not posted again');
@@ -428,7 +427,7 @@ test('daily pass, alerts live: never-reached-LP card names the contact', async (
   await runLeadLeakMonitor({ env: { LEAD_LEAK_ALERT_MODE: 'live' }, nowMs: NOW, deps });
   const intake = calls.find((c) => c.key === 'lead_intake_gap');
   assert.equal(intake.active, true);
-  assert.match(intake.text(), /Sam L\. · …0101 · Modernize/);
+  assert.match(intake.text(), /Sam L\. · 9415550101 · Modernize/);
   const speed = calls.find((c) => c.key === 'lead_speed_slow');
   assert.equal(speed.active, null, 'one lead is too little to judge a trend');
 });

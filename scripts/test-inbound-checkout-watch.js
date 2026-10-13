@@ -127,11 +127,10 @@ test('DST (2026-11-01, clocks fall back at 2 AM): office hours and waits follow 
   assert.equal(assessWaiting([r], Date.parse('2026-11-01T13:21:00Z'), cfg)[0].due, true);
 });
 
-test('the card line names everything a person needs and no full phone', () => {
+test('the card line names everything a person needs, the full phone as digits (2026-10-13)', () => {
   const card = formatWaitCard(assessWaiting([row()], edt('2026-10-06T15:40:00'), cfg));
   assert.ok(card.startsWith(WAIT_HEADER));
-  assert.match(card, /Shelley · …0700 · inquiry 428940 · GHL-Chatbot \/ Reece ChatBot · appt 2026-10-08 6:00 PM · waiting 17 min · FTMYR/);
-  assert.doesNotMatch(card, /9414670700/);
+  assert.match(card, /Shelley · 9414670700 · inquiry 428940 · GHL-Chatbot \/ Reece ChatBot · appt 2026-10-08 6:00 PM · waiting 17 min · FTMYR/);
 });
 
 test('contact appointment parsing and "upcoming"', () => {

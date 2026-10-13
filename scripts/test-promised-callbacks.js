@@ -142,7 +142,7 @@ test('the expired card names the promise and never the lead pronoun', () => {
   const card = formatExpiredCard({ promise: { ...OPEN, promise_text: 'Dana will be reaching out shortly.' }, name: 'Robert', locationId: 'LOC' });
   assert.match(card, /PROMISED CALL NOT KEPT/);
   assert.match(card, /Dana would call/);
-  assert.match(card, /\(917\) 555-0100/);
+  assert.match(card, /9175550100/);
   assert.doesNotMatch(card, /\b(he|she|him|her)\b/i);
 });
 

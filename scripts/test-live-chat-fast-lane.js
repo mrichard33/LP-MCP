@@ -681,7 +681,7 @@ test('name + phone that match → one reschedule offer; "no" → cancelled in GH
   assert.equal(b.state.cards.length, 1);
   assert.match(b.state.cards[0].text, /LIVE CHAT CANCEL — cancel it in LP/);
   assert.match(b.state.cards[0].text, /GHL: ✅ cancelled by the bot\. → Cancel it in LP\./);
-  assert.match(b.state.cards[0].text, /\(352\) 555-0188/);
+  assert.match(b.state.cards[0].text, /3525550188/); // digits only on the card (2026-10-13)
   assert.equal(b.state.cards[0].contactId, 'RICK1');
 });
 

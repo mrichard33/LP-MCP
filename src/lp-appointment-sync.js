@@ -230,7 +230,7 @@ import {
 import { refusedAppointmentAnswer } from './lp-appointment-guards.js';
 import { sendGroupMeMessage } from './groupme.js';
 import { acquireToken } from './ghl-rate-limiter.js';
-import { formatLpSource, formatApptTime12h } from './format-helpers.js';
+import { slackPhone, formatLpSource, formatApptTime12h } from './format-helpers.js';
 import { enrollLpLeadCreation } from './admin/lp-force-addlead.js';
 // 2026-07-07 call-dispatch-integrity: Five9 direct dispatch gate for GHL-only
 // calendars (dormant unless FIVE9_DIRECT_DISPATCH=true — see five9/list-dispatch.js).
@@ -1383,8 +1383,9 @@ async function releaseFailureNotices(contactId, client = supabase) {
 
 function formatPhoneDisplay(p) {
   const d = normalizePhone(p);
-  if (d.length !== 10) return p || '';
-  return `(${d.slice(0,3)}) ${d.slice(3,6)}-${d.slice(6)}`;
+  // Digits only on the card (the user, 2026-10-13).
+  if (d.length !== 10) return p ? String(p).replace(/\D/g, '') : '';
+  return d;
 }
 
 async function sendSyncFailureNotification({
@@ -1676,7 +1677,7 @@ const APPT_LABEL_FMT = new Intl.DateTimeFormat('en-US', {
 /** The card a person works from. PURE. Plain English, no rule codes. */
 function formatHeldInboundCard({ pending = {}, contactName, contactPhone, address, apptStartMs, timeKnown = true, calendarName, contactId }) {
   const name = [pending.firstName, pending.lastName].filter(Boolean).join(' ') || contactName || 'Unknown name';
-  const phone = pending.phone || contactPhone || 'no phone';
+  const phone = slackPhone(pending.phone || contactPhone) || 'no phone'; // digits only (2026-10-13)
   const where = address || pending.address1 || 'no address';
   const when = Number.isFinite(apptStartMs)
     ? (timeKnown ? APPT_LABEL_FMT.format(new Date(apptStartMs)) : APPT_LABEL_FMT.format(new Date(apptStartMs)).replace(/,\s*\d.*$/, ''))

@@ -83,7 +83,7 @@ const EXPECTED_486315 = [
   "What happened: Stacey Wheeler's LP job #58856 changed Started → Paid In Full (Sep 22, 2:53 PM ET).",
   "If you approve: Stacey's Pipeline 2 opportunity is marked WON ($116,000).",
   'If you reject: Nothing changes; the Pipeline 2 opportunity stays as it is. It is not retried.',
-  'Contact: Stacey Wheeler · (561) 373-9673 · Rep: Michael Carr · Branch: Fort Myers · Source: Internet',
+  'Contact: Stacey Wheeler · 5613739673 · Rep: Michael Carr · Branch: Fort Myers · Source: Internet',
   'ref: P2_JOB_TERMINAL_WON · event 3856701',
 ].join('\n');
 

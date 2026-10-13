@@ -57,6 +57,7 @@ import { enforceTeamVoice } from '../agentic/team-voice.js';
 import { enforcePropertyScope } from '../agentic/property-scope.js';
 import { enforceNonOwner, isNonOwner, nonOwnerLine } from '../agentic/non-owner.js';
 import { enforceJobScope, jobScopeFromThread, openingsToSave, RENTAL_LINE, COMMERCIAL_LINE, BELOW_MINIMUM_LINE, MINIMUM_CHECK_LINE, MINIMUM_CHECK_DOORS_LINE } from '../agentic/job-scope.js';
+import { scopeDqKind } from '../agentic/scope-dq.js';
 import { enforceCallTiming, promisedCallback, isTeamOpen } from '../agentic/team-hours.js';
 import { rewriteBookingClaims, appointmentOnFile, checkBookingTruth, bookingResult, noPromiseHandoffLine } from '../agentic/booking-claim.js';
 import { enforceCancelledVisit } from '../agentic/cancelled-visit.js';
@@ -1921,6 +1922,12 @@ export function createLiveChatFastLane(deps) {
       if (!extras.repeat_promise_blocked && !skipCapture && shouldRecordPromise({ trigger: body, plan: stageInput?.plan || null })) Promise.resolve()
         .then(() => d.recordPromise({ contactId, text: draft, channel: 'livechat', phone: phoneFromText(visitorTexts.join(' ') || body) || null, rule: LIVE_CHAT_RULE, actionId }))
         .catch(err => d.warn(`[LiveChat] promise record failed for ${contactId}: ${err.message}`));
+      // A commercial property or a rental unit: a note on the LP prospect and
+      // one card asking a person to set ND (2026-10-13, scope-dq.js).
+      const scopeKind = scopeDqKind(body);
+      if (scopeKind && d.scopeDq) Promise.resolve()
+        .then(() => d.scopeDq({ contactId, kind: scopeKind, inbound: body, phone: phoneFromText(visitorTexts.join(' ') || body) || null }))
+        .catch(err => d.warn(`[LiveChat] set-ND card failed for ${contactId}: ${err.message}`));
     }
     // 2026-10-12 (Lead Conversation Stage): where the conversation is now that
     // the reply went out. Only a planned model turn carries stageInput.
