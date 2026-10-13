@@ -274,6 +274,7 @@ import { enforcePropertyScope } from './agentic/property-scope.js';
 import { dropFragmentOpener, dropStaleCallMention, normalizeSignature, isNearRepeat, replySimilarity, NEAR_REPEAT_NOTE } from './agentic/sms-format.js';
 import { enforceNonOwner } from './agentic/non-owner.js';
 import { enforceJobScope, openingsToSave } from './agentic/job-scope.js';
+import { isPostDemoLead } from './agentic/post-demo-lead.js';
 import { enforceCallTiming, softenCallTiming, isTeamOpen, enforceRehashCallTiming } from './agentic/team-hours.js';
 import { enforceOneAsk } from './agentic/one-ask.js';
 import { findUnbackedBookingClaim, rewriteBookingClaims, bookingClaimNote, appointmentOnFile, noPromiseHandoffLine, NO_PROMISE_HANDOFF_RX } from './agentic/booking-claim.js';
@@ -1564,6 +1565,13 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
     if (opts.rehash?.active) parts.push(...P.POST_APPOINTMENT_CONDUCT_END);
     else if (unsoldPostDemo) parts.push(...P.POST_APPOINTMENT_CLOSE_FOLLOW_UP_TEAM);
     else parts.push(...P.POST_APPOINTMENT_CLOSE);
+  }
+  // 2026-10-13 (the user): a lead past its demo already meets the job
+  // requirements. The shared prompt states the rental / commercial / minimum
+  // rules and the count question for everyone; this tells the model they are
+  // settled for this lead (the guards skip them too, post-demo-lead.js).
+  if (postAppt.post || opts.rehash?.active || isPostDemoLead({ lp: context.lp, tags: context.lead?.current_tags || [], stageTag: context.lead?.current_stage_tag || null })) {
+    parts.push('', 'THIS LEAD IS PAST THEIR DEMO, so they already meet our job requirements. Do not ask how many windows or doors, whether they own the home, or anything about rentals, commercial property or a minimum, and never turn them away for any of those.');
   }
   // ─── POST-DEMO REHASH (2026-10-01, Mark) ───
   // An F.0 lead (tag active-f.0) is talking to the rehash rep, and the one goal
@@ -3676,6 +3684,10 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     if (!rehashRepName) console.warn(`[ResponseGenerator] rehash reply for ${contactId} with no rep name — signing as the team`);
   }
   const rehash = rehashActive ? { active: true, repName: rehashRepName } : null;
+  // 2026-10-13 (the user): "If the appointment is post demo … we can assume the
+  // lead already meets the requirements." No qualifying questions, no job-scope
+  // or tenant decline, no set-ND card for a lead past its demo (post-demo-lead.js).
+  const pastDemo = !!rehash || isPostDemoLead({ lp: context.lp, tags: context.lead?.current_tags || [], stageTag: context.lead?.current_stage_tag || null });
 
   // Every layer3 SCRIPT DIRECTIVE is written for a lead BEFORE the demo
   // ("pricing needs the in-home measurement", Confirmation Call slots, the
@@ -4156,6 +4168,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       const planArgs = {
         channel: 'sms',
         trigger: triggerMessage,
+        postDemoLead: pastDemo,
         conversation: context.conversation_recent || [],
         slots: offerSelection?.slots || [],
         allSlots: preferencePool,
@@ -5205,7 +5218,10 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     // 2026-10-13 (the user): no rentals, no commercial properties, and a
     // minimum of three openings or one sliding glass door (job-scope.js).
     // Every mode, like the renter guard. A block or the minimum check books nothing.
-    const jobScope = enforceJobScope(validated.message, { thread: context.conversation_recent || [], inbound: triggerMessage });
+    // A lead past its demo (2026-10-13): the rep already qualified the home, so
+    // only our own false claims are checked (no thread, no lead words).
+    if (pastDemo) validated.post_demo_lead = true;
+    const jobScope = pastDemo ? enforceJobScope(validated.message, {}) : enforceJobScope(validated.message, { thread: context.conversation_recent || [], inbound: triggerMessage });
     if (jobScope.changed) {
       console.warn(`[JobScope] ${contactId} ${jobScope.reason}`);
       validated.message = jobScope.text;
@@ -5221,7 +5237,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     if (openingsFields.length) validated.openings_fields = openingsFields;
     // 2026-10-12 (no single-leg visits; batch 3 T3): a lead who said they
     // rent gets no time and no booking, in every mode (non-owner.js).
-    const owner = enforceNonOwner(validated.message, { thread: context.conversation_recent || [], inbound: triggerMessage });
+    const owner = pastDemo ? { changed: false } : enforceNonOwner(validated.message, { thread: context.conversation_recent || [], inbound: triggerMessage });
     if (owner.changed) {
       console.warn(`[NonOwner] ${contactId} ${owner.reason}`);
       validated.message = owner.text;

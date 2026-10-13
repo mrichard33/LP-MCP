@@ -61,10 +61,10 @@ export function phoneLast4(phone) {
   return digits.length >= 4 ? digits.slice(-4) : null;
 }
 
-/** "(954) 379-2151", or null when the phone is not a valid US 10-digit. Pure. */
+/** "9543792151" (digits only on the card; the user, 2026-10-13), or null when
+ *  the phone is not a valid US 10-digit. n8n prints it as given. Pure. */
 export function formatPhoneFull(phone) {
-  const p = normalizePhone10(phone);
-  return p ? `(${p.slice(0, 3)}) ${p.slice(3, 6)}-${p.slice(6)}` : null;
+  return normalizePhone10(phone) || null;
 }
 
 // ─── Pre-consent block history (2026-10-02) ─────────────────────────────────

@@ -123,7 +123,7 @@ test('the reminder is the plain-English card, with a timeout header and outcome 
   assert.match(card, /^What happened: Stacey Wheeler's LP job #58856 changed Started → Paid In Full \(Sep 22, 2:53 PM ET\)\.$/m);
   assert.match(card, /^If you approve: Stacey's Pipeline 2 opportunity is marked WON \(\$116,000\)\.$/m);
   assert.match(card, /^If you reject: /m);
-  assert.match(card, /^Contact: Stacey Wheeler · \(561\) 373-9673 · Rep: Michael Carr · Branch: Fort Myers · Source: Internet$/m);
+  assert.match(card, /^Contact: Stacey Wheeler · 5613739673 · Rep: Michael Carr · Branch: Fort Myers · Source: Internet$/m);
   // A WON close never auto-runs since 2026-10-03, and the card says so.
   assert.match(card, /^If nobody decides: nothing happens/m);
   // Old reminder content must be gone: the raw contact id, the bare action

@@ -359,7 +359,7 @@ export function buildRemovalAction(c, { reason, readded = false, confList = null
       queued_at: new Date(nowMs).toISOString(),
     },
     reasoning:
-      `Booked-lead routing (decision #2669): ${c.name || 'this lead'} (…${c.phone.slice(-4)}, LP lead ${c.ldsId || `inquiry ${c.in1}`}) ` +
+      `Booked-lead routing (decision #2669): ${c.name || 'this lead'} (${c.phone}, LP lead ${c.ldsId || `inquiry ${c.in1}`}) ` +
       `has a visit ${visitText(c)}. It comes off ${listNames.map((l) => `"${l}"`).join(', ')}. ${where}` +
       (readded ? ' LP put the number back on a setter list after an earlier removal.' : '') +
       ` Removing a number that is not on a list does nothing. Expires at the appointment time.`,
@@ -395,7 +395,8 @@ export function buildAddAction(c, record, list, { reason, nowMs }) {
   };
 }
 
-const phoneText = (p) => `(${p.slice(0, 3)}) ${p.slice(3, 6)}-${p.slice(6)}`;
+// Digits only on the card (the user, 2026-10-13).
+const phoneText = (p) => String(p || '');
 
 /** The #contact-center card for adds that failed twice. Plain English. */
 export function formatAddFailedCard(items) {

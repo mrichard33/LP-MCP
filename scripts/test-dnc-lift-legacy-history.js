@@ -69,10 +69,10 @@ function harness(over = {}) {
   return { deps, posts, seeds, calls, run };
 }
 
-test('formatPhoneFull: (XXX) XXX-XXXX, or null', () => {
-  assert.equal(review.formatPhoneFull('+19543792151'), '(954) 379-2151');
-  assert.equal(review.formatPhoneFull('9543792151'), '(954) 379-2151');
-  assert.equal(review.formatPhoneFull('+1 (352) 281-1388'), '(352) 281-1388');
+test('formatPhoneFull: 10 digits (2026-10-13), or null', () => {
+  assert.equal(review.formatPhoneFull('+19543792151'), '9543792151'); // digits only (2026-10-13)
+  assert.equal(review.formatPhoneFull('9543792151'), '9543792151');
+  assert.equal(review.formatPhoneFull('+1 (352) 281-1388'), '3522811388');
   assert.equal(review.formatPhoneFull('12345'), null);
   assert.equal(review.formatPhoneFull(null), null);
 });
@@ -102,7 +102,7 @@ test('Five9-only block, no history → legacy_block on the card, seeded once as 
   const out = await h.run();
   assert.equal(out.action, 'review_requested');
   const p = h.posts[0];
-  assert.equal(p.phone_full, '(352) 281-1388');
+  assert.equal(p.phone_full, '3522811388');
   assert.equal(p.phone_last4, '1388', 'kept for older n8n code');
   assert.equal(p.lp_prospect_id, '458487');
   assert.equal(p.lp_manual_clear_required, true);

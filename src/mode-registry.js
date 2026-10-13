@@ -138,6 +138,10 @@ export const MODES = Object.freeze([
     since: '2026-10-07', goLive: LIVE_BY_DEFAULT,
     note: 'A team note in LP that says we cannot run the lead stops the bot.',
   }),
+  m('SCOPE_DQ_MODE', 'bot', 'enum', OSL, 'live', OSL_S, {
+    since: '2026-10-13', goLive: LIVE_BY_DEFAULT,
+    note: 'A commercial property or a rental unit: a note on the LP prospect and one #contact-center card asking a person to set ND (LP\'s API cannot).',
+  }),
   m('LP_PHONE_GUARD_MODE', 'bot', 'enum', OSE, 'enforce', OSE_S, {
     since: '2026-08-18', goLive: LIVE_BY_DEFAULT,
     note: 'Checks the phone number before the bot sends.',

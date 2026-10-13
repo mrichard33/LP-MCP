@@ -1421,7 +1421,9 @@ const TIME_STEPS = new Set(['offer_slots', 'confirm', 'ask_day', 'collect']);
  * address, decision maker); only ownership holds it. Pure.
  */
 function gateForStage(plan, args) {
-  if (!plan || plan.handoff || plan.post_demo || plan.step === 'booked') return plan;
+  // A lead past its demo already meets the requirements (the user, 2026-10-13):
+  // no qualifying question and no job-scope block, whatever POST_DEMO_PLANNER_MODE says.
+  if (!plan || plan.handoff || plan.post_demo || args?.postDemoLead || plan.step === 'booked') return plan;
   const offersTimes = !!plan.allowed?.slot_offer || (plan.slots_to_offer || []).length > 0 || TIME_STEPS.has(plan.step) || plan.required_move === 'bridge' || !!plan.offer_slots_pending;
   if (!offersTimes) return plan;
   const turns = normalizeThread(args.conversation, args.trigger);

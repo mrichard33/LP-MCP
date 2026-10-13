@@ -118,14 +118,14 @@ process.env.SLACK_BOT_TOKEN = 'xoxb-test';
 const slack = await import('../src/slack.js?live');
 slack.__setSlackClientForTests(stubDb);
 
-test('channel main → exactly one POST to CH_MAIN with the exact text', async () => {
+test('channel main → exactly one POST to CH_MAIN with the text, phones as digits (2026-10-13)', async () => {
   reset(slack);
   const text = '🔔 LP Appointment Set\nJane Doe · (239) 555-0100';
   const r = await slack.mirrorToSlack(text, 'main');
   assert.deepEqual(r, { mirrored: true, channels: 1, sent: 1, channelIds: [CH_MAIN] });
   assert.equal(posts.length, 1);
   assert.equal(posts[0].body.channel, CH_MAIN);
-  assert.equal(posts[0].body.text, text);
+  assert.equal(posts[0].body.text, '🔔 LP Appointment Set\nJane Doe · 2395550100');
   assert.equal(posts[0].headers.Authorization, 'Bearer xoxb-test');
 });
 

@@ -215,8 +215,8 @@ export function displayName(first, last) {
   return l ? `${f || '?'} ${l[0].toUpperCase()}.` : f;
 }
 
-/** "…3161" — the last four digits only. */
-export const phoneTail = (phone10) => (phone10 ? `…${String(phone10).slice(-4)}` : 'no phone');
+/** The full number, digits only (the user, 2026-10-13: never the last four). */
+export const phoneTail = (phone10) => (phone10 ? String(phone10).replace(/\D/g, '') : 'no phone');
 
 /** "3h 10m" / "2d 4h" / "12m". */
 export function formatWait(ms) {

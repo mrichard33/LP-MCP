@@ -277,6 +277,7 @@ import {
   CUSTOMER_STATUS_GATE_INTENT_SET,
   CALLBACK_TAG_SALES,
 } from '../knowledge/callback-resolver.js';
+import { slackPhone } from '../format-helpers.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY || '';
 
@@ -602,7 +603,7 @@ async function applyAutoReplyInline({
   const preview = (triggerMessage || '').slice(0, 120);
   const sentMessage = (sendAction.action_payload?.message || generated.message || '').slice(0, 400);
   const reasoning = (generated.reasoning || '').slice(0, 200);
-  const displayName = contactName ? `${contactName}${contactPhone ? ` (${contactPhone})` : ''}` : sendAction.target_id;
+  const displayName = contactName ? `${contactName}${contactPhone ? ` (${slackPhone(contactPhone)})` : ''}` : sendAction.target_id;
   const intent = generated.intent_class || 'unknown';
   const arc = generated.story_arc && generated.story_arc !== 'none' ? generated.story_arc : null;
 
@@ -740,7 +741,7 @@ async function applyHandoffInline({
   const dqLabel = isDQ ? ' [DISQUALIFIER]' : '';
   const tagSummary = tagsToApply.join(', ') || 'none';
   const preview = (triggerMessage || '').slice(0, 120);
-  const displayName = contactName ? `${contactName}${contactPhone ? ` (${contactPhone})` : ''}` : contactId;
+  const displayName = contactName ? `${contactName}${contactPhone ? ` (${slackPhone(contactPhone)})` : ''}` : contactId;
 
   await sendGroupMeMessage(
     `🛑 AGENTIC SHORT-CIRCUIT${dqLabel} (queue-time)\n` +

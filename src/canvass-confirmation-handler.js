@@ -69,6 +69,7 @@ import { flattenWebhookBody, webhookShapeFingerprint } from './webhook-body.js';
 import { buildLeadNoteLines } from './services/lead-note-lines.js';
 import { resolveCanvasserProId } from './services/canvasser-roster.js';
 import { trackBackground } from './graceful-shutdown.js';
+import { slackPhone } from './format-helpers.js';
 
 // Structural version gate. A literal on the workflow step, so it cannot fail
 // to resolve — if it arrives empty or wrong, the step is misconfigured and the
@@ -549,7 +550,7 @@ export async function processCanvassConfirmation(payload, deps = {}) {
       const mismatchNarrative = mismatched.length
         ? `Confirmation agent flagged the ${mismatched.join(' and ')} on file as wrong`
           + `${p.lp_prospect_id ? ` for LP prospect #${p.lp_prospect_id}` : ''}.`
-          + `${p.phone_correction ? ` Corrected phone: ${p.phone_correction}.` : ''}`
+          + `${p.phone_correction ? ` Corrected phone: ${slackPhone(p.phone_correction)}.` : ''}`
           + `${p.address_correction ? ` Corrected address: ${p.address_correction}.` : ''}`
           + ' Correct it in Lead Perfection at confirmation — this path records only'
           + ' and cannot write to LP.'

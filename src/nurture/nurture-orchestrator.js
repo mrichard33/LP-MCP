@@ -145,6 +145,7 @@ import { resolveAdaptiveCta, applyEvolution, injectEvolutionOverride } from '../
 // 2026-09-11 — Bot Review Phase 0 fingerprint. Detached, post-writeback only.
 import { recordMessageContextDetached } from '../bot-feedback/fingerprint.js';
 import { buildInputSnapshot } from '../bot-feedback/fingerprint-core.js';
+import { slackPhone } from '../format-helpers.js';
 
 const SHADOW_MODE = process.env.NURTURE_SHADOW_MODE === 'true';
 
@@ -753,7 +754,7 @@ function contactDisplay(context, contactId) {
   const composed = [lead.first_name, lead.last_name].filter(Boolean).join(' ').trim();
   const name = lead.name || composed || '(no name)';
   const email = lead.email ? `\n${lead.email}` : '';
-  const phone = lead.phone ? ` · ${lead.phone}` : '';
+  const phone = lead.phone ? ` · ${slackPhone(lead.phone)}` : '';
   return `${name}${email}${phone}\nid: ${contactId}`;
 }
 

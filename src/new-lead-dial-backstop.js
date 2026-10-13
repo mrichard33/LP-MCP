@@ -427,7 +427,7 @@ export function formatUnhandledCard(items, nowMs) {
   const lines = items.map(({ row, result }) => {
     const name = [row.first, row.last].filter(Boolean).join(' ') || 'No name';
     const source = row.sourceDetail || row.source || 'unknown source';
-    return `• ${name} · …${String(row.phone ?? '').slice(-4) || '????'} · ${source} · LP lead ${row.ldsId || `inbound ${row.in1}`} · ${ageText(nowMs - row.receivedMs)} old · ${REASON_TEXT[result] || result}`;
+    return `• ${name} · ${String(row.phone ?? '').replace(/\D/g, '') || 'no phone'} · ${source} · LP lead ${row.ldsId || `inbound ${row.in1}`} · ${ageText(nowMs - row.receivedMs)} old · ${REASON_TEXT[result] || result}`;
   });
   return [
     `⚠️ NEW LEADS NOBODY HAS CALLED — the dial backstop could not put them on a Five9 list`,
@@ -468,7 +468,7 @@ const VISIT_FMT = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York
 /** One readable line for one push, stored on its action row (card_line). No card posts it since 2026-10-07. */
 export function pushedLine(p) {
   const name = [p.row.first, p.row.last].filter(Boolean).join(' ') || 'No name';
-  const phone = `(${p.row.phone.slice(0, 3)}) ${p.row.phone.slice(3, 6)}-${p.row.phone.slice(6)}`;
+  const phone = p.row.phone; // digits only (the user, 2026-10-13)
   const visit = p.state?.hasAppt
     ? (Number.isFinite(p.state.apptStartMs) ? `visit ${VISIT_FMT.format(new Date(p.state.apptStartMs))}` : `visit ${p.state.apptDateEt}`)
     : 'no appointment';

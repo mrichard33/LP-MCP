@@ -334,6 +334,8 @@ import { applyBookingTruth, bookingResult } from './agentic/booking-claim.js';
 import { isTeamOpen } from './agentic/team-hours.js';
 import { noteDqPackage } from './agentic/lp-note-dq.js';
 import { botCallbackDeps, nepqHandoffDeps } from './services/bot-callback-io.js';
+import { scopeDqKind, runScopeDq } from './agentic/scope-dq.js';
+import { scopeDqDeps } from './services/scope-dq-io.js';
 // 2026-09-18 — the decision-maker handoff writes its rep task as a GHL note
 // (GHL has no task API; see src/actions/handlers/tasks.js).
 import { addGHLNote } from './ghl.js';
@@ -4183,7 +4185,10 @@ export async function executeSendMessage(action, context) {
     // card carrying the note, the appointment, the last messages and what the
     // bot said (lp-note-dq.js noteDqPackage).
     const noteDq = generated?.lp_note_dq ? { why: 'lp_note_dq', reason: 'lp_note_dq', kind: 'sales' } : null;
-    const decision = noteDq || ((generated?.nepq_handoff || generated?.dm_handoff) ? callbackDecision({ handoffReason: generated?.nepq_handoff?.reason || null, otherHandoff: !!generated?.dm_handoff, text: String(message || '') })
+    // 2026-10-13: a home we cannot work on gets the set-ND card below, never a sales call.
+    // Never for a lead past its demo (2026-10-13; post-demo-lead.js).
+    const scopeDq = !generated?.post_demo_lead && !!scopeDqKind(replyTriggerMessage || context?.message_text || '');
+    const decision = scopeDq ? null : noteDq || ((generated?.nepq_handoff || generated?.dm_handoff) ? callbackDecision({ handoffReason: generated?.nepq_handoff?.reason || null, otherHandoff: !!generated?.dm_handoff, text: String(message || '') })
       : (classified || scheduling || callbackDecision({ text: String(message || '') })));
     if (decision) {
       if (decision.why === 'promise_backed') console.log(`[SendMessage] call_promise_backed ${contactId}: "${String(message || '').slice(0, 160)}"`);
@@ -4200,6 +4205,20 @@ export async function executeSendMessage(action, context) {
           : (generated?.nepq_handoff?.extra || null),
       }, botCallbackDeps({ applyTags: applyContactTags, addNote: addGHLNote }))
         .catch(err => console.warn(`[SendMessage] bot callback failed for ${contactId} (fail-soft): ${err.message}`));
+    }
+  }
+
+  // ── A commercial property or a rental unit: ask a person to set ND (2026-10-13) ──
+  // LP's API cannot change a disposition, so a note on the LP prospect and ONE
+  // #contact-center card, once per contact per kind (src/agentic/scope-dq.js).
+  {
+    const kind = generated?.post_demo_lead ? null : scopeDqKind(replyTriggerMessage || context?.message_text || '');
+    if (kind) {
+      trackBackground(runScopeDq({
+        contactId, kind, channel, inbound: replyTriggerMessage || context?.message_text || '',
+        firstName: context?.lead?.first_name || null,
+        phone: generated?.contact_known_phone || context?.lead?.phone || null,
+      }, scopeDqDeps({ applyTags: applyContactTags, addNote: addGHLNote })));
     }
   }
 

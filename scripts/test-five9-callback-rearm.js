@@ -267,7 +267,7 @@ test('a flat push posts PROMISED CALL AT RISK to #contact-center at once', async
   assert.equal(posts.length, 1);
   assert.equal(posts[0].ch, 'C_CC');
   assert.match(posts[0].text, /PROMISED CALL AT RISK/);
-  assert.match(posts[0].text, /\(941\) 286-5161/);
+  assert.match(posts[0].text, /9412865161/);
   assert.match(posts[0].text, /63 → 63/);
   assert.equal(events[0].event_type, 'lp.callback_not_rearmed');
 });

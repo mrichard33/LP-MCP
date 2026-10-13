@@ -587,7 +587,8 @@ test('pipeline: phone_match "No" → priority card, correction on the event and 
   const card = calls.groupme.find((g) => g.text.includes('CANVASS CONFIRMATION MISMATCH'));
   assert.ok(card, 'a flagged mismatch is a case a human must act on');
   assert.match(card.text, /SALES PRIORITY/);
-  assert.match(card.text, /954-555-9999/);
+  // The card prints digits only (the user, 2026-10-13); the note keeps what the agent typed.
+  assert.match(card.text, /9545559999/);
   assert.match(card.text, /contacts\/detail\/CONTACT123/);
   assert.match(card.text, /Act within/);
   // The normal system card must NOT also fire — one submission, one card.

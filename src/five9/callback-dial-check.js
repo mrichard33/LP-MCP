@@ -62,7 +62,8 @@ export function dialCheckVerdict({ filedMs, nowMs, calls }) {
 
 function fmtPhone(n) {
   const d = String(n || '').replace(/\D/g, '').slice(-10);
-  return d.length === 10 ? `(${d.slice(0, 3)}) ${d.slice(3, 6)}-${d.slice(6)}` : (n || 'unknown');
+  // Digits only on the card (the user, 2026-10-13).
+  return d.length === 10 ? d : (n ? String(n).replace(/\D/g, '') || String(n) : 'unknown');
 }
 
 function fmtEt(ms) {

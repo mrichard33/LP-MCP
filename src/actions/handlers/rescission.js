@@ -44,6 +44,7 @@ import supabase from '../../supabase.js';
 import { applyGHLTag, updateGHLContactFields, getGHLContact } from '../../ghl.js';
 import { computeRescissionDeadline, detectSigningDate } from '../../rescission-window.js';
 import { resolveMarket } from '../enrichment.js';
+import { slackPhone } from '../../format-helpers.js';
 
 // GHL custom field IDs — provisioned by Mark in GHL UI per Phase 2 checklist.
 // If env vars not set, handler still tags the contact (custom field write is
@@ -204,7 +205,7 @@ export async function executeComputeRescissionDispatch(action /*, context */) {
         body:
           `Past-window rescission detected.\n` +
           `Contact: ${contact?.firstName || ''} ${contact?.lastName || ''}\n` +
-          `Phone: ${contact?.phone || 'unknown'}\n` +
+          `Phone: ${slackPhone(contact?.phone) || 'unknown'}\n` +
           `Signed: ${result.signing_dow_name} ${result.signed_date_iso}\n` +
           `Deadline (passed): ${result.deadline_iso}\n` +
           `Tagged lost-post-rescission + loss-reason:competitor for L.1 routing.\n` +
@@ -272,7 +273,7 @@ export async function executeComputeRescissionDispatch(action /*, context */) {
     (windowCount ? `Windows: ${windowCount}\n` : '') +
     (market ? `Market: ${market}\n` : '') +
     (repName ? `Assigned: ${repName}\n` : '') +
-    `Phone: ${contact?.phone || 'unknown'}\n` +
+    `Phone: ${slackPhone(contact?.phone) || 'unknown'}\n` +
     `https://app.gohighlevel.com/v2/location/${GHL_LOCATION_ID}/contacts/detail/${contactId}`;
 
   queued.push(await queueAction({

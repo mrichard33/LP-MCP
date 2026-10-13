@@ -306,7 +306,7 @@ test('card: grouped by reason with counts, the cap, "…and N more", and the das
   const h1 = lines.indexOf('*Called, no retry since — 3 (showing 2)*');
   const h2 = lines.indexOf('*In Five9 but not on any dialing list — 3 (showing 2)*');
   assert.ok(h1 > 0 && h2 > h1, 'both group headers, in order');
-  assert.match(text, /A B\. · …0000 · Internet · waiting 22h 4m · Called 1× \(last: Hung Up, 20h 0m ago\) — no retry since · LP b1/);
+  assert.match(text, /A B\. · 3525550000 · Internet · waiting 22h 4m · Called 1× \(last: Hung Up, 20h 0m ago\) — no retry since · LP b1/);
   assert.equal(lines.filter((l) => l.startsWith('• ')).length, 4, 'maxNamed caps named lines across groups');
   assert.ok(lines.includes('…and 2 more'));
   assert.equal(lines[lines.length - 1], 'Full list: https://d/leaks', 'every card ends with the link');

@@ -243,7 +243,8 @@ function fmtEt(ms) {
 
 function fmtPhone(n) {
   const d = phone10(n);
-  return d ? `(${d.slice(0, 3)}) ${d.slice(3, 6)}-${d.slice(6)}` : 'no phone on file';
+  // Digits only on the card (the user, 2026-10-13).
+  return d || 'no phone on file';
 }
 
 /** The #contact-center card for a promise nobody kept. Pure. */

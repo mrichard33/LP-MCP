@@ -63,13 +63,13 @@ export function formatEtDate(input) {
   return new Intl.DateTimeFormat('en-US', { timeZone: BUSINESS_TZ, month: 'short', day: 'numeric' }).format(d);
 }
 
-/** "5613739673" / "+15613739673" → "(561) 373-9673". Anything else as given. */
+/** "+15613739673" / "(561) 373-9673" → "5613739673": a card prints the number as
+ *  digits only (the user, 2026-10-13). Anything else keeps its digits. */
 export function formatPhoneUS(phone) {
-  if (!phone) return null;
+  if (phone === null || phone === undefined) return null;
   const digits = String(phone).replace(/\D/g, '');
-  const ten = digits.length === 11 && digits[0] === '1' ? digits.slice(1) : digits;
-  if (ten.length === 10) return `(${ten.slice(0, 3)}) ${ten.slice(3, 6)}-${ten.slice(6)}`;
-  return String(phone);
+  if (!digits) return null;
+  return digits.length === 11 && digits[0] === '1' ? digits.slice(1) : digits;
 }
 
 /** 116000 → "$116,000". Not a positive number → null. */

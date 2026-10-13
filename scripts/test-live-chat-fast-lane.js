@@ -681,7 +681,7 @@ test('name + phone that match → one reschedule offer; "no" → cancelled in GH
   assert.equal(b.state.cards.length, 1);
   assert.match(b.state.cards[0].text, /LIVE CHAT CANCEL — cancel it in LP/);
   assert.match(b.state.cards[0].text, /GHL: ✅ cancelled by the bot\. → Cancel it in LP\./);
-  assert.match(b.state.cards[0].text, /\(352\) 555-0188/);
+  assert.match(b.state.cards[0].text, /3525550188/); // digits only on the card (2026-10-13)
   assert.equal(b.state.cards[0].contactId, 'RICK1');
 });
 
@@ -1406,4 +1406,12 @@ test('a stated count is queued for Window Count / Door Count, with real columns 
   assert.deepEqual(row.action_payload.fields, [{ id: 'h9FJTUbmUHIuD6JKmpXv', field_value: 12 }, { id: 'j7l1KWmDgoJqy7SINjQs', field_value: 2 }]);
   const extra = Object.keys(row).filter(k => k !== 'id' && !AGENT_ACTIONS_COLUMNS.includes(k));
   assert.deepEqual(extra, []);
+});
+
+test('a lead past its demo is not declined as a rental (the user, 2026-10-13)', async () => {
+  const draft = 'Thanks for checking in. Is anything holding you back from moving forward?';
+  const { lane } = makeLane({ mode: 'shadow', tags: ['lp-demo-completed'], llm: () => ({ message: draft }) });
+  const out = await lane.processInbound(INBOUND('we rent it out, still thinking about the windows'));
+  assert.doesNotMatch(out.message, /rental propert/);
+  assert.match(out.message, /holding you back/);
 });

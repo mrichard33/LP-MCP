@@ -62,12 +62,18 @@ function statements(text) {
  * @param {Array<{text?: string, note_body?: string, entered_by?: string, date?: string}>} notes
  * @returns {{dq: boolean, signal: string|null, note: object|null, text: string|null}}
  */
-export function detectNoteDq(notes) {
+/** The signals that are the job requirements: a lead past its demo already
+ *  meets them (the user, 2026-10-13; post-demo-lead.js). */
+export const REQUIREMENT_SIGNALS = Object.freeze(['renter', 'below_minimum']);
+
+export function detectNoteDq(notes, { skip = [] } = {}) {
+  const skipped = new Set(skip || []);
   for (const n of Array.isArray(notes) ? notes : []) {
     const text = noteText(n);
     if (!isPersonNote(text)) continue;
     const said = statements(text);
     for (const s of LP_NOTE_DQ_SIGNALS) {
+      if (skipped.has(s.id)) continue;
       if (!said.some(x => s.rx.test(x))) continue;
       return { dq: true, signal: s.id, note: n, text };
     }

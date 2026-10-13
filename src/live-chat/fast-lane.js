@@ -57,6 +57,8 @@ import { enforceTeamVoice } from '../agentic/team-voice.js';
 import { enforcePropertyScope, leadRaisesScope } from '../agentic/property-scope.js';
 import { enforceNonOwner, isNonOwner, nonOwnerLine } from '../agentic/non-owner.js';
 import { enforceJobScope, jobScopeFromThread, openingsToSave, RENTAL_LINE, INVESTMENT_LINE, COMMERCIAL_LINE, BELOW_MINIMUM_LINE, MINIMUM_CHECK_LINE, MINIMUM_CHECK_DOORS_LINE } from '../agentic/job-scope.js';
+import { scopeDqKind } from '../agentic/scope-dq.js';
+import { isPostDemoLead } from '../agentic/post-demo-lead.js';
 import { enforceCallTiming, promisedCallback, isTeamOpen } from '../agentic/team-hours.js';
 import { rewriteBookingClaims, appointmentOnFile, checkBookingTruth, bookingResult, noPromiseHandoffLine } from '../agentic/booking-claim.js';
 import { enforceCancelledVisit } from '../agentic/cancelled-visit.js';
@@ -907,6 +909,10 @@ export function createLiveChatFastLane(deps) {
     let context = (!ctxRes.timedOut && !ctxRes.error && ctxRes.value) ? ctxRes.value : minimalContext({ contactId, contact, nowMs: d.now() });
     if (ctxRes.timedOut) d.log(`[LiveChat] lead context exceeded ${d.contextCapMs()}ms for ${contactId} — continuing with the contact record only`);
     if (ctxRes.error) d.warn(`[LiveChat] lead context failed for ${contactId}: ${ctxRes.error.message} — continuing with the contact record only`);
+    // 2026-10-13 (the user): a lead past its demo already meets the
+    // requirements: no qualifying questions, job-scope or tenant decline,
+    // job-scope booking refusal or set-ND card (post-demo-lead.js).
+    const pastDemo = isPostDemoLead({ lp: context.lp, tags: [...(context.lead?.current_tags || []), ...(Array.isArray(tags) ? tags : [])], stageTag: context.lead?.current_stage_tag || null });
     let thread = (!threadRes.timedOut && !threadRes.error) ? normalizeThread(threadRes.value) : [];
     if (!thread.length) {
       const own = (!ownRes.timedOut && !ownRes.error && Array.isArray(ownRes.value)) ? ownRes.value : [];
@@ -1087,7 +1093,7 @@ export function createLiveChatFastLane(deps) {
       try { leadStage = await d.readLeadStage(contactId); } catch { leadStage = null; }
       const realFirst = hasNameOnRecord ? String(context.lead?.first_name || context.lead?.name || '').trim().split(/\s+/)[0] || null : null;
       const planInput = {
-        channel: 'livechat', trigger: body, conversation: context.conversation_recent, firstName: realFirst,
+        channel: 'livechat', trigger: body, conversation: context.conversation_recent, firstName: realFirst, postDemoLead: pastDemo,
         hasAppointment: !!appointmentOnFile({ upcomingAppointments, lp: context.lp }),
         nextStepLabel: 'a free visit at your home', discipline, nowMs: d.now(),
         // A customer's call request goes to service (Mark, 2026-10-03).
@@ -1112,7 +1118,7 @@ export function createLiveChatFastLane(deps) {
       }
       if (nepqMode === 'live' && !saPlan.active) {
         const lastOutbound = [...context.conversation_recent].reverse().find(m => m.direction === 'outbound')?.text || '';
-        const nepqOut = reference ? null : await runNepqFixedMove({ plan: nepqPlan, slots: nepqSlots, contactId, body, hasName: hasNameOnRecord, hasPhone: hasPhoneOnRecord, firstName: realFirst, mode, lastOutbound: nepqPlan.last_offer || lastOutbound, contact, visitorTexts,
+        const nepqOut = reference ? null : await runNepqFixedMove({ plan: nepqPlan, slots: nepqSlots, contactId, body, hasName: hasNameOnRecord, hasPhone: hasPhoneOnRecord, firstName: realFirst, mode, lastOutbound: nepqPlan.last_offer || lastOutbound, contact, visitorTexts, pastDemo,
           threadTurns: (context.conversation_recent || []).map(m => ({ direction: String(m?.direction || '').toLowerCase() === 'outbound' ? 'outbound' : 'inbound', text: String(m?.text ?? m?.body ?? '') })) });
         if (nepqOut) {
           // Part 7 (Mark, 2026-10-02: "Each message should be custom"): the
@@ -1150,7 +1156,7 @@ export function createLiveChatFastLane(deps) {
       timing.t4_analysis_done = new Date(d.now()).toISOString();
       timing.t5_generation_done = timing.t4_analysis_done;
       return deliver({
-        contactId, conversationId, body, mode, actionId, timing, isSuperseded, turn, visitorTexts,
+        contactId, conversationId, body, mode, actionId, timing, isSuperseded, turn, visitorTexts, pastDemo,
         draft: priceTransitionReply({ hasName: hasNameOnRecord, hasPhone: hasPhoneOnRecord }),
         capture: phoneFromText(body) ? { phone: phoneFromText(body) } : {},
         extras: { price_turn: { asks: pricePlan.asks, insist: true, deterministic: true }, context_minimal: !!context._minimal, model: null },
@@ -1463,7 +1469,7 @@ export function createLiveChatFastLane(deps) {
     }
 
     return deliver({
-      contactId, conversationId, body, mode, actionId, timing, draft, turn, visitorTexts,
+      contactId, conversationId, body, mode, actionId, timing, draft, turn, visitorTexts, pastDemo,
       stageInput: buildStageInput({
         conversation: context.conversation_recent || [], trigger: body, plan: nepqPlan,
         zip: coverage?.zip || context.lead?.postal_code || null,
@@ -1650,7 +1656,7 @@ export function createLiveChatFastLane(deps) {
    * a day ask, a close, the Reveal, two real times, or booking a picked time.
    * Returns { reply, record } or null (the model writes this turn).
    */
-  async function runNepqFixedMove({ plan, slots, contactId, body, hasName, hasPhone, firstName, mode, lastOutbound = '', contact = null, visitorTexts = [], threadTurns = [] }) {
+  async function runNepqFixedMove({ plan, slots, contactId, body, hasName, hasPhone, firstName, mode, lastOutbound = '', contact = null, visitorTexts = [], threadTurns = [], pastDemo = false }) {
     if (!plan) return null;
     const live = mode === 'live';
     const ask = contactAskLine({ hasName, hasPhone });
@@ -1759,12 +1765,12 @@ export function createLiveChatFastLane(deps) {
       }
       // 2026-10-12 (no single-leg visits): a lead who said they rent is
       // never booked, whatever the plan or the mode says (non-owner.js).
-      if (isNonOwner(threadTurns, body)) {
+      if (!pastDemo && isNonOwner(threadTurns, body)) {
         return { reply: nonOwnerLine(threadTurns, body), record: { booking: 'refused_non_owner' } };
       }
       // 2026-10-13 (the user): no rentals, no commercial, and the minimum
       // (three openings or one sliding glass door) before any visit (job-scope.js).
-      {
+      if (!pastDemo) {
         const js = jobScopeFromThread(threadTurns, body);
         if (js.block || js.check) {
           const reply = js.check ? (js.doors ? MINIMUM_CHECK_DOORS_LINE : MINIMUM_CHECK_LINE) : ({ rental: RENTAL_LINE, investment: INVESTMENT_LINE, commercial: COMMERCIAL_LINE, below_minimum: BELOW_MINIMUM_LINE })[js.block];
@@ -1820,7 +1826,7 @@ export function createLiveChatFastLane(deps) {
   }
 
   /** Send (live) or record (shadow) one finished reply. */
-  async function deliver({ contactId, conversationId, body, mode, actionId, timing, draft, capture = {}, extras = {}, fingerprintExtras = {}, isSuperseded = () => false, turn = newTurnClaim(), visitorTexts = [], skipCapture = false, stageInput = null }) {
+  async function deliver({ contactId, conversationId, body, mode, actionId, timing, draft, capture = {}, extras = {}, fingerprintExtras = {}, isSuperseded = () => false, turn = newTurnClaim(), visitorTexts = [], skipCapture = false, stageInput = null, pastDemo = false }) {
     // A newer message from this visitor arrived while this reply was being
     // written: the newer turn answers both (2026-10-02, tzuzq double reply).
     if (isSuperseded()) {
@@ -1856,13 +1862,14 @@ export function createLiveChatFastLane(deps) {
         draft = scope.text;
       }
       // No rentals, no commercial, the minimum (2026-10-13; every mode).
-      const jobScope = enforceJobScope(draft, { thread: stageInput?.conversation || [], inbound: body });
+      // Past its demo: only our own false claims are checked (2026-10-13).
+      const jobScope = pastDemo ? enforceJobScope(draft, {}) : enforceJobScope(draft, { thread: stageInput?.conversation || [], inbound: body });
       if (jobScope.changed) {
         d.log(`[JobScope] live chat ${contactId} ${jobScope.reason}`);
         draft = jobScope.text;
       }
       // A renter gets no visit time (2026-10-12, batch 3 T3; active in every mode).
-      const owner = enforceNonOwner(draft, { thread: stageInput?.conversation || [], inbound: body });
+      const owner = pastDemo ? { changed: false } : enforceNonOwner(draft, { thread: stageInput?.conversation || [], inbound: body });
       if (owner.changed) {
         d.log(`[NonOwner] live chat ${contactId} ${owner.reason}`);
         draft = owner.text;
@@ -1926,6 +1933,12 @@ export function createLiveChatFastLane(deps) {
       if (!extras.repeat_promise_blocked && !skipCapture && shouldRecordPromise({ trigger: body, plan: stageInput?.plan || null })) Promise.resolve()
         .then(() => d.recordPromise({ contactId, text: draft, channel: 'livechat', phone: phoneFromText(visitorTexts.join(' ') || body) || null, rule: LIVE_CHAT_RULE, actionId }))
         .catch(err => d.warn(`[LiveChat] promise record failed for ${contactId}: ${err.message}`));
+      // A commercial property or a rental unit: a note on the LP prospect and
+      // one card asking a person to set ND (2026-10-13, scope-dq.js).
+      const scopeKind = pastDemo ? null : scopeDqKind(body);
+      if (scopeKind && d.scopeDq) Promise.resolve()
+        .then(() => d.scopeDq({ contactId, kind: scopeKind, inbound: body, phone: phoneFromText(visitorTexts.join(' ') || body) || null }))
+        .catch(err => d.warn(`[LiveChat] set-ND card failed for ${contactId}: ${err.message}`));
     }
     // 2026-10-12 (Lead Conversation Stage): where the conversation is now that
     // the reply went out. Only a planned model turn carries stageInput.

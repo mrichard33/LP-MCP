@@ -41,7 +41,7 @@ test('long issue text is trimmed under the limit', () => {
 });
 
 test('phone formats to (xxx) xxx-xxxx', () => {
-  assert.equal(formatPhone('+14074503223'), '(407) 450-3223');
+  assert.equal(formatPhone('+14074503223'), '4074503223'); // digits only (2026-10-13)
   assert.equal(formatPhone(''), 'No phone on file');
 });
 
@@ -52,7 +52,7 @@ test('card carries name, phone, issue, market and link', () => {
   });
   assert.match(text, /SERVICE REQUEST · Lakeland/);
   assert.match(text, /Customer: Steven Homenda/);
-  assert.match(text, /Phone: \(407\) 450-3223/);
+  assert.match(text, /Phone: 4074503223/);
   assert.match(text, /What they need: Slider screens will not latch\./);
   assert.match(text, /Sold customer: Yes/);
   assert.match(text, /contacts\/detail\/abc/);

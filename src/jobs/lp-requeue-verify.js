@@ -36,6 +36,7 @@ import { getInboundLeadInfo } from '../lp-client.js';
 import { sendGroupMeMessage } from '../groupme.js';
 import { ghlFetch } from '../actions/helpers.js';
 import { dialCheckVerdict, formatNotDialedCard } from '../five9/callback-dial-check.js';
+import { slackPhone } from '../format-helpers.js';
 
 const FIELD_LP_LEAD_ID = 'GmAVmW6V9sekD7pVONKr'; // lds_id custom field
 
@@ -136,7 +137,7 @@ async function verifyOne(row, deps = {}) {
   await notify(
     `🚨 PROMISED CALLBACK DID NOT REACH THE DIALER\n` +
     `Contact: ${name} (${contactId})\n` +
-    `Phone: ${phone}\n` +
+    `Phone: ${slackPhone(phone) || 'unknown'}\n` +
     `LP inbound id: ${inboundId || 'unknown'} | prospect: ${res.lp_prospect_id || 'unknown'}\n` +
     `The customer was told someone will ring within minutes. The LP re-queue was pushed ` +
     `${Math.round((Date.now() - Date.parse(row.created_at)) / 60000)}min ago and LP has not issued a lead.\n` +
@@ -221,7 +222,7 @@ async function verifyFive9Push(row, res, deps = {}) {
   await notify(
     `🚨 PROMISED CALLBACK DID NOT REACH THE DIALER\n` +
     `Contact: ${name} (${contactId})\n` +
-    `Phone: ${phone}\n` +
+    `Phone: ${slackPhone(phone) || 'unknown'}\n` +
     `Five9 list: ${res.list || 'Callback Request'} | CustID: ${res.cust_id || 'unknown'}\n` +
     `five9_add_records_to_list action ${five9ActionId || 'unknown'} is "${status || 'unknown'}"` +
     `${errorMessage ? ` — ${String(errorMessage).slice(0, 160)}` : ''}\n` +

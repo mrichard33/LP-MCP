@@ -59,6 +59,7 @@ import express from 'express';
 import { resolveApproval } from './groupme.js';
 import { slackApprovalsEnabled, lookupSlackUserEmail } from './slack.js';
 import { trackBackground } from './graceful-shutdown.js';
+import { normalizeSlackPhones, normalizeSlackBlocks } from './slack-phone-format.js';
 import {
   verifySlackSignature, parseInteraction, parseApproverIds, parsePayrollInteraction, isPayrollAction,
   isDncLiftAction, isMarketingInvoiceAction, parseMarketingInvoiceInteraction,
@@ -163,7 +164,12 @@ async function respond(responseUrl, body) {
     await fetch(responseUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
+      // Digits-only phones on the replaced card too (the user, 2026-10-13).
+      body: JSON.stringify({
+        ...body,
+        ...(typeof body?.text === 'string' ? { text: normalizeSlackPhones(body.text) } : {}),
+        ...(Array.isArray(body?.blocks) ? { blocks: normalizeSlackBlocks(body.blocks) } : {}),
+      }),
       signal: AbortSignal.timeout(8000),
     });
   } catch (err) {
