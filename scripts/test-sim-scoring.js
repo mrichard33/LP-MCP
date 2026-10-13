@@ -274,8 +274,10 @@ test('PR 7: the persona answers what the bot asks (autoAnswer scenarios only)', 
   assert.equal(B7.autoAnswerFor('Quick question before I pull up times: are you the homeowner?', p), 'Yes, I own it.');
   assert.equal(B7.autoAnswerFor("What's the zip code at the home?", p), '33908');
   assert.equal(B7.autoAnswerFor('Is anyone else part of the decision on this, like a spouse or partner?', p), 'Just me.');
-  assert.equal(B7.autoAnswerFor('How many windows and doors are you looking to get a quote on?', p), '12 windows and 2 doors');
-  assert.equal(B7.autoAnswerFor('How many doors are you thinking about, or is it just the windows? — Reece Team', p), '12 windows and 2 doors');
+  // 2026-10-13: the count question is always on, so the persona answers it.
+  assert.equal(B7.autoAnswerFor('How many windows and doors are you looking to get a quote on?', p), 'About 10 windows.');
+  assert.equal(B7.autoAnswerFor('What color frames do you like?', p), null);
+  assert.equal(B7.autoAnswerFor('How many doors are you thinking about, or is it just the windows? — Reece Team', p), 'About 10 windows.');
   assert.equal(B7.autoAnswerFor('How long have they been like that?', p), null);
   assert.equal(B7.autoAnswerFor('Thanks.', p), null);
   // Only the asking sentence counts (first eval run: a bridge that mentioned owning the home).

@@ -1062,7 +1062,19 @@ test("NEPQ live (Mark's test chat): yes to the visit with a question gets the an
   await lane.processInbound(INBOUND("Yeah, how long does that take? I don't have much time right now."));
   const sent = state.sends[0].message;
   assert.doesNotMatch(sent, /will call you to set up/);
-  assert.match(sent, /I have Tue, Oct 6 at 10:00 AM ET or Wed, Oct 7 at 2:00 PM ET\. Which works better\?$/);
+  // 2026-10-13 (the user: "leave the question on"): the answer, then the count
+  // question once, before the first times.
+  assert.match(sent, /^About an hour and a half\. How many windows and doors are you looking to (?:get a quote on|have us come measure)\?$/);
+});
+
+test('the answer to the count question gets the times the yes had earned (2026-10-13)', async () => {
+  const bridge = 'Based on what you told me, this could work for you, since you mentioned the heat. The next step would be a visit at your home. Would that help?';
+  const { lane, state } = nepqLane({
+    messages: [M('outbound', bridge, 3), M('inbound', 'Yes please', 2), M('outbound', 'How many windows and doors are you looking to get a quote on?', 1)],
+    llm: () => ({ message: 'Great, thanks.' }),
+  });
+  await lane.processInbound(INBOUND('About 12'));
+  assert.match(state.sends[0].message, /I have Tue, Oct 6 at 10:00 AM ET or Wed, Oct 7 at 2:00 PM ET\. Which works better\?$/);
 });
 
 test('NEPQ live: a financing figure in the model\'s draft never reaches the visitor', async () => {
@@ -1091,13 +1103,13 @@ test('a question the model ended with a period gets its question mark back', asy
   assert.match(state.sends[0].message, /right now\?$/);
 });
 
-test('NEPQ live: a typed day and time with a question gets the answer, then two real times near it', async () => {
+test('NEPQ live: a typed day and time with a question gets the answer, then the count question before the times', async () => {
   const { lane, state } = nepqLane({ messages: [M('inbound', 'tomorrow evening 6 pm', 0.2)], llm: () => ({ message: 'Our warranty covers parts and labor for life. What made you start looking?' }) });
   await lane.processInbound(INBOUND("actually, what's the warranty?"));
-  // The prefetch at the top of the turn plus the offer; in production both
-  // share one cached calendar read (cachedFreeSlots).
-  assert.equal(state.slotReads, 2);
-  assert.equal(state.sends[0].message, 'Our warranty covers parts and labor for life. I have Tue, Oct 6 at 10:00 AM ET or Wed, Oct 7 at 2:00 PM ET. Which works better?');
+  // 2026-10-13: the count question comes before the first times, so only the
+  // prefetch at the top of the turn reads the calendar.
+  assert.equal(state.slotReads, 1);
+  assert.match(state.sends[0].message, /^Our warranty covers parts and labor for life\. How many windows and doors are you looking to (?:get a quote on|have us come measure)\?$/);
 });
 
 test('shadow model: a stronger model runs beside, is recorded, and is never sent', async () => {

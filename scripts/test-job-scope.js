@@ -300,3 +300,44 @@ test('a flip or an investment property is a no; a second home the owner keeps is
   }
   assert.doesNotMatch(J.INVESTMENT_LINE, /[—–]/);
 });
+
+// ── the count question in every mode; a lead who had the visit is qualified (the user, 2026-10-13) ──
+
+test('no stored stage: a yes to the bridge asks the count once, then the answer gets the times', async () => {
+  const P = await import('../src/agentic/nepq-planner.js');
+  const SL = [{ iso: '2026-10-06T14:00:00Z', day: 'Tue, Oct 6', time: '10:00 AM' }, { iso: '2026-10-07T18:00:00Z', day: 'Wed, Oct 7', time: '2:00 PM' }];
+  const bridge = 'Based on what you told me, the next step would be a free visit at your home. Would that help?';
+  const ask = 'How many windows and doors are you looking to get a quote on?';
+  const first = P.planNepqTurn({ channel: 'sms', trigger: 'Yes please', conversation: thread(['o', bridge], ['i', 'Yes please']), slots: SL, tzLabel: 'ET' });
+  assert.equal(first.qualify_item, 'openings');
+  assert.equal(first.booking.allowed, false);
+  assert.match(first.fixed_line, /How many windows and doors/);
+  const answered = P.planNepqTurn({ channel: 'sms', trigger: 'About 12', conversation: thread(['o', bridge], ['i', 'Yes please'], ['o', ask], ['i', 'About 12']), slots: SL, tzLabel: 'ET' });
+  assert.equal(answered.step, 'offer_slots');
+  assert.match(answered.fixed_line, /I have Tue, Oct 6 at 10:00 AM ET or Wed, Oct 7 at 2:00 PM ET/);
+  // "1" is under the minimum: no times, the guard asks the friendly check.
+  const one = P.planNepqTurn({ channel: 'sms', trigger: '1', conversation: thread(['o', bridge], ['i', 'Yes please'], ['o', ask], ['i', '1']), slots: SL, tzLabel: 'ET' });
+  assert.equal(one.step, 'not_eligible');
+  assert.equal(one.booking.allowed, false);
+  // Known count (a Window Count on the contact): times straight away.
+  const known = P.planNepqTurn({ channel: 'sms', trigger: 'Yes please', conversation: thread(['o', bridge], ['i', 'Yes please']), slots: SL, tzLabel: 'ET', knownOpenings: true });
+  assert.equal(known.step, 'offer_slots');
+});
+
+test('a lead past its demo (postDemoLead) is never asked the count or the qualifying questions', async () => {
+  const P = await import('../src/agentic/nepq-planner.js');
+  const SL = [{ iso: '2026-10-06T14:00:00Z', day: 'Tue, Oct 6', time: '10:00 AM' }, { iso: '2026-10-07T18:00:00Z', day: 'Wed, Oct 7', time: '2:00 PM' }];
+  const bridge = 'Based on what you told me, the next step would be a free visit at your home. Would that help?';
+  const p = P.planNepqTurn({ channel: 'sms', trigger: 'Yes please', conversation: thread(['o', bridge], ['i', 'Yes please']), slots: SL, tzLabel: 'ET', postDemoLead: true });
+  assert.notEqual(p.qualify_item, 'openings');
+  assert.notEqual(p.step, 'not_eligible');
+  // A stated single window is not checked either.
+  const one = P.planNepqTurn({ channel: 'sms', trigger: 'Just one window', conversation: thread(['o', bridge], ['i', 'Just one window']), slots: SL, tzLabel: 'ET', postDemoLead: true });
+  assert.notEqual(one.step, 'not_eligible');
+  // Even with the stored stage driving the plan, no gate item.
+  const staged = P.planNepqTurn({ channel: 'sms', trigger: 'Yes please', conversation: thread(['o', bridge], ['i', 'Yes please']), slots: SL, tzLabel: 'ET', stage: { stage: 'problem', facts: {} }, postDemoLead: true });
+  assert.notEqual(staged.step, 'qualify');
+  // The bots run the guard with no thread for such a lead: nothing declined, our claims still fixed.
+  assert.equal(J.enforceJobScope(OFFER, {}).changed, false);
+  assert.equal(J.enforceJobScope('We also have non-impact options.', {}).text, 'Every window and door we sell is hurricane impact-rated.');
+});

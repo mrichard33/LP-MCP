@@ -381,6 +381,12 @@ after that). It runs WITHOUT approval by Mark's standing exception to #1057 (202
 should be able to automatically remove it from the other list"), keyed on rule `BOOKED_DIAL_ROUTING` only — any other
 list removal still needs approval. `BOOKED_ROUTING_AUTO_REMOVE=false` is the rollback to approval cards. Every decision is
 in `booked_dial_routing_log`.
+**Every upcoming visit is routed, not only new leads (the user, 2026-10-13: "we are going to start using the dialer
+again").** Of 80 Set/Verif visits for today..+2 on 2026-10-13, 36 had no Conf add: 25 were on leads older than the 72h
+window (a rebook, a re-set, a bot booking on an existing lead, or a visit booked 4+ days ahead), 9 sat on `lookup_cap`
+every pass, 2 lost their phone to a newer form row with no visit. Now the job also reads every lead with a visit
+today..+2 (`readLeadsByAppointment`), spends the Five9 lookups on adds first, soonest visit first (`lookupPriority`),
+and a row holding a visit wins its phone (`onePerPhone`).
 
 **The LP note is a 2–3 sentence rep brief (the user, 2026-10-05).** Prospect 462947 reached LP with 1,400
 characters: the address three times, "tomorrow" for the visit, a script with a blank ("this is [YOUR NAME]"), internal
@@ -571,6 +577,23 @@ Brad's XLSX (`marketing-cost-report`, formulas never typed values) read `v_marke
   (`trueUpInvoice`, variance > `MKT_FEED_VARIANCE_PCT` posts a line).
 - Mode switches: `MKT_INVOICE_ANALYZER` rules|rules+llm, `MKT_COST_NIGHTLY_ENABLED`. Dry runs: the tests
   (`scripts/test-marketing-*.js`) and `GET /n8n/admin/marketing-expenses/status` (reconciliation = 0 failing rows).
+- **A logo is not an invoice, and a missing fact is a flag, never a 500 (the first real email, 2026-10-13).** Mark's
+  forward of the JMJ Digital Marketing invoice carried the PDF plus two inline images; each image became a document, was
+  OCR'd ("qb"), reached the model and became a row with `amount NULL`, which `marketing_expenses` refuses; the PDF failed
+  the same way on `period_start NULL` (no service period printed). Three 500s, n8n retried each twice, no card, no
+  analysis saved. Now `triageExtraction` (`src/marketing/invoice-triage.js`, pure) runs right after extraction and BEFORE
+  storage or the model: under 40 characters with no money figure and no invoice word is `not_an_invoice`, remembered by
+  sha in `marketing_invoice_skips` (never a document; the next email answers `duplicate + skipped` with no OCR). A CSV,
+  XLSX or email body is never triaged out. `fillRowDefaults` makes every row insertable: a missing period becomes the
+  invoice date (else the day received) and the card says "assumed from the invoice date"; a missing total becomes `$0`,
+  which blocks Approve until Edit. The flags (`missing_period` / `missing_total`) still block auto-approve. The analysis
+  is saved before the rows are written. A deterministic failure answers **200 + `success:false`** (n8n reports it once);
+  only a service outage (extract 5xx/429, storage, a connection: `isTransientError`) is a 5xx that n8n retries, and the
+  retry reuses the stored text. A forward from our own domain never identifies or teaches a vendor (`INTERNAL_MAIL_DOMAINS`);
+  the e-mail address printed in the invoice text is tried instead (never a public mailbox). The n8n Code node drops
+  inline parts (Content-Disposition inline / Content-ID / mailparser `related`), images under 50 KB and a second copy of
+  the same file in one email, and sends the body text when no pdf/csv/xlsx is left. `scripts/lib/fake-supabase.js` now
+  enforces the NOT NULL columns that bit, so this class of bug fails offline.
 
 ## Alerting
 
@@ -1001,7 +1024,11 @@ impact?"; "Does your home only have 1 window?" reads the same). A yes or "just t
 states the minimum; "no, the others are old" or anything else is the normal flow, and an unknown count never blocks. The
 count is asked ONCE before any time, in the user's wording ("How many windows and doors are you looking to get a quote
 on?" / "… to have us come measure?"): the qualifying gate's `openings` item (owner → zip → openings → decision makers,
-`openingsKnown`), and the prompt's ASK FOR WINDOW COUNT. A bare "1" in reply to it is read as the count (`openingsAt`). The
+`openingsKnown`), and the prompt's ASK FOR WINDOW COUNT. A bare "1" in reply to it is read as the count (`openingsAt`). It is ON IN EVERY MODE (the user, 2026-10-13: "leave the
+question on"): without a stored stage `openingsGate` (`nepq-planner.js`) turns the FIRST time offer into the count
+question once (never after times were offered), and the answer replans the conversation as it stood before the
+question, so "about 10" gets the times the "yes" had earned; a job-scope block or check is `not_eligible` in every mode
+(no wasted SMS redraft before the minimum check). A lead past its demo is never asked it (`postDemoLead`, below). The
 count the lead states is SAVED to the GHL fields Window Count (`h9FJTUbmUHIuD6JKmpXv`) and Door Count
 (`j7l1KWmDgoJqy7SINjQs`; a slider is a door), read by code from their newest message (`openingsToSave`), as one
 `update_custom_fields` row (rule `OPENINGS_COUNT_PERSIST`) after the send on both bots; a count already on the contact
@@ -1016,7 +1043,7 @@ Reminders for Set/Verif only (Cnf and Issue get none) are GHL edits in A.WE-1: `
 (`src/agentic/post-demo-lead.js`: a demo disposition (`isDemoDisposition`) or closed won, or `lp-demo-completed` /
 `stage:post-appointment` / `rehash` / `active-f.0`; never `lp.demo_completed`, which LP sets for NOC) turns off, in both
 bots and whatever `POST_DEMO_PLANNER_MODE` says: the lead-side job-scope and tenant declines (our own false claims are
-still corrected), the qualifying gate (`postDemoLead` → `gateForStage`), the live chat's job-scope booking refusal, the
+still corrected), the qualifying gate and the count question (`postDemoLead` → `gateForStage` / `openingsGate`), the live chat's job-scope booking refusal, the
 set-ND card, and an LP-note DQ whose signal is only renter or below minimum (`REQUIREMENT_SIGNALS`). `checkReply` skips the lead-side check on `ctx.postDemoLead`.
 The live chat also never books in a chat that raised a manufactured home or a 3+ story building (`leadRaisesScope`).
 #1274 (the same rules built a second way, never told the minimum) was closed by the user's ruling. Also fixed: the SMS scope guard compared `scope.reason === 'lead_asked'`, which never matched `'<rule>:lead_asked'`, so a

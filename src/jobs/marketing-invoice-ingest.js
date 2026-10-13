@@ -7,21 +7,28 @@
  * (handoff 2026-10-12 §7.1), fail-closed, in order:
  *
  *   1. dedupe on the file's sha256  → { success:true, duplicate:true }
- *   2. store the original in Storage bucket marketing-invoices/<yyyy>/<mm>/<sha>.<ext>
- *   3. extract text for FREE (src/marketing/extract-client.js — reece-speech-api
+ *      (a part judged "not an invoice" before answers duplicate + skipped)
+ *   2. extract text for FREE (src/marketing/extract-client.js — reece-speech-api
  *      for PDF/images, in-process for CSV/XLSX/body text)
- *   4. analyze: rules, then the model on the TEXT only (invoice-analyzer.js)
- *   5. build marketing_expenses rows (pending_review) + flags
- *   6. auto-approve only with no flags AND ≥ MKT_AUTO_APPROVE_MIN_PRIOR prior
+ *   3. triage: a logo or a signature image has no invoice in it — remembered by
+ *      sha in marketing_invoice_skips, never a document, never the model
+ *      (2026-10-13, src/marketing/invoice-triage.js)
+ *   4. store the original in Storage bucket marketing-invoices/<yyyy>/<mm>/<sha>.<ext>
+ *   5. analyze: rules, then the model on the TEXT only (invoice-analyzer.js)
+ *   6. build marketing_expenses rows (pending_review) + flags; a missing period
+ *      or total is flagged, then filled so the row can exist (fillRowDefaults)
+ *   7. auto-approve only with no flags AND ≥ MKT_AUTO_APPROVE_MIN_PRIOR prior
  *      person approvals of the vendor; everything else → Slack review card
- *   7. answer { success, duplicate, document_id, expense_ids, flags, auto_approved }
+ *   8. answer { success, duplicate, skipped, document_id, expense_ids, flags, auto_approved }
  *
  * Auth: the same x-ghl-signature / LP_REPORT_INGEST_SECRET check the LP
  * report ingest uses (src/jobs/lp-report-common.js), with the same fail-open-
  * until-set posture it documents. A failure after the document row exists
- * leaves status='failed' + error, so nothing is silently lost; a 5xx makes
- * n8n retry, and the retry is a duplicate (the sha is already claimed) unless
- * the row was marked failed, in which case it is re-run.
+ * leaves status='failed' + error, so nothing is silently lost. Only a
+ * TRANSIENT failure (the extract service, storage, a connection) is a 5xx
+ * that makes n8n retry; a deterministic one (a refused insert, a rejected
+ * analysis) is 200 + success:false, reported once and never retried
+ * (2026-10-13). A retry of a failed row reuses its stored text.
  */
 import express from 'express';
 import supabaseDefault from '../supabase.js';
@@ -31,6 +38,7 @@ import { postToSlack } from '../slack.js';
 import { extractDocument, documentKind } from '../marketing/extract-client.js';
 import { analyzeInvoiceText } from '../marketing/invoice-analyzer.js';
 import { buildExpenseRows, computeFlags, autoApproveDecision } from '../marketing/expense-builder.js';
+import { triageExtraction, fillRowDefaults } from '../marketing/invoice-triage.js';
 import { allocateExpenseById, reallocateMonth, reconcileAllocations } from '../marketing/allocation-io.js';
 import { trueUpInvoice } from '../marketing/leadgurus-feed.js';
 import { buildReviewCard } from '../marketing/slack-review.js';
@@ -38,6 +46,7 @@ import { previewRows, reviewChannelId, signedOriginalLink } from '../marketing/r
 
 const LOG = '[MktInvoice]';
 export const INVOICES_BUCKET = 'marketing-invoices';
+export const SKIPS_TABLE = 'marketing_invoice_skips';
 
 export function ingestConfig(env = process.env) {
   return {
@@ -117,6 +126,18 @@ async function vendorHistory(supabase, vendor, facts) {
 }
 
 /**
+ * A failure that will fail the same way on a retry is answered 200 with
+ * success:false (n8n's IF routes it to the failed-telemetry node once and never
+ * retries); a failure of a service we depend on is answered 500 so n8n retries.
+ * 2026-10-13: three deterministic NOT NULL failures each came back as 500 and
+ * were retried twice more, re-OCR'ing and re-asking the model every time.
+ */
+export function isTransientError(err) {
+  const m = String(err?.message || err || '');
+  return /\((?:429|5\d\d)\)|timed out|timeout|aborted|ECONN|ENOTFOUND|EAI_AGAIN|fetch failed|socket hang up|not configured|rate limit/i.test(m);
+}
+
+/**
  * The whole pipeline for one payload. Returns the route's JSON body plus
  * `httpStatus`. Throws only for an infrastructure failure before the document
  * row exists (the caller answers 500 and n8n retries).
@@ -131,8 +152,15 @@ export async function ingestInvoice(body, deps = {}) {
   const bytes = buffer || Buffer.from(bodyText, 'utf8');
   const sha = sha256Hex(bytes);
 
-  // 1. dedupe — the sha is claimed by the insert; a race loses on the unique index.
-  const { data: seen } = await supabase.from('marketing_invoice_documents').select('id, status').eq('sha256', sha).maybeSingle();
+  // 1. dedupe — a part already judged "not an invoice" (a logo, a signature
+  //    image) is answered at once, before any storage, OCR or model call
+  //    (2026-10-13). Then the sha claimed by a document row; a race loses on
+  //    the unique index.
+  const { data: skippedBefore } = await supabase.from(SKIPS_TABLE).select('sha256, reason, file_name').eq('sha256', sha).maybeSingle();
+  if (skippedBefore) {
+    return { httpStatus: 200, success: true, duplicate: true, skipped: true, reason: skippedBefore.reason, document_id: null };
+  }
+  const { data: seen } = await supabase.from('marketing_invoice_documents').select('id, status, extracted_text, extraction_meta, storage_path').eq('sha256', sha).maybeSingle();
   let documentId = seen?.id || null;
   if (seen && seen.status !== 'failed') {
     return { httpStatus: 200, success: true, duplicate: true, document_id: seen.id, status: seen.status };
@@ -149,64 +177,90 @@ export async function ingestInvoice(body, deps = {}) {
     }
     documentId = data.id;
   }
-  const fail = async (step, err) => {
+  const fail = async (step, err, { transient = isTransientError(err) } = {}) => {
     const message = `${step}: ${err?.message || err}`;
-    console.error(`${LOG} ${documentId} ${message}`);
+    console.error(`${LOG} ${documentId} ${message}${transient ? ' (transient: n8n retries)' : ' (deterministic: reported once, not retried)'}`);
     await supabase.from('marketing_invoice_documents').update({ status: 'failed', error: message.slice(0, 1000), updated_at: now().toISOString() }).eq('id', documentId);
-    return { httpStatus: 500, success: false, document_id: documentId, error: message };
+    return { httpStatus: transient ? 500 : 200, success: false, document_id: documentId, error: message, transient };
   };
 
-  // 2. store the original
+  // 2. extract (free). A retry of a failed document reuses the text it already
+  //    has rather than OCR'ing and paying the model again.
   const kind = buffer ? documentKind(buffer, { fileName: meta.file_name, mimeType: meta.mime_type }) : 'text';
+  let extracted;
+  try {
+    if (seen?.extracted_text != null && seen.extraction_meta) {
+      extracted = { kind, text: seen.extracted_text, meta: seen.extraction_meta, tables: [] };
+    } else {
+      extracted = await (deps.extract || extractDocument)(buffer, { fileName: meta.file_name, mimeType: meta.mime_type, bodyText }, deps.extractDeps || {});
+      await supabase.from('marketing_invoice_documents').update({ extracted_text: extracted.text, extraction_meta: extracted.meta, status: 'extracted', updated_at: now().toISOString() }).eq('id', documentId);
+    }
+  } catch (err) { return fail('extract', err); }
+
+  // 3. triage — is there an invoice in this text at all? A logo or a signature
+  //    image is remembered by sha and never becomes a document (2026-10-13).
+  const triage = triageExtraction({ text: extracted.text, kind: extracted.kind || kind, meta: extracted.meta });
+  if (triage.verdict === 'not_an_invoice') {
+    const { error: skipErr } = await supabase.from(SKIPS_TABLE).insert({
+      sha256: sha, file_name: meta.file_name, mime_type: meta.mime_type, gmail_message_id: meta.gmail_message_id, from_address: meta.from_address,
+      reason: triage.reason, chars: triage.chars, page_count: extracted.meta?.page_count ?? null,
+    });
+    if (skipErr && !/duplicate|unique|23505/i.test(skipErr.message || '')) console.warn(`${LOG} skip row not written (${skipErr.message}); the part is still skipped this time`);
+    await supabase.from('marketing_invoice_documents').delete().eq('id', documentId);
+    console.log(`${LOG} skipped ${meta.file_name || '(body)'} from ${meta.from_address || '?'}: ${triage.reason} (${triage.chars} chars, ${extracted.meta?.ocr_pages ?? 0} OCR page(s))`);
+    return { httpStatus: 200, success: true, duplicate: false, skipped: true, reason: triage.reason, chars: triage.chars, document_id: null };
+  }
+
+  // 4. store the original (only a real invoice is kept)
   const ext = buffer ? extOf({ fileName: meta.file_name, mimeType: meta.mime_type, kind }) : 'txt';
   const d = now();
-  const storagePath = `${d.getUTCFullYear()}/${String(d.getUTCMonth() + 1).padStart(2, '0')}/${sha}.${ext}`;
+  const storagePath = seen?.storage_path || `${d.getUTCFullYear()}/${String(d.getUTCMonth() + 1).padStart(2, '0')}/${sha}.${ext}`;
   try {
     const { error } = await supabase.storage.from(INVOICES_BUCKET).upload(storagePath, bytes, { contentType: meta.mime_type || (buffer ? 'application/octet-stream' : 'text/plain'), upsert: true });
     if (error) throw new Error(error.message);
     await supabase.from('marketing_invoice_documents').update({ storage_bucket: INVOICES_BUCKET, storage_path: storagePath }).eq('id', documentId);
-  } catch (err) { return fail('store', err); }
+  } catch (err) { return fail('store', err, { transient: true }); }
 
-  // 3. extract (free)
-  let extracted;
-  try {
-    extracted = await (deps.extract || extractDocument)(buffer, { fileName: meta.file_name, mimeType: meta.mime_type, bodyText }, deps.extractDeps || {});
-    await supabase.from('marketing_invoice_documents').update({ extracted_text: extracted.text, extraction_meta: extracted.meta, status: 'extracted', updated_at: now().toISOString() }).eq('id', documentId);
-  } catch (err) { return fail('extract', err); }
-
-  // 4. analyze
+  // 5. analyze
   let a;
   try {
     const { vendors, slugNames } = await loadVendorsAndSlugs(supabase);
     a = await (deps.analyze || analyzeInvoiceText)({ text: extracted.text, fromAddress: meta.from_address, vendors, slugNames, sourceRef: sha }, deps.analyzeDeps || {});
   } catch (err) { return fail('analyze', err); }
 
-  // 5. expense rows + flags
-  const { rows, lineProblems } = buildExpenseRows({ document: { id: documentId }, vendor: a.vendor, facts: a.facts, analysis: a.ai, confidence: a.confidence });
+  // 6. expense rows + flags. The flags are computed on what the invoice SAID
+  //    (a missing period or total is flagged); the rows are then made
+  //    insertable (fillRowDefaults) so the card can exist and Edit can fix them.
+  const built = buildExpenseRows({ document: { id: documentId }, vendor: a.vendor, facts: a.facts, analysis: a.ai, confidence: a.confidence });
   const history = await vendorHistory(supabase, a.vendor, a.facts);
   const flags = computeFlags({
-    vendor: a.vendor, facts: a.facts, rows, lineProblems, confidence: a.confidence, disagreements: a.disagreements,
+    vendor: a.vendor, facts: a.facts, rows: built.rows, lineProblems: built.lineProblems, confidence: a.confidence, disagreements: a.disagreements,
     extraction: extracted.meta, trailingAvg: history.trailingAvg, possibleDuplicate: history.possibleDuplicate, minConfidence: cfg.minConfidence,
   });
   if (a.guard && a.guard.verdict && a.guard.verdict !== 'clean') flags.push('text_flagged_by_guardrail');
+  const filled = fillRowDefaults(built.rows, a.facts, { receivedAt: meta.received_at, today: todayET() });
+  const rows = filled.rows;
   const autoApproved = autoApproveDecision({ flags, priorApprovals: history.priorApprovals, minPrior: cfg.minPrior });
+
+  // The analysis is saved BEFORE the rows are written, so a refused insert
+  // still leaves the facts on the document (2026-10-13: none survived).
+  const analysis = {
+    facts: { ...filled.facts, vendor_name_hint: a.ai?.vendor_name || null }, rules: a.rules, ai: a.ai, ai_errors: a.aiErrors, hints: a.hints,
+    vendor_id: a.vendor?.id || null, vendor_method: a.vendorMethod, confidence: a.confidence, disagreements: a.disagreements, flags,
+    guard: a.guard ? { verdict: a.guard.verdict, score: a.guard.score, mode: a.guard.mode } : null,
+    history: { prior_approvals: history.priorApprovals, trailing_avg: history.trailingAvg },
+    assumed: filled.assumed, auto_approved: autoApproved,
+  };
+  await supabase.from('marketing_invoice_documents').update({ analysis, analyzer: a.analyzer, status: 'analyzed', updated_at: now().toISOString() }).eq('id', documentId);
 
   const { data: inserted, error: insErr } = await supabase.from('marketing_expenses').insert(rows.map((r) => ({ ...r, flags }))).select('id, line_no');
   if (insErr) return fail('expenses', insErr);
   const expenseIds = (inserted || []).map((r) => r.id);
-  const analysis = {
-    facts: { ...a.facts, vendor_name_hint: a.ai?.vendor_name || null }, rules: a.rules, ai: a.ai, ai_errors: a.aiErrors, hints: a.hints,
-    vendor_id: a.vendor?.id || null, vendor_method: a.vendorMethod, confidence: a.confidence, disagreements: a.disagreements, flags,
-    guard: a.guard ? { verdict: a.guard.verdict, score: a.guard.score, mode: a.guard.mode } : null,
-    history: { prior_approvals: history.priorApprovals, trailing_avg: history.trailingAvg },
-    auto_approved: autoApproved,
-  };
-  await supabase.from('marketing_invoice_documents').update({ analysis, analyzer: a.analyzer, status: 'analyzed', updated_at: now().toISOString() }).eq('id', documentId);
 
   const ctxBase = { document: { id: documentId, ...meta, analyzer: a.analyzer }, vendor: a.vendor, facts: analysis.facts, flags, confidence: a.confidence, extraction: extracted.meta, vendorMethod: a.vendorMethod, disagreements: a.disagreements };
   const post = deps.postToSlack || postToSlack;
 
-  // 6. auto-approve or review
+  // 7. auto-approve or review
   if (autoApproved) {
     const ts = now().toISOString();
     await supabase.from('marketing_expenses').update({ status: 'approved', approved_by: `auto (${history.priorApprovals} prior approvals, no flags)`, approved_at: ts }).in('id', expenseIds);
@@ -244,9 +298,10 @@ export async function ingestInvoice(body, deps = {}) {
       console.error(`${LOG} review card for ${documentId} NOT posted: ${r.error}`);
     }
   } else {
-    console.warn(`${LOG} SLACK_MKT_INVOICE_CHANNEL_ID unset — ${documentId} waits in the ledger with no card`);
+    await supabase.from('marketing_invoice_documents').update({ status: 'in_review', updated_at: now().toISOString() }).eq('id', documentId);
+    console.warn(`${LOG} SLACK_MKT_INVOICE_CHANNEL_ID unset — ${documentId} waits in the ledger (in_review) with no card`);
   }
-  return { httpStatus: 200, success: true, duplicate: false, document_id: documentId, expense_ids: expenseIds, flags, auto_approved: false, review_posted: posted };
+  return { httpStatus: 200, success: true, duplicate: false, document_id: documentId, expense_ids: expenseIds, flags, assumed: filled.assumed, auto_approved: false, review_posted: posted };
 }
 
 /**

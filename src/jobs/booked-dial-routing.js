@@ -32,10 +32,10 @@ import { runJob } from '../job-runner.js';
 import { summarizeContactRecord } from '../lead-leak-classify.js';
 import { insertSoft, isMissingTable } from '../lp-inbound-queue.js';
 import { normalizeInboundRow, rowFromLead, buildBackstopRecord, etDateKey, phone10 } from '../new-lead-dial-backstop.js';
-import { readInboundRows, readLeadsSince, readSoldPhones, readDnc } from './new-lead-dial-backstop.js';
+import { readInboundRows, readLeadsSince, readLeadsByAppointment, readSoldPhones, readDnc } from './new-lead-dial-backstop.js';
 import {
   routingMode, routingConfig, buildCandidate, onePerPhone, prefilter, decide, addState, addKey, removeKey,
-  priorRemoveKeys, buildAddAction, buildRemovalAction, approvalExpired, RULE_KEY,
+  priorRemoveKeys, buildAddAction, buildRemovalAction, approvalExpired, RULE_KEY, lookupPriority,
   failedAddCount, retryKey, moveKey, confMoveDue, formatAddFailedCard,
 } from '../booked-dial-routing.js';
 
@@ -46,6 +46,7 @@ const ALERT_KEY = 'booked-dial-routing';
 export const ADD_FAILED_AUDIT = 'booked_conf_add_failed';
 
 const q = (x) => `'${String(x).replace(/'/g, "''")}'`;
+const addDaysKey = (day, n) => new Date(Date.parse(`${day}T00:00:00Z`) + n * 86_400_000).toISOString().slice(0, 10);
 
 async function defaultDeps() {
   const [{ runSQL }, supabaseMod, five9, lp, alertState, slack, alertPosted] = await Promise.all([
@@ -244,8 +245,13 @@ export async function runBookedDialRouting({ env = process.env, nowMs = Date.now
       if (r.ldsId) seenLds.add(r.ldsId);
       all.push(buildCandidate(r, lead));
     }
-    for (const l of windowLeads) {
-      if (seenLds.has(String(l.lp_lead_id))) continue;
+    // 2026-10-13: every visit for today .. today+2 too, whatever the lead's age
+    // (readLeadsByAppointment). The 72h window alone missed older leads.
+    const apptLeads = await readLeadsByAppointment(d.runSQL, today, addDaysKey(today, 2));
+    for (const l of [...windowLeads, ...apptLeads]) {
+      const id = String(l.lp_lead_id);
+      if (seenLds.has(id)) continue;
+      seenLds.add(id);
       const c = buildCandidate(rowFromLead(l), l);
       if (c.apptDate && c.booked) all.push(c);
     }
@@ -278,6 +284,11 @@ export async function runBookedDialRouting({ env = process.env, nowMs = Date.now
   }
   let lookups = 0;
   const addFailed = [];
+  // Adds before removal re-checks, soonest visit first (lookupPriority).
+  live.sort((a, b) => lookupPriority(
+    { needsAdd: Boolean(a.pre.route.addList) && addState(adds.get(a.c.phone), a.pre.route.addList) !== 'done', c: a.c },
+    { needsAdd: Boolean(b.pre.route.addList) && addState(adds.get(b.c.phone), b.pre.route.addList) !== 'done', c: b.c },
+  ));
   for (const { c, pre } of live) {
     const list = pre.route.addList;
     const removedBefore = priorRemoveKeys(c.phone, c.apptDate, nowMs, cfg.readdLookbackDays).some((k) => marks.has(k));
