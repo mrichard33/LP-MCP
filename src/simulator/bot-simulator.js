@@ -110,6 +110,9 @@ export function autoAnswerFor(reply, persona = {}, { scriptDone = false } = {}) 
   if (/\bstreet\s+address\b|\bwhat(?:'s| is)\s+the\s+address\b|\baddress\b[^?]*\bzip\b[^?]*\?/i.test(q)) return persona.address || '1200 Palm Ave, Fort Myers FL 33908';
   if (/\bdo\s+you\s+own\b|\bhomeowner\b|\bown\s+the\s+(?:home|house)\b/i.test(q)) return 'Yes, I own it.';
   if (/\bzip(?:\s*code)?\b[^?]*\?/i.test(q)) return (String(persona.address || '').match(/\b\d{5}\b/) || [persona.postalCode || '33908'])[0];
+  // 2026-10-13: the qualifying gate asks how many openings before any time
+  // (job-scope.js), so a booking persona must say how many or never book.
+  if (/\bhow\s+many\s+(?:windows?|doors?|openings?)\b/i.test(q)) return persona.openings || '12 windows and 2 doors';
   if (/\bable\s+to\s+(?:be\s+there|make\s+it)\b|\bboth\s+be\s+there\b/i.test(q)) return "Yes, she'll be there.";
   if (/\b(?:anyone|anybody|someone)\s+else\b|\bpart\s+of\s+the\s+decision\b|\bweigh(?:ing)?\s+in\b/i.test(q)) return 'Just me.';
   if (/\b(?:first|full|your)\s+name\b|\bwho\s+should\s+i\s+put\b/i.test(q)) return persona.firstName && !/^guest$/i.test(persona.firstName) ? persona.firstName : 'Dana';
@@ -120,8 +123,8 @@ export function autoAnswerFor(reply, persona = {}, { scriptDone = false } = {}) 
   if (scriptDone && (t.match(/\b\d{1,2}(?::\d{2})?\s*(?:AM|PM)\b/gi) || []).length >= 2 && /\bwhich\b|\bwork(?:s)?\b|\bor\b/i.test(q)) return 'The first one';
   return null;
 }
-// 8: owner, zip, decision maker, presence, the pick, name, phone, address.
-const MAX_AUTO_ANSWERS = 8;
+// 9: owner, zip, openings, decision maker, presence, the pick, name, phone, address.
+const MAX_AUTO_ANSWERS = 9;
 
 /** The test conversations (the "good test messages" list). Customer side only. */
 export const SCENARIOS = Object.freeze({
@@ -234,7 +237,9 @@ export async function simulateLiveChat(plan, { nepqMode = 'live', productionDeps
     cancelAppointment: async (a) => { record('would_cancel_in_ghl', { appointment_id: a.appointmentId }); return { ok: true }; },
     rescheduleAppointment: async (a) => { record('would_move_same_appointment_in_ghl', { appointment_id: a.oldAppointmentId, new_start: a.startIso }); return { ok: true }; },
     postCancelCard: async (a) => { record('would_post_dispatch_card', { card: a.kind, text: String(a.text || '').slice(0, 400) }); return { ok: true }; },
-    bookSlot: async (a) => { record('would_book', { start: a.startIso }); await recordBookedStage({ contactId, channel: 'livechat', source: 'sim' }, stageDeps); return { ok: true, action_id: 0 }; },
+    // 2026-10-13: an appointment id, or booking truth reads action_id 0 as no
+    // booking and turns the confirm into the no-promise hand-off (live gate).
+    bookSlot: async (a) => { record('would_book', { start: a.startIso }); await recordBookedStage({ contactId, channel: 'livechat', source: 'sim' }, stageDeps); return { ok: true, action_id: 0, appointment_id: 'sim-booked' }; },
     recordLeadStage: async (a) => { turnStage = stageNote(await recordStage(a, stageDeps)); return turnStage; },
     readLeadStage: async () => simStageRead(stageDeps, contactId),
     leadStageMode: () => stageDeps.mode,
