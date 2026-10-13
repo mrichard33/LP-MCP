@@ -180,6 +180,23 @@ export async function readLeadsSince(runSQL, sinceMs) {
   return rows;
 }
 
+/**
+ * lp_leads with an appointment on one of the given ET days, whatever their age
+ * (2026-10-13). The confirmation routing read only leads CREATED in its 72h
+ * window, so a visit set on an older lead (a rebook, a re-set, a bot booking on
+ * an existing lead) or booked 4+ days ahead never reached a Conf list: 25 of 80
+ * Set/Verif visits for the next three days were missing on 2026-10-13.
+ * appointment_date is Eastern wall clock tagged +00:00, like the day keys.
+ */
+export async function readLeadsByAppointment(runSQL, fromDay, toDay) {
+  const next = new Date(Date.parse(`${toDay}T00:00:00Z`) + 86_400_000).toISOString().slice(0, 10);
+  const rows = await runSQL(`SELECT ${LEAD_COLS} FROM lp_leads
+    WHERE lp_deleted_at IS NULL
+      AND appointment_date >= ${q(`${fromDay} 00:00:00+00`)} AND appointment_date < ${q(`${next} 00:00:00+00`)}`);
+  if (!Array.isArray(rows)) throw new Error('lp_leads appointment read returned no row set');
+  return rows;
+}
+
 async function readLeads(runSQL, ldsIds) {
   const byId = new Map();
   for (const part of chunks(ldsIds, 300)) {

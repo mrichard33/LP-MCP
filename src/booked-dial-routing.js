@@ -159,7 +159,13 @@ export function buildCandidate(row, lead = null) {
   };
 }
 
-/** One candidate per phone; the newest row wins. */
+/**
+ * One candidate per phone. A row with a booked visit beats one without
+ * (2026-10-13: a fresh web form with no appointment, newer than the lead that
+ * holds the visit, won the phone and the visit never reached a Conf list).
+ * Otherwise the newest row wins.
+ */
+const hasVisit = (c) => Boolean(c.booked && c.apptDate);
 export function onePerPhone(candidates) {
   const byPhone = new Map();
   const dropped = [];
@@ -167,9 +173,26 @@ export function onePerPhone(candidates) {
     if (!c.phone) { dropped.push(c); continue; }
     const prev = byPhone.get(c.phone);
     if (!prev) { byPhone.set(c.phone, c); continue; }
-    if ((c.receivedMs ?? 0) > (prev.receivedMs ?? 0)) { dropped.push(prev); byPhone.set(c.phone, c); } else dropped.push(c);
+    const better = hasVisit(c) !== hasVisit(prev)
+      ? hasVisit(c)
+      : (c.receivedMs ?? 0) > (prev.receivedMs ?? 0);
+    if (better) { dropped.push(prev); byPhone.set(c.phone, c); } else dropped.push(c);
   }
   return { winners: [...byPhone.values()], dropped };
+}
+
+/**
+ * Order for the capped Five9 lookups (2026-10-13). Leads that still need a
+ * Confirmation ADD go first, soonest visit first; removal re-checks go last.
+ * The cap (40 a pass) was spent on removal re-checks every pass, and the same
+ * adds were deferred pass after pass (`lookup_cap`), one with a visit that
+ * morning. Pure: `needsAdd` is computed by the caller.
+ * @param {{ needsAdd: boolean, c: { apptDate?: string, apptStartMs?: number } }} a
+ */
+export function lookupPriority(a, b) {
+  if (a.needsAdd !== b.needsAdd) return a.needsAdd ? -1 : 1;
+  const when = (x) => (Number.isFinite(x.c.apptStartMs) ? x.c.apptStartMs : Date.parse(`${x.c.apptDate || '9999-12-31'}T23:59:59Z`));
+  return when(a) - when(b);
 }
 
 /* --- the target ----------------------------------------------------------------- */
