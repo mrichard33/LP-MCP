@@ -161,6 +161,8 @@ export const SCENARIOS = Object.freeze({
   landlord: { title: 'Landlord asks about a rental (no rentals)', persona: DANA, turns: ['Hi, I need new windows on a house I rent out to tenants', 'Can you just set something up anyway?'] },
   commercial: { title: 'Commercial property (no commercial)', persona: GUEST, turns: ['Do you do commercial buildings? We need windows for our office building', 'Can someone come take a look?'] },
   one_window: { title: 'One window only (under the minimum)', persona: DANA, turns: ['I would like to get a quote on replacing 1 24x36 window', 'Yes, the rest are already impact'] },
+  // ── 2026-10-13 (Erica Hilts): a price ask, then a goodbye, twice ──
+  price_then_goodbye: { title: 'Price ask, then "have a good day" (Erica Hilts)', persona: DANA, turns: ["Hi, I'm looking to get a bay window. The area is about 6ft wide", "Ok I see. What's an average price including installation?", 'Thank you for your time, just needing an average estimation, not exact pricing. Have a good day.', 'I can call back when I have more time. Ty'] },
   slider_only: { title: 'One sliding glass door (meets the minimum)', persona: DANA, autoAnswer: true, turns: ['I need to replace our sliding glass door', 'Yes, please set up a visit'] },
 });
 

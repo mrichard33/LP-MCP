@@ -25,7 +25,8 @@ const ofLength = (n) => 'We can go over that at the visit. '.repeat(20).slice(0,
 test('the version was bumped for the new check and the cap is the prompt\'s 320', () => {
   // 2026-10-10.2: money_figure now allows the ruled "0% APR" (scripts/test-zero-apr-ruling.js).
   // 2026-10-13.1: job_scope (no rentals, no commercial, the minimum, impact-only).
-  assert.equal(INVARIANTS_VERSION, '2026-10-13.1');
+  // 2026-10-13.2: times_after_sign_off and repeat_slot_offer (Erica Hilts).
+  assert.equal(INVARIANTS_VERSION, '2026-10-13.2');
   assert.equal(SMS_MAX_CHARS, 320);
 });
 

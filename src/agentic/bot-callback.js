@@ -115,6 +115,7 @@ export function readRequeueResult(res) {
   if (action === 'requeue_skipped_already_dialable' || action === 'requeue_suppressed_other_list') return { status: 'already_dialing' };
   if (action === 'requeue_deduped') return { status: 'deduped' };
   if (action === 'skipped_rehash_lead') return { status: 'rehash' };
+  if (action === 'requeue_blocked_opt_out') return { status: 'opted_out' };
   if (action === 'requeue_blocked_dnc') return { status: 'on_dnc', review: (res.result || res).dnc_review_action_id != null };
   return { status: 'failed', error: action || 'unknown result' };
 }
@@ -183,7 +184,8 @@ export async function fileBotCallback({ contactId, channel = 'sms', inbound = ''
   // A rehash lead's call request already went to #contact-rehash (the user,
   // 2026-10-09: "These leads will be handled by John Manieri or other rehash
   // team members"): no #contact-center card on top.
-  if (card && five9.status !== 'rehash') {
+  // An opted-out lead (2026-10-13): nobody calls, so no card asks anyone to.
+  if (card && five9.status !== 'rehash' && five9.status !== 'opted_out') {
     await Promise.resolve().then(() => deps.routeHandoff?.({
       // 2026-10-07: a caller's own context (the LP-note DQ package) rides above the Five9 line.
       contactId, reason, channel, inbound, firstName, nowMs, extra: [extra, five9ResultLine(five9)].filter(Boolean).join('\n'),

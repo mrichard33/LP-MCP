@@ -210,6 +210,28 @@ test('expired card posts once in live, tags needs-rep-review, never in shadow', 
   assert.equal(shadow.tags.length, 0, 'shadow tags nothing');
 });
 
+// 2026-10-13 (Erica Hilts): STOP a few minutes after the promise. Her row would
+// have expired into a "PROMISED CALL NOT KEPT" card asking a rep to call her.
+test('a lead who opted out since the promise: cancelled, no card, no tag', async () => {
+  const live = sweepDeps({ env: { PROMISED_CALLBACK_MODE: 'live', SLACK_CHANNEL_SERVICE: 'CC' } });
+  live.deps.readTags = async () => ['dnc-sms', 'stop-bot', 'suppress:dnc-reply'];
+  const r = await runPromisedCallbackSweep(live.deps);
+  assert.equal(r.cancelled, 1);
+  assert.equal(r.expired, 0);
+  assert.equal(live.posted.length, 0);
+  assert.equal(live.tags.length, 0);
+  assert.equal(live.db.updates[0].patch.status, 'cancelled');
+  assert.deepEqual(live.db.updates[0].patch.kept_evidence, { cancelled: 'lead_opted_out' });
+  // stop-bot alone is the bot switch, not an opt-out: the call is still owed.
+  const botOff = sweepDeps({ env: { PROMISED_CALLBACK_MODE: 'live', SLACK_CHANNEL_SERVICE: 'CC' } });
+  botOff.deps.readTags = async () => ['stop-bot'];
+  assert.equal((await runPromisedCallbackSweep(botOff.deps)).expired, 1);
+  // Unreadable tags change nothing.
+  const unread = sweepDeps({ env: { PROMISED_CALLBACK_MODE: 'live', SLACK_CHANNEL_SERVICE: 'CC' } });
+  unread.deps.readTags = async () => { throw new Error('down'); };
+  assert.equal((await runPromisedCallbackSweep(unread.deps)).expired, 1);
+});
+
 test('kept via Five9 in the sweep; closed team or off does nothing', async () => {
   const k = sweepDeps({ env: { PROMISED_CALLBACK_MODE: 'live' }, five9: [{ dnis: '9175550100', call_start_at: iso('2026-10-02T13:00:00Z') }] });
   const r = await runPromisedCallbackSweep(k.deps);

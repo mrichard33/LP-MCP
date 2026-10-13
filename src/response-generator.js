@@ -273,6 +273,7 @@ import { enforceTeamVoice } from './agentic/team-voice.js';
 import { enforcePropertyScope } from './agentic/property-scope.js';
 import { dropFragmentOpener, dropStaleCallMention, normalizeSignature, isNearRepeat, replySimilarity, NEAR_REPEAT_NOTE } from './agentic/sms-format.js';
 import { enforceNonOwner } from './agentic/non-owner.js';
+import { enforceSignOff } from './agentic/sign-off.js';
 import { enforceJobScope, openingsToSave } from './agentic/job-scope.js';
 import { isPostDemoLead } from './agentic/post-demo-lead.js';
 import { enforceCallTiming, softenCallTiming, isTeamOpen, enforceRehashCallTiming } from './agentic/team-hours.js';
@@ -417,6 +418,9 @@ import { postDemoPlannerMode } from './agentic/post-demo-turn.js';
 import { rehashCallSlotsMode, readRehashCallSlots, rehashCallBooking } from './agentic/rehash-slots.js';
 import { isInRehash, rehashLeadFromContext, rehashRoutingMode } from './agentic/rehash-state.js';
 import { planNepqTurn, enforceNepqPlan, referenceRetryNote, nepqBackboneMode, prefersCall as nepqPrefersCall, objectionType as nepqObjectionType, TIME_REQUEST_RX as NEPQ_TIME_REQUEST_RX, SCHEDULE_ASK_RX as NEPQ_SCHEDULE_ASK_RX,REPEAT_COMPLAINT_RX as NEPQ_REPEAT_COMPLAINT_RX, bookingOpenInThread as nepqBookingOpenInThread, dropUnaskedCallOffer, leadWantsCall as nepqLeadWantsCall, isServiceCallback as nepqIsServiceCallback } from './agentic/nepq-planner.js';
+// A layer3 script that forbids a time offer this turn (follow_up_scheduled,
+// OBJ_PRICE_STRIKE3's "no slot grid").
+const NO_TIMES_DIRECTIVE_RX = /\bno\s+(?:times|slots?|slot\s+grid|booking\s+ask)\b/i;
 import {
   outOfAreaLine,
   planServiceAreaTurn, resolveCoverage, coverageHint, guardCoverageDraft, serviceAreaRecord, coverageOwnsReply,
@@ -4188,6 +4192,10 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
         knownZip: identityState?.identity?.postal_code || context.lead?.postal_code || null,
         // A Window Count / Door Count already on the contact: the count is not asked (2026-10-13).
         knownOpenings: (Number(context.estimate?.window_count) || 0) + (Number(context.estimate?.door_count) || 0) > 0,
+        // 2026-10-13 (Erica Hilts): the layer3 script said "NO times" and the
+        // plan offered two anyway; the plan block wins over the script, so the
+        // planner is told.
+        directiveNoTimes: NO_TIMES_DIRECTIVE_RX.test(String(opts.promptHint || '')),
       };
       nepqPlan = planNepqTurn({ ...planArgs, postDemo: pdMode === 'live' && postDemoLead, rehashRep, rehash: !!rehash, callSlots: slotsMode === 'live' ? rehashCallSlots : null });
       if (slotsMode === 'shadow' && rehash && postDemoLead) {
@@ -4920,6 +4928,8 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       booking: nepqPlan.booking, slots: (nepqPlan.slots_to_offer || []).length,
       // 2026-10-11: the post-demo plan and its track stage (Bot Review, the gate).
       post_demo: !!nepqPlan.post_demo, rehash_stage: nepqPlan.rehash_stage || null,
+      // 2026-10-13: the third price ask's call offer is the plan, not unasked.
+      ...(nepqPlan.call_offer_ok ? { call_offer_ok: true } : {}),
     };
     const idf = identityState?.identity || {};
     const knownFirst = idf.first_name || context.lead?.first_name || null;
@@ -5242,6 +5252,15 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       console.warn(`[NonOwner] ${contactId} ${owner.reason}`);
       validated.message = owner.text;
       validated.non_owner = owner.reason;
+      if (validated.companion_action?.action_type === 'book_appointment') validated.companion_action = null;
+    }
+    // A goodbye ends the turn, in every mode (2026-10-13, Erica Hilts: "I can
+    // call back when I have more time" got "I'll check back next week. Enjoy."
+    // and the same two visit times). No question, no time, no booking.
+    const signOff = pastDemo ? { changed: false } : enforceSignOff(validated.message, { inbound: triggerMessage });
+    if (signOff.changed) {
+      console.warn(`[SignOff] ${contactId} question/time dropped after a goodbye`);
+      validated.message = signOff.text;
       if (validated.companion_action?.action_type === 'book_appointment') validated.companion_action = null;
     }
     // 2026-10-07 (Nicholas): a cancelled visit is never "your visit" (cancelled-visit.js).

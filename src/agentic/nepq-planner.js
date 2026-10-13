@@ -27,7 +27,7 @@
 import { isNotInterested } from './not-interested.js';
 import { isLeadQuestion, findBookingAsks } from './discovery-discipline.js';
 import { isTeamOpen, nextTeamOpenLabel, requestedCallTime, promisedCallback } from './team-hours.js';
-import { heldSlot, COLLECT_ASK } from './booking-collect.js';
+import { heldSlot, COLLECT_ASK, dmAnswerFromThread } from './booking-collect.js';
 import { RECHECK_RX } from './contact-check.js';
 import { slotMentionIndex, offeredSlots as offeredIn, pickSlot } from '../live-chat/cancel-flow.js';
 import { parseDayPreference, slotsForPreference, slotMatches, preferenceOfferLine } from './day-preference.js';
@@ -40,6 +40,7 @@ import { homeownerFromThread, OWNER_ASK_RX } from './homeowner.js';
 import { jobScopeFromThread, openingsKnown, COUNT_ASK_RX } from './job-scope.js';
 import { decisionMakersFromThread, dmSettled } from './qualifying.js';
 import { extractZip } from './service-area-turn.js';
+import { isLeadSignOff, leadWillReachOut } from './sign-off.js';
 
 export { isKnockComplaint };
 
@@ -126,7 +127,7 @@ const SERVICE_RX = /\b(?:you|you\s+guys|reece|your\s+(?:team|crew|company|instal
 const CALLBACK_RX = /\b(?:call|ring|phone)\s+(?:me|us)\b[^.?!]{0,30}\b(?:at|around|after|before|tomorrow|today|tonight|this\s+(?:morning|afternoon|evening)|in\s+the\s+(?:morning|afternoon|evening)|anytime|any\s+time)\b|\b(?:call\s+me\s+back|give\s+me\s+a\s+call|have\s+someone\s+call\s+me)\b|\b(?:can|could|would|will)\s+(?:someone|somebody|you|a\s+(?:person|rep|team\s+member))\s+(?:please\s+)?(?:call|ring|phone)\s+me\b|^\s*(?:just\s+)?(?:please\s+)?call\s+me\b|\b(?:i'?d|i\s+would)\s+(?:rather|prefer\s+to)\s+(?:talk|speak|chat)\s+(?:on\s+the\s+phone|by\s+phone|over\s+the\s+phone)\b/i;
 // 2026-10-03 (Mark's shutters thread): our own offer of a call ("Want someone
 // to give you a call and go over it?"). A yes to it is a callback request.
-export const CALL_OFFER_RX = /\b(?:want|would\s+you\s+like|should\s+i\s+have|can\s+(?:i|we)\s+have|shall\s+(?:i|we)\s+have)\s+(?:someone|somebody|us|me|a\s+(?:team\s+member|rep|specialist))\s+(?:to\s+)?(?:give\s+you\s+a\s+(?:call|ring)|call\s+you)\b|\b(?:can|could|may|should)\s+(?:we|i|someone)\s+(?:give\s+you\s+a\s+(?:call|ring)|call\s+you)\b|\bwhen'?s\s+(?:a\s+)?good\s+(?:time\s+)?for\s+a\s+(?:quick\s+)?call\b/i;
+export const CALL_OFFER_RX = /\b(?:want|would\s+you\s+like|should\s+i\s+have|can\s+(?:i|we)\s+have|shall\s+(?:i|we)\s+have)\s+(?:someone|somebody|us|me|a\s+(?:team\s+member|rep|specialist))\s+(?:to\s+)?(?:give\s+you\s+a\s+(?:call|ring)|call\s+you)\b|\b(?:can|could|may|should)\s+(?:we|i|someone)\s+(?:give\s+you\s+a\s+(?:quick\s+)?(?:call|ring)|call\s+you)\b|\bwhen'?s\s+(?:a\s+)?good\s+(?:time\s+)?for\s+a\s+(?:quick\s+)?call\b/i;
 // A sentence that offers a phone call from us (2026-10-03: "A quick call would
 // let us figure out what's happening" next to the visit ask). Dropped unless
 // the lead asked for a call or turned the visit down (dropUnaskedCallOffer).
@@ -269,8 +270,29 @@ export const LINES = Object.freeze({
   // time". A quote ask is a reason to talk, not to book: one short line and
   // the NEPQ connection question; the times come after discovery.
   quote_first: (what) => (what ? `Happy to help with the ${what}. What's got you looking into them now?` : "Happy to help with that. What's got you looking into it now?"),
-  price_again_slots: (slots) => `Fair question. Every home is different, so a number now would just be a guess. I have ${slotPair(slots)} to measure. Which works better?`,
-  price_again_no_slots: 'Fair question. Every home is different, so a number now would just be a guess. A team member will call to set up a free measure.',
+  // 2026-10-13 (the owner's ruling after the Erica Hilts chat): a price ask is
+  // answered with questions first, then the visit. Her "what's an average
+  // price?" got two visit times, and the next ask a promised call she never
+  // wanted. 1st ask: an honest line on what drives the price and ONE scoping
+  // question (the count question itself, so the count gate never asks it
+  // again; when the count is known, the style and size). 2nd ask: the free
+  // measure as a yes/no question, no times (BRIDGE_RX reads it, so a yes gets
+  // the times). 3rd ask: a call OFFERED as a question, never promised; Five9
+  // hears only after a yes (CALL_OFFER_RX). Every one keeps "every home is
+  // different" (PRICE_PLAY_RX counts them) except the call offer.
+  price_scope: (countKnown) => (countKnown
+    ? 'Fair question. Every home is different: the price depends on the size, the style and the impact glass. What style are you thinking about, and roughly how big is the opening?'
+    : 'Fair question. Every home is different: the price depends on how many openings, their size and the impact glass. How many windows are you thinking about, and is it the whole house or a few openings?'),
+  price_visit_offer: 'Totally fair. Every home is different, so an exact number comes from measuring. The next step would be a free visit to measure. Would that be helpful?',
+  price_call_offer: 'Understood. It might help to talk it through with one of our specialists. Can we give you a quick call?',
+  // Asked again after the call offer: no more questions, nothing promised.
+  price_rest: "Understood. An exact number has to come from measuring, so I'll leave it there. If you'd like a free measure or a call, just reply here.",
+  // 2026-10-13 (Erica Hilts; the reviewer's rule): "not now", "I'll call back",
+  // "have a good day" get a short warm goodbye. No times, no question, no
+  // promise to follow up, nothing filed.
+  sign_off: (name, booked = false) => (booked
+    ? `Thanks${name ? `, ${name}` : ''}. Have a great day.`
+    : `Sounds good${name ? `, ${name}` : ''}. We're here whenever you're ready. Have a great day.`),
   // "You just said that": no more questions, the next step.
   repeat_slots: (slots) => `You're right, sorry about that. Let's get you a time instead. I have ${slotPair(slots)}. Which works better?`,
   repeat_no_slots: "You're right, sorry about that. A team member will call to set a time for the visit.",
@@ -323,7 +345,6 @@ export const LINES = Object.freeze({
     // 2026-10-03 (Mark): service tells the lead a team member will reach out.
     service: "Sorry about that. I'm passing this to our service team, and a team member will reach out.",
     service_callback: "Got it. I'm passing this to our service team, and a team member will reach out.",
-    price_insist: "Understood. I'll have someone from our team call you to talk it through.",
     // 2026-10-03 (review of Part 14): two no's is a card for a person to
     // review, never an auto-dial, so the line promises no contact.
     two_nos: "No problem, I'll stop here. If anything changes, just reply here.",
@@ -426,8 +447,7 @@ export function nextQualifyItem(facts = {}, outbound = []) {
 export const ALT_LINES = Object.freeze({
   ask_day: ['Sure thing. What day would be easiest for you?', 'Okay. Which day is best for you?'],
   which: (slots) => [`Sounds good. Which one works for you, ${slotPair(slots)}?`, `Thanks. Should I hold ${slotPair(slots)} for you?`],
-  price_again_slots: (slots) => [`I hear you. Since every home is different, any number now would be a guess. I have ${slotPair(slots)} open to measure. Which one works for you?`],
-  price_again_no_slots: ['I hear you. Since every home is different, any number now would be a guess. A team member will call to set up a free measure.'],
+  price_visit_offer: ['I hear you. Since every home is different, an exact number comes from measuring. The next step would be a free visit to measure. Would that help?'],
   think_slots: (slots) => [`Totally fine. If it helps, I can hold a time so you don't have to chase us later. I have ${slotPair(slots)}. Which works better?`],
 });
 
@@ -501,6 +521,15 @@ export function isNo(text, lastOutbound = '') {
 // Every price reply says why there is no number yet; the next turn counts
 // these to decide quote → times → a person (Part 7: the model words them).
 const PRICE_PLAY_RX = /\bevery\s+(?:home|house)(?:'s|’s|\s+is)\s+(?:a\s+little\s+)?different\b|\bany\s+number\s+i\s+gave\b|\ba\s+number\s+(?:right\s+)?now\s+would\s+(?:just\s+)?be\s+a\s+guess\b/i;
+// Our own third-price-ask call offer (LINES.price_call_offer, model-worded).
+const PRICE_CALL_OFFER_RX = /\btalk\s+it\s+through\b[^?]*\?|\b(?:give\s+you\s+a\s+(?:quick\s+)?call|call\s+you)\b[^.!]*\?/i;
+// A message of ours that ends an open time offer: a hand-off to a person, a
+// call we promised, or a stop line (2026-10-13, Erica Hilts).
+// A message of ours that ENDS on a goodbye ("… Have a great day.", "Enjoy
+// your week.", "I'll check back next week."). Narrower than isSignOffLine:
+// "We're here to help." after an answer leaves the offer open.
+const CLOSING_LINE_RX = /\bhave\s+a\s+(?:great|good|nice|wonderful)\s+(?:day|week|weekend|evening|night|one)\b|\btake\s+care\b|\b(?:i|we)(?:'|’)?ll\s+check\s+back\b|\bwhenever\s+you(?:'|’)?re\s+ready\b|^\s*enjoy\b[^?]*$/i;
+const OFFER_CLOSED_RX = /\bsomeone\s+from\s+our\s+team\s+(?:will\s+)?(?:call|on\s+this)\b|\bhave\s+someone\s+(?:from\s+our\s+team\s+)?call\s+you\b|\bpassing\s+this\s+to\s+our\b|\bI'?ll\s+stop\s+here\b|\bI'?ll\s+leave\s+it\s+there\b/i;
 const COMPETITOR_PLAY_RX = /\bmaybe\s+nothing\s+would(?:'ve|\s+have)?\s+change[ds]?\b|\bboth\s+meet\s+your\s+criteria\b/i;
 const INFO_PLAY_RX = /\bjust\s+so\s+we\s+get\s+you\s+the\s+right\s+thing\b/i;
 const QUOTE_LINE_RX = /\bhappy\s+to\s+get\s+you\s+a\s+quote\b|\bexact\s+pricing\s+comes\s+from\s+a\s+quick\s+visit\b|\bcan'?t\s+give\s+a\s+fair\s+price\s+on\s+the\s+spot\b|\bhappy\s+to\s+help\s+with\b[^.?!]*\.\s+what'?s\s+got\s+you\s+looking\s+into\s+(?:them|it|this)\s+now\?|\ba\s+number\s+now\s+would\s+(?:just\s+)?be\s+a\s+guess\b/i;
@@ -663,6 +692,9 @@ function planNepqTurnCore({
   // src/agentic/lead-stage.js), passed ONLY when LEAD_STAGE_MODE=live. Null
   // leaves every step exactly as before. knownZip: the zip on file.
   stage = null, knownZip = null,
+  // 2026-10-13: the window/door count is on the contact (the price play's
+  // scoping question then asks the style and size instead).
+  knownOpenings = false,
 } = {}) {
   const turns = normalizeThread(conversation, trigger);
   const inbound = turns.filter(t => t.direction === 'inbound');
@@ -673,10 +705,16 @@ function planNepqTurnCore({
   // 2026-10-02 replay: a pick came two messages after the offer (a phone
   // re-check in between) and was not read as a pick. The offer stays open for
   // four of our messages, until a time is held or booked.
+  // 2026-10-13 (Erica Hilts): a hand-off or a goodbye of ours closes the
+  // offer too. "I'll have someone from our team call you" came between her
+  // offer and "I can call back when I have more time", and the same two times
+  // went out again under "I'll check back next week. Enjoy."
   const lastOfferOut = (() => {
     for (const m of outbound.slice(-4).reverse()) {
       if (/\bI'm\s+holding\b|\bI\s+have\s+you\s+down\s+for\b|\byou'?re\s+all\s+set\s+for\b/i.test(m.text)) return '';
+      if (OFFER_CLOSED_RX.test(m.text)) return '';
       if (SLOT_OFFER_RX.test(m.text)) return m.text;
+      if (CLOSING_LINE_RX.test(splitSentences(m.text).slice(-1)[0] || '')) return '';
     }
     return '';
   })();
@@ -689,7 +727,8 @@ function planNepqTurnCore({
     const t = turns[i];
     if (t.direction !== 'inbound') continue;
     const prevOut = [...turns.slice(0, i)].reverse().find(x => x.direction === 'outbound')?.text || '';
-    if (isNo(t.text, prevOut)) nos++;
+    // "No" to "anyone else part of the decision?" answers it (2026-10-13).
+    if (isNo(t.text, prevOut) && !DM_GATE_ASK_RX.test(prevOut)) nos++;
     else break;
   }
   // Each inbound read against the bot message before it.
@@ -891,6 +930,16 @@ function planNepqTurnCore({
   // stock first-contact question, slots offered twice to "Follow up in
   // November please", and "Congratulations" to a lead who signed elsewhere.
   if (postDemo) return planPostDemo();
+  // 1c. The lead is leaving for now (Erica Hilts, 2026-10-13: "Thank you for
+  // your time … Have a good day." read as a third price ask and got a promised
+  // call; "I can call back when I have more time. Ty" got "I'll check back
+  // next week. Enjoy." and the same two times). A short warm goodbye: no
+  // times, no question, no call, nothing filed. Before every price, objection
+  // and offer step below; after a call they asked for and the post-demo plan.
+  if (isLeadSignOff(now)) {
+    const booked = !!hasAppointment || outbound.some(m => BOOKED_LINE_RX.test(m.text));
+    return fixed('close', LINES.sign_off(firstName, booked), { step: 'sign_off', call_offer_ok: false, lead_will_reach_out: leadWillReachOut(now), booking: { allowed: false, reason: 'nepq:sign_off' } });
+  }
   // The lead's earlier messages, each with its own time when the thread has
   // one, so "by Friday" said last week is read against last week.
   function earlierInbound() {
@@ -1016,12 +1065,19 @@ function planNepqTurnCore({
     return pd({ step: 'post_demo', required_move: 'answer', ...(trackQ && !plan.pending_deferral ? { rehash_question: trackQ } : {}) });
   }
 
-  if (objType === 'price' && priceLines >= 2) return handoff('price_insist');
+  // The third price ask: a call OFFERED, never promised (the owner, 2026-10-13).
+  // A yes files the callback (the CALL_OFFER_RX step above); asked again after
+  // the offer, one line that asks nothing and promises nothing.
+  const priceCallOffered = outbound.some(m => PRICE_CALL_OFFER_RX.test(m.text));
+  const priceThird = () => (priceCallOffered
+    ? fixed('close', LINES.price_rest, { step: 'price_rest', objection: { type: 'price', attempt, line: LINES.price_rest }, booking: { allowed: false, reason: 'nepq:price_rest' } })
+    : fixed('objection_play', LINES.price_call_offer, { step: 'price_call_offer', call_offer_ok: true, objection: { type: 'price', attempt, line: LINES.price_call_offer }, booking: { allowed: false, reason: 'nepq:price_call_offer' } }));
+  if (objType === 'price' && priceLines >= 2) return priceThird();
   // 2026-10-13 (live eval, LEAD_STAGE_MODE=live): the first answer to a quote is
   // the info request, worded by the model, so it is not a "price line" and the
   // count never reached two: a third "how much?" got the ownership question
-  // again. Three money asks (a quote counts) after the price play → a person.
-  if (stageLive && objType === 'price' && pricePlayed && moneyAsks >= 3) return handoff('price_insist');
+  // again. Three money asks (a quote counts) after the price play → the call offer.
+  if (stageLive && objType === 'price' && pricePlayed && moneyAsks >= 3) return priceThird();
   if (nos >= 2) return handoff('two_nos');
   if ((objType === 'shopping' || objType === 'competitor') && attempt >= 2) return handoff('repeat_objection');
 
@@ -1102,18 +1158,15 @@ function planNepqTurnCore({
     return fixed('objection_play', LINES.competitor, { objection: { type: 'competitor', attempt, line: LINES.competitor }, booking: { allowed: false, reason: 'nepq:competitor' } });
   }
   if (objType === 'price') {
-    // First ask: the short line and one question, no times (discovery first).
+    // First ask (the owner, 2026-10-13): what drives the price and ONE scoping
+    // question, no times. The count question when the count is unknown.
     if (priceLines === 0) {
-      const line = LINES.quote_first(quoteItems(inbound.map(m => m.text).join(' \n ')));
-      return fixed('objection_play', line, { step: 'discover', objection: { type: 'price', attempt, line }, booking: { allowed: false, reason: 'nepq:discover_first' } });
+      const line = LINES.price_scope(!!knownOpenings || openingsKnown(turns));
+      return fixed('objection_play', line, { step: 'discover', objection: { type: 'price', attempt, line }, booking: { allowed: false, reason: 'nepq:price_scope' } });
     }
-    // Asked again: why there is no number, then two real times.
-    const line = offerSlots.length === 2 ? withSlots(vary(LINES.price_again_slots(offerSlots), ALT_LINES.price_again_slots(offerSlots))) : vary(LINES.price_again_no_slots, ALT_LINES.price_again_no_slots);
-    return fixed('objection_play', line, {
-      step: 'offer_slots', objection: { type: 'price', attempt, line },
-      ask_contact: offerSlots.length !== 2,
-      booking: { allowed: true, reason: 'nepq:price_again' },
-    });
+    // Asked again: the free measure as a yes/no question. Times only after a yes.
+    const line = vary(LINES.price_visit_offer, ALT_LINES.price_visit_offer);
+    return fixed('objection_play', line, { step: 'price_visit_offer', objection: { type: 'price', attempt, line }, booking: { allowed: false, reason: 'nepq:price_visit_offer' } });
   }
   if (objType === 'spouse') {
     if (attempt >= 2) {
@@ -1276,8 +1329,9 @@ function planNepqTurnCore({
     // service area." and no question). Back to the times, in other words.
     // Asked three times with no pick: ask the day instead of a fourth time.
     if (!isLeadQuestion(now) && !objType && offerSlots.length === 2) {
-      const offersInARow = outbound.slice(-3).filter(t => SLOT_OFFER_RX.test(t.text || '')).length;
-      if (offersInARow >= 3) return fixed('ask_day', vary(LINES.ask_day, ALT_LINES.ask_day), { step: 'ask_day', booking: { allowed: true, reason: 'nepq:ask_day' } });
+      // 2026-10-13 (Erica Hilts): the same two times never go out a third time.
+      const offersInARow = outbound.slice(-2).filter(t => SLOT_OFFER_RX.test(t.text || '')).length;
+      if (offersInARow >= 2) return fixed('ask_day', vary(LINES.ask_day, ALT_LINES.ask_day), { step: 'ask_day', booking: { allowed: true, reason: 'nepq:ask_day' } });
       // The same two times we just offered, not a fresh pair (2026-10-03
       // replay: "Sun 2 PM or Mon 2 PM", then "Sun 10 AM or Sun 2 PM").
       const pair = offeredInThread.length >= 2 ? offeredInThread.slice(0, 2) : offerSlots;
@@ -1401,58 +1455,108 @@ function planNepqTurnCore({
 
 /**
  * Plan this turn. With a stored stage (LEAD_STAGE_MODE=live) the plan then
- * passes the qualifying gate; without one it is exactly the old plan.
- * Parameters: see planNepqTurnCore.
+ * passes the qualifying gate; without one it passes the pre-offer gate (the
+ * count, then the decision makers). Parameters: see planNepqTurnCore, plus
+ * `directiveNoTimes`: the send's layer3 script says "NO times" (a follow-up
+ * hold), so no time offer goes out this turn.
  */
 export function planNepqTurn(args = {}) {
-  if (args?.stage?.stage) return gateForStage(planNepqTurnCore(args), args);
-  return openingsGate(args);
+  const plan = args?.stage?.stage ? gateForStage(planNepqTurnCore(args), args) : openingsGate(args);
+  return args?.directiveNoTimes ? withoutTimeOffer(plan) : plan;
+}
+
+// 2026-10-13 (Erica Hilts): the layer3 follow_up_scheduled hint said "NO
+// times", the plan block (which the reply writer obeys over the hint) offered
+// two. A pick of an offered time still books; only a new offer goes.
+function withoutTimeOffer(plan) {
+  if (!plan || !['offer_slots', 'ask_day'].includes(plan.step)) return plan;
+  plan.slots_to_offer = [];
+  plan.allowed = { ...plan.allowed, slot_offer: false };
+  plan.offer_line = null;
+  plan.answer_first = false;
+  plan.offer_slots_pending = false;
+  plan.day_preference_pending = false;
+  return Object.assign(plan, { step: 'directive_no_times', required_move: 'answer', fixed_line: null, reference_markers: null, booking: { allowed: false, reason: 'nepq:directive_no_times' } });
+}
+
+// Our pre-offer questions (the count, the decision makers), read by meaning:
+// the model words them.
+const DM_GATE_ASK_RX = /(?:\b(?:anyone|anybody|someone)\s+else\b|\bpart\s+of\s+the\s+decision\b|\bweigh(?:ing)?\s+in\b)[^?]*\?/i;
+const isGateAsk = (t) => COUNT_ASK_RX.test(String(t || '')) || DM_GATE_ASK_RX.test(String(t || ''));
+
+/**
+ * The plan we set aside for the pre-offer questions: the conversation replanned
+ * as it stood before the FIRST of them (the count, then the decision makers,
+ * each answered in turn). Only a time offer (or the day ask, when the caller
+ * has not read the calendar yet) is resumed. Pure.
+ */
+function resumeBeforeGate(args, turns) {
+  let askIdx = turns.map(t => t.direction).lastIndexOf('outbound');
+  while (askIdx >= 0) {
+    const before = turns.slice(0, askIdx);
+    const leadIdx = before.map(t => t.direction).lastIndexOf('inbound');
+    if (leadIdx < 0) return null;
+    const prevOutIdx = before.slice(0, leadIdx).map(t => t.direction).lastIndexOf('outbound');
+    if (prevOutIdx >= 0 && isGateAsk(turns[prevOutIdx].text)) { askIdx = prevOutIdx; continue; }
+    const resumed = planNepqTurnCore({ ...args, conversation: before.slice(0, leadIdx), trigger: before[leadIdx].text });
+    // offer_slots, or ask_day when the caller has not read the calendar yet
+    // (the live chat plans once without times, then again with them).
+    return resumed && (resumed.step === 'offer_slots' || resumed.step === 'ask_day') && !resumed.handoff ? resumed : null;
+  }
+  return null;
 }
 
 /**
- * The count question in every mode (the user, 2026-10-13: "Yes, leave the
- * question on"). Without a stored stage the planner re-reads the thread each
- * turn, so this gate does two things:
- *  - a plan that would offer visit times while the count is unknown and our
- *    count question was never asked becomes that question (once);
- *  - the turn after it, the answer resumes the plan we set aside: the
- *    conversation is replanned as it stood before the count question, so
- *    "about 10" gets the times the "yes" had earned.
- * A job we cannot take (job-scope.js) gets no times at all, and a lead past
- * its demo (`postDemoLead`, post-demo-lead.js) is never asked again (the user,
- * same day: "assume the lead is already qualified"). Pure.
+ * The pre-offer gate, every mode without a stored stage. The count question
+ * (the user, 2026-10-13: "Yes, leave the question on") and then the decision
+ * maker question (the owner, 2026-10-13, after the Erica Hilts chat: no
+ * single-leg visits, asked ONCE, right before the first times; any answer
+ * moves on). The planner re-reads the thread each turn, so this gate:
+ *  - turns a plan that would offer visit times into the next unasked
+ *    question, once each, before the FIRST offer only;
+ *  - on the answer, resumes the plan we set aside: the conversation is
+ *    replanned as it stood before the first gate question, so "about 10" and
+ *    then "just me" get the times the "yes" had earned.
+ * The decision-maker answer rides on the plan (`dm_known`), so the booking
+ * collect never asks it again. A job we cannot take (job-scope.js) gets no
+ * times at all, and a lead past its demo (`postDemoLead`, post-demo-lead.js)
+ * is never asked (the user: "assume the lead is already qualified"). Pure.
  */
 function openingsGate(args) {
-  const plan = planNepqTurnCore(args);
+  let plan = planNepqTurnCore(args);
   if (!plan || plan.handoff || plan.post_demo || plan.step === 'booked' || args.postDemoLead) return plan;
   const turns = normalizeThread(args.conversation, args.trigger);
   const js = jobScopeFromThread(turns);
   if (js.block || js.check) return notEligible(plan, js);
   const outbound = turns.filter(t => t.direction === 'outbound');
   const lastOut = outbound[outbound.length - 1]?.text || '';
-  // The answer to our count question: replan from before it.
-  // A question in the answer is answered first (the core plan), never skipped.
-  if (COUNT_ASK_RX.test(lastOut) && plan.step !== 'offer_slots' && !plan.objection && !isLeadQuestion(String(args.trigger || ''))) {
-    const askIdx = turns.map(t => t.direction === 'outbound' && t.text === lastOut).lastIndexOf(true);
-    const before = turns.slice(0, askIdx);
-    const leadIdx = before.map(t => t.direction).lastIndexOf('inbound');
-    if (leadIdx >= 0) {
-      const resumed = planNepqTurnCore({ ...args, conversation: before.slice(0, leadIdx), trigger: before[leadIdx].text });
-      // offer_slots, or ask_day when the caller has not read the calendar yet
-      // (the live chat plans once without times, then again with them).
-      if (resumed && (resumed.step === 'offer_slots' || resumed.step === 'ask_day') && !resumed.handoff) return resumed;
-    }
-    return plan;
+  const trigger = String(args.trigger || '');
+  // The answer to a gate question: replan from before the first one. A
+  // question in the answer is answered first (the core plan), never skipped,
+  // and a goodbye stays a goodbye. "My wife" to the decision-maker question is
+  // an answer, not the spouse objection.
+  const objectionOk = !plan.objection || (plan.objection.type === 'spouse' && DM_GATE_ASK_RX.test(lastOut));
+  // Never over a held time's own collect ("will anyone else be part of the
+  // decision?" after the hold is the collect's question, not this gate's).
+  const resumable = !['offer_slots', 'collect', 'confirm', 'sign_off', 'close'].includes(plan.step) && !plan.held_slot && plan.required_move !== 'close';
+  if (isGateAsk(lastOut) && resumable && objectionOk && !isLeadQuestion(trigger)) {
+    const resumed = resumeBeforeGate(args, turns);
+    if (!resumed) return plan;
+    plan = resumed;
   }
   if (plan.step !== 'offer_slots') return plan;
-  // Asked once, before the FIRST offer: times already on the table are never
-  // interrupted by it ("you just said that" after an offer gets new times).
+  // Times already on the table are never interrupted ("you just said that"
+  // after an offer gets new times).
   if (outbound.some(m => SLOT_OFFER_RX.test(m.text))) return plan;
-  const asked = outbound.some(m => COUNT_ASK_RX.test(m.text));
-  if (asked || args.knownOpenings || openingsKnown(turns)) return plan;
-  const ask = pickFresh(QUALIFY_LINES.openings, plan.recent_outbound || [], 0);
-  // A question in the same message is answered first, then the count is asked.
-  const answering = plan.required_move === 'answer' || (plan.answer_first && isLeadQuestion(String(args.trigger || '')));
+  const dm = dmAnswerFromThread(turns);
+  if (dm && dm !== 'conflict') plan.dm_known = dm;
+  let item = null;
+  if (!outbound.some(m => COUNT_ASK_RX.test(m.text)) && !args.knownOpenings && !openingsKnown(turns)) item = 'openings';
+  else if (!dm && !args.knownDecisionMakers && !outbound.some(m => DM_GATE_ASK_RX.test(m.text) || DM_ASK_RX.test(m.text) && m.text.includes('?'))) item = 'decision_makers';
+  if (!item) return plan;
+  const ask = pickFresh(QUALIFY_LINES[item], plan.recent_outbound || [], 0);
+  // A question in the same message is answered first, then the gate question.
+  const answering = plan.required_move === 'answer' || (plan.answer_first && isLeadQuestion(trigger));
   plan.slots_to_offer = [];
   plan.allowed = { ...plan.allowed, slot_offer: false };
   plan.offer_line = null;
@@ -1460,11 +1564,11 @@ function openingsGate(args) {
   plan.offer_slots_pending = false;
   plan.day_preference_pending = false;
   plan.last_offer = null;
-  const booking = { allowed: false, reason: 'nepq:qualify_openings' };
-  if (answering) return Object.assign(plan, { step: 'qualify', required_move: 'answer', fixed_line: null, reask_line: ask, qualify_item: 'openings', booking });
+  const booking = { allowed: false, reason: `nepq:qualify_${item}` };
+  if (answering) return Object.assign(plan, { step: 'qualify', required_move: 'answer', fixed_line: null, reask_line: ask, qualify_item: item, booking });
   return Object.assign(plan, {
-    step: 'qualify', required_move: 'qualify', fixed_line: ask, qualify_item: 'openings',
-    reference_markers: QUALIFY_MARKERS.openings, booking,
+    step: 'qualify', required_move: 'qualify', fixed_line: ask, qualify_item: item,
+    reference_markers: QUALIFY_MARKERS[item], booking,
   });
 }
 
@@ -1499,7 +1603,8 @@ function gateForStage(plan, args) {
   // A lead past its demo already meets the requirements (the user, 2026-10-13):
   // no qualifying question and no job-scope block, whatever POST_DEMO_PLANNER_MODE says.
   if (!plan || plan.handoff || plan.post_demo || args?.postDemoLead || plan.step === 'booked') return plan;
-  const offersTimes = !!plan.allowed?.slot_offer || (plan.slots_to_offer || []).length > 0 || TIME_STEPS.has(plan.step) || plan.required_move === 'bridge' || !!plan.offer_slots_pending;
+  // The second price ask's free-measure question is a bridge to the visit too.
+  const offersTimes = !!plan.allowed?.slot_offer || (plan.slots_to_offer || []).length > 0 || TIME_STEPS.has(plan.step) || plan.required_move === 'bridge' || plan.step === 'price_visit_offer' || !!plan.offer_slots_pending;
   if (!offersTimes) return plan;
   const turns = normalizeThread(args.conversation, args.trigger);
   const outbound = turns.filter(t => t.direction === 'outbound');
@@ -1719,6 +1824,9 @@ export function checkAgainstReference(draft, line, slots = [], plan = null) {
 export function appendReferenceAsk(draft, refLine, failed = []) {
   const body = String(draft || '').trim();
   if (!body || body.includes('?') || /\b\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?)/i.test(body)) return null;
+  // Never after a goodbye (2026-10-13, Erica Hilts): "No problem, Erica. I'll
+  // check back next week. Enjoy." went out with "Which works better, …?" glued on.
+  if (isSignOffLine(splitSentences(body).slice(-1)[0] || '')) return null;
   if (!failed.every(f => /^(?:missing_time:|missing:|no_question$)/.test(f))) return null;
   const parts = splitSentences(refLine);
   const at = parts.findIndex(p => p.includes('?') || /\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b/i.test(p));
@@ -1735,6 +1843,9 @@ export function appendReferenceAsk(draft, refLine, failed = []) {
 export function nepqFixedLineWins(plan) {
   return !!(plan?.fixed_line && FIXED_MOVES.has(plan.required_move));
 }
+// "I'll check back next week", "we'll follow up soon": a promise to chase a
+// lead who just said they would reach out themselves.
+const CHECK_BACK_RX = /\b(?:i|we)(?:'|’)?ll\s+(?:check\s+back|follow\s+up|reach\s+(?:back\s+)?out|be\s+in\s+touch|circle\s+back)\b|\b(?:i|we)\s+will\s+(?:check\s+back|follow\s+up|reach\s+out|be\s+in\s+touch)\b/i;
 const NO_FIGURES_LINE = 'Exact numbers come from the visit, since every home is different.';
 
 const norm = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
@@ -1977,6 +2088,11 @@ export function enforceNepqPlan(draft, plan, { allowFigures = false, known = {} 
     if (plan.rehash_stage && PRE_BRIDGE_STAGES.has(plan.rehash_stage) && sentences.some(s => !BEST_DEAL_RX.test(s))) {
       drop(s => BEST_DEAL_RX.test(s), 'best_deal_before_bridge');
     }
+  }
+  // 2a'. The lead said goodbye (2026-10-13, Erica Hilts): no question, no
+  // time, and no "I'll check back next week" when they said THEY would call.
+  if (plan.step === 'sign_off' || plan.step === 'price_rest') {
+    drop(s => s.includes('?') || SLOT_OFFER_RX.test(s) || clockMinutes(s).length > 0 || (plan.lead_will_reach_out && CHECK_BACK_RX.test(s)), 'sign_off_no_ask');
   }
   // 2b. "Do you offer financing?" keeps its yes when the figure strip took the
   // answer sentence (2026-10-02 simulation: "Yes, we offer 0% APR financing"

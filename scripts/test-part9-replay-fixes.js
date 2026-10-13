@@ -41,19 +41,19 @@ test('a typed time we do not have: say so, offer the two openings nearest it', (
     { direction: 'inbound', text: 'Fine lets book for 2 PM.' },
   ];
   for (const channel of ['sms', 'livechat']) {
-    const plan = planNepqTurn({ knownOpenings: true, channel, trigger: 'Fine lets book for 2 PM.', conversation: conv, slots: OFFERED, allSlots: ALL, tzLabel: 'ET', nowMs: NOW });
+    const plan = planNepqTurn({ knownOpenings: true, knownDecisionMakers: true, channel, trigger: 'Fine lets book for 2 PM.', conversation: conv, slots: OFFERED, allSlots: ALL, tzLabel: 'ET', nowMs: NOW });
     assert.equal(plan.required_move, 'offer_slots', channel);
     assert.equal(plan.fixed_line, 'Sure. For 2 PM, I have Sun, Oct 4 at 2:00 PM ET or Mon, Oct 5 at 2:00 PM ET. Which works better?');
   }
   // No 2 PM anywhere: say it is not open, and offer the nearest.
   const no2 = ALL.filter(s => s.time !== '2:00 PM');
-  const none = planNepqTurn({ knownOpenings: true, channel: 'sms', trigger: 'Fine lets book for 2 PM.', conversation: conv, slots: OFFERED, allSlots: no2, tzLabel: 'ET', nowMs: NOW });
+  const none = planNepqTurn({ knownOpenings: true, knownDecisionMakers: true, channel: 'sms', trigger: 'Fine lets book for 2 PM.', conversation: conv, slots: OFFERED, allSlots: no2, tzLabel: 'ET', nowMs: NOW });
   assert.match(none.fixed_line, /^2 PM isn't open, but I have .+ or .+\. Which works better\?$/);
   // An offered time typed out is still the pick.
-  const pick = planNepqTurn({ knownOpenings: true, channel: 'sms', trigger: '6 PM works', conversation: [...conv.slice(0, 2), { direction: 'inbound', text: '6 PM works' }], slots: OFFERED, allSlots: ALL, tzLabel: 'ET', nowMs: NOW });
+  const pick = planNepqTurn({ knownOpenings: true, knownDecisionMakers: true, channel: 'sms', trigger: '6 PM works', conversation: [...conv.slice(0, 2), { direction: 'inbound', text: '6 PM works' }], slots: OFFERED, allSlots: ALL, tzLabel: 'ET', nowMs: NOW });
   assert.equal(pick.required_move, 'confirm');
   // "Can't do 2 PM" is not a request for 2 PM.
-  const cant = planNepqTurn({ knownOpenings: true, channel: 'sms', trigger: "I can't do 2 PM", conversation: [...conv.slice(0, 2), { direction: 'inbound', text: "I can't do 2 PM" }], slots: OFFERED, allSlots: ALL, tzLabel: 'ET', nowMs: NOW });
+  const cant = planNepqTurn({ knownOpenings: true, knownDecisionMakers: true, channel: 'sms', trigger: "I can't do 2 PM", conversation: [...conv.slice(0, 2), { direction: 'inbound', text: "I can't do 2 PM" }], slots: OFFERED, allSlots: ALL, tzLabel: 'ET', nowMs: NOW });
   assert.notEqual(cant.step === 'offer_slots' && /2 PM isn't open/.test(cant.fixed_line || ''), true);
 });
 
@@ -66,7 +66,7 @@ test('the typed time is checked against the times we offered, not the ones loade
     { direction: 'inbound', text: 'Fine lets book for 2 PM.' },
   ];
   const nearTwo = [ALL[2], ALL[3]]; // Sun 10 AM and Sun 2 PM: one 2 PM among them
-  const plan = planNepqTurn({ knownOpenings: true, channel: 'livechat', trigger: 'Fine lets book for 2 PM.', conversation: conv, slots: nearTwo, allSlots: ALL, tzLabel: 'ET', nowMs: NOW });
+  const plan = planNepqTurn({ knownOpenings: true, knownDecisionMakers: true, channel: 'livechat', trigger: 'Fine lets book for 2 PM.', conversation: conv, slots: nearTwo, allSlots: ALL, tzLabel: 'ET', nowMs: NOW });
   assert.equal(plan.required_move, 'offer_slots');
   assert.equal(plan.fixed_line, 'Sure. For 2 PM, I have Sun, Oct 4 at 2:00 PM ET or Mon, Oct 5 at 2:00 PM ET. Which works better?');
 });
@@ -76,7 +76,7 @@ test('a day and time they typed that is open is the pick, even when we offered o
     { direction: 'outbound', text: 'I have tomorrow at 6:00 PM ET or Sun, Oct 4 at 10:00 AM ET. Which works better?' },
     { direction: 'inbound', text: 'Sunday at 2 PM please' },
   ];
-  const plan = planNepqTurn({ knownOpenings: true, channel: 'sms', trigger: 'Sunday at 2 PM please', conversation: conv, slots: OFFERED, allSlots: ALL, tzLabel: 'ET', nowMs: NOW });
+  const plan = planNepqTurn({ knownOpenings: true, knownDecisionMakers: true, channel: 'sms', trigger: 'Sunday at 2 PM please', conversation: conv, slots: OFFERED, allSlots: ALL, tzLabel: 'ET', nowMs: NOW });
   assert.equal(plan.required_move, 'confirm');
   assert.equal(plan.slots_to_offer[0].day, 'Sun, Oct 4');
   assert.equal(plan.slots_to_offer[0].time, '2:00 PM');
@@ -105,7 +105,7 @@ test('a real time counts however the reply words it', async () => {
 // what we sell. Only false urgency claims ("peak of hurricane season") go.
 test('hurricane and storm language is kept in a reply', async () => {
   const { enforceNepqPlan } = await import('../src/agentic/nepq-planner.js');
-  const plan = planNepqTurn({ knownOpenings: true, channel: 'sms', trigger: 'I need new windows', conversation: [{ direction: 'inbound', text: 'I need new windows' }], nowMs: NOW });
+  const plan = planNepqTurn({ knownOpenings: true, knownDecisionMakers: true, channel: 'sms', trigger: 'I need new windows', conversation: [{ direction: 'inbound', text: 'I need new windows' }], nowMs: NOW });
   const draft = "Hurricane season tends to be when that call comes in for a lot of folks. What's going on with your current windows that got you looking?";
   assert.equal(enforceNepqPlan(draft, plan).text, draft);
 });
@@ -122,7 +122,7 @@ test('a message that is only a day is their availability: two real times that da
     { direction: 'outbound', text: "Yes, it's free. Is it just the drafty windows, or the whole house?" },
     { direction: 'inbound', text: 'Usually on Wednesdays' },
   ];
-  const plan = planNepqTurn({ knownOpenings: true, channel: 'sms', trigger: 'Usually on Wednesdays', conversation: conv, slots: OFFERED, allSlots: [...ALL, ...WED], tzLabel: 'ET', nowMs: NOW });
+  const plan = planNepqTurn({ knownOpenings: true, knownDecisionMakers: true, channel: 'sms', trigger: 'Usually on Wednesdays', conversation: conv, slots: OFFERED, allSlots: [...ALL, ...WED], tzLabel: 'ET', nowMs: NOW });
   assert.equal(plan.required_move, 'offer_slots');
   assert.match(plan.fixed_line, /^Wednesdays work\. I have Wed, Oct 7 at 10:00 AM ET or Wed, Oct 7 at 7:00 PM ET\./);
 });
@@ -131,7 +131,7 @@ test('a message that is only a day is their availability: two real times that da
 test('a detail instead of a pick goes back to the times; the third time asks the day', () => {
   const offer = 'I have tomorrow at 6:00 PM ET or Sun, Oct 4 at 10:00 AM ET. Which works better?';
   const conv = [{ direction: 'outbound', text: offer }, { direction: 'inbound', text: '12 Main St, Ocala FL 34470' }];
-  const plan = planNepqTurn({ knownOpenings: true, channel: 'sms', trigger: '12 Main St, Ocala FL 34470', conversation: conv, slots: OFFERED, allSlots: ALL, tzLabel: 'ET', nowMs: NOW });
+  const plan = planNepqTurn({ knownOpenings: true, knownDecisionMakers: true, channel: 'sms', trigger: '12 Main St, Ocala FL 34470', conversation: conv, slots: OFFERED, allSlots: ALL, tzLabel: 'ET', nowMs: NOW });
   assert.equal(plan.required_move, 'offer_slots');
   assert.match(plan.fixed_line, /tomorrow at 6:00 PM ET or Sun, Oct 4 at 10:00 AM ET/);
   const three = [
@@ -139,7 +139,7 @@ test('a detail instead of a pick goes back to the times; the third time asks the
     { direction: 'outbound', text: 'Great. Which works better, tomorrow at 6:00 PM ET or Sun, Oct 4 at 10:00 AM ET?' }, { direction: 'inbound', text: '9543792151' },
     { direction: 'outbound', text: 'Sounds good. Which one works for you, tomorrow at 6:00 PM ET or Sun, Oct 4 at 10:00 AM ET?' }, { direction: 'inbound', text: '12 Main St, Ocala FL 34470' },
   ];
-  const p3 = planNepqTurn({ knownOpenings: true, channel: 'sms', trigger: '12 Main St, Ocala FL 34470', conversation: three, slots: OFFERED, allSlots: ALL, tzLabel: 'ET', nowMs: NOW });
+  const p3 = planNepqTurn({ knownOpenings: true, knownDecisionMakers: true, channel: 'sms', trigger: '12 Main St, Ocala FL 34470', conversation: three, slots: OFFERED, allSlots: ALL, tzLabel: 'ET', nowMs: NOW });
   assert.equal(p3.required_move, 'ask_day');
 });
 
@@ -160,7 +160,7 @@ test('a re-ask names the same two times we just offered', () => {
     { direction: 'outbound', text: "Sure. For 2 PM, I have Sun, Oct 4 at 2:00 PM ET or Mon, Oct 5 at 2:00 PM ET. Which works better?" },
     { direction: 'inbound', text: 'Mark' },
   ];
-  const plan = planNepqTurn({ knownOpenings: true, channel: 'sms', trigger: 'Mark', conversation: conv, slots: [ALL[2], ALL[3]], allSlots: ALL, tzLabel: 'ET', nowMs: NOW });
+  const plan = planNepqTurn({ knownOpenings: true, knownDecisionMakers: true, channel: 'sms', trigger: 'Mark', conversation: conv, slots: [ALL[2], ALL[3]], allSlots: ALL, tzLabel: 'ET', nowMs: NOW });
   assert.equal(plan.required_move, 'offer_slots');
   assert.match(plan.fixed_line, /Sun, Oct 4 at 2:00 PM ET or Mon, Oct 5 at 2:00 PM ET/);
   assert.deepEqual(plan.slots_to_offer.map(s => s.day), ['Sun, Oct 4', 'Mon, Oct 5']);
@@ -194,7 +194,7 @@ test('a draft that only acknowledges keeps its words and gets the planned ask', 
     { direction: 'outbound', text: 'Sure. For 2 PM, I have Sun, Oct 4 at 2:00 PM ET or Mon, Oct 5 at 2:00 PM ET. Which works better?' },
     { direction: 'inbound', text: 'She should be able to make it' },
   ];
-  const plan = planNepqTurn({ knownOpenings: true, channel: 'sms', trigger: 'She should be able to make it', conversation: conv, slots: [ALL[3], ALL[4]], allSlots: ALL, tzLabel: 'ET', nowMs: NOW });
+  const plan = planNepqTurn({ knownOpenings: true, knownDecisionMakers: true, channel: 'sms', trigger: 'She should be able to make it', conversation: conv, slots: [ALL[3], ALL[4]], allSlots: ALL, tzLabel: 'ET', nowMs: NOW });
   assert.equal(plan.required_move, 'offer_slots');
   const out = enforceNepqPlan('Good to hear she can make it.', plan);
   assert.deepEqual(out.failed, []);
@@ -231,12 +231,12 @@ test('after our "You\'re all set for…" the bot never offers times again', () =
     { direction: 'outbound', text: "You're all set for Wed, Oct 7 at 10:00 AM ET, Mark. Our team will reach out to confirm the details." },
     { direction: 'inbound', text: '12 Main St, Ocala FL 34470' },
   ];
-  const plan = planNepqTurn({ knownOpenings: true, channel: 'sms', trigger: '12 Main St, Ocala FL 34470', conversation: conv, slots: OFFERED, allSlots: ALL, tzLabel: 'ET', nowMs: NOW });
+  const plan = planNepqTurn({ knownOpenings: true, knownDecisionMakers: true, channel: 'sms', trigger: '12 Main St, Ocala FL 34470', conversation: conv, slots: OFFERED, allSlots: ALL, tzLabel: 'ET', nowMs: NOW });
   assert.equal(plan.step, 'booked');
   assert.notEqual(plan.required_move, 'offer_slots');
   // A cancel after it reopens booking.
   const after = [...conv, { direction: 'outbound', text: 'Done. Your Wed, Oct 7 appointment is cancelled.' }, { direction: 'inbound', text: 'Actually can we do Thursday?' }];
-  assert.notEqual(planNepqTurn({ knownOpenings: true, channel: 'sms', trigger: 'Actually can we do Thursday?', conversation: after, slots: OFFERED, allSlots: ALL, tzLabel: 'ET', nowMs: NOW }).step, 'booked');
+  assert.notEqual(planNepqTurn({ knownOpenings: true, knownDecisionMakers: true, channel: 'sms', trigger: 'Actually can we do Thursday?', conversation: after, slots: OFFERED, allSlots: ALL, tzLabel: 'ET', nowMs: NOW }).step, 'booked');
 });
 
 // 2026-10-03 replay: a GHL calendar timeout on the "Usually on Wednesdays"
@@ -246,16 +246,16 @@ test('a day preference with no calendar read asks the time of day, then uses bot
     { direction: 'outbound', text: "Yes, it's free. Is it just the drafty windows, or the whole house?" },
     { direction: 'inbound', text: 'Usually on Wednesdays' },
   ];
-  const noRead = planNepqTurn({ knownOpenings: true, channel: 'sms', trigger: 'Usually on Wednesdays', conversation: conv, slots: [], allSlots: [], tzLabel: 'ET', nowMs: NOW });
+  const noRead = planNepqTurn({ knownOpenings: true, knownDecisionMakers: true, channel: 'sms', trigger: 'Usually on Wednesdays', conversation: conv, slots: [], allSlots: [], tzLabel: 'ET', nowMs: NOW });
   assert.equal(noRead.required_move, 'ask_day');
   assert.equal(noRead.fixed_line, 'Wednesdays work. What time of day is best for you?');
   // Next turn, calendar back: "mornings" + the Wednesday they gave.
   const next = [...conv, { direction: 'outbound', text: noRead.fixed_line }, { direction: 'inbound', text: 'Mornings' }];
-  const plan = planNepqTurn({ knownOpenings: true, channel: 'sms', trigger: 'Mornings', conversation: next, slots: OFFERED, allSlots: [...ALL, ...WED], tzLabel: 'ET', nowMs: NOW });
+  const plan = planNepqTurn({ knownOpenings: true, knownDecisionMakers: true, channel: 'sms', trigger: 'Mornings', conversation: next, slots: OFFERED, allSlots: [...ALL, ...WED], tzLabel: 'ET', nowMs: NOW });
   assert.equal(plan.required_move, 'offer_slots');
   assert.match(plan.fixed_line, /Wed, Oct 7 at 10:00 AM ET/);
   // Live chat's first pass (no calendar asked for yet) still waits for the read.
-  const first = planNepqTurn({ knownOpenings: true, channel: 'livechat', trigger: 'Usually on Wednesdays', conversation: conv, nowMs: NOW });
+  const first = planNepqTurn({ knownOpenings: true, knownDecisionMakers: true, channel: 'livechat', trigger: 'Usually on Wednesdays', conversation: conv, nowMs: NOW });
   assert.equal(first.day_preference_pending, true);
   assert.notEqual(first.required_move, 'ask_day');
 });
@@ -288,7 +288,7 @@ test('an open offer makes the live chat load times before it plans', async () =>
     { direction: 'outbound', text: "Sure. For 2 PM, I have tomorrow at 2:00 PM ET or Mon, Oct 5 at 2:00 PM ET. Which works better?" },
     { direction: 'inbound', text: 'Mark' },
   ];
-  const first = planNepqTurn({ knownOpenings: true, channel: 'livechat', trigger: 'Mark', conversation: conv, nowMs: NOW });
+  const first = planNepqTurn({ knownOpenings: true, knownDecisionMakers: true, channel: 'livechat', trigger: 'Mark', conversation: conv, nowMs: NOW });
   assert.equal(first.offer_slots_pending, true);
   assert.equal(wantsSlots(first), true);
 });
@@ -300,7 +300,7 @@ test('a typed time with no offer on the table makes the live chat load times', a
     { direction: 'outbound', text: 'The next step would be a free visit at your home.' },
     { direction: 'inbound', text: 'Fine lets book for 2 PM.' },
   ];
-  const first = planNepqTurn({ knownOpenings: true, channel: 'livechat', trigger: 'Fine lets book for 2 PM.', conversation: conv, nowMs: NOW });
+  const first = planNepqTurn({ knownOpenings: true, knownDecisionMakers: true, channel: 'livechat', trigger: 'Fine lets book for 2 PM.', conversation: conv, nowMs: NOW });
   assert.equal(wantsSlots(first), true);
 });
 

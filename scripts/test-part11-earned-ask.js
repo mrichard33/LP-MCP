@@ -20,7 +20,7 @@ const { heuristicExtract } = await import('../src/services/identity-extraction.j
 const SLOTS = [{ iso: '2026-10-06T14:00:00Z', day: 'Tue, Oct 6', time: '10:00 AM' }, { iso: '2026-10-07T18:00:00Z', day: 'Wed, Oct 7', time: '2:00 PM' }];
 const T = (...pairs) => pairs.map(([d, t]) => ({ direction: d, text: t }));
 const OPEN_MS = Date.parse('2026-10-05T15:00:00Z');
-const plan = (a) => planNepqTurn({ knownOpenings: true, channel: 'sms', nowMs: OPEN_MS, ...a });
+const plan = (a) => planNepqTurn({ knownOpenings: true, knownDecisionMakers: true, channel: 'sms', nowMs: OPEN_MS, ...a });
 
 // ── earn the ask ──────────────────────────────────────────────────────────
 test('earned = the problem in their words AND why it matters', () => {
@@ -76,8 +76,11 @@ test('shortcuts are untouched: quote, quote again, schedule ask, think it over',
   assert.equal(q1.required_move, 'objection_play');
   assert.equal(q1.booking.allowed, false);
   const q2 = plan({ trigger: 'I just want a good price.', conversation: T(['inbound', 'quote on 5 windows'], ['outbound', q1.fixed_line]), slots: SLOTS, tzLabel: 'ET' });
-  assert.equal(q2.slots_to_offer.length, 2);
-  assert.equal(q2.booking.allowed, true);
+  // 2026-10-13 (the owner, after the Erica Hilts chat): the second ask offers
+  // the free measure as a question; times only after a yes.
+  assert.equal(q2.step, 'price_visit_offer');
+  assert.equal((q2.slots_to_offer || []).length, 0);
+  assert.equal(q2.booking.allowed, false);
   const come = plan({ trigger: "I'd like someone to come out", discipline: { booking: { allowed: true, reason: 'lead_asked_about_scheduling' } }, slots: SLOTS });
   assert.equal(come.required_move, 'offer_slots');
   const think = plan({ trigger: 'let me think about it', slots: SLOTS, tzLabel: 'ET', discipline: { booking: { allowed: false, reason: 'x' } } });

@@ -56,6 +56,7 @@ import { humanizeReply, restoreQuestionMark } from '../agentic/human-voice.js';
 import { enforceTeamVoice } from '../agentic/team-voice.js';
 import { enforcePropertyScope, leadRaisesScope } from '../agentic/property-scope.js';
 import { enforceNonOwner, isNonOwner, nonOwnerLine } from '../agentic/non-owner.js';
+import { enforceSignOff } from '../agentic/sign-off.js';
 import { enforceJobScope, jobScopeFromThread, openingsToSave, RENTAL_LINE, INVESTMENT_LINE, COMMERCIAL_LINE, BELOW_MINIMUM_LINE, MINIMUM_CHECK_LINE, MINIMUM_CHECK_DOORS_LINE } from '../agentic/job-scope.js';
 import { scopeDqKind } from '../agentic/scope-dq.js';
 import { isPostDemoLead } from '../agentic/post-demo-lead.js';
@@ -490,7 +491,7 @@ export function wantsSlots(plan) {
 /** What the row records about the plan. Pure. */
 export function nepqSummary(plan) {
   if (!plan) return null;
-  return { step: plan.step, move: plan.required_move, objection: plan.objection?.type || null, handoff: plan.handoff?.reason || null, counters: plan.counters };
+  return { step: plan.step, move: plan.required_move, objection: plan.objection?.type || null, handoff: plan.handoff?.reason || null, counters: plan.counters, ...(plan.call_offer_ok ? { call_offer_ok: true } : {}) };
 }
 
 const NEPQ_FIXED_MOVES = new Set(['handoff', 'objection_play', 'ask_day', 'close', 'reveal', 'offer_slots', 'status_frame', 'dnk', 'qualify']);
@@ -1873,6 +1874,12 @@ export function createLiveChatFastLane(deps) {
       if (owner.changed) {
         d.log(`[NonOwner] live chat ${contactId} ${owner.reason}`);
         draft = owner.text;
+      }
+      // A goodbye ends the turn (2026-10-13, Erica Hilts): no question, no time.
+      const signOff = pastDemo ? { changed: false } : enforceSignOff(draft, { inbound: body });
+      if (signOff.changed) {
+        d.log(`[SignOff] live chat ${contactId} question/time dropped after a goodbye`);
+        draft = signOff.text;
       }
       // Human voice once more, last (2026-10-06 bot gate, spouse/livechat):
       // the first pass runs before the guards, and a sentence a guard drops can

@@ -186,6 +186,13 @@ const CASES = [
     draft: "Sorry about that. What's the address, so we can add it to our do-not-knock list?",
   },
   {
+    id: 'times_after_a_goodbye',
+    incident: '2026-10-13 SMS (Erica Hilts): "I can call back when I have more time. Ty" got "I\'ll check back next week. Enjoy." and the same two visit times; STOP a minute later',
+    inbound: 'I can call back when I have more time. Ty',
+    draft: "No problem, Alyce. I'll check back next week. Enjoy. Which works better, tomorrow at 10:00 AM ET or Thu, Oct 15 at 6:00 PM ET?",
+    mustNot: /\?|10:00 AM|check back/i,
+  },
+  {
     id: 'bare_stop_is_silent',
     incident: 'Only an opt-out silences the bot (Mark, 2026-09-24)',
     inbound: 'STOP',

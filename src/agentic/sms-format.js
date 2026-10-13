@@ -12,6 +12,8 @@
 //     "would record promised call").
 //   Each pass here deletes or swaps; none invents copy. PURE.
 
+import { isLeadSignOff } from './sign-off.js';
+
 // ── a fragment opener ────────────────────────────────────────────────────
 
 const FRAGMENT_LEAD_RX = /^(?:with|for|on|about|regarding|as\s+for|given|after|before|in\s+terms\s+of)\b/i;
@@ -111,8 +113,11 @@ const CLOSE_OR_OPT_OUT_RX = /^\s*(?:stop|stopall|unsubscribe|quit|end)\s*[.!]*\s
  */
 export function shouldRecordPromise({ trigger = '', plan = null } = {}) {
   if (CLOSE_OR_OPT_OUT_RX.test(String(trigger || ''))) return false;
+  // A lead signing off (2026-10-13, Erica Hilts: "I can call back when I have
+  // more time") is never owed a call by us.
+  if (isLeadSignOff(trigger)) return false;
   const step = plan?.step || null;
-  if (step === 'close' || step === 'not_interested') return false;
+  if (step === 'close' || step === 'not_interested' || step === 'sign_off' || step === 'price_rest') return false;
   if (plan?.handoff?.reason === 'two_nos' || plan?.handoff === 'two_nos') return false;
   return true;
 }

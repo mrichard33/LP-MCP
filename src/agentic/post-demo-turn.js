@@ -222,9 +222,13 @@ export function isAcknowledgment(text) {
 }
 
 // A sentence that closes the conversation; nothing should come after it.
-const SIGN_OFF_RX = /\benjoy\s+(?:your|the)\s+(?:week|weekend|day|evening|night|holidays?|time)\b|\bwe(?:'|’)?re\s+here\b|\bwe\s+are\s+here\b|\bi(?:'|’)?m\s+here\s+(?:if|when|whenever)\b|\bcongrat(?:ulation)?s\b|\btake\s+care\b|\b(?:i|we)(?:'|’)?ll\s+check\s+back\b|\b(?:i|we)\s+will\s+check\s+back\b|\btalk\s+soon\b|\bgood\s+luck\s+with\b|\bhave\s+a\s+(?:great|good|nice|wonderful|blessed)\s+(?:day|week|weekend|evening|night|one)\b|\breach\s+out\s+(?:whenever|anytime|any\s+time)\b/i;
+const SIGN_OFF_RX = /\benjoy\s+(?:your|the)\s+(?:week|weekend|day|evening|night|holidays?|time)\b|\bwe(?:'|’)?re\s+here\b|\bwe\s+are\s+here\b|\bi(?:'|’)?m\s+here\s+(?:if|when|whenever)\b|\bcongrat(?:ulation)?s\b|\btake\s+care\b|\b(?:i|we)(?:'|’)?ll\s+check\s+back\b|\b(?:i|we)\s+will\s+check\s+back\b|\btalk\s+soon\b|\bgood\s+luck\s+with\b|\bhave\s+a\s+(?:great|good|nice|wonderful|blessed)\s+(?:day|week|weekend|evening|night|one)\b|\breach\s+out\s+(?:whenever|anytime|any\s+time)\b|^\s*enjoy(?:\s+it)?[.!]*\s*$/i;
 
-/** True for "Enjoy your week.", "Take care.", "I'll check back in November." Pure. */
+/**
+ * True for "Enjoy your week.", "Take care.", "I'll check back in November."
+ * A bare "Enjoy." counts too (Erica Hilts, 2026-10-13: the layer3 "Enjoy!"
+ * after stripExclamations, with the visit times glued on after it). Pure.
+ */
 export function isSignOffLine(sentence) {
   const s = String(sentence || '').trim();
   return !!s && !s.endsWith('?') && SIGN_OFF_RX.test(s);

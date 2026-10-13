@@ -29,10 +29,11 @@ import { enforceJobScope } from '../agentic/job-scope.js';
 import { findUnbackedBookingClaim } from '../agentic/booking-claim.js';
 import { enforceCallTiming, promisedCallback, enforceRehashCallTiming } from '../agentic/team-hours.js';
 import { enforceOneAsk } from '../agentic/one-ask.js';
+import { isLeadSignOff } from '../agentic/sign-off.js';
 import { dropUnaskedCallOffer, leadWantsCall, isMoneyFigure, URGENCY_RX, CLAIMS_RX } from '../agentic/nepq-planner.js';
 
 /** Bump when a check is added or changed, so scorecards from two versions are not compared as one. */
-export const INVARIANTS_VERSION = '2026-10-13.1';
+export const INVARIANTS_VERSION = '2026-10-13.2';
 
 /** The prompt's own SMS ceiling (CHANNEL CONSTRAINTS: "320 max"). */
 export const SMS_MAX_CHARS = 320;
@@ -67,6 +68,11 @@ function sentences(text) {
  * @param {boolean}[ctx.callbackFiled]  this turn filed a callback (a hand-off): any call it promises is backed
  * @returns {{ pass: boolean, violations: Array<{code: string, detail: string}>, skipped: string[], metrics: {chars: number, questions: number} }}
  */
+// The clock times a message names, normalized and sorted ("10:00 AM" → "10:00am").
+function clockSet(text) {
+  return [...new Set([...String(text || '').matchAll(/\b(\d{1,2})(?::(\d{2}))?\s*([ap])\.?m\.?\b/gi)].map(m => `${Number(m[1])}:${m[2] || '00'}${m[3].toLowerCase()}m`))].sort();
+}
+
 export function checkReply(reply, ctx = {}) {
   const text = String(reply ?? '');
   const violations = [];
@@ -170,6 +176,25 @@ export function checkReply(reply, ctx = {}) {
     // unasked: the first gate run (2026-10-06) failed four hand-offs on it.
     const offers = sentences(text).filter(s => !promisedCallback(s)).join(' ');
     if (offers && dropUnaskedCallOffer(offers, { leadWantsCall: wants }).changed) fail('unasked_call_offer', text);
+  }
+
+  // ── a goodbye ends the turn (2026-10-13, Erica Hilts) ──────────────────
+  // "I can call back when I have more time. Ty" got "I'll check back next
+  // week. Enjoy." and two visit times. After a lead's sign-off: no question,
+  // no time. A post-demo thank-you keeps its one proposal question (Mark,
+  // 2026-10-09), so a post-demo plan is not held to it.
+  if (ctx.inbound === undefined || ctx.postDemoLead || ctx.callOfferOk === true) skipped.push('times_after_sign_off');
+  else if (isLeadSignOff(ctx.inbound) && (text.includes('?') || clockSet(text).length > 0)) fail('times_after_sign_off', text);
+
+  // ── the same two times, never a third time (2026-10-13) ────────────────
+  if (!Array.isArray(ctx.conversation)) skipped.push('repeat_slot_offer');
+  else {
+    const mine = clockSet(text);
+    if (mine.length >= 2) {
+      const key = mine.join('|');
+      const before = ctx.conversation.filter(m => String(m?.direction || '').toLowerCase() === 'outbound' && clockSet(String(m?.text ?? m?.body ?? '')).join('|') === key).length;
+      if (before >= 2) fail('repeat_slot_offer', text);
+    }
   }
 
   return { pass: violations.length === 0, violations, skipped, metrics };
