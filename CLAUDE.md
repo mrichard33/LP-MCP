@@ -981,6 +981,13 @@ non-plumbing source file on the stack is used (`src:<file>`). `acquireToken` cou
 429s per label: `/n8n/rate-limiter/stats` → `byCaller`, a `[GhlCallers]` log line every 15 min and one
 `ghl.request_budget_by_caller` event. Measures only. New GHL code needs nothing; the coverage scan
 (`scripts/test-ghl-rate-limiter-coverage.js`) now also catches `doFetch(` / `fetchImpl(` / `fetchFn(` call sites.
+**Do not re-ask GHL what we already know (2026-10-13).** The first day of counts: capacity-lead-loop 60,253, P2
+backstop 9,152 (28 of 65 429s), rehash sweep 4,500. Now the capacity sweep calls `processProspect(p, { reuseStoredLink })`:
+a prospect whose leads all carry one stored, classified link skips `matchToGHL` (`storedLinkToReuse`; unlinked,
+`legacy_unverified` or a differing lognumber/User1 runs the full match) and an active-entry add the tag snapshot already
+shows. The P2 backstop remembers a settled `skip`/`report` for 6h per deciding job (`createSettledMemo`), never a write,
+a wait or an unreadable read. The rehash sweep decides from `contact_tag_snapshot` and reads GHL live only to act, for a
+contact not in the snapshot, or once a day per contact (`canSkipLiveRead`); every write is still decided from a live read.
 
 **Static system prompts are cached** (`callLLM({ cacheSystem: true })`: reply writer, analyzer, live chat).
 Only for a system prompt that is byte-identical across calls — a varying one pays the write premium every

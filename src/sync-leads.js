@@ -117,7 +117,7 @@ import { combineNotes } from './safe-notes.js';
 import { syncCallLogs, syncNotes, syncActivities, syncJobAndMilestones } from './sync-children.js';
 import { emitEvent, dispositionPriority } from './event-emitter.js';
 import { pushLeadNotesImmediately } from './ghl-notes-sync.js';
-import { GHL_CONTACT_ID_PATTERN, lognumberCandidate } from './ghl-link-shape.js';
+import { GHL_CONTACT_ID_PATTERN, lognumberCandidate, user1Candidate } from './ghl-link-shape.js';
 import { resolveLeadGhlLink, LINK_SOURCE } from './services/link-corroboration.js';
 import { shouldRenewConsent } from './services/consent-renewal.js';
 import { diffLeadContent, contentDiffMode, LEAD_CONTENT_COLUMNS } from './services/lead-content-diff.js';
@@ -335,6 +335,64 @@ async function removeTagsViaExecutor(contactId, tags) {
     console.warn(`[Sync] removeTagsViaExecutor(${contactId}, ${tags.length} tags) failed: ${err.message}`);
     return false;
   }
+}
+
+// ─── Reusing a stored link (2026-10-13) ───────────────────────────
+//
+// The capacity sweep's lead loop re-ran processProspect on every board lead
+// all night, and each run asked GHL to search the phone, the alt phone and the
+// email (matchToGHL), then re-added an active-entry tag the contact already
+// had: 60,253 GHL requests in 24h, 55% of all LP-MCP's GHL traffic (#1248's
+// per-caller counts, 2026-10-13), and the 429s it caused failed the rehash and
+// P2 sweeps. A lead whose link is already stored and classified gains nothing
+// from that search: resolveLeadGhlLink takes its zero-query fast path when
+// there is no new candidate. So, for callers that opt in, a prospect whose
+// leads all carry the SAME stored, classified link skips the search. Anything
+// else (an unlinked lead, a legacy_unverified link, two different ids, a
+// lognumber / User1 candidate that differs) runs the full path as before.
+
+/**
+ * Pure. The stored GHL id to reuse instead of matchToGHL, or null for the full path.
+ * @param {object[]} leads  the prospect's LP leads (as LP sent them)
+ * @param {object[]} rows   lp_leads rows: { lp_lead_id, ghl_contact_id, ghl_link_source }
+ */
+export function storedLinkToReuse(leads = [], rows = []) {
+  if (!Array.isArray(leads) || leads.length === 0) return null;
+  const byId = new Map((rows || []).map((r) => [String(r.lp_lead_id), r]));
+  let id = null;
+  for (const lead of leads) {
+    const row = byId.get(String(getField(lead, 'id', 'lds_id', 'LeadID')));
+    if (!row?.ghl_contact_id || !row.ghl_link_source) return null;
+    if (row.ghl_link_source === LINK_SOURCE.LEGACY_UNVERIFIED) return null;
+    if (id && row.ghl_contact_id !== id) return null;
+    id = row.ghl_contact_id;
+    const candidate = lognumberCandidate(lead) || user1Candidate(lead);
+    if (candidate && candidate !== id) return null;
+  }
+  return id;
+}
+
+/** Pure. True when the tags already hold exactly this active-entry tag (the add would be a no-op). */
+export function activeEntryAlreadySet(tags, activeTag) {
+  if (!Array.isArray(tags) || !activeTag) return false;
+  const active = tags.map((t) => String(t).toLowerCase()).filter((t) => t.startsWith('active-entry:'));
+  return active.length === 1 && active[0] === activeTag.toLowerCase();
+}
+
+async function readStoredLinks(leads) {
+  const ids = leads.map((l) => String(getField(l, 'id', 'lds_id', 'LeadID'))).filter(Boolean);
+  if (!ids.length) return [];
+  const { data, error } = await supabase.from('lp_leads')
+    .select('lp_lead_id, ghl_contact_id, ghl_link_source').in('lp_lead_id', ids);
+  if (error) throw new Error(error.message);
+  return data || [];
+}
+
+async function snapshotTags(contactId) {
+  const { data, error } = await supabase.from('contact_tag_snapshot')
+    .select('tags').eq('ghl_contact_id', contactId).maybeSingle();
+  if (error) throw new Error(error.message);
+  return data?.tags || null;
 }
 
 // Convert entry:X tag to active-entry:X
@@ -787,14 +845,27 @@ export async function upsertLeadOnly(prospect) {
 // v10.0: Tag operations route through executor handlers (immutability +
 //        exclusivity enforced; manual stale-tag list removed).
 
-export async function processProspect(prospect, { skipGHL = false, payloadHash = null } = {}) {
+export async function processProspect(prospect, { skipGHL = false, payloadHash = null, reuseStoredLink = false } = {}) {
   if (!loggedFirstKeys.has('prospect')) {
     loggedFirstKeys.add('prospect');
     console.log('[Sync] Prospect record keys:', Object.keys(prospect).join(', '));
   }
 
   let ghlId = null;
-  if (!skipGHL) {
+  // The id this pass's phone/email search returned. Null when the search was
+  // skipped, so the link resolver never mistakes a stored id for a fresh match.
+  let matchedGhlId = null;
+  let reusedLink = false;
+  if (!skipGHL && reuseStoredLink) {
+    try {
+      const prospectLeads = getField(prospect, 'leads', 'Leads') || [];
+      const stored = storedLinkToReuse(prospectLeads, await readStoredLinks(prospectLeads));
+      if (stored) { ghlId = stored; reusedLink = true; }
+    } catch (err) {
+      console.warn(`[Sync] stored-link read failed for prospect ${prospect.cst_id} (full match instead): ${err.message}`);
+    }
+  }
+  if (!skipGHL && !reusedLink) {
     try {
       ghlId = await matchToGHL({
         phone: normalizePhone(getField(prospect, 'phone1', 'Phone1', 'phone', 'Phone')),
@@ -804,6 +875,7 @@ export async function processProspect(prospect, { skipGHL = false, payloadHash =
     } catch (err) {
       console.warn(`[Sync] GHL match failed for prospect ${prospect.cst_id}:`, err.message);
     }
+    matchedGhlId = ghlId;
   }
 
   const allLeads = getField(prospect, 'leads', 'Leads') || [];
@@ -857,7 +929,7 @@ export async function processProspect(prospect, { skipGHL = false, payloadHash =
     const resolved = await resolveLeadGhlLink({
       lead,
       prospect,
-      verifiedGhlId: ghlId,
+      verifiedGhlId: matchedGhlId,
       existingGhlId: existing?.ghl_contact_id || null,
       existingLinkSource: existing?.ghl_link_source || null,
     }, { lpLeadId, lpProspectId });
@@ -1205,7 +1277,14 @@ export async function processProspect(prospect, { skipGHL = false, payloadHash =
       // v10.0: single add — namespace exclusivity guard in executeAddTag
       // pre-removes any conflicting active-entry:* tag automatically.
       // No manual ALL_ACTIVE_ENTRY_TAGS list needed.
-      await applyTagViaExecutor(ghlId, activeTag);
+      // 2026-10-13: a reused-link pass skips the add when the tag snapshot
+      // already shows exactly this tag (executeAddTag would read the contact
+      // and do nothing). A snapshot that cannot be read adds as before.
+      let alreadySet = false;
+      if (reusedLink) {
+        try { alreadySet = activeEntryAlreadySet(await snapshotTags(ghlId), activeTag); } catch { alreadySet = false; }
+      }
+      if (!alreadySet) await applyTagViaExecutor(ghlId, activeTag);
 
       if (leadSourceTracker.length > 1) {
         console.log(`[Sync] active-entry:* set to ${activeTag} for ${ghlId} (${leadSourceTracker.length} LP leads, newest=${leadSourceTracker[0].lpLeadId})`);

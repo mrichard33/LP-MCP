@@ -631,7 +631,7 @@ async function sweepForwardLeadDispositions(windowStart, windowEnd) {
     await processInBatches(withForwardAppt, LEAD_CONCURRENCY, async (prospect) => {
       const cstId = getField(prospect, 'cst_id', 'CstID', 'prospectid', 'ProspectID');
       try {
-        await withTimeout(processProspect(prospect), PROSPECT_TIMEOUT_MS, `cstId=${cstId}`);
+        await withTimeout(processProspect(prospect, REUSE_LINK), PROSPECT_TIMEOUT_MS, `cstId=${cstId}`);
         stats.processed++;
       } catch (err) {
         stats.failed++;
@@ -676,6 +676,12 @@ async function sweepForwardLeadDispositions(windowStart, windowEnd) {
 // Returns 'refreshed' | 'recovered_by_customer' | 'deleted_in_lp' | 'gone'.
 const DIGITS = /^\d+$/;
 
+// 2026-10-13: the board needs LP's data, not a fresh GHL phone/email search
+// for every board lead every pass (60k GHL requests a day, 55% of our GHL
+// traffic). A lead whose link is already stored reuses it; an unlinked lead
+// still gets the full match (storedLinkToReuse in src/sync-leads.js).
+const REUSE_LINK = Object.freeze({ reuseStoredLink: true });
+
 export async function refreshNearWindowLead({ ldsId, cstId }, deps = {}) {
   const d = {
     getLeadByLdsId, getProspectByCstId, processProspect,
@@ -689,7 +695,7 @@ export async function refreshNearWindowLead({ ldsId, cstId }, deps = {}) {
     const res = await d.getLeadByLdsId(ldsId);
     const prospect = extractArray(res)[0];
     if (!prospect) return 'gone'; // empty answer — nothing to refresh
-    await d.timeout(d.processProspect(prospect), `lds_id=${ldsId}`);
+    await d.timeout(d.processProspect(prospect, REUSE_LINK), `lds_id=${ldsId}`);
     return 'refreshed';
   } catch (err) {
     firstErr = err;
@@ -704,7 +710,7 @@ export async function refreshNearWindowLead({ ldsId, cstId }, deps = {}) {
   }
 
   if (presence.verdict === 'present') {
-    await d.timeout(d.processProspect(presence.prospect), `cst_id=${cstId}`);
+    await d.timeout(d.processProspect(presence.prospect, REUSE_LINK), `cst_id=${cstId}`);
     return 'recovered_by_customer';
   }
   if (presence.verdict === 'absent') {

@@ -234,3 +234,62 @@ test('hasPostAppointmentStage reads the GHL stage tag, case-insensitive', async 
   assert.equal(hasPostAppointmentStage(undefined), false);
   assert.equal(isInRehash({ tags: ['stage:post-appointment'] }), false, 'the stage tag alone is not rehash');
 });
+
+// ── GHL reads: decide from the tag snapshot, read live only to act (2026-10-13) ──
+
+test('canSkipLiveRead: only a snapshot "none" with a live read inside 24h', async () => {
+  const { canSkipLiveRead, LIVE_RECHECK_MS } = await import('../src/jobs/rehash-tag-sweep.js');
+  const none = { action: 'none' };
+  assert.equal(canSkipLiveRead({ snapshotDecision: none, lastLiveMs: NOW - 1000, nowMs: NOW }), true);
+  assert.equal(canSkipLiveRead({ snapshotDecision: none, lastLiveMs: NOW - LIVE_RECHECK_MS, nowMs: NOW }), false);
+  assert.equal(canSkipLiveRead({ snapshotDecision: none, lastLiveMs: undefined, nowMs: NOW }), false);
+  assert.equal(canSkipLiveRead({ snapshotDecision: { action: 'tag' }, lastLiveMs: NOW, nowMs: NOW }), false);
+  assert.equal(canSkipLiveRead({ snapshotDecision: null, lastLiveMs: NOW, nowMs: NOW }), false);
+});
+
+test('sweep: a settled contact read live in the last 24h is not read again', async () => {
+  const sb = fakeSupabase({ demos: [{ ghl_contact_id: 'mon' }], leads: { mon: [monica] } });
+  let reads = 0;
+  const res = await runRehashTagSweep({
+    supabase: sb, env, now: () => NOW, log: () => {},
+    readSnapshotTags: async () => new Map([['mon', ['rehash', 'rehash-lead:581695', 'rehash-since:2026-10-07']]]),
+    liveReadAt: new Map([['mon', NOW - 3_600_000]]),
+    getContact: async () => { reads++; return { tags: [] }; },
+    emitEvent: async () => {},
+  });
+  assert.equal(reads, 0);
+  assert.equal(res.counts.live_reads_skipped, 1);
+  assert.equal(sb.inserted.length, 0);
+});
+
+test('sweep: a snapshot that says act is checked live, and the LIVE tags decide', async () => {
+  const sb = fakeSupabase({ demos: [{ ghl_contact_id: 'mon' }], leads: { mon: [monica] } });
+  // Snapshot is stale (no rehash tag), GHL already has it: no write.
+  const liveReadAt = new Map([['mon', NOW - 1000]]);
+  let reads = 0;
+  const res = await runRehashTagSweep({
+    supabase: sb, env, now: () => NOW, log: () => {},
+    readSnapshotTags: async () => new Map([['mon', []]]),
+    liveReadAt,
+    getContact: async () => { reads++; return { tags: ['rehash', 'rehash-lead:581695', 'rehash-since:2026-10-07'] }; },
+    emitEvent: async () => {},
+  });
+  assert.equal(reads, 1);
+  assert.equal(res.counts.none, 1);
+  assert.equal(sb.inserted.length, 0, 'a stale snapshot never writes');
+});
+
+test('sweep: a contact missing from the snapshot, or a failed snapshot read, is read live', async () => {
+  for (const readSnapshotTags of [async () => new Map(), async () => null]) {
+    const sb = fakeSupabase({ demos: [{ ghl_contact_id: 'mon' }], leads: { mon: [monica] } });
+    let reads = 0;
+    const res = await runRehashTagSweep({
+      supabase: sb, env, now: () => NOW, log: () => {}, readSnapshotTags,
+      liveReadAt: new Map([['mon', NOW - 1000]]),
+      getContact: async () => { reads++; return { tags: [] }; },
+      emitEvent: async () => {},
+    });
+    assert.equal(reads, 1);
+    assert.equal(res.counts.tag, 1);
+  }
+});
