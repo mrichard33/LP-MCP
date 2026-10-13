@@ -127,13 +127,20 @@ test('the minimum: any three openings, or one sliding glass door', () => {
   assert.equal(meets('two windows and the garage door'), false);
 });
 
-test('a stated count under the minimum gets the one check question', () => {
-  for (const inbound of ['I just need one window replaced', 'I need a new front door', '2 doors', 'only two windows']) {
+test('a stated count under the minimum gets the friendly check, never the rule first', () => {
+  // The user, 2026-10-13: "I would like to get a quote on replacing 1 24x36
+  // window" → "Of course, I can help with that. Are all the other windows in
+  // your home already hurricane impact?"
+  for (const inbound of ['I would like to get a quote on replacing 1 24x36 window', 'I would like to get a quote on replacing 1 window', 'I just need one window replaced', 'only two windows', 'one 36" window please']) {
     const r = J.enforceJobScope(OFFER, { thread: [], inbound });
     assert.equal(r.text, J.MINIMUM_CHECK_LINE, inbound);
     assert.equal(r.reason, 'minimum_check', inbound);
-    assert.match(r.text, /three windows or doors, or one sliding glass door/);
+    assert.doesNotMatch(r.text, /minimum/);
     assert.equal((r.text.match(/\?/g) || []).length, 1);
+  }
+  // A door named: the doors version.
+  for (const inbound of ['I need a new front door', '2 doors']) {
+    assert.equal(J.enforceJobScope(OFFER, { thread: [], inbound }).text, J.MINIMUM_CHECK_DOORS_LINE, inbound);
   }
 });
 
@@ -144,20 +151,35 @@ test('a symptom is not a scope: "my window is foggy" is never checked', () => {
   }
 });
 
-test('a no to the check is under the minimum: the decline line, no times', () => {
-  const t = thread(['i', 'I just need one window replaced'], ['o', J.MINIMUM_CHECK_LINE]);
-  const r = J.enforceJobScope(OFFER, { thread: t, inbound: 'No, just that one' });
-  assert.equal(r.text, J.BELOW_MINIMUM_LINE);
-  assert.equal(r.block, 'below_minimum');
+test('"the rest are already impact" means this is the whole job: the minimum, no times', () => {
+  const t = thread(['i', 'I would like a quote on replacing 1 window'], ['o', J.MINIMUM_CHECK_LINE]);
+  for (const inbound of ['Yes', 'Yeah they are all impact already', 'Yes, the other 10 windows are impact', 'No, but I only want to replace this one for now', 'just this one']) {
+    const r = J.enforceJobScope(OFFER, { thread: t, inbound });
+    assert.equal(r.text, J.BELOW_MINIMUM_LINE, inbound);
+    assert.equal(r.block, 'below_minimum', inbound);
+  }
+  assert.match(J.BELOW_MINIMUM_LINE, /three windows or doors, or one sliding glass door/);
 });
 
-test('more openings or a slider after the check: the normal flow, never asked twice', () => {
-  const t = thread(['i', 'I just need one window replaced'], ['o', J.MINIMUM_CHECK_LINE]);
-  for (const inbound of ['Actually also the slider', 'Yes, 3 more in the bedrooms', 'Maybe the front door too']) {
+test('"the others are old" is a bigger job: the normal flow, never asked twice', () => {
+  const t = thread(['i', 'I would like a quote on replacing 1 window'], ['o', J.MINIMUM_CHECK_LINE]);
+  for (const inbound of ['No', 'No, the rest are original from 1990', 'Not yet, maybe all of them eventually', 'Hmm, I am not sure']) {
     const r = J.enforceJobScope(OFFER, { thread: t, inbound });
     assert.equal(r.changed, false, inbound);
     assert.equal(J.jobScopeBlocks(t, inbound), false, inbound);
   }
+});
+
+test('the other wording works the same: "Does your home only have 1 window?"', () => {
+  const t = thread(['i', 'quote on 1 window'], ['o', 'Yeah, I can help you with that. Does your home only have 1 window?']);
+  assert.equal(J.jobScopeFromThread(t, 'No, lol').block, null);
+  assert.equal(J.jobScopeFromThread(t, 'No, but I just want this one done').block, 'below_minimum');
+});
+
+test('a model that asks "any other windows or doors?" reads a NO as the whole job', () => {
+  const t = thread(['i', 'I just need one window replaced'], ['o', "Our minimum is three windows or doors. Are there any other windows or doors you'd want us to look at?"]);
+  assert.equal(J.jobScopeFromThread(t, 'No, just that one').block, 'below_minimum');
+  assert.equal(J.jobScopeFromThread(t, 'Actually also the slider').block, null);
 });
 
 test('counts across messages: "2 windows", then "and a door" meets it', () => {
@@ -166,7 +188,7 @@ test('counts across messages: "2 windows", then "and a door" meets it', () => {
 });
 
 test('a model-worded minimum ask stands', () => {
-  const r = J.enforceJobScope('Our minimum is three windows or doors. Is there anything else you want looked at?', { thread: [], inbound: 'just one window' });
+  const r = J.enforceJobScope('Sure, I can help with that. Are the other windows in your home already impact?', { thread: [], inbound: 'just one window' });
   assert.equal(r.changed, false);
 });
 
@@ -202,7 +224,7 @@ test('checkReply with no thread checks our claims only', () => {
 });
 
 test('every fixed line is dash-free and has at most one question', () => {
-  for (const line of [J.RENTAL_LINE, J.COMMERCIAL_LINE, J.MINIMUM_CHECK_LINE, J.BELOW_MINIMUM_LINE]) {
+  for (const line of [J.RENTAL_LINE, J.COMMERCIAL_LINE, J.MINIMUM_CHECK_LINE, J.MINIMUM_CHECK_DOORS_LINE, J.BELOW_MINIMUM_LINE]) {
     assert.doesNotMatch(line, /[—–]/);
     assert.ok((line.match(/\?/g) || []).length <= 1);
   }

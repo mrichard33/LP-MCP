@@ -56,7 +56,7 @@ import { humanizeReply, restoreQuestionMark } from '../agentic/human-voice.js';
 import { enforceTeamVoice } from '../agentic/team-voice.js';
 import { enforcePropertyScope } from '../agentic/property-scope.js';
 import { enforceNonOwner, isNonOwner, nonOwnerLine } from '../agentic/non-owner.js';
-import { enforceJobScope, jobScopeFromThread, RENTAL_LINE, COMMERCIAL_LINE, BELOW_MINIMUM_LINE, MINIMUM_CHECK_LINE } from '../agentic/job-scope.js';
+import { enforceJobScope, jobScopeFromThread, RENTAL_LINE, COMMERCIAL_LINE, BELOW_MINIMUM_LINE, MINIMUM_CHECK_LINE, MINIMUM_CHECK_DOORS_LINE } from '../agentic/job-scope.js';
 import { enforceCallTiming, promisedCallback, isTeamOpen } from '../agentic/team-hours.js';
 import { rewriteBookingClaims, appointmentOnFile, checkBookingTruth, bookingResult, noPromiseHandoffLine } from '../agentic/booking-claim.js';
 import { enforceCancelledVisit } from '../agentic/cancelled-visit.js';
@@ -1765,7 +1765,7 @@ export function createLiveChatFastLane(deps) {
       {
         const js = jobScopeFromThread(threadTurns, body);
         if (js.block || js.check) {
-          const reply = js.check ? MINIMUM_CHECK_LINE : ({ rental: RENTAL_LINE, commercial: COMMERCIAL_LINE, below_minimum: BELOW_MINIMUM_LINE })[js.block];
+          const reply = js.check ? (js.doors ? MINIMUM_CHECK_DOORS_LINE : MINIMUM_CHECK_LINE) : ({ rental: RENTAL_LINE, commercial: COMMERCIAL_LINE, below_minimum: BELOW_MINIMUM_LINE })[js.block];
           return { reply, record: { booking: `refused_job_scope:${js.block || 'minimum_check'}` } };
         }
       }

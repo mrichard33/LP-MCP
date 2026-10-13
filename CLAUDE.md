@@ -981,8 +981,10 @@ thread: a RENTAL (tenant, landlord, investment, Airbnb/VRBO, property manager; a
 or COMMERCIAL property (business, office/apartment building, church, HOA or condo association for the building; a single
 condo owner is a homeowner) said now → the whole reply is `RENTAL_LINE` / `COMMERCIAL_LINE`, said earlier → the time
 offer goes. The MINIMUM is three windows or doors in any mix, or one sliding glass door alone: a stated count under it
-(not a symptom: "my window is foggy" is never checked) gets `MINIMUM_CHECK_LINE` once; a no to it → `BELOW_MINIMUM_LINE`;
-anything else is the normal flow, and an unknown count never blocks. A draft saying we do commercial or rental work, or
+(not a symptom: "my window is foggy" is never checked) gets ONE friendly check, never the rule first (`MINIMUM_CHECK_LINE`,
+the user's wording: "Of course, I can help with that. Are all the other windows in your home already hurricane
+impact?"; "Does your home only have 1 window?" reads the same). A yes or "just this one" → `BELOW_MINIMUM_LINE`, which
+states the minimum; "no, the others are old" or anything else is the normal flow, and an unknown count never blocks. A draft saying we do commercial or rental work, or
 that some windows are not impact, has that sentence replaced. Any block drops `book_appointment`, the live chat refuses
 the booking (`refused_job_scope:*`), `gateForStage` returns `not_eligible`, `checkReply` fails `job_scope`, the analyzer
 has `dq_detected` rental_property / commercial / below_minimum, and an LP note saying rental, commercial or below minimum

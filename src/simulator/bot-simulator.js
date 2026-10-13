@@ -157,7 +157,7 @@ export const SCENARIOS = Object.freeze({
   // ── 2026-10-13 (the user): no rentals, no commercial, the minimum ──
   landlord: { title: 'Landlord asks about a rental (no rentals)', persona: DANA, turns: ['Hi, I need new windows on a house I rent out to tenants', 'Can you just set something up anyway?'] },
   commercial: { title: 'Commercial property (no commercial)', persona: GUEST, turns: ['Do you do commercial buildings? We need windows for our office building', 'Can someone come take a look?'] },
-  one_window: { title: 'One window only (under the minimum)', persona: DANA, turns: ['I just need one window replaced in the bathroom', 'No, just that one'] },
+  one_window: { title: 'One window only (under the minimum)', persona: DANA, turns: ['I would like to get a quote on replacing 1 24x36 window', 'Yes, the rest are already impact'] },
   slider_only: { title: 'One sliding glass door (meets the minimum)', persona: DANA, autoAnswer: true, turns: ['I need to replace our sliding glass door', 'Yes, please set up a visit'] },
 });
 

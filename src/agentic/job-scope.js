@@ -26,11 +26,14 @@
 //   - rental / commercial said THIS turn → the whole reply is the decline line.
 //     Said earlier → any time offer, booking ask or clock time is dropped;
 //     nothing left → the line.
-//   - a stated count under the minimum → ONE check: our minimum, and "are
-//     there any other windows or doors?". A no to it → the decline line.
-//     Anything else (more openings, a slider, "yes") → the normal flow. An
-//     unknown count is never blocked: the prompt's "a booking with an unknown
-//     window count beats a lost slot" still stands.
+//   - a stated count under the minimum → ONE friendly check, never the rule
+//     first (the user, 2026-10-13: "Of course, I can help with that. Are all
+//     the other windows in your home already hurricane impact?", or "Does your
+//     home only have 1 window?"). A yes (the rest are impact, it is just this
+//     one) → the decline line, which states the minimum. A no (the others are
+//     old) or anything else → the normal flow. An unknown count is never
+//     blocked: the prompt's "a booking with an unknown window count beats a
+//     lost slot" still stands.
 //   - a draft that says we DO commercial or rental work, or that not all our
 //     windows are impact → that sentence becomes the true line (we sell only
 //     hurricane impact windows and doors, the user, 2026-10-13).
@@ -42,8 +45,10 @@ import { findBookingAsks } from './discovery-discipline.js';
 
 export const RENTAL_LINE = "Thanks for letting me know. We don't work on rental properties, so we can't set up a visit for this one. Sorry about that.";
 export const COMMERCIAL_LINE = 'Thanks for asking. We only work on homes, not commercial properties, so this one is outside what we do. Sorry about that.';
-export const MINIMUM_CHECK_LINE = "Just so you know, our minimum is three windows or doors, or one sliding glass door. Are there any other windows or doors you'd want us to look at?";
-export const BELOW_MINIMUM_LINE = "Thanks for letting me know. That's under our minimum of three windows or doors, or one sliding glass door, so we can't set up a visit for it. If more come up, we'd be glad to help.";
+// The user's wording (2026-10-13). The doors version is for a lead who named a door.
+export const MINIMUM_CHECK_LINE = 'Of course, I can help with that. Are all the other windows in your home already hurricane impact?';
+export const MINIMUM_CHECK_DOORS_LINE = 'Of course, I can help with that. Are all the other windows and doors in your home already hurricane impact?';
+export const BELOW_MINIMUM_LINE = "Thanks for letting me know. Our minimum is three windows or doors, or one sliding glass door, so we can't set up a visit for this one. If anything else comes up, we'd be glad to help.";
 
 const LINE_FOR = { rental: RENTAL_LINE, commercial: COMMERCIAL_LINE, below_minimum: BELOW_MINIMUM_LINE };
 
@@ -105,8 +110,9 @@ const NUMBER_WORDS = {
 // Longest first: "a couple" must not read as "a" + "couple windows".
 const COUNT = '((?:a\\s+)?couple(?:\\s+of)?|(?:a\\s+)?pair\\s+of|(?:a\\s+)?few|\\d{1,3}|an|a|one|single|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|several|many)';
 // Up to two describing words between the count and the noun:
-// "one broken window", "2 small bathroom windows", "a front door".
-const DESC = '(?:\\s+(?!and\\b|or\\b|with\\b)[a-z\'-]+){0,2}';
+// "one broken window", "2 small bathroom windows", "a front door", and a size
+// ("1 24x36 window", "one 36\" window", the user's example, 2026-10-13).
+const DESC = '(?:\\s+(?!and\\b|or\\b|with\\b)(?:[a-z\'-]+|\\d{1,3}(?:\\s*["\'″]|\\s*(?:in|inch|inches)\\b)?(?:\\s*[x×]\\s*\\d{1,3}(?:\\s*["\'″])?)?)){0,2}';
 const WINDOW_COUNT_RX = new RegExp(`\\b${COUNT}${DESC}\\s+windows?\\b`, 'gi');
 const DOOR_COUNT_RX = new RegExp(`\\b${COUNT}${DESC}\\s+doors?\\b`, 'gi');
 // "the front door", "my back door": one door.
@@ -185,10 +191,29 @@ export function meetsMinimum(o) {
   return o.windows + o.doors > 0 ? false : null;
 }
 
-// Our minimum question, read by meaning (the model may word it).
-export const MINIMUM_ASK_RX = /\bminimum\b[^?]*\?|\bany\s+other\s+windows?\s+or\s+doors?\b[^?]*\?/i;
-// A no to it: "no", "just that one", "that's it", "only the one".
+// Our check, read by meaning (the model may word it). Two kinds, with
+// opposite answers:
+//   "Are the other windows already impact?" / "Does your home only have 1
+//   window?" → a YES means this is the whole job;
+//   "Any other windows or doors you'd want looked at?" / "our minimum is …?"
+//   → a NO means this is the whole job.
+const YES_MEANS_UNDER_ASK_RX = /\bother\s+windows?(?:\s+(?:and|or)\s+doors?)?\b[^?]*\bimpact\b[^?]*\?|\bonly\s+(?:have|has)\s+(?:1|one|2|two|a\s+couple(?:\s+of)?)\s+(?:windows?|doors?)\b[^?]*\?/i;
+const NO_MEANS_UNDER_ASK_RX = /\bminimum\b[^?]*\?|\bany\s+other\s+windows?\s+(?:or|and)\s+doors?\b[^?]*\?/i;
+export const MINIMUM_ASK_RX = new RegExp(`${YES_MEANS_UNDER_ASK_RX.source}|${NO_MEANS_UNDER_ASK_RX.source}`, 'i');
+// Wherever it is in the reply: they want only this one done.
+const ONLY_THIS_ONE_RX = /\b(?:only|just)\s+(?:want|need|doing|replacing|looking\s+to\s+(?:do|replace))\s+(?:to\s+(?:do|replace)\s+)?(?:this|that|the|one|1|two|2)\b|\bjust\s+(?:this|that|the)\s+one\b|\b(?:the\s+)?(?:others|rest)\s+(?:are|were)\s+(?:all\s+)?(?:already\s+)?(?:impact|done|replaced)\b|\bthey'?re\s+(?:all\s+)?(?:already\s+)?impact\b/i;
+const YES_REPLY_RX = /^\s*(?:y(?:es|eah|ep|up)|correct|right|they\s+are|all\s+(?:of\s+)?(?:them|the\s+others|the\s+rest)|already|it\s+does|we\s+do|i\s+do)\b/i;
+const NO_REPLY_RX = /^\s*(?:no(?:pe)?|nah|not\s+(?:really|yet|all)|none)\b/i;
+// A no to "any other windows or doors?": "no", "just that one", "that's it".
 const MINIMUM_NO_RX = /^\s*(?:no(?:pe)?|nah|not\s+really|just\s+(?:that|the|this|those|one|1|two|2)|only\s+(?:that|the|this|those|one|1|two|2)|that'?s\s+(?:it|all)|nothing\s+else|that\s+is\s+(?:it|all))\b/i;
+
+/** Is this reply to our check saying the job is only what they named? Pure. */
+function replyMeansUnder(ask, reply) {
+  const r = String(reply || '');
+  if (ONLY_THIS_ONE_RX.test(r)) return true;
+  if (YES_MEANS_UNDER_ASK_RX.test(ask)) return !NO_REPLY_RX.test(r) && YES_REPLY_RX.test(r);
+  return MINIMUM_NO_RX.test(r);
+}
 
 // ── reading the thread ────────────────────────────────────────────────────
 
@@ -245,9 +270,7 @@ export function jobScopeFromThread(thread = [], inbound = '') {
   if (asked >= 0) {
     const reply = turns.slice(asked + 1).find(t => t.direction === 'inbound');
     if (!reply) return { block: null, check: false, now: false };
-    const after = openingsIn(turns.slice(asked + 1).filter(t => t.direction === 'inbound').map(t => t.text).join(' '));
-    if (meetsMinimum(after) === true || after.unknown) return { block: null, check: false, now: false };
-    if (MINIMUM_NO_RX.test(reply.text)) {
+    if (replyMeansUnder(turns[asked].text, reply.text)) {
       const idx = turns.indexOf(reply);
       return { block: 'below_minimum', check: false, now: idx === lastInboundIdx };
     }
@@ -270,7 +293,12 @@ export function jobScopeFromThread(thread = [], inbound = '') {
     newest = i;
   }
   if (!stated || windows + doors >= 3 || windows + doors === 0) return { block: null, check: false, now: false };
-  return { block: null, check: true, now: newest === lastInboundIdx };
+  return { block: null, check: true, now: newest === lastInboundIdx, doors: doors > 0 };
+}
+
+/** The check line for this thread: the doors version when they named a door. Pure. */
+export function minimumCheckLine(thread = [], inbound = '') {
+  return jobScopeFromThread(thread, inbound).doors ? MINIMUM_CHECK_DOORS_LINE : MINIMUM_CHECK_LINE;
 }
 
 /** Is a visit off the table for this lead? (booking refusal) Pure. */
@@ -344,7 +372,7 @@ export function enforceJobScope(draft, { thread = [], inbound = '' } = {}) {
   if (scope.check) {
     // A draft that already asks about the minimum stands.
     if (MINIMUM_ASK_RX.test(original)) return { text: original, changed: false, reason: null, block: 'minimum_check' };
-    return { text: MINIMUM_CHECK_LINE, changed: true, reason: 'minimum_check', block: 'minimum_check' };
+    return { text: scope.doors ? MINIMUM_CHECK_DOORS_LINE : MINIMUM_CHECK_LINE, changed: true, reason: 'minimum_check', block: 'minimum_check' };
   }
 
   const claims = fixClaims(original);

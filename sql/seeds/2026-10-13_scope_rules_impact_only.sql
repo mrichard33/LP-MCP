@@ -27,12 +27,13 @@
 --   GET /n8n/kb/faq-probe?q=Are your windows impact rated?              (LIB-P15)
 --   GET /n8n/kb/faq-probe?q=Do you work on rental properties?           (LIB-P16)
 --   GET /n8n/kb/faq-probe?q=Do you do commercial buildings?             (LIB-P17)
---   GET /n8n/kb/faq-probe?q=Can you replace just one window?            (LIB-P18)
+--   GET /n8n/kb/faq-probe?q=I would like a quote on replacing 1 window  (LIB-P18)
+--   GET /n8n/kb/faq-probe?q=Is there a minimum?                         (LIB-P19)
 --   and re-probe the neighbours: "Do you do sliding glass doors?", "Do you
 --   do doors?", "Do you work on condos?" must keep their own rows.
 --
 -- ROLLBACK:
---   UPDATE kb_faqs SET active = false WHERE kb_key IN ('LIB-P16','LIB-P17','LIB-P18');
+--   UPDATE kb_faqs SET active = false WHERE kb_key IN ('LIB-P16','LIB-P17','LIB-P18','LIB-P19');
 --   LIB-P03 / LIB-P15 / proof points: re-run the old text from
 --   sql/seeds/2026-09-25_golden_kb_v1.sql and 2026-10-06_impact_rated_yes.sql.
 
@@ -68,13 +69,25 @@ SELECT 'LIB-P17',
 WHERE NOT EXISTS (SELECT 1 FROM kb_faqs WHERE kb_key = 'LIB-P17');
 
 -- ── the minimum ─────────────────────────────────────────────────────────
+-- A lead asking for one window gets a friendly question first, never the rule
+-- (the user, 2026-10-13: "Of course, I can help with that. Are all the other
+-- windows in your home already hurricane impact?"). LIB-P19 answers a lead who
+-- asks about the minimum itself.
 INSERT INTO kb_faqs (kb_key, question_pattern, canonical_answer, answer_short, channel, tier, active, notes)
 SELECT 'LIB-P18',
-       $$Can you replace just one window? | Do you do just one window? | I only need two windows | Is there a minimum? | Do you replace a single door? | What's your minimum job?$$,
-       $$Our minimum is three windows or doors in any mix, like three windows or two windows and a door, or one sliding glass door on its own. Are there any other windows or doors you'd want us to look at?$$,
+       $$I would like a quote on replacing 1 window | Can you replace just one window? | Do you do just one window? | I only need two windows replaced | Can you replace my front door?$$,
+       $$Of course, I can help with that. Are all the other windows in your home already hurricane impact?$$,
        NULL, 'both', 'factual', true,
-       $$2026-10-13 (the user): three openings in any mix of windows and doors, or one sliding glass door alone. Ask once about other openings; a no means it is under the minimum and gets no visit. Guard: src/agentic/job-scope.js.$$
+       $$2026-10-13 (the user): ask this first, never lead with the rule. A yes (the rest are impact, just this one) → our minimum is three windows or doors, or one sliding glass door, and no visit. A no → carry on normally. Guard: src/agentic/job-scope.js.$$
 WHERE NOT EXISTS (SELECT 1 FROM kb_faqs WHERE kb_key = 'LIB-P18');
+
+INSERT INTO kb_faqs (kb_key, question_pattern, canonical_answer, answer_short, channel, tier, active, notes)
+SELECT 'LIB-P19',
+       $$Is there a minimum? | What's your minimum job? | Do you have a minimum number of windows? | How many windows do I need for you to come out?$$,
+       $$Our minimum is three windows or doors in any mix, like three windows or two windows and a door, or one sliding glass door on its own.$$,
+       NULL, 'both', 'factual', true,
+       $$2026-10-13 (the user): three openings in any mix of windows and doors, or one sliding glass door alone. Guard: src/agentic/job-scope.js.$$
+WHERE NOT EXISTS (SELECT 1 FROM kb_faqs WHERE kb_key = 'LIB-P19');
 
 -- ── proof points: the renter row covers every rental now ─────────────────
 UPDATE kb_proof_points
@@ -83,8 +96,8 @@ UPDATE kb_proof_points
        updated_at = now()
  WHERE claim = 'Reece works with homeowners only — not renters';
 
--- Check: expect LIB-P03, LIB-P15, LIB-P16, LIB-P17, LIB-P18 active, none saying "not every".
+-- Check: expect LIB-P03, LIB-P15, LIB-P16 to LIB-P19 active, none saying "not every".
 SELECT json_agg(row_to_json(s)) FROM (
   SELECT kb_key, active, canonical_answer FROM kb_faqs
-   WHERE kb_key IN ('LIB-P03','LIB-P15','LIB-P16','LIB-P17','LIB-P18') ORDER BY kb_key
+   WHERE kb_key IN ('LIB-P03','LIB-P15','LIB-P16','LIB-P17','LIB-P18','LIB-P19') ORDER BY kb_key
 ) s;
