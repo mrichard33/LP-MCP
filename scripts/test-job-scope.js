@@ -23,7 +23,6 @@ const OFFER = 'Great. I have Thu, Oct 15 at 10:00 AM ET or Fri, Oct 16 at 2:00 P
 test('a rented-out home is a rental, whoever says it', () => {
   for (const t of [
     'We rent it out to tenants',
-    "It's an investment property",
     'We have it on Airbnb',
     'It is a short-term rental',
     "I'm the property manager for the owner",
@@ -53,7 +52,7 @@ test('a landlord said now gets the rental line: no times, no question', () => {
 
 test('a rental said earlier: the answer stays, the time offer goes', () => {
   const r = J.enforceJobScope('The visit takes about an hour. I have Thu, Oct 15 at 10:00 AM ET or Fri, Oct 16 at 2:00 PM ET. Which works better?',
-    { thread: thread(['i', 'It is an investment property'], ['o', 'Thanks for telling me.']), inbound: 'how long is a visit?' });
+    { thread: thread(['i', 'We rent it out to tenants'], ['o', 'Thanks for telling me.']), inbound: 'how long is a visit?' });
   assert.equal(r.text, 'The visit takes about an hour.');
   assert.equal(r.block, 'rental');
 });
@@ -158,7 +157,7 @@ test('"the rest are already impact" means this is the whole job: the minimum, no
     assert.equal(r.text, J.BELOW_MINIMUM_LINE, inbound);
     assert.equal(r.block, 'below_minimum', inbound);
   }
-  assert.match(J.BELOW_MINIMUM_LINE, /three windows or doors, or one sliding glass door/);
+  assert.match(J.BELOW_MINIMUM_LINE, /3-opening minimum, any mix of windows and doors, or one sliding glass door/);
 });
 
 test('"the others are old" is a bigger job: the normal flow, never asked twice', () => {
@@ -196,7 +195,7 @@ test('a model-worded minimum ask stands', () => {
 
 test('a draft that says we do commercial or rental work is corrected', () => {
   assert.equal(J.enforceJobScope('Yes, we do commercial work too. What got you looking?', {}).text, 'We only work on homes, not commercial properties. What got you looking?');
-  assert.equal(J.enforceJobScope('Sure, we work with landlords all the time.', {}).text, "We don't work on rental properties.");
+  assert.equal(J.enforceJobScope('Sure, we work with landlords all the time.', {}).text, "We don't work on rental or investment properties.");
   // A sentence that already says no stands.
   assert.equal(J.enforceJobScope("We don't work on commercial properties.", {}).changed, false);
 });
@@ -286,4 +285,18 @@ test('a count already on the contact skips the count question', async () => {
   const f = P.stageFactsNow({ stage: 'problem', facts: { homeowner: 'yes', zip: '33908' } }, [], null, true);
   assert.equal(f.openings_known, true);
   assert.equal(P.nextQualifyItem(f, []), 'decision_makers');
+});
+
+// ── investment properties (the user, 2026-10-13: a second home is a lead, a flip is not) ──
+
+test('a flip or an investment property is a no; a second home the owner keeps is a lead', () => {
+  for (const t of ["It's an investment property", 'We are flipping this house', "It's a fix and flip", 'Renovating it to resell']) {
+    const r = J.enforceJobScope(OFFER, { thread: [], inbound: t });
+    assert.equal(r.block, 'investment', t);
+    assert.equal(r.text, J.INVESTMENT_LINE, t);
+  }
+  for (const t of ['It is our second home in Naples', 'This is our vacation home, we do not rent it', 'I have a flip phone, text is fine', "It's not a flip, we live here"]) {
+    assert.equal(J.jobScopeFromThread([], t).block, null, t);
+  }
+  assert.doesNotMatch(J.INVESTMENT_LINE, /[—–]/);
 });

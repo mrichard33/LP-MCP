@@ -990,7 +990,8 @@ code".
 any owner, the prompt said "Investment properties are NOT a disqualifier", commercial work was "route to the team" (live
 chat pitched it as a LARGE JOB), no code knew a minimum, and two FAQs said "not every window in our line is
 impact-rated". `src/agentic/job-scope.js` (pure, both bots, EVERY mode, run right before `enforceNonOwner`) reads the
-thread: a RENTAL (tenant, landlord, investment, Airbnb/VRBO, property manager; an owner's un-rented second home is fine)
+thread: a RENTAL (tenant, landlord, Airbnb/VRBO, property manager) or an INVESTMENT property (a flip, or "an investment
+property" with nothing more; `INVESTMENT_LINE`; an owner's un-rented second home is a lead, the user, 2026-10-13)
 or COMMERCIAL property (business, office/apartment building, church, HOA or condo association for the building; a single
 condo owner is a homeowner) said now → the whole reply is `RENTAL_LINE` / `COMMERCIAL_LINE`, said earlier → the time
 offer goes. The MINIMUM is three windows or doors in any mix, or one sliding glass door alone: a stated count under it
@@ -1007,17 +1008,18 @@ count the lead states is SAVED to the GHL fields Window Count (`h9FJTUbmUHIuD6JK
 (`context.estimate.window_count` / `door_count`) skips the question (`knownOpenings`). A draft saying we do commercial or rental work, or
 that some windows are not impact, has that sentence replaced. Any block drops `book_appointment`, the live chat refuses
 the booking (`refused_job_scope:*`), `gateForStage` returns `not_eligible`, `checkReply` fails `job_scope`, the analyzer
-has `dq_detected` rental_property / commercial / below_minimum, and an LP note saying rental, commercial or below minimum
-is an LP-note DQ. FAQs LIB-P03/P15 (impact only), LIB-P16/17/18: `sql/seeds/2026-10-13_scope_rules_impact_only.sql`.
+has `dq_detected` rental_property / commercial / below_minimum, and an LP note saying below minimum is an LP-note DQ. An
+LP note that only DESCRIBES a rental or a commercial property is NOT (the team books those: "owns a rental property …
+estimate for three windows"); as a DQ it would stop-bot live appointments, so those rules read only the lead's words. FAQs LIB-P03/P15 (impact only), LIB-P16/17/18: `sql/seeds/2026-10-13_scope_rules_impact_only.sql`.
 Reminders for Set/Verif only (Cnf and Issue get none) are GHL edits in A.WE-1: `docs/ghl-we-reminders-set-only.md`.
 **A lead past its demo already meets these requirements (the user, 2026-10-13).** `isPostDemoLead`
 (`src/agentic/post-demo-lead.js`: a demo disposition (`isDemoDisposition`) or closed won, or `lp-demo-completed` /
 `stage:post-appointment` / `rehash` / `active-f.0`; never `lp.demo_completed`, which LP sets for NOC) turns off, in both
 bots and whatever `POST_DEMO_PLANNER_MODE` says: the lead-side job-scope and tenant declines (our own false claims are
 still corrected), the qualifying gate (`postDemoLead` → `gateForStage`), the live chat's job-scope booking refusal, the
-set-ND card, and an LP-note DQ whose signal is only renter / rental / commercial / below minimum
-(`REQUIREMENT_SIGNALS`). `checkReply` skips the lead-side check on `ctx.postDemoLead`.
-Also fixed: the SMS scope guard compared `scope.reason === 'lead_asked'`, which never matched `'<rule>:lead_asked'`, so a
+set-ND card, and an LP-note DQ whose signal is only renter or below minimum (`REQUIREMENT_SIGNALS`). `checkReply` skips the lead-side check on `ctx.postDemoLead`.
+The live chat also never books in a chat that raised a manufactured home or a 3+ story building (`leadRaisesScope`).
+#1274 (the same rules built a second way, never told the minimum) was closed by the user's ruling. Also fixed: the SMS scope guard compared `scope.reason === 'lead_asked'`, which never matched `'<rule>:lead_asked'`, so a
 declined manufactured home or tall building kept its booking.
 
 **Every GHL request is credited to the code that made it (2026-10-12).** LP-MCP made ~127,000 GHL requests in 24h

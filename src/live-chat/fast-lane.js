@@ -54,9 +54,9 @@ import {
 import { buildEstablishedFacts } from '../agentic/established-facts.js';
 import { humanizeReply, restoreQuestionMark } from '../agentic/human-voice.js';
 import { enforceTeamVoice } from '../agentic/team-voice.js';
-import { enforcePropertyScope } from '../agentic/property-scope.js';
+import { enforcePropertyScope, leadRaisesScope } from '../agentic/property-scope.js';
 import { enforceNonOwner, isNonOwner, nonOwnerLine } from '../agentic/non-owner.js';
-import { enforceJobScope, jobScopeFromThread, openingsToSave, RENTAL_LINE, COMMERCIAL_LINE, BELOW_MINIMUM_LINE, MINIMUM_CHECK_LINE, MINIMUM_CHECK_DOORS_LINE } from '../agentic/job-scope.js';
+import { enforceJobScope, jobScopeFromThread, openingsToSave, RENTAL_LINE, INVESTMENT_LINE, COMMERCIAL_LINE, BELOW_MINIMUM_LINE, MINIMUM_CHECK_LINE, MINIMUM_CHECK_DOORS_LINE } from '../agentic/job-scope.js';
 import { scopeDqKind } from '../agentic/scope-dq.js';
 import { isPostDemoLead } from '../agentic/post-demo-lead.js';
 import { enforceCallTiming, promisedCallback, isTeamOpen } from '../agentic/team-hours.js';
@@ -1773,9 +1773,14 @@ export function createLiveChatFastLane(deps) {
       if (!pastDemo) {
         const js = jobScopeFromThread(threadTurns, body);
         if (js.block || js.check) {
-          const reply = js.check ? (js.doors ? MINIMUM_CHECK_DOORS_LINE : MINIMUM_CHECK_LINE) : ({ rental: RENTAL_LINE, commercial: COMMERCIAL_LINE, below_minimum: BELOW_MINIMUM_LINE })[js.block];
+          const reply = js.check ? (js.doors ? MINIMUM_CHECK_DOORS_LINE : MINIMUM_CHECK_LINE) : ({ rental: RENTAL_LINE, investment: INVESTMENT_LINE, commercial: COMMERCIAL_LINE, below_minimum: BELOW_MINIMUM_LINE })[js.block];
           return { reply, record: { booking: `refused_job_scope:${js.block || 'minimum_check'}` } };
         }
+      }
+      // A manufactured home or a building over two stories raised anywhere in
+      // this chat: never booked (2026-10-13, kept from #1274).
+      if (leadRaisesScope([...threadTurns.filter(t => t.direction !== 'outbound').map(t => t.text), body])) {
+        return { reply: "Sorry, that's a home we can't work on, so we can't set up a visit for it.", record: { booking: 'refused_property_scope' } };
       }
       // Save what they typed BEFORE booking: the booking gate reads the
       // contact (address, name, phone) from GHL.

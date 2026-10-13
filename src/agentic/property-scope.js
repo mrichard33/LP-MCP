@@ -98,6 +98,16 @@ function leadRaises(rule, inbound) {
   return sentences(inbound).some(s => rule.rx.test(s) && !NEGATION_RX.test(s));
 }
 
+/**
+ * Did the lead, anywhere in these messages, raise a home we cannot work on?
+ * (2026-10-13, kept from #1274: the live chat never books a picked time in a
+ * chat that raised one.) Pure.
+ */
+export function leadRaisesScope(inboundTexts = []) {
+  const texts = Array.isArray(inboundTexts) ? inboundTexts : [inboundTexts];
+  return texts.some(t => RULES.some(r => leadRaises(r, String(t || ''))));
+}
+
 function draftSaysNo(rule, parts) {
   return parts.some(s => (rule.rx.test(s) && NEGATION_RX.test(s)) || (rule.limit && rule.limit.test(s)));
 }

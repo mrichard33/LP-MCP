@@ -46,8 +46,8 @@ export function buildLeadFacts({ lp = null, lpLead = null, lead = null } = {}) {
       : null);
 
   // A lead past its demo already meets the requirements (the user,
-  // 2026-10-13): a note that only says rental, commercial or below the minimum
-  // is not a DQ for them. Out of area, a housing program and the rest still are.
+  // 2026-10-13): a note that says renter or below the minimum is not a DQ for
+  // them. Out of area, a housing program and the rest still are.
   const pastDemo = isPostDemoLead({ lp, tags: lead?.current_tags || [], stageTag: lead?.current_stage_tag || null });
   const dq = detectNoteDq(notes, { skip: pastDemo ? REQUIREMENT_SIGNALS : [] });
   return {

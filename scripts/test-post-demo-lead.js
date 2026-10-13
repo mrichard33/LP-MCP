@@ -26,11 +26,12 @@ test('before the demo, or NOC, is not', () => {
   assert.equal(isPostDemoLead({}), false);
 });
 
-test('an LP note that only says rental / commercial / below minimum is not a DQ after the demo', () => {
+test('an LP note that says renter or below minimum is not a DQ after the demo', () => {
   const rentalNote = { notes: [{ text: 'Customer rents the house', entered_by: 'Kaley' }] };
   assert.equal(buildLeadFacts({ lp: { ...rentalNote, disposition: 'Set' } }).note_dq?.signal, 'renter', 'before the demo it still is');
   assert.equal(buildLeadFacts({ lp: { ...rentalNote, disposition: 'OPPFDN' } }).note_dq, null);
-  assert.equal(buildLeadFacts({ lp: { notes: [{ text: 'This is a commercial property.' }], disposition: 'OPPFDN' } }).note_dq, null);
+  assert.equal(buildLeadFacts({ lp: { notes: [{ text: 'Customer is below our minimum.' }], disposition: 'Set' } }).note_dq?.signal, 'below_minimum');
+  assert.equal(buildLeadFacts({ lp: { notes: [{ text: 'Customer is below our minimum.' }], disposition: 'OPPFDN' } }).note_dq, null);
   // Out of area still stops the bot after a demo.
   assert.equal(buildLeadFacts({ lp: { notes: [{ text: 'Out of area, we do not service it.' }], disposition: 'OPPFDN' } }).note_dq?.signal, 'out_of_area');
 });
