@@ -141,8 +141,13 @@ test('rows + flags: a clean known-vendor invoice has no flags; unknown vendor an
   const flags = computeFlags({ vendor: null, facts: { ...facts, total: null, period_start: null }, rows: unknown.rows, confidence: 0.4 });
   for (const f of [FLAGS.UNKNOWN_VENDOR, FLAGS.MISSING_PERIOD, FLAGS.MISSING_TOTAL, FLAGS.LOW_CONFIDENCE]) assert.ok(flags.includes(f), f);
 
+  // 2026-10-13: a vendor with a sub-source but no markets is split by that
+  // sub-source's issued leads, so it is not flagged; only one with neither is.
   const noMarkets = computeFlags({ vendor: VENDORS[1], facts, rows: buildExpenseRows({ document: { id: 'd3' }, vendor: VENDORS[1], facts, analysis: null, confidence: 0.9 }).rows, confidence: 0.9 });
-  assert.ok(noMarkets.includes(FLAGS.VENDOR_MARKETS_UNKNOWN));
+  assert.ok(!noMarkets.includes(FLAGS.VENDOR_MARKETS_UNKNOWN));
+  const bare = { ...VENDORS[1], lp_sub_sources: [], eligible_markets: [] };
+  const neither = computeFlags({ vendor: bare, facts, rows: buildExpenseRows({ document: { id: 'd4' }, vendor: bare, facts, analysis: null, confidence: 0.9 }).rows, confidence: 0.9 });
+  assert.ok(neither.includes(FLAGS.VENDOR_MARKETS_UNKNOWN));
 });
 
 test('flags: line sum ≠ total, non-USD, spike, duplicate, disagreement, OCR-heavy, non-eligible market', () => {

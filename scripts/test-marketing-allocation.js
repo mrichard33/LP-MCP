@@ -92,3 +92,29 @@ test('allocateExpense: several sub-sources → lp_sub_source null (the view keys
   const rows = allocateExpense({ amount: 10, period_start: '2026-09-01', period_end: '2026-09-30', lp_sub_sources: ['A', 'B'], eligible_markets: ['SAR_MKT'] });
   assert.equal(rows[0].lp_sub_source, null);
 });
+
+// 2026-10-13 (the user): no markets picked → the sub-source's gross issued leads pick them.
+test('by source: no markets picked splits over every market with issued leads for that sub-source', async () => {
+  const { allocateExpense, splitsBySource, marketsFromIssued } = await import('../src/marketing/allocation.js');
+  const e = { id: 'e', amount: 3624.6, period_start: '2026-09-02', period_end: '2026-09-02', lp_sub_sources: ['Vis PPC'], eligible_markets: [] };
+  assert.equal(splitsBySource(e), true);
+  assert.equal(splitsBySource({ ...e, eligible_markets: ['STPET_MKT'] }), false);
+  assert.deepEqual(marketsFromIssued({ STPET_MKT: 2, ORL_MKT: 0, REECE_HOLD: 4 }), ['STPET_MKT']);
+  const rows = allocateExpense(e, () => ({ STPET_MKT: 2, ORL_MKT: 0 }));
+  assert.deepEqual(rows.map((r) => [r.market, r.amount, r.rule]), [['STPET_MKT', 3624.6, 'direct']]);
+  const two = allocateExpense(e, () => ({ STPET_MKT: 3, SAR_MKT: 1 }));
+  assert.deepEqual(two.map((r) => [r.market, r.amount, r.rule]), [['SAR_MKT', 906.15, 'proportional'], ['STPET_MKT', 2718.45, 'proportional']]);
+  const none = allocateExpense(e, () => ({}));
+  assert.deepEqual(none.map((r) => [r.market, r.amount, r.rule]), [['REECE_HOLD', 3624.6, 'hold']]);
+  assert.match(none[0].note, /no Vis PPC issued leads in 2026-09 yet/);
+  assert.throws(() => allocateExpense({ ...e, lp_sub_sources: [] }, () => ({})), /no markets and no sub-source/);
+});
+
+test('the issued basis for a slice is its whole calendar month, not the days the slice covers', async () => {
+  const { previewAllocation } = await import('../src/marketing/allocation-io.js');
+  const calls = [];
+  const supabase = { rpc: async (_fn, args) => { calls.push(args); return { data: [{ market: 'STPET_MKT', lp_sub_source: 'Vis PPC', issued: 2 }], error: null }; } };
+  const rows = await previewAllocation({ id: 'e', amount: 100, period_start: '2026-10-02', period_end: '2026-10-02', lp_sub_sources: ['Vis PPC'], eligible_markets: [] }, { supabase });
+  assert.deepEqual(calls, [{ p_from: '2026-10-01', p_to: '2026-10-31' }]);
+  assert.deepEqual(rows.map((r) => [r.market, r.amount]), [['STPET_MKT', 100]]);
+});

@@ -211,19 +211,63 @@ test('approve: rows approved by name, allocated, feed vendor trued up, card repl
   assert.equal(r2.action, 'already_resolved');
 });
 
-test('approve is blocked while a line has no markets; edit fills them in and learns the alias; then approve works', async () => {
-  const supabase = db();
-  const posts = [];
+// 2026-10-13 (the user): "we should be able to determine the markets based on
+// the gross issued leads for that source". No markets picked → Approve splits
+// by the line's sub-source's issued leads; a month with none waits on hold.
+const MHP_ISSUED = { mkt_issued_counts: async () => [
+  { market: 'FTMYR_MKT', lp_sub_source: 'MyHomePros', issued: 3 }, { market: 'STPET_MKT', lp_sub_source: 'MyHomePros', issued: 1 },
+  { market: 'SAR_MKT', lp_sub_source: 'Lead Gurus', issued: 50 }, { market: null, lp_sub_source: 'MyHomePros', issued: 9 },
+] };
+async function ingestMhp(supabase) {
   const ai = { ...GOOD_AI, vendor_name: 'My Home Pros', vendor_match_id: MHP_ID, lines: [{ description: 'Leads', amount: 1000, lp_sub_source: 'MyHomePros', markets: [], market_evidence: null }] };
-  const r = await ingestInvoice(payload({ from: 'billing@myhomepros.com', file_b64: Buffer.from('My Home Pros\nInvoice # MHP-1\nService Period: 09/01/2026 - 09/30/2026\nTotal Due $1,000.00').toString('base64') }), depsFor(supabase, { posts, ai }));
-  assert.ok(r.flags.includes('vendor_eligible_markets_empty'));
+  return ingestInvoice(payload({ from: 'billing@myhomepros.com', file_b64: Buffer.from('My Home Pros\nInvoice # MHP-1\nService Period: 09/01/2026 - 09/30/2026\nTotal Due $1,000.00').toString('base64') }), depsFor(supabase, { posts: [], ai }));
+}
+
+test('no markets picked: Approve splits by the sub-source\'s gross issued leads, no Edit needed', async () => {
+  const supabase = db({}, MHP_ISSUED);
+  const r = await ingestMhp(supabase);
+  assert.ok(!r.flags.includes('vendor_eligible_markets_empty'));
+  const replies = [];
+  const deps = { supabase, approvers: new Set(['U_BRAD']), reply: async (_u, b) => replies.push(b), signedLink: async () => null };
+  const ok = await handleMarketingInvoiceInteraction(parsedClick('approve', r.document_id, { userId: 'U_BRAD', userName: 'brad' }), deps);
+  assert.equal(ok.action, 'approved');
+  // Only MyHomePros counts (not Lead Gurus), a lead with no market is ignored, 3:1 → 750 / 250.
+  assert.deepEqual(supabase.tables.marketing_expense_allocations.map((a) => [a.market, Number(a.amount), a.rule, a.issued_basis, a.issued_total]).sort(),
+    [['FTMYR_MKT', 750, 'proportional', 3, 4], ['STPET_MKT', 250, 'proportional', 1, 4]]);
+  assert.match(JSON.stringify(replies.at(-1).blocks), /markets by issued leads/);
+});
+
+test('no markets picked and no issued leads that month yet: the money waits on REECE_HOLD with a note', async () => {
+  const supabase = db({}, { mkt_issued_counts: async () => [{ market: 'SAR_MKT', lp_sub_source: 'Lead Gurus', issued: 50 }] });
+  const r = await ingestMhp(supabase);
+  const replies = [];
+  const ok = await handleMarketingInvoiceInteraction(parsedClick('approve', r.document_id, { userId: 'U_BRAD', userName: 'brad' }), { supabase, approvers: new Set(['U_BRAD']), reply: async (_u, b) => replies.push(b), signedLink: async () => null });
+  assert.equal(ok.action, 'approved');
+  const [a] = supabase.tables.marketing_expense_allocations;
+  assert.equal(supabase.tables.marketing_expense_allocations.length, 1);
+  assert.equal(a.market, 'REECE_HOLD');
+  assert.equal(a.rule, 'hold');
+  assert.match(a.recommendation_reason, /no MyHomePros issued leads in 2026-09 yet/);
+  assert.match(JSON.stringify(replies.at(-1).blocks), /no MyHomePros issued leads/);
+});
+
+test('a line with no markets AND no sub-source still cannot be approved', async () => {
+  const supabase = db({}, MHP_ISSUED);
+  const r = await ingestMhp(supabase);
+  supabase.tables.marketing_expenses.forEach((e) => { e.lp_sub_sources = []; });
+  const replies = [];
+  const blocked = await handleMarketingInvoiceInteraction(parsedClick('approve', r.document_id, { userId: 'U_BRAD', userName: 'brad' }), { supabase, approvers: new Set(['U_BRAD']), reply: async (_u, b) => replies.push(b), signedLink: async () => null });
+  assert.equal(blocked.action, 'blocked');
+  assert.match(replies.at(-1).text, /no LP sub-source/);
+});
+
+test('edit can still pin markets and learns the alias; then approve allocates to the pinned market', async () => {
+  const supabase = db();
+  const r = await ingestMhp(supabase);
   const replies = [];
   const updates = [];
   const deps = { supabase, approvers: new Set(['U_BRAD']), reply: async (_u, b) => replies.push(b), updateSlackMessage: async (c, ts, text, o) => { updates.push({ c, ts, text, o }); return { ok: true }; }, signedLink: async () => null };
   const click = (d, over) => parsedClick(d, r.document_id, { userId: 'U_BRAD', userName: 'brad', ...over });
-  const blocked = await handleMarketingInvoiceInteraction(click('approve'), deps);
-  assert.equal(blocked.action, 'blocked');
-  assert.match(replies.at(-1).text, /no markets/);
 
   const values = {
     vendor: { mktinv_v_vendor: { selected_option: { value: MHP_ID } } },

@@ -13,6 +13,20 @@
  *   several markets, total issued = 0      → equal, 1 ÷ n
  *   eligible_markets = {'REECE_HOLD'}       → hold (D4: never spread)
  *   never a market outside eligible_markets
+ *
+ * No markets picked (eligible_markets = '{}') means BY SOURCE (the user,
+ * 2026-10-13: "we should be able to determine the markets based on the gross
+ * issued leads for that source"). Every market where the line's sub-source
+ * had gross issued leads that month takes its share, the same proportional
+ * rule. A month with none yet (JMJ / Vis PPC in October 2026: a new campaign)
+ * goes to REECE_HOLD with a note, and the nightly re-run (current + prior
+ * month) splits it once leads issue. A line with no sub-source cannot be
+ * split by source and throws; Approve already refuses one.
+ *
+ * The issued basis for a slice is its whole CALENDAR MONTH (D1: "split per
+ * month and market by gross issued leads"), not only the days the slice
+ * covers: an invoice with no printed period sits on its invoice date, and one
+ * day of issued leads is almost always zero.
  * Round to cents. The leftover cent goes to the market with the most issued
  * (ties: alphabetical). The sum must equal the slice amount, or we throw —
  * a ledger that does not reconcile is worse than one that refuses to write.
@@ -112,21 +126,41 @@ export function allocateSlice({ amount, markets, issuedByMarket = {} }) {
   return rows.map(({ cents, ...r }) => ({ ...r, amount: fromCents(cents) }));
 }
 
+/** True when the expense names no markets, so its source's issued leads pick them. */
+export function splitsBySource(expense) {
+  return !(expense?.eligible_markets || []).filter(Boolean).length;
+}
+
+/** The markets a by-source slice spreads over: every market with issued > 0. */
+export function marketsFromIssued(issuedByMarket = {}) {
+  return Object.keys(issuedByMarket).filter((m) => m && m !== HOLD_MARKET && Number(issuedByMarket[m]) > 0).sort();
+}
+
 /**
  * Allocate a whole expense: month slices × markets. `issuedLookup(month,
- * start, end)` returns gross issued per market for that slice's window
+ * start, end)` returns gross issued per market for that slice's month
  * (restricted by the caller to the expense's sub-sources). Returns the rows
  * to insert into marketing_expense_allocations (without the expense_id).
  */
 export function allocateExpense(expense, issuedLookup = () => ({})) {
-  const markets = expense.eligible_markets || [];
-  const subSource = Array.isArray(expense.lp_sub_sources) && expense.lp_sub_sources.length === 1
-    ? expense.lp_sub_sources[0] : null;
+  const bySource = splitsBySource(expense);
+  const subs = (expense.lp_sub_sources || []).filter(Boolean);
+  if (bySource && !subs.length) throw new Error('allocation: no markets and no sub-source to split by');
+  const subSource = subs.length === 1 ? subs[0] : null;
   const out = [];
   for (const slice of splitPeriodByMonth(expense.period_start, expense.period_end, expense.amount)) {
     const issuedByMarket = issuedLookup(slice.month, slice.start, slice.end) || {};
+    let markets = expense.eligible_markets || [];
+    let note = null;
+    if (bySource) {
+      markets = marketsFromIssued(issuedByMarket);
+      if (!markets.length) {
+        markets = [HOLD_MARKET];
+        note = `no ${subs.join(' / ')} issued leads in ${slice.month.slice(0, 7)} yet; split by source once there are (re-run nightly)`;
+      }
+    }
     for (const row of allocateSlice({ amount: slice.amount, markets, issuedByMarket })) {
-      out.push({ month: slice.month, lp_sub_source: subSource, ...row });
+      out.push({ month: slice.month, lp_sub_source: subSource, ...row, ...(note ? { note } : {}) });
     }
   }
   const total = out.reduce((a, r) => a + toCents(r.amount), 0);

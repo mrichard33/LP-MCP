@@ -141,7 +141,9 @@ export function computeFlags({
 }) {
   const flags = new Set(lineProblems);
   if (!vendor) flags.add(FLAGS.UNKNOWN_VENDOR);
-  else if (!(vendor.eligible_markets || []).length) flags.add(FLAGS.VENDOR_MARKETS_UNKNOWN);
+  // 2026-10-13: a vendor with no markets on file is split by its sub-source's
+  // issued leads, so only a vendor with neither markets nor a sub-source is unknown.
+  else if (!(vendor.eligible_markets || []).length && !(vendor.lp_sub_sources || []).length) flags.add(FLAGS.VENDOR_MARKETS_UNKNOWN);
   if (!facts.period_start || !facts.period_end) flags.add(FLAGS.MISSING_PERIOD);
   if (facts.total == null) flags.add(FLAGS.MISSING_TOTAL);
   if (rows.some((r) => r.amount == null)) flags.add(FLAGS.MISSING_TOTAL);
@@ -166,7 +168,7 @@ export function autoApproveDecision({ flags = [], priorApprovals = 0, minPrior =
 /** Plain-English flag labels for the card. */
 export const FLAG_LABELS = Object.freeze({
   [FLAGS.UNKNOWN_VENDOR]: 'Vendor not recognised',
-  [FLAGS.VENDOR_MARKETS_UNKNOWN]: 'Vendor has no eligible markets on file (fill them in before approving)',
+  [FLAGS.VENDOR_MARKETS_UNKNOWN]: 'Vendor has no markets and no LP sub-source on file (fill one in before approving)',
   [FLAGS.MISSING_PERIOD]: 'Billing period not found',
   [FLAGS.MISSING_TOTAL]: 'Total not found',
   [FLAGS.LINES_NE_TOTAL]: 'Line items do not add up to the total',
