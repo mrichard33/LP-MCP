@@ -357,3 +357,124 @@ test('allocateExpenseById clears allocations of a non-approved row', async () =>
   assert.equal(r.skipped, 'rejected');
   assert.equal(supabase.tables.marketing_expense_allocations.length, 0);
 });
+
+// ─── 2026-10-13: the first real email (JMJ Digital Marketing, forwarded by Mark) ──
+// Three parts: the invoice PDF (total, invoice date, NO service period) and two
+// inline images (OCR "qb" / "Th Kf Wr"). All three answered 500 on a NOT NULL
+// column and nothing reached Slack. These pin the fix.
+import { JMJ_TEXT } from './test-marketing-invoice-triage.js';
+
+const FWD = { gmail_message_id: 'fwd1', from: 'm.richard@reecewindows.com', subject: 'Fw: Invoice - Reminder: Your payment to JMJ Digital Marketing, LLC (Mike Gibson) is due', received_at: '2026-10-13T16:01:38.000Z' };
+const imagePayload = (name, text) => ({ ...FWD, file_name: name, mime_type: 'image/png', file_b64: Buffer.from(text).toString('base64') });
+const noAi = () => ({ callJson: aiStub(null), guard: async () => ({ mode: 'shadow', verdict: 'clean', score: 0, block: false }) });
+
+test('a logo or a signature image is skipped: no document, no card, remembered by sha, no model call', async () => {
+  const supabase = db();
+  const posts = [];
+  const modelCalls = [];
+  const deps = { ...depsFor(supabase, { posts }), analyzeDeps: { callJson: async (...a) => { modelCalls.push(a); return { data: null }; }, guard: async () => ({ mode: 'shadow', verdict: 'clean', score: 0, block: false }) } };
+  const r1 = await ingestInvoice(imagePayload('Outlook-QB Logo.png', 'qb\n'), deps);
+  assert.equal(r1.httpStatus, 200);
+  assert.equal(r1.success, true);
+  assert.equal(r1.skipped, true);
+  assert.equal(r1.reason, 'too_little_text');
+  assert.equal(r1.document_id, null);
+  const r2 = await ingestInvoice(imagePayload('image.png', 'Th\nKf\nWr\n'), deps);
+  assert.equal(r2.skipped, true);
+  assert.equal(supabase.tables.marketing_invoice_documents.length, 0, 'a logo is never a document');
+  assert.equal(supabase.tables.marketing_expenses.length, 0);
+  assert.equal(supabase.tables.marketing_invoice_skips.length, 2);
+  assert.equal(posts.length, 0, 'no card for a logo');
+  assert.equal(modelCalls.length, 0, 'the model never sees a logo');
+  assert.equal(supabase.storageLog.uploads.length, 0, 'a logo is not stored');
+  // The same logo in the next email from that sender: answered at once, nothing re-run.
+  const extractCalls = [];
+  const r3 = await ingestInvoice(imagePayload('Outlook-QB Logo.png', 'qb\n'), { ...deps, extract: async (...a) => { extractCalls.push(a); return extractStub(...a); } });
+  assert.deepEqual([r3.duplicate, r3.skipped, r3.reason], [true, true, 'too_little_text']);
+  assert.equal(extractCalls.length, 0);
+});
+
+test('the JMJ PDF (forwarded, unknown vendor, no service period) reaches review with an assumed period, and its analysis is saved', async () => {
+  const supabase = db();
+  const posts = [];
+  const deps = { ...depsFor(supabase, { posts }), analyzeDeps: noAi() };
+  const r = await ingestInvoice({ ...FWD, file_name: 'INVOICE_1883_from_JMJ Digital Marketing, LLC.pdf', mime_type: 'application/pdf', file_b64: Buffer.from(JMJ_TEXT).toString('base64') }, deps);
+  assert.equal(r.httpStatus, 200, JSON.stringify(r));
+  assert.equal(r.success, true);
+  assert.equal(r.skipped, undefined);
+  assert.equal(r.auto_approved, false);
+  assert.ok(r.flags.includes('unknown_vendor'));
+  const rows = supabase.tables.marketing_expenses;
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].amount, 3624.6);
+  assert.ok(rows[0].period_start && rows[0].period_end, 'the row has a period the database accepts');
+  if (r.flags.includes('missing_period')) {
+    assert.equal(rows[0].period_start, '2026-10-02');
+    assert.equal(rows[0].period_end, '2026-10-02');
+    assert.deepEqual(r.assumed, ['missing_period']);
+  }
+  const doc = supabase.tables.marketing_invoice_documents[0];
+  assert.equal(doc.status, 'in_review');
+  assert.equal(doc.analysis.facts.total, 3624.6, 'the analysis is on the document');
+  assert.equal(doc.analysis.facts.invoice_number, '1883');
+  assert.equal(doc.analysis.vendor_id, null, 'a forward from our own domain never matches a vendor');
+  assert.equal(posts.length, 1, 'the review card posted');
+  assert.match(posts[0].text, /Unknown vendor/);
+  if (r.flags.includes('missing_period')) assert.match(JSON.stringify(posts[0].opts.blocks), /assumed from the invoice date/);
+});
+
+test('an invoice with no readable total lands at $0 with missing_total, approve is blocked, Edit fixes the amount', async () => {
+  const supabase = db();
+  const posts = [];
+  const deps = { ...depsFor(supabase, { posts }), analyzeDeps: noAi() };
+  const text = 'JMJ Digital Marketing\nInvoice no.: 77\nInvoice date: 10/02/2026\nThanks for your business and see the attached statement.';
+  const r = await ingestInvoice({ ...FWD, file_name: 'statement.pdf', mime_type: 'application/pdf', file_b64: Buffer.from(text).toString('base64') }, deps);
+  assert.equal(r.httpStatus, 200, JSON.stringify(r));
+  assert.equal(r.success, true);
+  assert.ok(r.flags.includes('missing_total'));
+  const row = supabase.tables.marketing_expenses[0];
+  assert.equal(row.amount, 0);
+  assert.match(JSON.stringify(posts[0].opts.blocks), /not found on the invoice/);
+  const replies = [];
+  const updates = [];
+  const cdeps = { supabase, approvers: new Set(['U_BRAD']), reply: async (_u, b) => replies.push(b), updateSlackMessage: async (c, ts, t, o) => { updates.push({ c, ts, t, o }); return { ok: true }; }, signedLink: async () => null };
+  const click = (d, over) => parsedClick(d, r.document_id, { userId: 'U_BRAD', userName: 'brad', ...over });
+  const blocked = await handleMarketingInvoiceInteraction(click('approve'), cdeps);
+  assert.equal(blocked.action, 'blocked');
+  assert.match(replies.at(-1).text, /amount is \$0/);
+  const values = { amount: { mktinv_v_amount: { value: '$500.00' } } };
+  const edited = await handleMarketingInvoiceInteraction(click('edit_submit', { values }), cdeps);
+  assert.equal(edited.action, 'edited');
+  assert.equal(supabase.tables.marketing_expenses[0].amount, 500);
+  const again = await handleMarketingInvoiceInteraction(click('approve'), cdeps);
+  assert.equal(again.action, 'blocked');
+  assert.doesNotMatch(replies.at(-1).text, /amount/, 'only the vendor/markets block remains');
+});
+
+test('a deterministic failure answers 200 + success:false (reported once, never retried); a service outage stays a 500 and the retry re-runs', async () => {
+  // Deterministic: the database refuses the rows → 200, document failed, analysis kept.
+  const base = db();
+  const refusing = { ...base, from: (t) => (t !== 'marketing_expenses' ? base.from(t) : { insert: () => ({ select: async () => ({ data: null, error: { message: 'new row for relation "marketing_expenses" violates check constraint "marketing_expenses_status_check"' } }) }) }) };
+  const r = await ingestInvoice({ ...FWD, file_name: 'x.pdf', mime_type: 'application/pdf', file_b64: Buffer.from(JMJ_TEXT).toString('base64') }, { ...depsFor(refusing), analyzeDeps: noAi() });
+  assert.equal(r.httpStatus, 200);
+  assert.equal(r.success, false);
+  assert.equal(r.transient, false);
+  assert.match(r.error, /^expenses: /);
+  const doc = base.tables.marketing_invoice_documents[0];
+  assert.equal(doc.status, 'failed');
+  assert.equal(doc.analysis.facts.total, 3624.6, 'the analysis survives a refused insert');
+
+  // Transient: the extract service is down → 500 (n8n retries); the retry is not a duplicate and succeeds.
+  const supabase = db();
+  const down = { ...depsFor(supabase), analyzeDeps: noAi(), extract: async () => { throw new Error('extract failed (503): service unavailable'); } };
+  const r1 = await ingestInvoice({ ...FWD, file_name: 'y.pdf', mime_type: 'application/pdf', file_b64: Buffer.from(JMJ_TEXT).toString('base64') }, down);
+  assert.equal(r1.httpStatus, 500);
+  assert.equal(r1.transient, true);
+  assert.equal(supabase.tables.marketing_invoice_documents[0].status, 'failed');
+  const r2 = await ingestInvoice({ ...FWD, file_name: 'y.pdf', mime_type: 'application/pdf', file_b64: Buffer.from(JMJ_TEXT).toString('base64') }, { ...depsFor(supabase), analyzeDeps: noAi() });
+  assert.equal(r2.httpStatus, 200);
+  assert.equal(r2.success, true);
+  assert.equal(r2.duplicate, false);
+  assert.equal(supabase.tables.marketing_invoice_documents.length, 1, 'the retry reuses the same document row');
+  assert.equal(supabase.tables.marketing_invoice_documents[0].status, 'in_review');
+});

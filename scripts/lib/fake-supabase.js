@@ -9,6 +9,24 @@
  */
 import { randomUUID } from 'node:crypto';
 
+/** NOT NULL columns mirrored from the migrations, for the tables whose inserts the ledger tests exercise. */
+export const NOT_NULL = Object.freeze({
+  marketing_expenses: ['amount', 'period_start', 'period_end', 'lp_sub_sources', 'eligible_markets', 'cost_type'],
+  marketing_invoice_documents: ['sha256'],
+  marketing_invoice_skips: ['sha256', 'reason'],
+});
+
+function notNullViolation(table, rows) {
+  const cols = NOT_NULL[table];
+  if (!cols) return null;
+  for (const r of rows) {
+    for (const c of cols) {
+      if (r[c] === null || r[c] === undefined) return `null value in column "${c}" of relation "${table}" violates not-null constraint`;
+    }
+  }
+  return null;
+}
+
 export function fakeSupabase(seed = {}, { rpc = {} } = {}) {
   const tables = {};
   for (const [name, rows] of Object.entries(seed)) tables[name] = rows.map((r) => ({ ...r }));
@@ -29,6 +47,14 @@ export function fakeSupabase(seed = {}, { rpc = {} } = {}) {
       data = out.map((r) => ({ ...r }));
     } else if (q.op === 'insert') {
       const list = (Array.isArray(q.payload) ? q.payload : [q.payload]).map((r) => ({ id: randomUUID(), created_at: new Date().toISOString(), ...r }));
+      // 2026-10-13: the real database refused amount NULL on marketing_expenses
+      // and this fake took it, so the tests were green while production was
+      // not. The NOT NULL columns that bit are enforced here, the same way.
+      const violated = notNullViolation(q.table, list);
+      if (violated) {
+        calls.push({ table: q.table, op: q.op, payload: q.payload, count: 0, error: violated });
+        return { data: null, error: { message: violated, code: '23502' } };
+      }
       rows.push(...list);
       data = list.map((r) => ({ ...r }));
     } else if (q.op === 'upsert') {

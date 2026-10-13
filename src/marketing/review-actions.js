@@ -94,7 +94,7 @@ export async function loadReviewContext(documentId, { supabase = supabaseDefault
 export async function previewRows(rows, deps) {
   const out = [];
   for (const r of rows) {
-    if (!(r.eligible_markets || []).length || !r.period_start || !r.period_end || r.amount == null) continue;
+    if (!(r.eligible_markets || []).length || !r.period_start || !r.period_end || r.amount == null || Number(r.amount) === 0) continue;
     try { out.push(...(await previewAllocation(r, deps))); } catch (err) { console.warn(`${LOG} preview ${r.id}: ${err.message}`); }
   }
   return out;
@@ -212,6 +212,9 @@ export async function handleMarketingInvoiceInteraction(parsed, deps = {}) {
     if (!(r.eligible_markets || []).length) blockers.push(`line ${r.line_no}: no markets (vendor has none on file) — Edit first`);
     if (!r.period_start || !r.period_end) blockers.push(`line ${r.line_no}: no billing period — Edit first`);
     if (r.amount == null) blockers.push(`line ${r.line_no}: no amount — Edit first`);
+    // 2026-10-13: a total the extraction could not read is stored as 0 with the
+    // missing_total flag (the column is NOT NULL); nobody approves $0.
+    else if (Number(r.amount) === 0) blockers.push(`line ${r.line_no}: amount is $0 (not found on the invoice) — Edit first`);
     if (!(r.lp_sub_sources || []).length) blockers.push(`line ${r.line_no}: no LP sub-source — Edit first`);
   }
   if (blockers.length) {
