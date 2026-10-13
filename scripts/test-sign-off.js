@@ -279,3 +279,28 @@ test('"you just said that" with no times: the decision-maker question goes alone
   assert.equal(p.qualify_item, 'decision_makers');
   assert.equal(p.ask_contact, false);
 });
+
+test('an evening asked for before the gate questions is honored once the decision maker is answered', () => {
+  // 2026-10-13 bot gate (book_it_evening_spouse, both bots): "Can someone come
+  // out in the evening?" … "Just me." got tomorrow at 2 PM or Thursday at 10 AM.
+  const ALL = [
+    { iso: '2026-10-14T14:00:00-04:00', day: 'Wed, Oct 14', rel: 'tomorrow', time: '2:00 PM' },
+    { iso: '2026-10-14T18:00:00-04:00', day: 'Wed, Oct 14', rel: 'tomorrow', time: '6:00 PM' },
+    { iso: '2026-10-15T10:00:00-04:00', day: 'Thu, Oct 15', time: '10:00 AM' },
+    { iso: '2026-10-15T18:00:00-04:00', day: 'Thu, Oct 15', time: '6:00 PM' },
+  ];
+  const conv = T(
+    ['i', 'I need new windows. Can someone come out in the evening?'],
+    ['o', 'We can definitely help with that. We do evening appointments. How many windows and doors are you looking to get a quote on?'],
+    ['i', 'About 10 windows.'],
+    ['o', 'Thanks for that. Is anyone else part of the decision on this, like a spouse or partner?'],
+  );
+  // The lead's "Just me." already allows a booking (the discipline read).
+  const discipline = { booking: { allowed: true, reason: 'lead_answered_decision_maker_ask' }, decision_makers: { status: 'sole' } };
+  const p = planNepqTurn({ channel: 'livechat', nowMs: OPEN_MS, slots: [ALL[0], ALL[2]], allSlots: ALL, tzLabel: 'ET', conversation: conv, trigger: 'Just me.', discipline });
+  assert.equal(p.step, 'offer_slots');
+  assert.deepEqual(p.slots_to_offer.map(s => s.time), ['6:00 PM', '6:00 PM']);
+  // A time named in the answer itself still wins.
+  const named = planNepqTurn({ channel: 'livechat', nowMs: OPEN_MS, slots: [ALL[0], ALL[2]], allSlots: ALL, tzLabel: 'ET', conversation: conv, trigger: 'Just me. Thursday morning works', discipline });
+  assert.ok(named.slots_to_offer.some(s => s.time === '10:00 AM'), JSON.stringify(named.slots_to_offer));
+});

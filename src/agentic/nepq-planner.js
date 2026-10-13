@@ -1547,10 +1547,19 @@ function openingsGate(args) {
   // Never over a held time's own collect ("will anyone else be part of the
   // decision?" after the hold is the collect's question, not this gate's).
   const resumable = !['offer_slots', 'collect', 'confirm', 'sign_off', 'close'].includes(plan.step) && !plan.held_slot && plan.required_move !== 'close';
-  if (isGateAsk(lastOut) && resumable && objectionOk && !isLeadQuestion(trigger)) {
+  // A plain offer the answer earned on its own ("Just me." settles the
+  // decision makers, so the core plan books) still loses a day or time of day
+  // asked for before the gate (2026-10-13 bot gate, book_it_evening_spouse:
+  // "Can someone come out in the evening?" … "Just me." got 2 PM and 10 AM).
+  const plainOffer = plan.step === 'offer_slots' && !plan.day_preference && !plan.held_slot && !DAY_OR_TIME_RX.test(trigger);
+  if (isGateAsk(lastOut) && (resumable || plainOffer) && objectionOk && !isLeadQuestion(trigger)) {
     const resumed = resumeBeforeGate(args, turns);
-    if (!resumed) return plan;
-    plan = resumed;
+    if (resumable) {
+      if (!resumed) return plan;
+      plan = resumed;
+    } else if (resumed?.day_preference) {
+      plan = resumed;
+    }
   }
   if (plan.step !== 'offer_slots') return plan;
   // Times already on the table are never interrupted ("you just said that"
