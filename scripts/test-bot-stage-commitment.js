@@ -248,3 +248,53 @@ test('a yes to the Status Frame is not a yes to a visit', () => {
   const p = plan(convo, 'sure', { channel: 'livechat', stage: { stage: 'connection', facts: QUALIFIED } });
   assert.notEqual(p.step, 'offer_slots');
 });
+
+// ── 2026-10-13: fixes from the first full live-mode bot gate ──────────────
+
+test('a third money ask hands off to a person, even when our quote line was model-worded (live eval)', () => {
+  const convo = thread(
+    ['i', 'Hi, I would like to get a quote on 12 windows and 2 sliding glass doors.'],
+    ['o', 'We can definitely help with that. To get you the right fit, are you looking to replace all of them?'],
+    ['i', 'I just want a good price.'],
+    ['o', "Every home is different, so a number now would just be a guess. What's prompting you to look at replacing them right now?"],
+    ['i', 'you just said that.'],
+    ['o', 'Got it. To make sure we can help, do you own the home, or are you renting?'],
+  );
+  const p = plan(convo, 'I just said I need new windows. I want a quote. how much?', { stage: { stage: 'qualifying', facts: {} }, stageLive: true, channel: 'livechat' });
+  assert.equal(p.handoff?.reason, 'price_insist');
+});
+
+test('the qualifying question never rides with the price play\'s contact ask (one question)', () => {
+  const convo = thread(['i', 'How much for 12 windows?'], ['o', "Every home is different, so a number now would just be a guess. What's prompting you to look at windows right now?"]);
+  const p = plan(convo, 'Just give me a number', { stage: { stage: 'objection:price', facts: {} }, stageLive: true, channel: 'livechat', slots: [] });
+  assert.equal(p.step, 'qualify');
+  assert.equal(p.ask_contact, false);
+  assert.equal((p.fixed_line.match(/\?/g) || []).length, 1);
+  assert.doesNotMatch(p.fixed_line, /happy to set that up/i);
+});
+
+test('"let me think about it" while qualifying is open: what they want to think over, not ownership', () => {
+  const convo = thread(['i', 'Your windows sound good'], ['o', "What's going on with your current windows that got you looking?"]);
+  const p = plan(convo, 'Let me think about it', { stage: { stage: 'connection', facts: {} }, stageLive: true });
+  assert.equal(p.fixed_line, P.LINES.think_no_times);
+  assert.equal(p.slots_to_offer.length, 0);
+  assert.doesNotMatch(p.fixed_line, /own the home|homeowner/i);
+  // Qualified: the think play still offers its two times.
+  const q = plan(convo, 'Let me think about it', { stage: { stage: 'connection', facts: QUALIFIED }, stageLive: true });
+  assert.equal(q.slots_to_offer.length, 2);
+});
+
+test('the model\'s own wording of "how would you decide" is read back, so the criteria reply reaches the visit', () => {
+  const convo = thread(
+    ['i', 'We already went with another company for our windows'],
+    ['o', "That's good to know, and maybe nothing would've changed that anyway. If you ever compared us side by side and the prices landed close, what would actually decide it for you?"],
+  );
+  const p = plan(convo, 'Probably the warranty and how fast they install', { stage: { stage: 'objection:competitor', facts: {} }, stageLive: true });
+  assert.notEqual(p.required_move, 'probe');
+  assert.equal(p.step, 'bridge');
+});
+
+test('an address ask is never deleted as a zip re-ask (the SMS hold that stopped)', () => {
+  assert.equal(P.asksForKnown("What's the street address for the visit, including the zip code?", { zip: '33908' }), false);
+  assert.equal(P.asksForKnown("What's the zip code at the home?", { zip: '33908' }), true);
+});
