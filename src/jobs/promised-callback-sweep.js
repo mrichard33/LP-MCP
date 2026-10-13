@@ -25,6 +25,7 @@ import {
   promisedCallbackMode, keptVerdict, sweepDecision, formatExpiredCard, NEEDS_REVIEW_TAG,
 } from '../agentic/promised-callbacks.js';
 import { SIM_CONTACT_PREFIX } from '../services/promised-callbacks-io.js';
+import { mayMessage } from '../services/may-message.js';
 
 export const JOB_ID = 'promised-callback-sweep';
 const INTERVAL_MS = 15 * 60 * 1000;
@@ -45,11 +46,32 @@ async function withDefaults(deps) {
     d.filterNew ||= ap.filterNew;
     d.recordPosted ||= ap.recordPosted;
   }
+  if (!d.readTags) d.readTags = (contactId) => readTagSnapshot(d, contactId);
   if (!d.addTag) {
     const { executeAddTag } = await import('../actions/handlers/tags.js');
     d.addTag = (contactId, tag) => executeAddTag({ target_id: contactId, action_payload: { tag }, rule_applied: 'PROMISED_CALLBACK_EXPIRED' });
   }
   return d;
+}
+
+// The contact's tags from the HL tag snapshot, or null when unreadable.
+async function readTagSnapshot(d, contactId) {
+  const { data, error } = await d.supabase.from('contact_tag_snapshot')
+    .select('tags').eq('ghl_contact_id', contactId).maybeSingle();
+  if (error || !data || !Array.isArray(data.tags)) return null;
+  return data.tags;
+}
+
+/**
+ * 2026-10-13 (Erica Hilts): a lead who opted out after we promised a call is
+ * owed no call. Her row would have expired into a "PROMISED CALL NOT KEPT"
+ * card asking a rep to call someone who texted STOP. A phone opt-out (the
+ * send gate's consent class: the DNC family, suppress:dnc-reply) closes the
+ * row as cancelled. Unreadable tags change nothing. Pure.
+ */
+export function optedOutOfCalls(tags) {
+  if (!Array.isArray(tags)) return false;
+  return mayMessage({ tags, channel: 'phone', purpose: 'outreach' }).reason === 'consent_stop';
 }
 
 async function readFive9Calls(d, phone, sinceIso) {
@@ -162,6 +184,14 @@ export async function runPromisedCallbackSweep(deps = {}) {
         .eq('id', promise.id).eq('status', 'open');
       summary.kept += 1;
       d.log(`[PromisedCallbackSweep] #${promise.id} ${promise.ghl_contact_id} kept (${decision.evidence?.source})`);
+      continue;
+    }
+    // Not kept and the lead has opted out since: cancelled, never a card.
+    let tags = null;
+    try { tags = await d.readTags(promise.ghl_contact_id); } catch { tags = null; }
+    if (optedOutOfCalls(tags)) {
+      await cancelRow(d, promise, 'lead_opted_out', stamp);
+      summary.cancelled += 1;
       continue;
     }
     if (decision.action === 'expired') {

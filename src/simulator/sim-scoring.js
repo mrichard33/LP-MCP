@@ -27,7 +27,7 @@ import { jobScopeFromThread } from '../agentic/job-scope.js';
 
 // 2026-10-12 (handoff PR 7): the scenario checks have their own version. A run
 // scored with new checks is a new baseline, never "worse" than an old one.
-export const SCORING_VERSION = '2026-10-13.1';
+export const SCORING_VERSION = '2026-10-13.2';
 
 const CLOCK_RX = /\b\d{1,2}(?::\d{2})?\s*(?:AM|PM)\b/gi;
 const clockCount = (text) => (String(text || '').match(CLOCK_RX) || []).length;
@@ -104,6 +104,20 @@ export const SCENARIO_EXPECTATIONS = Object.freeze({
   landlord: (r) => declinedNotBooked(r, /rental/i, 'rental'),
   commercial: (r) => declinedNotBooked(r, /commercial/i, 'commercial'),
   one_window: (r) => declinedNotBooked(r, /minimum/i, 'below_minimum'),
+  // 2026-10-13 (Erica Hilts; the owner's price ruling and the reviewer's rule):
+  // the price ask gets a question and no times; each goodbye gets a goodbye
+  // (no question, no time), and nothing promises or files a call.
+  price_then_goodbye: (r) => {
+    const out = [];
+    const price = replies(r.transcript?.[1]).join(' ');
+    if (clockCount(price)) out.push({ code: 'times_on_first_price_ask', detail: price, turn: 2 });
+    for (const t of (r.transcript || []).slice(2)) {
+      const text = replies(t).join(' ');
+      if (text.includes('?') || clockCount(text)) out.push({ code: 'times_after_sign_off', detail: text, turn: t.turn });
+    }
+    if (did(r, /callback|hand_off|would_record_promised_call/)) out.push({ code: 'call_after_goodbye', detail: 'a call was filed or promised' });
+    return out;
+  },
   slider_only: (r) => (bookedOrHeld(r) ? [] : [{ code: 'yes_without_booking', detail: 'a sliding glass door (meets the minimum) ended with nothing booked or held' }]),
   // Live: the competitor reaches times (disarm → criteria → bridge → times).
   competitor: (r) => (r.lead_stage_mode === 'live' && !allReplies(r).some(x => clockCount(x.text) >= 2)
@@ -280,7 +294,8 @@ export function scoreResult(result) {
         allowMultiAsk: /cancel/.test(String(result.scenario || '')),
         // A post-demo lead's one goal is the call (rehash, 2026-10-01/10-11):
         // offering it is the plan, not an unasked offer.
-        callOfferOk: t.nepq?.post_demo === true,
+        // The third price ask's call offer is the plan too (the owner, 2026-10-13).
+        callOfferOk: t.nepq?.post_demo === true || t.nepq?.call_offer_ok === true,
       });
       for (const v of check.violations) failures.push({ code: v.code, detail: v.detail, turn: t.turn });
       conversation.push({ direction: 'outbound', text });

@@ -751,6 +751,29 @@ re-asks for a name/phone/email/zip we have, and extra questions. `NEPQ_BACKBONE_
 awaited `book_appointment` row and confirms only on `appointment_booked`; GHL still refusing is the one case
 handed to a person.
 
+**A goodbye ends the turn; price is questions first; the decision makers before the first times (Erica Hilts,
+2026-10-13).** Her "… Have a good day." read as a third price ask and got a promised call (a Five9 Callback Request);
+"I can call back when I have more time. Ty" got "I'll check back next week. Enjoy." plus the same two visit times a
+third time; she texted STOP. Now:
+- `isLeadSignOff` (`src/agentic/sign-off.js`: a deferral anywhere, or a message ending on a goodbye; never with a "?"
+  or a time) plans `sign_off` (`LINES.sign_off`) before every price, objection and offer step: no question, no time,
+  nothing filed, no promise recorded (`shouldRecordPromise`), and no "I'll check back" when THEY said they would reach
+  out (`leadWillReachOut`). `enforceSignOff` is the last pass on both bots in every mode; `appendReferenceAsk` never
+  glues an ask after a sign-off line (a bare "Enjoy." counts). checkReply: `times_after_sign_off`, `repeat_slot_offer`.
+- Our hand-off or goodbye closes an open offer (`OFFER_CLOSED_RX` in `lastOfferOut`), the same two times never go out
+  three times in a row, and a layer3 script saying "NO times" reaches the planner (`directiveNoTimes`).
+- **Price (the owner's ruling, supersedes Mark's 2026-10-02 quote → times → a person):** 1st ask `LINES.price_scope`
+  (what drives the price + the count question, or style and size when the count is known), 2nd `price_visit_offer`
+  (the free measure as a yes/no question, no times; BRIDGE_RX reads it, so a yes gets the times), 3rd
+  `price_call_offer` (a call OFFERED as a question; Five9 only after a yes, `CALL_OFFER_RX`), after that `price_rest`.
+  There is no `price_insist` hand-off any more.
+- **Decision makers (the owner's ruling, supersedes "after the hold"):** `openingsGate` asks, before the FIRST time
+  offer and once each, the count and then "Is anyone else part of the decision?"; any answer resumes the set-aside
+  plan (`resumeBeforeGate`) and rides as `plan.dm_known`, so the collect never asks again. A "No" to it is not a no.
+  Not for a lead past its demo; stage-live mode keeps `gateForStage`.
+- An opt-out (the send gate's consent class) cancels an open `promised_callbacks` row (`lead_opted_out`, no card) and
+  refuses the Five9 push (`requeue_blocked_opt_out`, no DNC-lift review). stop-bot alone is not an opt-out.
+
 **Earn the ask (Mark, 2026-10-03).** The bridge to the free visit needs the problem in the lead's own words AND an
 answer to one "why it matters / what if you wait" question, or the lead volunteering it ("getting worse", "the bills",
 "before the next storm") — `discoveryEarned` in `nepq-planner.js`. "What's got you looking?" and "how long?" ask for the
@@ -841,7 +864,8 @@ silently) and the campaign is PREVIEW mode with a 7-hour gap filter after any ea
   (`checkAgainstReference` → `promises_a_call`): the SMS service hand-off said "we'll have someone call you … shortly" at night.
 
 **Book in the conversation, unconfirmed, on the right calendar (Mark, 2026-10-02).** Every bot booking is
-status `new` (the handler forces it). **Ask about decision makers ONCE, then book** (supersedes 2026-09-18):
+status `new` (the handler forces it). **Ask about decision makers ONCE, then book** (supersedes 2026-09-18; since
+2026-10-13 asked before the first times, above):
 the text bot booked 12 visits 08-03..09-07 and none after the 09-18 "all decision makers attend" block, and
 a lead who asked for "tomorrow" three times gave up. `decision_maker_unresolved` is no longer reported; only
 "my wife can't make that time" moves the time. **Every booking carries the visit address** (`payload.address` →
@@ -893,7 +917,7 @@ The simulator run (2026-10-02) added: `src/agentic/booking-claim.js` rewrites an
 "you're all set / booked / on the schedule" a model reply makes without a booking (live chat always; SMS
 when NEPQ is live), `restoreQuestionMark` puts back a "?" the model wrote as "." (every one-question check
 counts "?"), and a day + time the lead types with no offer on the table gets two real times near it.
-**A quote or price ask (Mark, 2026-10-02):** first one short line and the NEPQ connection question, no times
+**A quote or price ask (Mark, 2026-10-02; superseded 2026-10-13, see "A goodbye ends the turn"):** first one short line and the NEPQ connection question, no times
 (`LINES.quote_first`); asked again, "every home is different" + two real times; a third time a person; "you just said that" ends the
 questions with the times. Live chat often gets NO conversation id (GHL's I.LVI sends none and a new chat is
 not searchable yet: 44 of 68 turns in two days), so the thread falls back to our own `agent_actions` rows

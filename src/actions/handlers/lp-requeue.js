@@ -49,6 +49,7 @@
  * priority GroupMe — a promised call is never silently dropped.
  */
 
+import { mayMessage } from '../../services/may-message.js';
 import supabase from '../../supabase.js';
 import { addLead as lpAddLead, extractInboundLeadId, getInboundLeadInfo } from '../../lp-client.js';
 import { sendGroupMeMessage } from '../../groupme.js';
@@ -218,6 +219,17 @@ export async function executeLpCallbackRequeue(action) {
     throw new Error(`lp_callback_requeue: GHL contact fetch failed for ${contactId}: ${err.message}`);
   }
   if (!ghlContact) throw new Error(`lp_callback_requeue: GHL contact ${contactId} not found`);
+
+  // ── An opted-out lead is never pushed (2026-10-13, Erica Hilts) ──
+  // She texted STOP a few minutes after a promised call was queued. A phone
+  // opt-out (the send gate's consent class: the DNC family, suppress:dnc-reply)
+  // means nobody calls: no Five9 push and no DNC-lift review, which is for a
+  // lead who ASKED to be called back while on Five9's DNC list, never for a STOP.
+  const optOut = mayMessage({ tags: ghlContact.tags || [], channel: 'phone', purpose: 'outreach' });
+  if (optOut.reason === 'consent_stop') {
+    console.log(`[LP-REQUEUE] ⏭️ Skip ${contactId}: opted out (${optOut.blockedBy}) — no Five9 push`);
+    return { action: 'requeue_blocked_opt_out', requeued: false, contact_id: contactId, blocked_by: optOut.blockedBy };
+  }
 
   // ── Resolve LP state: prospect + existing leads ──────────────────
   // Supabase lp_leads is the local mirror (User1/HLCID carries the GHL

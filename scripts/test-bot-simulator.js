@@ -50,8 +50,10 @@ test('live chat: every turn and reply; a price move whose draft misses its job s
   const { calls, deps } = fakeProduction();
   const r = await simulateLiveChat(resolveScenario({ scenario: 'price' }), { nepqMode: 'live', productionDeps: deps });
   assert.equal(r.transcript.length, 2);
-  assert.equal(r.transcript[0].bot[0], "Happy to help with the 12 windows. What's got you looking into them now?");
-  assert.match(r.transcript[1].bot[0], /^Fair question\. Every home is different/);
+  // 2026-10-13 (the owner): the first ask gets a scoping question (the count is
+  // known, so the style and size), the second the free measure as a question.
+  assert.match(r.transcript[0].bot[0], /^Fair question\. Every home is different: the price depends on/);
+  assert.match(r.transcript[1].bot[0], /every home is different, (?:so )?an exact number comes from measuring/i);
   assert.ok(calls.llm > 0, 'the model is asked');
 });
 

@@ -312,15 +312,21 @@ test('no stored stage: a yes to the bridge asks the count once, then the answer 
   assert.equal(first.qualify_item, 'openings');
   assert.equal(first.booking.allowed, false);
   assert.match(first.fixed_line, /How many windows and doors/);
+  // 2026-10-13 (the owner): then the decision makers, once; any answer gets the times.
   const answered = P.planNepqTurn({ channel: 'sms', trigger: 'About 12', conversation: thread(['o', bridge], ['i', 'Yes please'], ['o', ask], ['i', 'About 12']), slots: SL, tzLabel: 'ET' });
-  assert.equal(answered.step, 'offer_slots');
-  assert.match(answered.fixed_line, /I have Tue, Oct 6 at 10:00 AM ET or Wed, Oct 7 at 2:00 PM ET/);
+  assert.equal(answered.qualify_item, 'decision_makers');
+  assert.equal((answered.slots_to_offer || []).length, 0);
+  const dmAsk = answered.fixed_line;
+  const timed = P.planNepqTurn({ channel: 'sms', trigger: 'Just me', conversation: thread(['o', bridge], ['i', 'Yes please'], ['o', ask], ['i', 'About 12'], ['o', dmAsk], ['i', 'Just me']), slots: SL, tzLabel: 'ET' });
+  assert.equal(timed.step, 'offer_slots');
+  assert.equal(timed.dm_known, 'Solo Owner');
+  assert.match(timed.fixed_line, /I have Tue, Oct 6 at 10:00 AM ET or Wed, Oct 7 at 2:00 PM ET/);
   // "1" is under the minimum: no times, the guard asks the friendly check.
   const one = P.planNepqTurn({ channel: 'sms', trigger: '1', conversation: thread(['o', bridge], ['i', 'Yes please'], ['o', ask], ['i', '1']), slots: SL, tzLabel: 'ET' });
   assert.equal(one.step, 'not_eligible');
   assert.equal(one.booking.allowed, false);
   // Known count (a Window Count on the contact): times straight away.
-  const known = P.planNepqTurn({ channel: 'sms', trigger: 'Yes please', conversation: thread(['o', bridge], ['i', 'Yes please']), slots: SL, tzLabel: 'ET', knownOpenings: true });
+  const known = P.planNepqTurn({ channel: 'sms', trigger: 'Yes please', conversation: thread(['o', bridge], ['i', 'Yes please']), slots: SL, tzLabel: 'ET', knownOpenings: true, knownDecisionMakers: true });
   assert.equal(known.step, 'offer_slots');
 });
 

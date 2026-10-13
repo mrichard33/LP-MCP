@@ -251,7 +251,9 @@ test('a yes to the Status Frame is not a yes to a visit', () => {
 
 // ── 2026-10-13: fixes from the first full live-mode bot gate ──────────────
 
-test('a third money ask hands off to a person, even when our quote line was model-worded (live eval)', () => {
+// 2026-10-13 (the owner, after the Erica Hilts chat): the third ask OFFERS a
+// call as a question; nothing is filed until a yes.
+test('a third money ask offers a call, even when our quote line was model-worded (live eval)', () => {
   const convo = thread(
     ['i', 'Hi, I would like to get a quote on 12 windows and 2 sliding glass doors.'],
     ['o', 'We can definitely help with that. To get you the right fit, are you looking to replace all of them?'],
@@ -261,7 +263,9 @@ test('a third money ask hands off to a person, even when our quote line was mode
     ['o', 'Got it. To make sure we can help, do you own the home, or are you renting?'],
   );
   const p = plan(convo, 'I just said I need new windows. I want a quote. how much?', { stage: { stage: 'qualifying', facts: {} }, stageLive: true, channel: 'livechat' });
-  assert.equal(p.handoff?.reason, 'price_insist');
+  assert.equal(p.handoff, null);
+  assert.equal(p.step, 'price_call_offer');
+  assert.equal(p.fixed_line, P.LINES.price_call_offer);
 });
 
 test('the qualifying question never rides with the price play\'s contact ask (one question)', () => {

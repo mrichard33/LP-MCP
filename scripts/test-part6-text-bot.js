@@ -67,7 +67,8 @@ test('approved lines are never trimmed or reordered (snapshot)', () => {
   const slots = [mk(3, 10), mk(4, 18)].map(s => ({ ...s, tz: 'ET' }));
   const fixed = [
     LINES.status_frame, LINES.price_play, LINES.spouse_1, LINES.spouse_2_slots(slots), LINES.shopping,
-    LINES.think_slots(slots), LINES.think_no_slots, LINES.ask_day, LINES.reveal, LINES.price_again_slots(slots),
+    LINES.think_slots(slots), LINES.think_no_slots, LINES.ask_day, LINES.reveal, LINES.price_scope(false), LINES.price_scope(true),
+    LINES.price_visit_offer, LINES.price_call_offer, LINES.price_rest, LINES.sign_off('Erica'),
     LINES.repeat_slots(slots), LINES.offer_slots(slots, 0), LINES.offer_slots(slots, 1), LINES.which(slots),
     ...ALT_LINES.ask_day, ...Object.values(LINES.handoff),
   ];
@@ -87,7 +88,7 @@ test('enforceNepqPlan logs multi_ask_trimmed and the re-ask after an answer drop
   const conv = [T('inbound', 'my windows are drafty'), T('outbound', 'Drafty? How long has that been going on?'), T('inbound', 'a few years'),
     T('outbound', 'Based on what you told me, this could work for you, since you mentioned the drafts. The next step would be a free visit at your home. Would that help?'),
     T('inbound', 'Ok, what do you need? Also is that free?')];
-  const plan = planNepqTurn({ knownOpenings: true, channel: 'livechat', trigger: 'Ok, what do you need? Also is that free?', conversation: conv });
+  const plan = planNepqTurn({ knownOpenings: true, knownDecisionMakers: true, channel: 'livechat', trigger: 'Ok, what do you need? Also is that free?', conversation: conv });
   const out = enforceNepqPlan("Yes, it's completely free. We just need your first name, best phone number, and email so we can get everything set up. No problem. What day works best for you?", plan);
   assert.equal(out.text, "Yes, it's completely free. What day works best for you?");
   assert.ok(out.changes.includes('multi_ask_trimmed'));
@@ -97,9 +98,9 @@ test('enforceNepqPlan logs multi_ask_trimmed and the re-ask after an answer drop
 
 test('"Usually on Wednesdays" → two real Wednesday times, no detail ask, nothing "blocked"', () => {
   const conv = [T('outbound', "Yes, it's completely free. What day works best for you?"), T('inbound', 'Usually on Wednesdays')];
-  const pending = planNepqTurn({ knownOpenings: true, channel: 'livechat', trigger: 'Usually on Wednesdays', conversation: conv, nowMs: NOW });
+  const pending = planNepqTurn({ knownOpenings: true, knownDecisionMakers: true, channel: 'livechat', trigger: 'Usually on Wednesdays', conversation: conv, nowMs: NOW });
   assert.equal(pending.day_preference_pending, true, 'the caller loads the calendar');
-  const plan = planNepqTurn({ knownOpenings: true, channel: 'sms', trigger: 'Usually on Wednesdays', conversation: conv, slots: ALL.slice(0, 2), allSlots: ALL, tzLabel: 'ET', nowMs: NOW });
+  const plan = planNepqTurn({ knownOpenings: true, knownDecisionMakers: true, channel: 'sms', trigger: 'Usually on Wednesdays', conversation: conv, slots: ALL.slice(0, 2), allSlots: ALL, tzLabel: 'ET', nowMs: NOW });
   assert.equal(plan.required_move, 'offer_slots');
   assert.equal(plan.fixed_line, 'Wednesdays work. I have Wed, Oct 7 at 10:00 AM ET or Wed, Oct 7 at 6:00 PM ET. Which is better for you?');
   assert.ok(plan.slots_to_offer.every(s => s.dayOfWeek === 'Wednesday'));
@@ -120,7 +121,7 @@ test('weekends, mornings, after 5; none in two weeks → say so and offer the ne
 
 test('a preference matching an offered time is a pick, not a new offer', () => {
   const offer = `I have ${ALL[0].day} at ${ALL[0].time} ET or ${ALL[4].day} at ${ALL[4].time} ET. Which works better?`;
-  const plan = planNepqTurn({ knownOpenings: true, channel: 'sms', trigger: 'Saturday works', conversation: [T('outbound', offer), T('inbound', 'Saturday works')], slots: [ALL[0], ALL[4]], allSlots: ALL, tzLabel: 'ET', nowMs: NOW });
+  const plan = planNepqTurn({ knownOpenings: true, knownDecisionMakers: true, channel: 'sms', trigger: 'Saturday works', conversation: [T('outbound', offer), T('inbound', 'Saturday works')], slots: [ALL[0], ALL[4]], allSlots: ALL, tzLabel: 'ET', nowMs: NOW });
   assert.equal(plan.required_move, 'confirm');
 });
 
@@ -301,13 +302,13 @@ test('exactSlotFor: a typed time that is a real opening is the pick ("Fine lets 
   const two = [mk(3, 10), mk(3, 14)];
   assert.equal(exactSlotFor('Fine lets book for 2 PM', two)?.iso, two[1].iso);
   assert.equal(exactSlotFor('3 PM?', two), null);
-  const plan = planNepqTurn({ knownOpenings: true, channel: 'sms', trigger: 'Fine lets book Saturday for 2 PM', conversation: [T('outbound', 'Happy to help. What made you start looking?'), T('inbound', 'Fine lets book Saturday for 2 PM')], slots: two, tzLabel: 'ET', nowMs: NOW });
+  const plan = planNepqTurn({ knownOpenings: true, knownDecisionMakers: true, channel: 'sms', trigger: 'Fine lets book Saturday for 2 PM', conversation: [T('outbound', 'Happy to help. What made you start looking?'), T('inbound', 'Fine lets book Saturday for 2 PM')], slots: two, tzLabel: 'ET', nowMs: NOW });
   assert.equal(plan.required_move, 'confirm');
 });
 
 test('once times are offered, never back to the bridge', () => {
   const offer = `No problem at all. Want to grab a time now so you don't have to chase us down later? I have ${ALL[0].day} at ${ALL[0].time} ET or ${ALL[4].day} at ${ALL[4].time} ET.`;
-  const plan = planNepqTurn({ knownOpenings: true, channel: 'sms', trigger: 'Mark', conversation: [T('inbound', 'let me think about it'), T('outbound', offer), T('inbound', 'what does the visit involve?'), T('outbound', 'About an hour, we measure every opening.'), T('inbound', 'Mark')], slots: [ALL[0], ALL[4]], tzLabel: 'ET', nowMs: NOW });
+  const plan = planNepqTurn({ knownOpenings: true, knownDecisionMakers: true, channel: 'sms', trigger: 'Mark', conversation: [T('inbound', 'let me think about it'), T('outbound', offer), T('inbound', 'what does the visit involve?'), T('outbound', 'About an hour, we measure every opening.'), T('inbound', 'Mark')], slots: [ALL[0], ALL[4]], tzLabel: 'ET', nowMs: NOW });
   assert.notEqual(plan.required_move, 'bridge');
   assert.doesNotMatch(String(plan.fixed_line || ''), /Would that help\?/);
 });

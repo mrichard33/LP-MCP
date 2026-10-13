@@ -894,13 +894,15 @@ const M = (direction, body, minsAgo) => ({ direction, body, dateAdded: new Date(
 // Part 7 (Mark, 2026-10-02: "Each message should be custom"): the model is
 // always asked now. These stubs answer "Sure." to everything, which misses
 // the move's job twice, so the reference line ships as the backup.
-test('NEPQ live: a price ask after two price lines goes to a person; a draft that misses it gets the backup line', async () => {
+// 2026-10-13 (the owner, after the Erica Hilts chat): the third ask OFFERS a
+// call as a question; no hand-off, nothing filed until a yes.
+test('NEPQ live: a price ask after two price lines offers a call; a draft that misses it gets the backup line', async () => {
   const { lane, state } = nepqLane({ messages: [M('inbound', 'how much for 12 windows?', 5), M('outbound', 'Happy to get you a quote on the 12 windows. Exact pricing comes from a quick visit to measure, and you keep the written quote. I have Tue, Oct 6 at 10:00 AM ET or Wed, Oct 7 at 2:00 PM ET. Which works better?', 4), M('inbound', 'I just want a good price', 3), M('outbound', 'Totally fair. Every home is different, so any number I gave you now would be a guess. The visit gets you the exact number in writing. I have Tue, Oct 6 at 10:00 AM ET or Wed, Oct 7 at 2:00 PM ET. Which works better?', 2)] });
   await lane.processInbound(INBOUND('just give me a number'));
   assert.equal(state.llmCalls.length, 2, 'the draft, one re-write, then the backup');
-  assert.match(state.sends[0].message, /^Understood\. I'll have someone from our team call you to talk it through\./);
+  assert.equal(state.sends[0].message, 'Understood. It might help to talk it through with one of our specialists. Can we give you a quick call?');
   await new Promise(r => setImmediate(r));
-  assert.equal(state.handoffs[0].reason, 'price_insist');
+  assert.equal((state.handoffs || []).length, 0, 'nothing filed until a yes');
 });
 
 test('NEPQ live: "let me think about it" gets two REAL times (backup when the draft drops them)', async () => {
@@ -1074,6 +1076,17 @@ test('the answer to the count question gets the times the yes had earned (2026-1
     llm: () => ({ message: 'Great, thanks.' }),
   });
   await lane.processInbound(INBOUND('About 12'));
+  // 2026-10-13 (the owner): the decision makers, once, right before the times.
+  assert.match(state.sends[0].message, /Is anyone else part of the decision on this, like a spouse or partner\?$/);
+});
+
+test('the answer to the decision-maker question gets the times, and it is never asked again (2026-10-13)', async () => {
+  const bridge = 'Based on what you told me, this could work for you, since you mentioned the heat. The next step would be a visit at your home. Would that help?';
+  const { lane, state } = nepqLane({
+    messages: [M('outbound', bridge, 5), M('inbound', 'Yes please', 4), M('outbound', 'How many windows and doors are you looking to get a quote on?', 3), M('inbound', 'About 12', 2), M('outbound', 'Is anyone else part of the decision on this, like a spouse or partner?', 1)],
+    llm: () => ({ message: 'Great, thanks.' }),
+  });
+  await lane.processInbound(INBOUND('my husband'));
   assert.match(state.sends[0].message, /I have Tue, Oct 6 at 10:00 AM ET or Wed, Oct 7 at 2:00 PM ET\. Which works better\?$/);
 });
 
@@ -1125,6 +1138,7 @@ test('shadow model: a stronger model runs beside, is recorded, and is never sent
 
 // 2026-10-02 (5i59G): GHL sent no conversation id, so every turn ran with no
 // history and the same price line went out three times.
+// 2026-10-13 (the owner): the second ask is the free measure as a question.
 test('no conversation id: the thread comes from our own rows, and the second price ask moves on', async () => {
   const at = (mins) => new Date(Date.now() - mins * 60000).toISOString();
   const first = 'Happy to get you a quote on the 12 windows and 2 sliding glass doors. Exact pricing comes from a quick visit to measure, and you keep the written quote. I have Tue, Oct 6 at 10:00 AM ET or Wed, Oct 7 at 2:00 PM ET. Which works better?';
@@ -1135,7 +1149,8 @@ test('no conversation id: the thread comes from our own rows, and the second pri
   await lane.processInbound({ contactId: 'C1', messageId: 'm-good-price', body: 'I just want a good price.' });
   assert.equal(state.llmCalls.length, 2);
   // Worded differently from our last message (no closing question twice).
-  assert.match(state.sends[0].message, /^(?:Fair question|I hear you)\. (?:Since every|Every) home is different, (?:so )?(?:a|any) number now would (?:just )?be a guess\. I have Tue, Oct 6/);
+  assert.match(state.sends[0].message, /^(?:Totally fair|I hear you)\. (?:Since every|Every) home is different, (?:so )?an exact number comes from measuring\. The next step would be a free visit to measure\. Would that (?:be )?help/);
+  assert.doesNotMatch(state.sends[0].message, /\d{1,2}:\d{2} [AP]M/, 'no times on the second ask');
 });
 
 test('turnsFromRows: the visitor message and what was sent, oldest first', async () => {
