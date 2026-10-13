@@ -1572,6 +1572,10 @@ function openingsGate(args) {
   plan.offer_slots_pending = false;
   plan.day_preference_pending = false;
   plan.last_offer = null;
+  // One question (2026-10-13 bot gate, "you just said that" on chat): the
+  // repeat play with no times asks for a name with its offer, and the chat
+  // sent "Is anyone else part of the decision …? What's your first name?".
+  plan.ask_contact = false;
   const booking = { allowed: false, reason: `nepq:qualify_${item}` };
   if (answering) return Object.assign(plan, { step: 'qualify', required_move: 'answer', fixed_line: null, reask_line: ask, qualify_item: item, booking });
   return Object.assign(plan, {
