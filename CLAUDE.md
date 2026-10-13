@@ -388,6 +388,11 @@ every pass, 2 lost their phone to a newer form row with no visit. Now the job al
 today..+2 (`readLeadsByAppointment`), spends the Five9 lookups on adds first, soonest visit first (`lookupPriority`),
 and a row holding a visit wins its phone (`onePerPhone`). A killed inbound row never wins a phone, and a row LP checked
 out into a lead beats an inbound-only one (583074 lost its Thursday visit to in1 430305, a self-book killed "Duplicate").
+**One Confirmation add per visit (the user, 2026-10-13: "It should only be sent once.").** In the week before, 42
+visits went on "Conf - 2nd Day" two days out and on "Conf - Next Day" again the next day (the 2026-10-06 move).
+`confListForVisit` now keeps a visit on whichever Conf list it was already added to (done or in flight) for the SAME
+visit date (the add row's `appointment.date`); only a rebooked visit (a new date) gets a new add. A visit already on
+both lists still comes off "2nd Day" (`confMoveDue`). The new-lead backstop's double adds stopped on 2026-10-08.
 
 **The LP note is a 2–3 sentence rep brief (the user, 2026-10-05).** Prospect 462947 reached LP with 1,400
 characters: the address three times, "tomorrow" for the visit, a script with a blank ("this is [YOUR NAME]"), internal

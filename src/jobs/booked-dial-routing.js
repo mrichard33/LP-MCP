@@ -36,7 +36,7 @@ import { readInboundRows, readLeadsSince, readLeadsByAppointment, readSoldPhones
 import {
   routingMode, routingConfig, buildCandidate, onePerPhone, prefilter, decide, addState, addKey, removeKey,
   priorRemoveKeys, buildAddAction, buildRemovalAction, approvalExpired, RULE_KEY, lookupPriority,
-  failedAddCount, retryKey, moveKey, confMoveDue, formatAddFailedCard,
+  failedAddCount, retryKey, moveKey, confMoveDue, formatAddFailedCard, confListForVisit,
 } from '../booked-dial-routing.js';
 
 export const JOB_ID = 'booked-dial-routing';
@@ -86,9 +86,14 @@ async function readBookedInbound(d, nowMs, cfg) {
   return { rows: raw.map(normalizeInboundRow).filter((r) => r.apptDate), source: 'lp_live' };
 }
 
+/** The visit date a Conf add was for (payload.appointment.date), or null. */
+function apptOf(payload) {
+  try { return JSON.parse(payload)?.appointment?.date || null; } catch { return null; }
+}
+
 /**
  * Confirmation adds already queued for these phones, by ANY rule (ours or the
- * new-lead dial backstop's), in the last 7 days. phone → [{ list, status }].
+ * new-lead dial backstop's), in the last 7 days. phone → [{ list, status, appt }].
  */
 async function readConfAdds(runSQL, confLists, nowMs) {
   const rows = await runSQL(`
@@ -105,7 +110,7 @@ async function readConfAdds(runSQL, confLists, nowMs) {
     const phones = new Set((String(r.payload ?? '').match(/\d{10,11}/g) || []).map(phone10).filter(Boolean));
     for (const p of phones) {
       if (!byPhone.has(p)) byPhone.set(p, []);
-      byPhone.get(p).push({ id: r.id, list: r.target_id, status: String(r.status || '') });
+      byPhone.get(p).push({ id: r.id, list: r.target_id, status: String(r.status || ''), appt: apptOf(r.payload) });
     }
   }
   return byPhone;
@@ -285,14 +290,23 @@ export async function runBookedDialRouting({ env = process.env, nowMs = Date.now
   let lookups = 0;
   const addFailed = [];
   // Adds before removal re-checks, soonest visit first (lookupPriority).
+  const needsConfAdd = ({ c, pre }) => {
+    const list = confListForVisit(adds.get(c.phone), c.apptDate, pre.route, cfg);
+    return Boolean(list) && addState(adds.get(c.phone), list) !== 'done';
+  };
   live.sort((a, b) => lookupPriority(
-    { needsAdd: Boolean(a.pre.route.addList) && addState(adds.get(a.c.phone), a.pre.route.addList) !== 'done', c: a.c },
-    { needsAdd: Boolean(b.pre.route.addList) && addState(adds.get(b.c.phone), b.pre.route.addList) !== 'done', c: b.c },
+    { needsAdd: needsConfAdd(a), c: a.c },
+    { needsAdd: needsConfAdd(b), c: b.c },
   ));
-  for (const { c, pre } of live) {
-    const list = pre.route.addList;
-    const removedBefore = priorRemoveKeys(c.phone, c.apptDate, nowMs, cfg.readdLookbackDays).some((k) => marks.has(k));
+  for (const item of live) {
+    const { c } = item;
     const addRows = adds.get(c.phone);
+    // One Confirmation add per visit (2026-10-13): a visit already on the other
+    // Conf list for the same date is treated as added there.
+    const list = confListForVisit(addRows, c.apptDate, item.pre.route, cfg);
+    const pre = list === item.pre.route.addList ? item.pre
+      : { ...item.pre, route: { ...item.pre.route, addList: list, why: 'conf_once_per_visit' } };
+    const removedBefore = priorRemoveKeys(c.phone, c.apptDate, nowMs, cfg.readdLookbackDays).some((k) => marks.has(k));
     // The Five9 record is read only when a decision needs it (2026-10-06): to
     // skip an add the record already has (an add still to do) or to see LP's
     // re-add (a removal on a later day). A removal-only lead (Cnf, Issue, 3+
@@ -320,9 +334,10 @@ export async function runBookedDialRouting({ env = process.env, nowMs = Date.now
       retryClaimed: list ? marks.has(retryKey(c.phone, c.apptDate, list)) : false,
     });
     if (dec.readded) lpReadded += 1;
-    // 2026-10-06 follow-up: moved from "2nd Day" to "Next Day" → off "2nd Day" too.
+    // 2026-10-06 follow-up: a visit already on BOTH Conf lists (added before the
+    // once-per-visit rule) comes off "2nd Day".
     const dncKnownClear = Boolean(onDnc && !onDnc.has(c.phone));
-    const moveDue = dncKnownClear && confMoveDue({ route: pre.route, addRows, moveClaimed: marks.has(moveKey(c.phone, c.apptDate)), cfg });
+    const moveDue = dncKnownClear && confMoveDue({ route: item.pre.route, addRows, moveClaimed: marks.has(moveKey(c.phone, c.apptDate)), cfg });
 
     if (dec.alert) {
       addFailed.push({ c, list, key: `${c.phone}:${c.apptDate}`, reason: 'add_failed_twice' });
