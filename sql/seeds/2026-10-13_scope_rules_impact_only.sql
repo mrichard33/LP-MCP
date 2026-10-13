@@ -84,7 +84,7 @@ WHERE NOT EXISTS (SELECT 1 FROM kb_faqs WHERE kb_key = 'LIB-P18');
 INSERT INTO kb_faqs (kb_key, question_pattern, canonical_answer, answer_short, channel, tier, active, notes)
 SELECT 'LIB-P19',
        $$Is there a minimum? | What's your minimum job? | Do you have a minimum number of windows? | How many windows do I need for you to come out?$$,
-       $$Our minimum is three windows or doors in any mix, like three windows or two windows and a door, or one sliding glass door on its own.$$,
+       $$We have a 3-opening minimum: any mix of windows and doors, like three windows or two windows and a door, or one sliding glass door on its own.$$,
        NULL, 'both', 'factual', true,
        $$2026-10-13 (the user): three openings in any mix of windows and doors, or one sliding glass door alone. Guard: src/agentic/job-scope.js.$$
 WHERE NOT EXISTS (SELECT 1 FROM kb_faqs WHERE kb_key = 'LIB-P19');

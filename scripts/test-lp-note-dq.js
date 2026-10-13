@@ -182,14 +182,15 @@ test('only a person\'s statement counts: no transcripts, no questions, no owner 
     'Is it a mobile home?',
     'he is the only h/o however he has a tenant that lives with him.',
   ]) assert.equal(detectNoteDq([{ text: t }]).dq, false, t);
-  // 2026-10-13 (the user): a home rented out is a rental we do not take, even
-  // when its owner meets us there. These were "not a DQ" before the ruling.
+  // 2026-10-13: a note that only describes a rental or a commercial property is
+  // not a person's decision (the team books these: lp_notes, 60 days).
   for (const t of [
     'Mr has a tenant in the property but he will be meeting us at the home',
     'He is renting it out to students',
-    'Investment property, owner lives in Ohio',
-  ]) assert.equal(detectNoteDq([{ text: t }]).signal, 'rental_property', t);
-  assert.equal(detectNoteDq([{ text: 'Commercial property, a dentist office' }]).signal, 'commercial');
+    'Spoke with David, who owns a rental property and is interested in receiving an estimate for three windows.',
+    'Investment property Mr said he is look for impact doors',
+    'we cant look at the commercial property but we can look at the rez',
+  ]) assert.equal(detectNoteDq([{ text: t }]).dq, false, t);
   assert.equal(detectNoteDq([{ text: 'CXL - only 1 window, below minimum' }]).signal, 'below_minimum');
   assert.equal(detectNoteDq([{ text: 'DNR MOBILE HOME' }]).signal, 'mobile_home');
   assert.equal(detectNoteDq([{ text: 'DNR - low value, renter, and on 4th floor.' }]).signal, 'renter');

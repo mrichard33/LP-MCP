@@ -994,8 +994,9 @@ count the lead states is SAVED to the GHL fields Window Count (`h9FJTUbmUHIuD6JK
 (`context.estimate.window_count` / `door_count`) skips the question (`knownOpenings`). A draft saying we do commercial or rental work, or
 that some windows are not impact, has that sentence replaced. Any block drops `book_appointment`, the live chat refuses
 the booking (`refused_job_scope:*`), `gateForStage` returns `not_eligible`, `checkReply` fails `job_scope`, the analyzer
-has `dq_detected` rental_property / commercial / below_minimum, and an LP note saying rental, commercial or below minimum
-is an LP-note DQ. FAQs LIB-P03/P15 (impact only), LIB-P16/17/18: `sql/seeds/2026-10-13_scope_rules_impact_only.sql`.
+has `dq_detected` rental_property / commercial / below_minimum, and an LP note saying below minimum is an LP-note DQ. An
+LP note that only DESCRIBES a rental or a commercial property is NOT (the team books those: "owns a rental property …
+estimate for three windows"); as a DQ it would stop-bot live appointments, so those rules read only the lead's words. FAQs LIB-P03/P15 (impact only), LIB-P16/17/18: `sql/seeds/2026-10-13_scope_rules_impact_only.sql`.
 Reminders for Set/Verif only (Cnf and Issue get none) are GHL edits in A.WE-1: `docs/ghl-we-reminders-set-only.md`.
 Also fixed: the SMS scope guard compared `scope.reason === 'lead_asked'`, which never matched `'<rule>:lead_asked'`, so a
 declined manufactured home or tall building kept its booking.

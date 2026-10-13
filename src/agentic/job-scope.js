@@ -48,7 +48,8 @@ export const COMMERCIAL_LINE = 'Thanks for asking. We only work on homes, not co
 // The user's wording (2026-10-13). The doors version is for a lead who named a door.
 export const MINIMUM_CHECK_LINE = 'Of course, I can help with that. Are all the other windows in your home already hurricane impact?';
 export const MINIMUM_CHECK_DOORS_LINE = 'Of course, I can help with that. Are all the other windows and doors in your home already hurricane impact?';
-export const BELOW_MINIMUM_LINE = "Thanks for letting me know. Our minimum is three windows or doors, or one sliding glass door, so we can't set up a visit for this one. If anything else comes up, we'd be glad to help.";
+// "3-opening minimum" is the user's wording (2026-10-13: "we should say there is a 3 open minimum").
+export const BELOW_MINIMUM_LINE = "Thanks for letting me know. We have a 3-opening minimum, any mix of windows and doors, or one sliding glass door on its own, so we can't set up a visit for this one. If anything else comes up, we'd be glad to help.";
 
 const LINE_FOR = { rental: RENTAL_LINE, commercial: COMMERCIAL_LINE, below_minimum: BELOW_MINIMUM_LINE };
 

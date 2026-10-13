@@ -158,7 +158,7 @@ test('"the rest are already impact" means this is the whole job: the minimum, no
     assert.equal(r.text, J.BELOW_MINIMUM_LINE, inbound);
     assert.equal(r.block, 'below_minimum', inbound);
   }
-  assert.match(J.BELOW_MINIMUM_LINE, /three windows or doors, or one sliding glass door/);
+  assert.match(J.BELOW_MINIMUM_LINE, /3-opening minimum, any mix of windows and doors, or one sliding glass door/);
 });
 
 test('"the others are old" is a bigger job: the normal flow, never asked twice', () => {
