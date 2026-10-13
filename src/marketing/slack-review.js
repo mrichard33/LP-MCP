@@ -63,9 +63,16 @@ export function buildReviewCard({
   const vendorName = vendor?.vendor_name || facts?.vendor_name_hint || 'Unknown vendor';
   const title = `Marketing invoice · ${vendorName}`;
   const total = rows.length ? rows.reduce((a, r) => a + (Number(r.amount) || 0), 0) : facts?.total;
+  // 2026-10-13: a period the invoice never printed is assumed (the invoice date,
+  // else the day it arrived) so the row can exist; the card says so. A total the
+  // extraction could not read is stored as $0 and blocks Approve until edited.
+  const periodNote = facts?.period_assumed_from
+    ? ` _(assumed from the ${facts.period_assumed_from === 'invoice_date' ? 'invoice date' : 'day it arrived'} — Edit if this bills a month)_`
+    : '';
+  const totalNote = flags.includes('missing_total') ? ' _(not found on the invoice — Edit to enter it)_' : '';
   const head = [
     `*${escapeMrkdwn(title)}*`,
-    `Invoice #: ${escapeMrkdwn(facts?.invoice_number || '—')} · Period: ${facts?.period_start || '?'} → ${facts?.period_end || '?'} · Total: *${usd(total)}*${facts?.currency && facts.currency !== 'USD' ? ` ${facts.currency}` : ''}`,
+    `Invoice #: ${escapeMrkdwn(facts?.invoice_number || '—')} · Period: ${facts?.period_start || '?'} → ${facts?.period_end || '?'}${periodNote} · Total: *${usd(total)}*${facts?.currency && facts.currency !== 'USD' ? ` ${facts.currency}` : ''}${totalNote}`,
     `From: ${escapeMrkdwn(document?.from_address || '—')} · ${escapeMrkdwn(document?.subject || '')}`.trim(),
     vendor ? `Vendor matched by ${escapeMrkdwn(vendorMethod || 'rules')}` : '⚠️ Vendor not matched — use Edit to pick one',
   ].join('\n');

@@ -2786,4 +2786,15 @@ export const STARTUP_MIRRORS = [
     fail: '[Migration] marketing cost ledger (migration 20261012222106) not applied — invoice ingest answers 503 and the nightly cost job skips until CI applies it (supabase db push):',
     level: 'warn',
   },
+  // Marketing invoice skips (2026-10-13): the attachments the ingest judged not
+  // to be invoices (logos, signature images), by sha, read before any OCR.
+  // Without it every email re-OCRs the same logo; nothing customer-facing.
+  {
+    name: 'migration/20261013162052',
+    expects: { tables: ['marketing_invoice_skips'] },
+    sqlFile: 'supabase/migrations/20261013162052_marketing_invoice_skips.sql',
+    ready: '[Migration] marketing invoice skips (migration 20261013162052) ready',
+    fail: '[Migration] marketing invoice skips (migration 20261013162052) not applied — the invoice ingest re-triages every logo on each email until CI applies it (supabase db push):',
+    level: 'warn',
+  },
 ];

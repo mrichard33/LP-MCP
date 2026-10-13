@@ -571,6 +571,23 @@ Brad's XLSX (`marketing-cost-report`, formulas never typed values) read `v_marke
   (`trueUpInvoice`, variance > `MKT_FEED_VARIANCE_PCT` posts a line).
 - Mode switches: `MKT_INVOICE_ANALYZER` rules|rules+llm, `MKT_COST_NIGHTLY_ENABLED`. Dry runs: the tests
   (`scripts/test-marketing-*.js`) and `GET /n8n/admin/marketing-expenses/status` (reconciliation = 0 failing rows).
+- **A logo is not an invoice, and a missing fact is a flag, never a 500 (the first real email, 2026-10-13).** Mark's
+  forward of the JMJ Digital Marketing invoice carried the PDF plus two inline images; each image became a document, was
+  OCR'd ("qb"), reached the model and became a row with `amount NULL`, which `marketing_expenses` refuses; the PDF failed
+  the same way on `period_start NULL` (no service period printed). Three 500s, n8n retried each twice, no card, no
+  analysis saved. Now `triageExtraction` (`src/marketing/invoice-triage.js`, pure) runs right after extraction and BEFORE
+  storage or the model: under 40 characters with no money figure and no invoice word is `not_an_invoice`, remembered by
+  sha in `marketing_invoice_skips` (never a document; the next email answers `duplicate + skipped` with no OCR). A CSV,
+  XLSX or email body is never triaged out. `fillRowDefaults` makes every row insertable: a missing period becomes the
+  invoice date (else the day received) and the card says "assumed from the invoice date"; a missing total becomes `$0`,
+  which blocks Approve until Edit. The flags (`missing_period` / `missing_total`) still block auto-approve. The analysis
+  is saved before the rows are written. A deterministic failure answers **200 + `success:false`** (n8n reports it once);
+  only a service outage (extract 5xx/429, storage, a connection: `isTransientError`) is a 5xx that n8n retries, and the
+  retry reuses the stored text. A forward from our own domain never identifies or teaches a vendor (`INTERNAL_MAIL_DOMAINS`);
+  the e-mail address printed in the invoice text is tried instead (never a public mailbox). The n8n Code node drops
+  inline parts (Content-Disposition inline / Content-ID / mailparser `related`), images under 50 KB and a second copy of
+  the same file in one email, and sends the body text when no pdf/csv/xlsx is left. `scripts/lib/fake-supabase.js` now
+  enforces the NOT NULL columns that bit, so this class of bug fails offline.
 
 ## Alerting
 
