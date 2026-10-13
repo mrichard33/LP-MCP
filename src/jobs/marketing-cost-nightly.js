@@ -18,6 +18,7 @@ import { syncFeedExpenses } from '../marketing/leadgurus-feed.js';
 import { recomputeCalculatedCosts } from '../marketing/commission.js';
 import { reallocateMonth } from '../marketing/allocation-io.js';
 import { recommendHolds } from '../marketing/holds.js';
+import { purgeStaleFailedDocuments } from './marketing-invoice-ingest.js';
 
 export const JOB_ID = 'marketing-cost-nightly';
 const RUN_HOUR_ET = 2;
@@ -46,6 +47,8 @@ export async function runMarketingCostNightly({ months = null, feedDays = 7, ski
     try { return await fn(); } catch (err) { out.ok = false; out.errors.push(`${label}: ${err.message}`); console.error(`${LOG} ${label} failed: ${err.message}`); return null; }
   };
   if (!skipFeed) out.feed = await step('feed', () => syncFeedExpenses({ from: isoDaysAgo(feedDays), to: todayET() }, deps));
+  // 2026-10-13: nothing stays on the dashboard's Failed list for more than a day.
+  out.failed_documents = await step('failed documents', () => purgeStaleFailedDocuments({}, deps));
   for (const month of list) {
     const r = { month };
     r.commission = await step(`commission ${month}`, () => recomputeCalculatedCosts(month, deps));

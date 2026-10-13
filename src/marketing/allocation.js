@@ -34,6 +34,24 @@
 
 export const HOLD_MARKET = 'REECE_HOLD';
 
+/**
+ * Company-wide spend (the user, 2026-10-13: "For software that doesn't generate
+ * leads for a specific office, distribute it evenly across all offices", e.g.
+ * Hatch). A line whose eligible_markets holds ALL_OFFICES is split EQUALLY over
+ * OFFICE_MARKETS, whatever the issued leads say, and needs no sub-source; its
+ * allocation rows carry the sub-source typed on the line, else COMPANY_WIDE.
+ * The six offices are the six markets (Lakeland is Orlando); Houston and
+ * Winston-Salem are service areas without an office of their own.
+ */
+export const ALL_OFFICES = 'ALL_OFFICES';
+export const OFFICE_MARKETS = Object.freeze(['FTLAU_MKT', 'FTMYR_MKT', 'JAX_MKT', 'ORL_MKT', 'SAR_MKT', 'STPET_MKT']);
+export const COMPANY_WIDE = 'Company-wide';
+
+/** True when the line is company-wide spend split evenly over every office. */
+export function splitsEvenly(expense) {
+  return (expense?.eligible_markets || []).includes(ALL_OFFICES);
+}
+
 const toCents = (n) => Math.round(Number(n) * 100);
 const fromCents = (c) => Math.round(c) / 100;
 
@@ -131,6 +149,13 @@ export function splitsBySource(expense) {
   return !(expense?.eligible_markets || []).filter(Boolean).length;
 }
 
+/** The plain-English split for a line, for the card and the Edit form. */
+export function splitKind(expense) {
+  if (splitsEvenly(expense)) return 'even';
+  if (splitsBySource(expense)) return 'by_source';
+  return 'markets';
+}
+
 /** The markets a by-source slice spreads over: every market with issued > 0. */
 export function marketsFromIssued(issuedByMarket = {}) {
   return Object.keys(issuedByMarket).filter((m) => m && m !== HOLD_MARKET && Number(issuedByMarket[m]) > 0).sort();
@@ -143,14 +168,16 @@ export function marketsFromIssued(issuedByMarket = {}) {
  * to insert into marketing_expense_allocations (without the expense_id).
  */
 export function allocateExpense(expense, issuedLookup = () => ({})) {
-  const bySource = splitsBySource(expense);
+  const even = splitsEvenly(expense);
+  const bySource = !even && splitsBySource(expense);
   const subs = (expense.lp_sub_sources || []).filter(Boolean);
   if (bySource && !subs.length) throw new Error('allocation: no markets and no sub-source to split by');
-  const subSource = subs.length === 1 ? subs[0] : null;
+  const subSource = subs.length === 1 ? subs[0] : (even && !subs.length ? COMPANY_WIDE : null);
   const out = [];
   for (const slice of splitPeriodByMonth(expense.period_start, expense.period_end, expense.amount)) {
-    const issuedByMarket = issuedLookup(slice.month, slice.start, slice.end) || {};
-    let markets = expense.eligible_markets || [];
+    // An even split ignores issued leads entirely: every office pays the same.
+    const issuedByMarket = even ? {} : (issuedLookup(slice.month, slice.start, slice.end) || {});
+    let markets = even ? [...OFFICE_MARKETS] : (expense.eligible_markets || []);
     let note = null;
     if (bySource) {
       markets = marketsFromIssued(issuedByMarket);

@@ -23,9 +23,10 @@ import { postToSlack, updateSlackMessage } from '../slack.js';
 import { parseApproverIds } from '../slack-approvals-core.js';
 import { allocateExpenseById, previewAllocation } from './allocation-io.js';
 import { trueUpInvoice } from './leadgurus-feed.js';
-import { buildReviewCard, buildEditView, parseEditSubmission } from './slack-review.js';
+import { buildReviewCard, buildEditView, parseEditSubmission, marketsForSplit } from './slack-review.js';
 import { computeFlags } from './expense-builder.js';
-import { vendorLearnPatch } from './vendors.js';
+import { vendorLearnPatch, normalizeName } from './vendors.js';
+import { splitsEvenly } from './allocation.js';
 
 const LOG = '[MktReview]';
 const INVOICES_BUCKET = 'marketing-invoices';
@@ -97,6 +98,7 @@ export async function previewRows(rows, deps) {
     // No markets picked = split by the sub-source's issued leads (2026-10-13), so
     // such a row previews as long as it names a sub-source.
     if ((!(r.eligible_markets || []).length && !(r.lp_sub_sources || []).length) || !r.period_start || !r.period_end || r.amount == null || Number(r.amount) === 0) continue;
+    // (an even split over all offices needs no sub-source and always previews)
     try { out.push(...(await previewAllocation(r, deps))); } catch (err) { console.warn(`${LOG} preview ${r.id}: ${err.message}`); }
   }
   return out;
@@ -150,45 +152,94 @@ export async function handleMarketingInvoiceInteraction(parsed, deps = {}) {
     const { data: vendors } = await supabase.from('marketing_vendors').select('id, vendor_name').eq('is_active', true).order('vendor_name');
     const view = buildEditView({ document: ctx.document, vendor: ctx.vendor, facts: ctx.facts, rows: pending.length ? pending : ctx.rows, vendors: vendors || [] });
     const r = await (deps.openView || openSlackView)(parsed.triggerId, view);
-    if (!r.ok) await reply(responseUrl, { response_type: 'ephemeral', replace_original: false, text: `Could not open the edit form (${r.error}).` });
+    if (r.ok) console.log(`${LOG} edit form opened for ${documentId} by ${who}`);
+    else {
+      console.error(`${LOG} edit form for ${documentId} NOT opened: ${r.error}`);
+      await reply(responseUrl, { response_type: 'ephemeral', replace_original: false, text: `Could not open the edit form (${r.error}).` });
+    }
     return { handled: true, action: r.ok ? 'edit_opened' : 'edit_failed' };
   }
 
   if (decision === 'edit_submit') {
     if (!pending.length) return { handled: true, action: 'already_resolved' };
     const v = parseEditSubmission(parsed.values);
+    const notes = [];
     let vendor = ctx.vendor;
-    if (v.vendor_id && v.vendor_id !== ctx.vendor?.id) {
+    const vendorChanged = !!(v.vendor_id && v.vendor_id !== ctx.vendor?.id);
+    if (vendorChanged) {
       const { data } = await supabase.from('marketing_vendors').select('*').eq('id', v.vendor_id).maybeSingle();
       vendor = data || vendor;
     }
+    // 2026-10-13 (the user): "allow editing and adding options when they don't
+    // already exist". A vendor typed in "New vendor" is created now (or, when
+    // one with that name or alias already exists, that one is used), with the
+    // sub-source and split from this form, so its next invoice matches by name.
+    const splitMarkets = marketsForSplit(v);
+    let created = false;
+    if (v.new_vendor) {
+      const { data: all } = await supabase.from('marketing_vendors').select('*');
+      const key = normalizeName(v.new_vendor);
+      const existing = (all || []).find((x) => [x.vendor_name, ...(x.aliases || [])].some((n) => normalizeName(n) === key));
+      if (existing) vendor = existing;
+      else {
+        const aliases = [...new Set([v.new_vendor, ctx.facts?.vendor_name_hint].filter(Boolean).map((x) => String(x).trim()))];
+        const { data: made, error: mkErr } = await supabase.from('marketing_vendors').insert({
+          vendor_name: v.new_vendor, aliases, sender_domains: [], lp_sub_sources: v.lp_sub_sources,
+          eligible_markets: splitMarkets ?? [], default_cost_type: 'invoice', is_active: true,
+          notes: `Added from the invoice Edit form by ${who}, ${new Date().toISOString().slice(0, 10)}`,
+        }).select('*').single();
+        if (mkErr) throw new Error(`vendor create failed: ${mkErr.message}`);
+        vendor = made;
+        created = true;
+        notes.push(`new vendor "${made.vendor_name}" added`);
+      }
+    }
+    const usingNewVendor = vendor && vendor.id !== ctx.vendor?.id;
     const patch = { updated_at: new Date().toISOString() };
     if (vendor) patch.vendor_id = vendor.id;
     if (v.invoice_number) patch.invoice_number = v.invoice_number;
     if (v.period_start) patch.period_start = v.period_start;
     if (v.period_end) patch.period_end = v.period_end;
+    // A vendor picked or created here brings its own sub-source and split when
+    // the form leaves them blank (pick "Hatch" → evenly across all offices).
     if (v.lp_sub_sources.length) patch.lp_sub_sources = v.lp_sub_sources;
-    if (v.eligible_markets.length) patch.eligible_markets = v.eligible_markets;
+    else if (usingNewVendor && (vendor.lp_sub_sources || []).length) patch.lp_sub_sources = vendor.lp_sub_sources;
+    else if (v.split === 'even') patch.lp_sub_sources = [];
+    if (splitMarkets) patch.eligible_markets = splitMarkets;
+    else if (usingNewVendor && !v.split) patch.eligible_markets = vendor.eligible_markets || [];
     if (v.amount != null && pending.length === 1) patch.amount = v.amount;
     const { error } = await supabase.from('marketing_expenses').update(patch).in('id', pending.map((r) => r.id));
     if (error) throw new Error(`edit update failed: ${error.message}`);
 
+    // "Remember": the vendor keeps this sub-source and split for its next invoices.
+    if (vendor && v.remember && !created) {
+      const keep = {};
+      if (patch.lp_sub_sources && JSON.stringify(patch.lp_sub_sources) !== JSON.stringify(vendor.lp_sub_sources || [])) keep.lp_sub_sources = patch.lp_sub_sources;
+      if (patch.eligible_markets && JSON.stringify(patch.eligible_markets) !== JSON.stringify(vendor.eligible_markets || [])) keep.eligible_markets = patch.eligible_markets;
+      if (Object.keys(keep).length) {
+        await supabase.from('marketing_vendors').update({ ...keep, updated_at: new Date().toISOString() }).eq('id', vendor.id);
+        vendor = { ...vendor, ...keep };
+        notes.push(`"${vendor.vendor_name}" will use this ${keep.eligible_markets ? 'split' : ''}${keep.eligible_markets && keep.lp_sub_sources ? ' and ' : ''}${keep.lp_sub_sources ? 'sub-source' : ''} next time`);
+      }
+    }
+
     // The vendor learns how this invoice named it, so the next one matches by rules.
     let learnt = null;
-    if (vendor) {
+    if (vendor && !created) {
       const learn = vendorLearnPatch(vendor, { alias: ctx.analysis?.ai?.vendor_name || ctx.facts?.vendor_name_hint || null, fromAddress: ctx.document.from_address });
       if (learn) {
         await supabase.from('marketing_vendors').update({ ...learn, updated_at: new Date().toISOString() }).eq('id', vendor.id);
         learnt = `vendor "${vendor.vendor_name}" now also matches ${[...(learn.aliases.slice(vendor.aliases?.length || 0)), ...(learn.sender_domains.slice(vendor.sender_domains?.length || 0))].join(', ')}`;
       }
     }
+    if (learnt) notes.push(learnt);
     const fresh = await loadReviewContext(documentId, { supabase });
     fresh.vendor = vendor;
     const facts = { ...fresh.facts, invoice_number: patch.invoice_number ?? fresh.facts.invoice_number, period_start: patch.period_start ?? fresh.facts.period_start, period_end: patch.period_end ?? fresh.facts.period_end, total: fresh.rows.reduce((a, r) => a + Number(r.amount || 0), 0) };
     const flags = computeFlags({ vendor, facts, rows: fresh.rows.filter((r) => r.status === 'pending_review'), confidence: fresh.confidence, extraction: fresh.extraction, minConfidence: 0 });
     const analysis = { ...(fresh.document.analysis || {}), facts, flags, vendor_method: 'edited', edited_by: who, edited_at: new Date().toISOString() };
     await supabase.from('marketing_invoice_documents').update({ analysis, updated_at: new Date().toISOString() }).eq('id', documentId);
-    const card = await renderCard({ ...fresh, facts, flags, vendorMethod: 'edited' }, { note: `Edited by ${userName}${learnt ? ` · ${learnt}` : ''}` }, { ...deps, supabase });
+    const card = await renderCard({ ...fresh, facts, flags, vendorMethod: 'edited' }, { note: `Edited by ${userName}${notes.length ? ` · ${notes.join(' · ')}` : ''}` }, { ...deps, supabase });
     await updateCard(fresh, card, deps);
     return { handled: true, action: 'edited' };
   }
@@ -216,7 +267,8 @@ export async function handleMarketingInvoiceInteraction(parsed, deps = {}) {
     // 2026-10-13: a total the extraction could not read is stored as 0 with the
     // missing_total flag (the column is NOT NULL); nobody approves $0.
     else if (Number(r.amount) === 0) blockers.push(`line ${r.line_no}: amount is $0 (not found on the invoice) — Edit first`);
-    if (!(r.lp_sub_sources || []).length) blockers.push(`line ${r.line_no}: no LP sub-source — Edit first`);
+    // An even split over all offices (software, company-wide) needs no sub-source.
+    if (!(r.lp_sub_sources || []).length && !splitsEvenly(r)) blockers.push(`line ${r.line_no}: no LP sub-source — Edit first`);
   }
   if (blockers.length) {
     await reply(responseUrl, { response_type: 'ephemeral', replace_original: false, text: `Not approved:\n• ${blockers.join('\n• ')}` });

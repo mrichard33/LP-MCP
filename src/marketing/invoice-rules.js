@@ -18,8 +18,11 @@ const MONTHS = {
 };
 const MONTH_RX = '(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)';
 // One date in any of the three shapes an invoice uses. Group 0 is the whole date.
-const DATE_RX = `(?:\\d{1,2}[/-]\\d{1,2}[/-]\\d{2,4}|\\d{4}-\\d{2}-\\d{2}|${MONTH_RX}\\.?\\s+\\d{1,2},?\\s+\\d{4}|\\d{1,2}\\s+${MONTH_RX}\\.?,?\\s+\\d{4})`;
+const DATE_RX = `(?:\\d{1,2}[/-]\\d{1,2}[/-]\\d{2,4}|\\d{4}-\\d{2}-\\d{2}|${MONTH_RX}\\.?\\s+\\d{1,2}(?:st|nd|rd|th)?,?\\s+\\d{4}|\\d{1,2}\\s+${MONTH_RX}\\.?,?\\s+\\d{4})`;
 const RANGE_SEP = '\\s*(?:-|–|—|to|through|thru|till|until)\\s*';
+// Between a label and its value. A table read from HTML, a CSV, an XLSX or a
+// Word file prints "Amount Due | $2,800.00" (2026-10-13), not "Amount Due: …".
+const LSEP = '\\s*(?:[:|]\\s*)*-?\\s*';
 
 const pad = (n) => String(n).padStart(2, '0');
 function ymd(y, m, d) {
@@ -30,7 +33,8 @@ function ymd(y, m, d) {
 
 /** Parse one date string to YYYY-MM-DD, or null. US order for slashes (MM/DD/YYYY). */
 export function parseDate(raw) {
-  const s = String(raw || '').trim().replace(/\.$/, '');
+  // "October 1st, 2026" reads like "October 1, 2026" (receipts print ordinals).
+  const s = String(raw || '').trim().replace(/\.$/, '').replace(/(\d{1,2})(?:st|nd|rd|th)\b/i, '$1');
   let m;
   if ((m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s))) return ymd(+m[1], +m[2], +m[3]);
   if ((m = /^(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})$/.exec(s))) return ymd(+m[3], +m[1], +m[2]);
@@ -59,12 +63,25 @@ function lastDayOfMonth(y, m) {
 /** Billing / service period, or a "month of September 2026" phrase, else null. */
 export function extractPeriod(text) {
   const t = String(text || '');
-  const labelled = new RegExp(`(?:service|billing|coverage|statement|reporting)\\s+(?:period|dates?|month)\\s*[:\\-]?\\s*(${DATE_RX})${RANGE_SEP}(${DATE_RX})`, 'i').exec(t);
+  const labelled = new RegExp(`(?:service|billing|coverage|statement|reporting)\\s+(?:period|dates?|month)${LSEP}(${DATE_RX})${RANGE_SEP}(${DATE_RX})`, 'i').exec(t);
   const anyRange = labelled || new RegExp(`(${DATE_RX})${RANGE_SEP}(${DATE_RX})`, 'i').exec(t);
   if (anyRange) {
     const a = parseDate(anyRange[1]);
     const b = parseDate(anyRange[2]);
     if (a && b && b >= a) return { period_start: a, period_end: b, source: labelled ? 'labelled_range' : 'date_range' };
+  }
+  // 2026-10-13: receipts print a range with ONE year at the end ("Oct 1 – Nov 1,
+  // 2026", "October 1 - 31, 2026", "Sep 1 – Sep 30 2026"); the shapes above need
+  // a year on both dates, so the Hatch-style receipt had no period at all.
+  const short = new RegExp(`(${MONTH_RX})\\.?\\s+(\\d{1,2})(?:st|nd|rd|th)?${RANGE_SEP}(?:(${MONTH_RX})\\.?\\s+)?(\\d{1,2})(?:st|nd|rd|th)?,?\\s+(\\d{4})`, 'i').exec(t);
+  if (short) {
+    const y2 = +short[5];
+    const m1 = MONTHS[short[1].toLowerCase()];
+    const m2 = short[3] ? MONTHS[short[3].toLowerCase()] : m1;
+    const y1 = m1 > m2 ? y2 - 1 : y2; // "Dec 15 – Jan 14, 2027"
+    const a = ymd(y1, m1, +short[2]);
+    const b = ymd(y2, m2, +short[4]);
+    if (a && b && b >= a) return { period_start: a, period_end: b, source: 'short_range' };
   }
   const month = new RegExp(`(?:month\\s+of|for|period)\\s+(${MONTH_RX})\\.?\\s+(\\d{4})`, 'i').exec(t);
   if (month) {
@@ -78,15 +95,17 @@ export function extractPeriod(text) {
 /** Invoice number: "Invoice #", "Invoice No.", "Invoice Number:", "INV-". */
 export function extractInvoiceNumber(text) {
   const t = String(text || '');
-  const m = /invoice\s*(?:#|no\.?|number|num\.?|id)?\s*[:#]?\s*([A-Z]{0,4}[-_]?\d[\dA-Z-]*)/i.exec(t)
-    || /\b(INV[-_]?\d[\dA-Z-]{1,})\b/i.exec(t);
+  const m = /invoice\s*(?:#|no\.?|number|num\.?|id)?\s*(?:[:#|(]\s*)*([A-Z]{0,4}[-_]?\d[\dA-Z-]*)/i.exec(t)
+    || /\b(INV[-_]?\d[\dA-Z-]{1,})\b/i.exec(t)
+    // A receipt or a statement carries its own number (Stripe-style "Receipt #2757-9497").
+    || /\b(?:receipt|statement|bill)\s*(?:#|no\.?|number)\s*(?:[:#|]\s*)*([A-Z]{0,4}[-_]?\d[\dA-Z-]*)/i.exec(t);
   return m ? m[1].trim() : null;
 }
 
 /** The invoice date, else the first date in the text that is not inside a range. */
 export function extractInvoiceDate(text) {
   const t = String(text || '');
-  const m = new RegExp(`(?:invoice\\s+date|date\\s+of\\s+invoice|bill\\s+date|issued?(?:\\s+on)?|date)\\s*[:\\-]?\\s*(${DATE_RX})`, 'i').exec(t);
+  const m = new RegExp(`(?:invoice\\s+date|date\\s+of\\s+invoice|bill\\s+date|issue\\s+date|date\\s+issued|date\\s+paid|paid\\s+on|payment\\s+date|receipt\\s+date|issued?(?:\\s+on)?|date)${LSEP}(${DATE_RX})`, 'i').exec(t);
   return m ? parseDate(m[1]) : null;
 }
 
@@ -97,7 +116,10 @@ export function extractInvoiceDate(text) {
  */
 export function extractTotal(text) {
   const t = String(text || '');
-  const strong = [...t.matchAll(new RegExp(`(?:amount\\s+due|balance\\s+due|total\\s+due|invoice\\s+total|grand\\s+total|total\\s+amount(?:\\s+due)?)\\s*(?:\\(?usd\\)?)?\\s*[:\\-]?\\s*(${AMOUNT_RX})`, 'gi'))];
+  // Receipts say "Amount paid" / "Amount charged" / "Total paid" (2026-10-13).
+  const strong = [...t.matchAll(new RegExp(`(?:amount\\s+due|balance\\s+due|total\\s+due|invoice\\s+total|grand\\s+total|total\\s+amount(?:\\s+due)?|amount\\s+paid|total\\s+paid|amount\\s+charged|total\\s+charged|payment\\s+amount|current\\s+charges|new\\s+charges)\\s*(?:\\(?usd\\)?)?${LSEP}(${AMOUNT_RX})`, 'gi'))];
+  // QuickBooks reminders say it in a sentence: "The amount due on invoice 1883 is $3,624.60."
+  strong.push(...t.matchAll(new RegExp(`(?:amount|balance|total)\\s+due(?:\\s+on\\s+invoice\\s+[\\w-]+)?\\s+(?:is|of)\\s+(${AMOUNT_RX})`, 'gi')));
   const pick = (list) => {
     for (let i = list.length - 1; i >= 0; i--) {
       const n = parseAmount(list[i][1]);
@@ -107,7 +129,7 @@ export function extractTotal(text) {
   };
   const s = pick(strong);
   if (s !== null) return s;
-  const weak = [...t.matchAll(new RegExp(`\\btotal\\b\\s*(?:\\(?usd\\)?)?\\s*[:\\-]?\\s*(${AMOUNT_RX})`, 'gi'))];
+  const weak = [...t.matchAll(new RegExp(`\\btotal\\b\\s*(?:\\(?usd\\)?)?${LSEP}(${AMOUNT_RX})`, 'gi'))];
   return pick(weak);
 }
 

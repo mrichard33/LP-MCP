@@ -31,7 +31,7 @@ export function fakeSupabase(seed = {}, { rpc = {} } = {}) {
   const tables = {};
   for (const [name, rows] of Object.entries(seed)) tables[name] = rows.map((r) => ({ ...r }));
   const calls = [];
-  const storageLog = { uploads: [], signed: [] };
+  const storageLog = { uploads: [], signed: [], removed: [] };
 
   const ensure = (t) => (tables[t] ||= []);
 
@@ -122,6 +122,7 @@ export function fakeSupabase(seed = {}, { rpc = {} } = {}) {
       from: (bucket) => ({
         upload: async (path, bytes, opts) => { storageLog.uploads.push({ bucket, path, bytes: bytes.length, opts }); return { data: { path }, error: null }; },
         createSignedUrl: async (path, ttl) => { storageLog.signed.push({ bucket, path, ttl }); return { data: { signedUrl: `https://signed.example/${bucket}/${path}` }, error: null }; },
+        remove: async (paths) => { storageLog.removed.push({ bucket, paths }); return { data: paths, error: null }; },
       }),
     },
   };

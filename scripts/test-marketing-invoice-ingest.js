@@ -495,18 +495,21 @@ test('an invoice with no readable total lands at $0 with missing_total, approve 
   assert.doesNotMatch(replies.at(-1).text, /amount/, 'only the vendor/markets block remains');
 });
 
-test('a deterministic failure answers 200 + success:false (reported once, never retried); a service outage stays a 500 and the retry re-runs', async () => {
-  // Deterministic: the database refuses the rows → 200, document failed, analysis kept.
+test('a deterministic failure is removed and reported once (never on the Failed list); a service outage stays a 500 and the retry re-runs', async () => {
+  // Deterministic: the database refuses the rows → 200, the document is removed,
+  // one line in the review channel names the file and the error (the user, 2026-10-13).
   const base = db();
-  const refusing = { ...base, from: (t) => (t !== 'marketing_expenses' ? base.from(t) : { insert: () => ({ select: async () => ({ data: null, error: { message: 'new row for relation "marketing_expenses" violates check constraint "marketing_expenses_status_check"' } }) }) }) };
-  const r = await ingestInvoice({ ...FWD, file_name: 'x.pdf', mime_type: 'application/pdf', file_b64: Buffer.from(JMJ_TEXT).toString('base64') }, { ...depsFor(refusing), analyzeDeps: noAi() });
+  const refusing = { ...base, from: (t) => (t !== 'marketing_expenses' ? base.from(t) : { insert: () => ({ select: async () => ({ data: null, error: { message: 'new row for relation "marketing_expenses" violates check constraint "marketing_expenses_status_check"' } }) }), select: () => ({ eq: async () => ({ data: [], error: null }) }) }) };
+  const posts = [];
+  const r = await ingestInvoice({ ...FWD, file_name: 'x.pdf', mime_type: 'application/pdf', file_b64: Buffer.from(JMJ_TEXT).toString('base64') }, { ...depsFor(refusing, { posts }), analyzeDeps: noAi() });
   assert.equal(r.httpStatus, 200);
   assert.equal(r.success, false);
   assert.equal(r.transient, false);
+  assert.equal(r.removed, true);
   assert.match(r.error, /^expenses: /);
-  const doc = base.tables.marketing_invoice_documents[0];
-  assert.equal(doc.status, 'failed');
-  assert.equal(doc.analysis.facts.total, 3624.6, 'the analysis survives a refused insert');
+  assert.equal(base.tables.marketing_invoice_documents.length, 0, 'nothing left on the Failed list');
+  assert.equal(posts.length, 1);
+  assert.match(posts[0].text, /x\.pdf .*could not be read \(expenses: /);
 
   // Transient: the extract service is down → 500 (n8n retries); the retry is not a duplicate and succeeds.
   const supabase = db();
@@ -521,4 +524,132 @@ test('a deterministic failure answers 200 + success:false (reported once, never 
   assert.equal(r2.duplicate, false);
   assert.equal(supabase.tables.marketing_invoice_documents.length, 1, 'the retry reuses the same document row');
   assert.equal(supabase.tables.marketing_invoice_documents[0].status, 'in_review');
+});
+
+// ─── 2026-10-13 (later): duplicates, linked receipts, company-wide software ──
+import { purgeStaleFailedDocuments, bodyShaText, findDuplicateInvoice } from '../src/jobs/marketing-invoice-ingest.js';
+
+const bodyExtract = async (_buffer, { bodyText }) => ({ kind: 'text', text: bodyText, meta: { format: 'email_body', page_count: 1, ocr_pages: 0, engine: 'email_body' }, tables: [] });
+const FRESHBOOKS = (cid) => `[cid:${cid}]\nMark Richard\nFrom: Brad Codman <b.codman@reecewindows.com>\nSubject: Fw: My Home Renovator, Inc. sent you an invoice (00046476)\nFrom: My Home Renovator, Inc. via FreshBooks <mail@fb05.freshbooks.com>\nInvoice #00046476\nInvoice Date: 10/06/2026\nAmount Due: $2,800.00`;
+const bodyPayload = (id, text) => ({ ...FWD, gmail_message_id: id, subject: 'Fw: My Home Renovator, Inc. sent you an invoice (00046476)', file_name: undefined, mime_type: undefined, file_b64: undefined, body_text: text });
+
+test('the same invoice forwarded twice is one document and one card (the cid ids differ, the invoice does not)', async () => {
+  assert.equal(bodyShaText(FRESHBOOKS('164a2fa1-5677')), bodyShaText(FRESHBOOKS('79a136d6-5de6')));
+  const supabase = db();
+  const posts = [];
+  const deps = { ...depsFor(supabase, { posts }), extract: bodyExtract, analyzeDeps: noAi() };
+  const r1 = await ingestInvoice(bodyPayload('1a136a872b9540d6', FRESHBOOKS('164a2fa1-5677')), deps);
+  assert.equal(r1.success, true);
+  assert.equal(r1.duplicate, false);
+  const r2 = await ingestInvoice(bodyPayload('1a136a968a770bb3', FRESHBOOKS('79a136d6-5de6')), deps);
+  assert.equal(r2.duplicate, true);
+  assert.equal(r2.document_id, r1.document_id);
+  assert.equal(supabase.tables.marketing_invoice_documents.length, 1);
+  assert.equal(supabase.tables.marketing_expenses.length, 1);
+  assert.equal(posts.length, 1, 'one card, not two');
+
+  // The same invoice arriving as a PDF instead (different bytes): caught by number + total + vendor.
+  const pdfText = 'My Home Renovator, Inc.\nInvoice #00046476\nInvoice Date: 10/06/2026\nAmount Due: $2,800.00\nThank you for your business';
+  const r3 = await ingestInvoice({ ...FWD, gmail_message_id: 'm9', file_name: 'Invoice-00046476.pdf', mime_type: 'application/pdf', file_b64: Buffer.from(pdfText).toString('base64') }, { ...depsFor(supabase, { posts }), analyzeDeps: { callJson: aiStub({ ...GOOD_AI, vendor_name: 'My Home Renovator, Inc.', vendor_match_id: null, invoice_number: '00046476', total: 2800, lines: [{ description: 'Invoice total', amount: 2800, lp_sub_source: null, markets: [], market_evidence: null }] }), guard: async () => ({ mode: 'shadow', verdict: 'clean', score: 0, block: false }) } });
+  assert.equal(r3.duplicate, true);
+  assert.equal(r3.reason, 'duplicate_invoice');
+  assert.equal(supabase.tables.marketing_invoice_documents.length, 1, 'still one document');
+  assert.equal(posts.length, 1, 'still one card');
+});
+
+test('findDuplicateInvoice: number, total and vendor must all match; a rejected one is not a copy', () => {
+  const d = (id, n, total, extra = {}) => ({ id, status: 'in_review', analysis: { vendor_id: null, facts: { invoice_number: n, total, vendor_name_hint: 'Acme LLC' } }, ...extra });
+  const facts = { invoice_number: '77', total: 100 };
+  assert.equal(findDuplicateInvoice([d('a', '77', 100)], { documentId: 'z', facts, vendorHint: 'Acme LLC' })?.id, 'a');
+  assert.equal(findDuplicateInvoice([d('a', '77', 101)], { documentId: 'z', facts, vendorHint: 'Acme LLC' }), null);
+  assert.equal(findDuplicateInvoice([d('a', '78', 100)], { documentId: 'z', facts, vendorHint: 'Acme LLC' }), null);
+  assert.equal(findDuplicateInvoice([d('a', '77', 100)], { documentId: 'z', facts, vendorHint: 'Other Co' }), null);
+  assert.equal(findDuplicateInvoice([d('a', '77', 100, { status: 'rejected' })], { documentId: 'z', facts, vendorHint: 'Acme LLC' }), null);
+  assert.equal(findDuplicateInvoice([d('a', '77', 100)], { documentId: 'z', facts: { invoice_number: null, total: 100 }, vendorHint: 'Acme LLC' }), null);
+});
+
+test('a receipt sent as a OneDrive link: no document, no $0 card, one note naming the file', async () => {
+  const supabase = db();
+  const posts = [];
+  const text = '​[https://res.public.onecdn.static.microsoft/assets/fluentui-resources/1.1.0/app-min/assets/item-types/24/pdf.png]Receipt-2757-9497.pdf<https://reecewindows-my.sharepoint.com/:b:/p/m_richard/IQDxd6PLVYpx>​ ';
+  const r = await ingestInvoice({ ...bodyPayload('hatch1', text), subject: 'Subject:' }, { ...depsFor(supabase, { posts }), extract: bodyExtract, analyzeDeps: noAi() });
+  assert.equal(r.skipped, true);
+  assert.equal(r.reason, 'linked_file');
+  assert.equal(supabase.tables.marketing_invoice_documents.length, 0);
+  assert.equal(supabase.tables.marketing_expenses.length, 0);
+  assert.equal(posts.length, 1);
+  assert.match(posts[0].text, /Receipt-2757-9497\.pdf/);
+  assert.match(posts[0].text, /attach/i);
+});
+
+const HATCH_ID = '33333333-3333-4333-8333-333333333333';
+test('software split evenly across all offices: no sub-source needed, six equal shares', async () => {
+  const hatch = { id: HATCH_ID, vendor_name: 'Hatch', aliases: ['Hatch'], sender_domains: [], lp_sub_sources: [], eligible_markets: ['ALL_OFFICES'], default_cost_type: 'invoice', is_active: true };
+  const supabase = db({ marketing_vendors: [...VENDORS, hatch] });
+  const posts = [];
+  const text = 'Hatch\nReceipt #2757-9497\nDate paid: 10/01/2026\nService period: 10/01/2026 - 10/31/2026\nTotal $600.00';
+  const r = await ingestInvoice({ ...FWD, gmail_message_id: 'h1', file_name: 'Receipt-2757-9497.pdf', mime_type: 'application/pdf', file_b64: Buffer.from(text).toString('base64') }, { ...depsFor(supabase, { posts }), analyzeDeps: noAi() });
+  assert.equal(r.success, true);
+  const [row] = supabase.tables.marketing_expenses;
+  assert.deepEqual(row.eligible_markets, ['ALL_OFFICES']);
+  assert.match(JSON.stringify(posts[0].opts.blocks), /all offices, split evenly/);
+  const replies = [];
+  const ok = await handleMarketingInvoiceInteraction(parsedClick('approve', r.document_id, { userId: 'U_BRAD', userName: 'brad' }), { supabase, approvers: new Set(['U_BRAD']), reply: async (_u, b) => replies.push(b), signedLink: async () => null });
+  assert.equal(ok.action, 'approved');
+  const allocs = supabase.tables.marketing_expense_allocations;
+  assert.equal(allocs.length, 6);
+  assert.deepEqual([...new Set(allocs.map((a) => a.rule))], ['equal']);
+  assert.deepEqual([...new Set(allocs.map((a) => a.lp_sub_source))], ['Company-wide']);
+  assert.ok(allocs.every((a) => Number(a.amount) === 100));
+  assert.deepEqual(allocs.map((a) => a.market).sort(), ['FTLAU_MKT', 'FTMYR_MKT', 'JAX_MKT', 'ORL_MKT', 'SAR_MKT', 'STPET_MKT']);
+});
+
+test('Edit adds a vendor that does not exist yet, sets "evenly across all offices", and remembers it for the next invoice', async () => {
+  const supabase = db();
+  const posts = [];
+  const text = 'Hatch Apps Inc\nReceipt #2757-9497\nService period: 10/01/2026 - 10/31/2026\nTotal $600.00';
+  const r = await ingestInvoice({ ...FWD, gmail_message_id: 'h2', file_name: 'Receipt-2757-9497.pdf', mime_type: 'application/pdf', file_b64: Buffer.from(text).toString('base64') }, { ...depsFor(supabase, { posts }), analyzeDeps: noAi() });
+  assert.ok(r.flags.includes('unknown_vendor'));
+  const updates = [];
+  const deps = { supabase, approvers: new Set(['U_BRAD']), reply: async () => {}, updateSlackMessage: async (c, ts, t, o) => { updates.push(o); return { ok: true }; }, signedLink: async () => null };
+  const values = {
+    new_vendor: { mktinv_v_new_vendor: { value: 'Hatch' } },
+    split: { mktinv_v_split: { selected_option: { value: 'even' } } },
+    remember: { mktinv_v_remember: { selected_options: [{ value: 'remember' }] } },
+  };
+  const parsed = parseEditSubmission(values);
+  assert.deepEqual([parsed.new_vendor, parsed.split, parsed.remember], ['Hatch', 'even', true]);
+  const edited = await handleMarketingInvoiceInteraction(parsedClick('edit_submit', r.document_id, { userId: 'U_BRAD', userName: 'brad', values }), deps);
+  assert.equal(edited.action, 'edited');
+  const vendor = supabase.tables.marketing_vendors.find((v) => v.vendor_name === 'Hatch');
+  assert.ok(vendor, 'the vendor was created');
+  assert.deepEqual(vendor.eligible_markets, ['ALL_OFFICES']);
+  const row = supabase.tables.marketing_expenses[0];
+  assert.equal(row.vendor_id, vendor.id);
+  assert.deepEqual(row.eligible_markets, ['ALL_OFFICES']);
+  assert.match(JSON.stringify(updates.at(-1).blocks), /new vendor \\"Hatch\\" added/);
+  const ok = await handleMarketingInvoiceInteraction(parsedClick('approve', r.document_id, { userId: 'U_BRAD', userName: 'brad' }), deps);
+  assert.equal(ok.action, 'approved', 'no sub-source needed for an even split');
+  assert.equal(supabase.tables.marketing_expense_allocations.length, 6);
+
+  // Next month's receipt matches "Hatch" by name and is split evenly with no Edit.
+  const next = 'Hatch\nReceipt #2757-9555\nService period: 11/01/2026 - 11/30/2026\nTotal $600.00';
+  const r2 = await ingestInvoice({ ...FWD, gmail_message_id: 'h3', file_name: 'Receipt-2757-9555.pdf', mime_type: 'application/pdf', file_b64: Buffer.from(next).toString('base64') }, { ...depsFor(supabase, { posts }), analyzeDeps: noAi() });
+  const row2 = supabase.tables.marketing_expenses.find((e) => e.document_id === r2.document_id);
+  assert.equal(row2.vendor_id, vendor.id);
+  assert.deepEqual(row2.eligible_markets, ['ALL_OFFICES']);
+});
+
+test('a document still failed a day later is removed and named once', async () => {
+  const supabase = db({ marketing_invoice_documents: [
+    { id: 'old', sha256: 'a', status: 'failed', file_name: 'x.pdf', from_address: 'b@x.com', error: 'extract: timed out', updated_at: '2026-10-11T00:00:00Z' },
+    { id: 'new', sha256: 'b', status: 'failed', file_name: 'y.pdf', from_address: 'b@x.com', error: 'extract: timed out', updated_at: '2026-10-13T11:00:00Z' },
+    { id: 'ok', sha256: 'c', status: 'in_review', updated_at: '2026-10-01T00:00:00Z' },
+  ] });
+  const posts = [];
+  const r = await purgeStaleFailedDocuments({}, { supabase, cfg: { channelId: 'C_REVIEW' }, postToSlack: async (t) => { posts.push(t); return { ok: true }; }, now: () => new Date('2026-10-13T12:00:00Z') });
+  assert.equal(r.removed, 1);
+  assert.deepEqual(supabase.tables.marketing_invoice_documents.map((d) => d.id).sort(), ['new', 'ok']);
+  assert.equal(posts.length, 1);
+  assert.match(posts[0], /x\.pdf/);
 });

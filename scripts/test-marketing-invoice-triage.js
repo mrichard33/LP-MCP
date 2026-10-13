@@ -9,7 +9,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { triageExtraction, fillRowDefaults, MIN_INVOICE_CHARS, SKIP_REASONS } from '../src/marketing/invoice-triage.js';
+import { triageExtraction, fillRowDefaults, linkedFileIn, MIN_INVOICE_CHARS, SKIP_REASONS } from '../src/marketing/invoice-triage.js';
 import { matchVendor, vendorLearnPatch, isInternalMailDomain, emailDomainsIn } from '../src/marketing/vendors.js';
 import { buildExpenseRows, computeFlags } from '../src/marketing/expense-builder.js';
 import { extractInvoiceFacts } from '../src/marketing/invoice-rules.js';
@@ -55,10 +55,18 @@ test('a short OCR that carries a money figure or an invoice word is still an inv
   assert.equal(triageExtraction({ text: 'see 987.65 attached', kind: 'image' }).verdict, 'invoice');
 });
 
-test('a CSV, an XLSX or the email body is never triaged out', () => {
+test('a CSV or an XLSX is never triaged out; an email body needs an amount, and a linked receipt is named', () => {
   assert.equal(triageExtraction({ text: 'a,b', kind: 'csv' }).verdict, 'invoice');
   assert.equal(triageExtraction({ text: '', kind: 'xlsx' }).verdict, 'invoice');
-  assert.equal(triageExtraction({ text: 'ok', kind: 'text', meta: { format: 'email_body' } }).verdict, 'invoice');
+  assert.equal(triageExtraction({ text: 'please pay $500 for September', kind: 'text', meta: { format: 'email_body' } }).verdict, 'invoice');
+  assert.deepEqual(triageExtraction({ text: 'ok', kind: 'text', meta: { format: 'email_body' } }).reason, SKIP_REASONS.NO_AMOUNT);
+  // 2026-10-13: the Hatch forward — Outlook "attached" the receipt as a OneDrive link.
+  const hatch = '​[https://res.public.onecdn.static.microsoft/assets/fluentui-resources/1.1.0/app-min/assets/item-types/24/pdf.png]Receipt-2757-9497.pdf<https://reecewindows-my.sharepoint.com/:b:/p/m_richard/IQDxd6PLVYpxRaGupkkG5vNWAapvV-GDyjSq6hwmoWrD0Ao>​ ';
+  const t = triageExtraction({ text: hatch, kind: 'text', meta: { format: 'email_body' } });
+  assert.equal(t.verdict, 'not_an_invoice');
+  assert.equal(t.reason, SKIP_REASONS.LINKED_FILE);
+  assert.equal(linkedFileIn(hatch).name, 'Receipt-2757-9497.pdf');
+  assert.equal(linkedFileIn('Total $5 https://example.com/x.pdf'), null);
 });
 
 test('the JMJ invoice: the rules read the total and the invoice date, the period is assumed and flagged', () => {
