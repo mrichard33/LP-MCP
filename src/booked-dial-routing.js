@@ -163,7 +163,11 @@ export function buildCandidate(row, lead = null) {
  * One candidate per phone. A row with a booked visit beats one without
  * (2026-10-13: a fresh web form with no appointment, newer than the lead that
  * holds the visit, won the phone and the visit never reached a Conf list).
- * Otherwise the newest row wins.
+ * A killed row never beats a live one, and a row LP checked out into a lead
+ * beats an inbound-only one (2026-10-13: in1 430305, a self-book a minute
+ * after 430304, killed "Duplicate" but carrying the appt date, took the phone
+ * from lead 583074 every pass and its Thursday visit never reached "Conf -
+ * 2nd Day"). Otherwise the newest row wins.
  */
 const hasVisit = (c) => Boolean(c.booked && c.apptDate);
 export function onePerPhone(candidates) {
@@ -173,9 +177,10 @@ export function onePerPhone(candidates) {
     if (!c.phone) { dropped.push(c); continue; }
     const prev = byPhone.get(c.phone);
     if (!prev) { byPhone.set(c.phone, c); continue; }
-    const better = hasVisit(c) !== hasVisit(prev)
-      ? hasVisit(c)
-      : (c.receivedMs ?? 0) > (prev.receivedMs ?? 0);
+    const better = c.killed !== prev.killed ? !c.killed
+      : hasVisit(c) !== hasVisit(prev) ? hasVisit(c)
+        : Boolean(c.ldsId) !== Boolean(prev.ldsId) ? Boolean(c.ldsId)
+          : (c.receivedMs ?? 0) > (prev.receivedMs ?? 0);
     if (better) { dropped.push(prev); byPhone.set(c.phone, c); } else dropped.push(c);
   }
   return { winners: [...byPhone.values()], dropped };
