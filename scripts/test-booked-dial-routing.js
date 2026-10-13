@@ -11,7 +11,7 @@ import assert from 'node:assert/strict';
 import {
   routingConfig, routingMode, buildCandidate, routeBooked, prefilter, decide, addState, buildRemovalAction,
   buildAddAction, approvalExpired, onePerPhone, priorRemoveKeys, removeKey, RULE_KEY,
-  failedAddCount, confMoveDue, formatAddFailedCard,
+  failedAddCount, confMoveDue, formatAddFailedCard, lookupPriority,
 } from '../src/booked-dial-routing.js';
 import { routeList, backstopConfig, currentState, prefilter as backstopPrefilter } from '../src/new-lead-dial-backstop.js';
 import { normalizeInboundRow } from '../src/new-lead-dial-backstop.js';
@@ -93,6 +93,26 @@ test('one candidate per phone, newest row wins', () => {
   const { winners, dropped } = onePerPhone([newer, older]);
   assert.deepEqual(winners.map((c) => c.in1), ['2']);
   assert.deepEqual(dropped.map((c) => c.in1), ['1']);
+});
+
+test('2026-10-13: the row holding the visit wins its phone over a newer row with none', () => {
+  const booked = cand({ id: '1', datereceived: '2026-10-05T10:00:00' });
+  const form = cand({ id: '2', datereceived: '2026-10-06T10:00:00', apptdate: '', appttime: '', dsp_id: '' });
+  for (const order of [[form, booked], [booked, form]]) {
+    const { winners } = onePerPhone(order);
+    assert.deepEqual(winners.map((c) => c.in1), ['1']);
+  }
+});
+
+test('2026-10-13: Five9 lookups go to adds first, soonest visit first; removal re-checks last', () => {
+  const at = (iso) => ({ c: { apptStartMs: Date.parse(iso) } });
+  const items = [
+    { ...at('2026-10-14T14:00:00Z'), needsAdd: false, id: 'recheck-soon' },
+    { ...at('2026-10-15T14:00:00Z'), needsAdd: true, id: 'add-later' },
+    { ...at('2026-10-13T14:00:00Z'), needsAdd: true, id: 'add-today' },
+    { c: { apptDate: '2026-10-14' }, needsAdd: true, id: 'add-tomorrow-no-time' },
+  ];
+  assert.deepEqual(items.sort(lookupPriority).map((x) => x.id), ['add-today', 'add-tomorrow-no-time', 'add-later', 'recheck-soon']);
 });
 
 /* --- the decision ----------------------------------------------------------- */
@@ -347,6 +367,7 @@ function harness({ inbound = [SHELLEY_RAW], soldPhones = [], dnc = [], contactLi
   };
   const runSQL = async (sql) => {
     if (/FROM lp_leads WHERE created_at_lp/.test(sql)) return [];
+    if (/appointment_date >=/.test(sql)) return state.apptLeads || [];
     if (/closed_won = true/.test(sql)) return soldPhones.map((p) => ({ phone10: p }));
     if (/five9_add_records_to_list/.test(sql)) {
       // Our own queued adds count too, as they would in agent_actions.
@@ -613,4 +634,28 @@ test('a removal-only lead needs no Five9 lookup, so the lookup cap never holds i
   assert.equal(lookups, 0);
   assert.equal(res.by_reason.lookup_cap, undefined);
   assert.equal(res.counts.would_remove, 20, 'only the removal cap applies');
+});
+
+test('2026-10-13: an OLDER lead with a visit tomorrow reaches "Conf - Next Day" (the 72h window missed it)', async () => {
+  __resetLoggedForTests();
+  const h = harness({ inbound: [] });
+  // Created 9 days earlier, re-booked for tomorrow: neither the inbound window nor created_at_lp sees it.
+  h.state.apptLeads = [{
+    lp_lead_id: '579435', lp_prospect_id: '461682', disposition_code: 'Set', appointment_date: '2026-10-07 10:00:00+00',
+    phone: '(941) 467-0700', first_name: 'Alyce', last_name: '', created_at_lp: '2026-09-28 17:06:06+00',
+  }];
+  const res = await runBookedDialRouting({ env: LIVE, nowMs: edt('2026-10-06T16:00:00'), deps: h.deps });
+  assert.equal(res.ok, true, res.errors.join());
+  assert.deepEqual(h.actions.map((a) => [a.action_type, a.target_id]), [['five9_add_records_to_list', 'Conf - Next Day']]);
+});
+
+test('2026-10-13: a cancelled older lead is still skipped', async () => {
+  __resetLoggedForTests();
+  const h = harness({ inbound: [] });
+  h.state.apptLeads = [{
+    lp_lead_id: '579436', lp_prospect_id: '461683', disposition_code: 'CXL', appointment_date: '2026-10-07 10:00:00+00',
+    phone: '(941) 467-0700', created_at_lp: '2026-09-28 17:06:06+00',
+  }];
+  await runBookedDialRouting({ env: LIVE, nowMs: edt('2026-10-06T16:00:00'), deps: h.deps });
+  assert.equal(h.actions.length, 0);
 });

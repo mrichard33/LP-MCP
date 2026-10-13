@@ -381,6 +381,12 @@ after that). It runs WITHOUT approval by Mark's standing exception to #1057 (202
 should be able to automatically remove it from the other list"), keyed on rule `BOOKED_DIAL_ROUTING` only — any other
 list removal still needs approval. `BOOKED_ROUTING_AUTO_REMOVE=false` is the rollback to approval cards. Every decision is
 in `booked_dial_routing_log`.
+**Every upcoming visit is routed, not only new leads (the user, 2026-10-13: "we are going to start using the dialer
+again").** Of 80 Set/Verif visits for today..+2 on 2026-10-13, 36 had no Conf add: 25 were on leads older than the 72h
+window (a rebook, a re-set, a bot booking on an existing lead, or a visit booked 4+ days ahead), 9 sat on `lookup_cap`
+every pass, 2 lost their phone to a newer form row with no visit. Now the job also reads every lead with a visit
+today..+2 (`readLeadsByAppointment`), spends the Five9 lookups on adds first, soonest visit first (`lookupPriority`),
+and a row holding a visit wins its phone (`onePerPhone`).
 
 **The LP note is a 2–3 sentence rep brief (the user, 2026-10-05).** Prospect 462947 reached LP with 1,400
 characters: the address three times, "tomorrow" for the visit, a script with a blank ("this is [YOUR NAME]"), internal
