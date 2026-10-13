@@ -127,6 +127,27 @@ export function smsBookingTurn({ plan, trigger, thread = [], slots = [], tz = 'E
   };
 }
 
+/**
+ * Did CODE fix the visit time this turn? (2026-10-13, live-mode gate,
+ * book_it_evening_spouse on SMS.) Two evening times were offered and the lead
+ * texted "Yes, book it" without picking one: pickSlot found no pick, so no
+ * booking facts were built, yet the model's own book_appointment survived and
+ * the reply said "You're all set" before asking which time. A model companion
+ * may stand only when code pinned the slot: booking facts that book, a pick
+ * against our own offer, a held time being collected, or a Rehash Call pick.
+ * Pure.
+ */
+export function bookingBackedByCode({ plan, trigger = '', bookingFacts = null, slots = [] } = {}) {
+  if (bookingFacts?.book) return true;
+  if (!plan) return false;
+  if (plan.rehash_pick) return true;
+  if (plan.step === 'collect' && plan.held_slot?.text) return true;
+  if (plan.required_move === 'confirm') {
+    return !!pickSlot(trigger, offeredSlots(plan.last_offer || '', Array.isArray(slots) ? slots : []));
+  }
+  return false;
+}
+
 const NAME_ASK_RX = /\b(?:first|full|your)\s+name\b|\bwho\s+should\s+i\s+put\b/i;
 /** The name the lead typed in this thread, or null. Pure. */
 export function nameFromThread(thread = []) {

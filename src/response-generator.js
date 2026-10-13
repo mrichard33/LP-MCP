@@ -407,7 +407,7 @@ import { normalizeTimezone, tzLongName, tzLabel } from './config/market-timezone
 import { offeredSlots, pickSlot } from './live-chat/cancel-flow.js';
 import { holdLine, COLLECT_ASK, dmAsk, parseDecisionMakers } from './agentic/booking-collect.js';
 import { contactRecheckLine, recheckHint, RECHECK_RX } from './agentic/contact-check.js';
-import { smsBookingTurn, enforceBookingFacts, bookingFactsNote } from './agentic/sms-booking-turn.js';
+import { smsBookingTurn, enforceBookingFacts, bookingFactsNote, bookingBackedByCode } from './agentic/sms-booking-turn.js';
 import { LINES as NEPQ_LINES } from './agentic/nepq-planner.js';
 import { buildStageInput, leadStageMode } from './agentic/lead-stage.js';
 import { typedZipFromThread, zoneForContact } from './services/contact-timezone.js';
@@ -4646,6 +4646,16 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // claim becomes "our team will call to set up a time". Gated on the NEPQ
   // backbone so production SMS is unchanged until it goes live.
   if (nepqModeEarly === 'live' && channel === 'sms') {
+    // 2026-10-13 (live-mode gate, book_it_evening_spouse): "Yes, book it" to a
+    // two-time offer booked a visit the lead never picked and said "You're all
+    // set". The model's book_appointment stands only when code fixed the time
+    // this turn; dropped here, so the claim below is rewritten to the times.
+    if (nepqPlan && validated.companion_action?.action_type === 'book_appointment'
+        && !bookingBackedByCode({ plan: nepqPlan, trigger: triggerMessage, bookingFacts, slots: fullSlotsForPick })) {
+      console.warn(`[NEPQ] ${contactId} unpinned_booking_dropped: ${nepqPlan.required_move || nepqPlan.step} with no picked time`);
+      validated.companion_action = null;
+      validated.unpinned_booking_dropped = true;
+    }
     const onFile = !!appointmentOnFile({ upcomingAppointments, lp: context.lp });
     // A hold stands only when code held the slot this turn (booking facts).
     const held = !!bookingFacts && (bookingFacts.kind === 'hold' || bookingFacts.kind === 'collect');

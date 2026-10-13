@@ -15,7 +15,7 @@ process.env.SUPABASE_SERVICE_KEY ||= 'test';
 const { enforceOneAsk, asksIn } = await import('../src/agentic/one-ask.js');
 const { parseDayPreference, slotsForPreference, preferenceOfferLine } = await import('../src/agentic/day-preference.js');
 const { findUnbackedBookingClaim, rewriteBookingClaims } = await import('../src/agentic/booking-claim.js');
-const { smsBookingTurn, enforceBookingFacts, clockTimes } = await import('../src/agentic/sms-booking-turn.js');
+const { smsBookingTurn, enforceBookingFacts, clockTimes, bookingBackedByCode } = await import('../src/agentic/sms-booking-turn.js');
 const { recheckSlot, nearestTwo } = await import('../src/agentic/slot-recheck.js');
 const { planNepqTurn, enforceNepqPlan, LINES, ALT_LINES } = await import('../src/agentic/nepq-planner.js');
 const { COLLECT_ASK } = await import('../src/agentic/booking-collect.js');
@@ -152,6 +152,18 @@ test('smsBookingTurn facts: a pick with the address missing → hold + one ask',
   assert.equal(f.book, false);
   assert.equal(f.slot.iso, '2026-10-03T14:00:00-04:00');
   assert.equal(f.companion, null);
+});
+
+// 2026-10-13 (live-mode gate, book_it_evening_spouse): "Yes, book it" to two
+// offered times booked a visit nobody picked and said "You're all set".
+test('bookingBackedByCode: a bare yes to two times backs no booking; a pick, a held time or booking facts do', () => {
+  const offerPlan = { required_move: 'offer_slots', step: 'offer', last_offer: OFFER, counters: {} };
+  assert.equal(bookingBackedByCode({ plan: offerPlan, trigger: 'Yes, book it', slots: SLOTS }), false);
+  assert.equal(bookingBackedByCode({ plan: CONFIRM, trigger: 'Yes, book it', slots: SLOTS }), false);
+  assert.equal(bookingBackedByCode({ plan: CONFIRM, trigger: 'Fine lets book for 2 PM', slots: SLOTS }), true);
+  assert.equal(bookingBackedByCode({ plan: { step: 'collect', held_slot: { text: 'Great, I\'m holding Sat, Oct 3 at 2:00 PM for you.' } }, trigger: '12 Main St 33908', slots: SLOTS }), true);
+  assert.equal(bookingBackedByCode({ plan: offerPlan, trigger: 'ok', bookingFacts: { book: true }, slots: SLOTS }), true);
+  assert.equal(bookingBackedByCode({ plan: null, trigger: 'Yes, book it', slots: SLOTS }), false);
 });
 
 test('smsBookingTurn facts: nothing missing → book, with the pinned slot and the decision-maker answer', () => {
