@@ -761,6 +761,10 @@ third time; she texted STOP. Now:
   nothing filed, no promise recorded (`shouldRecordPromise`), and no "I'll check back" when THEY said they would reach
   out (`leadWillReachOut`). `enforceSignOff` is the last pass on both bots in every mode; `appendReferenceAsk` never
   glues an ask after a sign-off line (a bare "Enjoy." counts). checkReply: `times_after_sign_off`, `repeat_slot_offer`.
+  A lead who says THEY will call is never a call request, even when the classifier says CALLBACK (post-merge sim: "I
+  can call back…" got "We'll have someone … give you a call" and a Five9 filing): `askedForCall`, the classifier
+  fallback (`callback_requested`) and the send handler's scheduling route all skip it, and both guards drop our call
+  promise. The first price ask must end on its scoping question (`PRICE_SCOPE_MARKERS`), never a calendar ask.
 - Our hand-off or goodbye closes an open offer (`OFFER_CLOSED_RX` in `lastOfferOut`), the same two times never go out
   three times in a row, and a layer3 script saying "NO times" reaches the planner (`directiveNoTimes`).
 - **Price (the owner's ruling, supersedes Mark's 2026-10-02 quote → times → a person):** 1st ask `LINES.price_scope`

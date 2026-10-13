@@ -521,6 +521,8 @@ export function isNo(text, lastOutbound = '') {
 // Every price reply says why there is no number yet; the next turn counts
 // these to decide quote → times → a person (Part 7: the model words them).
 const PRICE_PLAY_RX = /\bevery\s+(?:home|house)(?:'s|’s|\s+is)\s+(?:a\s+little\s+)?different\b|\bany\s+number\s+i\s+gave\b|\ba\s+number\s+(?:right\s+)?now\s+would\s+(?:just\s+)?be\s+a\s+guess\b/i;
+// The first price ask's question asks about the job, never for a visit.
+const PRICE_SCOPE_MARKERS = Object.freeze([{ rx: /\b(?:how\s+many|style|size|sizes|big|whole\s+house|openings?)\b[^?.!]*\?/i, say: 'end on the scoping question (how many windows, or the style and size), not a visit or calendar ask' }]);
 // Our own third-price-ask call offer (LINES.price_call_offer, model-worded).
 const PRICE_CALL_OFFER_RX = /\btalk\s+it\s+through\b[^?]*\?|\b(?:give\s+you\s+a\s+(?:quick\s+)?call|call\s+you)\b[^.!]*\?/i;
 // A message of ours that ends an open time offer: a hand-off to a person, a
@@ -895,7 +897,10 @@ function planNepqTurnCore({
   };
   // The intent classifier read a call request the regex missed ("can I talk
   // to a real person on the phone"): same hand-off (2026-10-03).
-  const askedForCall = (CALLBACK_RX.test(now) || callbackRequested) && !isNotInterested(now);
+  // 2026-10-13 (post-merge sim of Erica's thread): the classifier read "I can
+  // call back when I have more time" as CALLBACK and the bot promised a call
+  // and filed Five9. A lead who says THEY will call has asked for nothing.
+  const askedForCall = (CALLBACK_RX.test(now) || (callbackRequested && !leadWillReachOut(now))) && !isNotInterested(now);
   if (askedForCall && serviceCall()) return serviceHandoff();
   // 1a. A rehash call on the Rehash Call calendar (the user, 2026-10-09): two
   // REAL openings when they want the call, the pick booked, never a time the
@@ -1162,7 +1167,10 @@ function planNepqTurnCore({
     // question, no times. The count question when the count is unknown.
     if (priceLines === 0) {
       const line = LINES.price_scope(!!knownOpenings || openingsKnown(turns));
-      return fixed('objection_play', line, { step: 'discover', objection: { type: 'price', attempt, line }, booking: { allowed: false, reason: 'nepq:price_scope' } });
+      // 2026-10-13 (post-merge sim): the live chat's version swapped the scoping
+      // question for "Want to get on the calendar for that?". The model's
+      // question must be the scoping one.
+      return fixed('objection_play', line, { step: 'discover', objection: { type: 'price', attempt, line }, reference_markers: PRICE_SCOPE_MARKERS, booking: { allowed: false, reason: 'nepq:price_scope' } });
     }
     // Asked again: the free measure as a yes/no question. Times only after a yes.
     const line = vary(LINES.price_visit_offer, ALT_LINES.price_visit_offer);
@@ -2092,7 +2100,7 @@ export function enforceNepqPlan(draft, plan, { allowFigures = false, known = {} 
   // 2a'. The lead said goodbye (2026-10-13, Erica Hilts): no question, no
   // time, and no "I'll check back next week" when they said THEY would call.
   if (plan.step === 'sign_off' || plan.step === 'price_rest') {
-    drop(s => s.includes('?') || SLOT_OFFER_RX.test(s) || clockMinutes(s).length > 0 || (plan.lead_will_reach_out && CHECK_BACK_RX.test(s)), 'sign_off_no_ask');
+    drop(s => s.includes('?') || SLOT_OFFER_RX.test(s) || clockMinutes(s).length > 0 || (plan.lead_will_reach_out && (CHECK_BACK_RX.test(s) || promisedCallback(s))), 'sign_off_no_ask');
   }
   // 2b. "Do you offer financing?" keeps its yes when the figure strip took the
   // answer sentence (2026-10-02 simulation: "Yes, we offer 0% APR financing"

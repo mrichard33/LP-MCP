@@ -273,7 +273,7 @@ import { enforceTeamVoice } from './agentic/team-voice.js';
 import { enforcePropertyScope } from './agentic/property-scope.js';
 import { dropFragmentOpener, dropStaleCallMention, normalizeSignature, isNearRepeat, replySimilarity, NEAR_REPEAT_NOTE } from './agentic/sms-format.js';
 import { enforceNonOwner } from './agentic/non-owner.js';
-import { enforceSignOff } from './agentic/sign-off.js';
+import { enforceSignOff, leadWillReachOut } from './agentic/sign-off.js';
 import { enforceJobScope, openingsToSave } from './agentic/job-scope.js';
 import { isPostDemoLead } from './agentic/post-demo-lead.js';
 import { enforceCallTiming, softenCallTiming, isTeamOpen, enforceRehashCallTiming } from './agentic/team-hours.js';
@@ -4912,7 +4912,8 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   validated.service_conversation = nepqIsServiceCallback({ conversation: context.conversation_recent || [], trigger: triggerMessage, isCustomer: isCustomerP2(context) });
   // A call request the planner did not hand off (NEPQ off, or the plan failed)
   // is still filed after the send: Five9 for sales, #service for service.
-  if (String(classification?.intent_class || '').toUpperCase() === 'CALLBACK' && !nepqPlan?.handoff) {
+  // Not when the lead says THEY will call ("I can call back when I have more time", 2026-10-13).
+  if (String(classification?.intent_class || '').toUpperCase() === 'CALLBACK' && !nepqPlan?.handoff && !leadWillReachOut(triggerMessage)) {
     validated.callback_requested = validated.service_conversation ? 'service' : 'callback_request';
   }
 

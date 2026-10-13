@@ -220,3 +220,38 @@ test('an opt-out cancels the promised call and the Five9 push', () => {
   assert.equal(optedOutOfCalls(null), false, 'unreadable changes nothing');
   assert.deepEqual(readRequeueResult({ status: 'completed', result: { action: 'requeue_blocked_opt_out' } }), { status: 'opted_out' });
 });
+
+// 2026-10-13, the post-merge simulation of Erica's thread: the classifier read
+// "I can call back when I have more time. Ty" as CALLBACK, the planner handed
+// off, and the reply promised "We'll have someone from our team give you a call
+// when it's a better time." (a Five9 Callback Request she never asked for).
+test('the classifier\'s CALLBACK on "I can call back…" is a goodbye, not a call request', async () => {
+  const { enforceSignOff } = await import('../src/agentic/sign-off.js');
+  const p = plan({ trigger: MSG_1057, callbackRequested: true, conversation: [...ERICA, ...T(['i', MSG_1055], ['o', LINES.sign_off('Erica')], ['i', MSG_1057])] });
+  assert.equal(p.step, 'sign_off');
+  assert.equal(p.handoff, null);
+  // A real call request still is one, classifier or words.
+  assert.equal(plan({ trigger: 'Can someone call me back tomorrow?', conversation: T(['i', 'Can someone call me back tomorrow?']) }).handoff?.reason, 'callback_request');
+  assert.equal(plan({ trigger: 'yes', callbackRequested: true, conversation: T(['i', 'yes']) }).handoff?.reason, 'callback_request');
+  // The promise is dropped by both guards.
+  const draft = "Sounds good, Erica. We'll have someone from our team give you a call when it's a better time.";
+  const out = enforceNepqPlan(draft, p);
+  assert.doesNotMatch(out.text, /give you a call/);
+  const last = enforceSignOff(draft, { inbound: MSG_1057 });
+  assert.equal(last.changed, true);
+  assert.doesNotMatch(last.text, /give you a call/);
+  // A goodbye with no "I'll call you" keeps our call line (they did not say they would call).
+  assert.equal(enforceSignOff("Thanks. Someone from our team will give you a call tomorrow.", { inbound: 'Have a good day' }).changed, false);
+});
+
+// 2026-10-13, the post-merge live-chat simulation: the first price ask came back
+// as "…Want to get on the calendar for that?" instead of the scoping question.
+test('the first price ask must end on the scoping question, not a calendar ask', () => {
+  const p = plan({ channel: 'livechat', knownOpenings: true, trigger: 'How much for 12 windows?', conversation: T(['i', 'How much for 12 windows?']) });
+  const bad = 'Every home is different, so the price depends on the window sizes. Rather than guess wrong, we do a free in-home assessment. Want to get on the calendar for that?';
+  const out = enforceNepqPlan(bad, p);
+  assert.ok(out.failed.length, 'the calendar ask fails the reference check');
+  assert.equal(out.text, LINES.price_scope(true));
+  const good = 'Fair question. Every home is different, the price depends on size, style and the impact glass. What style are you thinking of, and how big are the openings?';
+  assert.deepEqual(enforceNepqPlan(good, p).failed, []);
+});
