@@ -189,6 +189,13 @@ test('not the owner: no times at all', () => {
   assert.equal(p.booking.allowed, false);
 });
 
+test('a landlord (a home rented out): no times either (the user, 2026-10-13)', () => {
+  const p = plan(thread(['o', 'Would a visit help?']), 'yes, we rent it out but I own it', { stage: { stage: 'problem', facts: {} } });
+  assert.equal(p.step, 'not_owner');
+  assert.equal(p.slots_to_offer.length, 0);
+  assert.equal(p.booking.allowed, false);
+});
+
 // ── the repeat complaint changes the move ────────────────────────────────
 
 test('"you just said that" never gets the same offer again (batch 2 #4)', () => {

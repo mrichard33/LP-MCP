@@ -35,8 +35,26 @@ test('a renter who says it now gets the non-owner line: no times, no question', 
   assert.equal(r.changed, true);
   assert.equal(r.text, NON_OWNER_LINE);
   assert.doesNotMatch(r.text, /\?|AM|PM|!/);
-  assert.match(r.text, /homeowner needs to be part/);
-  assert.match(r.text, /owner is welcome to reach out/);
+  assert.match(r.text, /don't work on rental units/);
+  // 2026-10-13: the owner of a rental cannot book either, so the tenant is
+  // never sent to the owner.
+  assert.doesNotMatch(r.text, /owner is welcome|reach out/);
+});
+
+test('a landlord gets the same no (the user, 2026-10-13: no rental units at all)', () => {
+  for (const inbound of ['we rent it out to tenants', 'It is an Airbnb we own', 'my tenants say the windows leak']) {
+    const r = enforceNonOwner(OFFER, { thread: [], inbound });
+    assert.equal(r.text, NON_OWNER_LINE, inbound);
+    assert.equal(isNonOwner([], inbound), true, inbound);
+  }
+  // A reply that already says no is left alone.
+  const no = "Sorry, we don't work on rental units, so we can't set up a visit for a home that's rented out.";
+  assert.equal(enforceNonOwner(no, { thread: [], inbound: 'we rent it out' }).changed, false);
+  // Said earlier: the time offer goes.
+  const later = enforceNonOwner(OFFER, { thread: thread(['i', 'we rent it out'], ['o', 'Thanks for telling me.']), inbound: 'so can you come by?' });
+  assert.doesNotMatch(later.text, /AM|PM/);
+  // A former rental they live in now is a normal home.
+  assert.equal(isNonOwner([], 'we used to rent it out but we live there now'), false);
 });
 
 test('said earlier: the answer stays, the time offer goes', () => {
@@ -45,8 +63,8 @@ test('said earlier: the answer stays, the time offer goes', () => {
   assert.equal(r.text, 'The visit takes about an hour.');
 });
 
-test('an owner, a landlord, or nothing said: untouched', () => {
-  for (const inbound of ['we own the house', 'we rent it out to tenants', 'my windows leak']) {
+test('an owner, or nothing said: untouched', () => {
+  for (const inbound of ['we own the house', 'my windows leak', 'it is an investment property we are fixing up']) {
     const r = enforceNonOwner(OFFER, { thread: [], inbound });
     assert.equal(r.changed, false, inbound);
   }

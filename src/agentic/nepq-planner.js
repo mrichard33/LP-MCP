@@ -36,7 +36,9 @@ import { isKnockComplaint } from './do-not-knock.js';
 import { detectDeferral, pendingDeferral, isAcknowledgment, isSignOffLine, POST_DEMO_QUESTIONS } from './post-demo-turn.js';
 import { PURCHASED_ELSEWHERE_RX } from './purchased-elsewhere.js';
 import { rehashNepqTurn, bridgedRecently, BEST_DEAL_RX, PRE_BRIDGE_STAGES } from './rehash-nepq.js';
-import { homeownerFromThread, OWNER_ASK_RX } from './homeowner.js';
+import { homeownerFromThread, rentalFromThread, OWNER_ASK_RX } from './homeowner.js';
+import { smallJobCount, smallJobItem, smallJobLine, SMALL_JOB_SAID_RX, dropMinimumTalk } from './small-job.js';
+import { leadRaisesScope } from './property-scope.js';
 import { decisionMakersFromThread, dmSettled } from './qualifying.js';
 import { extractZip } from './service-area-turn.js';
 
@@ -1384,7 +1386,32 @@ function planNepqTurnCore({
  */
 export function planNepqTurn(args = {}) {
   const plan = planNepqTurnCore(args);
-  return args?.stage?.stage ? gateForStage(plan, args) : plan;
+  return withSmallJob(args?.stage?.stage ? gateForStage(plan, args) : plan, args);
+}
+
+/**
+ * One or two windows (the user, 2026-10-13): the line goes in front of this
+ * turn's move, once per conversation, and the move goes on as planned (the
+ * next question, or the times). Never on a hand-off, a post-demo or booked
+ * lead, a lead we cannot book (not the owner, a rental) or a home we cannot
+ * work on: the no is the whole reply there. Pure.
+ */
+function withSmallJob(plan, args = {}) {
+  if (!plan || plan.handoff || plan.post_demo || plan.step === 'booked' || plan.step === 'not_owner') return plan;
+  const now = String(args.trigger || '');
+  const n = smallJobCount(now);
+  if (!n || leadRaisesScope(now)) return plan;
+  const turns = normalizeThread(args.conversation, args.trigger);
+  if (turns.some(t => t.direction === 'outbound' && SMALL_JOB_SAID_RX.test(t.text))) return plan;
+  if (rentalFromThread(turns) === 'tenant' || rentalFromThread(turns) === 'landlord') return plan;
+  const line = smallJobLine(n, smallJobItem(now));
+  const marker = { rx: SMALL_JOB_SAID_RX, say: 'say we will also quote the other windows, in case they want to do more later' };
+  plan.small_job_line = line;
+  plan.reference_markers = [...(Array.isArray(plan.reference_markers) ? plan.reference_markers : []), marker];
+  // A fixed line keeps its own job after ours; its "Happy to help with …"
+  // opener would say the same thing twice.
+  if (plan.fixed_line) plan.fixed_line = `${line} ${String(plan.fixed_line).replace(/^\s*Happy to help with [^.?!]*[.!]\s*/i, '')}`;
+  return plan;
 }
 
 // Steps that put a visit time in front of the lead (or a pick of one).
@@ -1414,8 +1441,9 @@ function gateForStage(plan, args) {
     plan.day_preference_pending = false;
     plan.last_offer = null;
   };
-  // Not the owner: no times at all (the qualifying guard words the reply).
-  if (facts.homeowner === 'no') {
+  // Not the owner, or a home that is rented out (the user, 2026-10-13: no
+  // rental units at all): no times (the qualifying guard words the reply).
+  if (facts.homeowner === 'no' || rentalFromThread(turns) === 'landlord') {
     clear();
     plan.stage = { ...(plan.stage || {}), blocked: 'not_owner' };
     return Object.assign(plan, { step: 'not_owner', required_move: 'answer', fixed_line: null, booking: { allowed: false, reason: 'nepq:not_owner' } });
@@ -1909,6 +1937,15 @@ export function enforceNepqPlan(draft, plan, { allowFigures = false, known = {} 
     if (questions.length > 1) changes.push('one_question');
   }
   body = sentences.join(' ').trim();
+  // 2026-10-13 (the user): the minimum is never told to the lead, and one or
+  // two windows get the line once. A fixed move's reference check keeps the
+  // line (its marker); any other move gets it in front when the draft lost it.
+  const minimum = dropMinimumTalk(body);
+  if (minimum.changed) { body = minimum.text; changes.push('minimum_dropped'); }
+  if (plan.small_job_line && !referenceMove && !SMALL_JOB_SAID_RX.test(body)) {
+    body = `${plan.small_job_line} ${body}`.trim();
+    changes.push('small_job_line');
+  }
   // A post-demo thank-you that lost everything to the drops: thanks back.
   if (!body && plan.post_demo && plan.ack_line) { body = plan.ack_line; changes.push('ack_line'); }
   // 2026-10-11 live simulation: "Thanks for checking in" got "Anytime. Talk

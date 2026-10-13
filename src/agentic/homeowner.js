@@ -9,12 +9,30 @@
 //   This is the one reader of the lead's own words about owning or renting,
 //   shared by the stage recorder (lead-stage.js) and the qualifying guard.
 //   A landlord ("we rent it out", "my tenants") OWNS the home: that is not a
-//   renter (lp-note-dq.js excludes "renting it out" for the same reason).
+//   renter. Since 2026-10-13 a rental is a no anyway (rentalFromThread and
+//   property-scope.js), but the ownership answer stays true.
 //
 // PURE. No I/O.
 
-// A rental owner talking about their own property.
-const RENTAL_OWNER_RX = /\brent(?:ing|ed)?\s+(?:it|them|this|that|the\s+\w+|my\s+\w+|our\s+\w+)\s+out\b|\brent(?:ing)?\s+out\b|\brental\s+propert(?:y|ies)\b|\b(?:my|our)\s+tenants?\b|\b(?:i'?m|i\s+am|we'?re|we\s+are)\s+the\s+landlords?\b|\bi\s+own\s+(?:a\s+|the\s+)?rental\b/i;
+// A rental owner talking about their own property. Exported for
+// property-scope.js: since 2026-10-13 a rental is a no for the landlord too
+// (the user: "We do not work on … rental units"), but the landlord still OWNS
+// the home, so homeownerFromThread keeps answering 'yes' for them.
+export const RENTAL_OWNER_RX = /\brent(?:ing|ed)?\s+(?:it|them|this|that|the\s+\w+|my\s+\w+|our\s+\w+)\s+out\b|\brent(?:ing)?\s+out\b|\brental\s+propert(?:y|ies)\b|\b(?:my|our)\s+tenants?\b|\b(?:i'?m|i\s+am|we'?re|we\s+are)\s+the\s+landlords?\b|\bi\s+own\s+(?:a\s+|the\s+)?rental\b/i;
+
+// The home is rented out, by the landlord's words or a rental named as a
+// thing (Airbnb, "it's a rental"). A tenant ("I'm renting") is RENTER_RX.
+export const RENTAL_HOME_RX = new RegExp([
+  RENTAL_OWNER_RX.source,
+  '\\brental\\s+(?:units?|homes?|houses?|condos?|apartments?)\\b',
+  '\\bapartment\\s+(?:building|complex)(?:es|s)?\\b',
+  '\\b(?:airbnb|vrbo)\\b',
+  '\\bshort[-\\s]term\\s+rentals?\\b',
+  "\\b(?:it'?s|it\\s+is)\\s+(?:a|an)\\s+rental\\b",
+].join('|'), 'i');
+
+// A former rental the owner now lives in: not a rental any more.
+export const LIVES_THERE_NOW_RX = /\b(?:used\s+to\s+(?:rent|be\s+a\s+rental)|was\s+a\s+rental|no\s+longer\s+(?:rent|a\s+rental))\b|\b(?:we|i)\s+(?:now\s+)?live\s+(?:there|in\s+it)\s+now\b/i;
 
 // The lead says they rent. "Can renters get a quote?" counts: batch 3 asked it
 // exactly that way about their own home.
@@ -66,3 +84,28 @@ export function homeownerFromThread(turns = []) {
   }
   return 'unknown';
 }
+
+/**
+ * Is the home a rental, by the lead's own words (the user, 2026-10-13: no
+ * rental units at all)? 'tenant' (they rent it), 'landlord' (they rent it
+ * out), 'none' (the newest decisive message says they own it and nothing
+ * about renting it out), 'unknown'. The newest decisive message wins, as in
+ * homeownerFromThread: "we used to rent it out but we live there now" ends
+ * on an owner. Pure.
+ */
+export function rentalFromThread(turns = []) {
+  const owner = homeownerFromThread(turns);
+  if (owner === 'no') return 'tenant';
+  const list = (Array.isArray(turns) ? turns : []).map(m => ({
+    direction: String(m?.direction || '').toLowerCase() === 'outbound' ? 'outbound' : 'inbound',
+    text: String(m?.text ?? m?.body ?? ''),
+  }));
+  for (let i = list.length - 1; i >= 0; i--) {
+    const m = list[i];
+    if (m.direction !== 'inbound') continue;
+    if (RENTAL_HOME_RX.test(m.text) && !LIVES_THERE_NOW_RX.test(m.text)) return 'landlord';
+    if (saysOwner(m.text) || LIVES_THERE_NOW_RX.test(m.text)) return 'none';
+  }
+  return 'unknown';
+}
+

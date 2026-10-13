@@ -609,7 +609,7 @@ Set dq_detected ONLY when the lead VOLUNTEERS a disqualifying fact. Never infer 
 • "renter" — they state they rent / are not the homeowner / "I'd have to ask my landlord".
 • "lanai-only" — the project is ONLY a lanai, sunroom, screen enclosure, or patio screen (no main-structure windows or doors). "Windows plus the lanai" is NOT a DQ — main-home work qualifies.
 
-INVESTMENT PROPERTIES ARE NOT A DISQUALIFIER. "It's an investment property", "it's a rental I own", "it's not my primary residence" → dq_detected stays null and the conversation proceeds completely normally. There is no investment-property routing of any kind.
+INVESTMENT PROPERTIES ARE NOT A DISQUALIFIER on their own. "It's an investment property", "it's not my primary residence" → dq_detected stays null. A home the owner RENTS OUT ("it's a rental I own", an Airbnb) is not served either, but the reply guards handle it: leave dq_detected null for it too.
 
 When dq_detected is set, recommended_action should usually be "continue_current" — a dedicated rule handles the exit; do not also route to suppress.
 

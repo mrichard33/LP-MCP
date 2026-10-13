@@ -26,7 +26,7 @@ import { BRIDGE_RX } from '../agentic/nepq-planner.js';
 
 // 2026-10-12 (handoff PR 7): the scenario checks have their own version. A run
 // scored with new checks is a new baseline, never "worse" than an old one.
-export const SCORING_VERSION = '2026-10-12.1';
+export const SCORING_VERSION = '2026-10-13.1';
 
 const CLOCK_RX = /\b\d{1,2}(?::\d{2})?\s*(?:AM|PM)\b/gi;
 const clockCount = (text) => (String(text || '').match(CLOCK_RX) || []).length;
@@ -42,6 +42,14 @@ const allReplies = (r) => (r.transcript || []).flatMap(t => replies(t).map(text 
 // Everything the run would have done: live chat keeps one list, SMS one per turn.
 const wouldDo = (r) => [...(r.would_do || []), ...(r.transcript || []).flatMap(t => (t.would_do || []).map(w => ({ turn: t.turn, ...w })))];
 const did = (r, rx) => wouldDo(r).some(w => rx.test(String(w.kind || '')));
+// A home we cannot work on: no booking and no two real times (2026-10-13).
+const noVisitFailures = (r, who) => {
+  const out = [];
+  if (did(r, /would_book/)) out.push({ code: `booked_${who}`, detail: `a ${who} lead was booked` });
+  const offer = allReplies(r).find(x => clockCount(x.text) >= 2);
+  if (offer) out.push({ code: `slots_offered_${who}`, detail: offer.text, turn: offer.turn });
+  return out;
+};
 
 /**
  * What each named scenario must do beyond the hard checks. Each returns a list
@@ -91,6 +99,21 @@ export const SCENARIO_EXPECTATIONS = Object.freeze({
   },
   // No single-leg visits (the no-single-leg rule, 2026-10-12): never booked.
   renter: (r) => (did(r, /would_book/) ? [{ code: 'booked_non_owner', detail: 'a renter was booked' }] : []),
+  // No rental units, whoever asks; no commercial properties (the user,
+  // 2026-10-13): never booked, never offered a time.
+  landlord: (r) => noVisitFailures(r, 'landlord'),
+  commercial: (r) => noVisitFailures(r, 'commercial'),
+  // One window (the user, 2026-10-13): the other-windows line once, the
+  // minimum never told.
+  one_window: (r) => {
+    const out = [];
+    const said = allReplies(r).filter(x => /\b(?:other|rest\s+of\s+(?:the|your))\s+windows\b/i.test(x.text));
+    if (!said.length) out.push({ code: 'small_job_line_missing', detail: 'the other-windows line was never said' });
+    if (said.length > 1) out.push({ code: 'small_job_line_repeated', detail: said[1].text, turn: said[1].turn });
+    const minimum = allReplies(r).find(x => /\bminimum\b/i.test(x.text));
+    if (minimum) out.push({ code: 'minimum_mentioned', detail: minimum.text, turn: minimum.turn });
+    return out;
+  },
   // Live: the competitor reaches times (disarm → criteria → bridge → times).
   competitor: (r) => (r.lead_stage_mode === 'live' && !allReplies(r).some(x => clockCount(x.text) >= 2)
     ? [{ code: 'competitor_no_times', detail: 'the competitor case never reached two real times' }] : []),

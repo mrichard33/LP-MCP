@@ -273,6 +273,7 @@ import { enforceTeamVoice } from './agentic/team-voice.js';
 import { enforcePropertyScope } from './agentic/property-scope.js';
 import { dropFragmentOpener, dropStaleCallMention, normalizeSignature, isNearRepeat, replySimilarity, NEAR_REPEAT_NOTE } from './agentic/sms-format.js';
 import { enforceNonOwner } from './agentic/non-owner.js';
+import { dropMinimumTalk } from './agentic/small-job.js';
 import { enforceCallTiming, softenCallTiming, isTeamOpen, enforceRehashCallTiming } from './agentic/team-hours.js';
 import { enforceOneAsk } from './agentic/one-ask.js';
 import { findUnbackedBookingClaim, rewriteBookingClaims, bookingClaimNote, appointmentOnFile, noPromiseHandoffLine, NO_PROMISE_HANDOFF_RX } from './agentic/booking-claim.js';
@@ -5186,15 +5187,24 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
 
   // ─── Property scope (2026-10-05) ───
   // We do not work on manufactured or mobile homes; the live chat said we
-  // did. Last of the text guards, so no later pass (the NEPQ discovery
+  // did. Nor buildings over two stories, commercial properties or rental
+  // units (2026-10-13). Last of the text guards, so no later pass (the NEPQ discovery
   // question, a booking ask) lands on top of the "no". Every channel, email
   // included: it is a fact, not a voice rule. A lead who asked gets no visit.
   {
+    // 2026-10-13 (the user): the three-opening minimum is never told to the lead.
+    const minimum = dropMinimumTalk(validated.message);
+    if (minimum.changed && minimum.text.trim()) {
+      console.warn(`[SmallJob] ${contactId} minimum_dropped`);
+      validated.message = minimum.text;
+    }
     const scope = enforcePropertyScope(validated.message, { inbound: triggerMessage });
     if (scope.changed) {
       console.warn(`[PropertyScope] ${contactId} ${scope.reason}`);
       validated.message = scope.text;
-      if (scope.reason === 'lead_asked' && validated.companion_action?.action_type === 'book_appointment') validated.companion_action = null;
+      // reason is '<rule>:lead_asked' (it never equalled the bare 'lead_asked',
+      // so a booking used to survive the no; 2026-10-13).
+      if (/:lead_asked\b/.test(scope.reason) && validated.companion_action?.action_type === 'book_appointment') validated.companion_action = null;
     }
     // 2026-10-12 (no single-leg visits; batch 3 T3): a lead who said they
     // rent gets no time and no booking, in every mode (non-owner.js).

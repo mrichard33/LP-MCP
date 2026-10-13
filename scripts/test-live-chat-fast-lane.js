@@ -1382,5 +1382,5 @@ test('a renter in live chat gets no times (batch 3 T3; active in every mode)', a
   const { lane } = makeLane({ mode: 'shadow', llm: () => ({ message: "Makes sense, you'll want his okay first. I have Thu, Oct 15 at 10:00 AM ET or Fri, Oct 16 at 2:00 PM ET. Which works better?" }) });
   const out = await lane.processInbound(INBOUND("I'm renting, my landlord would have to approve it"));
   assert.doesNotMatch(out.message, /\d{1,2}:\d{2}\s*(?:AM|PM)/);
-  assert.match(out.message, /homeowner needs to be part of the visit/);
+  assert.match(out.message, /don't work on rental units/);
 });

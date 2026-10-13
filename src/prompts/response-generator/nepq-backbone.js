@@ -94,6 +94,10 @@ export function renderPlanBlock(plan) {
   if (plan.qualify_item) {
     lines.push(`Before any visit time: ${plan.qualify_item === 'homeowner' ? 'ask whether they own the home (allowed on this turn; it overrides the rule about not probing for disqualifiers)' : plan.qualify_item === 'zip' ? 'ask for the zip code at the home' : 'ask about the other decision maker as planned'}. Offer no times, no visit and no booking in this reply.${plan.reask_line ? ` End with: "${plan.reask_line}"` : ''}`);
   }
+  // 2026-10-13 (the user): one or two windows. Said once, then the move.
+  if (plan.small_job_line && !(plan.reference_line || plan.fixed_line || '').includes(plan.small_job_line)) {
+    lines.push(`They asked about only one or two windows. Start with your own version of: "${plan.small_job_line}" Never mention a minimum. Then do this turn's move as planned.`);
+  }
   lines.push(...NEPQ_ALWAYS);
   // 2026-10-03 (Mark): the visit is the next step; a phone call only when the
   // lead asks for one. The guard (dropUnaskedCallOffer) backs this up.

@@ -111,3 +111,42 @@ test('mentionsTallBuilding', () => {
   assert.equal(mentionsTallBuilding('second floor'), false);
   assert.equal(mentionsTallBuilding('one story home'), false);
 });
+
+// ── 2026-10-13 (the user): no commercial properties, no rental units ──────
+import { COMMERCIAL_ANSWER, RENTAL_ANSWER, RENTAL_LINE, mentionsCommercial, scopeAnswerForThread } from '../src/agentic/property-scope.js';
+
+test('a commercial property gets the polite no and nothing after it', () => {
+  for (const inbound of ['Do you do commercial buildings?', 'Our office building needs new windows', 'It is for our restaurant', 'my business property on Main St', 'we need a quote for our storefront']) {
+    const r = enforcePropertyScope('Absolutely! What got you looking?', { inbound });
+    assert.equal(r.text, COMMERCIAL_ANSWER, inbound);
+    assert.doesNotMatch(r.text, /\?/);
+  }
+});
+
+test('a home office or a slow business is not commercial', () => {
+  for (const inbound of ['I need windows for my home office', 'my business is slow so I have time this week', 'the office upstairs is drafty']) {
+    assert.equal(mentionsCommercial(inbound), false, inbound);
+    assert.equal(enforcePropertyScope('Got it. What got you looking?', { inbound }).changed, false, inbound);
+  }
+});
+
+test('a rental gets the no, whoever is asking', () => {
+  for (const inbound of ['we rent it out, can you do the windows?', 'It is an Airbnb we own', "It's a rental", 'the apartment building I own needs windows', 'my tenants say the windows leak']) {
+    assert.equal(enforcePropertyScope('Sure, when works?', { inbound }).text, RENTAL_ANSWER, inbound);
+  }
+  // A home they used to rent out and live in now is a normal home.
+  assert.equal(enforcePropertyScope('Sure, when works?', { inbound: 'we used to rent it out but we live there now' }).changed, false);
+  assert.equal(enforcePropertyScope('Great. What got you looking?', { inbound: "It's not a rental, we live here" }).changed, false);
+});
+
+test('a reply that says we do rentals is corrected', () => {
+  const r = enforcePropertyScope('Yes, we handle rental properties too. What got you looking?', { inbound: 'hi' });
+  assert.equal(r.reason, 'rental_unit:claimed_in_reply');
+  assert.equal(r.text, `${RENTAL_LINE} What got you looking?`);
+});
+
+test('scopeAnswerForThread reads the whole chat (the live chat booking step)', () => {
+  const turns = [{ direction: 'inbound', text: 'Our office building needs new windows' }, { direction: 'outbound', text: 'Thanks.' }];
+  assert.equal(scopeAnswerForThread(turns, 'The first one'), COMMERCIAL_ANSWER);
+  assert.equal(scopeAnswerForThread([{ direction: 'inbound', text: 'my windows leak' }], 'The first one'), null);
+});

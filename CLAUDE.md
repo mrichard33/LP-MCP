@@ -1139,6 +1139,22 @@ live chat never runs `DQ_ABOVE_2ND_FLOOR_INTERIM`). Both are now in the shared s
 one gets the "no" as the whole reply, and any "we do" sentence is replaced. The building counts, not the unit. Modular
 homes are not ruled on and are deliberately not covered; "tower" alone and "4 floor-to-ceiling windows" do not count.
 
+**No commercial properties, no rental units, and one window is still a quote (the user, 2026-10-13).** Two more
+`enforcePropertyScope` rules: `commercial` (a commercial word or a business building; a home office or "my business is
+slow" never matches) gets "we only work on homes" and nothing after it, and `rental_unit` (`RENTAL_HOME_RX` in
+`homeowner.js`: "we rent it out", my tenants, Airbnb/VRBO, "it's a rental") gets "we don't work on rental units". A rental
+is a no WHOEVER asks: `rentalFromThread` reads tenant or landlord, `enforceNonOwner` / `isNonOwner` and the planner's
+qualifying gate block times for both, and `NON_OWNER_LINE` no longer sends a tenant to the owner. A home they used to rent
+out and live in now is a normal home (`LIVES_THERE_NOW_RX`), and so is an investment property that is not rented out.
+Churches, HOAs and condo associations still go to a person. The live chat never books a pick in a chat that raised any
+scope no (`scopeAnswerForThread`). One or two windows (`src/agentic/small-job.js`): the user's line ("No problem. We can
+give you the quote for the one window, and we'll give you quotes for the other windows as well…") goes in front of the
+turn's planned move ONCE per conversation (`withSmallJob` in `planNepqTurn`, read back by `SMALL_JOB_SAID_RX`), then the
+plan carries on. The three-opening minimum is never told to the lead: `dropMinimumTalk` in both bots, `checkReply`
+`states_minimum`. FAQs LIB-P16/17/18. LP team notes were NOT given a commercial or rental DQ signal: 60 days of notes
+read "waiting on verif that we can look at a commercial property" and "we cant look at the commercial property but we
+can look at the rez", and an automatic stop-bot on those would turn away good leads.
+
 **Retiring a FAQ without a replacement leaves a hole the search fills with the nearest thing.**
 Retiring `#14` (roofing) during the golden ingest left no roofing answer at all, and a live lead
 walked into it — the three FAQs retrieval offered were all irrelevant (top 0.405) and only the

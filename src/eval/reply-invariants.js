@@ -25,6 +25,7 @@
 import { humanizeReply } from '../agentic/human-voice.js';
 import { enforceTeamVoice } from '../agentic/team-voice.js';
 import { enforcePropertyScope } from '../agentic/property-scope.js';
+import { dropMinimumTalk } from '../agentic/small-job.js';
 import { findUnbackedBookingClaim } from '../agentic/booking-claim.js';
 import { enforceCallTiming, promisedCallback, enforceRehashCallTiming } from '../agentic/team-hours.js';
 import { enforceOneAsk } from '../agentic/one-ask.js';
@@ -95,6 +96,9 @@ export function checkReply(reply, ctx = {}) {
 
   const scope = enforcePropertyScope(text, { inbound: ctx.inbound || '' });
   if (scope.changed) fail('property_scope', scope.reason);
+
+  // The three-opening minimum is never told to the lead (the user, 2026-10-13).
+  if (dropMinimumTalk(text).changed) fail('states_minimum', 'a minimum job size was stated');
 
   if (FLORIDA_ONLY_RX.test(text)) fail('florida_only_claim', text.match(FLORIDA_ONLY_RX)[0]);
 
