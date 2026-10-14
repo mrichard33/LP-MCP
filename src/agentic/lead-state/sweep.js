@@ -82,6 +82,7 @@
 import supabase from '../../supabase.js';
 import { classifyLeadState } from './classifier.js';
 import { enrollIfEligible, enrollmentConfig } from './enrollment.js';
+import { withGhlCaller } from '../../ghl-caller.js';
 
 // ── Config (env-overridable) ────────────────────────────────────────
 const SWEEP_ENABLED      = process.env.LEAD_STATE_SWEEP_ENABLED === 'true';
@@ -253,7 +254,14 @@ async function selectCandidates(limit) {
  *                                       entirely (pure state refresh)
  * @returns {Promise<object>} summary with state + enrollment distributions
  */
-export async function runLeadStateSweep({ limit = SWEEP_BATCH, classifyOnly = false } = {}) {
+// 2026-10-14: credited to its own label in the GHL per-caller report. Unlabelled,
+// it read as `src:context-builder.js` (29,608 requests a day) and no one could
+// tell it was this pass.
+export function runLeadStateSweep(opts = {}) {
+  return withGhlCaller('job:lead-state-sweep', () => runLeadStateSweepPass(opts));
+}
+
+async function runLeadStateSweepPass({ limit = SWEEP_BATCH, classifyOnly = false } = {}) {
   if (sweepRunning) {
     return { success: true, skipped: true, reason: 'already_running' };
   }
