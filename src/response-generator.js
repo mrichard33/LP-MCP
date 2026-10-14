@@ -3666,7 +3666,9 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // as a literal: a merge tag can never ship (assertNoUnresolvedTokens).
   // SMS only: the rehash rep's line is a phone number, and an email reply
   // carries the in-office sender (resolveEmailSender) whatever the stage.
-  const rehashTagged = channel === 'sms' && isRehashContact({ tags: context.lead?.current_tags || [], fromNumber: opts.fromNumber || null });
+  // 2026-10-14 (John Manieri: "Koger is already sold and set"): a SOLD lead is a
+  // customer, not a rehash lead, even while F.0's active-f.0 tag is still on.
+  const rehashTagged = channel === 'sms' && !lpSold(context.lp) && isRehashContact({ tags: context.lead?.current_tags || [], fromNumber: opts.fromNumber || null });
   // 2026-10-09 (Monica, 581695): the `rehash` tag is added by a sweep that is
   // still in shadow, so an OPPFDN lead inside the 30-day window read as a new
   // lead here, the Rehash Call calendar was never read, and "I never got a

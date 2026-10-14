@@ -51,7 +51,7 @@ export function pickCurrentLead(leads) {
 export async function fetchCurrentLead(ghlContactId, client = supabase) {
   if (!client) throw new Error('LP Supabase not configured');
   const { data, error } = await client.from('lp_leads')
-    .select('lp_lead_id, disposition_code, appointment_date, appointment_set, created_at_lp, updated_at_lp')
+    .select('lp_lead_id, disposition_code, appointment_date, appointment_set, created_at_lp, updated_at_lp, closed_won')
     .eq('ghl_contact_id', String(ghlContactId))
     .is('lp_deleted_at', null)
     .limit(50);

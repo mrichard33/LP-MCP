@@ -293,3 +293,42 @@ test('sweep: a contact missing from the snapshot, or a failed snapshot read, is 
     assert.equal(res.counts.tag, 1);
   }
 });
+
+// ── 2026-10-14 (John Manieri: "Koger is already sold and set") ──
+test('a SOLD current lead is not in rehash, even with active-f.0 or rehash still on', () => {
+  const sold = { lp_lead_id: '582924', disposition_code: 'Sale', appointment_date: '2026-10-12' };
+  assert.equal(isInRehash({ tags: ['active-f.0'], currentLead: sold, nowMs: NOW }), false);
+  assert.equal(isInRehash({ tags: ['rehash', 'rehash-lead:581701'], currentLead: sold, nowMs: NOW }), false);
+  assert.equal(isInRehash({ tags: ['active-f.0'], currentLead: { lp_lead_id: '1', disposition_code: 'OPPFDN', closed_won: true }, nowMs: NOW }), false, 'closed_won counts');
+  assert.equal(isInRehash({ tags: ['active-f.0'], currentLead: { lp_lead_id: '1', disposition_code: 'OPPFDN' }, nowMs: NOW }), true, 'an unsold F.0 lead stays in rehash');
+  assert.equal(isInRehash({ tags: ['active-f.0'], currentLead: null, nowMs: NOW }), true, 'no LP lead: the tag still decides');
+});
+
+test('the sweep releases a tagged lead whose current lead is a Sale', () => {
+  const dec = decideRehash({
+    tags: ['rehash', 'rehash-lead:582924', 'rehash-since:2026-10-01'],
+    currentLead: { lp_lead_id: '582924', disposition_code: 'Sale', appointment_date: '2026-10-01' },
+    nowMs: NOW,
+  });
+  assert.equal(dec.action, 'release');
+  assert.equal(dec.reason, 'disposition_Sale');
+});
+
+test('rehashLeadFromContext carries closed_won, so the reply writer skips a sold lead', async () => {
+  const { rehashLeadFromContext } = await import('../src/agentic/rehash-state.js');
+  const lead = rehashLeadFromContext({ matched: true, lead_id: 9, disposition: 'OPPFDN', demo_date: '2026-10-07', closed_won: true });
+  assert.equal(lead.closed_won, true);
+  assert.equal(isInRehash({ tags: ['active-f.0'], currentLead: lead, nowMs: NOW }), false);
+});
+
+test('the rehash Five9 line no longer claims a call card was posted', () => {
+  const line = five9ResultLine({ status: 'rehash' });
+  assert.doesNotMatch(line, /was told/);
+  assert.match(line, /call, quote or concern/);
+});
+
+test('the reply writer never treats a sold lead as rehash by its tag (source guard)', async () => {
+  const fs = await import('node:fs');
+  const src = fs.readFileSync(new URL('../src/response-generator.js', import.meta.url), 'utf8');
+  assert.match(src, /const rehashTagged = channel === 'sms' && !lpSold\(context\.lp\) && isRehashContact\(/);
+});

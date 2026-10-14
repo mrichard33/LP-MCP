@@ -26,6 +26,7 @@
 
 import { F0_ACTIVE_TAG } from './rehash.js';
 import { REHASH_REP_USER_ID_DEFAULT } from '../config/rehash-assignee.js';
+import { lpSold } from './post-demo-owner.js';
 
 /**
  * GHL user ids of the rehash team (REHASH_TEAM_USER_IDS, comma-separated).
@@ -88,6 +89,11 @@ export function demoDate(lead) {
  *   currentLead  pickCurrentLead() row (src/current-lead.js) or null
  */
 export function isInRehash({ tags = [], currentLead = null, nowMs = Date.now(), env = process.env } = {}) {
+  // 2026-10-14 (John Manieri: "Koger is already sold and set"): a SOLD current
+  // lead is a customer, not a rehash lead, even while F.0's `active-f.0` tag
+  // (GHL's to remove) or our `rehash` tag (the sweep's) is still on. Checked
+  // before the tags, so a sold customer gets no rehash reply and no rehash card.
+  if (lpSold(currentLead)) return false;
   const t = readRehashTags(tags);
   if (t.f0 || t.tagged) return true;
   if (!currentLead) return false;
@@ -128,6 +134,7 @@ export function rehashLeadFromContext(lp) {
   return {
     lp_lead_id: lp.lead_id,
     disposition_code: lp.disposition ?? null,
+    closed_won: lp.closed_won === true,
     appointment_date: lp.demo_date || lp.appointment_date || lp.last_appointment_date || null,
   };
 }

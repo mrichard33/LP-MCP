@@ -251,6 +251,15 @@ and an LP re-set. Now:
   the user, 2026-10-09): that tag is read ONLY for this, since GHL workflows own it (F.0 adds it, S1.1/S1.3/S4.5/A.WE
   remove it); it never puts a contact in rehash, refuses a visit or touches Five9 (`hasPostAppointmentStage`).
 - `REHASH_ROUTING_MODE` off|shadow|live, default shadow (`rehash.would_*` events only). The LP lock is not behind it.
+- **The rehash card follows what the lead said (John Manieri, 2026-10-14).** All 14 "said yes to a call" cards of
+  10-10..10-14 came from `lp-requeue.js`'s rehash branch, which posted with a hard-coded `agreed: true`; 0 of the 14 had
+  agreed to a call (most wanted the quote emailed). `routeRehashReply` (`src/notifications/rehash-call.js`) classifies the
+  lead's words (`classifyRehashReply`, `src/agentic/rehash-intent.js`, pure): a call request → the call card; a quote ask →
+  📄 QUOTE REQUEST; a complaint → ⚠️ POST-DEMO CONCERN; thanks / still thinking → no card, one
+  `agentic.f0_rehash_reply_digest` event, listed by `rehash-reply-digest` (weekdays 08:45 ET, Monday covers Fri-Sun).
+  A bare "yes" is a call only after our call offer. The model's own `rehash_call.agreed` (send handler) stays the real
+  yes. A SOLD current lead (`lpSold`) is never in rehash, whatever `active-f.0` says. `REHASH_INTENT_ROUTING=off` is the
+  rollback.
 
 **A post-demo lead is planned as post-demo, never as a new lead (Mark, 2026-10-09).** Five rehash threads got a stock
 discovery question after "Thank you I will.", two slot offers to "Follow up in November please.", a question after "Enjoy
