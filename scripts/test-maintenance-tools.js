@@ -75,9 +75,10 @@ test('the script with no --max removes everything planned', async () => {
   assert.equal(removed.length, 3);
 });
 
-test('the tools register as check_rule_targets and stale_lp_tags_cleanup_run', () => {
+test('the tools register as rehash_tag_cleanup_run, check_rule_targets and stale_lp_tags_cleanup_run', () => {
   const names = [];
   registerMaintenanceTools({ tool: (name) => names.push(name) });
   // 2026-10-12: check_rule_targets (F-L, read-only) joined the file.
-  assert.deepEqual(names, ['check_rule_targets', 'stale_lp_tags_cleanup_run']);
+  // 2026-10-14: rehash_tag_cleanup_run (no dates or ids in GHL tags).
+  assert.deepEqual(names, ['rehash_tag_cleanup_run', 'check_rule_targets', 'stale_lp_tags_cleanup_run']);
 });

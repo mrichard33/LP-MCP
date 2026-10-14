@@ -247,6 +247,24 @@ export function rejectedTagResult(tag, contactId) {
   };
 }
 
+/**
+ * 2026-10-14 (Mark): "GHL tags must be plain, reusable labels. Never put dates,
+ * IDs, or other unique values in a tag." The rehash sweep had written
+ * rehash-lead:<lds>, rehash-since:<date> and rehash-done:<lds> onto 646
+ * contacts; that data now lives in rehash_stage. A tag holding a date
+ * (YYYY-MM-DD anywhere) or ending in a colon and digits only (`:12345`) is a
+ * unique value and is refused. Checked on 2026-10-14: in 60 days of add_tag
+ * rows only the three rehash shapes matched, and no agent_rules template builds
+ * such a tag. PURE: the reason, or null for a plain label.
+ */
+export const UNIQUE_VALUE_TAG_REASON = 'unique_value_tag_blocked';
+export function uniqueValueTagReason(tag) {
+  const t = String(tag ?? '').trim();
+  if (/\d{4}-\d{2}-\d{2}/.test(t)) return `${UNIQUE_VALUE_TAG_REASON}: "${t}" holds a date`;
+  if (/:\d+$/.test(t)) return `${UNIQUE_VALUE_TAG_REASON}: "${t}" ends in an id`;
+  return null;
+}
+
 export function decideTagWrite(currentTags, tag, contactId) {
   const rejected = rejectedTagResult(tag, contactId);
   if (rejected) return { verdict: 'rejected', result: rejected };
@@ -355,6 +373,13 @@ export async function executeAddTag(action, context = {}) {
   if (rejected) {
     console.warn(`[ActionExecutor] tag.construction_rejected: "${tag}" for ${contactId} — empty namespace value (rule: ${action.rule_applied || 'manual'})`);
     return rejected;
+  }
+  // A direct caller (not the queue) gets the same refusal as the executor gate
+  // in src/actions/index.js: no date or id in a GHL tag (Mark, 2026-10-14).
+  const uniqueValue = uniqueValueTagReason(tag);
+  if (uniqueValue) {
+    console.warn(`[ActionExecutor] ${uniqueValue} for ${contactId} (rule: ${action.rule_applied || 'manual'})`);
+    throw new Error(uniqueValue);
   }
 
   const cache = context?._contactCache;

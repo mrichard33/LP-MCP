@@ -250,7 +250,7 @@ import { findPriorEnrollment } from '../services/enrollment-dedup.js';
 import { validateAction } from '../services/validation-gate.js';
 
 // ─── Handlers ──────────────────────────────────────────────────────
-import { executeAddTag, executeRemoveTag, executeSetStage } from './handlers/tags.js';
+import { executeAddTag, executeRemoveTag, executeSetStage, uniqueValueTagReason } from './handlers/tags.js';
 import { executeMoveOpportunity, executeUpdateOpportunity } from './handlers/opportunities.js';
 // 2026-09-18 — status → GHL lost reason, shared with scripts/reconcile-p2-stages.js
 import { lostReasonIdForJobStatus } from '../lp-lost-reasons.js';
@@ -924,6 +924,26 @@ async function executeSingleActionUntracked(action, batchContext = {}, priorBatc
       updated_at: new Date().toISOString(),
     }).eq('id', action.id);
     return { action_id: action.id, status: 'failed', error: `Unknown: ${action.action_type}` };
+  }
+
+  // ═══ No date or id in a GHL tag (Mark, 2026-10-14) ═══════════════
+  // A tag is a plain, reusable label; a lead id or a date belongs in Supabase
+  // (the rehash sweep's rehash-lead:/rehash-since:/rehash-done: tags moved to
+  // rehash_stage). Refused before any GHL call and failed, not retried: the
+  // same payload can never pass.
+  if (action.action_type === 'add_tag') {
+    const blocked = uniqueValueTagReason(action.action_payload?.tag);
+    if (blocked) {
+      console.warn(`[ActionExecutor] 🚫 add_tag #${action.id} ${blocked} (contact ${action.target_id}, rule ${action.rule_applied || 'manual'})`);
+      await supabase.from('agent_actions').update({
+        status: 'failed',
+        error_message: blocked,
+        execution_result: { blocked: true, reason: 'unique_value_tag_blocked', tag: action.action_payload?.tag ?? null },
+        executed_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      }).eq('id', action.id);
+      return { action_id: action.id, status: 'failed', action_type: action.action_type, error: blocked };
+    }
   }
 
   // ═══ not_before_seconds (2026-09-21) ═════════════════════════════

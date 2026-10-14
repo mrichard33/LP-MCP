@@ -142,6 +142,13 @@ PostgREST's newest 1,000 rows and never released anyone. `CONVERSATION_PAUSE_MOD
 `POST /n8n/pause-workflow/sweep {"dryRun":true}` reports who live would release. S1.0, S1.1, S1.3, S1.6 and S4.5 have
 no gate yet, and S5.2 exits on the tag; those are GHL edits, not code.
 
+**GHL tags are plain, reusable labels: never a date, an id or any other one-off value (Mark, 2026-10-14).** A lead id,
+a date or a history belongs in Supabase (precedent: `rehash_stage`, above). The executor fails any `add_tag` row whose tag
+holds `YYYY-MM-DD` or ends in `:<digits>` (`uniqueValueTagReason` in `src/actions/handlers/tags.js`, status `failed`,
+`unique_value_tag_blocked`, before any GHL call); `executeAddTag` refuses the same for direct callers. On 2026-10-14 only
+the three old rehash shapes matched in 60 days of add_tag rows. A namespaced label (`bot-off:dq`, `nepq:handoff:price`)
+is fine; a value per contact is not.
+
 **Drip tags cannot go stale (the user, 2026-10-08).** `active-<code>` tags are added only by GHL workflows (our code
 only removes them; the n8n ports of the drips are inactive). Rule R7 in the daily tag sweep
 (`src/tag-hygiene/rules.js`, `src/jobs/tag-hygiene-sweep.js`) removes a drip tag that no PUBLISHED workflow adds any
@@ -237,11 +244,16 @@ and an LP re-set. Now:
   (`executeSetLPAppointment`, `syncAppointmentToLP`). It reads the caller's disposition, `lp_leads`, then LP live, and
   any `isDemoDisposition` answer (Sale, OPPFDN, NoRehash, FDNS, SW, PM) refuses. A lead neither source knows is a new
   lead; both reads failing refuses. "We should never modify a lead marked OPP FDN."
-- **The stage:** `src/agentic/rehash-state.js`. The current lead OPPFDN with a demo in the last `REHASH_DAYS` (30) → tags
-  `rehash` + `rehash-lead:<lds>` + `rehash-since:<demo date>`. It ends on a NEWER lead, when the lead leaves OPPFDN, or at
-  30 days: the tags come off, `rehash-done:<lds>` stays, and a GHL owner in `REHASH_TEAM_USER_IDS` (default John Manieri)
-  is cleared by `release_rehash_owner` (read back). Job `rehash-tag-sweep` (15 min) writes through agent_actions rows
-  (rule `REHASH_TAG_SWEEP`). `isRehashContact` counts `rehash` like `active-f.0`.
+- **The stage:** `src/agentic/rehash-state.js`. The current lead OPPFDN with a demo in the last `REHASH_DAYS` (30) → the
+  plain tag `rehash` plus an open `rehash_stage` row (contact, `lp_lead_id`, `demo_date` = the 30-day clock). It ends on a
+  NEWER lead, when the lead leaves OPPFDN, or at 30 days: `rehash` comes off, the row gets `ended_at` + `end_reason` (a
+  finished lead never re-enters), and a GHL owner in `REHASH_TEAM_USER_IDS` (default John Manieri) is cleared by
+  `release_rehash_owner` (read back). An open row whose tag went missing gets it back (`self_heal`); a `rehash` tag with no
+  row is adopted or released by the lead. Job `rehash-tag-sweep` (15 min) queues the tag rows (rule `REHASH_TAG_SWEEP`) and
+  writes `rehash_stage` only after that insert succeeded; a failed `rehash_stage` read decides nothing. `isRehashContact`
+  counts `rehash` like `active-f.0`. Until 2026-10-14 the lead, date and history were the tags `rehash-lead:<lds>`,
+  `rehash-since:<date>`, `rehash-done:<lds>` (646 contacts); `scripts/rehash-tag-cleanup.js` (MCP `rehash_tag_cleanup_run`,
+  dry run default) backfilled them into `rehash_stage` and queued their removal (rule `REHASH_TAG_CLEANUP`).
 - **Calls, not visits:** a rehash call request (`lp_callback_requeue`, so `fileBotCallback` and `HOT_CALL_IMMEDIATE` too)
   skips Five9 and posts one #contact-rehash card a day (`skipped_rehash_lead`); no #contact-center card. A
   `book_appointment` for a rehash lead goes only on Rehash Call: a Confirmation Call is moved there at the same time, a visit

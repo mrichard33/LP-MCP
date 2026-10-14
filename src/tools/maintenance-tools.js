@@ -23,6 +23,15 @@
  *                              PUBLISHED workflow? The same check the 02:10 job
  *                              runs (src/jobs/rule-target-check.js), writing
  *                              nothing.
+ *
+ *   rehash_tag_cleanup_run     (2026-10-14) the one-time move of the rehash
+ *                              sweep's rehash-lead:/rehash-since:/rehash-done:
+ *                              tags into rehash_stage, then their removal
+ *                              (src/services/rehash-tag-cleanup.js; Mark: no
+ *                              dates or ids in GHL tags). ~650 throttled GHL
+ *                              reads take minutes, longer than a tool call
+ *                              should wait, so it runs in the background and
+ *                              job_id returns the report.
  */
 import { z } from 'zod';
 
@@ -87,7 +96,53 @@ export function makeCheckRuleTargets(deps = {}) {
   };
 }
 
+const cleanupJobs = new Map();
+
+export function makeRehashTagCleanupRun(deps = {}) {
+  const {
+    run = async (opts) => {
+      const { runRehashTagCleanup } = await import('../services/rehash-tag-cleanup.js');
+      const supabase = (await import('../supabase.js')).default;
+      const { ghlFetch } = await import('../actions/helpers.js');
+      const getContact = async (id) => (await ghlFetch('GET', `/contacts/${id}`))?.contact || null;
+      return runRehashTagCleanup(opts, { supabase, getContact });
+    },
+  } = deps;
+  return async ({ job_id = null, dry_run = true, limit = 0, contact_ids = [] } = {}) => {
+    if (job_id) {
+      const job = cleanupJobs.get(job_id);
+      return job ? { ok: true, ...job } : { ok: false, error: 'job_not_found (jobs live in memory; a deploy clears them)' };
+    }
+    const id = `rehashclean_${Date.now().toString(36)}`;
+    const job = { job_id: id, status: 'running', dry_run, started_at: new Date().toISOString(), report: null, error: null };
+    cleanupJobs.set(id, job);
+    while (cleanupJobs.size > 20) cleanupJobs.delete(cleanupJobs.keys().next().value);
+    Promise.resolve()
+      .then(() => run({ dryRun: dry_run !== false, limit, contactIds: contact_ids }))
+      .then((report) => { job.report = report; job.status = 'completed'; })
+      .catch((err) => { job.error = String(err?.message || err).slice(0, 500); job.status = 'failed'; })
+      .finally(() => { job.completed_at = new Date().toISOString(); });
+    return { ok: true, job_id: id, dry_run: dry_run !== false, next_step: 'Call again with this job_id for the report.' };
+  };
+}
+
 export function registerMaintenanceTools(server, deps = {}) {
+  server.tool(
+    'rehash_tag_cleanup_run',
+    'One-time cleanup (2026-10-14, Mark: no dates or ids in GHL tags). Reads every contact carrying rehash-lead:, '
+      + 'rehash-since: or rehash-done: live from GHL, records them in rehash_stage (an open row for rehash + '
+      + 'rehash-lead + rehash-since, an ended row per rehash-done), then queues one remove_tag per old tag (rule '
+      + 'REHASH_TAG_CLEANUP). The plain rehash tag stays. Dry run by default (counts only). Runs in the background: '
+      + 'the first call returns job_id; call again with job_id for the report.',
+    {
+      job_id: z.string().optional().describe('return the report of an earlier run'),
+      dry_run: z.boolean().optional().default(true).describe('true (default) counts only; false backfills and queues the removals'),
+      limit: z.number().int().min(0).max(5000).optional().default(0).describe('at most this many contacts (0 = all)'),
+      contact_ids: z.array(z.string()).optional().default([]).describe('only these GHL contacts'),
+    },
+    async (args) => text(await makeRehashTagCleanupRun(deps)(args)),
+  );
+
   server.tool(
     'check_rule_targets',
     'Read-only. Checks every enabled agent rule that adds or removes a contact from a GHL workflow (by workflow_id or '

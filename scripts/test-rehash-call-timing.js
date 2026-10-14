@@ -65,7 +65,9 @@ test('Monica is in rehash by her LP lead, with no rehash tag', () => {
   assert.equal(isInRehash({ tags: MONICA_TAGS, currentLead: rehashLeadFromContext(MONICA_LP), nowMs: Date.parse('2026-11-07T12:00:00Z') }), false);
   // Not OPPFDN, finished stage, or no LP match: not rehash.
   assert.equal(isInRehash({ tags: [], currentLead: rehashLeadFromContext({ ...MONICA_LP, disposition: 'Set' }), nowMs }), false);
-  assert.equal(isInRehash({ tags: ['rehash-done:581695'], currentLead: rehashLeadFromContext(MONICA_LP), nowMs }), false);
+  // A finished stage is a rehash_stage row now (2026-10-14: no ids in GHL tags), never a tag.
+  const done = { open: null, doneLeadIds: new Set(['581695']) };
+  assert.equal(isInRehash({ tags: [], stage: done, currentLead: rehashLeadFromContext(MONICA_LP), nowMs }), false);
   assert.equal(rehashLeadFromContext({ matched: false, lead_id: null }), null);
   assert.equal(rehashLeadFromContext(null), null);
 });
