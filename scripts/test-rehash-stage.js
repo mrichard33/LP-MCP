@@ -241,6 +241,14 @@ test('sweep (live): a failed queue insert leaves rehash_stage untouched', async 
   assert.equal(sb.stage.length, 0);
 });
 
+test('sweep (live): a row written between the read and the insert is not a failure (23505)', async () => {
+  const { writeStage } = await import('../src/jobs/rehash-tag-sweep.js');
+  const sb = fakeSupabase({ stageRows: [{ ghl_contact_id: 'mon', lp_lead_id: '581695', demo_date: '2026-10-07' }] });
+  const err = await writeStage(sb, 'mon', { stageStart: { lp_lead_id: '581695', demo_date: '2026-10-07' } }, new Date(NOW).toISOString());
+  assert.equal(err, null);
+  assert.equal(sb.stage.length, 1);
+});
+
 test('sweep: a rehash_stage read that fails decides nothing', async () => {
   const sb = fakeSupabase({ demos: [{ ghl_contact_id: 'mon' }], leads: { mon: [monica] }, fail: { stageRead: true } });
   let reads = 0;

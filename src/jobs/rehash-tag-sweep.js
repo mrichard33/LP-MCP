@@ -147,7 +147,9 @@ export async function writeStage(supabase, contactId, dec, nowIso) {
       lp_lead_id: String(dec.stageStart.lp_lead_id),
       demo_date: dec.stageStart.demo_date || null,
     });
-    if (error) return `stage start ${error.message}`;
+    // 23505: the row is already there (2026-10-14: the one-time cleanup wrote it
+    // between this pass's read and its insert). Nothing to add; not a failure.
+    if (error && error.code !== '23505') return `stage start ${error.message}`;
   }
   if (dec.stageEnd) {
     const lead = String(dec.stageEnd.lp_lead_id);
