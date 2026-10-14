@@ -183,6 +183,11 @@ NEPQ plan dropped later. Now:
   the reply becomes "Thanks, {name}. A team member will call you shortly to confirm a time that works." (no day, no
   time; "as soon as we open" out of hours), logs `booking_claim_blocked` and emits `agentic.booking_claim_blocked`.
   The simulator mirrors it (`applyBookingTruth`). Add a new confirm wording to `CLAIM_PATTERNS`, never a second guard.
+- **A model `book_appointment` on SMS stands only when code fixed the time (2026-10-13, live-mode gate).** "Yes, book
+  it" to two offered times booked a visit nobody picked and said "You're all set" before asking which. With NEPQ live,
+  `bookingBackedByCode` (`src/agentic/sms-booking-turn.js`: booking facts that book, a pick against our own offer, a held
+  time being collected, a Rehash Call pick) runs before the booking-claim guard; anything else drops the companion
+  (`unpinned_booking_dropped`), so the claim is rewritten to the two real times.
 - A blocked claim, a callback route (`callback_request`, `busy_callback`, `frustrated_fast_track`,
   `escalate_to_rep`) or a `phone_call` ask that booked nothing files the Five9 Callback Request through
   `fileBotCallback` (`schedulingCallbackDecision`), unless a real future appointment exists.
