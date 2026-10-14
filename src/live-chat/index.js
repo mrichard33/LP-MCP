@@ -221,7 +221,8 @@ async function cancelAppointment({ contactId, appointmentId, reason }) {
 const cancelCardsPosted = new Set();
 
 /** #dispatch (Mark, 2026-10-02). Env-overridable; the code default is the live channel. */
-export const SLACK_CHANNEL_DISPATCH_DEFAULT = 'C0C19GRS8FJ';
+// 2026-10-14 (Mark): #dispatch (C0C19GRS8FJ) was deleted; dispatch cards go to #reece-chatbot.
+export const SLACK_CHANNEL_DISPATCH_DEFAULT = 'C0C9AGEM2N8';
 
 /**
  * The #dispatch card (Mark, 2026-10-02: LP has no cancel or reschedule API, so

@@ -682,6 +682,16 @@ uncalled-leads card names only leads not posted in 7 days, and waits for the new
 `ALERT_DIGEST_ENABLED=false` restores the per-alert cards (drift stays once-per-contact). Info-only rule cards
 are listed in `src/alert-noise.js`; a new informational card belongs in the digest, not its own post.
 
+**Self-healing live-ops alarms wait 10 minutes (2026-10-14, Mark).** The GHL limiter, agentic-silence and
+capacity-ranker watchdogs pass `sustainMs: FLAP_SUSTAIN_MS` (env `ALERT_FLAP_SUSTAIN_MS`, default 10 min) to
+`reportAlertCondition`: the row opens at once, the card posts only if still bad after the window, and a flap that
+clears first posts nothing either way. On 10-13 all six of those cards recovered in 1-9 minutes.
+
+**No-contact leads the After DIAL ASAP connector missed are re-queued (2026-10-14).** `src/jobs/after-asap-retry.js`
+(`AFTER_ASAP_RETRY_MODE`, default shadow): the connector keys on number1, so a repeat lead's add lands on an old
+record that profile "After DIAL ASAP V2" screens out (created > 72h). The job adds the NEW record, keyed number1 +
+LPRecKey (`key_fields` on `five9_add_records_to_list`). Never past 3 calls in 24h, DNC, booked or closed-out leads.
+
 **The reply SLA backstop is 3 minutes (2026-10-03).** `src/jobs/reply-sla-watchdog.js` (live) emits
 `agentic.reply_unanswered` for a text with no completed reply after `REPLY_SLA_MINUTES` (default 3, was 10), and
 rules 371–374 re-analyse, recover, alert. A reply still being written (a send row pending/approved/executing,
@@ -730,7 +740,7 @@ after GHL confirms. The row carries `lp_sync: 'dispatch'`, and `/webhook/ghl/set
 the automatic LP sync for 30 minutes on it (`src/services/lp-sync-hold.js`, fails open): A.WE's LP
 Appointment Sync would otherwise re-set LP, and enrol lead creation (a NEW LP lead) when it cannot
 resolve the lead. Same-calendar reschedules from the SMS bot move in place too. Every outcome posts to
-**#dispatch** (`SLACK_CHANNEL_DISPATCH`, default C0C19GRS8FJ) through `postToSlack`, and a person changes
+**#reece-chatbot** (`SLACK_CHANNEL_DISPATCH`, default C0C9AGEM2N8 since 2026-10-14; #dispatch was deleted) through `postToSlack`, and a person changes
 LP from that card; a failed post is an #ops-alerts line. Anything
 unmatched goes to the team; the bot never
 says "no appointment on file" to a guest it never identified. A "no" (`isDecline`, or the model's

@@ -298,3 +298,62 @@ test('the recovery card is one line and carries the outage length', () => {
   assert.ok(!card.includes('\n'), 'good news does not need a whole card');
   assert.match(formatRecovered('x', null), /^✅ RECOVERED — x$/, 'no duration, no parenthetical');
 });
+
+// ─── sustainMs: a flap posts nothing (2026-10-14) ───────────────────────
+// 10-13: the limiter, agentic-silence and capacity alarms each fired and
+// recovered inside 1-9 minutes. Held conditions open their row at once (so
+// first_seen_at is honest) but post only if still bad past the window.
+
+test('sustainMs: a condition that clears inside the window posts nothing at all', async () => {
+  const h = harness();
+  const S = 10 * 60000;
+  assert.equal((await h.call(true, { sustainMs: S, nowMs: 0 })).action, 'pending');
+  assert.equal((await h.call(true, { sustainMs: S, nowMs: 2 * 60000 })).action, 'silent');
+  const cleared = await h.call(false, { sustainMs: S, nowMs: 3 * 60000 });
+  assert.equal(cleared.sent, false, 'no recovery for an alert nobody saw');
+  assert.deepEqual(h.sent, []);
+});
+
+test('sustainMs: still bad past the window posts exactly once, then recovers once', async () => {
+  const h = harness();
+  const S = 10 * 60000;
+  await h.call(true, { sustainMs: S, nowMs: 0 });
+  await h.call(true, { sustainMs: S, nowMs: 5 * 60000 });
+  const fired = await h.call(true, { sustainMs: S, nowMs: 10 * 60000 });
+  assert.equal(fired.action, 'fired');
+  assert.equal(fired.sent, true);
+  await h.call(true, { sustainMs: S, nowMs: 15 * 60000 });
+  assert.deepEqual(h.sent, ['ALERT BODY']);
+  const rec = await h.call(false, { sustainMs: S, nowMs: 20 * 60000 });
+  assert.equal(rec.sent, true);
+  assert.equal(h.sent.length, 2);
+});
+
+test('sustainMs: two replicas past the window send one card', async () => {
+  const rows = new Map();
+  const a = harness({ rows });
+  const b = harness({ rows });
+  const S = 60000;
+  await a.call(true, { sustainMs: S, nowMs: 0 });
+  await Promise.all([a.call(true, { sustainMs: S, nowMs: S }), b.call(true, { sustainMs: S, nowMs: S })]);
+  assert.equal(a.sent.length + b.sent.length, 1);
+});
+
+test('sustainMs: a failed send hands the claim back so the next sweep retries', async () => {
+  const rows = new Map();
+  const client = mockClient(rows);
+  let ok = false;
+  const sent = [];
+  const call = (nowMs) => reportAlertCondition({
+    key: 'test:sustain-retry', active: true, text: 'BODY', client, nowMs, sustainMs: 1000,
+    send: async (b) => { if (!ok) return { sent: false, reason: 'slack down' }; sent.push(b); return { sent: true }; },
+  });
+  await call(0);
+  const first = await call(1000);
+  assert.equal(first.sent, false);
+  assert.equal(rows.get('test:sustain-retry').notify_count, 0);
+  ok = true;
+  const second = await call(2000);
+  assert.equal(second.sent, true);
+  assert.deepEqual(sent, ['BODY']);
+});

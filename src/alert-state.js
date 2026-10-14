@@ -286,6 +286,13 @@ async function _resolveText(text) {
  * @param {boolean} [args.notifyRecovery=true]
  * @param {number} [args.fallbackCooldownMs=0]  The emitter's pre-existing
  *   cooldown, used ONLY on the DB-error path.
+ * @param {number} [args.sustainMs=0]  Post only once the condition has stayed
+ *   bad this long (2026-10-14, Mark: "alert only if still broken after 10 min").
+ *   The row is still opened at the first bad sweep, so first_seen_at is the
+ *   real start; nothing is sent until a later sweep finds it still firing past
+ *   the window. A condition that clears first had notify_count 0, so _clear
+ *   sends no recovery card either: a 1-minute flap is silent in both
+ *   directions. 0 = post on the first bad sweep (the old behaviour).
  * @param {Function} [args.send]    Injectable sender (tests, capacityRanker).
  *   Default sendAlertMessage (ALERT_SEND_TARGET). Must resolve to { sent }.
  * @param {object} [args.client]    Injectable supabase (tests).
@@ -293,8 +300,21 @@ async function _resolveText(text) {
  *
  * @returns {Promise<{action:string, sent:boolean, reason?:string}>} action is
  *   one of 'fired' | 'reminded' | 'recovered' | 'silent' | 'idle' | 'noop' |
- *   'skipped' | 'fallback_fired' | 'fallback_silent'.
+ *   'skipped' | 'fallback_fired' | 'fallback_silent' | 'pending' (held by sustainMs).
  */
+/**
+ * How long a self-healing live-ops condition must last before it posts
+ * (2026-10-14, Mark). On 10-13 the GHL limiter flapped three times (1-3 min
+ * each), the agentic-silence alarm once (1 min) and the capacity ranker twice
+ * (one 5-minute poll each): every card was followed by RECOVERED before anyone
+ * could act. Used by those three emitters only; env ALERT_FLAP_SUSTAIN_MS, 0 to
+ * restore the old immediate post.
+ */
+export const FLAP_SUSTAIN_MS = (() => {
+  const n = parseInt(process.env.ALERT_FLAP_SUSTAIN_MS ?? '', 10);
+  return Number.isFinite(n) && n >= 0 ? n : 10 * 60 * 1000;
+})();
+
 export async function reportAlertCondition(args = {}) {
   const {
     key,
@@ -307,6 +327,7 @@ export async function reportAlertCondition(args = {}) {
     remindMs = 0,
     notifyRecovery = true,
     fallbackCooldownMs = 0,
+    sustainMs = 0,
     send = sendAlertMessage,
     client: clientArg,
     nowMs,
@@ -327,7 +348,7 @@ export async function reportAlertCondition(args = {}) {
 
   try {
     return active
-      ? await _fire({ client, key, label, text, detail, channel, remindMs, send, now, fallbackCooldownMs })
+      ? await _fire({ client, key, label, text, detail, channel, remindMs, send, now, fallbackCooldownMs, sustainMs })
       : await _clear({ client, key, label, recoveredText, channel, notifyRecovery, send, now });
   } catch (err) {
     // Clearing fails CLOSED — a false all-clear is worse than a missing one.
@@ -373,7 +394,7 @@ export async function observeAlertCondition({ key, active, label, detail, client
 }
 
 /** The condition is bad. Claim the firing edge, or stay silent if it is held. */
-async function _fire({ client, key, label, text, detail, channel, remindMs, send, now, fallbackCooldownMs }) {
+async function _fire({ client, key, label, text, detail, channel, remindMs, send, now, fallbackCooldownMs, sustainMs = 0 }) {
   const nowIso = new Date(now).toISOString();
   const trimmed = formatDetail(detail);
 
@@ -401,6 +422,8 @@ async function _fire({ client, key, label, text, detail, channel, remindMs, send
 
   if (claimed && claimed.length > 0) {
     _maybePrune(client);
+    // Opened, but held until it has lasted sustainMs (see the param note).
+    if (sustainMs > 0) return { action: 'pending', sent: false };
     return await _sendAndStamp({ client, key, text, channel, send, now, kind: 'fired' });
   }
 
@@ -425,6 +448,7 @@ async function _fire({ client, key, label, text, detail, channel, remindMs, send
     return await _fallbackFire({ key, text, channel, send, now, fallbackCooldownMs, reason: 'rearm_failed' });
   }
   if (rearmed && rearmed.length > 0) {
+    if (sustainMs > 0) return { action: 'pending', sent: false };
     return await _sendAndStamp({ client, key, text, channel, send, now, kind: 'fired' });
   }
 
@@ -432,6 +456,13 @@ async function _fire({ client, key, label, text, detail, channel, remindMs, send
   await Promise.resolve(
     client.from(TABLE).update({ last_seen_at: nowIso, detail: trimmed }).eq('alert_key', key),
   ).catch(() => {});
+
+  // Held condition that has now lasted sustainMs: claim the first card with a
+  // compare-and-swap on notify_count 0, so one replica sends it.
+  if (sustainMs > 0) {
+    const sustained = await _fireSustained({ client, key, text, channel, send, now, sustainMs });
+    if (sustained) return sustained;
+  }
 
   if (!remindMs) return { action: 'silent', sent: false };
 
@@ -454,6 +485,56 @@ async function _fire({ client, key, label, text, detail, channel, remindMs, send
   return await _sendAndStamp({
     client, key, text, channel, send, now, kind: 'reminded', alreadyStamped: true, remindMs,
   });
+}
+
+/**
+ * The first card for a condition held by sustainMs. Returns null when it is not
+ * due yet (or was already sent), so the caller falls through to the reminder
+ * check — which stays silent for a never-notified row (last_notified_at null).
+ */
+async function _fireSustained({ client, key, text, channel, send, now, sustainMs }) {
+  // lt(cutoff + 1ms) is "first_seen_at <= now - sustainMs".
+  const cutoff = new Date(now - sustainMs + 1).toISOString();
+  const nowIso = new Date(now).toISOString();
+  const { data: due, error } = await client.from(TABLE)
+    .update({ last_notified_at: nowIso, notify_count: 1 })
+    .eq('alert_key', key)
+    .eq('state', 'firing')
+    .eq('notify_count', 0)
+    .lt('first_seen_at', cutoff)
+    .select('alert_key');
+  if (error) {
+    console.warn(`[AlertState] ${key} sustained claim failed (staying silent): ${error.message}`);
+    return { action: 'silent', sent: false };
+  }
+  if (!due || due.length === 0) return null;
+
+  let body;
+  try {
+    body = await _resolveText(text);
+  } catch (err) {
+    console.error(`[AlertState] ${key} body build failed: ${err.message}`);
+    body = null;
+  }
+  let sent = false;
+  if (body) {
+    try {
+      const res = await send(body, { channel, noDedup: true });
+      sent = res?.sent !== false;
+      if (!sent) console.error(`[AlertState] ${key} send failed: ${res?.reason || 'sent:false'}`);
+    } catch (err) {
+      console.error(`[AlertState] ${key} send failed: ${err.message}`);
+    }
+  }
+  if (!sent) {
+    // Give the claim back so the next sweep retries, and a later clear does
+    // not announce a recovery nobody saw the alert for.
+    await Promise.resolve(
+      client.from(TABLE).update({ last_notified_at: null, notify_count: 0 }).eq('alert_key', key),
+    ).catch(() => {});
+    return { action: 'fired', sent: false, reason: body ? 'send_failed' : 'no_text' };
+  }
+  return { action: 'fired', sent: true };
 }
 
 /**

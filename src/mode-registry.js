@@ -356,6 +356,11 @@ export const MODES = Object.freeze([
     goLive: 'job_runs.detail.by_reason puts each lead on the list the 2026-10-06 ruling names',
     note: 'Pushes every imported, never-called LP lead to a Five9 list.',
   }),
+  m('AFTER_ASAP_RETRY_MODE', 'dialer', 'enum', OSL, 'shadow', OSL_S, {
+    since: '2026-10-14', decider: 'the user', evidence: job('after-asap-retry'),
+    goLive: 'job_runs.detail.decisions show would_push only for leads with no follow-up call and no After DIAL ASAP record',
+    note: 'Puts no-contact DIAL ASAP / Simpletext leads on After DIAL ASAP where the Five9 connector missed them.',
+  }),
   m('BOOKED_DIAL_ROUTING_MODE', 'dialer', 'enum', OSL, 'shadow', OSL_S, {
     since: '2026-10-06', evidence: { table: 'booked_dial_routing_log', job: 'booked-dial-routing' },
     goLive: 'booked_dial_routing_log decisions follow decision #2669 (add first, remove second)',
@@ -368,6 +373,10 @@ export const MODES = Object.freeze([
   m('FIVE9_CALLBACK_CALL_NOW_MODE', 'dialer', 'choice', FIVE9_CALL_NOW, 'ANY', {}, {
     since: '2026-09-04', goLive: 'a setting, not a rollout',
     note: 'Five9 call-now mode for bot callback pushes.',
+  }),
+  m('AFTER_ASAP_RETRY_CALL_NOW_MODE', 'dialer', 'choice', FIVE9_CALL_NOW, 'NONE', {}, {
+    since: '2026-10-14', goLive: 'a setting, not a rollout',
+    note: 'Five9 call-now mode for the After DIAL ASAP retry backstop (NONE: the campaign dials on its own schedule).',
   }),
   m('NEW_LEAD_BACKSTOP_CALL_NOW_MODE', 'dialer', 'choice', FIVE9_CALL_NOW, 'ANY', {}, {
     since: '2026-10-05', defaultFrom: 'FIVE9_CALLBACK_CALL_NOW_MODE', goLive: 'a setting, not a rollout',

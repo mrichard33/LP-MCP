@@ -83,7 +83,7 @@ import {
   executeModifyCampaignLists, executeStartCampaign, executeStopCampaign, five9WritesEnabled,
 } from '../five9/admin-writes.js';
 import { tryAcquireLock, releaseLock } from '../services/outbound-locks.js';
-import { reportAlertCondition, sendAlertMessage } from '../alert-state.js';
+import { reportAlertCondition, sendAlertMessage, FLAP_SUSTAIN_MS } from '../alert-state.js';
 import {
   rankMarkets, isMaterialChange, DEFAULT_SWAP_MARGIN, DEFAULT_HOPPER_WEIGHT, MARKET_CODES,
 } from '../capacity/rankMarkets.js';
@@ -1249,6 +1249,9 @@ export async function checkCampaignState(deps = {}) {
           detail: `state=${c.state ?? 'UNREADABLE'} cycling=${c.cycling}${c.read_error ? ` read_error=${c.read_error}` : ''}`,
           send: sendAlert,
           fallbackCooldownMs: WATCHDOG_SUPPRESS_MS,
+          // 2026-10-14 — one unanswered 5-minute poll (Hot 4m, Warm 9m on
+          // 10-13) is a slow Five9 API, not a dead campaign. Two in a row pages.
+          sustainMs: FLAP_SUSTAIN_MS,
         });
         if (r?.sent && active === true) alerted.push(c.campaign);
       } catch (err) {

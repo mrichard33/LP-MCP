@@ -606,3 +606,15 @@ test('weekends open 9am–5pm', () => {
   assert.equal(isOpenAt(Date.parse('2026-09-28T23:30:00Z')), true, 'Mon 7:30pm');
   assert.deepEqual(BUSINESS_HOURS, { weekday: { open: 8, close: 20 }, weekend: { open: 9, close: 17 } });
 });
+
+// 2026-10-14: the dedupe store's audit reason ('uncalled') overwrote each
+// lead's real reason, so every line on the card read "uncalled".
+test('hourly check, digest era: each line keeps the lead\'s real reason', async () => {
+  const store = postedStore();
+  const sent = [];
+  const deps = baseDeps({ ...store, sendAlertMessage: async (text) => { sent.push(text); return { sent: true }; } });
+  await runLeadUncalledCheck({ env: { LEAD_LEAK_ALERT_MODE: 'live' }, nowMs: NOW, deps });
+  assert.equal(sent.length, 1);
+  assert.doesNotMatch(sent[0], /· uncalled ·/);
+  assert.match(sent[0], /Jane D\. · 3524453161 · Google PPC · waiting \S+ \S+ · (?!uncalled)/);
+});

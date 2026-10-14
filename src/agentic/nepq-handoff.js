@@ -24,8 +24,12 @@
 import { CALLBACK_MARKER_TAG, NO_DIAL_REASONS } from './bot-callback.js';
 import { GHL_LOCATION_ID } from '../actions/constants.js';
 
-/** #dispatch's live channel; SLACK_CHANNEL_DISPATCH overrides (same default as the cancel cards). */
-export const DISPATCH_CHANNEL_DEFAULT = 'C0C19GRS8FJ';
+/**
+ * Where dispatch's cards go; SLACK_CHANNEL_DISPATCH overrides (same default as the cancel cards).
+ * 2026-10-14 (Mark): #dispatch (C0C19GRS8FJ) was deleted, so the 10-13 emergency card ("water
+ * coming in") failed with channel_not_found. Dispatch cards now go to #reece-chatbot.
+ */
+export const DISPATCH_CHANNEL_DEFAULT = 'C0C9AGEM2N8';
 const DISPATCH_REASONS = new Set(['complaint', 'booking_request', 'emergency']);
 
 /** The Slack channels a hand-off card goes to. Pure. */

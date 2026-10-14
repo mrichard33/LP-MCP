@@ -78,7 +78,7 @@
 
 import supabase from './supabase.js';
 import { processEvents } from './decision-engine.js';
-import { reportAlertCondition } from './alert-state.js';
+import { reportAlertCondition, FLAP_SUSTAIN_MS } from './alert-state.js';
 import {
   shouldAlertAgenticSilence,
   formatAgenticSilenceAlert,
@@ -422,6 +422,8 @@ async function maybeAlertAgenticSilence() {
     detail: reasons.join('; '),
     remindMs: SILENCE_REMIND_MS,
     fallbackCooldownMs: SILENCE_ALERT_COOLDOWN_MS,
+    // 2026-10-14 — fired and recovered inside one minute on 10-13.
+    sustainMs: FLAP_SUSTAIN_MS,
   });
   if (res.sent && active === true) {
     lastSilenceAlertAt = Date.now();
