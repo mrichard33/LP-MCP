@@ -23,7 +23,7 @@ import { postToSlack, updateSlackMessage } from '../slack.js';
 import { parseApproverIds } from '../slack-approvals-core.js';
 import { allocateExpenseById, previewAllocation } from './allocation-io.js';
 import { trueUpInvoice } from './leadgurus-feed.js';
-import { buildReviewCard, buildEditView, parseEditSubmission, marketsForSplit } from './slack-review.js';
+import { buildReviewCard, buildEditView, parseEditSubmission, marketsForSplit, subSourcesForSplit } from './slack-review.js';
 import { computeFlags } from './expense-builder.js';
 import { vendorLearnPatch, normalizeName } from './vendors.js';
 import { splitsEvenly } from './allocation.js';
@@ -175,6 +175,9 @@ export async function handleMarketingInvoiceInteraction(parsed, deps = {}) {
     // one with that name or alias already exists, that one is used), with the
     // sub-source and split from this form, so its next invoice matches by name.
     const splitMarkets = marketsForSplit(v);
+    // Call center / software (2026-10-14): the category IS the line's sub-source,
+    // whatever was typed in the sub-source box, so the report shows it as its own row.
+    const formSubs = subSourcesForSplit(v);
     let created = false;
     if (v.new_vendor) {
       const { data: all } = await supabase.from('marketing_vendors').select('*');
@@ -184,7 +187,7 @@ export async function handleMarketingInvoiceInteraction(parsed, deps = {}) {
       else {
         const aliases = [...new Set([v.new_vendor, ctx.facts?.vendor_name_hint].filter(Boolean).map((x) => String(x).trim()))];
         const { data: made, error: mkErr } = await supabase.from('marketing_vendors').insert({
-          vendor_name: v.new_vendor, aliases, sender_domains: [], lp_sub_sources: v.lp_sub_sources,
+          vendor_name: v.new_vendor, aliases, sender_domains: [], lp_sub_sources: formSubs,
           eligible_markets: splitMarkets ?? [], default_cost_type: 'invoice', is_active: true,
           notes: `Added from the invoice Edit form by ${who}, ${new Date().toISOString().slice(0, 10)}`,
         }).select('*').single();
@@ -202,9 +205,9 @@ export async function handleMarketingInvoiceInteraction(parsed, deps = {}) {
     if (v.period_end) patch.period_end = v.period_end;
     // A vendor picked or created here brings its own sub-source and split when
     // the form leaves them blank (pick "Hatch" → evenly across all offices).
-    if (v.lp_sub_sources.length) patch.lp_sub_sources = v.lp_sub_sources;
+    if (formSubs.length) patch.lp_sub_sources = formSubs;
     else if (usingNewVendor && (vendor.lp_sub_sources || []).length) patch.lp_sub_sources = vendor.lp_sub_sources;
-    else if (v.split === 'even') patch.lp_sub_sources = [];
+    else if (v.split === 'even' || v.lp_sub_sources.length) patch.lp_sub_sources = [];
     if (splitMarkets) patch.eligible_markets = splitMarkets;
     else if (usingNewVendor && !v.split) patch.eligible_markets = vendor.eligible_markets || [];
     if (v.amount != null && pending.length === 1) patch.amount = v.amount;

@@ -607,7 +607,11 @@ Brad's XLSX (`marketing-cost-report`, formulas never typed values) read `v_marke
   whose `eligible_markets` holds `ALL_OFFICES` is allocated `equal` over `OFFICE_MARKETS` whatever the issued leads say,
   needs no sub-source (its rows carry the typed one, else `Company-wide`), and is never blocked on one. A vendor with
   `eligible_markets = '{ALL_OFFICES}'` makes every invoice of theirs split that way. Houston and Winston-Salem have no
-  office, so they are not in the six.
+  office, so they are not in the six. **Two named kinds (the user, 2026-10-14): call center and software**
+  (`COST_CATEGORIES`): Edit's "What is this cost?" sets `ALL_OFFICES` and writes the label ("Call Center" /
+  "Software") as the line's sub-source, so the report shows each as its own row; a vendor carrying one keeps it on every
+  line whatever the model guessed (`buildExpenseRows`), and switching back to a lead source drops the label
+  (`subSourcesForSplit`).
 - **The Edit form can add what is missing (the user, 2026-10-13).** "New vendor" creates the vendor on Save (or uses
   the one with that name or alias), "How to split" is by the sub-source's issued leads / evenly across all offices /
   only the markets picked, and "Remember" writes the sub-source and split onto the vendor for its next invoices. Picking

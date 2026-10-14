@@ -640,6 +640,57 @@ test('Edit adds a vendor that does not exist yet, sets "evenly across all office
   assert.deepEqual(row2.eligible_markets, ['ALL_OFFICES']);
 });
 
+test('Edit assigns an invoice to "Call center": the label is its sub-source, six equal shares, remembered on the vendor', async () => {
+  // 2026-10-14, the user: "I should be able to assign it to either call-center
+  // or software, and the amount will be divided among all offices."
+  const supabase = db();
+  const posts = [];
+  const text = 'Five9 Inc\nInvoice #F9-1001\nService period: 10/01/2026 - 10/31/2026\nTotal $1,200.00';
+  const r = await ingestInvoice({ ...FWD, gmail_message_id: 'cc1', file_name: 'F9-1001.pdf', mime_type: 'application/pdf', file_b64: Buffer.from(text).toString('base64') }, { ...depsFor(supabase, { posts }), analyzeDeps: noAi() });
+  const updates = [];
+  const deps = { supabase, approvers: new Set(['U_BRAD']), reply: async () => {}, updateSlackMessage: async (c, ts, t, o) => { updates.push(o); return { ok: true }; }, signedLink: async () => null };
+  const values = {
+    new_vendor: { mktinv_v_new_vendor: { value: 'Five9' } },
+    // the sub-source box still holds an old guess: the category wins
+    sub_source: { mktinv_v_sub_source: { value: 'Vis PPC' } },
+    split: { mktinv_v_split: { selected_option: { value: 'call_center' } } },
+    remember: { mktinv_v_remember: { selected_options: [{ value: 'remember' }] } },
+  };
+  const edited = await handleMarketingInvoiceInteraction(parsedClick('edit_submit', r.document_id, { userId: 'U_BRAD', userName: 'brad', values }), deps);
+  assert.equal(edited.action, 'edited');
+  const row = supabase.tables.marketing_expenses[0];
+  assert.deepEqual(row.lp_sub_sources, ['Call Center']);
+  assert.deepEqual(row.eligible_markets, ['ALL_OFFICES']);
+  const vendor = supabase.tables.marketing_vendors.find((v) => v.vendor_name === 'Five9');
+  assert.deepEqual([vendor.lp_sub_sources, vendor.eligible_markets], [['Call Center'], ['ALL_OFFICES']]);
+  assert.match(JSON.stringify(updates.at(-1).blocks), /call center cost, split evenly across all offices/);
+  const ok = await handleMarketingInvoiceInteraction(parsedClick('approve', r.document_id, { userId: 'U_BRAD', userName: 'brad' }), deps);
+  assert.equal(ok.action, 'approved');
+  const allocs = supabase.tables.marketing_expense_allocations;
+  assert.equal(allocs.length, 6);
+  assert.deepEqual([...new Set(allocs.map((a) => a.lp_sub_source))], ['Call Center']);
+  assert.ok(allocs.every((a) => Number(a.amount) === 200));
+});
+
+test('switching a Software line back to a lead source drops the "Software" label', async () => {
+  const hatch = { id: HATCH_ID, vendor_name: 'Hatch', aliases: ['Hatch'], sender_domains: [], lp_sub_sources: ['Software'], eligible_markets: ['ALL_OFFICES'], default_cost_type: 'invoice', is_active: true };
+  const supabase = db({ marketing_vendors: [...VENDORS, hatch] });
+  const text = 'Hatch\nReceipt #2757-9600\nService period: 10/01/2026 - 10/31/2026\nTotal $600.00';
+  const r = await ingestInvoice({ ...FWD, gmail_message_id: 'sw1', file_name: 'R-2757-9600.pdf', mime_type: 'application/pdf', file_b64: Buffer.from(text).toString('base64') }, { ...depsFor(supabase, { posts: [] }), analyzeDeps: noAi() });
+  assert.deepEqual(supabase.tables.marketing_expenses[0].lp_sub_sources, ['Software'], 'the vendor brings its category');
+  const values = {
+    sub_source: { mktinv_v_sub_source: { value: 'Software' } },
+    split: { mktinv_v_split: { selected_option: { value: 'by_source' } } },
+  };
+  const deps = { supabase, approvers: new Set(['U_BRAD']), reply: async () => {}, updateSlackMessage: async () => ({ ok: true }), signedLink: async () => null };
+  await handleMarketingInvoiceInteraction(parsedClick('edit_submit', r.document_id, { userId: 'U_BRAD', userName: 'brad', values }), deps);
+  const row = supabase.tables.marketing_expenses[0];
+  assert.deepEqual([row.lp_sub_sources, row.eligible_markets], [[], []]);
+  const replies = [];
+  const blocked = await handleMarketingInvoiceInteraction(parsedClick('approve', r.document_id, { userId: 'U_BRAD', userName: 'brad' }), { ...deps, reply: async (_u, b) => replies.push(b) });
+  assert.notEqual(blocked.action, 'approved', 'a lead-source split still needs its sub-source');
+});
+
 test('a document still failed a day later is removed and named once', async () => {
   const supabase = db({ marketing_invoice_documents: [
     { id: 'old', sha256: 'a', status: 'failed', file_name: 'x.pdf', from_address: 'b@x.com', error: 'extract: timed out', updated_at: '2026-10-11T00:00:00Z' },
