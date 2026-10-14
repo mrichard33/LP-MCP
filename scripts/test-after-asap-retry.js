@@ -132,7 +132,11 @@ function stubs({ events, dispo = 'Data', dnc = [], failLp = false } = {}) {
       },
       supabase,
       checkDnc: async () => ({ on_dnc: dnc }),
-      getContactRecords: async () => LITA,
+      getContactRecords: async (arg) => {
+        // The real function throws on a bare array (buildLookupCriteriaXml).
+        if (!Array.isArray(arg?.criteria) || !arg.criteria.length) throw new Error('lookup_criteria requires at least one { field, value } criterion');
+        return LITA;
+      },
     },
   };
 }
