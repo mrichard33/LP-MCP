@@ -113,7 +113,10 @@ export async function runAfterAsapRetry({ env = process.env, nowMs = Date.now(),
     lookups += 1;
     let rec;
     try {
-      rec = recordForCall(await d.getContactRecords([{ field: 'number1', value: cand.phone }]), cand.lpRecKey);
+      // getContactRecords takes { criteria }, never a bare array: a bare array
+      // throws "lookup_criteria requires at least one criterion" (2026-10-14:
+      // every lookup of the first live passes read lookup_failed).
+      rec = recordForCall(await d.getContactRecords({ criteria: [{ field: 'number1', value: cand.phone }] }), cand.lpRecKey);
     } catch {
       rec = 'error';
     }
