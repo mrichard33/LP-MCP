@@ -145,7 +145,7 @@ async function fetchDormantContactIds(cap = 0, dormantDays = DEFAULT_DORMANT_DAY
  * so the two stay behavior-equivalent.
  */
 async function classifyOneDryRun(contactId) {
-  const ctx = await buildLeadContext(contactId, { skipCache: true });
+  const ctx = await buildLeadContext(contactId, { skipCache: true, forStateClassifier: true });
   const supp = classifySuppression(ctx);
   if (supp) {
     return {

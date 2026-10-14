@@ -99,7 +99,9 @@ export async function classifyLeadState(contactId, options = {}) {
     ctx = options.context;
   } else {
     try {
-      ctx = await buildLeadContext(contactId, { skipCache: true });
+      // 2026-10-14: the light build (no conversation, notes or calls): the
+      // shapes never read them, and this ran ~350 times an hour (GHL budget).
+      ctx = await buildLeadContext(contactId, { skipCache: true, forStateClassifier: true });
     } catch (err) {
       // Persist the failure as UNCLASSIFIED so the table reflects reality.
       const failureReason = {

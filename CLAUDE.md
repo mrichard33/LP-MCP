@@ -1141,6 +1141,13 @@ a prospect whose leads all carry one stored, classified link skips `matchToGHL` 
 shows. The P2 backstop remembers a settled `skip`/`report` for 6h per deciding job (`createSettledMemo`), never a write,
 a wait or an unreadable read. The rehash sweep decides from `contact_tag_snapshot` and reads GHL live only to act, for a
 contact not in the snapshot, or once a day per contact (`canSkipLiveRead`); every write is still decided from a live read.
+**The lead-state sweep reads a light context (2026-10-14).** After the cuts above, `src:context-builder.js` was the top caller
+(29,608 a day, 1,400-1,900 an hour overnight): the sweep (`LEAD_STATE_SWEEP_ENABLED`) re-classifies ~350 contacts an hour,
+each with a FULL build. The classifier never reads the conversation, GHL notes or calls, so it builds with
+`forStateClassifier: true` (`contextParts`: ~5 GHL calls → 2), and a partial build is never cached (the analyzer reads the
+cache). The sweep and the note-change analyzer are labelled `job:lead-state-sweep` / `job:note-change-analyzer`. The
+`CONTEXT_CALLS_SOURCE=shadow` Five9 read now runs in the background: it timed out at 6s on every build (a suffix
+`like` on `five9_events_raw`) and every context waited for it. It needs an index before `five9` mode can go live.
 
 **Static system prompts are cached** (`callLLM({ cacheSystem: true })`: reply writer, analyzer, live chat).
 Only for a system prompt that is byte-identical across calls — a varying one pays the write premium every

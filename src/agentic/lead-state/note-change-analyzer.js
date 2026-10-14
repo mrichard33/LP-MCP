@@ -38,6 +38,7 @@
 import supabase from '../../supabase.js';
 import { analyzeNotesForContact } from './note-intelligence.js';
 import { classifyLeadState } from './classifier.js';
+import { withGhlCaller } from '../../ghl-caller.js';
 
 // ── Config (env-overridable) ────────────────────────────────────────
 const ENABLED        = process.env.NOTE_CHANGE_ANALYZER_ENABLED === 'true';
@@ -154,7 +155,14 @@ async function fetchIntel(ghlContactId) {
   return data || {};
 }
 
-export async function runNoteChangeAnalysis({ limit = BATCH } = {}) {
+// 2026-10-14: credited to its own label in the GHL per-caller report. Unlabelled,
+// it read as `src:context-builder.js` (29,608 requests a day) and no one could
+// tell it was this pass.
+export function runNoteChangeAnalysis(opts = {}) {
+  return withGhlCaller('job:note-change-analyzer', () => runNoteChangeAnalysisPass(opts));
+}
+
+async function runNoteChangeAnalysisPass({ limit = BATCH } = {}) {
   if (running) return { success: true, skipped: true, reason: 'already_running' };
   running = true;
   const startedAt = Date.now();

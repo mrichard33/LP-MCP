@@ -877,13 +877,22 @@ export function sameLatestCall(lpCalls, five9Calls, toleranceMs = 15 * 60 * 1000
  *           ONE line compares them, so the switch to five9 is made on evidence
  *   five9   Five9 only; lp_call_logs is not read
  * Cached with the rest of the context (CONTEXT_CACHE_TTL_MS), nothing new.
+ *
+ * 2026-10-14: in shadow the Five9 read runs in the BACKGROUND. It timed out at
+ * 6s on 55 of 55 builds in the logs (the `ani.like.*<phone>` suffix match scans
+ * five9_events_raw), and the build's Promise.all waited for it, so every reply
+ * context sat up to 6s on a result the prompt never uses. The comparison line
+ * is still logged when it settles; `five9` mode still waits (it uses the result).
  */
-async function fetchRecentCalls({ ghlContactId, phone, lpLeadId }, deps = {}) {
+export async function fetchRecentCalls({ ghlContactId, phone, lpLeadId }, deps = {}) {
   const source = deps.source || CONTEXT_CALLS_SOURCE;
+  const readLp = deps.fetchLPCalls || fetchLPCalls;
   if (source === 'five9') return fetchFive9Calls({ phone, lpLeadId }, deps);
-  if (source === 'lp') return fetchLPCalls(lpLeadId);
-  const [lp, five9] = await Promise.all([fetchLPCalls(lpLeadId), fetchFive9Calls({ phone, lpLeadId }, deps)]);
-  console.log(`[ContextCalls] shadow contact=${ghlContactId} lp=${lp.length} five9=${five9.length} same_latest=${sameLatestCall(lp, five9)}`);
+  if (source === 'lp') return readLp(lpLeadId);
+  const lp = await readLp(lpLeadId);
+  fetchFive9Calls({ phone, lpLeadId }, deps)
+    .then((five9) => console.log(`[ContextCalls] shadow contact=${ghlContactId} lp=${lp.length} five9=${five9.length} same_latest=${sameLatestCall(lp, five9)}`))
+    .catch(() => {});
   return lp;
 }
 
@@ -1037,8 +1046,32 @@ function calcLpStaleness(lpLead) {
 // MAIN ENTRY POINT
 // ═══════════════════════════════════════════════════════════════════
 
+/**
+ * Which optional reads a build makes. Pure.
+ *
+ * 2026-10-14 (GHL budget, PR 3): the lead-state sweep (LEAD_STATE_SWEEP_ENABLED,
+ * ~350 contacts an hour around the clock, mostly the 7-day stale top-up) was the
+ * biggest GHL caller left: 29,608 requests a day credited to
+ * `src:context-builder.js`, because every contact got the FULL build (contact,
+ * opportunity search, conversation search + 30 messages, GHL notes). The
+ * classifier reads tags, custom fields, the pipeline, the LP lead and the
+ * Supabase intelligence/engagement rows (lead-state/signals/*) and never the
+ * conversation, the notes or the calls, so `forStateClassifier` skips those:
+ * about 5 GHL calls per contact become 2.
+ */
+export function contextParts(options = {}) {
+  const lite = options.forStateClassifier === true;
+  const includeConversation = options.includeConversation !== false && !lite;
+  const parts = { conversation: includeConversation, ghlNotes: !lite, calls: !lite };
+  // A partial build is never cached: the analyzer reads the cache
+  // (skipCache:false) and must not get a context with no conversation in it.
+  parts.cacheable = parts.conversation && parts.ghlNotes && parts.calls;
+  return parts;
+}
+
 export async function buildLeadContext(ghlContactId, options = {}) {
-  const { includeConversation = true, skipCache = false, workflow_code = null } = options;
+  const { skipCache = false, workflow_code = null } = options;
+  const parts = contextParts(options);
 
   if (!skipCache) {
     const cached = getCached(ghlContactId);
@@ -1157,15 +1190,15 @@ export async function buildLeadContext(ghlContactId, options = {}) {
   const [conversation, lpNotes, lpCalls, pipelineStageInfo, nurtureHistory, openObjectionState, ghlNotes, lpProspectHistory, market] = await Promise.all([
     // Part 7 (Mark, 2026-10-02): 30 messages across every channel, not 10, so
     // the bot knows the whole recent story (texts, chats, emails).
-    (includeConversation && ghlContact) ? fetchConversation(ghlContactId, 30, degraded) : [],
+    (parts.conversation && ghlContact) ? fetchConversation(ghlContactId, 30, degraded) : [],
     fetchLPNotes(lpLeadId),
     // 2026-10-10: Five9 is the source of truth for calls; CONTEXT_CALLS_SOURCE
     // decides whether the prompt sees it yet (default shadow: LP + one log line).
-    fetchRecentCalls({ ghlContactId, phone: ghlContact?.phone || null, lpLeadId }),
+    parts.calls ? fetchRecentCalls({ ghlContactId, phone: ghlContact?.phone || null, lpLeadId }) : [],
     opportunity?.pipelineStageId ? resolvePipelineStage(opportunity.pipelineStageId) : null,
     fetchNurtureHistory(ghlContactId, workflow_code),
     fetchOpenObjectionState(ghlContactId),
-    fetchGHLNotes(ghlContactId, 6, degraded),
+    parts.ghlNotes ? fetchGHLNotes(ghlContactId, 6, degraded) : [],
     // v2.9: whole-prospect history for customer_relationship.
     fetchLPProspectHistory(lpLead?.lp_prospect_id || cfProspectId || null),
     // 2026-10-01: the contact's market zone (Houston → Central). Fail-soft to
@@ -1449,7 +1482,7 @@ export async function buildLeadContext(ghlContactId, options = {}) {
   // the property ZIP on file, and a note that says we cannot run the lead.
   context.lead_facts = buildLeadFacts({ lp: context.lp, lpLead, lead: context.lead });
 
-  setCache(ghlContactId, context);
+  if (parts.cacheable) setCache(ghlContactId, context);
   return context;
 }
 
