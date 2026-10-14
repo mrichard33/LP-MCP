@@ -330,6 +330,7 @@ import { startStaleLeadRefreshScheduler } from './jobs/stale-lead-refresh.js';  
 import { startSaleContactBackstopScheduler } from './jobs/sale-contact-backstop.js';  // 2026-10-04 — every LP sale gets a GHL contact
 import { startMissedCallerRecoveryScheduler } from './jobs/missed-caller-recovery.js';  // 2026-09-24
 import { startNewLeadDialBackstopScheduler } from './jobs/new-lead-dial-backstop.js';  // 2026-10-05
+import { startAfterAsapRetryScheduler } from './jobs/after-asap-retry.js';  // 2026-10-14
 import { startInboundCheckoutWatchScheduler } from './jobs/inbound-checkout-watch.js';  // 2026-10-06
 import { startPromisedCallbackScheduler } from './jobs/promised-callback-sweep.js';  // 2026-10-07
 import { startRehashTagScheduler } from './jobs/rehash-tag-sweep.js';  // 2026-10-09
@@ -995,6 +996,7 @@ const server = app.listen(PORT, async () => {
   startSaleContactBackstopScheduler();
   startMissedCallerRecoveryScheduler();
   startNewLeadDialBackstopScheduler();
+  startAfterAsapRetryScheduler();
   startInboundCheckoutWatchScheduler();
   startPromisedCallbackScheduler();
   startRehashTagScheduler();

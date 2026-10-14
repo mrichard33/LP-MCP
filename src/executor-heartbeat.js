@@ -194,7 +194,7 @@ import { executeActions } from './action-executor.js';
 import { reapStaleLocks } from './actions/reaper.js';
 import { shouldAlertQueueDepth, formatQueueAlert } from './executor-queue-alerts.js';
 import { getRateLimiterStats } from './ghl-rate-limiter.js';
-import { reportAlertCondition } from './alert-state.js';
+import { reportAlertCondition, FLAP_SUSTAIN_MS } from './alert-state.js';
 import {
   shouldAlertLimiter,
   formatLimiterAlert,
@@ -514,6 +514,8 @@ async function maybeAlertLimiter() {
     text: () => formatLimiterAlert(curr, reasons, critical),
     detail: reasons.join('; '),
     fallbackCooldownMs: LIMITER_ALERT_COOLDOWN_MS,
+    // 2026-10-14 — a 1-3 minute flap is backpressure, not an incident.
+    sustainMs: FLAP_SUSTAIN_MS,
   });
   if (res.sent && alert) {
     console.warn(`[ExecutorHeartbeat] limiter alert sent — ${reasons.join('; ')}`);

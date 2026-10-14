@@ -1150,7 +1150,13 @@ export async function runLeadUncalledCheck({ env = process.env, nowMs = Date.now
       console.log(`[LeadLeak] uncalled check ${aMode} — waiting=${decision.count ?? 0}, none new — no card`);
       return { ok: true, mode: aMode, verdict: decision.verdict, summary: `waiting=${decision.count} new=0` };
     }
-    const text = formatUncalledAlert(fresh, { cfg: acfg, dashboardUrl: cfg.dashboardUrl, nowMs });
+    // 2026-10-14: `reason: 'uncalled'` above is the dedupe store's audit reason,
+    // and it overwrote each lead's real reason, so every line read "uncalled" —
+    // including leads DIAL ASAP had rung and never retried (7 of 8 on 10-14).
+    // The card prints the lead's own reason.
+    const realReason = new Map(offenders.map((o) => [String(o.lp_lead_id), o.reason]));
+    const named = fresh.map((f) => ({ ...f, reason: realReason.get(f.key) ?? f.reason }));
+    const text = formatUncalledAlert(named, { cfg: acfg, dashboardUrl: cfg.dashboardUrl, nowMs });
     if (aMode === 'shadow') {
       console.log(`[LeadLeak] shadow uncalled — would send ${fresh.length} new:\n${text}`);
       return { ok: true, mode: aMode, verdict: decision.verdict, summary: `waiting=${decision.count} new=${fresh.length} shadow` };

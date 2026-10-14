@@ -236,6 +236,16 @@ test('final: Five9 attempts on this lead skip; attempts from an older lead on th
   assert.deepEqual([old.action, old.list], ['push', 'Callback Request'], 'old record: too old for DIAL ASAP');
 });
 
+// 2026-10-14: CAROLYN O. (LP 583385) — Five9 held only her 2024 lead's record:
+// 10 attempts, blank last-dispo time, lead_id not hers. She was read as called.
+test('final: another lead\'s old record with no last-dispo time is not a call on this lead', () => {
+  const carolyn = F({ contact: { list: null, attempts: 10, lastDispoMs: null, leadIdMatch: false, createdMs: at('2024-03-31T14:11:39Z') } });
+  assert.equal(carolyn.action, 'push');
+  assert.equal(carolyn.list, 'Callback Request');
+  // This lead's own record still counts.
+  assert.equal(F({ contact: { list: null, attempts: 1, lastDispoMs: null, leadIdMatch: true } }).reason, 'five9_attempted');
+});
+
 test('final: already on our list skips; the two DIAL ASAP lists are one campaign', () => {
   const fresh = MON_1015 - 3600_000;
   assert.equal(F({ contact: { list: 'Direct Lead Entry', attempts: 0, createdMs: fresh } }).reason, 'already_on_target_list');

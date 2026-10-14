@@ -769,11 +769,15 @@ export function buildModifyOutboundCampaignXml(campaignName, patch) {
 
 // fieldsMapping entries shared by add/delete list bodies (WSDL tns:fieldEntry).
 // key=true on number1 — the dial-key column, same convention as list-dispatch.
-function fieldsMappingXml(fieldNames) {
+// 2026-10-14: keyFields widens the match (e.g. number1 + LPRecKey) so a phone
+// with several Five9 records adds the RIGHT one. Matching on number1 alone is
+// how the "After DIAL ASAP" connector lost repeat leads (src/after-asap-retry.js).
+function fieldsMappingXml(fieldNames, keyFields = ['number1']) {
+  const keys = new Set(keyFields?.length ? keyFields : ['number1']);
   return fieldNames.map((name, i) =>
     `<fieldsMapping><columnNumber>${i + 1}</columnNumber>` +
     `<fieldName>${escapeXml(name)}</fieldName>` +
-    `<key>${name === 'number1'}</key></fieldsMapping>`
+    `<key>${keys.has(name)}</key></fieldsMapping>`
   ).join('');
 }
 
@@ -790,7 +794,7 @@ function recordXml(values) {
  */
 export const CALL_NOW_MODES = new Set(['NONE', 'NEW_CRM_ONLY', 'NEW_LIST_ONLY', 'ANY']);
 
-export function buildAddRecordToListXml(listName, fieldNames, values, callNowMode = null) {
+export function buildAddRecordToListXml(listName, fieldNames, values, callNowMode = null, keyFields = null) {
   const list = String(listName || '').trim();
   if (!list) throw new Error('list_name is required');
   if (!Array.isArray(fieldNames) || !Array.isArray(values) || fieldNames.length !== values.length || !fieldNames.length) {
@@ -798,6 +802,12 @@ export function buildAddRecordToListXml(listName, fieldNames, values, callNowMod
   }
   if (callNowMode != null && !CALL_NOW_MODES.has(callNowMode)) {
     throw new Error(`invalid call_now_mode "${callNowMode}" (allowed: ${[...CALL_NOW_MODES].join(', ')})`);
+  }
+  if (keyFields != null) {
+    if (!Array.isArray(keyFields) || !keyFields.length || !keyFields.includes('number1')
+        || keyFields.some((k) => !fieldNames.includes(k))) {
+      throw new Error(`invalid key_fields ${JSON.stringify(keyFields)}: must include number1 and only mapped fields`);
+    }
   }
   // callNowMode is what makes a pushed record DIAL rather than wait for the
   // next list pass — verified against the live v13 WSDL 2026-09-04, where
@@ -819,7 +829,7 @@ export function buildAddRecordToListXml(listName, fieldNames, values, callNowMod
   const callNowXml = callNowMode ? `<callNowMode>${callNowMode}</callNowMode>` : '';
   return (
     `<listName>${escapeXml(list)}</listName>` +
-    `<listUpdateSettings>${fieldsMappingXml(fieldNames)}` +
+    `<listUpdateSettings>${fieldsMappingXml(fieldNames, keyFields)}` +
     `<skipHeaderLine>false</skipHeaderLine>` +
     callNowXml +
     `<cleanListBeforeUpdate>false</cleanListBeforeUpdate>` +
@@ -1416,12 +1426,14 @@ export function executeAddRecordsToList(action) {
   // Optional, and validated by the builder. Absent = a plain append, which is
   // what every caller before the 2026-09-04 callback push wanted.
   const callNowMode = payload.call_now_mode ?? null;
+  // Optional (2026-10-14): extra key columns, e.g. ['number1', 'LPRecKey'].
+  const keyFields = payload.key_fields ?? null;
   return withFive9WriteGate({ action, subtype: 'add_records_to_list', entityType: 'five9_list', entityId: listName }, async (ctx) => {
     const sizeOf = async () => (await getListsInfo()).lists.find(l => l.name === listName) ?? { name: listName, size: null };
     ctx.previous_state = await sizeOf();
     let added = 0;
     for (const values of records) {
-      const xml = await ctx.soap('addRecordToList', buildAddRecordToListXml(listName, fieldNames, values, callNowMode));
+      const xml = await ctx.soap('addRecordToList', buildAddRecordToListXml(listName, fieldNames, values, callNowMode, keyFields));
       if (xml !== null) assertNoRecordFailures('addRecordToList', xml);
       added += 1;
     }

@@ -391,7 +391,7 @@ test('hand-off card: #contact-center always, #dispatch for a complaint; a failed
     post: async (text, ch) => { posts.push({ text, ch }); return ch === 'CSERVICE' ? { ok: true } : { ok: false, error: 'not_in_channel' }; },
     opsAlert: async (t) => { ops.push(t); },
   });
-  assert.deepEqual(posts.map(p => p.ch), ['CSERVICE', 'C0C19GRS8FJ']);
+  assert.deepEqual(posts.map(p => p.ch), ['CSERVICE', 'C0C9AGEM2N8']);
   assert.match(posts[0].text, /WEBSITE CHAT[\s\S]*supposed to come today[\s\S]*contacts\/detail\/C9/);
   assert.equal(ops.length, 1);
   assert.match(ops[0], /NOT POSTED TO #dispatch[\s\S]*add the Reece Slack app/);

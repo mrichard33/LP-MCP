@@ -365,6 +365,17 @@ export const JOBS = Object.freeze([
     isEnabled: (env) => String(env.NEW_LEAD_DIAL_BACKSTOP_MODE || 'shadow').toLowerCase().trim() !== 'off',
   },
   {
+    id: 'after-asap-retry',
+    label: 'No-contact DIAL ASAP / Simpletext leads the Five9 connector missed → After DIAL ASAP',
+    group: 'five9',
+    cadence: 'every 15 min, 24/7',
+    enabledEnv: 'AFTER_ASAP_RETRY_MODE',
+    // A MODE (2026-10-14): off | shadow | live, default shadow. Mirrors
+    // retryMode() in src/after-asap-retry.js — only 'off' stops it.
+    enabledDefault: true,
+    isEnabled: (env) => String(env.AFTER_ASAP_RETRY_MODE || 'shadow').toLowerCase().trim() !== 'off',
+  },
+  {
     id: 'inbound-checkout-watch',
     label: 'LP inquiries waiting to be checked out → #contact-center; mirror of LP\'s inbound queue',
     group: 'lp-intake',

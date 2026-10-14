@@ -373,7 +373,15 @@ export function finalDecision({ pre, row, lead = null, onDnc, contact, nowMs, cf
   // Attempts on THIS lead count; attempts that predate its arrival belong to an
   // older lead on the same number (a returning homeowner) and do not.
   const attempts = Number(contact?.attempts) || 0;
-  const attemptsAreOld = Number.isFinite(contact?.lastDispoMs) && contact.lastDispoMs < row.receivedMs - 60_000;
+  // 2026-10-14 (CAROLYN O., LP 583385, canvass): Five9 had only her 2024
+  // record (10 attempts, no last-dispo time), so the old test could not date
+  // the attempts and read her as called; she sat uncalled for a day. A record
+  // whose lead_id is NOT this lead and that was created before it arrived is
+  // an older lead's record, whatever its last-dispo field says.
+  const otherLeadsRecord = contact?.leadIdMatch === false
+    && (!Number.isFinite(contact?.createdMs) || contact.createdMs < row.receivedMs - 60_000);
+  const attemptsAreOld = otherLeadsRecord
+    || (Number.isFinite(contact?.lastDispoMs) && contact.lastDispoMs < row.receivedMs - 60_000);
   if (attempts > 0 && !attemptsAreOld) return out('skip', 'five9_attempted');
 
   const list = contact?.list || null;
