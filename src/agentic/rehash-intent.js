@@ -38,7 +38,9 @@ const COMPLAINT_RX = new RegExp([
 ].join('|'), 'i');
 
 // The proposal itself: they want the quote, a copy, or its detail.
-const QUOTE_WORD_RX = /\b[qg]uot(?:e|es|ed|ation|ations)\b|\bestimates?\b|\bproposals?\b|\bpric(?:e|ing)\s+sheet\b|\bcontract\b|\bpaperwork\b|\bbreak\s*down\b|\bitemi[sz]\w*/i;
+// 2026-10-14: "I didn't receive a bid" (the first live reply after the deploy)
+// read as thanks, because "bid" was not a quote word.
+const QUOTE_WORD_RX = /\b[qg]uot(?:e|es|ed|ation|ations)\b|\bbids?\b|\bestimates?\b|\bproposals?\b|\bpric(?:e|ing)\s+sheet\b|\bcontract\b|\bpaperwork\b|\bbreak\s*down\b|\bitemi[sz]\w*/i;
 const QUOTE_ASK_RX = /\b(?:where|e-?mail\w*|send|sent|resend|re-send|copy|copies|provide|get|got|receive[d]?|see|look\s+at|double[\s-]?check|itemi[sz]\w*|in\s+writing|written|forward|attach\w*|pdf|pages?|full|whole|complete)\b/i;
 const QUOTE_ALONE_RX = /\bis\s+there\s+an?\s+e-?mail\b|\bonly\s+(?:got|received|have|saw)\s+(?:one|1|the\s+first)\s+page\b|\bone\s+page\s+of\s+it\b|\bonly\s+the\s+price\b/i;
 
