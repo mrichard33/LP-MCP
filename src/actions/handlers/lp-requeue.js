@@ -58,7 +58,8 @@ import { isLPLeadId, ghlFetch } from '../helpers.js';
 import { emitEvent } from '../../event-emitter.js';
 import { pickCurrentLead } from '../../current-lead.js';
 import { isInRehash, rehashRoutingMode } from '../../agentic/rehash-state.js';
-import { notifyRehashCall } from '../../notifications/rehash-call.js';
+import { routeRehashReply } from '../../notifications/rehash-call.js';
+import { leadTextFromNotes } from '../../agentic/rehash-intent.js';
 import {
   REQUEUE_SENDER,
   buildRequeueUser2,
@@ -178,6 +179,45 @@ async function priorRequeueLandedInLp(contactId, sinceIso) {
   }
 }
 
+/** LP's "Last, First" rep name as "First Last" for a team card. Pure. */
+export function lpRepDisplayName(raw) {
+  const s = String(raw ?? '').trim();
+  if (!s) return null;
+  const m = s.match(/^([^,]+),\s*(.+)$/);
+  return m ? `${m[2].trim()} ${m[1].trim()}` : s;
+}
+
+const withCap = (p, ms) => Promise.race([p, new Promise((resolve) => setTimeout(() => resolve(null), ms).unref?.())]);
+
+/**
+ * 2026-10-14: what the rehash lead said, and what we had said to them before.
+ *   BOT_CALLBACK rows carry the words in their notes (`…They said: "…"`).
+ *   HOT_CALL_IMMEDIATE (rule 324) rows carry nothing; their event_id is the
+ *   ai.analysis_completed event, whose payload has message_text and the time
+ *   the text arrived. Our last message BEFORE that time is what a bare "yes"
+ *   answers. Best-effort, capped: an unreadable read is '' / null, never a throw.
+ */
+async function readRehashReplyFacts(action, payload, contactId) {
+  let text = leadTextFromNotes(payload?.notes);
+  let inboundAt = null;
+  if (action?.event_id && supabase) {
+    const evt = await withCap(Promise.resolve(supabase.from('system_events').select('payload, created_at').eq('id', action.event_id).maybeSingle()).catch(() => null), 3000);
+    const p = evt?.data?.payload || null;
+    if (!text && p) text = String(p.message_text || p.message_preview || '').trim();
+    inboundAt = p?.inbound_received_at || p?.inbound_event_created_at || null;
+  }
+  let lastOutbound = null;
+  if (inboundAt && supabase) {
+    const res = await withCap(Promise.resolve(supabase.from('agent_actions')
+      .select('execution_result, created_at')
+      .eq('target_id', contactId).eq('action_type', 'send_message').eq('status', 'completed')
+      .lt('created_at', inboundAt)
+      .order('created_at', { ascending: false }).limit(1)).catch(() => null), 3000);
+    lastOutbound = res?.data?.[0]?.execution_result?.sent_body || null;
+  }
+  return { text, lastOutbound };
+}
+
 export async function executeLpCallbackRequeue(action) {
   const contactId = action.target_id;
   const payload = action.action_payload || {};
@@ -238,7 +278,7 @@ export async function executeLpCallbackRequeue(action) {
   try {
     const { data } = await supabase
       .from('lp_leads')
-      .select('lp_lead_id, lp_prospect_id, address, city, state, zip, raw_lp_data, created_at_lp, updated_at_lp, disposition_code, appointment_date')
+      .select('lp_lead_id, lp_prospect_id, address, city, state, zip, raw_lp_data, created_at_lp, updated_at_lp, disposition_code, appointment_date, closed_won, rep_name')
       .eq('ghl_contact_id', contactId)
       .order('created_at_lp', { ascending: false })
       .limit(10);
@@ -256,14 +296,22 @@ export async function executeLpCallbackRequeue(action) {
     const evt = { event_type: rehashMode === 'live' ? 'rehash.callback_rerouted' : 'rehash.would_reroute_callback', source: 'lp_requeue', entity_type: 'contact', entity_id: contactId, ghl_contact_id: contactId, priority: 'low', bypass_filter: true, payload: { contact_id: contactId, action_id: action.id || null, mode: rehashMode } };
     await emitEvent(evt).catch(() => {});
     if (rehashMode === 'live') {
-      const card = await notifyRehashCall({
+      // 2026-10-14 (John Manieri): this branch posted "said yes to a call" with a
+      // hard-coded agreed:true for every rehash requeue; 0 of 14 such leads had
+      // agreed to a call (most wanted their emailed quote). The card now follows
+      // what the lead actually said (routeRehashReply, src/notifications/rehash-call.js).
+      const facts = await readRehashReplyFacts(action, payload, contactId);
+      const currentLead = pickCurrentLead(lpRows);
+      const card = await routeRehashReply({
         contactId,
-        generated: { rehash: { active: true, rep_name: null }, rehash_call: { agreed: true, preferred_time: payload.preferred_time || null } },
-        triggerMessage: payload.notes || null,
+        text: facts.text,
+        lastOutbound: facts.lastOutbound,
         contact: { firstName: ghlContact.firstName || null, phone: ghlContact.phone || null },
+        repName: lpRepDisplayName(currentLead?.rep_name),
+        preferredTime: payload.preferred_time || null,
       });
-      console.log(`[LP-REQUEUE] ⏭️ ${contactId} is in rehash — no Five9 push; #contact-rehash card ${card.posted ? 'posted' : card.reason}`);
-      return { action: 'skipped_rehash_lead', requeued: false, contact_id: contactId, rehash_card: card.reason };
+      console.log(`[LP-REQUEUE] ⏭️ ${contactId} is in rehash — no Five9 push; #contact-rehash: ${card.rehash_card} (${card.intent || 'n/a'}, ${card.reason})`);
+      return { action: 'skipped_rehash_lead', requeued: false, contact_id: contactId, rehash_card: card.rehash_card, rehash_intent: card.intent, rehash_card_reason: card.reason };
     }
     console.log(`[LP-REQUEUE] 🕶️ ${contactId} is in rehash — live would skip Five9 and card #contact-rehash`);
   }

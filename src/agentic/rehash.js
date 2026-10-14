@@ -155,6 +155,56 @@ export function formatRehashCallCard({ firstName, phone, market, repName, prefer
 
 /** One card per contact per Eastern day. Pure. */
 export function rehashCallIdempotencyKey(contactId, nowMs = Date.now(), { booked = false } = {}) {
-  const day = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(nowMs));
-  return `f0_rehash_call_${booked ? 'booked_' : ''}${contactId}_${day}`;
+  return `f0_rehash_call_${booked ? 'booked_' : ''}${contactId}_${etDay(nowMs)}`;
+}
+
+/** 'YYYY-MM-DD' in Eastern time. Pure. */
+export function etDay(nowMs = Date.now()) {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(nowMs));
+}
+
+/**
+ * 2026-10-14 (John Manieri): the other rehash cards, one per kind per contact
+ * per Eastern day. kind: 'quote' | 'concern' | 'digest'. Pure.
+ */
+export function rehashReplyIdempotencyKey(kind, contactId, nowMs = Date.now()) {
+  return `f0_rehash_${kind}_${contactId}_${etDay(nowMs)}`;
+}
+
+const cardPhone = (phone) => {
+  const d = String(phone ?? '').replace(/\D/g, '');
+  if (!d) return 'not on file';
+  return d.length === 11 && d[0] === '1' ? d.slice(1) : d;
+};
+
+/**
+ * 2026-10-14 (John Manieri): most "call requests" were leads asking for the
+ * quote the salesperson promised to email. That is not a call, and the card
+ * says so. Plain English, first name only. Pure.
+ */
+export function formatRehashQuoteCard({ firstName, phone, repName = null, lastMessage, contactUrl }) {
+  const who = firstName || 'A post-demo lead';
+  return [
+    `📄 QUOTE REQUEST`,
+    `${who} (post-demo) is asking for their quote — not a call.`,
+    lastMessage ? `${who} said: "${String(lastMessage).slice(0, 300)}"` : null,
+    repName ? `Rep on the demo: ${repName}` : null,
+    `Phone: ${cardPhone(phone)}`,
+    contactUrl ? `Contact: ${contactUrl}` : null,
+    `→ Send ${firstName || 'them'} the full quote (all pages) today.`,
+  ].filter(Boolean).join('\n');
+}
+
+/** An upset post-demo reply ("that is fraud", "Bill did not receive a call"). Pure. */
+export function formatRehashConcernCard({ firstName, phone, repName = null, lastMessage, contactUrl }) {
+  const who = firstName || 'A post-demo lead';
+  return [
+    `⚠️ POST-DEMO CONCERN`,
+    `${who} (post-demo) sounds unhappy. This is not a call request.`,
+    lastMessage ? `${who} said: "${String(lastMessage).slice(0, 300)}"` : null,
+    repName ? `Rep on the demo: ${repName}` : null,
+    `Phone: ${cardPhone(phone)}`,
+    contactUrl ? `Contact: ${contactUrl}` : null,
+    `→ Someone on the rehash team: read the thread and reach out to ${firstName || 'them'} today.`,
+  ].filter(Boolean).join('\n');
 }

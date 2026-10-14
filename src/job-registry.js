@@ -422,6 +422,19 @@ export const JOBS = Object.freeze([
     isEnabled: (env) => String(env.REHASH_ROUTING_MODE || 'shadow').toLowerCase().trim() !== 'off',
   },
   {
+    // 2026-10-14 (John Manieri): thanks / "still thinking" replies from rehash
+    // leads post no real-time card; one #contact-rehash list of the previous
+    // day's (Fri-Sun on Monday). Mirrors rehashIntentRoutingEnabled() in
+    // src/agentic/rehash-intent.js — only 'off' stops it.
+    id: 'rehash-reply-digest',
+    label: 'Rehash reply digest: yesterday\'s post-demo thanks / still-thinking replies, one #contact-rehash post',
+    group: 'agentic',
+    cadence: 'weekdays 08:45 ET',
+    enabledEnv: 'REHASH_INTENT_ROUTING',
+    enabledDefault: true,
+    isEnabled: (env) => String(env.REHASH_INTENT_ROUTING ?? 'on').trim().toLowerCase() !== 'off',
+  },
+  {
     id: 'lp-identity-fill-sweep',
     label: 'Nameless GHL contacts get the name (and empty email / address) from their linked LP lead',
     group: 'lp-intake',

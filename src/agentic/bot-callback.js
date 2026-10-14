@@ -95,7 +95,9 @@ export function five9ResultLine(result) {
     case 'already_dialing': return 'Five9: this number is already being dialed, so it was not added twice.';
     case 'deduped': return 'Five9: already queued for a callback in the last little while.';
     // 2026-10-09: a rehash lead is the rehash team's call, from GHL.
-    case 'rehash': return 'Five9: NOT added. This is a post-demo rehash lead; the rehash team was told in #contact-rehash.';
+    // 2026-10-14: the rehash team gets the card the lead's words call for (a
+    // call, a quote or a concern) or the morning digest, never a made-up "yes".
+    case 'rehash': return 'Five9: NOT added. This is a post-demo rehash lead; the rehash team gets the right card (call, quote or concern) or the morning digest in #contact-rehash.';
     // 2026-10-03: Five9 takes a DNC number onto the list and never dials it.
     case 'on_dnc': return result.review
       ? 'Five9: NOT added. This number is on the Five9 do-not-call list, so the dialer would skip it. A DNC lift review was requested in #dnc-lift-approval; call them once it is approved.'
