@@ -63,6 +63,15 @@ test('a no to a call is never a call request', () => {
 
 test('a quote mention with no ask is not a quote request', () => {
   assert.notEqual(classifyRehashReply('The quote seems high.'), 'quote_request');
+  assert.notEqual(classifyRehashReply('Your bid was fine.'), 'quote_request');
+});
+
+// 2026-10-14: the first live reply after the deploy (an email, with its
+// disclaimer tail) read as thanks and went to the digest. "Bid" is the quote.
+test('"I didn\u2019t receive a bid" is a quote request, email disclaimer and all', () => {
+  const said = leadTextFromNotes('Bot callback (email, callback_request, callback_route). They said: "I didn\u2019t receive a bid\\n\\n\\n\\n\\nPLEASE NOTE:   The ideas and concepts or funding contacts contained within this email are the sole and confidential property of\\nShooting Star Entertainment, LLC and or Chosen For Change and will not "');
+  assert.equal(classifyRehashReply(said), 'quote_request');
+  assert.equal(classifyRehashReply("I didn't get the bid"), 'quote_request');
 });
 
 test('leadTextFromNotes keeps only the quoted words; other notes pass through', () => {
