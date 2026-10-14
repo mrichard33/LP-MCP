@@ -12,7 +12,7 @@
  */
 import { escapeMrkdwn } from '../slack-approvals-core.js';
 import { FLAG_LABELS } from './expense-builder.js';
-import { ALL_OFFICES, splitKind } from './allocation.js';
+import { ALL_OFFICES, COST_CATEGORIES, costCategory, splitKind } from './allocation.js';
 
 export const MKT_INVOICE_ACTION_PREFIX = 'mktinv_';
 export const ACTION_MKTINV_APPROVE = 'mktinv_approve';
@@ -36,17 +36,33 @@ export function marketLabel(code) {
 /** How a line's money is split, in plain words (2026-10-13). */
 export function splitLabel(row) {
   const k = splitKind(row);
-  if (k === 'even') return '_all offices, split evenly_';
+  if (k === 'even') {
+    const cat = costCategory(row);
+    return cat ? `_${COST_CATEGORIES[cat].toLowerCase()} cost, split evenly across all offices_` : '_all offices, split evenly_';
+  }
   if (k === 'by_source') return (row.lp_sub_sources || []).length ? '_markets by issued leads_' : '_no market_';
   return (row.eligible_markets || []).map(marketLabel).join(', ');
 }
 
-/** The three ways the Edit form can split a line. */
+/**
+ * The ways the Edit form can assign a line (2026-10-14, the user: "I should be
+ * able to assign it to either call-center or software, and the amount will be
+ * divided among all offices"). A lead source is split by its issued leads or
+ * pinned to markets; call center and software are split evenly over every office.
+ */
 export const SPLIT_OPTIONS = Object.freeze([
-  ['by_source', 'By the sub-source\'s issued leads (lead vendors)'],
-  ['even', 'Evenly across all offices (software, company-wide)'],
-  ['markets', 'Only the markets picked below'],
+  ['by_source', 'Lead source: split by its issued leads'],
+  ['call_center', 'Call center cost: split evenly across all offices'],
+  ['software', 'Software cost: split evenly across all offices'],
+  ['markets', 'Lead source: only the markets picked below'],
 ]);
+
+/** The Edit form's option for a line as it stands (an unlabelled even split reads as software). */
+export function splitChoice(row) {
+  const k = splitKind(row);
+  if (k === 'even') return costCategory(row) || 'software';
+  return k;
+}
 
 function extractionLine(extraction) {
   if (!extraction) return 'extraction: unknown';
@@ -150,7 +166,7 @@ export function buildEditView({ document, vendor, facts, rows = [], vendors = []
   const marketOptions = MARKET_OPTIONS.map(([c, l]) => ({ text: { type: 'plain_text', text: l }, value: c }));
   const marketInitial = marketOptions.filter((o) => (first.eligible_markets || []).includes(o.value));
   const splitOptions = SPLIT_OPTIONS.map(([v, l]) => ({ text: { type: 'plain_text', text: l }, value: v }));
-  const splitInitial = splitOptions.find((o) => o.value === splitKind(first));
+  const splitInitial = splitOptions.find((o) => o.value === splitChoice(first));
   const rememberOption = { text: { type: 'plain_text', text: 'Use this vendor, sub-source and split for this vendor\'s next invoices' }, value: 'remember' };
   const input = (block_id, label, element) => ({ type: 'input', block_id, label: { type: 'plain_text', text: label }, element, optional: true });
   return {
@@ -169,9 +185,9 @@ export function buildEditView({ document, vendor, facts, rows = [], vendors = []
       input('period_start', 'Period start', { type: 'datepicker', action_id: 'mktinv_v_period_start', ...(facts?.period_start ? { initial_date: facts.period_start } : {}) }),
       input('period_end', 'Period end', { type: 'datepicker', action_id: 'mktinv_v_period_end', ...(facts?.period_end ? { initial_date: facts.period_end } : {}) }),
       input('amount', rows.length > 1 ? 'Total (leave blank to keep the lines as they are)' : 'Amount', { type: 'plain_text_input', action_id: 'mktinv_v_amount', initial_value: first.amount != null ? String(first.amount) : '' }),
-      input('sub_source', 'LP sub-source (type a new one if needed; leave empty for software)', { type: 'plain_text_input', action_id: 'mktinv_v_sub_source', initial_value: (first.lp_sub_sources || []).join(', ') }),
-      input('split', 'How to split the cost', { type: 'radio_buttons', action_id: 'mktinv_v_split', options: splitOptions, ...(splitInitial ? { initial_option: splitInitial } : {}) }),
-      input('markets', 'Markets (only for "Only the markets picked below")', { type: 'multi_static_select', action_id: 'mktinv_v_markets', options: marketOptions, ...(marketInitial.length ? { initial_options: marketInitial } : {}) }),
+      input('sub_source', 'LP sub-source (lead sources only; type a new one if needed)', { type: 'plain_text_input', action_id: 'mktinv_v_sub_source', initial_value: (first.lp_sub_sources || []).join(', ') }),
+      input('split', 'What is this cost?', { type: 'radio_buttons', action_id: 'mktinv_v_split', options: splitOptions, ...(splitInitial ? { initial_option: splitInitial } : {}) }),
+      input('markets', 'Markets (only for "only the markets picked below")', { type: 'multi_static_select', action_id: 'mktinv_v_markets', options: marketOptions, ...(marketInitial.length ? { initial_options: marketInitial } : {}) }),
       input('remember', 'Remember', { type: 'checkboxes', action_id: 'mktinv_v_remember', options: [rememberOption], initial_options: [rememberOption] }),
     ],
   };
@@ -198,12 +214,27 @@ export function parseEditSubmission(stateValues = {}) {
 
 /**
  * The eligible_markets a submitted split means: [] = by the sub-source's
- * issued leads, [ALL_OFFICES] = evenly over every office, else the markets
- * picked. null = the form said nothing about markets (keep what the line has).
+ * issued leads, [ALL_OFFICES] = evenly over every office (call center,
+ * software, or the older plain "even"), else the markets picked. null = the
+ * form said nothing about markets (keep what the line has).
  */
 export function marketsForSplit({ split, eligible_markets = [] }) {
-  if (split === 'even') return [ALL_OFFICES];
+  if (split === 'even' || COST_CATEGORIES[split]) return [ALL_OFFICES];
   if (split === 'by_source') return [];
   if (split === 'markets') return eligible_markets.length ? eligible_markets : null;
   return eligible_markets.length ? eligible_markets : null;
+}
+
+const isCategoryLabel = (s) => Object.values(COST_CATEGORIES).some((l) => l.toLowerCase() === String(s).trim().toLowerCase());
+
+/**
+ * The sub-sources a submitted form writes on the line. A category split writes
+ * its label ("Call Center" / "Software") whatever the box says; a lead-source
+ * split drops a leftover category label (the box is prefilled from the line, so
+ * switching Software back to a lead source would otherwise keep "Software").
+ */
+export function subSourcesForSplit({ split, lp_sub_sources = [] }) {
+  if (COST_CATEGORIES[split]) return [COST_CATEGORIES[split]];
+  if (split === 'by_source' || split === 'markets') return lp_sub_sources.filter((s) => !isCategoryLabel(s));
+  return lp_sub_sources;
 }

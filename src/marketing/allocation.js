@@ -52,6 +52,22 @@ export function splitsEvenly(expense) {
   return (expense?.eligible_markets || []).includes(ALL_OFFICES);
 }
 
+/**
+ * The two kinds of company-wide spend (the user, 2026-10-14: "we should add a
+ * call-center cost and a software cost, each split among all offices"). An
+ * invoice assigned to one is split evenly over OFFICE_MARKETS and its line
+ * carries the category as its sub-source, so the report shows "Call Center"
+ * and "Software" as their own rows next to the lead sources.
+ */
+export const COST_CATEGORIES = Object.freeze({ call_center: 'Call Center', software: 'Software' });
+
+/** 'call_center' | 'software' for an even-split line carrying that label, else null. */
+export function costCategory(expense) {
+  if (!splitsEvenly(expense)) return null;
+  const subs = (expense?.lp_sub_sources || []).map((s) => String(s).trim().toLowerCase());
+  return Object.keys(COST_CATEGORIES).find((k) => subs.includes(COST_CATEGORIES[k].toLowerCase())) || null;
+}
+
 const toCents = (n) => Math.round(Number(n) * 100);
 const fromCents = (c) => Math.round(c) / 100;
 

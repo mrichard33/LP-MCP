@@ -9,6 +9,7 @@
  * when the list is empty AND the vendor has been approved by a person at
  * least MKT_AUTO_APPROVE_MIN_PRIOR (2) times before.
  */
+import { ALL_OFFICES } from './allocation.js';
 
 export const FLAGS = Object.freeze({
   UNKNOWN_VENDOR: 'unknown_vendor',
@@ -85,14 +86,18 @@ export function buildExpenseRows({ document, vendor, facts, analysis, confidence
   const lines = (analysis?.lines || []).filter((l) => l && l.amount != null);
   const src = lines.length ? lines : [{ description: facts.description || 'Invoice total', amount: facts.total, lp_sub_source: null, markets: [], market_evidence: null }];
 
+  // A vendor split evenly over every office (call center, software) keeps that
+  // split and its category on every line: the model's guess at a sub-source or
+  // a market on a software bill is noise, never a reason to flag it.
+  const even = vendorMarkets.includes(ALL_OFFICES);
   const rows = src.map((ln, i) => {
     let subs = vendorSubs;
-    if (ln.lp_sub_source) {
+    if (ln.lp_sub_source && !even) {
       if (vendorSubs.length && !vendorSubs.includes(ln.lp_sub_source)) lineProblems.push(FLAGS.UNKNOWN_SUB_SOURCE);
       else subs = [ln.lp_sub_source];
     }
     let markets = vendorMarkets;
-    const lineMarkets = (ln.markets || []).filter(Boolean);
+    const lineMarkets = even ? [] : (ln.markets || []).filter(Boolean);
     if (lineMarkets.length) {
       const outside = vendorMarkets.length ? lineMarkets.filter((m) => !vendorMarkets.includes(m)) : [];
       if (outside.length) lineProblems.push(FLAGS.MARKET_NOT_ELIGIBLE);

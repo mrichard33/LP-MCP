@@ -118,3 +118,44 @@ test('the issued basis for a slice is its whole calendar month, not the days the
   assert.deepEqual(calls, [{ p_from: '2026-10-01', p_to: '2026-10-31' }]);
   assert.deepEqual(rows.map((r) => [r.market, r.amount]), [['STPET_MKT', 100]]);
 });
+
+// 2026-10-14, the user: a call-center cost and a software cost, each split among all offices.
+import { costCategory, COST_CATEGORIES, OFFICE_MARKETS } from '../src/marketing/allocation.js';
+import { SPLIT_OPTIONS, splitChoice, splitLabel, marketsForSplit, subSourcesForSplit } from '../src/marketing/slack-review.js';
+import { buildExpenseRows } from '../src/marketing/expense-builder.js';
+
+test('call center and software: even over the six offices, the category on every allocation row', () => {
+  for (const [key, label] of Object.entries(COST_CATEGORIES)) {
+    const e = { id: key, amount: 1000, period_start: '2026-10-01', period_end: '2026-10-31', lp_sub_sources: [label], eligible_markets: ['ALL_OFFICES'] };
+    assert.equal(costCategory(e), key);
+    const rows = allocateExpense(e, () => ({ STPET_MKT: 99 }));
+    assert.deepEqual(rows.map((r) => r.market).sort(), [...OFFICE_MARKETS].sort());
+    assert.ok(rows.every((r) => r.rule === 'equal' && r.lp_sub_source === label));
+    assert.equal(sumCents(rows), 100000);
+  }
+  assert.equal(costCategory({ lp_sub_sources: ['Software'], eligible_markets: [] }), null, 'a category needs the even split');
+});
+
+test('the Edit form offers call center and software, and reads a line back to its choice', () => {
+  assert.deepEqual(SPLIT_OPTIONS.map(([v]) => v), ['by_source', 'call_center', 'software', 'markets']);
+  assert.ok(SPLIT_OPTIONS.every(([, l]) => l.length <= 75), 'Slack option text limit');
+  assert.equal(splitChoice({ lp_sub_sources: ['Call Center'], eligible_markets: ['ALL_OFFICES'] }), 'call_center');
+  assert.equal(splitChoice({ lp_sub_sources: [], eligible_markets: ['ALL_OFFICES'] }), 'software', 'an unlabelled even split reads as software');
+  assert.equal(splitChoice({ lp_sub_sources: ['Vis PPC'], eligible_markets: [] }), 'by_source');
+  assert.equal(splitChoice({ lp_sub_sources: ['Vis PPC'], eligible_markets: ['ORL_MKT'] }), 'markets');
+  assert.match(splitLabel({ lp_sub_sources: ['Software'], eligible_markets: ['ALL_OFFICES'] }), /software cost, split evenly across all offices/);
+  assert.deepEqual(marketsForSplit({ split: 'call_center' }), ['ALL_OFFICES']);
+  assert.deepEqual(marketsForSplit({ split: 'software', eligible_markets: ['ORL_MKT'] }), ['ALL_OFFICES']);
+  assert.deepEqual(subSourcesForSplit({ split: 'software', lp_sub_sources: ['Vis PPC'] }), ['Software']);
+  assert.deepEqual(subSourcesForSplit({ split: 'by_source', lp_sub_sources: ['software', 'Vis PPC'] }), ['Vis PPC']);
+  assert.deepEqual(subSourcesForSplit({ split: null, lp_sub_sources: ['Vis PPC'] }), ['Vis PPC']);
+});
+
+test('a vendor split evenly keeps its category and split whatever the model guessed for a line', () => {
+  const vendor = { id: 'v', vendor_name: 'Five9', lp_sub_sources: ['Call Center'], eligible_markets: ['ALL_OFFICES'] };
+  const facts = { invoice_number: '1', total: 500, period_start: '2026-10-01', period_end: '2026-10-31' };
+  const analysis = { lines: [{ description: 'Seats', amount: 500, lp_sub_source: 'Vis PPC', markets: ['ORL_MKT'] }] };
+  const { rows, lineProblems } = buildExpenseRows({ document: { id: 'd' }, vendor, facts, analysis, confidence: 0.9 });
+  assert.deepEqual(lineProblems, []);
+  assert.deepEqual([rows[0].lp_sub_sources, rows[0].eligible_markets], [['Call Center'], ['ALL_OFFICES']]);
+});
