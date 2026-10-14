@@ -14,7 +14,8 @@
  *   3. Look up the transition rule (specific row beats wildcard).
  *   4. Reject if no rule, or rule.allowed=false ("forbidden").
  *   5. Reject if the proposal's destination priority is lower than the
- *      current state's priority (precedence guard).
+ *      current state's priority (precedence guard), unless the matched rule
+ *      is an explicit (from, to) row with no wildcard (2026-10-14).
  *   6. If rule.requires_approval and confidence is below threshold (or null),
  *      route to the GroupMe approval queue and bail.
  *   7. Close the open row (set exited_at, resolution, exit_event_id).
@@ -312,7 +313,7 @@ export async function executeTransitionObjectionState(action) {
   const currentPolicy = currentState ? await fetchPolicy(currentState) : null;
   const currentPriority = currentPolicy?.priority ?? -1;
 
-  if (proposedPolicy.priority < currentPriority) {
+  if (precedenceBlocks({ transition, currentPriority, proposedPriority: proposedPolicy.priority })) {
     await emitTransitionEvent('state_transition_preempted', {
       contact_id, currentState, proposed_state,
       current_priority: currentPriority,
@@ -688,13 +689,46 @@ function escapeSqlLiteral(s) {
   return String(s).replace(/'/g, "''");
 }
 
-async function pickTransitionRule(fromState, proposedState) {
-  const tries = [
+/**
+ * Pure: the rows pickTransitionRule tries, in order (specific beats wildcard).
+ */
+export function transitionLookupOrder(fromState, proposedState) {
+  return [
     { from: fromState,   to: proposedState },
     { from: fromState,   to: '*' },
     { from: '*',         to: proposedState },
   ];
-  for (const t of tries) {
+}
+
+/**
+ * Pure: is the matched rule an EXPLICIT (from_state, to_state) pair, with
+ * neither side a wildcard?
+ */
+export function isExplicitTransition(transition) {
+  return !!transition && transition.from_state !== '*' && transition.to_state !== '*';
+}
+
+/**
+ * Pure: does the precedence guard (step 4) refuse this move?
+ *
+ * 2026-10-14 — an EXPLICIT transition row is a deliberate statement that this
+ * specific move is permitted, and it outranks the generic priority comparison.
+ * Without this, a contact in APPOINTMENT_DISRUPTION.cancelled (50) could never
+ * be re-routed by any objection route (40/20) even though
+ * objection_state_transitions explicitly allows the move, so the S5.2
+ * rotation kept sending scheduled rebook messages at people who had just
+ * objected (gordon brack, Gerald Mckim, erica hilts: two opt-outs in 24h).
+ * Wildcard-matched transitions still respect precedence, so a blanket
+ * "* -> passive_cooling" cannot drag a contact out of DISENGAGEMENT.hard_loss
+ * (100). Do not exempt wildcards too.
+ */
+export function precedenceBlocks({ transition, currentPriority, proposedPriority }) {
+  if (isExplicitTransition(transition)) return false;
+  return proposedPriority < currentPriority;
+}
+
+async function pickTransitionRule(fromState, proposedState) {
+  for (const t of transitionLookupOrder(fromState, proposedState)) {
     const { data, error } = await supabase
       .from('objection_state_transitions')
       .select('from_state, to_state, allowed, requires_approval, approval_threshold')
