@@ -12,7 +12,7 @@
  *                fullCalcOnLoad makes Excel recompute on open.
  *   Leads        one row per lead, the columns in LEAD_COLUMNS order. Never the LP lead id, a rep, setter or
  *                confirmer name: the SQL does not return them and nothing here adds them.
- *   Definitions  one plain-English line per column.
+ *   Definitions  one plain-English line per column, except the self-explanatory contact columns (NOT_DEFINED).
  *
  * Pure: rows in, workbook out. No I/O, so the tests build it offline.
  */
@@ -88,6 +88,9 @@ function cellValue(kind, v) {
   return v == null ? null : String(v);
 }
 const NUMFMT = { datetime: 'yyyy-mm-dd hh:mm', date: 'yyyy-mm-dd', num1: '0.0', money: '"$"#,##0', int: '0' };
+
+// Leads columns with no Definitions line (the user, 2026-10-15).
+export const NOT_DEFINED = new Set(['first_name', 'last_name', 'phone', 'email', 'city', 'zip']);
 
 // Market order on the Summary: the six offices west to east as the business lists them, then Outside.
 export const MARKET_ORDER = ['Orlando', 'St. Petersburg', 'Jacksonville', 'Fort Lauderdale', 'Fort Myers', 'Sarasota', 'Outside Service Area'];
@@ -265,10 +268,12 @@ export function buildVendorWorkbook(report, { generatedAt = new Date() } = {}) {
   ls.autoFilter = { from: 'A1', to: `${colLetter(LEAD_COLUMNS.length - 1)}1` };
 
   // ---------- Definitions ----------
+  // The contact columns need no explanation (the user, 2026-10-15): they stay on the Leads tab, not here.
   const ds = wb.addWorksheet('Definitions');
   ds.columns = [{ header: 'Column', key: 'c', width: 26 }, { header: 'What it means', key: 'd', width: 110 }];
   ds.getRow(1).eachCell((c) => styleCell(c, { size: 9, bold: true, color: WHITE, fill: NAVY }));
-  for (const [header, , , , def] of LEAD_COLUMNS) {
+  for (const [header, field, , , def] of LEAD_COLUMNS) {
+    if (NOT_DEFINED.has(field)) continue;
     const row = ds.addRow({ c: header, d: def });
     row.eachCell((c) => styleCell(c, { size: 9, align: { wrapText: true, vertical: 'top' } }));
   }

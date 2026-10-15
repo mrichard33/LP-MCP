@@ -74,10 +74,12 @@ test('three tabs, Leads headers in the agreed order, no id or rep field', async 
   for (const [h, field] of LEAD_COLUMNS) {
     assert.doesNotMatch(`${h} ${field}`, /lead.?id|rep\b|setter|confirmer|sales.?rep/i, h);
   }
-  // Definitions: one line per column, in the same order.
+  // Definitions: one line per column, in the same order, without the contact columns (the user, 2026-10-15).
   const ds = wb.getWorksheet('Definitions');
-  assert.equal(ds.rowCount, HEADERS.length + 1);
-  HEADERS.forEach((h, i) => assert.equal(ds.getRow(i + 2).getCell(1).value, h));
+  const defined = HEADERS.filter((h) => !['First Name', 'Last Name', 'Phone', 'Email', 'City', 'ZIP'].includes(h));
+  assert.equal(defined.length, 23);
+  assert.equal(ds.rowCount, defined.length + 1);
+  defined.forEach((h, i) => assert.equal(ds.getRow(i + 2).getCell(1).value, h));
 });
 
 test('Y/N booleans, 10-digit phone, dates as real dates', async () => {
