@@ -32,9 +32,11 @@ const MEMBERS_CAP = 200;
 
 export const LEGACY_MAP = Object.freeze([
   Object.freeze({ prefix: 'drift:ghl_closed_lp_active:', check_id: 'sync.appt_parity', severity: 'P2', set_valued: true,
-    fingerprint: 'sync.appt_parity:drift_ghl_closed_lp_active', title: 'GHL closed but LP still active (drift)' }),
+    fingerprint: 'sync.appt_parity:drift_ghl_closed_lp_active', title: 'Appointments closed in GHL but still open in Lead Perfection',
+    summaryOf: (n) => `${n} contact${n === 1 ? ' has' : 's have'} an appointment closed in GHL that is still open in Lead Perfection.` }),
   Object.freeze({ prefix: 'ci:recording_archive_unreachable', check_id: 'ci.recording_archive', severity: 'P3', set_valued: false, exact: true,
-    fingerprint: 'ci.recording_archive', title: 'Call recording archive unreachable' }),
+    fingerprint: 'ci.recording_archive', title: "Can't reach the call recordings",
+    summaryOf: () => "The call recordings can't be reached, so phone calls aren't being analyzed." }),
   Object.freeze({ prefix: 'capacity_ranker:campaign_not_running:', check_id: 'dialer.campaign_running', severity: 'P1', set_valued: false,
     fingerprintOf: (key) => `dialer.campaign_running:${key.slice('capacity_ranker:campaign_not_running:'.length)}` }),
 ]);
@@ -89,7 +91,7 @@ export async function syncLegacyIncidents({ client = supabase, registry, nowMs =
       const firing = mine.some((r) => r.state === 'firing');
       out.health.push({
         check_id: m.check_id, status: mine.length ? (firing ? 'fail' : 'pass') : 'pass',
-        summary: firing ? `legacy alert ${m.prefix} is firing` : `legacy alert ${m.prefix} is clear`,
+        summary: firing ? (m.summaryOf ? m.summaryOf(firing) : 'A problem is open.') : (m.check_id === 'ci.recording_archive' ? 'The call recordings can be reached.' : 'No problem open.'),
         fingerprint: m.fingerprint,
       });
     }
@@ -102,7 +104,8 @@ export async function syncLegacyIncidents({ client = supabase, registry, nowMs =
         const res = await openOrTouchIncident({
           check_id: m.check_id, fingerprint: fp, severity: m.severity, system: row?.system || 'webhooks',
           title: m.title || `${row?.label || m.check_id}${member ? ` — ${member}` : ''}`,
-          summary: m.set_valued ? `${firing.length} alert(s) firing under ${m.prefix}*` : `legacy alert ${firing[0].alert_key} firing`,
+          // 2026-10-15: plain words, never the alert key.
+          summary: m.summaryOf ? m.summaryOf(firing.length) : `${row?.label || m.check_id}: a problem is open (${firing.length} alert${firing.length === 1 ? '' : 's'}).`,
           business_impact: row?.business_impact || null,
           detail: { members: firing.slice(0, MEMBERS_CAP).map((r) => r.alert_key), members_total: firing.length, source: 'alert_conditions' },
           nowMs: Math.min(nowMs, ...firing.map((r) => Date.parse(r.first_seen_at) || nowMs)),
@@ -117,7 +120,7 @@ export async function syncLegacyIncidents({ client = supabase, registry, nowMs =
         }
         // A cleared set that came back: verifying → investigating (a reopen).
         if (inc.status === 'verifying') {
-          await transition(inc.id, 'investigating', { actor: 'system', body: 'legacy alert firing again', nowMs }, { client });
+          await transition(inc.id, 'investigating', { actor: 'system', body: 'The problem came back.', nowMs }, { client });
         }
         const unlinked = firing.filter((r) => r.incident_id !== inc.id).map((r) => r.alert_key);
         for (let i = 0; i < unlinked.length; i += 200) {
@@ -132,12 +135,12 @@ export async function syncLegacyIncidents({ client = supabase, registry, nowMs =
       const inc = incs?.[0];
       if (!inc || inc.data?.source !== 'legacy') continue;
       if (['open', 'acknowledged', 'investigating', 'fixing'].includes(inc.status)) {
-        await transition(inc.id, 'verifying', { actor: 'system', body: 'legacy alert cleared', nowMs, data: { legacy_cleared_at: new Date(nowMs).toISOString() } }, { client });
+        await transition(inc.id, 'verifying', { actor: 'system', body: 'The problem cleared; checking that it stays fixed.', nowMs, data: { legacy_cleared_at: new Date(nowMs).toISOString() } }, { client });
         out.verifying += 1;
       } else if (inc.status === 'verifying') {
         const since = Date.parse(inc.data?.legacy_cleared_at || '') || nowMs;
         if (nowMs - since >= LEGACY_CLEAR_MS) {
-          await transition(inc.id, 'resolved', { actor: 'system', verified_by: 'system', body: `legacy alert clear for ${Math.round((nowMs - since) / 60000)} min`, nowMs }, { client });
+          await transition(inc.id, 'resolved', { actor: 'system', verified_by: 'system', body: `Stayed clear for ${Math.round((nowMs - since) / 60000)} minutes.`, nowMs }, { client });
           out.resolved += 1;
         }
       }

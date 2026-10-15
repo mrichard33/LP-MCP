@@ -39,6 +39,7 @@
 
 import { runJob as defaultRunJob } from '../job-runner.js';
 import { hourET, todayET } from './lp-report-common.js';
+import { duration } from '../health/plain.js';
 import {
   alertDigestEnabled, capLines, filterNew as defaultFilterNew, recordPosted as defaultRecordPosted,
   lastPostedCount as defaultLastPostedCount,
@@ -424,17 +425,18 @@ async function shadowModesSection(deps, nowMs) {
 /** Pure. Lines for the System health section; [] when there is nothing. */
 export function systemHealthLines({ stuckYellow = [], shadowFails = [], resolved = [] } = {}) {
   const lines = [];
-  const mins = (ms) => (Number.isFinite(ms) ? (ms < 3_600_000 ? `${Math.round(ms / 60_000)}m` : `${Math.floor(ms / 3_600_000)}h ${Math.round((ms % 3_600_000) / 60_000)}m`) : '?');
+  // 2026-10-15: plain words, no check ids or "3h 12m" shorthand.
+  const mins = (ms) => (Number.isFinite(ms) ? duration(ms / 60_000) : 'an unknown time');
   if (stuckYellow.length) {
-    lines.push(`Yellow for 24h+: ${stuckYellow.slice(0, SECTION_MAX).map((c) => `${c.label} (${c.check_id})`).join(', ')}${stuckYellow.length > SECTION_MAX ? ` +${stuckYellow.length - SECTION_MAX} more` : ''}`);
+    lines.push(`Needed a look for more than a day: ${stuckYellow.slice(0, SECTION_MAX).map((c) => c.label).join(', ')}${stuckYellow.length > SECTION_MAX ? `, and ${stuckYellow.length - SECTION_MAX} more` : ''}`);
   }
   if (shadowFails.length) {
-    lines.push(`Shadow checks that would have fired yesterday: ${shadowFails.slice(0, SECTION_MAX).map((c) => `${c.check_id} ×${c.fails}`).join(', ')}${shadowFails.length > SECTION_MAX ? ` +${shadowFails.length - SECTION_MAX} more` : ''}`);
+    lines.push(`Test-mode checks that turned red yesterday: ${shadowFails.slice(0, SECTION_MAX).map((c) => `${c.label || c.check_id} (${c.fails} time${c.fails === 1 ? '' : 's'})`).join(', ')}${shadowFails.length > SECTION_MAX ? `, and ${shadowFails.length - SECTION_MAX} more` : ''}`);
   }
   for (const i of resolved.slice(0, SECTION_MAX)) {
     const opened = Date.parse(i.opened_at);
-    const ack = i.acknowledged_at ? mins(Date.parse(i.acknowledged_at) - opened) : 'never acknowledged';
-    lines.push(`Resolved: ${i.title} (#${i.id}) — acknowledged ${i.acknowledged_at ? `in ${ack}` : ack}, resolved in ${mins(Date.parse(i.resolved_at) - opened)}`);
+    const ack = i.acknowledged_at ? `picked up after ${mins(Date.parse(i.acknowledged_at) - opened)}` : 'nobody picked it up';
+    lines.push(`Fixed: ${i.title}: ${ack}, fixed after ${mins(Date.parse(i.resolved_at) - opened)}`);
   }
   return lines;
 }
@@ -461,7 +463,8 @@ async function systemHealthSection(deps, nowMs) {
     if (e2) throw new Error(`health_results read failed: ${e2.message}`);
     const n = new Map();
     for (const f of fails || []) n.set(f.check_id, (n.get(f.check_id) || 0) + 1);
-    shadowFails.push(...[...n.entries()].map(([check_id, count]) => ({ check_id, fails: count })).sort((a, b) => b.fails - a.fails));
+    const labelOf = new Map((latest || []).map((c) => [c.check_id, c.label]));
+    shadowFails.push(...[...n.entries()].map(([check_id, count]) => ({ check_id, label: labelOf.get(check_id) || null, fails: count })).sort((a, b) => b.fails - a.fails));
   }
   const { data: resolved, error: e3 } = await db.from('incidents').select('id, title, opened_at, acknowledged_at, resolved_at')
     .eq('status', 'resolved').gte('resolved_at', dayAgo);

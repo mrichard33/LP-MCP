@@ -47,7 +47,10 @@ function stubDeps(over = {}) {
       five9: async () => ({ state: 'connected', name: 'Five9', detail: 'ok', latency_ms: 10 }),
       slack: async () => ({ state: 'connected', name: 'Slack', detail: 'ok', latency_ms: 10 }),
     },
-    railway: { latestDeploy: async () => ({ status: 'SUCCESS' }), deploysLastHour: async () => ({ deploys: 0 }) },
+    railway: {
+      deployments: async () => [{ status: 'SUCCESS', createdAt: '2026-10-01T00:00:00Z' }],
+      state: async () => ({ state: 'running', deploysLastHour: 0 }),
+    },
     lastDetail: async () => null,
     ...over,
   };
