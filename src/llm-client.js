@@ -137,6 +137,11 @@ const FUNCTION_GROUPS = {
   // customer, so it rides the analysis group. Override with
   // MKT_INVOICE_ANALYSIS_MODEL_ANTHROPIC / _PROVIDER.
   mkt_invoice_analysis: 'decision_engine', // src/marketing/invoice-analyzer.js
+  // 2026-10-15 — the 2–3 line plain-English summary on a live chat's one Slack
+  // card. Internal, never a customer. Point it at a cheap model with
+  // LIVE_CHAT_SUMMARY_MODEL_ANTHROPIC; a failure falls back to the visitor's
+  // own last lines (src/live-chat/chat-summary.js).
+  live_chat_summary: 'decision_engine', // src/services/live-chat-summary-io.js
   // customer-facing — text a human reads
   response_generator: 'customer_facing', // src/response-generator.js
   // 2026-09-26 — website live chat, one merged classify+reply call under a
