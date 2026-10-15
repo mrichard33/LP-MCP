@@ -1442,3 +1442,89 @@ test('a lead past its demo is not declined as a rental (the user, 2026-10-13)', 
   assert.doesNotMatch(out.message, /rental propert/);
   assert.match(out.message, /holding you back/);
 });
+
+// ── 2026-10-15: one Slack card per lead, not one per message ─────────────
+// Contact jhVZZUtXp3jDrBsXOZcK: six "LARGE JOB SIGNAL" posts in six minutes,
+// one per visitor message, because the model's flag reads the whole thread
+// and the Slack post under the deduped event had no dedupe of its own.
+
+/** An emitEvent that behaves like event-emitter.js: the row on a new key, null on a repeat. */
+function dedupingEmit(store, events = []) {
+  return async (e) => {
+    events.push(e);
+    if (e.idempotency_key && store.has(e.idempotency_key)) return null;
+    if (e.idempotency_key) store.add(e.idempotency_key);
+    return { id: store.size };
+  };
+}
+const settle = () => new Promise(r => setTimeout(r, 20));
+const largeJobCards = (ops) => ops.filter(t => t.includes('LARGE JOB SIGNAL'));
+const REPLAY = ['We have 13 windows', 'yes', 'no', 'Tomorrow', 'Roberta', 'ok'];
+const MODEL_FLAGS_LARGE = () => ({ message: 'Got it. What made you start looking at this now?', live_chat: { large_job_signal: true } });
+
+test('replay of the 6-message chat: one large-job card, every row still says large_job', async () => {
+  const store = new Set();
+  const { lane, state } = makeLane({ llm: MODEL_FLAGS_LARGE, extra: { emitEvent: dedupingEmit(store) } });
+  const outs = [];
+  for (const body of REPLAY) outs.push(await lane.processInbound(INBOUND(body)));
+  await settle();
+  assert.equal(largeJobCards(state.ops).length, 1);
+  assert.match(largeJobCards(state.ops)[0], /13 windows/);
+  assert.ok(outs.every(o => o.large_job === true), 'reporting keeps the flag on every turn');
+});
+
+test('two restarts mid-chat (new lane objects, same event table) → still one card', async () => {
+  const store = new Set();
+  const ops = [];
+  for (const batch of [['We have 13 windows', 'yes'], ['no', 'Tomorrow'], ['Roberta', 'ok']]) {
+    const { lane, state } = makeLane({ llm: MODEL_FLAGS_LARGE, extra: { emitEvent: dedupingEmit(store) } });
+    for (const body of batch) await lane.processInbound(INBOUND(body));
+    await settle();
+    ops.push(...state.ops);
+  }
+  assert.equal(largeJobCards(ops).length, 1);
+});
+
+test('LIVE_CHAT_LARGE_JOB_ALERT_MODE=summary (or off) → no instant card, the event and the row flag stay', async () => {
+  for (const alertMode of ['summary', 'off']) {
+    const events = [];
+    const { lane, state } = makeLane({ llm: MODEL_FLAGS_LARGE, extra: { emitEvent: dedupingEmit(new Set(), events), largeJobAlertMode: () => alertMode } });
+    const out = await lane.processInbound(INBOUND('We have 13 windows'));
+    await settle();
+    assert.equal(largeJobCards(state.ops).length, 0, alertMode);
+    assert.equal(out.large_job, true);
+    assert.equal(events.filter(e => e.event_type === 'agentic.live_chat_large_job').length, 1);
+  }
+});
+
+test('largeJobAlertMode: once by default, anything unknown is once', async () => {
+  const { largeJobAlertMode } = await import('../src/live-chat/fast-lane.js');
+  assert.equal(largeJobAlertMode({}), 'once');
+  assert.equal(largeJobAlertMode({ LIVE_CHAT_LARGE_JOB_ALERT_MODE: 'SUMMARY' }), 'summary');
+  assert.equal(largeJobAlertMode({ LIVE_CHAT_LARGE_JOB_ALERT_MODE: 'off' }), 'off');
+  assert.equal(largeJobAlertMode({ LIVE_CHAT_LARGE_JOB_ALERT_MODE: 'loud' }), 'once');
+});
+
+test('a second Spanish message in the same chat → still one Spanish card', async () => {
+  const { lane, state } = makeLane({ mode: 'live', extra: { emitEvent: dedupingEmit(new Set()) } });
+  await lane.processInbound(INBOUND('hola necesito ventanas nuevas para mi casa'));
+  await lane.processInbound(INBOUND('hola otra vez, necesito ayuda con las ventanas'));
+  await settle();
+  assert.equal(state.ops.filter(t => t.includes('SPANISH')).length, 1);
+});
+
+test('two AI timeouts in one chat → one fallback card (alert-posted store, sliding window)', async () => {
+  const posted = new Map();
+  const filterNew = async ({ items, ttlDays, nowMs }) => ({
+    fresh: items.filter(i => { const at = posted.get(`${i.key}|${i.reason}`); return at == null || nowMs - at > ttlDays * 86_400_000; }),
+    dedupe: 'ok',
+  });
+  const recordPosted = async ({ items, nowMs }) => { for (const i of items) posted.set(`${i.key}|${i.reason}`, nowMs); return { ok: true }; };
+  const { lane, state } = makeLane({ llmDelayMs: 500, hardTimeoutMs: 120, extra: { filterNew, recordPosted } });
+  await lane.processInbound(INBOUND('Can you help with a sliding door?'));
+  await settle();
+  await lane.processInbound(INBOUND('Hello?'));
+  await settle();
+  assert.equal(state.sends.length, 2, 'both turns still get the holding line');
+  assert.equal(state.ops.filter(t => t.includes('LIVE CHAT FALLBACK')).length, 1);
+});

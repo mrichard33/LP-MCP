@@ -230,6 +230,10 @@ export async function simulateLiveChat(plan, { nepqMode = 'live', productionDeps
     releaseSlot: async () => {},
     emitEvent: async (e) => { record('event', { event_type: e.event_type }); return { id: 0 }; },
     opsAlert: async (text) => { record('ops_alert', { text: String(text).slice(0, 400) }); },
+    // The once-per-chat fallback store is production's (alert-posted.js): a sim
+    // never reads or writes it (2026-10-15).
+    filterNew: async ({ items }) => ({ fresh: items, dedupe: 'none' }),
+    recordPosted: async () => ({ ok: true }),
     fingerprint: () => {},
     markSent: () => {},
     captureIdentity: async (_id, input) => { record('ghl_field_capture', { capture: input?.capture || {}, visitor_text_count: (input?.visitorTexts || []).length }); return null; },

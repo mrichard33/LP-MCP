@@ -28,6 +28,7 @@ import { claimConsumedMessages } from '../services/consumed-messages.js';
 import { acquireAgenticSlot, commitAgenticSend, releaseAgenticSlot } from '../services/agentic-reply-locks.js';
 import { emitEvent } from '../event-emitter.js';
 import { sendAlertMessage } from '../alert-state.js';
+import { filterNew, recordPosted } from '../alert-posted.js';  // 2026-10-15: once-per-chat fallback card
 import { recordMessageContextDetached, markSentDetached } from '../bot-feedback/fingerprint.js';
 import { livechatSendBody } from '../send-message-handler.js';
 import { checkServiceAreaZip, checkServiceAreaPlace } from '../services/identity-extraction.js';
@@ -470,6 +471,8 @@ export function productionLaneDeps() {
     releaseSlot: releaseAgenticSlot,
     emitEvent,
     opsAlert: (text) => sendAlertMessage(text, { channel: 'ops' }),
+    filterNew: (a) => filterNew(a),
+    recordPosted: (a) => recordPosted(a),
     fingerprint: recordMessageContextDetached,
     markSent: (actionId) => markSentDetached('reply', String(actionId)),
     captureIdentity,

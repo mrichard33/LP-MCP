@@ -154,6 +154,17 @@ export const MODES = Object.freeze([
     since: '2026-10-06',
     note: 'Lets the live chat use the knowledge base intent match.',
   }),
+  m('LIVE_CHAT_LARGE_JOB_ALERT_MODE', 'bot', 'enum', ['once', 'summary', 'off'], 'once', { live: ['once', 'summary'], off: ['off'] }, {
+    since: '2026-10-15', decider: 'Mark', goLive: LIVE_BY_DEFAULT,
+    evidence: { events: ['agentic.live_chat_large_job'] },
+    note: 'Large-job card in live chat: once per contact, or only on the chat summary card.',
+  }),
+  m('LIVE_CHAT_SUMMARY_MODE', 'bot', 'enum', OSL, 'off', OSL_S, {
+    since: '2026-10-15', decider: 'Mark',
+    evidence: { table: 'live_chat_summaries' },
+    goLive: 'After a day in shadow, the summaries match the real chats (handoff, 2026-10-15).',
+    note: 'One Slack summary card per live chat once it goes quiet.',
+  }),
   m('LIVE_CHAT_MISSED_SWEEP_MODE', 'bot', 'enum', ['off', 'on'], 'on', { live: ['on'], off: ['off'] }, {
     since: '2026-10-01', goLive: LIVE_BY_DEFAULT,
     note: 'Finds live-chat messages that got no reply and answers them.',

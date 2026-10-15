@@ -1149,6 +1149,12 @@ function planNepqTurnCore({
       return stopPlan({ handoff: { reason: 'rehash_stop', line: stopLine } });
     }
     if (stopSent && !releases) return stopPlan({ post_demo_sticky: true });
+    // 3b. They asked for room with no date (more time, a hard stretch at home):
+    //     warm, no question, no pitch, no time (Jose Perez, 2026-10-14). The
+    //     thank-you that usually follows is closed the same way (step 4).
+    if (askedForSpace(now)) {
+      return pd({ step: 'post_demo_space', required_move: 'close', call_offer_ok: false, fixed_line: `Take all the time you need${hi}. We're here whenever you're ready.` });
+    }
     // 3c. The objection ladder (CANON.STD.011): one ask-back, one bridge with
     //     the rep's real Rehash Call times, then a person. Any objection counts
     //     toward the same ladder (Shawn's "estimates", "Cost" and "the price
@@ -1192,12 +1198,6 @@ function planNepqTurnCore({
       const line = `Understood${hi}. ${who}`;
       plan.objection.line = line;
       return pd({ step: 'handoff', required_move: 'handoff', fixed_line: line, call_offer_ok: false, handoff: { reason: 'rehash_repeat_objection', line }, rehash_ladder: 'handoff' });
-    }
-    // 3b. They asked for room with no date (more time, a hard stretch at home):
-    //     warm, no question, no pitch, no time (Jose Perez, 2026-10-14). The
-    //     thank-you that usually follows is closed the same way (step 4).
-    if (askedForSpace(now)) {
-      return pd({ step: 'post_demo_space', required_move: 'close', call_offer_ok: false, fixed_line: `Take all the time you need${hi}. We're here whenever you're ready.` });
     }
     // Asked for room in the last 48 hours of this thread.
     const spaceAsked = earlierIn.slice(-4).some(m => askedForSpace(m.text) && (!Number.isFinite(m.atMs) || nowMs - m.atMs < 48 * 3_600_000));

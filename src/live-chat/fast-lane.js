@@ -180,6 +180,23 @@ export function liveChatMode(env = process.env) {
   return LIVE_CHAT_MODES.includes(m) ? m : 'off';
 }
 
+// 2026-10-15 (contact jhVZZUtXp3jDrBsXOZcK: six "LARGE JOB SIGNAL" posts in six
+// minutes, one per visitor message). The model's large_job_signal reads the
+// whole thread, so it stays true on every turn after "13 windows"; the event
+// was deduped by its idempotency key but the Slack post under it was not.
+// Mark: never post the same item twice. `once` posts only when the event row
+// is NEW (durable across restarts and replicas); `summary` posts nothing here
+// and leaves the flag to the chat's summary card (src/jobs/live-chat-summary.js);
+// `off` posts nothing. `large_job` is still recorded on every action row.
+export const LARGE_JOB_ALERT_MODES = Object.freeze(['once', 'summary', 'off']);
+export function largeJobAlertMode(env = process.env) {
+  const m = String(env.LIVE_CHAT_LARGE_JOB_ALERT_MODE || 'once').trim().toLowerCase();
+  return LARGE_JOB_ALERT_MODES.includes(m) ? m : 'once';
+}
+/** One fallback card per chat: a fallback within this long of the last one is folded in. */
+export const FALLBACK_ALERT_WINDOW_MS = 60 * 60 * 1000;
+export const FALLBACK_ALERT_AUDIT = 'livechat_fallback';
+
 export function liveChatHardTimeoutMs(env = process.env) {
   const raw = parseInt(env.LIVE_CHAT_HARD_TIMEOUT_MS || '', 10);
   // Part 7 (Mark, 2026-10-02: "custom is worth it", 5-8s replies are fine):
@@ -621,6 +638,11 @@ export function createLiveChatFastLane(deps) {
     classify: async () => ({ intent_class: 'UNCLEAR', confidence: 0, classification_method: 'none', reasoning: 'no classifier' }),
     emitEvent: async () => null,
     opsAlert: async () => null,
+    // "Already posted" store for the once-per-chat fallback card (src/alert-posted.js).
+    // The default finds nothing posted, so an unwired lane behaves as before.
+    filterNew: async ({ items }) => ({ fresh: items, dedupe: 'none' }),
+    recordPosted: async () => ({ ok: true }),
+    largeJobAlertMode: () => largeJobAlertMode(),
     fingerprint: () => {},
     markSent: () => {},
     captureIdentity: async () => null,
@@ -954,12 +976,19 @@ export function createLiveChatFastLane(deps) {
     const langHandoff = planLanguageHandoff({ body, thread: context.conversation_recent, knownPhone: context.lead?.phone || contact?.phone || null });
     if (langHandoff) {
       if (langHandoff.first) {
-        d.emitEvent({
+        // `first` is read from the thread alone, so Spanish → English → Spanish
+        // reads as first twice. The card goes out only when the event row is
+        // NEW (2026-10-15, once per contact, the same gate as the large job).
+        Promise.resolve(d.emitEvent({
           event_type: 'agentic.live_chat_language_handoff', source: 'live_chat_fast_lane', entity_type: 'contact', entity_id: contactId, ghl_contact_id: contactId,
           priority: 'high', bypass_filter: true, idempotency_key: `livechat_lang_${contactId}`,
           payload: { contact_id: contactId, language: langHandoff.language, inbound_preview: body.slice(0, 300), mode, action_id: actionId },
-        }).catch(err => d.warn(`[LiveChat] language hand-off event failed: ${err.message}`));
-        d.opsAlert(`🌎 LIVE CHAT — SPANISH SPEAKER\nContact: ${contactId}\nThey said: "${body.slice(0, 200)}"\n→ Needs a Spanish-speaking person to follow up.`).catch(() => {});
+        }))
+          .then((ev) => {
+            if (!ev?.id) { d.log(`[LiveChat] Spanish hand-off for ${contactId} already raised — no second card`); return null; }
+            return d.opsAlert(`🌎 LIVE CHAT — SPANISH SPEAKER\nContact: ${contactId}\nThey said: "${body.slice(0, 200)}"\n→ Needs a Spanish-speaking person to follow up.`);
+          })
+          .catch(err => d.warn(`[LiveChat] language hand-off event failed: ${err.message}`));
       }
       reference = {
         reply: langHandoff.reply, slots: [], record: { language_handoff: langHandoff.language },
@@ -1410,12 +1439,20 @@ export function createLiveChatFastLane(deps) {
     // a job Reece cannot do.
     const isLarge = (!!largeJob || liveChatFields?.large_job_signal === true) && coverage?.status !== 'out';
     if (isLarge) {
-      await d.emitEvent({
+      // emitEvent returns the row only when it was newly inserted (null when
+      // the key already exists), so the first signal for a contact, typed or
+      // model-flagged, is the only one that can post (2026-10-15).
+      const ev = await Promise.resolve(d.emitEvent({
         event_type: 'agentic.live_chat_large_job', source: 'live_chat_fast_lane', entity_type: 'contact', entity_id: contactId, ghl_contact_id: contactId,
         priority: 'high', bypass_filter: true, idempotency_key: `livechat_large_job_${contactId}`,
         payload: { contact_id: contactId, signal: largeJob || 'model', inbound_preview: body.slice(0, 300), mode, action_id: actionId },
-      }).catch(err => d.warn(`[LiveChat] large-job event failed: ${err.message}`));
-      d.opsAlert(`🏢 LIVE CHAT — LARGE JOB SIGNAL\nContact: ${contactId}\nThey said: "${body.slice(0, 200)}"\nSignal: ${largeJob || 'model-flagged'}\n→ Needs a person to follow up.`).catch(() => {});
+      })).catch(err => { d.warn(`[LiveChat] large-job event failed: ${err.message}`); return null; });
+      const alertMode = d.largeJobAlertMode();
+      if (alertMode === 'once' && ev?.id) {
+        d.opsAlert(`🏢 LIVE CHAT — LARGE JOB SIGNAL\nContact: ${contactId}\nThey said: "${body.slice(0, 200)}"\nSignal: ${largeJob || 'model-flagged'}\n→ Needs a person to follow up.`).catch(() => {});
+      } else {
+        d.log(`[LiveChat] large job ${contactId}: no card (${alertMode !== 'once' ? `alert mode ${alertMode}` : 'already raised for this contact'})`);
+      }
     }
 
     // ── booking truth + cancelled visit (2026-10-07, Nicholas) ──
@@ -2075,7 +2112,18 @@ export function createLiveChatFastLane(deps) {
       priority: 'high', bypass_filter: true, idempotency_key: `livechat_fallback_${actionId ?? contactId}_${Date.now()}`,
       payload: { contact_id: contactId, reason, mode, action_id: actionId, inbound_preview: String(body || '').slice(0, 300), fallback_sent: sent, backup_line: !!backupReply },
     }).catch(err => d.warn(`[LiveChat] fallback event failed: ${err.message}`));
-    d.opsAlert(`⚠️ LIVE CHAT FALLBACK (${reason})\nContact: ${contactId}\nThey said: "${String(body || '').slice(0, 200)}"\n→ ${sent ? (backupReply ? `The AI reply ran out of time; the backup line went: "${backupReply.slice(0, 160)}". Check the chat.` : 'The holding line was sent; a person needs to pick this up now.') : `Mode ${mode}: nothing sent; a person needs to pick this up now.`}`).catch(() => {});
+    // One card per chat (the user, 2026-10-15): every slow turn used to post its
+    // own. The store's row slides forward on each fallback, so a chat that keeps
+    // timing out stays one card; an hour with none starts a new one. A failed
+    // read returns the item as new (alert-posted.js): never silence a real problem.
+    const fbItems = [{ key: contactId, reason: 'chat' }];
+    Promise.resolve(d.filterNew({ audit: FALLBACK_ALERT_AUDIT, items: fbItems, ttlDays: FALLBACK_ALERT_WINDOW_MS / 86_400_000, nowMs: d.now() }))
+      .then(async ({ fresh } = {}) => {
+        await d.recordPosted({ audit: FALLBACK_ALERT_AUDIT, items: fbItems, nowMs: d.now() });
+        if (!fresh?.length) { d.log(`[LiveChat] fallback for ${contactId}: card already posted for this chat`); return null; }
+        return d.opsAlert(`⚠️ LIVE CHAT FALLBACK (${reason})\nContact: ${contactId}\nThey said: "${String(body || '').slice(0, 200)}"\n→ ${sent ? (backupReply ? `The AI reply ran out of time; the backup line went: "${backupReply.slice(0, 160)}". Check the chat.` : 'The holding line was sent; a person needs to pick this up now.') : `Mode ${mode}: nothing sent; a person needs to pick this up now.`}`);
+      })
+      .catch(() => {});
     const finished = finalizeTiming(timing);
     await finishAction(actionId, {
       status: 'completed',
