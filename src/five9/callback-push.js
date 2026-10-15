@@ -152,6 +152,31 @@ export function formatFive9DateTime(ms) {
   return new Date(ms).toISOString().replace('T', ' ').replace(/Z$/, '');
 }
 
+/** The time zone Five9 reads a written Date/Time value in (the domain's). */
+export const FIVE9_WRITE_TZ = 'America/New_York';
+const ET_PARTS = new Intl.DateTimeFormat('en-US', {
+  timeZone: FIVE9_WRITE_TZ, hourCycle: 'h23',
+  year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit',
+});
+
+/**
+ * A Date/Time value to WRITE to Five9: `yyyy-MM-dd HH:mm:ss.SSS` on the
+ * Eastern wall clock (daylight saving included). Pure.
+ *
+ * 2026-10-15: Five9 READS dates back in UTC (above) but takes a WRITTEN value as
+ * Eastern. callback_requested_at was written in UTC, so Five9 stored it 4 hours
+ * in the future: Alexander F.'s 12:52 PM EDT request read back as 20:52 UTC
+ * (4:52 PM EDT), while his record's own create time read back exactly. Profile
+ * "Callback Request V3" filters on this field (requested in the last 48 hours),
+ * so every lead stayed eligible about 52 hours.
+ */
+export function formatFive9WriteDateTime(ms) {
+  const d = new Date(ms);
+  const p = Object.fromEntries(ET_PARTS.formatToParts(d).map((x) => [x.type, x.value]));
+  const msPart = String(d.getUTCMilliseconds()).padStart(3, '0');
+  return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}:${p.second}.${msPart}`;
+}
+
 /**
  * Build the field/value pair of arrays for one callback record.
  *
@@ -208,7 +233,7 @@ export function buildCallbackRecord({ contactId, ghlContact = {}, lpRow = {}, no
   // never moves, so a repeat requester aged out 48h after their FIRST record
   // (David Strehlow). Mark's Five9 field callback_requested_at is ours, unlike
   // the create time above; rule 3 moves onto it once the pushes are verified.
-  pairs.push(['callback_requested_at', formatFive9DateTime(nowMs)]);
+  pairs.push(['callback_requested_at', formatFive9WriteDateTime(nowMs)]);
 
   const kept = pairs.filter(([, v]) => v !== '' && v != null);
   return {
@@ -218,7 +243,7 @@ export function buildCallbackRecord({ contactId, ghlContact = {}, lpRow = {}, no
     number1,
     lpRecKey,
     lpRecType,
-    callbackRequestedAt: formatFive9DateTime(nowMs),
+    callbackRequestedAt: formatFive9WriteDateTime(nowMs),
   };
 }
 

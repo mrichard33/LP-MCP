@@ -338,6 +338,7 @@ import { startMissedCallerRecoveryScheduler } from './jobs/missed-caller-recover
 import { startNewLeadDialBackstopScheduler } from './jobs/new-lead-dial-backstop.js';  // 2026-10-05
 import { startAfterAsapRetryScheduler } from './jobs/after-asap-retry.js';  // 2026-10-14
 import { startCancelResetRoutingScheduler } from './jobs/cancel-reset-routing.js';  // 2026-10-15
+import { startFive9CallJourneyScheduler, registerFive9JourneyRoutes } from './jobs/five9-call-journey-sync.js';  // 2026-10-15
 import { startInboundCheckoutWatchScheduler } from './jobs/inbound-checkout-watch.js';  // 2026-10-06
 import { startPromisedCallbackScheduler } from './jobs/promised-callback-sweep.js';  // 2026-10-07
 import { startRehashTagScheduler } from './jobs/rehash-tag-sweep.js';  // 2026-10-09
@@ -363,6 +364,7 @@ import { registerHoldCompleteRoutes } from './agentic/hold-complete.js';
 import { registerLiveChatRoutes } from './live-chat/index.js';
 import { registerSimulatorRoutes } from './tools/simulator-tools.js';
 import { registerLeadStageRoutes } from './admin/lead-stage-routes.js';
+import { registerVdrReportRoutes } from './vdr/report-route.js';
 // 2026-10-01 — answers a live chat message GHL never sent us (a contact merge drops the webhook).
 import { startLiveChatMissedReplyScheduler } from './jobs/live-chat-missed-reply-sweep.js';
 import { startMissedInboundScheduler } from './jobs/missed-inbound-sweep.js';  // 2026-10-15
@@ -662,6 +664,7 @@ registerHoldCompleteRoutes(app);
 // 2026-09-26 — POST /webhooks/live-chat-inbound, behind LIVE_CHAT_FAST_LANE_MODE (default off).
 registerLiveChatRoutes(app);
 registerSimulatorRoutes(app); // 2026-10-02 — POST /admin/bot-simulate: real bots, nothing sent or written
+registerFive9JourneyRoutes(app); // 2026-10-15 — POST /admin/five9-journey/backfill?days=N (x-admin-token)
 registerLeadStageRoutes(app); // 2026-10-12 — GET /admin/lead-stage/:contactId: the conversation stage, read only
 
 // ─── Executor Heartbeat (failover for n8n cron) ──────────────────
@@ -932,6 +935,7 @@ registerP2UnresolvableRoutes(app);
 registerTagHygieneRoutes(app, authenticate);
 registerCleanup20261002Routes(app, authenticate);
 registerCiRoutes(app, authenticate);            // 2026-08-21 — Call Intelligence ingest (PR 2; worker ships disarmed)
+registerVdrReportRoutes(app, { authenticate }); // 2026-10-15 — Vendor Lead Report v2: GET /vdr/report.xlsx (n8n 06 VDR)
 
 const server = app.listen(PORT, async () => {
   console.log(`LP MCP Server v${SERVER_VERSION} running on port ${PORT}`);
@@ -1014,6 +1018,7 @@ const server = app.listen(PORT, async () => {
   startNewLeadDialBackstopScheduler();
   startAfterAsapRetryScheduler();
   startCancelResetRoutingScheduler();
+  startFive9CallJourneyScheduler();
   startInboundCheckoutWatchScheduler();
   startPromisedCallbackScheduler();
   startRehashTagScheduler();

@@ -403,6 +403,16 @@ phone whose NEWEST lead is CXL or CCC, cancelled 30 min..14 days ago, that no Re
 cancel. Never sold, Five9 DNC or opted out; a failed DNC or consent read waits. Keyed on number1 ALONE, the opposite of
 the new-lead backstop: profile "Resets V2" dials records created 25+ hours ago, so the phone's existing record is the
 one to add.
+**Every Five9 dial is stored, one row per call leg (the user, 2026-10-15, Call Journey handoff).** One row per leg with
+its list, skill, attempt count and LPRecKey, transfer legs included (`five9_events_raw` has one disposition per call). Job
+`five9-call-journey-sync` (`src/jobs/five9-call-journey-sync.js`, rules in `src/five9/call-journey.js`, every 15 min,
+`FIVE9_JOURNEY_SYNC_MODE` off|shadow|live, default shadow) runs the saved report "Shared Reports / Call Journey" into
+`five9_call_journey` (`leg_key` = call id | time | type | dnis, unique: a NULL dnis would slip past a four-column UNIQUE)
+and logs every pull in `five9_call_journey_runs`. The report's zone is PACIFIC, not Eastern: its window and its TIMESTAMP
+cells are Pacific wall clock (call 300000010540092 prints 09:10:20; the webhook has it at 16:10:20 UTC). Columns are read BY NAME (a missing one fails the run), a row with no time is a counted reject and an
+#ops alert, and a window at 50,000 rows is halved. `v_lead_call_journey` orders each lead's legs and counts the dials we
+placed in the trailing 24h (`calls_last_24h`, the 3-in-24 audit). `POST /admin/five9-journey/backfill?days=N` (live only).
+Read-only against Five9; never the CI "Call Log" (`src/ci/*`, `ci_calls`), never LP call logs: Five9 is the only call source.
 **Missed paid callers are judged by their whole call history (2026-10-12).** `src/jobs/missed-caller-recovery.js`
 (`MISSED_CALLER_RECOVERY_MODE`, default shadow) no longer uses `findContactInOtherLists` either: all 264 would_push rows
 read "cross-list check unreadable — failed open". `judgeHistory` reads every Five9 disposition for the number, any
@@ -463,6 +473,15 @@ and a gendered pronoun; one re-write, then fixed sentences (`fallbackBrief`). It
 (`[LP-PROXY] 🕶️ REP BRIEF SHADOW` logs it after the forward). Live runs in the addlead proxy, capped at
 `LP_REP_BRIEF_TIMEOUT_MS` (20s, inside GHL's 60s), and in `create_lp_lead`. Dry run:
 `node scripts/render-rep-brief.js <contact id>`. Never add a chat log, an opener or a relative day back to it.
+
+**Vendor lead reports read live data; LP report 135 is only a cross-check (handoff, 2026-10-15).** n8n "06 VDR" sent
+nothing from 2026-10-13: every send waited on the 135 (Lead Disposition Detail 2) email. Now each due vendor gets
+`GET /vdr/report.xlsx?vendor_id=&as_of=` (`src/vdr/`, operator token), built from `rpc/vdr_vendor_report` (lp_leads +
+lp_lead_market_assignments + Five9 only, never `call_count`): Summary (every number a COUNTIF/COUNTIFS/SUMIFS formula
+over the Leads tab), Leads (one row per lead, never an LP lead id, rep or setter) and Definitions. The window is whole
+ET days, as_of's date minus lookback through as_of's date (that reproduces the approved prototype; a timestamp cut does
+not). n8n blocks a send when `X-VDR-Lead-Synced-At` is 6h+ old and lists a 135 gap over 2% (`X-VDR-Feed-Leads`) in
+Mark's summary, never blocking on it. exceljs drops a cached formula result of 0; Excel recalculates on open.
 
 ## Consent (2026-09-28)
 
@@ -961,7 +980,9 @@ silently) and the campaign is PREVIEW mode with a 7-hour gap filter after any ea
   the callback list ONLY, `isCallbackRearmDelete`), run inline and awaited; one that did not finish is cancelled
   before the add is queued. After the add, `checkCallbackRearm` (in the Five9 write handler) posts
   "PROMISED CALL AT RISK" to #contact-center at once when the list did not grow. Every record carries
-  `callback_requested_at` (UTC, `yyyy-MM-dd HH:mm:ss.SSS`), which rule 3 moves onto once the pushes are verified.
+  `callback_requested_at` (`yyyy-MM-dd HH:mm:ss.SSS` on the EASTERN wall clock, `formatFive9WriteDateTime`: Five9 reads a
+  written value as Eastern and reports it in UTC, so a UTC write was stored 4 hours late, 2026-10-15). Profile "Callback
+  Request V3" (live on the Callback Request campaign since 2026-10-15) dials on it: requested in the last 48 hours.
 - two no's and a canvasser complaint are reviewed, never dialed (`NO_DIAL_REASONS` in `bot-callback.js`): the two-no's
   line promises no contact, and "stop knocking on my door" (`isKnockComplaint`) gets the do-not-knock flow: the address,
   a name if none, then a **🚪 DO NOT KNOCK** card to the market's #canvass channel and the rollup. No sales call.
