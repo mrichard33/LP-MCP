@@ -128,6 +128,34 @@ that family: no red that was not a real problem.
 3. `scripts/test-health-registry.js` fails if code names a check the registry
    lacks, or a check's owner is not a registered (or planned) job.
 
+## The words people read (2026-10-15)
+
+Every summary, Slack card and digest line is plain English, written with
+`src/health/plain.js`:
+- Eastern time on a 12-hour clock ("8:45 PM"), never "20:45 ET".
+- Durations a person would say ("about 19 hours", not "1125 min").
+- Severity as a word: P1 Urgent, P2 High, P3 Medium, P4 Low. The codes stay in
+  the database.
+- No check ids, "p90", "SLA" or "parity" in anything a person reads.
+
+The registry's label, question, yellow/red rule and "why it matters" text is
+plain too (`sql/seeds/2026-10-15_health_checks_plain_english.sql`). `cadence`
+and `active_window` keep their machine form ("08:00-20:00 ET"), because code
+reads them; the dashboard shows them as 12-hour time.
+`scripts/test-health-plain-results.js` fails if a summary carries a 24-hour time.
+
+Three checks changed behaviour in the same pass:
+- **Services running on Railway** (`svc.railway_restarts`) asks Railway for each
+  service by ID (`src/health/railway-state.js`). The old lookup searched
+  LP-MCP's own project by name and showed "?" for HL-MCP, n8n and the dashboard.
+  Red when a service is down. Yellow for a failed update (the previous version
+  still runs), 4+ restarts in an hour, or a service it can't see.
+- **Evening appointment checks** run on demand before their first time today
+  write nothing and answer "Not due yet: runs at 7:30 PM and 8:15 PM."
+- **Lead Perfection sync errors** turn red only for new errors (10+ today or 5+
+  in an hour); old open ones are yellow. **Appointments with no result** counts
+  the last 14 days only.
+
 ## Tests
 
 `scripts/test-health-record.js`, `scripts/test-health-checks.js`,

@@ -15,12 +15,14 @@ test('a clean day adds no section', () => {
 test('lines name the checks and the incident timings', () => {
   const lines = systemHealthLines({
     stuckYellow: [{ check_id: 'sync.lp_errors', label: 'Unresolved LP sync errors' }],
-    shadowFails: [{ check_id: 'dialer.never_again', fails: 3 }],
+    shadowFails: [{ check_id: 'dialer.never_again', label: '"No Demo" and Do Not Call leads are never called again', fails: 3 }],
     resolved: [{ id: 9, title: 'Leads waiting with no Five9 call', opened_at: '2026-10-14T14:00:00Z', acknowledged_at: '2026-10-14T14:12:00Z', resolved_at: '2026-10-14T16:30:00Z' },
       { id: 10, title: 'n8n down', opened_at: '2026-10-14T14:00:00Z', acknowledged_at: null, resolved_at: '2026-10-14T14:20:00Z' }],
   });
-  assert.equal(lines[0], 'Yellow for 24h+: Unresolved LP sync errors (sync.lp_errors)');
-  assert.equal(lines[1], 'Shadow checks that would have fired yesterday: dialer.never_again ×3');
-  assert.equal(lines[2], 'Resolved: Leads waiting with no Five9 call (#9) — acknowledged in 12m, resolved in 2h 30m');
-  assert.match(lines[3], /never acknowledged, resolved in 20m/);
+  // 2026-10-15: plain words, no check ids, no "2h 30m" shorthand.
+  assert.equal(lines[0], 'Needed a look for more than a day: Unresolved LP sync errors');
+  assert.equal(lines[1], 'Test-mode checks that turned red yesterday: "No Demo" and Do Not Call leads are never called again (3 times)');
+  assert.equal(lines[2], 'Fixed: Leads waiting with no Five9 call: picked up after 12 minutes, fixed after 2 hours 30 minutes');
+  assert.match(lines[3], /nobody picked it up, fixed after 20 minutes/);
+  assert.ok(lines.every((l) => !/sync\.lp_errors|dialer\.never_again|#9/.test(l)));
 });

@@ -30,6 +30,8 @@ import { runJob } from '../job-runner.js';
 import { loadHealthChecks } from '../health/registry.js';
 import { recordHealthResults } from '../health/record.js';
 import { inActiveWindow, cadenceMinutes, cadenceWindow, etParts } from '../health/window.js';
+import { RAILWAY_SERVICES, serviceIdFor, serviceState, restartsResult } from '../health/railway-state.js';
+import { count, duration, windowWords } from '../health/plain.js';
 
 export const JOB_ID = 'health-checks';
 export const TICK_MS = 5 * 60_000;
@@ -37,8 +39,8 @@ export const CHECK_TIMEOUT_MS = 5_000;
 
 /** Owner jobs that are not built yet. Their checks read 'unknown' with this reason. */
 export const NOT_BUILT_OWNERS = Object.freeze({
-  'synthetic-canary': 'synthetic canaries are Phase 3; not built yet',
-  'n8n-execution-poller': 'the n8n execution poller is Phase 2; not built yet',
+  'synthetic-canary': 'Coming later: test runs are not built yet.',
+  'n8n-execution-poller': 'Coming later: n8n monitoring is not built yet.',
 });
 
 export function healthChecksMode(env = process.env) {
@@ -91,7 +93,7 @@ export const CHECKS = {
       return {
         value: failed,
         rule: (_v, c) => (critical > 0 ? 'fail' : band(failed, c.warn, c.fail)),
-        summary: `${failed} action(s) failed in the last hour${critical ? `, ${critical} of them Five9 / LP lead writes` : ''}`,
+        summary: failed ? `${count(failed, 'automatic action')} failed in the last hour${critical ? ` (${critical} of them were writing leads to Five9 or Lead Perfection)` : ''}.` : 'No automatic actions failed in the last hour.',
         detail: { failed_1h: failed, critical_1h: critical },
       };
     },
@@ -106,7 +108,7 @@ export const CHECKS = {
       return {
         value: Math.round(ageH * 10) / 10,
         rule: (_v, c) => (waiting ? band(ageH, c.warn_h, c.fail_h) : 'pass'),
-        summary: waiting ? `${waiting} approval(s) waiting, oldest ${Math.round(ageH)}h` : 'no approval waiting',
+        summary: waiting ? `${count(waiting, 'approval')} waiting for someone to decide; the oldest has waited ${duration(ageH * 60)}.` : 'Nothing is waiting for approval.',
         detail: { waiting, oldest_at: r.oldest ?? null },
       };
     },
@@ -136,7 +138,7 @@ export const CHECKS = {
         value: Math.round(ratio * 100) / 100,
         // With a zero baseline, a handful of blocks is not a spike: need 3+.
         rule: (_v, c) => (median === 0 && last < 3 ? 'pass' : band(ratio, c.warn_x, c.fail_x)),
-        summary: `${last} block(s) last hour vs a median of ${median} for that hour`,
+        summary: `The safety filter blocked ${count(last, 'message')} in the last hour (a normal hour: ${median}).`,
         detail: { last_hour: last, median_same_hour_7d: median },
       };
     },
@@ -154,7 +156,7 @@ export const CHECKS = {
         value: Math.round(pct),
         eval: { suffix: 'pct' },
         active: false,
-        summary: `$${cost.toFixed(2)} spent today (ET) of a $${budget} budget`,
+        summary: `$${cost.toFixed(2)} spent on AI today, of a $${budget} daily budget.`,
         detail: { cost_usd: cost, budget_usd: budget, day_et: day },
       };
     },
@@ -172,11 +174,11 @@ export const CHECKS = {
       return expected.map((name) => {
         const c = byName.get(String(name).toLowerCase());
         const fp = `dialer.campaign_running:${name}`;
-        if (!c) return { status: 'unknown', summary: `${name}: not in Five9's campaign list (renamed?)`, fingerprint: fp, detail: { campaign: name } };
+        if (!c) return { status: 'unknown', summary: `${name}: Five9 has no campaign by this name (was it renamed?).`, fingerprint: fp, detail: { campaign: name } };
         const running = String(c.state || '').toUpperCase() === 'RUNNING';
         return {
           status: running ? 'pass' : 'fail',
-          summary: `${name}: ${c.state || 'no state'}`,
+          summary: running ? `${name} is running.` : `${name} is not running (Five9 says ${String(c.state || 'no state').toLowerCase()}).`,
           detail: { campaign: name, state: c.state || null, mode: c.mode || null },
           fingerprint: fp,
         };
@@ -213,7 +215,9 @@ export const CHECKS = {
       return {
         value: fresh.length,
         status: fresh.length ? 'warn' : 'pass',
-        summary: `${drafts.length} draft workflow trigger(s) live, ${dupes.length} cross-workflow duplicate trigger(s); ${fresh.length} new since the last run`,
+        summary: drafts.length || dupes.length
+          ? `${count(drafts.length, 'unpublished GHL workflow')} can still be started, and ${count(dupes.length, 'trigger')} start${dupes.length === 1 ? 's' : ''} more than one workflow${fresh.length ? ` (${fresh.length} new since yesterday)` : ''}.`
+          : 'No GHL workflow is set to start twice or from an unpublished draft.',
         detail: {
           keys,
           new: fresh.slice(0, 30),
@@ -249,7 +253,7 @@ export const CHECKS = {
           if (pct !== null && pct < Number(c.warn_pct ?? 50)) return 'warn';
           return 'pass';
         },
-        summary: `${last} GHL webhook(s) in the last 2h vs a median of ${median} for this window`,
+        summary: `GHL sent us ${count(last, 'update')} in the last 2 hours (a normal ${median}).`,
         detail: { last_2h: last, median_same_window_4w: median, pct_of_normal: pct === null ? null : Math.round(pct) },
       };
     },
@@ -282,8 +286,8 @@ export const CHECKS = {
         value: failing.length,
         status: failing.length ? 'fail' : flaky.length ? 'warn' : 'pass',
         summary: failing.length
-          ? `${failing.length} job(s) failed 3 runs in a row: ${failing.map((f) => f.job_id).join(', ')}`.slice(0, 300)
-          : `${flaky.length} job(s) with a failure in the last 3 runs`,
+          ? `${count(failing.length, 'background job')} failed 3 times in a row: ${failing.map((f) => f.job_id).join(', ')}.`.slice(0, 300)
+          : flaky.length ? `${count(flaky.length, 'background job')} failed once recently and then recovered: ${flaky.map((f) => f.job_id).join(', ')}.`.slice(0, 300) : 'Every background job ran without errors.',
         detail: { failing, flaky: flaky.slice(0, 30) },
       };
     },
@@ -314,7 +318,7 @@ export const CHECKS = {
       return {
         value: silent.length,
         status: worst,
-        summary: silent.length ? `${silent.length} job(s) silent past their cadence: ${silent.map((s) => s.job_id).join(', ')}`.slice(0, 300) : 'every scheduled job ran on its cadence',
+        summary: silent.length ? `${count(silent.length, 'background job')} didn't run when expected: ${silent.map((s) => `${s.job_id} (quiet ${duration(s.silent_min)})`).join(', ')}.`.slice(0, 300) : 'Every background job ran on time.',
         detail: { silent: silent.slice(0, 40) },
       };
     },
@@ -346,7 +350,7 @@ export const CHECKS = {
         value: rows.length,
         active: false,
         eval: {},
-        summary: `${rows.length} appointment(s) set on a call in 24h with no LP lead behind the caller`,
+        summary: rows.length ? `${count(rows.length, 'appointment')} booked on a phone call in the last day with no lead in Lead Perfection for that caller.` : 'Every appointment booked on a call in the last day has a lead in Lead Perfection.',
         detail: { calls: rows.map((r) => ({ phone10: String(r.caller || '').replace(/\D/g, '').slice(-10), campaign: r.campaign, at: r.last_call_at })) },
       };
     },
@@ -356,7 +360,7 @@ export const CHECKS = {
     everyMin: 5,
     async run({ fetch: fetchImpl, env }) {
       const base = n8nBaseUrl(env);
-      if (!base) return { status: 'unknown', summary: 'N8N_BASE_URL not set (and no n8n URL to derive it from)' };
+      if (!base) return { status: 'unknown', summary: "Can't check n8n: its web address isn't set up (N8N_BASE_URL)." };
       let ok = false;
       let detail = {};
       try {
@@ -368,7 +372,7 @@ export const CHECKS = {
       }
       return {
         rule: (_v, c) => missRule('n8n.reachable', ok, c),
-        summary: ok ? `n8n /healthz answered ${detail.http} in ${detail.latency_ms} ms` : `n8n /healthz did not answer: ${detail.error || `HTTP ${detail.http}`}`,
+        summary: ok ? 'n8n is up.' : `n8n is not answering (${detail.error || `error ${detail.http}`}).`,
         detail: { url: `${base}/healthz`, ...detail },
       };
     },
@@ -378,7 +382,7 @@ export const CHECKS = {
     everyMin: 5,
     async run({ fetch: fetchImpl, env }, row) {
       const url = row.config?.url || (env.DASHBOARD_BASE_URL ? `${env.DASHBOARD_BASE_URL.replace(/\/$/, '')}/overview` : null);
-      if (!url) return { status: 'unknown', summary: 'no dashboard URL in config or DASHBOARD_BASE_URL' };
+      if (!url) return { status: 'unknown', summary: "Can't check the dashboard: its web address isn't set up (DASHBOARD_BASE_URL)." };
       let ok = false;
       let detail = {};
       try {
@@ -392,7 +396,7 @@ export const CHECKS = {
       return {
         value: detail.latency_ms ?? null,
         rule: (_v, c) => missRule('svc.dashboard', ok, c, { latencyMs: detail.latency_ms, warnLatencyMs: 3000 }),
-        summary: ok ? `dashboard answered ${detail.http} in ${detail.latency_ms} ms` : `dashboard did not answer: ${detail.error || `HTTP ${detail.http}`}`,
+        summary: ok ? (detail.latency_ms > 3000 ? `The dashboard is up but slow (${(detail.latency_ms / 1000).toFixed(1)} seconds to load).` : 'The dashboard is up.') : `The dashboard is not answering (${detail.error || `error ${detail.http}`}).`,
         detail: { url, ...detail },
       };
     },
@@ -414,7 +418,7 @@ export const CHECKS = {
   'svc.hl_mcp': {
     everyMin: 5,
     async run({ fetch: fetchImpl, env, railway }, row) {
-      if (!env.HL_MCP_URL) return { status: 'unknown', summary: 'HL_MCP_URL not set' };
+      if (!env.HL_MCP_URL) return { status: 'unknown', summary: "Can't check HL-MCP: its web address isn't set up (HL_MCP_URL)." };
       const url = `${new URL(env.HL_MCP_URL).origin}/health`;
       let ok = false;
       let detail = {};
@@ -425,12 +429,14 @@ export const CHECKS = {
       } catch (err) {
         detail = { error: err.message };
       }
-      const deploy = await railway.latestDeploy('HL-MCP').catch((err) => ({ error: err.message }));
-      const badDeploy = ['FAILED', 'CRASHED'].includes(deploy?.status);
+      const deploy = await railway.state('HL-MCP').catch((err) => ({ error: err.message }));
+      const down = deploy?.state === 'crashed';
       return {
         value: detail.latency_ms ?? null,
-        rule: (_v, c) => (badDeploy ? 'fail' : missRule('svc.hl_mcp', ok, c, { latencyMs: detail.latency_ms, warnLatencyMs: Number(c.warn_latency_ms ?? 3000) })),
-        summary: `${ok ? `HL MCP answered in ${detail.latency_ms} ms` : `HL MCP did not answer: ${detail.error || `HTTP ${detail.http}`}`}; latest deploy ${deploy?.status || 'unknown'}`,
+        rule: (_v, c) => (down ? 'fail' : missRule('svc.hl_mcp', ok, c, { latencyMs: detail.latency_ms, warnLatencyMs: Number(c.warn_latency_ms ?? 3000) })),
+        summary: ok
+          ? `HL-MCP is up.${deploy?.state === 'failed_update' ? ' Its latest update failed to deploy; the previous version is still running.' : ''}`
+          : `HL-MCP is not answering (${detail.error || `error ${detail.http}`})${down ? ' and Railway shows it crashed' : ''}.`,
         detail: { url, ...detail, deploy },
       };
     },
@@ -441,12 +447,12 @@ export const CHECKS = {
     async run({ railway, uptimeSec }) {
       // This process answering IS the probe; the deploy status says whether a
       // newer build is failing behind it.
-      const deploy = await railway.latestDeploy('LP-MCP').catch((err) => ({ error: err.message }));
-      const bad = ['FAILED', 'CRASHED'].includes(deploy?.status);
+      const deploy = await railway.state('LP-MCP').catch((err) => ({ error: err.message }));
+      const failedUpdate = deploy?.state === 'failed_update';
       return {
         value: Math.round(uptimeSec),
-        status: bad ? 'fail' : 'pass',
-        summary: `LP MCP up ${Math.round(uptimeSec / 60)} min; latest deploy ${deploy?.status || 'unknown'}`,
+        status: failedUpdate ? 'warn' : 'pass',
+        summary: `LP-MCP is up (running for ${duration(uptimeSec / 60)}).${failedUpdate ? ' Its latest update failed to deploy; the previous version is still running.' : ''}`,
         detail: { uptime_sec: Math.round(uptimeSec), deploy },
       };
     },
@@ -454,24 +460,17 @@ export const CHECKS = {
 
   'svc.railway_restarts': {
     everyMin: 15,
-    async run({ railway }, row) {
-      const services = row.config?.services || [];
-      const out = [];
-      for (const name of services) {
-        const d = await railway.deploysLastHour(name);
-        out.push({ service: name, ...d });
+    async run({ railway, nowMs }) {
+      // Every watched service by its Railway ID (src/health/railway-state.js).
+      const entries = [];
+      for (const s of RAILWAY_SERVICES) {
+        try {
+          entries.push({ name: s.name, deployments: await railway.deployments(s.name) });
+        } catch (err) {
+          entries.push({ name: s.name, error: err.message });
+        }
       }
-      if (out.every((o) => o.error)) {
-        return { status: 'unknown', summary: `Railway API unreadable: ${out[0]?.error || 'no services'}`.slice(0, 300), detail: { services: out } };
-      }
-      const worst = Math.max(0, ...out.map((o) => o.deploys ?? 0));
-      return {
-        value: worst,
-        active: false,
-        eval: {},
-        summary: out.map((o) => `${o.service}: ${o.error ? '?' : o.deploys}`).join(', ').slice(0, 300),
-        detail: { services: out, measure: 'deployments created in the last hour (a crash loop restarts the same deploy and is read from its status)' },
-      };
+      return restartsResult(entries, { nowMs });
     },
   },
 
@@ -480,8 +479,8 @@ export const CHECKS = {
     async run({ supabase }) {
       const started = Date.now();
       const { error } = await supabase.from('health_checks').select('check_id').limit(1);
-      if (error) return { status: 'fail', summary: `LP Supabase read failed: ${error.message}`.slice(0, 300) };
-      return { status: 'pass', value: Date.now() - started, summary: `1-row read in ${Date.now() - started} ms (CPU/disk not read: no management API key)`, detail: { cpu_disk: 'skipped' } };
+      if (error) return { status: 'fail', summary: `The main database is not answering (${error.message}).`.slice(0, 300) };
+      return { status: 'pass', value: Date.now() - started, summary: 'The main database is answering normally.', detail: { read_ms: Date.now() - started, cpu_disk: 'not read (no Supabase management key)' } };
     },
   },
 
@@ -490,7 +489,7 @@ export const CHECKS = {
     async run({ hlRunSQL }) {
       const started = Date.now();
       await hlRunSQL('SELECT 1 AS ok');
-      return { status: 'pass', value: Date.now() - started, summary: `1-row read in ${Date.now() - started} ms (CPU/disk not read: no management API key)`, detail: { cpu_disk: 'skipped' } };
+      return { status: 'pass', value: Date.now() - started, summary: 'The GHL copy database is answering normally.', detail: { read_ms: Date.now() - started, cpu_disk: 'not read (no Supabase management key)' } };
     },
   },
 
@@ -503,7 +502,7 @@ export const CHECKS = {
         WHERE state = 'firing' AND alert_key LIKE 'appt_parity:gap:%'
           AND first_seen_at <= now() - make_interval(mins => ${minAge})`));
       const gaps = n(r.gaps) ?? 0;
-      return { value: gaps, active: false, eval: {}, summary: `${gaps} open LP/GHL appointment parity gap(s)`, detail: { source: "alert_conditions 'appt_parity:gap:*'" } };
+      return { value: gaps, active: false, eval: {}, summary: gaps ? `${count(gaps, 'appointment')} ${gaps === 1 ? 'is' : 'are'} different in Lead Perfection and GHL.` : 'Appointments match in Lead Perfection and GHL.', detail: { source: "alert_conditions 'appt_parity:gap:*'" } };
     },
   },
 
@@ -515,9 +514,9 @@ export const CHECKS = {
         FROM five9_events_raw WHERE received_at >= now() - interval '24 hours'`));
       const events = n(r.events) ?? 0;
       const keyed = n(r.keyed) ?? 0;
-      if (!events) return { status: 'unknown', summary: 'no Five9 events in 24h to measure' };
+      if (!events) return { status: 'unknown', summary: 'No Five9 calls in the last day to measure.' };
       const pct = Math.round((keyed / events) * 1000) / 10;
-      return { value: pct, active: false, eval: { suffix: 'pct', lowerIsWorse: true, strict: true }, summary: `${pct}% of ${events} Five9 events in 24h carry an LP key`, detail: { events, keyed } };
+      return { value: pct, active: false, eval: { suffix: 'pct', lowerIsWorse: true, strict: true }, summary: `${pct}% of ${events.toLocaleString('en-US')} Five9 call records in the last day are tied to a Lead Perfection lead.`, detail: { events, keyed } };
     },
   },
 
@@ -554,7 +553,7 @@ export const CHECKS = {
           if (per.some((p) => p.age_min === null || p.age_min > Math.max(Number(c.warn_min ?? 30), 2 * p.expected_every_min))) return 'warn';
           return 'pass';
         },
-        summary: `oldest entity sync ${maxAge} min ago; ${failed}/${total} sync runs failed in 24h`,
+        summary: `The GHL copy was last fully refreshed ${duration(maxAge)} ago${failed ? `; ${failed} of ${total} refreshes failed in the last day` : ''}.`,
         detail: { entities: per, failure_rate_24h_pct: Math.round(failRate * 10) / 10 },
       };
     },
@@ -563,23 +562,30 @@ export const CHECKS = {
   'sync.lp_errors': {
     everyMin: 15,
     async run({ runSQL }) {
+      // 2026-10-15: red only for NEW errors. 134 errors up to 97 days old with
+      // none new kept this red forever, which teaches people to ignore red.
       const r = first(await runSQL(`
         SELECT count(*) AS open_total,
                count(*) FILTER (WHERE created_at >= now() - interval '1 hour') AS new_1h,
+               count(*) FILTER (WHERE created_at >= now() - interval '24 hours') AS new_24h,
                min(created_at) AS oldest
         FROM lp_sync_errors WHERE resolved = false`));
       const total = n(r.open_total) ?? 0;
       const new1h = n(r.new_1h) ?? 0;
+      const new24h = n(r.new_24h) ?? 0;
       const ageH = r.oldest ? (Date.now() - Date.parse(r.oldest)) / 3_600_000 : 0;
+      const old = total - new24h;
       return {
-        value: total,
+        value: new24h,
         rule: (_v, c) => {
-          if (total > Number(c.fail_total ?? Infinity) || (total && ageH > Number(c.fail_age_h ?? Infinity))) return 'fail';
-          if (new1h > Number(c.warn_new_1h ?? Infinity)) return 'warn';
+          if (new24h >= Number(c.fail_new_24h ?? 10) || new1h > Number(c.warn_new_1h ?? 5)) return 'fail';
+          if (new24h > 0 || old > 0) return 'warn';
           return 'pass';
         },
-        summary: `${total} unresolved LP sync error(s), ${new1h} new in the last hour${total ? `, oldest ${Math.round(ageH)}h` : ''}`,
-        detail: { open_total: total, new_1h: new1h, oldest_at: r.oldest ?? null },
+        summary: !total
+          ? 'No Lead Perfection sync errors.'
+          : `${new24h ? `${count(new24h, 'new Lead Perfection sync error')} today${new1h ? ` (${new1h} in the last hour)` : ''}` : 'No new Lead Perfection sync errors today'}${old ? `; ${count(old, 'older error')} still open, the oldest ${duration(ageH * 60)} old` : ''}.`,
+        detail: { open_total: total, new_1h: new1h, new_24h: new24h, oldest_at: r.oldest ?? null },
       };
     },
   },
@@ -597,7 +603,7 @@ export const CHECKS = {
       return {
         value: age,
         rule: (_v, c) => (twoFailed ? 'fail' : age === null ? 'unknown' : band(age, c.warn_min, c.fail_min)),
-        summary: `last completed lead sync ${age ?? '?'} min ago${twoFailed ? '; the last two failed' : ''}`,
+        summary: age === null ? "Can't find a completed lead copy from Lead Perfection." : `Leads were last copied from Lead Perfection ${duration(age)} ago${twoFailed ? '; the last two tries failed' : ''}.`,
         detail: { last_completed_at: lastDone?.completed_at ?? null, recent_statuses: rows.map((r) => r.status) },
       };
     },
@@ -608,7 +614,7 @@ export const CHECKS = {
     async run() {
       return {
         status: 'unknown',
-        summary: 'needs an hourly source: lead_intake_gap_daily is written once a day at 08:10 ET by the lead-leak monitor',
+        summary: 'Coming later: this needs an hourly count, but the numbers it uses are only made once a day (8:10 AM).',
       };
     },
   },
@@ -617,13 +623,13 @@ export const CHECKS = {
 function probeEntry(checkId, row) {
   const state = row?.state;
   if (state === 'not_configured' || state === 'unknown') {
-    return { status: 'unknown', summary: `${row?.name || checkId}: ${state} — ${row?.detail || ''}`.slice(0, 300), detail: row || {} };
+    return { status: 'unknown', summary: `Can't check ${row?.name || checkId} right now${row?.detail ? ` (${row.detail})` : ''}.`.slice(0, 300), detail: row || {} };
   }
   const ok = state === 'connected';
   return {
     value: row?.latency_ms ?? null,
     rule: (_v, c) => missRule(checkId, ok, c),
-    summary: `${row?.name || checkId}: ${state} — ${row?.detail || ''}`.slice(0, 300),
+    summary: (ok ? `${row?.name || checkId} is connected.` : `${row?.name || checkId} is not connecting${row?.detail ? ` (${row.detail})` : ''}.`).slice(0, 300),
     detail: row || {},
   };
 }
@@ -676,7 +682,7 @@ export async function runHealthChecks({ env = process.env, nowMs = Date.now(), d
     if (!force && nowMs - (lastRunAt.get(checkId) || 0) < every - 30_000) continue;
     lastRunAt.set(checkId, nowMs);
     if (!inActiveWindow(row.active_window, nowMs)) {
-      health.push({ check_id: checkId, status: 'skipped', summary: `outside the active window (${row.active_window})`, fingerprint: checkId });
+      health.push({ check_id: checkId, status: 'skipped', summary: `Only checked ${windowWords(row.active_window)}.`, fingerprint: checkId });
       skipped.push(checkId);
       continue;
     }
@@ -689,7 +695,7 @@ export async function runHealthChecks({ env = process.env, nowMs = Date.now(), d
       for (const e of list) health.push({ fingerprint: checkId, ...e, check_id: checkId, elapsed_ms: elapsed });
       ran.push(checkId);
     } catch (err) {
-      health.push({ check_id: checkId, status: 'unknown', summary: `could not read: ${err.message}`.slice(0, 300), fingerprint: checkId, elapsed_ms: Date.now() - started });
+      health.push({ check_id: checkId, status: 'unknown', summary: `Can't tell right now: ${err.message}`.slice(0, 300), fingerprint: checkId, elapsed_ms: Date.now() - started });
       ran.push(checkId);
     }
   }
@@ -764,41 +770,25 @@ async function defaultProbes() {
 
 async function defaultRailway() {
   const { railwayQuery } = await import('../admin/railway-client.js');
-  const projectId = process.env.RAILWAY_PROJECT_ID;
-  let services = null;
-  const serviceList = async () => {
-    if (services) return services;
-    if (!projectId) throw new Error('RAILWAY_PROJECT_ID not configured');
-    const data = await railwayQuery(`query($id: String!) { project(id: $id) { services { edges { node { id name
-      deployments(first: 10) { edges { node { id status createdAt } } } } } } } }`, { id: projectId });
-    services = (data?.project?.services?.edges || []).map((e) => e.node);
-    setTimeout(() => { services = null; }, 60_000).unref?.();
-    return services;
-  };
-  const find = async (name) => {
-    const list = await serviceList();
-    const svc = list.find((s) => s.name.toLowerCase() === String(name).toLowerCase());
-    if (!svc) throw new Error(`Railway service "${name}" not found in the project`);
-    return svc;
+  // 2026-10-15: ask Railway for each service by its ID (any project the
+  // token can see). The old lookup searched LP-MCP's own project by name and
+  // never found HL-MCP, n8n or the Dashboard (src/health/railway-state.js).
+  const cache = new Map();
+  const deployments = async (name) => {
+    const id = serviceIdFor(name);
+    if (!id) throw new Error(`no Railway service ID for "${name}"`);
+    const hit = cache.get(id);
+    if (hit && Date.now() - hit.at < 60_000) return hit.deps;
+    const data = await railwayQuery(`query($id: String!) { service(id: $id) { name
+      deployments(first: 10) { edges { node { id status createdAt } } } } }`, { id });
+    const deps = (data?.service?.deployments?.edges || []).map((e) => e.node);
+    cache.set(id, { at: Date.now(), deps });
+    return deps;
   };
   return {
-    async latestDeploy(name) {
-      const svc = await find(name);
-      const dep = svc.deployments?.edges?.[0]?.node;
-      return dep ? { id: dep.id, status: dep.status, created_at: dep.createdAt } : { status: null };
-    },
-    async deploysLastHour(name) {
-      try {
-        const svc = await find(name);
-        const since = Date.now() - 3_600_000;
-        const deps = (svc.deployments?.edges || []).map((e) => e.node);
-        return {
-          deploys: deps.filter((x) => Date.parse(x.createdAt) >= since).length,
-          latest_status: deps[0]?.status ?? null,
-        };
-      } catch (err) {
-        return { error: err.message };
-      }
+    deployments,
+    async state(name) {
+      return serviceState(await deployments(name));
     },
   };
 }

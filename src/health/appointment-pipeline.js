@@ -24,10 +24,11 @@ import { loadHealthChecks } from './registry.js';
 import { etParts, inActiveWindow } from './window.js';
 import { displayName } from '../lead-speed-alerts.js';
 import { normalizePhone10 } from '../lead-leak-classify.js';
+import { clock12, clockList, count, dayWords, duration, windowWords } from './plain.js';
 
 export const JOB_ID = 'appointment-pipeline-check';
 export const TICK_MS = 5 * 60_000;
-export const GAPS_14 = 'field not in LP mirror — Gaps #14';
+export const GAPS_14 = 'Lead Perfection does not share whether a rep has viewed or acknowledged an appointment, so this cannot be checked yet.';
 const MIN = 60_000;
 const DAY = 24 * 60 * MIN;
 /** A timed check still runs if the tick arrives this late (a deploy at 20:14). */
@@ -51,13 +52,19 @@ const sqlList = (values) => values.map((v) => `'${String(v).replace(/'/g, "''")}
 /** The "issued" predicate, both places LP keeps it. */
 export const ISSUED_SQL = "(coalesce(ever_issued, false) OR coalesce(raw_lp_data->>'issued', 'false') = 'true')";
 
+/** "2026-10-16 14:00" (LP wall clock) as "Fri, Oct 16, 2:00 PM". */
+export function apptWhen(wall) {
+  const m = /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})/.exec(String(wall || ''));
+  return m ? `${dayWords(m[1])}, ${clock12(m[2])}` : (wall || null);
+}
+
 export function apptLine(l, extra = {}) {
   return {
     lp_lead_id: String(l.lp_lead_id),
     name: displayName(l.first_name, l.last_name),
     phone10: normalizePhone10(l.phone),
     source: l.lead_source || null,
-    appointment: l.appt_wall || null,
+    appointment: apptWhen(l.appt_wall),
     market: l.lp_branch_id || null,
     ...extra,
   };
@@ -65,6 +72,24 @@ export function apptLine(l, extra = {}) {
 
 const LEAD_COLS = `lp_lead_id, first_name, last_name, phone, lead_source, lp_branch_id, disposition_code, rep_id, rep_name,
   to_char(appointment_date AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI') AS appt_wall`;
+
+/**
+ * The appointment time rules, in words (pure): "10 appointments this week are
+ * at a time we don't book: 4 at 12:00 PM, 3 at 4:00 PM, 3 on a morning when
+ * that office has its sales meeting."
+ */
+export function timeRulesSummary(bad, { byBot = 0, pending = false } = {}) {
+  if (!bad.length) return 'Every appointment this week is at a time we book.';
+  const parts = [];
+  const byHour = new Map();
+  for (const b of bad.filter((x) => x.kind === 'never' || x.kind === 'outside')) byHour.set(b.hour, (byHour.get(b.hour) || 0) + 1);
+  for (const [h, n] of [...byHour].sort((a, b) => b[1] - a[1])) parts.push(`${n} at ${clock12(`${h}:00`)}`);
+  const meeting = bad.filter((x) => x.kind === 'meeting').length;
+  if (meeting) parts.push(`${meeting} on a morning when that office has its sales meeting`);
+  return `${count(bad.length, 'appointment')} this week ${bad.length === 1 ? 'is' : 'are'} at a time we don't book: ${parts.join(', ')}.`
+    + (byBot ? ` ${byBot} of them ${byBot === 1 ? 'was' : 'were'} booked by the chatbot or an automation.` : '')
+    + (pending ? ' Dispatch still needs to confirm these time rules.' : '');
+}
 
 /* ── the checks: each (ctx) → entry ─────────────────────────────────────── */
 
@@ -98,7 +123,7 @@ export const CHECKS = {
           if (oldest > Number(c.warn_age_min ?? 20) || waiting.length > Number(c.warn_count ?? 10)) return 'warn';
           return 'pass';
         },
-        summary: waiting.length ? `${waiting.length} inquir${waiting.length === 1 ? 'y' : 'ies'} waiting in the LP inbound queue; oldest ${oldest} office min` : 'LP inbound queue is empty',
+        summary: waiting.length ? `${count(waiting.length, 'new inquiry', 'new inquiries')} waiting in Lead Perfection to be turned into a lead; the oldest has waited ${duration(oldest)} of office time.` : 'No inquiries are waiting in Lead Perfection.',
         detail: { waiting: waiting.length, leads: waiting.slice(0, 50) },
       };
     },
@@ -116,7 +141,7 @@ export const CHECKS = {
       return {
         value: r.length,
         rule: (_v, c) => (!r.length ? 'pass' : late || r.length >= Number(c.fail_count_first ?? 3) ? 'fail' : 'warn'),
-        summary: `${r.length} confirmed appointment(s) for ${tomorrow} not issued at ${firedAt} ET`,
+        summary: r.length ? `${count(r.length, 'confirmed appointment')} for ${dayWords(tomorrow)} ${r.length === 1 ? 'was' : 'were'} not issued to a rep by ${clock12(firedAt)}.` : `Every confirmed appointment for ${dayWords(tomorrow)} was issued to a rep by ${clock12(firedAt)}.`,
         detail: { checked_at_et: firedAt, issued_field: "ever_issued OR raw_lp_data.issued = 'true'", leads: r.map((l) => apptLine(l, { rep: l.rep_name || null })) },
       };
     },
@@ -137,7 +162,7 @@ export const CHECKS = {
       return {
         value: r.length,
         status: !r.length ? 'pass' : firedAt === '20:15' ? 'fail' : 'warn',
-        summary: `${r.length} confirmed appointment(s) for ${tomorrow} with no sales rep at ${firedAt} ET`,
+        summary: r.length ? `${count(r.length, 'confirmed appointment')} for ${dayWords(tomorrow)} still had no sales rep at ${clock12(firedAt)}.` : `Every confirmed appointment for ${dayWords(tomorrow)} had a sales rep at ${clock12(firedAt)}.`,
         detail: { checked_at_et: firedAt, leads: r.map((l) => apptLine(l)) },
       };
     },
@@ -159,7 +184,7 @@ export const CHECKS = {
         value: pct,
         active: false,
         eval: { suffix: 'pct', strict: true },
-        summary: `${nc} of ${total} appointment(s) for ${tomorrow} still Set, not confirmed (${pct}%)`,
+        summary: total ? `${nc} of ${total} appointments for ${dayWords(tomorrow)} (${pct}%) were still not confirmed at 7:15 PM.` : `No appointments for ${dayWords(tomorrow)}.`,
         detail: { set_total: total, not_confirmed: nc },
       };
     },
@@ -173,7 +198,7 @@ export const CHECKS = {
       const leads = rowsOf(await runSQL(`
         SELECT ${LEAD_COLS} FROM lp_leads
          WHERE (appointment_date AT TIME ZONE 'UTC')::date = '${tomorrow}' AND disposition_code IN ('Set', 'Verif')`), 'tomorrow set');
-      if (!leads.length) return { status: 'pass', value: 0, summary: `no Set/Verif appointment for ${tomorrow}` };
+      if (!leads.length) return { status: 'pass', value: 0, summary: `Every appointment for ${dayWords(tomorrow)} is already confirmed.` };
       // Pre-aggregated: today's Conf-campaign dials by key and by phone (one
       // read, no join against the leads).
       const dials = rowsOf(await runSQL(`
@@ -193,7 +218,9 @@ export const CHECKS = {
           if (minute >= hhmm(c.warn_at_et ?? '17:00')) return 'warn';
           return 'pass';
         },
-        summary: `${missing.length} of ${leads.length} Set/Verif appointment(s) for ${tomorrow} with no Conf-campaign dial today`,
+        summary: missing.length
+          ? `${missing.length} of ${leads.length} unconfirmed appointments for ${dayWords(tomorrow)} have not had a confirmation call yet today${minute < hhmm(row.config?.warn_at_et ?? '17:00') ? ` (calls run until 7:00 PM)` : ''}.`
+          : `Every unconfirmed appointment for ${dayWords(tomorrow)} has had a confirmation call today.`,
         detail: { appointments: leads.length, leads: missing.map((l) => apptLine(l)) },
       };
     },
@@ -213,7 +240,7 @@ export const CHECKS = {
       return {
         value: r.length,
         rule: (_v, c) => (r.length >= Number(c.fail ?? 15) || oldest > Number(c.fail_age_h ?? 72) ? 'fail' : r.length >= Number(c.warn ?? 5) ? 'warn' : 'pass'),
-        summary: `${r.length} issued appointment(s) more than 24h past with no result; oldest ${Math.round(oldest)}h`,
+        summary: r.length ? `${count(r.length, 'issued appointment')} from more than a day ago still ${r.length === 1 ? 'has' : 'have'} no result entered; the oldest was ${duration(oldest * 60)} ago.` : 'Every issued appointment from before yesterday has a result.',
         detail: { leads: r.slice(0, 50).map((l) => apptLine(l, { rep: l.rep_name || null, hours_since: Math.round(Number(l.hours_since)) })) },
       };
     },
@@ -260,8 +287,8 @@ export const CHECKS = {
         value: worst,
         rule: (_v, c) => (worst >= Number(c.fail ?? 3) ? 'fail' : worst >= Number(c.warn ?? 1) ? 'warn' : 'pass'),
         summary: over.length
-          ? `${over.length} market block(s) for ${tomorrow} with more appointments than available reps; worst +${worst}`
-          : `every filed market block for ${tomorrow} has the reps for its appointments`,
+          ? `${count(over.length, 'office time block')} for ${dayWords(tomorrow)} ${over.length === 1 ? 'has' : 'have'} more appointments than reps available (up to ${worst} too many).`
+          : `Every office has enough reps for ${dayWords(tomorrow)}'s appointments.`,
         detail: { over, markets_not_filed: [...unfiled] },
       };
     },
@@ -273,14 +300,14 @@ export const CHECKS = {
       // Upcoming slots only: the view holds every past day too (3,150 rows on 2026-10-15).
       const [r] = rowsOf(await runSQL("SELECT count(*) AS n FROM v_appt_prospect_dupes WHERE slot_date >= (now() AT TIME ZONE 'America/New_York')::date"), 'prospect dupes');
       const n = Number(r?.n || 0);
-      return { value: n, active: false, eval: {}, summary: `${n} prospect(s) with duplicate rows for an upcoming appointment`, detail: { source: 'v_appt_prospect_dupes (slot_date today or later)' } };
+      return { value: n, active: false, eval: {}, summary: n ? `${count(n, 'customer')} with an upcoming appointment ${n === 1 ? 'is' : 'are'} entered twice in Lead Perfection.` : 'No customer with an upcoming appointment is entered twice.', detail: { source: 'v_appt_prospect_dupes (slot_date today or later)' } };
     },
   },
 
   'appt.rep_not_acknowledged': {
     times: ['07:30', '08:30'],
     async run() {
-      return { status: 'unknown', summary: `rep viewed / acknowledged status: ${GAPS_14}` };
+      return { status: 'unknown', summary: `Coming later: ${GAPS_14}` };
     },
   },
 
@@ -302,7 +329,7 @@ export const CHECKS = {
                 AND EXISTS (SELECT 1 FROM jsonb_array_elements(l.raw_lp_data->'appointments') b
                              WHERE (b->>'setdate') > (a->>'setdate') AND coalesce(b->>'issued', 'false') <> 'true'))
          LIMIT 100`), 'reschedule on issued');
-      return { value: r.length, active: false, eval: {}, summary: `${r.length} lead(s) rescheduled after an issued appointment (last 2 days)`, detail: { leads: r.map((l) => apptLine(l)) } };
+      return { value: r.length, active: false, eval: {}, summary: r.length ? `${count(r.length, 'lead')} got a new appointment after the first one was already issued (last 2 days).` : 'No lead got a new appointment after one was already issued.', detail: { leads: r.map((l) => apptLine(l)) } };
     },
   },
 
@@ -324,16 +351,20 @@ export const CHECKS = {
       for (const a of r) {
         const h = Number(a.hour);
         let why = null;
-        if (never.has(h)) why = `never at ${h}:00`;
-        else if (allowed.size && !allowed.has(h)) why = `${h}:00 is outside every block`;
-        else if ((blocks.morning || []).includes(h) && (noMorning[a.dow] || []).includes(a.lp_branch_id)) why = `${a.lp_branch_id} has no morning on ${a.dow} (sales meeting)`;
-        if (why) bad.push(apptLine(a, { why, set_by: a.set_by_name || null }));
+        let kind = null;
+        if (never.has(h)) { kind = 'never'; why = `we don't book at ${clock12(`${h}:00`)}`; }
+        else if (allowed.size && !allowed.has(h)) { kind = 'outside'; why = `${clock12(`${h}:00`)} is outside the morning, afternoon and evening times`; }
+        else if ((blocks.morning || []).includes(h) && (noMorning[a.dow] || []).includes(a.lp_branch_id)) { kind = 'meeting'; why = `the ${a.lp_branch_id} office has its sales meeting on ${a.dow} mornings`; }
+        if (why) bad.push(apptLine(a, { why, kind, hour: h, set_by: a.set_by_name || null }));
       }
       const byBot = bad.filter((b) => /bot|chat|ai|system|integration/i.test(String(b.set_by || ''))).length;
+      // 2026-10-15: say WHICH rule, in words; until dispatch confirms the
+      // rules this stays yellow at most (an unconfirmed rule never pages).
+      const pending = Boolean(c.confirm_with_dispatch);
       return {
         value: bad.length,
-        status: !bad.length ? 'pass' : byBot ? 'fail' : 'warn',
-        summary: `${bad.length} upcoming appointment(s) break the time rules${byBot ? ` (${byBot} set by the bot or an automation)` : ''}${c.confirm_with_dispatch ? ' — rules pending dispatch confirmation (confirm_with_dispatch)' : ''}`,
+        status: !bad.length ? 'pass' : byBot && !pending ? 'fail' : 'warn',
+        summary: timeRulesSummary(bad, { byBot, pending }),
         detail: { leads: bad.slice(0, 50) },
       };
     },
@@ -353,7 +384,7 @@ export const CHECKS = {
         value: r.length,
         active: false,
         eval: {},
-        summary: `${r.length} appointment(s) set in the last day missing Products, Qty or Rank/Appt Type`,
+        summary: r.length ? `${count(r.length, 'appointment')} set in the last day ${r.length === 1 ? 'is' : 'are'} missing the product, quantity or appointment type.` : 'Every appointment set in the last day has its product, quantity and appointment type.',
         detail: {
           fields: { products: 'raw_lp_data.productid', qty: 'raw_lp_data.qty', rank: 'raw_lp_data.rank' },
           leads: r.slice(0, 50).map((l) => apptLine(l, { product: l.product || null, qty: l.qty || null, rank: l.rank || null })),
@@ -385,7 +416,13 @@ export function dueSlot(checkId, spec, nowMs, force = false) {
         return { key, firedAt: t, cover };
       }
     }
-    return force ? { key: `${checkId}|${day}|forced`, firedAt: spec.times[spec.times.length - 1] } : null;
+    if (!force) return null;
+    // 2026-10-15: "Run all checks now" at 10:35 AM judged tomorrow's
+    // appointments against tonight's 8:45 PM deadline and wrote 31 false reds.
+    // A forced run uses the latest time already past today; before the first
+    // one the check is simply not due, and nothing is written.
+    const passed = [...spec.times].sort((a, b) => hhmm(b) - hhmm(a)).find((t) => minuteOfDay >= hhmm(t));
+    return passed ? { key: `${checkId}|${day}|forced`, firedAt: passed } : { notDue: true, times: [...spec.times].sort((a, b) => hhmm(a) - hhmm(b)) };
   }
   const every = (spec.everyMin ?? 5) * MIN;
   const key = `${checkId}|interval`;
@@ -402,17 +439,22 @@ export async function runAppointmentPipelineCheck({ env = process.env, nowMs = D
   const today = etParts(nowMs).day;
   const tomorrow = etParts(nowMs + DAY).day;
   const health = [];
+  const notDue = [];
   for (const [checkId, spec] of Object.entries(CHECKS)) {
     if (only && !only.includes(checkId)) continue;
     const row = registry.get(checkId);
     if (!row || row.enabled === false || row.mode === 'off') continue;
     const slot = dueSlot(checkId, spec, nowMs, force);
     if (!slot) continue;
+    if (slot.notDue) {
+      notDue.push({ check_id: checkId, message: `Not due yet: runs at ${clockList(slot.times)}.` });
+      continue;
+    }
     ran.set(slot.key, nowMs);
     for (const k of slot.cover || []) ran.set(k, nowMs);
     const minute = etParts(nowMs).minuteOfDay;
     if (!inActiveWindow(row.active_window, nowMs) || (spec.window && !force && (minute < spec.window[0] || minute > spec.window[1]))) {
-      health.push({ check_id: checkId, status: 'skipped', summary: `outside the active window (${row.active_window || `${spec.window.map((m) => `${Math.floor(m / 60)}:${String(m % 60).padStart(2, '0')}`).join('-')} ET`})`, fingerprint: checkId });
+      health.push({ check_id: checkId, status: 'skipped', summary: `Only checked ${windowWords(row.active_window || `${spec.window.map((m) => `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`).join('-')} ET`)}.`, fingerprint: checkId });
       continue;
     }
     const started = Date.now();
@@ -420,10 +462,10 @@ export async function runAppointmentPipelineCheck({ env = process.env, nowMs = D
       const e = await spec.run({ ...d, nowMs, today, tomorrow, firedAt: slot.firedAt, row });
       health.push({ fingerprint: checkId, ...e, check_id: checkId, elapsed_ms: Date.now() - started });
     } catch (err) {
-      health.push({ check_id: checkId, status: 'unknown', summary: `could not read: ${err.message}`.slice(0, 300), fingerprint: checkId, elapsed_ms: Date.now() - started });
+      health.push({ check_id: checkId, status: 'unknown', summary: `Can't tell right now: ${err.message}`.slice(0, 300), fingerprint: checkId, elapsed_ms: Date.now() - started });
     }
   }
-  return { ok: true, mode, results: health.length, summary: `${health.length} appointment result(s)`, health };
+  return { ok: true, mode, results: health.length, summary: `${health.length} appointment result(s)${notDue.length ? `, ${notDue.length} not due yet` : ''}`, health, notDue };
 }
 
 export function resetAppointmentPipelineState() {

@@ -131,16 +131,24 @@ let cursor;
 let running = false;
 
 /** Set/Cnf/Verif leads whose appointment is more than graceHours past. Never throws. */
+/** Days back the stale-Set count looks (sync.stale_set_leads). */
+export const STALE_WINDOW_DAYS = 14;
+
 async function countStaleSetLeads(cfg) {
   try {
     if (!supabase) return { error: 'no supabase client' };
+    // 2026-10-15: only the last 14 days. Counting all history (21,442 leads
+    // back to before the mirror existed) kept the check red forever.
+    const windowDays = STALE_WINDOW_DAYS;
     const cutoff = new Date(Date.now() - (cfg.graceHours ?? 24) * 3600_000).toISOString();
+    const from = new Date(Date.now() - windowDays * 86_400_000).toISOString();
     const { count, error } = await supabase.from('lp_leads')
       .select('lp_lead_id', { count: 'exact', head: true })
       .in('disposition_code', ['Set', 'Cnf', 'Verif'])
-      .lt('appointment_date', cutoff);
+      .lt('appointment_date', cutoff)
+      .gte('appointment_date', from);
     if (error) return { error: error.message };
-    return { count: count ?? 0 };
+    return { count: count ?? 0, windowDays };
   } catch (err) {
     return { error: err.message };
   }

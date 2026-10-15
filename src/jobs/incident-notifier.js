@@ -33,6 +33,7 @@ import { loadHealthChecks } from '../health/registry.js';
 import { openOrTouchIncident, transition, noteIncident, NON_TERMINAL, TERMINAL } from '../health/incidents.js';
 import { buildIncidentCard, resolvedReply, formatDuration } from '../health/incident-card.js';
 import { cadenceMinutes } from '../health/window.js';
+import { etWhen } from '../health/plain.js';
 import { syncLegacyIncidents } from '../health/alert-key-map.js';
 import { recordThrottled } from '../health/watchdog-results.js';
 import { recordHealthResult } from '../health/record.js';
@@ -141,8 +142,8 @@ export async function runIncidentNotifier({ env = process.env, nowMs = Date.now(
       if (since && nowMs - Date.parse(since) >= UNKNOWN_SUSTAIN_MS) {
         const res = await openOrTouchIncident({
           check_id: checkId, fingerprint: `unknown:${checkId}`, severity: 'P2', system: row.system,
-          title: `Could not read ${row.system.replace(/_/g, ' ')} (${row.label})`,
-          summary: `${checkId} has returned unknown since ${since}`, business_impact: row.business_impact, nowMs, checkConfig: row.config,
+          title: `Can't check: ${row.label}`,
+          summary: `This check hasn't been able to tell whether things are working since ${etWhen(Date.parse(since))}.`, business_impact: row.business_impact, nowMs, checkConfig: row.config,
         }, { client: c });
         if (res.incident) open.set(res.incident.fingerprint, res.incident);
         if (res.created) out.opened += 1;

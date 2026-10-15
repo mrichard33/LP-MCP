@@ -87,6 +87,10 @@ export async function runCheckNow(checkId, { actor, client } = {}, deps = {}) {
   const out = await run(checkId);
   if (out?.skipped) return fail(409, out.reason || 'the job is off');
   const health = (out?.health || []).filter((h) => h.check_id === checkId);
+  // 2026-10-15: an evening appointment check run in the morning is not due;
+  // it writes nothing and says when it runs (appointment-pipeline dueSlot).
+  const notDue = (out?.notDue || []).find((x) => x.check_id === checkId);
+  if (!health.length && notDue) return { ok: true, check_id: checkId, results: 0, written: 0, message: notDue.message, actor: actor || null };
   const written = await recordHealthResults(health, { client });
   return { ok: true, check_id: checkId, results: health.length, written: written.written, actor: actor || null };
 }
@@ -114,7 +118,7 @@ export async function runAllChecks({ actor, client } = {}, deps = {}) {
       if (out?.skipped) { report[job] = `skipped: ${out.reason}`; continue; }
       const w = await recordHealthResults(out?.health || [], { client });
       written += w.written;
-      report[job] = `${(out?.health || []).length} result(s)`;
+      report[job] = `${(out?.health || []).length} result(s)${out?.notDue?.length ? `, ${out.notDue.length} not due yet` : ''}`;
     } catch (err) {
       report[job] = `error: ${err.message}`;
     }

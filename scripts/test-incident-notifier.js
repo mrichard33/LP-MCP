@@ -100,7 +100,7 @@ test('two passes resolve it: the card is edited and one thread reply says so', a
   assert.equal(inc.verified_by, 'system');
   const replies = h.posts.filter((p) => p.threadTs);
   assert.equal(replies.length, 1);
-  assert.match(replies[0].text, /✅ resolved after/);
+  assert.match(replies[0].text, /✅ Fixed after/);
   assert.ok(h.updates.length >= 1, 'the same card was edited');
   assert.equal(h.posts.filter((p) => !p.threadTs).length, 2, 'never a second card');
 });
@@ -175,9 +175,12 @@ test('the card: plain words, the full 10-digit phone, the dashboard link', () =>
     opened_at: new Date(T0).toISOString(), occurrence_count: 1,
     data: { detail: { leads: [{ name: 'Pat Q.', phone10: '+1 (352) 555-0188', source: 'Google PPC', waiting_min: 42, est_value: 2100 }] } },
   }, { dashboardBaseUrl: 'https://dashboard.getreecewindows.com', nowMs: T0 + 15 * MIN });
-  assert.match(card.text, /Pat Q\. · 3525550188 · Google PPC · waiting 42m · est \$2,100/);
+  assert.match(card.text, /Pat Q\. · 3525550188 · Google PPC · waiting 42 minutes · about \$2,100/);
+  // Severity is a word, never "P1".
+  assert.match(card.text, /Urgent: Leads waiting with no Five9 call/);
+  assert.doesNotMatch(card.text, /\bP1\b/);
   assert.match(card.text, /https:\/\/dashboard\.getreecewindows\.com\/incidents\/7/);
-  assert.match(card.text, /est \$4,200 at risk/);
-  assert.equal(resolvedReply({ opened_at: new Date(T0).toISOString(), resolved_at: new Date(T0 + 95 * MIN).toISOString() }), '✅ resolved after 1h 35m');
+  assert.match(card.text, /about \$4,200 at risk/);
+  assert.equal(resolvedReply({ opened_at: new Date(T0).toISOString(), resolved_at: new Date(T0 + 95 * MIN).toISOString() }), '✅ Fixed after 1 hour 35 minutes.');
   assert.equal(incidentTitle({ label: 'Expected campaigns are RUNNING' }, 'dialer.campaign_running:DIAL ASAP'), 'Expected campaigns are RUNNING — DIAL ASAP');
 });

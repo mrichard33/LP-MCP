@@ -17,6 +17,7 @@
 
 import { recordHealthResult } from './record.js';
 import { displayName } from '../lead-speed-alerts.js';
+import { count as countOf, dayWords, duration, money } from './plain.js';
 
 const MIN = 60_000;
 
@@ -58,7 +59,7 @@ export function uncalledLiveRule(_value, config, lines) {
 
 export function uncalledLiveResults({ decision, offenders, nowMs, errors = [] }) {
   if (!decision || decision.verdict === 'insufficient_evidence') {
-    return [{ check_id: 'lead.uncalled_live', status: 'unknown', summary: `could not read: ${errors.join('; ') || 'lead or Five9 read failed'}`.slice(0, 300), fingerprint: 'lead.uncalled_live' }];
+    return [{ check_id: 'lead.uncalled_live', status: 'unknown', summary: `Can't tell right now: ${errors.join('; ') || 'the lead or Five9 read failed'}`.slice(0, 300), fingerprint: 'lead.uncalled_live' }];
   }
   const lines = (offenders || []).map((o) => leadLine(o, nowMs)).sort((a, b) => (b.waiting_min ?? 0) - (a.waiting_min ?? 0));
   const max = lines.length ? (lines[0].waiting_min ?? 0) : 0;
@@ -68,8 +69,8 @@ export function uncalledLiveResults({ decision, offenders, nowMs, errors = [] })
     value: max,
     rule: (_v, config) => uncalledLiveRule(max, config, lines),
     summary: lines.length
-      ? `${lines.length} lead(s) waiting with no Five9 call; longest ${max} min`
-      : 'every owed lead has a Five9 call',
+      ? `${countOf(lines.length, 'lead')} ${lines.length === 1 ? 'is' : 'are'} waiting for a first call; the longest has waited ${duration(max)}.`
+      : 'Every lead that should have been called has been called.',
     detail: { waiting: lines.length, est_value_at_risk: atRisk, leads: lines },
     fingerprint: 'lead.uncalled_live',
   }];
@@ -101,7 +102,7 @@ function reasonLeads(rows, reasons, nowMs) {
  */
 export function leadLeakResults({ m, nowMs, retiredDecision, speedRow = null, inboundQueueSplit = false }) {
   if (!m || m.verdict === 'insufficient_evidence') {
-    const why = `could not read: ${(m?.errors || []).join('; ') || 'lead or Five9 read failed'}`.slice(0, 300);
+    const why = `Can't tell right now: ${(m?.errors || []).join('; ') || 'the lead or Five9 read failed'}`.slice(0, 300);
     return ['lead.not_in_five9', 'lead.in_inbound_queue', 'lead.routing_failure', 'sync.retired_code', 'lead.first_call_p90']
       .map((id) => ({ check_id: id, status: 'unknown', summary: why, fingerprint: id }));
   }
@@ -116,31 +117,31 @@ export function leadLeakResults({ m, nowMs, retiredDecision, speedRow = null, in
         if (leads >= Number(c.warn_leads ?? Infinity)) return 'warn';
         return 'pass';
       },
-      summary: `${leads} lead(s) ${label}, est $${value.toLocaleString('en-US')}`,
+      summary: leads ? `${countOf(leads, 'lead')} ${label} (worth about ${money(value)}).` : `No leads ${label}.`,
       detail: { leads_count: leads, est_value_at_risk: value, leads: reasonLeads(m.rows, reasons, nowMs) },
       fingerprint: checkId,
     });
   };
-  add('lead.not_in_five9', ['not_in_five9'], 'Five9 has no record of');
-  if (inboundQueueSplit) add('lead.in_inbound_queue', ['in_inbound_queue'], 'still in the LP inbound queue');
-  else out.push({ check_id: 'lead.in_inbound_queue', status: 'unknown', summary: 'split from not_in_five9 pending (Phase 1.9)', fingerprint: 'lead.in_inbound_queue' });
-  add('lead.routing_failure', ['routing_or_automation_failure', 'on_list_not_dialed'], 'lost to routing or automation');
+  add('lead.not_in_five9', ['not_in_five9'], 'never reached Five9');
+  if (inboundQueueSplit) add('lead.in_inbound_queue', ['in_inbound_queue'], 'were still waiting in Lead Perfection to be turned into a lead');
+  else out.push({ check_id: 'lead.in_inbound_queue', status: 'unknown', summary: 'Coming later.', fingerprint: 'lead.in_inbound_queue' });
+  add('lead.routing_failure', ['routing_or_automation_failure', 'on_list_not_dialed'], 'were lost to a routing or automation problem');
 
   const fresh = retiredDecision?.verdict === 'insufficient_evidence' ? null : (m.retiredFresh || []);
   out.push(fresh === null
-    ? { check_id: 'sync.retired_code', status: 'unknown', summary: 'could not read retired codes', fingerprint: 'sync.retired_code' }
+    ? { check_id: 'sync.retired_code', status: 'unknown', summary: "Can't tell right now: the retired codes couldn't be read.", fingerprint: 'sync.retired_code' }
     : {
       check_id: 'sync.retired_code',
       value: fresh.length,
       eval: {},
       active: false,
-      summary: `${fresh.length} lead(s) given a retired code in the last day`,
+      summary: fresh.length ? `${countOf(fresh.length, 'lead')} got an old, retired result code in the last day.` : 'No lead got an old, retired result code in the last day.',
       detail: { leads: fresh.slice(0, 50) },
       fingerprint: 'sync.retired_code',
     });
 
   if (!speedRow) {
-    out.push({ check_id: 'lead.first_call_p90', status: 'unknown', summary: "no lead_call_speed_daily row for yesterday", fingerprint: 'lead.first_call_p90' });
+    out.push({ check_id: 'lead.first_call_p90', status: 'unknown', summary: "Can't tell yet: yesterday's call-speed numbers aren't in.", fingerprint: 'lead.first_call_p90' });
   } else {
     const p90 = Number(speedRow.p90_min);
     const never = Number(speedRow.never_called ?? 0);
@@ -155,7 +156,7 @@ export function leadLeakResults({ m, nowMs, retiredDecision, speedRow = null, in
         if (p90 > Number(c.warn_p90_min ?? Infinity)) return 'warn';
         return 'pass';
       },
-      summary: `${speedRow.created_day}: p90 ${Number.isFinite(p90) ? Math.round(p90) : '?'} min, ${never} of ${expected} never called`,
+      summary: `${dayWords(speedRow.created_day)}: 9 in 10 new leads were called within ${Number.isFinite(p90) ? duration(p90) : 'an unknown time'}${never ? `; ${never} of ${expected} were never called` : ''}.`,
       detail: { day: speedRow.created_day, p90_min: p90, never_called: never, expected, never_called_pct: Math.round(neverPct * 10) / 10 },
       fingerprint: 'lead.first_call_p90',
     });
@@ -167,7 +168,7 @@ export function leadLeakResults({ m, nowMs, retiredDecision, speedRow = null, in
 
 export function five9SilenceResults({ active, reason, latest, nowMs }) {
   if (reason === 'outside_business_hours') {
-    return [{ check_id: 'dialer.silence', status: 'skipped', summary: 'outside Five9 business hours (Mon-Sat 09-18 ET)', fingerprint: 'dialer.silence' }];
+    return [{ check_id: 'dialer.silence', status: 'skipped', summary: 'Only checked during calling hours (Monday to Saturday, 9 AM to 6 PM Eastern).', fingerprint: 'dialer.silence' }];
   }
   const ageMin = latest?.received_at ? Math.round((nowMs - Date.parse(latest.received_at)) / MIN) : null;
   return [{
@@ -175,8 +176,8 @@ export function five9SilenceResults({ active, reason, latest, nowMs }) {
     active,
     value: ageMin,
     summary: active === null
-      ? `could not tell: ${reason}`
-      : `newest Five9 event ${ageMin} min ago`,
+      ? `Can't tell right now: ${reason}`
+      : ageMin <= 5 ? 'Five9 is sending call activity normally.' : `No call activity from Five9 for ${duration(ageMin)}.`,
     detail: { reason, last_event_at: latest?.received_at ?? null },
     fingerprint: 'dialer.silence',
   }];
@@ -210,10 +211,10 @@ export function lpReportResult({ type, label, cadence = 'daily', state, lastEtDa
   const name = label || type;
   const fp = `sync.lp_reports:${type}`;
   const detail = { report_type: type, report_number: num, report: name, cadence, last_ingested_et: lastEtDay ?? null };
-  if (state === 'read_failed') return { check_id: 'sync.lp_reports', status: 'unknown', summary: `${name}: could not read the ingest log`, detail, fingerprint: fp };
-  if (state === 'unarmed') return { check_id: 'sync.lp_reports', status: 'unknown', summary: `${name}: ingesting but not guarded (no n8n-sourced success yet)`, detail, fingerprint: fp };
-  if (state === 'never_scheduled') return { check_id: 'sync.lp_reports', status: 'skipped', summary: `${name}: not scheduled in LP yet`, detail, fingerprint: fp };
-  if (state === 'ok') return { check_id: 'sync.lp_reports', status: 'pass', summary: `${name}: ingested (${lastEtDay})`, detail, fingerprint: fp };
+  if (state === 'read_failed') return { check_id: 'sync.lp_reports', status: 'unknown', summary: `${name}: can't tell right now (the report log couldn't be read).`, detail, fingerprint: fp };
+  if (state === 'unarmed') return { check_id: 'sync.lp_reports', status: 'unknown', summary: `${name}: arriving, but not through the usual email route yet, so a missed day won't be noticed.`, detail, fingerprint: fp };
+  if (state === 'never_scheduled') return { check_id: 'sync.lp_reports', status: 'skipped', summary: `${name}: not scheduled in Lead Perfection yet.`, detail, fingerprint: fp };
+  if (state === 'ok') return { check_id: 'sync.lp_reports', status: 'pass', summary: `${name}: arrived ${lastEtDay ? dayWords(lastEtDay) : 'today'}.`, detail, fingerprint: fp };
   const minute = etMinuteOfDay(nowMs);
   return {
     check_id: 'sync.lp_reports',
@@ -226,7 +227,7 @@ export function lpReportResult({ type, label, cadence = 'daily', state, lastEtDa
       if (warn !== null && minute >= warn) return 'warn';
       return 'pass';
     },
-    summary: `${name}: not ingested ${cadence === 'monthly' ? 'this month' : 'today'} (last ${lastEtDay ?? 'never'})`,
+    summary: `${name}: not arrived ${cadence === 'monthly' ? 'this month' : 'today'} (last one: ${lastEtDay ? dayWords(lastEtDay) : 'never'}).`,
     detail,
     fingerprint: fp,
   };
@@ -241,8 +242,8 @@ export function linkLeakResults({ decision, sample }) {
     active: verdictActive(decision?.verdict),
     value: total,
     summary: decision?.verdict === 'insufficient_evidence'
-      ? `could not tell: ${(sample?.errors || []).join('; ')}`.slice(0, 300)
-      : `${total ?? '?'} recent LP row(s) with a GHL contact but no link (${sample?.windowHours ?? '?'}h window)`,
+      ? `Can't tell right now: ${(sample?.errors || []).join('; ')}`.slice(0, 300)
+      : total ? `${countOf(total, 'new Lead Perfection lead')} from the last day ${total === 1 ? 'has' : 'have'} a GHL contact but ${total === 1 ? "isn't" : "aren't"} linked to it.` : 'Every new Lead Perfection lead from the last day is linked to its GHL contact.',
     detail: { tables: sample?.tables ?? null, offenders: decision?.offenders ?? null, measure: 'unlinked count (the monitor counts, it does not compute a %)' },
     fingerprint: 'sync.lp_ghl_link_pct',
   }];
@@ -250,16 +251,18 @@ export function linkLeakResults({ decision, sample }) {
 
 /* ── lp-stale-lead-refresh → sync.stale_set_leads ───────────────────────── */
 
-export function staleSetLeadsResult({ count, error }) {
+export function staleSetLeadsResult({ count, error, windowDays = 14 }) {
   if (error || !Number.isFinite(count)) {
-    return { check_id: 'sync.stale_set_leads', status: 'unknown', summary: `could not count stale Set leads: ${error || 'no count'}`.slice(0, 300), fingerprint: 'sync.stale_set_leads' };
+    return { check_id: 'sync.stale_set_leads', status: 'unknown', summary: `Can't tell right now: ${error || 'no count'}`.slice(0, 300), fingerprint: 'sync.stale_set_leads' };
   }
   return {
     check_id: 'sync.stale_set_leads',
     active: false,
     value: count,
     eval: {},
-    summary: `${count} Set lead(s) with an appointment over 24h old and no result`,
+    summary: count
+      ? `${countOf(count, 'appointment')} from the last ${windowDays} days ${count === 1 ? 'has' : 'have'} passed with no result entered in Lead Perfection.`
+      : `Every appointment from the last ${windowDays} days has a result in Lead Perfection.`,
     fingerprint: 'sync.stale_set_leads',
   };
 }
@@ -270,7 +273,7 @@ export function configDriftResult({ summary, changes = [] }) {
   const errs = Array.isArray(summary?.errors) ? summary.errors : [];
   const captured = Number(summary?.entities_captured || 0);
   if (!captured || errs.some((e) => e.entity === 'snapshot_upsert' || e.entity === 'supabase')) {
-    return { check_id: 'dialer.config_drift', status: 'unknown', summary: `snapshot did not complete: ${errs.map((e) => e.entity).join(', ') || 'nothing captured'}`, fingerprint: 'dialer.config_drift' };
+    return { check_id: 'dialer.config_drift', status: 'unknown', summary: `Can't tell right now: the Five9 settings copy didn't finish (${errs.map((e) => e.entity).join(', ') || 'nothing captured'}).`, fingerprint: 'dialer.config_drift' };
   }
   const n = Number(summary.changes_detected || 0);
   return {
@@ -281,7 +284,7 @@ export function configDriftResult({ summary, changes = [] }) {
       const p2 = new Set((c.p2_profiles || []).map((s) => String(s).toLowerCase()));
       return changes.some((ch) => p2.has(String(ch.entity_name || '').toLowerCase())) ? 'fail' : 'warn';
     },
-    summary: n ? `${n} Five9 config change(s) since the last snapshot` : 'no Five9 config change',
+    summary: n ? `${countOf(n, 'Five9 setting')} changed since yesterday.` : 'No Five9 settings changed since yesterday.',
     detail: { changes: changes.slice(0, 40).map((ch) => ({ entity_type: ch.entity_type, entity_name: ch.entity_name })), read_errors: errs.length },
     fingerprint: 'dialer.config_drift',
   };
@@ -290,7 +293,7 @@ export function configDriftResult({ summary, changes = [] }) {
 /* ── chat-lead-intake / canvass-lead-backstop ───────────────────────────── */
 
 export function intakeSweepResult(checkId, out, { readFailed }) {
-  if (readFailed) return { check_id: checkId, status: 'unknown', summary: `could not read: ${(out.errors || []).join('; ')}`.slice(0, 300), fingerprint: checkId };
+  if (readFailed) return { check_id: checkId, status: 'unknown', summary: `Can't tell right now: ${(out.errors || []).join('; ')}`.slice(0, 300), fingerprint: checkId };
   const live = out.mode === 'live';
   const bad = live ? Number(out.failed || 0) : Number(out.would_send || 0);
   return {
@@ -300,8 +303,8 @@ export function intakeSweepResult(checkId, out, { readFailed }) {
     // lead.canvass_to_lp: undelivered counts against warn/fail thresholds the same way.
     status: !bad ? 'pass' : live ? 'fail' : 'warn',
     summary: live
-      ? `${out.sent || 0} sent, ${out.failed || 0} failed of ${out.candidates || 0} candidate(s)`
-      : `${out.would_send || 0} lead(s) would be sent to LP (shadow) of ${out.candidates || 0} candidate(s)`,
+      ? (out.failed ? `${countOf(out.failed, 'lead')} failed to reach Lead Perfection (${out.sent || 0} sent).` : out.sent ? `${countOf(out.sent, 'missed lead')} sent to Lead Perfection; none failed.` : 'No leads were missing from Lead Perfection.')
+      : (out.would_send ? `${countOf(out.would_send, 'lead')} would be sent to Lead Perfection once this is switched on.` : 'No leads are missing from Lead Perfection.'),
     detail: { mode: out.mode, candidates: out.candidates, would_send: out.would_send, sent: out.sent, failed: out.failed, skipped: out.skipped },
     fingerprint: checkId,
   };
@@ -311,10 +314,10 @@ export function intakeSweepResult(checkId, out, { readFailed }) {
 
 export function afterAsapResult(out) {
   if (out?.checked === false || out?.readFailed) {
-    return { check_id: 'dialer.connector_after_asap', status: 'unknown', summary: `could not read Five9 events: ${out.reason || ''}`.slice(0, 300), fingerprint: 'dialer.connector_after_asap' };
+    return { check_id: 'dialer.connector_after_asap', status: 'unknown', summary: `Can't tell right now: Five9 calls couldn't be read (${out.reason || 'no reason given'}).`.slice(0, 300), fingerprint: 'dialer.connector_after_asap' };
   }
   if (out?.ok === false && !out?.counts) {
-    return { check_id: 'dialer.connector_after_asap', status: 'unknown', summary: `LP or DNC read failed: ${(out.errors || []).join('; ')}`.slice(0, 300), fingerprint: 'dialer.connector_after_asap' };
+    return { check_id: 'dialer.connector_after_asap', status: 'unknown', summary: `Can't tell right now: ${(out.errors || []).join('; ')}`.slice(0, 300), fingerprint: 'dialer.connector_after_asap' };
   }
   const missed = Number(out?.counts?.would_push || 0) + Number(out?.counts?.pushed || 0) + Number(out?.counts?.push_failed || 0);
   return {
@@ -322,7 +325,7 @@ export function afterAsapResult(out) {
     active: false,
     value: missed,
     eval: {},
-    summary: `${missed} no-contact lead(s) the connector missed this pass (${out?.candidates ?? 0} candidate(s))`,
+    summary: missed ? `${countOf(missed, 'unreached lead')} didn't move to the follow-up list ("After DIAL ASAP") on their own (${out?.candidates ?? 0} checked).` : 'Every unreached lead moved to the follow-up list on its own.',
     detail: { mode: out?.mode, counts: out?.counts || {} },
     fingerprint: 'dialer.connector_after_asap',
   };
@@ -331,14 +334,14 @@ export function afterAsapResult(out) {
 /* ── rule-target-check → ghl.rule_targets ───────────────────────────────── */
 
 export function ruleTargetResult(out) {
-  if (out?.checked === false) return { check_id: 'ghl.rule_targets', status: 'unknown', summary: out.summary || out.reason || 'could not run', fingerprint: 'ghl.rule_targets' };
+  if (out?.checked === false) return { check_id: 'ghl.rule_targets', status: 'unknown', summary: `Can't tell right now: ${out.summary || out.reason || 'the check could not run'}`, fingerprint: 'ghl.rule_targets' };
   const high = Number(out?.high || 0);
   const low = Number(out?.low || 0);
   return {
     check_id: 'ghl.rule_targets',
     value: high,
     status: high ? 'fail' : low ? 'warn' : 'pass',
-    summary: out?.summary || `${high} high, ${low} low`,
+    summary: high ? `${countOf(high, 'automation rule')} sends contacts to a GHL workflow that doesn't exist or is switched off.` : low ? `All automation rules reach a live GHL workflow (${countOf(low, 'minor note')} to tidy up).` : 'All automation rules reach a live GHL workflow.',
     detail: { high_findings: out?.high_findings || [] },
     fingerprint: 'ghl.rule_targets',
   };
@@ -348,13 +351,13 @@ export function ruleTargetResult(out) {
 
 export function replySlaResult(res) {
   if (!res || res.skipped) return null;
-  if (res.error) return { check_id: 'agent.bot_reply_sla', status: 'unknown', summary: `could not read replies: ${res.error}`.slice(0, 300), fingerprint: 'agent.bot_reply_sla' };
+  if (res.error) return { check_id: 'agent.bot_reply_sla', status: 'unknown', summary: `Can't tell right now: ${res.error}`.slice(0, 300), fingerprint: 'agent.bot_reply_sla' };
   const n = Number(res.unanswered || 0);
   return {
     check_id: 'agent.bot_reply_sla',
     value: n,
     status: n ? 'fail' : 'pass',
-    summary: n ? `${n} repl(ies) past ${res.sla_minutes} min with no answer` : `${res.scanned || 0} scanned, none unanswered`,
+    summary: n ? `${countOf(n, 'customer text')} waited more than ${res.sla_minutes} minutes for the chatbot to answer.` : 'The chatbot answered every customer text on time.',
     detail: { flagged: (res.flagged || []).slice(0, 25), counts: { answered: res.answered, in_flight: res.in_flight, unknown: res.unknown } },
     fingerprint: 'agent.bot_reply_sla',
   };
@@ -363,18 +366,18 @@ export function replySlaResult(res) {
 /* ── executor heartbeat → agent.executor_heartbeat / agent.queue_depth / ghl.rate_limiter ── */
 
 export function executorHeartbeatResult(health) {
-  if (!health) return { check_id: 'agent.executor_heartbeat', status: 'unknown', summary: 'executor health unreadable', fingerprint: 'agent.executor_heartbeat' };
-  if (!health.has_pending) return { check_id: 'agent.executor_heartbeat', status: 'pass', value: 0, summary: 'no pending actions', fingerprint: 'agent.executor_heartbeat' };
+  if (!health) return { check_id: 'agent.executor_heartbeat', status: 'unknown', summary: "Can't tell right now.", fingerprint: 'agent.executor_heartbeat' };
+  if (!health.has_pending) return { check_id: 'agent.executor_heartbeat', status: 'pass', value: 0, summary: 'Nothing is waiting to be done.', fingerprint: 'agent.executor_heartbeat' };
   const ageMin = health.age_ms == null ? null : Math.round(health.age_ms / MIN);
-  if (ageMin === null) return { check_id: 'agent.executor_heartbeat', status: 'unknown', summary: 'pending actions, no executor run on record', fingerprint: 'agent.executor_heartbeat' };
-  return { check_id: 'agent.executor_heartbeat', active: false, value: ageMin, eval: { suffix: 'min', strict: true }, summary: `last executor run ${ageMin} min ago with actions pending`, fingerprint: 'agent.executor_heartbeat' };
+  if (ageMin === null) return { check_id: 'agent.executor_heartbeat', status: 'unknown', summary: "Work is waiting and there's no record of the worker running.", fingerprint: 'agent.executor_heartbeat' };
+  return { check_id: 'agent.executor_heartbeat', active: false, value: ageMin, eval: { suffix: 'min', strict: true }, summary: ageMin <= 2 ? 'The automation worker is running.' : `The automation worker last ran ${duration(ageMin)} ago, and work is waiting.`, fingerprint: 'agent.executor_heartbeat' };
 }
 
 export function queueDepthResult(stats) {
   if (!stats || stats.stale) return null;
   const count = Number(stats.pendingCount ?? NaN);
   const ageMin = stats.oldestAgeMs == null ? 0 : Math.round(stats.oldestAgeMs / MIN);
-  if (!Number.isFinite(count)) return { check_id: 'agent.queue_depth', status: 'unknown', summary: 'queue depth unreadable', fingerprint: 'agent.queue_depth' };
+  if (!Number.isFinite(count)) return { check_id: 'agent.queue_depth', status: 'unknown', summary: "Can't tell right now.", fingerprint: 'agent.queue_depth' };
   return {
     check_id: 'agent.queue_depth',
     value: count,
@@ -383,18 +386,18 @@ export function queueDepthResult(stats) {
       if (count > Number(c.warn_count ?? Infinity) || ageMin > Number(c.warn_age_min ?? Infinity)) return 'warn';
       return 'pass';
     },
-    summary: `${count} pending, oldest ${ageMin} min, ${stats.executingCount ?? 0} executing`,
+    summary: count ? `${countOf(count, 'action')} waiting; the oldest has waited ${duration(ageMin)}.` : 'No actions waiting.',
     detail: { pending: count, oldest_age_min: ageMin, executing: stats.executingCount ?? null },
     fingerprint: 'agent.queue_depth',
   };
 }
 
 export function rateLimiterResult({ alert, reasons, error }) {
-  if (error) return { check_id: 'ghl.rate_limiter', status: 'unknown', summary: `limiter stats unreadable: ${error}`.slice(0, 300), fingerprint: 'ghl.rate_limiter' };
+  if (error) return { check_id: 'ghl.rate_limiter', status: 'unknown', summary: `Can't tell right now: ${error}`.slice(0, 300), fingerprint: 'ghl.rate_limiter' };
   return {
     check_id: 'ghl.rate_limiter',
     active: !!alert,
-    summary: alert ? `limiter unhealthy: ${(reasons || []).join('; ')}`.slice(0, 300) : 'limiter healthy',
+    summary: alert ? `We are hitting GHL's request limit: ${(reasons || []).join('; ')}`.slice(0, 300) : "Staying within GHL's request limit.",
     detail: { reasons: reasons || [] },
     fingerprint: 'ghl.rate_limiter',
   };
