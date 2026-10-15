@@ -76,6 +76,7 @@ export const REASON_LABELS = Object.freeze({
   noc_out_of_area: 'NOC — out of area (review)',
   rep_hold_expired: 'Rep hold over, back in play',
   routing_or_automation_failure: 'Never dialled — Five9 has the number',
+  in_inbound_queue: 'In LP inbound queue (not checked out)',
   not_in_five9: 'Not in Five9 at all',
   unverified: 'Not verified — Five9 lookup failed or skipped',
 });
@@ -84,7 +85,7 @@ export const REASON_LABELS = Object.freeze({
 // Groups are ordered by how many FRESH leads they hold (groupedOffenderLines);
 // this only decides between groups with equal counts.
 export const CARD_REASON_ORDER = Object.freeze([
-  'called_no_retry', 'not_on_dial_list', 'on_list_not_dialed', 'routing_or_automation_failure', 'not_in_five9',
+  'called_no_retry', 'not_on_dial_list', 'on_list_not_dialed', 'routing_or_automation_failure', 'in_inbound_queue', 'not_in_five9',
   'not_issued_call_center', 'not_covered_by_rep', 'rep_hold_expired', 'unverified',
 ]);
 

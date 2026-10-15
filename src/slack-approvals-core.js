@@ -271,3 +271,36 @@ export function parseMarketingInvoiceInteraction(rawBody) {
   }
   return null;
 }
+
+
+// ─── System health incident buttons (2026-10-15, System Health 1.6) ─────────
+// incident_ack / incident_snooze (and the incident_open URL button, which Slack
+// still reports as a click). Ours, and NEVER forwarded: the onboarding workflow
+// reads any action_id but deny_member as "approve a team member".
+export const INCIDENT_ACTION_PREFIX = 'incident_';
+
+export function isIncidentAction(rawBody) {
+  const p = payloadOf(rawBody);
+  if (!p || p.type !== 'block_actions') return false;
+  const id = Array.isArray(p.actions) ? String(p.actions[0]?.action_id || '') : '';
+  return id.startsWith(INCIDENT_ACTION_PREFIX);
+}
+
+/** { action: 'ack'|'snooze'|'open', incidentId, userId, userName, responseUrl } or null. */
+export function parseIncidentInteraction(rawBody) {
+  const p = payloadOf(rawBody);
+  const a = Array.isArray(p?.actions) ? p.actions[0] : null;
+  const actionId = String(a?.action_id || '');
+  if (!actionId.startsWith(INCIDENT_ACTION_PREFIX)) return null;
+  const action = actionId.slice(INCIDENT_ACTION_PREFIX.length);
+  if (action === 'open') return { action, incidentId: null, userId: p.user?.id || null };
+  const incidentId = Number(a?.value);
+  if (!['ack', 'snooze'].includes(action) || !Number.isInteger(incidentId) || incidentId <= 0) return null;
+  return {
+    action,
+    incidentId,
+    userId: p.user?.id || null,
+    userName: p.user?.username || p.user?.name || null,
+    responseUrl: p.response_url || null,
+  };
+}

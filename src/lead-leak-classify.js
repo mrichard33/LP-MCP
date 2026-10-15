@@ -130,6 +130,11 @@ export const REASONS = Object.freeze([
   'duplicate',
   'missing_source',
   'dead_status',
+  // 2026-10-15 (System Health 1.9): a lead whose inquiry is still waiting in
+  // LP's inbound queue (checkout_at_lp null) was never checked out, so LP never
+  // pushed it to a dial list. A person's intake bottleneck, not an automation
+  // gap, so it is told apart from not_in_five9 before the Five9 lookup.
+  'in_inbound_queue',
   'not_in_five9',
   'unverified',
   'not_on_dial_list',
@@ -174,6 +179,7 @@ export const LEAK_REASONS = Object.freeze([
   'not_issued_call_center',
   'not_covered_by_rep',
   'rep_hold_expired',
+  'in_inbound_queue',
   'not_in_five9',
   'not_on_dial_list',
   'on_list_not_dialed',
@@ -351,6 +357,10 @@ export function classifyUncalledLead(lead, ctx = {}) {
   if (!String(lead?.lead_source ?? '').trim()) return 'missing_source';
   // No Data line here any more (ruled 2026-09-28) — see DATA_DISPOSITIONS.
   if (DEAD.has(dispo(lead))) return 'dead_status';
+  // ctx.inboundWaiting: { phones: Set, lds: Set } of lp_inbound_queue rows not
+  // yet checked out. Absent (a failed read) classifies as before.
+  if (ctx.inboundWaiting && (ctx.inboundWaiting.phones?.has(phone)
+    || ctx.inboundWaiting.lds?.has(String(lead?.lp_lead_id ?? '')))) return 'in_inbound_queue';
   return null;
 }
 
@@ -605,6 +615,7 @@ export function formatSlackSummary({
     `• Never dialled, Five9 has the number: ${n('routing_or_automation_failure')}`,
     ...(b.not_on_dial_list?.leads ? [`• In Five9 but not on any dialing list: ${n('not_on_dial_list')}`] : []),
     ...(b.on_list_not_dialed?.leads ? [`• On a Five9 list but no call recorded: ${n('on_list_not_dialed')}`] : []),
+    ...(b.in_inbound_queue?.leads ? [`• In LP inbound queue (not checked out): ${n('in_inbound_queue')}`] : []),
     `• Not in Five9 at all: ${n('not_in_five9')}`,
     `• Not checked in Five9 (over the daily lookup cap, or the lookup failed): ${n('unverified')}`,
     ...(summary.data_leaks ? [`   ↳ of these, LP code "Data": ${num(summary.data_leaks)}`

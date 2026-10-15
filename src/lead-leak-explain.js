@@ -89,6 +89,9 @@ const join = (...xs) => xs.filter(Boolean).join(' ');
  */
 export function explainUncalled(reason, f = {}) {
   switch (reason) {
+    // 2026-10-15 (System Health 1.9): told apart from not_in_five9.
+    case 'in_inbound_queue':
+      return join('Still waiting in the LP inbound queue: nobody checked the inquiry out, so LP never sent it to a dial list.', contextClause(f));
     case 'not_in_five9':
       return join('Never loaded into Five9.', lpQueueClause(f), dncHistoryClause(f), contextClause(f));
     // Five9 may count an attempt here (LP 565211: LP_ASAP, 1 attempt) — what is

@@ -57,6 +57,10 @@
 // (src/five9/list-dispatch.js banner); backstopConfig refuses the name.
 
 import { lpStoredToUtcMs } from './lp-dates.js';
+// 2026-10-15 (System Health 1.1): the list routing lives in src/dial-routing-intent.js
+// so the dialer SLA check reads the SAME decision; re-exported here unchanged.
+import { etDateKey, daysBetween, isChatbotLead, routeList, routeNoAppt } from './dial-routing-intent.js';
+export { etDateKey, daysBetween, isChatbotLead, routeList, routeNoAppt };
 import { dialWindowStartMs } from './five9/callback-dial-check.js';
 import { buildCallbackRecord, callbackListName, callbackCallNowMode } from './five9/callback-push.js';
 import { capLines } from './alert-posted.js';
@@ -131,17 +135,6 @@ export function backstopConfig(env = process.env) {
 
 /* --- dates (all Eastern) -------------------------------------------------- */
 
-const ET_DATE = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit' });
-
-/** 'YYYY-MM-DD' of an instant, in Eastern time. */
-export function etDateKey(ms) {
-  return ET_DATE.format(new Date(ms));
-}
-
-/** Whole calendar days between two 'YYYY-MM-DD' strings (b - a). */
-export function daysBetween(a, b) {
-  return Math.round((Date.parse(`${b}T00:00:00Z`) - Date.parse(`${a}T00:00:00Z`)) / 86_400_000);
-}
 
 /** LP's "MM/DD/YYYY" → 'YYYY-MM-DD', or null (blank, garbage, Delphi zero 12/30/1899). */
 export function lpDateToKey(raw) {
@@ -230,12 +223,6 @@ export function rowFromLead(lead = {}) {
   };
 }
 
-/** The Reece ChatBot source (inbound sourcesubdescr, else lp_leads.lead_source_detail). */
-export function isChatbotLead(row, lead = null) {
-  const detail = row.sourceDetail || String(lead?.lead_source_detail ?? '');
-  return detail.trim().toLowerCase() === 'reece chatbot';
-}
-
 /**
  * The lead's CURRENT appointment state: the synced lp_leads row (disposition,
  * appointment) wins over the inbound row, which is frozen at arrival.
@@ -263,40 +250,6 @@ export function currentState(row, lead = null) {
 }
 
 /* --- routing ---------------------------------------------------------------- */
-
-/**
- * { list } or { skip: 'past_appointment' }. Calendar days in Eastern time.
- * With no appointment the list is provisional (`dialAsap: true`): which one
- * depends on the Five9 record's age, known only after the lookup (routeNoAppt).
- */
-export function routeList({ hasAppt, apptDateEt, apptStartMs, nowMs, cfg }) {
-  if (!hasAppt) return { list: cfg.lists.noAppt, why: 'no_appointment', dialAsap: true };
-  // Booked routing live: every booked visit is its job (2026-10-08, above).
-  if (cfg.bookedRoutingLive) return { skip: 'appt_owned_by_booked_routing' };
-  if (!apptDateEt) return { list: cfg.lists.nextDay, why: 'appt_date_unknown' };
-  const daysOut = daysBetween(etDateKey(nowMs), apptDateEt);
-  if (daysOut < 0) return { skip: 'past_appointment' };
-  if (daysOut === 0 && Number.isFinite(apptStartMs) && apptStartMs <= nowMs) return { skip: 'past_appointment' };
-  if (daysOut <= 1) return { list: cfg.lists.nextDay, why: daysOut === 0 ? 'appt_today' : 'appt_tomorrow' };
-  return { list: cfg.lists.secondDay, why: 'appt_2plus_days' };
-}
-
-/**
- * No appointment, no callback request: a DIAL ASAP list while the Five9 record
- * is young enough for that campaign's filter, else "Callback Request".
- * `recordCreatedMs` null with no record = Five9 creates it now (age 0). A
- * record whose create time cannot be read is aged from the lead's arrival —
- * LP's own push makes the record at arrival.
- */
-export function routeNoAppt({ row, lead = null, contact = null, nowMs, cfg }) {
-  const createdMs = Number.isFinite(contact?.createdMs) ? contact.createdMs
-    : (contact ? row.receivedMs : nowMs);
-  const ageH = (nowMs - createdMs) / 3_600_000;
-  if (ageH > cfg.dialAsapMaxAgeH) return { list: cfg.lists.noAppt, why: 'record_too_old_for_dial_asap' };
-  return isChatbotLead(row, lead)
-    ? { list: cfg.lists.chatbot, why: 'dial_asap_chatbot' }
-    : { list: cfg.lists.direct, why: 'dial_asap_direct' };
-}
 
 /** Every list a no-appointment lead can land on — for the "already pushed" check. */
 export const noApptLists = (cfg) => [cfg.lists.chatbot, cfg.lists.direct, cfg.lists.noAppt];

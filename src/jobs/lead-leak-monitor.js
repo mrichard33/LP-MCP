@@ -322,6 +322,34 @@ async function readDupCalledPhones({ runSQL, uncalled, five9 }) {
   return dup;
 }
 
+/**
+ * lp_inbound_queue rows not yet checked out, matched to the uncalled leads by
+ * phone10 or lds_id, in chunks of 500 (one big IN list times out). Throws on a
+ * failed read; the caller then leaves the split off.
+ */
+export async function readInboundWaiting({ runSQL, uncalled }) {
+  const phones = [...new Set(uncalled.map((l) => normalizePhone10(l.phone)).filter(Boolean))];
+  const lds = [...new Set(uncalled.map((l) => String(l.lp_lead_id ?? '')).filter(Boolean))];
+  const out = { phones: new Set(), lds: new Set() };
+  for (let i = 0; i < Math.max(phones.length, lds.length); i += 500) {
+    const ph = phones.slice(i, i + 500);
+    const ld = lds.slice(i, i + 500);
+    const where = [
+      ph.length ? `phone10 IN (${sqlList(ph)})` : null,
+      ld.length ? `lds_id IN (${sqlList(ld)})` : null,
+    ].filter(Boolean).join(' OR ');
+    if (!where) continue;
+    const rows = asRows(await runSQL(
+      `SELECT phone10, lds_id FROM lp_inbound_queue WHERE checkout_at_lp IS NULL AND (${where})`,
+    ), 'inbound queue');
+    for (const r of rows) {
+      if (r.phone10) out.phones.add(String(r.phone10));
+      if (r.lds_id) out.lds.add(String(r.lds_id));
+    }
+  }
+  return out;
+}
+
 /** Five9 DNC membership, in five9_check_dnc-sized batches. Throws if any batch fails. */
 async function readFive9Dnc({ checkDnc, phones }) {
   const onDnc = new Set();
@@ -408,7 +436,7 @@ const defaultFindLeadInDataQueues = async (ids) => {
   return findLeadInDataQueues(ids);
 };
 
-async function readRates({ runSQL, nowMs }) {
+export async function readRates({ runSQL, nowMs }) {
   return buildRates(asRows(await runSQL(`
     SELECT coalesce(nullif(trim(lead_source), ''), '(none)') AS source,
            count(*) AS leads,
@@ -426,7 +454,7 @@ async function readRates({ runSQL, nowMs }) {
  * matched on lead_id = the LP lead id, else the newest record) | 'present' when
  * Five9 counted a record we could not parse.
  */
-async function lookupFive9Contact(getContactRecords, phone, lpLeadId) {
+export async function lookupFive9Contact(getContactRecords, phone, lpLeadId) {
   try {
     const res = await getContactRecords({ criteria: [{ field: 'number1', value: phone }] });
     if (!(Number(res?.count) > 0)) return 'absent';
@@ -622,7 +650,17 @@ export async function measureLeadLeak({ env = process.env, nowMs = Date.now(), d
     serviceAreaZips = new Set();
   }
 
-  const ctx = { nowMs, five9Dnc, dupCalledPhones, serviceAreaZips };
+  // 2026-10-15 (System Health 1.9): inquiries still waiting in LP's inbound
+  // queue, for the in_inbound_queue reason. A failed read leaves it null and
+  // those leads classify exactly as before (not_in_five9 or the lookup's answer).
+  let inboundWaiting = null;
+  try {
+    inboundWaiting = await readInboundWaiting({ runSQL, uncalled });
+  } catch (err) {
+    errors.push(`inbound queue: ${err.message} (in_inbound_queue not split out)`);
+  }
+
+  const ctx = { nowMs, five9Dnc, dupCalledPhones, serviceAreaZips, inboundWaiting };
   let lookups = 0;
   let lookupErrors = 0;
   let consecutiveErrors = 0;

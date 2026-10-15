@@ -308,6 +308,7 @@ import { startLpCsvOrphanReaper } from './jobs/lp-csv-orphan-reaper.js';
 import { registerScorecardValidateRoutes, startScorecardValidateScheduler } from './jobs/scorecard-validate.js';
 // 2026-08-06 Phase E — daily Five9 config snapshot + change log (ships dark)
 import { registerFive9SnapshotRoutes, startFive9ConfigSnapshotScheduler } from './jobs/five9-config-snapshot.js';
+import { registerOpsRoutes } from './routes/ops.js';  // 2026-10-15 System Health 1.6
 import { registerFreshnessRefreshRoutes, startFreshnessRefreshScheduler } from './jobs/freshness-refresh.js';
 // 2026-09-18 — daily watch on the LP↔GHL link write path. The leak this
 // catches has been closed twice before and reopened unnoticed both times.
@@ -315,7 +316,11 @@ import { registerLinkLeakRoutes, startLinkLeakScheduler } from './jobs/link-leak
 import { registerP2UnresolvableRoutes, startP2UnresolvableScheduler } from './jobs/p2-unresolvable-monitor.js';
 import { registerTagHygieneRoutes, startTagHygieneScheduler } from './jobs/tag-hygiene-sweep.js';  // 2026-09-22
 import { startRuleTargetCheckScheduler } from './jobs/rule-target-check.js';
-import { startHealthChecksScheduler } from './jobs/health-checks.js';  // 2026-10-15 System Health Phase 0  // 2026-10-12 F-L: rules must target published workflows
+import { startHealthChecksScheduler } from './jobs/health-checks.js';  // 2026-10-15 System Health Phase 0
+import { startDialerSlaScheduler } from './health/dialer-sla.js';  // 2026-10-15 System Health 1.1
+import { startAppointmentPipelineScheduler } from './health/appointment-pipeline.js';  // 2026-10-15 System Health 1.8
+import { startIncidentNotifierScheduler } from './jobs/incident-notifier.js';  // 2026-10-15 System Health 1.3
+import { startHealthRetentionScheduler } from './jobs/health-retention.js';  // 2026-10-15 System Health 1.7  // 2026-10-12 F-L: rules must target published workflows
 import { registerCleanup20261002Routes } from './admin/cleanup-2026-10-02-f0-s52.js';  // 2026-10-02 — one-time F.0 / S5.2 cleanup
 import { startSiteEventsRetentionScheduler } from './jobs/site-events-retention.js';  // 2026-10-01
 import { startF0IntegrityAuditScheduler } from './jobs/f0-integrity-audit.js';  // 2026-09-30
@@ -915,6 +920,7 @@ registerLpReportReconRoutes(app);
 registerSourceReconcileRoutes(app);
 registerScorecardValidateRoutes(app);
 registerFive9SnapshotRoutes(app, authenticate);
+registerOpsRoutes(app, authenticate);  // 2026-10-15 System Health: incident ack/snooze/close/run + check runs
 registerFreshnessRefreshRoutes(app);
 registerLinkLeakRoutes(app);
 registerLeadLeakRoutes(app);
@@ -988,6 +994,10 @@ const server = app.listen(PORT, async () => {
   startTagHygieneScheduler();
   startRuleTargetCheckScheduler();
   startHealthChecksScheduler();  // 2026-10-15 System Health: health_results every 5 min (HEALTH_CHECKS_MODE)
+  startDialerSlaScheduler();  // DIALER_SLA_MODE (shadow): dialer SLA checks every 15 min
+  startAppointmentPipelineScheduler();  // APPT_PIPELINE_MODE (shadow): tomorrow's schedule, ET time gates
+  startIncidentNotifierScheduler();  // INCIDENT_NOTIFIER_MODE (shadow): one card per incident; nothing sent in shadow
+  startHealthRetentionScheduler();  // HEALTH_RETENTION_MODE (dry_run): daily 03:30 ET
   startSiteEventsRetentionScheduler();
   startF0IntegrityAuditScheduler();
   startOpsMorningDigestScheduler();
