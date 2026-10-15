@@ -23,7 +23,7 @@ const status = (e) => resolveStatus(e, REGISTRY.get(e.check_id));
 const at2015 = (day) => Date.parse(`${day}T00:15:00Z`) + 24 * 3600e3;
 
 const EVENINGS = [
-  ['2026-10-08', 0, 'pass'], ['2026-10-09', 1, 'warn'], ['2026-10-10', 0, 'pass'], ['2026-10-11', 4, 'fail'],
+  ['2026-10-08', 0, 'pass'], ['2026-10-09', 1, 'warn'], ['2026-10-10', 0, 'pass'], ['2026-10-11', 4, 'warn'],
   ['2026-10-12', 2, 'warn'], ['2026-10-13', 0, 'pass'], ['2026-10-14', 1, 'warn'],
 ];
 const lead = (i) => ({ lp_lead_id: String(583000 + i), first_name: 'Pat', last_name: 'Q', phone: '3525550188', lead_source: 'Internet', lp_branch_id: 'ORL', appt_wall: '2026-10-15 10:00', rep_name: 'Snowden, Starr' });
@@ -63,6 +63,24 @@ test('20:45 un-issued is fail even for one', async () => {
   const e = out.health.find((h) => h.detail?.checked_at_et === '20:45');
   assert.ok(e, '20:45 slot fired');
   assert.equal(status(e), 'fail');
+});
+
+test('at 8 AM each evening check writes one grey "Not due yet", so last night is not red all day', async () => {
+  resetAppointmentPipelineState();
+  const evening = ['appt.issue_by_2000', 'appt.unassigned_next_day', 'appt.set_not_confirmed', 'appt.capacity_over'];
+  const at805 = Date.parse('2026-10-15T12:05:00Z'); // 8:05 AM EDT
+  let reads = 0;
+  const run = (nowMs) => runAppointmentPipelineCheck({ env: {}, nowMs, only: evening, deps: { registry: REGISTRY, supabase: null, runSQL: async () => { reads += 1; return [lead(1)]; } } });
+  const out = await run(at805);
+  assert.deepEqual(out.health.map((h) => h.check_id).sort(), [...evening].sort());
+  for (const h of out.health) {
+    assert.equal(h.status, 'skipped');
+    assert.match(h.summary, /^Not due yet: next check at \d/);
+    assert.doesNotMatch(h.summary, /\b(19|20):\d\d\b/);
+  }
+  assert.equal(reads, 0, 'judges nothing');
+  assert.equal((await run(at805 + 15 * 60e3)).health.length, 0, 'once a morning');
+  assert.equal((await run(Date.parse('2026-10-15T16:00:00Z'))).health.length, 0, 'nothing at midday');
 });
 
 test('rep acknowledgement reads unknown with the Gaps #14 reason', async () => {

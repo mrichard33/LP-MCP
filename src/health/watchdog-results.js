@@ -62,16 +62,25 @@ export function uncalledLiveResults({ decision, offenders, nowMs, errors = [] })
     return [{ check_id: 'lead.uncalled_live', status: 'unknown', summary: `Can't tell right now: ${errors.join('; ') || 'the lead or Five9 read failed'}`.slice(0, 300), fingerprint: 'lead.uncalled_live' }];
   }
   const lines = (offenders || []).map((o) => leadLine(o, nowMs)).sort((a, b) => (b.waiting_min ?? 0) - (a.waiting_min ?? 0));
-  const max = lines.length ? (lines[0].waiting_min ?? 0) : 0;
+  // 2026-10-15: "6 leads are waiting for a first call" when 4 of the 6 had been
+  // called once and were waiting on a SECOND call. Only never-called leads
+  // count toward red; a missing follow-up call is yellow, said as what it is.
+  const never = lines.filter((l) => l.reason !== 'called_no_retry');
+  const retry = lines.filter((l) => l.reason === 'called_no_retry');
+  const max = never.length ? (never[0].waiting_min ?? 0) : 0;
   const atRisk = lines.reduce((s, l) => s + (l.est_value || 0), 0);
+  const parts = [];
+  if (never.length) parts.push(`${countOf(never.length, 'lead')} ${never.length === 1 ? 'has' : 'have'} not had a first call yet; the longest has waited ${duration(max)}.`);
+  if (retry.length) parts.push(`${countOf(retry.length, 'lead')} ${retry.length === 1 ? 'was' : 'were'} called once and ${retry.length === 1 ? 'is' : 'are'} waiting on a second call (the longest for ${duration(retry[0].waiting_min ?? 0)}).`);
   return [{
     check_id: 'lead.uncalled_live',
     value: max,
-    rule: (_v, config) => uncalledLiveRule(max, config, lines),
-    summary: lines.length
-      ? `${countOf(lines.length, 'lead')} ${lines.length === 1 ? 'is' : 'are'} waiting for a first call; the longest has waited ${duration(max)}.`
-      : 'Every lead that should have been called has been called.',
-    detail: { waiting: lines.length, est_value_at_risk: atRisk, leads: lines },
+    rule: (_v, config) => {
+      const verdict = uncalledLiveRule(max, config, never);
+      return verdict === 'pass' && retry.length ? 'warn' : verdict;
+    },
+    summary: parts.length ? parts.join(' ') : 'Every lead that should have been called has been called.',
+    detail: { waiting: never.length, waiting_second_call: retry.length, est_value_at_risk: atRisk, leads: lines },
     fingerprint: 'lead.uncalled_live',
   }];
 }
@@ -90,9 +99,35 @@ function reasonCount(summary, reasons) {
 }
 
 function reasonLeads(rows, reasons, nowMs) {
-  return (rows || []).filter((r) => reasons.includes(r.reason)).map((r) => leadLine({
-    ...(r.detail || {}), lp_lead_id: r.lp_lead_id, lead_source: r.lead_source, reason: r.reason, est_value: r.est_value,
-  }, nowMs));
+  return (rows || []).filter((r) => reasons.includes(r.reason)).map((r) => {
+    const createdMs = Date.parse(r.detail?.created_utc || '');
+    return {
+      ...leadLine({ ...(r.detail || {}), lp_lead_id: r.lp_lead_id, lead_source: r.lead_source, reason: r.reason, est_value: r.est_value }, nowMs),
+      created_ms: Number.isFinite(createdMs) ? createdMs : null,
+    };
+  });
+}
+
+/**
+ * 2026-10-15 (the user): "Leads that never reached Five9" was Urgent every
+ * morning for the same 13 leads from Aug 22 to Sep 17. Mark's rule is "post
+ * only what is new", so a lead from the last NEW_LEAK_DAYS days decides the
+ * color; older open ones stay listed, yellow, as a cleanup for a person.
+ */
+export const NEW_LEAK_DAYS = 2;
+export function splitNewOld(lines, nowMs) {
+  const cut = nowMs - NEW_LEAK_DAYS * 24 * 3600e3;
+  const isNew = (l) => l.created_ms == null || l.created_ms >= cut;
+  return { fresh: lines.filter(isNew), old: lines.filter((l) => !isNew(l)) };
+}
+
+function dayRange(lines) {
+  const days = lines.map((l) => l.created_ms).filter(Number.isFinite).sort((a, b) => a - b);
+  if (!days.length) return '';
+  const fmt = (ms) => new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', month: 'short', day: 'numeric' }).format(new Date(ms));
+  const a = fmt(days[0]);
+  const b = fmt(days[days.length - 1]);
+  return a === b ? ` (${a})` : ` (${a} to ${b})`;
 }
 
 /**
@@ -108,17 +143,29 @@ export function leadLeakResults({ m, nowMs, retiredDecision, speedRow = null, in
   }
   const out = [];
   const add = (checkId, reasons, label) => {
-    const { leads, value } = reasonCount(m.summary, reasons);
+    const lines = reasonLeads(m.rows, reasons, nowMs);
+    const { leads: total, value: totalValue } = reasonCount(m.summary, reasons);
+    const { fresh, old } = splitNewOld(lines, nowMs);
+    const sum = (list) => list.reduce((s, l) => s + (l.est_value || 0), 0);
+    // Leads counted in the summary with no row to date them count as new.
+    const undated = Math.max(0, total - lines.length);
+    const undatedValue = Math.max(0, totalValue - sum(lines));
+    const leads = fresh.length + undated;
+    const value = Math.round(sum(fresh) + undatedValue);
+    const oldValue = Math.round(sum(old));
+    const parts = [];
+    if (leads) parts.push(`${countOf(leads, old.length ? 'new lead' : 'lead')} ${label} (worth about ${money(value)}).`);
+    if (old.length) parts.push(`${countOf(old.length, 'older lead')}${dayRange(old)} ${label} and ${old.length === 1 ? 'is' : 'are'} still open (worth about ${money(oldValue)}): someone should call or close ${old.length === 1 ? 'it' : 'them'}.`);
     out.push({
       check_id: checkId,
       value: leads,
       rule: (_v, c) => {
         if (leads >= Number(c.fail_leads ?? Infinity) || (c.fail_value != null && value > Number(c.fail_value))) return 'fail';
-        if (leads >= Number(c.warn_leads ?? Infinity)) return 'warn';
+        if (leads >= Number(c.warn_leads ?? Infinity) || old.length) return 'warn';
         return 'pass';
       },
-      summary: leads ? `${countOf(leads, 'lead')} ${label} (worth about ${money(value)}).` : `No leads ${label}.`,
-      detail: { leads_count: leads, est_value_at_risk: value, leads: reasonLeads(m.rows, reasons, nowMs) },
+      summary: parts.length ? parts.join(' ') : `No leads ${label}.`,
+      detail: { leads_count: leads, est_value_at_risk: value, older_count: old.length, older_value: oldValue, leads: [...fresh, ...old].map(({ created_ms, ...l }) => ({ ...l, created: created_ms ? new Date(created_ms).toISOString() : null, older: !!(created_ms && old.some((o) => o.lp_lead_id === l.lp_lead_id)) })) },
       fingerprint: checkId,
     });
   };
