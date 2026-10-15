@@ -15,6 +15,7 @@
 // Kill switch: LP_REPORT_WATCHDOG_DISABLED (any value).
 
 import supabase from '../supabase.js';
+import { lpReportResult } from '../health/watchdog-results.js';
 import { todayET, hourET } from './lp-report-common.js';
 import { reportAlertCondition, sendAlertMessage } from '../alert-state.js';
 import { runJob } from '../job-runner.js';
@@ -168,6 +169,10 @@ export async function checkLpReportFreshness({ alert = true } = {}) {
   // Any read that failed this sweep. Guards the blind-spot key from clearing
   // on an `unarmed` list we could not actually verify.
   let readFailed = false;
+  // 2026-10-15 (System Health Phase 0): one sync.lp_reports result per watched
+  // report, written by runJob. What this sweep posts is unchanged.
+  const health = [];
+  const nowMs = Date.now();
 
   for (const { type, label, schedule, cadence = 'daily' } of WATCHED) {
     // Armed only after the first scheduled (n8n-sourced) success — see header.
@@ -188,6 +193,7 @@ export async function checkLpReportFreshness({ alert = true } = {}) {
     if (armErr) {
       console.error('[LPReportWatchdog] arm check failed:', armErr.message);
       readFailed = true;
+      health.push(lpReportResult({ type, label, cadence, state: 'read_failed', nowMs }));
       continue;
     }
 
@@ -197,6 +203,7 @@ export async function checkLpReportFreshness({ alert = true } = {}) {
     } catch (err) {
       console.error('[LPReportWatchdog]', err.message);
       readFailed = true;
+      health.push(lpReportResult({ type, label, cadence, state: 'read_failed', nowMs }));
       continue;
     }
 
@@ -205,12 +212,16 @@ export async function checkLpReportFreshness({ alert = true } = {}) {
       // never been scheduled stays quiet, which is why arming exists at all.
       if (lastEtDay && lastEtDay >= activeSince) {
         unarmed.push({ type, label, last_ingested_et: lastEtDay });
+        health.push(lpReportResult({ type, label, cadence, state: 'unarmed', lastEtDay, nowMs }));
+      } else {
+        health.push(lpReportResult({ type, label, cadence, state: 'never_scheduled', lastEtDay, nowMs }));
       }
       continue;
     }
 
     const isLate = isMissing({ cadence, lastEtDay, today });
     if (isLate) missing.push({ type, label, last_ingested_et: lastEtDay });
+    health.push(lpReportResult({ type, label, cadence, state: isLate ? 'missing' : 'ok', lastEtDay, nowMs }));
 
     // Every read failure above `continue`s before this point, so reaching here
     // is always a real observation — safe to open the condition or to clear it.
@@ -260,7 +271,7 @@ export async function checkLpReportFreshness({ alert = true } = {}) {
     });
   }
 
-  return { checked: true, today, missing, unarmed };
+  return { checked: true, today, missing, unarmed, health };
 }
 
 /**

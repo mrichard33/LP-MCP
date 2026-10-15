@@ -1,0 +1,1825 @@
+{
+  "exported_at": "2026-10-15T02:23:37.961Z",
+  "count": 73,
+  "checks": [
+    {
+      "check_id": "agent.action_failures",
+      "family": "agent",
+      "system": "ai_agents",
+      "label": "Agent actions failing",
+      "question": "Are actions failing after retries?",
+      "severity": "P2",
+      "cadence": "every 15 min",
+      "active_window": null,
+      "stale_after_min": 35,
+      "warn_rule": ">= 5 in 1h",
+      "fail_rule": ">= 20, or any five9_* / create_lp_lead failure",
+      "config": {
+        "fail": 20,
+        "warn": 5,
+        "fail_any_types": [
+          "five9_add_records_to_list",
+          "five9_delete_record_from_list",
+          "create_lp_lead"
+        ]
+      },
+      "mode": "shadow",
+      "owner_job_id": "health-checks",
+      "runbook": null,
+      "business_impact": "A failed Five9 push is a lead not dialed",
+      "enabled": true
+    },
+    {
+      "check_id": "agent.approval_backlog",
+      "family": "agent",
+      "system": "ai_agents",
+      "label": "Approvals waiting",
+      "question": "Is a human approval waiting too long?",
+      "severity": "P3",
+      "cadence": "hourly",
+      "active_window": null,
+      "stale_after_min": 130,
+      "warn_rule": "> 4h in business hours",
+      "fail_rule": "> 24h",
+      "config": {
+        "fail_h": 24,
+        "source": "agent_approval_queue",
+        "warn_h": 4
+      },
+      "mode": "shadow",
+      "owner_job_id": "health-checks",
+      "runbook": null,
+      "business_impact": "Proposed fixes stall",
+      "enabled": true
+    },
+    {
+      "check_id": "agent.bot_reply_sla",
+      "family": "agent",
+      "system": "ai_agents",
+      "label": "Chatbot reply SLA",
+      "question": "Is the chatbot answering inside SLA?",
+      "severity": "P2",
+      "cadence": "existing",
+      "active_window": null,
+      "stale_after_min": 35,
+      "warn_rule": "existing",
+      "fail_rule": "existing",
+      "config": {
+        "source": "reply-sla-watchdog"
+      },
+      "mode": "shadow",
+      "owner_job_id": "health-checks",
+      "runbook": null,
+      "business_impact": "Leads waiting on the bot",
+      "enabled": true
+    },
+    {
+      "check_id": "agent.executor_heartbeat",
+      "family": "agent",
+      "system": "ai_agents",
+      "label": "Executor heartbeat",
+      "question": "Are the decision engine and executor alive?",
+      "severity": "P1",
+      "cadence": "every min",
+      "active_window": null,
+      "stale_after_min": 5,
+      "warn_rule": "> 3 min",
+      "fail_rule": "> 6 min",
+      "config": {
+        "source": "/n8n/decision-engine/heartbeat-status",
+        "fail_min": 6,
+        "warn_min": 3
+      },
+      "mode": "shadow",
+      "owner_job_id": "health-checks",
+      "runbook": null,
+      "business_impact": "No agent action executes",
+      "enabled": true
+    },
+    {
+      "check_id": "agent.guardrail_blocks",
+      "family": "agent",
+      "system": "ai_agents",
+      "label": "Guardrail blocks spiking",
+      "question": "Are guardrail/validation blocks far above normal?",
+      "severity": "P2",
+      "cadence": "hourly",
+      "active_window": null,
+      "stale_after_min": 130,
+      "warn_rule": "> 2x trailing 7-day hourly median",
+      "fail_rule": "> 5x",
+      "config": {
+        "fail_x": 5,
+        "source": "guardrail_decisions, validation_log",
+        "warn_x": 2
+      },
+      "mode": "shadow",
+      "owner_job_id": "health-checks",
+      "runbook": null,
+      "business_impact": "An agent is misbehaving or being attacked",
+      "enabled": true
+    },
+    {
+      "check_id": "agent.llm_cost",
+      "family": "agent",
+      "system": "ai_agents",
+      "label": "Daily AI spend",
+      "question": "Is daily LLM spend inside budget?",
+      "severity": "P3",
+      "cadence": "hourly",
+      "active_window": null,
+      "stale_after_min": 130,
+      "warn_rule": "> 80% of LLM_DAILY_BUDGET_USD",
+      "fail_rule": "> 100%",
+      "config": {
+        "source": "v_llm_usage_daily",
+        "fail_pct": 100,
+        "warn_pct": 80
+      },
+      "mode": "shadow",
+      "owner_job_id": "health-checks",
+      "runbook": null,
+      "business_impact": "Runaway loop",
+      "enabled": true
+    },
+    {
+      "check_id": "agent.queue_depth",
+      "family": "agent",
+      "system": "ai_agents",
+      "label": "Pending actions aging",
+      "question": "Are pending agent_actions aging or piling up?",
+      "severity": "P2",
+      "cadence": "every 5 min",
+      "active_window": null,
+      "stale_after_min": 12,
+      "warn_rule": "> 15 min / > 50 pending",
+      "fail_rule": "> 45 min / > 200 pending",
+      "config": {
+        "fail_count": 200,
+        "warn_count": 50,
+        "fail_age_min": 45,
+        "warn_age_min": 15
+      },
+      "mode": "shadow",
+      "owner_job_id": "health-checks",
+      "runbook": null,
+      "business_impact": "Routing decisions arrive late",
+      "enabled": true
+    },
+    {
+      "check_id": "appt.capacity_over",
+      "family": "appointment",
+      "system": "lead_perfection",
+      "label": "Appointments vs rep availability",
+      "question": "Do next-day appointments exceed rep availability per market and block?",
+      "severity": "P2",
+      "cadence": "19:30 ET",
+      "active_window": null,
+      "stale_after_min": 1500,
+      "warn_rule": "Over >= 1",
+      "fail_rule": "Over >= 3 in one market",
+      "config": {
+        "fail": 3,
+        "warn": 1,
+        "source": "lp_capacity_slots"
+      },
+      "mode": "shadow",
+      "owner_job_id": "appointment-pipeline-check",
+      "runbook": null,
+      "business_impact": "Overbooked = NIS",
+      "enabled": true
+    },
+    {
+      "check_id": "appt.conf_attempt_coverage",
+      "family": "appointment",
+      "system": "five9",
+      "label": "Confirmation dial coverage",
+      "question": "Did every Set/Verif appointment for tomorrow get at least one Conf-campaign dial today?",
+      "severity": "P2",
+      "cadence": "hourly 10-19 ET",
+      "active_window": "10:00-19:00 ET",
+      "stale_after_min": 130,
+      "warn_rule": "any uncalled at 17:00",
+      "fail_rule": "any uncalled at 19:00",
+      "config": {
+        "fail_at_et": "19:00",
+        "warn_at_et": "17:00",
+        "conf_campaigns": [
+          "Conf - Next Day",
+          "Conf - 2nd Day"
+        ]
+      },
+      "mode": "shadow",
+      "owner_job_id": "appointment-pipeline-check",
+      "runbook": null,
+      "business_impact": "Replaces the manual CNF Summary Sheet tally",
+      "enabled": true
+    },
+    {
+      "check_id": "appt.duplicate_prospects",
+      "family": "appointment",
+      "system": "lead_perfection",
+      "label": "Duplicate prospects merged",
+      "question": "Are duplicate prospects splitting leads?",
+      "severity": "P3",
+      "cadence": "daily",
+      "active_window": null,
+      "stale_after_min": 1500,
+      "warn_rule": ">= 5 open",
+      "fail_rule": ">= 20",
+      "config": {
+        "fail": 20,
+        "warn": 5,
+        "source": "v_appt_prospect_dupes"
+      },
+      "mode": "shadow",
+      "owner_job_id": "appointment-pipeline-check",
+      "runbook": null,
+      "business_impact": "Split history, double dialing",
+      "enabled": true
+    },
+    {
+      "check_id": "appt.inbound_queue_age",
+      "family": "appointment",
+      "system": "lead_perfection",
+      "label": "LP inbound queue age",
+      "question": "Is the oldest unchecked-out inbound lead waiting too long?",
+      "severity": "P1",
+      "cadence": "every 5 min",
+      "active_window": "08:00-20:00 ET",
+      "stale_after_min": 12,
+      "warn_rule": "oldest > 20 min or > 10 waiting",
+      "fail_rule": "oldest > 45 min or > 25 waiting",
+      "config": {
+        "source": "lp_inbound_queue",
+        "fail_count": 25,
+        "warn_count": 10,
+        "fail_age_min": 45,
+        "warn_age_min": 20
+      },
+      "mode": "shadow",
+      "owner_job_id": "appointment-pipeline-check",
+      "runbook": null,
+      "business_impact": "A lead in the queue is on no dial list",
+      "enabled": true
+    },
+    {
+      "check_id": "appt.invalid_time_or_block",
+      "family": "appointment",
+      "system": "lead_perfection",
+      "label": "Appointment time rules",
+      "question": "Does any appointment violate the time blocks or a market's sales-meeting morning?",
+      "severity": "P3",
+      "cadence": "hourly",
+      "active_window": null,
+      "stale_after_min": 130,
+      "warn_rule": "any violation",
+      "fail_rule": "any violation set by the chatbot or an automation (P2)",
+      "config": {
+        "blocks": {
+          "evening": [
+            17,
+            18,
+            19
+          ],
+          "morning": [
+            9,
+            10,
+            11
+          ],
+          "afternoon": [
+            13,
+            14,
+            15
+          ]
+        },
+        "no_morning": {
+          "Mon": [
+            "SAR"
+          ],
+          "Thu": [
+            "ORL",
+            "LAKE",
+            "JAX",
+            "BOCA",
+            "FTLAU"
+          ],
+          "Tue": [
+            "FTMYR",
+            "JAX"
+          ],
+          "Wed": [
+            "STPET"
+          ]
+        },
+        "never_hours": [
+          12,
+          16
+        ],
+        "confirm_with_dispatch": true
+      },
+      "mode": "shadow",
+      "owner_job_id": "appointment-pipeline-check",
+      "runbook": null,
+      "business_impact": "Bot-booked appointments nobody can run",
+      "enabled": true
+    },
+    {
+      "check_id": "appt.issue_by_2000",
+      "family": "appointment",
+      "system": "lead_perfection",
+      "label": "Next-day CNF appointments issued by 20:15",
+      "question": "Is every next-day confirmed appointment in Issued status (reps cannot see it otherwise)?",
+      "severity": "P1",
+      "cadence": "20:15 and 20:45 ET",
+      "active_window": null,
+      "stale_after_min": 1500,
+      "warn_rule": "any un-issued at 20:15",
+      "fail_rule": "any un-issued at 20:45, or >= 3 at 20:15",
+      "config": {
+        "check_times_et": [
+          "20:15",
+          "20:45"
+        ],
+        "fail_count_first": 3
+      },
+      "mode": "shadow",
+      "owner_job_id": "appointment-pipeline-check",
+      "runbook": null,
+      "business_impact": "Rep never sees tomorrow's appointment",
+      "enabled": true
+    },
+    {
+      "check_id": "appt.issued_no_result",
+      "family": "appointment",
+      "system": "lead_perfection",
+      "label": "Issued appointments get a result",
+      "question": "Are issued appointments left without a disposition?",
+      "severity": "P2",
+      "cadence": "daily 09:00 ET",
+      "active_window": null,
+      "stale_after_min": 1500,
+      "warn_rule": ">= 5",
+      "fail_rule": ">= 15, or any > 72h",
+      "config": {
+        "fail": 15,
+        "warn": 5,
+        "fail_age_h": 72
+      },
+      "mode": "shadow",
+      "owner_job_id": "appointment-pipeline-check",
+      "runbook": null,
+      "business_impact": "Unknown outcomes distort set/sit/close reporting",
+      "enabled": true
+    },
+    {
+      "check_id": "appt.rep_not_acknowledged",
+      "family": "appointment",
+      "system": "lead_perfection",
+      "label": "Reps acknowledged today's appointments",
+      "question": "Has every rep viewed/acknowledged today's issued appointments?",
+      "severity": "P2",
+      "cadence": "07:30 and 08:30 ET",
+      "active_window": null,
+      "stale_after_min": 1500,
+      "warn_rule": "any unviewed at 07:30",
+      "fail_rule": "any unviewed at 08:30",
+      "config": {
+        "needs": "Presentation status field (Gaps #14)"
+      },
+      "mode": "shadow",
+      "owner_job_id": "appointment-pipeline-check",
+      "runbook": null,
+      "business_impact": "Unviewed appointment = NoHome risk",
+      "enabled": true
+    },
+    {
+      "check_id": "appt.required_fields",
+      "family": "appointment",
+      "system": "lead_perfection",
+      "label": "Set appointments carry required fields",
+      "question": "Do set appointments have Products/Qty and Rank/Appt Type?",
+      "severity": "P3",
+      "cadence": "daily",
+      "active_window": null,
+      "stale_after_min": 1500,
+      "warn_rule": ">= 5/day",
+      "fail_rule": ">= 15/day",
+      "config": {
+        "fail": 15,
+        "warn": 5,
+        "needs": "field names (Gaps #14)"
+      },
+      "mode": "shadow",
+      "owner_job_id": "appointment-pipeline-check",
+      "runbook": null,
+      "business_impact": "Dispatch cannot route blind",
+      "enabled": true
+    },
+    {
+      "check_id": "appt.reschedule_on_issued_lead",
+      "family": "appointment",
+      "system": "lead_perfection",
+      "label": "No reschedule inside an issued lead",
+      "question": "Was an appointment rescheduled inside a lead already Issued/Run?",
+      "severity": "P3",
+      "cadence": "daily",
+      "active_window": null,
+      "stale_after_min": 1500,
+      "warn_rule": ">= 1/day",
+      "fail_rule": ">= 3/day",
+      "config": {
+        "fail": 3,
+        "warn": 1
+      },
+      "mode": "shadow",
+      "owner_job_id": "appointment-pipeline-check",
+      "runbook": null,
+      "business_impact": "Breaks source/sub-source mirroring and rep stats",
+      "enabled": true
+    },
+    {
+      "check_id": "appt.set_not_confirmed",
+      "family": "appointment",
+      "system": "lead_perfection",
+      "label": "Tomorrow's appointments confirmed",
+      "question": "What share of tomorrow's appointments is still Set after the 7 PM summary?",
+      "severity": "P2",
+      "cadence": "19:15 ET",
+      "active_window": null,
+      "stale_after_min": 1500,
+      "warn_rule": "> 15% still Set",
+      "fail_rule": "> 30%, or any Set with no Conf dial today",
+      "config": {
+        "fail_pct": 30,
+        "warn_pct": 15
+      },
+      "mode": "shadow",
+      "owner_job_id": "appointment-pipeline-check",
+      "runbook": null,
+      "business_impact": "Unconfirmed appointments no-show",
+      "enabled": true
+    },
+    {
+      "check_id": "appt.unassigned_next_day",
+      "family": "appointment",
+      "system": "lead_perfection",
+      "label": "Next-day CNF appointments have a rep",
+      "question": "Does every next-day confirmed appointment have a sales rep?",
+      "severity": "P1",
+      "cadence": "19:30 and 20:15 ET",
+      "active_window": null,
+      "stale_after_min": 1500,
+      "warn_rule": "any unassigned at 19:30",
+      "fail_rule": "any unassigned at 20:15",
+      "config": {
+        "check_times_et": [
+          "19:30",
+          "20:15"
+        ]
+      },
+      "mode": "shadow",
+      "owner_job_id": "appointment-pipeline-check",
+      "runbook": null,
+      "business_impact": "Unrouted appointment = NIS",
+      "enabled": true
+    },
+    {
+      "check_id": "dialer.campaign_running",
+      "family": "dialer",
+      "system": "five9",
+      "label": "Expected campaigns are RUNNING",
+      "question": "Is every campaign in the expected-running set RUNNING during dialing hours?",
+      "severity": "P1",
+      "cadence": "every 5 min",
+      "active_window": "08:00-20:00 ET",
+      "stale_after_min": 12,
+      "warn_rule": "-",
+      "fail_rule": "NOT_RUNNING sustained 10 min; UNREADABLE = unknown",
+      "config": {
+        "expected": [
+          "DIAL ASAP",
+          "After DIAL ASAP",
+          "Callback Request",
+          "Conf - Next Day",
+          "Conf - 2nd Day",
+          "Data - Hot Leads less than 7",
+          "Data - Warm Leads less than 30",
+          "Data - Leads more than 30",
+          "Rehash - New",
+          "Rehash",
+          "Rehash - Very Old",
+          "Resets-Hot",
+          "Reset-Warm",
+          "Simpletext outbound",
+          "Previous Customer"
+        ],
+        "sustain_ms": 600000
+      },
+      "mode": "shadow",
+      "owner_job_id": "health-checks",
+      "runbook": null,
+      "business_impact": "DIAL ASAP stopped = no new lead is dialed",
+      "enabled": true
+    },
+    {
+      "check_id": "dialer.cap_3_in_24",
+      "family": "dialer",
+      "system": "five9",
+      "label": "3 dials per phone per 24h",
+      "question": "Is any phone being dialed more than 3 times in a rolling 24h?",
+      "severity": "P2",
+      "cadence": "hourly",
+      "active_window": null,
+      "stale_after_min": 130,
+      "warn_rule": "any phone at 4",
+      "fail_rule": "any phone >= 5, or >= 10 phones at 4",
+      "config": {
+        "cap": 3,
+        "fail_at": 5,
+        "warn_at": 4,
+        "fail_phones_at_warn": 10
+      },
+      "mode": "shadow",
+      "owner_job_id": "dialer-sla-check",
+      "runbook": null,
+      "business_impact": "Compliance and customer experience; Dana's profile filters enforce it",
+      "enabled": true
+    },
+    {
+      "check_id": "dialer.config_drift",
+      "family": "dialer",
+      "system": "five9",
+      "label": "Five9 config unchanged",
+      "question": "Did a campaign profile, filter, or list attachment change since the last approved snapshot?",
+      "severity": "P3",
+      "cadence": "daily 04:10 ET",
+      "active_window": null,
+      "stale_after_min": 1500,
+      "warn_rule": "any change",
+      "fail_rule": "change on DIAL ASAP V2 or After DIAL ASAP V2 profile (P2)",
+      "config": {
+        "source": "five9_config_changes",
+        "p2_profiles": [
+          "DIAL ASAP V2",
+          "After DIAL ASAP V2"
+        ]
+      },
+      "mode": "shadow",
+      "owner_job_id": "five9-config-snapshot",
+      "runbook": null,
+      "business_impact": "Unreviewed cadence change",
+      "enabled": true
+    },
+    {
+      "check_id": "dialer.connector_after_asap",
+      "family": "dialer",
+      "system": "five9",
+      "label": "No-contact DIAL ASAP leads reach After DIAL ASAP",
+      "question": "Did the Five9 connector move no-contact leads to After DIAL ASAP?",
+      "severity": "P2",
+      "cadence": "every 15 min",
+      "active_window": null,
+      "stale_after_min": 35,
+      "warn_rule": ">= 3 missed per pass",
+      "fail_rule": ">= 10 missed or any > 2h",
+      "config": {
+        "fail": 10,
+        "warn": 3,
+        "fail_age_h": 2
+      },
+      "mode": "shadow",
+      "owner_job_id": "after-asap-retry",
+      "runbook": null,
+      "business_impact": "Attempts 2 and 3 never happen",
+      "enabled": true
+    },
+    {
+      "check_id": "dialer.dial_rate_drop",
+      "family": "dialer",
+      "system": "five9",
+      "label": "Dials per campaign per hour",
+      "question": "Is this hour's dial volume normal for this weekday-hour?",
+      "severity": "P2",
+      "cadence": "hourly",
+      "active_window": "08:00-20:00 ET",
+      "stale_after_min": 130,
+      "warn_rule": "< 60% of 4-week median",
+      "fail_rule": "< 30% or 0 for 60 min",
+      "config": {
+        "fail_pct": 30,
+        "warn_pct": 60,
+        "baseline_weeks": 4,
+        "requires_running_and_agents": true
+      },
+      "mode": "shadow",
+      "owner_job_id": "dialer-sla-check",
+      "runbook": null,
+      "business_impact": "Silent capacity loss",
+      "enabled": true
+    },
+    {
+      "check_id": "dialer.first_dial_sla",
+      "family": "dialer",
+      "system": "five9",
+      "label": "First dial inside SLA",
+      "question": "Did DIAL ASAP leads get their first dial within 15 min (Callback inside its window)?",
+      "severity": "P1",
+      "cadence": "every 15 min",
+      "active_window": "08:00-20:00 ET",
+      "stale_after_min": 35,
+      "warn_rule": "p50 > 10 min",
+      "fail_rule": "any lead > 30 min, or >= 3 > 15 min",
+      "config": {
+        "fail_any_min": 30,
+        "warn_p50_min": 10,
+        "dial_asap_sla_min": 15,
+        "fail_count_over_sla": 3
+      },
+      "mode": "shadow",
+      "owner_job_id": "dialer-sla-check",
+      "runbook": null,
+      "business_impact": "Speed to lead drives set rate",
+      "enabled": true
+    },
+    {
+      "check_id": "dialer.list_membership_sla",
+      "family": "dialer",
+      "system": "five9",
+      "label": "Lead on its expected list inside SLA",
+      "question": "Is each new lead on the list its routing intent says, inside the SLA?",
+      "severity": "P1",
+      "cadence": "every 15 min",
+      "active_window": "08:00-20:00 ET",
+      "stale_after_min": 35,
+      "warn_rule": ">= 1 lead late",
+      "fail_rule": ">= 3 late, or any lead > 2x SLA",
+      "config": {
+        "chunk": 500,
+        "sla_min": {
+          "DIAL ASAP": 5,
+          "After DIAL ASAP": 30,
+          "Callback Request": 5
+        },
+        "conf_rule": "Conf - 2nd Day by 08:00 ET two days before; Conf - Next Day by 08:00 ET the day before",
+        "lookup_cap": 300
+      },
+      "mode": "shadow",
+      "owner_job_id": "dialer-sla-check",
+      "runbook": null,
+      "business_impact": "Wrong list = wrong cadence = missed first call",
+      "enabled": true
+    },
+    {
+      "check_id": "dialer.list_stalled",
+      "family": "dialer",
+      "system": "five9",
+      "label": "List with records not being worked",
+      "question": "Is a list with records and ready agents going undialed?",
+      "severity": "P1",
+      "cadence": "every 15 min",
+      "active_window": "08:00-20:00 ET",
+      "stale_after_min": 35,
+      "warn_rule": "no dial in 30 min",
+      "fail_rule": "no dial in 60 min",
+      "config": {
+        "fail_min": 60,
+        "warn_min": 30,
+        "start_after": "08:00 ET (lists repopulate 06:00)",
+        "requires_agents_ready": true
+      },
+      "mode": "shadow",
+      "owner_job_id": "dialer-sla-check",
+      "runbook": null,
+      "business_impact": "A stalled DIAL ASAP list is every new lead waiting",
+      "enabled": true
+    },
+    {
+      "check_id": "dialer.never_again",
+      "family": "dialer",
+      "system": "five9",
+      "label": "ND / No Demo / DNC never dialed again",
+      "question": "Is any ND, No Demo, or DNC lead on a dial list?",
+      "severity": "P2",
+      "cadence": "daily 07:30 ET",
+      "active_window": null,
+      "stale_after_min": 1500,
+      "warn_rule": ">= 1",
+      "fail_rule": ">= 3",
+      "config": {
+        "fail": 3,
+        "warn": 1,
+        "never_dispositions": [
+          "ND",
+          "No Demo"
+        ]
+      },
+      "mode": "shadow",
+      "owner_job_id": "dialer-sla-check",
+      "runbook": null,
+      "business_impact": "Decided 2026-10-07; a breach is a complaint risk",
+      "enabled": true
+    },
+    {
+      "check_id": "dialer.silence",
+      "family": "dialer",
+      "system": "five9",
+      "label": "Five9 producing events",
+      "question": "Is Five9 producing any events at all?",
+      "severity": "P1",
+      "cadence": "hourly",
+      "active_window": null,
+      "stale_after_min": 130,
+      "warn_rule": "existing watchdog thresholds",
+      "fail_rule": "existing watchdog thresholds",
+      "config": {
+        "source": "five9-silence-watchdog"
+      },
+      "mode": "shadow",
+      "owner_job_id": "five9-silence-watchdog",
+      "runbook": null,
+      "business_impact": "Whole dialer dark",
+      "enabled": true
+    },
+    {
+      "check_id": "dialer.unmapped_last",
+      "family": "dialer",
+      "system": "five9",
+      "label": "Unmapped queue dialed last",
+      "question": "Is the Unmapped queue being dialed while mapped lists still have records?",
+      "severity": "P3",
+      "cadence": "hourly",
+      "active_window": "08:00-20:00 ET",
+      "stale_after_min": 130,
+      "warn_rule": "any unmapped dial while a mapped list > 0",
+      "fail_rule": "sustained 1h",
+      "config": {
+        "unmapped_list": "Data - Warm Unmapped"
+      },
+      "mode": "shadow",
+      "owner_job_id": "dialer-sla-check",
+      "runbook": null,
+      "business_impact": "Agents working the wrong leads",
+      "enabled": true
+    },
+    {
+      "check_id": "ghl.dead_triggers",
+      "family": "workflow",
+      "system": "ghl",
+      "label": "Draft workflows with live triggers",
+      "question": "Any new draft workflow with a live trigger or a cross-workflow duplicate trigger?",
+      "severity": "P3",
+      "cadence": "daily",
+      "active_window": null,
+      "stale_after_min": 1500,
+      "warn_rule": "any new",
+      "fail_rule": "-",
+      "config": {
+        "source": "detect_dead_workflows, find_duplicate_triggers (cross-workflow only)"
+      },
+      "mode": "shadow",
+      "owner_job_id": "health-checks",
+      "runbook": null,
+      "business_impact": "Contacts enrolled in drafts",
+      "enabled": true
+    },
+    {
+      "check_id": "ghl.rate_limiter",
+      "family": "workflow",
+      "system": "ghl",
+      "label": "HL MCP GHL limiter healthy",
+      "question": "Is the GHL rate limiter healthy?",
+      "severity": "P2",
+      "cadence": "every min",
+      "active_window": null,
+      "stale_after_min": 5,
+      "warn_rule": "tokens < 20% for 10 min",
+      "fail_rule": "unhealthy sustained 10 min",
+      "config": {
+        "source": "/n8n/rate-limiter/stats",
+        "sustain_ms": 600000
+      },
+      "mode": "shadow",
+      "owner_job_id": "health-checks",
+      "runbook": null,
+      "business_impact": "Every GHL write queues",
+      "enabled": true
+    },
+    {
+      "check_id": "ghl.rule_targets",
+      "family": "workflow",
+      "system": "ghl",
+      "label": "Agent rules target published workflows",
+      "question": "Does every enabled agent rule point at a published GHL workflow?",
+      "severity": "P3",
+      "cadence": "daily",
+      "active_window": null,
+      "stale_after_min": 1500,
+      "warn_rule": "any unpublished",
+      "fail_rule": "any missing",
+      "config": {
+        "source": "rule_target_checks"
+      },
+      "mode": "shadow",
+      "owner_job_id": "rule-target-check",
+      "runbook": null,
+      "business_impact": "Rule fires into nothing",
+      "enabled": true
+    },
+    {
+      "check_id": "ghl.webhook_liveness",
+      "family": "workflow",
+      "system": "webhooks",
+      "label": "GHL webhooks delivering",
+      "question": "Are GHL workflow webhooks still arriving at expected volume?",
+      "severity": "P2",
+      "cadence": "hourly",
+      "active_window": "08:00-20:00 ET",
+      "stale_after_min": 130,
+      "warn_rule": "< 50% of expected for 2h",
+      "fail_rule": "0 in 2h during 08-20 ET",
+      "config": {
+        "source": "lead_events / ghl_workflow_webhooks",
+        "warn_pct": 50,
+        "fail_zero_h": 2,
+        "baseline_weeks": 4
+      },
+      "mode": "shadow",
+      "owner_job_id": "health-checks",
+      "runbook": null,
+      "business_impact": "Intake path dark",
+      "enabled": true
+    },
+    {
+      "check_id": "jobs.failed",
+      "family": "workflow",
+      "system": "railway",
+      "label": "LP-MCP jobs failing",
+      "question": "Is any registered job failing repeatedly?",
+      "severity": "P2",
+      "cadence": "every 5 min",
+      "active_window": null,
+      "stale_after_min": 12,
+      "warn_rule": "1 fail in last 3 runs",
+      "fail_rule": "3 consecutive fails, or a P1 job never run / stale > 2x cadence",
+      "config": {
+        "note": "promised-callback-sweep 163 fails/7d and rehash-tag-sweep 83/7d must be fixed or excluded before live (Gaps #11)",
+        "source": "v_job_status",
+        "fail_consecutive": 3
+      },
+      "mode": "shadow",
+      "owner_job_id": "health-checks",
+      "runbook": null,
+      "business_impact": "Silent automation loss",
+      "enabled": true
+    },
+    {
+      "check_id": "jobs.silent",
+      "family": "workflow",
+      "system": "railway",
+      "label": "LP-MCP jobs silent",
+      "question": "Is any enabled job silent past 2x its cadence?",
+      "severity": "P2",
+      "cadence": "every 5 min",
+      "active_window": null,
+      "stale_after_min": 12,
+      "warn_rule": "2x cadence",
+      "fail_rule": "4x cadence",
+      "config": {
+        "fail_x": 4,
+        "source": "v_job_status",
+        "warn_x": 2
+      },
+      "mode": "shadow",
+      "owner_job_id": "health-checks",
+      "runbook": null,
+      "business_impact": "The failure mode that caused the 47h outage",
+      "enabled": true
+    },
+    {
+      "check_id": "lead.booked_without_lp",
+      "family": "lead",
+      "system": "lead_perfection",
+      "label": "Appointments set with no LP record",
+      "question": "Is any GHL appointment set without an LP lead behind it?",
+      "severity": "P1",
+      "cadence": "hourly",
+      "active_window": null,
+      "stale_after_min": 130,
+      "warn_rule": ">= 1 in 24h",
+      "fail_rule": ">= 3 in 24h",
+      "config": {
+        "fail": 3,
+        "warn": 1,
+        "source": "get_identity_health.appt_set_without_lp_record"
+      },
+      "mode": "shadow",
+      "owner_job_id": "health-checks",
+      "runbook": null,
+      "business_impact": "A booked appointment LP cannot dispatch is a no-show",
+      "enabled": true
+    },
+    {
+      "check_id": "lead.canvass_to_lp",
+      "family": "lead",
+      "system": "lead_perfection",
+      "label": "Canvass leads delivered",
+      "question": "Did every canvass form lead reach LP and the dialer?",
+      "severity": "P1",
+      "cadence": "every 15 min",
+      "active_window": null,
+      "stale_after_min": 35,
+      "warn_rule": "1 undelivered > 30 min",
+      "fail_rule": ">= 2 undelivered or any > 2h",
+      "config": {
+        "fail_wait_min": 120,
+        "warn_wait_min": 30
+      },
+      "mode": "shadow",
+      "owner_job_id": "canvass-lead-backstop",
+      "runbook": null,
+      "business_impact": "Canvassers are paid per lead; a dropped lead is a wasted door",
+      "enabled": true
+    },
+    {
+      "check_id": "lead.chat_to_lp",
+      "family": "lead",
+      "system": "lead_perfection",
+      "label": "Chat leads sent to LP",
+      "question": "Are chatbot / chat-widget leads reaching LP?",
+      "severity": "P1",
+      "cadence": "every 15 min",
+      "active_window": null,
+      "stale_after_min": 35,
+      "warn_rule": "any would_send in shadow",
+      "fail_rule": "any failed send in live",
+      "config": {
+        "source": "chat-lead-intake job detail"
+      },
+      "mode": "shadow",
+      "owner_job_id": "chat-lead-intake",
+      "runbook": null,
+      "business_impact": "18/day were missing in Sep",
+      "enabled": true
+    },
+    {
+      "check_id": "lead.first_call_p90",
+      "family": "lead",
+      "system": "five9",
+      "label": "Time to first call (p90, yesterday)",
+      "question": "Were yesterday's leads dialed fast?",
+      "severity": "P2",
+      "cadence": "daily 08:10 ET",
+      "active_window": null,
+      "stale_after_min": 1500,
+      "warn_rule": "p90 > 120 min",
+      "fail_rule": "p90 > 240 min or never_called > 3% of expected",
+      "config": {
+        "source": "lead_call_speed_daily",
+        "fail_p90_min": 240,
+        "warn_p90_min": 120,
+        "fail_never_called_pct": 3
+      },
+      "mode": "shadow",
+      "owner_job_id": "lead-leak-monitor",
+      "runbook": null,
+      "business_impact": "Slow first call lowers set rate on every source",
+      "enabled": true
+    },
+    {
+      "check_id": "lead.in_inbound_queue",
+      "family": "lead",
+      "system": "lead_perfection",
+      "label": "Leads still in LP inbound queue at leak time",
+      "question": "How many leaked leads were simply never checked out of the LP inbound queue?",
+      "severity": "P1",
+      "cadence": "daily 08:10 ET",
+      "active_window": null,
+      "stale_after_min": 1500,
+      "warn_rule": ">= 3",
+      "fail_rule": ">= 10",
+      "config": {
+        "reason": "in_inbound_queue",
+        "source": "lead_leak_daily",
+        "fail_leads": 10,
+        "warn_leads": 3
+      },
+      "mode": "shadow",
+      "owner_job_id": "lead-leak-monitor",
+      "runbook": null,
+      "business_impact": "Human intake bottleneck, not an automation gap",
+      "enabled": true
+    },
+    {
+      "check_id": "lead.intake_gap",
+      "family": "lead",
+      "system": "lead_perfection",
+      "label": "GHL contacts that never became an LP lead",
+      "question": "Did every GHL contact with a lead source reach LP within 60 min?",
+      "severity": "P1",
+      "cadence": "hourly",
+      "active_window": "08:00-20:00 ET",
+      "stale_after_min": 130,
+      "warn_rule": ">= 1 in last 2h",
+      "fail_rule": ">= 3 in last 2h",
+      "config": {
+        "fail": 3,
+        "warn": 1,
+        "source": "lead_intake_gap_daily",
+        "window_h": 2
+      },
+      "mode": "shadow",
+      "owner_job_id": "health-checks",
+      "runbook": null,
+      "business_impact": "A contact that never reaches LP is never dialed",
+      "enabled": true
+    },
+    {
+      "check_id": "lead.not_in_five9",
+      "family": "lead",
+      "system": "five9",
+      "label": "Leads Five9 has no record of",
+      "question": "How many leads in the window never reached Five9 at all (after inbound checkout)?",
+      "severity": "P1",
+      "cadence": "daily 08:10 ET",
+      "active_window": null,
+      "stale_after_min": 1500,
+      "warn_rule": "> 5 leads/day",
+      "fail_rule": "> 10 leads/day or est_value > $25k",
+      "config": {
+        "reason": "not_in_five9",
+        "source": "lead_leak_daily",
+        "fail_leads": 10,
+        "fail_value": 25000,
+        "warn_leads": 5
+      },
+      "mode": "shadow",
+      "owner_job_id": "lead-leak-monitor",
+      "runbook": null,
+      "business_impact": "Oct 14: 42 leads, $94k classified here; to be split from in_inbound_queue",
+      "enabled": true
+    },
+    {
+      "check_id": "lead.routing_failure",
+      "family": "lead",
+      "system": "five9",
+      "label": "Routing or automation failures",
+      "question": "How many leads leaked because routing or an automation failed?",
+      "severity": "P1",
+      "cadence": "daily 08:10 ET",
+      "active_window": null,
+      "stale_after_min": 1500,
+      "warn_rule": ">= 1",
+      "fail_rule": ">= 3",
+      "config": {
+        "reasons": [
+          "routing_or_automation_failure",
+          "on_list_not_dialed"
+        ],
+        "fail_leads": 3,
+        "warn_leads": 1
+      },
+      "mode": "shadow",
+      "owner_job_id": "lead-leak-monitor",
+      "runbook": null,
+      "business_impact": "Oct 14: 6 leads, $8.8k",
+      "enabled": true
+    },
+    {
+      "check_id": "lead.uncalled_live",
+      "family": "lead",
+      "system": "five9",
+      "label": "Leads waiting with no Five9 call",
+      "question": "Does every LP lead created in the last 24h (phone, not DNC, not Set/Sale) have at least one Five9 dial?",
+      "severity": "P1",
+      "cadence": "hourly 08-20 ET",
+      "active_window": "08:00-20:00 ET",
+      "stale_after_min": 130,
+      "warn_rule": "any lead waiting > 30 min",
+      "fail_rule": "any lead waiting > 60 min, or 3+ leads > 30 min",
+      "config": {
+        "source": "lead-speed-alerts.js",
+        "fail_wait_min": 60,
+        "warn_wait_min": 30,
+        "fail_count_over_warn": 3
+      },
+      "mode": "shadow",
+      "owner_job_id": "lead-uncalled-check",
+      "runbook": null,
+      "business_impact": "A lead nobody called today is a lead a competitor calls; est_value from close rate x avg job value",
+      "enabled": true
+    },
+    {
+      "check_id": "n8n.cron_silence",
+      "family": "workflow",
+      "system": "n8n",
+      "label": "Scheduled n8n workflows ran",
+      "question": "Did every active cron-triggered workflow run inside 2x its interval?",
+      "severity": "P2",
+      "cadence": "every 15 min",
+      "active_window": null,
+      "stale_after_min": 35,
+      "warn_rule": "> 2x interval",
+      "fail_rule": "> 4x interval",
+      "config": {
+        "fail_x": 4,
+        "warn_x": 2,
+        "interval_from": "workflow JSON in GitHub mrichard33/n8n"
+      },
+      "mode": "shadow",
+      "owner_job_id": "n8n-execution-poller",
+      "runbook": null,
+      "business_impact": "LP report ingest, LF daily, VDR weekly silently stop",
+      "enabled": true
+    },
+    {
+      "check_id": "n8n.errors",
+      "family": "workflow",
+      "system": "n8n",
+      "label": "n8n error executions",
+      "question": "Are active n8n workflows erroring?",
+      "severity": "P2",
+      "cadence": "every 5 min",
+      "active_window": null,
+      "stale_after_min": 12,
+      "warn_rule": ">= 2 errors/workflow/hour",
+      "fail_rule": ">= 5, or any error on an intake workflow",
+      "config": {
+        "source": "n8n_execution_log",
+        "fail_per_wf_h": 5,
+        "warn_per_wf_h": 2,
+        "intake_prefixes": [
+          "I.",
+          "OPS.DNC-LIFT",
+          "05 LF",
+          "06 VDR"
+        ]
+      },
+      "mode": "shadow",
+      "owner_job_id": "n8n-execution-poller",
+      "runbook": null,
+      "business_impact": "Oct 14: 10 errors in 3h, 7 on 06 VDR",
+      "enabled": true
+    },
+    {
+      "check_id": "n8n.reachable",
+      "family": "workflow",
+      "system": "n8n",
+      "label": "n8n /healthz",
+      "question": "Does n8n answer /healthz?",
+      "severity": "P2",
+      "cadence": "every 5 min",
+      "active_window": null,
+      "stale_after_min": 12,
+      "warn_rule": "1 miss",
+      "fail_rule": "2 consecutive misses",
+      "config": {
+        "fail_consecutive": 2
+      },
+      "mode": "shadow",
+      "owner_job_id": "health-checks",
+      "runbook": null,
+      "business_impact": "All orchestration down",
+      "enabled": true
+    },
+    {
+      "check_id": "svc.dashboard",
+      "family": "service",
+      "system": "railway",
+      "label": "Dashboard serving",
+      "question": "Does /overview return 200?",
+      "severity": "P2",
+      "cadence": "every 5 min",
+      "active_window": null,
+      "stale_after_min": 12,
+      "warn_rule": "> 3s",
+      "fail_rule": "2 misses",
+      "config": {
+        "url": "https://dashboard.getreecewindows.com/overview",
+        "fail_consecutive": 2
+      },
+      "mode": "shadow",
+      "owner_job_id": "health-checks",
+      "runbook": null,
+      "business_impact": "Command center dark",
+      "enabled": true
+    },
+    {
+      "check_id": "svc.five9_api",
+      "family": "service",
+      "system": "five9",
+      "label": "Five9 API reachable",
+      "question": "Does the Five9 Admin API answer?",
+      "severity": "P1",
+      "cadence": "every 5 min",
+      "active_window": null,
+      "stale_after_min": 12,
+      "warn_rule": "1 miss",
+      "fail_rule": "2 consecutive misses",
+      "config": {
+        "source": "/health/integrations",
+        "fail_consecutive": 2
+      },
+      "mode": "shadow",
+      "owner_job_id": "health-checks",
+      "runbook": null,
+      "business_impact": "Dialer blind",
+      "enabled": true
+    },
+    {
+      "check_id": "svc.hl_mcp",
+      "family": "service",
+      "system": "railway",
+      "label": "HL MCP up",
+      "question": "Does HL MCP answer and is its latest deploy SUCCESS?",
+      "severity": "P1",
+      "cadence": "every 5 min",
+      "active_window": null,
+      "stale_after_min": 12,
+      "warn_rule": "latency > 3s or deploy in progress > 10 min",
+      "fail_rule": "unreachable 2 probes, or deploy FAILED/CRASHED",
+      "config": {
+        "alert_24_7": true,
+        "warn_latency_ms": 3000,
+        "fail_consecutive": 2
+      },
+      "mode": "shadow",
+      "owner_job_id": "health-checks",
+      "runbook": null,
+      "business_impact": "GHL hands down",
+      "enabled": true
+    },
+    {
+      "check_id": "svc.lp_api",
+      "family": "service",
+      "system": "lead_perfection",
+      "label": "Lead Perfection API reachable",
+      "question": "Does the LP API answer?",
+      "severity": "P1",
+      "cadence": "every 5 min",
+      "active_window": null,
+      "stale_after_min": 12,
+      "warn_rule": "1 miss",
+      "fail_rule": "2 consecutive misses",
+      "config": {
+        "source": "/health/integrations",
+        "fail_consecutive": 2
+      },
+      "mode": "shadow",
+      "owner_job_id": "health-checks",
+      "runbook": null,
+      "business_impact": "No new leads, no sync",
+      "enabled": true
+    },
+    {
+      "check_id": "svc.lp_mcp",
+      "family": "service",
+      "system": "railway",
+      "label": "LP MCP up",
+      "question": "Does LP MCP answer and is its latest deploy SUCCESS?",
+      "severity": "P1",
+      "cadence": "every 5 min",
+      "active_window": null,
+      "stale_after_min": 12,
+      "warn_rule": "latency > 3s or deploy in progress > 10 min",
+      "fail_rule": "unreachable 2 probes, or deploy FAILED/CRASHED",
+      "config": {
+        "alert_24_7": true,
+        "warn_latency_ms": 3000,
+        "fail_consecutive": 2
+      },
+      "mode": "shadow",
+      "owner_job_id": "health-checks",
+      "runbook": null,
+      "business_impact": "Brain down: every job and backstop stops",
+      "enabled": true
+    },
+    {
+      "check_id": "svc.railway_restarts",
+      "family": "service",
+      "system": "railway",
+      "label": "Service restarts",
+      "question": "Is a service restarting repeatedly?",
+      "severity": "P2",
+      "cadence": "every 15 min",
+      "active_window": null,
+      "stale_after_min": 35,
+      "warn_rule": ">= 2 in 1h",
+      "fail_rule": ">= 4 in 1h",
+      "config": {
+        "fail": 4,
+        "warn": 2,
+        "services": [
+          "LP-MCP",
+          "HL-MCP",
+          "n8n",
+          "Reece Dashboard"
+        ]
+      },
+      "mode": "shadow",
+      "owner_job_id": "health-checks",
+      "runbook": null,
+      "business_impact": "Crash loop",
+      "enabled": true
+    },
+    {
+      "check_id": "svc.slack",
+      "family": "service",
+      "system": "webhooks",
+      "label": "Slack reachable",
+      "question": "Does Slack accept a post?",
+      "severity": "P2",
+      "cadence": "every 5 min",
+      "active_window": null,
+      "stale_after_min": 12,
+      "warn_rule": "1 miss",
+      "fail_rule": "2 consecutive misses",
+      "config": {
+        "source": "/health/integrations",
+        "fail_consecutive": 2
+      },
+      "mode": "shadow",
+      "owner_job_id": "health-checks",
+      "runbook": null,
+      "business_impact": "Alerts silently lost",
+      "enabled": true
+    },
+    {
+      "check_id": "svc.supabase_hl",
+      "family": "service",
+      "system": "supabase",
+      "label": "HL Supabase healthy",
+      "question": "Does a read work and are disk/CPU below limits?",
+      "severity": "P2",
+      "cadence": "every 5 min",
+      "active_window": null,
+      "stale_after_min": 12,
+      "warn_rule": "CPU > 70% 15 min",
+      "fail_rule": "read fails, or disk > 90%",
+      "config": {
+        "project": "jtlngmcrtqncimtjjzlz",
+        "warn_cpu_pct": 70,
+        "fail_disk_pct": 90
+      },
+      "mode": "shadow",
+      "owner_job_id": "health-checks",
+      "runbook": null,
+      "business_impact": "GHL cache down",
+      "enabled": true
+    },
+    {
+      "check_id": "svc.supabase_lp",
+      "family": "service",
+      "system": "supabase",
+      "label": "LP Supabase healthy",
+      "question": "Does a read work and are disk/CPU below limits?",
+      "severity": "P1",
+      "cadence": "every 5 min",
+      "active_window": null,
+      "stale_after_min": 12,
+      "warn_rule": "CPU > 70% 15 min",
+      "fail_rule": "read fails, or disk > 90%",
+      "config": {
+        "project": "rcjcgjlqzepicbwhnnjl",
+        "warn_cpu_pct": 70,
+        "fail_disk_pct": 90
+      },
+      "mode": "shadow",
+      "owner_job_id": "health-checks",
+      "runbook": null,
+      "business_impact": "Memory down",
+      "enabled": true
+    },
+    {
+      "check_id": "syn.chatbot_reply",
+      "family": "synthetic",
+      "system": "ai_agents",
+      "label": "Canary: chatbot reply",
+      "question": "Does the bot reply to a scripted message inside SLA?",
+      "severity": "P2",
+      "cadence": "offline hourly; live 2x/day",
+      "active_window": null,
+      "stale_after_min": 130,
+      "warn_rule": "-",
+      "fail_rule": "no reply inside SLA or wrong shape",
+      "config": {
+        "offline_scripts": 3,
+        "live_runs_per_day": 2
+      },
+      "mode": "shadow",
+      "owner_job_id": "synthetic-canary",
+      "runbook": null,
+      "business_impact": "Bot down or regressed",
+      "enabled": true
+    },
+    {
+      "check_id": "syn.ghl_webhook_roundtrip",
+      "family": "synthetic",
+      "system": "webhooks",
+      "label": "Canary: GHL webhook round trip",
+      "question": "Does a tag on a standing synthetic contact reach LP-MCP within 2 min?",
+      "severity": "P2",
+      "cadence": "every 30 min",
+      "active_window": null,
+      "stale_after_min": 65,
+      "warn_rule": "-",
+      "fail_rule": "nonce not seen in 2 min",
+      "config": {
+        "workflow": "ZZ.CANARY",
+        "budget_min": 2
+      },
+      "mode": "shadow",
+      "owner_job_id": "synthetic-canary",
+      "runbook": null,
+      "business_impact": "GHL engine + webhook + ingress",
+      "enabled": true
+    },
+    {
+      "check_id": "syn.lead_to_lp",
+      "family": "synthetic",
+      "system": "lead_perfection",
+      "label": "Canary: GHL contact -> LP lead",
+      "question": "Does a synthetic contact become an LP lead within 10 min?",
+      "severity": "P1",
+      "cadence": "08:30 and 13:30 ET",
+      "active_window": "08:00-20:00 ET",
+      "stale_after_min": 1500,
+      "warn_rule": "-",
+      "fail_rule": "any step failed or > 10 min",
+      "config": {
+        "needs": "Gaps #3-5",
+        "budget_min": 10,
+        "identities": 30,
+        "lp_footprint_per_day": 2
+      },
+      "mode": "shadow",
+      "owner_job_id": "synthetic-canary",
+      "runbook": null,
+      "business_impact": "Proves the intake pipe without a real lead",
+      "enabled": true
+    },
+    {
+      "check_id": "syn.lp_api_read",
+      "family": "synthetic",
+      "system": "lead_perfection",
+      "label": "Canary: LP API read",
+      "question": "Does the LP API return a known lead?",
+      "severity": "P1",
+      "cadence": "every 15 min",
+      "active_window": null,
+      "stale_after_min": 35,
+      "warn_rule": "1 miss",
+      "fail_rule": "2 consecutive misses",
+      "config": {
+        "fail_consecutive": 2
+      },
+      "mode": "shadow",
+      "owner_job_id": "synthetic-canary",
+      "runbook": null,
+      "business_impact": "LP auth expiry before the sync notices",
+      "enabled": true
+    },
+    {
+      "check_id": "syn.lp_to_five9_list",
+      "family": "synthetic",
+      "system": "five9",
+      "label": "Canary: LP lead -> DIAL ASAP list",
+      "question": "Does the synthetic lead land on DIAL ASAP within 5 min and get removed before any dial?",
+      "severity": "P1",
+      "cadence": "with syn.lead_to_lp",
+      "active_window": "08:00-20:00 ET",
+      "stale_after_min": 1500,
+      "warn_rule": "-",
+      "fail_rule": "not on list in 5 min, or not removed in 60s",
+      "config": {
+        "budget_min": 5,
+        "remove_within_s": 60
+      },
+      "mode": "shadow",
+      "owner_job_id": "synthetic-canary",
+      "runbook": null,
+      "business_impact": "Proves LP -> Five9 routing",
+      "enabled": true
+    },
+    {
+      "check_id": "syn.n8n_roundtrip",
+      "family": "synthetic",
+      "system": "n8n",
+      "label": "Canary: n8n round trip",
+      "question": "Does an n8n webhook workflow write back within 2 min?",
+      "severity": "P2",
+      "cadence": "every 30 min",
+      "active_window": null,
+      "stale_after_min": 65,
+      "warn_rule": "-",
+      "fail_rule": "not seen in 2 min",
+      "config": {
+        "workflow": "OPS.CANARY",
+        "budget_min": 2
+      },
+      "mode": "shadow",
+      "owner_job_id": "synthetic-canary",
+      "runbook": null,
+      "business_impact": "n8n -> LP-MCP auth and networking",
+      "enabled": true
+    },
+    {
+      "check_id": "syn.slack_delivery",
+      "family": "synthetic",
+      "system": "webhooks",
+      "label": "Canary: Slack delivery",
+      "question": "Does a post to #ops-canary read back within 30 s?",
+      "severity": "P2",
+      "cadence": "every 30 min",
+      "active_window": null,
+      "stale_after_min": 65,
+      "warn_rule": "-",
+      "fail_rule": "not read back in 30 s",
+      "config": {
+        "channel": "#ops-canary (to create)",
+        "budget_s": 30
+      },
+      "mode": "shadow",
+      "owner_job_id": "synthetic-canary",
+      "runbook": null,
+      "business_impact": "Quiet vs broken Slack",
+      "enabled": true
+    },
+    {
+      "check_id": "sync.appt_parity",
+      "family": "sync",
+      "system": "ghl",
+      "label": "LP / GHL appointment parity",
+      "question": "Do LP and GHL appointment fields agree?",
+      "severity": "P2",
+      "cadence": "every 30 min",
+      "active_window": null,
+      "stale_after_min": 65,
+      "warn_rule": "new gaps >= 5",
+      "fail_rule": ">= 20",
+      "config": {
+        "fail": 20,
+        "note": "issue #2361",
+        "warn": 5,
+        "min_age_min": 15
+      },
+      "mode": "shadow",
+      "owner_job_id": "health-checks",
+      "runbook": null,
+      "business_impact": "Reps and bot act on the wrong time",
+      "enabled": true
+    },
+    {
+      "check_id": "sync.five9_key_pct",
+      "family": "sync",
+      "system": "five9",
+      "label": "Five9 events carry an LP key",
+      "question": "What share of Five9 events carries lp_rec_key?",
+      "severity": "P2",
+      "cadence": "daily",
+      "active_window": null,
+      "stale_after_min": 1500,
+      "warn_rule": "< 90%",
+      "fail_rule": "< 85%",
+      "config": {
+        "fail_pct": 85,
+        "warn_pct": 90
+      },
+      "mode": "shadow",
+      "owner_job_id": "health-checks",
+      "runbook": null,
+      "business_impact": "Call truth cannot be joined to leads",
+      "enabled": true
+    },
+    {
+      "check_id": "sync.hl_cache_fresh",
+      "family": "sync",
+      "system": "ghl",
+      "label": "HL cache fresh per entity",
+      "question": "Is the GHL cache in HL Supabase current?",
+      "severity": "P2",
+      "cadence": "every 5 min",
+      "active_window": null,
+      "stale_after_min": 12,
+      "warn_rule": "any entity > 30 min",
+      "fail_rule": "contacts or opportunities > 2h, or failure_rate_24h > 5%",
+      "config": {
+        "source": "HL MCP get_sync_health",
+        "fail_min": 120,
+        "warn_min": 30,
+        "fail_rate_pct": 5
+      },
+      "mode": "shadow",
+      "owner_job_id": "health-checks",
+      "runbook": null,
+      "business_impact": "GHL-side checks go blind",
+      "enabled": true
+    },
+    {
+      "check_id": "sync.lp_errors",
+      "family": "sync",
+      "system": "lead_perfection",
+      "label": "Unresolved LP sync errors",
+      "question": "Are LP sync errors piling up?",
+      "severity": "P2",
+      "cadence": "every 15 min",
+      "active_window": null,
+      "stale_after_min": 35,
+      "warn_rule": "> 5 new in 1h",
+      "fail_rule": "> 20, or any > 24h old",
+      "config": {
+        "source": "lp_sync_errors resolved=false",
+        "fail_age_h": 24,
+        "fail_total": 20,
+        "warn_new_1h": 5
+      },
+      "mode": "shadow",
+      "owner_job_id": "health-checks",
+      "runbook": null,
+      "business_impact": "Leads not mirrored are invisible to every monitor",
+      "enabled": true
+    },
+    {
+      "check_id": "sync.lp_ghl_link_pct",
+      "family": "sync",
+      "system": "ghl",
+      "label": "New LP leads linked to GHL",
+      "question": "What share of the last 30 days of LP leads is linked to a GHL contact?",
+      "severity": "P2",
+      "cadence": "daily",
+      "active_window": null,
+      "stale_after_min": 1500,
+      "warn_rule": "< 98%",
+      "fail_rule": "< 95%",
+      "config": {
+        "source": "get_identity_health",
+        "fail_pct": 95,
+        "warn_pct": 98
+      },
+      "mode": "shadow",
+      "owner_job_id": "link-leak-monitor",
+      "runbook": null,
+      "business_impact": "Unlinked leads get no nurture and no bot",
+      "enabled": true
+    },
+    {
+      "check_id": "sync.lp_leads_fresh",
+      "family": "sync",
+      "system": "supabase",
+      "label": "LP lead mirror fresh",
+      "question": "Is the LP -> Supabase lead mirror current?",
+      "severity": "P2",
+      "cadence": "every 5 min",
+      "active_window": "08:00-20:00 ET",
+      "stale_after_min": 12,
+      "warn_rule": "> 20 min since newest lp_leads.updated_at",
+      "fail_rule": "> 45 min, or last sync failed twice",
+      "config": {
+        "source": "lp_leads.updated_at_lp, lp_sync_log",
+        "fail_min": 45,
+        "warn_min": 20,
+        "fail_consecutive": 2
+      },
+      "mode": "shadow",
+      "owner_job_id": "health-checks",
+      "runbook": null,
+      "business_impact": "Every check downstream reads stale data",
+      "enabled": true
+    },
+    {
+      "check_id": "sync.lp_reports",
+      "family": "sync",
+      "system": "lead_perfection",
+      "label": "LP scheduled reports arrived",
+      "question": "Did reports 133 Jobs By Status, 134 Jobs by Milestone Date, 135 Lead Disposition Detail 2, 136 Mktg Sub-Source Cost Analysis 2, 137 Sales Efficiency By Mode arrive and parse?",
+      "severity": "P2",
+      "cadence": "every 5 min from 07:30 ET",
+      "active_window": null,
+      "stale_after_min": 12,
+      "warn_rule": "missing after 08:30 ET",
+      "fail_rule": "missing after 10:00 ET or parse quarantine",
+      "config": {
+        "reports": {
+          "133": "Jobs By Status",
+          "134": "Jobs by Milestone Date",
+          "135": "Lead Disposition Detail 2",
+          "136": "Mktg Sub-Source Cost Analysis 2",
+          "137": "Sales Efficiency By Mode"
+        },
+        "fail_at_et": "10:00",
+        "warn_at_et": "08:30"
+      },
+      "mode": "shadow",
+      "owner_job_id": "lp-report-watchdog",
+      "runbook": null,
+      "business_impact": "Scorecard day missing",
+      "enabled": true
+    },
+    {
+      "check_id": "sync.retired_code",
+      "family": "sync",
+      "system": "lead_perfection",
+      "label": "Retired disposition codes in use",
+      "question": "Is NIS2 or another retired code appearing on new leads?",
+      "severity": "P3",
+      "cadence": "daily",
+      "active_window": null,
+      "stale_after_min": 1500,
+      "warn_rule": ">= 1",
+      "fail_rule": ">= 5",
+      "config": {
+        "fail": 5,
+        "warn": 1,
+        "retired": [
+          "NIS2"
+        ]
+      },
+      "mode": "shadow",
+      "owner_job_id": "lead-leak-monitor",
+      "runbook": null,
+      "business_impact": "Leak classification silently wrong",
+      "enabled": true
+    },
+    {
+      "check_id": "sync.stale_set_leads",
+      "family": "sync",
+      "system": "lead_perfection",
+      "label": "Set leads past their appointment",
+      "question": "How many Set leads have an appointment > 24h in the past with no result?",
+      "severity": "P2",
+      "cadence": "nightly",
+      "active_window": null,
+      "stale_after_min": 1500,
+      "warn_rule": ">= 10",
+      "fail_rule": ">= 40",
+      "config": {
+        "fail": 40,
+        "warn": 10
+      },
+      "mode": "shadow",
+      "owner_job_id": "lp-stale-lead-refresh",
+      "runbook": null,
+      "business_impact": "Scorecard overstates sets",
+      "enabled": true
+    }
+  ],
+  "escalation_policy": [
+    {
+      "severity": "P1",
+      "ack_within_min": 30,
+      "remind_every_min": 30,
+      "escalate_to": [
+        {
+          "to": null,
+          "via": "slack_dm",
+          "after_min": 30
+        },
+        {
+          "to": null,
+          "via": "slack_dm",
+          "note": "SMS target TBD",
+          "after_min": 60
+        }
+      ],
+      "channels": {
+        "primary": "ops",
+        "contact_center": "C0C6BNY30TB"
+      }
+    },
+    {
+      "severity": "P2",
+      "ack_within_min": 240,
+      "remind_every_min": 120,
+      "escalate_to": [
+        {
+          "to": null,
+          "via": "slack_dm",
+          "after_min": 240,
+          "business_hours_only": true
+        }
+      ],
+      "channels": {
+        "primary": "ops"
+      }
+    },
+    {
+      "severity": "P3",
+      "ack_within_min": null,
+      "remind_every_min": null,
+      "escalate_to": [],
+      "channels": {
+        "digest": true,
+        "primary": "ops"
+      }
+    },
+    {
+      "severity": "P4",
+      "ack_within_min": null,
+      "remind_every_min": null,
+      "escalate_to": [],
+      "channels": {
+        "dashboard_only": true
+      }
+    }
+  ]
+}

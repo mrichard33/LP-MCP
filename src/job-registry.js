@@ -193,6 +193,19 @@ export const JOBS = Object.freeze([
     isEnabled: (env) => String(env.TAG_SWEEP_ENABLED || '').toLowerCase() === 'true',
   },
   {
+    // 2026-10-15 — System Health Phase 0 (docs/system-health.md). Evaluates
+    // the registry checks owned by `health-checks` and writes health_results.
+    // Read-only everywhere else; posts nothing. Mirrors healthChecksMode() in
+    // src/jobs/health-checks.js.
+    id: 'health-checks',
+    label: 'System health checks (health_results)',
+    group: 'ops',
+    cadence: 'every 5 min',
+    enabledEnv: 'HEALTH_CHECKS_MODE',
+    enabledDefault: true,
+    isEnabled: (env) => String(env.HEALTH_CHECKS_MODE ?? 'shadow').toLowerCase().trim() !== 'off',
+  },
+  {
     // 2026-10-12 (F-L): every enabled agent rule that adds/removes a contact
     // from a GHL workflow, or fires when one completes, must point at a
     // PUBLISHED workflow. Read-only (writes only rule_target_checks), so ON by

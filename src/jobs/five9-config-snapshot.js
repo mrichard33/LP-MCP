@@ -87,6 +87,7 @@
 //   via the house 5-minute-tick idiom.
 
 import crypto from 'node:crypto';
+import { configDriftResult } from '../health/watchdog-results.js';
 import supabase from '../supabase.js';
 import { emitEvent } from '../event-emitter.js';
 import { hourET, todayET } from './lp-report-common.js';
@@ -480,7 +481,14 @@ async function collectEntities(errors, locked) {
 
 let lastRun = null;
 
+// 2026-10-15 (System Health Phase 0): every pass also carries the
+// dialer.config_drift result for runJob to record. The snapshot is unchanged.
 export async function runFive9ConfigSnapshot() {
+  const summary = await runFive9ConfigSnapshotPass();
+  return { ...summary, health: [configDriftResult({ summary, changes: summary.changed_entities || [] })] };
+}
+
+async function runFive9ConfigSnapshotPass() {
   const startedAt = Date.now();
   const snapshot_date = todayET();
   const errors = [];
@@ -583,6 +591,7 @@ export async function runFive9ConfigSnapshot() {
     entities_captured: snapshotRows.length,
     changes_detected,
     same_day_deltas: same_day_delta_entities.length,
+    changed_entities: changes_detected ? changeRows.slice(0, 40).map((r) => ({ entity_type: r.entity_type, entity_name: r.entity_name })) : [],
     // The identities behind the count. Without these the count is unactionable.
     same_day_delta_entities,
     // Deprecated alias, kept so existing eyes and queries do not break

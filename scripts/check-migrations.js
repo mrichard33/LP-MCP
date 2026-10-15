@@ -250,6 +250,84 @@ export function pendingMigrationFiles(listText, fileNames) {
   });
 }
 
+/**
+ * A pending migration that RECORDS schema someone already applied by hand
+ * (2026-10-15, system health: Mark built the nine health tables in the
+ * dashboard on 2026-10-14, before the file existed; sql/README.md rule 4 asks
+ * for the same "by hand first, migration no-op" order for a CONCURRENTLY
+ * index). Setting such a file aside makes its own objects read as drift, so
+ * every PR fails until it merges, and the merge is the only thing that fixes
+ * it. The file says so with
+ *
+ *   -- applied by hand first: <name> <YYYY-MM-DD>
+ *
+ * and only then may the drift on objects IT declares pass, as a notice. An
+ * object it does not name is still drift. Once applied it is no longer pending,
+ * so the next diff replays it and any real difference from the hand-made
+ * object shows up then.
+ */
+export const HAND_APPLIED_MARKER = /^\s*--\s*applied by hand first:\s*\S.*\d{4}-\d{2}-\d{2}/mi;
+
+const ident = (s) => String(s).replace(/"/g, '').replace(/^public\./i, '').toLowerCase();
+
+/** The objects a migration declares: tables, views, indexes, constraints, added columns. */
+export function declaredObjects(sql) {
+  // Comments out; dollar-quoted DO bodies stay, because a guarded ADD
+  // CONSTRAINT lives inside one.
+  const text = String(sql).replace(/--[^\n]*/g, ' ');
+  const out = { tables: new Set(), views: new Set(), indexes: new Set(), constraints: new Set(), columns: new Set() };
+  const name = String.raw`((?:"?public"?\.)?"?[a-z_][a-z0-9_]*"?)`;
+  for (const m of text.matchAll(new RegExp(String.raw`create\s+table\s+(?:if\s+not\s+exists\s+)?${name}`, 'gi'))) out.tables.add(ident(m[1]));
+  for (const m of text.matchAll(new RegExp(String.raw`create\s+(?:or\s+replace\s+)?view\s+${name}`, 'gi'))) out.views.add(ident(m[1]));
+  for (const m of text.matchAll(new RegExp(String.raw`create\s+(?:unique\s+)?index\s+(?:concurrently\s+)?(?:if\s+not\s+exists\s+)?${name}`, 'gi'))) out.indexes.add(ident(m[1]));
+  for (const m of text.matchAll(new RegExp(String.raw`constraint\s+${name}`, 'gi'))) out.constraints.add(ident(m[1]));
+  for (const m of text.matchAll(new RegExp(String.raw`alter\s+table\s+(?:if\s+exists\s+)?${name}\s+add\s+column\s+(?:if\s+not\s+exists\s+)?${name}`, 'gi'))) {
+    out.columns.add(`${ident(m[1])}.${ident(m[2])}`);
+  }
+  return out;
+}
+
+/** True when one `db diff` statement touches only objects `d` declares. */
+export function statementDeclared(stmt, d) {
+  const s = stmt.toLowerCase();
+  const q = String.raw`"?public"?\."?([a-z0-9_]+)"?`;
+  const created = (t) => d.tables.has(t) || d.views.has(t);
+  let m;
+  if ((m = new RegExp(String.raw`^create\s+or\s+replace\s+view\s+${q}`).exec(s))) return d.views.has(m[1]);
+  if ((m = new RegExp(String.raw`^create\s+(?:unique\s+)?index\s+"?([a-z0-9_]+)"?\s+on\s+(?:only\s+)?${q}`).exec(s))) return created(m[2]) || d.indexes.has(m[1]);
+  if ((m = new RegExp(String.raw`^(?:create|alter)\s+sequence\s+${q}`).exec(s))) {
+    const seq = /^(.+)_[a-z0-9]+_seq$/.exec(m[1]);
+    return Boolean(seq && d.tables.has(seq[1]));
+  }
+  if ((m = new RegExp(String.raw`^(?:grant|revoke)\s+[a-z ,]+\s+on\s+(?:table\s+)?${q}`).exec(s))) return created(m[1]);
+  if ((m = new RegExp(String.raw`^create\s+table\s+${q}`).exec(s))) return d.tables.has(m[1]);
+  if ((m = new RegExp(String.raw`^alter\s+table\s+${q}\s+(.*)$`).exec(s))) {
+    const [, table, rest] = m;
+    if (d.tables.has(table)) return true;
+    const col = /^add\s+column\s+"?([a-z0-9_]+)"?/.exec(rest);
+    if (col) return d.columns.has(`${table}.${col[1]}`);
+    const con = /^(?:add|validate)\s+constraint\s+"?([a-z0-9_]+)"?/.exec(rest);
+    if (con) return d.constraints.has(con[1]);
+  }
+  return false;
+}
+
+/**
+ * Split remaining drift into what a pending hand-applied migration records
+ * and what is still drift. `pending` is [{ name, sql }]; a file without the
+ * marker records nothing.
+ */
+export function splitHandApplied(statements, pending) {
+  const recorders = pending.filter((f) => HAND_APPLIED_MARKER.test(f.sql)).map((f) => ({ name: f.name, d: declaredObjects(f.sql), count: 0 }));
+  const drift = [];
+  for (const stmt of statements) {
+    const r = recorders.find((x) => statementDeclared(stmt, x.d));
+    if (r) r.count += 1;
+    else drift.push(stmt);
+  }
+  return { drift, recorded: recorders.filter((r) => r.count).map(({ name, count }) => ({ name, count })) };
+}
+
 /** Rule 4: the old numbered folder is frozen. */
 export function checkLegacySqlFrozen(names, freeze = LEGACY_SQL_FREEZE) {
   const problems = [];
@@ -295,8 +373,27 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   const arg = (flag) => { const i = process.argv.indexOf(flag); return i > -1 ? process.argv[i + 1] : null; };
   const driftFile = arg('--drift');
   if (driftFile) {
-    const { remaining, ignored } = filterDrift(readFileSync(driftFile, 'utf8'));
+    const { remaining: unfiltered, ignored } = filterDrift(readFileSync(driftFile, 'utf8'));
     for (const k of ignored) console.log(`::notice::known build artefact, not drift: ${k.object} (${k.why})`);
+    // --pending-list: the same `supabase migration list` output, so a pending
+    // file marked "applied by hand first" can account for its own objects.
+    const listFile = arg('--pending-list');
+    let remaining = unfiltered;
+    if (listFile) {
+      const listText = readFileSync(listFile, 'utf8');
+      if (countLedgerRows(listText) === 0) {
+        console.error('✗ could not read the database ledger, so the pending migrations are unknown. This is not a pass.');
+        process.exit(1);
+      }
+      const dir = path.join(ROOT, MIGRATIONS_DIR);
+      const names = existsSync(dir) ? readdirSync(dir).filter((n) => n.endsWith('.sql')).sort() : [];
+      const pending = pendingMigrationFiles(listText, names).map((name) => ({ name, sql: readFileSync(path.join(dir, name), 'utf8') }));
+      const split = splitHandApplied(unfiltered, pending);
+      for (const r of split.recorded) {
+        console.log(`::notice::${r.count} statement(s) are schema applied by hand ahead of ${r.name}, which records them; \`db push\` applies it on merge and later diffs replay it.`);
+      }
+      remaining = split.drift;
+    }
     if (remaining.length) {
       console.error(`✗ the live schema differs from the migrations in this repo (${remaining.length} statement(s)):`);
       for (const s of remaining) console.error(`  ${s.slice(0, 300)}`);

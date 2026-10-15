@@ -396,6 +396,12 @@ export const MODES = Object.freeze([
   }),
 
   // ── Lead leaks and alerts ───────────────────────────────────────────────
+  // 2026-10-15 — System Health Phase 0 (docs/system-health.md).
+  m('HEALTH_CHECKS_MODE', 'alerts', 'enum', OSL, 'shadow', OSL_S, {
+    since: '2026-10-15', evidence: { table: 'health_results', job: 'health-checks' },
+    goLive: 'Mark, handoff 2026-10-14: 5 business days of v_health_check_latest with no false red, then flip',
+    note: 'Evaluates the health_checks owned by the health-checks job every 5 min and writes health_results. Posts nothing.',
+  }),
   m('LEAD_LEAK_MONITOR_MODE', 'alerts', 'enum', OSL, 'shadow', OSL_S, {
     since: '2026-09-26', evidence: job('lead-leak-monitor'),
     note: 'Finds leads that leaked between systems.',

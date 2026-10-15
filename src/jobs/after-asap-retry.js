@@ -12,6 +12,7 @@
 // never post "we fixed it").
 
 import { runJob } from '../job-runner.js';
+import { afterAsapResult } from '../health/watchdog-results.js';
 import {
   retryMode, retryConfig, pickCandidates, recordForCall, decide, buildRetryRecord, attemptsOf, AFTER_LIST,
 } from '../after-asap-retry.js';
@@ -63,7 +64,14 @@ async function readLpDispos(runSQL, phones) {
   return out;
 }
 
-export async function runAfterAsapRetry({ env = process.env, nowMs = Date.now(), deps: depsIn = {} } = {}) {
+// 2026-10-15 (System Health Phase 0): every pass also carries the
+// dialer.connector_after_asap result for runJob to record. Decisions unchanged.
+export async function runAfterAsapRetry(args = {}) {
+  const out = await runAfterAsapRetryPass(args);
+  return out?.skipped ? out : { ...out, health: [afterAsapResult(out)] };
+}
+
+async function runAfterAsapRetryPass({ env = process.env, nowMs = Date.now(), deps: depsIn = {} } = {}) {
   const mode = retryMode(env);
   if (mode === 'off') return { skipped: true, reason: 'AFTER_ASAP_RETRY_MODE=off', mode };
   const d = { ...(depsIn.runSQL && depsIn.supabase ? {} : await defaultDeps()), ...depsIn };

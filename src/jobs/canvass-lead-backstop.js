@@ -22,6 +22,7 @@
  */
 
 import { runJob } from '../job-runner.js';
+import { intakeSweepResult } from '../health/watchdog-results.js';
 import {
   backstopMode, buildCanvassCandidatesSql, selectCanvassLeads, liveHasLpId,
   buildPayloadFromContact, formatBackstopCard, markKey,
@@ -111,7 +112,9 @@ export async function runCanvassLeadBackstop({ env = process.env, nowMs = Date.n
 
   const errors = [];
   const out = { mode, candidates: 0, would_send: 0, sent: 0, failed: 0, live_has_lp: 0, skipped: {}, errors };
-  const finish = () => ({ ok: errors.length === 0, ...out });
+  // 2026-10-15 (System Health Phase 0): lead.canvass_to_lp rides on every finish.
+  let readFailed = false;
+  const finish = () => ({ ok: errors.length === 0, ...out, health: [intakeSweepResult('lead.canvass_to_lp', out, { readFailed })] });
 
   let picked;
   try {
@@ -130,6 +133,7 @@ export async function runCanvassLeadBackstop({ env = process.env, nowMs = Date.n
     picked = selectCanvassLeads(candidates, { lpPhones, arrived, tried, sentElsewhere, nowMs, max: MAX_PER_PASS });
   } catch (err) {
     errors.push(`read: ${err.message}`);
+    readFailed = true;
     return finish();
   }
   out.skipped = picked.skipped;

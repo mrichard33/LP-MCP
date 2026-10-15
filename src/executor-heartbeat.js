@@ -190,6 +190,7 @@
  */
 
 import supabase from './supabase.js';
+import { recordThrottled, queueDepthResult, rateLimiterResult, executorHeartbeatResult } from './health/watchdog-results.js';
 import { executeActions } from './action-executor.js';
 import { reapStaleLocks } from './actions/reaper.js';
 import { shouldAlertQueueDepth, formatQueueAlert } from './executor-queue-alerts.js';
@@ -520,7 +521,7 @@ async function maybeAlertLimiter() {
   if (res.sent && alert) {
     console.warn(`[ExecutorHeartbeat] limiter alert sent — ${reasons.join('; ')}`);
   }
-  return { alerted: !!(res.sent && alert), action: res.action, reasons, stats: curr };
+  return { alerted: !!(res.sent && alert), alert: !!alert, action: res.action, reasons, stats: curr };
 }
 
 /**
@@ -617,6 +618,8 @@ export async function runHeartbeat({ force = false } = {}) {
   try {
     queueStats = await getQueueStats({ force });
     if (!queueStats.stale) await maybeAlertQueueDepth(queueStats);
+    // 2026-10-15 (System Health Phase 0): agent.queue_depth, fresh samples only.
+    recordThrottled(queueDepthResult(queueStats), { intervalMs: 4 * 60_000 });
   } catch (err) {
     console.warn(`[ExecutorHeartbeat] queue stats/alert failed: ${err.message}`);
   }
@@ -627,7 +630,9 @@ export async function runHeartbeat({ force = false } = {}) {
   // and stays on every cycle; the failure-rate check is DB-backed and
   // follows the sample interval.
   try {
-    await maybeAlertLimiter();
+    const lim = await maybeAlertLimiter();
+    // 2026-10-15 (System Health Phase 0): ghl.rate_limiter, once a minute.
+    recordThrottled(rateLimiterResult({ alert: lim?.alert, reasons: lim?.reasons, error: lim?.error }));
   } catch (err) {
     console.warn(`[ExecutorHeartbeat] limiter alert check failed: ${err.message}`);
   }
@@ -648,6 +653,8 @@ export async function runHeartbeat({ force = false } = {}) {
   }
 
   const health = await checkExecutorHealth();
+  // 2026-10-15 (System Health Phase 0): agent.executor_heartbeat, once a minute.
+  recordThrottled(executorHeartbeatResult(health));
 
   if (!force && !health.needs_run) {
     const ageSeconds = health.age_ms != null ? Math.round(health.age_ms / 1000) : null;

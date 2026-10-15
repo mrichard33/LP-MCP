@@ -314,7 +314,8 @@ import { registerFreshnessRefreshRoutes, startFreshnessRefreshScheduler } from '
 import { registerLinkLeakRoutes, startLinkLeakScheduler } from './jobs/link-leak-monitor.js';
 import { registerP2UnresolvableRoutes, startP2UnresolvableScheduler } from './jobs/p2-unresolvable-monitor.js';
 import { registerTagHygieneRoutes, startTagHygieneScheduler } from './jobs/tag-hygiene-sweep.js';  // 2026-09-22
-import { startRuleTargetCheckScheduler } from './jobs/rule-target-check.js';  // 2026-10-12 F-L: rules must target published workflows
+import { startRuleTargetCheckScheduler } from './jobs/rule-target-check.js';
+import { startHealthChecksScheduler } from './jobs/health-checks.js';  // 2026-10-15 System Health Phase 0  // 2026-10-12 F-L: rules must target published workflows
 import { registerCleanup20261002Routes } from './admin/cleanup-2026-10-02-f0-s52.js';  // 2026-10-02 — one-time F.0 / S5.2 cleanup
 import { startSiteEventsRetentionScheduler } from './jobs/site-events-retention.js';  // 2026-10-01
 import { startF0IntegrityAuditScheduler } from './jobs/f0-integrity-audit.js';  // 2026-09-30
@@ -986,6 +987,7 @@ const server = app.listen(PORT, async () => {
   startP2UnresolvableScheduler();
   startTagHygieneScheduler();
   startRuleTargetCheckScheduler();
+  startHealthChecksScheduler();  // 2026-10-15 System Health: health_results every 5 min (HEALTH_CHECKS_MODE)
   startSiteEventsRetentionScheduler();
   startF0IntegrityAuditScheduler();
   startOpsMorningDigestScheduler();

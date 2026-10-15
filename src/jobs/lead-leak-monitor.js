@@ -84,6 +84,7 @@
 //   src/lead-speed.js: 8am–8pm ET Mon–Fri, 9am–5pm ET Sat–Sun).
 
 import { runSQL as defaultRunSQL } from '../admin/supabase-admin.js';
+import { leadLeakResults, uncalledLiveResults } from '../health/watchdog-results.js';
 import { hlRunSQL as defaultHlRunSQL } from '../admin/hl-client.js';
 import defaultSupabase from '../supabase.js';
 import {
@@ -921,7 +922,8 @@ export async function runLeadLeakMonitor({ env = process.env, nowMs = Date.now()
     console.warn(`[LeadLeak] insufficient_evidence — ${m.errors.join('; ')}`);
     // Not ok:false — runJob would file that `failed`. It could not tell, so
     // it is `unknown` (docs/job-runs.md).
-    return { checked: false, readFailed: true, verdict: m.verdict, reason: m.errors.join('; '), mode: cfg.mode };
+    return { checked: false, readFailed: true, verdict: m.verdict, reason: m.errors.join('; '), mode: cfg.mode,
+      health: leadLeakResults({ m, nowMs }) };
   }
 
   const errors = [...m.errors];
@@ -954,6 +956,13 @@ export async function runLeadLeakMonitor({ env = process.env, nowMs = Date.now()
   const speedDecision = m.speed.decision;
   const intakeDecision = shouldAlertIntakeGap(m.intake?.rows ?? null, { readOk: !!m.intake });
   const retiredDecision = shouldAlertRetiredCode(m.retiredFresh);
+  // 2026-10-15 (System Health Phase 0): the same numbers, recorded as
+  // health_results by runJob. Yesterday's speed row is already in hand.
+  const health = leadLeakResults({
+    m, nowMs, retiredDecision,
+    speedRow: (m.speed?.daily || []).find((d) => d.created_day === shiftDay(m.runDate, -1)) || null,
+    inboundQueueSplit: LEAK_REASONS.includes('in_inbound_queue'),
+  });
   if (digest) {
     // 2026-10-07: the digest posts these, but the alert rows must still track
     // the truth — otherwise 'Leads never reached LP' stayed firing from 10-02.
@@ -981,6 +990,7 @@ export async function runLeadLeakMonitor({ env = process.env, nowMs = Date.now()
         intakeUnreadable: intakeDecision.verdict === 'insufficient_evidence',
       },
       ...(hardFailure ? { errors } : { notes: errors }),
+      health,
     };
   }
   await deliverAlert({
@@ -1043,6 +1053,7 @@ export async function runLeadLeakMonitor({ env = process.env, nowMs = Date.now()
     stored,
     posted,
     ...(hardFailure ? { errors } : { notes: errors }),
+    health,
   };
 }
 
@@ -1118,6 +1129,12 @@ export async function runLeadUncalledCheck({ env = process.env, nowMs = Date.now
     m.offenders = hold.named;
   }
   const decision = shouldAlertUncalled(m.offenders, { readOk: m.verdict !== 'insufficient_evidence' });
+  // 2026-10-15 (System Health Phase 0): every return below carries the
+  // lead.uncalled_live result; runJob writes it. The card logic is unchanged.
+  const health = uncalledLiveResults({
+    decision, offenders: decision.verdict === 'alert' ? m.offenders : [], nowMs, errors: m.errors,
+  });
+  const withHealth = (out) => ({ ...out, health });
 
   // 2026-10-02 (Mark, alert noise cut): name only leads never posted before
   // (7 days, audit 'lead_uncalled'), and stay silent when there is none. No
@@ -1133,7 +1150,7 @@ export async function runLeadUncalledCheck({ env = process.env, nowMs = Date.now
     }
     if (decision.verdict === 'insufficient_evidence') {
       console.log(`[LeadLeak] uncalled check — could not read (${m.errors.join('; ')})`);
-      return { checked: false, readFailed: true, reason: m.errors.join('; ') };
+      return withHealth({ checked: false, readFailed: true, reason: m.errors.join('; ') });
     }
     const offenders = decision.verdict === 'alert' ? m.offenders : [];
     const filterNew = deps.filterNew || defaultFilterNew;
@@ -1144,11 +1161,11 @@ export async function runLeadUncalledCheck({ env = process.env, nowMs = Date.now
       : { fresh: [], dedupe: 'none' };
     if (dedupe === 'unavailable') {
       console.warn('[LeadLeak] uncalled check — posted-leads store unreadable, holding the card (it would re-list every lead hourly)');
-      return { ok: true, mode: aMode, verdict: decision.verdict, summary: `waiting=${decision.count} dedupe_unavailable` };
+      return withHealth({ ok: true, mode: aMode, verdict: decision.verdict, summary: `waiting=${decision.count} dedupe_unavailable` });
     }
     if (!fresh.length) {
       console.log(`[LeadLeak] uncalled check ${aMode} — waiting=${decision.count ?? 0}, none new — no card`);
-      return { ok: true, mode: aMode, verdict: decision.verdict, summary: `waiting=${decision.count} new=0` };
+      return withHealth({ ok: true, mode: aMode, verdict: decision.verdict, summary: `waiting=${decision.count} new=0` });
     }
     // 2026-10-14: `reason: 'uncalled'` above is the dedupe store's audit reason,
     // and it overwrote each lead's real reason, so every line read "uncalled" —
@@ -1159,16 +1176,16 @@ export async function runLeadUncalledCheck({ env = process.env, nowMs = Date.now
     const text = formatUncalledAlert(named, { cfg: acfg, dashboardUrl: cfg.dashboardUrl, nowMs });
     if (aMode === 'shadow') {
       console.log(`[LeadLeak] shadow uncalled — would send ${fresh.length} new:\n${text}`);
-      return { ok: true, mode: aMode, verdict: decision.verdict, summary: `waiting=${decision.count} new=${fresh.length} shadow` };
+      return withHealth({ ok: true, mode: aMode, verdict: decision.verdict, summary: `waiting=${decision.count} new=${fresh.length} shadow` });
     }
     const send = deps.sendAlertMessage || defaultSendAlertMessage;
     const sent = await send(text, { channel: 'ops' });
     if (sent?.sent === false) {
-      return { ok: false, mode: aMode, verdict: decision.verdict, errors: [`slack: ${sent?.reason || 'not sent'}`] };
+      return withHealth({ ok: false, mode: aMode, verdict: decision.verdict, errors: [`slack: ${sent?.reason || 'not sent'}`] });
     }
     await recordPosted({ audit: UNCALLED_AUDIT, items: fresh, nowMs, deps: { supabase: deps.supabase } });
     console.log(`[LeadLeak] uncalled check — posted ${fresh.length} new of ${decision.count} waiting`);
-    return { ok: true, mode: aMode, verdict: decision.verdict, summary: `waiting=${decision.count} new=${fresh.length} posted` };
+    return withHealth({ ok: true, mode: aMode, verdict: decision.verdict, summary: `waiting=${decision.count} new=${fresh.length} posted` });
   }
 
   const res = await deliverAlert({
@@ -1180,9 +1197,9 @@ export async function runLeadUncalledCheck({ env = process.env, nowMs = Date.now
   });
   console.log(`[LeadLeak] uncalled check ${aMode} ${decision.verdict} — waiting=${decision.count ?? '?'} (${res?.action})`);
   if (decision.verdict === 'insufficient_evidence') {
-    return { checked: false, readFailed: true, reason: m.errors.join('; ') };
+    return withHealth({ checked: false, readFailed: true, reason: m.errors.join('; ') });
   }
-  return { ok: true, mode: aMode, verdict: decision.verdict, summary: `waiting=${decision.count} ${res?.action}` };
+  return withHealth({ ok: true, mode: aMode, verdict: decision.verdict, summary: `waiting=${decision.count} ${res?.action}` });
 }
 
 /* --- endpoint ----------------------------------------------------------- */

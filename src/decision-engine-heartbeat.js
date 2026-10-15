@@ -77,6 +77,7 @@
  */
 
 import supabase from './supabase.js';
+import { recordThrottled, replySlaResult } from './health/watchdog-results.js';
 import { processEvents } from './decision-engine.js';
 import { reportAlertCondition, FLAP_SUSTAIN_MS } from './alert-state.js';
 import {
@@ -528,6 +529,9 @@ export async function runDecisionEngineHeartbeat({ force = false } = {}) {
   // must run before the skip branch. Never throws into the heartbeat.
   lastReplySlaCheck = await runReplySlaWatchdog()
     .catch((err) => { console.warn(`[DecisionEngineHeartbeat] reply SLA watchdog threw (ignored): ${err.message}`); return { error: err.message }; });
+  // 2026-10-15 (System Health Phase 0): agent.bot_reply_sla, at most every 5
+  // min (this tick runs every minute). Fire and forget; never blocks the tick.
+  recordThrottled(replySlaResult(lastReplySlaCheck), { intervalMs: 5 * 60_000 });
 
   // 2026-10-11 — the one no-reply follow-up after a held opener-race reply
   // (src/jobs/no-reply-followup.js). Same placement as the reply SLA: a held
