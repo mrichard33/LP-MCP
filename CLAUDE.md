@@ -1026,6 +1026,33 @@ Conf list could call him first. While the team is closed, `parseSlots` drops in-
 `AFTER_HOURS_VISIT_EARLIEST_HOUR` (default 14, 0 = off; `visitTooEarlyAfterHours` in `team-hours.js`). Calls (PPR) and
 later days are untouched. The lead always goes to LP first; Five9 Conf lists are filled from LP by the new-lead dial backstop.
 
+**The bot books an in-home time only where the market's LP capacity is open (Mark, 2026-10-15).** GHL appointments
+carry no market and Mark ruled out per-market calendars, so `src/knowledge/market-capacity-gate.js` decides: open =
+rep slots (`lp_capacity_slots` joined to `lp_branch_market_map`; the table has NO market column) − `has_appt` − bot
+bookings not yet in LP (a completed `book_appointment` stamped `capacity_market`, no LP sync mark since). A date past
+`v_capacity_submission_horizon` is `unfiled` (closed); a band overlapping an active `market_meeting_blocks` row is
+`meeting`. Bands are `bandOfEtTime` (18:00, 18:30 and 19:00 are all Evening). Only BOT reads pass `marketCode` to
+`fetchFreeSlots` (SMS slot read and `recheckSlot`, live chat `cachedFreeSlots` / `bookSlot`); the LP→GHL sync,
+call-center bookings and manual moves never do, and must not. The market is `context.market.market_code` (the short
+zip code, SAR / BOCA / LAKE); HOU and WSNC map to nothing and are not gated (`capacity_gate_skipped:not_in_universe`).
+A failed capacity read opens the gate (logged). When the gate empties the offer window the bot offers the two earliest
+times the market can take in 14 days and NEVER the booking link (the widget books past the gate); with none, the team
+reaches out and #contact-center gets one card a day (`postNoCapacityCard`). Job `capacity-unfiled-alert` tells the
+market's `sales-<slug>` channel once a day about unfiled days in the next `UNFILED_ALERT_DAYS_AHEAD`.
+`CAPACITY_GATE_ENABLED=false` restores the old reads exactly, the 6:30 / 7:00 handling included.
+**A 6:30 / 7:00 ask books 6:00 PM, and LP gets a note (Mark, 2026-10-15; the user: AI-worded, same meaning).**
+`src/agentic/evening-request.js`: "6:30", "7pm", "at 7", "after 6" on a day they name (or the day we offered) pins
+6:00 PM that day when it is open through the gate; the booking facts' reference is "I'm putting you for 6:00, with a
+note that you would like the appointment for {time}. Our team will be reaching out to confirm the details and make
+that adjustment for you." (`checkEveningReply`; keep "confirm the details": `NOT_A_CALLBACK_RX` reads it, so no
+Five9 callback is filed). Once the booking LANDS (`recordEveningRequest`): a GHL note, the Requested Appointment Time
+field (`7lpRWFDM8DZbLd3viHEG`) OVERWRITTEN (`overwriteRequestedTime`, never the fill-if-empty path, which the
+generator skips that turn), one `appt_time_change_requests` row and one #contact-center card. No tag, no GHL task.
+The row becomes ONE IMPORTANT LP prospect note (`writeLpNote`) from `syncAppointmentToLP`'s success path
+(fire-and-forget) or job `time-change-lp-note-sweep` (15 min; a cancel or move off 6:00 supersedes it; one card after
+`LP_NOTE_ALERT_AFTER_MINUTES`; failed after 24h). The row is claimed before the write, so the hook and the sweep never
+both write it.
+
 **No line twice, one reply per burst (Mark, 2026-10-02).** Lines that recur in a thread come in variants
 (`bridgeLine`, `LINES.offer_slots(slots, n)`, `ALT_LINES`); `pickFresh` never picks one whose opening words were
 already sent, and `enforceNepqPlan` drops a sentence already sent word for word. Every offer variant keeps

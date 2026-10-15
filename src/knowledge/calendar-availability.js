@@ -164,6 +164,21 @@ export function spreadCallOffer(slots, maxOffer = MAX_OFFER_SLOTS) {
  *   or null on any failure (no API key, network error, non-2xx, 429, parse error).
  */
 export async function fetchFreeSlots(calendarId, opts = {}) {
+  const value = await fetchFreeSlotsUngated(calendarId, opts);
+  // 2026-10-15 (Mark, market capacity gate): a bot read names the lead's market
+  // (`marketCode`), and an in-home calendar then keeps only the times that
+  // market's LP capacity can take (market-capacity-gate.js). No market named
+  // (the LP→GHL sync, call-center and manual paths), a phone calendar, or
+  // CAPACITY_GATE_ENABLED=false → the read is returned exactly as before.
+  if (!value || opts.marketCode === undefined || !Array.isArray(value.slots)) return value;
+  const { filterSlotsByCapacity, capacityGateEnabled } = await import('./market-capacity-gate.js');
+  if (!capacityGateEnabled()) return value;
+  const r = await filterSlotsByCapacity({ calendarId, marketCode: opts.marketCode, slots: value.slots }, opts.capacityDeps);
+  if (!r.gated) return value;
+  return { ...value, slots: r.slots, capacity_gate: { market: r.market, removed: r.removed } };
+}
+
+async function fetchFreeSlotsUngated(calendarId, opts = {}) {
   if (!calendarId) return null;
   // 2026-10-03 replay: one GHL free-slots read timed out (10s) on the turn a
   // lead said "Usually on Wednesdays"; with no times the text bot pitched the
@@ -353,6 +368,14 @@ function formatSlot(iso, timezone) {
 export function formatSlotsForPrompt(availability) {
   if (!availability) return null;
 
+  // R6 (Mark, 2026-10-15): the lead's market has no in-home time open for two
+  // weeks. The booking link would book past the capacity gate, so none is sent.
+  if (availability.capacity_gated_empty) {
+    return [
+      'CALENDAR AVAILABILITY: NO in-home visit times are open in this lead\'s area for the next two weeks.',
+      'Do NOT send a booking link and do NOT propose a date or time. Say our team will reach out to find a time that works. No other promise.',
+    ].join('\n');
+  }
   if (!availability.slots || availability.slots.length === 0) {
     return [
       'CALENDAR AVAILABILITY: NO open slots in the configured window.',

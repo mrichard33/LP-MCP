@@ -409,6 +409,9 @@ import { offeredSlots, pickSlot } from './live-chat/cancel-flow.js';
 import { holdLine, COLLECT_ASK, dmAsk, parseDecisionMakers } from './agentic/booking-collect.js';
 import { contactRecheckLine, recheckHint, RECHECK_RX } from './agentic/contact-check.js';
 import { smsBookingTurn, enforceBookingFacts, bookingFactsNote, bookingBackedByCode } from './agentic/sms-booking-turn.js';
+import { findSixPmSlot, eveningRequestFromThread, eveningReplyLine } from './agentic/evening-request.js';
+import { capacityGateEnabled, isInHomeCalendar } from './knowledge/market-capacity-gate.js';
+import { postNoCapacityCard } from './notifications/capacity-cards.js';
 import { LINES as NEPQ_LINES } from './agentic/nepq-planner.js';
 import { buildStageInput, leadStageMode } from './agentic/lead-stage.js';
 import { typedZipFromThread, zoneForContact } from './services/contact-timezone.js';
@@ -3977,7 +3980,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       // 2026-10-01: in the contact's market zone (Houston → Central).
       // Two weeks of openings, not the first 12 (about four days): a day
       // preference ("usually Wednesdays") needs next week too (Part 6).
-      availability = await memo(`slots:${calendarId}`, () => fetchFreeSlots(calendarId, { timezone: promptTimezoneFor(context), maxSlots: FULL_SLOT_READ, ...(calendarId === BOOKING_CALENDARS.PROTECTION_PROFILE_REVIEW ? { minNoticeHours: CALL_MIN_NOTICE_HOURS } : {}) }));
+      availability = await memo(`slots:${calendarId}`, () => fetchFreeSlots(calendarId, { timezone: promptTimezoneFor(context), maxSlots: FULL_SLOT_READ, marketCode: context.market?.market_code ?? null, ...(calendarId === BOOKING_CALENDARS.PROTECTION_PROFILE_REVIEW ? { minNoticeHours: CALL_MIN_NOTICE_HOURS } : {}) }));
     } catch (err) {
       console.warn(`[ResponseGenerator] Calendar availability fetch threw for ${contactId} (cal ${calendarId}): ${err.message} — proceeding without`);
       availability = null;
@@ -4015,7 +4018,24 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
         offerWindowHours: 24 * 14, maxOffer: 500,
         ...(calendarId === BOOKING_CALENDARS.PROTECTION_PROFILE_REVIEW ? { call: true, isOpen: isTeamOpen } : {}),
       })?.slots || [];
+      const capacityGate = availability?.capacity_gate || null;
       availability = offerSelection.availability;
+      // R6 (Mark, 2026-10-15): the market capacity gate thinned the calendar.
+      // The booking link would skip the gate (the widget books any GHL time),
+      // so it is never sent. The two earliest times the market can take in
+      // the next 14 days are offered; with none, the team reaches out and
+      // #contact-center gets one card.
+      if (capacityGate && !(availability?.slots || []).length) {
+        if (kbPack?.booking_context) kbPack.booking_context.booking_url = null;
+        if (preferencePool.length) {
+          availability = { ...(availability || {}), slots: preferencePool.slice(0, 2) };
+          console.log(`[CapacityGate] ${contactId} market=${capacityGate.market}: nothing open in the offer window — offering the next ${Math.min(2, preferencePool.length)} the market can take`);
+        } else {
+          availability = { ...(availability || {}), slots: [], capacity_gated_empty: true };
+          console.log(`[CapacityGate] ${contactId} market=${capacityGate.market}: no in-home time open for 14 days — no booking link, the team reaches out`);
+          if (!dryRun) postNoCapacityCard({ contactId, market: capacityGate.market, name: [context.lead?.first_name, context.lead?.last_name].filter(Boolean).join(' ') || null, channel: 'sms' }).catch(() => {});
+        }
+      }
     }
   } catch (err) {
     console.warn(`[ResponseGenerator] offer-window selection threw for ${contactId}: ${err.message} — using unfiltered availability`);
@@ -4246,7 +4266,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // rendered into the plan block; the model writes the reply; the draft is
   // checked against them right after it comes back (enforceBookingFacts).
   let bookingFacts = null;
-  if (nepqMode === 'live' && channel === 'sms' && nepqPlan && !nepqPlan.rehash_call_slots && (nepqPlan.required_move === 'confirm' || nepqPlan.step === 'collect')) {
+  if (nepqMode === 'live' && channel === 'sms' && nepqPlan && !nepqPlan.rehash_call_slots && (nepqPlan.required_move === 'confirm' || nepqPlan.step === 'collect' || (nepqPlan.required_move === 'offer_slots' && capacityGateEnabled()))) {
     try {
       const idn = identityState?.identity || {};
       const thread = (context.conversation_recent || []).map(m => ({ direction: String(m?.direction || '').toLowerCase() === 'outbound' ? 'outbound' : 'inbound', text: String(m?.text ?? m?.body ?? '') }));
@@ -4260,8 +4280,22 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       // the one item every visit must carry, so it is asked for.
       const gateMissing = smsGateMissing(inHomeGate, bookingGate);
       const tzl = tzLabel(promptTimezoneFor(context));
+      // R5 (Mark, 2026-10-15): an ask for 6:30 / 7:00 / "after 6" books 6:00 PM
+      // that day when 6:00 is open and the market's capacity takes it
+      // (fullSlotsForPick is already through the gate). A held 6:00 picked up
+      // on a later turn finds the ask in the thread. Off with the gate.
+      let eveningPin = null;
+      let eveningAsk = null;
+      if (capacityGateEnabled() && isInHomeCalendar(calendarId)) {
+        if (nepqPlan.required_move === 'offer_slots' || nepqPlan.required_move === 'confirm') {
+          eveningPin = findSixPmSlot({ text: triggerMessage, slots: fullSlotsForPick, offered: offeredSlots(nepqPlan.last_offer || '', fullSlotsForPick), timeZone: promptTimezoneFor(context) });
+          if (eveningPin) console.log(`[EveningRequest] ${contactId} asked for ${eveningPin.requested_time}: 6:00 PM ${eveningPin.slot.iso} is open — pinned`);
+        }
+        eveningAsk = eveningPin ? { requested_time: eveningPin.requested_time, minutes: eveningPin.requested_minutes } : eveningRequestFromThread(thread);
+      }
       bookingFacts = smsBookingTurn({
         plan: nepqPlan, trigger: triggerMessage, thread, slots: fullSlotsForPick,
+        pinnedSlot: eveningPin?.slot || null, evening: eveningAsk, timeZone: promptTimezoneFor(context),
         tz: tzl,
         gateMissing,
         onFileAddress: inHomeGate && idn.address_line1 && idn._source?.address_line1 === 'ghl_record' ? { address1: idn.address_line1, city: idn.city || null } : null,
@@ -4274,7 +4308,9 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
           kind: bookingFacts.kind, label: bookingFacts.label, ask: bookingFacts.ask, ask_line: bookingFacts.ask_line,
           first_name: firstName || bookingFacts.thread_name || null,
           alternatives_text: bookingFacts.alternatives.length === 2 ? bookingFacts.alternatives.map(x => `${x.day} at ${x.time} ${x.tz || tzl}`.trim()).join(' or ') : null,
+          ...(bookingFacts.evening ? { evening_request: bookingFacts.evening.requested_time, evening_line: eveningReplyLine(bookingFacts.evening.requested_time) } : {}),
         };
+        if (eveningPin && bookingFacts.slot?.iso === eveningPin.slot.iso) nepqPlan = { ...nepqPlan, required_move: 'confirm', evening_pin: eveningPin.requested_time };
         console.log(`[NEPQ] ${contactId} SMS booking facts: ${JSON.stringify(bookingFacts.record)}`);
       }
     } catch (err) {
@@ -4383,6 +4419,18 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     validated.message = checked.message;
     validated.companion_action = checked.companion;
     validated.sms_booking = checked.record;
+    // R5: what the send handler writes once the 6:00 PM booking lands.
+    if (bookingFacts.kind === 'book' && bookingFacts.evening) {
+      validated.evening_request = {
+        requested_time: bookingFacts.evening.requested_time,
+        requested_label: bookingFacts.evening.requested_label,
+        slot_iso: bookingFacts.slot.iso,
+        time_zone: promptTimezoneFor(context),
+        market_code: context.market?.market_code ?? null,
+        first_name: context.lead?.first_name || null,
+        last_name: context.lead?.last_name || null,
+      };
+    }
     console.log(`[NEPQ] ${contactId} SMS booking ${bookingFacts.kind}: ${checked.fallback_used ? `fixed line (${checked.problems.join(',')})` : 'AI-written'}${checked.notes.length ? ` fixes=${checked.notes.join(',')}` : ''}`);
   }
 
@@ -4395,7 +4443,9 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       ...(context.conversation_recent || []),
       { direction: 'outbound', text: validated.message },
     ]);
-    if (acceptedPref && acceptedPref.source === 'bot_accepted') {
+    // R5: the Requested Appointment Time field is overwritten after the send;
+    // a fill-if-empty write this turn must not race it.
+    if (acceptedPref && acceptedPref.source === 'bot_accepted' && !validated.evening_request) {
       if (!dryRun) persistPreferredTime(contactId, acceptedPref).catch(() => {});
     }
   } catch (err) {
@@ -5396,6 +5446,9 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     // For the re-check right before booking (send handler, slot-recheck.js).
     validated.slot_timezone = promptTimezoneFor(context);
     validated.slot_tz_label = tzLabel(promptTimezoneFor(context));
+    // 2026-10-15 (market capacity gate): the lead's market, for the capacity
+    // re-check and the booking's capacity_market stamp in the send handler.
+    validated.slot_market_code = context.market?.market_code ?? null;
 
     // (a) authoritative calendar id — decoupled from bookingResolution so this
     //     fires even when the resolver was skipped (e.g. an ack/status turn that

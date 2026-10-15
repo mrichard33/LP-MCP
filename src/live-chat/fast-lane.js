@@ -68,6 +68,9 @@ import { lpNoteDqMode } from '../agentic/lp-note-dq.js';
 import { enforceOneAsk } from '../agentic/one-ask.js';
 import { looksLikeShortPhone } from '../agentic/contact-typos.js';
 import { planNepqTurn, enforceNepqPlan, referenceRetryNote, nepqBackboneMode, pickFresh, LINES as NEPQ_LINES, isServiceCallback, dropUnsafeLines, leadWantsCall } from '../agentic/nepq-planner.js';
+import { nearestTwo } from '../agentic/slot-recheck.js';
+import { findSixPmSlot, eveningRequestFromThread, eveningReplyLine, requestedLabel } from '../agentic/evening-request.js';
+import { capacityGateEnabled } from '../knowledge/market-capacity-gate.js';
 import { buildStageInput, leadStageMode, rescheduleStepFor } from '../agentic/lead-stage.js';
 import { typedZipFromThread } from '../services/contact-timezone.js';
 import { shouldRecordPromise } from '../agentic/sms-format.js';
@@ -648,6 +651,8 @@ export function createLiveChatFastLane(deps) {
     shadowModelEnabled: () => !!process.env.LIVE_CHAT_SHADOW_MODEL,
     offerBookingSlots: async () => ({ slots: [], tzLabel: 'ET' }),
     bookSlot: async () => ({ ok: false, error: 'no book dep' }),
+    // 2026-10-15 (R5): the 6:30 / 7:00 side effects. Default does nothing.
+    recordEveningRequest: async () => null,
     nepqHandoff: async () => null,
     // 2026-10-07 — promised calls (src/services/promised-callbacks-io.js).
     // Defaults change nothing and record nothing.
@@ -1145,6 +1150,7 @@ export function createLiveChatFastLane(deps) {
                 kind: nepqOut.facts.kind, label: nepqOut.facts.label, ask: nepqOut.facts.ask, ask_line: nepqOut.facts.ask_line,
                 first_name: nepqOut.firstName || realFirst || null,
                 alternatives_text: nepqOut.facts.alternatives.length === 2 ? nepqOut.facts.alternatives.map(x => `${x.day} at ${x.time} ${x.tz || ''}`.trim()).join(' or ') : null,
+                ...(nepqOut.facts.evening ? { evening_request: nepqOut.facts.evening.requested_time, evening_line: eveningReplyLine(nepqOut.facts.evening.requested_time) } : {}),
               },
             };
           } else {
@@ -1676,16 +1682,27 @@ export function createLiveChatFastLane(deps) {
     // for what the booking still needs, one item at a time, then book it
     // (Mark, 2026-10-02: "ask first, then book"; booking-collect.js). A person
     // is brought in only when GHL still refuses the booking.
-    const isConfirm = plan.required_move === 'confirm' && slots?.slots?.length;
-    const isCollect = plan.required_move === 'collect';
+    // R5 (Mark, 2026-10-15): an ask for 6:30 / 7:00 / "after 6" books 6:00 PM
+    // that day when 6:00 is open and the market's capacity takes it (the
+    // slots are already through the gate). Off with CAPACITY_GATE_ENABLED.
+    const eveningOn = capacityGateEnabled() && (plan.required_move === 'offer_slots' || plan.required_move === 'confirm' || plan.required_move === 'collect');
+    const eveningPool = [...(slots?.slots || []), ...((slots?.all || []).filter(a => !(slots?.slots || []).some(x => x.iso === a.iso)))];
+    const eveningPin = eveningOn && plan.required_move !== 'collect' && eveningPool.length
+      ? findSixPmSlot({ text: body, slots: eveningPool, offered: offeredSlots(lastOutbound || '', eveningPool), timeZone: slots?.timeZone || 'America/New_York' })
+      : null;
+    if (eveningPin) d.log(`[EveningRequest] live chat ${contactId} asked for ${eveningPin.requested_time}: 6:00 PM ${eveningPin.slot.iso} is open — pinned`);
+    const isConfirm = (plan.required_move === 'confirm' || !!eveningPin) && slots?.slots?.length;
+    const isCollect = !eveningPin && plan.required_move === 'collect';
     if (isConfirm || isCollect) {
       const tz = slots?.tzLabel || '';
       // Every real opening, not just the two nearest: an offer can name any of
       // them (Part 7 replay: "usually Wednesdays" offered Wed, Oct 7, and "the
       // first one" was lost because only the next two openings were searched).
-      const pool = [...(slots?.slots || []), ...((slots?.all || []).filter(a => !(slots?.slots || []).some(x => x.iso === a.iso)))];
+      const pool = eveningPool;
       let chosen = null;
-      if (isConfirm) {
+      if (eveningPin) {
+        chosen = eveningPin.slot;
+      } else if (isConfirm) {
         const offered = offeredSlots(lastOutbound || '', pool);
         chosen = pickSlot(body, offered.length ? offered : []);
         if (!chosen) return null;
@@ -1698,11 +1715,19 @@ export function createLiveChatFastLane(deps) {
           return { reply: `That time just filled up. ${NEPQ_LINES.offer_slots(two, plan.counters?.slot_offers || 0)}`, slots: two, record: { collect: 'held_slot_gone' } };
         }
       }
+      // R5: the evening ask behind a 6:00 PM pick, this turn or held from an earlier one.
+      const zoneName = slots?.timeZone || 'America/New_York';
+      const eveningSrc = eveningPin ? { requested_time: eveningPin.requested_time, minutes: eveningPin.requested_minutes }
+        : (eveningOn ? eveningRequestFromThread([...threadTurns, { direction: 'inbound', text: body }]) : null);
+      const evening = eveningSrc && new Intl.DateTimeFormat('en-US', { timeZone: zoneName, hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(new Date(chosen.iso)) === '18:00'
+        ? { requested_time: eveningSrc.requested_time, requested_minutes: eveningSrc.minutes ?? null, requested_label: requestedLabel(eveningSrc.requested_time, chosen.iso, zoneName) }
+        : null;
       // Part 7: the facts of this booking turn, for the model to write the
       // reply from (enforceBookingFacts checks it; `fallback` is the backup).
       const factsFor = (kind, { ask = null, ask_line = null, alternatives = [], book = false, fallback, record }) => ({
         kind, slot: { ...chosen, tz: chosen.tz || tz }, label: slotLabel(chosen, tz), ask, ask_line, book,
         alternatives: alternatives.map(x => ({ ...x, tz: x.tz || tz })), fallback, companion: null, record,
+        ...(evening && (kind === 'book' || kind === 'hold') ? { evening } : {}),
       });
       // What the visitor has typed in this chat (name, phone, street, zip),
       // and the decision-maker answer when that was our question.
@@ -1765,12 +1790,14 @@ export function createLiveChatFastLane(deps) {
         const askLine = pickFresh([firstAsk, COLLECT_ASK_AGAIN[missing[0]]].filter(Boolean), plan.recent_outbound || [], 0);
         // 2026-10-02 (Mark): no opener twice in a row ("Got it." … "Got it.").
         const ack = (typed.first_name && plan.held_slot?.asked === 'name') ? `Thanks, ${typed.first_name}.` : pickFresh(['Got it.', 'Perfect, thanks.', 'Great, thank you.'], plan.recent_outbound || [], 0);
-        const reply = isConfirm ? holdLine(chosen, tz, askLine) : `${ack} ${askLine}`;
+        const reply = isConfirm
+          ? (evening ? `I'm holding ${slotLabel(chosen, tz)} for you. I've made a note that you would like ${evening.requested_time}. ${askLine}` : holdLine(chosen, tz, askLine))
+          : `${ack} ${askLine}`;
         const record = { collect: missing[0], held: chosen.iso };
         return { reply, record, facts: factsFor(isConfirm ? 'hold' : 'collect', { ask: missing[0], ask_line: askLine, fallback: reply, record }) };
       }
       if (!live) {
-        const reply = NEPQ_LINES.confirm(chosen, tz, name);
+        const reply = evening ? eveningReplyLine(evening.requested_time) : NEPQ_LINES.confirm(chosen, tz, name);
         const record = { booking: 'would_book', start: chosen.iso, calendar_id: slots.calendarId || null, decision_makers: decisionMakers };
         return { reply, record, facts: factsFor('book', { book: true, fallback: reply, record }), firstName: name };
       }
@@ -1807,13 +1834,28 @@ export function createLiveChatFastLane(deps) {
         if (typedAddress && contact?.address1 && !String(contact.address1).toLowerCase().includes(String(typed.address_line1).toLowerCase().split(' ').slice(0, 2).join(' '))) {
           d.warn(`[LiveChat] ${contactId} gave a visit address that differs from the contact's (${contact.address1}); the appointment carries the new one`);
         }
-        res = await d.bookSlot({ contactId, startIso: chosen.iso, calendarId: slots.calendarId || null, decisionMakers, address: address || null });
+        res = await d.bookSlot({ contactId, startIso: chosen.iso, calendarId: slots.calendarId || null, decisionMakers, address: address || null, ...(slots.marketCode !== undefined ? { marketCode: slots.marketCode } : {}) });
       } catch (err) {
         res = { ok: false, error: err.message };
       }
+      // 2026-10-15 (Mark, R1): the market cannot take that time any more (full,
+      // unfiled or a meeting). Nothing is booked; the two nearest times it can
+      // take are offered, as when GHL says the slot was just taken.
+      if (res?.capacity_closed) {
+        const pool = (slots.all || []).filter(s => s.iso !== chosen.iso);
+        const two = nearestTwo(pool, chosen.iso).map(s => ({ ...s, tz }));
+        d.log(`[LiveChat] ${contactId} ${chosen.iso} closed by capacity (${res.closed_reason}) — re-offering ${two.length}`);
+        const reply = two.length === 2 ? `Sorry, that time was just taken. ${NEPQ_LINES.offer_slots(two, 1)}` : 'Sorry, that time was just taken. What other day works best for you?';
+        return { reply, slots: two, record: { booking: 'capacity_closed', start: chosen.iso, closed_reason: res.closed_reason } };
+      }
       if (res?.ok) {
-        const reply = NEPQ_LINES.confirm(chosen, tz, name);
-        const record = { booking: 'booked', start: chosen.iso, action_id: res.action_id || null, appointment_id: res.appointment_id || null };
+        const reply = evening ? eveningReplyLine(evening.requested_time) : NEPQ_LINES.confirm(chosen, tz, name);
+        const record = { booking: 'booked', start: chosen.iso, action_id: res.action_id || null, appointment_id: res.appointment_id || null, ...(evening ? { evening_request: evening.requested_time } : {}) };
+        // R5: the note, the field overwrite, the request row and one card.
+        if (evening && res.appointment_id) {
+          Promise.resolve(d.recordEveningRequest({ contactId, appointmentId: res.appointment_id, request: { ...evening, slot_iso: chosen.iso, time_zone: zoneName, market_code: slots?.marketCode ?? null, first_name: name || contact?.firstName || null, last_name: contact?.lastName || null } }))
+            .catch(err => d.warn(`[LiveChat] evening request side effects failed for ${contactId}: ${err.message}`));
+        }
         return { reply, record, skipCapture: true, facts: factsFor('book', { book: true, fallback: reply, record }), firstName: name };
       }
       // GHL still refused (a real failure, not a missing detail): a person
