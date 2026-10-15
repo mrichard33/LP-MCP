@@ -34,7 +34,7 @@ import { slotMentionIndex, offeredSlots as offeredIn, pickSlot } from '../live-c
 import { parseDayPreference, slotsForPreference, slotMatches, preferenceOfferLine } from './day-preference.js';
 import { enforceOneAsk } from './one-ask.js';
 import { isKnockComplaint } from './do-not-knock.js';
-import { detectDeferral, pendingDeferral, isAcknowledgment, isSignOffLine, POST_DEMO_QUESTIONS } from './post-demo-turn.js';
+import { detectDeferral, pendingDeferral, isAcknowledgment, isSignOffLine, askedForSpace, POST_DEMO_QUESTIONS } from './post-demo-turn.js';
 import { PURCHASED_ELSEWHERE_RX } from './purchased-elsewhere.js';
 import { rehashNepqTurn, bridgedRecently, BEST_DEAL_RX, PRE_BRIDGE_STAGES } from './rehash-nepq.js';
 import { homeownerFromThread, OWNER_ASK_RX } from './homeowner.js';
@@ -1072,10 +1072,22 @@ function planNepqTurnCore({
     if (onTrack && track.stage === 'stop') {
       return pd({ step: 'post_demo_stop', required_move: 'close', call_offer_ok: false, fixed_line: `Understood${hi}. I'm here if anything changes.` });
     }
+    // 3b. They asked for room with no date (more time, a hard stretch at home):
+    //     warm, no question, no pitch, no time (Jose Perez, 2026-10-14). The
+    //     thank-you that usually follows is closed the same way (step 4).
+    if (askedForSpace(now)) {
+      return pd({ step: 'post_demo_space', required_move: 'close', call_offer_ok: false, fixed_line: `Take all the time you need${hi}. We're here whenever you're ready.` });
+    }
+    // Asked for room in the last 48 hours of this thread.
+    const spaceAsked = earlierIn.slice(-4).some(m => askedForSpace(m.text) && (!Number.isFinite(m.atMs) || nowMs - m.atMs < 48 * 3_600_000));
     // 4. A thank-you: thanks back, and at most one question about the
     //    proposal (none if one went out in our last three, or they asked us to wait).
     if (isAcknowledgment(now)) {
       const askedRecently = lastThreeOut.some(t => POST_DEMO_QUESTIONS.some(q => norm(t).includes(norm(q))));
+      if (spaceAsked) {
+        // They asked for time and then said thanks: that is a goodbye.
+        return pd({ step: 'post_demo_space', required_move: 'close', call_offer_ok: false, fixed_line: `Of course${hi}. Thinking of you, and we're here whenever you're ready.` });
+      }
       // 2026-10-11: the post-demo track's question for where they are
       // ("Did you get a chance to look over the proposal?") when it has one.
       const question = (askedRecently || plan.pending_deferral) ? null : (trackQ || pickFresh([...POST_DEMO_QUESTIONS], plan.recent_outbound, plan.variant_seed));
@@ -2123,7 +2135,7 @@ export function enforceNepqPlan(draft, plan, { allowFigures = false, known = {} 
       changes.push('question_after_sign_off');
     }
     if (plan.step === 'competitor_signed') drop(s => /\bcongrat/i.test(s), 'no_congratulations');
-    if (plan.step === 'defer' || plan.step === 'competitor_signed' || plan.step === 'post_demo_stop') {
+    if (plan.step === 'defer' || plan.step === 'competitor_signed' || plan.step === 'post_demo_stop' || plan.step === 'post_demo_space') {
       drop(s => s.includes('?') || SLOT_OFFER_RX.test(s) || clockMinutes(s).length > 0, 'post_demo_no_question');
     } else if (plan.step === 'post_demo_ack' && !plan.post_demo_question) {
       drop(s => s.includes('?'), 'post_demo_no_question');
@@ -2283,7 +2295,7 @@ export function enforceNepqPlan(draft, plan, { allowFigures = false, known = {} 
   // Never on a post-demo plan, a deferral, a close or after a goodbye
   // (2026-10-09: "Enjoy your week. Is it more how they look, or how they work?").
   const endsOnSignOff = isSignOffLine(splitSentences(body).slice(-1)[0] || '');
-  const noDiscovery = plan.post_demo || ['defer', 'close', 'competitor_signed', 'post_demo_ack', 'post_demo_stop'].includes(plan.step) || endsOnSignOff;
+  const noDiscovery = plan.post_demo || ['defer', 'close', 'competitor_signed', 'post_demo_ack', 'post_demo_stop', 'post_demo_space'].includes(plan.step) || endsOnSignOff;
   if ((plan.required_move === 'probe' || plan.required_move === 'consequence') && !body.includes('?') && !actionable && !noDiscovery) {
     // A discovery turn collects no details: "Let me get your zip code so I can
     // confirm…" next to the question was two asks, and a zip asked twice
