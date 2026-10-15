@@ -10,6 +10,11 @@
 // now, is a rehash team member (REHASH_TEAM_USER_IDS, default John Manieri). A
 // contact a person reassigned to anyone else in the meantime is left alone. The
 // write is read back: an owner GHL kept is a failure, not a success.
+//
+// 2026-10-15: the GHL rehash workflow now adds the rep as a FOLLOWER and leaves
+// the owner as the Reece team user, and removes the follower itself after 30
+// days. So this action normally finds no rehash owner and does nothing; it
+// stays for contacts entered before that change.
 
 import { ghlFetch } from '../helpers.js';
 import { rehashTeamUserIds } from '../../agentic/rehash-state.js';

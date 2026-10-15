@@ -8,8 +8,9 @@
 //
 // Now a rehash lead who says yes to a call (or asks for one, or names a time)
 // is offered two REAL openings on the Rehash Call calendar (REHASH_CALENDAR_ID),
-// read for the rep the booking will name (callAssigneeFor: the contact's owner
-// when on the rehash team, else the Rehash rep). A pick books that slot after
+// read for the rep the booking will name (callAssigneeFor: the follower on the
+// lead (rehashRepFor), else the contact's owner when on the rehash team, else
+// the Rehash rep). A pick books that slot after
 // the pre-booking re-check reads it again for the same rep (slot-recheck.js).
 // No calendar, no open times or a failed read: the reply is the old one (ask
 // their time, then the #contact-rehash card).
@@ -19,7 +20,7 @@
 // POST_DEMO_PLANNER_MODE=live (the post-demo planner owns the turn).
 
 import { rehashCalendarId } from '../knowledge/booking-calendar-router.js';
-import { callAssigneeFor } from '../config/rehash-assignee.js';
+import { callAssigneeFor, rehashRepFor } from '../config/rehash-assignee.js';
 import { rehashTeamUserIds } from './rehash-state.js';
 
 export const REHASH_CALL_SLOT_MODES = Object.freeze(['off', 'shadow', 'live']);
@@ -51,6 +52,31 @@ export function rehashRepFirstName(userId, env = process.env) {
   return name || null;
 }
 
+// 2026-10-15: a follower that is not in REHASH_TEAM_USER_NAMES gets its first
+// name from GHL's user record, read once a day per user. A failed read is null
+// (the line then says "someone from our team"), never a guess.
+const USER_NAME_TTL_MS = 24 * 60 * 60 * 1000;
+const userNameCache = new Map();
+
+/** The first name of a GHL user by id, or null. Cached a day. Never throws. */
+export async function ghlUserFirstName(userId, deps = {}) {
+  const id = String(userId || '').trim();
+  if (!id) return null;
+  const now = Date.now();
+  const hit = userNameCache.get(id);
+  if (hit && now - hit.at < USER_NAME_TTL_MS) return hit.name;
+  try {
+    const fetchFn = deps.ghlFetch || (await import('../actions/helpers.js')).ghlFetch;
+    const res = await fetchFn('GET', `/users/${id}`, null, { maxWaitMs: 2000 });
+    const u = res?.user || res || {};
+    const name = String(u.firstName || u.name || '').trim().split(/\s+/)[0] || null;
+    userNameCache.set(id, { name, at: now });
+    return name;
+  } catch {
+    return null;
+  }
+}
+
 /** REHASH_CALL_SLOTS_MODE off|shadow|live, default shadow; a typo is shadow. */
 export function rehashCallSlotsMode(env = process.env) {
   const raw = String(env.REHASH_CALL_SLOTS_MODE ?? '').trim().toLowerCase();
@@ -75,10 +101,16 @@ export async function readRehashCallSlots({ contactId, timezone, tzLabel = 'ET',
   if (!calendarId) return null;
   try {
     const d = { ...deps };
-    if (!d.getOwner) {
+    // Production reads the contact and, for a follower with no configured name,
+    // the GHL user. A test that injects getOwner (the pre-2026-10-15 seam) or
+    // getContact gets no user lookup unless it passes getUserName.
+    if (!d.getContact && d.getOwner) d.getContact = async (id) => ({ assignedTo: await d.getOwner(id) });
+    if (!d.getContact) {
       const { getContactCached } = await import('../actions/contact-cache.js');
-      d.getOwner = async (id) => (await getContactCached(id, null, { maxWaitMs: 2000 }))?.assignedTo || null;
+      d.getContact = async (id) => getContactCached(id, null, { maxWaitMs: 2000 });
+      d.getUserName ||= ghlUserFirstName;
     }
+    d.getUserName ||= async () => null;
     if (!d.fetchFreeSlots || !d.selectOfferableSlots || !d.spreadCallOffer) {
       const cal = await import('../knowledge/calendar-availability.js');
       d.fetchFreeSlots ||= cal.fetchFreeSlots;
@@ -88,8 +120,11 @@ export async function readRehashCallSlots({ contactId, timezone, tzLabel = 'ET',
     if (!d.isOpen) d.isOpen = (await import('./team-hours.js')).isTeamOpen;
     const cap = (p) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), READ_CAP_MS))]);
 
-    const owner = await cap(d.getOwner(contactId)).catch(() => null);
-    const rep = callAssigneeFor({ isRehashCalendar: true, contactOwner: owner, team: rehashTeamUserIds(env) }, env);
+    // 2026-10-15 (the user): the rep is the follower on THIS lead (rehashRepFor),
+    // so the times offered are that rep's, not a fixed John Manieri's.
+    const contact = await cap(d.getContact(contactId)).catch(() => null);
+    const team = rehashTeamUserIds(env);
+    const rep = callAssigneeFor({ isRehashCalendar: true, contactRep: rehashRepFor(contact, team), contactOwner: contact?.assignedTo || null, team }, env);
     const av = await cap(d.fetchFreeSlots(calendarId, { timezone, maxSlots: 120, minNoticeHours: 0.5, ...(rep ? { userId: rep } : {}) }));
     if (!av || !Array.isArray(av.slots)) return null;
     const sel = d.selectOfferableSlots(av, null, { call: true, isOpen: d.isOpen });
@@ -101,7 +136,8 @@ export async function readRehashCallSlots({ contactId, timezone, tzLabel = 'ET',
     // two soonest real openings in the 14 days (an hour apart, same day allowed).
     let offer = (sel?.slots || []).slice(0, 2);
     if (offer.length < 2 && all.length >= 2) offer = d.spreadCallOffer(all, 2);
-    return { calendarId, rep, repName: rehashRepFirstName(rep, env), offer: offer.map(withTz), all: all.map(withTz), tz: tzLabel };
+    const repName = rehashRepFirstName(rep, env) || await cap(d.getUserName(rep)).catch(() => null);
+    return { calendarId, rep, repName: repName || null, offer: offer.map(withTz), all: all.map(withTz), tz: tzLabel };
   } catch (err) {
     console.warn(`[RehashSlots] ${contactId}: Rehash Call read failed (${err.message}) — the reply asks for their time instead`);
     return null;

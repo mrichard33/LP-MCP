@@ -340,6 +340,12 @@ team would get pre-demo calls. Now a rehash call goes on "Rehash Call" (a GHL Ro
 owner when that owner is on the rehash team (`REHASH_TEAM_USER_IDS`), else the Rehash rep (John Manieri
 `TYcZ9DcNkuPCFYsFxRFV`, `CONFIRMATION_CALL_ASSIGNED_USER_ID`). A Confirmation Call names only an assignee the booking
 named (`callAssigneeFor`, `src/config/rehash-assignee.js`).
+**The rehash rep is the follower on the lead (the user, 2026-10-15).** GHL's rehash workflow now adds the rep as a
+FOLLOWER (the owner stays the Reece team user) and removes them after 30 days itself. `rehashRepFor` (`rehash-assignee.js`):
+a follower (one on `REHASH_TEAM_USER_IDS` first) → the "Assigned To (User ID)" field (`7YkTgCb9IXsoQWDsP50E`; the live
+rehash contact had no `followers` in the API but this field set) → null, and the caller keeps John Manieri as the
+default. It picks the Rehash Call assignee, the calendar read (`readRehashCallSlots`, first name from GHL's user record
+when `REHASH_TEAM_USER_NAMES` has none) and the post-demo follow-up task. `release_rehash_owner` now normally does nothing.
 **A rehash call is offered only at times the Rehash Call calendar shows open (the user, 2026-10-09).** Calendar
 `ncDzLgzbfKJRfhmtlWtB` (`REHASH_CALENDAR_ID`). `readRehashCallSlots` (`src/agentic/rehash-slots.js`) reads it for the rep
 the booking will name (`callAssigneeFor`; `fetchFreeSlots({ userId })`), team hours, 30+ minutes out. In the post-demo

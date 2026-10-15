@@ -94,7 +94,7 @@ import { CALENDAR_MAP, GHL_LOCATION_ID } from '../constants.js';
 import { updateGHLContactFields, applyGHLTag, removeGHLTags } from '../../ghl.js';
 import { fetchUpcomingAppointments } from '../../knowledge/contact-appointments.js';
 import { isInHomeCalendarId, isGhlOnlyCalendarId, isRehashCalendarId, rehashCalendarId, BOOKING_CALENDARS } from '../../knowledge/booking-calendar-router.js';
-import { callAssigneeFor } from '../../config/rehash-assignee.js';
+import { callAssigneeFor, rehashRepFor } from '../../config/rehash-assignee.js';
 import { isInRehash, rehashRoutingMode, rehashTeamUserIds, hasPostAppointmentStage } from '../../agentic/rehash-state.js';
 import { notifyRehashCall } from '../../notifications/rehash-call.js';
 import { fetchCurrentLead } from '../../current-lead.js';
@@ -936,10 +936,11 @@ export async function executeBookAppointment(action, context) {
   // pre-demo Confirmation Call names nobody, as before #1223 (the rehash
   // default had sent those to John Manieri). A named assignee always wins.
   if (isRehashCalendarId(calendarId)) {
-    const owner = await getContactCached(contactId, context?._contactCache, { maxWaitMs: BOOKING_TOKEN_WAIT_MS })
-      .then((c) => c?.assignedTo || null)
+    // 2026-10-15: the rep on the lead (its follower, rehashRepFor) first.
+    const contact = await getContactCached(contactId, context?._contactCache, { maxWaitMs: BOOKING_TOKEN_WAIT_MS })
       .catch(() => null);
-    const assignee = callAssigneeFor({ isRehashCalendar: true, explicit: payload.assigned_user_id, contactOwner: owner, team: rehashTeamUserIds() });
+    const team = rehashTeamUserIds();
+    const assignee = callAssigneeFor({ isRehashCalendar: true, explicit: payload.assigned_user_id, contactRep: rehashRepFor(contact, team), contactOwner: contact?.assignedTo || null, team });
     if (assignee) body.assignedUserId = assignee;
   }
 
