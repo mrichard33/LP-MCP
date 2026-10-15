@@ -561,6 +561,10 @@ const PRICE_INFO_Q_RX = /\b(?:how\s+much|what(?:'|’)?s\s+the\s+(?:price|cost|t
 export function postDemoObjection(text, lastOutbound = '') {
   const t = String(text || '');
   if (!t.trim() || isPostDemoNo(t, lastOutbound) || PURCHASED_ELSEWHERE_RX.test(t)) return null;
+  // Asking for room ("we need more time, it's a hard stretch") is not a "think
+  // it over" objection: it gets the warm close (post_demo_space, Jose Perez
+  // 2026-10-14), never an ask-back, and never counts toward the ladder.
+  if (askedForSpace(t)) return null;
   if (PRICE_INFO_Q_RX.test(t)) return null;
   const r = rehashObjection(t)?.type || null;
   if (r === 'price' || POST_DEMO_PRICE_RX.test(t)) return 'price';
