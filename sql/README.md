@@ -30,7 +30,10 @@ The repo and the database could not say whether they agreed.
 4. **`CREATE INDEX CONCURRENTLY`** cannot run inside a transaction and the CLI wraps each file in one.
    Use a plain `CREATE INDEX IF NOT EXISTS` in the migration. For a hot, populated table where the lock
    matters, run the `CONCURRENTLY` form by hand FIRST (it will then be a no-op in the migration) and
-   say so in the file header.
+   say so in the file header with the line `-- applied by hand first: <name> <YYYY-MM-DD>`. Without
+   it, the PR's drift check sets the pending file aside and reads the hand-made objects as drift; with
+   it, statements on objects the file declares are a notice, anything else still fails (2026-10-15,
+   the system-health tables).
 5. **One database, one ledger.** Reece-Dashboard, n8n, window-calculator and the AI OS loads put their
    LP-project DDL in THIS folder, in a PR to this repo. DDL for the HL project goes in
    `HL-MCP/supabase/migrations/`. Nothing else writes schema anywhere.
