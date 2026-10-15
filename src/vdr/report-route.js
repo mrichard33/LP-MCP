@@ -4,7 +4,7 @@
 // attaches the workbook it returns. Live data only: rpc/vdr_vendor_report (lp_leads + market assignments + Five9);
 // the LP report 135 email is a cross-check, never a blocker.
 //
-//   GET /vdr/report.xlsx?vendor_id=<id>&as_of=<iso>      (operator bearer token, like every LP-MCP endpoint)
+//   GET /vdr/report.xlsx?vendor_id=<id>&as_of=<iso>      (operator token or the LP Supabase service-role key; vdrAuthenticate)
 //     200 the .xlsx, plus headers n8n reads:
 //         X-VDR-Vendor-Id (n8n checks each file belongs to the vendor it asked for), X-VDR-File-Name, X-VDR-Lead-Count, X-VDR-Summary (JSON totals), X-VDR-Lead-Synced-At,
 //         X-VDR-Window (start..end), X-VDR-Feed-Leads / X-VDR-Feed-Received-At (the 135 cross-check, when a
@@ -13,10 +13,61 @@
 //
 // It never sends anything and never writes: the freshness gate, the cross-check verdict and the send log are n8n's.
 
-import { denyAll } from '../auth.js';
+import { createHash } from 'node:crypto';
+import { denyAll, safeEqual } from '../auth.js';
 import { buildVendorWorkbook } from './report-xlsx.js';
 
 const XLSX_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+
+/**
+ * Who may download a workbook (2026-10-15). It carries every lead's name, phone, email and address, so this route
+ * never runs on the shared soft-launch check: with AUTH_SOFT_LAUNCH=true in production, a request with no token was
+ * answered with the full Modernize file. Two keys open it, nothing else:
+ *   - the operator bearer token (MCP_AUTH_TOKEN), compared in constant time;
+ *   - a Supabase SERVICE-ROLE key of the LP project, which is what n8n's "LP Supabase" credential sends. It already
+ *     reads every row this report is built from, so accepting it opens nothing new, and it keeps the n8n relay off
+ *     MCP_AUTH_TOKEN (index.js: "the n8n relay must not hold the key to every admin route"). The key is proven by
+ *     asking the database: vdr_vendor_config is readable by service_role only (RLS on, no grant to anon or
+ *     authenticated), so a key that reads a row is a service-role key. A verdict is cached for 10 minutes by a hash
+ *     of the key (1 minute when refused), never the key itself.
+ * No token configured and no way to verify a key → 503. Anything else → 401.
+ */
+const KEY_CACHE = new Map();   // sha256(key) -> { ok, until }
+const OK_TTL_MS = 10 * 60 * 1000;
+const NO_TTL_MS = 60 * 1000;
+
+export async function defaultVerifyServiceKey(key, { fetchImpl = fetch, url = process.env.SUPABASE_URL } = {}) {
+  if (!url) return false;
+  const res = await fetchImpl(`${url.replace(/\/$/, '')}/rest/v1/vdr_vendor_config?select=id&limit=1`, {
+    headers: { apikey: key, Authorization: `Bearer ${key}` },
+    signal: AbortSignal.timeout(5000),
+  });
+  if (!res.ok) return false;
+  const rows = await res.json().catch(() => null);
+  return Array.isArray(rows) && rows.length > 0;
+}
+
+export function vdrAuthenticate({ token = null, verifyServiceKey = defaultVerifyServiceKey, canVerify = !!process.env.SUPABASE_URL, now = () => Date.now() } = {}) {
+  return async function vdrAuth(req, res, next) {
+    const h = String(req.headers.authorization || '');
+    const bearer = h.startsWith('Bearer ') ? h.slice(7).trim() : '';
+    if (token && bearer && safeEqual(bearer, token)) return next();
+    if (!token && !canVerify) return res.status(503).json({ error: 'auth_not_configured' });
+    if (bearer && canVerify) {
+      const k = createHash('sha256').update(bearer).digest('hex');
+      const hit = KEY_CACHE.get(k);
+      let ok = hit && hit.until > now() ? hit.ok : null;
+      if (ok === null) {
+        try { ok = await verifyServiceKey(bearer); } catch (err) { console.warn(`[VDR] service-key check failed: ${err.message}`); ok = false; }
+        KEY_CACHE.set(k, { ok, until: now() + (ok ? OK_TTL_MS : NO_TTL_MS) });
+      }
+      if (ok) return next();
+    }
+    console.warn(`[VDR] REJECTED ${req.method} ${req.path} from ${req.ip} (${bearer ? 'bad_key' : 'missing_token'})`);
+    return res.status(401).json({ error: 'Unauthorized' });
+  };
+}
+export function _resetVdrKeyCache() { KEY_CACHE.clear(); }
 
 export async function defaultReportReader({ vendorId, asOf }) {
   const supabase = (await import('../supabase.js')).default;

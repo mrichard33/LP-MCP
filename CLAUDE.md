@@ -476,12 +476,14 @@ and a gendered pronoun; one re-write, then fixed sentences (`fallbackBrief`). It
 
 **Vendor lead reports read live data; LP report 135 is only a cross-check (handoff, 2026-10-15).** n8n "06 VDR" sent
 nothing from 2026-10-13: every send waited on the 135 (Lead Disposition Detail 2) email. Now each due vendor gets
-`GET /vdr/report.xlsx?vendor_id=&as_of=` (`src/vdr/`, operator token), built from `rpc/vdr_vendor_report` (lp_leads +
+`GET /vdr/report.xlsx?vendor_id=&as_of=` (`src/vdr/`), built from `rpc/vdr_vendor_report` (lp_leads +
 lp_lead_market_assignments + Five9 only, never `call_count`): Summary (every number a COUNTIF/COUNTIFS/SUMIFS formula
 over the Leads tab), Leads (one row per lead, never an LP lead id, rep or setter) and Definitions. The window is whole
 ET days, as_of's date minus lookback through as_of's date (that reproduces the approved prototype; a timestamp cut does
 not). n8n blocks a send when `X-VDR-Lead-Synced-At` is 6h+ old and lists a 135 gap over 2% (`X-VDR-Feed-Leads`) in
-Mark's summary, never blocking on it. exceljs drops a cached formula result of 0; Excel recalculates on open.
+Mark's summary, never blocking on it. The file is lead PII, so the route NEVER uses the soft-launch check (production
+runs `AUTH_SOFT_LAUNCH=true`, and a token-less request got the whole file on 2026-10-15): `vdrAuthenticate` takes the
+operator token or a key the database proves is the LP service-role key (n8n's "LP Supabase" credential). exceljs drops a cached formula result of 0; Excel recalculates on open.
 
 ## Consent (2026-09-28)
 
