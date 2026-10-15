@@ -45,8 +45,20 @@ export function journeyConfig(env = process.env) {
     intervalMs: num(env.FIVE9_JOURNEY_INTERVAL_MS, 900_000, 60_000),
     backfillDays: num(env.FIVE9_JOURNEY_BACKFILL_DAYS, 7),
     maxWaitMs: num(env.FIVE9_JOURNEY_REPORT_MAX_WAIT_MS, 180_000, 10_000),
+    // Five9 refuses more than 16 runReport calls a minute, account-wide (2026-10-15: the first
+    // 7-day backfill fired 28 windows in 20 seconds and 15 were refused, "60 seconds limit (16)
+    // for report request operation is reached"). 6s apart is 10 a minute, leaving room for the
+    // CI Call Log and anyone running a report by hand.
+    paceMs: num(env.FIVE9_JOURNEY_PACE_MS, 6_000, 0),
   };
 }
+
+/** Five9's per-minute report limit. The minute passes; the window is retried once. */
+export function isReportRateLimit(message) {
+  return /seconds limit \(\d+\) for report request/i.test(String(message || ''));
+}
+const RATE_LIMIT_WAIT_MS = 65_000;
+const realSleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function defaultDeps() {
   const [five9, supabaseMod, alertState] = await Promise.all([
@@ -181,8 +193,10 @@ export async function runFive9CallJourneySync({ env = process.env, nowMs = Date.
     return { checked: false, readFailed: true, mode, reason: err.message };
   }
   const windows = planJourneyWindows({ lastEndMs, nowMs });
+  const sleep = d.sleep || realSleep;
   const results = [];
-  for (const w of windows) {
+  for (const [i, w] of windows.entries()) {
+    if (i > 0 && cfg.paceMs) await sleep(cfg.paceMs); // a catch-up after an outage is several windows
     const r = await syncWindow(d, cfg, { ...w, mode });
     results.push(r);
     if (!r.ok) break; // keep the cursor here; the next pass retries from it
@@ -215,8 +229,17 @@ export async function runFive9CallJourneyBackfill({ days, env = process.env, now
   const cfg = journeyConfig(env);
   const n = Math.min(Math.max(Number(days) || cfg.backfillDays, 1), 31);
   const windows = planJourneyWindows({ lastEndMs: nowMs - n * 24 * 60 * MIN, nowMs, overlapMin: 0 });
+  const sleep = d.sleep || realSleep;
   const results = [];
-  for (const w of windows) results.push(await syncWindow(d, cfg, { ...w, mode: 'backfill' }));
+  for (const [i, w] of windows.entries()) {
+    if (i > 0 && cfg.paceMs) await sleep(cfg.paceMs);
+    let r = await syncWindow(d, cfg, { ...w, mode: 'backfill' });
+    if (!r.ok && isReportRateLimit(r.error)) {
+      await sleep(RATE_LIMIT_WAIT_MS); // the refused window keeps its failed run row; the retry logs its own
+      r = await syncWindow(d, cfg, { ...w, mode: 'backfill' });
+    }
+    results.push(r);
+  }
   const sum = (k) => results.reduce((s, r) => s + (r[k] || 0), 0);
   return {
     ok: results.every((r) => r.ok), days: n, windows: results.length,

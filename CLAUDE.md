@@ -418,6 +418,8 @@ and logs every pull in `five9_call_journey_runs`. The report's zone is PACIFIC, 
 cells are Pacific wall clock (call 300000010540092 prints 09:10:20; the webhook has it at 16:10:20 UTC). Columns are read BY NAME (a missing one fails the run), a row with no time is a counted reject and an
 #ops alert, and a window at 50,000 rows is halved. `v_lead_call_journey` orders each lead's legs and counts the dials we
 placed in the trailing 24h (`calls_last_24h`, the 3-in-24 audit). `POST /admin/five9-journey/backfill?days=N` (live only).
+Five9 refuses more than 16 runReport calls a minute ACCOUNT-WIDE (the first 7-day backfill fired 28 windows in 20s; 15
+were refused): windows are paced `FIVE9_JOURNEY_PACE_MS` (6s) apart and a refused one waits 65s and retries once.
 Read-only against Five9; never the CI "Call Log" (`src/ci/*`, `ci_calls`), never LP call logs: Five9 is the only call source.
 **Missed paid callers are judged by their whole call history (2026-10-12).** `src/jobs/missed-caller-recovery.js`
 (`MISSED_CALLER_RECOVERY_MODE`, default shadow) no longer uses `findContactInOtherLists` either: all 264 would_push rows

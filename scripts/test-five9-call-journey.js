@@ -14,7 +14,7 @@ import {
   planJourneyWindows, toReportCriteriaString, cellText,
 } from '../src/five9/call-journey.js';
 import {
-  runFive9CallJourneySync, runFive9CallJourneyBackfill, journeyAlertState, journeyMode,
+  runFive9CallJourneySync, runFive9CallJourneyBackfill, isReportRateLimit, journeyAlertState, journeyMode,
 } from '../src/jobs/five9-call-journey-sync.js';
 
 const COLUMNS = ['TIMESTAMP', 'DNIS', 'LPRecKey', 'lead_id', 'CAMPAIGN', 'LIST NAME', 'SKILL', 'CALL TYPE', 'DISPOSITION', 'AGENT NAME', 'Number of attempts', 'ANI', 'CALL ID'];
@@ -212,9 +212,29 @@ test('backfill runs only in live, in chunks of 6 hours or less, logged as backfi
   const refused = await runFive9CallJourneyBackfill({ days: 1, env: {}, nowMs: NOW });
   assert.equal(refused.refused, true);
   const db = fakeDb();
-  const out = await runFive9CallJourneyBackfill({ days: 1, env: { FIVE9_JOURNEY_SYNC_MODE: 'live' }, nowMs: NOW, deps: { supabase: db, runReportAndWait: report([SAMPLE]) } });
+  const slept = [];
+  const out = await runFive9CallJourneyBackfill({ days: 1, env: { FIVE9_JOURNEY_SYNC_MODE: 'live' }, nowMs: NOW, deps: { supabase: db, runReportAndWait: report([SAMPLE]), sleep: async (ms) => slept.push(ms) } });
   assert.equal(out.ok, true);
   assert.equal(out.windows, 4, '24h minus the 2-minute lag → 3 full 6h chunks and a short one');
   assert.ok(db.runs.every((r) => r.mode === 'backfill' && r.status === 'ok'));
   assert.equal(db.legs.size, 1);
+  assert.deepEqual(slept, [6000, 6000, 6000], 'paced between windows, never before the first');
+});
+
+test('backfill: a window Five9 refuses for its per-minute limit waits out the minute and is retried once', async () => {
+  assert.equal(isReportRateLimit('Five9 runReport fault: 60 seconds limit (16) for report request operation is reached.'), true);
+  assert.equal(isReportRateLimit('report did not finish in 180s'), false);
+  const db = fakeDb();
+  let calls = 0;
+  const flaky = async () => {
+    calls += 1;
+    if (calls === 2) throw new Error('Five9 runReport fault: 60 seconds limit (16) for report request operation is reached.');
+    return { done: true, columns: COLUMNS, rows: [SAMPLE] };
+  };
+  const slept = [];
+  const out = await runFive9CallJourneyBackfill({ days: 1, env: { FIVE9_JOURNEY_SYNC_MODE: 'live', FIVE9_JOURNEY_PACE_MS: '0' }, nowMs: NOW, deps: { supabase: db, runReportAndWait: flaky, sleep: async (ms) => slept.push(ms) } });
+  assert.equal(out.ok, true, 'the retried window counts');
+  assert.equal(out.windows, 4);
+  assert.deepEqual(slept, [65000], 'no pacing at 0, one wait for the refused window');
+  assert.equal(db.runs.filter((r) => r.status === 'failed').length, 1, 'the refusal stays logged');
 });
