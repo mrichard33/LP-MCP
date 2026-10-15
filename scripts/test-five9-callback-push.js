@@ -35,6 +35,7 @@ import {
   callbackCallNowMode,
   callbackLpRecType,
   formatFive9DateTime,
+  formatFive9WriteDateTime,
   FIVE9_OWNED_FIELDS,
 } from '../src/five9/callback-push.js';
 
@@ -152,17 +153,29 @@ test('no Five9-owned field is ever written', () => {
   }
 });
 
-test('every push stamps callback_requested_at, in Five9 format and UTC (2026-10-09)', () => {
+test('every push stamps callback_requested_at, in Five9 format on the Eastern clock (2026-10-15)', () => {
   // Profile "Callback Request V2" rule 3 reads Contact Record Created, which an
   // update never moves, so a repeat requester aged out 48h after the FIRST
   // record (David Strehlow). This field is the request time of THIS push.
   const nowMs = Date.parse('2026-10-09T17:30:05.123Z');
   const rec = buildCallbackRecord({ contactId: CONTACT_ID, ghlContact, lpRow, nowMs });
   const m = asMap(rec);
-  assert.equal(m.callback_requested_at, '2026-10-09 17:30:05.123', 'yyyy-MM-dd HH:mm:ss.SSS, UTC (Five9 date fields read as UTC)');
+  // Five9 takes a written value as Eastern and reports it back in UTC: 13:30
+  // EDT is stored as 17:30Z, the true request time (a UTC write was stored 4h late).
+  assert.equal(m.callback_requested_at, '2026-10-09 13:30:05.123', 'yyyy-MM-dd HH:mm:ss.SSS, Eastern wall clock');
   assert.equal(rec.callbackRequestedAt, m.callback_requested_at);
   assert.equal(rec.fieldNames.length, rec.values.length);
   assert.ok(!FIVE9_OWNED_FIELDS.includes('callback_requested_at'), 'ours, not Five9\'s');
+});
+
+test('formatFive9WriteDateTime: Eastern wall clock, daylight saving and standard time, padded', () => {
+  // Alexander F. (2026-10-15): asked at 12:52:32 PM EDT = 16:52:32Z.
+  assert.equal(formatFive9WriteDateTime(Date.parse('2026-10-15T16:52:32Z')), '2026-10-15 12:52:32.000');
+  // Standard time (EST, UTC-5) after the November change.
+  assert.equal(formatFive9WriteDateTime(Date.parse('2026-12-01T15:04:05.006Z')), '2026-12-01 10:04:05.006');
+  // Midnight hour reads 00, never 24; the date rolls back across UTC midnight.
+  assert.equal(formatFive9WriteDateTime(Date.parse('2026-10-16T04:05:00Z')), '2026-10-16 00:05:00.000');
+  assert.equal(formatFive9WriteDateTime(Date.parse('2026-10-16T02:00:00Z')), '2026-10-15 22:00:00.000');
 });
 
 test('formatFive9DateTime pads every part and keeps milliseconds', () => {
