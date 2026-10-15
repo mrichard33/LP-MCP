@@ -492,6 +492,29 @@ export const JOBS = Object.freeze([
     isEnabled: (env) => String(env.REHASH_INTENT_ROUTING ?? 'on').trim().toLowerCase() !== 'off',
   },
   {
+    // 2026-10-15 (Mark, R8): a 6:30 / 7:00 request booked at 6:00 PM gets an
+    // IMPORTANT note on the LP prospect once the appointment is in LP.
+    // Always on: it drains pending rows even after a CAPACITY_GATE_ENABLED rollback.
+    id: 'time-change-lp-note-sweep',
+    label: 'Evening time requests: LP note for the confirming agent, superseded / missing-note card',
+    group: 'agentic',
+    cadence: 'every 15 min',
+    enabledEnv: 'CAPACITY_GATE_ENABLED',
+    enabledDefault: true,
+    isEnabled: () => true,
+  },
+  {
+    // 2026-10-15 (Mark, R2): unfiled availability closes those days to the bot;
+    // the market's sales channel hears it once a day.
+    id: 'capacity-unfiled-alert',
+    label: 'Market capacity: availability not filed for the next days, one market-channel post a day',
+    group: 'agentic',
+    cadence: 'hourly 08:00-18:59 ET',
+    enabledEnv: 'CAPACITY_GATE_ENABLED',
+    enabledDefault: true,
+    isEnabled: (env) => String(env.CAPACITY_GATE_ENABLED ?? 'true').toLowerCase() !== 'false',
+  },
+  {
     id: 'lp-identity-fill-sweep',
     label: 'Nameless GHL contacts get the name (and empty email / address) from their linked LP lead',
     group: 'lp-intake',

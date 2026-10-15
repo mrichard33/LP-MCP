@@ -29,6 +29,7 @@ import {
 } from './booking-collect.js';
 import { LINES, pickFresh } from './nepq-planner.js';
 import { asksIn, enforceOneAsk } from './one-ask.js';
+import { checkEveningReply, eveningReplyLine, requestedLabel } from './evening-request.js';
 
 // The booking gate's names for what is missing → our ask keys.
 function askKey(missing) {
@@ -56,16 +57,23 @@ const ORDER = ['name', 'phone', 'address', 'address_confirm', 'dm'];
  * @returns {null|{kind:'hold'|'collect'|'book'|'dm_conflict', slot, ask:string|null, ask_line:string|null, book:boolean,
  *   alternatives:Array, fallback:string, companion:object|null, record:object}}
  */
-export function smsBookingTurn({ plan, trigger, thread = [], slots = [], tz = 'ET', gateMissing = [], onFileAddress = null, firstName = null, calendar = {}, spread = (s) => s.slice(0, 2) } = {}) {
+// 2026-10-15 (Mark, R5): `pinnedSlot` is the 6:00 PM opening code chose for a
+// lead who asked for 6:30 / 7:00 (evening-request.js), and `evening` is that
+// ask. A booked 6:00 PM with an evening ask on the thread gets the R5 line as
+// its reference instead of the confirm line.
+export function smsBookingTurn({ plan, trigger, thread = [], slots = [], tz = 'ET', gateMissing = [], onFileAddress = null, firstName = null, calendar = {}, spread = (s) => s.slice(0, 2), pinnedSlot = null, evening = null, timeZone = 'America/New_York' } = {}) {
   if (!plan || !Array.isArray(slots) || !slots.length) return null;
-  const isConfirm = plan.required_move === 'confirm';
-  const isCollect = plan.step === 'collect' && !!plan.held_slot?.text;
+  const isConfirm = !!pinnedSlot || plan.required_move === 'confirm';
+  const isCollect = !pinnedSlot && plan.step === 'collect' && !!plan.held_slot?.text;
   if (!isConfirm && !isCollect) return null;
-  const pinned = isConfirm
+  const pinned = pinnedSlot || (isConfirm
     ? pickSlot(trigger, offeredSlots(plan.last_offer || '', slots))
-    : (offeredSlots(plan.held_slot.text, slots)[0] || null);
+    : (offeredSlots(plan.held_slot.text, slots)[0] || null));
   if (!pinned) return null;
   const slot = { ...pinned, tz: pinned.tz || tz };
+  const eveningAsk = evening && isSixPm(pinned.iso, timeZone)
+    ? { requested_time: evening.requested_time, requested_minutes: evening.minutes ?? evening.requested_minutes ?? null, requested_label: requestedLabel(evening.requested_time, pinned.iso, timeZone) }
+    : null;
   const recentOut = thread.filter(m => m.direction === 'outbound').slice(-8).map(m => m.text);
   const inboundTexts = thread.filter(m => m.direction !== 'outbound').map(m => m.text);
   const base = { slot, label: slotLabel(slot, tz), alternatives: [], companion: null, thread_name: nameFromThread(thread) };
@@ -101,7 +109,13 @@ export function smsBookingTurn({ plan, trigger, thread = [], slots = [], tz = 'E
   if (next) {
     const first = next === 'dm' ? dmAsk(inboundTexts) : next === 'address_confirm' ? addressConfirmAsk(onFileAddress) : COLLECT_ASK[next];
     const askLine = pickFresh([first, COLLECT_ASK_AGAIN[next]].filter(Boolean), recentOut, 0);
-    if (isConfirm) return { ...base, kind: 'hold', ask: next, ask_line: askLine, book: false, fallback: holdLine(pinned, tz, askLine), record: { sms_booking: 'hold', ask: next, slot: pinned.iso } };
+    if (isConfirm) {
+      // R5: the hold says the evening ask is noted, so 6:00 is never a surprise.
+      const fallback = eveningAsk
+        ? `I'm holding ${slotLabel(pinned, tz)} for you. I've made a note that you would like ${eveningAsk.requested_time}. ${askLine}`
+        : holdLine(pinned, tz, askLine);
+      return { ...base, kind: 'hold', ask: next, ask_line: askLine, book: false, fallback, ...(eveningAsk ? { evening: eveningAsk } : {}), record: { sms_booking: 'hold', ask: next, slot: pinned.iso, ...(eveningAsk ? { evening: eveningAsk.requested_time } : {}) } };
+    }
     const ack = pickFresh(['Got it.', 'Perfect, thanks.', 'Great, thank you.'], recentOut, 0);
     return { ...base, kind: 'collect', ask: next, ask_line: askLine, book: false, fallback: `${ack} ${askLine}`, record: { sms_booking: 'collect', ask: next, slot: pinned.iso } };
   }
@@ -111,7 +125,8 @@ export function smsBookingTurn({ plan, trigger, thread = [], slots = [], tz = 'E
   return {
     ...base,
     kind: 'book', ask: null, ask_line: null, book: true,
-    fallback: LINES.confirm(pinned, tz, firstName || threadName),
+    fallback: eveningAsk ? eveningReplyLine(eveningAsk.requested_time) : LINES.confirm(pinned, tz, firstName || threadName),
+    ...(eveningAsk ? { evening: eveningAsk } : {}),
     companion: {
       action_type: 'book_appointment',
       action_payload: {
@@ -123,8 +138,13 @@ export function smsBookingTurn({ plan, trigger, thread = [], slots = [], tz = 'E
       },
       reasoning: 'SMS: the lead picked a real open time and nothing the visit needs is missing (sms-booking-turn)',
     },
-    record: { sms_booking: 'book', slot: pinned.iso },
+    record: { sms_booking: 'book', slot: pinned.iso, ...(eveningAsk ? { evening: eveningAsk.requested_time } : {}) },
   };
+}
+
+function isSixPm(iso, timeZone) {
+  const f = new Intl.DateTimeFormat('en-US', { timeZone, hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
+  return f.format(new Date(iso)) === '18:00';
 }
 
 /**
@@ -188,6 +208,8 @@ export function enforceBookingFacts(draft, facts, { companion = null } = {}) {
   const problems = [];
   const notes = [];
   const want = facts.kind === 'dm_conflict' ? facts.alternatives.map(slotMinutes) : [slotMinutes(facts.slot)];
+  // R5: the time they asked for is named too ("… for 6:30 PM").
+  if (facts.evening?.requested_minutes != null) want.push(facts.evening.requested_minutes);
   const times = clockTimes(text);
   if (times.some(t => !want.includes(t))) problems.push('wrong_time');
   const split = (t) => String(t || '').split(/(?<=[.!?])\s+/).map(x => x.trim()).filter(Boolean);
@@ -195,7 +217,11 @@ export function enforceBookingFacts(draft, facts, { companion = null } = {}) {
   const exact = slot.day && slot.time ? `${slot.day} at ${slot.time}` : null;
   const namesDay = (t) => [slot.day, slot.rel, slot.dayOfWeek].filter(Boolean).some(d => String(t).toLowerCase().includes(String(d).toLowerCase()));
   let message = text;
-  if (facts.kind === 'book') {
+  if (facts.kind === 'book' && facts.evening) {
+    // R5 (Mark, 2026-10-15): 6:00 booked, their time noted, the team confirms
+    // and moves it. The model's words stand when they keep those facts.
+    problems.push(...checkEveningReply(text, facts.evening).problems);
+  } else if (facts.kind === 'book') {
     if (!times.length || !namesDay(text)) problems.push('no_time');
     if (!/\ball\s+set\b/i.test(text) || !/\bconfirm/i.test(text)) problems.push('not_the_confirm_line');
     // The confirmation is a CALL (the user, 2026-10-06): "reach out" alone misses it.
@@ -218,9 +244,12 @@ export function enforceBookingFacts(draft, facts, { companion = null } = {}) {
       // The hold sentence names the slot exactly as offered, or heldSlot
       // cannot find it next turn: the model's when it does, else ours.
       const own = body.find(p => /\bI'?m\s+holding\b/i.test(p) && exact && slotMentionIndex(p, slot) >= 0);
-      body = body.filter(p => p === own || (!/\bI'?m\s+holding\b/i.test(p) && !clockTimes(p).length));
+      // R5: the sentence noting their 6:30 / 7:00 ask may name that time.
+      const evNote = (p) => !!facts.evening && clockTimes(p).length > 0 && clockTimes(p).every(t => t === facts.evening.requested_minutes) && /\bnote/i.test(p);
+      body = body.filter(p => p === own || (!/\bI'?m\s+holding\b/i.test(p) && (!clockTimes(p).length || evNote(p))));
       // Their acknowledgement first, then the hold ("Sure. I'm holding … for you.").
       if (!own) { body = body.length ? [...body, `I'm holding ${slotLabel(slot, slot.tz || '')} for you.`] : [holdLine(slot, slot.tz || '', '').trim()]; notes.push('hold_sentence_fixed'); }
+      if (facts.evening && !body.some(evNote)) { body = [...body, `I've made a note that you would like ${facts.evening.requested_time}.`]; notes.push('evening_note_added'); }
     } else if (body.some(p => clockTimes(p).length)) {
       // Collecting: no time talk (the held time stands; a change is the lead's to ask).
       body = body.filter(p => !clockTimes(p).length);
@@ -245,7 +274,9 @@ export function bookingFactsNote(facts, problems = []) {
   const what = {
     hold: `say "I'm holding ${facts.label} for you." and then ask exactly: "${facts.ask_line}"`,
     collect: `thank them in a few words, then ask exactly: "${facts.ask_line}". Mention no other time`,
-    book: `say they're all set, that someone from our team will give them a call to confirm the details, and that they're on the calendar for ${facts.label}. No question`,
+    book: facts.evening
+      ? `say this in your own words, keeping "6:00", "${facts.evening.requested_time}", that it is noted, and "confirm the details": "${eveningReplyLine(facts.evening.requested_time)}" No question`
+      : `say they're all set, that someone from our team will give them a call to confirm the details, and that they're on the calendar for ${facts.label}. No question`,
     dm_conflict: facts.alternatives?.length === 2
       ? `offer exactly these two times and ask which works better: ${facts.alternatives.map(s => `${s.day} at ${s.time}`).join(' or ')}`
       : 'ask what day works best when they can both be there',

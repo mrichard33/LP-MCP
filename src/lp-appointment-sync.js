@@ -1943,7 +1943,24 @@ export function terminalDispositionDecision(disp, { requireBookable = false } = 
   return { allow: true, reason: 'rebook_closed_lead' };
 }
 
-async function syncAppointmentToLP({
+// R8 (Mark, 2026-10-15): once an appointment is in LP, a lead's 6:30 / 7:00
+// request (appt_time_change_requests) becomes an IMPORTANT note on the LP
+// prospect for the confirming agent (src/services/time-change-lp-note.js).
+// Fire-and-forget AFTER the sync returned: the sync's result, timing and
+// every refusal are exactly as before (R4: the gate never touches this path).
+async function syncAppointmentToLP(args, deps = {}) {
+  const result = await syncAppointmentToLPInner(args, deps);
+  if (result?.success && (result.action === 'lp_appointment_set' || result.action === 'already_set_in_lp') && result.lp_prospect_id) {
+    const hook = deps.onLpAppointmentSynced
+      || ((a) => import('./services/time-change-lp-note.js').then(m => m.onLpAppointmentSynced(a)));
+    trackBackground(Promise.resolve()
+      .then(() => hook({ contactId: args.contactId, prospectId: result.lp_prospect_id, apptDate: result.appt_date || result.date || args.appointmentDate, apptTime: result.appt_time || args.appointmentTime || null }))
+      .catch(err => console.warn(`[LP-APPT] time-change note hook failed for ${args.contactId}: ${err.message}`)));
+  }
+  return result;
+}
+
+async function syncAppointmentToLPInner({
   contactId, contactPhone, contactEmail, contactName,
   address1, city, state, postalCode,
   prospectId: webhookProspectId, inboundId, ghlLeadIdField,

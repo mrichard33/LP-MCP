@@ -459,3 +459,26 @@ export async function persistPreferredTime(contactId, preferred, opts = {}) {
     return 0;
   }
 }
+
+/**
+ * R5 (Mark, 2026-10-15): the lead asked for 6:30 / 7:00 and was booked at
+ * 6:00 PM. "Requested Appointment Time" (7lpRWFDM8DZbLd3viHEG, the same field
+ * as Preferred Estimate Time, renamed by Mark) is OVERWRITTEN with what they
+ * asked for ("6:30 PM on Thu Oct 16"), on purpose: it is the one place the
+ * team reads the real request. Never through persistPreferredTime (that is
+ * fill-if-empty). The body is { customFields } only, so tags are never
+ * touched. Fail-soft. @returns {Promise<boolean>}
+ */
+export async function overwriteRequestedTime(contactId, value, deps = {}) {
+  if (!contactId || !value) return false;
+  const fieldId = process.env.REQUESTED_APPT_TIME_FIELD_ID || PREFERRED_ESTIMATE_TIME_FIELD_ID;
+  try {
+    const result = await (deps.updateFields || updateGHLContactFields)(contactId, [{ id: fieldId, field_value: String(value) }]);
+    if (result === true) { console.log(`[PreferredTime] requested time overwritten for ${contactId}: "${value}"`); return true; }
+    console.warn(`[PreferredTime] requested time overwrite returned ${result} for ${contactId}`);
+    return false;
+  } catch (err) {
+    console.warn(`[PreferredTime] requested time overwrite threw for ${contactId}: ${err.message}`);
+    return false;
+  }
+}

@@ -341,6 +341,7 @@ import { startInboundCheckoutWatchScheduler } from './jobs/inbound-checkout-watc
 import { startPromisedCallbackScheduler } from './jobs/promised-callback-sweep.js';  // 2026-10-07
 import { startRehashTagScheduler } from './jobs/rehash-tag-sweep.js';  // 2026-10-09
 import { startRehashReplyDigestScheduler } from './jobs/rehash-reply-digest.js';  // 2026-10-14 — rehash thanks / still-thinking digest
+import { startCapacityGateJobs } from './jobs/capacity-gate-jobs.js';  // 2026-10-15 — evening-request LP notes + unfiled-availability alert
 import { startIdentityFillScheduler } from './jobs/lp-identity-fill-sweep.js';  // 2026-10-11
 import { registerLpIdentityFillRoutes } from './admin/lp-identity-fill.js';  // 2026-10-11
 import { startPostIssueRetryScheduler } from './jobs/post-issue-rebook-retry.js';  // 2026-10-09
@@ -1015,6 +1016,7 @@ const server = app.listen(PORT, async () => {
   startPromisedCallbackScheduler();
   startRehashTagScheduler();
   startRehashReplyDigestScheduler();
+  startCapacityGateJobs();
   startIdentityFillScheduler();
   startPostIssueRetryScheduler();
   startLeadLeakScheduler();

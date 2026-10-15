@@ -39,14 +39,17 @@ export function nearestTwo(slots, wantIso, { nowMs = Date.now(), noticeMs = NOTI
  */
 // 2026-10-09: a Rehash Call is read for the rep the booking names (`userId`),
 // and a call's alternatives may be 30 minutes out, not a visit's 4 hours.
-export async function recheckSlot({ calendarId, startIso, timezone = 'America/New_York', tzLabel = 'ET', nowMs = Date.now(), userId = null, noticeMs = NOTICE_MS } = {}, deps = {}) {
+// 2026-10-15 (market capacity gate): `marketCode` makes the read keep only the
+// times the lead's market can take, so a band that filled up (or was never
+// filed) since the offer reads as taken here too.
+export async function recheckSlot({ calendarId, startIso, timezone = 'America/New_York', tzLabel = 'ET', nowMs = Date.now(), userId = null, noticeMs = NOTICE_MS, marketCode = undefined } = {}, deps = {}) {
   if (!calendarId || !startIso || typeof deps.fetchFreeSlots !== 'function') return { open: null, reason: 'nothing_to_check' };
   let av;
   try {
     // Every opening up to the picked day, with no notice floor and no count
     // cap: a later or sooner slot must never read as "taken".
     const days = Math.max(14, Math.ceil((Date.parse(startIso) - nowMs) / 86_400_000) + 1);
-    av = await deps.fetchFreeSlots(calendarId, { timezone, windowDays: days, maxSlots: 1000, minNoticeHours: 0, ...(userId ? { userId } : {}) });
+    av = await deps.fetchFreeSlots(calendarId, { timezone, windowDays: days, maxSlots: 1000, minNoticeHours: 0, ...(userId ? { userId } : {}), ...(marketCode !== undefined ? { marketCode } : {}) });
   } catch (err) {
     return { open: null, reason: `read_failed: ${err.message}` };
   }

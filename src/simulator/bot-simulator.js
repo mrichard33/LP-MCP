@@ -260,6 +260,8 @@ export async function simulateLiveChat(plan, { nepqMode = 'live', productionDeps
     },
     // 2026-10-13: the LP note + set-ND card. Recorded here, never done.
     scopeDq: async (a) => { record('would_ask_nd_in_lp', { reason: a.kind }); return { done: false, reason: 'simulated' }; },
+    // 2026-10-15 (R5): the note, field overwrite, request row and card. Recorded here, never done.
+    recordEveningRequest: async (a) => { record('would_record_evening_request', { requested: a?.request?.requested_label || null }); return null; },
   });
 
   const transcript = [];

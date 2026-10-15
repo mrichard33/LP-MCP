@@ -46,6 +46,8 @@ import { guardRepeatPromise, recordPromiseIfAny } from '../services/promised-cal
 import { recordTurnStage, readStageForPlanner } from '../services/lead-stage-io.js';  // 2026-10-12
 import { trackBackground } from '../graceful-shutdown.js';
 import { fetchFreeSlots, selectOfferableSlots } from '../knowledge/calendar-availability.js';
+import { resolveGate, isSlotBookable } from '../knowledge/market-capacity-gate.js';
+import { recordEveningRequest } from '../services/evening-request-io.js';
 import { extractPreferredTime } from '../services/preferred-time.js';
 import { BOOKING_CALENDARS, inHomeCalendarFor } from '../knowledge/booking-calendar-router.js';
 import { routeNepqHandoff } from '../agentic/nepq-handoff.js';
@@ -272,12 +274,15 @@ async function postCancelCard({ text, contactId, kind }) {
 // shared, so the prefetch at the top of a turn and the offer reuse it.
 const SLOT_CACHE_MS = 60_000;
 const slotCache = new Map();
-export function cachedFreeSlots(calendarId, timezone, { fetch = fetchFreeSlots, now = Date.now } = {}) {
-  const key = `${calendarId}|${timezone}`;
+// 2026-10-15 (market capacity gate): `marketCode` keeps only the in-home times
+// the visitor's market can take; it is part of the key, so two markets never
+// share a read. Undefined (no zip yet) is the read as before.
+export function cachedFreeSlots(calendarId, timezone, { fetch = fetchFreeSlots, now = Date.now, marketCode = undefined } = {}) {
+  const key = `${calendarId}|${timezone}|${marketCode === undefined ? '' : marketCode}`;
   const hit = slotCache.get(key);
   if (hit && now() - hit.at < SLOT_CACHE_MS) return hit.promise;
   // Two weeks of openings, not the first 12 (day preferences, Part 6).
-  const promise = Promise.resolve().then(() => fetch(calendarId, { timezone, maxSlots: 120 }));
+  const promise = Promise.resolve().then(() => fetch(calendarId, { timezone, maxSlots: 120, ...(marketCode !== undefined ? { marketCode } : {}) }));
   slotCache.set(key, { at: now(), promise });
   // A failed or empty read is not kept: the next turn reads again.
   promise.then((av) => { if (!av?.slots?.length) slotCache.delete(key); }, () => slotCache.delete(key));
@@ -294,7 +299,10 @@ async function offerSlots({ calendarId, contact, preferredText = null, zip: type
   if (zip) {
     try { zone = { ...zone, ...(await timezoneForZip(zip)) }; } catch { /* Eastern */ }
   }
-  const av = await cachedFreeSlots(calendarId, zone.timezone);
+  // The visitor's market (service code from the zip; null = not known, which
+  // the gate logs as capacity_gate_skipped:unresolved and leaves ungated).
+  const marketCode = zone.market_code ?? null;
+  const av = await cachedFreeSlots(calendarId, zone.timezone, { marketCode });
   // A day/time the visitor typed ("tomorrow evening 6 pm") picks the times
   // nearest it (2026-10-02 simulation: it was ignored).
   const preferred = preferredText ? extractPreferredTime([{ direction: 'inbound', text: preferredText }], { timeZone: zone.timezone }) : null;
@@ -311,7 +319,11 @@ async function offerSlots({ calendarId, contact, preferredText = null, zip: type
   // Every offerable opening in the next two weeks (past the notice floor), for
   // a stated day preference ("usually Wednesdays", day-preference.js).
   const all = selectOfferableSlots(av, null, { offerWindowHours: 24 * 14, maxOffer: 500 })?.slots || [];
-  return { slots: slots.slice(0, 2), all, tzLabel: zone.label || 'ET' };
+  // R6 (Mark, 2026-10-15): when the capacity gate thinned the week, the two
+  // earliest times the market can take in the next 14 days are offered.
+  let pair = slots.slice(0, 2);
+  if (av?.capacity_gate && pair.length < 2 && all.length > pair.length) pair = all.slice(0, 2);
+  return { slots: pair, all, tzLabel: zone.label || 'ET', timeZone: zone.timezone, marketCode, capacityGated: !!av?.capacity_gate };
 }
 
 /** Slots ordered by closeness to a parsed preferred day/time (kept in time order within the pair). Pure. */
@@ -371,14 +383,27 @@ async function offerBookingSlots({ contact, preferredText = null, zip = null }) 
  * missing address, decision-makers not confirmed) returns, it does not throw,
  * and the visitor must never hear "you're set" for it.
  */
-async function bookSlot({ contactId, startIso, calendarId, decisionMakers = null, address = null }) {
+async function bookSlot({ contactId, startIso, calendarId, decisionMakers = null, address = null, marketCode = undefined }) {
   if (!supabase) return { ok: false, error: 'supabase client not configured' };
+  // 2026-10-15 (Mark, R1): the picked time is checked against the market's LP
+  // capacity right before booking. Closed → no booking; the lane re-offers.
+  const cal = calendarId || BOOKING_CALENDARS.WINDOW_ESTIMATE;
+  let capacityMarket = null;
+  if (marketCode !== undefined) {
+    const gate = await resolveGate({ calendarId: cal, marketCode }).catch(() => ({ skip: 'read_failed' }));
+    if (gate.market) {
+      capacityMarket = gate.market;
+      const check = await isSlotBookable(gate.market, startIso).catch(err => { console.warn(`[CapacityGate] capacity_gate_skipped:read_failed (market=${gate.market}): ${err.message}`); return { ok: true }; });
+      if (!check.ok) return { ok: false, capacity_closed: true, closed_reason: check.closed_reason, error: `capacity_closed:${check.closed_reason}` };
+    }
+  }
   const { data, error } = await supabase.from('agent_actions').insert({
     action_type: 'book_appointment', target_system: 'ghl', target_entity: 'contact', target_id: contactId,
     rule_applied: 'LIVE_CHAT_BOOK', status: 'executing', requires_approval: false, max_retries: 1,
     reasoning: 'Live chat: the visitor picked one of two real open times (NEPQ Calendar Commitment)',
     action_payload: {
-      calendar_id: calendarId || BOOKING_CALENDARS.WINDOW_ESTIMATE, start_time: startIso, source: 'live_chat',
+      calendar_id: cal, start_time: startIso, source: 'live_chat',
+      ...(capacityMarket ? { capacity_market: capacityMarket } : {}),
       // The visitor's answer to "will anyone else be part of the decision?"
       // satisfies the in-home gate's decision-maker check (2026-10-02).
       ...(decisionMakers ? { qualifying_data: { decision_makers_present: decisionMakers } } : {}),
@@ -459,6 +484,7 @@ export function productionLaneDeps() {
     rescheduleAppointment,
     offerBookingSlots,
     bookSlot,
+    recordEveningRequest: (a) => recordEveningRequest(a),
     nepqHandoff,
     scopeDq,
     guardRepeatPromise: (p) => guardRepeatPromise(p),

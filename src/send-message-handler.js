@@ -251,6 +251,8 @@
  */
 
 import { recheckSlot } from './agentic/slot-recheck.js';
+import { capacityMarketFor, isInHomeCalendar } from './knowledge/market-capacity-gate.js';
+import { recordEveningRequest } from './services/evening-request-io.js';
 import { fetchFreeSlots } from './knowledge/calendar-availability.js';
 import supabase from './supabase.js';
 import { sendGroupMeMessage } from './groupme.js';
@@ -4054,6 +4056,10 @@ export async function executeSendMessage(action, context) {
       tzLabel: generated.slot_tz_label || 'ET',
       // A Rehash Call is checked for the rep it is booked with (2026-10-09).
       ...(cap.rehash_call ? { userId: cap.assigned_user_id || null, noticeMs: 30 * 60_000 } : {}),
+      // 2026-10-15 (Mark, R1): an in-home time the lead's market can no longer
+      // take (full, unfiled, a meeting) reads as taken, so the two nearest
+      // times the market CAN take are offered instead.
+      marketCode: generated.slot_market_code ?? null,
     }, { fetchFreeSlots }).catch(err => ({ open: null, reason: err.message }));
     if (check.open === false) {
       console.warn(`[SendMessage] slot_taken_before_book: ${contactId} ${cap.start_time} on ${cap.calendar_id} is no longer open — offering ${check.alternatives.length} other time(s), no booking`);
@@ -4064,6 +4070,12 @@ export async function executeSendMessage(action, context) {
     }
   }
   if (generated?.companion_action?.action_type === 'book_appointment') {
+    // 2026-10-15 (market capacity gate): the booking holds a seat LP will not
+    // show until the sync lands; the stamp lets the gate count it meanwhile.
+    if (isInHomeCalendar(generated.companion_action.action_payload?.calendar_id)) {
+      const capMkt = await capacityMarketFor(generated.slot_market_code ?? null);
+      if (capMkt) generated.companion_action.action_payload = { ...generated.companion_action.action_payload, capacity_market: capMkt };
+    }
     try {
       // Pass `message`, not generated.message: by this point the disclosure
       // guard and quality pass may have rewritten it, and the deferred
@@ -4447,6 +4459,16 @@ export async function executeSendMessage(action, context) {
       } catch (ocErr) {
         console.warn(`[SendMessage] openings count persist failed for ${contactId} (fail-soft): ${ocErr.message}`);
       }
+    }
+
+    // R5 (Mark, 2026-10-15): the lead asked for 6:30 / 7:00 and the 6:00 PM
+    // booking LANDED this turn. The note, the Requested Appointment Time
+    // overwrite, the request row (the LP note comes from it) and one
+    // #contact-center card. Runs after any fill-if-empty preferred-time write
+    // (the generator skipped its own on this turn). Failure-soft.
+    if (generated?.evening_request && inlineBooking?.landed && inlineBooking.execResult?.appointment_id) {
+      trackBackground(recordEveningRequest({ contactId, appointmentId: inlineBooking.execResult.appointment_id, request: generated.evening_request })
+        .catch(err => console.warn(`[SendMessage] evening request side effects failed for ${contactId} (fail-soft): ${err.message}`)));
     }
 
     // 2026-09-24 — UNDELIVERED PROMISE: the reply still says something is
