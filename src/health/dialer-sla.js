@@ -149,6 +149,34 @@ export function arrivalMsFor(lead, arrivals) {
   return arrived != null && arrived < createdMs ? arrived : createdMs;
 }
 
+/**
+ * Lists our own adds put each phone on (completed in the last 72h). 2026-10-15:
+ * the list check read Five9's f9_last_list, which is the list a record was last
+ * DIALED from, so six visits booked-dial-routing had put on their Conf list
+ * (each add completed) read "not on any list" until their first call. A failed
+ * read returns nothing and the Five9 lookup decides, as before.
+ */
+async function readCompletedAdds(runSQL, phones, nowMs) {
+  const out = new Map();
+  if (!phones.length) return out;
+  try {
+    for (let i = 0; i < phones.length; i += 500) {
+      const part = phones.slice(i, i + 500);
+      const r = await runSQL(`
+        SELECT action_payload->'records'->0->>0 AS phone, target_id AS list
+          FROM agent_actions
+         WHERE action_type = 'five9_add_records_to_list' AND status = 'completed'
+           AND created_at >= '${new Date(nowMs - 72 * HOUR).toISOString()}'
+           AND action_payload->'records'->0->>0 IN (${sqlList(part)})`);
+      for (const x of r || []) {
+        const p = normalizePhone10(x.phone);
+        if (p) out.set(p, [...(out.get(p) || []), x.list]);
+      }
+    }
+  } catch { /* the Five9 lookup decides */ }
+  return out;
+}
+
 /** Phones with an open callback request in the last 72h (the callback path owns them). */
 async function readCallbackPhones(runSQL, nowMs) {
   try {
@@ -274,11 +302,15 @@ export async function evaluateLeadSla({ d, nowMs, registry }) {
   // Newest first, capped (the Five9 SOAP budget).
   candidates.sort((a, b) => (lpLocalToUtcMs(b.lead.created_at_lp) ?? 0) - (lpLocalToUtcMs(a.lead.created_at_lp) ?? 0));
   const cap = Number(listRow?.config?.lookup_cap ?? 300);
+  const added = await readCompletedAdds(d.runSQL, candidates.map((c) => c.phone10), nowMs);
   const late = [];
   const texting = [];
   let lookups = 0;
   let lookupErrors = 0;
   for (const c of candidates.slice(0, cap)) {
+    // Our own completed add to the expected list is membership; Five9's
+    // f9_last_list is only the list a record was last DIALED from.
+    if ((added.get(c.phone10) || []).some((list) => listSatisfies(c.expected, list, cfg))) continue;
     lookups += 1;
     const rec = await d.lookupContact(d.five9.getContactRecords, c.phone10, c.lead.lp_lead_id);
     if (rec === 'error') { lookupErrors += 1; continue; }
@@ -475,12 +507,18 @@ async function campaignPicture({ d, registry }) {
   const { ready, working } = agentCounts(stats?.records);
   const sizes = new Map(((await d.five9.getListsInfo())?.lists || []).map((l) => [l.name, Number(l.size) || 0]));
   const out = [];
+  const unreadable = [];
   for (const c of running) {
-    const cfg = await d.five9.getOutboundCampaign(c.name);
-    if (!Array.isArray(cfg?.lists)) throw new Error(`lists for ${c.name} unreadable`);
+    // 2026-10-15: Five9 refuses to read a campaign someone has open in its
+    // admin ("CAMPAIGN ... is already locked"), and one locked campaign turned
+    // both checks "can't tell". Skip it and say so; only all unreadable is unknown.
+    let cfg;
+    try { cfg = await d.five9.getOutboundCampaign(c.name); } catch { cfg = null; }
+    if (!Array.isArray(cfg?.lists)) { unreadable.push(c.name); continue; }
     out.push({ campaign: c.name, records: cfg.lists.reduce((s, l) => s + (sizes.get(l.name) || 0), 0), lists: cfg.lists.map((l) => l.name) });
   }
-  return { campaigns: out, agentsReady: ready, agentsWorking: working };
+  if (running.length && unreadable.length === running.length) throw new Error(`no campaign readable (${unreadable.join(', ')})`);
+  return { campaigns: out, agentsReady: ready, agentsWorking: working, unreadable };
 }
 
 /**
@@ -552,7 +590,7 @@ export async function evaluateListStalled({ d, registry, nowMs }) {
         ? `${count(n, 'calling list')} with leads waiting ${n === 1 ? 'has' : 'have'} not dialed in ${duration(worst)}, while ${count(pic.agentsWorking, 'agent')} ${pic.agentsWorking === 1 ? 'is' : 'are'} working.`
         : `Every calling list with leads waiting is dialing (${count(pic.agentsWorking, 'agent')} working, ${pic.agentsReady} ready for the next call).`;
     })(),
-    detail: { agents_ready: pic.agentsReady, agents_working: pic.agentsWorking, campaigns: stalled },
+    detail: { agents_ready: pic.agentsReady, agents_working: pic.agentsWorking, campaigns: stalled, not_read: pic.unreadable },
     fingerprint: 'dialer.list_stalled',
   };
 }

@@ -192,3 +192,37 @@ test('a texting campaign is never a stalled calling list', async () => {
   assert.equal(e.status, 'pass');
   assert.equal(e.summary, 'No calling list has leads waiting.');
 });
+
+test('a visit our routing job already added to its Conf list is on the list (2026-10-15)', async () => {
+  // Five9's f9_last_list is the list a record was last DIALED from, so a fresh
+  // add reads as "no list" until the first call; our completed add is the proof.
+  const visit = { lp_lead_id: '583749', first_name: 'Thomas', last_name: 'F', phone: '9542633605', lead_source: 'Internet', lead_source_detail: 'Lead Gurus', disposition_code: 'Set', appointment_date: '2026-10-17T14:00:00+00:00', created_at_lp: '2026-10-15T11:52:31.903+00:00' };
+  const d = slaDeps({ leads: [visit], visits: [visit] });
+  const base = d.runSQL;
+  d.runSQL = async (q) => (/FROM agent_actions/.test(q) && /status = 'completed'/.test(q) ? [{ phone: '9542633605', list: 'Conf - 2nd Day' }] : base(q));
+  let lookups = 0;
+  d.lookupContact = async () => { lookups += 1; return { list: null }; };
+  const [, list] = await evaluateLeadSla({ d, nowMs: Date.parse('2026-10-15T17:26:00Z'), registry: REGISTRY });
+  assert.equal(list.detail.late, 0);
+  assert.equal(lookups, 0, 'no Five9 lookup spent on a lead we know we added');
+});
+
+test('a campaign locked in Five9 admin is skipped, not "can\'t tell" (2026-10-15)', async () => {
+  const d = {
+    runSQL: async () => [],
+    five9: {
+      getCampaigns: async () => ({ campaigns: [{ name: 'DIAL ASAP', type: 'OUTBOUND', state: 'RUNNING' }, { name: 'Data - Warm Leads less than 30', type: 'OUTBOUND', state: 'RUNNING' }] }),
+      getStatistics: async () => ({ records: [{ State: 'Ready' }] }),
+      getListsInfo: async () => ({ lists: [] }),
+      getOutboundCampaign: async (name) => {
+        if (name.startsWith('Data')) throw new Error('CAMPAIGN ("Data - Warm Leads less than 30") is already locked');
+        return { lists: [{ name: 'LP_ASAP' }] };
+      },
+    },
+  };
+  const reg = new Map(REGISTRY);
+  reg.set('dialer.campaign_running', { ...REGISTRY.get('dialer.campaign_running'), config: { expected: ['DIAL ASAP', 'Data - Warm Leads less than 30'] } });
+  const e = await evaluateListStalled({ d, registry: reg, nowMs: NOON });
+  assert.equal(e.status, 'pass');
+  assert.equal(e.summary, 'No calling list has leads waiting.');
+});
