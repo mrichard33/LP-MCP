@@ -363,6 +363,7 @@ import { registerSimulatorRoutes } from './tools/simulator-tools.js';
 import { registerLeadStageRoutes } from './admin/lead-stage-routes.js';
 // 2026-10-01 — answers a live chat message GHL never sent us (a contact merge drops the webhook).
 import { startLiveChatMissedReplyScheduler } from './jobs/live-chat-missed-reply-sweep.js';
+import { startMissedInboundScheduler } from './jobs/missed-inbound-sweep.js';  // 2026-10-15
 // ─── FB Publish Watchdog (alert on missed WF4 publish window) ────
 import { startFbPublishWatchdog } from './fb-publish-watchdog.js';
 // ─── Five9 ESS Silence Watchdog (alert on a quiet Five9 feed) ────
@@ -1020,6 +1021,7 @@ const server = app.listen(PORT, async () => {
   startLeadUncalledScheduler();
   startChatLeadIntakeScheduler();
   startLiveChatMissedReplyScheduler();
+  startMissedInboundScheduler();
   startCanvassBackstopScheduler();
   startDncReentryScheduler();
   startDncLiftReportScheduler();

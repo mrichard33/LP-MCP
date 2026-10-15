@@ -24,6 +24,7 @@
  * it on the draft (enforceNepqPlan), and run the side effects.
  */
 
+import { isWarrantyRequest, warrantyReference, WARRANTY_MARKERS } from './warranty-request.js';
 import { isNotInterested } from './not-interested.js';
 import { isLeadQuestion, findBookingAsks } from './discovery-discipline.js';
 import { isTeamOpen, nextTeamOpenLabel, requestedCallTime, promisedCallback } from './team-hours.js';
@@ -702,6 +703,9 @@ function planNepqTurnCore({
   // 2026-10-13: the window/door count is on the contact (the price play's
   // scoping question then asks the style and size instead).
   knownOpenings = false,
+  // 2026-10-15 (Jeff Clark): the warranty files are configured
+  // (WARRANTY_PDF_URLS), so a copy asked for is sent with this reply.
+  warrantyAvailable = false,
 } = {}) {
   const turns = normalizeThread(conversation, trigger);
   const inbound = turns.filter(t => t.direction === 'inbound');
@@ -891,6 +895,13 @@ function planNepqTurnCore({
 
   // 1. A person takes over: complaint, price insisted after the play, two no's.
   if (EMERGENCY_RX.test(now)) return handoff('emergency');
+  // 1. (2026-10-15, Jeff Clark) A copy of the warranty asked for is sent with
+  // this reply (src/agentic/warranty-request.js), on every stage, rehash
+  // included. Not a hand-off: nothing is filed for it. A call asked for in the
+  // same message keeps its callback below (the send handler adds the files).
+  if (warrantyAvailable && isWarrantyRequest(now) && !CALLBACK_RX.test(now)) {
+    return fixed('warranty', warrantyReference(firstName), { step: 'warranty', warranty: true, booking: { allowed: false, reason: 'nepq:warranty' }, reference_markers: WARRANTY_MARKERS });
+  }
   if (SERVICE_RX.test(now)) return handoff('service');
   if (COMPLAINT_RX.test(now)) return handoff('complaint');
   // A call asked for about service (an install, an order, a repair) goes to
@@ -1734,7 +1745,7 @@ export const URGENCY_RX = /\bonly\s+\d+\s+(?:spots?|slots?|openings?)\s+left\b|\
 export const CLAIMS_RX = /\bcode\s+(?:changed|tightened|got\s+(?:stricter|tighter)|was\s+(?:updated|changed))\b|\b(?:after|since|before)\s+(?:the\s+)?(?:19|20)\d\d\b[^.?!]{0,40}\bcode\b|\bcode\b[^.?!]{0,40}\b(?:after|since|before)\s+(?:19|20)\d\d\b|\bpeak\s+(?:of\s+)?(?:the\s+)?(?:hurricane|storm)\s+season\b|\bmost\s+active\s+(?:stretch|part|time)\b|\b(?:storm\s+season|we)\s+(?:has|have)\s+(?:us\s+)?(?:slammed|swamped)\b|\bcalendar\s+(?:is\s+)?(?:tight|filling|full)\b|\b(?:andersen|renewal|pgt|pella|lowe'?s|home\s+depot|es\s+windows|cgi)\b[^.?!]{0,60}\b(?:uses?|only|standard|cheap\w*|worse|inferior|lower|basic)\b|\b(?:they|their|them|other\s+(?:companies|contractors|installers|guys)|competitors?|those\s+guys|that\s+(?:company|contractor|installer))\b[^.?!]{0,60}\b(?:installed\s+to\s+code|(?:up\s+)?to\s+code|code[-\s]compliant)\b|\b(?:not|never|isn'?t|aren'?t|wasn'?t|weren'?t|might\s+not\s+be|may\s+not\s+be)\s+(?:installed\s+)?(?:up\s+)?to\s+code\b/i;
 const SEE_YOU_RX = /\bsee\s+you\s+(?:then|soon|there)\b/i;
 const SIGNOFF_RX = /(?:^|\s)([—–-]\s*[A-Z][A-Za-z.'’ ]{0,40})\s*$/;
-const FIXED_MOVES = new Set(['handoff', 'objection_play', 'ask_day', 'close', 'reveal', 'offer_slots', 'status_frame', 'dnk', 'qualify']);
+const FIXED_MOVES = new Set(['handoff', 'objection_play', 'ask_day', 'close', 'reveal', 'offer_slots', 'status_frame', 'dnk', 'qualify', 'warranty']);
 
 // ── Part 7 (Mark, 2026-10-02): "I don't think we need any static messages
 // sent by the bot. Each message should be custom." A fixed line is now a

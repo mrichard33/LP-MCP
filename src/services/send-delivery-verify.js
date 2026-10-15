@@ -37,6 +37,7 @@ import supabaseDefault from '../supabase.js';
 import { ghlFetch as ghlFetchDefault } from '../actions/helpers.js';
 import { emitEvent as emitEventDefault } from '../event-emitter.js';
 import { attemptCarrierResend as attemptCarrierResendDefault } from './carrier-resend-runner.js';
+import { senderReadBack } from '../agentic/ai-sender.js';
 
 const MIN_AGE_SEC = Math.max(60, parseInt(process.env.SEND_VERIFY_MIN_AGE_SEC || '120', 10));
 const MAX_AGE_MIN = Math.max(5, parseInt(process.env.SEND_VERIFY_MAX_AGE_MIN || '60', 10));
@@ -86,9 +87,29 @@ export async function verifyRecentSends(deps = {}) {
 
     checked++;
     let status = null;
+    let senderCheck = 'unknown';
     try {
       const msg = await ghlFetch('GET', `/conversations/messages/${messageId}`);
       status = String(msg?.message?.status || msg?.status || '').toLowerCase();
+      // 2026-10-15 — the AI sender read-back (src/agentic/ai-sender.js): did
+      // GHL keep the userId we sent? 'ignored' is the signal to build the
+      // assignedTo fallback. Never changes the row's status.
+      const sentAs = row.execution_result?.sent_as_user_id || null;
+      senderCheck = senderReadBack({ sentAs, message: msg?.message || msg });
+      if (senderCheck === 'ignored') {
+        console.warn(`[SendVerify] action ${row.id}: GHL shows message ${messageId} as user ${msg?.message?.userId || msg?.userId}, not the AI sender ${sentAs}`);
+        await emitEvent({
+          event_type: 'agentic.ai_sender_ignored',
+          source: 'send_verify',
+          entity_type: 'contact',
+          entity_id: String(row.target_id || 'unknown'),
+          ghl_contact_id: row.target_id || null,
+          priority: 'normal',
+          bypass_filter: true,
+          payload: { action_id: row.id, message_id: messageId, sent_as_user_id: sentAs, ghl_user_id: msg?.message?.userId || msg?.userId || null },
+          idempotency_key: `ai_sender_ignored_${row.id}`,
+        }).catch(() => {});
+      }
     } catch (err) {
       // Fail-open: a lookup error is not evidence of a failed send.
       console.warn(`[SendVerify] lookup failed for message ${messageId} (action ${row.id}): ${err.message}`);
@@ -161,7 +182,10 @@ export async function verifyRecentSends(deps = {}) {
       confirmed++;
       // Stamp so the next pass skips this row.
       await supabase.from('agent_actions').update({
-        execution_result: { ...row.execution_result, delivery_verified: true, delivery_status: status },
+        execution_result: {
+          ...row.execution_result, delivery_verified: true, delivery_status: status,
+          ...(row.execution_result?.sent_as_user_id ? { sender_readback: senderCheck } : {}),
+        },
         updated_at: new Date().toISOString(),
       }).eq('id', row.id).eq('status', 'completed');
     }

@@ -106,6 +106,17 @@ GHL Inbound Webhook workflow. Every email needs all three (Mark, 2026-09-24). Po
 workflow that sends those fields unchanged. A workflow with a ChatGPT step rewriting the text (as
 U.SEND-AI and I.AI-MAIL do today) skips every check in `src/actions/handlers/info-email.js`.
 
+**A copy of the warranty asked for goes out in the same reply (Jeff Clark, 2026-10-15).** "Please include a copy of
+your warranty as well" had nothing that could answer it. `isWarrantyRequest` (`src/agentic/warranty-request.js`; a
+"warranty claim / repair", "under warranty" stays the service hand-off) plans the `warranty` move (before `SERVICE_RX`,
+every stage, rehash too; not a hand-off, nothing filed), the SMS writer and the live chat add a prompt line, and
+`enforceWarrantyReply` is a last pass: the reply says the warranty is here, never "later", and never states the 30-Day
+Price Guarantee (LIB-X05). The files are `WARRANTY_PDF_URLS` (GHL Media Library, comma-separated; unset = off). Code adds
+them, never the model: the LINKS on SMS and live chat (the user: a 3 MB scanned PDF by MMS is blocked or mangled), both
+PDFs as Conversations API `attachments` on email. The PDFs go as they are, guarantee page included (the user's ruling).
+A fulfilled request skips the analyzer's callback route; a call asked for still files. `execution_result.warranty_sent`;
+checkReply `warranty_claim_without_file`.
+
 **A guide goes out with a saved first name (Mark, 2026-10-03).** U.GUIDE emails the guide with `{{contact.first_name}}`
 and sent "Hi ," when nothing had saved one. `ensureGuideName` (`src/agentic/guide-name.js`) runs before any
 `send-<type>-guide` tag (the layer3 dispatch and an accepted `guide_disposition`): a name on the contact → send; a name in
@@ -210,6 +221,14 @@ NEPQ plan dropped later. Now:
   (`routeNepqHandoff` reason `lp_note_dq`), and queues `dq_hard_stop` (stop-bot, out of S5.x/S4.5/W). S5.2 entry
   is refused on such a note and for a lead who texted in the last 2 hours (`s52-entry-gate.js`).
   `LP_NOTE_DQ_MODE` off|shadow|live, default live.
+
+**A rehash contact's bot message shows as the AI user (Jeff Clark, 2026-10-15).** GHL credits a message with no
+`userId` to the contact's assigned user, so the bot's texts to a rehash lead read as John Manieri's own. `sendAsUserFor`
+(`src/agentic/ai-sender.js`: the `rehash` / `active-f.0` tag, the rehash line or the writer's `rehash.active`) puts
+`AI_SENDER_USER_ID` (3K6HtoPyBLWeQrrnSnCD; unset = off) on the Conversations API body for SMS, live chat and email.
+`fromNumber` and the email From never change: email gets it only with an explicit `emailFrom`. `assignedTo` is never
+written for this. `execution_result.sent_as_user_id`; send-delivery-verify reads it back and emits
+`agentic.ai_sender_ignored` if GHL kept another user. Only then build the assign → send → restore fallback.
 
 **Post-demo F.0 leads talk to the rehash rep (Mark, 2026-10-01).** A contact tagged `active-f.0` (or texting
 727-800-4578) gets SMS replies written AS the rep in the GHL custom value `rehash_rep_name`, read by
@@ -518,6 +537,14 @@ Precedents: `src/jobs/canvass-lead-backstop.js` (re-drives through the webhook's
 who types a phone number that already has a contact is MERGED by GHL, and that message's I.LVI webhook
 never fires). Keep any I/O before a webhook's response capped — the
 `findRecentCanvassMark` pre-check is held to 3s for that reason.
+**Every inbound SMS and email is checked the same way (Jeff Clark, 2026-10-15).** I.L3-IN's POST to `/webhook/ghl/reply`
+never arrived for his 15:04 text (22 of 187 inbound messages in 3 days, "We have decided to go with your quote" among
+them), and HL-MCP's `contact.replied` copy is read by no rule, so "processed" there means nothing. Job
+`missed-inbound-sweep` (`src/jobs/missed-inbound-sweep.js`, rules in `src/agentic/missed-inbound.js`, every 60s, not in
+job-registry) compares the HL mirror's `messages` (types 2/3) with our `ghl.reply_received` / `reply_channel_excluded`
+and runs a missed one, 90s+ old, through `processInboundReply` (the webhook's own pipeline, every gate), claimed once
+(`inbound_sweep_<id>`). No Slack; `agentic.missed_inbound_redriven`. `MISSED_INBOUND_SWEEP_MODE` off|shadow|live,
+default live (the user).
 
 **A linked contact gets its name from LP, fill-empty-only (2026-10-11).** a9eG41qtxCqMEXxbbD2l reached a demo with no
 name while LP lead 581424 said Andrew Marcus: the backstop wrote names only on create, and `/n8n/enrich-lead` read them

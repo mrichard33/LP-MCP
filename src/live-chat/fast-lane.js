@@ -40,6 +40,7 @@
  * pattern for anything that reaches the network or the database.
  */
 
+import { warrantyTurn, enforceWarrantyReply, appendWarrantyLinks } from '../agentic/warranty-request.js';
 import { promptSha256 } from '../bot-feedback/fingerprint-core.js';
 import { cleanInboundForModel } from '../security/untrusted-text.js';
 import { guardInBackground } from '../security/injection-guard.js';
@@ -673,6 +674,8 @@ export function createLiveChatFastLane(deps) {
   // been overtaken by a newer one is not sent; the newer turn reads the whole
   // thread and answers both.
   const latestInbound = new Map();
+  // contactId → the turn's tags, for the send (2026-10-15, ai-sender.js).
+  const sendTags = new Map();
 
   /** Express handler. Always answers 200 once past auth/validation. */
   async function handle(req, res) {
@@ -754,6 +757,11 @@ export function createLiveChatFastLane(deps) {
       if (!conversationId) d.warn(`[LiveChat] no conversation found for ${contactId} — replying without the thread`);
     }
     const tags = (Array.isArray(contact?.tags) ? contact.tags : []).map(t => String(t).trim().toLowerCase());
+    // 2026-10-15 — the send reads these to show a rehash visitor's reply as the
+    // AI user (src/agentic/ai-sender.js). Keyed by contact: two turns of one
+    // visitor share the same tags.
+    if (sendTags.size > LATEST_INBOUND_MAX) sendTags.clear();
+    sendTags.set(contactId, tags);
     // Warm the calendar read while the rest of the turn is built: the NEPQ
     // offer below reuses it (cachedFreeSlots shares the in-flight read).
     if (d.nepqMode() === 'live') Promise.resolve().then(() => d.offerBookingSlots({ contact, zip: typedZipFromThread([], body) })).catch(() => null);
@@ -1105,6 +1113,8 @@ export function createLiveChatFastLane(deps) {
         knownZip: context.lead?.postal_code || null,
         // A Window Count / Door Count already on the contact (2026-10-13).
         knownOpenings: (Number(context.estimate?.window_count) || 0) + (Number(context.estimate?.door_count) || 0) > 0,
+        // 2026-10-15: a copy of the warranty asked for is sent with this reply.
+        warrantyAvailable: !!warrantyTurn(body),
       };
       nepqPlan = planNepqTurn(planInput);
       if (!saPlan.active && wantsSlots(nepqPlan)) {
@@ -1881,6 +1891,15 @@ export function createLiveChatFastLane(deps) {
         d.log(`[SignOff] live chat ${contactId} question/time dropped after a goodbye`);
         draft = signOff.text;
       }
+      // 2026-10-15 (Jeff Clark): a copy of the warranty asked for goes with this
+      // reply: the reply says it is here (never "later"), the links follow it.
+      if (!skipCapture && warrantyTurn(body)) {
+        const w = enforceWarrantyReply(draft, { firstName: null });
+        if (w.changed) {
+          d.log(`[Warranty] live chat ${contactId} reply fixed: ${w.changes.join(',')}`);
+          draft = w.text;
+        }
+      }
       // Human voice once more, last (2026-10-06 bot gate, spouse/livechat):
       // the first pass runs before the guards, and a sentence a guard drops can
       // leave two stock openers side by side ("Got it. That makes sense.").
@@ -1907,9 +1926,12 @@ export function createLiveChatFastLane(deps) {
     let sendMethod = null;
     let sent = false;
     if (mode === 'live') {
-      const res = await d.sendMessage({ contactId, conversationId, message: draft, actionId, inboundMessage: body });
+      const warrantyFiles = !skipCapture ? warrantyTurn(body)?.urls || null : null;
+      const res = await d.sendMessage({ contactId, conversationId, message: warrantyFiles ? appendWarrantyLinks(draft, warrantyFiles) : draft, actionId, inboundMessage: body, tags: sendTags.get(contactId) || [] });
+      if (warrantyFiles) extras = { ...extras, warranty_sent: true, warranty_urls: warrantyFiles, warranty_delivery: 'links' };
       ghlMessageId = res?.messageId || null;
       sendMethod = res?.method || null;
+      if (res?.sentAsUserId) extras = { ...extras, sent_as_user_id: res.sentAsUserId };
       sent = true;
       timing.t6_ghl_sent = new Date(d.now()).toISOString();
       // Every sent turn: the capture decides (no I/O when the visitor's words
@@ -1998,7 +2020,7 @@ export function createLiveChatFastLane(deps) {
     }
     if (mode === 'live') {
       try {
-        const res = await d.sendMessage({ contactId, conversationId, message, actionId, inboundMessage: body });
+        const res = await d.sendMessage({ contactId, conversationId, message, actionId, inboundMessage: body, tags: sendTags.get(contactId) || [] });
         ghlMessageId = res?.messageId || null;
         sent = true;
         timing.t6_ghl_sent = new Date(d.now()).toISOString();
