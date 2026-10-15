@@ -141,7 +141,7 @@ test('the sweep reports types that are ingesting but unarmed', () => {
   // `if (!armed) continue` failed OPEN and SILENT: a feed nobody watched
   // looked exactly like a feed that was fine. That is the deeper bug.
   assert.match(WATCHDOG_CODE, /unarmed\.push\(/);
-  assert.match(WATCHDOG_CODE, /unarmed,?\s*\n?\s*\}?;?\s*$|return \{ checked: true, today, missing, unarmed \}/m);
+  assert.match(WATCHDOG_CODE, /unarmed,?\s*\n?\s*\}?;?\s*$|return \{ checked: true, today, missing, unarmed(, \w+)* \}/m);
 });
 
 test('the unarmed set is logged AND alerted, not just returned', () => {

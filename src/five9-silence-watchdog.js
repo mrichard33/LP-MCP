@@ -35,6 +35,7 @@
  */
 
 import supabase from './supabase.js';
+import { five9SilenceResults } from './health/watchdog-results.js';
 import { reportAlertCondition } from './alert-state.js';
 import { runJob } from './job-runner.js';
 
@@ -120,7 +121,7 @@ async function readFive9FeedState() {
  * Returns true if a card was sent this sweep.
  */
 export async function checkFive9Silence() {
-  const { active, latest } = await readFive9FeedState();
+  const { active, latest, reason } = await readFive9FeedState();
 
   const res = await reportAlertCondition({
     key: ALERT_KEY,
@@ -136,7 +137,10 @@ export async function checkFive9Silence() {
     // No `send`: alert-state's default posts to Slack (ALERT_SEND_TARGET, 2026-09-29).
   });
 
-  return res.sent === true;
+  // 2026-10-15 (System Health Phase 0): the verdict also goes to
+  // health_results as dialer.silence (runJob writes `health`). The card above
+  // is unchanged.
+  return { sent: res.sent === true, active, health: five9SilenceResults({ active, reason, latest, nowMs: Date.now() }) };
 }
 
 export function startFive9SilenceWatchdog() {
@@ -146,7 +150,7 @@ export function startFive9SilenceWatchdog() {
   }
   const tick = () =>
     runJob('five9-silence-watchdog', () => checkFive9Silence())
-      .then(({ value: sent }) => { if (sent) console.log('[Five9Watchdog] silence alert sent'); })
+      .then(({ value }) => { if (value?.sent) console.log('[Five9Watchdog] silence alert sent'); })
       .catch((e) => console.error('[Five9Watchdog] tick error:', e.message));
   setTimeout(tick, 30 * 1000);    // first run ~30s after boot
   setInterval(tick, INTERVAL_MS); // then on cadence

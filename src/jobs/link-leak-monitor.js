@@ -50,6 +50,7 @@
 // SCHEDULER (startLinkLeakScheduler): daily at 06:00 ET.
 
 import { alertDigestEnabled } from '../alert-posted.js';
+import { linkLeakResults } from '../health/watchdog-results.js';
 import { getHlSupabase } from '../admin/hl-client.js';
 import { runSQL } from '../admin/supabase-admin.js';
 import { reportAlertCondition, observeAlertCondition } from '../alert-state.js';
@@ -237,6 +238,8 @@ export async function runLinkLeakMonitor({ post = true } = {}) {
     verdict: decision.verdict,
     offenders: decision.offenders,
     sample,
+    // 2026-10-15 (System Health Phase 0): recorded by runJob as sync.lp_ghl_link_pct.
+    health: linkLeakResults({ decision, sample }),
   };
 }
 

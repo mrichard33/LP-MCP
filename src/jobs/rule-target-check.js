@@ -18,6 +18,7 @@
 // check_rule_targets runs the same check with write:false.
 
 import { runJob } from '../job-runner.js';
+import { ruleTargetResult } from '../health/watchdog-results.js';
 import { hourET, todayET } from './lp-report-common.js';
 import { buildRegistry, checkRules, findingLine, registryFresh, HIGH, LOW } from '../rule-target-resolve.js';
 
@@ -94,7 +95,14 @@ async function writeFindings(deps, runAt, findings) {
  * Run the check. → { ok, checked, summary, high, low, findings, high_findings, ... }
  * `checked: false` (job status unknown) when the mirror is unreadable or stale.
  */
-export async function runRuleTargetCheck({ write = true, includeOk = false, deps: depsArg } = {}) {
+// 2026-10-15 (System Health Phase 0): every pass also carries the
+// ghl.rule_targets result for runJob to record.
+export async function runRuleTargetCheck(args = {}) {
+  const out = await runRuleTargetCheckPass(args);
+  return { ...out, health: [ruleTargetResult(out)] };
+}
+
+async function runRuleTargetCheckPass({ write = true, includeOk = false, deps: depsArg } = {}) {
   const deps = { ...(depsArg?.__noDefaults ? {} : await defaultDeps()), ...(depsArg || {}) };
   const nowMs = deps.nowMs ?? Date.now();
 

@@ -71,7 +71,7 @@ export async function probe(id, name, group, fn, { timeoutMs = PROBE_TIMEOUT_MS,
 
 // ─── Individual probes ──────────────────────────────────────────────
 
-async function lpApiProbe(deps) {
+export async function lpApiProbe(deps) {
   const env = deps.env;
   const missing = LP_REQUIRED_ENV.filter((k) => !env[k]);
   if (missing.length) {
@@ -92,7 +92,7 @@ async function lpApiProbe(deps) {
   };
 }
 
-async function five9Probe(deps) {
+export async function five9Probe(deps) {
   const env = deps.env;
   if (!env.FIVE9_USERNAME || !env.FIVE9_PASSWORD) {
     return { state: 'not_configured', detail: 'Set FIVE9_USERNAME and FIVE9_PASSWORD on LP MCP.' };
@@ -113,7 +113,7 @@ async function five9Probe(deps) {
   };
 }
 
-async function slackProbe(deps) {
+export async function slackProbe(deps) {
   const env = deps.env;
   if (String(env.SLACK_MIRROR_ENABLED || 'false') !== 'true') {
     return { state: 'not_configured', detail: 'Mirror is off (SLACK_MIRROR_ENABLED is not "true"). Cards go to GroupMe only.' };

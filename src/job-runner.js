@@ -36,6 +36,7 @@ import os from 'node:os';
 import { withGhlCaller } from './ghl-caller.js';
 import supabase from './supabase.js';
 import { onShutdown } from './graceful-shutdown.js';
+import { recordHealthResults } from './health/record.js';
 
 /** Terminal statuses. Mirrors the CHECK constraint in sql/113_job_runs.sql. */
 export const JOB_STATUS = Object.freeze({
@@ -145,8 +146,8 @@ function db(deps) {
  * daily jobs. With one set, the database decides which replica runs: the loser
  * gets `skipped` and the job is never called. Interval jobs pass nothing.
  *
- * Returns { status, summary, value, error } so a caller that wants the job's
- * own return value still has it.
+ * Returns { status, summary, value, error, runId } so a caller that wants the
+ * job's own return value (or its job_runs id) still has it.
  */
 export async function runJob(jobId, fn, deps = {}) {
   const client = db(deps);
@@ -217,7 +218,8 @@ export async function runJob(jobId, fn, deps = {}) {
         .update({
           status,
           summary,
-          detail: serializable(value ?? (error ? { error: String(error.message || error) } : null)),
+          // `health` goes to health_results (below), not into the run's detail.
+          detail: serializable(withoutHealth(value) ?? (error ? { error: String(error.message || error) } : null)),
           finished_at: new Date(finishedMs).toISOString(),
           elapsed_ms: Math.max(0, Math.round(finishedMs - startedMs)),
         })
@@ -231,7 +233,21 @@ export async function runJob(jobId, fn, deps = {}) {
     }
   }
 
-  return { status, summary, value, error };
+  // 2026-10-15 (System Health Phase 0): a job that returns `health: [...]`
+  // gets each entry written to health_results, linked to this run. After the
+  // run row is closed, and never able to change the job's own status: a health
+  // write that fails is a log line (recordHealthResults never throws).
+  if (value && typeof value === 'object' && Array.isArray(value.health) && value.health.length) {
+    const healthClient = deps.healthClient !== undefined ? deps.healthClient : client;
+    const out = await recordHealthResults(value.health, {
+      job_run_id: runId,
+      client: healthClient,
+      nowMs: deps.now ? finishedMs : undefined,
+    });
+    if (out.failed) console.warn(`[JobRunner] ${jobId}: ${out.failed} health result(s) not written`);
+  }
+
+  return { status, summary, value, error, runId };
 }
 
 /**
@@ -245,6 +261,12 @@ export async function runJob(jobId, fn, deps = {}) {
 export function isOccurrenceTaken(err) {
   if (!err) return false;
   return err.code === '23505' || /duplicate key value/i.test(err.message || '');
+}
+
+function withoutHealth(value) {
+  if (!value || typeof value !== 'object' || !('health' in value)) return value;
+  const { health: _health, ...rest } = value;
+  return rest;
 }
 
 /** jsonb-safe: drop anything that will not survive JSON.stringify. */

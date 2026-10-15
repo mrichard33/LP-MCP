@@ -26,6 +26,7 @@
  */
 
 import supabase from '../supabase.js';
+import { staleSetLeadsResult } from '../health/watchdog-results.js';
 import { runJob } from '../job-runner.js';
 import { getProspectByCstId, getCircuitStatus } from '../lp-client.js';
 import { buildLeadRow } from '../sync-leads.js';
@@ -129,6 +130,22 @@ export function productionDeps({ cfg, nowMs = Date.now() } = {}) {
 let cursor;
 let running = false;
 
+/** Set/Cnf/Verif leads whose appointment is more than graceHours past. Never throws. */
+async function countStaleSetLeads(cfg) {
+  try {
+    if (!supabase) return { error: 'no supabase client' };
+    const cutoff = new Date(Date.now() - (cfg.graceHours ?? 24) * 3600_000).toISOString();
+    const { count, error } = await supabase.from('lp_leads')
+      .select('lp_lead_id', { count: 'exact', head: true })
+      .in('disposition_code', ['Set', 'Cnf', 'Verif'])
+      .lt('appointment_date', cutoff);
+    if (error) return { error: error.message };
+    return { count: count ?? 0 };
+  } catch (err) {
+    return { error: err.message };
+  }
+}
+
 async function loadLastCursor() {
   try {
     const { data } = await supabase.from('job_runs')
@@ -154,7 +171,9 @@ export async function runStaleLeadRefreshOnce(env = process.env) {
     const result = await runStaleLeadRefresh({ cfg, cursor }, productionDeps({ cfg }));
     cursor = result.cursor_out ?? null;
     console.log(`[StaleLeadRefresh] ${result.summary}`);
-    return result;
+    // 2026-10-15 (System Health Phase 0): sync.stale_set_leads — the backlog
+    // this job works through, counted once per pass. A failed count is unknown.
+    return { ...result, health: [staleSetLeadsResult(await countStaleSetLeads(cfg))] };
   } finally {
     running = false;
   }
