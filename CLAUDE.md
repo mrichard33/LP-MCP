@@ -169,6 +169,13 @@ more (`buildRetiredDripTagsSql` over the HL mirror's `workflow_actions`; old W-n
 it off. `POST /admin/tag-hygiene/run?dryRun=true` writes nothing. Current tags left behind by a pause gate's 30-day
 timeout are a GHL fix, not a guess in code: `docs/ghl-drip-tag-timeout-fixes.md`.
 
+**A post-demo lead who asks for room gets room (Jose Perez, 2026-10-14).** He shared a hard few days and asked for
+more time; his "Appreciate it, thank you again" then got the rehash track's "What would you need to see to feel good
+moving forward?" (`post_demo_question_added`). `askedForSpace` (`src/agentic/post-demo-turn.js`: more/some time, "not a
+good time", a hardship; never a bare "need to think about it", which the track asks back, and never a question) plans
+`post_demo_space`: one warm line, no question, no time, no call pitch, for that message and for a thank-you within 48h
+after it. Rule 330 no longer clears a `follow-up:*` promise on a bare thank-you.
+
 **Only an opt-out silences the bot (Mark, 2026-09-24).** A classifier handoff tags the contact and,
 where a person must act, pages one — and the bot still replies, unless `handoffReplyPolicy`
 (`src/agentic/handoff-policy.js`) says `silent` (STOP, WRONG_NUMBER; a STOP that is only a door complaint is

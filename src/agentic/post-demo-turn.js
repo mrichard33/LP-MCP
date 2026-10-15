@@ -221,6 +221,28 @@ export function isAcknowledgment(text) {
   return !!word && /^\p{Lu}/u.test(word);
 }
 
+// The lead asked for room: more time, time to think, or a hard stretch at
+// home (Jose Perez, 2026-10-14: "Had a traumatic event with my small dog …
+// I would need more time to think about this thank you", then "Appreciate it,
+// thank you again" got "What would you need to see to feel good moving
+// forward?"). No date in it, so detectDeferral misses it; it still means stop
+// asking for now. A bare "need to think about it" is NOT this: the rehash
+// track asks it back (rehashObjection 'think'). A question in the message ("can I have more time?") is not
+// this: it gets an answer.
+const SPACE_RX = new RegExp([
+  String.raw`\b(?:need|needs|want|wants|take|taking|give\s+(?:me|us))\s+(?:a\s+(?:bit|little)\s+)?(?:more|some|extra)(?:\s+more)?\s+time\b`,
+  String.raw`\bmore\s+time\s+to\s+(?:think|decide|consider|talk|discuss|process|look)\b`,
+  String.raw`\b(?:not|isn'?t|isnt)\s+(?:a\s+)?(?:good|right|the\s+right)\s+time\b`,
+  String.raw`\b(?:a\s+)?(?:tough|rough|hard|difficult|crazy)\s+(?:few\s+)?(?:days?|weeks?|time|stretch|couple\s+(?:of\s+)?(?:days|weeks))\b`,
+  String.raw`\b(?:traumatic|trauma|passed\s+away|funeral|hospital(?:i[sz]ed)?|surgery|family\s+emergency|lost\s+my|in\s+the\s+er\b|bad\s+news|going\s+through\s+(?:a\s+lot|something))\b`,
+].join('|'), 'i');
+
+/** The lead asked for space with no date and no question. Pure. */
+export function askedForSpace(text) {
+  const t = String(text || '').replace(/[’]/g, "'").trim();
+  return !!t && !t.includes('?') && SPACE_RX.test(t);
+}
+
 // A sentence that closes the conversation; nothing should come after it.
 const SIGN_OFF_RX = /\benjoy\s+(?:your|the)\s+(?:week|weekend|day|evening|night|holidays?|time)\b|\bwe(?:'|’)?re\s+here\b|\bwe\s+are\s+here\b|\bi(?:'|’)?m\s+here\s+(?:if|when|whenever)\b|\bcongrat(?:ulation)?s\b|\btake\s+care\b|\b(?:i|we)(?:'|’)?ll\s+check\s+back\b|\b(?:i|we)\s+will\s+check\s+back\b|\btalk\s+soon\b|\bgood\s+luck\s+with\b|\bhave\s+a\s+(?:great|good|nice|wonderful|blessed)\s+(?:day|week|weekend|evening|night|one)\b|\breach\s+out\s+(?:whenever|anytime|any\s+time)\b|^\s*enjoy(?:\s+it)?[.!]*\s*$/i;
 
