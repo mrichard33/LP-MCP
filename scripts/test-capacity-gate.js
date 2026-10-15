@@ -274,3 +274,18 @@ test('16. persistPreferredTime still fills only an empty field', async () => {
   const n = await persistPreferredTime('c1', { raw: 'Thursday at 6:30 PM', source: 'inbound' }, { contact });
   assert.equal(n, 0, 'a value already there is never clobbered by the normal path');
 });
+
+test('7c. a held 6:00 PM says the evening note once, even when the model writes "7" without PM', () => {
+  const slot6 = slot(THU_6PM);
+  const facts = smsBookingTurn({ plan: PLAN, trigger: 'Can you do 7pm tomorrow?', thread: thread('Can you do 7pm tomorrow?'), slots: [slot6], tz: 'ET',
+    gateMissing: ['address'], pinnedSlot: slot6, evening: { requested_time: '7:00 PM', minutes: 1140 } });
+  assert.equal(facts.kind, 'hold');
+  const draft = `I'm holding Thu, Oct 15 at 6:00 PM ET for you. We start visits at 6, but I noted you'd prefer 7. ${facts.ask_line}`;
+  const out = enforceBookingFacts(draft, facts);
+  assert.equal((out.message.match(/\bnote/gi) || []).length, 1, out.message);
+  assert.match(out.message, /I'm holding Thu, Oct 15 at 6:00 PM ET for you\./);
+  assert.ok(out.message.endsWith(facts.ask_line));
+  // A draft with no note at all still gets ours.
+  const bare = enforceBookingFacts(`I'm holding Thu, Oct 15 at 6:00 PM ET for you. ${facts.ask_line}`, facts);
+  assert.match(bare.message, /I've made a note that you would like 7:00 PM\./);
+});
