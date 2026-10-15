@@ -21,7 +21,7 @@ const { default: express } = await import('express');
 const { default: ExcelJS } = await import('exceljs');
 const { makeAuthenticate } = await import('../src/auth.js');
 const { buildVendorWorkbook, tally, reportFileName, LEAD_COLUMNS, LEAD_COL } = await import('../src/vdr/report-xlsx.js');
-const { registerVdrReportRoutes } = await import('../src/vdr/report-route.js');
+const { registerVdrReportRoutes, vdrAuthenticate, defaultVerifyServiceKey, _resetVdrKeyCache } = await import('../src/vdr/report-route.js');
 
 const TOKEN = 'test-operator-token';
 
@@ -251,4 +251,49 @@ test('route: no saved 135 feed means no feed headers', async () => {
     assert.equal(res.status, 200);
     assert.equal(res.headers.get('x-vdr-feed-leads'), null);
   } finally { await app.close(); }
+});
+
+// 2026-10-15: production runs AUTH_SOFT_LAUNCH=true, and the shared check let a request with no token download the
+// whole Modernize file. This route is always enforced: the operator token, or a key the database proves is the LP
+// project's service-role key (what n8n's "LP Supabase" credential sends).
+async function serveWith(authenticate) {
+  const app = express();
+  registerVdrReportRoutes(app, { authenticate, readReport: async () => REPORT });
+  const server = await new Promise((resolve) => { const s = app.listen(0, '127.0.0.1', () => resolve(s)); });
+  return { url: `http://127.0.0.1:${server.address().port}`, close: () => new Promise((r) => server.close(r)) };
+}
+const get = (url, key) => fetch(`${url}/vdr/report.xlsx?vendor_id=1`, key ? { headers: { Authorization: `Bearer ${key}` } } : {});
+
+test('route auth: no soft launch; operator token or a verified service-role key only', async () => {
+  const prev = process.env.AUTH_SOFT_LAUNCH;
+  process.env.AUTH_SOFT_LAUNCH = 'true';
+  _resetVdrKeyCache();
+  const asked = [];
+  const verifyServiceKey = async (k) => { asked.push(k); return k === 'service-key'; };
+  const app = await serveWith(vdrAuthenticate({ token: TOKEN, verifyServiceKey, canVerify: true }));
+  try {
+    assert.equal((await get(app.url)).status, 401);
+    assert.equal((await get(app.url, 'wrong')).status, 401);
+    assert.equal((await get(app.url, TOKEN)).status, 200);
+    assert.equal((await get(app.url, 'service-key')).status, 200);
+    assert.equal((await get(app.url, 'service-key')).status, 200);
+    assert.deepEqual(asked, ['wrong', 'service-key']);   // the operator token never reaches the database; verdicts are cached
+  } finally {
+    await app.close();
+    if (prev === undefined) delete process.env.AUTH_SOFT_LAUNCH; else process.env.AUTH_SOFT_LAUNCH = prev;
+  }
+});
+
+test('route auth: nothing configured refuses with 503', async () => {
+  const app = await serveWith(vdrAuthenticate({ token: null, canVerify: false }));
+  try { assert.equal((await get(app.url)).status, 503); } finally { await app.close(); }
+});
+
+test('service-key check: a key that reads vdr_vendor_config is the service role', async () => {
+  const seen = [];
+  const fetchImpl = async (u, o) => { seen.push([u, o.headers.apikey]); return { ok: o.headers.apikey === 'svc', json: async () => (o.headers.apikey === 'svc' ? [{ id: 1 }] : []) }; };
+  assert.equal(await defaultVerifyServiceKey('svc', { fetchImpl, url: 'https://x.supabase.co/' }), true);
+  assert.equal(await defaultVerifyServiceKey('anon', { fetchImpl, url: 'https://x.supabase.co' }), false);
+  assert.equal(await defaultVerifyServiceKey('svc', { fetchImpl, url: '' }), false);
+  assert.equal(seen[0][0], 'https://x.supabase.co/rest/v1/vdr_vendor_config?select=id&limit=1');
 });
