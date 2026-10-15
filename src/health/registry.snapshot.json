@@ -1,6 +1,6 @@
 {
-  "exported_at": "2026-10-15T02:23:37.961Z",
-  "count": 73,
+  "exported_at": "2026-10-15T04:05:00.609Z",
+  "count": 74,
   "checks": [
     {
       "check_id": "agent.action_failures",
@@ -482,6 +482,27 @@
       "owner_job_id": "appointment-pipeline-check",
       "runbook": null,
       "business_impact": "Unrouted appointment = NIS",
+      "enabled": true
+    },
+    {
+      "check_id": "ci.recording_archive",
+      "family": "sync",
+      "system": "supabase",
+      "label": "Call recording archive reachable",
+      "question": "Can the call-intelligence worker reach the recording archive?",
+      "severity": "P3",
+      "cadence": "existing",
+      "active_window": null,
+      "stale_after_min": 1500,
+      "warn_rule": "existing",
+      "fail_rule": "legacy alert ci:recording_archive_unreachable firing",
+      "config": {
+        "source": "alert_conditions ci:recording_archive_unreachable (src/ci/worker.js)"
+      },
+      "mode": "shadow",
+      "owner_job_id": null,
+      "runbook": null,
+      "business_impact": "Calls are not analyzed while the archive is unreachable",
       "enabled": true
     },
     {
