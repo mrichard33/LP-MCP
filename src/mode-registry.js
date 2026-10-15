@@ -396,6 +396,27 @@ export const MODES = Object.freeze([
   }),
 
   // ── Lead leaks and alerts ───────────────────────────────────────────────
+  // 2026-10-15 — System Health Phase 1 (docs/system-health.md).
+  m('DIALER_SLA_MODE', 'dialer', 'enum', OSL, 'shadow', OSL_S, {
+    since: '2026-10-15', evidence: { table: 'health_results', job: 'dialer-sla-check' },
+    goLive: 'Mark, handoff 2026-10-14: 5 business days of v_health_check_latest with no false red, then flip',
+    note: 'Dialer SLA checks (list membership, first dial, stalled lists, dial rate, 3-in-24, never-again). Writes health_results only.',
+  }),
+  m('APPT_PIPELINE_MODE', 'lp', 'enum', OSL, 'shadow', OSL_S, {
+    since: '2026-10-15', evidence: { table: 'health_results', job: 'appointment-pipeline-check' },
+    goLive: 'Mark, handoff 2026-10-14: 5 business days of v_health_check_latest with no false red, then flip',
+    note: 'Appointment pipeline checks (inbound queue age, issued by 20:15, unassigned, capacity, ...). Writes health_results only.',
+  }),
+  m('INCIDENT_NOTIFIER_MODE', 'alerts', 'enum', OSL, 'shadow', OSL_S, {
+    since: '2026-10-15', evidence: { table: 'incidents', job: 'incident-notifier' },
+    goLive: 'Mark, handoff 2026-10-14: after HEALTH_CHECKS / DIALER_SLA / APPT_PIPELINE are live; one card per incident, edited in place',
+    note: 'Opens incidents from live-mode checks and mapped legacy alerts; shadow writes incidents and logs the card, sends nothing.',
+  }),
+  m('HEALTH_RETENTION_MODE', 'alerts', 'enum', ['off', 'dry_run', 'live'], 'dry_run', { live: ['live'], shadow: ['dry_run'], off: ['off'] }, {
+    since: '2026-10-15', evidence: { job: 'health-retention' },
+    goLive: 'Mark, handoff 2026-10-14: after a dry_run whose counts match expectations in job_runs.detail',
+    note: 'Rolls health_results older than 30 days into health_results_daily, then deletes; n8n log 14d; synthetic 30d; lead_leak_daily 90d after summarizing.',
+  }),
   // 2026-10-15 — System Health Phase 0 (docs/system-health.md).
   m('HEALTH_CHECKS_MODE', 'alerts', 'enum', OSL, 'shadow', OSL_S, {
     since: '2026-10-15', evidence: { table: 'health_results', job: 'health-checks' },

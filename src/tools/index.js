@@ -18,6 +18,7 @@ import { registerPayrollTools } from './payroll/index.js';
 import { registerSimulatorTools } from './simulator-tools.js';
 import { registerAiOsTools } from './ai-os-tools.js';
 import { registerMaintenanceTools } from './maintenance-tools.js';
+import { registerHealthTools } from './health-tools.js';
 import { withSanitizedResults } from '../text-sanitize.js';
 import { withInfraGuard } from '../security/infra-guard.js';
 
@@ -58,6 +59,9 @@ export function registerAllTools(rawServer) {
   // Drift detection tool (1) — backs the dashboard Issues-page "drift" tile.
   //   get_drift_candidates (read-only; GHL-closed but LP-active cross-reference)
   registerDriftTools(server);
+  // System health (2) — 2026-10-15: incident_action, health_run_check
+  //   (the dashboard's incident buttons; src/health/ops-actions.js).
+  registerHealthTools(server);
   // Capacity diagnostics (1) — 2026-07-25
   //   get_capacity_vs_ghl (read-only; LP per-band rep availability vs GHL
   //   calendar bookings — the slot_id dimension /board/capacity sums away.

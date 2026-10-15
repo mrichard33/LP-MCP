@@ -416,6 +416,60 @@ async function shadowModesSection(deps, nowMs) {
   return lines.length ? { title: 'Shadow-mode review (Mondays)', lines } : null;
 }
 
+// 2026-10-15 (System Health 1.10). One section, only when it has something:
+// checks yellow for more than 24h, shadow checks that WOULD have fired
+// yesterday (count per check), and incidents resolved yesterday with their
+// time to acknowledge and to resolve. A clean day adds nothing.
+
+/** Pure. Lines for the System health section; [] when there is nothing. */
+export function systemHealthLines({ stuckYellow = [], shadowFails = [], resolved = [] } = {}) {
+  const lines = [];
+  const mins = (ms) => (Number.isFinite(ms) ? (ms < 3_600_000 ? `${Math.round(ms / 60_000)}m` : `${Math.floor(ms / 3_600_000)}h ${Math.round((ms % 3_600_000) / 60_000)}m`) : '?');
+  if (stuckYellow.length) {
+    lines.push(`Yellow for 24h+: ${stuckYellow.slice(0, SECTION_MAX).map((c) => `${c.label} (${c.check_id})`).join(', ')}${stuckYellow.length > SECTION_MAX ? ` +${stuckYellow.length - SECTION_MAX} more` : ''}`);
+  }
+  if (shadowFails.length) {
+    lines.push(`Shadow checks that would have fired yesterday: ${shadowFails.slice(0, SECTION_MAX).map((c) => `${c.check_id} ×${c.fails}`).join(', ')}${shadowFails.length > SECTION_MAX ? ` +${shadowFails.length - SECTION_MAX} more` : ''}`);
+  }
+  for (const i of resolved.slice(0, SECTION_MAX)) {
+    const opened = Date.parse(i.opened_at);
+    const ack = i.acknowledged_at ? mins(Date.parse(i.acknowledged_at) - opened) : 'never acknowledged';
+    lines.push(`Resolved: ${i.title} (#${i.id}) — acknowledged ${i.acknowledged_at ? `in ${ack}` : ack}, resolved in ${mins(Date.parse(i.resolved_at) - opened)}`);
+  }
+  return lines;
+}
+
+async function systemHealthSection(deps, nowMs) {
+  const db = deps.supabase;
+  const dayAgo = new Date(nowMs - DAY_MS).toISOString();
+  const { data: latest, error } = await db.from('v_health_check_latest')
+    .select('check_id, label, color, mode, last_observed_at');
+  if (error) throw new Error(`v_health_check_latest read failed: ${error.message}`);
+  const yellow = (latest || []).filter((c) => c.color === 'yellow');
+  // Yellow for 24h+ = yellow now and not one pass in the last 24h.
+  const stuckYellow = [];
+  for (const c of yellow) {
+    const { data: passes } = await db.from('health_results').select('id').eq('check_id', c.check_id)
+      .eq('status', 'pass').gte('observed_at', dayAgo).limit(1);
+    if (!passes?.length) stuckYellow.push(c);
+  }
+  const shadowIds = (latest || []).filter((c) => c.mode === 'shadow').map((c) => c.check_id);
+  const shadowFails = [];
+  if (shadowIds.length) {
+    const { data: fails, error: e2 } = await db.from('health_results').select('check_id').eq('status', 'fail')
+      .gte('observed_at', dayAgo).in('check_id', shadowIds).limit(5000);
+    if (e2) throw new Error(`health_results read failed: ${e2.message}`);
+    const n = new Map();
+    for (const f of fails || []) n.set(f.check_id, (n.get(f.check_id) || 0) + 1);
+    shadowFails.push(...[...n.entries()].map(([check_id, count]) => ({ check_id, fails: count })).sort((a, b) => b.fails - a.fails));
+  }
+  const { data: resolved, error: e3 } = await db.from('incidents').select('id, title, opened_at, acknowledged_at, resolved_at')
+    .eq('status', 'resolved').gte('resolved_at', dayAgo);
+  if (e3) throw new Error(`incidents read failed: ${e3.message}`);
+  const lines = systemHealthLines({ stuckYellow, shadowFails, resolved: resolved || [] });
+  return lines.length ? { title: 'System health', lines } : null;
+}
+
 /** Pure. The digest text. */
 export function formatDigest(sections, { date } = {}) {
   const live = sections.filter(Boolean);
@@ -450,7 +504,7 @@ export async function runOpsMorningDigest({ post = true, deps: depsArg } = {}) {
     if (post) await deps.sendAlertMessage(`⚠️ ${label} could not run: ${error}`, { channel: 'ops' });
   };
 
-  for (const [label, build] of [['P2 won/lost summary', p2Section], ['Sale → P2 backstop summary', p2BackstopSection], ['Sale → contact backstop summary', saleContactSection], ['Appointment parity summary', paritySection], ['Post-issue rebook summary', postIssueSection], ['Shadow-mode review', shadowModesSection]]) {
+  for (const [label, build] of [['P2 won/lost summary', p2Section], ['Sale → P2 backstop summary', p2BackstopSection], ['Sale → contact backstop summary', saleContactSection], ['Appointment parity summary', paritySection], ['Post-issue rebook summary', postIssueSection], ['Shadow-mode review', shadowModesSection], ['System health', systemHealthSection]]) {
     try { sections.push(await build(deps, nowMs)); } catch (err) { await couldNotRun(label, err.message); }
   }
   try { sections.push(...await nightlySummarySections(deps, nowMs)); } catch (err) { await couldNotRun('Nightly summaries (tag sweep, inbound callers, rule targets)', err.message); }

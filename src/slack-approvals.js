@@ -63,6 +63,7 @@ import { normalizeSlackPhones, normalizeSlackBlocks } from './slack-phone-format
 import {
   verifySlackSignature, parseInteraction, parseApproverIds, parsePayrollInteraction, isPayrollAction,
   isDncLiftAction, isMarketingInvoiceAction, parseMarketingInvoiceInteraction,
+  isIncidentAction, parseIncidentInteraction,
 } from './slack-approvals-core.js';
 import { handleMarketingInvoiceInteraction, reviewChannelId as mktInvoiceChannelId } from './marketing/review-actions.js';
 import { approvePayrollRun } from './payroll/ledger-actions.js';
@@ -266,6 +267,48 @@ export async function handlePayrollInteraction(parsed, {
 }
 
 /**
+ * 2026-10-15 (System Health 1.6) — Acknowledge / Snooze 2h on an incident
+ * card. The signature check already ran, so the Slack user id is trustworthy;
+ * the actor written to incident_events is their email (users.info), else the
+ * team_members row for that Slack id, else the Slack id itself. The card is
+ * edited by the incident notifier on its next minute; the clicker gets an
+ * ephemeral line now.
+ */
+export async function handleIncidentInteraction(parsed, {
+  act = null,
+  lookupEmail = (id) => lookupSlackUserEmail(id),
+  teamEmail = defaultTeamEmail,
+  reply = respond,
+} = {}) {
+  const { action, incidentId, userId, responseUrl } = parsed;
+  let actor = null;
+  try { actor = (await lookupEmail(userId))?.email || null; } catch { /* next */ }
+  if (!actor) {
+    try { actor = await teamEmail(userId); } catch { /* next */ }
+  }
+  actor = actor || userId || 'unknown-slack-user';
+  const run = act || (async (a, id, args) => (await import('./health/ops-actions.js')).incidentAction(a, id, args));
+  const out = action === 'snooze'
+    ? await run('snooze', incidentId, { actor, reason: 'Snoozed 2h from Slack', minutes: 120 })
+    : await run('ack', incidentId, { actor });
+  await reply(responseUrl, {
+    response_type: 'ephemeral',
+    replace_original: false,
+    text: out.ok
+      ? `${action === 'snooze' ? '😴 Snoozed for 2 hours' : '👍 Acknowledged'} — incident #${incidentId} (${actor}). The card updates within a minute.`
+      : `Nothing changed on incident #${incidentId}: ${String(out.error || 'refused').slice(0, 200)}`,
+  });
+  return { handled: true, ok: !!out.ok };
+}
+
+async function defaultTeamEmail(slackUserId) {
+  if (!slackUserId) return null;
+  const { default: supabase } = await import('./supabase.js');
+  const { data } = await supabase.from('team_members').select('email').eq('slack_user_id', slackUserId).limit(1);
+  return data?.[0]?.email || null;
+}
+
+/**
  * @param {object} app — express app
  * @param {object} [deps] — network seam, per the repo's deps convention. Tests
  *   point `forwardUrl` at a local stub; production passes nothing.
@@ -280,11 +323,14 @@ export function registerSlackApprovalRoutes(app, {
   // never on SLACK_APPROVALS_ENABLED (a different job, a different approver list).
   mktInvoiceOn = () => !!mktInvoiceChannelId(),
   mktInvoiceHandler = handleMarketingInvoiceInteraction,
+  // 2026-10-15 — incident cards exist only while the notifier is live.
+  incidentLive = () => String(process.env.INCIDENT_NOTIFIER_MODE || '').toLowerCase().trim() === 'live',
+  incidentHandler = handleIncidentInteraction,
 } = {}) {
   app.post('/webhook/slack/interactions', (req, res) => {
     const approvalsOn = slackApprovalsEnabled();
     // Nothing configured for any job — ack so Slack does not retry, and stop.
-    if (!approvalsOn && !forwardUrl && !payrollLive() && !dncLiftUrl && !mktInvoiceOn()) {
+    if (!approvalsOn && !forwardUrl && !payrollLive() && !dncLiftUrl && !mktInvoiceOn() && !incidentLive()) {
       console.log('[SlackApprovals] click received while disabled and not forwarding — ignored');
       return res.status(200).send('');
     }
@@ -368,6 +414,21 @@ export function registerSlackApprovalRoutes(app, {
       }
       trackBackground(
         mktInvoiceHandler(mkt).catch((err) => console.error(`[MktReview] handler error: ${err.message}`)),
+      );
+      return;
+    }
+
+    // Incident buttons (2026-10-15) are ours and NEVER forwarded, on or off,
+    // malformed included: onboarding would read incident_ack as an approval.
+    if (isIncidentAction(rawBody)) {
+      const inc = parseIncidentInteraction(rawBody);
+      if (!inc || inc.action === 'open') return; // the URL button opens the page by itself
+      if (!incidentLive()) {
+        console.log(`[Incident] ${inc.action} click on #${inc.incidentId} while INCIDENT_NOTIFIER_MODE is not live — ignored`);
+        return;
+      }
+      trackBackground(
+        incidentHandler(inc).catch((err) => console.error(`[Incident] button handler error: ${err.message}`)),
       );
       return;
     }

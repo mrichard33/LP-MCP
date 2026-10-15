@@ -68,6 +68,57 @@ Two switches, on purpose:
   family (lead, dialer, appointment first) after 5 business days of
   `v_health_check_latest` with no false red.
 
+## Phase 1: incidents and the command center
+
+| Job | File | Mode (default) | What it does |
+|---|---|---|---|
+| `dialer-sla-check` | `src/health/dialer-sla.js` | `DIALER_SLA_MODE` (shadow) | list membership vs the routing intent (`src/dial-routing-intent.js`, the same decision both routing jobs make), first dial, stalled lists, dial-rate drop, 3 dials in 24h, never-again. |
+| `appointment-pipeline-check` | `src/health/appointment-pipeline.js` | `APPT_PIPELINE_MODE` (shadow) | inbound queue age, issued by 20:15, a rep on every confirmed visit, Set vs confirmed, Conf dial coverage, capacity, dupes, time rules, required fields. |
+| `incident-notifier` | `src/jobs/incident-notifier.js` | `INCIDENT_NOTIFIER_MODE` (shadow) | results → incidents; ONE Slack card per incident, edited in place. |
+| `health-retention` | `src/jobs/health-retention.js` | `HEALTH_RETENTION_MODE` (dry_run) | 30-day rollup, n8n / synthetic age-out, lead_leak_daily summarized before its 90-day delete. |
+
+**Incidents** (`src/health/incidents.js`). One non-terminal incident per
+fingerprint. Every move is in `TRANSITIONS` (anything else throws) and writes an
+`incident_events` row naming the actor (`system`, `aios`, or a person's email).
+A pass moves an open incident to `verifying`; 2 passes in a row resolve it (1
+for a daily check); a fail inside `verifying` reopens it, and 3 reopens in 24h
+mark it flapping. Closing with no action quiets the fingerprint for 7 days
+(`health_checks.config.suppress`).
+
+**Cards.** Only a check in `mode='live'` opens an incident from a result. The
+card posts once the incident is still failing 10 minutes after it opened (a
+daily check at once), to #ops-alerts, and P1 lead / dialer / appointment cards to
+#contact-center too. Unknown on a P1 live check for 30 minutes opens a P2
+"could not read" incident. Unacknowledged cards get a thread reminder from
+`escalation_policy`; a step with no `to` is skipped and logged once.
+
+**Legacy alerts** (`src/health/alert-key-map.js`). `drift:ghl_closed_lp_active:*`
+(one incident for the whole set), `ci:recording_archive_unreachable` and
+`capacity_ranker:campaign_not_running:*` keep an incident in step and set
+`alert_conditions.incident_id`. Their own cards still post until
+`LEGACY_ALERT_SUPPRESS_MAPPED=true` with the notifier live.
+
+**Doors** (`src/health/ops-actions.js`, one module): `POST /ops/incidents/:id/{ack,snooze,close,run}`,
+`POST /ops/checks/:check_id/run`, `POST /ops/checks/run-all` (bearer token, `actor`
+in the body; snooze and close need a reason), the MCP tools `incident_action`
+and `health_run_check` (the dashboard), and the Slack buttons `incident_ack` /
+`incident_snooze`, handled in LP-MCP and never forwarded to n8n's onboarding
+flow (it reads any unknown button as a member approval).
+
+**Gaps #14** (from `raw_lp_data`): issued = `issued` / `everissued` /
+`netissued` ("true"/"false" strings, also `lp_leads.ever_issued`); Rank / Appt
+Type = `rank` / `rnk_id`; Products / Qty = `productid`, `prod2..4`, `qty..qty4`.
+Rep viewed / acknowledged is not in LP's data, so `appt.rep_not_acknowledged`
+reads unknown.
+
+## Going live
+
+Five business days in shadow, then, one at a time: set `mode='live'` on the
+lead, dialer and appointment rows of `health_checks` (family by family), flip
+`HEALTH_CHECKS_MODE`, `DIALER_SLA_MODE`, `APPT_PIPELINE_MODE`, then
+`INCIDENT_NOTIFIER_MODE=live`. Before each flip, read `v_health_check_latest` for
+that family: no red that was not a real problem.
+
 ## Adding a check
 
 1. Insert the row in `health_checks` (mode `shadow`), with thresholds in

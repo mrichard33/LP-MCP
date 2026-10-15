@@ -61,6 +61,9 @@
 
 import { lpStoredToUtcMs } from './lp-dates.js';
 import { etDateKey, daysBetween, FORBIDDEN_LIST } from './new-lead-dial-backstop.js';
+// 2026-10-15 (System Health 1.1): routeBooked lives in src/dial-routing-intent.js; re-exported unchanged.
+import { routeBooked, REMOVE_ONLY_DSP } from './dial-routing-intent.js';
+export { routeBooked, REMOVE_ONLY_DSP };
 
 export const MODES = Object.freeze(['off', 'shadow', 'live']);
 export const RULE_KEY = 'BOOKED_DIAL_ROUTING';
@@ -73,7 +76,6 @@ export const DEFAULT_SKIP_DSP = Object.freeze(['CXL', 'Reset', 'NoShow']);
 // a rep) is treated like confirmed (removal only, below).
 export const BOOKED_DSP = Object.freeze(new Set(['Set', 'Verif', 'Cnf', 'Issue']));
 // Booked AND past the confirmation call: off the setter lists, no Confirmation add.
-export const REMOVE_ONLY_DSP = Object.freeze({ Cnf: 'already_confirmed', Issue: 'appointment_issued' });
 
 /* --- config, read per pass ---------------------------------------------- */
 
@@ -206,23 +208,6 @@ export function lookupPriority(a, b) {
 export function apptExpiryMs(c) {
   if (Number.isFinite(c.apptStartMs)) return c.apptStartMs;
   return c.apptDate ? lpStoredToUtcMs(`${c.apptDate}T23:59:59`) : null;
-}
-
-/**
- * Where the lead should be. Pure.
- * @returns {{ skip?: string, hold?: boolean, addList: string|null, removeAllowedWithoutAdd: boolean, daysOut?: number, why: string }}
- */
-export function routeBooked(c, { nowMs, cfg }) {
-  if (!c.apptDate) return { skip: 'no_appointment' };
-  const daysOut = daysBetween(etDateKey(nowMs), c.apptDate);
-  if (daysOut < 0) return { skip: 'past_appointment' };
-  if (daysOut === 0 && Number.isFinite(c.apptStartMs) && c.apptStartMs <= nowMs) return { skip: 'past_appointment' };
-  if (REMOVE_ONLY_DSP[c.dsp]) return { addList: null, removeAllowedWithoutAdd: true, daysOut, why: REMOVE_ONLY_DSP[c.dsp] };
-  if (daysOut <= 1) return { addList: cfg.conf.nextDay, removeAllowedWithoutAdd: false, daysOut, why: daysOut === 0 ? 'appt_today' : 'appt_tomorrow' };
-  if (daysOut === 2) return { addList: cfg.conf.secondDay, removeAllowedWithoutAdd: false, daysOut, why: 'appt_in_2_days' };
-  // 3+ days (Mark, 2026-10-06 follow-up): off the setter lists now; the
-  // Confirmation add comes two days before the visit, on a later pass.
-  return { hold: true, addList: null, removeAllowedWithoutAdd: true, daysOut, why: 'appt_3plus_days' };
 }
 
 /* --- the decision ------------------------------------------------------------------ */

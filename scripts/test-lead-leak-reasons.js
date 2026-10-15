@@ -430,3 +430,20 @@ test('a record left in routing_or_automation_failure is logged with its raw Five
   assert.ok(logged.includes('[LeadLeak] unmatched five9 record lp_lead_id=579009 list="" campaign="DIAL ASAP" attempts="00002"'),
     logged.join('\n'));
 });
+
+// ─── 2026-10-15 (System Health 1.9): in_inbound_queue ───────────────────────
+// A lead whose inquiry still waits in LP's inbound queue is told apart from
+// not_in_five9: first match after dead_status, before the Five9 lookup.
+test('in_inbound_queue: a waiting inquiry by phone or lds, after dead_status, before not_in_five9', async () => {
+  const { classifyUncalledLead, REASONS, LEAK_REASONS } = await import('../src/lead-leak-classify.js');
+  const nowMs = Date.parse('2026-10-15T14:00:00Z');
+  const lead = { lp_lead_id: '581900', phone: '(352) 555-0188', lead_source: 'Google PPC', disposition_code: 'Data' };
+  const waiting = { phones: new Set(['3525550188']), lds: new Set() };
+  assert.equal(classifyUncalledLead(lead, { nowMs, inboundWaiting: waiting }), 'in_inbound_queue');
+  assert.equal(classifyUncalledLead(lead, { nowMs, inboundWaiting: { phones: new Set(), lds: new Set(['581900']) } }), 'in_inbound_queue');
+  assert.equal(classifyUncalledLead(lead, { nowMs }), null, 'a failed queue read classifies as before');
+  assert.equal(classifyUncalledLead({ ...lead, disposition_code: 'CXL' }, { nowMs, inboundWaiting: waiting }), 'dead_status');
+  assert.ok(REASONS.indexOf('dead_status') < REASONS.indexOf('in_inbound_queue'));
+  assert.ok(REASONS.indexOf('in_inbound_queue') < REASONS.indexOf('not_in_five9'));
+  assert.ok(LEAK_REASONS.includes('in_inbound_queue'), 'priced like not_in_five9');
+});

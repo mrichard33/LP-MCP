@@ -193,6 +193,50 @@ export const JOBS = Object.freeze([
     isEnabled: (env) => String(env.TAG_SWEEP_ENABLED || '').toLowerCase() === 'true',
   },
   {
+    // 2026-10-15 — System Health Phase 1.1: is every lead on the Five9 list
+    // routing says, and dialed in time? Writes health_results only.
+    id: 'dialer-sla-check',
+    label: 'Dialer SLA checks (health_results)',
+    group: 'five9',
+    cadence: 'every 15 min',
+    enabledEnv: 'DIALER_SLA_MODE',
+    enabledDefault: true,
+    isEnabled: (env) => String(env.DIALER_SLA_MODE ?? 'shadow').toLowerCase().trim() !== 'off',
+  },
+  {
+    // 2026-10-15 — System Health Phase 1.8: tomorrow's schedule the night
+    // before (issued by 20:15, a rep on every confirmed visit, capacity).
+    id: 'appointment-pipeline-check',
+    label: 'Appointment pipeline checks (health_results)',
+    group: 'lp-intake',
+    cadence: 'every 5 min with ET time gates',
+    enabledEnv: 'APPT_PIPELINE_MODE',
+    enabledDefault: true,
+    isEnabled: (env) => String(env.APPT_PIPELINE_MODE ?? 'shadow').toLowerCase().trim() !== 'off',
+  },
+  {
+    // 2026-10-15 — System Health Phase 1.3: incidents from health_results and
+    // legacy alert rows; ONE Slack card per incident, edited in place (live only).
+    id: 'incident-notifier',
+    label: 'Incident notifier (one card per incident)',
+    group: 'ops',
+    cadence: 'every min',
+    enabledEnv: 'INCIDENT_NOTIFIER_MODE',
+    enabledDefault: true,
+    isEnabled: (env) => String(env.INCIDENT_NOTIFIER_MODE ?? 'shadow').toLowerCase().trim() !== 'off',
+  },
+  {
+    // 2026-10-15 — System Health Phase 1.7: health_results → daily rollup at 30
+    // days, n8n log 14d, synthetic runs 30d, lead_leak_daily summarized then 90d.
+    id: 'health-retention',
+    label: 'Health tables retention',
+    group: 'ops',
+    cadence: 'daily 03:30 ET',
+    enabledEnv: 'HEALTH_RETENTION_MODE',
+    enabledDefault: true,
+    isEnabled: (env) => String(env.HEALTH_RETENTION_MODE ?? 'dry_run').toLowerCase().trim() !== 'off',
+  },
+  {
     // 2026-10-15 — System Health Phase 0 (docs/system-health.md). Evaluates
     // the registry checks owned by `health-checks` and writes health_results.
     // Read-only everywhere else; posts nothing. Mirrors healthChecksMode() in

@@ -92,6 +92,7 @@
  */
 
 import supabase from './supabase.js';
+import { legacyPostSuppressed, nudgeLegacyKey } from './health/alert-key-map.js';
 import { sendGroupMeMessage } from './groupme.js';
 import { postToSlack, resolveSlackChannels, opsChannelId } from './slack.js';
 
@@ -346,10 +347,20 @@ export async function reportAlertCondition(args = {}) {
       : { action: 'skipped', sent: false };
   }
 
+  // 2026-10-15 (System Health 1.4): a key that maps onto a registry check
+  // keeps an incident in step (src/health/alert-key-map.js, fire-and-forget,
+  // never blocks the card). With LEGACY_ALERT_SUPPRESS_MAPPED=true and the
+  // incident notifier live, the legacy card stays quiet: the incident card
+  // took over. The row itself still opens and clears exactly as before.
+  const sendFn = legacyPostSuppressed(key)
+    ? async () => ({ sent: true, suppressed: 'incident_card' })
+    : send;
   try {
-    return active
-      ? await _fire({ client, key, label, text, detail, channel, remindMs, send, now, fallbackCooldownMs, sustainMs })
-      : await _clear({ client, key, label, recoveredText, channel, notifyRecovery, send, now });
+    const res = active
+      ? await _fire({ client, key, label, text, detail, channel, remindMs, send: sendFn, now, fallbackCooldownMs, sustainMs })
+      : await _clear({ client, key, label, recoveredText, channel, notifyRecovery, send: sendFn, now });
+    nudgeLegacyKey(key, { client, nowMs: now });
+    return res;
   } catch (err) {
     // Clearing fails CLOSED — a false all-clear is worse than a missing one.
     if (!active) {
