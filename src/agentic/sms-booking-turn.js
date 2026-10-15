@@ -262,7 +262,14 @@ export function enforceBookingFacts(draft, facts, { companion = null } = {}) {
       body = body.filter(p => p === own || (!/\bI'?m\s+holding\b/i.test(p) && (!clockTimes(p).length || evNote(p))));
       // Their acknowledgement first, then the hold ("Sure. I'm holding … for you.").
       if (!own) { body = body.length ? [...body, `I'm holding ${slotLabel(slot, slot.tz || '')} for you.`] : [holdLine(slot, slot.tz || '', '').trim()]; notes.push('hold_sentence_fixed'); }
-      if (facts.evening && !body.some(evNote)) { body = [...body, `I've made a note that you would like ${facts.evening.requested_time}.`]; notes.push('evening_note_added'); }
+      // The second dry run put the note INSIDE the hold sentence ("I'm holding Fri, Oct 16
+      // at 6:00 PM ET for you, and I've noted you'd prefer 7."): that counts as noted too.
+      // The slot's own date and clock time are taken out first, so "Oct 7" never reads as 7.
+      const ownNote = (p) => !!facts.evening && !!p && /\bnote/i.test(p)
+        && (clockTimes(p).includes(facts.evening.requested_minutes)
+          || namesRequestedHour(p.replace(/\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+\d{1,2}\b/gi, ' ')
+            .replace(/\b\d{1,2}(?::\d{2})?\s*[ap]\.?m\.?/gi, ' '), facts.evening.requested_time));
+      if (facts.evening && !body.some(evNote) && !ownNote(own)) { body = [...body, `I've made a note that you would like ${facts.evening.requested_time}.`]; notes.push('evening_note_added'); }
     } else if (body.some(p => clockTimes(p).length)) {
       // Collecting: no time talk (the held time stands; a change is the lead's to ask).
       body = body.filter(p => !clockTimes(p).length);

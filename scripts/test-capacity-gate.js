@@ -289,3 +289,17 @@ test('7c. a held 6:00 PM says the evening note once, even when the model writes 
   const bare = enforceBookingFacts(`I'm holding Thu, Oct 15 at 6:00 PM ET for you. ${facts.ask_line}`, facts);
   assert.match(bare.message, /I've made a note that you would like 7:00 PM\./);
 });
+
+test('7d. a note inside the hold sentence counts as the note (second live dry run, 2026-10-15)', () => {
+  const slot6 = slot(THU_6PM);
+  const facts = smsBookingTurn({ plan: PLAN, trigger: 'Can you do 7pm tomorrow?', thread: thread('Can you do 7pm tomorrow?'), slots: [slot6], tz: 'ET',
+    gateMissing: ['address'], pinnedSlot: slot6, evening: { requested_time: '7:00 PM', minutes: 1140 } });
+  const draft = `Thanks, Dana. Visits actually start at 6 PM, so I'm holding Thu, Oct 15 at 6:00 PM ET for you, and I've noted you'd prefer 7. ${facts.ask_line}`;
+  const out = enforceBookingFacts(draft, facts);
+  assert.equal((out.message.match(/\bnote/gi) || []).length, 1, out.message);
+  assert.match(out.message, /I'm holding Thu, Oct 15 at 6:00 PM ET for you/);
+  assert.ok(out.message.endsWith(facts.ask_line));
+  // A hold sentence with "noted" but not the requested hour still gets ours.
+  const other = enforceBookingFacts(`I'm holding Thu, Oct 15 at 6:00 PM ET for you, noted. ${facts.ask_line}`, facts);
+  assert.match(other.message, /I've made a note that you would like 7:00 PM\./);
+});
