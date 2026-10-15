@@ -112,3 +112,62 @@ export function normalizeDateForComparison(dateStr) {
   }
   return null;
 }
+
+/**
+ * Parse LP's `apptdate` into comparable wall-clock parts.
+ *
+ * LP returns this field in several shapes across endpoints and eras:
+ *   "2026-08-07T18:00:00", "2026-08-07 18:00:00", "8/7/2026 6:00:00 PM",
+ *   and occasionally a bare "2026-08-07" with no time at all.
+ *
+ * It is LOCAL WALL CLOCK, not UTC — do not hand it to Date.parse. Verified
+ * live 2026-07-31 against /api/Customers/GetLead: apptdate comes back as
+ * "2026-09-27T18:00:00" with no offset and no Z. src/appointment-dates.js says
+ * the same of the value once it lands in lp_leads ("ET WALL-CLOCK digits
+ * mislabeled as UTC"), and casting it shifts by 4-5 hours. String comparison
+ * of the normalized parts avoids the whole class of bug.
+ *
+ * @returns {{date: string, time: string|null, timeStatus: 'known'|'absent'|'unparseable'}|null}
+ *   null when no date parses at all. date is YYYY-MM-DD. time is HH:MM
+ *   24-hour when timeStatus === 'known', otherwise null:
+ *     'absent'      — LP carried no time, or exact midnight (see below)
+ *     'unparseable' — LP carried something we could not read; the caller
+ *                     writes anyway and logs, so a future LP format change
+ *                     surfaces as a bug instead of silent suppression.
+ */
+export function parseLpApptWallClock(raw) {
+  if (raw === null || raw === undefined) return null;
+  const s = String(raw).trim();
+  if (!s) return null;
+
+  const [datePart, ...rest] = s.split(/[T\s]+/);
+  // toLpApptDate first: normalizeDateForComparison's US branch requires a
+  // TWO-digit month and day, so it returns null on LP's "8/7/2026". Composing
+  // through toLpApptDate pads that to "08/07/2026" and also absorbs ISO and
+  // long form, passing null straight through for garbage.
+  const date = normalizeDateForComparison(toLpApptDate(datePart));
+  if (!date) return null;
+
+  // Strip fractional seconds and a trailing Z — LP emits ".373" on sibling
+  // timestamps (dateadded, setdate), and toLpApptTime rejects both.
+  // toLpApptTime's 12-hour branch also does not accept seconds ("6:00:00 PM"),
+  // so drop them before the AM/PM marker; its 24-hour branch tolerates them.
+  const timeRaw = rest.join(' ').trim()
+    .replace(/\.\d+/, '')
+    .replace(/Z$/i, '')
+    .replace(/^(\d{1,2}:\d{2}):\d{2}(\s*[AP]M)$/i, '$1$2')
+    .trim();
+
+  if (!timeRaw) return { date, time: null, timeStatus: 'absent' };
+
+  const time = toLpApptTime(timeRaw);
+  if (!time) return { date, time: null, timeStatus: 'unparseable' };
+
+  // Exact midnight is LP's "date known, time unknown", not a real 12:00 AM
+  // appointment — 15,890 of 128,766 appointment rows carry it (2026-07-31).
+  // Same rule lpWallClockToGhlStartTime applies in appointment-dates.js;
+  // encoding it once more here rather than inventing a second one.
+  if (time === '00:00') return { date, time: null, timeStatus: 'absent' };
+
+  return { date, time, timeStatus: 'known' };
+}

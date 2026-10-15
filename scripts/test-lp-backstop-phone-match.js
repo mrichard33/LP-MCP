@@ -69,6 +69,8 @@ globalThis.fetch = async (url, opts = {}) => {
 };
 
 const { processOneLead } = await import('../src/services/lp-contact-backstop.js');
+// No live LP read here (2026-10-15): see test-lp-ghl-ghost-appointment.js.
+const NO_LIVE_LP = { readLiveForSync: async () => null };
 
 const LP_LEAD_ID_FIELD = 'GmAVmW6V9sekD7pVONKr';
 
@@ -106,7 +108,7 @@ test('(1) projection carries a matching phone → linked, no verification GET', 
     search: [{ id: 'lisa-ghl', phone: '3528121262' }],
     full: { 'lisa-ghl': { id: 'lisa-ghl', phone: '3528121262', tags: [], customFields: [] } },
   });
-  const r = await processOneLead({ lead: lisa(), contactCache: new Map(), dryRun: true });
+  const r = await processOneLead({ deps: NO_LIVE_LP, lead: lisa(), contactCache: new Map(), dryRun: true });
   assert.equal(r.outcome, 'linked');
   assert.equal(r.contact_id, 'lisa-ghl');
   // Exactly ONE full-contact GET: the caller's own read at the link site. The
@@ -122,7 +124,7 @@ test('(2) projection carries only a MISMATCHING phone → nothing linked', async
   // This path was already correct before the fix; the test pins it so the
   // rewrite of pickPhoneMatch's return contract cannot regress it.
   reset({ search: [{ id: 'yvonne-ghl', phone: '9044870668' }] });
-  const r = await processOneLead({ lead: lisa(), contactCache: new Map(), dryRun: true });
+  const r = await processOneLead({ deps: NO_LIVE_LP, lead: lisa(), contactCache: new Map(), dryRun: true });
   assertNotLinked(r);
   assert.equal(contactGets().length, 0, 'a mismatching hit must not be read at all');
 });
@@ -134,7 +136,7 @@ test('(3) projection has no phone, full GET confirms the match → linked', asyn
     search: [{ id: 'lisa-ghl' }], // projection omitted phone, as GHL routinely does
     full: { 'lisa-ghl': { id: 'lisa-ghl', phone: '+13528121262', tags: [], customFields: [] } },
   });
-  const r = await processOneLead({ lead: lisa(), contactCache: new Map(), dryRun: true });
+  const r = await processOneLead({ deps: NO_LIVE_LP, lead: lisa(), contactCache: new Map(), dryRun: true });
   assert.equal(r.outcome, 'linked');
   assert.equal(r.contact_id, 'lisa-ghl');
   // The verification GET plus the caller's read.
@@ -152,7 +154,7 @@ test('(4) projection has no phone, full GET shows a DIFFERENT phone → nothing 
     search: [{ id: 'guest-visitor' }],
     full: { 'guest-visitor': { id: 'guest-visitor', phone: '9044870668', tags: [], customFields: [] } },
   });
-  const r = await processOneLead({ lead: lisa(), contactCache: new Map(), dryRun: true });
+  const r = await processOneLead({ deps: NO_LIVE_LP, lead: lisa(), contactCache: new Map(), dryRun: true });
   assertNotLinked(r);
   assert.equal(contactGets().length, 1, 'exactly one confirming read, and it rejected');
 });
@@ -161,7 +163,7 @@ test('(5) projection has no phone, full GET throws → nothing linked', async ()
   // Fail closed: an unverifiable match is not a match. A duplicate contact is
   // recoverable; a mis-linked LP identity is not.
   reset({ search: [{ id: 'guest-visitor' }], throwOn: ['guest-visitor'] });
-  const r = await processOneLead({ lead: lisa(), contactCache: new Map(), dryRun: true });
+  const r = await processOneLead({ deps: NO_LIVE_LP, lead: lisa(), contactCache: new Map(), dryRun: true });
   assertNotLinked(r);
 });
 
@@ -171,7 +173,7 @@ test('(5b) full GET returns a contact with NO phone at all → nothing linked', 
     search: [{ id: 'guest-visitor' }],
     full: { 'guest-visitor': { id: 'guest-visitor', tags: [], customFields: [] } },
   });
-  const r = await processOneLead({ lead: lisa(), contactCache: new Map(), dryRun: true });
+  const r = await processOneLead({ deps: NO_LIVE_LP, lead: lisa(), contactCache: new Map(), dryRun: true });
   assertNotLinked(r);
 });
 
@@ -179,7 +181,7 @@ test('(5b) full GET returns a contact with NO phone at all → nothing linked', 
 
 test('(6) empty search result → nothing linked, no reads', async () => {
   reset({ search: [] });
-  const r = await processOneLead({ lead: lisa(), contactCache: new Map(), dryRun: true });
+  const r = await processOneLead({ deps: NO_LIVE_LP, lead: lisa(), contactCache: new Map(), dryRun: true });
   assertNotLinked(r);
   assert.equal(contactGets().length, 0);
 });
@@ -194,7 +196,7 @@ test('(7) a phone-less candidate is preferred over a mismatching one, and still 
     search: [{ id: 'yvonne-ghl', phone: '9044870668' }, { id: 'lisa-ghl' }],
     full: { 'lisa-ghl': { id: 'lisa-ghl', phone: '3528121262', tags: [], customFields: [] } },
   });
-  const r = await processOneLead({ lead: lisa(), contactCache: new Map(), dryRun: true });
+  const r = await processOneLead({ deps: NO_LIVE_LP, lead: lisa(), contactCache: new Map(), dryRun: true });
   assert.equal(r.outcome, 'linked');
   assert.equal(r.contact_id, 'lisa-ghl', 'must confirm the verifiable candidate, never the mismatching hit');
 });
@@ -209,7 +211,7 @@ test('(8) a rejected match never stamps LP fields onto the contact', async () =>
     search: [{ id: 'guest-visitor' }],
     full: { 'guest-visitor': { id: 'guest-visitor', phone: '9044870668', tags: [], customFields: [] } },
   });
-  await processOneLead({ lead: lisa(), contactCache: new Map() });
+  await processOneLead({ deps: NO_LIVE_LP, lead: lisa(), contactCache: new Map() });
   const stampPuts = calls.filter((c) => c.method === 'PUT' && /^\/contacts\/guest-visitor$/.test(c.path));
   assert.equal(stampPuts.length, 0, 'the wrong contact must never receive an LP identity stamp');
   const wroteLeadId = calls.some((c) =>

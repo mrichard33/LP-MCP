@@ -53,8 +53,10 @@
  */
 
 import supabase from '../../supabase.js';
-import { reconcileLpAppointmentToGhl } from '../../services/lp-ghl-appointment-reconciler.js';
+import { reconcileLpAppointmentToGhl, resolveSyncStartTime } from '../../services/lp-ghl-appointment-reconciler.js';
 import { sendGroupMeMessage } from '../../groupme.js';
+import { sendAlertMessage } from '../../alert-state.js';
+import { readLiveForSync } from '../../services/lp-live-appointment.js';
 import { lpWallClockToGhlStartTime } from '../../appointment-dates.js';
 import {
   claimAppointmentAuthority,
@@ -64,7 +66,9 @@ import {
 
 const LEAD_COLUMNS =
   'lp_lead_id, lp_prospect_id, disposition_code, appointment_date, appointment_set, ' +
-  'ghl_contact_id, first_name, last_name, lead_source, created_at_lp, updated_at_lp';
+  'ghl_contact_id, first_name, last_name, lead_source, created_at_lp, updated_at_lp, ' +
+  // 2026-10-15: the reconciler's stale-row and ghost-appointment guards read these.
+  'synced_at, set_date, last_contact_date';
 
 /**
  * The LP lead whose change queued this action. See the header for why this is
@@ -181,6 +185,11 @@ export async function executeSyncLpAppointmentToGhl(action, context = {}) {
     console.warn(`[LpGhlApptSync] payload disposition '${payload.disposition_code}' differs from lp_leads row '${lead.disposition_code}' for lead ${lead.lp_lead_id} — using the row`);
   }
 
+  // Read LP live before anything books (2026-10-15, see
+  // src/services/lp-live-appointment.js). The mirror row is corrected to LP
+  // whatever the reconciler decides, so the next reader sees LP's time.
+  const live = await readLiveForSync(lead);
+
   // A cancellation is never gated on authority (see shouldBlockOnAuthority).
   // Claim it anyway so the seat's rank/seen_at stay current and the denial is
   // still countable — just don't act on the verdict.
@@ -191,7 +200,10 @@ export async function executeSyncLpAppointmentToGhl(action, context = {}) {
     seenAt: lead.updated_at_lp || null,
     // ET-normalized ONCE, here, at the claim boundary — lp_leads.appointment_date
     // is wall-clock digits wearing a UTC offset. Nothing downstream re-guesses.
-    appointmentStart: lpWallClockToGhlStartTime(lead.appointment_date),
+    // LP's live time wins when it was read (2026-10-15).
+    appointmentStart: live?.ok
+      ? resolveSyncStartTime(lead, live).startTime
+      : lpWallClockToGhlStartTime(lead.appointment_date),
     prospectId: lead.lp_prospect_id,
     source: 'lp_disposition',
   });
@@ -221,6 +233,7 @@ export async function executeSyncLpAppointmentToGhl(action, context = {}) {
     result = await reconcileLpAppointmentToGhl({
       contactId,
       lead,
+      live,
       toNotify: !payload.suppress_notifications,
       contactCache: context._contactCache,
     });
@@ -249,6 +262,11 @@ export async function executeSyncLpAppointmentToGhl(action, context = {}) {
       console.warn(`[LpGhlApptSync] impossible-hour card failed for ${contactId}: ${err.message}`));
   }
 
+  if (result?.reason === 'implausible_future_appointment') {
+    await notifyImplausibleAppointment({ contactId, lead, result }).catch((err) =>
+      console.warn(`[LpGhlApptSync] implausible-appointment alert failed for ${contactId}: ${err.message}`));
+  }
+
   return { action: 'lp_ghl_appointment_sync', lead_source: leadSource, ...result };
 }
 
@@ -269,35 +287,41 @@ export async function executeSyncLpAppointmentToGhl(action, context = {}) {
 // Lifecycle: a later successful sync for the contact releases its notices
 // via clearSyncFailedTag → releaseFailureNotices, so a NEW bad date after a
 // correction is allowed to card again.
-async function claimImpossibleHourNotice({ contactId, lead, result }) {
-  const dateKey = String(lead.appointment_date || '').slice(0, 10) || 'nodate';
-  const noticeKey = `impossible-hour:${lead.lp_lead_id || contactId}:${dateKey}`;
+// One claim for every sync card (impossible hour, implausible date): the
+// notice_key prefix says which card, the row says it was already sent.
+async function claimSyncNotice({ noticeKey, contactId, dateKey, apptTime = null, label }) {
   try {
     const { error } = await supabase
       .from('lp_sync_failure_notices')
-      .insert({
-        notice_key: noticeKey,
-        contact_id: contactId,
-        appt_date: dateKey,
-        appt_time: result?.appointment_hour_et != null
-          ? `${String(result.appointment_hour_et).padStart(2, '0')}:00`
-          : null,
-      });
+      .insert({ notice_key: noticeKey, contact_id: contactId, appt_date: dateKey, appt_time: apptTime });
     if (!error) return true;
     if (error.code === '23505') {
-      console.log(`[LpGhlApptSync] impossible-hour card already claimed for ${noticeKey} — no repeat`);
+      console.log(`[LpGhlApptSync] ${label} card already claimed for ${noticeKey} — no repeat`);
       return false;
     }
     if (error.code === '42P01') {
       console.error('[LpGhlApptSync] lp_sync_failure_notices missing — apply sql/047 — sending card UNGUARDED');
       return true;
     }
-    console.warn(`[LpGhlApptSync] impossible-hour notice claim errored (card suppressed): ${error.message}`);
+    console.warn(`[LpGhlApptSync] ${label} notice claim errored (card suppressed): ${error.message}`);
     return false;
   } catch (err) {
-    console.warn(`[LpGhlApptSync] impossible-hour notice claim threw (card suppressed): ${err.message}`);
+    console.warn(`[LpGhlApptSync] ${label} notice claim threw (card suppressed): ${err.message}`);
     return false;
   }
+}
+
+async function claimImpossibleHourNotice({ contactId, lead, result }) {
+  const dateKey = String(lead.appointment_date || '').slice(0, 10) || 'nodate';
+  return claimSyncNotice({
+    noticeKey: `impossible-hour:${lead.lp_lead_id || contactId}:${dateKey}`,
+    contactId,
+    dateKey,
+    apptTime: result?.appointment_hour_et != null
+      ? `${String(result.appointment_hour_et).padStart(2, '0')}:00`
+      : null,
+    label: 'impossible-hour',
+  });
 }
 
 async function notifyImpossibleHour({ contactId, lead, result }) {
@@ -314,5 +338,44 @@ async function notifyImpossibleHour({ contactId, lead, result }) {
     `Five9 lists repopulate at 6 AM — verify the real time with the\n` +
     `customer, correct it in LP FIRST, then re-fire the disposition to mirror.`,
     { flushNow: true }
+  );
+}
+
+// ─── Implausible-date alert (2026-10-15) ───────────────────────────────
+// The reconciler refuses a Set/Cnf more than LP_GHL_SYNC_MAX_FORWARD_DAYS past
+// the lead's last LP activity (reason implausible_future_appointment). A
+// person must fix the date in LP, so ONE Slack card per lead + date goes to
+// #ops-alerts (sendAlertMessage, channel 'ops'; operational alarms are Slack
+// only), claimed before send like the impossible-hour card.
+export function formatImplausibleAppointmentAlert({ contactId, lead, result }) {
+  const name = [lead?.first_name, lead?.last_name].filter(Boolean).join(' ') || contactId;
+  const when = result?.start_time
+    ? String(result.start_time).slice(0, 16).replace('T', ' ')
+    : String(lead?.appointment_date || '?').slice(0, 16).replace('T', ' ');
+  return (
+    `🚨 GHOST APPOINTMENT BLOCKED (LP → GHL sync)\n` +
+    `👤 ${name}\n` +
+    `📋 LP Lead: ${lead?.lp_lead_id || '?'} | GHL: ${contactId}\n` +
+    `📅 LP appointment: ${when} ET (${lead?.disposition_code || '?'})\n` +
+    `🕒 LP last activity: ${result?.last_activity_at || '?'} ` +
+    `(${result?.days_after_last_activity ?? '?'} days before the visit; limit ${result?.max_forward_days ?? '?'})\n` +
+    `⚠️ Likely year typo — fix the date in LP. GHL was NOT booked.`
+  );
+}
+
+export async function notifyImplausibleAppointment({ contactId, lead, result, deps = {} }) {
+  const dateKey = String(result?.start_time || lead?.appointment_date || '').slice(0, 10) || 'nodate';
+  const claim = deps.claimSyncNotice || claimSyncNotice;
+  const claimed = await claim({
+    noticeKey: `implausible-appt:${lead?.lp_lead_id || contactId}:${dateKey}`,
+    contactId,
+    dateKey,
+    apptTime: result?.start_time ? String(result.start_time).slice(11, 16) : null,
+    label: 'implausible-appointment',
+  });
+  if (!claimed) return { sent: false, reason: 'already_claimed' };
+  return (deps.sendAlertMessage || sendAlertMessage)(
+    formatImplausibleAppointmentAlert({ contactId, lead, result }),
+    { channel: 'ops' },
   );
 }

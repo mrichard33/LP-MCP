@@ -52,7 +52,7 @@ import { getContactCached } from '../actions/contact-cache.js';
 import { fetchUpcomingAppointments } from '../knowledge/contact-appointments.js';
 import { BOOKING_CALENDARS, isInHomeCalendarId, isGhlOnlyCalendarId } from '../knowledge/booking-calendar-router.js';
 import { syncCancelledAppointmentState } from '../actions/handlers/appointment-field-sync.js';
-import { lpWallClockToGhlStartTime } from '../appointment-dates.js';
+import { lpWallClockToGhlStartTime, wallClockToIso } from '../appointment-dates.js';
 // NOTE: slot-check.js imports normalizeGhlStartTime from THIS module, so this
 // is an ESM import cycle. It is safe because both sides are hoisted `export
 // function` declarations and neither is called during module evaluation. Do not
@@ -119,6 +119,73 @@ const NON_ACTIVE_APPOINTMENT_STATUSES = new Set([
 const CONSENT_BLOCK_TAGS = new Set([
   'dnc', 'dnc-sms', 'do-not-contact', 'stage:dnc', 'unsubscribed',
 ]);
+
+// ── Stale-mirror and ghost-appointment guards (2026-10-15) ────────────
+// Five GHL visits were booked from lp_leads rows LP no longer stood behind:
+// rows synced before 2026-07-08 held real UTC (lead 475840: LP 10:00 AM, row
+// 15:00Z → a 3:00 PM visit), and 2025 leads carried visits about a year after
+// LP last touched them (likely year typos). Set/Cnf now book from LP LIVE
+// (the caller reads it, src/services/lp-live-appointment.js, and passes it in
+// as `live`, the same way `lead` is injected), trust a row on its own only when
+// it was synced on or after WALL_CLOCK_MIRROR_SINCE, and refuse a visit more
+// than LP_GHL_SYNC_MAX_FORWARD_DAYS past the lead's last LP activity. CANCEL
+// never reads either: converging a dead appointment to zero is never unsafe.
+export const WALL_CLOCK_MIRROR_SINCE = '2026-07-08';
+export const DEFAULT_MAX_FORWARD_DAYS = 120;
+
+export function maxForwardDays(env = process.env) {
+  const n = Number(env.LP_GHL_SYNC_MAX_FORWARD_DAYS);
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_MAX_FORWARD_DAYS;
+}
+
+/** True when the row was written in the ET wall-clock convention. Missing → false. */
+export function isWallClockMirrorRow(lead) {
+  const ms = Date.parse(lead?.synced_at || '');
+  return Number.isFinite(ms) && ms >= Date.parse(`${WALL_CLOCK_MIRROR_SINCE}T00:00:00Z`);
+}
+
+/**
+ * Pure: the GHL startTime a Set/Cnf may book, and where it came from.
+ *   live ok        → LP's live wall clock (null when LP holds no time)
+ *   live failed    → the row, only when it is a wall-clock row
+ *   otherwise      → { stale: true }: do not book blind
+ */
+export function resolveSyncStartTime(lead, live) {
+  if (live?.ok) {
+    const startTime = live.timeStatus === 'known' ? wallClockToIso(live.date, live.time) : null;
+    return { startTime, source: 'lp_live' };
+  }
+  if (isWallClockMirrorRow(lead)) {
+    return { startTime: lpWallClockToGhlStartTime(lead.appointment_date), source: 'mirror' };
+  }
+  return { startTime: null, source: 'mirror', stale: true };
+}
+
+function dayOf(v) {
+  const m = /^(\d{4}-\d{2}-\d{2})/.exec(String(v || ''));
+  return m ? m[1] : null;
+}
+
+/** Latest LP activity day (YYYY-MM-DD) known for the lead, row and live; null when none. */
+export function lastLpActivityDay(lead, live) {
+  const days = [
+    lead?.updated_at_lp, lead?.created_at_lp, lead?.set_date, lead?.last_contact_date,
+    live?.ok ? live.setDate : null, live?.ok ? live.lastChangedOn : null,
+  ].map(dayOf).filter(Boolean);
+  return days.length ? days.sort().at(-1) : null;
+}
+
+/**
+ * Pure: is this visit too far past the lead's last LP activity to be real?
+ * No activity date at all → not implausible (the guard stands down).
+ */
+export function isImplausibleFutureAppointment({ startTime, lead, live, maxDays = maxForwardDays() }) {
+  const apptDay = dayOf(startTime);
+  const lastDay = lastLpActivityDay(lead, live);
+  if (!apptDay || !lastDay) return { implausible: false, lastActivityDay: lastDay, daysAfter: null };
+  const daysAfter = Math.round((Date.parse(`${apptDay}T00:00:00Z`) - Date.parse(`${lastDay}T00:00:00Z`)) / 86400000);
+  return { implausible: daysAfter > maxDays, lastActivityDay: lastDay, daysAfter, maxDays };
+}
 
 /** Map an LP disposition code to a reconciliation kind. */
 export function classifyDisposition(code) {
@@ -238,29 +305,58 @@ async function contactHasConsentBlock(contactId, contactCache) {
  *
  * @param {object} args
  * @param {string} args.contactId          GHL contact id
- * @param {object} args.lead               lp_leads row: { lp_lead_id, disposition_code, appointment_date }
+ * @param {object} args.lead               lp_leads row: { lp_lead_id, disposition_code, appointment_date,
+ *                                          synced_at, updated_at_lp, created_at_lp, set_date, last_contact_date }
+ * @param {object} [args.live]             readLiveLpAppointment() result for Set/Cnf (null = not read)
  * @param {boolean} [args.toNotify=true]   false for backfill (suppress GHL notifications)
  * @param {Map}    [args.contactCache]     per-batch contact cache
  * @param {boolean} [args.dryRun=false]    plan only — zero mutations (still GETs)
  * @returns {Promise<object>} { outcome: 'created'|'rescheduled'|'status_updated'|'cancelled'|'noop',
  *   appointment_id, start_time, previous_start_time?, skipped?, reason?, planned_op? }
  */
-export async function reconcileLpAppointmentToGhl({ contactId, lead, toNotify = true, contactCache, dryRun = false }) {
+export async function reconcileLpAppointmentToGhl({ contactId, lead, live = null, toNotify = true, contactCache, dryRun = false }) {
   if (!contactId) throw new Error('reconcileLpAppointmentToGhl: contactId is required');
   if (!lead) throw new Error('reconcileLpAppointmentToGhl: lead row is required');
 
   const kind = classifyDisposition(lead.disposition_code);
-  const startTime = lpWallClockToGhlStartTime(lead.appointment_date);
+  // Cancel keeps reading the row (it only needs to know there was one); Set and
+  // Cnf book from LP live or a wall-clock row — see resolveSyncStartTime.
+  const resolved = kind === 'set' || kind === 'confirm'
+    ? resolveSyncStartTime(lead, live)
+    : { startTime: lpWallClockToGhlStartTime(lead.appointment_date), source: 'mirror' };
+  const startTime = resolved.startTime;
 
   const base = {
     contact_id: contactId,
     lp_lead_id: lead.lp_lead_id || null,
     disposition_code: lead.disposition_code || null,
     start_time: startTime,
+    appointment_source: resolved.source,
   };
   const noop = (reason, extra = {}) => ({ ...base, outcome: 'noop', skipped: true, reason, ...extra });
 
   if (kind === 'out_of_scope') return noop('out_of_scope');
+
+  if (kind !== 'cancel') {
+    // A pre-2026-07-08 row read as wall clock is hours off, and LP could not
+    // be asked: book nothing rather than book blind.
+    if (resolved.stale) {
+      return noop('stale_mirror_unverified', {
+        synced_at: lead.synced_at || null,
+        live_error: live && !live.ok ? live.error || null : null,
+      });
+    }
+    // A visit far past the lead's last LP activity is a likely year typo
+    // (Gilles/Edouard 475840: last touched 2025-11-26, visit 2026-11-30).
+    const ghost = isImplausibleFutureAppointment({ startTime, lead, live });
+    if (ghost.implausible) {
+      return noop('implausible_future_appointment', {
+        last_activity_at: ghost.lastActivityDay,
+        days_after_last_activity: ghost.daysAfter,
+        max_forward_days: ghost.maxDays,
+      });
+    }
+  }
 
   // ── Impossible-hour guard (2026-07-22) ──────────────────────────────
   // 88 LP leads since 2026-05-01 carried appointments at hours no rep

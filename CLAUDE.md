@@ -354,6 +354,20 @@ refusal was re-sent by the executor, the parity watchdog, inbound-checkout-watch
 holds a refused lead + date + time for 24h (`refused:<dedupKey>` mark, `lp_refusal_recent`). Replay test:
 `scripts/test-lp-appt-guard-replay.js`. Add a new LP reply there when one appears.
 
+**The LP→GHL sync books from LP live, never from a stale row or a year-typo date (2026-10-15).** Five GHL visits were
+booked from `lp_leads` rows LP no longer stood behind: rows synced before 2026-07-08 hold real UTC, not the ET wall clock
+`lpWallClockToGhlStartTime` assumes (lead 475840: LP 10:00 AM, row 15:00Z → a 3:00 PM visit), and 2025 leads carried
+visits about a year after LP last touched them (likely year typos; the contact backstop pulled them in). Every caller of
+`reconcileLpAppointmentToGhl` (the `sync_lp_appointment_to_ghl` handler, the contact backstop, the admin backfill) now
+calls `readLiveForSync` (`src/services/lp-live-appointment.js`) for a Set/Verif/Cnf and passes the result in as `live`
+(the reconciler stays supabase-free): LP's live time wins and the row is rewritten to it; with LP unreadable the row books
+only when `synced_at >= 2026-07-08`, else `stale_mirror_unverified`. A visit more than `LP_GHL_SYNC_MAX_FORWARD_DAYS`
+(120) past the lead's last LP activity is `implausible_future_appointment` and posts ONE #ops-alerts card per lead + date
+(`notifyImplausibleAppointment`, claimed in `lp_sync_failure_notices`). A cancel never reads LP and is never gated. A new
+caller of the reconciler passes `live` too. `parseLpApptWallClock` now lives in `src/actions/date-parsers.js`. One-time
+re-read of the old rows: `POST /admin/refresh-stale-lp-appointments` / `scripts/refresh-stale-lp-appointments.js` (dry
+run default; lp_leads only, never GHL).
+
 **A held appointment asks a person to import its LP row (2026-10-05).** When LP already has an unimported
 inbound row for a contact, `syncAppointmentToLP` holds the appointment (`lp-appt-deferred`) rather than add a
 duplicate lead, and the parity watchdog re-drives it every 30 min. LP has no API that imports a row, so once a

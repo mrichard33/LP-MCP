@@ -28,6 +28,7 @@ function run(over = {}) {
     stragglerCancel: false,
     ...over.opts,
     deps: {
+      readLiveForSync: async () => null, // live LP read: test-lp-ghl-ghost-appointment.js
       nowMs: NOW,
       scanBackfillCandidates: async () => ({ targets, unlinked: [], total_rows: targets.length, linked_contacts: targets.length }),
       reconcileLpAppointmentToGhl: async ({ lead }) => {
@@ -78,6 +79,7 @@ test('a skipped same-day contact is kept out of the straggler scope', async () =
   await runGhlAppointmentBackfill({
     dryRun: true,
     deps: {
+      readLiveForSync: async () => null, // live LP read: test-lp-ghl-ghost-appointment.js
       nowMs: NOW,
       scanBackfillCandidates: async () => ({
         targets: [TODAY_LATER, TOMORROW].map((lead) => ({ lead, superseded: 0 })),
@@ -96,6 +98,7 @@ test('the straggler pass runs AFTER the reconciler, and is handed what the recon
   await runGhlAppointmentBackfill({
     dryRun: true,
     deps: {
+      readLiveForSync: async () => null, // live LP read: test-lp-ghl-ghost-appointment.js
       nowMs: NOW,
       scanBackfillCandidates: async () => ({ targets: [{ lead: TOMORROW, superseded: 0 }], unlinked: [], total_rows: 1, linked_contacts: 1 }),
       reconcileLpAppointmentToGhl: async () => {

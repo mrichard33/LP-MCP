@@ -49,6 +49,7 @@
 
 import supabase from '../supabase.js';
 import { reconcileLpAppointmentToGhl, classifyDisposition } from '../services/lp-ghl-appointment-reconciler.js';
+import { readLiveForSync } from '../services/lp-live-appointment.js';
 import { lpWallClockToGhlStartTime, appointmentDelta } from '../appointment-dates.js';
 import { utcToLpStoredIso } from '../lp-dates.js';
 import { runStragglerCancelPass, DEFAULT_STRAGGLER_LOOKBACK_DAYS } from './ghl-straggler-cancel.js';
@@ -83,7 +84,9 @@ export async function scanBackfillCandidates({ horizonDays = DEFAULT_HORIZON_DAY
   while (true) {
     let q = supabase
       .from('lp_leads')
-      .select('lp_lead_id, ghl_contact_id, disposition_code, appointment_date, created_at_lp, first_name, last_name, phone')
+      .select('lp_lead_id, ghl_contact_id, disposition_code, appointment_date, created_at_lp, first_name, last_name, phone, '
+        // 2026-10-15: the reconciler's stale-row and ghost-appointment guards.
+        + 'synced_at, updated_at_lp, set_date, last_contact_date')
       .in('disposition_code', DISPOSITIONS)
       .gte('appointment_date', fromIso)
       .lte('appointment_date', toIso)
@@ -156,6 +159,8 @@ export async function runGhlAppointmentBackfill({
   const scanFn = deps.scanBackfillCandidates || scanBackfillCandidates;
   const reconcile = deps.reconcileLpAppointmentToGhl || reconcileLpAppointmentToGhl;
   const stragglerPass = deps.runStragglerCancelPass || runStragglerCancelPass;
+  // Set/Cnf book from LP live (2026-10-15, src/services/lp-live-appointment.js).
+  const readLive = deps.readLiveForSync || readLiveForSync;
 
   const scan = await scanFn({ horizonDays, contactId, limit });
   const { targets, unlinked } = scan;
@@ -207,9 +212,11 @@ export async function runGhlAppointmentBackfill({
     if (hasLiveForwardLpAppointment) stragglerScope.set(lead.ghl_contact_id, { lead });
 
     try {
+      const live = await readLive(lead, { dryRun });
       const result = await reconcile({
         contactId: lead.ghl_contact_id,
         lead,
+        live,
         toNotify: false,
         dryRun,
       });

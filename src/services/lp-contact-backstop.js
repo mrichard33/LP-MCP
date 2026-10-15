@@ -69,6 +69,8 @@ import supabase from '../supabase.js';
 import { ghlFetch } from '../actions/helpers.js';
 import { GHL_LOCATION_ID } from '../actions/constants.js';
 import { reconcileLpAppointmentToGhl } from './lp-ghl-appointment-reconciler.js';
+import { readLiveForSync } from './lp-live-appointment.js';
+import { notifyImplausibleAppointment } from '../actions/handlers/lp-ghl-appointment-sync.js';
 import { normalizePhone } from '../sync-utils.js';
 import { pickPhoneMatch, searchByPhone as resolveSearchByPhone, isDuplicate400 } from './ghl-contact-resolve.js';
 
@@ -92,7 +94,10 @@ const LP_PROSPECT_ID_FIELD = 'ZRQAVrzhtzApzLlHmT87';
 const DISPOSITIONS = ['Set', 'Cnf', 'Verif'];
 // Both scans read the same columns. email/address/city/state/zip were added
 // 2026-10-11 for the identity fill on the link path (lp-identity-fill.js).
-const LEAD_COLUMNS = 'lp_lead_id, ghl_contact_id, disposition_code, appointment_date, created_at_lp, first_name, last_name, email, address, city, state, zip, phone, lead_source, lead_source_detail, lp_prospect_id';
+const LEAD_COLUMNS = 'lp_lead_id, ghl_contact_id, disposition_code, appointment_date, created_at_lp, first_name, last_name, email, address, city, state, zip, phone, lead_source, lead_source_detail, lp_prospect_id, '
+  // 2026-10-15: the reconciler's stale-row and ghost-appointment guards read
+  // these. Five ghost visits (year typos on 2025 leads) came in this way.
+  + 'updated_at_lp, synced_at, set_date, last_contact_date';
 const DEFAULT_HORIZON_DAYS = 45;
 // Absolute upper bound enforced REGARDLESS of the caller's horizon_days. This
 // — not the caller-supplied window — is the guard that keeps garbage-dated LP
@@ -553,6 +558,7 @@ export async function processOneLead({
   contactCache,
   suppressOutbound = false,
   freshHours = DEFAULT_INTAKE_FRESH_HOURS,
+  deps = {},
 }) {
   contactCache = contactCache || new Map();
   seenPhones = seenPhones || new Set();
@@ -676,8 +682,17 @@ export async function processOneLead({
   let apptResult = 'no_appointment';
   let outcome = action;
   if (lead.appointment_date) {
-    const rec = await reconcileLpAppointmentToGhl({ contactId, lead, toNotify: true, contactCache, dryRun });
+    // LP live first (2026-10-15): a stale row or a year-typo date must not
+    // become a real visit with reminders to the homeowner.
+    const live = await (deps.readLiveForSync || readLiveForSync)(lead, { dryRun });
+    const rec = await (deps.reconcileLpAppointmentToGhl || reconcileLpAppointmentToGhl)({
+      contactId, lead, live, toNotify: true, contactCache, dryRun,
+    });
     apptResult = rec.outcome === 'noop' ? rec.reason : rec.outcome;
+    if (rec.reason === 'implausible_future_appointment' && !dryRun) {
+      await (deps.notifyImplausibleAppointment || notifyImplausibleAppointment)({ contactId, lead, result: rec })
+        .catch((e) => console.warn(`[LpContactBackstop] implausible-appointment alert failed for lead ${lead.lp_lead_id}: ${e.message}`));
+    }
     if (rec.reason === 'dnc_consent') outcome = 'skipped_dnc'; // matched DNC = link-only
   }
 
