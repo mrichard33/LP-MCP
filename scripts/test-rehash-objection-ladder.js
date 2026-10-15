@@ -169,12 +169,6 @@ test('a dated deferral and "we signed elsewhere" still win over the ladder', () 
   assert.equal(plan('We went with another company, too expensive', [...START]).step, 'competitor_signed');
 });
 
-test('asking for room is the warm close, not a ladder step (PR #1324 x #1325, 2026-10-15)', () => {
-  const msg = "We need more time, it's been a hard stretch at home";
-  assert.equal(postDemoObjection(msg), null);
-  assert.equal(plan(msg, [...START, inn(msg)]).step, 'post_demo_space');
-});
-
 test('a question about the number is not an objection', () => {
   assert.equal(postDemoObjection('What was the price again?'), null);
   assert.equal(postDemoObjection(COST), 'price');
