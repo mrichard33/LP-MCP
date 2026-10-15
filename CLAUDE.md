@@ -40,6 +40,19 @@ parentheses. Card builders use `slackPhone` (`src/format-helpers.js`); `normaliz
 GroupMe send (only a phone SHAPE with a separator or a +1 is rewritten, and only block `text`, never a button `value`).
 Customer-facing texts and chat replies keep `(352) 555-0188`.
 
+**A live chat gets one Slack card per lead, and one summary per chat (Mark, 2026-10-15).** One chat
+(jhVZZUtXp3jDrBsXOZcK) posted six "LARGE JOB SIGNAL" cards in six minutes: the model's `large_job_signal` reads the
+whole thread, and the event under it was deduped but the Slack post was not. The large-job and Spanish cards in
+`src/live-chat/fast-lane.js` now post only when their `emitEvent` returns a NEW row (the idempotency key is per
+contact, so restarts and replicas cannot repeat it), and the fallback card posts once per chat (`alert-posted.js`,
+audit `livechat_fallback`, a sliding hour). `LIVE_CHAT_LARGE_JOB_ALERT_MODE` once (default) | summary | off; the
+action row keeps `large_job` every turn. `LIVE_CHAT_SUMMARY_MODE` off (default) | shadow | live: job
+`src/jobs/live-chat-summary.js` (every minute; pass in `src/services/live-chat-summary-io.js`, card in
+`src/live-chat/chat-summary.js`) claims each chat quiet for `LIVE_CHAT_SUMMARY_QUIET_MIN` (15) by INSERTING its
+`live_chat_summaries` row first (UNIQUE contact + session start), then posts one card to #ops-alerts; a lead who comes
+back gets a thread reply under their first card. "Needs a person" appears only when no other card already asked
+(Spanish, a last-turn timeout, a large job not booked). Never add a per-message live-chat card: put it on the summary.
+
 **When Slack is the PRIMARY destination, not a mirror, use `postToSlack(text, channelId)`** in
 `src/slack.js` — it returns `{ ok, ts, channel, error }`. `mirrorToSlack` fans out to several channels
 and reduces the result to a count, so it cannot tell you the message `ts` or that a specific post
