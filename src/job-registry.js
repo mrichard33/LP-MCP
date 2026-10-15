@@ -433,6 +433,17 @@ export const JOBS = Object.freeze([
     isEnabled: (env) => String(env.AFTER_ASAP_RETRY_MODE || 'shadow').toLowerCase().trim() !== 'off',
   },
   {
+    id: 'five9-call-journey-sync',
+    label: 'Five9 "Call Journey" report → five9_call_journey (every dial, one row per leg)',
+    group: 'five9',
+    cadence: 'every 15 min, 24/7',
+    enabledEnv: 'FIVE9_JOURNEY_SYNC_MODE',
+    // A MODE (2026-10-15): off | shadow | live, default shadow. Mirrors
+    // journeyMode() in src/jobs/five9-call-journey-sync.js.
+    enabledDefault: true,
+    isEnabled: (env) => String(env.FIVE9_JOURNEY_SYNC_MODE || 'shadow').toLowerCase().trim() !== 'off',
+  },
+  {
     id: 'cancel-reset-routing',
     label: 'Cancelled LP leads (CXL / CCC) no Reset campaign has called → Five9 "Resets-Hot"',
     group: 'five9',

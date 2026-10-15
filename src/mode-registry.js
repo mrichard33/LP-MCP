@@ -366,6 +366,11 @@ export const MODES = Object.freeze([
     goLive: 'job_runs.detail.decisions show would_push only for leads with no follow-up call and no After DIAL ASAP record',
     note: 'Puts no-contact DIAL ASAP / Simpletext leads on After DIAL ASAP where the Five9 connector missed them.',
   }),
+  m('FIVE9_JOURNEY_SYNC_MODE', 'dialer', 'enum', OSL, 'shadow', OSL_S, {
+    since: '2026-10-15', decider: 'the user', evidence: { table: 'five9_call_journey_runs', job: 'five9-call-journey-sync' },
+    goLive: '2-3 shadow runs in five9_call_journey_runs with status ok, rows_returned > 0 and rows_rejected = 0 (the user\'s Call Journey handoff, 2026-10-15)',
+    note: 'Pulls the Five9 "Call Journey" report every 15 min into five9_call_journey (shadow: pull + parse + log, no rows).',
+  }),
   m('CANCEL_RESET_ROUTING_MODE', 'dialer', 'enum', OSL, 'live', OSL_S, {
     since: '2026-10-15', decider: 'the user', evidence: job('cancel-reset-routing'),
     goLive: 'ruled live by the user on 2026-10-15: every cancelled lead goes to Resets-Hot',

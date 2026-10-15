@@ -403,6 +403,16 @@ phone whose NEWEST lead is CXL or CCC, cancelled 30 min..14 days ago, that no Re
 cancel. Never sold, Five9 DNC or opted out; a failed DNC or consent read waits. Keyed on number1 ALONE, the opposite of
 the new-lead backstop: profile "Resets V2" dials records created 25+ hours ago, so the phone's existing record is the
 one to add.
+**Every Five9 dial is stored, one row per call leg (the user, 2026-10-15, Call Journey handoff).** `five9_events_raw` is a
+webhook mirror and misses most unanswered and busy dials (69 calls against the report's 150 in one 16-minute window). Job
+`five9-call-journey-sync` (`src/jobs/five9-call-journey-sync.js`, rules in `src/five9/call-journey.js`, every 15 min,
+`FIVE9_JOURNEY_SYNC_MODE` off|shadow|live, default shadow) runs the saved report "Shared Reports / Call Journey" into
+`five9_call_journey` (`leg_key` = call id | time | type | dnis, unique: a NULL dnis would slip past a four-column UNIQUE)
+and logs every pull in `five9_call_journey_runs`. The report's zone is EASTERN: its window and its TIMESTAMP cells are
+Eastern wall clock. Columns are read BY NAME (a missing one fails the run), a row with no time is a counted reject and an
+#ops alert, and a window at 50,000 rows is halved. `v_lead_call_journey` orders each lead's legs and counts the dials we
+placed in the trailing 24h (`calls_last_24h`, the 3-in-24 audit). `POST /admin/five9-journey/backfill?days=N` (live only).
+Read-only against Five9; never the CI "Call Log" (`src/ci/*`, `ci_calls`), never LP call logs: Five9 is the only call source.
 **Missed paid callers are judged by their whole call history (2026-10-12).** `src/jobs/missed-caller-recovery.js`
 (`MISSED_CALLER_RECOVERY_MODE`, default shadow) no longer uses `findContactInOtherLists` either: all 264 would_push rows
 read "cross-list check unreadable — failed open". `judgeHistory` reads every Five9 disposition for the number, any
