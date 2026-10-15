@@ -113,7 +113,8 @@ const { normalizeDateForComparison, toLpApptTime } = await import('../src/action
 const { lpWallClockToGhlStartTime } = await import('../src/appointment-dates.js');
 
 const LEAD_DATE = '2027-07-08T10:00:00+00:00'; // LP wall-clock-mislabeled-UTC
-const lead = (disposition_code) => ({ lp_lead_id: '555360', disposition_code, appointment_date: LEAD_DATE });
+// synced_at: a wall-clock-era row (the stale-row guard, 2026-10-15).
+const lead = (disposition_code) => ({ lp_lead_id: '555360', disposition_code, appointment_date: LEAD_DATE, synced_at: '2026-10-01T00:00:00Z' });
 const mutations = () => calls.filter((c) => c.method === 'POST' || c.method === 'PUT');
 
 // Rows this test's PostgREST stub saw written to `table`.

@@ -87,6 +87,10 @@ const {
   LP_BACKSTOP_ALWAYS_TAGS,
 } = await import('../src/services/lp-contact-backstop.js');
 
+// No live LP read here (2026-10-15): the live read and the stale-row guard
+// have their own suite, test-lp-ghl-ghost-appointment.js. Fixtures carry a
+// wall-clock-era synced_at so the reconciler trusts the row.
+const NO_LIVE_LP = { readLiveForSync: async () => null };
 const GHL_LOCATION_ID = 'SsBG7j5KQAIP1SFP2Sca';
 const LP_LEAD_ID_FIELD = 'GmAVmW6V9sekD7pVONKr';
 const LP_PROSPECT_ID_FIELD = 'ZRQAVrzhtzApzLlHmT87';
@@ -133,7 +137,7 @@ const lead = (over = {}) => ({
   lp_lead_id: '555360', lp_prospect_id: '900001', disposition_code: 'Set',
   appointment_date: FUTURE, first_name: 'Jane', last_name: 'Blust',
   phone: '(239) 555-1234', lead_source: 'Canvass',
-  created_at_lp: new Date().toISOString(), ...over,
+  created_at_lp: new Date().toISOString(), synced_at: new Date().toISOString(), ...over,
 });
 
 // ═══ 1. Pure selection ════════════════════════════════════════════════
@@ -218,7 +222,7 @@ test('cleanName: junk → empty, real names preserved', () => {
 
 test('(1) phone match → link + stamp, zero POST /contacts, reconcile once', async () => {
   reset({ search: [{ id: 'ext-1', phone: '2395551234' }], full: { id: 'ext-1', tags: [], customFields: [] } });
-  const r = await processOneLead({ lead: lead(), contactCache: new Map() });
+  const r = await processOneLead({ deps: NO_LIVE_LP, lead: lead(), contactCache: new Map() });
   assert.equal(r.outcome, 'linked');
   assert.equal(r.contact_id, 'ext-1');
   assert.equal(contactCreates().length, 0);                       // never created
@@ -238,7 +242,7 @@ test('(1b) link stamps only empty fields — non-empty LP Lead ID preserved', as
     search: [{ id: 'ext-1', phone: '2395551234' }],
     full: { id: 'ext-1', tags: [], customFields: [{ id: LP_LEAD_ID_FIELD, field_value: '999' }] },
   });
-  await processOneLead({ lead: lead(), contactCache: new Map() });
+  await processOneLead({ deps: NO_LIVE_LP, lead: lead(), contactCache: new Map() });
   const stampPuts = calls.filter((c) => c.method === 'PUT' && /^\/contacts\/ext-1$/.test(c.path));
   assert.equal(stampPuts.length, 1);
   // LP Lead ID already set → only the prospect field is stamped
@@ -253,7 +257,7 @@ test('(2) no match → one POST /contacts with correct tags/source/customFields,
     ['Mystery', ['entry:other', 'active-entry:other', 'source:unknown', ...LP_BACKSTOP_ALWAYS_TAGS]],
   ]) {
     reset({ search: [] });
-    const r = await processOneLead({ lead: lead({ lead_source: src }), contactCache: new Map() });
+    const r = await processOneLead({ deps: NO_LIVE_LP, lead: lead({ lead_source: src }), contactCache: new Map() });
     assert.equal(r.outcome, 'created', `src ${src}`);
     assert.equal(contactCreates().length, 1, `src ${src}`);
     const b = contactCreates()[0].body;
@@ -273,7 +277,7 @@ test('(2) no match → one POST /contacts with correct tags/source/customFields,
 // source-field cases read as one thing each.
 async function captureCreateBody(over) {
   reset({ search: [] }); // no phone match → the create branch
-  await processOneLead({ lead: lead(over), contactCache: new Map() });
+  await processOneLead({ deps: NO_LIVE_LP, lead: lead(over), contactCache: new Map() });
   assert.equal(contactCreates().length, 1);
   return contactCreates()[0].body;
 }
@@ -306,7 +310,7 @@ test('provenance survives the change', async () => {
 
 test('(3) junk name → created with empty firstName/lastName, not "N/A"', async () => {
   reset({ search: [] });
-  await processOneLead({ lead: lead({ first_name: 'N/A', last_name: '..' }), contactCache: new Map() });
+  await processOneLead({ deps: NO_LIVE_LP, lead: lead({ first_name: 'N/A', last_name: '..' }), contactCache: new Map() });
   const b = contactCreates()[0].body;
   assert.equal(b.firstName, '');
   assert.equal(b.lastName, '');
@@ -314,7 +318,7 @@ test('(3) junk name → created with empty firstName/lastName, not "N/A"', async
 
 test('(4) no phone → no search, no create, skipped_no_phone', async () => {
   reset({ search: [{ id: 'should-not-be-hit' }] });
-  const r = await processOneLead({ lead: lead({ phone: '12' }), contactCache: new Map() });
+  const r = await processOneLead({ deps: NO_LIVE_LP, lead: lead({ phone: '12' }), contactCache: new Map() });
   assert.equal(r.outcome, 'skipped_no_phone');
   assert.equal(calls.length, 0); // never even searched
 });
@@ -324,7 +328,7 @@ test('(5) existing DNC contact → link-only, no appointment create', async () =
     search: [{ id: 'ext-dnc', phone: '2395551234' }],
     full: { id: 'ext-dnc', tags: ['dnc'], customFields: [] },
   });
-  const r = await processOneLead({ lead: lead(), contactCache: new Map() });
+  const r = await processOneLead({ deps: NO_LIVE_LP, lead: lead(), contactCache: new Map() });
   assert.equal(r.outcome, 'skipped_dnc');
   assert.equal(r.contact_id, 'ext-dnc');
   assert.equal(contactCreates().length, 0);
@@ -337,7 +341,7 @@ test('(7) duplicate-400 on create → re-search → linked', async () => {
     full: { id: 'ext-dup', tags: [], customFields: [] },
     create400: true,
   });
-  const r = await processOneLead({ lead: lead(), contactCache: new Map() });
+  const r = await processOneLead({ deps: NO_LIVE_LP, lead: lead(), contactCache: new Map() });
   assert.equal(r.outcome, 'linked');
   assert.equal(r.contact_id, 'ext-dup');
   assert.equal(contactCreates().length, 1);   // create attempted once (threw 400)
@@ -348,13 +352,13 @@ test('(7) duplicate-400 on create → re-search → linked', async () => {
 test('(8) dry-run → search GETs allowed, zero POST/PUT anywhere', async () => {
   // match path
   reset({ search: [{ id: 'ext-1', phone: '2395551234' }], full: { id: 'ext-1', tags: [], customFields: [] } });
-  await processOneLead({ lead: lead(), dryRun: true, contactCache: new Map() });
+  await processOneLead({ deps: NO_LIVE_LP, lead: lead(), dryRun: true, contactCache: new Map() });
   assert.equal(mutations().length, 0, 'match dry-run must not mutate');
   assert.ok(calls.some((c) => c.method === 'GET'), 'dry-run still reads');
 
   // no-match path
   reset({ search: [] });
-  const r = await processOneLead({ lead: lead(), dryRun: true, contactCache: new Map() });
+  const r = await processOneLead({ deps: NO_LIVE_LP, lead: lead(), dryRun: true, contactCache: new Map() });
   assert.equal(mutations().length, 0, 'no-match dry-run must not mutate');
   assert.equal(contactCreates().length, 0);
   assert.equal(r.outcome, 'created'); // planned create, no contact yet
@@ -369,14 +373,14 @@ test('a lead older than the freshness window is created with suppress-outbound',
   const stale = lead({
     created_at_lp: new Date(Date.now() - 72 * 3600 * 1000).toISOString(),
   });
-  const r = await processOneLead({ lead: stale, contactCache: new Map() });
+  const r = await processOneLead({ deps: NO_LIVE_LP, lead: stale, contactCache: new Map() });
   assert.equal(r.outcome, 'created');
   assert.ok(contactCreates()[0].body.tags.includes('suppress-outbound'));
 });
 
 test('a fresh lead is NOT suppressed — the guard is age-based, not always-on', async () => {
   reset({ search: [] });
-  const r = await processOneLead({ lead: lead(), contactCache: new Map() });
+  const r = await processOneLead({ deps: NO_LIVE_LP, lead: lead(), contactCache: new Map() });
   assert.equal(r.outcome, 'created');
   assert.ok(!contactCreates()[0].body.tags.includes('suppress-outbound'));
 });

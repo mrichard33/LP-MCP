@@ -203,6 +203,7 @@ import { registerLinkVerifySampleRoutes } from './admin/link-verify-sample.js';
 // dry-run by default) so it can run on Railway without shell access; shares
 // its core with scripts/backfill-ghl-appointments.js.
 import { registerGhlAppointmentBackfillRoutes } from './admin/ghl-appointment-backfill.js';
+import { registerStaleAppointmentRefreshRoutes } from './admin/stale-lp-appointment-refresh.js';
 // LP contact auto-create backstop — flag-gated 15-min sweep + admin endpoint;
 // finds-or-creates the GHL contact for unlinked LP leads then reconciles the
 // appointment. Scheduler no-ops unless ENABLE_LP_CONTACT_BACKSTOP=true.
@@ -891,6 +892,7 @@ registerGuestVisitorRemediationRoutes(app);
 registerLinkVerifySampleRoutes(app); // 2026-07-23 — pre-enforce cache-vs-live rejection sampling (read-only vs GHL)
 registerPendingProbeTtlSweepRoutes(app); // 2026-07-08 — stale pending:customer-status-check TTL sweep (scheduler env-gated, default off)
 registerGhlAppointmentBackfillRoutes(app); // 2026-07-07 — LP→GHL appointment backfill trigger (dry-run default)
+registerStaleAppointmentRefreshRoutes(app, authenticate); // 2026-10-15 — one-time re-read of pre-2026-07-08 lp_leads appointment rows from LP (dry-run default, never GHL)
 registerLpContactBackstopRoutes(app); // 2026-07-09 — LP contact auto-create backstop (scheduler env-gated, default off)
 registerLpIdentityFillRoutes(app, { authenticate }); // 2026-10-11 — fill nameless contacts from LP (dry-run default)
 registerLpMirrorBackfillRoutes(app); // 2026-07-10 — windowed cursor-independent mirror recovery (dry-run default)

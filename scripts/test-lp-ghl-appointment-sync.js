@@ -99,8 +99,11 @@ const weAppt = (over = {}) => ({
   id: 'appt-1', calendarId: WE, startTime: FUTURE_GHL, endTime: null,
   appointmentStatus: 'new', ...over,
 });
+// synced_at: a wall-clock-era row, so the reconciler may trust it without a
+// live LP read (the stale-row guard, 2026-10-15, has its own suite:
+// test-lp-ghl-ghost-appointment.js).
 const lead = (disposition_code, appointment_date = FUTURE) =>
-  ({ lp_lead_id: '555360', disposition_code, appointment_date });
+  ({ lp_lead_id: '555360', disposition_code, appointment_date, synced_at: '2026-10-01T00:00:00Z' });
 
 // ═══ 1. ET wall-clock transform ═══════════════════════════════════════
 
