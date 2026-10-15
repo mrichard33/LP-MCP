@@ -22,6 +22,7 @@
  * Pure: no network, no database, no clock unless `nowMs` is passed.
  */
 
+import { claimsWarrantySent } from '../agentic/warranty-request.js';
 import { humanizeReply } from '../agentic/human-voice.js';
 import { enforceTeamVoice } from '../agentic/team-voice.js';
 import { enforcePropertyScope } from '../agentic/property-scope.js';
@@ -33,7 +34,7 @@ import { isLeadSignOff } from '../agentic/sign-off.js';
 import { dropUnaskedCallOffer, leadWantsCall, isMoneyFigure, URGENCY_RX, CLAIMS_RX } from '../agentic/nepq-planner.js';
 
 /** Bump when a check is added or changed, so scorecards from two versions are not compared as one. */
-export const INVARIANTS_VERSION = '2026-10-13.2';
+export const INVARIANTS_VERSION = '2026-10-15.1';
 
 /** The prompt's own SMS ceiling (CHANNEL CONSTRAINTS: "320 max"). */
 export const SMS_MAX_CHARS = 320;
@@ -66,6 +67,7 @@ function sentences(text) {
  * @param {boolean}[ctx.callOfferOk]    the plan's goal is a call (a post-demo lead), so an offer is never unasked
  * @param {boolean}[ctx.rehash]         a rehash (post-demo) lead; undefined skips the rehash call-timing check
  * @param {boolean}[ctx.callbackFiled]  this turn filed a callback (a hand-off): any call it promises is backed
+ * @param {boolean}[ctx.warrantySent]   this turn sends the warranty files; undefined skips the warranty-claim check
  * @returns {{ pass: boolean, violations: Array<{code: string, detail: string}>, skipped: string[], metrics: {chars: number, questions: number} }}
  */
 // The clock times a message names, normalized and sorted ("10:00 AM" → "10:00am").
@@ -185,6 +187,12 @@ export function checkReply(reply, ctx = {}) {
   // 2026-10-09), so a post-demo plan is not held to it.
   if (ctx.inbound === undefined || ctx.postDemoLead || ctx.callOfferOk === true) skipped.push('times_after_sign_off');
   else if (isLeadSignOff(ctx.inbound) && (text.includes('?') || clockSet(text).length > 0)) fail('times_after_sign_off', text);
+
+  // ── "here's your warranty" only with the files (2026-10-15, Jeff Clark) ──
+  // A reply may say the warranty is here / attached only on a turn that sends
+  // it (src/agentic/warranty-request.js).
+  if (ctx.warrantySent === undefined) skipped.push('warranty_claim');
+  else if (ctx.warrantySent !== true && claimsWarrantySent(text)) fail('warranty_claim_without_file', text);
 
   // ── the same two times, never a third time (2026-10-13) ────────────────
   if (!Array.isArray(ctx.conversation)) skipped.push('repeat_slot_offer');

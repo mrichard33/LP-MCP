@@ -400,6 +400,7 @@ import { getCustomValue } from './services/ghl-custom-values.js';
 import { dialWindowPromptLine, canPromiseImmediateCall } from './dial-window.js';
 import { normalizeRepNote } from './agentic/rep-note.js';
 import { findUndeliveredSendPromise, undeliveredPromiseNote, rewriteUndeliveredPromise, validateInfoEmailPayload } from './agentic/send-promise.js';
+import { warrantyTurn, enforceWarrantyReply } from './agentic/warranty-request.js';
 import { findUnbackedEstimatePromise, estimatePromiseNote, rewriteEstimatePromise, calculatorFallbackAllowed } from './agentic/estimate-promise.js';
 // v2.7.14 — Bot Review Phase 0. Pure shaping helpers only: no I/O, no writes.
 import { buildInputSnapshot, extractKbModes, extractKbSources } from './bot-feedback/fingerprint-core.js';
@@ -3736,7 +3737,15 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     ? `GUIDE NEEDS A NAME: the guide goes out with their first name on it, and we do not have it yet. Ask for ONE thing only, their first name, e.g. "${GUIDE_NAME_ASK}" Do not say the guide is sent or on its way, and ask nothing else.`
     : guideReleased.length ? 'The guide they asked for is being sent to their email now; you may say it is on its way.' : null;
 
-  const promptHint = [rehash ? null : opts.promptHint, handoffNote, contactTypoHint(triggerMessage), recheckHint(recheckEarly), guideHint]
+  // 2026-10-15 (Jeff Clark): a copy of the warranty asked for is SENT with this
+  // reply (src/agentic/warranty-request.js): the links on SMS, the PDFs on
+  // email, added by the send handler. Null when WARRANTY_PDF_URLS is unset.
+  const warranty = warrantyTurn(triggerMessage);
+  const warrantyHint = warranty
+    ? `WARRANTY: they asked for a copy of the warranty, and it is sent WITH this message (${channel === 'email' ? 'both PDFs are attached' : 'the links are added below your reply'}). Say here is a copy of the warranty, then offer to walk them through anything in it. Never say it will come later or that someone will send it. You may state warranty terms you know; never mention a price guarantee or price matching. Answer anything else they asked too.`
+    : null;
+
+  const promptHint = [rehash ? null : opts.promptHint, handoffNote, contactTypoHint(triggerMessage), recheckHint(recheckEarly), guideHint, warrantyHint]
     .filter(Boolean).join('\n\n') || null;
 
   const buyerStage    = inferBuyerStage(context);
@@ -4194,6 +4203,8 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
         knownZip: identityState?.identity?.postal_code || context.lead?.postal_code || null,
         // A Window Count / Door Count already on the contact: the count is not asked (2026-10-13).
         knownOpenings: (Number(context.estimate?.window_count) || 0) + (Number(context.estimate?.door_count) || 0) > 0,
+        // 2026-10-15: a copy of the warranty asked for is sent with this reply.
+        warrantyAvailable: !!warranty,
         // 2026-10-13 (Erica Hilts): the layer3 script said "NO times" and the
         // plan offered two anyway; the plan block wins over the script, so the
         // planner is told.
@@ -4631,7 +4642,8 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       ...(Array.isArray(opts.deliveryTags) ? opts.deliveryTags : []),
       ...(guideResend ? [guideResend.tag] : []),
     ];
-    const promise = findUndeliveredSendPromise(validated.message, validated.companion_action, { channel, deliveryTags });
+    // A warranty turn carries its own delivery (the links / the attachments).
+    const promise = warranty ? null : findUndeliveredSendPromise(validated.message, validated.companion_action, { channel, deliveryTags });
     if (promise) {
       // Part 6: rewritten on the first draft and flagged; a rep keeps it.
       validated.message = rewriteUndeliveredPromise(validated.message, promise, { email: context.lead?.email || null });
@@ -5286,6 +5298,17 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       console.warn(`[CancelledVisit] ${contactId} upcoming-visit sentence replaced: "${String(cancelled.sentence).slice(0, 120)}"`);
       validated.message = cancelled.text;
       validated.cancelled_visit_fixed = true;
+    }
+    // 2026-10-15 (Jeff Clark): a warranty turn says the warranty is here,
+    // never "it will come later", and never states the price guarantee
+    // (warranty-request.js). The send handler adds the files.
+    if (warranty) {
+      const w = enforceWarrantyReply(validated.message, { firstName: context.lead?.first_name || null });
+      if (w.changed) {
+        console.log(`[Warranty] ${contactId} reply fixed: ${w.changes.join(',')}`);
+        validated.message = w.text;
+      }
+      validated.warranty = { urls: warranty.urls };
     }
     // Human voice once more, last (2026-10-06 bot gate): the first pass runs
     // before the NEPQ and booking guards, and a sentence they drop can leave

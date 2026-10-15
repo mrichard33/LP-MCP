@@ -158,6 +158,11 @@ export const MODES = Object.freeze([
     since: '2026-10-01', goLive: LIVE_BY_DEFAULT,
     note: 'Finds live-chat messages that got no reply and answers them.',
   }),
+  m('MISSED_INBOUND_SWEEP_MODE', 'bot', 'enum', OSL, 'live', OSL_S, {
+    since: '2026-10-15', decider: 'the user', goLive: LIVE_BY_DEFAULT,
+    evidence: { events: ['agentic.missed_inbound_redriven'] },
+    note: 'Answers an inbound text or email GHL never sent to the reply webhook.',
+  }),
   m('REPLY_SLA_WATCHDOG_MODE', 'bot', 'enum', OSL, 'shadow', OSL_S, {
     since: '2026-09-02',
     note: 'Flags a text with no reply after 3 minutes.',

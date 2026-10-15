@@ -26,7 +26,8 @@ test('the version was bumped for the new check and the cap is the prompt\'s 320'
   // 2026-10-10.2: money_figure now allows the ruled "0% APR" (scripts/test-zero-apr-ruling.js).
   // 2026-10-13.1: job_scope (no rentals, no commercial, the minimum, impact-only).
   // 2026-10-13.2: times_after_sign_off and repeat_slot_offer (Erica Hilts).
-  assert.equal(INVARIANTS_VERSION, '2026-10-13.2');
+  // 2026-10-15.1: warranty_claim_without_file (Jeff Clark).
+  assert.equal(INVARIANTS_VERSION, '2026-10-15.1');
   assert.equal(SMS_MAX_CHARS, 320);
 });
 

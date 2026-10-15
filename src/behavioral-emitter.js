@@ -632,6 +632,7 @@ onShutdown(() => { flushReplyBuffersNow(); });
 /** test-only: queue a message exactly as handleReply does. */
 export function _scheduleBufferedPipelineForTests(...args) { return scheduleBufferedPipeline(...args); }
 export function _replyBufferCountForTests() { return replyBuffers.size; }
+export function _isTrivialMessageForTests(text) { return isTrivialMessage(text); }
 
 // 2026-07-03 — terminal marker for a fully-deduped buffer window: the events
 // are processed (nothing left to analyze) with an explicit audit trail.
@@ -905,7 +906,21 @@ async function ensureAgenticOwnershipStamp(contactId) {
 // ═══════════════════════════════════════════════════════════════════
 
 async function handleReply(req, res) {
-  const body = req.body || {};
+  const out = await processInboundReply(req.body || {});
+  return res.status(out.httpStatus || 200).json(out.response);
+}
+
+/**
+ * The inbound reply pipeline, minus Express (2026-10-15). The webhook route
+ * above calls it with GHL's payload; src/jobs/missed-inbound-sweep.js calls it
+ * for an inbound text GHL never sent us (Jeff Clark, 10-14 15:04: I.L3-IN's
+ * webhook did not arrive, and no reply was written). Every gate is the same:
+ * DNC, the channel gate, the ownership stamp, the drip pause, the trivial
+ * filter, the reply buffer and its claim. Returns { httpStatus?, response }.
+ * `opts.source` is stamped on the pending_analysis payload as `redriven_by`.
+ */
+export async function processInboundReply(body = {}, opts = {}) {
+  const redrivenBy = opts.source && opts.source !== 'ghl_webhook' ? String(opts.source) : null;
   const contactId = body.contactId || body.contact_id || body.id || null;
   const messageText = body.body || body.message || body.text || '';
   const messageType = body.messageType || body.type || 'SMS';
@@ -930,7 +945,7 @@ async function handleReply(req, res) {
     || cleanGHLValue(body.timestamp) || null;
   const webhookReceivedAt = new Date().toISOString();
 
-  if (!contactId) return res.status(400).json({ error: 'Missing contactId in webhook payload' });
+  if (!contactId) return { httpStatus: 400, response: { error: 'Missing contactId in webhook payload' } };
   const channel = normalizeInboundChannel(messageType);
   // v2.15 — strip the quoted thread on email before ANYTHING downstream sees it
   // (event payload, message key, analyzer).
@@ -958,7 +973,7 @@ async function handleReply(req, res) {
       priority: 'critical', idempotency_key: `ghl_reply_dnc_${contactId}_${Date.now()}`,
     });
     console.log(`[BehavioralEmitter] DNC reply from ${contactId} (${channel}): "${trimmed.slice(0, 50)}"`);
-    return res.json({ status: 'accepted', classification: 'dnc', channel });
+    return { response: { status: 'accepted', classification: 'dnc', channel } };
   }
 
   // v2.15 — CHANNEL GATE. SMS + Email are answered. Social and unidentifiable
@@ -975,7 +990,7 @@ async function handleReply(req, res) {
       idempotency_key: `ghl_reply_excluded_${contactId}_${messageId}`,
     }).catch((err) => console.warn(`[BehavioralEmitter] channel-excluded event emit failed for ${contactId}: ${err.message}`));
     console.log(`[BehavioralEmitter] ${channel} inbound from ${contactId} — not an agentic reply channel, no stamp, no reply pipeline`);
-    return res.json({ status: 'accepted', classification: 'channel_excluded', channel });
+    return { response: { status: 'accepted', classification: 'channel_excluded', channel } };
   }
 
   // v2.15 — never hand an empty/attachment-only email body to the analyzer; it
@@ -990,7 +1005,7 @@ async function handleReply(req, res) {
       idempotency_key: `ghl_reply_nobody_${contactId}_${messageId}`,
     }).catch((err) => console.warn(`[BehavioralEmitter] email_no_body event emit failed for ${contactId}: ${err.message}`));
     console.log(`[BehavioralEmitter] email inbound from ${contactId} has no answerable body (empty or attachment-only) — routed to human, no analyzer call`);
-    return res.json({ status: 'accepted', classification: 'email_no_body' });
+    return { response: { status: 'accepted', classification: 'email_no_body' } };
   }
 
   // v2.15 — ownership stamp now runs for SMS *and* Email (v2.14 was SMS-only).
@@ -1051,7 +1066,7 @@ async function handleReply(req, res) {
         payload: { message_text: trimmed, message_type: messageType, channel, message_id: messageId, engagement_quality: 'neutral', word_count: trimmed.split(/\s+/).length },
         priority: 'low', idempotency_key: `ghl_reply_trivial_${contactId}_${Date.now()}`,
       });
-      return res.json({ status: 'accepted', classification: 'trivial' });
+      return { response: { status: 'accepted', classification: 'trivial' } };
     }
 
     // Agentic ownership active: fall through to the substantive path
@@ -1071,6 +1086,7 @@ async function handleReply(req, res) {
       ...(inboundTo ? { inbound_to: inboundTo } : {}),
       ...(inboundAt ? { inbound_at: inboundAt } : {}),
       webhook_received_at: webhookReceivedAt,
+      ...(redrivenBy ? { redriven_by: redrivenBy } : {}),
     },
     priority: 'high', idempotency_key: `ghl_reply_${contactId}_${Date.now()}`,
   });
@@ -1090,7 +1106,7 @@ async function handleReply(req, res) {
     event_created_at: emittedEvent?.created_at ?? null,
   });
 
-  return res.json({ status: 'accepted', classification: 'pending_analysis', buffered: true });
+  return { response: { status: 'accepted', classification: 'pending_analysis', buffered: true } };
 }
 
 /**

@@ -51,6 +51,7 @@ import { BOOKING_CALENDARS, inHomeCalendarFor } from '../knowledge/booking-calen
 import { routeNepqHandoff } from '../agentic/nepq-handoff.js';
 import { addGHLNote } from '../ghl.js';
 import { enqueueNoReplyFollowup } from '../jobs/no-reply-followup.js';
+import { sendAsUserFor } from '../agentic/ai-sender.js';
 
 async function fetchContact(contactId) {
   const res = await ghlFetch('GET', `/contacts/${contactId}`, null, { priority: 'high', maxWaitMs: 1500 });
@@ -145,7 +146,7 @@ export async function sendViaWebhook(url, args, { fetchImpl = fetch, timeoutMs =
   return { messageId: json?.id || null, conversationId: args.conversationId || null, method: 'ghl_webhook' };
 }
 
-async function sendMessage({ contactId, conversationId, message, actionId = null, inboundMessage = null }) {
+async function sendMessage({ contactId, conversationId, message, actionId = null, inboundMessage = null, tags = [] }) {
   const webhookUrl = (process.env.LIVE_CHAT_SEND_WEBHOOK_URL || '').trim();
   if (webhookUrl) return sendViaWebhook(webhookUrl, { contactId, conversationId, message, actionId, inboundMessage });
   let convId = conversationId;
@@ -155,8 +156,11 @@ async function sendMessage({ contactId, conversationId, message, actionId = null
     convId = conversations[0]?.id || null;
     if (!convId) throw new Error('no conversation found for contact');
   }
-  const result = await ghlFetch('POST', '/conversations/messages', livechatSendBody({ contactId, conversationId: convId, message }), { priority: 'high' });
-  return { messageId: result?.messageId || result?.id || null, conversationId: convId, method: 'conversations_api' };
+  // 2026-10-15 — a rehash visitor's reply shows as the AI user, never the rep
+  // the contact is assigned to (src/agentic/ai-sender.js).
+  const sendAs = sendAsUserFor({ tags, channel: 'livechat' });
+  const result = await ghlFetch('POST', '/conversations/messages', livechatSendBody({ contactId, conversationId: convId, message, userId: sendAs.userId }), { priority: 'high' });
+  return { messageId: result?.messageId || result?.id || null, conversationId: convId, method: 'conversations_api', sentAsUserId: sendAs.userId || null };
 }
 
 async function insertAction(row) {

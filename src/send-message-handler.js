@@ -350,6 +350,8 @@ import { guardRepeatPromise, recordPromiseIfAny } from './services/promised-call
 import { openerAlreadyAsked, leadReplyState } from './agentic/discovery-discipline.js';
 import { enqueueNoReplyFollowup, openerHoldMode } from './jobs/no-reply-followup.js';
 import { leadWillReachOut } from './agentic/sign-off.js';
+import { sendAsUserFor } from './agentic/ai-sender.js';
+import { appendWarrantyLinks } from './agentic/warranty-request.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY || '';
 const GHL_LOCATION_ID = process.env.GHL_LOCATION_ID || 'SsBG7j5KQAIP1SFP2Sca';
@@ -580,8 +582,9 @@ const DECISION_MAKER_SIGNAL_PATTERNS = Object.freeze([
  * that knows the shape (2026-09-26 — the live-chat fast lane sends through
  * it too, so a GHL field rename is fixed once).
  */
-export function livechatSendBody({ contactId, conversationId, message }) {
-  return { type: 'Live_Chat', contactId, conversationId, message };
+export function livechatSendBody({ contactId, conversationId, message, userId = null }) {
+  // 2026-10-15: userId = the AI user on a rehash contact (src/agentic/ai-sender.js).
+  return { type: 'Live_Chat', contactId, conversationId, message, ...(userId ? { userId } : {}) };
 }
 
 /**
@@ -1915,6 +1918,25 @@ async function sendViaConversationsAPI(contactId, message, channel, subject, opt
     if (opts.fromNumber) msgBody.fromNumber = opts.fromNumber;
   }
 
+  // 2026-10-15 — a rehash contact's bot message shows as the AI user, never
+  // the rep it is assigned to (Jeff Clark, src/agentic/ai-sender.js). Decided
+  // here, after the email sender, because on email it needs the emailFrom the
+  // Randy guard settled. fromNumber and emailFrom are untouched.
+  const sendAs = opts.aiSender
+    ? sendAsUserFor({ ...opts.aiSender, channel, emailFrom: msgBody.emailFrom || null })
+    : { userId: null, reason: 'not_rehash' };
+  if (sendAs.userId) msgBody.userId = sendAs.userId;
+  else if (opts.aiSender && sendAs.reason === 'email_no_from') {
+    console.warn(`[SendMessage] ai_sender skipped for ${contactId}: email has no explicit emailFrom (GHL would change the From mailbox)`);
+  }
+
+  // 2026-10-15 — the warranty PDFs ride as email attachments (src/agentic/
+  // warranty-request.js). SMS and live chat get links in the text instead
+  // (the user's ruling: a 3 MB scanned PDF by MMS is blocked or mangled).
+  if (channel === 'email' && Array.isArray(opts.attachments) && opts.attachments.length) {
+    msgBody.attachments = opts.attachments;
+  }
+
   const result = await ghlFetch('POST', '/conversations/messages', msgBody);
 
   return {
@@ -1932,7 +1954,12 @@ async function sendViaConversationsAPI(contactId, message, channel, subject, opt
     // 2026-09-02 — durable record of WHO the reply went out as. Railway logs
     // roll off; execution_result does not. Absent for non-email.
     ...(msgBody.emailFrom ? { emailFrom: msgBody.emailFrom } : {}),
-    ...(msgBody.userId ? { emailUserId: msgBody.userId } : {}),
+    ...(msgBody.userId && channel === 'email' ? { emailUserId: msgBody.userId } : {}),
+    // 2026-10-15 — who GHL was asked to show as the sender (the AI user on a
+    // rehash contact). send-delivery-verify reads it back against GHL.
+    ...(sendAs.userId ? { sentAsUserId: sendAs.userId } : {}),
+    ...(opts.aiSender ? { sentAsReason: sendAs.reason } : {}),
+    ...(msgBody.attachments?.length ? { attachments: msgBody.attachments } : {}),
   };
 }
 
@@ -2098,7 +2125,8 @@ async function sendWithFallback(contactId, message, channel, subject, action, op
     }
     // Fallback to Conv API
     try {
-      const result = await sendViaConversationsAPI(contactId, message, channel, subject);
+      // 2026-10-15 — opts too: without them this path dropped fromNumber and the AI sender.
+      const result = await sendViaConversationsAPI(contactId, message, channel, subject, opts);
       if (result) return { result, sendMethod: 'conversations_api_fallback' };
     } catch (err) {
       console.warn(`[SendMessage] Conv API fallback also failed for ${contactId}: ${err.message}`);
@@ -2108,7 +2136,7 @@ async function sendWithFallback(contactId, message, channel, subject, action, op
 
   // primary === 'conversations_api'
   try {
-    const result = await sendViaConversationsAPI(contactId, message, channel, subject);
+    const result = await sendViaConversationsAPI(contactId, message, channel, subject, opts);
     if (result) return { result, sendMethod: 'conversations_api' };
   } catch (err) {
     console.warn(`[SendMessage] Conv API primary failed for ${contactId} (${channel}): ${err.message} — falling back to webhook`);
@@ -2387,6 +2415,7 @@ async function sendCustomerStatusProbe(contactId, generated, action, context, op
     contactId, message, channel, null, action,
     {
       fromNumber: opts.replyContext?.fromNumber || null,
+      aiSender: { tags: context?.lead?.current_tags || [], fromNumber: opts.replyContext?.fromNumber || null, rehashActive: generated?.rehash?.active === true },
       // 2026-08-18 phone guard: same allowed set as the main send path.
       allowedPhones: [
         generated?.resolved_service_phone || null,
@@ -4126,6 +4155,15 @@ export async function executeSendMessage(action, context) {
   }
   fingerprintReply({ action, contactId, message, channel, triggerMessage: replyTriggerMessage, generated, ruleFields });
 
+  // ── The warranty files (2026-10-15, Jeff Clark) ─────────────────
+  // A warranty turn's reply says "here's a copy" (response-generator), and the
+  // files go with it: the links on their own lines on SMS (the user: a 3 MB
+  // scanned PDF by MMS is blocked or mangled), both PDFs attached on email
+  // (src/agentic/warranty-request.js). After every body guard and the
+  // fingerprint, so no length or duplicate check counts the links.
+  const warrantyFiles = Array.isArray(generated?.warranty?.urls) && generated.warranty.urls.length ? generated.warranty.urls : null;
+  if (warrantyFiles && channel !== 'email') message = appendWarrantyLinks(message, warrantyFiles);
+
   // ── Send (v3.3: channel-routed) ────────────────────────────────
   const _tPreSend = Date.now();
   const { result: sendResult, sendMethod } = await sendWithFallback(
@@ -4133,6 +4171,11 @@ export async function executeSendMessage(action, context) {
     {
       fromNumber: replyContext?.fromNumber || null,
       preheader: generated?.preheader || null,
+      // 2026-10-15 — a rehash contact's message shows as the AI user
+      // (src/agentic/ai-sender.js). Decided inside the Conv API send, where
+      // the email sender is known.
+      aiSender: { tags, fromNumber: replyContext?.fromNumber || null, rehashActive: generated?.rehash?.active === true },
+      ...(warrantyFiles && channel === 'email' ? { attachments: warrantyFiles } : {}),
       // 2026-08-18 phone guard: the only numbers this body may contain — the
       // market service phone this generation resolved and the contact's own
       // known number. The sending line is added inside sendWithFallback.
@@ -4180,7 +4223,11 @@ export async function executeSendMessage(action, context) {
     const leadWillCall = leadWillReachOut(replyTriggerMessage || context?.message_text || '');
     const scheduling = generated && !generated.service_conversation && !leadWillCall ? schedulingCallbackDecision({
       bookingClaimBlocked: !!generated.booking_claim_blocked,
-      recommendedAction: analysis.recommended_action || payload.recommended_action || null,
+      // 2026-10-15: a warranty request answered with the files is fulfilled; the
+      // analyzer's escalate_to_rep / callback route for it (document_request)
+      // is not a call we owe. A call the lead asked for still files
+      // (requested_fulfillment phone_call, the classifier's CALLBACK).
+      recommendedAction: warrantyFiles ? null : (analysis.recommended_action || payload.recommended_action || null),
       requestedFulfillment: analysis.requested_fulfillment || null,
       booked: !!inlineBooking?.landed,
       onFile: !!generated.appointment_on_file,
@@ -4631,6 +4678,13 @@ export async function executeSendMessage(action, context) {
     // address out. A row carrying this means the resolver missed and the net
     // caught it; that is worth knowing before the next mailbox is added.
     randy_sender_blocked: sendResult?.randySenderBlocked || null,
+    // 2026-10-15 — who GHL was asked to show as the sender. The AI user on a
+    // rehash contact (src/agentic/ai-sender.js); null = GHL's default, the
+    // contact's assigned user. The dashboard and Bot Review label on it.
+    sent_as_user_id: sendResult?.sentAsUserId || null,
+    sent_as_reason: sendResult?.sentAsReason || null,
+    // 2026-10-15 — the warranty went with this reply (links on SMS, PDFs on email).
+    ...(warrantyFiles ? { warranty_sent: true, warranty_urls: warrantyFiles, warranty_delivery: channel === 'email' ? 'attachments' : 'links' } : {}),
     ai_generated: !!generated,
     intent_class: generated?.intent_class || null,
     classifier_method: generated?.classification_method || null,
