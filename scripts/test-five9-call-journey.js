@@ -1,7 +1,7 @@
 /**
  * test-five9-call-journey.js — the Five9 "Call Journey" report → five9_call_journey
  * (the user's handoff, 2026-10-15). Uses the verbatim sample row from the live
- * report. Covers the Eastern timestamp (EDT and EST), null and "[None]",
+ * report. Covers the Pacific timestamp (PDT and PST), null and "[None]",
  * headers by name (a missing one is a hard failure), transfer legs on one CALL
  * ID, customer_phone for outbound vs inbound, window planning, the idempotent
  * re-run, shadow writing nothing, and the alert when rows come back but none
@@ -10,8 +10,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  resolveJourneyColumns, parseEasternReportTimestamp, normalizeJourneyRow, parseJourneyReport,
-  planJourneyWindows, toEasternCriteriaString, cellText,
+  resolveJourneyColumns, parseReportTimestamp, normalizeJourneyRow, parseJourneyReport,
+  planJourneyWindows, toReportCriteriaString, cellText,
 } from '../src/five9/call-journey.js';
 import {
   runFive9CallJourneySync, runFive9CallJourneyBackfill, journeyAlertState, journeyMode,
@@ -24,7 +24,7 @@ const cols = resolveJourneyColumns(COLUMNS);
 
 test('the sample row normalizes field by field', () => {
   const { row } = normalizeJourneyRow(SAMPLE, cols, COLUMNS);
-  assert.equal(row.call_ts, '2026-10-15T13:10:20.000Z', '9:10:20 AM EDT');
+  assert.equal(row.call_ts, '2026-10-15T16:10:20.000Z', '9:10:20 AM PDT: the webhook has this call at 16:10:20 UTC');
   assert.equal(row.call_id, '300000010540092');
   assert.equal(row.call_type, 'Outbound');
   assert.equal(row.campaign, 'Data - Warm Leads less than 30');
@@ -40,18 +40,18 @@ test('the sample row normalizes field by field', () => {
   assert.equal(row.lp_rec_key, 'INQ427994');
   assert.equal(row.lp_lead_id, '580663');
   assert.equal(row.attempts, 5);
-  assert.equal(row.leg_key, '300000010540092|2026-10-15T13:10:20.000Z|Outbound|2022861482');
+  assert.equal(row.leg_key, '300000010540092|2026-10-15T16:10:20.000Z|Outbound|2022861482');
   assert.equal(row.raw['CALL ID'], '300000010540092');
   assert.equal(row.raw['Number of attempts'], '5');
 });
 
-test('Eastern timestamps: October (EDT, UTC-4) and January (EST, UTC-5); garbage is null', () => {
-  assert.equal(parseEasternReportTimestamp('Thu, 15 Oct 2026 09:10:20').toISOString(), '2026-10-15T13:10:20.000Z');
-  assert.equal(parseEasternReportTimestamp('Mon, 12 Jan 2026 09:10:20').toISOString(), '2026-01-12T14:10:20.000Z');
-  assert.equal(parseEasternReportTimestamp('12 Jan 2026 23:59:59').toISOString(), '2026-01-13T04:59:59.000Z', 'weekday optional');
-  assert.equal(parseEasternReportTimestamp('2026-10-15 09:10:20'), null);
-  assert.equal(parseEasternReportTimestamp('31 Sep 2026 09:00:00'), null, 'no such day');
-  assert.equal(parseEasternReportTimestamp(null), null);
+test('Pacific timestamps: October (PDT, UTC-7) and January (PST, UTC-8); garbage is null', () => {
+  assert.equal(parseReportTimestamp('Thu, 15 Oct 2026 09:10:20').toISOString(), '2026-10-15T16:10:20.000Z');
+  assert.equal(parseReportTimestamp('Mon, 12 Jan 2026 09:10:20').toISOString(), '2026-01-12T17:10:20.000Z');
+  assert.equal(parseReportTimestamp('12 Jan 2026 23:59:59').toISOString(), '2026-01-13T07:59:59.000Z', 'weekday optional');
+  assert.equal(parseReportTimestamp('2026-10-15 09:10:20'), null);
+  assert.equal(parseReportTimestamp('31 Sep 2026 09:00:00'), null, 'no such day');
+  assert.equal(parseReportTimestamp(null), null);
 });
 
 test('null and "[None]" cells are null; attempts is an int or null', () => {
@@ -111,8 +111,8 @@ test('windows: 10-minute overlap, 2-minute lag, cold start 30 minutes, chunks of
   const catchUp = planJourneyWindows({ lastEndMs: now - 14 * 3600_000, nowMs: now });
   assert.equal(catchUp.length, 3, '14h10m behind → 6h + 6h + the rest');
   assert.ok(catchUp.every((x) => x.endMs - x.startMs <= 6 * 3600_000));
-  assert.equal(toEasternCriteriaString(new Date('2026-10-15T13:00:00Z')), '2026-10-15T09:00:00', 'the window runReport reads, in Eastern');
-  assert.equal(toEasternCriteriaString(new Date('2026-01-12T05:00:00Z')), '2026-01-12T00:00:00');
+  assert.equal(toReportCriteriaString(new Date('2026-10-15T16:00:00Z')), '2026-10-15T09:00:00', 'the window runReport reads, in Pacific');
+  assert.equal(toReportCriteriaString(new Date('2026-01-12T08:00:00Z')), '2026-01-12T00:00:00');
 });
 
 /** A fake Supabase with a run log and the upsert function keyed on leg_key. */

@@ -19,7 +19,7 @@
 import { runJob } from '../job-runner.js';
 import { checkRequestSecret } from '../security/request-auth.js';
 import {
-  parseJourneyReport, planJourneyWindows, toEasternCriteriaString, REPORT_ROW_CAP,
+  parseJourneyReport, planJourneyWindows, toReportCriteriaString, REPORT_ROW_CAP,
 } from '../five9/call-journey.js';
 
 export const JOB_ID = 'five9-call-journey-sync';
@@ -68,7 +68,7 @@ async function defaultDeps() {
 async function pullWindow(d, cfg, startMs, endMs, depth = 0) {
   const res = await d.runReportAndWait({
     folder: cfg.folder, name: cfg.name,
-    startIso: toEasternCriteriaString(new Date(startMs)), endIso: toEasternCriteriaString(new Date(endMs)),
+    startIso: toReportCriteriaString(new Date(startMs)), endIso: toReportCriteriaString(new Date(endMs)),
     maxWaitMs: cfg.maxWaitMs,
   });
   if (!res?.done) {

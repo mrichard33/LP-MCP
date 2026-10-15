@@ -2,17 +2,21 @@
 //
 // WHY (the user, 2026-10-15, Call Journey handoff)
 //   The saved report "Shared Reports / Call Journey" lists every call leg
-//   Five9 placed or took, unanswered and busy dials included, which the
-//   five9_events_raw webhook mirror never sees (69 calls for 13:00-13:16 UTC
-//   against 150 in the report). One row per leg gives every lead its
-//   dial-by-dial history and is the basis for auditing the 3-in-24 cap.
+//   Five9 placed or took, with the list, skill, attempt count and LPRecKey of
+//   each, and transfer / conference legs as their own rows. One row per leg
+//   gives every lead its dial-by-dial history and is the basis for auditing
+//   the 3-in-24 cap. (The handoff's "69 webhook calls against 150" compared
+//   13:00-13:16 UTC with the report's 09:00-09:16, which is PACIFIC: for the
+//   same 16 minutes five9_events_raw holds 159 calls against ~162 legs.)
 //   This is NOT the CI "Call Log" report (src/ci/*, ci_calls): a different
 //   report, a different zone, and untouched.
 //
-// THE REPORT (verified 2026-10-15)
-//   Its time zone is set to EASTERN in Five9: the window passed to runReport
-//   is read in Eastern, and TIMESTAMP cells ("Thu, 15 Oct 2026 09:10:20") are
-//   Eastern wall clock. Columns, resolved BY NAME (a missing one is a hard
+// THE REPORT (verified 2026-10-15 against five9_events_raw)
+//   Its time zone is PACIFIC, not Eastern as the handoff said: the window
+//   passed to runReport is read in Pacific, and TIMESTAMP cells ("Thu, 15 Oct
+//   2026 09:10:20") are Pacific wall clock. Call 300000010540092 prints
+//   09:10:20 and its webhook call_start_at is 16:10:20 UTC. Read as Eastern,
+//   every window asked for a time 3 hours ahead and came back empty. Columns, resolved BY NAME (a missing one is a hard
 //   failure, never a shifted column):
 //     TIMESTAMP, DNIS, LPRecKey, lead_id, CAMPAIGN, LIST NAME, SKILL,
 //     CALL TYPE, DISPOSITION, AGENT NAME, Number of attempts, ANI, CALL ID
@@ -23,7 +27,7 @@
 import { zonedWallClockToUtc } from '../ci/time.js';
 import { teamFromName, stripTeamSuffix } from '../ci/teams.js';
 
-export const JOURNEY_TZ = 'America/New_York';
+export const JOURNEY_TZ = 'America/Los_Angeles';
 export const REPORT_ROW_CAP = 50_000;
 
 /** Every header the report must carry, and the field each one feeds. */
@@ -66,12 +70,12 @@ export function resolveJourneyColumns(columns) {
 }
 
 /**
- * "Thu, 15 Oct 2026 09:10:20" (weekday optional) on the Eastern wall clock →
+ * "Thu, 15 Oct 2026 09:10:20" (weekday optional) on the report's Pacific wall clock →
  * a UTC Date, daylight saving aware. Anything else → null (the caller counts
  * it as a reject and alerts; a parser that silently returned null for every
  * row once meant zero inserts and no error).
  */
-export function parseEasternReportTimestamp(text) {
+export function parseReportTimestamp(text) {
   const s = String(text ?? '').trim();
   const m = /^(?:[A-Za-z]{3},\s*)?(\d{1,2})\s+([A-Za-z]{3})\s+(\d{4})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?$/.exec(s);
   if (!m) return null;
@@ -105,7 +109,7 @@ export function normalizeJourneyRow(cells, cols, columns) {
   const get = (field) => cellText(cells?.[cols[field]]);
   const tsText = get('timestamp');
   if (!tsText) return { reject: 'no_timestamp' };
-  const ts = parseEasternReportTimestamp(tsText);
+  const ts = parseReportTimestamp(tsText);
   if (!ts) return { reject: 'bad_timestamp' };
   const callId = get('call_id');
   if (!callId) return { reject: 'no_call_id' };
@@ -165,8 +169,8 @@ export function parseJourneyReport({ columns, rows }) {
   return out;
 }
 
-/** An instant as the Eastern wall-clock string runReport reads: 'YYYY-MM-DDTHH:MM:SS'. */
-export function toEasternCriteriaString(date) {
+/** An instant as the Pacific wall-clock string runReport reads: 'YYYY-MM-DDTHH:MM:SS'. */
+export function toReportCriteriaString(date) {
   const p = Object.fromEntries(new Intl.DateTimeFormat('en-US', {
     timeZone: JOURNEY_TZ, hourCycle: 'h23',
     year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit',
