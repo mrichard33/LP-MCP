@@ -213,7 +213,12 @@ function vagueRun(inbound = []) {
 const BARE_PICK_RX = /^\s*(?:ok(?:ay)?,?\s+|yes,?\s+|sure,?\s+)?(?:the\s+)?(?:first|second|1st|2nd|earlier|later|either)(?:\s+one)?(?:\s+(?:works|please|is\s+good))?\s*[.!]*\s*$/i;
 const NEITHER_RX = /\b(?:neither|none\s+of\s+(?:those|them)|(?:those|that)\s+(?:times?\s+)?(?:don'?t|won'?t|doesn'?t)\s+work|can'?t\s+do\s+(?:either|those|that)|not\s+(?:those|that)\s+(?:days?|times?))\b/i;
 // "Wednesdays" too (Oct 2 6:12 PM chat: the plural missed this and the day ask was not read as answered).
-const DAY_OR_TIME_RX = /\b(?:mon|tues?|wed(?:nes)?|thurs?|fri|sat(?:ur)?|sun)(?:day)?s?\b|\bweekends?\b|\btomorrow\b|\btoday\b|\b\d{1,2}(?::\d{2})?\s*(?:am|pm|a\.m\.|p\.m\.)\b|\b(?:morning|afternoon|evening)\b|\bthe\s+(?:first|second|earlier|later)\s+one\b|\beither\b/i;
+// 2026-10-15 (Guest Visitor pkjiz): a calendar date is a day too. "24th" and
+// "October 24th", answering "Sat, Oct 17 … or Sat, Oct 24 …", matched nothing
+// here, so the planner re-offered the same two times, then asked "What day
+// works best?", then offered them again. Month + day, an ordinal day, and m/d.
+const DATE_MENTION_SRC = String.raw`\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\.?\s+(?:the\s+)?\d{1,2}(?:st|nd|rd|th)?\b|(?:^|[^\d/:$])(?:[4-9]|[12]\d|3[01])(?:st|nd|rd|th)\b|(?:^|[^\d/])(?:0?[1-9]|1[0-2])\s*\/\s*(?:0?[1-9]|[12]\d|3[01])(?![\d/])`;
+const DAY_OR_TIME_RX = new RegExp(String.raw`\b(?:mon|tues?|wed(?:nes)?|thurs?|fri|sat(?:ur)?|sun)(?:day)?s?\b|\bweekends?\b|\btomorrow\b|\btoday\b|\b\d{1,2}(?::\d{2})?\s*(?:am|pm|a\.m\.|p\.m\.)\b|\b(?:morning|afternoon|evening)\b|\bthe\s+(?:first|second|earlier|later)\s+one\b|\beither\b|${DATE_MENTION_SRC}`, 'i');
 
 // The problem in their words, for the echo and the bridge.
 const PROBLEM_RX = /\b(drafty|drafts?|fogg(?:y|ing)|fogged|condensation|moisture|leak(?:s|ing|y)?|noisy|noise|hot|heat|old|ugly|stuck|sticks?|sticking|broken|cracked|rott?(?:ed|ing)?|seals?|hurricanes?|storms?|insurance|electric\s+bill|energy\s+bills?|security|break-?ins?)\b/gi;

@@ -342,6 +342,25 @@ export function offeredSlots(offerText, freeSlots) {
 }
 
 /**
+ * Did the visitor name this slot's calendar date by its day number? Pure.
+ * 2026-10-15 (Guest Visitor pkjiz): "24th" and "October 24th" were answers to
+ * "Sat, Oct 17 … or Sat, Oct 24 …" and read as no pick, so the bot asked the
+ * same question three times. Counts "24th", "the 24th", "10/24", and a bare
+ * "24" only when it is the whole message (a bare number is otherwise a count
+ * or a time).
+ */
+export function slotDateMentioned(text, slot, dayNum = null) {
+  const s = String(text || '').toLowerCase();
+  const fromLabel = (String(slot?.day || '').match(/(\d{1,2})$/) || [])[1] || '';
+  const day = String(dayNum != null ? dayNum : fromLabel);
+  if (!day) return false;
+  const month = (String(slot?.iso || '').match(/^\d{4}-(\d{2})-/) || [])[1];
+  if (new RegExp(`(?:^|[^\\d/:$])${day}(?:st|nd|rd|th)\\b`).test(s)) return true;
+  if (month && new RegExp(`(?:^|[^\\d/])0?${Number(month)}\\s*/\\s*0?${day}(?![\\d/])`).test(s)) return true;
+  return new RegExp(`^\\s*(?:the\\s+)?${day}\\s*[.!]*\\s*$`).test(s);
+}
+
+/**
  * Which offered slot the visitor picked, or null. Pure.
  * "the first one", "2", "Tuesday", "Oct 6", "10am", and for a single offer
  * "yes" / "that works".
@@ -369,10 +388,15 @@ export function pickSlot(text, offered) {
     const hour = String(slot.time || '').toLowerCase().match(/^(\d{1,2})(?::(\d{2}))?\s*([ap])m/);
     return (dow && s.includes(dow))
       || (dow && s.includes(dow.slice(0, 3)) && /\b(?:mon|tue|wed|thu|fri|sat|sun)\b/.test(s))
-      || (mon && day && new RegExp(`\\b${mon}\\w*\\s+${day}\\b`).test(s))
+      // 2026-10-15 (Guest Visitor pkjiz): "October 24th" missed — the ordinal
+      // suffix broke the word boundary after the day number.
+      || (mon && day && new RegExp(`\\b${mon}\\w*\\.?\\s+(?:the\\s+)?${day}(?:st|nd|rd|th)?\\b`).test(s))
+      || (day && slotDateMentioned(s, slot, day))
       || (hour && new RegExp(`\\b${hour[1]}(?::${hour[2] || '00'})?\\s*${hour[3]}\\.?m?\\b|\\b${hour[1]}\\s*o'?clock\\b`).test(s));
   });
-  return hits.length === 1 ? hits[0] : null;
+  if (hits.length === 1) return hits[0];
+  // Two offers on the same calendar date and they named only the date: no pick.
+  return null;
 }
 
 export function movedLine(slot, tzLabelText = 'ET') {
