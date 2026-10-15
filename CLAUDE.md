@@ -282,7 +282,27 @@ and an LP re-set. Now:
   the user, 2026-10-09): that tag is read ONLY for this, since GHL workflows own it (F.0 adds it, S1.1/S1.3/S4.5/A.WE
   remove it); it never puts a contact in rehash, refuses a visit or touches Five9 (`hasPostAppointmentStage`).
 - `REHASH_ROUTING_MODE` off|shadow|live, default shadow (`rehash.would_*` events only). The LP lock is not behind it.
-- **The rehash card follows what the lead said (John Manieri, 2026-10-14).** All 14 "said yes to a call" cards of
+- **A post-demo objection gets one ask-back, one bridge, then a person; two no's stop the selling (Shawn Eastman,
+2026-10-15).** "We like your product the best, but … twice the cost of our other estimates" got three rebuttals ("cheaper
+bids usually cut something … folks end up replacing in five years"), more selling after "Not at this time. Thanks", and
+"This is obviously an AI bot. Stop texting". `planPostDemo` returned before every objection rule and the only stop was the
+track's two no's IN A ROW. Now, after `competitor_signed` and `defer`:
+- **Stop:** two no's in the session (`isPostDemoNo`: a soft no like "not at this time" / "we're good" counts only as the
+  answer to our offer or track question) or the track's `stop` → `post_demo_stop` with `plan.handoff` `rehash_stop`. It is
+  STICKY: after our "I'm here if anything changes." every turn stays stopped until the lead asks a question, a time or a
+  call. The bot still answers; no stop-bot.
+- **Ladder**, rehash line only (a post-demo lead off it may be SOLD) (`postDemoObjection`; any objection counts,
+  price first): attempt 1 → `rehash_objection`, the ask-back
+  (`POST_DEMO_ASK_BACK`, a reference move); 2 → the bridge with two real Rehash Call times (`rehash_offer`, "best deal"
+  once) or "Would that help?" without times; 3+ → `rehash_repeat_objection` ("I'll have {rep} take a look at it and reach
+  out", no offer). Both hand-offs are `NO_DIAL_REASONS` and post to #contact-rehash only (`REHASH_REASONS`).
+- **Guard:** `enforceNepqPlan` drops `POST_DEMO_REBUTTAL_RX` sentences and, off a hand-off / `rehash_offer` /
+  `rehash_confirm` step, `UNPROMISED_FOLLOW_UP_RX` ("someone from our team will reach out"); the plan's own line is never
+  dropped and an empty body is never the rebuttal. checkReply: `post_demo_rebuttal`, `post_demo_unbacked_follow_up`,
+  `question_after_post_demo_stop` (`ctx.postDemoStep`). Rule 234 `LAYER3_PRICE_ANXIETY` skips post-demo tags (the same
+  incident enrolled S5.2 v2 calculator_downsell beside O.0).
+
+**The rehash card follows what the lead said (John Manieri, 2026-10-14).** All 14 "said yes to a call" cards of
   10-10..10-14 came from `lp-requeue.js`'s rehash branch, which posted with a hard-coded `agreed: true`; 0 of the 14 had
   agreed to a call (most wanted the quote emailed). `routeRehashReply` (`src/notifications/rehash-call.js`) classifies the
   lead's words (`classifyRehashReply`, `src/agentic/rehash-intent.js`, pure): a call request → the call card; a quote ask →
@@ -581,7 +601,11 @@ them), and HL-MCP's `contact.replied` copy is read by no rule, so "processed" th
 job-registry) compares the HL mirror's `messages` (types 2/3) with our `ghl.reply_received` / `reply_channel_excluded`
 and runs a missed one, 90s+ old, through `processInboundReply` (the webhook's own pipeline, every gate), claimed once
 (`inbound_sweep_<id>`). No Slack; `agentic.missed_inbound_redriven`. `MISSED_INBOUND_SWEEP_MODE` off|shadow|live,
-default live (the user).
+default live (the user). **An answered text is never re-driven (Shawn Eastman, 2026-10-15).** I.L3-IN relays a newline
+as the two characters `\n` and the mirror keeps the real one, so every multi-line text missed its own event and got a
+second answer ~10 min later (2 of 2 re-drives that day). `normalizeText` reads the escapes and NBSP as spaces, and a
+message the bot queued or sent a `send_message` for (LP `agent_actions`, within `ANSWERED_AFTER_MS`, 15 min) is answered
+whatever its text looks like. The mirror cannot tell a bot send from a workflow drip, so never read its outbound rows for this.
 
 **A linked contact gets its name from LP, fill-empty-only (2026-10-11).** a9eG41qtxCqMEXxbbD2l reached a demo with no
 name while LP lead 581424 said Andrew Marcus: the backstop wrote names only on create, and `/n8n/enrich-lead` read them

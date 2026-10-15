@@ -31,10 +31,10 @@ import { findUnbackedBookingClaim } from '../agentic/booking-claim.js';
 import { enforceCallTiming, promisedCallback, enforceRehashCallTiming } from '../agentic/team-hours.js';
 import { enforceOneAsk } from '../agentic/one-ask.js';
 import { isLeadSignOff } from '../agentic/sign-off.js';
-import { dropUnaskedCallOffer, leadWantsCall, isMoneyFigure, URGENCY_RX, CLAIMS_RX } from '../agentic/nepq-planner.js';
+import { dropUnaskedCallOffer, leadWantsCall, isMoneyFigure, URGENCY_RX, CLAIMS_RX, POST_DEMO_REBUTTAL_RX, UNPROMISED_FOLLOW_UP_RX } from '../agentic/nepq-planner.js';
 
 /** Bump when a check is added or changed, so scorecards from two versions are not compared as one. */
-export const INVARIANTS_VERSION = '2026-10-15.1';
+export const INVARIANTS_VERSION = '2026-10-15.2';
 
 /** The prompt's own SMS ceiling (CHANNEL CONSTRAINTS: "320 max"). */
 export const SMS_MAX_CHARS = 320;
@@ -67,6 +67,7 @@ function sentences(text) {
  * @param {boolean}[ctx.callOfferOk]    the plan's goal is a call (a post-demo lead), so an offer is never unasked
  * @param {boolean}[ctx.rehash]         a rehash (post-demo) lead; undefined skips the rehash call-timing check
  * @param {boolean}[ctx.callbackFiled]  this turn filed a callback (a hand-off): any call it promises is backed
+ * @param {string} [ctx.postDemoStep]   the post-demo plan's step; null = not a post-demo turn; undefined skips the post-demo checks
  * @param {boolean}[ctx.warrantySent]   this turn sends the warranty files; undefined skips the warranty-claim check
  * @returns {{ pass: boolean, violations: Array<{code: string, detail: string}>, skipped: string[], metrics: {chars: number, questions: number} }}
  */
@@ -193,6 +194,17 @@ export function checkReply(reply, ctx = {}) {
   // it (src/agentic/warranty-request.js).
   if (ctx.warrantySent === undefined) skipped.push('warranty_claim');
   else if (ctx.warrantySent !== true && claimsWarrantySent(text)) fail('warranty_claim_without_file', text);
+
+  // ── a post-demo lead is asked, never argued with (2026-10-15, Shawn Eastman) ──
+  // No rebuttal, no "someone will reach out" outside a hand-off, and nothing
+  // asked once the bot stopped (nepq-planner.js planPostDemo / enforceNepqPlan).
+  if (ctx.postDemoStep === undefined) skipped.push('post_demo');
+  else if (ctx.postDemoStep) {
+    const said = sentences(text);
+    if (said.some(s => POST_DEMO_REBUTTAL_RX.test(s))) fail('post_demo_rebuttal', text);
+    if (!['handoff', 'rehash_confirm', 'rehash_offer'].includes(ctx.postDemoStep) && said.some(s => UNPROMISED_FOLLOW_UP_RX.test(s))) fail('post_demo_unbacked_follow_up', text);
+    if (ctx.postDemoStep === 'post_demo_stop' && text.includes('?')) fail('question_after_post_demo_stop', text);
+  }
 
   // ── the same two times, never a third time (2026-10-13) ────────────────
   if (!Array.isArray(ctx.conversation)) skipped.push('repeat_slot_offer');
