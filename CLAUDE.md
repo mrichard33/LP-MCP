@@ -464,6 +464,15 @@ and a gendered pronoun; one re-write, then fixed sentences (`fallbackBrief`). It
 `LP_REP_BRIEF_TIMEOUT_MS` (20s, inside GHL's 60s), and in `create_lp_lead`. Dry run:
 `node scripts/render-rep-brief.js <contact id>`. Never add a chat log, an opener or a relative day back to it.
 
+**Vendor lead reports read live data; LP report 135 is only a cross-check (handoff, 2026-10-15).** n8n "06 VDR" sent
+nothing from 2026-10-13: every send waited on the 135 (Lead Disposition Detail 2) email. Now each due vendor gets
+`GET /vdr/report.xlsx?vendor_id=&as_of=` (`src/vdr/`, operator token), built from `rpc/vdr_vendor_report` (lp_leads +
+lp_lead_market_assignments + Five9 only, never `call_count`): Summary (every number a COUNTIF/COUNTIFS/SUMIFS formula
+over the Leads tab), Leads (one row per lead, never an LP lead id, rep or setter) and Definitions. The window is whole
+ET days, as_of's date minus lookback through as_of's date (that reproduces the approved prototype; a timestamp cut does
+not). n8n blocks a send when `X-VDR-Lead-Synced-At` is 6h+ old and lists a 135 gap over 2% (`X-VDR-Feed-Leads`) in
+Mark's summary, never blocking on it. exceljs drops a cached formula result of 0; Excel recalculates on open.
+
 ## Consent (2026-09-28)
 
 `contact_consent` / `consent_events` (sql/136–139) are the record of who may be contacted and why not.

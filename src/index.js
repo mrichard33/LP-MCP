@@ -362,6 +362,7 @@ import { registerHoldCompleteRoutes } from './agentic/hold-complete.js';
 import { registerLiveChatRoutes } from './live-chat/index.js';
 import { registerSimulatorRoutes } from './tools/simulator-tools.js';
 import { registerLeadStageRoutes } from './admin/lead-stage-routes.js';
+import { registerVdrReportRoutes } from './vdr/report-route.js';
 // 2026-10-01 — answers a live chat message GHL never sent us (a contact merge drops the webhook).
 import { startLiveChatMissedReplyScheduler } from './jobs/live-chat-missed-reply-sweep.js';
 import { startMissedInboundScheduler } from './jobs/missed-inbound-sweep.js';  // 2026-10-15
@@ -931,6 +932,7 @@ registerP2UnresolvableRoutes(app);
 registerTagHygieneRoutes(app, authenticate);
 registerCleanup20261002Routes(app, authenticate);
 registerCiRoutes(app, authenticate);            // 2026-08-21 — Call Intelligence ingest (PR 2; worker ships disarmed)
+registerVdrReportRoutes(app, { authenticate }); // 2026-10-15 — Vendor Lead Report v2: GET /vdr/report.xlsx (n8n 06 VDR)
 
 const server = app.listen(PORT, async () => {
   console.log(`LP MCP Server v${SERVER_VERSION} running on port ${PORT}`);
