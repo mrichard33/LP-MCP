@@ -3,7 +3,11 @@
  *
  * WHAT THIS IS
  *   Trailing-90d set-to-sale per market from lp_market_scorecard_daily, turned
- *   into a multiplier the ranker scales open slots by:
+ *   into a multiplier. Since 2026-10-15 (the user) the ranker uses it ONLY to
+ *   break an exact tie on confirmed ÷ requested: the higher multiplier (better
+ *   conversion) dials first. It never reorders markets whose fill differs.
+ *   Before that it scaled open slots; the history below is kept for why the
+ *   number itself is computed the way it is:
  *
  *     perf_multiplier = clamp(1 + W × (market_set_to_sale / company - 1), 0.85, 1.15)
  *
@@ -202,7 +206,7 @@ export function _resetPerfCache() { cache = null; }
  * Read, dedupe, aggregate and weight — memoised for PERF_MEMO_MS.
  *
  * FAILS OPEN. A query error returns {} and logs, which rankMarkets reads as
- * "every multiplier is 1.0" — pure open-slot order. A scorecard outage must
+ * "every multiplier is 1.0" — ties break on market code. A scorecard outage must
  * degrade the ranking to unweighted, never take the ranker down: the floor
  * still needs a dial order.
  */
@@ -228,7 +232,7 @@ export async function getMarketPerformance({
     if (rows && !Array.isArray(rows) && Array.isArray(rows.rows)) rows = rows.rows;
     if (!Array.isArray(rows)) rows = [];
   } catch (err) {
-    log(`[MarketPerformance] WARN scorecard read FAILED — ranking falls back to unweighted open slots: ${err.message}`);
+    log(`[MarketPerformance] WARN scorecard read FAILED — fill ties break on market code: ${err.message}`);
     return {};
   }
 
@@ -241,42 +245,4 @@ export async function getMarketPerformance({
     .join(' ');
   log(`[MarketPerformance] window_start=${windowStart} W=${weight} min_sets=${minSets} company=${(value._company.set_to_sale * 100).toFixed(1)}% ${summary}`);
   return value;
-}
-
-/* ─── Starvation history ─────────────────────────────────────────────────── */
-
-/**
- * Consecutive BOTTOM-HALF placements per market, reading applied rankings most
- * recent first. PURE.
- *
- * A market sitting mid-table indefinitely never gets worked, however sound the
- * score that put it there. This counts how long that has been true so the
- * ranker can force it up for one cycle.
- *
- * Bottom half of n ranked markets is rank > n/2 — for the six LP markets
- * that is ranks 4 through 7. The FIRST top-half placement stops the count:
- * the streak is consecutive by definition, so an older run of bottom-half
- * placements behind a top-half one does not carry forward.
- *
- * @param {Array<{ranking:Array<{market:string, rank:number}>}>} history
- *        applied = true rows, most recent first.
- */
-export function countBottomHalfStreaks(history) {
-  const streaks = {};
-  const stopped = new Set();
-
-  for (const entry of history || []) {
-    const ranking = entry?.ranking;
-    if (!Array.isArray(ranking) || ranking.length === 0) continue;
-    const size = ranking.length;
-    for (const r of ranking) {
-      const code = String(r?.market ?? '').trim();
-      if (!code || stopped.has(code)) continue;
-      const rank = Number(r?.rank);
-      if (!Number.isFinite(rank)) continue;
-      if (rank > size / 2) streaks[code] = (streaks[code] || 0) + 1;
-      else stopped.add(code); // top half — the streak ends here
-    }
-  }
-  return streaks;
 }

@@ -62,18 +62,18 @@
  * Always inserts one dial_priority_log row. If the table is missing (sql/080
  * not applied) the route answers 500 with a message that says so.
  *
- * SCORING (see src/capacity/rankMarkets.js): markets are ranked on
- * score = open_true × perf_multiplier, DESCENDING — absolute open slots,
- * scaled by a clamped trailing-90d conversion weight from
- * src/capacity/marketPerformance.js. Both the performance read and the
- * starvation history are best-effort: either failing degrades the ranking
- * (unweighted, or no promotion) and adds a warning, never a 500. The floor
- * always gets a dial order.
+ * SCORING (see src/capacity/rankMarkets.js; the user, 2026-10-15): markets
+ * are ranked on confirmed ÷ requested, LOWEST first. Set / hopper
+ * appointments and appointments still needed do not count. An exact tie
+ * breaks on the trailing-90d conversion ranking from
+ * src/capacity/marketPerformance.js. That read is best-effort: failing, ties
+ * break on market code and a warning is added, never a 500. The floor always
+ * gets a dial order.
  *
- * Response: { slot_date, ranking:[{market, rank, score, open_true,
- *             perf_multiplier, set_to_sale, starvation_promoted, fill_pct,
- *             flags[]}], unknown:[], changed, applied, mode, perf_weight,
- *             perf_baseline, scoring_basis, ... }
+ * Response: { slot_date, ranking:[{market, rank, fill_pct, confirmed,
+ *             requested, still_needed, set_pending, perf_multiplier,
+ *             set_to_sale, flags[]}], unknown:[], changed, applied, mode,
+ *             perf_weight, perf_baseline, scoring_basis, ... }
  */
 
 import supabase from '../supabase.js';
@@ -85,13 +85,13 @@ import {
 import { tryAcquireLock, releaseLock } from '../services/outbound-locks.js';
 import { reportAlertCondition, sendAlertMessage, FLAP_SUSTAIN_MS } from '../alert-state.js';
 import {
-  rankMarkets, isMaterialChange, DEFAULT_SWAP_MARGIN, DEFAULT_HOPPER_WEIGHT, MARKET_CODES,
+  rankMarkets, isMaterialChange, DEFAULT_SWAP_MARGIN, MARKET_CODES,
 } from '../capacity/rankMarkets.js';
 import {
   applyDialPriority, CAMPAIGNS, TIERS, isCycling, restartCampaignVerified, DEFAULT_RESTART,
 } from '../capacity/applyDialPriority.js';
 import {
-  getMarketPerformance, countBottomHalfStreaks, resolvePerfWeight,
+  getMarketPerformance, resolvePerfWeight,
 } from '../capacity/marketPerformance.js';
 
 const TIMEZONE = 'America/New_York';
@@ -113,18 +113,14 @@ export function resolveMode(raw = process.env.CAPACITY_RANKER_MODE) {
   return String(raw || 'shadow').trim().toLowerCase() === 'live' ? 'live' : 'shadow';
 }
 
-export function resolveSwapMargin(raw = process.env.CAPACITY_RANKER_SWAP_MARGIN) {
+/**
+ * Fill-gap margin in PERCENTAGE POINTS (2026-10-15). A new env name on
+ * purpose: CAPACITY_RANKER_SWAP_MARGIN held SLOTS under the old open-slot
+ * scoring, and reading it here would silently change its meaning.
+ */
+export function resolveSwapMargin(raw = process.env.CAPACITY_RANKER_SWAP_MARGIN_PCT) {
   const n = parseFloat(raw);
   return Number.isFinite(n) && n >= 0 ? n : DEFAULT_SWAP_MARGIN;
-}
-
-/**
- * How much one hopper appointment fills a slot (2026-10-09: 0.5, the user's
- * ruling — a confirmed appointment counts 1). See rankMarkets.js.
- */
-export function resolveHopperWeight(raw = process.env.RANKER_HOPPER_WEIGHT) {
-  const n = parseFloat(raw);
-  return Number.isFinite(n) && n >= 0 ? n : DEFAULT_HOPPER_WEIGHT;
 }
 
 const MISSING_TABLE_RE = /does not exist|could not find the table|schema cache|42P01|PGRST205/i;
@@ -167,28 +163,6 @@ async function readLastAppliedLive() {
   }
   const row = data?.[0];
   return row ? { id: row.id, ran_at: row.ran_at, slot_date: row.slot_date, ranking: row.ranking, unknown: row.unknown_markets } : null;
-}
-
-/**
- * Recent APPLIED rankings, most recent first — the starvation guard's memory.
- *
- * Only applied rows count: a shadow or refused run never pointed the floor
- * anywhere, so it cannot have starved anybody. `limit` is small because the
- * guard only ever looks at a streak of a few.
- */
-async function readAppliedHistoryLive(limit = 10) {
-  if (!supabase) throw new Error('Supabase not configured');
-  const { data, error } = await supabase
-    .from(TABLE)
-    .select('ranking')
-    .eq('applied', true)
-    .order('ran_at', { ascending: false })
-    .limit(limit);
-  if (error) {
-    if (isMissingTable(error)) throw new MissingTableError(error);
-    throw new Error(`${TABLE} history read failed: ${error.message}`);
-  }
-  return (data || []).map((r) => ({ ranking: r.ranking }));
 }
 
 async function insertLogLive(row) {
@@ -461,7 +435,6 @@ async function runRankerLocked(slotDate, deps = {}) {
   const {
     fetchCapacity = fetchCapacityLive,
     readLastApplied = readLastAppliedLive,
-    readAppliedHistory = readAppliedHistoryLive,
     getPerformance = getMarketPerformance,
     insertLog = insertLogLive,
     readCycleDisabledUntil = readCycleDisabledUntilLive,
@@ -470,7 +443,6 @@ async function runRankerLocked(slotDate, deps = {}) {
     mode = resolveMode(),
     swapMargin = resolveSwapMargin(),
     perfWeight = resolvePerfWeight(),
-    hopperWeight = resolveHopperWeight(),
     now = new Date(),
     log = console.log,
   } = deps;
@@ -479,30 +451,17 @@ async function runRankerLocked(slotDate, deps = {}) {
 
   const capacity = await fetchCapacity(slotDate);
 
-  // Performance weighting and the starvation history are both BEST EFFORT. A
-  // failure in either degrades the ranking (to unweighted, or to no starvation
-  // promotion) but must never take the ranker down — the floor still needs a
-  // dial order. getMarketPerformance already fails open internally; the
-  // history read is wrapped here for the same reason.
+  // Performance only breaks an exact tie on confirmed % (2026-10-15). It is
+  // BEST EFFORT: a failure leaves ties to the market code and must never take
+  // the ranker down — the floor still needs a dial order.
+  // getMarketPerformance already fails open internally.
   const performance = await getPerformance({ asOf: todayET(now), weight: perfWeight, log });
   if (!Object.keys(performance).length) {
-    warnings.push('market performance unavailable — ranking on unweighted open slots (every multiplier 1.0)');
+    warnings.push('market performance unavailable — an exact tie on confirmed % breaks on market code');
   }
 
-  let starvationStreaks = {};
-  try {
-    starvationStreaks = countBottomHalfStreaks(await readAppliedHistory());
-  } catch (err) {
-    warnings.push(`starvation history unavailable (${err.message}) — no starvation promotion this run`);
-  }
-
-  const { ranking, unknown } = rankMarkets(capacity.rows, { performance, starvationStreaks, hopperWeight });
+  const { ranking, unknown } = rankMarkets(capacity.rows, { performance });
   const rankResult = { ranking, unknown };
-
-  const starved = ranking.filter((r) => r.starvation_promoted).map((r) => r.market);
-  if (starved.length) {
-    warnings.push(`starvation guard promoted ${starved.join(', ')} to rank 2 — bottom-half in 3+ consecutive applied rankings with zero confirmed`);
-  }
   const unmapped = unknown.filter((u) => u.reason === 'unmapped_market').map((u) => u.market);
   if (unmapped.length) {
     warnings.push(`capacity source returned market codes outside the mapping: ${unmapped.join(', ')} — not ranked; mapping is ${MARKET_CODES.join(', ')}`);
@@ -577,8 +536,8 @@ async function runRankerLocked(slotDate, deps = {}) {
     }
   }
 
-  const summary = ranking.map((r) => `${r.rank}.${r.market}(${r.open_true}open×${r.perf_multiplier.toFixed(3)}=${r.score}${r.flags.length ? ' ' + r.flags.join('+') : ''})`).join(' ');
-  log(`[CapacityRanker] slot_date=${slotDate} mode=${mode} hopper_weight=${hopperWeight} changed=${changed} applied=${applied} ranking=${summary} unknown=${unknown.map((u) => u.market).join(',') || '-'}`);
+  const summary = ranking.map((r) => `${r.rank}.${r.market}(${r.confirmed}/${r.requested}=${r.fill_pct}%×${r.perf_multiplier.toFixed(3)}${r.flags.length ? ' ' + r.flags.join('+') : ''})`).join(' ');
+  log(`[CapacityRanker] slot_date=${slotDate} mode=${mode} basis=confirmed_fill_pct changed=${changed} applied=${applied} ranking=${summary} unknown=${unknown.map((u) => u.market).join(',') || '-'}`);
 
   const logId = await insertLog({
     slot_date: slotDate,
@@ -589,7 +548,7 @@ async function runRankerLocked(slotDate, deps = {}) {
     mode,
     error_message: errorMessage,
     perf_weight: perfWeight,
-    scoring_basis: 'open_true_weighted',
+    scoring_basis: 'confirmed_fill_pct',
     cycled: applyResult ? Object.values(applyResult.campaigns || {}).some((c) => c.cycled) : false,
     downtime_ms: applyResult
       ? Object.values(applyResult.campaigns || {}).reduce((a, c) => a + (c.downtime_ms || 0), 0) || null
@@ -607,15 +566,14 @@ async function runRankerLocked(slotDate, deps = {}) {
       ranking: ranking.map((r) => ({
         market: r.market,
         rank: r.rank,
-        score: r.score,
-        open_true: r.open_true,
-        perf_multiplier: r.perf_multiplier,
-        set_to_sale: r.set_to_sale,
-        starvation_promoted: r.starvation_promoted,
-        fill_pct: r.fill_pct, // kept for dashboard parity — no longer the sort key
-        requested: r.requested,
+        fill_pct: r.fill_pct, // THE sort key: confirmed ÷ requested, lowest first
+        score: r.score,       // same number, kept for older readers
         confirmed: r.confirmed,
-        set_pending: r.set_pending,
+        requested: r.requested,
+        still_needed: r.still_needed, // reported only — does not rank
+        set_pending: r.set_pending,   // reported only — the hopper does not rank
+        perf_multiplier: r.perf_multiplier, // breaks an exact fill tie only
+        set_to_sale: r.set_to_sale,
         flags: r.flags,
       })),
       unknown,
@@ -623,9 +581,8 @@ async function runRankerLocked(slotDate, deps = {}) {
       change_reasons: material.reasons,
       applied,
       mode,
-      scoring_basis: 'open_true_weighted',
+      scoring_basis: 'confirmed_fill_pct',
       perf_weight: perfWeight,
-      hopper_weight: hopperWeight,
       perf_baseline: performance?._company
         ? { set_to_sale: performance._company.set_to_sale, sets: performance._company.sets, sales: performance._company.sales }
         : null,

@@ -1,11 +1,12 @@
 /**
  * test-capacity-ranker.js — capacity-driven Five9 list priority ranker.
  *
- * THE RULE UNDER TEST (pre-merge board — see PRE_MERGE_MARKETS): Lakeland on 2026-09-04 read 0.0 % filled (0 of 2
- * requested) with 3 appointments already pending — open_true = -1. A naive
- * fill-% sort ranks it FIRST and points the whole floor at a market with
- * nothing to sell. It must rank LAST. Fort Myers (1/43, 39 truly open) ranks
- * first.
+ * THE RULE UNDER TEST (the user, 2026-10-15): markets are ranked on
+ * confirmed ÷ requested from the Appointment Capacity board, LOWEST first.
+ * Set / hopper appointments and appointments still needed play no part. An
+ * exact tie breaks on the market conversion ranking (perf_multiplier), then
+ * market code. Supersedes the open-slot scoring of 2026-09-05 and the
+ * half-weight hopper of 2026-10-09.
  *
  * Pure — no Supabase, no Five9, no network. Every I/O seam is injected.
  * Run: node --test scripts/test-capacity-ranker.js
@@ -17,8 +18,9 @@ import assert from 'node:assert/strict';
 import {
   rankMarkets,
   isMaterialChange,
+  compareFill,
   MARKET_CODES,
-  DEFAULT_HOPPER_WEIGHT,
+  DEFAULT_SWAP_MARGIN,
 } from '../src/capacity/rankMarkets.js';
 import {
   computeListBlock,
@@ -40,7 +42,6 @@ import {
   runCapacityRanker,
   resolveMode,
   resolveSwapMargin,
-  resolveHopperWeight,
   cycleEnabled,
   withinCycleWindow,
   withinWatchdogWindow,
@@ -66,7 +67,6 @@ import {
   buildScorecardQuery,
   getMarketPerformance,
   _resetPerfCache,
-  countBottomHalfStreaks,
   PERF_CLAMP,
   DEFAULT_PERF_WEIGHT,
   DEFAULT_PERF_MIN_SETS,
@@ -83,16 +83,13 @@ import {
 // (six markets, ranks 1–6, no LAKE_MKT, no LKE list ever ranked) has its own
 // "MERGE:" block further down.
 //
-// 2026-10-09: the hopper now counts half a slot and W is 0.125 (the user's
-// ruling). These boards and their hand-checked numbers were recorded at the old
-// weights (hopper 1, W 0.25), so they pin those weights explicitly and keep
-// guarding the RULES (oversold, small market, starvation, tie-break). The new
-// defaults have their own "2026-10-09:" block.
+// 2026-10-15: the ranking is confirmed ÷ requested only. These boards keep
+// their real numbers; the hand-checked multipliers below were recorded at the
+// old W 0.25 and now only break exact fill ties.
 const PRE_MERGE_MARKETS = Object.freeze([...MARKET_CODES, 'LAKE_MKT']);
-const OLD_HOPPER_WEIGHT = 1;
 const OLD_PERF_WEIGHT = 0.25;
-const rankPreMerge = (rows, opts = {}) => rankMarkets(rows, { markets: PRE_MERGE_MARKETS, hopperWeight: OLD_HOPPER_WEIGHT, ...opts });
-const rankOld = (rows, opts = {}) => rankMarkets(rows, { hopperWeight: OLD_HOPPER_WEIGHT, ...opts });
+const rankPreMerge = (rows, opts = {}) => rankMarkets(rows, { markets: PRE_MERGE_MARKETS, ...opts });
+const rankOld = (rows, opts = {}) => rankMarkets(rows, opts);
 
 // ─── Fixture: GET /board/capacity?date=2026-09-04, live 2026-09-03 12:48 ET ──
 // (the HANDOFF worked example; STPET read 6/29 by 17:01 UTC — LP data moves)
@@ -106,13 +103,14 @@ const FIXTURE_2026_09_04 = [
   { market: 'STPET_MKT', requested: 30, confirmed: 6,  set_pending: 7 },
 ];
 
-// ─── Fixture: the 2026-09-05 board — THE REGRESSION THIS PR EXISTS FOR ───────
+// ─── Fixture: the 2026-09-05 board ────────────────────────────────────────────
 //
-// Jacksonville ranked FIRST on this board under the old confirmed/requested
-// sort: 2 confirmed of 17 reads 11.8 % "empty", but 14 are already in the
-// hopper, so exactly ONE slot is genuinely open. St. Pete and Fort Myers each
-// have SEVEN. The oversold guard only fires at open_true <= 0, so JAX at 1
-// sailed straight through it to priority 1 and pointed the floor at nothing.
+// History: Jacksonville (2 confirmed of 17, 14 in the hopper) ranked FIRST here
+// under the first confirmed/requested sort, and the 2026-09-05 fix moved the
+// ranker to hopper-weighted open slots. The user's ruling of 2026-10-15 brings
+// confirmed ÷ requested back as the ONLY key, on purpose: the hopper is not
+// confirmed capacity. The open-slot numbers in the comments are kept for
+// reference only.
 const FIXTURE_2026_09_05 = [
   { market: 'JAX_MKT',   requested: 17, confirmed: 2, set_pending: 14 }, // open  1
   { market: 'FTLAU_MKT', requested: 4,  confirmed: 2, set_pending: 4 },  // open -2 → oversold
@@ -139,56 +137,157 @@ const SCORECARD_90D = [
 /** The multipliers SCORECARD_90D produces at W=0.25 — the HANDOFF table. */
 const PERF_2026_09_04 = computeMultipliers(SCORECARD_90D, { weight: OLD_PERF_WEIGHT });
 
+// ─── Fixture: dial_priority_log #670, live 2026-10-15 11:15 ET, slots 10/16 ──
+// The board the 2026-10-15 ruling was checked against. The old open-slot
+// scoring ranked it FTMYR, ORL, JAX, STPET, FTLAU, SAR.
+const FIXTURE_2026_10_16 = [
+  { market: 'FTMYR_MKT', requested: 41, confirmed: 6,  set_pending: 4 },  // 14.6 %
+  { market: 'ORL_MKT',   requested: 34, confirmed: 11, set_pending: 5 },  // 32.4 %
+  { market: 'JAX_MKT',   requested: 22, confirmed: 0,  set_pending: 5 },  //  0 %
+  { market: 'STPET_MKT', requested: 28, confirmed: 4,  set_pending: 11 }, // 14.3 %
+  { market: 'FTLAU_MKT', requested: 11, confirmed: 1,  set_pending: 1 },  //  9.1 %
+  { market: 'SAR_MKT',   requested: 15, confirmed: 10, set_pending: 2 },  // 66.7 %
+];
+/** Row #670's logged multipliers (W 0.125). */
+const PERF_2026_10_15 = {
+  FTMYR_MKT: { multiplier: 1.0160 }, ORL_MKT: { multiplier: 1.0085 }, JAX_MKT: { multiplier: 0.9575 },
+  STPET_MKT: { multiplier: 0.9987 }, FTLAU_MKT: { multiplier: 0.9409 }, SAR_MKT: { multiplier: 1.0332 },
+};
+
 const byMarket = (ranking) => Object.fromEntries(ranking.map((r) => [r.market, r]));
 const order = (ranking) => ranking.map((r) => r.market.replace('_MKT', ''));
 
-// ─── rankMarkets ─────────────────────────────────────────────────────────────
+// ─── rankMarkets: confirmed ÷ requested, lowest first (the user, 2026-10-15) ─
 
-test('2026-09-04 fixture: FTMYR_MKT ranks first, LAKE_MKT ranks LAST (not first)', () => {
-  const { ranking, unknown } = rankPreMerge(FIXTURE_2026_09_04);
-  assert.equal(unknown.length, 0, 'every market filed capacity');
-  assert.equal(ranking.length, 7);
-  assert.equal(ranking[0].market, 'FTMYR_MKT', 'Fort Myers 1/43 is priority 1');
-  assert.equal(ranking[0].rank, 1);
-  assert.equal(ranking[ranking.length - 1].market, 'LAKE_MKT', 'Lakeland ranks last');
-  assert.equal(ranking[ranking.length - 1].rank, 7);
-  assert.notEqual(ranking[0].market, 'LAKE_MKT', 'Lakeland must NEVER be priority 1');
+test('2026-10-15: the user\'s example — 1 of 10 (10 %) beats 11 of 20 (55 %) though both need 9', () => {
+  const { ranking } = rankMarkets([
+    { market: 'ORL_MKT', requested: 20, confirmed: 11, set_pending: 0 }, // Office B, 55 %
+    { market: 'SAR_MKT', requested: 10, confirmed: 1,  set_pending: 0 }, // Office A, 10 %
+  ]);
+  const m = byMarket(ranking);
+  assert.equal(m.SAR_MKT.still_needed, 9);
+  assert.equal(m.ORL_MKT.still_needed, 9, 'both still need nine');
+  assert.equal(m.SAR_MKT.fill_pct, 10);
+  assert.equal(m.ORL_MKT.fill_pct, 55);
+  assert.deepEqual(order(ranking), ['SAR', 'ORL']);
 });
 
-test('2026-09-04 fixture: full order is by ABSOLUTE open slots, oversold last', () => {
-  const { ranking } = rankPreMerge(FIXTURE_2026_09_04);
-  // 39, 17, 14, 13, 9, 4 open — then Lakeland at -1, oversold.
-  assert.deepEqual(
-    ranking.map((r) => r.market),
-    ['FTMYR_MKT', 'STPET_MKT', 'SAR_MKT', 'ORL_MKT', 'JAX_MKT', 'FTLAU_MKT', 'LAKE_MKT'],
-  );
-  assert.deepEqual(ranking.map((r) => r.open_true), [39, 17, 14, 13, 9, 4, -1]);
-  // Under the OLD confirmed/requested sort this read FTMYR, FTLAU, JAX, STPET,
-  // SAR, ORL, LAKE — Fort Lauderdale second on 14.3 % filled while holding
-  // just FOUR open slots, ahead of St. Pete's seventeen.
+test('2026-10-15: appointments still needed never decide — 10 of 50 (20 %) ranks above 1 of 4 (25 %)', () => {
+  const { ranking } = rankMarkets([
+    { market: 'JAX_MKT', requested: 4,  confirmed: 1,  set_pending: 0 }, // 25 %, needs 3
+    { market: 'FTMYR_MKT', requested: 50, confirmed: 10, set_pending: 0 }, // 20 %, needs 40
+  ]);
+  assert.deepEqual(order(ranking), ['FTMYR', 'JAX']);
+  // and the other way round: a big office with MORE still needed but a higher % ranks below.
+  const r2 = rankMarkets([
+    { market: 'JAX_MKT', requested: 4,  confirmed: 0,  set_pending: 0 }, // 0 %, needs 4
+    { market: 'FTMYR_MKT', requested: 50, confirmed: 5, set_pending: 0 }, // 10 %, needs 45
+  ]);
+  assert.deepEqual(order(r2.ranking), ['JAX', 'FTMYR']);
 });
 
-test('2026-09-04 fixture: Lakeland carries BOTH oversold and small_denominator, open_true = -1', () => {
-  const m = byMarket(rankPreMerge(FIXTURE_2026_09_04).ranking);
-  assert.equal(m.LAKE_MKT.fill_pct, 0);
-  assert.equal(m.LAKE_MKT.open_true, -1);
-  assert.equal(m.LAKE_MKT.oversold, true);
-  assert.equal(m.LAKE_MKT.small_denominator, true);
-  assert.deepEqual(m.LAKE_MKT.flags, ['oversold', 'small_denominator']);
-  // and no other market is flagged
-  for (const code of MARKET_CODES.filter((c) => c !== 'LAKE_MKT')) {
-    assert.deepEqual(m[code].flags, [], `${code} is unflagged`);
+test('2026-10-15: Set / hopper appointments are ignored — a full hopper changes nothing', () => {
+  const base = [
+    { market: 'JAX_MKT', requested: 20, confirmed: 2, set_pending: 0 },  // 10 %
+    { market: 'STPET_MKT', requested: 20, confirmed: 4, set_pending: 0 }, // 20 %
+  ];
+  const withHopper = base.map((r) => (r.market === 'JAX_MKT' ? { ...r, set_pending: 18 } : r));
+  assert.deepEqual(order(rankMarkets(base).ranking), ['JAX', 'STPET']);
+  const { ranking } = rankMarkets(withHopper);
+  assert.deepEqual(order(ranking), ['JAX', 'STPET'], 'JAX stays first with 18 in the hopper');
+  const m = byMarket(ranking);
+  assert.equal(m.JAX_MKT.set_pending, 18, 'still reported for the board');
+  assert.equal(m.JAX_MKT.oversold, false, 'the hopper cannot make a market oversold');
+  assert.ok(!('open_true' in m.JAX_MKT), 'no hopper-weighted open slots any more');
+  assert.ok(!('hopper_weight' in m.JAX_MKT));
+});
+
+test('2026-10-15: an EXACT tie (1/10 vs 2/20) breaks on conversion — the better converter first', () => {
+  const rows = [
+    { market: 'FTLAU_MKT', requested: 10, confirmed: 1, set_pending: 0 },
+    { market: 'ORL_MKT',   requested: 20, confirmed: 2, set_pending: 9 },
+  ];
+  const performance = { FTLAU_MKT: { multiplier: 1.03, set_to_sale: 0.15 }, ORL_MKT: { multiplier: 0.97, set_to_sale: 0.11 } };
+  assert.deepEqual(order(rankMarkets(rows, { performance }).ranking), ['FTLAU', 'ORL']);
+  const flipped = { FTLAU_MKT: { multiplier: 0.97 }, ORL_MKT: { multiplier: 1.03 } };
+  assert.deepEqual(order(rankMarkets(rows, { performance: flipped }).ranking), ['ORL', 'FTLAU']);
+});
+
+test('2026-10-15: an exact tie with no conversion data falls to market code — deterministic', () => {
+  const rows = [
+    { market: 'STPET_MKT', requested: 8,  confirmed: 2, set_pending: 0 }, // 25 %
+    { market: 'SAR_MKT',   requested: 12, confirmed: 3, set_pending: 0 }, // 25 %
+  ];
+  const { ranking } = rankMarkets(rows);
+  assert.deepEqual(order(ranking), ['SAR', 'STPET']);
+  for (const r of ranking) assert.equal(r.perf_multiplier, 1);
+});
+
+test('2026-10-15: fill is compared exactly, never on the rounded fill_pct', () => {
+  // 1/3 = 33.33… % and 333/1000 = 33.3 % both print 33.3, but they are not equal.
+  const { ranking } = rankMarkets([
+    { market: 'ORL_MKT', requested: 3,    confirmed: 1,   set_pending: 0 },
+    { market: 'JAX_MKT', requested: 1000, confirmed: 333, set_pending: 0 },
+  ], { performance: { ORL_MKT: { multiplier: 1.15 } } });
+  const m = byMarket(ranking);
+  assert.equal(m.ORL_MKT.fill_pct, m.JAX_MKT.fill_pct, 'same rounded number');
+  assert.deepEqual(order(ranking), ['JAX', 'ORL'], '33.3 % exactly is lower than 33.33… %, conversion never consulted');
+});
+
+test('2026-10-15: conversion can NEVER beat a real % gap', () => {
+  // 14.3 % vs 14.6 % (dial_priority_log #670: St. Pete 4/28, Fort Myers 6/41),
+  // with the clamp's most extreme multipliers pulling the other way.
+  const rows = [
+    { market: 'FTMYR_MKT', requested: 41, confirmed: 6, set_pending: 4 },
+    { market: 'STPET_MKT', requested: 28, confirmed: 4, set_pending: 11 },
+  ];
+  const performance = { FTMYR_MKT: { multiplier: 1.15 }, STPET_MKT: { multiplier: 0.85 } };
+  assert.deepEqual(order(rankMarkets(rows, { performance }).ranking), ['STPET', 'FTMYR']);
+});
+
+test('2026-10-15: live row #670 (slots 10/16) — every market ranked, lowest confirmed % first', () => {
+  const { ranking, unknown } = rankMarkets(FIXTURE_2026_10_16, { performance: PERF_2026_10_15 });
+  assert.deepEqual(unknown, []);
+  assert.deepEqual(ranking.map((r) => r.rank), [1, 2, 3, 4, 5, 6]);
+  assert.deepEqual(order(ranking), ['JAX', 'FTLAU', 'STPET', 'FTMYR', 'ORL', 'SAR']);
+  assert.deepEqual(ranking.map((r) => r.fill_pct), [0, 9.1, 14.3, 14.6, 32.4, 66.7]);
+  // Under the old open-slot scoring this read FTMYR, ORL, JAX, STPET, FTLAU, SAR:
+  // Fort Myers first on 35 open slots while 14.6 % filled, Jacksonville third at 0 %.
+  for (let i = 1; i < ranking.length; i += 1) {
+    assert.ok(compareFill(ranking[i - 1], ranking[i]) <= 0, `${ranking[i - 1].market} is no fuller than ${ranking[i].market}`);
   }
 });
 
-test('2026-09-04 fixture: fill % and open_true per market match the handoff table', () => {
-  const m = byMarket(rankPreMerge(FIXTURE_2026_09_04).ranking);
-  assert.equal(m.FTMYR_MKT.fill_pct, 2.3);  assert.equal(m.FTMYR_MKT.open_true, 39);
-  assert.equal(m.FTLAU_MKT.fill_pct, 14.3); assert.equal(m.FTLAU_MKT.open_true, 4);
-  assert.equal(m.JAX_MKT.fill_pct, 19.0);   assert.equal(m.JAX_MKT.open_true, 9);
-  assert.equal(m.STPET_MKT.fill_pct, 20.0); assert.equal(m.STPET_MKT.open_true, 17);
-  assert.equal(m.SAR_MKT.fill_pct, 21.1);   assert.equal(m.SAR_MKT.open_true, 14);
-  assert.equal(m.ORL_MKT.fill_pct, 40.7);   assert.equal(m.ORL_MKT.open_true, 13);
+test('2026-10-15: score is the fill % — kept under the old name for log readers', () => {
+  for (const r of rankMarkets(FIXTURE_2026_10_16).ranking) {
+    assert.equal(r.score, r.fill_pct, r.market);
+    assert.equal(r.still_needed, Math.max(0, r.requested - r.confirmed), r.market);
+  }
+});
+
+test('2026-09-04 board (pre-merge): ranked by confirmed % alone — Lakeland 0 of 2 is now FIRST', () => {
+  // The hopper (3 pending against 2 slots) no longer counts, so Lakeland is
+  // simply 0 % filled. That is the user's rule: only confirmed fills capacity.
+  const { ranking, unknown } = rankPreMerge(FIXTURE_2026_09_04);
+  assert.equal(unknown.length, 0);
+  assert.deepEqual(order(ranking), ['LAKE', 'FTMYR', 'FTLAU', 'JAX', 'STPET', 'SAR', 'ORL']);
+  const m = byMarket(ranking);
+  assert.equal(m.FTMYR_MKT.fill_pct, 2.3);
+  assert.equal(m.FTLAU_MKT.fill_pct, 14.3);
+  assert.equal(m.JAX_MKT.fill_pct, 19.0);
+  assert.equal(m.STPET_MKT.fill_pct, 20.0);
+  assert.equal(m.SAR_MKT.fill_pct, 21.1);
+  assert.equal(m.ORL_MKT.fill_pct, 40.7);
+  assert.deepEqual(m.LAKE_MKT.flags, ['small_denominator'], 'small, but no longer oversold');
+});
+
+test('2026-09-05 board (pre-merge): a 25 % tie between St. Pete and Sarasota breaks on conversion', () => {
+  const { ranking } = rankPreMerge(FIXTURE_2026_09_05, { performance: PERF_2026_09_04 });
+  assert.deepEqual(order(ranking), ['LAKE', 'JAX', 'SAR', 'STPET', 'ORL', 'FTMYR', 'FTLAU']);
+  const m = byMarket(ranking);
+  assert.equal(m.SAR_MKT.fill_pct, 25);
+  assert.equal(m.STPET_MKT.fill_pct, 25);
+  assert.ok(m.SAR_MKT.perf_multiplier > m.STPET_MKT.perf_multiplier, 'Sarasota converts at 15.7 %, St. Pete 13.5 %');
 });
 
 test('UNKNOWN fail-open: requested = 0 lands in unknown[] and is absent from ranking[]', () => {
@@ -198,7 +297,6 @@ test('UNKNOWN fail-open: requested = 0 lands in unknown[] and is absent from ran
   assert.equal(unknown[0].reason, 'requested_zero');
   assert.ok(!ranking.some((r) => r.market === 'SAR_MKT'), 'not in ranking');
   assert.equal(ranking.length, 6);
-  assert.equal(ranking[0].market, 'FTMYR_MKT');
 });
 
 test('UNKNOWN fail-open: a market with NO capacity row lands in unknown[] with no_capacity_row', () => {
@@ -216,169 +314,36 @@ test('UNKNOWN: a market code outside the list is surfaced as unmapped_market, ne
   assert.deepEqual(unknown.map((u) => [u.market, u.reason]), [['TPA_MKT', 'unmapped_market']]);
 });
 
-test('SMALL DENOMINATOR: requested < 4 ranks after every normal market, before oversold', () => {
+test('SMALL DENOMINATOR: flagged for the board, ranked on its % like everyone else', () => {
   const rows = [
-    { market: 'ORL_MKT',   requested: 27, confirmed: 20, set_pending: 3 },   // 74 %, normal
-    { market: 'FTLAU_MKT', requested: 3,  confirmed: 0,  set_pending: 0 },   // 0 %, small
-    { market: 'JAX_MKT',   requested: 21, confirmed: 4,  set_pending: 8 },   // 19 %, normal
-    { market: 'LAKE_MKT',  requested: 10, confirmed: 5,  set_pending: 6 },   // 50 %, oversold (open -1)
+    { market: 'ORL_MKT',   requested: 27, confirmed: 20, set_pending: 3 }, // 74 %
+    { market: 'FTLAU_MKT', requested: 3,  confirmed: 0,  set_pending: 0 }, // 0 %, small
+    { market: 'JAX_MKT',   requested: 21, confirmed: 4,  set_pending: 8 }, // 19 %
   ];
-  const { ranking } = rankPreMerge(rows);
-  assert.deepEqual(ranking.map((r) => r.market), ['JAX_MKT', 'ORL_MKT', 'FTLAU_MKT', 'LAKE_MKT']);
-  const m = byMarket(ranking);
-  assert.deepEqual(m.FTLAU_MKT.flags, ['small_denominator']);
-  assert.deepEqual(m.LAKE_MKT.flags, ['oversold']);
+  const { ranking } = rankMarkets(rows);
+  assert.deepEqual(order(ranking), ['FTLAU', 'JAX', 'ORL']);
+  assert.deepEqual(byMarket(ranking).FTLAU_MKT.flags, ['small_denominator']);
 });
 
-test('OVERSOLD: open_true = 0 counts as full (<= 0), ranks last even at 0 % fill', () => {
+test('OVERSOLD: confirmed >= requested is flagged and sorts last on the % alone', () => {
   const rows = [
-    { market: 'ORL_MKT', requested: 10, confirmed: 9, set_pending: 0 },   // 90 %, open 1
-    { market: 'SAR_MKT', requested: 10, confirmed: 0, set_pending: 10 },  // 0 %, open 0
+    { market: 'SAR_MKT', requested: 4,  confirmed: 5, set_pending: 0 },  // 125 %
+    { market: 'ORL_MKT', requested: 10, confirmed: 9, set_pending: 0 },  // 90 %
+    { market: 'JAX_MKT', requested: 10, confirmed: 10, set_pending: 0 }, // 100 %
   ];
-  const { ranking } = rankPreMerge(rows);
-  assert.deepEqual(ranking.map((r) => r.market), ['ORL_MKT', 'SAR_MKT']);
-  assert.equal(byMarket(ranking).SAR_MKT.open_true, 0);
-  assert.equal(byMarket(ranking).SAR_MKT.oversold, true);
-});
-
-test('ranking is deterministic on ties (same fill % → more open slots first, then code)', () => {
-  const rows = [
-    { market: 'SAR_MKT', requested: 10, confirmed: 2, set_pending: 5 }, // 20 %, open 3
-    { market: 'JAX_MKT', requested: 20, confirmed: 4, set_pending: 2 }, // 20 %, open 14
-  ];
-  assert.deepEqual(rankPreMerge(rows).ranking.map((r) => r.market), ['JAX_MKT', 'SAR_MKT']);
-});
-
-// ─── 2026-09-05: rank on TRUE OPEN SLOTS, weighted by market performance ─────
-//
-// This block is the reason the PR exists. Everything else in this file is
-// regression cover for behaviour that already shipped.
-
-test('2026-09-05: JAX must NOT rank 1 — it has ONE genuinely open slot', () => {
-  const { ranking } = rankPreMerge(FIXTURE_2026_09_05, { performance: PERF_2026_09_04 });
+  const { ranking } = rankMarkets(rows, { performance: { SAR_MKT: { multiplier: 1.15 } } });
+  assert.deepEqual(order(ranking), ['ORL', 'JAX', 'SAR']);
   const m = byMarket(ranking);
-  assert.equal(m.JAX_MKT.open_true, 1, '17 requested - 2 confirmed - 14 pending');
-  assert.notEqual(ranking[0].market, 'JAX_MKT', 'JAX ranked FIRST under the old fill-% sort');
-  assert.equal(m.JAX_MKT.rank, 6, 'it belongs near the bottom, not the top');
-  // The precise regression: the market the floor was pointed at had a
-  // fourteenth of St. Pete's actual opportunity.
-  assert.ok(m.JAX_MKT.open_true < m.STPET_MKT.open_true, 'STP has more real work than JAX');
+  assert.equal(m.JAX_MKT.oversold, true);
+  assert.equal(m.SAR_MKT.oversold, true);
+  assert.equal(m.ORL_MKT.oversold, false);
+  assert.equal(m.SAR_MKT.still_needed, 0, 'never negative');
 });
 
-test('2026-09-05: full expected order is FTM, STP, SAR, LKE, ORL, JAX, FTL', () => {
-  const { ranking, unknown } = rankPreMerge(FIXTURE_2026_09_05, { performance: PERF_2026_09_04 });
-  assert.equal(unknown.length, 0, 'every market filed capacity');
-  assert.deepEqual(order(ranking), ['FTMYR', 'STPET', 'SAR', 'LAKE', 'ORL', 'JAX', 'FTLAU']);
-});
-
-test('2026-09-05: FTM outranks STP — both have 7 open, the weight is the only differentiator', () => {
-  const { ranking } = rankPreMerge(FIXTURE_2026_09_05, { performance: PERF_2026_09_04 });
-  const m = byMarket(ranking);
-  assert.equal(m.FTMYR_MKT.open_true, 7);
-  assert.equal(m.STPET_MKT.open_true, 7, 'identical capacity — nothing to separate them but performance');
-  assert.ok(m.FTMYR_MKT.score > m.STPET_MKT.score, `${m.FTMYR_MKT.score} > ${m.STPET_MKT.score}`);
-  assert.equal(m.FTMYR_MKT.rank, 1);
-  assert.equal(m.STPET_MKT.rank, 2);
-  // St. Pete IS the company baseline (13.5 %), so its multiplier is ~1.0 and
-  // Fort Myers wins on 14.9 % converting better. The whole gap is 0.18 slots.
-  assert.ok(Math.abs(m.STPET_MKT.perf_multiplier - 1) < 0.005, 'STP sits at the baseline');
-  assert.ok(m.FTMYR_MKT.perf_multiplier > m.STPET_MKT.perf_multiplier);
-});
-
-test('2026-09-05: FTL ranks LAST — open_true = -2 is oversold', () => {
-  const { ranking } = rankPreMerge(FIXTURE_2026_09_05, { performance: PERF_2026_09_04 });
-  const last = ranking[ranking.length - 1];
-  assert.equal(last.market, 'FTLAU_MKT');
-  assert.equal(last.open_true, -2);
-  assert.equal(last.oversold, true);
-  assert.ok(last.flags.includes('oversold'));
-});
-
-test('2026-09-05: LKE ranks 4th on absolute score — neither 1st nor last', () => {
-  const { ranking } = rankPreMerge(FIXTURE_2026_09_05, { performance: PERF_2026_09_04 });
-  const m = byMarket(ranking);
-  assert.equal(m.LAKE_MKT.rank, 4);
-  assert.notEqual(ranking[0].market, 'LAKE_MKT');
-  assert.notEqual(ranking[ranking.length - 1].market, 'LAKE_MKT');
-  // Still FLAGGED small (2 requested), but the flag no longer reorders it.
-  assert.equal(m.LAKE_MKT.small_denominator, true);
-  assert.ok(m.LAKE_MKT.flags.includes('small_denominator'));
-});
-
-test('2026-09-05: absolute slots, not a rate — LKE at 100 % open still ranks below STP at 35 %', () => {
-  const { ranking } = rankPreMerge(FIXTURE_2026_09_05, { performance: PERF_2026_09_04 });
-  const m = byMarket(ranking);
-  // Lakeland is 2 of 2 open (100 %); St. Pete is 7 of 20 (35 %). Sorting on
-  // the RATE would put Lakeland first and spend the floor's best hour on two
-  // appointments. The size of the prize is what matters.
-  assert.ok(m.LAKE_MKT.open_true / m.LAKE_MKT.requested > m.STPET_MKT.open_true / m.STPET_MKT.requested);
-  assert.ok(m.STPET_MKT.rank < m.LAKE_MKT.rank, 'the bigger prize dials first');
-});
-
-test('2026-09-05: score = open_true × perf_multiplier, reported per market', () => {
-  const { ranking } = rankPreMerge(FIXTURE_2026_09_05, { performance: PERF_2026_09_04 });
-  for (const r of ranking) {
-    assert.equal(r.score, Math.round(r.open_true * r.perf_multiplier * 1000) / 1000, r.market);
-    assert.ok(Number.isFinite(r.set_to_sale), `${r.market} reports set_to_sale`);
-  }
-  const m = byMarket(ranking);
-  assert.equal(m.FTMYR_MKT.score, 7.189);
-  assert.equal(m.STPET_MKT.score, 7.008);
-  assert.equal(m.SAR_MKT.score, 4.169);
-});
-
-test('2026-09-05: RANKER_PERF_WEIGHT=0 → pure open-slot order', () => {
-  const flat = computeMultipliers(SCORECARD_90D, { weight: 0 });
-  for (const [code, p] of Object.entries(flat)) {
-    if (code === '_company') continue;
-    assert.equal(p.multiplier, 1, 'W=0 disables weighting entirely');
-  }
-  const { ranking } = rankPreMerge(FIXTURE_2026_09_05, { performance: flat });
-  const m = byMarket(ranking);
-  // FTM and STP now tie exactly (both 7 open, both ×1.0) and the deterministic
-  // fallback — more open slots, then market code — keeps FTM first.
-  assert.equal(m.FTMYR_MKT.score, m.STPET_MKT.score, 'a genuine tie at W=0');
-  assert.equal(m.FTMYR_MKT.rank, 1);
-  assert.equal(m.STPET_MKT.rank, 2);
-  // JAX and ORL also tie (1 open each) and fall to the alphabetical tie-break,
-  // so ORL and JAX swap versus the weighted order. That swap IS the weight
-  // doing its job: ORL converts at 16.0 % and JAX at 8.8 %, and with W=0 there
-  // is nothing left to tell them apart.
-  assert.deepEqual(order(ranking), ['FTMYR', 'STPET', 'SAR', 'LAKE', 'JAX', 'ORL', 'FTLAU']);
-  assert.equal(m.JAX_MKT.score, m.ORL_MKT.score);
-  // The regression still holds with the weight fully disabled: JAX is not 1st.
-  assert.notEqual(ranking[0].market, 'JAX_MKT');
-});
-
-test('2026-09-05: no performance data at all → every multiplier 1.0, ranking still sane', () => {
-  const { ranking } = rankPreMerge(FIXTURE_2026_09_05);
+test('no performance data at all → every multiplier 1.0, ranking still by %', () => {
+  const { ranking } = rankMarkets(FIXTURE_2026_10_16);
   for (const r of ranking) assert.equal(r.perf_multiplier, 1);
-  assert.deepEqual(order(ranking), ['FTMYR', 'STPET', 'SAR', 'LAKE', 'JAX', 'ORL', 'FTLAU']);
-  assert.notEqual(ranking[0].market, 'JAX_MKT', 'the regression is fixed by open_true alone');
-  assert.equal(ranking[ranking.length - 1].market, 'FTLAU_MKT');
-});
-
-test('the weight is what separates ORL from JAX — both have exactly 1 open slot', () => {
-  const unweighted = byMarket(rankPreMerge(FIXTURE_2026_09_05).ranking);
-  const weighted = byMarket(rankPreMerge(FIXTURE_2026_09_05, { performance: PERF_2026_09_04 }).ranking);
-  assert.equal(unweighted.ORL_MKT.open_true, 1);
-  assert.equal(unweighted.JAX_MKT.open_true, 1);
-  assert.ok(unweighted.JAX_MKT.rank < unweighted.ORL_MKT.rank, 'unweighted: alphabetical, JAX first');
-  assert.ok(weighted.ORL_MKT.rank < weighted.JAX_MKT.rank, 'weighted: ORL first at 16.0 % vs 8.8 %');
-});
-
-test('2026-09-05: the weight CANNOT flip a 7-vs-4 capacity gap', () => {
-  // SAR is the best-converting market with open slots (15.7 %) and still ranks
-  // below both 7-slot markets. Capacity dominates, by construction.
-  const { ranking } = rankPreMerge(FIXTURE_2026_09_05, { performance: PERF_2026_09_04 });
-  const m = byMarket(ranking);
-  assert.equal(m.SAR_MKT.open_true, 4);
-  assert.ok(m.SAR_MKT.rank > m.FTMYR_MKT.rank && m.SAR_MKT.rank > m.STPET_MKT.rank);
-  // Even at an absurd weight the clamp holds the spread inside ±0.15, so the
-  // best 4-slot market maxes at 4.6 and the worst 7-slot market floors at 5.95.
-  const extreme = computeMultipliers(SCORECARD_90D, { weight: 99 });
-  const r2 = byMarket(rankPreMerge(FIXTURE_2026_09_05, { performance: extreme }).ranking);
-  assert.ok(r2.SAR_MKT.rank > r2.FTMYR_MKT.rank && r2.SAR_MKT.rank > r2.STPET_MKT.rank);
+  assert.deepEqual(order(ranking), ['JAX', 'FTLAU', 'STPET', 'FTMYR', 'ORL', 'SAR']);
 });
 
 // ─── marketPerformance: the multiplier itself ────────────────────────────────
@@ -509,181 +474,81 @@ test('getMarketPerformance FAILS OPEN: a query error yields 1.0 everywhere, neve
   const warnings = [];
   const perf = await getMarketPerformance({ query, log: (m) => warnings.push(m) });
   assert.deepEqual(perf, {});
-  // and rankMarkets on an empty table is pure open-slot order — degraded, but
-  // still a sane dial list, and JAX is still not first.
+  // and rankMarkets on an empty table is still ranked by confirmed % — ties
+  // fall to market code. Degraded, but still a sane dial list.
   const { ranking } = rankPreMerge(FIXTURE_2026_09_05, { performance: perf });
-  assert.deepEqual(order(ranking), ['FTMYR', 'STPET', 'SAR', 'LAKE', 'JAX', 'ORL', 'FTLAU']);
-  assert.notEqual(ranking[0].market, 'JAX_MKT');
+  assert.deepEqual(order(ranking), ['LAKE', 'JAX', 'SAR', 'STPET', 'ORL', 'FTMYR', 'FTLAU']);
   assert.ok(warnings.some((w) => /run_sql exploded/.test(w)), 'the failure is logged, not swallowed');
 });
 
-// ─── Starvation guard ────────────────────────────────────────────────────────
-
-/** n applied rankings, most recent first, each placing `market` at `rank`. */
-const historyPlacing = (market, rank, n, size = 7) => Array.from({ length: n }, () => ({
-  ranking: Array.from({ length: size }, (_, i) => ({
-    market: i + 1 === rank ? market : `OTHER${i}_MKT`,
-    rank: i + 1,
-  })),
-}));
-
-test('countBottomHalfStreaks: counts consecutive bottom-half placements, most recent first', () => {
-  assert.equal(countBottomHalfStreaks(historyPlacing('LAKE_MKT', 6, 3)).LAKE_MKT, 3);
-  assert.equal(countBottomHalfStreaks(historyPlacing('LAKE_MKT', 6, 9)).LAKE_MKT, 9);
-  assert.equal(countBottomHalfStreaks(historyPlacing('LAKE_MKT', 2, 5)).LAKE_MKT ?? 0, 0, 'top half never counts');
-});
-
-test('countBottomHalfStreaks: a top-half placement RESETS the counter', () => {
-  const history = [
-    ...historyPlacing('LAKE_MKT', 6, 2),  // 2 recent bottom-half runs
-    ...historyPlacing('LAKE_MKT', 1, 1),  // then a top-half one, older
-    ...historyPlacing('LAKE_MKT', 7, 5),  // and older bottom-half ones
-  ];
-  assert.equal(countBottomHalfStreaks(history).LAKE_MKT, 2, 'the streak stops at the top-half run');
-});
-
-test('starvation: bottom-half 3x with confirmed=0 and open_true>0 is promoted to RANK 2', () => {
-  const streaks = { LAKE_MKT: 3 };
-  const { ranking } = rankPreMerge(FIXTURE_2026_09_05, { performance: PERF_2026_09_04, starvationStreaks: streaks });
-  const m = byMarket(ranking);
-  assert.equal(m.LAKE_MKT.rank, 2, 'promoted from 4th');
-  assert.equal(m.LAKE_MKT.starvation_promoted, true);
-  assert.ok(m.LAKE_MKT.flags.includes('starvation_promoted'));
-  assert.equal(m.LAKE_MKT.confirmed, 0);
-  assert.ok(m.LAKE_MKT.open_true > 0);
-  // NEVER rank 1 — the top slot stays earned on score.
-  assert.equal(ranking[0].market, 'FTMYR_MKT');
-  assert.notEqual(ranking[0].market, 'LAKE_MKT');
-  // everyone else keeps their relative order, shifted down one
-  assert.deepEqual(order(ranking), ['FTMYR', 'LAKE', 'STPET', 'SAR', 'ORL', 'JAX', 'FTLAU']);
-});
-
-test('starvation: NEVER forces rank 1, even if it is the only ranked market left', () => {
-  const rows = [{ market: 'LAKE_MKT', requested: 2, confirmed: 0, set_pending: 0 }];
-  const { ranking } = rankPreMerge(rows, { starvationStreaks: { LAKE_MKT: 9 } });
-  assert.equal(ranking[0].market, 'LAKE_MKT');
-  assert.equal(ranking[0].rank, 1, 'it is rank 1 because it is alone — not because it was promoted');
-  assert.equal(ranking[0].starvation_promoted, false, 'no promotion when there is nothing to promote past');
-});
-
-test('starvation: does NOT fire below 3 consecutive runs', () => {
-  for (const streak of [0, 1, 2]) {
-    const { ranking } = rankPreMerge(FIXTURE_2026_09_05, { performance: PERF_2026_09_04, starvationStreaks: { LAKE_MKT: streak } });
-    const m = byMarket(ranking);
-    assert.equal(m.LAKE_MKT.starvation_promoted, false, `streak ${streak}`);
-    assert.equal(m.LAKE_MKT.rank, 4, `streak ${streak} leaves it at its earned rank`);
-  }
-});
-
-test('starvation: does NOT fire when the market has confirmed appointments', () => {
-  const rows = FIXTURE_2026_09_05.map((r) => (r.market === 'LAKE_MKT' ? { ...r, requested: 4, confirmed: 1 } : r));
-  const { ranking } = rankPreMerge(rows, { performance: PERF_2026_09_04, starvationStreaks: { LAKE_MKT: 9 } });
-  assert.equal(byMarket(ranking).LAKE_MKT.starvation_promoted, false, 'it is being worked — not starving');
-});
-
-test('starvation: does NOT fire on an oversold market (nothing to sell)', () => {
-  const { ranking } = rankPreMerge(FIXTURE_2026_09_05, { performance: PERF_2026_09_04, starvationStreaks: { FTLAU_MKT: 9 } });
-  const m = byMarket(ranking);
-  assert.equal(m.FTLAU_MKT.starvation_promoted, false, 'open_true = -2');
-  assert.equal(m.FTLAU_MKT.rank, 7, 'still last');
-});
-
-test('starvation: promoting to rank 2 puts the market TOP HALF, so it is not promoted again next cycle', () => {
-  // Cycle 1 — 3 bottom-half runs behind it, so it promotes.
-  const history = historyPlacing('LAKE_MKT', 6, 3);
-  const streaks1 = countBottomHalfStreaks(history);
-  const run1 = rankPreMerge(FIXTURE_2026_09_05, { performance: PERF_2026_09_04, starvationStreaks: streaks1 });
-  assert.equal(byMarket(run1.ranking).LAKE_MKT.rank, 2);
-  assert.equal(byMarket(run1.ranking).LAKE_MKT.starvation_promoted, true);
-
-  // Cycle 2 — that applied run is now the most recent history entry. Rank 2 of
-  // 7 is top half, so the streak resets to 0 and the guard stands down.
-  const streaks2 = countBottomHalfStreaks([{ ranking: run1.ranking }, ...history]);
-  assert.equal(streaks2.LAKE_MKT ?? 0, 0, 'the counter reset');
-  const run2 = rankPreMerge(FIXTURE_2026_09_05, { performance: PERF_2026_09_04, starvationStreaks: streaks2 });
-  assert.equal(byMarket(run2.ranking).LAKE_MKT.starvation_promoted, false);
-  assert.equal(byMarket(run2.ranking).LAKE_MKT.rank, 4, 'back to its earned rank');
-});
-
-// ─── isMaterialChange ────────────────────────────────────────────────────────
+// ─── isMaterialChange (fill gap in percentage points, 2026-10-15) ────────────
 
 test('material change: no prior applied ranking is material', () => {
-  const next = rankPreMerge(FIXTURE_2026_09_04);
-  const r = isMaterialChange(null, next);
+  const r = isMaterialChange(null, rankMarkets(FIXTURE_2026_10_16));
   assert.equal(r.changed, true);
   assert.deepEqual(r.reasons, ['no_prior_applied_ranking']);
 });
 
 test('material change: identical ranking is NOT a change', () => {
-  const a = rankPreMerge(FIXTURE_2026_09_04);
-  const b = rankPreMerge(FIXTURE_2026_09_04);
-  assert.equal(isMaterialChange(a, b).changed, false);
+  assert.equal(isMaterialChange(rankMarkets(FIXTURE_2026_10_16), rankMarkets(FIXTURE_2026_10_16)).changed, false);
 });
 
-test('material change: a swap on a FRACTIONAL score gap alone is NOT material', () => {
-  // THE CASE THE MARGIN EXISTS FOR. Fort Myers and St. Pete both have 7 open
-  // slots; only the performance weight separates them, by 0.18 of a slot. If
-  // that alone could re-point the floor, every refresh of the multipliers
-  // would trigger a Five9 write.
-  const prev = rankPreMerge(FIXTURE_2026_09_05, { performance: PERF_2026_09_04 });
-  // Flip the weighting so STP edges out FTM — same capacity, swapped order.
-  const flipped = { ...PERF_2026_09_04, STPET_MKT: { ...PERF_2026_09_04.STPET_MKT, multiplier: 1.05 } };
-  const next = rankPreMerge(FIXTURE_2026_09_05, { performance: flipped });
-  assert.equal(next.ranking[0].market, 'STPET_MKT', 'they did swap');
-  assert.equal(prev.ranking[0].market, 'FTMYR_MKT');
-  const gap = Math.abs(byMarket(next.ranking).FTMYR_MKT.score - byMarket(next.ranking).STPET_MKT.score);
-  assert.ok(gap < 0.5, `gap is ${gap} of a slot`);
-  assert.equal(isMaterialChange(prev, next).changed, false, 'under the 0.5-slot margin');
+test('material change: a swap made by the conversion tiebreak alone (0-point gap) is NOT material', () => {
+  const rows = [
+    { market: 'FTLAU_MKT', requested: 10, confirmed: 1, set_pending: 0 },
+    { market: 'ORL_MKT',   requested: 20, confirmed: 2, set_pending: 0 },
+  ];
+  const prev = rankMarkets(rows, { performance: { FTLAU_MKT: { multiplier: 1.03 }, ORL_MKT: { multiplier: 0.97 } } });
+  const next = rankMarkets(rows, { performance: { FTLAU_MKT: { multiplier: 0.97 }, ORL_MKT: { multiplier: 1.03 } } });
+  assert.notDeepEqual(order(prev.ranking), order(next.ranking), 'they did swap');
+  assert.equal(isMaterialChange(prev, next).changed, false, 'a refreshed multiplier must not re-point Five9');
 });
 
-test('material change: a market genuinely GAINING a slot past the margin IS material', () => {
-  const prev = rankPreMerge(FIXTURE_2026_09_05, { performance: PERF_2026_09_04 });
-  // SAR frees up 4 more slots: open 4 → 8, jumping both 7-slot markets.
-  const rows = FIXTURE_2026_09_05.map((r) => (r.market === 'SAR_MKT' ? { ...r, requested: 12 } : r));
-  const next = rankPreMerge(rows, { performance: PERF_2026_09_04 });
-  assert.equal(next.ranking[0].market, 'SAR_MKT');
+test('material change: ANY real % difference that reorders IS material (14.3 % must dial ahead of 14.6 %)', () => {
+  const prevRows = FIXTURE_2026_10_16.map((r) => (r.market === 'STPET_MKT' ? { ...r, confirmed: 5 } : r)); // STP 17.9 %
+  const prev = rankMarkets(prevRows);
+  const next = rankMarkets(FIXTURE_2026_10_16); // STP back to 14.3 %, now ahead of FTM 14.6 %
+  assert.ok(byMarket(prev.ranking).FTMYR_MKT.rank < byMarket(prev.ranking).STPET_MKT.rank);
+  assert.ok(byMarket(next.ranking).STPET_MKT.rank < byMarket(next.ranking).FTMYR_MKT.rank);
   const r = isMaterialChange(prev, next);
   assert.equal(r.changed, true);
+  assert.ok(r.reasons.some((s) => /FTMYR_MKT\/STPET_MKT|STPET_MKT\/FTMYR_MKT/.test(s) && s.includes('0.3-point')), r.reasons.join('; '));
+});
+
+test('material change: the margin is configurable in percentage points', () => {
+  const prev = rankMarkets(FIXTURE_2026_10_16.map((r) => (r.market === 'STPET_MKT' ? { ...r, confirmed: 5 } : r)));
+  const next = rankMarkets(FIXTURE_2026_10_16);
+  assert.equal(isMaterialChange(prev, next, { swapMargin: 0 }).changed, true);
+  assert.equal(isMaterialChange(prev, next, { swapMargin: 1 }).changed, false, 'a 0.3-point swap under a 1-point margin');
+});
+
+test('material change: a row logged under the OLD open-slot scoring still compares', () => {
+  // dial_priority_log #670 as it was written: open-slot order, with score and
+  // open_true, and the retired starvation flag present on nobody.
+  const prev = { ranking: [
+    { market: 'FTMYR_MKT', rank: 1, score: 33.526, open_true: 33, fill_pct: 14.6, flags: [] },
+    { market: 'ORL_MKT',   rank: 2, score: 20.673, open_true: 20.5, fill_pct: 32.4, flags: [] },
+    { market: 'JAX_MKT',   rank: 3, score: 18.67, open_true: 19.5, fill_pct: 0, flags: [] },
+    { market: 'STPET_MKT', rank: 4, score: 18.476, open_true: 18.5, fill_pct: 14.3, flags: [] },
+    { market: 'FTLAU_MKT', rank: 5, score: 8.938, open_true: 9.5, fill_pct: 9.1, flags: [] },
+    { market: 'SAR_MKT',   rank: 6, score: 4.133, open_true: 4, fill_pct: 66.7, flags: [] },
+  ], unknown: [] };
+  const r = isMaterialChange(prev, rankMarkets(FIXTURE_2026_10_16));
+  assert.equal(r.changed, true, 'the first run on the new basis re-points Five9');
   assert.ok(r.reasons.some((s) => s.includes('rank swap')), r.reasons.join('; '));
-});
-
-test('material change: a rank swap at or over the margin IS material', () => {
-  const prev = rankPreMerge(FIXTURE_2026_09_04);
-  // ORL drops to 2/27 = 7.4 % — jumps over FTLAU (14.3), JAX, STPET, SAR
-  const rows = FIXTURE_2026_09_04.map((r) => (r.market === 'ORL_MKT' ? { ...r, confirmed: 2 } : r));
-  const r = isMaterialChange(prev, rankPreMerge(rows));
-  assert.equal(r.changed, true);
-  assert.ok(r.reasons.some((s) => s.includes('rank swap')), r.reasons.join('; '));
-});
-
-test('material change: the margin is configurable — the same fractional swap IS material at 0.1', () => {
-  const prev = rankPreMerge(FIXTURE_2026_09_05, { performance: PERF_2026_09_04 });
-  const flipped = { ...PERF_2026_09_04, STPET_MKT: { ...PERF_2026_09_04.STPET_MKT, multiplier: 1.05 } };
-  const next = rankPreMerge(FIXTURE_2026_09_05, { performance: flipped });
-  assert.equal(isMaterialChange(prev, next, { swapMargin: 0.5 }).changed, false);
-  assert.equal(isMaterialChange(prev, next, { swapMargin: 0.1 }).changed, true);
-});
-
-test('material change: starvation_promoted flipping state IS material on its own', () => {
-  const prev = rankPreMerge(FIXTURE_2026_09_05, { performance: PERF_2026_09_04 });
-  const next = rankPreMerge(FIXTURE_2026_09_05, { performance: PERF_2026_09_04, starvationStreaks: { LAKE_MKT: 3 } });
-  const r = isMaterialChange(prev, next);
-  assert.equal(r.changed, true);
-  assert.ok(r.reasons.some((s) => /LAKE_MKT: starvation_promoted false → true/.test(s)), r.reasons.join('; '));
 });
 
 test('material change: a market changing oversold state is material regardless of rank', () => {
-  const prev = rankPreMerge(FIXTURE_2026_09_04);
-  // Lakeland pending drops 3 → 1: open_true = 1, no longer oversold (still small)
-  const rows = FIXTURE_2026_09_04.map((r) => (r.market === 'LAKE_MKT' ? { ...r, set_pending: 1 } : r));
-  const r = isMaterialChange(prev, rankPreMerge(rows));
+  const prev = rankMarkets(FIXTURE_2026_10_16);
+  const rows = FIXTURE_2026_10_16.map((r) => (r.market === 'SAR_MKT' ? { ...r, confirmed: 15 } : r));
+  const r = isMaterialChange(prev, rankMarkets(rows));
   assert.equal(r.changed, true);
-  assert.ok(r.reasons.some((s) => s.includes('LAKE_MKT: oversold true → false')), r.reasons.join('; '));
+  assert.ok(r.reasons.some((s) => s.includes('SAR_MKT: oversold false → true')), r.reasons.join('; '));
 });
 
 test('material change: a market becoming UNKNOWN is material', () => {
-  const prev = rankPreMerge(FIXTURE_2026_09_04);
-  const next = rankPreMerge(FIXTURE_2026_09_04.filter((r) => r.market !== 'SAR_MKT'));
+  const prev = rankMarkets(FIXTURE_2026_10_16);
+  const next = rankMarkets(FIXTURE_2026_10_16.filter((r) => r.market !== 'SAR_MKT'));
   const r = isMaterialChange(prev, next);
   assert.equal(r.changed, true);
   assert.ok(r.reasons.some((s) => s.includes('SAR_MKT: unknown false → true')));
@@ -736,97 +601,19 @@ test('mapping: the 12 market list names match what is attached to both campaigns
   assert.ok(!Object.keys(MARKET_LISTS).some((c) => /TPA|TAMPA/i.test(c)));
 });
 
-// ─── 2026-10-09: the hopper counts half a slot, W halved (the user's ruling) ──
-//
-// dial_priority_log #585 (slot 2026-10-10): Jacksonville ranked FIFTH with 0
-// confirmed and 7 in the hopper of 15. A full-weight hopper read it as 8 open,
-// and its ×0.92 performance weight put it under Orlando. Ruling: confirmed 1,
-// hopper 0.5, and the performance weight halved (W 0.25 → 0.125).
-const FIXTURE_2026_10_10 = [
-  { market: 'STPET_MKT', requested: 24, confirmed: 1, set_pending: 7 },
-  { market: 'FTMYR_MKT', requested: 28, confirmed: 9, set_pending: 5 },
-  { market: 'SAR_MKT',   requested: 17, confirmed: 5, set_pending: 2 },
-  { market: 'ORL_MKT',   requested: 16, confirmed: 4, set_pending: 3 },
-  { market: 'JAX_MKT',   requested: 15, confirmed: 0, set_pending: 7 },
-  { market: 'FTLAU_MKT', requested: 4,  confirmed: 6, set_pending: 3 },
-];
-// set-to-sale from row #585, as raw multiplier inputs (company rate 1.0 → the
-// rate IS the ratio). Rebuilt through computeMultipliers so W applies.
-const SET_TO_SALE_2026_10_09 = {
-  STPET_MKT: 0.9994, FTMYR_MKT: 1.0315, SAR_MKT: 1.0658, ORL_MKT: 1.0157, JAX_MKT: 0.9175, FTLAU_MKT: 0.8753,
-};
-// Row #585's multipliers were at W=0.25: m = 1 + 0.25 × (ratio − 1).
-const ratioAt025 = (m) => 1 + (m - 1) / 0.25;
-const perfAt = (w) => Object.fromEntries(Object.entries(SET_TO_SALE_2026_10_09)
-  .map(([k, m]) => [k, { multiplier: 1 + w * (ratioAt025(m) - 1) }]));
-
-test('2026-10-09: the hopper counts half a slot by default, confirmed counts one', () => {
-  assert.equal(DEFAULT_HOPPER_WEIGHT, 0.5);
-  assert.equal(DEFAULT_PERF_WEIGHT, 0.125);
-  const m = byMarket(rankMarkets(FIXTURE_2026_10_10).ranking);
-  assert.equal(m.JAX_MKT.open_true, 11.5, '15 − 0 − 0.5 × 7');
-  assert.equal(m.STPET_MKT.open_true, 19.5, '24 − 1 − 0.5 × 7');
-  assert.equal(m.ORL_MKT.open_true, 10.5, '16 − 4 − 0.5 × 3');
-  assert.equal(m.JAX_MKT.hopper_weight, 0.5);
-});
-
-test('2026-10-09: the old weights reproduce row #585 — JAX 5th behind Orlando', () => {
-  const { ranking } = rankMarkets(FIXTURE_2026_10_10, { hopperWeight: OLD_HOPPER_WEIGHT, performance: perfAt(OLD_PERF_WEIGHT) });
-  assert.deepEqual(order(ranking), ['STPET', 'FTMYR', 'SAR', 'ORL', 'JAX', 'FTLAU']);
-  assert.equal(byMarket(ranking).JAX_MKT.open_true, 8);
-});
-
-test('2026-10-09: the new weights put JAX (0 confirmed, 7 hopper) above Orlando', () => {
-  const { ranking } = rankMarkets(FIXTURE_2026_10_10, { performance: perfAt(DEFAULT_PERF_WEIGHT) });
-  assert.deepEqual(order(ranking), ['STPET', 'FTMYR', 'SAR', 'JAX', 'ORL', 'FTLAU']);
-  assert.ok(byMarket(ranking).FTLAU_MKT.oversold, '4 − 6 − 1.5 is still oversold');
-});
-
-test('2026-10-09: hopper half does NOT undo the 2026-09-05 fix — JAX with 14 in the hopper is not first', () => {
-  const { ranking } = rankPreMerge(FIXTURE_2026_09_05, { hopperWeight: DEFAULT_HOPPER_WEIGHT });
-  assert.notEqual(ranking[0].market, 'JAX_MKT');
-  assert.equal(byMarket(ranking).JAX_MKT.open_true, 8, '17 − 2 − 0.5 × 14');
-});
-
-test('2026-10-09: oversold now means confirmed + half the hopper fills the slots', () => {
-  const { ranking } = rankMarkets([
-    { market: 'ORL_MKT', requested: 10, confirmed: 6, set_pending: 8 }, // 10 − 6 − 4 = 0 → oversold
-    { market: 'SAR_MKT', requested: 10, confirmed: 0, set_pending: 10 }, // 10 − 0 − 5 = 5 → open
-  ]);
-  const m = byMarket(ranking);
-  assert.equal(m.ORL_MKT.oversold, true);
-  assert.equal(m.SAR_MKT.oversold, false);
-  assert.equal(m.SAR_MKT.open_true, 5);
-});
-
-test('2026-10-09: a bad hopper weight falls back to 0.5', () => {
-  for (const hopperWeight of [NaN, -1, undefined]) {
-    const m = byMarket(rankMarkets(FIXTURE_2026_10_10, { hopperWeight }).ranking);
-    assert.equal(m.JAX_MKT.open_true, 11.5, String(hopperWeight));
-  }
-  assert.equal(resolveHopperWeight(undefined), 0.5);
-  assert.equal(resolveHopperWeight(''), 0.5);
-  assert.equal(resolveHopperWeight('-0.2'), 0.5);
-  assert.equal(resolveHopperWeight('0.25'), 0.25);
-  assert.equal(resolveHopperWeight('1'), 1);
-});
-
-test('2026-10-09: at the default W=0.125 the real spread is about 0.96–1.03', () => {
-  const mults = Object.entries(computeMultipliers(SCORECARD_90D))
-    .filter(([k]) => !k.startsWith('_'))
-    .map(([, v]) => v.multiplier);
-  assert.ok(Math.min(...mults) > 0.95 && Math.min(...mults) < 0.96);
-  assert.ok(Math.max(...mults) > 1.02 && Math.max(...mults) < 1.03);
-});
-
-test('route 2026-10-09: the hopper weight reaches the ranking and the response', async () => {
-  const { deps } = fakeRun({ rows: FIXTURE_2026_10_10, performance: perfAt(DEFAULT_PERF_WEIGHT), perfWeight: DEFAULT_PERF_WEIGHT });
-  delete deps.hopperWeight; // the route resolves its own default (RANKER_HOPPER_WEIGHT unset)
-  const { status, body } = await runCapacityRanker({ slot_date: '2026-10-10' }, deps);
+test('route 2026-10-15: the response and log row carry the confirmed-% basis, no hopper weight', async () => {
+  const { deps, calls } = fakeRun({ rows: FIXTURE_2026_10_16, performance: PERF_2026_10_15 });
+  const { status, body } = await runCapacityRanker({ slot_date: '2026-10-16' }, deps);
   assert.equal(status, 200);
-  assert.equal(body.hopper_weight, 0.5);
-  assert.deepEqual(order(body.ranking), ['STPET', 'FTMYR', 'SAR', 'JAX', 'ORL', 'FTLAU']);
-  assert.equal(byMarket(body.ranking).JAX_MKT.open_true, 11.5);
+  assert.equal(body.scoring_basis, 'confirmed_fill_pct');
+  assert.equal(calls.inserted[0].scoring_basis, 'confirmed_fill_pct');
+  assert.ok(!('hopper_weight' in body));
+  assert.deepEqual(order(body.ranking), ['JAX', 'FTLAU', 'STPET', 'FTMYR', 'ORL', 'SAR']);
+  const jax = byMarket(body.ranking).JAX_MKT;
+  assert.equal(jax.fill_pct, 0);
+  assert.equal(jax.still_needed, 22);
+  assert.equal(jax.set_pending, 5, 'reported, not ranked');
+  assert.ok(!('open_true' in jax));
 });
 
 test('MERGE: six markets, ranked 1–6, and LAKE_MKT is not one of them', () => {
@@ -835,8 +622,9 @@ test('MERGE: six markets, ranked 1–6, and LAKE_MKT is not one of them', () => 
   assert.ok(!('LAKE_MKT' in MARKET_LISTS), 'no LKE mapping');
   const { ranking, unknown } = rankOld(FIXTURE_2026_09_04_MERGED);
   assert.deepEqual(ranking.map((r) => r.rank), [1, 2, 3, 4, 5, 6]);
-  assert.deepEqual(order(ranking), ['FTMYR', 'STPET', 'SAR', 'ORL', 'JAX', 'FTLAU']);
-  assert.equal(byMarket(ranking).ORL_MKT.open_true, 12, 'Orlando carries the former Lakeland slots');
+  // FTMYR 2.3 %, FTLAU 14.3, JAX 19.0, STPET 20.0, SAR 21.1, ORL 11/29 = 37.9.
+  assert.deepEqual(order(ranking), ['FTMYR', 'FTLAU', 'JAX', 'STPET', 'SAR', 'ORL']);
+  assert.equal(byMarket(ranking).ORL_MKT.requested, 29, 'Orlando carries the former Lakeland slots');
   assert.deepEqual(unknown, []);
 });
 
@@ -860,11 +648,11 @@ test('computeListBlock: rank → dialingPriority, market lists 1–6, LKE and Un
   const rank = rankOld(FIXTURE_2026_09_04_MERGED);
   const block = computeListBlock(LIVE_HOT_LISTS, rank, 'hot');
   assert.equal(block.intended['Data - Hot - FTM less than 7'], 1);
-  assert.equal(block.intended['Data - Hot - STP less than 7'], 2);
-  assert.equal(block.intended['Data - Hot - SAR less than 7'], 3);
-  assert.equal(block.intended['Data - Hot - ORL less than 7'], 4);
-  assert.equal(block.intended['Data - Hot - JAX less than 7'], 5);
-  assert.equal(block.intended['Data - Hot - FTL less than 7'], 6);
+  assert.equal(block.intended['Data - Hot - FTL less than 7'], 2);
+  assert.equal(block.intended['Data - Hot - JAX less than 7'], 3);
+  assert.equal(block.intended['Data - Hot - STP less than 7'], 4);
+  assert.equal(block.intended['Data - Hot - SAR less than 7'], 5);
+  assert.equal(block.intended['Data - Hot - ORL less than 7'], 6);
   assert.equal(block.intended['Data - Hot - LKE less than 7'], 7, 'former market list, now pinned');
   assert.equal(block.intended['Data - Hot - Unmapped'], 7, 'non-market list pinned to the highest number');
   assert.deepEqual(block.pinned, ['Data - Hot - LKE less than 7', 'Data - Hot - Unmapped']);
@@ -1086,7 +874,7 @@ test('CYCLE: read-back MISMATCH after a landed write → campaign is still resta
 
 test('CYCLE: stop before modify, start after, one campaign at a time — the write lands only because the campaign was stopped', async () => {
   const f = fakeFive9({ refuseWhileRunning: true });
-  const out = await applyDialPriority(rankPreMerge(FIXTURE_2026_09_04), { ...f.deps, cycleCampaigns: true, log: () => {} });
+  const out = await applyDialPriority(rankOld(FIXTURE_2026_09_04_MERGED), { ...f.deps, cycleCampaigns: true, log: () => {} });
   assert.deepEqual(f.calls, [
     ['stop', CAMPAIGNS.hot], ['modify', CAMPAIGNS.hot], ['start', CAMPAIGNS.hot],
     ['stop', CAMPAIGNS.warm], ['modify', CAMPAIGNS.warm], ['start', CAMPAIGNS.warm],
@@ -1564,7 +1352,7 @@ test('CYCLE: getCampaignState, when injected, is used for restart verification',
 
 test('applyDialPriority: writes both campaigns, reads back, applied=true when the order matches', async () => {
   const f = fakeFive9();
-  const out = await applyDialPriority(rankPreMerge(FIXTURE_2026_09_04), { ...f.deps, log: () => {} });
+  const out = await applyDialPriority(rankOld(FIXTURE_2026_09_04_MERGED), { ...f.deps, log: () => {} });
   assert.equal(out.applied, true);
   assert.equal(out.dry_run, false);
   assert.equal(f.writes.length, 2);
@@ -1623,21 +1411,19 @@ test('applyDialPriority: no write when the order already matches', async () => {
 function fakeRun({
   prev = null, mode = 'shadow', rows = FIXTURE_2026_09_04_MERGED, applyImpl = null,
   insertImpl = null, stale = false, now = null, performance = PERF_2026_09_04,
-  history = [], historyImpl = null, perfWeight = 0.25, hopperWeight = OLD_HOPPER_WEIGHT,
+  perfWeight = 0.25,
   lockHeld = false, lockImpl = null, releaseImpl = null,
   cycleDisabledUntil = null, cycleDisabledImpl = null,
 } = {}) {
   const calls = { apply: 0, applyOpts: [], inserted: [], acquired: 0, released: [], alerts: [] };
   const deps = {
     mode,
-    swapMargin: 0.5,
+    swapMargin: DEFAULT_SWAP_MARGIN,
     perfWeight,
-    hopperWeight,
     log: () => {},
     now: now || new Date('2026-09-03T16:48:00Z'), // 12:48 ET
     fetchCapacity: async () => ({ rows, stale, last_sweep_at: '2026-09-03T16:45:00Z' }),
     getPerformance: async () => performance,
-    readAppliedHistory: historyImpl || (async () => history),
     readLastApplied: async () => prev,
     readCycleDisabledUntil: cycleDisabledImpl || (async () => cycleDisabledUntil),
     raiseAlert: async (a) => { calls.alerts.push(a); },
@@ -1782,60 +1568,36 @@ test('LOCK: a malformed slot_date is rejected BEFORE the lock is taken', async (
   assert.deepEqual(calls.released, []);
 });
 
-test('route: the 2026-09-05 board end to end — order, multipliers and new fields', async () => {
+test('route: the 2026-09-05 board end to end — order by confirmed %, tie on conversion, fields', async () => {
   const { deps, calls } = fakeRun({ rows: FIXTURE_2026_09_05_MERGED });
   const { status, body } = await runCapacityRanker({ slot_date: '2026-09-05' }, deps);
   assert.equal(status, 200);
-  assert.deepEqual(order(body.ranking), ['FTMYR', 'STPET', 'SAR', 'ORL', 'JAX', 'FTLAU']);
+  // JAX 11.8 %, SAR 25 % = STP 25 % (SAR converts better), ORL 6/18 33.3, FTM 40, FTL 50.
+  assert.deepEqual(order(body.ranking), ['JAX', 'SAR', 'STPET', 'ORL', 'FTMYR', 'FTLAU']);
   assert.deepEqual(body.ranking.map((r) => r.rank), [1, 2, 3, 4, 5, 6]);
-  assert.notEqual(body.ranking[0].market, 'JAX_MKT', 'THE regression');
   const m = byMarket(body.ranking);
-  // every field the handoff asks the response to carry
-  assert.equal(m.FTMYR_MKT.score, 7.189);
+  assert.equal(m.JAX_MKT.fill_pct, 11.8);
+  assert.equal(m.JAX_MKT.score, 11.8);
+  assert.equal(m.JAX_MKT.still_needed, 15);
+  assert.equal(m.JAX_MKT.set_pending, 14, 'reported, not ranked');
   assert.equal(Math.round(m.FTMYR_MKT.perf_multiplier * 1000) / 1000, 1.027);
   assert.equal(Math.round(m.FTMYR_MKT.set_to_sale * 1000) / 10, 14.9);
-  assert.equal(m.FTMYR_MKT.starvation_promoted, false);
-  assert.equal(m.JAX_MKT.fill_pct, 11.8, 'fill_pct kept for dashboard parity');
-  assert.equal(body.scoring_basis, 'open_true_weighted');
+  assert.ok(!('starvation_promoted' in m.FTMYR_MKT), 'the starvation guard is retired');
+  assert.equal(body.scoring_basis, 'confirmed_fill_pct');
   assert.equal(body.perf_weight, 0.25);
   assert.equal(Math.round(body.perf_baseline.set_to_sale * 1000) / 10, 13.5);
-  // and the log row carries the two new columns
-  assert.equal(calls.inserted[0].scoring_basis, 'open_true_weighted');
+  assert.equal(calls.inserted[0].scoring_basis, 'confirmed_fill_pct');
   assert.equal(calls.inserted[0].perf_weight, 0.25);
 });
 
-test('route: a market performance outage degrades to unweighted, warns, and still answers 200', async () => {
+test('route: a market performance outage warns, ties fall to market code, and it still answers 200', async () => {
   const { deps } = fakeRun({ rows: FIXTURE_2026_09_05_MERGED, performance: {} });
   const { status, body } = await runCapacityRanker({ slot_date: '2026-09-05' }, deps);
   assert.equal(status, 200, 'the floor still needs a dial order');
-  assert.ok(body.warnings.some((w) => /market performance unavailable/.test(w)), body.warnings.join('; '));
+  assert.ok(body.warnings.some((w) => /market performance unavailable.*market code/.test(w)), body.warnings.join('; '));
   for (const r of body.ranking) assert.equal(r.perf_multiplier, 1);
-  assert.notEqual(body.ranking[0].market, 'JAX_MKT', 'the regression is fixed even unweighted');
+  assert.deepEqual(order(body.ranking), ['JAX', 'SAR', 'STPET', 'ORL', 'FTMYR', 'FTLAU']);
   assert.equal(body.perf_baseline, null);
-});
-
-test('route: a starvation-history read failure warns but never fails the run', async () => {
-  const { deps } = fakeRun({
-    rows: FIXTURE_2026_09_05_MERGED,
-    historyImpl: async () => { throw new Error('dial_priority_log unreachable'); },
-  });
-  const { status, body } = await runCapacityRanker({ slot_date: '2026-09-05' }, deps);
-  assert.equal(status, 200);
-  assert.ok(body.warnings.some((w) => /starvation history unavailable.*unreachable/.test(w)), body.warnings.join('; '));
-  assert.ok(body.ranking.every((r) => r.starvation_promoted === false));
-});
-
-test('route: starvation promotion surfaces in the response and the warnings', async () => {
-  // Post-merge there is no Lakeland to starve, so JAX plays the part: nothing
-  // confirmed, one slot open, bottom half three runs running.
-  const rows = FIXTURE_2026_09_05_MERGED.map((r) => (r.market === 'JAX_MKT' ? { ...r, confirmed: 0, set_pending: 16 } : r));
-  const { deps } = fakeRun({ rows, history: historyPlacing('JAX_MKT', 5, 3, 6) });
-  const { body } = await runCapacityRanker({ slot_date: '2026-09-05' }, deps);
-  const m = byMarket(body.ranking);
-  assert.equal(m.JAX_MKT.rank, 2);
-  assert.equal(m.JAX_MKT.starvation_promoted, true);
-  assert.notEqual(body.ranking[0].market, 'JAX_MKT', 'never rank 1');
-  assert.ok(body.warnings.some((w) => /starvation guard promoted JAX_MKT to rank 2/.test(w)), body.warnings.join('; '));
 });
 
 test('route: defaults slot_date to tomorrow in America/New_York', async () => {
@@ -1865,15 +1627,15 @@ test('route: SHADOW mode computes, logs one row, returns the ranking, and NEVER 
   assert.equal(calls.inserted[0].mode, 'shadow');
   assert.equal(calls.inserted[0].slot_date, '2026-09-04');
   assert.equal(body.log_id, 42);
-  assert.equal(body.ranking[0].market, 'FTMYR_MKT');
+  assert.equal(body.ranking[0].market, 'FTMYR_MKT', 'Fort Myers 1 of 43 is the least filled');
   assert.equal(body.ranking[0].rank, 1);
   assert.equal(body.ranking.length, 6, 'six markets since the Lakeland merge');
-  assert.equal(body.ranking[5].market, 'FTLAU_MKT');
+  assert.equal(body.ranking[5].market, 'ORL_MKT', 'Orlando 11 of 29 is the most filled');
   assert.equal(body.ranking[5].rank, 6);
   assert.ok(!body.ranking.some((r) => r.market === 'LAKE_MKT'), 'Lakeland is never ranked');
   assert.deepEqual(body.unknown, []);
   for (const r of body.ranking) {
-    for (const k of ['market', 'rank', 'fill_pct', 'open_true', 'flags']) assert.ok(k in r, `ranking row carries ${k}`);
+    for (const k of ['market', 'rank', 'fill_pct', 'still_needed', 'confirmed', 'requested', 'flags']) assert.ok(k in r, `ranking row carries ${k}`);
   }
 });
 
@@ -2548,15 +2310,27 @@ test('CAPACITY_RANKER_MODE: default shadow; only the literal "live" arms live mo
   assert.equal(resolveMode('on'), 'shadow');
 });
 
-test('CAPACITY_RANKER_SWAP_MARGIN: default 0.5 SLOTS, unparseable falls back', () => {
-  // The margin used to be 5 fill-percentage points. It is now a minimum score
-  // gap in slots — a 5-point fill margin is meaningless once the sort key is a
-  // slot count, and 5 SLOTS would suppress almost every real change.
-  assert.equal(resolveSwapMargin(undefined), 0.5);
+test('CAPACITY_RANKER_SWAP_MARGIN_PCT: default 0 POINTS, unparseable falls back', () => {
+  // 2026-10-15: the margin is a fill gap in percentage points. A new env name,
+  // because CAPACITY_RANKER_SWAP_MARGIN held SLOTS under the open-slot scoring.
+  assert.equal(DEFAULT_SWAP_MARGIN, 0);
+  assert.equal(resolveSwapMargin(undefined), 0);
   assert.equal(resolveSwapMargin('1.5'), 1.5);
   assert.equal(resolveSwapMargin('0'), 0);
-  assert.equal(resolveSwapMargin('abc'), 0.5);
-  assert.equal(resolveSwapMargin('-1'), 0.5);
+  assert.equal(resolveSwapMargin('abc'), 0);
+  assert.equal(resolveSwapMargin('-1'), 0);
+  const saved = { old: process.env.CAPACITY_RANKER_SWAP_MARGIN, pct: process.env.CAPACITY_RANKER_SWAP_MARGIN_PCT };
+  try {
+    process.env.CAPACITY_RANKER_SWAP_MARGIN = '0.5';
+    delete process.env.CAPACITY_RANKER_SWAP_MARGIN_PCT;
+    assert.equal(resolveSwapMargin(), 0, 'the old slot-unit variable is never read');
+    process.env.CAPACITY_RANKER_SWAP_MARGIN_PCT = '2';
+    assert.equal(resolveSwapMargin(), 2);
+  } finally {
+    for (const [k, v] of [['CAPACITY_RANKER_SWAP_MARGIN', saved.old], ['CAPACITY_RANKER_SWAP_MARGIN_PCT', saved.pct]]) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  }
 });
 
 test('CAPACITY_RANKER_CYCLE_CAMPAIGNS: default false; only the literal "true" arms cycling', () => {

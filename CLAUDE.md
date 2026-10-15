@@ -1239,6 +1239,14 @@ to review). Never add a customer chat surface to that list without Mark's ruling
 `guardInBackground` and never wait. The attack + benign corpus is `scripts/fixtures/redteam-corpus.js`: a new attack
 seen live goes in ATTACKS, a misflagged customer message in BENIGN. Live red-team runs: `redteam/README.md`.
 
+**The Five9 market dial order is confirmed ÷ requested, lowest first (the user, 2026-10-15).** `rankMarkets`
+(`src/capacity/rankMarkets.js`) reads only the Appointment Capacity board's `confirmed` and `requested`. Set / hopper
+appointments and appointments still needed do not rank (both are reported only); an EXACT tie (compared by
+cross-multiplying, never the rounded %) breaks on the 90-day set-to-sale multiplier, then market code. The open-slot
+score, the half-weight hopper (`RANKER_HOPPER_WEIGHT`, now unread) and the starvation guard are gone. A swap is
+material when the fill gap is over `CAPACITY_RANKER_SWAP_MARGIN_PCT` points (default 0, so a tiebreak-only swap never
+writes); the old slot-unit `CAPACITY_RANKER_SWAP_MARGIN` is not read. Log rows say `scoring_basis: confirmed_fill_pct`.
+
 **UNREADABLE is not down (dialer watchdog and heal, 2026-09-28).** A Five9 status read that fails is
 retried (`readCampaignState` in `src/routes/capacityRanker.js`, 3 reads over ~6s) and its reason is
 logged. Still unreadable, the watchdog pages with honest wording ("may not be dialing"), because a real
