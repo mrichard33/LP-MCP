@@ -120,6 +120,8 @@ const COUNT = '((?:a\\s+)?couple(?:\\s+of)?|(?:a\\s+)?pair\\s+of|(?:a\\s+)?few|\
 const DESC = '(?:\\s+(?!and\\b|or\\b|with\\b)(?:[a-z\'-]+|\\d{1,3}(?:\\s*["\'″]|\\s*(?:in|inch|inches)\\b)?(?:\\s*[x×]\\s*\\d{1,3}(?:\\s*["\'″])?)?)){0,2}';
 const WINDOW_COUNT_RX = new RegExp(`\\b${COUNT}${DESC}\\s+windows?\\b`, 'gi');
 const DOOR_COUNT_RX = new RegExp(`\\b${COUNT}${DESC}\\s+doors?\\b`, 'gi');
+// "windows, about 10 of them": the count after the noun, in the same sentence.
+const TRAILING_COUNT_RX = new RegExp(`\\b(windows?|doors?)\\b[^.!?\\d]{0,25}?\\b(?:(?:about|around|maybe|roughly|probably|like|just|only)\\s+)?${COUNT}\\s+of\\s+(?:them|those)\\b`, 'gi');
 // "the front door", "my back door": one door.
 const ONE_DOOR_RX = /\b(?:the|my|our)\s+(?:front|back|entry|entrance|side|exterior|patio|french)\s+doors?\b/gi;
 const ONE_WINDOW_RX = /\b(?:the|my|our)\s+(?:\w+\s+)?window\b(?!s|\s+(?:guy|company|companies|people|treatment|tint|film|unit|cleaner))/gi;
@@ -176,6 +178,16 @@ export function openingsIn(text) {
     if (n == null) continue;
     out.doors += n; out.stated = true;
     if (!/^an?$/i.test(m[1].trim())) out.explicit = true;
+    rest = rest.replace(m[0], ' ');
+  }
+  // The count after the noun (live dry run, 2026-10-15): "I need new impact windows, about 10 of
+  // them." read as no count, so the bot asked "How many windows and doors…?" right after saying
+  // "Ten windows". Same sentence only: "windows. 10 of them are mine." is not a count.
+  for (const m of rest.matchAll(TRAILING_COUNT_RX)) {
+    const n = countValue(m[2]);
+    if (n == null) continue;
+    if (/^d/i.test(m[1])) out.doors += n; else out.windows += n;
+    out.stated = true; out.explicit = true;
     rest = rest.replace(m[0], ' ');
   }
   for (const m of rest.matchAll(ONE_DOOR_RX)) {

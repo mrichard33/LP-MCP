@@ -347,3 +347,18 @@ test('a lead past its demo (postDemoLead) is never asked the count or the qualif
   assert.equal(J.enforceJobScope(OFFER, {}).changed, false);
   assert.equal(J.enforceJobScope('We also have non-impact options.', {}).text, 'Every window and door we sell is hurricane impact-rated.');
 });
+
+test('a count after the noun is the count (live dry run, 2026-10-15)', () => {
+  // "I need new impact windows, about 10 of them." got "How many windows and doors…?" right after "Ten windows".
+  const t = 'Hi, I need new impact windows, about 10 of them. I own the house.';
+  assert.equal(J.openingsIn(t).windows, 10);
+  assert.equal(J.openingsKnown([], t), true);
+  assert.deepEqual(J.openingsToSave([], t), [{ id: J.WINDOW_COUNT_FIELD_ID, field_value: 10 }]);
+  assert.equal(J.openingsIn('doors, 2 of them').doors, 2);
+  assert.equal(J.openingsIn('10 windows, all 10 of them').windows, 10, 'never counted twice');
+  // Not a count: no number, or the number in another sentence.
+  assert.equal(J.openingsKnown([], 'windows, some of them are foggy'), false);
+  assert.equal(J.openingsKnown([], 'windows. 10 of them are mine.'), false);
+  // Under the minimum still gets the one friendly check.
+  assert.equal(J.jobScopeFromThread([], 'I need windows, just 1 of them').check, true);
+});

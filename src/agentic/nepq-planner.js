@@ -1163,7 +1163,10 @@ function planNepqTurnCore({
     //     Only on the rehash line (onTrack): a post-demo lead off it may be a
     //     SOLD customer (lp-demo-completed), who is never bridged to "the best
     //     deal possible". The stop above and the rebuttal guard apply to all.
-    const pdObj = onTrack ? postDemoObjection(now, lastOut) : null;
+    // A request for room is never an objection (2026-10-15): Jose's "tough few days I would need more time to
+    // think about this" reads as "think" to postDemoObjection, and the ladder (merged beside 3b, #1324/#1325)
+    // asked it back. Room comes first; a bare "need to think about it" still reaches the ladder.
+    const pdObj = onTrack && !askedForSpace(now) ? postDemoObjection(now, lastOut) : null;
     if (pdObj) {
       const objAttempt = turns.reduce((n, t, i) => n + (t.direction === 'inbound' && postDemoObjection(t.text, prevOutAt(i)) ? 1 : 0), 0);
       const repName = (Array.isArray(callSlots?.offer) && callSlots?.repName) || rehashRep || null;
