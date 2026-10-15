@@ -1,6 +1,7 @@
 -- System health monitoring: registry, results, incidents (2026-10-15)
 --
 -- Applied to prod 2026-10-14 via LP MCP. Idempotent; re-running is a no-op.
+-- applied by hand first: Mark 2026-10-14
 -- Every object below was created in the dashboard by Mark on 2026-10-14/15 and
 -- was missing from supabase_migrations.schema_migrations. This file is the
 -- repo's history of it, copied from the live catalog (pg_constraint, pg_indexes,

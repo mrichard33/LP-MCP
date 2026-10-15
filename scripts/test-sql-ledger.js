@@ -19,6 +19,10 @@ import {
   parseMigrationList,
   countLedgerRows,
   pendingMigrationFiles,
+  declaredObjects,
+  statementDeclared,
+  splitHandApplied,
+  HAND_APPLIED_MARKER,
   filterDrift,
   KNOWN_DRIFT_NOISE,
   isDestructive,
@@ -191,4 +195,79 @@ test('pendingMigrationFiles names only the files the database has not applied', 
   const files = ['20261012164849_baseline_dump.sql', '20261012180000_feature_modes.sql', 'README.md'];
   assert.deepEqual(pendingMigrationFiles(list, files), ['20261012180000_feature_modes.sql']);
   assert.deepEqual(pendingMigrationFiles(list.split('\n')[0], files), []);
+});
+
+// 2026-10-15: the nine system-health tables were built by hand on 2026-10-14
+// and recorded by a migration afterwards (sql/README.md rule 4's order). Set
+// aside as pending, that file's own objects read as drift on every PR; the
+// marker lets it account for the objects IT declares, and nothing else.
+const HAND_FILE = {
+  name: '20261015120000_system_health.sql',
+  sql: [
+    '-- applied by hand first: Mark 2026-10-14',
+    'CREATE TABLE IF NOT EXISTS incidents (id bigserial PRIMARY KEY, status text CONSTRAINT incidents_status_check CHECK (status <> \'\'));',
+    'CREATE UNIQUE INDEX IF NOT EXISTS incidents_open_fingerprint ON incidents (id);',
+    'CREATE OR REPLACE VIEW v_incident_board AS SELECT 1;',
+    'ALTER TABLE agent_actions ADD COLUMN IF NOT EXISTS incident_id bigint;',
+    'DO $$ BEGIN ALTER TABLE agent_actions ADD CONSTRAINT agent_actions_incident_id_fkey FOREIGN KEY (incident_id) REFERENCES incidents(id); END $$;',
+    '-- CREATE TABLE IF NOT EXISTS commented_out (x int);',
+  ].join('\n'),
+};
+const HAND_DRIFT = [
+  'create sequence "public"."incidents_id_seq"',
+  'create table "public"."incidents" ( "id" bigint not null )',
+  'alter table "public"."incidents" enable row level security',
+  'alter sequence "public"."incidents_id_seq" owned by "public"."incidents"."id"',
+  'CREATE UNIQUE INDEX incidents_pkey ON public.incidents USING btree (id)',
+  'alter table "public"."incidents" add constraint "incidents_status_check" CHECK ((status <> \'\'::text)) not valid',
+  'alter table "public"."agent_actions" add column "incident_id" bigint',
+  'alter table "public"."agent_actions" add constraint "agent_actions_incident_id_fkey" FOREIGN KEY (incident_id) REFERENCES public.incidents(id) not valid',
+  'alter table "public"."agent_actions" validate constraint "agent_actions_incident_id_fkey"',
+  'create or replace view "public"."v_incident_board" as SELECT 1',
+  'grant select on table "public"."incidents" to "anon"',
+];
+
+test('declaredObjects reads tables, views, indexes, constraints (in DO bodies too) and added columns, not comments', () => {
+  const d = declaredObjects(HAND_FILE.sql);
+  assert.deepEqual([...d.tables], ['incidents']);
+  assert.deepEqual([...d.views], ['v_incident_board']);
+  assert.ok(d.indexes.has('incidents_open_fingerprint'));
+  assert.ok(d.constraints.has('incidents_status_check') && d.constraints.has('agent_actions_incident_id_fkey'));
+  assert.ok(d.columns.has('agent_actions.incident_id'));
+  assert.ok(!d.tables.has('commented_out'));
+});
+
+test('a marked pending file accounts for every statement on objects it declares', () => {
+  const { drift, recorded } = splitHandApplied(HAND_DRIFT, [HAND_FILE]);
+  assert.deepEqual(drift, []);
+  assert.deepEqual(recorded, [{ name: HAND_FILE.name, count: HAND_DRIFT.length }]);
+});
+
+test('anything the file does not declare is still drift', () => {
+  const extra = [
+    'alter table "public"."agent_actions" add column "other" text',
+    'alter table "public"."lp_leads" add column "incident_id" bigint',
+    'alter table "public"."agent_actions" drop constraint "agent_actions_pkey"',
+    'create table "public"."commented_out" ( "x" integer )',
+    'grant select on table "public"."lp_leads" to "anon"',
+    'create or replace view "public"."v_other" as SELECT 1',
+    'create sequence "public"."lp_leads_id_seq"',
+    'CREATE INDEX lp_leads_x ON public.lp_leads USING btree (x)',
+  ];
+  const { drift } = splitHandApplied([...HAND_DRIFT, ...extra], [HAND_FILE]);
+  assert.deepEqual(drift, extra);
+});
+
+test('without the marker a pending file accounts for nothing', () => {
+  const unmarked = { ...HAND_FILE, sql: HAND_FILE.sql.replace(/^-- applied by hand first.*\n/, '') };
+  assert.ok(!HAND_APPLIED_MARKER.test(unmarked.sql));
+  const { drift, recorded } = splitHandApplied(HAND_DRIFT, [unmarked]);
+  assert.deepEqual(drift, HAND_DRIFT);
+  assert.deepEqual(recorded, []);
+});
+
+test('the system-health migration carries the marker', () => {
+  const sql = readFileSync(path.join(ROOT, MIGRATIONS_DIR, HAND_FILE.name), 'utf8');
+  assert.ok(HAND_APPLIED_MARKER.test(sql));
+  assert.ok(statementDeclared('create table "public"."health_checks" ( "check_id" text )', declaredObjects(sql)));
 });

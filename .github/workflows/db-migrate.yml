@@ -139,7 +139,10 @@ jobs:
           # check-migrations.js drops only the pinned build artefacts in
           # KNOWN_DRIFT_NOISE (each by the hash of its exact statement) and
           # fails on anything else.
-          if ! node scripts/check-migrations.js --drift drift.sql; then
+          # 2026-10-15: a pending file marked "-- applied by hand first:"
+          # accounts for the objects IT declares (schema built by hand before
+          # its migration, sql/README.md rule 4); anything else is still drift.
+          if ! node scripts/check-migrations.js --drift drift.sql --pending-list migration-list.txt; then
             echo "::error::The live schema differs from the migrations in this repo. Either add a migration for the change, or someone changed the database by hand."
             cat drift.sql
             exit 1
