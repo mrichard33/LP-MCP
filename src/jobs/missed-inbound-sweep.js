@@ -9,8 +9,10 @@
  *
  * THE SOURCES. The HL mirror's `messages` (HL-MCP writes each inbound within
  * seconds of GHL's marketplace webhook, a different delivery than I.L3-IN) and
- * LP's own `ghl.reply_received` / `ghl.reply_channel_excluded` events. A read
- * that fails ends the pass: no re-drive on a guess.
+ * LP's own `ghl.reply_received` / `ghl.reply_channel_excluded` events, plus the
+ * bot's own `send_message` rows (a message the bot already answered is never
+ * missed, Shawn Eastman 2026-10-15). A read that fails ends the pass: no
+ * re-drive on a guess.
  *
  * ONCE PER MESSAGE. Each re-drive is claimed in agentic_consumed_messages as
  * `inbound_sweep_<ghl message id>` before it runs, so a message is re-driven at
@@ -32,7 +34,7 @@
  * shadow (logs what it would re-drive, claims nothing) | off.
  */
 
-import { planMissedInbound, sweepMessageKey, LOOKBACK_MS, AFTER_MS } from '../agentic/missed-inbound.js';
+import { planMissedInbound, sweepMessageKey, LOOKBACK_MS, AFTER_MS, ANSWERED_AFTER_MS } from '../agentic/missed-inbound.js';
 
 export const INTERVAL_MS = 60 * 1000;
 
@@ -106,7 +108,20 @@ export async function runMissedInboundSweep({ env = process.env, nowMs = Date.no
   `));
   if (!Array.isArray(received)) throw new Error('reply events: read returned no row set');
 
-  const plan = planMissedInbound({ messages, received, nowMs });
+  // The bot's own sends. A skipped / failed / cancelled send is not an answer.
+  const outbound = rowsOf(await d.runSQL(`
+    SELECT json_agg(row_to_json(s)) FROM (
+      SELECT target_id AS ghl_contact_id, coalesce(executed_at, created_at) AS created_at
+        FROM agent_actions
+       WHERE action_type = 'send_message'
+         AND status IN ('pending', 'approved', 'executing', 'completed')
+         AND target_id IN (${sqlList(contacts)})
+         AND created_at > now() - interval '${minutes + Math.ceil(ANSWERED_AFTER_MS / 60000) + 2} minutes'
+    ) s
+  `));
+  if (!Array.isArray(outbound)) throw new Error('bot sends: read returned no row set');
+
+  const plan = planMissedInbound({ messages, received, outbound, nowMs });
   let redriven = 0;
   for (const item of plan) {
     const key = sweepMessageKey(item.messageId);

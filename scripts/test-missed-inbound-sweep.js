@@ -95,7 +95,7 @@ function sweepDeps({ claimed = new Set() } = {}) {
     deps: {
       log: { log: () => {}, warn: () => {} },
       hlRunSQL: async () => MIRROR,
-      runSQL: async () => [{ json_agg: RECEIVED }],
+      runSQL: async (q) => [{ json_agg: /agent_actions/.test(q) ? [] : RECEIVED }],
       claim: async (contactId, keys) => ({ fresh: keys.filter((k) => !claimed.has(k)), consumed: keys.filter((k) => claimed.has(k)) }),
       processInboundReply: async (body, opts) => { calls.push({ body, opts }); return { response: { status: 'accepted', classification: 'pending_analysis' } }; },
       emitEvent: async (e) => { events.push(e); },
@@ -133,6 +133,49 @@ test('shadow re-drives nothing; off reads nothing; default is live', async () =>
 test('a failed read ends the pass: no re-drive on a guess', async () => {
   const { deps, calls } = sweepDeps();
   await assert.rejects(runMissedInboundSweep({ env: {}, nowMs: AT_1506, deps: { ...deps, runSQL: async () => null } }));
+  assert.equal(calls.length, 0);
+});
+
+// Shawn Eastman (39JdHrmdeQQtlJdDyS2r), 2026-10-15: his 14:05 ET text, as the
+// mirror has it (real newlines) and as I.L3-IN relayed it (the characters \n).
+const SHAWN = '39JdHrmdeQQtlJdDyS2r';
+const SHAWN_BODY = 'We are still getting estimates and evaluating them. No decisions have been made yet.\n\nWe like your product the best, but the reality is that it is roughly twice the cost of our other estimates. We recognize that you get what you pay for, but I can\'t buy a Lamborghini on a Honda Civic budget. \n\nI appreciate you following up.';
+const SHAWN_MIRROR = [{ ghl_message_id: 'shawn1405', ghl_contact_id: SHAWN, type: '2', body: SHAWN_BODY, sent_at: '2026-10-15T14:05:41.421-04:00' }];
+const SHAWN_RELAYED = SHAWN_BODY.replace(/\n/g, '\\n');
+const AT_1816Z = Date.parse('2026-10-15T18:16:00Z');
+
+test('Shawn: a multi-line text relayed with literal \\n matches its own event (no duplicate reply)', () => {
+  assert.ok(SHAWN_RELAYED.includes('\\n\\n') && !SHAWN_RELAYED.includes('\n'));
+  const received = [{ ghl_contact_id: SHAWN, created_at: '2026-10-15T18:05:43Z', message_text: SHAWN_RELAYED }];
+  assert.equal(planMissedInbound({ messages: SHAWN_MIRROR, received, nowMs: AT_1816Z }).length, 0);
+  assert.equal(normalizeText('a\\\\nb\\r\\tc\u00a0d'), 'a b c d', 'double-escaped, \\r, \\t and NBSP');
+});
+
+test('Shawn: a text the bot already answered is not missed, whatever its text looks like', () => {
+  const garbled = [{ ghl_contact_id: SHAWN, created_at: '2026-10-15T18:05:43Z', message_text: 'something else' }];
+  const sends = [{ ghl_contact_id: SHAWN, created_at: '2026-10-15T18:06:41Z' }];
+  assert.equal(planMissedInbound({ messages: SHAWN_MIRROR, received: garbled, outbound: sends, nowMs: AT_1816Z }).length, 0);
+  // A send BEFORE the text, or one past the window, does not answer it.
+  const early = [{ ghl_contact_id: SHAWN, created_at: '2026-10-15T18:00:00Z' }];
+  assert.equal(planMissedInbound({ messages: SHAWN_MIRROR, outbound: early, nowMs: AT_1816Z }).length, 1);
+  const late = [{ ghl_contact_id: SHAWN, created_at: '2026-10-15T18:25:00Z' }];
+  assert.equal(planMissedInbound({ messages: SHAWN_MIRROR, outbound: late, nowMs: Date.parse('2026-10-15T18:30:00Z') }).length, 1);
+  // Another contact's send answers nothing here.
+  assert.equal(planMissedInbound({ messages: SHAWN_MIRROR, outbound: [{ ghl_contact_id: JEFF, created_at: '2026-10-15T18:06:41Z' }], nowMs: AT_1816Z }).length, 1);
+});
+
+test('a true miss (no event, no send) is still missed', () => {
+  assert.deepEqual(planMissedInbound({ messages: SHAWN_MIRROR, received: [], outbound: [], nowMs: AT_1816Z }).map((m) => m.messageId), ['shawn1405']);
+});
+
+test('sweep: the bot-send read is passed in, and a failed one ends the pass', async () => {
+  const { deps, calls } = sweepDeps();
+  const answered = { ...deps, hlRunSQL: async () => SHAWN_MIRROR, runSQL: async (q) => [{ json_agg: /agent_actions/.test(q) ? [{ ghl_contact_id: SHAWN, created_at: '2026-10-15T18:06:41Z' }] : [] }] };
+  const out = await runMissedInboundSweep({ env: {}, nowMs: AT_1816Z, deps: answered });
+  assert.equal(out.checked, 0);
+  assert.equal(calls.length, 0);
+  const broken = { ...deps, hlRunSQL: async () => SHAWN_MIRROR, runSQL: async (q) => (/agent_actions/.test(q) ? null : [{ json_agg: [] }]) };
+  await assert.rejects(runMissedInboundSweep({ env: {}, nowMs: AT_1816Z, deps: broken }), /bot sends/);
   assert.equal(calls.length, 0);
 });
 

@@ -36,7 +36,8 @@ import { enforceOneAsk } from './one-ask.js';
 import { isKnockComplaint } from './do-not-knock.js';
 import { detectDeferral, pendingDeferral, isAcknowledgment, isSignOffLine, askedForSpace, POST_DEMO_QUESTIONS } from './post-demo-turn.js';
 import { PURCHASED_ELSEWHERE_RX } from './purchased-elsewhere.js';
-import { rehashNepqTurn, bridgedRecently, BEST_DEAL_RX, PRE_BRIDGE_STAGES } from './rehash-nepq.js';
+import { bestDealHintUsed } from './rehash.js';
+import { rehashNepqTurn, bridgedRecently, rehashObjection, BEST_DEAL_RX, PRE_BRIDGE_STAGES, REHASH_STAGES, REHASH_BRIDGE_RX } from './rehash-nepq.js';
 import { homeownerFromThread, OWNER_ASK_RX } from './homeowner.js';
 import { jobScopeFromThread, openingsKnown, COUNT_ASK_RX } from './job-scope.js';
 import { decisionMakersFromThread, dmSettled } from './qualifying.js';
@@ -518,6 +519,67 @@ export function isNo(text, lastOutbound = '') {
   // A bare "no" counts only when it answers an offer or a next step.
   return BRIDGE_RX.test(lastOutbound) || SLOT_OFFER_RX.test(lastOutbound) || /\bwould\s+that\s+help\b|\bgrab\s+a\s+time\b|\bpick\s+a\s+time\b|\bvisit\b|\bset\s+(?:it|that|a\s+time)\s+up\b/i.test(lastOutbound) || /\bwhat\s+changed\b/i.test(lastOutbound);
 }
+
+// ── Post-demo objections and no's (Shawn Eastman 39JdHrmdeQQtlJdDyS2r, 2026-10-15) ──
+// A post-demo OPPFDN lead wrote "We like your product the best, but … it is
+// roughly twice the cost of our other estimates." The bot argued three times
+// ("The cheaper bids we see usually cut something … folks end up replacing in
+// five years", "what actually holds up is what you can prove five years down
+// the line"), kept selling after "Not at this time. Thanks", and got "This is
+// obviously an AI bot. Stop texting". planPostDemo returned before every
+// objection rule, the no counter stopped at the first message that was not a
+// no, and the only stop was the rehash track's two no's IN A ROW. Now the
+// post-demo ladder is code (CANON.STD.011): one ask-back, one bridge with real
+// call times, then a person; two no's in the session stop the selling.
+//
+// A soft no ("Not at this time", "we're good") counts only as the answer to
+// one of our offers or track questions, so a pre-demo "not right now" to a
+// discovery question is not a no (DECLINE_RX is unchanged on purpose).
+const SOFT_DECLINE_RX = /^\s*(?:no[,.!]?\s+)?(?:not\s+at\s+(?:this|the\s+moment|the\s+present)(?:\s+time)?|not\s+right\s+now|not\s+now|no\s+thank\s+you|no\s+thanks|(?:we|i)(?:'|’)?(?:re|m)\s+(?:good|all\s+set|fine)|(?:we|i)\s+(?:are|am)\s+(?:good|all\s+set|fine)|(?:we|i)(?:'|’)?ll\s+pass|(?:we|i)\s+will\s+pass|not\s+interested)\b/i;
+const POST_DEMO_OFFER_RX = /\bwould\s+(?:a\s+)?(?:quick\s+)?call\s+help\b|\bwould\s+that\s+help\b|\bgive\s+you\s+a\s+(?:ring|call)\b/i;
+
+/** A no on the post-demo line: isNo, or a soft no to our offer / track question. Pure. */
+export function isPostDemoNo(text, lastOutbound = '') {
+  const t = String(text || '');
+  if (isNo(t, lastOutbound)) return true;
+  if (!SOFT_DECLINE_RX.test(t)) return false;
+  const o = String(lastOutbound || '');
+  return CALL_OFFER_SENTENCE_RX.test(o) || BRIDGE_RX.test(o) || POST_DEMO_OFFER_RX.test(o) || REHASH_BRIDGE_RX.test(o) || REHASH_STAGES.some(st => st.rx.test(o));
+}
+
+// A post-demo price objection: the cost itself, never a question asking what
+// the number was ("what was the price again?" is a question to answer).
+const POST_DEMO_PRICE_RX = /\b(?:costs?|price[sd]?|pricing|pricey|expensive|budget|afford|cheaper|too\s+(?:much|high|steep))\b/i;
+const PRICE_INFO_Q_RX = /\b(?:how\s+much|what(?:'|’)?s\s+the\s+(?:price|cost|total)|what\s+(?:is|was)\s+the\s+(?:price|cost|total))\b[^.!]*\?/i;
+
+/**
+ * The post-demo objection in this message: 'price' | 'competitor' | 'think' |
+ * 'spouse' | null. A no, a deferral-free "we signed elsewhere" and a plain
+ * question about the number are not objections. Price first: after a demo the
+ * cost gap is the objection even when they name other estimates. Pure.
+ */
+export function postDemoObjection(text, lastOutbound = '') {
+  const t = String(text || '');
+  if (!t.trim() || isPostDemoNo(t, lastOutbound) || PURCHASED_ELSEWHERE_RX.test(t)) return null;
+  if (PRICE_INFO_Q_RX.test(t)) return null;
+  const r = rehashObjection(t)?.type || null;
+  if (r === 'price' || POST_DEMO_PRICE_RX.test(t)) return 'price';
+  if (r === 'other_quote' || SHOPPING_RX.test(t) || COMPETITOR_RX.test(t)) return 'competitor';
+  if (r === 'think' || THINK_RX.test(t)) return 'think';
+  if (r === 'spouse' || SPOUSE_OBJECTION_RX.test(t)) return 'spouse';
+  return null;
+}
+
+// The ask-back, one question, by objection type (rehash-nepq.js OBJECTIONS).
+export const POST_DEMO_ASK_BACK = Object.freeze({
+  price: (hi = '') => `Too expensive compared to what you were quoted elsewhere${hi}?`,
+  competitor: () => 'How do they compare, out of curiosity?',
+  think: () => 'What part do you want to think through?',
+  spouse: () => "What do you think they'll want to know?",
+});
+
+// Our post-demo stop line, read back (the stop is sticky for the session).
+export const POST_DEMO_STOP_RX = /\bi(?:'|’)?m\s+here\s+if\s+anything\s+changes\b/i;
 
 // The shopping play's question. The reply to it names what they decide on
 // ("probably price and the warranty"): that is an answer, not a price ask
@@ -1069,8 +1131,67 @@ function planNepqTurnCore({
     // The track's question for this stage, unless one of our last three asked it.
     const trackQ = onTrack && ['connection', 'situation', 'problem', 'solution'].includes(track.stage) && track.example
       && !lastThreeOut.some(t => norm(t).includes(norm(track.example))) ? track.example : null;
-    if (onTrack && track.stage === 'stop') {
-      return pd({ step: 'post_demo_stop', required_move: 'close', call_offer_ok: false, fixed_line: `Understood${hi}. I'm here if anything changes.` });
+    // 3b. STOP, enforced in code (Shawn Eastman, 2026-10-15). Two no's in this
+    //     session, in a row or not (or the track's two in a row): one short
+    //     line, no question, no pitch, and a #contact-rehash card (rehash_stop,
+    //     never dialed). STICKY: once our stop line went out, every later turn
+    //     stays stopped unless the lead asks something, asks to schedule or
+    //     asks for a call (those reach planRehashCall / the callback hand-off
+    //     first). The bot keeps answering; it only stops selling.
+    const stopLine = `Understood${hi}. I'm here if anything changes.`;
+    const prevOutAt = (i) => [...turns.slice(0, i)].reverse().find(x => x.direction === 'outbound')?.text || '';
+    const noCount = turns.reduce((n, t, i) => n + (t.direction === 'inbound' && isPostDemoNo(t.text, prevOutAt(i)) && !DM_GATE_ASK_RX.test(prevOutAt(i)) ? 1 : 0), 0);
+    plan.counters.post_demo_nos = noCount;
+    const stopSent = outbound.some(m => POST_DEMO_STOP_RX.test(m.text));
+    const releases = now.includes('?') || SCHEDULE_ASK_RX.test(now) || TIME_REQUEST_RX.test(now) || askedForCall;
+    const stopPlan = (extra) => pd({ step: 'post_demo_stop', required_move: 'close', call_offer_ok: false, fixed_line: stopLine, rehash_question: null, ...extra });
+    if (!stopSent && (noCount >= 2 || track.stage === 'stop')) {
+      return stopPlan({ handoff: { reason: 'rehash_stop', line: stopLine } });
+    }
+    if (stopSent && !releases) return stopPlan({ post_demo_sticky: true });
+    // 3c. The objection ladder (CANON.STD.011): one ask-back, one bridge with
+    //     the rep's real Rehash Call times, then a person. Any objection counts
+    //     toward the same ladder (Shawn's "estimates", "Cost" and "the price
+    //     cut in half" are one objection). Never a rebuttal, a crew or warranty
+    //     claim, a price, a discount or "a deal" (enforceNepqPlan, stripOfferTalk).
+    //     Only on the rehash line (onTrack): a post-demo lead off it may be a
+    //     SOLD customer (lp-demo-completed), who is never bridged to "the best
+    //     deal possible". The stop above and the rebuttal guard apply to all.
+    const pdObj = onTrack ? postDemoObjection(now, lastOut) : null;
+    if (pdObj) {
+      const objAttempt = turns.reduce((n, t, i) => n + (t.direction === 'inbound' && postDemoObjection(t.text, prevOutAt(i)) ? 1 : 0), 0);
+      const repName = (Array.isArray(callSlots?.offer) && callSlots?.repName) || rehashRep || null;
+      const speaksAsRep = !!(repName && rehashRep && String(repName).toLowerCase() === String(rehashRep).toLowerCase());
+      plan.objection = { type: pdObj, attempt: objAttempt, line: null };
+      if (objAttempt <= 1) {
+        const line = POST_DEMO_ASK_BACK[pdObj](hi);
+        plan.objection.line = line;
+        return pd({ step: 'rehash_objection', required_move: 'objection_play', fixed_line: line, call_offer_ok: false, rehash_ladder: 'ask_back' });
+      }
+      if (objAttempt === 2) {
+        // The bridge. "The best deal possible" is said once per conversation.
+        const hintUsed = bestDealHintUsed(conversation);
+        const lead = hintUsed ? 'I may be able to do something for you' : "I want to make sure you're getting the best deal possible. I may be able to do something for you";
+        const offer = Array.isArray(callSlots?.offer) ? callSlots.offer : [];
+        Object.assign(plan, { rehash_stage: 'bridge', rehash_bridged: true, rehash_ladder: 'bridge' });
+        plan.objection.line = null;
+        if (offer.length === 2) {
+          const withRep = repName && !speaksAsRep ? ` with ${repName}` : '';
+          const line = `${lead}, it's just easier on a quick call${withRep}. ${LINES.offer_slots(offer, counters.slot_offers)}`;
+          plan.objection.line = line;
+          return pd({
+            step: 'rehash_offer', required_move: 'offer_slots', fixed_line: line, slots_to_offer: offer, rehash_call_slots: true,
+            allowed: { ...plan.allowed, slot_offer: true }, booking: { allowed: true, reason: 'nepq:rehash_offer' },
+          });
+        }
+        const line = `${lead}, it's just easier on a quick call. Would that help?`;
+        plan.objection.line = line;
+        return pd({ step: 'rehash_bridge', required_move: 'objection_play', fixed_line: line });
+      }
+      const who = speaksAsRep ? "I'll take a look at it and reach out." : `I'll have ${repName || 'our team'} take a look at it and reach out.`;
+      const line = `Understood${hi}. ${who}`;
+      plan.objection.line = line;
+      return pd({ step: 'handoff', required_move: 'handoff', fixed_line: line, call_offer_ok: false, handoff: { reason: 'rehash_repeat_objection', line }, rehash_ladder: 'handoff' });
     }
     // 3b. They asked for room with no date (more time, a hard stretch at home):
     //     warm, no question, no pitch, no time (Jose Perez, 2026-10-14). The
@@ -1909,6 +2030,15 @@ const NO_FIGURES_LINE = 'Exact numbers come from the visit, since every home is 
 
 const norm = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
 
+// 2026-10-15 (Shawn Eastman): a rebuttal to a post-demo objection. Each live
+// one is here: "The cheaper bids we see usually cut something, subcontracted
+// crews or parts-only warranties, and folks end up replacing in five years",
+// "what actually holds up is what you can prove five years down the line",
+// "cheaper bids usually get there by cutting the crew or the warranty".
+export const POST_DEMO_REBUTTAL_RX = /\b(?:cheaper|lower|other)\s+(?:bids?|quotes?|estimates?|companies|guys|options?)\b[^.?!]*\b(?:cut|cutting|skimp|subcontract|parts[\s-]+only|replac|corners?)|\bwhat\s+you\s+can\s+prove\b|\bholds?\s+up\b|\bfive\s+years\b|\b(?:folks|people|homeowners)\s+(?:end\s+up|usually|often)\b|\bget\s+what\s+you\s+pay\s+for\b|\byou\s+get\s+what\b|\bapples\s+to\s+apples\b|\bpeace\s+of\s+mind\b/i;
+// "Someone from our team will reach out" on a step that files nothing.
+export const UNPROMISED_FOLLOW_UP_RX = /\b(?:someone|a\s+team\s+member|our\s+(?:follow[\s-]*up\s+)?team)\s+(?:from\s+our\s+team\s+)?(?:will|is\s+going\s+to)\s+(?:reach\s+out|get\s+in\s+touch|follow\s+up|call|be\s+in\s+touch)\b/i;
+
 const ASK_FIELD_RX = {
   name: /\b(?:your|first|full)\s+name\b|\bwho\s+(?:am\s+i|i'?m)\s+(?:speaking|talking)\s+(?:to|with)\b/i,
   phone: /\b(?:phone|cell)(?:\s+number)?\b|\bbest\s+number\b|\bnumber\s+to\s+(?:reach|call)\b/i,
@@ -2147,6 +2277,17 @@ export function enforceNepqPlan(draft, plan, { allowFigures = false, known = {} 
     if (plan.rehash_stage && PRE_BRIDGE_STAGES.has(plan.rehash_stage) && sentences.some(s => !BEST_DEAL_RX.test(s))) {
       drop(s => BEST_DEAL_RX.test(s), 'best_deal_before_bridge');
     }
+    // 2026-10-15 (Shawn Eastman, CANON.STD.018): a post-demo lead is asked,
+    // never argued with. The three live rebuttals ("cheaper bids … cut
+    // something", "what you can prove five years down the line", "cheaper bids
+    // usually get there by cutting the crew") go, and so does a promise that
+    // someone will reach out on a step that files nothing (only a hand-off
+    // files a card). The plan's own line is never dropped.
+    const ownLine = new Set(splitSentences(`${plan.fixed_line || ''} ${plan.reference_line || ''}`).map(norm));
+    drop(s => !ownLine.has(norm(s)) && POST_DEMO_REBUTTAL_RX.test(s), 'rebuttal_dropped');
+    if (!['handoff', 'rehash_confirm', 'rehash_offer'].includes(plan.step)) {
+      drop(s => !ownLine.has(norm(s)) && UNPROMISED_FOLLOW_UP_RX.test(s), 'unpromised_follow_up_dropped');
+    }
   }
   // 2a'. The lead said goodbye (2026-10-13, Erica Hilts): no question, no
   // time, and no "I'll check back next week" when they said THEY would call.
@@ -2212,6 +2353,9 @@ export function enforceNepqPlan(draft, plan, { allowFigures = false, known = {} 
   body = sentences.join(' ').trim();
   // A post-demo thank-you that lost everything to the drops: thanks back.
   if (!body && plan.post_demo && plan.ack_line) { body = plan.ack_line; changes.push('ack_line'); }
+  // A post-demo reply that was all rebuttal: never the rebuttal itself (the
+  // generic fallback below ships the original), never silence.
+  if (!body && plan.post_demo && !referenceMove) { body = 'Understood.'; changes.push('post_demo_fallback'); }
   // 2026-10-11 live simulation: "Thanks for checking in" got "Anytime. Talk
   // soon." The planned proposal question goes on; a sign-off in its way goes.
   const trackQuestion = plan.step === 'post_demo_ack' ? plan.post_demo_question : plan.step === 'post_demo' ? plan.rehash_question : null;

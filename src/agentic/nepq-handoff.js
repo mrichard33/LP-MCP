@@ -23,6 +23,7 @@
 
 import { CALLBACK_MARKER_TAG, NO_DIAL_REASONS } from './bot-callback.js';
 import { GHL_LOCATION_ID } from '../actions/constants.js';
+import { rehashSlackChannel } from './rehash.js';
 
 /**
  * Where dispatch's cards go; SLACK_CHANNEL_DISPATCH overrides (same default as the cancel cards).
@@ -31,9 +32,16 @@ import { GHL_LOCATION_ID } from '../actions/constants.js';
  */
 export const DISPATCH_CHANNEL_DEFAULT = 'C0C9AGEM2N8';
 const DISPATCH_REASONS = new Set(['complaint', 'booking_request', 'emergency']);
+// 2026-10-15 (Shawn Eastman): a post-demo lead is the rehash team's, so the
+// post-demo ladder's two hand-offs go to #contact-rehash ONLY.
+export const REHASH_REASONS = new Set(['rehash_stop', 'rehash_repeat_objection']);
 
 /** The Slack channels a hand-off card goes to. Pure. */
 export function handoffSlackChannels(reason, env = process.env) {
+  if (REHASH_REASONS.has(reason)) {
+    const rehash = rehashSlackChannel(env);
+    return rehash ? [{ name: 'contact-rehash', id: rehash }] : [];
+  }
   const service = String(env.SLACK_CHANNEL_SERVICE || '').trim();
   const dispatch = String(env.SLACK_CHANNEL_DISPATCH || DISPATCH_CHANNEL_DEFAULT).trim();
   const out = [service ? { name: 'contact-center', id: service } : null];
@@ -57,6 +65,9 @@ const WHY = {
   // 2026-10-07 (Nicholas Ferraioli): a team note says we cannot run the lead.
   // 2026-10-13 (the user): a commercial property or a rental unit (scope-dq.js).
   scope_dq: "The lead said the home is one we do not work on. LP's API cannot change a disposition: open the lead in LP and set it to ND. No sales call.",
+  // 2026-10-15 (Shawn Eastman): the post-demo ladder (nepq-planner.js planPostDemo).
+  rehash_stop: 'Post-demo lead said no twice. NOT added to the dialer and the bot stopped selling (it still answers). Read the thread; reach out only if something in it says they want to hear from us.',
+  rehash_repeat_objection: 'Post-demo lead raised the same objection again after the call offer. Call them and see what we can do; the bot promised no offer.',
   lp_note_dq: 'A team note in LP says we cannot run this lead. The bot is now OFF for this contact (stop-bot) and booked nothing. Call them, explain plainly, and settle what happens next. Remove stop-bot only if the bot should talk to them again.',
 };
 
@@ -65,6 +76,8 @@ const TOLD = {
   lp_note_dq: ' The bot told them a team member will call to confirm a time, and named no day or time.',
   scope_dq: " The bot told them we can't help with this home and offered no visit.",
   two_nos: ' The bot stopped asking and promised no call.',
+  rehash_stop: ' The bot stopped asking and promised no call.',
+  rehash_repeat_objection: ' The bot told them the rep will take a look at it and reach out, and promised no offer.',
   do_not_knock: ' The bot apologised and told them our team will not knock again.',
 };
 

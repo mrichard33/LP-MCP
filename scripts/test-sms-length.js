@@ -27,7 +27,8 @@ test('the version was bumped for the new check and the cap is the prompt\'s 320'
   // 2026-10-13.1: job_scope (no rentals, no commercial, the minimum, impact-only).
   // 2026-10-13.2: times_after_sign_off and repeat_slot_offer (Erica Hilts).
   // 2026-10-15.1: warranty_claim_without_file (Jeff Clark).
-  assert.equal(INVARIANTS_VERSION, '2026-10-15.1');
+  // 2026-10-15.2: post_demo_rebuttal / _unbacked_follow_up / question_after_post_demo_stop (Shawn Eastman).
+  assert.equal(INVARIANTS_VERSION, '2026-10-15.2');
   assert.equal(SMS_MAX_CHARS, 320);
 });
 

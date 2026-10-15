@@ -47,7 +47,9 @@ export const CALLBACK_MARKER_TAG = 'callback:requested';
  *                   list and the card goes to the canvass channel.
  */
 // scope_dq (2026-10-13): a home we cannot work on; the card asks for ND, never a call.
-export const NO_DIAL_REASONS = new Set(['two_nos', 'do_not_knock', 'scope_dq']);
+// rehash_stop / rehash_repeat_objection (2026-10-15, Shawn Eastman): the post-demo
+// ladder's hand-offs, reviewed by the rehash team in #contact-rehash.
+export const NO_DIAL_REASONS = new Set(['two_nos', 'do_not_knock', 'scope_dq', 'rehash_stop', 'rehash_repeat_objection']);
 
 /**
  * What a sent reply needs filed, and why. Pure.
