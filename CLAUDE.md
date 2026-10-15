@@ -396,6 +396,13 @@ updated their OLD Five9 record, which profile DIAL ASAP V2 screens out (> 72h): 
 Direct Lead Entry and were never dialed (`backstopKeyFields`, the same keys `after-asap-retry` uses).
 `findContactInOtherLists` is NOT used here: it has never worked in production (bare-array criteria) and
 `f9_last_list` keeps the last list ever, so a naive fix would block most callbacks.
+**Every cancelled lead goes to Five9 "Resets-Hot" (the user, 2026-10-15).** Nothing of ours put cancelled leads there:
+of 274 leads cancelled 10-01..10-14, 103 were never called again. Job `cancel-reset-routing` (15 min,
+`CANCEL_RESET_ROUTING_MODE` off|shadow|live, default live by that ruling; rules in `src/cancel-reset-routing.js`) adds a
+phone whose NEWEST lead is CXL or CCC, cancelled 30 min..14 days ago, that no Reset campaign has dialed since, once per
+cancel. Never sold, Five9 DNC or opted out; a failed DNC or consent read waits. Keyed on number1 ALONE, the opposite of
+the new-lead backstop: profile "Resets V2" dials records created 25+ hours ago, so the phone's existing record is the
+one to add.
 **Missed paid callers are judged by their whole call history (2026-10-12).** `src/jobs/missed-caller-recovery.js`
 (`MISSED_CALLER_RECOVERY_MODE`, default shadow) no longer uses `findContactInOtherLists` either: all 264 would_push rows
 read "cross-list check unreadable — failed open". `judgeHistory` reads every Five9 disposition for the number, any

@@ -366,6 +366,11 @@ export const MODES = Object.freeze([
     goLive: 'job_runs.detail.decisions show would_push only for leads with no follow-up call and no After DIAL ASAP record',
     note: 'Puts no-contact DIAL ASAP / Simpletext leads on After DIAL ASAP where the Five9 connector missed them.',
   }),
+  m('CANCEL_RESET_ROUTING_MODE', 'dialer', 'enum', OSL, 'live', OSL_S, {
+    since: '2026-10-15', decider: 'the user', evidence: job('cancel-reset-routing'),
+    goLive: 'ruled live by the user on 2026-10-15: every cancelled lead goes to Resets-Hot',
+    note: 'Adds cancelled LP leads (CXL / CCC) that no Reset campaign has called to Five9 "Resets-Hot".',
+  }),
   m('BOOKED_DIAL_ROUTING_MODE', 'dialer', 'enum', OSL, 'shadow', OSL_S, {
     since: '2026-10-06', evidence: { table: 'booked_dial_routing_log', job: 'booked-dial-routing' },
     goLive: 'booked_dial_routing_log decisions follow decision #2669 (add first, remove second)',
