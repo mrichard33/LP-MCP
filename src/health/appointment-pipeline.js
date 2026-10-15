@@ -33,6 +33,14 @@ const MIN = 60_000;
 const DAY = 24 * 60 * MIN;
 /** A timed check still runs if the tick arrives this late (a deploy at 20:14). */
 const LATE_GRACE_MIN = 90;
+/**
+ * 2026-10-15 (the user): "Tomorrow's appointments have a rep" was red at
+ * midday. An evening check judges TOMORROW's appointments, so its 8:15 PM
+ * result means nothing once those appointments start. At 8:00 AM ET each
+ * evening check writes a grey "Not due yet" result, so last night's answer is
+ * on the board overnight only.
+ */
+const EVENING_RESET_AT = '08:00';
 
 export function apptPipelineMode(env = process.env) {
   const raw = String(env.APPT_PIPELINE_MODE ?? '').trim().toLowerCase();
@@ -101,14 +109,16 @@ export const CHECKS = {
       // older one is the held-row card's, not a queue backlog).
       const r = rowsOf(await runSQL(`
         SELECT in1_id, first_name, last_name, phone10, source, source_sub,
-               to_char(received_at_lp AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS') AS received_wall
+               received_at_lp
           FROM lp_inbound_queue
          WHERE checkout_at_lp IS NULL AND kill_reason IS NULL
            AND received_at_lp >= now() - interval '3 days'
          ORDER BY received_at_lp ASC LIMIT 200`), 'inbound queue');
-      const { lpLocalToUtcMs, workingMsBetween } = await import('../lead-speed.js');
+      const { workingMsBetween } = await import('../lead-speed.js');
       const waiting = r.map((q) => {
-        const at = lpLocalToUtcMs(q.received_wall);
+        // received_at_lp is already TRUE UTC (src/lp-inbound-queue.js), unlike
+        // lp_leads' Eastern-wall times; read as Eastern it lost 4 hours of wait.
+        const at = Date.parse(q.received_at_lp) || null;
         return {
           in1_id: q.in1_id, name: displayName(q.first_name, q.last_name), phone10: q.phone10 || null,
           source: [q.source, q.source_sub].filter(Boolean).join(' / ') || null,
@@ -131,6 +141,7 @@ export const CHECKS = {
 
   'appt.issue_by_2000': {
     times: ['20:15', '20:45'],
+    resetAt: EVENING_RESET_AT,
     async run({ runSQL, tomorrow, firedAt }) {
       const r = rowsOf(await runSQL(`
         SELECT ${LEAD_COLS} FROM lp_leads
@@ -140,7 +151,10 @@ export const CHECKS = {
       const late = firedAt === '20:45';
       return {
         value: r.length,
-        rule: (_v, c) => (!r.length ? 'pass' : late || r.length >= Number(c.fail_count_first ?? 3) ? 'fail' : 'warn'),
+        // 2026-10-15 (the user): yellow at 8:15 PM, red only when one is still
+        // not issued at 8:45 PM. "3 or more at 8:15 PM" read as a second rule
+        // nobody could explain.
+        status: !r.length ? 'pass' : late ? 'fail' : 'warn',
         summary: r.length ? `${count(r.length, 'confirmed appointment')} for ${dayWords(tomorrow)} ${r.length === 1 ? 'was' : 'were'} not issued to a rep by ${clock12(firedAt)}.` : `Every confirmed appointment for ${dayWords(tomorrow)} was issued to a rep by ${clock12(firedAt)}.`,
         detail: { checked_at_et: firedAt, issued_field: "ever_issued OR raw_lp_data.issued = 'true'", leads: r.map((l) => apptLine(l, { rep: l.rep_name || null })) },
       };
@@ -148,6 +162,7 @@ export const CHECKS = {
   },
 
   'appt.unassigned_next_day': {
+    resetAt: EVENING_RESET_AT,
     times: ['19:30', '20:15'],
     async run({ runSQL, tomorrow, firedAt }) {
       const r = rowsOf(await runSQL(`
@@ -170,6 +185,7 @@ export const CHECKS = {
 
   'appt.set_not_confirmed': {
     times: ['19:15'],
+    resetAt: EVENING_RESET_AT,
     async run({ runSQL, tomorrow }) {
       const [row] = rowsOf(await runSQL(`
         SELECT count(*) FILTER (WHERE appointment_set) AS set_total,
@@ -247,6 +263,7 @@ export const CHECKS = {
   },
 
   'appt.capacity_over': {
+    resetAt: EVENING_RESET_AT,
     times: ['19:30'],
     async run({ runSQL, tomorrow, row }) {
       const blocks = row.config?.blocks || { morning: [9, 10, 11], afternoon: [13, 14, 15], evening: [17, 18, 19] };
@@ -430,6 +447,16 @@ export function dueSlot(checkId, spec, nowMs, force = false) {
   return { key, firedAt: null };
 }
 
+/** The once-a-morning "Not due yet" slot of an evening check. Pure apart from `ran`. */
+export function resetDue(checkId, spec, nowMs) {
+  if (!spec.resetAt) return null;
+  const { day, minuteOfDay } = etParts(nowMs);
+  const at = hhmm(spec.resetAt);
+  const key = `${checkId}|${day}|reset`;
+  if (minuteOfDay < at || minuteOfDay >= at + LATE_GRACE_MIN || ran.has(key)) return null;
+  return { key };
+}
+
 export async function runAppointmentPipelineCheck({ env = process.env, nowMs = Date.now(), deps = {}, force = false, only = null } = {}) {
   const mode = apptPipelineMode(env);
   if (mode === 'off') return { skipped: true, reason: 'APPT_PIPELINE_MODE=off' };
@@ -444,6 +471,12 @@ export async function runAppointmentPipelineCheck({ env = process.env, nowMs = D
     if (only && !only.includes(checkId)) continue;
     const row = registry.get(checkId);
     if (!row || row.enabled === false || row.mode === 'off') continue;
+    const reset = !force && resetDue(checkId, spec, nowMs);
+    if (reset) {
+      ran.set(reset.key, nowMs);
+      health.push({ check_id: checkId, status: 'skipped', summary: `Not due yet: next check at ${clockList(spec.times)}.`, fingerprint: checkId });
+      continue;
+    }
     const slot = dueSlot(checkId, spec, nowMs, force);
     if (!slot) continue;
     if (slot.notDue) {

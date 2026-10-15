@@ -161,3 +161,27 @@ Three checks changed behaviour in the same pass:
 `scripts/test-health-record.js`, `scripts/test-health-checks.js`,
 `scripts/test-health-registry.js`, `scripts/test-health-schema.js`
 (`HEALTH_SCHEMA_LIVE=1` also reads the live schema, read-only).
+
+## Accuracy review (2026-10-15)
+
+The first full review of the board against live data found these false or missing alerts, now fixed:
+
+- **"No agents are ready" all day.** Five9 had five agents Ready. When more than one agent is listed, the agent list parses to an array, and `array.values` is Array's own method, so every row collapsed to `[null]` (`normalizeStatistics`, `src/five9-supervisor.js`). "Calling lists being worked" and "Dialing pace" had never run. Now:
+  - An agent counts as **working** when Ready, On Call or After Call Work (`agentCounts`).
+  - No agent working during call-center hours (`isTeamOpen`) is yellow, and red once no call has ended for 30 minutes.
+- **First call within 15 minutes.**
+  - The clock now starts when the inquiry ARRIVED in LP's inbound queue (`lp_inbound_queue.received_at_lp`, already true UTC), not when a person checked it out into a lead (`created_at_lp`).
+  - Calls on the inquiry count. Frederick B. was called 17 seconds after arriving, yet read "not called".
+- **Right calling list.**
+  - A visit booked after its Conf deadline gets `BOOKED_GRACE_MIN` (30) from its own time.
+  - A lead on a Simpletext list is its own yellow line, never "wrong list". Whether Simpletext leads should also be dialed is an open ruling.
+- **Called again after No Demo / DNC.**
+  - Only dials after the lead's `updated_at_lp` count, so the call that produced the ND does not.
+  - The Reset campaigns (`RESET_CAMPAIGN_RX`; `config.allowed_campaigns` overrides) are listed separately.
+  - Any Do Not Call lead called again is red on its own.
+- **Lead leaks.** Leads from the last `NEW_LEAK_DAYS` (2) decide the color. Older open leads are listed, yellow, as a cleanup for a person: the same 13 leads from Aug 22 to Sep 17 were "Urgent" every morning.
+- **Waiting for a first call.** A lead called once with no second call (`called_no_retry`) is said as such and is yellow; only never-called leads count toward red.
+- **Evening appointment checks.**
+  - At 8:00 AM ET each one writes a grey "Not due yet" (`resetDue`), so last night's result is on the board overnight only.
+  - Issued: yellow at 8:15 PM, red only at 8:45 PM.
+- **Inbound queue age** read `received_at_lp` as Eastern and lost 4 hours of wait.

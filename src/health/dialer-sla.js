@@ -31,11 +31,20 @@ import { lpLocalToUtcMs, callsSince, percentile, workingMsBetween } from '../lea
 import { normalizePhone10, estimateValue, DEAD_DISPOSITIONS, DNC_DISPOSITIONS, PROGRESSED_DISPOSITIONS } from '../lead-leak-classify.js';
 import { displayName } from '../lead-speed-alerts.js';
 import { count, duration, windowWords } from './plain.js';
+import { isTeamOpen } from '../agentic/team-hours.js';
 
 export const JOB_ID = 'dialer-sla-check';
 export const TICK_MS = 15 * 60_000;
 const MIN = 60_000;
 const HOUR = 60 * MIN;
+/** Minutes a visit booked after its Conf deadline gets to reach the Conf list. */
+export const BOOKED_GRACE_MIN = 30;
+/**
+ * A lead on a Simpletext list is on the texting campaign, not on the wrong
+ * calling list. Whether those leads should ALSO be dialed is a ruling still
+ * open (2026-10-15); until then they get their own line, never "wrong list".
+ */
+export const TEXTING_LIST_RX = /^simpletext/i;
 
 /** LP_ASAP is LP's DIAL ASAP list; Reece Chatbot / Direct Lead Entry are ours. All feed the DIAL ASAP campaign. */
 export const DIAL_ASAP_LISTS = Object.freeze(['LP_ASAP', 'Reece Chatbot', 'Direct Lead Entry']);
@@ -106,6 +115,40 @@ async function readUpcomingVisits(runSQL, todayKey, lastKey) {
        AND appointment_date >= '${todayKey}' AND appointment_date < '${lastKey}'`), 'lp_leads visits');
 }
 
+/**
+ * When each lead first ARRIVED, as an inquiry in LP's inbound queue
+ * (lds_id → ms). 2026-10-15: the first-call clock started at created_at_lp,
+ * which is when a person checked the inquiry out into a lead, up to an hour
+ * later, and calls placed on the inquiry before that were not counted:
+ * Frederick B. arrived 10:06:41 AM, was called 10:06:58 AM, and read "not
+ * called, 99 minutes". received_at_lp is already true UTC. A failed read
+ * falls back to created_at_lp (the old clock), never to "no lead".
+ */
+async function readArrivals(runSQL, leadIds) {
+  const out = new Map();
+  try {
+    for (let i = 0; i < leadIds.length; i += 500) {
+      const part = leadIds.slice(i, i + 500);
+      const r = await runSQL(`
+        SELECT lds_id, min(received_at_lp) AS received_at_lp FROM lp_inbound_queue
+         WHERE lds_id IN (${sqlList(part)}) GROUP BY 1`);
+      for (const x of r || []) {
+        const ms = Date.parse(x.received_at_lp);
+        if (Number.isFinite(ms)) out.set(String(x.lds_id), ms);
+      }
+    }
+  } catch { /* the old clock */ }
+  return out;
+}
+
+/** The lead's start: its inquiry's arrival, if earlier than LP's lead time. Pure. */
+export function arrivalMsFor(lead, arrivals) {
+  const createdMs = lpLocalToUtcMs(lead.created_at_lp);
+  const arrived = arrivals?.get(String(lead.lp_lead_id));
+  if (createdMs == null) return arrived ?? null;
+  return arrived != null && arrived < createdMs ? arrived : createdMs;
+}
+
 /** Phones with an open callback request in the last 72h (the callback path owns them). */
 async function readCallbackPhones(runSQL, nowMs) {
   try {
@@ -145,6 +188,7 @@ export async function evaluateLeadSla({ d, nowMs, registry }) {
   const history = await d.readHistory({ runSQL: d.runSQL, windowDays: 2, nowMs });
   const ctx = { five9Keys: history.keys, five9Phones: history.phones };
   const callbackPhones = await readCallbackPhones(d.runSQL, nowMs);
+  const arrivals = await readArrivals(d.runSQL, leads.map((l) => String(l.lp_lead_id)));
   let rates = null;
   try { rates = await d.readRates({ runSQL: d.runSQL, nowMs }); } catch { /* $ goes blank */ }
   const value = (lead) => (rates ? Math.round(estimateValue({ ...lead, source: lead.lead_source }, 'not_in_five9', rates) || 0) : null);
@@ -157,14 +201,16 @@ export async function evaluateLeadSla({ d, nowMs, registry }) {
     const st = leadState(lead);
     if (st.hasAppt) continue;
     const createdMs = lpLocalToUtcMs(lead.created_at_lp);
-    if (createdMs == null || createdMs > nowMs) continue;
-    const startMs = dialWindowStartMs(createdMs);
+    const arrivedMs = arrivalMsFor(lead, arrivals);
+    if (createdMs == null || arrivedMs == null || arrivedMs > nowMs) continue;
+    const startMs = dialWindowStartMs(arrivedMs);
     if (startMs > nowMs) continue; // its clock has not started (overnight arrival)
-    const calls = callsSince({ leadId: lead.lp_lead_id, phone10: normalizePhone10(lead.phone), createdAtLp: lead.created_at_lp }, ctx, 0);
-    const firstMs = calls.find((t) => t >= createdMs - MIN && t <= nowMs) ?? null;
+    // Calls on the inquiry (keyed INQ, matched by phone) count from its arrival.
+    const calls = callsSince({ leadId: lead.lp_lead_id, phone10: normalizePhone10(lead.phone), createdAtLp: lead.created_at_lp }, ctx, Math.max(0, (createdMs - arrivedMs) / HOUR) + 1 / 60);
+    const firstMs = calls.find((t) => t >= arrivedMs - MIN && t <= nowMs) ?? null;
     // Call-center minutes only (the same clock as lead_call_speed_daily): a
     // lead in at 19:50 and dialed at 08:05 waited 15 minutes, not 12 hours.
-    const minutes = workingMsBetween(createdMs, firstMs ?? nowMs) / MIN;
+    const minutes = workingMsBetween(arrivedMs, firstMs ?? nowMs) / MIN;
     measured.push({ minutes, dialed: firstMs != null });
     if (minutes > slaMin) lateLeads.push(slaLeadLine(lead, { waiting_min: Math.round(minutes), dialed: firstMs != null, est_value: value(lead) }));
   }
@@ -206,11 +252,17 @@ export async function evaluateLeadSla({ d, nowMs, registry }) {
     }, { nowMs, cfg });
     if (!expected.list) continue;
     let dueMs;
-    if (expected.dueByMs) dueMs = expected.dueByMs;
-    else {
+    if (expected.dueByMs) {
+      // A visit booked after its Conf deadline (11:41 AM for tomorrow, against
+      // 8:00 AM today) was "late" the moment it existed; the routing job adds it
+      // within minutes (2026-10-15: 3 of 5 flagged were that). It gets
+      // BOOKED_GRACE_MIN from the lead's own time.
+      dueMs = createdMs != null ? Math.max(expected.dueByMs, createdMs + BOOKED_GRACE_MIN * MIN) : expected.dueByMs;
+    } else {
       const sla = slaMinutesFor(expected.intent, listRow?.config);
-      if (sla === null || createdMs == null) continue;
-      dueMs = dialWindowStartMs(createdMs) + sla * MIN;
+      const arrivedMs = arrivalMsFor(lead, arrivals);
+      if (sla === null || arrivedMs == null) continue;
+      dueMs = dialWindowStartMs(arrivedMs) + sla * MIN;
     }
     if (dueMs > nowMs) continue;
     // Dialed already (for a booked visit: dialed since the deadline opened) → it was on a list.
@@ -223,6 +275,7 @@ export async function evaluateLeadSla({ d, nowMs, registry }) {
   candidates.sort((a, b) => (lpLocalToUtcMs(b.lead.created_at_lp) ?? 0) - (lpLocalToUtcMs(a.lead.created_at_lp) ?? 0));
   const cap = Number(listRow?.config?.lookup_cap ?? 300);
   const late = [];
+  const texting = [];
   let lookups = 0;
   let lookupErrors = 0;
   for (const c of candidates.slice(0, cap)) {
@@ -231,6 +284,10 @@ export async function evaluateLeadSla({ d, nowMs, registry }) {
     if (rec === 'error') { lookupErrors += 1; continue; }
     const actual = rec && typeof rec === 'object' ? rec.list || null : null;
     if (listSatisfies(c.expected, actual, cfg)) continue;
+    if (actual && TEXTING_LIST_RX.test(actual)) {
+      texting.push(slaLeadLine(c.lead, { actual_list: actual, expected_list: c.expected.list, waiting_min: Math.round((nowMs - c.dueMs) / MIN) }));
+      continue;
+    }
     late.push(slaLeadLine(c.lead, {
       expected_list: c.expected.list,
       actual_lists: actual ? [actual] : [],
@@ -250,16 +307,18 @@ export async function evaluateLeadSla({ d, nowMs, registry }) {
           return sla && l.waiting_min > sla;
         });
         if (late.length >= 3 || twiceSla) return 'fail';
-        if (late.length >= 1) return 'warn';
+        if (late.length >= 1 || texting.length) return 'warn';
         return lookupErrors ? 'unknown' : 'pass';
       },
-      summary: late.length
+      summary: (late.length
         ? `${count(late.length, 'lead')} ${late.length === 1 ? 'is' : 'are'} not on the Five9 calling list ${late.length === 1 ? 'it' : 'they'} should be on, past the deadline (${lookups} checked${lookupErrors ? `, ${lookupErrors} couldn't be looked up` : ''}${candidates.length > cap ? `, ${candidates.length - cap} not checked yet` : ''}).`
-        : `Every lead checked (${lookups}) is on the right Five9 calling list.`,
+        : `Every lead checked (${lookups}) is on the right Five9 calling list.`)
+        + (texting.length ? ` ${count(texting.length, 'Simpletext lead')} ${texting.length === 1 ? 'is' : 'are'} only on the Simpletext texting list, so ${texting.length === 1 ? 'it is' : 'they are'} not being called.` : ''),
       detail: {
         late: late.length, candidates: candidates.length, lookups, lookup_errors: lookupErrors,
         est_value_at_risk: late.reduce((s, l) => s + (l.est_value || 0), 0),
         leads: late,
+        texting_only: texting,
       },
       fingerprint: 'dialer.list_membership_sla',
     };
@@ -307,17 +366,44 @@ export async function evaluateCap3({ d }) {
   };
 }
 
+/**
+ * The Reset campaigns exist to call No Demo leads back and re-set them, so a
+ * dial from one is their job, not a breach (2026-10-15: 18 of 20 "called
+ * again" were Resets-Hot / Reset-Warm). Listed on their own line. Mark can
+ * override with config.allowed_campaigns (names; [] counts every campaign).
+ */
+export const RESET_CAMPAIGN_RX = /^resets?\b/i;
+export function isAllowedNeverAgainCampaign(campaign, config) {
+  const list = config?.allowed_campaigns;
+  if (Array.isArray(list)) return list.some((n) => String(n).toLowerCase() === String(campaign || '').toLowerCase());
+  return RESET_CAMPAIGN_RX.test(String(campaign || ''));
+}
+
+/**
+ * Of one phone's dials, the ones placed AFTER its lead got the disposition.
+ * LP gives no disposition time, so updated_at_lp (Eastern wall clock, the last
+ * change, never earlier than the disposition) stands in: the call that
+ * PRODUCED the ND is never a breach (2026-10-15: 583606 was called at 4:56 PM
+ * and set ND at 5:05 PM, and read "called again"). Pure.
+ */
+export function dialsAfterDisposition(times, updatedAtLp) {
+  const setMs = lpLocalToUtcMs(updatedAtLp);
+  return (times || []).map((t) => Date.parse(t)).filter((ms) => Number.isFinite(ms) && (setMs == null || ms > setMs));
+}
+
 /** dialer.never_again: ND / No Demo / DNC leads dialed again in the last 24h. */
 export async function evaluateNeverAgain({ d, registry }) {
   const row = registry.get('dialer.never_again');
   const never = [...(row?.config?.never_dispositions || ['ND', 'No Demo']), ...DNC_DISPOSITIONS];
+  const dncSet = new Set(DNC_DISPOSITIONS.map((x) => x.toLowerCase()));
   // The phone's NEWEST lead decides (an older ND lead on a number that has a
   // fresh lead since is a new conversation, not a breach).
   const r = rows(await d.runSQL(`
     WITH newest AS (
       SELECT DISTINCT ON (right(regexp_replace(coalesce(phone, ''), '[^0-9]', '', 'g'), 10))
              right(regexp_replace(coalesce(phone, ''), '[^0-9]', '', 'g'), 10) AS phone10,
-             lp_lead_id, first_name, last_name, lead_source, disposition_code, updated_at_lp
+             lp_lead_id, first_name, last_name, lead_source, disposition_code,
+             to_char(updated_at_lp AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS') AS updated_wall
         FROM lp_leads
        WHERE updated_at_lp >= now() - interval '120 days'
        ORDER BY right(regexp_replace(coalesce(phone, ''), '[^0-9]', '', 'g'), 10), created_at_lp DESC)
@@ -328,29 +414,46 @@ export async function evaluateNeverAgain({ d, registry }) {
   if (!outbound.length) return { check_id: 'dialer.never_again', status: 'unknown', summary: "Can't tell right now: Five9 didn't list any calling campaigns.", fingerprint: 'dialer.never_again' };
   const byPhone = new Map(r.map((x) => [x.phone10, x]));
   const dialed = [];
+  const byReset = [];
   const phones = [...byPhone.keys()];
   for (let i = 0; i < phones.length; i += 500) {
     const part = phones.slice(i, i + 500);
     const hits = rows(await d.runSQL(`
-      SELECT right(regexp_replace(coalesce(dnis, ''), '[^0-9]', '', 'g'), 10) AS phone, count(*) AS dials, max(received_at) AS last_at,
-             (array_agg(campaign ORDER BY received_at DESC))[1] AS campaign
+      SELECT right(regexp_replace(coalesce(dnis, ''), '[^0-9]', '', 'g'), 10) AS phone, campaign,
+             array_agg(received_at ORDER BY received_at) AS times
         FROM five9_events_raw
        WHERE event_type = 'disposition' AND received_at >= now() - interval '24 hours'
          AND campaign IN (${sqlList(outbound)})
          AND right(regexp_replace(coalesce(dnis, ''), '[^0-9]', '', 'g'), 10) IN (${sqlList(part)})
-       GROUP BY 1`), 'never-again dials');
+       GROUP BY 1, 2`), 'never-again dials');
     for (const h of hits) {
       const lead = byPhone.get(h.phone);
-      if (lead) dialed.push({ ...slaLeadLine({ ...lead, phone: lead.phone10 }), disposition: lead.disposition_code, dials: Number(h.dials), campaign: h.campaign, last_at: h.last_at });
+      if (!lead) continue;
+      const after = dialsAfterDisposition(h.times, lead.updated_wall);
+      if (!after.length) continue;
+      const line = { ...slaLeadLine({ ...lead, phone: lead.phone10 }), disposition: lead.disposition_code, dials: after.length, campaign: h.campaign, last_at: new Date(Math.max(...after)).toISOString() };
+      const dnc = dncSet.has(String(lead.disposition_code || '').toLowerCase());
+      // A Do Not Call lead is a breach from any campaign, a Reset one included.
+      (!dnc && isAllowedNeverAgainCampaign(h.campaign, row?.config) ? byReset : dialed).push(line);
     }
   }
+  // One phone can be dialed from two campaigns: count LEADS, list each line.
+  const uniq = (list) => new Set(list.map((l) => l.lp_lead_id)).size;
+  const dncCalled = uniq(dialed.filter((l) => dncSet.has(String(l.disposition || '').toLowerCase())));
+  const breached = uniq(dialed);
+  const resetLeads = uniq(byReset);
+  const parts = [];
+  parts.push(dncCalled ? `${count(dncCalled, 'Do Not Call lead')} ${dncCalled === 1 ? 'was' : 'were'} called again in the last day.` : 'No Do Not Call lead was called.');
+  const nd = breached - dncCalled;
+  parts.push(nd ? `${count(nd, '"No Demo" lead')} ${nd === 1 ? 'was' : 'were'} called again after being marked.` : 'No "No Demo" lead was called again outside the Reset campaigns.');
+  if (resetLeads) parts.push(`${count(resetLeads, '"No Demo" lead')} ${resetLeads === 1 ? 'was' : 'were'} called by the Reset campaigns, whose job is to re-set them.`);
   return {
     check_id: 'dialer.never_again',
-    value: dialed.length,
-    active: false,
-    eval: {},
-    summary: dialed.length ? `${count(dialed.length, 'lead')} marked "No Demo" or Do Not Call ${dialed.length === 1 ? 'was' : 'were'} called again in the last day (${r.length.toLocaleString('en-US')} checked).` : `None of the ${r.length.toLocaleString('en-US')} "No Demo" or Do Not Call leads was called again.`,
-    detail: { checked: r.length, leads: dialed.slice(0, 50), measure: 'a dial in five9_events_raw to the phone of a lead whose newest disposition is ND, No Demo or DNC' },
+    value: breached,
+    // Any Do Not Call lead called again is red on its own.
+    rule: (_v, c) => (dncCalled || breached >= Number(c.fail ?? 3) ? 'fail' : breached >= Number(c.warn ?? 1) ? 'warn' : 'pass'),
+    summary: `${parts.join(' ')} (${r.length.toLocaleString('en-US')} checked)`,
+    detail: { checked: r.length, leads: dialed.slice(0, 50), reset_campaign_calls: byReset.slice(0, 50), measure: 'a dial in five9_events_raw to the phone of a lead whose newest disposition is ND, No Demo or DNC, placed after the lead was last updated in LP' },
     fingerprint: 'dialer.never_again',
   };
 }
@@ -366,7 +469,7 @@ async function campaignPicture({ d, registry }) {
   const running = expected.map((n) => byName.get(String(n).toLowerCase()))
     .filter((c) => c && String(c.state).toUpperCase() === 'RUNNING' && String(c.type).toUpperCase() === 'OUTBOUND');
   const stats = await d.five9.getStatistics('AgentState');
-  const ready = (stats?.records || []).filter((rec) => Object.values(rec).some((v) => /^ready/i.test(String(v ?? '')))).length;
+  const { ready, working } = agentCounts(stats?.records);
   const sizes = new Map(((await d.five9.getListsInfo())?.lists || []).map((l) => [l.name, Number(l.size) || 0]));
   const out = [];
   for (const c of running) {
@@ -374,14 +477,53 @@ async function campaignPicture({ d, registry }) {
     if (!Array.isArray(cfg?.lists)) throw new Error(`lists for ${c.name} unreadable`);
     out.push({ campaign: c.name, records: cfg.lists.reduce((s, l) => s + (sizes.get(l.name) || 0), 0), lists: cfg.lists.map((l) => l.name) });
   }
-  return { campaigns: out, agentsReady: ready };
+  return { campaigns: out, agentsReady: ready, agentsWorking: working };
+}
+
+/**
+ * Agents Ready, and agents WORKING (Ready, on a call, or wrapping one up), from
+ * Five9's AgentState records. An agent on a call is not "Ready" but is taking
+ * calls, so "nobody is available" means nobody is working. Pure.
+ */
+export function agentCounts(records) {
+  const states = (records || []).map((rec) => {
+    if (rec && 'State' in rec) return String(rec.State ?? '').trim();
+    // An unexpected shape: any value that reads as a state.
+    return String(Object.values(rec || {}).find((v) => /^(ready|on call|after call work)/i.test(String(v ?? ''))) ?? '');
+  });
+  return {
+    ready: states.filter((st) => /^ready/i.test(st)).length,
+    working: states.filter((st) => /^(ready|on call|after call work|on hold|on park)/i.test(st)).length,
+  };
+}
+
+/**
+ * No agent working during call-center hours (2026-10-15, the user: "If no agent
+ * is ready, it's an issue, we need agents available."). Yellow; red when no
+ * call has ended for 30 minutes either. Outside call-center hours: skipped.
+ */
+async function noAgentsResult({ d, checkId, nowMs }) {
+  if (!isTeamOpen(nowMs)) return { check_id: checkId, status: 'skipped', summary: 'The call center is closed right now.', fingerprint: checkId };
+  const [last] = rows(await d.runSQL(`
+    SELECT max(received_at) AS last_at FROM five9_events_raw
+     WHERE event_type = 'disposition' AND received_at >= now() - interval '6 hours'`), 'last call');
+  const lastMs = last?.last_at ? Date.parse(last.last_at) : null;
+  const quietMin = lastMs ? Math.round((nowMs - lastMs) / MIN) : null;
+  return {
+    check_id: checkId,
+    status: quietMin === null || quietMin >= 30 ? 'fail' : 'warn',
+    value: 0,
+    summary: `No agents are logged in and available to take calls during call-center hours${quietMin === null ? ', and no call has ended in the last 6 hours' : `; the last call ended ${duration(quietMin)} ago`}.`,
+    detail: { agents_working: 0, last_call_at: last?.last_at || null },
+    fingerprint: checkId,
+  };
 }
 
 export async function evaluateListStalled({ d, registry, nowMs }) {
   const row = registry.get('dialer.list_stalled');
   if (etParts(nowMs).hour < 8) return { check_id: 'dialer.list_stalled', status: 'skipped', summary: 'Only checked after 8:00 AM (the calling lists refill at 6:00 AM).', fingerprint: 'dialer.list_stalled' };
   const pic = await campaignPicture({ d, registry });
-  if (!pic.agentsReady) return { check_id: 'dialer.list_stalled', status: 'skipped', summary: 'No agents are logged in and ready, so there is nothing to check.', fingerprint: 'dialer.list_stalled' };
+  if (!pic.agentsWorking) return noAgentsResult({ d, checkId: 'dialer.list_stalled', nowMs });
   const names = pic.campaigns.filter((c) => c.records > 0).map((c) => c.campaign);
   if (!names.length) return { check_id: 'dialer.list_stalled', status: 'pass', value: 0, summary: 'No calling list has leads waiting.', fingerprint: 'dialer.list_stalled' };
   const last = rows(await d.runSQL(`
@@ -404,17 +546,18 @@ export async function evaluateListStalled({ d, registry, nowMs }) {
     summary: (() => {
       const n = stalled.filter((s) => s.silent_min >= Number(row?.config?.warn_min ?? 30)).length;
       return n
-        ? `${count(n, 'calling list')} with leads waiting ${n === 1 ? 'has' : 'have'} not dialed in ${duration(worst)}, while ${count(pic.agentsReady, 'agent')} ${pic.agentsReady === 1 ? 'is' : 'are'} ready.`
-        : 'Every calling list with leads waiting is dialing.';
+        ? `${count(n, 'calling list')} with leads waiting ${n === 1 ? 'has' : 'have'} not dialed in ${duration(worst)}, while ${count(pic.agentsWorking, 'agent')} ${pic.agentsWorking === 1 ? 'is' : 'are'} working.`
+        : `Every calling list with leads waiting is dialing (${count(pic.agentsWorking, 'agent')} working, ${pic.agentsReady} ready for the next call).`;
     })(),
-    detail: { agents_ready: pic.agentsReady, campaigns: stalled },
+    detail: { agents_ready: pic.agentsReady, agents_working: pic.agentsWorking, campaigns: stalled },
     fingerprint: 'dialer.list_stalled',
   };
 }
 
 export async function evaluateDialRateDrop({ d, registry, nowMs }) {
   const pic = await campaignPicture({ d, registry });
-  if (!pic.agentsReady) return { check_id: 'dialer.dial_rate_drop', status: 'skipped', summary: 'No agents are logged in and ready, so there is nothing to check.', fingerprint: 'dialer.dial_rate_drop' };
+  // "Calling lists being worked" carries the no-agents alert; one card, not two.
+  if (!pic.agentsWorking) return { check_id: 'dialer.dial_rate_drop', status: 'skipped', summary: 'No agents are working, so there is no dialing pace to measure (see "Calling lists being worked").', fingerprint: 'dialer.dial_rate_drop' };
   const names = pic.campaigns.map((c) => c.campaign);
   if (!names.length) return { check_id: 'dialer.dial_rate_drop', status: 'skipped', summary: 'No calling campaign is running right now.', fingerprint: 'dialer.dial_rate_drop' };
   // This hour vs the same weekday-hour over the trailing 4 weeks, per campaign.
@@ -444,7 +587,7 @@ export async function evaluateDialRateDrop({ d, registry, nowMs }) {
       return 'pass';
     },
     summary: judged.length ? (worst >= 60 ? 'Dialing at a normal pace for this time of day.' : `The slowest campaign is dialing at ${worst}% of its normal pace for this time of day.`) : 'Not enough history yet to compare dialing pace.',
-    detail: { campaigns: per, agents_ready: pic.agentsReady },
+    detail: { campaigns: per, agents_ready: pic.agentsReady, agents_working: pic.agentsWorking },
     fingerprint: 'dialer.dial_rate_drop',
   };
 }

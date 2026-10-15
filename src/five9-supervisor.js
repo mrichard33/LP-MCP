@@ -202,7 +202,12 @@ export function normalizeStatistics(rawBlock) {
   const raw = rawBlock || {};
   const columns = asArray(raw.columns?.values?.data ?? raw.columns?.data ?? raw.header?.values?.data);
   const rowContainer = raw.values ?? raw.records ?? raw.rows;
-  const rows = asArray(rowContainer?.values ?? rowContainer)
+  // 2026-10-15: with more than one agent logged in, `rows` parses to an ARRAY,
+  // and `array.values` is Array.prototype.values (a function), so every row
+  // collapsed to one [null]. The health check read "no agent Ready" all day
+  // while five were Ready. An array is the row list itself.
+  const rowList = Array.isArray(rowContainer) ? rowContainer : (rowContainer?.values ?? rowContainer);
+  const rows = asArray(rowList)
     .map(r => asArray(r?.values?.data ?? r?.data ?? r))
     .filter(r => r.length);
   return { columns, rows };
