@@ -408,6 +408,27 @@ ON CONFLICT (check_id) DO UPDATE SET
   updated_at = CASE WHEN (health_checks.family, health_checks.system, health_checks.label, health_checks.question, health_checks.severity, health_checks.cadence, health_checks.active_window, health_checks.stale_after_min, health_checks.warn_rule, health_checks.fail_rule, health_checks.config, health_checks.mode, health_checks.owner_job_id, health_checks.runbook, health_checks.business_impact, health_checks.enabled) IS DISTINCT FROM (EXCLUDED.family, EXCLUDED.system, EXCLUDED.label, EXCLUDED.question, EXCLUDED.severity, EXCLUDED.cadence, EXCLUDED.active_window, EXCLUDED.stale_after_min, EXCLUDED.warn_rule, EXCLUDED.fail_rule, EXCLUDED.config, EXCLUDED.mode, EXCLUDED.owner_job_id, EXCLUDED.runbook, EXCLUDED.business_impact, EXCLUDED.enabled) THEN now() ELSE health_checks.updated_at END;
 
 INSERT INTO health_checks (check_id, family, system, label, question, severity, cadence, active_window, stale_after_min, warn_rule, fail_rule, config, mode, owner_job_id, runbook, business_impact, enabled)
+VALUES ('ci.recording_archive', 'sync', 'supabase', 'Call recording archive reachable', 'Can the call-intelligence worker reach the recording archive?', 'P3', 'existing', NULL, 1500, 'existing', 'legacy alert ci:recording_archive_unreachable firing', '{"source":"alert_conditions ci:recording_archive_unreachable (src/ci/worker.js)"}'::jsonb, 'shadow', NULL, NULL, 'Calls are not analyzed while the archive is unreachable', true)
+ON CONFLICT (check_id) DO UPDATE SET
+  family = EXCLUDED.family,
+  system = EXCLUDED.system,
+  label = EXCLUDED.label,
+  question = EXCLUDED.question,
+  severity = EXCLUDED.severity,
+  cadence = EXCLUDED.cadence,
+  active_window = EXCLUDED.active_window,
+  stale_after_min = EXCLUDED.stale_after_min,
+  warn_rule = EXCLUDED.warn_rule,
+  fail_rule = EXCLUDED.fail_rule,
+  config = EXCLUDED.config,
+  mode = EXCLUDED.mode,
+  owner_job_id = EXCLUDED.owner_job_id,
+  runbook = EXCLUDED.runbook,
+  business_impact = EXCLUDED.business_impact,
+  enabled = EXCLUDED.enabled,
+  updated_at = CASE WHEN (health_checks.family, health_checks.system, health_checks.label, health_checks.question, health_checks.severity, health_checks.cadence, health_checks.active_window, health_checks.stale_after_min, health_checks.warn_rule, health_checks.fail_rule, health_checks.config, health_checks.mode, health_checks.owner_job_id, health_checks.runbook, health_checks.business_impact, health_checks.enabled) IS DISTINCT FROM (EXCLUDED.family, EXCLUDED.system, EXCLUDED.label, EXCLUDED.question, EXCLUDED.severity, EXCLUDED.cadence, EXCLUDED.active_window, EXCLUDED.stale_after_min, EXCLUDED.warn_rule, EXCLUDED.fail_rule, EXCLUDED.config, EXCLUDED.mode, EXCLUDED.owner_job_id, EXCLUDED.runbook, EXCLUDED.business_impact, EXCLUDED.enabled) THEN now() ELSE health_checks.updated_at END;
+
+INSERT INTO health_checks (check_id, family, system, label, question, severity, cadence, active_window, stale_after_min, warn_rule, fail_rule, config, mode, owner_job_id, runbook, business_impact, enabled)
 VALUES ('dialer.campaign_running', 'dialer', 'five9', 'Expected campaigns are RUNNING', 'Is every campaign in the expected-running set RUNNING during dialing hours?', 'P1', 'every 5 min', '08:00-20:00 ET', 12, '-', 'NOT_RUNNING sustained 10 min; UNREADABLE = unknown', '{"expected":["DIAL ASAP","After DIAL ASAP","Callback Request","Conf - Next Day","Conf - 2nd Day","Data - Hot Leads less than 7","Data - Warm Leads less than 30","Data - Leads more than 30","Rehash - New","Rehash","Rehash - Very Old","Resets-Hot","Reset-Warm","Simpletext outbound","Previous Customer"],"sustain_ms":600000}'::jsonb, 'shadow', 'health-checks', NULL, 'DIAL ASAP stopped = no new lead is dialed', true)
 ON CONFLICT (check_id) DO UPDATE SET
   family = EXCLUDED.family,
@@ -1557,5 +1578,5 @@ INSERT INTO escalation_policy (severity, ack_within_min, remind_every_min, escal
 VALUES ('P4', NULL, NULL, '[]'::jsonb, '{"dashboard_only":true}'::jsonb)
 ON CONFLICT (severity) DO NOTHING;
 
--- Verify (expect 73 and 4):
+-- Verify (expect 74 and 4):
 -- SELECT count(*) FROM health_checks; SELECT count(*) FROM escalation_policy;
