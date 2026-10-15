@@ -391,6 +391,9 @@ list and per phone per day (`lp_appointment_sync_marks`, claimed before the push
 `job_runs.detail.by_reason`. A push posts NOTHING (Mark, 2026-10-07: the system fixed it, nobody acts; the per-pass and
 8 AM "put on a Five9 list" cards are gone, the push stays an `agent_actions` row with its `card_line`); live names in
 #ops, once, any lead 30+ dial minutes old with no call, push or reason.
+**The push is keyed number1 + LPRecKey (2026-10-15).** Keyed on number1 alone, an add for a returning homeowner
+updated their OLD Five9 record, which profile DIAL ASAP V2 screens out (> 72h): 7 of 147 pushes in a week sat on
+Direct Lead Entry and were never dialed (`backstopKeyFields`, the same keys `after-asap-retry` uses).
 `findContactInOtherLists` is NOT used here: it has never worked in production (bare-array criteria) and
 `f9_last_list` keeps the last list ever, so a naive fix would block most callbacks.
 **Missed paid callers are judged by their whole call history (2026-10-12).** `src/jobs/missed-caller-recovery.js`

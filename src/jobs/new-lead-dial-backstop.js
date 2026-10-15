@@ -277,6 +277,19 @@ async function claim(db, key, { contactId = null, ldsId = null, apptDate = null 
   return Array.isArray(data) && data.length > 0;
 }
 
+/**
+ * Which Five9 record the add updates (2026-10-15). Keyed on number1 alone, an
+ * add for a returning homeowner landed on their OLD record (Leo M., LP 582550:
+ * a Feb 2026 record; a Simpletext lead: an Aug 31 one), whose create time
+ * profile "DIAL ASAP V2" screens out (> 72h), so the lead sat on Direct Lead
+ * Entry and was never dialed: 7 of 147 pushes in a week. Keyed number1 +
+ * LPRecKey (INQ<in1>, the key LP's own inquiry record carries), it updates this
+ * lead's record, or creates a fresh one; the same keys after-asap-retry uses.
+ */
+export function backstopKeyFields(record) {
+  return record?.fieldNames?.includes('LPRecKey') ? { key_fields: ['number1', 'LPRecKey'] } : {};
+}
+
 function buildAction(row, record, list, reason, callNowMode, { cardLine, held }) {
   return {
     event_id: null,
@@ -289,6 +302,7 @@ function buildAction(row, record, list, reason, callNowMode, { cardLine, held })
     // stays one query away. The executor ignores them.
     action_payload: {
       list_name: list, field_names: record.fieldNames, records: [record.values], call_now_mode: callNowMode,
+      ...backstopKeyFields(record),
       card_line: cardLine, card_held: held,
     },
     rollback_payload: { action_type: 'five9_delete_record_from_list', list_name: list, field_names: ['number1'], records: [[record.number1]] },
