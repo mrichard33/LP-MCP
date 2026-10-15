@@ -961,7 +961,9 @@ silently) and the campaign is PREVIEW mode with a 7-hour gap filter after any ea
   the callback list ONLY, `isCallbackRearmDelete`), run inline and awaited; one that did not finish is cancelled
   before the add is queued. After the add, `checkCallbackRearm` (in the Five9 write handler) posts
   "PROMISED CALL AT RISK" to #contact-center at once when the list did not grow. Every record carries
-  `callback_requested_at` (UTC, `yyyy-MM-dd HH:mm:ss.SSS`), which rule 3 moves onto once the pushes are verified.
+  `callback_requested_at` (`yyyy-MM-dd HH:mm:ss.SSS` on the EASTERN wall clock, `formatFive9WriteDateTime`: Five9 reads a
+  written value as Eastern and reports it in UTC, so a UTC write was stored 4 hours late, 2026-10-15). Profile "Callback
+  Request V3" (live on the Callback Request campaign since 2026-10-15) dials on it: requested in the last 48 hours.
 - two no's and a canvasser complaint are reviewed, never dialed (`NO_DIAL_REASONS` in `bot-callback.js`): the two-no's
   line promises no contact, and "stop knocking on my door" (`isKnockComplaint`) gets the do-not-knock flow: the address,
   a name if none, then a **🚪 DO NOT KNOCK** card to the market's #canvass channel and the rollup. No sales call.
