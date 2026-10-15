@@ -279,6 +279,8 @@ export async function createAppointmentFromLpHandler(req, res) {
     assignedUserId = callAssigneeFor({
       isRehashCalendar: true,
       explicit: assignedUserId,
+      // 2026-10-15: a workflow may pass the lead's rehash rep (its follower).
+      contactRep: src.rehashRepId || src.rehash_rep_id || null,
       contactOwner: src.contactOwner || src.contact_owner || src.assignedTo || null,
       team: rehashTeamUserIds(),
     }) || '';

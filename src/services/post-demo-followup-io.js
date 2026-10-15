@@ -13,9 +13,10 @@
 // Melissa's second "November" files nothing new. Fire-and-forget: never blocks
 // or fails the reply. Every step is best-effort and logged.
 //
-// deps (tests): { ghlFetch, applyGHLTag, addGHLNote, filterNew, recordPosted, emitEvent, env, log }
+// deps (tests): { ghlFetch, getContact, applyGHLTag, addGHLNote, filterNew, recordPosted, emitEvent, env, log }
 
 import { rehashTeamUserIds } from '../agentic/rehash-state.js';
+import { rehashRepFor } from '../config/rehash-assignee.js';
 
 export const FOLLOWUP_TAG = 'followup-requested';
 export const FOLLOWUP_AUDIT = 'post_demo_followup';
@@ -24,6 +25,12 @@ async function withDefaults(deps) {
   const d = { ...deps };
   d.env ||= process.env;
   d.log ||= console.log;
+  // The contact read (for the rep on the lead) defaults only in production: a
+  // test that injects ghlFetch and no getContact keeps the team default.
+  if (!d.ghlFetch && !d.getContact) {
+    const { getContactCached } = await import('../actions/contact-cache.js');
+    d.getContact = (id) => getContactCached(id, null, { maxWaitMs: 2000 });
+  }
   if (!d.ghlFetch) d.ghlFetch = (await import('../actions/helpers.js')).ghlFetch;
   if (!d.applyGHLTag || !d.addGHLNote) {
     const ghl = await import('../ghl.js');
@@ -40,9 +47,10 @@ async function withDefaults(deps) {
 }
 
 /** The task, tag and note text for one deferral. Pure. */
-export function followUpTask({ firstName = null, label, untilIso, triggerMessage = '' }, env = process.env) {
+export function followUpTask({ firstName = null, label, untilIso, triggerMessage = '', rep = null }, env = process.env) {
   const who = firstName || 'This lead';
-  const assignedTo = [...rehashTeamUserIds(env)][0] || null;
+  // 2026-10-15: the rep on the lead (its follower) first; else the rehash rep.
+  const assignedTo = rep || [...rehashTeamUserIds(env)][0] || null;
   const said = String(triggerMessage || '').replace(/\s+/g, ' ').trim().slice(0, 300);
   return {
     title: `Follow up — ${who} asked for ${label}`,
@@ -67,7 +75,9 @@ export async function filePostDemoFollowUp({ contactId, deferral, firstName = nu
     if (!fresh.length) return { filed: false, reason: 'already_filed' };
   } catch { /* an unreadable store files again: the safe direction */ }
 
-  const t = followUpTask({ firstName, label: deferral.label, untilIso: deferral.untilIso, triggerMessage }, d.env);
+  const contact = d.getContact ? await d.getContact(contactId).catch(() => null) : null;
+  const rep = rehashRepFor(contact, rehashTeamUserIds(d.env));
+  const t = followUpTask({ firstName, label: deferral.label, untilIso: deferral.untilIso, triggerMessage, rep }, d.env);
   const out = { filed: true };
   try {
     await d.ghlFetch('POST', `/contacts/${contactId}/tasks`, {
