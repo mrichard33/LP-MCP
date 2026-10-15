@@ -466,8 +466,11 @@ async function campaignPicture({ d, registry }) {
   const expected = registry.get('dialer.campaign_running')?.config?.expected || [];
   const inv = await d.five9.getCampaigns();
   const byName = new Map((inv?.campaigns || []).map((c) => [String(c.name).toLowerCase(), c]));
+  // Only campaigns that DIAL: "Simpletext outbound" sends texts, so it never
+  // "goes quiet" (2026-10-15: it read as a stalled calling list).
+  const dialing = new Set(outboundDialCampaigns(inv));
   const running = expected.map((n) => byName.get(String(n).toLowerCase()))
-    .filter((c) => c && String(c.state).toUpperCase() === 'RUNNING' && String(c.type).toUpperCase() === 'OUTBOUND');
+    .filter((c) => c && String(c.state).toUpperCase() === 'RUNNING' && dialing.has(c.name));
   const stats = await d.five9.getStatistics('AgentState');
   const { ready, working } = agentCounts(stats?.records);
   const sizes = new Map(((await d.five9.getListsInfo())?.lists || []).map((l) => [l.name, Number(l.size) || 0]));
