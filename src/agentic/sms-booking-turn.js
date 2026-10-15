@@ -142,6 +142,15 @@ export function smsBookingTurn({ plan, trigger, thread = [], slots = [], tz = 'E
   };
 }
 
+/** Does a sentence name the requested time without AM/PM ("7", "6:30", "after 6")? Pure. */
+function namesRequestedHour(text, requestedTime) {
+  const [hm] = String(requestedTime || '').replace(/^after\s+/i, '').split(' ');
+  const [h, mm] = hm.split(':');
+  if (!h) return false;
+  const rx = mm && mm !== '00' ? new RegExp(`\\b${h}:${mm}\\b`) : new RegExp(`\\b${h}(?::00)?\\b(?!:)`);
+  return rx.test(String(text || ''));
+}
+
 function isSixPm(iso, timeZone) {
   const f = new Intl.DateTimeFormat('en-US', { timeZone, hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
   return f.format(new Date(iso)) === '18:00';
@@ -245,7 +254,11 @@ export function enforceBookingFacts(draft, facts, { companion = null } = {}) {
       // cannot find it next turn: the model's when it does, else ours.
       const own = body.find(p => /\bI'?m\s+holding\b/i.test(p) && exact && slotMentionIndex(p, slot) >= 0);
       // R5: the sentence noting their 6:30 / 7:00 ask may name that time.
-      const evNote = (p) => !!facts.evening && clockTimes(p).length > 0 && clockTimes(p).every(t => t === facts.evening.requested_minutes) && /\bnote/i.test(p);
+      // 2026-10-15 (live dry run): "I noted you'd prefer 7" names the hour with no
+      // AM/PM, which clockTimes cannot read, so the note was added a second time.
+      const evNote = (p) => !!facts.evening && /\bnote/i.test(p)
+        && clockTimes(p).every(t => t === facts.evening.requested_minutes)
+        && (clockTimes(p).length > 0 || namesRequestedHour(p, facts.evening.requested_time));
       body = body.filter(p => p === own || (!/\bI'?m\s+holding\b/i.test(p) && (!clockTimes(p).length || evNote(p))));
       // Their acknowledgement first, then the hold ("Sure. I'm holding … for you.").
       if (!own) { body = body.length ? [...body, `I'm holding ${slotLabel(slot, slot.tz || '')} for you.`] : [holdLine(slot, slot.tz || '', '').trim()]; notes.push('hold_sentence_fixed'); }
