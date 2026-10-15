@@ -175,3 +175,20 @@ test('"waiting for a first call" counts only leads never called', () => {
   const red = uncalledLiveResults({ decision: { verdict: 'alert' }, offenders: [lead('4', 'not_on_dial_list', 241)], nowMs: now })[0];
   assert.equal(status(red), 'fail');
 });
+
+test('a texting campaign is never a stalled calling list', async () => {
+  const d = {
+    runSQL: async () => [],
+    five9: {
+      getCampaigns: async () => ({ campaigns: [{ name: 'Simpletext outbound', type: 'OUTBOUND', state: 'RUNNING' }] }),
+      getStatistics: async () => ({ records: [{ State: 'Ready' }] }),
+      getListsInfo: async () => ({ lists: [{ name: 'Simpletext_ASAP', size: 441 }] }),
+      getOutboundCampaign: async () => ({ lists: [{ name: 'Simpletext_ASAP' }] }),
+    },
+  };
+  const reg = new Map(REGISTRY);
+  reg.set('dialer.campaign_running', { ...REGISTRY.get('dialer.campaign_running'), config: { expected: ['Simpletext outbound'] } });
+  const e = await evaluateListStalled({ d, registry: reg, nowMs: NOON });
+  assert.equal(e.status, 'pass');
+  assert.equal(e.summary, 'No calling list has leads waiting.');
+});

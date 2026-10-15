@@ -337,6 +337,7 @@ import { startSaleContactBackstopScheduler } from './jobs/sale-contact-backstop.
 import { startMissedCallerRecoveryScheduler } from './jobs/missed-caller-recovery.js';  // 2026-09-24
 import { startNewLeadDialBackstopScheduler } from './jobs/new-lead-dial-backstop.js';  // 2026-10-05
 import { startAfterAsapRetryScheduler } from './jobs/after-asap-retry.js';  // 2026-10-14
+import { startCancelResetRoutingScheduler } from './jobs/cancel-reset-routing.js';  // 2026-10-15
 import { startInboundCheckoutWatchScheduler } from './jobs/inbound-checkout-watch.js';  // 2026-10-06
 import { startPromisedCallbackScheduler } from './jobs/promised-callback-sweep.js';  // 2026-10-07
 import { startRehashTagScheduler } from './jobs/rehash-tag-sweep.js';  // 2026-10-09
@@ -1012,6 +1013,7 @@ const server = app.listen(PORT, async () => {
   startMissedCallerRecoveryScheduler();
   startNewLeadDialBackstopScheduler();
   startAfterAsapRetryScheduler();
+  startCancelResetRoutingScheduler();
   startInboundCheckoutWatchScheduler();
   startPromisedCallbackScheduler();
   startRehashTagScheduler();

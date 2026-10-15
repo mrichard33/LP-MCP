@@ -433,6 +433,17 @@ export const JOBS = Object.freeze([
     isEnabled: (env) => String(env.AFTER_ASAP_RETRY_MODE || 'shadow').toLowerCase().trim() !== 'off',
   },
   {
+    id: 'cancel-reset-routing',
+    label: 'Cancelled LP leads (CXL / CCC) no Reset campaign has called → Five9 "Resets-Hot"',
+    group: 'five9',
+    cadence: 'every 15 min, 24/7',
+    enabledEnv: 'CANCEL_RESET_ROUTING_MODE',
+    // A MODE (2026-10-15): off | shadow | live, default live (the user's
+    // ruling). Mirrors cancelResetMode() in src/cancel-reset-routing.js.
+    enabledDefault: true,
+    isEnabled: (env) => String(env.CANCEL_RESET_ROUTING_MODE || 'live').toLowerCase().trim() !== 'off',
+  },
+  {
     id: 'inbound-checkout-watch',
     label: 'LP inquiries waiting to be checked out → #contact-center; mirror of LP\'s inbound queue',
     group: 'lp-intake',

@@ -20,7 +20,7 @@ import {
   etDateKey, lpDateToKey, lpTimeToHHMM, unhandledLeads, formatUnhandledCard, isChatbotLead,
 } from '../src/new-lead-dial-backstop.js';
 import {
-  runNewLeadDialBackstop, wasCalled, inDialWindow, readInboundRows,
+  runNewLeadDialBackstop, wasCalled, inDialWindow, readInboundRows, backstopKeyFields,
 } from '../src/jobs/new-lead-dial-backstop.js';
 import { executeAddRecordsToList } from '../src/five9/admin-writes.js';
 import { summarizeContactRecord, five9UtcMs } from '../src/lead-leak-classify.js';
@@ -414,6 +414,10 @@ test('live: pushes once, posts nothing to #contact-center, and the next pass pus
   assert.equal(daniel.requires_approval, false);
   assert.equal(daniel.action_payload.card_held, false);
   assert.match(daniel.action_payload.card_line, /Daniel .* → Conf - Next Day \(LP lead 581084\)/, 'the push stays readable on its row');
+  // 2026-10-15: keyed on this lead's own record, never an older one on the phone.
+  for (const a of h.state.actions) {
+    if (a.action_payload.field_names.includes('LPRecKey')) assert.deepEqual(a.action_payload.key_fields, ['number1', 'LPRecKey']);
+  }
   assert.equal(h.state.posts.length, 0, 'Mark 2026-10-07: the system fixed it, nobody has to act');
   assert.equal(h.state.alerts.at(-1).active, false);
   const second = await h.run(MON_1015 + 5 * 60000);
@@ -602,4 +606,15 @@ test('a failed #ops watchdog post raises the ops alarm', async () => {
   assert.equal(res.ok, false);
   assert.ok(res.errors.some((e) => /unhandled-leads card/.test(e)));
   assert.equal(h.state.alerts.at(-1).active, true);
+});
+
+test('the add is keyed on number1 + LPRecKey when the record has one (Leo M., 2026-10-15)', () => {
+  // A number1-only add for a returning lead updated his Feb 2026 Five9 record,
+  // which DIAL ASAP V2 screens out (> 72h), so he was never dialed.
+  assert.deepEqual(backstopKeyFields({ fieldNames: ['number1', 'CustID', 'lead_id', 'LPRecKey'] }), { key_fields: ['number1', 'LPRecKey'] });
+  assert.deepEqual(backstopKeyFields({ fieldNames: ['number1', 'CustID', 'lead_id'] }), {}, 'no LPRecKey: number1, as before');
+  // The executor accepts the keys (both are mapped fields).
+  const rec = buildBackstopRecord({ phone: '8134556625', first: 'Leo', last: 'M', cstId: '400751', ldsId: '582550', in1: '429782' });
+  assert.ok(rec.fieldNames.includes('LPRecKey'));
+  assert.deepEqual(backstopKeyFields(rec), { key_fields: ['number1', 'LPRecKey'] });
 });
