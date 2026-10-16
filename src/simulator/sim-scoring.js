@@ -319,7 +319,7 @@ function rehashLaneFailures(r) {
 
 // 2026-10-16 (Melissa): the turn where the persona picked one of the offered
 // times in her own words ("sunday at 2", "Sun, Oct 18 at 2:00 PM ET?").
-const PICK_TEXT_RX = /^(?:sunday|monday|tuesday|wednesday|thursday|friday|saturday|tomorrow|today) at \d{1,2}\b|^(?:Sun|Mon|Tue|Wed|Thu|Fri|Sat), [A-Z][a-z]{2} \d{1,2} at \d{1,2}:\d{2} [AP]M/;
+const PICK_TEXT_RX = /^(?:sunday|monday|tuesday|wednesday|thursday|friday|saturday|tomorrow|today) at \d{1,2}\b|^(?:Sun|Mon|Tue|Wed|Thu|Fri|Sat|Tomorrow|Today)[a-z]*(?:,? [A-Z][a-z]+\.? \d{1,2})? at \d{1,2}:\d{2} [AP]M/;
 function pickTurn(r) {
   return (r.transcript || []).find(t => PICK_TEXT_RX.test(String(t.customer || ''))) || null;
 }

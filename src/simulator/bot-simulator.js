@@ -179,16 +179,23 @@ const MELISSA = {
  */
 export function pickOfferedTime(form) {
   const fn = (reply) => {
-    const rx = /\b(?:(Sun|Mon|Tue|Wed|Thu|Fri|Sat)[a-z]*,?\s+[A-Z][a-z]{2}\s+\d{1,2}|(tomorrow|today))\s+at\s+(\d{1,2}):(\d{2})\s*(AM|PM)(?:\s+([A-Z]{2}))?/g;
-    const times = [...String(reply || '').matchAll(rx)];
+    // 2026-10-16 (first live run): the model words its own offer ("Saturday,
+    // October 17 at 2:00 PM ET or 6:00 PM ET", "Saturday at 2:00 PM or 6:00
+    // PM"), so read every clock time and the day word nearest before it.
+    const text = String(reply || '');
+    const times = [...text.matchAll(/\b(\d{1,2}):(\d{2})\s*(AM|PM)\b/gi)];
     if (times.length < 2) return 'Yes, please set up a visit';
-    const m = times[1];
-    const DAY = { Sun: 'sunday', Mon: 'monday', Tue: 'tuesday', Wed: 'wednesday', Thu: 'thursday', Fri: 'friday', Sat: 'saturday' };
-    const day = m[1] ? DAY[m[1]] : m[2];
-    const hour = String(Number(m[3]));
-    if (form === 'label_q') return `${m[0].trim()}${m[6] ? '' : ' ET'}?`;
-    if (form === 'plus_q') return `${day} at ${hour} - what is the company name are there any specials going on`;
-    return `${day} at ${hour}`;
+    const t = times[1];
+    const before = text.slice(0, t.index);
+    const days = [...before.matchAll(/\b(?:(sun|mon|tue|wed|thu|fri|sat)[a-z]*(?:,?\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+\d{1,2})?|tomorrow|today)\b/gi)];
+    const day = days.at(-1);
+    if (!day) return 'Yes, please set up a visit';
+    const DAY = { sun: 'sunday', mon: 'monday', tue: 'tuesday', wed: 'wednesday', thu: 'thursday', fri: 'friday', sat: 'saturday' };
+    const dayWord = day[1] ? DAY[day[1].toLowerCase()] : day[0].toLowerCase();
+    const hour = String(Number(t[1]));
+    if (form === 'label_q') return `${day[0]} at ${t[1]}:${t[2]} ${t[3].toUpperCase()} ET?`;
+    if (form === 'plus_q') return `${dayWord} at ${hour} - what is the company name are there any specials going on`;
+    return `${dayWord} at ${hour}`;
   };
   fn.form = form;
   return fn;

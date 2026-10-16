@@ -299,3 +299,16 @@ test('eval: the Melissa scenarios pick from the times the bot offered and score 
   assert.deepEqual(SCENARIO_EXPECTATIONS.bare_unit_address(booked), []);
   assert.equal(SCENARIO_EXPECTATIONS.bare_unit_address({ would_do: [{ kind: 'would_book', address: '2486 Caring Way, 33952' }] })[0].code, 'address_incomplete');
 });
+
+test('eval: the pick helper reads the model\'s own wording of its offer', async () => {
+  const { pickOfferedTime } = await import('../src/simulator/bot-simulator.js');
+  const { SCENARIO_EXPECTATIONS } = await import('../src/simulator/sim-scoring.js');
+  const a = 'Perfect. So we can measure your windows and doors this weekend. Saturday, October 17 at 2:00 PM ET, or Saturday, October 17 at 6:00 PM ET. Which works better for you?';
+  assert.equal(pickOfferedTime('bare')(a), 'saturday at 6');
+  assert.equal(pickOfferedTime('label_q')(a), 'Saturday, October 17 at 6:00 PM ET?');
+  const b = 'Perfect. For a windows and doors assessment this weekend, I have Saturday at 2:00 PM or 6:00 PM. Which works better for you?';
+  assert.equal(pickOfferedTime('plus_q')(b), 'saturday at 6 - what is the company name are there any specials going on');
+  assert.equal(pickOfferedTime('bare')('I have tomorrow at 10:00 AM ET or Sun, Oct 18 at 2:00 PM ET.'), 'sunday at 2');
+  const run = { transcript: [{ turn: 1, customer: 'hi', bot: [a] }, { turn: 2, customer: 'Saturday, October 17 at 6:00 PM ET?', bot: ["I'm holding Saturday, October 17 at 6:00 PM ET for you. What's your first name?"] }] };
+  assert.deepEqual(SCENARIO_EXPECTATIONS.pick_with_question_mark(run), []);
+});
