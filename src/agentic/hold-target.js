@@ -76,15 +76,20 @@ export function pickEndedHold(holds, nowMs) {
 
 /**
  * Where this callback's return_to comes from:
- *   'body'          the callback carried it (unchanged behavior)
- *   'body_field'    GHL sent the contact field (hold_return_target)
+ *   'body'          a top-level return_to (a direct caller; unchanged behavior)
+ *   'custom_data'   GHL's Webhook action: its Custom Data rows arrive nested
+ *                   under body.customData, never at the top level
+ *   'body_field'    the contact field GHL puts on every webhook body
+ *                   ("Hold Return Target", or hold_return_target)
  *   'issued_hold'   our own issue_hold row that is due now
  *   null            nothing; the callback is refused as before
  */
 export function recoverHoldTarget({ body = {}, holds = [], nowMs = Date.now() } = {}) {
   const direct = clean(body.return_to);
   if (direct) return { returnTo: direct, source: 'body', hold: null };
-  const field = clean(body.hold_return_target);
+  const nested = clean(body.customData?.return_to);
+  if (nested) return { returnTo: nested, source: 'custom_data', hold: null };
+  const field = clean(body.hold_return_target) || clean(body['Hold Return Target']);
   if (field) return { returnTo: field, source: 'body_field', hold: null };
   const hold = pickEndedHold(holds, nowMs);
   if (hold) return { returnTo: hold.return_to, source: 'issued_hold', hold };

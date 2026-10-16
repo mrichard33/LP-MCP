@@ -157,3 +157,41 @@ test('route: off, nothing due, or a failed read → refused as before, nothing e
     assert.equal(r.events.length, 0);
   }
 });
+
+// ── GHL's real webhook shape (live test on Mark Test, 2026-10-16) ─────
+// The Webhook action puts the contact payload (contact_id, every custom field
+// by name) at the top level and its Custom Data rows under body.customData.
+test('return_to nested under customData is read, labelled custom_data', () => {
+  const r = recoverHoldTarget({ body: { contact_id: 'c1', customData: { return_to: 'hold_test' } }, nowMs: NOW });
+  assert.deepEqual([r.returnTo, r.source], ['hold_test', 'custom_data']);
+});
+
+test('the contact field "Hold Return Target" on the top level is read', () => {
+  const r = recoverHoldTarget({ body: { contact_id: 'c1', 'Hold Return Target': 'renter_recheck', customData: { return_to: '' } }, nowMs: NOW });
+  assert.deepEqual([r.returnTo, r.source], ['renter_recheck', 'body_field']);
+});
+
+test('custom_data is gated by the mode like any recovered target', () => {
+  assert.equal(completionEventType({ source: 'custom_data', mode: 'shadow' }), 'agentic.hold_completed_shadow');
+  assert.equal(completionEventType({ source: 'custom_data', mode: 'live' }), 'agentic.hold_completed');
+  assert.equal(completionEventType({ source: 'custom_data', mode: 'off' }), null);
+});
+
+test('route: a GHL-shaped body emits from customData without reading our holds', async () => {
+  const r = routeWith({ env: {}, holds: [] });
+  const out = await r.call({
+    contact_id: 'hZOcPk6XmMvWVvjZJ7mz',
+    'Hold Return Target': 'hold_test',
+    'Next Wait Hours': 0.05,
+    customData: { event: 'hold_complete', contact_id: 'hZOcPk6XmMvWVvjZJ7mz', return_to: 'hold_test', hold_hours: '0.05', hold_reason: 'Test hold', workflow_code: 'HOLD_TEST', completed_at: '1:41 PM' },
+  });
+  assert.equal(out.ok, true);
+  assert.equal(out.return_to_source, 'custom_data');
+  assert.equal(out.emitted, 'agentic.hold_completed_shadow');
+  assert.equal(r.reads(), 0);
+  assert.equal(r.events[0].event_subtype, 'hold_test');
+  assert.equal(r.events[0].payload.hold_hours, 0.05);
+  assert.equal(r.events[0].payload.workflow_code, 'HOLD_TEST');
+  // GHL's completed_at is a wall-clock "1:41 PM", never an ISO time.
+  assert.ok(!Number.isNaN(Date.parse(r.events[0].payload.completed_at)));
+});
