@@ -338,3 +338,59 @@ test('PR 7: a run with new scenario checks is a new baseline, not "worse"', () =
   assert.match(cmp.reasons[0], /scenario checks changed/);
   assert.equal(scoreRun([{ channel: 'sms', scenario: 'x', transcript: [], lead_stage_mode: 'live' }]).lead_stage_mode, 'live');
 });
+
+// ── 2026-10-16 (framework cleanup, Phase 0): the rehash scenarios ──
+const sms = (scenario, transcript, extra = {}) => result(scenario, transcript, { channel: 'sms', ...extra });
+const pd = (step, extra = {}) => ({ nepq: { post_demo: true, step, ...extra } });
+
+test('rehash: every turn must be planned post-demo, and only a Rehash Call is booked', () => {
+  const notPd = scoreResult(sms('rehash_competitor_signed', [turn(1, 'We went with someone else, thanks', 'Thanks for letting me know.', { nepq: { step: 'answer' } })]));
+  assert.ok(notPd.failures.some(f => f.code === 'not_planned_as_post_demo'), JSON.stringify(notPd.failures));
+  const visit = scoreResult(sms('rehash_book_call', [turn(1, 'Sure, what times work for a call?', 'I have Tue at 10:00 AM or Wed at 2:00 PM. Which works better?', pd('rehash_offer', { would_do: [] }))], {
+    would_do: [{ kind: 'would_book_appointment', payload: { calendar_name: 'Window Estimate' } }],
+  }));
+  assert.ok(visit.failures.some(f => f.code === 'rehash_booked_visit'));
+});
+
+test('rehash_not_at_this_time: two no\'s end in a stop with no question', () => {
+  const good = scoreResult(sms('rehash_not_at_this_time', [
+    turn(1, 'Hi, I got the proposal', 'Great. Did you get a chance to look it over?', pd('post_demo_ack')),
+    turn(2, 'Not at this time. Thanks', 'Of course. What would make it work for you?', pd('post_demo')),
+    turn(3, 'No, we are good', "Understood. I'm here if anything changes.", pd('post_demo_stop')),
+  ]));
+  assert.equal(good.pass, true, JSON.stringify(good.failures));
+  const bad = scoreResult(sms('rehash_not_at_this_time', [
+    turn(1, 'Not at this time. Thanks', 'Of course. What would make it work?', pd('post_demo')),
+    turn(2, 'No, we are good', 'Totally get it. Cheaper bids usually cut corners on install. Want to talk it over?', pd('post_demo')),
+  ]));
+  const codes = bad.failures.map(f => f.code);
+  assert.ok(codes.includes('no_stop_after_two_nos'), codes.join());
+  assert.ok(codes.includes('question_after_two_nos'), codes.join());
+  assert.ok(codes.includes('post_demo_rebuttal'), 'a post-demo turn now gets the post-demo hard checks: ' + codes.join());
+});
+
+test('rehash_defer and competitor: the right step, and no times', () => {
+  assert.equal(scoreResult(sms('rehash_defer', [turn(1, 'Call me in November', "That works. I'll check back in November.", pd('defer'))])).pass, true);
+  const missed = scoreResult(sms('rehash_defer', [turn(1, 'Call me in the spring', 'Sure. I have Tue at 10:00 AM or Wed at 2:00 PM for a call.', pd('post_demo'))]));
+  assert.deepEqual(missed.failures.map(f => f.code).sort(), ['deferral_not_recognised', 'times_after_deferral']);
+  const comp = scoreResult(sms('rehash_competitor_signed', [turn(1, 'We went with someone else', "Thanks for letting me know. I'll pass this to our team.", pd('competitor_signed'))]));
+  assert.equal(comp.pass, true, JSON.stringify(comp.failures));
+});
+
+test('rehash_repeat_objection: a person takes it, never a Five9 dial', () => {
+  const t3 = turn(3, 'The price is the problem', "Understood. I'll have John take a look at it and reach out.", pd('handoff', { handoff: { reason: 'rehash_repeat_objection' } }));
+  t3.would_do = [{ kind: 'would_post_review_card_no_five9', reason: 'rehash_repeat_objection' }];
+  const good = scoreResult(sms('rehash_repeat_objection', [turn(1, 'Too expensive', 'What part of the price felt off?', pd('rehash_objection')), t3]));
+  assert.equal(good.pass, true, JSON.stringify(good.failures));
+  const dialed = { ...t3, would_do: [{ kind: 'would_file_callback_five9_and_contact_center', reason: 'x' }] };
+  assert.ok(scoreResult(sms('rehash_repeat_objection', [dialed])).failures.some(f => f.code === 'rehash_dialed'));
+});
+
+test('rehash_book_call: offered, booked on Rehash Call, the caller named', () => {
+  const t2 = turn(2, 'The first one', "You're all set for Tue at 10:00 AM. John will give you a call then.", pd('rehash_confirm'));
+  t2.would_do = [{ kind: 'would_book_appointment', payload: { rehash_call: true, calendar_name: 'Rehash Call' } }];
+  const good = scoreResult(sms('rehash_book_call', [turn(1, 'Sure, what times work for a call?', 'I have Tue at 10:00 AM or Wed at 2:00 PM. Which works better?', pd('rehash_offer')), t2]));
+  assert.equal(good.pass, true, JSON.stringify(good.failures));
+  const none = scoreResult(sms('rehash_book_call', [turn(1, 'Sure, what times?', "I'll have John reach out.", pd('post_demo'))]));
+  assert.deepEqual(none.failures.map(f => f.code).sort(), ['no_rehash_call_times', 'rehash_call_not_booked']);
+});

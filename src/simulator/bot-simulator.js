@@ -81,7 +81,10 @@ export function withPersonaLp(context, persona) {
     appointment_set: lp.appointment_cancelled ? false : !!lp.appointment_date,
     appointment_cancelled: !!lp.appointment_cancelled,
     appointment_date: lp.appointment_cancelled ? null : (lp.appointment_date || null),
-    last_appointment_date: lp.last_appointment_date || null,
+    // lastAppointmentDaysAgo keeps a rehash persona inside its 30-day window
+    // whenever the run happens (2026-10-16).
+    last_appointment_date: lp.last_appointment_date
+      || (Number.isFinite(lp.lastAppointmentDaysAgo) ? new Date((Date.parse(context?.now?.iso) || Date.now()) - lp.lastAppointmentDaysAgo * 86_400_000).toISOString() : null),
     notes: lp.notes || [],
   };
   const next = { ...context, lp: ctxLp };
@@ -93,6 +96,14 @@ export function withPersonaLp(context, persona) {
 // scenario that should book can (yes_without_booking is only fair then).
 const DANA = { firstName: 'Dana', lastName: 'Sim', phone: '+13525550101', email: null, postalCode: '33908', address: '1200 Palm Ave, Fort Myers FL 33908' };
 const KATY = { firstName: 'Dana', lastName: 'Sim', phone: '+13525550101', email: null, postalCode: null, address: '1200 Main Street, Katy TX 77494' };
+// 2026-10-16 (framework cleanup, Phase 0): a post-demo lead in rehash. Her LP
+// lead is OPPFDN with a demo a week ago (isInRehash by LP lead) and she carries
+// the `rehash` tag, so the SMS reply writer plans the post-demo NEPQ track. The
+// demo date is relative to the run, so the 30-day window never runs out.
+const REHASH_LEAD = {
+  firstName: 'Monica', lastName: 'Sim', phone: '+17275550177', email: null, postalCode: '33711', tags: ['rehash'],
+  lp: { disposition: 'OPPFDN', lastAppointmentDaysAgo: 7, zip: '33711', city: 'Saint Petersburg', address: '400 Oak St' },
+};
 
 /**
  * The persona's answer to the bot's last question, or null (2026-10-12,
@@ -164,6 +175,13 @@ export const SCENARIOS = Object.freeze({
   // ── 2026-10-13 (Erica Hilts): a price ask, then a goodbye, twice ──
   price_then_goodbye: { title: 'Price ask, then "have a good day" (Erica Hilts)', persona: DANA, turns: ["Hi, I'm looking to get a bay window. The area is about 6ft wide", "Ok I see. What's an average price including installation?", 'Thank you for your time, just needing an average estimation, not exact pricing. Have a good day.', 'I can call back when I have more time. Ty'] },
   slider_only: { title: 'One sliding glass door (meets the minimum)', persona: DANA, autoAnswer: true, turns: ['I need to replace our sliding glass door', 'Yes, please set up a visit'] },
+  // ── 2026-10-16 (framework cleanup, Phase 0): the post-demo rehash track ──
+  // SMS only: rehash is the SMS reply writer's (the live chat never plans it).
+  rehash_not_at_this_time: { title: 'Rehash: "Not at this time", then a second no', persona: REHASH_LEAD, channels: ['sms'], turns: ['Hi, I got the proposal', 'Not at this time. Thanks', 'No, we are good'] },
+  rehash_competitor_signed: { title: 'Rehash: went with someone else', persona: REHASH_LEAD, channels: ['sms'], turns: ['We went with someone else, thanks'] },
+  rehash_defer: { title: 'Rehash: call me in the spring', persona: REHASH_LEAD, channels: ['sms'], turns: ['Thanks for coming out. Call me in the spring and we will see'] },
+  rehash_repeat_objection: { title: 'Rehash: the same price objection three times', persona: REHASH_LEAD, channels: ['sms'], turns: ['It is just too expensive for us right now', 'Honestly the price is still too high', 'The price is the problem, it is just too much'] },
+  rehash_book_call: { title: 'Rehash: "Sure, what times?" then a pick', persona: REHASH_LEAD, channels: ['sms'], autoAnswer: true, turns: ['Sure, what times work for a call?'] },
 });
 
 /** Parse a message list or a scenario name into one plan. Pure. */
@@ -326,7 +344,7 @@ export async function simulateSms(plan, { nepqMode = 'live', generate, buildReal
   // A real contact's record, read once (dry run: nothing is written to it).
   const realBase = plan.contactId && buildRealContext ? await buildRealContext(plan.contactId) : null;
   const p = plan.persona;
-  const contact = { firstName: /^guest$/i.test(p.firstName || '') ? null : p.firstName, lastName: /^guest$/i.test(p.firstName || '') ? null : p.lastName, phone: p.phone || '+15555550100', email: p.email, postalCode: p.postalCode, tags: [] };
+  const contact = { firstName: /^guest$/i.test(p.firstName || '') ? null : p.firstName, lastName: /^guest$/i.test(p.firstName || '') ? null : p.lastName, phone: p.phone || '+15555550100', email: p.email, postalCode: p.postalCode, tags: Array.isArray(p.tags) ? [...p.tags] : [] };
   const thread = [];
   const transcript = [];
   const stageDeps = simStageDeps(stageModeOverride);
