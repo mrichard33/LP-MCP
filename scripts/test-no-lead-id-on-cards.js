@@ -85,7 +85,7 @@ const SHAPES = [
   /\blp_lead \$\{/,
 ];
 // A log line, or a GHL note, is not Slack. The statement may start a few lines up.
-const NOT_SLACK = /console\.|logger\.|\blog\.(?:warn|info|error|debug|log)\(|\blog\(|addGHLNote\(|addNote\(/;
+const NOT_SLACK = /console\.|logger\.|\blog\.(?:warn|info|error|debug|log)(?:\?\.)?\(|\blog\(|addGHLNote\(|addNote\(/;
 
 function* jsFiles(dir) {
   for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
