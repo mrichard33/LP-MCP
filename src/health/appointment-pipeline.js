@@ -213,7 +213,7 @@ export const CHECKS = {
       const campaigns = row.config?.conf_campaigns || ['Conf - Next Day', 'Conf - 2nd Day'];
       const leads = rowsOf(await runSQL(`
         SELECT ${LEAD_COLS} FROM lp_leads
-         WHERE (appointment_date AT TIME ZONE 'UTC')::date = '${tomorrow}' AND disposition_code IN ('Set', 'Verif')`), 'tomorrow set');
+         WHERE (appointment_date AT TIME ZONE 'UTC')::date = '${tomorrow}' AND disposition_code = 'Set'`), 'tomorrow set'); // Verif is a hold: no Conf dial owed (2026-10-16)
       if (!leads.length) return { status: 'pass', value: 0, summary: `Every appointment for ${dayWords(tomorrow)} is already confirmed.` };
       // Pre-aggregated: today's Conf-campaign dials by key and by phone (one
       // read, no join against the leads).

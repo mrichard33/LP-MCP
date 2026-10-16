@@ -64,6 +64,7 @@ export { etDateKey, daysBetween, isChatbotLead, routeList, routeNoAppt };
 import { dialWindowStartMs } from './five9/callback-dial-check.js';
 import { buildCallbackRecord, callbackListName, callbackCallNowMode } from './five9/callback-push.js';
 import { capLines } from './alert-posted.js';
+import { isHoldDisposition } from './lp-disposition-classes.js';
 
 export const MODES = Object.freeze(['off', 'shadow', 'live']);
 export const FORBIDDEN_LIST = 'LP_ASAP';
@@ -74,13 +75,14 @@ export const FORBIDDEN_LIST = 'LP_ASAP';
 export const DEAD_DISPOSITIONS = Object.freeze(new Set([
   'CXL', 'ND', 'No Demo', 'NoHome', 'OPPFDN', 'CCC', '1Leg', 'NIS2', 'DNC', 'Out Of Area', 'OOA', 'Kill', 'Bad Data',
 ]));
-// "Verif" is NOT here (Mark, 2026-10-06: "Verif means the same as Set"):
-// a never-called Verif lead is routed like a Set one (currentState below).
+// "Verif" is not dead either: it is a HOLD (Mark, 2026-10-16, superseding
+// 2026-10-06 "Verif means the same as Set"). A Verif lead is pushed to NO list
+// — neither a Confirmation list nor DIAL ASAP — see prefilter's hold check.
 export const PROGRESSED_DISPOSITIONS = Object.freeze(new Set([
   'Cnf', 'Issue', 'Sale', 'Reset', 'NIS', 'NOC', 'NoRehash', 'Demo',
 ]));
-// Dispositions that mean a booked visit. Verif = Set (Mark, 2026-10-06).
-export const BOOKED_DISPOSITIONS = Object.freeze(new Set(['Set', 'Verif']));
+// Dispositions that mean a booked visit. Verif left 2026-10-16 (a hold, above).
+export const BOOKED_DISPOSITIONS = Object.freeze(new Set(['Set']));
 
 // "Nobody spoke to them" — an inbound call from the lead with one of these is
 // not contact (same list as src/jobs/missed-caller-recovery.js).
@@ -242,7 +244,7 @@ export function currentState(row, lead = null) {
     apptDateEt = row.apptDate;
     apptStartMs = row.apptTime ? lpStoredToUtcMs(`${row.apptDate}T${row.apptTime}:00`) : null;
   }
-  // "Set" (or "Verif", which means the same) is a booked visit. A blank
+  // "Set" is a booked visit. A blank
   // disposition with a date is a self-booked row LP has not dispositioned yet.
   // "Data" with a leftover date is not booked.
   const hasAppt = BOOKED_DISPOSITIONS.has(dsp) || (!dsp && Boolean(apptDateEt));
@@ -292,6 +294,7 @@ export function prefilter({ row, lead = null, called, sold = false, callbackRequ
   const state = currentState(row, lead);
   if (DEAD_DISPOSITIONS.has(state.dsp)) return { action: 'skip', reason: 'dead_disposition', state };
   if (PROGRESSED_DISPOSITIONS.has(state.dsp)) return { action: 'skip', reason: 'progressed', state };
+  if (isHoldDisposition(state.dsp)) return { action: 'skip', reason: 'verif_hold', state };
 
   const route = routeList({ ...state, nowMs, cfg });
   if (route.skip) return { action: 'skip', reason: route.skip, state };

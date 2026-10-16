@@ -50,7 +50,8 @@ import { emitEvent } from './event-emitter.js';
 import { utcToLpStoredIso } from './lp-dates.js';
 
 // Dispositions that prove a lead's appointment is still live on the books.
-const LIVE_APPOINTMENT_DISPOSITIONS = ['Set', 'Cnf'];
+// 2026-10-16: Issue (issued to a rep) is a live appointment too (Mark).
+const LIVE_APPOINTMENT_DISPOSITIONS = ['Set', 'Cnf', 'Issue'];
 
 // Dispositions that prove the contact already bought on another lead.
 // 'Sold' is not currently emitted by the LP sync; kept as a harmless synonym

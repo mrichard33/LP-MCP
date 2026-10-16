@@ -32,6 +32,7 @@
  */
 
 import { lpWallClockToGhlStartTime } from '../appointment-dates.js';
+import { isDisqualifiedDisposition } from '../lp-disposition-classes.js';
 
 // The IDs were checked against list_pipelines(forceLive) on 2026-10-16. The
 // stages were renamed, so they do not follow the old stage names. Env wins so a
@@ -175,7 +176,8 @@ export function targetFor({ disposition, appt, now, cfg }) {
   if (!appt) return { kind: 'close', status: 'abandoned', reason: code === 'CXL' ? 'cxl' : 'no_appointment' };
   if (appointmentPassed(appt, now, cfg)) return { kind: 'close', status: code === 'CXL' ? 'abandoned' : null, reason: 'appointment_passed' };
   if (code === 'CXL') return { kind: 'close', status: 'abandoned', reason: 'cxl' };
-  if (code === 'ND') return { kind: 'stage', stage: 'disqualified', reason: 'nd' };
+  // ND and No Demo are one class (src/lp-disposition-classes.js, Mark 2026-10-16).
+  if (isDisqualifiedDisposition(code)) return { kind: 'stage', stage: 'disqualified', reason: code === 'ND' ? 'nd' : 'no_demo' };
   if (code === 'Cnf') return { kind: 'stage', stage: 'confirmed', reason: 'cnf' };
   if (code === 'Verif') return { kind: 'stage', stage: 'issue', reason: 'verif' };
   if (code === 'Set') {
@@ -267,7 +269,7 @@ export function decideMove({ row, live, target, disposition, apptAt, lpChangedAt
   if (handMoved && timeBased) return { ...base, op: 'blocked', toStage: to, reason: 'manual_move_respected' };
 
   if (LOCKED_STAGES.has(currentStage)) {
-    const ndException = to === 'disqualified' && disposition === 'ND';
+    const ndException = to === 'disqualified' && isDisqualifiedDisposition(disposition);
     if (!ndException) return { ...base, op: 'blocked', toStage: to, reason: 'locked_stage' };
   }
 

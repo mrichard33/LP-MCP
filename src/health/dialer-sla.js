@@ -48,7 +48,8 @@ export const TEXTING_LIST_RX = /^simpletext/i;
 
 /** LP_ASAP is LP's DIAL ASAP list; Reece Chatbot / Direct Lead Entry are ours. All feed the DIAL ASAP campaign. */
 export const DIAL_ASAP_LISTS = Object.freeze(['LP_ASAP', 'Reece Chatbot', 'Direct Lead Entry']);
-export const BOOKED = new Set(['Set', 'Verif', 'Cnf', 'Issue', 'Issued']);
+// 2026-10-16: Verif out — a hold gets no Confirmation list, so the SLA must not expect one.
+export const BOOKED = new Set(['Set', 'Cnf', 'Issue', 'Issued']);
 const SKIP = new Set([...DEAD_DISPOSITIONS, ...DNC_DISPOSITIONS, ...PROGRESSED_DISPOSITIONS].map((s) => String(s).toLowerCase()));
 
 export function dialerSlaMode(env = process.env) {
@@ -111,7 +112,7 @@ async function readUpcomingVisits(runSQL, todayKey, lastKey) {
     SELECT lp_lead_id, lp_prospect_id, first_name, last_name, phone, lead_source, lead_source_detail,
            disposition_code, appointment_date, created_at_lp
       FROM lp_leads
-     WHERE disposition_code IN ('Set', 'Verif')
+     WHERE disposition_code = 'Set'
        AND appointment_date >= '${todayKey}' AND appointment_date < '${lastKey}'`), 'lp_leads visits');
 }
 

@@ -50,6 +50,7 @@
 
 import { DEAD_DISPOSITIONS, PROGRESSED_DISPOSITIONS, BOOKED_DISPOSITIONS } from './new-lead-dial-backstop.js';
 import { contactRecordRows, parseFive9Attempts } from './lead-leak-classify.js';
+import { isHoldDisposition } from './lp-disposition-classes.js';
 
 export const MODES = Object.freeze(['off', 'shadow', 'live']);
 export const AFTER_LIST = 'After DIAL ASAP';
@@ -89,6 +90,25 @@ export const phone10 = (raw) => {
   return d.length >= 10 ? d.slice(-10) : null;
 };
 
+// 2026-10-16 (Olga 8134839869, LP 583671, handoff v3.4 Fix 6): DIAL ASAP got an
+// Answering Machine at 12:02Z, then the same agent dialed her twice by hand on
+// "Main Number" (NA, NA). Her LAST event was therefore not a DIAL ASAP call, so
+// she was never a candidate and never reached After DIAL ASAP (Data - Hot
+// called her ~26h later). A trailing MANUAL call that made no contact is not a
+// conversation and does not end the follow-up: look past it to the dialer call
+// before it. Any contact, inbound call or other campaign still ends it.
+export const MANUAL_DIAL_CAMPAIGNS = Object.freeze(new Set(['Main Number']));
+
+/** Pure: the event that decides the follow-up — the last one, skipping trailing manual no-contact dials. */
+export function lastDialerEvent(sortedList) {
+  for (let i = sortedList.length - 1; i >= 0; i--) {
+    const e = sortedList[i];
+    if (i > 0 && e.outbound && MANUAL_DIAL_CAMPAIGNS.has(e.campaign) && NO_CONTACT_DISPOSITIONS.has(e.d)) continue;
+    return e;
+  }
+  return sortedList[sortedList.length - 1];
+}
+
 /**
  * Phones owed the After DIAL ASAP follow-up, from Five9 disposition events.
  * events: [{ dnis, ani, campaign, d, lp_rec_key, t }] (t: ISO, real UTC).
@@ -109,7 +129,7 @@ export function pickCandidates(events, { nowMs, cfg }) {
   const out = [];
   for (const [phone, list] of byPhone) {
     list.sort((a, b) => a.ms - b.ms);
-    const last = list[list.length - 1];
+    const last = lastDialerEvent(list);
     if (!last.outbound || !SOURCE_CAMPAIGNS.has(last.campaign) || !NO_CONTACT_DISPOSITIONS.has(last.d)) continue;
     const age = nowMs - last.ms;
     if (age < cfg.graceMin * 60_000 || age > cfg.lookbackHours * HOUR) continue;
@@ -137,6 +157,9 @@ export function decide({ cand, rec, lpDispo, onDnc }) {
   if (onDnc === true) return { action: 'skip', reason: 'dnc' };
   const code = String(lpDispo ?? '').trim();
   if (BOOKED_DISPOSITIONS.has(code)) return { action: 'skip', reason: 'booked' };
+  // Verif is a hold (Mark, 2026-10-16): never handed to a list. It left
+  // BOOKED_DISPOSITIONS that day, so it is named here on its own.
+  if (isHoldDisposition(code)) return { action: 'skip', reason: 'verif_hold' };
   if (DEAD_DISPOSITIONS.has(code) || PROGRESSED_DISPOSITIONS.has(code)) return { action: 'skip', reason: `lp_${code}` };
   if (!cand.lpRecKey) return { action: 'skip', reason: 'no_lp_rec_key' };
   if (rec === 'error') return { action: 'skip', reason: 'lookup_failed' };

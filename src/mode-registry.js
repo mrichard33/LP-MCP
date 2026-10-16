@@ -174,6 +174,11 @@ export const MODES = Object.freeze([
     evidence: { events: ['agentic.missed_inbound_redriven'] },
     note: 'Answers an inbound text or email GHL never sent to the reply webhook.',
   }),
+  m('HOLD_RETURN_RECOVERY_MODE', 'bot', 'enum', OSL, 'shadow', OSL_S, {
+    since: '2026-10-16', decider: 'the user',
+    evidence: { events: ['agentic.hold_completed_shadow'] },
+    note: 'Completes a Dynamic Hold whose GHL callback arrived with a blank return_to, from our own issue_hold row.',
+  }),
   m('REPLY_SLA_WATCHDOG_MODE', 'bot', 'enum', OSL, 'shadow', OSL_S, {
     since: '2026-09-02',
     note: 'Flags a text with no reply after 3 minutes.',
@@ -266,6 +271,12 @@ export const MODES = Object.freeze([
     since: '2026-10-05', decider: 'the user',
     goLive: '"[LP-PROXY] REP BRIEF SHADOW" briefs pass checkRepBrief and read right (node scripts/render-rep-brief.js)',
     note: 'Writes the 2-3 sentence rep brief as the LP note.',
+  }),
+  m('ESTIMATE_DRIFT_FIX_MODE', 'lp', 'enum', OSL, 'shadow', OSL_S, {
+    since: '2026-10-16',
+    evidence: { events: ['appt.drift_detected'] },
+    goLive: 'Mark flips it in Railway after two watchdog runs of appt.drift_detected would-do rows are reviewed (handoff v3.4 Fix 8)',
+    note: 'Parity watchdog corrects sync-created GHL estimates that drifted from LP: reschedule to LP time, or invalid for a year-typo date.',
   }),
   m('LP_APPT_GUARD_MODE', 'lp', 'enum', OSE, 'shadow', OSE_S, {
     since: '2026-09-13',

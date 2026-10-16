@@ -147,6 +147,9 @@ export const REASONS = Object.freeze([
 // lead was called, so it never enters lead_leak_daily — but it is owed another
 // call, so the waiting card names it rather than dropping it.
 export const CALLED_NO_RETRY_REASON = 'called_no_retry';
+// 2026-10-16 (handoff v3.4 Fix 6): called through the last After DIAL ASAP
+// attempt and not handed to the next list (Data - Hot) since.
+export const ATTEMPTS_EXHAUSTED_REASON = 'attempts_exhausted_not_handed';
 
 // Which LAST Five9 disposition leaves a lead owed another call (2026-09-29).
 // Only "we did not reach them": the first live hour of called_no_retry named

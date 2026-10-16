@@ -68,7 +68,12 @@ import { emitEvent } from '../event-emitter.js';
 // Unlisted dispositions rank 0 and can never TAKE authority. That includes
 // CXL — which is exactly why callers must never gate a cancellation on a
 // granted claim. See the cancel carve-out in the LP→GHL handler.
-export const BOOKING_AUTHORITY_RANK = { Set: 1, Verif: 1, Cnf: 2 };
+//
+// 2026-10-16 (Mark): Verif is a HOLD ("there is an issue with the lead") and no
+// longer claims or holds a seat — it ranks 0 like CXL. Issue (issued to a rep)
+// is as live as a Cnf and ranks with it. The rank reaches the database as
+// p_rank on every claim, so no SQL change is needed.
+export const BOOKING_AUTHORITY_RANK = { Set: 1, Cnf: 2, Issue: 2 };
 
 /** Rank for an LP disposition code. Unknown/absent → 0. */
 export function rankForDisposition(code) {

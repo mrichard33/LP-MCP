@@ -54,7 +54,8 @@ import { lpWallClockToGhlStartTime, appointmentDelta } from '../appointment-date
 import { utcToLpStoredIso } from '../lp-dates.js';
 import { runStragglerCancelPass, DEFAULT_STRAGGLER_LOOKBACK_DAYS } from './ghl-straggler-cancel.js';
 
-const DISPOSITIONS = ['Set', 'Cnf', 'CXL', 'Verif'];
+// 2026-10-16: Verif out (a hold, no automation); Issue in (a live appointment).
+const DISPOSITIONS = ['Set', 'Cnf', 'Issue', 'CXL'];
 const DEFAULT_HORIZON_DAYS = 14;
 
 // In-memory job registry. Map<jobId, jobState>.

@@ -113,6 +113,7 @@ test('stage order: past → close, CXL, ND, Cnf, Verif, Set <24h, Set', () => {
   assert.equal(t('Verif', '2026-10-17T09:00:00+00:00').stage, 'issue');             // Issue beats the 24h rule
   assert.equal(t('Cnf', '2026-10-20T10:00:00+00:00').stage, 'confirmed');
   assert.equal(t('ND', '2026-10-20T10:00:00+00:00').stage, 'disqualified');
+  assert.equal(t('No Demo', '2026-10-20T10:00:00+00:00').stage, 'disqualified');   // one class with ND (lp-disposition-classes.js)
   assert.deepEqual(t('CXL', '2026-10-20T10:00:00+00:00'), { kind: 'close', status: 'abandoned', reason: 'cxl' });
   assert.equal(t('Cnf', '2026-10-15T18:00:00+00:00').kind, 'close');                // yesterday
   assert.equal(t('Cnf', '2026-10-16T07:00:00+00:00').kind, 'close');                // 3h ago today (>2h)

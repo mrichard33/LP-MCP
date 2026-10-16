@@ -216,7 +216,9 @@ test('digest: P2 won/lost with names, new parity keys only, and the morning chec
 });
 
 // 2026-10-03: the Sale → P2 backstop's work is a digest section, not its own card.
-test('digest: Sale → P2 backstop fixes are counted; a no-price sale is named once', async () => {
+// 2026-10-16 (handoff v3.4 Fix 7): a fix needs nobody — one "Auto-fixed" line;
+// only the sales the backstop could not place are named (once).
+test('digest: Sale → P2 backstop fixes are one Auto-fixed line; a no-price sale is named once', async () => {
   const tables = {
     system_events: [
       { event_type: 'p2.sale_backstop', event_subtype: 'tagged_deal_won', ghl_contact_id: 's1', created_at: iso(NOW - 2 * HOUR), payload: {} },
@@ -233,9 +235,10 @@ test('digest: Sale → P2 backstop fixes are counted; a no-price sale is named o
   const { deps, sent, db } = digestDeps({ tables, names: { s1: 'Sam Sale', s2: 'Cara Cancel', s3: 'Nora Noprice' } });
   await digest.runOpsMorningDigest({ post: true, deps });
   const t = sent[0].text;
-  assert.match(t, /Sales put into P2 by the backstop \(24h\)/);
-  assert.match(t, /deal-won added \(C\.0 builds the card\): 1 — Sam Sale/);
-  assert.match(t, /card created as Lost: 1 — Cara Cancel/);
+  assert.match(t, /Auto-fixed: 2 \(no action\)/);
+  assert.match(t, /P2 backstop added 2 sales — auto-fixed/);
+  assert.doesNotMatch(t, /Sam Sale|Cara Cancel/);
+  assert.match(t, /Sale → P2 backstop: needs a person/);
   assert.match(t, /Nora Noprice \(s3\) · LP job 59882 "Awaiting Paperwork" · LP job has no price yet — not in P2 · price the job in LP/);
   assert.match(t, /\(s4\) · LP job 58338 "Awaiting Paperwork" · looks like an old quote a paid job replaced — not in P2 · close it in LP if it is dead/);
   assert.match(t, /\(s5\) · LP job 60074 "RTP Await recission" · repeat customer: GHL allows one P2 card per person and the old one is closed — not in P2 · decide by hand; do not reopen the old card/);

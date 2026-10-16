@@ -68,10 +68,12 @@
  *     layer3_dispatch, emit_event, check_eligibility, check_throttle,
  *     compute_risk_score, calculate_time_lapse_tier, classify_bucket,
  *     reanalyze_reply
- *   State machines (8):
+ *   State machines (9):
  *     compute_rescission_dispatch, transition_objection_state,
  *     resolve_objection_state, classify_lead_state, end_agentic_handoff,
  *     dq_hard_stop (2026-10-07),
+ *     disqualified_cleanup (2026-10-16 — ND / No Demo end state;
+ *       src/actions/handlers/disqualified-cleanup.js),
  *     release_rehash_owner (2026-10-09 — the rehash stage ended; the rehash
  *       rep stops owning the contact; src/actions/handlers/rehash-owner.js)
  *     s52_cancel_recheck (2026-10-02 — the one 30-minute re-check of a cancel
@@ -303,6 +305,8 @@ import { trackAction } from '../graceful-shutdown.js';
 import { isDqTriggerTag, scheduleDqHardStop, executeDqHardStop, LP_NOTE_DQ_TRIGGER } from '../services/dq-hard-stop.js';
 import { resolveWorkflowIdByCanonicalCode } from '../tools/admin/hl-fallback.js';
 import { ghlFetch } from './helpers.js';
+import { executeDisqualifiedCleanup } from './handlers/disqualified-cleanup.js';
+import { fetchUpcomingAppointments } from '../knowledge/contact-appointments.js';
 
 // MVI v2.5 — fetch the source event for a given action. The shared
 // getEventContext returns ONLY the spread payload (no event_id /
@@ -636,6 +640,15 @@ async function executeUpdateOpportunityWithLostReason(action, context) {
 // actions). Done here, not in the rule templates, so every DQ rule — and the
 // next one written — is covered. Shadow (SEND_GATE_MODE unset) only records
 // send_gate.would_hard_stop. A scheduling failure never fails the add_tag.
+function disqualifiedCleanupDeps() {
+  return {
+    supabase,
+    ghlFetch,
+    fetchUpcomingAppointments,
+    resolveWorkflowId: resolveWorkflowIdByCanonicalCode,
+  };
+}
+
 function dqHardStopDeps() {
   return {
     supabase,
@@ -719,6 +732,7 @@ export const ACTION_HANDLERS = {
   classify_lead_state: executeClassifyLeadState, // 2026-06-02 — Phase 2 lead-state classifier + S4.5 enrollment (reactive invoker)
   end_agentic_handoff: (action) => endAgenticHandoff(action.target_id), // 2026-06-16 — silent agentic-active teardown on terminal closeout
   dq_hard_stop: (action, context) => executeDqHardStop(action, context, dqHardStopDeps()), // 2026-10-07 — stop-bot + leave workflows after a DQ
+  disqualified_cleanup: (action, context) => executeDisqualifiedCleanup(action, context, disqualifiedCleanupDeps()), // 2026-10-16 — ND / No Demo end state (handoff v3.4 Fix 2)
   // 2026-07-21 Phase C — Five9 gated writes. Ships dark (FIVE9_WRITES_ENABLED
   // unset → every one of these skips). Must be queued requires_approval=true.
   five9_start_campaign: executeFive9Write,

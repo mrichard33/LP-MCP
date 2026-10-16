@@ -71,6 +71,7 @@ import { GHL_LOCATION_ID } from '../actions/constants.js';
 import { reconcileLpAppointmentToGhl } from './lp-ghl-appointment-reconciler.js';
 import { readLiveForSync } from './lp-live-appointment.js';
 import { notifyImplausibleAppointment } from '../actions/handlers/lp-ghl-appointment-sync.js';
+import { mirrorLeadAppointment } from './mirror-on-link.js';
 import { normalizePhone } from '../sync-utils.js';
 import { pickPhoneMatch, searchByPhone as resolveSearchByPhone, isDuplicate400 } from './ghl-contact-resolve.js';
 
@@ -78,6 +79,7 @@ import { pickPhoneMatch, searchByPhone as resolveSearchByPhone, isDuplicate400 }
 const searchByPhone = (phone) => resolveSearchByPhone(phone, { log: console });
 import { appointmentDelta } from '../appointment-dates.js';
 import { emitDispositionBackfill } from '../sync-leads.js';
+import { LIVE_APPOINTMENT_DISPOSITIONS } from '../lp-disposition-classes.js';
 import { notifyBackstopRun } from './backstop-notify.js';
 import { utcToLpStoredIso } from '../lp-dates.js';
 import { cleanName, buildIdentityFill, dropTakenEmail, putWithIdentityFill } from './lp-identity-fill.js';
@@ -90,8 +92,10 @@ const LP_LEAD_ID_FIELD = 'GmAVmW6V9sekD7pVONKr';
 const LP_PROSPECT_ID_FIELD = 'ZRQAVrzhtzApzLlHmT87';
 
 // Only live-appointment dispositions. NOT CXL — no value creating a contact
-// for a cancelled appointment; NOT DNC/Issue/others.
-const DISPOSITIONS = ['Set', 'Cnf', 'Verif'];
+// for a cancelled appointment; NOT DNC/others. 2026-10-16 (Mark): Verif is a
+// hold that starts nothing (no contact, no appointment); Issue (issued to a
+// rep) is a live appointment and joins Set/Cnf.
+const DISPOSITIONS = [...LIVE_APPOINTMENT_DISPOSITIONS];
 // Both scans read the same columns. email/address/city/state/zip were added
 // 2026-10-11 for the identity fill on the link path (lp-identity-fill.js).
 const LEAD_COLUMNS = 'lp_lead_id, ghl_contact_id, disposition_code, appointment_date, created_at_lp, first_name, last_name, email, address, city, state, zip, phone, lead_source, lead_source_detail, lp_prospect_id, '
@@ -319,7 +323,7 @@ export function makeIntakeWindowGate(lookbackHours, untilIso = null, nowMs = Dat
 // ─── Selection ───────────────────────────────────────────────────────
 /**
  * Scan lp_leads for APPOINTMENT-mode backstop candidates: unlinked leads with
- * an upcoming Set/Cnf/Verif appointment and a plausibly-valid phone. Coarse
+ * an upcoming Set/Cnf/Issue appointment and a plausibly-valid phone. Coarse
  * SQL date prefilter (appointment_date stores ET wall-clock mislabeled as UTC
  * → bounds widened a day each side), exact day-granular filtering in JS.
  *
@@ -683,16 +687,20 @@ export async function processOneLead({
   let outcome = action;
   if (lead.appointment_date) {
     // LP live first (2026-10-15): a stale row or a year-typo date must not
-    // become a real visit with reminders to the homeowner.
-    const live = await (deps.readLiveForSync || readLiveForSync)(lead, { dryRun });
-    const rec = await (deps.reconcileLpAppointmentToGhl || reconcileLpAppointmentToGhl)({
-      contactId, lead, live, toNotify: true, contactCache, dryRun,
+    // become a real visit with reminders to the homeowner. Since 2026-10-16
+    // (handoff v3.4 Fix 3) through the one mirror-on-link path: only a live
+    // disposition, never within 60 minutes, canvass leads without
+    // notifications, and one "LP date/time looks wrong" card for a bad date
+    // or hour (src/services/mirror-on-link.js).
+    const rec = await mirrorLeadAppointment({
+      contactId, lead, tags: contactCache.get(contactId)?.tags || [], contactCache, dryRun,
+      deps: {
+        readLiveForSync: deps.readLiveForSync || readLiveForSync,
+        reconcileLpAppointmentToGhl: deps.reconcileLpAppointmentToGhl || reconcileLpAppointmentToGhl,
+        notifyImplausibleAppointment: deps.notifyImplausibleAppointment || notifyImplausibleAppointment,
+      },
     });
     apptResult = rec.outcome === 'noop' ? rec.reason : rec.outcome;
-    if (rec.reason === 'implausible_future_appointment' && !dryRun) {
-      await (deps.notifyImplausibleAppointment || notifyImplausibleAppointment)({ contactId, lead, result: rec })
-        .catch((e) => console.warn(`[LpContactBackstop] implausible-appointment alert failed for lead ${lead.lp_lead_id}: ${e.message}`));
-    }
     if (rec.reason === 'dnc_consent') outcome = 'skipped_dnc'; // matched DNC = link-only
   }
 

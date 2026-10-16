@@ -222,7 +222,7 @@ test('Cnf (already confirmed) → no add, removal yes', () => {
   assert.deepEqual([d.add, d.remove], [false, true]);
 });
 
-test('Issue is treated like confirmed (no add, removal yes); Verif is treated like Set (Mark, 2026-10-06)', () => {
+test('Issue is treated like confirmed (no add, removal yes); Verif is a hold: no add, removal yes (Mark, 2026-10-16)', () => {
   const now = edt('2026-10-06T16:00:00');
   const issue = pre(cand({ dsp_id: 'Issue' }), now);
   assert.equal(issue.action, 'candidate');
@@ -232,10 +232,13 @@ test('Issue is treated like confirmed (no add, removal yes); Verif is treated li
   // lp_leads says Issue even though the inquiry row said Set.
   const lead = { lp_lead_id: '581671', disposition_code: 'Issue', appointment_date: '2026-10-08 18:00:00+00', lp_prospect_id: '463389' };
   assert.equal(pre(cand({}, lead), now).reason, 'appointment_issued');
-  // "Verif means the same as Set": Confirmation add first, then the removal.
+  // 2026-10-16 (Mark) supersedes "Verif means the same as Set": a Verif lead gets
+  // NO Confirmation add, but staying off the setter lists (suppression) stays.
   const verif = pre(cand({ dsp_id: 'Verif' }), now);
-  assert.deepEqual([verif.action, verif.reason, verif.route.addList], ['candidate', 'appt_in_2_days', 'Conf - 2nd Day']);
-  assert.deepEqual([decide({ ...base, pre: verif }).add, decide({ ...base, pre: verif }).remove], [true, false]);
+  assert.deepEqual([verif.action, verif.reason, verif.route.addList], ['candidate', 'verif_hold', null]);
+  assert.deepEqual([decide({ ...base, pre: verif }).add, decide({ ...base, pre: verif }).remove], [false, true]);
+  const vrow = buildRemovalAction(cand({ dsp_id: 'Verif' }), { reason: 'verif_hold', cfg, nowMs: now });
+  assert.match(vrow.reasoning, /Verif/);
   const row = buildRemovalAction(cand({ dsp_id: 'Issue' }), { reason: 'appointment_issued', cfg, nowMs: now });
   assert.match(row.reasoning, /already issued to a rep/);
   assert.match(describeApprove(row, { contactName: 'Shelley' }), /already issued to a rep/);
@@ -660,10 +663,12 @@ test('the claim read pages until a short page', async () => {
   assert.deepEqual(calls, [0, 1000, 2000]);
 });
 
-test('new-lead backstop: Verif is a booked visit, exactly like Set (Mark, 2026-10-06)', () => {
+test('new-lead backstop: Set is a booked visit; Verif is a hold pushed to no list (Mark, 2026-10-16)', () => {
   const nowMs = edt('2026-10-06T16:00:00');
   const bcfg = backstopConfig({});
-  for (const dsp of ['Set', 'Verif']) {
+  const v = backstopPrefilter({ row: normalizeInboundRow({ ...SHELLEY_RAW, dsp_id: 'Verif' }), lead: null, called: false, nowMs, cfg: bcfg });
+  assert.deepEqual([v.action, v.reason], ['skip', 'verif_hold']);
+  for (const dsp of ['Set']) {
     const row = normalizeInboundRow({ ...SHELLEY_RAW, dsp_id: dsp });
     const st = currentState(row, null);
     assert.equal(st.hasAppt, true, dsp);

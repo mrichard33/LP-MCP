@@ -31,8 +31,10 @@ export function isChatbotLead(row, lead = null) {
 }
 
 
-/** Dispositions booked routing takes OFF the setter lists without a Confirmation add (Mark, 2026-10-06). */
-export const REMOVE_ONLY_DSP = Object.freeze({ Cnf: 'already_confirmed', Issue: 'appointment_issued' });
+/** Dispositions booked routing takes OFF the setter lists without a Confirmation add (Mark, 2026-10-06).
+ *  Verif (Mark, 2026-10-16): "there is an issue with the lead" — it starts nothing, so it gets NO
+ *  Confirmation add, but staying off the setter lists is suppression and stays. */
+export const REMOVE_ONLY_DSP = Object.freeze({ Cnf: 'already_confirmed', Issue: 'appointment_issued', Verif: 'verif_hold' });
 
 /* --- new leads (from src/new-lead-dial-backstop.js) --------------------- */
 

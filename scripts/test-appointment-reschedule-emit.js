@@ -85,15 +85,15 @@ test('CXL never emits — rule 271 owns cancels', () => {
   assert.equal(d.reason, 'disposition_not_eligible');
 });
 
-test('only Set, Verif and Cnf are eligible', () => {
-  assert.deepEqual([...RESCHEDULE_ELIGIBLE_DISPOSITIONS].sort(), ['Cnf', 'Set', 'Verif']);
-  for (const code of ['Set', 'Verif', 'Cnf']) {
+test('only Set and Cnf are eligible (Verif is a hold since 2026-10-16)', () => {
+  assert.deepEqual([...RESCHEDULE_ELIGIBLE_DISPOSITIONS].sort(), ['Cnf', 'Set']);
+  for (const code of ['Set', 'Cnf']) {
     assert.equal(
       shouldEmitReschedule({ previousAppointmentDate: PREV, appointmentDate: NEXT, dispositionCode: code }).emit,
       true, `${code} should emit`);
   }
   // A date move after the appointment happened is history, not a held slot.
-  for (const code of ['Issue', 'Sold', 'NS', 'Data', '', null]) {
+  for (const code of ['Verif', 'Issue', 'Sold', 'NS', 'Data', '', null]) {
     assert.equal(
       shouldEmitReschedule({ previousAppointmentDate: PREV, appointmentDate: NEXT, dispositionCode: code }).emit,
       false, `${code} should not emit`);

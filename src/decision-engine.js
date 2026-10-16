@@ -204,6 +204,7 @@
  */
 
 import supabase from './supabase.js';
+import { LIVE_APPOINTMENT_DISPOSITIONS } from './lp-disposition-classes.js';
 import { analyzeMessage } from './message-analyzer.js';
 import { claimConsumedMessages, releaseConsumedMessages } from './services/consumed-messages.js';
 import { scoreIntent } from './intent-scorer.js';
@@ -327,8 +328,10 @@ const LP_DISP_PREFIX = 'LP_DISP_';
 // contact". Used by the multi-lead guard's DNC-duplicate carve-out so a stale
 // DNC lead can't bury a booking that lands on an older sibling lead of the
 // same contact. Kept in sync with classifyDisposition in
-// services/lp-ghl-appointment-reconciler.js (Set/Cnf/Verif → appointment).
-const BOOKING_DISPOSITION_CODES = new Set(['Set', 'Cnf', 'Verif']);
+// services/lp-ghl-appointment-reconciler.js. 2026-10-16 (Mark): Verif is a
+// hold that starts nothing, so it no longer gets past the guard on this ground;
+// Issue (issued to a rep) is a live appointment and does.
+const BOOKING_DISPOSITION_CODES = new Set(LIVE_APPOINTMENT_DISPOSITIONS);
 const DNC_DISPOSITION_CODES = new Set(['DNC']);
 
 // 2026-08-02 — booking-authority rank. Within the booking states, a later
@@ -380,6 +383,10 @@ export function olderLeadWinsOnAuthority(eventDisp, newestDisp) {
   const e = String(eventDisp || '');
   const n = String(newestDisp || '');
   if (DNC_DISPOSITION_CODES.has(n) && BOOKING_DISPOSITION_CODES.has(e)) return true;
+  // 2026-10-16: a newest lead on Verif (a hold — "there is an issue with the
+  // lead", rank 0) must not bury a live booking on an older sibling either. Same
+  // ground as the DNC carve-out: the newest lead holds no appointment we mirror.
+  if (n === 'Verif' && BOOKING_DISPOSITION_CODES.has(e)) return true;
   const eventRank = BOOKING_AUTHORITY_RANK[e] ?? 0;
   const newestRank = BOOKING_AUTHORITY_RANK[n] ?? 0;
   return newestRank > 0 && eventRank > newestRank;
@@ -1042,7 +1049,7 @@ const IO_BACKED_CONDITION_KEYS = new Set([
   'has_tag_prefix', 'not_has_tag_prefix', 'not_has_any_tag_prefix',
   'custom_field_eq', 'custom_field_in',
   // lp_leads / demo state
-  'lp_disposition_in', 'demo_state_eq', 'lp_current_lead_match', 'lp_had_demo',
+  'lp_disposition_in', 'lp_disposition_not_in', 'demo_state_eq', 'lp_current_lead_match', 'lp_had_demo',
   // appointment lookups
   'not_active_in_home_appointment', 'not_reschedule_inflight',
   'not_duplicate_lead_live_appointment', 'no_future_appointment',
@@ -1602,6 +1609,30 @@ async function evaluateContextConditions(conditions, intelligence, event, opts =
         const disp = lpLead.disposition_code || null;
         if (!allowed.includes(disp)) {
           console.log(`[Context] BLOCKED: lp_disposition "${disp}" not in [${allowed.join(',')}]`);
+          return false;
+        }
+        break;
+      }
+
+      // 2026-10-16 (handoff v3.4 Fix 2) — the CURRENT lead's disposition is NOT
+      // in the list. Lets a cancel rule (171 GHL_APPT_CANCELLED_REBOOK_COLD) skip
+      // a disqualified lead (ND / No Demo) up front instead of relying on the
+      // late lp_note_dq read. A contact with no LP lead has no disposition, so
+      // it passes (nothing to exclude); a failed read fails CLOSED.
+      case 'lp_disposition_not_in': {
+        const blocked = Array.isArray(expected) ? expected : [expected];
+        const ninContactId = event.ghl_contact_id;
+        if (!ninContactId) return notApplicableNoContact(key);
+        const ninDb = opts.deps?.supabase !== undefined ? opts.deps.supabase : supabase;
+        let ninLead;
+        try {
+          ninLead = await fetchCurrentLead(ninContactId, ninDb);
+        } catch (lpErr) {
+          return failClosed(key, `lp_leads lookup failed: ${lpErr.message}`);
+        }
+        const ninDisp = ninLead?.disposition_code || null;
+        if (ninDisp !== null && blocked.includes(ninDisp)) {
+          console.log(`[Context] BLOCKED: lp_disposition "${ninDisp}" is in [${blocked.join(',')}] (rule ${ruleKey || '?'})`);
           return false;
         }
         break;

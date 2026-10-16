@@ -59,6 +59,11 @@ function deps(emitted, resolved = new Map()) {
     readLpBook: async () => ({ active: lpBook, resolved }),
     getGHLContact: async () => ({ tags: [] }),
     syncAppointmentToLP: async () => ({ success: true, action: 'lp_appointment_set' }),
+    // 2026-10-16 (handoff v3.4 Fix 3.2): Class B now CREATES in GHL. This file
+    // pins what happens BEFORE the create (grace, live check, budget order), so
+    // the create answers with a refusal a person must judge, and the gap
+    // escalates exactly as it did. The create itself: test-appointment-parity-heal.js.
+    mirrorLeadAppointment: async () => ({ outcome: 'noop', skipped: true, reason: 'dnc_consent' }),
     emitEvent: async (evt) => { emitted.push(evt.event_type); return { id: emitted.length }; },
     // Alerting is covered by test-appointment-parity-alerts.js; stub it out.
     claimAlertConditionSet: async () => ({ ok: true, newlyFiring: [], cleared: [] }),

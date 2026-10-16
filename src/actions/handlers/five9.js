@@ -206,10 +206,20 @@ const BOOKED_ROUTING_RULE_KEY = 'BOOKED_DIAL_ROUTING';
 // LP_CALLBACK_REARM_FIVE9 AND to the callback list alone (isCallbackRearmDelete:
 // one list, callbackListName(), never LP_ASAP). The same op from any other rule,
 // or naming any other list, is still armed.
+// 2026-10-16 — disqualified leads (ND / No Demo, Mark, handoff v3.4 Fix 2) come
+// off every outbound list. Approval stays the default (#1057): only with
+// DISQUALIFIED_FIVE9_AUTO_REMOVE=true (exactly) do rows from rule
+// LP_DISP_DISQUALIFIED run unarmed — the same carve-out pattern as
+// BOOKED_ROUTING_AUTO_REMOVE, keyed on who queued it. Mark decides the flip.
+const DISQUALIFIED_RULE_KEY = 'LP_DISP_DISQUALIFIED';
+
 function execAutoApproved(actionType, action) {
   if (actionType === EXEC_AUTO_APPROVED_FIVE9_OP) return true;
   if (actionType === EXEC_AUTO_APPROVED_BOOKED_REMOVE_OP) {
     if (isCallbackRearmDelete(action)) return true;
+    if (action?.rule_applied === DISQUALIFIED_RULE_KEY) {
+      return String(process.env.DISQUALIFIED_FIVE9_AUTO_REMOVE || '').trim().toLowerCase() === 'true';
+    }
     return action?.rule_applied === BOOKED_ROUTING_RULE_KEY
       && String(process.env.BOOKED_ROUTING_AUTO_REMOVE || '').trim().toLowerCase() !== 'false';
   }
