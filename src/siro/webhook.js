@@ -5,16 +5,15 @@
  * (docs/siro-reference.md §3). They arrive in either order and every payload
  * carries both flags; we act only when BOTH are true.
  *
- *   - EVERY request passes TWO checks first, in every mode, or gets 401
- *     (the user, 2026-10-16; an unsigned POST must read 401, never 404/503):
- *       a. the svix signature against SIRO_WEBHOOK_SECRET on the RAW body
- *          (svix-* or webhook-* header names, signatureHeaders below)
- *          (express.raw is mounted on this path ahead of the global parsers
- *          in src/index.js);
- *       b. the header x-reece-webhook-key equals SIRO_WEBHOOK_HEADER_KEY,
- *          compared in constant time.
- *     Either variable unset refuses everything (fail closed). Neither secret
- *     nor the header value is ever logged.
+ *   - EVERY request is verified first, in every mode, or gets 401 (the user,
+ *     2026-10-16; an unsigned POST must read 401, never 404/503): the svix
+ *     signature against SIRO_WEBHOOK_SECRET on the RAW body (svix-* or
+ *     webhook-* header names, signatureHeaders below; express.raw is mounted
+ *     on this path ahead of the global parsers in src/index.js). An unset
+ *     secret refuses everything (fail closed). The secret is never logged.
+ *     The second check, a shared x-reece-webhook-key header, was removed by
+ *     the user's ruling the same day (their endpoint no longer sends it); the
+ *     signature alone proves Siro sent the exact bytes.
  *   - siro_webhook_events is keyed on svix-id: a redelivery is answered 200
  *     and does no work (CANON.K.072).
  *   - The answer goes out first; the fetch / match / store runs after it in
@@ -22,7 +21,6 @@
  *   - SIRO_WEBHOOK_MODE off | shadow (default: verify, store, fetch, upsert;
  *     emit nothing, queue nothing) | live.
  */
-import crypto from 'node:crypto';
 import express from 'express';
 import { Webhook } from 'svix';
 import supabaseDefault from '../supabase.js';
@@ -39,21 +37,9 @@ export function readyToAct(payload) {
   return payload?.recordingProcessed === true && payload?.recordingLinked === true;
 }
 
-export const HEADER_KEY_NAME = 'x-reece-webhook-key';
-
-/** Constant-time compare of the shared header key. Never logs either value. */
-export function headerKeyMatches(given, expected) {
-  if (!expected || typeof given !== 'string' || !given) return false;
-  // Hash both to a fixed length so timingSafeEqual never sees unequal sizes.
-  const a = crypto.createHash('sha256').update(given).digest();
-  const b = crypto.createHash('sha256').update(String(expected)).digest();
-  return crypto.timingSafeEqual(a, b);
-}
-
-/** Both checks; either variable unset fails closed. */
-export function verifySiroRequest(rawBody, headers, { secret, headerKey }) {
-  if (!secret || !headerKey) return { ok: false, status: 401, error: 'webhook not configured' };
-  if (!headerKeyMatches(headers[HEADER_KEY_NAME], headerKey)) return { ok: false, status: 401, error: 'bad or missing header key' };
+/** The signature check; an unset secret fails closed. */
+export function verifySiroRequest(rawBody, headers, { secret }) {
+  if (!secret) return { ok: false, status: 401, error: 'webhook not configured' };
   return verifySiroSignature(rawBody, headers, secret);
 }
 
@@ -104,7 +90,7 @@ export function makeSiroWebhookHandler({ env = process.env, deps = {} } = {}) {
     const track = deps.trackBackground || trackBackground;
     const mode = siroModes(env).webhook;
     const cfg = siroConfig(env);
-    const v = verifySiroRequest(req.body, req.headers || {}, { secret: cfg.webhookSecret, headerKey: cfg.webhookHeaderKey });
+    const v = verifySiroRequest(req.body, req.headers || {}, { secret: cfg.webhookSecret });
     if (!v.ok) {
       const names = signatureHeaderNames(req.headers || {});
       console.warn(`[Siro] webhook refused: ${v.error} (signature headers present: ${names.length ? names.join(',') : 'none'})`);
@@ -154,7 +140,7 @@ export function registerSiroWebhookRoutes(app, env = process.env) {
   app.post('/webhook/siro', makeSiroWebhookHandler({ env }));
   const cfg = siroConfig(env);
   console.log(`[Siro] webhook route mounted mode=${siroModes(env).webhook}`);
-  if (!cfg.webhookSecret || !cfg.webhookHeaderKey) {
-    console.warn(`[Siro] webhook refuses every request (401): ${[!cfg.webhookSecret && 'SIRO_WEBHOOK_SECRET', !cfg.webhookHeaderKey && 'SIRO_WEBHOOK_HEADER_KEY'].filter(Boolean).join(' and ')} unset`);
+  if (!cfg.webhookSecret) {
+    console.warn('[Siro] webhook refuses every request (401): SIRO_WEBHOOK_SECRET unset');
   }
 }

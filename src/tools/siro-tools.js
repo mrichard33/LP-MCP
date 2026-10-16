@@ -55,7 +55,6 @@ export function registerSiroTools(server) {
         connections_error: conns.ok ? null : `${conns.status} ${conns.error}`,
         users: users.ok ? listRows(users.data).length : users.error,
         webhook_secret: cfg.webhookSecret ? 'set' : 'NOT SET',
-        webhook_header_key: cfg.webhookHeaderKey ? 'set' : 'NOT SET',
         modes: siroModes(),
       });
     },

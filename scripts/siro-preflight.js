@@ -34,10 +34,8 @@ async function main() {
   const authKind = cfg.clientId && cfg.clientSecret ? 'client app (client_credentials)'
     : cfg.legacyToken ? `legacy org token (SIRO_API, ${cfg.legacyToken.length} chars)` : 'none';
   console.log(`Auth: ${authKind}`);
-  // Webhook secrets: set or not set, never the value.
-  for (const name of ['SIRO_WEBHOOK_SECRET', 'SIRO_WEBHOOK_HEADER_KEY']) {
-    console.log(`${name}: ${process.env[name] ? 'set' : 'NOT SET (the webhook refuses every request)'}`);
-  }
+  // The webhook secret: set or not set, never the value.
+  console.log(`SIRO_WEBHOOK_SECRET: ${process.env.SIRO_WEBHOOK_SECRET ? 'set' : 'NOT SET (the webhook refuses every request)'}`);
 
   const org = await getCallerIdentity('org');
   const user = await getCallerIdentity('user');
