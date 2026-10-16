@@ -45,13 +45,17 @@
  *
  *   B. ghl_missing_appointment — LP has an appointment in the window, GHL
  *      has none, or only a cancelled/past one.
- *      → ESCALATE, DO NOT AUTO-CREATE. The GHL calendar object is the
- *        revenue-bearing artifact: it drives rep dispatch, reminders and
- *        capacity. Creating one from a cache read risks double-booking a
- *        slot a human already gave away, and `lp_leads.appointment_date` is
- *        on the untrustworthy list (overwritten on reset, wrong grain). We
- *        emit the finding and open a rep task instead. Promote to auto-heal
- *        only once the date is sourced from an LP report rather than cache.
+ *      → AUTO-CREATE since 2026-10-16 (Mark, handoff v3.4: "GHL must match
+ *        LP", replacing "escalate only"). The date is no longer the cache's:
+ *        the create goes through src/services/mirror-on-link.js, which reads
+ *        LP LIVE and runs the reconciler with its guards (stale mirror, year
+ *        typo, impossible hour) plus its slot check and create claim. A guard
+ *        refusal is never "add it to GHL": a bad LP date/hour is the "LP
+ *        date/time looks wrong" card; LP unreadable, a visit inside 60 minutes
+ *        or nothing live waits. Only a failed create, or a refusal a person
+ *        must judge (a DNC contact, two estimate objects), escalates. The
+ *        grace period and live GHL check below still run FIRST. Verif and
+ *        ND / No Demo never reach this class (settled, readLpBook).
  *
  *   C. confirmation_drift      — LP says confirmed, GHL does not.
  *      → EMIT ONLY, despite what this said until v1.1. It emits
@@ -64,6 +68,13 @@
  *      → ESCALATE. A cancellation that only half-landed usually means a
  *        human cancelled in one system; which system is authoritative is a
  *        judgement call, so a rep decides.
+ *      → ONE exception (Badley, 2026-10-16, Fix 1.7): LP holds a live lead AND
+ *        a cancelled duplicate at the SAME slot as the cancelled GHL row, and
+ *        LP live confirms the live one — the duplicate's cancel is undone (Set
+ *        → new, Cnf / Issue → confirmed) and the S5.2 / rebook tags come off
+ *        (src/jobs/appointment-parity-heal.js). An `invalid` GHL row is SETTLED
+ *        (Fix 8): never restored, never re-created over, never flagged —
+ *        unless LP has since moved the lead to a different slot.
  *
  *   E. lp_cancelled_ghl_active — LP cancelled (CXL/CCC/NoHome/NG), GHL still
  *      holds an ACTIVE appointment. The mirror of D, and new in v1.2.
@@ -307,6 +318,16 @@ import { utcToLpStoredIso, lpStoredAgeMinutes } from '../lp-dates.js';
 import { claimAlertConditionSet, confirmAlertSend, sendAlertMessage } from '../alert-state.js';
 import { shouldAlertParityGaps, parityAlertKey, formatParityGapCard } from './appointment-parity-alerts.js';
 import { isHoldDisposition, isDisqualifiedDisposition } from '../lp-disposition-classes.js';
+import { mirrorLeadAppointment } from '../services/mirror-on-link.js';
+import { readLiveForSync } from '../services/lp-live-appointment.js';
+import { classBOutcome, restoreDecision, sameSlot, sameSlotDuplicateCandidate, S52_REBOOK_TAGS } from './appointment-parity-heal.js';
+import { ghlFetch as defaultGhlFetch } from '../actions/helpers.js';
+
+/** One agent_actions insert (deps seam: deps.queueAction). */
+async function queueAgentAction(row) {
+  const { error } = await supabase.from('agent_actions').insert(row);
+  if (error) throw new Error(error.message);
+}
 
 // One alert key per contact per class — see appointment-parity-alerts.js for
 // why this is set-valued rather than a per-sweep digest.
@@ -526,7 +547,9 @@ async function readLpBook(from, to, deps = {}) {
     .from('lp_leads')
     // created_at_lp rides along for the Class B grace period (v1.3). Both LP
     // clocks are needed: see lpRowAgeMinutes.
-    .select('ghl_contact_id, lp_lead_id, lp_prospect_id, first_name, last_name, disposition_code, appointment_set, appointment_confirmed, appointment_date, set_date, created_at_lp, updated_at_lp')
+    // 2026-10-16: synced_at / last_contact_date / lead_source / set_by_name ride
+    // along for the Class B create (the reconciler's guards and the Fix 4 card).
+    .select('ghl_contact_id, lp_lead_id, lp_prospect_id, first_name, last_name, disposition_code, appointment_set, appointment_confirmed, appointment_date, set_date, created_at_lp, updated_at_lp, synced_at, last_contact_date, lead_source, set_by_name')
     .eq('appointment_set', true)
     // Bound built in the stored ET-wall-clock frame. Unlike the GHL
     // appointments read above (start_time is true UTC), lp_leads
@@ -710,7 +733,104 @@ export async function runAppointmentParityWatchdog({ dryRun = !PARITY_AUTOHEAL, 
     write_ceiling_hit: 0,
     // 2026-10-16: GHL active against a Verif / ND / No Demo LP row — in sync by rule.
     settled_in_sync: 0,
+    // 2026-10-16 (handoff v3.4): LP→GHL heals and their refusals.
+    invalid_settled: 0,       // GHL holds an `invalid` at LP's slot — settled (Fix 8.5)
+    ghl_created: 0,           // Class B created in GHL (Fix 3.2)
+    ghl_create_deferred: 0,   // LP unreadable, too late, nothing live — next sweep
+    lp_looks_wrong: 0,        // bad LP date/hour — a person fixes LP (Fix 4)
+    same_slot_restored: 0,    // a duplicate's cancel undone (Fix 1.7)
   };
+
+  const _mirror = deps.mirrorLeadAppointment || mirrorLeadAppointment;
+  const _readLive = deps.readLiveForSync || readLiveForSync;
+  const _ghlFetch = deps.ghlFetch || defaultGhlFetch;
+  const _queueAction = deps.queueAction || queueAgentAction;
+
+  // Class B → create in GHL. Returns 'handled' when no escalation is owed.
+  async function tryCreateMissing({ cid, lead }) {
+    const finding = { class: 'ghl_missing_appointment', contact_id: cid, name: `${lead.first_name || ''} ${lead.last_name || ''}`.trim(), lp_lead_id: lead.lp_lead_id, lp_appointment_date: lead.appointment_date, lp_disposition: lead.disposition_code, action: 'create_in_ghl' };
+    // Report mode: the gap is reported as it always was, marked as a create.
+    if (dryRun) return 'dry';
+    if (!canWrite()) {
+      counts.write_ceiling_hit++;
+      counts.ghl_missing_appointment++;   // found, not yet created — still a gap
+      findings.push({ ...finding, executed: false, would_create: true });
+      return 'handled';   // the next sweep creates it; no person is owed a card
+    }
+    let rec;
+    try {
+      rec = await _mirror({ contactId: cid, lead });
+    } catch (err) {
+      errors++;
+      console.warn(`[ApptParity] Class B create failed for ${cid}: ${err.message} — escalating`);
+      return 'escalate';
+    }
+    const o = classBOutcome(rec);
+    if (o.kind === 'created') {
+      writes++;
+      counts.ghl_created++;
+      findings.push({ ...finding, executed: true, outcome: rec.outcome, appointment_id: rec.appointment_id || null });
+      await emitAutoFixed(cid, 'ghl_created', { lp_lead_id: lead.lp_lead_id, appointment_id: rec.appointment_id || null });
+      return 'handled';
+    }
+    if (o.kind === 'in_sync') { outcomes.already_present++; return 'handled'; }
+    if (o.kind === 'lp_looks_wrong') {
+      counts.lp_looks_wrong++;
+      findings.push({ ...finding, class: 'lp_looks_wrong', reason: o.reason, action: 'fix_in_lp' });
+      return 'handled';
+    }
+    if (o.kind === 'deferred') {
+      counts.ghl_create_deferred++;
+      findings.push({ ...finding, executed: false, deferred: o.reason });
+      return 'handled';
+    }
+    return 'escalate';
+  }
+
+  // Class D, Badley case → restore. Returns 'handled' when no escalation is owed.
+  async function tryRestoreSameSlot({ cid, lead, cancelledRow, resolvedRow }) {
+    // Pure pre-check first: no LP read unless a same-slot duplicate exists.
+    if (!sameSlotDuplicateCandidate({ lead, resolvedRow, cancelledAppt: cancelledRow })) return 'escalate';
+    let live;
+    try { live = await _readLive(lead, { dryRun }); } catch { return 'escalate'; }
+    const d = restoreDecision({ lead, resolvedRow, cancelledAppt: cancelledRow, live });
+    if (!d.restore) return 'escalate';
+    const finding = { class: 'cancellation_drift', contact_id: cid, name: `${lead.first_name || ''} ${lead.last_name || ''}`.trim(), ghl_appointment_id: cancelledRow.ghl_appointment_id, lp_lead_id: lead.lp_lead_id, cancel_lead_id: resolvedRow?.lp_lead_id || null, action: 'restore_in_ghl', status: d.status };
+    if (!canWrite()) {
+      if (!dryRun) counts.write_ceiling_hit++;
+      findings.push({ ...finding, executed: false, would_restore: true });
+      return 'handled';
+    }
+    try {
+      await _ghlFetch('PUT', `/calendars/events/appointments/${cancelledRow.ghl_appointment_id}`, { appointmentStatus: d.status });
+      writes++;
+      counts.same_slot_restored++;
+      await _queueAction({
+        action_type: 'remove_tag', target_system: 'ghl', target_entity: 'contact', target_id: cid,
+        action_payload: { tags: [...S52_REBOOK_TAGS], claim_key: `parity-restore:${cancelledRow.ghl_appointment_id}:tags` },
+        reasoning: `Restored appointment ${cancelledRow.ghl_appointment_id} (${d.status}): the cancel came from duplicate lead ${resolvedRow?.lp_lead_id || '?'} at the same slot as live lead ${lead.lp_lead_id}; S5.2 / rebook tags off.`,
+        rule_applied: 'PARITY_SAME_SLOT_RESTORE', status: 'pending', requires_approval: false, priority: 30,
+      }).catch((err) => console.warn(`[ApptParity] restore tag cleanup not queued for ${cid}: ${err.message}`));
+      findings.push({ ...finding, executed: true });
+      await emitAutoFixed(cid, 'same_slot_restored', { appointment_id: cancelledRow.ghl_appointment_id, status: d.status, lp_lead_id: lead.lp_lead_id });
+      return 'handled';
+    } catch (err) {
+      errors++;
+      console.warn(`[ApptParity] restore failed for ${cid}: ${err.message} — escalating`);
+      return 'escalate';
+    }
+  }
+
+  // One low-priority event per heal: the morning digest's "Auto-fixed" count.
+  async function emitAutoFixed(cid, subtype, payload) {
+    try {
+      await _emitEvent({
+        event_type: 'appointment.parity_auto_fixed', event_subtype: subtype, source: 'appointment_parity_watchdog',
+        entity_type: 'contact', entity_id: cid, ghl_contact_id: cid, payload, priority: 'low', bypass_filter: true,
+        idempotency_key: `parity_fixed_${subtype}_${cid}_${payload?.appointment_id || payload?.lp_lead_id || ''}_${asOf.toISOString().slice(0, 13)}`,
+      });
+    } catch { /* telemetry only */ }
+  }
 
   // v1.1 — 2026-09-14. Outcome counters, one per thing that can actually
   // happen. The single `healed` and `escalated` they replace were incremented
@@ -928,8 +1048,24 @@ export async function runAppointmentParityWatchdog({ dryRun = !PARITY_AUTOHEAL, 
 
   for (const [cid, lead] of lpBook) {
     if (ghlActive.has(cid)) continue;
-    const wasCancelled = ghlCancelled.has(cid);
-    const cls = wasCancelled ? 'cancellation_drift' : 'ghl_missing_appointment';
+    const cancelledRow = ghlCancelled.get(cid) || null;
+    let cls = cancelledRow ? 'cancellation_drift' : 'ghl_missing_appointment';
+
+    // 2026-10-16 (handoff v3.4 Fix 8.5): `invalid` is the settled kill status —
+    // never restored, never re-created over, never flagged as missing. Only a
+    // lead that has since moved to a DIFFERENT slot gets a fresh create.
+    if (cancelledRow && String(cancelledRow.status || '').toLowerCase() === 'invalid') {
+      if (sameSlot(cancelledRow.start_time, lead.appointment_date)) { counts.invalid_settled++; continue; }
+      cls = 'ghl_missing_appointment';
+    }
+
+    // 2026-10-16 (Fix 1.7): a duplicate lead's cancel at the same slot is
+    // restored to the status LP implies; every other cancellation_drift
+    // escalates exactly as before.
+    if (cls === 'cancellation_drift') {
+      const r = await tryRestoreSameSlot({ cid, lead, cancelledRow, resolvedRow: lpResolved.get(cid) || null });
+      if (r === 'handled') continue;
+    }
 
     // v1.3 grace period — CLASS B ONLY. The LP→GHL reconciler runs in batches
     // every 30 minutes and this sweep samples between them, so an LP row booked
@@ -978,6 +1114,16 @@ export async function runAppointmentParityWatchdog({ dryRun = !PARITY_AUTOHEAL, 
       }
     }
 
+    // 2026-10-16 (Fix 3.2, Mark: GHL must match LP — replaces "Class B
+    // escalate only"): create through the one mirror path. A guard refusal is
+    // never "add it to GHL"; only a failed create or a person's call escalates.
+    let wouldCreate = false;
+    if (cls === 'ghl_missing_appointment') {
+      const r = await tryCreateMissing({ cid, lead });
+      if (r === 'handled') continue;
+      wouldCreate = r === 'dry';
+    }
+
     counts[cls]++;
 
     const finding = {
@@ -987,7 +1133,8 @@ export async function runAppointmentParityWatchdog({ dryRun = !PARITY_AUTOHEAL, 
       lp_appointment_date: lead.appointment_date,
       lp_disposition: lead.disposition_code,
       lp_prospect_id: lead.lp_prospect_id,
-      action: 'escalate_to_rep',
+      action: wouldCreate ? 'create_in_ghl' : 'escalate_to_rep',
+      ...(wouldCreate ? { would_create: true } : {}),
     };
     escalations.push(finding);
 

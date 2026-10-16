@@ -71,6 +71,7 @@ import { GHL_LOCATION_ID } from '../actions/constants.js';
 import { reconcileLpAppointmentToGhl } from './lp-ghl-appointment-reconciler.js';
 import { readLiveForSync } from './lp-live-appointment.js';
 import { notifyImplausibleAppointment } from '../actions/handlers/lp-ghl-appointment-sync.js';
+import { mirrorLeadAppointment } from './mirror-on-link.js';
 import { normalizePhone } from '../sync-utils.js';
 import { pickPhoneMatch, searchByPhone as resolveSearchByPhone, isDuplicate400 } from './ghl-contact-resolve.js';
 
@@ -686,16 +687,20 @@ export async function processOneLead({
   let outcome = action;
   if (lead.appointment_date) {
     // LP live first (2026-10-15): a stale row or a year-typo date must not
-    // become a real visit with reminders to the homeowner.
-    const live = await (deps.readLiveForSync || readLiveForSync)(lead, { dryRun });
-    const rec = await (deps.reconcileLpAppointmentToGhl || reconcileLpAppointmentToGhl)({
-      contactId, lead, live, toNotify: true, contactCache, dryRun,
+    // become a real visit with reminders to the homeowner. Since 2026-10-16
+    // (handoff v3.4 Fix 3) through the one mirror-on-link path: only a live
+    // disposition, never within 60 minutes, canvass leads without
+    // notifications, and one "LP date/time looks wrong" card for a bad date
+    // or hour (src/services/mirror-on-link.js).
+    const rec = await mirrorLeadAppointment({
+      contactId, lead, tags: contactCache.get(contactId)?.tags || [], contactCache, dryRun,
+      deps: {
+        readLiveForSync: deps.readLiveForSync || readLiveForSync,
+        reconcileLpAppointmentToGhl: deps.reconcileLpAppointmentToGhl || reconcileLpAppointmentToGhl,
+        notifyImplausibleAppointment: deps.notifyImplausibleAppointment || notifyImplausibleAppointment,
+      },
     });
     apptResult = rec.outcome === 'noop' ? rec.reason : rec.outcome;
-    if (rec.reason === 'implausible_future_appointment' && !dryRun) {
-      await (deps.notifyImplausibleAppointment || notifyImplausibleAppointment)({ contactId, lead, result: rec })
-        .catch((e) => console.warn(`[LpContactBackstop] implausible-appointment alert failed for lead ${lead.lp_lead_id}: ${e.message}`));
-    }
     if (rec.reason === 'dnc_consent') outcome = 'skipped_dnc'; // matched DNC = link-only
   }
 

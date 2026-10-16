@@ -56,6 +56,7 @@ import supabase from '../../supabase.js';
 import { reconcileLpAppointmentToGhl, resolveSyncStartTime, classifyDisposition } from '../../services/lp-ghl-appointment-reconciler.js';
 import { sendAlertMessage } from '../../alert-state.js';
 import { readLiveForSync } from '../../services/lp-live-appointment.js';
+import { findSameSlotLiveSibling, liveStillHoldsSlot, slotKeyOf } from '../../same-slot-sibling.js';
 import { lpWallClockToGhlStartTime } from '../../appointment-dates.js';
 import {
   claimAppointmentAuthority,
@@ -155,6 +156,8 @@ export function shouldBlockOnAuthority(claim, dispositionCode) {
 export function authorityFollowUp(claim, result) {
   const none = { release: false, record: null };
   if (!claim?.granted || claim.shadowDenied) return none;
+  // A cancel ignored for a same-slot live sibling touched nothing (2026-10-16).
+  if (result?.outcome === SAME_SLOT_IGNORED) return none;
   if (result?.outcome === 'cancelled') return { release: true, record: null };
   if (result?.appointment_id) {
     return {
@@ -163,6 +166,65 @@ export function authorityFollowUp(claim, result) {
     };
   }
   return none;
+}
+
+export const SAME_SLOT_IGNORED = 'cancel_ignored_same_slot_sibling';
+const LP_LEAD_ID_FIELD = 'GmAVmW6V9sekD7pVONKr';
+const LP_LAST_APPT_ID_FIELD = 'yII9akTft1RKOG0Ri4Q9';
+
+/** Every live-or-not lp_leads row for the contact (not soft-deleted). */
+async function readContactLeads(contactId, db = supabase) {
+  const { data, error } = await db.from('lp_leads').select(`${LEAD_COLUMNS}, lp_deleted_at`)
+    .eq('ghl_contact_id', contactId).is('lp_deleted_at', null).limit(25);
+  if (error) throw new Error(`lp_leads read failed: ${error.message}`);
+  return data || [];
+}
+
+/**
+ * The same-slot cancel decision. Returns the noop result to send back, or null
+ * to let the cancel run. Never throws: any failed read lets the cancel run.
+ * deps: { readContactLeads, readLiveForSync, writeLeadIdFields }
+ */
+export async function maybeIgnoreSameSlotCancel({ contactId, lead, deps = {} }) {
+  try {
+    const leads = await (deps.readContactLeads || readContactLeads)(contactId);
+    const sibling = findSameSlotLiveSibling(leads, lead);
+    if (!sibling) return null;
+    const live = await (deps.readLiveForSync || readLiveForSync)(sibling);
+    const slot = slotKeyOf(lead.appointment_date);
+    if (!liveStillHoldsSlot(live, slot)) {
+      console.log(`[LpGhlApptSync] same-slot sibling ${sibling.lp_lead_id} not confirmed live at ${slot} (${live?.ok ? live.disposition : live?.error || 'unread'}) — cancel proceeds`);
+      return null;
+    }
+    console.log(`[LpGhlApptSync] cancel ignored: same-slot live sibling (cancel lead ${lead.lp_lead_id}, live lead ${sibling.lp_lead_id}) contact=${contactId} slot=${slot}`);
+    await (deps.writeLeadIdFields || writeLeadIdFields)(contactId, sibling.lp_lead_id)
+      .catch((err) => console.warn(`[LpGhlApptSync] LP Lead ID repoint failed for ${contactId}: ${err.message}`));
+    return {
+      outcome: SAME_SLOT_IGNORED,
+      skipped: true,
+      reason: SAME_SLOT_IGNORED,
+      contact_id: contactId,
+      lp_lead_id: lead.lp_lead_id,
+      disposition_code: lead.disposition_code || null,
+      live_lead_id: sibling.lp_lead_id,
+      live_disposition: live.disposition,
+      slot,
+    };
+  } catch (err) {
+    console.warn(`[LpGhlApptSync] same-slot check failed for ${contactId} (cancel proceeds): ${err.message}`);
+    return null;
+  }
+}
+
+/** Point the contact's LP Lead ID fields at the lead that owns the live visit. */
+async function writeLeadIdFields(contactId, lpLeadId) {
+  const { ghlFetch } = await import('../helpers.js');
+  await ghlFetch('PUT', `/contacts/${contactId}`, {
+    customFields: [
+      { id: LP_LEAD_ID_FIELD, field_value: String(lpLeadId) },
+      { id: LP_LAST_APPT_ID_FIELD, field_value: String(lpLeadId) },
+    ],
+  });
 }
 
 export async function executeSyncLpAppointmentToGhl(action, context = {}) {
@@ -205,6 +267,18 @@ export async function executeSyncLpAppointmentToGhl(action, context = {}) {
       disposition_code: lead.disposition_code || null,
       lead_source: leadSource,
     };
+  }
+
+  // ── Same-slot live sibling (Badley, 2026-10-16, handoff v3.4 Fix 1) ──
+  // A CXL on a duplicate lead must not cancel the visit a sibling lead still
+  // holds at the SAME slot. Only that narrow case is ignored, and only when LP
+  // live confirms the sibling still holds the slot; LP unreadable or the
+  // sibling not live → the cancel goes through exactly as before. The seat is
+  // neither claimed, released nor re-recorded (authorityFollowUp), and the
+  // contact's LP Lead ID fields move to the sibling that owns the visit.
+  if (classifyDisposition(lead.disposition_code) === 'cancel') {
+    const ignored = await maybeIgnoreSameSlotCancel({ contactId, lead, deps: context.deps || {} });
+    if (ignored) return { action: 'lp_ghl_appointment_sync', lead_source: leadSource, ...ignored };
   }
 
   // Read LP live before anything books (2026-10-15, see
