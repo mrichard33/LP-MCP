@@ -172,6 +172,35 @@ export function detectDeferral(text, nowMs = Date.now(), tz = DEFAULT_TZ) {
     const word = n === 1 ? `a ${unit}` : `${n} ${unit}s`;
     return result(c, `in ${word}`, m[0], String.raw`\b(?:${n}|${Object.keys(COUNT_WORDS).find(k => COUNT_WORDS[k] === n && k.length > 2) || n}|a|couple|few)\s+${unit}s?\b`);
   }
+  // 2026-10-16 (opt-outs; the bot gate's rehash_defer): "Call me in the spring"
+  // was no date, so "Call me" read as a call request and the lead was offered
+  // two times TODAY and dialed by Five9. A season is a date: its first day, or
+  // two weeks out when we are already in it ("in the fall" said in October);
+  // "next spring" is next year's; "after the summer" is the next season.
+  // Only after a preposition: "my windows fall apart" is not a season.
+  if ((m = t.match(/\b(in|around|until|til+|this|next|after|by|come|sometime\s+in)\s+(?:the\s+)?(spring|summer|fall|autumn|winter)(?:time)?\b/))) {
+    const order = ['spring', 'summer', 'fall', 'winter'];
+    const starts = { spring: [2, 20], summer: [5, 21], fall: [8, 22], winter: [11, 21] };
+    let season = m[2] === 'autumn' ? 'fall' : m[2];
+    const word = m[2];
+    if (m[1] === 'after') season = order[(order.indexOf(season) + 1) % 4];
+    const [mi, day] = starts[season];
+    const thisYear = ymd(today.y, mi + 1, day);
+    const nextIdx = (order.indexOf(season) + 1) % 4;
+    const [nmi, nday] = starts[order[nextIdx]];
+    const seasonEnd = ymd(nmi < mi ? today.y + 1 : today.y, nmi + 1, nday);
+    // Winter runs into the new year: a January "this winter" is still winter.
+    const lastWinterStart = ymd(today.y - 1, 12, 21);
+    const inSeason = (cmp(today, thisYear) >= 0 && cmp(today, seasonEnd) < 0)
+      || (season === 'winter' && cmp(today, lastWinterStart) >= 0 && cmp(today, ymd(today.y, 3, 20)) < 0);
+    let c;
+    // "next spring": the coming one, never the one after it (said in January it is this year's).
+    if (m[1] === 'next') c = !inSeason && cmp(thisYear, today) > 0 ? thisYear : ymd(today.y + 1, mi + 1, day);
+    else if (inSeason && m[1] !== 'after') c = addDays(today, 14);
+    else c = monthDate(today, mi, day);
+    const label = m[1] === 'after' ? `after the ${word}` : m[1] === 'next' ? `next ${word}` : `in the ${word}`;
+    return result(c, label, m[0], String.raw`\b(?:${word}|${season})\b`);
+  }
   // "next week" / "next month".
   if ((m = t.match(/\bnext\s+(week|month)\b/))) {
     const c = m[1] === 'week' ? addDays(today, ((8 - today.dow) % 7) || 7) : ymd(today.y, today.m + 1, 1);

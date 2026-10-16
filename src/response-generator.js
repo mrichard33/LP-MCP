@@ -4987,7 +4987,11 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // A call request the planner did not hand off (NEPQ off, or the plan failed)
   // is still filed after the send: Five9 for sales, #service for service.
   // Not when the lead says THEY will call ("I can call back when I have more time", 2026-10-13).
-  if (String(classification?.intent_class || '').toUpperCase() === 'CALLBACK' && !nepqPlan?.handoff && !leadWillReachOut(triggerMessage)) {
+  // 2026-10-16 (opt-outs; the bot gate's rehash_defer): "Call me in the spring"
+  // was filed to Five9 for a call now. A lead who gave a follow-up date, said
+  // no twice, asked for room or signed elsewhere is never dialed for it.
+  const noDialStep = ['defer', 'post_demo_stop', 'post_demo_space', 'competitor_signed'].includes(String(nepqPlan?.step || ''));
+  if (String(classification?.intent_class || '').toUpperCase() === 'CALLBACK' && !nepqPlan?.handoff && !noDialStep && !leadWillReachOut(triggerMessage)) {
     validated.callback_requested = validated.service_conversation ? 'service' : 'callback_request';
   }
 

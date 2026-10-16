@@ -128,6 +128,9 @@ const EMERGENCY_RX = /\bwater\s+(?:is\s+)?(?:coming|pouring|leaking|getting)\s+i
 const SERVICE_RX = /\b(?:you|you\s+guys|reece|your\s+(?:team|crew|company|installers?))\s+(?:installed|put\s+in|replaced|did)\b[^.?!]{0,80}\b(?:leak\w*|broken|crack\w*|won'?t|doesn'?t|not\s+(?:working|closing|opening|locking|sealing)|problem|issue|stuck|draft\w*|fogg\w*)\b|\bwarranty\s+(?:claim|issue|repair|work)\b|\b(?:needs?|need\s+a)\s+(?:a\s+)?(?:repair|service\s+call)\b|\b(?:referral|refund|rebate|reward|bonus|deposit)\b[^.?!]{0,80}\b(?:not\s+(?:been\s+)?(?:received|gotten|paid)|never\s+(?:received|got|paid|came)|haven'?t\s+(?:received|gotten|been\s+paid|seen))\b|\b(?:have\s+not|has\s+not|haven'?t|hasn'?t|never|did\s+not|didn'?t)\s+(?:received?|gotten|got|been\s+paid)\b[^.?!]{0,60}\b(?:referral|refund|rebate|reward|bonus|deposit)\b/i;
 // "Just call me at 5pm" is a call request, not a visit (2026-10-02 break test:
 // it got two visit times on another day).
+// A question about WHEN a call can happen ("what times work for a call?",
+// "when can John call me?"): a call asked for, on the rehash line (2026-10-16).
+const CALL_TIME_ASK_RX = /\b(?:what|which)\s+(?:times?|days?|day\s+and\s+time)\b[^.?!]{0,30}\b(?:call|talk|chat|phone)\b|\bwhen\s+(?:can|could|would|will)\s+(?:you|someone|somebody|he|she|they|[A-Z][a-z]+)\s+(?:call|ring|phone|talk)\b|\b(?:call|talk)\s+(?:times?|availability)\b/i;
 const CALLBACK_RX = /\b(?:call|ring|phone)\s+(?:me|us)\b[^.?!]{0,30}\b(?:at|around|after|before|tomorrow|today|tonight|this\s+(?:morning|afternoon|evening)|in\s+the\s+(?:morning|afternoon|evening)|anytime|any\s+time)\b|\b(?:call\s+me\s+back|give\s+me\s+a\s+call|have\s+someone\s+call\s+me)\b|\b(?:can|could|would|will)\s+(?:someone|somebody|you|a\s+(?:person|rep|team\s+member))\s+(?:please\s+)?(?:call|ring|phone)\s+me\b|^\s*(?:just\s+)?(?:please\s+)?call\s+me\b|\b(?:i'?d|i\s+would)\s+(?:rather|prefer\s+to)\s+(?:talk|speak|chat)\s+(?:on\s+the\s+phone|by\s+phone|over\s+the\s+phone)\b/i;
 // 2026-10-03 (Mark's shutters thread): our own offer of a call ("Want someone
 // to give you a call and go over it?"). A yes to it is a callback request.
@@ -255,6 +258,8 @@ export const CONSEQUENCE_RX = /\bwhat\s+happens\s+if\b|\bif\s+you\s+(?:wait|hold
 // Every bridge variant (bridgeLine) names "the next step" and must match here.
 export const BRIDGE_RX = /\bbased\s+on\s+what\s+you\s+(?:told|said|mentioned)\b|\bthis\s+could\s+work\s+for\s+you\b|\b(?:the\s+)?(?:easiest\s+|best\s+)?next\s+step\s+(?:would\s+be|is)\b/i;
 // A vague opener: a greeting, or "I need new windows" with nothing else to go on.
+// Only a hello, nothing else said (2026-10-16): "Hi", "hey there!", "good morning".
+const GREETING_ONLY_RX = /^\s*(?:hi|hii+|hello|hey|hey\s+there|hi\s+there|hello\s+there|howdy|yo|good\s+(?:morning|afternoon|evening))[\s!.,]*$/i;
 const OPENER_RX = /^\s*(?:(?:hi|hello|hey|howdy|good\s+(?:morning|afternoon|evening))(?:\s+there)?[\s!.,]*|(?:hi|hello|hey)?[\s,!.]*(?:i\s+(?:need|want|am\s+looking\s+for|'m\s+looking\s+for)|looking\s+(?:for|into)|interested\s+in)\s+(?:some\s+|new\s+|a\s+few\s+)*(?:impact\s+)?(?:windows?|doors?|windows?\s+and\s+doors?)[\s!.]*)$/i;
 // Part 7: the bot words its own day ask now, so any day/time question counts.
 const ASK_DAY_RX = /\bwhat\s+day\s+(?:works\s+best|would\s+be\s+easiest)\b|\bwhich\s+day\s+is\s+best\b|\b(?:what|which)\s+(?:day|days|time\s+of\s+day)\b[^.?!]*\?|\bwhen\s+(?:works|would\s+work|is\s+(?:a\s+)?good)\b[^.?!]*\?/i;
@@ -543,9 +548,16 @@ const POST_DEMO_OFFER_RX = /\bwould\s+(?:a\s+)?(?:quick\s+)?call\s+help\b|\bwoul
 /** A no on the post-demo line: isNo, or a soft no to our offer / track question. Pure. */
 export function isPostDemoNo(text, lastOutbound = '') {
   const t = String(text || '');
-  if (isNo(t, lastOutbound)) return true;
+  // 2026-10-16 (opt-outs; Shawn Eastman and the bot gate's rehash test): our
+  // rehash texts end "— John", and the model asks "Did you get a chance to look
+  // it over?" with no "proposal", so "Not at this time" to it counted as no no
+  // and the selling went on. The signature comes off first, and the track's
+  // connection pattern now reads "look it over" (rehash-nepq.js). A soft no to
+  // any OTHER question (a pre-demo discovery question) is still not a no.
+  const sign = String(lastOutbound || '').match(SIGNOFF_RX);
+  const o = sign ? String(lastOutbound).slice(0, sign.index).trim() : String(lastOutbound || '');
+  if (isNo(t, o)) return true;
   if (!SOFT_DECLINE_RX.test(t)) return false;
-  const o = String(lastOutbound || '');
   return CALL_OFFER_SENTENCE_RX.test(o) || BRIDGE_RX.test(o) || POST_DEMO_OFFER_RX.test(o) || REHASH_BRIDGE_RX.test(o) || REHASH_STAGES.some(st => st.rx.test(o));
 }
 
@@ -1040,7 +1052,10 @@ function planNepqTurnCore({
   function planRehashCall() {
     // A follow-up date or "we signed elsewhere" is the post-demo plan's job.
     if (PURCHASED_ELSEWHERE_RX.test(now) || detectDeferral(now, nowMs)) return null;
-    const scheduleAsk = SCHEDULE_ASK_RX.test(now) || TIME_REQUEST_RX.test(now);
+    // 2026-10-16 (opt-outs; the bot gate's rehash_book_call): "Sure, what
+    // times work for a call?" matched no call or schedule pattern, so the lead
+    // got the proposal question instead of the rep's real times.
+    const scheduleAsk = SCHEDULE_ASK_RX.test(now) || TIME_REQUEST_RX.test(now) || CALL_TIME_ASK_RX.test(now);
     if (pendingDeferral(earlierInbound(), nowMs) && !scheduleAsk && !askedForCall) return null;
     const all = Array.isArray(callSlots.all) ? callSlots.all : [];
     const offer = Array.isArray(callSlots.offer) ? callSlots.offer : [];
@@ -1135,8 +1150,12 @@ function planNepqTurnCore({
     const onTrack = rehash ?? !!rehashRep;
     if (onTrack) plan.rehash_stage = track.stage;
     // The track's question for this stage, unless one of our last three asked it.
+    // 2026-10-16 (opt-outs; the bot gate's rehash test): the model words the
+    // question its own way ("look it over?"), so an exact-words check let the
+    // same question go out twice in a row. The stage's own pattern reads it back.
+    const stageRx = REHASH_STAGES.find(st => st.key === track.stage)?.rx || null;
     const trackQ = onTrack && ['connection', 'situation', 'problem', 'solution'].includes(track.stage) && track.example
-      && !lastThreeOut.some(t => norm(t).includes(norm(track.example))) ? track.example : null;
+      && !lastThreeOut.some(t => norm(t).includes(norm(track.example)) || (stageRx && stageRx.test(t))) ? track.example : null;
     // 3b. STOP, enforced in code (Shawn Eastman, 2026-10-15). Two no's in this
     //     session, in a row or not (or the track's two in a row): one short
     //     line, no question, no pitch, and a #contact-rehash card (rehash_stop,
@@ -1614,7 +1633,10 @@ function planNepqTurnCore({
   // (once; after that a "why now" probe). No problem yet: a probe for it.
   plan.allowed.consequence = earned.problem && !earned.consequence && !counters.consequence_used && counters.discovery_questions_asked >= 1;
   plan.required_move = plan.allowed.consequence ? 'consequence' : 'probe';
-  if (plan.required_move === 'probe') plan.probe_for = earned.problem ? 'why_it_matters' : 'problem';
+  // 2026-10-16 (opt-outs): Joshua and Erica said only "Hi" and got "Is it more
+  // how they look, or how they work?", an either/or about a problem they never
+  // named; both opted out. A bare hello gets a plain, open question.
+  if (plan.required_move === 'probe') plan.probe_for = earned.problem ? 'why_it_matters' : (GREETING_ONLY_RX.test(now) ? 'open' : 'problem');
   plan.booking = { allowed: false, reason: 'nepq:discover_first' };
   return plan;
 }
@@ -2464,9 +2486,16 @@ export function enforceNepqPlan(draft, plan, { allowFigures = false, known = {} 
 const DETAIL_REQUEST_RX = /\b(?:let\s+me\s+(?:get|grab|have)|(?:i|we)(?:'ll|’ll|\s+will)?\s+(?:just\s+|also\s+)?need|(?:can|could)\s+(?:you|i\s+get))\b[^.?!]*\b(?:zip|address|phone|number|e-?mail|name)\b/i;
 
 const DISCOVERY_QUESTIONS = {
+  // A bare hello (2026-10-16): open, plain, never an either/or.
+  open: [
+    'What can we help you with on your windows or doors?',
+    'What has you looking into windows or doors?',
+  ],
+  // 2026-10-16: "Is it more how they look, or how they work?" is gone; as a
+  // reply to a hello it read as a quiz and both leads who got it opted out.
   problem: [
     "What's bothering you most about your windows or doors right now?",
-    'Is it more how they look, or how they work?',
+    'What made you start looking into this?',
     'What would you most like to change about them?',
   ],
   why_it_matters: [
@@ -2483,6 +2512,6 @@ const DISCOVERY_QUESTIONS = {
 
 /** A discovery question for this plan, never one already sent. Pure. */
 export function discoveryQuestion(plan = {}) {
-  const key = plan.required_move === 'consequence' ? 'consequence' : (plan.probe_for === 'why_it_matters' ? 'why_it_matters' : 'problem');
+  const key = plan.required_move === 'consequence' ? 'consequence' : (plan.probe_for === 'why_it_matters' ? 'why_it_matters' : plan.probe_for === 'open' ? 'open' : 'problem');
   return pickFresh(DISCOVERY_QUESTIONS[key], plan.recent_outbound || [], plan.variant_seed || 0);
 }
