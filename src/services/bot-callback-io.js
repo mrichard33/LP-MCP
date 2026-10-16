@@ -42,6 +42,19 @@ export function botCallbackDeps({ applyTags, addNote }) {
       return executeActionById(data.id);
     },
     routeHandoff: (args) => routeNepqHandoff(args, nepqHandoffDeps({ applyTags, addNote })),
+    // 2026-10-16: a post-demo lead's call goes to the rehash team, through the
+    // same routing the requeue's rehash branch uses (src/notifications/rehash-call.js).
+    // Live only, like the requeue's branch (REHASH_ROUTING_MODE).
+    routeRehash: async ({ contactId, inbound }) => {
+      const { rehashRoutingMode } = await import('../agentic/rehash-state.js');
+      if (rehashRoutingMode() !== 'live') return { rehash_card: 'none', reason: `rehash_routing_${rehashRoutingMode()}` };
+      const [{ routeRehashReply }, who] = await Promise.all([
+        import('../notifications/rehash-call.js'),
+        resolveHandoffIdentityLive(contactId).catch(() => null),
+      ]);
+      const firstName = String(who?.name || '').trim().split(/\s+/)[0] || null;
+      return routeRehashReply({ contactId, text: inbound, contact: { firstName, phone: who?.phone || null } });
+    },
   };
 }
 
@@ -67,10 +80,36 @@ export async function canvassChannelsFor(contactId) {
   return resolveSlackChannels('canvass', { market: market || undefined });
 }
 
+/**
+ * Who a hand-off card names (2026-10-16, Linda Darnell: "Contact: name not given
+ * yet", no phone, no prospect). The same reads the GroupMe "AGENTIC MESSAGE SENT"
+ * card uses: resolveContactInfo (GHL, then lp_leads) and the LP prospect from the
+ * lp_leads row it already read, else resolveLPProspectId (the GHL field from the
+ * snapshot; LP live only when a lead id is known but its prospect is not).
+ * Capped so a slow read never holds the card; null on any failure.
+ */
+export const IDENTITY_LOOKUP_CAP_MS = 8000;
+export async function resolveHandoffIdentityLive(contactId) {
+  const read = (async () => {
+    const { resolveContactInfo, resolveLPProspectId } = await import('../actions/resolvers.js');
+    const info = await resolveContactInfo(contactId).catch(() => null);
+    let prospectId = info?.lpLead?.lp_prospect_id ? String(info.lpLead.lp_prospect_id) : null;
+    if (!prospectId) {
+      const pid = await resolveLPProspectId(contactId, { ghlContact: info?.ghlContact || null }).catch(() => null);
+      prospectId = /^\d+$/.test(String(pid || '').trim()) ? String(pid).trim() : null;
+    }
+    return { name: info?.name || null, phone: info?.phone || null, prospectId };
+  })();
+  let timer;
+  const cap = new Promise((resolve) => { timer = setTimeout(() => resolve(null), IDENTITY_LOOKUP_CAP_MS); timer.unref?.(); });
+  try { return await Promise.race([read, cap]); } finally { clearTimeout(timer); }
+}
+
 /** Production deps for routeNepqHandoff (src/agentic/nepq-handoff.js), shared by both bots. */
 export function nepqHandoffDeps({ applyTags, addNote }) {
   return {
     applyTags, addNote, emitEvent,
+    resolveIdentity: resolveHandoffIdentityLive,
     post: (text, channelId) => import('../slack.js').then(({ postToSlack }) => postToSlack(text, channelId)),
     opsAlert: (text) => import('../alert-state.js').then(({ sendAlertMessage }) => sendAlertMessage(text, { channel: 'ops' })),
     serviceChannels: serviceChannelsFor,

@@ -205,6 +205,21 @@ const SPOUSE_OBJECTION_RX = /\b(?:talk|check|ask|discuss|run\s+(?:it|this))\b[^.
 const SHOPPING_RX = /\b(?:(?:\d|two|three|four|few|couple(?:\s+of)?|multiple|other|more)\s+(?:quotes|estimates|bids|companies|contractors)|shopping\s+around|comparing|getting\s+(?:other\s+)?(?:quotes|estimates|bids))\b/i;
 const THINK_RX = /\b(?:think\s+(?:it\s+over|about\s+it|on\s+it)|sleep\s+on\s+it|get\s+back\s+to\s+you|let\s+me\s+(?:think|see|check)|maybe\s+later|not\s+(?:right\s+)?now|need\s+(?:some\s+)?time)\b/i;
 export const YES_RX = /^\s*(?:y(?:es|eah|ep|up)|sure|ok(?:ay)?|sounds\s+good|that\s+works|please|absolutely|definitely|why\s+not|let'?s\s+do\s+it|i'?d\s+like\s+that)\b/i;
+/**
+ * Did the lead, in their own words, ask for a phone call? A call request
+ * ("call me", "can someone call me?", "what time can John call?", "I'd rather
+ * talk on the phone"), or a yes to our own call offer. "I can call you back" is
+ * the lead calling US, never a call we owe. Pure.
+ * 2026-10-16 (Linda Darnell): the analyzer's appointment-day override turned a
+ * post-demo "Too expensive for me." into a call request; message-analyzer.js
+ * applyAppointmentDayGate keeps a callback only when this says yes.
+ */
+export function leadAsksForCall(text, lastOutbound = '') {
+  const t = String(text || '').trim();
+  if (!t || leadWillReachOut(t)) return false;
+  if (CALLBACK_RX.test(t) || CALL_TIME_ASK_RX.test(t)) return true;
+  return CALL_OFFER_RX.test(String(lastOutbound || '')) && YES_RX.test(t);
+}
 // "A team member will call you to set up a time" — wrong next to two real times.
 const CALL_TO_SET_RX = /\b(?:a\s+(?:team\s+)?member(?:\s+of\s+our\s+team)?|someone(?:\s+from\s+our\s+team)?|our\s+team|we)(?:'ll|\s+will)\s+(?:give\s+you\s+a\s+)?call(?:\s+you)?\s+to\s+(?:set\s+(?:up\s+)?|schedule|book|find|pick|line\s+up)\b/i;
 // A non-answer to a discovery question. "no" is not here: it is counted as a no.

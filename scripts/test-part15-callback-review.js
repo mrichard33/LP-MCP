@@ -106,7 +106,7 @@ test('do-not-knock card: canvass channel, its details, no callback tag', async (
   assert.deepEqual(tags, ['nepq:handoff:do_not_knock']);
   // Two no's: #contact-center, no callback marker.
   posted.length = 0; tags.length = 0;
-  await routeNepqHandoff({ contactId: 'C1', reason: 'two_nos', channel: 'sms', inbound: 'no' }, deps);
+  await routeNepqHandoff({ contactId: 'C1', reason: 'two_nos', channel: 'sms', inbound: 'no', phone: '8135550142' }, deps);
   assert.deepEqual(posted.map(p => p.id), ['C_CONTACT_CENTER']);
   assert.deepEqual(tags, ['nepq:handoff:two_nos']);
 });

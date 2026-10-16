@@ -155,3 +155,37 @@ test('only the zip ask and the out-of-area close own the whole reply', () => {
     assert.equal(coverageOwnsReply({ plan: { active: true }, coverage: { status } }), false, status);
   }
 });
+
+// ── 2026-10-16 (Linda Darnell, wq7tGW8n2HlOxgd2gnBt): a post-demo lead is the rehash team's ──
+test('post-demo lead: no Five9 requeue and no #contact-center card, even when the requeue would answer deduped', async () => {
+  const { calls, deps } = fakeDeps({ requeue: { status: 'completed', result: { action: 'requeue_deduped' } } });
+  const rehash = [];
+  deps.routeRehash = async (args) => { rehash.push(args); return { rehash_card: 'digest' }; };
+  const res = await fileBotCallback({ contactId: 'wq7', inbound: 'Too expensive for me.', why: 'callback_route', isPostDemo: true }, deps);
+  assert.deepEqual({ filed: res.filed, reason: res.reason }, { filed: false, reason: 'post_demo' });
+  assert.equal(calls.requeue.length, 0);
+  assert.equal(calls.handoff.length, 0);
+  // The rehash team still hears it, through the #contact-rehash routing.
+  assert.equal(rehash.length, 1);
+  assert.equal(rehash[0].inbound, 'Too expensive for me.');
+});
+
+test('post-demo lead: service and the reviewed rehash hand-offs keep their own paths', async () => {
+  const svc = fakeDeps();
+  await fileBotCallback({ contactId: 'C1', reason: 'service', isPostDemo: true }, svc.deps);
+  assert.equal(svc.calls.handoff[0].reason, 'service');
+  const stop = fakeDeps();
+  await fileBotCallback({ contactId: 'C1', reason: 'rehash_stop', isPostDemo: true }, stop.deps);
+  assert.equal(stop.calls.handoff[0].reason, 'rehash_stop');
+  assert.equal(stop.calls.requeue.length, 0);
+});
+
+test('isPostDemoForCallback: the post-demo flag, rehash or a demo tag; a SOLD lead keeps the old path', async () => {
+  const { isPostDemoForCallback } = await import('../src/agentic/bot-callback.js');
+  assert.equal(isPostDemoForCallback({ tags: ['lp-demo-completed', 'rehash', 'stage:post-appointment'] }), true);
+  assert.equal(isPostDemoForCallback({ generated: { post_demo_lead: true } }), true);
+  assert.equal(isPostDemoForCallback({ generated: { rehash: { active: true } } }), true);
+  assert.equal(isPostDemoForCallback({ tags: ['Rehash'] }), true);
+  assert.equal(isPostDemoForCallback({ tags: ['lp-demo-completed'], sold: true }), false);
+  assert.equal(isPostDemoForCallback({ tags: ['stage:new-lead'] }), false);
+});

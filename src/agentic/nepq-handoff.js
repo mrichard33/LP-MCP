@@ -24,6 +24,7 @@
 import { CALLBACK_MARKER_TAG, NO_DIAL_REASONS } from './bot-callback.js';
 import { GHL_LOCATION_ID } from '../actions/constants.js';
 import { rehashSlackChannel } from './rehash.js';
+import { slackPhone, prospectLabel } from '../format-helpers.js';
 
 /**
  * Where dispatch's cards go; SLACK_CHANNEL_DISPATCH overrides (same default as the cancel cards).
@@ -81,12 +82,22 @@ const TOLD = {
   do_not_knock: ' The bot apologised and told them our team will not knock again.',
 };
 
-/** The rep note and the card body. Pure. */
-export function formatNepqHandoff({ reason, channel, inbound, contactId, firstName, extra = null }) {
-  const who = firstName || 'A lead';
+/**
+ * The rep note and the card body. Pure.
+ * 2026-10-16 (Linda Darnell, wq7tGW8n2HlOxgd2gnBt): the card printed "Contact:
+ * name not given yet" with no phone and no prospect, so #contact-center could not
+ * tell who to call. It now names the lead (`name`, the full name when known), the
+ * phone as 10 digits (slackPhone, the 2026-10-13 ruling) and the LP prospect
+ * (prospectLabel: never the lead id; "Prospect: unknown" when none is known).
+ * A phone that is not known prints no Phone line.
+ */
+export function formatNepqHandoff({ reason, channel, inbound, contactId, firstName, name = null, phone = null, prospectId = null, extra = null }) {
+  const display = String(name || firstName || '').trim() || null;
+  const who = display || 'A lead';
+  const digits = slackPhone(phone);
   return {
     note: `[AGENT TASK] ${who} needs a person (NEPQ hand-off: ${reason}).\nThey said: "${String(inbound || '').slice(0, 400)}"\n${WHY[reason] || ''}`,
-    card: `${reason === 'do_not_knock' ? '🚪 DO NOT KNOCK' : reason === 'lp_note_dq' ? '⛔ TEAM NOTE: WE CAN\'T RUN THIS LEAD, BOT STOPPED' : reason === 'scope_dq' ? '⛔ SET THIS LEAD TO ND IN LP' : `🤝 A PERSON IS NEEDED (${reason.replace(/_/g, ' ')})`}\nContact: ${firstName || 'name not given yet'}\nChannel: ${channel === 'livechat' ? 'WEBSITE CHAT' : String(channel || 'sms').toUpperCase()}\nThey said: "${String(inbound || '').slice(0, 200)}"\n→ ${WHY[reason] || 'Needs a person.'}${TOLD[reason] ?? ' The bot told them someone from our team will reach out.'}${extra ? `\n${extra}` : ''}\nGHL: https://app.gohighlevel.com/v2/location/${GHL_LOCATION_ID}/contacts/detail/${contactId}`,
+    card: `${reason === 'do_not_knock' ? '🚪 DO NOT KNOCK' : reason === 'lp_note_dq' ? '⛔ TEAM NOTE: WE CAN\'T RUN THIS LEAD, BOT STOPPED' : reason === 'scope_dq' ? '⛔ SET THIS LEAD TO ND IN LP' : `🤝 A PERSON IS NEEDED (${reason.replace(/_/g, ' ')})`}\nContact: ${display || 'name not given yet'}${digits ? `\nPhone: ${digits}` : ''}\nLP: ${prospectLabel(prospectId)}\nChannel: ${channel === 'livechat' ? 'WEBSITE CHAT' : String(channel || 'sms').toUpperCase()}\nThey said: "${String(inbound || '').slice(0, 200)}"\n→ ${WHY[reason] || 'Needs a person.'}${TOLD[reason] ?? ' The bot told them someone from our team will reach out.'}${extra ? `\n${extra}` : ''}\nGHL: https://app.gohighlevel.com/v2/location/${GHL_LOCATION_ID}/contacts/detail/${contactId}`,
   };
 }
 
@@ -101,11 +112,20 @@ export function formatNepqHandoff({ reason, channel, inbound, contactId, firstNa
  *   daily claim of its own; the SMS path's bot-callback claim already held it
  *   to one. The tag, note and event still run every time.
  */
-export async function routeNepqHandoff({ contactId, reason, channel, inbound, firstName = null, nowMs = Date.now(), extra = null }, deps) {
+export async function routeNepqHandoff({ contactId, reason, channel, inbound, firstName = null, phone = null, prospectId = null, nowMs = Date.now(), extra = null }, deps) {
   if (!contactId || !reason) return { routed: false };
+  // 2026-10-16 (Linda Darnell): the caller's first name was empty, so the card
+  // named nobody. Fill what is missing from the contact (deps.resolveIdentity:
+  // the same GHL / lp_leads reads the GroupMe "AGENTIC MESSAGE SENT" card uses).
+  const who = await resolveHandoffIdentity({ contactId, firstName, phone, prospectId }, deps);
   // `extra`: one more card line (the Five9 result of a callback, bot-callback.js).
-  const { note, card } = formatNepqHandoff({ reason, channel, inbound, contactId, firstName, extra });
+  const { note, card } = formatNepqHandoff({ reason, channel, inbound, contactId, firstName, name: who.name, phone: who.phone, prospectId: who.prospectId, extra });
   const day = new Date(nowMs).toISOString().slice(0, 10);
+  // A card nobody can act on is not posted (2026-10-16): no name and no phone
+  // after the lookup. One #ops-alerts line instead, so the missing identity
+  // data gets looked at; the tag, note and event below still run. A do-not-knock
+  // card names the door by its address (in `extra`), so it always posts.
+  const skipCard = !who.name && !who.phone && reason !== 'do_not_knock';
   const results = await Promise.allSettled([
     // 2026-10-03 (Mark): no GHL instant ring. hdl:callback-sales started
     // I.HDL-1 → B.HC-L's GHL call bridge (the lead saw a GHL number); the call
@@ -119,11 +139,46 @@ export async function routeNepqHandoff({ contactId, reason, channel, inbound, fi
       priority: 'high', bypass_filter: true, idempotency_key: `nepq_handoff_${contactId}_${reason}_${day}`,
       payload: { contact_id: contactId, reason, channel, inbound_preview: String(inbound || '').slice(0, 300) },
     })),
-    Promise.resolve().then(() => postCardOnce({ card, reason, contactId, day, nowMs }, deps)),
+    Promise.resolve().then(() => (skipCard
+      ? deps.opsAlert?.(`HAND-OFF CARD SKIPPED: no name or phone for ${contactId} (${reason})\nGHL: https://app.gohighlevel.com/v2/location/${GHL_LOCATION_ID}/contacts/detail/${contactId}`)
+      : postCardOnce({ card, reason, contactId, day, nowMs }, deps))),
   ]);
   const failed = results.filter(r => r.status === 'rejected');
   for (const f of failed) console.warn(`[NepqHandoff] side effect failed for ${contactId} (${reason}): ${f.reason?.message || f.reason}`);
-  return { routed: true, failed: failed.length };
+  if (skipCard) console.warn(`[NepqHandoff] ${contactId} (${reason}) card SKIPPED: no name or phone after lookup`);
+  return { routed: true, failed: failed.length, card_skipped: skipCard };
+}
+
+/** A name a card can use: never the contact id, a placeholder or a bare prospect label. Pure. */
+export function usableName(name, contactId = null) {
+  const n = String(name || '').trim();
+  if (!n || n === contactId) return null;
+  if (/^(?:unknown(?:\s+contact)?|prospect\b.*|guest(?:\s+visitor\b.*)?|visitor\b.*|name not given yet)$/i.test(n)) return null;
+  return n;
+}
+
+/**
+ * The name, phone and prospect a hand-off card prints: the caller's values,
+ * with anything missing filled by deps.resolveIdentity(contactId) →
+ * { name, phone, prospectId }. Fail-soft: a failed lookup keeps what we had.
+ */
+export async function resolveHandoffIdentity({ contactId, firstName = null, phone = null, prospectId = null }, deps = {}) {
+  let name = usableName(firstName, contactId);
+  let ph = phone ? String(phone) : null;
+  let pid = prospectId ? String(prospectId) : null;
+  // The full name is always worth reading when only a first name is in hand.
+  if (deps.resolveIdentity && (!ph || !pid || !name || !/\s/.test(name))) {
+    const got = await Promise.resolve().then(() => deps.resolveIdentity(contactId)).catch((err) => {
+      console.warn(`[NepqHandoff] identity lookup failed for ${contactId}: ${err?.message || err}`);
+      return null;
+    });
+    const full = usableName(got?.name, contactId);
+    // A resolved full name wins over a bare first name it starts with.
+    if (full && (!name || full.toLowerCase().startsWith(name.toLowerCase()))) name = full;
+    if (!ph && got?.phone) ph = String(got.phone);
+    if (!pid && got?.prospectId) pid = String(got.prospectId);
+  }
+  return { name, phone: ph, prospectId: pid };
 }
 
 export const HANDOFF_CARD_AUDIT = 'nepq_handoff_card';

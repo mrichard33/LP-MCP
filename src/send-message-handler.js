@@ -331,7 +331,7 @@ import { checkNotSuperseded, commitAgenticSend } from './services/agentic-reply-
 import { findNewerInbound } from './agentic/burst-yield.js';
 import { emitEvent } from './event-emitter.js';
 import { routeNepqHandoff } from './agentic/nepq-handoff.js';
-import { fileBotCallback, callbackDecision, schedulingCallbackDecision, CALLBACK_MARKER_TAG } from './agentic/bot-callback.js';
+import { fileBotCallback, callbackDecision, schedulingCallbackDecision, isPostDemoForCallback, CALLBACK_MARKER_TAG } from './agentic/bot-callback.js';
 import { applyBookingTruth, bookingResult } from './agentic/booking-claim.js';
 import { isTeamOpen } from './agentic/team-hours.js';
 import { noteDqPackage } from './agentic/lp-note-dq.js';
@@ -4293,6 +4293,9 @@ export async function executeSendMessage(action, context) {
         // A service conversation goes to the service channel, never Five9 (Mark, 2026-10-03).
         kind: decision.kind || (generated?.service_conversation ? 'service' : 'sales'),
         card: decision.card !== false,
+        // 2026-10-16 (Linda Darnell): an unsold post-demo lead is the rehash
+        // team's: no Five9 sales list, no #contact-center card (bot-callback.js).
+        isPostDemo: isPostDemoForCallback({ generated, tags, sold: generated?.lead_sold === true }),
         // The do-not-knock address and name (nepq-planner.js), on the card;
         // for a team-note DQ, the whole context package.
         extra: noteDq

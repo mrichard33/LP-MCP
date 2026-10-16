@@ -257,6 +257,7 @@ import { inboundFromReplyEvent } from './agentic/burst-yield.js';
 // handling or rep escalation (that produced a duplicate "a rep will call" send
 // alongside the booking confirmation).
 import { hasActiveBooking } from './agentic/lead-state/signals/context-reader.js';
+import { leadAsksForCall } from './agentic/nepq-planner.js';
 // 2026-09-11 (Alfredo Fontan) — the shared contract for which established
 // facts are writable and what values they accept. Pure; the action handler
 // that performs the write imports the same module, so the two cannot drift.
@@ -529,13 +530,21 @@ with every value null and answered_question_keys empty. Do NOT omit the object
 and do NOT invent a value to fill it.
 
 APPOINTMENT-DAY OVERRIDE (highest precedence when it applies):
-Read appointment_phase from the context. When appointment_phase is
-"in_window" or "past" and the contact has just sent an inbound message,
-recommended_action MUST be "callback_request" — never "fast_track_booking"
-and never "continue_current". A booked homeowner who is texting during or
-after their own appointment window is not asking to be reassured and is not
-asking to be re-booked. They need a human on the phone, now. Set
-requested_fulfillment to "phone_call".
+It applies ONLY on the day of the appointment. Read appointment_phase from the
+context. When appointment_phase is "in_window", or "past" on the SAME calendar
+day as the appointment (the NOW line's date is the appointment's date), and the
+contact has just sent an inbound message, recommended_action MUST be
+"callback_request" — never "fast_track_booking" and never "continue_current".
+A booked homeowner who is texting during or just after their own appointment
+window is not asking to be reassured and is not asking to be re-booked. They
+need a human on the phone, now. Set requested_fulfillment to "phone_call".
+
+When the appointment was on an EARLIER day, this override does NOT apply. A
+lead days past the visit who raises an objection ("too expensive", "need to
+think") without asking for a call is a post-demo objection: use
+deploy_objection_handler with the objection_type, never callback_request and
+never requested_fulfillment "phone_call". Only the lead's own call request
+("call me", "can someone call me", a yes to our call offer) is callback_request.
 
 When appointment_phase is "imminent" (the visit is within four hours),
 treat logistics questions — ETA, directions, gate codes, who is coming,
@@ -1153,6 +1162,68 @@ export function applyFastTrackEvidenceGate(analysis, messageText, context, conta
 // null escalation_category to the Five9 Callback Request list, gated on the
 // customer_relationship field emitted below (see the 2026-09-07 seed).
 
+/**
+ * Is the APPOINTMENT-DAY OVERRIDE in force? Pure.
+ * 2026-10-16 (Linda Darnell, wq7tGW8n2HlOxgd2gnBt): "Too expensive for me." came
+ * 4,680 minutes (three days) after her demo. appointment_phase is 'past' for
+ * EVERY lead more than two hours past the visit, so the override, written for a
+ * homeowner texting during or just after their own visit (Myron Thorner,
+ * 2026-08-28), routed a post-demo price objection to callback_request +
+ * phone_call: a Five9 callback and a blank #contact-center card.
+ * In force: 'in_window', or 'past' on the same local calendar day as the
+ * appointment (the contact's market zone; Eastern by default). Anything else,
+ * or a phase it cannot place on a day, is not the appointment day.
+ * @param {object} lp  context.lp (appointment_phase, appointment_minutes_delta, appointment_days_delta)
+ */
+export function appointmentDayOverrideApplies(lp, { nowMs = Date.now(), timeZone = 'America/New_York' } = {}) {
+  const phase = lp?.appointment_phase || null;
+  if (phase === 'in_window') return true;
+  if (phase !== 'past') return false;
+  const mins = lp?.appointment_minutes_delta;
+  if (typeof mins === 'number' && Number.isFinite(mins)) {
+    const ymd = (ms) => new Intl.DateTimeFormat('en-CA', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(ms));
+    return ymd(nowMs + mins * 60000) === ymd(nowMs);
+  }
+  return lp?.appointment_days_delta === 0;
+}
+
+/**
+ * The deterministic half of the appointment-day rule (the prompt says it too;
+ * the model drifted). When the visit was on an earlier day and the lead did not
+ * ask for a call in their own words (leadAsksForCall), a callback_request route
+ * becomes the post-demo objection route (deploy_objection_handler with an
+ * objection on file, else continue_current) and requested_fulfillment
+ * 'phone_call' is cleared, so the send handler files no Five9 callback
+ * (bot-callback.js schedulingCallbackDecision) and the post-demo ladder
+ * (nepq-planner.js planPostDemo → #contact-rehash) owns the turn. A real call
+ * request ("call me", a yes to our call offer) is untouched. Mutates and
+ * returns `analysis`. Pure apart from logs.
+ */
+export function applyAppointmentDayGate(analysis, messageText, context, contactId = '?', { nowMs = Date.now() } = {}) {
+  if (!analysis) return analysis;
+  const lp = context?.lp || null;
+  const phase = lp?.appointment_phase || null;
+  if (phase !== 'past' && phase !== 'in_window') return analysis;
+  const routesToCall = analysis.recommended_action === 'callback_request' || analysis.requested_fulfillment === 'phone_call';
+  if (!routesToCall) return analysis;
+  const timeZone = context?.now?.tz || context?.market?.timezone || 'America/New_York';
+  if (appointmentDayOverrideApplies(lp, { nowMs, timeZone })) return analysis;
+  const recent = Array.isArray(context?.conversation_recent) ? context.conversation_recent : [];
+  const lastOut = [...recent].reverse().find(m => m?.direction === 'outbound');
+  if (leadAsksForCall(messageText, lastOut?.text || lastOut?.body || '')) return analysis;
+  const before = `${analysis.recommended_action}/${analysis.requested_fulfillment || 'none'}`;
+  if (analysis.recommended_action === 'callback_request') {
+    analysis.recommended_action = analysis.objection_type ? 'deploy_objection_handler' : 'continue_current';
+  }
+  if (analysis.requested_fulfillment === 'phone_call') analysis.requested_fulfillment = null;
+  console.log(
+    `[MessageAnalyzer] Appointment-day gate for ${contactId}: visit was on an earlier day ` +
+    `(phase=${phase}, minutes_delta=${lp?.appointment_minutes_delta ?? 'n/a'}) and no call asked → ` +
+    `${before} → ${analysis.recommended_action}/${analysis.requested_fulfillment || 'none'}`
+  );
+  return analysis;
+}
+
 // Language about installed product / service on work already done.
 // Word-bounded on every alternative. Exported for unit tests.
 export const SERVICE_ISSUE_REGEX = new RegExp(
@@ -1448,6 +1519,11 @@ export async function analyzeMessage(ghlContactId, messageText, eventId = null, 
     // (which may coerce toward escalate_to_rep) and before the booking-flow
     // override, so a cleared category can never re-enter through either.
     applyCustomerRelationshipGate(analysis, messageText, context, ghlContactId);
+
+    // 2026-10-16 (Linda Darnell) — the appointment-day override is for the day
+    // of the visit only. Runs after the relationship gate and before the
+    // booking-flow override (which may soften the objection route it leaves).
+    applyAppointmentDayGate(analysis, messageText, context, ghlContactId);
 
     // 2026-06-10 — S1.3 suppress-gate. In the S1.3 revival cohort, suppression
     // decisions belong to the reply-lane rules, not the LLM: dispatch row 1 now

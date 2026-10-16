@@ -5312,6 +5312,9 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     // A lead past its demo (2026-10-13): the rep already qualified the home, so
     // only our own false claims are checked (no thread, no lead words).
     if (pastDemo) validated.post_demo_lead = true;
+    // 2026-10-16: a SOLD lead keeps its rep; the bot callback reads this to keep
+    // a sold customer's call off the rehash path (bot-callback.js isPostDemoForCallback).
+    if (lpSold(context?.lp) || isCustomerP2(context)) validated.lead_sold = true;
     const jobScope = pastDemo ? enforceJobScope(validated.message, {}) : enforceJobScope(validated.message, { thread: context.conversation_recent || [], inbound: triggerMessage });
     if (jobScope.changed) {
       console.warn(`[JobScope] ${contactId} ${jobScope.reason}`);

@@ -69,6 +69,8 @@ test('the service card goes to the market #service channel, with no callback wor
     opsAlert: async () => {},
     serviceChannels: async () => ['C_SERVICE_ORLANDO'],
     env: { SLACK_CHANNEL_SERVICE: 'C_CONTACT_CENTER' },
+    // 2026-10-16: a card with no name and no phone is not posted.
+    resolveIdentity: async () => ({ name: 'Pat Lee', phone: '8135550142', prospectId: null }),
   };
   await routeNepqHandoff({ contactId: 'C1', reason: 'service', channel: 'sms', inbound: 'my install date?' }, deps);
   assert.deepEqual(posted, ['C_SERVICE_ORLANDO']);
@@ -96,6 +98,8 @@ test('a hand-off card posts once per contact per reason per day; tag and note st
     opsAlert: async () => {},
     serviceChannels: async () => ['C_SERVICE_ORLANDO'],
     env: { SLACK_CHANNEL_SERVICE: 'C_CONTACT_CENTER' },
+    // 2026-10-16: a card with no name and no phone is not posted.
+    resolveIdentity: async () => ({ name: 'Pat Lee', phone: '8135550142', prospectId: null }),
     filterNew: async ({ items }) => ({ fresh: items.filter((i) => !seen.has(`${i.key}|${i.reason}`)) }),
     recordPosted: async ({ items }) => { items.forEach((i) => seen.add(`${i.key}|${i.reason}`)); },
   };

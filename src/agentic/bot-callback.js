@@ -89,6 +89,17 @@ export function schedulingCallbackDecision({ bookingClaimBlocked = false, recomm
   return null;
 }
 
+/**
+ * 2026-10-16 (Linda Darnell): is this an unsold lead past its demo, whose
+ * callback belongs to the rehash team? A SOLD lead keeps its rep and the old
+ * path (CLAUDE.md: "A SOLD lead keeps its rep"), so `sold` wins. Pure.
+ */
+export function isPostDemoForCallback({ generated = null, tags = [], sold = false } = {}) {
+  if (sold) return false;
+  const t = (Array.isArray(tags) ? tags : []).map(x => String(x).toLowerCase());
+  return !!generated?.post_demo_lead || generated?.rehash?.active === true || t.includes('lp-demo-completed') || t.includes('rehash');
+}
+
 /** The card line for the Five9 result. Pure. */
 export function five9ResultLine(result) {
   switch (result?.status) {
@@ -126,14 +137,17 @@ export function readRequeueResult(res) {
 
 /**
  * @param {{ contactId, channel, inbound, firstName?, hasPhone?, why?, kind?: 'sales'|'service',
- *           reason?: string, card?: boolean, nowMs? }} args
+ *           reason?: string, card?: boolean, isPostDemo?: boolean, nowMs? }} args
  *   reason — the hand-off reason on the card (callback_request, complaint, price_insist, …)
  *   card   — false when the caller already posts its own card (Five9 only)
  *   extra  — one more card line for a reviewed hand-off (the do-not-knock details)
+ *   isPostDemo — an unsold lead past its demo: the rehash team's, never Five9's
+ *                sales list and never a #contact-center card (2026-10-16)
  * @param {{ alreadyFiled(contactId, key) → Promise<boolean>, claim(contactId, key, payload) → Promise<any>,
- *           queueRequeue(contactId, notes) → Promise<any>, routeHandoff(args) → Promise<any>, log? }} deps
+ *           queueRequeue(contactId, notes) → Promise<any>, routeHandoff(args) → Promise<any>,
+ *           routeRehash?(args) → Promise<any>, log? }} deps
  */
-export async function fileBotCallback({ contactId, channel = 'sms', inbound = '', firstName = null, hasPhone = true, why = 'planned', kind = 'sales', reason = 'callback_request', card = true, extra = null, nowMs = Date.now() } = {}, deps = {}) {
+export async function fileBotCallback({ contactId, channel = 'sms', inbound = '', firstName = null, hasPhone = true, why = 'planned', kind = 'sales', reason = 'callback_request', card = true, extra = null, isPostDemo = false, nowMs = Date.now() } = {}, deps = {}) {
   const log = deps.log || ((m) => console.log(m));
   if (!contactId) return { filed: false, reason: 'no_contact' };
   // A service call never goes on the sales callback list (Mark, 2026-10-03):
@@ -159,6 +173,22 @@ export async function fileBotCallback({ contactId, channel = 'sms', inbound = ''
     }
     log(`[BotCallback] ${contactId} (${channel}, ${reason}) is reviewed, not dialed: card only`);
     return { filed: true, five9: { status: 'not_dialed' } };
+  }
+  // A post-demo lead is the rehash team's (2026-10-16, Linda Darnell): "Too
+  // expensive for me." three days after her demo became a #contact-center "A
+  // PERSON IS NEEDED" card. The requeue's own rehash check never ran: its dedup
+  // window answered first, and a deduped result posted the card. Decided here,
+  // before any requeue: no Five9 sales list, no #contact-center card. The rehash
+  // team still hears it: deps.routeRehash is the same #contact-rehash routing the
+  // requeue's rehash branch uses (a call, a quote or a concern card, or the
+  // morning digest). The reviewed hand-offs above (rehash_stop,
+  // rehash_repeat_objection → #contact-rehash), a team-note DQ (the bot is off
+  // and a person must settle it) and service are unchanged.
+  if (isPostDemo && reason !== 'lp_note_dq') {
+    const rehash = await Promise.resolve().then(() => deps.routeRehash?.({ contactId, inbound, firstName, nowMs }))
+      .catch(err => { log(`[BotCallback] ${contactId} rehash routing failed: ${err.message}`); return null; });
+    log(`[BotCallback] ${contactId} post-demo lead: rehash team handles it, no Five9, no #contact-center card${rehash?.rehash_card ? ` (#contact-rehash: ${rehash.rehash_card})` : ''}`);
+    return { filed: false, reason: 'post_demo', rehash: rehash || null };
   }
   if (!hasPhone) {
     // A call request waits for the number (the bot asks for it). Any other

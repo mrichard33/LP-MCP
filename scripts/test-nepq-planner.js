@@ -230,6 +230,7 @@ test('hand-off: trace tag + reason tag, a rep note, one idempotent event, a card
     addNote: async (_id, note) => { seen.note = note; },
     emitEvent: async (e) => { seen.event = e; },
     alert: async (t) => { seen.card = t; },
+    resolveIdentity: async () => ({ name: 'Pat Lee', phone: '+18135550142', prospectId: '582879' }),
   });
   // 2026-10-03 (Mark): no GHL instant ring, so a trace tag, never hdl:callback-sales.
   assert.deepEqual(seen.tags, ['callback:requested', 'nepq:handoff:price_insist']);
@@ -390,6 +391,7 @@ test('hand-off card: #contact-center always, #dispatch for a complaint; a failed
     env, applyTags: async () => {}, addNote: async () => {}, emitEvent: async () => {},
     post: async (text, ch) => { posts.push({ text, ch }); return ch === 'CSERVICE' ? { ok: true } : { ok: false, error: 'not_in_channel' }; },
     opsAlert: async (t) => { ops.push(t); },
+    resolveIdentity: async () => ({ name: 'Pat Lee', phone: null, prospectId: null }),
   });
   assert.deepEqual(posts.map(p => p.ch), ['CSERVICE', 'C0C9AGEM2N8']);
   assert.match(posts[0].text, /WEBSITE CHAT[\s\S]*supposed to come today[\s\S]*contacts\/detail\/C9/);
@@ -566,4 +568,46 @@ test('the new booking confirm: kept whole, never a Callback Request, and read ba
   const p = planNepqTurn({ knownOpenings: true, knownDecisionMakers: true, channel: 'sms', trigger: 'Thanks', conversation: [{ direction: 'outbound', text: line }, { direction: 'inbound', text: 'Thanks' }] });
   assert.ok(['reveal', 'answer'].includes(p.required_move), p.required_move);
   assert.equal(p.booking.allowed, false);
+});
+
+
+// ── 2026-10-16 (Linda Darnell, wq7tGW8n2HlOxgd2gnBt): the card names who to call ──
+
+test('hand-off card: the resolved name, the phone as 10 digits and the LP prospect', async () => {
+  const posts = []; const notes = [];
+  await routeNepqHandoff({ contactId: 'wq7', reason: 'callback_request', channel: 'sms', inbound: 'Too expensive for me.', firstName: null }, {
+    env: { SLACK_CHANNEL_SERVICE: 'CSERVICE' }, applyTags: async () => {}, addNote: async (_id, n) => { notes.push(n); }, emitEvent: async () => {},
+    post: async (text, ch) => { posts.push({ text, ch }); return { ok: true }; }, opsAlert: async () => {},
+    resolveIdentity: async () => ({ name: 'Linda Darnell', phone: '+18132936461', prospectId: '582879' }),
+  });
+  assert.equal(posts.length, 1);
+  assert.match(posts[0].text, /Contact: Linda Darnell\nPhone: 8132936461\nLP: Prospect 582879\n/);
+  assert.ok(!/name not given yet/.test(posts[0].text));
+  assert.match(notes[0], /^\[AGENT TASK\] Linda Darnell needs a person/);
+});
+
+test('hand-off card: a first name in hand still gets the full name; no phone prints no Phone line', async () => {
+  const { formatNepqHandoff, resolveHandoffIdentity } = await import('../src/agentic/nepq-handoff.js');
+  const who = await resolveHandoffIdentity({ contactId: 'C1', firstName: 'Linda' }, { resolveIdentity: async () => ({ name: 'Linda Darnell', phone: null, prospectId: null }) });
+  assert.deepEqual(who, { name: 'Linda Darnell', phone: null, prospectId: null });
+  const { card } = formatNepqHandoff({ reason: 'callback_request', channel: 'sms', inbound: 'hi', contactId: 'C1', name: who.name });
+  assert.match(card, /Contact: Linda Darnell\nLP: Prospect: unknown\nChannel: SMS/);
+  // A lookup that failed, or that returned the contact id as the "name", fills nothing.
+  assert.deepEqual(await resolveHandoffIdentity({ contactId: 'C1', firstName: 'Linda' }, { resolveIdentity: async () => { throw new Error('ghl down'); } }), { name: 'Linda', phone: null, prospectId: null });
+  assert.equal((await resolveHandoffIdentity({ contactId: 'C1' }, { resolveIdentity: async () => ({ name: 'C1' }) })).name, null);
+});
+
+test('hand-off card: no name and no phone after the lookup → no card, one ops line; tag, note, event still run', async () => {
+  const posts = []; const ops = []; const seen = { tags: 0, notes: 0, events: 0 };
+  const res = await routeNepqHandoff({ contactId: 'wq7', reason: 'callback_request', channel: 'sms', inbound: 'Too expensive for me.' }, {
+    env: { SLACK_CHANNEL_SERVICE: 'CSERVICE' },
+    applyTags: async () => { seen.tags++; }, addNote: async () => { seen.notes++; }, emitEvent: async () => { seen.events++; },
+    post: async (text, ch) => { posts.push({ text, ch }); return { ok: true }; }, opsAlert: async (t) => { ops.push(t); },
+    resolveIdentity: async () => ({ name: 'wq7', phone: null, prospectId: '582879' }),
+  });
+  assert.equal(res.card_skipped, true);
+  assert.equal(posts.length, 0);
+  assert.equal(ops.length, 1);
+  assert.match(ops[0], /^HAND-OFF CARD SKIPPED: no name or phone for wq7 \(callback_request\)\nGHL: .*contacts\/detail\/wq7/);
+  assert.deepEqual(seen, { tags: 1, notes: 1, events: 1 });
 });
