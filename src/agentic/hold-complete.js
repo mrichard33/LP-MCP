@@ -43,6 +43,8 @@ import { emitEvent } from '../event-emitter.js';
 import { sendGroupMeMessage } from '../groupme.js';
 import supabase from '../supabase.js';
 import { recoverHoldTarget, completionEventType, holdRecoveryMode } from './hold-target.js';
+import { FOLLOW_UP_RETURN_TO } from './follow-up-checkin.js';
+import { trackBackground } from '../graceful-shutdown.js';
 
 // 2026-10-16: the issued holds a blank-return_to callback is matched against
 // (see src/agentic/hold-target.js). Newest first; a few is plenty, since only
@@ -189,6 +191,48 @@ export function registerHoldCompleteRoutes(app, deps = {}) {
       idempotency_key: `${shadow ? 'hold_complete_shadow' : 'hold_complete'}_${contactId}_${returnTo}_${completedAt}`,
       ...(shadow ? { bypass_filter: true } : {}),
     });
+
+    // ── Watch-only check-in draft (2026-10-16, the user) ──────────────
+    // In shadow no rule reads the event, so rule 331 never writes the
+    // check-in. Write it anyway, send nothing, and record the draft as
+    // agentic.follow_up_checkin_shadow so the wording can be reviewed before
+    // HOLD_RETURN_RECOVERY_MODE goes live. Background: GHL is not kept waiting.
+    if (shadow && returnTo === FOLLOW_UP_RETURN_TO) {
+      const draftJob = (async () => {
+        try {
+          const write = deps.writeFollowUpCheckIn
+            || (await import('../services/follow-up-checkin-io.js')).writeFollowUpCheckIn;
+          const draft = await write({ contactId, channel: 'sms', tags: null });
+          await emit({
+            event_type: 'agentic.follow_up_checkin_shadow',
+            event_subtype: draft.skip ? 'skipped' : 'drafted',
+            source: 'ghl_dynamic_hold',
+            entity_type: 'contact',
+            entity_id: contactId,
+            ghl_contact_id: contactId,
+            payload: draft.skip
+              ? { contact_id: contactId, skipped: true, reason: draft.reason }
+              : {
+                contact_id: contactId,
+                draft: draft.message,
+                used_fallback: draft.used_fallback,
+                fallback_reason: draft.fallback_reason,
+                hold_action_id: draft.hold_action_id,
+                follow_up_label: draft.follow_up?.label || null,
+                follow_up_source: draft.follow_up?.source || null,
+              },
+            priority: 'low',
+            bypass_filter: true,
+            idempotency_key: `follow_up_checkin_shadow_${contactId}_${completedAt}`,
+          });
+          console.log(`[HoldComplete] check-in draft (watch only) contact=${contactId} ` +
+            (draft.skip ? `skipped: ${draft.reason}` : `${draft.used_fallback ? 'backup line' : 'AI-written'}: "${draft.message}"`));
+        } catch (err) {
+          console.warn(`[HoldComplete] check-in draft failed contact=${contactId}: ${err.message}`);
+        }
+      })();
+      if (deps.awaitDrafts) await draftJob; else trackBackground(draftJob);
+    }
 
     // ── Back-compat re-fire (gated) ───────────────────────────────────
     // Never in shadow: a shadow completion must change nothing.

@@ -354,6 +354,8 @@ import { enqueueNoReplyFollowup, openerHoldMode } from './jobs/no-reply-followup
 import { leadWillReachOut } from './agentic/sign-off.js';
 import { sendAsUserFor } from './agentic/ai-sender.js';
 import { appendWarrantyLinks } from './agentic/warranty-request.js';
+import { isFollowUpDue } from './agentic/follow-up-checkin.js';
+import { writeFollowUpCheckIn } from './services/follow-up-checkin-io.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY || '';
 const GHL_LOCATION_ID = process.env.GHL_LOCATION_ID || 'SsBG7j5KQAIP1SFP2Sca';
@@ -3344,6 +3346,29 @@ export async function executeSendMessage(action, context) {
   // pre-generated send, where no inbound was read here.
   let replyTriggerMessage = null;
 
+  // 2026-10-16 (the user) — a follow-up hold that ended (rule 331) has no inbound
+  // to answer, so the reply writer below refused it (no_trigger_message) and the
+  // promised check-in never went. It is written here from what the hold carried
+  // and the conversation as it stands (src/agentic/follow-up-checkin.js), then
+  // sent like any provided message: quiet hours, the live re-check and the
+  // dedup gates still apply.
+  let followUpCheckIn = null;
+  if (!message && payload.requires_ai_generation && isFollowUpDue(context)) {
+    followUpCheckIn = await writeFollowUpCheckIn({
+      contactId,
+      channel,
+      tags,
+      promptHint: payload.prompt_hint || '',
+    });
+    if (followUpCheckIn.skip) {
+      console.log(`[SendMessage] ⏭️ FOLLOW-UP CHECK-IN skipped for ${contactId}: ${followUpCheckIn.reason}`);
+      return { skipped: true, reason: `follow_up_checkin_${followUpCheckIn.reason}`, contact_id: contactId, channel };
+    }
+    message = followUpCheckIn.message;
+    console.log(`[SendMessage] FOLLOW-UP CHECK-IN for ${contactId} (hold ${followUpCheckIn.hold_action_id}, ` +
+      `${followUpCheckIn.used_fallback ? `backup line: ${followUpCheckIn.fallback_reason}` : 'AI-written'})`);
+  }
+
   if (message) {
     console.log(`[SendMessage] Using ${payload.pre_generated ? 'pre-generated' : 'provided'} message for ${contactId} (${message.length} chars)`);
   } else if (payload.requires_ai_generation) {
@@ -4679,6 +4704,15 @@ export async function executeSendMessage(action, context) {
     // which is exactly how the second duplicate slipped through.
     sent_body: String(message).slice(0, 500),
     rule_trigger: action.rule_applied || 'manual',
+    // 2026-10-16 — a follow-up check-in: which hold ended and whether the backup line went.
+    ...(followUpCheckIn ? {
+      follow_up_checkin: {
+        hold_action_id: followUpCheckIn.hold_action_id,
+        used_fallback: followUpCheckIn.used_fallback,
+        fallback_reason: followUpCheckIn.fallback_reason,
+        label: followUpCheckIn.follow_up?.label || null,
+      },
+    } : {}),
     send_method: sendMethod,
     fell_back: sendMethod.includes('fallback'),
     conversation_id: sendResult?.conversationId || null,
