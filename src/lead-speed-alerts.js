@@ -68,6 +68,7 @@ export function alertMode(env = process.env) {
 // lead up. It now means only "we could not check", and says so.
 export const REASON_LABELS = Object.freeze({
   called_no_retry: 'Called, no retry since',
+  attempts_exhausted_not_handed: 'Attempts used up, not handed to next list',
   not_on_dial_list: 'In Five9 but not on any dialing list',
   // The group header; each line names the list (reasonText).
   on_list_not_dialed: 'On a Five9 list but no call recorded',
@@ -85,7 +86,7 @@ export const REASON_LABELS = Object.freeze({
 // Groups are ordered by how many FRESH leads they hold (groupedOffenderLines);
 // this only decides between groups with equal counts.
 export const CARD_REASON_ORDER = Object.freeze([
-  'called_no_retry', 'not_on_dial_list', 'on_list_not_dialed', 'routing_or_automation_failure', 'in_inbound_queue', 'not_in_five9',
+  'called_no_retry', 'attempts_exhausted_not_handed', 'not_on_dial_list', 'on_list_not_dialed', 'routing_or_automation_failure', 'in_inbound_queue', 'not_in_five9',
   'not_issued_call_center', 'not_covered_by_rep', 'rep_hold_expired', 'unverified',
 ]);
 
@@ -244,6 +245,10 @@ export function reasonText(o, nowMs = Date.now()) {
     const last = [o.calls.lastDispo || 'no disposition', Number.isFinite(o.calls.lastMs)
       ? `${formatWait(nowMs - o.calls.lastMs)} ago` : null].filter(Boolean).join(', ');
     return `Called ${o.calls.count}× (last: ${last}) — no retry since`;
+  }
+  if (o.reason === 'attempts_exhausted_not_handed' && o.calls) {
+    const ago = Number.isFinite(o.calls.lastMs) ? `, last ${formatWait(nowMs - o.calls.lastMs)} ago` : '';
+    return `Called ${o.calls.count}× (After DIAL ASAP attempts used up${ago}) — not handed to the next list`;
   }
   if (o.reason === 'on_list_not_dialed' && o.five9_record?.list) {
     return `On ${o.five9_record.list} in Five9 but no call recorded`;

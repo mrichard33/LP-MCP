@@ -359,7 +359,7 @@ booked from `lp_leads` rows LP no longer stood behind: rows synced before 2026-0
 `lpWallClockToGhlStartTime` assumes (lead 475840: LP 10:00 AM, row 15:00Z → a 3:00 PM visit), and 2025 leads carried
 visits about a year after LP last touched them (likely year typos; the contact backstop pulled them in). Every caller of
 `reconcileLpAppointmentToGhl` (the `sync_lp_appointment_to_ghl` handler, the contact backstop, the admin backfill) now
-calls `readLiveForSync` (`src/services/lp-live-appointment.js`) for a Set/Verif/Cnf and passes the result in as `live`
+calls `readLiveForSync` (`src/services/lp-live-appointment.js`) for a Set/Cnf/Issue (Verif is a hold since 2026-10-16) and passes the result in as `live`
 (the reconciler stays supabase-free): LP's live time wins and the row is rewritten to it; with LP unreadable the row books
 only when `synced_at >= 2026-07-08`, else `stale_mirror_unverified`. A visit more than `LP_GHL_SYNC_MAX_FORWARD_DAYS`
 (120) past the lead's last LP activity is `implausible_future_appointment` and posts ONE #ops-alerts card per lead + date
@@ -367,6 +367,43 @@ only when `synced_at >= 2026-07-08`, else `stale_mirror_unverified`. A visit mor
 caller of the reconciler passes `live` too. `parseLpApptWallClock` now lives in `src/actions/date-parsers.js`. One-time
 re-read of the old rows: `POST /admin/refresh-stale-lp-appointments` / `scripts/refresh-stale-lp-appointments.js` (dry
 run default; lp_leads only, never GHL).
+
+**Verif is a hold, ND and No Demo are disqualified, and the watchdog heals appointments (Mark, 2026-10-16, handoff v3.4).**
+One place for the classes: `src/lp-disposition-classes.js` (live = Set / Cnf / Issue, hold = Verif, disqualified = ND /
+No Demo; GHL status Set → new, Cnf / Issue → confirmed, never Set → confirmed).
+- **Verif = "there is an issue with the lead" and starts NOTHING.** This reverses the 2026-07-09 reconciler rule ("Verif
+  = a live Window Estimate, exactly like Set") and the 2026-10-06 "Verif counts as Set". The reconciler returns
+  `verif_hold`; no live read, no authority seat (rank 0); no Confirmation-list add (it still comes off the setter lists,
+  `REMOVE_ONLY_DSP`); no DNC lift (rule 339 is Set / Cnf only) while a DNC is still pushed to LP (rule 292); rules 338
+  `LP_APPT_GHL_SYNC_VERIF` and 30 `LP_DISP_VERIF` are disabled. Where Verif SUPPRESSES (S5.2 gate, leak alerts, dial
+  backstops) it stays suppressed. A GHL appointment that already exists for a Verif lead is left as it is.
+- **Issue = a live appointment** (issued to a rep): classifyDisposition → confirm, authority rank with Cnf.
+- **ND and No Demo = disqualified, an end state.** Rule `LP_DISP_DISQUALIFIED` (replaces `LP_DISP_NO_DEMO`'s rebook
+  route) queues `disqualified_cleanup` (`src/actions/handlers/disqualified-cleanup.js`): every open estimate →
+  `mark_invalid`, out of S5.x / S4.5 / W-series, tag `lp-disqualified`, P3 Hard Disqualified, one Five9 removal over every
+  outbound list. The removal needs approval unless `DISQUALIFIED_FIVE9_AUTO_REMOVE=true` (the BOOKED_ROUTING_AUTO_REMOVE
+  pattern, keyed on the rule; Mark flips it). The S5.2 gate and rule 171 (`lp_disposition_not_in`) refuse them up front.
+- **`invalid` is the no-notification kill status** (`src/appointments/mark-invalid.js`): status `invalid` (never
+  `cancelled`, which fires cancel / rebook), then A.WE-1 removed, then the reminder tags off. The watchdog treats an
+  `invalid` row at LP's slot as SETTLED: never restored, never re-created over, never flagged.
+- **Same-slot duplicate leads (Badley).** A CXL on a lead whose sibling holds the SAME ET date and time in a live
+  disposition is ignored when LP live confirms the sibling (`src/same-slot-sibling.js`): no cancel, no S5.2, the seat
+  untouched, the LP Lead ID fields moved to the sibling; the field sync does the same. Every other CXL cancels as before
+  (the canaries). Duplicates within 7 days are named once a day in the 08:00 digest.
+- **The parity watchdog is the ONE auto-heal owner; no other sweep.** "GHL must match LP" replaces decision 541 ("Class B
+  escalate only"): Class B creates through `src/services/mirror-on-link.js` (reconciler + LP live, never within 60
+  minutes, canvass without notifications), which the LP contact backstop uses too; a guard refusal is never "add it to
+  GHL". Class D restores a duplicate's same-slot cancel. Fix 8 (`src/appointments/estimate-drift.js`) corrects
+  sync-created estimates that drifted from LP behind `ESTIMATE_DRIFT_FIX_MODE` (off | shadow | live, default shadow; cap
+  25). GHL keeps no "last updated by", so "nobody edited it" means it still starts where our create put it.
+- **A bad LP date or hour is ONE card**, "LP date/time looks wrong — confirmation team must fix in LP"
+  (`notifyLpLooksWrong`, Slack, one per lead + date in `lp_sync_failure_notices`), replacing the GroupMe impossible-hour
+  card.
+- **The delegated booking endpoint (I.LP-IN) reads LP live first** (`src/appointments/booking-endpoint-guard.js`) and
+  skips Verif, ND / No Demo, year-typo dates and impossible hours. I.LP-IN branches on `response.outcome`, NOT on the
+  HTTP code (verified in the HL mirror): any outcome but created / updated / noop_already_exists makes GHL book around
+  every guard. So a skip answers `noop_already_exists` + `{ ok: true, booked: false, skipped: true, reason }`; only a real
+  failure answers `error`. Never return another outcome for a deliberate skip.
 
 **A held appointment asks a person to import its LP row (2026-10-05).** When LP already has an unimported
 inbound row for a contact, `syncAppointmentToLP` holds the appointment (`lp-appt-deferred`) rather than add a
@@ -510,7 +547,7 @@ EXCLUSIVE: a range ending today returns none of today's rows (issue #490).
 (`BOOKED_DIAL_ROUTING_MODE`, default shadow) runs after each watch pass: visit today/tomorrow → "Conf - Next Day", two
 days → "Conf - 2nd Day", later → held. ADD FIRST, REMOVE SECOND: the removal from LP_ASAP / Reece Chatbot / Direct Lead
 Entry / After DIAL ASAP is queued only once a Confirmation add for that phone COMPLETED (any rule) or Five9 already has it
-there (an unissued inquiry waits). Mark's exceptions (2026-10-06 follow-up): a Cnf or Issue lead (Verif counts as Set) and a visit 3+ days out come off
+there (an unissued inquiry waits). Mark's exceptions (2026-10-06 follow-up): a Cnf or Issue lead (and, since 2026-10-16, a Verif lead: a hold, no Conf add) and a visit 3+ days out come off
 right away (the 3+ day one is added two days before). A failed add is retried ONCE, then #contact-center is told (once per
 visit). A visit that moved from "2nd Day" to "Next Day" comes off "Conf - 2nd Day" once the Next Day add completed. While
 `BOOKED_DIAL_ROUTING_MODE=live` (and only then) the new-lead backstop pushes NO booked visit (2026-10-08: both jobs had added the same lead to the same Conf list). The

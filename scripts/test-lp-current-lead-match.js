@@ -222,7 +222,8 @@ test('runF0IntegrityAudit: reports a demo that is missing from F.0 and posts not
       : Object.entries(hl).filter(([id]) => sql.includes(`'${id}'`)).map(([id, tags]) => ({ ghl_contact_id: id, tags }))),
     sendAlertMessage: async () => { throw new Error('must not post'); },
   };
-  const r = await runF0IntegrityAudit({ post: false, deps });
+  // Reporting only here; the 2026-10-16 auto-enrol has its own suite (test-f0-audit-healthy.js).
+  const r = await runF0IntegrityAudit({ post: false, autoEnroll: false, deps });
   assert.equal(r.ok, true);
   assert.deepEqual(r.flagged, []);
   assert.deepEqual(r.missing, [{ contact_id: 'missed', lp_lead_id: 'L-missed' }]);

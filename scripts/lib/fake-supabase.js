@@ -2,7 +2,7 @@
  * A small in-memory stand-in for the supabase-js client — scripts/lib/fake-supabase.js
  *
  * Enough of the query builder for the marketing ledger tests: from().select /
- * insert / upsert / update / delete with eq / neq / in / gte / lte / is /
+ * insert / upsert / update / delete with eq / neq / in / gte / lte / is / not /
  * order / limit / maybeSingle / single, rpc(), and storage.from().upload /
  * createSignedUrl. Thenable like the real builder, so `await` works.
  * Not a general mock: it exists so the ledger's I/O modules run offline.
@@ -100,6 +100,7 @@ export function fakeSupabase(seed = {}, { rpc = {} } = {}) {
       gt(c, v) { q.filters.push((r) => r[c] > v); return chain; },
       lt(c, v) { q.filters.push((r) => r[c] < v); return chain; },
       is(c, v) { q.filters.push((r) => r[c] == v); return chain; },
+      not(c, op, v) { q.filters.push((r) => (op === 'is' ? r[c] != v : r[c] !== v)); return chain; },
       like(c, pat) { const rx = new RegExp('^' + String(pat).replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/%/g, '.*') + '$'); q.filters.push((r) => rx.test(String(r[c] ?? ''))); return chain; },
       order(c, o) { q.order = [c, o?.ascending !== false]; return chain; },
       limit(n) { q.limit = n; return chain; },

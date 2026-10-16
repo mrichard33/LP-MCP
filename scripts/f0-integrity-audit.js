@@ -5,7 +5,8 @@
 // HL_SUPABASE_URL / HL_SUPABASE_SERVICE_ROLE_KEY (HL contacts cache).
 import { runF0IntegrityAudit } from '../src/jobs/f0-integrity-audit.js';
 
-const result = await runF0IntegrityAudit({ post: false });
+// Read-only from the command line: never posts, never enrols (2026-10-16).
+const result = await runF0IntegrityAudit({ post: false, autoEnroll: false });
 console.log(result.text);
 if (result.flagged.length > 25) {
   console.log('\nFull list:');
