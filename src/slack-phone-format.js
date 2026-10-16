@@ -14,7 +14,7 @@
 // match. Only a block's `text` strings are rewritten, never a button's
 // `value`, `action_id`, `url` or `block_id` (a handler reads those back).
 //
-// PURE. No imports.
+// PURE. No imports (the URL base reads process.env only through lpProspectUrlBase).
 
 const PHONE_SHAPE_RX = new RegExp([
   // +1 3525550188, +1 352 555 0188, +1-352-555-0188, 1-352-555-0188, 1 (352) 555-0188
@@ -62,17 +62,76 @@ export function normalizeSlackText(text) {
   return stripSlackLeadIds(normalizeSlackPhones(text));
 }
 
-/** The same pass over a Block Kit array: only `text` strings change. Pure. */
-export function normalizeSlackBlocks(blocks) {
+// ─── The prospect is a link to its LP page (the user, 2026-10-16) ───────────
+// "Can all Slack cards include a hyperlink that ends with the custom Prospect
+// ID … Link to the Lead Perfection lead." Every card already names the
+// prospect through prospectLabel ("Prospect 463174"), so the send point turns
+// that text into Slack's link markup, <url|Prospect 463174>, and no card
+// builder carries a URL. Slack only: GroupMe shows markup as raw text, so the
+// GroupMe send keeps normalizeSlackText and the Slack mirror (postToSlack)
+// adds the link. "Prospect: unknown" has no id and stays plain. Text already
+// inside <…> (a link, a mention) or inside `code` is left alone, because Slack
+// would print the markup there instead of a link.
+export const LP_PROSPECT_URL_DEFAULT = 'https://br27a.leadperfection.com/leaddetail.html?custid=';
+const PROSPECT_ID_RX = /\bProspect(?:\s+ID)?\s*[:#]?\s*(\d{4,})\b(?![-/:.]\d)/gi;
+const SLACK_KEEP_RX = /```[\s\S]*?```|`[^`\n]*`|<[^>\n]*>/g;
+
+/** The LP page base: LP_PROSPECT_URL_BASE when it is an http(s) URL, else the br27a lead page. */
+export function lpProspectUrlBase(env = globalThis.process?.env || {}) {
+  const v = String(env.LP_PROSPECT_URL_BASE || '').trim();
+  return /^https?:\/\//i.test(v) ? v : LP_PROSPECT_URL_DEFAULT;
+}
+
+/** The LP lead page for a prospect, or null without an id. Pure. */
+export function lpProspectUrl(prospectId, base = LP_PROSPECT_URL_DEFAULT) {
+  const id = String(prospectId ?? '').trim();
+  return /^\d+$/.test(id) ? `${base}${id}` : null;
+}
+
+/** Every "Prospect 463174" outside a link or code becomes <url|Prospect 463174>. Pure. */
+export function linkSlackProspects(text, base = LP_PROSPECT_URL_DEFAULT) {
+  if (typeof text !== 'string' || !text) return text;
+  const link = (part) => part.replace(PROSPECT_ID_RX, (m, id) => `<${base}${id}|${m}>`);
+  let out = '';
+  let last = 0;
+  for (const keep of text.matchAll(SLACK_KEEP_RX)) {
+    out += link(text.slice(last, keep.index)) + keep[0];
+    last = keep.index + keep[0].length;
+  }
+  return out + link(text.slice(last));
+}
+
+/** Slack message text: phones, lead ids, then the prospect link. */
+export function slackMessageText(text, base = lpProspectUrlBase()) {
+  return linkSlackProspects(normalizeSlackText(text), base);
+}
+
+/**
+ * The same pass over a Block Kit array: only `text` strings change, and only a
+ * `mrkdwn` text object gets the prospect link (a plain_text header or button
+ * would print the markup). Pass `{ link: false }` for the plain pass. Pure.
+ */
+export function normalizeSlackBlocks(blocks, { link = false, base = LP_PROSPECT_URL_DEFAULT } = {}) {
   if (!Array.isArray(blocks)) return blocks;
   const walk = (node) => {
     if (Array.isArray(node)) return node.map(walk);
     if (!node || typeof node !== 'object') return node;
+    const mrkdwn = link && node.type === 'mrkdwn';
     const out = {};
     for (const [k, v] of Object.entries(node)) {
-      out[k] = k === 'text' && typeof v === 'string' ? normalizeSlackText(v) : walk(v);
+      if (k === 'text' && typeof v === 'string') {
+        const clean = normalizeSlackText(v);
+        out[k] = mrkdwn ? linkSlackProspects(clean, base) : clean;
+      } else {
+        out[k] = walk(v);
+      }
     }
     return out;
   };
   return walk(blocks);
+}
+
+/** Slack Block Kit: the plain pass plus the prospect link in mrkdwn text. */
+export function slackMessageBlocks(blocks, base = lpProspectUrlBase()) {
+  return normalizeSlackBlocks(blocks, { link: true, base });
 }
