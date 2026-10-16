@@ -7,8 +7,10 @@
  *      included (GHL, not our table, is the list);
  *   2. close each card whose appointment date is before today (ET):
  *      Confirmed → won, Disqualified → lost, anything else → abandoned;
- *   3. a card whose date cannot be read is NOT closed: it is named in the
- *      summary as "needs a date";
+ *   3. a card with no readable date is closed abandoned and named in the
+ *      summary (the user, 2026-10-16: "only opportunities in P4 that have
+ *      appointments scheduled in the future"). A contact read that FAILED is
+ *      not "no date": that card is left alone this pass and counted unreadable;
  *   4. one summary line to CONF_SLACK_CHANNEL (counts by status).
  * The date comes from our row, else the contact's Current Appointment Date
  * field, else the "— M/D/YYYY" in the card name (sweepAppointmentYmd).
@@ -66,14 +68,15 @@ function dedupe(cards) {
 }
 
 async function currentApptField(deps, contactId) {
+  if (!contactId) return { value: null, failed: false };
   try {
     const res = await deps.ghlFetch('GET', `/contacts/${contactId}`);
     const fields = (res?.contact || res || {}).customFields || [];
     const f = fields.find((x) => x.id === CURRENT_APPT_DATE_FIELD);
-    return f ? (f.value ?? f.field_value ?? null) : null;
+    return { value: f ? (f.value ?? f.field_value ?? null) : null, failed: false };
   } catch (err) {
     deps.log.warn?.(`[ConfPipe] sweep: contact ${contactId} read failed: ${err.message}`);
-    return null;
+    return { value: null, failed: true };
   }
 }
 
@@ -81,7 +84,8 @@ export function formatSweepSummary({ counts, needsDate, truncated, dryRun }) {
   const closed = (counts.won || 0) + (counts.lost || 0) + (counts.abandoned || 0);
   const head = `🧹 Confirmation board sweep${dryRun ? ' (dry run)' : ''}: closed ${closed} past-dated card(s) — won ${counts.won || 0}, lost ${counts.lost || 0}, abandoned ${counts.abandoned || 0}.`;
   const lines = [head];
-  if (needsDate.length) lines.push(`Needs a date (${needsDate.length}, left open): ${needsDate.slice(0, 20).map((c) => c.name || c.id).join('; ')}${needsDate.length > 20 ? ' …' : ''}`);
+  if (needsDate.length) lines.push(`Closed with no appointment date (${needsDate.length}, counted as abandoned): ${needsDate.slice(0, 20).map((c) => c.name || c.id).join('; ')}${needsDate.length > 20 ? ' …' : ''}`);
+  if (counts.unreadable) lines.push(`${counts.unreadable} card(s) left for the next pass: the contact could not be read.`);
   if (truncated) lines.push('⚠️ The card list hit the page cap; some cards were not checked.');
   return lines.join('\n');
 }
@@ -91,7 +95,7 @@ export async function runConfirmationSweep({ deps = defaultDeps(), post = true }
   const cfg = readConfig(deps.env);
   const now = deps.now();
   const today = ymdInZone(now, cfg.tz);
-  const counts = { won: 0, lost: 0, abandoned: 0, kept: 0 };
+  const counts = { won: 0, lost: 0, abandoned: 0, kept: 0, unreadable: 0 };
   const needsDate = [];
   const errors = [];
 
@@ -107,17 +111,19 @@ export async function runConfirmationSweep({ deps = defaultDeps(), post = true }
   for (const card of cards) {
     try {
       const row = rowsById.get(card.id) || null;
-      let field = null;
       let when = sweepAppointmentYmd({ row, currentApptField: null, cardTitle: null, tz: cfg.tz });
       if (!when.ymd) {
-        field = await currentApptField(deps, card.contactId || card.contact?.id);
-        when = sweepAppointmentYmd({ row: null, currentApptField: field, cardTitle: card.name, tz: cfg.tz });
+        const field = await currentApptField(deps, card.contactId || card.contact?.id);
+        when = sweepAppointmentYmd({ row: null, currentApptField: field.value, cardTitle: card.name, tz: cfg.tz });
+        // Could not tell is not "no date": a failed read closes nothing.
+        if (!when.ymd && field.failed) { counts.unreadable++; continue; }
       }
-      if (!when.ymd) { needsDate.push(card); continue; }
-      if (when.ymd >= today) { counts.kept++; continue; }
+      const noDate = !when.ymd;
+      if (!noDate && when.ymd >= today) { counts.kept++; continue; }
 
       const stageKey = stageKeyForId(cfg, card.pipelineStageId) || row?.stage_key;
-      const status = row?.last_lp_disposition === 'CXL' ? 'abandoned' : closeStatusFor(stageKey);
+      const status = noDate || row?.last_lp_disposition === 'CXL' ? 'abandoned' : closeStatusFor(stageKey);
+      if (noDate) needsDate.push(card);
       if (!cfg.dryRun) await deps.ghlFetch('PUT', `/opportunities/${card.id}`, { status });
       if (row && (!cfg.dryRun || row.dry_run)) {
         await db.from('confirmation_opportunities').update({ closed_status: status, closed_at: now.toISOString(), updated_at: now.toISOString() }).eq('id', row.id);
@@ -125,7 +131,7 @@ export async function runConfirmationSweep({ deps = defaultDeps(), post = true }
       await writeLog(db, {
         lp_lead_id: row?.lp_lead_id || null, ghl_opportunity_id: card.id, from_stage: stageKey,
         to_stage: `closed:${status}`, action: 'close', source: 'sweep', lp_disposition: row?.last_lp_disposition || null,
-        dry_run: cfg.dryRun, note: `appointment ${when.ymd} before ${today} (date from ${when.source})`,
+        dry_run: cfg.dryRun, note: noDate ? 'no readable appointment date' : `appointment ${when.ymd} before ${today} (date from ${when.source})`,
       }, deps.log);
       counts[status]++;
     } catch (err) {
@@ -245,7 +251,7 @@ export function startConfirmationPipelineSweepScheduler() {
     lastRunSlot = ymd;
     try {
       const { value: res } = await runJob(JOB_ID, () => runConfirmationSweep(), { occurrence: ymd });
-      if (res) console.log(`[ConfPipe] sweep: ${JSON.stringify(res.counts)}${res.needs_date?.length ? `, ${res.needs_date.length} need a date` : ''}`);
+      if (res) console.log(`[ConfPipe] sweep: ${JSON.stringify(res.counts)}${res.needs_date?.length ? `, ${res.needs_date.length} closed with no date` : ''}`);
     } catch (err) {
       console.error(`[ConfPipe] sweep threw: ${err.message}`);
     }

@@ -378,8 +378,10 @@ rep) is not mapped. Confirmed and Disqualified are locked: only ND, a Set at a n
 stage that differs from the stored one is a person's move: kept against the clock, and given way only to a NEWER LP
 change. GHL allows one card per contact per pipeline, so a returning homeowner's new lead re-points the contact's card
 (the user, 2026-10-16). Jobs: `confirmation-pipeline-clock` (15 min: 24h move, close, one 4h alert to
-`CONF_SLACK_CHANNEL`) and `confirmation-pipeline-sweep` (00:05 ET: every open card in GHL dated before today is closed;
-no readable date → "needs a date"). `CONF_PIPE_DRY_RUN` is TRUE unless set to `false`: log only
+`CONF_SLACK_CHANNEL`) and `confirmation-pipeline-sweep` (00:05 ET: every open card in GHL dated before today, or with no readable date, is
+closed; a failed contact read closes nothing). The board holds only appointments still scheduled (the user,
+2026-10-16): a lead whose appointment LP cleared closes its card abandoned, unless the card's own lead still holds an
+upcoming visit (a new inquiry with no appointment does not close it). `CONF_PIPE_DRY_RUN` is TRUE unless set to `false`: log only
 (`confirmation_opportunity_log`), rows marked `dry_run`. Go-live: `POST /admin/confirmation-pipeline/backfill` and
 `/sweep`. Every GHL search there carries `pipeline_id`; never touch "5. Canvass Confirmation Pipeline" or a calendar
 appointment from it. The bot's `fetchOpportunity` ignores both confirmation boards (not "P1 only": `isCustomerP2` reads

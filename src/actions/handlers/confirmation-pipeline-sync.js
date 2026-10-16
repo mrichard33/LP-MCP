@@ -37,7 +37,7 @@ import { ghlFetch } from '../helpers.js';
 import { GHL_LOCATION_ID } from '../constants.js';
 import {
   readConfig, readAppointment, targetFor, decideMove, cardName, isCanvassLead,
-  stageKeyForId,
+  stageKeyForId, appointmentPassed,
 } from '../../confirmation-pipeline/rules.js';
 
 const LEAD_COLUMNS =
@@ -154,9 +154,25 @@ async function runOne({ contactId, lpLeadId, lpChangedAt, timeBased, lead, sourc
     await writeLog(db, { lp_lead_id: lpLeadId ? String(lpLeadId) : null, action: 'skip', source, dry_run: dry, note: 'no_lp_lead' }, log);
     return { outcome: 'skip', reason: 'no_lp_lead' };
   }
+  // A lead with no appointment closes its card (rules.js). But a homeowner's
+  // NEW inquiry often has no appointment yet while the card's lead still holds
+  // a real upcoming visit: then the card follows the visit, not the inquiry.
+  const notes = [];
+  if (!readAppointment(lead.appointment_date)) {
+    const { data: cardRow } = await db.from('confirmation_opportunities').select('lp_lead_id')
+      .eq('ghl_contact_id', contactId).is('closed_status', null).order('updated_at', { ascending: false }).limit(1).maybeSingle();
+    if (cardRow && String(cardRow.lp_lead_id) !== String(lead.lp_lead_id)) {
+      const { data: cardLead } = await db.from('lp_leads').select(LEAD_COLUMNS)
+        .eq('lp_lead_id', String(cardRow.lp_lead_id)).is('lp_deleted_at', null).maybeSingle();
+      const cardAppt = readAppointment(cardLead?.appointment_date);
+      if (cardLead && cardAppt && !appointmentPassed(cardAppt, deps.now(), readConfig(deps.env))) {
+        notes.push(`newest lead ${lead.lp_lead_id} has no appointment; card stays on lead ${cardLead.lp_lead_id}`);
+        lead = cardLead;
+      }
+    }
+  }
   const leadId = String(lead.lp_lead_id);
   const disposition = String(lead.disposition_code || '');
-  const notes = [];
   if (lpLeadId && String(lpLeadId) !== leadId) notes.push(`event lead ${lpLeadId} is not the newest (${leadId})`);
 
   if (isCanvassLead(lead)) {

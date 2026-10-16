@@ -409,7 +409,7 @@ test('clock: a card closes at appointment + 2h, Confirmed → won', async () => 
 
 /* ── sweep ─────────────────────────────────────────────────────────────── */
 
-test('sweep: closes every past-dated card (hand-made ones too), keeps today, names cards with no date', async () => {
+test('sweep: closes every past-dated card and every card with no date (hand-made ones too), keeps today', async () => {
   const s = setup({
     leads: [],
     rows: [{ id: 1, lp_lead_id: '1', ghl_contact_id: 'a', ghl_opportunity_id: 'o1', stage_key: 'confirmed', last_moved_by: 'agent', appointment_at: '2026-10-15T14:00:00Z', dry_run: false }],
@@ -429,16 +429,47 @@ test('sweep: closes every past-dated card (hand-made ones too), keeps today, nam
   });
   s.clock.now = new Date('2026-10-16T04:05:00Z');                           // 00:05 ET
   const r = await runConfirmationSweep({ deps: s.deps });
-  assert.deepEqual({ won: r.counts.won, lost: r.counts.lost, abandoned: r.counts.abandoned, kept: r.counts.kept }, { won: 1, lost: 0, abandoned: 1, kept: 1 });
+  assert.deepEqual({ won: r.counts.won, lost: r.counts.lost, abandoned: r.counts.abandoned, kept: r.counts.kept }, { won: 1, lost: 0, abandoned: 2, kept: 1 });
   assert.equal(s.ghl.store.get('o1').status, 'won');
   assert.equal(s.ghl.store.get('o2').status, 'abandoned');
   assert.equal(s.ghl.store.get('o3').status, 'open');
-  assert.equal(s.ghl.store.get('o4').status, 'open', 'no readable date: left open');
+  assert.equal(s.ghl.store.get('o4').status, 'abandoned', 'no readable date: closed (only future appointments stay)');
   assert.equal(s.ghl.store.get('p5').status, 'open', 'Pipeline 5 is never touched');
   assert.deepEqual(r.needs_date.map((c) => c.id), ['o4']);
   assert.equal(s.slack.length, 1);
-  assert.match(s.slack[0].text, /won 1, lost 0, abandoned 1/);
-  assert.match(s.slack[0].text, /Needs a date \(1/);
+  assert.match(s.slack[0].text, /won 1, lost 0, abandoned 2/);
+  assert.match(s.slack[0].text, /Closed with no appointment date \(1/);
+});
+
+test('sweep: a contact read that FAILS closes nothing', async () => {
+  const s = setup({ leads: [], env: LIVE, opps: [{ id: 'o9', contactId: 'z', pipelineId: PIPE, pipelineStageId: S.new, name: 'Z' }] });
+  const real = s.deps.ghlFetch;
+  s.deps.ghlFetch = async (m, p, b) => { if (p === '/contacts/z') throw new Error('GHL GET /contacts/z → 503: down'); return real(m, p, b); };
+  const r = await runConfirmationSweep({ deps: s.deps, post: false });
+  assert.equal(r.counts.unreadable, 1);
+  assert.equal(s.ghl.store.get('o9').status, 'open');
+});
+
+test('a card whose lead lost its appointment closes abandoned; never a card for a lead with none', async () => {
+  const s = setup();
+  await syncConfirmationCard({ contactId: 'c1', deps: s.deps });
+  await s.db.from('lp_leads').update({ disposition_code: 'CCC', appointment_date: null }).eq('lp_lead_id', '600001');
+  const r = await syncConfirmationCard({ contactId: 'c1', lpChangedAt: NOW.toISOString(), deps: s.deps });
+  assert.equal(r.outcome, 'close'); assert.equal(r.closed_status, 'abandoned');
+  assert.equal(s.ghl.store.get('opp_1').status, 'abandoned');
+
+  const none = setup({ leads: [lead({ appointment_date: null })] });
+  assert.equal((await syncConfirmationCard({ contactId: 'c1', deps: none.deps })).outcome, 'skip');
+  assert.equal(none.ghl.calls.length, 0);
+});
+
+test('a new inquiry with no appointment does not close the card of a real upcoming visit', async () => {
+  const s = setup();
+  await syncConfirmationCard({ contactId: 'c1', deps: s.deps });
+  await s.db.from('lp_leads').insert(lead({ lp_lead_id: '600002', created_at_lp: '2026-10-16T12:00:00+00:00', appointment_date: null, disposition_code: 'Data' }));
+  const r = await syncConfirmationCard({ contactId: 'c1', deps: s.deps });
+  assert.equal(r.outcome, 'noop'); assert.equal(r.lp_lead_id, '600001');
+  assert.equal(s.ghl.store.get('opp_1').status, 'open');
 });
 
 test('sweep: dry run writes nothing and posts nothing', async () => {

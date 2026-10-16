@@ -165,14 +165,14 @@ export function appointmentPassed(appt, now, cfg) {
  *   { kind: 'close', status: null | 'abandoned', reason }   status null = by stage
  *   { kind: 'stage', stage, reason }
  *   { kind: 'hold',  reason }    unmapped disposition: leave the card where it is
- *   { kind: 'skip',  reason }    nothing to act on (no appointment)
+ *   { kind: 'skip',  reason }    reserved (no caller returns it today)
  */
 export function targetFor({ disposition, appt, now, cfg }) {
   const code = String(disposition || '').trim();
-  if (!appt) {
-    if (code === 'CXL') return { kind: 'close', status: 'abandoned', reason: 'cxl' };
-    return { kind: 'skip', reason: 'no_appointment' };
-  }
+  // No appointment on the lead any more (LP cleared it): an open card closes
+  // abandoned (the user, 2026-10-16: only cards for appointments still
+  // scheduled). decideMove never CREATES from a close, so this never makes one.
+  if (!appt) return { kind: 'close', status: 'abandoned', reason: code === 'CXL' ? 'cxl' : 'no_appointment' };
   if (appointmentPassed(appt, now, cfg)) return { kind: 'close', status: code === 'CXL' ? 'abandoned' : null, reason: 'appointment_passed' };
   if (code === 'CXL') return { kind: 'close', status: 'abandoned', reason: 'cxl' };
   if (code === 'ND') return { kind: 'stage', stage: 'disqualified', reason: 'nd' };
