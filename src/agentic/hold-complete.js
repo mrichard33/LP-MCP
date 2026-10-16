@@ -125,7 +125,13 @@ export function registerHoldCompleteRoutes(app, deps = {}) {
     // fails recovers nothing and the callback is refused as before.
     const nowMs = Date.now();
     let holds = [];
-    const hasBodyTarget = Boolean(String(body.return_to ?? '').trim() || String(body.hold_return_target ?? '').trim());
+    // 2026-10-16: GHL's Webhook action nests its Custom Data rows under
+    // body.customData; read them like top-level keys for everything but the
+    // return_to source (recoverHoldTarget labels that one 'custom_data').
+    const cd = body.customData && typeof body.customData === 'object' ? body.customData : {};
+    const pick = (k) => (body[k] !== undefined && body[k] !== null && body[k] !== '') ? body[k] : cd[k];
+    const hasBodyTarget = Boolean(String(body.return_to ?? '').trim() || String(cd.return_to ?? '').trim()
+      || String(body.hold_return_target ?? '').trim() || String(body['Hold Return Target'] ?? '').trim());
     if (!hasBodyTarget) {
       try {
         holds = await readHolds(contactId);
@@ -150,9 +156,9 @@ export function registerHoldCompleteRoutes(app, deps = {}) {
       return res.status(200).json({ ok: false, error: 'return_to required', recovered_from: recovered.source, mode });
     }
 
-    const completedAt = body.completed_at || new Date(nowMs).toISOString();
-    const rawHours = body.hold_hours !== undefined && body.hold_hours !== null && body.hold_hours !== ''
-      ? Number(body.hold_hours) : null;
+    const completedAt = new Date(nowMs).toISOString();
+    const hoursIn = pick('hold_hours');
+    const rawHours = hoursIn !== undefined && hoursIn !== null && hoursIn !== '' ? Number(hoursIn) : null;
     const holdHours = Number.isFinite(rawHours) ? rawHours : (recovered.hold?.hold_hours ?? null);
     const shadow = eventType !== 'agentic.hold_completed';
 
@@ -172,8 +178,8 @@ export function registerHoldCompleteRoutes(app, deps = {}) {
         contact_id: contactId,
         return_to: returnTo,
         hold_hours: holdHours,
-        hold_reason: body.hold_reason || recovered.hold?.hold_reason || null,
-        workflow_code: body.workflow_code || recovered.hold?.workflow_code || null,
+        hold_reason: pick('hold_reason') || recovered.hold?.hold_reason || null,
+        workflow_code: pick('workflow_code') || recovered.hold?.workflow_code || null,
         completed_at: completedAt,
         return_to_source: recovered.source,
         hold_action_id: recovered.hold?.action_id ?? null,
@@ -186,8 +192,8 @@ export function registerHoldCompleteRoutes(app, deps = {}) {
 
     // ── Back-compat re-fire (gated) ───────────────────────────────────
     // Never in shadow: a shadow completion must change nothing.
-    const explicitRefire = body.refire === true;
-    const explicitNoRefire = body.refire === false;
+    const explicitRefire = pick('refire') === true;
+    const explicitNoRefire = pick('refire') === false;
     const shouldRefire = !shadow && !explicitNoRefire && (explicitRefire || looksLikeTriggerId(returnTo));
 
     let refire = null;
@@ -197,10 +203,9 @@ export function registerHoldCompleteRoutes(app, deps = {}) {
         enrollment_reason: 'hold_complete',
         returned_from_hold: true,
       };
-      if (body.sequence_position !== undefined && body.sequence_position !== null && body.sequence_position !== '') {
-        refirePayload.sequence_position = body.sequence_position;
-      }
-      if (body.workflow_code) refirePayload.workflow_code = body.workflow_code;
+      const seq = pick('sequence_position');
+      if (seq !== undefined && seq !== null && seq !== '') refirePayload.sequence_position = seq;
+      if (pick('workflow_code')) refirePayload.workflow_code = pick('workflow_code');
       try {
         refire = await refireTrigger(returnTo, refirePayload);
       } catch (err) {
@@ -210,7 +215,7 @@ export function registerHoldCompleteRoutes(app, deps = {}) {
     }
 
     console.log(`[HoldComplete] contact=${contactId} return_to=${returnTo} ` +
-      `wf=${body.workflow_code || '?'} reason="${body.hold_reason || ''}" ` +
+      `wf=${pick('workflow_code') || '?'} reason="${pick('hold_reason') || ''}" source=${recovered.source} ` +
       `emitted=${eventType} refired=${shouldRefire ? (refire?.status ?? 'err') : 'no'}`);
 
     return res.status(200).json({
@@ -230,7 +235,12 @@ export function registerHoldCompleteRoutes(app, deps = {}) {
   app.post('/api/agentic/hold-error', async (req, res) => {
     if (!checkBearer(req, res)) return;
 
-    const body = req.body || {};
+    // 2026-10-16: GHL's Webhook action nests Custom Data under body.customData.
+    const raw = req.body || {};
+    const body = { ...(raw.customData && typeof raw.customData === 'object' ? raw.customData : {}), ...raw };
+    for (const k of Object.keys(raw.customData || {})) {
+      if (body[k] === undefined || body[k] === null || body[k] === '') body[k] = raw.customData[k];
+    }
     const contactId = body.contact_id;
     const returnTo = typeof body.return_to === 'string' ? body.return_to.trim() : '';
     const completedAt = body.completed_at || new Date().toISOString();
