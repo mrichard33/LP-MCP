@@ -50,6 +50,12 @@ into a card (approval reasoning, an error, model output) loses its number. LP in
 #430305") stay: an inquiry has no prospect yet. Machine values stay too (dedupe keys, Five9 `LPRecKey`, `card_line`,
 action payloads), as do GHL and LP notes. `scripts/test-no-lead-id-on-cards.js` scans `src/` for a template that prints
 a lead id; a line that is not Slack text carries `lead-id-ok: <why>`.
+**The prospect is a link to its LP lead page (the user, 2026-10-16).** `slackMessageText` / `slackMessageBlocks`
+(`src/slack-phone-format.js`, used by `postToSlack`, `updateSlackMessage` and the approval `respond()`) turn every
+"Prospect 463174" into `<https://br27a.leadperfection.com/leaddetail.html?custid=463174|Prospect 463174>`
+(`LP_PROSPECT_URL_BASE` overrides the page). So a card prints the prospect with `prospectLabel` and never builds the
+URL itself. Only `mrkdwn` text is linked (a plain_text header or a button would print the markup), never inside an
+existing `<…>` or code, and never on GroupMe, whose send keeps the plain `normalizeSlackText`.
 
 **A live chat gets one Slack card per lead, and one summary per chat (Mark, 2026-10-15).** One chat
 (jhVZZUtXp3jDrBsXOZcK) posted six "LARGE JOB SIGNAL" cards in six minutes: the model's `large_job_signal` reads the
