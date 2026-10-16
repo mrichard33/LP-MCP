@@ -148,8 +148,20 @@ export function dmAnswerFromThread(turns = []) {
     const dm = parseDecisionMakers(reply.text);
     return dm === 'conflict' ? 'conflict' : (dm || 'Uncertain');
   }
+  // Said before we asked (live dry run, 2026-10-15): "Yes I'd like the free visit, it's just me deciding" was
+  // read as no answer, so "Can you do 7pm tomorrow?" got "Is anyone else part of the decision…?". A later
+  // partner named ("my husband wants to be there") still gets the question once.
+  for (let k = list.length - 1; k >= 0; k--) {
+    if (list[k].direction === 'outbound') continue;
+    const text = String(list[k].text || '');
+    if (mentionedPartner([text])) return null;
+    if (DM_VOLUNTEERED_SOLO_RX.test(text)) return 'Solo Owner';
+  }
   return null;
 }
+
+// "it's just me deciding", "I make the decisions", "I'm the only decision maker". A bare "just me" is not one.
+const DM_VOLUNTEERED_SOLO_RX = /\b(?:just|only)\s+me\s+(?:deciding|making\s+(?:the|this)\s+decision|on\s+the\s+decision)\b|\bit'?s\s+(?:just\s+|only\s+)?my\s+(?:call|decision)\b|\bi\s+(?:make|am\s+making)\s+(?:all\s+)?(?:the|this)\s+decisions?\b|\bi'?m\s+the\s+(?:only|sole)\s+(?:decision[-\s]?maker|one\s+deciding)\b|\b(?:no\s*one|nobody)\s+else\s+(?:is\s+)?(?:involved|deciding|in\s+the\s+decision)\b|\bi\s+live\s+alone\b/i;
 
 const SPOUSE = String.raw`(?:wife|husband|spouse|partner|fianc[eé]e?|boyfriend|girlfriend|mom|mother|dad|father|son|daughter|they|he|she)`;
 // "My husband works then", "she can't make Saturday".
