@@ -21,7 +21,7 @@ import { isInRehash, rehashLeadFromContext } from '../agentic/rehash-state.js';
 import { prospectLabel } from '../format-helpers.js';
 
 const READ_BUDGET_MS = 1500;
-const COLS = 'recording_id, rep_name, rep_email, result, recorded_at, summary, moments, followup_score, followup_status, followup_action, processed, deleted, lp_lead_id, lp_prospect_id, ghl_contact_id';
+const COLS = 'recording_id, rep_name, rep_email, result, recorded_at, summary, moments, followup_score, followup_status, followup_action, insights, pricing, processed, deleted, lp_lead_id, lp_prospect_id, ghl_contact_id';
 
 function within(promise, ms) {
   let t;

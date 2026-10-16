@@ -8,8 +8,8 @@ import { Webhook } from 'svix';
 import { fakeSupabase } from './lib/fake-supabase.js';
 import { processRecording, queueDemoNote } from '../src/siro/ingest.js';
 import { makeSiroWebhookHandler, readyToAct, registerSiroWebhookRoutes, signatureHeaderNames } from '../src/siro/webhook.js';
-import { runSiroRecordingSync, WATERMARK_KEY } from '../src/jobs/siro-recording-sync.js';
-import { RAW_RECORDING } from './fixtures/siro-recording.js';
+import { runSiroRecordingSync, refreshMissingContacts, WATERMARK_KEY } from '../src/jobs/siro-recording-sync.js';
+import { RAW_RECORDING, FIXTURE_RECORDED_AT } from './fixtures/siro-recording.js';
 
 const LEAD = { lp_lead_id: '583321', lp_prospect_id: '470111', ghl_contact_id: 'c1', phone: '3525550188', demo_date: '2026-10-14T22:00:00Z' };
 const readLeads = async ({ by, values }) => (by === 'lp_lead_id' && values.includes('583321')) ? [LEAD] : [];
@@ -66,10 +66,39 @@ test('a failed note insert clears the claim', async () => {
     }
     return c;
   };
-  const row = { recording_id: 'r1', ghl_contact_id: 'c1', lp_lead_id: '1', processed: true, moments: [], summary: [], recorded_at: '2026-10-14T00:00:00Z' };
+  const row = { recording_id: 'r1', ghl_contact_id: 'c1', lp_lead_id: '1', processed: true, moments: [], summary: [], recorded_at: new Date().toISOString() };
   const out = await queueDemoNote(row, { mode: 'live', supabase: db, log: quiet });
   assert.equal(out, 'failed');
   assert.equal(db.tables.siro_recordings[0].ghl_note_action_id, null);
+});
+
+test('demo notes are for new visits only: older than 48h is too_old, nothing claimed', async () => {
+  const db = fakeSupabase({ siro_recordings: [{ recording_id: 'r1', ghl_note_action_id: null }] });
+  const nowMs = Date.parse('2026-10-16T12:00:00Z');
+  const base = { recording_id: 'r1', ghl_contact_id: 'c1', lp_lead_id: '1', processed: true, moments: [], summary: [] };
+  const old = await queueDemoNote({ ...base, recorded_at: '2026-10-14T11:00:00Z' }, { mode: 'live', supabase: db, log: quiet, env: {}, nowMs });
+  assert.equal(old, 'too_old');
+  assert.equal((db.tables.agent_actions || []).length, 0);
+  assert.equal(db.tables.siro_recordings[0].ghl_note_action_id, null);
+  // SIRO_DEMO_NOTE_MAX_AGE_H widens the window.
+  const wide = await queueDemoNote({ ...base, recorded_at: '2026-10-14T11:00:00Z' }, { mode: 'shadow', supabase: db, log: quiet, env: { SIRO_DEMO_NOTE_MAX_AGE_H: '72' }, nowMs });
+  assert.equal(wide, 'shadow');
+  assert.equal(await queueDemoNote({ ...base, recorded_at: null }, { mode: 'live', supabase: db, log: quiet, nowMs }), 'too_old');
+});
+
+test('the queued note carries the prices; raw never holds GPS, emails, drafts or thinking', async () => {
+  const db = fakeSupabase({ siro_recordings: [] });
+  const deps = { supabase: db, siro: fakeSiro(), readLeads, emitEvent: async () => ({ id: 1 }), log: quiet };
+  await processRecording('rec_abc123', { source: 'webhook', mode: 'live', env: { SIRO_DEMO_NOTE_MODE: 'live' }, deps });
+  const note = db.tables.agent_actions[0].action_payload.note;
+  assert.match(note, /Final quote: \$18,400/);
+  const stored = db.tables.siro_recordings[0];
+  assert.equal(stored.recorded_at, FIXTURE_RECORDED_AT);
+  assert.equal(stored.rep_name, 'Brian Kowalski');
+  assert.equal(stored.pricing.final_price_quote, '$18,400');
+  assert.match(stored.insights.objection_summary, /\$18,400/); // prices kept (the user, 2026-10-16)
+  const elsewhere = JSON.stringify({ raw: stored.raw, insights: stored.insights, moments: stored.moments, summary: stored.summary });
+  assert.doesNotMatch(elsewhere, /latitude|28\.18|dana@example\.com|Dear Dana|HIGH FOLLOW-UP/);
 });
 
 test('no lead → stored, nothing emitted', async () => {
@@ -159,6 +188,42 @@ test('poll: pages, stores, moves the watermark only after a full pass', async ()
   const out2 = await runSiroRecordingSync({ env: {}, deps: { supabase: db2, siro: broken, readLeads, log: quiet } });
   assert.equal(out2.complete, false);
   assert.equal((db2.tables.siro_sync_state || []).length, 0);
+});
+
+test('a reprocess pass re-normalizes stored rows: no event, no note, watermark untouched', async () => {
+  // A row stored before this change: the whole Siro record in raw, no rep name.
+  const db = fakeSupabase({
+    siro_recordings: [{ recording_id: 'rec_abc123', updated_at_siro: RAW_RECORDING.updatedAt, rep_name: null, raw: { latitude: 28.18 } }],
+    siro_sync_state: [{ key: WATERMARK_KEY, value: '2026-10-01T00:00:00.000Z' }],
+  });
+  const pages = [{ ok: true, data: { data: [RAW_RECORDING] } }];
+  const siro = { ...fakeSiro(), listRecordingsUpdatedSince: async () => pages.shift() };
+  let emitted = 0;
+  const out = await runSiroRecordingSync({
+    since: '2026-10-09T00:00:00Z', reprocess: true, env: { SIRO_SYNC_MODE: 'live', SIRO_DEMO_NOTE_MODE: 'live' },
+    deps: { supabase: db, siro, readLeads, emitEvent: async () => { emitted++; return { id: 1 }; }, log: quiet },
+  });
+  assert.equal(out.reprocess, true);
+  const r = db.tables.siro_recordings.find(x => x.recording_id === 'rec_abc123');
+  assert.equal(r.rep_name, 'Brian Kowalski');
+  assert.equal(r.raw.latitude, undefined);
+  assert.equal(emitted, 0);
+  assert.equal((db.tables.agent_actions || []).length, 0);
+  assert.equal(db.tables.siro_sync_state.find(x => x.key === WATERMARK_KEY).value, '2026-10-01T00:00:00.000Z');
+});
+
+test('matched rows with no GHL contact get one from lp_leads', async () => {
+  const db = fakeSupabase({
+    siro_recordings: [
+      { recording_id: 'a', lp_lead_id: '583321', ghl_contact_id: null },
+      { recording_id: 'b', lp_lead_id: '999', ghl_contact_id: null },
+      { recording_id: 'c', lp_lead_id: null, ghl_contact_id: null },
+    ],
+    lp_leads: [{ lp_lead_id: '583321', ghl_contact_id: 'c1' }, { lp_lead_id: '999', ghl_contact_id: null }],
+  });
+  assert.equal(await refreshMissingContacts(db), 1);
+  assert.equal(db.tables.siro_recordings.find(r => r.recording_id === 'a').ghl_contact_id, 'c1');
+  assert.equal(db.tables.siro_recordings.find(r => r.recording_id === 'b').ghl_contact_id, null);
 });
 
 test('the route mounts on POST /webhook/siro and logs its mode', () => {

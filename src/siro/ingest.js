@@ -25,6 +25,7 @@ import { buildPresentationFacts } from './presentation-facts.js';
 import { buildDemoNote } from './demo-note.js';
 import { siroConfig, siroModes } from './config.js';
 import { prospectLabel } from '../format-helpers.js';
+import { siroUserNames } from './users.js';
 
 export const DEMO_NOTE_RULE = 'SIRO_DEMO_NOTE';
 const NOTE_CLAIM_PENDING = -1;
@@ -66,14 +67,19 @@ async function readStored(supabase, recordingId) {
 
 /**
  * Queue the GHL demo note once per recording (§6). Shadow logs the text.
- * @returns {'queued'|'shadow'|'already_claimed'|'no_contact'|'not_ready'|'off'|'failed'}
+ * @returns {'queued'|'shadow'|'already_claimed'|'no_contact'|'too_old'|'not_ready'|'off'|'failed'}
  */
-export async function queueDemoNote(row, { mode, supabase, eventId = null, log = console.log } = {}) {
+export async function queueDemoNote(row, { mode, supabase, eventId = null, log = console.log, env = process.env, nowMs = Date.now() } = {}) {
   if (mode === 'off') return 'off';
   if (!row?.ghl_contact_id) return 'no_contact';
-  const facts = buildPresentationFacts([row]);
+  // New visits only (the user, 2026-10-16): turning notes on never back-fills
+  // last week's demos onto GHL contacts.
+  const recordedMs = Date.parse(row.recorded_at || '');
+  if (!Number.isFinite(recordedMs) || nowMs - recordedMs > siroConfig(env).demoNoteMaxAgeH * 3_600_000) return 'too_old';
+  const facts = buildPresentationFacts([row], { now: nowMs });
   if (!facts) return 'not_ready';
-  const note = buildDemoNote(facts);
+  // The quotes go to GHL in this internal note (the user's ruling); the bot never sees them.
+  const note = buildDemoNote(facts, { pricing: row.pricing || null });
   if (mode !== 'live') {
     log(`[Siro] shadow: demo note for ${prospectLabel(row.lp_prospect_id)}:\n${note}`);
     return 'shadow';
@@ -121,7 +127,7 @@ export async function queueDemoNote(row, { mode, supabase, eventId = null, log =
  * @returns {Promise<{result:string, row?:object}>}
  */
 export async function processRecording(recordingId, {
-  source, mode = 'shadow', raw = null, flags = {}, onlyIfNewer = false,
+  source, mode = 'shadow', raw = null, flags = {}, onlyIfNewer = false, reprocess = false,
   env = process.env, deps = {},
 } = {}) {
   const supabase = deps.supabase || supabaseDefault;
@@ -136,12 +142,13 @@ export async function processRecording(recordingId, {
     if (!res.ok) return { result: res.status === 404 ? 'not_found' : 'fetch_failed', error: res.error };
     rec = res.data?.data && res.data.data.id ? res.data.data : res.data;
   }
-  const row = normalizeRecording(rec, { source, flags });
+  const userNames = deps.userNames || await siroUserNames({ siro });
+  const row = normalizeRecording(rec, { source, flags, userNames });
   if (!row) return { result: 'unreadable' };
   if (!rowMatchesConversationType(row, env)) return { result: 'other_conversation_type' };
 
   const stored = await readStored(supabase, row.recording_id);
-  if (onlyIfNewer && stored?.updated_at_siro && row.updated_at_siro
+  if (onlyIfNewer && !reprocess && stored?.updated_at_siro && row.updated_at_siro
     && Date.parse(stored.updated_at_siro) >= Date.parse(row.updated_at_siro) && stored.lp_lead_id) {
     return { result: 'unchanged' };
   }
@@ -161,7 +168,7 @@ export async function processRecording(recordingId, {
 
   const ready = full.processed && !!full.lp_lead_id && !full.deleted;
   if (mode !== 'live') {
-    if (ready) await queueDemoNote({ ...full }, { mode: 'shadow', supabase, log });
+    if (ready && !reprocess) await queueDemoNote({ ...full }, { mode: 'shadow', supabase, log, env });
     return { result: ready ? 'stored_shadow' : (full.lp_lead_id ? 'stored_not_processed' : 'stored_no_lead'), row: full };
   }
   if (!ready) return { result: full.lp_lead_id ? 'stored_not_processed' : 'stored_no_lead', row: full };
@@ -196,6 +203,6 @@ export async function processRecording(recordingId, {
       .eq('recording_id', full.recording_id).is('event_emitted_at', null);
   }
   const noteMode = siroModes(env).demoNote;
-  const note = await queueDemoNote({ ...full }, { mode: noteMode, supabase, eventId, log });
+  const note = await queueDemoNote({ ...full }, { mode: noteMode, supabase, eventId, log, env });
   return { result: `live_${note}`, row: full };
 }

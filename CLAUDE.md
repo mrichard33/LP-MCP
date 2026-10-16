@@ -647,6 +647,17 @@ transcript), matches the LP lead (`resolve-lead.js`: engagement → account → 
 upserts `siro_recordings`. Live only: one `siro.recording_processed` event (key `siro:<id>`) and ONE GHL demo note
 (`SIRO_DEMO_NOTE`, claimed on `ghl_note_action_id` before the insert). Siro's own LP integration writes the LP note;
 we never add one.
+- **We keep the useful parts, not the record (the user, 2026-10-16).** `raw` is a small whitelist (`rawWhitelist`:
+  ids, times, result, duration, the follow-up's type / score / status / rep / team): never GPS, emails, phones, prices,
+  Siro's drafted email/text or its `thinking`. The summary is read BY SECTION (Need & Motivation → what they want,
+  Objections → hesitations, Next Steps → the next step, Sentiment → how they felt). `insights` holds Siro's follow-up
+  fields (main objection, why they held off, follow-up timing, scope). **Prices are kept, never stripped** (the user,
+  2026-10-16: "I do not want to strip money"): the quotes sit in `pricing` and in Siro's own text, go to GHL in the demo
+  note, and the PRESENTATION block shows them to the bot ("Quoted at the visit … never to be stated in a reply"). The
+  reply guard (`enforcePresentationGuard`, `checkReply presentation_quoted_price`) is what keeps a price out of a text.
+  Demo notes are for NEW visits only: a recording
+  older than `SIRO_DEMO_NOTE_MAX_AGE_H` (48) is `too_old`. `siro_sync_run { reprocess: true }` re-normalizes stored rows
+  (no event, no note, watermark untouched); every sync pass fills a missing GHL contact id from `lp_leads`.
 - **The webhook fails closed.** Every request needs a valid svix signature (`SIRO_WEBHOOK_SECRET`, raw body; the
   parser is mounted before `express.json`; `svix-*` or `webhook-*` header names). Unset, missing or wrong → 401, in
   every mode. Never log the secret. The extra `x-reece-webhook-key` header was removed by the user's ruling

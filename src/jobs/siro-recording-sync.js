@@ -37,7 +37,32 @@ async function readWatermark(supabase) {
  * @param {{since?: string, dryRun?: boolean, env?: object, deps?: object, nowMs?: number}} o
  *   dryRun lists what the pass would process and writes nothing.
  */
-export async function runSiroRecordingSync({ since = null, dryRun = false, env = process.env, deps = {}, nowMs = Date.now() } = {}) {
+/**
+ * Matched recordings stored before their LP lead had a GHL contact id never
+ * got one (58 of the first 118, 2026-10-16), so they could never get a demo
+ * note. Database only: re-read lp_leads for them and fill it in.
+ */
+export async function refreshMissingContacts(supabase, { limit = 200 } = {}) {
+  const { data: rows, error } = await supabase.from('siro_recordings')
+    .select('recording_id, lp_lead_id').is('ghl_contact_id', null).not('lp_lead_id', 'is', null).limit(limit);
+  if (error) throw new Error(`siro_recordings read failed: ${error.message}`);
+  const ids = [...new Set((rows || []).map(r => String(r.lp_lead_id)))];
+  if (!ids.length) return 0;
+  const { data: leads, error: lErr } = await supabase.from('lp_leads').select('lp_lead_id, ghl_contact_id').in('lp_lead_id', ids);
+  if (lErr) throw new Error(`lp_leads read failed: ${lErr.message}`);
+  const contactOf = new Map((leads || []).filter(l => l.ghl_contact_id).map(l => [String(l.lp_lead_id), l.ghl_contact_id]));
+  let filled = 0;
+  for (const r of rows || []) {
+    const c = contactOf.get(String(r.lp_lead_id));
+    if (!c) continue;
+    const { error: uErr } = await supabase.from('siro_recordings').update({ ghl_contact_id: c })
+      .eq('recording_id', r.recording_id).is('ghl_contact_id', null);
+    if (!uErr) filled++;
+  }
+  return filled;
+}
+
+export async function runSiroRecordingSync({ since = null, dryRun = false, reprocess = false, env = process.env, deps = {}, nowMs = Date.now() } = {}) {
   const supabase = deps.supabase || supabaseDefault;
   const siro = deps.siro || siroDefault;
   const mode = syncMode(env);
@@ -65,7 +90,8 @@ export async function runSiroRecordingSync({ since = null, dryRun = false, env =
       if (raw.updatedAt && (!maxUpdated || raw.updatedAt > maxUpdated)) maxUpdated = raw.updatedAt;
       if (dryRun) { note('would_process', id); continue; }
       try {
-        const out = await processRecording(id, { source: 'poll', mode, raw, onlyIfNewer: true, env, deps });
+        // A reprocess pass re-normalizes what we hold; it never emits or notes.
+        const out = await processRecording(id, { source: 'poll', mode: reprocess ? 'shadow' : mode, raw, onlyIfNewer: true, reprocess, env, deps });
         note(out.result, id);
       } catch (err) {
         errors.push(`${id}: ${err.message}`);
@@ -76,17 +102,26 @@ export async function runSiroRecordingSync({ since = null, dryRun = false, env =
     if (!cursor || !rows.length) { complete = true; break; }
   }
 
+  if (!dryRun) {
+    try {
+      const filled = await refreshMissingContacts(supabase);
+      if (filled) counts.contact_refreshed = filled;
+    } catch (err) {
+      errors.push(`contact refresh: ${err.message}`);
+    }
+  }
+
   // Only a full pass moves the watermark. The newest updatedAt seen is the
   // next start (an equal updatedAt is re-read, not skipped: gte).
   let watermark = from;
-  if (complete && !dryRun) {
+  if (complete && !dryRun && !reprocess) {
     watermark = maxUpdated || startedIso;
     const { error } = await supabase.from('siro_sync_state')
       .upsert({ key: WATERMARK_KEY, value: watermark, updated_at: startedIso }, { onConflict: 'key' });
     if (error) errors.push(`watermark write: ${error.message}`);
   }
   return {
-    ok: errors.length === 0, mode, dry_run: dryRun, from, watermark, complete, pages,
+    ok: errors.length === 0, mode, dry_run: dryRun, reprocess, from, watermark, complete, pages,
     counts, by_reason: byReason, errors: errors.slice(0, 20),
     summary: `${mode}${dryRun ? ' dry run' : ''}: ${Object.entries(counts).map(([k, v]) => `${k}=${v}`).join(' ') || 'nothing new'}`,
   };
