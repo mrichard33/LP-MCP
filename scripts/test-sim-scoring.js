@@ -394,3 +394,11 @@ test('rehash_book_call: offered, booked on Rehash Call, the caller named', () =>
   const none = scoreResult(sms('rehash_book_call', [turn(1, 'Sure, what times?', "I'll have John reach out.", pd('post_demo'))]));
   assert.deepEqual(none.failures.map(f => f.code).sort(), ['no_rehash_call_times', 'rehash_call_not_booked']);
 });
+
+// 2026-10-16: the plan summary stores the hand-off as a plain reason string.
+test('rehash_repeat_objection reads a hand-off stored as a string', () => {
+  const t3 = turn(3, 'The price is the problem', "Understood. I'll take a look and reach out.", pd('handoff', { handoff: 'rehash_repeat_objection' }));
+  t3.would_do = [{ kind: 'would_post_review_card_no_five9', reason: 'rehash_repeat_objection' }];
+  const s = scoreResult(sms('rehash_repeat_objection', [turn(1, 'Too expensive', 'What part of the price felt off?', pd('rehash_objection')), t3]));
+  assert.equal(s.pass, true, JSON.stringify(s.failures));
+});

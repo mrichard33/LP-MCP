@@ -237,7 +237,9 @@ export const SCENARIO_EXPECTATIONS = Object.freeze({
   rehash_repeat_objection: (r) => {
     const out = rehashLaneFailures(r);
     const last = (r.transcript || []).at(-1);
-    if (last?.nepq?.handoff?.reason !== 'rehash_repeat_objection') out.push({ code: 'no_person_after_repeat_objection', detail: `last step ${last?.nepq?.step || 'none'}`, turn: last?.turn });
+    // The plan summary stores the hand-off as its reason string; the full plan as { reason }.
+    const handoffReason = typeof last?.nepq?.handoff === 'string' ? last.nepq.handoff : last?.nepq?.handoff?.reason;
+    if (handoffReason !== 'rehash_repeat_objection') out.push({ code: 'no_person_after_repeat_objection', detail: `last step ${last?.nepq?.step || 'none'}`, turn: last?.turn });
     // A rehash hand-off is a #contact-rehash card, never a Five9 dial (REHASH_REASONS / NO_DIAL_REASONS).
     if (did(r, /would_file_callback_five9/)) out.push({ code: 'rehash_dialed', detail: 'a rehash hand-off was filed to Five9' });
     return out;

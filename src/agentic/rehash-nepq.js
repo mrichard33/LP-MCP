@@ -49,7 +49,9 @@ export const REHASH_STAGES = Object.freeze([
   {
     key: 'connection', label: 'CONNECTION', aim: 'about the proposal, not the windows',
     example: 'Did you get a chance to look over the proposal?',
-    rx: /\b(?:look(?:ed)?\s+(?:it\s+)?over|chance\s+to\s+(?:look|review|go\s+(?:over|through))|had\s+a\s+(?:chance|minute)|get\s+a\s+(?:chance|minute))\b[^?]*\bproposal\b|\bproposal\b[^?]*\b(?:look(?:ed)?\s+over|review(?:ed)?)\b/i,
+    // 2026-10-16: the model's own "Did you get a chance to look it over?" (no
+    // "proposal") is the same question; reading it back stops a repeat.
+    rx: /\b(?:look(?:ed)?\s+(?:it\s+)?over|chance\s+to\s+(?:look|review|go\s+(?:over|through))|had\s+a\s+(?:chance|minute)|get\s+a\s+(?:chance|minute))\b[^?]*\bproposal\b|\bproposal\b[^?]*\b(?:look(?:ed)?\s+over|review(?:ed)?)\b|\bchance\s+to\s+(?:look\s+(?:it|that|them)\s+over|review\s+(?:it|that)|go\s+(?:over|through)\s+(?:it|that))\b/i,
   },
   {
     key: 'situation', label: 'SITUATION', aim: 'where they are in the decision',
