@@ -88,12 +88,48 @@ test('a run is worse when the pass rate falls or a passing conversation now fail
   const cmp = compareScorecards(bad, good);
   assert.equal(cmp.worse, true);
   assert.ok(cmp.reasons.some(r => /price\/livechat passed last run and now fails \(money_figure\)/.test(r)), cmp.reasons.join(' | '));
-  assert.deepEqual(compareScorecards(good, good), { compared: true, worse: false, reasons: [] });
+  assert.deepEqual(compareScorecards(good, good), { compared: true, worse: false, reasons: [], new_keys: [] });
   assert.equal(compareScorecards(good, null).worse, null, 'no earlier run → not compared');
   assert.equal(compareScorecards(good, { ...good, invariants_version: 'old' }).compared, false, 'new checks → a new baseline, not a regression');
   assert.equal(compareScorecards({ ...good, nepq_mode: 'off' }, { ...bad, nepq_mode: 'live' }).compared, false, 'NEPQ off is never judged against NEPQ live');
   assert.match(formatScorecard(bad, cmp), /WORSE THAN LAST RUN/);
   assert.match(formatScorecard(bad, cmp), /✗ price\/livechat: money_figure@1/);
+});
+
+// 2026-10-16 (framework cleanup, Phase 0): a new scenario moves the
+// denominator; it must be listed, never read as a regression.
+test('a new scenario is listed apart and never makes a run worse', () => {
+  const before = scoreRun([result('discovery', [turn(1, 'Hi', 'What got you looking?')])]);
+  const withNewFail = scoreRun([
+    result('discovery', [turn(1, 'Hi', 'What got you looking?')]),
+    result('price', [turn(1, 'How much?', 'About $15,000. What got you looking?')]),
+  ]);
+  assert.equal(withNewFail.pass_rate, 0.5, 'the whole-run rate still counts it');
+  const cmp = compareScorecards(withNewFail, before);
+  assert.equal(cmp.compared, true, 'same versions → compared, not a new baseline');
+  assert.equal(cmp.worse, false, cmp.reasons.join(' | '));
+  assert.deepEqual(cmp.new_keys, [{ key: 'price/livechat', pass: false }]);
+  assert.match(formatScorecard(withNewFail, cmp), /New this run \(not compared\): price\/livechat FAIL/);
+  assert.match(formatScorecard(withNewFail, cmp), /Not worse than the last run/);
+});
+
+test('an old scenario that regresses is still worse when new ones were added', () => {
+  const before = scoreRun([result('price', [turn(1, 'How much?', 'Every home is different. What got you looking?')])]);
+  const after = scoreRun([
+    result('price', [turn(1, 'How much?', 'About $15,000. What got you looking?')]),
+    result('discovery', [turn(1, 'Hi', 'What got you looking?')]),
+  ]);
+  const cmp = compareScorecards(after, before);
+  assert.equal(cmp.worse, true);
+  assert.ok(cmp.reasons.some(r => /pass rate fell from 100% to 0% over the 1 shared/.test(r)), cmp.reasons.join(' | '));
+  assert.ok(cmp.reasons.some(r => /price\/livechat passed last run and now fails/.test(r)));
+  assert.deepEqual(cmp.new_keys, [{ key: 'discovery/livechat', pass: true }]);
+});
+
+test('a saved run with no per-key results falls back to the whole-run rate', () => {
+  const now = scoreRun([result('price', [turn(1, 'How much?', 'About $15,000. What got you looking?')])]);
+  const cmp = compareScorecards(now, { invariants_version: now.invariants_version, scoring_version: now.scoring_version, pass_rate: 1, results: [] });
+  assert.equal(cmp.worse, true);
 });
 
 test('a saved run carries codes and turns, never customer text', () => {

@@ -28,6 +28,10 @@ import { isCallPromise } from '../agentic/promised-callbacks.js';
 
 // 2026-10-12 (handoff PR 7): the scenario checks have their own version. A run
 // scored with new checks is a new baseline, never "worse" than an old one.
+// 2026-10-16 (framework cleanup, Phase 0): bump only when a check's meaning
+// changes; a bump makes the next run a new baseline and disables the WORSE
+// gate. A NEW scenario is not a bump: compareScorecards scores the pass rate
+// over the scenarios both runs share and lists new ones apart.
 export const SCORING_VERSION = '2026-10-13.3';
 
 const CLOCK_RX = /\b\d{1,2}(?::\d{2})?\s*(?:AM|PM)\b/gi;
@@ -336,10 +340,17 @@ export function scoreRun(results, meta = {}) {
 }
 
 /**
- * Is this run worse than the last one? Worse = a lower pass rate, or a
- * conversation that passed last time and fails now. A run against a
- * different set of checks (INVARIANTS_VERSION) is reported, not compared:
- * a new check failing old behaviour is not a regression of the bot. Pure.
+ * Is this run worse than the last one? Worse = a lower pass rate over the
+ * conversations BOTH runs scored, or a conversation that passed last time and
+ * fails now. A run against a different set of checks (INVARIANTS_VERSION,
+ * SCORING_VERSION) is reported, not compared: a new check failing old
+ * behaviour is not a regression of the bot. Pure.
+ *
+ * 2026-10-16 (framework cleanup, Phase 0): a scenario new in this run is
+ * listed in `new_keys` and never makes the run worse. Before, adding five
+ * rehash scenarios moved the pass-rate denominator, so one failing new
+ * scenario read "WORSE THAN LAST RUN" with nothing old broken, which would
+ * have forced a version bump and switched the gate off for that run.
  */
 export function compareScorecards(current, previous) {
   if (!previous) return { compared: false, worse: null, reasons: ['no earlier run to compare with'] };
@@ -354,20 +365,31 @@ export function compareScorecards(current, previous) {
     return { compared: false, worse: null, reasons: [`the scenario checks changed (${previous.scoring_version || 'none'} → ${current.scoring_version || 'none'}); this run is the new baseline`] };
   }
   const reasons = [];
-  if (current.pass_rate != null && previous.pass_rate != null && current.pass_rate < previous.pass_rate) {
-    reasons.push(`pass rate fell from ${Math.round(previous.pass_rate * 100)}% to ${Math.round(current.pass_rate * 100)}%`);
-  }
   const before = new Map((previous.results || []).map(r => [r.key, r.pass]));
-  for (const r of current.results || []) {
+  const currentResults = current.results || [];
+  const shared = currentResults.filter(r => before.has(r.key));
+  const newKeys = currentResults.filter(r => !before.has(r.key)).map(r => ({ key: r.key, pass: !!r.pass }));
+  // The pass rate over the shared conversations; a saved run with no per-key
+  // results (none today, but an older payload could lack them) falls back to
+  // the whole-run rates.
+  const rate = (rows, map) => (rows.length ? rows.filter(map).length / rows.length : null);
+  const prevRate = before.size ? rate(shared, r => before.get(r.key) === true) : previous.pass_rate;
+  const curRate = before.size ? rate(shared, r => !!r.pass) : current.pass_rate;
+  if (curRate != null && prevRate != null && curRate < prevRate) {
+    reasons.push(`pass rate fell from ${Math.round(prevRate * 100)}% to ${Math.round(curRate * 100)}% over the ${before.size ? `${shared.length} shared` : 'same'} conversations`);
+  }
+  for (const r of shared) {
     if (before.get(r.key) === true && !r.pass) reasons.push(`${r.key} passed last run and now fails (${r.failures.map(f => f.code).join(', ')})`);
   }
-  return { compared: true, worse: reasons.length > 0, reasons };
+  return { compared: true, worse: reasons.length > 0, reasons, new_keys: newKeys };
 }
 
 /** One short block for a person, worst first. Pure. */
 export function formatScorecard(card, comparison = null) {
   const lines = [`Scorecard: ${card.passed}/${card.conversations} conversations pass (${Math.round((card.pass_rate || 0) * 100)}%) · checks ${card.invariants_version}${card.prompt_version ? ` · prompt ${card.prompt_version}` : ''}${card.git_sha ? ` · ${String(card.git_sha).slice(0, 7)}` : ''}${card.kb_exemplar_mode ? ` · exemplars ${card.kb_exemplar_mode}` : ''}`];
   if (comparison) lines.push(comparison.worse === true ? `WORSE THAN LAST RUN: ${comparison.reasons.join('; ')}` : comparison.worse === false ? 'Not worse than the last run.' : `Not compared: ${comparison.reasons.join('; ')}`);
+  // New scenarios are reported, never counted against the run (2026-10-16).
+  if (comparison?.new_keys?.length) lines.push(`New this run (not compared): ${comparison.new_keys.map(k => `${k.key} ${k.pass ? 'pass' : 'FAIL'}`).join(', ')}`);
   for (const r of card.results.filter(x => !x.pass)) {
     lines.push(`  ✗ ${r.key}: ${r.failures.slice(0, 4).map(f => `${f.code}${f.turn ? `@${f.turn}` : ''}`).join(', ')}${r.failures.length > 4 ? ` (+${r.failures.length - 4})` : ''}`);
   }
