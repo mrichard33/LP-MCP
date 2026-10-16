@@ -135,3 +135,25 @@ test('text helpers', () => {
   assert.equal(cleanSiroText('**Strong** point.[1][2] '), 'Strong point.');
   assert.deepEqual(bulletsOf('- A one.[1] - B two.[2]'), ['A one.', 'B two.']);
 });
+
+test('Siro HTML, a bare "Yes." and "N/A" quotes are cleaned at normalize', () => {
+  const rec = {
+    ...RAW_RECORDING,
+    summary: [
+      { id: 'a', name: 'Customer Need & Motivation', content: '- Yes. The clearest need is replacing aging windows. - They want lower bills.' },
+      { id: 'b', name: 'Customer Objections', content: '<ul><li>The strongest objection was affordability &amp; timing.</li><li>She wants other quotes.</li></ul>' },
+    ],
+    followups: [{ ...RAW_RECORDING.followups[0], context: [
+      { header: 'first_price_quote', value: 'N/A' }, { header: 'final_price_quote', value: 'Not provided' },
+      { header: 'financing', value: '$200/month mentioned.' },
+    ] }],
+  };
+  const row = normalizeRecording(rec, { source: 'poll' });
+  const wants = row.moments.filter(m => m.kind === 'buying_signal').map(m => m.customer_said);
+  assert.deepEqual(wants, ['The clearest need is replacing aging windows.', 'They want lower bills.']);
+  const obj = row.moments.filter(m => m.kind === 'objection').map(m => m.customer_said);
+  assert.deepEqual(obj, ['The strongest objection was affordability & timing.', 'She wants other quotes.']);
+  assert.doesNotMatch(JSON.stringify(row.summary), /<\/?(?:ul|li)>|&amp;/);
+  assert.deepEqual(row.pricing, { financing: '$200/month mentioned.' });
+  assert.equal(cleanSiroText('<p>One</p><br/>Two'), '- One - Two');
+});

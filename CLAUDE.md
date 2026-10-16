@@ -656,6 +656,10 @@ we never add one.
   2026-10-16: "I do not want to strip money"): the quotes sit in `pricing` and in Siro's own text, go to GHL in the demo
   note, and the PRESENTATION block shows them to the bot ("Quoted at the visit … never to be stated in a reply"). The
   reply guard (`enforcePresentationGuard`, `checkReply presentation_quoted_price`) is what keeps a price out of a text.
+  Siro's concession advice ("offer the additional $2,000 to $5,000 discount", "a manager-approved discount") is NOT a
+  fact: `dropDiscountTalk` (`presentation-facts.js`) removes that clause or sentence from everything the bot reads, so
+  the bot never offers a concession (the rehash track's one hint is "the best deal possible"). Siro HTML, a bare "Yes."
+  bullet opener and "N/A" quotes are cleaned at normalize and again on read.
   Demo notes are for NEW visits only: a recording
   older than `SIRO_DEMO_NOTE_MAX_AGE_H` (48) is `too_old`. `siro_sync_run { reprocess: true }` re-normalizes stored rows
   (no event, no note, watermark untouched); every sync pass fills a missing GHL contact id from `lp_leads`.

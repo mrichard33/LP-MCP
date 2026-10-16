@@ -8,14 +8,37 @@
  * PII on the way in, and is data — never instructions (CANON.K.082, K.047).
  */
 
-import { bulletsOf, objectionTypeOf } from './normalize.js';
+import { bulletsOf, objectionTypeOf, cleanSiroText, NONE_RX } from './normalize.js';
 
 const LINE_MAX = 300;
 const TOTAL_MAX = 1500;
 
 function clip(s, n) {
-  const t = String(s ?? '').replace(/\s+/g, ' ').trim();
+  // cleanSiroText again: rows stored before the HTML clean still carry tags.
+  const t = dropDiscountTalk(cleanSiroText(s).replace(/^-\s+/, '').replace(/^(?:yes|no|yeah|correct)[.,!]\s+(?=\S)/i, ''));
   return t.length > n ? `${t.slice(0, n - 1).trimEnd()}…` : t;
+}
+
+// Siro's follow-up advice often names a concession ("offer the additional
+// $2,000 to $5,000 discount", "a manager-approved discount", 2026-10-16). The
+// bot must never offer one (rehash: "the best deal possible" is the one hint),
+// so any sentence about a discount, a price cut or a promotion is dropped from
+// what the bot reads. The quotes themselves stay (the user's ruling).
+const DISCOUNT_RX = /\b(?:discount\w*|rebate\w*|promo(?:tion|tional)?s?|coupon\w*|price\s+(?:cut|drop|reduction|match)\w*|(?:reduce|lower|cut|drop)\w*\s+(?:the\s+|their\s+|her\s+|his\s+)?(?:price|cost|quote|number)|manager[-\s]approved|special\s+(?:pricing|offer|deal)|incentive\w*|knock\w*\s+off)\b/i;
+export function dropDiscountTalk(text) {
+  const t = String(text ?? '');
+  if (!DISCOUNT_RX.test(t)) return t;
+  const kept = [];
+  for (const sen of t.split(/(?<=[.!?])\s+/)) {
+    if (!DISCOUNT_RX.test(sen)) { kept.push(sen); continue; }
+    // "…review the brochures, confirm door specs, and offer the discount." keeps
+    // its first clauses; a sentence that opens on the concession goes whole.
+    const clauses = sen.split(/,\s+/);
+    if (DISCOUNT_RX.test(clauses[0])) continue;
+    const rest = clauses.filter(c => !DISCOUNT_RX.test(c));
+    kept.push(`${rest.join(', ').replace(/[,;]?\s*(?:and|or)?\s*$/i, '').replace(/[.!?]?$/, '')}.`);
+  }
+  return kept.join(' ').trim();
 }
 
 export function repFirstName(name) {
@@ -34,7 +57,8 @@ function pickInsights(i) {
   for (const k of INSIGHT_KEYS) {
     const v = i[k];
     if (v == null || v === '') continue;
-    out[k] = Array.isArray(v) ? v.map(x => clip(x, LINE_MAX)) : clip(v, 500);
+    const val = Array.isArray(v) ? v.map(x => clip(x, LINE_MAX)).filter(Boolean) : clip(v, 500);
+    if (Array.isArray(val) ? val.length : val) out[k] = val;
   }
   return out;
 }
@@ -49,7 +73,12 @@ export const PRICING_LABELS = [
 function pickPricing(p) {
   if (!p || typeof p !== 'object') return null;
   const out = {};
-  for (const [k] of PRICING_LABELS) if (p[k] != null && String(p[k]).trim()) out[k] = clip(p[k], 400);
+  for (const [k] of PRICING_LABELS) {
+    if (p[k] == null) continue;
+    // Prices are kept as quoted (no discount filter here: a quote is a fact).
+    const t = cleanSiroText(p[k]);
+    if (t && !NONE_RX.test(t)) out[k] = t.length > 400 ? `${t.slice(0, 399).trimEnd()}…` : t;
+  }
   return Object.keys(out).length ? out : null;
 }
 /** "First quote: $24,500; Final quote: $18,400" or ''. Pure. */
@@ -102,10 +131,10 @@ export function buildPresentationFacts(rows, { now = Date.now() } = {}) {
     rep_first_name: repFirstName(r.rep_name),
     result: r.result || null,
     summary_lines: sentimentLines(r.summary),
-    objections: said('objection').map(m => ({ type: m.objection_type || 'other', said: clip(m.customer_said, 200) })),
-    interests: said('buying_signal').map(m => clip(m.customer_said, 200)),
-    questions: said('question').map(m => clip(m.customer_said, 200)),
-    followup: { score: r.followup_score ?? null, action: r.followup_action || null, status: r.followup_status || null },
+    objections: said('objection').map(m => ({ type: m.objection_type || 'other', said: clip(m.customer_said, 200) })).filter(o => o.said),
+    interests: said('buying_signal').map(m => clip(m.customer_said, 200)).filter(Boolean),
+    questions: said('question').map(m => clip(m.customer_said, 200)).filter(Boolean),
+    followup: { score: r.followup_score ?? null, action: (r.followup_action && clip(r.followup_action, 500)) || null, status: r.followup_status || null },
     // Siro's own read of the visit.
     insights: pickInsights(r.insights),
     // The quotes, as Siro wrote them (the user, 2026-10-16: the bot sees them).
