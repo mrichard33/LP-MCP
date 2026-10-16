@@ -643,7 +643,8 @@ operator token or a key the database proves is the LP service-role key (n8n's "L
 client credentials preferred, `SIRO_API` legacy). Every recording goes through ONE path, `processRecording`
 (`src/siro/ingest.js`), whoever found it: the webhook (`POST /webhook/siro`), the 10-minute poll
 (`siro-recording-sync`) or the on-demand ensure. It normalizes (moments in the ci-moments shape, PII scrubbed, no
-transcript), matches the LP lead (`resolve-lead.js`: engagement → account → opportunity → phone ±3 days → none) and
+transcript), matches the LP lead (`resolve-lead.js`: opportunity → account → phone ±3 days → none; never the engagement id, which is
+LP's APPOINTMENT id and hit an unrelated old lead on all 54 recordings it matched) and
 upserts `siro_recordings`. Live only: one `siro.recording_processed` event (key `siro:<id>`) and ONE GHL demo note
 (`SIRO_DEMO_NOTE`, claimed on `ghl_note_action_id` before the insert). Siro's own LP integration writes the LP note;
 we never add one.
