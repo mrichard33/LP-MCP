@@ -68,7 +68,7 @@ async function main() {
   if (orgId) {
     const types = await listConversationConfigurations(orgId);
     console.log(`Conversation configurations: ${types.status} ${types.ok ? '' : types.error}`);
-    for (const t of listRows(types.data)) console.log(`  ${t.conversationType || '?'}  ${t.name || ''}`);
+    for (const t of listRows(types.data)) console.log(`  ${t.conversationType || '?'}  ${t.name || t.title || t.displayName || ''}`);
   }
 
   const users = await listUsers();

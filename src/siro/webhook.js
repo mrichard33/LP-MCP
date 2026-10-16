@@ -8,6 +8,7 @@
  *   - EVERY request passes TWO checks first, in every mode, or gets 401
  *     (the user, 2026-10-16; an unsigned POST must read 401, never 404/503):
  *       a. the svix signature against SIRO_WEBHOOK_SECRET on the RAW body
+ *          (svix-* or webhook-* header names, signatureHeaders below)
  *          (express.raw is mounted on this path ahead of the global parsers
  *          in src/index.js);
  *       b. the header x-reece-webhook-key equals SIRO_WEBHOOK_HEADER_KEY,
@@ -56,17 +57,40 @@ export function verifySiroRequest(rawBody, headers, { secret, headerKey }) {
   return verifySiroSignature(rawBody, headers, secret);
 }
 
+/**
+ * The signature headers under either name (2026-10-16, first live deliveries).
+ * Svix signs with svix-id / svix-timestamp / svix-signature, or, on newer
+ * endpoints, with the Standard Webhooks names webhook-id / webhook-timestamp /
+ * webhook-signature. Siro's first two deliveries carried the right header key
+ * and were refused as "signature headers missing" by a check that read the
+ * svix-* names only. The svix library verifies either. Pure.
+ */
+export function signatureHeaders(headers = {}) {
+  const h = headers || {};
+  return {
+    id: h['svix-id'] || h['webhook-id'] || null,
+    timestamp: h['svix-timestamp'] || h['webhook-timestamp'] || null,
+    signature: h['svix-signature'] || h['webhook-signature'] || null,
+  };
+}
+
+/** The names (never the values) of the signature-style headers present, for a refusal log. Pure. */
+export function signatureHeaderNames(headers = {}) {
+  return Object.keys(headers || {}).filter(k => /^(?:svix|webhook)-/i.test(k)).sort();
+}
+
 export function verifySiroSignature(rawBody, headers, secret) {
   if (!secret) return { ok: false, status: 401, error: 'SIRO_WEBHOOK_SECRET unset' };
   if (!Buffer.isBuffer(rawBody)) return { ok: false, status: 400, error: 'raw body missing' };
-  if (!headers['svix-id'] || !headers['svix-timestamp'] || !headers['svix-signature']) {
+  const sig = signatureHeaders(headers);
+  if (!sig.id || !sig.timestamp || !sig.signature) {
     return { ok: false, status: 401, error: 'signature headers missing' };
   }
   try {
     const payload = new Webhook(secret).verify(rawBody.toString('utf8'), {
-      'svix-id': headers['svix-id'],
-      'svix-timestamp': headers['svix-timestamp'],
-      'svix-signature': headers['svix-signature'],
+      'svix-id': sig.id,
+      'svix-timestamp': sig.timestamp,
+      'svix-signature': sig.signature,
     });
     return { ok: true, payload };
   } catch {
@@ -82,12 +106,13 @@ export function makeSiroWebhookHandler({ env = process.env, deps = {} } = {}) {
     const cfg = siroConfig(env);
     const v = verifySiroRequest(req.body, req.headers || {}, { secret: cfg.webhookSecret, headerKey: cfg.webhookHeaderKey });
     if (!v.ok) {
-      console.warn(`[Siro] webhook refused: ${v.error}`);
+      const names = signatureHeaderNames(req.headers || {});
+      console.warn(`[Siro] webhook refused: ${v.error} (signature headers present: ${names.length ? names.join(',') : 'none'})`);
       return res.status(v.status).json({ ok: false, error: v.error });
     }
     if (mode === 'off') return res.status(200).json({ ok: true, mode: 'off' });
     const p = v.payload || {};
-    const svixId = String(req.headers['svix-id'] || '');
+    const svixId = String(signatureHeaders(req.headers || {}).id || '');
     const recordingId = p.recordingId ? String(p.recordingId) : '';
     if (!recordingId) return res.status(200).json({ ok: true, ignored: 'no_recording_id' });
 

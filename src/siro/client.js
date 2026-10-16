@@ -179,8 +179,13 @@ export function getFollowups(filters = {}, deps) {
 export function listUsers(deps) {
   return siroFetch({ scope: 'user', path: '/core/users' }, deps);
 }
-export function listConnections(deps) {
-  return siroFetch({ scope: 'user', path: '/core/integrations/connections' }, deps);
+// 2026-10-16: the user-scoped API answered 404 for this path with a client app;
+// the org-wide API is tried first, the user-scoped one as the fallback.
+export async function listConnections(deps) {
+  const org = await siroFetch({ scope: 'org', path: '/core/integrations/connections' }, deps);
+  if (org.ok) return org;
+  const user = await siroFetch({ scope: 'user', path: '/core/integrations/connections' }, deps);
+  return user.ok ? user : org;
 }
 export function listConversationConfigurations(organizationId, deps) {
   return siroFetch({ scope: 'user', path: '/core/conversation-configurations', query: { organizationId } }, deps);
