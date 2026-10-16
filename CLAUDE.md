@@ -981,7 +981,8 @@ answer to one "why it matters / what if you wait" question, or the lead voluntee
 "before the next storm") — `discoveryEarned` in `nepq-planner.js`. "What's got you looking?" and "how long?" ask for the
 problem, not its weight. Not earned at the old cap (2 chat / 3 SMS): keep discovering (`probe_for` problem / why it
 matters, or the consequence question); two vague answers or `cap + 2` questions bridge anyway. The shortcuts are
-unchanged (Mark: "keep how we had"): quote/price (one question, then times), a schedule or come-out ask, a typed day
+unchanged (Mark: "keep how we had"): quote/price (one question, then times), a schedule or come-out ask (the user,
+2026-10-16: "Yes I'd like the free visit" / "I want the free estimate" count, `SCHEDULE_ASK_RX`), a typed day
 and time, the objection plays. With no plan (planner error, coverage turn) a booking ask goes unless the thread already
 earned it (`bookingOpenInThread`). A probe or consequence turn always ends on a question: when the draft (or a guard)
 lost it, `enforceNepqPlan` appends a fresh one (`discoveryQuestion`, logged `discovery_question_added`), unless the reply
