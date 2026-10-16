@@ -569,7 +569,7 @@ Seven conversation-level actions route to dedicated response playbooks. Pick the
 
 • guide_send — they ask for information/materials to review: "send me info", "got anything I can read", "can you email me details", or accept a guide offer. Set guide_type to the best topical match: "hurricane" (storm protection), "energy" (savings/cooling), "security" (break-ins), "warranty", "financing", "reviews", "credentials" (company info/licensing), "booking-link" (they explicitly ask for a scheduling LINK), "process" (what the visit involves), or "dhp" (Documented Home Protection Guide — the default for vague/skeptical "just send me something" requests).
 
-• follow_up_scheduled — they ask to be re-contacted at a specific time: "check back next week", "reach out after the holidays", "try me in a month". Set follow_up_bucket to the closest bucket; a vague deferral with no timeframe = "1week". Buckets: tomorrow / few-days / 1week / 2weeks / 1month / 2months / after-holidays / seasonal.
+• follow_up_scheduled — they ask to be re-contacted at a specific time: "check back next week", "reach out after the holidays", "try me in a month". Set follow_up_bucket to the closest bucket; a vague deferral with no timeframe ("whenever", "later") = "2weeks" (the user, 2026-10-16). Buckets: tomorrow / few-days / 1week / 2weeks / 1month / 2months / after-holidays / seasonal.
 
 ═══════════════════════════════════════════════════════════════════
 OPEN-QUESTION RULE — THE LEAD MAY BE ANSWERING THE BOT'S QUESTION

@@ -23,6 +23,8 @@ import { isInHomeCalendarId } from '../knowledge/booking-calendar-router.js';
 import { interpolatePayload } from '../actions/helpers.js';
 import { inferChannelFromEvent } from '../channel-inference.js';
 import { deliveryTagsFromSubActions } from '../agentic/guide-delivery.js';
+import { planFollowUpHold } from '../agentic/follow-up-hold.js';
+import { FOLLOW_UP_RETURN_TO } from '../agentic/follow-up-checkin.js';
 
 // ═══════════════════════════════════════════════════════════════════
 // 2026-09-02 — follow-up promise vs soft decline (Jacqueline Branham,
@@ -299,6 +301,26 @@ export function planLayer3SubActions({ event, dispatch, result = {}, targetId = 
         );
         actionPayload = { ...actionPayload, channel: eventChannel };
       }
+    }
+
+    // 2026-10-16 (the user) — a follow-up hold is timed to the date the lead
+    // named, "whenever" waits two weeks, and the row keeps what they asked for
+    // so the check-in can pick up where the conversation left off
+    // (src/agentic/follow-up-hold.js). A dispatch guard that forced the bucket
+    // (the soft-decline guard) keeps its hours; the context still rides along.
+    if (tmpl.action_type === 'issue_hold' && actionPayload.return_to === FOLLOW_UP_RETURN_TO) {
+      const plan = planFollowUpHold({
+        messageText: event.payload?.message_text || '',
+        bucket: interpContext.follow_up_bucket,
+        nowMs: Date.now(),
+        reasoning: event.payload?.reasoning || null,
+      });
+      const bucketForced = Boolean(result.payload_overrides?.follow_up_bucket);
+      actionPayload = {
+        ...actionPayload,
+        ...(bucketForced ? {} : { hold_hours: plan.hold_hours }),
+        follow_up: plan.follow_up,
+      };
     }
 
     const row = {

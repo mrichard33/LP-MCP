@@ -151,6 +151,7 @@ const FUNCTION_GROUPS = {
   live_chat: 'customer_facing',
   nurture_generator: 'customer_facing',  // src/nurture/nurture-generator.js
   agentic_callback: 'customer_facing',   // src/agentic-callback-message.js
+  follow_up_checkin: 'customer_facing',  // src/agentic/follow-up-checkin.js (2026-10-16)
   appt_notification: 'customer_facing',  // src/notifications/appointment-body-generator.js (legacy APPT_NOTIFICATION_MODEL)
   cancellation_body: 'customer_facing',  // src/notifications/cancellation-body-generator.js
   // Sales-board announcement. Not a customer message, but it is read by the
