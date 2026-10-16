@@ -254,6 +254,36 @@ export const SCENARIO_EXPECTATIONS = Object.freeze({
     if (confirm && !replies(confirm).some(x => /\bgive\s+you\s+a\s+call\b/i.test(x))) out.push({ code: 'rehash_confirm_no_caller', detail: replies(confirm).join(' '), turn: confirm.turn });
     return out;
   },
+  // ── 2026-10-16 (Melissa, 6U6uceZGMQRz8XEQc9Lk): the time she picked is heard ──
+  // "sunday at 2" to two Sunday times holds 2 PM in that same reply.
+  same_day_pick_at_two: (r) => heldThePick(r),
+  // "Sun, Oct 18 at 2:00 PM ET?" is a pick, never a question nor the holding line.
+  pick_with_question_mark: (r) => heldThePick(r),
+  // Both answered: the time held AND the company question answered.
+  pick_plus_question: (r) => {
+    const out = heldThePick(r);
+    const t = pickTurn(r);
+    if (t && !replies(t).some(x => /\breece\b/i.test(x))) out.push({ code: 'side_question_dropped', detail: replies(t).join(' / ').slice(0, 200), turn: t.turn });
+    return out;
+  },
+  // The booking carries her real name, and no reply calls her "Visitor".
+  placeholder_name_then_melissa: (r) => {
+    const out = [];
+    const book = wouldDo(r).find(w => w.kind === 'would_book');
+    if (!book) out.push({ code: 'yes_without_booking', detail: 'the visit was never booked' });
+    else if (book.contact_name !== 'Melissa') out.push({ code: 'placeholder_name_on_booking', detail: String(book.contact_name || '(none)') });
+    const v = allReplies(r).find(x => /\bvisitor\b/i.test(x.text));
+    if (v) out.push({ code: 'placeholder_name_said', detail: v.text, turn: v.turn });
+    return out;
+  },
+  // The booking's address keeps the unit, the zip's city, the state and the zip.
+  bare_unit_address: (r) => {
+    const book = wouldDo(r).find(w => w.kind === 'would_book');
+    if (!book) return [{ code: 'yes_without_booking', detail: 'the visit was never booked' }];
+    const a = String(book.address || '');
+    const missing = ['14A', 'Port Charlotte', 'FL', '33952'].filter(x => !a.includes(x));
+    return missing.length ? [{ code: 'address_incomplete', detail: `${a || '(none)'} (missing ${missing.join(', ')})` }] : [];
+  },
 });
 
 /** The NEPQ plan steps of a run, in order. Pure. */
@@ -273,6 +303,23 @@ function rehashLaneFailures(r) {
     if (w.kind === 'would_book_appointment' && w.payload?.rehash_call !== true) out.push({ code: 'rehash_booked_visit', detail: String(w.payload?.calendar_name || w.payload?.calendar_id || 'a non-rehash calendar'), turn: w.turn });
   }
   return out;
+}
+
+// 2026-10-16 (Melissa): the turn where the persona picked one of the offered
+// times in her own words ("sunday at 2", "Sun, Oct 18 at 2:00 PM ET?").
+const PICK_TEXT_RX = /^(?:sunday|monday|tuesday|wednesday|thursday|friday|saturday|tomorrow|today) at \d{1,2}\b|^(?:Sun|Mon|Tue|Wed|Thu|Fri|Sat), [A-Z][a-z]{2} \d{1,2} at \d{1,2}:\d{2} [AP]M/;
+function pickTurn(r) {
+  return (r.transcript || []).find(t => PICK_TEXT_RX.test(String(t.customer || ''))) || null;
+}
+function heldThePick(r) {
+  const t = pickTurn(r);
+  if (!t) return [{ code: 'no_offer_to_pick', detail: 'the bot never offered two times to pick from' }];
+  const said = String(t.customer || '');
+  const hour = Number((said.match(/\bat (\d{1,2})/) || [])[1]);
+  const text = replies(t).join(' ');
+  const hourRx = new RegExp(`\\b${hour}(?::00)?\\s*PM\\b|\\b${hour}(?::00)?\\s*AM\\b`, 'i');
+  const held = HOLD_LINE_RX.test(text) && hourRx.test(text);
+  return held ? [] : [{ code: 'pick_not_heard', detail: `"${said}" → ${text.slice(0, 200) || '(no reply)'}`, turn: t.turn }];
 }
 
 /** Did the run book, move or hold a time (code-backed), at any turn? Pure. */

@@ -2795,6 +2795,13 @@ async function insertCompanionAction(parentAction, generated, callPurpose = null
     companion.action_payload.call_purpose = callPurpose;
   }
 
+  // 2026-10-16 (Melissa): a booking the bot makes says so, so the handler
+  // gives it the bot's owner (BOT_BOOKING_USER_ID) and the post-booking email
+  // ask goes out on the channel the lead used.
+  if (ctype === 'book_appointment' && !companion.action_payload.source) {
+    companion.action_payload.source = 'sms_bot';
+  }
+
   try {
     const { data, error } = await supabase
       .from('agent_actions')

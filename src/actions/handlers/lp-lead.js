@@ -119,7 +119,7 @@ import {
   calculatorLeadGuardMode, calcDedupeKey, pickNewestCalculatorLead,
 } from '../../services/lp-existing-lead-guard.js';
 import { needsNameRecovery, recoverPlaceholderName } from '../../services/placeholder-name-recovery.js';
-import { NAME_PLACEHOLDER_TAG } from '../../services/identity-extraction.js';
+import { NAME_PLACEHOLDER_TAG, isPlaceholderSurname } from '../../services/identity-extraction.js';
 // v1.2 — the deterministic call-center brief. Pure builder + a fetch
 // wrapper that returns null on ANY failure, so this stays fail-soft.
 import { buildAgenticLeadNotes, isWeakNotes } from '../../services/agentic-lead-notes.js';
@@ -543,6 +543,10 @@ export async function executeCreateLPLead(action) {
   }
   if (existingLeadId) {
     console.log(`[LP-CREATE] ⏭️ Skip: contact ${contactId} already in LP (in1=${existingInbound || 'none'}, lds=${existingLeadId || 'none'})`);
+    // 2026-10-16 (Melissa, 584060): a lead 8e30ff37 added with the appointment
+    // on it shows "No, Setter". One SetAppointment with set_by 5686 at the time
+    // LP already holds, never retried (src/lp-setter-stamp.js). Fire-and-forget.
+    stampSetterFromLive(contactId, existingLeadId).catch(() => {});
     return {
       action: 'already_in_lp',
       contact_id: contactId,
@@ -625,6 +629,10 @@ export async function executeCreateLPLead(action) {
       console.warn(`[LP-CREATE] 🪪 ${contactId}: placeholder name "${wasName}", none recovered (${rec.reason})`);
     }
   }
+
+  // 2026-10-16 (Melissa): a real first name next to the widget's surname
+  // ("Visitor Anlxy") reaches LP with the first name only.
+  if (isPlaceholderSurname(ghlContact.lastName)) ghlContact = { ...ghlContact, lastName: '' };
 
   // ─── Validate required GHL fields ─────────────────────────────────
   // LP needs a first name and a phone — nothing else (Mark, 2026-09-28).
@@ -874,4 +882,25 @@ export async function executeCreateLPLead(action) {
     ...(isCalcLane ? { calc_dedupe_key: calcCheck?.key || null, calculator_check: calcCheck } : {}),
     lp_response: lpResponse,
   };
+}
+
+
+/** The already_in_lp setter stamp: reads LP live, stamps only a Set lead with no setter. */
+async function stampSetterFromLive(contactId, ldsId) {
+  const [{ stampSetterOnce, lpApptToSetArgs }, lp, { getField }, { emitEvent: emit }, { findLeadInLpResponse }] = await Promise.all([
+    import('../../lp-setter-stamp.js'), import('../../lp-client.js'), import('../../sync-utils.js'), import('../../event-emitter.js'), import('./lp-appointment.js'),
+  ]);
+  const leadOf = (resp) => findLeadInLpResponse(resp, ldsId);
+  const lead = leadOf(await lp.getLeadByLdsId(ldsId, { fast: true }));
+  const args = lead ? lpApptToSetArgs(getField(lead, 'apptdate', 'ApptDate')) : null;
+  if (!args) return { stamped: false, reason: 'no_appointment' };
+  return stampSetterOnce({
+    contactId, ldsId, ...args,
+    setByName: getField(lead, 'setbyname', 'SetByName'), disposition: getField(lead, 'disposition', 'Disposition'),
+  }, {
+    claim: async (key) => { const row = await emit({ event_type: 'lp.setter_stamp_attempt', source: 'lp_mcp', entity_type: 'lp_lead', entity_id: key, payload: { key }, priority: 'low', bypass_filter: true, idempotency_key: key }); return !!row && !row.filtered; },
+    setAppointment: (a) => lp.setAppointment(a),
+    readSetter: async (id) => { const l = findLeadInLpResponse(await lp.getLeadByLdsId(id, { fast: true }), id); return l ? (getField(l, 'setbyname', 'SetByName') ?? '') : null; },
+    emit,
+  });
 }

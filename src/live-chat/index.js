@@ -46,6 +46,7 @@ import { scopeDqDeps } from '../services/scope-dq-io.js';
 import { guardRepeatPromise, recordPromiseIfAny } from '../services/promised-callbacks-io.js';  // 2026-10-07
 import { recordTurnStage, readStageForPlanner } from '../services/lead-stage-io.js';  // 2026-10-12
 import { trackBackground } from '../graceful-shutdown.js';
+import { sendChatEmailAsk } from './email-ask.js';
 import { fetchFreeSlots, selectOfferableSlots } from '../knowledge/calendar-availability.js';
 import { resolveGate, isSlotBookable } from '../knowledge/market-capacity-gate.js';
 import { recordEveningRequest } from '../services/evening-request-io.js';
@@ -384,7 +385,7 @@ async function offerBookingSlots({ contact, preferredText = null, zip = null }) 
  * missing address, decision-makers not confirmed) returns, it does not throw,
  * and the visitor must never hear "you're set" for it.
  */
-async function bookSlot({ contactId, startIso, calendarId, decisionMakers = null, address = null, marketCode = undefined }) {
+async function bookSlot({ contactId, startIso, calendarId, decisionMakers = null, address = null, marketCode = undefined, contactName = null }) {
   if (!supabase) return { ok: false, error: 'supabase client not configured' };
   // 2026-10-15 (Mark, R1): the picked time is checked against the market's LP
   // capacity right before booking. Closed → no booking; the lane re-offers.
@@ -410,6 +411,9 @@ async function bookSlot({ contactId, startIso, calendarId, decisionMakers = null
       ...(decisionMakers ? { qualifying_data: { decision_makers_present: decisionMakers } } : {}),
       // 2026-10-02 (Mark): the visit address on the appointment itself.
       ...(address ? { address } : {}),
+      // 2026-10-16 (Melissa): the name the visitor gave here, for the title
+      // when the record still holds the widget's "Guest Visitor …".
+      ...(contactName ? { contact_name: contactName } : {}),
     },
   }).select('id').single();
   if (error || data?.id == null) return { ok: false, error: error?.message || 'insert returned no id' };
@@ -450,6 +454,19 @@ async function scopeDq({ contactId, kind, inbound, phone = null }) {
  * (src/simulator/bot-simulator.js) takes the real model, knowledge and
  * read-only lookups from here and swaps every write and send for a recorder.
  */
+/**
+ * The post-booking email ask for a chat booking, sent in the chat after the
+ * confirmation (2026-10-16, Melissa; src/live-chat/email-ask.js). Tracked, so a
+ * deploy waits for it.
+ */
+export function scheduleChatEmailAsk(contactId, message) {
+  return trackBackground(sendChatEmailAsk(contactId, message, {
+    sleep: (ms) => new Promise(r => setTimeout(r, ms)),
+    fetchContact: (id) => ghlFetch('GET', `/contacts/${id}`, null, { priority: 'normal' }).then(res => res?.contact || null),
+    sendMessage: ({ contactId: id, message: text }) => sendMessage({ contactId: id, conversationId: null, message: text }),
+  }));
+}
+
 export function productionLaneDeps() {
   return {
     fetchContact,

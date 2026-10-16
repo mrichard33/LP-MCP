@@ -1301,6 +1301,39 @@ Mark: "I don't think we need any static messages sent by the bot. Each message s
   - The live chat passes `upcomingAppointments` to the prompt.
   - `normalizeThread` labels each turn by its own channel, because texts and emails sit in the same GHL conversation.
 
+**The Melissa trace: a chat booking hears the time, keeps the real name and the whole address (2026-10-16).** GHL
+6U6uceZGMQRz8XEQc9Lk, LP lead 584060: "sunday at 2" was not heard four times, the P1 opportunity read "Melissa Visitor
+Anlxy", the visit went to a round-robin user, LP showed "No, Setter", the unit "14A" and the city were lost, and the email
+ask went by SMS. Now:
+- **Time.** `pickSlot` (`cancel-flow.js`) keeps only the offered slots that match EVERY part the lead named (day AND
+  time); a bare hour after "at" / a weekday / "o'clock" reads 1-7 PM, 8-11 AM (`mentionedMinutes`); a whole-message "2"
+  is still "the second one". The planner's `offeredNow` reads by meaning (`slotMentionIndex`), a pick ending in "?" is not
+  a question (`pickTextForQuestion`), a question beside a pick is answered in one line before the hold (`side_question`,
+  `sideQuestionOf`, both bots' facts block), and a day the lead named is never asked again (`namedDayInThread`). The
+  timeout line no longer says "grab the right person" (`LIVE_CHAT_FALLBACK_MESSAGE`); `execution_result.timing.steps`
+  times each step from arrival (`markStep`), and a deadline logs them.
+- **Name.** "Visitor xxxx" is never a surname and a bare "Guest" never a first name (`isPlaceholderSurname`,
+  `isPlaceholderName`, `cleanDisplayName` in `identity-extraction.js`). The surname is cleared with an explicit null
+  (`updateGHLContactStandardFields(…, { clear })`: GHL ignores ''), read back, retried once, then
+  `identity.placeholder_clear_failed`. Titles never carry it; the chat name rides on the booking (`contact_name`). A real
+  name renames open "Visitor" opportunities (`update_opportunity`, rule `PLACEHOLDER_NAME_REPAIR`) and re-sends an LP lead
+  held for a name (`placeholder-name-followups.js`). The addlead proxy drops the surname and holds a placeholder first
+  name (`addlead-name.js`, tag `name-placeholder`). GHL's A.WE names the P1 opportunity from `{{contact.name}}`, so the
+  name is saved BEFORE the booking.
+- **Owner.** Every non-rehash bot booking (`source` `live_chat` / `sms_bot`) is assigned `BOT_BOOKING_USER_ID`
+  (default 3K6HtoPyBLWeQrrnSnCD, Reece Team); a GHL refusal of the user books without it (`bot_assignee_refused`).
+- **Setter (interim).** When LP already holds the same appointment and the setter is blank / "No, Setter" on a Set lead,
+  ONE SetAppointment with set_by 5686, never retried (`src/lp-setter-stamp.js`, `lp.setter_stamped` /
+  `lp.setter_stamp_refused`). The permanent fix is the setter key on 8e30ff37's addlead body (`LP_ADDLEAD_SETTER_FIELD`
+  once LP names the key; never guess it).
+- **Address.** `ADDRESS_RE` keeps a unit ("Apt 3", or a bare "14A" with a digit) as `address_line2` and reads a city with
+  no comma; the chat capture fills city and state from the zip (a near-miss city is corrected; HOU → TX, WSNC → NC). GHL
+  has one street line, so the unit rides on address1 (`streetWithUnit`) and reaches LP from there.
+- **Email ask.** A chat booking asks for the email in the chat (`scheduleChatEmailAsk`, `src/live-chat/email-ask.js`,
+  20s after the booking); the send pipeline never answers in the chat.
+Tests: `scripts/test-melissa-trace.js`; eval scenarios `same_day_pick_at_two`, `pick_with_question_mark`,
+`pick_plus_question`, `placeholder_name_then_melissa`, `bare_unit_address` (a turn may be a function of the bot's reply).
+
 **A live-chat turn answers exactly once (2026-10-02, vnazu).** `raceWithBudget` abandons work, it does not
 stop it: the reply and the holding line share one `newTurnClaim()`, a second draft starts only when
 `redraftFits`, and a reply that claimed the turn is waited for instead of sending the fallback on top.

@@ -41,7 +41,7 @@
 
 import { callLLM } from '../llm-client.js';
 import { emitEvent } from '../event-emitter.js';
-import { updateGHLContactStandardFields, removeGHLTags } from '../ghl.js';
+import { updateGHLContactStandardFields, removeGHLTags, getGHLContact } from '../ghl.js';
 import { extractPreferredTime, persistPreferredTime } from './preferred-time.js';
 import { scrubUrlsForExtraction } from '../email-thread.js';
 import supabase from '../supabase.js';
@@ -62,11 +62,47 @@ export const EMAIL_ASKED_TAG = 'booking:email-asked';
 // importantly `tags` and `customFields` — never reaches the payload.
 const PROMOTABLE_FIELDS = ['firstName', 'lastName', 'email', 'phone', 'address1', 'city', 'state', 'postalCode'];
 
+// 2026-10-16 (Melissa, 6U6uceZGMQRz8XEQc9Lk): the widget's surname
+// ("Visitor Anlxy") survived next to her real first name, so A.WE named the
+// P1 opportunity "Melissa Visitor Anlxy". A surname shaped "Visitor xxxx" is
+// never a real one, and a bare first name "Guest" / "Visitor" is the widget's
+// too (placeholder-name-recovery.js found those on 2026-09-28).
+export const PLACEHOLDER_SURNAME_RE = /^visitor\s+\w+$/i;
+export const BARE_PLACEHOLDER_FIRST_RE = /^(?:guest|visitor)$/i;
+
+/** True when a surname is the widget's "Visitor xxxx". */
+export function isPlaceholderSurname(lastName) {
+  return PLACEHOLDER_SURNAME_RE.test(String(lastName || '').trim());
+}
+
 /** True when a name is missing or the live-chat widget placeholder. */
 export function isPlaceholderName(name) {
   const n = String(name || '').trim();
   if (!n) return true;
-  return PLACEHOLDER_NAME_RE.test(n);
+  return PLACEHOLDER_NAME_RE.test(n) || BARE_PLACEHOLDER_FIRST_RE.test(n);
+}
+
+/** True when either half of a stored name is the widget's placeholder. */
+export function hasPlaceholderNamePart(firstName, lastName) {
+  const f = String(firstName || '').trim();
+  return isPlaceholderName(f) || isPlaceholderName(`${f} ${String(lastName || '').trim()}`.trim()) || isPlaceholderSurname(lastName);
+}
+
+/**
+ * A display name with every placeholder part taken out: "Melissa Visitor
+ * Anlxy" → "Melissa", "Guest Visitor abcde" → "". Any "Visitor xxxx" token is
+ * dropped wherever it sits. Pure.
+ */
+export function cleanDisplayName(firstName, lastName = '') {
+  const f = String(firstName || '').trim();
+  const l = String(lastName || '').trim();
+  const first = isPlaceholderName(f) ? '' : f;
+  const last = isPlaceholderSurname(l) || (!first && isPlaceholderName(`${f} ${l}`)) ? '' : l;
+  return [first, last].filter(Boolean).join(' ')
+    .replace(/\bguest\s+visitor\s+\w+\b/gi, '')
+    .replace(/\bvisitor\s+[a-z0-9]{4,6}\b/gi, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
 }
 
 /** Normalize a US phone to E.164 (+1XXXXXXXXXX) or null. */
@@ -91,6 +127,7 @@ function emptyIdentity() {
     phone: null,
     email: null,
     address_line1: null,
+    address_line2: null,
     city: null,
     state: null,
     postal_code: null,
@@ -120,7 +157,8 @@ export function hydrateIdentityFromRecord(record = {}) {
   if (first && !isPlaceholderName(fullName) && !isPlaceholderName(first)) {
     id.first_name = String(first).trim();
     id._source.first_name = 'ghl_record';
-    if (last) {
+    // "Visitor xxxx" is the widget's surname, never the person's (2026-10-16).
+    if (last && !isPlaceholderSurname(last)) {
       id.last_name = String(last).trim();
       id._source.last_name = 'ghl_record';
     }
@@ -159,11 +197,19 @@ export function hydrateIdentityFromRecord(record = {}) {
 // ═══════════════════════════════════════════════════════════════════
 
 const STREET_SUFFIX = '(?:Dr|Drive|St|Street|Ave|Avenue|Rd|Road|Ln|Lane|Blvd|Boulevard|Ct|Court|Cir|Circle|Way|Ter|Terrace|Trl|Trail|Pl|Place|Pkwy|Parkway|Hwy|Highway|Loop)';
+// 2026-10-16 (Melissa): "2486 Caring Way 14A Port Charolette, FL 33952" lost
+// the unit (the unit group was non-capturing) and the city (a city needed a
+// comma before it). Groups: [1] street, [2] keyword unit ("Apt 3"), [3] bare
+// unit right after the suffix ("14A", "B12": a digit is required, so "N Port"
+// is never a unit, and four digits at most, so a zip never is), [4] city (a
+// comma before it is optional, but it must run up to a state, a zip or the end),
+// [5] state, [6] zip.
+const STATE_WORDS = '(?:FL|Florida|TX|Texas|NC|North Carolina)';
 const ADDRESS_RE = new RegExp(
   `\\b(\\d{1,6}\\s+(?:[NSEW]\\.?\\s+)?[A-Za-z0-9'.]+(?:\\s+[A-Za-z0-9'.]+){0,3}?\\s+${STREET_SUFFIX})\\.?\\b` +
-  `(?:\\s*,?\\s*(?:Apt|Unit|Ste|Suite|#)\\s*[\\w-]+)?` +
-  `(?:\\s*,\\s*([A-Za-z][A-Za-z .'-]{2,30}))?` +
-  `(?:\\s*,?\\s*(FL|Florida|TX|Texas|NC|North Carolina)\\b)?` +
+  `(?:\\s*,?\\s*(?:((?:Apt|Apartment|Unit|Ste|Suite|#)\\.?\\s*#?\\s*[\\w-]+)|(\\d{1,4}[A-Za-z]?|[A-Za-z]\\d{1,4})(?![\\w-])))?` +
+  `(?:\\s*,?\\s*([A-Za-z][A-Za-z .'-]{1,30}?)(?=\\s*,?\\s*(?:\\b${STATE_WORDS}\\b|\\d{5})|\\s*[.!]?\\s*$))?` +
+  `(?:\\s*,?\\s*\\b(${STATE_WORDS})\\b)?` +
   `(?:\\s*,?\\s*(\\d{5})(?:-\\d{4})?)?`,
   'i'
 );
@@ -309,18 +355,20 @@ export function heuristicExtract(messages = []) {
       if (addrM) {
         id.address_line1 = addrM[1].replace(/\s+/g, ' ').trim();
         id._source.address_line1 = 'extracted';
-        if (addrM[2]) {
-          // Greedy city capture may swallow a trailing state token — strip it.
-          const stateM = addrM[2].trim().match(/[\s,]+(FL|Florida|TX|Texas|NC|North Carolina)$/i);
-          const cityRaw = stateM ? addrM[2].trim().slice(0, stateM.index) : addrM[2].trim();
+        const unit = addrM[2] || addrM[3] || null;
+        if (unit) { id.address_line2 = unit.replace(/\s+/g, ' ').trim(); id._source.address_line2 = 'extracted'; }
+        if (addrM[4]) {
+          // A lazy city may still end on a state token — strip it.
+          const stateM = addrM[4].trim().match(/[\s,]+(FL|Florida|TX|Texas|NC|North Carolina)$/i);
+          const cityRaw = (stateM ? addrM[4].trim().slice(0, stateM.index) : addrM[4].trim()).replace(/[\s,]+$/, '');
           if (cityRaw && looksLikeName(cityRaw.split(/\s+/))) {
             id.city = cityRaw;
             id._source.city = 'extracted';
           }
           if (stateM) { id.state = stateCode(stateM[1]); id._source.state = 'extracted'; }
         }
-        if (addrM[3]) { id.state = stateCode(addrM[3]); id._source.state = 'extracted'; }
-        if (addrM[4]) { id.postal_code = addrM[4]; id._source.postal_code = 'extracted'; }
+        if (addrM[5]) { id.state = stateCode(addrM[5]); id._source.state = 'extracted'; }
+        if (addrM[6]) { id.postal_code = addrM[6]; id._source.postal_code = 'extracted'; }
         else {
           const tail = seg.match(TRAILING_ZIP_RE);
           if (tail) { id.postal_code = tail[1]; id._source.postal_code = 'extracted'; }
@@ -548,6 +596,7 @@ export async function buildIdentityState(context, { useLLM = false, extraMessage
     conflicts,
     contact_id: lead.ghl_contact_id || null,
     record_had_placeholder_name: isPlaceholderName([lead.first_name, lead.last_name].filter(Boolean).join(' ') || lead.name),
+    record_placeholder_surname: isPlaceholderSurname(lead.last_name),
     tags: lead.current_tags || [],
   };
 }
@@ -809,15 +858,52 @@ export async function geocodeStreetToZip(addressLine1, { city = null, state = 'F
  */
 export function enrichIdentityFromServiceArea(identity, serviceArea) {
   if (!identity || !serviceArea?.checked || serviceArea.in_service_area !== true) return identity;
-  if (!identity.city && serviceArea.city) {
+  identity._source ||= {};
+  if (serviceArea.city && (!identity.city || cityTypo(identity.city, serviceArea.city))) {
+    // 2026-10-16 (Melissa): "Port Charolette" for zip 33952 → "Port Charlotte".
+    // A typed city only gives way to the zip's when it is a near-miss of it.
     identity.city = serviceArea.city;
     identity._source.city = 'extracted';
   }
   if (!identity.state) {
-    identity.state = 'FL';
+    // Houston and Winston-Salem are service markets too (sql/141): never FL there.
+    identity.state = MARKET_STATE[String(serviceArea.market_code || '').toUpperCase()] || 'FL';
     identity._source.state = 'extracted';
   }
   return identity;
+}
+
+const MARKET_STATE = { HOU: 'TX', WSNC: 'NC' };
+
+/** A typed city that is a near-miss of the zip's city (edit distance ≤ 3, not equal). Pure. */
+export function cityTypo(typed, real) {
+  const a = String(typed || '').trim().toLowerCase();
+  const b = String(real || '').trim().toLowerCase();
+  if (!a || !b || a === b) return false;
+  return editDistance(a, b) <= Math.min(3, Math.floor(b.length / 3));
+}
+
+function editDistance(a, b) {
+  const prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i++) {
+    let diag = prev[0];
+    prev[0] = i;
+    for (let j = 1; j <= b.length; j++) {
+      const tmp = prev[j];
+      prev[j] = Math.min(prev[j] + 1, prev[j - 1] + 1, diag + (a[i - 1] === b[j - 1] ? 0 : 1));
+      diag = tmp;
+    }
+  }
+  return prev[b.length];
+}
+
+/** The street line with its unit ("2486 Caring Way 14A"): GHL has no second address line. Pure. */
+export function streetWithUnit(identity) {
+  const street = String(identity?.address_line1 || '').trim();
+  const unit = String(identity?.address_line2 || '').trim();
+  if (!street) return null;
+  if (!unit || street.toLowerCase().includes(unit.toLowerCase())) return street;
+  return `${street} ${unit}`;
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -856,17 +942,25 @@ export function buildPromotionPayload(current = {}, identity = {}) {
 
   // Name — placeholder-or-empty overwrite only (also match raw firstName).
   const curFull = [cur.firstName, cur.lastName].filter(Boolean).join(' ');
-  const curIsPlaceholder = isPlaceholderName(curFull) || isPlaceholderName(cur.firstName);
+  const curIsPlaceholder = hasPlaceholderNamePart(cur.firstName, cur.lastName);
   if (identity.first_name && src.first_name === 'extracted' && !isPlaceholderName(identity.first_name)) {
     if (curIsPlaceholder) {
       payload.firstName = identity.first_name;
       // A placeholder surname ("Visitor bljpx") must not survive next to a
-      // real first name — write the extracted last name or clear it.
-      payload.lastName = identity.last_name || '';
+      // real first name — write the extracted last name or clear it. GHL
+      // ignored the '' this sent until 2026-10-16 (Melissa): null clears it.
+      payload.lastName = identity.last_name || null;
       wroteRealName = true;
     } else if (!normalizedEqual('name', curFull, [identity.first_name, identity.last_name].filter(Boolean).join(' '))) {
       conflicts.push({ field: 'name', record_value: curFull, extracted_value: [identity.first_name, identity.last_name].filter(Boolean).join(' ') });
     }
+  }
+  // A real first name on the record with the widget's surname beside it
+  // ("Melissa" + "Visitor Anlxy"): the surname is cleared (or replaced by one
+  // the visitor typed), whatever else this pass writes (2026-10-16).
+  if (payload.lastName === undefined && !isPlaceholderName(cur.firstName) && isPlaceholderSurname(cur.lastName)) {
+    payload.lastName = (src.last_name === 'extracted' && identity.last_name && !isPlaceholderSurname(identity.last_name)) ? identity.last_name : null;
+    wroteRealName = true;
   }
 
   const fillIfEmpty = (payloadKey, curValue, extValue, extracted) => {
@@ -879,7 +973,8 @@ export function buildPromotionPayload(current = {}, identity = {}) {
   };
   fillIfEmpty('phone', cur.phone, identity.phone, src.phone === 'extracted');
   fillIfEmpty('email', cur.email, identity.email, src.email === 'extracted');
-  fillIfEmpty('address1', cur.address1, identity.address_line1, src.address_line1 === 'extracted');
+  // GHL has one street line, so the unit rides on it (2026-10-16, Melissa).
+  fillIfEmpty('address1', cur.address1, streetWithUnit(identity), src.address_line1 === 'extracted');
   fillIfEmpty('city', cur.city, identity.city, src.city === 'extracted');
   fillIfEmpty('state', cur.state, identity.state, src.state === 'extracted');
   // 'geocoded' = zip resolved from the street address via the Census
@@ -908,7 +1003,10 @@ export function buildPromotionPayload(current = {}, identity = {}) {
  *   to the record view captured in state via hydration source markers)
  * @param {string} [opts.trigger]  provenance for the event log
  */
-export async function promoteIdentityToGHL(contactId, state, { current = null, trigger = 'agentic' } = {}) {
+export async function promoteIdentityToGHL(contactId, state, { current = null, trigger = 'agentic', deps = {} } = {}) {
+  const updateFields = deps.updateFields || updateGHLContactStandardFields;
+  const readContact = deps.readContact || getGHLContact;
+  const emit = deps.emitEvent || emitEvent;
   if (!contactId || !state?.identity) return { written: 0, conflicts: 0 };
 
   // Reconstruct the record view from hydration when no explicit current
@@ -917,7 +1015,7 @@ export async function promoteIdentityToGHL(contactId, state, { current = null, t
   const src = id._source || {};
   const cur = current || {
     firstName: src.first_name === 'ghl_record' ? id.first_name : (state.record_had_placeholder_name ? 'Guest Visitor' : null),
-    lastName: src.last_name === 'ghl_record' ? id.last_name : null,
+    lastName: src.last_name === 'ghl_record' ? id.last_name : (state.record_placeholder_surname ? 'Visitor placeholder' : null),
     email: src.email === 'ghl_record' ? id.email : null,
     phone: src.phone === 'ghl_record' ? id.phone : null,
     address1: src.address_line1 === 'ghl_record' ? id.address_line1 : null,
@@ -952,13 +1050,19 @@ export async function promoteIdentityToGHL(contactId, state, { current = null, t
     return { written: 0, conflicts: allConflicts.length };
   }
 
-  const result = await updateGHLContactStandardFields(contactId, payload);
+  const clear = payload.lastName === null ? ['lastName'] : [];
+  const result = await updateFields(contactId, payload, { clear });
   if (result !== true) {
     console.warn(`[IdentityExtraction] standard-field promotion failed for ${contactId} (result=${result})`);
     return { written: 0, conflicts: allConflicts.length, failed: true };
   }
 
   console.log(`[IdentityExtraction] ✅ promoted ${Object.keys(payload).join(', ')} for ${contactId}${wroteRealName ? ' (placeholder name replaced)' : ''}`);
+  // 2026-10-16 (Melissa): the PUT answered 200 and "Visitor Anlxy" stayed.
+  // A cleared placeholder surname is read back; still there → one retry, then
+  // one event (no card: the booking title and the LP lead are cleaned anyway).
+  let placeholderCleared = null;
+  if (clear.length) placeholderCleared = await verifySurnameCleared(contactId, payload, { updateFields, readContact, emit, trigger });
   try {
     await emitEvent({
       event_type: 'identity.promoted',
@@ -974,10 +1078,70 @@ export async function promoteIdentityToGHL(contactId, state, { current = null, t
   } catch { /* best-effort */ }
 
   if (wroteRealName) {
+    // Tags read BEFORE the removal: a `name-placeholder` contact had its LP
+    // lead held for want of a name, and the follow-up re-sends it.
+    const tagsBefore = deps.readTags ? await deps.readTags(contactId).catch(() => null) : null;
     await removeGHLTags(contactId, [NAME_PLACEHOLDER_TAG]).catch(() => {});
+    // 2026-10-16 (Melissa): the open opportunity GHL named from the placeholder
+    // is renamed, and a held LP lead goes now. Fire-and-forget.
+    if (deps.repair !== false) {
+      const realFirst = payload.firstName || cur.firstName;
+      runNameRepair(contactId, { firstName: realFirst, lastName: payload.lastName ?? (isPlaceholderSurname(cur.lastName) ? null : cur.lastName) }, tagsBefore)
+        .catch(err => console.warn(`[IdentityExtraction] name repair failed for ${contactId}: ${err.message}`));
+    }
   }
 
-  return { written: Object.keys(payload).length, conflicts: allConflicts.length, wroteRealName };
+  return { written: Object.keys(payload).length, conflicts: allConflicts.length, wroteRealName, payload, placeholderCleared };
+}
+
+/** Production wiring for placeholder-name-followups.js (lazy: no import cycle). */
+async function runNameRepair(contactId, name, tagsBefore) {
+  const [{ repairAfterNamePromotion }, { ghlFetch }, { enrollLpLeadCreation }, { GHL_LOCATION_ID: locationId }] = await Promise.all([
+    import('./placeholder-name-followups.js'),
+    import('../actions/helpers.js'),
+    import('../admin/lp-force-addlead.js'),
+    import('../actions/constants.js'),
+  ]);
+  return repairAfterNamePromotion(contactId, name, {
+    fetchOpportunities: async (id) => (await ghlFetch('GET', `/opportunities/search?location_id=${locationId}&contact_id=${id}`))?.opportunities || [],
+    insertAction: async (row) => {
+      const { error } = await supabase.from('agent_actions').insert(row);
+      if (error) throw new Error(error.message);
+    },
+    readTags: async () => tagsBefore || (await getGHLContact(contactId))?.tags || [],
+    enrollLpLeadCreation,
+  });
+}
+
+/**
+ * Read the contact back after a write that cleared a placeholder surname;
+ * retry once; emit identity.placeholder_clear_failed when it is still there.
+ * Returns true (cleared), false (still there) or null (could not read).
+ */
+export async function verifySurnameCleared(contactId, payload, { updateFields, readContact, emit, trigger = 'agentic' }) {
+  const stillThere = async () => {
+    try {
+      const c = await readContact(contactId);
+      return c ? isPlaceholderSurname(c.lastName) : null;
+    } catch { return null; }
+  };
+  let left = await stillThere();
+  if (left === true) {
+    console.warn(`[IdentityExtraction] ${contactId} still has a "Visitor …" surname after the write — retrying once`);
+    await updateFields(contactId, { lastName: null }, { clear: ['lastName'] }).catch(() => false);
+    left = await stillThere();
+  }
+  if (left === true) {
+    try {
+      await emit({
+        event_type: 'identity.placeholder_clear_failed', source: 'lp_mcp', entity_type: 'contact', entity_id: contactId,
+        ghl_contact_id: contactId, payload: { trigger, first_name: payload.firstName || null }, priority: 'normal',
+        idempotency_key: `placeholder-clear-failed:${contactId}`, bypass_filter: true,
+      });
+    } catch { /* best-effort */ }
+    return false;
+  }
+  return left === false ? true : null;
 }
 
 /**

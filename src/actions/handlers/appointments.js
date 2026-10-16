@@ -101,7 +101,7 @@ import { fetchCurrentLead } from '../../current-lead.js';
 import { markRescheduleInflight } from '../../services/reschedule-inflight.js';
 import { executeCreateTask } from './tasks.js';
 import { getContactCached } from '../contact-cache.js';
-import { isPlaceholderName, EMAIL_ASKED_TAG } from '../../services/identity-extraction.js';
+import { isPlaceholderName, cleanDisplayName, EMAIL_ASKED_TAG } from '../../services/identity-extraction.js';
 import { emitEvent } from '../../event-emitter.js';
 import { etAppointmentParts, wallClockToIso } from '../../appointment-dates.js';
 import { normalizeTimezone } from '../../config/market-timezones.js';
@@ -211,6 +211,28 @@ function readContactCustomField(contact, fieldId) {
  * primary control and a transient GHL error must not strand a legit
  * booking the bot already promised.
  */
+/** The Reece Team user every non-rehash bot booking is assigned to (env BOT_BOOKING_USER_ID). */
+export function botBookingUserId(env = process.env) {
+  return String(env.BOT_BOOKING_USER_ID || '').trim() || '3K6HtoPyBLWeQrrnSnCD';
+}
+
+/** A booking the bot made: the live chat, or an SMS reply's companion. Pure. */
+export function isBotBooking(payload) {
+  return payload?.source === 'live_chat' || payload?.source === 'sms_bot';
+}
+
+/** GHL refused the booking because of the assignee, not the slot. Pure. */
+export function isAssigneeRefusal(err) {
+  const m = String(err?.message || '');
+  return /\b(?:assigned\s*user|assignedUserId|user\s+(?:is\s+)?not\s+(?:part|a\s+member)|team\s+member)\b/i.test(m) && !/slot/i.test(m);
+}
+
+/** The real name the bot captured in this chat, from the booking payload, or ''. */
+export function chatNameFor(payload) {
+  const n = cleanDisplayName(String(payload?.contact_name || '').trim());
+  return n && !isPlaceholderName(n) ? n : '';
+}
+
 export async function evaluateInHomePrerequisites(contactId, payload, context) {
   let contact;
   try {
@@ -223,7 +245,13 @@ export async function evaluateInHomePrerequisites(contactId, payload, context) {
   const missing = [];
   const fullName = [contact.firstName, contact.lastName].filter(Boolean).join(' ')
     || contact.contactName || contact.name || '';
-  if (isPlaceholderName(fullName) || isPlaceholderName(contact.firstName ?? fullName)) missing.push('real_name');
+  // 2026-10-16 (Melissa): "Visitor xxxx" parts do not count as a name; a real
+  // name the visitor gave in this chat (payload.contact_name) does when the
+  // record is still the widget's.
+  const realName = cleanDisplayName(contact.firstName, contact.lastName)
+    || (contact.firstName || contact.lastName ? '' : cleanDisplayName(fullName))
+    || chatNameFor(payload);
+  if (!realName || isPlaceholderName(realName)) missing.push('real_name');
   if (!contact.phone) missing.push('phone');
   // Street + zip are the hard components (zip proves service area);
   // city/state derive from the zip and never block.
@@ -291,8 +319,9 @@ async function persistQualifyingData(contactId, qualifyingData) {
 // booking lands, as its OWN message (never bundled with the confirmation or a
 // slot offer; that dual-question was Defect 4). Kept deliberately short and
 // self-contained so it reads as a standalone follow-up.
-const POST_BOOKING_EMAIL_ASK_MESSAGE =
-  "One more thing — what's the best email to send your confirmation and appointment details to?";
+// 2026-10-16: no em dash in a bot line (the human-voice rule, 2026-10-06).
+export const POST_BOOKING_EMAIL_ASK_MESSAGE =
+  "One more thing: what's the best email to send your confirmation and appointment details to?";
 
 // 2026-08-13 — tag guard for the deferred confirmation. Stamped on enqueue so a
 // handler re-run or a reaper requeue can never text the lead two confirmations
@@ -307,6 +336,11 @@ const DEFERRED_CONFIRM_TAG = 'booking:confirm-queued';
  * (MIN_AGENTIC_SEND_GAP_SEC), so it lands AFTER the confirmation send. Best-
  * effort — never fails the booking.
  */
+/** The channel a booking's email ask goes on: where the booking came from. Pure. */
+export function postBookingAskChannel(action) {
+  return action?.action_payload?.source === 'live_chat' ? 'livechat' : 'sms';
+}
+
 async function enqueuePostBookingEmailAsk(contactId, action, context) {
   try {
     const contact = await getContactCached(contactId, context?._contactCache);
@@ -314,6 +348,16 @@ async function enqueuePostBookingEmailAsk(contactId, action, context) {
     const tags = Array.isArray(contact?.tags) ? contact.tags.map((t) => String(t).toLowerCase()) : [];
     if (email) return { queued: false, reason: 'email_on_file' };
     if (tags.includes(EMAIL_ASKED_TAG)) return { queued: false, reason: 'already_asked' };
+
+    // 2026-10-16 (Melissa): a visit booked in the website chat is asked in the
+    // chat, by the live chat's own send (the send pipeline never answers in the
+    // chat, reply-sender.js). SMS stays for an SMS booking.
+    if (postBookingAskChannel(action) === 'livechat') {
+      const { scheduleChatEmailAsk } = await import('../../live-chat/index.js');
+      scheduleChatEmailAsk(contactId, POST_BOOKING_EMAIL_ASK_MESSAGE);
+      await applyGHLTag(contactId, EMAIL_ASKED_TAG).catch(() => {});
+      return { queued: true, channel: 'livechat' };
+    }
 
     const { error } = await supabase.from('agent_actions').insert({
       event_id: action?.event_id || null,
@@ -919,7 +963,9 @@ export async function executeBookAppointment(action, context) {
   // customer-visible artifact. No name on the record → calendar name alone.
   try {
     const titleContact = await getContactCached(contactId, context?._contactCache, { maxWaitMs: BOOKING_TOKEN_WAIT_MS });
-    const ghlName = [titleContact?.firstName, titleContact?.lastName].filter(Boolean).join(' ').trim();
+    // 2026-10-16 (Melissa): never a "Visitor xxxx" token in a title; when the
+    // record is still the widget's, the name the visitor gave in this chat.
+    const ghlName = cleanDisplayName(titleContact?.firstName, titleContact?.lastName) || chatNameFor(payload);
     const calName = payload.calendar_name
       || Object.keys(CALENDAR_MAP).find((n) => CALENDAR_MAP[n] === calendarId)
       || 'Appointment';
@@ -942,6 +988,11 @@ export async function executeBookAppointment(action, context) {
     const team = rehashTeamUserIds();
     const assignee = callAssigneeFor({ isRehashCalendar: true, explicit: payload.assigned_user_id, contactRep: rehashRepFor(contact, team), contactOwner: contact?.assignedTo || null, team });
     if (assignee) body.assignedUserId = assignee;
+  } else if (!body.assignedUserId && isBotBooking(payload)) {
+    // 2026-10-16 (the user, Melissa trace): a visit the bot books belongs to
+    // the Reece Team user, not whoever GHL's round robin picks
+    // (ySw0WWLr4966zkLSO501 got hers). Rehash calls keep their rep above.
+    body.assignedUserId = botBookingUserId();
   }
 
   // Title + address. No-op unless APPT_FORMAT_ENABLED, and fails open.
@@ -949,7 +1000,19 @@ export async function executeBookAppointment(action, context) {
 
   let result;
   try {
-    result = await ghlFetch('POST', '/calendars/events/appointments', body, { maxWaitMs: BOOKING_TOKEN_WAIT_MS });
+    try {
+      result = await ghlFetch('POST', '/calendars/events/appointments', body, { maxWaitMs: BOOKING_TOKEN_WAIT_MS });
+    } catch (assignErr) {
+      // The bot's owner is not on this calendar's team: book without it rather
+      // than lose the visit over who owns it (one retry, logged).
+      if (body.assignedUserId && body.assignedUserId === botBookingUserId() && isAssigneeRefusal(assignErr)) {
+        console.warn(`[ActionExecutor] bot_assignee_refused ${contactId} on ${calendarId}: ${assignErr.message} — booking without an assignee`);
+        delete body.assignedUserId;
+        result = await ghlFetch('POST', '/calendars/events/appointments', body, { maxWaitMs: BOOKING_TOKEN_WAIT_MS });
+      } else {
+        throw assignErr;
+      }
+    }
   } catch (err) {
     // Release so the executor's retry can re-attempt this slot.
     if (claimed) await releaseAppointmentCreate(contactId, slotMs).catch(() => {});

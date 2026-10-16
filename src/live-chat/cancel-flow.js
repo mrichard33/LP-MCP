@@ -378,25 +378,63 @@ export function pickSlot(text, offered) {
   if ((ordinalFirst || ordinalSecond) && list.length < 2) return null;
   if (ordinalFirst) return list[0];
   if (ordinalSecond) return list[1] || null;
-  // "tomorrow" / "today" pick the offered time labelled so (2026-10-02 offers
-  // read "tomorrow at 10:00 AM ET or Mon, Oct 5 at 6:00 PM ET").
-  const rel = list.filter((slot) => slot.rel && new RegExp(`\\b${slot.rel}\\b`).test(s));
-  if (rel.length === 1) return rel[0];
-  const hits = list.filter((slot) => {
+  // 2026-10-16 (Melissa, 6U6uceZGMQRz8XEQc9Lk): with Sun 10 AM and Sun 2 PM
+  // offered, "sunday at 2", "Sunday at 2pm oct 18" and "Sun, Oct 18 at 2:00 PM
+  // ET?" all came back null four times: the old test ORed weekday / date /
+  // hour, so the weekday matched BOTH Sunday slots, and a bare "at 2" was never
+  // a time. Now each thing the message names (the day, the time) must match:
+  // the slots that answer to every named part are kept, and one left is the
+  // pick. "tomorrow" / "today" are a day like any other (an early return on
+  // them once picked tomorrow 10 AM for "tomorrow at 6").
+  const minutes = mentionedMinutes(s);
+  const dayHit = (slot) => {
     const dow = String(slot.dayOfWeek || '').toLowerCase();
     const [, mon, day] = String(slot.day || '').toLowerCase().match(/(\w{3})\s+(\d{1,2})$/) || [];
-    const hour = String(slot.time || '').toLowerCase().match(/^(\d{1,2})(?::(\d{2}))?\s*([ap])m/);
-    return (dow && s.includes(dow))
+    return !!((slot.rel && new RegExp(`\\b${slot.rel}\\b`).test(s))
+      || (dow && s.includes(dow))
       || (dow && s.includes(dow.slice(0, 3)) && /\b(?:mon|tue|wed|thu|fri|sat|sun)\b/.test(s))
       // 2026-10-15 (Guest Visitor pkjiz): "October 24th" missed — the ordinal
       // suffix broke the word boundary after the day number.
       || (mon && day && new RegExp(`\\b${mon}\\w*\\.?\\s+(?:the\\s+)?${day}(?:st|nd|rd|th)?\\b`).test(s))
-      || (day && slotDateMentioned(s, slot, day))
-      || (hour && new RegExp(`\\b${hour[1]}(?::${hour[2] || '00'})?\\s*${hour[3]}\\.?m?\\b|\\b${hour[1]}\\s*o'?clock\\b`).test(s));
-  });
+      || (day && slotDateMentioned(s, slot, day)));
+  };
+  const hourHit = (slot) => {
+    const hour = String(slot.time || '').toLowerCase().match(/^(\d{1,2})(?::(\d{2}))?\s*([ap])m/);
+    return !!((hour && new RegExp(`\\b${hour[1]}(?::${hour[2] || '00'})?\\s*${hour[3]}\\.?m?\\b`).test(s))
+      || minutes.has(clockOf(slot.time)));
+  };
+  const namesDay = list.some(dayHit);
+  const namesHour = minutes.size > 0 || list.some(hourHit);
+  if (!namesDay && !namesHour) return null;
+  const hits = list.filter((slot) => (!namesDay || dayHit(slot)) && (!namesHour || hourHit(slot)));
   if (hits.length === 1) return hits[0];
-  // Two offers on the same calendar date and they named only the date: no pick.
+  // Two offers on the same calendar date and they named only the date, or a
+  // time none of the offers has: no pick.
   return null;
+}
+
+/**
+ * The clock times a lead's message names, as minutes after midnight. Explicit
+ * ones ("2 PM", "2:00 pm") come from clockMentions; a bare hour after "at", a
+ * weekday or "o'clock" ("sunday at 2", "Sunday 2", "2 o'clock") is read the
+ * way a booking means it: 1-7 PM, 8-11 AM, 12 noon (2026-10-16, Melissa).
+ * Pure.
+ */
+export function mentionedMinutes(text) {
+  const s = String(text || '').toLowerCase();
+  const out = new Set(clockMentions(s).map((m) => m.minutes));
+  const bare = (h, m) => {
+    const hour = Number(h);
+    const min = Number(m || 0);
+    if (!(hour >= 1 && hour <= 12) || min > 59) return;
+    const h24 = hour === 12 ? 12 : hour <= 7 ? hour + 12 : hour;
+    out.add(h24 * 60 + min);
+  };
+  const NOT_A_TIME = String.raw`(?![\d/]|\s*(?:st|nd|rd|th|[ap]\.?\s?m\b|%|windows?\b|doors?\b|sliders?\b|panels?\b|people\b|of\b|or\s+\d))`;
+  for (const m of s.matchAll(new RegExp(String.raw`\b(?:at|@)\s*(\d{1,2})(?::(\d{2}))?` + NOT_A_TIME, 'g'))) bare(m[1], m[2]);
+  for (const m of s.matchAll(new RegExp(String.raw`\b(?:sun|mon|tue|tues|wed|thu|thur|thurs|fri|sat)(?:day|nesday|rsday|urday|sday)?,?\s+(\d{1,2})(?::(\d{2}))?` + NOT_A_TIME, 'g'))) bare(m[1], m[2]);
+  for (const m of s.matchAll(/\b(\d{1,2})\s*o'?clock\b/g)) bare(m[1]);
+  return out;
 }
 
 export function movedLine(slot, tzLabelText = 'ET') {

@@ -362,7 +362,7 @@ const GHL_STANDARD_FIELD_ALLOWLIST = new Set([
  * Returns true on success, 'not_found' when the contact is gone, false
  * on any other failure (mirrors updateGHLContactFields semantics).
  */
-export async function updateGHLContactStandardFields(ghlContactId, fields) {
+export async function updateGHLContactStandardFields(ghlContactId, fields, { clear = [] } = {}) {
   if (ghlDisabled || !ghlClient || !ghlContactId) return false;
   if (!fields || typeof fields !== 'object') return false;
 
@@ -374,6 +374,9 @@ export async function updateGHLContactStandardFields(ghlContactId, fields) {
       }
       continue;
     }
+    // 2026-10-16 (Melissa): GHL ignores an empty string, so a field is
+    // cleared only by an explicit null, and only for a key the caller names.
+    if (value === null && clear.includes(key)) { body[key] = null; continue; }
     if (value === undefined || value === null) continue;
     body[key] = value;
   }

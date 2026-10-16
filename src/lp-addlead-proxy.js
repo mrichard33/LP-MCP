@@ -64,6 +64,9 @@ import { fetchAndBuildAgenticNotes, isWeakNotes } from './services/agentic-lead-
 import { fetchAndBuildRepBrief, repBriefMode, REP_BRIEF_TOTAL_MS } from './services/rep-brief-io.js';
 import { replaceableNotes } from './services/rep-brief.js';
 import { applyAddressGate } from './services/lp-address-gate.js';
+import { cleanAddleadName } from './services/addlead-name.js';
+import { getGHLContact, applyGHLTag } from './ghl.js';
+import { NAME_PLACEHOLDER_TAG } from './services/identity-extraction.js';
 import { LP_SRS, LP_PRO } from './lp-source-ids.js';
 import {
   BUSINESS_HOUR_START_ET,
@@ -403,6 +406,27 @@ export function registerLpAddleadProxyRoutes(app) {
         console.error(`[LP-PROXY] validation threw — forwarding untouched: ${err.message}`);
         outbound = dropControlKeys(body);
         plan = { action: 'forward', reason: `validation_error:${err.message}`, hour: null };
+      }
+    }
+
+    // ── The name (2026-10-16, Melissa) ──────────────────────────────────
+    // No LP lead while the name is still the chat widget's placeholder; a
+    // "Visitor xxxx" surname never reaches LP; a real name saved on the contact
+    // since the workflow read it is used (services/addlead-name.js). A held
+    // lead is re-sent when the name lands (placeholder-name-followups.js).
+    if (mode !== 'passthrough') {
+      try {
+        const nm = await cleanAddleadName(outbound, { getContact: getGHLContact });
+        if (nm.action === 'hold') {
+          if (body.lognumber) await applyGHLTag(String(body.lognumber), NAME_PLACEHOLDER_TAG).catch(() => {});
+          console.log(`[LP-PROXY] ${body.sender || '?'} log=${body.lognumber || '?'} name=HELD (placeholder "${[body.firstname, body.lastname].filter(Boolean).join(' ')}") ${Date.now() - started}ms`);
+          res.status(200).type('application/json').send(JSON.stringify({ status: 'HELD', message: 'name hold: the contact still has the chat placeholder name' }));
+          return;
+        }
+        if (nm.notes.length) console.log(`[LP-PROXY] name ${nm.notes.join(',')} log=${body.lognumber || '?'}`);
+        outbound = nm.body;
+      } catch (err) {
+        console.error(`[LP-PROXY] name stage threw — forwarding untouched: ${err.message}`);
       }
     }
 

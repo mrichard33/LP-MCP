@@ -120,7 +120,8 @@ test('the placeholder surname is cleared when only a first name is found', async
   const r = await recoverPlaceholderName('c2', { firstName: 'guest', lastName: 'visitor kjyzo' },
     { transcript: 'this is Donna' }, deps);
   assert.equal(r.found, true);
-  assert.equal(calls.updates[0].lastName, '');
+  // null, not '': GHL ignores an empty string (Melissa, 2026-10-16).
+  assert.equal(calls.updates[0].lastName, null);
 });
 test('address found in the chat fills an empty contact address, never overwrites one', async () => {
   const withAddr = identity('Victor', 'Lopez', {
@@ -298,7 +299,7 @@ test('a possessive is not a surname; the first name survives (sgt5AGF0AVTBaMNr7L
   const { deps, calls } = fakeDeps({ extracted: identity('Jason', "TINA's") });
   const r = await recoverPlaceholderName('j1', { firstName: 'guest' }, { transcript: t }, deps);
   assert.equal(r.found, true);
-  assert.deepEqual(calls.updates[0], { firstName: 'Jason', lastName: '' });
+  assert.deepEqual(calls.updates[0], { firstName: 'Jason', lastName: null });
 });
 test('names the dry run got right still pass', () => {
   let turns = buildRecoveryCorpus('I received a message that my windows are ready. / Carmen Díaz, my phone number is 407-719-4432.', []);

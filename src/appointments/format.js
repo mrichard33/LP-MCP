@@ -37,7 +37,7 @@
  * on all six statuses and runs 16 webhooks. Separate ticket.
  */
 
-import { isPlaceholderName } from '../services/identity-extraction.js';
+import { isPlaceholderName, cleanDisplayName } from '../services/identity-extraction.js';
 
 /**
  * Calendar ID → the name to put in an appointment title.
@@ -107,10 +107,9 @@ export function calendarTitleName(calendarId, fallbackName) {
 export function buildAppointmentTitle({ firstName, lastName, calendarId, calendarName }) {
   const calName = calendarTitleName(calendarId, calendarName);
 
-  const parts = [firstName, lastName]
-    .map((p) => String(p || '').trim())
-    .filter(Boolean);
-  const fullName = parts.join(' ');
+  // 2026-10-16 (Melissa): placeholder parts out ("Melissa Visitor Anlxy" →
+  // "Melissa"), so no title carries a "Visitor xxxx" token.
+  const fullName = cleanDisplayName(firstName, lastName);
 
   const usableName = fullName && !isPlaceholderName(fullName) ? fullName : '';
 

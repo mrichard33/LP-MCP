@@ -153,6 +153,8 @@
 import supabase from '../../supabase.js';
 import { setAppointment as lpSetAppointment, getLeadByLdsId, getCircuitStatus } from '../../lp-client.js';
 import { refusedAppointmentAnswer } from '../../lp-appointment-guards.js';
+import { stampSetterOnce } from '../../lp-setter-stamp.js';
+import { emitEvent } from '../../event-emitter.js';
 import { postDemoLock } from '../../lp-post-demo-lock.js';
 import { postIssueGate } from '../../lp-post-issue-rebook.js';
 import { extractArray, getField } from '../../sync-utils.js';
@@ -337,13 +339,32 @@ export function isSameDayLpTimeElapsed(parsed, now = new Date()) {
  * so both live-read call sites unwrap LP's nested prospect→leads envelope
  * identically.
  */
-function findLeadInLpResponse(resp, ldsId) {
+export function findLeadInLpResponse(resp, ldsId) {
   for (const prospect of extractArray(resp)) {
     const leads = getField(prospect, 'leads', 'Leads') || [];
     const match = leads.find((l) => String(getField(l, 'id', 'lds_id', 'LeadID')) === String(ldsId));
     if (match) return match;
   }
   return null;
+}
+
+/** Production deps for the one-time setter stamp (src/lp-setter-stamp.js). */
+function setterStampDeps() {
+  return {
+    claim: async (key) => {
+      const row = await emitEvent({
+        event_type: 'lp.setter_stamp_attempt', source: 'lp_mcp', entity_type: 'lp_lead', entity_id: key,
+        payload: { key }, priority: 'low', bypass_filter: true, idempotency_key: key,
+      });
+      return !!row && !row.filtered;
+    },
+    setAppointment: (args) => lpSetAppointment(args),
+    readSetter: async (ldsId) => {
+      const lead = findLeadInLpResponse(await getLeadByLdsId(ldsId, { fast: true }), ldsId);
+      return lead ? (getField(lead, 'setbyname', 'SetByName') ?? '') : null;
+    },
+    emit: (event) => emitEvent(event),
+  };
 }
 
 export async function executeSetLPAppointment(action, context = {}) {
@@ -594,6 +615,13 @@ export async function executeSetLPAppointment(action, context = {}) {
         // idempotent at LP while a timeless booking strands the rep.
         if (verdict === 'already_set') {
           console.log(`[LP-APPT] ⏭️ LIVE: LP already holds ${liveAppt.date} ${liveAppt.time} for lds_id=${lpLeadId} — suppressing duplicate write`);
+          // 2026-10-16 (Melissa, 584060): addlead put this appointment in LP with
+          // no setter. One SetAppointment with set_by 5686, never retried.
+          const setterStamp = await stampSetterOnce({
+            contactId, ldsId: lpLeadId, apptDate, apptTime,
+            setByName: getField(liveLead, 'setbyname', 'SetByName'),
+            disposition: getField(liveLead, 'disposition', 'Disposition'),
+          }, setterStampDeps()).catch(() => null);
           if (!isLPLeadId(contactId)) {
             await addGHLNote(contactId,
               `[LP SYNC v4.5] Appointment already in LP (verified live) — skipped\n` +
@@ -617,6 +645,7 @@ export async function executeSetLPAppointment(action, context = {}) {
             calendar_name: calendarName,
             contact_id: contactId,
             resolution_source: resolutionSource,
+            ...(setterStamp && setterStamp.reason !== 'setter_present' ? { setter_stamp: setterStamp } : {}),
           };
         }
         // ─── Unresolvable conflict (2026-08-01) ───────────────────────
@@ -764,7 +793,7 @@ export async function executeSetLPAppointment(action, context = {}) {
 
   try {
     const { data: existingLead } = await supabase.from('lp_leads')
-      .select('appointment_set, appointment_date, lead_source, lead_source_detail')
+      .select('appointment_set, appointment_date, lead_source, lead_source_detail, set_by_name, disposition_code')
       .eq('lp_lead_id', lpLeadId)
       .maybeSingle();
 
@@ -776,6 +805,11 @@ export async function executeSetLPAppointment(action, context = {}) {
       const lpDateNormalized = normalizeDateForComparison(existingLead.appointment_date);
       if (ghlDateNormalized && lpDateNormalized && ghlDateNormalized === lpDateNormalized) {
         console.log(`[LP-APPT] ⏭️ LP already has appointment on ${lpDateNormalized} for lds_id=${lpLeadId}`);
+        // 2026-10-16: the same one-time setter stamp as the live path, from the mirror row.
+        await stampSetterOnce({
+          contactId, ldsId: lpLeadId, apptDate, apptTime,
+          setByName: existingLead.set_by_name, disposition: existingLead.disposition_code,
+        }, setterStampDeps()).catch(() => null);
         if (!isLPLeadId(contactId)) {
           await addGHLNote(contactId,
             `[LP SYNC v4.4] Appointment already exists in LP — skipped\n` +

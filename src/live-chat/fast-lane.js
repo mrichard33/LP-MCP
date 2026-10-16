@@ -81,6 +81,7 @@ import { COLLECT_ASK, COLLECT_ASK_AGAIN, dmAsk, holdLine, missingItems, parseDec
 import { enforceBookingFacts, bookingFactsNote } from '../agentic/sms-booking-turn.js';
 import { contactRecheckLine } from '../agentic/contact-check.js';
 import { chatIdentity } from './identity-capture.js';
+import { isPlaceholderName } from '../services/identity-extraction.js';
 import {
   loopBreakState,
   spouseAdvocacyState,
@@ -164,7 +165,11 @@ import {
 } from './cancel-flow.js';
 
 export const LIVE_CHAT_RULE = 'LIVE_CHAT_FAST_LANE';
-export const LIVE_CHAT_FALLBACK_MESSAGE = 'Thanks. Let me grab the right person for that, one moment.';
+// 2026-10-16 (Melissa): the old line, "Thanks. Let me grab the right person for
+// that, one moment.", went out on a plain time pick that timed out, with no
+// hand-off behind it. A hand-off plan sends its own line (the backup); this
+// one only holds the turn.
+export const LIVE_CHAT_FALLBACK_MESSAGE = 'Thanks, give me just a moment to check on that.';
 export const LIVE_CHAT_MODES = Object.freeze(['off', 'shadow', 'live']);
 /**
  * The coverage lookup's own cap (Mark's ruling 4, 2026-10-01). It runs beside
@@ -209,6 +214,24 @@ export function liveChatHardTimeoutMs(env = process.env) {
 // should be combined." Each message waits this long (from its arrival) before
 // a reply is written; a newer message in that time takes over and its turn
 // answers all of them (the planner reads every message since our last reply).
+/**
+ * When each step of a live-chat turn finished, in ms from the message landing
+ * (2026-10-16, Melissa: four turns hit the deadline at ~13.6s and nothing said
+ * which step was slow). Rides on execution_result.timing.steps.
+ */
+/** "2486 Caring Way, 14A, Port Charlotte, FL 33952". Pure. */
+export function visitAddressLine(a = {}) {
+  return [a.address_line1, a.address_line2, a.city, [a.state, a.postal_code].filter(Boolean).join(' ')]
+    .map(x => String(x || '').trim()).filter(Boolean).join(', ');
+}
+
+export function markStep(timing, key, nowMs) {
+  if (!timing) return;
+  const t0 = Date.parse(timing.t0_inbound_received || '');
+  if (!Number.isFinite(t0)) return;
+  (timing.steps ||= {})[key] = Math.max(0, nowMs - t0);
+}
+
 export function liveChatQuietMs(env = process.env) {
   const raw = parseInt(env.LIVE_CHAT_QUIET_MS ?? '', 10);
   return Number.isFinite(raw) && raw >= 0 ? raw : 3000;
@@ -836,6 +859,7 @@ export function createLiveChatFastLane(deps) {
     const isSuperseded = () => latestInbound.get(contactId) !== turnSeq;
     const quietLeft = d.quietMs() - (d.now() - tReceived);
     if (quietLeft > 0) await d.sleep(quietLeft);
+    markStep(timing, 'quiet_done', d.now());
     if (isSuperseded()) {
       d.log(`[LiveChat] ${contactId} sent another message within ${d.quietMs()}ms — this one is answered with it`);
       await finishAction(actionId, { status: 'skipped', error_message: 'superseded_by_newer_message', execution_result: { action: 'send_message_skipped', channel: 'livechat', reason: 'superseded_by_newer_message', stage: 'quiet_period', timing: finalizeTiming(timing) } });
@@ -872,6 +896,7 @@ export function createLiveChatFastLane(deps) {
       if (raced.timedOut || raced.error) {
         const reason = raced.timedOut ? 'hard_timeout' : `error: ${String(raced.error.message || raced.error).slice(0, 160)}`;
         if (raced.error) d.warn(`[LiveChat] reply failed for ${contactId}: ${raced.error.message}`);
+        if (raced.timedOut) d.warn(`[LiveChat] ${contactId} hit the ${d.hardTimeoutMs()}ms deadline; steps so far (ms from arrival): ${JSON.stringify(timing.steps || {})}`);
         if (turn.claim('fallback')) {
           // After a cancel or a move the visitor is told, whatever came next (Part 8).
           outcome = await fallback({ contactId, conversationId, mode, actionId, timing, reason, body, rawInbound: rawBody, isSuperseded: backup.mustDeliver ? () => false : isSuperseded, backupReply: backup.reply });
@@ -944,6 +969,7 @@ export function createLiveChatFastLane(deps) {
     ]);
     const upcomingAppointments = (!apptRes.timedOut && !apptRes.error && Array.isArray(apptRes.value)) ? apptRes.value : null;
     let context = (!ctxRes.timedOut && !ctxRes.error && ctxRes.value) ? ctxRes.value : minimalContext({ contactId, contact, nowMs: d.now() });
+    markStep(timing, ctxRes.timedOut ? 'context_timed_out' : 'context_done', d.now());
     if (ctxRes.timedOut) d.log(`[LiveChat] lead context exceeded ${d.contextCapMs()}ms for ${contactId} — continuing with the contact record only`);
     if (ctxRes.error) d.warn(`[LiveChat] lead context failed for ${contactId}: ${ctxRes.error.message} — continuing with the contact record only`);
     // 2026-10-13 (the user): a lead past its demo already meets the
@@ -1179,6 +1205,7 @@ export function createLiveChatFastLane(deps) {
               booking_facts: {
                 kind: nepqOut.facts.kind, label: nepqOut.facts.label, ask: nepqOut.facts.ask, ask_line: nepqOut.facts.ask_line,
                 first_name: nepqOut.firstName || realFirst || null,
+                ...(nepqPlan.side_question ? { side_question: nepqPlan.side_question } : {}),
                 alternatives_text: nepqOut.facts.alternatives.length === 2 ? nepqOut.facts.alternatives.map(x => `${x.day} at ${x.time} ${x.tz || ''}`.trim()).join(' or ') : null,
                 ...(nepqOut.facts.evening ? { evening_request: nepqOut.facts.evening.requested_time, evening_line: eveningReplyLine(nepqOut.facts.evening.requested_time) } : {}),
               },
@@ -1190,6 +1217,7 @@ export function createLiveChatFastLane(deps) {
       }
     }
 
+    markStep(timing, 'plan_done', d.now());
     // The cancel flow or the Spanish hand-off owns this turn (Part 8).
     if (planOverride) nepqPlan = planOverride;
     // The re-check is this turn's job whatever the plan says (Part 7).
@@ -1249,6 +1277,7 @@ export function createLiveChatFastLane(deps) {
       coverageLookup,
       recordZone,
     ]);
+    markStep(timing, 'kb_done', d.now());
     const coverage = resolveCoverage(saPlan, coverageLookups || {});
     if (saPlan.active && coverageOwnsReply({ plan: saPlan, coverage }) && !planOverride) nepqPlan = null;
     // The market the visitor asked about (or is on record in) sets the prompt's
@@ -1413,8 +1442,10 @@ export function createLiveChatFastLane(deps) {
         }))
         .catch(err => d.warn(`[LiveChat] shadow model failed for ${contactId}: ${err.message}`));
     }
+    markStep(timing, 'draft1_start', d.now());
     let gen = await generate(null);
     timing.t4_analysis_done = new Date(d.now()).toISOString();
+    markStep(timing, 'draft1_done', d.now());
     let guard = runGuards(gen.validated.message, gen.live);
     // A second draft only when it can finish inside the deadline (2026-10-02,
     // vnazu): the old fixed "under 5s" rule started a ~5s Haiku redraft at
@@ -1422,6 +1453,7 @@ export function createLiveChatFastLane(deps) {
     if (guard.notes.length && redraftFits({ elapsedMs: d.now() - started, firstDraftMs: d.now() - tGen, budgetMs: d.hardTimeoutMs() })) {
       regenerated = true;
       gen = await generate(guard.notes.join('\n\n'));
+      markStep(timing, 'redraft_done', d.now());
       guard = runGuards(gen.validated.message, gen.live);
     }
     draft = guard.fixed;
@@ -1862,19 +1894,25 @@ export function createLiveChatFastLane(deps) {
       }
       // Save what they typed BEFORE booking: the booking gate reads the
       // contact (address, name, phone) from GHL.
-      try { await d.captureIdentity(contactId, { visitorTexts: allTexts, capture: typed.first_name ? { name: typed.first_name } : {} }); } catch { /* the gate decides */ }
+      // 2026-10-16 (Melissa): the capture is awaited and its zip-filled city and
+      // state (and the unit) ride on the booking's address.
+      let captured = null;
+      try { captured = await d.captureIdentity(contactId, { visitorTexts: allTexts, capture: typed.first_name ? { name: typed.first_name } : {} }); } catch { /* the gate decides */ }
+      const addr = captured?.identity?.address_line1 ? captured.identity : typed;
       const when = `${chosen.day} at ${chosen.time} ${tz}`.trim();
       let res = null;
       try {
         // The visit address rides on the appointment itself (Mark: every
         // booking carries the address), typed here or confirmed on file.
+        // Street, unit, city, state and zip (2026-10-16, Melissa: "2486 Caring
+        // Way, 33952" lost the unit, the city and the state).
         const address = typedAddress
-          ? [typed.address_line1, typed.city, [typed.state, typed.postal_code || contact?.postalCode].filter(Boolean).join(' ')].filter(Boolean).join(', ')
+          ? visitAddressLine({ address_line1: addr.address_line1, address_line2: addr.address_line2, city: addr.city, state: addr.state, postal_code: addr.postal_code || typed.postal_code || contact?.postalCode })
           : [contact?.address1, contact?.city, [contact?.state, contact?.postalCode].filter(Boolean).join(' ')].filter(Boolean).join(', ');
         if (typedAddress && contact?.address1 && !String(contact.address1).toLowerCase().includes(String(typed.address_line1).toLowerCase().split(' ').slice(0, 2).join(' '))) {
           d.warn(`[LiveChat] ${contactId} gave a visit address that differs from the contact's (${contact.address1}); the appointment carries the new one`);
         }
-        res = await d.bookSlot({ contactId, startIso: chosen.iso, calendarId: slots.calendarId || null, decisionMakers, address: address || null, ...(slots.marketCode !== undefined ? { marketCode: slots.marketCode } : {}) });
+        res = await d.bookSlot({ contactId, startIso: chosen.iso, calendarId: slots.calendarId || null, decisionMakers, address: address || null, contactName: name && !isPlaceholderName(name) ? name : null, ...(slots.marketCode !== undefined ? { marketCode: slots.marketCode } : {}) });
       } catch (err) {
         res = { ok: false, error: err.message };
       }
@@ -2164,6 +2202,7 @@ export function createLiveChatFastLane(deps) {
       analyze_ms: diff('t3_action_claimed', 't4_analysis_done'),
       generate_ms: diff('t3_action_claimed', 't5_generation_done'),
       send_ms: diff('t5_generation_done', 't6_ghl_sent'),
+      steps: t.steps ? { ...t.steps } : null,
       source_event_type: 'live_chat_webhook',
     };
   }
