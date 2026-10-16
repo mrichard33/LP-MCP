@@ -7,7 +7,7 @@ import assert from 'node:assert/strict';
 import { Webhook } from 'svix';
 import { fakeSupabase } from './lib/fake-supabase.js';
 import { processRecording, queueDemoNote } from '../src/siro/ingest.js';
-import { makeSiroWebhookHandler, readyToAct, registerSiroWebhookRoutes, headerKeyMatches } from '../src/siro/webhook.js';
+import { makeSiroWebhookHandler, readyToAct, registerSiroWebhookRoutes, headerKeyMatches, signatureHeaderNames } from '../src/siro/webhook.js';
 import { runSiroRecordingSync, WATERMARK_KEY } from '../src/jobs/siro-recording-sync.js';
 import { RAW_RECORDING } from './fixtures/siro-recording.js';
 
@@ -183,4 +183,19 @@ test('the route mounts on POST /webhook/siro and logs its mode', () => {
   } finally { console.log = orig; }
   assert.deepEqual(routes, ['/webhook/siro']);
   assert.ok(logs.includes('[Siro] webhook route mounted mode=live'));
+});
+
+test('the Standard Webhooks header names (webhook-id / -timestamp / -signature) verify too', async () => {
+  const body = JSON.stringify({ recordingId: 'rec_abc123', recordingProcessed: true, recordingLinked: false, eventType: 'integrations.recordingProcessed' });
+  const s = signed(SECRET, body, 'msg_std');
+  const std = { 'webhook-id': s['svix-id'], 'webhook-timestamp': s['svix-timestamp'], 'webhook-signature': s['svix-signature'], 'x-reece-webhook-key': KEY };
+  const db = fakeSupabase({});
+  const res = fakeRes();
+  await makeSiroWebhookHandler({ env: ENV, deps: { supabase: db, log: quiet, trackBackground: () => {} } })({ body: Buffer.from(body), headers: std }, res);
+  assert.equal(res.code, 200);
+  assert.equal(db.tables.siro_webhook_events[0].svix_id, 'msg_std');
+  const bad = fakeRes();
+  await makeSiroWebhookHandler({ env: ENV, deps: { supabase: db, log: quiet } })({ body: Buffer.from(body), headers: { ...std, 'webhook-signature': 'v1,bad' } }, bad);
+  assert.equal(bad.code, 401);
+  assert.deepEqual(signatureHeaderNames({ 'webhook-id': 'x', 'content-type': 'y', 'svix-signature': 'z' }), ['svix-signature', 'webhook-id']);
 });
