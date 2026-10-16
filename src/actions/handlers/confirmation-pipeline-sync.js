@@ -166,6 +166,7 @@ async function runOne({ contactId, lpLeadId, lpChangedAt, timeBased, lead, sourc
         .eq('lp_lead_id', String(cardRow.lp_lead_id)).is('lp_deleted_at', null).maybeSingle();
       const cardAppt = readAppointment(cardLead?.appointment_date);
       if (cardLead && cardAppt && !appointmentPassed(cardAppt, deps.now(), readConfig(deps.env))) {
+        // lead-id-ok: an internal pipeline-log note (the row's `note`), never Slack text
         notes.push(`newest lead ${lead.lp_lead_id} has no appointment; card stays on lead ${cardLead.lp_lead_id}`);
         lead = cardLead;
       }
@@ -173,6 +174,7 @@ async function runOne({ contactId, lpLeadId, lpChangedAt, timeBased, lead, sourc
   }
   const leadId = String(lead.lp_lead_id);
   const disposition = String(lead.disposition_code || '');
+  // lead-id-ok: an internal pipeline-log note (the row's `note`), never Slack text
   if (lpLeadId && String(lpLeadId) !== leadId) notes.push(`event lead ${lpLeadId} is not the newest (${leadId})`);
 
   if (isCanvassLead(lead)) {
@@ -301,6 +303,7 @@ async function runOne({ contactId, lpLeadId, lpChangedAt, timeBased, lead, sourc
     }
   }
 
+  // lead-id-ok: an internal pipeline-log note (the row's `note`), never Slack text
   if (rebind && row) notes.push(`rebind from lead ${row.lp_lead_id}`);
   if (decision.reschedule) notes.push('reschedule');
   if (rename) notes.push(`rename → ${expectedName}`);
