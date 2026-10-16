@@ -177,6 +177,11 @@ const ALLOWED_EVENT_TYPES = new Set([
                                    // system_events_filtered and GHL keeps holding
                                    // the stale slot — the exact defect this
                                    // event exists to fix.
+  'lp.appointment_confirmed',      // 2026-10-16 (Roberta Ritchie) — rule
+                                   // LP_APPT_GHL_SYNC_CONFIRMED: LP's confirmed
+                                   // checkbox flipped on a Set lead. Same
+                                   // plumbing as the reschedule above: without
+                                   // this entry GHL stays `new`.
 
   // ── APPOINTMENT PARITY WATCHDOG (2026-09-14) ──
   // All three emitted by src/jobs/appointment-parity-watchdog.js. No consuming

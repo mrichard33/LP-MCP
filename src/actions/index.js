@@ -68,12 +68,14 @@
  *     layer3_dispatch, emit_event, check_eligibility, check_throttle,
  *     compute_risk_score, calculate_time_lapse_tier, classify_bucket,
  *     reanalyze_reply
- *   State machines (9):
+ *   State machines (10):
  *     compute_rescission_dispatch, transition_objection_state,
  *     resolve_objection_state, classify_lead_state, end_agentic_handoff,
  *     dq_hard_stop (2026-10-07),
  *     disqualified_cleanup (2026-10-16 — ND / No Demo end state;
  *       src/actions/handlers/disqualified-cleanup.js),
+ *     close_past_lp_appointment (2026-10-16 — the GHL estimate after the visit;
+ *       src/actions/handlers/post-appointment-close.js),
  *     release_rehash_owner (2026-10-09 — the rehash stage ended; the rehash
  *       rep stops owning the contact; src/actions/handlers/rehash-owner.js)
  *     s52_cancel_recheck (2026-10-02 — the one 30-minute re-check of a cancel
@@ -306,7 +308,9 @@ import { isDqTriggerTag, scheduleDqHardStop, executeDqHardStop, LP_NOTE_DQ_TRIGG
 import { resolveWorkflowIdByCanonicalCode } from '../tools/admin/hl-fallback.js';
 import { ghlFetch } from './helpers.js';
 import { executeDisqualifiedCleanup } from './handlers/disqualified-cleanup.js';
-import { fetchUpcomingAppointments } from '../knowledge/contact-appointments.js';
+import { executeClosePastLpAppointment } from './handlers/post-appointment-close.js';
+import { readLiveLpAppointment } from '../services/lp-live-appointment.js';
+import { fetchUpcomingAppointments, fetchRecentAndUpcomingAppointments } from '../knowledge/contact-appointments.js';
 
 // MVI v2.5 — fetch the source event for a given action. The shared
 // getEventContext returns ONLY the spread payload (no event_id /
@@ -649,6 +653,19 @@ function disqualifiedCleanupDeps() {
   };
 }
 
+// 2026-10-16 (Roberta Ritchie): close a GHL estimate once LP says what happened
+// at the visit (src/appointments/post-appointment-close.js).
+function postAppointmentCloseDeps() {
+  return {
+    supabase,
+    fetchRecentAndUpcomingAppointments,
+    readLive: (lead) => readLiveLpAppointment(lead.lp_lead_id),
+    putAppointment: (id, body) => ghlFetch('PUT', `/calendars/events/appointments/${id}`, body),
+    queueAction: async (row) => { const { error } = await supabase.from('agent_actions').insert(row); if (error) throw new Error(error.message); },
+    emitEvent,
+  };
+}
+
 function dqHardStopDeps() {
   return {
     supabase,
@@ -733,6 +750,7 @@ export const ACTION_HANDLERS = {
   end_agentic_handoff: (action) => endAgenticHandoff(action.target_id), // 2026-06-16 — silent agentic-active teardown on terminal closeout
   dq_hard_stop: (action, context) => executeDqHardStop(action, context, dqHardStopDeps()), // 2026-10-07 — stop-bot + leave workflows after a DQ
   disqualified_cleanup: (action, context) => executeDisqualifiedCleanup(action, context, disqualifiedCleanupDeps()), // 2026-10-16 — ND / No Demo end state (handoff v3.4 Fix 2)
+  close_past_lp_appointment: (action, context) => executeClosePastLpAppointment(action, context, postAppointmentCloseDeps()), // 2026-10-16 — GHL estimate showed / noshow / cancelled once LP says so (Roberta Ritchie)
   // 2026-07-21 Phase C — Five9 gated writes. Ships dark (FIVE9_WRITES_ENABLED
   // unset → every one of these skips). Must be queued requires_approval=true.
   five9_start_campaign: executeFive9Write,

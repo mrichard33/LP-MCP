@@ -30,15 +30,20 @@
  *
  * CXL is deliberately absent — rule 271 owns cancels, and emitting a
  * reschedule for a cancelled lead would race it. Everything past the
- * appointment (Issue, Sold, ...) is likewise out: a date move there is
+ * appointment (OPPFDN, Sale, ...) is likewise out: a date move there is
  * history, not a slot GHL is still holding.
  */
 //
 // 2026-10-16 (Mark): Verif is a hold ("there is an issue with the lead") and
-// moves nothing, so a Verif date move is not propagated. Cnf stays; Issue is a
-// live appointment now but stays out here — a post-issue date move is LP's
-// post-issue gate's business, not a reschedule echo.
-export const RESCHEDULE_ELIGIBLE_DISPOSITIONS = new Set(['Set', 'Cnf']);
+// moves nothing, so a Verif date move is not propagated. Cnf stays.
+//
+// 2026-10-16 (later, Roberta Ritchie 583833): Issue is IN. It is a live,
+// confirmed visit (handoff v3.4), and this event only MIRRORS LP into GHL
+// (reconciler kind 'confirm' → reschedule_confirm in place). The post-issue gate
+// (src/lp-post-issue-rebook.js) governs LP writes, which this path never makes.
+// Leaving Issue out kept a rep's move of an issued visit out of GHL for good:
+// LP is the authority on the time, issued or not.
+export const RESCHEDULE_ELIGIBLE_DISPOSITIONS = new Set(['Set', 'Cnf', 'Issue']);
 
 /** Epoch ms for a stored/derived appointment timestamp, or null. */
 function toMs(value) {
@@ -141,5 +146,65 @@ export function buildRescheduleEvent({
     // disposition-driven appointment sync runs in ('high' for Set/Cnf).
     priority,
     idempotency_key: `appt_resched_${lpLeadId}_${keyPart(previousAppointmentDate)}_${keyPart(appointmentDate)}`,
+  };
+}
+
+/**
+ * Should this lead emit lp.appointment_confirmed on this sync pass?
+ *
+ * WHY (Roberta Ritchie 583833, 2026-10-16; the user's ruling). LP's "confirmed"
+ * checkbox flipping true on a Set lead changes nothing about the disposition,
+ * so no event fired and GHL stayed `new` while LP said confirmed. The reconciler
+ * now reads the checkbox (lpConfirmedFlag); this is the event that runs it.
+ *
+ * Only Set: Cnf / Issue already confirm by code, and their own disposition
+ * event (or a reschedule) drives the sync. A disposition change in the same
+ * pass already emits lp.disposition_changed, which reads the checkbox too, so it
+ * stays quiet then rather than double-driving the reconciler.
+ *
+ * @returns {{ emit: boolean, reason: string }}
+ */
+export function shouldEmitConfirmed({ previousConfirmed, confirmed, dispositionCode, dispositionChanged = false } = {}) {
+  const code = (dispositionCode == null ? '' : String(dispositionCode)).trim();
+  if (code !== 'Set') return { emit: false, reason: 'not_set' };
+  if (dispositionChanged) return { emit: false, reason: 'disposition_event_covers_it' };
+  if (confirmed !== true) return { emit: false, reason: 'not_confirmed' };
+  if (previousConfirmed === true) return { emit: false, reason: 'unchanged' };
+  return { emit: true, reason: 'confirmed_in_lp' };
+}
+
+/**
+ * The event body for lp.appointment_confirmed. Same columns as the reschedule
+ * event (entity_id = the LP LEAD id, which the sync handler re-reads). One
+ * emit per lead per appointment date: a second confirm of the same visit is the
+ * same fact.
+ */
+export function buildConfirmedEvent({
+  lpLeadId, lpProspectId, ghlContactId, appointmentDate, dispositionCode = 'Set',
+  leadName = null, leadSource = null, priority = 'high',
+}) {
+  const keyPart = (v) => String(v ?? 'null').replace(/[^0-9A-Za-z]/g, '');
+  return {
+    event_type: 'lp.appointment_confirmed',
+    event_subtype: dispositionCode,
+    source: 'lp_sync',
+    entity_type: 'lead',
+    entity_id: lpLeadId,
+    ghl_contact_id: ghlContactId || null,
+    lp_lead_id: lpLeadId,
+    lp_prospect_id: lpProspectId || null,
+    payload: {
+      appointment_date: appointmentDate,
+      appointment_confirmed: true,
+      disposition_code: dispositionCode,
+      lp_lead_id: lpLeadId,
+      lead_name: leadName,
+      lead_source: leadSource,
+      source: 'sync-leads',
+    },
+    previous_state: { appointment_confirmed: false },
+    new_state: { appointment_confirmed: true },
+    priority,
+    idempotency_key: `appt_confirmed_${lpLeadId}_${keyPart(appointmentDate)}`,
   };
 }

@@ -87,7 +87,9 @@ export async function scanBackfillCandidates({ horizonDays = DEFAULT_HORIZON_DAY
       .from('lp_leads')
       .select('lp_lead_id, ghl_contact_id, disposition_code, appointment_date, created_at_lp, first_name, last_name, phone, '
         // 2026-10-15: the reconciler's stale-row and ghost-appointment guards.
-        + 'synced_at, updated_at_lp, set_date, last_contact_date')
+        + 'synced_at, updated_at_lp, set_date, last_contact_date, '
+        // 2026-10-16: LP's confirmed checkbox confirms a Set lead (lpConfirmedFlag).
+        + 'appointment_confirmed')
       .in('disposition_code', DISPOSITIONS)
       .gte('appointment_date', fromIso)
       .lte('appointment_date', toIso)

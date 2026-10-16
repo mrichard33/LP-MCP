@@ -19,6 +19,8 @@ import {
   buildRescheduleEvent,
   sameApptInstant,
   RESCHEDULE_ELIGIBLE_DISPOSITIONS,
+  shouldEmitConfirmed,
+  buildConfirmedEvent,
 } from '../src/services/appointment-reschedule-emit.js';
 
 // The canary: prospect 230117 / lead 575494 (Pat Maidment). LP moved the
@@ -85,15 +87,15 @@ test('CXL never emits — rule 271 owns cancels', () => {
   assert.equal(d.reason, 'disposition_not_eligible');
 });
 
-test('only Set and Cnf are eligible (Verif is a hold since 2026-10-16)', () => {
-  assert.deepEqual([...RESCHEDULE_ELIGIBLE_DISPOSITIONS].sort(), ['Cnf', 'Set']);
-  for (const code of ['Set', 'Cnf']) {
+test('Set, Cnf and Issue are eligible (Verif is a hold; Issue a live visit, Roberta Ritchie 2026-10-16)', () => {
+  assert.deepEqual([...RESCHEDULE_ELIGIBLE_DISPOSITIONS].sort(), ['Cnf', 'Issue', 'Set']);
+  for (const code of ['Set', 'Cnf', 'Issue']) {
     assert.equal(
       shouldEmitReschedule({ previousAppointmentDate: PREV, appointmentDate: NEXT, dispositionCode: code }).emit,
       true, `${code} should emit`);
   }
   // A date move after the appointment happened is history, not a held slot.
-  for (const code of ['Verif', 'Issue', 'Sold', 'NS', 'Data', '', null]) {
+  for (const code of ['Verif', 'OPPFDN', 'Sold', 'NS', 'Data', '', null]) {
     assert.equal(
       shouldEmitReschedule({ previousAppointmentDate: PREV, appointmentDate: NEXT, dispositionCode: code }).emit,
       false, `${code} should not emit`);
@@ -165,7 +167,42 @@ test('both decision-engine newest-lead type checks cover the new event', () => {
   // isNewestLeadForContact. Widening only one leaves a guard that reads as
   // working and waves every superseded lead through. Canary: prospect 230117
   // holds four lead rows on one contact and only 575494 is live.
+  //
+  // 2026-10-16: both checks now read ONE set, NEWEST_LEAD_GUARDED_EVENTS, so
+  // they cannot drift apart again; lp.appointment_confirmed joined it.
   const src = readFileSync(new URL('../src/decision-engine.js', import.meta.url), 'utf8');
-  const hits = src.split("'lp.appointment_rescheduled'").length - 1;
-  assert.ok(hits >= 2, `expected both type checks to name the event, found ${hits}`);
+  const set = src.slice(src.indexOf('const NEWEST_LEAD_GUARDED_EVENTS'), src.indexOf(']);', src.indexOf('const NEWEST_LEAD_GUARDED_EVENTS')));
+  for (const t of ['lp.disposition_changed', 'lp.appointment_rescheduled', 'lp.appointment_confirmed']) {
+    assert.ok(set.includes(`'${t}'`), `${t} must be in NEWEST_LEAD_GUARDED_EVENTS`);
+  }
+  const uses = src.split('NEWEST_LEAD_GUARDED_EVENTS.has(event.event_type)').length - 1;
+  assert.ok(uses >= 2, `expected both type checks to read the set, found ${uses}`);
+});
+
+test('lp.appointment_confirmed is on the intake allowlist (Roberta Ritchie, 2026-10-16)', () => {
+  const src = readFileSync(new URL('../src/services/event-intake-filter.js', import.meta.url), 'utf8');
+  const allowlist = src.slice(src.indexOf('const ALLOWED_EVENT_TYPES'), src.indexOf('// Quiet but rule-watched'));
+  assert.ok(allowlist.includes("'lp.appointment_confirmed'"));
+});
+
+test('LP\'s confirmed checkbox flipping on a Set lead emits once, nothing else does', () => {
+  const ok = shouldEmitConfirmed({ previousConfirmed: false, confirmed: true, dispositionCode: 'Set' });
+  assert.deepEqual(ok, { emit: true, reason: 'confirmed_in_lp' });
+  assert.equal(shouldEmitConfirmed({ previousConfirmed: null, confirmed: true, dispositionCode: 'Set' }).emit, true);
+  assert.equal(shouldEmitConfirmed({ previousConfirmed: true, confirmed: true, dispositionCode: 'Set' }).reason, 'unchanged');
+  assert.equal(shouldEmitConfirmed({ previousConfirmed: false, confirmed: false, dispositionCode: 'Set' }).emit, false);
+  assert.equal(shouldEmitConfirmed({ previousConfirmed: false, confirmed: undefined, dispositionCode: 'Set' }).emit, false);
+  // Cnf / Issue confirm by code; a disposition change already emits its own event.
+  assert.equal(shouldEmitConfirmed({ previousConfirmed: false, confirmed: true, dispositionCode: 'Cnf' }).reason, 'not_set');
+  assert.equal(shouldEmitConfirmed({ previousConfirmed: false, confirmed: true, dispositionCode: 'Set', dispositionChanged: true }).reason, 'disposition_event_covers_it');
+});
+
+test('the confirmed event carries the lead id as entity_id and a per-visit key', () => {
+  const e = buildConfirmedEvent({ lpLeadId: '583833', lpProspectId: '461906', ghlContactId: '0Hwk6Mw05TSkKfQDhssm', appointmentDate: '2026-10-16T14:00:00+00:00' });
+  assert.equal(e.event_type, 'lp.appointment_confirmed');
+  assert.equal(e.entity_id, '583833');
+  assert.equal(e.lp_lead_id, '583833');
+  assert.equal(e.ghl_contact_id, '0Hwk6Mw05TSkKfQDhssm');
+  assert.equal(e.event_subtype, 'Set');
+  assert.equal(e.idempotency_key, 'appt_confirmed_583833_20261016T1400000000');
 });

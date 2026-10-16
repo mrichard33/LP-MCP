@@ -59,6 +59,10 @@ function deps(emitted, resolved = new Map()) {
     readLpBook: async () => ({ active: lpBook, resolved }),
     getGHLContact: async () => ({ tags: [] }),
     syncAppointmentToLP: async () => ({ success: true, action: 'lp_appointment_set' }),
+    // 2026-10-16: no LP history for these contacts (lp-origin-guard.js), and no
+    // post-appointment close pass — both have their own tests.
+    readLpOrigin: async () => ({ syncCreated: new Set(), leadsByContact: new Map() }),
+    runPostAppointmentClose: async () => null,
     // 2026-10-16 (handoff v3.4 Fix 3.2): Class B now CREATES in GHL. This file
     // pins what happens BEFORE the create (grace, live check, budget order), so
     // the create answers with a refusal a person must judge, and the gap

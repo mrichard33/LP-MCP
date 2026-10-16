@@ -652,15 +652,26 @@ async function hasDuplicatePendingActions(ruleKey, targetId) {
 // LP MULTI-LEAD GUARD — Only newest lead fires rules
 // ═══════════════════════════════════════════════════════════════════
 
+// The event types the newest-lead guard covers. ONE list for both checks (the
+// guard's own early return and the caller in processSingleEventInner): two
+// hand-kept lists drifted once already (WO-4a, below).
+const NEWEST_LEAD_GUARDED_EVENTS = new Set([
+  'lp.disposition_changed', 'lp.appointment_rescheduled', 'lp.appointment_confirmed',
+]);
+
 async function isNewestLeadForContact(event, client = supabase) {
   // 2026-09-14 (WO-4a): lp.appointment_rescheduled is guarded too. NOTE there
   // are TWO type checks for this guard — this one and the caller's in
   // processSingleEventInner. Widening only the caller leaves this early return
   // waving everything through, which reads exactly like a working guard.
-  if (event.event_type !== 'lp.disposition_changed'
-      && event.event_type !== 'lp.appointment_rescheduled') return true;
+  // 2026-10-16: lp.appointment_confirmed (LP's confirmed checkbox) too.
+  if (!NEWEST_LEAD_GUARDED_EVENTS.has(event.event_type)) return true;
 
-  const lpLeadId = event.entity_id || event.lp_lead_id;
+  // 2026-10-16: the lp_lead_id COLUMN first. Field sync emits
+  // lp.disposition_changed with entity_id = the CONTACT id (ghl-field-sync.js),
+  // so `entity_id || lp_lead_id` compared a contact id with a lead id and skipped
+  // the event as an older lead (Roberta Ritchie, 2026-10-15 19:31).
+  const lpLeadId = event.lp_lead_id || event.entity_id;
   const ghlContactId = event.ghl_contact_id;
 
   if (!ghlContactId || !lpLeadId) return true;
@@ -2664,8 +2675,7 @@ async function processSingleEventInner(event) {
   // The guard is opt-in by event type — a new type added without this line is
   // silently exempt. Canary: prospect 230117 holds four lead rows on contact
   // 3a3rAaHxnICmykJKGDt1 and only 575494 is live.
-  if (event.event_type === 'lp.disposition_changed'
-      || event.event_type === 'lp.appointment_rescheduled') {
+  if (NEWEST_LEAD_GUARDED_EVENTS.has(event.event_type)) {
     if (!(await isNewestLeadForContact(event))) {
       await supabase.from('system_events').update({
         processed: true, processed_by: 'decision_engine',

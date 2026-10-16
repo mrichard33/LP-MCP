@@ -19,7 +19,12 @@
  *     marked `invalid` (never `cancelled`, which fires the cancel/rebook paths).
  *
  * GHL status implied by LP: Set → new; Cnf, Issue → confirmed. Never upgrade a
- * Set to confirmed.
+ * Set to confirmed on the CODE alone.
+ *
+ * ONE exception (the user, 2026-10-16, Roberta Ritchie 583833): LP's own
+ * "confirmed" checkbox. A Set lead whose LP row says confirmed IS confirmed —
+ * the 10/16 ruling was about the Set code, not LP's checkbox (the capacity board
+ * already reads it this way, capacity-sweep.js). `confirmed` is that checkbox.
  */
 
 export const LIVE_APPOINTMENT_DISPOSITIONS = Object.freeze(['Set', 'Cnf', 'Issue']);
@@ -36,9 +41,9 @@ export function isHoldDisposition(code) { return HOLD.has(norm(code)); }
 export function isDisqualifiedDisposition(code) { return DQ.has(norm(code)); }
 
 /** GHL appointment status LP implies for a live disposition; null for anything else. */
-export function ghlStatusForDisposition(code) {
+export function ghlStatusForDisposition(code, { confirmed = false } = {}) {
   const c = norm(code);
-  if (c === 'Set') return 'new';
+  if (c === 'Set') return confirmed === true ? 'confirmed' : 'new';
   if (c === 'Cnf' || c === 'Issue') return 'confirmed';
   return null;
 }

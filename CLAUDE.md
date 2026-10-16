@@ -393,7 +393,8 @@ run default; lp_leads only, never GHL).
 
 **Verif is a hold, ND and No Demo are disqualified, and the watchdog heals appointments (Mark, 2026-10-16, handoff v3.4).**
 One place for the classes: `src/lp-disposition-classes.js` (live = Set / Cnf / Issue, hold = Verif, disqualified = ND /
-No Demo; GHL status Set → new, Cnf / Issue → confirmed, never Set → confirmed).
+No Demo; GHL status Set → new, Cnf / Issue → confirmed, never Set → confirmed on the code alone; LP's confirmed checkbox is
+the one exception, below).
 - **Verif = "there is an issue with the lead" and starts NOTHING.** This reverses the 2026-07-09 reconciler rule ("Verif
   = a live Window Estimate, exactly like Set") and the 2026-10-06 "Verif counts as Set". The reconciler returns
   `verif_hold`; no live read, no authority seat (rank 0); no Confirmation-list add (it still comes off the setter lists,
@@ -427,6 +428,29 @@ No Demo; GHL status Set → new, Cnf / Issue → confirmed, never Set → confir
   HTTP code (verified in the HL mirror): any outcome but created / updated / noop_already_exists makes GHL book around
   every guard. So a skip answers `noop_already_exists` + `{ ok: true, booked: false, skipped: true, reason }`; only a real
   failure answers `error`. Never return another outcome for a deliberate skip.
+
+**GHL estimates follow LP after every LP change, and the watchdog never writes a stale GHL time back (Roberta Ritchie,
+2026-10-16).** LP moved her lead 583833 from 10/17 10 AM to 10/16 2 PM and issued it in one edit; no rule routed an Issue,
+Class C only emitted an event, Fix 8 sat in shadow, and Class A then wrote GHL's stale 10/17 10 AM onto her OLDER lead
+579742 (Data → Set). Now:
+- **LP's confirmed checkbox counts** (the user's ruling, an exception to "never Set → confirmed"): `classifyDisposition(code,
+  { confirmed })` / `lpConfirmedFlag` (live first, then `lp_leads.appointment_confirmed`); sync-leads emits
+  `lp.appointment_confirmed` when it flips on a Set lead (rule `LP_APPT_GHL_SYNC_CONFIRMED`). Issue syncs
+  (`LP_APPT_GHL_SYNC_ISSUE`) and its date moves emit `lp.appointment_rescheduled`. The newest-lead guard reads ONE set
+  (`NEWEST_LEAD_GUARDED_EVENTS`) and the `lp_lead_id` column first (field sync's `entity_id` is the contact).
+- **Class A refuses an LP-origin appointment** (`src/appointments/lp-origin-guard.js`, `lp_origin_drift`): one our sync
+  created, or a contact whose LP visit was in the last 72h, or whose newest lead is post-demo within 30 days. A failed
+  read writes nothing to LP. Class B skips a row a NEWER lead supersedes (`ghl_create_superseded`), and `postDemoLock`
+  refuses an older lead when a newer one on the prospect is Issue or post-demo (`newer_lead`).
+- **Class C heals** through the mirror path (`confirm_healed`); the event stays for audit (`confirm_emitted` = not healed).
+- **Class F closes the visit** (`src/appointments/post-appointment-close.js`, also rule `LP_APPT_GHL_CLOSE` →
+  `close_past_lp_appointment`): once LP's visit time passed, demo → `showed` at LP's time + P1 → Appointment Completed
+  (queued `move_opportunity`, forward-only), NoHome → `noshow`, CXL / CCC / NG → `cancelled`, one PUT with `toNotify:
+  false`; a FUTURE GHL row against a cancel stays Class E's. `POST_APPT_CLOSE_MODE` off|shadow|live, default shadow
+  (`appt.close_would_apply`): read the HL mirror's appointment-status triggers before live. Writes share PARITY_MAX_WRITES.
+- **Confirmation coverage:** the clock gives a card to up to 25 linked leads a pass with a visit in the next 14 days and no
+  `confirmation_opportunities` row (`readUncoveredLeads`); `CONF_PIPE_RESCHEDULED` / `CONF_PIPE_CONFIRMED` re-read the card.
+Seeds: `sql/seeds/2026-10-16_parity_self_heal.sql`. Tests: `scripts/test-parity-roberta.js`.
 
 **Every LP appointment has ONE card in "4. Confirmation Pipeline", and only LP MCP moves it (handoff, 2026-10-16).**
 Pipeline `ThrBNpyzJhAON4WFC855`; no GHL workflow may trigger on it. Rules `CONF_PIPE_SET/VERIF/CNF/ND/CXL` queue

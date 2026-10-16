@@ -187,7 +187,7 @@ test('D1 — removed action types are absent from ACTION_HANDLERS entirely', asy
   }
 });
 
-test('D1 — the registry holds exactly the 86 documented action types', async () => {
+test('D1 — the registry holds exactly the 87 documented action types', async () => {
   const { ACTION_HANDLERS } = await import('../src/actions/index.js');
   const types = Object.keys(ACTION_HANDLERS);
   // The header comment in src/actions/index.js enumerates these by name. It
@@ -221,7 +221,9 @@ test('D1 — the registry holds exactly the 86 documented action types', async (
   // No Demo end state (invalid estimate, out of every sequence, off Five9).
   // 2026-10-16 (4. Confirmation Pipeline): 85 → 86, sync_confirmation_opportunity —
   // one card per LP appointment, moved by LP disposition and the clock.
-  assert.equal(types.length, 86);
+  // 2026-10-16 (Roberta Ritchie): 86 → 87, close_past_lp_appointment — the GHL
+  // estimate is marked showed / noshow / cancelled once LP says what happened.
+  assert.equal(types.length, 87);
   assert.equal(types.filter(t => t.startsWith('five9_')).length, 39);
   // Every type the coercion loop covers must actually be dispatchable.
   for (const actionType of FIVE9_WRITE_TYPES) {

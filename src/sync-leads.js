@@ -112,7 +112,7 @@ function noteDroppedApptDate(rawAppt, sanitized, ldsId) {
 import { matchToGHL } from './ghl.js';
 import { executeAddTag, executeRemoveTag } from './actions/handlers/tags.js';
 import { upsertProspect } from './upsert-prospect.js';
-import { shouldEmitReschedule, buildRescheduleEvent, sameApptInstant } from './services/appointment-reschedule-emit.js';
+import { shouldEmitReschedule, buildRescheduleEvent, sameApptInstant, shouldEmitConfirmed, buildConfirmedEvent } from './services/appointment-reschedule-emit.js';
 import { combineNotes } from './safe-notes.js';
 import { syncCallLogs, syncNotes, syncActivities, syncJobAndMilestones } from './sync-children.js';
 import { emitEvent, dispositionPriority } from './event-emitter.js';
@@ -1121,6 +1121,33 @@ export async function processProspect(prospect, { skipGHL = false, payloadHash =
         `[Sync] APPT RESCHEDULED: lead ${lpLeadId} (${newDisposition}) ` +
         `${existing.appointment_date} → ${row.appointment_date} — emitted lp.appointment_rescheduled`
       );
+    }
+
+    // ─── LP's "confirmed" checkbox flipped on a Set lead (2026-10-16) ───
+    // Roberta Ritchie (583833) was confirmed in LP and `new` in GHL all morning:
+    // the checkbox changes no disposition, so nothing fired. The user ruled the
+    // checkbox counts; the reconciler reads it (lpConfirmedFlag), and this event
+    // runs it (rule LP_APPT_GHL_SYNC_CONFIRMED). Pure decision in
+    // services/appointment-reschedule-emit.js. Emitted after the upsert, like the
+    // reschedule above, so the handler's re-read sees the new row.
+    const confirmedEmit = shouldEmitConfirmed({
+      previousConfirmed: existing?.appointment_confirmed ?? null,
+      confirmed: row.appointment_confirmed,
+      dispositionCode: newDisposition,
+      dispositionChanged: Boolean(dispositionChanged),
+    });
+    if (existing && confirmedEmit.emit) {
+      await emitEvent(buildConfirmedEvent({
+        lpLeadId,
+        lpProspectId,
+        ghlContactId: newLeadGhlId || existing?.ghl_contact_id || null,
+        appointmentDate: row.appointment_date ?? existing.appointment_date ?? null,
+        dispositionCode: newDisposition,
+        leadName: `${getField(prospect, 'firstname', 'FirstName') || ''} ${getField(prospect, 'lastname', 'LastName') || ''}`.trim(),
+        leadSource: getField(lead, 'source', 'Source') || null,
+        priority: dispositionPriority(newDisposition),
+      }));
+      console.log(`[Sync] APPT CONFIRMED IN LP: lead ${lpLeadId} (${newDisposition}) — emitted lp.appointment_confirmed`);
     }
 
     // ─── AGENTIC: Emit disposition change event ──────────────────

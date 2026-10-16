@@ -305,8 +305,13 @@ export const MODES = Object.freeze([
   m('ESTIMATE_DRIFT_FIX_MODE', 'lp', 'enum', OSL, 'shadow', OSL_S, {
     since: '2026-10-16',
     evidence: { events: ['appt.drift_detected'] },
-    goLive: 'Mark flips it in Railway after two watchdog runs of appt.drift_detected would-do rows are reviewed (handoff v3.4 Fix 8)',
+    goLive: 'the user ruled 2026-10-16 (Roberta Ritchie): live right after the parity self-heal PR ships; the 3 shadow rows of 10/16 were all correct (handoff v3.4 Fix 8)',
     note: 'Parity watchdog corrects sync-created GHL estimates that drifted from LP: reschedule to LP time, or invalid for a year-typo date.',
+  }),
+  m('POST_APPT_CLOSE_MODE', 'lp', 'enum', OSL, 'shadow', OSL_S, {
+    since: '2026-10-16', decider: 'the user',
+    evidence: { events: ['appt.close_would_apply'] },
+    note: 'After LP\'s visit time, sets the GHL estimate showed (demo, + P1 → Appointment Completed), noshow (NoHome) or cancelled (CXL/CCC/NG); watchdog Class F + rule LP_APPT_GHL_CLOSE.',
   }),
   m('LP_APPT_GUARD_MODE', 'lp', 'enum', OSE, 'shadow', OSE_S, {
     since: '2026-09-13',

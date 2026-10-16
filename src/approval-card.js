@@ -264,6 +264,8 @@ export function describeApprove(action, { event, contactName, enrichment = {} } 
       const stage = pl.stage ? ` → ${pl.stage}` : '';
       return `${capitalize(whose)} opportunity moves to ${pipelineLabel(pl.pipeline)}${stage}.`;
     }
+    case 'close_past_lp_appointment':
+      return `${capitalize(whose)} past estimate in GHL is marked the way LP recorded the visit (showed, no-show or cancelled).`;
     case 'sync_confirmation_opportunity':
       return `${capitalize(whose)} card in the Confirmation Pipeline is created or moved to match LP${pl.disposition_code ? ` (${pl.disposition_code})` : ''}.`;
     case 'add_tag': {

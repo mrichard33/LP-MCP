@@ -37,6 +37,12 @@
  *
  *   A. lp_missing_appointment  — GHL has an active future appointment, LP
  *      has none for that contact in the window.
+ *      → NEVER for an appointment LP itself created, or a contact whose LP
+ *        visit just happened (2026-10-16, src/appointments/lp-origin-guard.js:
+ *        `lp_origin_drift`). Roberta Ritchie: GHL kept our sync's stale 10/17
+ *        10 AM after LP moved and issued the visit, and Class A wrote it back
+ *        onto her older lead 579742. Then GHL is the stale side; the drift fix
+ *        and the post-appointment close own it. A failed read writes nothing.
  *      → AUTO-HEAL. Calls syncAppointmentToLP, the same orchestrator the
  *        webhook path uses: it resolves the LP lead through the 5-step
  *        chain and either runs LP SetAppointment or self-heals by enrolling
@@ -58,11 +64,13 @@
  *        ND / No Demo never reach this class (settled, readLpBook).
  *
  *   C. confirmation_drift      — LP says confirmed, GHL does not.
- *      → EMIT ONLY, despite what this said until v1.1. It emits
- *        appointment.confirmation_drift and nothing consumes it, so GHL is
- *        never actually confirmed. Counted as `confirm_emitted`, not
- *        `healed`, until a consumer exists. Calling it a heal is how the old
- *        number lied.
+ *      → AUTO-HEAL since 2026-10-16 (Roberta Ritchie). Until then it only
+ *        emitted appointment.confirmation_drift, which nothing consumes, so
+ *        GHL was never confirmed (63 findings in 14 days). It now runs the same
+ *        mirror path as Class B (LP live + the reconciler, which confirms a Set
+ *        lead LP's checkbox marks confirmed — the user's ruling) and counts
+ *        `confirm_healed` only when GHL changed. The event still goes out for
+ *        audit; a heal that did not land is `confirm_emitted`, as before.
  *
  *   D. cancellation_drift      — GHL cancelled, LP still shows set.
  *      → ESCALATE. A cancellation that only half-landed usually means a
@@ -75,6 +83,12 @@
  *        (src/jobs/appointment-parity-heal.js). An `invalid` GHL row is SETTLED
  *        (Fix 8): never restored, never re-created over, never flagged —
  *        unless LP has since moved the lead to a different slot.
+ *
+ *   F. post-appointment close (2026-10-16, src/appointments/post-appointment-close.js)
+ *      — a GHL estimate still new / confirmed after LP's visit time, with LP
+ *        saying what happened: demo → showed (+ P1 → Appointment Completed),
+ *        NoHome → noshow, CXL / CCC / NG → cancelled. POST_APPT_CLOSE_MODE
+ *        (default shadow). Its writes count against PARITY_MAX_WRITES.
  *
  *   E. lp_cancelled_ghl_active — LP cancelled (CXL/CCC/NoHome/NG), GHL still
  *      holds an ACTIVE appointment. The mirror of D, and new in v1.2.
@@ -326,6 +340,9 @@ import { runEstimateDriftFix, readSyncCreatedStarts } from '../appointments/esti
 import { putReschedule } from '../services/lp-ghl-appointment-reconciler.js';
 import { markRescheduleInflight } from '../services/reschedule-inflight.js';
 import { resolveSyncLead, notifyLpLooksWrong } from '../actions/handlers/lp-ghl-appointment-sync.js';
+import { lpOriginBlock, supersededByNewerLead, readLpOriginFacts } from '../appointments/lp-origin-guard.js';
+import { runPostAppointmentClose } from '../appointments/post-appointment-close.js';
+import { readLiveLpAppointment } from '../services/lp-live-appointment.js';
 
 /** One agent_actions insert (deps seam: deps.queueAction). */
 async function queueAgentAction(row) {
@@ -499,6 +516,46 @@ async function readGhlBook(from, to) {
     .lt('start_time', to.toISOString());
   if (error) throw new Error(`GHL appointment read: ${error.message}`);
   return bucketGhlBook(data);
+}
+
+/**
+ * Class F's GHL read (2026-10-16): every estimate-pool row from the look-back
+ * on, any status (closeCandidates keeps the open ones). HL mirror, read-only.
+ */
+async function readGhlCloseRows(fromIso, toIso) {
+  const hl = getHlSupabase();
+  const rows = [];
+  for (let offset = 0; ; offset += 1000) {
+    const { data, error } = await hl
+      .from('appointments')
+      .select('ghl_contact_id, ghl_appointment_id, status, start_time, ghl_calendar_id')
+      .is('deleted_at', null)
+      .gte('start_time', fromIso)
+      .lt('start_time', toIso)
+      .in('status', ['new', 'confirmed'])
+      .order('start_time', { ascending: true })
+      .range(offset, offset + 999);
+    if (error) throw new Error(`GHL close read: ${error.message}`);
+    rows.push(...(data || []));
+    if (!data || data.length < 1000) break;
+  }
+  return rows;
+}
+
+/** Class F's lead read: every lp_leads row per contact (Map cid → rows). */
+async function readContactLeads(contactIds) {
+  const out = new Map();
+  for (let i = 0; i < contactIds.length; i += 100) {
+    const { data, error } = await supabase.from('lp_leads')
+      .select('lp_lead_id, lp_prospect_id, ghl_contact_id, disposition_code, appointment_date, synced_at, updated_at_lp, created_at_lp, set_date, last_contact_date')
+      .in('ghl_contact_id', contactIds.slice(i, i + 100));
+    if (error) throw new Error(`lp_leads read failed: ${error.message}`);
+    for (const r of data || []) {
+      if (!out.has(r.ghl_contact_id)) out.set(r.ghl_contact_id, []);
+      out.get(r.ghl_contact_id).push(r);
+    }
+  }
+  return out;
 }
 
 /**
@@ -735,8 +792,28 @@ export async function runAppointmentParityWatchdog({ dryRun = !PARITY_AUTOHEAL, 
     console.warn(`[ApptParity] drift fix failed (watchdog continues): ${err.message}`);
   }
 
+  // ---- Class F: close estimates after the visit (2026-10-16) ----
+  // Behind POST_APPT_CLOSE_MODE (default shadow). Runs before the classes so a
+  // closed appointment is not then read as a gap. Its writes share the budget.
+  let close = null;
+  try {
+    close = await (deps.runPostAppointmentClose || runPostAppointmentClose)({
+      dryRun, deps: {
+        cap: PARITY_MAX_WRITES,
+        readGhlRows: deps.readGhlCloseRows || readGhlCloseRows,
+        readLeads: deps.readContactLeads || readContactLeads,
+        readLive: deps.readLiveLpAppointment || ((lead) => readLiveLpAppointment(lead.lp_lead_id)),
+        putAppointment: deps.putAppointment || ((id, body) => (deps.ghlFetch || defaultGhlFetch)('PUT', `/calendars/events/appointments/${id}`, body)),
+        queueAction: deps.queueAction || queueAgentAction,
+        emitEvent: deps.emitEvent || emitEvent,
+      },
+    });
+  } catch (err) {
+    console.warn(`[ApptParity] post-appointment close failed (watchdog continues): ${err.message}`);
+  }
+
   const findings = [];
-  let writes = 0;
+  let writes = close?.writes || 0;
   let errors = 0;
   let liveChecks = 0;   // v1.5 — Class B live GHL reads this sweep
   const counts = {
@@ -765,7 +842,31 @@ export async function runAppointmentParityWatchdog({ dryRun = !PARITY_AUTOHEAL, 
     ghl_create_deferred: 0,   // LP unreadable, too late, nothing live — next sweep
     lp_looks_wrong: 0,        // bad LP date/hour — a person fixes LP (Fix 4)
     same_slot_restored: 0,    // a duplicate's cancel undone (Fix 1.7)
+    // 2026-10-16 (Roberta Ritchie): Class A refusals — GHL is the stale side.
+    lp_origin_drift: 0,       // our sync made it, or LP's visit just happened
+    lp_origin_unreadable: 0,  // could not tell — no LP write this sweep
+    ghl_create_superseded: 0, // Class B: a newer lead on the prospect owns the visit
   };
+
+  // Class A / B need each contact's LP history (lp-origin-guard.js). One read,
+  // before either loop. A failed read: Class A writes nothing to LP (fail
+  // closed), Class B behaves as before.
+  const originCandidates = new Map();
+  for (const [cid, appt] of ghlActive) {
+    if (!lpBook.has(cid) && !lpResolved.has(cid) && !lpSettled.has(cid)) originCandidates.set(cid, appt);
+  }
+  for (const cid of lpBook.keys()) if (!ghlActive.has(cid)) originCandidates.set(cid, null);
+  let origin = null;
+  let originError = null;
+  try {
+    origin = await (deps.readLpOrigin || ((candidates) => readLpOriginFacts({
+      candidates, db: supabase,
+      readSyncCreatedStarts: deps.readSyncCreatedStarts || ((ids) => readSyncCreatedStarts(supabase, ids)),
+    })))(originCandidates);
+  } catch (err) {
+    originError = err;
+    console.warn(`[ApptParity] LP-origin read failed — no Class A write to LP this sweep: ${err.message}`);
+  }
 
   const _mirror = deps.mirrorLeadAppointment || mirrorLeadAppointment;
   const _readLive = deps.readLiveForSync || readLiveForSync;
@@ -873,7 +974,8 @@ export async function runAppointmentParityWatchdog({ dryRun = !PARITY_AUTOHEAL, 
     refused: 0,            // LP refused the appointment (LP_APPT_GUARD_MODE=enforce)
     unknown_result: 0,     // unrecognised action — logged raw
     escalated: 0,          // parity_gap event that actually inserted
-    confirm_emitted: 0,    // confirmation_drift event that actually inserted
+    confirm_emitted: 0,    // confirmation_drift event that actually inserted (heal did not land)
+    confirm_healed: 0,     // 2026-10-16: GHL confirmed (or moved + confirmed) to LP
     dropped_at_intake: 0,  // emitEvent returned {filtered:true}
     emit_noop: 0,          // idempotency skip or write failure
   };
@@ -929,6 +1031,25 @@ export async function runAppointmentParityWatchdog({ dryRun = !PARITY_AUTOHEAL, 
     // A contact LP has cancelled is Class E above, not a missing appointment.
     if (lpResolved.has(cid)) continue;
     if (lpSettled.has(cid)) continue;   // counted once, in the Class E loop
+    // LP is the authority (2026-10-16, Roberta Ritchie): never write back an
+    // appointment LP created, or one for a contact whose LP visit just
+    // happened. Could not tell → write nothing.
+    if (originError) {
+      counts.lp_origin_unreadable++;
+      findings.push({ class: 'lp_missing_appointment', contact_id: cid, ghl_appointment_id: appt.ghl_appointment_id, ghl_start: appt.start_time, action: 'none', executed: false, outcome: 'lp_origin_unreadable' });
+      continue;
+    }
+    const block = lpOriginBlock({
+      syncCreated: origin?.syncCreated?.has(appt.ghl_appointment_id) || false,
+      leads: origin?.leadsByContact?.get(cid) || [],
+      nowMs: asOf.getTime(),
+    });
+    if (block.block) {
+      counts.lp_origin_drift++;
+      findings.push({ class: 'lp_origin_drift', contact_id: cid, ghl_appointment_id: appt.ghl_appointment_id, ghl_start: appt.start_time, ghl_status: appt.status, reason: block.reason, lp_lead_id: block.lp_lead_id || null, action: 'none' });
+      continue;
+    }
+
     counts.lp_missing_appointment++;
     const finding = {
       class: 'lp_missing_appointment',
@@ -1006,7 +1127,7 @@ export async function runAppointmentParityWatchdog({ dryRun = !PARITY_AUTOHEAL, 
     }
   }
 
-  // ---- Class C: confirmation drift. -----------------------------------
+  // ---- Class C: confirmation drift. AUTO-HEAL (2026-10-16). -----------
   //
   // Runs BEFORE the escalation class as of v1.1. PARITY_MAX_WRITES is 25 and
   // Class B/D routinely produces 27 findings, so in the original order the
@@ -1014,10 +1135,11 @@ export async function runAppointmentParityWatchdog({ dryRun = !PARITY_AUTOHEAL, 
   // write — while 21 of those escalation "writes" were being discarded at
   // event intake anyway. The budget now goes to the classes that change state.
   //
-  // NOT an auto-heal today, despite the original header. It emits an event and
-  // nothing consumes it, so GHL is never actually confirmed. Counted as
-  // `confirm_emitted` rather than `healed` until a consumer exists — calling it
-  // a heal is how the old number lied.
+  // Until 2026-10-16 this only emitted an event nothing consumed, so GHL was
+  // never confirmed (Roberta Ritchie sat confirmed in LP, `new` in GHL). It now
+  // heals through the Class B mirror path: LP live, the reconciler's guards,
+  // and its confirm / reschedule_confirm (a Set lead LP's checkbox marks
+  // confirmed is confirmed — the user's ruling). The event stays, for audit.
   for (const [cid, lead] of lpBook) {
     const appt = ghlActive.get(cid);
     if (!appt) continue;
@@ -1030,6 +1152,8 @@ export async function runAppointmentParityWatchdog({ dryRun = !PARITY_AUTOHEAL, 
       contact_id: cid,
       ghl_appointment_id: appt.ghl_appointment_id,
       ghl_status: appt.status,
+      lp_lead_id: lead.lp_lead_id || null,
+      disposition_code: lead.disposition_code || null,
       action: 'confirm_in_ghl',
     };
 
@@ -1038,6 +1162,27 @@ export async function runAppointmentParityWatchdog({ dryRun = !PARITY_AUTOHEAL, 
       findings.push({ ...finding, executed: false });
       continue;
     }
+
+    // The heal. One write from the budget whatever it did; a refusal or an
+    // error falls through to the audit event below as before.
+    let healed = false;
+    try {
+      const rec = await _mirror({ contactId: cid, lead });
+      const o = classBOutcome(rec);
+      finding.outcome = rec?.outcome === 'noop' ? (rec?.reason || 'noop') : rec?.outcome;
+      if (o.kind === 'created') {
+        healed = true;
+        outcomes.confirm_healed++;
+        await emitAutoFixed(cid, 'confirmed', { appointment_id: rec.appointment_id || appt.ghl_appointment_id, lp_lead_id: lead.lp_lead_id });
+      } else if (o.kind === 'lp_looks_wrong') {
+        counts.lp_looks_wrong++;
+      }
+    } catch (err) {
+      errors++;
+      finding.outcome = 'error';
+      console.warn(`[ApptParity] Class C confirm failed for ${cid}: ${err.message}`);
+    }
+    writes++;
 
     try {
       const res = await _emitEvent({
@@ -1049,15 +1194,14 @@ export async function runAppointmentParityWatchdog({ dryRun = !PARITY_AUTOHEAL, 
         ghl_contact_id: cid,
         payload: finding,
         priority: 'normal',
-        idempotency_key: `parity_confirm_${appt.ghl_appointment_id}`,
+        idempotency_key: `parity_confirm_${appt.ghl_appointment_id}${healed ? '_healed' : ''}`,
       });
-      writes++;
       const outcome = classifyEmit(res);
-      outcomes[outcome === 'emitted' ? 'confirm_emitted' : outcome]++;
-      findings.push({ ...finding, executed: outcome === 'emitted', outcome });
+      if (!healed) outcomes[outcome === 'emitted' ? 'confirm_emitted' : outcome]++;
+      findings.push({ ...finding, executed: healed || outcome === 'emitted', healed });
     } catch (err) {
-      errors++;
-      findings.push({ ...finding, executed: false, error: err.message });
+      if (!healed) errors++;
+      findings.push({ ...finding, executed: healed, healed, error: err.message });
     }
   }
 
@@ -1092,6 +1236,19 @@ export async function runAppointmentParityWatchdog({ dryRun = !PARITY_AUTOHEAL, 
     if (cls === 'cancellation_drift') {
       const r = await tryRestoreSameSlot({ cid, lead, cancelledRow, resolvedRow: lpResolved.get(cid) || null });
       if (r === 'handled') continue;
+    }
+
+    // 2026-10-16 (Roberta Ritchie): a newer lead on the contact / prospect
+    // owns the visit (it holds a live one, or its demo just happened). Then
+    // this older row is not a GHL appointment to create — the watchdog itself
+    // had written GHL's stale time onto her older lead 579742.
+    if (cls === 'ghl_missing_appointment' && origin) {
+      const sup = supersededByNewerLead({ lead, leads: origin.leadsByContact?.get(cid) || [], nowMs: asOf.getTime() });
+      if (sup.superseded) {
+        counts.ghl_create_superseded++;
+        findings.push({ class: 'ghl_missing_appointment', contact_id: cid, lp_lead_id: lead.lp_lead_id, executed: false, deferred: sup.reason, newer_lp_lead_id: sup.lp_lead_id, action: 'none' });
+        continue;
+      }
     }
 
     // v1.3 grace period — CLASS B ONLY. The LP→GHL reconciler runs in batches
@@ -1236,6 +1393,7 @@ export async function runAppointmentParityWatchdog({ dryRun = !PARITY_AUTOHEAL, 
     writes,
     errors,
     drift_fix: drift,
+    post_appointment_close: close,
     dry_run: !!dryRun,
     elapsed_ms: Date.now() - started,
   };

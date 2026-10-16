@@ -71,7 +71,10 @@ const LEAD_COLUMNS =
   // 2026-10-15: the reconciler's stale-row and ghost-appointment guards read these.
   'synced_at, set_date, last_contact_date, ' +
   // 2026-10-16: the "LP date/time looks wrong" card names who set it.
-  'set_by_name';
+  'set_by_name, ' +
+  // 2026-10-16: LP's confirmed checkbox confirms a Set lead (lpConfirmedFlag,
+  // the user's ruling after Roberta Ritchie 583833).
+  'appointment_confirmed';
 
 /**
  * The LP lead whose change queued this action. See the header for why this is
