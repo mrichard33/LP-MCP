@@ -4307,6 +4307,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
         nepqPlan.booking_facts = {
           kind: bookingFacts.kind, label: bookingFacts.label, ask: bookingFacts.ask, ask_line: bookingFacts.ask_line,
           first_name: firstName || bookingFacts.thread_name || null,
+          ...(nepqPlan.side_question ? { side_question: nepqPlan.side_question } : {}),
           alternatives_text: bookingFacts.alternatives.length === 2 ? bookingFacts.alternatives.map(x => `${x.day} at ${x.time} ${x.tz || tzl}`.trim()).join(' or ') : null,
           ...(bookingFacts.evening ? { evening_request: bookingFacts.evening.requested_time, evening_line: eveningReplyLine(bookingFacts.evening.requested_time) } : {}),
         };

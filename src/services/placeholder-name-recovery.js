@@ -20,14 +20,15 @@
 
 import {
   isPlaceholderName,
+  isPlaceholderSurname,
+  BARE_PLACEHOLDER_FIRST_RE,
   extractIdentityLLM,
   buildPromotionPayload,
   NAME_PLACEHOLDER_TAG,
 } from './identity-extraction.js';
 
-// First names the widget / normaliser leave behind. A real person called
-// "Guest" or "Visitor" is far rarer than this bug.
-const BARE_PLACEHOLDER_FIRST_RE = /^(guest|visitor)$/i;
+// First names the widget / normaliser leave behind ("Guest", "Visitor"): the
+// one definition is BARE_PLACEHOLDER_FIRST_RE in identity-extraction.js.
 
 /** True when the first name is missing or a chat-widget placeholder. */
 export function needsNameRecovery(firstName, lastName) {
@@ -36,6 +37,11 @@ export function needsNameRecovery(firstName, lastName) {
   if (!f) return true;
   if (BARE_PLACEHOLDER_FIRST_RE.test(f)) return true;
   return isPlaceholderName(f) || isPlaceholderName(`${f} ${l}`);
+}
+
+/** True when only the surname is the widget's ("Melissa" + "Visitor Anlxy"). */
+export function needsSurnameClear(firstName, lastName) {
+  return !needsNameRecovery(firstName, lastName) && isPlaceholderSurname(lastName);
 }
 
 /**
@@ -185,7 +191,8 @@ export async function recoverPlaceholderName(contactId, contact, { transcript = 
 
   let ghlWrite = false;
   try {
-    ghlWrite = await updateFields(contactId, payload);
+    // A null lastName clears the widget's surname (GHL ignores '', 2026-10-16).
+    ghlWrite = await updateFields(contactId, payload, { clear: payload.lastName === null ? ['lastName'] : [] });
     if (ghlWrite === true) await removeTags(contactId, [NAME_PLACEHOLDER_TAG]).catch(() => {});
   } catch (err) {
     ghlWrite = `error: ${err.message}`;

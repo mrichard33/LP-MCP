@@ -22,7 +22,7 @@
  * No I/O unless the visitor's words or the model's report carry something.
  */
 
-import { heuristicExtract, promoteIdentityToGHL, normalizePhoneE164, isPlaceholderName } from '../services/identity-extraction.js';
+import { heuristicExtract, promoteIdentityToGHL, normalizePhoneE164, isPlaceholderName, checkServiceAreaZip, enrichIdentityFromServiceArea } from '../services/identity-extraction.js';
 
 const EMAIL_OK = /^[^\s@]+@[^\s@]+\.[A-Za-z]{2,}$/;
 const NAME_WORD = /^[A-Za-z][A-Za-z'’-]{1,20}$/;
@@ -88,17 +88,26 @@ export function currentFromContact(c = {}) {
  */
 export async function captureChatIdentity(contactId, input, deps) {
   const id = chatIdentity(input);
-  if (!hasIdentity(id)) return { written: 0, reason: 'nothing_to_capture' };
+  if (!hasIdentity(id)) return { written: 0, reason: 'nothing_to_capture', identity: id };
+  // 2026-10-16 (Melissa): city and state come from the zip when the visitor
+  // typed none (or misspelled the city), as on SMS (response-generator.js).
+  // A failed lookup changes nothing.
+  if (id.postal_code) {
+    try {
+      const area = await (deps.checkServiceArea || checkServiceAreaZip)(id.postal_code);
+      enrichIdentityFromServiceArea(id, area);
+    } catch { /* the zip lookup is best-effort */ }
+  }
   let contact = null;
   try {
     contact = await deps.fetchContact(contactId);
   } catch (err) {
-    return { written: 0, reason: `contact_unreadable: ${err.message}` };
+    return { written: 0, reason: `contact_unreadable: ${err.message}`, identity: id };
   }
   // Merged away (or deleted): the surviving contact is someone's real record,
   // and nothing here may write to it.
-  if (!contact || (contact.id && contact.id !== contactId)) return { written: 0, reason: 'contact_gone_or_merged' };
+  if (!contact || (contact.id && contact.id !== contactId)) return { written: 0, reason: 'contact_gone_or_merged', identity: id };
   const promote = deps.promote || promoteIdentityToGHL;
   const res = await promote(contactId, { identity: id }, { current: currentFromContact(contact), trigger: 'live_chat' });
-  return { written: res?.written || 0, conflicts: res?.conflicts || 0, reason: res?.failed ? 'ghl_write_failed' : 'ok' };
+  return { written: res?.written || 0, conflicts: res?.conflicts || 0, reason: res?.failed ? 'ghl_write_failed' : 'ok', identity: id, placeholderCleared: res?.placeholderCleared ?? null };
 }

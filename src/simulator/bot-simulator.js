@@ -35,6 +35,7 @@ import { scoreRun, compareScorecards } from './sim-scoring.js';
 import { createMemoryStageStore, recordStage, recordBookedStage } from '../services/lead-stage-io.js';
 import { leadStageMode } from '../agentic/lead-stage.js';
 import { runWithSimOverrides } from './sim-overrides.js';
+import { captureChatIdentity } from '../live-chat/identity-capture.js';
 
 export const SIM_CONTACT_PREFIX = 'sim-';
 
@@ -125,7 +126,7 @@ export function autoAnswerFor(reply, persona = {}, { scriptDone = false } = {}) 
   if (/\bzip(?:\s*code)?\b[^?]*\?/i.test(q)) return (String(persona.address || '').match(/\b\d{5}\b/) || [persona.postalCode || '33908'])[0];
   if (/\bable\s+to\s+(?:be\s+there|make\s+it)\b|\bboth\s+be\s+there\b/i.test(q)) return "Yes, she'll be there.";
   if (/\b(?:anyone|anybody|someone)\s+else\b|\bpart\s+of\s+the\s+decision\b|\bweigh(?:ing)?\s+in\b/i.test(q)) return 'Just me.';
-  if (/\b(?:first|full|your)\s+name\b|\bwho\s+should\s+i\s+put\b/i.test(q)) return persona.firstName && !/^guest$/i.test(persona.firstName) ? persona.firstName : 'Dana';
+  if (/\b(?:first|full|your)\s+name\b|\bwho\s+should\s+i\s+put\b/i.test(q)) return persona.answerName || (persona.firstName && !/^guest$/i.test(persona.firstName) ? persona.firstName : 'Dana');
   if (/\bphone\s+number\b|\bbest\s+number\b/i.test(q)) return persona.phone ? String(persona.phone).replace(/^\+1/, '') : '352-555-0101';
   // Two real times on the table and the script has said all it had to: a
   // lead who said "book it" picks one (easy_yes ended on the offer, so the
@@ -135,6 +136,37 @@ export function autoAnswerFor(reply, persona = {}, { scriptDone = false } = {}) 
 }
 // 9: owner, zip, the count, decision maker, presence, the pick, name, phone, address.
 const MAX_AUTO_ANSWERS = 9;
+
+// 2026-10-16 (Melissa, GHL 6U6uceZGMQRz8XEQc9Lk): a chat visitor still named
+// "Guest Visitor …" who gives her name, an address with a bare unit and a
+// misspelled city, and picks the 2 PM of two Sunday times.
+const MELISSA = {
+  firstName: 'Guest', lastName: 'Visitor abcde', answerName: 'Melissa', phone: null, email: null, postalCode: null,
+  address: '2486 Caring Way 14A Port Charolette, FL 33952', openings: '4 sliding doors and 3 windows',
+};
+
+/**
+ * A turn that picks the SECOND time the bot just offered, worded like
+ * Melissa: 'bare' → "sunday at 2", 'label_q' → "Sun, Oct 18 at 2:00 PM ET?",
+ * 'plus_q' → "sunday at 2 - what is the company name are there any specials
+ * going on". With fewer than two times on the table, a plain yes. Pure.
+ */
+export function pickOfferedTime(form) {
+  const fn = (reply) => {
+    const rx = /\b(?:(Sun|Mon|Tue|Wed|Thu|Fri|Sat)[a-z]*,?\s+[A-Z][a-z]{2}\s+\d{1,2}|(tomorrow|today))\s+at\s+(\d{1,2}):(\d{2})\s*(AM|PM)(?:\s+([A-Z]{2}))?/g;
+    const times = [...String(reply || '').matchAll(rx)];
+    if (times.length < 2) return 'Yes, please set up a visit';
+    const m = times[1];
+    const DAY = { Sun: 'sunday', Mon: 'monday', Tue: 'tuesday', Wed: 'wednesday', Thu: 'thursday', Fri: 'friday', Sat: 'saturday' };
+    const day = m[1] ? DAY[m[1]] : m[2];
+    const hour = String(Number(m[3]));
+    if (form === 'label_q') return `${m[0].trim()}${m[6] ? '' : ' ET'}?`;
+    if (form === 'plus_q') return `${day} at ${hour} - what is the company name are there any specials going on`;
+    return `${day} at ${hour}`;
+  };
+  fn.form = form;
+  return fn;
+}
 
 /** The test conversations (the "good test messages" list). Customer side only. */
 export const SCENARIOS = Object.freeze({
@@ -182,6 +214,12 @@ export const SCENARIOS = Object.freeze({
   rehash_defer: { title: 'Rehash: call me in the spring', persona: REHASH_LEAD, channels: ['sms'], turns: ['Thanks for coming out. Call me in the spring and we will see'] },
   rehash_repeat_objection: { title: 'Rehash: the same price objection three times', persona: REHASH_LEAD, channels: ['sms'], turns: ['It is just too expensive for us right now', 'Honestly the price is still too high', 'The price is the problem, it is just too much'] },
   rehash_book_call: { title: 'Rehash: "Sure, what times?" then a pick', persona: REHASH_LEAD, channels: ['sms'], autoAnswer: true, turns: ['Sure, what times work for a call?'] },
+  // ── 2026-10-16 (Melissa, 6U6uceZGMQRz8XEQc9Lk): hearing the time she picked ──
+  same_day_pick_at_two: { title: 'Two times, she says "sunday at 2" (Melissa)', persona: MELISSA, channels: ['livechat'], autoAnswer: true, turns: ['I want the free estimate for my windows and sliding doors. Can someone come out this weekend?', pickOfferedTime('bare')] },
+  pick_with_question_mark: { title: 'Pick typed back with a "?" (Melissa)', persona: MELISSA, channels: ['livechat'], autoAnswer: true, turns: ['I want the free estimate for my windows and sliding doors. Can someone come out this weekend?', pickOfferedTime('label_q')] },
+  pick_plus_question: { title: 'Pick plus "company name, any specials?" (Melissa)', persona: MELISSA, channels: ['livechat'], autoAnswer: true, turns: ['I want the free estimate for my windows and sliding doors. Can someone come out this weekend?', pickOfferedTime('plus_q')] },
+  placeholder_name_then_melissa: { title: '"Guest Visitor" gives her name, books (Melissa)', persona: MELISSA, channels: ['livechat'], autoAnswer: true, turns: ['I want the free estimate for my windows and sliding doors. Can someone come out this weekend?', pickOfferedTime('bare')] },
+  bare_unit_address: { title: 'Address with a bare unit and a misspelled city (Melissa)', persona: MELISSA, channels: ['livechat'], autoAnswer: true, turns: ['I want the free estimate for my windows and sliding doors. Can someone come out this weekend?', pickOfferedTime('bare')] },
 });
 
 /** Parse a message list or a scenario name into one plan. Pure. */
@@ -254,7 +292,12 @@ export async function simulateLiveChat(plan, { nepqMode = 'live', productionDeps
     recordPosted: async () => ({ ok: true }),
     fingerprint: () => {},
     markSent: () => {},
-    captureIdentity: async (_id, input) => { record('ghl_field_capture', { capture: input?.capture || {}, visitor_text_count: (input?.visitorTexts || []).length }); return null; },
+    // 2026-10-16 (Melissa): the identity the capture would write (zip-filled
+    // city and state included) comes back, as in production; nothing is written.
+    captureIdentity: async (_id, input) => {
+      record('ghl_field_capture', { capture: input?.capture || {}, visitor_text_count: (input?.visitorTexts || []).length });
+      return captureChatIdentity(contactId, input, { fetchContact: async () => ({ id: contactId }), promote: async () => ({ written: 0 }) }).catch(() => null);
+    },
     findContactByPhone: (realContact && !holder) ? productionDeps.findContactByPhone : async (digits) => (holder && String(holder.phone).endsWith(String(digits).slice(-10)) ? { id: 'sim-holder', firstName: holder.firstName, lastName: holder.lastName, phone: holder.phone } : null),
     fetchAppointments: (realContact && !holder) ? productionDeps.fetchAppointments : async () => (holderAppt ? [holderAppt] : []),
     cancelAppointment: async (a) => { record('would_cancel_in_ghl', { appointment_id: a.appointmentId }); return { ok: true }; },
@@ -262,7 +305,7 @@ export async function simulateLiveChat(plan, { nepqMode = 'live', productionDeps
     postCancelCard: async (a) => { record('would_post_dispatch_card', { card: a.kind, text: String(a.text || '').slice(0, 400) }); return { ok: true }; },
     // 2026-10-13: an appointment id, or booking truth reads action_id 0 as no
     // booking and turns the confirm into the no-promise hand-off (live gate).
-    bookSlot: async (a) => { record('would_book', { start: a.startIso }); await recordBookedStage({ contactId, channel: 'livechat', source: 'sim' }, stageDeps); return { ok: true, action_id: 0, appointment_id: 'sim-booked' }; },
+    bookSlot: async (a) => { record('would_book', { start: a.startIso, address: a.address || null, contact_name: a.contactName || null }); await recordBookedStage({ contactId, channel: 'livechat', source: 'sim' }, stageDeps); return { ok: true, action_id: 0, appointment_id: 'sim-booked' }; },
     recordLeadStage: async (a) => { turnStage = stageNote(await recordStage(a, stageDeps)); return turnStage; },
     readLeadStage: async () => simStageRead(stageDeps, contactId),
     leadStageMode: () => stageDeps.mode,
@@ -325,7 +368,10 @@ export async function simulateLiveChat(plan, { nepqMode = 'live', productionDeps
     const queue = [...plan.turns];
     let autos = 0;
     for (let i = 0; queue.length; i++) {
-      await runTurn(queue.shift(), i);
+      // A turn may be a function of the bot's last reply (2026-10-16: pick one
+      // of the times the bot actually offered, in the lead's own words).
+      const next = queue.shift();
+      await runTurn(typeof next === 'function' ? next((transcript.at(-1)?.bot || []).at(-1) || '') : next, i);
       const lastBot = (transcript.at(-1)?.bot || []).at(-1);
       const auto = plan.autoAnswer && autos < MAX_AUTO_ANSWERS ? autoAnswerFor(lastBot, persona, { scriptDone: !queue.length }) : null;
       if (auto) { autos++; queue.unshift(auto); transcript.at(-1).next_auto = true; }
@@ -351,7 +397,8 @@ export async function simulateSms(plan, { nepqMode = 'live', generate, buildReal
   const queue = [...plan.turns];
   let autos = 0;
   for (let i = 0; queue.length; i++) {
-    const text = queue.shift();
+    const next = queue.shift();
+    const text = typeof next === 'function' ? next((transcript.at(-1)?.bot || []).at(-1) || '') : next;
     const at = new Date(nowMs + i * 60000).toISOString();
     thread.push({ direction: 'inbound', channel: 'sms', text, type: 'text', timestamp: at });
     const context = { ...(realBase || withPersonaLp(minimalContext({ contactId, contact, nowMs: nowMs + i * 60000 }), p)), conversation_recent: thread.slice(-20) };

@@ -30,7 +30,7 @@ import { isLeadQuestion, findBookingAsks } from './discovery-discipline.js';
 import { isTeamOpen, nextTeamOpenLabel, requestedCallTime, promisedCallback } from './team-hours.js';
 import { heldSlot, COLLECT_ASK, dmAnswerFromThread } from './booking-collect.js';
 import { RECHECK_RX } from './contact-check.js';
-import { slotMentionIndex, offeredSlots as offeredIn, pickSlot } from '../live-chat/cancel-flow.js';
+import { slotMentionIndex, offeredSlots as offeredIn, pickSlot, mentionedMinutes } from '../live-chat/cancel-flow.js';
 import { parseDayPreference, slotsForPreference, slotMatches, preferenceOfferLine } from './day-preference.js';
 import { enforceOneAsk } from './one-ask.js';
 import { isKnockComplaint } from './do-not-knock.js';
@@ -811,6 +811,12 @@ function planNepqTurnCore({
   })();
   const now = String(trigger || inbound[inbound.length - 1]?.text || '');
   const offerSlots = (Array.isArray(slots) ? slots : []).slice(0, 2).map(s => ({ ...s, tz: s.tz || tzLabel || '' }));
+  // 2026-10-16 (Melissa, 6U6uceZGMQRz8XEQc9Lk): "Sun, Oct 18 at 2:00 PM ET?"
+  // copied our own offer back with a "?" and was read as a question, so the
+  // pick was skipped (and the turn timed out into "Let me grab the right
+  // person"). A message that names one of our real times is a pick: its
+  // trailing "?" does not make it a question.
+  const nowAsks = isLeadQuestion(pickTextForQuestion(now, [...(Array.isArray(allSlots) ? allSlots : []), ...offerSlots]));
 
   // Counters, from the thread.
   let nos = 0;
@@ -1282,7 +1288,7 @@ function planNepqTurnCore({
   const lastIdx = (rx) => { for (let i = outbound.length - 1; i >= 0; i--) if (rx.test(outbound[i].text || '')) return i; return -1; };
   const bookedInThread = lastIdx(BOOKED_LINE_RX) > lastIdx(/\bis\s+(?:now\s+)?cancel+ed\b|\bhave\s+cancel+ed\b/i);
   if (hasAppointment || bookedInThread) {
-    if (!counters.reveal_used && !isLeadQuestion(now)) return fixed('reveal', LINES.reveal, { step: 'booked', booking: { allowed: false, reason: 'nepq:booked' } });
+    if (!counters.reveal_used && !nowAsks) return fixed('reveal', LINES.reveal, { step: 'booked', booking: { allowed: false, reason: 'nepq:booked' } });
     return Object.assign(plan, { step: 'booked', required_move: 'answer', booking: { allowed: false, reason: 'nepq:booked' } });
   }
 
@@ -1304,7 +1310,7 @@ function planNepqTurnCore({
   // same ask again.
   const held = heldSlot(turns);
   if (held && !isNotInterested(now) && !NEITHER_RX.test(now)) {
-    if (isLeadQuestion(now) && held.asked) {
+    if (nowAsks && held.asked) {
       return Object.assign(plan, { step: 'collect', required_move: 'answer', held_slot: held, reask_line: COLLECT_ASK[held.asked], booking: { allowed: true, reason: 'nepq:collect' } });
     }
     return Object.assign(plan, { step: 'collect', required_move: 'collect', held_slot: held, booking: { allowed: true, reason: 'nepq:collect' } });
@@ -1373,7 +1379,7 @@ function planNepqTurnCore({
   // 2 PM" after "what day works best for you both?" got two times back).
   // "after 2", "before noon" and "around 2" are preferences, not picks.
   const PREF_WORD_RX = /\b(?:after|before|until|around|by|usually|earliest|latest)\b/i;
-  if (offerSlots.length && !isLeadQuestion(now) && !PREF_WORD_RX.test(now) && !SLOT_OFFER_RX.test(lastOut)) {
+  if (offerSlots.length && !nowAsks && !PREF_WORD_RX.test(now) && !SLOT_OFFER_RX.test(lastOut)) {
     const exactPick = exactSlotFor(now, offerSlots);
     if (exactPick) {
       plan.slots_to_offer = offerSlots;
@@ -1392,7 +1398,7 @@ function planNepqTurnCore({
   // of an offer that never named it).
   const allPool = Array.isArray(allSlots) ? allSlots.map(s => ({ ...s, tz: s.tz || tzLabel || '' })) : [];
   const offeredInThread = lastOfferOut ? allPool.filter(s => slotMentionIndex(lastOfferOut, s) >= 0) : offerSlots;
-  if (offerSlots.length && allPool.length >= 2 && !isLeadQuestion(now) && !PREF_WORD_RX.test(now) && !/\b(?:can'?t|cannot|not|won'?t|busy|except)\b/i.test(now) && typedClock(now) != null && !exactSlotFor(now, offeredInThread)) {
+  if (offerSlots.length && allPool.length >= 2 && !nowAsks && !PREF_WORD_RX.test(now) && !/\b(?:can'?t|cannot|not|won'?t|busy|except)\b/i.test(now) && typedClock(now) != null && !exactSlotFor(now, offeredInThread)) {
     const all = allPool;
     // A day AND time they typed that is open ("Sunday at 2 PM") is the pick.
     const named = all.filter(s => slotMentionIndex(now, s) >= 0);
@@ -1426,7 +1432,7 @@ function planNepqTurnCore({
   // A short message that is only a day ("Usually on Wednesdays") is their
   // availability whatever we asked (2026-10-03 SMS replay: it got the bridge,
   // then "we don't have a Wednesday slot", which was not true).
-  const bareDay = !!pref?.days && String(now).trim().split(/\s+/).length <= 6 && !isLeadQuestion(now);
+  const bareDay = !!pref?.days && String(now).trim().split(/\s+/).length <= 6 && !nowAsks;
   const prefScheduling = !!pref && (ASK_DAY_RX.test(lastOut) || /\b(?:what|which)\s+day\b|\bwhen\s+(?:works|would|is\s+good)\b/i.test(lastOut)
     || !!lastOfferOut || BRIDGE_RX.test(lastOut) || counters.bridge_used || SCHEDULE_ASK_RX.test(now) || bareDay);
   // The caller loads the calendar for this (wantsSlots) and plans again.
@@ -1439,7 +1445,10 @@ function planNepqTurnCore({
     return fixed('ask_day', `${pref.label} ${verb}. What time of day is best for you?`, { step: 'ask_day', booking: { allowed: true, reason: 'nepq:day_preference_no_slots' } });
   }
   if (prefScheduling && pool.length >= 2) {
-    const offeredNow = lastOfferOut ? pool.filter(s => lastOfferOut.includes(`${s.day} at ${s.time}`) || (s.rel && lastOfferOut.includes(`${s.rel} at ${s.time}`))) : [];
+    // 2026-10-16 (Melissa): read by meaning, not the exact label. The model
+    // wrote "Sun, Oct 18 at 2:00 PM ET" / "Sunday at 2 PM", the exact check
+    // found nothing on the table, and "sunday at 2" was re-offered two Sunday times.
+    const offeredNow = lastOfferOut ? pool.filter(s => slotMentionIndex(lastOfferOut, s) >= 0) : [];
     if (!offeredNow.some(s => slotMatches(s, pref))) {
       const picked = slotsForPreference(pool, pref, { nowMs });
       const line = preferenceOfferLine(pref, picked, tzLabel);
@@ -1468,11 +1477,11 @@ function planNepqTurnCore({
     const ready = (YES_RX.test(now) && offerAsk) || SCHEDULE_ASK_RX.test(now) || STREET_ADDRESS_RX.test(now);
     const pastBridge = counters.bridge_used || stageAtCommit;
     // A pick of the newest offer, after the 4-message window step 5 reads.
-    if (!lastOfferOut && latestOfferText && sBase === 'commitment_offered' && (DAY_OR_TIME_RX.test(now) || BARE_PICK_RX.test(now)) && !isLeadQuestion(now)) {
+    if (!lastOfferOut && latestOfferText && sBase === 'commitment_offered' && (DAY_OR_TIME_RX.test(now) || BARE_PICK_RX.test(now)) && !nowAsks) {
       return Object.assign(plan, { step: 'confirm', required_move: 'confirm', last_offer: latestOfferText, booking: { allowed: true, reason: 'nepq:stage_pick' } });
     }
     if (ready || pastBridge) {
-      if (isLeadQuestion(now)) return stagedOffer(true);
+      if (nowAsks) return stagedOffer(true);
       return stagedOffer();
     }
   }
@@ -1480,7 +1489,7 @@ function planNepqTurnCore({
   // 4b. They typed a day and a time with no offer on the table: two real
   // times near it. A question in the same burst is answered first.
   if (timeRequest) {
-    const asked = isLeadQuestion(now) && !TIME_REQUEST_RX.test(now);
+    const asked = nowAsks && !TIME_REQUEST_RX.test(now);
     // 2026-10-02 (Mark's 5:22 PM chat, SMS replay): "Fine lets book for 2 PM"
     // got two times back instead of the 2 PM it asked for. A typed time that
     // IS one of the real openings is the pick.
@@ -1513,7 +1522,7 @@ function planNepqTurnCore({
     // replay: an address after the offer got "Good news, 12 Main St is in our
     // service area." and no question). Back to the times, in other words.
     // Asked three times with no pick: ask the day instead of a fourth time.
-    if (!isLeadQuestion(now) && !objType && offerSlots.length === 2) {
+    if (!nowAsks && !objType && offerSlots.length === 2) {
       // 2026-10-13 (Erica Hilts): the same two times never go out a third time.
       const offersInARow = outbound.slice(-2).filter(t => SLOT_OFFER_RX.test(t.text || '')).length;
       if (offersInARow >= 2) return fixed('ask_day', vary(LINES.ask_day, ALT_LINES.ask_day), { step: 'ask_day', booking: { allowed: true, reason: 'nepq:ask_day' } });
@@ -1541,14 +1550,14 @@ function planNepqTurnCore({
   // stops asking once the lead has done their own convincing.
   const READY = /^(?:lead_asked_about_scheduling|lead_answered_booking_prerequisite|lead_answered_decision_maker_ask|urgent_deadline_stated|recommended_action:)/;
   if (discipline?.booking?.allowed && READY.test(String(discipline.booking.reason || ''))) {
-    if (offerSlots.length === 2 && !isLeadQuestion(now)) return fixed('offer_slots', withSlots(LINES.offer_slots(offerSlots, counters.slot_offers)), { step: 'offer_slots' });
-    return Object.assign(plan, { step: 'offer_slots', required_move: isLeadQuestion(now) ? 'answer' : 'offer_slots', booking: { allowed: true, reason: discipline.booking.reason } });
+    if (offerSlots.length === 2 && !nowAsks) return fixed('offer_slots', withSlots(LINES.offer_slots(offerSlots, counters.slot_offers)), { step: 'offer_slots' });
+    return Object.assign(plan, { step: 'offer_slots', required_move: nowAsks ? 'answer' : 'offer_slots', booking: { allowed: true, reason: discipline.booking.reason } });
   }
 
   // 6a. Yes to the bridge with a question in the same message ("Yeah, how
   // long does that take?"): answer it in one sentence, then the two times.
   // Mark's test chat (2026-10-02) got "a team member will call you" here.
-  if (BRIDGE_RX.test(lastOut) && YES_RX.test(now) && isLeadQuestion(now)) {
+  if (BRIDGE_RX.test(lastOut) && YES_RX.test(now) && nowAsks) {
     if (offerSlots.length === 2) {
       withSlots(null);
       return Object.assign(plan, { step: 'offer_slots', required_move: 'offer_slots', answer_first: true, offer_line: LINES.offer_slots(offerSlots, counters.slot_offers) });
@@ -1559,7 +1568,7 @@ function planNepqTurnCore({
   }
 
   // 6. They asked us something: answer it first (one question after, at most).
-  if (isLeadQuestion(now)) {
+  if (nowAsks) {
     plan.required_move = 'answer';
     plan.allowed.consequence = false;
     return plan;
@@ -1650,6 +1659,20 @@ function planNepqTurnCore({
  */
 export function planNepqTurn(args = {}) {
   const plan = args?.stage?.stage ? gateForStage(planNepqTurnCore(args), args) : openingsGate(args);
+  // 2026-10-16 (Melissa): "sunday at 2 - what is the company name are there
+  // any specials going on". The pick is held and the question answered in one
+  // short line in the same reply; it is never dropped.
+  // 2026-10-16 (Melissa): "No problem. What day works best for you?" went to a
+  // lead who had said "sunday at 2" twice. Once they named a day, the day is
+  // never asked again: the time of day on that day is.
+  if (plan && plan.required_move === 'ask_day' && plan.fixed_line && /\bwhat\s+day\b|\bwhich\s+day\b/i.test(plan.fixed_line)) {
+    const named = namedDayInThread(args);
+    if (named) plan.fixed_line = `${named} works. What time of day is best for you?`;
+  }
+  if (plan && (plan.required_move === 'confirm' || plan.required_move === 'collect') && !plan.side_question) {
+    const side = sideQuestionOf(args?.trigger || '');
+    if (side) Object.assign(plan, { answer_first: true, side_question: side });
+  }
   return args?.directiveNoTimes ? withoutTimeOffer(plan) : plan;
 }
 
@@ -2128,6 +2151,56 @@ export function nearestToClock(slots, minutes, text = '', nowMs = Date.now()) {
 }
 
 /** The one real opening a typed time names ("2 PM", "tomorrow at 10"), or null. Pure. */
+/**
+ * The text to test for a question: a trailing "?" comes off when the message
+ * names one of the real times we have (2026-10-16, Melissa: "Sun, Oct 18 at
+ * 2:00 PM ET?" is a pick, not a question). Pure.
+ */
+/**
+ * The day the lead named in their last few messages ("sunday at 2" → "Sunday"),
+ * or null. Read from the lead's own words only. Pure.
+ */
+export function namedDayInThread({ conversation = [], trigger = '' } = {}) {
+  const turns = normalizeThread(conversation, trigger);
+  const inbound = turns.filter(t => t.direction === 'inbound').slice(-4).reverse();
+  for (const t of inbound) {
+    if (NEITHER_RX.test(t.text || '')) return null;
+    const pref = parseDayPreference(t.text || '');
+    if (pref?.days?.length === 1 && pref.label) return pref.label.replace(/s$/i, '');
+    // A day with a clock time ("Sunday at 2pm oct 18") is not a preference to
+    // parseDayPreference, but it still names the day.
+    const m = String(t.text || '').match(/\b(sun|mon|tue|wed|thu|fri|sat)(?:day|sday|nesday|rsday|urday)?\b/i);
+    if (m) return ({ sun: 'Sunday', mon: 'Monday', tue: 'Tuesday', wed: 'Wednesday', thu: 'Thursday', fri: 'Friday', sat: 'Saturday' })[m[1].toLowerCase()];
+  }
+  return null;
+}
+
+export function pickTextForQuestion(text, slots = []) {
+  const t = String(text || '');
+  if (!/\?\s*$/.test(t)) return t;
+  const bare = t.replace(/\?+\s*$/, '');
+  if (QUESTION_OPENER_SIDE_RX.test(bare.trim())) return t;
+  const named = (Array.isArray(slots) ? slots : []).some(s => s && slotMentionIndex(bare, s) >= 0);
+  return named || (mentionedMinutes(bare).size > 0 && DAY_OR_TIME_RX.test(bare)) ? bare : t;
+}
+
+const QUESTION_OPENER_SIDE_RX = /^(?:and\s+|also\s+|plus\s+|oh\s+and\s+)?(?:who|what|what'?s|whats|when|where|why|how|which|do|does|did|can|could|is|are|will|would|should|any)\b/i;
+
+/**
+ * A question asked beside a time pick ("sunday at 2 - what is the company
+ * name are there any specials going on"), or null. The pick is held AND the
+ * question answered in one short line; the question is never dropped
+ * (2026-10-16, Melissa). Pure.
+ */
+export function sideQuestionOf(text) {
+  const parts = String(text || '')
+    .split(/\s+[-\u2013\u2014]+\s+|[?.!;]+\s*|,\s+(?=(?:and\s+|also\s+)?(?:who|what|when|where|why|how|which|do|does|is|are|any|can|could)\b)/i)
+    .map(x => x.trim()).filter(Boolean);
+  if (parts.length < 2) return null;
+  const qs = parts.filter(p => QUESTION_OPENER_SIDE_RX.test(p) && p.split(/\s+/).length >= 3 && !mentionedMinutes(p).size && !DAY_OR_TIME_RX.test(p));
+  return qs.length ? qs.join('; ').slice(0, 200) : null;
+}
+
 export function exactSlotFor(text, slots = []) {
   const m = String(text || '').match(/\b(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?)/i);
   if (!m) return null;

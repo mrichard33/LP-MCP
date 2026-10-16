@@ -927,7 +927,7 @@ test('NEPQ live: an on-file address is read back once, then the visit is booked 
   assert.match(hold, /I'm holding Wed, Oct 7 at 2:00 PM ET for you\. Is the visit at 123 Main St, Tampa\?$/);
   const two = nepqLane({ contact: READY_CONTACT, messages: [M('inbound', 'let me think about it', 4), M('outbound', offer, 3), M('inbound', 'wednesday works', 2), M('outbound', hold, 1)] });
   await two.lane.processInbound(INBOUND('yes'));
-  assert.deepEqual(two.state.bookings, [{ contactId: 'C1', startIso: '2026-10-07T18:00:00Z', calendarId: 'CALWE', decisionMakers: null, address: '123 Main St, Tampa, FL 33601' }]);
+  assert.deepEqual(two.state.bookings, [{ contactId: 'C1', startIso: '2026-10-07T18:00:00Z', calendarId: 'CALWE', decisionMakers: null, address: '123 Main St, Tampa, FL 33601', contactName: 'Alyce' }]);
   assert.equal(two.state.sends[0].message, "You're all set, Alyce. Someone from our team will give you a call to confirm the details. You're on the calendar for Wed, Oct 7 at 2:00 PM ET.");
 });
 
@@ -975,7 +975,7 @@ test('NEPQ live (Mark, 2026-10-02): a pick with the address missing is held, the
   // 3. "Just me": booked on the held time with Solo Owner.
   const three = nepqLane({ contact: { address1: '123 Main St', postalCode: '33601' }, messages: [M('outbound', offer, 4), M('inbound', 'the first one', 3), M('outbound', hold, 2), M('inbound', '123 Main St, Tampa FL 33601', 1), M('outbound', dmAsk, 0.5)] });
   await three.lane.processInbound(INBOUND('just me'));
-  assert.deepEqual(three.state.bookings, [{ contactId: 'C1', startIso: '2026-10-06T14:00:00Z', calendarId: 'CALWE', decisionMakers: 'Solo Owner', address: '123 Main St, Tampa, FL 33601' }]);
+  assert.deepEqual(three.state.bookings, [{ contactId: 'C1', startIso: '2026-10-06T14:00:00Z', calendarId: 'CALWE', decisionMakers: 'Solo Owner', address: '123 Main St, Tampa, FL 33601', contactName: 'Alyce' }]);
   assert.match(three.state.sends[0].message, /^You're all set, Alyce\. Someone from our team will give you a call to confirm the details\. You're on the calendar for Tue, Oct 6 at 10:00 AM ET\.$/);
 });
 
@@ -1006,7 +1006,7 @@ test('NEPQ live: a guest who types their name, phone, address and "just me" is b
   assert.match(c.state.sends[0].message, /anyone else be part of the decision/);
   const t4 = [...t3, M('inbound', '12 Main St, Ocala FL 34470', 2), M('outbound', c.state.sends[0].message, 1)];
   const e = lane(t4); await e.lane.processInbound(INBOUND('No, just me'));
-  assert.deepEqual(e.state.bookings, [{ contactId: 'C1', startIso: '2026-10-06T14:00:00Z', calendarId: 'CALWE', decisionMakers: 'Solo Owner', address: '12 Main St, Ocala, FL 34470' }]);
+  assert.deepEqual(e.state.bookings, [{ contactId: 'C1', startIso: '2026-10-06T14:00:00Z', calendarId: 'CALWE', decisionMakers: 'Solo Owner', address: '12 Main St, Ocala, FL 34470', contactName: 'Mark' }]);
   assert.equal(e.state.sends[0].message, "You're all set, Mark. Someone from our team will give you a call to confirm the details. You're on the calendar for Tue, Oct 6 at 10:00 AM ET.");
 });
 
