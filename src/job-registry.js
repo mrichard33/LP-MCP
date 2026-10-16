@@ -226,6 +226,29 @@ export const JOBS = Object.freeze([
     isEnabled: (env) => String(env.INCIDENT_NOTIFIER_MODE ?? 'shadow').toLowerCase().trim() !== 'off',
   },
   {
+    // 2026-10-16 — Siro PR 1: the poll backstop for the Siro webhook. Pages
+    // recordings updated since the watermark and runs each through the same
+    // processRecording the webhook uses (src/siro/ingest.js).
+    id: 'siro-recording-sync',
+    label: 'Siro recordings poll backstop',
+    group: 'sync',
+    cadence: 'every 10 min',
+    enabledEnv: 'SIRO_SYNC_MODE',
+    enabledDefault: true,
+    isEnabled: (env) => String(env.SIRO_SYNC_MODE ?? 'shadow').toLowerCase().trim() !== 'off',
+  },
+  {
+    // 2026-10-16 — Siro PR 1: month-to-date rep scorecards from Siro's saved
+    // scorecard instances (filterBy=USER) into siro_rep_scorecards.
+    id: 'siro-rep-scorecard-sync',
+    label: 'Siro rep scorecards',
+    group: 'scorecard',
+    cadence: 'daily 03:30 ET',
+    enabledEnv: 'SIRO_SCORECARD_SYNC_MODE',
+    enabledDefault: false,
+    isEnabled: (env) => String(env.SIRO_SCORECARD_SYNC_MODE ?? 'off').toLowerCase().trim() !== 'off',
+  },
+  {
     // 2026-10-15 — System Health Phase 1.7: health_results → daily rollup at 30
     // days, n8n log 14d, synthetic runs 30d, lead_leak_daily summarized then 90d.
     id: 'health-retention',
