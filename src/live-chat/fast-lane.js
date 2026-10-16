@@ -73,6 +73,7 @@ import { findSixPmSlot, eveningRequestFromThread, eveningReplyLine, requestedLab
 import { capacityGateEnabled } from '../knowledge/market-capacity-gate.js';
 import { buildStageInput, leadStageMode, rescheduleStepFor } from '../agentic/lead-stage.js';
 import { typedZipFromThread } from '../services/contact-timezone.js';
+import { labelClockTimes } from '../agentic/time-zone-label.js';
 import { shouldRecordPromise } from '../agentic/sms-format.js';
 import { NO_DIAL_REASONS } from '../agentic/bot-callback.js';
 import { isCustomerP2 } from '../agentic/lead-state/signals/context-reader.js';
@@ -1524,6 +1525,8 @@ export function createLiveChatFastLane(deps) {
 
     return deliver({
       contactId, conversationId, body, mode, actionId, timing, draft, turn, visitorTexts, pastDemo,
+      // The zone the turn's times were read in, else the zone the visitor's market set (2026-10-16).
+      tzLabel: nepqSlots?.tzLabel || (context.market?.timezone ? tzLabel(context.market.timezone) : null),
       stageInput: buildStageInput({
         conversation: context.conversation_recent || [], trigger: body, plan: nepqPlan,
         zip: coverage?.zip || context.lead?.postal_code || null,
@@ -1916,7 +1919,7 @@ export function createLiveChatFastLane(deps) {
   }
 
   /** Send (live) or record (shadow) one finished reply. */
-  async function deliver({ contactId, conversationId, body, mode, actionId, timing, draft, capture = {}, extras = {}, fingerprintExtras = {}, isSuperseded = () => false, turn = newTurnClaim(), visitorTexts = [], skipCapture = false, stageInput = null, pastDemo = false }) {
+  async function deliver({ contactId, conversationId, body, mode, actionId, timing, draft, capture = {}, extras = {}, fingerprintExtras = {}, isSuperseded = () => false, turn = newTurnClaim(), visitorTexts = [], skipCapture = false, stageInput = null, pastDemo = false, tzLabel: replyTzLabel = null }) {
     // A newer message from this visitor arrived while this reply was being
     // written: the newer turn answers both (2026-10-02, tzuzq double reply).
     if (isSuperseded()) {
@@ -1943,6 +1946,14 @@ export function createLiveChatFastLane(deps) {
       if (team.changes.length || callTiming.changed) {
         d.log(`[TeamVoice] live chat ${contactId} ${[...team.changes, ...(callTiming.changed ? ['call_timing'] : [])].join(',')}`);
         draft = callTiming.text;
+      }
+      // 2026-10-16 (bot gate, houston_tz/livechat): a non-Eastern lead reads
+      // every clock time with its zone ("9:00 AM CT"). The label rode on the
+      // model's wording and once went missing; code adds it now (time-zone-label.js).
+      const tzFix = labelClockTimes(draft, replyTzLabel);
+      if (tzFix.changed) {
+        d.log(`[TzLabel] live chat ${contactId} clock times labelled ${replyTzLabel}`);
+        draft = tzFix.text;
       }
       // We do not work on manufactured or mobile homes (2026-10-05): this
       // lane told a visitor "Yes, we work on manufactured homes."
