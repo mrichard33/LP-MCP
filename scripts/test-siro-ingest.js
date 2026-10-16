@@ -7,7 +7,7 @@ import assert from 'node:assert/strict';
 import { Webhook } from 'svix';
 import { fakeSupabase } from './lib/fake-supabase.js';
 import { processRecording, queueDemoNote } from '../src/siro/ingest.js';
-import { makeSiroWebhookHandler, readyToAct, registerSiroWebhookRoutes } from '../src/siro/webhook.js';
+import { makeSiroWebhookHandler, readyToAct, registerSiroWebhookRoutes, headerKeyMatches } from '../src/siro/webhook.js';
 import { runSiroRecordingSync, WATERMARK_KEY } from '../src/jobs/siro-recording-sync.js';
 import { RAW_RECORDING } from './fixtures/siro-recording.js';
 
@@ -102,38 +102,56 @@ function fakeRes() {
   return r;
 }
 const SECRET = 'whsec_' + Buffer.from('test-secret-test-secret-123456').toString('base64');
+const KEY = 'header-key-123';
+const ENV = { SIRO_WEBHOOK_SECRET: SECRET, SIRO_WEBHOOK_HEADER_KEY: KEY };
+const withKey = (h) => ({ ...h, 'x-reece-webhook-key': KEY });
 
-test('webhook: unset secret 401, missing or bad signature 401, duplicate 200, acts only when processed AND linked', async () => {
+test('webhook: fail closed, both checks or 401; duplicate 200; acts only when processed AND linked', async () => {
   const body = JSON.stringify({ recordingId: 'rec_abc123', recordingProcessed: true, recordingLinked: true, eventType: 'integrations.recordingLinked' });
   const db = fakeSupabase({});
   const jobs = [];
   const deps = { supabase: db, siro: fakeSiro(), readLeads, log: quiet, trackBackground: (p) => jobs.push(p) };
+  const call = async (env, headers, b = body) => { const res = fakeRes(); await makeSiroWebhookHandler({ env, deps })({ body: Buffer.from(b), headers }, res); return res; };
 
-  let res = fakeRes();
-  await makeSiroWebhookHandler({ env: {}, deps })({ body: Buffer.from(body), headers: signed(SECRET, body) }, res);
-  assert.equal(res.code, 401);
+  // Either variable unset refuses everything.
+  assert.equal((await call({}, withKey(signed(SECRET, body)))).code, 401);
+  assert.equal((await call({ SIRO_WEBHOOK_SECRET: SECRET }, withKey(signed(SECRET, body)))).code, 401);
+  assert.equal((await call({ SIRO_WEBHOOK_HEADER_KEY: KEY }, withKey(signed(SECRET, body)))).code, 401);
+  // Unsigned, no key: 401 even with the mode off.
+  assert.equal((await call({ ...ENV, SIRO_WEBHOOK_MODE: 'off' }, {})).code, 401);
+  // A valid signature without the key, or a wrong key: 401.
+  assert.equal((await call(ENV, signed(SECRET, body))).code, 401);
+  assert.equal((await call(ENV, { ...signed(SECRET, body), 'x-reece-webhook-key': 'wrong' })).code, 401);
+  // The right key without a valid signature: 401.
+  assert.equal((await call(ENV, withKey({ ...signed(SECRET, body), 'svix-signature': 'v1,bad' }))).code, 401);
+  assert.equal((await call(ENV, { 'x-reece-webhook-key': KEY })).code, 401);
 
-  res = fakeRes();
-  await makeSiroWebhookHandler({ env: { SIRO_WEBHOOK_SECRET: SECRET, SIRO_WEBHOOK_MODE: 'off' }, deps })({ body: Buffer.from(body), headers: {} }, res);
-  assert.equal(res.code, 401, 'even with the mode off, an unsigned request is refused');
-
-  res = fakeRes();
-  await makeSiroWebhookHandler({ env: { SIRO_WEBHOOK_SECRET: SECRET }, deps })({ body: Buffer.from(body), headers: { ...signed(SECRET, body), 'svix-signature': 'v1,bad' } }, res);
-  assert.equal(res.code, 401);
-
-  res = fakeRes();
-  await makeSiroWebhookHandler({ env: { SIRO_WEBHOOK_SECRET: SECRET }, deps })({ body: Buffer.from(body), headers: signed(SECRET, body) }, res);
-  assert.equal(res.code, 200);
-  assert.equal(res.body.accepted, true);
+  const ok = await call(ENV, withKey(signed(SECRET, body)));
+  assert.equal(ok.code, 200);
+  assert.equal(ok.body.accepted, true);
   await Promise.all(jobs);
   assert.equal(db.tables.siro_recordings.length, 1);
   assert.equal(db.tables.siro_webhook_events[0].handled, true);
+  // A redelivery: the real table's primary key on svix_id answers 23505.
+  const realFrom = db.from;
+  db.from = (t) => (t === 'siro_webhook_events'
+    ? { insert: async () => ({ data: null, error: { code: '23505', message: 'duplicate key' } }) }
+    : realFrom(t));
+  const dup = await call(ENV, withKey(signed(SECRET, body)));
+  assert.equal(dup.body.duplicate, true);
+  db.from = realFrom;
 
   const half = JSON.stringify({ recordingId: 'rec_2', recordingProcessed: true, recordingLinked: false, eventType: 'integrations.recordingProcessed' });
-  res = fakeRes();
-  await makeSiroWebhookHandler({ env: { SIRO_WEBHOOK_SECRET: SECRET }, deps })({ body: Buffer.from(half), headers: signed(SECRET, half, 'msg_2') }, res);
-  assert.equal(res.body.waiting, 'processed_and_linked');
+  const wait = await call(ENV, withKey(signed(SECRET, half, 'msg_2')), half);
+  assert.equal(wait.body.waiting, 'processed_and_linked');
   assert.equal(readyToAct({ recordingProcessed: true, recordingLinked: true }), true);
+});
+
+test('header key compare: equal only when identical, never throws on length', () => {
+  assert.equal(headerKeyMatches('abc', 'abc'), true);
+  assert.equal(headerKeyMatches('abcd', 'abc'), false);
+  assert.equal(headerKeyMatches(undefined, 'abc'), false);
+  assert.equal(headerKeyMatches('abc', ''), false);
 });
 
 test('poll: pages, stores, moves the watermark only after a full pass', async () => {
@@ -161,7 +179,7 @@ test('the route mounts on POST /webhook/siro and logs its mode', () => {
   const orig = console.log;
   console.log = (l) => logs.push(String(l));
   try {
-    registerSiroWebhookRoutes({ post: (path) => routes.push(path) }, { SIRO_WEBHOOK_MODE: 'live', SIRO_WEBHOOK_SECRET: SECRET });
+    registerSiroWebhookRoutes({ post: (path) => routes.push(path) }, { ...ENV, SIRO_WEBHOOK_MODE: 'live' });
   } finally { console.log = orig; }
   assert.deepEqual(routes, ['/webhook/siro']);
   assert.ok(logs.includes('[Siro] webhook route mounted mode=live'));

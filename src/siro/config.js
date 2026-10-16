@@ -45,6 +45,8 @@ export function siroConfig(env = process.env) {
     clientSecret: env.SIRO_CLIENT_SECRET || '',
     legacyToken: env.SIRO_API || '',
     webhookSecret: env.SIRO_WEBHOOK_SECRET || '',
+    // 2026-10-16 (the user): a second, shared header key on top of the svix signature.
+    webhookHeaderKey: env.SIRO_WEBHOOK_HEADER_KEY || '',
     organizationId: env.SIRO_ORGANIZATION_ID || '',
     lpConnectionId: env.SIRO_LP_CONNECTION_ID || '',
     presentationConversationType: env.SIRO_PRESENTATION_CONVERSATION_TYPE || '',
