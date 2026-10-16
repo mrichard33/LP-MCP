@@ -200,6 +200,10 @@ const ALLOWED_EVENT_TYPES = new Set([
                                    // LP_APPT_GUARD_MODE's verdicts; no rule consumes
                                    // it. Dropped here, the go-live evidence would be
                                    // gone, as the parity events were on 2026-09-14.
+  'siro.recording_processed',      // 2026-10-16 — a Siro demo recording matched to
+                                   // its lead (src/siro/ingest.js). No rule yet; the
+                                   // examples in sql/seeds/2026-10-16_siro_rules_EXAMPLES.sql
+                                   // would read it. Dropped here, they never could.
 
   // Quiet but rule-watched (must not drop)
   'ghl.lead_score_changed',        // 4 rules (W11_1_*)

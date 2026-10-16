@@ -59,7 +59,7 @@ test('the scanner sees both spellings of a flag read', () => {
 });
 
 test('the roster is pinned (bump on purpose when a flag is added or removed)', () => {
-  assert.equal(MODES.length, 107); // +HOLD_RETURN_RECOVERY_MODE (2026-10-16); +ESTIMATE_DRIFT_FIX_MODE (2026-10-16); +LIVE_CHAT_LARGE_JOB_ALERT_MODE, +LIVE_CHAT_SUMMARY_MODE (2026-10-15); +FIVE9_JOURNEY_SYNC_MODE (2026-10-15); +CANCEL_RESET_ROUTING_MODE (2026-10-15); +MISSED_INBOUND_SWEEP_MODE (2026-10-15); +HEALTH_CHECKS_MODE, +DIALER_SLA_MODE, +APPT_PIPELINE_MODE, +INCIDENT_NOTIFIER_MODE, +HEALTH_RETENTION_MODE (2026-10-15); +SCOPE_DQ_MODE (2026-10-13); +AFTER_ASAP_RETRY_MODE, +AFTER_ASAP_RETRY_CALL_NOW_MODE (2026-10-14)
+  assert.equal(MODES.length, 114); // +SIRO_WEBHOOK/SYNC/CONTEXT/ENSURE/DEMO_NOTE/SCORECARD_SYNC_MODE, +F0_V2_MODE (2026-10-16); +HOLD_RETURN_RECOVERY_MODE (2026-10-16); +ESTIMATE_DRIFT_FIX_MODE (2026-10-16); +LIVE_CHAT_LARGE_JOB_ALERT_MODE, +LIVE_CHAT_SUMMARY_MODE (2026-10-15); +FIVE9_JOURNEY_SYNC_MODE (2026-10-15); +CANCEL_RESET_ROUTING_MODE (2026-10-15); +MISSED_INBOUND_SWEEP_MODE (2026-10-15); +HEALTH_CHECKS_MODE, +DIALER_SLA_MODE, +APPT_PIPELINE_MODE, +INCIDENT_NOTIFIER_MODE, +HEALTH_RETENTION_MODE (2026-10-15); +SCOPE_DQ_MODE (2026-10-13); +AFTER_ASAP_RETRY_MODE, +AFTER_ASAP_RETRY_CALL_NOW_MODE (2026-10-14)
   assert.equal(new Set(MODE_NAMES).size, MODES.length, 'duplicate names');
 });
 
@@ -123,7 +123,7 @@ test('stateOf: listed values, "otherwise" flags, choices, and an unknown value',
 
 test('modeRows records the value, the state and whether the variable is set', () => {
   const rows = modeRows(MODES, { env: { SEND_GATE_MODE: 'live', KB_VECTOR_MODE: 'shadow' }, now: Date.parse('2026-10-12T00:00:00Z') });
-  assert.equal(rows.length, 107);
+  assert.equal(rows.length, 114);
   const send = rows.find((r) => r.name === 'SEND_GATE_MODE');
   assert.equal(send.current_value, 'live');
   assert.equal(send.current_state, 'live');
@@ -139,8 +139,8 @@ test('registerModes upserts on name and never throws', async () => {
   const calls = [];
   const fake = (error) => ({ from: (t) => ({ upsert: async (rows, opts) => { calls.push({ t, n: rows.length, opts }); return { error }; } }) });
   const ok = await registerModes(MODES, { supabase: fake(null), env: {} });
-  assert.equal(ok.registered, 107);
-  assert.deepEqual(calls[0], { t: 'feature_modes', n: 107, opts: { onConflict: 'name' } });
+  assert.equal(ok.registered, 114);
+  assert.deepEqual(calls[0], { t: 'feature_modes', n: 114, opts: { onConflict: 'name' } });
   const bad = await registerModes(MODES, { supabase: fake({ message: 'relation "feature_modes" does not exist' }), env: {} });
   assert.equal(bad.registered, 0);
   assert.match(bad.error, /does not exist/);

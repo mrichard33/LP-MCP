@@ -32,7 +32,7 @@ import { isCallPromise } from '../agentic/promised-callbacks.js';
 // changes; a bump makes the next run a new baseline and disables the WORSE
 // gate. A NEW scenario is not a bump: compareScorecards scores the pass rate
 // over the scenarios both runs share and lists new ones apart.
-export const SCORING_VERSION = '2026-10-13.3';
+export const SCORING_VERSION = '2026-10-16.1';
 
 const CLOCK_RX = /\b\d{1,2}(?::\d{2})?\s*(?:AM|PM)\b/gi;
 const clockCount = (text) => (String(text || '').match(CLOCK_RX) || []).length;
@@ -232,6 +232,18 @@ export const SCENARIO_EXPECTATIONS = Object.freeze({
     if (first && first.nepq?.step !== 'defer') out.push({ code: 'deferral_not_recognised', detail: `step ${first.nepq?.step || 'none'}`, turn: first.turn });
     if (first && replies(first).length > 1) out.push({ code: 'more_than_one_ack', detail: `${replies(first).length} replies`, turn: first.turn });
     for (const { turn: n, text } of allReplies(r)) if (clockCount(text)) out.push({ code: 'times_after_deferral', detail: text, turn: n });
+    return out;
+  },
+  // 2026-10-16 (Siro PR 1): the reply picks up the visit's hesitation in the
+  // lead's own terms, states no price (the summary carries one), one question.
+  rehash_siro_price_objection: (r) => {
+    const out = rehashLaneFailures(r);
+    const first = (r.transcript || [])[0];
+    const text = first ? replies(first).join(' ') : '';
+    if (!/\b(?:price|cost|budget|spend|afford|invest|number)/i.test(text)) out.push({ code: 'visit_hesitation_ignored', detail: text, turn: first?.turn });
+    if (/\$\s?\d|\b\d[\d,]{2,}\b/.test(text)) out.push({ code: 'price_from_visit_stated', detail: text, turn: first?.turn });
+    if ((text.match(/\?/g) || []).length !== 1) out.push({ code: 'not_one_question', detail: text, turn: first?.turn });
+    if (/\b(?:said|mentioned)\b/i.test(text) && /\b(?:brian|rep)\b/i.test(text)) out.push({ code: 'rep_quoted', detail: text, turn: first?.turn });
     return out;
   },
   rehash_repeat_objection: (r) => {

@@ -123,6 +123,9 @@ import { registerAppointmentNotificationRoutes } from './notifications/appointme
 import { registerGroupMeRoutes } from './groupme.js';
 // ─── Slack approval buttons (Approve / Reject on approval cards) ─
 import { registerSlackApprovalRoutes, slackRawBodyParser } from './slack-approvals.js';
+import { registerSiroWebhookRoutes, siroRawBodyParser } from './siro/webhook.js';  // 2026-10-16 Siro PR 1
+import { startSiroRecordingSyncScheduler } from './jobs/siro-recording-sync.js';
+import { startSiroScorecardSyncScheduler } from './jobs/siro-rep-scorecard-sync.js';
 import { registerDncLiftDecisionRoutes } from './consent/dnc-lift-decision.js';
 import { registerApDncReentryRoutes } from './consent/dnc-lift-review.js';
 // ─── LP Appointment Sync (GHL → LP) ────────────────────────────
@@ -397,6 +400,8 @@ app.use('/memory/omi', omiBodyParser());
 // consume the stream first, so this path gets express.raw and body-parser's
 // own already-parsed check makes the global parsers skip it.
 app.use('/webhook/slack', slackRawBodyParser());
+// 2026-10-16 — Siro signs the exact bytes too (svix); same reason, same place.
+app.use('/webhook/siro', siroRawBodyParser());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 // Graceful drain: count in-flight requests so SIGTERM waits for them.
@@ -775,6 +780,8 @@ registerFallthroughSweepRoutes(app);
 // ─── GroupMe Two-Way Integration ─────────────────────────────────
 registerGroupMeRoutes(app, authenticate);
 registerSlackApprovalRoutes(app);
+// 2026-10-16 — Siro demo recordings (svix-signed; SIRO_WEBHOOK_MODE, default shadow).
+registerSiroWebhookRoutes(app);
 // 2026-09-28 — Consent Model v1: n8n's OPS.DNC-LIFT posts Slack decisions here.
 // Own fail-closed header secret (DNC_LIFT_WEBHOOK_SECRET), not the MCP token.
 registerDncLiftDecisionRoutes(app);
@@ -1028,6 +1035,8 @@ const server = app.listen(PORT, async () => {
   startConfirmationPipelineSweepScheduler();
   startFive9CallJourneyScheduler();
   startInboundCheckoutWatchScheduler();
+  startSiroRecordingSyncScheduler();  // SIRO_SYNC_MODE (shadow): every 10 min
+  startSiroScorecardSyncScheduler();  // SIRO_SCORECARD_SYNC_MODE (off): daily 03:30 ET
   startPromisedCallbackScheduler();
   startRehashTagScheduler();
   startRehashReplyDigestScheduler();

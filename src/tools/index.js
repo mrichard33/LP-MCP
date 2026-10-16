@@ -19,6 +19,7 @@ import { registerSimulatorTools } from './simulator-tools.js';
 import { registerAiOsTools } from './ai-os-tools.js';
 import { registerMaintenanceTools } from './maintenance-tools.js';
 import { registerHealthTools } from './health-tools.js';
+import { registerSiroTools } from './siro-tools.js';
 import { withSanitizedResults } from '../text-sanitize.js';
 import { withInfraGuard } from '../security/infra-guard.js';
 
@@ -62,6 +63,11 @@ export function registerAllTools(rawServer) {
   // System health (2) — 2026-10-15: incident_action, health_run_check
   //   (the dashboard's incident buttons; src/health/ops-actions.js).
   registerHealthTools(server);
+  // Siro (7) — 2026-10-16, Siro PR 1: siro_whoami, siro_get_recording,
+  //   siro_find_recordings, siro_lead_presentation (with the F.0 dry run),
+  //   siro_rehash_priority, siro_rep_scorecard (read-only), siro_sync_run
+  //   (dry run by default).
+  registerSiroTools(server);
   // Capacity diagnostics (1) — 2026-07-25
   //   get_capacity_vs_ghl (read-only; LP per-band rep availability vs GHL
   //   calendar bookings — the slot_id dimension /board/capacity sums away.

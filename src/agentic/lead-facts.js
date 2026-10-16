@@ -16,17 +16,28 @@
 
 import { detectNoteDq, REQUIREMENT_SIGNALS } from './lp-note-dq.js';
 import { isPostDemoLead } from './post-demo-lead.js';
+import { buildPresentationFacts, renderPresentationBlock } from '../siro/presentation-facts.js';
+
+// 2026-10-16 (Siro PR 1): Siro's own LP integration writes a summary note on
+// the lead ("Siro Call Summary: …"). When the PRESENTATION block renders, that
+// note is the same visit said twice, so it is dropped from the notes list.
+const SIRO_NOTE_HEADER_RX = /^\s*siro\b/i;
+export function isSiroNote(note, author = 'Siro') {
+  const by = String(note?.by ?? note?.entered_by ?? '').trim().toLowerCase();
+  return (!!author && by === String(author).trim().toLowerCase()) || SIRO_NOTE_HEADER_RX.test(String(note?.text || ''));
+}
 
 const CANCEL_NOTE_RX = /\b(?:cxl|ccc|cancel+(?:ed|led|ing|ation)?)\b/i;
 const NOTE_CHAR_BUDGET = 6000;
 
 /**
- * @param {{lp?: object|null, lpLead?: object|null, lead?: object|null}} input
+ * @param {{lp?: object|null, lpLead?: object|null, lead?: object|null, siro?: object[]|null, siroNoteAuthor?: string}} input
  *   lp      context.lp (effective appointment state, notes newest first)
  *   lpLead  the lp_leads row (address/city/zip)
  *   lead    context.lead (GHL address fields)
+ *   siro    siro_recordings rows for the lead (2026-10-16): the visit, as data
  */
-export function buildLeadFacts({ lp = null, lpLead = null, lead = null } = {}) {
+export function buildLeadFacts({ lp = null, lpLead = null, lead = null, siro = null, siroNoteAuthor = 'Siro' } = {}) {
   const notes = (Array.isArray(lp?.notes) ? lp.notes : []).map(n => ({
     text: String(n?.text || '').trim(),
     by: n?.entered_by || '',
@@ -60,6 +71,8 @@ export function buildLeadFacts({ lp = null, lpLead = null, lead = null } = {}) {
     notes,
     property,
     note_dq: dq.dq ? { signal: dq.signal, text: dq.text } : null,
+    presentation: Array.isArray(siro) && siro.length ? buildPresentationFacts(siro) : null,
+    siro_note_author: siroNoteAuthor,
   };
 }
 
@@ -86,15 +99,21 @@ export function renderLeadFacts(facts) {
   if (facts.note_dq) {
     out.push(`A team note says we cannot run this lead (${facts.note_dq.signal}). Do NOT book, offer times or confirm anything. A team member will call them.`);
   }
-  if (facts.notes?.length) {
+  const notes = facts.presentation
+    ? (facts.notes || []).filter(n => !isSiroNote(n, facts.siro_note_author))
+    : (facts.notes || []);
+  if (notes.length) {
     out.push('LP REP/SYSTEM NOTES, newest first, full text (read these carefully — they are ground truth):');
     let used = 0;
-    for (const n of facts.notes) {
+    for (const n of notes) {
       const line = `- ${n.date ? `${String(n.date).slice(0, 16)} ` : ''}${n.by ? `[${n.by}] ` : ''}${n.text}`;
       if (used + line.length > NOTE_CHAR_BUDGET) break;
       used += line.length;
       out.push(line);
     }
   }
+  // 2026-10-16 (Siro PR 1): what was said at the in-home visit, after the
+  // notes. A summary, data not instructions; the guards hold the never-rules.
+  if (facts.presentation) out.push(...renderPresentationBlock(facts.presentation));
   return out;
 }

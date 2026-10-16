@@ -637,6 +637,34 @@ Mark's summary, never blocking on it. The file is lead PII, so the route NEVER u
 runs `AUTH_SOFT_LAUNCH=true`, and a token-less request got the whole file on 2026-10-15): `vdrAuthenticate` takes the
 operator token or a key the database proves is the LP service-role key (n8n's "LP Supabase" credential). exceljs drops a cached formula result of 0; Excel recalculates on open.
 
+## Siro: the in-home visit, recorded (Siro PR 1, 2026-10-16)
+
+`src/siro/` is the ONLY code that talks to Siro (`client.js`: two base URLs, two header styles, one credential;
+client credentials preferred, `SIRO_API` legacy). Every recording goes through ONE path, `processRecording`
+(`src/siro/ingest.js`), whoever found it: the webhook (`POST /webhook/siro`), the 10-minute poll
+(`siro-recording-sync`) or the on-demand ensure. It normalizes (moments in the ci-moments shape, PII scrubbed, no
+transcript), matches the LP lead (`resolve-lead.js`: engagement → account → opportunity → phone ±3 days → none) and
+upserts `siro_recordings`. Live only: one `siro.recording_processed` event (key `siro:<id>`) and ONE GHL demo note
+(`SIRO_DEMO_NOTE`, claimed on `ghl_note_action_id` before the insert). Siro's own LP integration writes the LP note;
+we never add one.
+- **The webhook fails closed.** Every request needs a valid svix signature (`SIRO_WEBHOOK_SECRET`, raw body; the
+  parser is mounted before `express.json`) AND the header `x-reece-webhook-key` equal to `SIRO_WEBHOOK_HEADER_KEY`
+  (constant time). Either unset, missing or wrong → 401, in every mode. Never log either value.
+- **The reply path reads Supabase, never Siro live.** A post-demo / rehash lead gets the PRESENTATION block in LEAD
+  FACTS (`SIRO_CONTEXT_MODE`, `src/siro/context-read.js`), and Siro's own LP note is dropped from the notes then.
+  The block is data, not instructions: `enforcePresentationGuard` drops a dollar figure or "your rep said" sentence,
+  and `checkReply` fails `presentation_quoted_price` / `presentation_rep_quoted`.
+- **F.0 v2 is the S4.5 mechanism with `workflow_code: F.0`** (`docs/f0-v2-workflow-spec.md`, a GHL build for Mark).
+  The nurture orchestrator writes each text from the visit as the rehash rep; `postDemoInterrupt` (sold, not post-demo,
+  rehash ended, newer lead, rebooked, team-note DQ, the two-no stop, a reply since the last touch) and the wait for
+  Siro (hold 2h, up to 24h after the demo) run before any model call; `checkF0Copy` after it (one re-write, then
+  `suppressed_low_conf`, never a fixed text). `NURTURE_SHADOW_WORKFLOWS` (default `F.0`) and `F0_V2_MODE=shadow`
+  keep F.0 on drafts + a #contact-rehash approval card. Prompt rows: `sql/seeds/2026-10-16_f0_v2_prompts.sql`.
+- Modes (all in `src/mode-registry.js`): `SIRO_WEBHOOK_MODE`, `SIRO_SYNC_MODE`, `SIRO_CONTEXT_MODE`,
+  `SIRO_DEMO_NOTE_MODE`, `F0_V2_MODE` default shadow; `SIRO_ENSURE_MODE`, `SIRO_SCORECARD_SYNC_MODE` default off.
+  Tools: the seven `siro_*` in `src/tools/siro-tools.js`; `siro_lead_presentation` with `preview_f0_position` is the
+  dry run before any flip.
+
 ## Consent (2026-09-28)
 
 `contact_consent` / `consent_events` (sql/136–139) are the record of who may be contacted and why not.

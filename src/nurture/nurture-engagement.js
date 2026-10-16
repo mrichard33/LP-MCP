@@ -147,6 +147,9 @@ const EVENT_RESOLUTIONS = {
   sent:            { kind: 'sent', column: 'ghl_sent_at' },
   email_sent:      { kind: 'sent', column: 'ghl_sent_at' },
   sent_email:      { kind: 'sent', column: 'ghl_sent_at' },
+  // 2026-10-16 (F.0 v2): the SMS sequence reports its sends the same way.
+  sms_sent:        { kind: 'sent', column: 'ghl_sent_at' },
+  sent_sms:        { kind: 'sent', column: 'ghl_sent_at' },
   delivered:       { kind: 'sent', column: 'ghl_sent_at' },
   email_delivered: { kind: 'sent', column: 'ghl_sent_at' },
   delivered_email: { kind: 'sent', column: 'ghl_sent_at' },

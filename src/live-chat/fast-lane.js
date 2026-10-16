@@ -40,6 +40,7 @@
  * pattern for anything that reaches the network or the database.
  */
 
+import { enforcePresentationGuard } from '../siro/presentation-guard.js';
 import { warrantyTurn, enforceWarrantyReply, appendWarrantyLinks } from '../agentic/warranty-request.js';
 import { promptSha256 } from '../bot-feedback/fingerprint-core.js';
 import { cleanInboundForModel } from '../security/untrusted-text.js';
@@ -1190,7 +1191,7 @@ export function createLiveChatFastLane(deps) {
       }
       if (nepqMode === 'live' && !saPlan.active) {
         const lastOutbound = [...context.conversation_recent].reverse().find(m => m.direction === 'outbound')?.text || '';
-        const nepqOut = reference ? null : await runNepqFixedMove({ plan: nepqPlan, slots: nepqSlots, contactId, body, hasName: hasNameOnRecord, hasPhone: hasPhoneOnRecord, firstName: realFirst, mode, lastOutbound: nepqPlan.last_offer || lastOutbound, contact, visitorTexts, pastDemo,
+        const nepqOut = reference ? null : await runNepqFixedMove({ plan: nepqPlan, slots: nepqSlots, contactId, body, hasName: hasNameOnRecord, hasPhone: hasPhoneOnRecord, firstName: realFirst, mode, lastOutbound: nepqPlan.last_offer || lastOutbound, contact, visitorTexts, pastDemo, presentation: context.siro?.presentation || null,
           threadTurns: (context.conversation_recent || []).map(m => ({ direction: String(m?.direction || '').toLowerCase() === 'outbound' ? 'outbound' : 'inbound', text: String(m?.text ?? m?.body ?? '') })) });
         if (nepqOut) {
           // Part 7 (Mark, 2026-10-02: "Each message should be custom"): the
@@ -1231,7 +1232,7 @@ export function createLiveChatFastLane(deps) {
       timing.t4_analysis_done = new Date(d.now()).toISOString();
       timing.t5_generation_done = timing.t4_analysis_done;
       return deliver({
-        contactId, conversationId, body, mode, actionId, timing, isSuperseded, turn, visitorTexts, pastDemo,
+        contactId, conversationId, body, mode, actionId, timing, isSuperseded, turn, visitorTexts, pastDemo, presentation: context.siro?.presentation || null,
         draft: priceTransitionReply({ hasName: hasNameOnRecord, hasPhone: hasPhoneOnRecord }),
         capture: phoneFromText(body) ? { phone: phoneFromText(body) } : {},
         extras: { price_turn: { asks: pricePlan.asks, insist: true, deterministic: true }, context_minimal: !!context._minimal, model: null },
@@ -1556,7 +1557,7 @@ export function createLiveChatFastLane(deps) {
     }
 
     return deliver({
-      contactId, conversationId, body, mode, actionId, timing, draft, turn, visitorTexts, pastDemo,
+      contactId, conversationId, body, mode, actionId, timing, draft, turn, visitorTexts, pastDemo, presentation: context.siro?.presentation || null,
       // The zone the turn's times were read in, else the zone the visitor's market set (2026-10-16).
       tzLabel: nepqSlots?.tzLabel || (context.market?.timezone ? tzLabel(context.market.timezone) : null),
       stageInput: buildStageInput({
@@ -1957,7 +1958,7 @@ export function createLiveChatFastLane(deps) {
   }
 
   /** Send (live) or record (shadow) one finished reply. */
-  async function deliver({ contactId, conversationId, body, mode, actionId, timing, draft, capture = {}, extras = {}, fingerprintExtras = {}, isSuperseded = () => false, turn = newTurnClaim(), visitorTexts = [], skipCapture = false, stageInput = null, pastDemo = false, tzLabel: replyTzLabel = null }) {
+  async function deliver({ contactId, conversationId, body, mode, actionId, timing, draft, capture = {}, extras = {}, fingerprintExtras = {}, isSuperseded = () => false, turn = newTurnClaim(), visitorTexts = [], skipCapture = false, stageInput = null, pastDemo = false, presentation = null, tzLabel: replyTzLabel = null }) {
     // A newer message from this visitor arrived while this reply was being
     // written: the newer turn answers both (2026-10-02, tzuzq double reply).
     if (isSuperseded()) {
@@ -2027,6 +2028,12 @@ export function createLiveChatFastLane(deps) {
           d.log(`[Warranty] live chat ${contactId} reply fixed: ${w.changes.join(',')}`);
           draft = w.text;
         }
+      }
+      // The visit is context, never a quote (2026-10-16, Siro PR 1).
+      const pres = enforcePresentationGuard(draft, { presentation });
+      if (pres.changed) {
+        d.log(`[Siro] live chat ${contactId} presentation guard: ${pres.changes.join(',')}`);
+        draft = pres.text;
       }
       // Human voice once more, last (2026-10-06 bot gate, spouse/livechat):
       // the first pass runs before the guards, and a sentence a guard drops can

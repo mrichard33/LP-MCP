@@ -145,9 +145,31 @@ import { resolveAdaptiveCta, applyEvolution, injectEvolutionOverride } from '../
 // 2026-09-11 — Bot Review Phase 0 fingerprint. Detached, post-writeback only.
 import { recordMessageContextDetached } from '../bot-feedback/fingerprint.js';
 import { buildInputSnapshot } from '../bot-feedback/fingerprint-core.js';
-import { slackPhone } from '../format-helpers.js';
+import { slackPhone, prospectLabel } from '../format-helpers.js';
+// 2026-10-16 (Siro PR 1) — F.0 v2: the post-demo sequence written from the
+// Siro visit, as the rehash rep, through this same orchestrator.
+import { loadF0Context } from '../siro/f0-context.js';
+import { postDemoInterrupt } from '../siro/f0-interrupts.js';
+import { checkF0Copy, f0RetryNote } from '../siro/f0-copy-checks.js';
+import { siroConfig, siroModes, siroRecordingUrl } from '../siro/config.js';
+import { postToSlack } from '../slack.js';
 
 const SHADOW_MODE = process.env.NURTURE_SHADOW_MODE === 'true';
+
+export const F0_WORKFLOW = 'F.0';
+
+/**
+ * Drafts only, gate unflipped, a person approves (2026-10-16, Siro PR 1).
+ * NURTURE_SHADOW_MODE=true keeps every workflow in shadow, as before; a
+ * workflow on NURTURE_SHADOW_WORKFLOWS (default "F.0") is in shadow too.
+ * F0_V2_MODE=shadow forces F.0 into shadow whatever the list says; live
+ * honours the list (Mark removes F.0 from it after a week of approvals).
+ */
+export function isShadowWorkflow(workflowCode, env = process.env, globalShadow = SHADOW_MODE) {
+  if (globalShadow) return true;
+  if (workflowCode === F0_WORKFLOW && siroModes(env).f0 === 'shadow') return true;
+  return siroConfig(env).nurtureShadowWorkflows.includes(String(workflowCode || ''));
+}
 
 /**
  * Main entry — orchestrate one generation cycle.
@@ -174,6 +196,47 @@ export async function runNurtureGeneration(request) {
   // Write pending row early so we always have an audit anchor, even
   // if a later step throws.
   await createPendingRow(generation_id, request, context);
+
+  // Step 1b — F.0 v2 (2026-10-16, Siro PR 1): off → nothing generated; else
+  // the visit data, the post-demo interrupts and the wait for Siro, all
+  // before any model call. force_send skips the interrupts, never the read.
+  const isF0 = request.workflow_code === F0_WORKFLOW;
+  let f0 = null;
+  if (isF0) {
+    if (siroModes().f0 === 'off') {
+      await updateStatus(generation_id, 'suppressed_interrupt', 'f0_v2_off');
+      await safeClearDrafts(request.contact_id, 'f0_v2_off');
+      return finishResponse(generation_id, false, 'f0_v2_off', startedAt);
+    }
+    f0 = await loadF0Context(context, request);
+    context.siro = {
+      ...f0.vars,
+      // The "no-visit-data" prompt variant when the visit is not on file.
+      selector_objection: f0.facts ? null : 'no-visit-data',
+    };
+    context.nurture_request = { workflow_code: request.workflow_code, sequence_position: request.sequence_position };
+    await stampSiroRecording(generation_id, f0.recordingId);
+    if (request.force_send !== true) {
+      const pd = postDemoInterrupt(f0.interruptInput);
+      if (pd?.hold) {
+        console.log(JSON.stringify({ level: 'info', type: 'intentional_suppression', status: 'suppressed_overlap', reason: pd.reason, workflow_code: request.workflow_code, sequence_position: request.sequence_position, ghl_contact_id: request.contact_id, generation_id, hold_h: pd.hold }));
+        await updateStatus(generation_id, 'suppressed_overlap', pd.reason);
+        await safeClearDrafts(request.contact_id, `interrupt:${pd.reason}`);
+        try {
+          await writeSuppressionHold(request.contact_id, pd.hold);
+        } catch (holdErr) {
+          console.warn(`[NurtureOrch] F.0 hold write failed ${generation_id}: ${holdErr.message}`);
+        }
+        return finishResponse(generation_id, false, pd.reason, startedAt);
+      }
+      if (pd?.suppress) {
+        console.log(JSON.stringify({ level: 'info', type: 'intentional_suppression', status: 'suppressed_interrupt', reason: pd.suppress, terminal: pd.terminal, workflow_code: request.workflow_code, sequence_position: request.sequence_position, ghl_contact_id: request.contact_id, generation_id }));
+        await updateStatus(generation_id, 'suppressed_interrupt', pd.suppress);
+        await safeClearDrafts(request.contact_id, `interrupt:${pd.suppress}`);
+        return finishResponse(generation_id, false, pd.suppress, startedAt);
+      }
+    }
+  }
 
   // Step 2 — pre-gen interrupts (deterministic).
   // v2.1: Skippable via request.force_send for admin/test use only.
@@ -291,7 +354,7 @@ export async function runNurtureGeneration(request) {
   // validator sees normalized output. The model often emits slightly
   // long subjects or a sign-off line; auto-fixing those things keeps
   // the message shippable instead of triggering suppression.
-  const autofixResult = applyAutofix(genResult.output);
+  const autofixResult = applyAutofix(genResult.output, isF0 ? { smsMax: null } : {});
   if (autofixResult.applied.length > 0) {
     console.log(`[NurtureOrch] autofix ${generation_id}: applied=${autofixResult.applied.join(',')}`);
   }
@@ -302,7 +365,7 @@ export async function runNurtureGeneration(request) {
   // judge) is no longer called from the nurture path. One retry on
   // safety failure with the failure codes injected into the prompt;
   // if the retry still fails, suppress.
-  let safety = validateSafety(output, prompt, context);
+  let safety = runOutputChecks(output, prompt, context, f0, request);
   if (!safety.passed) {
     retryCount++;
     console.warn(`[NurtureOrch] safety failed first attempt for ${generation_id}: ${safety.failures.join(', ')} details=${safety.details.join('|')} — retrying`);
@@ -310,25 +373,26 @@ export async function runNurtureGeneration(request) {
       const constrainedPrompt = {
         ...prompt,
         system_prompt: prompt.system_prompt +
-          `\n\nIMPORTANT: A previous attempt failed these safety checks: ${safety.failures.join(', ')}. Details: ${safety.details.join('; ')}. You MUST fix all of them in this attempt. These are non-negotiable compliance and trust requirements.`,
+          `\n\nIMPORTANT: A previous attempt failed these safety checks: ${safety.failures.join(', ')}. Details: ${safety.details.join('; ')}. You MUST fix all of them in this attempt. These are non-negotiable compliance and trust requirements.` +
+          (safety.f0Failures?.length ? `\n\n${f0RetryNote(safety.f0Failures, { position: request.sequence_position })}` : ''),
       };
       genResult = await generateNurtureContent(constrainedPrompt, context);
       // Add any generation-internal retries from the safety-retry's
       // generate call on top of the safety retry itself.
       retryCount += genResult.generationRetries || 0;
-      const retryAutofix = applyAutofix(genResult.output);
+      const retryAutofix = applyAutofix(genResult.output, isF0 ? { smsMax: null } : {});
       if (retryAutofix.applied.length > 0) {
         console.log(`[NurtureOrch] autofix retry ${generation_id}: applied=${retryAutofix.applied.join(',')}`);
       }
       output = retryAutofix.output;
       autofixesApplied = [...autofixesApplied, ...retryAutofix.applied];
-      safety = validateSafety(output, prompt, context);
+      safety = runOutputChecks(output, prompt, context, f0, request);
       if (!safety.passed) {
         await updateRowOnSuppress(generation_id, 'suppressed_low_conf',
           `safety_failed_after_retry:${safety.failures.join(',')}`,
           { output, safety_failures: safety.failures, safety_details: safety.details, retry_count: retryCount, autofixes: autofixesApplied, evolution });
         await safeClearDrafts(request.contact_id, `safety_failed:${safety.failures.join(',')}`);
-        await alertGroupMe(buildSuppressionCard(request, context, generation_id, 'safety_failed_after_retry', {
+        if (!isF0) await alertGroupMe(buildSuppressionCard(request, context, generation_id, 'safety_failed_after_retry', {
           safetyFailures: safety.failures,
           safetyDetails: safety.details,
           subject: output && output.subject,
@@ -343,14 +407,24 @@ export async function runNurtureGeneration(request) {
     }
   }
 
+  // F.0: the recording and the position ride in ai_msg_meta_json.
+  if (isF0) output = { ...output, extra_meta: { siro_recording_id: f0?.recordingId || null, position: request.sequence_position } };
+
   // Step 7 — writeback. Two paths:
   //   - SHADOW_MODE env flag → drafts only + approval card
   //   - else → full two-phase writeback (sends the email)
   try {
-    if (SHADOW_MODE) {
+    if (isShadowWorkflow(request.workflow_code)) {
       await writeDraftsOnly(request.contact_id, output, generation_id, 1.0);
       await markAwaitingApproval(generation_id, output, retryCount, autofixesApplied, evolution);
-      await alertGroupMe(buildApprovalCard(request, context, generation_id, output, retryCount, autofixesApplied));
+      if (isF0) {
+        // Slack only (CLAUDE.md: never a GroupMe-only path for new work).
+        const card = buildF0ApprovalCard({ request, context, generationId: generation_id, output, prompt, recordingId: f0?.recordingId });
+        const posted = await postToSlack(card, siroConfig().f0ApprovalChannel);
+        if (!posted.ok) console.warn(`[NurtureOrch] F.0 approval card failed ${generation_id}: ${posted.error}`);
+      } else {
+        await alertGroupMe(buildApprovalCard(request, context, generation_id, output, retryCount, autofixesApplied));
+      }
       return finishResponse(generation_id, false, 'awaiting_approval', startedAt);
     }
     await writeBackToGHL(request.contact_id, output, generation_id, 1.0);
@@ -405,6 +479,59 @@ export async function runNurtureGeneration(request) {
 }
 
 // ─── HELPERS ─────────────────────────────────────────────────────────
+
+/**
+ * The safety validator, plus the F.0 copy checks on an F.0 draft (2026-10-16).
+ * One shape, so the existing one-retry-then-suppress loop handles both.
+ */
+function runOutputChecks(output, prompt, context, f0, request) {
+  const safety = validateSafety(output, prompt, context);
+  if (!f0) return safety;
+  const f0Failures = checkF0Copy(output?.sms_body, {
+    facts: f0.facts,
+    position: Number(request.sequence_position) || 1,
+    repFirstName: f0.vars?.rehash_rep_first_name || null,
+  });
+  if (!f0Failures.length) return safety;
+  return {
+    passed: false,
+    failures: [...safety.failures, ...f0Failures.map(f => `F0_${f.toUpperCase()}`)],
+    details: [...safety.details, ...f0Failures.map(f => `F0:${f}`)],
+    f0Failures,
+  };
+}
+
+async function stampSiroRecording(generation_id, recordingId) {
+  if (!supabase || !recordingId) return;
+  const { error } = await supabase.from('agentic_messages')
+    .update({ siro_recording_id: recordingId, updated_at: new Date().toISOString() })
+    .eq('generation_id', generation_id);
+  if (error) console.warn(`[NurtureOrch] siro_recording_id stamp failed: ${error.message}`);
+}
+
+/**
+ * The F.0 v2 approval card for #contact-rehash. Plain English, the prospect
+ * label (never an LP lead id), a 10-digit phone, the draft as it would go,
+ * and how to approve: the gate is a GHL field a person flips. Pure.
+ */
+export function buildF0ApprovalCard({ request, context, generationId, output, prompt, recordingId }) {
+  const lead = context?.lead || {};
+  const first = lead.first_name || 'This lead';
+  const phone = slackPhone(lead.phone);
+  const loc = process.env.GHL_LOCATION_ID || '';
+  return [
+    `✅ F.0 POST-DEMO TEXT READY — please review (position ${request.sequence_position} of 5)`,
+    `${first}${phone ? ` · ${phone}` : ''} · ${prospectLabel(context?.lp?.prospect_id)}`,
+    `Prompt: ${prompt?.prompt_code || 'unknown'} · next wait ${output?.next_wait_hours ?? '?'}h`,
+    '',
+    `Draft: ${String(output?.sms_body || '').trim()}`,
+    '',
+    recordingId ? `Visit: ${siroRecordingUrl(recordingId)}` : 'Visit: no Siro recording on file (written from the LP notes)',
+    loc ? `Contact: https://app.gohighlevel.com/v2/location/${loc}/contacts/detail/${request.contact_id}` : null,
+    'TO SEND: set "AI SMS Send Ready" = Yes on the contact in GHL. TO SKIP: leave it.',
+    `gen ${generationId}`,
+  ].filter(l => l !== null).join('\n');
+}
 
 /**
  * Defensively extract request fields from a body of unknown shape.

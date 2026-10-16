@@ -20,6 +20,7 @@
     "exceljs": "^4.4.0",
     "express": "^4.21.2",
     "jszip": "^3.10.2",
-    "ssh2-sftp-client": "^11.0.0"
+    "ssh2-sftp-client": "^11.0.0",
+    "svix": "^1.99.1"
   }
 }

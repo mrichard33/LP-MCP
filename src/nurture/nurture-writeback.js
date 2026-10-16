@@ -261,6 +261,8 @@ function buildPhase1Fields(output, nextWaitHours) {
       techniques_used: output.techniques_used || null,
       primary_belief_shift: output.primary_belief_shift || null,
       has_ps: !!output.ps_text,
+      // 2026-10-16 (F.0 v2): siro_recording_id + position.
+      ...(output.extra_meta && typeof output.extra_meta === 'object' ? output.extra_meta : {}),
     }),
   });
   usedKeys.push('ai_msg_meta_json');
