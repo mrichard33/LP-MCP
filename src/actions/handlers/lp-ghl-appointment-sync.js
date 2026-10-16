@@ -58,6 +58,7 @@ import { sendAlertMessage } from '../../alert-state.js';
 import { readLiveForSync } from '../../services/lp-live-appointment.js';
 import { findSameSlotLiveSibling, liveStillHoldsSlot, slotKeyOf } from '../../same-slot-sibling.js';
 import { lpWallClockToGhlStartTime } from '../../appointment-dates.js';
+import { prospectLabel } from '../../format-helpers.js';
 import {
   claimAppointmentAuthority,
   recordAppointmentAuthorityResult,
@@ -427,7 +428,7 @@ export function formatLpLooksWrongAlert({ contactId, lead, result }) {
   return (
     `🚨 LP date/time looks wrong — confirmation team must fix in LP\n` +
     `👤 ${name}\n` +
-    `📋 LP Lead: ${lead?.lp_lead_id || '?'} | GHL: ${contactId}\n` +
+    `📋 LP: ${prospectLabel(lead?.lp_prospect_id)} | GHL: ${contactId}\n` +
     `📅 LP appointment: ${when} ET (${lead?.disposition_code || '?'})\n` +
     `🕒 LP last activity: ${result?.last_activity_at || String(lead?.updated_at_lp || '?').slice(0, 10)}\n` +
     `🙋 Set by: ${lead?.set_by_name || '?'}\n` +

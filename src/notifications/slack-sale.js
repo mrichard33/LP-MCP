@@ -48,6 +48,7 @@
 
 import { postToSlack, salesRollupChannelId, opsChannelId, resolveSlackChannels } from '../slack.js';
 import { sendGroupMeMessage } from '../groupme.js';
+import { prospectLabel } from '../format-helpers.js';
 
 export const SLACK_RETRY_ATTEMPTS = 3;
 export const SLACK_RETRY_DELAY_MS = 5000;
@@ -277,7 +278,8 @@ export async function alertSaleDeliveryFailed(detail, deps = {}) {
     '🚨 Sale announcement did NOT post to the sales board.',
     `Rep: ${detail?.rep_display_name || '(unknown)'}`,
     `Amount: ${detail?.gross_sale_amount ?? '(unknown)'}`,
-    `Lead: ${detail?.lp_lead_id || '(unresolved)'}  key_source: ${detail?.key_source || '(none)'}`,
+    // The prospect, never the lead id (the user, 2026-10-16).
+    `LP: ${prospectLabel(detail?.lp_prospect_id)}  key_source: ${detail?.key_source || '(none)'}`,
     `Slack error: ${detail?.error || '(unknown)'} after ${detail?.attempts ?? 0} attempts`,
     `sale_announcements.id: ${detail?.row_id ?? '(none)'}`,
     'The message text is stored on the row — repost it by hand, do not recompose.',

@@ -22,6 +22,7 @@
 
 import { LEAK_REASONS } from './lead-leak-classify.js';
 import { BUSINESS_HOURS, workingMsBetween } from './lead-speed.js';
+import { prospectLabel } from './format-helpers.js';
 
 // ─── Thresholds — one place; each is env-overridable in alertConfig() ────────
 export const ALERT_DEFAULTS = Object.freeze({
@@ -263,7 +264,7 @@ export function reasonText(o, nowMs = Date.now()) {
 function offenderLine(o, nowMs) {
   return `• ${displayName(o.first_name, o.last_name)} · ${phoneTail(o.phone10)}`
     + ` · ${o.lead_source || 'no source'} · waiting ${formatWait(o.waitingMs)}`
-    + ` · ${reasonText(o, nowMs)} · LP ${o.lp_lead_id}`;
+    + ` · ${reasonText(o, nowMs)} · LP ${prospectLabel(o.lp_prospect_id)}`;
 }
 
 /**
@@ -403,7 +404,7 @@ export function shouldAlertRetiredCode(fresh, { readOk = true } = {}) {
 
 export function formatRetiredCodeAlert(fresh, { cfg = ALERT_DEFAULTS, dashboardUrl } = {}) {
   const lines = fresh.slice(0, cfg.maxNamed).map((l) => `• ${displayName(l.first_name, l.last_name)}`
-    + ` · coded ${l.disposition_code} · LP ${l.lp_lead_id}`);
+    + ` · coded ${l.disposition_code} · LP ${prospectLabel(l.lp_prospect_id)}`);
   if (fresh.length > cfg.maxNamed) lines.push(`…and ${fresh.length - cfg.maxNamed} more`);
   return [
     `🏷️ *Retired code used on ${fresh.length} lead${fresh.length === 1 ? '' : 's'} in the last day*`,

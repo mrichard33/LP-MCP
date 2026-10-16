@@ -294,7 +294,7 @@ test('hourly pass: lookups only for leads the card names, capped by LEAD_UNCALLE
 
 test('card: grouped by reason with counts, the cap, "…and N more", and the dashboard link', () => {
   const o = (id, reason, extra = {}) => ({ first_name: 'A', last_name: 'B', phone10: '3525550000', lead_source: 'Internet',
-    reason, lp_lead_id: id, waitingMs: 22 * HOUR + 4 * 60000, ...extra });
+    reason, lp_lead_id: `L${id}`, lp_prospect_id: id, waitingMs: 22 * HOUR + 4 * 60000, ...extra });
   const offenders = [
     ...[1, 2, 3].map((i) => o(`a${i}`, 'not_on_dial_list')),
     ...[1, 2, 3].map((i) => o(`b${i}`, 'called_no_retry', { calls: { count: 1, lastMs: NOW - 20 * HOUR, lastDispo: 'Hung Up' } })),
@@ -306,7 +306,8 @@ test('card: grouped by reason with counts, the cap, "…and N more", and the das
   const h1 = lines.indexOf('*Called, no retry since — 3 (showing 2)*');
   const h2 = lines.indexOf('*In Five9 but not on any dialing list — 3 (showing 2)*');
   assert.ok(h1 > 0 && h2 > h1, 'both group headers, in order');
-  assert.match(text, /A B\. · 3525550000 · Internet · waiting 22h 4m · Called 1× \(last: Hung Up, 20h 0m ago\) — no retry since · LP b1/);
+  assert.match(text, /A B\. · 3525550000 · Internet · waiting 22h 4m · Called 1× \(last: Hung Up, 20h 0m ago\) — no retry since · LP Prospect b1/);
+  assert.doesNotMatch(text, /Lb1/, 'never the lead id (2026-10-16)');
   assert.equal(lines.filter((l) => l.startsWith('• ')).length, 4, 'maxNamed caps named lines across groups');
   assert.ok(lines.includes('…and 2 more'));
   assert.equal(lines[lines.length - 1], 'Full list: https://d/leaks', 'every card ends with the link');
@@ -321,9 +322,9 @@ test('card: grouped by reason with counts, the cap, "…and N more", and the das
 // An offender created `hoursAgo` real hours before NOW.
 const aged = (id, reason, hoursAgo, extra = {}) => ({
   first_name: 'Lee', last_name: `N${id}`, phone10: '3525550000', lead_source: 'Simpletext', reason,
-  lp_lead_id: String(id), createdMs: NOW - hoursAgo * HOUR, waitingMs: hoursAgo * HOUR, ...extra,
+  lp_lead_id: `L${id}`, lp_prospect_id: String(id), createdMs: NOW - hoursAgo * HOUR, waitingMs: hoursAgo * HOUR, ...extra,
 });
-const namedIds = (text) => text.split('\n').filter((l) => l.startsWith('• ')).map((l) => l.split(' · LP ')[1]);
+const namedIds = (text) => text.split('\n').filter((l) => l.startsWith('• ')).map((l) => l.split(' · LP Prospect ')[1]);
 
 test('card: a lead created today is listed before one from 2 days ago', () => {
   const offenders = [aged(1, 'not_in_five9', 50), aged(2, 'not_in_five9', 3), aged(3, 'not_in_five9', 26)];
@@ -342,7 +343,7 @@ test('card: groups ordered by leads from the last 24 call-center hours, most fir
   const fresh = lines.indexOf('*On a Five9 list but no call recorded — 2*');
   const old = lines.indexOf('*Not in Five9 at all — 5*');
   assert.ok(fresh > 0 && old > fresh, 'the group holding today\'s leads comes first');
-  assert.ok(lines.some((l) => l.includes('· On LP_ASAP in Five9 but no call recorded · LP f1')));
+  assert.ok(lines.some((l) => l.includes('· On LP_ASAP in Five9 but no call recorded · LP Prospect f1')));
 });
 
 test('card: 40 offenders across 3 reasons, maxNamed 15 → every group shows ≥3 lines and its full count', () => {

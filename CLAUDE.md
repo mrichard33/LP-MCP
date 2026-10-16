@@ -40,6 +40,17 @@ parentheses. Card builders use `slackPhone` (`src/format-helpers.js`); `normaliz
 GroupMe send (only a phone SHAPE with a separator or a +1 is rewritten, and only block `text`, never a button `value`).
 Customer-facing texts and chat replies keep `(352) 555-0188`.
 
+**A Slack card names the LP Prospect, never the LP lead id (the user, 2026-10-16).** "It must always include the
+Prospect ID, never the actual lead ID." Print `prospectLabel(prospectId)` (`src/format-helpers.js`): `Prospect 462947`,
+or `Prospect: unknown` when none is known (the card still posts; the lead id is never the fallback). Only a lead id in
+hand → read `lp_leads.lp_prospect_id` (`prospectIdForLead` in `src/actions/resolvers.js`). Several leads on one prospect
+are told apart by disposition, source and date. `normalizeSlackText` (`src/slack-phone-format.js`, phones then
+`stripSlackLeadIds`) is the net at the same send points as the phone format: a "lead 581695" / `LDS581695` that slips
+into a card (approval reasoning, an error, model output) loses its number. LP inbound inquiry numbers (`in1`, "inbound
+#430305") stay: an inquiry has no prospect yet. Machine values stay too (dedupe keys, Five9 `LPRecKey`, `card_line`,
+action payloads), as do GHL and LP notes. `scripts/test-no-lead-id-on-cards.js` scans `src/` for a template that prints
+a lead id; a line that is not Slack text carries `lead-id-ok: <why>`.
+
 **A live chat gets one Slack card per lead, and one summary per chat (Mark, 2026-10-15).** One chat
 (jhVZZUtXp3jDrBsXOZcK) posted six "LARGE JOB SIGNAL" cards in six minutes: the model's `large_job_signal` reads the
 whole thread, and the event under it was deduped but the Slack post was not. The large-job and Spanish cards in

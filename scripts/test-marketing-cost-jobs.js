@@ -82,7 +82,7 @@ test('holds: email, then phone, then zip; and the allocation row gets the recomm
       { lead_id: 'd', email: null, phone: null, zip_code: '99999', territory: null, created_at: '2026-09-22T13:00:00' },
       { lead_id: 'e', email: 'mapped@x.com', phone: null, zip_code: '33901', territory: 'FTMYR', created_at: '2026-09-22T13:00:00' },
     ],
-    lp_leads: [{ lp_lead_id: '581001', lp_branch_id: 'SAR', email: 'a@x.com', phone: '+19415550100' }, { lp_lead_id: '581002', lp_branch_id: 'FTMYR', email: null, phone: '2395550200' }],
+    lp_leads: [{ lp_lead_id: '581001', lp_prospect_id: '462001', lp_branch_id: 'SAR', email: 'a@x.com', phone: '+19415550100' }, { lp_lead_id: '581002', lp_branch_id: 'FTMYR', email: null, phone: '2395550200' }],
     lp_branch_market_map: [{ brn_id: 'SAR', market_code: 'SAR_MKT' }, { brn_id: 'FTMYR', market_code: 'FTMYR_MKT' }],
     service_area_zips: [{ zip: '33901', market_code: 'FTMYR' }],
     marketing_expenses: [{ id: 'g1', source_system: 'leadgurus_feed', source_ref: '2026-09-22|__gap__', period_start: '2026-09-22', eligible_markets: ['REECE_HOLD'] }, { id: 'i1', source_system: 'email_invoice', source_ref: 'x', period_start: '2026-09-01', eligible_markets: ['REECE_HOLD'] }],
@@ -90,7 +90,8 @@ test('holds: email, then phone, then zip; and the allocation row gets the recomm
   });
   const m = await matchHeldLeads('2026-09-22', { supabase });
   assert.deepEqual(m.map((x) => [x.lead_id, x.market]), [['a', 'SAR_MKT'], ['b', 'FTMYR_MKT'], ['c', 'FTMYR_MKT'], ['d', null]]);
-  assert.match(m[0].reason, /matched LP lead 581001, branch SAR/);
+  assert.match(m[0].reason, /matched LP Prospect 462001, branch SAR/);
+  assert.doesNotMatch(m[0].reason, /581001/);
   assert.match(m[2].reason, /zip 33901 in FTMYR_MKT service area/);
   const r = await recommendHolds('2026-09', { supabase });
   assert.deepEqual(r, { month: '2026-09-01', holds: 2, recommended: 1, unmatched: 1 });

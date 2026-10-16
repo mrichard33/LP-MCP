@@ -57,13 +57,13 @@ test('a failed read is INSUFFICIENT EVIDENCE — neither pages nor clears', () =
   assert.notEqual(activeFromVerdict('insufficient_evidence'), false);
 });
 
-test('the card carries both lead ids, both dispositions and both sources', () => {
+test('the card carries the prospect, both dispositions and both sources, never a lead id (2026-10-16)', () => {
   const card = formatApptProspectDupes(FIVE);
   for (const r of FIVE) {
     assert.ok(card.includes(r.lp_prospect_id), `prospect ${r.lp_prospect_id} missing`);
     assert.ok(card.includes(r.slot_date), `slot_date ${r.slot_date} missing`);
     for (const id of r.lead_ids) {
-      assert.ok(card.includes(id), `lead ${id} missing`);
+      assert.ok(!card.includes(id), `lead id ${id} must not be on the card`);
       assert.ok(card.includes(r.sources[id]), `source for ${id} missing`);
     }
   }

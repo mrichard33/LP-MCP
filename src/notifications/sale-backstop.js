@@ -338,6 +338,7 @@ export async function runSaleBackstop(deps = {}) {
       repDisplayName: s.repDisplayName,
       amount: s.amount,
       leadId: s.leadId,
+      prospectId: s.prospectId,
       keySource: 'lead_id',
     }, { supabase, logger, now, mirror: (text) => groupMe(text, { logger }) });
     if (r?.ok) announced += 1; else failed += 1;

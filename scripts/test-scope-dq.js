@@ -26,7 +26,8 @@ test('the note and the card say what to do, digits-only phone', () => {
   const extra = cardExtra({ kind: 'commercial', prospectId: '463200', leadId: '581413', note: 'added', phone: '+1 (352) 555-0188' });
   assert.match(extra, /Why: a commercial property\./);
   assert.match(extra, /^Phone: 3525550188$/m);
-  assert.match(extra, /LP: prospect 463200 · lead 581413/);
+  assert.match(extra, /LP: Prospect 463200/);
+  assert.doesNotMatch(extra, /581413/, 'the card names the prospect, never the LP lead id');
   assert.match(extra, /LP note: added\./);
   assert.match(cardExtra({ kind: 'rental' }), /no LP lead is linked/);
   const { card } = formatNepqHandoff({ reason: SCOPE_DQ_REASON, channel: 'sms', inbound: 'we rent it out', contactId: 'C1', firstName: 'Dana', extra });

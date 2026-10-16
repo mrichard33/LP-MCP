@@ -381,7 +381,7 @@ test('drift: first detection posts one card; clearing and re-firing posts nothin
   assert.equal(r1.posted, 1);
   assert.equal(sent.length, 1);
   assert.equal(sent[0].opts.channel, 'ops');
-  assert.match(sent[0].text, /Nina New · new1 · LP lead L-new1 still Set/);
+  assert.match(sent[0].text, /Nina New · new1 · LP Prospect: unknown still Set/);
   assert.ok(db.tables.audit_posted_items.every((r) => r.permanent === true));
 
   // Same contact clears (absent from a scan) and drifts again, much later.

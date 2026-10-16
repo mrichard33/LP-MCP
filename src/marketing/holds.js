@@ -18,6 +18,7 @@
  */
 import supabaseDefault from '../supabase.js';
 import { FEED_SOURCE, FEED_GAP_TERRITORY } from './leadgurus-feed.js';
+import { prospectLabel } from '../format-helpers.js';
 
 const LOG = '[MktHold]';
 const digits = (s) => String(s || '').replace(/\D/g, '');
@@ -68,20 +69,20 @@ export async function matchHeldLeads(date, { supabase = supabaseDefault } = {}) 
     let hit = null;
     const email = String(lead.email || '').trim().toLowerCase();
     if (email) {
-      const { data } = await supabase.from('lp_leads').select('lp_lead_id, lp_branch_id, email').eq('email', email).limit(1);
+      const { data } = await supabase.from('lp_leads').select('lp_lead_id, lp_prospect_id, lp_branch_id, email').eq('email', email).limit(1);
       if (data?.length) hit = data[0];
     }
     if (!hit) {
       const last10 = digits(lead.phone).slice(-10);
       if (last10.length === 10) {
-        const { data } = await supabase.from('lp_leads').select('lp_lead_id, lp_branch_id, phone').like('phone', `%${last10}`).limit(1);
+        const { data } = await supabase.from('lp_leads').select('lp_lead_id, lp_prospect_id, lp_branch_id, phone').like('phone', `%${last10}`).limit(1);
         if (data?.length) hit = data[0];
       }
     }
     if (hit) {
       const map = await loadBranchMap();
       const market = map[hit.lp_branch_id] || null;
-      out.push({ lead_id: lead.lead_id, market, reason: `matched LP lead ${hit.lp_lead_id}, branch ${hit.lp_branch_id || '?'}` });
+      out.push({ lead_id: lead.lead_id, market, reason: `matched LP ${prospectLabel(hit.lp_prospect_id)}, branch ${hit.lp_branch_id || '?'}` });
       continue;
     }
     const zip = digits(lead.zip_code).slice(0, 5);

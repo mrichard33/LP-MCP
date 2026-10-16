@@ -138,7 +138,8 @@ test('throws on OOA with an actionable message', () => {
     () => assertAppointmentAccepted({ Result: 1, Message: 'market is OOA.  ' }, { ldsId: '570351' }),
     (err) => err.code === 'LP_APPT_REFUSED'
       && err.reason === 'lp_market_out_of_area'
-      && err.message.includes('570351')
+      && err.ldsId === '570351'
+      && !err.message.includes('570351') // the message reaches Slack: no lead id (2026-10-16)
   );
 });
 test('does not throw on success', () => {

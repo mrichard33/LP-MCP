@@ -179,6 +179,7 @@ export function classifyCaller(caller, ctx = {}) {
 
   if (ctx.lpPhones?.has(phone)) return { label: 'already_in_lp', why: 'an LP lead with this phone now exists' };
   const lpLeadId = readCustomField(contact, LP_LEAD_ID_FIELD);
+  // lead-id-ok: classifier reason, the daily post prints counts only
   if (lpLeadId) return { label: 'already_in_lp', why: `GHL contact carries LP lead ${lpLeadId}` };
 
   const soldTag = tags.find((t) => CUSTOMER_SET.has(t));

@@ -47,6 +47,7 @@ import { runJob } from '../job-runner.js';
 import { hourET, todayET } from './lp-report-common.js';
 import { evaluateS52Entry, isGatedState, isS52Target } from '../s52-entry-gate.js';
 import { alertDigestEnabled, filterNew, recordPosted as recordPostedItems } from '../alert-posted.js';
+import { prospectLabel } from '../format-helpers.js';
 
 export const JOB_ID = 'f0-integrity-audit';
 export const F0_ACTIVE_TAG = 'active-f.0';
@@ -161,11 +162,11 @@ export function auditItems(result) {
     // enrols it and says so; only a failed attempt still needs a person.
     if (m.auto_enrolled) {
       items.push({ contact_id: m.contact_id, name: name(m.contact_id), reason: 'f0_autoenrolled',
-        wrong: `demoed (lead ${m.lp_lead_id ?? '?'}, OPPFDN), F.0 enrolment had not run`, todo: 'auto-enrolled (no action)' });
+        wrong: `demoed (LP ${prospectLabel(m.lp_prospect_id)}, OPPFDN), F.0 enrolment had not run`, todo: 'auto-enrolled (no action)' });
       continue;
     }
     items.push({ contact_id: m.contact_id, name: name(m.contact_id), reason: 'f0_missing',
-      wrong: `demoed (lead ${m.lp_lead_id ?? '?'}, OPPFDN) but not in F.0${m.enroll_error ? ` (auto-enrol failed: ${m.enroll_error})` : ''}`, todo: 'enrol in F.0 by hand' });
+      wrong: `demoed (LP ${prospectLabel(m.lp_prospect_id)}, OPPFDN) but not in F.0${m.enroll_error ? ` (auto-enrol failed: ${m.enroll_error})` : ''}`, todo: 'enrol in F.0 by hand' });
   }
   for (const f of result.s52?.flagged || []) {
     items.push({ contact_id: f.contact_id, name: name(f.contact_id), reason: `s52_flag:${f.reason}`,
@@ -173,7 +174,7 @@ export function auditItems(result) {
   }
   for (const m of result.s52?.missed || []) {
     items.push({ contact_id: m.contact_id, name: name(m.contact_id), reason: 's52_missed_cancel',
-      wrong: `no-demo cancel (lead ${m.lp_lead_id ?? '?'}, ${m.disposition}) not in S5.2 and not blocked`, todo: 'check why S5.2 did not enroll' });
+      wrong: `no-demo cancel (LP ${prospectLabel(m.lp_prospect_id)}, ${m.disposition}) not in S5.2 and not blocked`, todo: 'check why S5.2 did not enroll' });
   }
   return items;
 }
@@ -218,7 +219,7 @@ export function formatF0AuditReport({ total, flagged, missing = [], s52 = null, 
   }
   if (missing.length) {
     out.push(`🚪 Demoed in the last ${MISSING_WINDOW_DAYS} days but NOT in F.0: ${missing.length}`,
-      ...listLines(missing, (m) => `• ${m.contact_id} · lead ${m.lp_lead_id ?? '?'}`));
+      ...listLines(missing, (m) => `• ${m.contact_id} · LP ${prospectLabel(m.lp_prospect_id)}`));
   }
   if (s52Flagged.length) {
     out.push(`🔎 S5.2 integrity: ${s52Flagged.length} of ${s52.total} active contacts fail the entry gate`,
@@ -226,7 +227,7 @@ export function formatF0AuditReport({ total, flagged, missing = [], s52 = null, 
   }
   if (s52Missed.length) {
     out.push(`🚪 No-demo cancels NOT in S5.2 and not blocked: ${s52Missed.length}`,
-      ...listLines(s52Missed, (m) => `• ${m.contact_id} · lead ${m.lp_lead_id ?? '?'} · ${m.disposition}`));
+      ...listLines(s52Missed, (m) => `• ${m.contact_id} · LP ${prospectLabel(m.lp_prospect_id)} · ${m.disposition}`));
   }
   return out.join('\n');
 }
@@ -272,7 +273,7 @@ async function autoEnrollMissing(deps, missing) {
     const rows = template.map((a) => ({
       action_type: a.action_type, target_system: a.target_system || 'ghl', target_entity: a.target_entity || 'contact',
       target_id: m.contact_id, action_payload: { ...(a.params || {}), claim_key: `f0-autoenrol:${m.contact_id}:${a.action_type}` },
-      reasoning: `F.0 audit: lead ${m.lp_lead_id ?? '?'} demoed (OPPFDN) and F.0 enrolment never ran — enrolling with rule ${F0_ENROLL_RULE}'s own actions`,
+      reasoning: `F.0 audit: LP ${prospectLabel(m.lp_prospect_id)} demoed (OPPFDN) and F.0 enrolment never ran — enrolling with rule ${F0_ENROLL_RULE}'s own actions`,
       rule_applied: F0_AUTOENROL_RULE, status: 'pending', requires_approval: false, priority: 40,
     }));
     const { error } = await deps.supabase.from('agent_actions').insert(rows);
@@ -305,7 +306,7 @@ async function loadLeads(deps, contactIds) {
   const byContact = new Map();
   for (let i = 0; i < contactIds.length; i += LP_CHUNK) {
     const { data, error } = await deps.supabase.from('lp_leads')
-      .select('ghl_contact_id, lp_lead_id, disposition_code, closed_won, appointment_date, created_at_lp, updated_at_lp, appts:raw_lp_data->appointments')
+      .select('ghl_contact_id, lp_lead_id, lp_prospect_id, disposition_code, closed_won, appointment_date, created_at_lp, updated_at_lp, appts:raw_lp_data->appointments')
       .in('ghl_contact_id', contactIds.slice(i, i + LP_CHUNK))
       .is('lp_deleted_at', null);
     if (error) throw new Error(`lp_leads read failed: ${error.message}`);
@@ -422,7 +423,7 @@ async function auditS52(deps, nowMs, sinceMs, names) {
       const ctx = { tags: tags.get(id), ...(decided.get(id) || {}) };
       if (isMissedS52Cancel(rows, ctx, nowMs, sinceMs)) {
         const cur = pickCurrentLead(rows);
-        missed.push({ contact_id: id, lp_lead_id: cur?.lp_lead_id ?? null, disposition: cur?.disposition_code ?? null });
+        missed.push({ contact_id: id, lp_lead_id: cur?.lp_lead_id ?? null, lp_prospect_id: cur?.lp_prospect_id ?? null, disposition: cur?.disposition_code ?? null });
       }
     }
   }
@@ -518,7 +519,7 @@ export async function runF0IntegrityAudit({ post = true, autoEnroll = true, deps
     for (const id of candidates.sort()) {
       const rows = candLeads.get(id) || [];
       if (isMissingFromF0(rows, candTags.get(id), nowMs, sinceMs)) {
-        missing.push({ contact_id: id, lp_lead_id: pickCurrentLead(rows)?.lp_lead_id ?? null });
+        missing.push({ contact_id: id, lp_lead_id: pickCurrentLead(rows)?.lp_lead_id ?? null, lp_prospect_id: pickCurrentLead(rows)?.lp_prospect_id ?? null });
       }
     }
     const enrolled = autoEnroll ? await autoEnrollMissing(deps, missing) : missing;

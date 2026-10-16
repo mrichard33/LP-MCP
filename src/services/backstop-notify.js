@@ -11,7 +11,7 @@
 // The narrative is model-written by generateBackstopInsight, called ONLY
 // after the gate decides to send, with a deterministic template as fallback.
 
-import { formatLpSource } from '../format-helpers.js';
+import { formatLpSource, prospectLabel } from '../format-helpers.js';
 import { buildClassifiedNotification } from '../actions/notification-classifier.js';
 import { generateBackstopInsight } from './backstop-insight.js';
 import { reportAlertCondition, sendAlertMessage, __resetAlertStateFallback } from '../alert-state.js';
@@ -194,13 +194,13 @@ function detailLines(results = [], errors = []) {
     const verb = r.action === 'created' ? 'created' : 'linked';
     const src = formatLpSource(r.lead_source, r.lead_source_detail) || 'Unknown';
     const sup = r.suppressed ? ` [${r.suppress_reason}]` : '';
-    out.push(`• ${nm} — ${src} — lead ${r.lp_lead_id} → contact ${r.contact_id || '?'} (${verb})${sup}`);
+    out.push(`• ${nm} — ${src} — ${prospectLabel(r.lp_prospect_id)} → contact ${r.contact_id || '?'} (${verb})${sup}`);
   }
   if (touched.length > MAX_DETAIL_LEADS) out.push(`• …and ${touched.length - MAX_DETAIL_LEADS} more`);
 
   for (const e of errs.slice(0, MAX_DETAIL_LEADS)) {
     const src = formatLpSource(e.lead_source, e.lead_source_detail) || 'Unknown';
-    out.push(`⚠ lead ${e.lp_lead_id} — ${src} — ${e.error}`);
+    out.push(`⚠ ${prospectLabel(e.lp_prospect_id)} — ${src} — ${e.error}`);
   }
   if (errs.length > MAX_DETAIL_LEADS) out.push(`⚠ …and ${errs.length - MAX_DETAIL_LEADS} more errored`);
 

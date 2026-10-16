@@ -24,8 +24,8 @@ import {
 // Bermudez, prospect 358689: lead 550806 (Issue) and 575443 (Set), both on
 // 2026-09-14. Three months apart, same vendor.
 const BERMUDEZ = [
-  { lp_lead_id: '550806', disposition_code: 'Issue', appointment_date: '2026-09-14T10:00:00+00:00' },
-  { lp_lead_id: '575443', disposition_code: 'Set', appointment_date: '2026-09-14T10:00:00+00:00' },
+  { lp_lead_id: '550806', lp_prospect_id: '431122', disposition_code: 'Issue', appointment_date: '2026-09-14T10:00:00+00:00' },
+  { lp_lead_id: '575443', lp_prospect_id: '431122', disposition_code: 'Set', appointment_date: '2026-09-14T10:00:00+00:00' },
 ];
 
 test('date normalizer reads both wire formats', () => {
@@ -130,7 +130,11 @@ test('end to end against an injected client: the Bermudez duplicate blocks', asy
     { ghlContactId: '82ih7hR4RsD6fzEYuwso', apptDate: '9/14/2026' }, { client });
   assert.equal(v.action, 'block');
   assert.deepEqual(queried, { table: 'lp_leads', col: 'ghl_contact_id', val: '82ih7hR4RsD6fzEYuwso' });
+  const line = formatDuplicateBlock({ ghlContactId: '82ih7hR4RsD6fzEYuwso', apptDay: '2026-09-14', conflicts: v.conflicts });
+  // The prospect, never the lead id: this line reaches Slack (the user, 2026-10-16).
+  assert.match(line, /LP Prospect 431122 \(Issue\), LP Prospect 431122 \(Set\)/);
+  assert.doesNotMatch(line, /550806|575443/);
   assert.match(
-    formatDuplicateBlock({ ghlContactId: '82ih7hR4RsD6fzEYuwso', apptDay: '2026-09-14', conflicts: v.conflicts }),
-    /550806 \(Issue\), 575443 \(Set\)/);
+    formatDuplicateBlock({ ghlContactId: 'x', apptDay: '2026-09-14', conflicts: [{ lp_lead_id: '1', disposition_code: 'Set' }] }),
+    /LP Prospect: unknown \(Set\)/);
 });

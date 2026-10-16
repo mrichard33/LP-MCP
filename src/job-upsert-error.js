@@ -45,6 +45,7 @@ export function buildJobUpsertError(jobId, lpLeadId, jobErr) {
 export function describeJobUpsertError(e) {
   if (!e) return '';
   return (
+    // lead-id-ok: lp_sync_errors.error_message, not a card
     `Job ${e.jobId} upsert failed (lead ${e.lpLeadId}) — [${e.code}] ${e.message}` +
     (e.details ? ` — ${e.details}` : '') +
     (e.missingParent ? ' — parent lead absent from lp_leads' : '')

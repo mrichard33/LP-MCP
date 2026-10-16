@@ -60,6 +60,7 @@ import supabase from '../supabase.js';
 import { emitEvent } from '../event-emitter.js';
 import { claimAlertConditionSet, confirmAlertSend } from '../alert-state.js';
 import { filterNew, recordPosted } from '../alert-posted.js';
+import { prospectLabel } from '../format-helpers.js';
 
 // Exported (2026-10-07) so src/stale-lead-refresh.js's test can prove its open
 // set covers every code this detector reads as LP-active.
@@ -213,7 +214,7 @@ export async function backfillDriftPosted(deps = {}) {
 
 /** Pure. The card for one drifted contact. */
 export function formatDriftCard(d, name) {
-  return `🔁 GHL closed / LP active — ${name || '(no name)'} · ${d.contact_id} · LP lead ${d.lp_lead_id ?? '?'} still ${d.lp_disposition} · ` +
+  return `🔁 GHL closed / LP active — ${name || '(no name)'} · ${d.contact_id} · LP ${prospectLabel(d.lp_prospect_id)} still ${d.lp_disposition} · ` +
     'close the LP lead, or reopen the contact in GHL';
 }
 

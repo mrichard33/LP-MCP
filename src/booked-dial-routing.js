@@ -65,6 +65,7 @@ import { lpStoredToUtcMs } from './lp-dates.js';
 import { etDateKey, daysBetween, FORBIDDEN_LIST } from './new-lead-dial-backstop.js';
 // 2026-10-15 (System Health 1.1): routeBooked lives in src/dial-routing-intent.js; re-exported unchanged.
 import { routeBooked, REMOVE_ONLY_DSP } from './dial-routing-intent.js';
+import { prospectLabel } from './format-helpers.js';
 export { routeBooked, REMOVE_ONLY_DSP };
 
 export const MODES = Object.freeze(['off', 'shadow', 'live']);
@@ -395,7 +396,7 @@ export function buildRemovalAction(c, { reason, readded = false, confList = null
       queued_at: new Date(nowMs).toISOString(),
     },
     reasoning:
-      `Booked-lead routing (decision #2669): ${c.name || 'this lead'} (${c.phone}, LP lead ${c.ldsId || `inquiry ${c.in1}`}) ` +
+      `Booked-lead routing (decision #2669): ${c.name || 'this lead'} (${c.phone}, ${c.ldsId ? `LP ${prospectLabel(c.custId)}` : `inquiry ${c.in1}`}) ` +
       `has a visit ${visitText(c)}. It comes off ${listNames.map((l) => `"${l}"`).join(', ')}. ${where}` +
       (readded ? ' LP put the number back on a setter list after an earlier removal.' : '') +
       ` Removing a number that is not on a list does nothing. Expires at the appointment time.`,
@@ -421,7 +422,7 @@ export function buildAddAction(c, record, list, { reason, nowMs }) {
     },
     rollback_payload: { action_type: 'five9_delete_record_from_list', list_name: list, field_names: ['number1'], values: [record.number1] },
     reasoning:
-      `Booked-lead routing (decision #2669): ${c.name || 'this lead'} (LP lead ${c.ldsId || c.in1}) has a visit ${visitText(c)} (${reason}), ` +
+      `Booked-lead routing (decision #2669): ${c.name || 'this lead'} (${c.ldsId ? `LP ${prospectLabel(c.custId)}` : `inquiry ${c.in1}`}) has a visit ${visitText(c)} (${reason}), ` +
       `so it goes on "${list}" for the confirmation call. Its removal from the setter lists waits until this add completes.`,
     rule_applied: RULE_KEY,
     confidence: 1.0,
@@ -436,7 +437,7 @@ const phoneText = (p) => String(p || '');
 
 /** The #contact-center card for adds that failed twice. Plain English. */
 export function formatAddFailedCard(items) {
-  const lines = items.map(({ c, list }) => `• ${c.name || 'No name'} · ${phoneText(c.phone)} · visit ${visitText(c)} → "${list}" (LP lead ${c.ldsId || `inquiry ${c.in1}`})`);
+  const lines = items.map(({ c, list }) => `• ${c.name || 'No name'} · ${phoneText(c.phone)} · visit ${visitText(c)} → "${list}" (${c.ldsId ? `LP ${prospectLabel(c.custId)}` : `inquiry ${c.in1}`})`);
   return [
     '⚠️ BOOKED LEADS NOT ON A CONFIRMATION LIST — please add them in Five9 by hand',
     '',

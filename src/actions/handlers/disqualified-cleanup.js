@@ -35,6 +35,7 @@ import { buildMarkInvalidRows } from '../../appointments/mark-invalid.js';
 import { isDisqualifiedDisposition } from '../../lp-disposition-classes.js';
 import { workflowCodesToLeave } from '../../services/dq-hard-stop.js';
 import { ESTIMATE_CALENDAR_IDS } from '../../services/lp-ghl-appointment-reconciler.js';
+import { prospectLabel } from '../../format-helpers.js';
 
 export const DISQUALIFIED_RULE = 'LP_DISP_DISQUALIFIED';
 export const DISQUALIFIED_TAG = 'lp-disqualified';
@@ -63,7 +64,8 @@ export function openEstimateAppointments(upcoming) {
  */
 export function planDisqualifiedCleanup({ contactId, lead, appointments, tags, phone, workflowIds = {}, autoRemove, eventId = null, nowMs = Date.now() }) {
   const disp = String(lead?.disposition_code || '').trim();
-  const why = `LP lead ${lead?.lp_lead_id || '?'} is ${disp} (disqualified)`;
+  // The prospect, never the lead id: this text is the approval card's reason (the user, 2026-10-16).
+  const why = `LP ${prospectLabel(lead?.lp_prospect_id)} is ${disp} (disqualified)`;
   const rows = [];
   for (const appt of openEstimateAppointments(appointments)) {
     rows.push(...buildMarkInvalidRows({ contactId, appointmentId: appt.appointment_id, rule: DISQUALIFIED_RULE, why, eventId }));
@@ -121,7 +123,7 @@ export async function executeDisqualifiedCleanup(action, _context = {}, deps = {
   const contactId = action.target_id;
   if (!contactId) throw new Error('disqualified_cleanup: missing target_id');
   const { data: lead, error } = await deps.supabase.from('lp_leads')
-    .select('lp_lead_id, disposition_code, first_name, last_name, phone')
+    .select('lp_lead_id, lp_prospect_id, disposition_code, first_name, last_name, phone')
     .eq('ghl_contact_id', contactId).is('lp_deleted_at', null)
     .order('created_at_lp', { ascending: false }).limit(1).maybeSingle();
   if (error) throw new Error(`disqualified_cleanup: lp_leads read failed: ${error.message}`);
