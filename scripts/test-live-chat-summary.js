@@ -10,7 +10,7 @@ import assert from 'node:assert/strict';
 
 const {
   sessionize, readySessions, toTurn, summarizeFacts, needsAPerson, buildCard, summaryMode, summaryQuietMs,
-  cleanSummary, fallbackSummary, openingsFromRows,
+  cleanSummary, fallbackSummary, openingsFromRows, worthPosting, flagList, summaryChannel, SUMMARY_CHANNEL_DEFAULT,
 } = await import('../src/live-chat/chat-summary.js');
 const { runLiveChatSummaryPass, threadRootFor, WINDOW_COUNT_FIELD_ID, DOOR_COUNT_FIELD_ID } = await import('../src/services/live-chat-summary-io.js');
 
@@ -227,4 +227,106 @@ test('helpers: summary cleanup, fallback, openings rows, thread root', () => {
   assert.deepEqual(openingsFromRows([{ action_payload: { fields: [{ id: WINDOW_COUNT_FIELD_ID, field_value: 13 }, { id: DOOR_COUNT_FIELD_ID, field_value: 2 }] } }], { windowFieldId: WINDOW_COUNT_FIELD_ID, doorFieldId: DOOR_COUNT_FIELD_ID }), { windows: 13, doors: 2 });
   assert.equal(threadRootFor('c', [{ contact_id: 'c', posted_at: at(0), slack_ts: '1', slack_channel: 'C' }], T0 + 8 * 24 * 60 * MIN), null, 'older than a week starts a new card');
   assert.deepEqual(threadRootFor('c', [{ contact_id: 'c', posted_at: at(0), slack_ts: '1', slack_channel: 'C' }], T0 + MIN), { thread_ts: '1', channel: 'C' });
+});
+
+// ── 2026-10-16: #reece-chatbot, no card for an empty chat, any non-English visitor ──
+
+const GUEST = { name: 'Guest Visitor kupsc', phone: null };
+const oneTurn = (inbound, er = {}, contact = 'FbGjckn4HAFe5iydGcAr') =>
+  [chatRow(1, 0, inbound, { large_job: false, sent_body: 'Hey there. What brings you in today?', ...er }, contact)];
+
+test('the card goes to #reece-chatbot by default; LIVE_CHAT_SUMMARY_CHANNEL overrides', () => {
+  assert.equal(SUMMARY_CHANNEL_DEFAULT, 'C0C9AGEM2N8');
+  assert.equal(summaryChannel({}), 'C0C9AGEM2N8');
+  assert.equal(summaryChannel({ SLACK_CHANNEL_DISPATCH: 'C_DISPATCH' }), 'C_DISPATCH');
+  assert.equal(summaryChannel({ LIVE_CHAT_SUMMARY_CHANNEL: ' C_SUMMARY ', SLACK_CHANNEL_DISPATCH: 'C_DISPATCH' }), 'C_SUMMARY');
+});
+
+test('a one-message chat with nothing to act on: row written and marked skipped, no card, never retried', async () => {
+  for (const inbound of ['bb', 'English', 'I need the manufacturer of the high impact windows for QMID for energy credit']) {
+    const { deps, state } = makeDeps({ rows: oneTurn(inbound), contact: GUEST });
+    const out = await runLiveChatSummaryPass({ env: LIVE, nowMs: T0 + 20 * MIN, deps });
+    assert.equal(out.claimed, 1, inbound);
+    assert.equal(out.skipped, 1, inbound);
+    assert.equal(state.posts.length, 0, inbound);
+    assert.equal(state.table[0].payload.skipped, 'nothing_to_act_on');
+    assert.equal(state.table[0].posted_at, null);
+    for (let i = 1; i <= 3; i++) await runLiveChatSummaryPass({ env: LIVE, nowMs: T0 + (20 + i) * MIN, deps });
+    assert.equal(state.posts.length, 0, `${inbound}: a skipped row is never retried into a card`);
+    assert.equal(state.table.length, 1);
+  }
+});
+
+test('shadow marks the same chats skipped, so shadow shows what live would skip', async () => {
+  const { deps, state } = makeDeps({ rows: oneTurn('bb'), contact: GUEST });
+  const out = await runLiveChatSummaryPass({ env: SHADOW, nowMs: T0 + 20 * MIN, deps });
+  assert.equal(out.skipped, 1);
+  assert.equal(state.table[0].payload.skipped, 'nothing_to_act_on');
+});
+
+test('worthPosting: a real name, a phone, an outcome, a zip or openings each earn the card', () => {
+  const empty = summarizeFacts(oneTurn('bb').map(toTurn));
+  assert.equal(worthPosting(empty, GUEST), false);
+  assert.equal(worthPosting(empty, null), false, 'a failed contact read with nothing else is still nothing');
+  assert.equal(worthPosting(empty, { name: 'Dana', phone: null }), true);
+  assert.equal(worthPosting(empty, { name: null, phone: '+1 352 555 0188' }), true);
+  assert.equal(worthPosting({ ...empty, zip: '33901' }, GUEST), true);
+  assert.equal(worthPosting({ ...empty, openings: { windows: 3, doors: 0 } }, GUEST), true);
+  assert.equal(worthPosting({ ...empty, outcome: 'callback' }, GUEST), true);
+  assert.equal(worthPosting({ ...empty, opted_out: true }, GUEST), true, 'an opt-out is a flag');
+  assert.equal(worthPosting({ ...empty, fallbacks: 1 }, GUEST), true, 'a slow reply is a flag');
+  assert.equal(worthPosting(summarizeFacts(SIX.map(toTurn)), { name: 'Roberta Smith', phone: null }), true);
+});
+
+test('a visitor who does not speak English is flagged and asks for a person, whatever the language', async () => {
+  const rows = oneTurn('no English', { live_chat: { escalation_category: 'language', recommended_action: 'escalate_to_rep' } }, 'wTcbTNm9d0CRDDTKbygg');
+  const f = summarizeFacts(rows.map(toTurn));
+  assert.equal(f.language, 'unknown');
+  assert.equal(f.spanish, false);
+  assert.deepEqual(flagList(f), ['Non-English (unknown)']);
+  assert.equal(needsAPerson(f), "Doesn't speak English (language unknown): someone who can help should follow up.");
+  const { deps, state } = makeDeps({ rows, contact: { name: 'Guest Visitor xiinu', phone: null } });
+  await runLiveChatSummaryPass({ env: LIVE, nowMs: T0 + 20 * MIN, deps });
+  assert.equal(state.posts.length, 1, 'never skipped: someone has to follow up');
+  assert.match(state.posts[0].text, /Flags: Non-English \(unknown\)/);
+  assert.match(state.posts[0].text, /Needs a person: Doesn't speak English \(language unknown\)/);
+});
+
+test('a Spanish hand-off keeps today\'s flag and line; spanish stays on the facts', () => {
+  const rows = [
+    chatRow(1, 0, 'hola', { large_job: false }, 'nwwB55NnNUMnsMEahzvR'),
+    chatRow(2, 1, 'comoestaflorida', { large_job: false, live_chat: { escalation_category: 'language' } }, 'nwwB55NnNUMnsMEahzvR'),
+    chatRow(3, 2, 'español', { large_job: false, language_handoff: 'es', live_chat: { escalation_category: 'language' } }, 'nwwB55NnNUMnsMEahzvR'),
+  ];
+  const f = summarizeFacts(rows.map(toTurn));
+  assert.equal(f.language, 'Spanish');
+  assert.equal(f.spanish, true);
+  assert.deepEqual(flagList(f), ['Spanish']);
+  assert.equal(needsAPerson(f), 'Spanish speaker: a Spanish-speaking person should follow up.');
+  // Another language code the hand-off might name one day is shown as it is.
+  const other = summarizeFacts(oneTurn('bonjour', { language_handoff: 'fr' }).map(toTurn));
+  assert.equal(other.language, 'fr');
+  assert.match(needsAPerson(other), /Doesn't speak English \(fr\)/);
+});
+
+test('the held 13-window chat still posts, unchanged, and a thread reply stays in the first card\'s channel', async () => {
+  const rows = [...SIX];
+  const { deps, state } = makeDeps({ rows });
+  deps.channel = () => summaryChannel({});
+  await runLiveChatSummaryPass({ env: LIVE, nowMs: T0 + 21 * MIN, deps });
+  assert.equal(state.posts[0].channel, 'C0C9AGEM2N8');
+  assert.match(state.posts[0].text, /Flags: Large job$/m);
+  // The first card was posted somewhere else (an #ops-alerts card from before this change): the reply follows it.
+  state.table[0].slack_channel = 'C_OLD_OPS';
+  rows.push(chatRow(7, 35, 'Actually can you come Friday?'));
+  await runLiveChatSummaryPass({ env: LIVE, nowMs: T0 + 51 * MIN, deps });
+  assert.equal(state.posts[1].channel, 'C_OLD_OPS');
+  assert.equal(state.posts[1].threadTs, state.table[0].slack_ts);
+});
+
+test('an old shadow row is never posted once the mode is live', async () => {
+  const { deps, state } = makeDeps();
+  await runLiveChatSummaryPass({ env: SHADOW, nowMs: T0 + 21 * MIN, deps });
+  await runLiveChatSummaryPass({ env: LIVE, nowMs: T0 + 22 * MIN, deps });
+  assert.equal(state.posts.length, 0);
 });

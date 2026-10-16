@@ -11,10 +11,13 @@
  *      loses the insert and does nothing, so a session gets one card, never two,
  *   4. builds the facts from code, asks a cheap model for the 2–3 lines
  *      (fn live_chat_summary; a failure uses the visitor's own words),
- *   5. shadow: stores the card's parts on the row and posts nothing.
- *      live: posts to #ops-alerts (SLACK_CHANNEL_OPS, where the large-job card
- *      went). A lead who comes back gets the new summary as a THREAD REPLY
- *      under their earlier card (postToSlack threadTs), not a new post.
+ *   5. a chat with nothing to act on (`worthPosting`) is stored with
+ *      payload.skipped = 'nothing_to_act_on' and never posted or retried,
+ *   6. shadow: stores the card's parts on the row and posts nothing.
+ *      live: posts to #reece-chatbot (LIVE_CHAT_SUMMARY_CHANNEL, else
+ *      SLACK_CHANNEL_DISPATCH; 2026-10-16, Mark: #ops-alerts is for system
+ *      alerts). A lead who comes back gets the new summary as a THREAD REPLY
+ *      under their earlier card, in that card's channel (postToSlack threadTs).
  *
  * A failed post keeps the row (error, attempts) and is retried on later passes
  * up to MAX_POST_ATTEMPTS. A failed read ends the pass: nothing is claimed on a
@@ -23,7 +26,7 @@
 
 import {
   summaryMode, summaryQuietMs, toTurn, sessionize, readySessions, summarizeFacts, buildCard,
-  buildSummaryPrompt, cleanSummary, fallbackSummary, openingsFromRows,
+  buildSummaryPrompt, cleanSummary, fallbackSummary, openingsFromRows, worthPosting, summaryChannel,
   READ_WINDOW_MS, THREAD_WINDOW_MS, MAX_POST_ATTEMPTS,
 } from '../live-chat/chat-summary.js';
 
@@ -39,7 +42,7 @@ const iso = (t) => new Date(t).toISOString();
 
 /** Production deps. Lazy imports keep the module loadable in tests. */
 export async function defaultSummaryDeps() {
-  const [{ default: supabase }, { ghlFetch }, { GHL_LOCATION_ID }, { callLLM }, { postToSlack, opsChannelId }, { withGhlCaller }] = await Promise.all([
+  const [{ default: supabase }, { ghlFetch }, { GHL_LOCATION_ID }, { callLLM }, { postToSlack }, { withGhlCaller }] = await Promise.all([
     import('../supabase.js'),
     import('../actions/helpers.js'),
     import('../actions/constants.js'),
@@ -102,7 +105,7 @@ export async function defaultSummaryDeps() {
       return out?.text || null;
     },
     postToSlack,
-    channel: () => opsChannelId() || null,
+    channel: () => summaryChannel(),
     contactUrl: (id) => `https://app.gohighlevel.com/v2/location/${GHL_LOCATION_ID}/contacts/detail/${id}`,
     log: (line) => console.log(line),
     warn: (line) => console.warn(line),
@@ -147,7 +150,7 @@ async function postCard({ rowId, parts, root, attempts, session, d }) {
   const channel = root?.channel || d.channel();
   const card = buildCard({ facts: parts.facts, summary: parts.summary, contact: parts.contact, contactUrl: d.contactUrl(session.contact_id), followUp: !!root });
   if (!channel) {
-    await d.updateSummary(rowId, { attempts: attempts + 1, error: 'no Slack channel (SLACK_CHANNEL_OPS unset)' });
+    await d.updateSummary(rowId, { attempts: attempts + 1, error: 'no Slack channel (LIVE_CHAT_SUMMARY_CHANNEL unset)' });
     d.warn(`[ChatSummary] ${session.contact_id}: no Slack channel, card not posted`);
     return { posted: false };
   }
@@ -178,20 +181,24 @@ export async function runLiveChatSummaryPass({ env = process.env, nowMs = Date.n
   const rows = await d.readChatRows(iso(windowStartMs));
   const ready = readySessions(sessionize((rows || []).map(toTurn), quietMs), { nowMs, quietMs, windowStartMs })
     .sort((a, b) => ms(a.session_start) - ms(b.session_start));
-  if (!ready.length) return { ok: true, mode, ready: 0, claimed: 0, posted: 0, retried: 0 };
+  if (!ready.length) return { ok: true, mode, ready: 0, claimed: 0, posted: 0, retried: 0, skipped: 0 };
 
   const contacts = [...new Set(ready.map((s) => s.contact_id))];
   const summaries = [...(await d.readSummaries(contacts, iso(nowMs - THREAD_WINDOW_MS)) || [])];
   let claimed = 0;
   let posted = 0;
   let retried = 0;
+  let skipped = 0;
 
   for (const session of ready) {
     const startMs = ms(session.session_start);
     const existing = summaries.find((s) => s.contact_id === session.contact_id && ms(s.session_start) === startMs);
     if (existing) {
-      // A live row whose post failed is retried; anything else is done.
-      if (mode !== 'live' || existing.mode !== 'live' || existing.posted_at || (existing.attempts || 0) >= MAX_POST_ATTEMPTS) continue;
+      // A live row whose post failed is retried; anything else is done. A
+      // skipped row has no posted_at either, so it is named here or it would
+      // be "retried" into the card it was meant not to get.
+      if (mode !== 'live' || existing.mode !== 'live' || existing.posted_at || existing.payload?.skipped
+        || (existing.attempts || 0) >= MAX_POST_ATTEMPTS) continue;
       const parts = await buildParts(session, d);
       const root = threadRootFor(session.contact_id, summaries.filter((s) => s !== existing), nowMs);
       const out = await postCard({ rowId: existing.id, parts, root, attempts: existing.attempts || 0, session, d });
@@ -211,6 +218,14 @@ export async function runLiveChatSummaryPass({ env = process.env, nowMs = Date.n
     const root = threadRootFor(session.contact_id, summaries, nowMs);
     // The facts and the summary only: no phone or email is stored on the row.
     const payload = { facts: parts.facts, summary: parts.summary, summary_source: parts.source, follow_up: !!root };
+    if (!worthPosting(parts.facts, parts.contact)) {
+      // In shadow too, so the shadow rows show what live would skip.
+      row.payload = { ...payload, skipped: 'nothing_to_act_on' };
+      await d.updateSummary(claim.id, { payload: row.payload });
+      skipped++;
+      d.log(`[ChatSummary] ${mode} ${session.contact_id}: nothing to act on, no card (${session.turns.length} turn(s))`);
+      continue;
+    }
     if (mode === 'shadow') {
       await d.updateSummary(claim.id, { payload, thread_ts: root?.thread_ts || null });
       d.log(`[ChatSummary] shadow ${session.contact_id}: ${parts.facts.outcome}, ${session.turns.length} turn(s)${root ? ', would thread' : ''}`);
@@ -220,5 +235,5 @@ export async function runLiveChatSummaryPass({ env = process.env, nowMs = Date.n
     const out = await postCard({ rowId: claim.id, parts, root, attempts: 0, session, d });
     if (out.posted) { posted++; Object.assign(row, { posted_at: iso(nowMs), slack_ts: out.ts, slack_channel: out.channel, thread_ts: root?.thread_ts || null }); }
   }
-  return { ok: true, mode, ready: ready.length, claimed, posted, retried };
+  return { ok: true, mode, ready: ready.length, claimed, posted, retried, skipped };
 }
