@@ -541,8 +541,9 @@ test('watchdog: a lead stuck 30+ min with no call, no push and no reason → ONE
   assert.equal(res.unhandled, 4);
   assert.equal(h.state.ops.length, 1);
   assert.equal(h.state.ops[0].opts.channel, 'ops');
-  assert.match(h.state.ops[0].text, /Donna · 6623125252 · Reece ChatBot · LP lead 581413 · \d+h \d+m old · Five9 DNC check failed/);
-  assert.match(h.state.ops[0].text, /Lori Brannon · 8639446117 · Google PPC Windows · LP lead 581416/);
+  assert.match(h.state.ops[0].text, /Donna · 6623125252 · Reece ChatBot · LP Prospect 463200 · \d+h \d+m old · Five9 DNC check failed/);
+  assert.match(h.state.ops[0].text, /Lori Brannon · 8639446117 · Google PPC Windows · LP Prospect 463203/);
+  assert.doesNotMatch(h.state.ops[0].text, /581413|581416/, 'the card names the prospect, never the LP lead id');
   await h.run(at('2026-10-06T12:36:00Z'));
   assert.equal(h.state.ops.length, 1, 'each lead is named once');
 });

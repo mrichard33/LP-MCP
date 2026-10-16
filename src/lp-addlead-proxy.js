@@ -69,7 +69,7 @@ import {
   BUSINESS_HOUR_START_ET,
   BUSINESS_HOUR_END_ET,
 } from './services/lp-ghl-appointment-reconciler.js';
-import { slackPhone } from './format-helpers.js';
+import { slackPhone, prospectLabel } from './format-helpers.js';
 
 const LP_ADDLEAD_URL =
   process.env.LP_ADDLEAD_URL || 'http://lppost.leadperfection.com/br27/addlead';
@@ -294,7 +294,7 @@ async function sendStripCard({ body, plan, mode }) {
     // The duplicate case needs the OTHER lead ids to be actionable at all —
     // "stripped, duplicate" with nothing to compare against is a dead end.
     (plan.conflicts?.length
-      ? `Contact already holds: ${plan.conflicts.map((c) => `${c.lp_lead_id} (${c.disposition_code})`).join(', ')}\n`
+      ? `Contact already holds: ${plan.conflicts.map((c) => `LP ${prospectLabel(c.lp_prospect_id)} (${c.disposition_code})`).join(', ')}\n`
       : '') +
     `Confirm the real time with the customer and set it in LP (LP is system of record; Five9 lists repopulate at 6 AM).`,
     { flushNow: true }

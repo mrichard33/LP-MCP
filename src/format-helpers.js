@@ -53,6 +53,18 @@ export function slackPhone(phone) {
 }
 
 /**
+ * The LP record a Slack card names: the PROSPECT, never the lead (the user,
+ * 2026-10-16: "It must always include the Prospect ID, never the actual lead
+ * ID."). A blank id reads "Prospect: unknown" and the card still posts; the
+ * lead id is never the fallback. One format for every card; the guard in
+ * scripts/test-no-lead-id-on-cards.js keeps lead ids off them.
+ */
+export function prospectLabel(prospectId) {
+  const id = prospectId === null || prospectId === undefined ? '' : String(prospectId).trim();
+  return id && id !== '?' && !/^(null|undefined|none)$/i.test(id) ? `Prospect ${id}` : 'Prospect: unknown';
+}
+
+/**
  * Format a date/time string for human display.
  * Handles multiple input formats:
  *   ISO:        2026-04-09T10:00:00+00:00 → 04/09/2026 at 10:00 AM

@@ -155,7 +155,7 @@ async function defaultResolveLead(contactId) {
   const { default: supabase } = await import('../supabase.js');
   if (!supabase) return null;
   const { data, error } = await supabase.from('lp_leads')
-    .select('lp_lead_id, disposition_code, appointment_date, first_name, last_name, lead_source, ' +
+    .select('lp_lead_id, lp_prospect_id, disposition_code, appointment_date, first_name, last_name, lead_source, ' +
       'created_at_lp, updated_at_lp, set_date, last_contact_date, synced_at, set_by_name')
     .eq('ghl_contact_id', contactId).is('lp_deleted_at', null)
     .order('created_at_lp', { ascending: false }).limit(1).maybeSingle();

@@ -637,7 +637,9 @@ test('the #contact-center card names the person, the leads, the reason and the o
     issued_lead_id: '190599', issued_disposition: 'CCC', issued_reason: 'lp_issued_flag',
     appt_date: '2026-10-16', appt_time: '18:00', reason: 'srs_id_unresolvable',
   }, { GHL_LOCATION_ID: 'LOC' });
-  for (const s of ['Heather Faling', '9417269363', '158825', '190599', 'CCC', '2026-10-16 18:00', 'srs_id_unresolvable', 'create a NEW lead', `contacts/detail/${CONTACT}`]) {
+  for (const s of ['Heather Faling', '9417269363', 'Prospect 158825', 'CCC', '2026-10-16 18:00', 'srs_id_unresolvable', 'create a NEW lead', `contacts/detail/${CONTACT}`]) {
     assert.ok(text.includes(s), s);
   }
+  // The prospect, never the lead id (the user, 2026-10-16).
+  assert.ok(!text.includes('190599'), 'the card must not print the issued LP lead id');
 });

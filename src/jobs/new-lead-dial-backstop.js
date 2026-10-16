@@ -307,6 +307,7 @@ function buildAction(row, record, list, reason, callNowMode, { cardLine, held })
     },
     rollback_payload: { action_type: 'five9_delete_record_from_list', list_name: list, field_names: ['number1'], records: [[record.number1]] },
     reasoning:
+      // lead-id-ok: action reasoning; the Slack net strips it on an approval card
       `New-lead dial backstop: LP lead ${row.ldsId} (inbound ${row.in1}) arrived ${new Date(row.receivedMs).toISOString()} ` +
       `and Five9 has not called it (${reason}). Nothing had it on a dial list, so it is queued to "${list}" (2026-10-06 routing).`,
     rule_applied: RULE_KEY,

@@ -44,6 +44,7 @@
  */
 
 import { formatLpSource, slackPhone } from '../format-helpers.js';
+import { isLPLeadId } from './helpers.js';
 
 // ══════════════════════════════════════════════════════════════════════
 // CLASS DEFINITIONS
@@ -236,7 +237,9 @@ export function buildClassifiedNotification(args = {}) {
   // Slack cards print the number as digits only (the user, 2026-10-13).
   const displayPhone = slackPhone(phone);
   lines.push(`👤 ${name || 'Unknown'}${displayPhone ? ` | ${displayPhone}` : ''}`);
-  lines.push(`Contact ID: ${contactId || 'unknown'}`);
+  // An LP lead id is never printed (the user, 2026-10-16): the Prospect line
+  // below names the LP record.
+  if (!isLPLeadId(contactId)) lines.push(`Contact ID: ${contactId || 'unknown'}`);
 
   // Per Mark's v4.2 directive the Prospect line ALWAYS renders — absence is
   // signal. v1.2 (2026-09-14): the absent value reads "Not yet assigned"

@@ -429,8 +429,9 @@ export function buildRichNotification({ baseMessage, name, phone, contactId, pro
   const displayPhone = slackPhone(phone);
   const nameLine = `👤 ${name || 'Unknown'}${displayPhone ? ` ${displayPhone}` : ''}`;
   lines.push(nameLine);
-  const idLabel = isLPLeadId(contactId) ? 'LP Lead ID' : 'Contact ID';
-  const idParts = [`${idLabel}: ${contactId}`];
+  // An LP lead id is never printed (the user, 2026-10-16); the Prospect line
+  // below names the LP record. A GHL contact id still shows.
+  const idParts = isLPLeadId(contactId) ? [] : [`Contact ID: ${contactId}`];
   // v4.2 (2026-05-01): always render the Prospect line. Per Mark's directive,
   // absence-of-Prospect-ID is itself signal. v5.1 (2026-09-14): the absent
   // value is the shared constant, so this card and the classified card can

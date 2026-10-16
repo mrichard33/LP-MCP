@@ -45,6 +45,8 @@
  * customer with no appointment.
  */
 
+import { prospectLabel } from '../format-helpers.js';
+
 /**
  * Dispositions that mean "this lead is holding a live appointment".
  * Matches the live_rows definition in v_appt_prospect_dupes (sql/108).
@@ -102,8 +104,9 @@ export function planDuplicateAppointment({ liveLeads, apptDay } = {}) {
 
 /** Human-readable one-liner for the ops card and the log line. */
 export function formatDuplicateBlock({ ghlContactId, apptDay, conflicts }) {
+  // The prospect, never the lead id: this line reaches Slack (the user, 2026-10-16).
   const rows = (conflicts || []).map((c) =>
-    `${c.lp_lead_id} (${c.disposition_code})`).join(', ');
+    `LP ${prospectLabel(c.lp_prospect_id)} (${c.disposition_code})`).join(', ');
   return `🚫 LP duplicate appointment blocked — contact ${ghlContactId} already holds a live lead on ${apptDay}: ${rows}. New create suppressed on our path.`;
 }
 
@@ -136,7 +139,7 @@ export async function checkDuplicateAppointment({ ghlContactId, apptDate } = {},
 
   try {
     const { data, error } = await supabase.from('lp_leads')
-      .select('lp_lead_id, disposition_code, appointment_date')
+      .select('lp_lead_id, lp_prospect_id, disposition_code, appointment_date')
       .eq('ghl_contact_id', ghlContactId)
       .not('appointment_date', 'is', null);
     if (error) {

@@ -134,6 +134,7 @@ export function buildReviewAction(lead) {
       blocked_in: lead.blocked_in,
     },
     rule_applied: RULE_KEY,
+    // lead-id-ok: action reasoning; the DNC-lift card prints the prospect
     reasoning: `New LP lead ${lead.lp_lead_id}${vendor ? ` from ${vendor}` : ''} for a number that is blocked (${lead.blocked_in.join(', ')}) — asking a person in #dnc-lift-approval`,
     status: 'pending',
     requires_approval: false,

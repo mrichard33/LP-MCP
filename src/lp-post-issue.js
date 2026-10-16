@@ -303,6 +303,7 @@ export function buildRebookLeadFields({ prospect, srsId, proId, dateYmd, timeHHM
     pro_id: clean(proId),
     productID: clean(product) || 'Win',
     proddescr: clean(product) || 'Win',
+    // lead-id-ok: an LP note, not Slack
     notes: `Rebook: LP lead ${issuedLeadId} was already issued (${clean(issuedDisposition) || 'issued'}). ` +
       'New lead per call-center rule; Source, Sub-Source and Promoter carried from that lead.',
   };

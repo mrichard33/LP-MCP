@@ -48,20 +48,23 @@ test('Auto-fixed counts every fallback fix in one section', async () => {
 });
 
 test('LP date/time looks wrong: one line per lead, never "add it to GHL"', async () => {
-  const t = await run({ lp_sync_failure_notices: [{ notice_key: 'lp-looks-wrong:583740:2026-11-03', contact_id: 'stuckey', appt_date: '2026-11-03', appt_time: '02:00', created_at: iso(NOW - HOUR) }] });
+  const t = await run({ lp_sync_failure_notices: [{ notice_key: 'lp-looks-wrong:583740:2026-11-03', contact_id: 'stuckey', appt_date: '2026-11-03', appt_time: '02:00', created_at: iso(NOW - HOUR) }],
+    lp_leads: [{ lp_lead_id: '583740', lp_prospect_id: '462947' }] });
   assert.match(t, /LP date\/time looks wrong: 1/);
-  assert.match(t, /LP lead 583740 · 2026-11-03 02:00 · confirmation team fixes it in LP/);
+  assert.match(t, /LP Prospect 462947 · 2026-11-03 02:00 · confirmation team fixes it in LP/);
+  assert.doesNotMatch(t, /583740/, 'never the lead id (2026-10-16)');
   assert.doesNotMatch(t, /add it to the GHL calendar/);
 });
 
 test('duplicate LP leads: named once a day', async () => {
   const tables = { lp_leads: [
-    { ghl_contact_id: 'badley', lp_lead_id: '583460', disposition_code: 'CXL', appointment_set: true, appointment_date: '2026-10-17T10:00:00+00:00', lp_branch_id: 'SAR', lp_deleted_at: null },
-    { ghl_contact_id: 'badley', lp_lead_id: '583453', disposition_code: 'Cnf', appointment_set: true, appointment_date: '2026-10-17T10:00:00+00:00', lp_branch_id: 'FTMYR', lp_deleted_at: null },
+    { ghl_contact_id: 'badley', lp_lead_id: '583460', lp_prospect_id: '470001', disposition_code: 'CXL', appointment_set: true, appointment_date: '2026-10-17T10:00:00+00:00', lp_branch_id: 'SAR', lp_deleted_at: null },
+    { ghl_contact_id: 'badley', lp_lead_id: '583453', lp_prospect_id: '470001', disposition_code: 'Cnf', appointment_set: true, appointment_date: '2026-10-17T10:00:00+00:00', lp_branch_id: 'FTMYR', lp_deleted_at: null },
   ] };
   const t = await run(tables);
   assert.match(t, /Duplicate LP leads to clean up: 1/);
-  assert.match(t, /583460\/SAR\/CXL\/2026-10-17 10:00 vs 583453\/FTMYR\/Cnf\/2026-10-17 10:00 · clean up in LP/);
+  assert.match(t, /LP Prospect 470001 · SAR\/CXL\/2026-10-17 10:00 vs FTMYR\/Cnf\/2026-10-17 10:00 · clean up in LP/);
+  assert.doesNotMatch(t, /58346|58345/);
 });
 
 test('disqualified Five9 removals waiting on approval are counted — only while auto-remove is off', async () => {

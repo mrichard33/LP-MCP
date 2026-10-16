@@ -13,7 +13,7 @@
 // steady state (healthy runs, silent) it costs nothing at all.
 
 import { callLLM } from '../llm-client.js';
-import { formatLpSource } from '../format-helpers.js';
+import { formatLpSource, prospectLabel } from '../format-helpers.js';
 import { sanitizeNarrative } from '../actions/notification-classifier.js';
 
 export const INSIGHT_CHAR_CAP = parseInt(process.env.LP_BACKSTOP_INSIGHT_CAP || '320', 10);
@@ -74,7 +74,7 @@ function buildUserPrompt({ sweepMode, severity, counts = {}, scan = {}, errors =
     lines.push('  (none)');
   } else {
     for (const e of errors.slice(0, INSIGHT_LEAD_SAMPLE)) {
-      lines.push(`  - lead ${e.lp_lead_id}: ${String(e.error).slice(0, 200)}`);
+      lines.push(`  - ${prospectLabel(e.lp_prospect_id)}: ${String(e.error).slice(0, 200)}`);
     }
   }
   lines.push('');

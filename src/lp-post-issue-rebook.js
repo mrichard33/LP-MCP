@@ -47,7 +47,7 @@ import {
 } from './lp-post-issue.js';
 import { assertNotTransposed } from './lp-source-ids.js';
 import { lpStoredToUtcMs } from './lp-dates.js';
-import { slackPhone } from './format-helpers.js';
+import { slackPhone, prospectLabel } from './format-helpers.js';
 
 export const POST_ISSUE_AUDIT = 'lp_post_issue_rebook';
 export const EVENT_TYPE = 'lp.post_issue_rebook';
@@ -276,7 +276,7 @@ export function formatPostIssueCard(r, env = process.env) {
   const lines = [
     r.mode === 'live' ? '🧾 *LP lead needs a person: appointment on an issued lead*' : `🕶️ *Post-issue rule (shadow): live would have done ${r.would_do || r.outcome}*`,
     `👤 ${r.contact_name || r.contact_id}${r.phone ? ` · ${slackPhone(r.phone)}` : ''}`,
-    `🆔 Prospect ${r.lp_prospect_id || '?'} · issued lead ${r.issued_lead_id || '?'} (${r.issued_disposition || 'no disposition'}, ${r.issued_reason || '?'})`,
+    `🆔 ${prospectLabel(r.lp_prospect_id)} · issued lead (${r.issued_disposition || 'no disposition'}, ${r.issued_reason || '?'})`,
     `📅 Requested: ${r.appt_date || '?'} ${r.appt_time || ''}`.trim(),
     `Reason: ${r.reason || r.outcome}`,
   ];
@@ -340,7 +340,7 @@ export async function notify(r, d) {
     if (live) {
       await Promise.resolve(d.sendAlertMessage(
         `⚠️ Could not post the post-issue LP card to #contact-center (${res?.error || 'unknown'}). ` +
-        `Contact ${r.contact_id}, issued lead ${r.issued_lead_id}: ${r.outcome}.`, { channel: 'ops' },
+        `Contact ${r.contact_id}, ${prospectLabel(r.lp_prospect_id)}: ${r.outcome}.`, { channel: 'ops' },
       )).catch(() => {});
     } else {
       console.warn(`[LP-POST-ISSUE] shadow line not posted (${res?.error || 'unknown'})`);

@@ -146,10 +146,19 @@ export function createPayrollStore({ supabase = defaultSupabase } = {}) {
         const leadId = leadByContract.get(c);
         if (!leadId) out.set(c, { reason: 'no LP job with this contract id' });
         else if (leadId === 'AMBIGUOUS') out.set(c, { reason: 'contract maps to more than one lead' });
+        // lead-id-ok: unresolved-row reason, not a card
         else if (!leads.has(leadId)) out.set(c, { reason: `lead ${leadId} not in lp_leads` });
         else out.set(c, { lead: leads.get(leadId) });
       }
       return out;
+    },
+
+    /** The prospect a Slack note names for a lead (never the lead id, the user 2026-10-16); null when unknown. */
+    async prospectIdForLead(leadId) {
+      if (!leadId) return null;
+      const { data, error } = await supabase.from('lp_leads').select('lp_prospect_id').eq('lp_lead_id', String(leadId)).maybeSingle();
+      if (error) return null;
+      return data?.lp_prospect_id != null ? String(data.lp_prospect_id) : null;
     },
 
     /** line_key → run id, for keys already PAID in a run other than `runId`. */

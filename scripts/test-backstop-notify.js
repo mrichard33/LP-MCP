@@ -458,7 +458,7 @@ test('(23) buildUserPrompt carries every touched lead source and every error', (
       { action: undefined, outcome: 'skipped_no_phone', lead_source: 'Excluded' },
     ],
     errors: [
-      { lp_lead_id: '5001', error: 'GHL 429 rate limited' },
+      { lp_lead_id: '5001', lp_prospect_id: '9001', error: 'GHL 429 rate limited' },
       { lp_lead_id: '5002', error: 'no_contact_id_after_create' },
     ],
   });
@@ -469,8 +469,9 @@ test('(23) buildUserPrompt carries every touched lead source and every error', (
   assert.match(prompt, /Iheart > Simpletext \| linked/);
   assert.match(prompt, /Unknown \| created \| suppressed/);
   assert.ok(!prompt.includes('Excluded'), 'untouched leads must not reach the prompt');
-  assert.match(prompt, /lead 5001: GHL 429 rate limited/);
-  assert.match(prompt, /lead 5002: no_contact_id_after_create/);
+  assert.match(prompt, /Prospect 9001: GHL 429 rate limited/);
+  assert.match(prompt, /Prospect: unknown: no_contact_id_after_create/);
+  assert.ok(!/500[12]/.test(prompt), 'no lead id reaches the model');
   assert.match(prompt, /deferred_by_cap: 4 \(cap 25\)/);
 });
 
@@ -571,8 +572,8 @@ test('(17) every • detail line carries an " — " separated source segment', (
     scan: scanOf(3, { deferredCapped: 12, eligible: 15 }),
     counts: { created: 2, linked: 1 },
     results: [
-      lead({ lp_lead_id: '1', contact_id: 'c1' }),
-      lead({ lp_lead_id: '2', contact_id: 'c2', action: 'linked', lead_source: 'Iheart', lead_source_detail: 'Simpletext' }),
+      lead({ lp_lead_id: '1', lp_prospect_id: '901', contact_id: 'c1' }),
+      lead({ lp_lead_id: '2', lp_prospect_id: '902', contact_id: 'c2', action: 'linked', lead_source: 'Iheart', lead_source_detail: 'Simpletext' }),
       lead({ lp_lead_id: '3', contact_id: 'c3', lead_source: null, lead_source_detail: null }),
     ],
     errors: [],
@@ -585,10 +586,10 @@ test('(17) every • detail line carries an " — " separated source segment', (
     assert.ok(seg.length >= 3, `detail line lacks a source segment: ${b}`);
     assert.ok(seg[1].trim().length > 0, `empty source segment: ${b}`);
   }
-  assert.match(card, /• .* — Internet > Modernize — lead 1 → contact c1 \(created\)/);
-  assert.match(card, /• .* — Iheart > Simpletext — lead 2 → contact c2 \(linked\)/);
+  assert.match(card, /• .* — Internet > Modernize — Prospect 901 → contact c1 \(created\)/);
+  assert.match(card, /• .* — Iheart > Simpletext — Prospect 902 → contact c2 \(linked\)/);
   // An unresolvable source still renders — absence is signal, never a blank.
-  assert.match(card, /• .* — Unknown — lead 3/);
+  assert.match(card, /• .* — Unknown — Prospect: unknown/);
 });
 
 test('(17b) errored leads render a ⚠ line carrying source and the error text', () => {
@@ -598,10 +599,11 @@ test('(17b) errored leads render a ⚠ line carrying source and the error text',
     scan: scanOf(2),
     counts: { created: 1, error: 1 },
     results: [lead({ lp_lead_id: '1', contact_id: 'c1' })],
-    errors: [{ lp_lead_id: '5001', error: 'GHL 429 rate limited', lead_source: 'Internet', lead_source_detail: 'Modernize' }],
+    errors: [{ lp_lead_id: '5001', lp_prospect_id: '9001', error: 'GHL 429 rate limited', lead_source: 'Internet', lead_source_detail: 'Modernize' }],
     maxPerRun: 50,
   });
-  assert.match(card, /⚠ lead 5001 — Internet > Modernize — GHL 429 rate limited/);
+  assert.match(card, /⚠ Prospect 9001 — Internet > Modernize — GHL 429 rate limited/);
+  assert.ok(!card.includes('5001'), 'no lead id on the card');
 });
 
 test('(17c) all-errors run still names its sources — the card that matters most', () => {
@@ -643,7 +645,7 @@ test('(17d) detail lines truncate at MAX_DETAIL_LEADS with an "…and N more" li
   });
   assert.equal(card.split('\n').filter((l) => l.startsWith('• ') && !l.includes('…and')).length, MAX_DETAIL_LEADS);
   assert.match(card, /• …and 3 more/);
-  assert.equal(card.split('\n').filter((l) => l.startsWith('⚠ lead')).length, MAX_DETAIL_LEADS);
+  assert.equal(card.split('\n').filter((l) => l.startsWith('⚠ Prospect')).length, MAX_DETAIL_LEADS);
   assert.match(card, /⚠ …and 2 more errored/);
 });
 

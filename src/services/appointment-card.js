@@ -27,7 +27,7 @@
 
 import { buildClassifiedNotification, PROSPECT_UNASSIGNED } from '../actions/notification-classifier.js';
 import { resolveMarket } from '../actions/enrichment.js';
-import { formatApptTime12h } from '../format-helpers.js';
+import { formatApptTime12h, prospectLabel } from '../format-helpers.js';
 import { normalizeState } from '../sync-utils.js';
 
 /**
@@ -154,7 +154,9 @@ export async function buildLpAppointmentCard({
     // Same words as the card's own Prospect line, lowercased because this one
     // sits mid-sentence after "Prospect". Sharing the constant is the point:
     // these two lines have already disagreed once (NONE vs N/A).
-    lpRef: `Lead ${lpLeadId} | Prospect ${prospectId || PROSPECT_UNASSIGNED.toLowerCase()}`,
+    // 2026-10-16 (the user): the prospect only, never the lead id. The absent
+    // words stay the card's own Prospect line's, so the two cannot disagree.
+    lpRef: prospectId ? prospectLabel(prospectId) : `Prospect ${PROSPECT_UNASSIGNED.toLowerCase()}`,
     appointmentDisplay: buildAppointmentDisplay({ apptDate, apptTime, calendarName, ghlStatus }),
     tier: 'Hot',
     status: 'Appointment Set',

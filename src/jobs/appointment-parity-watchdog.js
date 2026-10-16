@@ -834,6 +834,7 @@ export async function runAppointmentParityWatchdog({ dryRun = !PARITY_AUTOHEAL, 
       await _queueAction({
         action_type: 'remove_tag', target_system: 'ghl', target_entity: 'contact', target_id: cid,
         action_payload: { tags: [...S52_REBOOK_TAGS], claim_key: `parity-restore:${cancelledRow.ghl_appointment_id}:tags` },
+        // lead-id-ok: action reasoning; the Slack net strips it on an approval card
         reasoning: `Restored appointment ${cancelledRow.ghl_appointment_id} (${d.status}): the cancel came from duplicate lead ${resolvedRow?.lp_lead_id || '?'} at the same slot as live lead ${lead.lp_lead_id}; S5.2 / rebook tags off.`,
         rule_applied: 'PARITY_SAME_SLOT_RESTORE', status: 'pending', requires_approval: false, priority: 30,
       }).catch((err) => console.warn(`[ApptParity] restore tag cleanup not queued for ${cid}: ${err.message}`));

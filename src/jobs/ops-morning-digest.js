@@ -40,6 +40,7 @@
 import { runJob as defaultRunJob } from '../job-runner.js';
 import { hourET, todayET } from './lp-report-common.js';
 import { duration } from '../health/plain.js';
+import { prospectLabel } from '../format-helpers.js';
 import {
   alertDigestEnabled, capLines, filterNew as defaultFilterNew, recordPosted as defaultRecordPosted,
   lastPostedCount as defaultLastPostedCount,
@@ -216,7 +217,7 @@ async function postIssueSection(deps, nowMs) {
   const rows = data || [];
   if (!rows.length) return null;
   const names = await loadNames(deps, rows.map((r) => r.ghl_contact_id).filter(Boolean));
-  const who = (r) => (r.ghl_contact_id ? nameOf(names, r.ghl_contact_id) : `LP lead ${r.payload?.issued_lead_id}`);
+  const who = (r) => (r.ghl_contact_id ? nameOf(names, r.ghl_contact_id) : `LP ${prospectLabel(r.payload?.lp_prospect_id)}`);
   const lines = [`new LP leads sent for issued leads: ${rows.length}`];
   const noPromoter = rows.filter((r) => r.payload?.promoter_status && r.payload.promoter_status !== 'matched');
   if (noPromoter.length) lines.push(`sent without a promoter: ${noPromoter.map((r) => `${who(r)} (${r.payload.promoter_status})`).slice(0, SECTION_MAX).join(', ')}`);
@@ -267,9 +268,9 @@ async function leadLeakSection(deps, value, nowMs) {
     ...(d.intakeMissing || []).map((g) => ({ key: g.ghl_contact_id, reason: 'never_reached_lp',
       line: `${fullName(g.first_name, g.last_name) || '(no name)'} (GHL ${g.ghl_contact_id}) · in GHL since ${String(g.date_added ?? '').slice(0, 10)}, never reached LP · push the lead into LP` })),
     ...(d.retired || []).map((l) => ({ key: String(l.lp_lead_id), reason: 'retired_code',
-      line: `${fullName(l.first_name, l.last_name) || '(no name)'} (LP ${l.lp_lead_id}) · coded ${l.disposition_code}, a retired code · re-code it in LP` })),
+      line: `${fullName(l.first_name, l.last_name) || '(no name)'} (LP ${prospectLabel(l.lp_prospect_id)}) · coded ${l.disposition_code}, a retired code · re-code it in LP` })),
     ...(d.speedSlow || []).map((o) => ({ key: String(o.lp_lead_id), reason: 'slow_first_call',
-      line: `${fullName(o.first_name, o.last_name) || '(no name)'} (LP ${o.lp_lead_id}) · still waiting for a first call · get it dialed` })),
+      line: `${fullName(o.first_name, o.last_name) || '(no name)'} (LP ${prospectLabel(o.lp_prospect_id)}) · still waiting for a first call · get it dialed` })),
   ].filter((i) => i.key && i.key !== 'undefined');
   if (!items.length) return null;
   const { fresh } = await deps.filterNew({ audit: 'lead_leak', items, ttlDays: LEAD_TTL_DAYS, nowMs, deps: { supabase: deps.supabase } });
@@ -553,9 +554,17 @@ async function lpLooksWrongSection(deps, nowMs) {
   const rows = data || [];
   if (!rows.length) return null;
   const names = await loadNames(deps, rows.map((r) => r.contact_id));
+  // The notice key carries the lead id; the line names its prospect (the user,
+  // 2026-10-16). A failed read leaves "Prospect: unknown", never the lead id.
+  const leadIds = [...new Set(rows.map((r) => String(r.notice_key).split(':')[1]).filter(Boolean))];
+  const prospectOf = new Map();
+  if (leadIds.length) {
+    const { data: pl } = await deps.supabase.from('lp_leads').select('lp_lead_id, lp_prospect_id').in('lp_lead_id', leadIds);
+    for (const l of pl || []) prospectOf.set(String(l.lp_lead_id), l.lp_prospect_id);
+  }
   const lines = rows.map((r) => {
-    const lead = String(r.notice_key).split(':')[1] || '?';
-    return `${nameOf(names, r.contact_id)} · LP lead ${lead} · ${r.appt_date || '?'}${r.appt_time ? ` ${r.appt_time}` : ''} · confirmation team fixes it in LP`;
+    const lead = String(r.notice_key).split(':')[1] || '';
+    return `${nameOf(names, r.contact_id)} · LP ${prospectLabel(prospectOf.get(lead))} · ${r.appt_date || '?'}${r.appt_time ? ` ${r.appt_time}` : ''} · confirmation team fixes it in LP`;
   });
   return { title: `LP date/time looks wrong: ${rows.length}`, lines: capLines(lines, SECTION_MAX) };
 }
@@ -566,7 +575,7 @@ async function duplicateLeadsSection(deps, nowMs) {
   const { findDuplicateLeadGroups } = await import('../same-slot-sibling.js');
   const from = new Date(nowMs - DAY_MS).toISOString().slice(0, 10);
   const { data, error } = await deps.supabase.from('lp_leads')
-    .select('ghl_contact_id, lp_lead_id, disposition_code, appointment_date, lp_branch_id, first_name, last_name, lp_deleted_at')
+    .select('ghl_contact_id, lp_lead_id, lp_prospect_id, disposition_code, appointment_date, lp_branch_id, first_name, last_name, lp_deleted_at')
     .eq('appointment_set', true).gte('appointment_date', from).not('ghl_contact_id', 'is', null).is('lp_deleted_at', null).limit(5000);
   if (error) throw new Error(`lp_leads duplicate read failed: ${error.message}`);
   const groups = findDuplicateLeadGroups(data || []);
@@ -575,7 +584,8 @@ async function duplicateLeadsSection(deps, nowMs) {
   const { fresh } = await deps.filterNew({ audit: 'lp_duplicate_leads', items, ttlDays: 1, nowMs, deps: { supabase: deps.supabase } });
   if (!fresh.length) return null;
   const names = await loadNames(deps, fresh.map((i) => i.key));
-  const lines = fresh.map((i) => `${nameOf(names, i.key)} · ${i.leads.map((l) => `${l.lp_lead_id}/${l.lp_branch_id || '?'}/${l.disposition_code || '?'}/${String(l.appointment_date || '').slice(0, 16).replace('T', ' ')}`).join(' vs ')} · clean up in LP`);
+  // The prospect once, then each lead by branch, disposition and visit, never its id (the user, 2026-10-16).
+  const lines = fresh.map((i) => `${nameOf(names, i.key)} · LP ${[...new Set(i.leads.map((l) => prospectLabel(l.lp_prospect_id)))].join(' / ')} · ${i.leads.map((l) => `${l.lp_branch_id || '?'}/${l.disposition_code || '?'}/${String(l.appointment_date || '').slice(0, 16).replace('T', ' ')}`).join(' vs ')} · clean up in LP`);
   return { title: `Duplicate LP leads to clean up: ${fresh.length}`, lines: capLines(lines, SECTION_MAX), record: { audit: 'lp_duplicate_leads', items: fresh } };
 }
 

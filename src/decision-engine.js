@@ -1168,6 +1168,7 @@ export function evaluateCurrentLeadMatch(lead, spec, event, nowMs = Date.now()) 
       return { pass: false, reason: `appointment ${days.toFixed(1)} days ago > ${cfg.appointment_within_days}` };
     }
   }
+  // lead-id-ok: rule-evaluation reason, logged only
   return { pass: true, reason: `current lead ${lead.lp_lead_id ?? '?'} (${disp || 'null'}) matches` };
 }
 
@@ -2199,6 +2200,7 @@ async function createActionsFromRule(event, rule) {
         status: 'skipped', requires_approval: false,
         priority,
         batch_id: batchId, sequence_order: i,
+        // lead-id-ok: agent_actions error_message, not a card
         error_message: `No GHL contact ID — LP lead ${event.entity_id} not matched to GHL`,
       });
       continue;

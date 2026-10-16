@@ -243,6 +243,7 @@ async function deferLead(id, claimedRow, attempts, outcome, detail) {
 
   if (alert) {
     sendGroupMeMessage(
+      // lead-id-ok: "lead ${verb}" is a verb, not an id
       `⚠️ GHL→LP lead ${verb} · row=${id} · contact=${claimedRow.ghl_contact_id} · ${outcome}` +
         (detail ? ` · ${detail}` : ''),
       { flushNow: true }

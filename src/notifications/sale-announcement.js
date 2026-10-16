@@ -344,7 +344,7 @@ export async function completeAnnouncement(ctx, deps = {}) {
     now = () => new Date(),
   } = deps;
 
-  const { rowId, repDisplayName, amount, leadId, keySource } = ctx;
+  const { rowId, repDisplayName, amount, leadId, prospectId = null, keySource } = ctx;
 
   try {
     // ── 1. Stamp the lead first, so facts include this sale ──────
@@ -507,6 +507,7 @@ export async function completeAnnouncement(ctx, deps = {}) {
       rep_display_name: repDisplayName,
       gross_sale_amount: amount,
       lp_lead_id: leadId,
+      lp_prospect_id: prospectId,
       key_source: keySource,
       error: res.error,
       attempts: res.attempts,
@@ -666,6 +667,7 @@ export function makeSaleAnnouncementHandler(deps = {}) {
       repDisplayName: fields.rep_display_name,
       amount,
       leadId: resolved.lead_id,
+      prospectId: fields.lp_prospect_id,
       keySource: resolved.key_source,
     }, deps).catch((err) => {
       logger.error?.(`[SaleAnnounce] detached completion rejected for row=${rowId}: ${err.message}`);

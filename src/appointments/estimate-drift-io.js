@@ -119,6 +119,7 @@ export async function runEstimateDriftFix({ ghlActive, dryRun = false, deps }) {
       } else if (p.op === 'mark_invalid') {
         await deps.queueRows(buildMarkInvalidRows({
           contactId: p.cid, appointmentId: p.appt.ghl_appointment_id, rule: DRIFT_RULE,
+          // lead-id-ok: mark_invalid reasoning on an action row, not a card
           why: `LP lead ${p.lead?.lp_lead_id || '?'}: ${p.reason}`,
         }));
         summary.applied.mark_invalid++;
@@ -178,6 +179,7 @@ export async function correctConflictIfSyncCreated({ contactId, lpLeadId, ghlSta
       await deps.markRescheduleInflight(contactId).catch(() => {});
       await deps.putReschedule({ appointmentId: hit.appointment_id, calendarId: hit.calendar_id, startTime: plan.startTime });
     } else {
+      // lead-id-ok: mark_invalid reasoning on an action row, not a card
       await deps.queueRows(buildMarkInvalidRows({ contactId, appointmentId: hit.appointment_id, rule: DRIFT_RULE, why: `conflict, LP lead ${lead?.lp_lead_id || lpLeadId}: ${plan.reason}` }));
       if (plan.card) await deps.notify?.({ contactId, lead, result: plan.card }).catch(() => {});
     }

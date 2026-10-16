@@ -219,6 +219,7 @@ export async function runCancelResetRouting({ env = process.env, nowMs = Date.no
         // created 25+ hours ago, so the phone's existing record is the one to add.
         action_payload: { list_name: cfg.list, field_names: record.fieldNames, records: [record.values] },
         rollback_payload: { action_type: 'five9_delete_record_from_list', list_name: cfg.list, field_names: ['number1'], records: [[String(lead.phone10)]] },
+        // lead-id-ok: action reasoning; the Slack net strips it on an approval card
         reasoning: `Cancelled lead → ${cfg.list} (the user, 2026-10-15): LP lead ${lead.lp_lead_id} is ${lead.disposition_code} `
           + `since ${lead.updated_wall} ET and no Reset campaign has called it since. Not sold, not on Five9 DNC, no opt-out.`,
         rule_applied: RULE_KEY,

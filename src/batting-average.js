@@ -473,6 +473,7 @@ export function checkAtBat(r, siblings = []) {
   if (five9Set && !o.walk) {
     const sib = siblings[0];
     if (sib) {
+      // lead-id-ok: scorecard working note, never posted
       why = `duplicate lead: set on the customer's other LP lead ${sib.lp_lead_id} (${sib.lead_source_detail || 'no sub-source'}${sib.set_by_name ? `, by ${sib.set_by_name}` : ''})`;
     } else {
       verdict = 'mismatch';
