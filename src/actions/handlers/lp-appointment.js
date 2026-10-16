@@ -167,7 +167,7 @@ import { resolveContactInfo } from '../resolvers.js';
 import { buildRichNotification } from '../enrichment.js';
 import { isGhlOnlyCalendarId } from '../../knowledge/booking-calendar-router.js';
 import { checkConfirmationCallSlot } from '../../services/confirmation-call-slot.js';
-import { appointmentDelta, lpWallClockToGhlStartTime } from '../../appointment-dates.js';
+import { appointmentDelta, lpWallClockToGhlStartTime, wallClockToIso } from '../../appointment-dates.js';
 import { LP_EMP } from '../../lp-source-ids.js';
 // 2026-05-27 v2's hasMeaningfulCalendar now lives beside the card builder that
 // is its other consumer, so the GHL note and the GroupMe card cannot disagree
@@ -639,6 +639,38 @@ export async function executeSetLPAppointment(action, context = {}) {
         if (verdict === 'conflict') {
           const lpHolds  = `${liveAppt.date}${liveAppt.time ? ` ${liveAppt.time}` : ''}`;
           const ghlHolds = `${ghlDateNormalized} ${apptTime}`;
+
+          // 2026-10-16 (handoff v3.4 Fix 8.8): a GHL estimate OUR sync created
+          // and nobody has moved is not a person's booking to protect — it is
+          // a mirror that drifted from LP. With ESTIMATE_DRIFT_FIX_MODE=live it
+          // is corrected to LP and NO conflict card posts; in shadow it is
+          // logged and the card posts as before. A human-made booking is never
+          // in scope, so its card is exactly as before.
+          if (!isLPLeadId(contactId)) {
+            const driftFix = context.deps?.correctConflictIfSyncCreated
+              || (async (args) => {
+                const io = await import('../../appointments/estimate-drift-io.js');
+                return io.correctConflictIfSyncCreated({ ...args, deps: await io.conflictDriftDeps() });
+              });
+            const fix = await driftFix({
+              contactId, lpLeadId,
+              ghlStartIso: ghlDateNormalized && apptTime ? wallClockToIso(ghlDateNormalized, apptTime) : null,
+            }).catch(() => ({ corrected: false }));
+            if (fix?.corrected) {
+              console.log(`[LP-APPT] conflict for ${contactId} was a drifted mirror — GHL corrected to LP (${fix.op}), no conflict card`);
+              return {
+                action: 'ghl_corrected_to_lp',
+                verified: 'live',
+                lp_lead_id: lpLeadId,
+                lp_appointment_date: liveAppt.date,
+                lp_appointment_time: liveAppt.time,
+                ghl_appointment_date: ghlDateNormalized,
+                ghl_appointment_time: apptTime,
+                drift_fix: fix,
+                contact_id: contactId,
+              };
+            }
+          }
 
           // Instrumentation for the one population a more permissive rule
           // would serve: a same-day conflict whose LP time has ALREADY

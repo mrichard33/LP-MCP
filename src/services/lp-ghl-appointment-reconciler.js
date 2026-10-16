@@ -283,6 +283,21 @@ function endTimeFor(startTime) {
 }
 
 /**
+ * The one in-place reschedule PUT: same appointment, its own calendar, LP's
+ * slot is reality (ignoreFreeSlotValidation, so an explicit assignee). Shared
+ * with the parity watchdog's drift fix (src/appointments/estimate-drift-io.js).
+ */
+export async function putReschedule({ appointmentId, calendarId, startTime, fetchImpl = ghlFetch }) {
+  return fetchImpl('PUT', `/calendars/events/appointments/${appointmentId}`, {
+    calendarId,
+    startTime,
+    endTime: endTimeFor(startTime),
+    assignedUserId: DEFAULT_ASSIGNED_USER_ID,
+    ignoreFreeSlotValidation: true,
+  });
+}
+
+/**
  * Contact's upcoming appointments with start_time offset-normalized.
  * Throws on lookup failure (fail closed — see module header).
  */
@@ -574,13 +589,7 @@ export async function reconcileLpAppointmentToGhl({ contactId, lead, live = null
     // matches the create path: LP's slot is reality, and GHL otherwise
     // rejects the move with 400 "slot no longer available" when the target
     // time looks full (verified live 2026-07-08: Mcbride, Buzzell).
-    await ghlFetch('PUT', `/calendars/events/appointments/${appointmentId}`, {
-      calendarId: existing.calendar_id,
-      startTime,
-      endTime: endTimeFor(startTime),
-      assignedUserId: DEFAULT_ASSIGNED_USER_ID,
-      ignoreFreeSlotValidation: true,
-    });
+    await putReschedule({ appointmentId, calendarId: existing.calendar_id, startTime });
     if (plan.op === 'reschedule') {
       return { ...base, outcome: 'rescheduled', appointment_id: appointmentId, previous_start_time: existing.start_time };
     }

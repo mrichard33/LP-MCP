@@ -322,6 +322,10 @@ import { mirrorLeadAppointment } from '../services/mirror-on-link.js';
 import { readLiveForSync } from '../services/lp-live-appointment.js';
 import { classBOutcome, restoreDecision, sameSlot, sameSlotDuplicateCandidate, S52_REBOOK_TAGS } from './appointment-parity-heal.js';
 import { ghlFetch as defaultGhlFetch } from '../actions/helpers.js';
+import { runEstimateDriftFix, readSyncCreatedStarts } from '../appointments/estimate-drift-io.js';
+import { putReschedule } from '../services/lp-ghl-appointment-reconciler.js';
+import { markRescheduleInflight } from '../services/reschedule-inflight.js';
+import { resolveSyncLead, notifyLpLooksWrong } from '../actions/handlers/lp-ghl-appointment-sync.js';
 
 /** One agent_actions insert (deps seam: deps.queueAction). */
 async function queueAgentAction(row) {
@@ -708,6 +712,28 @@ export async function runAppointmentParityWatchdog({ dryRun = !PARITY_AUTOHEAL, 
       _readGhlBook(asOf, windowEnd),
       _readLpBook(asOf, windowEnd),
     ]);
+
+  // ---- Fix 8: sync-created estimates that drifted from LP (2026-10-16) ----
+  // Behind ESTIMATE_DRIFT_FIX_MODE (default shadow); its own cap of 25, apart
+  // from PARITY_MAX_WRITES. Runs first so a corrected time is not read as a gap.
+  let drift = null;
+  try {
+    drift = await (deps.runEstimateDriftFix || runEstimateDriftFix)({
+      ghlActive, dryRun, deps: {
+        readSyncCreatedStarts: deps.readSyncCreatedStarts || ((ids) => readSyncCreatedStarts(supabase, ids)),
+        resolveLead: deps.resolveOwningLead || (async (cid) => (await resolveSyncLead({}, {}, cid)).lead),
+        readLive: deps.readLiveForSync || readLiveForSync,
+        putReschedule: deps.putReschedule || putReschedule,
+        markRescheduleInflight: deps.markRescheduleInflight || markRescheduleInflight,
+        queueRows: deps.queueRows || (async (rows) => { const { error } = await supabase.from('agent_actions').insert(rows); if (error) throw new Error(error.message); }),
+        notify: deps.notifyLpLooksWrong || notifyLpLooksWrong,
+        emitEvent: _emitEvent,
+        sendAlert: deps.send || sendAlertMessage,
+      },
+    });
+  } catch (err) {
+    console.warn(`[ApptParity] drift fix failed (watchdog continues): ${err.message}`);
+  }
 
   const findings = [];
   let writes = 0;
@@ -1208,6 +1234,7 @@ export async function runAppointmentParityWatchdog({ dryRun = !PARITY_AUTOHEAL, 
     escalated: outcomes.escalated,
     writes,
     errors,
+    drift_fix: drift,
     dry_run: !!dryRun,
     elapsed_ms: Date.now() - started,
   };
