@@ -2,7 +2,9 @@
  * Live chat summary job — src/jobs/live-chat-summary.js
  *
  * Every 60 seconds: post ONE Slack card per live chat once it has gone quiet
- * (2026-10-15, Mark: group a chat into one summary; never repeat an item). The
+ * (2026-10-15, Mark: group a chat into one summary; never repeat an item), to
+ * #reece-chatbot (LIVE_CHAT_SUMMARY_CHANNEL), skipping a chat with nothing to
+ * act on. The
  * pass, the claim and the card live in src/services/live-chat-summary-io.js and
  * src/live-chat/chat-summary.js.
  *
@@ -12,7 +14,8 @@
  * is its own live_chat_summaries row, which is the run record.
  *
  * MODE  LIVE_CHAT_SUMMARY_MODE = off (default) | shadow (rows written, no
- * Slack) | live. QUIET  LIVE_CHAT_SUMMARY_QUIET_MIN (default 15).
+ * Slack) | live. QUIET  LIVE_CHAT_SUMMARY_QUIET_MIN (default 15). CHANNEL
+ * LIVE_CHAT_SUMMARY_CHANNEL (default SLACK_CHANNEL_DISPATCH, #reece-chatbot).
  */
 
 import { runLiveChatSummaryPass } from '../services/live-chat-summary-io.js';

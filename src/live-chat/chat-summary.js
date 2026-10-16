@@ -19,9 +19,17 @@
  * The facts come from code (each row's execution_result), never from the
  * model; the model writes only the 2–3 plain-English lines, and a failed call
  * falls back to the visitor's own words.
+ *
+ * 2026-10-16 (Mark: no redundant or unnecessary Slack notifications). Three
+ * fixes before live: the card goes to #reece-chatbot, where the bot's other
+ * chat cards already go, not #ops-alerts (system alerts only); a chat with
+ * nothing to act on (one "bb", no name, no phone) gets no card, only its row
+ * (`worthPosting`); and any visitor who does not speak English is flagged, not
+ * only Spanish (wTcbTNm9d0CRDDTKbygg wrote "no English" and got no flag).
  */
 
 import { slackPhone } from '../format-helpers.js';
+import { isRealName } from './chat-rules.js';
 
 export const SUMMARY_MODES = Object.freeze(['off', 'shadow', 'live']);
 export const DEFAULT_QUIET_MIN = 15;
@@ -31,6 +39,17 @@ export const READ_WINDOW_MS = 24 * 60 * 60 * 1000;
 export const THREAD_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 /** A failed Slack post is retried this many times, then left with its error. */
 export const MAX_POST_ATTEMPTS = 3;
+
+/**
+ * #reece-chatbot: the same id as SLACK_CHANNEL_DISPATCH_DEFAULT in
+ * src/live-chat/index.js (copied, not imported, to keep this module pure).
+ */
+export const SUMMARY_CHANNEL_DEFAULT = 'C0C9AGEM2N8';
+
+/** Where a new card goes: LIVE_CHAT_SUMMARY_CHANNEL, else the dispatch channel (#reece-chatbot). Pure. */
+export function summaryChannel(env = process.env) {
+  return String(env.LIVE_CHAT_SUMMARY_CHANNEL || env.SLACK_CHANNEL_DISPATCH || SUMMARY_CHANNEL_DEFAULT).trim() || null;
+}
 
 export function summaryMode(env = process.env) {
   const m = String(env.LIVE_CHAT_SUMMARY_MODE || 'off').trim().toLowerCase();
@@ -109,6 +128,20 @@ function lastOf(turns, pick) {
   return null;
 }
 
+const LANGUAGE_NAMES = Object.freeze({ es: 'Spanish' });
+
+/**
+ * The visitor's language when it is not English, else null. The Spanish
+ * hand-off (`language_handoff`, the only language code detects) names it; the
+ * model's `escalation_category: 'language'` alone does not, so it is "unknown".
+ * Pure.
+ */
+export function chatLanguage(ers) {
+  const code = lastOf(ers || [], (er) => er?.language_handoff || null);
+  if (code) return LANGUAGE_NAMES[String(code).toLowerCase()] || String(code);
+  return (ers || []).some((er) => er?.live_chat?.escalation_category === 'language') ? 'unknown' : null;
+}
+
 /**
  * What happened in the chat, read from code's own records. Pure.
  * @param {Array} turns  toTurn() rows of ONE session, oldest first
@@ -138,6 +171,7 @@ export function summarizeFacts(turns, { openings = null, optedOut = false } = {}
   else if (callback) outcome = 'callback';
   else if (outOfArea) outcome = 'out_of_area';
 
+  const language = chatLanguage(ers);
   const fallbacks = ers.filter((er) => er.send_status === 'fallback' || er.send_status === 'fallback_not_sent').length;
   const last = ers[ers.length - 1] || {};
   return {
@@ -147,7 +181,9 @@ export function summarizeFacts(turns, { openings = null, optedOut = false } = {}
     turns: list.length,
     // Out of area is never a large job: nobody follows up on a job Reece cannot do.
     large_job: ers.some((er) => er.large_job === true) && !outOfArea,
-    spanish: ers.some((er) => !!er.language_handoff),
+    language,
+    // Kept for rows and readers from before 2026-10-16.
+    spanish: language === 'Spanish',
     service: handoffs.has('service') || ers.some((er) => er.live_chat?.escalation_category === 'existing_customer_service'),
     opted_out: !!optedOut,
     fallbacks,
@@ -167,6 +203,7 @@ export function summarizeFacts(turns, { openings = null, optedOut = false } = {}
 export function needsAPerson(f) {
   if (!f || f.opted_out) return null;
   if (f.spanish) return 'Spanish speaker: a Spanish-speaking person should follow up.';
+  if (f.language) return `Doesn't speak English (${f.language === 'unknown' ? 'language unknown' : f.language}): someone who can help should follow up.`;
   if (f.last_was_fallback) return 'The bot\'s last reply timed out: someone should pick up this chat.';
   if (f.large_job && !['booked', 'rescheduled', 'out_of_area'].includes(f.outcome)) return 'Large job with no visit booked: follow up.';
   return null;
@@ -197,11 +234,28 @@ export function outcomeLine(f) {
 export function flagList(f) {
   return [
     f.large_job ? 'Large job' : null,
-    f.spanish ? 'Spanish' : null,
+    f.spanish ? 'Spanish' : (f.language ? `Non-English (${f.language})` : null),
     f.service ? 'Service / existing customer' : null,
     f.opted_out ? 'Opted out' : null,
     f.fallbacks ? `${f.fallbacks} slow ${f.fallbacks === 1 ? 'reply' : 'replies'}` : null,
   ].filter(Boolean);
+}
+
+/**
+ * Does this chat need a card at all? No when there is nothing anyone could act
+ * on: no booking or other outcome, no flag, no "Needs a person", no openings,
+ * no zip or market, and no real name or phone on the contact (GHL's "Guest
+ * Visitor abcde" is a placeholder, not a name). Of the first 10 shadow chats,
+ * 4 were this. The row is still written (the claim is the dedupe). Pure.
+ * @param {object} facts    summarizeFacts()
+ * @param {object} contact  { name, phone } or null when the read failed
+ */
+export function worthPosting(facts, contact) {
+  if (!facts) return false;
+  if (facts.outcome !== 'no_booking') return true;
+  if (flagList(facts).length || needsAPerson(facts)) return true;
+  if (facts.openings || facts.zip || facts.market_code) return true;
+  return isRealName(contact?.name) || !!slackPhone(contact?.phone);
 }
 
 /** The model's prompt: the chat, both sides, in order. Pure. */

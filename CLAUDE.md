@@ -66,9 +66,15 @@ audit `livechat_fallback`, a sliding hour). `LIVE_CHAT_LARGE_JOB_ALERT_MODE` onc
 action row keeps `large_job` every turn. `LIVE_CHAT_SUMMARY_MODE` off (default) | shadow | live: job
 `src/jobs/live-chat-summary.js` (every minute; pass in `src/services/live-chat-summary-io.js`, card in
 `src/live-chat/chat-summary.js`) claims each chat quiet for `LIVE_CHAT_SUMMARY_QUIET_MIN` (15) by INSERTING its
-`live_chat_summaries` row first (UNIQUE contact + session start), then posts one card to #ops-alerts; a lead who comes
-back gets a thread reply under their first card. "Needs a person" appears only when no other card already asked
-(Spanish, a last-turn timeout, a large job not booked). Never add a per-message live-chat card: put it on the summary.
+`live_chat_summaries` row first (UNIQUE contact + session start), then posts one card to **#reece-chatbot**
+(`LIVE_CHAT_SUMMARY_CHANNEL`, else `SLACK_CHANNEL_DISPATCH`, C0C9AGEM2N8; never #ops-alerts, which is for system alerts,
+Mark 2026-10-16); a lead who comes back gets a thread reply under their first card, in that card's channel. "Needs a
+person" appears only when no other card already asked (any visitor who does not speak English, a last-turn timeout, a
+large job not booked). A visitor is non-English on the Spanish hand-off (`language_handoff`) OR the model's
+`escalation_category: 'language'` (`chatLanguage`; "unknown" when nothing names it): one "no English" got no flag. A chat
+with nothing to act on (no outcome, flag, person line, openings, zip or market, and no real name or phone: "Guest
+Visitor …" is not a name) gets no card (`worthPosting`); its row is kept with `payload.skipped = 'nothing_to_act_on'`
+and is never retried (4 of the first 10 shadow chats). Never add a per-message live-chat card: put it on the summary.
 
 **When Slack is the PRIMARY destination, not a mirror, use `postToSlack(text, channelId)`** in
 `src/slack.js` — it returns `{ ok, ts, channel, error }`. `mirrorToSlack` fans out to several channels
