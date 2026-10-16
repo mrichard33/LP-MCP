@@ -468,10 +468,20 @@ its list, skill, attempt count and LPRecKey, transfer legs included (`five9_even
 `five9-call-journey-sync` (`src/jobs/five9-call-journey-sync.js`, rules in `src/five9/call-journey.js`, every 15 min,
 `FIVE9_JOURNEY_SYNC_MODE` off|shadow|live, default shadow) runs the saved report "Shared Reports / Call Journey" into
 `five9_call_journey` (`leg_key` = call id | time | type | dnis, unique: a NULL dnis would slip past a four-column UNIQUE)
-and logs every pull in `five9_call_journey_runs`. The report's zone is PACIFIC, not Eastern: its window and its TIMESTAMP
-cells are Pacific wall clock (call 300000010540092 prints 09:10:20; the webhook has it at 16:10:20 UTC). Columns are read BY NAME (a missing one fails the run), a row with no time is a counted reject and an
-#ops alert, and a window at 50,000 rows is halved. `v_lead_call_journey` orders each lead's legs and counts the dials we
-placed in the trailing 24h (`calls_last_24h`, the 3-in-24 audit). A lead is its LPRecKey only when that is `LDS<n>` /
+and logs every pull in `five9_call_journey_runs`. The report's zone is the setting `FIVE9_JOURNEY_REPORT_TZ` (default
+Pacific, as built: call 300000010540092 printed 09:10:20; the webhook has it at 16:10:20 UTC), used for the window and the
+TIMESTAMP cells. Every pull checks it against `five9_events_raw.call_start_at` for up to 20 of its calls
+(`zoneOffsetVerdict`): a median over 30 minutes off fails the run before anything is stored; no match or a failed read
+skips the check. Switching the report to Eastern in Five9 means setting the variable to `America/New_York` right after.
+Columns are read BY NAME (a missing one fails the run), a row with no time is a counted reject and an
+#ops alert, and a window at 50,000 rows is halved. `v_lead_call_journey` orders each lead's legs; **the 3-in-24 cap counts
+DIALER calls only (the user, 2026-10-16)**: `calls_last_24h` is Outbound + Preview, `all_calls_last_24h` adds Manual, and
+`cap_violation` is `dialer` or `manual` (a Manual call that was a 4th+ call of any kind). Every time a person reads is
+Eastern (`call_ts_et`, `call_date_et`). `v_call_journey_cap_daily` rolls both up per Eastern day with the cross-campaign
+clashes (two campaigns dialing one lead within 4h, DIAL ASAP → After DIAL ASAP excluded as the designed hand-off), and the
+08:00 digest lists yesterday's (`callCapLines`). Baseline 10-08..10-15: 107 dialer and 395 manual violations; nearly every
+dialer one was two campaigns on the lead, Data - Hot and After DIAL ASAP both opening at a record age of 25h. The fix is
+in Five9 (one owner per lead by age: Simpletext 0-12h, DIAL ASAP / After DIAL ASAP to 72h, Data - Hot after), not code. A lead is its LPRecKey only when that is `LDS<n>` /
 `INQ<n>`; anything else is the phone (`INQ-1` sits on the "Data -Old more than 180" records of 499 different phones). `POST /admin/five9-journey/backfill?days=N` (live only).
 Five9 refuses more than 16 runReport calls a minute ACCOUNT-WIDE (the first 7-day backfill fired 28 windows in 20s; 15
 were refused): windows are paced `FIVE9_JOURNEY_PACE_MS` (6s) apart and a refused one waits 65s and retries once.

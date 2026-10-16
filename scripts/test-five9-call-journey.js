@@ -11,7 +11,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   resolveJourneyColumns, parseReportTimestamp, normalizeJourneyRow, parseJourneyReport,
-  planJourneyWindows, toReportCriteriaString, cellText,
+  planJourneyWindows, toReportCriteriaString, cellText, journeyTz, zoneOffsetVerdict,
 } from '../src/five9/call-journey.js';
 import {
   runFive9CallJourneySync, runFive9CallJourneyBackfill, isReportRateLimit, journeyAlertState, journeyMode,
@@ -237,4 +237,48 @@ test('backfill: a window Five9 refuses for its per-minute limit waits out the mi
   assert.equal(out.windows, 4);
   assert.deepEqual(slept, [65000], 'no pacing at 0, one wait for the refused window');
   assert.equal(db.runs.filter((r) => r.status === 'failed').length, 1, 'the refusal stays logged');
+});
+
+test('report zone setting: Eastern parses and asks in Eastern; a typo is null, blank is Pacific', () => {
+  assert.equal(journeyTz({}), 'America/Los_Angeles');
+  assert.equal(journeyTz({ FIVE9_JOURNEY_REPORT_TZ: 'America/New_York' }), 'America/New_York');
+  assert.equal(journeyTz({ FIVE9_JOURNEY_REPORT_TZ: 'Eastern' }), null);
+  assert.equal(parseReportTimestamp('Thu, 15 Oct 2026 12:10:20', 'America/New_York').toISOString(), '2026-10-15T16:10:20.000Z');
+  assert.equal(toReportCriteriaString(new Date('2026-10-15T16:00:00Z'), 'America/New_York'), '2026-10-15T12:00:00');
+  const et = [...SAMPLE]; et[0] = 'Thu, 15 Oct 2026 12:10:20';
+  assert.equal(parseJourneyReport({ columns: COLUMNS, rows: [et] }, 'America/New_York').rows[0].call_ts, '2026-10-15T16:10:20.000Z');
+});
+
+test('zone verdict: the median decides; one late transfer leg does not; no match is unknown', () => {
+  const legs = [1, 2, 3].map((i) => ({ call_id: `c${i}`, call_ts: '2026-10-15T16:10:20Z' }));
+  const hook = (shiftMin) => legs.map((l) => ({ call_id: l.call_id, call_start_at: new Date(Date.parse(l.call_ts) - shiftMin * 60_000).toISOString() }));
+  assert.deepEqual(zoneOffsetVerdict(legs, hook(0)), { verdict: 'match', offsetMin: 0, matched: 3 });
+  assert.equal(zoneOffsetVerdict(legs, hook(180)).verdict, 'mismatch', 'a report switched to Eastern read as Pacific is 3h off');
+  assert.equal(zoneOffsetVerdict(legs, hook(180)).offsetMin, 180);
+  const oneLate = hook(0); oneLate[0].call_start_at = '2026-10-15T13:00:00Z';
+  assert.equal(zoneOffsetVerdict(legs, oneLate).verdict, 'match');
+  assert.equal(zoneOffsetVerdict(legs, []).verdict, 'unknown');
+});
+
+test('zone check: a mismatch fails the run and stores nothing; a failed read or no match stores as usual', async () => {
+  const env = { FIVE9_JOURNEY_SYNC_MODE: 'live' };
+  const hookAt = (shiftMin) => async (ids) => ids.map((id) => ({ call_id: id, call_start_at: new Date(Date.parse('2026-10-15T16:10:20Z') - shiftMin * 60_000).toISOString() }));
+  // The report switched to Eastern in Five9, the setting still Pacific: every leg reads 3h late.
+  const db = fakeDb();
+  const alerts = [];
+  const bad = await runFive9CallJourneySync({ env, nowMs: NOW, deps: { supabase: db, runReportAndWait: report([SAMPLE]), readWebhookStarts: hookAt(180), reportAlertCondition: async (a) => alerts.push(a) } });
+  assert.equal(bad.ok, false);
+  assert.match(bad.errors[0], /time zone does not match FIVE9_JOURNEY_REPORT_TZ=America\/Los_Angeles \(legs are off by 3h/);
+  assert.equal(db.legs.size, 0, 'nothing stored hours off');
+  assert.equal(db.runs[0].status, 'failed');
+  assert.equal(alerts[0].active, true);
+  for (const readWebhookStarts of [hookAt(0), async () => [], async () => { throw new Error('timeout'); }]) {
+    const ok = fakeDb();
+    const out = await runFive9CallJourneySync({ env, nowMs: NOW, deps: { supabase: ok, runReportAndWait: report([SAMPLE]), readWebhookStarts, reportAlertCondition: async () => {} } });
+    assert.equal(out.ok, true);
+    assert.equal(ok.legs.size, 1);
+  }
+  const typo = fakeDb();
+  const t = await runFive9CallJourneySync({ env: { ...env, FIVE9_JOURNEY_REPORT_TZ: 'Eastern' }, nowMs: NOW, deps: { supabase: typo, runReportAndWait: report([SAMPLE]), reportAlertCondition: async () => {} } });
+  assert.match(t.errors[0], /"Eastern" is not a time zone/);
 });

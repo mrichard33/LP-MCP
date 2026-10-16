@@ -12,6 +12,13 @@
 // own cursor (the last ok run of that mode), so going live starts fresh and
 // the backfill fills the past.
 //
+// ZONE — FIVE9_JOURNEY_REPORT_TZ (default America/Los_Angeles) is the zone the
+// report runs in. Every pull compares a sample of its legs with our webhook copy
+// of the same calls (five9_events_raw.call_start_at, true UTC); a median off by
+// more than 30 minutes fails the run, so a report switched in Five9 before the
+// setting (or after it) stores nothing wrong and pages #ops-alerts. No matched
+// call, or a failed read, skips the check and says so in the log.
+//
 // ALERTS — Slack #ops-alerts only, edge-triggered (reportAlertCondition): a
 // failed pull, timestamps that would not parse, or rows returned with nothing
 // stored. A read of our own run log that fails touches nothing.
@@ -20,6 +27,7 @@ import { runJob } from '../job-runner.js';
 import { checkRequestSecret } from '../security/request-auth.js';
 import {
   parseJourneyReport, planJourneyWindows, toReportCriteriaString, REPORT_ROW_CAP,
+  journeyTz, zoneOffsetVerdict, ZONE_CHECK_SAMPLE,
 } from '../five9/call-journey.js';
 
 export const JOB_ID = 'five9-call-journey-sync';
@@ -50,6 +58,8 @@ export function journeyConfig(env = process.env) {
     // for report request operation is reached"). 6s apart is 10 a minute, leaving room for the
     // CI Call Log and anyone running a report by hand.
     paceMs: num(env.FIVE9_JOURNEY_PACE_MS, 6_000, 0),
+    tz: journeyTz(env), // null = not a real zone: every pull fails and says so
+    tzRaw: String(env.FIVE9_JOURNEY_REPORT_TZ ?? '').trim(),
   };
 }
 
@@ -80,7 +90,7 @@ async function defaultDeps() {
 async function pullWindow(d, cfg, startMs, endMs, depth = 0) {
   const res = await d.runReportAndWait({
     folder: cfg.folder, name: cfg.name,
-    startIso: toReportCriteriaString(new Date(startMs)), endIso: toReportCriteriaString(new Date(endMs)),
+    startIso: toReportCriteriaString(new Date(startMs), cfg.tz), endIso: toReportCriteriaString(new Date(endMs), cfg.tz),
     maxWaitMs: cfg.maxWaitMs,
   });
   if (!res?.done) {
@@ -96,6 +106,40 @@ async function pullWindow(d, cfg, startMs, endMs, depth = 0) {
     return [...a, ...b];
   }
   return [{ columns: res.columns || [], rows }];
+}
+
+/** The webhook's start time for each call id (five9_events_raw), for the zone check. */
+async function readWebhookStarts(supabase, callIds) {
+  const { data, error } = await supabase.from('five9_events_raw').select('call_id,call_start_at')
+    .in('call_id', callIds).not('call_start_at', 'is', null);
+  if (error) throw new Error(error.message);
+  return data || [];
+}
+
+/**
+ * The zone check for one pull. Throws on a mismatch (the run fails, the cursor
+ * stays); returns the verdict otherwise. A read that fails is "unknown".
+ */
+async function checkReportZone(d, cfg, legs) {
+  if (!legs.length) return { verdict: 'unknown', offsetMin: null, matched: 0, reason: 'no legs' };
+  // Spread the sample across the window, not just its first minutes.
+  const step = Math.max(1, Math.floor(legs.length / ZONE_CHECK_SAMPLE));
+  const sample = legs.filter((_, i) => i % step === 0).slice(0, ZONE_CHECK_SAMPLE);
+  let webhook;
+  try {
+    const ids = [...new Set(sample.map((l) => l.call_id))];
+    webhook = d.readWebhookStarts ? await d.readWebhookStarts(ids) : await readWebhookStarts(d.supabase, ids);
+  } catch (err) {
+    console.warn(`[Five9Journey] zone check skipped: webhook read failed (${err.message})`);
+    return { verdict: 'unknown', offsetMin: null, matched: 0, reason: 'read failed' };
+  }
+  const v = zoneOffsetVerdict(sample, webhook);
+  if (v.verdict === 'mismatch') {
+    const h = Math.round((v.offsetMin / 60) * 10) / 10;
+    throw new Error(`report time zone does not match FIVE9_JOURNEY_REPORT_TZ=${cfg.tz} (legs are off by ${h}h against the webhook, ${v.matched} calls); set it to the zone the Five9 report runs in`);
+  }
+  if (v.verdict === 'unknown') console.warn('[Five9Journey] zone check skipped: no sampled call is in five9_events_raw');
+  return v;
 }
 
 async function lastOkEnd(supabase, mode) {
@@ -118,11 +162,12 @@ export async function syncWindow(d, cfg, { startMs, endMs, mode }) {
     }).select('id').single();
     if (ins.error) throw new Error(`run log insert: ${ins.error.message}`);
     runId = ins.data?.id ?? null;
+    if (!cfg.tz) throw new Error(`FIVE9_JOURNEY_REPORT_TZ="${cfg.tzRaw}" is not a time zone (e.g. America/New_York)`);
 
     const parts = await pullWindow(d, cfg, startMs, endMs);
     const legs = [];
     for (const part of parts) {
-      const parsed = parseJourneyReport(part); // throws on a missing header
+      const parsed = parseJourneyReport(part, cfg.tz); // throws on a missing header
       counts.returned += parsed.returned;
       legs.push(...parsed.rows);
       for (const [k, n] of Object.entries(parsed.rejects)) {
@@ -130,6 +175,8 @@ export async function syncWindow(d, cfg, { startMs, endMs, mode }) {
         counts.rejected += n;
       }
     }
+    const zone = await checkReportZone(d, cfg, legs); // throws on a mismatch, before anything is stored
+    counts.zone = { verdict: zone.verdict, offset_min: zone.offsetMin, matched: zone.matched };
     if (mode !== 'shadow') {
       for (let i = 0; i < legs.length; i += BATCH) {
         const { data, error } = await d.supabase.rpc(UPSERT_FN, { p_rows: legs.slice(i, i + BATCH) });

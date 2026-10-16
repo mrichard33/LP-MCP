@@ -473,6 +473,42 @@ async function systemHealthSection(deps, nowMs) {
   return lines.length ? { title: 'System health', lines } : null;
 }
 
+// 2026-10-16 (the user: "Count dialer calls only but I want to track the number of
+// violations caused by manual calls"). Yesterday's Eastern day from
+// v_call_journey_cap_daily: dialer calls over the 3-in-24 cap, manual calls that were
+// a 4th+ call (by campaign), and two campaigns dialing one lead within 4 hours (the
+// designed DIAL ASAP → After DIAL ASAP hand-off excluded). Informational, so it lives
+// here and not on its own card; a day with all three at zero adds nothing.
+const n0 = (v) => Number(v) || 0;
+const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
+
+/** Pure. Lines for the call-cap section from one v_call_journey_cap_daily row; [] when all zero. */
+export function callCapLines(row) {
+  if (!row) return [];
+  const dialer = n0(row.dialer_violations);
+  const manual = n0(row.manual_violations);
+  const clashes = n0(row.clashes);
+  if (!dialer && !manual && !clashes) return [];
+  const lines = [];
+  if (dialer) lines.push(`Dialer: ${plural(dialer, 'call')} over the 3-calls-in-24-hours cap, on ${plural(n0(row.leads_over_cap), 'lead')}`);
+  if (manual) {
+    const by = Object.entries(row.manual_by_campaign || {}).sort((a, b) => b[1] - a[1]).map(([c, n]) => `${c} ${n}`).join(', ');
+    lines.push(`Manual: ${plural(manual, 'call')} that were a 4th call or more in 24 hours${by ? ` (${by})` : ''}`);
+  }
+  if (clashes) lines.push(`Two campaigns dialed the same lead within 4 hours ${plural(clashes, 'time')} (Data - Hot and After DIAL ASAP: ${n0(row.hot_after_clashes)})`);
+  return lines;
+}
+
+async function callCapSection(deps, nowMs) {
+  const yesterday = todayET(new Date(nowMs - DAY_MS));
+  const { data, error } = await deps.supabase.from('v_call_journey_cap_daily')
+    .select('call_date_et, dialer_violations, manual_violations, leads_over_cap, clashes, hot_after_clashes, manual_by_campaign')
+    .eq('call_date_et', yesterday).limit(1);
+  if (error) throw new Error(`v_call_journey_cap_daily read failed: ${error.message}`);
+  const lines = callCapLines(data?.[0]);
+  return lines.length ? { title: `Five9 call cap, ${yesterday} (Eastern)`, lines } : null;
+}
+
 /** Pure. The digest text. */
 export function formatDigest(sections, { date } = {}) {
   const live = sections.filter(Boolean);
@@ -507,7 +543,7 @@ export async function runOpsMorningDigest({ post = true, deps: depsArg } = {}) {
     if (post) await deps.sendAlertMessage(`⚠️ ${label} could not run: ${error}`, { channel: 'ops' });
   };
 
-  for (const [label, build] of [['P2 won/lost summary', p2Section], ['Sale → P2 backstop summary', p2BackstopSection], ['Sale → contact backstop summary', saleContactSection], ['Appointment parity summary', paritySection], ['Post-issue rebook summary', postIssueSection], ['Shadow-mode review', shadowModesSection], ['System health', systemHealthSection]]) {
+  for (const [label, build] of [['P2 won/lost summary', p2Section], ['Sale → P2 backstop summary', p2BackstopSection], ['Sale → contact backstop summary', saleContactSection], ['Appointment parity summary', paritySection], ['Post-issue rebook summary', postIssueSection], ['Shadow-mode review', shadowModesSection], ['System health', systemHealthSection], ['Five9 call cap', callCapSection]]) {
     try { sections.push(await build(deps, nowMs)); } catch (err) { await couldNotRun(label, err.message); }
   }
   try { sections.push(...await nightlySummarySections(deps, nowMs)); } catch (err) { await couldNotRun('Nightly summaries (tag sweep, inbound callers, rule targets)', err.message); }
