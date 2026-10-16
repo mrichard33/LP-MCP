@@ -368,6 +368,23 @@ caller of the reconciler passes `live` too. `parseLpApptWallClock` now lives in 
 re-read of the old rows: `POST /admin/refresh-stale-lp-appointments` / `scripts/refresh-stale-lp-appointments.js` (dry
 run default; lp_leads only, never GHL).
 
+**Every LP appointment has ONE card in "4. Confirmation Pipeline", and only LP MCP moves it (handoff, 2026-10-16).**
+Pipeline `ThrBNpyzJhAON4WFC855`; no GHL workflow may trigger on it. Rules `CONF_PIPE_SET/VERIF/CNF/ND/CXL` queue
+`sync_confirmation_opportunity` (`src/actions/handlers/confirmation-pipeline-sync.js`), which re-reads the contact's
+NEWEST lp_leads row. The decisions live in `src/confirmation-pipeline/rules.js`: past (appointment + 2h, or a date before
+today ET) → close (Confirmed won, Disqualified lost, else abandoned), CXL → abandoned, ND → Disqualified, Cnf →
+Confirmed, Verif → Issue Detected (wins over the 24h rule), Set under 24h → Confirm Now, Set → New. `Issue` (issued to a
+rep) is not mapped. Confirmed and Disqualified are locked: only ND, a Set at a new time and the close get out. A live
+stage that differs from the stored one is a person's move: kept against the clock, and given way only to a NEWER LP
+change. GHL allows one card per contact per pipeline, so a returning homeowner's new lead re-points the contact's card
+(the user, 2026-10-16). Jobs: `confirmation-pipeline-clock` (15 min: 24h move, close, one 4h alert to
+`CONF_SLACK_CHANNEL`) and `confirmation-pipeline-sweep` (00:05 ET: every open card in GHL dated before today is closed;
+no readable date → "needs a date"). `CONF_PIPE_DRY_RUN` is TRUE unless set to `false`: log only
+(`confirmation_opportunity_log`), rows marked `dry_run`. Go-live: `POST /admin/confirmation-pipeline/backfill` and
+`/sweep`. Every GHL search there carries `pipeline_id`; never touch "5. Canvass Confirmation Pipeline" or a calendar
+appointment from it. The bot's `fetchOpportunity` ignores both confirmation boards (not "P1 only": `isCustomerP2` reads
+P2 there), and `move_opportunity`'s duplicate-400 recovery no longer PUTs onto a card in another pipeline.
+
 **A held appointment asks a person to import its LP row (2026-10-05).** When LP already has an unimported
 inbound row for a contact, `syncAppointmentToLP` holds the appointment (`lp-appt-deferred`) rather than add a
 duplicate lead, and the parity watchdog re-drives it every 30 min. LP has no API that imports a row, so once a

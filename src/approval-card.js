@@ -258,6 +258,8 @@ export function describeApprove(action, { event, contactName, enrichment = {} } 
       const stage = pl.stage ? ` → ${pl.stage}` : '';
       return `${capitalize(whose)} opportunity moves to ${pipelineLabel(pl.pipeline)}${stage}.`;
     }
+    case 'sync_confirmation_opportunity':
+      return `${capitalize(whose)} card in the Confirmation Pipeline is created or moved to match LP${pl.disposition_code ? ` (${pl.disposition_code})` : ''}.`;
     case 'add_tag': {
       const tag = pl.tag || (Array.isArray(pl.tags) ? pl.tags.join(', ') : '');
       const meaning = tagMeaning(String(tag));

@@ -417,6 +417,21 @@ export async function executeMoveOpportunity(action) {
         } catch (readErr) {
           console.warn(`[ActionExecutor] duplicate-recovery: could not read opp ${existingId} (${readErr.message}) — omitting monetaryValue`);
         }
+        // 2026-10-16 (4. Confirmation Pipeline): GHL names the colliding card
+        // whatever pipeline it is in. PUTting our stage onto a card in ANOTHER
+        // pipeline wrote a P1/P2 stage id onto it (and could pull a
+        // Confirmation card off its board). Different pipeline → log, skip.
+        if (existingOpp && existingOpp.pipelineId && existingOpp.pipelineId !== pipelineId) {
+          console.warn(`[ActionExecutor] move_opportunity duplicate-400 named opp ${existingId} in pipeline ${existingOpp.pipelineId}, not ${pipeline} (${pipelineId}) — not updating it`);
+          return {
+            action: 'skipped',
+            reason: 'duplicate_in_other_pipeline',
+            opportunity_id: existingId,
+            existing_pipeline_id: existingOpp.pipelineId,
+            pipeline,
+            stage,
+          };
+        }
         const recoveryValueField = (existingOpp && isValueWritable(existingOpp)) ? valueField : {};
         await ghlFetch('PUT', `/opportunities/${existingId}`, { pipelineStageId: stageId, status: status || 'open', ...recoveryValueField });
         console.log(`[ActionExecutor] ♻️ move_opportunity recovered from duplicate-opp 400 — updated existing opp ${existingId} → ${pipeline}/${stage}`);

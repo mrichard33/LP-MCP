@@ -51,7 +51,8 @@
  *     set_dnd, issue_hold
  *   Appointments (5):
  *     book_appointment, cancel_appointment, reschedule_appointment,
- *     update_appointment_status, sync_lp_appointment_to_ghl
+ *     update_appointment_status, sync_lp_appointment_to_ghl,
+ *     sync_confirmation_opportunity (2026-10-16 — the "4. Confirmation Pipeline" card)
  *   Consent (2) — 2026-09-28, Consent Model v1:
  *     record_consent_change (contact_consent + consent_events, shadow),
  *     request_dnc_lift_review (asks a person in #dnc-lift-approval)
@@ -258,6 +259,7 @@ import { postL6AfterP2Loss } from '../loss-routing/l6.js';  // 2026-09-22 — P2
 import { executeAddToWorkflow, executeRemoveFromWorkflow, executeIssueHold } from './handlers/workflows.js';
 import { executeBookAppointment, executeCancelAppointment, executeRescheduleAppointment, executeUpdateAppointmentStatus } from './handlers/appointments.js';
 import { executeSyncLpAppointmentToGhl } from './handlers/lp-ghl-appointment-sync.js';
+import { executeSyncConfirmationOpportunity } from './handlers/confirmation-pipeline-sync.js'; // 2026-10-16 — 4. Confirmation Pipeline
 import { executeSetLPAppointment } from './handlers/lp-appointment.js';
 import { executeCreateLPLead } from './handlers/lp-lead.js';
 import { executeCaptureInboundCaller } from './handlers/inbound-capture.js';
@@ -686,6 +688,7 @@ export const ACTION_HANDLERS = {
   reschedule_appointment: executeRescheduleAppointment, // v2.7.8 — agentic reschedule (cancel old + book new)
   update_appointment_status: executeUpdateAppointmentStatus, // 2026-06-03 — in-home book-then-capture status upgrade (new→confirmed)
   sync_lp_appointment_to_ghl: executeSyncLpAppointmentToGhl, // 2026-07-07 — LP→GHL appointment authority (LP disposition Set/Cnf/CXL → WE calendar)
+  sync_confirmation_opportunity: executeSyncConfirmationOpportunity, // 2026-10-16 — one card per LP appointment in "4. Confirmation Pipeline"
   create_task: executeCreateTask,
   send_notification: executeSendNotification,
   set_lp_appointment: executeSetLPAppointment,

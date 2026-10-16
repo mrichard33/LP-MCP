@@ -299,6 +299,7 @@ const DEFAULT_PRIORITY_BY_TYPE = {
   cancel_appointment: TIME_SENSITIVE_PRIORITY,
   reschedule_appointment: TIME_SENSITIVE_PRIORITY,
   sync_lp_appointment_to_ghl: TIME_SENSITIVE_PRIORITY, // 2026-07-07 — LP→GHL appointment authority lane
+  sync_confirmation_opportunity: TIME_SENSITIVE_PRIORITY, // 2026-10-16 — the confirmation team works this board today
   update_lp_dnc_status: TIME_SENSITIVE_PRIORITY,
   send_notification: TIME_SENSITIVE_PRIORITY,
 };

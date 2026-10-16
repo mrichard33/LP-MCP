@@ -339,6 +339,8 @@ import { startMissedCallerRecoveryScheduler } from './jobs/missed-caller-recover
 import { startNewLeadDialBackstopScheduler } from './jobs/new-lead-dial-backstop.js';  // 2026-10-05
 import { startAfterAsapRetryScheduler } from './jobs/after-asap-retry.js';  // 2026-10-14
 import { startCancelResetRoutingScheduler } from './jobs/cancel-reset-routing.js';  // 2026-10-15
+import { startConfirmationPipelineClockScheduler } from './jobs/confirmation-pipeline-clock.js';  // 2026-10-16 — 4. Confirmation Pipeline
+import { startConfirmationPipelineSweepScheduler, registerConfirmationPipelineRoutes } from './jobs/confirmation-pipeline-sweep.js';  // 2026-10-16
 import { startFive9CallJourneyScheduler, registerFive9JourneyRoutes } from './jobs/five9-call-journey-sync.js';  // 2026-10-15
 import { startInboundCheckoutWatchScheduler } from './jobs/inbound-checkout-watch.js';  // 2026-10-06
 import { startPromisedCallbackScheduler } from './jobs/promised-callback-sweep.js';  // 2026-10-07
@@ -893,6 +895,7 @@ registerGuestVisitorRemediationRoutes(app);
 registerLinkVerifySampleRoutes(app); // 2026-07-23 — pre-enforce cache-vs-live rejection sampling (read-only vs GHL)
 registerPendingProbeTtlSweepRoutes(app); // 2026-07-08 — stale pending:customer-status-check TTL sweep (scheduler env-gated, default off)
 registerGhlAppointmentBackfillRoutes(app); // 2026-07-07 — LP→GHL appointment backfill trigger (dry-run default)
+registerConfirmationPipelineRoutes(app, authenticate); // 2026-10-16 — 4. Confirmation Pipeline: sweep by hand + go-live backfill (CONF_PIPE_DRY_RUN decides)
 registerStaleAppointmentRefreshRoutes(app, authenticate); // 2026-10-15 — one-time re-read of pre-2026-07-08 lp_leads appointment rows from LP (dry-run default, never GHL)
 registerLpContactBackstopRoutes(app); // 2026-07-09 — LP contact auto-create backstop (scheduler env-gated, default off)
 registerLpIdentityFillRoutes(app, { authenticate }); // 2026-10-11 — fill nameless contacts from LP (dry-run default)
@@ -1021,6 +1024,8 @@ const server = app.listen(PORT, async () => {
   startNewLeadDialBackstopScheduler();
   startAfterAsapRetryScheduler();
   startCancelResetRoutingScheduler();
+  startConfirmationPipelineClockScheduler();
+  startConfirmationPipelineSweepScheduler();
   startFive9CallJourneyScheduler();
   startInboundCheckoutWatchScheduler();
   startPromisedCallbackScheduler();
