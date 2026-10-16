@@ -69,6 +69,9 @@ export const TEMPLATE_ROOTS = Object.freeze([
   'intelligence',
   'engagement',
   'scarcity_real',
+  // 2026-10-16 (F.0 v2): the Siro visit and the request itself.
+  'siro',
+  'nurture_request',
 ]);
 
 export const LIMITS = Object.freeze({

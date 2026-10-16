@@ -96,6 +96,8 @@ export async function selectPrompt(context, request) {
  * objection name (e.g. 'price', 'spouse') or null when no tags.
  */
 export function pickDominantObjection(context) {
+  // F.0 v2 with no visit on file picks its "no-visit-data" variant (2026-10-16).
+  if (context?.siro?.selector_objection) return context.siro.selector_objection;
   const priority = ['price', 'spouse', 'timing', 'trust', 'competitor', 'diy'];
   // 2026-10-16 (Siro PR 1): what the lead said at the visit beats an old tag.
   // The Siro objections are read FIRST; 'other' is not a prompt variant.

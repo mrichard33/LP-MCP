@@ -98,7 +98,7 @@ function stripSignaturesFromBody(html) {
  * @param {object} output — { subject, preheader, body_html, ps_text, sms_body, ... }
  * @returns {{ output: object, applied: string[] }}
  */
-export function applyAutofix(output) {
+export function applyAutofix(output, { smsMax = SMS_MAX } = {}) {
   if (!output || typeof output !== 'object') {
     return { output, applied: [] };
   }
@@ -119,8 +119,10 @@ export function applyAutofix(output) {
   }
 
   // SMS
-  if (typeof fixed.sms_body === 'string' && fixed.sms_body.length > SMS_MAX) {
-    fixed.sms_body = smartTruncate(fixed.sms_body, SMS_MAX);
+  // smsMax null (F.0 v2, 2026-10-16): never truncate; a cut text loses its
+  // signature, so the F.0 copy check fails it and the retry rewrites it.
+  if (smsMax && typeof fixed.sms_body === 'string' && fixed.sms_body.length > smsMax) {
+    fixed.sms_body = smartTruncate(fixed.sms_body, smsMax);
     applied.push('SMS_TRUNCATED');
   }
 
