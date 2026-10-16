@@ -204,6 +204,7 @@
  */
 
 import supabase from './supabase.js';
+import { LIVE_APPOINTMENT_DISPOSITIONS } from './lp-disposition-classes.js';
 import { analyzeMessage } from './message-analyzer.js';
 import { claimConsumedMessages, releaseConsumedMessages } from './services/consumed-messages.js';
 import { scoreIntent } from './intent-scorer.js';
@@ -326,8 +327,10 @@ const LP_DISP_PREFIX = 'LP_DISP_';
 // contact". Used by the multi-lead guard's DNC-duplicate carve-out so a stale
 // DNC lead can't bury a booking that lands on an older sibling lead of the
 // same contact. Kept in sync with classifyDisposition in
-// services/lp-ghl-appointment-reconciler.js (Set/Cnf/Verif → appointment).
-const BOOKING_DISPOSITION_CODES = new Set(['Set', 'Cnf', 'Verif']);
+// services/lp-ghl-appointment-reconciler.js. 2026-10-16 (Mark): Verif is a
+// hold that starts nothing, so it no longer gets past the guard on this ground;
+// Issue (issued to a rep) is a live appointment and does.
+const BOOKING_DISPOSITION_CODES = new Set(LIVE_APPOINTMENT_DISPOSITIONS);
 const DNC_DISPOSITION_CODES = new Set(['DNC']);
 
 // 2026-08-02 — booking-authority rank. Within the booking states, a later
@@ -379,6 +382,10 @@ export function olderLeadWinsOnAuthority(eventDisp, newestDisp) {
   const e = String(eventDisp || '');
   const n = String(newestDisp || '');
   if (DNC_DISPOSITION_CODES.has(n) && BOOKING_DISPOSITION_CODES.has(e)) return true;
+  // 2026-10-16: a newest lead on Verif (a hold — "there is an issue with the
+  // lead", rank 0) must not bury a live booking on an older sibling either. Same
+  // ground as the DNC carve-out: the newest lead holds no appointment we mirror.
+  if (n === 'Verif' && BOOKING_DISPOSITION_CODES.has(e)) return true;
   const eventRank = BOOKING_AUTHORITY_RANK[e] ?? 0;
   const newestRank = BOOKING_AUTHORITY_RANK[n] ?? 0;
   return newestRank > 0 && eventRank > newestRank;

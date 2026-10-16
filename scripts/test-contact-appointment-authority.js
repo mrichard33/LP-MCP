@@ -165,10 +165,11 @@ test('a NULL lp_appointment_seen_at is releasable, not permanently wedged', () =
 });
 
 // ── rank scale ─────────────────────────────────────────────────────────────
-test('BOOKING_AUTHORITY_RANK: Verif ties Set, Cnf beats both', () => {
-  assert.deepEqual(BOOKING_AUTHORITY_RANK, { Set: 1, Verif: 1, Cnf: 2 });
-  assert.equal(rankForDisposition('Cnf') > rankForDisposition('Verif'), true);
-  assert.equal(rankForDisposition('Set'), rankForDisposition('Verif'));
+test('BOOKING_AUTHORITY_RANK: Cnf and Issue beat Set; Verif is a hold and never claims (2026-10-16)', () => {
+  assert.deepEqual(BOOKING_AUTHORITY_RANK, { Set: 1, Cnf: 2, Issue: 2 });
+  assert.equal(rankForDisposition('Cnf') > rankForDisposition('Set'), true);
+  assert.equal(rankForDisposition('Issue'), rankForDisposition('Cnf'));
+  assert.equal(rankForDisposition('Verif'), 0);
 });
 
 test('unlisted dispositions rank 0 — including CXL', () => {

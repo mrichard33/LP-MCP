@@ -78,6 +78,7 @@ import { pickPhoneMatch, searchByPhone as resolveSearchByPhone, isDuplicate400 }
 const searchByPhone = (phone) => resolveSearchByPhone(phone, { log: console });
 import { appointmentDelta } from '../appointment-dates.js';
 import { emitDispositionBackfill } from '../sync-leads.js';
+import { LIVE_APPOINTMENT_DISPOSITIONS } from '../lp-disposition-classes.js';
 import { notifyBackstopRun } from './backstop-notify.js';
 import { utcToLpStoredIso } from '../lp-dates.js';
 import { cleanName, buildIdentityFill, dropTakenEmail, putWithIdentityFill } from './lp-identity-fill.js';
@@ -90,8 +91,10 @@ const LP_LEAD_ID_FIELD = 'GmAVmW6V9sekD7pVONKr';
 const LP_PROSPECT_ID_FIELD = 'ZRQAVrzhtzApzLlHmT87';
 
 // Only live-appointment dispositions. NOT CXL — no value creating a contact
-// for a cancelled appointment; NOT DNC/Issue/others.
-const DISPOSITIONS = ['Set', 'Cnf', 'Verif'];
+// for a cancelled appointment; NOT DNC/others. 2026-10-16 (Mark): Verif is a
+// hold that starts nothing (no contact, no appointment); Issue (issued to a
+// rep) is a live appointment and joins Set/Cnf.
+const DISPOSITIONS = [...LIVE_APPOINTMENT_DISPOSITIONS];
 // Both scans read the same columns. email/address/city/state/zip were added
 // 2026-10-11 for the identity fill on the link path (lp-identity-fill.js).
 const LEAD_COLUMNS = 'lp_lead_id, ghl_contact_id, disposition_code, appointment_date, created_at_lp, first_name, last_name, email, address, city, state, zip, phone, lead_source, lead_source_detail, lp_prospect_id, '
@@ -319,7 +322,7 @@ export function makeIntakeWindowGate(lookbackHours, untilIso = null, nowMs = Dat
 // ─── Selection ───────────────────────────────────────────────────────
 /**
  * Scan lp_leads for APPOINTMENT-mode backstop candidates: unlinked leads with
- * an upcoming Set/Cnf/Verif appointment and a plausibly-valid phone. Coarse
+ * an upcoming Set/Cnf/Issue appointment and a plausibly-valid phone. Coarse
  * SQL date prefilter (appointment_date stores ET wall-clock mislabeled as UTC
  * → bounds widened a day each side), exact day-granular filtering in JS.
  *

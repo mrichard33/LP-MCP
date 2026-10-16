@@ -52,7 +52,10 @@
  *     "message": "<short diagnostic>" }
  *
  * created / updated / noop_already_exists all mean I.LP-IN must NOT fall back to
- * native booking. Only `error` should.
+ * native booking. Only `error` should. A deliberate guard skip (Verif, ND /
+ * No Demo, a year-typo date, an impossible hour — booking-endpoint-guard.js,
+ * 2026-10-16) answers `noop_already_exists` plus { ok: true, booked: false,
+ * skipped: true, reason }, because I.LP-IN branches on outcome, not HTTP code.
  *
  * ALWAYS HTTP 200, including on internal failure. A non-2xx may render as an
  * unparseable response in GHL and cost Mark the ability to branch cleanly; the
@@ -73,6 +76,8 @@ import { claimAppointmentCreate, releaseAppointmentCreate } from '../services/ap
 import { isRehashCalendarId } from '../knowledge/booking-calendar-router.js';
 import { callAssigneeFor } from '../config/rehash-assignee.js';
 import { rehashTeamUserIds } from '../agentic/rehash-state.js';
+import { checkBookingGuards } from './booking-endpoint-guard.js';
+import { readLiveLpAppointment } from '../services/lp-live-appointment.js';
 
 const APPOINTMENT_DURATION_MS = 90 * 60_000;
 const DEFAULT_BUDGET_MS = 8000;
@@ -133,13 +138,41 @@ export function raceWithBudget(work, budgetMs) {
     .finally(() => clearTimeout(timer));
 }
 
-/** The one response shape. Always 200, always these three keys. */
-function respond(res, outcome, appointmentId, message) {
+/** The one response shape. Always 200, always these three keys (a guard skip adds its own, below). */
+function respond(res, outcome, appointmentId, message, extra = null) {
   return res.status(200).json({
     outcome,
     appointmentId: appointmentId || null,
     message: String(message || ''),
+    ...(extra || {}),
   });
+}
+
+// ─── Guards (handoff v3.4 Fix 0.9, 2026-10-16) — see booking-endpoint-guard.js
+// Production reads: the contact's newest lp_leads row, then LP live. Swappable
+// for tests through __setBookingGuardDepsForTest.
+async function defaultResolveLead(contactId) {
+  const { default: supabase } = await import('../supabase.js');
+  if (!supabase) return null;
+  const { data, error } = await supabase.from('lp_leads')
+    .select('lp_lead_id, disposition_code, appointment_date, first_name, last_name, lead_source, ' +
+      'created_at_lp, updated_at_lp, set_date, last_contact_date, synced_at, set_by_name')
+    .eq('ghl_contact_id', contactId).is('lp_deleted_at', null)
+    .order('created_at_lp', { ascending: false }).limit(1).maybeSingle();
+  if (error) throw new Error(`lp_leads read failed: ${error.message}`);
+  return data || null;
+}
+
+async function defaultNotify(args) {
+  const { notifyLpLooksWrong } = await import('../actions/handlers/lp-ghl-appointment-sync.js');
+  return notifyLpLooksWrong(args);
+}
+
+let guardDeps = null;
+/** Test seam: replace the guard's reads and card (null restores production). */
+export function __setBookingGuardDepsForTest(deps) { guardDeps = deps; }
+function currentGuardDeps() {
+  return guardDeps || { resolveLead: defaultResolveLead, readLive: readLiveLpAppointment, notify: defaultNotify };
 }
 
 /**
@@ -316,10 +349,29 @@ export async function createAppointmentFromLpHandler(req, res) {
   // `budget_exceeded` subtype. We deliberately do NOT try to cancel it: a
   // duplicate is visible and recoverable, a missed appointment is neither.
   try {
-    const work = doBooking({
-      contactId, calendarId, startTime, requestedStatus, assignedUserId,
-      endTime: src.endTime || src.end_time, title, contact, startedAt,
-    });
+    const work = (async () => {
+      // A deliberate skip answers an outcome I.LP-IN's "yes" branch accepts, so
+      // GHL never falls back to its native booking step (verified 2026-10-16).
+      const guard = await checkBookingGuards({ contactId, startTime, deps: currentGuardDeps() });
+      if (guard.skip) {
+        console.log(`[ApptBooking] skipped ${contactId} @ ${startTime}: ${guard.reason} (LP ${guard.lead?.lp_lead_id || '?'}, ${guard.disposition || '?'})`);
+        void emitSlotCheckEvent('skipped', {
+          contactId, calendarId, startTime, matched: null,
+          extra: {
+            caller: 'endpoint', reason: guard.reason, disposition: guard.disposition,
+            lp_lead_id: guard.lead?.lp_lead_id || null, duration_ms: Date.now() - startedAt,
+          },
+        });
+        return {
+          outcome: 'noop_already_exists', appointmentId: null, message: `skipped:${guard.reason}`,
+          extra: { ok: true, booked: false, skipped: true, reason: guard.reason },
+        };
+      }
+      return doBooking({
+        contactId, calendarId, startTime, requestedStatus, assignedUserId,
+        endTime: src.endTime || src.end_time, title, contact, startedAt,
+      });
+    })();
     // Keep the abandoned promise from surfacing as an unhandled rejection once
     // we have already responded on the budget path.
     work.catch((err) => console.error(`[ApptBooking] abandoned work failed for ${contactId}: ${err.message}`));
@@ -337,7 +389,7 @@ export async function createAppointmentFromLpHandler(req, res) {
     }
 
     const winner = raced.value;
-    return respond(res, winner.outcome, winner.appointmentId, winner.message);
+    return respond(res, winner.outcome, winner.appointmentId, winner.message, winner.extra);
 
   } catch (err) {
     const durationMs = Date.now() - startedAt;

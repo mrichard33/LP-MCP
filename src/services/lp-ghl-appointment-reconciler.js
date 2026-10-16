@@ -3,7 +3,7 @@
  *
  * Shared core for the `sync_lp_appointment_to_ghl` action handler and the
  * one-time backfill script (scripts/backfill-ghl-appointments.js). On an LP
- * disposition change (Set / Cnf / CXL) it converges the lead's GHL estimate
+ * disposition change (Set / Cnf / Issue / CXL) it converges the lead's GHL estimate
  * appointment to LP reality. The estimate appointment may live on any of the
  * three in-home calendars — Window Estimate, Measurement Verification, or
  * Home Protection Assessment (MV and HPA are just different names for the
@@ -60,6 +60,7 @@ import { lpWallClockToGhlStartTime, wallClockToIso } from '../appointment-dates.
 import { findExistingAppointment, emitSlotCheckEvent, isSlotCheckEnabled } from '../appointments/slot-check.js';
 import { applyAppointmentFormatForContact } from '../appointments/format-contact.js';
 import { markRescheduleInflight } from './reschedule-inflight.js';
+import { isHoldDisposition, isDisqualifiedDisposition } from '../lp-disposition-classes.js';
 
 export const WINDOW_ESTIMATE_CALENDAR_ID = BOOKING_CALENDARS.WINDOW_ESTIMATE;
 
@@ -191,12 +192,19 @@ export function isImplausibleFutureAppointment({ startTime, lead, live, maxDays 
 export function classifyDisposition(code) {
   const c = String(code || '').trim();
   if (c === 'Set') return 'set';
-  if (c === 'Cnf') return 'confirm';
+  // Issue = issued to a rep: a live, confirmed visit (Mark, 2026-10-16). It
+  // creates/confirms like Cnf; it is never a post-issue REBOOK here — the
+  // post-issue gate (lp-post-issue-rebook.js) owns LP writes, this only mirrors.
+  if (c === 'Cnf' || c === 'Issue') return 'confirm';
   if (c === 'CXL') return 'cancel';
-  // LP Verif = a live Window Estimate appointment that must exist in GHL as
-  // status 'new', exactly like Set (Mark's rule, 2026-07-09). Same 'set'
-  // semantics: create-new / reschedule-in-place / never-downgrade-a-confirmed.
-  if (c === 'Verif') return 'set';
+  // Verif = "there is an issue with the lead" (Mark, 2026-10-16). It starts
+  // NOTHING: never create, reschedule, confirm or cancel. This REVERSES the
+  // 2026-07-09 rule that mapped Verif to 'set'. A GHL appointment that already
+  // exists for a Verif lead is left exactly as it is (a person decides).
+  if (isHoldDisposition(c)) return 'hold';
+  // ND / No Demo = disqualified (Mark, 2026-10-16). The mirror does nothing;
+  // the LP_DISP_DISQUALIFIED rule marks an open estimate `invalid`.
+  if (isDisqualifiedDisposition(c)) return 'disqualified';
   return 'out_of_scope';
 }
 
@@ -231,6 +239,8 @@ export function sameStartTime(a, b) {
  */
 export function planReconciliation({ kind, startTime, existing, nowMs = Date.now() }) {
   if (kind === 'out_of_scope') return { op: 'noop', reason: 'out_of_scope' };
+  if (kind === 'hold') return { op: 'noop', reason: 'verif_hold' };
+  if (kind === 'disqualified') return { op: 'noop', reason: 'disqualified' };
 
   // Cancel ignores the date guards: LP says this appointment is dead, and
   // that holds whether or not we can parse when it was.
@@ -336,6 +346,8 @@ export async function reconcileLpAppointmentToGhl({ contactId, lead, live = null
   const noop = (reason, extra = {}) => ({ ...base, outcome: 'noop', skipped: true, reason, ...extra });
 
   if (kind === 'out_of_scope') return noop('out_of_scope');
+  if (kind === 'hold') return noop('verif_hold');
+  if (kind === 'disqualified') return noop('disqualified');
 
   if (kind !== 'cancel') {
     // A pre-2026-07-08 row read as wall clock is hours off, and LP could not
@@ -381,7 +393,7 @@ export async function reconcileLpAppointmentToGhl({ contactId, lead, live = null
     }
   }
 
-  // Consent guard — Set/Verif creation only. Two carve-outs:
+  // Consent guard — Set creation only (Verif is a hold since 2026-10-16). Two carve-outs:
   //   - CXL must still cancel (honoring the contact's wishes, not marketing).
   //   - An LP 'confirm' (Cnf) is the call center's confirmation authority (see
   //     module header) AND the reconsent signal on a DNC-lift recovery: when a

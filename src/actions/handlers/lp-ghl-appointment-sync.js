@@ -53,8 +53,7 @@
  */
 
 import supabase from '../../supabase.js';
-import { reconcileLpAppointmentToGhl, resolveSyncStartTime } from '../../services/lp-ghl-appointment-reconciler.js';
-import { sendGroupMeMessage } from '../../groupme.js';
+import { reconcileLpAppointmentToGhl, resolveSyncStartTime, classifyDisposition } from '../../services/lp-ghl-appointment-reconciler.js';
 import { sendAlertMessage } from '../../alert-state.js';
 import { readLiveForSync } from '../../services/lp-live-appointment.js';
 import { lpWallClockToGhlStartTime } from '../../appointment-dates.js';
@@ -68,7 +67,9 @@ const LEAD_COLUMNS =
   'lp_lead_id, lp_prospect_id, disposition_code, appointment_date, appointment_set, ' +
   'ghl_contact_id, first_name, last_name, lead_source, created_at_lp, updated_at_lp, ' +
   // 2026-10-15: the reconciler's stale-row and ghost-appointment guards read these.
-  'synced_at, set_date, last_contact_date';
+  'synced_at, set_date, last_contact_date, ' +
+  // 2026-10-16: the "LP date/time looks wrong" card names who set it.
+  'set_by_name';
 
 /**
  * The LP lead whose change queued this action. See the header for why this is
@@ -130,7 +131,11 @@ export async function resolveSyncLead(action, payload, contactId, db = supabase)
  */
 export function shouldBlockOnAuthority(claim, dispositionCode) {
   if (claim?.granted) return false;
-  return String(dispositionCode || '').trim() !== 'CXL';
+  const code = String(dispositionCode || '').trim();
+  // 2026-10-16: a Verif (hold) or ND / No Demo (disqualified) never claims a
+  // seat — the handler answers before the claim — so it is never "blocked".
+  if (code === 'Verif' || code === 'ND' || code === 'No Demo') return false;
+  return code !== 'CXL';
 }
 
 /**
@@ -183,6 +188,23 @@ export async function executeSyncLpAppointmentToGhl(action, context = {}) {
   if (payload.disposition_code && payload.disposition_code !== lead.disposition_code) {
     // Row wins: it is fresher than the event that queued this action.
     console.warn(`[LpGhlApptSync] payload disposition '${payload.disposition_code}' differs from lp_leads row '${lead.disposition_code}' for lead ${lead.lp_lead_id} — using the row`);
+  }
+
+  // Verif (a hold) and ND / No Demo (disqualified) move nothing and never
+  // claim or hold the contact's appointment seat (Mark, 2026-10-16). Answer
+  // before the live read and the claim, so neither touches LP or the seat.
+  const heldKind = classifyDisposition(lead.disposition_code);
+  if (heldKind === 'hold' || heldKind === 'disqualified') {
+    return {
+      action: 'lp_ghl_appointment_sync',
+      outcome: 'noop',
+      skipped: true,
+      reason: heldKind === 'hold' ? 'verif_hold' : 'disqualified',
+      contact_id: contactId,
+      lp_lead_id: lead.lp_lead_id,
+      disposition_code: lead.disposition_code || null,
+      lead_source: leadSource,
+    };
   }
 
   // Read LP live before anything books (2026-10-15, see
@@ -257,25 +279,19 @@ export async function executeSyncLpAppointmentToGhl(action, context = {}) {
       .catch(() => {});
   }
 
-  if (result?.reason === 'impossible_hour') {
-    await notifyImpossibleHour({ contactId, lead, result }).catch((err) =>
-      console.warn(`[LpGhlApptSync] impossible-hour card failed for ${contactId}: ${err.message}`));
-  }
-
-  if (result?.reason === 'implausible_future_appointment') {
-    await notifyImplausibleAppointment({ contactId, lead, result }).catch((err) =>
-      console.warn(`[LpGhlApptSync] implausible-appointment alert failed for ${contactId}: ${err.message}`));
+  if (isLpLooksWrongReason(result?.reason)) {
+    await notifyLpLooksWrong({ contactId, lead, result }).catch((err) =>
+      console.warn(`[LpGhlApptSync] LP-looks-wrong card failed for ${contactId}: ${err.message}`));
   }
 
   return { action: 'lp_ghl_appointment_sync', lead_source: leadSource, ...result };
 }
 
-// ─── Impossible-hour notification (2026-07-22) ────────────────────────
-// The reconciler blocks set/confirm mirrors whose ET hour falls outside
-// business hours and returns reason 'impossible_hour'. The block itself is
-// silent by design (the reconciler is supabase-free); this handler owns the
-// human surface: ONE priority GroupMe card per (lead, date), claim-before-
-// send against lp_sync_failure_notices (sql/047) so executor retries and
+// ─── Sync-notice claim (2026-07-22; the card moved to Slack 2026-10-16) ─
+// The reconciler blocks set/confirm mirrors LP got wrong (impossible hour,
+// year-typo date). The block itself is silent by design (the reconciler is
+// supabase-free); this handler owns the human surface: ONE Slack card per
+// (lead, date), claim-before-send against lp_sync_failure_notices (sql/047) so executor retries and
 // re-fired disposition events can't card twice. Mirrors claimFailureNotice
 // semantics in src/lp-appointment-sync.js — deliberately NOT imported from
 // there (routes module; cycle risk through admin/lp-force-addlead):
@@ -311,71 +327,61 @@ async function claimSyncNotice({ noticeKey, contactId, dateKey, apptTime = null,
   }
 }
 
-async function claimImpossibleHourNotice({ contactId, lead, result }) {
-  const dateKey = String(lead.appointment_date || '').slice(0, 10) || 'nodate';
-  return claimSyncNotice({
-    noticeKey: `impossible-hour:${lead.lp_lead_id || contactId}:${dateKey}`,
-    contactId,
-    dateKey,
-    apptTime: result?.appointment_hour_et != null
-      ? `${String(result.appointment_hour_et).padStart(2, '0')}:00`
-      : null,
-    label: 'impossible-hour',
-  });
+// ─── "LP date/time looks wrong" (2026-10-16, handoff v3.4 Fix 4) ─────────
+// An impossible hour (before 8 AM / from 8 PM ET) and a year-typo date
+// (implausible_future_appointment) are ONE problem: LP holds a time no rep can
+// keep, the mirror correctly refused it, and only the confirmation team can fix
+// it IN LP. They used to be a GroupMe card and an ops card, and the parity
+// watchdog later listed the same lead as "add it to the GHL calendar" — the one
+// thing nobody should do. Now: ONE Slack card per lead + date to #ops-alerts
+// (operational alarm → Slack only), claimed in lp_sync_failure_notices before
+// send, never an auto-create. Once LP is fixed, the next sync mirrors it.
+export const LP_LOOKS_WRONG_REASONS = Object.freeze(['impossible_hour', 'implausible_future_appointment']);
+
+export function isLpLooksWrongReason(reason) {
+  return LP_LOOKS_WRONG_REASONS.includes(String(reason || ''));
 }
 
-async function notifyImpossibleHour({ contactId, lead, result }) {
-  if (!(await claimImpossibleHourNotice({ contactId, lead, result }))) return;
-  const name = [lead.first_name, lead.last_name].filter(Boolean).join(' ') || contactId;
-  const when = String(lead.appointment_date || '?').slice(0, 16).replace('T', ' ');
-  await sendGroupMeMessage(
-    `🚨 IMPOSSIBLE APPOINTMENT HOUR — GHL mirror BLOCKED\n` +
-    `👤 ${name}\n` +
-    `📋 LP Lead: ${lead.lp_lead_id || '?'} | GHL: ${contactId}\n` +
-    `📅 LP holds: ${when} ET (hour ${result.appointment_hour_et})\n` +
-    `📋 Src: ${lead.lead_source || '?'} | Disp: ${lead.disposition_code || '?'}\n` +
-    `⚠️ The GHL calendar was NOT written. LP still holds the bad time and\n` +
-    `Five9 lists repopulate at 6 AM — verify the real time with the\n` +
-    `customer, correct it in LP FIRST, then re-fire the disposition to mirror.`,
-    { flushNow: true }
-  );
-}
-
-// ─── Implausible-date alert (2026-10-15) ───────────────────────────────
-// The reconciler refuses a Set/Cnf more than LP_GHL_SYNC_MAX_FORWARD_DAYS past
-// the lead's last LP activity (reason implausible_future_appointment). A
-// person must fix the date in LP, so ONE Slack card per lead + date goes to
-// #ops-alerts (sendAlertMessage, channel 'ops'; operational alarms are Slack
-// only), claimed before send like the impossible-hour card.
-export function formatImplausibleAppointmentAlert({ contactId, lead, result }) {
+export function formatLpLooksWrongAlert({ contactId, lead, result }) {
   const name = [lead?.first_name, lead?.last_name].filter(Boolean).join(' ') || contactId;
   const when = result?.start_time
     ? String(result.start_time).slice(0, 16).replace('T', ' ')
     : String(lead?.appointment_date || '?').slice(0, 16).replace('T', ' ');
+  const why = result?.reason === 'impossible_hour'
+    ? `the time is ${result?.appointment_hour_et ?? '?'}:00, outside 8 AM–8 PM`
+    : `the visit is ${result?.days_after_last_activity ?? '?'} days after LP last touched the lead (limit ${result?.max_forward_days ?? '?'}) — likely a year typo`;
   return (
-    `🚨 GHOST APPOINTMENT BLOCKED (LP → GHL sync)\n` +
+    `🚨 LP date/time looks wrong — confirmation team must fix in LP\n` +
     `👤 ${name}\n` +
     `📋 LP Lead: ${lead?.lp_lead_id || '?'} | GHL: ${contactId}\n` +
     `📅 LP appointment: ${when} ET (${lead?.disposition_code || '?'})\n` +
-    `🕒 LP last activity: ${result?.last_activity_at || '?'} ` +
-    `(${result?.days_after_last_activity ?? '?'} days before the visit; limit ${result?.max_forward_days ?? '?'})\n` +
-    `⚠️ Likely year typo — fix the date in LP. GHL was NOT booked.`
+    `🕒 LP last activity: ${result?.last_activity_at || String(lead?.updated_at_lp || '?').slice(0, 10)}\n` +
+    `🙋 Set by: ${lead?.set_by_name || '?'}\n` +
+    `⚠️ Why: ${why}. GHL was NOT booked. Fix the date/time in LP; it mirrors on its own after that.`
   );
 }
 
-export async function notifyImplausibleAppointment({ contactId, lead, result, deps = {} }) {
+export async function notifyLpLooksWrong({ contactId, lead, result, deps = {} }) {
   const dateKey = String(result?.start_time || lead?.appointment_date || '').slice(0, 10) || 'nodate';
   const claim = deps.claimSyncNotice || claimSyncNotice;
   const claimed = await claim({
-    noticeKey: `implausible-appt:${lead?.lp_lead_id || contactId}:${dateKey}`,
+    noticeKey: `lp-looks-wrong:${lead?.lp_lead_id || contactId}:${dateKey}`,
     contactId,
     dateKey,
     apptTime: result?.start_time ? String(result.start_time).slice(11, 16) : null,
-    label: 'implausible-appointment',
+    label: 'lp-looks-wrong',
   });
   if (!claimed) return { sent: false, reason: 'already_claimed' };
   return (deps.sendAlertMessage || sendAlertMessage)(
-    formatImplausibleAppointmentAlert({ contactId, lead, result }),
+    formatLpLooksWrongAlert({ contactId, lead, result }),
     { channel: 'ops' },
   );
+}
+
+// Old names, kept for the callers and tests that import them: both now post
+// the one "LP date/time looks wrong" card.
+export const formatImplausibleAppointmentAlert = formatLpLooksWrongAlert;
+
+export async function notifyImplausibleAppointment(args) {
+  return notifyLpLooksWrong(args);
 }

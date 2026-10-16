@@ -306,6 +306,7 @@ import { getGHLContact } from '../ghl.js';
 import { utcToLpStoredIso, lpStoredAgeMinutes } from '../lp-dates.js';
 import { claimAlertConditionSet, confirmAlertSend, sendAlertMessage } from '../alert-state.js';
 import { shouldAlertParityGaps, parityAlertKey, formatParityGapCard } from './appointment-parity-alerts.js';
+import { isHoldDisposition, isDisqualifiedDisposition } from '../lp-disposition-classes.js';
 
 // One alert key per contact per class — see appointment-parity-alerts.js for
 // why this is set-valued rather than a per-sweep digest.
@@ -439,6 +440,17 @@ const ACTIVE_GHL_STATUSES = ['new', 'confirmed'];
 //   NG      not given / no good
 const RESOLVED_DISPOSITIONS = new Set(['CXL', 'CCC', 'NoHome', 'NG']);
 
+// 2026-10-16 (Mark, handoff v3.4) — SETTLED dispositions: GHL is in sync with
+// them WHATEVER it holds, so they are never a gap and never auto-fixed here.
+//   Verif        a hold ("there is an issue with the lead"); no automation of
+//                any kind, so a GHL appointment is neither created, restored,
+//                written back to LP nor flagged.
+//   ND, No Demo  disqualified; LP_DISP_DISQUALIFIED marks an open GHL estimate
+//                `invalid`, and cancelled / invalid / none is the end state.
+function isSettledDisposition(code) {
+  return isHoldDisposition(code) || isDisqualifiedDisposition(code);
+}
+
 // Operational DNC — liftable on a genuine opt-back-in.
 const OPERATIONAL_DNC_TAGS = ['dnc', 'dnc-related', 'stage:dnc', 'lp-dnc'];
 
@@ -529,6 +541,7 @@ async function readLpBook(from, to, deps = {}) {
   // in each bucket.
   const book = new Map();
   const resolved = new Map();
+  const settled = new Map();
   const keepNewest = (map, row) => {
     const prev = map.get(row.ghl_contact_id);
     if (!prev) { map.set(row.ghl_contact_id, row); return; }
@@ -550,9 +563,10 @@ async function readLpBook(from, to, deps = {}) {
     // and every one of those 71 rows becomes a fabricated Class B gap against a
     // real customer. Keep the guard at the row level so that change stays safe.
     if (isSentinelAppointmentDate(row.appointment_date)) continue;
+    if (isSettledDisposition(row.disposition_code)) { keepNewest(settled, row); continue; }
     keepNewest(RESOLVED_DISPOSITIONS.has(row.disposition_code) ? resolved : book, row);
   }
-  return { active: book, resolved };
+  return { active: book, resolved, settled };
 }
 
 // LP writes a pre-epoch date rather than NULL when a lead has no appointment,
@@ -666,7 +680,7 @@ export async function runAppointmentParityWatchdog({ dryRun = !PARITY_AUTOHEAL, 
   const asOf = new Date();
   const windowEnd = new Date(asOf.getTime() + PARITY_WINDOW_DAYS * 86400000);
 
-  const [{ active: ghlActive, cancelled: ghlCancelled }, { active: lpBook, resolved: lpResolved }] =
+  const [{ active: ghlActive, cancelled: ghlCancelled }, { active: lpBook, resolved: lpResolved, settled: lpSettled = new Map() }] =
     await Promise.all([
       _readGhlBook(asOf, windowEnd),
       _readLpBook(asOf, windowEnd),
@@ -694,6 +708,8 @@ export async function runAppointmentParityWatchdog({ dryRun = !PARITY_AUTOHEAL, 
     dnc_partial_lift: 0,
     dnc_blocked_consent: 0,
     write_ceiling_hit: 0,
+    // 2026-10-16: GHL active against a Verif / ND / No Demo LP row — in sync by rule.
+    settled_in_sync: 0,
   };
 
   // v1.1 — 2026-09-14. Outcome counters, one per thing that can actually
@@ -740,6 +756,8 @@ export async function runAppointmentParityWatchdog({ dryRun = !PARITY_AUTOHEAL, 
   // call. Writing the appointment back into LP would silently un-cancel it.
   for (const [cid, appt] of ghlActive) {
     if (lpBook.has(cid)) continue;
+    // Verif / ND / No Demo: settled, whatever GHL holds (2026-10-16).
+    if (lpSettled.has(cid)) { counts.settled_in_sync++; continue; }
     const lpRow = lpResolved.get(cid);
     if (!lpRow) continue;
 
@@ -763,6 +781,7 @@ export async function runAppointmentParityWatchdog({ dryRun = !PARITY_AUTOHEAL, 
     if (lpBook.has(cid)) continue;
     // A contact LP has cancelled is Class E above, not a missing appointment.
     if (lpResolved.has(cid)) continue;
+    if (lpSettled.has(cid)) continue;   // counted once, in the Class E loop
     counts.lp_missing_appointment++;
     const finding = {
       class: 'lp_missing_appointment',
