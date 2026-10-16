@@ -14,8 +14,15 @@
 -- and LP_DISP_NO_DEMO (enabled) tagged 138 No Demo contacts lp-route:rebook-group2 + a
 -- time-lapse tier. LP_DISP_ND (46) was already disabled.
 --
+-- APPLIED LIVE 2026-10-16 16:17Z (before the deploy, verified by a read-back; reload asserted 305 rules):
+--   rules 338 LP_APPT_GHL_SYNC_VERIF and 30 LP_DISP_VERIF disabled, rule 339 and rule 292 lose
+--   Verif, rule 34 LP_DISP_NO_DEMO disabled. These need no new code.
+-- APPLY AFTER THE DEPLOY (they need the new code): the LP_DISP_DISQUALIFIED insert (action
+--   disqualified_cleanup) and rule 171's lp_disposition_not_in (an unknown verb would stop 171
+--   firing at all). Then reload.
+--
 -- Ships with the code (src/lp-disposition-classes.js, the reconciler's verif_hold /
--- disqualified kinds, the disqualified_cleanup handler). Apply AFTER the deploy, then reload.
+-- disqualified kinds, the disqualified_cleanup handler).
 
 -- ── 1. Verif starts nothing ───────────────────────────────────────────────
 -- Expect 2.
