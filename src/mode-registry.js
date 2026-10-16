@@ -174,6 +174,11 @@ export const MODES = Object.freeze([
     evidence: { events: ['agentic.missed_inbound_redriven'] },
     note: 'Answers an inbound text or email GHL never sent to the reply webhook.',
   }),
+  m('HOLD_RETURN_RECOVERY_MODE', 'bot', 'enum', OSL, 'shadow', OSL_S, {
+    since: '2026-10-16', decider: 'the user',
+    evidence: { events: ['agentic.hold_completed_shadow'] },
+    note: 'Completes a Dynamic Hold whose GHL callback arrived with a blank return_to, from our own issue_hold row.',
+  }),
   m('REPLY_SLA_WATCHDOG_MODE', 'bot', 'enum', OSL, 'shadow', OSL_S, {
     since: '2026-09-02',
     note: 'Flags a text with no reply after 3 minutes.',

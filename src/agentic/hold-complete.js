@@ -41,6 +41,24 @@
 import { checkRequestSecret, rejectionBody } from '../security/request-auth.js';
 import { emitEvent } from '../event-emitter.js';
 import { sendGroupMeMessage } from '../groupme.js';
+import supabase from '../supabase.js';
+import { recoverHoldTarget, completionEventType, holdRecoveryMode } from './hold-target.js';
+
+// 2026-10-16: the issued holds a blank-return_to callback is matched against
+// (see src/agentic/hold-target.js). Newest first; a few is plenty, since only
+// one hold per contact is open at a time (HOLD_SERIALIZATION_ENABLED).
+export async function readRecentHolds(contactId, { db = supabase } = {}) {
+  const { data, error } = await db
+    .from('agent_actions')
+    .select('id, created_at, executed_at, action_payload, execution_result')
+    .eq('action_type', 'issue_hold')
+    .eq('target_id', contactId)
+    .eq('status', 'completed')
+    .order('created_at', { ascending: false })
+    .limit(5);
+  if (error) throw new Error(error.message);
+  return data || [];
+}
 
 // NOTE (2026-09-14): /hooks/ is GHL's INBOUND webhook-trigger surface, not the
 // rate-limited v2 API (services.leadconnectorhq.com/contacts, /conversations,
@@ -85,32 +103,66 @@ function checkBearer(req, res) {
   return false;
 }
 
-export function registerHoldCompleteRoutes(app) {
+export function registerHoldCompleteRoutes(app, deps = {}) {
+  const readHolds = deps.readRecentHolds || readRecentHolds;
+  const emit = deps.emitEvent || emitEvent;
+  const env = deps.env || process.env;
+
   app.post('/api/agentic/hold-complete', async (req, res) => {
     if (!checkBearer(req, res)) return;
 
     const body = req.body || {};
     const contactId = body.contact_id;
-    const returnTo = typeof body.return_to === 'string' ? body.return_to.trim() : '';
 
     if (!contactId || typeof contactId !== 'string') {
       return res.status(200).json({ ok: false, error: 'contact_id required' });
     }
+
+    // 2026-10-16: GHL sends return_to BLANK when the callback runs long after
+    // the inbound webhook that started the hold, so every callback since
+    // 2026-06-12 was refused here and no hold ever completed. A blank one is
+    // recovered from our own issue_hold row (hold-target.js); a read that
+    // fails recovers nothing and the callback is refused as before.
+    const nowMs = Date.now();
+    let holds = [];
+    const hasBodyTarget = Boolean(String(body.return_to ?? '').trim() || String(body.hold_return_target ?? '').trim());
+    if (!hasBodyTarget) {
+      try {
+        holds = await readHolds(contactId);
+      } catch (err) {
+        console.warn(`[HoldComplete] issued-hold read failed for contact=${contactId}: ${err.message}`);
+      }
+    }
+    const recovered = recoverHoldTarget({ body, holds, nowMs });
+    const returnTo = recovered.returnTo;
+    const mode = holdRecoveryMode(env);
+    const eventType = completionEventType({ source: recovered.source, mode });
+
     if (!returnTo) {
-      console.warn(`[HoldComplete] missing return_to for contact=${contactId}`);
+      console.warn(`[HoldComplete] missing return_to for contact=${contactId} (no issued hold due now)`);
       return res.status(200).json({ ok: false, error: 'return_to required' });
     }
+    if (recovered.source !== 'body') {
+      console.log(`[HoldComplete] return_to recovered from ${recovered.source} contact=${contactId} ` +
+        `return_to=${returnTo} mode=${mode}` + (recovered.hold ? ` hold_action=${recovered.hold.action_id} due=${recovered.hold.due_at}` : ''));
+    }
+    if (!eventType) {
+      return res.status(200).json({ ok: false, error: 'return_to required', recovered_from: recovered.source, mode });
+    }
 
-    const completedAt = body.completed_at || new Date().toISOString();
-    const holdHours = body.hold_hours !== undefined && body.hold_hours !== null && body.hold_hours !== ''
+    const completedAt = body.completed_at || new Date(nowMs).toISOString();
+    const rawHours = body.hold_hours !== undefined && body.hold_hours !== null && body.hold_hours !== ''
       ? Number(body.hold_hours) : null;
+    const holdHours = Number.isFinite(rawHours) ? rawHours : (recovered.hold?.hold_hours ?? null);
+    const shadow = eventType !== 'agentic.hold_completed';
 
-    // ── Always emit for the Decision Engine ───────────────────────────
+    // ── Emit for the Decision Engine ──────────────────────────────────
     // event_subtype = return_to so completion rules match on event_pattern
     // (no payload-equality verb needed). agentic.hold_completed is allowlisted
-    // in services/event-intake-filter.js.
-    await emitEvent({
-      event_type: 'agentic.hold_completed',
+    // in services/event-intake-filter.js. The shadow event has no consumer, so
+    // it bypasses the filter like hold_error.
+    await emit({
+      event_type: eventType,
       event_subtype: returnTo,
       source: 'ghl_dynamic_hold',
       entity_type: 'contact',
@@ -120,18 +172,23 @@ export function registerHoldCompleteRoutes(app) {
         contact_id: contactId,
         return_to: returnTo,
         hold_hours: holdHours,
-        hold_reason: body.hold_reason || null,
-        workflow_code: body.workflow_code || null,
+        hold_reason: body.hold_reason || recovered.hold?.hold_reason || null,
+        workflow_code: body.workflow_code || recovered.hold?.workflow_code || null,
         completed_at: completedAt,
+        return_to_source: recovered.source,
+        hold_action_id: recovered.hold?.action_id ?? null,
+        hold_due_at: recovered.hold?.due_at ?? null,
       },
       priority: 'normal',
-      idempotency_key: `hold_complete_${contactId}_${returnTo}_${completedAt}`,
+      idempotency_key: `${shadow ? 'hold_complete_shadow' : 'hold_complete'}_${contactId}_${returnTo}_${completedAt}`,
+      ...(shadow ? { bypass_filter: true } : {}),
     });
 
     // ── Back-compat re-fire (gated) ───────────────────────────────────
+    // Never in shadow: a shadow completion must change nothing.
     const explicitRefire = body.refire === true;
     const explicitNoRefire = body.refire === false;
-    const shouldRefire = !explicitNoRefire && (explicitRefire || looksLikeTriggerId(returnTo));
+    const shouldRefire = !shadow && !explicitNoRefire && (explicitRefire || looksLikeTriggerId(returnTo));
 
     let refire = null;
     if (shouldRefire) {
@@ -154,13 +211,14 @@ export function registerHoldCompleteRoutes(app) {
 
     console.log(`[HoldComplete] contact=${contactId} return_to=${returnTo} ` +
       `wf=${body.workflow_code || '?'} reason="${body.hold_reason || ''}" ` +
-      `emitted=agentic.hold_completed refired=${shouldRefire ? (refire?.status ?? 'err') : 'no'}`);
+      `emitted=${eventType} refired=${shouldRefire ? (refire?.status ?? 'err') : 'no'}`);
 
     return res.status(200).json({
       ok: true,
       contact_id: contactId,
       return_to: returnTo,
-      emitted: 'agentic.hold_completed',
+      return_to_source: recovered.source,
+      emitted: eventType,
       refired: shouldRefire,
       refire_status: refire?.status ?? null,
     });
