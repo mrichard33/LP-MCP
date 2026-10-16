@@ -60,6 +60,15 @@ export const F0_ENROLL_EXCLUDE_TAGS = [
   'customer', 'lp-sale', 'deal-won', 'dnc', 'lp-dnc', 'stage:dnc', 'stop-bot', 'suppress-outbound',
 ];
 
+// 2026-10-16 (handoff v3.4 Fix 5): a demoed lead is HEALTHY when F.0 ran
+// (f.0-v2) or the lead moved on to a later post-demo route: O.0 Objection
+// Handler (active-o.0 / agentic-routed-o.0) or the rehash stage. Collier
+// (582185), Fulwood (581286) and Dierickx (582740) were enrolled in F.0 and
+// correctly handed to O.0, and the audit still flagged them.
+export const F0_HEALTHY_TAGS = ['active-f.0', 'f.0-v2', 'active-o.0', 'agentic-routed-o.0', 'rehash', 'stage:proposal-delivered'];
+export const F0_ENROLL_RULE = 'F0_ENROLL_CURRENT_OPPFDN';
+export const F0_AUTOENROL_RULE = 'F0_AUDIT_AUTOENROL';
+
 export const AUDIT_KEY = 'f0-s52-integrity';
 export const CARD_MAX_LINES = 10;
 export const POSTED_TTL_DAYS = 30;
@@ -103,7 +112,7 @@ export function flagF0Contact(leads) {
 export function isMissingFromF0(leads, tags, nowMs = Date.now(), sinceMs = -Infinity) {
   if (!Array.isArray(tags)) return false;
   const lower = tags.map((t) => String(t).toLowerCase());
-  if (lower.includes(F0_ACTIVE_TAG) || F0_ENROLL_EXCLUDE_TAGS.some((t) => lower.includes(t))) return false;
+  if (F0_HEALTHY_TAGS.some((t) => lower.includes(t)) || F0_ENROLL_EXCLUDE_TAGS.some((t) => lower.includes(t))) return false;
   const current = pickCurrentLead(Array.isArray(leads) ? leads : []);
   if (String(current?.disposition_code ?? '').trim() !== 'OPPFDN') return false;
   const apptMs = current.appointment_date ? lpStoredToUtcMs(current.appointment_date) : NaN;
@@ -148,8 +157,15 @@ export function auditItems(result) {
       wrong: `in F.0 — ${f.reason}`, todo: 'remove from F.0' });
   }
   for (const m of result.missing || []) {
+    // 2026-10-16 (Fix 5): F.0 enrolment never ran or failed → the audit
+    // enrols it and says so; only a failed attempt still needs a person.
+    if (m.auto_enrolled) {
+      items.push({ contact_id: m.contact_id, name: name(m.contact_id), reason: 'f0_autoenrolled',
+        wrong: `demoed (lead ${m.lp_lead_id ?? '?'}, OPPFDN), F.0 enrolment had not run`, todo: 'auto-enrolled (no action)' });
+      continue;
+    }
     items.push({ contact_id: m.contact_id, name: name(m.contact_id), reason: 'f0_missing',
-      wrong: `demoed (lead ${m.lp_lead_id ?? '?'}, OPPFDN) but not in F.0`, todo: 'check why F.0 did not enroll' });
+      wrong: `demoed (lead ${m.lp_lead_id ?? '?'}, OPPFDN) but not in F.0${m.enroll_error ? ` (auto-enrol failed: ${m.enroll_error})` : ''}`, todo: 'enrol in F.0 by hand' });
   }
   for (const f of result.s52?.flagged || []) {
     items.push({ contact_id: f.contact_id, name: name(f.contact_id), reason: `s52_flag:${f.reason}`,
@@ -168,6 +184,7 @@ const S52_REASON_TEXT = {
   live_appointment: 'has a live appointment',
   current_lead_issue: 'current lead is Issue',
   current_lead_no_demo: 'current lead is No Demo / ND / NOC',
+  current_lead_disqualified: 'current lead is ND / No Demo (disqualified)',
 };
 
 /** Pure. The Slack card for NEW items only. */
@@ -212,6 +229,56 @@ export function formatF0AuditReport({ total, flagged, missing = [], s52 = null, 
       ...listLines(s52Missed, (m) => `• ${m.contact_id} · lead ${m.lp_lead_id ?? '?'} · ${m.disposition}`));
   }
   return out.join('\n');
+}
+
+/**
+ * 2026-10-16 (Fix 5.2): for each demo missing from F.0, look at rule 393's own
+ * history. A completed F0_ENROLL_CURRENT_OPPFDN (or an earlier auto-enrol) means
+ * F.0 ran and the lead moved on — healthy, dropped. Never ran or failed →
+ * queue rule 393's own actions for the contact (rule_applied F0_AUDIT_AUTOENROL),
+ * so the enrolment is exactly the rule's. Only the demoed lead itself reaches
+ * here (isMissingFromF0: the CURRENT lead is OPPFDN within 14 days), so an ND /
+ * No Demo / Verif current lead and a duplicate's old demo never enrol.
+ */
+async function autoEnrollMissing(deps, missing) {
+  if (!missing.length || !deps.supabase) return missing;
+  const ids = missing.map((m) => m.contact_id);
+  const history = new Map();
+  for (let i = 0; i < ids.length; i += LP_CHUNK) {
+    const { data, error } = await deps.supabase.from('agent_actions')
+      .select('target_id, status, rule_applied')
+      .in('rule_applied', [F0_ENROLL_RULE, F0_AUTOENROL_RULE])
+      .eq('action_type', 'add_to_workflow')
+      .in('target_id', ids.slice(i, i + LP_CHUNK));
+    if (error) throw new Error(`F.0 enrolment history read failed: ${error.message}`);
+    for (const r of data || []) {
+      const h = history.get(r.target_id) || new Set();
+      h.add(r.status);
+      history.set(r.target_id, h);
+    }
+  }
+  const { data: rule, error: ruleErr } = await deps.supabase.from('agent_rules')
+    .select('action_template').eq('rule_key', F0_ENROLL_RULE).maybeSingle();
+  const template = !ruleErr && Array.isArray(rule?.action_template) ? rule.action_template : null;
+  const out = [];
+  for (const m of missing) {
+    const h = history.get(m.contact_id) || new Set();
+    if (h.has('completed')) continue;                                   // F.0 ran; the lead moved on
+    if (h.has('pending') || h.has('executing') || h.has('approved')) {  // already queued
+      out.push({ ...m, auto_enrolled: true, pending: true });
+      continue;
+    }
+    if (!template) { out.push({ ...m, enroll_error: 'rule 393 template unreadable' }); continue; }
+    const rows = template.map((a) => ({
+      action_type: a.action_type, target_system: a.target_system || 'ghl', target_entity: a.target_entity || 'contact',
+      target_id: m.contact_id, action_payload: { ...(a.params || {}), claim_key: `f0-autoenrol:${m.contact_id}:${a.action_type}` },
+      reasoning: `F.0 audit: lead ${m.lp_lead_id ?? '?'} demoed (OPPFDN) and F.0 enrolment never ran — enrolling with rule ${F0_ENROLL_RULE}'s own actions`,
+      rule_applied: F0_AUTOENROL_RULE, status: 'pending', requires_approval: false, priority: 40,
+    }));
+    const { error } = await deps.supabase.from('agent_actions').insert(rows);
+    out.push(error ? { ...m, enroll_error: error.message } : { ...m, auto_enrolled: true });
+  }
+  return out;
 }
 
 async function defaultDeps() {
@@ -434,7 +501,7 @@ async function confirmF0Flags(deps, cacheFlags) {
  * Returns { ok, total, flagged, missing, s52, items, posted, text }. A read
  * failure is ok:false, so runJob records the pass as failed rather than clean.
  */
-export async function runF0IntegrityAudit({ post = true, deps: depsArg } = {}) {
+export async function runF0IntegrityAudit({ post = true, autoEnroll = true, deps: depsArg } = {}) {
   const deps = depsArg || await defaultDeps();
   const nowMs = deps.nowMs ?? Date.now();
   const sinceMs = deps.sinceMs ?? auditSinceMs();
@@ -454,8 +521,9 @@ export async function runF0IntegrityAudit({ post = true, deps: depsArg } = {}) {
         missing.push({ contact_id: id, lp_lead_id: pickCurrentLead(rows)?.lp_lead_id ?? null });
       }
     }
+    const enrolled = autoEnroll ? await autoEnrollMissing(deps, missing) : missing;
     const s52 = await auditS52(deps, nowMs, sinceMs, names);
-    result = { ok: true, total: ids.length, flagged, missing, s52, names };
+    result = { ok: true, total: ids.length, flagged, missing: enrolled, s52, names };
   } catch (err) {
     result = { ok: false, total: 0, flagged: [], missing: [], s52: null, error: err.message };
   }

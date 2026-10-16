@@ -199,6 +199,7 @@ async function sweepWithCcc({ ghlActive = new Map(), ghlCancelled = new Map() } 
       readLpBook: async () => books,
       getGHLContact: async () => ({ tags: [] }),
       syncAppointmentToLP: async () => ({ success: true, action: 'lp_appointment_set' }),
+      mirrorLeadAppointment: async () => ({ outcome: 'noop', skipped: true, reason: 'dnc_consent' }), // Class B escalates here (2026-10-16 create: test-appointment-parity-heal.js)
       emitEvent: async () => ({ id: 1 }),
       claimAlertConditionSet: async () => ({ ok: true, newlyFiring: [], cleared: [] }),
       confirmAlertSend: async () => ({ ok: true }),
@@ -363,6 +364,7 @@ test('the watchdog ignores a Confirmation Call: no Class A sync, no confirmation
       readLpBook: async () => ({ active: lpActive, resolved: new Map() }),
       getGHLContact: async () => ({ tags: [] }),
       syncAppointmentToLP: async () => { syncCalls++; return { action: 'lp_appointment_set' }; },
+      mirrorLeadAppointment: async () => ({ outcome: 'noop', skipped: true, reason: 'dnc_consent' }), // Class B escalates here (2026-10-16 create: test-appointment-parity-heal.js)
       fetchUpcomingAppointments: async () => [
         { appointment_id: 'call-2', status: 'new', start_time: t, calendar_id: CONF_CALL_CAL },
       ],
@@ -399,6 +401,7 @@ test('watchdog Class A asks for a bookable lead and passes the calendar (the use
       readLpBook: async () => ({ active: new Map(), resolved: new Map() }),
       getGHLContact: async () => ({ tags: [] }),
       syncAppointmentToLP: async (args) => { calls.push(args); return { action: 'skipped_terminal_disposition' }; },
+      mirrorLeadAppointment: async () => ({ outcome: 'noop', skipped: true, reason: 'dnc_consent' }), // Class B escalates here (2026-10-16 create: test-appointment-parity-heal.js)
       emitEvent: async () => ({ id: 1 }),
       claimAlertConditionSet: async () => ({ ok: true, newlyFiring: [], cleared: [] }),
       confirmAlertSend: async () => ({ ok: true }),

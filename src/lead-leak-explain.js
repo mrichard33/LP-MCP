@@ -105,6 +105,8 @@ export function explainUncalled(reason, f = {}) {
       return join("Couldn't check Five9 today (the lookup was skipped or failed).", lpQueueClause(f), dncHistoryClause(f), contextClause(f));
     case 'called_no_retry':
       return join('Five9 called it, but has not tried again since.', lpQueueClause(f), contextClause(f));
+    case 'attempts_exhausted_not_handed':
+      return join('Five9 used up its After DIAL ASAP attempts and no next list (Data - Hot) has called it since.', lpQueueClause(f), contextClause(f));
     case 'dnc': {
       const why = DNC_SOURCE_TEXT[f.dnc_source];
       const base = why ? `Not called because ${why}.` : 'Not called because the phone is on a do-not-call list.';

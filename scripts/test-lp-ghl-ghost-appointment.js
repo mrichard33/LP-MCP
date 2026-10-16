@@ -310,9 +310,11 @@ const ghostResult = {
   last_activity_at: '2025-11-26', days_after_last_activity: 369, max_forward_days: 120,
 };
 
+// 2026-10-16 (Fix 4): the year-typo and impossible-hour cards are ONE card,
+// "LP date/time looks wrong — confirmation team must fix in LP".
 test('alert text names the lead, the date, the last activity and the fix', () => {
   const text = formatImplausibleAppointmentAlert({ contactId: 'BQ7uPNReghzTTLVjKFJS', lead: ghostLead, result: ghostResult });
-  for (const part of ['Gilles Edouard', '475840', 'BQ7uPNReghzTTLVjKFJS', '2026-11-30 10:00', '2025-11-26', 'Likely year typo — fix the date in LP.']) {
+  for (const part of ['LP date/time looks wrong — confirmation team must fix in LP', 'Gilles Edouard', '475840', 'BQ7uPNReghzTTLVjKFJS', '2026-11-30 10:00', '2025-11-26', 'likely a year typo', 'Fix the date/time in LP']) {
     assert.ok(text.includes(part), `missing "${part}"`);
   }
 });
@@ -328,7 +330,7 @@ test('alert goes to Slack #ops-alerts once per lead + date (claim before send)',
   const again = await notifyImplausibleAppointment({ contactId: 'BQ7uPNReghzTTLVjKFJS', lead: ghostLead, result: ghostResult, deps });
   assert.equal(sent.length, 1);
   assert.deepEqual(sent[0].opts, { channel: 'ops' });
-  assert.deepEqual([...keys], ['implausible-appt:475840:2026-11-30']);
+  assert.deepEqual([...keys], ['lp-looks-wrong:475840:2026-11-30']);
   assert.equal(again.reason, 'already_claimed');
 });
 
@@ -371,4 +373,26 @@ test('runStaleAppointmentRefresh: dry run writes nothing; apply writes lp_leads 
   const applied = await runStaleAppointmentRefresh({ dryRun: false, deps });
   assert.equal(applied.counts.written, 1);
   assert.deepEqual(updates.map((u) => [u.t, u.v]), [['lp_leads', '475840']]);
+});
+
+test('an impossible hour gets the same card and the same per lead + date claim', async () => {
+  const { notifyLpLooksWrong, formatLpLooksWrongAlert } = await import('../src/actions/handlers/lp-ghl-appointment-sync.js');
+  const stuckey = { lp_lead_id: '583740', first_name: 'S', last_name: 'Stuckey', disposition_code: 'Set', set_by_name: 'Agent A', appointment_date: '2026-11-03T02:00:00+00:00' };
+  const result = { reason: 'impossible_hour', start_time: '2026-11-03T02:00:00-05:00', appointment_hour_et: 2 };
+  const text = formatLpLooksWrongAlert({ contactId: 'c-stuckey', lead: stuckey, result });
+  for (const part of ['LP date/time looks wrong', '583740', '2026-11-03 02:00', 'Set by: Agent A', 'outside 8 AM–8 PM']) {
+    assert.ok(text.includes(part), `missing "${part}"`);
+  }
+  assert.doesNotMatch(text, /add it to/i);
+  const keys = new Set();
+  const sent = [];
+  const deps = {
+    claimSyncNotice: async ({ noticeKey }) => (keys.has(noticeKey) ? false : (keys.add(noticeKey), true)),
+    sendAlertMessage: async (t, opts) => { sent.push(opts); return { sent: true }; },
+  };
+  await notifyLpLooksWrong({ contactId: 'c-stuckey', lead: stuckey, result, deps });
+  await notifyLpLooksWrong({ contactId: 'c-stuckey', lead: stuckey, result, deps });
+  assert.equal(sent.length, 1);
+  assert.deepEqual(sent[0], { channel: 'ops' });
+  assert.deepEqual([...keys], ['lp-looks-wrong:583740:2026-11-03']);
 });

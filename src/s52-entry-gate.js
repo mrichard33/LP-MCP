@@ -21,6 +21,7 @@
 //                              stuck at "Set" from months ago cannot block forever.
 //   4. current_lead_issue    — "Issue waits until LP updates it"
 //   5. current_lead_no_demo  — No Demo / ND / NOC never enter S5.2
+//   0b. current_lead_disqualified — ND / No Demo, checked up front (2026-10-16)
 //
 // SCOPE (user, 2026-10-02): only APPOINTMENT_DISRUPTION.* and
 // APPOINTMENT_FRICTION.ghost_after_booking. The other APPOINTMENT_FRICTION
@@ -34,6 +35,7 @@ import { contactHadDemo } from './demo-truth.js';
 import { pickCurrentLead } from './current-lead.js';
 import { lpDateToEastern, lpCreatedDate, sanitizeLpApptDate } from './lp-dates.js';
 import { detectNoteDq } from './agentic/lp-note-dq.js';
+import { isDisqualifiedDisposition } from './lp-disposition-classes.js';
 
 export const S52_WORKFLOW_IDS = Object.freeze([
   '0a6a1349-0b44-429b-91e1-4c5be264cd9f', // S5.2 v2 (active-s5.2)
@@ -99,6 +101,15 @@ export function evaluateS52Entry({ leads, tags, notes = [], lastInboundMs = null
   const tagSet = lowerSet(tags);
   const canvass = CANVASSING_TAGS.find((t) => tagSet.has(t));
   if (canvass) return { allow: false, reason: 'canvassing', detail: { tag: canvass } };
+
+  // 2026-10-16 (Mark, handoff v3.4 Fix 2): ND and No Demo are DISQUALIFIED — an
+  // end state, never a rescue. Checked up front, not only through the late
+  // lp_note_dq read: Avila (LP 583486, ND "we don't service this type of
+  // project") reached S5.2 v2 and was stopped only by the note.
+  const currentEarly = pickCurrentLead(Array.isArray(leads) ? leads : []);
+  if (isDisqualifiedDisposition(currentEarly?.disposition_code)) {
+    return { allow: false, reason: 'current_lead_disqualified', detail: { lp_lead_id: currentEarly.lp_lead_id ?? null, disposition: norm(currentEarly.disposition_code) } };
+  }
 
   // 2026-10-07 (Nicholas Ferraioli): we cancelled his visit because a team
   // note said we cannot run it, and S5.2 still texted him "Ninety minutes in

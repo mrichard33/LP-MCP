@@ -149,9 +149,11 @@ test('gate: an old entry:canvassing / source:canvass marker alone does not block
 });
 
 test('gate: blocks current lead No Demo / ND / NOC (NOC is not a demo, but still never enters)', () => {
-  for (const disp of ['No Demo', 'ND', 'NOC']) {
+  // 2026-10-16: ND and No Demo are disqualified and refused up front
+  // (current_lead_disqualified); NOC keeps the late no-demo reason.
+  for (const [disp, reason] of [['No Demo', 'current_lead_disqualified'], ['ND', 'current_lead_disqualified'], ['NOC', 'current_lead_no_demo']]) {
     const leads = [row('1', disp, '2026-09-30T14:00:00+00:00', '2026-09-25T10:00:00+00:00')];
-    assert.equal(gate.evaluateS52Entry({ leads, tags: [], nowMs: NOW }).reason, 'current_lead_no_demo', disp);
+    assert.equal(gate.evaluateS52Entry({ leads, tags: [], nowMs: NOW }).reason, reason, disp);
   }
 });
 

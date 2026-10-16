@@ -23,6 +23,7 @@
 import { getLeadByLdsId as defaultGetLeadByLdsId } from '../lp-client.js';
 import { extractArray, getField } from '../sync-utils.js';
 import { parseLpApptWallClock } from '../actions/date-parsers.js';
+import { isLiveAppointmentDisposition } from '../lp-disposition-classes.js';
 
 /**
  * Pull one lead out of an LP GetLead response by lds_id. Same unwrap as
@@ -127,14 +128,15 @@ export async function writeMirrorUpdate(lpLeadId, patch, { db } = {}) {
 
 /**
  * Whether a caller should read LP live before reconciling this row. Only
- * Set / Verif / Cnf can create or move an appointment; a cancel never reads.
+ * Set / Cnf / Issue can create or move an appointment; a cancel never reads, and
+ * Verif is a hold that moves nothing (2026-10-16), so it is never read for a sync.
  */
 export function needsLiveRead(dispositionCode) {
-  return ['Set', 'Verif', 'Cnf'].includes(String(dispositionCode || '').trim());
+  return isLiveAppointmentDisposition(dispositionCode);
 }
 
 /**
- * Live LP read for a Set/Verif/Cnf row, plus the lp_leads write-back when LP
+ * Live LP read for a Set/Cnf/Issue row, plus the lp_leads write-back when LP
  * disagrees with the row. Null for a cancel (never read). Never throws.
  * Shared by the contact backstop and the admin backfill so every caller of
  * the reconciler reads LP the same way.

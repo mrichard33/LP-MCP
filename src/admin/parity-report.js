@@ -7,7 +7,7 @@
  * because the LP side reads lp_leads.
  *
  * Per contact, the diff surfaces:
- *   missing         LP expects an appointment (Set/Cnf/Verif, appointment_set,
+ *   missing         LP expects an appointment (Set/Cnf/Issue, appointment_set,
  *                   with a real start time) but GHL has none at that slot.
  *   orphan          GHL has an active estimate appointment for a contact with no
  *                   active LP appointment expectation.
@@ -24,7 +24,8 @@ import { sameStartTime } from '../services/lp-ghl-appointment-reconciler.js';
 import { listEstimatePoolEvents } from '../services/ghl-calendar-read.js';
 import { utcToLpStoredIso } from '../lp-dates.js';
 
-const ACTIVE_DISPOSITIONS = ['Set', 'Cnf', 'Verif'];
+// 2026-10-16: Verif is a hold (no GHL appointment expected); Issue is live.
+const ACTIVE_DISPOSITIONS = ['Set', 'Cnf', 'Issue'];
 
 function isConfirmedStatus(status) {
   const s = String(status || '').toLowerCase();

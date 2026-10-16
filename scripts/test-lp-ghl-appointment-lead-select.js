@@ -203,14 +203,22 @@ test('CANARY: a denied CXL still cancels — authority never gates a cancellatio
   assert.equal(shouldBlockOnAuthority(DENIED, ' CXL '), false, 'codes are trimmed');
 });
 
-test('a denied Set/Cnf/Verif IS blocked', () => {
-  for (const code of ['Set', 'Cnf', 'Verif']) {
+// 2026-10-16 (handoff v3.4 Fix 0): Verif is a hold that never claims a seat, so
+// it left this list; Issue (issued to a rep) joined it as a live appointment.
+test('a denied Set/Cnf/Issue IS blocked', () => {
+  for (const code of ['Set', 'Cnf', 'Issue']) {
     assert.equal(shouldBlockOnAuthority(DENIED, code), true, `${code} must be blocked`);
   }
 });
 
+test('Verif / ND / No Demo never claim, so they are never "blocked" (the handler answers first)', () => {
+  for (const code of ['Verif', 'ND', 'No Demo']) {
+    assert.equal(shouldBlockOnAuthority(DENIED, code), false, code);
+  }
+});
+
 test('a granted claim never blocks, whatever the disposition', () => {
-  for (const code of ['Set', 'Cnf', 'Verif', 'CXL', null]) {
+  for (const code of ['Set', 'Cnf', 'Issue', 'CXL', null]) {
     assert.equal(shouldBlockOnAuthority(GRANTED, code), false);
   }
   assert.equal(shouldBlockOnAuthority(SHADOW, 'Set'), false, 'dark mode reports granted');

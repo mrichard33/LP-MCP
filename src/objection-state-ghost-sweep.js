@@ -157,12 +157,16 @@ const ET_TZ = 'America/New_York';
 // with a known outcome." Any contact whose lp_leads cache shows ANY
 // of these codes is past the ghost-after-booking window — they
 // either sat, no-showed, sold, or reached a definitive post-demo
-// state. Pre-demo codes (Set, Cnf, Data, CCC, Verif) are NOT in
-// this set — those are still in the window where ghosting matters.
+// state. Pre-demo codes (Set, Cnf, Data, CCC) are NOT in this set —
+// those are still in the window where ghosting matters. Verif IS in it
+// since 2026-10-16 (Mark: Verif = a lead issue, no automation), so a
+// Verif contact never starts the ghost-after-booking path.
 //
 // Source for code semantics: src/sync-dispositions.js
 // KNOWN_DISPOSITION_LABELS.
 const POST_APPT_DISPOSITION_CODES = new Set([
+  // Hold: no automation (2026-10-16)
+  'Verif',
   // Sat / closed-won
   'OPPFDN',    // Opportunity Found — post-demo, opp identified
   'Sat',       // Sat for the demo

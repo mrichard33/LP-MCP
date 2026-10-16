@@ -23,7 +23,9 @@ const FIXTURES = [
   // [name, lead, expected intent, expected list]
   ['today visit', { hasAppt: true, apptDateEt: '2026-10-15', apptStartMs: NOW + 4 * 3600e3, dsp: 'Set' }, 'conf_next_day', 'Conf - Next Day'],
   ['tomorrow visit', { hasAppt: true, apptDateEt: '2026-10-16', dsp: 'Set' }, 'conf_next_day', 'Conf - Next Day'],
-  ['visit in 2 days', { hasAppt: true, apptDateEt: '2026-10-17', dsp: 'Verif' }, 'conf_2nd_day', 'Conf - 2nd Day'],
+  ['visit in 2 days', { hasAppt: true, apptDateEt: '2026-10-17', dsp: 'Set' }, 'conf_2nd_day', 'Conf - 2nd Day'],
+  // Verif is a hold (Mark, 2026-10-16): no Confirmation list, ever.
+  ['Verif visit in 2 days', { hasAppt: true, apptDateEt: '2026-10-17', dsp: 'Verif' }, 'none', null],
   ['visit in 5 days', { hasAppt: true, apptDateEt: '2026-10-20', dsp: 'Set' }, 'conf_later', null],
   ['already confirmed', { hasAppt: true, apptDateEt: '2026-10-16', dsp: 'Cnf' }, 'none', null],
   ['past visit', { hasAppt: true, apptDateEt: '2026-10-14', dsp: 'Set' }, 'none', null],

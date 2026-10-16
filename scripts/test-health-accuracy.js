@@ -91,7 +91,7 @@ function slaDeps({ leads, visits = [], inbound = [], calls = [], lookup = async 
     env: {},
     runSQL: async (q) => {
       if (/FROM lp_leads\s+WHERE created_at_lp/.test(q)) return leads;
-      if (/disposition_code IN \('Set', 'Verif'\)/.test(q)) return visits;
+      if (/disposition_code = 'Set'/.test(q)) return visits; // Verif is a hold since 2026-10-16
       if (/FROM lp_inbound_queue/.test(q)) return inbound;
       return [];
     },

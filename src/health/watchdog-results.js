@@ -65,8 +65,10 @@ export function uncalledLiveResults({ decision, offenders, nowMs, errors = [] })
   // 2026-10-15: "6 leads are waiting for a first call" when 4 of the 6 had been
   // called once and were waiting on a SECOND call. Only never-called leads
   // count toward red; a missing follow-up call is yellow, said as what it is.
-  const never = lines.filter((l) => l.reason !== 'called_no_retry');
-  const retry = lines.filter((l) => l.reason === 'called_no_retry');
+  // 2026-10-16: a lead whose After DIAL ASAP attempts ran out was called too.
+  const calledAlready = (r) => r === 'called_no_retry' || r === 'attempts_exhausted_not_handed';
+  const never = lines.filter((l) => !calledAlready(l.reason));
+  const retry = lines.filter((l) => calledAlready(l.reason));
   const max = never.length ? (never[0].waiting_min ?? 0) : 0;
   const atRisk = lines.reduce((s, l) => s + (l.est_value || 0), 0);
   const parts = [];

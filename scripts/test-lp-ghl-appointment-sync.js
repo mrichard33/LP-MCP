@@ -144,8 +144,12 @@ test('classifyDisposition: exact codes only', () => {
   assert.equal(classifyDisposition('Set'), 'set');
   assert.equal(classifyDisposition('Cnf'), 'confirm');
   assert.equal(classifyDisposition('CXL'), 'cancel');
-  // Verif is a live Window Estimate appointment — same 'set' semantics as Set.
-  assert.equal(classifyDisposition('Verif'), 'set');
+  // 2026-10-16 (Mark): Issue is a live, confirmed visit; Verif is a hold that
+  // moves nothing; ND / No Demo are disqualified (their own rule cleans up).
+  assert.equal(classifyDisposition('Issue'), 'confirm');
+  assert.equal(classifyDisposition('Verif'), 'hold');
+  assert.equal(classifyDisposition('ND'), 'disqualified');
+  assert.equal(classifyDisposition('No Demo'), 'disqualified');
   for (const c of ['DNC', 'Data', 'NoRehash', '', null, 'set', 'CNF', 'verif']) {
     assert.equal(classifyDisposition(c), 'out_of_scope', `code ${c}`);
   }
@@ -238,35 +242,39 @@ test('Set + different time → one PUT reschedule (startTime, NO appointmentStat
   assert.ok(puts[0].body.assignedUserId); // ignoreFreeSlotValidation on a PUT requires an explicit assignee (else 422)
 });
 
-// Verif rides the exact 'set' path (create-new / never-downgrade / reschedule-keeping-status).
-test('Verif + none → exactly one POST: status new (same as Set)', async () => {
+// 2026-10-16 (Mark): Verif = "there is an issue with the lead". It REVERSES the
+// 2026-07-09 rule that rode Verif on the 'set' path: never create, reschedule,
+// confirm or cancel — and no GHL read at all.
+for (const [name, upcoming] of [
+  ['none', []],
+  ['same time, confirmed', [weAppt({ appointmentStatus: 'confirmed' })]],
+  ['different time', [weAppt({ startTime: OTHER_TIME_GHL, appointmentStatus: 'confirmed' })]],
+]) {
+  test(`Verif + ${name} → noop verif_hold, ZERO GHL calls`, async () => {
+    reset({ upcoming });
+    const res = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('Verif') });
+    assert.equal(res.outcome, 'noop');
+    assert.equal(res.reason, 'verif_hold');
+    assert.equal(calls.length, 0);
+  });
+}
+
+test('ND / No Demo → noop disqualified, ZERO GHL calls (LP_DISP_DISQUALIFIED owns the cleanup)', async () => {
+  for (const code of ['ND', 'No Demo']) {
+    reset({ upcoming: [weAppt()] });
+    const res = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead(code) });
+    assert.equal(res.reason, 'disqualified', code);
+    assert.equal(calls.length, 0, code);
+  }
+});
+
+test('Issue + none → one POST, status confirmed (Issue = a live, issued visit)', async () => {
   reset();
-  const res = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('Verif') });
+  const res = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('Issue') });
   assert.equal(res.outcome, 'created');
   const posts = calls.filter((c) => c.method === 'POST');
   assert.equal(posts.length, 1);
-  assert.equal(mutations().length, 1);
-  assert.equal(posts[0].body.appointmentStatus, 'new');
-  assert.equal(posts[0].body.startTime, FUTURE_GHL);
-});
-
-test('Verif + same time, confirmed → zero mutations (never downgrades a confirmed)', async () => {
-  reset({ upcoming: [weAppt({ appointmentStatus: 'confirmed' })] });
-  const res = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('Verif') });
-  assert.equal(res.outcome, 'noop');
-  assert.equal(res.reason, 'already_in_sync');
-  assert.equal(mutations().length, 0);
-});
-
-test('Verif + different time → one PUT reschedule (startTime, NO appointmentStatus)', async () => {
-  reset({ upcoming: [weAppt({ startTime: OTHER_TIME_GHL, appointmentStatus: 'confirmed' })] });
-  const res = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('Verif') });
-  assert.equal(res.outcome, 'rescheduled');
-  const puts = calls.filter((c) => c.method === 'PUT');
-  assert.equal(puts.length, 1);
-  assert.equal(mutations().length, 1);
-  assert.equal(puts[0].body.startTime, FUTURE_GHL);
-  assert.equal(puts[0].body.appointmentStatus, undefined); // reschedule keeps existing status
+  assert.equal(posts[0].body.appointmentStatus, 'confirmed');
 });
 
 test('Cnf + same time, status new → one PUT confirming', async () => {
@@ -342,7 +350,7 @@ test('dnc tag → Set noop dnc_consent, but CXL still cancels', async () => {
 // confirm-sync must NOT skip on dnc_consent — LP Cnf is the confirmation
 // authority + reconsent signal, and the stale DNC stack may not have drained
 // off the contact yet (DNC_LIFT_ON_REENGAGEMENT clears it in a parallel lane).
-test('DNC-lift: Cnf on a DNC-stacked contact CONFIRMS despite the consent block (Set/Verif still blocked)', async () => {
+test('DNC-lift: Cnf on a DNC-stacked contact CONFIRMS despite the consent block (Set still blocked)', async () => {
   // Cnf + existing same-time 'new' pool appt → confirm it, even with stage:dnc/stop-bot present.
   reset({ tags: ['stage:dnc', 'stop-bot', 'lp-dnc'], upcoming: [weAppt()] });
   const cnfRes = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('Cnf') });
@@ -355,13 +363,14 @@ test('DNC-lift: Cnf on a DNC-stacked contact CONFIRMS despite the consent block 
   assert.equal(cnfCreate.outcome, 'created');
   assert.equal(cnfCreate.new_status, 'confirmed');
 
-  // Guard scope: Set and Verif are still consent-blocked (only the confirm
-  // authority is the reconsent carve-out; the lift rule clears tags for Set).
+  // Guard scope: Set is still consent-blocked (only the confirm authority is
+  // the reconsent carve-out; the lift rule clears tags for Set). Verif never
+  // gets that far: it is a hold (2026-10-16).
   reset({ tags: ['dnc', 'stage:dnc'] });
   const setBlocked = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('Set') });
   assert.equal(setBlocked.reason, 'dnc_consent');
-  const verifBlocked = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('Verif') });
-  assert.equal(verifBlocked.reason, 'dnc_consent');
+  const verifHeld = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('Verif') });
+  assert.equal(verifHeld.reason, 'verif_hold');
 });
 
 test('appt on a NON-in-home calendar (Conf Call) → does not block; other calendar untouched', async () => {

@@ -58,6 +58,8 @@ import { pickCurrentLead } from './current-lead.js';
 import { executeAddTag } from './actions/handlers/tags.js';
 import { emitEvent, dispositionPriority } from './event-emitter.js';
 import { sendGroupMeMessage } from './groupme.js';
+import { findSameSlotLiveSibling } from './same-slot-sibling.js';
+import { isLiveAppointmentDisposition } from './lp-disposition-classes.js';
 
 // GHL custom field ID for the canonical LP disposition (URWTGtobi9a9Y7gwGxC8).
 // Used to detect disposition changes from the field payload after a push so we
@@ -119,7 +121,15 @@ export function buildMergedLead(leads, jobs = null) {
   //
   // Soft-deleted LP leads (lp_deleted_at) are skipped here exactly as
   // fetchCurrentLead skips them, so the field and routing pick the same lead.
-  const newest = pickCurrentLead(leads.filter(l => !l.lp_deleted_at)) || sorted[0];
+  const currentLead = pickCurrentLead(leads.filter(l => !l.lp_deleted_at)) || sorted[0];
+  // 2026-10-16 (Badley, handoff v3.4 Fix 1): when the current lead is a
+  // non-live duplicate (a CXL) of a sibling that still holds the SAME slot in a
+  // live disposition, the sibling owns the visit — its id and disposition go on
+  // the contact, so one duplicate cannot reroute it (LP Lead ID fields, the LP
+  // Disposition field and every rule keyed off them). Any other case: unchanged.
+  const newest = isLiveAppointmentDisposition(currentLead?.disposition_code)
+    ? currentLead
+    : (findSameSlotLiveSibling(leads, currentLead) || currentLead);
 
   // Find the lead with the most recent appointment date (where appt was set)
   const withAppt = sorted.filter(l => l.appointment_set && l.appointment_date);

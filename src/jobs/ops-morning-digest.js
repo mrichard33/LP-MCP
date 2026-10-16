@@ -52,8 +52,12 @@ const DAY_MS = 86_400_000;
 const LEAD_TTL_DAYS = 7;
 const P2_RULES = { P2_JOB_TERMINAL_WON: 'won', P2_JOB_TERMINAL_LOST: 'lost' };
 const PARITY_PREFIX = 'appt_parity:gap:';
+// 2026-10-16 (handoff v3.4): the watchdog now CREATES a missing GHL appointment
+// itself (Fix 3), so a Class B line here means the create failed or needs a
+// person's call (a DNC contact, two estimate objects) — never "add it to GHL".
+// A bad LP date/hour is its own section ("LP date/time looks wrong", Fix 4).
 const PARITY_TEXT = {
-  ghl_missing_appointment: ['LP has an appointment GHL does not', 'add it to the GHL calendar or fix LP'],
+  ghl_missing_appointment: ['LP has an appointment GHL could not create on its own', 'look at the contact in GHL and decide'],
   cancellation_drift: ['cancelled on one side only', 'cancel it in the other system'],
   lp_cancelled_ghl_active: ['LP cancelled, GHL still booked', 'cancel the GHL appointment'],
 };
@@ -142,16 +146,14 @@ async function p2BackstopSection(deps, nowMs) {
     .gte('created_at', since);
   if (error) throw new Error(`P2 backstop read failed: ${error.message}`);
   const rows = data || [];
-  if (!rows.length) return null;
   const lines = [];
-  const fixed = rows.filter((r) => P2_BACKSTOP_FIXES[r.event_subtype]);
-  if (fixed.length) {
-    const names = await loadNames(deps, fixed.map((r) => r.ghl_contact_id));
-    for (const [sub, label] of Object.entries(P2_BACKSTOP_FIXES)) {
-      const who = [...new Set(fixed.filter((r) => r.event_subtype === sub).map((r) => nameOf(names, r.ghl_contact_id)))];
-      if (who.length) lines.push(`${label}: ${who.length} — ${who.slice(0, SECTION_MAX).join(', ')}${who.length > SECTION_MAX ? ` +${who.length - SECTION_MAX} more` : ''}`);
-    }
-  }
+  // 2026-10-16 (handoff v3.4 Fix 7): what the backstop FIXED needs nobody — it
+  // is one "Auto-fixed" line (autoFixedSection). Only its failures and the
+  // sales it could not place are listed here.
+  const { data: runs, error: runErr } = await deps.supabase.from('job_runs')
+    .select('status').eq('job_id', 'sale-p2-backstop').gte('started_at', since).in('status', ['failed', 'unknown']);
+  if (!runErr && runs?.length) lines.push(`the Sale → P2 backstop itself failed ${runs.length} time${runs.length === 1 ? '' : 's'} in 24h · check its job runs`);
+  if (!rows.length && !lines.length) return null;
   const review = rows.filter((r) => r.event_subtype === 'needs_review')
     .map((r) => ({ key: r.ghl_contact_id, reason: `needs_review:${r.payload?.job_id ?? ''}`, job: r.payload || {} }));
   let record = null;
@@ -174,7 +176,7 @@ async function p2BackstopSection(deps, nowMs) {
     }
   }
   if (!lines.length) return null;
-  return { title: `Sales put into P2 by the backstop (24h)`, lines, record };
+  return { title: `Sale → P2 backstop: needs a person`, lines, record };
 }
 
 // 2026-10-04: sales the sale-contact backstop (src/services/lp-sale-contact-backstop.js)
@@ -247,7 +249,11 @@ async function paritySection(deps, nowMs) {
 }
 
 async function f0Section(deps, value, nowMs) {
-  const items = (value.items || []).map((i) => ({ ...i, key: i.contact_id }));
+  // 2026-10-16 (Fix 5/7): an auto-enrolled demo is fixed — counted in the
+  // Auto-fixed line, never listed. Only leads still not enrolled are named.
+  const all = value.items || [];
+  if (deps.autoFixed) deps.autoFixed.f0 = all.filter((i) => i.reason === 'f0_autoenrolled').length;
+  const items = all.filter((i) => i.reason !== 'f0_autoenrolled').map((i) => ({ ...i, key: i.contact_id }));
   if (!items.length) return null;
   const { fresh } = await deps.filterNew({ audit: 'f0-s52-integrity', items, ttlDays: 30, nowMs, deps: { supabase: deps.supabase } });
   if (!fresh.length) return null;
@@ -455,21 +461,13 @@ async function systemHealthSection(deps, nowMs) {
       .eq('status', 'pass').gte('observed_at', dayAgo).limit(1);
     if (!passes?.length) stuckYellow.push(c);
   }
-  const shadowIds = (latest || []).filter((c) => c.mode === 'shadow').map((c) => c.check_id);
-  const shadowFails = [];
-  if (shadowIds.length) {
-    const { data: fails, error: e2 } = await db.from('health_results').select('check_id').eq('status', 'fail')
-      .gte('observed_at', dayAgo).in('check_id', shadowIds).limit(5000);
-    if (e2) throw new Error(`health_results read failed: ${e2.message}`);
-    const n = new Map();
-    for (const f of fails || []) n.set(f.check_id, (n.get(f.check_id) || 0) + 1);
-    const labelOf = new Map((latest || []).map((c) => [c.check_id, c.label]));
-    shadowFails.push(...[...n.entries()].map(([check_id, count]) => ({ check_id, label: labelOf.get(check_id) || null, fails: count })).sort((a, b) => b.fails - a.fails));
-  }
+  // 2026-10-16 (handoff v3.4 Fix 7): test-mode (shadow) check counts are no
+  // longer in the morning message — nobody acts on them there; the dashboard
+  // keeps them. systemHealthLines still renders them for any other caller.
   const { data: resolved, error: e3 } = await db.from('incidents').select('id, title, opened_at, acknowledged_at, resolved_at')
     .eq('status', 'resolved').gte('resolved_at', dayAgo);
   if (e3) throw new Error(`incidents read failed: ${e3.message}`);
-  const lines = systemHealthLines({ stuckYellow, shadowFails, resolved: resolved || [] });
+  const lines = systemHealthLines({ stuckYellow, resolved: resolved || [] });
   return lines.length ? { title: 'System health', lines } : null;
 }
 
@@ -509,6 +507,89 @@ async function callCapSection(deps, nowMs) {
   return lines.length ? { title: `Five9 call cap, ${yesterday} (Eastern)`, lines } : null;
 }
 
+// ── 2026-10-16 (handoff v3.4 Fix 7) — only what needs a person ────────────
+
+/** Pure. The one "Auto-fixed" section from the counts; null when nothing was fixed. */
+export function autoFixedLines(c = {}) {
+  const lines = [];
+  if (c.p2) lines.push(`P2 backstop added ${plural(c.p2, 'sale')} — auto-fixed`);
+  if (c.ghl_created) lines.push(`${plural(c.ghl_created, 'LP appointment')} created in GHL (LP had it, GHL did not)`);
+  if (c.same_slot_restored) lines.push(`${plural(c.same_slot_restored, 'cancelled appointment')} restored (a duplicate LP lead's cancel)`);
+  if (c.drift) lines.push(`${plural(c.drift, 'GHL estimate')} corrected to LP's date/time`);
+  if (c.disqualified) lines.push(`${plural(c.disqualified, 'ND / No Demo lead')} cleaned up (appointment invalid, out of every sequence)`);
+  if (c.f0) lines.push(`${plural(c.f0, 'demoed lead')} enrolled in F.0`);
+  return lines;
+}
+
+async function autoFixedCounts(deps, nowMs) {
+  const since = new Date(nowMs - DAY_MS).toISOString();
+  const counts = {};
+  const { data: p2, error: e1 } = await deps.supabase.from('system_events')
+    .select('ghl_contact_id, event_subtype').eq('event_type', 'p2.sale_backstop').gte('created_at', since);
+  if (e1) throw new Error(`P2 backstop read failed: ${e1.message}`);
+  counts.p2 = new Set((p2 || []).filter((r) => P2_BACKSTOP_FIXES[r.event_subtype]).map((r) => r.ghl_contact_id)).size;
+  const { data: fixes, error: e2 } = await deps.supabase.from('system_events')
+    .select('event_subtype').eq('event_type', 'appointment.parity_auto_fixed').gte('created_at', since);
+  if (e2) throw new Error(`parity auto-fix read failed: ${e2.message}`);
+  for (const r of fixes || []) {
+    const k = String(r.event_subtype || '').startsWith('drift_') ? 'drift' : r.event_subtype;
+    counts[k] = (counts[k] || 0) + 1;
+  }
+  const { data: dq, error: e3 } = await deps.supabase.from('agent_actions')
+    .select('target_id').eq('action_type', 'disqualified_cleanup').eq('status', 'completed').gte('executed_at', since);
+  if (e3) throw new Error(`disqualified cleanup read failed: ${e3.message}`);
+  counts.disqualified = new Set((dq || []).map((r) => r.target_id)).size;
+  return counts;
+}
+
+// Fix 4: one line per lead whose LP date/time looked wrong in the last 24h (the
+// per-lead card's claim in lp_sync_failure_notices is the source).
+async function lpLooksWrongSection(deps, nowMs) {
+  const since = new Date(nowMs - DAY_MS).toISOString();
+  const { data, error } = await deps.supabase.from('lp_sync_failure_notices')
+    .select('notice_key, contact_id, appt_date, appt_time, created_at')
+    .like('notice_key', 'lp-looks-wrong:%').gte('created_at', since);
+  if (error) throw new Error(`lp_sync_failure_notices read failed: ${error.message}`);
+  const rows = data || [];
+  if (!rows.length) return null;
+  const names = await loadNames(deps, rows.map((r) => r.contact_id));
+  const lines = rows.map((r) => {
+    const lead = String(r.notice_key).split(':')[1] || '?';
+    return `${nameOf(names, r.contact_id)} · LP lead ${lead} · ${r.appt_date || '?'}${r.appt_time ? ` ${r.appt_time}` : ''} · confirmation team fixes it in LP`;
+  });
+  return { title: `LP date/time looks wrong: ${rows.length}`, lines: capLines(lines, SECTION_MAX) };
+}
+
+// Fix 1.6: contacts with 2+ LP leads holding appointments within 7 days of each
+// other. One line per contact per day (dedupe audit lp_duplicate_leads, 1 day).
+async function duplicateLeadsSection(deps, nowMs) {
+  const { findDuplicateLeadGroups } = await import('../same-slot-sibling.js');
+  const from = new Date(nowMs - DAY_MS).toISOString().slice(0, 10);
+  const { data, error } = await deps.supabase.from('lp_leads')
+    .select('ghl_contact_id, lp_lead_id, disposition_code, appointment_date, lp_branch_id, first_name, last_name, lp_deleted_at')
+    .eq('appointment_set', true).gte('appointment_date', from).not('ghl_contact_id', 'is', null).is('lp_deleted_at', null).limit(5000);
+  if (error) throw new Error(`lp_leads duplicate read failed: ${error.message}`);
+  const groups = findDuplicateLeadGroups(data || []);
+  if (!groups.length) return null;
+  const items = groups.map((g) => ({ key: g.contactId, reason: 'lp_duplicate_leads', leads: g.leads }));
+  const { fresh } = await deps.filterNew({ audit: 'lp_duplicate_leads', items, ttlDays: 1, nowMs, deps: { supabase: deps.supabase } });
+  if (!fresh.length) return null;
+  const names = await loadNames(deps, fresh.map((i) => i.key));
+  const lines = fresh.map((i) => `${nameOf(names, i.key)} · ${i.leads.map((l) => `${l.lp_lead_id}/${l.lp_branch_id || '?'}/${l.disposition_code || '?'}/${String(l.appointment_date || '').slice(0, 16).replace('T', ' ')}`).join(' vs ')} · clean up in LP`);
+  return { title: `Duplicate LP leads to clean up: ${fresh.length}`, lines: capLines(lines, SECTION_MAX), record: { audit: 'lp_duplicate_leads', items: fresh } };
+}
+
+// Fix 2: Five9 removals for disqualified leads waiting on a person's approval
+// (only while DISQUALIFIED_FIVE9_AUTO_REMOVE is not true).
+async function disqualifiedFive9Section(deps) {
+  if (String(deps.env?.DISQUALIFIED_FIVE9_AUTO_REMOVE ?? process.env.DISQUALIFIED_FIVE9_AUTO_REMOVE ?? '').trim().toLowerCase() === 'true') return null;
+  const { data, error } = await deps.supabase.from('agent_actions')
+    .select('id').eq('action_type', 'five9_delete_record_from_list').eq('rule_applied', 'LP_DISP_DISQUALIFIED').eq('status', 'pending_approval');
+  if (error) throw new Error(`disqualified Five9 removal read failed: ${error.message}`);
+  const n = (data || []).length;
+  return n ? { title: 'Five9 removals for ND / No Demo leads', lines: [`waiting on approval: ${n} · approve in Slack`] } : null;
+}
+
 /** Pure. The digest text. */
 export function formatDigest(sections, { date } = {}) {
   const live = sections.filter(Boolean);
@@ -543,7 +624,8 @@ export async function runOpsMorningDigest({ post = true, deps: depsArg } = {}) {
     if (post) await deps.sendAlertMessage(`⚠️ ${label} could not run: ${error}`, { channel: 'ops' });
   };
 
-  for (const [label, build] of [['P2 won/lost summary', p2Section], ['Sale → P2 backstop summary', p2BackstopSection], ['Sale → contact backstop summary', saleContactSection], ['Appointment parity summary', paritySection], ['Post-issue rebook summary', postIssueSection], ['Shadow-mode review', shadowModesSection], ['System health', systemHealthSection], ['Five9 call cap', callCapSection]]) {
+  deps.autoFixed = {};
+  for (const [label, build] of [['P2 won/lost summary', p2Section], ['Sale → P2 backstop summary', p2BackstopSection], ['Sale → contact backstop summary', saleContactSection], ['Appointment parity summary', paritySection], ['LP date/time looks wrong', lpLooksWrongSection], ['Duplicate LP leads', duplicateLeadsSection], ['Disqualified Five9 removals', disqualifiedFive9Section], ['Post-issue rebook summary', postIssueSection], ['Shadow-mode review', shadowModesSection], ['System health', systemHealthSection], ['Five9 call cap', callCapSection]]) {
     try { sections.push(await build(deps, nowMs)); } catch (err) { await couldNotRun(label, err.message); }
   }
   try { sections.push(...await nightlySummarySections(deps, nowMs)); } catch (err) { await couldNotRun('Nightly summaries (tag sweep, inbound callers, rule targets)', err.message); }
@@ -557,6 +639,16 @@ export async function runOpsMorningDigest({ post = true, deps: depsArg } = {}) {
     }
     try { sections.push(await j.build(deps, out.value || {}, nowMs)); } catch (err) { await couldNotRun(j.label, err.message); }
   }
+
+  // One "Auto-fixed: N (no action)" section, first: what a fallback fixed needs nobody.
+  try {
+    const counts = { ...(await autoFixedCounts(deps, nowMs)), f0: deps.autoFixed.f0 || 0 };
+    const lines = autoFixedLines(counts);
+    if (lines.length) {
+      const n = Object.values(counts).reduce((t, v) => t + (Number(v) || 0), 0);
+      sections.unshift({ title: `Auto-fixed: ${n} (no action)`, lines });
+    }
+  } catch (err) { await couldNotRun('Auto-fixed summary', err.message); }
 
   const live = sections.filter(Boolean);
   const text = formatDigest(live, { date: today });

@@ -20,7 +20,9 @@
 //   watch gets it checked out.
 //   Exceptions, all Mark's rulings: an appointment already confirmed (dsp
 //   "Cnf") or issued to a rep (dsp "Issue", 2026-10-06) needs no confirmation
-//   call, so it gets no add and the removal goes ahead ("Verif" is a Set);
+//   call, so it gets no add and the removal goes ahead. "Verif" is NOT a Set
+//   any more (Mark, 2026-10-16: Verif = a lead issue, no automation): it gets
+//   no Confirmation add, and the setter-list removal (suppression) stays;
 //   and a visit 3+ days out (2026-10-06 follow-up) comes off the setter
 //   lists RIGHT AWAY and goes on Confirmation two days before the visit —
 //   nobody should call a booked person in between.
@@ -71,9 +73,10 @@ export const DEFAULT_REMOVE_LISTS = Object.freeze(['LP_ASAP', 'Reece Chatbot', '
 export const DEFAULT_SKIP_DSP = Object.freeze(['CXL', 'Reset', 'NoShow']);
 // Booked = a Set, verified, confirmed or issued appointment, or a blank
 // disposition carrying a date (a self-booked inquiry LP has not dispositioned
-// yet). Mark's rulings, 2026-10-06: "Verif means the same as Set" (so it gets
-// the Confirmation add, then the removal), and "Issue" (the visit is issued to
-// a rep) is treated like confirmed (removal only, below).
+// yet). Mark's rulings: "Issue" (the visit is issued to a rep) is treated like
+// confirmed (removal only, 2026-10-06), and Verif (2026-10-16, superseding the
+// 2026-10-06 "Verif means the same as Set") is removal only too: no
+// Confirmation add, still off the setter lists (REMOVE_ONLY_DSP).
 export const BOOKED_DSP = Object.freeze(new Set(['Set', 'Verif', 'Cnf', 'Issue']));
 // Booked AND past the confirmation call: off the setter lists, no Confirmation add.
 
@@ -365,7 +368,9 @@ export function buildRemovalAction(c, { reason, readded = false, confList = null
       ? 'The visit is 3+ days out; the number goes on a confirmation list two days before it.'
       : reason === 'appointment_issued'
         ? 'The appointment is already issued to a rep, so no confirmation call is needed.'
-        : confList ? `It is on "${confList}" for the confirmation call.` : 'The appointment is already confirmed.';
+        : reason === 'verif_hold'
+          ? 'LP has the lead on Verif (a lead issue), so it gets no confirmation call and setters stop calling.'
+          : confList ? `It is on "${confList}" for the confirmation call.` : 'The appointment is already confirmed.';
   return {
     event_id: null,
     action_type: 'five9_delete_record_from_list',

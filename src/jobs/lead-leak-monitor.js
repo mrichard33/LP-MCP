@@ -107,7 +107,7 @@ import {
   normalizePhone10, wasCalled, needsDncCheck, isRetiredCode, holdDateUnknown,
   isNotCovered, isNewlyRetiredCode, zip5, isDataLead, summarizeContactRecord, isRetryOwedDispo,
   classifyUncalledLead, finalizeReason, buildRates, estimateValue,
-  summarize, formatSlackSummary, LEAK_REASONS, CALLED_NO_RETRY_REASON,
+  summarize, formatSlackSummary, LEAK_REASONS, CALLED_NO_RETRY_REASON, ATTEMPTS_EXHAUSTED_REASON,
 } from '../lead-leak-classify.js';
 import {
   lpLocalToUtcMs, etDay, firstCallAfter, creationCallMs, minutesToFirstCall, waitingMs,
@@ -200,11 +200,11 @@ function addTimes(map, key, times) {
 }
 
 /** Keep the later of two { ms, name } last-call records under `id`. */
-function keepLast(map, id, t, name) {
+function keepLast(map, id, t, name, campaign = null) {
   const ms = Date.parse(t ?? '');
   if (!Number.isFinite(ms)) return;
   const prev = map.get(id);
-  if (!prev || ms >= prev.ms) map.set(id, { ms, name: name ? String(name) : null });
+  if (!prev || ms >= prev.ms) map.set(id, { ms, name: name ? String(name) : null, campaign: campaign ? String(campaign) : null });
 }
 
 /**
@@ -237,32 +237,34 @@ export async function readFive9History({ runSQL, windowDays, nowMs }) {
     const to = Math.min(from + DAY_MS, nowMs);
     const [row] = asRows(await runSQL(`
       WITH s AS (
-        SELECT lp_rec_key, dnis, ani, disposition_name AS d, coalesce(call_start_at, received_at) AS t
+        SELECT lp_rec_key, dnis, ani, disposition_name AS d, campaign AS c, coalesce(call_start_at, received_at) AS t
           FROM five9_events_raw
          WHERE event_type = 'disposition'
            AND received_at >= '${new Date(from).toISOString()}'
            AND received_at <  '${new Date(to).toISOString()}'
       )
       SELECT
-        (SELECT json_agg(json_build_array(k, ts, ld, lt)) FROM (
+        (SELECT json_agg(json_build_array(k, ts, ld, lt, lc)) FROM (
            SELECT lp_rec_key AS k, array_agg(DISTINCT t ORDER BY t) AS ts,
-                  (array_agg(d ORDER BY t DESC))[1] AS ld, max(t) AS lt
+                  (array_agg(d ORDER BY t DESC))[1] AS ld, max(t) AS lt,
+                  (array_agg(c ORDER BY t DESC))[1] AS lc
              FROM s WHERE lp_rec_key LIKE 'LDS%' GROUP BY 1) a) AS keys,
-        (SELECT json_agg(json_build_array(p, ts, ld, lt)) FROM (
+        (SELECT json_agg(json_build_array(p, ts, ld, lt, lc)) FROM (
            SELECT p, array_agg(DISTINCT t ORDER BY t) AS ts,
-                  (array_agg(d ORDER BY t DESC))[1] AS ld, max(t) AS lt FROM (
-             SELECT dnis AS p, t, d FROM s WHERE dnis IS NOT NULL
+                  (array_agg(d ORDER BY t DESC))[1] AS ld, max(t) AS lt,
+                  (array_agg(c ORDER BY t DESC))[1] AS lc FROM (
+             SELECT dnis AS p, t, d, c FROM s WHERE dnis IS NOT NULL
              UNION ALL
-             SELECT ani, t, d FROM s WHERE ani IS NOT NULL) x
+             SELECT ani, t, d, c FROM s WHERE ani IS NOT NULL) x
             GROUP BY p) b) AS phones
     `), 'five9 day slice');
-    for (const [k, ts, ld, lt] of row?.keys || []) {
+    for (const [k, ts, ld, lt, lc] of row?.keys || []) {
       addTimes(keys, String(k).trim(), ts);
-      keepLast(last, String(k).trim(), lt, ld);
+      keepLast(last, String(k).trim(), lt, ld, lc);
     }
-    for (const [raw, ts, ld, lt] of row?.phones || []) {
+    for (const [raw, ts, ld, lt, lc] of row?.phones || []) {
       const p = normalizePhone10(raw);
-      if (p) { addTimes(phones, p, ts); keepLast(last, p, lt, ld); }
+      if (p) { addTimes(phones, p, ts); keepLast(last, p, lt, ld, lc); }
     }
   }
   for (const list of keys.values()) list.sort((a, b) => a - b);
@@ -780,7 +782,9 @@ export async function measureLeadLeak({ env = process.env, nowMs = Date.now(), d
       created_at_lp: t.lead.created_at_lp ?? null,
       lead_source: t.lead.lead_source ?? null,
       lp_lead_id: String(t.lead.lp_lead_id),
-      reason: CALLED_NO_RETRY_REASON,
+      // 2026-10-16 (Fix 6): the last call was the final After DIAL ASAP try and
+      // nothing has dialed since — the hand-off to the next list did not happen.
+      reason: lastRec?.campaign === 'After DIAL ASAP' ? ATTEMPTS_EXHAUSTED_REASON : CALLED_NO_RETRY_REASON,
       calls: {
         count: calls.length,
         lastMs,
@@ -840,7 +844,8 @@ export async function measureLeadLeak({ env = process.env, nowMs = Date.now(), d
     // Rung before LP stamped them (inquiry stage) and never after — counted as
     // called, kept out of the speed numbers.
     called_before_creation: timing.filter((t) => t.precreate !== null && t.firstCallMs === null).length,
-    called_no_retry: retryWaiting.length,
+    called_no_retry: retryWaiting.filter((r) => r.reason === CALLED_NO_RETRY_REASON).length,
+    attempts_exhausted_not_handed: retryWaiting.filter((r) => r.reason === ATTEMPTS_EXHAUSTED_REASON).length,
     five9: { keys: five9.keys.size, phones: five9.phones.size, first_event_at: new Date(five9.firstAt).toISOString() },
     lookups: { made: lookups, cap: lookupCap, failed: lookupErrors },
     revenueAvailable: !!rates,

@@ -33,7 +33,12 @@
  * appointment (Issue, Sold, ...) is likewise out: a date move there is
  * history, not a slot GHL is still holding.
  */
-export const RESCHEDULE_ELIGIBLE_DISPOSITIONS = new Set(['Set', 'Verif', 'Cnf']);
+//
+// 2026-10-16 (Mark): Verif is a hold ("there is an issue with the lead") and
+// moves nothing, so a Verif date move is not propagated. Cnf stays; Issue is a
+// live appointment now but stays out here — a post-issue date move is LP's
+// post-issue gate's business, not a reschedule echo.
+export const RESCHEDULE_ELIGIBLE_DISPOSITIONS = new Set(['Set', 'Cnf']);
 
 /** Epoch ms for a stored/derived appointment timestamp, or null. */
 function toMs(value) {
