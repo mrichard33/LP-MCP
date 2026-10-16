@@ -218,7 +218,7 @@ function userFrom(raw, fu, userNames) {
   return {
     siro_user_id: id,
     rep_email: (u.email || raw?.userEmail || known?.email || '').toLowerCase() || null,
-    rep_name: name ? String(name).trim() : null,
+    rep_name: name ? String(name).replace(/\s+/g, ' ').trim() : null,
   };
 }
 

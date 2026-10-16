@@ -26,7 +26,7 @@ test('shadow stores the matched row and emits nothing', async () => {
   assert.equal(out.result, 'stored_shadow');
   assert.equal(db.tables.siro_recordings.length, 1);
   assert.equal(db.tables.siro_recordings[0].lp_lead_id, '583321');
-  assert.equal(db.tables.siro_recordings[0].match_method, 'engagement');
+  assert.equal(db.tables.siro_recordings[0].match_method, 'opportunity');
   assert.equal(emitted.length, 0);
   assert.equal((db.tables.agent_actions || []).length, 0);
 });
@@ -210,6 +210,26 @@ test('a reprocess pass re-normalizes stored rows: no event, no note, watermark u
   assert.equal(emitted, 0);
   assert.equal((db.tables.agent_actions || []).length, 0);
   assert.equal(db.tables.siro_sync_state.find(x => x.key === WATERMARK_KEY).value, '2026-10-01T00:00:00.000Z');
+});
+
+test('a list item without Siro\'s follow-up block is fetched whole; an unchanged one is not fetched at all', async () => {
+  const { followups, ...listItem } = RAW_RECORDING; // the LIST call's shape
+  assert.ok(followups.length);
+  const db = fakeSupabase({ siro_recordings: [] });
+  let fetched = 0;
+  const siro = { getRecording: async () => { fetched++; return { ok: true, status: 200, data: RAW_RECORDING }; } };
+  const deps = { supabase: db, siro, readLeads, userNames: new Map(), log: quiet };
+  await processRecording('rec_abc123', { source: 'poll', mode: 'shadow', raw: listItem, onlyIfNewer: true, deps });
+  assert.equal(fetched, 1);
+  const row = db.tables.siro_recordings[0];
+  assert.equal(row.rep_name, 'Brian Kowalski');
+  assert.equal(row.pricing.final_price_quote, '$18,400');
+  const again = await processRecording('rec_abc123', { source: 'poll', mode: 'shadow', raw: listItem, onlyIfNewer: true, deps });
+  assert.equal(again.result, 'unchanged');
+  assert.equal(fetched, 1);
+  // A reprocess fetches again.
+  await processRecording('rec_abc123', { source: 'poll', mode: 'shadow', raw: listItem, onlyIfNewer: true, reprocess: true, deps });
+  assert.equal(fetched, 2);
 });
 
 test('matched rows with no GHL contact get one from lp_leads', async () => {

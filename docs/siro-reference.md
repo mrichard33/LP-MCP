@@ -314,7 +314,7 @@ an LP lead. Payload:
 { "recording_id": "...", "lp_lead_id": "...", "lp_prospect_id": "...", "ghl_contact_id": "...",
   "rep_name": "...", "result": "closed | not closed | in progress", "followup_score": 1-5,
   "objections": ["price", "spouse"], "interests": ["..."],
-  "match_method": "engagement | account | opportunity | phone | none" }
+  "match_method": "opportunity | account | phone | none" }
 ```
 
 Rule examples (commented out): `sql/seeds/2026-10-16_siro_rules_EXAMPLES.sql`.

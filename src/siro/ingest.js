@@ -52,6 +52,11 @@ export function leadReader(supabase) {
   };
 }
 
+function hasFollowupContext(rec) {
+  const f = rec?.followups;
+  return Array.isArray(f) && f.some(x => Array.isArray(x?.context) && x.context.length);
+}
+
 export function rowMatchesConversationType(row, env = process.env) {
   const want = siroConfig(env).presentationConversationType;
   return !want || !row.conversation_type || row.conversation_type === want;
@@ -136,8 +141,19 @@ export async function processRecording(recordingId, {
   const log = deps.log || console.log;
   if (!supabase) return { result: 'no_database' };
 
+  // An unchanged recording is skipped before any Siro call (the poll re-reads
+  // the watermark minute every pass).
+  if (raw && onlyIfNewer && !reprocess && raw.updatedAt) {
+    const held = await readStored(supabase, String(raw.id || recordingId));
+    if (held?.updated_at_siro && held.lp_lead_id
+      && Date.parse(held.updated_at_siro) >= Date.parse(raw.updatedAt)) return { result: 'unchanged' };
+  }
   let rec = raw;
-  if (!rec || !Array.isArray(rec.summary)) {
+  // The LIST call returns the summary but not Siro's follow-up block (rep name,
+  // objections, follow-up timing, quotes): all 158 rows the first reprocess
+  // stored from it had no rep and no prices (2026-10-16). Only the single-record
+  // GET carries it, so a list item without it is fetched whole.
+  if (!rec || !Array.isArray(rec.summary) || !hasFollowupContext(rec)) {
     const res = await siro.getRecording(recordingId);
     if (!res.ok) return { result: res.status === 404 ? 'not_found' : 'fetch_failed', error: res.error };
     rec = res.data?.data && res.data.data.id ? res.data.data : res.data;
@@ -155,7 +171,7 @@ export async function processRecording(recordingId, {
 
   let match;
   try {
-    match = await resolveLead(row, { readLeads: deps.readLeads || leadReader(supabase), log });
+    match = await resolveLead(row, { readLeads: deps.readLeads || leadReader(supabase) });
   } catch (err) {
     log(`[Siro] lead resolve failed for ${row.recording_id}: ${err.message}`);
     match = { lp_lead_id: stored?.lp_lead_id || null, lp_prospect_id: null, ghl_contact_id: stored?.ghl_contact_id || null, match_method: 'none' };
