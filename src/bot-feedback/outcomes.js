@@ -22,6 +22,7 @@ import {
   FRESHNESS_MAX_AGE_MS,
   SCAN_LOOKBACK_MS,
   computeOutcome,
+  frameworkFor,
   isSourceFresh,
 } from './outcomes-core.js';
 
@@ -183,6 +184,11 @@ export async function syncOutcomes({ now = Date.now(), limit = BATCH_LIMIT } = {
   const apptsBy = byContact(apptRes.data);
   const contactBy = new Map((contactRes.data ?? []).map((c) => [c.ghl_contact_id, c]));
 
+  // 4b. The plan each reply was written under (2026-10-16, framework cleanup
+  //     Phase 0): LP's own agent_actions rows, keyed by message_ref. A failed
+  //     read leaves bot_outcomes.framework untouched for the whole batch.
+  const plans = await readReplyPlans(pending);
+
   // 5. Compute + upsert.
   const rows = [];
   for (const ctx of pending) {
@@ -193,6 +199,9 @@ export async function syncOutcomes({ now = Date.now(), limit = BATCH_LIMIT } = {
       contact: contactBy.get(ctx.ghl_contact_id) ?? null,
       sourceFresh: freshness.fresh,
       now,
+      framework: plans
+        ? frameworkFor({ messageType: ctx.message_type, executionResult: plans.get(String(ctx.message_ref)) })
+        : undefined,
     });
     if (row) rows.push(row);
   }
@@ -200,9 +209,18 @@ export async function syncOutcomes({ now = Date.now(), limit = BATCH_LIMIT } = {
   let written = 0;
   const finalized = rows.filter((r) => r.final).length;
   if (rows.length) {
-    const { error: upsertError } = await supabase
+    let { error: upsertError } = await supabase
       .from('bot_outcomes')
       .upsert(rows, { onConflict: 'message_type,message_ref' });
+    // 2026-10-16: Railway can boot this code before CI has applied the
+    // migration that adds bot_outcomes.framework. Outcomes matter more than
+    // the tag, so write them without it rather than fail the whole pass.
+    if (upsertError && /framework/i.test(upsertError.message || '') && rows.some((r) => 'framework' in r)) {
+      console.warn(`[BotOutcomes] framework column not writable yet (${upsertError.message}); writing outcomes without it`);
+      ({ error: upsertError } = await supabase
+        .from('bot_outcomes')
+        .upsert(rows.map(({ framework, ...rest }) => rest), { onConflict: 'message_type,message_ref' }));
+    }
     if (upsertError) {
       console.error(`[BotOutcomes] upsert failed: ${upsertError.message}`);
       return { ok: false, reason: upsertError.message, started_at: startedAt };
@@ -228,4 +246,28 @@ export async function syncOutcomes({ now = Date.now(), limit = BATCH_LIMIT } = {
   return summary;
 }
 
-export default { syncOutcomes, readHlFreshness };
+/**
+ * The execution_result of each reply's agent_actions row, by message_ref
+ * (2026-10-16). Only the two plan fields and the cancel-flow marker are read.
+ * Returns null when the read fails: the caller then leaves `framework` out of
+ * every row instead of writing a guess over a value already stored.
+ */
+export async function readReplyPlans(pending, { db = supabase } = {}) {
+  const ids = [...new Set(pending.filter((c) => c.message_type === 'reply')
+    .map((c) => Number(c.message_ref)).filter((n) => Number.isSafeInteger(n) && n > 0))];
+  const out = new Map();
+  for (let i = 0; i < ids.length; i += 200) {
+    const { data, error } = await db
+      .from('agent_actions')
+      .select('id, nepq_plan:execution_result->nepq_plan, nepq:execution_result->nepq, cancel_flow:execution_result->cancel_flow')
+      .in('id', ids.slice(i, i + 200));
+    if (error) {
+      console.warn(`[BotOutcomes] agent_actions plan read failed (framework left unset): ${error.message}`);
+      return null;
+    }
+    for (const r of data ?? []) out.set(String(r.id), { nepq_plan: r.nepq_plan ?? null, nepq: r.nepq ?? null, cancel_flow: r.cancel_flow ?? null });
+  }
+  return out;
+}
+
+export default { syncOutcomes, readHlFreshness, readReplyPlans };

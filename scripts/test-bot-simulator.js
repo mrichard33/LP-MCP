@@ -118,3 +118,19 @@ test('live-chat-only scenarios skip SMS; request parsing refuses bad input', asy
   assert.equal(parseSimRequest({ messages_json: '["hi"]' }).turns[0], 'hi');
   assert.ok(Object.keys(SCENARIOS).length >= 14);
 });
+
+// 2026-10-16 (framework cleanup, Phase 0): a rehash persona reaches the reply
+// writer as a post-demo lead: its tags and its OPPFDN LP lead inside 30 days.
+test('SMS: a persona\'s tags and its LP demo date reach the simulated context', async () => {
+  let seen = null;
+  const generate = async (_id, _ch, _text, opts) => { seen = opts.simulatedContext; return { message: 'Of course.', nepq_plan: { post_demo: true, step: 'post_demo' } }; };
+  const nowMs = Date.parse('2026-10-16T15:00:00Z');
+  await simulateSms(resolveScenario({ scenario: 'rehash_defer' }), { nepqMode: 'live', generate, nowMs });
+  assert.deepEqual(seen.lead.current_tags, ['rehash']);
+  assert.equal(seen.lp.disposition, 'OPPFDN');
+  const days = (nowMs - Date.parse(seen.lp.last_appointment_date)) / 86_400_000;
+  assert.ok(days >= 6.9 && days <= 7.1, `demo ${days} days ago`);
+  for (const k of ['rehash_not_at_this_time', 'rehash_competitor_signed', 'rehash_defer', 'rehash_repeat_objection', 'rehash_book_call']) {
+    assert.deepEqual(SCENARIOS[k].channels, ['sms'], `${k} is SMS only`);
+  }
+});

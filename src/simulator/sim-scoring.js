@@ -28,6 +28,10 @@ import { isCallPromise } from '../agentic/promised-callbacks.js';
 
 // 2026-10-12 (handoff PR 7): the scenario checks have their own version. A run
 // scored with new checks is a new baseline, never "worse" than an old one.
+// 2026-10-16 (framework cleanup, Phase 0): bump only when a check's meaning
+// changes; a bump makes the next run a new baseline and disables the WORSE
+// gate. A NEW scenario is not a bump: compareScorecards scores the pass rate
+// over the scenarios both runs share and lists new ones apart.
 export const SCORING_VERSION = '2026-10-13.3';
 
 const CLOCK_RX = /\b\d{1,2}(?::\d{2})?\s*(?:AM|PM)\b/gi;
@@ -196,7 +200,78 @@ export const SCENARIO_EXPECTATIONS = Object.freeze({
     }
     return out;
   },
+  // ── 2026-10-16 (framework cleanup, Phase 0): the post-demo rehash track ──
+  // Rulings: "A post-demo objection gets one ask-back, one bridge, then a
+  // person; two no's stop the selling" (Shawn Eastman, 2026-10-15), "A
+  // post-demo lead is planned as post-demo" (Mark, 2026-10-09), "Calls, not
+  // visits" (the user, 2026-10-09). The checks read the plan, not wording.
+  rehash_not_at_this_time: (r) => {
+    const out = rehashLaneFailures(r);
+    const steps = planSteps(r);
+    if (steps.filter(s => s === 'rehash_objection').length > 1) out.push({ code: 'ask_back_repeated', detail: 'more than one post-demo ask-back' });
+    if (steps.filter(s => s === 'rehash_offer' || s === 'rehash_bridge').length > 1) out.push({ code: 'bridge_repeated', detail: 'more than one post-demo bridge' });
+    const last = (r.transcript || []).at(-1);
+    const lastStep = String(last?.nepq?.step || '');
+    if (!['post_demo_stop', 'handoff'].includes(lastStep)) out.push({ code: 'no_stop_after_two_nos', detail: `last step ${lastStep || 'none'}`, turn: last?.turn });
+    if (replies(last).some(x => x.includes('?'))) out.push({ code: 'question_after_two_nos', detail: replies(last).join(' '), turn: last?.turn });
+    return out;
+  },
+  rehash_competitor_signed: (r) => {
+    const out = rehashLaneFailures(r);
+    const first = (r.transcript || [])[0];
+    if (first && first.nepq?.step !== 'competitor_signed') out.push({ code: 'competitor_not_recognised', detail: `step ${first.nepq?.step || 'none'}`, turn: first.turn });
+    for (const { turn: n, text } of allReplies(r)) {
+      if (clockCount(text)) out.push({ code: 'times_after_competitor', detail: text, turn: n });
+      if (text.includes('?')) out.push({ code: 'selling_after_competitor', detail: text, turn: n });
+    }
+    return out;
+  },
+  rehash_defer: (r) => {
+    const out = rehashLaneFailures(r);
+    const first = (r.transcript || [])[0];
+    if (first && first.nepq?.step !== 'defer') out.push({ code: 'deferral_not_recognised', detail: `step ${first.nepq?.step || 'none'}`, turn: first.turn });
+    if (first && replies(first).length > 1) out.push({ code: 'more_than_one_ack', detail: `${replies(first).length} replies`, turn: first.turn });
+    for (const { turn: n, text } of allReplies(r)) if (clockCount(text)) out.push({ code: 'times_after_deferral', detail: text, turn: n });
+    return out;
+  },
+  rehash_repeat_objection: (r) => {
+    const out = rehashLaneFailures(r);
+    const last = (r.transcript || []).at(-1);
+    if (last?.nepq?.handoff?.reason !== 'rehash_repeat_objection') out.push({ code: 'no_person_after_repeat_objection', detail: `last step ${last?.nepq?.step || 'none'}`, turn: last?.turn });
+    // A rehash hand-off is a #contact-rehash card, never a Five9 dial (REHASH_REASONS / NO_DIAL_REASONS).
+    if (did(r, /would_file_callback_five9/)) out.push({ code: 'rehash_dialed', detail: 'a rehash hand-off was filed to Five9' });
+    return out;
+  },
+  rehash_book_call: (r) => {
+    const out = rehashLaneFailures(r);
+    if (!planSteps(r).includes('rehash_offer')) out.push({ code: 'no_rehash_call_times', detail: 'no Rehash Call times were offered' });
+    const books = wouldDo(r).filter(w => w.kind === 'would_book_appointment');
+    if (!books.some(w => w.payload?.rehash_call === true)) out.push({ code: 'rehash_call_not_booked', detail: 'no Rehash Call booking' });
+    const confirm = (r.transcript || []).find(t => t.nepq?.step === 'rehash_confirm');
+    // The caller named is the one the calendar read gave, or "Someone from our team": never a guess.
+    if (confirm && !replies(confirm).some(x => /\bgive\s+you\s+a\s+call\b/i.test(x))) out.push({ code: 'rehash_confirm_no_caller', detail: replies(confirm).join(' '), turn: confirm.turn });
+    return out;
+  },
 });
+
+/** The NEPQ plan steps of a run, in order. Pure. */
+const planSteps = (r) => (r.transcript || []).map(t => String(t.nepq?.step || '')).filter(Boolean);
+
+/**
+ * What every rehash scenario must do (2026-10-16): each turn is planned as
+ * post-demo, and nothing is booked or offered but a Rehash Call (a rehash lead
+ * is never booked into an in-home visit, 2026-10-09). Pure.
+ */
+function rehashLaneFailures(r) {
+  const out = [];
+  for (const t of r.transcript || []) {
+    if (replies(t).length && t.nepq?.post_demo !== true) out.push({ code: 'not_planned_as_post_demo', detail: `step ${t.nepq?.step || 'none'}`, turn: t.turn });
+  }
+  for (const w of wouldDo(r)) {
+    if (w.kind === 'would_book_appointment' && w.payload?.rehash_call !== true) out.push({ code: 'rehash_booked_visit', detail: String(w.payload?.calendar_name || w.payload?.calendar_id || 'a non-rehash calendar'), turn: w.turn });
+  }
+  return out;
+}
 
 /** Did the run book, move or hold a time (code-backed), at any turn? Pure. */
 function bookedOrHeld(r) {
@@ -300,6 +375,10 @@ export function scoreResult(result) {
         // offering it is the plan, not an unasked offer.
         // The third price ask's call offer is the plan too (the owner, 2026-10-13).
         callOfferOk: t.nepq?.post_demo === true || t.nepq?.call_offer_ok === true,
+        // 2026-10-16: a post-demo turn gets the post-demo hard checks
+        // (post_demo_rebuttal, post_demo_unbacked_follow_up,
+        // question_after_post_demo_stop). Any other turn skips them, as before.
+        ...(t.nepq?.post_demo === true ? { postDemoStep: String(t.nepq.step || '') || null, postDemoLead: true } : {}),
       });
       for (const v of check.violations) failures.push({ code: v.code, detail: v.detail, turn: t.turn });
       conversation.push({ direction: 'outbound', text });
@@ -336,10 +415,17 @@ export function scoreRun(results, meta = {}) {
 }
 
 /**
- * Is this run worse than the last one? Worse = a lower pass rate, or a
- * conversation that passed last time and fails now. A run against a
- * different set of checks (INVARIANTS_VERSION) is reported, not compared:
- * a new check failing old behaviour is not a regression of the bot. Pure.
+ * Is this run worse than the last one? Worse = a lower pass rate over the
+ * conversations BOTH runs scored, or a conversation that passed last time and
+ * fails now. A run against a different set of checks (INVARIANTS_VERSION,
+ * SCORING_VERSION) is reported, not compared: a new check failing old
+ * behaviour is not a regression of the bot. Pure.
+ *
+ * 2026-10-16 (framework cleanup, Phase 0): a scenario new in this run is
+ * listed in `new_keys` and never makes the run worse. Before, adding five
+ * rehash scenarios moved the pass-rate denominator, so one failing new
+ * scenario read "WORSE THAN LAST RUN" with nothing old broken, which would
+ * have forced a version bump and switched the gate off for that run.
  */
 export function compareScorecards(current, previous) {
   if (!previous) return { compared: false, worse: null, reasons: ['no earlier run to compare with'] };
@@ -354,20 +440,31 @@ export function compareScorecards(current, previous) {
     return { compared: false, worse: null, reasons: [`the scenario checks changed (${previous.scoring_version || 'none'} → ${current.scoring_version || 'none'}); this run is the new baseline`] };
   }
   const reasons = [];
-  if (current.pass_rate != null && previous.pass_rate != null && current.pass_rate < previous.pass_rate) {
-    reasons.push(`pass rate fell from ${Math.round(previous.pass_rate * 100)}% to ${Math.round(current.pass_rate * 100)}%`);
-  }
   const before = new Map((previous.results || []).map(r => [r.key, r.pass]));
-  for (const r of current.results || []) {
+  const currentResults = current.results || [];
+  const shared = currentResults.filter(r => before.has(r.key));
+  const newKeys = currentResults.filter(r => !before.has(r.key)).map(r => ({ key: r.key, pass: !!r.pass }));
+  // The pass rate over the shared conversations; a saved run with no per-key
+  // results (none today, but an older payload could lack them) falls back to
+  // the whole-run rates.
+  const rate = (rows, map) => (rows.length ? rows.filter(map).length / rows.length : null);
+  const prevRate = before.size ? rate(shared, r => before.get(r.key) === true) : previous.pass_rate;
+  const curRate = before.size ? rate(shared, r => !!r.pass) : current.pass_rate;
+  if (curRate != null && prevRate != null && curRate < prevRate) {
+    reasons.push(`pass rate fell from ${Math.round(prevRate * 100)}% to ${Math.round(curRate * 100)}% over the ${before.size ? `${shared.length} shared` : 'same'} conversations`);
+  }
+  for (const r of shared) {
     if (before.get(r.key) === true && !r.pass) reasons.push(`${r.key} passed last run and now fails (${r.failures.map(f => f.code).join(', ')})`);
   }
-  return { compared: true, worse: reasons.length > 0, reasons };
+  return { compared: true, worse: reasons.length > 0, reasons, new_keys: newKeys };
 }
 
 /** One short block for a person, worst first. Pure. */
 export function formatScorecard(card, comparison = null) {
   const lines = [`Scorecard: ${card.passed}/${card.conversations} conversations pass (${Math.round((card.pass_rate || 0) * 100)}%) · checks ${card.invariants_version}${card.prompt_version ? ` · prompt ${card.prompt_version}` : ''}${card.git_sha ? ` · ${String(card.git_sha).slice(0, 7)}` : ''}${card.kb_exemplar_mode ? ` · exemplars ${card.kb_exemplar_mode}` : ''}`];
   if (comparison) lines.push(comparison.worse === true ? `WORSE THAN LAST RUN: ${comparison.reasons.join('; ')}` : comparison.worse === false ? 'Not worse than the last run.' : `Not compared: ${comparison.reasons.join('; ')}`);
+  // New scenarios are reported, never counted against the run (2026-10-16).
+  if (comparison?.new_keys?.length) lines.push(`New this run (not compared): ${comparison.new_keys.map(k => `${k.key} ${k.pass ? 'pass' : 'FAIL'}`).join(', ')}`);
   for (const r of card.results.filter(x => !x.pass)) {
     lines.push(`  ✗ ${r.key}: ${r.failures.slice(0, 4).map(f => `${f.code}${f.turn ? `@${f.turn}` : ''}`).join(', ')}${r.failures.length > 4 ? ` (+${r.failures.length - 4})` : ''}`);
   }

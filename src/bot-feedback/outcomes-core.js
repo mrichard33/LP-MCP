@@ -217,6 +217,37 @@ export function isWindowClosed(sentAt, now = Date.now(), windowMs = BOOKING_WIND
   return now > base + windowMs;
 }
 
+/** The framework values bot_outcomes.framework accepts (2026-10-16). */
+export const FRAMEWORKS = Object.freeze(['nepq', 'nepq_rehash', 'logistics', 'none']);
+
+/**
+ * Which framework wrote this send (2026-10-16, framework cleanup Phase 0).
+ *
+ * Mark's 2026-10-15 decision makes NEPQ the only framework in the conversation
+ * prompt; booked % and opt-out % have to be read per framework to know whether
+ * that helped, and bot_outcomes held no trace of the plan. The plan lives on
+ * the reply's agent_actions row (bot_message_context.message_ref = its id):
+ * SMS stores `execution_result.nepq_plan`, the live chat `execution_result.nepq`.
+ *
+ *   logistics    a cancel / reschedule flow turn (live chat's cancel_flow)
+ *   nepq_rehash  the post-demo planner planned it (the rehash lane)
+ *   nepq         any other turn with a live NEPQ plan
+ *   none         no live plan, or not a conversation reply (nurture)
+ *   null         the reply's action row is unknown: never a guess
+ *
+ * Pure.
+ */
+export function frameworkFor({ messageType, executionResult } = {}) {
+  if (messageType !== 'reply') return 'none';
+  if (!executionResult || typeof executionResult !== 'object') return null;
+  const plan = executionResult.nepq_plan || executionResult.nepq || null;
+  const step = String(plan?.step || plan?.required_move || '');
+  if (executionResult.cancel_flow || step === 'cancel_flow' || /^reschedule/.test(step)) return 'logistics';
+  if (plan?.post_demo === true) return 'nepq_rehash';
+  if (plan && plan.mode === 'live') return 'nepq';
+  return 'none';
+}
+
 /**
  * Compute one bot_outcomes row.
  *
@@ -232,6 +263,9 @@ export function computeOutcome({
   contact = null,
   sourceFresh = false,
   now = Date.now(),
+  // 2026-10-16: frameworkFor() of the send; undefined leaves the column out
+  // of the row, so a failed plan read never erases a value already written.
+  framework = undefined,
 }) {
   const sentAt = iso(context?.sent_at);
   if (!sentAt) return null;
@@ -251,6 +285,7 @@ export function computeOutcome({
     source_fresh: !!sourceFresh,
     checked_at: new Date(now).toISOString(),
     final: !!sourceFresh && isWindowClosed(sentAt, now),
+    ...(framework !== undefined ? { framework } : {}),
   };
 }
 
