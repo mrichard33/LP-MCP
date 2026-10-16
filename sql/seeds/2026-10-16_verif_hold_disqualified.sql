@@ -82,6 +82,19 @@ WITH u AS (
   RETURNING 1)
 SELECT count(*) FROM u;
 
+-- Rule 171 GHL_APPT_CANCELLED_REBOOK_COLD skips a disqualified current lead UP FRONT (new verb
+-- lp_disposition_not_in, src/decision-engine.js), not only through the late lp_note_dq read
+-- (Avila, LP 583486). Expect 1.
+WITH u AS (
+  UPDATE agent_rules SET
+    context_conditions = context_conditions || '{"lp_disposition_not_in":["ND","No Demo"]}'::jsonb,
+    version = coalesce(version,1) + 1, updated_at = now(),
+    notes = coalesce(notes,'') || E'\n2026-10-16: lp_disposition_not_in [ND, No Demo] — a disqualified lead is never rebooked or rescued (Mark, handoff v3.4 Fix 2).'
+  WHERE rule_key = 'GHL_APPT_CANCELLED_REBOOK_COLD'
+    AND NOT (context_conditions ? 'lp_disposition_not_in')
+  RETURNING 1)
+SELECT count(*) FROM u;
+
 -- Then reload: POST https://lp-mcp-production.up.railway.app/n8n/decision-engine/reload-rules
 
 -- ROLLBACK:
@@ -89,3 +102,4 @@ SELECT count(*) FROM u;
 -- UPDATE agent_rules SET conditions = jsonb_set(conditions,'{event_subtype_in}','["Set","Cnf","Verif"]'::jsonb), updated_at = now() WHERE rule_key = 'DNC_LIFT_ON_REENGAGEMENT_LP';
 -- UPDATE agent_rules SET conditions = jsonb_set(conditions,'{event_subtype_not_in}','["Set","Cnf","Verif"]'::jsonb), updated_at = now() WHERE rule_key = 'RECONCILE_LP_DNC_ON_LINK';
 -- UPDATE agent_rules SET enabled = FALSE, updated_at = now() WHERE rule_key = 'LP_DISP_DISQUALIFIED';
+-- UPDATE agent_rules SET context_conditions = context_conditions - 'lp_disposition_not_in', updated_at = now() WHERE rule_key = 'GHL_APPT_CANCELLED_REBOOK_COLD';

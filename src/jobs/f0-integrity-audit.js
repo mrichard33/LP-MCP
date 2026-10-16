@@ -168,6 +168,7 @@ const S52_REASON_TEXT = {
   live_appointment: 'has a live appointment',
   current_lead_issue: 'current lead is Issue',
   current_lead_no_demo: 'current lead is No Demo / ND / NOC',
+  current_lead_disqualified: 'current lead is ND / No Demo (disqualified)',
 };
 
 /** Pure. The Slack card for NEW items only. */

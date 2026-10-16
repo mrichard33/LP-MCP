@@ -1048,7 +1048,7 @@ const IO_BACKED_CONDITION_KEYS = new Set([
   'has_tag_prefix', 'not_has_tag_prefix', 'not_has_any_tag_prefix',
   'custom_field_eq', 'custom_field_in',
   // lp_leads / demo state
-  'lp_disposition_in', 'demo_state_eq', 'lp_current_lead_match', 'lp_had_demo',
+  'lp_disposition_in', 'lp_disposition_not_in', 'demo_state_eq', 'lp_current_lead_match', 'lp_had_demo',
   // appointment lookups
   'not_active_in_home_appointment', 'not_reschedule_inflight',
   'not_duplicate_lead_live_appointment', 'no_future_appointment',
@@ -1608,6 +1608,30 @@ async function evaluateContextConditions(conditions, intelligence, event, opts =
         const disp = lpLead.disposition_code || null;
         if (!allowed.includes(disp)) {
           console.log(`[Context] BLOCKED: lp_disposition "${disp}" not in [${allowed.join(',')}]`);
+          return false;
+        }
+        break;
+      }
+
+      // 2026-10-16 (handoff v3.4 Fix 2) — the CURRENT lead's disposition is NOT
+      // in the list. Lets a cancel rule (171 GHL_APPT_CANCELLED_REBOOK_COLD) skip
+      // a disqualified lead (ND / No Demo) up front instead of relying on the
+      // late lp_note_dq read. A contact with no LP lead has no disposition, so
+      // it passes (nothing to exclude); a failed read fails CLOSED.
+      case 'lp_disposition_not_in': {
+        const blocked = Array.isArray(expected) ? expected : [expected];
+        const ninContactId = event.ghl_contact_id;
+        if (!ninContactId) return notApplicableNoContact(key);
+        const ninDb = opts.deps?.supabase !== undefined ? opts.deps.supabase : supabase;
+        let ninLead;
+        try {
+          ninLead = await fetchCurrentLead(ninContactId, ninDb);
+        } catch (lpErr) {
+          return failClosed(key, `lp_leads lookup failed: ${lpErr.message}`);
+        }
+        const ninDisp = ninLead?.disposition_code || null;
+        if (ninDisp !== null && blocked.includes(ninDisp)) {
+          console.log(`[Context] BLOCKED: lp_disposition "${ninDisp}" is in [${blocked.join(',')}] (rule ${ruleKey || '?'})`);
           return false;
         }
         break;
