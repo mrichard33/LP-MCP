@@ -1397,7 +1397,8 @@ function planNepqTurnCore({
   // loads slots near "2 PM", found a 2 PM among them, and took it as a pick
   // of an offer that never named it).
   const allPool = Array.isArray(allSlots) ? allSlots.map(s => ({ ...s, tz: s.tz || tzLabel || '' })) : [];
-  const offeredInThread = lastOfferOut ? allPool.filter(s => slotMentionIndex(lastOfferOut, s) >= 0) : offerSlots;
+  // A weekday named without its date is the nearest one (2026-10-16, soonestPerWeekday).
+  const offeredInThread = lastOfferOut ? offeredIn(lastOfferOut, allPool) : offerSlots;
   if (offerSlots.length && allPool.length >= 2 && !nowAsks && !PREF_WORD_RX.test(now) && !/\b(?:can'?t|cannot|not|won'?t|busy|except)\b/i.test(now) && typedClock(now) != null && !exactSlotFor(now, offeredInThread)) {
     const all = allPool;
     // A day AND time they typed that is open ("Sunday at 2 PM") is the pick.
