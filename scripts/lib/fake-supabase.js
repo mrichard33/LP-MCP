@@ -14,6 +14,8 @@ export const NOT_NULL = Object.freeze({
   marketing_expenses: ['amount', 'period_start', 'period_end', 'lp_sub_sources', 'eligible_markets', 'cost_type'],
   marketing_invoice_documents: ['sha256'],
   marketing_invoice_skips: ['sha256', 'reason'],
+  // 2026-10-16: supabase/migrations/20261016180000_confirmation_pipeline.sql.
+  confirmation_opportunities: ['lp_lead_id', 'ghl_contact_id', 'stage_key', 'last_moved_by'],
 });
 
 function notNullViolation(table, rows) {
@@ -43,7 +45,7 @@ export function fakeSupabase(seed = {}, { rpc = {} } = {}) {
     if (q.op === 'select') {
       let out = rows.filter(match);
       if (q.order) out = [...out].sort((a, b) => (a[q.order[0]] > b[q.order[0]] ? 1 : a[q.order[0]] < b[q.order[0]] ? -1 : 0) * (q.order[1] ? 1 : -1));
-      if (q.limit != null) out = out.slice(0, q.limit);
+      if (q.limit != null) out = out.slice(q.offset || 0, (q.offset || 0) + q.limit);
       data = out.map((r) => ({ ...r }));
     } else if (q.op === 'insert') {
       const list = (Array.isArray(q.payload) ? q.payload : [q.payload]).map((r) => ({ id: randomUUID(), created_at: new Date().toISOString(), ...r }));
@@ -104,6 +106,9 @@ export function fakeSupabase(seed = {}, { rpc = {} } = {}) {
       like(c, pat) { const rx = new RegExp('^' + String(pat).replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/%/g, '.*') + '$'); q.filters.push((r) => rx.test(String(r[c] ?? ''))); return chain; },
       order(c, o) { q.order = [c, o?.ascending !== false]; return chain; },
       limit(n) { q.limit = n; return chain; },
+      // 2026-10-16: range() pages like the real client; not(c, 'is', null) only.
+      range(a, b) { q.offset = a; q.limit = b - a + 1; return chain; },
+      not(c, op, v) { q.filters.push(op === 'is' ? (r) => r[c] != v : (r) => r[c] !== v); return chain; },
       maybeSingle() { q.single = 'maybe'; return chain; },
       single() { q.single = 'one'; return chain; },
       then(res, rej) { try { return Promise.resolve(exec(q)).then(res, rej); } catch (e) { return Promise.reject(e).then(res, rej); } },

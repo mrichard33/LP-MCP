@@ -405,6 +405,25 @@ No Demo; GHL status Set → new, Cnf / Issue → confirmed, never Set → confir
   every guard. So a skip answers `noop_already_exists` + `{ ok: true, booked: false, skipped: true, reason }`; only a real
   failure answers `error`. Never return another outcome for a deliberate skip.
 
+**Every LP appointment has ONE card in "4. Confirmation Pipeline", and only LP MCP moves it (handoff, 2026-10-16).**
+Pipeline `ThrBNpyzJhAON4WFC855`; no GHL workflow may trigger on it. Rules `CONF_PIPE_SET/VERIF/CNF/ND/CXL` queue
+`sync_confirmation_opportunity` (`src/actions/handlers/confirmation-pipeline-sync.js`), which re-reads the contact's
+NEWEST lp_leads row. The decisions live in `src/confirmation-pipeline/rules.js`: past (appointment + 2h, or a date before
+today ET) → close (Confirmed won, Disqualified lost, else abandoned), CXL → abandoned, ND / No Demo → Disqualified (`isDisqualifiedDisposition`), Cnf →
+Confirmed, Verif → Issue Detected (wins over the 24h rule; moving the card is the ONLY thing Verif starts, in line with the hold above), Set under 24h → Confirm Now, Set → New. `Issue` (issued to a
+rep) is not mapped. Confirmed and Disqualified are locked: only ND, a Set at a new time and the close get out. A live
+stage that differs from the stored one is a person's move: kept against the clock, and given way only to a NEWER LP
+change. GHL allows one card per contact per pipeline, so a returning homeowner's new lead re-points the contact's card
+(the user, 2026-10-16). Jobs: `confirmation-pipeline-clock` (15 min: 24h move, close, one 4h alert to
+`CONF_SLACK_CHANNEL`) and `confirmation-pipeline-sweep` (00:05 ET: every open card in GHL dated before today, or with no readable date, is
+closed; a failed contact read closes nothing). The board holds only appointments still scheduled (the user,
+2026-10-16): a lead whose appointment LP cleared closes its card abandoned, unless the card's own lead still holds an
+upcoming visit (a new inquiry with no appointment does not close it). `CONF_PIPE_DRY_RUN` is TRUE unless set to `false`: log only
+(`confirmation_opportunity_log`), rows marked `dry_run`. Go-live: `POST /admin/confirmation-pipeline/backfill` and
+`/sweep`. Every GHL search there carries `pipeline_id`; never touch "5. Canvass Confirmation Pipeline" or a calendar
+appointment from it. The bot's `fetchOpportunity` ignores both confirmation boards (not "P1 only": `isCustomerP2` reads
+P2 there), and `move_opportunity`'s duplicate-400 recovery no longer PUTs onto a card in another pipeline.
+
 **A held appointment asks a person to import its LP row (2026-10-05).** When LP already has an unimported
 inbound row for a contact, `syncAppointmentToLP` holds the appointment (`lp-appt-deferred`) rather than add a
 duplicate lead, and the parity watchdog re-drives it every 30 min. LP has no API that imports a row, so once a
