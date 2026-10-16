@@ -648,8 +648,9 @@ upserts `siro_recordings`. Live only: one `siro.recording_processed` event (key 
 (`SIRO_DEMO_NOTE`, claimed on `ghl_note_action_id` before the insert). Siro's own LP integration writes the LP note;
 we never add one.
 - **The webhook fails closed.** Every request needs a valid svix signature (`SIRO_WEBHOOK_SECRET`, raw body; the
-  parser is mounted before `express.json`) AND the header `x-reece-webhook-key` equal to `SIRO_WEBHOOK_HEADER_KEY`
-  (constant time). Either unset, missing or wrong → 401, in every mode. Never log either value.
+  parser is mounted before `express.json`; `svix-*` or `webhook-*` header names). Unset, missing or wrong → 401, in
+  every mode. Never log the secret. The extra `x-reece-webhook-key` header was removed by the user's ruling
+  (2026-10-16): do not add it back without one.
 - **The reply path reads Supabase, never Siro live.** A post-demo / rehash lead gets the PRESENTATION block in LEAD
   FACTS (`SIRO_CONTEXT_MODE`, `src/siro/context-read.js`), and Siro's own LP note is dropped from the notes then.
   The block is data, not instructions: `enforcePresentationGuard` drops a dollar figure or "your rep said" sentence,
