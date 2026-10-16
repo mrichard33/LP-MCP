@@ -5,10 +5,11 @@
  * (docs/siro-reference.md §3). They arrive in either order and every payload
  * carries both flags; we act only when BOTH are true.
  *
- *   - Verified with the svix library against SIRO_WEBHOOK_SECRET on the RAW
- *     body (express.raw is mounted on this path ahead of the global parsers in
- *     src/index.js). Unset secret → 503, the Slack posture: refuse rather than
- *     accept unsigned bytes. A bad signature → 401.
+ *   - EVERY request is verified first, in every mode, with the svix library
+ *     against SIRO_WEBHOOK_SECRET on the RAW body (express.raw is mounted on
+ *     this path ahead of the global parsers in src/index.js). A missing or bad
+ *     signature → 401; an unset secret refuses everything, also 401 (the
+ *     user, 2026-10-16: an unsigned POST must read 401, never 404 or 503).
  *   - siro_webhook_events is keyed on svix-id: a redelivery is answered 200
  *     and does no work (CANON.K.072).
  *   - The answer goes out first; the fetch / match / store runs after it in
@@ -33,8 +34,11 @@ export function readyToAct(payload) {
 }
 
 export function verifySiroSignature(rawBody, headers, secret) {
-  if (!secret) return { ok: false, status: 503, error: 'SIRO_WEBHOOK_SECRET unset' };
+  if (!secret) return { ok: false, status: 401, error: 'SIRO_WEBHOOK_SECRET unset' };
   if (!Buffer.isBuffer(rawBody)) return { ok: false, status: 400, error: 'raw body missing' };
+  if (!headers['svix-id'] || !headers['svix-timestamp'] || !headers['svix-signature']) {
+    return { ok: false, status: 401, error: 'signature headers missing' };
+  }
   try {
     const payload = new Webhook(secret).verify(rawBody.toString('utf8'), {
       'svix-id': headers['svix-id'],
@@ -52,13 +56,12 @@ export function makeSiroWebhookHandler({ env = process.env, deps = {} } = {}) {
     const supabase = deps.supabase || supabaseDefault;
     const track = deps.trackBackground || trackBackground;
     const mode = siroModes(env).webhook;
-    if (mode === 'off') return res.status(200).json({ ok: true, mode: 'off' });
-
     const v = verifySiroSignature(req.body, req.headers || {}, siroConfig(env).webhookSecret);
     if (!v.ok) {
       console.warn(`[Siro] webhook refused: ${v.error}`);
       return res.status(v.status).json({ ok: false, error: v.error });
     }
+    if (mode === 'off') return res.status(200).json({ ok: true, mode: 'off' });
     const p = v.payload || {};
     const svixId = String(req.headers['svix-id'] || '');
     const recordingId = p.recordingId ? String(p.recordingId) : '';
@@ -98,6 +101,7 @@ export function makeSiroWebhookHandler({ env = process.env, deps = {} } = {}) {
   };
 }
 
-export function registerSiroWebhookRoutes(app) {
-  app.post('/webhook/siro', makeSiroWebhookHandler());
+export function registerSiroWebhookRoutes(app, env = process.env) {
+  app.post('/webhook/siro', makeSiroWebhookHandler({ env }));
+  console.log(`[Siro] webhook route mounted mode=${siroModes(env).webhook}${siroConfig(env).webhookSecret ? '' : ' (SIRO_WEBHOOK_SECRET unset: every request is refused 401)'}`);
 }

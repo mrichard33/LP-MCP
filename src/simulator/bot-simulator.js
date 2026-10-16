@@ -31,6 +31,7 @@ import { callbackDecision, schedulingCallbackDecision, NO_DIAL_REASONS } from '.
 import { scopeDqKind } from '../agentic/scope-dq.js';
 import { applyBookingTruth } from '../agentic/booking-claim.js';
 import { buildLeadFacts } from '../agentic/lead-facts.js';
+import { buildPresentationFacts } from '../siro/presentation-facts.js';
 import { scoreRun, compareScorecards } from './sim-scoring.js';
 import { createMemoryStageStore, recordStage, recordBookedStage } from '../services/lead-stage-io.js';
 import { leadStageMode } from '../agentic/lead-stage.js';
@@ -89,7 +90,12 @@ export function withPersonaLp(context, persona) {
     notes: lp.notes || [],
   };
   const next = { ...context, lp: ctxLp };
-  next.lead_facts = buildLeadFacts({ lp: ctxLp, lpLead: { zip: lp.zip, city: lp.city, address: lp.address }, lead: context.lead });
+  // 2026-10-16 (Siro PR 1): a persona may carry the Siro recording of its
+  // visit (persona.lp.siro: siro_recordings rows), as SIRO_CONTEXT_MODE=live
+  // would read it from Supabase.
+  const siroRows = Array.isArray(lp.siro) && lp.siro.length ? lp.siro : null;
+  next.lead_facts = buildLeadFacts({ lp: ctxLp, lpLead: { zip: lp.zip, city: lp.city, address: lp.address }, lead: context.lead, siro: siroRows });
+  if (siroRows) next.siro = { presentation: buildPresentationFacts(siroRows) };
   return next;
 }
 
@@ -104,6 +110,26 @@ const KATY = { firstName: 'Dana', lastName: 'Sim', phone: '+13525550101', email:
 const REHASH_LEAD = {
   firstName: 'Monica', lastName: 'Sim', phone: '+17275550177', email: null, postalCode: '33711', tags: ['rehash'],
   lp: { disposition: 'OPPFDN', lastAppointmentDaysAgo: 7, zip: '33711', city: 'Saint Petersburg', address: '400 Oak St' },
+};
+
+// 2026-10-16 (Siro PR 1): the same rehash lead, with the Siro recording of
+// her visit: the price was her hesitation and the lanai slider her priority.
+const REHASH_SIRO_LEAD = {
+  ...REHASH_LEAD,
+  lp: {
+    ...REHASH_LEAD.lp,
+    siro: [{
+      recording_id: 'sim-siro-1', processed: true, deleted: false, lp_lead_id: 'sim-lead',
+      recorded_at: new Date(Date.now() - 7 * 86_400_000).toISOString(),
+      rep_name: 'Brian Kowalski', result: 'not closed',
+      summary: [{ name: 'Customer Need & Motivation', content: 'The lanai slider sticks and the bedroom windows leak in storms. The total came in at $18,400.' }],
+      moments: [
+        { kind: 'objection', objection_type: 'price', customer_said: 'The price is more than we planned to spend', agent_said: null, resolved: null, confidence: null },
+        { kind: 'buying_signal', objection_type: null, customer_said: 'Storm protection for the lanai slider', agent_said: null, resolved: null, confidence: null },
+      ],
+      followup_score: 4, followup_action: 'Revisit the budget question', followup_status: 'TO_DO',
+    }],
+  },
 };
 
 /**
@@ -214,6 +240,8 @@ export const SCENARIOS = Object.freeze({
   rehash_defer: { title: 'Rehash: call me in the spring', persona: REHASH_LEAD, channels: ['sms'], turns: ['Thanks for coming out. Call me in the spring and we will see'] },
   rehash_repeat_objection: { title: 'Rehash: the same price objection three times', persona: REHASH_LEAD, channels: ['sms'], turns: ['It is just too expensive for us right now', 'Honestly the price is still too high', 'The price is the problem, it is just too much'] },
   rehash_book_call: { title: 'Rehash: "Sure, what times?" then a pick', persona: REHASH_LEAD, channels: ['sms'], autoAnswer: true, turns: ['Sure, what times work for a call?'] },
+  // 2026-10-16 (Siro PR 1): the visit's price hesitation is in LEAD FACTS.
+  rehash_siro_price_objection: { title: 'Rehash with the Siro visit: price was the hesitation', persona: REHASH_SIRO_LEAD, channels: ['sms'], turns: ['Hi, got your message. We are still thinking it over'] },
   // ── 2026-10-16 (Melissa, 6U6uceZGMQRz8XEQc9Lk): hearing the time she picked ──
   same_day_pick_at_two: { title: 'Two times, she says "sunday at 2" (Melissa)', persona: MELISSA, channels: ['livechat'], autoAnswer: true, turns: ['I want the free estimate for my windows and sliding doors. Can someone come out this weekend?', pickOfferedTime('bare')] },
   pick_with_question_mark: { title: 'Pick typed back with a "?" (Melissa)', persona: MELISSA, channels: ['livechat'], autoAnswer: true, turns: ['I want the free estimate for my windows and sliding doors. Can someone come out this weekend?', pickOfferedTime('label_q')] },

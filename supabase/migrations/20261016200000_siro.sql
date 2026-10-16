@@ -1,4 +1,5 @@
 -- Siro integration (2026-10-16, Siro PR 1).
+-- applied by hand first: the user asked for the Siro tables before deploy (every statement is idempotent; db push re-runs it on merge) 2026-10-16
 --
 -- One row per Siro recording of an in-home demo, matched to the LP lead.
 -- Stored: summary, entity extractions and normalized moments. Never the

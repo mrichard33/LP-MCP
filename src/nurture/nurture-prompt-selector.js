@@ -95,11 +95,16 @@ export async function selectPrompt(context, request) {
  * Pick the strongest objection signal from the context. Returns the
  * objection name (e.g. 'price', 'spouse') or null when no tags.
  */
-function pickDominantObjection(context) {
+export function pickDominantObjection(context) {
+  const priority = ['price', 'spouse', 'timing', 'trust', 'competitor', 'diy'];
+  // 2026-10-16 (Siro PR 1): what the lead said at the visit beats an old tag.
+  // The Siro objections are read FIRST; 'other' is not a prompt variant.
+  const visit = (context?.siro?.presentation?.objections || []).map(o => o?.type).filter(t => t && t !== 'other');
+  for (const p of priority) {
+    if (visit.includes(p)) return p;
+  }
   const tags = context?.lead?.objection_tags || [];
   if (tags.length === 0) return null;
-
-  const priority = ['price', 'spouse', 'timing', 'trust', 'competitor', 'diy'];
   for (const p of priority) {
     if (tags.includes(p)) return p;
   }

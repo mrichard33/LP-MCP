@@ -22,6 +22,7 @@
  * Pure: no network, no database, no clock unless `nowMs` is passed.
  */
 
+import { presentationViolations } from '../siro/presentation-guard.js';
 import { claimsWarrantySent } from '../agentic/warranty-request.js';
 import { humanizeReply } from '../agentic/human-voice.js';
 import { enforceTeamVoice } from '../agentic/team-voice.js';
@@ -34,7 +35,7 @@ import { isLeadSignOff } from '../agentic/sign-off.js';
 import { dropUnaskedCallOffer, leadWantsCall, isMoneyFigure, URGENCY_RX, CLAIMS_RX, POST_DEMO_REBUTTAL_RX, UNPROMISED_FOLLOW_UP_RX } from '../agentic/nepq-planner.js';
 
 /** Bump when a check is added or changed, so scorecards from two versions are not compared as one. */
-export const INVARIANTS_VERSION = '2026-10-15.2';
+export const INVARIANTS_VERSION = '2026-10-16.1';
 
 /** The prompt's own SMS ceiling (CHANNEL CONSTRAINTS: "320 max"). */
 export const SMS_MAX_CHARS = 320;
@@ -69,6 +70,7 @@ function sentences(text) {
  * @param {boolean}[ctx.callbackFiled]  this turn filed a callback (a hand-off): any call it promises is backed
  * @param {string} [ctx.postDemoStep]   the post-demo plan's step; null = not a post-demo turn; undefined skips the post-demo checks
  * @param {boolean}[ctx.warrantySent]   this turn sends the warranty files; undefined skips the warranty-claim check
+ * @param {object} [ctx.presentation]   the Siro visit facts the prompt showed; undefined skips the presentation check
  * @returns {{ pass: boolean, violations: Array<{code: string, detail: string}>, skipped: string[], metrics: {chars: number, questions: number} }}
  */
 // The clock times a message names, normalized and sorted ("10:00 AM" → "10:00am").
@@ -205,6 +207,11 @@ export function checkReply(reply, ctx = {}) {
     if (!['handoff', 'rehash_confirm', 'rehash_offer'].includes(ctx.postDemoStep) && said.some(s => UNPROMISED_FOLLOW_UP_RX.test(s))) fail('post_demo_unbacked_follow_up', text);
     if (ctx.postDemoStep === 'post_demo_stop' && text.includes('?')) fail('question_after_post_demo_stop', text);
   }
+
+  // ── the visit is context, never a quote (2026-10-16, Siro PR 1) ─────────
+  // With the PRESENTATION block rendered: no dollar figure, no "your rep said".
+  if (ctx.presentation === undefined) skipped.push('presentation');
+  else for (const code of presentationViolations(text, ctx.presentation)) fail(code, text);
 
   // ── the same two times, never a third time (2026-10-13) ────────────────
   if (!Array.isArray(ctx.conversation)) skipped.push('repeat_slot_offer');

@@ -7,7 +7,7 @@ import assert from 'node:assert/strict';
 import { Webhook } from 'svix';
 import { fakeSupabase } from './lib/fake-supabase.js';
 import { processRecording, queueDemoNote } from '../src/siro/ingest.js';
-import { makeSiroWebhookHandler, readyToAct } from '../src/siro/webhook.js';
+import { makeSiroWebhookHandler, readyToAct, registerSiroWebhookRoutes } from '../src/siro/webhook.js';
 import { runSiroRecordingSync, WATERMARK_KEY } from '../src/jobs/siro-recording-sync.js';
 import { RAW_RECORDING } from './fixtures/siro-recording.js';
 
@@ -103,7 +103,7 @@ function fakeRes() {
 }
 const SECRET = 'whsec_' + Buffer.from('test-secret-test-secret-123456').toString('base64');
 
-test('webhook: unset secret 503, bad signature 401, duplicate 200, acts only when processed AND linked', async () => {
+test('webhook: unset secret 401, missing or bad signature 401, duplicate 200, acts only when processed AND linked', async () => {
   const body = JSON.stringify({ recordingId: 'rec_abc123', recordingProcessed: true, recordingLinked: true, eventType: 'integrations.recordingLinked' });
   const db = fakeSupabase({});
   const jobs = [];
@@ -111,7 +111,11 @@ test('webhook: unset secret 503, bad signature 401, duplicate 200, acts only whe
 
   let res = fakeRes();
   await makeSiroWebhookHandler({ env: {}, deps })({ body: Buffer.from(body), headers: signed(SECRET, body) }, res);
-  assert.equal(res.code, 503);
+  assert.equal(res.code, 401);
+
+  res = fakeRes();
+  await makeSiroWebhookHandler({ env: { SIRO_WEBHOOK_SECRET: SECRET, SIRO_WEBHOOK_MODE: 'off' }, deps })({ body: Buffer.from(body), headers: {} }, res);
+  assert.equal(res.code, 401, 'even with the mode off, an unsigned request is refused');
 
   res = fakeRes();
   await makeSiroWebhookHandler({ env: { SIRO_WEBHOOK_SECRET: SECRET }, deps })({ body: Buffer.from(body), headers: { ...signed(SECRET, body), 'svix-signature': 'v1,bad' } }, res);
@@ -149,4 +153,16 @@ test('poll: pages, stores, moves the watermark only after a full pass', async ()
   const out2 = await runSiroRecordingSync({ env: {}, deps: { supabase: db2, siro: broken, readLeads, log: quiet } });
   assert.equal(out2.complete, false);
   assert.equal((db2.tables.siro_sync_state || []).length, 0);
+});
+
+test('the route mounts on POST /webhook/siro and logs its mode', () => {
+  const routes = [];
+  const logs = [];
+  const orig = console.log;
+  console.log = (l) => logs.push(String(l));
+  try {
+    registerSiroWebhookRoutes({ post: (path) => routes.push(path) }, { SIRO_WEBHOOK_MODE: 'live', SIRO_WEBHOOK_SECRET: SECRET });
+  } finally { console.log = orig; }
+  assert.deepEqual(routes, ['/webhook/siro']);
+  assert.ok(logs.includes('[Siro] webhook route mounted mode=live'));
 });

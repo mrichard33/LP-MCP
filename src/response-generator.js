@@ -421,6 +421,7 @@ import { isUnsoldPostDemo, lpSold, postDemoOwnerName, replaceSalesRepFollowUp } 
 import { postDemoPlannerMode } from './agentic/post-demo-turn.js';
 import { rehashCallSlotsMode, readRehashCallSlots, rehashCallBooking } from './agentic/rehash-slots.js';
 import { isInRehash, rehashLeadFromContext, rehashRoutingMode } from './agentic/rehash-state.js';
+import { enforcePresentationGuard } from './siro/presentation-guard.js';
 import { planNepqTurn, enforceNepqPlan, referenceRetryNote, nepqBackboneMode, prefersCall as nepqPrefersCall, objectionType as nepqObjectionType, TIME_REQUEST_RX as NEPQ_TIME_REQUEST_RX, SCHEDULE_ASK_RX as NEPQ_SCHEDULE_ASK_RX,REPEAT_COMPLAINT_RX as NEPQ_REPEAT_COMPLAINT_RX, bookingOpenInThread as nepqBookingOpenInThread, dropUnaskedCallOffer, leadWantsCall as nepqLeadWantsCall, isServiceCallback as nepqIsServiceCallback } from './agentic/nepq-planner.js';
 // A layer3 script that forbids a time offer this turn (follow_up_scheduled,
 // OBJ_PRICE_STRIKE3's "no slot grid").
@@ -5364,6 +5365,14 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
         validated.message = w.text;
       }
       validated.warranty = { urls: warranty.urls };
+    }
+    // The visit is context, never a quote (2026-10-16, Siro PR 1): with the
+    // PRESENTATION block in the prompt, a dollar figure or "your rep said"
+    // sentence is dropped. No block (pre-demo, SIRO_CONTEXT_MODE not live): no-op.
+    const pres = enforcePresentationGuard(validated.message, { presentation: context.siro?.presentation || null });
+    if (pres.changed) {
+      console.log(`[Siro] ${contactId} presentation guard: ${pres.changes.join(',')}`);
+      validated.message = pres.text;
     }
     // Human voice once more, last (2026-10-06 bot gate): the first pass runs
     // before the NEPQ and booking guards, and a sentence they drop can leave

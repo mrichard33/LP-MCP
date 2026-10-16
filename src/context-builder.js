@@ -109,6 +109,7 @@ import { isCustomerP2 } from './agentic/lead-state/signals/context-reader.js';
 import { withGhlToken } from './ghl-rate-limiter.js';
 import { leadHadDemo } from './demo-truth.js';
 import { buildLeadFacts } from './agentic/lead-facts.js';
+import { siroForContext } from './siro/context-read.js';
 import { normalizePhone10, leadKey } from './lead-leak-classify.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY;
@@ -1491,7 +1492,21 @@ export async function buildLeadContext(ghlContactId, options = {}) {
   // 2026-10-07 (Nicholas): the facts both prompts render the same way and the
   // guards read: the appointment's real status and cancel note, every LP note,
   // the property ZIP on file, and a note that says we cannot run the lead.
-  context.lead_facts = buildLeadFacts({ lp: context.lp, lpLead, lead: context.lead });
+  // 2026-10-16 (Siro PR 1): a lead past its demo also gets the visit — the
+  // newest Siro recording from Supabase (never Siro live), live mode only.
+  // Pre-demo leads and the light classifier build never pay for the read.
+  let siroRows = null;
+  if (parts.conversation) {
+    const siro = await siroForContext({ contactId: ghlContactId, lp: context.lp, lead: context.lead });
+    if (siro.applied) {
+      siroRows = siro.rows;
+      context.siro = { presentation: siro.facts };
+    }
+  }
+  context.lead_facts = buildLeadFacts({
+    lp: context.lp, lpLead, lead: context.lead,
+    siro: siroRows, siroNoteAuthor: process.env.SIRO_LP_NOTE_AUTHOR || 'Siro',
+  });
 
   if (parts.cacheable) setCache(ghlContactId, context);
   return context;
