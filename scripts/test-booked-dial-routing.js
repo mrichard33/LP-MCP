@@ -177,7 +177,8 @@ test('failedAddCount counts only failed rows for that list', () => {
 test('the add-failed card names the lead and asks for a hand add', () => {
   const text = formatAddFailedCard([{ c: cand(), list: 'Conf - 2nd Day' }]);
   assert.match(text, /add them in Five9 by hand/);
-  assert.match(text, /Shelley · 9414670700 · visit .* → "Conf - 2nd Day" \(LP lead 581671\)/);
+  assert.match(text, /Shelley · 9414670700 · visit .* → "Conf - 2nd Day" \(LP Prospect \S+\)/);
+  assert.doesNotMatch(text, /581671/);
 });
 
 test('a move from 2nd Day to Next Day is due once both adds completed', () => {

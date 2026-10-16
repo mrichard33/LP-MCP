@@ -159,11 +159,11 @@ import { extractArray, getField } from '../../sync-utils.js';
 import { resolveLPLeadId } from '../../lp-appointment-sync.js';
 import { sendGroupMeMessage } from '../../groupme.js';
 import { addGHLNote, updateGHLContactFields, applyGHLTag } from '../../ghl.js';
-import { formatLpSource, formatApptTime12h } from '../../format-helpers.js';
+import { formatLpSource, formatApptTime12h, prospectLabel } from '../../format-helpers.js';
 import { isLPLeadId } from '../helpers.js';
 import { getContactCached } from '../contact-cache.js';
 import { toLpApptDate, toLpApptTime, normalizeDateForComparison, parseLpApptWallClock } from '../date-parsers.js';
-import { resolveContactInfo } from '../resolvers.js';
+import { resolveContactInfo, prospectIdForLead } from '../resolvers.js';
 import { buildRichNotification } from '../enrichment.js';
 import { isGhlOnlyCalendarId } from '../../knowledge/booking-calendar-router.js';
 import { checkConfirmationCallSlot } from '../../services/confirmation-call-slot.js';
@@ -706,10 +706,12 @@ export async function executeSetLPAppointment(action, context = {}) {
           }
 
           const { name: conflictName } = await resolveContactInfo(contactId, eventPayload);
+          // The prospect, never the lead id (the user, 2026-10-16).
+          const conflictProspect = resolvedProspectId || await prospectIdForLead(lpLeadId);
           await sendGroupMeMessage(
             `⛔ LP Appointment CONFLICT — manual LP fix needed\n` +
-            `👤 ${conflictName || contactId}\n` +
-            `📋 LP Lead: ${lpLeadId} | Prospect: ${resolvedProspectId || 'NONE'}\n` +
+            `👤 ${conflictName || prospectLabel(conflictProspect)}\n` +
+            `📋 LP: ${prospectLabel(conflictProspect)}\n` +
             (lpSourceLine ? `📋 Src: ${lpSourceLine}\n` : '') +
             `🗓️ LP holds:  ${liveAppt.date} ${liveAppt.time ? formatApptTime12h(liveAppt.time) : '(no time)'}\n` +
             `🗓️ GHL holds: ${ghlDateNormalized} ${formatApptTime12h(apptTime)}\n` +
@@ -862,11 +864,15 @@ export async function executeSetLPAppointment(action, context = {}) {
       });
 
       const { name: deniedName } = await resolveContactInfo(contactId, eventPayload);
+      // The prospect, never a lead id (the user, 2026-10-16). Two leads of one
+      // person usually share a prospect, so the owner line says whether they do.
+      const deniedProspect = resolvedProspectId || await prospectIdForLead(lpLeadId);
+      const ownerProspect = claim.ownerLeadId ? await prospectIdForLead(claim.ownerLeadId) : null;
       await sendGroupMeMessage(
         `⛔ LP Appointment NOT synced — appointment authority denied\n` +
-        `👤 ${deniedName || contactId}\n` +
-        `📋 Attempted LP Lead: ${lpLeadId} | Prospect: ${resolvedProspectId || 'NONE'}\n` +
-        `📋 Authority owner: ${ownerLine}\n` +
+        `👤 ${deniedName || prospectLabel(deniedProspect)}\n` +
+        `📋 Attempted: LP ${prospectLabel(deniedProspect)}\n` +
+        `📋 Authority owner: ${claim.ownerLeadId ? (ownerProspect && ownerProspect === deniedProspect ? 'another lead on the same prospect' : `LP ${prospectLabel(ownerProspect)}`) : 'unknown'}\n` +
         `🗓️ GHL holds: ${ghlDateNormalized} ${formatApptTime12h(apptTime)}\n` +
         `👉 Two LP leads are fighting over one contact's appointment. Reconcile them in LP.`
       ).catch(() => {});
@@ -993,7 +999,7 @@ export async function executeSetLPAppointment(action, context = {}) {
       calendarName,
       ghlStatus,
       ghlContact: cardContact,
-      narrative: `Appointment written to Lead Perfection for LP lead ${lpLeadId}. The LP-side team works it from here.`,
+      narrative: `Appointment written to Lead Perfection for LP ${prospectLabel(resolvedProspectId)}. The LP-side team works it from here.`,
     })
   ).catch(() => {});
 

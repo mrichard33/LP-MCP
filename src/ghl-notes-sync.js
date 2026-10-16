@@ -119,6 +119,7 @@ export function formatNoteForGHL(note) {
 
   if (note.lp_lead_id) {
     parts.push('');
+    // lead-id-ok: a GHL note, not Slack
     parts.push(`LP Lead: ${note.lp_lead_id}`);
   }
 

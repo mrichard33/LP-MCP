@@ -124,6 +124,7 @@ import { NAME_PLACEHOLDER_TAG } from '../../services/identity-extraction.js';
 // wrapper that returns null on ANY failure, so this stays fail-soft.
 import { buildAgenticLeadNotes, isWeakNotes } from '../../services/agentic-lead-notes.js';
 import { fetchAndBuildRepBrief, repBriefMode } from '../../services/rep-brief-io.js';
+import { prospectLabel } from '../../format-helpers.js';
 
 // ─── GHL custom field IDs (canonical Reece location field map) ─────
 // v1.3: SOURCE and PROMOTER were swapped here from the file's creation
@@ -341,7 +342,7 @@ async function reuseExistingLpLead(action, contactId, existing, appt) {
       // same "set it by hand" card as a thrown failure below.
       if (apptResult?.action === 'lp_appointment_refused') {
         await sendGroupMeMessage(
-          `⚠️ LP APPT NOT SET on reused lead ${existing.ldsId} (contact ${contactId}, ${appt.adate} ${appt.atime}): ` +
+          `⚠️ LP APPT NOT SET on the reused LP lead of ${prospectLabel(existing._prospectId)} (contact ${contactId}, ${appt.adate} ${appt.atime}): ` +
           `LP said "${String(apptResult.lp_message || '').slice(0, 200)}"\n👉 Set the appointment in LP by hand.`
         ).catch(() => {});
       }
@@ -350,7 +351,7 @@ async function reuseExistingLpLead(action, contactId, existing, appt) {
       // We did not create a lead, so this appointment now exists only in GHL.
       // Say so loudly — the reuse must not turn a booking into a silent miss.
       await sendGroupMeMessage(
-        `⚠️ LP APPT NOT SET on reused lead ${existing.ldsId} (contact ${contactId}, ${appt.adate} ${appt.atime}): ${String(err.message).slice(0, 200)}\n👉 Set the appointment in LP by hand.`
+        `⚠️ LP APPT NOT SET on the reused LP lead of ${prospectLabel(existing._prospectId)} (contact ${contactId}, ${appt.adate} ${appt.atime}): ${String(err.message).slice(0, 200)}\n👉 Set the appointment in LP by hand.`
       ).catch(() => {});
     }
   }

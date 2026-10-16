@@ -195,7 +195,8 @@ test('buildLpAppointmentCard renders one card carrying LP ref, address, email an
   assert.match(card, /Prospect: 454810/);
   assert.match(card, /📍 123 Main St, Trinity FL 34655/);
   assert.match(card, /✉️ myron@example\.com/);
-  assert.match(card, /📋 LP: Lead 570351 \| Prospect 454810/);
+  assert.match(card, /📋 LP: Prospect 454810/);
+  assert.doesNotMatch(card, /570351/, 'the lead id is never on the card (2026-10-16)');
   assert.match(card, /📅 08\/28\/2026 6:00 PM EST \| Window Estimate \| ⏳ DM confirm pending/);
   assert.match(card, /📊 Tier: Hot/);
   assert.match(card, /📌 Status: Appointment Set/);
@@ -208,7 +209,8 @@ test('a missing prospect reads the same on BOTH the Prospect line and the LP ref
     contactId: 'C1', lpLeadId: '570351', apptDate: '08/28/2026', apptTime: '18:00',
   });
   assert.match(card, /Prospect: Not yet assigned/);
-  assert.match(card, /📋 LP: Lead 570351 \| Prospect not yet assigned/);
+  assert.match(card, /📋 LP: Prospect not yet assigned/);
+  assert.doesNotMatch(card, /570351/);
   assert.doesNotMatch(card, /N\/A/);
   assert.doesNotMatch(card, /NONE/);
 });

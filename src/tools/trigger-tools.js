@@ -20,18 +20,22 @@ export function registerTriggerTools(server) {
         .single();
 
       if (error || !lead) {
+        // lead-id-ok: MCP tool output, not Slack
         return { content: [{ type: 'text', text: `Lead ${lead_id} not found.` }] };
       }
 
       if (lead.closed_won) {
+        // lead-id-ok: MCP tool output, not Slack
         return { content: [{ type: 'text', text: `Lead ${lead_id} is already closed/won. Handoff not applicable.` }] };
       }
 
       if (lead.lp_day15_triggered) {
+        // lead-id-ok: MCP tool output, not Slack
         return { content: [{ type: 'text', text: `Lead ${lead_id} already had Day 15 handoff triggered. Skipping duplicate.` }] };
       }
 
       if (!lead.ghl_contact_id) {
+        // lead-id-ok: MCP tool output, not Slack
         return { content: [{ type: 'text', text: `Lead ${lead_id} has no matched GHL contact. Cannot apply tag.` }] };
       }
 
@@ -80,6 +84,7 @@ export function registerTriggerTools(server) {
         return {
           content: [{
             type: 'text',
+            // lead-id-ok: MCP tool output, not Slack
             text: `Failed to apply Day 15 handoff tag for lead ${lead_id}. Check GHL API key and contact ID.`,
           }],
         };

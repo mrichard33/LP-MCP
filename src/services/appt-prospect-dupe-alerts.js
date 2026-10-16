@@ -1,3 +1,4 @@
+import { prospectLabel } from '../format-helpers.js';
 /**
  * Duplicate live appointment alerts — src/services/appt-prospect-dupe-alerts.js
  *
@@ -58,13 +59,15 @@ export function formatApptProspectDupes(rows) {
     const ids = r.lead_ids || [];
     const disps = r.dispositions || [];
     const sources = r.sources || {};
+    // Each lead by disposition and source, never its id: the prospect line
+    // above names the record (the user, 2026-10-16).
     const pairs = ids.map((id, i) => {
       const disp = disps[i] || '?';
       const src = sources[String(id)] || 'source unknown';
-      return `    • ${id} (${disp}) — ${src}`;
+      return `    • lead ${i + 1} (${disp}) — ${src}`;
     }).join('\n');
     const names = [...new Set(r.surnames || [])].map((n) => String(n).trim()).filter(Boolean);
-    return `📅 ${r.slot_date} — prospect ${r.lp_prospect_id} — ${names.join(' / ') || '(no surname)'}\n${pairs}`;
+    return `📅 ${r.slot_date} — ${prospectLabel(r.lp_prospect_id)} — ${names.join(' / ') || '(no surname)'}\n${pairs}`;
   });
 
   return `🚨 DUPLICATE LIVE APPOINTMENTS — ${rows.length} prospect${rows.length === 1 ? '' : 's'} holding more than one live lead on the same day\n\n` +

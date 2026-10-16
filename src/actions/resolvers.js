@@ -113,7 +113,8 @@ export async function resolveContactInfo(contactId, eventContext = {}) {
     } catch {}
     const payloadName = eventContext.contactName || eventContext.contact_name || eventContext.lead_name || eventContext.leadName || null;
     if (payloadName) return { name: payloadName, phone: null, ghlContactId: lpLeadRow?.ghl_contact_id || null, lpLead: lpLeadRow, ghlContact: null };
-    return { name: `LP Lead ${contactId}`, phone: null, ghlContactId: lpLeadRow?.ghl_contact_id || null, lpLead: lpLeadRow, ghlContact: null };
+    // No name anywhere: name the prospect, never the lead id (the user, 2026-10-16).
+    return { name: lpLeadRow?.lp_prospect_id ? `Prospect ${lpLeadRow.lp_prospect_id}` : 'Unknown contact', phone: null, ghlContactId: lpLeadRow?.ghl_contact_id || null, lpLead: lpLeadRow, ghlContact: null };
   }
 
   let lpLeadRow = null;
@@ -201,6 +202,22 @@ function writeBackProspectId(contactId, pid, source) {
  *   reads from it instead of refetching, and (b) a prospect ID resolved
  *   from LP while the GHL field is empty triggers a write-back.
  */
+/**
+ * The prospect a Slack card names for an LP lead id (the user, 2026-10-16:
+ * a card shows the Prospect ID, never the lead id). One lp_leads read, never
+ * LP live (a card must not wait on LP); null when unknown or unreadable, so the
+ * card prints "Prospect: unknown" (prospectLabel).
+ */
+export async function prospectIdForLead(lpLeadId, { db = supabase } = {}) {
+  if (!lpLeadId) return null;
+  try {
+    const { data } = await db.from('lp_leads').select('lp_prospect_id').eq('lp_lead_id', String(lpLeadId)).maybeSingle();
+    return data?.lp_prospect_id ? String(data.lp_prospect_id) : null;
+  } catch {
+    return null;
+  }
+}
+
 export async function resolveLPProspectId(contactId, { ghlContact = null } = {}) {
   if (!contactId) return 'Not in LP';
 

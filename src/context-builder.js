@@ -896,6 +896,17 @@ export async function fetchRecentCalls({ ghlContactId, phone, lpLeadId }, deps =
   return lp;
 }
 
+// 2026-10-16 (4. Confirmation Pipeline): the search was unscoped and the newest
+// card won, so a Confirmation card moved by the clock every 15 minutes would
+// have become "the contact's opportunity" for the bot. The handoff asked for a
+// P1 filter; the confirmation boards are EXCLUDED instead, because
+// isCustomerP2 and deriveCustomerRelationship read pipeline_id === P2 here and
+// a P1-only search would hide every sold customer's P2 card from them.
+const CONFIRMATION_PIPELINE_IDS = new Set([
+  process.env.CONF_PIPELINE_ID || 'ThrBNpyzJhAON4WFC855', // 4. Confirmation Pipeline
+  'peerSJtm3CX2NJt0NLkR',                                 // 5. Canvass Confirmation Pipeline
+]);
+
 async function fetchOpportunity(contactId, degraded = null) {
   let data;
   try {
@@ -907,7 +918,7 @@ async function fetchOpportunity(contactId, degraded = null) {
     console.warn(`[ContextBuilder] ${err.message} — proceeding without opportunity`);
     return null;
   }
-  const opps = data?.opportunities || [];
+  const opps = (data?.opportunities || []).filter((o) => !CONFIRMATION_PIPELINE_IDS.has(o.pipelineId));
   if (!opps.length) return null;
   const sorted = opps.sort((a, b) =>
     new Date(b.updatedAt || b.lastStatusChangeAt || 0) - new Date(a.updatedAt || a.lastStatusChangeAt || 0));

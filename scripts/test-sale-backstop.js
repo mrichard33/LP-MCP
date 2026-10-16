@@ -117,7 +117,7 @@ test('a fresh sale is announced through the normal pipeline, with GroupMe as the
   const groupMe = [];
   const out = await runSaleBackstop({
     now: () => NOW, logger: quiet, supabase: {},
-    find: async () => [{ leadId: '578357', repDisplayName: 'Donte Wheeler', amount: 28002, branch: 'JAX', firstSeenAt: '2026-09-25T19:48:00Z' }],
+    find: async () => [{ leadId: '578357', prospectId: '441200', repDisplayName: 'Donte Wheeler', amount: 28002, branch: 'JAX', firstSeenAt: '2026-09-25T19:48:00Z' }],
     claim: async (row) => ({ claimed: true, row: { id: 92, ...row } }),
     complete: async (ctx, deps) => { completed.push(ctx); await deps.mirror('celebration text'); return { ok: true }; },
     groupMe: async (text) => { groupMe.push(text); return { mirrored: true }; },
@@ -125,7 +125,7 @@ test('a fresh sale is announced through the normal pipeline, with GroupMe as the
   });
   assert.equal(out.ok, true);
   assert.equal(out.announced, 1);
-  assert.deepEqual(completed[0], { rowId: 92, repDisplayName: 'Donte Wheeler', amount: 28002, leadId: '578357', keySource: 'lead_id' });
+  assert.deepEqual(completed[0], { rowId: 92, repDisplayName: 'Donte Wheeler', amount: 28002, leadId: '578357', prospectId: '441200', keySource: 'lead_id' });
   assert.deepEqual(groupMe, ['celebration text']);
 });
 

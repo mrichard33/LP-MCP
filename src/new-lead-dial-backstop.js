@@ -65,6 +65,7 @@ import { dialWindowStartMs } from './five9/callback-dial-check.js';
 import { buildCallbackRecord, callbackListName, callbackCallNowMode } from './five9/callback-push.js';
 import { capLines } from './alert-posted.js';
 import { isHoldDisposition } from './lp-disposition-classes.js';
+import { prospectLabel } from './format-helpers.js';
 
 export const MODES = Object.freeze(['off', 'shadow', 'live']);
 export const FORBIDDEN_LIST = 'LP_ASAP';
@@ -391,7 +392,7 @@ export function formatUnhandledCard(items, nowMs) {
   const lines = items.map(({ row, result }) => {
     const name = [row.first, row.last].filter(Boolean).join(' ') || 'No name';
     const source = row.sourceDetail || row.source || 'unknown source';
-    return `• ${name} · ${String(row.phone ?? '').replace(/\D/g, '') || 'no phone'} · ${source} · LP lead ${row.ldsId || `inbound ${row.in1}`} · ${ageText(nowMs - row.receivedMs)} old · ${REASON_TEXT[result] || result}`;
+    return `• ${name} · ${String(row.phone ?? '').replace(/\D/g, '') || 'no phone'} · ${source} · ${row.ldsId ? `LP ${prospectLabel(row.cstId)}` : `inbound ${row.in1}`} · ${ageText(nowMs - row.receivedMs)} old · ${REASON_TEXT[result] || result}`;
   });
   return [
     `⚠️ NEW LEADS NOBODY HAS CALLED — the dial backstop could not put them on a Five9 list`,
@@ -436,6 +437,7 @@ export function pushedLine(p) {
   const visit = p.state?.hasAppt
     ? (Number.isFinite(p.state.apptStartMs) ? `visit ${VISIT_FMT.format(new Date(p.state.apptStartMs))}` : `visit ${p.state.apptDateEt}`)
     : 'no appointment';
+  // lead-id-ok: card_line is stored, never posted; uncalled-backstop-hold.js parses it
   return `• ${name} · ${phone} · ${visit} → ${p.list} (LP lead ${p.row.ldsId})`;
 }
 

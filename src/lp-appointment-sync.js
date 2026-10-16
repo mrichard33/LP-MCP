@@ -230,7 +230,7 @@ import {
 import { refusedAppointmentAnswer } from './lp-appointment-guards.js';
 import { sendGroupMeMessage } from './groupme.js';
 import { acquireToken } from './ghl-rate-limiter.js';
-import { slackPhone, formatLpSource, formatApptTime12h } from './format-helpers.js';
+import { slackPhone, formatLpSource, formatApptTime12h, prospectLabel } from './format-helpers.js';
 import { enrollLpLeadCreation } from './admin/lp-force-addlead.js';
 // 2026-07-07 call-dispatch-integrity: Five9 direct dispatch gate for GHL-only
 // calendars (dormant unless FIVE9_DIRECT_DISPATCH=true — see five9/list-dispatch.js).
@@ -1405,7 +1405,9 @@ async function sendSyncFailureNotification({
   const idsLine = [
     prospectId    ? `prospect=${prospectId}`              : null,
     inboundId     ? `in1_id=${inboundId}`                 : null,
-    ghlLeadIdField? `ghl_lp_lead_field=${ghlLeadIdField}` : null,
+    // The GHL LP-lead field holds a lead id, which a card never prints (the
+    // user, 2026-10-16); it is only noted as set.
+    ghlLeadIdField? 'GHL LP lead field set'                : null,
   ].filter(Boolean).join(' • ') || 'none populated';
 
   const apptLine = [
@@ -1430,13 +1432,13 @@ async function sendSyncFailureNotification({
   let lpSnapshot = 'no linked LP lead in Supabase';
   try {
     const { data: linked } = await supabase.from('lp_leads')
-      .select('lp_lead_id, disposition_code, appointment_date')
+      .select('lp_lead_id, lp_prospect_id, disposition_code, appointment_date')
       .eq('ghl_contact_id', contactId)
       .order('synced_at', { ascending: false })
       .limit(3);
     if (linked?.length) {
       lpSnapshot = linked.map(r =>
-        `lead ${r.lp_lead_id} disp=${r.disposition_code || '?'} appt=${r.appointment_date ? String(r.appointment_date).slice(0, 16).replace('T', ' ') : 'none'}`
+        `${prospectLabel(r.lp_prospect_id)} disp=${r.disposition_code || '?'} appt=${r.appointment_date ? String(r.appointment_date).slice(0, 16).replace('T', ' ') : 'none'}`
       ).join('\n     ');
     }
   } catch { /* best-effort — card still sends without it */ }
@@ -2514,7 +2516,7 @@ async function syncAppointmentToLPInner({
       apptDate,
       apptTime,
       calendarName,
-      narrative: `Appointment written to Lead Perfection for LP lead ${ldsId}. The LP-side team works it from here.`,
+      narrative: `Appointment written to Lead Perfection for LP ${prospectLabel(prospectId)}. The LP-side team works it from here.`,
     })
   ))().catch(() => {}));
 
@@ -2934,7 +2936,7 @@ export function registerLPAppointmentSyncRoutes(app) {
       if (result?.action === 'lp_appointment_refused') {
         await sendGroupMeMessage(
           `❌ LP APPT REFUSED: LP said "${result.lp_message || '(no message)'}" (${result.reason})\n` +
-          `LP lead: ${result.lp_lead_id || '?'} | ${result.date || ''} ${result.time || ''}\nContact: ${contactId}`
+          `LP: ${prospectLabel(result.lp_prospect_id)} | ${result.date || ''} ${result.time || ''}\nContact: ${contactId}`
         ).catch(() => {});
       }
 

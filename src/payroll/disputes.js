@@ -29,6 +29,7 @@
 //   money moves until a live run is approved and marked paid by a person.
 
 import { lineKey, PAYEE_LIGHTFIRE, formatCents } from './rules.js';
+import { prospectLabel } from '../format-helpers.js';
 
 export const DISPUTE_STATUSES = Object.freeze(['open', 'approved', 'denied']);
 export const EVENT_DISPUTE_ADJUSTMENT = 'dispute_adjustment';
@@ -90,6 +91,12 @@ export function validateDecision({ decision, note, approvedAmount, fallbackCents
 }
 
 /** File a ticket. deps: { store, post?, channel? } */
+/** The ticket's prospect for the Slack note; null (→ "Prospect: unknown") when the store cannot say. */
+async function prospectOfLead(store, leadId) {
+  if (typeof store?.prospectIdForLead !== 'function') return null;
+  return Promise.resolve(store.prospectIdForLead(leadId)).catch(() => null);
+}
+
 export async function fileDispute(input, { store, post = null, channel = '' }) {
   const v = validateFiling(input);
   if (!v.ok) return v;
@@ -115,7 +122,7 @@ export async function fileDispute(input, { store, post = null, channel = '' }) {
   });
   if (post && channel) {
     const claim = d.claimed_amount_cents != null ? ` claiming ${formatCents(d.claimed_amount_cents)}` : '';
-    const r = await post(`🎫 Payroll ticket #${d.id} filed by ${d.filed_by_email}${claim} — lead ${d.lp_lead_id}, ${d.event_type}${d.event_date ? ` on ${d.event_date}` : ''}.\n“${d.reason.slice(0, 300)}”\nDecide it on the dashboard Payroll page → Disputes.`, channel, {});
+    const r = await post(`🎫 Payroll ticket #${d.id} filed by ${d.filed_by_email}${claim} — LP ${prospectLabel(await prospectOfLead(store, d.lp_lead_id))}, ${d.event_type}${d.event_date ? ` on ${d.event_date}` : ''}.\n“${d.reason.slice(0, 300)}”\nDecide it on the dashboard Payroll page → Disputes.`, channel, {});
     if (!r?.ok) console.warn(`[Payroll] ticket #${d.id} Slack note not posted (${r?.error || 'unknown'})`);
   }
   return { ok: true, dispute: d };

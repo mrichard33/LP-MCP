@@ -158,8 +158,9 @@ export function assertAppointmentAccepted(resp, ctx = {}) {
   const verdict = inspectAppointmentResponse(resp);
   if (verdict.accepted) return verdict;
 
-  const where = ctx.ldsId ? ` (lds_id=${ctx.ldsId}` +
-    (ctx.apptDate ? `, ${ctx.apptDate} ${ctx.apptTime || ''}`.trimEnd() : '') + ')' : '';
+  // No lead id in the text: it reaches Slack (the user, 2026-10-16); err.ldsId
+  // still carries it for code.
+  const where = ctx.apptDate ? ` (${`${ctx.apptDate} ${ctx.apptTime || ''}`.trimEnd()})` : '';
 
   const err = new Error(
     `LP SetAppointment REFUSED${where}: ${verdict.message || '(no message)'} ` +
@@ -171,6 +172,7 @@ export function assertAppointmentAccepted(resp, ctx = {}) {
       : 'Do NOT tag this contact as synced.')
   );
   err.code = 'LP_APPT_REFUSED';
+  err.ldsId = ctx.ldsId || null;
   err.reason = verdict.reason;
   err.lpMessage = verdict.message;
   err.lpResult = verdict.resultCode;
@@ -224,7 +226,7 @@ export function assertLeadCanTakeAppointment(lead = {}, opts = {}) {
 
   if (isBlankAddress(lead.brn_id)) {
     const err = new Error(
-      `LP lead ${ldsId} has no market (brn_id is blank) — it can never accept an ` +
+      `The LP lead has no market (brn_id is blank) — it can never accept an ` +
       `appointment. This lead was created without a resolvable address. ` +
       `UpdateProspectInfo cannot repair a lead's market; the lead must be re-created ` +
       `with a real address, or the appointment set on a different lead.`
@@ -237,7 +239,7 @@ export function assertLeadCanTakeAppointment(lead = {}, opts = {}) {
   const dispo = String(lead.disposition || '').trim().toLowerCase();
   if (dispo.includes('out of area') || dispo === 'ooa') {
     const err = new Error(
-      `LP lead ${ldsId} is dispositioned "${lead.disposition}" — LP will refuse the appointment.`
+      `The LP lead is dispositioned "${lead.disposition}" — LP will refuse the appointment.`
     );
     err.code = 'LP_LEAD_OUT_OF_AREA';
     err.ldsId = ldsId;
@@ -248,7 +250,7 @@ export function assertLeadCanTakeAppointment(lead = {}, opts = {}) {
     const hasFuture = Array.isArray(lead.appointments) && lead.appointments.length > 0;
     if (hasFuture || String(lead.apptset || '').toLowerCase() === 'true') {
       const err = new Error(
-        `LP lead ${ldsId} already holds an appointment — SetAppointment cannot ` +
+        `The LP lead already holds an appointment — SetAppointment cannot ` +
         `overwrite one, and cancel-then-set is unsupported by the LP API.`
       );
       err.code = 'LP_LEAD_APPT_EXISTS';

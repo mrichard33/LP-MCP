@@ -90,7 +90,8 @@ test('enforce: a Result:1 "market is OOA" refusal THROWS instead of reading as s
       assert.equal(err.code, 'LP_APPT_REFUSED', 'must carry the typed code');
       assert.equal(err.reason, 'lp_market_out_of_area');
       assert.match(err.message, /REFUSED/);
-      assert.match(err.message, /575580/, 'names the lead');
+      assert.equal(err.ldsId, '575580', 'the lead rides on the error for code');
+      assert.doesNotMatch(err.message, /575580/, 'the message reaches Slack: no lead id (2026-10-16)');
       return true;
     },
     'a refusal must not resolve — resolving is what wrote the 24h self-lock',

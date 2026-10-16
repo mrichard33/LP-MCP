@@ -56,6 +56,7 @@ async function markDay15Suppressed(db, lpLeadId, ghlContactId, currentLeadId) {
   await db.from('lp_leads').update({ lp_day15_triggered: true }).eq('lp_lead_id', lpLeadId);
   await logTrigger(db, {
     lp_lead_id: String(lpLeadId), ghl_contact_id: ghlContactId, tag_fired: null,
+    // lead-id-ok: error_detail on a trigger row, not a card
     status: 'suppressed', error_detail: `${DAY15_SUPERSEDED}: current lead ${currentLeadId}`,
   });
   console.log(`[Sync] Day 15 suppressed for lead ${lpLeadId} — newer lead ${currentLeadId} is current for ${ghlContactId}`);

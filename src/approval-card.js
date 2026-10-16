@@ -113,7 +113,7 @@ export function stripRulePrefix(reasoning) {
 function personName(name) {
   const s = String(name ?? '').trim();
   if (!s || s === 'Unknown') return null;
-  if (/^LP Lead \d+$/.test(s)) return null;
+  if (/^LP Lead \d+$/.test(s) || /^Prospect( \d+|: unknown)$/.test(s) || s === 'Unknown contact') return null;
   if (/^[A-Za-z0-9]{16,}$/.test(s) && /\d/.test(s)) return null;
   return s;
 }
@@ -223,10 +223,16 @@ function listNumbers(nums) {
   return nums.length > 5 ? `${shown} and ${nums.length - 5} more` : shown;
 }
 
+// An LP lead id is never on a card (the user, 2026-10-16): these keys are
+// skipped, and the prospect stands in for them. A Five9 record array that
+// carries an LDS key is scrubbed by the send-point net (slack-phone-format.js).
+const LEAD_ID_KEYS = new Set(['lp_lead_id', 'lead_id', 'lds_id', 'ldsId', 'lpLeadId', 'issued_lead_id', 'owner_lead_id']);
+
 function shortPayload(payload) {
   const parts = [];
   for (const [k, v] of Object.entries(payload || {})) {
     if (k.startsWith('_') || v === null || v === undefined || v === '') continue;
+    if (LEAD_ID_KEYS.has(k)) continue;
     const val = Array.isArray(v) ? v.slice(0, 5).join(', ') + (v.length > 5 ? ` (+${v.length - 5})` : '')
       : typeof v === 'object' ? JSON.stringify(v)
         : String(v);
@@ -258,6 +264,8 @@ export function describeApprove(action, { event, contactName, enrichment = {} } 
       const stage = pl.stage ? ` → ${pl.stage}` : '';
       return `${capitalize(whose)} opportunity moves to ${pipelineLabel(pl.pipeline)}${stage}.`;
     }
+    case 'sync_confirmation_opportunity':
+      return `${capitalize(whose)} card in the Confirmation Pipeline is created or moved to match LP${pl.disposition_code ? ` (${pl.disposition_code})` : ''}.`;
     case 'add_tag': {
       const tag = pl.tag || (Array.isArray(pl.tags) ? pl.tags.join(', ') : '');
       const meaning = tagMeaning(String(tag));

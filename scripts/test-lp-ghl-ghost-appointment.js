@@ -302,7 +302,7 @@ test('readLiveForSync: Set reads and writes the mirror; dry run never writes; CX
 // ═══ 6. The Slack alert ═══════════════════════════════════════════════════
 
 const ghostLead = {
-  lp_lead_id: '475840', first_name: 'Gilles', last_name: 'Edouard', disposition_code: 'Set',
+  lp_lead_id: '475840', lp_prospect_id: '388120', first_name: 'Gilles', last_name: 'Edouard', disposition_code: 'Set',
   appointment_date: '2026-11-30T10:00:00+00:00',
 };
 const ghostResult = {
@@ -314,9 +314,11 @@ const ghostResult = {
 // "LP date/time looks wrong — confirmation team must fix in LP".
 test('alert text names the lead, the date, the last activity and the fix', () => {
   const text = formatImplausibleAppointmentAlert({ contactId: 'BQ7uPNReghzTTLVjKFJS', lead: ghostLead, result: ghostResult });
-  for (const part of ['LP date/time looks wrong — confirmation team must fix in LP', 'Gilles Edouard', '475840', 'BQ7uPNReghzTTLVjKFJS', '2026-11-30 10:00', '2025-11-26', 'likely a year typo', 'Fix the date/time in LP']) {
+  for (const part of ['LP date/time looks wrong — confirmation team must fix in LP', 'Gilles Edouard', 'LP: Prospect 388120', 'BQ7uPNReghzTTLVjKFJS', '2026-11-30 10:00', '2025-11-26', 'likely a year typo', 'Fix the date/time in LP']) {
     assert.ok(text.includes(part), `missing "${part}"`);
   }
+  // The prospect, never the lead id (the user, 2026-10-16).
+  assert.ok(!text.includes('475840'), 'card must not print the LP lead id');
 });
 
 test('alert goes to Slack #ops-alerts once per lead + date (claim before send)', async () => {
@@ -377,13 +379,14 @@ test('runStaleAppointmentRefresh: dry run writes nothing; apply writes lp_leads 
 
 test('an impossible hour gets the same card and the same per lead + date claim', async () => {
   const { notifyLpLooksWrong, formatLpLooksWrongAlert } = await import('../src/actions/handlers/lp-ghl-appointment-sync.js');
-  const stuckey = { lp_lead_id: '583740', first_name: 'S', last_name: 'Stuckey', disposition_code: 'Set', set_by_name: 'Agent A', appointment_date: '2026-11-03T02:00:00+00:00' };
+  const stuckey = { lp_lead_id: '583740', lp_prospect_id: '462947', first_name: 'S', last_name: 'Stuckey', disposition_code: 'Set', set_by_name: 'Agent A', appointment_date: '2026-11-03T02:00:00+00:00' };
   const result = { reason: 'impossible_hour', start_time: '2026-11-03T02:00:00-05:00', appointment_hour_et: 2 };
   const text = formatLpLooksWrongAlert({ contactId: 'c-stuckey', lead: stuckey, result });
-  for (const part of ['LP date/time looks wrong', '583740', '2026-11-03 02:00', 'Set by: Agent A', 'outside 8 AM–8 PM']) {
+  for (const part of ['LP date/time looks wrong', 'LP: Prospect 462947', '2026-11-03 02:00', 'Set by: Agent A', 'outside 8 AM–8 PM']) {
     assert.ok(text.includes(part), `missing "${part}"`);
   }
   assert.doesNotMatch(text, /add it to/i);
+  assert.ok(!text.includes('583740'), 'card must not print the LP lead id');
   const keys = new Set();
   const sent = [];
   const deps = {

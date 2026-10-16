@@ -183,12 +183,13 @@ test('uncalled / intake alarms are three-way, and verdicts map onto `active`', (
 test('cards name the leads — first name + initial, the full phone as digits (2026-10-13)', () => {
   const offenders = [{
     first_name: 'Jane', last_name: 'Doe', phone10: '3524453161', lead_source: 'Google PPC',
-    reason: 'routing_or_automation_failure', lp_lead_id: '578472', waitingMs: 3 * 3600000 + 600000,
+    reason: 'routing_or_automation_failure', lp_lead_id: '578472', lp_prospect_id: '462947', waitingMs: 3 * 3600000 + 600000,
   }];
   const text = formatUncalledAlert(offenders, { dashboardUrl: 'https://dash.example/lead-leaks' });
   assert.match(text, /1 lead waiting more than 2h for a Five9 call/);
   assert.match(text, /\*Never dialled — Five9 has the number — 1\*/, 'grouped under its reason');
-  assert.match(text, /Jane D\. · 3524453161 · Google PPC · waiting 3h 10m · Never dialled — Five9 has the number · LP 578472/);
+  assert.match(text, /Jane D\. · 3524453161 · Google PPC · waiting 3h 10m · Never dialled — Five9 has the number · LP Prospect 462947/);
+  assert.doesNotMatch(text, /578472/);
   assert.match(text, /https:\/\/dash\.example\/lead-leaks/);
 
   const speed = formatSpeedAlert({ reasons: ['slower'], recent: { median_min: 90 }, baseline: { median_min: 20 } }, offenders);
@@ -551,7 +552,7 @@ test('NOC zip lookup: in-area stays a leak, out-of-area goes to review, a failed
 
 test('daily pass, alerts live: a NIS2 set in the last day fires the retired-code card naming the lead', async () => {
   const calls = [];
-  const fresh = lpLead({ lp_lead_id: '930', first_name: 'Pat', last_name: 'Lee', phone: '3525550930',
+  const fresh = lpLead({ lp_lead_id: '930', lp_prospect_id: '9300', first_name: 'Pat', last_name: 'Lee', phone: '3525550930',
     disposition_code: 'NIS2', created_at_lp: lpTs(48), updated_at_lp: lpTs(2) });
   const old = lpLead({ lp_lead_id: '931', phone: '3525550931', disposition_code: 'NIS2',
     created_at_lp: lpTs(400), updated_at_lp: lpTs(300) });
@@ -565,8 +566,8 @@ test('daily pass, alerts live: a NIS2 set in the last day fires the retired-code
   assert.equal(card.channel, 'ops');
   const text = card.text();
   assert.match(text, /Retired code used on 1 lead/);
-  assert.match(text, /Pat L\. · coded NIS2 · LP 930/);
-  assert.ok(!text.includes('LP 931'), 'an old NIS2 is history, not a new use');
+  assert.match(text, /Pat L\. · coded NIS2 · LP Prospect 9300/);
+  assert.ok(!/· LP Prospect: unknown/.test(text), 'an old NIS2 is history, not a new use');
 });
 
 /* --- business hours only (2026-09-29) -------------------------------- */

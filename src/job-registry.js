@@ -455,6 +455,27 @@ export const JOBS = Object.freeze([
     isEnabled: (env) => String(env.CANCEL_RESET_ROUTING_MODE || 'live').toLowerCase().trim() !== 'off',
   },
   {
+    // 2026-10-16 handoff "4. Confirmation Pipeline". Always on: with
+    // CONF_PIPE_DRY_RUN (default true) it computes and logs, and with no
+    // CONF_PIPE_* rules it finds no open cards.
+    id: 'confirmation-pipeline-clock',
+    label: '4. Confirmation Pipeline: 24h move, 4h alert, close after the appointment',
+    group: 'ghl',
+    cadence: 'every 15 min, 24/7',
+    enabledEnv: null,
+    enabledDefault: true,
+    isEnabled: () => true,
+  },
+  {
+    id: 'confirmation-pipeline-sweep',
+    label: '4. Confirmation Pipeline: close every open card dated before today',
+    group: 'ghl',
+    cadence: 'daily 00:05 ET',
+    enabledEnv: null,
+    enabledDefault: true,
+    isEnabled: () => true,
+  },
+  {
     id: 'inbound-checkout-watch',
     label: 'LP inquiries waiting to be checked out → #contact-center; mirror of LP\'s inbound queue',
     group: 'lp-intake',

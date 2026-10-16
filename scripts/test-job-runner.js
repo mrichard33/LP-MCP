@@ -441,7 +441,8 @@ test('the roster is unique, complete and shaped', () => {
   // 52 → 53 on 2026-10-15: cancel-reset-routing (cancelled leads → Resets-Hot).
   // 53 → 54 on 2026-10-15: five9-call-journey-sync (the Five9 Call Journey report → five9_call_journey).
   // 54 → 56 on 2026-10-15: time-change-lp-note-sweep, capacity-unfiled-alert (market capacity gate).
-  assert.equal(JOBS.length, 56);
+  // 56 → 58 on 2026-10-16: confirmation-pipeline-clock, confirmation-pipeline-sweep (4. Confirmation Pipeline).
+  assert.equal(JOBS.length, 58);
   for (const j of JOBS) {
     assert.match(j.id, /^[a-z0-9-]+$/, `${j.id} should be a slug`);
     assert.ok(j.label && j.group && j.cadence, `${j.id} needs a label, group and cadence`);

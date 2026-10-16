@@ -181,9 +181,10 @@ test('missing (Sharyn Blake): a blank Data lead on top of the demo lead does not
 });
 
 test('missing report: lists the demos that never reached F.0', () => {
-  const text = formatF0AuditReport({ total: 390, flagged: [], missing: [{ contact_id: 'c9', lp_lead_id: 'L9' }] });
+  const text = formatF0AuditReport({ total: 390, flagged: [], missing: [{ contact_id: 'c9', lp_lead_id: 'L9', lp_prospect_id: 'P9' }] });
   assert.match(text, /NOT in F\.0: 1/);
-  assert.match(text, /c9 · lead L9/);
+  assert.match(text, /c9 · LP Prospect P9/);
+  assert.doesNotMatch(text, /L9/);
 });
 
 function fakeSupabase(rows) {
@@ -226,7 +227,7 @@ test('runF0IntegrityAudit: reports a demo that is missing from F.0 and posts not
   const r = await runF0IntegrityAudit({ post: false, autoEnroll: false, deps });
   assert.equal(r.ok, true);
   assert.deepEqual(r.flagged, []);
-  assert.deepEqual(r.missing, [{ contact_id: 'missed', lp_lead_id: 'L-missed' }]);
+  assert.deepEqual(r.missing, [{ contact_id: 'missed', lp_lead_id: 'L-missed', lp_prospect_id: null }]);
   assert.match(r.text, /NOT in F\.0: 1/);
 });
 

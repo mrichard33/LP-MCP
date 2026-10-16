@@ -212,6 +212,7 @@ export async function runDncReentrySweep({ env = process.env, deps = {} } = {}) 
     const ins = await d.supabase.from('agent_actions').insert(buildReviewAction(lead)).select('id').single();
     if (ins.error) {
       // Left unmarked: the next pass asks again.
+      // lead-id-ok: job_runs error detail, not a card
       errors.push(`queue ${lead.ghl_contact_id} (lead ${lead.lp_lead_id}): ${ins.error.message}`);
       continue;
     }

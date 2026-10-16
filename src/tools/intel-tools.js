@@ -474,6 +474,7 @@ export function registerIntelTools(server) {
                 ts: toIsoString(row.appointment_date),
                 source: 'lp',
                 type: 'appointment_set',
+                // lead-id-ok: MCP tool output, not Slack
                 summary: `Appointment set (lead ${row.lp_lead_id})`,
                 detail: { rep: row.rep_name },
               });
@@ -483,6 +484,7 @@ export function registerIntelTools(server) {
                 ts: toIsoString(row.demo_date),
                 source: 'lp',
                 type: 'demo_completed',
+                // lead-id-ok: MCP tool output, not Slack
                 summary: `Demo completed (lead ${row.lp_lead_id})`,
                 detail: { rep: row.rep_name, job_value: row.job_value },
               });

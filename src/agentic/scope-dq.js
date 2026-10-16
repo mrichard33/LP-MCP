@@ -22,6 +22,7 @@
 // PURE. Every write is a deps call (production deps: src/services/scope-dq-io.js).
 
 import { jobScopeFromThread } from './job-scope.js';
+import { prospectLabel } from '../format-helpers.js';
 
 export const SCOPE_DQ_REASON = 'scope_dq';
 export const SCOPE_DQ_AUDIT = 'scope_dq';
@@ -50,7 +51,7 @@ export function lpNoteText(kind) {
 /** The card's extra lines. Pure. */
 export function cardExtra({ kind, prospectId = null, leadId = null, note = 'skipped', phone = null }) {
   const lp = prospectId
-    ? `LP: prospect ${prospectId}${leadId ? ` · lead ${leadId}` : ''}`
+    ? `LP: ${prospectLabel(prospectId)}`
     : 'LP: no LP lead is linked to this contact. Search LP by phone; if there is no lead, there is nothing to set.';
   const noteLine = note === 'added' ? 'LP note: added.'
     : note === 'failed' ? 'LP note: could NOT be added (LP refused or was unreachable).'

@@ -782,6 +782,8 @@ export async function measureLeadLeak({ env = process.env, nowMs = Date.now(), d
       created_at_lp: t.lead.created_at_lp ?? null,
       lead_source: t.lead.lead_source ?? null,
       lp_lead_id: String(t.lead.lp_lead_id),
+      // Cards name the prospect, never the lead id (the user, 2026-10-16).
+      lp_prospect_id: t.lead.lp_prospect_id == null ? null : String(t.lead.lp_prospect_id),
       // 2026-10-16 (Fix 6): the last call was the final After DIAL ASAP try and
       // nothing has dialed since — the hand-off to the next list did not happen.
       reason: lastRec?.campaign === 'After DIAL ASAP' ? ATTEMPTS_EXHAUSTED_REASON : CALLED_NO_RETRY_REASON,
@@ -802,7 +804,7 @@ export async function measureLeadLeak({ env = process.env, nowMs = Date.now(), d
   const offenders = [
     ...rows
       .filter((r) => LEAK_REASONS.includes(r.reason))
-      .map((r) => ({ ...r.detail, lead_source: r.lead_source, reason: r.reason, lp_lead_id: r.lp_lead_id,
+      .map((r) => ({ ...r.detail, lead_source: r.lead_source, reason: r.reason, lp_lead_id: r.lp_lead_id, lp_prospect_id: r.lp_prospect_id,
         waitingMs: waitingMs(r.detail.created_at_lp, nowMs) })),
     ...retryWaiting,
   ]
@@ -829,7 +831,8 @@ export async function measureLeadLeak({ env = process.env, nowMs = Date.now(), d
   const retiredCodeInUse = leads.filter(isRetiredCode).length;
   // A retired code put on a lead in the last day — somebody still picking it.
   const retiredFresh = leads.filter((l) => isNewlyRetiredCode(l, nowMs)).map((l) => ({
-    lp_lead_id: String(l.lp_lead_id), first_name: l.first_name ?? null, last_name: l.last_name ?? null,
+    lp_lead_id: String(l.lp_lead_id), lp_prospect_id: l.lp_prospect_id == null ? null : String(l.lp_prospect_id),
+    first_name: l.first_name ?? null, last_name: l.last_name ?? null,
     disposition_code: l.disposition_code,
   }));
   const summary = summarize(rows, { retiredCodeInUse });
