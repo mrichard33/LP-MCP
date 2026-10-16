@@ -1399,6 +1399,43 @@ test('a zip the visitor typed reaches the booking-slot read (77494 → Central, 
   assert.equal(calls[0].zip, '77494');
 });
 
+// 2026-10-16 (bot gate, houston_tz/livechat): a Central lead's clock times
+// carry "CT" whatever the model wrote ("…on the calendar for Saturday,
+// October 17 at 9:00 AM." shipped with no zone).
+function confirmLane(label) {
+  const offer = `I have Tue, Oct 6 at 10:00 AM ${label} or Wed, Oct 7 at 2:00 PM ${label}. Which works better?`;
+  const hold = `Great, I'm holding Tue, Oct 6 at 10:00 AM ${label} for you. What's the street address for the visit, including the zip code?`;
+  const dmAsk = "Got it. Will anyone else be part of the decision? We'll want them there too so nobody has to repeat anything.";
+  const draft = "Perfect, Alyce, you're all set. Someone from our team will give you a call to confirm the details, and you're on the calendar for Tue, Oct 6 at 10:00 AM.";
+  const box = {};
+  const made = makeLane({
+    llm: () => ({ message: draft }), phone: '+13525550188',
+    messages: [M('outbound', offer, 4), M('inbound', 'the first one', 3), M('outbound', hold, 2), M('inbound', '123 Main St, Katy TX 77494', 1), M('outbound', dmAsk, 0.5)],
+    extra: {
+      fetchContact: async () => ({ id: 'C1', firstName: 'Alyce', tags: [], phone: '+13525550188', email: null, address1: '123 Main St', postalCode: label === 'CT' ? '77494' : '33601' }),
+      nepqMode: () => 'live',
+      offerBookingSlots: async () => ({ slots: NEPQ_SLOTS, tzLabel: label, calendarId: 'CALWE' }),
+      bookSlot: async (a) => { box.state.bookings = [...(box.state.bookings || []), a]; return { ok: true, action_id: 77 }; },
+      nepqHandoff: async () => {},
+    },
+  });
+  box.state = made.state;
+  return made;
+}
+
+test('a Central-time visitor reads the booked time with CT, added by code', async () => {
+  const { lane, state } = confirmLane('CT');
+  await lane.processInbound(INBOUND('just me'));
+  assert.equal(state.bookings.length, 1);
+  assert.match(state.sends[0].message, /on the calendar for Tue, Oct 6 at 10:00 AM CT\./);
+});
+
+test('an Eastern visitor\'s booked time is left as the model wrote it', async () => {
+  const { lane, state } = confirmLane('ET');
+  await lane.processInbound(INBOUND('just me'));
+  assert.match(state.sends[0].message, /on the calendar for Tue, Oct 6 at 10:00 AM\./);
+});
+
 // ── 2026-10-12 (handoff PR 3): service-area parity and the renter guard ──
 
 test('a zip typed outside a coverage question is checked; out of area → the one decline (batch 2 #3)', async () => {
