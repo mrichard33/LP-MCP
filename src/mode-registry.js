@@ -196,6 +196,36 @@ export const MODES = Object.freeze([
     note: 'Keeps suppressed contacts out of the S1.3 lead selection.',
   }),
 
+  // ── Siro (2026-10-16, Siro PR 1; src/siro/config.js) ───────────────────
+  m('SIRO_WEBHOOK_MODE', 'intake', 'enum', OSL, 'shadow', OSL_S, {
+    since: '2026-10-16', evidence: { table: 'siro_webhook_events' },
+    note: 'POST /webhook/siro: shadow verifies, stores and matches each Siro recording; live also emits siro.recording_processed and queues the demo note.',
+  }),
+  m('SIRO_SYNC_MODE', 'intake', 'enum', OSL, 'shadow', OSL_S, {
+    since: '2026-10-16', evidence: { ...job('siro-recording-sync'), table: 'siro_recordings' },
+    note: 'The 10-minute Siro poll backstop: shadow stores and matches, live also emits and queues the demo note.',
+  }),
+  m('SIRO_CONTEXT_MODE', 'bot', 'enum', OSL, 'shadow', OSL_S, {
+    since: '2026-10-16',
+    note: 'The PRESENTATION block (the Siro visit) in LEAD FACTS for post-demo leads; shadow only logs "[Siro] shadow: would add presentation facts".',
+  }),
+  m('SIRO_ENSURE_MODE', 'bot', 'enum', OL, 'off', OL_S, {
+    since: '2026-10-16',
+    note: 'One on-demand Siro look (by phone, 2s cap) for a post-demo lead with no stored recording.',
+  }),
+  m('SIRO_DEMO_NOTE_MODE', 'bot', 'enum', OSL, 'shadow', OSL_S, {
+    since: '2026-10-16', evidence: { table: 'siro_recordings' },
+    note: 'One GHL note per Siro recording (rule SIRO_DEMO_NOTE); shadow logs the text.',
+  }),
+  m('SIRO_SCORECARD_SYNC_MODE', 'sales', 'enum', OL, 'off', OL_S, {
+    since: '2026-10-16', evidence: { ...job('siro-rep-scorecard-sync'), table: 'siro_rep_scorecards' },
+    note: 'Nightly month-to-date Siro rep scorecards into siro_rep_scorecards.',
+  }),
+  m('F0_V2_MODE', 'bot', 'enum', OSL, 'shadow', OSL_S, {
+    since: '2026-10-16', evidence: { table: 'agentic_messages' },
+    note: 'F.0 v2 post-demo texts from the nurture orchestrator: off generates nothing, shadow forces approval (drafts + #contact-rehash card), live honours NURTURE_SHADOW_WORKFLOWS.',
+  }),
+
   // ── Knowledge base ──────────────────────────────────────────────────────
   m('KB_FAQ_SEMANTIC_MODE', 'knowledge', 'enum', OSL, 'off', OSL_S, {
     since: '2026-09-03', goLive: 'live in production (CLAUDE.md "The FAQ corpus"); rollback is shadow',

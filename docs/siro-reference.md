@@ -301,3 +301,20 @@ Same pattern: contact Siro CSM → open the Merge "magic link" (must say "Siro.a
 ---
 
 **Note:** The per-endpoint field-by-field schemas (shown in the "Try it" panels) come from Siro's OpenAPI files and are only partly captured above. Check the live page for any endpoint you build against.
+
+---
+
+## Events we emit (LP-MCP, added 2026-10-16)
+
+`siro.recording_processed` — once per recording (idempotency key `siro:<recording_id>`), only in live
+mode (`SIRO_WEBHOOK_MODE` / `SIRO_SYNC_MODE`), and only when the recording is processed AND matched to
+an LP lead. Payload:
+
+```json
+{ "recording_id": "...", "lp_lead_id": "...", "lp_prospect_id": "...", "ghl_contact_id": "...",
+  "rep_name": "...", "result": "closed | not closed | in progress", "followup_score": 1-5,
+  "objections": ["price", "spouse"], "interests": ["..."],
+  "match_method": "engagement | account | opportunity | phone | none" }
+```
+
+Rule examples (commented out): `sql/seeds/2026-10-16_siro_rules_EXAMPLES.sql`.

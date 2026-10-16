@@ -316,7 +316,7 @@ test('golden set runs every case in both NEPQ modes', () => {
 // ── the checks themselves: each fires on its incident and stays quiet on a good reply ──
 
 test('invariants: a clean reply passes every check that can run', () => {
-  const r = checkReply('What made you start looking at windows now?', { channel: 'livechat', inbound: 'hi', conversation: [], booked: false, nowMs: IN_HOURS_MS, rehash: false, warrantySent: false, postDemoStep: null });
+  const r = checkReply('What made you start looking at windows now?', { channel: 'livechat', inbound: 'hi', conversation: [], booked: false, nowMs: IN_HOURS_MS, rehash: false, warrantySent: false, postDemoStep: null, presentation: null });
   assert.deepEqual(r.violations, []);
   assert.deepEqual(r.skipped, []);
 });
@@ -327,6 +327,10 @@ test('invariants: each known bad reply is caught by its own check', () => {
     assert.ok(r.violations.some(v => v.code === code), `${code} not raised for: ${reply} (got ${r.violations.map(v => v.code).join(',') || 'none'})`);
   };
   expect('Hey {{contact.first_name}}, thanks for reaching out. What got you looking?', 'unresolved_token');
+  // 2026-10-16 (Siro PR 1): with the visit in the prompt, no price from it and no "your rep said".
+  const visit = { presentation: { rep_first_name: 'Brian', objections: [] } };
+  expect('The quote came in at $18,400. Does that still work?', 'presentation_quoted_price', visit);
+  expect('Brian mentioned the lanai slider. Still on your mind?', 'presentation_rep_quoted', visit);
   // 2026-10-15 (Shawn Eastman, post-demo): the three live rebuttals, the
   // unbacked follow-up and a question after the stop.
   expect('The cheaper bids we see usually cut something, subcontracted crews or parts-only warranties, and folks end up replacing in five years. Would that help?', 'post_demo_rebuttal', { postDemoStep: 'post_demo' });

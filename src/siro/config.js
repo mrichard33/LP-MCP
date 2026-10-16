@@ -4,7 +4,7 @@
  * Every Siro environment variable and its default, in one place, so the client,
  * the jobs, the context read and the F.0 step never disagree on a default.
  * Every *_MODE here is registered in src/mode-registry.js (decider Mark,
- * go-live NEEDS_RULING); the registry scan reads `env.X_MODE` from this file.
+ * go-live NEEDS_RULING); scripts/test-mode-registry.js finds each read here.
  *
  * AIOS: CANON.K.078 (least privilege: one org credential, read-mostly), K.070
  * (a bad value falls back to the safe default, never throws).

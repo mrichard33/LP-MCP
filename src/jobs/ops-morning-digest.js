@@ -40,7 +40,7 @@
 import { runJob as defaultRunJob } from '../job-runner.js';
 import { hourET, todayET } from './lp-report-common.js';
 import { duration } from '../health/plain.js';
-import { prospectLabel } from '../format-helpers.js';
+import { prospectLabel, slackPhone } from '../format-helpers.js';
 import {
   alertDigestEnabled, capLines, filterNew as defaultFilterNew, recordPosted as defaultRecordPosted,
   lastPostedCount as defaultLastPostedCount,
@@ -543,6 +543,52 @@ async function autoFixedCounts(deps, nowMs) {
   return counts;
 }
 
+// 2026-10-16 (Siro PR 1): Siro recordings from the last 24h we could not
+// match to an LP lead. They never reach LEAD FACTS or F.0 until matched (LP
+// connected in Siro, or a phone on the recording). Rep, date, 10-digit phone.
+async function siroNoLeadSection(deps, nowMs) {
+  const since = new Date(nowMs - DAY_MS).toISOString();
+  const { data, error } = await deps.supabase.from('siro_recordings')
+    .select('recording_id, rep_name, recorded_at, customer_phone, processed, deleted, lp_lead_id, ingested_at')
+    .is('lp_lead_id', null).gte('ingested_at', since);
+  if (error) throw new Error(`siro_recordings read failed: ${error.message}`);
+  const rows = (data || []).filter((r) => r.processed && !r.deleted);
+  if (!rows.length) return null;
+  const lines = rows.map((r) => `${r.rep_name || 'rep unknown'} · ${String(r.recorded_at || '').slice(0, 10) || 'date unknown'} · ${slackPhone(r.customer_phone) || 'no phone'}`);
+  return { title: `Siro recordings with no lead (${rows.length})`, lines: capLines(lines, SECTION_MAX) };
+}
+
+// 2026-10-16 (F.0 v2): yesterday's post-demo texts — generated, awaiting
+// approval, sent, suppressed by reason — and every suppressed_low_conf draft,
+// so the prompt rows can be tuned. No per-message card exists beyond the
+// approval card; this is where the rest is seen.
+async function f0V2Section(deps, nowMs) {
+  const since = new Date(nowMs - DAY_MS).toISOString();
+  const { data, error } = await deps.supabase.from('agentic_messages')
+    .select('generation_id, send_status, suppressed_reason, generated_sms, prompt_code, generated_at')
+    .eq('workflow_code', 'F.0').gte('generated_at', since);
+  if (error) throw new Error(`agentic_messages read failed: ${error.message}`);
+  const rows = data || [];
+  if (!rows.length) return null;
+  const awaiting = rows.filter((r) => r.suppressed_reason === 'awaiting_approval').length;
+  const sent = rows.filter((r) => r.send_status === 'ghl_sent_confirmed').length;
+  const ready = rows.filter((r) => r.send_status === 'generated_ready').length;
+  const byReason = {};
+  for (const r of rows) {
+    if (r.suppressed_reason && r.suppressed_reason !== 'awaiting_approval') {
+      const k = String(r.suppressed_reason).split(':')[0];
+      byReason[k] = (byReason[k] || 0) + 1;
+    }
+  }
+  const lines = [`generated ${rows.length} · awaiting approval ${awaiting} · ready ${ready} · sent ${sent}`];
+  const reasons = Object.entries(byReason).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k} ${v}`);
+  if (reasons.length) lines.push(`suppressed: ${reasons.join(', ')}`);
+  for (const r of rows.filter((x) => x.send_status === 'suppressed_low_conf').slice(0, 5)) {
+    lines.push(`low confidence (${r.prompt_code || '?'}, ${String(r.suppressed_reason || '').replace(/^safety_failed_after_retry:/, '')}): ${String(r.generated_sms || '').slice(0, 200)}`);
+  }
+  return { title: 'F.0 v2 yesterday', lines };
+}
+
 // Fix 4: one line per lead whose LP date/time looked wrong in the last 24h (the
 // per-lead card's claim in lp_sync_failure_notices is the source).
 async function lpLooksWrongSection(deps, nowMs) {
@@ -635,7 +681,7 @@ export async function runOpsMorningDigest({ post = true, deps: depsArg } = {}) {
   };
 
   deps.autoFixed = {};
-  for (const [label, build] of [['P2 won/lost summary', p2Section], ['Sale → P2 backstop summary', p2BackstopSection], ['Sale → contact backstop summary', saleContactSection], ['Appointment parity summary', paritySection], ['LP date/time looks wrong', lpLooksWrongSection], ['Duplicate LP leads', duplicateLeadsSection], ['Disqualified Five9 removals', disqualifiedFive9Section], ['Post-issue rebook summary', postIssueSection], ['Shadow-mode review', shadowModesSection], ['System health', systemHealthSection], ['Five9 call cap', callCapSection]]) {
+  for (const [label, build] of [['P2 won/lost summary', p2Section], ['Sale → P2 backstop summary', p2BackstopSection], ['Sale → contact backstop summary', saleContactSection], ['Appointment parity summary', paritySection], ['LP date/time looks wrong', lpLooksWrongSection], ['Duplicate LP leads', duplicateLeadsSection], ['Disqualified Five9 removals', disqualifiedFive9Section], ['Post-issue rebook summary', postIssueSection], ['Shadow-mode review', shadowModesSection], ['System health', systemHealthSection], ['Five9 call cap', callCapSection], ['Siro recordings with no lead', siroNoLeadSection], ['F.0 v2 yesterday', f0V2Section]]) {
     try { sections.push(await build(deps, nowMs)); } catch (err) { await couldNotRun(label, err.message); }
   }
   try { sections.push(...await nightlySummarySections(deps, nowMs)); } catch (err) { await couldNotRun('Nightly summaries (tag sweep, inbound callers, rule targets)', err.message); }

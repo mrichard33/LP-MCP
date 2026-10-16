@@ -1,0 +1,22 @@
+-- Siro rule EXAMPLES (2026-10-16, Siro PR 1). COMMENTED OUT: nothing here runs.
+--
+-- siro.recording_processed is emitted once per recording (idempotency key
+-- siro:<recording_id>) when SIRO_WEBHOOK_MODE / SIRO_SYNC_MODE is live; it is
+-- on the intake allowlist (src/services/event-intake-filter.js). Payload:
+--   { recording_id, lp_lead_id, lp_prospect_id, ghl_contact_id, rep_name,
+--     result, followup_score, objections[], interests[], match_method }
+-- Before using an operator below, confirm it exists in
+-- evaluateContextConditions (an unknown operator silently never fires).
+--
+-- (a) A strong Siro follow-up on an unsold demo → the #contact-rehash card
+--     (src/notifications/rehash-call.js), reason siro_followup.
+-- insert into agent_rules (rule_name, event_type, enabled, priority, context_conditions, action_type, action_template, requires_approval)
+-- values ('SIRO_FOLLOWUP_REHASH_CARD', 'siro.recording_processed', false, 50,
+--   '{"payload_gte": {"followup_score": 4}, "lp_disposition_not_in": ["Sale"]}'::jsonb,
+--   'send_notification', '{"route": "rehash_call", "reason": "siro_followup"}'::jsonb, false);
+--
+-- (b) A price objection at the visit → the plain tag nepq:objection:price.
+-- insert into agent_rules (rule_name, event_type, enabled, priority, context_conditions, action_type, action_template, requires_approval)
+-- values ('SIRO_PRICE_OBJECTION_TAG', 'siro.recording_processed', false, 60,
+--   '{"payload_array_contains": {"objections": "price"}}'::jsonb,
+--   'add_tag', '{"tag": "nepq:objection:price"}'::jsonb, false);
