@@ -312,3 +312,19 @@ test('eval: the pick helper reads the model\'s own wording of its offer', async 
   const run = { transcript: [{ turn: 1, customer: 'hi', bot: [a] }, { turn: 2, customer: 'Saturday, October 17 at 6:00 PM ET?', bot: ["I'm holding Saturday, October 17 at 6:00 PM ET for you. What's your first name?"] }] };
   assert.deepEqual(SCENARIO_EXPECTATIONS.pick_with_question_mark(run), []);
 });
+
+test('5: "Saturday at 2:00 PM or Saturday at 6:00 PM" means the nearest Saturday', async () => {
+  const { offeredSlots } = await import('../src/live-chat/cancel-flow.js');
+  const S2 = { iso: '2026-10-17T18:00:00Z', day: 'Sat, Oct 17', time: '2:00 PM', dayOfWeek: 'Saturday', rel: 'tomorrow' };
+  const S6 = { iso: '2026-10-17T22:00:00Z', day: 'Sat, Oct 17', time: '6:00 PM', dayOfWeek: 'Saturday', rel: 'tomorrow' };
+  const N6 = { iso: '2026-10-24T22:00:00Z', day: 'Sat, Oct 24', time: '6:00 PM', dayOfWeek: 'Saturday' };
+  const offer = 'Perfect. We have Saturday at 2:00 PM or Saturday at 6:00 PM. Which time is better for you?';
+  const offered = offeredSlots(offer, [S2, S6, N6]);
+  assert.deepEqual(offered.map(s => s.iso), [S2.iso, S6.iso]);
+  assert.equal(pickSlot('Saturday at 6:00 PM ET?', offered)?.iso, S6.iso);
+  // A date the offer names stays.
+  assert.deepEqual(offeredSlots('I have Sat, Oct 17 at 6:00 PM or Sat, Oct 24 at 6:00 PM.', [S6, N6]).map(s => s.iso), [S6.iso, N6.iso]);
+  const p = planNepqTurn({ knownOpenings: true, knownDecisionMakers: true, channel: 'livechat', nowMs: OPEN_MS,
+    trigger: 'Saturday at 6:00 PM ET?', conversation: T(['inbound', 'Just me.'], ['outbound', offer]), slots: [S2, S6], allSlots: [S2, S6, N6], tzLabel: 'ET' });
+  assert.equal(p.required_move, 'confirm');
+});

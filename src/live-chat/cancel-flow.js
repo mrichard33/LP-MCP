@@ -336,9 +336,37 @@ export function offeredSlots(offerText, freeSlots) {
   // times, and "the first one" booked the SECOND (simulator, never live).
   // Part 7 replay: the model writes "Sunday at 10 AM", so a mention counts too.
   const at = (s) => slotMentionIndex(text, s);
-  return (Array.isArray(freeSlots) ? freeSlots : [])
-    .filter((s) => at(s) >= 0)
-    .sort((x, y) => at(x) - at(y));
+  const named = (Array.isArray(freeSlots) ? freeSlots : []).filter((s) => at(s) >= 0);
+  return soonestPerWeekday(named, text).sort((x, y) => at(x) - at(y));
+}
+
+/**
+ * An offer that names a weekday without its date ("Saturday at 2:00 PM or
+ * Saturday at 6:00 PM") means the NEAREST Saturday. 2026-10-16 (Melissa eval):
+ * every later Saturday at 6 PM in the calendar read as offered too, so
+ * "Saturday at 6:00 PM ET?" matched two openings and the bot offered new
+ * times instead of holding the one it had offered. A slot whose own date the
+ * text names ("Sat, Oct 24") always stays. Pure.
+ */
+export function soonestPerWeekday(slots, text) {
+  const t = String(text || '').toLowerCase();
+  const dated = (s) => {
+    const [, mon, dd] = String(s?.day || '').toLowerCase().match(/(\w{3})\s+(\d{1,2})$/) || [];
+    return !!(mon && dd && new RegExp(`\\b${mon}\\w*\\.?\\s+${dd}\\b`).test(t));
+  };
+  const groups = new Map();
+  for (const s of slots) {
+    const key = `${String(s?.dayOfWeek || String(s?.day || '').slice(0, 3)).toLowerCase()}|${s?.time}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(s);
+  }
+  const out = [];
+  for (const g of groups.values()) {
+    if (g.length === 1) { out.push(g[0]); continue; }
+    const named = g.filter(dated);
+    out.push(...(named.length ? named : [g.slice().sort((a, b) => Date.parse(a.iso) - Date.parse(b.iso))[0]]));
+  }
+  return out;
 }
 
 /**
