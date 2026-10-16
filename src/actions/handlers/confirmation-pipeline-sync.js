@@ -166,14 +166,14 @@ async function runOne({ contactId, lpLeadId, lpChangedAt, timeBased, lead, sourc
         .eq('lp_lead_id', String(cardRow.lp_lead_id)).is('lp_deleted_at', null).maybeSingle();
       const cardAppt = readAppointment(cardLead?.appointment_date);
       if (cardLead && cardAppt && !appointmentPassed(cardAppt, deps.now(), readConfig(deps.env))) {
-        notes.push(`newest lead ${lead.lp_lead_id} has no appointment; card stays on lead ${cardLead.lp_lead_id}`);
+        notes.push(`newest lead ${lead.lp_lead_id} has no appointment; card stays on lead ${cardLead.lp_lead_id}`); // lead-id-ok: confirmation_opportunity_log note, never Slack text
         lead = cardLead;
       }
     }
   }
   const leadId = String(lead.lp_lead_id);
   const disposition = String(lead.disposition_code || '');
-  if (lpLeadId && String(lpLeadId) !== leadId) notes.push(`event lead ${lpLeadId} is not the newest (${leadId})`);
+  if (lpLeadId && String(lpLeadId) !== leadId) notes.push(`event lead ${lpLeadId} is not the newest (${leadId})`); // lead-id-ok: confirmation_opportunity_log note, never Slack text
 
   if (isCanvassLead(lead)) {
     await writeLog(db, { lp_lead_id: leadId, action: 'skip', source, lp_disposition: disposition, dry_run: dry, note: 'canvass_lead' }, log);
@@ -301,7 +301,7 @@ async function runOne({ contactId, lpLeadId, lpChangedAt, timeBased, lead, sourc
     }
   }
 
-  if (rebind && row) notes.push(`rebind from lead ${row.lp_lead_id}`);
+  if (rebind && row) notes.push(`rebind from lead ${row.lp_lead_id}`); // lead-id-ok: confirmation_opportunity_log note, never Slack text
   if (decision.reschedule) notes.push('reschedule');
   if (rename) notes.push(`rename → ${expectedName}`);
   await writeLog(db, {

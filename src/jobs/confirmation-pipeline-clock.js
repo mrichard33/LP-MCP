@@ -115,7 +115,7 @@ export async function runConfirmationClock({ deps = defaultDeps() } = {}) {
         if (cfg.dryRun) note = 'dry_run';
         else if (!cfg.slackChannel) {
           note = 'no_channel';
-          deps.log.warn?.(`[ConfPipe] 4h alert for lead ${current.lp_lead_id} not posted: CONF_SLACK_CHANNEL is empty`);
+          deps.log.warn?.(`[ConfPipe] 4h alert for lead ${current.lp_lead_id} not posted: CONF_SLACK_CHANNEL is empty`); // lead-id-ok: server log, never Slack text
         } else {
           const res = await deps.postToSlack(buildAlertText(current, appt, cfg), cfg.slackChannel);
           note = res?.ok ? `posted ts=${res.ts}` : `post_failed: ${res?.error || 'unknown'}`;
