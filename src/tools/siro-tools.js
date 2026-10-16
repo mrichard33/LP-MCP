@@ -20,7 +20,7 @@ import { resolveOrganizationId, monthStartIso } from '../jobs/siro-rep-scorecard
 import { normalizePhone10 } from '../lead-leak-classify.js';
 
 const ok = (obj) => ({ content: [{ type: 'text', text: JSON.stringify(obj, null, 2) }] });
-const ROW_COLS = 'recording_id, rep_name, rep_email, result, recorded_at, updated_at_siro, deleted, processed, linked, match_method, lp_lead_id, lp_prospect_id, ghl_contact_id, customer_phone, followup_score, followup_status, followup_action, summary, moments, source, event_emitted_at, ghl_note_action_id, context_ready';
+const ROW_COLS = 'recording_id, rep_name, rep_email, result, recorded_at, updated_at_siro, deleted, processed, linked, match_method, lp_lead_id, lp_prospect_id, ghl_contact_id, customer_phone, followup_score, followup_status, followup_action, insights, pricing, summary, moments, source, event_emitted_at, ghl_note_action_id, context_ready';
 
 async function rowsFor({ lp_lead_id, lp_prospect_id, ghl_contact_id }, limit = 10) {
   let q = supabase.from('siro_recordings').select(ROW_COLS).order('recorded_at', { ascending: false }).limit(limit);
@@ -178,8 +178,8 @@ export function registerSiroTools(server) {
 
   server.tool(
     'siro_sync_run',
-    'Run one Siro poll pass now (the 10-minute backstop). dry_run (default true) lists what it would process and writes nothing; dry_run=false stores and matches at the current SIRO_SYNC_MODE (shadow: store only). since overrides the watermark (ISO time).',
-    { since: z.string().optional(), dry_run: z.boolean().optional() },
-    async ({ since, dry_run }) => ok(await runSiroRecordingSync({ since: since || null, dryRun: dry_run !== false })),
+    'Run one Siro poll pass now (the 10-minute backstop). dry_run (default true) lists what it would process and writes nothing; dry_run=false stores and matches at the current SIRO_SYNC_MODE (shadow: store only). since overrides the watermark (ISO time). reprocess=true re-normalizes every recording in the window even when Siro did not change it (use after a normalize change; it never writes a demo note or emits an event in shadow).',
+    { since: z.string().optional(), dry_run: z.boolean().optional(), reprocess: z.boolean().optional() },
+    async ({ since, dry_run, reprocess }) => ok(await runSiroRecordingSync({ since: since || null, dryRun: dry_run !== false, reprocess: reprocess === true })),
   );
 }

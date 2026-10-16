@@ -54,6 +54,8 @@ export function siroConfig(env = process.env) {
     ratePerMin: num(env.SIRO_RATE_PER_MIN, 600, { min: 1, max: 1000 }),
     waitMaxH: num(env.SIRO_WAIT_MAX_H, 24, { min: 0, max: 168 }),
     waitHoldH: num(env.SIRO_WAIT_HOLD_H, 2, { min: 1, max: 24 }),
+    // A demo note is written only for a visit this recent (new visits only, 2026-10-16).
+    demoNoteMaxAgeH: num(env.SIRO_DEMO_NOTE_MAX_AGE_H, 48, { min: 1, max: 720 }),
     nurtureShadowWorkflows: String(env.NURTURE_SHADOW_WORKFLOWS ?? 'F.0')
       .split(',').map(s => s.trim()).filter(Boolean),
     f0ApprovalChannel: env.F0_APPROVAL_CHANNEL || env.SLACK_CHANNEL_REHASH || 'C0C5YMHNYJH',
