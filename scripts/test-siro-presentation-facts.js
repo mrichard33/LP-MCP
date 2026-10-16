@@ -80,3 +80,38 @@ test('rep first names', () => {
   assert.equal(repFirstName('jane doe'), 'Jane');
   assert.equal(repFirstName(''), null);
 });
+
+test('the bot never reads Siro\'s discount advice; the rest of the advice stays (2026-10-16)', () => {
+  const advice = { ...row, followup_action: null, insights: {
+    ...row.insights,
+    follow_up_summary: 'The sales consultant should follow up ASAP after her next estimate to review the brochures, confirm door specifications, and offer the additional $2,000 to $5,000 discount to secure the agreement.',
+    objection_summary: 'She held off over price. The consultant could ask for a manager-approved discount.',
+  } };
+  const f = buildPresentationFacts([advice], { now: NOW });
+  assert.equal(f.insights.follow_up_summary, 'The sales consultant should follow up ASAP after her next estimate to review the brochures, confirm door specifications.');
+  assert.equal(f.insights.objection_summary, 'She held off over price.');
+  const block = renderPresentationBlock(f).join('\n');
+  assert.doesNotMatch(block, /discount|manager-approved/i);
+  assert.match(block, /Final quote: \$18,400/); // the quotes themselves stay
+  // A sentence that is only the concession goes; the next step falls back.
+  const only = buildPresentationFacts([{ ...row, insights: { follow_up_summary: 'Offer a reduced scope or manager-approved discount to get closer to her budget.', next_steps: ['Call on Friday.'] } }], { now: NOW });
+  assert.equal(only.insights.follow_up_summary, undefined);
+  assert.match(renderPresentationBlock(only).join('\n'), /^Agreed next step: Call on Friday\.$/m);
+});
+
+test('stored rows are cleaned on the way to the bot: HTML, a bare "Yes.", "N/A" prices', () => {
+  const messy = {
+    ...row,
+    moments: [
+      { kind: 'objection', objection_type: 'price', customer_said: '<ul><li>The strongest objection was affordability.</li></ul>' },
+      { kind: 'buying_signal', customer_said: 'Yes. The clearest need is replacing aging windows.' },
+    ],
+    pricing: { first_price_quote: 'N/A', final_price_quote: 'N/A', overall_cost: 'n/a', financing: 'About $200/month mentioned.' },
+  };
+  const f = buildPresentationFacts([messy], { now: NOW });
+  assert.equal(f.objections[0].said, 'The strongest objection was affordability.');
+  assert.equal(f.interests[0], 'The clearest need is replacing aging windows.');
+  assert.deepEqual(f.pricing, { financing: 'About $200/month mentioned.' });
+  assert.doesNotMatch(renderPresentationBlock(f).join('\n'), /N\/A|<\/?(?:ul|li)>/i);
+  assert.equal(buildPresentationFacts([{ ...row, pricing: { first_price_quote: 'N/A' } }], { now: NOW }).pricing, null);
+});

@@ -56,13 +56,25 @@ export function objectionTypeOf(text) {
 }
 
 /** Siro's citation marks and markdown out, whitespace collapsed. Pure. */
+// 2026-10-16: some Siro sections arrive as HTML ("<ul><li>The strongest
+// objection…"); a tag or an entity must never reach a prompt or a note.
+const ENTITIES = { '&amp;': '&', '&lt;': '<', '&gt;': '>', '&quot;': '"', '&#39;': "'", '&nbsp;': ' ' };
 export function cleanSiroText(s) {
   return String(s ?? '')
+    .replace(/<(?:li|p|br|div)\b[^>]*>/gi, ' - ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&(?:amp|lt|gt|quot|#39|nbsp);/g, (m) => ENTITIES[m])
     .replace(/\[\d+\]/g, '')
     .replace(/\*\*/g, '')
     .replace(/\s+/g, ' ')
+    .replace(/(?:\s-(?=\s|$))+(?=\s-\s)/g, '') // " - - - A" → " - A"
+    .replace(/\s+-\s*$/, '')                   // a dangling bullet at the end
     .trim();
 }
+
+// Siro sometimes opens a bullet with a bare answer word ("Yes. The clearest
+// need is …"): the word answers a question nobody here asked.
+const BARE_ANSWER_RX = /^(?:yes|no|yeah|correct)[.,!]\s+(?=\S)/i;
 
 const cap = (s, n) => {
   const t = scrubPii(cleanSiroText(s));
@@ -91,7 +103,7 @@ export function bulletsOf(v) {
   // Bullets when Siro wrote them; only a bullet-less list splits on "; ", so a
   // sentence with a semicolon inside a bullet stays whole.
   const split = (rx) => t.split(rx).map(x => x.trim()).filter(Boolean);
-  const bullets = split(/(?:^|\s)[-•]\s+(?=\S)/);
+  const bullets = split(/(?:^|\s)[-•]\s+(?=\S)/).map(b => b.replace(BARE_ANSWER_RX, '')).filter(Boolean);
   if (bullets.length > 1 || /^[-•]\s/.test(t)) return bullets;
   const parts = split(/\n+|;\s+/);
   return parts.length ? parts : [t];
@@ -105,7 +117,7 @@ function kindForName(name) {
   return null;
 }
 
-const NONE_RX = /^(?:none|n\/a|no|null|not\s+(?:mentioned|discussed|applicable))\.?$/i;
+export const NONE_RX = /^(?:none|n\/a|na|no|null|unknown|not\s+(?:mentioned|discussed|applicable|provided|quoted|given))\.?$/i;
 
 export function buildMoments({ extractions = [], summary = [] } = {}) {
   const out = [];
@@ -181,7 +193,9 @@ function pricingFrom(fu) {
   for (const k of PRICING_FIELDS) {
     const v = ctx[k];
     if (v == null || !String(v).trim()) continue;
-    out[k] = cap(valueText(v), 400);
+    const t = cap(valueText(v), 400);
+    if (t && !NONE_RX.test(t)) out[k] = t; // "N/A" when no quote was given
+
   }
   return Object.keys(out).length ? out : null;
 }
