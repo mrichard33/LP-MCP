@@ -15,7 +15,8 @@
 //   post-demo or sold (isDemoDisposition: Sale, OPPFDN, NoRehash, FDNS, SW, PM)?
 //   Any source that says so locks it. Sources, cheapest first:
 //     1. the disposition the caller already resolved (no I/O)
-//     2. lp_leads (our copy, Supabase)
+//     2. lp_leads (our copy, Supabase), and a NEWER lead on the same prospect
+//        that is issued or post-demo (2026-10-16, Roberta Ritchie)
 //     3. LP live (GetLead by lds_id)
 //   A lead neither source knows (a lead minted minutes ago) is not post-demo and
 //   proceeds. Both reads FAILING is "could not tell" and locks: a SetAppointment
@@ -40,6 +41,20 @@ function liveDisposition(resp, ldsId) {
   return clean(lead.Disposition ?? lead.disposition ?? lead.disp_code ?? lead.dsp_id);
 }
 
+// Post-issue dispositions of a newer lead that make an older lead's write wrong:
+// Issue (the visit is with a rep) and every post-demo / sold code.
+async function newerOwningLead(sb, prospectId, ldsId) {
+  const { data, error } = await sb.from('lp_leads').select('lp_lead_id, disposition_code').eq('lp_prospect_id', String(prospectId));
+  if (error || !Array.isArray(data)) return null;
+  const mine = Number(ldsId);
+  for (const row of data) {
+    if (!(Number(row.lp_lead_id) > mine)) continue;
+    const d = clean(row.disposition_code);
+    if (d === 'Issue' || isDemoDisposition(d)) return { lp_lead_id: String(row.lp_lead_id), disposition: d };
+  }
+  return null;
+}
+
 /**
  * @param {string|number} ldsId
  * @param {object} [o]
@@ -56,12 +71,22 @@ export async function postDemoLock(ldsId, { knownDisposition = null, deps = {} }
   let dbSaw = false;
   try {
     const sb = deps.supabase || (await import('./supabase.js')).default;
-    const { data, error } = await sb.from('lp_leads').select('disposition_code').eq('lp_lead_id', String(ldsId)).maybeSingle();
+    const { data, error } = await sb.from('lp_leads').select('disposition_code, lp_prospect_id').eq('lp_lead_id', String(ldsId)).maybeSingle();
     if (error) throw new Error(error.message);
     if (data) {
       dbSaw = true;
       const d = clean(data.disposition_code);
       if (isDemoDisposition(d)) return { locked: true, disposition: d, source: 'lp_leads' };
+      // A NEWER lead on the same prospect that is post-demo or issued owns the
+      // visit (2026-10-16, Roberta Ritchie): the parity watchdog wrote GHL's
+      // stale 10/17 10 AM onto her OLDER lead 579742 (Data → Set) the afternoon
+      // her newest lead 583833 was issued and had its demo. An older lead must
+      // not take an appointment then. Best-effort: a failed read here adds no
+      // lock (the caller-lead checks above and below still stand).
+      if (data.lp_prospect_id) {
+        const newer = await newerOwningLead(sb, data.lp_prospect_id, ldsId).catch(() => null);
+        if (newer) return { locked: true, disposition: newer.disposition, source: 'newer_lead', newer_lp_lead_id: newer.lp_lead_id };
+      }
     }
   } catch {
     dbFailed = true;

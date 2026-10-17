@@ -199,6 +199,10 @@ async function sweepWithCcc({ ghlActive = new Map(), ghlCancelled = new Map() } 
       readLpBook: async () => books,
       getGHLContact: async () => ({ tags: [] }),
       syncAppointmentToLP: async () => ({ success: true, action: 'lp_appointment_set' }),
+      // 2026-10-16: no LP history for these contacts (lp-origin-guard.js), and no
+      // post-appointment close pass — both have their own tests.
+      readLpOrigin: async () => ({ syncCreated: new Set(), leadsByContact: new Map() }),
+      runPostAppointmentClose: async () => null,
       mirrorLeadAppointment: async () => ({ outcome: 'noop', skipped: true, reason: 'dnc_consent' }), // Class B escalates here (2026-10-16 create: test-appointment-parity-heal.js)
       emitEvent: async () => ({ id: 1 }),
       claimAlertConditionSet: async () => ({ ok: true, newlyFiring: [], cleared: [] }),
@@ -364,6 +368,10 @@ test('the watchdog ignores a Confirmation Call: no Class A sync, no confirmation
       readLpBook: async () => ({ active: lpActive, resolved: new Map() }),
       getGHLContact: async () => ({ tags: [] }),
       syncAppointmentToLP: async () => { syncCalls++; return { action: 'lp_appointment_set' }; },
+      // 2026-10-16: no LP history for these contacts (lp-origin-guard.js), and no
+      // post-appointment close pass — both have their own tests.
+      readLpOrigin: async () => ({ syncCreated: new Set(), leadsByContact: new Map() }),
+      runPostAppointmentClose: async () => null,
       mirrorLeadAppointment: async () => ({ outcome: 'noop', skipped: true, reason: 'dnc_consent' }), // Class B escalates here (2026-10-16 create: test-appointment-parity-heal.js)
       fetchUpcomingAppointments: async () => [
         { appointment_id: 'call-2', status: 'new', start_time: t, calendar_id: CONF_CALL_CAL },
@@ -401,6 +409,10 @@ test('watchdog Class A asks for a bookable lead and passes the calendar (the use
       readLpBook: async () => ({ active: new Map(), resolved: new Map() }),
       getGHLContact: async () => ({ tags: [] }),
       syncAppointmentToLP: async (args) => { calls.push(args); return { action: 'skipped_terminal_disposition' }; },
+      // 2026-10-16: no LP history for these contacts (lp-origin-guard.js), and no
+      // post-appointment close pass — both have their own tests.
+      readLpOrigin: async () => ({ syncCreated: new Set(), leadsByContact: new Map() }),
+      runPostAppointmentClose: async () => null,
       mirrorLeadAppointment: async () => ({ outcome: 'noop', skipped: true, reason: 'dnc_consent' }), // Class B escalates here (2026-10-16 create: test-appointment-parity-heal.js)
       emitEvent: async () => ({ id: 1 }),
       claimAlertConditionSet: async () => ({ ok: true, newlyFiring: [], cleared: [] }),

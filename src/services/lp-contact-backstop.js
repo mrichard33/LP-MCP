@@ -101,7 +101,9 @@ const DISPOSITIONS = [...LIVE_APPOINTMENT_DISPOSITIONS];
 const LEAD_COLUMNS = 'lp_lead_id, ghl_contact_id, disposition_code, appointment_date, created_at_lp, first_name, last_name, email, address, city, state, zip, phone, lead_source, lead_source_detail, lp_prospect_id, '
   // 2026-10-15: the reconciler's stale-row and ghost-appointment guards read
   // these. Five ghost visits (year typos on 2025 leads) came in this way.
-  + 'updated_at_lp, synced_at, set_date, last_contact_date';
+  + 'updated_at_lp, synced_at, set_date, last_contact_date, '
+  // 2026-10-16: LP's confirmed checkbox confirms a Set lead (lpConfirmedFlag).
+  + 'appointment_confirmed';
 const DEFAULT_HORIZON_DAYS = 45;
 // Absolute upper bound enforced REGARDLESS of the caller's horizon_days. This
 // — not the caller-supplied window — is the guard that keeps garbage-dated LP

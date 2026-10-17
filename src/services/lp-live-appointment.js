@@ -39,6 +39,14 @@ export function findLeadInGetLead(resp, ldsId) {
   return null;
 }
 
+// GetLead's `confirmed`: true/false, "true"/"false" or 1/0; anything else is
+// unknown (undefined), never false — an absent field must not un-confirm.
+function liveConfirmed(raw) {
+  if (raw === true || raw === 'true' || raw === 1 || raw === '1' || raw === 'True') return true;
+  if (raw === false || raw === 'false' || raw === 0 || raw === '0' || raw === 'False') return false;
+  return undefined;
+}
+
 // LP sends its own timestamps (setdate, lastchangedon) as bare strings; only
 // the calendar day is needed for the plausibility window, so take the
 // YYYY-MM-DD the wall-clock parser reads and leave the zone alone.
@@ -50,8 +58,8 @@ function lpDay(raw) {
 /**
  * Pure: shape a GetLead lead object into what the reconciler reads.
  * @returns {{ ok: true, date: string|null, time: string|null, timeStatus: string|null,
- *            disposition: string|null, setDate: string|null, lastChangedOn: string|null,
- *            mirrorAppointmentDate: string|null }}
+ *            disposition: string|null, confirmed: boolean|undefined, setDate: string|null,
+ *            lastChangedOn: string|null, mirrorAppointmentDate: string|null }}
  */
 export function liveAppointmentFromLead(lpLead) {
   const parsed = parseLpApptWallClock(getField(lpLead, 'apptdate', 'ApptDate'));
@@ -61,6 +69,10 @@ export function liveAppointmentFromLead(lpLead) {
     time: parsed?.time || null,
     timeStatus: parsed?.timeStatus || null,
     disposition: getField(lpLead, 'disposition', 'Disposition') || null,
+    // LP's "confirmed" checkbox (2026-10-16): a Set lead LP marks confirmed is
+    // confirmed in GHL too. Undefined when GetLead did not carry the field, so
+    // the reconciler falls back to the lp_leads row (lpConfirmedFlag).
+    confirmed: liveConfirmed(getField(lpLead, 'confirmed', 'Confirmed')),
     setDate: lpDay(getField(lpLead, 'setdate', 'SetDate')),
     lastChangedOn: lpDay(getField(lpLead, 'lastchangedon', 'LastChangedOn')),
     mirrorAppointmentDate: mirrorAppointmentDate(parsed),

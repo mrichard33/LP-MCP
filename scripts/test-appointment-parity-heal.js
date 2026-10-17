@@ -37,6 +37,10 @@ function deps({ lpActive = new Map(), lpResolved = new Map(), lpSettled = new Ma
     readLpBook: async () => ({ active: lpActive, resolved: lpResolved, settled: lpSettled }),
     getGHLContact: async () => ({ tags: [] }),
     syncAppointmentToLP: async () => ({ action: 'lp_appointment_set' }),
+    // 2026-10-16: no LP history for these contacts (lp-origin-guard.js), and no
+    // post-appointment close pass — both have their own tests.
+    readLpOrigin: async () => ({ syncCreated: new Set(), leadsByContact: new Map() }),
+    runPostAppointmentClose: async () => null,
     mirrorLeadAppointment: mirror,
     readLiveForSync: live,
     ghlFetch: async (method, path, body) => { puts.push({ method, path, body }); return {}; },

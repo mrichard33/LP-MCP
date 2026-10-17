@@ -188,10 +188,27 @@ export function isImplausibleFutureAppointment({ startTime, lead, live, maxDays 
   return { implausible: daysAfter > maxDays, lastActivityDay: lastDay, daysAfter, maxDays };
 }
 
-/** Map an LP disposition code to a reconciliation kind. */
-export function classifyDisposition(code) {
+/**
+ * LP's "confirmed" checkbox for this lead: LP live when the live read carried it,
+ * else the lp_leads row (sync-leads.js writes appointment_confirmed from GetLead's
+ * `confirmed`). Anything but a real true is not confirmed.
+ */
+export function lpConfirmedFlag(lead, live) {
+  if (live?.ok && typeof live.confirmed === 'boolean') return live.confirmed;
+  return lead?.appointment_confirmed === true;
+}
+
+/**
+ * Map an LP disposition code to a reconciliation kind.
+ *
+ * `confirmed` is LP's own checkbox (lpConfirmedFlag). A Set lead LP marks
+ * confirmed reconciles as 'confirm' (the user, 2026-10-16): Roberta Ritchie
+ * (583833) sat confirmed in LP and `new` in GHL all morning, because only the
+ * Cnf / Issue CODES confirmed.
+ */
+export function classifyDisposition(code, { confirmed = false } = {}) {
   const c = String(code || '').trim();
-  if (c === 'Set') return 'set';
+  if (c === 'Set') return confirmed === true ? 'confirm' : 'set';
   // Issue = issued to a rep: a live, confirmed visit (Mark, 2026-10-16). It
   // creates/confirms like Cnf; it is never a post-issue REBOOK here — the
   // post-issue gate (lp-post-issue-rebook.js) owns LP writes, this only mirrors.
@@ -343,7 +360,7 @@ export async function reconcileLpAppointmentToGhl({ contactId, lead, live = null
   if (!contactId) throw new Error('reconcileLpAppointmentToGhl: contactId is required');
   if (!lead) throw new Error('reconcileLpAppointmentToGhl: lead row is required');
 
-  const kind = classifyDisposition(lead.disposition_code);
+  const kind = classifyDisposition(lead.disposition_code, { confirmed: lpConfirmedFlag(lead, live) });
   // Cancel keeps reading the row (it only needs to know there was one); Set and
   // Cnf book from LP live or a wall-clock row — see resolveSyncStartTime.
   const resolved = kind === 'set' || kind === 'confirm'

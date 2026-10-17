@@ -572,3 +572,66 @@ test('Set + CANCELLED Confirmation Call at the same time → estimate created (o
   const res = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('Set') });
   assert.equal(res.outcome, 'created');
 });
+
+// ═══ LP's confirmed checkbox (the user, 2026-10-16, Roberta Ritchie 583833) ═══
+
+const { lpConfirmedFlag } = await import('../src/services/lp-ghl-appointment-reconciler.js');
+
+test('classifyDisposition: Set + LP\'s confirmed checkbox → confirm; the code alone stays set', () => {
+  assert.equal(classifyDisposition('Set', { confirmed: true }), 'confirm');
+  assert.equal(classifyDisposition('Set', { confirmed: false }), 'set');
+  assert.equal(classifyDisposition('Set'), 'set');
+  // Only a real true counts; the checkbox never moves Verif / ND / CXL.
+  assert.equal(classifyDisposition('Set', { confirmed: 'true' }), 'set');
+  assert.equal(classifyDisposition('Verif', { confirmed: true }), 'hold');
+  assert.equal(classifyDisposition('CXL', { confirmed: true }), 'cancel');
+});
+
+test('lpConfirmedFlag: LP live wins when it carried the field; else the row', () => {
+  assert.equal(lpConfirmedFlag({ appointment_confirmed: true }, null), true);
+  assert.equal(lpConfirmedFlag({ appointment_confirmed: true }, { ok: true, confirmed: false }), false);
+  assert.equal(lpConfirmedFlag({ appointment_confirmed: false }, { ok: true, confirmed: true }), true);
+  assert.equal(lpConfirmedFlag({ appointment_confirmed: true }, { ok: true }), true);       // field absent live
+  assert.equal(lpConfirmedFlag({ appointment_confirmed: true }, { ok: false }), true);      // live failed
+  assert.equal(lpConfirmedFlag({}, null), false);
+});
+
+test('Set + confirmed checkbox, same time, GHL new → one PUT confirming (Roberta Ritchie)', async () => {
+  reset({ upcoming: [weAppt()] });
+  const r = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: { ...lead('Set'), appointment_confirmed: true } });
+  assert.equal(r.outcome, 'status_updated');
+  assert.equal(r.new_status, 'confirmed');
+  const m = mutations();
+  assert.equal(m.length, 1);
+  assert.deepEqual(m[0].body, { appointmentStatus: 'confirmed' });
+});
+
+test('Set + confirmed checkbox, none in GHL → created confirmed', async () => {
+  reset({ upcoming: [] });
+  const r = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: { ...lead('Set'), appointment_confirmed: true } });
+  assert.equal(r.outcome, 'created');
+  assert.equal(mutations()[0].body.appointmentStatus, 'confirmed');
+});
+
+test('LP live says NOT confirmed → a stale row\'s checkbox does not confirm', async () => {
+  reset({ upcoming: [weAppt()] });
+  const live = { ok: true, date: FUTURE.slice(0, 10), time: '10:00', timeStatus: 'known', disposition: 'Set', confirmed: false };
+  const r = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: { ...lead('Set'), appointment_confirmed: true }, live });
+  assert.equal(r.reason, 'already_in_sync');
+  assert.equal(mutations().length, 0);
+});
+
+test('Issue at a NEW time (LP moved and issued in one edit) → reschedule in place, then confirm', async () => {
+  // Roberta Ritchie 10/16: LP moved 583833 to 2 PM and set it Issue at once;
+  // with no Issue sync rule GHL never heard. The reconciler side: in place, no create.
+  reset({ upcoming: [weAppt({ startTime: OTHER_TIME_GHL })] });
+  const r = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('Issue') });
+  assert.equal(r.outcome, 'status_updated');
+  assert.equal(r.rescheduled, true);
+  const m = mutations();
+  assert.equal(m.length, 2);
+  assert.equal(m[0].path, '/calendars/events/appointments/appt-1');
+  assert.equal(m[0].body.startTime, FUTURE_GHL);
+  assert.deepEqual(m[1].body, { appointmentStatus: 'confirmed' });
+  assert.equal(calls.filter((c) => c.method === 'POST').length, 0);
+});
