@@ -64,6 +64,11 @@ test('a promise that already names the opening is not given it twice (bot gate, 
   const live = "I'm sorry about that. I've flagged this to our team, and someone will call you today at 9 AM ET to sort it out. What's your first name?";
   assert.equal(enforceCallTiming(live, SUN_8AM).text, live);
   assert.equal(enforceCallTiming('Someone will call you today at 9 AM to get it sorted.', SUN_8AM).text, 'Someone will call you today at 9 AM ET to get it sorted.');
+  // The live SMS (abb3b6c): the time came BEFORE "today", and the first "today"
+  // in the sentence was the flagging, not the call.
+  assert.equal(
+    enforceCallTiming("I'm flagging this to our team today, and someone will call you at 9 AM ET today to make it right.", SUN_8AM).text,
+    "I'm flagging this to our team today, and someone will call you today at 9 AM ET to make it right.");
   // A stale time from a model at night is replaced as a whole, not appended to.
   assert.equal(enforceCallTiming('Someone will call you today at 3 PM to sort it out.', MON_9PM).text, 'Someone will call you tomorrow at 9 AM ET to sort it out.');
 });
