@@ -31,7 +31,7 @@ export const EVAL_RUN_EVENT = 'agentic.bot_eval_run';
 export function evalRunPayload(scorecard, comparison) {
   const { results = [], ...head } = scorecard || {};
   return {
-    scorecard: { ...head, results: results.map(r => ({ key: r.key, pass: r.pass, failures: r.failures.map(f => ({ code: f.code, turn: f.turn ?? null })) })) },
+    scorecard: { ...head, results: results.map(r => ({ key: r.key, family: r.family || null, pass: r.pass, failures: r.failures.map(f => ({ code: f.code, turn: f.turn ?? null })) })) },
     comparison: comparison || null,
   };
 }

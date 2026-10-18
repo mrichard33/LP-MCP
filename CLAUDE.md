@@ -1944,6 +1944,15 @@ competitor, stop_sms, stop_chat, trick_prompt, reschedule_unclear, out_of_area_c
 slots_offered_to_non_owner, stage_regressed, and, only when the run's `lead_stage_mode` is live, slots_without_qualifying
 and bridge_repeated (today's designed behavior in shadow). A texted STOP answered with silence is not `no_reply`. The
 scenario checks carry `SCORING_VERSION`: a run scored with new checks is a new baseline, not "worse".
+**Phase 0: freeze and measure (architecture review 2026-10-17).** A scenario may carry `expect: { [turn]: {
+question_allowed, move, step, no_clock } }`, checked on every turn (`turnExpectationFailures`: a guard that appends a
+question to a turn that must ask nothing fails `guard_question_appended`), and names its `family`; the scorecard prints
+`pass_rate_by_family` and a family whose rate falls reads WORSE. A prompt copy change needs a `RESPONSE_GENERATOR_VERSION`
+bump (the snapshot test compares it with `__snapshots__/VERSION`). `scripts/test-guard-polarity.js` holds one must-change
+and one must-pass input per reply guard; `scripts/test-regex-budget.js` caps the `_RX =` count in `src/agentic`
+(`scripts/fixtures/regex-budget.json`; raising it needs a reason naming a scenario key). By hand, not in the gate:
+`scripts/replay-bot-eval.js` (live incidents, ids only in the fixture; the text is read from bot_message_context) and
+`scripts/report-stage-agreement.js` (shadow stage vs buyer_stage). Phase 0 baseline: (gate job id after deploy).
 
 ## Writing code here
 

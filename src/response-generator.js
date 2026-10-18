@@ -18,6 +18,13 @@
  * prompt blocks. An unexplained snapshot diff means the change is wrong, not
  * the snapshot. Map: docs/handoffs/response-generator-split-map.md.
  *
+ * v2.8.0 — 2026-10-18. PHASE 0 FREEZE (architecture review 2026-10-17).
+ *   NO PROMPT TEXT OR BEHAVIOUR CHANGES. v2.7.14 had been stamped on every
+ *   reply across 206 builds, so a row could not say which build wrote it. From
+ *   here a prompt copy change cannot ship without a bump:
+ *   scripts/test-response-prompt-snapshot.js fails when a snapshot differs and
+ *   this version still equals __snapshots__/VERSION.
+ *
  * v2.7.14 — 2026-09-11. REPLAY CONTEXT FOR BOT REVIEW (PHASE 0).
  *   PROBLEM: when a reply is wrong, nothing records the inputs that produced
  *   it — the thread, tags, stage, disposition, the slots it could offer, which
@@ -432,11 +439,11 @@ import {
 } from './agentic/service-area-turn.js';
 
 /**
- * v2.7.14 — the header version above, as a value. Stamped (with the deployed
+ * v2.8.0 — the header version above, as a value. Stamped (with the deployed
  * git sha) onto every fingerprint so a replay knows which generator wrote the
  * reply. Bump it with the header note.
  */
-export const RESPONSE_GENERATOR_VERSION = 'v2.7.14';
+export const RESPONSE_GENERATOR_VERSION = 'v2.8.0';
 
 // Provider + model resolved at call time by the shared client from the
 // `response_generator` fn key (customer_facing group). Legacy

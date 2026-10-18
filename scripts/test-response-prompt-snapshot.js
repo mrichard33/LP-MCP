@@ -24,6 +24,13 @@
  * being moved, with a probe that identifies it in rendered output. A block no
  * fixture reaches fails the run, so a block cannot be extracted unguarded.
  *
+ * VERSION DISCIPLINE (Phase 0, 2026-10-18): __snapshots__/VERSION records the
+ * RESPONSE_GENERATOR_VERSION the snapshots were written under. A snapshot that
+ * differs while the constant still equals VERSION fails with "prompt copy
+ * changed; bump RESPONSE_GENERATOR_VERSION …": v2.7.14 had been stamped on
+ * 206 builds, so a stored reply could not say which prompt wrote it.
+ * UPDATE_SNAPSHOTS=1 rewrites VERSION along with the snapshots.
+ *
  * Run: node --test scripts/test-response-prompt-snapshot.js
  */
 import test from 'node:test';
@@ -85,8 +92,28 @@ class PinnedDate extends RealDate {
 }
 globalThis.Date = PinnedDate;
 
-const { buildResponsePrompt, getResponseSystemPrompt } =
+const { buildResponsePrompt, getResponseSystemPrompt, RESPONSE_GENERATOR_VERSION } =
   await import('../src/response-generator.js');
+
+const VERSION_FILE = path.join(SNAPSHOT_DIR, 'VERSION');
+const recordedVersion = fs.existsSync(VERSION_FILE) ? fs.readFileSync(VERSION_FILE, 'utf8').trim() : null;
+if (UPDATE) {
+  fs.mkdirSync(SNAPSHOT_DIR, { recursive: true });
+  fs.writeFileSync(VERSION_FILE, `${RESPONSE_GENERATOR_VERSION}\n`);
+}
+
+/**
+ * Why a differing snapshot fails. Pure. The same version as the one the
+ * snapshots were recorded under means the copy moved without a bump; a new
+ * version means the bump is there and the snapshots only need re-recording.
+ */
+export function snapshotVerdict({ same, version, recorded }) {
+  if (same) return null;
+  if (recorded == null || version === recorded) {
+    return 'prompt copy changed; bump RESPONSE_GENERATOR_VERSION and re-run with UPDATE_SNAPSHOTS=1';
+  }
+  return `RESPONSE_GENERATOR_VERSION is ${version} (snapshots recorded under ${recorded}); re-run with UPDATE_SNAPSHOTS=1 to record its copy`;
+}
 
 // ── Fixtures ─────────────────────────────────────────────────────────
 const fixtures = fs.readdirSync(FIXTURE_DIR)
@@ -156,6 +183,7 @@ function compare(file, label, actual) {
   const expected = fs.readFileSync(file, 'utf8');
   if (expected !== actual) {
     assert.fail(
+      `${snapshotVerdict({ same: false, version: RESPONSE_GENERATOR_VERSION, recorded: recordedVersion })}\n` +
       `${label} changed.\n` +
       `If this was not a deliberate copy edit, the extraction is wrong — revert it.\n` +
       `First differing lines (- committed, + produced):\n${firstDifferences(expected, actual)}`,
@@ -173,6 +201,21 @@ const SYSTEM_SNAPSHOT = path.join(SNAPSHOT_DIR, 'system.txt');
 
 // ── Snapshots ────────────────────────────────────────────────────────
 const rendered = new Map();
+
+test('the snapshots record the generator version they were written under', () => {
+  assert.ok(recordedVersion, `missing ${path.relative(HERE, VERSION_FILE)} — run with UPDATE_SNAPSHOTS=1`);
+  assert.match(recordedVersion, /^v\d+\.\d+\.\d+$/);
+});
+
+test('a snapshot diff without a version bump names the bump; with one, the re-record', () => {
+  assert.equal(snapshotVerdict({ same: true, version: 'v2.8.0', recorded: 'v2.8.0' }), null);
+  assert.equal(
+    snapshotVerdict({ same: false, version: 'v2.8.0', recorded: 'v2.8.0' }),
+    'prompt copy changed; bump RESPONSE_GENERATOR_VERSION and re-run with UPDATE_SNAPSHOTS=1',
+  );
+  assert.match(snapshotVerdict({ same: false, version: 'v2.8.1', recorded: 'v2.8.0' }), /re-run with UPDATE_SNAPSHOTS=1/);
+  assert.doesNotMatch(snapshotVerdict({ same: false, version: 'v2.8.1', recorded: 'v2.8.0' }), /bump/);
+});
 
 test('fixtures load', () => {
   assert.ok(fixtures.length >= 10, `expected at least 10 fixtures, found ${fixtures.length}`);
