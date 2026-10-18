@@ -72,7 +72,9 @@ test('lpOriginBlock: a visit LP held in the last 72h (Issue, a demo, a live code
 });
 
 test('lpOriginBlock: the newest lead post-demo within 30 days blocks; an old demo does not', () => {
-  const now = Date.now();
+  // A fixed midday clock (2026-10-18): run between midnight and 1 AM ET, now - 10 days landed on an LP
+  // midnight, which reads as a date with no visit time, and the test failed for that hour only.
+  const now = Date.parse('2026-10-16T16:00:00Z');
   const leads = [
     { lp_lead_id: '579742', disposition_code: 'Data', appointment_date: null },
     { lp_lead_id: '583833', disposition_code: 'OPPFDN', appointment_date: lpAt(now - 10 * DAY) },
