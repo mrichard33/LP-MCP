@@ -1217,7 +1217,18 @@ function planNepqTurnCore({
     //     first). The bot keeps answering; it only stops selling.
     const stopLine = `Understood${hi}. I'm here if anything changes.`;
     const prevOutAt = (i) => [...turns.slice(0, i)].reverse().find(x => x.direction === 'outbound')?.text || '';
-    const noCount = turns.reduce((n, t, i) => n + (t.direction === 'inbound' && isPostDemoNo(t.text, prevOutAt(i)) && !DM_GATE_ASK_RX.test(prevOutAt(i)) ? 1 : 0), 0);
+    // 2026-10-18 (the bot gate, again): the model words its own close after a first no ("No problem, thanks for
+    // letting us know."), so a wording check missed the second no. A no right after a no, with nothing asked in
+    // between, is the second no whatever our close said.
+    let lastWasNo = false;
+    const noCount = turns.reduce((n, t, i) => {
+      if (t.direction !== 'inbound') return n;
+      const prev = prevOutAt(i);
+      const counted = !DM_GATE_ASK_RX.test(prev) && (isPostDemoNo(t.text, prev)
+        || (lastWasNo && !prev.includes('?') && (SOFT_DECLINE_RX.test(t.text) || BARE_NO_RX.test(t.text))));
+      lastWasNo = counted;
+      return n + (counted ? 1 : 0);
+    }, 0);
     plan.counters.post_demo_nos = noCount;
     const stopSent = outbound.some(m => POST_DEMO_STOP_RX.test(m.text));
     const releases = now.includes('?') || SCHEDULE_ASK_RX.test(now) || TIME_REQUEST_RX.test(now) || askedForCall;
