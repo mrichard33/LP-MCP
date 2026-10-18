@@ -356,6 +356,21 @@ track's two no's IN A ROW. Now, after `competitor_signed` and `defer`:
   yes. A SOLD current lead (`lpSold`) is never in rehash, whatever `active-f.0` says. `REHASH_INTENT_ROUTING=off` is the
   rollback.
 
+**A post-demo lead's sign-off ends the turn: no question (live threads 2026-10-15..17).** "Not ready", "Will do.
+Thanks!", "I'll get back with you", "Not at this time. Thanks", "I have your number saved" each got the track's next
+question (Billy: "Now you're harassing me"). `isLeadCloser` (`src/agentic/post-demo-turn.js`; never with a "?", and a
+bare "Thanks!" / "Thank you I will." stays a thank-you) plans `post_demo_close`, and a first no (`door_open`) plans
+`post_demo` with `no_question`, as does the stop. `no_question` turns off the guard's appended stage question and bridge
+ask and drops any "?" sentence (`closer_no_question`, else `ack_line`); checkReply `question_after_closer`. A closer counts
+in `isRehashNo` but is the `closer` stage BEFORE the two-no's stop, so two pleasantries never file a `rehash_stop` card; a
+yes to our bridge is still the call. A stage the lead already answered (`answeredRx`) is never asked. The same text
+arriving as two events (Shawn: `\n\n` vs a real newline, two refs) gets one reply: `findAnsweredDuplicateInbound`
+(`src/agentic/burst-yield.js`, `normalizeText`, 15 min) skips the second as `duplicate_inbound_text`, which the reply SLA
+watchdog treats as held. A `concern-expressed:` / `pre-demo-concern:` tag we write is one plain label (`cleanReasonTag`);
+the O.V copy is a GHL edit (`docs/ghl-concern-tag-split.md`). GHL's naive appointment time is Eastern wall clock in
+`booking-claim.js` (Melissa's correct time read 4h early), and a booked lead's phone/email-only reply restates the time
+on file, never "confirm a time" (`isContactDetailsOnly`, `bookedDetailsLine`).
+
 **A post-demo lead is planned as post-demo, never as a new lead (Mark, 2026-10-09).** Five rehash threads got a stock
 discovery question after "Thank you I will.", two slot offers to "Follow up in November please.", a question after "Enjoy
 your week." and "Congratulations" to a lead who signed elsewhere: `planNepqTurn` never knew, and `enforceNepqPlan` step 7

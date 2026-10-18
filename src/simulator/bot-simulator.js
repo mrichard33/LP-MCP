@@ -247,6 +247,13 @@ export const SCENARIOS = Object.freeze({
   rehash_defer: { title: 'Rehash: call me in the spring', persona: REHASH_LEAD, channels: ['sms'], turns: ['Thanks for coming out. Call me in the spring and we will see'] },
   rehash_repeat_objection: { title: 'Rehash: the same price objection three times', persona: REHASH_LEAD, channels: ['sms'], turns: ['It is just too expensive for us right now', 'Honestly the price is still too high', 'The price is the problem, it is just too much'] },
   rehash_book_call: { title: 'Rehash: "Sure, what times?" then a pick', persona: REHASH_LEAD, channels: ['sms'], autoAnswer: true, turns: ['Sure, what times work for a call?'] },
+  // ── 2026-10-17: a lead's sign-off ends the turn (live threads 10-15..10-17) ──
+  rehash_closer_not_ready: { title: 'Rehash: "Not ready" is a closer', persona: REHASH_LEAD, channels: ['sms'], turns: ['Hi, I got the proposal, thanks', 'Not ready'] },
+  rehash_closer_get_back: { title: 'Rehash: "I\'ll get back with you" is a closer', persona: REHASH_LEAD, channels: ['sms'], turns: ['Thanks for coming out. We are still comparing a couple of quotes', "You're welcome and I'll get back with you as soon as I can"] },
+  rehash_closer_will_do: { title: 'Rehash: "Will do. Thanks!" is a closer', persona: REHASH_LEAD, channels: ['sms'], turns: ['Will do. Thanks!'] },
+  rehash_first_no_with_reason: { title: 'Rehash: first no with a reason gets no question (Billy)', persona: REHASH_LEAD, channels: ['sms'], turns: ['Not interested at this time. We explained to Damian we were in the planning stage.'] },
+  rehash_situation_answered: { title: 'Rehash: lead already said where they are (Tatyana)', persona: REHASH_LEAD, channels: ['sms'], turns: ['I have to finish my bathroom remodel first, then windows. Everything should be done by January, maybe February. I have your number saved'] },
+  rehash_closer_after_objection: { title: 'Rehash: price objection, then "Not at this time. Thanks" (Shawn)', persona: REHASH_LEAD, channels: ['sms'], turns: ['We like your product the best but it is roughly twice the cost of our other estimates', 'Not at this time. Thanks'] },
   // 2026-10-16 (Siro PR 1): the visit's price hesitation is in LEAD FACTS.
   rehash_siro_price_objection: { title: 'Rehash with the Siro visit: price was the hesitation', persona: REHASH_SIRO_LEAD, channels: ['sms'], turns: ['Hi, got your message. We are still thinking it over'] },
   // ── 2026-10-16 (Melissa, 6U6uceZGMQRz8XEQc9Lk): hearing the time she picked ──
@@ -463,7 +470,7 @@ export async function simulateSms(plan, { nepqMode = 'live', generate, buildReal
     let truthBlocked = null;
     if (generated?.message) {
       const simBooked = generated.companion_action?.action_type === 'book_appointment';
-      const truth = applyBookingTruth(generated.message, generated, { result: simBooked ? { booked: true, appointment_id: 'sim' } : null, nowMs: nowMs + i * 60000 });
+      const truth = applyBookingTruth(generated.message, generated, { result: simBooked ? { booked: true, appointment_id: 'sim' } : null, nowMs: nowMs + i * 60000, inbound: text });
       if (truth.blocked) { generated = { ...generated, message: truth.message, companion_action: null }; truthBlocked = truth.blocked; }
     }
     const reply = generated?.message || null;

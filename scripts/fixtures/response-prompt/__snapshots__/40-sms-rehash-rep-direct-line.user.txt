@@ -70,7 +70,8 @@ OBJECTIONS (ask back, never rebut):
 - "Got another quote" → "How do they compare, out of curiosity?" → then bridge with "the best deal possible."
 - "Need to think about it" → "What part do you want to think through?"
 - "Talking to my spouse" → "What do you think they'll want to know?" → offer the call with both on.
-- "Not interested" → acknowledge, leave the door open, no pitch. Two no's in a row = stop asking.
+- "Not interested" → acknowledge, leave the door open, no pitch, NO question. Two no's in a row = stop asking.
+- A sign-off ("will do", "I'll get back to you", "not ready", "ok thanks") → one matching line, no question.
 
 "THE BEST DEAL POSSIBLE": may be said at most ONCE per conversation, and only at the bridge.
 Never name what the deal is: no amount, no percentage, no discount, no promotion, no

@@ -63,7 +63,7 @@ import { enforceJobScope, jobScopeFromThread, openingsToSave, RENTAL_LINE, INVES
 import { scopeDqKind } from '../agentic/scope-dq.js';
 import { isPostDemoLead } from '../agentic/post-demo-lead.js';
 import { enforceCallTiming, promisedCallback, isTeamOpen } from '../agentic/team-hours.js';
-import { rewriteBookingClaims, appointmentOnFile, checkBookingTruth, bookingResult, noPromiseHandoffLine } from '../agentic/booking-claim.js';
+import { rewriteBookingClaims, appointmentOnFile, checkBookingTruth, bookingResult, noPromiseHandoffLine, isContactDetailsOnly, bookedDetailsLine } from '../agentic/booking-claim.js';
 import { enforceCancelledVisit } from '../agentic/cancelled-visit.js';
 import { lpNoteDqMode } from '../agentic/lp-note-dq.js';
 import { enforceOneAsk } from '../agentic/one-ask.js';
@@ -1505,15 +1505,18 @@ export function createLiveChatFastLane(deps) {
         start_time: rec?.start || null,
         source: 'live_chat',
       }) : null;
+      const onFile = appointmentOnFile({ upcomingAppointments, lp: context.lp, nowMs: d.now() });
       const verdict = checkBookingTruth(draft, {
         result,
-        existing: appointmentOnFile({ upcomingAppointments, lp: context.lp, nowMs: d.now() }),
+        existing: onFile,
         held: !!reference?.facts && (reference.facts.kind === 'hold' || reference.facts.kind === 'collect'),
         nowMs: d.now(),
       });
       if (!verdict.allowed) {
         d.warn(`[LiveChat] booking_claim_blocked ${contactId}: ${verdict.reason} — "${String(verdict.sentence || '').slice(0, 160)}" → no-promise hand-off`);
-        draft = noPromiseHandoffLine(leadFirstName, { teamOpen: isTeamOpen(d.now()) });
+        // 2026-10-17 (Melissa): a booked visitor who sends only a phone or email hears the time on file.
+        draft = (onFile?.appointment_id && isContactDetailsOnly(body) && bookedDetailsLine(leadFirstName, onFile))
+          || noPromiseHandoffLine(leadFirstName, { teamOpen: isTeamOpen(d.now()) });
         guard.booking_claim_blocked = { reason: verdict.reason, sentence: String(verdict.sentence || '').slice(0, 300) };
       }
       // A team note says we cannot run this lead (lp-note-dq.js): no time,

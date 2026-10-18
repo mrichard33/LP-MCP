@@ -42,7 +42,7 @@ const MOVE_TEXT = {
   answer: (p) => (p.post_demo
     ? (p.step === 'post_demo_ack'
       ? `This turn's move: they thanked you. Thank them back in a few words${p.post_demo_question ? `, then you may end with this one question about their proposal: "${p.post_demo_question}"` : '. Ask no question.'} Never ask what bothers them about their windows or doors or what they would change: they already had the visit.`
-      : `This turn's move: answer what they said plainly, in one or two sentences. They already had the in-home visit and have a proposal: ask about the proposal or nothing, never a discovery question about their windows or doors, never a visit, a measure or a time.${p.pending_deferral ? ` They asked us to follow up ${p.pending_deferral.label}: do not push for anything sooner.` : ''}`)
+      : `This turn's move: answer what they said plainly, in one or two sentences. They already had the in-home visit and have a proposal: ${p.no_question ? 'leave the door open and ask NO question (no question mark, no call pitch)' : 'ask about the proposal or nothing'}, never a discovery question about their windows or doors, never a visit, a measure or a time.${p.pending_deferral ? ` They asked us to follow up ${p.pending_deferral.label}: do not push for anything sooner.` : ''}`)
     : p.price_note
     ? 'This turn\'s move: answer their other questions in one short sentence each. On price, one short sentence: every home is different, so a number now would just be a guess (never a number or range). Then ONE question: what\'s got them looking into this now. No times, no visit pitch, nothing else.'
     : p.criteria_reply
@@ -51,6 +51,9 @@ const MOVE_TEXT = {
   offer_slots: (p) => (p.offer_line
     ? `This turn's move: answer their question in ONE sentence, then send exactly: "${p.offer_line}" Nothing after it.`
     : 'This turn\'s move: offer exactly two real times from CALENDAR AVAILABILITY and ask which works better. Never invent a time.'),
+  // 2026-10-17: a lead's sign-off ("Will do. Thanks!") on the post-demo line
+  // (post_demo_close, no fixed line). Before this a close move rendered nothing.
+  close: () => 'This turn\'s move: they signed off. One short line that matches theirs. No question, no call pitch, no time.',
   // 2026-10-02 (Mark: ask first, then book). A time is held (booking-collect.js).
   collect: (p) => `This turn's move: we are holding ${p.held_slot?.text || 'their picked time'} for them. If their reply gives the last missing detail (name, street address with zip, or who else is part of the decision), book it and confirm as: "You're all set, [first name]. Someone from our team will give you a call to confirm the details. You're on the calendar for [day] at [time]." Otherwise thank them in a few words and ask the ONE next missing item. Never offer new times unless they asked to change the time.`,
   // 2026-10-02 (Mark): "They tell the lead that they're all set and that our

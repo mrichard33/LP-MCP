@@ -32,7 +32,8 @@ import { isCallPromise } from '../agentic/promised-callbacks.js';
 // changes; a bump makes the next run a new baseline and disables the WORSE
 // gate. A NEW scenario is not a bump: compareScorecards scores the pass rate
 // over the scenarios both runs share and lists new ones apart.
-export const SCORING_VERSION = '2026-10-16.1';
+// 2026-10-18: question_after_closer (a post-demo sign-off or first no asks nothing).
+export const SCORING_VERSION = '2026-10-18.1';
 
 const CLOCK_RX = /\b\d{1,2}(?::\d{2})?\s*(?:AM|PM)\b/gi;
 const clockCount = (text) => (String(text || '').match(CLOCK_RX) || []).length;
@@ -266,6 +267,20 @@ export const SCENARIO_EXPECTATIONS = Object.freeze({
     if (confirm && !replies(confirm).some(x => /\bgive\s+you\s+a\s+call\b/i.test(x))) out.push({ code: 'rehash_confirm_no_caller', detail: replies(confirm).join(' '), turn: confirm.turn });
     return out;
   },
+  // ── 2026-10-17: a post-demo lead's sign-off ends the turn ──
+  // Ruling: the brief "Rehash bot: hard stop on closers" (live threads of
+  // 2026-10-15..17). The last turn is the closer (or Billy's first no): one
+  // line, no question, no time, never the track's next stage.
+  rehash_closer_not_ready: (r) => closerFailures(r, ['post_demo_close']),
+  rehash_closer_get_back: (r) => closerFailures(r, ['post_demo_close']),
+  rehash_closer_will_do: (r) => closerFailures(r, ['post_demo_close']),
+  rehash_first_no_with_reason: (r) => closerFailures(r, ['post_demo', 'post_demo_close']),
+  rehash_situation_answered: (r) => {
+    const out = closerFailures(r, ['post_demo_close']);
+    for (const { turn: n, text } of allReplies(r)) if (/\bwhere\s+(?:are\s+you|you(?:'|’)?re)\s+at\b/i.test(text)) out.push({ code: 'answered_stage_asked', detail: text, turn: n });
+    return out;
+  },
+  rehash_closer_after_objection: (r) => closerFailures(r, ['post_demo_close', 'post_demo_stop']),
   // ── 2026-10-16 (Melissa, 6U6uceZGMQRz8XEQc9Lk): the time she picked is heard ──
   // "sunday at 2" to two Sunday times holds 2 PM in that same reply.
   same_day_pick_at_two: (r) => heldThePick(r),
@@ -297,6 +312,19 @@ export const SCENARIO_EXPECTATIONS = Object.freeze({
     return missing.length ? [{ code: 'address_incomplete', detail: `${a || '(none)'} (missing ${missing.join(', ')})` }] : [];
   },
 });
+
+/** The last turn is a closer: an expected step, no question, no time, no pitch (2026-10-17). Pure. */
+function closerFailures(r, steps) {
+  const out = rehashLaneFailures(r);
+  const last = (r.transcript || []).at(-1);
+  if (!last) return out;
+  const step = String(last.nepq?.step || '');
+  if (!steps.includes(step)) out.push({ code: 'closer_not_recognised', detail: `step ${step || 'none'}`, turn: last.turn });
+  const text = replies(last).join(' ');
+  if (text.includes('?')) out.push({ code: 'question_after_closer', detail: text, turn: last.turn });
+  if (clockCount(text)) out.push({ code: 'times_after_closer', detail: text, turn: last.turn });
+  return out;
+}
 
 /** The NEPQ plan steps of a run, in order. Pure. */
 const planSteps = (r) => (r.transcript || []).map(t => String(t.nepq?.step || '')).filter(Boolean);
@@ -439,7 +467,7 @@ export function scoreResult(result) {
         // 2026-10-16: a post-demo turn gets the post-demo hard checks
         // (post_demo_rebuttal, post_demo_unbacked_follow_up,
         // question_after_post_demo_stop). Any other turn skips them, as before.
-        ...(t.nepq?.post_demo === true ? { postDemoStep: String(t.nepq.step || '') || null, postDemoLead: true } : {}),
+        ...(t.nepq?.post_demo === true ? { postDemoStep: String(t.nepq.step || '') || null, postDemoLead: true, postDemoNoQuestion: t.nepq.no_question === true } : {}),
       });
       for (const v of check.violations) failures.push({ code: v.code, detail: v.detail, turn: t.turn });
       conversation.push({ direction: 'outbound', text });

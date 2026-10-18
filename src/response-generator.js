@@ -4992,7 +4992,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // 2026-10-16 (opt-outs; the bot gate's rehash_defer): "Call me in the spring"
   // was filed to Five9 for a call now. A lead who gave a follow-up date, said
   // no twice, asked for room or signed elsewhere is never dialed for it.
-  const noDialStep = ['defer', 'post_demo_stop', 'post_demo_space', 'competitor_signed'].includes(String(nepqPlan?.step || ''));
+  const noDialStep = ['defer', 'post_demo_stop', 'post_demo_space', 'post_demo_close', 'competitor_signed'].includes(String(nepqPlan?.step || ''));
   if (String(classification?.intent_class || '').toUpperCase() === 'CALLBACK' && !nepqPlan?.handoff && !noDialStep && !leadWillReachOut(triggerMessage)) {
     validated.callback_requested = validated.service_conversation ? 'service' : 'callback_request';
   }
@@ -5009,6 +5009,8 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       booking: nepqPlan.booking, slots: (nepqPlan.slots_to_offer || []).length,
       // 2026-10-11: the post-demo plan and its track stage (Bot Review, the gate).
       post_demo: !!nepqPlan.post_demo, rehash_stage: nepqPlan.rehash_stage || null,
+      // 2026-10-17: the plan asks nothing (a lead's sign-off, a first no, the stop).
+      ...(nepqPlan.no_question ? { no_question: true } : {}),
       // 2026-10-13: the third price ask's call offer is the plan, not unasked.
       ...(nepqPlan.call_offer_ok ? { call_offer_ok: true } : {}),
     };

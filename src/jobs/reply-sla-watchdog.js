@@ -98,7 +98,9 @@ async function readTags(db, contactId) {
 const IN_FLIGHT_STATUSES = new Set(['pending', 'approved', 'executing']);
 // Skip reasons that mean the reply was withheld on purpose (result-status.js
 // writes a skipped handler's reason into error_message).
-const HELD_SKIP_REASONS = new Set(['opener_hold']);
+// duplicate_inbound_text (2026-10-17): the same text arrived twice and the first
+// copy's reply answers it; the backstop must not answer it a third time.
+const HELD_SKIP_REASONS = new Set(['opener_hold', 'duplicate_inbound_text']);
 
 /**
  * Pure: from the contact's send_message rows since the reply, was it answered,

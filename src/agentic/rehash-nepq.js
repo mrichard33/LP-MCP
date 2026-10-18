@@ -23,7 +23,7 @@
 // PURE. No I/O.
 
 import { isNotInterested } from './not-interested.js';
-import { detectDeferral } from './post-demo-turn.js';
+import { detectDeferral, isLeadCloser } from './post-demo-turn.js';
 import { PURCHASED_ELSEWHERE_RX } from './purchased-elsewhere.js';
 
 /** The hint (Mark's framing). Said at most once per conversation, at the bridge. */
@@ -40,22 +40,27 @@ export function bridgedRecently(outboundTexts = []) {
 }
 
 /** Stages where "best deal" may not be said yet (only at the bridge). */
-export const PRE_BRIDGE_STAGES = Object.freeze(new Set(['connection', 'situation', 'problem', 'solution', 'objection', 'door_open', 'stop', 'signed_elsewhere', 'follow_up_date']));
+export const PRE_BRIDGE_STAGES = Object.freeze(new Set(['connection', 'situation', 'problem', 'solution', 'objection', 'door_open', 'closer', 'stop', 'signed_elsewhere', 'follow_up_date']));
 
 // Each stage, the question that IS that stage, and how we recognise it in our
 // own earlier messages (the model words it, so we read it back by meaning).
 // The post-demo planner's own questions (POST_DEMO_QUESTIONS) count too.
+// `answeredRx` is what the LEAD says that already answers the stage (Tatyana,
+// 2026-10-17: "finish my bathroom remodel first … done by January" still got
+// "Where are you at with it?"). A stage answered is never asked.
 export const REHASH_STAGES = Object.freeze([
   {
     key: 'connection', label: 'CONNECTION', aim: 'about the proposal, not the windows',
     example: 'Did you get a chance to look over the proposal?',
     // 2026-10-16: the model's own "Did you get a chance to look it over?" (no
     // "proposal") is the same question; reading it back stops a repeat.
+    answeredRx: /\b(?:looked|read|went)\s+(?:it\s+|them\s+)?(?:over|through)\b|\bgot\s+the\s+proposal\b|\breviewed\b/i,
     rx: /\b(?:look(?:ed)?\s+(?:it\s+)?over|chance\s+to\s+(?:look|review|go\s+(?:over|through))|had\s+a\s+(?:chance|minute)|get\s+a\s+(?:chance|minute))\b[^?]*\bproposal\b|\bproposal\b[^?]*\b(?:look(?:ed)?\s+over|review(?:ed)?)\b|\bchance\s+to\s+(?:look\s+(?:it|that|them)\s+over|review\s+(?:it|that)|go\s+(?:over|through)\s+(?:it|that))\b/i,
   },
   {
     key: 'situation', label: 'SITUATION', aim: 'where they are in the decision',
     example: 'Where are you at with it?',
+    answeredRx: /\bstill\s+(?:getting|comparing|evaluating|deciding|thinking|looking|waiting)\b|\bno\s+decisions?\b|\bhaven(?:'|’)?t\s+decided\b|\bfinish(?:ing)?\s+(?:the|my|our)\b|\b(?:january|february|march|april|may|june|july|august|september|october|november|december|spring|summer|fall|winter|holidays)\b|\bplanning\s+stage\b/i,
     rx: /\bwhere\s+(?:are\s+you|you(?:'|’)?re|do\s+you\s+stand|are\s+you\s+landing|you\s+at)\b|\bwhere\s+(?:things|it)\s+(?:stand|stands|is)\b|\blanding\s+on\s+the\s+proposal\b/i,
   },
   {
@@ -104,11 +109,15 @@ const OBJECTIONS = [
 const BARE_NO_RX = /^\s*(?:no|nope|nah|no\s+thanks?|no\s+thank\s+you|not\s+really|not\s+now|not\s+right\s+now|not\s+interested|pass|i(?:'|’)?m\s+good|we(?:'|’)?re\s+good)\b[\s.!]*$/i;
 const YES_RX = /^\s*(?:y(?:es|eah|ep|up)|sure|ok(?:ay)?|sounds\s+good|that\s+works|please|absolutely|definitely|why\s+not|let(?:'|’)?s\s+do\s+it|i(?:'|’)?d\s+like\s+that|that\s+would\s+help|it\s+would)\b/i;
 
-/** A no for the two-no's rule on the rehash line. Pure. */
+/** A no for the two-no's rule on the rehash line; a closer ("Not ready", "Will do") counts (2026-10-17). Pure. */
 export function isRehashNo(text) {
   const t = String(text || '');
-  return isNotInterested(t) || BARE_NO_RX.test(t);
+  return isNotInterested(t) || BARE_NO_RX.test(t) || isLeadCloser(t);
 }
+
+// The lead already answered the PROBLEM stage when they named an objection.
+const answeredProblem = (t) => OBJECTIONS.some(o => o.rx.test(t));
+const stageAnswered = (s, inbound) => inbound.some(t => (s.key === 'problem' ? answeredProblem(t) : !!s.answeredRx?.test(t)));
 
 /** The objection in this message, or null. Pure. */
 export function rehashObjection(text) {
@@ -149,7 +158,9 @@ export function rehashNepqTurn({ conversation = [], trigger = '', nowMs = Date.n
     return i >= 0 ? turns[i].text : '';
   })();
   const hintUsed = outbound.some(t => BEST_DEAL_RX.test(t));
-  const asked = REHASH_STAGES.filter(s => outbound.some(t => s.rx.test(t))).map(s => s.key);
+  const inbound = turns.filter(t => t.direction === 'inbound').map(t => t.text);
+  // A stage we asked, or one the lead already answered without being asked.
+  const asked = REHASH_STAGES.filter(s => outbound.some(t => s.rx.test(t)) || stageAnswered(s, inbound)).map(s => s.key);
 
   let nos = 0;
   for (let i = turns.length - 1; i >= 0; i--) {
@@ -168,16 +179,23 @@ export function rehashNepqTurn({ conversation = [], trigger = '', nowMs = Date.n
   if (detectDeferral(now, nowMs)) {
     return at('follow_up_date', 'Confirm the exact date they gave in plain words and stop. No question, no time, no call pitch.', { label: 'FOLLOW-UP DATE' });
   }
+  // A yes to our bridge: the call is agreed. The schedule step is the plan's.
+  // Before the closer and the no's (2026-10-17): "Ok" after the bridge is the
+  // call, though "ok" alone now reads as a closer.
+  if (bridgedRecently(outbound) && YES_RX.test(now) && !isNotInterested(now) && !BARE_NO_RX.test(now)) {
+    return at('schedule', 'They said yes to the call. Schedule it (see SCHEDULING in the rehash block). Do not pitch again and do not say "best deal" again.', { label: 'SCHEDULE', example: null });
+  }
+  // A sign-off ends the exchange (2026-10-17): before the two-no's stop, so two
+  // pleasantries in a row are never a rehash_stop card.
+  if (isLeadCloser(now)) {
+    return at('closer', 'They closed the exchange. One short line that matches theirs, no question, no call pitch, no time.', { label: 'LEAD SIGNED OFF' });
+  }
   if (nos >= 2) {
     return at('stop', 'Two no\'s in a row: acknowledge it in one short line, leave the door open, and ask NOTHING. No call pitch, no question mark.', { label: 'STOP ASKING' });
   }
   const objection = rehashObjection(now);
   if (objection?.type === 'not_interested') {
-    return at('door_open', 'Acknowledge it, leave the door open in their words, no pitch. At most one soft question about the proposal, or none.', { label: 'NOT INTERESTED (first no)', objection });
-  }
-  // A yes to our bridge: the call is agreed. The schedule step is the plan's.
-  if (bridgedRecently(outbound) && YES_RX.test(now) && !isRehashNo(now)) {
-    return at('schedule', 'They said yes to the call. Schedule it (see SCHEDULING in the rehash block). Do not pitch again and do not say "best deal" again.', { label: 'SCHEDULE', example: null });
+    return at('door_open', 'Acknowledge it in their words, leave the door open in ONE short line, and ask NOTHING. No question mark. No call pitch. A reason they gave ("planning stage", "cost") is never asked about.', { label: 'NOT INTERESTED (first no)', objection });
   }
   // They answered our ask-back: now the bridge.
   if (ASK_BACK_RX.test(lastOut) && !objection) {
@@ -231,7 +249,8 @@ export function buildRehashNepqBlock(turn, { repName = null } = {}) {
     '- "Got another quote" → "How do they compare, out of curiosity?" → then bridge with "the best deal possible."',
     '- "Need to think about it" → "What part do you want to think through?"',
     '- "Talking to my spouse" → "What do you think they\'ll want to know?" → offer the call with both on.',
-    '- "Not interested" → acknowledge, leave the door open, no pitch. Two no\'s in a row = stop asking.',
+    '- "Not interested" → acknowledge, leave the door open, no pitch, NO question. Two no\'s in a row = stop asking.',
+    '- A sign-off ("will do", "I\'ll get back to you", "not ready", "ok thanks") → one matching line, no question.',
     '',
     t.hintUsed
       ? '"THE BEST DEAL POSSIBLE": ALREADY SAID in this conversation. Do not say it again, in any wording.'

@@ -328,7 +328,7 @@ import {
 import { timezoneForZip } from './services/contact-timezone.js';
 import { findNearDuplicate } from './services/message-similarity.js';
 import { checkNotSuperseded, commitAgenticSend } from './services/agentic-reply-locks.js';
-import { findNewerInbound } from './agentic/burst-yield.js';
+import { findNewerInbound, findAnsweredDuplicateInbound } from './agentic/burst-yield.js';
 import { emitEvent } from './event-emitter.js';
 import { routeNepqHandoff } from './agentic/nepq-handoff.js';
 import { fileBotCallback, callbackDecision, schedulingCallbackDecision, isPostDemoForCallback, CALLBACK_MARKER_TAG } from './agentic/bot-callback.js';
@@ -4067,6 +4067,20 @@ export async function executeSendMessage(action, context) {
         channel,
       };
     }
+    // The same text twice, as two events (Shawn, 2026-10-17: "\\n\\n" vs a real
+    // newline, two refs, two different replies): the earlier one's reply answers both.
+    const dup = await findAnsweredDuplicateInbound({ contactId, payload: sourceEventMeta.payload || {}, actionId: action.id }, { supabase });
+    if (dup) {
+      console.log(`[SendMessage] ⏭️ duplicate_inbound_text: ${contactId} action ${action.id} — inbound event ${dup.earlier_event_id} had the same text and action ${dup.answered_by_action_id} answers it`);
+      return {
+        skipped: true,
+        reason: 'duplicate_inbound_text',
+        earlier_reply_event_id: dup.earlier_event_id,
+        answered_by_action_id: dup.answered_by_action_id,
+        contact_id: contactId,
+        channel,
+      };
+    }
   }
 
   // ── Book BEFORE we promise (2026-08-13) ────────────────────────
@@ -4155,7 +4169,7 @@ export async function executeSendMessage(action, context) {
       calendar_id: landed.calendar_id || null,
       source: landed.action || 'inline_booking',
     }) : null;
-    const truth = applyBookingTruth(message, generated, { result, teamOpen: isTeamOpen() });
+    const truth = applyBookingTruth(message, generated, { result, teamOpen: isTeamOpen(), inbound: replyTriggerMessage || '' });
     const verdict = truth.blocked ? { allowed: false, ...truth.blocked } : { allowed: true };
     if (!verdict.allowed) {
       const blockedText = String(message || '');

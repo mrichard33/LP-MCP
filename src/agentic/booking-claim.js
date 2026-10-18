@@ -11,9 +11,11 @@
  *
  * Same shape as send-promise.js: a reply may only say a visit is set when
  * this turn actually booked it (or it names the appointment already on file).
- * Pure and dependency-free. Used by src/live-chat/fast-lane.js (rewrite) and
+ * Pure (one leaf import, appointment-dates.js). Used by src/live-chat/fast-lane.js (rewrite) and
  * src/response-generator.js (regenerate once, then rewrite).
  */
+
+import { lpWallClockToGhlStartTime } from '../appointment-dates.js';
 
 const CLAIM_PATTERNS = [
   /\byou(?:'re|’re|\s+are)\s+(?:all\s+|now\s+)?(?:set|booked|scheduled|confirmed|locked\s+in)\b/i,
@@ -175,6 +177,20 @@ export function bookingResult({ booked = false, appointment_id = null, start_tim
   };
 }
 
+// 2026-10-17 (Melissa, 6U6uceZGMQRz8XEQc9Lk): GHL's contact appointments come
+// back as NAIVE Eastern wall clock ("2026-10-18 14:00:00"). Date.parse reads
+// that as UTC on the server, so her 2:00 PM visit read as 10:00 AM, her correct
+// "You're on the calendar for Sun, Oct 18 at 2:00 PM" failed as
+// existing_time_mismatch, and the reply became "a team member will call you
+// shortly to confirm a time that works". The same rule as toEpochMsEt
+// (contact-appointments.js): a string with Z or an offset passes untouched.
+function epochMs(value) {
+  const str = String(value || '');
+  if (!str) return NaN;
+  if (/(Z|[+-]\d{2}:?\d{2})$/.test(str)) return Date.parse(str);
+  return Date.parse(lpWallClockToGhlStartTime(str) || str);
+}
+
 const WEEKDAYS = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
 const MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
 
@@ -189,7 +205,7 @@ function partsOf(iso, { timeZone = 'America/New_York', wallClock = false } = {})
     const date = new Date(Date.UTC(+m[1], +m[2] - 1, +m[3]));
     return { year: +m[1], month: +m[2], day: +m[3], hour: +m[4], minute: +m[5], weekday: date.getUTCDay() };
   }
-  const ms = Date.parse(raw);
+  const ms = epochMs(raw);
   if (!Number.isFinite(ms)) return null;
   const f = new Intl.DateTimeFormat('en-US', { timeZone, year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', hourCycle: 'h23', weekday: 'long' });
   const p = Object.fromEntries(f.formatToParts(new Date(ms)).map(x => [x.type, x.value]));
@@ -208,7 +224,7 @@ export function appointmentOnFile({ upcomingAppointments = null, lp = null, nowM
   for (const a of Array.isArray(upcomingAppointments) ? upcomingAppointments : []) {
     const status = String(a?.status || '').toLowerCase();
     if (/cancel|no-?show|invalid/.test(status) || a?.already_ended) continue;
-    const startMs = Date.parse(a?.start_time || '');
+    const startMs = epochMs(a?.start_time);
     if (!a?.appointment_id || !Number.isFinite(startMs) || startMs <= nowMs) continue;
     return { appointment_id: String(a.appointment_id), start_time: a.start_time, calendar_id: a.calendar_id || null, source: 'ghl', wall_clock: false };
   }
@@ -303,19 +319,52 @@ export function noPromiseHandoffLine(firstName, { teamOpen = true } = {}) {
  * @param {{result?: object|null, teamOpen?: boolean, nowMs?: number}} opts
  * @returns {{message: string, blocked: null | {reason: string, sentence: string|null}}}
  */
-export function applyBookingTruth(message, generated, { result = null, teamOpen = true, nowMs = Date.now() } = {}) {
+export function applyBookingTruth(message, generated, { result = null, teamOpen = true, nowMs = Date.now(), inbound = '' } = {}) {
+  const existing = generated?.appointment_on_file || null;
+  const timeZone = generated?.slot_timezone_for_truth || 'America/New_York';
   const verdict = checkBookingTruth(message, {
     result,
-    existing: generated?.appointment_on_file || null,
+    existing,
     held: !!generated?.booking_hold_backed,
     nowMs,
-    timeZone: generated?.slot_timezone_for_truth || 'America/New_York',
+    timeZone,
   });
   if (verdict.allowed) return { message: String(message || ''), blocked: null };
+  // 2026-10-17 (Melissa): a booked lead who sends only her phone and email is
+  // never told we will "confirm a time that works": the time is on file.
+  const restated = existing?.appointment_id && isContactDetailsOnly(inbound)
+    ? bookedDetailsLine(generated?.lead_first_name || null, existing, { timeZone })
+    : null;
   return {
-    message: noPromiseHandoffLine(generated?.lead_first_name || null, { teamOpen }),
+    message: restated || noPromiseHandoffLine(generated?.lead_first_name || null, { teamOpen }),
     blocked: { reason: verdict.reason, sentence: verdict.sentence },
   };
+}
+
+const PHONE_IN_TEXT_RX = /(?:\+?1[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}\b/g;
+const EMAIL_IN_TEXT_RX = /[^\s@]+@[^\s@]+\.[a-z]{2,}/gi;
+
+/** The message is only a phone and/or an email ("3525550188 mel@x.com", "My email is …"). Pure. */
+export function isContactDetailsOnly(text) {
+  const t = String(text || '').trim();
+  if (!t || t.includes('?')) return false;
+  const hits = (t.match(PHONE_IN_TEXT_RX) || []).length + (t.match(EMAIL_IN_TEXT_RX) || []).length;
+  if (!hits) return false;
+  const rest = t.replace(PHONE_IN_TEXT_RX, ' ').replace(EMAIL_IN_TEXT_RX, ' ').replace(/[^\p{L}\s]/gu, ' ').split(/\s+/).filter(Boolean);
+  return rest.length <= 8;
+}
+
+/** "Thanks, Melissa, got it. You're on the calendar for Sun, Oct 18 at 2:00 PM ET." Pure; null when the time cannot be read. */
+export function bookedDetailsLine(firstName, appt, { timeZone = 'America/New_York' } = {}) {
+  const ms = appt?.wall_clock ? epochMs(String(appt.start_time || '').replace(/[+-]00:00$|Z$/, '')) : epochMs(appt?.start_time);
+  if (!Number.isFinite(ms)) return null;
+  const d = new Date(ms);
+  const day = new Intl.DateTimeFormat('en-US', { timeZone, weekday: 'short', month: 'short', day: 'numeric' }).format(d);
+  const time = new Intl.DateTimeFormat('en-US', { timeZone, hour: 'numeric', minute: '2-digit' }).format(d);
+  const zone = timeZone === 'America/Chicago' ? 'CT' : 'ET';
+  const name = String(firstName || '').trim().split(/\s+/)[0];
+  const who = name && !/^guest$/i.test(name) ? `Thanks, ${name}, got it.` : 'Thanks, got it.';
+  return `${who} You're on the calendar for ${day} at ${time} ${zone}.`;
 }
 
 /** Reads our own no-promise hand-off back from the thread. */
