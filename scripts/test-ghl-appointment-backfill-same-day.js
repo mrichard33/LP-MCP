@@ -30,6 +30,7 @@ function run(over = {}) {
     deps: {
       readLiveForSync: async () => null, // live LP read: test-lp-ghl-ghost-appointment.js
       nowMs: NOW,
+      sameSlotCheck: async () => null, // no live sibling (Badley test below)
       scanBackfillCandidates: async () => ({ targets, unlinked: [], total_rows: targets.length, linked_contacts: targets.length }),
       reconcileLpAppointmentToGhl: async ({ lead }) => {
         seen.push(lead.ghl_contact_id);
@@ -70,6 +71,46 @@ test('a same-day CXL still cancels — converging a dead appointment to zero rem
   const { summary, seen } = await run({ targets: [TODAY_CXL] });
   assert.equal(summary.counts.skipped_same_day, undefined);
   assert.deepEqual(seen, ['today-cxl']);
+});
+
+test('Badley (2026-10-17): a same-day CXL whose live sibling holds the slot is ignored, never cancelled', async () => {
+  const seen = [];
+  const checked = [];
+  const targets = [{ lead: TODAY_CXL, superseded: 0 }];
+  const summary = await runGhlAppointmentBackfill({
+    dryRun: true, stragglerCancel: false,
+    deps: {
+      nowMs: NOW,
+      readLiveForSync: async () => null,
+      scanBackfillCandidates: async () => ({ targets, unlinked: [], total_rows: 1, linked_contacts: 1 }),
+      sameSlotCheck: async (args) => {
+        checked.push(args);
+        return { outcome: 'cancel_ignored_same_slot_sibling', live_lead_id: '583453', live_disposition: 'Issue', slot: '2026-09-14T18:00' };
+      },
+      reconcileLpAppointmentToGhl: async ({ lead }) => { seen.push(lead.ghl_contact_id); return { planned_op: 'cancel' }; },
+    },
+  });
+  assert.deepEqual(seen, [], 'the reconciler is never asked to cancel');
+  assert.equal(summary.counts.cancel_ignored_same_slot_sibling, 1);
+  assert.equal(summary.counts.cancel, undefined);
+  assert.equal(checked[0].dryRun, true, 'a dry run reaches the check as a dry run (no GHL write)');
+  assert.match(summary.lines[0], /cancel_ignored_same_slot_sibling \(live lead 583453 Issue/);
+});
+
+test('the same-slot check runs only for a cancel', async () => {
+  let checks = 0;
+  const targets = [{ lead: TOMORROW, superseded: 0 }];
+  await runGhlAppointmentBackfill({
+    dryRun: true, stragglerCancel: false,
+    deps: {
+      nowMs: NOW,
+      readLiveForSync: async () => null,
+      scanBackfillCandidates: async () => ({ targets, unlinked: [], total_rows: 1, linked_contacts: 1 }),
+      sameSlotCheck: async () => { checks++; return null; },
+      reconcileLpAppointmentToGhl: async () => ({ planned_op: 'create' }),
+    },
+  });
+  assert.equal(checks, 0);
 });
 
 test('a skipped same-day contact is kept out of the straggler scope', async () => {

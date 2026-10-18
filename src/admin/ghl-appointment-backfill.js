@@ -53,6 +53,7 @@ import { readLiveForSync } from '../services/lp-live-appointment.js';
 import { lpWallClockToGhlStartTime, appointmentDelta } from '../appointment-dates.js';
 import { utcToLpStoredIso } from '../lp-dates.js';
 import { runStragglerCancelPass, DEFAULT_STRAGGLER_LOOKBACK_DAYS } from './ghl-straggler-cancel.js';
+import { maybeIgnoreSameSlotCancel, SAME_SLOT_IGNORED } from '../actions/handlers/lp-ghl-appointment-sync.js';
 
 // 2026-10-16: Verif out (a hold, no automation); Issue in (a live appointment).
 const DISPOSITIONS = ['Set', 'Cnf', 'Issue', 'CXL'];
@@ -85,7 +86,7 @@ export async function scanBackfillCandidates({ horizonDays = DEFAULT_HORIZON_DAY
   while (true) {
     let q = supabase
       .from('lp_leads')
-      .select('lp_lead_id, ghl_contact_id, disposition_code, appointment_date, created_at_lp, first_name, last_name, phone, '
+      .select('lp_lead_id, lp_prospect_id, ghl_contact_id, disposition_code, appointment_date, created_at_lp, first_name, last_name, phone, '
         // 2026-10-15: the reconciler's stale-row and ghost-appointment guards.
         + 'synced_at, updated_at_lp, set_date, last_contact_date, '
         // 2026-10-16: LP's confirmed checkbox confirms a Set lead (lpConfirmedFlag).
@@ -164,6 +165,9 @@ export async function runGhlAppointmentBackfill({
   const stragglerPass = deps.runStragglerCancelPass || runStragglerCancelPass;
   // Set/Cnf book from LP live (2026-10-15, src/services/lp-live-appointment.js).
   const readLive = deps.readLiveForSync || readLiveForSync;
+  // A CXL whose live sibling holds the same slot is not a cancel (Badley,
+  // 2026-10-17): the dry run of 10/17 planned to cancel her real 10 AM visit.
+  const sameSlotCheck = deps.sameSlotCheck || maybeIgnoreSameSlotCancel;
 
   const scan = await scanFn({ horizonDays, contactId, limit });
   const { targets, unlinked } = scan;
@@ -215,6 +219,16 @@ export async function runGhlAppointmentBackfill({
     if (hasLiveForwardLpAppointment) stragglerScope.set(lead.ghl_contact_id, { lead });
 
     try {
+      if (kind === 'cancel') {
+        const ignored = await sameSlotCheck({ contactId: lead.ghl_contact_id, lead, dryRun });
+        if (ignored) {
+          counts[SAME_SLOT_IGNORED] = (counts[SAME_SLOT_IGNORED] || 0) + 1;
+          // lead-id-ok: the admin backfill's per-contact report (JSON job status), never Slack text
+          lines.push(`${lead.ghl_contact_id} ${leadLine(lead, `→ ${SAME_SLOT_IGNORED} (live lead ${ignored.live_lead_id} ${ignored.live_disposition} holds ${ignored.slot})`)}`);
+          if (job) job.processed++;
+          continue;
+        }
+      }
       const live = await readLive(lead, { dryRun });
       const result = await reconcile({
         contactId: lead.ghl_contact_id,

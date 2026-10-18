@@ -75,6 +75,51 @@ test('Badley: the CXL is ignored, LP Lead ID fields move to the live lead, nothi
   assert.deepEqual(authorityFollowUp({ granted: true }, r), { release: false, record: null });
 });
 
+test('Badley (2026-10-17): the live sibling on ANOTHER prospect with no contact id is found by phone', async () => {
+  const { readSlotSiblings } = await import('../src/same-slot-sibling-io.js');
+  // Badley's two leads: the CXL on the contact (prospect 464723), the live Issue
+  // lead on prospect 464721 with no ghl_contact_id. Only the phone joins them.
+  const ROWS = [
+    { ...CXL, lp_prospect_id: '464723', ghl_contact_id: 'badley', phone: '5865363499' },
+    { ...CNF, disposition_code: 'Issue', lp_prospect_id: '464721', ghl_contact_id: null, phone: '5865363499' },
+  ];
+  const queries = [];
+  const db = {
+    from() {
+      const filters = [];
+      const q = {
+        select() { return q; },
+        is() { return q; },
+        eq(col, v) { filters.push((r) => String(r[col] ?? '') === String(v)); return q; },
+        in(col, vs) { filters.push((r) => vs.map(String).includes(String(r[col] ?? ''))); return q; },
+        or(expr) {
+          const list = /phone\.in\.\(([^)]*)\)/.exec(expr)[1].split(',');
+          filters.push((r) => list.includes(r.phone) || list.includes(r.phone_alt));
+          return q;
+        },
+        limit() { queries.push(filters.length); return Promise.resolve({ data: ROWS.filter((r) => filters.every((f) => f(r))), error: null }); },
+      };
+      return q;
+    },
+  };
+  const leads = await readSlotSiblings({ contactId: 'badley', lead: ROWS[0], db });
+  assert.deepEqual(leads.map((r) => r.lp_lead_id).sort(), ['583453', '583460']);
+  assert.equal(findSameSlotLiveSibling(leads, ROWS[0])?.lp_lead_id, '583453');
+  // A failed read throws, so the cancel guard lets the cancel run as before.
+  const broken = { from: () => ({ select() { return this; }, is() { return this; }, eq() { return this; }, limit: async () => ({ data: null, error: { message: 'down' } }) }) };
+  await assert.rejects(readSlotSiblings({ contactId: 'badley', lead: ROWS[0], db: broken }), /contact read failed/);
+});
+
+test('a dry run (the backfill) reads LP but never repoints the LP Lead ID fields', async () => {
+  const repointed = [];
+  const r = await maybeIgnoreSameSlotCancel({
+    contactId: 'badley', lead: CXL, dryRun: true,
+    deps: { readContactLeads: async () => [CXL, CNF], readLiveForSync: async () => liveAt('Cnf'), writeLeadIdFields: async (c, id) => { repointed.push([c, id]); } },
+  });
+  assert.equal(r.outcome, SAME_SLOT_IGNORED);
+  assert.deepEqual(repointed, []);
+});
+
 test('a sibling at a DIFFERENT time does not stop the cancel (CANARY behaviour)', async () => {
   const other = { ...CNF, appointment_date: '2027-10-17T14:00:00+00:00' };
   const r = await maybeIgnoreSameSlotCancel({ contactId: 'c', lead: CXL, deps: { readContactLeads: async () => [CXL, other], readLiveForSync: async () => liveAt('Cnf') } });
