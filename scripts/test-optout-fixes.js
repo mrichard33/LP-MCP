@@ -40,6 +40,22 @@ test('a soft no counts after our signed text and after "look it over"', () => {
   assert.equal(isPostDemoNo('Not right now', 'What got you looking at windows? — Reece Team'), false, 'a discovery question is not the track');
 });
 
+test('a soft no counts after the model\'s own post-demo question (bot gate, 2026-10-17)', () => {
+  assert.equal(isPostDemoNo('No, we are good', 'Understood, Monica. What changed since the visit?'), true);
+  assert.equal(isPostDemoNo('No, we are good', 'What has changed for you?'), true);
+  assert.equal(isPostDemoNo('Not right now', 'Any thoughts on the proposal?'), true);
+  assert.equal(isPostDemoNo('Not right now', 'Since the visit, how are you feeling?'), true);
+  assert.equal(isPostDemoNo('No, we are good', 'Understood. Thanks for the update on the proposal.'), false, 'no question asked: not a no');
+  // The two no's of the scenario now stop the selling.
+  const p = rehashPlan([
+    msg('inbound', 'Hi, I got the proposal', 5),
+    msg('outbound', 'Thanks for the update, Monica. Did you get a chance to look over the proposal yet? — John', 4),
+    msg('inbound', 'Not at this time. Thanks', 3),
+    msg('outbound', 'Understood, Monica. What changed since the visit?', 2),
+  ], 'No, we are good');
+  assert.equal(p.step, 'post_demo_stop');
+});
+
 test('two no\'s stop the selling, with one line and no question', () => {
   const p = rehashPlan([
     msg('inbound', 'Hi, I got the proposal', 5), msg('outbound', 'Did you get a chance to look it over? — John', 4),

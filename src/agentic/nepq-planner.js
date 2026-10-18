@@ -559,6 +559,13 @@ export function isNo(text, lastOutbound = '') {
 // discovery question is not a no (DECLINE_RX is unchanged on purpose).
 const SOFT_DECLINE_RX = /^\s*(?:no[,.!]?\s+)?(?:not\s+at\s+(?:this|the\s+moment|the\s+present)(?:\s+time)?|not\s+right\s+now|not\s+now|no\s+thank\s+you|no\s+thanks|(?:we|i)(?:'|’)?(?:re|m)\s+(?:good|all\s+set|fine)|(?:we|i)\s+(?:are|am)\s+(?:good|all\s+set|fine)|(?:we|i)(?:'|’)?ll\s+pass|(?:we|i)\s+will\s+pass|not\s+interested)\b/i;
 const POST_DEMO_OFFER_RX = /\bwould\s+(?:a\s+)?(?:quick\s+)?call\s+help\b|\bwould\s+that\s+help\b|\bgive\s+you\s+a\s+(?:ring|call)\b/i;
+// 2026-10-17 (the bot gate's rehash_not_at_this_time): the model words its own
+// post-demo question ("What changed since the visit?") instead of the track's
+// ("Where are you at with it?"), so "No, we are good" to it counted as no no
+// and the bot never stopped. A question of ours about the visit, the proposal
+// or what changed is on the post-demo line too. A pre-demo discovery question
+// ("What got you looking at windows?") still is not.
+const POST_DEMO_QUESTION_RX = /\bwhat(?:'|’)?s?\s+(?:has\s+)?changed\b|\bsince\s+(?:the|our|my)\s+(?:visit|appointment|demo|meeting|presentation)\b|\b(?:the|your|our)\s+(?:proposal|quote|estimate|presentation)\b|\bmov(?:e|ing)\s+forward\b/i;
 
 /** A no on the post-demo line: isNo, or a soft no to our offer / track question. Pure. */
 export function isPostDemoNo(text, lastOutbound = '') {
@@ -573,7 +580,8 @@ export function isPostDemoNo(text, lastOutbound = '') {
   const o = sign ? String(lastOutbound).slice(0, sign.index).trim() : String(lastOutbound || '');
   if (isNo(t, o)) return true;
   if (!SOFT_DECLINE_RX.test(t)) return false;
-  return CALL_OFFER_SENTENCE_RX.test(o) || BRIDGE_RX.test(o) || POST_DEMO_OFFER_RX.test(o) || REHASH_BRIDGE_RX.test(o) || REHASH_STAGES.some(st => st.rx.test(o));
+  return CALL_OFFER_SENTENCE_RX.test(o) || BRIDGE_RX.test(o) || POST_DEMO_OFFER_RX.test(o) || REHASH_BRIDGE_RX.test(o) || REHASH_STAGES.some(st => st.rx.test(o))
+    || (o.includes('?') && POST_DEMO_QUESTION_RX.test(o));
 }
 
 // A post-demo price objection: the cost itself, never a question asking what
