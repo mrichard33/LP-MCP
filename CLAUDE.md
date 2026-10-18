@@ -420,7 +420,10 @@ the one exception, below).
   minutes, canvass without notifications), which the LP contact backstop uses too; a guard refusal is never "add it to
   GHL". Class D restores a duplicate's same-slot cancel. Fix 8 (`src/appointments/estimate-drift.js`) corrects
   sync-created estimates that drifted from LP behind `ESTIMATE_DRIFT_FIX_MODE` (off | shadow | live, default shadow; cap
-  25). GHL keeps no "last updated by", so "nobody edited it" means it still starts where our create put it.
+  25). GHL keeps no "last updated by", so "nobody edited it" means it still starts where our create put it. It never
+  moves a visit to a time already past or under 60 minutes away (`lp_time_past`), and never against an endpoint booking
+  made after the LP lead last changed (`lp_unchanged_since_booking`): Affeld (2026-10-17), live mode, moved a Sun 10/18
+  canvass visit to 9/28 off a 2016 lead while the lead holding 10/18 had not synced.
 - **A bad LP date or hour is ONE card**, "LP date/time looks wrong — confirmation team must fix in LP"
   (`notifyLpLooksWrong`, Slack, one per lead + date in `lp_sync_failure_notices`), replacing the GroupMe impossible-hour
   card.

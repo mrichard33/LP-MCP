@@ -21,13 +21,23 @@ import { buildMarkInvalidRows } from './mark-invalid.js';
 
 const CHUNK = 100;
 
-/** appointmentId → the startTime OUR sync created it with (reconciler or delegated endpoint). */
+/** A created-event entry, whichever shape it came in. */
+export function createdEntry(v) {
+  if (!v) return null;
+  return typeof v === 'string' ? { startTime: v, createdBy: null, createdAt: null } : v;
+}
+
+/**
+ * appointmentId → { startTime, createdBy, createdAt }: how OUR sync created it
+ * (createdBy 'reconciler' or 'endpoint'). A plain string value (older callers,
+ * tests) is read as { startTime } by createdEntry.
+ */
 export async function readSyncCreatedStarts(db, appointmentIds) {
   const out = new Map();
   for (let i = 0; i < appointmentIds.length; i += CHUNK) {
     const ids = appointmentIds.slice(i, i + CHUNK);
     const { data, error } = await db.from('system_events')
-      .select('payload')
+      .select('payload, created_at')
       .eq('event_type', 'appt.booking')
       .eq('event_subtype', 'created')
       .in('payload->>appointmentId', ids)
@@ -35,7 +45,9 @@ export async function readSyncCreatedStarts(db, appointmentIds) {
     if (error) throw new Error(`appt.booking read failed: ${error.message}`);
     for (const row of data || []) {
       const p = row.payload || {};
-      if (p.appointmentId && p.startTime && !out.has(p.appointmentId)) out.set(p.appointmentId, p.startTime);
+      if (p.appointmentId && p.startTime && !out.has(p.appointmentId)) {
+        out.set(p.appointmentId, { startTime: p.startTime, createdBy: p.caller === 'endpoint' ? 'endpoint' : 'reconciler', createdAt: row.created_at || null });
+      }
     }
   }
   return out;
@@ -69,14 +81,14 @@ export async function runEstimateDriftFix({ ghlActive, dryRun = false, deps }) {
   const writes = mode === 'live' && !dryRun;
   const plans = [];
   for (const appt of candidates) {
-    const createdStartTime = starts.get(appt.ghl_appointment_id);
-    if (!createdStartTime) continue;   // a person or a workflow made it — never touched
+    const created = createdEntry(starts.get(appt.ghl_appointment_id));
+    if (!created?.startTime) continue;   // a person or a workflow made it — never touched
     summary.sync_created++;
     const cid = appt.ghl_contact_id;
     try {
       const lead = await deps.resolveLead(cid);
       const live = lead ? await deps.readLive(lead, { dryRun: !writes }) : null;
-      const plan = decideDrift({ appt, lead, live, createdStartTime });
+      const plan = decideDrift({ appt, lead, live, createdStartTime: created.startTime, createdBy: created.createdBy, createdAt: created.createdAt, nowMs });
       plans.push({ ...plan, appt, lead, cid });
     } catch (err) {
       summary.errors++;
@@ -165,13 +177,13 @@ export async function correctConflictIfSyncCreated({ contactId, lpLeadId, ghlSta
       && inDriftScope({ ghl_appointment_id: a.appointment_id, ghl_calendar_id: a.calendar_id, status: a.status, start_time: a.start_time }));
     if (!hit) return { corrected: false, reason: 'not_in_scope' };
     const starts = await deps.readSyncCreatedStarts([hit.appointment_id]);
-    const createdStartTime = starts.get(hit.appointment_id);
-    if (!createdStartTime) return { corrected: false, reason: 'not_sync_created' };
+    const created = createdEntry(starts.get(hit.appointment_id));
+    if (!created?.startTime) return { corrected: false, reason: 'not_sync_created' };
     const lead = await deps.resolveLead(contactId, lpLeadId);
     const writes = mode === 'live';
     const live = lead ? await deps.readLive(lead, { dryRun: !writes }) : null;
     const appt = { ghl_appointment_id: hit.appointment_id, ghl_calendar_id: hit.calendar_id, start_time: hit.start_time, status: hit.status };
-    const plan = decideDrift({ appt, lead, live, createdStartTime });
+    const plan = decideDrift({ appt, lead, live, createdStartTime: created.startTime, createdBy: created.createdBy, createdAt: created.createdAt, nowMs: deps.nowMs ?? Date.now() });
     if (plan.op !== 'reschedule' && plan.op !== 'mark_invalid') return { corrected: false, reason: plan.reason };
     log(`[DriftFix] conflict ${writes ? 'live' : 'shadow'} would ${plan.op} appt=${hit.appointment_id} contact=${contactId} lp=${lead?.lp_lead_id || lpLeadId} reason=${plan.reason}`);
     if (!writes) return { corrected: false, reason: 'shadow', would: plan.op };

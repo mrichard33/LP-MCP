@@ -29,6 +29,17 @@
  *                                invalidate a 2 AM visit, so a person decides)
  *   live time ≠ GHL time       → reschedule in place to LP's time (ET)
  *   match                      → in sync
+ *
+ * NEVER INTO THE PAST, NEVER BEHIND THE ENDPOINT (Affeld, 2026-10-17). With the
+ * mode live, a canvass visit I.LP-IN's endpoint booked for Sun 10/18 10 AM was
+ * moved to 9/28: the contact linked only to a 2016 LP lead whose stored visit was
+ * 9/28, while the lead holding 10/18 had not synced yet. Two refusals now come
+ * before any write:
+ *   LP's time already passed, or under 60 minutes away → skip `lp_time_past`
+ *                              (a visit is never moved where nobody can attend)
+ *   the endpoint booked it AFTER the LP lead last changed → skip `lp_unchanged_since_booking`
+ *                              (the endpoint carries LP's newest webhook; a lead
+ *                              row LP has not touched since is the stale side)
  */
 
 import {
@@ -36,9 +47,12 @@ import {
   BUSINESS_HOUR_START_ET, BUSINESS_HOUR_END_ET, ESTIMATE_CALENDAR_IDS,
 } from '../services/lp-ghl-appointment-reconciler.js';
 import { isHoldDisposition, isDisqualifiedDisposition, isLiveAppointmentDisposition } from '../lp-disposition-classes.js';
+import { lpWallClockToGhlStartTime } from '../appointment-dates.js';
 
 export const DRIFT_RULE = 'ESTIMATE_DRIFT_FIX';
 export const DRIFT_CAP = 25;
+/** A correction never lands a visit sooner than this (the mirror path's too-late window). */
+export const DRIFT_MIN_LEAD_MINUTES = 60;
 const MODES = ['off', 'shadow', 'live'];
 
 export function estimateDriftMode(env = process.env) {
@@ -62,9 +76,22 @@ export function untouchedSinceCreate(appt, createdStartTime) {
 }
 
 /**
+ * Pure: the endpoint booked this appointment after the LP lead last changed, so the
+ * lead row is older news than the booking. Only the delegated endpoint qualifies:
+ * a reconciler create was BUILT from the lead, so a mismatch there is ours to fix.
+ * LP stamps are Eastern wall clock (lpWallClockToGhlStartTime); unknown → false.
+ */
+export function endpointNewerThanLead({ createdBy, createdAt, lead }) {
+  if (createdBy !== 'endpoint' || !createdAt || !lead?.updated_at_lp) return false;
+  const changed = Date.parse(lpWallClockToGhlStartTime(lead.updated_at_lp) || '');
+  const booked = Date.parse(createdAt);
+  return Number.isFinite(changed) && Number.isFinite(booked) && changed < booked;
+}
+
+/**
  * Pure. @returns {{ op: 'none'|'reschedule'|'mark_invalid'|'skip', reason: string, startTime?: string, card?: object }}
  */
-export function decideDrift({ appt, lead, live, createdStartTime }) {
+export function decideDrift({ appt, lead, live, createdStartTime, createdBy = null, createdAt = null, nowMs = Date.now() }) {
   if (!untouchedSinceCreate(appt, createdStartTime)) return { op: 'skip', reason: 'edited_since_create' };
   if (!lead) return { op: 'skip', reason: 'no_lp_lead' };
   const code = String(lead.disposition_code || '').trim();
@@ -78,6 +105,13 @@ export function decideDrift({ appt, lead, live, createdStartTime }) {
   if (!isLiveAppointmentDisposition(liveCode)) return { op: 'none', reason: 'not_live_owned_by_cancel_path' };
   const { startTime } = resolveSyncStartTime(lead, live);
   if (!startTime) return { op: 'skip', reason: 'no_lp_time' };
+  const targetMs = Date.parse(startTime);
+  if (Number.isFinite(targetMs) && targetMs - nowMs < DRIFT_MIN_LEAD_MINUTES * 60_000) {
+    return { op: 'skip', reason: 'lp_time_past', startTime };
+  }
+  if (!sameStartTime(appt.start_time, startTime) && endpointNewerThanLead({ createdBy, createdAt, lead })) {
+    return { op: 'skip', reason: 'lp_unchanged_since_booking', startTime };
+  }
   const ghost = isImplausibleFutureAppointment({ startTime, lead, live });
   if (ghost.implausible) {
     return {

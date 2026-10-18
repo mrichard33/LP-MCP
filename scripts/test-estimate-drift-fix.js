@@ -10,12 +10,14 @@ process.env.SUPABASE_SERVICE_ROLE_KEY ||= 'test-key';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-const { decideDrift, inDriftScope, overCap, estimateDriftMode, DRIFT_RULE } = await import('../src/appointments/estimate-drift.js');
+const { decideDrift: decideDriftAt, inDriftScope, overCap, estimateDriftMode, DRIFT_RULE } = await import('../src/appointments/estimate-drift.js');
 const { runEstimateDriftFix, correctConflictIfSyncCreated } = await import('../src/appointments/estimate-drift-io.js');
 const { wallClockToIso } = await import('../src/appointment-dates.js');
 
 const WE = 'aJj14ONxh1oFyDcQ706O';
 const NOW = Date.parse('2026-10-16T16:00:00Z');
+// The pure tests run at the fixed NOW, so the November fixtures stay in the future.
+const decideDrift = (a) => decideDriftAt({ nowMs: NOW, ...a });
 const today = '2026-10-16T12:00:00+00:00';
 const lead = (code = 'Set', extra = {}) => ({ lp_lead_id: '475840', disposition_code: code, appointment_date: '2026-11-03T10:00:00+00:00', synced_at: today, updated_at_lp: today, created_at_lp: today, ...extra });
 const live = (time = '10:00', date = '2026-11-03', disposition = 'Set') => ({ ok: true, date, time, timeStatus: 'known', disposition });
@@ -149,4 +151,47 @@ test('conflict branch: sync-created → corrected, no card; a human booking → 
   assert.deepEqual([human.corrected, human.reason], [false, 'not_sync_created']);
   const shadow = await correctConflictIfSyncCreated({ contactId: 'c1', lpLeadId: '475840', ghlStartIso: NOV_15, deps: { ...deps, mode: 'shadow' } });
   assert.deepEqual([shadow.corrected, shadow.would], [false, 'reschedule']);
+});
+
+// Affeld (vg8HD7VB3E9jtHUZvB8y, 2026-10-17): the endpoint booked Sun 10/18 10 AM for a
+// canvass lead; the contact linked only to 2016 lead 48501, whose stored visit was 9/28.
+// With the mode live the fix moved the visit to 9/28. Never again.
+const AFFELD_NOW = Date.parse('2026-10-17T20:14:00Z');
+const OCT18 = wallClockToIso('2026-10-18', '10:00');
+const affeldLead = lead('Set', { lp_lead_id: '48501', appointment_date: '2026-09-28T10:00:00+00:00', created_at_lp: '2016-11-14T14:37:17+00:00', updated_at_lp: '2026-10-17T15:44:49+00:00', synced_at: '2026-10-17T19:45:26+00:00' });
+
+test('Affeld: LP time already passed → skip lp_time_past, never a reschedule into the past', () => {
+  const p = decideDriftAt({ appt: appt(OCT18), lead: affeldLead, live: live('10:00', '2026-09-28'), createdStartTime: OCT18, createdBy: 'endpoint', createdAt: '2026-10-17T19:47:39Z', nowMs: AFFELD_NOW });
+  assert.deepEqual([p.op, p.reason], ['skip', 'lp_time_past']);
+});
+
+test('a correction never lands under 60 minutes from now', () => {
+  const soon = new Date(NOW + 30 * 60_000);
+  const hhmm = soon.toLocaleTimeString('en-GB', { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit' });
+  const p = decideDrift({ appt: appt(NOV_15), lead: lead(), live: live(hhmm, '2026-10-16'), createdStartTime: NOV_15 });
+  assert.equal(p.reason, 'lp_time_past');
+});
+
+test('endpoint booked after the LP lead last changed → skip lp_unchanged_since_booking (future LP date too)', () => {
+  const stale = lead('Set', { updated_at_lp: '2026-10-15T09:00:00+00:00' });
+  const p = decideDrift({ appt: appt(NOV_15), lead: stale, live: live('10:00'), createdStartTime: NOV_15, createdBy: 'endpoint', createdAt: '2026-10-15T20:00:00Z' });
+  assert.deepEqual([p.op, p.reason], ['skip', 'lp_unchanged_since_booking']);
+  // A reconciler create was built from the lead, so the same mismatch is still ours to fix.
+  const ours = decideDrift({ appt: appt(NOV_15), lead: stale, live: live('10:00'), createdStartTime: NOV_15, createdBy: 'reconciler', createdAt: '2026-10-15T20:00:00Z' });
+  assert.equal(ours.op, 'reschedule');
+  // LP changed after the booking (it moved the visit) → follow LP.
+  const moved = decideDrift({ appt: appt(NOV_15), lead: lead('Set', { updated_at_lp: '2026-10-16T09:00:00+00:00' }), live: live('10:00'), createdStartTime: NOV_15, createdBy: 'endpoint', createdAt: '2026-10-15T20:00:00Z' });
+  assert.equal(moved.op, 'reschedule');
+});
+
+test('Affeld through the I/O: live mode, no PUT, nothing auto-fixed', async () => {
+  const { deps, rec } = ioDeps({
+    mode: 'live', nowMs: AFFELD_NOW,
+    readSyncCreatedStarts: async () => new Map([['ap1', { startTime: OCT18, createdBy: 'endpoint', createdAt: '2026-10-17T19:47:39Z' }]]),
+    resolveLead: async () => affeldLead, readLive: async () => live('10:00', '2026-09-28'),
+  });
+  const s = await runEstimateDriftFix({ ghlActive: new Map([['c1', appt(OCT18)]]), deps });
+  assert.equal(rec.puts.length, 0);
+  assert.equal(s.skipped.lp_time_past, 1);
+  assert.equal(rec.events.filter((e) => e.event_type === 'appointment.parity_auto_fixed').length, 0);
 });
