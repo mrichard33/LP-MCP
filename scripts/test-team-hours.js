@@ -52,6 +52,22 @@ test('after hours, "in the next few minutes" / "today" become the next opening',
   assert.match(enforceCallTiming('Our service team will call you today to get it scheduled.', MON_9PM).text, /call you tomorrow at 9 AM ET to get it scheduled/);
 });
 
+test('a promise that already names the opening is not given it twice (bot gate, 2026-10-18)', () => {
+  // Before 9 AM the next opening is "today at 9 AM ET", and the planner's own
+  // after-hours line carries it: the guard used to swap only "today" for the
+  // label, giving "today at 9 AM ET at 9 AM ET".
+  const plan = planNepqTurn({ channel: 'livechat', trigger: 'Your rep never showed up yesterday', nowMs: SUN_8AM });
+  assert.equal(plan.handoff.reason, 'complaint');
+  assert.match(plan.fixed_line, /call you today at 9 AM ET\./);
+  assert.equal(enforceCallTiming(plan.fixed_line, SUN_8AM).text, plan.fixed_line);
+  // The model's rewording, with or without the zone, still reads the time once.
+  const live = "I'm sorry about that. I've flagged this to our team, and someone will call you today at 9 AM ET to sort it out. What's your first name?";
+  assert.equal(enforceCallTiming(live, SUN_8AM).text, live);
+  assert.equal(enforceCallTiming('Someone will call you today at 9 AM to get it sorted.', SUN_8AM).text, 'Someone will call you today at 9 AM ET to get it sorted.');
+  // A stale time from a model at night is replaced as a whole, not appended to.
+  assert.equal(enforceCallTiming('Someone will call you today at 3 PM to sort it out.', MON_9PM).text, 'Someone will call you tomorrow at 9 AM ET to sort it out.');
+});
+
 test('inside hours the same promise is left alone', () => {
   const t = 'Our service team will call you today to get it scheduled.';
   assert.deepEqual(enforceCallTiming(t, MON_11AM), { text: t, changed: false });
