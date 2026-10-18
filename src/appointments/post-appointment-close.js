@@ -227,6 +227,50 @@ export function closeCandidates({ ghlRows = [], leadsByContact = new Map(), nowM
 }
 
 /**
+ * Settled-row memo (2026-10-18). Every candidate cost one LP live read, earliest
+ * first under READ_CAP, and nothing remembered a decision: a past visit LP had
+ * not dispositioned yet (`wait`) and every shadow-mode `close` (GHL stays `new`)
+ * were read again on every 30-minute sweep, so the later visits waited behind
+ * them for days. The memo (the createSettledMemo pattern of src/p2-sale-backstop.js)
+ * remembers those two outcomes, keyed on the facts that would change the answer:
+ * the appointment, its owning lead, that lead's STORED disposition and the GHL
+ * status, plus the mode. LP dispositioning the lead changes lp_leads, so the key
+ * changes and the row is read again at once. A live write, an unreadable LP and
+ * anything else is never remembered. In-process: a deploy starts empty.
+ */
+export const SETTLED_TTL_MS = { wait: 2 * 3600_000, close: 6 * 3600_000 };
+
+export function settledKey(appt, lead, mode) {
+  return [appt?.ghl_appointment_id, lead?.lp_lead_id, lead?.disposition_code, String(appt?.status || '').toLowerCase(), mode].join('|');
+}
+
+export function createSettledMemo() {
+  const map = new Map();
+  return {
+    get(key, nowMs) {
+      const e = map.get(key);
+      if (!e) return null;
+      if (e.expiresAt <= nowMs) { map.delete(key); return null; }
+      return e.result;
+    },
+    set(key, result, ttlMs, nowMs) {
+      for (const [k, e] of map) if (e.expiresAt <= nowMs) map.delete(k);
+      map.set(key, { result, expiresAt: nowMs + ttlMs });
+    },
+    size: () => map.size,
+  };
+}
+
+/** The TTL a closeOne result may be remembered for, or 0 (never). */
+export function settledTtl(result, mode) {
+  if (result?.op === 'wait' && result.reason === 'lp_not_dispositioned') return SETTLED_TTL_MS.wait;
+  if (result?.op === 'close' && !result.applied && mode !== 'live') return SETTLED_TTL_MS.close;
+  return 0;
+}
+
+const SETTLED_MEMO = createSettledMemo();
+
+/**
  * The watchdog pass. Reads the HL mirror's estimates from the look-back on, the
  * candidates' lp_leads rows, closes each (shadow / live), capped by the caller.
  *
@@ -250,15 +294,26 @@ export async function runPostAppointmentClose({ dryRun = false, deps = {} }) {
   const leadsByContact = cids.length ? await deps.readLeads(cids) : new Map();
   const candidates = closeCandidates({ ghlRows: rows, leadsByContact, nowMs });
   summary.candidates = candidates.length;
+  const memo = deps.settledMemo || SETTLED_MEMO;
+  summary.remembered = 0;
   let writes = 0;
   let reads = 0;
   for (const appt of candidates) {
     const leads = leadsByContact.get(appt.ghl_contact_id) || [];
     if (!leads.length) { summary.skipped.no_lp_lead = (summary.skipped.no_lp_lead || 0) + 1; continue; }
-    if (mode === 'live' && writes >= cap) { summary.capped++; continue; }
-    if (reads >= readCap) { summary.capped++; continue; }
-    reads++;
-    const r = await closeOne({ contactId: appt.ghl_contact_id, appt, leads, deps: { ...deps, mode, nowMs } });
+    // A remembered row costs no LP read and no slot under readCap.
+    const key = settledKey(appt, owningLead(leads, appt, nowMs), mode);
+    let r = memo.get(key, nowMs);
+    if (r) {
+      summary.remembered++;
+    } else {
+      if (mode === 'live' && writes >= cap) { summary.capped++; continue; }
+      if (reads >= readCap) { summary.capped++; continue; }
+      reads++;
+      r = await closeOne({ contactId: appt.ghl_contact_id, appt, leads, deps: { ...deps, mode, nowMs } });
+      const ttl = settledTtl(r, mode);
+      if (ttl) memo.set(key, r, ttl, nowMs);
+    }
     if (r.op === 'close') {
       const bucket = r.applied ? summary.closed : summary.would;
       bucket[r.status] = (bucket[r.status] || 0) + 1;
@@ -268,5 +323,6 @@ export async function runPostAppointmentClose({ dryRun = false, deps = {} }) {
     else summary.skipped[r.reason] = (summary.skipped[r.reason] || 0) + 1;
   }
   summary.writes = writes;
+  summary.reads = reads;
   return summary;
 }

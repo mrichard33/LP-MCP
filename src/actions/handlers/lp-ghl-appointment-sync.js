@@ -57,6 +57,7 @@ import { reconcileLpAppointmentToGhl, resolveSyncStartTime, classifyDisposition 
 import { sendAlertMessage } from '../../alert-state.js';
 import { readLiveForSync } from '../../services/lp-live-appointment.js';
 import { findSameSlotLiveSibling, liveStillHoldsSlot, slotKeyOf } from '../../same-slot-sibling.js';
+import { readSlotSiblings } from '../../same-slot-sibling-io.js';
 import { lpWallClockToGhlStartTime } from '../../appointment-dates.js';
 import { prospectLabel } from '../../format-helpers.js';
 import {
@@ -176,12 +177,14 @@ export const SAME_SLOT_IGNORED = 'cancel_ignored_same_slot_sibling';
 const LP_LEAD_ID_FIELD = 'GmAVmW6V9sekD7pVONKr';
 const LP_LAST_APPT_ID_FIELD = 'yII9akTft1RKOG0Ri4Q9';
 
-/** Every live-or-not lp_leads row for the contact (not soft-deleted). */
-async function readContactLeads(contactId, db = supabase) {
-  const { data, error } = await db.from('lp_leads').select(`${LEAD_COLUMNS}, lp_deleted_at`)
-    .eq('ghl_contact_id', contactId).is('lp_deleted_at', null).limit(25);
-  if (error) throw new Error(`lp_leads read failed: ${error.message}`);
-  return data || [];
+/**
+ * Every lp_leads row (not soft-deleted) that could hold the same visit: the
+ * contact's, plus any sharing a prospect or a phone with them or with the
+ * cancelling lead (Badley, 2026-10-17: the live sibling was on another prospect
+ * with no contact id; see src/same-slot-sibling-io.js).
+ */
+function readContactLeads(contactId, lead) {
+  return readSlotSiblings({ contactId, lead, db: supabase });
 }
 
 /**
@@ -189,20 +192,23 @@ async function readContactLeads(contactId, db = supabase) {
  * to let the cancel run. Never throws: any failed read lets the cancel run.
  * deps: { readContactLeads, readLiveForSync, writeLeadIdFields }
  */
-export async function maybeIgnoreSameSlotCancel({ contactId, lead, deps = {} }) {
+export async function maybeIgnoreSameSlotCancel({ contactId, lead, dryRun = false, deps = {} }) {
   try {
-    const leads = await (deps.readContactLeads || readContactLeads)(contactId);
+    const leads = await (deps.readContactLeads || readContactLeads)(contactId, lead);
     const sibling = findSameSlotLiveSibling(leads, lead);
     if (!sibling) return null;
-    const live = await (deps.readLiveForSync || readLiveForSync)(sibling);
+    const live = await (deps.readLiveForSync || readLiveForSync)(sibling, { dryRun });
     const slot = slotKeyOf(lead.appointment_date);
     if (!liveStillHoldsSlot(live, slot)) {
       console.log(`[LpGhlApptSync] same-slot sibling ${sibling.lp_lead_id} not confirmed live at ${slot} (${live?.ok ? live.disposition : live?.error || 'unread'}) — cancel proceeds`);
       return null;
     }
     console.log(`[LpGhlApptSync] cancel ignored: same-slot live sibling (cancel lead ${lead.lp_lead_id}, live lead ${sibling.lp_lead_id}) contact=${contactId} slot=${slot}`);
-    await (deps.writeLeadIdFields || writeLeadIdFields)(contactId, sibling.lp_lead_id)
-      .catch((err) => console.warn(`[LpGhlApptSync] LP Lead ID repoint failed for ${contactId}: ${err.message}`));
+    // A dry run (the admin backfill) reads but writes nothing.
+    if (!dryRun) {
+      await (deps.writeLeadIdFields || writeLeadIdFields)(contactId, sibling.lp_lead_id)
+        .catch((err) => console.warn(`[LpGhlApptSync] LP Lead ID repoint failed for ${contactId}: ${err.message}`));
+    }
     return {
       outcome: SAME_SLOT_IGNORED,
       skipped: true,

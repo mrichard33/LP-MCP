@@ -470,6 +470,14 @@ Class C only emitted an event, Fix 8 sat in shadow, and Class A then wrote GHL's
 - **Confirmation coverage:** the clock gives a card to up to 25 linked leads a pass with a visit in the next 14 days and no
   `confirmation_opportunities` row (`readUncoveredLeads`); `CONF_PIPE_RESCHEDULED` / `CONF_PIPE_CONFIRMED` re-read the card.
 Seeds: `sql/seeds/2026-10-16_parity_self_heal.sql`. Tests: `scripts/test-parity-roberta.js`.
+- **Follow-up (2026-10-18).** A person cancelling the leftover GHL estimate after a demo is not a customer cancel: rules
+  107 / 171 carry `not_stale_post_demo_cancel` (`src/appointments/stale-post-demo-cancel.js`: newest lead post-demo
+  within 30 days, the cancelled start after its visit, no live lead at that slot; a failed read fails closed;
+  `sql/seeds/2026-10-18_stale_post_demo_cancel.sql`). Roberta's Reactivation was undone by hand. A same-slot sibling is
+  searched by contact, prospect AND phone (`readSlotSiblings`, `src/same-slot-sibling-io.js`: Badley's live lead sat on
+  another prospect with no contact id), and the admin backfill runs the same check before any cancel
+  (`cancel_ignored_same_slot_sibling`; a dry run writes nothing). Class F remembers a `wait` (2h) and a shadow `close`
+  (6h) per appointment + lead + stored disposition (`settledKey`), so settled rows stop eating `READ_CAP`.
 
 **Every LP appointment has ONE card in "4. Confirmation Pipeline", and only LP MCP moves it (handoff, 2026-10-16).**
 Pipeline `ThrBNpyzJhAON4WFC855`; no GHL workflow may trigger on it. Rules `CONF_PIPE_SET/VERIF/CNF/ND/CXL` queue

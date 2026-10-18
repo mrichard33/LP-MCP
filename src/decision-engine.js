@@ -252,6 +252,9 @@ import { inferChannelFromEvent } from './channel-inference.js';
 import { withGhlToken } from './ghl-rate-limiter.js';
 import { withGhlCaller } from './ghl-caller.js';
 import { contactHadDemo, demoInCurrentCycle } from './demo-truth.js';
+import { stalePostDemoCancel } from './appointments/stale-post-demo-cancel.js';
+import { readSlotSiblings } from './same-slot-sibling-io.js';
+import { resolveApptStart } from './objection-state-ghost-sweep.js';
 import { fetchCurrentLead } from './current-lead.js';
 import { lpStoredToUtcMs } from './lp-dates.js';
 import { inboundFromReplyEvent } from './agentic/burst-yield.js';
@@ -1064,7 +1067,7 @@ const IO_BACKED_CONDITION_KEYS = new Set([
   // appointment lookups
   'not_active_in_home_appointment', 'not_reschedule_inflight',
   'not_duplicate_lead_live_appointment', 'no_future_appointment',
-  'last_active_appointment',
+  'last_active_appointment', 'not_stale_post_demo_cancel',
   // system_events history
   'thread_turn_count_gte', 'analysis_occurrence_gte', 'analysis_occurrence_lt',
   'no_inbound_within_hours', 'inbound_within_hours', 'has_prior_inbound',
@@ -1989,6 +1992,40 @@ async function evaluateContextConditions(conditions, intelligence, event, opts =
           return false;
         }
         break; // 0 remaining active → this was the last appointment → pass
+      }
+
+      // not_stale_post_demo_cancel (Roberta Ritchie, 2026-10-16): a GHL cancel of
+      // an appointment left over after the demo is not a customer cancel. A
+      // person cancelled her stale 10/17 estimate the day after her 10/16 demo
+      // (OPPFDN) and rule 107 moved P1 to Reactivation, pulled her from F.0 and
+      // opened APPOINTMENT_DISRUPTION.cancelled. Suppress when the newest LP lead
+      // (contact + prospects + phone) is post-demo with its visit inside 30 days
+      // and before the cancelled start, and no live lead holds the cancelled
+      // slot (src/appointments/stale-post-demo-cancel.js). Only on
+      // ghl.appointment_cancelled; an unreadable start or a failed read fails
+      // closed (doctrine).
+      case 'not_stale_post_demo_cancel': {
+        if (!expected) break;
+        if (event?.event_type !== 'ghl.appointment_cancelled') break;
+        const spContactId = event?.ghl_contact_id;
+        if (!spContactId) return notApplicableNoContact(key);
+        const spStart = resolveApptStart({ payload });
+        if (!spStart) return failClosed(key, 'cancelled appointment start unreadable');
+        const spDb = opts.deps?.supabase !== undefined ? opts.deps.supabase : supabase;
+        if (!spDb) return failClosed(key, 'LP Supabase not configured');
+        let spLeads;
+        try {
+          spLeads = await readSlotSiblings({ contactId: spContactId, db: spDb });
+        } catch (err) {
+          return failClosed(key, `lp_leads lookup failed: ${err.message}`);
+        }
+        const spNow = opts.deps?.nowMs ?? Date.now();
+        const verdict = stalePostDemoCancel({ leads: spLeads, cancelledStartMs: spStart.getTime(), nowMs: spNow });
+        if (verdict.stale) {
+          console.log(`[Context] BLOCKED: not_stale_post_demo_cancel — cancelled ${payload.appointment_id || '?'} is a leftover after the demo on lead ${verdict.lp_lead_id} (rule ${ruleKey || '?'})`);
+          return false;
+        }
+        break;
       }
 
       // no_inbound_within_hours: N — block if an inbound message landed within

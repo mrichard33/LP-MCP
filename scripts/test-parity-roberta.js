@@ -31,6 +31,7 @@ const { runAppointmentParityWatchdog } = await import('../src/jobs/appointment-p
 const { lpOriginBlock, supersededByNewerLead, lpVisitMs, readLpOriginFacts } = await import('../src/appointments/lp-origin-guard.js');
 const {
   decideClose, owningLead, closeOne, closeCandidates, runPostAppointmentClose, closedStatusFor, postApptCloseMode,
+  createSettledMemo, settledTtl,
 } = await import('../src/appointments/post-appointment-close.js');
 const { executeClosePastLpAppointment } = await import('../src/actions/handlers/post-appointment-close.js');
 const { readUncoveredLeads } = await import('../src/jobs/confirmation-pipeline-clock.js');
@@ -327,6 +328,7 @@ function closeDeps(over = {}) {
       putAppointment: async (id, body) => { rec.puts.push({ id, body }); return {}; },
       queueAction: async (row) => { rec.queued.push(row); },
       emitEvent: async (e) => { rec.events.push(e); return { id: rec.events.length }; },
+      settledMemo: createSettledMemo(),
       nowMs: NOW, log: quiet, ...over,
     },
   };
@@ -513,4 +515,41 @@ test('runPostAppointmentClose: LP live reads are capped per pass (the rest wait 
   assert.equal(reads, 2);
   assert.equal(s.waiting, 2);
   assert.equal(s.capped, 3);
+});
+
+test('close memo (2026-10-18): a second pass re-reads no settled row and reaches the rows past the cap', async () => {
+  const rows = Array.from({ length: 5 }, (_, i) => ({ ghl_contact_id: `c${i}`, ghl_appointment_id: `a${i}`, ghl_calendar_id: WE, status: 'new', start_time: DEMO_GHL }));
+  const leads = new Map(rows.map((r, i) => [r.ghl_contact_id, [{ lp_lead_id: `${i}`, disposition_code: 'Issue', appointment_date: DEMO_LP }]]));
+  const read = [];
+  const memo = createSettledMemo();
+  const { deps } = closeDeps({ mode: 'shadow', readCap: 2, settledMemo: memo, readGhlRows: async () => rows, readLeads: async () => leads, readLive: async (lead) => { read.push(lead.lp_lead_id); return live('Issue'); } });
+  await runPostAppointmentClose({ deps });
+  const second = await runPostAppointmentClose({ deps });
+  const third = await runPostAppointmentClose({ deps });
+  assert.deepEqual(read, ['0', '1', '2', '3', '4'], 'every row read once, none twice');
+  assert.equal(second.remembered, 2);
+  assert.equal(third.remembered, 4, 'pass 3 reads only the last row');
+  assert.equal(third.waiting, 5, 'a remembered wait still counts as waiting');
+  assert.equal(third.capped, 0);
+});
+
+test('close memo: LP dispositioning the lead re-reads at once; a shadow close is remembered, a live write and an unreadable LP never', async () => {
+  const memo = createSettledMemo();
+  const rows = [{ ghl_contact_id: 'c0', ghl_appointment_id: 'a0', ghl_calendar_id: WE, status: 'new', start_time: DEMO_GHL }];
+  let code = 'Issue';
+  let reads = 0;
+  const { deps } = closeDeps({ mode: 'shadow', settledMemo: memo, readGhlRows: async () => rows,
+    readLeads: async () => new Map([['c0', [{ lp_lead_id: '7', disposition_code: code, appointment_date: DEMO_LP }]]]),
+    readLive: async () => { reads++; return live(code); } });
+  await runPostAppointmentClose({ deps });
+  code = 'OPPFDN';
+  const s = await runPostAppointmentClose({ deps });
+  assert.equal(reads, 2, 'a new stored disposition is a new key');
+  assert.equal(s.would.showed, 1);
+  const again = await runPostAppointmentClose({ deps });
+  assert.equal(reads, 2, 'the shadow close is remembered');
+  assert.equal(again.would.showed, 1, 'and still reported');
+  assert.equal(settledTtl({ op: 'close', applied: true }, 'live'), 0);
+  assert.equal(settledTtl({ op: 'skip', reason: 'lp_unreadable' }, 'shadow'), 0);
+  assert.equal(settledTtl({ op: 'wait', reason: 'visit_not_passed' }, 'shadow'), 0);
 });
