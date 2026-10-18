@@ -45,6 +45,8 @@ import { runScopeDq } from '../agentic/scope-dq.js';
 import { scopeDqDeps } from '../services/scope-dq-io.js';
 import { guardRepeatPromise, recordPromiseIfAny } from '../services/promised-callbacks-io.js';  // 2026-10-07
 import { recordTurnStage, readStageForPlanner } from '../services/lead-stage-io.js';  // 2026-10-12
+import { claimTurn, releaseTurn } from '../agentic/turn-lock-io.js';  // 2026-10-18 (Phase 1)
+import { readLastPlanStep } from '../services/plan-step-io.js';  // 2026-10-18 (Phase 1 item 4)
 import { trackBackground } from '../graceful-shutdown.js';
 import { sendChatEmailAsk } from './email-ask.js';
 import { fetchFreeSlots, selectOfferableSlots } from '../knowledge/calendar-availability.js';
@@ -512,6 +514,10 @@ export function productionLaneDeps() {
     // Fire-and-forget: the stage never holds up a reply (lead-stage-io.js).
     recordLeadStage: (p) => { trackBackground(recordTurnStage(p).catch(() => {})); return null; },
     readLeadStage: (contactId) => readStageForPlanner(contactId),
+    // 2026-10-18 (Phase 1): one owner per inbound, and the previous reply's plan step.
+    claimTurn: (a) => claimTurn(a, { supabase }),
+    releaseTurn: (a) => releaseTurn(a, { supabase }),
+    readLastPlanStep: (contactId) => readLastPlanStep(contactId),
     contactUrl: (id) => (id ? `https://app.gohighlevel.com/v2/location/${GHL_LOCATION_ID}/contacts/detail/${id}` : null),
   };
 }

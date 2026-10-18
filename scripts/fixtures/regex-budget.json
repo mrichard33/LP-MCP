@@ -1,5 +1,5 @@
 {
-  "count": 297,
+  "count": 296,
   "updated": "2026-10-18",
-  "reason": "Phase 0 seed: the count of `_RX =` declarations in src/agentic on main at c2e9d70, 2026-10-18 (architecture review 2026-10-17)."
+  "reason": "Phase 1 item 4: DOOR_OPEN_LINE_RX removed; the second no after our close is read from the recorded plan_step (CLOSE_PLAN_STEPS), not our wording (rehash_not_at_this_time). Phase 0 seed was 297 at c2e9d70."
 }

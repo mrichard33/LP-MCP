@@ -18,6 +18,15 @@
  * prompt blocks. An unexplained snapshot diff means the change is wrong, not
  * the snapshot. Map: docs/handoffs/response-generator-split-map.md.
  *
+ * v2.9.0 — 2026-10-18. PHASE 1: ONE OWNER PER INBOUND (architecture review
+ *   2026-10-17, cause 4). NO PROMPT COPY CHANGES. The one planner change: a
+ *   no right after our recorded close step (post_demo_close, door_open,
+ *   post_demo_stop) counts as a no whatever our close said; the planner reads
+ *   the previous SENT reply's plan_step (src/services/plan-step-io.js), and the
+ *   wording regex it replaces is gone. _bot_context carries plan_step and
+ *   question_allowed (top-level bot_message_context columns). The turn lock
+ *   lives in the send path (src/agentic/turn-lock.js), not here.
+ *
  * v2.8.0 — 2026-10-18. PHASE 0 FREEZE (architecture review 2026-10-17).
  *   NO PROMPT TEXT OR BEHAVIOUR CHANGES. v2.7.14 had been stamped on every
  *   reply across 206 builds, so a row could not say which build wrote it. From
@@ -423,13 +432,14 @@ import { LINES as NEPQ_LINES } from './agentic/nepq-planner.js';
 import { buildStageInput, leadStageMode } from './agentic/lead-stage.js';
 import { typedZipFromThread, zoneForContact } from './services/contact-timezone.js';
 import { readStageForPlanner } from './services/lead-stage-io.js';
+import { readLastPlanStep } from './services/plan-step-io.js';  // 2026-10-18 (Phase 1 item 4)
 import { isCustomerP2 } from './agentic/lead-state/signals/context-reader.js';
 import { isUnsoldPostDemo, lpSold, postDemoOwnerName, replaceSalesRepFollowUp } from './agentic/post-demo-owner.js';
 import { postDemoPlannerMode } from './agentic/post-demo-turn.js';
 import { rehashCallSlotsMode, readRehashCallSlots, rehashCallBooking } from './agentic/rehash-slots.js';
 import { isInRehash, rehashLeadFromContext, rehashRoutingMode } from './agentic/rehash-state.js';
 import { enforcePresentationGuard } from './siro/presentation-guard.js';
-import { planNepqTurn, enforceNepqPlan, referenceRetryNote, nepqBackboneMode, prefersCall as nepqPrefersCall, objectionType as nepqObjectionType, TIME_REQUEST_RX as NEPQ_TIME_REQUEST_RX, SCHEDULE_ASK_RX as NEPQ_SCHEDULE_ASK_RX,REPEAT_COMPLAINT_RX as NEPQ_REPEAT_COMPLAINT_RX, bookingOpenInThread as nepqBookingOpenInThread, dropUnaskedCallOffer, leadWantsCall as nepqLeadWantsCall, isServiceCallback as nepqIsServiceCallback } from './agentic/nepq-planner.js';
+import { planNepqTurn, enforceNepqPlan, referenceRetryNote, nepqBackboneMode, prefersCall as nepqPrefersCall, objectionType as nepqObjectionType, TIME_REQUEST_RX as NEPQ_TIME_REQUEST_RX, SCHEDULE_ASK_RX as NEPQ_SCHEDULE_ASK_RX,REPEAT_COMPLAINT_RX as NEPQ_REPEAT_COMPLAINT_RX, bookingOpenInThread as nepqBookingOpenInThread, dropUnaskedCallOffer, leadWantsCall as nepqLeadWantsCall, isServiceCallback as nepqIsServiceCallback, planStepOf as nepqPlanStepOf } from './agentic/nepq-planner.js';
 // A layer3 script that forbids a time offer this turn (follow_up_scheduled,
 // OBJ_PRICE_STRIKE3's "no slot grid").
 const NO_TIMES_DIRECTIVE_RX = /\bno\s+(?:times|slots?|slot\s+grid|booking\s+ask)\b/i;
@@ -439,11 +449,11 @@ import {
 } from './agentic/service-area-turn.js';
 
 /**
- * v2.8.0 — the header version above, as a value. Stamped (with the deployed
+ * v2.9.0 — the header version above, as a value. Stamped (with the deployed
  * git sha) onto every fingerprint so a replay knows which generator wrote the
  * reply. Bump it with the header note.
  */
-export const RESPONSE_GENERATOR_VERSION = 'v2.8.0';
+export const RESPONSE_GENERATOR_VERSION = 'v2.9.0';
 
 // Provider + model resolved at call time by the shared client from the
 // `response_generator` fn key (customer_facing group). Legacy
@@ -4208,6 +4218,9 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
         rehashCallSlots = await memo('rehash_call_slots', () => readRehashCallSlots({ contactId, timezone: tz, tzLabel: tzLabel(tz) }));
       }
       leadStage = opts.dryRun === true ? (opts.leadStageOverride || null) : await readStageForPlanner(contactId);
+      // 2026-10-18 (Phase 1 item 4): the plan step our previous SENT reply ran
+      // on. The simulator carries its own in memory (dry run never reads).
+      const lastPlanStep = opts.dryRun === true ? (opts.lastPlanStepOverride ?? null) : await readLastPlanStep(contactId);
       const planArgs = {
         channel: 'sms',
         trigger: triggerMessage,
@@ -4237,6 +4250,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
         // plan offered two anyway; the plan block wins over the script, so the
         // planner is told.
         directiveNoTimes: NO_TIMES_DIRECTIVE_RX.test(String(opts.promptHint || '')),
+        lastPlanStep,
       };
       nepqPlan = planNepqTurn({ ...planArgs, postDemo: pdMode === 'live' && postDemoLead, rehashRep, rehash: !!rehash, callSlots: slotsMode === 'live' ? rehashCallSlots : null });
       if (slotsMode === 'shadow' && rehash && postDemoLead) {
@@ -5018,6 +5032,8 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       post_demo: !!nepqPlan.post_demo, rehash_stage: nepqPlan.rehash_stage || null,
       // 2026-10-17: the plan asks nothing (a lead's sign-off, a first no, the stop).
       ...(nepqPlan.no_question ? { no_question: true } : {}),
+      // 2026-10-18 (Phase 1 item 4): the step this reply is recorded under.
+      plan_step: nepqPlanStepOf(nepqPlan),
       // 2026-10-13: the third price ask's call offer is the plan, not unasked.
       ...(nepqPlan.call_offer_ok ? { call_offer_ok: true } : {}),
     };
@@ -5638,6 +5654,10 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     // hands it to recordMessageContext() with the action id as message_ref.
     _bot_context: {
       core_prompt_version: RESPONSE_GENERATOR_VERSION,
+      // 2026-10-18 (Phase 1 item 4): the plan this reply ran on, recorded as
+      // top-level bot_message_context columns for the next turn's planner.
+      plan_step: nepqPlanStepOf(nepqPlan) || 'unplanned',
+      question_allowed: nepqPlan ? nepqPlan.no_question !== true : null,
       model: resolveLLM('response_generator').model,
       // CANON.STD.026: what this reply ran on (null before the call returns).
       prompt_sha256: genMeta.prompt_sha256 || null,

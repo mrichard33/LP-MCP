@@ -1942,7 +1942,7 @@ through the REAL bots on Railway, with nothing sent or written. It scores each c
 no pitch after a no, never "done" without the cancel, one reply to a burst, …). It compares the
 result with the last gate run and saves it as a `agentic.bot_eval_run` system event (codes and
 turns only, never customer text). **Ship only if the scorecard does not read WORSE THAN LAST RUN.**
-A run takes 10–15 minutes and about 130 real model turns. A new scenario rule must come from a
+A run takes 20–30 minutes and about 260 real model turns (every scenario twice since Phase 1). A new scenario rule must come from a
 ruling already in this file, so a failure means a regression, not a matter of taste.
 **The AIOS test runs are named scenarios (handoff PR 7, 2026-10-12).** easy_yes, book_it_evening_spouse, renter,
 competitor, stop_sms, stop_chat, trick_prompt, reschedule_unclear, out_of_area_chat, houston_tz. A scenario with
@@ -1960,10 +1960,31 @@ and one must-pass input per reply guard; `scripts/test-regex-budget.js` caps the
 (`scripts/fixtures/regex-budget.json`; raising it needs a reason naming a scenario key). By hand, not in the gate:
 `scripts/replay-bot-eval.js` (live incidents, ids only in the fixture; the text is read from bot_message_context) and
 `scripts/report-stage-agreement.js` (shadow stage vs buyer_stage). Phase 0 baseline (2026-10-18, build 17aabde, scoring
-2026-10-18.2): `agentic.bot_eval_run` system_events 4385611, 64/72; confirmed by `sim_mvdsv66o_grvs`, 66/72, not worse.
+2026-10-18.2): the 2026-10-18 12:55Z gate events (`agentic.bot_eval_run`, v2.8.0+17aabde): system_events 4385611, 64/72; confirmed by `sim_mvdsv66o_grvs`, 66/72, not worse. Two runs on one build; see Phase 1 item 3.
 rehash_not_at_this_time and rehash_book_call flip between runs on the same build. The full w42 replay still needs a
 machine with the keys (planner-only: 10/14). A gate job lives in memory: a deploy during the run loses it, so start one
 only while nothing is about to merge.
+
+**Phase 1: one owner per inbound, a gate that runs twice (2026-10-18, v2.9.0).** Four rules can answer one SMS (106,
+161, 228, 373) and a rule-written send can re-fire with no new inbound (Teresa's two DQ replies, Shawn's and Paul's two
+replies to one text). Every reply path CLAIMS the inbound in `bot_turn_locks` before any context build or model call
+(`src/agentic/turn-lock.js` pure, `turn-lock-io.js` I/O): the SMS send path once, in `claimReplyTurn`
+(`src/send-message-handler.js`, after the quiet-hours and email-delay holds), and the live-chat lane per inbound message
+id. The key is the GHL message id, else the sha256 of the text read by the ONE normaliser (`src/agentic/turn-key.js`,
+which `missed-inbound.js` re-exports); a re-fire with no text claims the LAST inbound. A failed claim is a skip row
+(`turn_owned_by:<rule>` or `already_answered`) and no model call. An owner that stands down without a reply releases
+the turn for the next path (a stand-down is only safe if something else answers); a claim 10 minutes old and never
+released is taken over and logged. A bot-initiated send (a hold return, a nurture step) claims nothing
+(`turnClaimScope`); POST_BOOKING_EMAIL_ASK claims a turn of its own. The watchdogs 228 and 373 claim like everyone
+else and, live, wait until the inbound is 180 s old and lose to any reply sent after it (`watchdog_recovered` when they
+win). `TURN_LOCK_MODE` shadow (default) records the would-skip on the row (`input_snapshot.turn_lock_shadow_would_skip`)
+and proceeds; live skips. The 48-hour check before live: every flagged row is a duplicate or a watchdog that lost.
+The gate runs every scenario twice (`run_bot_eval` `runs`, default 2): a key passes only if it passes in every run,
+mixed is `flaky` (listed, never WORSE), and the comparison and family rates use stable results only. The second no
+after our close is read from the previous SENT reply's `bot_message_context.plan_step` (`post_demo_close`,
+`door_open`, `post_demo_stop`), never our wording; every reply row writes `plan_step` and `question_allowed`. The
+version rule covers planner copy too: `scripts/test-planner-copy-snapshot.js` snapshots LINES / fixed lines and the
+rehash track's copy, and a change without a `RESPONSE_GENERATOR_VERSION` bump fails.
 
 ## Writing code here
 

@@ -1250,6 +1250,10 @@ async function executeSingleActionUntracked(action, batchContext = {}, priorBatc
           gate_result: result?.action || null,
           gate_reason: result?.reason || null,
           recorded_status: status,
+          // 2026-10-18 (Phase 1): the turn lock's claim, when it decided this skip
+          // (live) or would have (shadow; the 48-hour check reads this flag).
+          ...(result?.turn_key ? { turn_key: result.turn_key, owner_rule: result.owner_rule || null } : {}),
+          ...(result?.turn_lock_shadow_would_skip ? { turn_lock_shadow_would_skip: true, turn_lock_skip_reason: result.turn_lock_skip_reason || null } : {}),
         },
       });
     }

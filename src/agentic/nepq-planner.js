@@ -578,7 +578,6 @@ const POST_DEMO_OFFER_RX = /\bwould\s+(?:a\s+)?(?:quick\s+)?call\s+help\b|\bwoul
 // ("What got you looking at windows?") still is not.
 const POST_DEMO_QUESTION_RX = /\bwhat(?:'|’)?s?\s+(?:has\s+)?changed\b|\bsince\s+(?:the|our|my)\s+(?:visit|appointment|demo|meeting|presentation)\b|\b(?:the|your|our)\s+(?:proposal|quote|estimate|presentation)\b|\bmov(?:e|ing)\s+forward\b/i;
 
-const DOOR_OPEN_LINE_RX = /\bif\s+anything\s+changes\b|\bwe(?:'|’)?re\s+(?:here|around)\b|\bwe\s+are\s+here\b/i;
 /** A no on the post-demo line: isNo, or a soft no to our offer / track question. Pure. */
 export function isPostDemoNo(text, lastOutbound = '') {
   const t = String(text || '');
@@ -591,15 +590,40 @@ export function isPostDemoNo(text, lastOutbound = '') {
   const sign = String(lastOutbound || '').match(SIGNOFF_RX);
   const o = sign ? String(lastOutbound).slice(0, sign.index).trim() : String(lastOutbound || '');
   if (isNo(t, o)) return true;
-  // 2026-10-18 (the bot gate after #1355): the closer step answers a first no
-  // with the model's own door-open line ("If anything changes down the road,
-  // we're here.") and asks nothing, so "No, we are good" after it was not a no
-  // and the second no got "What's holding you back?". A no after that line is
-  // the second no. "No problem" and a no with more to say still are not.
-  if (DOOR_OPEN_LINE_RX.test(o) && (SOFT_DECLINE_RX.test(t) || BARE_NO_RX.test(t))) return true;
+  // 2026-10-18 (Phase 1 item 4): a no after our door-open close used to be read
+  // from our own wording ("If anything changes … we're here."), which the model
+  // varies, so the second no was missed. It is now read from the plan step our
+  // last reply ran on (isNoAfterClose, CLOSE_PLAN_STEPS) in planPostDemo.
   if (!SOFT_DECLINE_RX.test(t)) return false;
   return CALL_OFFER_SENTENCE_RX.test(o) || BRIDGE_RX.test(o) || POST_DEMO_OFFER_RX.test(o) || REHASH_BRIDGE_RX.test(o) || REHASH_STAGES.some(st => st.rx.test(o))
     || (o.includes('?') && POST_DEMO_QUESTION_RX.test(o));
+}
+
+/**
+ * The plan steps after which the lead's next no counts, whatever our reply
+ * said (Phase 1 item 4, 2026-10-18): our close (a sign-off answered), the
+ * door-open line (a first no answered) and the stop line. Read from the
+ * previous reply's recorded plan_step (bot_message_context), never our text.
+ */
+export const CLOSE_PLAN_STEPS = Object.freeze(new Set(['post_demo_close', 'door_open', 'post_demo_stop']));
+
+/** A soft or bare no right after one of our close steps. Pure. */
+export function isNoAfterClose(text, lastPlanStep) {
+  if (!CLOSE_PLAN_STEPS.has(String(lastPlanStep || ''))) return false;
+  const t = String(text || '');
+  return SOFT_DECLINE_RX.test(t) || BARE_NO_RX.test(t);
+}
+
+/**
+ * The step a reply is RECORDED under (bot_message_context.plan_step). The
+ * door-open turn is planned as step 'post_demo' with rehash_stage 'door_open'
+ * (the enforcer keys on 'post_demo', so the plan's step name stays); it is
+ * recorded as 'door_open' so the next turn can tell it from an open answer. Pure.
+ */
+export function planStepOf(plan) {
+  if (!plan || !plan.step) return null;
+  if (plan.step === 'post_demo' && plan.rehash_stage === 'door_open' && plan.no_question === true) return 'door_open';
+  return String(plan.step);
 }
 
 // A post-demo price objection: the cost itself, never a question asking what
@@ -832,6 +856,10 @@ function planNepqTurnCore({
   // 2026-10-15 (Jeff Clark): the warranty files are configured
   // (WARRANTY_PDF_URLS), so a copy asked for is sent with this reply.
   warrantyAvailable = false,
+  // 2026-10-18 (Phase 1 item 4): the plan step our PREVIOUS reply to this
+  // contact ran on (bot_message_context.plan_step, planStepOf), or null when
+  // unknown. A no right after a close step counts, whatever our close said.
+  lastPlanStep = null,
 } = {}) {
   const turns = normalizeThread(conversation, trigger);
   const inbound = turns.filter(t => t.direction === 'inbound');
@@ -1221,10 +1249,14 @@ function planNepqTurnCore({
     // letting us know."), so a wording check missed the second no. A no right after a no, with nothing asked in
     // between, is the second no whatever our close said.
     let lastWasNo = false;
+    // 2026-10-18 (Phase 1 item 4): this turn's no after our recorded close step
+    // (post_demo_close, door_open, post_demo_stop) counts, however we worded it.
+    const nowIdx = turns.length - 1;
     const noCount = turns.reduce((n, t, i) => {
       if (t.direction !== 'inbound') return n;
       const prev = prevOutAt(i);
       const counted = !DM_GATE_ASK_RX.test(prev) && (isPostDemoNo(t.text, prev)
+        || (i === nowIdx && isNoAfterClose(t.text, lastPlanStep))
         || (lastWasNo && !prev.includes('?') && (SOFT_DECLINE_RX.test(t.text) || BARE_NO_RX.test(t.text))));
       lastWasNo = counted;
       return n + (counted ? 1 : 0);

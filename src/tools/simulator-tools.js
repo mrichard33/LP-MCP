@@ -28,11 +28,14 @@ import { formatScorecard } from '../simulator/sim-scoring.js';
 export const EVAL_RUN_EVENT = 'agentic.bot_eval_run';
 
 /** The saved form of a scorecard: codes and turns, never customer text. Pure. */
-export function evalRunPayload(scorecard, comparison) {
+export function evalRunPayload(scorecard, comparison, runCards = null) {
   const { results = [], ...head } = scorecard || {};
+  const compact = (r) => ({ key: r.key, family: r.family || null, pass: r.pass, ...(r.flaky ? { flaky: true } : {}), failures: r.failures.map(f => ({ code: f.code, turn: f.turn ?? null, ...(f.run ? { run: f.run } : {}) })) });
   return {
-    scorecard: { ...head, results: results.map(r => ({ key: r.key, family: r.family || null, pass: r.pass, failures: r.failures.map(f => ({ code: f.code, turn: f.turn ?? null })) })) },
+    scorecard: { ...head, results: results.map(compact) },
     comparison: comparison || null,
+    // 2026-10-18 (Phase 1 item 3): one event per gate, every run's results inside.
+    ...(Array.isArray(runCards) && runCards.length > 1 ? { runs: runCards.map(c => ({ passed: c.passed, conversations: c.conversations, results: (c.results || []).map(compact) })) } : {}),
   };
 }
 
@@ -63,14 +66,14 @@ export const simulatorDeps = {
     const modeOf = (m) => (m || 'live');
     return (data || []).map(r => r?.payload?.scorecard).find(c => c && modeOf(c.nepq_mode) === modeOf(nepqMode)) || null;
   },
-  recordEvalRun: async (scorecard, comparison) => {
+  recordEvalRun: async (scorecard, comparison, runCards = null) => {
     const { emitEvent } = await import('../event-emitter.js');
-    return emitEvent({ event_type: EVAL_RUN_EVENT, source: 'bot_eval', entity_type: 'bot_eval', payload: evalRunPayload(scorecard, comparison), bypass_filter: true });
+    return emitEvent({ event_type: EVAL_RUN_EVENT, source: 'bot_eval', entity_type: 'bot_eval', payload: evalRunPayload(scorecard, comparison, runCards), bypass_filter: true });
   },
 };
 
 /** Validate and normalise a run request. Pure; throws a readable error. */
-export function parseSimRequest({ scenario = null, messages_json = null, channel = 'both', nepq_mode = 'live', persona_json = null, title = null, contact_id = null, lead_stage_mode = null, kb_exemplar_mode = null } = {}) {
+export function parseSimRequest({ scenario = null, messages_json = null, channel = 'both', nepq_mode = 'live', persona_json = null, title = null, contact_id = null, lead_stage_mode = null, kb_exemplar_mode = null, runs = null, turn_lock_mode = null } = {}) {
   let turns = null;
   if (messages_json) {
     try { turns = JSON.parse(messages_json); } catch { throw new Error('messages_json must be a JSON array of strings'); }
@@ -89,7 +92,11 @@ export function parseSimRequest({ scenario = null, messages_json = null, channel
   if (lead_stage_mode != null && lead_stage_mode !== '' && !['shadow', 'live'].includes(lead_stage_mode)) throw new Error('lead_stage_mode must be shadow or live');
   // 2026-10-12: try past-win exemplars before Railway's KB_EXEMPLAR_MODE is switched.
   if (kb_exemplar_mode != null && kb_exemplar_mode !== '' && !['off', 'shadow', 'live'].includes(kb_exemplar_mode)) throw new Error('kb_exemplar_mode must be off, shadow or live');
-  return { scenario: turns ? null : scenario, turns, persona, title, channel, nepqMode: nepq_mode, contactId: contact_id || null, leadStageMode: lead_stage_mode || null, kbExemplarMode: kb_exemplar_mode || null };
+  // 2026-10-18 (Phase 1 item 3): the gate's runs (1-4; the gate defaults to 2).
+  if (runs != null && runs !== '' && !(Number.isInteger(Number(runs)) && Number(runs) >= 1 && Number(runs) <= 4)) throw new Error('runs must be 1 to 4');
+  // 2026-10-18 (Phase 1): try TURN_LOCK_MODE=live in the simulator before Railway's is switched.
+  if (turn_lock_mode != null && turn_lock_mode !== '' && !['shadow', 'live'].includes(turn_lock_mode)) throw new Error('turn_lock_mode must be shadow or live');
+  return { scenario: turns ? null : scenario, turns, persona, title, channel, nepqMode: nepq_mode, contactId: contact_id || null, leadStageMode: lead_stage_mode || null, kbExemplarMode: kb_exemplar_mode || null, ...(runs != null && runs !== '' ? { runs: Number(runs) } : {}), turnLockMode: turn_lock_mode || null };
 }
 
 async function waitFor(job, seconds) {
@@ -100,7 +107,7 @@ async function waitFor(job, seconds) {
 
 function render(job, format) {
   if (format === 'json') return text(job);
-  const head = `Simulation ${job.id}: ${job.status}${job.error ? ` (${job.error})` : ''} — ${job.results.length} conversation(s)`;
+  const head = `Simulation ${job.id}: ${job.status}${job.error ? ` (${job.error})` : ''} — ${job.results.length} conversation(s)${job.runs > 1 ? ` · run ${Math.min(job.runs, (job.runs_done || 0) + (job.status === 'running' ? 1 : 0))} of ${job.runs} (transcripts below are run 1)` : ''}`;
   const card = job.scorecard ? [formatScorecard(job.scorecard, job.comparison || null) + (job.save_error ? `\n(${job.save_error})` : '')] : [];
   return text([head, ...card, ...job.results.map(formatTranscript)].join('\n\n'));
 }
@@ -136,15 +143,18 @@ export function registerSimulatorTools(server, deps = simulatorDeps) {
     'The bot gate: runs EVERY scenario through the real live-chat and SMS bots (real model, nothing sent or written), ' +
       'scores each conversation against the hard checks and the scenario\'s own rules, compares with the last gate run ' +
       'and saves the result. Run it before and after any prompt or model change and ship only if it is not worse. ' +
-      'Takes 10-15 minutes and real model calls; returns a job id for get_bot_simulation.',
+      'Every scenario runs `runs` times (default 2): a key passes only if it passes in every run, and one that passes in one run and fails in another is reported as flaky, never compared. ' +
+      'Cost: ~260 real model turns per gate at the default 2 runs (about 20-30 minutes); returns a job id for get_bot_simulation.',
     {
+      runs: z.number().optional().describe('How many times each scenario runs (1-4, default 2).'),
+      turn_lock_mode: z.string().optional().describe('shadow or live (default: Railway\'s TURN_LOCK_MODE). live runs the turn lock as it would skip.'),
       nepq_mode: z.string().optional().describe('live (default, production) or off.'),
       lead_stage_mode: z.string().optional().describe('shadow or live (default: Railway\'s LEAD_STAGE_MODE). live runs the stored-stage planner before it is switched on.'),
       kb_exemplar_mode: z.string().optional().describe('off, shadow or live (default: Railway\'s KB_EXEMPLAR_MODE). live puts past-win examples in the prompt before it is switched on.'),
     },
-    async ({ nepq_mode = 'live', lead_stage_mode = null, kb_exemplar_mode = null } = {}) => {
+    async ({ nepq_mode = 'live', lead_stage_mode = null, kb_exemplar_mode = null, runs = 2, turn_lock_mode = null } = {}) => {
       let req;
-      try { req = parseSimRequest({ scenario: 'all', channel: 'both', nepq_mode, lead_stage_mode, kb_exemplar_mode }); } catch (err) { return text({ error: err.message }); }
+      try { req = parseSimRequest({ scenario: 'all', channel: 'both', nepq_mode, lead_stage_mode, kb_exemplar_mode, runs, turn_lock_mode }); } catch (err) { return text({ error: err.message }); }
       const job = startSimulationJob({ ...req, gate: true }, deps);
       return text({ job_id: job.id, status: 'running', next: 'call get_bot_simulation with this job_id (wait_seconds up to 100, repeat until done); the scorecard is at the top' });
     },
@@ -184,14 +194,14 @@ export function registerSimulatorRoutes(app, deps = simulatorDeps) {
     const job = startSimulationJob(parsed, deps);
     return res.status(202).json({ job_id: job.id, status_url: `/admin/bot-simulate/${job.id}` });
   });
-  // The gate spends ~130 real model turns, so unlike bot-simulate it refuses
+  // The gate spends ~260 real model turns (2 runs), so unlike bot-simulate it refuses
   // when ADMIN_API_TOKEN is unset instead of running open (2026-10-06 audit:
   // fail-open admin secrets were finding F7).
   app.post('/admin/bot-eval', (req, res) => {
     if (!process.env.ADMIN_API_TOKEN) return res.status(503).json({ error: 'ADMIN_API_TOKEN is not set; the bot gate is closed' });
     if (!authed(req, res)) return;
     let parsed;
-    try { parsed = parseSimRequest({ scenario: 'all', channel: 'both', nepq_mode: req.body?.nepq_mode || 'live', lead_stage_mode: req.body?.lead_stage_mode || null, kb_exemplar_mode: req.body?.kb_exemplar_mode || null }); }
+    try { parsed = parseSimRequest({ scenario: 'all', channel: 'both', nepq_mode: req.body?.nepq_mode || 'live', lead_stage_mode: req.body?.lead_stage_mode || null, kb_exemplar_mode: req.body?.kb_exemplar_mode || null, runs: req.body?.runs ?? 2, turn_lock_mode: req.body?.turn_lock_mode || null }); }
     catch (err) { return res.status(400).json({ error: err.message }); }
     const job = startSimulationJob({ ...parsed, gate: true }, deps);
     return res.status(202).json({ job_id: job.id, status_url: `/admin/bot-simulate/${job.id}` });

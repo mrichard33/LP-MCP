@@ -47,12 +47,10 @@ export const ANSWERED_AFTER_MS = 15 * 60 * 1000;
 /** HL mirror `messages.type` → the webhook's messageType. Pure. */
 export const MIRROR_TYPES = Object.freeze({ 2: 'SMS', 3: 'Email' });
 
-export function normalizeText(t) {
-  return String(t ?? '')
-    .replace(/\\\\[nrt]|\\[nrt]/g, ' ')
-    .replace(/\u00a0/g, ' ')
-    .replace(/\s+/g, ' ').trim().toLowerCase();
-}
+// One normaliser for "the same inbound" (Phase 1, 2026-10-18): the turn key
+// (turn-key.js) and the duplicate checks read text the same way.
+import { normalizeInbound } from './turn-key.js';
+export const normalizeText = normalizeInbound;
 
 const ms = (v) => {
   const n = Date.parse(v ?? '');

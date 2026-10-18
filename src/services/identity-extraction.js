@@ -105,6 +105,23 @@ export function cleanDisplayName(firstName, lastName = '') {
     .trim();
 }
 
+/**
+ * 2026-10-18 (Phase 1 item 5; WVdo3zSqe2PEjXfCmhDA): a reply opened
+ * "Christina/Nikhil". A first name holding two people or something that is not
+ * a name — a "/", "&", "+", " and ", a digit, or over 20 characters — is
+ * rendered as no name at all (the reply then opens without one). Pure; no regex.
+ */
+export const MAX_FIRST_NAME_CHARS = 20;
+export function usableFirstName(raw) {
+  const n = String(raw ?? '').trim();
+  if (!n) return null;
+  if (n.length > MAX_FIRST_NAME_CHARS) return null;
+  if (n.includes('/') || n.includes('&') || n.includes('+')) return null;
+  if (` ${n.toLowerCase()} `.includes(' and ')) return null;
+  for (const ch of n) if (ch >= '0' && ch <= '9') return null;
+  return n;
+}
+
 /** Normalize a US phone to E.164 (+1XXXXXXXXXX) or null. */
 export function normalizePhoneE164(raw) {
   if (!raw) return null;
