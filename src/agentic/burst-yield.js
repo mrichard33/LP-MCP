@@ -34,6 +34,8 @@
  * none, the reply is sent. The reply SLA watchdog (3 min) is the backstop.
  */
 
+import { normalizeText } from './missed-inbound.js';
+
 const ACK_ONLY_RX = /^\s*(?:ok(?:ay)?|k|kk|thanks?(?:\s+you)?|thx|ty|cool|great|lol|ha(?:ha)?|👍|🙏|\.)\s*[.!]*\s*$/i;
 
 /**
@@ -74,6 +76,64 @@ export async function findNewerInbound({ contactId, payload = {} } = {}, deps = 
     return null;
   }
 }
+
+/**
+ * 2026-10-17 (Shawn Eastman, refs 590695 @14:06 and 590865 @14:17): ONE text
+ * of his reached us as two ghl.reply_received events whose bodies differed only
+ * by "\\n\\n" vs a real newline, and each got its own, different reply. The
+ * message_ref dedupe cannot see it (two refs). This answers: did an EARLIER
+ * inbound from this contact, in the last 15 minutes, carry the same text once
+ * normalized (normalizeText: escapes and whitespace read as spaces, lowercase),
+ * and has a reply (send_message, any live status, not this action) already
+ * been queued or sent after it? Then this reply is a duplicate.
+ * Fails open: an error, no text or no boundary returns null (send as before).
+ *
+ * @param {{ contactId: string, payload: object, actionId?: string|number }} args
+ * @param {{ supabase: object, nowMs?: number }} deps
+ * @returns {Promise<{ earlier_event_id, answered_by_action_id } | null>}
+ */
+export async function findAnsweredDuplicateInbound({ contactId, payload = {}, actionId = null } = {}, deps = {}) {
+  const text = normalizeText(payload?.message_text);
+  const ownId = positiveId(payload?.inbound_event_id) ?? positiveId(payload?.last_inbound_event_id);
+  const ownAt = validIso(payload?.inbound_event_created_at) ?? validIso(payload?.last_inbound_event_created_at);
+  if (!contactId || !deps.supabase || !text || (ownId == null && ownAt == null)) return null;
+  const batchKeys = new Set((Array.isArray(payload?.inbound_message_keys) ? payload.inbound_message_keys : []).map(String));
+  if (payload?.message_id) batchKeys.add(String(payload.message_id));
+  const nowMs = Number.isFinite(deps.nowMs) ? deps.nowMs : Date.now();
+  const since = new Date((ownAt ? Date.parse(ownAt) : nowMs) - DUPLICATE_WINDOW_MS).toISOString();
+  try {
+    let q = deps.supabase
+      .from('system_events')
+      .select('id, created_at, payload')
+      .eq('ghl_contact_id', contactId)
+      .eq('event_type', 'ghl.reply_received')
+      .gte('created_at', since);
+    q = ownId != null ? q.lt('id', ownId) : q.lt('created_at', ownAt);
+    const { data, error } = await q.order('id', { ascending: false }).limit(20);
+    if (error || !Array.isArray(data)) return null;
+    const earlier = data.find((e) => {
+      const mid = e?.payload?.message_id;
+      if (mid && batchKeys.has(String(mid))) return false;
+      return normalizeText(e?.payload?.message_text) === text;
+    });
+    if (!earlier?.created_at) return null;
+    let a = deps.supabase
+      .from('agent_actions')
+      .select('id, status, created_at')
+      .eq('target_id', contactId)
+      .eq('action_type', 'send_message')
+      .in('status', ['pending', 'approved', 'executing', 'completed'])
+      .gt('created_at', earlier.created_at);
+    if (actionId != null) a = a.neq('id', actionId);
+    const { data: sends, error: sendErr } = await a.order('created_at', { ascending: true }).limit(1);
+    if (sendErr || !Array.isArray(sends) || !sends.length) return null;
+    return { earlier_event_id: earlier.id, answered_by_action_id: sends[0].id };
+  } catch {
+    return null;
+  }
+}
+
+const DUPLICATE_WINDOW_MS = 15 * 60 * 1000;
 
 function positiveId(v) {
   if (v == null || v === '') return null;

@@ -250,6 +250,31 @@ export function isAcknowledgment(text) {
   return !!word && /^\p{Lu}/u.test(word);
 }
 
+// The lead closed the exchange (2026-10-17, six live rehash threads): "Not
+// ready" got "Where are you at with it?", "I'll get back with you as soon as I
+// can" and "Will do. Thanks!" got a proposal question, "Not at this time.
+// Thanks" got "Would a quick call help?", and Billy answered the next one with
+// "Now you're harassing me". A closer asks nothing and gets one matching line,
+// no question. A thank-you that opens ("Hi, I got the proposal, thanks") is
+// isAcknowledgment, not this; "Thank you I will." stays a thank-you too.
+const CLOSER_RXS = [
+  /\b(?:i|we)(?:'|’)?ll\s+(?:get\s+back\s+(?:to|with)\s+you|be\s+in\s+touch|reach\s+out|let\s+you\s+know|contact\s+you|call\s+you|text\s+you|keep\s+you\s+posted|follow\s+up)\b/i,
+  /^\s*(?:will\s+do|sounds\s+good|got\s+it|noted|understood)\b[\s.!,]*(?:(?:thanks?|thank\s+you|ty)\b)?[\s.!,👍🙏]*$/iu,
+  /\bi\s+(?:have|saved|got)\s+(?:your|both)\s+(?:number|numbers|info)\b/i,
+  /\b(?:thanks?|thank\s+you)\b[^?]*\b(?:god\s+bless|take\s+care|have\s+a\s+(?:good|great|nice)\b)/i,
+  /^\s*(?:ok(?:ay)?|k)[\s.,!]*(?:(?:thanks?|thank\s+you|ty)\b)?[\s.!👍]*$/iu,
+];
+// Shawn's exact words were "Not at this time. Thanks": a thanks or a name may follow.
+const NOT_NOW_CLOSER_RX = /^\s*(?:no[,.]?\s+)?not\s+(?:ready|yet|now|at\s+this\s+time)\b[\s.!,]*(?:(?:thanks?|thank\s+you|ty)\b(?:\s+\p{L}+)?)?[\s.!]*$/iu;
+
+/** The lead signed off: a closer that ends the exchange and asks nothing. Pure. */
+export function isLeadCloser(text) {
+  const t = String(text || '').replace(/[’]/g, "'").trim();
+  if (!t || t.includes('?')) return false;
+  if (t.split(/\s+/).length <= 6 && NOT_NOW_CLOSER_RX.test(t)) return true;
+  return CLOSER_RXS.some(rx => rx.test(t));
+}
+
 // The lead asked for room: more time, time to think, or a hard stretch at
 // home (Jose Perez, 2026-10-14: "Had a traumatic event with my small dog …
 // I would need more time to think about this thank you", then "Appreciate it,

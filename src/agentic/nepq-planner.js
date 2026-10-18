@@ -34,7 +34,7 @@ import { slotMentionIndex, offeredSlots as offeredIn, pickSlot, mentionedMinutes
 import { parseDayPreference, slotsForPreference, slotMatches, preferenceOfferLine } from './day-preference.js';
 import { enforceOneAsk } from './one-ask.js';
 import { isKnockComplaint } from './do-not-knock.js';
-import { detectDeferral, pendingDeferral, isAcknowledgment, isSignOffLine, askedForSpace, POST_DEMO_QUESTIONS } from './post-demo-turn.js';
+import { detectDeferral, pendingDeferral, isAcknowledgment, isLeadCloser, isSignOffLine, askedForSpace, POST_DEMO_QUESTIONS } from './post-demo-turn.js';
 import { PURCHASED_ELSEWHERE_RX } from './purchased-elsewhere.js';
 import { bestDealHintUsed } from './rehash.js';
 import { rehashNepqTurn, bridgedRecently, rehashObjection, BEST_DEAL_RX, PRE_BRIDGE_STAGES, REHASH_STAGES, REHASH_BRIDGE_RX } from './rehash-nepq.js';
@@ -1190,7 +1190,7 @@ function planNepqTurnCore({
     plan.counters.post_demo_nos = noCount;
     const stopSent = outbound.some(m => POST_DEMO_STOP_RX.test(m.text));
     const releases = now.includes('?') || SCHEDULE_ASK_RX.test(now) || TIME_REQUEST_RX.test(now) || askedForCall;
-    const stopPlan = (extra) => pd({ step: 'post_demo_stop', required_move: 'close', call_offer_ok: false, fixed_line: stopLine, rehash_question: null, ...extra });
+    const stopPlan = (extra) => pd({ step: 'post_demo_stop', required_move: 'close', call_offer_ok: false, fixed_line: stopLine, rehash_question: null, no_question: true, ...extra });
     if (!stopSent && (noCount >= 2 || track.stage === 'stop')) {
       return stopPlan({ handoff: { reason: 'rehash_stop', line: stopLine } });
     }
@@ -1247,6 +1247,19 @@ function planNepqTurnCore({
       const line = `Understood${hi}. ${who}`;
       plan.objection.line = line;
       return pd({ step: 'handoff', required_move: 'handoff', fixed_line: line, call_offer_ok: false, handoff: { reason: 'rehash_repeat_objection', line }, rehash_ladder: 'handoff' });
+    }
+    // 3d. The lead signed off ("Not ready", "Will do. Thanks!", "I'll get back
+    //     with you", "I have your number saved"; six live threads, 2026-10-17).
+    //     One line that matches theirs and NO question: the track's next stage
+    //     question, appended by the guard, was what Billy called harassing.
+    if (track.stage === 'closer' || (isLeadCloser(now) && track.stage !== 'schedule')) {
+      return pd({ step: 'post_demo_close', required_move: 'close', call_offer_ok: false, no_question: true, fixed_line: null, rehash_question: null, ack_line: `Sounds good${hi}.` });
+    }
+    // 3e. A first no ("Not interested at this time. We explained to Damian we
+    //     were in the planning stage."): leave the door open and ask nothing.
+    //     The model's own "What changed since the visit?" went out to Billy.
+    if (onTrack && track.stage === 'door_open') {
+      return pd({ step: 'post_demo', required_move: 'answer', call_offer_ok: false, no_question: true, rehash_question: null, ack_line: `Understood${hi}. We're here whenever you're ready.` });
     }
     // Asked for room in the last 48 hours of this thread.
     const spaceAsked = earlierIn.slice(-4).some(m => askedForSpace(m.text) && (!Number.isFinite(m.atMs) || nowMs - m.atMs < 48 * 3_600_000));
@@ -2385,7 +2398,7 @@ export function enforceNepqPlan(draft, plan, { allowFigures = false, known = {} 
       changes.push('question_after_sign_off');
     }
     if (plan.step === 'competitor_signed') drop(s => /\bcongrat/i.test(s), 'no_congratulations');
-    if (plan.step === 'defer' || plan.step === 'competitor_signed' || plan.step === 'post_demo_stop' || plan.step === 'post_demo_space') {
+    if (plan.step === 'defer' || plan.step === 'competitor_signed' || plan.step === 'post_demo_stop' || plan.step === 'post_demo_space' || plan.step === 'post_demo_close') {
       drop(s => s.includes('?') || SLOT_OFFER_RX.test(s) || clockMinutes(s).length > 0, 'post_demo_no_question');
     } else if (plan.step === 'post_demo_ack' && !plan.post_demo_question) {
       drop(s => s.includes('?'), 'post_demo_no_question');
@@ -2470,6 +2483,13 @@ export function enforceNepqPlan(draft, plan, { allowFigures = false, known = {} 
     changes.push('multi_ask_trimmed');
     if (questions.length > 1) changes.push('one_question');
   }
+  // 5'. A plan that asks nothing (a lead's sign-off, a first no, the stop;
+  // 2026-10-17): every question goes, whoever wrote it.
+  if (plan.no_question && sentences.some(s => s.includes('?'))) {
+    sentences = sentences.filter(s => !s.includes('?'));
+    changes.push('closer_no_question');
+    if (!sentences.length) sentences = [plan.ack_line || 'Sounds good.'];
+  }
   body = sentences.join(' ').trim();
   // A post-demo thank-you that lost everything to the drops: thanks back.
   if (!body && plan.post_demo && plan.ack_line) { body = plan.ack_line; changes.push('ack_line'); }
@@ -2479,14 +2499,14 @@ export function enforceNepqPlan(draft, plan, { allowFigures = false, known = {} 
   // 2026-10-11 live simulation: "Thanks for checking in" got "Anytime. Talk
   // soon." The planned proposal question goes on; a sign-off in its way goes.
   const trackQuestion = plan.step === 'post_demo_ack' ? plan.post_demo_question : plan.step === 'post_demo' ? plan.rehash_question : null;
-  if (trackQuestion && plan.rehash_stage && !body.includes('?')) {
+  if (trackQuestion && plan.rehash_stage && !plan.no_question && !body.includes('?')) {
     const kept = splitSentences(body).filter(s => !isSignOffLine(s) && !/^talk\s+soon\b/i.test(s));
     body = [...kept, trackQuestion].join(' ').trim();
     changes.push('post_demo_question_added');
   }
   // The bridge turn asks for the call (the same simulation: "Worth seeing if
   // we can close that difference." and no question).
-  if (plan.post_demo && plan.rehash_stage === 'bridge' && plan.step === 'post_demo' && body && !body.includes('?')) {
+  if (plan.post_demo && plan.rehash_stage === 'bridge' && plan.step === 'post_demo' && !plan.no_question && body && !body.includes('?')) {
     body = `${body} Would a quick call help?`;
     changes.push('rehash_bridge_ask_added');
   }
@@ -2559,7 +2579,7 @@ export function enforceNepqPlan(draft, plan, { allowFigures = false, known = {} 
   // Never on a post-demo plan, a deferral, a close or after a goodbye
   // (2026-10-09: "Enjoy your week. Is it more how they look, or how they work?").
   const endsOnSignOff = isSignOffLine(splitSentences(body).slice(-1)[0] || '');
-  const noDiscovery = plan.post_demo || ['defer', 'close', 'competitor_signed', 'post_demo_ack', 'post_demo_stop', 'post_demo_space'].includes(plan.step) || endsOnSignOff;
+  const noDiscovery = plan.post_demo || ['defer', 'close', 'competitor_signed', 'post_demo_ack', 'post_demo_stop', 'post_demo_space', 'post_demo_close'].includes(plan.step) || endsOnSignOff;
   if ((plan.required_move === 'probe' || plan.required_move === 'consequence') && !body.includes('?') && !actionable && !noDiscovery) {
     // A discovery turn collects no details: "Let me get your zip code so I can
     // confirm…" next to the question was two asks, and a zip asked twice

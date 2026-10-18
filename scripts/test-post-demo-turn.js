@@ -161,9 +161,12 @@ test('thread C turn 2: "Follow up in November please." → the same, never a sec
 test('thread C turn 3: a thank-you after the deferral gets no question and no times', () => {
   const conv = [FOLLOW_UP_OUT, inb('Follow up in November please.'), out("That works, Pat. I'll check back in November.")];
   const p = plan('ok thanks', conv);
-  assert.equal(p.step, 'post_demo_ack');
+  // 2026-10-17 ("Rehash bot: hard stop on closers"): "ok thanks" is a closer,
+  // so it is post_demo_close (no question at all), no longer post_demo_ack.
+  assert.equal(p.step, 'post_demo_close');
+  assert.equal(p.no_question, true);
   assert.equal(p.pending_deferral.label, 'in November');
-  assert.equal(p.post_demo_question, null);
+  assert.ok(!p.post_demo_question);
   assert.deepEqual(p.slots_to_offer, []);
 });
 

@@ -265,6 +265,30 @@ export function uniqueValueTagReason(tag) {
   return null;
 }
 
+/**
+ * 2026-10-17 (Diane, c4mxpy24yMrzsga4nj8g): a reason-bearing tag reached GHL as
+ * three tags, "concern-expressed:trust (skeptical", "need references" and
+ * "seems too good)": GHL's tag field splits on commas. A concern tag we write
+ * keeps a plain label: no commas or parentheses, spaces collapsed, the value
+ * capped at 40 characters. The reason belongs in a note. The O.V workflow
+ * builds `pre-demo-concern:{{contact.objection_type_ai}}` in GHL itself; that
+ * copy is a GHL edit (docs/ghl-concern-tag-split.md). PURE.
+ */
+const REASON_TAG_PREFIXES = ['concern-expressed:', 'pre-demo-concern:'];
+export const REASON_TAG_MAX_VALUE = 40;
+export function cleanReasonTag(tag) {
+  const t = String(tag ?? '').trim();
+  const prefix = REASON_TAG_PREFIXES.find(p => t.toLowerCase().startsWith(p));
+  if (!prefix) return t;
+  const value = t.slice(prefix.length)
+    .replace(/[(),]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, REASON_TAG_MAX_VALUE)
+    .trim();
+  return `${prefix}${value}`;
+}
+
 export function decideTagWrite(currentTags, tag, contactId) {
   const rejected = rejectedTagResult(tag, contactId);
   if (rejected) return { verdict: 'rejected', result: rejected };
@@ -362,7 +386,7 @@ export function decideTagWrite(currentTags, tag, contactId) {
 
 export async function executeAddTag(action, context = {}) {
   const contactId = action.target_id;
-  const tag = normalizeTag(action.action_payload?.tag);
+  const tag = cleanReasonTag(normalizeTag(action.action_payload?.tag));
   if (!contactId || !tag) throw new Error('Missing contactId or tag');
 
   // 2026-07-03 — tag hygiene: a tag ending in ':' is a namespace with an empty

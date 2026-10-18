@@ -206,6 +206,9 @@ export function checkReply(reply, ctx = {}) {
     if (said.some(s => POST_DEMO_REBUTTAL_RX.test(s))) fail('post_demo_rebuttal', text);
     if (!['handoff', 'rehash_confirm', 'rehash_offer'].includes(ctx.postDemoStep) && said.some(s => UNPROMISED_FOLLOW_UP_RX.test(s))) fail('post_demo_unbacked_follow_up', text);
     if (ctx.postDemoStep === 'post_demo_stop' && text.includes('?')) fail('question_after_post_demo_stop', text);
+    // 2026-10-17 (Billy, Shawn, Debbie, James, Paul, Tatyana, Jeff): a lead's
+    // sign-off or first no gets one line and no question.
+    else if ((ctx.postDemoStep === 'post_demo_close' || ctx.postDemoNoQuestion === true) && text.includes('?')) fail('question_after_closer', text);
   }
 
   // ── the visit is context, never a quote (2026-10-16, Siro PR 1) ─────────
