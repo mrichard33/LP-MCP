@@ -319,11 +319,16 @@ export function buildContextRow(input = {}, env = process.env) {
     // (or by a path that has no model call) carries no new column at all.
     ...(input.prompt_sha256 ? { prompt_sha256: clip(input.prompt_sha256, 64) } : {}),
     ...(input.resolved_model ? { resolved_model: clip(input.resolved_model, 120) } : {}),
+    // 2026-10-18 (Phase 1 item 4): the plan this reply ran on, for the next
+    // turn's planner ("a no after our close" reads the recorded step, not our
+    // wording). Reply rows only; present only when known.
+    ...(messageType === 'reply' && input.plan_step ? { plan_step: clip(input.plan_step, 80) } : {}),
+    ...(messageType === 'reply' && typeof input.question_allowed === 'boolean' ? { question_allowed: input.question_allowed } : {}),
   };
 }
 
-/** The two STD.026 columns (sql/148). */
-export const FINGERPRINT_VERSION_COLUMNS = Object.freeze(['prompt_sha256', 'resolved_model']);
+/** The optional columns: STD.026's two (sql/148) and Phase 1's two (20261018200100). A write refused for any of them retries without all four. */
+export const FINGERPRINT_VERSION_COLUMNS = Object.freeze(['prompt_sha256', 'resolved_model', 'plan_step', 'question_allowed']);
 
 /** sha256 hex of the exact prompt string sent, or null. Pure. */
 export function promptSha256(text) {

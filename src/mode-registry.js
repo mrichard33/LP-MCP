@@ -113,6 +113,12 @@ export const MODES = Object.freeze([
     goLive: 'rehash.would_* events name only OPPFDN leads inside the 30-day window',
     note: 'Puts post-demo leads in the rehash stage and routes their calls to the rehash team.',
   }),
+  m('TURN_LOCK_MODE', 'bot', 'enum', ['shadow', 'live'], 'shadow', { live: ['live'], shadow: ['shadow'] }, {
+    since: '2026-10-18', decider: 'Mark',
+    evidence: { table: 'bot_turn_locks' },
+    goLive: '48 h in shadow: every bot_message_context row with input_snapshot.turn_lock_shadow_would_skip is a duplicate or a watchdog that lost (10 checked by hand); no code change for the flip. Retired in Phase 5.',
+    note: 'One owner per inbound (Phase 1): every reply path claims the inbound before any model call; live skips a second path, a duplicate or a re-fire (skip row, no message).',
+  }),
   m('LEAD_STAGE_MODE', 'bot', 'enum', OSL, 'shadow', OSL_S, {
     since: '2026-10-12', decider: 'Mark',
     evidence: { table: 'lead_conversation_stage' },

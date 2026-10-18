@@ -68,7 +68,9 @@ import { enforceCancelledVisit } from '../agentic/cancelled-visit.js';
 import { lpNoteDqMode } from '../agentic/lp-note-dq.js';
 import { enforceOneAsk } from '../agentic/one-ask.js';
 import { looksLikeShortPhone } from '../agentic/contact-typos.js';
-import { planNepqTurn, enforceNepqPlan, referenceRetryNote, nepqBackboneMode, pickFresh, LINES as NEPQ_LINES, isServiceCallback, dropUnsafeLines, leadWantsCall } from '../agentic/nepq-planner.js';
+import { planNepqTurn, enforceNepqPlan, referenceRetryNote, nepqBackboneMode, pickFresh, LINES as NEPQ_LINES, isServiceCallback, dropUnsafeLines, leadWantsCall, planStepOf } from '../agentic/nepq-planner.js';
+import { turnLockMode } from '../agentic/turn-lock.js';
+import { turnKeyFor } from '../agentic/turn-key.js';
 import { nearestTwo } from '../agentic/slot-recheck.js';
 import { findSixPmSlot, eveningRequestFromThread, eveningReplyLine, requestedLabel } from '../agentic/evening-request.js';
 import { capacityGateEnabled } from '../knowledge/market-capacity-gate.js';
@@ -82,7 +84,7 @@ import { COLLECT_ASK, COLLECT_ASK_AGAIN, dmAsk, holdLine, missingItems, parseDec
 import { enforceBookingFacts, bookingFactsNote } from '../agentic/sms-booking-turn.js';
 import { contactRecheckLine } from '../agentic/contact-check.js';
 import { chatIdentity } from './identity-capture.js';
-import { isPlaceholderName } from '../services/identity-extraction.js';
+import { isPlaceholderName, usableFirstName } from '../services/identity-extraction.js';
 import {
   loopBreakState,
   spouseAdvocacyState,
@@ -411,7 +413,7 @@ export function minimalContext({ contactId, contact = null, nowMs = Date.now(), 
     lead: {
       ghl_contact_id: contactId,
       name,
-      first_name: contact?.firstName || contact?.first_name || (name ? name.split(' ')[0] : null),
+      first_name: usableFirstName(contact?.firstName || contact?.first_name || (name ? name.split(' ')[0] : null)),   // Phase 1 item 5
       phone: contact?.phone || null,
       email: contact?.email || null,
       current_tags: tags,
@@ -717,8 +719,30 @@ export function createLiveChatFastLane(deps) {
     recordOpenerHold: async () => null,
     rescheduleAppointment: async () => ({ ok: false, error: 'no reschedule dep' }),
     contactUrl: () => null,
+    // 2026-10-18 (Phase 1): one owner per inbound (src/agentic/turn-lock-io.js).
+    // Defaults claim everything and record nothing, so an unwired lane behaves
+    // as before. turnLockMode: shadow (record, proceed) | live (skip).
+    claimTurn: async () => ({ claimed: null, error: 'no_turn_lock_dep' }),
+    releaseTurn: async () => ({ released: false }),
+    turnLockMode: () => turnLockMode(),
+    // 2026-10-18 (Phase 1 item 4): the plan step our previous reply ran on.
+    readLastPlanStep: async () => null,
     ...deps,
   };
+
+  // Every reply row says which plan step it ran on (Phase 1 item 4), and in
+  // TURN_LOCK_MODE=shadow a turn another path already owned is flagged on the
+  // row (turn_lock_shadow_would_skip) for the 48-hour check.
+  const shadowSkips = new Map();
+  function fingerprint(row) {
+    const flag = shadowSkips.get(String(row.message_ref));
+    if (flag) shadowSkips.delete(String(row.message_ref));
+    d.fingerprint({
+      ...row,
+      plan_step: row.plan_step || 'unplanned',
+      ...(flag ? { input_snapshot: { ...(row.input_snapshot || {}), turn_lock_shadow_would_skip: true, turn_lock_skip_reason: flag } } : {}),
+    });
+  }
 
   // 2026-10-02 ("Guest Visitor tzuzq") — the newest message received per
   // visitor. Two messages 28s apart each got their own reply, written without
@@ -867,6 +891,32 @@ export function createLiveChatFastLane(deps) {
       return { outcome: 'superseded', mode, sent: false, action_id: actionId };
     }
 
+    // ── one owner per inbound (Phase 1, 2026-10-18; turn-lock.js) ──
+    // Claimed per inbound message id before any model call. live: a turn
+    // another path owns (or already answered) is a skip row; shadow: recorded
+    // on this reply's row, and the reply goes ahead as before. A claim that
+    // could not be read fails open.
+    const turnKey = turnKeyFor({ messageId: inbound.messageId || null, text: rawBody }) || `msg:${messageKey}`;
+    const turnClaim = await Promise.resolve()
+      .then(() => d.claimTurn({ contactId, turnKey, ownerRule: LIVE_CHAT_RULE, channel: 'livechat', ownerActionId: actionId }))
+      .catch(err => ({ claimed: null, error: err.message }));
+    const turnHeld = turnClaim?.claimed === true;
+    if (turnClaim?.claimed === false) {
+      if (d.turnLockMode() === 'live') {
+        d.log(`[LiveChat] ${contactId} turn ${turnKey} ${turnClaim.skip_reason} — no reply`);
+        await finishAction(actionId, { status: 'skipped', error_message: turnClaim.skip_reason, execution_result: { action: 'send_message_skipped', channel: 'livechat', reason: turnClaim.skip_reason, timing: finalizeTiming(timing) } });
+        if (actionId != null) d.fingerprint({ message_type: 'skip', message_ref: String(actionId), ghl_contact_id: contactId, channel: 'livechat', rule_applied: LIVE_CHAT_RULE, inbound_text: rawBody, skip_reason: turnClaim.skip_reason, input_snapshot: { gate_result: 'send_message_skipped', gate_reason: turnClaim.skip_reason, turn_key: turnKey, owner_rule: turnClaim.owner_rule || null } });
+        return { outcome: 'skipped', mode, reason: turnClaim.skip_reason, action_id: actionId };
+      }
+      d.log(`[LiveChat] ${contactId} turn ${turnKey} would skip (${turnClaim.skip_reason}) — TURN_LOCK_MODE=shadow, replying`);
+      if (actionId != null) shadowSkips.set(String(actionId), turnClaim.skip_reason);
+    }
+    const settleTurn = (out) => {
+      if (!turnHeld) return;
+      const outcome = out?.sent ? 'sent' : String(out?.reason || out?.outcome || 'not_sent').slice(0, 120);
+      Promise.resolve().then(() => d.releaseTurn({ contactId, turnKey, ownerActionId: actionId, outcome })).catch(() => {});
+    };
+
     // ── the reply lock: the pipeline can never also answer this message ──
     const slot = await d.acquireSlot({ contact_id: contactId, job_id: String(actionId ?? `livechat-${messageKey}`), trigger_id: messageKey, holder: 'live_chat_fast_lane' });
     let holderToken = slot.holder_token || null;
@@ -874,6 +924,7 @@ export function createLiveChatFastLane(deps) {
     if (!slot.acquired) {
       if (slot.reason === 'already_sent' || slot.reason === 'yield_to_newer') {
         await finishAction(actionId, { status: 'skipped', error_message: `reply lock: ${slot.reason}`, execution_result: { action: 'send_message_skipped', channel: 'livechat', reason: slot.reason, timing } });
+        settleTurn({ reason: slot.reason });
         return { outcome: 'skipped', mode, reason: slot.reason };
       }
       // cooldown: a chat is synchronous; the 90s SMS gap would dead-end it.
@@ -916,6 +967,7 @@ export function createLiveChatFastLane(deps) {
         outcome = raced.value;
       }
     } finally {
+      settleTurn(outcome);
       if (lockHeld && outcome?.sent) {
         await d.commitSend(contactId, String(actionId ?? `livechat-${messageKey}`), { message_id: outcome.ghl_message_id || null, conversation_id: conversationId, gapSec: 0 });
       } else if (lockHeld) {
@@ -1162,7 +1214,7 @@ export function createLiveChatFastLane(deps) {
     let leadStage = null;
     if (nepqMode !== 'off' && (!saPlan.active || coveragePlanned) && !planOverride) {
       try { leadStage = await d.readLeadStage(contactId); } catch { leadStage = null; }
-      const realFirst = hasNameOnRecord ? String(context.lead?.first_name || context.lead?.name || '').trim().split(/\s+/)[0] || null : null;
+      const realFirst = hasNameOnRecord ? usableFirstName(String(context.lead?.first_name || context.lead?.name || '').trim().split(/\s+/)[0] || null) : null;
       const planInput = {
         channel: 'livechat', trigger: body, conversation: context.conversation_recent, firstName: realFirst, postDemoLead: pastDemo,
         hasAppointment: !!appointmentOnFile({ upcomingAppointments, lp: context.lp }),
@@ -1177,6 +1229,8 @@ export function createLiveChatFastLane(deps) {
         knownOpenings: (Number(context.estimate?.window_count) || 0) + (Number(context.estimate?.door_count) || 0) > 0,
         // 2026-10-15: a copy of the warranty asked for is sent with this reply.
         warrantyAvailable: !!warrantyTurn(body),
+        // 2026-10-18 (Phase 1 item 4): our previous reply's recorded plan step.
+        lastPlanStep: await Promise.resolve().then(() => d.readLastPlanStep(contactId)).catch(() => null),
       };
       nepqPlan = planNepqTurn(planInput);
       if (!saPlan.active && wantsSlots(nepqPlan)) {
@@ -1603,6 +1657,9 @@ export function createLiveChatFastLane(deps) {
       fingerprintExtras: {
         // The record keeps what the lead typed; the snapshot says what was removed.
         inbound_text: rawInbound,
+        // Phase 1 item 4 (2026-10-18): the plan this reply ran on, for the next turn.
+        plan_step: planStepOf(nepqPlan) || 'unplanned',
+        question_allowed: nepqPlan ? nepqPlan.no_question !== true : null,
         prompt_sha256: promptSha,
         resolved_model: resolvedModel,
         intent_class: classification?.intent_class || null, buyer_stage: Number(liveChatFields?.buyer_stage) || null, model,
@@ -2128,7 +2185,7 @@ export function createLiveChatFastLane(deps) {
     };
     await finishAction(actionId, { status: 'completed', execution_result: executionResult });
     if (actionId != null) {
-      d.fingerprint({
+      fingerprint({
         message_type: 'reply', message_ref: String(actionId), ghl_contact_id: contactId, channel: 'livechat',
         rule_applied: LIVE_CHAT_RULE, inbound_text: body, reply_text: draft,
         ...fingerprintExtras,
@@ -2190,7 +2247,7 @@ export function createLiveChatFastLane(deps) {
       execution_result: { action: 'message_sent', channel: 'livechat', send_status: sent ? 'fallback' : 'fallback_not_sent', ...(sent ? { sent_body: message } : {}), message_id: ghlMessageId, conversation_id: conversationId, reason, timing: finished },
     });
     if (actionId != null) {
-      d.fingerprint({ message_type: 'reply', message_ref: String(actionId), ghl_contact_id: contactId, channel: 'livechat', rule_applied: LIVE_CHAT_RULE, inbound_text: rawInbound, reply_text: sent ? message : null, input_snapshot: { mode, fallback_reason: reason } });
+      fingerprint({ message_type: 'reply', message_ref: String(actionId), ghl_contact_id: contactId, channel: 'livechat', rule_applied: LIVE_CHAT_RULE, inbound_text: rawInbound, reply_text: sent ? message : null, plan_step: 'fallback', input_snapshot: { mode, fallback_reason: reason } });
       if (sent) d.markSent(actionId);
     }
     return { outcome: 'fallback', sent, message: sent ? message : null, ghl_message_id: ghlMessageId, reason, timing: finished };

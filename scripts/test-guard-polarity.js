@@ -90,6 +90,19 @@ export const CASES = [
     },
   },
   {
+    // Phase 1 item 4 (2026-10-18): the PLAN is what changed, not the enforcer.
+    // A second no after our recorded close plans no_question (post_demo_stop),
+    // and with no_question the enforcer must hand the closer back untouched.
+    // The KNOWN-BAD case above stays: the enforcer still appends when the plan
+    // does not say no_question.
+    guard: 'enforceNepqPlan (no_question plan passes unchanged)',
+    mustChange: () => enforceNepqPlan(JAMES_DRAFT, POST_DEMO_PLAN).text !== JAMES_DRAFT,
+    mustPass: () => {
+      const r = enforceNepqPlan(JAMES_DRAFT, { ...POST_DEMO_PLAN, no_question: true });
+      return r.text === JAMES_DRAFT && !(r.changes || []).length;
+    },
+  },
+  {
     guard: 'enforceSignOff',
     mustChange: () => enforceSignOff("Sounds good, Erica. We'll have someone from our team give you a call when it's a better time.", { inbound: 'I can call back when I have more time. Ty' }).changed === true,
     mustPass: () => enforceSignOff('Thanks. Someone from our team will give you a call tomorrow.', { inbound: 'Have a good day' }).changed === false,

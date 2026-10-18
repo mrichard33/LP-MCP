@@ -18,7 +18,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-const { planNepqTurn, isPostDemoNo, discoveryQuestion } = await import('../src/agentic/nepq-planner.js');
+const { planNepqTurn, isPostDemoNo, isNoAfterClose, planStepOf, discoveryQuestion } = await import('../src/agentic/nepq-planner.js');
 const { detectDeferral } = await import('../src/agentic/post-demo-turn.js');
 const { renderPlanBlock } = await import('../src/prompts/response-generator/nepq-backbone.js');
 
@@ -56,20 +56,43 @@ test('a soft no counts after the model\'s own post-demo question (bot gate, 2026
   assert.equal(p.step, 'post_demo_stop');
 });
 
-test('a no after our door-open close is the second no (bot gate, 2026-10-18)', () => {
+test('a no after our recorded close step is the second no, whatever we said (Phase 1 item 4)', () => {
   const close = "Understood, Monica. If anything changes down the road, we're here.";
-  assert.equal(isPostDemoNo('No, we are good', close), true);
-  assert.equal(isPostDemoNo('No thanks', close), true);
-  assert.equal(isPostDemoNo('No problem, I will reach out', close), false, 'not a no');
-  assert.equal(isPostDemoNo('No, we are good', 'Sounds good, Monica.'), false, 'a plain ack asks nothing: not a no');
-  const p = rehashPlan([
-    msg('inbound', 'Hi, I got the proposal', 5),
-    msg('outbound', 'Where are you at with it? — John', 4),
-    msg('inbound', 'Not at this time. Thanks', 3),
-    msg('outbound', close, 2),
-  ], 'No, we are good');
-  assert.equal(p.step, 'post_demo_stop');
-  assert.equal(p.handoff?.reason, 'rehash_stop');
+  // Our wording no longer decides it: the regex over our own close is gone.
+  assert.equal(isPostDemoNo('No, we are good', close), false, 'wording alone is not read any more');
+  assert.equal(isNoAfterClose('No, we are good', 'door_open'), true);
+  assert.equal(isNoAfterClose('No thanks', 'post_demo_close'), true);
+  assert.equal(isNoAfterClose('No', 'post_demo_stop'), true);
+  assert.equal(isNoAfterClose('No problem, I will reach out', 'door_open'), false, 'not a no');
+  assert.equal(isNoAfterClose('No, we are good', 'post_demo'), false, 'an open answer is not a close');
+  assert.equal(isNoAfterClose('No, we are good', null), false, 'unknown step: not counted from this rule');
+  // A no, then a sign-off (breaks "a no right after a no"), then a no after our
+  // close: the recorded step is what makes it the second no.
+  const thread = [
+    msg('inbound', 'Hi, I got the proposal', 7),
+    msg('outbound', 'Where are you at with it? — John', 6),
+    msg('inbound', 'Not at this time. Thanks', 5),
+    msg('outbound', close, 4),
+    msg('inbound', 'Will do. Thanks!', 3),
+    msg('outbound', 'Sounds good, Monica.', 2),
+  ];
+  const withStep = planNepqTurn({
+    channel: 'sms', trigger: 'No, we are good', conversation: [...thread, msg('inbound', 'No, we are good', 0)], firstName: 'Monica',
+    postDemo: true, rehash: true, rehashRep: 'John', callSlots: { offer: SLOTS, all: SLOTS, repName: 'John' }, nowMs: NOW, lastPlanStep: 'post_demo_close',
+  });
+  assert.equal(withStep.step, 'post_demo_stop');
+  assert.equal(withStep.handoff?.reason, 'rehash_stop');
+  const without = rehashPlan(thread, 'No, we are good');
+  assert.notEqual(without.step, 'post_demo_stop', 'with no recorded step the plain ack reads as no close');
+});
+
+test('the door-open turn is recorded as door_open; every other plan by its step', () => {
+  assert.equal(planStepOf({ step: 'post_demo', rehash_stage: 'door_open', no_question: true }), 'door_open');
+  assert.equal(planStepOf({ step: 'post_demo', rehash_stage: 'situation' }), 'post_demo');
+  assert.equal(planStepOf({ step: 'post_demo_close' }), 'post_demo_close');
+  assert.equal(planStepOf(null), null);
+  const p = rehashPlan([msg('inbound', 'Hi, I got the proposal', 4), msg('outbound', 'Where are you at with it? — John', 3)], 'Not interested at this time. We are in the planning stage.');
+  assert.equal(planStepOf(p), 'door_open');
 });
 
 test('a no right after a no counts, however our close was worded (bot gate, 2026-10-18)', () => {

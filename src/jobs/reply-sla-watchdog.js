@@ -222,6 +222,9 @@ export async function runReplySlaWatchdog(deps = {}) {
           message_text: String(r.payload?.message_text || '').slice(0, 1000),
           channel: r.payload?.channel || null,
           inbound_at: r.created_at,
+          // 2026-10-18 (Phase 1): the inbound's GHL message id, so the recovery
+          // reply claims the same turn as every other path (turn-key.js).
+          message_id: r.payload?.message_id || null,
         },
         idempotency_key: `reply_sla_${r.id}`,
       });

@@ -97,6 +97,7 @@
  * v2.0 — Notes/calls from normalized lp_notes + lp_call_logs tables.
  */
 
+import { usableFirstName } from './services/identity-extraction.js';
 import supabase from './supabase.js';
 import { appointmentDelta, appointmentPhase, formatDateHuman, formatTimeHuman } from './appointment-dates.js';
 import { timezoneForZip } from './services/contact-timezone.js';
@@ -1273,8 +1274,10 @@ export async function buildLeadContext(ghlContactId, options = {}) {
     market,
     lead: {
       ghl_contact_id: ghlContactId,
-      name: ghlContact?.name || lpName || 'Unknown',
-      first_name: ghlContact?.firstName || lpLead?.first_name || null,    // v2.5
+      // 2026-10-18 (Phase 1 item 5): a first name that is two people or not a
+      // name ("Christina/Nikhil") is no name, here where the writer reads it.
+      name: leadDisplayName(ghlContact?.name || lpName || 'Unknown', ghlContact?.firstName || lpLead?.first_name || null),
+      first_name: usableFirstName(ghlContact?.firstName || lpLead?.first_name || null),    // v2.5
       last_name: ghlContact?.lastName || lpLead?.last_name || null,        // v2.5
       email: ghlContact?.email || null,
       phone: ghlContact?.phone || null,
@@ -1584,4 +1587,15 @@ export function registerContextBuilderRoutes(app) {
     bumpContactCache(contactId);
     res.json({ ok: true, contactId });
   });
+}
+
+/**
+ * The lead's display name with an unusable first name taken off the front
+ * (Phase 1 item 5): "Christina/Nikhil Patel" → "Patel". Pure.
+ */
+export function leadDisplayName(name, rawFirst) {
+  const full = String(name || '').trim();
+  const first = String(rawFirst || '').trim();
+  if (!first || usableFirstName(first) || !full.startsWith(first)) return full || 'Unknown';
+  return full.slice(first.length).trim() || 'Unknown';
 }

@@ -184,6 +184,28 @@ export const SCENARIO_EXPECTATIONS = Object.freeze({
     const first = replies(r.transcript?.[0]).join(' ');
     return first && !/\b(?:gracias|nuestro|equipo|usted|hola|le|se\s+comunicar[áa])\b/i.test(first) ? [{ code: 'spanish_reply_not_spanish', detail: first, turn: 1 }] : [];
   },
+  // ── 2026-10-18 (Phase 1): one owner per inbound ──
+  // Teresa (DQ_RENTER_DETECTED, 2026-10-18 06:44): a re-fire with no new inbound
+  // is answered by nothing. The lock refuses it (`already_answered`) in live and
+  // records the would-skip in shadow; either way no second message.
+  dq_renter_refire: (r) => {
+    const out = [];
+    const refire = (r.transcript || []).find(t => t.refire === true);
+    if (!refire) return [{ code: 'refire_not_run', detail: 'the scenario had no re-fire turn' }];
+    const lock = refire.turn_lock || {};
+    if (replies(refire).length) out.push({ code: 'refire_answered', detail: replies(refire).join(' '), turn: refire.turn });
+    const ok = lock.mode === 'live' ? lock.skip_reason === 'already_answered' : lock.shadow_would_skip === true && lock.skip_reason === 'already_answered';
+    if (!ok) out.push({ code: 'refire_not_locked', detail: `mode ${lock.mode || '?'}, ${lock.skip_reason || 'claimed'}`, turn: refire.turn });
+    return out;
+  },
+  // Paul (d2hmgL9fAAWvtuu7NN5q, 2026-10-17 14:45): two texts 3 s apart got two
+  // replies from two rules. Exactly one reply goes out; a second rule's send is
+  // counted when the run is in shadow (it would still go out today).
+  two_texts_one_reply_sms: (r) => {
+    const t = r.transcript?.[0];
+    const n = replies(t).length + (Number(t?.shadow_extra_sends) || 0);
+    return n === 1 ? [] : [{ code: 'two_texts_not_one_reply', detail: `${n} replies to two quick texts`, turn: 1 }];
+  },
   // Rapid-fire messages get ONE reply (Mark, 2026-10-02).
   burst: (r) => {
     const n = replies(r.transcript?.[0]).length;
@@ -380,8 +402,9 @@ const asList = (v) => (v == null ? null : (Array.isArray(v) ? v : [v]).map(Strin
  * The per-turn expectations a scenario declares (Phase 0, 2026-10-18), held
  * to every conversation that carries `expect`. Pure.
  *   expect: { [turn]: { question_allowed?: boolean, move?: string|string[],
- *                       step?: string|string[], no_clock?: boolean } }
- * Codes: expected_turn_missing, question_not_allowed, move_mismatch,
+ *                       step?: string|string[], no_clock?: boolean,
+ *                       max_questions?: number } }
+ * Codes: expected_turn_missing, question_not_allowed, move_mismatch, too_many_questions,
  * step_mismatch, clock_not_allowed, guard_question_appended (a turn that must
  * ask nothing, where a guard appended the post-demo question or the bridge
  * ask, live `changes` or shadow `would_change`).
@@ -409,8 +432,18 @@ export function turnExpectationFailures(result) {
     const step = String(t.nepq?.step || '');
     if (steps && !steps.includes(step)) out.push({ code: 'step_mismatch', detail: `step ${step || 'none'}, expected ${steps.join(' | ')}`, turn: turnNo });
     if (want?.no_clock === true && clockCount(text)) out.push({ code: 'clock_not_allowed', detail: text, turn: turnNo });
+    // 2026-10-18 (Phase 1, the user's ruling on a new lead's first "Not
+    // interested"): at most this many questions (sentences ending "?").
+    if (Number.isInteger(want?.max_questions) && questionCount(text) > want.max_questions) {
+      out.push({ code: 'too_many_questions', detail: `${questionCount(text)} questions: ${text}`, turn: turnNo });
+    }
   }
   return out;
+}
+
+/** Sentences that end in a question mark. Pure. */
+export function questionCount(text) {
+  return String(text || '').split(/(?<=[.!?])\s+/).filter(x => x.trim().endsWith('?')).length;
 }
 
 /** Did the run book, move or hold a time (code-backed), at any turn? Pure. */
@@ -487,7 +520,10 @@ export function scoreResult(result) {
     // off (stop-bot) and a person owns the lead (2026-10-07).
     // A texted STOP is answered with silence, which is right (2026-10-12, PR 7).
     const smsStop = result.channel === 'sms' && isOptOut(inbound);
-    if (!texts.length && t.intent !== 'LP_NOTE_DQ' && !smsStop) failures.push({ code: 'no_reply', detail: t.error || t.outcome || 'no reply', turn: t.turn });
+    // A re-fire with no new inbound, or a turn the turn lock gave to another
+    // path, is silent on purpose (Phase 1, 2026-10-18).
+    const lockSkipped = t.refire === true || t.turn_lock?.skipped === true;
+    if (!texts.length && t.intent !== 'LP_NOTE_DQ' && !smsStop && !lockSkipped) failures.push({ code: 'no_reply', detail: t.error || t.outcome || 'no reply', turn: t.turn });
     // Whether THIS turn booked: a recorded booking in the turn's effects.
     // A move of the same appointment (the cancel flow's reschedule) counts:
     // "You're now set for …" is backed by it (2026-10-07 gate run, after
@@ -564,6 +600,69 @@ export function scoreRun(results, meta = {}) {
 }
 
 /**
+ * One scorecard from several runs of the same gate (Phase 1 item 3,
+ * 2026-10-18). The Phase 0 baseline ran twice on one build 5 s apart and
+ * scored 64/72 and 66/72: rehash_not_at_this_time failed turn 3 in one run and
+ * passed in the other. A key passes only if it passes in EVERY run; a key that
+ * passes in one and fails in another is `flaky` (listed and counted apart, and
+ * never WORSE on its own). The pass rate and the family rates are over the
+ * stable keys only. Pure.
+ * @param {object[]} cards  scoreRun() output, one per run
+ */
+export function combineRuns(cards = []) {
+  const runs = (cards || []).filter(Boolean);
+  if (runs.length <= 1) return runs[0] ? { ...runs[0], runs: 1, stable: runs[0].conversations, flaky: 0, flaky_keys: [] } : null;
+  const byKey = new Map();
+  runs.forEach((card, i) => {
+    for (const r of card.results || []) {
+      const e = byKey.get(r.key) || { key: r.key, scenario: r.scenario, channel: r.channel, family: r.family, per_run: [] };
+      e.per_run[i] = r;
+      byKey.set(r.key, e);
+    }
+  });
+  const results = [];
+  for (const e of byKey.values()) {
+    const seen = e.per_run.filter(Boolean);
+    const passes = seen.filter(r => r.pass).length;
+    const allPass = seen.length === runs.length && passes === seen.length;
+    const flaky = passes > 0 && !allPass;
+    results.push({
+      key: e.key, scenario: e.scenario, channel: e.channel, family: e.family,
+      pass: allPass, flaky,
+      runs_passed: passes, runs_seen: seen.length,
+      replies: Math.max(0, ...seen.map(r => r.replies || 0)),
+      failures: e.per_run.flatMap((r, i) => (r && !r.pass ? r.failures.map(f => ({ ...f, run: i + 1 })) : [])),
+    });
+  }
+  const stableRows = results.filter(r => !r.flaky);
+  const passed = stableRows.filter(r => r.pass).length;
+  const codes = {};
+  for (const r of results) for (const f of r.failures) codes[f.code] = (codes[f.code] || 0) + 1;
+  const byFamily = {};
+  for (const r of stableRows) {
+    const f = (byFamily[familyOf(r)] ||= { conversations: 0, passed: 0, pass_rate: null });
+    f.conversations += 1;
+    if (r.pass) f.passed += 1;
+  }
+  for (const f of Object.values(byFamily)) f.pass_rate = Math.round((f.passed / f.conversations) * 1000) / 1000;
+  const { results: _r, pass_rate_by_family: _f, failure_counts: _c, passed: _p, pass_rate: _pr, conversations: _n, ...head } = runs[0];
+  return {
+    ...head,
+    runs: runs.length,
+    run_scores: runs.map(c => ({ passed: c.passed, conversations: c.conversations })),
+    conversations: results.length,
+    stable: stableRows.length,
+    passed,
+    pass_rate: stableRows.length ? Math.round((passed / stableRows.length) * 1000) / 1000 : null,
+    flaky: results.length - stableRows.length,
+    flaky_keys: results.filter(r => r.flaky).map(r => r.key),
+    pass_rate_by_family: byFamily,
+    failure_counts: codes,
+    results,
+  };
+}
+
+/**
  * Is this run worse than the last one? Worse = a lower pass rate over the
  * conversations BOTH runs scored, or a conversation that passed last time and
  * fails now. A run against a different set of checks (INVARIANTS_VERSION,
@@ -589,10 +688,15 @@ export function compareScorecards(current, previous) {
     return { compared: false, worse: null, reasons: [`the scenario checks changed (${previous.scoring_version || 'none'} → ${current.scoring_version || 'none'}); this run is the new baseline`] };
   }
   const reasons = [];
-  const before = new Map((previous.results || []).map(r => [r.key, r.pass]));
-  const currentResults = current.results || [];
+  // 2026-10-18 (Phase 1 item 3): stable results only. A key flaky in either
+  // run is reported under "Flaky this run" and never compared: a coin flip
+  // is not a regression (or a fix).
+  const before = new Map((previous.results || []).filter(r => !r.flaky).map(r => [r.key, r.pass]));
+  const flakyNow = (current.results || []).filter(r => r.flaky).map(r => r.key);
+  const currentResults = (current.results || []).filter(r => !r.flaky);
   const shared = currentResults.filter(r => before.has(r.key));
-  const newKeys = currentResults.filter(r => !before.has(r.key)).map(r => ({ key: r.key, pass: !!r.pass }));
+  const prevKeys = new Set((previous.results || []).map(r => r.key));
+  const newKeys = currentResults.filter(r => !prevKeys.has(r.key)).map(r => ({ key: r.key, pass: !!r.pass }));
   // The pass rate over the shared conversations; a saved run with no per-key
   // results (none today, but an older payload could lack them) falls back to
   // the whole-run rates.
@@ -622,19 +726,27 @@ export function compareScorecards(current, previous) {
   for (const r of shared) {
     if (before.get(r.key) === true && !r.pass) reasons.push(`${r.key} passed last run and now fails (${r.failures.map(f => f.code).join(', ')})`);
   }
-  return { compared: true, worse: reasons.length > 0, reasons, new_keys: newKeys };
+  return { compared: true, worse: reasons.length > 0, reasons, new_keys: newKeys, ...(flakyNow.length ? { flaky_keys: flakyNow } : {}) };
 }
 
 /** One short block for a person, worst first. Pure. */
 export function formatScorecard(card, comparison = null) {
-  const lines = [`Scorecard: ${card.passed}/${card.conversations} conversations pass (${Math.round((card.pass_rate || 0) * 100)}%) · checks ${card.invariants_version}${card.prompt_version ? ` · prompt ${card.prompt_version}` : ''}${card.git_sha ? ` · ${String(card.git_sha).slice(0, 7)}` : ''}${card.kb_exemplar_mode ? ` · exemplars ${card.kb_exemplar_mode}` : ''}`];
+  // 2026-10-18 (Phase 1 item 3): passed out of the STABLE conversations (the
+  // same result in every run), with the flaky ones counted apart.
+  const runs = Number(card.runs) || 1;
+  const stable = Number.isFinite(card.stable) ? card.stable : card.conversations;
+  const head = runs > 1
+    ? `Scorecard (${runs} runs): ${card.passed}/${stable} stable conversations pass (${Math.round((card.pass_rate || 0) * 100)}%) · ${card.flaky || 0} flaky of ${card.conversations}`
+    : `Scorecard: ${card.passed}/${card.conversations} conversations pass (${Math.round((card.pass_rate || 0) * 100)}%)`;
+  const lines = [`${head} · checks ${card.invariants_version}${card.prompt_version ? ` · prompt ${card.prompt_version}` : ''}${card.git_sha ? ` · ${String(card.git_sha).slice(0, 7)}` : ''}${card.kb_exemplar_mode ? ` · exemplars ${card.kb_exemplar_mode}` : ''}`];
   if (comparison) lines.push(comparison.worse === true ? `WORSE THAN LAST RUN: ${comparison.reasons.join('; ')}` : comparison.worse === false ? 'Not worse than the last run.' : `Not compared: ${comparison.reasons.join('; ')}`);
   for (const [fam, f] of Object.entries(card.pass_rate_by_family || {}).sort((a, b) => a[0].localeCompare(b[0]))) {
     lines.push(`  family ${fam}: ${f.passed}/${f.conversations} (${Math.round((f.pass_rate || 0) * 100)}%)`);
   }
   // New scenarios are reported, never counted against the run (2026-10-16).
   if (comparison?.new_keys?.length) lines.push(`New this run (not compared): ${comparison.new_keys.map(k => `${k.key} ${k.pass ? 'pass' : 'FAIL'}`).join(', ')}`);
-  for (const r of card.results.filter(x => !x.pass)) {
+  if (card.flaky_keys?.length) lines.push(`Flaky this run (not compared): ${card.flaky_keys.join(', ')}`);
+  for (const r of card.results.filter(x => !x.pass && !x.flaky)) {
     lines.push(`  ✗ ${r.key}: ${r.failures.slice(0, 4).map(f => `${f.code}${f.turn ? `@${f.turn}` : ''}`).join(', ')}${r.failures.length > 4 ? ` (+${r.failures.length - 4})` : ''}`);
   }
   return lines.join('\n');

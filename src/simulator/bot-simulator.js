@@ -32,7 +32,10 @@ import { scopeDqKind } from '../agentic/scope-dq.js';
 import { applyBookingTruth } from '../agentic/booking-claim.js';
 import { buildLeadFacts } from '../agentic/lead-facts.js';
 import { buildPresentationFacts } from '../siro/presentation-facts.js';
-import { scoreRun, compareScorecards } from './sim-scoring.js';
+import { scoreRun, compareScorecards, combineRuns } from './sim-scoring.js';
+import { memoryTurnLockStore, claimTurn, releaseTurn } from '../agentic/turn-lock-io.js';
+import { turnLockMode } from '../agentic/turn-lock.js';
+import { turnKeyFor } from '../agentic/turn-key.js';
 import { createMemoryStageStore, recordStage, recordBookedStage } from '../services/lead-stage-io.js';
 import { leadStageMode } from '../agentic/lead-stage.js';
 import { runWithSimOverrides } from './sim-overrides.js';
@@ -225,7 +228,10 @@ export const SCENARIOS = Object.freeze({
   spouse: { title: 'Spouse', family: 'objection', persona: GUEST, turns: ["I'm interested but I need to talk to my wife first", 'She has to see it before we decide', 'The first one works for both of us'] },
   think: { title: 'Think it over', family: 'objection', persona: GUEST, turns: ['Your windows sound good', 'Let me think about it', 'The first one'] },
   quotes: { title: 'Getting 3 quotes', family: 'objection', persona: GUEST, turns: ["We're getting 3 quotes", 'Probably price and the warranty'] },
-  not_interested: { title: 'Not interested, twice', family: 'objection', expect: { 1: { question_allowed: false }, 2: { question_allowed: false } }, persona: GUEST, turns: ['Not interested', 'No'] },
+  // 2026-10-18 (the user's ruling, new lead only): the FIRST "Not interested"
+  // may carry ONE question; the second no none. (The rehash first no stays
+  // no-question: rehash_not_at_this_time is unchanged.)
+  not_interested: { title: 'Not interested, twice', family: 'objection', expect: { 1: { question_allowed: true, max_questions: 1 }, 2: { question_allowed: false } }, persona: GUEST, turns: ['Not interested', 'No'] },
   complaint: { title: 'Complaint', family: 'service', persona: GUEST, turns: ['Your rep never showed up yesterday'] },
   service_area: { title: 'Service area', family: 'new_lead', persona: GUEST, turns: ['Do you service Houston?', '77494', 'What about 10001?'] },
   details: { title: 'Sharing details (no re-asks)', family: 'new_lead', persona: GUEST, turns: ['Hi, I need new windows', 'Danh', '657-242-0815', 'danh.ho@hotmail.com', '1200 Main Street, Katy, TX 77494'] },
@@ -268,6 +274,13 @@ export const SCENARIOS = Object.freeze({
   rehash_first_no_with_reason: { title: 'Rehash: first no with a reason gets no question (Billy)', family: 'rehash', persona: REHASH_LEAD, channels: ['sms'], turns: ['Not interested at this time. We explained to Damian we were in the planning stage.'] },
   rehash_situation_answered: { title: 'Rehash: lead already said where they are (Tatyana)', family: 'rehash', persona: REHASH_LEAD, channels: ['sms'], turns: ['I have to finish my bathroom remodel first, then windows. Everything should be done by January, maybe February. I have your number saved'] },
   rehash_closer_after_objection: { title: 'Rehash: price objection, then "Not at this time. Thanks" (Shawn)', family: 'rehash', persona: REHASH_LEAD, channels: ['sms'], turns: ['We like your product the best but it is roughly twice the cost of our other estimates', 'Not at this time. Thanks'] },
+  // ── 2026-10-18 (Phase 1): one owner per inbound ──
+  // Teresa (wfLR6b1NLFOKXORAAFB9, 06:44): DQ_RENTER_DETECTED replied twice, the
+  // second with no new inbound and a discovery question after the DQ.
+  dq_renter_refire: { title: 'Renter DQ, then a re-fire with no new text (Teresa)', family: 'compliance', expect: { 2: { question_allowed: false, no_clock: true } }, persona: DANA, channels: ['sms'], turns: ['Hi', 'Seeing how can I get help with my rent my rent is $589 a month', { refire: true, rule: 'DQ_RENTER_DETECTED' }] },
+  // Paul (d2hmgL9fAAWvtuu7NN5q, 2026-10-17 14:45): two texts 3 s apart, two
+  // replies from two rules. One reply, and the second rule's claim is refused.
+  two_texts_one_reply_sms: { title: 'Two texts 3 s apart get one reply (Paul)', family: 'booking', persona: DANA, channels: ['sms'], secondRule: 'LAYER3_DISPATCH', turns: [['Still got a couple more quotes to come in', 'Sounds good 👍']] },
   // 2026-10-16 (Siro PR 1): the visit's price hesitation is in LEAD FACTS.
   rehash_siro_price_objection: { title: 'Rehash with the Siro visit: price was the hesitation', family: 'rehash', persona: REHASH_SIRO_LEAD, channels: ['sms'], turns: ['Hi, got your message. We are still thinking it over'] },
   // ── 2026-10-16 (Melissa, 6U6uceZGMQRz8XEQc9Lk): hearing the time she picked ──
@@ -299,7 +312,7 @@ function tomorrowAt(hourUtc, nowMs) {
  * @param {object} plan     resolveScenario() output
  * @param {object} opts     { nepqMode, productionDeps, nowMs }
  */
-export async function simulateLiveChat(plan, { nepqMode = 'live', productionDeps, nowMs = Date.now(), leadStageMode: stageModeOverride = null } = {}) {
+export async function simulateLiveChat(plan, { nepqMode = 'live', productionDeps, nowMs = Date.now(), leadStageMode: stageModeOverride = null, turnLockMode: lockModeOverride = null } = {}) {
   // A real contact (e.g. Mark Test) supplies its GHL/LP record, READ ONLY;
   // the conversation is still the script and every write is still recorded.
   const realContact = plan.contactId || null;
@@ -314,6 +327,9 @@ export async function simulateLiveChat(plan, { nepqMode = 'live', productionDeps
   let currentTurn = 0;
   const stageDeps = simStageDeps(stageModeOverride);
   let turnStage = null;
+  let lastPlanStep = null;
+  const lockStore = memoryTurnLockStore();
+  const lockMode = lockModeOverride || turnLockMode();
   const holder = plan.appointmentHolder || null;
   const holderAppt = holder ? {
     appointment_id: 'sim-appt-1', calendar_id: BOOKING_CALENDARS.WINDOW_ESTIMATE,
@@ -346,7 +362,14 @@ export async function simulateLiveChat(plan, { nepqMode = 'live', productionDeps
     // never reads or writes it (2026-10-15).
     filterNew: async ({ items }) => ({ fresh: items, dedupe: 'none' }),
     recordPosted: async () => ({ ok: true }),
-    fingerprint: () => {},
+    // 2026-10-18 (Phase 1 item 4): the plan step each reply ran on, kept in
+    // memory and read back by the next turn (production reads bot_message_context).
+    fingerprint: (row) => { if (row?.message_type === 'reply' && row.plan_step) lastPlanStep = row.plan_step; },
+    readLastPlanStep: async () => lastPlanStep,
+    // 2026-10-18 (Phase 1): the turn lock, in memory (nothing is written).
+    claimTurn: (a) => claimTurn(a, { store: lockStore, log: () => {}, warn: () => {} }),
+    releaseTurn: (a) => releaseTurn(a, { store: lockStore }),
+    turnLockMode: () => lockMode,
     markSent: () => {},
     // 2026-10-16 (Melissa): the identity the capture would write (zip-filled
     // city and state included) comes back, as in production; nothing is written.
@@ -433,7 +456,7 @@ export async function simulateLiveChat(plan, { nepqMode = 'live', productionDeps
       if (auto) { autos++; queue.unshift(auto); transcript.at(-1).next_auto = true; }
     }
   }
-  return { channel: 'livechat', scenario: plan.key, title: plan.title, family: plan.family || 'new_lead', expect: plan.expect || null, nepq_mode: nepqMode, lead_stage_mode: stageDeps.env.LEAD_STAGE_MODE, contact_id: realContact, transcript, would_do: effects.filter(e => e.kind !== 'event'), events: effects.filter(e => e.kind === 'event').map(e => e.event_type) };
+  return { channel: 'livechat', scenario: plan.key, title: plan.title, family: plan.family || 'new_lead', expect: plan.expect || null, nepq_mode: nepqMode, lead_stage_mode: stageDeps.env.LEAD_STAGE_MODE, turn_lock_mode: lockMode, contact_id: realContact, transcript, would_do: effects.filter(e => e.kind !== 'event'), events: effects.filter(e => e.kind === 'event').map(e => e.event_type) };
 }
 
 /**
@@ -441,7 +464,7 @@ export async function simulateLiveChat(plan, { nepqMode = 'live', productionDeps
  * The send handler's side effects are reported from the generator's flags
  * (hand-off, booking companion), never run.
  */
-export async function simulateSms(plan, { nepqMode = 'live', generate, buildRealContext = null, nowMs = Date.now(), maxAttempts = 2, leadStageMode: stageModeOverride = null } = {}) {
+export async function simulateSms(plan, { nepqMode = 'live', generate, buildRealContext = null, nowMs = Date.now(), maxAttempts = 2, leadStageMode: stageModeOverride = null, turnLockMode: lockModeOverride = null } = {}) {
   const contactId = plan.contactId || `${SIM_CONTACT_PREFIX}sms-${plan.key}-${nowMs}`;
   // A real contact's record, read once (dry run: nothing is written to it).
   const realBase = plan.contactId && buildRealContext ? await buildRealContext(plan.contactId) : null;
@@ -450,13 +473,43 @@ export async function simulateSms(plan, { nepqMode = 'live', generate, buildReal
   const thread = [];
   const transcript = [];
   const stageDeps = simStageDeps(stageModeOverride);
+  // 2026-10-18 (Phase 1): the turn lock and the previous reply's plan step, in
+  // memory. Each turn is claimed as rule 106 would claim it; a re-fire and a
+  // second rule on the same inbound go through the same claim (nothing written).
+  const lockStore = memoryTurnLockStore();
+  const lockMode = lockModeOverride || turnLockMode();
+  const lockDeps = { store: lockStore, log: () => {}, warn: () => {} };
+  let lastPlanStep = null;
+  let lastTurnKey = null;
   const queue = [...plan.turns];
   let autos = 0;
   for (let i = 0; queue.length; i++) {
     const next = queue.shift();
-    const text = typeof next === 'function' ? next((transcript.at(-1)?.bot || []).at(-1) || '') : next;
+    // A re-fire: the same rule-written send again, with no new inbound
+    // (Teresa, 2026-10-18). It claims the LAST inbound's turn; no model call.
+    if (next && typeof next === 'object' && next.refire) {
+      const claim = lastTurnKey
+        ? await claimTurn({ contactId, turnKey: lastTurnKey, ownerRule: next.rule || 'DQ_RENTER_DETECTED', channel: 'sms', ownerActionId: `sim-refire-${i}` }, { ...lockDeps, nowMs: nowMs + i * 60000 })
+        : { claimed: null };
+      transcript.push({
+        turn: i + 1, customer: '(re-fire: no new inbound)', bot: null, refire: true, intent: null, nepq: null, would_do: [], stage: null, seconds: 0,
+        turn_lock: { mode: lockMode, key: lastTurnKey, claimed: claim.claimed, skip_reason: claim.skip_reason || null, skipped: claim.claimed === false && lockMode === 'live', shadow_would_skip: claim.claimed === false && lockMode !== 'live' },
+      });
+      continue;
+    }
+    const burstTexts = Array.isArray(next) ? next.map(String) : null;
+    const text = burstTexts ? burstTexts.join('\n') : (typeof next === 'function' ? next((transcript.at(-1)?.bot || []).at(-1) || '') : next);
     const at = new Date(nowMs + i * 60000).toISOString();
-    thread.push({ direction: 'inbound', channel: 'sms', text, type: 'text', timestamp: at });
+    if (burstTexts) {
+      // Two texts seconds apart: the reply buffer hands them to ONE analysis
+      // (REPLY_DEBOUNCE_MS), and the turn is the last message's.
+      burstTexts.forEach((b, j) => thread.push({ direction: 'inbound', channel: 'sms', text: b, type: 'text', timestamp: new Date(Date.parse(at) + j * 3000).toISOString() }));
+    } else {
+      thread.push({ direction: 'inbound', channel: 'sms', text, type: 'text', timestamp: at });
+    }
+    const turnKey = turnKeyFor({ messageId: `sim-${i}${burstTexts ? `-${burstTexts.length - 1}` : ''}` });
+    lastTurnKey = turnKey;
+    const claim = await claimTurn({ contactId, turnKey, ownerRule: 'AGENTIC_RESPOND_POST_CHATBOT', channel: 'sms', ownerActionId: `sim-${i}` }, { ...lockDeps, nowMs: Date.parse(at) });
     const context = { ...(realBase || withPersonaLp(minimalContext({ contactId, contact, nowMs: nowMs + i * 60000 }), p)), conversation_recent: thread.slice(-20) };
     const t0 = Date.now();
     let generated = null;
@@ -469,7 +522,7 @@ export async function simulateSms(plan, { nepqMode = 'live', generate, buildReal
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       const ta = Date.now();
       try {
-        generated = await generate(contactId, 'sms', text, { dryRun: true, simulatedContext: context, nepqModeOverride: nepqMode, leadStageOverride, leadStageModeOverride: stageDeps.mode, ...(note ? { regenerationNote: note } : {}) });
+        generated = await generate(contactId, 'sms', text, { dryRun: true, simulatedContext: context, nepqModeOverride: nepqMode, leadStageOverride, leadStageModeOverride: stageDeps.mode, lastPlanStepOverride: lastPlanStep, ...(note ? { regenerationNote: note } : {}) });
         attempts.push({ seconds: Math.round((Date.now() - ta) / 100) / 10, guard: null });
         break;
       } catch (err) {
@@ -489,6 +542,16 @@ export async function simulateSms(plan, { nepqMode = 'live', generate, buildReal
     }
     const reply = generated?.message || null;
     if (reply) thread.push({ direction: 'outbound', channel: 'sms', text: reply, type: 'text', timestamp: new Date(Date.parse(at) + 30000).toISOString() });
+    // The claim ends with the reply, and the plan step is what the next turn reads.
+    if (claim.claimed === true) await releaseTurn({ contactId, turnKey, ownerActionId: `sim-${i}`, outcome: reply ? 'sent' : 'no_reply' }, lockDeps);
+    if (reply) lastPlanStep = generated?.nepq_plan?.plan_step || (generated?.nepq_plan ? null : 'unplanned');
+    // A second rule on the same inbound (Paul, 2026-10-17: 106 and 228 both
+    // answered). It claims the same turn; live skips it, shadow would send it.
+    let second = null;
+    if (plan.secondRule && reply) {
+      const c2 = await claimTurn({ contactId, turnKey, ownerRule: plan.secondRule, channel: 'sms', ownerActionId: `sim-${i}-2` }, { ...lockDeps, nowMs: Date.parse(at) + 60000 });
+      second = { rule: plan.secondRule, claimed: c2.claimed, skip_reason: c2.skip_reason || null, mode: lockMode };
+    }
     const wouldDo = [];
     if (generated?.dm_handoff) wouldDo.push({ kind: 'would_hand_off_decision_maker', reason: generated.dm_handoff.reason });
     // 2026-10-03: the send handler files the callback (Five9 + #contact-center).
@@ -525,18 +588,21 @@ export async function simulateSms(plan, { nepqMode = 'live', generate, buildReal
       turn: i + 1, customer: text, bot: reply ? [reply] : null, error,
       redrafted: !!note, redraft_guard: attempts.find(a => a.guard)?.guard || null, attempts, intent: generated?.intent_class || null, nepq: generated?.nepq_plan || null,
       would_do: wouldDo, stage, seconds: Math.round((Date.now() - t0) / 100) / 10,
+      turn_lock: { mode: lockMode, key: turnKey, claimed: claim.claimed, ...(second ? { second } : {}) },
+      ...(second && second.claimed !== true && lockMode !== 'live' ? { shadow_extra_sends: 1 } : {}),
+      ...(second && second.claimed === true ? { shadow_extra_sends: 1 } : {}),
     });
     const auto = plan.autoAnswer && autos < MAX_AUTO_ANSWERS ? autoAnswerFor(reply, p, { scriptDone: !queue.length }) : null;
     if (auto) { autos++; queue.unshift(auto); transcript.at(-1).next_auto = true; }
   }
-  return { channel: 'sms', scenario: plan.key, title: plan.title, family: plan.family || 'new_lead', expect: plan.expect || null, nepq_mode: nepqMode, lead_stage_mode: stageDeps.env.LEAD_STAGE_MODE, contact_id: plan.contactId || null, transcript };
+  return { channel: 'sms', scenario: plan.key, title: plan.title, family: plan.family || 'new_lead', expect: plan.expect || null, nepq_mode: nepqMode, lead_stage_mode: stageDeps.env.LEAD_STAGE_MODE, turn_lock_mode: lockMode, contact_id: plan.contactId || null, transcript };
 }
 
 /** Run one scenario on the channels it applies to. */
-export async function runSimulation({ scenario, turns, persona, title, contactId = null, channel = 'both', nepqMode = 'live', leadStageMode = null, kbExemplarMode = null }, deps) {
+export async function runSimulation({ scenario, turns, persona, title, contactId = null, channel = 'both', nepqMode = 'live', leadStageMode = null, kbExemplarMode = null, turnLockMode: lockMode = null }, deps) {
   // KB_EXEMPLAR_MODE for this run only (2026-10-12); null = Railway's value.
   if (kbExemplarMode) {
-    const results = await runWithSimOverrides({ kbExemplarMode }, () => runSimulation({ scenario, turns, persona, title, contactId, channel, nepqMode, leadStageMode }, deps));
+    const results = await runWithSimOverrides({ kbExemplarMode }, () => runSimulation({ scenario, turns, persona, title, contactId, channel, nepqMode, leadStageMode, turnLockMode: lockMode }, deps));
     return results.map(r => ({ ...r, kb_exemplar_mode: kbExemplarMode }));
   }
   const plan = resolveScenario({ scenario, turns, persona, title, contactId });
@@ -546,8 +612,8 @@ export async function runSimulation({ scenario, turns, persona, title, contactId
   for (const ch of want) {
     try {
       results.push(ch === 'livechat'
-        ? await simulateLiveChat(plan, { nepqMode, productionDeps: await deps.productionDeps(), leadStageMode })
-        : await simulateSms(plan, { nepqMode, generate: await deps.generate(), buildRealContext: deps.buildRealContext || null, leadStageMode }));
+        ? await simulateLiveChat(plan, { nepqMode, productionDeps: await deps.productionDeps(), leadStageMode, turnLockMode: lockMode })
+        : await simulateSms(plan, { nepqMode, generate: await deps.generate(), buildRealContext: deps.buildRealContext || null, leadStageMode, turnLockMode: lockMode }));
     } catch (err) {
       results.push({ channel: ch, scenario: plan.key, title: plan.title, family: plan.family || 'new_lead', expect: plan.expect || null, error: String(err?.message || err).slice(0, 300) });
     }
@@ -570,6 +636,8 @@ export function formatTranscript(result) {
     if (t.nepq?.changes?.length || t.nepq?.would_change?.length) notes.push(`guard=${(t.nepq.changes || t.nepq.would_change).join(',')}`);
     if (t.redraft_guard) notes.push(`redraft=${t.redraft_guard} (${(t.attempts || []).map(a => `${a.seconds}s`).join(' + ')})`);
     if (t.flow) notes.push(`flow=${t.flow}`);
+    if (t.turn_lock?.skip_reason) notes.push(`turn_lock=${t.turn_lock.shadow_would_skip ? 'shadow_would_skip:' : ''}${t.turn_lock.skip_reason}`);
+    if (t.turn_lock?.second) notes.push(`second_rule=${t.turn_lock.second.rule}:${t.turn_lock.second.claimed === true ? 'claimed' : t.turn_lock.second.skip_reason}`);
     for (const w of t.would_do || []) notes.push(`${w.kind}${w.reason ? `:${w.reason}` : ''}`);
     notes.push(`${t.seconds}s`);
     lines.push(`            [${notes.join(' | ')}]`);
@@ -592,10 +660,22 @@ export function startSimulationJob(input, deps) {
   jobs.set(id, job);
   if (jobs.size > MAX_JOBS) jobs.delete(jobs.keys().next().value);
   const keys = input.scenario === 'all' ? Object.keys(SCENARIOS) : [input.scenario || null];
+  // 2026-10-18 (Phase 1 item 3): the gate runs every scenario `runs` times
+  // (default 2; a plain simulation once). job.results is run 1, for the
+  // transcripts; the scorecard combines every run (combineRuns).
+  const runs = Math.max(1, Math.min(4, Number(input.runs) || (input.gate ? 2 : 1)));
+  job.runs = runs;
+  job.run_results = [];
   (async () => {
-    for (const key of keys) {
-      const res = await runSimulation({ ...input, scenario: key }, deps);
-      job.results.push(...res);
+    for (let n = 0; n < runs; n++) {
+      const runResults = [];
+      for (const key of keys) {
+        const res = await runSimulation({ ...input, scenario: key }, deps);
+        runResults.push(...res);
+        if (n === 0) job.results.push(...res);
+      }
+      job.run_results.push(runResults);
+      job.runs_done = n + 1;
     }
     // 2026-10-06 (AI audit, F1): every run is scored. A gate run (run_bot_eval)
     // is also compared with the last gate run and saved, so a prompt or model
@@ -604,12 +684,13 @@ export function startSimulationJob(input, deps) {
     // job, never thrown, and never turns a finished run into a failed one.
     let meta = {};
     try { meta = (await deps.evalMeta?.()) || {}; } catch { /* meta is decoration */ }
-    job.scorecard = scoreRun(job.results, { ...meta, nepq_mode: input.nepqMode || 'live' });
+    const cards = job.run_results.map(r => scoreRun(r, { ...meta, nepq_mode: input.nepqMode || 'live' }));
+    job.scorecard = runs > 1 ? combineRuns(cards) : cards[0];
     if (input.gate) {
       let previous = null;
       try { previous = await deps.lastEvalRun?.({ nepqMode: input.nepqMode || 'live' }); } catch (err) { job.save_error = `last run unreadable: ${String(err?.message || err).slice(0, 200)}`; }
       job.comparison = job.save_error ? { compared: false, worse: null, reasons: [job.save_error] } : compareScorecards(job.scorecard, previous);
-      try { await deps.recordEvalRun?.(job.scorecard, job.comparison); } catch (err) { job.save_error = `run not saved: ${String(err?.message || err).slice(0, 200)}`; }
+      try { await deps.recordEvalRun?.(job.scorecard, job.comparison, runs > 1 ? cards : null); } catch (err) { job.save_error = `run not saved: ${String(err?.message || err).slice(0, 200)}`; }
     }
     job.status = 'done';
     job.completed_at = new Date().toISOString();

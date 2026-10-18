@@ -83,7 +83,7 @@ export async function recordMessageContext(input) {
     // 2026-10-06 (AI OS batch 1 PR 2): sql/148 not applied yet. Never lose
     // the row over the two new columns: drop them, say so once, retry.
     if (error && isMissingFingerprintColumn(error)) {
-      if (!versionColumnsMissing) console.warn('[BotFingerprint] prompt_sha256 / resolved_model columns missing (apply sql/148); writing rows without them');
+      if (!versionColumnsMissing) console.warn('[BotFingerprint] an optional column (prompt_sha256 / resolved_model, sql/148; plan_step / question_allowed, 20261018200100) is missing; writing rows without them');
       versionColumnsMissing = true;
       row = withoutFingerprintColumns(row);
       ({ data, error } = await write(row));

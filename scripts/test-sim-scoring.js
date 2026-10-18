@@ -140,7 +140,8 @@ test('a saved run carries codes and turns, never customer text', () => {
 });
 
 async function waitDone(id) {
-  for (let i = 0; i < 200; i++) {
+  // 2026-10-18 (Phase 1 item 3): a gate job runs every scenario twice.
+  for (let i = 0; i < 1000; i++) {
     const job = getSimulationJob(id);
     if (job.status !== 'running') return job;
     await new Promise(r => setTimeout(r, 20));
@@ -180,6 +181,9 @@ test('a gate run is scored, compared with the last run and saved', async () => {
   assert.equal(done.scorecard.prompt_version, 'v-test');
   assert.equal(done.comparison.compared, true);
   assert.equal(saved.length, 1, 'a gate run is saved once');
+  // 2026-10-18 (Phase 1 item 3): the gate runs twice and saves one event.
+  assert.equal(done.runs, 2);
+  assert.equal(done.scorecard.runs, 2);
 });
 
 test('a run that cannot read or save the last run still finishes, and says so', async () => {

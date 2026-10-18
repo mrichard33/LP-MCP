@@ -260,6 +260,9 @@ import { acquireToken, report429, withGhlToken } from './ghl-rate-limiter.js';
 import { generateResponse, getReplySenderAllowlist, isRandyName, normalizeThreadSender } from './response-generator.js';
 // v3.18 — Bot Review Phase 0. Both are detached, fire-and-forget, never awaited.
 import { recordMessageContextDetached, markSentDetached } from './bot-feedback/fingerprint.js';
+// 2026-10-18 (Phase 1): one owner per inbound.
+import { turnLockMode, turnClaimScope, watchdogMayAnswer, isWatchdogRule, releaseOutcomeFor } from './agentic/turn-lock.js';
+import { claimTurn, releaseTurn, answeredSince, resolveTurnKey } from './agentic/turn-lock-io.js';
 import { ruleSendFingerprintFields } from './bot-feedback/fingerprint-core.js';
 import { judgeSentReplyDetached } from './bot-feedback/judge.js';
 import { buildAiFallback } from './ai-fallback.js';
@@ -2329,10 +2332,22 @@ async function handleShortCircuit(contactId, generated, action, context, opts = 
  * the row is still worth having — a fallback that went out is exactly the kind
  * of message a reviewer needs to see.
  */
+// 2026-10-18 (Phase 1): actions whose turn another path already owned while
+// TURN_LOCK_MODE=shadow. The reply goes out as before and its row says so
+// (input_snapshot.turn_lock_shadow_would_skip) for the 48-hour check.
+const turnLockShadowSkips = new Map();
+
 function fingerprintReply({ action, contactId, message, channel, triggerMessage, generated, ruleFields = null }) {
   if (action?.id == null) return;   // no stable message_ref → no row (never a duplicate key)
   const bot = generated?._bot_context || null;
+  const shadowSkip = turnLockShadowSkips.get(String(action.id)) || null;
+  if (shadowSkip) turnLockShadowSkips.delete(String(action.id));
+  const snapshot = bot?.input_snapshot || ruleFields?.input_snapshot || null;
   recordMessageContextDetached({
+    // 2026-10-18 (Phase 1 item 4): every reply row names its plan step, for the
+    // next turn's planner. A rule's own fixed text ran on no plan.
+    plan_step: bot?.plan_step || (generated ? 'unplanned' : 'rule_written'),
+    question_allowed: typeof bot?.question_allowed === 'boolean' ? bot.question_allowed : null,
     message_type: 'reply',
     message_ref: String(action.id),
     ghl_contact_id: contactId,
@@ -2351,7 +2366,7 @@ function fingerprintReply({ action, contactId, message, channel, triggerMessage,
     // inbound and thread it already had in hand — see ruleSendFingerprintFields.
     inbound_text: triggerMessage || ruleFields?.inbound_text || null,
     reply_text: message,
-    input_snapshot: bot?.input_snapshot || ruleFields?.input_snapshot || null,
+    input_snapshot: shadowSkip ? { ...(snapshot || {}), turn_lock_shadow_would_skip: true, turn_lock_skip_reason: shadowSkip } : snapshot,
     kb_modes: bot?.kb_modes || null,
     kb_sources: bot?.kb_sources || null,
     // Phase 2 fills the guidance/example id arrays; they default to '{}'.
@@ -2957,7 +2972,105 @@ export function findAnswerSinceInbound(messages, inboundAtMs) {
   }) || null;
 }
 
+/**
+ * 2026-10-18 (Phase 1): the send handler, with the turn claim settled however
+ * it ends. The claim is taken inside (claimReplyTurn, before any model call);
+ * here it is released with what happened: `sent` / `watchdog_recovered` when a
+ * reply went out, the skip reason when none did, kept on a deferral (the same
+ * action re-enters it), `error` on a throw (the retry takes it back).
+ */
 export async function executeSendMessage(action, context) {
+  const turnState = { held: null };
+  let result;
+  try {
+    result = await executeSendMessageInner(action, context, turnState);
+  } catch (err) {
+    settleTurnClaim(turnState, null);
+    throw err;
+  }
+  settleTurnClaim(turnState, result);
+  // A shadow would-skip on a send that ended without a reply: the executor's
+  // skip row carries the flag (actions/index.js), since no reply row will.
+  const shadowSkip = action?.id != null ? turnLockShadowSkips.get(String(action.id)) : null;
+  if (shadowSkip) {
+    turnLockShadowSkips.delete(String(action.id));
+    if (result && typeof result === 'object') result = { ...result, turn_lock_shadow_would_skip: true, turn_lock_skip_reason: shadowSkip };
+  }
+  return result;
+}
+
+function settleTurnClaim(turnState, result) {
+  const held = turnState?.held;
+  if (!held) return;
+  const outcome = result === null ? 'error' : releaseOutcomeFor(result, { ownerRule: held.ownerRule });
+  if (!outcome) return;   // deferred: still ours
+  Promise.resolve()
+    .then(() => releaseTurn({ contactId: held.contactId, turnKey: held.turnKey, ownerActionId: held.actionId, outcome }, { supabase }))
+    .catch(() => {});
+}
+
+/**
+ * The turn claim for one send (Phase 1, src/agentic/turn-lock.js). Returns a
+ * handler result to return as-is (a skip or a watchdog's wait), or null to go
+ * on. Never throws; a claim that cannot be read fails open.
+ */
+async function claimReplyTurn({ action, context, payload, contactId, channel, sourceEventMeta, turnState }) {
+  try {
+    const ownerRule = action.rule_applied || 'manual';
+    const scope = turnClaimScope({ ruleApplied: ownerRule, sourceEventType: sourceEventMeta?.event_type || null, triggerId: payload.trigger_id || null });
+    if (!scope.claims) return null;
+    const mode = turnLockMode();
+    const src = sourceEventMeta?.payload || {};
+    const keys = Array.isArray(src.inbound_message_keys) ? src.inbound_message_keys.filter(Boolean) : [];
+    const messageId = keys.length ? keys[keys.length - 1] : (src.message_id || context?.message_id || null);
+    const inboundText = context?.message_text || context?.messageText || context?.body || src.message_text || null;
+    const resolved = scope.ownKey
+      ? { key: scope.ownKey, source: 'own' }
+      : await resolveTurnKey({ contactId, messageId, text: inboundText }, { supabase });
+    if (!resolved.key) return null;
+    const shadowNote = (reason) => {
+      if (action.id != null) turnLockShadowSkips.set(String(action.id), reason);
+      console.log(`[TurnLock] shadow: ${contactId} ${ownerRule} action ${action.id} would skip (${reason}) on ${resolved.key}`);
+    };
+
+    // Watchdogs (228, 373) win only once the inbound is 180 s old and no reply
+    // went out after it (Phase 1 item 2).
+    if (isWatchdogRule(ownerRule) && !scope.ownKey) {
+      const inboundAtMs = Date.parse(payload.inbound_at || context?.inbound_at || resolved.inbound_at || sourceEventMeta?.created_at || '');
+      const may = watchdogMayAnswer({
+        inboundAtMs: Number.isFinite(inboundAtMs) ? inboundAtMs : null,
+        answeredAtMs: Number.isFinite(inboundAtMs) ? await answeredSince(contactId, inboundAtMs, { supabase }) : [],
+      });
+      if (!may.ok && mode === 'live') {
+        if (may.defer_until_ms) {
+          return { deferred: true, reason: 'watchdog_waits_180s', retry_at: new Date(may.defer_until_ms).toISOString(), contact_id: contactId, channel, turn_key: resolved.key };
+        }
+        console.log(`[TurnLock] ⏭️ ${contactId} ${ownerRule} action ${action.id}: ${may.skip_reason} (${resolved.key})`);
+        return { skipped: true, reason: may.skip_reason, turn_key: resolved.key, contact_id: contactId, channel };
+      }
+      if (!may.ok && may.skip_reason) shadowNote(may.skip_reason);
+    }
+
+    const claim = await claimTurn({ contactId, turnKey: resolved.key, ownerRule, channel, ownerActionId: action.id ?? null }, { supabase });
+    if (claim.claimed === true) {
+      turnState.held = { contactId, turnKey: resolved.key, ownerRule, actionId: action.id ?? null };
+      return null;
+    }
+    if (claim.claimed === false) {
+      if (mode === 'live') {
+        console.log(`[TurnLock] ⏭️ ${contactId} ${ownerRule} action ${action.id}: ${claim.skip_reason} (${resolved.key}, claimed ${claim.claimed_at || '?'})`);
+        return { skipped: true, reason: claim.skip_reason, turn_key: resolved.key, owner_rule: claim.owner_rule || null, contact_id: contactId, channel };
+      }
+      shadowNote(claim.skip_reason);
+    }
+    return null;
+  } catch (err) {
+    console.warn(`[TurnLock] claim threw for ${contactId} (fail-open): ${err.message}`);
+    return null;
+  }
+}
+
+async function executeSendMessageInner(action, context, turnState = { held: null }) {
   const _tStart = Date.now(); // 2026-07-03 hotfix: phase-timing telemetry
   // 2026-09-26 (reply timing): claim_agent_actions sets updated_at = now() and
   // returns the row, so updated_at AS RECEIVED here is the claim instant (t3).
@@ -3329,6 +3442,14 @@ export async function executeSendMessage(action, context) {
   if (channel === 'email' && emailDelay.reason === 'inbound_time_unknown') {
     console.warn(`[SendMessage] email min delay skipped for ${contactId} — inbound time unreadable; sending now rather than holding a reply on a read that could not tell`);
   }
+
+  // ── One owner per inbound (Phase 1, 2026-10-18) ─────────────────
+  // After the gates that hold a send for later (quiet hours, the email delay)
+  // and BEFORE any context build or model call: a turn another path owns, or
+  // one already answered, is a skip row and no model call (TURN_LOCK_MODE=live);
+  // in shadow it is recorded and the send goes on as before.
+  const turnSkip = await claimReplyTurn({ action, context, payload, contactId, channel, sourceEventMeta, turnState });
+  if (turnSkip) return turnSkip;
 
   // Livechat replies are generated with SMS constraints (short,
   // conversational, one question) — the widget is a chat surface.
