@@ -1959,7 +1959,11 @@ bump (the snapshot test compares it with `__snapshots__/VERSION`). `scripts/test
 and one must-pass input per reply guard; `scripts/test-regex-budget.js` caps the `_RX =` count in `src/agentic`
 (`scripts/fixtures/regex-budget.json`; raising it needs a reason naming a scenario key). By hand, not in the gate:
 `scripts/replay-bot-eval.js` (live incidents, ids only in the fixture; the text is read from bot_message_context) and
-`scripts/report-stage-agreement.js` (shadow stage vs buyer_stage). Phase 0 baseline: (gate job id after deploy).
+`scripts/report-stage-agreement.js` (shadow stage vs buyer_stage). Phase 0 baseline (2026-10-18, build 17aabde, scoring
+2026-10-18.2): `agentic.bot_eval_run` system_events 4385611, 64/72; confirmed by `sim_mvdsv66o_grvs`, 66/72, not worse.
+rehash_not_at_this_time and rehash_book_call flip between runs on the same build. The full w42 replay still needs a
+machine with the keys (planner-only: 10/14). A gate job lives in memory: a deploy during the run loses it, so start one
+only while nothing is about to merge.
 
 ## Writing code here
 
