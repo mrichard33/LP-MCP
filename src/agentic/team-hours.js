@@ -96,9 +96,14 @@ function hourLabel(h) {
 }
 
 /**
- * When the team next opens, as words: "today at 9 AM ET", "tomorrow at 9 AM ET",
- * "Monday at 9 AM ET". `fromDow`/`fromHour` let a caller ask from a requested
+ * When the team next opens, as words: "this morning", "tomorrow morning",
+ * "Monday morning". `fromDow`/`fromHour` let a caller ask from a requested
  * time instead of now (a call asked for at 9 PM tonight).
+ *
+ * 2026-10-18 (the user): "our dialer is not set up to send a call at the exact
+ * time." A bot callback goes on Five9's Callback Request list, a preview
+ * campaign worked as agents come free, so "tomorrow at 9 AM ET" was a clock
+ * time nobody could keep. The label names the morning, never the hour.
  */
 export function nextTeamOpenLabel(nowMs = Date.now(), { fromDow = null, fromHour = null, dayOffset = 0 } = {}) {
   const clock = etClock(nowMs);
@@ -109,8 +114,7 @@ export function nextTeamOpenLabel(nowMs = Date.now(), { fromDow = null, fromHour
     const h = TEAM_HOURS[dow];
     if (add === 0 && startHour >= h.open) continue;
     const daysFromToday = dayOffset + add;
-    const when = daysFromToday === 0 ? 'today' : daysFromToday === 1 ? 'tomorrow' : DAY_NAMES[dow];
-    return `${when} at ${hourLabel(h.open)} ET`;
+    return daysFromToday === 0 ? 'this morning' : daysFromToday === 1 ? 'tomorrow morning' : `${DAY_NAMES[dow]} morning`;
   }
   return 'when we open';
 }
@@ -187,6 +191,10 @@ const IMMEDIATE = String.raw`\b(?:right\s+now|right\s+away|immediately|in\s+the\
 // that carries a clock time is the one replaced; with none, the first.
 const CLOCK_AT = String.raw`at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm|a\.m\.|p\.m\.)?(?:\s+[ECMP]T\b)?`;
 const IMMEDIATE_WITH_TIME = String.raw`(?:\b${CLOCK_AT}\s+)?${IMMEDIATE}(?:\s+${CLOCK_AT})?`;
+// 2026-10-18 (the user): the dialer cannot call at a set hour, so after hours a
+// promised call naming one ("tomorrow at 9 AM ET", "Monday at 9 AM", the old
+// label a model still copies) becomes the label too.
+const OPENING_AT = String.raw`\b(?:on\s+)?(?:tomorrow|(?:mon|tues|wednes|thurs|fri|satur|sun)day)(?:\s+morning)?\s+${CLOCK_AT}`;
 function replaceTiming(sentence, replacement) {
   const matches = [...sentence.matchAll(new RegExp(IMMEDIATE_WITH_TIME, 'gi'))];
   if (!matches.length) return sentence;
@@ -206,11 +214,13 @@ export function enforceCallTiming(text, nowMs = Date.now()) {
   if (!body || isTeamOpen(nowMs)) return { text: body, changed: false };
   const label = nextTeamOpenLabel(nowMs);
   const hasImmediate = new RegExp(IMMEDIATE, 'i');
+  const openingAt = new RegExp(OPENING_AT, 'i');
   // Sentence by sentence, in place, so line breaks (a sign-off) survive.
   let out = body;
   for (const s of body.split(/(?<=[.!?])\s+/)) {
-    if (!promisesCall(s) || !hasImmediate.test(s)) continue;
-    out = out.replace(s, replaceTiming(s, label));
+    if (!promisesCall(s)) continue;
+    if (hasImmediate.test(s)) out = out.replace(s, replaceTiming(s, label));
+    else if (openingAt.test(s)) out = out.replace(s, s.replace(openingAt, label));
   }
   return { text: out, changed: out !== body };
 }

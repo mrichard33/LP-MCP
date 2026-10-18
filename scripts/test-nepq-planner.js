@@ -428,7 +428,7 @@ test('break test: abuse closes, emergencies, service issues and call requests go
   assert.equal(plan({ trigger: 'You installed my windows last month and one is leaking' }).handoff?.reason, 'service');
   const cb = plan({ trigger: 'Just call me at 5pm today, 813-555-0142', slots: SLOTS });
   assert.equal(cb.handoff?.reason, 'callback_request');
-  assert.equal(cb.fixed_line, "Got it. I'll have someone from our team call you around 5pm today.");
+  assert.equal(cb.fixed_line, "Got it. I'll have someone from our team call you, and I've let them know 5pm today works best for you.");
   assert.equal(plan({ trigger: 'please do not call me' }).handoff?.reason === 'callback_request', false);
 });
 
