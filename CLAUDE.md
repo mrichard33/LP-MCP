@@ -331,7 +331,8 @@ bids usually cut something … folks end up replacing in five years"), more sell
 "This is obviously an AI bot. Stop texting". `planPostDemo` returned before every objection rule and the only stop was the
 track's two no's IN A ROW. Now, after `competitor_signed` and `defer`:
 - **Stop:** two no's in the session (`isPostDemoNo`: a soft no like "not at this time" / "we're good" counts only as the
-  answer to our offer or track question) or the track's `stop` → `post_demo_stop` with `plan.handoff` `rehash_stop`. It is
+  answer to our offer or track question, or to a question of ours about the visit, the proposal or what changed,
+  `POST_DEMO_QUESTION_RX`: the model words its own "What changed since the visit?", bot gate 2026-10-17) or the track's `stop` → `post_demo_stop` with `plan.handoff` `rehash_stop`. It is
   STICKY: after our "I'm here if anything changes." every turn stays stopped until the lead asks a question, a time or a
   call. The bot still answers; no stop-bot.
 - **Ladder**, rehash line only (a post-demo lead off it may be SOLD) (`postDemoObjection`; any objection counts,
