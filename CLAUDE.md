@@ -1446,7 +1446,10 @@ the rehash rep's line keeps a name, and emails keep their sender). Randy's FATHE
 not. `enforceTeamVoice` (`src/agentic/team-voice.js`) corrects both after the model, and `enforceCallTiming`
 (`src/agentic/team-hours.js`) turns a promised call "today" / "right now" / "in the next few minutes" into the next
 opening outside 9–8 weekdays, 9–5 Saturday, 9–3 Sunday (ET). The planner's hand-off and callback lines use the same
-hours (`nowMs`). Look for `[TeamVoice]` log lines.
+hours (`nowMs`). **The opening is a morning, never a clock time (the user, 2026-10-18: "our dialer is not set up to send a
+call at the exact time").** `nextTeamOpenLabel` says "this morning" / "tomorrow morning" / "Monday morning", after hours a
+promised call naming a day and an hour ("tomorrow at 9 AM ET") becomes that label, and a time the lead asks for is passed
+on, not promised (`LINES.callback_at`: "I've let them know 5pm today works best for you"; the card prints their words). Look for `[TeamVoice]` log lines.
 
 **A conversation has ONE stored stage (Lead Conversation Stage, 2026-10-12).** Three test batches (~35 chats) booked
 nothing: `planNepqTurn` re-guessed the stage from the thread every turn, and `stageBlock` read the analyzer's

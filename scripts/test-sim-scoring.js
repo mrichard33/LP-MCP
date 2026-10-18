@@ -58,7 +58,7 @@ test('a held time is not a fake booking; a "you\'re all set" with no hold or boo
 });
 
 test('a hand-off that promises a call passes', () => {
-  const s = scoreResult(result('complaint', [turn(1, 'Your rep never showed up yesterday', "I'm sorry. I've flagged this to our team, and someone will call you tomorrow at 9 AM ET.", { nepq: { move: 'handoff', handoff: 'complaint' } })], { would_do: [{ kind: 'would_file_callback_five9_and_contact_center' }] }));
+  const s = scoreResult(result('complaint', [turn(1, 'Your rep never showed up yesterday', "I'm sorry. I've flagged this to our team, and someone will call you tomorrow morning.", { nepq: { move: 'handoff', handoff: 'complaint' } })], { would_do: [{ kind: 'would_file_callback_five9_and_contact_center' }] }));
   assert.equal(s.pass, true, JSON.stringify(s.failures));
 });
 

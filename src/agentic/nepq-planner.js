@@ -334,6 +334,9 @@ export const LINES = Object.freeze({
   repeat_slots: (slots) => `You're right, sorry about that. Let's get you a time instead. I have ${slotPair(slots)}. Which works better?`,
   repeat_no_slots: "You're right, sorry about that. A team member will call to set a time for the visit.",
   callback: (when) => `Got it. I'll have someone from our team call you${when ? ` ${when}` : ''}.`,
+  // 2026-10-18 (the user): the dialer cannot call at a set time, so a time the
+  // lead asks for is passed on (the card prints their words), never promised.
+  callback_at: (time) => `Got it. I'll have someone from our team call you, and I've let them know ${time} works best for you.`,
   spouse_1: 'Makes sense. How does your spouse feel about getting this done?',
   spouse_2_slots: (slots) => `Would it be easier to pick a time when you're both home? I have ${slotPair(slots)}.`,
   spouse_2_no_slots: "Would it be easier to pick a time when you're both home? What day works best for you both?",
@@ -668,6 +671,11 @@ export function isComplexPriceAsk(text) {
   if (t.length > 220) return true;
   if ((t.match(/\?/g) || []).length >= 2) return true;
   return /\b(?:how\s+long|price\s*match|match\s+(?:a|their|the)\s+(?:price|quote)|beat\s+(?:that|their|it)|discounts?|deals?|warranty|financ\w*|do\s+you\s+(?:do|offer|have|sell|install|work))\b/i.test(t);
+}
+
+/** The confirm line for a call request: a clock time is the lead's preference, never our promise. Pure. */
+export function callbackLine(when) {
+  return when && /^around\s/.test(when) ? LINES.callback_at(when.replace(/^around\s+/, '')) : LINES.callback(when);
 }
 
 /** "at 5pm today" from a call request, for the confirm line. Pure. */
@@ -1058,8 +1066,8 @@ function planNepqTurnCore({
     const asked = requestedCallTime(now, nowMs);
     let line;
     if (asked && !asked.ok && !asked.past) line = LINES.callback_outside_hours(nextTeamOpenLabel(nowMs, { fromDow: asked.dow, fromHour: asked.hour, dayOffset: asked.dayOffset }));
-    else if (asked?.ok) line = LINES.callback(callbackWhen(now));
-    else line = LINES.callback(teamOpen ? (asked ? null : callbackWhen(now)) : nextTeamOpenLabel(nowMs));
+    else if (asked?.ok) line = callbackLine(callbackWhen(now));
+    else line = teamOpen ? callbackLine(asked ? null : callbackWhen(now)) : LINES.callback(nextTeamOpenLabel(nowMs));
     return fixed('handoff', line, { step: 'handoff', handoff: { reason: 'callback_request', line }, booking: { allowed: false, reason: 'nepq:callback_request' } });
   }
   // A yes to our own offer of a call (2026-10-03): the call is now promised,
