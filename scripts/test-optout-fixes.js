@@ -72,6 +72,17 @@ test('a no after our door-open close is the second no (bot gate, 2026-10-18)', (
   assert.equal(p.handoff?.reason, 'rehash_stop');
 });
 
+test('a no right after a no counts, however our close was worded (bot gate, 2026-10-18)', () => {
+  const p = rehashPlan([
+    msg('inbound', 'Hi, I got the proposal', 5),
+    msg('outbound', 'Did you get a chance to look it over? — John', 4),
+    msg('inbound', 'Not at this time. Thanks', 3),
+    msg('outbound', 'No problem, thanks for letting us know.', 2),
+  ], 'No, we are good');
+  assert.equal(p.step, 'post_demo_stop');
+  assert.equal(p.handoff?.reason, 'rehash_stop');
+});
+
 test('two no\'s stop the selling, with one line and no question', () => {
   const p = rehashPlan([
     msg('inbound', 'Hi, I got the proposal', 5), msg('outbound', 'Did you get a chance to look it over? — John', 4),
