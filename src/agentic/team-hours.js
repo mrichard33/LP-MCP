@@ -177,6 +177,11 @@ export function promisedCallback(text) {
 // The same-day / immediate part of that promise. "now" alone is left out: it
 // reads as "I'm passing this on now", which stays true after hours.
 const IMMEDIATE = String.raw`\b(?:right\s+now|right\s+away|immediately|in\s+the\s+next\s+(?:few|couple(?:\s+of)?|\d+|several)\s+(?:minutes|hours?)|within\s+the\s+(?:next\s+)?(?:hour|few\s+minutes|\d+\s+minutes)|in\s+a\s+few\s+minutes|shortly|today|tonight|this\s+(?:morning|afternoon|evening))\b`;
+// The immediacy plus the clock time already beside it ("today at 9 AM ET"),
+// replaced as one. 2026-10-18 (bot gate, complaint scenario): the planner's
+// after-hours line already reads "someone will call you today at 9 AM ET";
+// replacing only "today" with the label made "today at 9 AM ET at 9 AM ET".
+const IMMEDIATE_WITH_TIME = IMMEDIATE + String.raw`(?:\s+at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm|a\.m\.|p\.m\.)?(?:\s+[ECMP]T\b)?)?`;
 
 /**
  * Outside team hours, a promised call "today" / "right now" / "in the next few
@@ -194,7 +199,7 @@ export function enforceCallTiming(text, nowMs = Date.now()) {
   let out = body;
   for (const s of body.split(/(?<=[.!?])\s+/)) {
     if (!promisesCall(s) || !hasImmediate.test(s)) continue;
-    out = out.replace(s, s.replace(new RegExp(IMMEDIATE, 'i'), label));
+    out = out.replace(s, s.replace(new RegExp(IMMEDIATE_WITH_TIME, 'i'), label));
   }
   return { text: out, changed: out !== body };
 }
@@ -218,7 +223,7 @@ export function replaceCallImmediacy(text, replacement) {
   let out = body;
   for (const s of body.split(/(?<=[.!?])\s+/)) {
     if (!promisesCall(s)) continue;
-    out = out.replace(s, s.replace(new RegExp(IMMEDIATE, 'i'), replacement));
+    out = out.replace(s, s.replace(new RegExp(IMMEDIATE_WITH_TIME, 'i'), replacement));
   }
   return out;
 }
