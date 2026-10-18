@@ -28,7 +28,7 @@ const AGENTIC = path.join(ROOT, 'src', 'agentic');
 const BUDGET_FILE = path.join(HERE, 'fixtures', 'regex-budget.json');
 const SEED_REASON = /^Phase 0 seed\b/;
 // The seed reason covers the seed count only; any budget above it needs its own.
-const SEED_COUNT = 296;
+const SEED_COUNT = 297;
 
 /** Every `_RX =` declaration under a directory, recursively (matches, not lines). */
 export function countRegexDeclarations(dir) {

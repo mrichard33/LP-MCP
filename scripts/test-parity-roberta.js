@@ -51,7 +51,13 @@ const quiet = () => {};
 
 // LP stores the ET wall clock labelled +00:00; on the hour so the parser keeps the time.
 const onHour = (ms) => Math.floor(ms / HOUR) * HOUR;
-const lpAt = (ms) => utcToLpStoredIso(onHour(ms));
+// A stored LP time of 00:00 means "no time" (lpWallClockToGhlStartTime), so a
+// helper landing on ET midnight made these tests fail during that hour of the
+// day; step back to 23:00 then (2026-10-18).
+const lpAt = (ms) => {
+  const iso = utcToLpStoredIso(onHour(ms));
+  return /T00:00/.test(iso) ? utcToLpStoredIso(onHour(ms) - HOUR) : iso;
+};
 const ghlAt = (ms) => lpWallClockToGhlStartTime(lpAt(ms));
 
 // ═══ Fix 0: the LP-origin guard (pure) ═══════════════════════════════════
@@ -72,10 +78,9 @@ test('lpOriginBlock: a visit LP held in the last 72h (Issue, a demo, a live code
 });
 
 test('lpOriginBlock: the newest lead post-demo within 30 days blocks; an old demo does not', () => {
-  // A fixed clock (2026-10-18): with Date.now() the hour-rounded visit lands on
-  // 00:00 ET whenever the suite runs between 04:00 and 04:59 UTC, and LP's
-  // midnight reads as "no time" (lpVisitMs → null), so CI failed in that hour.
-  const now = Date.parse('2026-10-17T18:00:00Z');
+  // A fixed midday clock (2026-10-18): run between midnight and 1 AM ET, now - 10 days landed on an LP
+  // midnight, which reads as a date with no visit time, and the test failed for that hour only.
+  const now = Date.parse('2026-10-16T16:00:00Z');
   const leads = [
     { lp_lead_id: '579742', disposition_code: 'Data', appointment_date: null },
     { lp_lead_id: '583833', disposition_code: 'OPPFDN', appointment_date: lpAt(now - 10 * DAY) },

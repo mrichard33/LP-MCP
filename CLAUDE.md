@@ -478,6 +478,10 @@ Seeds: `sql/seeds/2026-10-16_parity_self_heal.sql`. Tests: `scripts/test-parity-
   another prospect with no contact id), and the admin backfill runs the same check before any cancel
   (`cancel_ignored_same_slot_sibling`; a dry run writes nothing). Class F remembers a `wait` (2h) and a shadow `close`
   (6h) per appointment + lead + stored disposition (`settledKey`), so settled rows stop eating `READ_CAP`.
+  An appointment our sync created is an LP booking, not GHL attribution: rule 87 `GHL_ATTR_APPT_BOOKED_VIA_GHL` carries
+  `not_sync_created_appointment` (2,289 of 2,302 handoffs in 30 days were ours; its opportunity-field write never
+  stored anything), and MCP `ghl_attribution_cleanup_run` removed the `ghl-attributed` tags it alone had added. MCP
+  `post_ops_alert` posts an operator's message to #ops-alerts through `sendAlertMessage` (dry run by default).
 
 **Every LP appointment has ONE card in "4. Confirmation Pipeline", and only LP MCP moves it (handoff, 2026-10-16).**
 Pipeline `ThrBNpyzJhAON4WFC855`; no GHL workflow may trigger on it. Rules `CONF_PIPE_SET/VERIF/CNF/ND/CXL` queue

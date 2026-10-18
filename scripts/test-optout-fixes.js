@@ -56,6 +56,22 @@ test('a soft no counts after the model\'s own post-demo question (bot gate, 2026
   assert.equal(p.step, 'post_demo_stop');
 });
 
+test('a no after our door-open close is the second no (bot gate, 2026-10-18)', () => {
+  const close = "Understood, Monica. If anything changes down the road, we're here.";
+  assert.equal(isPostDemoNo('No, we are good', close), true);
+  assert.equal(isPostDemoNo('No thanks', close), true);
+  assert.equal(isPostDemoNo('No problem, I will reach out', close), false, 'not a no');
+  assert.equal(isPostDemoNo('No, we are good', 'Sounds good, Monica.'), false, 'a plain ack asks nothing: not a no');
+  const p = rehashPlan([
+    msg('inbound', 'Hi, I got the proposal', 5),
+    msg('outbound', 'Where are you at with it? — John', 4),
+    msg('inbound', 'Not at this time. Thanks', 3),
+    msg('outbound', close, 2),
+  ], 'No, we are good');
+  assert.equal(p.step, 'post_demo_stop');
+  assert.equal(p.handoff?.reason, 'rehash_stop');
+});
+
 test('two no\'s stop the selling, with one line and no question', () => {
   const p = rehashPlan([
     msg('inbound', 'Hi, I got the proposal', 5), msg('outbound', 'Did you get a chance to look it over? — John', 4),

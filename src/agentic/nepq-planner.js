@@ -575,6 +575,7 @@ const POST_DEMO_OFFER_RX = /\bwould\s+(?:a\s+)?(?:quick\s+)?call\s+help\b|\bwoul
 // ("What got you looking at windows?") still is not.
 const POST_DEMO_QUESTION_RX = /\bwhat(?:'|’)?s?\s+(?:has\s+)?changed\b|\bsince\s+(?:the|our|my)\s+(?:visit|appointment|demo|meeting|presentation)\b|\b(?:the|your|our)\s+(?:proposal|quote|estimate|presentation)\b|\bmov(?:e|ing)\s+forward\b/i;
 
+const DOOR_OPEN_LINE_RX = /\bif\s+anything\s+changes\b|\bwe(?:'|’)?re\s+(?:here|around)\b|\bwe\s+are\s+here\b/i;
 /** A no on the post-demo line: isNo, or a soft no to our offer / track question. Pure. */
 export function isPostDemoNo(text, lastOutbound = '') {
   const t = String(text || '');
@@ -587,6 +588,12 @@ export function isPostDemoNo(text, lastOutbound = '') {
   const sign = String(lastOutbound || '').match(SIGNOFF_RX);
   const o = sign ? String(lastOutbound).slice(0, sign.index).trim() : String(lastOutbound || '');
   if (isNo(t, o)) return true;
+  // 2026-10-18 (the bot gate after #1355): the closer step answers a first no
+  // with the model's own door-open line ("If anything changes down the road,
+  // we're here.") and asks nothing, so "No, we are good" after it was not a no
+  // and the second no got "What's holding you back?". A no after that line is
+  // the second no. "No problem" and a no with more to say still are not.
+  if (DOOR_OPEN_LINE_RX.test(o) && (SOFT_DECLINE_RX.test(t) || BARE_NO_RX.test(t))) return true;
   if (!SOFT_DECLINE_RX.test(t)) return false;
   return CALL_OFFER_SENTENCE_RX.test(o) || BRIDGE_RX.test(o) || POST_DEMO_OFFER_RX.test(o) || REHASH_BRIDGE_RX.test(o) || REHASH_STAGES.some(st => st.rx.test(o))
     || (o.includes('?') && POST_DEMO_QUESTION_RX.test(o));

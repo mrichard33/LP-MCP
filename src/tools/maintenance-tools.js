@@ -32,6 +32,12 @@
  *                              reads take minutes, longer than a tool call
  *                              should wait, so it runs in the background and
  *                              job_id returns the report.
+ *
+ *   ghl_attribution_cleanup_run (2026-10-18) removes the `ghl-attributed` tag
+ *                              rule 87 put on contacts for appointments our own
+ *                              LP→GHL sync created (src/services/ghl-attribution-cleanup.js;
+ *                              the user: "Clear the wrong ones"). Same background
+ *                              job pattern; dry run by default.
  */
 import { z } from 'zod';
 
@@ -126,7 +132,51 @@ export function makeRehashTagCleanupRun(deps = {}) {
   };
 }
 
+export function makeGhlAttributionCleanupRun(deps = {}) {
+  const {
+    run = async (opts) => {
+      const { runAttributionCleanup } = await import('../services/ghl-attribution-cleanup.js');
+      const { readSyncCreatedStarts } = await import('../appointments/estimate-drift-io.js');
+      const db = (await import('../supabase.js')).default;
+      const { ghlFetch } = await import('../actions/helpers.js');
+      const getContact = async (id) => (await ghlFetch('GET', `/contacts/${id}`))?.contact || null;
+      return runAttributionCleanup(opts, { db, readSyncCreatedStarts, getContact });
+    },
+  } = deps;
+  return async ({ job_id = null, dry_run = true, max_removals = 200 } = {}) => {
+    if (job_id) {
+      const job = cleanupJobs.get(job_id);
+      return job ? { ok: true, ...job } : { ok: false, error: 'job_not_found (jobs live in memory; a deploy clears them)' };
+    }
+    const id = `attrclean_${Date.now().toString(36)}`;
+    const job = { job_id: id, status: 'running', dry_run: dry_run !== false, started_at: new Date().toISOString(), report: null, error: null };
+    cleanupJobs.set(id, job);
+    while (cleanupJobs.size > 20) cleanupJobs.delete(cleanupJobs.keys().next().value);
+    Promise.resolve()
+      .then(() => run({ dryRun: dry_run !== false, maxRemovals: max_removals }))
+      .then((report) => { job.report = report; job.status = 'completed'; })
+      .catch((err) => { job.error = String(err?.message || err).slice(0, 500); job.status = 'failed'; })
+      .finally(() => { job.completed_at = new Date().toISOString(); });
+    return { ok: true, job_id: id, dry_run: dry_run !== false, next_step: 'Call again with this job_id for the report.' };
+  };
+}
+
 export function registerMaintenanceTools(server, deps = {}) {
+  server.tool(
+    'ghl_attribution_cleanup_run',
+    'One-time cleanup (2026-10-18). Rule 87 GHL_ATTR_APPT_BOOKED_VIA_GHL tagged ghl-attributed for appointments our own '
+      + 'LP→GHL sync created (LP bookings, not GHL ones). Removes that tag only where rule 87 really added it, every '
+      + 'rule-87 booking for the contact was sync-created, and GHL_ATTR_DIGITAL_ENTRY never touched the contact; the live '
+      + 'tag is read first, one remove_tag per contact (rule GHL_ATTR_SYNC_CLEANUP). Dry run by default (counts only). '
+      + 'Runs in the background: the first call returns job_id; call again with job_id for the report.',
+    {
+      job_id: z.string().optional().describe('return the report of an earlier run'),
+      dry_run: z.boolean().optional().default(true).describe('true (default) counts only; false queues the removals'),
+      max_removals: z.number().int().min(1).max(2000).optional().default(200).describe('contacts read and queued per run'),
+    },
+    async (args) => text(await makeGhlAttributionCleanupRun(deps)(args)),
+  );
+
   server.tool(
     'rehash_tag_cleanup_run',
     'One-time cleanup (2026-10-14, Mark: no dates or ids in GHL tags). Reads every contact carrying rehash-lead:, '

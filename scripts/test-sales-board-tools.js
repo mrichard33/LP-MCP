@@ -13,6 +13,7 @@ import {
   registerSalesBoardTools,
   makeSaleP2BackstopRun,
   makeSaleContactBackstopRun,
+  makePostOpsAlert,
 } from '../src/tools/sales-board-tools.js';
 import { RECENT_APPT_MS } from '../src/notifications/sale-backstop.js';
 
@@ -147,7 +148,7 @@ test('every tool registers and defaults to dry run', async () => {
   registerSalesBoardTools({ tool: (name, _d, schema) => { tools[name] = schema; } });
   // 2026-10-03: sale_p2_backstop_run added (the Sale → P2 backfill).
   // 2026-10-04: sale_contact_backstop_run added (a GHL contact for every LP sale).
-  assert.deepEqual(Object.keys(tools).sort(), ['announce_missed_sale', 'post_office_power_ranking', 'sale_contact_backstop_run', 'sale_p2_backstop_run']);
+  assert.deepEqual(Object.keys(tools).sort(), ['announce_missed_sale', 'post_office_power_ranking', 'post_ops_alert', 'sale_contact_backstop_run', 'sale_p2_backstop_run']);
   assert.equal(tools.sale_contact_backstop_run.dry_run.parse(undefined), true);
   assert.equal(tools.post_office_power_ranking.dry_run.parse(undefined), true);
   assert.equal(tools.announce_missed_sale.dry_run.parse(undefined), true);
@@ -184,4 +185,24 @@ test('sale_contact_backstop_run: dry run is shadow; lead_ids and since pass thro
   assert.deepEqual(dry.sales.map((s) => [s.lp_lead_id, s.outcome]), [['474939', 'would_create']]);
   await tool({ dry_run: false, since: '2024-11-01', lead_ids: [474939], max_actions: 40 });
   assert.deepEqual(calls[1], { mode: 'live', sinceDay: '2024-11-01', maxPerRun: 40, leadIds: ['474939'] });
+});
+
+// ── post_ops_alert (2026-10-18) ─────────────────────────────────────────────
+
+test('post_ops_alert: a dry run posts nothing; a live run goes to the ops channel once', async () => {
+  const sent = [];
+  const tool = makePostOpsAlert({ send: async (t, opts) => { sent.push([t, opts]); return { sent: true, target: 'slack' }; } });
+  const dry = await tool({ text: '*Appointment sync follow-up*' });
+  assert.equal(dry.dry_run, true);
+  assert.equal(sent.length, 0);
+  const live = await tool({ text: '*Appointment sync follow-up*', dry_run: false });
+  assert.equal(live.ok, true);
+  assert.deepEqual(sent, [['*Appointment sync follow-up*', { channel: 'ops' }]]);
+});
+
+test('post_ops_alert: empty or oversized text is refused; a failed send reads not ok', async () => {
+  const tool = makePostOpsAlert({ send: async () => ({ sent: false, slack: { ok: false, error: 'no_slack_channel' } }) });
+  assert.equal((await tool({ text: '  ' })).ok, false);
+  assert.equal((await tool({ text: 'x'.repeat(3001), dry_run: false })).ok, false);
+  assert.equal((await tool({ text: 'hi', dry_run: false })).ok, false);
 });
