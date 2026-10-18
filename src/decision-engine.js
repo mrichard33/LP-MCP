@@ -254,6 +254,7 @@ import { withGhlCaller } from './ghl-caller.js';
 import { contactHadDemo, demoInCurrentCycle } from './demo-truth.js';
 import { stalePostDemoCancel } from './appointments/stale-post-demo-cancel.js';
 import { readSlotSiblings } from './same-slot-sibling-io.js';
+import { readSyncCreatedStarts } from './appointments/estimate-drift-io.js';
 import { resolveApptStart } from './objection-state-ghost-sweep.js';
 import { fetchCurrentLead } from './current-lead.js';
 import { lpStoredToUtcMs } from './lp-dates.js';
@@ -1067,7 +1068,7 @@ const IO_BACKED_CONDITION_KEYS = new Set([
   // appointment lookups
   'not_active_in_home_appointment', 'not_reschedule_inflight',
   'not_duplicate_lead_live_appointment', 'no_future_appointment',
-  'last_active_appointment', 'not_stale_post_demo_cancel',
+  'last_active_appointment', 'not_stale_post_demo_cancel', 'not_sync_created_appointment',
   // system_events history
   'thread_turn_count_gte', 'analysis_occurrence_gte', 'analysis_occurrence_lt',
   'no_inbound_within_hours', 'inbound_within_hours', 'has_prior_inbound',
@@ -2004,6 +2005,36 @@ async function evaluateContextConditions(conditions, intelligence, event, opts =
       // slot (src/appointments/stale-post-demo-cancel.js). Only on
       // ghl.appointment_cancelled; an unreadable start or a failed read fails
       // closed (doctrine).
+      // not_sync_created_appointment (Joseph Servis, 2026-10-18): an appointment our
+      // own LP→GHL sync created is not a booking GHL drove. Rule 87
+      // GHL_ATTR_APPT_BOOKED_VIA_GHL fires on every A.WE
+      // `appt:booked` handoff, and in the 30 days to 2026-10-18 2,289 of 2,302 of
+      // them were our sync's creates (LP / call-center bookings), so the
+      // `ghl-attributed` tag credited GHL for them. The handoff carries
+      // calendar.appointmentId; a matching appt.booking `created` event from the
+      // reconciler or the delegated endpoint means our sync made it. No id or a
+      // failed read fails closed (doctrine): no attribution is written.
+      case 'not_sync_created_appointment': {
+        if (!expected) break;
+        const scType = event?.event_type;
+        if (scType !== 'ghl.workflow_handoff' && scType !== 'ghl.appointment_booked') break;
+        const scId = payload?.calendar?.appointmentId || payload?.appointment_id || null;
+        if (!scId) return failClosed(key, 'appointment id missing from the booking payload');
+        const scDb = opts.deps?.supabase !== undefined ? opts.deps.supabase : supabase;
+        if (!scDb) return failClosed(key, 'LP Supabase not configured');
+        let scCreated;
+        try {
+          scCreated = await readSyncCreatedStarts(scDb, [String(scId)]);
+        } catch (err) {
+          return failClosed(key, `appt.booking lookup failed: ${err.message}`);
+        }
+        if (scCreated.has(String(scId))) {
+          console.log(`[Context] BLOCKED: not_sync_created_appointment — ${scId} was created by our LP→GHL sync (rule ${ruleKey || '?'})`);
+          return false;
+        }
+        break;
+      }
+
       case 'not_stale_post_demo_cancel': {
         if (!expected) break;
         if (event?.event_type !== 'ghl.appointment_cancelled') break;

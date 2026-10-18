@@ -10,6 +10,10 @@
  *                              an on-demand pass of src/p2-sale-backstop.js
  *   sale_contact_backstop_run  (2026-10-04) give every LP sale with no GHL
  *                              contact one, so its P2 card has somewhere to go
+ *   post_ops_alert             (2026-10-18) post one operator message to
+ *                              #ops-alerts through the system's own Slack bot
+ *                              (the user authorized it: the chat's Slack
+ *                              connector was not connected)
  *
  * WHY THESE EXIST. Both automatic paths have a window, and on 2026-09-25 a
  * post fell outside each one:
@@ -46,6 +50,7 @@ import {
 
 import { runSaleP2Backstop } from '../p2-sale-backstop.js';
 import { runSaleContactBackstop } from '../services/lp-sale-contact-backstop.js';
+import { sendAlertMessage } from '../alert-state.js';
 
 const text = (obj) => ({ content: [{ type: 'text', text: JSON.stringify(obj, null, 2) }] });
 
@@ -174,7 +179,38 @@ export function makeSaleContactBackstopRun(deps = {}) {
   };
 }
 
+export const OPS_ALERT_MAX_CHARS = 3000;
+
+/**
+ * Post (or preview) one message to #ops-alerts. It goes through
+ * sendAlertMessage(…, { channel: 'ops' }), the one ops send: Slack only, the
+ * phone and lead-id nets of postToSlack apply, never GroupMe.
+ */
+export function makePostOpsAlert(deps = {}) {
+  const { send = sendAlertMessage } = deps;
+  return async ({ text: body = '', dry_run = true } = {}) => {
+    const message = String(body || '').trim();
+    if (!message) return { ok: false, error: 'text is empty' };
+    if (message.length > OPS_ALERT_MAX_CHARS) return { ok: false, error: `text is over ${OPS_ALERT_MAX_CHARS} characters` };
+    if (dry_run !== false) return { ok: true, dry_run: true, text: message, next_step: 'Nothing posted. Run again with dry_run:false to post.' };
+    const result = await send(message, { channel: 'ops' });
+    return { ok: result?.sent === true, dry_run: false, result };
+  };
+}
+
 export function registerSalesBoardTools(server, deps = {}) {
+  server.tool(
+    'post_ops_alert',
+    'Post one message to #ops-alerts through the system\'s own Slack bot (the operational alarm channel; Slack only, '
+      + 'never GroupMe). For a summary an operator asked to have posted. Dry run by default — returns the text and posts '
+      + 'nothing.',
+    {
+      text: z.string().min(1).max(OPS_ALERT_MAX_CHARS).describe('the message (Slack mrkdwn)'),
+      dry_run: z.boolean().optional().default(true).describe('true (default) previews only; false posts'),
+    },
+    async (args) => text(await makePostOpsAlert(deps)(args)),
+  );
+
   server.tool(
     'sale_contact_backstop_run',
     'Give every LP sale whose lead has no GHL contact a contact (find by phone first, create only if none), and link it, '

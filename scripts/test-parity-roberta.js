@@ -51,7 +51,13 @@ const quiet = () => {};
 
 // LP stores the ET wall clock labelled +00:00; on the hour so the parser keeps the time.
 const onHour = (ms) => Math.floor(ms / HOUR) * HOUR;
-const lpAt = (ms) => utcToLpStoredIso(onHour(ms));
+// A stored LP time of 00:00 means "no time" (lpWallClockToGhlStartTime), so a
+// helper landing on ET midnight made these tests fail during that hour of the
+// day; step back to 23:00 then (2026-10-18).
+const lpAt = (ms) => {
+  const iso = utcToLpStoredIso(onHour(ms));
+  return /T00:00/.test(iso) ? utcToLpStoredIso(onHour(ms) - HOUR) : iso;
+};
 const ghlAt = (ms) => lpWallClockToGhlStartTime(lpAt(ms));
 
 // ═══ Fix 0: the LP-origin guard (pure) ═══════════════════════════════════
