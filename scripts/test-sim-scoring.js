@@ -402,3 +402,80 @@ test('rehash_repeat_objection reads a hand-off stored as a string', () => {
   const s = scoreResult(sms('rehash_repeat_objection', [turn(1, 'Too expensive', 'What part of the price felt off?', pd('rehash_objection')), t3]));
   assert.equal(s.pass, true, JSON.stringify(s.failures));
 });
+
+// ── 2026-10-18 (Phase 0): per-turn expectations and the pass rate by family ──
+const { turnExpectationFailures, SCORING_VERSION } = await import('../src/simulator/sim-scoring.js');
+const { SCENARIOS, SCENARIO_FAMILIES, resolveScenario } = await import('../src/simulator/bot-simulator.js');
+
+test('Phase 0: a turn that must ask nothing fails on a "?" even when the last turn is clean', () => {
+  // rehash_not_at_this_time as the gate runs it: the scenario's own expect rides on the result.
+  const exp = SCENARIOS.rehash_not_at_this_time.expect;
+  const run = sms('rehash_not_at_this_time', [
+    turn(1, 'Hi, I got the proposal', 'Great. Did you get a chance to look it over?', pd('post_demo_ack')),
+    turn(2, 'Not at this time. Thanks', "Of course. Where are you at with it?", pd('post_demo', { changes: ['post_demo_question_added'] })),
+    turn(3, 'No, we are good', "Understood. I'm here if anything changes.", pd('post_demo_stop')),
+  ], { expect: exp });
+  const codes = scoreResult(run).failures.map(f => `${f.code}@${f.turn}`);
+  assert.ok(codes.includes('question_not_allowed@2'), codes.join());
+  assert.ok(codes.includes('guard_question_appended@2'), codes.join());
+  const clean = sms('rehash_not_at_this_time', [
+    turn(1, 'Hi, I got the proposal', 'Great. Did you get a chance to look it over?', pd('post_demo_ack')),
+    turn(2, 'Not at this time. Thanks', "Of course. I'm here whenever you're ready.", pd('post_demo', { no_question: true })),
+    turn(3, 'No, we are good', "Understood. I'm here if anything changes.", pd('post_demo_stop')),
+  ], { expect: exp });
+  assert.deepEqual(turnExpectationFailures(clean), []);
+});
+
+test('Phase 0: each per-turn code fires on its own case', () => {
+  const t = (nepq, bot = 'Okay.') => turn(1, 'x', bot, { nepq });
+  const run = (expect, tr) => turnExpectationFailures(result('custom', tr, { expect }));
+  assert.deepEqual(run({ 2: { question_allowed: false } }, [t({})]).map(f => f.code), ['expected_turn_missing']);
+  assert.deepEqual(run({ 1: { move: 'bridge' } }, [t({ move: 'probe' })]).map(f => f.code), ['move_mismatch']);
+  assert.deepEqual(run({ 1: { move: ['probe', 'bridge'] } }, [t({ move: 'probe' })]), []);
+  assert.deepEqual(run({ 1: { step: ['post_demo_stop', 'handoff'] } }, [t({ step: 'post_demo' })]).map(f => f.code), ['step_mismatch']);
+  assert.deepEqual(run({ 1: { step: 'handoff' } }, [t({ step: 'handoff' })]), []);
+  assert.deepEqual(run({ 1: { no_clock: true } }, [t({}, 'I have Tue at 10:00 AM.')]).map(f => f.code), ['clock_not_allowed']);
+  assert.deepEqual(run({ 1: { no_clock: true } }, [t({}, 'Sounds good.')]), []);
+  // Shadow mode records the guard's change as would_change.
+  assert.deepEqual(run({ 1: { question_allowed: false } }, [t({ would_change: ['rehash_bridge_ask_added'] })]).map(f => f.code), ['guard_question_appended']);
+  // No expect: nothing is checked.
+  assert.deepEqual(turnExpectationFailures(result('custom', [t({}, 'What?')])), []);
+});
+
+test('Phase 0: the six scenarios carry the spec\'s expectations; every scenario has a known family', () => {
+  for (const k of ['rehash_not_at_this_time', 'not_interested', 'price_then_goodbye', 'rehash_defer', 'rehash_competitor_signed', 'stop_chat']) {
+    assert.ok(SCENARIOS[k].expect && Object.keys(SCENARIOS[k].expect).length, `${k} has expect`);
+    for (const n of Object.keys(SCENARIOS[k].expect)) assert.ok(Number(n) >= 1 && Number(n) <= SCENARIOS[k].turns.length, `${k} turn ${n} is a scripted turn`);
+  }
+  assert.deepEqual(SCENARIOS.price_then_goodbye.expect[4], { question_allowed: false, no_clock: true });
+  for (const [k, s] of Object.entries(SCENARIOS)) assert.ok(SCENARIO_FAMILIES.includes(s.family), `${k} family ${s.family}`);
+  for (const k of Object.keys(SCENARIOS)) if (k.startsWith('rehash_')) assert.equal(SCENARIOS[k].family, 'rehash', k);
+  assert.equal(resolveScenario({ turns: ['hi'] }).family, 'new_lead');
+  assert.equal(resolveScenario({ scenario: 'stop_chat' }).expect[1].question_allowed, false);
+});
+
+test('Phase 0: the scorecard reports a pass rate per family, and a family that falls is worse', () => {
+  const fam = (scenario, family, ok) => ({ ...result(scenario, [turn(1, 'hi', ok ? 'What got you looking?' : null)]), family });
+  const card = scoreRun([fam('fam_a', 'new_lead', true), fam('fam_b', 'rehash', false), fam('fam_c', 'booking', true)]);
+  assert.equal(SCORING_VERSION, '2026-10-18.2');
+  assert.deepEqual(card.pass_rate_by_family.rehash, { conversations: 1, passed: 0, pass_rate: 0 });
+  assert.equal(card.pass_rate_by_family.new_lead.pass_rate, 1);
+  const text = formatScorecard(card);
+  assert.match(text, /family rehash: 0\/1 \(0%\)/);
+  assert.match(text, /family booking: 1\/1 \(100%\)/);
+  // Previous run: rehash passed, booking failed. Now the reverse: the total holds, rehash fell.
+  const prev = { ...card, results: [{ key: 'fam_a/livechat', pass: true }, { key: 'fam_b/livechat', pass: true }, { key: 'fam_c/livechat', pass: false }] };
+  const cmp = compareScorecards(card, prev);
+  assert.equal(cmp.worse, true);
+  assert.ok(cmp.reasons.some(r => /^family rehash fell from 100% to 0%/.test(r)), cmp.reasons.join(' | '));
+  assert.ok(!cmp.reasons.some(r => /^pass rate fell/.test(r)), 'the total did not fall');
+  // An old saved run with no family on its rows still compares.
+  assert.equal(compareScorecards(card, { ...prev, results: prev.results.map(({ key, pass }) => ({ key, pass })) }).compared, true);
+  // A result with no family is new_lead.
+  assert.equal(scoreResult(result('discovery', [turn(1, 'hi', 'What got you looking?')])).family, 'new_lead');
+});
+
+test('Phase 0: a saved run keeps each result\'s family', () => {
+  const card = scoreRun([{ ...result('rehash_defer', [turn(1, 'Call me in the spring', 'Will do.', pd('defer'))]), family: 'rehash' }]);
+  assert.equal(evalRunPayload(card, null).scorecard.results[0].family, 'rehash');
+});

@@ -33,7 +33,19 @@ import { isCallPromise } from '../agentic/promised-callbacks.js';
 // gate. A NEW scenario is not a bump: compareScorecards scores the pass rate
 // over the scenarios both runs share and lists new ones apart.
 // 2026-10-18: question_after_closer (a post-demo sign-off or first no asks nothing).
-export const SCORING_VERSION = '2026-10-18.1';
+// 2026-10-18.2 (Phase 0): per-turn `expect` checks (turnExpectationFailures),
+// which now apply to six existing scenarios, and the pass rate by family. The
+// first gate run on this version is the Phase 0 baseline, never "worse". (.1
+// was already taken by the rehash closer PR the same day.)
+export const SCORING_VERSION = '2026-10-18.2';
+
+/** A scenario with no family is a new-lead conversation (Phase 0, 2026-10-18). */
+export const DEFAULT_FAMILY = 'new_lead';
+const familyOf = (r) => String(r?.family || DEFAULT_FAMILY);
+
+// Guard changes that ADD a question to the reply. On a turn that must ask
+// nothing, either one is the bug the last-turn-only gate could not see.
+const QUESTION_ADDING_CHANGES = Object.freeze(['post_demo_question_added', 'rehash_bridge_ask_added']);
 
 const CLOCK_RX = /\b\d{1,2}(?::\d{2})?\s*(?:AM|PM)\b/gi;
 const clockCount = (text) => (String(text || '').match(CLOCK_RX) || []).length;
@@ -362,6 +374,45 @@ function heldThePick(r) {
   return held ? [] : [{ code: 'pick_not_heard', detail: `"${said}" → ${text.slice(0, 200) || '(no reply)'}`, turn: t.turn }];
 }
 
+const asList = (v) => (v == null ? null : (Array.isArray(v) ? v : [v]).map(String));
+
+/**
+ * The per-turn expectations a scenario declares (Phase 0, 2026-10-18), held
+ * to every conversation that carries `expect`. Pure.
+ *   expect: { [turn]: { question_allowed?: boolean, move?: string|string[],
+ *                       step?: string|string[], no_clock?: boolean } }
+ * Codes: expected_turn_missing, question_not_allowed, move_mismatch,
+ * step_mismatch, clock_not_allowed, guard_question_appended (a turn that must
+ * ask nothing, where a guard appended the post-demo question or the bridge
+ * ask, live `changes` or shadow `would_change`).
+ */
+export function turnExpectationFailures(result) {
+  const expect = result?.expect;
+  if (!expect || typeof expect !== 'object') return [];
+  const out = [];
+  const turns = result.transcript || [];
+  for (const [n, want] of Object.entries(expect)) {
+    const turnNo = Number(n);
+    const t = turns.find(x => x.turn === turnNo);
+    if (!t) { out.push({ code: 'expected_turn_missing', detail: `no turn ${turnNo} in the transcript`, turn: turnNo }); continue; }
+    const text = replies(t).join(' ');
+    if (want?.question_allowed === false) {
+      if (text.includes('?')) out.push({ code: 'question_not_allowed', detail: text, turn: turnNo });
+      const changes = [...(t.nepq?.changes || []), ...(t.nepq?.would_change || [])].map(String);
+      const added = changes.filter(c => QUESTION_ADDING_CHANGES.includes(c));
+      if (added.length) out.push({ code: 'guard_question_appended', detail: added.join(','), turn: turnNo });
+    }
+    const moves = asList(want?.move);
+    const move = String(t.nepq?.move || t.nepq?.required_move || '');
+    if (moves && !moves.includes(move)) out.push({ code: 'move_mismatch', detail: `move ${move || 'none'}, expected ${moves.join(' | ')}`, turn: turnNo });
+    const steps = asList(want?.step);
+    const step = String(t.nepq?.step || '');
+    if (steps && !steps.includes(step)) out.push({ code: 'step_mismatch', detail: `step ${step || 'none'}, expected ${steps.join(' | ')}`, turn: turnNo });
+    if (want?.no_clock === true && clockCount(text)) out.push({ code: 'clock_not_allowed', detail: text, turn: turnNo });
+  }
+  return out;
+}
+
 /** Did the run book, move or hold a time (code-backed), at any turn? Pure. */
 function bookedOrHeld(r) {
   if (did(r, /would_book|would_move_same_appointment/)) return true;
@@ -424,7 +475,7 @@ export function stageFlowFailures(result) {
  */
 export function scoreResult(result) {
   const key = `${result.scenario}/${result.channel}`;
-  const base = { key, scenario: result.scenario, channel: result.channel };
+  const base = { key, scenario: result.scenario, channel: result.channel, family: familyOf(result) };
   if (result.error) return { ...base, pass: false, replies: 0, failures: [{ code: 'run_error', detail: result.error }] };
 
   const failures = [];
@@ -476,6 +527,7 @@ export function scoreResult(result) {
   failures.push(...stageFlowFailures(result));
   const expect = SCENARIO_EXPECTATIONS[result.scenario];
   if (expect) failures.push(...expect(result));
+  failures.push(...turnExpectationFailures(result));
   return { ...base, pass: failures.length === 0, replies: allReplies(result).length, failures };
 }
 
@@ -489,6 +541,13 @@ export function scoreRun(results, meta = {}) {
   const passed = scored.filter(s => s.pass).length;
   const codes = {};
   for (const s of scored) for (const f of s.failures) codes[f.code] = (codes[f.code] || 0) + 1;
+  const byFamily = {};
+  for (const s of scored) {
+    const f = (byFamily[s.family] ||= { conversations: 0, passed: 0, pass_rate: null });
+    f.conversations += 1;
+    if (s.pass) f.passed += 1;
+  }
+  for (const f of Object.values(byFamily)) f.pass_rate = Math.round((f.passed / f.conversations) * 1000) / 1000;
   return {
     invariants_version: INVARIANTS_VERSION,
     scoring_version: SCORING_VERSION,
@@ -498,6 +557,7 @@ export function scoreRun(results, meta = {}) {
     conversations: scored.length,
     passed,
     pass_rate: scored.length ? Math.round((passed / scored.length) * 1000) / 1000 : null,
+    pass_rate_by_family: byFamily,
     failure_counts: codes,
     results: scored,
   };
@@ -542,6 +602,23 @@ export function compareScorecards(current, previous) {
   if (curRate != null && prevRate != null && curRate < prevRate) {
     reasons.push(`pass rate fell from ${Math.round(prevRate * 100)}% to ${Math.round(curRate * 100)}% over the ${before.size ? `${shared.length} shared` : 'same'} conversations`);
   }
+  // A family whose rate fell is worse even when the total holds (Phase 0,
+  // 2026-10-18): rehash going red behind booking going green read as "not
+  // worse". Grouped by the CURRENT run's family, so an older saved run that
+  // stored none still compares.
+  if (before.size) {
+    const families = new Map();
+    for (const r of shared) {
+      const g = families.get(familyOf(r)) || { n: 0, prev: 0, cur: 0 };
+      g.n += 1;
+      if (before.get(r.key) === true) g.prev += 1;
+      if (r.pass) g.cur += 1;
+      families.set(familyOf(r), g);
+    }
+    for (const [fam, g] of [...families].sort((a, b) => a[0].localeCompare(b[0]))) {
+      if (g.cur < g.prev) reasons.push(`family ${fam} fell from ${Math.round((g.prev / g.n) * 100)}% to ${Math.round((g.cur / g.n) * 100)}% over its ${g.n} shared conversations`);
+    }
+  }
   for (const r of shared) {
     if (before.get(r.key) === true && !r.pass) reasons.push(`${r.key} passed last run and now fails (${r.failures.map(f => f.code).join(', ')})`);
   }
@@ -552,6 +629,9 @@ export function compareScorecards(current, previous) {
 export function formatScorecard(card, comparison = null) {
   const lines = [`Scorecard: ${card.passed}/${card.conversations} conversations pass (${Math.round((card.pass_rate || 0) * 100)}%) · checks ${card.invariants_version}${card.prompt_version ? ` · prompt ${card.prompt_version}` : ''}${card.git_sha ? ` · ${String(card.git_sha).slice(0, 7)}` : ''}${card.kb_exemplar_mode ? ` · exemplars ${card.kb_exemplar_mode}` : ''}`];
   if (comparison) lines.push(comparison.worse === true ? `WORSE THAN LAST RUN: ${comparison.reasons.join('; ')}` : comparison.worse === false ? 'Not worse than the last run.' : `Not compared: ${comparison.reasons.join('; ')}`);
+  for (const [fam, f] of Object.entries(card.pass_rate_by_family || {}).sort((a, b) => a[0].localeCompare(b[0]))) {
+    lines.push(`  family ${fam}: ${f.passed}/${f.conversations} (${Math.round((f.pass_rate || 0) * 100)}%)`);
+  }
   // New scenarios are reported, never counted against the run (2026-10-16).
   if (comparison?.new_keys?.length) lines.push(`New this run (not compared): ${comparison.new_keys.map(k => `${k.key} ${k.pass ? 'pass' : 'FAIL'}`).join(', ')}`);
   for (const r of card.results.filter(x => !x.pass)) {
