@@ -379,6 +379,19 @@ test('a missed visit is a complaint: a person takes over, no pitch', () => {
   assert.equal(plan({ trigger: 'never call me again' }).handoff?.reason === 'complaint', false);
 });
 
+test('a lead who feels threatened or insulted gets an apology and a person, no sales question (2026-10-18)', () => {
+  for (const t of ['This sounds like a threat', 'I have done nothing to you.',
+    'There is no reason for your harsh words. That is your marketing strategy to be threatening. I am glad that I did not choose your company.',
+    'Are you threatening me?', 'This is harassment', 'Stop the scare tactics', 'How dare you']) {
+    const p = plan({ trigger: t });
+    assert.equal(p.handoff?.reason, 'complaint', t);
+    assert.equal(p.booking?.allowed === true, false, t);
+  }
+  for (const t of ['I worry about the threat of hurricanes', 'A storm is threatening the coast this week', 'Is the attic insulated?']) {
+    assert.notEqual(plan({ trigger: t }).handoff?.reason, 'complaint', t);
+  }
+});
+
 // Mark, 2026-10-02: hand-off cards go to #contact-center, and a complaint to #dispatch too.
 test('hand-off card: #contact-center always, #dispatch for a complaint; a failed post is an ops line', async () => {
   const { handoffSlackChannels } = await import('../src/agentic/nepq-handoff.js');

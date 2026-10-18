@@ -172,6 +172,14 @@ export function isServiceCallback({ conversation = [], trigger = '', isCustomer 
 
 const COMPLAINT_RX = /\b(?:supposed\s+to\s+(?:come|show|be\s+(?:here|there)|call|arrive)|never\s+(?:came|showed(?:\s+up)?|arrived|called(?:\s+(?:me\s+)?back)?)|(?:didn'?t|did\s+not)\s+(?:come|show(?:\s+up)?|arrive|call(?:\s+(?:me\s+)?back)?)|stood\s+(?:me|us)\s+up|waited\s+all\s+(?:day|morning|afternoon)|(?:nobody|no\s+one|no-one)\s+(?:showed|came|called|answered)|complain\w*|ripped\s+off|rip[-\s]?off|scam\w*|refund|lawyer|attorney|sue\b|bbb|better\s+business|manager|supervisor|no[-\s]?show(?:ed)?|never\s+showed|(?:nobody|no\s+one)\s+(?:came|showed|called|answered)|unprofessional|rude|terrible\s+service|worst)\b/i;
 
+// A lead who feels threatened, harassed or insulted by what we sent is a
+// complaint too (2026-10-18, the user; Diane, c4mxpy24yMrzsga4nj8g): an S5.2
+// drip line read as a threat to her ("This sounds like a threat", "There is no
+// reason for your harsh words") and the bot answered with two discovery
+// questions, then she opted out. Narrow on purpose: "the threat of hurricanes"
+// or "a storm is threatening" is a sales topic, not a complaint.
+const OFFENDED_RX = /\b(?:(?:sounds?|feels?|reads?|seems?|looks?)\s+like\s+a\s+threat|is\s+(?:that|this)\s+a\s+threat|threaten(?:ed|ing)?\s+(?:me|us|my|our)\b|(?:to\s+be|being|so|very|kind\s+of|really|pretty)\s+threatening|intimidat\w*|harass\w*|harsh\s+words?|done\s+nothing\s+to\s+you|(?:scare|fear)\s+tactics?|how\s+dare|offensive|insult\w*|disrespect\w*)/i;
+
 // Do-not-knock (2026-10-03): detection lives in do-not-knock.js, shared with
 // the opt-out gate (a door complaint is not a text opt-out).
 export const DNK_ASK_RX = /\bdo[-\s]not[-\s]knock\s+list\b/i;
@@ -1012,7 +1020,7 @@ function planNepqTurnCore({
     return fixed('warranty', warrantyReference(firstName), { step: 'warranty', warranty: true, booking: { allowed: false, reason: 'nepq:warranty' }, reference_markers: WARRANTY_MARKERS });
   }
   if (SERVICE_RX.test(now)) return handoff('service');
-  if (COMPLAINT_RX.test(now)) return handoff('complaint');
+  if (COMPLAINT_RX.test(now) || OFFENDED_RX.test(now)) return handoff('complaint');
   // A call asked for about service (an install, an order, a repair) goes to
   // the service team, never the sales callback list (Mark, 2026-10-03).
   const serviceCall = () => isServiceCallback({ conversation, trigger, isCustomer });
