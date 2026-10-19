@@ -772,6 +772,31 @@ we never add one.
   Tools: the seven `siro_*` in `src/tools/siro-tools.js`; `siro_lead_presentation` with `preview_f0_position` is the
   dry run before any flip.
 
+## Revin: every text it sends or receives, one thread per contact (2026-10-19)
+
+Until now all we kept of Revin AI's texting was its ~160-character LP summary note (`note_origin = 'lp_revin'`, still
+synced and pushed to GHL as before). `POST /webhooks/revin` (`src/revin/webhook.js`) now stores every Revin event.
+- **Fail closed, never soft-launch.** `X-Revin-Secret` must equal `REVIN_WEBHOOK_SECRET` (`safeEqual`); an unset secret
+  refuses everything. Not `checkRequestSecret`: production's `AUTH_SOFT_LAUNCH` would let a token-less body in.
+- **Store, answer, then process.** The raw bytes go to `revin_events_raw` (256 KB, `payload_hash` UNIQUE, so a retry is
+  one row) with the secret header removed; 200 goes out; `src/revin/process.js` runs in `trackBackground`. A body we
+  cannot parse is stored and answered 200; only a failed store is a 5xx.
+- **Unknown shapes are expected.** Revin publishes no spec: `FIELD_MAP` / `EVENT_MAP` at the top of
+  `src/revin/normalize.js` are the one place to adjust, and every pass logs `unmapped keys`. An unknown event is stored
+  as `event_type 'unknown'`, never dropped. `contact_messages.dedupe_key` is `x:<message id>` or a hash, UNIQUE with source.
+- **Read-only matching.** LP lead id → `resolveContactIdForLead`; phone → the HL mirror, lp_leads, then (first pass only)
+  `resolveOrCreateContact({ create: false })`. Never creates a contact or a lead, never messages anyone. Job
+  `revin-relink` (15 min) retries cut-off rows, attaches unmatched ones (no GHL token), follows contact merges and alerts
+  #ops-alerts (an `error` row in the hour, or 25+ `unmatched`).
+- **A Revin call event is `channel 'call_event'`, context only.** Five9 stays the only call source; never count these.
+- **The bot reads Revin only with `BOT_INCLUDE_REVIN_THREAD=true` (default off; Mark flips it).** Both history loaders
+  merge `readRevinTurns` (`src/revin/thread-read.js`: 20 turns / 14 days from `contact_thread_v`, cleaned and screened as
+  surface `revin_thread`) through `mergeRevinTurns`, labelled "Revin (automated texting)"; off returns the same array. No
+  prompt copy changed. Before the flip: `run_bot_eval` with `include_revin_thread` true vs false (a simulated lead gets a
+  short Revin exchange from two days before), compared with the last gate run.
+- `contact_thread_v` is the whole thread: `contact_messages` + `bot_message_context` (both sides) + sent
+  `agentic_messages`, read in place.
+
 ## Consent (2026-09-28)
 
 `contact_consent` / `consent_events` (sql/136–139) are the record of who may be contacted and why not.

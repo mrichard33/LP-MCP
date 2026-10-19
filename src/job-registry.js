@@ -478,6 +478,18 @@ export const JOBS = Object.freeze([
     isEnabled: (env) => String(env.CANCEL_RESET_ROUTING_MODE || 'live').toLowerCase().trim() !== 'off',
   },
   {
+    // 2026-10-19: the Revin webhook's backstop (src/jobs/revin-relink.js).
+    // Always on: it only reads, stores and alerts, and with no Revin rows it
+    // finds nothing to do.
+    id: 'revin-relink',
+    label: 'Revin webhook: retry unprocessed events, attach unmatched messages, follow contact merges, alert',
+    group: 'sync',
+    cadence: 'every 15 min, 24/7',
+    enabledEnv: null,
+    enabledDefault: true,
+    isEnabled: () => true,
+  },
+  {
     // 2026-10-16 handoff "4. Confirmation Pipeline". Always on: with
     // CONF_PIPE_DRY_RUN (default true) it computes and logs, and with no
     // CONF_PIPE_* rules it finds no open cards.

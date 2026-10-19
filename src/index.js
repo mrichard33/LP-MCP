@@ -124,6 +124,7 @@ import { registerGroupMeRoutes } from './groupme.js';
 // ─── Slack approval buttons (Approve / Reject on approval cards) ─
 import { registerSlackApprovalRoutes, slackRawBodyParser } from './slack-approvals.js';
 import { registerSiroWebhookRoutes, siroRawBodyParser } from './siro/webhook.js';  // 2026-10-16 Siro PR 1
+import { registerRevinWebhookRoutes, revinRawBodyParser, REVIN_WEBHOOK_PATH } from './revin/webhook.js';  // 2026-10-19
 import { startSiroRecordingSyncScheduler } from './jobs/siro-recording-sync.js';
 import { startSiroScorecardSyncScheduler } from './jobs/siro-rep-scorecard-sync.js';
 import { registerDncLiftDecisionRoutes } from './consent/dnc-lift-decision.js';
@@ -342,6 +343,7 @@ import { startMissedCallerRecoveryScheduler } from './jobs/missed-caller-recover
 import { startNewLeadDialBackstopScheduler } from './jobs/new-lead-dial-backstop.js';  // 2026-10-05
 import { startAfterAsapRetryScheduler } from './jobs/after-asap-retry.js';  // 2026-10-14
 import { startCancelResetRoutingScheduler } from './jobs/cancel-reset-routing.js';  // 2026-10-15
+import { startRevinRelinkScheduler } from './jobs/revin-relink.js';  // 2026-10-19
 import { startConfirmationPipelineClockScheduler } from './jobs/confirmation-pipeline-clock.js';  // 2026-10-16 — 4. Confirmation Pipeline
 import { startConfirmationPipelineSweepScheduler, registerConfirmationPipelineRoutes } from './jobs/confirmation-pipeline-sweep.js';  // 2026-10-16
 import { startFive9CallJourneyScheduler, registerFive9JourneyRoutes } from './jobs/five9-call-journey-sync.js';  // 2026-10-15
@@ -402,6 +404,8 @@ app.use('/memory/omi', omiBodyParser());
 app.use('/webhook/slack', slackRawBodyParser());
 // 2026-10-16 — Siro signs the exact bytes too (svix); same reason, same place.
 app.use('/webhook/siro', siroRawBodyParser());
+// 2026-10-19: Revin's webhook keeps its raw bytes (payload_hash) and caps the body at 256 KB.
+app.use(REVIN_WEBHOOK_PATH, revinRawBodyParser());
 // 2026-10-19 — an invoice PDF arrives base64 in JSON (~400 KB+); the 100 kB
 // default below answered 413 to every one of six LightFire invoices.
 app.use(INVOICE_INGEST_PATH, invoiceBodyParser());
@@ -785,6 +789,7 @@ registerGroupMeRoutes(app, authenticate);
 registerSlackApprovalRoutes(app);
 // 2026-10-16 — Siro demo recordings (svix-signed; SIRO_WEBHOOK_MODE, default shadow).
 registerSiroWebhookRoutes(app);
+registerRevinWebhookRoutes(app);
 // 2026-09-28 — Consent Model v1: n8n's OPS.DNC-LIFT posts Slack decisions here.
 // Own fail-closed header secret (DNC_LIFT_WEBHOOK_SECRET), not the MCP token.
 registerDncLiftDecisionRoutes(app);
@@ -1034,6 +1039,7 @@ const server = app.listen(PORT, async () => {
   startNewLeadDialBackstopScheduler();
   startAfterAsapRetryScheduler();
   startCancelResetRoutingScheduler();
+  startRevinRelinkScheduler();
   startConfirmationPipelineClockScheduler();
   startConfirmationPipelineSweepScheduler();
   startFive9CallJourneyScheduler();

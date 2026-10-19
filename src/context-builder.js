@@ -104,6 +104,8 @@ import { timezoneForZip } from './services/contact-timezone.js';
 import { stripQuotedEmail } from './email-thread.js';
 import { channelOfMessage } from './agentic/reply-sender.js';
 import { filterConversationForModel } from './context-activity-filter.js';
+import { readRevinTurns } from './revin/thread-read.js';  // 2026-10-19
+import { mergeRevinTurns } from './revin/thread.js';
 // v2.9: the canonical five-signal "is this person a customer" test. Reused
 // here so customer_relationship never disagrees with the suppression shapes.
 import { isCustomerP2 } from './agentic/lead-state/signals/context-reader.js';
@@ -1200,7 +1202,7 @@ export async function buildLeadContext(ghlContactId, options = {}) {
   }
 
   const lpLeadId = lpLead?.lp_lead_id || null;
-  const [conversation, lpNotes, lpCalls, pipelineStageInfo, nurtureHistory, openObjectionState, ghlNotes, lpProspectHistory, market] = await Promise.all([
+  const [ghlConversation, lpNotes, lpCalls, pipelineStageInfo, nurtureHistory, openObjectionState, ghlNotes, lpProspectHistory, market, revinTurns] = await Promise.all([
     // Part 7 (Mark, 2026-10-02): 30 messages across every channel, not 10, so
     // the bot knows the whole recent story (texts, chats, emails).
     (parts.conversation && ghlContact) ? fetchConversation(ghlContactId, 30, degraded) : [],
@@ -1217,8 +1219,13 @@ export async function buildLeadContext(ghlContactId, options = {}) {
     // 2026-10-01: the contact's market zone (Houston → Central). Fail-soft to
     // Eastern; see src/services/contact-timezone.js.
     timezoneForZip(ghlContact?.postalCode || lpLead?.zip || null),
+    // 2026-10-19: what Revin texted the lead, only with BOT_INCLUDE_REVIN_THREAD=true
+    // (src/revin/thread-read.js returns [] without a read when it is off).
+    (parts.conversation && ghlContact) ? readRevinTurns(ghlContactId) : [],
   ]);
 
+  // Off (no Revin turns) this is the same array fetchConversation returned.
+  const conversation = mergeRevinTurns(ghlConversation, revinTurns);
   const modelConversation = filterConversationForModel(conversation);
   const tags = ghlContact?.tags || [];
   const daysInStage = calculateDaysInStage(opportunity);
