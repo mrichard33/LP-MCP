@@ -324,57 +324,17 @@ export async function handleMarketingInvoiceInteraction(parsed, deps = {}) {
   }
 
   // 2026-10-19 (the user: "accept an invoice as received and later amend it if a
-  // dispute arises"): the Disputed part of an approved invoice is settled here.
-  //   dispute_accept  the charge stands: flag 'dispute_accepted' and re-split the
-  //                   whole line by what was found (no Disputed row any more)
-  //   dispute_credit  the vendor credited it: the line's amount drops by the
-  //                   disputed part ('dispute_credited'), the offices keep theirs,
-  //                   and the document records what was credited, by whom, when
-  // A revised invoice settles it too, by replacing the original on approval.
+  // dispute arises"): the Disputed part of an approved invoice is settled here,
+  // through settleDispute (below), which the dashboard's invoice view uses too.
   if (decision === 'dispute_accept' || decision === 'dispute_credit') {
-    const approved = ctx.rows.filter((r) => r.status === 'approved');
-    const { data: parked } = approved.length
-      ? await supabase.from('marketing_expense_allocations').select('expense_id, amount').in('expense_id', approved.map((r) => r.id)).eq('market', DISPUTED_MARKET)
-      : { data: [] };
-    const byExpense = new Map();
-    for (const a of parked || []) byExpense.set(a.expense_id, Math.round(((byExpense.get(a.expense_id) || 0) + Number(a.amount || 0)) * 100) / 100);
-    const lines = approved.filter((r) => (byExpense.get(r.id) || 0) > 0);
-    if (!lines.length) {
-      await reply(responseUrl, { response_type: 'ephemeral', replace_original: false, text: 'Nothing on this invoice is in dispute. Nothing changed.' });
-      return { handled: true, action: 'nothing_disputed' };
+    const out = await settleDispute({ documentId, action: decision === 'dispute_accept' ? 'accept' : 'credit', who, userName }, { ...deps, supabase });
+    if (!out.ok) {
+      await reply(responseUrl, { response_type: 'ephemeral', replace_original: false, text: out.message });
+      return { handled: true, action: out.action };
     }
-    const now = new Date().toISOString();
-    const allocate = deps.allocate || allocateExpenseById;
-    const credits = [];
-    for (const r of lines) {
-      const disputed = byExpense.get(r.id);
-      const flags = [...new Set([...(r.flags || []), decision === 'dispute_accept' ? 'dispute_accepted' : 'dispute_credited'])];
-      const patch = { flags, updated_at: now };
-      if (decision === 'dispute_credit') {
-        patch.amount = Math.round((Number(r.amount) - disputed) * 100) / 100;
-        credits.push({ expense_id: r.id, line_no: r.line_no, was: Number(r.amount), credited: disputed, by: who, at: now });
-      }
-      const { error } = await supabase.from('marketing_expenses').update(patch).eq('id', r.id);
-      if (error) throw new Error(`dispute update failed: ${error.message}`);
-      // A credited line keeps exactly what it had found; its new amount matches
-      // the found work, so the re-split parks nothing and charges the same.
-      await allocate(r.id, { supabase });
-    }
-    const total = Math.round([...byExpense.values()].reduce((a, v) => a + v, 0) * 100) / 100;
-    if (credits.length) {
-      const analysis = { ...(ctx.document.analysis || {}), credits: [...((ctx.document.analysis || {}).credits || []), ...credits] };
-      await supabase.from('marketing_invoice_documents').update({ analysis, updated_at: now }).eq('id', documentId);
-    }
-    const fresh = await loadReviewContext(documentId, { supabase });
-    const first = fresh.rows.find((r) => r.status === 'approved');
-    const settledText = decision === 'dispute_accept'
-      ? `Disputed ${usdPlain(total)} confirmed by ${userName}: charged to the offices`
-      : `${usdPlain(total)} credit recorded by ${userName}: taken off the invoice`;
-    const card = await renderCard(fresh, { decision: { outcome: 'approved', by: String(first?.approved_by || '').replace(/ \(.*\)$/, '') || userName, at: String(first?.approved_at || now).slice(0, 16).replace('T', ' ') }, note: settledText }, { ...deps, supabase });
-    await reply(responseUrl, { replace_original: true, text: card.text, blocks: card.blocks });
-    await postDecisionReply(fresh.document, decision === 'dispute_accept' ? `✅ ${settledText}.` : `💳 ${settledText}.`, deps);
-    console.log(`${LOG} ${decision} on ${documentId} by ${who}: ${usdPlain(total)} over ${lines.length} line(s)`);
-    return { handled: true, action: decision === 'dispute_accept' ? 'dispute_accepted' : 'dispute_credited', amount: total };
+    await reply(responseUrl, { replace_original: true, text: out.card.text, blocks: out.card.blocks });
+    await postDecisionReply(out.document, out.threadText, deps);
+    return { handled: true, action: out.action, amount: out.amount };
   }
 
   if (!pending.length) {
@@ -435,6 +395,139 @@ export async function handleMarketingInvoiceInteraction(parsed, deps = {}) {
 }
 
 const usdPlain = (n) => `$${Number(n || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+
+const DISPUTE_FLAGS = new Set(['dispute_accepted', 'dispute_credited']);
+const cents = (n) => Math.round(Number(n || 0) * 100);
+
+/** Disputed dollars per expense, read from its DISPUTED allocations. */
+async function disputedByExpense(ids, supabase) {
+  const out = new Map();
+  if (!ids.length) return out;
+  const { data, error } = await supabase.from('marketing_expense_allocations').select('expense_id, amount').in('expense_id', ids).eq('market', DISPUTED_MARKET);
+  if (error) throw new Error(`disputed read failed: ${error.message}`);
+  for (const a of data || []) out.set(a.expense_id, (out.get(a.expense_id) || 0) + cents(a.amount));
+  return out;
+}
+
+/**
+ * Settle, change or reopen the Disputed part of an approved invoice (the user,
+ * 2026-10-19). Shared by the Slack card's buttons and the dashboard's invoice view.
+ *   accept  the charge stands: 'dispute_accepted', the whole line re-split by office
+ *   credit  the vendor credited `amount` (default: everything disputed): the line
+ *           drops by it ('dispute_credited'); a part credit leaves the rest Disputed
+ *   reopen  undo a confirm or a credit: amounts back to what was billed, flags off,
+ *           re-split, so the gap is Disputed again
+ * `reset: true` (the dashboard) first undoes any earlier settlement, so a credit can
+ * be changed and a confirmed charge credited instead. The Slack buttons keep their
+ * one-way meaning (reset false): they act on what is Disputed right now.
+ * `analysis.credits` holds the credits in force (each with the line's billed `was`),
+ * `analysis.dispute_log` every action. Returns { ok, action, amount, message, ... }.
+ */
+export async function settleDispute({ documentId, action, amount = null, who, userName, reset = false }, deps = {}) {
+  const supabase = deps.supabase || supabaseDefault;
+  const allocate = deps.allocate || allocateExpenseById;
+  const ctx = await loadReviewContext(documentId, { supabase });
+  if (!ctx) return { ok: false, action: 'not_found', message: 'That invoice is no longer in the ledger.' };
+  const approved = ctx.rows.filter((r) => r.status === 'approved');
+  if (!approved.length) return { ok: false, action: 'not_approved', message: 'Only an approved invoice can have a dispute settled. Nothing changed.' };
+  const now = new Date().toISOString();
+  const analysis = ctx.document.analysis || {};
+  const credits = Array.isArray(analysis.credits) ? analysis.credits : [];
+  const billedWas = new Map();
+  for (const c of credits) if (c?.expense_id && !billedWas.has(c.expense_id)) billedWas.set(c.expense_id, Number(c.was));
+
+  // Undo an earlier confirm / credit: back to what the vendor billed, and re-split.
+  let undone = 0;
+  if (reset || action === 'reopen') {
+    for (const r of approved) {
+      const settled = (r.flags || []).some((f) => DISPUTE_FLAGS.has(f)) || billedWas.has(r.id);
+      if (!settled) continue;
+      const billed = billedWas.has(r.id) ? billedWas.get(r.id) : Number(r.amount);
+      const { error } = await supabase.from('marketing_expenses')
+        .update({ amount: billed, flags: (r.flags || []).filter((f) => !DISPUTE_FLAGS.has(f)), updated_at: now }).eq('id', r.id);
+      if (error) throw new Error(`dispute reset failed: ${error.message}`);
+      r.amount = billed;
+      r.flags = (r.flags || []).filter((f) => !DISPUTE_FLAGS.has(f));
+      await allocate(r.id, { supabase });
+      undone++;
+    }
+  }
+
+  const disputed = await disputedByExpense(approved.map((r) => r.id), supabase);
+  const lines = approved.filter((r) => (disputed.get(r.id) || 0) > 0);
+  const totalC = lines.reduce((a, r) => a + disputed.get(r.id), 0);
+  let keptCredits = undone ? [] : credits;
+  let amountC = totalC;
+  let settledText;
+
+  if (action === 'reopen') {
+    if (!undone) return { ok: false, action: 'nothing_to_reopen', message: 'Nothing on this invoice was confirmed or credited. Nothing changed.' };
+    settledText = `Dispute reopened by ${userName}: ${usdPlain(totalC / 100)} is Disputed again`;
+  } else {
+    if (!lines.length) return { ok: false, action: 'nothing_disputed', message: 'Nothing on this invoice is in dispute. Nothing changed.' };
+    if (action === 'credit' && amount != null) {
+      amountC = cents(amount);
+      if (!(amountC > 0) || amountC > totalC) {
+        return { ok: false, action: 'bad_amount', message: `The credit must be more than $0 and at most the ${usdPlain(totalC / 100)} in dispute. Nothing changed.` };
+      }
+    }
+    let leftC = amountC;
+    const added = [];
+    for (const r of lines) {
+      const flag = action === 'accept' ? 'dispute_accepted' : 'dispute_credited';
+      const patch = { flags: [...new Set([...(r.flags || []), flag])], updated_at: now };
+      if (action === 'credit') {
+        const partC = Math.min(leftC, disputed.get(r.id));
+        if (!(partC > 0)) continue;
+        leftC -= partC;
+        patch.amount = (cents(r.amount) - partC) / 100;
+        added.push({ expense_id: r.id, line_no: r.line_no, was: billedWas.get(r.id) ?? Number(r.amount), credited: partC / 100, by: who, at: now });
+      }
+      const { error } = await supabase.from('marketing_expenses').update(patch).eq('id', r.id);
+      if (error) throw new Error(`dispute update failed: ${error.message}`);
+      // A credited line keeps exactly what it had found; its new amount matches the
+      // found work, so the re-split parks nothing (or only the part not credited).
+      await allocate(r.id, { supabase });
+    }
+    keptCredits = [...keptCredits, ...added];
+    const restC = totalC - amountC;
+    settledText = action === 'accept'
+      ? `Disputed ${usdPlain(totalC / 100)} confirmed by ${userName}: charged to the offices`
+      : `${usdPlain(amountC / 100)} credit recorded by ${userName}: taken off the invoice${restC > 0 ? `; ${usdPlain(restC / 100)} still disputed` : ''}`;
+  }
+
+  const log = [...(Array.isArray(analysis.dispute_log) ? analysis.dispute_log : []), { action, amount: (action === 'reopen' ? totalC : amountC) / 100, by: who, at: now }];
+  const { error: dErr } = await supabase.from('marketing_invoice_documents')
+    .update({ analysis: { ...analysis, credits: keptCredits, dispute_log: log }, updated_at: now }).eq('id', documentId);
+  if (dErr) throw new Error(`dispute record failed: ${dErr.message}`);
+
+  const fresh = await loadReviewContext(documentId, { supabase });
+  const first = fresh.rows.find((r) => r.status === 'approved');
+  const decision = { outcome: 'approved', by: String(first?.approved_by || '').replace(/ \(.*\)$/, '') || userName, at: String(first?.approved_at || now).slice(0, 16).replace('T', ' ') };
+  const card = await renderCard(fresh, { decision, note: settledText }, { ...deps, supabase });
+  const icon = action === 'accept' ? '✅' : action === 'credit' ? '💳' : '↩️';
+  const done = { accept: 'dispute_accepted', credit: 'dispute_credited', reopen: 'dispute_reopened' }[action];
+  console.log(`${LOG} ${done} on ${documentId} by ${who}: ${settledText}`);
+  return { ok: true, action: done, amount: (action === 'reopen' ? totalC : amountC) / 100, message: settledText, card, document: fresh.document, fresh, threadText: `${icon} ${settledText}.` };
+}
+
+/**
+ * The dashboard's invoice view (the user, 2026-10-19: "a button that displays the
+ * invoice and lets me update the credit received, confirm the charge, or reopen a
+ * disputed amount"). The dashboard checks the person is an admin and relays the
+ * click here; the Slack card is redrawn in place and gets the same thread reply,
+ * so the card and the dashboard never disagree.
+ */
+export async function settleDisputeFromDashboard({ documentId, action, amount = null, by = null }, deps = {}) {
+  if (!['accept', 'credit', 'reopen'].includes(action)) return { ok: false, action: 'bad_action', message: 'Unknown action.' };
+  const name = String(by || 'dashboard').replace(/@.*$/, '');
+  const out = await settleDispute({ documentId, action, amount, who: `${by || 'dashboard'} (dashboard)`, userName: name, reset: true }, deps);
+  if (!out.ok) return out;
+  const r = await updateCard(out.fresh, out.card, deps);
+  if (!r?.ok && r?.error !== 'no_card') console.warn(`${LOG} card for ${documentId} not redrawn after the dashboard ${action}: ${r?.error}`);
+  await postDecisionReply(out.document, out.threadText, deps);
+  return { ok: true, action: out.action, amount: out.amount, message: out.message };
+}
 
 /**
  * A revised invoice replaces the original (the user, 2026-10-19: "Replace the

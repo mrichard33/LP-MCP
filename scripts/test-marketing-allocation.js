@@ -528,3 +528,71 @@ test('refreshReviewCards: a dry run lists the cards and touches nothing; a faile
   assert.equal(out.refreshed, 1);
   assert.deepEqual(out.failed.map((f) => f.error), ['message_not_found']);
 });
+
+// 2026-10-19 (the user): the dashboard's invoice view can change the credit,
+// confirm the charge or reopen the dispute. The fake allocator re-splits like the
+// real one: $2,250 of demos found, the rest Disputed unless the charge was confirmed.
+import { settleDisputeFromDashboard } from '../src/marketing/review-actions.js';
+function resplitDeps(supabase, sink) {
+  const allocate = async (id) => {
+    sink.allocated.push(id);
+    const e = supabase.tables.marketing_expenses.find((x) => x.id === id);
+    const found = 2250;
+    const accepted = (e.flags || []).includes('dispute_accepted');
+    const office = accepted ? Number(e.amount) : Math.min(Number(e.amount), found);
+    const rest = Math.round((Number(e.amount) - office) * 100) / 100;
+    supabase.tables.marketing_expense_allocations = [
+      ...supabase.tables.marketing_expense_allocations.filter((a) => a.expense_id !== id),
+      { expense_id: id, month: '2026-08-01', market: 'FTLAU_MKT', amount: office, rule: 'proportional' },
+      ...(rest > 0 ? [{ expense_id: id, month: '2026-08-01', market: DISPUTED_MARKET, amount: rest, rule: 'hold' }] : []),
+    ];
+  };
+  return { supabase, allocate, signedLink: async () => null, postToSlack: async (t) => { sink.thread.push(t); return { ok: true }; }, updateSlackMessage: async () => { sink.redrawn++; return { ok: true }; } };
+}
+const dashSink = () => ({ allocated: [], thread: [], redrawn: 0 });
+const disputedNow = (supabase) => supabase.tables.marketing_expense_allocations.filter((a) => a.market === DISPUTED_MARKET).reduce((t, a) => t + a.amount, 0);
+
+test('dashboard: a part credit leaves the rest Disputed; changing it starts again from what was billed', async () => {
+  const supabase = disputedDb();
+  const sink = dashSink();
+  const deps = resplitDeps(supabase, sink);
+  const r = await settleDisputeFromDashboard({ documentId: DOC_ID, action: 'credit', amount: 500, by: 'brad@reecewindows.com' }, deps);
+  assert.equal(r.ok, true);
+  assert.equal(supabase.tables.marketing_expenses[0].amount, 2500);
+  assert.equal(disputedNow(supabase), 250);
+  assert.match(r.message, /\$500\.00 credit recorded by brad: taken off the invoice; \$250\.00 still disputed/);
+  assert.equal(sink.redrawn, 1, 'the Slack card is redrawn to match');
+  assert.equal(sink.thread.length, 1);
+  // Change it: the $500 is undone first, then $750 is credited from the billed $3,000.
+  const again = await settleDisputeFromDashboard({ documentId: DOC_ID, action: 'credit', amount: 750, by: 'brad@reecewindows.com' }, deps);
+  assert.equal(again.ok, true);
+  assert.equal(supabase.tables.marketing_expenses[0].amount, 2250);
+  assert.equal(disputedNow(supabase), 0);
+  const credits = supabase.tables.marketing_invoice_documents[0].analysis.credits;
+  assert.deepEqual(credits.map((c) => [c.was, c.credited]), [[3000, 750]], 'only the credit in force is kept');
+  assert.equal(supabase.tables.marketing_invoice_documents[0].analysis.dispute_log.length, 2);
+  const tooMuch = await settleDisputeFromDashboard({ documentId: DOC_ID, action: 'credit', amount: 900 }, deps);
+  assert.equal(tooMuch.action, 'bad_amount');
+});
+
+test('dashboard: confirm, then reopen puts the gap back on Disputed; a credit after a confirm undoes the confirm', async () => {
+  const supabase = disputedDb();
+  const sink = dashSink();
+  const deps = resplitDeps(supabase, sink);
+  assert.equal((await settleDisputeFromDashboard({ documentId: DOC_ID, action: 'accept' }, deps)).action, 'dispute_accepted');
+  assert.equal(disputedNow(supabase), 0);
+  const back = await settleDisputeFromDashboard({ documentId: DOC_ID, action: 'reopen', by: 'mark@x.com' }, deps);
+  assert.equal(back.action, 'dispute_reopened');
+  assert.equal(disputedNow(supabase), 750);
+  assert.deepEqual(supabase.tables.marketing_expenses[0].flags, []);
+  assert.equal((await settleDisputeFromDashboard({ documentId: DOC_ID, action: 'reopen' }, deps)).action, 'nothing_to_reopen');
+  await settleDisputeFromDashboard({ documentId: DOC_ID, action: 'accept' }, deps);
+  const credit = await settleDisputeFromDashboard({ documentId: DOC_ID, action: 'credit' }, deps);
+  assert.equal(credit.amount, 750, 'no amount = everything disputed');
+  assert.deepEqual(supabase.tables.marketing_expenses[0].flags, ['dispute_credited']);
+  assert.equal(supabase.tables.marketing_expenses[0].amount, 2250);
+  // Reopen after a credit restores what was billed.
+  await settleDisputeFromDashboard({ documentId: DOC_ID, action: 'reopen' }, deps);
+  assert.equal(supabase.tables.marketing_expenses[0].amount, 3000);
+  assert.deepEqual(supabase.tables.marketing_invoice_documents[0].analysis.credits, []);
+});
