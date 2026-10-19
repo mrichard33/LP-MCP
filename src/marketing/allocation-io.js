@@ -13,7 +13,9 @@
  * insert happen only after the rows exist in memory.
  */
 import supabaseDefault from '../supabase.js';
-import { allocateExpense, splitPeriodByMonth, splitsBySource, splitsEvenly, HOLD_MARKET } from './allocation.js';
+import { allocateExpense, splitPeriodByMonth, splitsBySource, splitsEvenly, callCenterLineKind, HOLD_MARKET } from './allocation.js';
+import { agedDays, buildLightFireEvents, daysBetween, EVENT_CANVASS_CONFIRM, EVENT_DEMO, EVENT_DIRECT_NET, isLightFireAgent } from '../payroll/rules.js';
+import { createPayrollStore } from '../payroll/store.js';
 
 const LOG = '[MktAlloc]';
 
@@ -27,6 +29,82 @@ export async function issuedByMarketFor({ from, to, subSources = [] }, { supabas
     if (!r.market) continue;
     if (wanted.size && !wanted.has(r.lp_sub_source)) continue;
     out[r.market] = (out[r.market] || 0) + Number(r.issued || 0);
+  }
+  return out;
+}
+
+/** Market per LP lead id, as mkt_issued_counts maps one: the branch map, then the lead's assignment. */
+async function marketsForLeads(leadIds, { supabase = supabaseDefault } = {}) {
+  const ids = [...new Set((leadIds || []).filter(Boolean).map(String))];
+  const out = new Map();
+  if (!ids.length) return out;
+  const { data: branches, error: bErr } = await supabase.from('lp_branch_market_map').select('brn_id, market_code');
+  if (bErr) throw new Error(`branch map read failed: ${bErr.message}`);
+  const byBranch = new Map((branches || []).filter((r) => r.market_code).map((r) => [String(r.brn_id), r.market_code]));
+  for (let i = 0; i < ids.length; i += 200) {
+    const part = ids.slice(i, i + 200);
+    const [{ data: leads, error: lErr }, { data: assigned, error: aErr }] = await Promise.all([
+      supabase.from('lp_leads').select('lp_lead_id, lp_branch_id').in('lp_lead_id', part),
+      supabase.from('lp_lead_market_assignments').select('lead_id, resolved_market_code').in('lead_id', part),
+    ]);
+    if (lErr) throw new Error(`lead branch read failed: ${lErr.message}`);
+    if (aErr) throw new Error(`market assignment read failed: ${aErr.message}`);
+    for (const r of assigned || []) if (r.resolved_market_code) out.set(String(r.lead_id), r.resolved_market_code);
+    for (const l of leads || []) {
+      const m = byBranch.get(String(l.lp_branch_id));
+      if (m) out.set(String(l.lp_lead_id), m);
+    }
+  }
+  return out;
+}
+
+/**
+ * The call center's work per office for one window (the user, 2026-10-19:
+ * each charge goes to the office of the leads it was for). The SAME events
+ * payroll pays LightFire for (src/payroll/rules.js buildLightFireEvents, an
+ * "- LF" agent), with the age split of its pay rules (agedDays, default 30):
+ *   canvass  canvass appointments confirmed, counted
+ *   demo     demos on AGED leads (created 30+ days before the set), counted
+ *   sales    net dollars RTP'd on NEW leads (report 134), the 1.5% basis
+ * A sale takes the market report 134 prints for the job, else its lead's.
+ * Checked against the August invoices: canvass 194 of 194 (8/23-8/31), demos
+ * 9-13 of the 12-17 billed a week, sales $179,513 of $169,254 (8/1-8/15):
+ * close enough to set the offices' shares, never the amount, which is the invoice's.
+ */
+export async function callCenterWorkByMarketFor({ kind, from, to }, { supabase = supabaseDefault, store = null, env = process.env } = {}) {
+  const st = store || createPayrollStore({ supabase });
+  const period = { start: from, end: to };
+  const aged = agedDays(env);
+  const isAged = (ev) => { const d = daysBetween(ev.lead_created_date, ev.set_date); return d == null ? null : d >= aged; };
+  let events;
+  const jobMarket = new Map();
+  if (kind === 'canvass') {
+    events = buildLightFireEvents({ canvassLeads: await st.loadCanvassConfirms(period), period })
+      .filter((ev) => ev.event_type === EVENT_CANVASS_CONFIRM && isLightFireAgent(ev.agent_name));
+  } else if (kind === 'demo') {
+    events = buildLightFireEvents({ demoLeads: await st.loadDemos(period), period })
+      .filter((ev) => ev.event_type === EVENT_DEMO && isLightFireAgent(ev.agent_name) && isAged(ev) === true);
+  } else if (kind === 'sales') {
+    const net = await st.load134(period);
+    const matches = await st.matchJobsToLeads(net.rows.map((r) => r.job_number));
+    const netJobs = [];
+    for (const row of net.rows) {
+      const m = matches.get(String(row.job_number));
+      if (!m?.lead) continue;
+      netJobs.push({ ...row, lead: m.lead });
+      if (row.market) jobMarket.set(String(row.job_number), row.market);
+    }
+    events = buildLightFireEvents({ netJobs, period })
+      .filter((ev) => ev.event_type === EVENT_DIRECT_NET && isLightFireAgent(ev.agent_name) && isAged(ev) === false && ev.basis_cents > 0);
+  } else {
+    throw new Error(`call-center work: unknown kind "${kind}"`);
+  }
+  const leadMarket = await marketsForLeads(events.map((ev) => ev.lp_lead_id), { supabase });
+  const out = {};
+  for (const ev of events) {
+    const m = jobMarket.get(String(ev.job_number)) || leadMarket.get(String(ev.lp_lead_id));
+    if (!m) continue;
+    out[m] = (out[m] || 0) + (kind === 'sales' ? ev.basis_cents : 1);
   }
   return out;
 }
@@ -47,6 +125,12 @@ function monthLastDay(month) {
 export async function previewAllocation(expense, deps = {}) {
   const slices = splitPeriodByMonth(expense.period_start, expense.period_end, expense.amount);
   const counts = {};
+  const workKind = callCenterLineKind(expense);
+  if (workKind) {
+    // The slice's own days, not its whole month: the invoice bills one week's work.
+    for (const s of slices) counts[s.month] = await callCenterWorkByMarketFor({ kind: workKind, from: s.start, to: s.end }, deps);
+    return allocateExpense(expense, (month) => counts[month] || {});
+  }
   const holdOnly = (expense.eligible_markets || []).length === 1 && expense.eligible_markets[0] === HOLD_MARKET;
   if (!holdOnly && !splitsEvenly(expense) && ((expense.eligible_markets || []).length > 1 || splitsBySource(expense))) {
     for (const s of slices) {

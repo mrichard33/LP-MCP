@@ -254,3 +254,92 @@ test('the thread reply names who decided and the money per market', () => {
   assert.equal(t, '✅ Approved by mark · $300.00\n• Fort Lauderdale: $198.00\n• Orlando: $102.00');
   assert.match(buildDecisionReply({ outcome: 'reopened', by: 'brad' }), /^🔓 Reopened by brad/);
 });
+
+// 2026-10-19, the user: every LightFire charge goes to the office of the leads it
+// was for ("10 demos at $250 each set in Fort Lauderdale ... all assigned to Fort
+// Lauderdale. The same applies to the 1.5% sales"), never split evenly.
+import { fakeSupabase } from './lib/fake-supabase.js';
+test('a call-center demo / sales / canvass line goes to the offices of its leads; a fee stays even', async () => {
+  const { allocateExpense, callCenterLineKind, splitKind } = await import('../src/marketing/allocation.js');
+  const line = (description, amount) => ({ id: description, amount, period_start: '2026-08-23', period_end: '2026-08-31', description, lp_sub_sources: ['Call Center'], eligible_markets: ['ALL_OFFICES'] });
+  const canvass = line('Canvas', 2910);
+  const demos = line('Demos - AGED', 4250);
+  const sales = line('Sales 1.5%', 3812.07);
+  const fee = line('Credit Card Fee .035', 60);
+  assert.deepEqual([canvass, demos, sales, fee].map(callCenterLineKind), ['canvass', 'demo', 'sales', null]);
+  assert.equal(callCenterLineKind({ ...canvass, lp_sub_sources: ['Canvass'], eligible_markets: [] }), null, 'a canvass lead source is not a call-center line');
+  assert.equal(callCenterLineKind({ ...demos, lp_sub_sources: ['Software'] }), null, 'only call-center cost');
+  assert.equal(splitKind(demos), 'call_center_work');
+
+  const tenInLauderdale = allocateExpense({ ...demos, amount: 2500 }, () => ({ FTLAU_MKT: 10 }));
+  assert.deepEqual(tenInLauderdale.map((r) => [r.market, r.amount, r.lp_sub_source]), [['FTLAU_MKT', 2500, 'Call Center']]);
+  const c = allocateExpense(canvass, () => ({ FTMYR_MKT: 71, STPET_MKT: 41, SAR_MKT: 33, ORL_MKT: 31, JAX_MKT: 18 }));
+  assert.equal(c.reduce((t, r) => t + Math.round(r.amount * 100), 0), 291000);
+  assert.equal(c.find((r) => r.market === 'FTMYR_MKT').amount, 1065, '71 of 194 × $15');
+  const s = allocateExpense(sales, () => ({ FTMYR_MKT: 300000, ORL_MKT: 100000 }));
+  assert.deepEqual(s.map((r) => [r.market, r.amount]), [['FTMYR_MKT', 2859.06], ['ORL_MKT', 953.01]], 'by net dollars, the leftover cent to the bigger');
+  const even = allocateExpense(fee, () => { throw new Error('an even split reads nothing'); });
+  assert.equal(even.length, 6);
+  const none = allocateExpense(demos, () => ({}));
+  assert.deepEqual(none.map((r) => [r.market, r.rule]), [['REECE_HOLD', 'hold']]);
+  assert.match(none[0].note, /aged-lead demos it set found 2026-08-23\.\.2026-08-31/);
+  assert.equal(splitLabel(demos), '_call center cost, by the office of the aged-lead demos it set_');
+  assert.equal(splitChoice(sales), 'call_center');
+});
+
+test('call-center work per office: LF agents only, aged demos, new-lead sales by the job\'s market', async () => {
+  const { callCenterWorkByMarketFor, previewAllocation } = await import('../src/marketing/allocation-io.js');
+  const supabase = fakeSupabase({
+    lp_leads: [
+      { lp_lead_id: '1', lp_branch_id: '10' }, { lp_lead_id: '2', lp_branch_id: '20' }, { lp_lead_id: '3', lp_branch_id: null },
+      { lp_lead_id: '4', lp_branch_id: '10' }, { lp_lead_id: '5', lp_branch_id: '20' },
+    ],
+    lp_branch_market_map: [{ brn_id: '10', market_code: 'FTLAU_MKT' }, { brn_id: '20', market_code: 'SAR_MKT' }],
+    lp_lead_market_assignments: [{ lead_id: '3', resolved_market_code: 'ORL_MKT' }],
+  });
+  const lead = (id, over) => ({ lp_lead_id: id, lead_source: 'Data', created_at_lp: '2026-06-01T10:00:00+00:00', set_date: '2026-08-20T10:00:00+00:00', ever_sat: true, ...over });
+  const store = {
+    loadCanvassConfirms: async () => [
+      lead('1', { lead_source: 'Canvass', confirmed_by_name: 'Smith - LF, Ann', confirmed_date: '2026-08-24T14:00:00+00:00' }),
+      lead('3', { lead_source: 'Canvass Sticky', confirmed_by_name: 'Lee-LF, Cy', confirmed_date: '2026-08-25T14:00:00+00:00' }),
+      lead('4', { lead_source: 'Canvass', confirmed_by_name: 'Garner, Chris', confirmed_date: '2026-08-25T14:00:00+00:00' }),
+      lead('2', { lead_source: 'Canvass', confirmed_by_name: 'No, Setter', confirmed_date: '2026-08-25T14:00:00+00:00' }),
+    ],
+    loadDemos: async () => [
+      lead('1', { set_by_name: 'Deer - LF, Craig', demo_date: '2026-08-25T14:00:00+00:00' }),
+      lead('4', { set_by_name: 'Deer - LF, Craig', demo_date: '2026-08-26T14:00:00+00:00' }),
+      lead('2', { set_by_name: 'Deer - LF, Craig', demo_date: '2026-08-26T14:00:00+00:00', created_at_lp: '2026-08-10T10:00:00+00:00' }),
+      lead('5', { set_by_name: 'Garner, Chris', demo_date: '2026-08-26T14:00:00+00:00' }),
+    ],
+    load134: async () => ({ rows: [
+      { job_number: 'J1', rtp_date: '2026-08-25', net_cents: 3000000, market: 'JAX_MKT' },
+      { job_number: 'J2', rtp_date: '2026-08-26', net_cents: 1000000, market: null },
+      { job_number: 'J3', rtp_date: '2026-08-27', net_cents: 5000000, market: 'FTLAU_MKT' },
+      { job_number: 'J4', rtp_date: '2026-08-27', net_cents: 7000000, market: 'FTLAU_MKT' },
+    ] }),
+    matchJobsToLeads: async () => new Map([
+      ['J1', { lead: lead('2', { set_by_name: 'Deer - LF, Craig', created_at_lp: '2026-08-10T10:00:00+00:00' }) }],
+      ['J2', { lead: lead('5', { set_by_name: 'Gray-LF, Romeala', created_at_lp: '2026-08-15T10:00:00+00:00' }) }],
+      ['J3', { lead: lead('1', { set_by_name: 'Deer - LF, Craig' }) }],
+      ['J4', { lead: lead('4', { set_by_name: 'Garner, Chris', created_at_lp: '2026-08-15T10:00:00+00:00' }) }],
+    ]),
+  };
+  const deps = { supabase, store, env: {} };
+  const win = { from: '2026-08-23', to: '2026-08-31' };
+  assert.deepEqual(await callCenterWorkByMarketFor({ kind: 'canvass', ...win }, deps), { FTLAU_MKT: 1, ORL_MKT: 1 }, 'LF confirmers only');
+  assert.deepEqual(await callCenterWorkByMarketFor({ kind: 'demo', ...win }, deps), { FTLAU_MKT: 2 }, 'aged LF demos only');
+  assert.deepEqual(await callCenterWorkByMarketFor({ kind: 'sales', ...win }, deps), { JAX_MKT: 3000000, SAR_MKT: 1000000 }, 'new LF leads only; the job\'s market, else the lead\'s');
+  const rows = await previewAllocation({ id: 'd', amount: 500, period_start: '2026-08-23', period_end: '2026-08-31', description: 'Demos - AGED', lp_sub_sources: ['Call Center'], eligible_markets: ['ALL_OFFICES'] }, deps);
+  assert.deepEqual(rows.map((r) => [r.market, r.amount]), [['FTLAU_MKT', 500]]);
+});
+
+test('a $0 line beside billed lines is dropped; an all-$0 invoice keeps its line', () => {
+  const vendor = { id: 'lf', vendor_name: 'LightFire Partners', lp_sub_sources: ['Call Center'], eligible_markets: ['ALL_OFFICES'] };
+  const facts = { invoice_number: '17734', total: 3812.07, period_start: '2026-08-16', period_end: '2026-08-31' };
+  const { rows } = buildExpenseRows({ document: { id: 'd' }, vendor, facts, analysis: { lines: [
+    { description: 'Demos - AGED', amount: 0 }, { description: 'Canvas', amount: 0 }, { description: 'Sales 1.5%', amount: 3812.07 },
+  ] } });
+  assert.deepEqual(rows.map((r) => [r.line_no, r.description, r.amount, r.lp_sub_sources, r.eligible_markets]), [[1, 'Sales 1.5%', 3812.07, ['Call Center'], ['ALL_OFFICES']]]);
+  const allZero = buildExpenseRows({ document: { id: 'd' }, vendor, facts, analysis: { lines: [{ description: 'Canvas', amount: 0 }] } });
+  assert.equal(allZero.rows.length, 1);
+});

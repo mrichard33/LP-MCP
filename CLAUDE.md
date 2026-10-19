@@ -958,6 +958,18 @@ Brad's XLSX (`marketing-cost-report`, formulas never typed values) read `v_marke
   **The ingest route has its own 40 MB body parser, mounted BEFORE the global `express.json()` (2026-10-19).** A PDF
   arrives base64 in JSON; the global 100 kB default answered 413 to all six LightFire invoices (~390 KB each) before
   the route's own parser ever ran (`invoiceBodyParser` / `INVOICE_INGEST_PATH`, `scripts/test-marketing-invoice-body-limit.js`).
+- **LightFire is call-center cost, and each charge goes to the office of its leads (the user, 2026-10-19).** "If there
+  were 10 demos at $250 each set in Fort Lauderdale, then those should all be assigned to Fort Lauderdale. The same
+  applies to the 1.5% sales." Never split evenly. Vendor "LightFire Partners"
+  (`sql/seeds/2026-10-19_lightfire_call_center_vendor.sql`) is Call Center; `callCenterLineKind` reads each line's
+  kind from its description ("Demos - AGED", "Sales 1.5%", "Canvas") and `callCenterWorkByMarketFor` weights it by the
+  events payroll pays LightFire for in the line's own days (`buildLightFireEvents`, "- LF" agents): aged-lead demos
+  set (count), net dollars RTP'd on new leads set (report 134; the job's market, else the lead's), canvass appointments
+  confirmed (count). August check: canvass 194 of 194, demos 9-13 of the 12-17 billed a week, sales $179,513 vs $169,254;
+  the shares come from our records, the amount from the invoice. Still "Call Center"; nothing found yet → REECE_HOLD
+  with a note, re-run nightly, never a hold recommendation; a call-center line naming none of the three stays even.
+  Read from the description, so an Edit to "call center cost" keeps it. A $0 line beside billed lines is dropped at
+  build (`buildExpenseRows`): kept, it blocked Approve on a multi-line invoice Edit could not fix.
 - **Only Mark or Brad decides (D6).** The card in `SLACK_MKT_INVOICE_CHANNEL_ID` carries `mktinv_approve` /
   `mktinv_edit` / `mktinv_reject`; `isMarketingInvoiceAction` in `src/slack-approvals-core.js` catches those clicks AND
   the Edit modal's `view_submission` so they are never relayed to onboarding (which would read them as a member
