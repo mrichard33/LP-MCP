@@ -22,7 +22,7 @@ export const MKTINV_EDIT_CALLBACK = 'mktinv_edit';
 
 export const MARKET_OPTIONS = Object.freeze([
   ['STPET_MKT', 'St. Petersburg'], ['ORL_MKT', 'Orlando'], ['FTMYR_MKT', 'Fort Myers'],
-  ['FTLAU_MKT', 'Fort Lauderdale'], ['JAX_MKT', 'Jacksonville'], ['SAR_MKT', 'Sarasota'], ['REECE_HOLD', 'Hold at company level'],
+  ['FTLAU_MKT', 'Fort Lauderdale'], ['JAX_MKT', 'Jacksonville'], ['SAR_MKT', 'Sarasota'], ['REECE_HOLD', 'Hold at company level (parked, not split to any office)'],
 ]);
 
 const usd = (n) => (n == null || Number.isNaN(Number(n)) ? '—' : `$${Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`);
@@ -168,7 +168,7 @@ export function buildEditView({ document, vendor, facts, rows = [], vendors = []
   const splitOptions = SPLIT_OPTIONS.map(([v, l]) => ({ text: { type: 'plain_text', text: l }, value: v }));
   const splitInitial = splitOptions.find((o) => o.value === splitChoice(first));
   const rememberOption = { text: { type: 'plain_text', text: 'Use this vendor, sub-source and split for this vendor\'s next invoices' }, value: 'remember' };
-  const input = (block_id, label, element) => ({ type: 'input', block_id, label: { type: 'plain_text', text: label }, element, optional: true });
+  const input = (block_id, label, element, hint) => ({ type: 'input', block_id, label: { type: 'plain_text', text: label }, element, optional: true, ...(hint ? { hint: { type: 'plain_text', text: hint } } : {}) });
   return {
     type: 'modal',
     callback_id: MKTINV_EDIT_CALLBACK,
@@ -187,7 +187,11 @@ export function buildEditView({ document, vendor, facts, rows = [], vendors = []
       input('amount', rows.length > 1 ? 'Total (leave blank to keep the lines as they are)' : 'Amount', { type: 'plain_text_input', action_id: 'mktinv_v_amount', initial_value: first.amount != null ? String(first.amount) : '' }),
       input('sub_source', 'LP sub-source (lead sources only; type a new one if needed)', { type: 'plain_text_input', action_id: 'mktinv_v_sub_source', initial_value: (first.lp_sub_sources || []).join(', ') }),
       input('split', 'What is this cost?', { type: 'radio_buttons', action_id: 'mktinv_v_split', options: splitOptions, ...(splitInitial ? { initial_option: splitInitial } : {}) }),
-      input('markets', 'Markets (only for "only the markets picked below")', { type: 'multi_static_select', action_id: 'mktinv_v_markets', options: marketOptions, ...(marketInitial.length ? { initial_options: marketInitial } : {}) }),
+      // 2026-10-19 (the user was unsure what "Hold at company level" does):
+      // say plainly that Hold parks the money and does NOT split it, and that
+      // this box is ignored for software, call center and by-issued-leads.
+      input('markets', 'Markets (only for "Lead source: only the markets picked below")', { type: 'multi_static_select', action_id: 'mktinv_v_markets', options: marketOptions, ...(marketInitial.length ? { initial_options: marketInitial } : {}) },
+        'Ignored for software, call center and "split by its issued leads". Pick one office to give it all the cost, several to split by their issued leads. "Hold at company level" parks the cost unassigned (not split) until you move it.'),
       input('remember', 'Remember', { type: 'checkboxes', action_id: 'mktinv_v_remember', options: [rememberOption], initial_options: [rememberOption] }),
     ],
   };
