@@ -281,7 +281,9 @@ export async function handleMarketingInvoiceInteraction(parsed, deps = {}) {
     fresh.vendor = vendor;
     const facts = { ...fresh.facts, invoice_number: patch.invoice_number ?? fresh.facts.invoice_number, period_start: patch.period_start ?? fresh.facts.period_start, period_end: patch.period_end ?? fresh.facts.period_end, total: fresh.rows.reduce((a, r) => a + Number(r.amount || 0), 0) };
     const flags = computeFlags({ vendor, facts, rows: fresh.rows.filter((r) => r.status === 'pending_review'), confidence: fresh.confidence, extraction: fresh.extraction, minConfidence: 0 });
-    const analysis = { ...(fresh.document.analysis || {}), facts, flags, vendor_method: 'edited', edited_by: who, edited_at: new Date().toISOString() };
+    // vendor_id too (2026-10-19): the dashboard's Invoices tab names the vendor from
+    // analysis.vendor_id, so a vendor picked or created in Edit read "unknown" there.
+    const analysis = { ...(fresh.document.analysis || {}), facts, flags, ...(vendor?.id ? { vendor_id: vendor.id } : {}), vendor_method: 'edited', edited_by: who, edited_at: new Date().toISOString() };
     await supabase.from('marketing_invoice_documents').update({ analysis, updated_at: new Date().toISOString() }).eq('id', documentId);
     const card = await renderCard({ ...fresh, facts, flags, vendorMethod: 'edited' }, { note: `Edited by ${userName}${notes.length ? ` · ${notes.join(' · ')}` : ''}` }, { ...deps, supabase });
     await updateCard(fresh, card, deps);

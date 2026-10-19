@@ -629,6 +629,7 @@ test('Edit adds a vendor that does not exist yet, sets "evenly across all office
   const row = supabase.tables.marketing_expenses[0];
   assert.equal(row.vendor_id, vendor.id);
   assert.deepEqual(row.eligible_markets, ['ALL_OFFICES']);
+  assert.equal(supabase.tables.marketing_invoice_documents.find((d) => d.id === r.document_id).analysis.vendor_id, vendor.id, 'the Invoices tab names the vendor (2026-10-19)');
   assert.match(JSON.stringify(updates.at(-1).blocks), /new vendor \\"Hatch\\" added/);
   const ok = await handleMarketingInvoiceInteraction(parsedClick('approve', r.document_id, { userId: 'U_BRAD', userName: 'brad' }), deps);
   assert.equal(ok.action, 'approved', 'no sub-source needed for an even split');
