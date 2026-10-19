@@ -589,6 +589,25 @@ export function registerMarketingInvoiceRoutes(app, deps = {}) {
     }
   });
 
+  // The dashboard's invoice view settles a dispute (2026-10-19): confirm the charge,
+  // record / change the credit received, or reopen it. The dashboard lets only an
+  // admin click and relays here; the Slack card is redrawn to match.
+  app.post('/n8n/admin/marketing-invoices/dispute', json, async (req, res) => {
+    try {
+      if (refuse(req, res)) return;
+      const documentId = String(req.body?.document_id || '');
+      if (!/^[0-9a-f-]{36}$/i.test(documentId)) return res.status(400).json({ success: false, error: 'document_id must be a uuid' });
+      const raw = req.body?.amount;
+      const amount = raw == null || raw === '' ? null : Number(raw);
+      if (amount != null && !Number.isFinite(amount)) return res.status(400).json({ success: false, error: 'amount must be a number' });
+      const { settleDisputeFromDashboard } = await import('../marketing/review-actions.js');
+      const out = await settleDisputeFromDashboard({ documentId, action: String(req.body?.action || ''), amount, by: req.body?.by || null }, deps);
+      res.status(out.ok ? 200 : 400).json({ success: out.ok, ...out, ...(out.ok ? {} : { error: out.message }) });
+    } catch (err) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
   // A PERSON applies a REECE_HOLD recommendation (handoff §7.5): the dashboard's
   // admin-only button relays here; the money never moves on its own.
   app.post('/n8n/admin/marketing-expenses/apply-recommendation', json, async (req, res) => {
@@ -618,5 +637,5 @@ export function registerMarketingInvoiceRoutes(app, deps = {}) {
     }
   });
 
-  console.log('[REST API] Registered: POST /n8n/admin/marketing-invoice-ingest | /marketing-expenses/import-csv | /marketing-expenses/reallocate | /marketing-expenses/apply-recommendation | GET /marketing-expenses/status');
+  console.log('[REST API] Registered: POST /n8n/admin/marketing-invoice-ingest | /marketing-expenses/import-csv | /marketing-expenses/reallocate | /marketing-expenses/apply-recommendation | /marketing-invoices/dispute | GET /marketing-expenses/status');
 }

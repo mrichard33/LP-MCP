@@ -1004,7 +1004,14 @@ Brad's XLSX (`marketing-cost-report`, formulas never typed values) read `v_marke
   (`replaceEarlierInvoice`: old lines `superseded`, allocations gone, `analysis.replaced_by`); **Confirm charge**
   (`mktinv_dispute_accept`, flag `dispute_accepted`, the whole line split by office); **Credit received**
   (`mktinv_dispute_credit`, the line's amount drops by the disputed part, flag `dispute_credited`, `analysis.credits`).
-  The nightly re-run shrinks a dispute on its own when the missing leads sync. Sales weights are WHOLE dollars, and the
+  The nightly re-run shrinks a dispute on its own when the missing leads sync.
+  **The dashboard's invoice view settles it too (the user, 2026-10-19: "update the credit received, confirm the
+  charge, or reopen a disputed amount").** `settleDispute` (`review-actions.js`) is the one routine for the Slack buttons
+  and `POST /n8n/admin/marketing-invoices/dispute {document_id, action: accept|credit|reopen, amount?, by}`
+  (`settleDisputeFromDashboard`, admin-only on the dashboard): a credit may be part of the disputed amount (the rest stays
+  Disputed), and the dashboard first undoes any earlier confirm or credit (`reset`), so a credit can be changed and a
+  reopen puts the line back to what was billed. `analysis.credits` holds the credits in force (`was` = billed),
+  `analysis.dispute_log` every action; the Slack card is redrawn and gets the same thread reply. Sales weights are WHOLE dollars, and the
   card prints every basis in words (`basisText`: "$41,827 of $179,513 in sales", "3 of 9 aged-lead demos", "12 of 40
   issued leads"), never "4182700/17951276 issued".
 - **A commission invoice line is one sale: it goes to that sale's office and month, and replaces the estimate (the
