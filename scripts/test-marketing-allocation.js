@@ -254,3 +254,57 @@ test('the thread reply names who decided and the money per market', () => {
   assert.equal(t, '✅ Approved by mark · $300.00\n• Fort Lauderdale: $198.00\n• Orlando: $102.00');
   assert.match(buildDecisionReply({ outcome: 'reopened', by: 'brad' }), /^🔓 Reopened by brad/);
 });
+
+// 2026-10-19, the user: LightFire is all call-center cost, and its canvass charge
+// goes to the offices whose canvass appointments it confirmed.
+import { fakeSupabase } from './lib/fake-supabase.js';
+test('a call-center canvass line splits by the offices whose canvass the call center confirmed', async () => {
+  const { allocateExpense, splitsByCanvassConfirms, splitKind } = await import('../src/marketing/allocation.js');
+  const canvass = { id: 'c', amount: 2910, period_start: '2026-08-23', period_end: '2026-08-31', description: 'Canvas', lp_sub_sources: ['Call Center'], eligible_markets: ['ALL_OFFICES'] };
+  const aged = { ...canvass, id: 'a', amount: 4250, description: 'Demos - AGED' };
+  assert.equal(splitsByCanvassConfirms(canvass), true);
+  assert.equal(splitsByCanvassConfirms(aged), false, 'aged demos stay an even call-center split');
+  assert.equal(splitsByCanvassConfirms({ ...canvass, lp_sub_sources: ['Canvass'], eligible_markets: [] }), false, 'a canvass lead source is not a call-center line');
+  assert.equal(splitKind(canvass), 'canvass_confirms');
+  const rows = allocateExpense(canvass, () => ({ FTMYR_MKT: 71, STPET_MKT: 41, SAR_MKT: 33, ORL_MKT: 31, JAX_MKT: 18 }));
+  assert.equal(rows.reduce((a, r) => a + Math.round(r.amount * 100), 0), 291000);
+  assert.deepEqual(rows.find((r) => r.market === 'FTMYR_MKT').amount, 1065, '71 of 194 × $15');
+  assert.ok(rows.every((r) => r.lp_sub_source === 'Call Center' && r.market !== 'FTLAU_MKT'));
+  const even = allocateExpense(aged, () => { throw new Error('an even split reads nothing'); });
+  assert.equal(even.length, 6);
+  const none = allocateExpense(canvass, () => ({}));
+  assert.deepEqual(none.map((r) => [r.market, r.rule]), [['REECE_HOLD', 'hold']]);
+  assert.match(none[0].note, /canvass confirmations 2026-08-23\.\.2026-08-31/);
+  assert.equal(splitLabel(canvass), '_call center canvass cost, split by the offices whose canvass appointments it confirmed_');
+  assert.equal(splitChoice(canvass), 'call_center');
+});
+
+test('canvass confirmations are the call center agents\' only, in the line\'s own days, by branch then assignment', async () => {
+  const { canvassConfirmsByMarketFor, previewAllocation } = await import('../src/marketing/allocation-io.js');
+  const supabase = fakeSupabase({
+    lp_leads: [
+      { lp_lead_id: '1', lp_branch_id: '10', lead_source: 'Canvass', lp_deleted_at: null, confirmed_by_name: 'Smith - LF, Ann', confirmed_date: '2026-08-23T14:00:00+00:00' },
+      { lp_lead_id: '2', lp_branch_id: '20', lead_source: 'Canvass Sticky', lp_deleted_at: null, confirmed_by_name: 'Jones - LF, Bo', confirmed_date: '2026-08-31T20:00:00+00:00' },
+      { lp_lead_id: '3', lp_branch_id: null, lead_source: 'Canvass', lp_deleted_at: null, confirmed_by_name: 'Lee - LF, Cy', confirmed_date: '2026-08-25T14:00:00+00:00' },
+      { lp_lead_id: '4', lp_branch_id: '10', lead_source: 'Canvass', lp_deleted_at: null, confirmed_by_name: 'Garner, Chris', confirmed_date: '2026-08-25T14:00:00+00:00' },
+      { lp_lead_id: '5', lp_branch_id: '10', lead_source: 'Canvass', lp_deleted_at: null, confirmed_by_name: 'Smith - LF, Ann', confirmed_date: '2026-09-01T14:00:00+00:00' },
+      { lp_lead_id: '6', lp_branch_id: '10', lead_source: 'Lead Gurus', lp_deleted_at: null, confirmed_by_name: 'Smith - LF, Ann', confirmed_date: '2026-08-25T14:00:00+00:00' },
+    ],
+    lp_branch_market_map: [{ brn_id: '10', market_code: 'FTMYR_MKT' }, { brn_id: '20', market_code: 'SAR_MKT' }],
+    lp_lead_market_assignments: [{ lead_id: '3', resolved_market_code: 'SAR_MKT' }],
+  });
+  assert.deepEqual(await canvassConfirmsByMarketFor({ from: '2026-08-23', to: '2026-08-31' }, { supabase }), { FTMYR_MKT: 1, SAR_MKT: 2 });
+  const rows = await previewAllocation({ id: 'c', amount: 30, period_start: '2026-08-23', period_end: '2026-08-31', description: '194 Canvas', lp_sub_sources: ['Call Center'], eligible_markets: ['ALL_OFFICES'] }, { supabase });
+  assert.deepEqual(rows.map((r) => [r.market, r.amount]), [['FTMYR_MKT', 10], ['SAR_MKT', 20]]);
+});
+
+test('a $0 line beside billed lines is dropped; an all-$0 invoice keeps its line', () => {
+  const vendor = { id: 'lf', vendor_name: 'LightFire Partners', lp_sub_sources: ['Call Center'], eligible_markets: ['ALL_OFFICES'] };
+  const facts = { invoice_number: '17734', total: 3812.07, period_start: '2026-08-16', period_end: '2026-08-31' };
+  const { rows } = buildExpenseRows({ document: { id: 'd' }, vendor, facts, analysis: { lines: [
+    { description: 'Demos - AGED', amount: 0 }, { description: 'Canvas', amount: 0 }, { description: 'Sales 1.5%', amount: 3812.07 },
+  ] } });
+  assert.deepEqual(rows.map((r) => [r.line_no, r.description, r.amount, r.lp_sub_sources, r.eligible_markets]), [[1, 'Sales 1.5%', 3812.07, ['Call Center'], ['ALL_OFFICES']]]);
+  const allZero = buildExpenseRows({ document: { id: 'd' }, vendor, facts, analysis: { lines: [{ description: 'Canvas', amount: 0 }] } });
+  assert.equal(allZero.rows.length, 1);
+});

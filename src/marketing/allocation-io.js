@@ -13,7 +13,8 @@
  * insert happen only after the rows exist in memory.
  */
 import supabaseDefault from '../supabase.js';
-import { allocateExpense, splitPeriodByMonth, splitsBySource, splitsEvenly, HOLD_MARKET } from './allocation.js';
+import { allocateExpense, splitPeriodByMonth, splitsBySource, splitsEvenly, splitsByCanvassConfirms, HOLD_MARKET } from './allocation.js';
+import { CANVASS_SOURCES, isLightFireAgent, lpStoredBounds } from '../payroll/rules.js';
 
 const LOG = '[MktAlloc]';
 
@@ -27,6 +28,46 @@ export async function issuedByMarketFor({ from, to, subSources = [] }, { supabas
     if (!r.market) continue;
     if (wanted.size && !wanted.has(r.lp_sub_source)) continue;
     out[r.market] = (out[r.market] || 0) + Number(r.issued || 0);
+  }
+  return out;
+}
+
+/**
+ * Canvass appointments the call center confirmed, per office, for one window
+ * (the user, 2026-10-19: a call center's canvass charge belongs to the offices
+ * it worked). The same leads payroll pays LightFire for (rules.js
+ * buildLightFireEvents: a canvass lead whose confirmer is an "- LF" agent,
+ * confirmed_date in the window), mapped to a market like mkt_issued_counts
+ * (branch map first, then the lead's market assignment). For the 8/23-8/31
+ * invoice this counted 194, the invoice's own "194 Canvas".
+ */
+export async function canvassConfirmsByMarketFor({ from, to }, { supabase = supabaseDefault } = {}) {
+  const b = lpStoredBounds({ start: from, end: to });
+  const leads = [];
+  for (let off = 0; ; off += 1000) {
+    const { data, error } = await supabase.from('lp_leads').select('lp_lead_id, lp_branch_id, confirmed_by_name')
+      .in('lead_source', CANVASS_SOURCES).is('lp_deleted_at', null)
+      .gte('confirmed_date', b.gte).lt('confirmed_date', b.lt)
+      .order('lp_lead_id').range(off, off + 999);
+    if (error) throw new Error(`canvass confirms read failed: ${error.message}`);
+    leads.push(...(data || []).filter((l) => isLightFireAgent(l.confirmed_by_name)));
+    if (!data || data.length < 1000) break;
+  }
+  if (!leads.length) return {};
+  const { data: branches, error: bErr } = await supabase.from('lp_branch_market_map').select('brn_id, market_code');
+  if (bErr) throw new Error(`branch map read failed: ${bErr.message}`);
+  const byBranch = new Map((branches || []).filter((r) => r.market_code).map((r) => [String(r.brn_id), r.market_code]));
+  const assigned = new Map();
+  const ids = leads.map((l) => l.lp_lead_id);
+  for (let i = 0; i < ids.length; i += 200) {
+    const { data, error } = await supabase.from('lp_lead_market_assignments').select('lead_id, resolved_market_code').in('lead_id', ids.slice(i, i + 200));
+    if (error) throw new Error(`market assignment read failed: ${error.message}`);
+    for (const r of data || []) if (r.resolved_market_code) assigned.set(String(r.lead_id), r.resolved_market_code);
+  }
+  const out = {};
+  for (const l of leads) {
+    const m = byBranch.get(String(l.lp_branch_id)) || assigned.get(String(l.lp_lead_id));
+    if (m) out[m] = (out[m] || 0) + 1;
   }
   return out;
 }
@@ -47,6 +88,11 @@ function monthLastDay(month) {
 export async function previewAllocation(expense, deps = {}) {
   const slices = splitPeriodByMonth(expense.period_start, expense.period_end, expense.amount);
   const counts = {};
+  if (splitsByCanvassConfirms(expense)) {
+    // The slice's own days, not its whole month: the invoice bills one week's confirmations.
+    for (const s of slices) counts[s.month] = await canvassConfirmsByMarketFor({ from: s.start, to: s.end }, deps);
+    return allocateExpense(expense, (month) => counts[month] || {});
+  }
   const holdOnly = (expense.eligible_markets || []).length === 1 && expense.eligible_markets[0] === HOLD_MARKET;
   if (!holdOnly && !splitsEvenly(expense) && ((expense.eligible_markets || []).length > 1 || splitsBySource(expense))) {
     for (const s of slices) {

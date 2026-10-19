@@ -37,6 +37,7 @@ export function marketLabel(code) {
 /** How a line's money is split, in plain words (2026-10-13). */
 export function splitLabel(row) {
   const k = splitKind(row);
+  if (k === 'canvass_confirms') return '_call center canvass cost, split by the offices whose canvass appointments it confirmed_';
   if (k === 'even') {
     const cat = costCategory(row);
     return cat ? `_${COST_CATEGORIES[cat].toLowerCase()} cost, split evenly across all offices_` : '_all offices, split evenly_';
@@ -61,6 +62,8 @@ export const SPLIT_OPTIONS = Object.freeze([
 /** The Edit form's option for a line as it stands (an unlabelled even split reads as software). */
 export function splitChoice(row) {
   const k = splitKind(row);
+  // A canvass line is call-center cost; choosing "call center" keeps its by-office split.
+  if (k === 'canvass_confirms') return 'call_center';
   if (k === 'even') return costCategory(row) || 'software';
   return k;
 }

@@ -113,7 +113,13 @@ export function buildExpenseRows({ document, vendor, facts, analysis, confidence
   const vendorSubs = vendor?.lp_sub_sources || [];
   const vendorMarkets = vendor?.eligible_markets || [];
   const lineProblems = [];
-  const lines = (analysis?.lines || []).filter((l) => l && l.amount != null);
+  let lines = (analysis?.lines || []).filter((l) => l && l.amount != null);
+  // A $0 line next to billed ones bills nothing (LightFire 17734: "0 Demos -
+  // AGED 0.00", "0 Canvas 0.00" above "Sales 3,812.07", 2026-10-19). Kept, it
+  // blocked Approve ("amount is $0 — Edit first") and Edit can fix an amount
+  // only on a one-line invoice. An invoice whose lines are ALL $0 keeps them
+  // (the missing_total path).
+  if (lines.some((l) => Number(l.amount) !== 0)) lines = lines.filter((l) => Number(l.amount) !== 0);
   const src = lines.length ? lines : [{ description: facts.description || 'Invoice total', amount: facts.total, lp_sub_source: null, markets: [], market_evidence: null }];
 
   // A vendor split evenly over every office (call center, software) keeps that

@@ -958,6 +958,14 @@ Brad's XLSX (`marketing-cost-report`, formulas never typed values) read `v_marke
   **The ingest route has its own 40 MB body parser, mounted BEFORE the global `express.json()` (2026-10-19).** A PDF
   arrives base64 in JSON; the global 100 kB default answered 413 to all six LightFire invoices (~390 KB each) before
   the route's own parser ever ran (`invoiceBodyParser` / `INVOICE_INGEST_PATH`, `scripts/test-marketing-invoice-body-limit.js`).
+- **LightFire is call-center cost; its canvass charge goes to the offices it confirmed for (the user, 2026-10-19).**
+  Vendor "LightFire Partners" (`sql/seeds/2026-10-19_lightfire_call_center_vendor.sql`) is Call Center, split evenly,
+  for "Demos - AGED" and "Sales 1.5%". A call-center line whose description names canvass ("61 Canvas", $15 a
+  confirmation) is split by the canvass appointments LightFire's "- LF" agents confirmed per office in the line's own
+  days (`splitsByCanvassConfirms`, `canvassConfirmsByMarketFor`: the payroll rule's leads; 8/23-8/31 counted 194, the
+  invoice's 194), still under "Call Center"; none yet → REECE_HOLD with a note, re-run nightly, never a hold
+  recommendation. Read from the description, so an Edit to "call center cost" keeps it. A $0 line beside billed lines
+  is dropped at build (`buildExpenseRows`): kept, it blocked Approve on a multi-line invoice Edit could not fix.
 - **Only Mark or Brad decides (D6).** The card in `SLACK_MKT_INVOICE_CHANNEL_ID` carries `mktinv_approve` /
   `mktinv_edit` / `mktinv_reject`; `isMarketingInvoiceAction` in `src/slack-approvals-core.js` catches those clicks AND
   the Edit modal's `view_submission` so they are never relayed to onboarding (which would read them as a member
