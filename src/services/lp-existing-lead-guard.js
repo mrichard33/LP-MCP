@@ -88,6 +88,9 @@ export function pickNewestLead(leads) {
     lpSourceDetail: best.sourcesubdescr || null,
     disposition: best.disposition || null,
     createdAtLp: leadDate(best),
+    // Eastern wall clock, like createdAtLp. Inbound capture reads it to tell an
+    // old lead an agent just worked for the call (2026-10-19).
+    lastChangedOn: best.lastchangedon || best.LastChangedOn || null,
   };
 }
 

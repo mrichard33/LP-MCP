@@ -23,8 +23,15 @@
  * decideLeadMatch is pure; readLeadMatch owns the reads behind a deps seam.
  */
 
+import { etOffsetMinutes } from './appointment-dates.js';
+
 export const MATCH_WINDOW_DAYS = 15;
 const DAY_MS = 24 * 60 * 60 * 1000;
+// A lead LP changed from this long before the call onward was worked FOR this
+// call. 2026-10-19: 9419281328 called the Gwinnett newspaper line and the agent
+// set the visit on the caller's 2023 lead (226131) a minute after the call. By
+// entry date alone that is a "returning caller" and a duplicate lead.
+export const WORKED_BEFORE_CALL_MS = 60 * 60 * 1000;
 // GHL "LP Lead ID" — 8e30ff37's first step skips any contact that has one.
 export const LP_LEAD_ID_FIELD = 'GmAVmW6V9sekD7pVONKr';
 
@@ -35,6 +42,28 @@ const ms = (v) => {
   const t = Date.parse(v);
   return Number.isFinite(t) ? t : null;
 };
+
+/** An LP time to the true instant. A string with a zone (the SQL read has
+ *  already converted it) parses as is; LP live's bare digits are Eastern wall
+ *  clock, which matters here because the "worked for this call" test is
+ *  minutes, not days. */
+export function lpTimeMs(v) {
+  if (v == null || v === '') return null;
+  const s = String(v).trim();
+  if (/(Z|[+-]\d{2}(:?\d{2})?)$/i.test(s)) return ms(s);
+  const m = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?/.exec(s);
+  if (!m) return ms(s);
+  const wall = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +(m[6] || 0));
+  let off = etOffsetMinutes(new Date(wall));
+  const refined = etOffsetMinutes(new Date(wall - off * 60000));
+  if (refined !== off) off = refined;
+  return wall - off * 60000;
+}
+
+function workedForCall(changedAt, callAtMs) {
+  const t = lpTimeMs(changedAt);
+  return t != null && Number.isFinite(callAtMs) && t >= callAtMs - WORKED_BEFORE_CALL_MS;
+}
 
 /**
  * @param {object} p
@@ -63,10 +92,12 @@ export function decideLeadMatch({
   }
 
   const known = (supabaseLeads || [])
-    .map((l) => ({ kind: 'lead', lead_id: String(l.lp_lead_id), prospect_id: l.lp_prospect_id ? String(l.lp_prospect_id) : null, at: l.created_at_lp || null, t: ms(l.created_at_lp) }))
+    .map((l) => ({ kind: 'lead', lead_id: String(l.lp_lead_id), prospect_id: l.lp_prospect_id ? String(l.lp_prospect_id) : null, at: l.created_at_lp || null, t: ms(l.created_at_lp), changed: l.updated_at_lp || null }))
     .sort((a, b) => (b.t ?? Infinity) - (a.t ?? Infinity));
   const recentKnown = known.find((l) => recent(l.t));
   if (recentKnown) return { verdict: 'reuse', lead: strip(recentKnown), why: `LP lead from ${dayOf(recentKnown.at)} (within ${windowDays} days)` };
+  const workedKnown = known.find((l) => workedForCall(l.changed, callAtMs));
+  if (workedKnown) return { verdict: 'reuse', lead: strip(workedKnown), why: 'an older LP lead was worked in LP for this call' };
 
   // A lead id on the contact that Supabase does not have: its date is unknown
   // unless LP live names it.
@@ -80,6 +111,8 @@ export function decideLeadMatch({
     const t = ms(live.createdAtLp);
     const lead = { kind: 'lead', lead_id: String(live.ldsId), prospect_id: live.prospectId ? String(live.prospectId) : null, at: live.createdAtLp || null };
     if (recent(t)) return { verdict: 'reuse', lead, why: `LP lead from ${dayOf(lead.at)} (within ${windowDays} days)` };
+    // lp_leads can lag LP by minutes: the agent's change may be live only.
+    if (workedForCall(live.lastChangedOn, callAtMs)) return { verdict: 'reuse', lead, why: 'an older LP lead was worked in LP for this call' };
   }
   if (ghlUnknown && !(live && String(live.ldsId) === ghlId)) {
     // Neither Supabase nor LP's phone search can date it: treat it as new
@@ -95,7 +128,7 @@ export function decideLeadMatch({
 }
 
 function strip(l) {
-  const { t, ...rest } = l;
+  const { t, changed, ...rest } = l;
   return rest;
 }
 function dayOf(at) {
@@ -117,7 +150,8 @@ export async function readLeadMatch({ phone10, callAtMs, ghlLeadId = '' }, deps 
   try {
     const rows = await deps.runSQL(`
       SELECT lp_lead_id::text AS lp_lead_id, lp_prospect_id::text AS lp_prospect_id,
-             ((created_at_lp AT TIME ZONE 'UTC') AT TIME ZONE 'America/New_York') AS created_at_lp
+             ((created_at_lp AT TIME ZONE 'UTC') AT TIME ZONE 'America/New_York') AS created_at_lp,
+             ((updated_at_lp AT TIME ZONE 'UTC') AT TIME ZONE 'America/New_York') AS updated_at_lp
         FROM lp_leads
        WHERE lp_deleted_at IS NULL
          AND (right(regexp_replace(coalesce(phone, ''::text), '[^0-9]'::text, ''::text, 'g'::text), 10) = ${q(phone10)}
