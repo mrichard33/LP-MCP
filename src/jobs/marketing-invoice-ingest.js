@@ -44,7 +44,8 @@ import { allocateExpenseById, reallocateMonth, reconcileAllocations } from '../m
 import { trueUpInvoice } from '../marketing/leadgurus-feed.js';
 import { buildReviewCard, buildDecisionReply, disputedTotal } from '../marketing/slack-review.js';
 import { callCenterLineKind } from '../marketing/allocation.js';
-import { previewRows, reviewChannelId, signedOriginalLink, replaceEarlierInvoice } from '../marketing/review-actions.js';
+import { previewRows, reviewChannelId, signedOriginalLink, replaceEarlierInvoice, refreshEstimatesFor } from '../marketing/review-actions.js';
+import { matchCommissionInvoiceRows } from '../marketing/commission-invoice.js';
 
 const LOG = '[MktInvoice]';
 export const INVOICES_BUCKET = 'marketing-invoices';
@@ -360,9 +361,13 @@ export async function ingestInvoice(body, deps = {}) {
   //    (a missing period or total is flagged); the rows are then made
   //    insertable (fillRowDefaults) so the card can exist and Edit can fix them.
   const built = buildExpenseRows({ document: { id: documentId }, vendor: a.vendor, facts: a.facts, analysis: a.ai, confidence: a.confidence });
+  // 2026-10-19: a commission vendor's line is one sale; it goes to that sale's
+  // office and month, found in LP, never to the city on the vendor's letterhead.
+  const sales = await (deps.matchSales || matchCommissionInvoiceRows)({ rows: built.rows, lines: built.lines, vendor: a.vendor }, { ...deps, supabase });
+  built.rows = sales.rows;
   const history = await vendorHistory(supabase, a.vendor, a.facts);
   const flags = computeFlags({
-    vendor: a.vendor, facts: a.facts, rows: built.rows, lineProblems: built.lineProblems, confidence: a.confidence, disagreements: a.disagreements,
+    vendor: a.vendor, facts: a.facts, rows: built.rows, lineProblems: [...built.lineProblems, ...sales.flags], confidence: a.confidence, disagreements: a.disagreements,
     extraction: extracted.meta, trailingAvg: history.trailingAvg, possibleDuplicate: history.possibleDuplicate, minConfidence: cfg.minConfidence,
   });
   if (a.guard && a.guard.verdict && a.guard.verdict !== 'clean') flags.push('text_flagged_by_guardrail');
@@ -378,6 +383,7 @@ export async function ingestInvoice(body, deps = {}) {
     guard: a.guard ? { verdict: a.guard.verdict, score: a.guard.score, mode: a.guard.mode } : null,
     history: { prior_approvals: history.priorApprovals, trailing_avg: history.trailingAvg },
     assumed: filled.assumed, auto_approved: autoApproved,
+    ...(sales.matches.length ? { sale_matches: sales.matches } : {}),
   };
   await supabase.from('marketing_invoice_documents').update({ analysis, analyzer: a.analyzer, status: 'analyzed', error: null, updated_at: now().toISOString() }).eq('id', documentId);
 
@@ -403,6 +409,7 @@ export async function ingestInvoice(body, deps = {}) {
     for (const id of expenseIds) await allocate(id, { supabase });
     // A revised invoice replaces the original, auto-approved or not (2026-10-19).
     await (deps.replaceEarlier || replaceEarlierInvoice)({ documentId, rows: rows.map((r, i) => ({ ...r, id: expenseIds[i] })), by: 'auto', now: ts }, { ...deps, supabase });
+    await (deps.refreshEstimates || refreshEstimatesFor)(rows, { ...deps, supabase });
     let trueUp = null;
     if (a.vendor?.default_cost_type === 'feed') {
       const { data: approvedRows } = await supabase.from('marketing_expenses').select('*').in('id', expenseIds);

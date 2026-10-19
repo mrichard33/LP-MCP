@@ -414,6 +414,7 @@ export async function handleMarketingInvoiceInteraction(parsed, deps = {}) {
   const allocate = deps.allocate || allocateExpenseById;
   for (const r of pending) await allocate(r.id, { supabase });
   const replaced = await (deps.replaceEarlier || replaceEarlierInvoice)({ documentId, rows: pending, by: who, now }, { ...deps, supabase });
+  await (deps.refreshEstimates || refreshEstimatesFor)(pending, { ...deps, supabase });
   let trueUp = null;
   if (ctx.vendor?.default_cost_type === 'feed') {
     const approved = pending.map((r) => ({ ...r, status: 'approved' }));
@@ -466,6 +467,32 @@ export async function replaceEarlierInvoice({ documentId, rows, by, now }, deps 
     return { invoice_number: invoiceNumber, documents: docs, lines: older.length, amount };
   } catch (err) {
     console.warn(`${LOG} replacing earlier invoice #${invoiceNumber} failed: ${err.message}`);
+    return null;
+  }
+}
+
+/**
+ * The invoice replaces the estimate (the user, 2026-10-19). Once lines that
+ * carry a commission rule's sub-source are approved, the months they sit in are
+ * recomputed so the 15% estimate steps aside for them at once, not at the next
+ * report 133 or nightly run (which only reaches the current and prior month; a
+ * LeadPilot sale is often older). Best effort: the approval already stands.
+ */
+export async function refreshEstimatesFor(rows, deps = {}) {
+  const supabase = deps.supabase || supabaseDefault;
+  try {
+    const { data: rules } = await supabase.from('marketing_cost_rules').select('lp_sub_sources');
+    const ruled = new Set((rules || []).flatMap((r) => r.lp_sub_sources || []));
+    const months = [...new Set((rows || [])
+      .filter((r) => (r.lp_sub_sources || []).some((s) => ruled.has(s)) && r.period_start)
+      .map((r) => `${String(r.period_start).slice(0, 7)}-01`))];
+    if (!months.length) return [];
+    const { recomputeCalculatedCosts } = await import('./commission.js');
+    const out = [];
+    for (const m of months) out.push(await (deps.recompute || recomputeCalculatedCosts)(m, { supabase }));
+    return out;
+  } catch (err) {
+    console.warn(`${LOG} estimate refresh after approval failed: ${err.message}`);
     return null;
   }
 }

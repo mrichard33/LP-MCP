@@ -34,7 +34,7 @@ export async function issuedByMarketFor({ from, to, subSources = [] }, { supabas
 }
 
 /** Market per LP lead id, as mkt_issued_counts maps one: the branch map, then the lead's assignment. */
-async function marketsForLeads(leadIds, { supabase = supabaseDefault } = {}) {
+export async function marketsForLeads(leadIds, { supabase = supabaseDefault } = {}) {
   const ids = [...new Set((leadIds || []).filter(Boolean).map(String))];
   const out = new Map();
   if (!ids.length) return out;

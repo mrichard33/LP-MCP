@@ -993,6 +993,19 @@ Brad's XLSX (`marketing-cost-report`, formulas never typed values) read `v_marke
   The nightly re-run shrinks a dispute on its own when the missing leads sync. Sales weights are WHOLE dollars, and the
   card prints every basis in words (`basisText`: "$41,827 of $179,513 in sales", "3 of 9 aged-lead demos", "12 of 40
   issued leads"), never "4182700/17951276 issued".
+- **A commission invoice line is one sale: it goes to that sale's office and month, and replaces the estimate (the
+  user, 2026-10-19).** LeadPilot INV-000088 ("David Shadlick $68,000 … Sold on 09/14/2025") landed on Fort Lauderdale
+  from LeadPilot's own letterhead (West Palm Beach); the sale was David Shadick's (Prospect 449431), an Orlando lead,
+  contract 8/26/2026. "If the lead wasn't created in Fort Lauderdale, it shouldn't use Lead Pilot's office address. We
+  need to locate that lead in Lead Perfection if it isn't in our database." For a vendor with `default_cost_type`
+  'calculated', `matchCommissionInvoiceRows` (`src/marketing/commission-invoice.js`) finds each line's sale: the
+  vendor's sub-source + the sale amount (printed, else line ÷ the rule's rate), confirmed by `nameMatches` (one typo
+  allowed; a same-price stranger is refused), in lp_jobs / lp_leads, then LP live (`GetCustomers3` on the surname's first
+  four letters, at most 5 `GetLead`s). Found → the lead's market and the CONTRACT month (report 133's month), with
+  "LP: Prospect N, name, office, sold date" on the line; not found → the vendor's own markets and flag `sale_not_found`.
+  The vendor's printed city is never a market for these lines. `buildCommissionRows` subtracts approved invoice lines on
+  ONE market in that month (`invoicedByCell`, "less $X invoiced", never below 0), and approving such lines recomputes
+  their months at once (`refreshEstimatesFor`; the nightly reaches only the current and prior month).
 - **Only Mark or Brad decides (D6).** The card in `SLACK_MKT_INVOICE_CHANNEL_ID` carries `mktinv_approve` /
   `mktinv_edit` / `mktinv_reject`; `isMarketingInvoiceAction` in `src/slack-approvals-core.js` catches those clicks AND
   the Edit modal's `view_submission` so they are never relayed to onboarding (which would read them as a member

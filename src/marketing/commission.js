@@ -28,8 +28,31 @@ export function isEstimateRule(rule) {
   return /_estimate$/.test(String(rule?.basis || ''));
 }
 
-/** Pure: the rows a month's rules × dollars imply. */
-export function buildCommissionRows({ month, rules, dollars, vendors = [] }) {
+/**
+ * Pure: approved invoice dollars per "market|sub-source" for one month (the
+ * user, 2026-10-19: "have the invoice replace the estimate"). Only a line that
+ * sits on ONE market with its period inside the month counts: a per-sale
+ * commission line is matched to its sale and booked in that sale's office and
+ * contract month (commission-invoice.js), the same cell the estimate fills.
+ */
+export function invoicedByCell(invoices = [], month) {
+  const { start, end } = monthBounds(month);
+  const out = {};
+  for (const r of invoices) {
+    if (r.cost_type !== 'invoice' || r.status !== 'approved') continue;
+    if (!(r.period_start >= start && r.period_start <= end)) continue;
+    const markets = r.eligible_markets || [];
+    if (markets.length !== 1) continue;
+    for (const sub of r.lp_sub_sources || []) {
+      const k = `${markets[0]}|${sub}`;
+      out[k] = Math.round(((out[k] || 0) + Number(r.amount || 0)) * 100) / 100;
+    }
+  }
+  return out;
+}
+
+/** Pure: the rows a month's rules × dollars imply, less what was already invoiced. */
+export function buildCommissionRows({ month, rules, dollars, vendors = [], invoiced = {} }) {
   const { start, end } = monthBounds(month);
   const rows = [];
   for (const rule of rules) {
@@ -43,10 +66,15 @@ export function buildCommissionRows({ month, rules, dollars, vendors = [] }) {
       for (const d of dollars) {
         if (d.lp_sub_source !== sub || !/_MKT$/.test(String(d.market || ''))) continue;
         const net = Number(d.net || 0);
-        const amount = Math.round(Number(rule.rate) * net * 100) / 100;
+        const full = Math.round(Number(rule.rate) * net * 100) / 100;
+        // The vendor's own invoice for these sales replaces the estimate: the
+        // rule keeps only what is not invoiced yet, never below zero.
+        const billed = invoiced[`${d.market}|${sub}`] || 0;
+        const amount = Math.max(0, Math.round((full - billed) * 100) / 100);
+        const less = billed > 0 ? `, less $${billed.toLocaleString('en-US', { minimumFractionDigits: 2 })} invoiced` : '';
         rows.push({
           vendor_id: vendor?.id ?? null, cost_type: 'calculated',
-          description: `${rule.label}: ${(Number(rule.rate) * 100).toFixed(rule.rate < 0.01 ? 2 : 0)}% × net $${net.toLocaleString('en-US', { minimumFractionDigits: 2 })} (${sub}, ${d.market})${estimate && !/estimate/i.test(rule.label || '') ? ' (estimate until canvasser payroll)' : ''}`,
+          description: `${rule.label}: ${(Number(rule.rate) * 100).toFixed(rule.rate < 0.01 ? 2 : 0)}% × net $${net.toLocaleString('en-US', { minimumFractionDigits: 2 })} (${sub}, ${d.market})${less}${estimate && !/estimate/i.test(rule.label || '') ? ' (estimate until canvasser payroll)' : ''}`,
           amount, period_start: start, period_end: end,
           lp_sub_sources: [sub], eligible_markets: [d.market],
           status: 'approved', provisional: estimate,
@@ -67,19 +95,25 @@ export function buildCommissionRows({ month, rules, dollars, vendors = [] }) {
 export async function recomputeCalculatedCosts(month, deps = {}) {
   const supabase = deps.supabase || supabaseDefault;
   const { start } = monthBounds(month);
-  const [{ data: rules, error: rErr }, { data: dollars, error: dErr }, { data: vendors }] = await Promise.all([
+  const { end } = monthBounds(month);
+  const [{ data: rules, error: rErr }, { data: dollars, error: dErr }, { data: vendors }, { data: invoices, error: iErr }] = await Promise.all([
     supabase.from('marketing_cost_rules').select('*'),
     supabase.rpc('mkt_sales_dollars', { p_month: start }),
     supabase.from('marketing_vendors').select('id, vendor_name, lp_sub_sources, default_cost_type'),
+    supabase.from('marketing_expenses').select('cost_type, status, amount, period_start, eligible_markets, lp_sub_sources')
+      .eq('cost_type', 'invoice').eq('status', 'approved').gte('period_start', start).lte('period_start', end),
   ]);
   if (rErr) throw new Error(`marketing_cost_rules read failed: ${rErr.message}`);
   if (dErr) throw new Error(`mkt_sales_dollars failed: ${dErr.message}`);
+  // An unread invoice list would put the estimate back on top of the invoice:
+  // stop rather than double count.
+  if (iErr) throw new Error(`invoiced read failed: ${iErr.message}`);
   const out = { month: start, rules: (rules || []).length, dollars_rows: (dollars || []).length, inserted: 0, updated: 0, unchanged: 0, zeroed: 0 };
   if (!(dollars || []).length) {
     console.warn(`${LOG} ${start}: no 133 snapshot for this month — nothing computed`);
     return { ...out, skipped: 'no_snapshot' };
   }
-  const wanted = buildCommissionRows({ month: start, rules: rules || [], dollars: dollars || [], vendors: vendors || [] });
+  const wanted = buildCommissionRows({ month: start, rules: rules || [], dollars: dollars || [], vendors: vendors || [], invoiced: invoicedByCell(invoices || [], start) });
   const { data: existing, error: eErr } = await supabase.from('marketing_expenses').select('id, source_ref, amount, status, provisional, flags')
     .eq('source_system', COMMISSION_SOURCE).eq('period_start', start);
   if (eErr) throw new Error(`marketing_expenses read failed: ${eErr.message}`);

@@ -160,7 +160,7 @@ export function buildExpenseRows({ document, vendor, facts, analysis, confidence
       match_confidence: confidence,
     };
   });
-  return { rows, lineProblems: [...new Set(lineProblems)] };
+  return { rows, lines: src, lineProblems: [...new Set(lineProblems)] };
 }
 
 /**
@@ -225,4 +225,6 @@ export const FLAG_LABELS = Object.freeze({
   [FLAGS.UNKNOWN_SUB_SOURCE]: 'A line names a sub-source this vendor does not have',
   // 2026-10-19: set at ingest from the allocation preview, not by computeFlags.
   billed_more_than_found: 'Billed for more than we can find: approving accepts it as received and parks the difference as Disputed',
+  // 2026-10-19: set at ingest by commission-invoice.js.
+  sale_not_found: 'A commission line\'s sale was not found in LP (check the customer name and amount); it is split by this source\'s leads until fixed',
 });
