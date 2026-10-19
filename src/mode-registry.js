@@ -279,7 +279,7 @@ export const MODES = Object.freeze([
   }),
   m('INBOUND_CAPTURE_MODE', 'intake', 'enum', ['off', 'shadow', 'approval', 'live'], 'shadow', { live: ['approval', 'live'], shadow: ['shadow'], off: ['off'] }, {
     since: '2026-09-27', evidence: job('inbound-caller-capture'),
-    note: 'Captures inbound callers as leads. In live, INBOUND_CAPTURE_DNC_LIFT=on (default off, 2026-10-18) lifts a DNC caller first and creates the lead once the lift finished.',
+    note: 'Captures inbound callers as leads. In live, INBOUND_CAPTURE_DNC_LIFT=on (default off, 2026-10-18) lifts a DNC caller first and creates the lead once the lift finished. Since 2026-10-19 a caller is captured 15 min after the call (INBOUND_CAPTURE_WAIT_MIN; INBOUND_CAPTURE_INSTANT=off for hourly only) and matched to an existing lead first.',
   }),
   m('MISSED_CALLER_RECOVERY_MODE', 'intake', 'enum', OSL, 'shadow', OSL_S, {
     since: '2026-09-24', evidence: job('missed-caller-recovery'),

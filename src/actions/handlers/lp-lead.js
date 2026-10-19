@@ -288,7 +288,7 @@ function resolveNotes(payload, ghlContact, contactId, hasAppointment) {
  * header of src/services/lp-existing-lead-guard.js. Throws on an LP error so
  * the caller fails open.
  */
-async function findExistingLpLead(phone, { calculatorOnly = false } = {}) {
+export async function findExistingLpLead(phone, { calculatorOnly = false } = {}) {
   const prospects = await getCustomers3({ phone }, { fast: true });
   const list = (Array.isArray(prospects) ? prospects : [prospects]).filter(Boolean);
   const leads = [];

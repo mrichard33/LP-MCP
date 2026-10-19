@@ -872,6 +872,22 @@ Sub-Source; "Main Number" (hundreds of local numbers) is Reece Call In (91). The
 called wins over an older source), reads them back, and does not enroll if they did not stick. A number not in the
 table is `unmapped_number`: listed, never sent. Add a new tracking number to the table; never widen the chatbot backfill.
 
+**A caller is captured 15 minutes after the call, and matched to their lead first (the user, 2026-10-19).** The end of
+a call (Five9's disposition webhook) starts a timer per caller (`scheduleCaptureForCall`, `src/jobs/inbound-caller-capture.js`);
+16 minutes later a FRESH pass runs for that caller, and a fresh pass every 5 minutes, 24/7, catches a timer a deploy lost.
+A fresh pass skips calls a pass already stored before any GHL or LP read; the hourly full pass (08:00-20:00 ET) still
+re-checks stored ones. The 15 minutes (`INBOUND_CAPTURE_WAIT_MIN`) are the agent's turn: 202 of 222 inbound callers
+agents entered in 30 days were in LP within 5 minutes of the call ending, 207 within 15. `INBOUND_CAPTURE_INSTANT=off`
+restores hourly only. The view `v_new_callers_no_lp_30d` is no longer read (~20s a pass, and it drops any phone with an
+LP lead EVER): `buildCallersSql` has its filters, drops only a caller with a lead from the 15 days before the call, and
+`src/inbound-capture-match.js` decides the rest (option B): an LP inquiry still waiting to be checked out, or a lead
+from the last 15 days, is the caller's lead (`already_in_lp`, nothing created); only older leads make a returning
+caller, captured as a NEW lead. It reads lp_leads (by phone, alt phone, the contact's LP Lead ID), `lp_inbound_queue`,
+then LP live by phone (`findExistingLpLead`, exported from lp-lead.js) when those settled nothing: lp_leads holds 16% of
+February's and 5% of April's leads. A failed read is `unverified`, never "no lead". 8e30ff37 skips any contact whose LP
+Lead ID is filled ("Already Sent to LP?"), so a returning caller's old id is cleared, read back and noted on the contact
+right before the enrollment (`clearOldLeadId`); one that will not clear is not sent.
+
 **Every LP sale gets a P2 card, even when LP's webhook does not arrive (2026-10-03).** A P2 (Client
 Lifecycle) card is built only by LP's outbound webhook → GHL I.LP-IN (adds `deal-won`) → C.0-IN (P1 Sale
 Recorded + P2 Contract Signed, valued from LP Gross Sale Amount). LP's webhook all but stopped on 2026-09-24,

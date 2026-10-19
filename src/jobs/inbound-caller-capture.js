@@ -63,11 +63,35 @@
 //   without it there is no idempotency record, so nothing may be created.
 //
 // SCHEDULE
-//   hourly 08:00–20:00 ET  the action pass, calls from the last
-//                          INBOUND_CAPTURE_LOOKBACK_HOURS (48).
-//   daily 07:15 ET         the summary: the whole 30-day view, labelled, posted
-//                          to the ops channel. After lead-leak's 07:00. Never acts.
-//   Both run under one job id (runJob occurrence keys keep them apart).
+//   15 min after the call  the end of the call (Five9's disposition webhook,
+//                          src/five9-events.js → scheduleCaptureForCall) starts a
+//                          timer; when it fires, a FRESH pass runs for that
+//                          caller (the user, 2026-10-19: "triggered by the
+//                          caller"). The wait (INBOUND_CAPTURE_WAIT_MIN, 15) lets
+//                          the agent enter the lead first: of 222 inbound callers
+//                          agents entered in 30 days, 202 were in LP within 5
+//                          minutes of the call ending and 207 within 15.
+//   every 5 min, 24/7      the same FRESH pass for every call at least 15 min
+//                          old that no pass has stored yet: the backstop for a
+//                          timer a deploy lost. A fresh pass classifies only
+//                          new calls, so it costs one GHL read per new caller.
+//   hourly                 the FULL pass over INBOUND_CAPTURE_LOOKBACK_HOURS (48),
+//                          which re-checks calls already stored (an `unverified`
+//                          one, a lift still pending).
+//   daily 07:15 ET         the summary: the last 30 days, labelled. Never acts.
+//   INBOUND_CAPTURE_INSTANT=off restores the hourly 08:00–20:00 ET pass only.
+//   All run under one job id (runJob occurrence keys keep them apart).
+//
+// MATCHING TO AN EXISTING LEAD (the user, 2026-10-19, option B)
+//   A caller's newest LP lead, or an LP inquiry still waiting to be checked
+//   out, from the last 15 days is their lead: nothing is created
+//   (`already_in_lp`). Older leads only → a returning homeowner, captured as a
+//   NEW lead. src/inbound-capture-match.js reads Supabase, LP's inbound queue,
+//   the contact's LP Lead ID and, when those settle nothing, LP live by phone
+//   (lp_leads is missing most leads before August 2026). Workflow 8e30ff37
+//   skips any contact whose LP Lead ID is filled ("Already Sent to LP?"), so a
+//   returning caller's old id is cleared, read back and noted on the contact
+//   right before the enrollment.
 //
 // ENDPOINT
 //   GET|POST /api/lp/inbound-capture → the classified list. Never creates, never
@@ -90,14 +114,18 @@ import { enrollLpLeadCreation as defaultEnroll } from '../admin/lp-force-addlead
 import { runJob } from '../job-runner.js';
 import { captureSourceFor, LP_SOURCE_ID_FIELD, PRO_ID_FIELD } from '../inbound-capture-source.js';
 import { hourET, todayET } from './lp-report-common.js';
+import { readLeadMatch } from '../inbound-capture-match.js';
 import { alertDigestEnabled } from '../alert-posted.js';
 import {
   classifyCaller, isCandidate, normalizeCallerPhone, summarizeCallers, formatDailySummary, isAppointmentSet,
-  notALeadReason, readCustomField, pendingLiftStep, LIFT_REQUEUE_AFTER_MS,
+  notALeadReason, readCustomField, pendingLiftStep, LIFT_REQUEUE_AFTER_MS, LP_LEAD_ID_FIELD,
 } from '../inbound-caller-classify.js';
 
 export const JOB_ID = 'inbound-caller-capture';
 export const TABLE = 'inbound_capture_daily';
+// 2026-10-19: no longer read. The view drops any phone with an LP lead EVER,
+// which option B (a lead older than 15 days is a returning caller) cannot use,
+// and it took ~20s a pass. buildCallersSql below is the same filters.
 export const VIEW = 'v_new_callers_no_lp_30d';
 export const ACTION_TYPE = 'capture_inbound_caller';
 export const RULE_APPLIED = 'INBOUND_CALLER_CAPTURE';
@@ -138,19 +166,34 @@ export function dncLiftEnabled(env = process.env) {
   return captureMode(env) === 'live' && String(env.INBOUND_CAPTURE_DNC_LIFT ?? '').trim().toLowerCase() === 'on';
 }
 
+/** INBOUND_CAPTURE_INSTANT: anything but `off` is on. Pure. */
+export function instantEnabled(env = process.env) {
+  return String(env.INBOUND_CAPTURE_INSTANT ?? '').trim().toLowerCase() !== 'off';
+}
+
 export function captureConfig(env = process.env) {
   return {
     mode: captureMode(env),
     dncLift: dncLiftEnabled(env),
+    instant: instantEnabled(env),
+    // Minutes after the call before anything is decided (the agent's turn).
+    waitMin: positiveInt(env.INBOUND_CAPTURE_WAIT_MIN, 15),
     lookbackHours: positiveInt(env.INBOUND_CAPTURE_LOOKBACK_HOURS, 48),
     // Blank → the ops channel the other monitors report to (#ops-alerts).
     slackChannel: String(env.INBOUND_CAPTURE_SLACK_CHANNEL ?? '').trim() || opsChannelId(),
   };
 }
 
+async function defaultFindExistingLpLead(phone10) {
+  const { findExistingLpLead } = await import('../actions/handlers/lp-lead.js');
+  return findExistingLpLead(phone10);
+}
+
 function resolveDeps(deps = {}) {
+  const runSQL = deps.runSQL || defaultRunSQL;
   return {
-    runSQL: deps.runSQL || defaultRunSQL,
+    runSQL,
+    matchLead: deps.matchLead || ((p) => readLeadMatch(p, { runSQL, findExistingLpLead: deps.findExistingLpLead || defaultFindExistingLpLead })),
     db: deps.supabase || defaultSupabase,
     checkDnc: deps.checkDnc || defaultCheckDnc,
     ghlFetch: deps.ghlFetch || defaultGhlFetch,
@@ -168,14 +211,60 @@ const asRows = (res, what) => {
   return res;
 };
 
-/** The view, optionally narrowed to calls since `sinceMs`. Newest first. */
-async function readCallers({ runSQL, sinceMs }) {
-  const where = sinceMs ? `WHERE call_at >= '${new Date(sinceMs).toISOString()}'` : '';
-  return asRows(await runSQL(`
-    SELECT caller, campaign, disposition, minutes, agent_name, team, call_at
-      FROM ${VIEW} ${where}
-     ORDER BY call_at DESC
-  `), VIEW);
+/**
+ * The calls to look at: v_new_callers_no_lp_30d's filters (2+ minutes with an
+ * agent, no LPRecKey, not a dispatch / confirmation / reset / rehash line, not
+ * a service / DNC / bad-data result, not one of our own numbers), between
+ * `sinceMs` and `untilMs`, optionally for one caller. What changed (2026-10-19):
+ * a caller is dropped only for an LP lead from the 15 days before the call
+ * (the matching step decides the rest), and the 30-day "own numbers" set is
+ * computed once (MATERIALIZED, ~1s) instead of inside the view (~20s a pass).
+ * Pure.
+ */
+export function buildCallersSql({ sinceMs, untilMs, phone = null }) {
+  const since = new Date(sinceMs).toISOString();
+  const until = new Date(untilMs).toISOString();
+  const onePhone = phone ? `AND right(regexp_replace(coalesce(e.ani, ''), '\\D', '', 'g'), 10) = '${String(phone).replace(/\D/g, '')}'` : '';
+  return `
+    WITH own AS MATERIALIZED (
+      SELECT right(regexp_replace(ani, '\\D', '', 'g'), 10) AS p FROM five9_events_raw
+       WHERE received_at >= now() - interval '30 days' AND ani IS NOT NULL GROUP BY 1 HAVING count(DISTINCT dnis) >= 20
+      UNION
+      SELECT right(regexp_replace(dnis, '\\D', '', 'g'), 10) FROM five9_events_raw
+       WHERE received_at >= now() - interval '30 days' AND dnis IS NOT NULL GROUP BY 1 HAVING count(DISTINCT ani) >= 20
+    ), agent_team AS (
+      SELECT DISTINCT ON (lower(agent_name)) lower(agent_name) AS name_key, team FROM ci_agent_map
+       WHERE agent_name IS NOT NULL
+       ORDER BY lower(agent_name), active DESC NULLS LAST, updated_at DESC NULLS LAST
+    ), calls AS (
+      SELECT right(regexp_replace(coalesce(e.ani, ''), '\\D', '', 'g'), 10) AS caller,
+             e.campaign, e.disposition_name AS disposition,
+             round(e.duration_sec::numeric / 60.0, 1) AS minutes, e.agent_name, e.received_at AS call_at,
+             coalesce(m.team, CASE substring(e.agent_name, ' - ([A-Za-z]+)$')
+                                WHEN 'LF' THEN 'lightfire' WHEN 'NC' THEN 'north_carolina' END, 'unmapped') AS team
+        FROM five9_events_raw e
+        LEFT JOIN agent_team m ON m.name_key = lower(regexp_replace(e.agent_name, ' - [A-Za-z]+$', ''))
+       WHERE e.event_type = 'disposition'
+         AND e.received_at >= '${since}' AND e.received_at <= '${until}'
+         AND coalesce(e.lp_rec_key, '') = '' AND coalesce(e.agent_name, '') <> '' AND e.duration_sec >= 120
+         AND e.campaign NOT ILIKE ALL (ARRAY['%dispatch%', '%confirmation%', '%reset%', '%rehash%'])
+         AND coalesce(e.disposition_name, '') <> ALL (ARRAY['Service Call', 'Do Not Call', 'DNC', 'Bad Data', 'Confirmed', 'Spanish - Send data to Spanish list'])
+         ${onePhone}
+    )
+    SELECT c.caller, c.campaign, c.disposition, c.minutes, c.agent_name, c.team, c.call_at
+      FROM calls c
+     WHERE length(c.caller) = 10
+       AND NOT EXISTS (SELECT 1 FROM own o WHERE o.p = c.caller)
+       AND NOT EXISTS (SELECT 1 FROM lp_leads l
+             WHERE right(regexp_replace(coalesce(l.phone, ''::text), '[^0-9]'::text, ''::text, 'g'::text), 10) = c.caller
+               AND l.lp_deleted_at IS NULL
+               AND ((l.created_at_lp AT TIME ZONE 'UTC') AT TIME ZONE 'America/New_York') >= c.call_at - interval '15 days')
+     ORDER BY c.call_at DESC`;
+}
+
+/** Calls between `sinceMs` and `untilMs` (optionally one caller). Newest first. */
+async function readCallers({ runSQL, sinceMs, untilMs, phone = null }) {
+  return asRows(await runSQL(buildCallersSql({ sinceMs, untilMs, phone })), 'inbound callers');
 }
 
 /** Five9 DNC membership in five9_check_dnc-sized batches. Throws if any batch fails. */
@@ -189,29 +278,6 @@ async function readFive9Dnc({ checkDnc, phones }) {
     }
   }
   return onDnc;
-}
-
-/**
- * Phones with an lp_leads row RIGHT NOW — the race between the view and this
- * pass. `phone` uses the idx_lp_leads_phone10 expression byte-for-byte (see
- * lead-leak-monitor.js); phone_alt matches the view's own lp_ph CTE.
- */
-async function readLpPhones({ runSQL, phones }) {
-  const found = new Set();
-  for (let i = 0; i < phones.length; i += LEAD_CHUNK) {
-    const list = sqlList(phones.slice(i, i + LEAD_CHUNK));
-    const rows = asRows(await runSQL(`
-      SELECT right(regexp_replace(coalesce(phone, ''::text), '[^0-9]'::text, ''::text, 'g'::text), 10) AS p
-        FROM lp_leads
-       WHERE right(regexp_replace(coalesce(phone, ''::text), '[^0-9]'::text, ''::text, 'g'::text), 10) IN (${list})
-      UNION
-      SELECT right(regexp_replace(phone_alt, '\\D', '', 'g'), 10)
-        FROM lp_leads
-       WHERE phone_alt IS NOT NULL AND right(regexp_replace(phone_alt, '\\D', '', 'g'), 10) IN (${list})
-    `), 'lp_leads race check');
-    for (const r of rows) if (r?.p) found.add(String(r.p));
-  }
-  return found;
 }
 
 /**
@@ -340,11 +406,6 @@ export async function classifyCallers(viewRows, { deps = {}, dncLift = false, ig
     five9Dnc = phones.length ? await readFive9Dnc({ checkDnc: d.checkDnc, phones }) : new Set();
   } catch (err) { return insufficient('five9 dnc', err); }
 
-  let lpPhones;
-  try {
-    lpPhones = phones.length ? await readLpPhones({ runSQL: d.runSQL, phones }) : new Set();
-  } catch (err) { return insufficient('lp_leads race check', err); }
-
   // The caller's NEWEST call decides whether they are a lead (2026-10-12): a
   // "Hung Up" on Monday followed by "Not Interested" on Tuesday is not one,
   // and the other way round is.
@@ -385,6 +446,21 @@ export async function classifyCallers(viewRows, { deps = {}, dncLift = false, ig
   }
   if (ghlErrors) errors.push(`ghl lookup: ${ghlErrors} failed (labelled unverified)`);
 
+  // 2026-10-19 (option B): match every looked-up caller to an existing lead
+  // (src/inbound-capture-match.js). Done per phone, on the caller's newest
+  // call; only phones that reached GHL are worth the reads.
+  const matchByPhone = new Map();
+  for (const [p, g] of ghlByPhone) {
+    if (g.status === 'error') continue;
+    const newest = newestByPhone.get(p);
+    const ghlLeadId = g.status === 'found' ? readCustomField(g.contact, LP_LEAD_ID_FIELD) : '';
+    try {
+      matchByPhone.set(p, await d.matchLead({ phone10: p, callAtMs: Date.parse(newest?.call_at), ghlLeadId }));
+    } catch (err) {
+      matchByPhone.set(p, { verdict: 'unverified', lead: null, why: `lead match failed: ${err.message}` });
+    }
+  }
+
   const contactIds = [...new Set([...ghlByPhone.values()]
     .filter((g) => g.status === 'found').map((g) => String(g.contact.id)))];
   let lpJobContacts = null;
@@ -401,27 +477,44 @@ export async function classifyCallers(viewRows, { deps = {}, dncLift = false, ig
     const ghl = ghlByPhone.get(r.caller_phone) || { status: skipped ? 'none' : 'error' };
     const cid = ghl.status === 'found' ? String(ghl.contact.id) : null;
     const lpJob = !cid ? null : lpJobContacts ? { status: lpJobContacts.has(cid) ? 'yes' : 'no' } : { status: 'error' };
-    const ctx = { five9Dnc, lpPhones, ghl, lpJob, notALead, noSource, ignoreDncTags };
+    const leadMatch = matchByPhone.get(r.caller_phone) || (ghl.status === 'error' ? null : { verdict: 'unverified', why: 'lead not matched' });
+    const ctx = { five9Dnc, ghl, lpJob, notALead, noSource, ignoreDncTags, leadMatch };
     const { label, why } = classifyCaller({ caller: r.caller_phone }, ctx);
+    const match = leadMatch ? { lead_match: leadMatch.verdict, matched_lead: leadMatch.lead || null } : {};
     if (dncLift && label === 'dnc') {
       // What they would be once lifted: lift only a would-be candidate.
       const lifted = classifyCaller({ caller: r.caller_phone }, { ...ctx, ignoreDnc: true });
-      return { ...r, label, why, ghl_contact_id: cid, label_if_lifted: lifted.label, dnc_liftable: isCandidate(lifted.label) };
+      return { ...r, label, why, ghl_contact_id: cid, ...match, label_if_lifted: lifted.label, dnc_liftable: isCandidate(lifted.label) };
     }
-    return { ...r, label, why, ghl_contact_id: cid };
+    return { ...r, label, why, ghl_contact_id: cid, ...match };
   });
 
   return { verdict: 'ok', rows, summary: summarizeCallers(rows), errors };
 }
 
 /** Read the view (optionally the last `hours`) and classify it. Never throws. */
-export async function measureCallers({ nowMs = Date.now(), hours = null, deps = {}, dncLift = false } = {}) {
+export async function measureCallers({ nowMs = Date.now(), hours = null, deps = {}, dncLift = false, waitMin = 15, phone = null, skip = null } = {}) {
   const d = resolveDeps(deps);
   let viewRows;
   try {
-    viewRows = await readCallers({ runSQL: d.runSQL, sinceMs: hours ? nowMs - hours * HOUR_MS : null });
+    viewRows = await readCallers({
+      runSQL: d.runSQL,
+      sinceMs: nowMs - (hours || 30 * 24) * HOUR_MS,
+      // Nothing is decided before the agent had their turn (2026-10-19).
+      untilMs: nowMs - waitMin * 60 * 1000,
+      phone,
+    });
   } catch (err) {
-    return { verdict: 'insufficient_evidence', rows: [], summary: null, errors: [`${VIEW}: ${err.message}`] };
+    return { verdict: 'insufficient_evidence', rows: [], summary: null, errors: [`inbound callers: ${err.message}`] };
+  }
+  // A fresh pass drops calls a pass already stored, BEFORE any GHL or LP read.
+  if (skip) {
+    try {
+      const drop = await skip(viewRows.map(toRow).filter((r) => r.caller_phone && r.call_at));
+      viewRows = viewRows.filter((v) => { const r = toRow(v); return !drop.has(rowKey(r.caller_phone, r.call_at)); });
+    } catch (err) {
+      return { verdict: 'insufficient_evidence', rows: [], summary: null, errors: [`${TABLE} read: ${err.message}`] };
+    }
   }
   let called;
   try {
@@ -468,7 +561,7 @@ export async function captureCaller(input, { deps = {}, ignoreDncTags = [] } = {
   if (recheck.verdict !== 'ok') {
     return { ok: false, action_taken: 'failed', label: null, detail: recheck.errors.join('; ') };
   }
-  const { label, why } = recheck.rows[0];
+  const { label, why, lead_match: leadMatch, matched_lead: matchedLead } = recheck.rows[0];
   let contactId = recheck.rows[0].ghl_contact_id;
   if (!isCandidate(label)) {
     return { ok: true, action_taken: 'not_a_candidate', label, ghl_contact_id: contactId, detail: why };
@@ -508,6 +601,14 @@ export async function captureCaller(input, { deps = {}, ignoreDncTags = [] } = {
     if (!stamped.ok) {
       return { ok: false, action_taken: 'failed', label, ghl_contact_id: contactId, detail: `LP source not set: ${stamped.detail}` };
     }
+    // A returning caller (option B): 8e30ff37 skips a contact whose LP Lead
+    // ID is filled, so the OLD lead's id is cleared, read back and noted first.
+    if (leadMatch === 'create_returning' && !created) {
+      const cleared = await clearOldLeadId(contactId, matchedLead, d);
+      if (!cleared.ok) {
+        return { ok: false, action_taken: 'failed', label, ghl_contact_id: contactId, detail: `old LP Lead ID not cleared: ${cleared.detail}` };
+      }
+    }
     const enrolled = await d.enroll({ contactId, calendarName: `Inbound call · ${row.campaign || 'unknown'}` });
     const already = enrolled?.action === 'create_lead_already_enrolled';
     return {
@@ -519,6 +620,33 @@ export async function captureCaller(input, { deps = {}, ignoreDncTags = [] } = {
     };
   } catch (err) {
     return { ok: false, action_taken: 'failed', label, ghl_contact_id: contactId || null, detail: err.message };
+  }
+}
+
+/**
+ * A returning caller's contact still carries their OLD LP lead id, which makes
+ * workflow 8e30ff37 skip them ("Already Sent to LP?"). Clear it (custom fields
+ * clear with '' here, like nurture-writeback.js), read it back, and leave a
+ * note naming the old prospect. Nothing to clear is ok. Never throws.
+ */
+export async function clearOldLeadId(contactId, matchedLead, { ghlFetch }) {
+  try {
+    const before = await ghlFetch('GET', `/contacts/${contactId}`);
+    const old = readCustomField(before?.contact || before, LP_LEAD_ID_FIELD);
+    if (!old) return { ok: true, detail: 'no LP Lead ID to clear' };
+    await ghlFetch('PUT', `/contacts/${contactId}`, { customFields: [{ id: LP_LEAD_ID_FIELD, field_value: '' }] });
+    const after = await ghlFetch('GET', `/contacts/${contactId}`);
+    if (readCustomField(after?.contact || after, LP_LEAD_ID_FIELD)) return { ok: false, detail: 'still set after the clear' };
+    const when = matchedLead?.at ? String(matchedLead.at).slice(0, 10) : 'an earlier date';
+    const prospect = matchedLead?.prospect_id ? `Prospect ${matchedLead.prospect_id}` : 'their earlier prospect';
+    await ghlFetch('POST', `/contacts/${contactId}/notes`, {
+      // A GHL note may name the lead id (CLAUDE.md: notes keep machine values).
+      body: `Returning caller: called in again more than 15 days after their last LP lead (${old}, ${prospect}, ${when}). `
+        + 'LP Lead ID cleared so a new LP lead can be created for this call (inbound caller capture).',
+    }).catch(() => {});
+    return { ok: true, detail: `cleared ${old}` };
+  } catch (err) {
+    return { ok: false, detail: err.message };
   }
 }
 
@@ -640,12 +768,25 @@ async function finishRow(db, row, patch) {
 /* --- the hourly action pass --------------------------------------------- */
 
 /** One scheduled action pass. Returns the runJob verdict shape. */
-export async function runInboundCapture({ env = process.env, nowMs = Date.now(), deps = {} } = {}) {
+/**
+ * One action pass. `fresh` (2026-10-19): only calls no pass has stored yet,
+ * dropped before any GHL or LP read, so it can run every few minutes; `phone`
+ * narrows it to one caller (the call-end timer). Without `fresh`, the full
+ * pass re-checks every call in the lookback window.
+ */
+export async function runInboundCapture({ env = process.env, nowMs = Date.now(), deps = {}, fresh = false, phone = null } = {}) {
   const cfg = captureConfig(env);
   if (cfg.mode === 'off') return { skipped: true, reason: 'INBOUND_CAPTURE_MODE=off' };
   const d = resolveDeps(deps);
 
-  const m = await measureCallers({ nowMs, hours: cfg.lookbackHours, deps, dncLift: cfg.dncLift });
+  const skip = fresh
+    ? async (rows) => {
+      const ex = await readExisting(d.db, [...new Set(rows.map((r) => r.caller_phone))]);
+      if (ex.missing) throw new Error(`${TABLE} does not exist`);
+      return new Set(ex.rows.map((r) => rowKey(r.caller_phone, r.call_at)));
+    }
+    : null;
+  const m = await measureCallers({ nowMs, hours: cfg.lookbackHours, deps, dncLift: cfg.dncLift, waitMin: cfg.waitMin, phone, skip });
   if (m.verdict === 'insufficient_evidence') {
     d.log.warn(`[InboundCapture] insufficient_evidence — ${m.errors.join('; ')}`);
     return { checked: false, readFailed: true, verdict: m.verdict, reason: m.errors.join('; '), mode: cfg.mode };
@@ -809,10 +950,10 @@ export async function runInboundCapture({ env = process.env, nowMs = Date.now(),
     + ` customer=${s.by_label.existing_customer} unverified=${s.by_label.unverified} stored=${stored}`
     + ` queued=${tally.queued} created=${tally.created} already=${tally.already} failed=${tally.failed}`
     + (cfg.dncLift ? ` dnc_lift_queued=${tally.lift_queued} dnc_lift_waiting=${tally.lift_waiting} dnc_kept_blocked=${tally.lift_kept_blocked}` : '');
-  d.log.log(`[InboundCapture] ${cfg.mode} ${cfg.lookbackHours}h — ${line}`);
+  d.log.log(`[InboundCapture] ${cfg.mode} ${fresh ? `fresh${phone ? ' (call ended)' : ''}` : `${cfg.lookbackHours}h`} — ${line}`);
 
   const hardFailure = tally.failed > 0 || errors.some((e) => / (claim|update|write): /.test(e));
-  return { ok: !hardFailure, mode: cfg.mode, summary: line, stored, ...tally, ...(hardFailure ? { errors } : { notes: errors }) };
+  return { ok: !hardFailure, mode: cfg.mode, pass: fresh ? 'fresh' : 'full', summary: line, stored, ...tally, ...(hardFailure ? { errors } : { notes: errors }) };
 }
 
 /* --- DNC callers: lift first, then capture (2026-10-18) ----------------- */
@@ -1002,7 +1143,7 @@ export async function runInboundCaptureSummary({ env = process.env, nowMs = Date
   if (cfg.mode === 'off') return { skipped: true, reason: 'INBOUND_CAPTURE_MODE=off' };
   const d = resolveDeps(deps);
 
-  const m = await measureCallers({ nowMs, hours: null, deps });
+  const m = await measureCallers({ nowMs, hours: null, deps, waitMin: cfg.waitMin });
   if (m.verdict === 'insufficient_evidence') {
     d.log.warn(`[InboundCapture] summary insufficient_evidence — ${m.errors.join('; ')}`);
     return { checked: false, readFailed: true, reason: m.errors.join('; '), mode: cfg.mode };
@@ -1047,7 +1188,7 @@ export async function dryRun({ hours, nowMs = Date.now(), env = process.env, dep
   const cfg = captureConfig(env);
   if (hours === 'all') hours = null;
   else hours = positiveInt(hours, cfg.lookbackHours);
-  const m = await measureCallers({ nowMs, hours, deps });
+  const m = await measureCallers({ nowMs, hours, deps, waitMin: cfg.waitMin });
   if (m.verdict === 'insufficient_evidence') return { ok: false, verdict: m.verdict, errors: m.errors };
   const byTeamLabel = {};
   for (const r of m.rows) {
@@ -1095,17 +1236,31 @@ function minuteET(d = new Date()) {
   return Number(parts.find((p) => p.type === 'minute')?.value ?? 0);
 }
 
-/** Which pass, if any, a tick at `d` should run. Exported for tests. */
-export function dueSlot(d = new Date()) {
+/**
+ * Which pass, if any, a tick at `d` should run. Exported for tests.
+ * The summary first, then the hourly full pass (08:00–20:00 ET), then (with
+ * INBOUND_CAPTURE_INSTANT on, the default since 2026-10-19) a fresh pass every
+ * tick, all day: a full pass covers fresh calls too, so a tick runs one.
+ */
+export function dueSlot(d = new Date(), { instant = false, last = {} } = {}) {
   const h = hourET(d);
   const day = todayET(d);
-  if (h === SUMMARY_HOUR_ET && minuteET(d) >= SUMMARY_MINUTE_ET) return { kind: 'summary', occurrence: `${day}-summary` };
-  if (h >= FIRST_HOUR_ET && h <= LAST_HOUR_ET) return { kind: 'hourly', occurrence: `${day}T${String(h).padStart(2, '0')}` };
+  const hh = String(h).padStart(2, '0');
+  if (h === SUMMARY_HOUR_ET && minuteET(d) >= SUMMARY_MINUTE_ET && last.summary !== `${day}-summary`) {
+    return { kind: 'summary', occurrence: `${day}-summary` };
+  }
+  if (h >= FIRST_HOUR_ET && h <= LAST_HOUR_ET && last.hourly !== `${day}T${hh}`) {
+    return { kind: 'hourly', occurrence: `${day}T${hh}` };
+  }
+  if (instant) {
+    const mm = String(Math.floor(minuteET(d) / 5) * 5).padStart(2, '0');
+    return { kind: 'fresh', occurrence: `${day}T${hh}:${mm}-fresh` };
+  }
   return null;
 }
 
 let timer = null;
-const lastSlot = { summary: null, hourly: null };
+const lastSlot = { summary: null, hourly: null, fresh: null };
 
 export function startInboundCaptureScheduler() {
   if (timer) return;
@@ -1113,14 +1268,17 @@ export function startInboundCaptureScheduler() {
     console.log('[InboundCapture] disabled (INBOUND_CAPTURE_MODE=off)');
     return;
   }
-  console.log(`[InboundCapture] Scheduler started — hourly ${FIRST_HOUR_ET}:00–${LAST_HOUR_ET}:00 ET + summary 07:15 ET (mode=${captureMode()})`);
+  const instant = instantEnabled();
+  console.log(`[InboundCapture] Scheduler started — ${instant ? 'each call 15 min after it ends + every 5 min (fresh) + ' : ''}hourly ${FIRST_HOUR_ET}:00–${LAST_HOUR_ET}:00 ET + summary 07:15 ET (mode=${captureMode()})`);
   const tick = async () => {
-    const slot = dueSlot();
+    const slot = dueSlot(new Date(), { instant: instantEnabled(), last: lastSlot });
     if (!slot || lastSlot[slot.kind] === slot.occurrence) return;
     lastSlot[slot.kind] = slot.occurrence;
-    const work = slot.kind === 'summary' ? runInboundCaptureSummary : runInboundCapture;
+    const work = slot.kind === 'summary' ? () => runInboundCaptureSummary()
+      : slot.kind === 'fresh' ? () => runInboundCapture({ fresh: true })
+        : () => runInboundCapture();
     try {
-      await runJob(JOB_ID, () => guarded(() => work())
+      await runJob(JOB_ID, () => guarded(work)
         .then((r) => (r?.busy ? { skipped: true, reason: 'another inbound-capture pass was running' } : r)),
       { occurrence: slot.occurrence });
     } catch (err) {
@@ -1132,4 +1290,57 @@ export function startInboundCaptureScheduler() {
 
 export function stopInboundCaptureScheduler() {
   if (timer) { clearInterval(timer); timer = null; }
+}
+
+/* --- the call that just ended (2026-10-19) ------------------------------- */
+
+const EXCLUDED_CAMPAIGN_RX = /dispatch|confirmation|reset|rehash/i;
+const EXCLUDED_DISPOSITIONS = new Set(['Service Call', 'Do Not Call', 'DNC', 'Bad Data', 'Confirmed', 'Spanish - Send data to Spanish list']);
+
+/**
+ * Could this Five9 disposition be a call the capture looks at? The cheap half
+ * of buildCallersSql's filters, so a timer is only set for plausible calls; the
+ * pass re-reads and decides everything. Pure.
+ * @returns {string|null} the caller's 10-digit phone, or null
+ */
+export function callToWatch(row = {}) {
+  if (!/disposition|connector/i.test(String(row.event_type || ''))) return null;
+  if (String(row.lp_rec_key || '').trim()) return null;
+  if (!String(row.agent_name || '').trim()) return null;
+  if (!(Number(row.duration_sec) >= 120)) return null;
+  if (EXCLUDED_CAMPAIGN_RX.test(String(row.campaign || ''))) return null;
+  if (EXCLUDED_DISPOSITIONS.has(String(row.disposition_name || '').trim())) return null;
+  return normalizeCallerPhone(row.ani);
+}
+
+const watchTimers = new Map();
+
+/**
+ * Called by the Five9 webhook (src/five9-events.js) for every disposition. A
+ * plausible call starts ONE timer per caller; when it fires (the wait plus a
+ * minute, so the call is past the cut-off), a fresh pass runs for that caller.
+ * The timer lives in memory: a deploy that drops it is caught by the 5-minute
+ * fresh pass. Never throws.
+ */
+export function scheduleCaptureForCall(row, { env = process.env, setTimer = setTimeout } = {}) {
+  try {
+    if (captureMode(env) === 'off' || !instantEnabled(env)) return { scheduled: false, reason: 'off' };
+    const phone = callToWatch(row);
+    if (!phone) return { scheduled: false, reason: 'not_a_capture_call' };
+    if (watchTimers.has(phone)) return { scheduled: false, reason: 'already_scheduled', phone };
+    const delayMs = (captureConfig(env).waitMin + 1) * 60 * 1000;
+    const t = setTimer(() => {
+      watchTimers.delete(phone);
+      runJob(JOB_ID, () => guarded(() => runInboundCapture({ env, fresh: true, phone }))
+        .then((r) => (r?.busy ? { skipped: true, reason: 'another inbound-capture pass was running; the 5-minute pass will take it' } : r)),
+      { occurrence: `call-${phone}-${Date.now()}` })
+        .catch((err) => console.error(`[InboundCapture] call-end pass failed: ${err.message}`));
+    }, delayMs);
+    if (typeof t?.unref === 'function') t.unref();
+    watchTimers.set(phone, t);
+    return { scheduled: true, phone, delay_ms: delayMs };
+  } catch (err) {
+    console.warn(`[InboundCapture] could not schedule a call-end pass: ${err.message}`);
+    return { scheduled: false, reason: 'error' };
+  }
 }
