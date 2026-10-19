@@ -988,7 +988,9 @@ Brad's XLSX (`marketing-cost-report`, formulas never typed values) read `v_marke
   `scripts/test-marketing-invoice-formats.js` holds one sample per format: a new format seen live goes there first.
 - **REECE_HOLD money is never spread by code (D4).** Lead Gurus "Unknown" / "Out Of Area" and the daily territory gap
   (09-22: $4,763.59) sit on `REECE_HOLD`; `src/marketing/holds.js` writes a RECOMMENDATION (matched LP lead → branch,
-  else zip → service area) and a person applies it. The feed is provisional until the invoice supersedes it
+  else zip → service area) and a person applies it. A day gap is held only once the day is over and only from $5
+  (`GAP_MIN_CENTS`, `buildFeedRows` in `leadgurus-feed.js`, 2026-10-19): a mid-day pull held $62.65 that the next pull
+  zeroed, and a $0.02 rounding gap got an "Apply recommendation" button. The user kept the button (2026-10-19). The feed is provisional until the invoice supersedes it
   (`trueUpInvoice`, variance > `MKT_FEED_VARIANCE_PCT` posts a line).
 - Mode switches: `MKT_INVOICE_ANALYZER` rules|rules+llm, `MKT_COST_NIGHTLY_ENABLED`. Dry runs: the tests
   (`scripts/test-marketing-*.js`) and `GET /n8n/admin/marketing-expenses/status` (reconciliation = 0 failing rows).

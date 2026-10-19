@@ -26,6 +26,18 @@ export const FEED_SUB_SOURCE = 'Lead Gurus';
 export const FEED_GAP_TERRITORY = '__gap__';
 const cents = (n) => Math.round(Number(n || 0) * 100);
 
+/**
+ * A day gap under this is rounding, not unattributed spend (2026-10-19). The
+ * territory sum and the daily total differ by cents to a few dollars on most
+ * days, in both directions (10-17: $0.02 held, with an "Apply recommendation"
+ * button for two cents). The one real gap so far was $4,763.59 (09-22).
+ */
+export const GAP_MIN_CENTS = 500;
+
+function todayET(d = new Date()) {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit' }).format(d);
+}
+
 export async function loadTerritoryMap({ supabase = supabaseDefault } = {}) {
   const { data, error } = await supabase.from('marketing_territory_map').select('territory, market');
   if (error) throw new Error(`marketing_territory_map read failed: ${error.message}`);
@@ -44,8 +56,9 @@ export async function feedVendor({ supabase = supabaseDefault } = {}) {
  * @param {Array} territoryRows  ft_summary_territory rows
  * @param {Array} dailyRows      ft_daily_summary rows
  * @param {Record<string,string>} map  lower(territory) → market
+ * @param {string} [today]  ET date; no gap is held for it or later
  */
-export function buildFeedRows({ territoryRows, dailyRows, map, vendorId }) {
+export function buildFeedRows({ territoryRows, dailyRows, map, vendorId, today = todayET() }) {
   const rows = [];
   const byDate = {};
   for (const t of territoryRows || []) {
@@ -65,8 +78,13 @@ export function buildFeedRows({ territoryRows, dailyRows, map, vendorId }) {
     });
   }
   for (const d of dailyRows || []) {
+    // Today is still filling in: Lead Gurus posts the day's total before the
+    // per-territory rows catch up, so a gap held mid-day ($62.65 on 10-19) is a
+    // timing artefact that the next pull zeroes. Hold a gap only once the day
+    // is over (2026-10-19).
+    if (d.date >= today) continue;
     const gap = cents(d.total_spend) - (byDate[d.date] || 0);
-    if (gap <= 1) continue; // cents of rounding are not a territory gap
+    if (gap < GAP_MIN_CENTS) continue; // rounding is not a territory gap
     rows.push({
       vendor_id: vendorId, cost_type: 'feed',
       description: `Lead Gurus feed ${d.date} · not attributed to any territory (daily total − territories)`,
