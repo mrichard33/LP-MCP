@@ -691,6 +691,12 @@ not). n8n blocks a send when `X-VDR-Lead-Synced-At` is 6h+ old and lists a 135 g
 Mark's summary, never blocking on it. The file is lead PII, so the route NEVER uses the soft-launch check (production
 runs `AUTH_SOFT_LAUNCH=true`, and a token-less request got the whole file on 2026-10-15): `vdrAuthenticate` takes the
 operator token or a key the database proves is the LP service-role key (n8n's "LP Supabase" credential). exceljs drops a cached formula result of 0; Excel recalculates on open.
+**Every vendor sees Net Sales, RTP and Pending RTP (the user, 2026-10-19).** Net = Gross − Cancelled (job status
+Cancelled, Cancelled By Mgt or Dead Deal) − Financing Denied (Credit Decline); RTP = a sold job with an RTP milestone,
+not cancelled or declined; Pending RTP = Net − RTP. All on the lead's own sale amount (`gross_sale`), from the lead's
+deciding job (`vdr_vendor_leads`, migration `20261019150000`: placeholder twins dropped, `lp_jobs.job_status` then 133).
+A rev-share vendor's RTP tile reads "RTP (your payout basis)" and its Payable Jobs CSV column is "RTP Amount (payout
+basis)". The report's RTP is by lead entry window, the pay list by release week: they never match line for line.
 
 ## Siro: the in-home visit, recorded (Siro PR 1, 2026-10-16)
 

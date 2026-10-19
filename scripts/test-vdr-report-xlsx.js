@@ -3,9 +3,11 @@
  *
  * The workbook goes to outside vendors, so these tests pin what the handoff ruled:
  *   - three tabs; the Leads columns in the agreed order; never an LP lead id, rep, setter or confirmer name
- *   - Arial everywhere, Summary tab red, gridlines off, A1:K1 merged navy title, Leads frozen at B2 with a filter
+ *   - Arial everywhere, Summary tab red, gridlines off, A1:M1 merged navy title, Leads frozen at B2 with a filter
  *   - EVERY Summary number is a formula over the Leads tab (never a typed value), and the cached result of each
  *     equals the counts worked out from the rows (tally)
+ *   - Net Sales = Gross - Cancelled - Financing Denied, RTP, Pending RTP = Net - RTP (the user, 2026-10-19), and a
+ *     rev-share vendor's RTP tile names it as the payout basis
  *   - the route: 401 without the operator token, 400/404/500 on bad input or a failed read, 200 with the
  *     X-VDR-* headers n8n reads
  *
@@ -20,7 +22,7 @@ process.env.SUPABASE_SERVICE_ROLE_KEY ||= 'test-key';
 const { default: express } = await import('express');
 const { default: ExcelJS } = await import('exceljs');
 const { makeAuthenticate } = await import('../src/auth.js');
-const { buildVendorWorkbook, tally, reportFileName, LEAD_COLUMNS, LEAD_COL } = await import('../src/vdr/report-xlsx.js');
+const { buildVendorWorkbook, tally, reportFileName, LEAD_COLUMNS, LEAD_COL, SUMMARY_DEFINITIONS, REV_SHARE_DEFINITION } = await import('../src/vdr/report-xlsx.js');
 const { registerVdrReportRoutes, vdrAuthenticate, defaultVerifyServiceKey, _resetVdrKeyCache } = await import('../src/vdr/report-route.js');
 
 const TOKEN = 'test-operator-token';
@@ -29,7 +31,8 @@ const HEADERS = [
   'Prospect ID', 'Repeat Prospect (Y/N)', 'Sub-Source', 'Market', 'Entry Date', 'Entry Week (Mon)', 'First Name',
   'Last Name', 'Phone', 'Email', 'City', 'ZIP', 'Five9 Dials', 'Minutes to First Dial', 'Last Call Result (Five9)',
   'Contacted', 'Appt Set Date', 'Appt Date', 'Days Set → Appt', 'Confirmed Date', 'Set', 'Confirmed', 'Issue Date',
-  'Issued', 'Net Issued', 'Demo', 'Sold', 'Gross Sale Amount', 'Current LP Status',
+  'Issued', 'Net Issued', 'Demo', 'Sold', 'Gross Sale Amount', 'Job Status', 'Cancelled Amount',
+  'Financing Denied Amount', 'Net Sale Amount', 'RTP Date', 'RTP Amount', 'Current LP Status',
 ];
 
 function lead(over = {}) {
@@ -40,17 +43,24 @@ function lead(over = {}) {
     minutes_to_first_dial: 1.5, last_call_result: 'No Answer', contacted: false, appt_set_at: null, appt_at: null,
     days_set_to_appt: null, confirmed_at: null, is_set: false, is_confirmed: false, issue_date: null,
     is_issued: false, is_net_issued: false, is_demo: false, is_sold: false, gross_sale: null, lp_status: 'New',
+    job_status: null, cancelled_amount: null, financing_denied_amount: null, rtp_date: null, rtp_amount: null,
     ...over,
   };
 }
 
 const ROWS = [
   lead({ prospect_id: '1', contacted: true, is_set: true, is_issued: true, is_demo: true, is_sold: true, gross_sale: 24000,
-    appt_set_at: '2026-10-14T10:00:00', appt_at: '2026-10-16T14:00:00', days_set_to_appt: 2.2, issue_date: '2026-10-16' }),
+    appt_set_at: '2026-10-14T10:00:00', appt_at: '2026-10-16T14:00:00', days_set_to_appt: 2.2, issue_date: '2026-10-16',
+    job_status: 'Awaiting Product', rtp_date: '2026-10-17', rtp_amount: 24000 }),
   lead({ prospect_id: '2', contacted: true, is_set: true, market: 'Sarasota', market_code: 'SAR_MKT' }),
   lead({ prospect_id: '3', market: 'Outside Service Area', market_code: 'UNASSIGNED', entry_week: '2026-10-05', entry_at: '2026-10-07T08:00:00' }),
   lead({ prospect_id: '3', repeat_prospect: true, market: 'Outside Service Area', market_code: 'UNASSIGNED', five9_dials: 0, minutes_to_first_dial: null }),
-  lead({ prospect_id: '4', contacted: true, is_set: true, is_issued: true, is_demo: true, is_sold: true, gross_sale: 15500.5, entry_week: '2026-10-05' }),
+  lead({ prospect_id: '4', contacted: true, is_set: true, is_issued: true, is_demo: true, is_sold: true, gross_sale: 15500.5, entry_week: '2026-10-05',
+    job_status: 'Cancelled', cancelled_amount: 15500.5 }),
+  lead({ prospect_id: '5', contacted: true, is_set: true, is_issued: true, is_demo: true, is_sold: true, gross_sale: 9000,
+    job_status: 'Credit Decline', financing_denied_amount: 9000 }),
+  lead({ prospect_id: '6', contacted: true, is_set: true, is_issued: true, is_demo: true, is_sold: true, gross_sale: 12000,
+    job_status: 'HOLD - HOA' }),
 ];
 const REPORT = { found: true, vendor_id: 1, vendor_name: 'Modernize', start_date: '2026-07-17', end_date: '2026-10-15',
   lead_synced_at: '2026-10-15T14:50:00+00:00', rows: ROWS };
@@ -77,9 +87,10 @@ test('three tabs, Leads headers in the agreed order, no id or rep field', async 
   // Definitions: one line per column, in the same order, without the contact columns (the user, 2026-10-15).
   const ds = wb.getWorksheet('Definitions');
   const defined = HEADERS.filter((h) => !['First Name', 'Last Name', 'Phone', 'Email', 'City', 'ZIP'].includes(h));
-  assert.equal(defined.length, 23);
-  assert.equal(ds.rowCount, defined.length + 1);
-  defined.forEach((h, i) => assert.equal(ds.getRow(i + 2).getCell(1).value, h));
+  assert.equal(defined.length, 29);
+  const expected = [...defined, ...SUMMARY_DEFINITIONS.map(([c]) => c)];   // not rev share: no payout line
+  assert.equal(ds.rowCount, expected.length + 1);
+  expected.forEach((h, i) => assert.equal(ds.getRow(i + 2).getCell(1).value, h));
 });
 
 test('Y/N booleans, 10-digit phone, dates as real dates', async () => {
@@ -104,7 +115,7 @@ test('branding: Arial, red tab, no gridlines, merged navy title, frozen Leads wi
   assert.equal(ws.views[0].showGridLines, false);
   assert.equal(ws.pageSetup.orientation, 'landscape');
   assert.equal(ws.pageSetup.fitToWidth, 1);
-  assert.ok(ws.model.merges.includes('A1:K1'));
+  assert.ok(ws.model.merges.includes('A1:M1'));
   const a1 = ws.getCell('A1');
   assert.equal(a1.value, 'REECE WINDOWS & DOORS');
   assert.equal(a1.fill.fgColor.argb, 'FF1F3A5F');
@@ -127,7 +138,7 @@ test('every Summary number is a formula over the Leads tab, and its result equal
   const ws = wb.getWorksheet('Summary');
   const t = tally(ROWS);
   const tile = (col) => ws.getCell(`${col}6`).value;
-  for (const col of 'ABCDEFGH') {
+  for (const col of 'ABCDEFG') {
     assert.ok(tile(col) && typeof tile(col).formula === 'string', `tile ${col} is a formula`);
   }
   assert.match(tile('A').formula, /Leads!/);
@@ -137,12 +148,27 @@ test('every Summary number is a formula over the Leads tab, and its result equal
   assert.equal(tile('E').result, t.issued);
   assert.equal(tile('F').result, t.demos);
   assert.equal(tile('G').result, t.sold);
-  assert.equal(tile('H').result, 39500.5);
+  assert.equal(ws.getCell('H6').value, null);
+
+  // Sales dollars (row 8 labels, row 9 values): Gross, Cancelled, Financing Denied, Net, RTP, Pending RTP.
+  const money = (col) => ws.getCell(`${col}9`).value;
+  assert.deepEqual('ABCDEF'.split('').map((c) => ws.getCell(`${c}8`).value),
+    ['Gross Sales', 'Cancelled', 'Financing Denied', 'Net Sales', 'Released to Production (RTP)', 'Pending RTP']);
+  for (const col of 'ABCDEF') assert.ok(typeof money(col).formula === 'string', `dollar tile ${col} is a formula`);
+  assert.equal(money('A').result, 60500.5);
+  assert.equal(money('B').result, 15500.5);
+  assert.equal(money('C').result, 9000);
+  assert.equal(money('D').result, 36000);
+  assert.equal(money('E').result, 24000);
+  assert.equal(money('F').formula, 'D9-E9');
+  assert.equal(money('F').result, 12000);
+  assert.match(money('D').formula, new RegExp(`^SUM\\(Leads!\\$${LEAD_COL.net_sale}\\$2`));
+  assert.deepEqual([t.gross, t.cancelled, t.denied, t.net, t.rtp, t.pending], [60500.5, 15500.5, 9000, 36000, 24000, 12000]);
 
   // Every numeric cell below the tiles (market + week tables and their totals) is a formula.
   let numbers = 0;
   ws.eachRow((row, r) => {
-    if (r < 8) return;
+    if (r < 11) return;
     row.eachCell((c, col) => {
       if (col === 1) return;
       if (typeof c.value === 'number') assert.fail(`typed number at ${c.address}`);
@@ -159,6 +185,8 @@ test('every Summary number is a formula over the Leads tab, and its result equal
     assert.equal(row.getCell(2).value.result, t.leads);
     assert.equal(row.getCell(5).value.result, t.set);
     assert.equal(row.getCell(11).value.result, t.gross);
+    assert.equal(row.getCell(12).value.result, t.net);
+    assert.equal(row.getCell(13).value.result, t.rtp);
   }
   // Markets in the business order, Outside last; weeks oldest first.
   const labels = [];
@@ -167,6 +195,27 @@ test('every Summary number is a formula over the Leads tab, and its result equal
   assert.ok(iO > 0 && iO < iS && iS < iX);
   const foot = labels.find((v) => typeof v === 'string' && v.startsWith('Recent weeks are still maturing'));
   assert.ok(foot);
+});
+
+test('Net Sale Amount is a per-row formula; unsold rows stay blank', async () => {
+  const wb = await roundTrip(REPORT);
+  const ls = wb.getWorksheet('Leads');
+  const net = (r) => ls.getRow(r).getCell(LEAD_COL.net_sale).value;
+  const g = LEAD_COL.gross_sale, c = LEAD_COL.cancelled_amount, d = LEAD_COL.financing_denied_amount;
+  assert.equal(net(2).formula, `N(${g}2)-N(${c}2)-N(${d}2)`);
+  assert.equal(net(2).result, 24000);
+  assert.equal(net(6).result ?? 0, 0);            // cancelled: exceljs drops a cached 0
+  assert.equal(net(3), null);                     // not sold
+  assert.equal(ls.getRow(2).getCell(LEAD_COL.job_status).value, 'Awaiting Product');
+  assert.ok(ls.getRow(2).getCell(LEAD_COL.rtp_date).value instanceof Date);
+});
+
+test('a rev-share vendor sees RTP as its payout basis', async () => {
+  const wb = await roundTrip({ ...REPORT, vendor_name: 'LeadPilot', rev_share: true });
+  assert.equal(wb.getWorksheet('Summary').getCell('E8').value, 'RTP (your payout basis)');
+  const ds = wb.getWorksheet('Definitions');
+  assert.equal(ds.getRow(ds.rowCount).getCell(1).value, REV_SHARE_DEFINITION[0]);
+  assert.match(ds.getRow(ds.rowCount).getCell(2).value, /payout is based on the RTP Amount/);
 });
 
 test('a vendor with no leads still builds a valid workbook', async () => {
@@ -235,7 +284,10 @@ test('route: 200 returns the workbook and the headers n8n reads', async () => {
     assert.equal(res.headers.get('x-vdr-vendor-id'), '1');
     assert.equal(res.headers.get('x-vdr-file-name'), 'Reece_Vendor_Lead_Report_Modernize_2026-10-15.xlsx');
     assert.equal(res.headers.get('x-vdr-lead-count'), String(ROWS.length));
-    assert.equal(JSON.parse(res.headers.get('x-vdr-summary')).sold, 2);
+    const summary = JSON.parse(res.headers.get('x-vdr-summary'));
+    assert.equal(summary.sold, 4);
+    assert.equal(summary.net, 36000);
+    assert.equal(summary.pending, 12000);
     assert.equal(res.headers.get('x-vdr-window'), '2026-07-17..2026-10-15');
     assert.equal(res.headers.get('x-vdr-lead-synced-at'), REPORT.lead_synced_at);
     assert.equal(res.headers.get('x-vdr-feed-leads'), '5');

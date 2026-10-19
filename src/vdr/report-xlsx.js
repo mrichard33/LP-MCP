@@ -6,13 +6,17 @@
  * lp_lead_market_assignments + Five9) as one branded workbook with every lead in the vendor's window.
  *
  * Three sheets, Arial throughout:
- *   Summary      KPI tiles, "By market" and "By week" tables. EVERY number is a formula (COUNTIF/COUNTIFS/SUMIFS)
+ *   Summary      KPI tiles, the "Sales dollars" tiles, "By market" and "By week" tables. EVERY number is a formula (COUNTIF/COUNTIFS/SUMIFS)
  *                over the Leads sheet, never a typed value. Each formula carries its computed result too, so a
  *                viewer that does not recalculate (a phone, a mail preview) still shows the right number, and
  *                fullCalcOnLoad makes Excel recompute on open.
  *   Leads        one row per lead, the columns in LEAD_COLUMNS order. Never the LP lead id, a rep, setter or
  *                confirmer name: the SQL does not return them and nothing here adds them.
  *   Definitions  one plain-English line per column, except the self-explanatory contact columns (NOT_DEFINED).
+ *
+ * Net Sales, RTP and Pending RTP (the user, 2026-10-19): Net = Gross - Cancelled (job Cancelled, Cancelled By
+ * Mgt or Dead Deal) - Financing Denied (Credit Decline); RTP = net sales released to production; Pending RTP = Net -
+ * RTP. All on the lead's own sale amount, so they add up. A rev-share vendor's RTP tile says it is the payout basis.
  *
  * Pure: rows in, workbook out. No I/O, so the tests build it offline.
  */
@@ -58,6 +62,12 @@ export const LEAD_COLUMNS = [
   ['Demo', 'is_demo', 'yn', 6, 'Y when the sales rep completed an in-home presentation.'],
   ['Sold', 'is_sold', 'yn', 6, 'Y when the homeowner signed a contract.'],
   ['Gross Sale Amount', 'gross_sale', 'money', 13, 'Contract amount, shown only for sold leads.'],
+  ['Job Status', 'job_status', 'text', 18, "The sold job's current status in Lead Perfection (for example Awaiting Product, Paid In Full, Cancelled)."],
+  ['Cancelled Amount', 'cancelled_amount', 'money', 12, 'The sale amount when the job was cancelled (Cancelled, Cancelled By Mgt or Dead Deal).'],
+  ['Financing Denied Amount', 'financing_denied_amount', 'money', 12, 'The sale amount when the homeowner was declined for financing (Credit Decline).'],
+  ['Net Sale Amount', 'net_sale', 'netformula', 12, 'Gross Sale Amount minus Cancelled Amount minus Financing Denied Amount.'],
+  ['RTP Date', 'rtp_date', 'date', 12, 'Date the job was released to production (RTP): the paperwork, financing and rescission period are cleared and the order is placed.'],
+  ['RTP Amount', 'rtp_amount', 'money', 12, 'The sale amount once the job is released to production and not cancelled or declined.'],
   ['Current LP Status', 'lp_status', 'text', 24, "The lead's current status in Lead Perfection."],
 ];
 
@@ -67,6 +77,15 @@ export const colLetter = (i) => {           // 0 -> A, 26 -> AA
   return s;
 };
 const COL = Object.fromEntries(LEAD_COLUMNS.map((c, i) => [c[1], colLetter(i)]));
+
+// Summary-only figures, defined after the columns on the Definitions tab. REV_SHARE_DEFINITION is added for a
+// rev-share vendor, whose weekly Payable Jobs list counts by release week, not by lead entry date.
+export const SUMMARY_DEFINITIONS = [
+  ['Net Sales', 'Gross Sales minus Cancelled minus Financing Denied.'],
+  ['Pending RTP', 'Net Sales not yet released to production. These jobs are still moving through paperwork, financing, HOA or permits.'],
+];
+export const REV_SHARE_DEFINITION = ['RTP and your payout',
+  'Your rev-share payout is based on the RTP Amount. This report counts RTP for leads entered in its window; the weekly Payable Jobs list counts jobs by the week they were released, so the two do not match line for line.'];
 export const LEAD_COL = COL;
 
 // Postgres timestamp without zone ("2026-10-15T12:35:30.043") or date ("2026-10-15") → a Date whose UTC parts are
@@ -87,7 +106,7 @@ function cellValue(kind, v) {
   if (kind === 'datetime' || kind === 'date') return wallDate(v);
   return v == null ? null : String(v);
 }
-const NUMFMT = { datetime: 'yyyy-mm-dd hh:mm', date: 'yyyy-mm-dd', num1: '0.0', money: '"$"#,##0', int: '0' };
+const NUMFMT = { datetime: 'yyyy-mm-dd hh:mm', date: 'yyyy-mm-dd', num1: '0.0', money: '"$"#,##0', netformula: '"$"#,##0', int: '0' };
 
 // Leads columns with no Definitions line (the user, 2026-10-15).
 export const NOT_DEFINED = new Set(['first_name', 'last_name', 'phone', 'email', 'city', 'zip']);
@@ -102,16 +121,25 @@ export function reportFileName(vendorName, endDate) {
 
 /** The numbers the Summary formulas compute, worked out in JS (formula results + the n8n summary line). */
 export function tally(rows) {
-  const t = { leads: 0, contacted: 0, set: 0, issued: 0, demos: 0, sold: 0, gross: 0 };
+  const t = { leads: 0, contacted: 0, set: 0, issued: 0, demos: 0, sold: 0, gross: 0, cancelled: 0, denied: 0, net: 0, rtp: 0, pending: 0 };
   for (const r of rows) {
     t.leads++;
     if (r.contacted) t.contacted++;
     if (r.is_set) t.set++;
     if (r.is_issued) t.issued++;
     if (r.is_demo) t.demos++;
-    if (r.is_sold) { t.sold++; t.gross += Number(r.gross_sale || 0); }
+    if (r.is_sold) {
+      t.sold++;
+      t.gross += Number(r.gross_sale || 0);
+      t.cancelled += Number(r.cancelled_amount || 0);
+      t.denied += Number(r.financing_denied_amount || 0);
+      t.rtp += Number(r.rtp_amount || 0);
+    }
   }
-  t.gross = Math.round(t.gross * 100) / 100;
+  const c2 = (v) => Math.round(v * 100) / 100;
+  for (const k of ['gross', 'cancelled', 'denied', 'rtp']) t[k] = c2(t[k]);
+  t.net = c2(t.gross - t.cancelled - t.denied);
+  t.pending = c2(t.net - t.rtp);
   return t;
 }
 const ratio = (a, b) => (b ? a / b : 0);
@@ -131,6 +159,7 @@ function styleCell(cell, { size = 9, bold = false, color, fill, numFmt, align, b
  */
 export function buildVendorWorkbook(report, { generatedAt = new Date() } = {}) {
   const rows = Array.isArray(report?.rows) ? report.rows : [];
+  const revShare = report?.rev_share === true;
   const n = rows.length;
   const last = Math.max(n + 1, 2);                   // last Leads data row (at least row 2, so ranges stay valid)
   const rng = (field) => `Leads!$${COL[field]}$2:$${COL[field]}$${last}`;
@@ -145,8 +174,8 @@ export function buildVendorWorkbook(report, { generatedAt = new Date() } = {}) {
     views: [{ showGridLines: false }],
     pageSetup: { orientation: 'landscape', fitToPage: true, fitToWidth: 1, fitToHeight: 0 },
   });
-  ws.columns = [{ width: 24 }, ...Array.from({ length: 10 }, () => ({ width: 13 }))];
-  ws.mergeCells('A1:K1');
+  ws.columns = [{ width: 24 }, ...Array.from({ length: 12 }, () => ({ width: 13 }))];
+  ws.mergeCells('A1:M1');
   const title = ws.getCell('A1');
   title.value = 'REECE WINDOWS & DOORS';
   styleCell(title, { size: 18, bold: true, color: WHITE, fill: NAVY, align: { vertical: 'middle' } });
@@ -157,7 +186,7 @@ export function buildVendorWorkbook(report, { generatedAt = new Date() } = {}) {
   const meta = ws.getCell('A3');
   meta.value = `Leads entered ${mdy(report?.start_date)} – ${mdy(report?.end_date)} · Generated ${mdy(generatedAt.toISOString())} · Sources: Lead Perfection (leads, appointments, sales) and Five9 (calls)`;
   styleCell(meta, { size: 9, color: GREY });
-  for (let c = 1; c <= 11; c++) ws.getRow(4).getCell(c).border = { top: { style: 'medium', color: { argb: RED } } };
+  for (let c = 1; c <= 13; c++) ws.getRow(4).getCell(c).border = { top: { style: 'medium', color: { argb: RED } } };
 
   const t = tally(rows);
   const tiles = [
@@ -168,21 +197,34 @@ export function buildVendorWorkbook(report, { generatedAt = new Date() } = {}) {
     ['Issued', { formula: `COUNTIF(${rng('is_issued')},"Y")`, result: t.issued }, '#,##0'],
     ['Demos', { formula: `COUNTIF(${rng('is_demo')},"Y")`, result: t.demos }, '#,##0'],
     ['Sales', { formula: `COUNTIF(${rng('is_sold')},"Y")`, result: t.sold }, '#,##0'],
-    ['Gross Sales', { formula: `SUM(${rng('gross_sale')})`, result: t.gross }, '"$"#,##0'],
+  ];
+  // Row 8-9: what happened to the sales (the user, 2026-10-19). D9 = Net, E9 = RTP.
+  const money = '"$"#,##0';
+  const dollarTiles = [
+    ['Gross Sales', { formula: `SUM(${rng('gross_sale')})`, result: t.gross }, money],
+    ['Cancelled', { formula: `SUM(${rng('cancelled_amount')})`, result: t.cancelled }, money],
+    ['Financing Denied', { formula: `SUM(${rng('financing_denied_amount')})`, result: t.denied }, money],
+    ['Net Sales', { formula: `SUM(${rng('net_sale')})`, result: t.net }, money],
+    [revShare ? 'RTP (your payout basis)' : 'Released to Production (RTP)', { formula: `SUM(${rng('rtp_amount')})`, result: t.rtp }, money],
+    ['Pending RTP', { formula: 'D9-E9', result: t.pending }, money],
   ];
   const tileBorder = { top: { style: 'thin', color: { argb: TILE_BORDER } }, left: { style: 'thin', color: { argb: TILE_BORDER } }, bottom: { style: 'thin', color: { argb: TILE_BORDER } }, right: { style: 'thin', color: { argb: TILE_BORDER } } };
-  tiles.forEach(([label, value, fmt], i) => {
-    const l = ws.getRow(5).getCell(i + 1);
-    l.value = label;
-    styleCell(l, { size: 9, color: GREY, fill: TILE_FILL, border: tileBorder, align: { horizontal: 'center' } });
-    const v = ws.getRow(6).getCell(i + 1);
-    v.value = value;
-    styleCell(v, { size: 14, bold: true, color: NAVY, fill: TILE_FILL, border: tileBorder, numFmt: fmt, align: { horizontal: 'center' } });
-  });
-  ws.getRow(6).height = 24;
+  function tileRow(labelRow, list) {
+    list.forEach(([label, value, fmt], i) => {
+      const l = ws.getRow(labelRow).getCell(i + 1);
+      l.value = label;
+      styleCell(l, { size: 9, color: GREY, fill: TILE_FILL, border: tileBorder, align: { horizontal: 'center', wrapText: true } });
+      const v = ws.getRow(labelRow + 1).getCell(i + 1);
+      v.value = value;
+      styleCell(v, { size: 14, bold: true, color: NAVY, fill: TILE_FILL, border: tileBorder, numFmt: fmt, align: { horizontal: 'center' } });
+    });
+    ws.getRow(labelRow + 1).height = 24;
+  }
+  tileRow(5, tiles);
+  tileRow(8, dollarTiles);
 
-  const TABLE_HEAD = ['Leads', 'Contacted', 'Contact %', 'Appts Set', 'Set Rate', 'Issued', 'Issued / Set', 'Demos', 'Sales', 'Gross Sales'];
-  const FMTS = ['#,##0', '#,##0', '0.0%', '#,##0', '0.0%', '#,##0', '0.0%', '#,##0', '#,##0', '"$"#,##0'];
+  const TABLE_HEAD = ['Leads', 'Contacted', 'Contact %', 'Appts Set', 'Set Rate', 'Issued', 'Issued / Set', 'Demos', 'Sales', 'Gross Sales', 'Net Sales', 'RTP'];
+  const FMTS = ['#,##0', '#,##0', '0.0%', '#,##0', '0.0%', '#,##0', '0.0%', '#,##0', '#,##0', money, money, money];
   // One breakdown table (by market, or by entry week). keyField is the Leads column the first column matches.
   function table(startRow, heading, firstHeader, keyField, keys, keyFmt) {
     const h = ws.getCell(`A${startRow}`);
@@ -214,6 +256,8 @@ export function buildVendorWorkbook(report, { generatedAt = new Date() } = {}) {
         { formula: cf('is_demo'), result: s.demos },
         { formula: cf('is_sold'), result: s.sold },
         { formula: `SUMIFS(${rng('gross_sale')},${rng(keyField)},${key})`, result: s.gross },
+        { formula: `SUMIFS(${rng('net_sale')},${rng(keyField)},${key})`, result: s.net },
+        { formula: `SUMIFS(${rng('rtp_amount')},${rng(keyField)},${key})`, result: s.rtp },
       ];
       values.forEach((v, i) => {
         const c = row.getCell(i + 1);
@@ -232,6 +276,7 @@ export function buildVendorWorkbook(report, { generatedAt = new Date() } = {}) {
       { formula: sum('E'), result: t.set }, { formula: `IFERROR(E${tr}/B${tr},0)`, result: ratio(t.set, t.leads) },
       { formula: sum('G'), result: t.issued }, { formula: `IFERROR(G${tr}/E${tr},0)`, result: ratio(t.issued, t.set) },
       { formula: sum('I'), result: t.demos }, { formula: sum('J'), result: t.sold }, { formula: sum('K'), result: t.gross },
+      { formula: sum('L'), result: t.net }, { formula: sum('M'), result: t.rtp },
     ];
     totals.forEach((v, i) => {
       const c = total.getCell(i + 1);
@@ -242,7 +287,7 @@ export function buildVendorWorkbook(report, { generatedAt = new Date() } = {}) {
   }
   const marketsPresent = MARKET_ORDER.filter((m) => rows.some((r) => r.market === m));
   for (const m of new Set(rows.map((r) => r.market))) if (m && !marketsPresent.includes(m)) marketsPresent.push(m);
-  const mEnd = table(8, 'By market', 'Market', 'market', marketsPresent, undefined);
+  const mEnd = table(11, 'By market', 'Market', 'market', marketsPresent, undefined);
   const weeks = [...new Set(rows.map((r) => ymd(r.entry_week)).filter(Boolean))].sort();
   const wEnd = table(mEnd + 2, 'By week (lead entry week)', 'Week of (Mon)', 'entry_week', weeks, 'yyyy-mm-dd');
   const foot = ws.getCell(`A${wEnd + 2}`);
@@ -258,6 +303,12 @@ export function buildVendorWorkbook(report, { generatedAt = new Date() } = {}) {
   for (const r of rows) {
     const values = {};
     for (const [, key, kind] of LEAD_COLUMNS) values[key] = cellValue(kind, r[key]);
+    const rowNum = ls.rowCount + 1;
+    // Net Sale Amount is a formula on the row itself, so the Summary's SUM of it stays a formula chain.
+    values.net_sale = r.is_sold
+      ? { formula: `N(${COL.gross_sale}${rowNum})-N(${COL.cancelled_amount}${rowNum})-N(${COL.financing_denied_amount}${rowNum})`,
+          result: Number(r.gross_sale || 0) - Number(r.cancelled_amount || 0) - Number(r.financing_denied_amount || 0) }
+      : null;
     const row = ls.addRow(values);
     row.eachCell({ includeEmpty: true }, (c, colNumber) => {
       const kind = LEAD_COLUMNS[colNumber - 1]?.[2];
@@ -276,6 +327,10 @@ export function buildVendorWorkbook(report, { generatedAt = new Date() } = {}) {
     if (NOT_DEFINED.has(field)) continue;
     const row = ds.addRow({ c: header, d: def });
     row.eachCell((c) => styleCell(c, { size: 9, align: { wrapText: true, vertical: 'top' } }));
+  }
+  for (const [c, d] of [...SUMMARY_DEFINITIONS, ...(revShare ? [REV_SHARE_DEFINITION] : [])]) {
+    const row = ds.addRow({ c, d });
+    row.eachCell((cell) => styleCell(cell, { size: 9, align: { wrapText: true, vertical: 'top' } }));
   }
 
   return { workbook: wb, fileName: reportFileName(report?.vendor_name, report?.end_date), rowCount: n, totals: t };
