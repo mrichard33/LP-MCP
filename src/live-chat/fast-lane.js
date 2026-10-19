@@ -132,6 +132,8 @@ import {
   guardTimeOffers,
   planLanguageHandoff,
   SPANISH_REPLY_MARKER,
+  SPANISH_NAME_MARKER,
+  SPANISH_PHONE_MARKER,
   planPriceTurn,
   priceTransitionReply,
   priceHint,
@@ -665,6 +667,7 @@ export function createLiveChatFastLane(deps) {
     classify: async () => ({ intent_class: 'UNCLEAR', confidence: 0, classification_method: 'none', reasoning: 'no classifier' }),
     emitEvent: async () => null,
     opsAlert: async () => null,
+    queueSpanishList: async () => ({ queued: false, reason: 'no_dep' }),
     // "Already posted" store for the once-per-chat fallback card (src/alert-posted.js).
     // The default finds nothing posted, so an unwired lane behaves as before.
     filterNew: async ({ items }) => ({ fresh: items, dedupe: 'none' }),
@@ -1053,7 +1056,8 @@ export function createLiveChatFastLane(deps) {
     let langHint = null;
 
     // ── Spanish → a person (2026-10-01; Part 8: the model writes it, in Spanish) ──
-    const langHandoff = planLanguageHandoff({ body, thread: context.conversation_recent, knownPhone: context.lead?.phone || contact?.phone || null });
+    const knownFirst = contact?.firstName || contact?.first_name || null;
+    const langHandoff = planLanguageHandoff({ body, thread: context.conversation_recent, knownPhone: context.lead?.phone || contact?.phone || null, knownName: knownFirst || context.lead?.name || null });
     if (langHandoff) {
       if (langHandoff.first) {
         // `first` is read from the thread alone, so Spanish → English → Spanish
@@ -1070,17 +1074,32 @@ export function createLiveChatFastLane(deps) {
           })
           .catch(err => d.warn(`[LiveChat] language hand-off event failed: ${err.message}`));
       }
+      // 2026-10-19 (Guest Visitor ugurs): the hand-off collects the first name
+      // and phone, so the contact is named before the summary card, the LP lead
+      // the addlead proxy held for a placeholder name goes out once the name
+      // lands (placeholder-name-followups.js), and the number reaches the Five9
+      // Spanish list.
       reference = {
         reply: langHandoff.reply, slots: [], record: { language_handoff: langHandoff.language },
-        capture: langHandoff.phone ? { phone: langHandoff.phone } : {},
+        capture: { ...(langHandoff.phone ? { phone: langHandoff.phone } : {}), ...(langHandoff.name ? { name: langHandoff.name } : {}) },
         extras: { language_handoff: langHandoff.language },
       };
       backup.reply = langHandoff.reply;
+      const askMarker = langHandoff.ask === 'name' ? [SPANISH_NAME_MARKER] : langHandoff.ask === 'phone' ? [SPANISH_PHONE_MARKER] : [];
       planOverride = {
         required_move: 'language_handoff', step: 'language_handoff', counters: {}, booking: { allowed: false },
-        reference_line: langHandoff.reply, reference_slots: [], reference_markers: [SPANISH_REPLY_MARKER],
+        reference_line: langHandoff.reply, reference_slots: [], reference_markers: [SPANISH_REPLY_MARKER, ...askMarker],
       };
-      langHint = 'LANGUAGE: the visitor writes in Spanish. Reply ONLY in Spanish, warmly, in one or two short sentences. A Spanish-speaking member of our team will reach out to them; ask nothing else.';
+      const askText = langHandoff.ask === 'name' ? 'End by asking for their first name (one question, nothing else).'
+        : langHandoff.ask === 'phone' ? 'End by asking for the best phone number to call them (one question, nothing else).'
+        : langHandoff.ask === 'confirm' ? 'End by asking if we may call them at the number on file (one question, nothing else).'
+        : 'Ask nothing else.';
+      langHint = `LANGUAGE: the visitor writes in Spanish. Reply ONLY in Spanish, warmly, in one or two short sentences. A Spanish-speaking member of our team will reach out to them. ${askText}`;
+      const spanishPhone = langHandoff.phone || context.lead?.phone || contact?.phone || null;
+      if (mode === 'live' && spanishPhone) {
+        Promise.resolve(d.queueSpanishList({ contactId, phone: spanishPhone, firstName: langHandoff.name, tags: [...(context.lead?.current_tags || []), ...(Array.isArray(tags) ? tags : [])] }))
+          .catch(err => d.warn(`[LiveChat] Spanish list queue failed for ${contactId}: ${err.message}`));
+      }
     }
 
     // ── the same turn state generateResponse builds ──

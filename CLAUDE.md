@@ -76,6 +76,15 @@ with nothing to act on (no outcome, flag, person line, openings, zip or market, 
 Visitor …" is not a name) gets no card (`worthPosting`); its row is kept with `payload.skipped = 'nothing_to_act_on'`
 and is never retried (4 of the first 10 shadow chats). Never add a per-message live-chat card: put it on the summary.
 
+**A Spanish chat visitor is named before anyone is told (the user, 2026-10-19).** "Guest Visitor ugurs" left a phone,
+got "a Spanish-speaking team member will follow up" and no name was ever asked, so the addlead proxy held the LP lead
+(`name-placeholder`) and the summary card named nobody. `planLanguageHandoff` (`src/live-chat/chat-rules.js`) now asks
+the first name, then the phone, one per message (a phone on file is read back in the name ask), and the name rides the
+chat's capture, which clears the placeholder and re-sends the held LP lead. Once a phone is known (live mode only), the
+number goes to the Five9 list named by `SPANISH_FIVE9_LIST` (`src/live-chat/spanish-list.js`, rule
+`LIVE_CHAT_SPANISH_LIST`, once unnamed and once named; unset = off). On 2026-10-19 Five9 had a "Spanish" skill but no
+Spanish list or campaign: the list must be built in Five9 before the variable is set.
+
 **When Slack is the PRIMARY destination, not a mirror, use `postToSlack(text, channelId)`** in
 `src/slack.js` — it returns `{ ok, ts, channel, error }`. `mirrorToSlack` fans out to several channels
 and reduces the result to a count, so it cannot tell you the message `ts` or that a specific post

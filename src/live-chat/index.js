@@ -18,6 +18,7 @@
  */
 
 import supabase from '../supabase.js';
+import { queueSpanishList, SPANISH_LIST_RULE } from './spanish-list.js';
 import { ghlFetch } from '../actions/helpers.js';
 import { GHL_LOCATION_ID } from '../actions/constants.js';
 import { buildLeadContext } from '../context-builder.js';
@@ -490,6 +491,18 @@ export function productionLaneDeps() {
     releaseSlot: releaseAgenticSlot,
     emitEvent,
     opsAlert: (text) => sendAlertMessage(text, { channel: 'ops' }),
+    // 2026-10-19: a Spanish visitor's number → the Five9 Spanish list
+    // (SPANISH_FIVE9_LIST; unset = nothing queued).
+    queueSpanishList: (input) => queueSpanishList(input, {
+      insertAction,
+      findExisting: async (key) => {
+        if (!supabase) return true; // cannot check → do not risk a duplicate
+        const { data, error } = await supabase.from('agent_actions').select('id')
+          .eq('rule_applied', SPANISH_LIST_RULE).contains('action_payload', { spanish_key: key }).limit(1);
+        if (error) throw new Error(error.message);
+        return Array.isArray(data) && data.length > 0;
+      },
+    }),
     filterNew: (a) => filterNew(a),
     recordPosted: (a) => recordPosted(a),
     fingerprint: recordMessageContextDetached,
