@@ -35,6 +35,17 @@
 export const HOLD_MARKET = 'REECE_HOLD';
 
 /**
+ * Billed but not found (the user, 2026-10-19: "accept an invoice as received
+ * and later amend it if a dispute arises … it should be clear that 9 leads
+ * were actually issued to an office, while 3 were overbilled"). The part of a
+ * call-center line we cannot match to its leads sits here: not charged to any
+ * office, shown as Disputed, until a revised invoice replaces it, the charge is
+ * confirmed, or a credit comes off it. Stored with rule 'hold' (the rule CHECK
+ * allows no other parked rule); the market keeps it apart from REECE_HOLD.
+ */
+export const DISPUTED_MARKET = 'DISPUTED';
+
+/**
  * Company-wide spend (the user, 2026-10-13: "For software that doesn't generate
  * leads for a specific office, distribute it evenly across all offices", e.g.
  * Hatch). A line whose eligible_markets holds ALL_OFFICES is split EQUALLY over
@@ -184,6 +195,40 @@ export function callCenterLineKind(expense) {
   const d = String(expense?.description || '');
   return CALL_CENTER_LINE_KINDS.find(([, rx]) => rx.test(d))?.[0] || null;
 }
+/** What one unit of a kind's weight is, for the card and the dispute note. */
+export const CALL_CENTER_UNIT = Object.freeze({
+  canvass: { one: 'canvass confirmation', many: 'canvass confirmations', dollars: false },
+  demo: { one: 'aged-lead demo', many: 'aged-lead demos', dollars: false },
+  sales: { one: 'dollar of sales', many: 'in sales', dollars: true },
+});
+
+const usd0 = (d) => `$${Math.round(d).toLocaleString('en-US')}`;
+const usd2 = (d) => `$${Number(d).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+
+/**
+ * Billed more than we found (the user, 2026-10-19: a dispute opens only when
+ * they billed MORE than we found; finding more just splits normally). `weights`
+ * are the found units per office (a count, or whole dollars of sales);
+ * `unitPrice` is the dollars billed per unit ($250 a demo, $15 a canvass
+ * confirmation, 0.015 per dollar of sales), from pay_rules. Unknown price → no
+ * dispute can be told. A gap under half a unit (a dollar for sales) is rounding.
+ * Returns null, or { matched, disputed, note } in dollars.
+ */
+export function callCenterGap({ amount, weights = {}, unitPrice, kind }) {
+  if (!(Number(unitPrice) > 0) || !CALL_CENTER_UNIT[kind]) return null;
+  const found = Object.entries(weights).filter(([m]) => m !== HOLD_MARKET && m !== DISPUTED_MARKET).reduce((a, [, v]) => a + Math.max(0, Number(v) || 0), 0);
+  const amountC = toCents(amount);
+  const matchedC = Math.min(amountC, Math.round(found * unitPrice * 100));
+  const gapC = amountC - matchedC;
+  const unit = CALL_CENTER_UNIT[kind];
+  if (gapC < (unit.dollars ? 100 : Math.round(unitPrice * 50))) return null;
+  const billed = amount / unitPrice;
+  const note = unit.dollars
+    ? `billed on ${usd0(billed)} in sales, found ${usd0(found)}: ${usd0(billed - found)} of sales not found (${usd2(gapC / 100)})`
+    : `billed ${Math.round(billed)} ${unit.many}, found ${found}: ${Math.round(billed) - found} not found (${usd2(gapC / 100)})`;
+  return { matched: fromCents(matchedC), disputed: fromCents(gapC), note };
+}
+
 export const CALL_CENTER_KIND_LABEL = Object.freeze({
   canvass: 'canvass appointments it confirmed', demo: 'aged-lead demos it set', sales: 'sales on leads it set',
 });
@@ -224,11 +269,23 @@ export function allocateExpense(expense, issuedLookup = () => ({})) {
   const out = [];
   for (const slice of splitPeriodByMonth(expense.period_start, expense.period_end, expense.amount)) {
     // An even split ignores issued leads entirely: every office pays the same.
-    const issuedByMarket = even ? {} : (issuedLookup(slice.month, slice.start, slice.end) || {});
+    const looked = even ? {} : (issuedLookup(slice.month, slice.start, slice.end) || {});
+    // A call-center line's lookup answers { weights, unitPrice }; anything else is a weight map.
+    const work = workKind && looked && typeof looked === 'object' && 'weights' in looked ? looked : null;
+    const issuedByMarket = work ? (work.weights || {}) : looked;
     let markets = even ? [...OFFICE_MARKETS] : (expense.eligible_markets || []);
     let note = null;
     if (workKind) {
       markets = marketsFromIssued(issuedByMarket);
+      const accepted = (expense.flags || []).includes('dispute_accepted');
+      const gap = accepted ? null : callCenterGap({ amount: slice.amount, weights: issuedByMarket, unitPrice: work?.unitPrice, kind: workKind });
+      if (gap) {
+        if (gap.matched > 0 && markets.length) {
+          for (const row of allocateSlice({ amount: gap.matched, markets, issuedByMarket })) out.push({ month: slice.month, lp_sub_source: subSource, ...row });
+        }
+        out.push({ month: slice.month, lp_sub_source: subSource, market: DISPUTED_MARKET, rule: 'hold', issued_basis: null, issued_total: null, amount: gap.disputed, note: gap.note });
+        continue;
+      }
       if (!markets.length) {
         markets = [HOLD_MARKET];
         note = `no call-center ${CALL_CENTER_KIND_LABEL[workKind]} found ${slice.start}..${slice.end} yet; split by office once they sync (re-run nightly)`;

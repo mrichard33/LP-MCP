@@ -12,13 +12,17 @@
  */
 import { escapeMrkdwn } from '../slack-approvals-core.js';
 import { FLAG_LABELS } from './expense-builder.js';
-import { ALL_OFFICES, CALL_CENTER_KIND_LABEL, COST_CATEGORIES, callCenterLineKind, costCategory, splitKind } from './allocation.js';
+import { ALL_OFFICES, CALL_CENTER_KIND_LABEL, CALL_CENTER_UNIT, COST_CATEGORIES, DISPUTED_MARKET, callCenterLineKind, costCategory, splitKind } from './allocation.js';
 
 export const MKT_INVOICE_ACTION_PREFIX = 'mktinv_';
 export const ACTION_MKTINV_APPROVE = 'mktinv_approve';
 export const ACTION_MKTINV_REJECT = 'mktinv_reject';
 export const ACTION_MKTINV_EDIT = 'mktinv_edit';
 export const ACTION_MKTINV_REOPEN = 'mktinv_reopen';
+// 2026-10-19 (the user: accept an invoice as received, amend it if a dispute
+// arises): settle the Disputed part of an approved invoice.
+export const ACTION_MKTINV_DISPUTE_ACCEPT = 'mktinv_dispute_accept';
+export const ACTION_MKTINV_DISPUTE_CREDIT = 'mktinv_dispute_credit';
 export const MKTINV_EDIT_CALLBACK = 'mktinv_edit';
 
 export const MARKET_OPTIONS = Object.freeze([
@@ -31,6 +35,7 @@ const short = (id) => String(id || '').slice(0, 8);
 
 export function marketLabel(code) {
   if (code === ALL_OFFICES) return 'All offices, split evenly';
+  if (code === DISPUTED_MARKET) return 'Disputed (not charged to any office)';
   return MARKET_OPTIONS.find(([c]) => c === code)?.[1] || code;
 }
 
@@ -120,7 +125,7 @@ export function groupLines(rows = []) {
 export function groupAllocations(allocation = []) {
   const groups = new Map();
   for (const a of allocation) {
-    const key = `${a.month}\u0000${a.market}`;
+    const key = `${a.month}\u0000${a.market}\u0000${a.kind || ''}`;
     const g = groups.get(key);
     if (!g) { groups.set(key, { ...a, amount: Math.round(Number(a.amount || 0) * 100) / 100, notes: a.note ? [a.note] : [] }); continue; }
     g.amount = Math.round((g.amount + Number(a.amount || 0)) * 100) / 100;
@@ -130,6 +135,31 @@ export function groupAllocations(allocation = []) {
   return [...groups.values()]
     .map(({ notes, ...g }) => ({ ...g, note: notes.join('; ') || undefined }))
     .sort((x, y) => (x.month === y.month ? marketLabel(x.market).localeCompare(marketLabel(y.market)) : x.month.localeCompare(y.month)));
+}
+
+const KIND_SHORT = Object.freeze({ demo: 'demos', sales: 'sales', canvass: 'canvass' });
+const fmt0 = (n) => Math.round(Number(n) || 0).toLocaleString('en-US');
+
+/**
+ * What a split was based on, in words a person reads (2026-10-19, the user could
+ * not read "(proportional, 4182700/17951276 issued)"): "$41,827 of $179,513 in
+ * sales", "3 of 9 aged-lead demos", "12 of 40 issued leads", "split evenly".
+ */
+export function basisText(a) {
+  if (!a || a.market === DISPUTED_MARKET) return '';
+  if (a.rule === 'equal') return ' (split evenly)';
+  if (a.rule == null || a.issued_basis == null || a.issued_total == null) return '';
+  const unit = a.kind ? CALL_CENTER_UNIT[a.kind] : null;
+  if (unit) return unit.dollars
+    ? ` ($${fmt0(a.issued_basis)} of $${fmt0(a.issued_total)} in sales)`
+    : ` (${fmt0(a.issued_basis)} of ${fmt0(a.issued_total)} ${unit.many})`;
+  if (a.rule === 'direct') return '';
+  return ` (${fmt0(a.issued_basis)} of ${fmt0(a.issued_total)} issued leads)`;
+}
+
+/** The money a set of allocation rows parks as Disputed. */
+export function disputedTotal(allocation = []) {
+  return Math.round(allocation.filter((a) => a.market === DISPUTED_MARKET).reduce((t, a) => t + Number(a.amount || 0), 0) * 100) / 100;
 }
 
 /**
@@ -177,7 +207,7 @@ export function buildReviewCard({
     : '_no lines_';
 
   const allocText = allocation.length
-    ? groupAllocations(allocation).map((a) => `• ${a.month.slice(0, 7)} ${marketLabel(a.market)}: ${usd(a.amount)}${a.rule ? ` (${a.rule}${a.issued_total != null && a.rule !== 'direct' ? `, ${a.issued_basis}/${a.issued_total} issued` : ''})` : ''}${a.note ? ` _${escapeMrkdwn(a.note)}_` : ''}`).join('\n')
+    ? groupAllocations(allocation).map((a) => `• ${a.month.slice(0, 7)} ${marketLabel(a.market)}${a.kind && a.market !== DISPUTED_MARKET ? ` · ${KIND_SHORT[a.kind]}` : ''}: ${usd(a.amount)}${basisText(a)}${a.note ? ` _${escapeMrkdwn(a.note)}_` : ''}`).join('\n')
     : '_cannot preview: fix the flags first_';
 
   const flagText = flags.length
@@ -189,7 +219,7 @@ export function buildReviewCard({
   const blocks = [
     { type: 'section', text: { type: 'mrkdwn', text: head.slice(0, 2900) } },
     { type: 'section', text: { type: 'mrkdwn', text: `*Lines*\n${lineText}`.slice(0, 2900) } },
-    { type: 'section', text: { type: 'mrkdwn', text: `*Allocation ${decision ? '' : 'preview '}by gross issued leads*\n${allocText}`.slice(0, 2900) } },
+    { type: 'section', text: { type: 'mrkdwn', text: `*Allocation${decision ? '' : ' preview'}*\n${allocText}`.slice(0, 2900) } },
     { type: 'section', text: { type: 'mrkdwn', text: flagText.slice(0, 2900) } },
     { type: 'context', elements: [{ type: 'mrkdwn', text: context.slice(0, 2900) }] },
   ];
@@ -200,10 +230,29 @@ export function buildReviewCard({
     blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `${icon} *${decision.outcome.replace('_', ' ')}* by ${escapeMrkdwn(decision.by)} · ${decision.at}` } });
     // 2026-10-19 (the user: "I would like the ability to reopen"): a decided
     // invoice can go back to review. Undoing the split is the handler's job.
+    const disputed = decision.outcome === 'rejected' ? 0 : disputedTotal(allocation);
+    const settle = disputed > 0 ? [
+      {
+        type: 'button', action_id: ACTION_MKTINV_DISPUTE_ACCEPT, text: { type: 'plain_text', text: 'Confirm charge' }, value: String(document?.id),
+        confirm: {
+          title: { type: 'plain_text', text: 'Confirm the disputed charge?' },
+          text: { type: 'mrkdwn', text: `The ${usd(disputed)} in dispute is accepted as billed and charged to the offices by the same split as the rest of the line.` },
+          confirm: { type: 'plain_text', text: 'Confirm charge' }, deny: { type: 'plain_text', text: 'Cancel' },
+        },
+      },
+      {
+        type: 'button', action_id: ACTION_MKTINV_DISPUTE_CREDIT, text: { type: 'plain_text', text: 'Credit received' }, value: String(document?.id),
+        confirm: {
+          title: { type: 'plain_text', text: 'Record a credit?' },
+          text: { type: 'mrkdwn', text: `The vendor credited the ${usd(disputed)} in dispute. It comes off the invoice and off the ledger; the offices keep what they were charged.` },
+          confirm: { type: 'plain_text', text: 'Record credit' }, deny: { type: 'plain_text', text: 'Cancel' },
+        },
+      },
+    ] : [];
     blocks.push({
       type: 'actions',
       block_id: `mktinv_done_${document?.id}`,
-      elements: [{
+      elements: [...settle, {
         type: 'button', action_id: ACTION_MKTINV_REOPEN, text: { type: 'plain_text', text: 'Reopen' }, value: String(document?.id),
         confirm: {
           title: { type: 'plain_text', text: 'Reopen this invoice?' },
@@ -223,7 +272,9 @@ export function buildReviewCard({
           type: 'button', action_id: ACTION_MKTINV_APPROVE, style: 'primary', text: { type: 'plain_text', text: 'Approve' }, value: String(document?.id),
           confirm: {
             title: { type: 'plain_text', text: 'Approve this invoice?' },
-            text: { type: 'mrkdwn', text: `Posts ${usd(total)} to the ledger and allocates it as previewed.` },
+            text: { type: 'mrkdwn', text: disputedTotal(allocation) > 0
+              ? `Accepts ${usd(total)} as received. ${usd(Math.round((total - disputedTotal(allocation)) * 100) / 100)} goes to the offices; ${usd(disputedTotal(allocation))} sits as Disputed until a revised invoice, a confirmed charge or a credit settles it.`
+              : `Posts ${usd(total)} to the ledger and allocates it as previewed.` },
             confirm: { type: 'plain_text', text: 'Approve' }, deny: { type: 'plain_text', text: 'Cancel' },
           },
         },

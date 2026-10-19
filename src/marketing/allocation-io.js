@@ -65,7 +65,10 @@ async function marketsForLeads(leadIds, { supabase = supabaseDefault } = {}) {
  * "- LF" agent), with the age split of its pay rules (agedDays, default 30):
  *   canvass  canvass appointments confirmed, counted
  *   demo     demos on AGED leads (created 30+ days before the set), counted
- *   sales    net dollars RTP'd on NEW leads (report 134), the 1.5% basis
+ *   sales    net WHOLE dollars RTP'd on NEW leads (report 134), the 1.5% basis
+ *            (whole dollars, not cents: the card prints "$41,827 of $179,513 in
+ *            sales", and issued_basis is an integer; 2026-10-19 the user could
+ *            not read "4182700/17951276 issued")
  * A sale takes the market report 134 prints for the job, else its lead's.
  * Checked against the August invoices: canvass 194 of 194 (8/23-8/31), demos
  * 9-13 of the 12-17 billed a week, sales $179,513 of $169,254 (8/1-8/15):
@@ -104,9 +107,35 @@ export async function callCenterWorkByMarketFor({ kind, from, to }, { supabase =
   for (const ev of events) {
     const m = jobMarket.get(String(ev.job_number)) || leadMarket.get(String(ev.lp_lead_id));
     if (!m) continue;
-    out[m] = (out[m] || 0) + (kind === 'sales' ? ev.basis_cents : 1);
+    out[m] = (out[m] || 0) + (kind === 'sales' ? ev.basis_cents / 100 : 1);
   }
+  if (kind === 'sales') for (const m of Object.keys(out)) out[m] = Math.round(out[m]);
   return out;
+}
+
+/**
+ * Dollars the call center bills per unit of a kind's weight, from its active
+ * pay_rules (the same table payroll pays it from): a demo / canvass
+ * confirmation's amount_cents, or the sales pct (dollars per dollar of sales).
+ * The newest rule wins whatever its start date (the August invoices predate the
+ * 2026-09-01 rules at the same rates). Unreadable → null: no dispute can be told,
+ * so the line is split by what was found, as before.
+ */
+const KIND_EVENT = { canvass: EVENT_CANVASS_CONFIRM, demo: EVENT_DEMO, sales: EVENT_DIRECT_NET };
+export async function callCenterUnitPrice(kind, { supabase = supabaseDefault } = {}) {
+  const event = KIND_EVENT[kind];
+  if (!event) return null;
+  try {
+    const { data, error } = await supabase.from('pay_rules').select('amount_cents, pct, effective_from')
+      .eq('payee_type', 'partner').eq('event_type', event).eq('active', true)
+      .order('effective_from', { ascending: false }).limit(1);
+    if (error || !data?.length) return null;
+    const r = data[0];
+    if (kind === 'sales') return r.pct != null && Number(r.pct) > 0 ? Number(r.pct) : null;
+    return r.amount_cents != null && Number(r.amount_cents) > 0 ? Number(r.amount_cents) / 100 : null;
+  } catch {
+    return null;
+  }
 }
 
 /** Last day of the calendar month a YYYY-MM-01 starts. */
@@ -128,7 +157,9 @@ export async function previewAllocation(expense, deps = {}) {
   const workKind = callCenterLineKind(expense);
   if (workKind) {
     // The slice's own days, not its whole month: the invoice bills one week's work.
-    for (const s of slices) counts[s.month] = await callCenterWorkByMarketFor({ kind: workKind, from: s.start, to: s.end }, deps);
+    // The unit price lets the allocator see a line billed for more than was found.
+    const unitPrice = await callCenterUnitPrice(workKind, deps);
+    for (const s of slices) counts[s.month] = { weights: await callCenterWorkByMarketFor({ kind: workKind, from: s.start, to: s.end }, deps), unitPrice };
     return allocateExpense(expense, (month) => counts[month] || {});
   }
   const holdOnly = (expense.eligible_markets || []).length === 1 && expense.eligible_markets[0] === HOLD_MARKET;

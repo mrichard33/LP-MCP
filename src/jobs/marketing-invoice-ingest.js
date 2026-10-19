@@ -42,8 +42,9 @@ import { triageExtraction, fillRowDefaults, linkedFileIn, SKIP_REASONS } from '.
 import { normalizeName } from '../marketing/vendors.js';
 import { allocateExpenseById, reallocateMonth, reconcileAllocations } from '../marketing/allocation-io.js';
 import { trueUpInvoice } from '../marketing/leadgurus-feed.js';
-import { buildReviewCard, buildDecisionReply } from '../marketing/slack-review.js';
-import { previewRows, reviewChannelId, signedOriginalLink } from '../marketing/review-actions.js';
+import { buildReviewCard, buildDecisionReply, disputedTotal } from '../marketing/slack-review.js';
+import { callCenterLineKind } from '../marketing/allocation.js';
+import { previewRows, reviewChannelId, signedOriginalLink, replaceEarlierInvoice } from '../marketing/review-actions.js';
 
 const LOG = '[MktInvoice]';
 export const INVOICES_BUCKET = 'marketing-invoices';
@@ -386,12 +387,22 @@ export async function ingestInvoice(body, deps = {}) {
 
   const ctxBase = { document: { id: documentId, ...meta, analyzer: a.analyzer }, vendor: a.vendor, facts: analysis.facts, flags, confidence: a.confidence, extraction: extracted.meta, vendorMethod: a.vendorMethod, disagreements: a.disagreements };
 
-  // 7. auto-approve or review
-  if (autoApproved) {
+  // 7. auto-approve or review. A line billed for more than we can find
+  // (2026-10-19) always goes to a person: its Disputed part needs someone to
+  // see it, even from a vendor that is otherwise auto-approved.
+  const preview = await previewRows(rows.map((r, i) => ({ ...r, id: expenseIds[i] })), { supabase });
+  const disputed = disputedTotal(preview);
+  if (disputed > 0) {
+    flags.push('billed_more_than_found');
+    await supabase.from('marketing_invoice_documents').update({ analysis: { ...analysis, flags, auto_approved: false } }).eq('id', documentId);
+  }
+  if (autoApproved && disputed <= 0) {
     const ts = now().toISOString();
     await supabase.from('marketing_expenses').update({ status: 'approved', approved_by: `auto (${history.priorApprovals} prior approvals, no flags)`, approved_at: ts }).in('id', expenseIds);
     const allocate = deps.allocate || allocateExpenseById;
     for (const id of expenseIds) await allocate(id, { supabase });
+    // A revised invoice replaces the original, auto-approved or not (2026-10-19).
+    await (deps.replaceEarlier || replaceEarlierInvoice)({ documentId, rows: rows.map((r, i) => ({ ...r, id: expenseIds[i] })), by: 'auto', now: ts }, { ...deps, supabase });
     let trueUp = null;
     if (a.vendor?.default_cost_type === 'feed') {
       const { data: approvedRows } = await supabase.from('marketing_expenses').select('*').in('id', expenseIds);
@@ -399,7 +410,9 @@ export async function ingestInvoice(body, deps = {}) {
     }
     await supabase.from('marketing_invoice_documents').update({ status: 'posted', updated_at: ts }).eq('id', documentId);
     const { data: approvedRows } = await supabase.from('marketing_expenses').select('*').in('id', expenseIds);
-    const { data: allocation } = await supabase.from('marketing_expense_allocations').select('month, market, amount, rule, issued_basis, issued_total').in('expense_id', expenseIds).order('month');
+    const kindOf = new Map((approvedRows || []).map((r) => [r.id, callCenterLineKind(r)]));
+    const { data: allocRows } = await supabase.from('marketing_expense_allocations').select('expense_id, month, market, amount, rule, issued_basis, issued_total').in('expense_id', expenseIds).order('month');
+    const allocation = (allocRows || []).map((x) => ({ ...x, kind: kindOf.get(x.expense_id) || null }));
     const link = await (deps.signedLink || signedOriginalLink)({ id: documentId, storage_bucket: INVOICES_BUCKET, storage_path: storagePath }, { supabase });
     const card = buildReviewCard({ ...ctxBase, rows: approvedRows || [], allocation: allocation || [], link, decision: { outcome: 'auto_approved', by: 'system', at: ts.slice(0, 16).replace('T', ' ') } });
     if (cfg.channelId) {
@@ -416,7 +429,7 @@ export async function ingestInvoice(body, deps = {}) {
     return { httpStatus: 200, success: true, duplicate: false, document_id: documentId, expense_ids: expenseIds, flags, auto_approved: true, true_up: trueUp };
   }
 
-  const allocation = await previewRows(rows.map((r, i) => ({ ...r, id: expenseIds[i] })), { supabase });
+  const allocation = preview;
   const link = await (deps.signedLink || signedOriginalLink)({ id: documentId, storage_bucket: INVOICES_BUCKET, storage_path: storagePath }, { supabase });
   const card = buildReviewCard({ ...ctxBase, rows, allocation, link });
   let posted = false;
