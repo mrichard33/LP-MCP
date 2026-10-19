@@ -205,7 +205,9 @@ const BOOKED_ROUTING_RULE_KEY = 'BOOKED_DIAL_ROUTING';
 // reason the push is: a promised call cannot wait on a click. Welded to rule
 // LP_CALLBACK_REARM_FIVE9 AND to the callback list alone (isCallbackRearmDelete:
 // one list, callbackListName(), never LP_ASAP). The same op from any other rule,
-// or naming any other list, is still armed.
+// or naming any other list, is still armed. 2026-10-19: the Spanish list
+// (SPANISH_FIVE9_LIST) is re-armable too, because its campaign runs the same
+// Callback Request V3 profile (rearmableLists).
 // 2026-10-16 — disqualified leads (ND / No Demo, Mark, handoff v3.4 Fix 2) come
 // off every outbound list. Approval stays the default (#1057): only with
 // DISQUALIFIED_FIVE9_AUTO_REMOVE=true (exactly) do rows from rule

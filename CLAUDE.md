@@ -87,8 +87,12 @@ got "a Spanish-speaking team member will follow up" and no name was ever asked, 
 the first name, then the phone, one per message (a phone on file is read back in the name ask), and the name rides the
 chat's capture, which clears the placeholder and re-sends the held LP lead. Once a phone is known (live mode only), the
 number goes to the Five9 list named by `SPANISH_FIVE9_LIST` (`src/live-chat/spanish-list.js`, rule
-`LIVE_CHAT_SPANISH_LIST`, once unnamed and once named; unset = off). On 2026-10-19 Five9 had a "Spanish" skill but no
-Spanish list or campaign: the list must be built in Five9 before the variable is set.
+`LIVE_CHAT_SPANISH_LIST`; unset = off; live: `Spanish`). **It is a callback push (the user, 2026-10-19):** the Spanish
+campaign runs profile "Callback Request V3", which dials on `callback_requested_at`, so the first push does what
+lp-requeue does: Five9 DNC first (a hit asks for one lift review, never pushes), the re-arm (`rearmableLists` now holds
+the callback list AND the Spanish list, never LP_ASAP), `callback_requested_at` on the Eastern clock, call-now, and
+`checkCallbackRearm` alerts #contact-center when the list did not grow. A name arriving later is a name-only update
+(`kind: 'name_update'`: no re-arm, no call-now, no new request time). Never a record without the request time: V3 skips it.
 
 **When Slack is the PRIMARY destination, not a mirror, use `postToSlack(text, channelId)`** in
 `src/slack.js` — it returns `{ ok, ts, channel, error }`. `mirrorToSlack` fans out to several channels

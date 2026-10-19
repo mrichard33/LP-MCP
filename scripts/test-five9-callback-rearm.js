@@ -115,6 +115,21 @@ test('any other rule, list, list count or LP_ASAP is NOT the re-arm delete', () 
   });
 });
 
+// 2026-10-19: the Spanish campaign runs the same Callback Request V3 profile.
+test('the Spanish list is re-armable once named, alone, and never LP_ASAP', () => {
+  withEnv({ FIVE9_CALLBACK_LIST_NAME: undefined, SPANISH_FIVE9_LIST: 'Spanish' }, () => {
+    assert.equal(isCallbackRearmDelete(del({ list_name: 'Spanish' })), true);
+    assert.equal(isCallbackRearmDelete(del({ list_names: ['Spanish', 'Callback Request'] })), false);
+    assert.equal(isCallbackRearmDelete(del({ list_name: 'Spanish' }, 'BOOKED_DIAL_ROUTING')), false);
+  });
+  withEnv({ SPANISH_FIVE9_LIST: undefined }, () => {
+    assert.equal(isCallbackRearmDelete(del({ list_name: 'Spanish' })), false);
+  });
+  withEnv({ SPANISH_FIVE9_LIST: 'LP_ASAP' }, () => {
+    assert.equal(isCallbackRearmDelete(del({ list_name: 'LP_ASAP' })), false);
+  });
+});
+
 test('the executor refuses an unarmed delete that is not the re-arm', async () => {
   for (const action of [
     del({ list_name: 'Reece Chatbot', field_names: ['number1'], values: [NUMBER] }),
@@ -291,6 +306,19 @@ test('a push that grew, a dry run, a deferral or another rule posts nothing', as
   assert.equal((await checkCallbackRearm(pushAction(), { dry_run: true, previous_state: { size: 63 }, new_state: null }, deps)).status, 'unknown');
   assert.equal(await checkCallbackRearm(pushAction(), { deferred: true }, deps), null);
   assert.equal(await checkCallbackRearm({ ...pushAction(), rule_applied: 'NEW_LEAD_DIAL_BACKSTOP' }, { previous_state: { size: 5 }, new_state: { size: 5 } }, deps), null);
+  // The Spanish list's name-only update adds no entry by design.
+  assert.equal(await checkCallbackRearm({ ...pushAction({ list_name: 'Spanish', kind: 'name_update' }), rule_applied: 'LIVE_CHAT_SPANISH_LIST' }, { previous_state: { size: 5 }, new_state: { size: 5 } }, deps), null);
+});
+
+test('a flat Spanish-list push is called out like a callback push', async () => {
+  const posts = [];
+  const out = await checkCallbackRearm({ ...pushAction({ list_name: 'Spanish', kind: 'push' }), rule_applied: 'LIVE_CHAT_SPANISH_LIST' }, { previous_state: { size: 1 }, new_state: { size: 1 } }, {
+    env: { SLACK_CHANNEL_SERVICE: 'C_CC' },
+    post: async (text, ch) => { posts.push({ text, ch }); return { ok: true }; },
+    emitEvent: async () => {},
+  });
+  assert.equal(out.status, 'not_rearmed');
+  assert.match(posts[0].text, /"Spanish" list/);
 });
 
 test('the card says which case it is', () => {

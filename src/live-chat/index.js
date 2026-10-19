@@ -498,9 +498,16 @@ export function productionLaneDeps() {
       findExisting: async (key) => {
         if (!supabase) return true; // cannot check → do not risk a duplicate
         const { data, error } = await supabase.from('agent_actions').select('id')
-          .eq('rule_applied', SPANISH_LIST_RULE).contains('action_payload', { spanish_key: key }).limit(1);
+          .in('rule_applied', [SPANISH_LIST_RULE, 'CALLBACK_DNC_REVIEW']).contains('action_payload', { spanish_key: key }).limit(1);
         if (error) throw new Error(error.message);
         return Array.isArray(data) && data.length > 0;
+      },
+      // CustID / lead_id for the screen pop when the lead is in LP already.
+      findLpLead: async (contactId) => {
+        if (!supabase) return null;
+        const { data } = await supabase.from('lp_leads').select('lp_prospect_id, lp_lead_id')
+          .eq('ghl_contact_id', contactId).order('lp_lead_id', { ascending: false }).limit(1);
+        return Array.isArray(data) && data[0] ? data[0] : null;
       },
     }),
     filterNew: (a) => filterNew(a),

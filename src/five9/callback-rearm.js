@@ -31,6 +31,7 @@
 
 import supabase from '../supabase.js';
 import { callbackListName } from './callback-push.js';
+import { spanishListName, SPANISH_LIST_RULE } from '../live-chat/spanish-list.js';
 
 /** rule_applied on the delete row. The executor's carve-out keys on it. */
 export const REARM_RULE_KEY = 'LP_CALLBACK_REARM_FIVE9';
@@ -52,19 +53,29 @@ const DELETE_STALE_MS = 30_000;
  */
 const BACKGROUND_HOLD_MS = 5 * 60_000;
 
-/** Is this delete the callback re-arm, on the callback list and nothing else? Pure. */
-export function isCallbackRearmDelete(action, listName = callbackListName()) {
+/**
+ * The lists a re-arm may touch: the callback list, and the Spanish list
+ * (2026-10-19: its campaign runs the same "Callback Request V3" profile, so a
+ * Spanish chat visitor is pushed exactly like a callback request).
+ */
+export function rearmableLists(env = process.env) {
+  return [callbackListName(), spanishListName(env)].map((l) => String(l || '').trim()).filter(Boolean);
+}
+
+/** Is this delete the callback re-arm, on ONE re-armable list and nothing else? Pure. */
+export function isCallbackRearmDelete(action, listName = rearmableLists()) {
   if (action?.action_type !== 'five9_delete_record_from_list') return false;
   if (action?.rule_applied !== REARM_RULE_KEY) return false;
   const p = action.action_payload || {};
   const lists = Array.isArray(p.list_names) && p.list_names.length
     ? p.list_names.map((l) => String(l || '').trim())
     : [String(p.list_name || '').trim()];
-  const ours = String(listName || '').trim();
-  // LP_ASAP is LP's own list: never an unarmed write of any kind, even if the
+  // LP_ASAP is LP's own list: never an unarmed write of any kind, even if an
   // env var ever names it.
-  if (!ours || ours.toUpperCase() === 'LP_ASAP') return false;
-  return lists.length === 1 && lists[0] === ours;
+  const ours = (Array.isArray(listName) ? listName : [listName])
+    .map((l) => String(l || '').trim())
+    .filter((l) => l && l.toUpperCase() !== 'LP_ASAP');
+  return lists.length === 1 && ours.includes(lists[0]);
 }
 
 /** The delete row: one number, the callback list only. Pure. */
@@ -210,9 +221,12 @@ export function formatNotRearmedCard({ name, phone, contactId, listName, verdict
  */
 export async function checkCallbackRearm(action, addResult, deps = {}) {
   try {
-    if (action?.action_type !== 'five9_add_records_to_list' || action?.rule_applied !== CALLBACK_PUSH_RULE_KEY) return null;
+    if (action?.action_type !== 'five9_add_records_to_list') return null;
+    if (action?.rule_applied !== CALLBACK_PUSH_RULE_KEY && action?.rule_applied !== SPANISH_LIST_RULE) return null;
     if (!addResult || addResult.deferred || addResult.skipped) return null;
     const p = action.action_payload || {};
+    // The Spanish list's name-only update adds no entry by design: nothing to check.
+    if (p.kind === 'name_update') return null;
     const verdict = rearmVerdict(addResult, p.rearm || null);
     if (verdict.status !== 'not_rearmed') {
       console.log(`[LP-REQUEUE] callback push ${action.id}: ${verdict.status} (list ${verdict.size_before ?? '?'} → ${verdict.size_after ?? '?'})`);
