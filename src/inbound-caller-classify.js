@@ -161,9 +161,16 @@ export function classifyCaller(caller, ctx = {}) {
   const contact = ghl.status === 'found' ? ghl.contact : null;
   const tags = tagsOf(contact);
 
-  if (ctx.five9Dnc?.has(phone)) return { label: 'dnc', why: 'on the Five9 DNC list' };
-  const dncTag = tags.find((t) => DNC_SET.has(t));
-  if (dncTag) return { label: 'dnc', why: `GHL tag ${dncTag}` };
+  // ctx.ignoreDnc (2026-10-18): "what would this caller be once the DNC is
+  // lifted?" — asked only to decide whether to lift. ctx.ignoreDncTags: tags
+  // a finished lift deliberately leaves (dnc-sms after a texted STOP keeps
+  // texts off; calls, and so an LP lead, are back).
+  if (!ctx.ignoreDnc) {
+    if (ctx.five9Dnc?.has(phone)) return { label: 'dnc', why: 'on the Five9 DNC list' };
+    const ignored = new Set((ctx.ignoreDncTags || []).map((t) => String(t).toLowerCase()));
+    const dncTag = tags.find((t) => DNC_SET.has(t) && !ignored.has(t));
+    if (dncTag) return { label: 'dnc', why: `GHL tag ${dncTag}` };
+  }
 
   // Decided from the call itself, before any GHL read: nothing GHL holds can
   // turn a refusal into a lead. `ctx.notALead` lets the job apply the
@@ -252,4 +259,34 @@ export function formatDailySummary({ runDate, mode, summary, actioned = null }) 
     lines.push(`Last 24h: ${actioned.queued} queued for approval · ${actioned.created} leads created · ${actioned.failed} failed`);
   }
   return lines.join('\n');
+}
+
+/* --- DNC callers, lifted first (2026-10-18) -------------------------------- */
+
+// Mark: with INBOUND_CAPTURE_MODE=live and INBOUND_CAPTURE_DNC_LIFT=on, a DNC
+// caller who would otherwise be captured has the DNC lifted first (through
+// request_dnc_lift_review, so a canvassing caller still goes to a person), and
+// the LP lead is created only once the lift has finished. Until then the row
+// waits as dnc_pending_lift and every hourly pass looks again.
+export const LIFT_REQUEUE_AFTER_MS = 24 * 60 * 60 * 1000;
+const LIFT_ACTION_OPEN = new Set(['pending', 'executing', 'pending_approval', 'approved']);
+const LIFT_REQUEST_OPEN = new Set(['awaiting_decision', 'processing']);
+
+/**
+ * The next step for a caller waiting on a lift. Pure.
+ * @param {object} p
+ *   action   the request_dnc_lift_review row (null when it is gone)
+ *   request  its dnc_lift_requests row (null when the review asked nothing)
+ * @returns {'wait' | 'kept_blocked' | 'try_capture' | 'requeue'}
+ *   try_capture runs captureCaller, which re-reads Five9 and GHL: only a lift
+ *   that really finished lets the lead through.
+ */
+export function pendingLiftStep({ action = null, request = null } = {}) {
+  if (!action) return 'requeue';
+  if (LIFT_ACTION_OPEN.has(action.status)) return 'wait';
+  if (action.status !== 'completed') return 'requeue';
+  if (!request) return 'try_capture';
+  if (request.status === 'kept_blocked') return 'kept_blocked';
+  if (LIFT_REQUEST_OPEN.has(request.status)) return 'wait';
+  return 'try_capture';
 }

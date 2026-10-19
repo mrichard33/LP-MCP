@@ -61,6 +61,9 @@ import { getConsent, detectCarrierStop, blockingTags, isMissingSchemaError } fro
 import { APPROVED_DNC_LIFT_RULE_KEY, isSlackUserId } from '../five9/admin-writes.js';
 import { lpManualClearRequired } from './dnc-lift-review.js';
 import { trackBackground } from '../graceful-shutdown.js';
+import {
+  AUTO_DNC_LIFT_RULE_KEY, AUTO_DNC_LIFT_APPROVER, AUTO_LIFT_ACTOR, AUTO_LIFT_TAG, AUTO_LIFT_EVENT, AUTO_LIFT_SOURCE,
+} from './dnc-auto-lift.js';
 
 export const KEEP_BLOCKED_RULE_KEY = 'SLACK_DNC_KEEP_BLOCKED';
 export const LIFT_TAGS = Object.freeze([
@@ -108,63 +111,87 @@ function actorLabel({ slackUserId, slackUserName }) {
  * The APPROVE batch as agent_actions rows. Pure. `carrierStop` decides the
  * only three differences: dnc-sms stays, SMS/RCS DND stays, and phone consent
  * is recorded as granted-for-calls with a reason that says so.
+ *
+ * `auto` (2026-10-18, DNC_LIFT_APPROVAL_MODE=auto): the SAME batch with a
+ * system actor instead of a Slack user. Rule AUTO_DNC_LIFT, consent source
+ * auto_lift, tag recovery:dnc-lifted-auto, event consent.dnc_lifted_auto, and
+ * the Five9 row approved by AUTO_DNC_LIFT_APPROVER (admin-writes.js accepts
+ * that only for AUTO_DNC_LIFT while the mode is still auto). Carrier-STOP
+ * handling is identical.
  */
-export function buildLiftBatch({ contactId, requestId, slackUserId, slackUserName, slackTs, carrierStop, carrierBasis = [], blocking = [], lpClear = false }) {
-  const actor = actorLabel({ slackUserId, slackUserName });
-  const evidence = {
-    slack_ts: slackTs, request_id: requestId, slack_user_id: slackUserId,
-    slack_user_name: slackUserName || null, blocking_tags: blocking,
-    sms_carrier_stop: carrierStop, carrier_stop_basis: carrierBasis,
-  };
+export function buildLiftBatch({ contactId, requestId, slackUserId, slackUserName, slackTs, carrierStop, carrierBasis = [], blocking = [], lpClear = false, auto = false }) {
+  const actor = auto ? AUTO_LIFT_ACTOR : actorLabel({ slackUserId, slackUserName });
+  const ruleKey = auto ? AUTO_DNC_LIFT_RULE_KEY : APPROVED_DNC_LIFT_RULE_KEY;
+  const source = auto ? AUTO_LIFT_SOURCE : 'slack_lift';
+  const evidence = auto
+    ? {
+      request_id: requestId, approved_by: AUTO_DNC_LIFT_APPROVER, blocking_tags: blocking,
+      sms_carrier_stop: carrierStop, carrier_stop_basis: carrierBasis,
+    }
+    : {
+      slack_ts: slackTs, request_id: requestId, slack_user_id: slackUserId,
+      slack_user_name: slackUserName || null, blocking_tags: blocking,
+      sms_carrier_stop: carrierStop, carrier_stop_basis: carrierBasis,
+    };
   const base = (action_type, target_system, action_payload, extra = {}) => ({
     action_type, target_system, target_entity: 'contact', target_id: contactId,
-    action_payload, rule_applied: APPROVED_DNC_LIFT_RULE_KEY, batch_id: requestId,
+    action_payload, rule_applied: ruleKey, batch_id: requestId,
     requires_approval: false,
-    reasoning: `Manual DNC lift approved in Slack by ${actor} (request ${requestId})`,
+    reasoning: auto
+      ? `DNC lift auto-approved (DNC_LIFT_APPROVAL_MODE=auto, request ${requestId})`
+      : `Manual DNC lift approved in Slack by ${actor} (request ${requestId})`,
     ...extra,
   });
+  const lifted = auto ? 'Automatic DNC lift' : 'Manual DNC lift approved in #dnc-lift-approval';
   const tags = carrierStop ? [...LIFT_TAGS] : [...LIFT_TAGS, CARRIER_STOP_KEEP_TAG];
   const dnd = carrierStop ? [...LIFT_DND_CHANNELS] : [...LIFT_DND_CHANNELS, ...SMS_DND_CHANNELS];
   const rows = [
     base('record_consent_change', 'lp', {
-      channel: 'all', change: 'dnc_full_off', source: 'slack_lift', actor, evidence,
-      reason: 'Manual DNC lift approved in #dnc-lift-approval',
+      channel: 'all', change: 'dnc_full_off', source, actor, evidence,
+      reason: lifted,
     }),
     base('record_consent_change', 'lp', {
-      channel: 'phone', change: 'granted', source: 'slack_lift', actor, evidence,
+      channel: 'phone', change: 'granted', source, actor, evidence,
       reason: carrierStop
         ? 'Granted for CALLS only — the lead texted STOP, so SMS stays carrier-blocked until START/UNSTOP or a new form with SMS consent'
-        : 'Manual DNC lift approved in #dnc-lift-approval',
+        : lifted,
     }),
     base('record_consent_change', 'lp', {
-      channel: 'email', change: 'granted', source: 'slack_lift', actor, evidence,
-      reason: 'Manual DNC lift approved in #dnc-lift-approval — Email DND turned off',
+      channel: 'email', change: 'granted', source, actor, evidence,
+      reason: `${lifted} — Email DND turned off`,
     }),
     base('remove_tag', 'ghl', { tags, bypass_suppression: true }),
     base('set_dnd', 'ghl', {
       status: 'inactive', channels: dnd,
-      reason: `Manual DNC lift approved in Slack by ${actor}${carrierStop ? ' — SMS/RCS left ON (lead texted STOP)' : ''}`,
+      reason: `${auto ? 'DNC lift auto-approved' : `Manual DNC lift approved in Slack by ${actor}`}${carrierStop ? ' — SMS/RCS left ON (lead texted STOP)' : ''}`,
     }),
     // LP's clear has been rejected on every value tried ("Invalid DNC value",
     // still on 2026-10-09), and each lift retried it three times. Those retries
     // are what posted a second Slack reply. Until a clear is verified
     // (LP_DNC_CLEAR_WORKING=true) the step is not queued; lpClearOutcome then
     // reports the manual LP clear, and the thread says so.
-    ...(lpClear ? [base('update_lp_dnc_status', 'lp', { mode: 'clear', source: `slack_lift by ${actor}` })] : []),
+    ...(lpClear ? [base('update_lp_dnc_status', 'lp', { mode: 'clear', source: `${source} by ${actor}` })] : []),
     base('five9_remove_numbers_from_dnc_approved', 'lp', {
       numbers_from_contact: true,
-      approved_by: slackUserId,
-      approved_by_name: slackUserName || null,
+      approved_by: auto ? AUTO_DNC_LIFT_APPROVER : slackUserId,
+      approved_by_name: auto ? AUTO_LIFT_ACTOR : (slackUserName || null),
       clear_sms: !carrierStop,
       evidence,
     }, { requires_approval: true }),
-    base('add_tag', 'ghl', { tag: 'recovery:dnc-lifted-manual', bypass_suppression: true }),
-    base('emit_event', 'lp', {
-      event_type: 'consent.dnc_lifted_manual',
-      bypass_filter: true,
-      idempotency_key: `consent_dnc_lifted_manual_${requestId}`,
-      payload: { approver: { slack_user_id: slackUserId, slack_user_name: slackUserName || null }, evidence },
-    }),
+    base('add_tag', 'ghl', { tag: auto ? AUTO_LIFT_TAG : 'recovery:dnc-lifted-manual', bypass_suppression: true }),
+    base('emit_event', 'lp', auto
+      ? {
+        event_type: AUTO_LIFT_EVENT,
+        bypass_filter: true,
+        idempotency_key: `consent_dnc_lifted_auto_${requestId}`,
+        payload: { approver: { system: AUTO_DNC_LIFT_APPROVER, mode: 'auto' }, evidence },
+      }
+      : {
+        event_type: 'consent.dnc_lifted_manual',
+        bypass_filter: true,
+        idempotency_key: `consent_dnc_lifted_manual_${requestId}`,
+        payload: { approver: { slack_user_id: slackUserId, slack_user_name: slackUserName || null }, evidence },
+      }),
   ];
   return rows.map((r, i) => ({ ...r, sequence_order: i + 1 }));
 }
@@ -291,7 +318,7 @@ async function defaultReadContact(contactId) {
   }
 }
 
-async function defaultInsertActions(rows, db, holdUntilIso) {
+export async function defaultInsertActions(rows, db, holdUntilIso) {
   const insertRows = rows.map((r) => ({
     ...r,
     status: r.requires_approval ? 'pending_approval' : 'pending',
