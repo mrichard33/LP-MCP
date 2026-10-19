@@ -1,11 +1,15 @@
 /**
  * Held spend recommendations — src/marketing/holds.js (handoff D4, §7.5).
  *
- * Lead Gurus "Unknown" / "Out Of Area" spend and the daily territory gap sit
- * in REECE_HOLD. Nobody spreads that money automatically. This job writes a
- * RECOMMENDATION on each hold allocation so Mark or Brad can move it with one
- * click (the dashboard's "Apply recommendation", which rewrites
- * eligible_markets and reallocates):
+ * Lead Gurus "Unknown" / "Out Of Area" spend and the daily territory gap land
+ * in REECE_HOLD. Since 2026-10-19 (the user: "Why do we have all these …? This
+ * needs to be fixed." — August alone had 30 one-day items, some $0.01, and not
+ * one had a suggestion: recommendHolds only ever ran for the current and prior
+ * month) the FEED's held days are placed by code, assignHeldFeedSpend below:
+ * the offices of that day's held leads, else split by Lead Gurus' issued leads
+ * that month. Anything else still held gets a RECOMMENDATION a person applies
+ * with one click (the dashboard's "Apply recommendation"). How a held lead is
+ * matched:
  *
  *   1. who ran it: that day's Unknown / Out Of Area ft_leads matched to
  *      lp_leads by email, then by the last 10 digits of the phone → the
@@ -19,7 +23,7 @@
 import supabaseDefault from '../supabase.js';
 import { FEED_SOURCE, FEED_GAP_TERRITORY } from './leadgurus-feed.js';
 import { prospectLabel } from '../format-helpers.js';
-import { callCenterLineKind } from './allocation.js';
+import { callCenterLineKind, HOLD_MARKET } from './allocation.js';
 
 const LOG = '[MktHold]';
 const digits = (s) => String(s || '').replace(/\D/g, '');
@@ -82,7 +86,14 @@ export async function matchHeldLeads(date, { supabase = supabaseDefault } = {}) 
     }
     if (hit) {
       const map = await loadBranchMap();
-      const market = map[hit.lp_branch_id] || null;
+      let market = map[hit.lp_branch_id] || null;
+      // An Out Of Area lead often has no LP branch (37 of 52 August matches,
+      // 2026-10-19); the lead's resolved market (zip / branch) is the next answer.
+      if (!market && hit.lp_lead_id) {
+        const { data: assigned } = await supabase.from('lp_lead_market_assignments').select('resolved_market_code').eq('lead_id', String(hit.lp_lead_id)).limit(1);
+        const code = String(assigned?.[0]?.resolved_market_code || '');
+        if (/_MKT$/.test(code)) market = code;
+      }
       out.push({ lead_id: lead.lead_id, market, reason: `matched LP ${prospectLabel(hit.lp_prospect_id)}, branch ${hit.lp_branch_id || '?'}` });
       continue;
     }
@@ -155,4 +166,52 @@ export async function applyRecommendation(expenseId, { markets, by }, deps = {})
   if (error) throw new Error(`apply recommendation failed: ${error.message}`);
   const { allocateExpenseById } = await import('./allocation-io.js');
   return { ok: true, ...(await allocateExpenseById(expenseId, { supabase })) };
+}
+
+const cents = (n) => Math.round(Number(n || 0) * 100);
+
+/** Pure: the offices a day's matched held leads point at, most leads first (none = []). */
+export function marketsFromMatches(matches = []) {
+  const counts = {};
+  for (const m of matches) if (m?.market) counts[m.market] = (counts[m.market] || 0) + 1;
+  return Object.entries(counts).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).map(([m]) => m);
+}
+
+/**
+ * Place every held Lead Gurus feed day of a month (the user, 2026-10-19: "assign it
+ * automatically"; supersedes D4's "never spread by code" for the feed). Each held
+ * day (an "Unknown" / "Out Of Area" territory row or the day gap) goes to the
+ * offices of THAT day's held leads, matched in LP (matchHeldLeads), split by those
+ * offices' Lead Gurus issued leads that month; a day with no match is split like
+ * any lead-source cost, by Lead Gurus' issued leads per office that month
+ * (eligible_markets '{}'). The row keeps flag 'auto_assigned', and the feed sync
+ * keeps its markets when the day's amount changes (syncFeedExpenses). A failed
+ * lookup leaves the day held for the next run, never guessed.
+ */
+export async function assignHeldFeedSpend(month, deps = {}) {
+  const supabase = deps.supabase || supabaseDefault;
+  const { start, end } = monthBounds(month);
+  const { data: rows, error } = await supabase.from('marketing_expenses').select('id, period_start, eligible_markets, amount, flags, status')
+    .eq('source_system', FEED_SOURCE).eq('status', 'approved').gte('period_start', start).lte('period_start', end);
+  if (error) throw new Error(`feed rows read failed: ${error.message}`);
+  const held = (rows || []).filter((r) => (r.eligible_markets || []).length === 1 && r.eligible_markets[0] === HOLD_MARKET && cents(r.amount) !== 0);
+  const out = { month: start, held: held.length, to_offices: 0, by_source: 0, failed: 0 };
+  const allocate = deps.allocate || (await import('./allocation-io.js')).allocateExpenseById;
+  const cache = {};
+  for (const r of held) {
+    try {
+      cache[r.period_start] ||= await (deps.matchHeldLeads || matchHeldLeads)(r.period_start, { supabase });
+      const markets = marketsFromMatches(cache[r.period_start]);
+      const flags = [...new Set([...(r.flags || []), 'auto_assigned'])];
+      const { error: uErr } = await supabase.from('marketing_expenses').update({ eligible_markets: markets, flags, updated_at: new Date().toISOString() }).eq('id', r.id);
+      if (uErr) throw new Error(uErr.message);
+      await allocate(r.id, { supabase });
+      if (markets.length) out.to_offices++; else out.by_source++;
+    } catch (err) {
+      out.failed++;
+      console.warn(`${LOG} assign ${r.period_start} (${r.id}): ${err.message}`);
+    }
+  }
+  console.log(`${LOG} ${start} held feed days assigned: ${JSON.stringify(out)}`);
+  return out;
 }

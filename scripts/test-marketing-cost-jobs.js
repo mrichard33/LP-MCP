@@ -248,3 +248,61 @@ test('commission: an *_estimate rule writes provisional rows flagged estimate; L
   assert.equal(stored.provisional, true);
   assert.deepEqual(stored.flags, ['estimate']);
 });
+
+// 2026-10-19: "Why do we have all these …? This needs to be fixed." Held Lead Gurus days are placed by code.
+import { assignHeldFeedSpend, marketsFromMatches } from '../src/marketing/holds.js';
+import { syncFeedExpenses } from '../src/marketing/leadgurus-feed.js';
+
+test('marketsFromMatches: most matched leads first, unmatched ignored, none → []', () => {
+  assert.deepEqual(marketsFromMatches([{ market: 'SAR_MKT' }, { market: 'ORL_MKT' }, { market: 'ORL_MKT' }, { market: null }]), ['ORL_MKT', 'SAR_MKT']);
+  assert.deepEqual(marketsFromMatches([{ market: null }]), []);
+});
+
+test('assignHeldFeedSpend: a matched day goes to its offices, an unmatched day splits by source, nothing else moves', async () => {
+  const supabase = fakeSupabase({
+    marketing_expenses: [
+      { id: 'd9', source_system: 'leadgurus_feed', status: 'approved', period_start: '2026-08-09', eligible_markets: ['REECE_HOLD'], amount: 113.81, flags: ['unassigned_territory'] },
+      { id: 'd26', source_system: 'leadgurus_feed', status: 'approved', period_start: '2026-08-26', eligible_markets: ['REECE_HOLD'], amount: 70.52, flags: ['unknown_territory'] },
+      { id: 'zero', source_system: 'leadgurus_feed', status: 'approved', period_start: '2026-08-26', eligible_markets: ['REECE_HOLD'], amount: 0, flags: [] },
+      { id: 'mapped', source_system: 'leadgurus_feed', status: 'approved', period_start: '2026-08-26', eligible_markets: ['ORL_MKT'], amount: 500, flags: [] },
+      { id: 'inv', source_system: 'email_invoice', status: 'approved', period_start: '2026-08-01', eligible_markets: ['REECE_HOLD'], amount: 10, flags: [] },
+    ],
+  });
+  const allocated = [];
+  const out = await assignHeldFeedSpend('2026-08', {
+    supabase,
+    allocate: async (id) => allocated.push(id),
+    matchHeldLeads: async (day) => (day === '2026-08-09' ? [{ market: 'SAR_MKT' }, { market: 'ORL_MKT' }, { market: 'ORL_MKT' }] : [{ market: null }]),
+  });
+  assert.deepEqual(out, { month: '2026-08-01', held: 2, to_offices: 1, by_source: 1, failed: 0 });
+  const byId = Object.fromEntries(supabase.tables.marketing_expenses.map((r) => [r.id, r]));
+  assert.deepEqual(byId.d9.eligible_markets, ['ORL_MKT', 'SAR_MKT']);
+  assert.deepEqual(byId.d26.eligible_markets, []);
+  assert.ok(byId.d26.flags.includes('auto_assigned') && byId.d26.flags.includes('unknown_territory'));
+  assert.deepEqual(byId.zero.eligible_markets, ['REECE_HOLD']);
+  assert.deepEqual(byId.inv.eligible_markets, ['REECE_HOLD']);
+  assert.deepEqual(allocated.sort(), ['d26', 'd9']);
+});
+
+test('assignHeldFeedSpend: a failed lookup leaves the day held for the next run', async () => {
+  const supabase = fakeSupabase({ marketing_expenses: [{ id: 'd1', source_system: 'leadgurus_feed', status: 'approved', period_start: '2026-08-01', eligible_markets: ['REECE_HOLD'], amount: 5, flags: [] }] });
+  const out = await assignHeldFeedSpend('2026-08', { supabase, allocate: async () => {}, matchHeldLeads: async () => { throw new Error('ft_leads read failed'); } });
+  assert.equal(out.failed, 1);
+  assert.deepEqual(supabase.tables.marketing_expenses[0].eligible_markets, ['REECE_HOLD']);
+});
+
+test('feed sync: a placed held day keeps its offices when the feed re-pulls a new amount', async () => {
+  const supabase = fakeSupabase({
+    marketing_vendors: [{ id: 'v-lg', vendor_name: 'Lead Gurus' }],
+    marketing_territory_map: [],
+    ft_summary_territory: [{ date: '2026-08-26', territory: 'Unknown', total_spend: 80 }],
+    ft_daily_summary: [{ date: '2026-08-26', total_spend: 80 }],
+    marketing_expenses: [{ id: 'u26', source_system: 'leadgurus_feed', source_ref: '2026-08-26|Unknown', status: 'approved', period_start: '2026-08-26', period_end: '2026-08-26', amount: 70.52, eligible_markets: [], flags: ['unknown_territory', 'auto_assigned'], lp_sub_sources: ['Lead Gurus'], cost_type: 'feed' }],
+    marketing_expense_allocations: [],
+  }, { rpc: { mkt_issued_counts: () => [] } });
+  await syncFeedExpenses({ from: '2026-08-26', to: '2026-08-26' }, { supabase });
+  const row = supabase.tables.marketing_expenses.find((r) => r.id === 'u26');
+  assert.equal(Number(row.amount), 80);
+  assert.deepEqual(row.eligible_markets, []);
+  assert.ok(row.flags.includes('auto_assigned'));
+});

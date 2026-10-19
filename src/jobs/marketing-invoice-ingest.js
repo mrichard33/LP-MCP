@@ -557,6 +557,24 @@ export function registerMarketingInvoiceRoutes(app, deps = {}) {
     }
   });
 
+  // Place held Lead Gurus feed days for a range of months (2026-10-19 backfill;
+  // the nightly does the current and prior month). { from: 'YYYY-MM', to: 'YYYY-MM' }.
+  app.post('/n8n/admin/marketing-expenses/assign-held', json, async (req, res) => {
+    try {
+      if (refuse(req, res)) return;
+      const { assignHeldFeedSpend } = await import('../marketing/holds.js');
+      const { monthsInPeriod } = await import('../marketing/commission.js');
+      const from = String(req.body?.from || '').slice(0, 7);
+      const to = String(req.body?.to || from).slice(0, 7);
+      if (!/^\d{4}-\d{2}$/.test(from) || !/^\d{4}-\d{2}$/.test(to)) return res.status(400).json({ success: false, error: 'from / to must be YYYY-MM' });
+      const months = [];
+      for (const m of monthsInPeriod(`${from}-01`, `${to}-01`)) months.push(await assignHeldFeedSpend(m, deps));
+      res.json({ success: true, months });
+    } catch (err) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
   // Redraw the review cards already in Slack with today's card and rules
   // (2026-10-19: six LightFire cards kept the split from before the rule change).
   app.post('/n8n/admin/marketing-invoices/refresh-cards', json, async (req, res) => {

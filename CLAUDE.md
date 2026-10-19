@@ -1056,9 +1056,15 @@ Brad's XLSX (`marketing-cost-report`, formulas never typed values) read `v_marke
   note (`linked_file`), never a $0 card. The rules read receipts too ("Receipt #", "Amount paid", "Date paid", ordinals,
   "Oct 1 – Nov 1, 2026" with one year, "Amount Due | $X" table rows, QuickBooks' "amount due on invoice 1883 is $X").
   `scripts/test-marketing-invoice-formats.js` holds one sample per format: a new format seen live goes there first.
-- **REECE_HOLD money is never spread by code (D4).** Lead Gurus "Unknown" / "Out Of Area" and the daily territory gap
-  (09-22: $4,763.59) sit on `REECE_HOLD`; `src/marketing/holds.js` writes a RECOMMENDATION (matched LP lead → branch,
-  else zip → service area) and a person applies it. A day gap is held only once the day is over and only from $5
+- **Held Lead Gurus days are placed by code (the user, 2026-10-19; supersedes D4's "never spread by code" for the
+  feed).** "Why do we have all these …? This needs to be fixed.": August alone listed 30 one-day "Unknown" items (some
+  $0.01) for a person to place, and none had a suggestion (`recommendHolds` only ever ran for the current and prior
+  month). `assignHeldFeedSpend` (`src/marketing/holds.js`; nightly, before the re-split; backfill
+  `POST /n8n/admin/marketing-expenses/assign-held {from,to}`) puts each held feed day (Unknown / Out Of Area territory
+  or the day gap) on the offices of THAT day's held leads (`matchHeldLeads`: email, phone → LP branch, else the lead's
+  `lp_lead_market_assignments` market, else zip → service area), split by their Lead Gurus issued leads; no match →
+  `eligible_markets '{}'`, the by-source split. Flag `auto_assigned`; `syncFeedExpenses` keeps a placed day's offices
+  when the feed re-pulls it. Everything else still on `REECE_HOLD` gets a RECOMMENDATION a person applies. A day gap is held only once the day is over and only from $5
   (`GAP_MIN_CENTS`, `buildFeedRows` in `leadgurus-feed.js`, 2026-10-19): a mid-day pull held $62.65 that the next pull
   zeroed, and a $0.02 rounding gap got an "Apply recommendation" button. The user kept the button (2026-10-19). The feed is provisional until the invoice supersedes it
   (`trueUpInvoice`, variance > `MKT_FEED_VARIANCE_PCT` posts a line).
