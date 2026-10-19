@@ -216,3 +216,41 @@ test('card combines repeated invoice lines and sums the allocation per month and
   const mixed = groupAllocations([a('SAR_MKT', 5, 1), { month: '2026-10-01', market: 'SAR_MKT', amount: 5, rule: 'direct', issued_basis: 1, issued_total: 1 }]);
   assert.deepEqual([mixed[0].amount, mixed[0].rule], [10, null]);
 });
+
+// 2026-10-19, the user: per-market invoice lines go to the market printed on them;
+// Lakeland → Orlando, BOCA → Fort Lauderdale.
+import { marketFromLineText } from '../src/marketing/expense-builder.js';
+import { buildDecisionReply } from '../src/marketing/slack-review.js';
+test('an invoice line that prints one market goes to that market', () => {
+  assert.equal(marketFromLineText('Account Level - BOCA - Total Leads (BOCA)'), 'FTLAU_MKT');
+  assert.equal(marketFromLineText('Account Level - LAKE - Total Leads (LAKE)'), 'ORL_MKT');
+  assert.equal(marketFromLineText('Account Level - FTMYR - Total Leads'), 'FTMYR_MKT');
+  assert.equal(marketFromLineText('Leads - St. Petersburg'), 'STPET_MKT');
+  assert.equal(marketFromLineText('Lake Worth homeowners'), null, 'a capital code only, never prose');
+  assert.equal(marketFromLineText('ORL and JAX bundle'), null, 'two markets → split by source as before');
+  assert.equal(marketFromLineText('Monthly subscription'), null);
+  const vendor = { id: 'v', vendor_name: 'Modernize', lp_sub_sources: ['Modernize'], eligible_markets: [] };
+  const facts = { invoice_number: '9', total: 300, period_start: '2026-10-09', period_end: '2026-10-15' };
+  const analysis = { lines: [
+    { description: 'Account Level - BOCA - Total Leads (BOCA)', amount: 198, lp_sub_source: 'Modernize', markets: [] },
+    { description: 'Account Level - LAKE - Total Leads (LAKE)', amount: 30, lp_sub_source: 'Modernize', markets: [] },
+    { description: 'Platform fee', amount: 72, lp_sub_source: 'Modernize', markets: [] },
+  ] };
+  const { rows } = buildExpenseRows({ document: { id: 'd' }, vendor, facts, analysis, confidence: 0.9 });
+  assert.deepEqual(rows.map((r) => r.eligible_markets), [['FTLAU_MKT'], ['ORL_MKT'], []]);
+});
+
+test('Edit on an invoice whose lines carry their own markets never offers one market box for all', () => {
+  const rows = [{ amount: 1, lp_sub_sources: ['Modernize'], eligible_markets: ['FTLAU_MKT'] }, { amount: 2, lp_sub_sources: ['Modernize'], eligible_markets: ['ORL_MKT'] }];
+  const v = buildEditView({ document: DOCX, facts: {}, rows });
+  assert.ok(!ids(v).includes('markets'));
+  assert.ok(v.blocks.some((b) => b.type === 'context' && /printed on it/.test(b.elements[0].text)));
+  assert.equal(marketsForSplit({ split: 'markets', eligible_markets: [] }), null, 'Save keeps each line\'s market');
+});
+
+test('the thread reply names who decided and the money per market', () => {
+  const t = buildDecisionReply({ outcome: 'approved', by: 'mark', total: 300, allocation: [
+    { month: '2026-10-01', market: 'FTLAU_MKT', amount: 100 }, { month: '2026-11-01', market: 'FTLAU_MKT', amount: 98 }, { month: '2026-10-01', market: 'ORL_MKT', amount: 102 }] });
+  assert.equal(t, '✅ Approved by mark · $300.00\n• Fort Lauderdale: $198.00\n• Orlando: $102.00');
+  assert.match(buildDecisionReply({ outcome: 'reopened', by: 'brad' }), /^🔓 Reopened by brad/);
+});

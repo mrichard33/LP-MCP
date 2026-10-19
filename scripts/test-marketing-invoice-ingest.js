@@ -110,8 +110,10 @@ test('known vendor, clean, 2 prior person approvals → auto-approved and alloca
   assert.deepEqual(allocs.map((a) => [a.market, Number(a.amount), a.rule]).sort(), [['FTMYR_MKT', 600, 'direct'], ['SAR_MKT', 400, 'direct']]);
   assert.equal(trueUps.length, 1, 'the feed vendor gets a true-up');
   assert.equal(supabase.tables.marketing_invoice_documents[0].status, 'posted');
-  assert.equal(posts.length, 1, 'an auto-approved card still lands, without buttons');
-  assert.ok(!posts[0].opts.blocks.some((b) => b.type === 'actions'));
+  // 2026-10-19: the card, then the decision as a reply in its thread; the card's only button is Reopen.
+  assert.equal(posts.length, 2, 'an auto-approved card still lands, plus its thread reply');
+  assert.deepEqual(posts[0].opts.blocks.filter((b) => b.type === 'actions').flatMap((b) => b.elements.map((e) => e.action_id)), ['mktinv_reopen']);
+  assert.match(posts[1].text, /Auto-approved/);
   assert.deepEqual((await reconcileAllocations({ supabase })).filter((x) => !/^p\d$/.test(x.id)), []);
 });
 
@@ -312,14 +314,14 @@ test('edit opens the modal through views.open with the document in private_metad
   assert.equal(opened[0].view.private_metadata, documentId);
 });
 
-test('card: an undecided card has three buttons, a decided one none', () => {
+test('card: an undecided card has three buttons, a decided one only Reopen', () => {
   const doc = { id: '99999999-9999-4999-8999-999999999999' };
   const open = buildReviewCard({ document: doc, vendor: VENDORS[0], facts: { total: 1 }, rows: [], flags: ['low_confidence'] });
   const actions = open.blocks.find((b) => b.type === 'actions');
   assert.deepEqual(actions.elements.map((e) => e.action_id), ['mktinv_approve', 'mktinv_edit', 'mktinv_reject']);
   assert.ok(actions.elements.every((e) => e.value === doc.id));
   const done = buildReviewCard({ document: doc, vendor: VENDORS[0], facts: { total: 1 }, rows: [], decision: { outcome: 'approved', by: 'mark', at: 'now' } });
-  assert.ok(!done.blocks.some((b) => b.type === 'actions'));
+  assert.deepEqual(done.blocks.filter((b) => b.type === 'actions').flatMap((b) => b.elements.map((e) => e.action_id)), ['mktinv_reopen']);
 });
 
 // ─── Lead Gurus feed ─────────────────────────────────────────────────────────
@@ -703,4 +705,44 @@ test('a document still failed a day later is removed and named once', async () =
   assert.deepEqual(supabase.tables.marketing_invoice_documents.map((d) => d.id).sort(), ['new', 'ok']);
   assert.equal(posts.length, 1);
   assert.match(posts[0], /x\.pdf/);
+});
+
+// 2026-10-19, the user: "I would like the ability to reopen" and "show the
+// approval right below as a reply to the thread".
+test('approve posts a thread reply per market; Reopen undoes the split, reopens the card and replies again', async () => {
+  const supabase = db({}, MHP_ISSUED);
+  const r = await ingestMhp(supabase);
+  const doc = supabase.tables.marketing_invoice_documents.find((d) => d.id === r.document_id);
+  doc.slack_channel = 'C_REVIEW'; doc.slack_ts = '111.222';
+  const replies = []; const threads = [];
+  const deps = { supabase, approvers: new Set(['U_BRAD']), reply: async (_u, b) => replies.push(b), signedLink: async () => null,
+    postToSlack: async (text, channel, opts) => { threads.push({ text, channel, threadTs: opts?.threadTs }); return { ok: true }; } };
+  await handleMarketingInvoiceInteraction(parsedClick('approve', r.document_id, { userId: 'U_BRAD', userName: 'brad' }), deps);
+  assert.equal(threads.length, 1);
+  assert.equal(threads[0].threadTs, '111.222');
+  assert.match(threads[0].text, /Approved by brad · \$1,000\.00/);
+  assert.match(threads[0].text, /Fort Myers: \$750\.00/);
+  assert.ok(JSON.stringify(replies.at(-1).blocks).includes('mktinv_reopen'), 'a decided card carries Reopen');
+
+  const re = await handleMarketingInvoiceInteraction(parsedClick('reopen', r.document_id, { userId: 'U_BRAD', userName: 'brad' }), deps);
+  assert.equal(re.action, 'reopened');
+  assert.equal(supabase.tables.marketing_expense_allocations.length, 0, 'the split is taken back out');
+  assert.ok(supabase.tables.marketing_expenses.every((x) => x.status === 'pending_review' && !x.approved_by));
+  assert.equal(doc.status, 'in_review');
+  assert.ok(JSON.stringify(replies.at(-1).blocks).includes('mktinv_approve'), 'the card has its buttons back');
+  assert.match(threads.at(-1).text, /Reopened by brad/);
+  const again = await handleMarketingInvoiceInteraction(parsedClick('reopen', r.document_id, { userId: 'U_BRAD', userName: 'brad' }), deps);
+  assert.equal(again.action, 'nothing_to_reopen');
+  const ok = await handleMarketingInvoiceInteraction(parsedClick('approve', r.document_id, { userId: 'U_BRAD', userName: 'brad' }), deps);
+  assert.equal(ok.action, 'approved', 'approved again after the reopen');
+});
+
+test('a Lead Gurus (feed) invoice is not reopened from Slack', async () => {
+  const { supabase, documentId } = await ingestForReview();
+  const replies = [];
+  const deps = { supabase, approvers: new Set(['U_MARK']), reply: async (_u, b) => replies.push(b), trueUp: async () => ({ months: [] }), signedLink: async () => null, postToSlack: async () => ({ ok: true }) };
+  await handleMarketingInvoiceInteraction(parsedClick('approve', documentId), deps);
+  const r = await handleMarketingInvoiceInteraction(parsedClick('reopen', documentId), deps);
+  assert.equal(r.action, 'reopen_refused_feed');
+  assert.ok(supabase.tables.marketing_expenses.every((x) => x.status === 'approved'));
 });

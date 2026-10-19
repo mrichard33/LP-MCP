@@ -42,7 +42,7 @@ import { triageExtraction, fillRowDefaults, linkedFileIn, SKIP_REASONS } from '.
 import { normalizeName } from '../marketing/vendors.js';
 import { allocateExpenseById, reallocateMonth, reconcileAllocations } from '../marketing/allocation-io.js';
 import { trueUpInvoice } from '../marketing/leadgurus-feed.js';
-import { buildReviewCard } from '../marketing/slack-review.js';
+import { buildReviewCard, buildDecisionReply } from '../marketing/slack-review.js';
 import { previewRows, reviewChannelId, signedOriginalLink } from '../marketing/review-actions.js';
 
 const LOG = '[MktInvoice]';
@@ -404,7 +404,13 @@ export async function ingestInvoice(body, deps = {}) {
     const card = buildReviewCard({ ...ctxBase, rows: approvedRows || [], allocation: allocation || [], link, decision: { outcome: 'auto_approved', by: 'system', at: ts.slice(0, 16).replace('T', ' ') } });
     if (cfg.channelId) {
       const r = await post(card.text, cfg.channelId, { blocks: card.blocks });
-      if (r.ok) await supabase.from('marketing_invoice_documents').update({ slack_channel: r.channel, slack_ts: r.ts }).eq('id', documentId);
+      if (r.ok) {
+        await supabase.from('marketing_invoice_documents').update({ slack_channel: r.channel, slack_ts: r.ts }).eq('id', documentId);
+        // 2026-10-19: the decision also sits in the card's thread, like a person's approval.
+        const total = (approvedRows || []).reduce((acc, x) => acc + Number(x.amount || 0), 0);
+        const t = await post(buildDecisionReply({ outcome: 'auto_approved', by: 'system', total, allocation: allocation || [] }), r.channel, { threadTs: r.ts });
+        if (!t?.ok) console.warn(`${LOG} ${documentId} auto-approve thread reply not posted: ${t?.error}`);
+      }
     }
     console.log(`${LOG} ${documentId} auto-approved (${a.vendor?.vendor_name}, $${a.facts.total})`);
     return { httpStatus: 200, success: true, duplicate: false, document_id: documentId, expense_ids: expenseIds, flags, auto_approved: true, true_up: trueUp };

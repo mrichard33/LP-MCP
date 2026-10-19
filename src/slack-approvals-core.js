@@ -266,7 +266,7 @@ export function parseMarketingInvoiceInteraction(rawBody) {
       };
     }
     const decision = id.slice(MKT_INVOICE_ACTION_PREFIX.length);
-    if (!['approve', 'reject', 'edit'].includes(decision)) return null;
+    if (!['approve', 'reject', 'edit', 'reopen'].includes(decision)) return null;
     const documentId = String(action.value ?? '').trim();
     if (!UUID_RE.test(documentId)) return null;
     return {

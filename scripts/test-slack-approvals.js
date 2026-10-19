@@ -504,6 +504,7 @@ test('mktinv: parse — decisions, uuid document id, modal values; malformed →
   assert.equal(p.triggerId, 'trig.1');
   assert.equal(p.responseUrl, 'https://hooks.slack.com/actions/T/1/x');
   assert.equal(parseMarketingInvoiceInteraction(mktClick('mktinv_edit')).decision, 'edit');
+  assert.equal(parseMarketingInvoiceInteraction(mktClick('mktinv_reopen')).decision, 'reopen');
   const m = parseMarketingInvoiceInteraction(mktModal());
   assert.equal(m.decision, 'edit_submit');
   assert.equal(m.documentId, DOC);

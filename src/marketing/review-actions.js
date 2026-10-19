@@ -21,9 +21,9 @@
 import supabaseDefault from '../supabase.js';
 import { postToSlack, updateSlackMessage } from '../slack.js';
 import { parseApproverIds } from '../slack-approvals-core.js';
-import { allocateExpenseById, previewAllocation } from './allocation-io.js';
+import { allocateExpenseById, previewAllocation, deleteAllocations } from './allocation-io.js';
 import { trueUpInvoice } from './leadgurus-feed.js';
-import { buildReviewCard, buildEditView, parseEditSubmission, marketsForSplit, subSourcesForSplit } from './slack-review.js';
+import { buildReviewCard, buildEditView, buildDecisionReply, parseEditSubmission, marketsForSplit, subSourcesForSplit } from './slack-review.js';
 import { computeFlags } from './expense-builder.js';
 import { vendorLearnPatch, normalizeName } from './vendors.js';
 import { splitsEvenly } from './allocation.js';
@@ -141,6 +141,19 @@ async function updateCard(ctx, card, deps) {
   const channel = ctx.document.slack_channel || reviewChannelId(deps.env);
   if (!ctx.document.slack_ts || !channel) return { ok: false, error: 'no_card' };
   return update(channel, ctx.document.slack_ts, card.text, { blocks: card.blocks });
+}
+
+/**
+ * One reply in the card's thread (2026-10-19, the user: the approval "right below
+ * as a reply to the thread so it is always directly attached"). Best effort: a
+ * failed reply is a log line, never a reason to undo the decision.
+ */
+export async function postDecisionReply(document, text, deps = {}) {
+  const channel = document?.slack_channel || reviewChannelId(deps.env);
+  if (!document?.slack_ts || !channel || !text) return { ok: false, error: 'no_card' };
+  const r = await (deps.postToSlack || postToSlack)(text, channel, { threadTs: document.slack_ts });
+  if (!r?.ok) console.warn(`${LOG} decision reply for ${document.id} not posted: ${r?.error}`);
+  return r || { ok: false };
 }
 
 /**
@@ -275,6 +288,35 @@ export async function handleMarketingInvoiceInteraction(parsed, deps = {}) {
     return { handled: true, action: 'edited' };
   }
 
+  // 2026-10-19 (the user: "I would like the ability to reopen"): a decided
+  // invoice goes back to review. Its allocations are deleted (the market
+  // numbers drop it at once), the lines go back to pending_review, and the card
+  // gets its Approve / Edit / Reject buttons back. A Lead Gurus invoice is not
+  // reopened here: its approval superseded the feed rows (trueUpInvoice) and
+  // reopening would leave that month with neither.
+  if (decision === 'reopen') {
+    const decided = ctx.rows.filter((r) => r.status === 'approved' || r.status === 'rejected');
+    if (!decided.length) {
+      await reply(responseUrl, { response_type: 'ephemeral', replace_original: false, text: pending.length ? 'This invoice is already open for review.' : 'Nothing to reopen on this invoice.' });
+      return { handled: true, action: 'nothing_to_reopen' };
+    }
+    if (ctx.vendor?.default_cost_type === 'feed' && decided.some((r) => r.status === 'approved')) {
+      await reply(responseUrl, { response_type: 'ephemeral', replace_original: false, text: 'Lead Gurus invoices can\'t be reopened from Slack yet (approving one replaced that month\'s daily feed). Nothing changed.' });
+      return { handled: true, action: 'reopen_refused_feed' };
+    }
+    const now = new Date().toISOString();
+    for (const r of decided) await (deps.deleteAllocations || deleteAllocations)(r.id, { supabase });
+    const { error } = await supabase.from('marketing_expenses').update({ status: 'pending_review', approved_by: null, approved_at: null, updated_at: now }).in('id', decided.map((r) => r.id));
+    if (error) throw new Error(`reopen update failed: ${error.message}`);
+    await supabase.from('marketing_invoice_documents').update({ status: 'in_review', updated_at: now }).eq('id', documentId);
+    const fresh = await loadReviewContext(documentId, { supabase });
+    const card = await renderCard(fresh, { note: `Reopened by ${userName}` }, { ...deps, supabase });
+    await reply(responseUrl, { replace_original: true, text: card.text, blocks: card.blocks });
+    await postDecisionReply(fresh.document, buildDecisionReply({ outcome: 'reopened', by: userName }), deps);
+    console.log(`${LOG} reopened ${documentId} by ${who}: ${decided.length} line(s)`);
+    return { handled: true, action: 'reopened' };
+  }
+
   if (!pending.length) {
     await reply(responseUrl, { response_type: 'ephemeral', replace_original: false, text: `This invoice was already ${ctx.rows[0]?.status || 'decided'}.` });
     return { handled: true, action: 'already_resolved' };
@@ -287,6 +329,7 @@ export async function handleMarketingInvoiceInteraction(parsed, deps = {}) {
     const fresh = await loadReviewContext(documentId, { supabase });
     const card = await renderCard(fresh, { decision: { outcome: 'rejected', by: userName, at: now.slice(0, 16).replace('T', ' ') } }, { ...deps, supabase });
     await reply(responseUrl, { replace_original: true, text: card.text, blocks: card.blocks });
+    await postDecisionReply(fresh.document, buildDecisionReply({ outcome: 'rejected', by: userName }), deps);
     return { handled: true, action: 'rejected' };
   }
 
@@ -319,6 +362,9 @@ export async function handleMarketingInvoiceInteraction(parsed, deps = {}) {
   const fresh = await loadReviewContext(documentId, { supabase });
   const card = await renderCard(fresh, { decision: { outcome: 'approved', by: userName, at: now.slice(0, 16).replace('T', ' ') } }, { ...deps, supabase });
   await reply(responseUrl, { replace_original: true, text: card.text, blocks: card.blocks });
+  const approvedTotal = fresh.rows.filter((r) => r.status === 'approved').reduce((a, r) => a + Number(r.amount || 0), 0);
+  const allocations = await loadAllocations(fresh.rows.map((r) => r.id), { supabase });
+  await postDecisionReply(fresh.document, buildDecisionReply({ outcome: 'approved', by: userName, total: approvedTotal, allocation: allocations }), deps);
   console.log(`${LOG} approved ${documentId} by ${who}: ${pending.length} line(s)${trueUp ? `, true-up ${JSON.stringify(trueUp.months)}` : ''}`);
   return { handled: true, action: 'approved', trueUp };
 }

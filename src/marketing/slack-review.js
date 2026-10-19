@@ -18,6 +18,7 @@ export const MKT_INVOICE_ACTION_PREFIX = 'mktinv_';
 export const ACTION_MKTINV_APPROVE = 'mktinv_approve';
 export const ACTION_MKTINV_REJECT = 'mktinv_reject';
 export const ACTION_MKTINV_EDIT = 'mktinv_edit';
+export const ACTION_MKTINV_REOPEN = 'mktinv_reopen';
 export const MKTINV_EDIT_CALLBACK = 'mktinv_edit';
 
 export const MARKET_OPTIONS = Object.freeze([
@@ -71,6 +72,25 @@ function extractionLine(extraction) {
   const pages = extraction.page_count ?? '?';
   const ocr = Number(extraction.ocr_pages || 0);
   return ocr ? `OCR ${ocr} of ${pages} page(s)` : `text layer (${pages} page(s))`;
+}
+
+/**
+ * The thread reply under the card when an invoice is decided or reopened
+ * (2026-10-19, the user: "show the approval right below as a reply to the
+ * thread so it is always directly attached"). One line per market, all months.
+ */
+export function buildDecisionReply({ outcome, by, total = null, allocation = [] }) {
+  const head = {
+    approved: `✅ Approved by ${by}`,
+    auto_approved: '🤖✅ Auto-approved',
+    rejected: `🚫 Rejected by ${by}`,
+    reopened: `🔓 Reopened by ${by}. Back in review; the cost is out of the market numbers until it is approved again.`,
+  }[outcome] || `${outcome} by ${by}`;
+  if (outcome === 'reopened' || outcome === 'rejected') return total == null || outcome === 'reopened' ? head : `${head} · ${usd(total)}`;
+  const byMarket = new Map();
+  for (const a of allocation) byMarket.set(a.market, Math.round(((byMarket.get(a.market) || 0) + Number(a.amount || 0)) * 100) / 100);
+  const lines = [...byMarket.entries()].sort((x, y) => marketLabel(x[0]).localeCompare(marketLabel(y[0]))).map(([m, amt]) => `• ${marketLabel(m)}: ${usd(amt)}`);
+  return [`${head} · ${usd(total)}`, ...lines].join('\n');
 }
 
 /** Card only: invoice lines with the same description, sub-source and split, summed (first-seen order). */
@@ -175,6 +195,22 @@ export function buildReviewCard({
   if (decision) {
     const icon = decision.outcome === 'approved' ? '✅' : decision.outcome === 'auto_approved' ? '🤖✅' : '🚫';
     blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `${icon} *${decision.outcome.replace('_', ' ')}* by ${escapeMrkdwn(decision.by)} · ${decision.at}` } });
+    // 2026-10-19 (the user: "I would like the ability to reopen"): a decided
+    // invoice can go back to review. Undoing the split is the handler's job.
+    blocks.push({
+      type: 'actions',
+      block_id: `mktinv_done_${document?.id}`,
+      elements: [{
+        type: 'button', action_id: ACTION_MKTINV_REOPEN, text: { type: 'plain_text', text: 'Reopen' }, value: String(document?.id),
+        confirm: {
+          title: { type: 'plain_text', text: 'Reopen this invoice?' },
+          text: { type: 'mrkdwn', text: decision.outcome === 'rejected'
+            ? 'Puts it back in review with Approve, Edit and Reject.'
+            : `Takes ${usd(total)} back out of the market costs and puts the invoice back in review. Approve it again when it is right.` },
+          confirm: { type: 'plain_text', text: 'Reopen' }, deny: { type: 'plain_text', text: 'Cancel' },
+        },
+      }],
+    });
   } else {
     blocks.push({
       type: 'actions',
@@ -226,6 +262,11 @@ export function buildEditView({ document, vendor, facts, rows = [], vendors = []
   const split = (state && typed('split', 'selected_option')?.value) || splitChoice(first);
   const splitInitial = splitOptions.find((o) => o.value === split);
   const isLeadSource = split === 'by_source' || split === 'markets';
+  // Lines that each carry their own market (the invoice printed one per line,
+  // 2026-10-19): the form never offers one market box for all of them, and a
+  // Save with no markets keeps every line's own (marketsForSplit → null).
+  const perLine = rows.length > 1 && new Set(rows.map((r) => [...(r.eligible_markets || [])].sort().join(','))).size > 1
+    && rows.every((r) => (r.eligible_markets || []).length && !(r.eligible_markets || []).includes(ALL_OFFICES));
   const rememberOption = { text: { type: 'plain_text', text: 'Use this vendor, sub-source and split for this vendor\'s next invoices' }, value: 'remember' };
   const rememberInitial = had('remember') ? (typed('remember', 'selected_options') || []) : [rememberOption];
   // On a redraw, a field the open form had keeps exactly what is in it (even
@@ -255,7 +296,9 @@ export function buildEditView({ document, vendor, facts, rows = [], vendors = []
   if (isLeadSource) {
     blocks.push(input('sub_source', 'LP sub-source', { type: 'plain_text_input', action_id: 'mktinv_v_sub_source', initial_value: text('sub_source', subsPrefill) }, hint('Must match the sub-source in Lead Perfection exactly.')));
   }
-  if (split === 'markets') {
+  if (split === 'markets' && perLine) {
+    blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: 'Each line goes to the market printed on it on the invoice.' }] });
+  } else if (split === 'markets') {
     blocks.push(input('markets', 'Markets', { type: 'multi_static_select', action_id: 'mktinv_v_markets', placeholder: { type: 'plain_text', text: 'Pick one or more' }, options: marketOptions, ...(marketInitial.length ? { initial_options: marketInitial } : {}) },
       hint('One office gets all of it. Several are split by their issued leads. "Hold at company level" parks it unassigned (not split) until you move it.')));
   }

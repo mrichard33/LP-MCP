@@ -30,6 +30,36 @@ export const FLAGS = Object.freeze({
 const cents = (n) => Math.round(Number(n || 0) * 100);
 
 /**
+ * The ONE market an invoice line names, or null (the user, 2026-10-19: "if the
+ * invoice has the budget broken down per market already, attach it to the
+ * markets listed"; "Lakeland → Orlando and BOCA is Fort Lauderdale").
+ * Modernize prints "Account Level - BOCA - Total Leads (BOCA)" per line, and
+ * every line had been split by issued leads over ALL markets.
+ *
+ * Short codes match only in capitals as whole words (LP's branch codes), so
+ * "Lake Worth" or "sar" in prose never match; city names match in any case.
+ * Two different markets on one line → null (split by source as before).
+ * MIAMI follows BOCA to Fort Lauderdale, the same alias as src/slack.js.
+ */
+const LINE_MARKET_CODES = [
+  [/\b(?:ORL|LAKE)\b/, 'ORL_MKT'], [/\b(?:BOCA|MIAMI|FTLAU|FTL)\b/, 'FTLAU_MKT'], [/\bFTMYR\b/, 'FTMYR_MKT'],
+  [/\bJAX\b/, 'JAX_MKT'], [/\bSAR\b/, 'SAR_MKT'], [/\b(?:STPET|STP)\b/, 'STPET_MKT'],
+];
+const LINE_MARKET_NAMES = [
+  [/\b(?:orlando|lakeland)\b/i, 'ORL_MKT'], [/\b(?:boca\s+raton|miami|f(?:or)?t\.?\s+lauderdale)\b/i, 'FTLAU_MKT'],
+  [/\bf(?:or)?t\.?\s+myers\b/i, 'FTMYR_MKT'], [/\bjacksonville\b/i, 'JAX_MKT'], [/\bsarasota\b/i, 'SAR_MKT'],
+  [/\b(?:st\.?|saint)\s+pete(?:rsburg)?\b/i, 'STPET_MKT'],
+];
+export function marketFromLineText(...texts) {
+  const text = texts.filter(Boolean).join(' ');
+  if (!text) return null;
+  const found = new Set();
+  for (const [rx, m] of LINE_MARKET_CODES) if (rx.test(text)) found.add(m);
+  for (const [rx, m] of LINE_MARKET_NAMES) if (rx.test(text)) found.add(m);
+  return found.size === 1 ? [...found][0] : null;
+}
+
+/**
  * Merge the rules' facts with the AI's. Rules win on total and invoice
  * number; the AI fills what the rules could not read. Every disagreement is
  * recorded so the card can show it.
@@ -97,7 +127,9 @@ export function buildExpenseRows({ document, vendor, facts, analysis, confidence
       else subs = [ln.lp_sub_source];
     }
     let markets = vendorMarkets;
-    const lineMarkets = even ? [] : (ln.markets || []).filter(Boolean);
+    const aiMarkets = (ln.markets || []).filter(Boolean);
+    const printed = aiMarkets.length ? null : marketFromLineText(ln.description, ln.market_evidence);
+    const lineMarkets = even ? [] : (aiMarkets.length ? aiMarkets : (printed ? [printed] : []));
     if (lineMarkets.length) {
       const outside = vendorMarkets.length ? lineMarkets.filter((m) => !vendorMarkets.includes(m)) : [];
       if (outside.length) lineProblems.push(FLAGS.MARKET_NOT_ELIGIBLE);
