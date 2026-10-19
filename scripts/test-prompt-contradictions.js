@@ -165,40 +165,65 @@ test('the inbound message and the thread sit inside the fence, and cannot close 
   assert.equal(fenceSafe('a <<<CUSTOMER_DATA b'), 'a CUSTOMER_DATA b');
 });
 
-// ─── the NEPQ cleanup variant (2026-10-10, audit 2026-10-09) ────────
+// ─── the NEPQ-only prompt (2026-10-19, PR2 step 2) ────────────────────
 // nepq-backbone.js: the PLAN block "outranks the older formulas still in the
-// system prompt". With PROMPT_NEPQ_CLEANUP_MODE=live those formulas are gone
-// from the NEPQ-live prompt; with it off (the default) nothing changes.
+// system prompt". With NEPQ live those formulas are gone: the 2026-10-10
+// cleanup lines (HSO mandate, two times by default, push to book) and, since
+// 2026-10-19, the Antifragile / Brunson framework block, the trust model,
+// buyer stages, story arcs and their response-format fields. NEPQ off keeps
+// every one of them, byte for byte.
 
 const LEGACY_FORMULAS = [
   'HSO MANDATE — EVERY REPLY',
   'Two options. Not one. Not three. Two.',
   'push to book',
   'propose TWO SPECIFIC TIME slots',
+  '═══════ FRAMEWORK INTEGRATION ═══════',
+  'EXPERT SECRETS',
+  'TRAFFIC SECRETS',
+  'DOTCOM SECRETS',
+  '═══════ TRUST MODEL — 4 LEVELS ═══════',
+  '═══════ BUYER STAGES — MOVE ONE FORWARD ═══════',
+  '═══════ STORY ARCS — FALLBACK SUMMARIES ═══════',
+  '"hso_breakdown"',
+  '"frameworks_applied"',
+  '"story_arc"',
+  '"trust_level_targeted"',
 ];
-const cleanSms = () => getResponseSystemPrompt('live', { cleanup: 'live' });
-const cleanChat = () => cleanSms() + LIVE_CHAT_ADDENDUM;
 
-for (const [label, build] of [['SMS', () => cleanSms() + '\n' + smsUser()], ['live chat', cleanChat]]) {
-  test(`${label} (NEPQ live, cleanup live): none of the legacy formulas the PLAN block outranks`, () => {
+for (const [label, build] of [['SMS', () => smsSystem() + '\n' + smsUser()], ['live chat', () => chatSystem()]]) {
+  test(`${label} (NEPQ live): NEPQ is the only sales method in the prompt`, () => {
     const p = build();
     for (const phrase of LEGACY_FORMULAS) {
-      assert.ok(!p.includes(phrase), `the clean prompt still carries: ${phrase}`);
+      assert.ok(!p.includes(phrase), `the NEPQ prompt still carries: ${phrase}`);
     }
     assert.ok(p.includes('═══════ REPLY SHAPE ═══════'), 'the REPLY SHAPE section replaces the HSO mandate');
-    assert.ok(p.includes('hso_breakdown'), 'the response format still carries hso_breakdown (the parser reads it)');
+    assert.ok(p.includes('═══════ HOW YOU SELL ═══════'), 'the HOW YOU SELL section replaces the framework block');
+    // What the framework block carried that is still a rule stays.
+    assert.ok(p.includes('Use only approved parables supplied in the KB PACK'));
+    assert.ok(p.includes('Never promise a storm outcome or an insurance outcome.'));
+    assert.ok(p.includes("Randy Reece's first-person voice is EMAIL-ONLY"));
     // The earlier NEPQ swaps (PPR gate, value ladder) are still in place.
     assert.ok(p.includes('Offer exactly the move in the PLAN block.'));
     assert.ok(!p.includes('never as an in-home visit'));
   });
 }
 
-test('cleanup off (the default) and NEPQ off both keep the legacy formulas, byte for byte', () => {
-  for (const sys of [smsSystem('live'), smsSystem('off')]) {
-    for (const phrase of LEGACY_FORMULAS) assert.ok(sys.includes(phrase), `legacy prompt lost: ${phrase}`);
-  }
-  assert.equal(getResponseSystemPrompt('live', { cleanup: 'off' }), smsSystem('live'));
-  assert.equal(getResponseSystemPrompt('off', { cleanup: 'live' }), smsSystem('off'));
+test('SMS user prompt: the Traffic Secrets line and the story arc go with a PLAN block, and only then', () => {
+  const ctx = { ...fixture.context, intelligence: { ...(fixture.context.intelligence || {}), buyer_stage: 'curious', recommended_story_arc: 'SA2' } };
+  const build = (opts) => buildResponsePrompt(ctx, fixture.channel, fixture.triggerMessage, fixture.kbPack, fixture.classification, fixture.fastTrack, fixture.trafficTemp || 'warm', fixture.availability, opts);
+  const withPlan = build({ ...(fixture.opts || {}), nepqPlan: { required_move: 'answer', booking_ask_allowed: false } });
+  assert.ok(withPlan.includes('NEPQ TURN PLAN'), 'the PLAN block renders');
+  assert.ok(!withPlan.includes('TRAFFIC TEMPERATURE'));
+  assert.ok(!withPlan.includes('Recommended Arc:'));
+  const noPlan = build({ ...(fixture.opts || {}) });
+  assert.ok(noPlan.includes('TRAFFIC TEMPERATURE'));
+  assert.ok(noPlan.includes('Recommended Arc: SA2'));
+});
+
+test('NEPQ off keeps the legacy formulas, byte for byte', () => {
+  const sys = smsSystem('off');
+  for (const phrase of LEGACY_FORMULAS) assert.ok(sys.includes(phrase), `legacy prompt lost: ${phrase}`);
 });
 
 test('no example SMS in examples.js carries an em dash (the prompt bans them in SMS)', () => {
@@ -208,7 +233,7 @@ test('no example SMS in examples.js carries an em dash (the prompt bans them in 
 });
 
 test('the FINANCING script carries no em dash, in every prompt variant', () => {
-  for (const sys of [smsSystem('live'), smsSystem('off'), cleanSms()]) {
+  for (const sys of [smsSystem('live'), smsSystem('off')]) {
     const line = sys.split('\n').find((l) => l.startsWith('- FINANCING: '));
     assert.ok(line, 'FINANCING script missing');
     assert.ok(!line.includes('—'), `em dash in the FINANCING script: ${line}`);
@@ -222,7 +247,7 @@ test('the FINANCING script carries no em dash, in every prompt variant', () => {
 // prompt was the side that was wrong.
 
 test('every system prompt variant states the 0% APR exception, never the bare ban', () => {
-  for (const [label, sys] of [['legacy', smsSystem('off')], ['NEPQ live', smsSystem('live')], ['NEPQ clean', cleanSms()], ['live chat', chatSystem('live')]]) {
+  for (const [label, sys] of [['legacy', smsSystem('off')], ['NEPQ live', smsSystem('live')], ['live chat', chatSystem('live')]]) {
     assert.ok(sys.includes('0% APR financing'), `${label}: no 0% APR in the prompt`);
     assert.ok(!sys.includes('NEVER quote rates or terms.'), `${label}: the bare ban is back`);
     assert.ok(sys.includes('- FINANCING: "Yes, we offer 0% APR financing, and the rep walks you through exactly what fits during the visit." You may say 0% APR financing is available (Mark\'s ruling, 2026-09-25). Beyond that, NEVER quote a rate, a term, a monthly payment or any other financing figure.'), `${label}: FINANCING script`);
