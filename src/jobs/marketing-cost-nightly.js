@@ -17,7 +17,7 @@ import { todayET, hourET, refuseIngest } from './lp-report-common.js';
 import { syncFeedExpenses } from '../marketing/leadgurus-feed.js';
 import { recomputeCalculatedCosts } from '../marketing/commission.js';
 import { reallocateMonth } from '../marketing/allocation-io.js';
-import { recommendHolds } from '../marketing/holds.js';
+import { recommendHolds, assignHeldFeedSpend } from '../marketing/holds.js';
 import { purgeStaleFailedDocuments } from './marketing-invoice-ingest.js';
 
 export const JOB_ID = 'marketing-cost-nightly';
@@ -52,6 +52,8 @@ export async function runMarketingCostNightly({ months = null, feedDays = 7, ski
   for (const month of list) {
     const r = { month };
     r.commission = await step(`commission ${month}`, () => recomputeCalculatedCosts(month, deps));
+    // 2026-10-19: held Lead Gurus days are placed by code, before the re-split.
+    r.held_feed = await step(`held feed ${month}`, () => assignHeldFeedSpend(month, deps));
     r.reallocate = await step(`reallocate ${month}`, () => reallocateMonth(month, deps));
     r.holds = await step(`holds ${month}`, () => recommendHolds(month, deps));
     out.months.push(r);

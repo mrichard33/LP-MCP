@@ -115,7 +115,7 @@ export async function syncFeedExpenses({ from, to }, deps = {}) {
 
   const wanted = buildFeedRows({ territoryRows: terr, dailyRows: daily, map, vendorId: vendor.id });
   const { data: existing, error: eErr } = await supabase.from('marketing_expenses')
-    .select('id, source_ref, amount, status, eligible_markets')
+    .select('id, source_ref, amount, status, eligible_markets, flags')
     .eq('source_system', FEED_SOURCE).gte('period_start', from).lte('period_start', to);
   if (eErr) throw new Error(`marketing_expenses read failed: ${eErr.message}`);
   const byRef = Object.fromEntries((existing || []).map((r) => [r.source_ref, r]));
@@ -132,6 +132,13 @@ export async function syncFeedExpenses({ from, to }, deps = {}) {
       continue;
     }
     if (cur.status === 'superseded') { out.superseded_kept++; continue; }
+    // A held day already placed (by assignHeldFeedSpend or a person) keeps its
+    // offices when the feed re-pulls it; only its amount follows the feed.
+    const placed = (cur.eligible_markets || []).join() !== HOLD_MARKET && (cur.flags || []).some((f) => f === 'auto_assigned' || f === 'held_then_applied');
+    if (placed && (row.eligible_markets || []).join() === HOLD_MARKET) {
+      row.eligible_markets = cur.eligible_markets || [];
+      row.flags = cur.flags || [];
+    }
     const same = cents(cur.amount) === cents(row.amount)
       && JSON.stringify(cur.eligible_markets || []) === JSON.stringify(row.eligible_markets);
     if (same) { out.unchanged++; continue; }
