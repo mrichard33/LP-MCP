@@ -24,7 +24,9 @@ import {
 import {
   runInboundCapture, runInboundCaptureSummary, dryRun, captureCaller, buildApprovalAction,
   captureMode, dueSlot, contactSource, TABLE, ACTION_TYPE, readCalledNumbers,
+  callToWatch, scheduleCaptureForCall, buildCallersSql, instantEnabled,
 } from '../src/jobs/inbound-caller-capture.js';
+import { decideLeadMatch, readLeadMatch } from '../src/inbound-capture-match.js';
 import {
   captureSourceFor, CAPTURE_SOURCES_BY_NUMBER, CAPTURE_PROMOTER, LP_SOURCE_ID_FIELD, PRO_ID_FIELD,
 } from '../src/inbound-capture-source.js';
@@ -109,9 +111,14 @@ function world({
     log: quiet,
     runSQL: async (q) => {
       w.sql.push(q);
-      if (q.includes('v_new_callers_no_lp_30d')) {
-        const m = q.match(/call_at >= '([^']+)'/);
-        return view.filter((r) => !m || Date.parse(r.call_at) >= Date.parse(m[1]));
+      if (q.includes('WITH own AS MATERIALIZED')) {
+        // buildCallersSql (2026-10-19): a window, and maybe one caller.
+        const since = q.match(/received_at >= '([^']+)'/);
+        const until = q.match(/received_at <= '([^']+)'/);
+        const one = q.match(/10\) = '(\d{10})'/);
+        return view.filter((r) => (!since || Date.parse(r.call_at) >= Date.parse(since[1]))
+          && (!until || Date.parse(r.call_at) <= Date.parse(until[1]))
+          && (!one || String(r.caller).replace(/\D/g, '').slice(-10) === one[1]));
       }
       if (q.includes('FROM five9_events_raw')) {
         // The called-number read (2026-10-12): each view row's own `called`.
@@ -149,6 +156,10 @@ function world({
         if (!c) throw new Error('GHL → 404');
         return { contact: { ...c, phone: `+1${phoneOf(c)}` } };
       }
+      if (method === 'POST' && /^\/contacts\/[^/]+\/notes$/.test(path)) {
+        (w.notes ||= []).push({ id: path.split('/')[2], body: body.body });
+        return { note: { id: 'n1' } };
+      }
       if (method === 'POST' && path === '/contacts/') {
         const id = `new${w.created.length + 1}`;
         w.created.push({ id, ...body });
@@ -159,6 +170,11 @@ function world({
       }
       throw new Error(`unexpected GHL ${method} ${path}`);
     },
+    // The lead match (2026-10-19, option B): a phone in lpPhones has a recent
+    // LP lead; everyone else has none.
+    matchLead: async ({ phone10 }) => (lpPhones.includes(phone10)
+      ? { verdict: 'reuse', lead: { kind: 'lead', lead_id: '581695' }, why: 'LP lead from 2026-09-26 (within 15 days)' }
+      : { verdict: 'create', lead: null, why: 'no LP lead for this phone' }),
     enroll: async ({ contactId }) => {
       w.enrolls.push(contactId);
       return { success: true, action: 'enrolled_lead_creation_workflow', contact_id: contactId };
@@ -528,7 +544,7 @@ test('idempotency: a caller who rang twice is actioned once, on the newest call'
 test('idempotency: a caller actioned on an earlier call is not actioned on a new one', async () => {
   const w = world({ view: [call('8130000002')], contacts: { 8130000002: { id: 'c2', tags: [] } } });
   await runInboundCapture({ env: env('live'), nowMs: NOW, deps: w.deps });
-  w.deps.runSQL = ((orig) => async (q) => (q.includes('v_new_callers_no_lp_30d')
+  w.deps.runSQL = ((orig) => async (q) => (q.includes('WITH own AS MATERIALIZED')
     ? [call('8130000002', { call_at: '2026-09-27T14:30:00.000Z' })] : orig(q)))(w.deps.runSQL);
   await runInboundCapture({ env: env('live'), nowMs: NOW + 3600e3, deps: w.deps });
   assert.deepEqual(w.enrolls, ['c2']);
@@ -565,7 +581,9 @@ test('the action pass reads only the lookback window', async () => {
   const w = world({ view: [call('8130000001', { call_at: '2026-09-20T13:00:00.000Z' })] });
   await runInboundCapture({ env: { ...env('shadow'), INBOUND_CAPTURE_LOOKBACK_HOURS: '48' }, nowMs: NOW, deps: w.deps });
   assert.equal(w.db.tables[TABLE].length, 0);
-  assert.match(w.sql[0], /call_at >= '2026-09-25T15:00:00.000Z'/);
+  assert.match(w.sql[0], /received_at >= '2026-09-25T15:00:00.000Z'/);
+  // 2026-10-19: nothing younger than INBOUND_CAPTURE_WAIT_MIN (15) is read.
+  assert.match(w.sql[0], /received_at <= '2026-09-27T14:45:00.000Z'/);
 });
 
 /* --- dry run + summary ------------------------------------------------------ */
@@ -592,7 +610,7 @@ test('dry run: defaults to the 48h lookback window, not the whole view', async (
   const w = world({ view: [call('8130000001'), call('8130000007', { call_at: '2026-09-10T13:00:00.000Z' })] });
   const out = await dryRun({ nowMs: NOW, env: env('shadow'), deps: w.deps });
   assert.equal(out.window, '48h');
-  assert.match(w.sql[0], /call_at >= '2026-09-25T15:00:00.000Z'/);
+  assert.match(w.sql[0], /received_at >= '2026-09-25T15:00:00.000Z'/);
   assert.equal(out.summary.callers, 1);
 });
 
@@ -602,14 +620,14 @@ test('dry run: follows INBOUND_CAPTURE_LOOKBACK_HOURS, and ?hours=N overrides it
   assert.equal(a.window, '24h');
   const b = await dryRun({ hours: '6', nowMs: NOW, env: env('shadow'), deps: w.deps });
   assert.equal(b.window, '6h');
-  assert.match(w.sql.at(-1), /call_at >= '2026-09-27T09:00:00.000Z'/);
+  assert.match(w.sql.filter((q) => q.includes('WITH own')).at(-1), /received_at >= '2026-09-27T09:00:00.000Z'/);
 });
 
 test('dry run: hours=all reads the whole view; junk falls back to 48h', async () => {
   const w = world({ view: [call('8130000001'), call('8130000007', { call_at: '2026-09-10T13:00:00.000Z' })] });
   const all = await dryRun({ hours: 'all', nowMs: NOW, env: env('shadow'), deps: w.deps });
   assert.equal(all.window, '30d (whole view)');
-  assert.doesNotMatch(w.sql[0], /call_at >=/);
+  assert.match(w.sql[0], /received_at >= '2026-08-28T15:00:00.000Z'/, 'all = the 30 days');
   assert.equal(all.summary.callers, 2);
   const junk = await dryRun({ hours: 'banana', nowMs: NOW, env: env('shadow'), deps: w.deps });
   assert.equal(junk.window, '48h');
@@ -802,4 +820,192 @@ test('captureCaller: no usable phone fails without touching anything', async () 
   const res = await captureCaller({ caller_phone: '12' }, { deps: w.deps });
   assert.equal(res.action_taken, 'failed');
   assert.equal(w.ghlCalls.length, 0);
+});
+
+
+/* --- 2026-10-19: matching to an existing lead (option B) ------------------- */
+
+const CALL_AT = Date.parse('2026-10-19T14:00:00Z');
+const daysAgo = (n) => new Date(CALL_AT - n * 86400000).toISOString();
+
+test('match: an LP inquiry still waiting to be checked out is the lead', () => {
+  const m = decideLeadMatch({ callAtMs: CALL_AT, openInquiries: [{ in1_id: '430305', cst_id: '462947', received_at_lp: daysAgo(40) }] });
+  assert.equal(m.verdict, 'reuse');
+  assert.equal(m.lead.kind, 'inquiry');
+});
+
+test('match: a lead from the last 15 days in Supabase is reused, without asking LP', () => {
+  const m = decideLeadMatch({ callAtMs: CALL_AT, supabaseLeads: [{ lp_lead_id: '581695', lp_prospect_id: '462947', created_at_lp: daysAgo(3) }] });
+  assert.equal(m.verdict, 'reuse');
+  assert.equal(m.lead.lead_id, '581695');
+});
+
+test('match: only older leads in Supabase → ask LP live first', () => {
+  const m = decideLeadMatch({ callAtMs: CALL_AT, supabaseLeads: [{ lp_lead_id: '501000', created_at_lp: daysAgo(200) }] });
+  assert.equal(m.verdict, 'need_live');
+});
+
+test('match: LP live is the final word — recent reuses, old makes a returning caller, none creates', () => {
+  const old = [{ lp_lead_id: '501000', lp_prospect_id: '400001', created_at_lp: daysAgo(200) }];
+  assert.equal(decideLeadMatch({ callAtMs: CALL_AT, supabaseLeads: old, liveRead: true, live: { ldsId: '584000', createdAtLp: daysAgo(2) } }).verdict, 'reuse');
+  const ret = decideLeadMatch({ callAtMs: CALL_AT, supabaseLeads: old, liveRead: true, live: { ldsId: '501000', prospectId: '400001', createdAtLp: daysAgo(200) } });
+  assert.equal(ret.verdict, 'create_returning');
+  assert.equal(ret.lead.prospect_id, '400001');
+  assert.equal(decideLeadMatch({ callAtMs: CALL_AT, liveRead: true, live: null }).verdict, 'create');
+  // Supabase never had it, LP does (an April lead): still a returning caller.
+  assert.equal(decideLeadMatch({ callAtMs: CALL_AT, liveRead: true, live: { ldsId: '530000', createdAtLp: daysAgo(180) } }).verdict, 'create_returning');
+});
+
+test('match: exactly 15 days old is still the lead; 16 is a returning caller', () => {
+  assert.equal(decideLeadMatch({ callAtMs: CALL_AT, supabaseLeads: [{ lp_lead_id: '1', created_at_lp: daysAgo(15) }] }).verdict, 'reuse');
+  assert.equal(decideLeadMatch({ callAtMs: CALL_AT, liveRead: true, live: { ldsId: '1', createdAtLp: daysAgo(16) } }).verdict, 'create_returning');
+});
+
+test('match: a lead with no date is treated as brand new (reuse, never a duplicate on a guess)', () => {
+  assert.equal(decideLeadMatch({ callAtMs: CALL_AT, supabaseLeads: [{ lp_lead_id: '1', created_at_lp: null }] }).verdict, 'reuse');
+  assert.equal(decideLeadMatch({ callAtMs: CALL_AT, liveRead: true, live: { ldsId: '2', createdAtLp: null } }).verdict, 'reuse');
+  assert.equal(decideLeadMatch({ callAtMs: CALL_AT, ghlLeadId: '999999', liveRead: true, live: null }).verdict, 'reuse',
+    'an LP Lead ID on the contact that nothing can date');
+});
+
+test('match: a failed LP read is unverified, never "no lead"', () => {
+  const m = decideLeadMatch({ callAtMs: CALL_AT, liveRead: true, liveError: 'LP 503' });
+  assert.equal(m.verdict, 'unverified');
+});
+
+test('readLeadMatch: LP live is asked only when Supabase and the queue settle nothing', async () => {
+  let live = 0;
+  const deps = (leads, inquiries = []) => ({
+    runSQL: async (q) => (q.includes('FROM lp_inbound_queue') ? inquiries : leads),
+    findExistingLpLead: async () => { live += 1; return null; },
+  });
+  const recent = await readLeadMatch({ phone10: '8135551234', callAtMs: CALL_AT }, deps([{ lp_lead_id: '1', created_at_lp: daysAgo(1) }]));
+  assert.equal(recent.verdict, 'reuse');
+  assert.equal(live, 0);
+  const none = await readLeadMatch({ phone10: '8135551234', callAtMs: CALL_AT }, deps([]));
+  assert.equal(none.verdict, 'create');
+  assert.equal(live, 1);
+  const broken = await readLeadMatch({ phone10: '8135551234', callAtMs: CALL_AT }, { runSQL: async () => { throw new Error('timeout'); }, findExistingLpLead: async () => null });
+  assert.equal(broken.verdict, 'unverified');
+});
+
+test('readLeadMatch: reads lp_leads by phone, alt phone and the contact\'s lead id, and only open inquiries', async () => {
+  const sql = [];
+  await readLeadMatch({ phone10: '8135551234', callAtMs: CALL_AT, ghlLeadId: '577000' }, {
+    runSQL: async (q) => { sql.push(q); return []; }, findExistingLpLead: async () => null,
+  });
+  assert.match(sql[0], /phone_alt/);
+  assert.match(sql[0], /lp_lead_id::text = '577000'/);
+  assert.match(sql[1], /checkout_at_lp IS NULL/);
+});
+
+test('live: a caller with a recent LP lead is matched, nothing is created', async () => {
+  const w = world({ view: [call('8130000041')], contacts: { 8130000041: { id: 'c41', tags: [] } } });
+  w.deps.matchLead = async () => ({ verdict: 'reuse', lead: { kind: 'lead', lead_id: '583000' }, why: 'LP lead from 2026-10-12 (within 15 days)' });
+  await runInboundCapture({ env: env('live'), nowMs: NOW, deps: w.deps });
+  assert.equal(w.enrolls.length, 0);
+  assert.equal(w.db.tables[TABLE][0].label, 'already_in_lp');
+});
+
+test('live: a returning caller (old lead only) gets a NEW lead; the old LP Lead ID is cleared and noted first', async () => {
+  const w = world({ view: [call('8130000042')], contacts: { 8130000042: { id: 'c42', tags: [], customFields: [{ id: LP_LEAD_ID_FIELD, value: '501000' }] } } });
+  w.deps.matchLead = async () => ({ verdict: 'create_returning', lead: { kind: 'lead', lead_id: '501000', prospect_id: '400001', at: '2026-03-02' }, why: 'returning caller' });
+  const out = await runInboundCapture({ env: env('live'), nowMs: NOW, deps: w.deps });
+  assert.equal(out.ok, true, JSON.stringify(out));
+  assert.deepEqual(w.enrolls, ['c42']);
+  const clear = w.stamps.find((st) => st.customFields.some((f) => f.id === LP_LEAD_ID_FIELD));
+  assert.deepEqual(clear.customFields, [{ id: LP_LEAD_ID_FIELD, field_value: '' }]);
+  assert.match(w.notes[0].body, /Returning caller.*Prospect 400001.*2026-03-02/);
+  const ix = w.ghlCalls.lastIndexOf('PUT /contacts/c42');
+  assert.ok(ix > 0, 'cleared before the enroll');
+});
+
+test('live: a returning caller whose old LP Lead ID will not clear is NOT sent (8e30ff37 would skip it)', async () => {
+  const w = world({ view: [call('8130000043')], contacts: { 8130000043: { id: 'c43', tags: [], customFields: [{ id: LP_LEAD_ID_FIELD, value: '501000' }] } } });
+  w.deps.matchLead = async () => ({ verdict: 'create_returning', lead: { lead_id: '501000' }, why: 'returning caller' });
+  const realFetch = w.deps.ghlFetch;
+  w.deps.ghlFetch = async (method, path, body) => {
+    if (method === 'PUT' && body?.customFields?.some((f) => f.id === LP_LEAD_ID_FIELD)) return { succeded: true }; // GHL ignores it
+    return realFetch(method, path, body);
+  };
+  const out = await runInboundCapture({ env: env('live'), nowMs: NOW, deps: w.deps });
+  assert.equal(w.enrolls.length, 0);
+  assert.equal(out.failed, 1);
+});
+
+test('live: an unverifiable lead match creates nothing', async () => {
+  const w = world({ view: [call('8130000044')] });
+  w.deps.matchLead = async () => ({ verdict: 'unverified', lead: null, why: 'LP lookup failed: 503' });
+  await runInboundCapture({ env: env('live'), nowMs: NOW, deps: w.deps });
+  assert.equal(w.created.length + w.enrolls.length, 0);
+  assert.equal(w.db.tables[TABLE][0].label, 'unverified');
+});
+
+/* --- 2026-10-19: the 15-minute wait and the call-end trigger --------------- */
+
+test('wait: a call that ended under 15 minutes ago is not read at all', async () => {
+  const w = world({ view: [call('8130000045', { call_at: new Date(NOW - 10 * 60e3).toISOString() })], contacts: { 8130000045: { id: 'c45', tags: [] } } });
+  await runInboundCapture({ env: env('live'), nowMs: NOW, deps: w.deps });
+  assert.equal(w.db.tables[TABLE].length, 0);
+  assert.equal(w.enrolls.length, 0);
+  await runInboundCapture({ env: env('live'), nowMs: NOW + 6 * 60e3, deps: w.deps, fresh: true });
+  assert.deepEqual(w.enrolls, ['c45'], '16 minutes after the call it is captured');
+});
+
+test('wait: INBOUND_CAPTURE_WAIT_MIN changes it', () => {
+  const sql = buildCallersSql({ sinceMs: 0, untilMs: Date.parse('2026-10-19T14:00:00Z') });
+  assert.match(sql, /received_at <= '2026-10-19T14:00:00.000Z'/);
+  assert.doesNotMatch(sql, /v_new_callers_no_lp_30d/, 'the 20-second view is no longer read');
+  assert.match(sql, /interval '15 days'/, 'only a lead from the 15 days before the call drops a caller up front');
+});
+
+test('fresh pass: a call a pass already stored is skipped before any GHL read', async () => {
+  const w = world({ view: [call('8130000046')], contacts: { 8130000046: { id: 'c46', tags: [] } } });
+  w.db.tables[TABLE].push({ id: 7, caller_phone: '8130000046', call_at: '2026-09-27T13:00:00.000Z', action_taken: 'none', label: 'unverified' });
+  const out = await runInboundCapture({ env: env('live'), nowMs: NOW, deps: w.deps, fresh: true });
+  assert.equal(out.pass, 'fresh');
+  assert.equal(w.ghlCalls.length, 0);
+  assert.equal(w.enrolls.length, 0);
+  // The hourly full pass still re-checks it.
+  await runInboundCapture({ env: env('live'), nowMs: NOW, deps: w.deps });
+  assert.deepEqual(w.enrolls, ['c46']);
+});
+
+test('fresh pass for one caller reads only that caller', async () => {
+  const w = world({ view: [call('8130000047'), call('8130000048')], contacts: { 8130000047: { id: 'c47', tags: [] }, 8130000048: { id: 'c48', tags: [] } } });
+  await runInboundCapture({ env: env('live'), nowMs: NOW, deps: w.deps, fresh: true, phone: '8130000047' });
+  assert.deepEqual(w.enrolls, ['c47']);
+  assert.match(w.sql[0], /10\) = '8130000047'/);
+});
+
+test('callToWatch: only a call that could be a capture starts a timer', () => {
+  const base = { event_type: 'disposition', ani: '+1 (813) 555-1234', agent_name: 'Doe, Jane - LF', duration_sec: 200, campaign: 'Google PPC Windows', disposition_name: 'Hung Up' };
+  assert.equal(callToWatch(base), '8135551234');
+  assert.equal(callToWatch({ ...base, duration_sec: 90 }), null);
+  assert.equal(callToWatch({ ...base, lp_rec_key: 'LDS581695' }), null);
+  assert.equal(callToWatch({ ...base, agent_name: '' }), null);
+  assert.equal(callToWatch({ ...base, campaign: 'Confirmation Calls' }), null);
+  assert.equal(callToWatch({ ...base, disposition_name: 'Do Not Call' }), null);
+});
+
+test('scheduleCaptureForCall: one timer per caller, 16 minutes out; off when switched off', () => {
+  const timers = [];
+  const setTimer = (fn, ms) => { timers.push(ms); return { unref() {} }; };
+  const row = { event_type: 'disposition', ani: '8135559876', agent_name: 'A - LF', duration_sec: 300, campaign: 'Google PPC Windows', disposition_name: 'Callback' };
+  const live = { INBOUND_CAPTURE_MODE: 'live' };
+  assert.equal(scheduleCaptureForCall(row, { env: live, setTimer }).scheduled, true);
+  assert.equal(scheduleCaptureForCall(row, { env: live, setTimer }).reason, 'already_scheduled');
+  assert.deepEqual(timers, [16 * 60e3]);
+  assert.equal(scheduleCaptureForCall({ ...row, ani: '8135550000' }, { env: { ...live, INBOUND_CAPTURE_INSTANT: 'off' }, setTimer }).scheduled, false);
+  assert.equal(scheduleCaptureForCall({ ...row, ani: '8135550001' }, { env: { INBOUND_CAPTURE_MODE: 'off' }, setTimer }).scheduled, false);
+  assert.equal(instantEnabled({}), true, 'on by default');
+});
+
+test('dueSlot: with INBOUND_CAPTURE_INSTANT on, a fresh pass every tick around the clock', () => {
+  const night = new Date('2026-10-19T06:12:00Z'); // 02:12 ET
+  assert.equal(dueSlot(night), null, 'off: nothing at night, as before');
+  assert.deepEqual(dueSlot(night, { instant: true }), { kind: 'fresh', occurrence: '2026-10-19T02:10-fresh' });
+  const day = new Date('2026-10-19T14:07:00Z'); // 10:07 ET
+  assert.equal(dueSlot(day, { instant: true }).kind, 'hourly', 'the hourly full pass first');
+  assert.equal(dueSlot(day, { instant: true, last: { hourly: '2026-10-19T10' } }).kind, 'fresh');
 });

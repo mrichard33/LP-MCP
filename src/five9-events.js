@@ -307,6 +307,12 @@ export async function five9WebhookHandler(req, res) {
     call_end_at:      fields.call_end_at,
   } };
 
+  // 2026-10-19 (the user: "triggered by the caller"): a call that may be an
+  // inbound lead starts the capture's 15-minute timer. Best-effort.
+  import('./jobs/inbound-caller-capture.js')
+    .then((m) => m.scheduleCaptureForCall(normRow))
+    .catch((err) => console.warn(`[Five9] inbound-capture trigger failed raw_id=${row.id}: ${err.message}`));
+
   // 4. NORMALIZE after the response (fire-and-forget).
   trackImmediate(() => {
     normalizeFive9Row(normRow).catch(err =>

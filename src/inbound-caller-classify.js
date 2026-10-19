@@ -184,10 +184,21 @@ export function classifyCaller(caller, ctx = {}) {
     return { label: 'unverified', why: 'GHL lookup failed' };
   }
 
-  if (ctx.lpPhones?.has(phone)) return { label: 'already_in_lp', why: 'an LP lead with this phone now exists' };
-  const lpLeadId = readCustomField(contact, LP_LEAD_ID_FIELD);
-  // lead-id-ok: classifier reason, the daily post prints counts only
-  if (lpLeadId) return { label: 'already_in_lp', why: `GHL contact carries LP lead ${lpLeadId}` };
+  // 2026-10-19 (the user, option B): with a lead match (src/inbound-capture-match.js)
+  // a lead from the last 15 days, or an inquiry still waiting in LP, is the
+  // caller's lead; older leads make a returning caller who gets a fresh one.
+  // Without one, the old rule: any LP lead with this phone.
+  if (ctx.leadMatch) {
+    if (ctx.leadMatch.verdict === 'reuse') return { label: 'already_in_lp', why: ctx.leadMatch.why };
+    if (ctx.leadMatch.verdict !== 'create' && ctx.leadMatch.verdict !== 'create_returning') {
+      return { label: 'unverified', why: ctx.leadMatch.why || 'lead match could not tell' };
+    }
+  } else {
+    if (ctx.lpPhones?.has(phone)) return { label: 'already_in_lp', why: 'an LP lead with this phone now exists' };
+    const lpLeadId = readCustomField(contact, LP_LEAD_ID_FIELD);
+    // lead-id-ok: classifier reason, the daily post prints counts only
+    if (lpLeadId) return { label: 'already_in_lp', why: `GHL contact carries LP lead ${lpLeadId}` };
+  }
 
   const soldTag = tags.find((t) => CUSTOMER_SET.has(t));
   if (soldTag) return { label: 'existing_customer', why: `GHL tag ${soldTag}` };

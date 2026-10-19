@@ -487,7 +487,7 @@ function captureWorld({ disposition = 'Hung Up' } = {}) {
     supabase: db,
     log: quiet,
     runSQL: async (q) => {
-      if (q.includes('v_new_callers_no_lp_30d')) return view;
+      if (q.includes('WITH own AS MATERIALIZED')) return view;
       if (q.includes('FROM five9_events_raw')) return view.map((r) => ({ caller: r.caller, received_at: r.call_at, called_number: r.called }));
       if (q.includes('FROM lp_leads')) return [];
       if (q.includes('FROM lp_jobs')) return [];
@@ -503,6 +503,7 @@ function captureWorld({ disposition = 'Hung Up' } = {}) {
       }
       throw new Error(`unexpected GHL ${method} ${path}`);
     },
+    matchLead: async () => ({ verdict: 'create', lead: null, why: 'no LP lead for this phone' }),
     enroll: async ({ contactId }) => { w.enrolls.push(contactId); return { action: 'enrolled_lead_creation_workflow' }; },
     postToSlack: async () => ({ ok: true }),
   };
