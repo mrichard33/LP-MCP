@@ -27,7 +27,7 @@
 import { isWarrantyRequest, warrantyReference, WARRANTY_MARKERS } from './warranty-request.js';
 import { isNotInterested } from './not-interested.js';
 import { isLeadQuestion, findBookingAsks } from './discovery-discipline.js';
-import { isTeamOpen, nextTeamOpenLabel, requestedCallTime, promisedCallback } from './team-hours.js';
+import { isTeamOpen, nextTeamOpenLabel, requestedCallTime, promisedCallback, namesWhen } from './team-hours.js';
 import { heldSlot, COLLECT_ASK, dmAnswerFromThread } from './booking-collect.js';
 import { RECHECK_RX } from './contact-check.js';
 import { slotMentionIndex, offeredSlots as offeredIn, pickSlot, mentionedMinutes } from '../live-chat/cancel-flow.js';
@@ -2162,7 +2162,8 @@ export function referenceRetryNote(plan, failed = []) {
   const keep = referenceRulesText(referenceRules(line, plan?.reference_slots || plan?.slots_to_offer || [], plan));
   return `Your previous draft did not do this turn's job (${failed.join(', ')}). Write it again, in your own words for this lead, ` +
     `using the reference only as a guide: "${line}". It must ${keep || 'do what the reference does'}.` +
-    (failed.includes('promises_a_call') ? ' Do not say anyone will call them: say a team member will reach out, as the reference does.' : '');
+    (failed.includes('promises_a_call') ? ' Do not say anyone will call them: say a team member will reach out, as the reference does.' : '') +
+    (failed.includes('promises_a_day') ? ' Do not name a day or time for it: say the team will look into it and reach out, as the reference does.' : '');
 }
 
 /**
@@ -2189,6 +2190,11 @@ export function checkAgainstReference(draft, line, slots = [], plan = null) {
   // "we'll have someone … call you … shortly", at night. Service, two no's and
   // do-not-knock promise no call, and a sent call promise files a Five9 callback.
   if (promisedCallback(text) && !promisedCallback(line)) problems.push('promises_a_call');
+  // A hand-off promises nothing dated (2026-10-19, bot gate rehash_high_rise):
+  // "I'll have John look into that and reach out" came back as "someone will
+  // get it over to you today". Nobody had set a day, and the card asks a
+  // person to follow up, not to beat a clock.
+  if (plan?.required_move === 'handoff' && namesWhen(text) && !namesWhen(line)) problems.push('promises_a_day');
   return problems;
 }
 

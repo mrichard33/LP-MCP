@@ -202,6 +202,19 @@ function replaceTiming(sentence, replacement) {
   return sentence.slice(0, m.index) + replacement + sentence.slice(m.index + m[0].length);
 }
 
+// A day or time named for what we will do: the immediacy above, or a later day.
+const WHEN = String.raw`${IMMEDIATE}|\b(?:tomorrow|(?:mon|tues|wednes|thurs|fri|satur|sun)day|by\s+(?:the\s+)?end\s+of\s+(?:the\s+)?(?:day|week))\b`;
+/**
+ * Does this text name a day or time ("today", "tomorrow", "Monday", "by end of
+ * day", "right now")? Pure. 2026-10-19 (bot gate, rehash_high_rise): a
+ * hand-off reply said "someone will get it over to you today", a promise
+ * nobody had made; checkAgainstReference fails a hand-off draft that names a
+ * day its reference does not.
+ */
+export function namesWhen(text) {
+  return new RegExp(WHEN, 'i').test(String(text || ''));
+}
+
 /**
  * Outside team hours, a promised call "today" / "right now" / "in the next few
  * minutes" becomes the next opening ("tomorrow at 9 AM ET"). Inside hours the
@@ -239,11 +252,17 @@ export function softenCallTiming(text) {
  * The immediacy in every promised call replaced with `replacement` ("right
  * now" → "on Monday"). softenCallTiming is this with "soon". Pure.
  */
+// Two real times offered for a call ("I have today at 4:30 PM ET or tomorrow
+// at 9:30 AM ET for your call."): a choice, not a promise. 2026-10-19 (bot gate,
+// rehash_neither_times): the rehash timing guard read "I have … call" as a
+// promised call, so the slot became "I have soon or tomorrow at 9:30 AM ET".
+const TIME_CHOICE_RX = /\b\d{1,2}(?::\d{2})?\s*(?:am|pm|a\.m\.|p\.m\.)[^.!?]*\bor\b[^.!?]*\b\d{1,2}(?::\d{2})?\s*(?:am|pm|a\.m\.|p\.m\.)/i;
+
 export function replaceCallImmediacy(text, replacement) {
   const body = String(text || '');
   let out = body;
   for (const s of body.split(/(?<=[.!?])\s+/)) {
-    if (!promisesCall(s)) continue;
+    if (!promisesCall(s) || TIME_CHOICE_RX.test(s)) continue;
     out = out.replace(s, replaceTiming(s, replacement));
   }
   return out;

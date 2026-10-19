@@ -1,5 +1,5 @@
 {
-  "count": 298,
+  "count": 299,
   "updated": "2026-10-19",
-  "reason": "REHASH_TIME_ASK_RX (nepq-planner.js): our 'When is a good day and time for a call?' after a rehash lead turned both call times down; a no to it is a real no, 'Neither' to the times is not (Sam, rehash_neither_times). Was 297 after REASONED_DECLINE_RX (rehash_first_no_with_reason)."
+  "reason": "TIME_CHOICE_RX (team-hours.js): two call times offered as a choice are an offer, not a promised call; the rehash timing guard turned 'I have today at 4:30 PM ET or tomorrow at 9:30 AM ET' into 'I have soon or …' (rehash_neither_times). Was 298 after REHASH_TIME_ASK_RX (rehash_neither_times)."
 }
