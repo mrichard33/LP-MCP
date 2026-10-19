@@ -26,7 +26,7 @@ import { trueUpInvoice } from './leadgurus-feed.js';
 import { buildReviewCard, buildEditView, buildDecisionReply, parseEditSubmission, marketsForSplit, subSourcesForSplit } from './slack-review.js';
 import { computeFlags } from './expense-builder.js';
 import { vendorLearnPatch, normalizeName } from './vendors.js';
-import { splitsEvenly } from './allocation.js';
+import { splitsEvenly, callCenterLineKind, DISPUTED_MARKET } from './allocation.js';
 
 const LOG = '[MktReview]';
 const INVOICES_BUCKET = 'marketing-invoices';
@@ -117,14 +117,18 @@ export async function previewRows(rows, deps) {
     // such a row previews as long as it names a sub-source.
     if ((!(r.eligible_markets || []).length && !(r.lp_sub_sources || []).length) || !r.period_start || !r.period_end || r.amount == null || Number(r.amount) === 0) continue;
     // (an even split over all offices needs no sub-source and always previews)
-    try { out.push(...(await previewAllocation(r, deps))); } catch (err) { console.warn(`${LOG} preview ${r.id}: ${err.message}`); }
+    const kind = callCenterLineKind(r);
+    try { out.push(...(await previewAllocation(r, deps)).map((a) => ({ ...a, expense_id: r.id, kind }))); } catch (err) { console.warn(`${LOG} preview ${r.id}: ${err.message}`); }
   }
   return out;
 }
 
 export async function renderCard(ctx, { decision = null, note = null } = {}, deps = {}) {
+  // The card says what each split was based on (demos, sales, issued leads), so
+  // every allocation row carries the kind of its invoice line.
+  const kindOf = new Map(ctx.rows.map((r) => [r.id, callCenterLineKind(r)]));
   const allocation = decision
-    ? await loadAllocations(ctx.rows.map((r) => r.id), deps)
+    ? (await loadAllocations(ctx.rows.map((r) => r.id), deps)).map((a) => ({ ...a, kind: kindOf.get(a.expense_id) || null }))
     : await previewRows(ctx.rows, deps);
   const link = deps.signedLink ? await deps.signedLink(ctx.document) : await signedOriginalLink(ctx.document, deps);
   return buildReviewCard({ ...ctx, allocation, link, decision, note });
@@ -132,7 +136,7 @@ export async function renderCard(ctx, { decision = null, note = null } = {}, dep
 
 async function loadAllocations(expenseIds, { supabase = supabaseDefault } = {}) {
   if (!expenseIds.length) return [];
-  const { data } = await supabase.from('marketing_expense_allocations').select('month, market, amount, rule, issued_basis, issued_total, recommendation_reason').in('expense_id', expenseIds).order('month');
+  const { data } = await supabase.from('marketing_expense_allocations').select('expense_id, month, market, amount, rule, issued_basis, issued_total, recommendation_reason').in('expense_id', expenseIds).order('month');
   return (data || []).map(({ recommendation_reason, ...r }) => (r.rule === 'hold' && recommendation_reason ? { ...r, note: recommendation_reason } : r));
 }
 
@@ -319,6 +323,60 @@ export async function handleMarketingInvoiceInteraction(parsed, deps = {}) {
     return { handled: true, action: 'reopened' };
   }
 
+  // 2026-10-19 (the user: "accept an invoice as received and later amend it if a
+  // dispute arises"): the Disputed part of an approved invoice is settled here.
+  //   dispute_accept  the charge stands: flag 'dispute_accepted' and re-split the
+  //                   whole line by what was found (no Disputed row any more)
+  //   dispute_credit  the vendor credited it: the line's amount drops by the
+  //                   disputed part ('dispute_credited'), the offices keep theirs,
+  //                   and the document records what was credited, by whom, when
+  // A revised invoice settles it too, by replacing the original on approval.
+  if (decision === 'dispute_accept' || decision === 'dispute_credit') {
+    const approved = ctx.rows.filter((r) => r.status === 'approved');
+    const { data: parked } = approved.length
+      ? await supabase.from('marketing_expense_allocations').select('expense_id, amount').in('expense_id', approved.map((r) => r.id)).eq('market', DISPUTED_MARKET)
+      : { data: [] };
+    const byExpense = new Map();
+    for (const a of parked || []) byExpense.set(a.expense_id, Math.round(((byExpense.get(a.expense_id) || 0) + Number(a.amount || 0)) * 100) / 100);
+    const lines = approved.filter((r) => (byExpense.get(r.id) || 0) > 0);
+    if (!lines.length) {
+      await reply(responseUrl, { response_type: 'ephemeral', replace_original: false, text: 'Nothing on this invoice is in dispute. Nothing changed.' });
+      return { handled: true, action: 'nothing_disputed' };
+    }
+    const now = new Date().toISOString();
+    const allocate = deps.allocate || allocateExpenseById;
+    const credits = [];
+    for (const r of lines) {
+      const disputed = byExpense.get(r.id);
+      const flags = [...new Set([...(r.flags || []), decision === 'dispute_accept' ? 'dispute_accepted' : 'dispute_credited'])];
+      const patch = { flags, updated_at: now };
+      if (decision === 'dispute_credit') {
+        patch.amount = Math.round((Number(r.amount) - disputed) * 100) / 100;
+        credits.push({ expense_id: r.id, line_no: r.line_no, was: Number(r.amount), credited: disputed, by: who, at: now });
+      }
+      const { error } = await supabase.from('marketing_expenses').update(patch).eq('id', r.id);
+      if (error) throw new Error(`dispute update failed: ${error.message}`);
+      // A credited line keeps exactly what it had found; its new amount matches
+      // the found work, so the re-split parks nothing and charges the same.
+      await allocate(r.id, { supabase });
+    }
+    const total = Math.round([...byExpense.values()].reduce((a, v) => a + v, 0) * 100) / 100;
+    if (credits.length) {
+      const analysis = { ...(ctx.document.analysis || {}), credits: [...((ctx.document.analysis || {}).credits || []), ...credits] };
+      await supabase.from('marketing_invoice_documents').update({ analysis, updated_at: now }).eq('id', documentId);
+    }
+    const fresh = await loadReviewContext(documentId, { supabase });
+    const first = fresh.rows.find((r) => r.status === 'approved');
+    const settledText = decision === 'dispute_accept'
+      ? `Disputed ${usdPlain(total)} confirmed by ${userName}: charged to the offices`
+      : `${usdPlain(total)} credit recorded by ${userName}: taken off the invoice`;
+    const card = await renderCard(fresh, { decision: { outcome: 'approved', by: String(first?.approved_by || '').replace(/ \(.*\)$/, '') || userName, at: String(first?.approved_at || now).slice(0, 16).replace('T', ' ') }, note: settledText }, { ...deps, supabase });
+    await reply(responseUrl, { replace_original: true, text: card.text, blocks: card.blocks });
+    await postDecisionReply(fresh.document, decision === 'dispute_accept' ? `✅ ${settledText}.` : `💳 ${settledText}.`, deps);
+    console.log(`${LOG} ${decision} on ${documentId} by ${who}: ${usdPlain(total)} over ${lines.length} line(s)`);
+    return { handled: true, action: decision === 'dispute_accept' ? 'dispute_accepted' : 'dispute_credited', amount: total };
+  }
+
   if (!pending.length) {
     await reply(responseUrl, { response_type: 'ephemeral', replace_original: false, text: `This invoice was already ${ctx.rows[0]?.status || 'decided'}.` });
     return { handled: true, action: 'already_resolved' };
@@ -355,6 +413,7 @@ export async function handleMarketingInvoiceInteraction(parsed, deps = {}) {
   if (error) throw new Error(`approve update failed: ${error.message}`);
   const allocate = deps.allocate || allocateExpenseById;
   for (const r of pending) await allocate(r.id, { supabase });
+  const replaced = await (deps.replaceEarlier || replaceEarlierInvoice)({ documentId, rows: pending, by: who, now }, { ...deps, supabase });
   let trueUp = null;
   if (ctx.vendor?.default_cost_type === 'feed') {
     const approved = pending.map((r) => ({ ...r, status: 'approved' }));
@@ -366,7 +425,47 @@ export async function handleMarketingInvoiceInteraction(parsed, deps = {}) {
   await reply(responseUrl, { replace_original: true, text: card.text, blocks: card.blocks });
   const approvedTotal = fresh.rows.filter((r) => r.status === 'approved').reduce((a, r) => a + Number(r.amount || 0), 0);
   const allocations = await loadAllocations(fresh.rows.map((r) => r.id), { supabase });
-  await postDecisionReply(fresh.document, buildDecisionReply({ outcome: 'approved', by: userName, total: approvedTotal, allocation: allocations }), deps);
+  const replacedLine = replaced?.documents?.length
+    ? `\n♻️ Replaces invoice #${replaced.invoice_number} approved earlier (${usdPlain(replaced.amount)}); that one is now marked replaced and out of the market costs.`
+    : '';
+  await postDecisionReply(fresh.document, buildDecisionReply({ outcome: 'approved', by: userName, total: approvedTotal, allocation: allocations }) + replacedLine, deps);
   console.log(`${LOG} approved ${documentId} by ${who}: ${pending.length} line(s)${trueUp ? `, true-up ${JSON.stringify(trueUp.months)}` : ''}`);
   return { handled: true, action: 'approved', trueUp };
+}
+
+const usdPlain = (n) => `$${Number(n || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+
+/**
+ * A revised invoice replaces the original (the user, 2026-10-19: "Replace the
+ * original automatically"). When an invoice is approved, any APPROVED lines of
+ * another document from the same vendor with the same invoice number are marked
+ * `superseded` (their allocations go, so the market costs carry only the
+ * revision), and that document records `replaced_by`. One with the same number
+ * AND total never gets here: the ingest drops it as a duplicate. Best effort: a
+ * failure is a log line, never a reason to undo the approval.
+ */
+export async function replaceEarlierInvoice({ documentId, rows, by, now }, deps = {}) {
+  const supabase = deps.supabase || supabaseDefault;
+  const invoiceNumber = rows.find((r) => r.invoice_number)?.invoice_number;
+  const vendorId = rows.find((r) => r.vendor_id)?.vendor_id;
+  if (!invoiceNumber || !vendorId) return null;
+  try {
+    const { data: older, error } = await supabase.from('marketing_expenses').select('id, document_id, amount')
+      .eq('vendor_id', vendorId).eq('invoice_number', invoiceNumber).eq('status', 'approved').neq('document_id', documentId);
+    if (error || !older?.length) return null;
+    for (const r of older) await (deps.deleteAllocations || deleteAllocations)(r.id, { supabase });
+    const { error: uErr } = await supabase.from('marketing_expenses').update({ status: 'superseded', updated_at: now }).in('id', older.map((r) => r.id));
+    if (uErr) throw new Error(uErr.message);
+    const docs = [...new Set(older.map((r) => r.document_id).filter(Boolean))];
+    for (const id of docs) {
+      const { data: d } = await supabase.from('marketing_invoice_documents').select('analysis').eq('id', id).maybeSingle();
+      await supabase.from('marketing_invoice_documents').update({ analysis: { ...(d?.analysis || {}), replaced_by: documentId, replaced_at: now, replaced_by_who: by }, updated_at: now }).eq('id', id);
+    }
+    const amount = Math.round(older.reduce((a, r) => a + Number(r.amount || 0), 0) * 100) / 100;
+    console.log(`${LOG} invoice #${invoiceNumber}: ${older.length} line(s) of ${docs.length} earlier document(s) replaced by ${documentId}`);
+    return { invoice_number: invoiceNumber, documents: docs, lines: older.length, amount };
+  } catch (err) {
+    console.warn(`${LOG} replacing earlier invoice #${invoiceNumber} failed: ${err.message}`);
+    return null;
+  }
 }

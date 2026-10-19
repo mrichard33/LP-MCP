@@ -223,4 +223,6 @@ export const FLAG_LABELS = Object.freeze({
   [FLAGS.OCR_HEAVY]: 'More than half the pages were OCR\'d (scan quality)',
   [FLAGS.MARKET_NOT_ELIGIBLE]: 'A line names a market this vendor is not eligible for',
   [FLAGS.UNKNOWN_SUB_SOURCE]: 'A line names a sub-source this vendor does not have',
+  // 2026-10-19: set at ingest from the allocation preview, not by computeFlags.
+  billed_more_than_found: 'Billed for more than we can find: approving accepts it as received and parks the difference as Disputed',
 });

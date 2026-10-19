@@ -328,7 +328,7 @@ test('call-center work per office: LF agents only, aged demos, new-lead sales by
   const win = { from: '2026-08-23', to: '2026-08-31' };
   assert.deepEqual(await callCenterWorkByMarketFor({ kind: 'canvass', ...win }, deps), { FTLAU_MKT: 1, ORL_MKT: 1 }, 'LF confirmers only');
   assert.deepEqual(await callCenterWorkByMarketFor({ kind: 'demo', ...win }, deps), { FTLAU_MKT: 2 }, 'aged LF demos only');
-  assert.deepEqual(await callCenterWorkByMarketFor({ kind: 'sales', ...win }, deps), { JAX_MKT: 3000000, SAR_MKT: 1000000 }, 'new LF leads only; the job\'s market, else the lead\'s');
+  assert.deepEqual(await callCenterWorkByMarketFor({ kind: 'sales', ...win }, deps), { JAX_MKT: 30000, SAR_MKT: 10000 }, 'new LF leads only, whole dollars; the job\'s market, else the lead\'s');
   const rows = await previewAllocation({ id: 'd', amount: 500, period_start: '2026-08-23', period_end: '2026-08-31', description: 'Demos - AGED', lp_sub_sources: ['Call Center'], eligible_markets: ['ALL_OFFICES'] }, deps);
   assert.deepEqual(rows.map((r) => [r.market, r.amount]), [['FTLAU_MKT', 500]]);
 });
@@ -342,4 +342,122 @@ test('a $0 line beside billed lines is dropped; an all-$0 invoice keeps its line
   assert.deepEqual(rows.map((r) => [r.line_no, r.description, r.amount, r.lp_sub_sources, r.eligible_markets]), [[1, 'Sales 1.5%', 3812.07, ['Call Center'], ['ALL_OFFICES']]]);
   const allZero = buildExpenseRows({ document: { id: 'd' }, vendor, facts, analysis: { lines: [{ description: 'Canvas', amount: 0 }] } });
   assert.equal(allZero.rows.length, 1);
+});
+
+// 2026-10-19, the user: "accept an invoice as received and later amend it if a
+// dispute arises … 9 leads were actually issued to an office, while 3 were
+// overbilled." A dispute opens only when they billed MORE than we found.
+import { callCenterGap, DISPUTED_MARKET } from '../src/marketing/allocation.js';
+import { basisText, disputedTotal, buildReviewCard } from '../src/marketing/slack-review.js';
+test('billed 12 demos, found 9: $2,250 to the offices of the 9, $750 Disputed; confirmed → all $3,000 by office', () => {
+  const line = { id: 'd', amount: 3000, period_start: '2026-08-01', period_end: '2026-08-08', description: 'Demos - AGED', lp_sub_sources: ['Call Center'], eligible_markets: ['ALL_OFFICES'], flags: [] };
+  const look = () => ({ weights: { FTLAU_MKT: 5, SAR_MKT: 4 }, unitPrice: 250 });
+  const rows = allocateExpense(line, look);
+  assert.deepEqual(rows.map((r) => [r.market, r.amount]), [['FTLAU_MKT', 1250], ['SAR_MKT', 1000], [DISPUTED_MARKET, 750]]);
+  const d = rows.find((r) => r.market === DISPUTED_MARKET);
+  assert.equal(d.rule, 'hold');
+  assert.equal(d.note, 'billed 12 aged-lead demos, found 9: 3 not found ($750.00)');
+  assert.equal(sumCents(rows), 300000);
+  const accepted = allocateExpense({ ...line, flags: ['dispute_accepted'] }, look);
+  assert.deepEqual(accepted.map((r) => [r.market, r.amount]), [['FTLAU_MKT', 1666.67], ['SAR_MKT', 1333.33]]);
+  const credited = allocateExpense({ ...line, amount: 2250, flags: ['dispute_credited'] }, look);
+  assert.deepEqual(credited.map((r) => [r.market, r.amount]), [['FTLAU_MKT', 1250], ['SAR_MKT', 1000]], 'after the credit the offices keep exactly what they had');
+  assert.deepEqual(allocateExpense(line, () => ({ weights: {}, unitPrice: 250 })).map((r) => [r.market, r.amount]), [[DISPUTED_MARKET, 3000]], 'nothing found: all disputed');
+  assert.deepEqual(allocateExpense(line, () => ({ weights: { FTLAU_MKT: 9 }, unitPrice: null })).map((r) => r.market), ['FTLAU_MKT'], 'no price on file: no dispute can be told');
+});
+
+test('sales: finding MORE than billed splits normally; finding less parks the difference', () => {
+  const sales = { id: 's', amount: 2538.81, period_start: '2026-08-01', period_end: '2026-08-15', description: 'Sales 169,254 x 0.015', lp_sub_sources: ['Call Center'], eligible_markets: ['ALL_OFFICES'] };
+  const found = { FTMYR_MKT: 41827, ORL_MKT: 60984, SAR_MKT: 37560, STPET_MKT: 39141 };
+  const rows = allocateExpense(sales, () => ({ weights: found, unitPrice: 0.015 }));
+  assert.ok(rows.every((r) => r.market !== DISPUTED_MARKET));
+  assert.equal(rows.find((r) => r.market === 'FTMYR_MKT').issued_basis, 41827, 'whole dollars of sales, as the card prints them');
+  assert.equal(basisText({ ...rows.find((r) => r.market === 'FTMYR_MKT'), kind: 'sales' }), ' ($41,827 of $179,512 in sales)');
+  const gap = callCenterGap({ amount: 2538.81, weights: { FTMYR_MKT: 100000 }, unitPrice: 0.015, kind: 'sales' });
+  assert.deepEqual([gap.matched, gap.disputed], [1500, 1038.81]);
+  assert.equal(gap.note, 'billed on $169,254 in sales, found $100,000: $69,254 of sales not found ($1,038.81)');
+  assert.equal(callCenterGap({ amount: 2538.81, weights: { FTMYR_MKT: 169200 }, unitPrice: 0.015, kind: 'sales' }), null, 'under a dollar is rounding');
+  assert.equal(callCenterGap({ amount: 3000, weights: { FTLAU_MKT: 12 }, unitPrice: 250, kind: 'demo' }), null);
+});
+
+test('the card says what each split was based on, and a decided card with a dispute can settle it', () => {
+  assert.equal(basisText({ market: 'SAR_MKT', rule: 'proportional', issued_basis: 3, issued_total: 9, kind: 'demo' }), ' (3 of 9 aged-lead demos)');
+  assert.equal(basisText({ market: 'SAR_MKT', rule: 'proportional', issued_basis: 12, issued_total: 40 }), ' (12 of 40 issued leads)');
+  assert.equal(basisText({ market: 'SAR_MKT', rule: 'equal' }), ' (split evenly)');
+  assert.equal(basisText({ market: DISPUTED_MARKET, rule: 'hold' }), '');
+  const allocation = [
+    { month: '2026-08-01', market: 'FTLAU_MKT', amount: 1250, rule: 'proportional', issued_basis: 5, issued_total: 9, kind: 'demo' },
+    { month: '2026-08-01', market: DISPUTED_MARKET, amount: 750, rule: 'hold', note: 'billed 12 aged-lead demos, found 9: 3 not found ($750.00)', kind: 'demo' },
+  ];
+  assert.equal(disputedTotal(allocation), 750);
+  const rows = [{ id: 'd', amount: 3000, description: 'Demos - AGED', lp_sub_sources: ['Call Center'], eligible_markets: ['ALL_OFFICES'] }];
+  const preview = buildReviewCard({ document: DOCX, facts: { invoice_number: '17638' }, rows, allocation });
+  const text = JSON.stringify(preview.blocks);
+  assert.match(text, /Fort Lauderdale · demos: \$1,250\.00 \(5 of 9 aged-lead demos\)/);
+  assert.match(text, /Disputed \(not charged to any office\): \$750\.00 _billed 12 aged-lead demos, found 9: 3 not found/);
+  assert.doesNotMatch(text, /issued\)/);
+  assert.match(text, /Accepts \$3,000\.00 as received\. \$2,250\.00 goes to the offices; \$750\.00 sits as Disputed/);
+  const done = buildReviewCard({ document: DOCX, facts: {}, rows, allocation, decision: { outcome: 'approved', by: 'mark', at: 'x' } });
+  const ids = done.blocks.filter((b) => b.type === 'actions').flatMap((b) => b.elements.map((e) => e.action_id));
+  assert.deepEqual(ids, ['mktinv_dispute_accept', 'mktinv_dispute_credit', 'mktinv_reopen']);
+  const clean = buildReviewCard({ document: DOCX, facts: {}, rows, allocation: allocation.slice(0, 1), decision: { outcome: 'approved', by: 'mark', at: 'x' } });
+  assert.deepEqual(clean.blocks.filter((b) => b.type === 'actions').flatMap((b) => b.elements.map((e) => e.action_id)), ['mktinv_reopen']);
+});
+
+import { handleMarketingInvoiceInteraction, replaceEarlierInvoice } from '../src/marketing/review-actions.js';
+import { parseMarketingInvoiceInteraction } from '../src/slack-approvals-core.js';
+const DOC_ID = '22222222-2222-4222-8222-222222222222';
+function disputedDb() {
+  return fakeSupabase({
+    marketing_invoice_documents: [{ id: DOC_ID, status: 'posted', analysis: { facts: { invoice_number: '17638' } }, slack_channel: 'C1', slack_ts: '1.1' }],
+    marketing_expenses: [{ id: 'e1', document_id: DOC_ID, line_no: 1, status: 'approved', approved_by: 'mark (U_MARK)', approved_at: '2026-10-19T18:00:00Z', amount: 3000, description: 'Demos - AGED', lp_sub_sources: ['Call Center'], eligible_markets: ['ALL_OFFICES'], flags: [], invoice_number: '17638', vendor_id: 'lf' }],
+    marketing_expense_allocations: [
+      { expense_id: 'e1', month: '2026-08-01', market: 'FTLAU_MKT', amount: 2250, rule: 'proportional' },
+      { expense_id: 'e1', month: '2026-08-01', market: DISPUTED_MARKET, amount: 750, rule: 'hold', recommendation_reason: 'billed 12 …' },
+    ],
+  });
+}
+const click = (decision) => ({ kind: 'mktinv', decision, documentId: DOC_ID, userId: 'U_MARK', userName: 'mark', responseUrl: 'https://hooks.slack.com/x' });
+const settleDeps = (supabase, sink) => ({ supabase, approvers: new Set(['U_MARK']), reply: async (_u, b) => sink.replies.push(b), allocate: async (id) => sink.allocated.push(id), signedLink: async () => null, postToSlack: async (t) => { sink.thread.push(t); return { ok: true }; }, updateSlackMessage: async () => ({ ok: true }) });
+
+test('Credit received: the line drops by the disputed $750, the credit is recorded, the line re-splits', async () => {
+  const supabase = disputedDb();
+  const sink = { replies: [], allocated: [], thread: [] };
+  const r = await handleMarketingInvoiceInteraction(click('dispute_credit'), settleDeps(supabase, sink));
+  assert.equal(r.action, 'dispute_credited');
+  const e = supabase.tables.marketing_expenses[0];
+  assert.equal(e.amount, 2250);
+  assert.ok(e.flags.includes('dispute_credited'));
+  assert.deepEqual(sink.allocated, ['e1']);
+  assert.equal(supabase.tables.marketing_invoice_documents[0].analysis.credits[0].credited, 750);
+  assert.match(sink.thread[0], /\$750\.00 credit recorded by mark/);
+});
+
+test('Confirm charge: flagged accepted and re-split; with nothing disputed the click changes nothing', async () => {
+  const supabase = disputedDb();
+  const sink = { replies: [], allocated: [], thread: [] };
+  const r = await handleMarketingInvoiceInteraction(click('dispute_accept'), settleDeps(supabase, sink));
+  assert.equal(r.action, 'dispute_accepted');
+  assert.equal(supabase.tables.marketing_expenses[0].amount, 3000);
+  assert.ok(supabase.tables.marketing_expenses[0].flags.includes('dispute_accepted'));
+  supabase.tables.marketing_expense_allocations = supabase.tables.marketing_expense_allocations.filter((a) => a.market !== DISPUTED_MARKET);
+  const again = await handleMarketingInvoiceInteraction(click('dispute_credit'), settleDeps(supabase, sink));
+  assert.equal(again.action, 'nothing_disputed');
+});
+
+test('a revised invoice with the same number replaces the approved original', async () => {
+  const supabase = disputedDb();
+  const r = await replaceEarlierInvoice({ documentId: 'NEW', rows: [{ invoice_number: '17638', vendor_id: 'lf' }], by: 'mark', now: '2026-10-20T00:00:00Z' }, { supabase });
+  assert.deepEqual([r.invoice_number, r.lines, r.amount], ['17638', 1, 3000]);
+  assert.equal(supabase.tables.marketing_expenses[0].status, 'superseded');
+  assert.equal(supabase.tables.marketing_expense_allocations.length, 0, 'the original is out of the market costs');
+  assert.equal(supabase.tables.marketing_invoice_documents[0].analysis.replaced_by, 'NEW');
+  assert.equal(await replaceEarlierInvoice({ documentId: 'NEW', rows: [{ invoice_number: '99', vendor_id: 'lf' }], by: 'mark', now: 'x' }, { supabase }), null);
+});
+
+test('the settle buttons reach the handler', () => {
+  for (const id of ['mktinv_dispute_accept', 'mktinv_dispute_credit']) {
+    const p = parseMarketingInvoiceInteraction(`payload=${encodeURIComponent(JSON.stringify({ type: 'block_actions', user: { id: 'U_MARK', name: 'mark' }, actions: [{ action_id: id, value: DOC_ID }] }))}`);
+    assert.equal(p?.decision, id.replace('mktinv_', ''));
+  }
 });

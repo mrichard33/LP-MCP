@@ -88,15 +88,20 @@ export function buildMarketModel({ market, month, monthRows, weekRows }) {
   const held = aggregate(monthRows.filter((r) => r.period_start === m0 && r.market === 'REECE_HOLD'), () => 'held');
   const heldTotal = held.length ? held[0].invoice_cost + held[0].calculated_cost : 0;
   const recommendations = [...new Set(monthRows.filter((r) => r.period_start === m0 && r.market === 'REECE_HOLD' && r.recommended_market).map((r) => `${r.recommended_market}: ${r.recommendation_reason || ''}`))];
+  // 2026-10-19: billed but not found, parked until a revised invoice, a confirmed
+  // charge or a credit settles it (allocation.js DISPUTED_MARKET).
+  const disputed = aggregate(monthRows.filter((r) => r.period_start === m0 && r.market === 'DISPUTED'), () => 'disputed');
+  const disputedTotal = disputed.length ? disputed[0].invoice_cost + disputed[0].calculated_cost : 0;
   const asOf = thisMonth.map((r) => r.as_of_snapshot).filter(Boolean).sort().pop() || null;
   const footnotes = [
     campaign.some((c) => c.has_provisional) ? '† provisional: Lead Gurus feed spend until the invoice replaces it at month close; Canvass commission is a 15% estimate until canvasser payroll is uploaded.' : null,
     heldTotal ? `Held at company level (REECE_HOLD), not in any market: $${heldTotal.toLocaleString('en-US', { minimumFractionDigits: 2 })}${recommendations.length ? ` — recommended: ${recommendations.join(' | ')}` : ' — no recommendation yet'}.` : null,
+    disputedTotal ? `Disputed, not in any market (billed for more than we could find; waiting on a revised invoice, a confirmed charge or a credit): $${disputedTotal.toLocaleString('en-US', { minimumFractionDigits: 2 })}.` : null,
     asOf ? `Net / Working $ as of the ${asOf} report 133 snapshot — statuses move daily.` : 'Net / Working $: no report 133 snapshot for this month yet.',
     'Net $ = jobs released to production (RTP) or completed; Working $ = sold but not yet RTP.',
     'Cost / Issued Lead = (Invoice Cost + Calculated Cost) ÷ Issued. Calculated = Canvass 15% (estimate until canvasser payroll), MVP Marketing 15%, LeadPilotData 15%, Previous Customer / Referral 1% of net.',
   ].filter(Boolean);
-  return { market, title: market === COMPANY ? 'Reece Windows & Doors — all markets' : marketLabel(market), month, monthLabel: monthLabel(month), campaign, monthly, weekly, held: heldTotal, recommendations, asOf, footnotes };
+  return { market, title: market === COMPANY ? 'Reece Windows & Doors — all markets' : marketLabel(market), month, monthLabel: monthLabel(month), campaign, monthly, weekly, held: heldTotal, disputed: disputedTotal, recommendations, asOf, footnotes };
 }
 
 /** Load everything one month's report needs and build every market model + the company. */

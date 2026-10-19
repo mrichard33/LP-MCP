@@ -981,6 +981,18 @@ Brad's XLSX (`marketing-cost-report`, formulas never typed values) read `v_marke
   with a note, re-run nightly, never a hold recommendation; a call-center line naming none of the three stays even.
   Read from the description, so an Edit to "call center cost" keeps it. A $0 line beside billed lines is dropped at
   build (`buildExpenseRows`): kept, it blocked Approve on a multi-line invoice Edit could not fix.
+- **Accept as received, dispute what was billed but not found (the user, 2026-10-19: 12 demos billed, 9 found).** A
+  call-center line billed for MORE than we found (`callCenterGap`: found × the pay_rules unit price, a gap of half a unit
+  or a dollar of sales) splits the found part by office and parks the rest on market `DISPUTED` (rule 'hold': the rule
+  CHECK allows no other; never REECE_HOLD, never a hold recommendation) with "billed 12 aged-lead demos, found 9: 3 not
+  found ($750.00)". Finding more just splits. Such an invoice is never auto-approved (flag `billed_more_than_found`).
+  It is settled three ways: a revised invoice with the same number replaces the approved original on approval
+  (`replaceEarlierInvoice`: old lines `superseded`, allocations gone, `analysis.replaced_by`); **Confirm charge**
+  (`mktinv_dispute_accept`, flag `dispute_accepted`, the whole line split by office); **Credit received**
+  (`mktinv_dispute_credit`, the line's amount drops by the disputed part, flag `dispute_credited`, `analysis.credits`).
+  The nightly re-run shrinks a dispute on its own when the missing leads sync. Sales weights are WHOLE dollars, and the
+  card prints every basis in words (`basisText`: "$41,827 of $179,513 in sales", "3 of 9 aged-lead demos", "12 of 40
+  issued leads"), never "4182700/17951276 issued".
 - **Only Mark or Brad decides (D6).** The card in `SLACK_MKT_INVOICE_CHANNEL_ID` carries `mktinv_approve` /
   `mktinv_edit` / `mktinv_reject`; `isMarketingInvoiceAction` in `src/slack-approvals-core.js` catches those clicks AND
   the Edit modal's `view_submission` so they are never relayed to onboarding (which would read them as a member
