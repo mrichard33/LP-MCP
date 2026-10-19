@@ -18,6 +18,14 @@
  * prompt blocks. An unexplained snapshot diff means the change is wrong, not
  * the snapshot. Map: docs/handoffs/response-generator-split-map.md.
  *
+ * v2.9.1 — 2026-10-19. POST-DEMO EMAIL DECLINE (Mark; Thomas Geary, agent_actions
+ *   573254). A Phase-freeze exception Mark approved. A post-demo lead's firm
+ *   decline by email gets ONE objection reply that ends with no question
+ *   (every asking sentence dropped after the model); a second decline adds the
+ *   POST-DEMO EMAIL: SECOND DECLINE plan line (a warm close, no reframe, no
+ *   question). A reasoned decline never gets the "what changed?" block. See
+ *   src/agentic/post-demo-email.js; EMAIL_POST_DEMO_MODE off|shadow|live.
+ *
  * v2.9.0 — 2026-10-18. PHASE 1: ONE OWNER PER INBOUND (architecture review
  *   2026-10-17, cause 4). NO PROMPT COPY CHANGES. The one planner change: a
  *   no right after our recorded close step (post_demo_close, door_open,
@@ -436,6 +444,9 @@ import { readLastPlanStep } from './services/plan-step-io.js';  // 2026-10-18 (P
 import { isCustomerP2 } from './agentic/lead-state/signals/context-reader.js';
 import { isUnsoldPostDemo, lpSold, postDemoOwnerName, replaceSalesRepFollowUp } from './agentic/post-demo-owner.js';
 import { postDemoPlannerMode } from './agentic/post-demo-turn.js';
+// 2026-10-19 (Mark; Thomas Geary): a post-demo decline by email gets one
+// objection reply with no question, then a warm close.
+import { emailPostDemoMode, planPostDemoEmail, enforcePostDemoEmail, planStepFor as postDemoEmailStepFor } from './agentic/post-demo-email.js';
 import { rehashCallSlotsMode, readRehashCallSlots, rehashCallBooking } from './agentic/rehash-slots.js';
 import { isInRehash, rehashLeadFromContext, rehashRoutingMode } from './agentic/rehash-state.js';
 import { enforcePresentationGuard } from './siro/presentation-guard.js';
@@ -449,11 +460,11 @@ import {
 } from './agentic/service-area-turn.js';
 
 /**
- * v2.9.0 — the header version above, as a value. Stamped (with the deployed
+ * v2.9.1 — the header version above, as a value. Stamped (with the deployed
  * git sha) onto every fingerprint so a replay knows which generator wrote the
  * reply. Bump it with the header note.
  */
-export const RESPONSE_GENERATOR_VERSION = 'v2.9.0';
+export const RESPONSE_GENERATOR_VERSION = 'v2.9.1';
 
 // Provider + model resolved at call time by the shared client from the
 // `response_generator` fn key (customer_facing group). Legacy
@@ -1755,7 +1766,9 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
   }
   // 2026-09-24 (Mark) — "not interested" gets one "what changed?", then a
   // warm close. See src/agentic/not-interested.js.
-  const niTurn = notInterestedTurn(triggerMessage, context.conversation_recent);
+  // A post-demo email decline has its own turn (2026-10-19), so it never
+  // also gets the "what changed?" ask.
+  const niTurn = opts.postDemoEmailDecline ? null : notInterestedTurn(triggerMessage, context.conversation_recent);
   if (niTurn) parts.push(...P.notInterestedTurnBlock(niTurn));
   if (String(process.env.NAMED_STORM_MODE || '').toLowerCase() === 'true') {
     parts.push(...P.NAMED_STORM_POSTURE);
@@ -2090,6 +2103,8 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
   // 2026-10-02: the NEPQ turn plan is the last word before the output
   // contract (later text wins). Absent unless NEPQ_BACKBONE_MODE=live.
   if (opts.nepqPlan) parts.push(...P.renderPlanBlock(opts.nepqPlan));
+  // 2026-10-19 (Mark): a post-demo lead's second decline by email.
+  if (opts.postDemoEmailDecline === 'decline_close') parts.push(...P.postDemoEmailCloseBlock(context.lead?.first_name || null));
   parts.push(...P.OUTPUT_CONTRACT);
 
   return parts.join('\n');
@@ -4282,6 +4297,31 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     }
   }
 
+  // ─── Post-demo email decline (Mark, 2026-10-19; Thomas Geary) ─────────
+  // The planner above is SMS only. A post-demo lead's firm decline by email
+  // gets ONE reply that works the objection and ends with no question; a
+  // second decline gets a short warm close. EMAIL_POST_DEMO_MODE off|shadow|
+  // live (default live) and POST_DEMO_PLANNER_MODE live; shadow logs only.
+  let postDemoEmail = null;
+  if (channel === 'email') {
+    try {
+      const emMode = (opts.dryRun === true && opts.emailPostDemoModeOverride) ? opts.emailPostDemoModeOverride : emailPostDemoMode();
+      const pdModeEmail = (opts.dryRun === true && opts.postDemoModeOverride) ? opts.postDemoModeOverride : postDemoPlannerMode();
+      const sold = lpSold(context?.lp) || isCustomerP2(context);
+      const postDemoEmailLead = !sold && (!!rehash || derivePostAppointment(context, opts.contextSnapshot).post);
+      if (emMode !== 'off' && pdModeEmail === 'live' && postDemoEmailLead) {
+        const lastPlanStep = opts.dryRun === true ? (opts.lastPlanStepOverride ?? null) : await readLastPlanStep(contactId);
+        const kind = planPostDemoEmail({ trigger: triggerMessage, lastPlanStep });
+        if (kind && emMode === 'shadow') console.log(`[PostDemoEmail] shadow ${contactId}: would plan ${kind} (last step ${lastPlanStep || 'none'})`);
+        else if (kind) postDemoEmail = { kind, step: postDemoEmailStepFor(kind) };
+      }
+    } catch (err) {
+      console.warn(`[PostDemoEmail] plan failed for ${contactId} (email unchanged): ${err.message}`);
+      postDemoEmail = null;
+    }
+  }
+  const postDemoEmailDecline = postDemoEmail?.step ? postDemoEmail.kind : null;
+
   // ─── Booking facts (Part 6, 2026-10-02): code decides, AI writes ───
   // A pick or a held time is resolved against the real slots, and the ONE
   // thing to ask next (or "book it now") is worked out here. The facts are
@@ -4402,6 +4442,8 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       // 2026-10-02: the binding NEPQ move, rendered last (live mode only).
       nepqPlan: nepqMode === 'live' ? nepqPlan : null,
       leadStage: nepqMode === 'live' ? leadStage : null,
+      // 2026-10-19: the post-demo email decline turn (decline_first / decline_close).
+      postDemoEmailDecline,
     }
   );
   // Part 7 (Mark, 2026-10-02: "I don't think we need any static messages"):
@@ -5547,6 +5589,16 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     }
   }
 
+  // ─── Post-demo email decline (Mark, 2026-10-19; Thomas Geary) ─────────
+  // The LAST change to the body: a first decline loses every sentence that
+  // asks (the reframe, the proposal line and the follow-up team stay); a
+  // second loses questions and rebuttals too. Never an empty body.
+  if (postDemoEmailDecline) {
+    const pd = enforcePostDemoEmail(validated.message, postDemoEmailDecline, { firstName: identityState?.identity?.first_name || context.lead?.first_name || null });
+    console.log(`[PostDemoEmail] ${contactId} ${postDemoEmailDecline} dropped=${pd.dropped}`);
+    if (pd.changed && pd.text.trim()) validated.message = pd.text;
+  }
+
   // v2.7.8: companion log line now includes action_type so cancel/reschedule
   // appear distinctly in stdout.
   let companionLog = 'none';
@@ -5656,8 +5708,8 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       core_prompt_version: RESPONSE_GENERATOR_VERSION,
       // 2026-10-18 (Phase 1 item 4): the plan this reply ran on, recorded as
       // top-level bot_message_context columns for the next turn's planner.
-      plan_step: nepqPlanStepOf(nepqPlan) || 'unplanned',
-      question_allowed: nepqPlan ? nepqPlan.no_question !== true : null,
+      plan_step: postDemoEmail?.step || nepqPlanStepOf(nepqPlan) || 'unplanned',
+      question_allowed: postDemoEmail?.step ? false : (nepqPlan ? nepqPlan.no_question !== true : null),
       model: resolveLLM('response_generator').model,
       // CANON.STD.026: what this reply ran on (null before the call returns).
       prompt_sha256: genMeta.prompt_sha256 || null,

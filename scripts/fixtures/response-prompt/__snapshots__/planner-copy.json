@@ -1,5 +1,5 @@
 {
- "version": "v2.9.0",
+ "version": "v2.9.1",
  "copy": {
   "src/agentic/nepq-planner.js": [
    "${label ? `${label} isn't open` : \"That time isn't open\"}, but I have ${slotPair(slots)}. Which works better?",
@@ -256,6 +256,21 @@
    "what would make it work for them",
    "where they are in the decision",
    "words, and only about cost, comfort or another season of the same thing. Never danger,"
+  ],
+  "src/agentic/post-demo-email.js": [
+   "Thank you${name && !/^guest$/i.test(name) ? `, ${name}` : ''}. We understand, and we respect your decision. ",
+   "Your proposal stays good for a full year, so if anything changes, just reply here.",
+   "\\n",
+   "\\n\\n",
+   "decline_close",
+   "decline_first",
+   "defer",
+   "live",
+   "off",
+   "post_demo_email_decline_close",
+   "post_demo_email_decline_first",
+   "shadow",
+   "signed_elsewhere"
   ]
  }
 }

@@ -9,7 +9,9 @@
  *     ALT_LINES, POST_DEMO_ASK_BACK, and on every line that sets a fixed line
  *     (fixed_line, ack_line, fixed(...), const line / stopLine);
  *   - src/agentic/rehash-nepq.js: every string / template literal (the track's
- *     stages, examples, moves and the block it renders).
+ *     stages, examples, moves and the block it renders);
+ *   - src/agentic/post-demo-email.js: every string (the second decline's
+ *     close line, 2026-10-19).
  * A change there while RESPONSE_GENERATOR_VERSION still equals the version the
  * snapshot was recorded under fails, exactly like the prompt snapshot.
  * UPDATE_SNAPSHOTS=1 re-records it (with the new version).
@@ -117,6 +119,9 @@ const FIXED_LINE_RX = /\bfixed_line\b|\back_line\b|\bfixed\(|\bconst\s+(?:line|s
 export function plannerCopy(root = ROOT) {
   const planner = fs.readFileSync(path.join(root, 'src/agentic/nepq-planner.js'), 'utf8');
   const rehash = fs.readFileSync(path.join(root, 'src/agentic/rehash-nepq.js'), 'utf8');
+  // 2026-10-19: the post-demo email decline's close line (a lead reads it as a backup).
+  const pdEmailPath = path.join(root, 'src/agentic/post-demo-email.js');
+  const pdEmail = fs.existsSync(pdEmailPath) ? fs.readFileSync(pdEmailPath, 'utf8') : '';
   const lits = stringLiterals(planner);
   const ranges = ['LINES', 'ALT_LINES', 'POST_DEMO_ASK_BACK'].map(n => blockLines(planner, n)).filter(Boolean);
   const srcLines = planner.split('\n');
@@ -134,6 +139,7 @@ export function plannerCopy(root = ROOT) {
   return {
     'src/agentic/nepq-planner.js': pick(lits.filter(x => inRange(x.line))),
     'src/agentic/rehash-nepq.js': pick(stringLiterals(rehash).filter(x => !/^\.\.?\//.test(x.text))),
+    'src/agentic/post-demo-email.js': pick(stringLiterals(pdEmail).filter(x => !/^\.\.?\//.test(x.text))),
   };
 }
 

@@ -259,6 +259,7 @@ import { resolveApptStart } from './objection-state-ghost-sweep.js';
 import { fetchCurrentLead } from './current-lead.js';
 import { lpStoredToUtcMs } from './lp-dates.js';
 import { inboundFromReplyEvent } from './agentic/burst-yield.js';
+import { isPostDemoDecline } from './agentic/post-demo-email.js';  // 2026-10-19 (not_post_demo_decline)
 
 // ═══════════════════════════════════════════════════════════════════
 // CONSTANTS
@@ -721,6 +722,24 @@ async function isNewestLeadForContact(event, client = supabase) {
 // CONTEXTUAL RULE EVALUATION
 // ═══════════════════════════════════════════════════════════════════
 
+// 2026-10-19 (not_post_demo_decline): the lead's newest inbound text at or
+// before `atIso`, within the hour before it, or '' when there is none. Throws
+// on a failed read (the caller fails closed).
+const LATEST_INBOUND_WINDOW_MS = 60 * 60_000;
+export async function readLatestInboundText(db, contactId, atIso) {
+  const atMs = Number.isFinite(Date.parse(atIso)) ? Date.parse(atIso) : Date.now();
+  const { data, error } = await db.from('system_events')
+    .select('payload, created_at')
+    .eq('ghl_contact_id', contactId)
+    .eq('event_type', 'ghl.reply_received')
+    .lte('created_at', new Date(atMs + 1000).toISOString())
+    .gte('created_at', new Date(atMs - LATEST_INBOUND_WINDOW_MS).toISOString())
+    .order('created_at', { ascending: false })
+    .limit(1);
+  if (error) throw new Error(error.message);
+  return String((Array.isArray(data) && data[0]?.payload?.message_text) || '');
+}
+
 async function fetchLeadIntelligence(ghlContactId) {
   if (!ghlContactId) return null;
   const { data, error } = await supabase.from('lead_intelligence').select('*').eq('ghl_contact_id', ghlContactId).maybeSingle();
@@ -1069,6 +1088,8 @@ const IO_BACKED_CONDITION_KEYS = new Set([
   'not_active_in_home_appointment', 'not_reschedule_inflight',
   'not_duplicate_lead_live_appointment', 'no_future_appointment',
   'last_active_appointment', 'not_stale_post_demo_cancel', 'not_sync_created_appointment',
+  // contact tags + the latest inbound (system_events) — 2026-10-19
+  'not_post_demo_decline',
   // system_events history
   'thread_turn_count_gte', 'analysis_occurrence_gte', 'analysis_occurrence_lt',
   'no_inbound_within_hours', 'inbound_within_hours', 'has_prior_inbound',
@@ -2030,6 +2051,42 @@ async function evaluateContextConditions(conditions, intelligence, event, opts =
         }
         if (scCreated.has(String(scId))) {
           console.log(`[Context] BLOCKED: not_sync_created_appointment — ${scId} was created by our LP→GHL sync (rule ${ruleKey || '?'})`);
+          return false;
+        }
+        break;
+      }
+
+      // 2026-10-19 (Mark; Thomas Geary, agent_actions 573250 / 573270): a
+      // post-demo lead's firm decline gets ONE reply, never an O.0 drip beside
+      // it. BEHAVIORAL_PRICE_OBJECTION fires on ai.analysis_completed (the text
+      // is on the payload); OBJECTION_ROUTE_POST_DEMO fires on
+      // intent.objection_detected, whose payload is empty, so the lead's latest
+      // inbound before the event is read. A failed read fails closed; no
+      // inbound at all is not a decline.
+      case 'not_post_demo_decline': {
+        if (!expected) break;
+        const pdContactId = event?.ghl_contact_id;
+        if (!pdContactId) return notApplicableNoContact(key);
+        let pdText = typeof payload.message_text === 'string' ? payload.message_text : null;
+        if (pdText === null) {
+          const pdDb = opts.deps?.supabase !== undefined ? opts.deps.supabase : supabase;
+          if (!pdDb) return failClosed(key, 'LP Supabase not configured');
+          try {
+            pdText = await readLatestInboundText(pdDb, pdContactId, event?.created_at);
+          } catch (err) {
+            return failClosed(key, `latest inbound read failed: ${err.message}`);
+          }
+        }
+        if (!pdText) break;
+        if (!tagsFetched) {
+          const snapshot = await getContactSnapshot(event, opts.deps);
+          tags = snapshot === null ? null : snapshot.tags;
+          tagSource = snapshot === null ? null : snapshot.source;
+          tagsFetched = true;
+        }
+        if (tags === null) return failClosedContactRead(key, 'contact tags unreadable');
+        if (isPostDemoDecline({ tags, text: pdText })) {
+          console.log(`[Context] BLOCKED: not_post_demo_decline — post-demo decline, the reply owns it (rule ${ruleKey || '?'})`);
           return false;
         }
         break;

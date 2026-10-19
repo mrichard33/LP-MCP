@@ -50,6 +50,9 @@ export function contextForRow(row) {
     // calculator lead's online estimate ("the customer's own estimate excepted").
     allowFigures: MONEY_RX.test(inbound) || tags.some(t => t === 'active-entry:estimate-calculator' || t === 'active-entry:calculator'),
     allowName: rehashName || null,
+    // 2026-10-19: a post-demo email decline turn ends with no question.
+    postDemoEmailStep: row.plan_step === 'post_demo_email_decline_first' ? 'decline_first'
+      : row.plan_step === 'post_demo_email_decline_close' ? 'decline_close' : undefined,
   };
 }
 
@@ -84,7 +87,7 @@ async function loadRows() {
   const rows = [];
   for (let from = 0; ; from += 1000) {
     let q = supabase.from('bot_message_context')
-      .select('message_ref, channel, model, core_prompt_version, inbound_text, reply_text, input_snapshot, generated_at, sent_at')
+      .select('message_ref, channel, model, core_prompt_version, inbound_text, reply_text, input_snapshot, generated_at, sent_at, plan_step')
       .gte('generated_at', since).order('generated_at', { ascending: true }).range(from, from + 999);
     const channel = opt('--channel');
     if (channel) q = q.eq('channel', channel);

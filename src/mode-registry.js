@@ -102,6 +102,11 @@ export const MODES = Object.freeze([
     goLive: '[PostDemo] shadow plans read right on real post-demo threads (Mark, 2026-10-09)',
     note: 'Plans replies to post-demo leads as post-demo (defer, acknowledge, competitor signed).',
   }),
+  m('EMAIL_POST_DEMO_MODE', 'bot', 'enum', OSL, 'live', OSL_S, {
+    since: '2026-10-19', decider: 'Mark',
+    goLive: 'Thomas replay passes; gate not worse',
+    note: 'A post-demo lead who declines by email gets one objection reply with no question, then a warm close (needs POST_DEMO_PLANNER_MODE=live). off is the rollback.',
+  }),
   m('REHASH_CALL_SLOTS_MODE', 'bot', 'enum', OSL, 'shadow', OSL_S, {
     since: '2026-10-09', decider: 'the user',
     goLive: '[RehashSlots] shadow offers name times open on the Rehash Call calendar; needs POST_DEMO_PLANNER_MODE=live first',

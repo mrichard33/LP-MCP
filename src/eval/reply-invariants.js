@@ -33,6 +33,7 @@ import { enforceCallTiming, promisedCallback, enforceRehashCallTiming } from '..
 import { enforceOneAsk } from '../agentic/one-ask.js';
 import { isLeadSignOff } from '../agentic/sign-off.js';
 import { dropUnaskedCallOffer, leadWantsCall, isMoneyFigure, URGENCY_RX, CLAIMS_RX, POST_DEMO_REBUTTAL_RX, UNPROMISED_FOLLOW_UP_RX } from '../agentic/nepq-planner.js';
+import { sentenceAsks } from '../agentic/post-demo-email.js';
 
 /** Bump when a check is added or changed, so scorecards from two versions are not compared as one. */
 export const INVARIANTS_VERSION = '2026-10-16.1';
@@ -69,6 +70,7 @@ function sentences(text) {
  * @param {boolean}[ctx.rehash]         a rehash (post-demo) lead; undefined skips the rehash call-timing check
  * @param {boolean}[ctx.callbackFiled]  this turn filed a callback (a hand-off): any call it promises is backed
  * @param {string} [ctx.postDemoStep]   the post-demo plan's step; null = not a post-demo turn; undefined skips the post-demo checks
+ * @param {string} [ctx.postDemoEmailStep] the post-demo email decline turn ('decline_first' | 'decline_close'); null = none; undefined skips
  * @param {boolean}[ctx.warrantySent]   this turn sends the warranty files; undefined skips the warranty-claim check
  * @param {object} [ctx.presentation]   the Siro visit facts the prompt showed; undefined skips the presentation check
  * @returns {{ pass: boolean, violations: Array<{code: string, detail: string}>, skipped: string[], metrics: {chars: number, questions: number} }}
@@ -209,6 +211,16 @@ export function checkReply(reply, ctx = {}) {
     // 2026-10-17 (Billy, Shawn, Debbie, James, Paul, Tatyana, Jeff): a lead's
     // sign-off or first no gets one line and no question.
     else if ((ctx.postDemoStep === 'post_demo_close' || ctx.postDemoNoQuestion === true) && text.includes('?')) fail('question_after_closer', text);
+  }
+
+  // ── a post-demo email decline ends with no question (Mark, 2026-10-19) ──
+  // Thomas Geary (agent_actions 573254): the reply worked the objection and
+  // closed on a question. A second decline gets no rebuttal either
+  // (src/agentic/post-demo-email.js). The first reply may keep its reframe.
+  if (ctx.postDemoEmailStep === undefined) skipped.push('post_demo_email_decline');
+  else if (ctx.postDemoEmailStep === 'decline_first' || ctx.postDemoEmailStep === 'decline_close') {
+    if (sentences(text).some(s => sentenceAsks(s))) fail('question_after_post_demo_decline_email', text);
+    if (ctx.postDemoEmailStep === 'decline_close' && sentences(text).some(s => POST_DEMO_REBUTTAL_RX.test(s))) fail('post_demo_rebuttal', text);
   }
 
   // ── the visit is context, never a quote (2026-10-16, Siro PR 1) ─────────

@@ -316,7 +316,7 @@ test('golden set runs every case in both NEPQ modes', () => {
 // ── the checks themselves: each fires on its incident and stays quiet on a good reply ──
 
 test('invariants: a clean reply passes every check that can run', () => {
-  const r = checkReply('What made you start looking at windows now?', { channel: 'livechat', inbound: 'hi', conversation: [], booked: false, nowMs: IN_HOURS_MS, rehash: false, warrantySent: false, postDemoStep: null, presentation: null });
+  const r = checkReply('What made you start looking at windows now?', { channel: 'livechat', inbound: 'hi', conversation: [], booked: false, nowMs: IN_HOURS_MS, rehash: false, warrantySent: false, postDemoStep: null, postDemoEmailStep: null, presentation: null });
   assert.deepEqual(r.violations, []);
   assert.deepEqual(r.skipped, []);
 });
@@ -337,6 +337,8 @@ test('invariants: each known bad reply is caught by its own check', () => {
   expect('Price is the easy number to compare, but what actually holds up is what you can prove five years down the line. What would you need to see to feel good moving forward?', 'post_demo_rebuttal', { postDemoStep: 'post_demo' });
   expect('Half or more is a real gap, Shawn. Someone from our team will reach out to go over it with you directly.', 'post_demo_unbacked_follow_up', { postDemoStep: 'rehash_objection' });
   expect("Understood, Shawn. I'm here if anything changes. Anything else?", 'question_after_post_demo_stop', { postDemoStep: 'post_demo_stop' });
+  // 2026-10-19 (Thomas Geary, agent_actions 573254): a post-demo email decline closed on a question written with a period.
+  expect('We will not push on this one. If anything about the numbers is still unclear, what is the part you would want walked through again.', 'question_after_post_demo_decline_email', { channel: 'email', postDemoEmailStep: 'decline_first' });
   expect("I'm Mark, handling chat here in the office. What can I help with?", 'team_voice:team_identity');
   expect('Randy founded the company back in 1972. What got you looking?', 'team_voice:founder');
   expect('Yes, we work on manufactured homes. What area are you in?', 'property_scope', { inbound: 'Do you work on manufactured homes?' });
