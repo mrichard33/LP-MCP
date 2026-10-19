@@ -38,6 +38,7 @@
 import express from 'express';
 
 import supabase from '../supabase.js';
+import { trackBackground } from '../graceful-shutdown.js';
 import { getMarketMaps } from './market-resolver.js';
 import {
   sha256Hex, contentSha256, resolveRowMarket, todayET, centsToDollars,
@@ -827,6 +828,17 @@ export async function ingestCsv({ reportType, text, source = 'manual', expectedT
     const warned = Array.isArray(extraDetail.warnings) && extraDetail.warnings.length > 0;
     await done(warned ? 'succeeded_with_warnings' : 'success',
       { snapshot_id: snapshotId, detail: { ...extraDetail, control_totals: controlTotals, fact_rows: factRows, ...(netProjection ? { net_projection: netProjection } : {}) } });
+    // Report 133 is the commission basis (Canvass / MVP 15%, Previous
+    // Customer / Referral 1% of net): recompute them now rather than at 02:30
+    // ET tomorrow (the user, 2026-10-19). Background and best-effort; the
+    // nightly is the backstop. Dynamic import, like the projection above.
+    if (reportType === 'job_status_ytd') {
+      trackBackground(import('../marketing/commission.js')
+        .then(({ recomputeAfterSalesSnapshot }) => recomputeAfterSalesSnapshot({
+          periodStart: snapshotPayload.period_start, periodEnd: snapshotPayload.period_end,
+        }))
+        .catch((err) => console.error(`[LPCsv] commission recompute after 133 failed: ${err.message}`)));
+    }
     console.log(`[LPCsv] ${reportType} ingested${warned ? ` WITH ${extraDetail.warnings.length} warning(s)` : ''}: ${rows.length} rows, snapshot ${snapshotId}, ${factRows} fact rows${netProjection?.projected ? `, net-report projected ${netProjection.total_net} as of ${netProjection.report_as_of}` : ''}`);
     return { success: true, snapshot_id: snapshotId, rows: rows.length, fact_rows: factRows, sha256: sha, ...extraDetail, ...(netProjection ? { net_projection: netProjection } : {}) };
   } catch (err) {

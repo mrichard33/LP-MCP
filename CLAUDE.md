@@ -933,7 +933,10 @@ are retired: nobody types a cost into LP again, and no code reads `mcost_cents` 
 `marketing_expense_allocations` by GROSS ISSUED LEADS (D1: `ever_issued` by `created_at_lp`, `mkt_issued_counts`); Net /
 Working / Gross $ come from report 133 (`mkt_sales_dollars`, D8). The allocator is ONE pure module,
 `src/marketing/allocation.js` (direct / proportional / equal / hold, cents reconciled or it throws); the rows are written by
-`allocation-io.js` and re-run nightly (`marketing-cost-nightly`, 02:30 ET, current + prior month). The dashboard and
+`allocation-io.js` and re-run nightly (`marketing-cost-nightly`, 02:30 ET, current + prior month). Commissions are also
+recomputed the moment a report 133 snapshot lands (`recomputeAfterSalesSnapshot`, `lp-csv-ingest.js`; the user,
+2026-10-19): the 02:30 run read the day-old snapshot (Fort Myers Canvass at 15% × $322,390 against the day's $276,190).
+A campaign with no sub-source reads "Unknown" in the XLSX and on the dashboard, never "(none)" (`campaignLabel`). The dashboard and
 Brad's XLSX (`marketing-cost-report`, formulas never typed values) read `v_market_subsource_cost`.
 - **An invoice file never reaches a paid model (D9).** n8n `I.MCIN` POSTs the attachment to
   `/n8n/admin/marketing-invoice-ingest`; `src/marketing/extract-client.js` gets the TEXT for free from reece-speech-api

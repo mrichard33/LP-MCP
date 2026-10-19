@@ -99,3 +99,39 @@ export async function recomputeCalculatedCosts(month, deps = {}) {
   console.log(`${LOG} ${start}: ${JSON.stringify(out)}`);
   return out;
 }
+
+/** Pure: the first of each month from start's month through end's month (at most 13). */
+export function monthsInPeriod(start, end) {
+  const out = [];
+  let y = +String(start).slice(0, 4);
+  let m = +String(start).slice(5, 7);
+  const last = String(end).slice(0, 7);
+  while (out.length < 13) {
+    const ym = `${y}-${String(m).padStart(2, '0')}`;
+    out.push(`${ym}-01`);
+    if (ym >= last) break;
+    m += 1; if (m > 12) { m = 1; y += 1; }
+  }
+  return out;
+}
+
+/**
+ * Recompute the commissions a fresh report 133 snapshot covers (the user,
+ * 2026-10-19). The 02:30 ET nightly ran before that day's 133 landed, so the
+ * ledger was a day behind it: Fort Myers Canvass held 15% × $322,390 while the
+ * 10-19 snapshot said $276,190. Called after a 133 ingest succeeds; the nightly
+ * stays as the backstop. Never throws: the snapshot is already stored.
+ */
+export async function recomputeAfterSalesSnapshot({ periodStart, periodEnd }, deps = {}) {
+  const recompute = deps.recompute || recomputeCalculatedCosts;
+  const out = [];
+  for (const month of monthsInPeriod(periodStart, periodEnd || periodStart)) {
+    try {
+      out.push(await recompute(month, deps));
+    } catch (err) {
+      console.error(`${LOG} recompute after 133 for ${month} failed: ${err.message}`);
+      out.push({ month, error: err.message });
+    }
+  }
+  return out;
+}
