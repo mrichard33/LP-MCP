@@ -610,3 +610,55 @@ test('dashboard: confirming what is left after a part credit keeps the credit', 
   assert.equal(disputedNow(supabase), 0);
   assert.equal(supabase.tables.marketing_invoice_documents[0].analysis.credits.length, 1);
 });
+
+// 2026-10-19 (the user: "View and Edit … doesn't allow any edits"): the dashboard
+// approves, rejects, reopens and edits through the Slack card's own handler.
+import { decideFromDashboard } from '../src/marketing/review-actions.js';
+function reviewDb(row = {}) {
+  return fakeSupabase({
+    marketing_invoice_documents: [{ id: DOC_ID, status: 'in_review', analysis: { facts: { invoice_number: '400' } }, slack_channel: 'C1', slack_ts: '1.1' }],
+    marketing_expenses: [{ id: 'p1', document_id: DOC_ID, line_no: 1, status: 'pending_review', amount: 1200, period_start: '2026-10-01', period_end: '2026-10-31', description: 'Hatch', lp_sub_sources: ['Hatch'], eligible_markets: ['ORL_MKT'], flags: [], invoice_number: '400', vendor_id: null, cost_type: 'invoice', ...row }],
+    marketing_expense_allocations: [],
+    marketing_vendors: [],
+  });
+}
+const dashDeps = (supabase, sink) => ({
+  supabase, signedLink: async () => null,
+  allocate: async (id) => sink.allocated.push(id),
+  replaceEarlier: async () => null, refreshEstimates: async () => null,
+  postToSlack: async (t) => { sink.thread.push(t); return { ok: true }; },
+  updateSlackMessage: async () => { sink.redrawn++; return { ok: true }; },
+});
+
+test('dashboard decide: approve allocates, posts the thread reply and redraws the card; reject and reopen too', async () => {
+  const supabase = reviewDb();
+  const sink = { allocated: [], thread: [], redrawn: 0 };
+  const r = await decideFromDashboard({ documentId: DOC_ID, action: 'approve', by: 'mrichard6275@gmail.com' }, dashDeps(supabase, sink));
+  assert.equal(r.ok, true);
+  assert.equal(supabase.tables.marketing_expenses[0].status, 'approved');
+  assert.match(supabase.tables.marketing_expenses[0].approved_by, /^mrichard6275 \(DASHBOARD\)$/);
+  assert.deepEqual(sink.allocated, ['p1']);
+  assert.equal(sink.redrawn, 1);
+  assert.equal(sink.thread.length, 1);
+  const back = await decideFromDashboard({ documentId: DOC_ID, action: 'reopen', by: 'mark' }, dashDeps(supabase, sink));
+  assert.equal(back.action, 'reopened');
+  assert.equal(supabase.tables.marketing_expenses[0].status, 'pending_review');
+  const no = await decideFromDashboard({ documentId: DOC_ID, action: 'reject', by: 'mark' }, dashDeps(supabase, sink));
+  assert.equal(no.action, 'rejected');
+  assert.equal(supabase.tables.marketing_invoice_documents[0].status, 'rejected');
+});
+
+test('dashboard decide: a blocked approve says why; edit rewrites the line from the form', async () => {
+  const supabase = reviewDb({ amount: 0 });
+  const sink = { allocated: [], thread: [], redrawn: 0 };
+  const blocked = await decideFromDashboard({ documentId: DOC_ID, action: 'approve' }, dashDeps(supabase, sink));
+  assert.equal(blocked.ok, false);
+  assert.match(blocked.message, /amount is \$0/);
+  const e = await decideFromDashboard({ documentId: DOC_ID, action: 'edit', by: 'mark', edit: { amount: '1,350.50', invoice_number: '400-A', period_start: '2026-09-01', period_end: '2026-09-30', split: 'software' } }, dashDeps(supabase, sink));
+  assert.equal(e.ok, true);
+  const row = supabase.tables.marketing_expenses[0];
+  assert.deepEqual([row.amount, row.invoice_number, row.period_start, row.period_end], [1350.5, '400-A', '2026-09-01', '2026-09-30']);
+  assert.deepEqual(row.eligible_markets, ['ALL_OFFICES']);
+  assert.deepEqual(row.lp_sub_sources, ['Software']);
+  assert.equal((await decideFromDashboard({ documentId: DOC_ID, action: 'nope' }, dashDeps(supabase, sink))).action, 'bad_action');
+});

@@ -608,6 +608,21 @@ export function registerMarketingInvoiceRoutes(app, deps = {}) {
     }
   });
 
+  // The dashboard's invoice view decides an invoice (2026-10-19): approve, reject,
+  // reopen, or edit its details, through the same handler as the Slack card.
+  app.post('/n8n/admin/marketing-invoices/decide', json, async (req, res) => {
+    try {
+      if (refuse(req, res)) return;
+      const documentId = String(req.body?.document_id || '');
+      if (!/^[0-9a-f-]{36}$/i.test(documentId)) return res.status(400).json({ success: false, error: 'document_id must be a uuid' });
+      const { decideFromDashboard } = await import('../marketing/review-actions.js');
+      const out = await decideFromDashboard({ documentId, action: String(req.body?.action || ''), edit: req.body?.edit || null, by: req.body?.by || null }, deps);
+      res.status(out.ok ? 200 : 400).json({ success: out.ok, ...out, ...(out.ok ? {} : { error: out.message }) });
+    } catch (err) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
   // A PERSON applies a REECE_HOLD recommendation (handoff §7.5): the dashboard's
   // admin-only button relays here; the money never moves on its own.
   app.post('/n8n/admin/marketing-expenses/apply-recommendation', json, async (req, res) => {

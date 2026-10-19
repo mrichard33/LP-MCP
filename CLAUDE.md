@@ -1015,7 +1015,12 @@ Brad's XLSX (`marketing-cost-report`, formulas never typed values) read `v_marke
   (`settleDisputeFromDashboard`, admin-only on the dashboard): a credit may be part of the disputed amount (the rest stays
   Disputed), and a dashboard credit first undoes any earlier confirm or credit (`reset`), so it can be changed; a
   reopen puts the line back to what was billed. `analysis.credits` holds the credits in force (`was` = billed),
-  `analysis.dispute_log` every action; a confirm keeps a credit already received. The Slack card is redrawn and gets the same thread reply. Sales weights are WHOLE dollars, and the
+  `analysis.dispute_log` every action; a confirm keeps a credit already received. The Slack card is redrawn and gets the same thread reply.
+  **The invoice view also approves, rejects, reopens and edits (the user, 2026-10-19: "View and Edit … doesn't allow any
+  edits").** `POST /n8n/admin/marketing-invoices/decide {document_id, action: approve|reject|reopen|edit, edit?, by}`
+  (`decideFromDashboard`) runs `handleMarketingInvoiceInteraction` itself, as approver `DASHBOARD` (the dashboard lets only
+  its admins, Mark and Brad, click), with `parsed.edit` = the fields `parseEditSubmission` returns. A Slack reply that
+  would have replaced the card redraws the card instead; an ephemeral one (a blocker) is the answer the dashboard shows. Sales weights are WHOLE dollars, and the
   card prints every basis in words (`basisText`: "$41,827 of $179,513 in sales", "3 of 9 aged-lead demos", "12 of 40
   issued leads"), never "4182700/17951276 issued".
 - **A commission invoice line is one sale: it goes to that sale's office and month, and replaces the estimate (the

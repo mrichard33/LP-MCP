@@ -207,7 +207,8 @@ export async function handleMarketingInvoiceInteraction(parsed, deps = {}) {
 
   if (decision === 'edit_submit') {
     if (!pending.length) return { handled: true, action: 'already_resolved' };
-    const v = parseEditSubmission(parsed.values);
+    // The dashboard's edit form sends the parsed fields (decideFromDashboard); Slack sends its view state.
+    const v = parsed.edit || parseEditSubmission(parsed.values);
     const notes = [];
     let vendor = ctx.vendor;
     const vendorChanged = !!(v.vendor_id && v.vendor_id !== ctx.vendor?.id);
@@ -642,4 +643,65 @@ export async function refreshReviewCards({ ids = null, since = null, dryRun = fa
   }
   console.log(`${LOG} cards refreshed${dryRun ? ' (dry run)' : ''}: ${out.refreshed}/${out.matched}, ${out.failed.length} failed`);
   return out;
+}
+
+
+/**
+ * Approve, reject, reopen or edit an invoice from the dashboard's invoice view
+ * (the user, 2026-10-19: "View and Edit … doesn't allow any edits"). It runs the
+ * SAME handler as the Slack buttons and the Edit modal, so the rules, blockers
+ * and thread replies are one code path; the dashboard checks the person is an
+ * admin (Mark, Brad) and relays here. A Slack reply that would have replaced the
+ * card is applied to the card instead (updateCard), and an ephemeral one becomes
+ * the answer the dashboard shows. `edit` carries the fields parseEditSubmission
+ * returns (vendor_id, new_vendor, invoice_number, period_start, period_end,
+ * amount, lp_sub_sources, split, eligible_markets, remember).
+ */
+export async function decideFromDashboard({ documentId, action, edit = null, by = null }, deps = {}) {
+  const decision = { approve: 'approve', reject: 'reject', reopen: 'reopen', edit: 'edit_submit' }[action];
+  if (!decision) return { ok: false, action: 'bad_action', message: 'Unknown action.' };
+  const supabase = deps.supabase || supabaseDefault;
+  const userName = String(by || 'dashboard').replace(/@.*$/, '');
+  const said = [];
+  let card = null;
+  const out = await handleMarketingInvoiceInteraction(
+    { decision, documentId, userId: 'DASHBOARD', userName, responseUrl: null, edit: decision === 'edit_submit' ? normalizeEdit(edit) : null },
+    {
+      ...deps,
+      supabase,
+      approvers: new Set(['DASHBOARD']),
+      reply: async (_url, body) => {
+        if (body?.replace_original && body.blocks) card = body;
+        else if (body?.text) said.push(body.text);
+        return { ok: true };
+      },
+    },
+  );
+  if (card) {
+    const ctx = await loadReviewContext(documentId, { supabase });
+    if (ctx) {
+      const r = await updateCard(ctx, card, deps);
+      if (!r?.ok && r?.error !== 'no_card') console.warn(`${LOG} card for ${documentId} not redrawn after the dashboard ${action}: ${r?.error}`);
+    }
+  }
+  const done = ['approved', 'rejected', 'reopened', 'edited'].includes(out?.action);
+  return { ok: done, action: out?.action || 'unknown', message: said.join(' ') || (done ? `Invoice ${out.action}.` : 'Nothing changed.'), blockers: out?.blockers || null };
+}
+
+function normalizeEdit(e = {}) {
+  const num = (v) => { if (v == null || v === '') return null; const n = Number(String(v).replace(/[$,\s]/g, '')); return Number.isFinite(n) ? Math.round(n * 100) / 100 : null; };
+  const date = (v) => (/^\d{4}-\d{2}-\d{2}$/.test(String(v || '')) ? String(v) : null);
+  const list = (v) => (Array.isArray(v) ? v : String(v || '').split(',')).map((x) => String(x).trim()).filter(Boolean);
+  return {
+    vendor_id: e.vendor_id || null,
+    invoice_number: String(e.invoice_number || '').trim() || null,
+    period_start: date(e.period_start),
+    period_end: date(e.period_end),
+    amount: num(e.amount),
+    lp_sub_sources: list(e.lp_sub_sources),
+    eligible_markets: list(e.eligible_markets).filter((m) => /^[A-Z_]{2,16}$/.test(m)),
+    new_vendor: String(e.new_vendor || '').trim().slice(0, 150) || null,
+    split: ['by_source', 'markets', 'even', 'call_center', 'software'].includes(e.split) ? e.split : null,
+    remember: e.remember === true,
+  };
 }
