@@ -346,6 +346,25 @@ test('feed rows: one per (date, territory), the day gap to REECE_HOLD, unmapped 
   assert.ok(rows.every((r) => r.provisional === true && r.status === 'approved' && r.cost_type === 'feed'));
 });
 
+test('feed gap: rounding is not held, and today (still filling in) is never held (2026-10-19)', () => {
+  const map = { ftmyr: 'FTMYR_MKT' };
+  const rows = buildFeedRows({
+    territoryRows: [
+      { date: '2026-10-17', territory: 'FTMYR', total_spend: 8710.53 },
+      { date: '2026-10-18', territory: 'FTMYR', total_spend: 9776.27 },
+      { date: '2026-10-19', territory: 'FTMYR', total_spend: 376.15 },
+    ],
+    dailyRows: [
+      { date: '2026-10-17', total_spend: 8710.55 }, // +$0.02: rounding
+      { date: '2026-10-18', total_spend: 9781.27 }, // +$5.00: held
+      { date: '2026-10-19', total_spend: 438.8 }, // today, mid-day: not held
+    ],
+    map, vendorId: LG_ID, today: '2026-10-19',
+  });
+  const gaps = rows.filter((r) => r.source_ref.endsWith('|__gap__'));
+  assert.deepEqual(gaps.map((r) => [r.source_ref, r.amount]), [['2026-10-18|__gap__', 5]]);
+});
+
 test('feed sync is idempotent, allocates what changed, and leaves superseded rows alone', async () => {
   const supabase = db({
     ft_summary_territory: [{ date: '2026-09-22', territory: 'FTMYR', total_spend: 100 }, { date: '2026-09-22', territory: 'SAR', total_spend: 50 }],

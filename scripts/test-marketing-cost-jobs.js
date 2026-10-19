@@ -10,10 +10,10 @@ delete process.env.SUPABASE_URL;
 delete process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 import { fakeSupabase } from './lib/fake-supabase.js';
-import { buildCommissionRows, recomputeCalculatedCosts } from '../src/marketing/commission.js';
+import { buildCommissionRows, recomputeCalculatedCosts, monthsInPeriod, recomputeAfterSalesSnapshot } from '../src/marketing/commission.js';
 import { summarizeRecommendation, matchHeldLeads, recommendHolds } from '../src/marketing/holds.js';
 import { runMarketingCostNightly, defaultMonths } from '../src/jobs/marketing-cost-nightly.js';
-import { buildMarketModel, COMPANY } from '../src/marketing/report.js';
+import { buildMarketModel, COMPANY, campaignLabel } from '../src/marketing/report.js';
 import { buildWorkbook, readWorkbook } from '../src/marketing/report-xlsx.js';
 import { runMarketingReport, defaultReportMonth } from '../src/jobs/marketing-cost-report.js';
 
@@ -187,4 +187,31 @@ test('report run: one file per market + company, stored and linked, one card', a
   assert.match(posts[0].text, /Marketing cost report — September 2026/);
   assert.equal(defaultReportMonth('2026-10-02'), '2026-09');
   assert.equal(defaultReportMonth('2026-10-12'), '2026-10');
+});
+
+test('commission recompute after a 133 snapshot: every month it covers, and a failing month never throws (2026-10-19)', async () => {
+  assert.deepEqual(monthsInPeriod('2026-10-01', '2026-10-19'), ['2026-10-01']);
+  assert.deepEqual(monthsInPeriod('2026-11-01', '2027-01-31'), ['2026-11-01', '2026-12-01', '2027-01-01']);
+  assert.equal(monthsInPeriod('2025-01-01', '2026-12-31').length, 13);
+  const seen = [];
+  const out = await recomputeAfterSalesSnapshot({ periodStart: '2026-09-01', periodEnd: '2026-10-19' }, {
+    recompute: async (month) => { seen.push(month); if (month === '2026-09-01') throw new Error('boom'); return { month, updated: 1 }; },
+  });
+  assert.deepEqual(seen, ['2026-09-01', '2026-10-01']);
+  assert.deepEqual(out, [{ month: '2026-09-01', error: 'boom' }, { month: '2026-10-01', updated: 1 }]);
+});
+
+test('report: a campaign with no sub-source is "Unknown", never "(none)" (2026-10-19)', () => {
+  assert.equal(campaignLabel('(none)'), 'Unknown');
+  assert.equal(campaignLabel(null), 'Unknown');
+  assert.equal(campaignLabel('Lead Gurus'), 'Lead Gurus');
+  const m = buildMarketModel({
+    market: 'REECE', month: '2026-10',
+    monthRows: [
+      { grain: 'month', period_start: '2026-10-01', market: 'SAR_MKT', lp_sub_source: '(none)', raw: 3, issued: 1, invoice_cost: 0, calculated_cost: 0 },
+      { grain: 'month', period_start: '2026-10-01', market: 'ORL_MKT', lp_sub_source: '(none)', raw: 2, issued: 0, invoice_cost: 0, calculated_cost: 0 },
+    ],
+    weekRows: [],
+  });
+  assert.deepEqual(m.campaign.map((c) => [c.label, c.raw]), [['Unknown', 5]]);
 });

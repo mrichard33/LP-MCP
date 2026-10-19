@@ -57,6 +57,12 @@ function aggregate(rows, keyFn) {
 
 const isMarket = (m) => MARKETS.includes(m);
 
+/** A campaign with no sub-source reads "Unknown", never "(none)" (the user, 2026-10-19). */
+export function campaignLabel(key) {
+  const s = String(key ?? '').trim();
+  return !s || s.toLowerCase() === '(none)' ? 'Unknown' : s;
+}
+
 /**
  * Pure: the model for one market (or the company roll-up) from view rows.
  * @param {object} p
@@ -69,7 +75,7 @@ export function buildMarketModel({ market, month, monthRows, weekRows }) {
   const mine = (r) => (market === COMPANY ? isMarket(r.market) : r.market === market);
   const m0 = monthStart(month);
   const thisMonth = monthRows.filter((r) => r.period_start === m0 && mine(r));
-  const campaign = aggregate(thisMonth, (r) => r.lp_sub_source)
+  const campaign = aggregate(thisMonth, (r) => campaignLabel(r.lp_sub_source))
     .filter((a) => a.raw || a.issued || a.invoice_cost || a.calculated_cost || a.gross)
     .sort((a, b) => (b.invoice_cost + b.calculated_cost) - (a.invoice_cost + a.calculated_cost) || b.raw - a.raw)
     .map((a) => ({ label: a.key, ...a }));
