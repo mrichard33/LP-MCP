@@ -450,8 +450,11 @@ the one exception, below).
 - **ND and No Demo = disqualified, an end state.** Rule `LP_DISP_DISQUALIFIED` (replaces `LP_DISP_NO_DEMO`'s rebook
   route) queues `disqualified_cleanup` (`src/actions/handlers/disqualified-cleanup.js`): every open estimate →
   `mark_invalid`, out of S5.x / S4.5 / W-series, tag `lp-disqualified`, P3 Hard Disqualified, one Five9 removal over every
-  outbound list. The removal needs approval unless `DISQUALIFIED_FIVE9_AUTO_REMOVE=true` (the BOOKED_ROUTING_AUTO_REMOVE
-  pattern, keyed on the rule; Mark flips it). The S5.2 gate and rule 171 (`lp_disposition_not_in`) refuse them up front.
+  outbound list. **The removal runs without a click (the user, 2026-10-19: "the updates are occurring correctly each
+  time")**, keyed on the rule like BOOKED_ROUTING_AUTO_REMOVE; `DISQUALIFIED_FIVE9_AUTO_REMOVE=false` is the rollback to
+  approval cards. Where the card posted, ONE no-button notice says the LP disposition and that the number is off every
+  dialing list (`src/notifications/disqualified-removed.js`, approvals channel; only after a real removal, never a dry run
+  or an approved card; a failed post is an #ops-alerts line). The S5.2 gate and rule 171 (`lp_disposition_not_in`) refuse them up front.
 - **`invalid` is the no-notification kill status** (`src/appointments/mark-invalid.js`): status `invalid` (never
   `cancelled`, which fires cancel / rebook), then A.WE-1 removed, then the reminder tags off. The watchdog treats an
   `invalid` row at LP's slot as SETTLED: never restored, never re-created over, never flagged.

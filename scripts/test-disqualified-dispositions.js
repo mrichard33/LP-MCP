@@ -72,16 +72,68 @@ test('DISQUALIFIED_FIVE9_AUTO_REMOVE=true queues the removal unarmed', () => {
   assert.deepEqual([f9.requires_approval, f9.status], [false, 'pending']);
 });
 
-test('the Five9 executor runs it unarmed ONLY with the flag; otherwise it must carry approval', async () => {
+test('automatic by default (the user, 2026-10-19); only the literal false puts the approval card back', async () => {
+  const { disqualifiedAutoRemove } = await import('../src/actions/handlers/disqualified-cleanup.js');
+  assert.equal(disqualifiedAutoRemove({}), true);
+  assert.equal(disqualifiedAutoRemove({ DISQUALIFIED_FIVE9_AUTO_REMOVE: 'true' }), true);
+  assert.equal(disqualifiedAutoRemove({ DISQUALIFIED_FIVE9_AUTO_REMOVE: 'False' }), false);
+});
+
+test('the Five9 executor runs it unarmed by default; with the flag false it must carry approval', async () => {
   const { executeFive9Write } = await import('../src/actions/handlers/five9.js');
   const row = { action_type: 'five9_delete_record_from_list', rule_applied: 'LP_DISP_DISQUALIFIED', requires_approval: false, action_payload: {} };
   const prev = process.env.DISQUALIFIED_FIVE9_AUTO_REMOVE;
   try {
-    delete process.env.DISQUALIFIED_FIVE9_AUTO_REMOVE;
+    process.env.DISQUALIFIED_FIVE9_AUTO_REMOVE = 'false';
     await assert.rejects(executeFive9Write(row), /REFUSED/);
+    delete process.env.DISQUALIFIED_FIVE9_AUTO_REMOVE;
+    // Past the gate: the op itself refuses the empty payload, never the approval check.
+    await assert.rejects(executeFive9Write(row), (err) => !/REFUSED: .*requires_approval/.test(err.message));
+    // Any other rule's removal still needs approval.
+    await assert.rejects(executeFive9Write({ ...row, rule_applied: 'SOMETHING_ELSE' }), /REFUSED/);
   } finally {
     if (prev === undefined) delete process.env.DISQUALIFIED_FIVE9_AUTO_REMOVE; else process.env.DISQUALIFIED_FIVE9_AUTO_REMOVE = prev;
   }
+});
+
+test('the automatic removal posts one no-button notice: ND, off every list, prospect not lead id', async () => {
+  const { noticeDisqualifiedRemoval, formatDisqualifiedRemovedNotice } = await import('../src/notifications/disqualified-removed.js');
+  const f9 = plan({ autoRemove: true, lead: { ...AVILA, lp_prospect_id: '470123' } })
+    .find((r) => r.action_type === 'five9_delete_record_from_list');
+  const action = { ...f9, id: 609912 };
+  const result = { lists: [...DISQUALIFIED_FIVE9_LISTS], record_deleted: true,
+    per_list: DISQUALIFIED_FIVE9_LISTS.map((list) => ({ list, deleted: list === 'LP_ASAP' ? 1 : 0, outcome: list === 'LP_ASAP' ? 'deleted' : 'not_on_list' })) };
+  const text = formatDisqualifiedRemovedNotice(action, result);
+  assert.match(text, /Done automatically · #609912 · LP ND → disqualified, off every dialing list/);
+  assert.match(text, /Maria Avila was dispositioned "ND" in LP/);
+  assert.match(text, /took 8135551234 off every Five9 dialing list\. Removed from "LP_ASAP"; it was not on the others\./);
+  assert.match(text, /No action needed\./);
+  assert.match(text, /Contact: Maria Avila · 8135551234 · Prospect 470123/);
+  assert.doesNotMatch(text, /583486/, 'never the lead id');
+
+  const posts = [];
+  const deps = { channel: 'C_APPROVALS', post: async (t, ch) => { posts.push([t, ch]); return { ok: true }; } };
+  assert.deepEqual(await noticeDisqualifiedRemoval(action, result, deps), { posted: 'approvals' });
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0][1], 'C_APPROVALS');
+
+  // An approved card, a dry run, a deferral or another rule posts nothing.
+  for (const [a, r] of [
+    [{ ...action, requires_approval: true }, result],
+    [action, { ...result, record_deleted: false }],
+    [action, { deferred: true }],
+    [{ ...action, rule_applied: 'BOOKED_DIAL_ROUTING' }, result],
+  ]) assert.equal(await noticeDisqualifiedRemoval(a, r, deps), null);
+  assert.equal(posts.length, 1);
+
+  // A failed post is an #ops-alerts line, never silence.
+  const alerts = [];
+  const failed = await noticeDisqualifiedRemoval(action, result, {
+    channel: 'C_APPROVALS', post: async () => ({ ok: false, error: 'channel_not_found' }),
+    sendAlert: async (t, o) => { alerts.push([t, o]); return { sent: true }; },
+  });
+  assert.deepEqual(failed, { posted: 'ops' });
+  assert.equal(alerts[0][1].channel, 'ops');
 });
 
 test('No Demo is the same as ND; an unresolved sequence goes out through Remove All Marketing', () => {

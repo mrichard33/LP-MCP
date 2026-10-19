@@ -24,9 +24,11 @@
  *   - Five9: one five9_delete_record_from_list for the phone over every
  *     outbound list. Five9 has no read that lists every list holding a number
  *     (findContactInOtherLists never worked, see CLAUDE.md), and a list the
- *     number is not on is left as is, so the row names all of them. Approval
- *     card by default (#1057); DISQUALIFIED_FIVE9_AUTO_REMOVE=true runs it
- *     unarmed (src/actions/handlers/five9.js).
+ *     number is not on is left as is, so the row names all of them. Runs
+ *     unarmed by default since 2026-10-19 (the user: "automate these
+ *     approvals"), with a no-button notice (src/notifications/
+ *     disqualified-removed.js); DISQUALIFIED_FIVE9_AUTO_REMOVE=false puts the
+ *     approval card back (src/actions/handlers/five9.js).
  *
  * All I/O through deps; idempotent per appointment / contact through claim keys.
  */
@@ -47,7 +49,7 @@ const ESTIMATE_POOL = ESTIMATE_CALENDAR_IDS;
 const DEAD_STATUSES = new Set(['cancelled', 'canceled', 'no_show', 'noshow', 'no-show', 'invalid']);
 
 export function disqualifiedAutoRemove(env = process.env) {
-  return String(env.DISQUALIFIED_FIVE9_AUTO_REMOVE || '').trim().toLowerCase() === 'true';
+  return String(env.DISQUALIFIED_FIVE9_AUTO_REMOVE || '').trim().toLowerCase() !== 'false';
 }
 
 const digits10 = (p) => String(p || '').replace(/\D/g, '').slice(-10);
@@ -104,7 +106,7 @@ export function planDisqualifiedCleanup({ contactId, lead, appointments, tags, p
       action_payload: {
         list_names: [...DISQUALIFIED_FIVE9_LISTS], field_names: ['number1'], values: [ph], list_delete_mode: 'DELETE_ALL',
         phone: ph, contact_name: [lead?.first_name, lead?.last_name].filter(Boolean).join(' ') || null,
-        lp_lead_id: lead?.lp_lead_id || null, reason: 'disqualified', disposition: disp,
+        lp_lead_id: lead?.lp_lead_id || null, lp_prospect_id: lead?.lp_prospect_id || null, reason: 'disqualified', disposition: disp,
         queued_at: new Date(nowMs).toISOString(),
       },
       reasoning: `${why}: a disqualified lead is never dialed again, so it comes off every outbound list. A list the number is not on is left as is.`,

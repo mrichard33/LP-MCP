@@ -67,6 +67,7 @@ import {
   executeRemoveNumbersFromDncApproved,
 } from '../../five9/admin-writes.js';
 import { isCallbackRearmDelete, checkCallbackRearm } from '../../five9/callback-rearm.js';
+import { noticeDisqualifiedRemoval } from '../../notifications/disqualified-removed.js';
 
 const FIVE9_WRITE_OPS = {
   five9_start_campaign: executeStartCampaign,
@@ -209,10 +210,11 @@ const BOOKED_ROUTING_RULE_KEY = 'BOOKED_DIAL_ROUTING';
 // (SPANISH_FIVE9_LIST) is re-armable too, because its campaign runs the same
 // Callback Request V3 profile (rearmableLists).
 // 2026-10-16 — disqualified leads (ND / No Demo, Mark, handoff v3.4 Fix 2) come
-// off every outbound list. Approval stays the default (#1057): only with
-// DISQUALIFIED_FIVE9_AUTO_REMOVE=true (exactly) do rows from rule
-// LP_DISP_DISQUALIFIED run unarmed — the same carve-out pattern as
-// BOOKED_ROUTING_AUTO_REMOVE, keyed on who queued it. Mark decides the flip.
+// off every outbound list. Rows from rule LP_DISP_DISQUALIFIED run unarmed — the
+// same carve-out pattern as BOOKED_ROUTING_AUTO_REMOVE, keyed on who queued it.
+// 2026-10-19 (the user): automatic by default ("the updates are occurring
+// correctly each time"); DISQUALIFIED_FIVE9_AUTO_REMOVE=false is the rollback to
+// approval cards. A notice (no buttons) says what LP said and what came off.
 const DISQUALIFIED_RULE_KEY = 'LP_DISP_DISQUALIFIED';
 
 function execAutoApproved(actionType, action) {
@@ -220,7 +222,7 @@ function execAutoApproved(actionType, action) {
   if (actionType === EXEC_AUTO_APPROVED_BOOKED_REMOVE_OP) {
     if (isCallbackRearmDelete(action)) return true;
     if (action?.rule_applied === DISQUALIFIED_RULE_KEY) {
-      return String(process.env.DISQUALIFIED_FIVE9_AUTO_REMOVE || '').trim().toLowerCase() === 'true';
+      return String(process.env.DISQUALIFIED_FIVE9_AUTO_REMOVE || '').trim().toLowerCase() !== 'false';
     }
     return action?.rule_applied === BOOKED_ROUTING_RULE_KEY
       && String(process.env.BOOKED_ROUTING_AUTO_REMOVE || '').trim().toLowerCase() !== 'false';
@@ -245,5 +247,8 @@ export async function executeFive9Write(action) {
   // 2026-10-09 — a callback push that did not grow the list updated an entry in
   // place and will not dial: say so now, not at the 15-minute verify sweep.
   const rearm = await checkCallbackRearm(action, result);
-  return rearm ? { ...result, rearm } : result;
+  // 2026-10-19 — an automatic ND / No Demo removal still tells the team.
+  const notice = await noticeDisqualifiedRemoval(action, result);
+  const out = rearm ? { ...result, rearm } : result;
+  return notice ? { ...out, notice } : out;
 }
