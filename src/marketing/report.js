@@ -90,10 +90,11 @@ export function buildMarketModel({ market, month, monthRows, weekRows }) {
   const recommendations = [...new Set(monthRows.filter((r) => r.period_start === m0 && r.market === 'REECE_HOLD' && r.recommended_market).map((r) => `${r.recommended_market}: ${r.recommendation_reason || ''}`))];
   const asOf = thisMonth.map((r) => r.as_of_snapshot).filter(Boolean).sort().pop() || null;
   const footnotes = [
-    campaign.some((c) => c.has_provisional) ? '† provisional: Lead Gurus feed spend, no invoice yet. The invoice replaces it at month close.' : null,
+    campaign.some((c) => c.has_provisional) ? '† provisional: Lead Gurus feed spend until the invoice replaces it at month close; Canvass commission is a 15% estimate until canvasser payroll is uploaded.' : null,
     heldTotal ? `Held at company level (REECE_HOLD), not in any market: $${heldTotal.toLocaleString('en-US', { minimumFractionDigits: 2 })}${recommendations.length ? ` — recommended: ${recommendations.join(' | ')}` : ' — no recommendation yet'}.` : null,
     asOf ? `Net / Working $ as of the ${asOf} report 133 snapshot — statuses move daily.` : 'Net / Working $: no report 133 snapshot for this month yet.',
-    'Cost / Issued Lead = (Invoice Cost + Calculated Cost) ÷ Issued. Calculated = Canvass 15%, MVP 15%, Previous Customer / Referral 1% of net.',
+    'Net $ = jobs released to production (RTP) or completed; Working $ = sold but not yet RTP.',
+    'Cost / Issued Lead = (Invoice Cost + Calculated Cost) ÷ Issued. Calculated = Canvass 15% (estimate until canvasser payroll), MVP Marketing 15%, LeadPilotData 15%, Previous Customer / Referral 1% of net.',
   ].filter(Boolean);
   return { market, title: market === COMPANY ? 'Reece Windows & Doors — all markets' : marketLabel(market), month, monthLabel: monthLabel(month), campaign, monthly, weekly, held: heldTotal, recommendations, asOf, footnotes };
 }
