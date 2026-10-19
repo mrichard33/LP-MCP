@@ -13,9 +13,9 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { enforceRehashCallTiming, rehashOpeningDay, promisedCallback, enforceCallTiming, softenCallTiming } from '../src/agentic/team-hours.js';
+import { enforceRehashCallTiming, rehashOpeningDay, promisedCallback, enforceCallTiming, softenCallTiming, namesWhen } from '../src/agentic/team-hours.js';
 import { isInRehash, rehashLeadFromContext } from '../src/agentic/rehash-state.js';
-import { planNepqTurn } from '../src/agentic/nepq-planner.js';
+import { planNepqTurn, checkAgainstReference, referenceRetryNote } from '../src/agentic/nepq-planner.js';
 import { checkReply } from '../src/eval/reply-invariants.js';
 
 const SENT = "Sorry about that, Monica. We're having someone call you back right now. — Reece Team";
@@ -91,4 +91,28 @@ test('the hard check fails the sent reply for a rehash lead and skips when unkno
   assert.ok(checkReply(SENT, { channel: 'sms', rehash: true, allowName: null }).violations.some(v => v.code === 'call_promised_now_to_rehash_lead'));
   assert.ok(!checkReply(SENT, { channel: 'sms', rehash: false }).violations.some(v => v.code === 'call_promised_now_to_rehash_lead'));
   assert.ok(checkReply(SENT, { channel: 'sms' }).skipped.includes('rehash_call_timing'));
+});
+
+// 2026-10-19 (bot gate, rehash_neither_times): two call times offered as a
+// choice are an offer, not a promise; "today at 4:30 PM ET" became "soon".
+test('two offered call times are never rewritten as an immediate promise', () => {
+  const offer = 'I have today at 4:30 PM ET or tomorrow at 9:30 AM ET for your call. Which works better? — John';
+  assert.equal(enforceRehashCallTiming(offer, {}).changed, false);
+  assert.equal(softenCallTiming(offer), offer);
+  // A real promise is still caught.
+  assert.equal(enforceRehashCallTiming("We're having someone call you back right now.", {}).text, "We're having someone call you back soon.");
+});
+
+// 2026-10-19 (bot gate, rehash_high_rise): "someone will get it over to you
+// today" on a hand-off whose reference names no day.
+test('a hand-off draft that names a day its reference does not fails the check', () => {
+  const ref = "Good question, Monica. I'll have John look into that and reach out.";
+  const plan = { required_move: 'handoff', fixed_line: ref };
+  assert.deepEqual(checkAgainstReference("Sorry about that, Monica. I've let our team know, and someone will get it over to you today.", ref, [], plan), ['promises_a_day']);
+  assert.deepEqual(checkAgainstReference("Sorry about that, Monica. I've let John know, and he'll look into it and reach out.", ref, [], plan), []);
+  // A reference that names the day allows it; a non-hand-off move is not checked for it.
+  assert.ok(!checkAgainstReference('Someone from our team will reach out tomorrow morning.', 'A team member will reach out tomorrow morning.', [], plan).includes('promises_a_day'));
+  assert.ok(!checkAgainstReference('Someone from our team will reach out today.', ref, [], { required_move: 'answer' }).includes('promises_a_day'));
+  assert.match(referenceRetryNote(plan, ['promises_a_day']), /Do not name a day or time/);
+  assert.ok(namesWhen('by end of day') && namesWhen('on Monday') && !namesWhen('look into it and reach out'));
 });
