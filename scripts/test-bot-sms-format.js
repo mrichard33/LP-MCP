@@ -22,7 +22,7 @@ import assert from 'node:assert/strict';
 
 const F = await import('../src/agentic/sms-format.js');
 const { mayRedraft, trimSmsToCap, SMS_REDRAFT_BUDGET_MS } = await import('../src/response-generator.js');
-const { planLanguageHandoff, SPANISH_CONFIRM_LINE, SPANISH_HANDOFF_LINE, SPANISH_THANKS_LINE } = await import('../src/live-chat/chat-rules.js');
+const { planLanguageHandoff, SPANISH_CONFIRM_LINE, SPANISH_NAME_ASK_ON_FILE_LINE, SPANISH_PHONE_ASK_LINE, SPANISH_THANKS_NAMED_LINE } = await import('../src/live-chat/chat-rules.js');
 
 test('one redraft at most, and none past the budget (SMS only)', () => {
   const t0 = 1_000_000;
@@ -85,11 +85,14 @@ test('no promised call is recorded on an opt-out or a close', () => {
 
 test('Spanish: a number on file is confirmed, not asked for; "Sí" confirms it', () => {
   const thread = (body) => [{ direction: 'inbound', text: body }];
-  const withPhone = planLanguageHandoff({ body: 'Hola, necesito ventanas', thread: thread('Hola, necesito ventanas'), knownPhone: '+13525550101' });
+  const withPhone = planLanguageHandoff({ body: 'Hola, necesito ventanas', thread: thread('Hola, necesito ventanas'), knownPhone: '+13525550101', knownName: 'Rosa' });
   assert.equal(withPhone.reply, SPANISH_CONFIRM_LINE('(352) 555-0101'));
   assert.doesNotMatch(withPhone.reply, /mejor número/);
-  const noPhone = planLanguageHandoff({ body: 'Hola, necesito ventanas', thread: thread('Hola, necesito ventanas') });
-  assert.equal(noPhone.reply, SPANISH_HANDOFF_LINE);
-  const yes = planLanguageHandoff({ body: 'Sí', thread: [{ direction: 'outbound', text: withPhone.reply }, { direction: 'inbound', text: 'Sí' }], knownPhone: '+13525550101' });
-  assert.equal(yes.reply, SPANISH_THANKS_LINE);
+  // 2026-10-19: with no real name, the number on file is read back in the name ask.
+  const guest = planLanguageHandoff({ body: 'Hola, necesito ventanas', thread: thread('Hola, necesito ventanas'), knownPhone: '+13525550101', knownName: 'Guest Visitor ugurs' });
+  assert.equal(guest.reply, SPANISH_NAME_ASK_ON_FILE_LINE('(352) 555-0101'));
+  const noPhone = planLanguageHandoff({ body: 'Hola, necesito ventanas', thread: thread('Hola, necesito ventanas'), knownName: 'Rosa' });
+  assert.equal(noPhone.reply, SPANISH_PHONE_ASK_LINE('Rosa'));
+  const yes = planLanguageHandoff({ body: 'Sí', thread: [{ direction: 'outbound', text: withPhone.reply }, { direction: 'inbound', text: 'Sí' }], knownPhone: '+13525550101', knownName: 'Rosa' });
+  assert.equal(yes.reply, SPANISH_THANKS_NAMED_LINE('Rosa'));
 });

@@ -146,27 +146,110 @@ export const SPANISH_REPLY_MARKER = Object.freeze({
 
 const PHONE_RX = /(?:\+?1[\s.-]*)?\(?\d{3}\)?[\s.-]*\d{3}[\s.-]*\d{4}\b/;
 
+// 2026-10-19 ("Guest Visitor ugurs", P0TM5O8p0EmNJpXzgKig): a Spanish visitor
+// gave a phone, got "a Spanish-speaking team member will follow up", and the
+// chat ended with no name. The contact stayed "Guest Visitor ugurs", so the
+// addlead proxy held the LP lead (`name-placeholder`, addlead-name.js) and the
+// summary card named nobody. The hand-off now collects the first name, then the
+// phone, one ask per message (contactAskLine's order), before it signs off.
+// Every line still says our team will reach out (SPANISH_TEAM_RX), which is how
+// the next turn knows it is still this flow's.
+export const SPANISH_NAME_ASK_LINE = 'Hola, gracias por escribirnos. Un miembro de nuestro equipo que habla español se comunicará con usted. ¿Cuál es su nombre?';
+export const SPANISH_NAME_ASK_ON_FILE_LINE = (phoneHumanText) => `Hola, gracias por escribirnos. Un miembro de nuestro equipo que habla español le llamará al ${phoneHumanText}. ¿Cuál es su nombre?`;
+export const SPANISH_NAME_AGAIN_LINE = 'Gracias. ¿Y cuál es su nombre, para que nuestro equipo sepa por quién preguntar?';
+export const SPANISH_PHONE_ASK_LINE = (name) => `Gracias, ${name}. ¿Cuál es el mejor número de teléfono para que nuestro equipo le llame?`;
+export const SPANISH_THANKS_NAMED_LINE = (name) => `Gracias, ${name}. Un miembro de nuestro equipo le llamará pronto.`;
+// Read back by meaning: the model words the ask (Part 8).
+const SPANISH_NAME_ASK_RX = /cu[aá]l\s+es\s+su\s+nombre|\bsu\s+nombre\b|c[oó]mo\s+se\s+llama/i;
+const SPANISH_PHONE_ASK_RX = /n[uú]mero\s+de\s+tel[eé]fono|\bsu\s+n[uú]mero\b|mejor\s+n[uú]mero/i;
+export const SPANISH_NAME_MARKER = Object.freeze({ rx: SPANISH_NAME_ASK_RX, say: 'end by asking for their first name, in Spanish (¿Cuál es su nombre?)' });
+export const SPANISH_PHONE_MARKER = Object.freeze({ rx: SPANISH_PHONE_ASK_RX, say: 'end by asking for the best phone number, in Spanish' });
+
+const NAME_WORD_RX = "[A-Za-zÁÉÍÓÚÜÑáéíóúüñ][A-Za-zÁÉÍÓÚÜÑáéíóúüñ'’-]{1,20}";
+const STATED_ES_RX = new RegExp(String.raw`(?:\bme\s+llamo|\bmi\s+nombre\s+es|\bsoy)\s+(${NAME_WORD_RX})`, 'i');
+const STATED_EN_RX = new RegExp(String.raw`\bmy\s+name(?:\s+is|'?s)\s+(${NAME_WORD_RX})`, 'i');
+const BARE_NAME_RX = new RegExp(String.raw`^\s*(${NAME_WORD_RX})(?:\s+(${NAME_WORD_RX}))?\s*[.!]?\s*$`, 'i');
+const NOT_A_NAME_ES = new Set(['si', 'sí', 'no', 'ok', 'okay', 'gracias', 'hola', 'claro', 'bueno', 'buenas', 'buenos', 'perfecto', 'correcto', 'yes', 'thanks', 'hello', 'hi', 'guest', 'visitor', 'de', 'el', 'la', 'muchas', 'favor', 'por', 'espanol', 'español', 'ingles', 'inglés', 'the', 'and', 'un', 'una', 'del', 'muy', 'cliente', 'propietario', 'dueño', 'dueña', 'nuevo', 'nueva']);
+const capWord = (w) => w.charAt(0).toLocaleUpperCase('es') + w.slice(1).toLocaleLowerCase('es');
+
+/** A first name from "me llamo X" / "soy X" / "my name is X", or a bare reply to our name ask. Pure. */
+export function spanishNameFromReply(text, { asked = false } = {}) {
+  const t = String(text || '');
+  const stated = t.match(STATED_ES_RX) || t.match(STATED_EN_RX);
+  if (stated && !NOT_A_NAME_ES.has(stated[1].toLowerCase())) return capWord(stated[1]);
+  if (!asked || /\d/.test(t)) return null;
+  const m = t.match(BARE_NAME_RX);
+  if (!m || [m[1], m[2]].filter(Boolean).some((w) => NOT_A_NAME_ES.has(w.toLowerCase()))) return null;
+  return capWord(m[1]);
+}
+
+/** The name the visitor gave in this chat (a statement, or the reply to our name ask). Pure. */
+function nameInThread(turns) {
+  let name = null;
+  for (let i = 0; i < turns.length; i++) {
+    const m = turns[i];
+    if (m?.direction !== 'inbound') continue;
+    const before = [...turns.slice(0, i)].reverse().find((x) => x?.direction === 'outbound');
+    const asked = !!before && SPANISH_NAME_ASK_RX.test(String(before.text || ''));
+    name = spanishNameFromReply(m.text, { asked }) || name;
+  }
+  return name;
+}
+
 /**
  * Should this turn be the Spanish hand-off? A Spanish message, or any reply
  * right after our own Spanish hand-off line (a visitor answering with just a
- * phone number writes no Spanish words). Pure.
+ * phone number or a name writes no Spanish words). Pure.
  *
- * @returns {null | { language: 'es', reply: string, phone: string|null, first: boolean }}
+ * It collects the first name, then the phone (one ask per message), and signs
+ * off only when both are known. A real name on record or a phone on file is
+ * never asked for (the phone on file is read back in the name ask, so a wrong
+ * one can be corrected).
+ *
+ * @returns {null | { language: 'es', reply: string, phone: string|null, name: string|null, ask: 'name'|'phone'|'confirm'|null, first: boolean }}
  */
-export function planLanguageHandoff({ body, thread = [], knownPhone = null }) {
-  const prior = Array.isArray(thread) ? thread.slice(0, -1) : [];
+export function planLanguageHandoff({ body, thread = [], knownPhone = null, knownName = null }) {
+  const all = Array.isArray(thread) ? thread : [];
+  const prior = all.slice(0, -1);
   const lastOut = [...prior].reverse().find((m) => m.direction === 'outbound');
   // Part 8: the model words the hand-off now, so it is read back by meaning.
   const afterOurHandoff = !!lastOut && SPANISH_TEAM_RX.test(String(lastOut.text || ''));
-  const phone = (String(body || '').match(PHONE_RX) || [null])[0];
-  if (afterOurHandoff && phone) return { language: 'es', reply: SPANISH_THANKS_LINE, phone, first: false };
-  // "Sí" to our "¿Le podemos llamar al …?" confirms the number on file.
+  const text = String(body || '');
+  const phone = (text.match(PHONE_RX) || [null])[0];
+  const askedName = afterOurHandoff && SPANISH_NAME_ASK_RX.test(String(lastOut.text || ''));
+  const nameNow = spanishNameFromReply(text, { asked: askedName });
   const onFile = phoneHuman(knownPhone);
-  if (afterOurHandoff && onFile && SPANISH_YES_RX.test(String(body || ''))) return { language: 'es', reply: SPANISH_THANKS_LINE, phone: knownPhone, first: false };
-  if (!looksSpanish(body)) return null; // an English reply after the hand-off goes to the model as usual
-  // A number on file is confirmed, never asked for again (2026-10-12, PR 6).
-  const reply = !phone && onFile && !afterOurHandoff ? SPANISH_CONFIRM_LINE(onFile) : SPANISH_HANDOFF_LINE;
-  return { language: 'es', reply, phone: phone || null, first: !afterOurHandoff };
+  const confirmedOnFile = afterOurHandoff && onFile && SPANISH_YES_RX.test(text);
+  // Ours only when it is Spanish, or answers our own Spanish ask.
+  if (!looksSpanish(text) && !(afterOurHandoff && (phone || nameNow || confirmedOnFile))) return null;
+
+  const turns = all.length && all[all.length - 1]?.text === body ? all : [...all, { direction: 'inbound', text }];
+  const typedPhone = phone || [...turns].reverse().filter((m) => m?.direction === 'inbound').map((m) => (String(m.text || '').match(PHONE_RX) || [null])[0]).find(Boolean) || null;
+  const name = isRealName(knownName) ? String(knownName).trim().split(/\s+/)[0] : (nameNow || nameInThread(turns));
+  const havePhone = typedPhone || knownPhone || null;
+  const first = !afterOurHandoff;
+
+  let reply;
+  let ask = null;
+  if (!name) {
+    ask = 'name';
+    if (!afterOurHandoff) reply = !typedPhone && onFile ? SPANISH_NAME_ASK_ON_FILE_LINE(onFile) : SPANISH_NAME_ASK_LINE;
+    // Already asked once and the answer was not a name: ask once more, then let it go.
+    else if (askedName && prior.filter((m) => m.direction === 'outbound' && SPANISH_NAME_ASK_RX.test(String(m.text || ''))).length >= 2) {
+      ask = havePhone ? null : 'phone';
+      reply = havePhone ? SPANISH_THANKS_LINE : SPANISH_HANDOFF_LINE;
+    } else reply = SPANISH_NAME_AGAIN_LINE;
+  } else if (!havePhone) {
+    ask = 'phone';
+    reply = SPANISH_PHONE_ASK_LINE(name);
+  } else if (!typedPhone && onFile && !confirmedOnFile && !afterOurHandoff) {
+    // A real name on record and a number on file: confirm the number (PR 6).
+    ask = 'confirm';
+    reply = SPANISH_CONFIRM_LINE(onFile);
+  } else {
+    reply = name ? SPANISH_THANKS_NAMED_LINE(name) : SPANISH_THANKS_LINE;
+  }
+  return { language: 'es', reply, phone: typedPhone || (confirmedOnFile ? knownPhone : null), name: name || null, ask, first };
 }
 
 // ── 3. name + phone before any call promise (Mark, 2026-10-01) ─────────────

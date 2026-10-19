@@ -469,7 +469,7 @@ test('a visitor who will not give a zip is not asked twice; one-market place ans
 
 // ── 2026-10-01 go-live check fixes ──────────────────────────────────────────
 
-const { SPANISH_HANDOFF_LINE } = await import('../src/live-chat/chat-rules.js');
+const { SPANISH_HANDOFF_LINE, SPANISH_PHONE_ASK_LINE, SPANISH_NAME_ASK_LINE } = await import('../src/live-chat/chat-rules.js');
 
 test('no conversation id in the payload → found by contact, and the thread is read (the bot remembers)', async () => {
   const messages = [
@@ -512,9 +512,10 @@ test('the invented weekend slots never reach the visitor', async () => {
 // Part 8: the model writes the Spanish hand-off; an English draft (the stub's)
 // misses it, so the Spanish line ships as the backup.
 test('a Spanish visitor gets the Spanish hand-off (backup when the draft is not Spanish), and #ops-alerts is told once', async () => {
+  // Alyce is on record with no phone: the name is known, so the phone is asked.
   const { lane, state } = makeLane({ mode: 'live' });
   const out = await lane.processInbound(INBOUND('hola dime que debo de haser'));
-  assert.equal(out.message, SPANISH_HANDOFF_LINE);
+  assert.equal(out.message, SPANISH_PHONE_ASK_LINE('Alyce'));
   assert.ok(state.llmCalls.length >= 1, 'the model is asked');
   assert.match(state.llmCalls[0].user, /Reply ONLY in Spanish/);
   assert.equal(state.sends.length, 1);
@@ -522,6 +523,41 @@ test('a Spanish visitor gets the Spanish hand-off (backup when the draft is not 
   assert.equal(state.ops.filter(t => t.includes('SPANISH')).length, 1);
   assert.equal(state.events.filter(e => e.event_type === 'agentic.live_chat_language_handoff').length, 1);
   assert.equal(state.updates.find(u => u.status === 'completed').execution_result.language_handoff, 'es');
+});
+
+// 2026-10-19 (Guest Visitor ugurs): a placeholder name and a typed phone → the
+// bot asks the name, saves it with the phone, and queues the Five9 Spanish list.
+test('Spanish visitor with a placeholder name: the name is asked, then captured, and the number goes to the Spanish list', async () => {
+  const queued = [];
+  const queueSpanishList = async (input) => { queued.push(input); return { queued: true }; };
+  const one = makeLane({ mode: 'live', firstName: 'Guest', extra: { queueSpanishList } });
+  const out = await one.lane.processInbound(INBOUND('Necesito una ventana de impacto 117 x 64. 3056807206'));
+  assert.equal(out.message, SPANISH_NAME_ASK_LINE);
+  await new Promise(r => setImmediate(r));
+  assert.equal(queued.length, 1);
+  assert.equal(queued[0].phone, '3056807206');
+  assert.equal(queued[0].firstName, null);
+  assert.equal(one.state.captured.at(-1).capture.phone, '3056807206');
+
+  const messages = [
+    { direction: 'inbound', body: 'Necesito una ventana de impacto 117 x 64. 3056807206', dateAdded: '2026-10-19T19:20:00Z' },
+    { direction: 'outbound', body: SPANISH_NAME_ASK_LINE, dateAdded: '2026-10-19T19:20:05Z' },
+  ];
+  const two = makeLane({ mode: 'live', firstName: 'Guest', phone: '+13056807206', messages, findConversation: () => 'conv1', extra: { queueSpanishList } });
+  const out2 = await two.lane.processInbound(INBOUND('Carlos'));
+  assert.match(out2.message, /Carlos/);
+  assert.match(out2.message, /nuestro equipo le llamar/);
+  await new Promise(r => setImmediate(r));
+  assert.equal(two.state.captured.at(-1).capture.name, 'Carlos');
+  assert.equal(queued.at(-1).firstName, 'Carlos');
+});
+
+test('Spanish list is never queued in shadow mode', async () => {
+  const queued = [];
+  const { lane } = makeLane({ mode: 'shadow', firstName: 'Guest', extra: { queueSpanishList: async (i) => { queued.push(i); } } });
+  await lane.processInbound(INBOUND('Hola, necesito ventanas. 3056807206'));
+  await new Promise(r => setImmediate(r));
+  assert.equal(queued.length, 0);
 });
 
 test('a Spanish draft that says our team will reach out is sent as the model wrote it', async () => {

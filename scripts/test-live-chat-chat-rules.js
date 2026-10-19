@@ -7,7 +7,7 @@ process.env.SUPABASE_SERVICE_ROLE_KEY ||= 'test-key';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-const { findTimeOffers, guardTimeOffers, bookingHandoffLine, looksSpanish, planLanguageHandoff, SPANISH_HANDOFF_LINE, SPANISH_THANKS_LINE } = await import('../src/live-chat/chat-rules.js');
+const { findTimeOffers, guardTimeOffers, bookingHandoffLine, looksSpanish, planLanguageHandoff, SPANISH_HANDOFF_LINE, SPANISH_THANKS_LINE, SPANISH_NAME_ASK_LINE, SPANISH_PHONE_ASK_LINE, SPANISH_THANKS_NAMED_LINE } = await import('../src/live-chat/chat-rules.js');
 const { liveChatWebhookPayload, sendViaWebhook } = await import('../src/live-chat/index.js');
 
 const LIVE_DRAFT = "Perfect. The next step is an in-home visit where we measure to Florida code and leave you with exact pricing that's good for a year. I have two openings this weekend — Saturday at 10 AM or Sunday at 2 PM. Which works better for you?";
@@ -38,16 +38,27 @@ test('Spanish detection: the live visitor, accents and marks; English with a str
 });
 
 test('Spanish hand-off: first message, then a phone number gets thanks, then English goes back to the model', () => {
+  // 2026-10-19: the first name comes first, then the phone (one ask each).
   const first = planLanguageHandoff({ body: 'hola dime que debo de haser', thread: [{ direction: 'inbound', text: 'hola dime que debo de haser' }] });
-  assert.equal(first.reply, SPANISH_HANDOFF_LINE);
+  assert.equal(first.reply, SPANISH_NAME_ASK_LINE);
+  assert.equal(first.ask, 'name');
   assert.equal(first.first, true);
+  const named = planLanguageHandoff({ body: 'Me llamo José', thread: [
+    { direction: 'inbound', text: 'hola dime que debo de haser' }, { direction: 'outbound', text: SPANISH_NAME_ASK_LINE }, { direction: 'inbound', text: 'Me llamo José' },
+  ] });
+  assert.equal(named.name, 'José');
+  assert.equal(named.reply, SPANISH_PHONE_ASK_LINE('José'));
   const thread = [
     { direction: 'inbound', text: 'hola dime que debo de haser' },
-    { direction: 'outbound', text: SPANISH_HANDOFF_LINE },
+    { direction: 'outbound', text: SPANISH_NAME_ASK_LINE },
+    { direction: 'inbound', text: 'Me llamo José' },
+    { direction: 'outbound', text: SPANISH_PHONE_ASK_LINE('José') },
   ];
   const phone = planLanguageHandoff({ body: '305 555 1212', thread: [...thread, { direction: 'inbound', text: '305 555 1212' }] });
-  assert.equal(phone.reply, SPANISH_THANKS_LINE);
+  assert.equal(phone.reply, SPANISH_THANKS_NAMED_LINE('José'));
   assert.equal(phone.phone, '305 555 1212');
+  assert.equal(phone.name, 'José');
+  assert.equal(phone.ask, null);
   assert.equal(planLanguageHandoff({ body: 'Actually I speak English', thread: [...thread, { direction: 'inbound', text: 'Actually I speak English' }] }), null);
   assert.equal(planLanguageHandoff({ body: 'How much?', thread: [{ direction: 'inbound', text: 'How much?' }] }), null);
 });
@@ -202,8 +213,12 @@ test('pickSlot: a weekday name picks that day from the offer', async () => {
 // Part 8: the Spanish hand-off is model-written; it is read back by meaning.
 test('Spanish hand-off: a reworded line still counts as ours, and the marker wants Spanish + our team', () => {
   const ours = 'Hola, gracias. Un miembro de nuestro equipo que habla español le llamará pronto. ¿Cuál es su número?';
-  const next = R.planLanguageHandoff({ body: '352-555-0188', thread: [{ direction: 'inbound', text: 'hola' }, { direction: 'outbound', text: ours }, { direction: 'inbound', text: '352-555-0188' }] });
-  assert.equal(next.reply, R.SPANISH_THANKS_LINE);
+  const next = R.planLanguageHandoff({ body: '352-555-0188', knownName: 'Rosa', thread: [{ direction: 'inbound', text: 'hola' }, { direction: 'outbound', text: ours }, { direction: 'inbound', text: '352-555-0188' }] });
+  assert.equal(next.reply, R.SPANISH_THANKS_NAMED_LINE('Rosa'));
+  // No name yet: the number is kept and the name is asked.
+  const noName = R.planLanguageHandoff({ body: '352-555-0188', thread: [{ direction: 'inbound', text: 'hola' }, { direction: 'outbound', text: ours }, { direction: 'inbound', text: '352-555-0188' }] });
+  assert.equal(noName.phone, '352-555-0188');
+  assert.equal(noName.ask, 'name');
   assert.equal(R.SPANISH_REPLY_MARKER.rx.test(ours), true);
   assert.equal(R.SPANISH_REPLY_MARKER.rx.test('Thanks, a team member will reach out.'), false);
   assert.equal(R.SPANISH_REPLY_MARKER.rx.test(R.SPANISH_HANDOFF_LINE), true);
