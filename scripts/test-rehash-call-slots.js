@@ -172,3 +172,38 @@ test('the rehash prompt lets the reply name times only when real ones were read'
   assert.doesNotMatch(on, /You cannot see a calendar/);
   assert.match(on, /REAL open call times/);
 });
+
+// 2026-10-19 (Sam, IMWge24jxc0xO0ppy7OR): "Neither" to the two call times got
+// "Did you get a chance to look over the proposal?" and counted as a no.
+const OFFER_OUT = { direction: 'outbound', text: 'We can get John on the line to go over that with you. Today at 2:00 PM ET or 3:30 PM ET, which works better? — John' };
+const ASKED_CALL = { direction: 'inbound', text: 'Could you please give me a call on my cell phone' };
+test('"Neither" / "none of those" / "No" to our call times → ask when works, no track question, not a no', () => {
+  for (const t of ['Neither', 'None of those work', 'No']) {
+    const p = plan(t, [ASKED_CALL, OFFER_OUT]);
+    assert.equal(p.step, 'rehash_ask_time', t);
+    assert.match(p.fixed_line, /When is a good day and time for a call\?/);
+    assert.ok(!p.rehash_question, t);
+    assert.equal(p.counters.post_demo_nos || 0, 0, t);
+  }
+});
+
+test('a day after our ask → two openings that day; a no to the ask is a real no', () => {
+  const asked = { direction: 'outbound', text: 'No problem, Pat. When is a good day and time for a call?' };
+  const p = plan('Monday afternoon', [ASKED_CALL, OFFER_OUT, { direction: 'inbound', text: 'Neither' }, asked]);
+  assert.equal(p.step, 'rehash_offer');
+  assert.ok(p.slots_to_offer.some(s => s.day.startsWith('Mon')));
+  const no = plan('No', [ASKED_CALL, OFFER_OUT, { direction: 'inbound', text: 'Neither' }, asked]);
+  assert.notEqual(no.step, 'rehash_ask_time');
+  assert.ok(no.counters.post_demo_nos >= 1);
+});
+
+test('a high-rise question after the demo → a hand-off to the team, no question, never dialed', async () => {
+  const { NO_DIAL_REASONS } = await import('../src/agentic/bot-callback.js');
+  const { REHASH_REASONS } = await import('../src/agentic/nepq-handoff.js');
+  const p = plan("I'm waiting for Chris to give me a list of high-rises that your company has done in the past.", []);
+  assert.equal(p.step, 'handoff');
+  assert.equal(p.handoff?.reason, 'rehash_scope_question');
+  assert.ok(p.no_question);
+  assert.doesNotMatch(p.fixed_line, /two stor|can'?t/i);
+  assert.ok(NO_DIAL_REASONS.has('rehash_scope_question') && REHASH_REASONS.has('rehash_scope_question'));
+});

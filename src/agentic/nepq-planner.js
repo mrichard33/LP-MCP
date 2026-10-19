@@ -32,6 +32,7 @@ import { heldSlot, COLLECT_ASK, dmAnswerFromThread } from './booking-collect.js'
 import { RECHECK_RX } from './contact-check.js';
 import { slotMentionIndex, offeredSlots as offeredIn, pickSlot, mentionedMinutes } from '../live-chat/cancel-flow.js';
 import { parseDayPreference, slotsForPreference, slotMatches, preferenceOfferLine } from './day-preference.js';
+import { leadRaisesScope } from './property-scope.js';
 import { enforceOneAsk } from './one-ask.js';
 import { isKnockComplaint } from './do-not-knock.js';
 import { detectDeferral, pendingDeferral, isAcknowledgment, isLeadCloser, isSignOffLine, askedForSpace, POST_DEMO_QUESTIONS } from './post-demo-turn.js';
@@ -242,6 +243,11 @@ function vagueRun(inbound = []) {
 // A bare pick: "first", "2nd", "the earlier one", "either".
 const BARE_PICK_RX = /^\s*(?:ok(?:ay)?,?\s+|yes,?\s+|sure,?\s+)?(?:the\s+)?(?:first|second|1st|2nd|earlier|later|either)(?:\s+one)?(?:\s+(?:works|please|is\s+good))?\s*[.!]*\s*$/i;
 const NEITHER_RX = /\b(?:neither|none\s+of\s+(?:those|them)|(?:those|that)\s+(?:times?\s+)?(?:don'?t|won'?t|doesn'?t)\s+work|can'?t\s+do\s+(?:either|those|that)|not\s+(?:those|that)\s+(?:days?|times?))\b/i;
+// 2026-10-19 (Sam, IMWge24jxc0xO0ppy7OR): our ask after a rehash lead turned
+// down both call times. A no to THIS ask is a real no; "Neither" to the two
+// times is not (isPostDemoNo).
+const REHASH_TIME_ASK_RX = /\bwhen\s+is\s+a\s+good\s+day\s+and\s+time\s+for\s+a\s+call\b/i;
+export const REHASH_TIME_ASK_LINE = 'When is a good day and time for a call?';
 // "Wednesdays" too (Oct 2 6:12 PM chat: the plural missed this and the day ask was not read as answered).
 // 2026-10-15 (Guest Visitor pkjiz): a calendar date is a day too. "24th" and
 // "October 24th", answering "Sat, Oct 17 … or Sat, Oct 24 …", matched nothing
@@ -589,6 +595,13 @@ export function isPostDemoNo(text, lastOutbound = '') {
   // any OTHER question (a pre-demo discovery question) is still not a no.
   const sign = String(lastOutbound || '').match(SIGNOFF_RX);
   const o = sign ? String(lastOutbound).slice(0, sign.index).trim() : String(lastOutbound || '');
+  // 2026-10-19 (Sam, IMWge24jxc0xO0ppy7OR): "Neither" to the two call times
+  // we offered was counted as a no and got the track question; one more no
+  // would have stopped the bot. Turning down two times is not turning down
+  // the call: planRehashCall asks for a day and time instead. A no to THAT ask
+  // (REHASH_TIME_ASK_RX) counts.
+  if (SLOT_OFFER_RX.test(o) && (NEITHER_RX.test(t) || /^\s*(?:no|nope|nah|neither)\s*[.!]*\s*$/i.test(t))) return false;
+  if (REHASH_TIME_ASK_RX.test(o) && (BARE_NO_RX.test(t) || NEITHER_RX.test(t))) return true;
   if (isNo(t, o)) return true;
   // 2026-10-18 (Phase 1 item 4): a no after our door-open close used to be read
   // from our own wording ("If anything changes … we're here."), which the model
@@ -1176,6 +1189,31 @@ function planNepqTurnCore({
       const near = nearestToClock(all, typed, now, nowMs);
       if (near.length === 2) return offerPlan(near, LINES.offer_slots(near, counters.slot_offers));
     }
+    // 2026-10-19 (Sam, IMWge24jxc0xO0ppy7OR): "Neither" to the two call times
+    // fell through to the track's "Did you get a chance to look over the
+    // proposal?". Turning the times down is not turning the call down: ask
+    // when works, once, and offer what the Rehash Call calendar shows for it.
+    // Asked once: a no to our own ask is a no (isPostDemoNo), never asked again.
+    const askedWhen = outbound.slice(-4).some(m => REHASH_TIME_ASK_RX.test(m.text));
+    if (lastOfferOut && !askedWhen && (NEITHER_RX.test(now) || /^\s*(?:no|nope|nah|neither)\s*[.!]*\s*$/i.test(now))) {
+      return Object.assign(plan, base, {
+        step: 'rehash_ask_time', required_move: 'ask_day', fixed_line: `No problem${hi}. ${REHASH_TIME_ASK_LINE}`,
+        booking: { allowed: true, reason: 'nepq:rehash_ask_time' },
+      });
+    }
+    // A day or part of day ("Thursday afternoon") answering our ask or our
+    // offer: two openings that match it, or the nearest two said honestly.
+    if ((lastOfferOut || REHASH_TIME_ASK_RX.test(lastOut)) && all.length) {
+      const pref = parseDayPreference(now);
+      // Never the times they just turned down.
+      const refused = new Set(outbound.slice(-4).flatMap(m => offeredIn(m.text, all)).map(x => x.iso));
+      const fresh = all.filter(x => !refused.has(x.iso));
+      if (pref && fresh.length) {
+        const picked = slotsForPreference(fresh, pref, { nowMs });
+        const line = preferenceOfferLine(pref, picked, callSlots.tz || tzLabel);
+        if (line && picked?.slots?.length === 2) return offerPlan(picked.slots, line);
+      }
+    }
     // Yes to our call offer, a call asked for, or "can we set up a time".
     // 2026-10-11 live simulation: "Yes that would help" two messages after the
     // "best deal possible" bridge got "I'll have John give you a quick call"
@@ -1215,6 +1253,20 @@ function planNepqTurnCore({
         // The model's version must still name the date they gave.
         reference_markers: [{ rx: new RegExp(deferral.marker, 'i'), say: `confirm the follow-up as ${deferral.label}` }],
       });
+    }
+    // 2a. The home type or the building's height, raised after the demo
+    //     (Sam, IMWge24jxc0xO0ppy7OR, 2026-10-19): his rep had been to the
+    //     high-rise, and the reply said we only work on two stories. The rep
+    //     already saw the home (the user's 2026-10-13 ruling: a lead past the
+    //     demo meets our requirements), so the question goes to the team, no
+    //     yes, no no (enforcePropertyScope drops either), no question.
+    if (leadRaisesScope([now])) {
+      const repName = (Array.isArray(callSlots?.offer) && callSlots?.repName) || rehashRep || null;
+      const speaksAsRep = !!(repName && rehashRep && String(repName).toLowerCase() === String(rehashRep).toLowerCase());
+      const line = speaksAsRep
+        ? `Good question${hi}. I'll look into that and get back to you.`
+        : `Good question${hi}. I'll have ${repName || 'our team'} look into that and reach out.`;
+      return pd({ step: 'handoff', required_move: 'handoff', fixed_line: line, call_offer_ok: false, no_question: true, rehash_question: null, handoff: { reason: 'rehash_scope_question', line } });
     }
     // 3. A deferral asked for earlier and not yet due: no times unless they ask
     //    to schedule now (Melissa: the second "November" still got two slots).

@@ -44,3 +44,20 @@ test('checkReply does not hold a post-demo reply to the lead-side job checks', (
   // Our own false claim is still caught.
   assert.ok(checkReply('Yes, we do commercial work too.', { channel: 'sms', inbound: 'hi', conversation, postDemoLead: true }).violations.some(v => v.code === 'job_scope'));
 });
+
+// 2026-10-19 (Sam, IMWge24jxc0xO0ppy7OR): the home type and height are the rep's to answer after a demo.
+test('checkReply: past the demo the lead-side property check is skipped; a scope sentence still fails', () => {
+  const inbound = "I'm waiting for Chris to give me a list of high-rises that your company has done in the past.";
+  const reply = "Good question, Sam. I'll have our team look into that and reach out.";
+  assert.ok(checkReply(reply, { channel: 'sms', inbound }).violations.some(v => v.code === 'property_scope'));
+  const post = checkReply(reply, { channel: 'sms', inbound, postDemoLead: true });
+  assert.ok(!post.violations.some(v => v.code === 'property_scope'));
+  assert.ok(post.skipped.includes('property_scope_lead_side'));
+  assert.ok(checkReply('Sorry, we only work on buildings that are two stories or lower.', { channel: 'sms', inbound, postDemoLead: true }).violations.some(v => v.code === 'property_scope'));
+});
+
+test('a mobile-home LP note does not stop the bot after the demo (2026-10-19)', () => {
+  const note = { notes: [{ text: 'Customer lives in a mobile home.' }] };
+  assert.equal(buildLeadFacts({ lp: { ...note, disposition: 'Set' } }).note_dq?.signal, 'mobile_home');
+  assert.equal(buildLeadFacts({ lp: { ...note, disposition: 'OPPFDN' } }).note_dq, null);
+});

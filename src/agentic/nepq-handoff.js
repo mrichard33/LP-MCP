@@ -35,7 +35,8 @@ export const DISPATCH_CHANNEL_DEFAULT = 'C0C9AGEM2N8';
 const DISPATCH_REASONS = new Set(['complaint', 'booking_request', 'emergency']);
 // 2026-10-15 (Shawn Eastman): a post-demo lead is the rehash team's, so the
 // post-demo ladder's two hand-offs go to #contact-rehash ONLY.
-export const REHASH_REASONS = new Set(['rehash_stop', 'rehash_repeat_objection']);
+// 2026-10-19 (Sam): a home-type or height question after the demo too.
+export const REHASH_REASONS = new Set(['rehash_stop', 'rehash_repeat_objection', 'rehash_scope_question']);
 
 /** The Slack channels a hand-off card goes to. Pure. */
 export function handoffSlackChannels(reason, env = process.env) {
@@ -69,6 +70,8 @@ const WHY = {
   // 2026-10-15 (Shawn Eastman): the post-demo ladder (nepq-planner.js planPostDemo).
   rehash_stop: 'Post-demo lead said no twice. NOT added to the dialer and the bot stopped selling (it still answers). Read the thread; reach out only if something in it says they want to hear from us.',
   rehash_repeat_objection: 'Post-demo lead raised the same objection again after the call offer. Call them and see what we can do; the bot promised no offer.',
+  // 2026-10-19 (Sam, IMWge24jxc0xO0ppy7OR): the bot told a high-rise lead whose rep had been out that we only work on two stories.
+  rehash_scope_question: 'Post-demo lead asked about the home type or the building height (e.g. a high-rise or a manufactured home). The rep already saw the home. Check with the rep and answer them; the bot said neither yes nor no.',
   lp_note_dq: 'A team note in LP says we cannot run this lead. The bot is now OFF for this contact (stop-bot) and booked nothing. Call them, explain plainly, and settle what happens next. Remove stop-bot only if the bot should talk to them again.',
 };
 
@@ -79,6 +82,7 @@ const TOLD = {
   two_nos: ' The bot stopped asking and promised no call.',
   rehash_stop: ' The bot stopped asking and promised no call.',
   rehash_repeat_objection: ' The bot told them the rep will take a look at it and reach out, and promised no offer.',
+  rehash_scope_question: ' The bot told them the team will look into it and get back to them.',
   do_not_knock: ' The bot apologised and told them our team will not knock again.',
 };
 

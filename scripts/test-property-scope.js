@@ -118,3 +118,20 @@ test('leadRaisesScope reads every message the lead sent, and a denial raises not
   assert.equal(leadRaisesScope(['My condo is on the 5th floor']), true);
   assert.equal(leadRaisesScope(["it's not a mobile home, it's a house", '2 story house']), false);
 });
+
+// 2026-10-19 (Sam, IMWge24jxc0xO0ppy7OR): his rep had been to the high-rise.
+test('past the demo: the lead raising a high-rise gets no "we only do two stories"', async () => {
+  const { POST_DEMO_SCOPE_LINE } = await import('../src/agentic/property-scope.js');
+  const inbound = "I'm waiting for Chris to give me a list of high-rises that your company has done in the past.";
+  const draft = "Thanks, Sam. I'll have our team look into that and reach out.";
+  assert.equal(enforcePropertyScope(draft, { inbound }).changed, true, 'before the demo the limit still answers');
+  assert.equal(enforcePropertyScope(draft, { inbound, pastDemo: true }).changed, false);
+  // The real bad draft is dropped, never sent.
+  const bad = enforcePropertyScope(HEIGHT_ANSWER, { inbound, pastDemo: true });
+  assert.equal(bad.reason, 'post_demo_dropped');
+  assert.equal(bad.text, POST_DEMO_SCOPE_LINE);
+  // A claim is dropped too, and the rest of the reply stays.
+  const claim = enforcePropertyScope('We do high-rise condos all the time. I will check with Chris.', { inbound, pastDemo: true });
+  assert.equal(claim.text, 'I will check with Chris.');
+  assert.equal(enforcePropertyScope('Sorry, we only work on buildings two stories or lower. Anything else?', { inbound: 'hi', pastDemo: true }).text, 'Anything else?');
+});
