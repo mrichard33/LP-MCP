@@ -10,7 +10,7 @@ delete process.env.SUPABASE_URL;
 delete process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 import { fakeSupabase } from './lib/fake-supabase.js';
-import { buildCommissionRows, recomputeCalculatedCosts, monthsInPeriod, recomputeAfterSalesSnapshot } from '../src/marketing/commission.js';
+import { buildCommissionRows, recomputeCalculatedCosts, monthsInPeriod, recomputeAfterSalesSnapshot, isEstimateRule } from '../src/marketing/commission.js';
 import { summarizeRecommendation, matchHeldLeads, recommendHolds } from '../src/marketing/holds.js';
 import { runMarketingCostNightly, defaultMonths } from '../src/jobs/marketing-cost-nightly.js';
 import { buildMarketModel, COMPANY, campaignLabel } from '../src/marketing/report.js';
@@ -214,4 +214,37 @@ test('report: a campaign with no sub-source is "Unknown", never "(none)" (2026-1
     weekRows: [],
   });
   assert.deepEqual(m.campaign.map((c) => [c.label, c.raw]), [['Unknown', 5]]);
+});
+
+test('commission: an *_estimate rule writes provisional rows flagged estimate; LeadPilotData at 15% (the user, 2026-10-19)', async () => {
+  const rules = [
+    { id: 'r-cv', lp_sub_sources: ['Canvass'], rate: 0.15, basis: 'net_sales_estimate', label: 'Canvass 15% of net (estimate until canvasser payroll)', effective_from: '2026-01-01', effective_to: null },
+    { id: 'r-lpd', lp_sub_sources: ['LeadPilotData'], rate: 0.15, basis: 'net_sales', label: 'LeadPilotData 15% of net', effective_from: '2026-01-01', effective_to: null },
+  ];
+  const dollars = [
+    { market: 'FTMYR_MKT', lp_sub_source: 'Canvass', net: 276190 },
+    { market: 'ORL_MKT', lp_sub_source: 'LeadPilotData', net: 10000 },
+  ];
+  assert.equal(isEstimateRule(rules[0]), true);
+  assert.equal(isEstimateRule(rules[1]), false);
+  const rows = buildCommissionRows({ month: '2026-10-01', rules, dollars });
+  const cv = rows.find((r) => r.lp_sub_sources[0] === 'Canvass');
+  assert.equal(cv.amount, 41428.5);
+  assert.equal(cv.provisional, true);
+  assert.deepEqual(cv.flags, ['estimate']);
+  const lpd = rows.find((r) => r.lp_sub_sources[0] === 'LeadPilotData');
+  assert.equal(lpd.amount, 1500);
+  assert.equal(lpd.provisional, false);
+  assert.deepEqual(lpd.flags, []);
+
+  // A row stored before the rule became an estimate is re-marked even when the amount did not move.
+  const supabase = fakeSupabase({
+    marketing_cost_rules: rules, marketing_vendors: [], marketing_expense_allocations: [],
+    marketing_expenses: [{ ...cv, id: 'e1', provisional: false, flags: [] }],
+  }, { rpc: { mkt_sales_dollars: async () => dollars } });
+  const r = await recomputeCalculatedCosts('2026-10', { supabase });
+  assert.equal(r.updated, 1);
+  const stored = supabase.tables.marketing_expenses.find((e) => e.id === 'e1');
+  assert.equal(stored.provisional, true);
+  assert.deepEqual(stored.flags, ['estimate']);
 });

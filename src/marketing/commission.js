@@ -23,6 +23,11 @@ function monthBounds(month) {
   return { start, end };
 }
 
+/** A rule whose basis ends in `_estimate` (e.g. `net_sales_estimate`) is a stand-in. */
+export function isEstimateRule(rule) {
+  return /_estimate$/.test(String(rule?.basis || ''));
+}
+
 /** Pure: the rows a month's rules × dollars imply. */
 export function buildCommissionRows({ month, rules, dollars, vendors = [] }) {
   const { start, end } = monthBounds(month);
@@ -30,6 +35,10 @@ export function buildCommissionRows({ month, rules, dollars, vendors = [] }) {
   for (const rule of rules) {
     if (rule.effective_from > end || (rule.effective_to && rule.effective_to < start)) continue;
     const vendor = vendors.find((v) => v.default_cost_type === 'calculated' && (rule.lp_sub_sources || []).some((s) => (v.lp_sub_sources || []).includes(s)));
+    // A rule on an *_estimate basis is a stand-in, not the real cost (the user,
+    // 2026-10-19: Canvass 15% of net until the canvasser payroll reports are
+    // uploaded). Its rows are provisional and flagged so every report marks them.
+    const estimate = isEstimateRule(rule);
     for (const sub of rule.lp_sub_sources || []) {
       for (const d of dollars) {
         if (d.lp_sub_source !== sub || !/_MKT$/.test(String(d.market || ''))) continue;
@@ -37,11 +46,11 @@ export function buildCommissionRows({ month, rules, dollars, vendors = [] }) {
         const amount = Math.round(Number(rule.rate) * net * 100) / 100;
         rows.push({
           vendor_id: vendor?.id ?? null, cost_type: 'calculated',
-          description: `${rule.label}: ${(Number(rule.rate) * 100).toFixed(rule.rate < 0.01 ? 2 : 0)}% × net $${net.toLocaleString('en-US', { minimumFractionDigits: 2 })} (${sub}, ${d.market})`,
+          description: `${rule.label}: ${(Number(rule.rate) * 100).toFixed(rule.rate < 0.01 ? 2 : 0)}% × net $${net.toLocaleString('en-US', { minimumFractionDigits: 2 })} (${sub}, ${d.market})${estimate && !/estimate/i.test(rule.label || '') ? ' (estimate until canvasser payroll)' : ''}`,
           amount, period_start: start, period_end: end,
           lp_sub_sources: [sub], eligible_markets: [d.market],
-          status: 'approved', provisional: false,
-          source_system: COMMISSION_SOURCE, source_ref: `${rule.id}|${d.market}|${sub}|${start}`, flags: [],
+          status: 'approved', provisional: estimate,
+          source_system: COMMISSION_SOURCE, source_ref: `${rule.id}|${d.market}|${sub}|${start}`, flags: estimate ? ['estimate'] : [],
           approved_by: 'system (commission rule)',
         });
       }
@@ -71,7 +80,7 @@ export async function recomputeCalculatedCosts(month, deps = {}) {
     return { ...out, skipped: 'no_snapshot' };
   }
   const wanted = buildCommissionRows({ month: start, rules: rules || [], dollars: dollars || [], vendors: vendors || [] });
-  const { data: existing, error: eErr } = await supabase.from('marketing_expenses').select('id, source_ref, amount, status')
+  const { data: existing, error: eErr } = await supabase.from('marketing_expenses').select('id, source_ref, amount, status, provisional, flags')
     .eq('source_system', COMMISSION_SOURCE).eq('period_start', start);
   if (eErr) throw new Error(`marketing_expenses read failed: ${eErr.message}`);
   const byRef = Object.fromEntries((existing || []).map((r) => [r.source_ref, r]));
@@ -84,8 +93,10 @@ export async function recomputeCalculatedCosts(month, deps = {}) {
       if (error) throw new Error(`commission insert failed: ${error.message}`);
       out.inserted++; touched.push(data.id); continue;
     }
-    if (cents(cur.amount) === cents(row.amount) && cur.status === 'approved') { out.unchanged++; continue; }
-    const { error } = await supabase.from('marketing_expenses').update({ amount: row.amount, description: row.description, status: 'approved', updated_at: new Date().toISOString() }).eq('id', cur.id);
+    const sameMark = Boolean(cur.provisional) === row.provisional
+      && JSON.stringify(cur.flags || []) === JSON.stringify(row.flags);
+    if (cents(cur.amount) === cents(row.amount) && cur.status === 'approved' && sameMark) { out.unchanged++; continue; }
+    const { error } = await supabase.from('marketing_expenses').update({ amount: row.amount, description: row.description, status: 'approved', provisional: row.provisional, flags: row.flags, updated_at: new Date().toISOString() }).eq('id', cur.id);
     if (error) throw new Error(`commission update failed: ${error.message}`);
     out.updated++; touched.push(cur.id);
   }
