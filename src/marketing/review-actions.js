@@ -417,8 +417,8 @@ async function disputedByExpense(ids, supabase) {
  *           drops by it ('dispute_credited'); a part credit leaves the rest Disputed
  *   reopen  undo a confirm or a credit: amounts back to what was billed, flags off,
  *           re-split, so the gap is Disputed again
- * `reset: true` (the dashboard) first undoes any earlier settlement, so a credit can
- * be changed and a confirmed charge credited instead. The Slack buttons keep their
+ * `reset: true` (the dashboard's credit) first undoes any earlier settlement, so a
+ * credit can be changed and a confirmed charge credited instead. The Slack buttons keep their
  * one-way meaning (reset false): they act on what is Disputed right now.
  * `analysis.credits` holds the credits in force (each with the line's billed `was`),
  * `analysis.dispute_log` every action. Returns { ok, action, amount, message, ... }.
@@ -521,7 +521,9 @@ export async function settleDispute({ documentId, action, amount = null, who, us
 export async function settleDisputeFromDashboard({ documentId, action, amount = null, by = null }, deps = {}) {
   if (!['accept', 'credit', 'reopen'].includes(action)) return { ok: false, action: 'bad_action', message: 'Unknown action.' };
   const name = String(by || 'dashboard').replace(/@.*$/, '');
-  const out = await settleDispute({ documentId, action, amount, who: `${by || 'dashboard'} (dashboard)`, userName: name, reset: true }, deps);
+  // A credit is a change: undo the earlier confirm / credit and start from what was
+  // billed. A confirm keeps a credit already received and confirms what is left.
+  const out = await settleDispute({ documentId, action, amount, who: `${by || 'dashboard'} (dashboard)`, userName: name, reset: action === 'credit' }, deps);
   if (!out.ok) return out;
   const r = await updateCard(out.fresh, out.card, deps);
   if (!r?.ok && r?.error !== 'no_card') console.warn(`${LOG} card for ${documentId} not redrawn after the dashboard ${action}: ${r?.error}`);

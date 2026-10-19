@@ -596,3 +596,17 @@ test('dashboard: confirm, then reopen puts the gap back on Disputed; a credit af
   assert.equal(supabase.tables.marketing_expenses[0].amount, 3000);
   assert.deepEqual(supabase.tables.marketing_invoice_documents[0].analysis.credits, []);
 });
+
+test('dashboard: confirming what is left after a part credit keeps the credit', async () => {
+  const supabase = disputedDb();
+  const sink = dashSink();
+  const deps = resplitDeps(supabase, sink);
+  await settleDisputeFromDashboard({ documentId: DOC_ID, action: 'credit', amount: 500 }, deps);
+  const r = await settleDisputeFromDashboard({ documentId: DOC_ID, action: 'accept' }, deps);
+  assert.equal(r.amount, 250);
+  const e = supabase.tables.marketing_expenses[0];
+  assert.equal(e.amount, 2500, 'the $500 credit stays');
+  assert.deepEqual(e.flags.sort(), ['dispute_accepted', 'dispute_credited']);
+  assert.equal(disputedNow(supabase), 0);
+  assert.equal(supabase.tables.marketing_invoice_documents[0].analysis.credits.length, 1);
+});
