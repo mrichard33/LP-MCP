@@ -364,7 +364,7 @@ export const FAIL_CLOSED = Object.freeze({ mode: 'enforce' });
  * Answer the refusal for an ingest route. Returns true when it did (the
  * caller returns). 503 when the secret is unset under enforce, else 401.
  * `opts.mode: 'enforce'` makes one family of routes fail closed whatever
- * AUTH_ENFORCE_MODE says (the marketing-cost routes, 2026-10-19: invoices
+ * AUTH_ENFORCE_MODE says (the marketing-invoice decision routes, 2026-10-19: invoices
  * carry bank details and /decide approves them).
  */
 export function refuseIngest(req, res, where, opts = {}) {

@@ -13,7 +13,7 @@
  */
 import express from 'express';
 import { runJob } from '../job-runner.js';
-import { todayET, hourET, refuseIngest, FAIL_CLOSED } from './lp-report-common.js';
+import { todayET, hourET, refuseIngest } from './lp-report-common.js';
 import { syncFeedExpenses } from '../marketing/leadgurus-feed.js';
 import { recomputeCalculatedCosts } from '../marketing/commission.js';
 import { reallocateMonth } from '../marketing/allocation-io.js';
@@ -96,7 +96,7 @@ export function registerMarketingCostRoutes(app, deps = {}) {
   const json = express.json({ limit: '1mb' });
   app.post('/n8n/admin/marketing-cost/nightly', json, async (req, res) => {
     try {
-      if (refuseIngest(req, res, 'marketing-cost', FAIL_CLOSED)) return;
+      if (refuseIngest(req, res, 'marketing-cost')) return;
       const months = Array.isArray(req.body?.months) ? req.body.months : null;
       const out = await runJob(JOB_ID, () => runMarketingCostNightly({ months, skipFeed: req.body?.skipFeed === true, feedDays: Number(req.body?.feedDays) || 7 }, deps));
       res.json({ status: out.status, summary: out.summary, ...(out.value || {}), error: out.error || undefined });

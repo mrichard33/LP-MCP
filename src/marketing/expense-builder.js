@@ -30,6 +30,7 @@ export const FLAGS = Object.freeze({
   // a person already approved, always goes to a person: neither is auto-approved.
   VENDOR_FROM_MODEL: 'vendor_matched_by_ai_only',
   REPLACES_APPROVED: 'replaces_approved_invoice',
+  UNVERIFIED_SOURCE: 'arrived_without_intake_password',
 });
 
 const cents = (n) => Math.round(Number(n || 0) * 100);
@@ -231,6 +232,7 @@ export const FLAG_LABELS = Object.freeze({
   [FLAGS.UNKNOWN_SUB_SOURCE]: 'A line names a sub-source this vendor does not have',
   [FLAGS.VENDOR_FROM_MODEL]: 'Vendor was picked by the AI only (the sender and name did not match one on file)',
   [FLAGS.REPLACES_APPROVED]: 'Replaces an invoice with the same number that was already approved',
+  [FLAGS.UNVERIFIED_SOURCE]: 'Arrived before the intake password was set, so it could not be checked (never auto-approved)',
   // 2026-10-19: set at ingest from the allocation preview, not by computeFlags.
   billed_more_than_found: 'Billed for more than we can find: approving accepts it as received and parks the difference as Disputed',
   // 2026-10-19: set at ingest by commission-invoice.js.

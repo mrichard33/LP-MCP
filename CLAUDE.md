@@ -988,9 +988,13 @@ Brad's XLSX (`marketing-cost-report`, formulas never typed values) read `v_marke
   `invoice_bank_redact_run` (counts only, dry run default; `scripts/redact-saved-bank-numbers.js`). Original PDFs and
   photos are KEPT but open for dashboard admins only (the user's ruling); the Slack card carries no file link. A new
   place that stores invoice text runs the same function.
-- **The marketing-cost routes fail closed (security review, 2026-10-19).** `LP_REPORT_INGEST_SECRET` was unset, so
-  `/n8n/admin/marketing-invoice*` (ingest, `/decide`, `/dispute`), `/marketing-expenses/*` and the report routes took
-  anyone's request. They pass `FAIL_CLOSED` to `refuseIngest` (503 with no secret, whatever `AUTH_ENFORCE_MODE` says).
+- **The invoice decision routes fail closed; the email intake does not (security review, 2026-10-19).**
+  `LP_REPORT_INGEST_SECRET` was unset, so `/n8n/admin/marketing-invoices/*` (`/decide`, `/dispute`, `/refresh-cards`)
+  and `/marketing-expenses/*` took anyone's request. They pass `FAIL_CLOSED` to `refuseIngest` (503 with no secret,
+  whatever `AUTH_ENFORCE_MODE` says); the Slack buttons are signed separately and keep working. The ingest route and the
+  scheduled report / nightly triggers keep the old posture (open while unset, enforced once set) so emailed invoices and
+  the OPS.MCRP report never stop on a deploy (the user: "people can still email the invoice"); an invoice that arrives
+  with no secret configured is flagged `arrived_without_intake_password` and never auto-approved.
   A vendor only the model matched (`vendor_matched_by_ai_only`) or a revision of an approved invoice number
   (`replaces_approved_invoice`) is never auto-approved, and a commission invoice looks up at most 20 lines in LP live.
 - **An invoice file never reaches a paid model (D9).** n8n `I.MCIN` POSTs the attachment to

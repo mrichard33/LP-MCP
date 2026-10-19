@@ -22,8 +22,10 @@
  *   8. answer { success, duplicate, skipped, document_id, expense_ids, flags, auto_approved }
  *
  * Auth: the same x-ghl-signature / LP_REPORT_INGEST_SECRET check the LP
- * report ingest uses (src/jobs/lp-report-common.js), but FAIL-CLOSED: an unset
- * secret refuses every request (2026-10-19). A failure after the document row exists
+ * report ingest uses (src/jobs/lp-report-common.js). The decision routes fail
+ * closed (2026-10-19); the ingest itself stays open while the secret is unset
+ * so emailed invoices keep arriving (the user: "people can still email the
+ * invoice"), but nothing that arrives unverified is ever auto-approved. A failure after the document row exists
  * leaves status='failed' + error, so nothing is silently lost. Only a
  * TRANSIENT failure (the extract service, storage, a connection) is a 5xx
  * that makes n8n retry; a deterministic one (a refused insert, a rejected
@@ -32,7 +34,7 @@
  */
 import express from 'express';
 import supabaseDefault from '../supabase.js';
-import { sha256Hex, refuseIngest, assertIngestAuthConfigured, FAIL_CLOSED, todayET } from './lp-report-common.js';
+import { sha256Hex, refuseIngest, assertIngestAuthConfigured, FAIL_CLOSED, INGEST_SECRET, todayET } from './lp-report-common.js';
 import { parseCsv } from './lp-report-csv-common.js';
 import { postToSlack } from '../slack.js';
 import { extractDocument, documentKind, cleanEmailBody } from '../marketing/extract-client.js';
@@ -412,6 +414,9 @@ export async function ingestInvoice(body, deps = {}) {
   // The model only ever saw redacted text; its descriptions are redacted again
   // anyway, so nothing it echoes back can land in the ledger (2026-10-19).
   const rows = filled.rows.map((r) => (typeof r.description === 'string' ? { ...r, description: redactBankText(r.description) } : r));
+  // While LP_REPORT_INGEST_SECRET is unset the route cannot tell n8n from anyone
+  // else, so an unverified arrival always goes to a person (2026-10-19).
+  if ((deps.ingestVerified ?? Boolean(INGEST_SECRET)) !== true) flags.push(FLAGS.UNVERIFIED_SOURCE);
   const autoApproved = autoApproveDecision({ flags, priorApprovals: history.priorApprovals, minPrior: cfg.minPrior });
 
   // The analysis is saved BEFORE the rows are written, so a refused insert
@@ -559,14 +564,19 @@ export function registerMarketingInvoiceRoutes(app, deps = {}) {
   assertIngestAuthConfigured('marketing-invoice-ingest', { failClosed: true });
   // Fail closed (security review, 2026-10-19): with LP_REPORT_INGEST_SECRET unset
   // these routes used to take anyone's request, and /decide approves invoices.
-  // Unset now answers 503 to everyone, n8n and the dashboard included.
+  // Unset now answers 503 to everyone on every route but the ingest itself.
   const refuse = (req, res) => refuseIngest(req, res, 'marketing-invoice-ingest', FAIL_CLOSED);
+  // The ingest is how an emailed invoice arrives (n8n I.MCIN): it keeps the old
+  // posture (open while the secret is unset, enforced once it is set), so email
+  // never stops on a deploy (the user, 2026-10-19). Unverified arrivals are
+  // flagged and never auto-approved.
+  const refuseIntake = (req, res) => refuseIngest(req, res, 'marketing-invoice-ingest');
   const json = express.json({ limit: INVOICE_BODY_LIMIT });
   const text = express.text({ type: ['text/csv', 'text/plain'], limit: '10mb' });
 
   app.post(INVOICE_INGEST_PATH, json, async (req, res) => {
     try {
-      if (refuse(req, res)) return;
+      if (refuseIntake(req, res)) return;
       const out = await (deps.ingest || ingestInvoice)(req.body, deps);
       const { httpStatus, ...body } = out;
       res.status(httpStatus || 200).json(body);

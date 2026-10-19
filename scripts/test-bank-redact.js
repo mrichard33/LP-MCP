@@ -4,7 +4,7 @@
  * Account numbers. Or any routing or account numbers."), and the invoice
  * security fixes that came with it: a vendor only the model found, or a
  * revision of an approved invoice, is never auto-approved; the card carries no
- * file link; the marketing routes fail closed.
+ * file link; the marketing decision routes fail closed while email intake keeps working.
  *
  * The numbers below are public test values (021000021 is a published ABA
  * example), never a real remit-to account.
@@ -133,6 +133,7 @@ function deps(supabase, { ai = AI, posts = [], modelInputs = [], guard } = {}) {
     },
     postToSlack: async (text, channel, opts) => { posts.push({ text, channel, opts }); return { ok: true, ts: `${posts.length}.0`, channel }; },
     matchSales: async ({ rows }) => ({ rows, matches: [], flags: [] }),
+    ingestVerified: true,
   };
 }
 
@@ -214,17 +215,29 @@ test('a revision of an already-approved invoice number needs a person', async ()
   assert.equal(supabase.tables.marketing_expenses.find((x) => x.id === 'p3').status, 'approved', 'the original is untouched');
 });
 
-test('the marketing routes fail closed: no secret → 503 for n8n, the dashboard and anyone else', async () => {
+test('no secret: the decision routes answer 503, but emailed invoices still arrive (the user, 2026-10-19)', async () => {
   const app = express();
-  registerMarketingInvoiceRoutes(app, { ingest: async () => { throw new Error('must not run'); } });
+  let ingested = 0;
+  registerMarketingInvoiceRoutes(app, { ingest: async () => { ingested++; return { httpStatus: 200, success: true }; } });
   const server = app.listen(0);
   try {
     const { port } = server.address();
-    for (const [method, path] of [['POST', '/n8n/admin/marketing-invoice-ingest'], ['POST', '/n8n/admin/marketing-invoices/decide'], ['POST', '/n8n/admin/marketing-invoices/dispute'], ['GET', '/n8n/admin/marketing-expenses/status']]) {
+    for (const [method, path] of [['POST', '/n8n/admin/marketing-invoices/decide'], ['POST', '/n8n/admin/marketing-invoices/dispute'], ['POST', '/n8n/admin/marketing-invoices/refresh-cards'], ['GET', '/n8n/admin/marketing-expenses/status']]) {
       const res = await fetch(`http://127.0.0.1:${port}${path}`, { method, headers: { 'content-type': 'application/json', 'x-ghl-signature': 'anything' }, body: method === 'POST' ? '{}' : undefined });
       assert.equal(res.status, 503, path);
     }
+    const res = await fetch(`http://127.0.0.1:${port}/n8n/admin/marketing-invoice-ingest`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+    assert.equal(res.status, 200, 'the email intake keeps working');
+    assert.equal(ingested, 1);
   } finally { server.close(); }
+});
+
+test('an invoice that arrived unverified (no intake password yet) is never auto-approved', async () => {
+  const supabase = db({ marketing_expenses: priorApprovals() });
+  const r = await ingestInvoice(payload(LIGHTFIRE), { ...deps(supabase), ingestVerified: false, allocate: async () => {}, refreshEstimates: async () => [] });
+  assert.equal(r.success, true);
+  assert.equal(r.auto_approved, false);
+  assert.ok(r.flags.includes('arrived_without_intake_password'), JSON.stringify(r.flags));
 });
 
 test('with the secret set, a fail-closed route lets the right header in and refuses the wrong one', () => {
