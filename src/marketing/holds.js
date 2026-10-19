@@ -19,7 +19,7 @@
 import supabaseDefault from '../supabase.js';
 import { FEED_SOURCE, FEED_GAP_TERRITORY } from './leadgurus-feed.js';
 import { prospectLabel } from '../format-helpers.js';
-import { splitsByCanvassConfirms } from './allocation.js';
+import { callCenterLineKind } from './allocation.js';
 
 const LOG = '[MktHold]';
 const digits = (s) => String(s || '').replace(/\D/g, '');
@@ -118,8 +118,8 @@ export async function recommendHolds(month, deps = {}) {
     // lead of the month is not a held lead to place by hand; the nightly re-run
     // splits it. Its allocation already says so.
     if (e && !(e.eligible_markets || []).length) continue;
-    // 2026-10-19: so is a call center's canvass line waiting on its confirmations.
-    if (e && splitsByCanvassConfirms(e)) continue;
+    // 2026-10-19: so is a call center's demo / sales / canvass line waiting on its leads.
+    if (e && callCenterLineKind(e)) continue;
     let rec;
     if (e?.source_system === FEED_SOURCE && e.period_start) {
       try {

@@ -161,20 +161,32 @@ export function allocateSlice({ amount, markets, issuedByMarket = {} }) {
 }
 
 /**
- * A call center's canvass charge goes to the offices whose canvass it worked
- * (the user, 2026-10-19: "The cost for canvassing should be assigned to the
- * office that had the cost directly associated for it"). LightFire bills $15
- * per canvass appointment its agents confirm ("61 Canvas"), next to its aged
- * demos and its 1.5% of sales, which stay split evenly. So a call-center line
- * whose description names canvass is split by the call center's canvass
- * confirmations per office in the line's own period (the caller's lookup),
- * still under "Call Center". Read from the description, not stored on the row,
- * so an Edit back to "call center cost" keeps it.
+ * A call center's charges go to the offices whose leads they were for (the
+ * user, 2026-10-19: "if there were 10 demos at $250 each set in Fort
+ * Lauderdale, then those should all be assigned to Fort Lauderdale. The same
+ * applies to the 1.5% sales"). LightFire bills three kinds of line, each read
+ * from its description and weighted by the leads payroll pays it for
+ * (src/payroll/rules.js), in the line's own days:
+ *   canvass  "61 Canvas", $15 a confirmation → canvass appointments its agents confirmed
+ *   demo     "Demos - AGED", $250 a demo     → aged-lead demos its agents set
+ *   sales    "Sales 1.5%"                    → net dollars RTP'd on new leads its agents set
+ * Still "Call Center" cost. A call-center line naming none of them (a fee)
+ * stays split evenly. Read from the description, not stored on the row, so an
+ * Edit back to "call center cost" keeps it.
  */
-const CANVASS_LINE_RX = /\bcanvas{1,2}\b/i;
-export function splitsByCanvassConfirms(expense) {
-  return costCategory(expense) === 'call_center' && CANVASS_LINE_RX.test(String(expense?.description || ''));
+const CALL_CENTER_LINE_KINDS = Object.freeze([
+  ['canvass', /\bcanvas{1,2}\b/i],
+  ['demo', /\bdemos?\b/i],
+  ['sales', /\bsales\b/i],
+]);
+export function callCenterLineKind(expense) {
+  if (costCategory(expense) !== 'call_center') return null;
+  const d = String(expense?.description || '');
+  return CALL_CENTER_LINE_KINDS.find(([, rx]) => rx.test(d))?.[0] || null;
 }
+export const CALL_CENTER_KIND_LABEL = Object.freeze({
+  canvass: 'canvass appointments it confirmed', demo: 'aged-lead demos it set', sales: 'sales on leads it set',
+});
 
 /** True when the expense names no markets, so its source's issued leads pick them. */
 export function splitsBySource(expense) {
@@ -183,7 +195,7 @@ export function splitsBySource(expense) {
 
 /** The plain-English split for a line, for the card and the Edit form. */
 export function splitKind(expense) {
-  if (splitsByCanvassConfirms(expense)) return 'canvass_confirms';
+  if (callCenterLineKind(expense)) return 'call_center_work';
   if (splitsEvenly(expense)) return 'even';
   if (splitsBySource(expense)) return 'by_source';
   return 'markets';
@@ -201,11 +213,11 @@ export function marketsFromIssued(issuedByMarket = {}) {
  * to insert into marketing_expense_allocations (without the expense_id).
  */
 export function allocateExpense(expense, issuedLookup = () => ({})) {
-  // A call center's canvass line: `issuedLookup` returns canvass confirmations
-  // per office for the slice's own days, and those pick the offices.
-  const byConfirms = splitsByCanvassConfirms(expense);
-  const even = !byConfirms && splitsEvenly(expense);
-  const bySource = !even && !byConfirms && splitsBySource(expense);
+  // A call center's demo / sales / canvass line: `issuedLookup` returns that
+  // work per office for the slice's own days, and those pick the offices.
+  const workKind = callCenterLineKind(expense);
+  const even = !workKind && splitsEvenly(expense);
+  const bySource = !even && !workKind && splitsBySource(expense);
   const subs = (expense.lp_sub_sources || []).filter(Boolean);
   if (bySource && !subs.length) throw new Error('allocation: no markets and no sub-source to split by');
   const subSource = subs.length === 1 ? subs[0] : (even && !subs.length ? COMPANY_WIDE : null);
@@ -215,11 +227,11 @@ export function allocateExpense(expense, issuedLookup = () => ({})) {
     const issuedByMarket = even ? {} : (issuedLookup(slice.month, slice.start, slice.end) || {});
     let markets = even ? [...OFFICE_MARKETS] : (expense.eligible_markets || []);
     let note = null;
-    if (byConfirms) {
+    if (workKind) {
       markets = marketsFromIssued(issuedByMarket);
       if (!markets.length) {
         markets = [HOLD_MARKET];
-        note = `no call-center canvass confirmations ${slice.start}..${slice.end} yet; split by office once they sync (re-run nightly)`;
+        note = `no call-center ${CALL_CENTER_KIND_LABEL[workKind]} found ${slice.start}..${slice.end} yet; split by office once they sync (re-run nightly)`;
       }
     } else if (bySource) {
       markets = marketsFromIssued(issuedByMarket);
