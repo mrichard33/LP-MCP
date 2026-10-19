@@ -3,7 +3,8 @@
  *
  * Every 15 minutes, all hours: a returning lead (GHL contact added 15+ days
  * before the chat, newest LP lead 15+ days old or none) who talked to the
- * website chatbot gets a NEW LP lead with source Reece ChatBot (830 / 5574).
+ * chatbot, on the website chat or by text, gets a NEW LP lead with source
+ * Reece ChatBot (830 / 5574).
  * The rules and the WHY live in src/chat-return-lead.js (the user, 2026-10-19).
  *
  * THE WRITES, in order, each one read back before the next (the inbound-call
@@ -176,7 +177,7 @@ export async function runChatReturnLeadSweep({ env = process.env, nowMs = Date.n
 
     out.would_send += 1;
     if (mode !== 'live') {
-      console.log(`[ChatReturn] shadow: would send ${r.ghl_contact_id} to LP as Reece ChatBot (${decision.reason})`);
+      console.log(`[ChatReturn] shadow: would send ${r.ghl_contact_id} to LP as Reece ChatBot (${r.channels || 'chat'}; ${decision.reason})`);
       continue;
     }
 
@@ -185,7 +186,7 @@ export async function runChatReturnLeadSweep({ env = process.env, nowMs = Date.n
       if (!stamped?.ok) throw new Error(`LP source not set: ${stamped?.detail || 'no answer'}`);
       const cleared = await d.clearLeadId(r.ghl_contact_id, match.lead);
       if (!cleared?.ok) throw new Error(`old LP Lead ID not cleared: ${cleared?.detail || 'no answer'}`);
-      const res = await d.enroll({ contactId: r.ghl_contact_id, calendarName: 'Website chat · returning lead', notify: false });
+      const res = await d.enroll({ contactId: r.ghl_contact_id, calendarName: `Chatbot (${r.channels || 'chat'}) · returning lead`, notify: false });
       if (!res?.success) throw new Error(res?.error || 'enroll returned no success');
       const markErrs = [
         res.action === 'create_lead_already_enrolled' ? null : await writeMark(d.supabase, sentKey(r.ghl_contact_id), r.ghl_contact_id, nowMs),
@@ -193,7 +194,7 @@ export async function runChatReturnLeadSweep({ env = process.env, nowMs = Date.n
       ].filter(Boolean);
       for (const e of markErrs) errors.push(`mark ${r.ghl_contact_id}: ${e}`);
       sentRows.push(r.ghl_contact_id);
-      console.log(`[ChatReturn] ✅ ${r.ghl_contact_id} → LP as Reece ChatBot (${decision.reason}; ${res.action})`);
+      console.log(`[ChatReturn] ✅ ${r.ghl_contact_id} → LP as Reece ChatBot (${r.channels || 'chat'}; ${decision.reason}; ${res.action})`);
     } catch (err) {
       failed.push(r.ghl_contact_id);
       errors.push(`${r.ghl_contact_id}: ${err.message}`);

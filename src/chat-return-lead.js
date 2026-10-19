@@ -1,5 +1,5 @@
 /**
- * Returning lead talks to the website chatbot → a new LP lead — src/chat-return-lead.js
+ * Returning lead talks to the chatbot → a new LP lead — src/chat-return-lead.js
  *
  * Pure and dependency-free. src/jobs/chat-return-lead-sweep.js owns the reads
  * (our live-chat turns, the HL contacts mirror, lp_leads, LP live, the marks)
@@ -17,7 +17,11 @@
  *   any new lead would have been credited to that channel instead of the bot.
  *
  * THE RULE
- *   A website chat (a LIVE_CHAT_FAST_LANE turn) on a GHL contact that was added
+ *   A conversation with the chatbot, on the website chat (a LIVE_CHAT_FAST_LANE
+ *   turn) or by text (the SMS bot answering the lead's own text; added the same
+ *   day, the user: "I want the chatbot replies and the text message replies to
+ *   the bot to be counted. If the lead is older than 15 days, the chatbot
+ *   receives credit."), on a GHL contact that was added
  *   more than RETURN_DAYS (15) before the chat, whose newest LP lead is also
  *   more than 15 days old (or who has none), gets a new LP lead with source
  *   Reece ChatBot (830 / 5574). The 15-day test is the inbound-call capture's
@@ -80,18 +84,38 @@ export function chatReturnMode(env = process.env) {
   return ['off', 'shadow', 'live'].includes(m) ? m : 'live';
 }
 
-/** LP DB: every contact with a live-chat turn in the window whose chat has gone quiet. */
+// The SMS bot's answers to the lead's OWN text (the user, 2026-10-19: "I want the
+// chatbot replies and the text message replies to the bot to be counted"). A
+// send counts when it answers an inbound: its event is the analysis of the
+// lead's text, or the reply-SLA watchdog's unanswered text. Not a DQ reply (the
+// lead was just disqualified), not the post-booking email ask, and not a
+// bot-started send (a hold return, a check-in), whose event is something else.
+export const SMS_REPLY_EVENTS = Object.freeze(['ai.analysis_completed', 'agentic.reply_unanswered']);
+export const SMS_NOT_COUNTED_RULES = Object.freeze(['POST_BOOKING_EMAIL_ASK']);
+
+/**
+ * LP DB: every contact the chatbot answered in the window (website chat, or a
+ * text the lead sent the bot) whose conversation has gone quiet. `channels` is
+ * 'livechat', 'sms' or both, for the log.
+ */
 export function buildChatEngagementsSql({ sinceIso, quietBeforeIso }) {
   return `
-    SELECT target_id AS ghl_contact_id, min(created_at) AS chat_started_at, max(created_at) AS last_chat_at
-      FROM agent_actions
-     WHERE rule_applied = '${LIVE_CHAT_RULE}'
-       AND action_type = 'send_message'
-       AND target_id IS NOT NULL
-       AND created_at >= '${esc(sinceIso)}'
-     GROUP BY target_id
-    HAVING max(created_at) < '${esc(quietBeforeIso)}'
-     ORDER BY max(created_at) ASC
+    SELECT a.target_id AS ghl_contact_id, min(a.created_at) AS chat_started_at, max(a.created_at) AS last_chat_at,
+           string_agg(DISTINCT CASE WHEN a.rule_applied = '${LIVE_CHAT_RULE}' THEN 'livechat' ELSE 'sms' END, ',') AS channels
+      FROM agent_actions a
+      LEFT JOIN system_events e ON e.id = a.event_id
+     WHERE a.action_type = 'send_message'
+       AND a.status = 'completed'
+       AND a.target_id IS NOT NULL
+       AND a.created_at >= '${esc(sinceIso)}'
+       AND (a.rule_applied = '${LIVE_CHAT_RULE}'
+            OR (a.action_payload->>'channel' = 'sms'
+                AND e.event_type IN (${list(SMS_REPLY_EVENTS)})
+                AND a.rule_applied NOT LIKE 'DQ\\_%'
+                AND a.rule_applied NOT IN (${list(SMS_NOT_COUNTED_RULES)})))
+     GROUP BY a.target_id
+    HAVING max(a.created_at) < '${esc(quietBeforeIso)}'
+     ORDER BY max(a.created_at) ASC
   `;
 }
 
@@ -173,6 +197,7 @@ export function selectChats(engagements, { contacts, sentRecently, seen, recentC
     check.push({
       ghl_contact_id: id, phone10, first_name: c.first_name ?? null, last_name: c.last_name ?? null,
       date_added: c.date_added ?? null, chat_started_at: e.chat_started_at ?? null, last_chat_at: e.last_chat_at ?? null,
+      channels: e.channels ?? null,
     });
   }
   return { check, skipped };
@@ -198,7 +223,7 @@ export function decideChat({ match, statusBlock }) {
 export function clearNote(oldLeadId, matchedLead) {
   const when = matchedLead?.at ? String(matchedLead.at).slice(0, 10) : 'an earlier date';
   const prospect = matchedLead?.prospect_id ? `Prospect ${matchedLead.prospect_id}` : 'their earlier prospect';
-  return `Returning lead: chatted on the website more than ${RETURN_DAYS} days after their last LP lead `
+  return `Returning lead: talked to the chatbot (website chat or text) more than ${RETURN_DAYS} days after their last LP lead `
     + `(${oldLeadId}, ${prospect}, ${when}). LP Lead ID cleared and LP Source set to Reece ChatBot (830 / 5574) `
     + 'so a new LP lead is created for this chat (chat return sweep).';
 }

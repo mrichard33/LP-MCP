@@ -280,7 +280,7 @@ export const MODES = Object.freeze([
   }),
   m('CHAT_RETURN_LP_MODE', 'intake', 'enum', OSL, 'live', OSL_S, {
     since: '2026-10-19', decider: 'the user', evidence: job('chat-return-lead'), goLive: LIVE_BY_DEFAULT,
-    note: 'A lead added 15+ days ago whose newest LP lead is 15+ days old (or none) and who talks to the website chatbot gets a new LP lead with source Reece ChatBot (830 / 5574). Default live by the user\'s ruling of 2026-10-19.',
+    note: 'A lead added 15+ days ago whose newest LP lead is 15+ days old (or none) and who talks to the chatbot (website chat, or a text answered by the SMS bot) gets a new LP lead with source Reece ChatBot (830 / 5574). Default live by the user\'s ruling of 2026-10-19.',
   }),
   m('INTAKE_JOURNAL_MODE', 'intake', 'enum', OSL, 'shadow', OSL_S, {
     since: '2026-09-11',

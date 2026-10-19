@@ -10,14 +10,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  chatReturnMode, selectChats, leadStatusBlock, decideChat, seenKey, sentKey, clearNote, CHATBOT_LP_SOURCE,
+  chatReturnMode, buildChatEngagementsSql, selectChats, leadStatusBlock, decideChat, seenKey, sentKey, clearNote, CHATBOT_LP_SOURCE,
 } from '../src/chat-return-lead.js';
 import { runChatReturnLeadSweep } from '../src/jobs/chat-return-lead-sweep.js';
 
 const NOW = Date.parse('2026-10-19T18:00:00Z');
 const DAY = 86_400_000;
 const iso = (ms) => new Date(ms).toISOString();
-const chat = (id, { agoMin = 90 } = {}) => ({ ghl_contact_id: id, chat_started_at: iso(NOW - (agoMin + 10) * 60_000), last_chat_at: iso(NOW - agoMin * 60_000) });
+const chat = (id, { agoMin = 90, channels = 'sms' } = {}) => ({ ghl_contact_id: id, chat_started_at: iso(NOW - (agoMin + 10) * 60_000), last_chat_at: iso(NOW - agoMin * 60_000), channels });
 const contact = (id, { addedDaysAgo = 60, phone = `352555${String(id).replace(/\D/g, '').padStart(4, '0')}`, tags = [] } = {}) =>
   ({ ghl_contact_id: id, first_name: 'Pat', last_name: 'Lee', phone, date_added: iso(NOW - addedDaysAgo * DAY), tags });
 
@@ -30,6 +30,16 @@ test('mode: live by default (the user\'s ruling), shadow and off on request', ()
   assert.equal(chatReturnMode({}), 'live');
   assert.equal(chatReturnMode({ CHAT_RETURN_LP_MODE: 'shadow' }), 'shadow');
   assert.equal(chatReturnMode({ CHAT_RETURN_LP_MODE: 'off' }), 'off');
+});
+
+test('engagement read counts website chats AND the SMS bot\'s answers to the lead\'s own text (2026-10-19)', () => {
+  const sql = buildChatEngagementsSql({ sinceIso: iso(NOW - DAY), quietBeforeIso: iso(NOW - 3_600_000) });
+  assert.match(sql, /rule_applied = 'LIVE_CHAT_FAST_LANE'/);
+  assert.match(sql, /action_payload->>'channel' = 'sms'/);
+  assert.match(sql, /event_type IN \('ai\.analysis_completed','agentic\.reply_unanswered'\)/, 'an answer to an inbound text, not a bot-started send');
+  assert.match(sql, /NOT LIKE 'DQ\\_%'/, 'a disqualification reply never counts');
+  assert.match(sql, /NOT IN \('POST_BOOKING_EMAIL_ASK'\)/);
+  assert.match(sql, /status = 'completed'/);
 });
 
 test('selectChats: only contacts added 15+ days before the chat, with a phone, no opt-out, no rehash', () => {
@@ -116,7 +126,7 @@ function stub({ chats = [chat('c1')], contacts = [contact('c1')], verdict = 'cre
       matchLead: async (p) => { calls.match.push(p); return { verdict, lead: { lead_id: '512345' }, why: 'returning' }; },
       stampSource: async (id) => { calls.stamp.push(id); return { ok: stampOk, detail: 'x' }; },
       clearLeadId: async (id) => { calls.clear.push(id); return { ok: clearOk, detail: 'x' }; },
-      enroll: async ({ contactId, notify }) => { assert.equal(notify, false); calls.enroll.push(contactId); return { success: true, action: 'enrolled_lead_creation_workflow' }; },
+      enroll: async ({ contactId, notify, calendarName }) => { assert.equal(notify, false); assert.match(calendarName, /^Chatbot \(sms\)/); calls.enroll.push(contactId); return { success: true, action: 'enrolled_lead_creation_workflow' }; },
     },
   };
 }
