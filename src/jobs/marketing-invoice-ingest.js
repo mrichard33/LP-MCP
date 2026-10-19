@@ -482,13 +482,29 @@ export async function importCsvExpenses(csvText, { approvedBy = null } = {}, dep
   return out;
 }
 
+/** The invoice route's body limit: a base64 PDF is ~1.33x the file. */
+export const INVOICE_BODY_LIMIT = '40mb';
+export const INVOICE_INGEST_PATH = '/n8n/admin/marketing-invoice-ingest';
+
+/**
+ * Mounted in src/index.js BEFORE the global express.json() (2026-10-19). The
+ * global parser's 100 kB default answered 413 "request entity too large" to
+ * every real invoice PDF (six LightFire invoices, ~390 KB each, all refused
+ * before this route's own 40 MB parser could run); only small email-body
+ * invoices had ever got through. body-parser skips a body already parsed, so
+ * the global parser leaves this path alone.
+ */
+export function invoiceBodyParser() {
+  return express.json({ limit: INVOICE_BODY_LIMIT });
+}
+
 export function registerMarketingInvoiceRoutes(app, deps = {}) {
   assertIngestAuthConfigured('marketing-invoice-ingest');
   const refuse = (req, res) => refuseIngest(req, res, 'marketing-invoice-ingest');
-  const json = express.json({ limit: '40mb' });
+  const json = express.json({ limit: INVOICE_BODY_LIMIT });
   const text = express.text({ type: ['text/csv', 'text/plain'], limit: '10mb' });
 
-  app.post('/n8n/admin/marketing-invoice-ingest', json, async (req, res) => {
+  app.post(INVOICE_INGEST_PATH, json, async (req, res) => {
     try {
       if (refuse(req, res)) return;
       const out = await (deps.ingest || ingestInvoice)(req.body, deps);

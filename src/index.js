@@ -333,7 +333,7 @@ import { startOfficePowerRankingScheduler } from './jobs/office-power-ranking.js
 import { startSaleBackstopScheduler } from './jobs/sale-announce-backstop.js';  // 2026-09-25
 import { startSaleP2BackstopScheduler } from './jobs/sale-p2-backstop.js';  // 2026-10-03 — every LP sale gets a P2 card
 // 2026-10-12 — marketing cost ledger (migration 20261012222106): invoice ingest, nightly costs, Brad-format report.
-import { registerMarketingInvoiceRoutes } from './jobs/marketing-invoice-ingest.js';
+import { registerMarketingInvoiceRoutes, invoiceBodyParser, INVOICE_INGEST_PATH } from './jobs/marketing-invoice-ingest.js';
 import { registerMarketingCostRoutes, startMarketingCostNightlyScheduler } from './jobs/marketing-cost-nightly.js';
 import { registerMarketingReportRoutes } from './jobs/marketing-cost-report.js';
 import { startStaleLeadRefreshScheduler } from './jobs/stale-lead-refresh.js';  // 2026-10-07 — re-read open leads whose appointment passed
@@ -402,6 +402,9 @@ app.use('/memory/omi', omiBodyParser());
 app.use('/webhook/slack', slackRawBodyParser());
 // 2026-10-16 — Siro signs the exact bytes too (svix); same reason, same place.
 app.use('/webhook/siro', siroRawBodyParser());
+// 2026-10-19 — an invoice PDF arrives base64 in JSON (~400 KB+); the 100 kB
+// default below answered 413 to every one of six LightFire invoices.
+app.use(INVOICE_INGEST_PATH, invoiceBodyParser());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 // Graceful drain: count in-flight requests so SIGTERM waits for them.
