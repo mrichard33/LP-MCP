@@ -496,3 +496,55 @@ export async function refreshEstimatesFor(rows, deps = {}) {
     return null;
   }
 }
+
+/** Pure: the header a decided card is redrawn with, from what the ledger holds (null = still in review). */
+export function decisionFor(ctx) {
+  const rows = ctx.rows || [];
+  const approved = rows.find((r) => r.status === 'approved');
+  if (ctx.document?.status === 'posted' && approved) {
+    return { outcome: 'approved', by: String(approved.approved_by || '').replace(/ \(.*\)$/, ''), at: String(approved.approved_at || ctx.document.updated_at || '').slice(0, 16).replace('T', ' ') };
+  }
+  if (rows.length && rows.every((r) => r.status === 'rejected')) {
+    return { outcome: 'rejected', by: '', at: String(ctx.document?.updated_at || '').slice(0, 16).replace('T', ' ') };
+  }
+  return null;
+}
+
+/**
+ * Redraw the review cards already in Slack (the user, 2026-10-19: "All of the
+ * Slack items need to be updated"). A card is a picture taken when it was
+ * posted: the six LightFire cards went up at 1:53 PM ET, the office split and
+ * the readable basis went live at 2:15 PM, and 17734 kept showing
+ * "4182700/17951276 issued" with no office. Each card is drawn again exactly as
+ * a new one would be (an open card with a fresh preview, a decided one with its
+ * real allocations and its decision) and replaces the old one in place. Posts
+ * nothing new, writes nothing to the ledger, and one card failing never stops
+ * the rest. Run it after any change to the card or to the allocation rules.
+ */
+export async function refreshReviewCards({ ids = null, since = null, dryRun = false } = {}, deps = {}) {
+  const supabase = deps.supabase || supabaseDefault;
+  let q = supabase.from('marketing_invoice_documents').select('id, status, slack_ts, created_at').not('slack_ts', 'is', null);
+  if (ids?.length) q = q.in('id', ids);
+  else q = q.gte('created_at', since || new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 10));
+  const { data: docs, error } = await q;
+  if (error) throw new Error(`documents read failed: ${error.message}`);
+  const out = { matched: (docs || []).length, refreshed: 0, failed: [], cards: [] };
+  for (const d of docs || []) {
+    try {
+      const ctx = await loadReviewContext(d.id, { supabase });
+      if (!ctx) continue;
+      const decision = decisionFor(ctx);
+      out.cards.push({ id: d.id, invoice_number: ctx.facts?.invoice_number || null, status: ctx.document.status, decided: decision?.outcome || null });
+      if (dryRun) continue;
+      const card = await renderCard(ctx, { decision }, { ...deps, supabase });
+      const r = await updateCard(ctx, card, deps);
+      if (r?.ok === false) throw new Error(r.error || 'slack_update_failed');
+      out.refreshed++;
+    } catch (err) {
+      console.warn(`${LOG} refresh ${d.id} failed: ${err.message}`);
+      out.failed.push({ id: d.id, error: err.message });
+    }
+  }
+  console.log(`${LOG} cards refreshed${dryRun ? ' (dry run)' : ''}: ${out.refreshed}/${out.matched}, ${out.failed.length} failed`);
+  return out;
+}
