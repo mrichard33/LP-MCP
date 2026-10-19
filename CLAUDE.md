@@ -56,6 +56,11 @@ a lead id; a line that is not Slack text carries `lead-id-ok: <why>`.
 (`LP_PROSPECT_URL_BASE` overrides the page). So a card prints the prospect with `prospectLabel` and never builds the
 URL itself. Only `mrkdwn` text is linked (a plain_text header or a button would print the markup), never inside an
 existing `<…>` or code, and never on GroupMe, whose send keeps the plain `normalizeSlackText`.
+**The GHL contact id is a link to its GHL contact (the user, 2026-10-19).** The same pass (`linkSlackContacts`, run by
+`slackMessageText` / `slackMessageBlocks` after the prospect link) turns "Contact ID: gxMVJgLkjFCVxTTLnn8A" (also
+"Contact:", "contact", "GHL:", "(GHL …)") into `<https://app.gohighlevel.com/v2/location/<GHL_LOCATION_ID>/contacts/detail/<id>|Contact ID: …>`.
+Only a GHL id shape is linked (20 letters/digits with a capital), never inside a link, a bare URL or code, never on
+GroupMe. A card prints the label and the id; it never builds the URL itself.
 
 **A live chat gets one Slack card per lead, and one summary per chat (Mark, 2026-10-15).** One chat
 (jhVZZUtXp3jDrBsXOZcK) posted six "LARGE JOB SIGNAL" cards in six minutes: the model's `large_job_signal` reads the
