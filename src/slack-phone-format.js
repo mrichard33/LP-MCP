@@ -14,7 +14,8 @@
 // match. Only a block's `text` strings are rewritten, never a button's
 // `value`, `action_id`, `url` or `block_id` (a handler reads those back).
 //
-// PURE. No imports (the URL base reads process.env only through lpProspectUrlBase).
+// PURE. No imports (the URL bases read process.env only through lpProspectUrlBase
+// and ghlContactUrlBase).
 
 const PHONE_SHAPE_RX = new RegExp([
   // +1 3525550188, +1 352 555 0188, +1-352-555-0188, 1-352-555-0188, 1 (352) 555-0188
@@ -74,7 +75,9 @@ export function normalizeSlackText(text) {
 // would print the markup there instead of a link.
 export const LP_PROSPECT_URL_DEFAULT = 'https://br27a.leadperfection.com/leaddetail.html?custid=';
 const PROSPECT_ID_RX = /\bProspect(?:\s+ID)?\s*[:#]?\s*(\d{4,})\b(?![-/:.]\d)/gi;
-const SLACK_KEEP_RX = /```[\s\S]*?```|`[^`\n]*`|<[^>\n]*>/g;
+// A bare URL is kept too (2026-10-19): a GHL contact URL carries the contact id,
+// and a link inside a URL would break it.
+const SLACK_KEEP_RX = /```[\s\S]*?```|`[^`\n]*`|<[^>\n]*>|https?:\/\/[^\s<>|]+/g;
 
 /** The LP page base: LP_PROSPECT_URL_BASE when it is an http(s) URL, else the br27a lead page. */
 export function lpProspectUrlBase(env = globalThis.process?.env || {}) {
@@ -88,10 +91,8 @@ export function lpProspectUrl(prospectId, base = LP_PROSPECT_URL_DEFAULT) {
   return /^\d+$/.test(id) ? `${base}${id}` : null;
 }
 
-/** Every "Prospect 463174" outside a link or code becomes <url|Prospect 463174>. Pure. */
-export function linkSlackProspects(text, base = LP_PROSPECT_URL_DEFAULT) {
-  if (typeof text !== 'string' || !text) return text;
-  const link = (part) => part.replace(PROSPECT_ID_RX, (m, id) => `<${base}${id}|${m}>`);
+/** `link` applied to every part of the text outside a link, a URL or code. Pure. */
+function outsideKept(text, link) {
   let out = '';
   let last = 0;
   for (const keep of text.matchAll(SLACK_KEEP_RX)) {
@@ -101,9 +102,53 @@ export function linkSlackProspects(text, base = LP_PROSPECT_URL_DEFAULT) {
   return out + link(text.slice(last));
 }
 
-/** Slack message text: phones, lead ids, then the prospect link. */
-export function slackMessageText(text, base = lpProspectUrlBase()) {
-  return linkSlackProspects(normalizeSlackText(text), base);
+/** Every "Prospect 463174" outside a link or code becomes <url|Prospect 463174>. Pure. */
+export function linkSlackProspects(text, base = LP_PROSPECT_URL_DEFAULT) {
+  if (typeof text !== 'string' || !text) return text;
+  return outsideKept(text, (part) => part.replace(PROSPECT_ID_RX, (m, id) => `<${base}${id}|${m}>`));
+}
+
+// ─── The GHL contact id is a link to its GHL contact (the user, 2026-10-19) ──
+// "Link the contact ID (the Go High Level contact ID) to the corresponding Go
+// High Level contact. This should apply to every notification." Same idea as
+// the prospect link: a card prints the id after a label ("Contact ID: …",
+// "Contact: …", "GHL: …", "(GHL …)", "contact …") and the send point turns it
+// into <url|Contact ID: …>, so no card builder carries the URL. Only a GHL id
+// SHAPE is linked: 20 letters and digits with at least one capital and one
+// lower-case letter or digit (an LP lead id, a word, a "sim-" contact, "abc"
+// never match). Slack only, mrkdwn only, never inside <…>, a URL or code.
+export const GHL_LOCATION_ID_DEFAULT = 'SsBG7j5KQAIP1SFP2Sca';
+const GHL_CONTACT_ID_RX = /\b((?:GHL\s+)?contact(?:\s+id)?|GHL(?:\s+id)?)(\s*[:#]?\s*)([A-Za-z0-9]{20})(?![A-Za-z0-9])/gi;
+const isGhlIdShape = (id) => /[A-Z]/.test(id) && /[a-z0-9]/.test(id) && !/^\d+$/.test(id);
+
+/** The GHL contact page base for a location: GHL_LOCATION_ID when set, else ours. */
+export function ghlContactUrlBase(env = globalThis.process?.env || {}) {
+  const loc = String(env.GHL_LOCATION_ID || '').trim();
+  return `https://app.gohighlevel.com/v2/location/${/^[A-Za-z0-9]+$/.test(loc) ? loc : GHL_LOCATION_ID_DEFAULT}/contacts/detail/`;
+}
+export const GHL_CONTACT_URL_DEFAULT = ghlContactUrlBase({});
+
+/** The GHL contact page, or null without an id. Pure. */
+export function ghlContactUrl(contactId, base = GHL_CONTACT_URL_DEFAULT) {
+  const id = String(contactId ?? '').trim();
+  return /^[A-Za-z0-9]+$/.test(id) ? `${base}${id}` : null;
+}
+
+/** Every "Contact ID: <ghl id>" outside a link or code becomes <url|Contact ID: …>. Pure. */
+export function linkSlackContacts(text, base = GHL_CONTACT_URL_DEFAULT) {
+  if (typeof text !== 'string' || !text) return text;
+  return outsideKept(text, (part) => part.replace(GHL_CONTACT_ID_RX, (m, _label, _sep, id) => (
+    isGhlIdShape(id) ? `<${base}${id}|${m}>` : m)));
+}
+
+/** Both links: the LP prospect, then the GHL contact. Pure. */
+export function linkSlackIds(text, base = LP_PROSPECT_URL_DEFAULT, contactBase = GHL_CONTACT_URL_DEFAULT) {
+  return linkSlackContacts(linkSlackProspects(text, base), contactBase);
+}
+
+/** Slack message text: phones, lead ids, then the prospect and contact links. */
+export function slackMessageText(text, base = lpProspectUrlBase(), contactBase = ghlContactUrlBase()) {
+  return linkSlackIds(normalizeSlackText(text), base, contactBase);
 }
 
 /**
@@ -111,7 +156,7 @@ export function slackMessageText(text, base = lpProspectUrlBase()) {
  * `mrkdwn` text object gets the prospect link (a plain_text header or button
  * would print the markup). Pass `{ link: false }` for the plain pass. Pure.
  */
-export function normalizeSlackBlocks(blocks, { link = false, base = LP_PROSPECT_URL_DEFAULT } = {}) {
+export function normalizeSlackBlocks(blocks, { link = false, base = LP_PROSPECT_URL_DEFAULT, contactBase = GHL_CONTACT_URL_DEFAULT } = {}) {
   if (!Array.isArray(blocks)) return blocks;
   const walk = (node) => {
     if (Array.isArray(node)) return node.map(walk);
@@ -121,7 +166,7 @@ export function normalizeSlackBlocks(blocks, { link = false, base = LP_PROSPECT_
     for (const [k, v] of Object.entries(node)) {
       if (k === 'text' && typeof v === 'string') {
         const clean = normalizeSlackText(v);
-        out[k] = mrkdwn ? linkSlackProspects(clean, base) : clean;
+        out[k] = mrkdwn ? linkSlackIds(clean, base, contactBase) : clean;
       } else {
         out[k] = walk(v);
       }
@@ -131,7 +176,7 @@ export function normalizeSlackBlocks(blocks, { link = false, base = LP_PROSPECT_
   return walk(blocks);
 }
 
-/** Slack Block Kit: the plain pass plus the prospect link in mrkdwn text. */
-export function slackMessageBlocks(blocks, base = lpProspectUrlBase()) {
-  return normalizeSlackBlocks(blocks, { link: true, base });
+/** Slack Block Kit: the plain pass plus the prospect and contact links in mrkdwn text. */
+export function slackMessageBlocks(blocks, base = lpProspectUrlBase(), contactBase = ghlContactUrlBase()) {
+  return normalizeSlackBlocks(blocks, { link: true, base, contactBase });
 }
