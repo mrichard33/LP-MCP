@@ -95,6 +95,8 @@ import { emitEvent } from '../event-emitter.js';
 import { resolveContactDncNumbers } from '../actions/resolvers.js';
 import { ghlFetch } from '../actions/helpers.js';
 import supabase from '../supabase.js';
+// The review path and this op read the same switch (2026-10-18).
+import { AUTO_DNC_LIFT_RULE_KEY, AUTO_DNC_LIFT_APPROVER, dncLiftApprovalMode } from '../consent/dnc-auto-lift.js';
 
 /* ---------------------------------------------------------------------- *
  * Guardrail 1 — master flag (ships dark).
@@ -2083,6 +2085,13 @@ async function _readReentryEventForAction(action) {
  *      protects the paired GHL step from a request built on a stale read. An
  *      unreadable consent row with clear_sms:true is also a refusal.
  *
+ * 2026-10-18 AMENDMENT (Mark: DNC lifts run without a click, canvassing
+ * excepted). Guards 1-4 have ONE alternative, for rule AUTO_DNC_LIFT only:
+ * DNC_LIFT_APPROVAL_MODE must be `auto` when the row runs, approved_by (row and
+ * payload) must be exactly AUTO_DNC_LIFT_APPROVER, and evidence.request_id
+ * (the dnc_lift_requests row) replaces slack_ts. Guards 5 and 6 are unchanged.
+ * Any other rule key is still refused.
+ *
  * Gated by FIVE9_WRITES_ENABLED like every Five9 write (withFive9WriteGate).
  */
 export async function executeRemoveNumbersFromDncApproved(action, deps = {}) {
@@ -2094,23 +2103,41 @@ export async function executeRemoveNumbersFromDncApproved(action, deps = {}) {
   const payload = action?.action_payload || {};
 
   const ruleApplied = action?.rule_applied || null;
-  if (ruleApplied !== APPROVED_DNC_LIFT_RULE_KEY) {
-    throw refuse(`runs only for ${APPROVED_DNC_LIFT_RULE_KEY}, not "${ruleApplied || 'none'}". ` +
+  // 2026-10-18 (Mark): a lift may also run with no Slack click, but ONLY as
+  // AUTO_DNC_LIFT and only while DNC_LIFT_APPROVAL_MODE is still `auto` when
+  // the row executes (flipping it back to manual stops a queued lift). That
+  // row's approver is the one system id, never a Slack user; every other rule
+  // key is refused exactly as before.
+  const autoLift = ruleApplied === AUTO_DNC_LIFT_RULE_KEY;
+  if (!autoLift && ruleApplied !== APPROVED_DNC_LIFT_RULE_KEY) {
+    throw refuse(`runs only for ${APPROVED_DNC_LIFT_RULE_KEY} or ${AUTO_DNC_LIFT_RULE_KEY}, not "${ruleApplied || 'none'}". ` +
       'Five9 DNC removal has no general path — see the tombstone in src/five9/admin-writes.js.');
+  }
+  if (autoLift && dncLiftApprovalMode(deps.env || process.env) !== 'auto') {
+    throw refuse(`${AUTO_DNC_LIFT_RULE_KEY} runs only while DNC_LIFT_APPROVAL_MODE=auto (it is manual now)`);
   }
   const contactId = action.target_id;
   if (!contactId) throw refuse('action.target_id (GHL contact id) is required');
 
   if (action.requires_approval !== true) throw refuse('the row was not queued requires_approval=true');
   if (!action.approved_at) throw refuse('the row has no approved_at — it was never approved via approve_action');
-  if (!isSlackUserId(action.approved_by)) {
+  if (autoLift) {
+    if (action.approved_by !== AUTO_DNC_LIFT_APPROVER) {
+      throw refuse(`approved_by "${action.approved_by || ''}" is not ${AUTO_DNC_LIFT_APPROVER} — an automatic lift is approved by the system only`);
+    }
+  } else if (!isSlackUserId(action.approved_by)) {
     throw refuse(`approved_by "${action.approved_by || ''}" is not a Slack user id — only a person approving in Slack may lift Five9 DNC (auto and GroupMe approvals are refused)`);
   }
   if (String(payload.approved_by || '') !== String(action.approved_by)) {
     throw refuse(`action_payload.approved_by (${payload.approved_by || 'missing'}) does not match the approver on the row (${action.approved_by})`);
   }
-  const slackTs = payload.evidence?.slack_ts;
-  if (!slackTs || !String(slackTs).trim()) throw refuse('evidence.slack_ts is required');
+  if (autoLift) {
+    const requestId = payload.evidence?.request_id;
+    if (!requestId || !String(requestId).trim()) throw refuse('evidence.request_id is required');
+  } else {
+    const slackTs = payload.evidence?.slack_ts;
+    if (!slackTs || !String(slackTs).trim()) throw refuse('evidence.slack_ts is required');
+  }
   if (payload.numbers_from_contact !== true) throw refuse('numbers_from_contact:true is required');
   if (payload.numbers != null || payload.removals != null) {
     throw refuse('a free-form number list is not accepted — numbers are resolved from the contact');
@@ -2227,6 +2254,11 @@ async function _getConsentForApprovedLift(contactId) {
  * requires a Slack-user approval through approve_action plus the card's
  * slack_ts, and resolves numbers from the contact only. Still no general
  * path: five9_remove_numbers_from_dnc stays deleted and forbidden.
+ *
+ * 2026-10-18 AMENDMENT. The same op also runs for AUTO_DNC_LIFT (Mark's
+ * ruling: lifts no longer wait for a click, canvassing leads excepted), only
+ * while DNC_LIFT_APPROVAL_MODE=auto and only with the system approver. Any
+ * other rule key is still refused.
  */
 
 /* ---------------------------------------------------------------------- *

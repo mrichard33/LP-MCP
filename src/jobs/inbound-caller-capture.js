@@ -29,8 +29,22 @@
 //   5+ days of shadow output, and needs sql/133 applied first.
 //
 // NEVER, IN ANY MODE
-//   Touches a DNC caller, sends a message, or books an appointment. The only
-//   GHL writes are a new contact (no_ghl_contact) and the 8e30ff37 enrollment.
+//   Sends a message or books an appointment. The only GHL writes are a new
+//   contact (no_ghl_contact) and the 8e30ff37 enrollment. A DNC caller is left
+//   alone unless INBOUND_CAPTURE_DNC_LIFT is on (below).
+//
+// DNC CALLERS — INBOUND_CAPTURE_DNC_LIFT = off (default) | on (Mark, 2026-10-18)
+//   With INBOUND_CAPTURE_MODE=live and the flag on, a caller labelled `dnc`
+//   who would otherwise be captured (a sales call to a mapped number, not a
+//   customer, not in LP) is not skipped. The pass queues ONE
+//   request_dnc_lift_review (trigger inbound_call) and parks the row as
+//   dnc_pending_lift. That review follows DNC_LIFT_APPROVAL_MODE: it lifts on
+//   its own, or a canvassing caller gets the Slack card. Each later pass looks
+//   again (pendingLiftStep) and runs captureCaller only once the lift is done;
+//   captureCaller's fresh Five9 + GHL read is what proves it, so a lift that
+//   is pending, refused or half-finished never creates a lead. A caller who
+//   said "do not call" on THIS call is never lifted: their call is not a lead
+//   disposition, and the review refuses a Five9 DNC disposition after the call.
 //
 // IDEMPOTENCY
 //   inbound_capture_daily is UNIQUE (caller_phone, call_at). A row is CLAIMED
@@ -79,7 +93,7 @@ import { hourET, todayET } from './lp-report-common.js';
 import { alertDigestEnabled } from '../alert-posted.js';
 import {
   classifyCaller, isCandidate, normalizeCallerPhone, summarizeCallers, formatDailySummary, isAppointmentSet,
-  notALeadReason, readCustomField,
+  notALeadReason, readCustomField, pendingLiftStep, LIFT_REQUEUE_AFTER_MS,
 } from '../inbound-caller-classify.js';
 
 export const JOB_ID = 'inbound-caller-capture';
@@ -91,7 +105,11 @@ export const MODES = Object.freeze(['off', 'shadow', 'approval', 'live']);
 // A row in one of these states has been acted on (or is being). Never again.
 export const ACTIONED = Object.freeze([
   'in_progress', 'approval_queued', 'enrolled', 'contact_created_enrolled', 'already_enrolled',
+  'dnc_pending_lift', 'dnc_kept_blocked',
 ]);
+export const PENDING_LIFT = 'dnc_pending_lift';
+export const LIFT_RULE_APPLIED = 'INBOUND_CAPTURE_DNC_LIFT';
+const PENDING_LIFT_BATCH = 50;
 export const CONTACT_TAG = 'inbound-capture';
 const FIRST_HOUR_ET = 8;
 const LAST_HOUR_ET = 20;       // inclusive: the 20:00 pass catches the evening
@@ -115,9 +133,15 @@ const positiveInt = (raw, fallback) => {
   return Number.isFinite(n) && n > 0 ? n : fallback;
 };
 
+/** INBOUND_CAPTURE_DNC_LIFT: exactly `on`, and only in live mode. Pure. */
+export function dncLiftEnabled(env = process.env) {
+  return captureMode(env) === 'live' && String(env.INBOUND_CAPTURE_DNC_LIFT ?? '').trim().toLowerCase() === 'on';
+}
+
 export function captureConfig(env = process.env) {
   return {
     mode: captureMode(env),
+    dncLift: dncLiftEnabled(env),
     lookbackHours: positiveInt(env.INBOUND_CAPTURE_LOOKBACK_HOURS, 48),
     // Blank → the ops channel the other monitors report to (#ops-alerts).
     slackChannel: String(env.INBOUND_CAPTURE_SLACK_CHANNEL ?? '').trim() || opsChannelId(),
@@ -300,7 +324,7 @@ export async function readCalledNumbers({ runSQL, rows }) {
  *   { verdict: 'ok' | 'insufficient_evidence', rows, summary, errors }
  * Each row: the attribution columns + label, why, ghl_contact_id.
  */
-export async function classifyCallers(viewRows, { deps = {} } = {}) {
+export async function classifyCallers(viewRows, { deps = {}, dncLift = false, ignoreDncTags = [] } = {}) {
   const d = resolveDeps(deps);
   const errors = [];
   const insufficient = (stage, err) => {
@@ -347,7 +371,9 @@ export async function classifyCallers(viewRows, { deps = {} } = {}) {
   let consecutive = 0;
   let ghlErrors = 0;
   for (const p of phones) {
-    if (five9Dnc.has(p) || notALeadByPhone.get(p) || noSourceByPhone.get(p)) continue;
+    // With the DNC lift on, a Five9-DNC caller is looked up too: the lift
+    // needs their contact, and only a would-be candidate is lifted.
+    if ((five9Dnc.has(p) && !dncLift) || notALeadByPhone.get(p) || noSourceByPhone.get(p)) continue;
     if (consecutive >= MAX_CONSECUTIVE_GHL_ERRORS) {
       ghlByPhone.set(p, { status: 'error', error: 'skipped after repeated GHL failures' });
       ghlErrors += 1;
@@ -375,7 +401,13 @@ export async function classifyCallers(viewRows, { deps = {} } = {}) {
     const ghl = ghlByPhone.get(r.caller_phone) || { status: skipped ? 'none' : 'error' };
     const cid = ghl.status === 'found' ? String(ghl.contact.id) : null;
     const lpJob = !cid ? null : lpJobContacts ? { status: lpJobContacts.has(cid) ? 'yes' : 'no' } : { status: 'error' };
-    const { label, why } = classifyCaller({ caller: r.caller_phone }, { five9Dnc, lpPhones, ghl, lpJob, notALead, noSource });
+    const ctx = { five9Dnc, lpPhones, ghl, lpJob, notALead, noSource, ignoreDncTags };
+    const { label, why } = classifyCaller({ caller: r.caller_phone }, ctx);
+    if (dncLift && label === 'dnc') {
+      // What they would be once lifted: lift only a would-be candidate.
+      const lifted = classifyCaller({ caller: r.caller_phone }, { ...ctx, ignoreDnc: true });
+      return { ...r, label, why, ghl_contact_id: cid, label_if_lifted: lifted.label, dnc_liftable: isCandidate(lifted.label) };
+    }
     return { ...r, label, why, ghl_contact_id: cid };
   });
 
@@ -383,7 +415,7 @@ export async function classifyCallers(viewRows, { deps = {} } = {}) {
 }
 
 /** Read the view (optionally the last `hours`) and classify it. Never throws. */
-export async function measureCallers({ nowMs = Date.now(), hours = null, deps = {} } = {}) {
+export async function measureCallers({ nowMs = Date.now(), hours = null, deps = {}, dncLift = false } = {}) {
   const d = resolveDeps(deps);
   let viewRows;
   try {
@@ -402,7 +434,7 @@ export async function measureCallers({ nowMs = Date.now(), hours = null, deps = 
     const r = toRow(v);
     return { ...v, called_number: called.get(`${r.caller_phone}|${r.call_at}`) || null };
   });
-  return classifyCallers(withCalled, { deps });
+  return classifyCallers(withCalled, { deps, dncLift });
 }
 
 /* --- acting on one caller ------------------------------------------------ */
@@ -427,12 +459,12 @@ export function contactSource(campaign) {
  * action_taken: enrolled | contact_created_enrolled | already_enrolled |
  *               not_a_candidate | failed
  */
-export async function captureCaller(input, { deps = {} } = {}) {
+export async function captureCaller(input, { deps = {}, ignoreDncTags = [] } = {}) {
   const d = resolveDeps(deps);
   const row = toRow({ ...input, caller: input.caller_phone ?? input.caller });
   if (!row.caller_phone) return { ok: false, action_taken: 'failed', label: null, detail: 'no usable phone' };
 
-  const recheck = await classifyCallers([{ ...input, caller: row.caller_phone, call_at: row.call_at || new Date().toISOString() }], { deps });
+  const recheck = await classifyCallers([{ ...input, caller: row.caller_phone, call_at: row.call_at || new Date().toISOString() }], { deps, ignoreDncTags });
   if (recheck.verdict !== 'ok') {
     return { ok: false, action_taken: 'failed', label: null, detail: recheck.errors.join('; ') };
   }
@@ -613,7 +645,7 @@ export async function runInboundCapture({ env = process.env, nowMs = Date.now(),
   if (cfg.mode === 'off') return { skipped: true, reason: 'INBOUND_CAPTURE_MODE=off' };
   const d = resolveDeps(deps);
 
-  const m = await measureCallers({ nowMs, hours: cfg.lookbackHours, deps });
+  const m = await measureCallers({ nowMs, hours: cfg.lookbackHours, deps, dncLift: cfg.dncLift });
   if (m.verdict === 'insufficient_evidence') {
     d.log.warn(`[InboundCapture] insufficient_evidence — ${m.errors.join('; ')}`);
     return { checked: false, readFailed: true, verdict: m.verdict, reason: m.errors.join('; '), mode: cfg.mode };
@@ -643,11 +675,20 @@ export async function runInboundCapture({ env = process.env, nowMs = Date.now(),
   const plannedPhones = new Set();
   const toStore = [];
   const toAct = [];
+  const toLift = [];
   for (const r of m.rows) {
     const prior = done.get(rowKey(r.caller_phone, r.call_at));
     if (prior && ACTIONED.includes(prior.action_taken)) continue; // never overwrite an actioned row
     let action = 'none';
-    if (isCandidate(r.label)) {
+    if (cfg.dncLift && r.label === 'dnc' && r.dnc_liftable) {
+      if (actionedPhones.has(r.caller_phone) || plannedPhones.has(r.caller_phone)) {
+        action = 'skipped_duplicate';
+      } else {
+        action = 'pending';
+        plannedPhones.add(r.caller_phone);
+        toLift.push(r);
+      }
+    } else if (isCandidate(r.label)) {
       if (actionedPhones.has(r.caller_phone) || plannedPhones.has(r.caller_phone)) {
         action = 'skipped_duplicate';
       } else if (cfg.mode === 'shadow') {
@@ -731,14 +772,207 @@ export async function runInboundCapture({ env = process.env, nowMs = Date.now(),
     }
   }
 
+  // ── DNC callers: queue the lift, then capture once it finished ──
+  if (cfg.dncLift) {
+    Object.assign(tally, { lift_queued: 0, lift_waiting: 0, lift_kept_blocked: 0 });
+    for (const r of toLift) {
+      let claimed = false;
+      try { claimed = await claimRow(d.db, r); } catch (err) { errors.push(err.message); }
+      if (!claimed) { tally.lost_claim += 1; continue; }
+      const res = await queueCallerLift(r, { d, nowMs });
+      if (res.ok) tally.lift_queued += 1;
+      else if (res.action_taken === 'not_a_candidate') tally.not_candidate += 1;
+      else { tally.failed += 1; errors.push(`lift ${r.caller_phone}: ${res.detail}`); }
+    }
+    // Rows parked by THIS pass have nothing to look at yet.
+    const justQueued = new Set(toLift.map((r) => rowKey(r.caller_phone, r.call_at)));
+    let pending = [];
+    try {
+      pending = (await readPendingLifts(d.db)).filter((r) => !justQueued.has(rowKey(r.caller_phone, r.call_at)));
+    } catch (err) {
+      errors.push(err.message);
+    }
+    for (const row of pending) {
+      const res = await advancePendingLift(row, { d, deps, nowMs }).catch((err) => ({ outcome: 'failed', detail: err.message }));
+      if (res.outcome === 'captured') tally.created += 1;
+      else if (res.outcome === 'already') tally.already += 1;
+      else if (res.outcome === 'kept_blocked') tally.lift_kept_blocked += 1;
+      else if (res.outcome === 'requeued') tally.lift_queued += 1;
+      else if (res.outcome === 'not_candidate') tally.not_candidate += 1;
+      else if (res.outcome === 'failed') { tally.failed += 1; errors.push(`lift ${row.caller_phone}: ${res.detail}`); }
+      else if (res.outcome !== 'lost_claim') tally.lift_waiting += 1;
+    }
+  }
+
   const s = m.summary;
   const line = `callers=${s.callers} candidates=${s.candidates} dnc=${s.by_label.dnc} not_lead=${s.by_label.not_a_lead} in_lp=${s.by_label.already_in_lp}`
     + ` customer=${s.by_label.existing_customer} unverified=${s.by_label.unverified} stored=${stored}`
-    + ` queued=${tally.queued} created=${tally.created} already=${tally.already} failed=${tally.failed}`;
+    + ` queued=${tally.queued} created=${tally.created} already=${tally.already} failed=${tally.failed}`
+    + (cfg.dncLift ? ` dnc_lift_queued=${tally.lift_queued} dnc_lift_waiting=${tally.lift_waiting} dnc_kept_blocked=${tally.lift_kept_blocked}` : '');
   d.log.log(`[InboundCapture] ${cfg.mode} ${cfg.lookbackHours}h — ${line}`);
 
   const hardFailure = tally.failed > 0 || errors.some((e) => / (claim|update|write): /.test(e));
   return { ok: !hardFailure, mode: cfg.mode, summary: line, stored, ...tally, ...(hardFailure ? { errors } : { notes: errors }) };
+}
+
+/* --- DNC callers: lift first, then capture (2026-10-18) ----------------- */
+
+/** The request_dnc_lift_review row for one caller. Pure. */
+export function buildLiftReviewAction(row, contactId, { runAt }) {
+  const src = captureSourceFor({ calledNumber: row.called_number, campaign: row.campaign });
+  return {
+    action_type: 'request_dnc_lift_review',
+    target_system: 'lp',
+    target_entity: 'contact',
+    target_id: contactId,
+    action_payload: {
+      trigger: 'inbound_call',
+      caller_phone: row.caller_phone,
+      call_at: row.call_at,
+      campaign: row.campaign,
+      team: row.team,
+      agent_name: row.agent_name,
+      disposition: row.disposition,
+      minutes: row.minutes,
+      called_number: row.called_number ?? null,
+      // The card's source line (n8n prints lead_source / vendor as-is).
+      lead_source: contactSource(row.campaign),
+      vendor: src ? src.subSource : null,
+      queued_at: new Date(runAt).toISOString(),
+    },
+    rule_applied: LIFT_RULE_APPLIED,
+    reasoning: `A caller on DNC (${phoneDisplay(row.caller_phone)}) talked ${row.minutes ?? '?'} min on "${row.campaign || 'unknown line'}" `
+      + `(${row.disposition || 'no disposition'}) and has no LP lead. Lifting the DNC first; the LP lead is created once the lift finishes.`,
+    status: 'pending',
+    requires_approval: false,
+    priority: 20,
+  };
+}
+
+/**
+ * Queue the lift for one claimed row and park it as dnc_pending_lift.
+ * Creates the GHL contact first when there is none (the lift is per contact).
+ */
+async function queueCallerLift(r, { d, nowMs }) {
+  let sideEffect = false;
+  try {
+    let contactId = r.ghl_contact_id;
+    if (!contactId) {
+      if (r.label_if_lifted !== 'no_ghl_contact') throw new Error(`no contact id for a ${r.label_if_lifted} caller`);
+      const res = await resolveOrCreateContact(
+        { phone: r.caller_phone, source: contactSource(r.campaign), tags: [CONTACT_TAG] },
+        { create: true, deps: { ...GHL_RESOLVE_DEPS, ghlFetch: d.ghlFetch }, log: d.log },
+      );
+      if (res.outcome === 'found') {
+        // Someone made the contact between our check and our create; its tags
+        // were never read, so the next pass labels it.
+        await finishRow(d.db, r, { action_taken: 'not_a_candidate', ghl_contact_id: res.contactId });
+        return { ok: false, action_taken: 'not_a_candidate', detail: 'a GHL contact appeared mid-capture' };
+      }
+      if (res.outcome !== 'created' || !res.contactId) throw new Error(`contact create returned ${res.outcome}`);
+      contactId = res.contactId;
+      sideEffect = true;
+    }
+    // One open review per contact: reuse one already queued.
+    const open = await d.db.from('agent_actions').select('id')
+      .eq('action_type', 'request_dnc_lift_review').eq('target_id', contactId).in('status', ['pending', 'executing']);
+    let actionId = (open?.data || [])[0]?.id || null;
+    if (!actionId) {
+      const { data, error } = await d.db.from('agent_actions')
+        .insert(buildLiftReviewAction(r, contactId, { runAt: nowMs })).select('id').single();
+      if (error || !data?.id) throw new Error(`agent_actions insert: ${error?.message || 'no id returned'}`);
+      actionId = data.id;
+    }
+    sideEffect = true;
+    await finishRow(d.db, r, { action_taken: PENDING_LIFT, agent_action_id: actionId, ghl_contact_id: contactId });
+    d.log.log(`[InboundCapture] DNC caller ${phoneDisplay(r.caller_phone)} → lift review queued (action ${actionId}); lead waits for the lift`);
+    return { ok: true, action_taken: PENDING_LIFT, ghl_contact_id: contactId };
+  } catch (err) {
+    // Nothing outside the table yet: release the claim for the next pass.
+    if (!sideEffect) await finishRow(d.db, r, { action_taken: 'failed' }).catch(() => {});
+    return { ok: false, action_taken: 'failed', detail: err.message };
+  }
+}
+
+async function readPendingLifts(db) {
+  const { data, error } = await db.from(TABLE)
+    .select('caller_phone, call_at, agent_action_id, ghl_contact_id')
+    .eq('action_taken', PENDING_LIFT)
+    .limit(PENDING_LIFT_BATCH);
+  if (error) throw new Error(`${TABLE} pending lifts read: ${error.message}`);
+  return data || [];
+}
+
+async function readOne(db, table, col, value, cols) {
+  if (value == null) return null;
+  const { data, error } = await db.from(table).select(cols).eq(col, value);
+  if (error) throw new Error(`${table} read: ${error.message}`);
+  return (Array.isArray(data) ? data : [data])[0] || null;
+}
+
+/**
+ * One caller waiting on a lift. Claims the row (dnc_pending_lift → in_progress)
+ * so two passes never act on it, then: wait, give up (kept blocked), re-queue
+ * the review, or try the capture. A capture that still reads DNC goes back to
+ * waiting — only a finished lift creates the lead.
+ */
+async function advancePendingLift(row, { d, deps, nowMs }) {
+  const { data: claimed, error: claimErr } = await d.db.from(TABLE)
+    .update({ action_taken: 'in_progress' })
+    .eq('caller_phone', row.caller_phone).eq('call_at', row.call_at).eq('action_taken', PENDING_LIFT)
+    .select('id');
+  if (claimErr) throw new Error(`${TABLE} claim: ${claimErr.message}`);
+  if (!Array.isArray(claimed) || claimed.length !== 1) return { outcome: 'lost_claim' };
+  const park = (patch = {}) => finishRow(d.db, row, { action_taken: PENDING_LIFT, ...patch });
+
+  try {
+    const action = await readOne(d.db, 'agent_actions', 'id', row.agent_action_id, 'id, status, execution_result, action_payload, created_at');
+    const requestId = action?.execution_result?.request_id || null;
+    const request = requestId ? await readOne(d.db, 'dnc_lift_requests', 'request_id', requestId, 'request_id, status, batch_result') : null;
+    const step = pendingLiftStep({ action, request });
+    const payload = action?.action_payload || null;
+    const oldAction = !action || nowMs - Date.parse(action.created_at || 0) > LIFT_REQUEUE_AFTER_MS;
+
+    const requeue = async () => {
+      if (!payload?.caller_phone || !row.ghl_contact_id) return { outcome: 'failed', detail: 'no payload to re-queue the lift from' };
+      const { data, error } = await d.db.from('agent_actions')
+        .insert(buildLiftReviewAction(payload, row.ghl_contact_id, { runAt: nowMs })).select('id').single();
+      if (error || !data?.id) throw new Error(`agent_actions insert: ${error?.message || 'no id returned'}`);
+      await park({ agent_action_id: data.id });
+      return { outcome: 'requeued' };
+    };
+
+    if (step === 'wait') { await park(); return { outcome: 'waiting' }; }
+    if (step === 'kept_blocked') { await finishRow(d.db, row, { action_taken: 'dnc_kept_blocked' }); return { outcome: 'kept_blocked' }; }
+    if (step === 'requeue') return requeue();
+
+    // try_capture: captureCaller re-reads Five9 and GHL. A finished lift with
+    // a texted STOP leaves dnc-sms on purpose (texts stay off, calls are back).
+    if (!payload?.caller_phone) return { outcome: 'failed', detail: 'the lift action carries no caller payload' };
+    const carrierStop = request?.batch_result?.sms_carrier_stop === true;
+    const res = await captureCaller(payload, { deps, ignoreDncTags: request?.status === 'approved' && carrierStop ? ['dnc-sms'] : [] });
+    if (res.action_taken === 'not_a_candidate' && res.label === 'dnc') {
+      if (oldAction && (!request || !['awaiting_decision', 'processing'].includes(request.status))) return requeue();
+      await park();
+      return { outcome: 'waiting', detail: res.detail };
+    }
+    await finishRow(d.db, row, {
+      action_taken: res.action_taken, label: res.label || 'dnc', ghl_contact_id: res.ghl_contact_id || row.ghl_contact_id,
+    });
+    if (res.action_taken === 'enrolled' || res.action_taken === 'contact_created_enrolled') {
+      d.log.log(`[InboundCapture] DNC caller ${phoneDisplay(row.caller_phone)} lifted → LP lead enrolled`);
+      return { outcome: 'captured' };
+    }
+    if (res.action_taken === 'already_enrolled') return { outcome: 'already' };
+    if (res.action_taken === 'not_a_candidate') return { outcome: 'not_candidate' };
+    return { outcome: 'failed', detail: res.detail };
+  } catch (err) {
+    // The lift (or its review) already exists: never release to `failed`,
+    // which would queue it again. Back to waiting; a stuck in_progress row is
+    // the safe direction if even that write fails.
+    await park().catch(() => {});
+    return { outcome: 'failed', detail: err.message };
+  }
 }
 
 /* --- the daily summary -------------------------------------------------- */

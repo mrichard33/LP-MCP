@@ -250,7 +250,15 @@ export async function runDncLiftReportSweep(deps = {}) {
     if (out.posted) posted += 1;
     else if (!out.ok) errors.push(`${r.request_id}: ${out.error}`);
   }
-  return { ok: errors.length === 0, checked: due.length, posted, errors };
+  // 2026-10-18: an automatic lift (DNC_LIFT_APPROVAL_MODE=auto) that a deploy
+  // cut off before its notice is finished here too.
+  const { sweepStaleAutoLifts } = deps.sweepStaleAutoLifts
+    ? { sweepStaleAutoLifts: deps.sweepStaleAutoLifts }
+    : await import('./dnc-auto-lift-run.js');
+  const stale = await sweepStaleAutoLifts(deps).catch((err) => ({ ok: false, errors: [err.message] }));
+  if (stale.error) errors.push(`auto lifts: ${stale.error}`);
+  for (const e of stale.errors || []) errors.push(`auto lift ${e}`);
+  return { ok: errors.length === 0, checked: due.length, posted, auto_finished: stale.finished || 0, errors };
 }
 
 let timer = null;
@@ -265,7 +273,7 @@ export function startDncLiftReportScheduler() {
     running = true;
     try {
       const { value: res } = await runJob(JOB_ID, () => runDncLiftReportSweep());
-      if (res?.checked) console.log(`[DncLiftReport] sweep: checked=${res.checked} posted=${res.posted}${res.errors?.length ? ` errors: ${res.errors.slice(0, 3).join('; ')}` : ''}`);
+      if (res?.checked || res?.auto_finished) console.log(`[DncLiftReport] sweep: checked=${res.checked} posted=${res.posted} auto_finished=${res.auto_finished || 0}${res.errors?.length ? ` errors: ${res.errors.slice(0, 3).join('; ')}` : ''}`);
     } catch (err) {
       console.error(`[DncLiftReport] sweep threw: ${err.message}`);
     } finally {

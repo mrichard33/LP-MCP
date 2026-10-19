@@ -410,9 +410,9 @@ export const OP_REGISTRY = Object.freeze([
     note: 'NOT a general DNC removal — see removeNumbersFromDnc in OP_CLASSIFICATION. Welded to one rule; refuses every other rule_applied, a missing consent tag, an unreadable tag read, and a trigger event older than 15 minutes. five9_remove_numbers_from_dnc remains FORBIDDEN.',
   }),
   reg('five9_remove_numbers_from_dnc_approved', 'removeNumbersFromDnc', null, 'gated', {
-    guards: ['ruleApplied:SLACK_DNC_LIFT', 'approvedViaApproveAction', 'approvedBy:slackUserId', 'evidence.slack_ts', 'numbersFromContactOnly', 'noSmsClearOnCarrierStop', 'checkDncForNumbers'],
+    guards: ['ruleApplied:SLACK_DNC_LIFT|AUTO_DNC_LIFT', 'autoOnlyWhileDncLiftApprovalModeAuto', 'approvedViaApproveAction', 'approvedBy:slackUserId|systemAutoApprover', 'evidence.slack_ts|evidence.request_id', 'numbersFromContactOnly', 'noSmsClearOnCarrierStop', 'checkDncForNumbers'],
     readBeforeWrite: true, builder: 'buildNumbersXml',
-    note: 'NOT a general DNC removal — the human-approved Slack lift (2026-09-28). Welded to SLACK_DNC_LIFT; refuses auto/GroupMe approvals, a missing slack_ts, any free-form number list, and an SMS clear for a contact who texted STOP. five9_remove_numbers_from_dnc remains FORBIDDEN.',
+    note: 'NOT a general DNC removal — the human-approved Slack lift (2026-09-28). Welded to SLACK_DNC_LIFT; refuses auto/GroupMe approvals, a missing slack_ts, any free-form number list, and an SMS clear for a contact who texted STOP. AMENDED 2026-10-18: also AUTO_DNC_LIFT (no click; canvassing leads still go to Slack), only while DNC_LIFT_APPROVAL_MODE=auto at execution and only with the system approver. five9_remove_numbers_from_dnc remains FORBIDDEN.',
   }),
 
   /* -- user skills ------------------------------------------------------- */

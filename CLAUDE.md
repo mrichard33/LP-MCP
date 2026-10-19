@@ -753,8 +753,9 @@ transaction. `CONSENT_MODEL_MODE` is `shadow`: nothing gates a send on these tab
   calls + texts, and the lift must restore texts for them (the user's ruling). Every other lift
   restores calls, texts and email, and records `email/granted` too.
 - **Five9 DNC removal has exactly two callers**, both welded: the re-entry lift and
-  `five9_remove_numbers_from_dnc_approved` (Slack, `SLACK_DNC_LIFT`). The approved op refuses any
-  `approved_by` that is not a Slack user id, which is what keeps GroupMe and auto-escalation
+  `five9_remove_numbers_from_dnc_approved` (Slack, `SLACK_DNC_LIFT`; and since 2026-10-18 `AUTO_DNC_LIFT`, below). The
+  approved op refuses any `approved_by` that is not a Slack user id (for `AUTO_DNC_LIFT`: anything but the one system
+  approver, and only while `DNC_LIFT_APPROVAL_MODE=auto`), which is what keeps GroupMe and auto-escalation
   approvals out. Do not add a carve-out for it in `resolveRequiresApproval`.
 - **LP clears DNC with a single-space `newDncStatus`** (LP's API docs: "Passing a blank value will
   remove the existing selection and reset the status"). On 2026-09-29 LP rejected both `N` (the old
@@ -783,6 +784,17 @@ transaction. `CONSENT_MODEL_MODE` is `shadow`: nothing gates a send on these tab
   `LP_DNC_CLEAR_WORKING=true`; the thread still prints the manual LP line. A follow-up EDITS the stored reply
   (`batch_result.slack_reply_ts`), never posts a second one, and a repeat async click gets a 202 replay so n8n prints
   nothing. Five9's read-back now fails the step when a number is still on DNC (`assertDncRemoved`); it used to read ✅.
+- **DNC lifts run without a click, except canvassing leads (Mark, 2026-10-18).** `DNC_LIFT_APPROVAL_MODE` manual (default:
+  the card, unchanged) | auto. In auto, `request_dnc_lift_review` runs the SAME `buildLiftBatch({ auto: true })` (rule
+  `AUTO_DNC_LIFT`, source `auto_lift`, tag `recovery:dnc-lifted-auto`, event `consent.dnc_lifted_auto`) in the
+  background (`src/consent/dnc-auto-lift-run.js`) and posts ONE notice with no buttons to #dnc-lift-approval; a failed
+  step is in the notice and one #ops-alerts line. The card still posts, with the reason on its "Blocked by:" line, for a
+  canvassing contact (`isCanvassingContact`: canvass tags, an LP "Canvass" source, a `canvassing_intake_marks` row), a
+  check that could not be read (counts as canvassing), the new lead dispositioned DNC, or an opt-out after it arrived
+  (`decideAutoLift`, `src/consent/dnc-auto-lift.js`). The Five9 op takes the system approver only for `AUTO_DNC_LIFT` and
+  only while the mode is still auto at execution. Inbound capture: `INBOUND_CAPTURE_DNC_LIFT=on` (live only) lifts a DNC
+  caller who would be captured, parks the row `dnc_pending_lift`, and enrolls only once a fresh Five9 + GHL read says the
+  lift finished (`pendingLiftStep`).
 - **A card with no consent history shows the old Five9 block instead (2026-10-02).** `legacy_block`
   (last Five9 DNC result, last call, LP disposition) is built when `consent_events` is empty, every
   lookup best-effort. A Five9-only block is then seeded ONCE as `phone/revoked`, source

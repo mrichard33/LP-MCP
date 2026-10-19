@@ -279,7 +279,7 @@ export const MODES = Object.freeze([
   }),
   m('INBOUND_CAPTURE_MODE', 'intake', 'enum', ['off', 'shadow', 'approval', 'live'], 'shadow', { live: ['approval', 'live'], shadow: ['shadow'], off: ['off'] }, {
     since: '2026-09-27', evidence: job('inbound-caller-capture'),
-    note: 'Captures inbound callers as leads.',
+    note: 'Captures inbound callers as leads. In live, INBOUND_CAPTURE_DNC_LIFT=on (default off, 2026-10-18) lifts a DNC caller first and creates the lead once the lift finished.',
   }),
   m('MISSED_CALLER_RECOVERY_MODE', 'intake', 'enum', OSL, 'shadow', OSL_S, {
     since: '2026-09-24', evidence: job('missed-caller-recovery'),
@@ -463,6 +463,11 @@ export const MODES = Object.freeze([
   m('CAPACITY_RANKER_MODE', 'dialer', 'enum', ['shadow', 'live'], 'shadow', { live: ['live'], shadow: ['shadow'] }, {
     since: '2026-09-03',
     note: 'Ranks next-day capacity for the dialer.',
+  }),
+  m('DNC_LIFT_APPROVAL_MODE', 'dialer', 'boolean', ['manual', 'auto'], 'manual', { live: ['auto'], otherwise: 'off' }, {
+    since: '2026-10-18', evidence: { events: ['consent.dnc_lifted_auto'], table: 'dnc_lift_requests' },
+    goLive: 'Mark, 2026-10-18: set auto after the deploy is green; watch the first 3 notices in #dnc-lift-approval',
+    note: 'auto = DNC lifts run without a Slack click and post a notice; canvassing leads keep the Approve card.',
   }),
   m('DNC_REENTRY_SWEEP_MODE', 'dialer', 'enum', OSL, 'live', OSL_S, {
     since: '2026-10-01', evidence: job('dnc-reentry-sweep'), goLive: LIVE_BY_DEFAULT,

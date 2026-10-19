@@ -37,6 +37,13 @@
  *
  * Unset N8N_DNC_LIFT_REVIEW_WEBHOOK is a FAILURE, not a skip: a card that
  * silently never appears looks exactly like a quiet day (CLAUDE.md).
+ *
+ * DNC_LIFT_APPROVAL_MODE=auto (Mark, 2026-10-18): once the checks above say
+ * ask, a contact that is not canvassing and has no fresh opt-out is lifted
+ * with no card (./dnc-auto-lift-run.js: the same batch, a system actor, one
+ * notice with no buttons). Everyone else gets the card exactly as before, with
+ * the reason on its "Blocked by:" line (./dnc-auto-lift.js decideAutoLift).
+ * Manual mode (the default) reads and posts exactly what it did before.
  */
 
 import crypto from 'node:crypto';
@@ -46,6 +53,7 @@ import { getConsent, detectCarrierStop, blockingTags, isMissingSchemaError, reco
 import { normalizePhone10, contactRecordRows } from '../lead-leak-classify.js';
 import { FIVE9_DNC_DISPOSITIONS } from './dnc-reentry.js';
 import { lpLocalToUtcMs } from '../lead-speed.js';
+import { dncLiftApprovalMode, decideAutoLift, HOLD_REASON_TEXT } from './dnc-auto-lift.js';
 
 export const REVIEW_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 export const FIRST_PARTY_CONSENT_TAG = 'consent:new-submission';
@@ -265,7 +273,7 @@ export function consentBlocks(consentRead) {
  * The payload n8n turns into the Slack card. Pure — everything it needs is
  * passed in, so the card's content is unit-tested.
  */
-export function buildReviewPayload({ requestId, contactId, contact, context = {}, trigger, consentRead, carrier, reenteredAt, vendor = null, leadSource = null, blockedElsewhere = [], lpProspectId = null, legacyBlock = null, env = process.env }) {
+export function buildReviewPayload({ requestId, contactId, contact, context = {}, trigger, consentRead, carrier, reenteredAt, vendor = null, leadSource = null, blockedElsewhere = [], lpProspectId = null, legacyBlock = null, holdReason = null, env = process.env }) {
   const tags = contact?.tags || [];
   const name = [contact?.firstName, contact?.lastName].filter(Boolean).join(' ').trim()
     || contact?.contactName || contact?.name || 'Unknown';
@@ -293,7 +301,10 @@ export function buildReviewPayload({ requestId, contactId, contact, context = {}
     reentered_at: reenteredAt,
     trigger,
     vendor: vendor || null,
-    blocking_tags: [...blockingTags(tags), ...blockedElsewhere],
+    blocking_tags: [...blockingTags(tags), ...blockedElsewhere, ...(holdReason ? [HOLD_REASON_TEXT[holdReason] || `Needs a person: ${holdReason}`] : [])],
+    // 2026-10-18: why an automatic lift sent this to a person instead (the
+    // line above is what the card prints). Absent in manual mode.
+    ...(holdReason ? { auto_lift_held: holdReason } : {}),
     sms_carrier_stop: carrier.carrierStop,
     carrier_stop_basis: carrier.basis,
     sms_warning: carrier.carrierStop ? SMS_CARRIER_STOP_WARNING : null,
@@ -312,7 +323,11 @@ export async function executeRequestDncLiftReview(action, context = {}, deps = {
   const contactId = action.target_id;
   if (!contactId) throw new Error('request_dnc_lift_review requires action.target_id');
   const webhook = String(env.N8N_DNC_LIFT_REVIEW_WEBHOOK || '').trim();
-  if (!webhook) throw new Error('request_dnc_lift_review: N8N_DNC_LIFT_REVIEW_WEBHOOK is not set — no review card can be posted');
+  const webhookMissing = () => new Error('request_dnc_lift_review: N8N_DNC_LIFT_REVIEW_WEBHOOK is not set — no review card can be posted');
+  // 2026-10-18: in auto mode most lifts post no card, so the webhook is only
+  // required once this contact turns out to need one (canvassing, a guard).
+  const approvalMode = dncLiftApprovalMode(env);
+  if (!webhook && approvalMode !== 'auto') throw webhookMissing();
 
   const readContact = deps.readContact || (async (id) => (await ghlFetch('GET', `/contacts/${id}`))?.contact || null);
   const contact = await readContact(contactId);
@@ -360,8 +375,26 @@ export async function executeRequestDncLiftReview(action, context = {}, deps = {
   }
 
   const carrier = detectCarrierStop({ consent: consentRead.consent, tags: contact.tags, dndSettings: contact.dndSettings });
-  const requestId = deps.newRequestId ? deps.newRequestId() : `dnc-lift-${crypto.randomUUID()}`;
   const trigger = action.action_payload?.trigger || (context?.source === 'reentry' ? 'reentry' : 'manual_tag');
+
+  // ── lift on our own, or ask a person? (Mark, 2026-10-18) ──
+  // Manual mode reads nothing here and posts the card exactly as before. In
+  // auto mode a canvassing contact, a check we could not read, or a fresh
+  // opt-out still gets the card, with the reason on it.
+  let autoDecision = null;
+  let autoFacts = null;
+  if (approvalMode === 'auto') {
+    autoFacts = await (deps.readAutoLiftFacts || ((p) => readAutoLiftFacts(p, { db, deps })))({ action, contact, contactId, trigger, now });
+    autoDecision = decideAutoLift({ mode: approvalMode, tags: contact.tags, facts: autoFacts });
+    if (!autoDecision.auto) {
+      console.log(`[DncLiftReview] auto mode, but ${contactId} needs a person: ${autoDecision.reason}${autoFacts?.error ? ` (${autoFacts.error})` : ''}`);
+    }
+  }
+  const holdReason = autoDecision && !autoDecision.auto ? autoDecision.reason : null;
+  // An automatic lift's id comes from its action, so an executor retry of the
+  // same action finds the request it already ran instead of lifting twice.
+  const requestId = deps.newRequestId ? deps.newRequestId()
+    : autoDecision?.auto && action.id != null ? `dnc-lift-auto-${action.id}` : `dnc-lift-${crypto.randomUUID()}`;
 
   // ── LP prospect id + pre-consent history (best-effort; never blocks the card) ──
   const phone10 = normalizePhone10(contact.phone);
@@ -374,7 +407,7 @@ export async function executeRequestDncLiftReview(action, context = {}, deps = {
       : null,
     bestEffort('LP lead lookup', () => readLpLead(contactId, phone10), capMs),
   ]);
-  const lpProspectId = readCustomField(contact, LP_PROSPECT_FIELD_ID) || lpLead?.prospect_id || null;
+  const lpProspectId = readCustomField(contact, LP_PROSPECT_FIELD_ID) || lpLead?.prospect_id || autoFacts?.lpProspectId || null;
   let legacyBlock = null;
   if (noHistory) {
     const five9 = Array.isArray(five9Rows) ? pickFive9History(five9Rows) : null;
@@ -393,6 +426,7 @@ export async function executeRequestDncLiftReview(action, context = {}, deps = {
     blockedElsewhere,
     lpProspectId,
     legacyBlock,
+    holdReason,
     env,
   });
 
@@ -421,6 +455,12 @@ export async function executeRequestDncLiftReview(action, context = {}, deps = {
       console.warn(`[DncLiftReview] five9_legacy seed failed for ${contactId}: ${err.message}`);
     }
   }
+
+  if (autoDecision?.auto) {
+    const { runAutoLift } = deps.runAutoLift ? { runAutoLift: deps.runAutoLift } : await import('./dnc-auto-lift-run.js');
+    return runAutoLift({ requestId, contactId, contact, carrier, payload }, { ...deps, env, supabase: db });
+  }
+  if (!webhook) throw webhookMissing();
 
   const ins = await db.from('dnc_lift_requests').insert({
     request_id: requestId,
@@ -459,7 +499,95 @@ export async function executeRequestDncLiftReview(action, context = {}, deps = {
     request_id: requestId,
     sms_carrier_stop: carrier.carrierStop,
     blocking_tags: payload.blocking_tags,
+    ...(holdReason ? { auto_lift_held: holdReason } : {}),
   };
+}
+
+// ─── the auto-lift checks (2026-10-18) ───────────────────────────────────────
+
+export const AUTO_LIFT_FACTS_TIMEOUT_MS = 10000;
+// An inbound call's own Five9 disposition is written as the call ends, a
+// moment after the call time the capture stores: look a little earlier so a
+// "Do Not Call" on THIS call counts as a fresh opt-out.
+export const INBOUND_CALL_LOOKBACK_MS = 5 * 60 * 1000;
+
+/**
+ * What decideAutoLift needs, read live. Never throws: any failed read or a
+ * timeout is { ok: false }, which decideAutoLift sends to a person.
+ *   lpLeadSource        the newest LP lead's source + detail (and the new lead's)
+ *   hasIntakeMark       a canvassing_intake_marks row for the contact
+ *   newLeadDisposition  the lead this review is about (action_payload.lead_id,
+ *                       else the newest; none for an inbound call, which has
+ *                       no LP lead yet)
+ *   optedOutAfter       a consent opt-out or Five9 DNC disposition after that
+ *                       lead (or the call) arrived — the re-entry sweep's own
+ *                       query (buildOptedOutAfterSql), not a second copy
+ */
+export async function readAutoLiftFacts({ action, contact, contactId, trigger, now = Date.now() }, { db = supabase, deps = {} } = {}) {
+  const capMs = deps.autoLiftTimeoutMs ?? AUTO_LIFT_FACTS_TIMEOUT_MS;
+  let timer;
+  const work = (async () => {
+    const runSQL = deps.runSQL || (await import('../admin/supabase-admin.js')).runSQL;
+    const { buildOptedOutAfterSql } = await import('../jobs/dnc-reentry-sweep.js');
+    const phone10 = normalizePhone10(contact?.phone);
+    const pick = 'lp_lead_id, lp_prospect_id, lead_source, lead_source_detail, disposition_code, created_at_lp';
+    let { data: leads, error } = await db.from('lp_leads').select(pick)
+      .eq('ghl_contact_id', contactId).order('created_at_lp', { ascending: false, nullsFirst: false }).limit(20);
+    if (error) throw new Error(`lp_leads: ${error.message}`);
+    if (!(leads || []).length && phone10) {
+      ({ data: leads, error } = await db.from('lp_leads').select(pick)
+        .eq('phone', phone10).order('created_at_lp', { ascending: false, nullsFirst: false }).limit(20));
+      if (error) throw new Error(`lp_leads by phone: ${error.message}`);
+    }
+    leads = leads || [];
+    const p = action?.action_payload || {};
+    const leadId = p.lead_id != null && String(p.lead_id).trim() ? String(p.lead_id).trim() : null;
+    let newLead = null;
+    if (trigger !== 'inbound_call') {
+      newLead = leadId ? leads.find((l) => String(l.lp_lead_id) === leadId) || null : leads[0] || null;
+      if (leadId && !newLead) {
+        const one = await db.from('lp_leads').select(pick).eq('lp_lead_id', leadId).limit(1);
+        if (one.error) throw new Error(`lp_leads by id: ${one.error.message}`);
+        newLead = (one.data || [])[0] || null;
+      }
+    }
+
+    const marks = await db.from('canvassing_intake_marks').select('dedup_key').eq('ghl_contact_id', contactId).limit(1);
+    if (marks.error) throw new Error(`canvassing_intake_marks: ${marks.error.message}`);
+
+    let arrivedMs;
+    if (trigger === 'inbound_call') arrivedMs = Date.parse(p.call_at) - INBOUND_CALL_LOOKBACK_MS;
+    else if (newLead) arrivedMs = lpLocalToUtcMs(newLead.created_at_lp);
+    else arrivedMs = Date.parse(action?.created_at || '') || now;
+    if (!Number.isFinite(arrivedMs)) throw new Error('could not tell when this lead arrived');
+    const opted = await runSQL(buildOptedOutAfterSql([{
+      lp_lead_id: newLead ? String(newLead.lp_lead_id) : 'this-request',
+      ghl_contact_id: contactId,
+      phone10: phone10 || '',
+      arrived_at: new Date(arrivedMs).toISOString(),
+    }]));
+    if (!Array.isArray(opted)) throw new Error('opted-out-after read returned no row set');
+
+    const newest = leads[0] || null;
+    return {
+      ok: true,
+      lpLeadSource: [newest?.lead_source, newest?.lead_source_detail, newLead?.lead_source, newLead?.lead_source_detail].filter(Boolean),
+      hasIntakeMark: (marks.data || []).length > 0,
+      newLeadDisposition: newLead?.disposition_code || null,
+      optedOutAfter: opted.length > 0,
+      lpProspectId: newest?.lp_prospect_id ? String(newest.lp_prospect_id) : null,
+    };
+  })();
+  try {
+    return await Promise.race([
+      work,
+      new Promise((resolve) => { timer = setTimeout(() => resolve({ ok: false, error: `timed out after ${capMs}ms` }), capMs); }),
+    ]);
+  } catch (err) {
+    return { ok: false, error: err.message };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 // ─── ActiveProspect re-entry → review (2026-09-28) ───────────────────────────
