@@ -14,6 +14,10 @@
  * it reaches the model, and the system prompt says to ignore instructions in
  * it. Nothing in the document can make this code DO anything: the only
  * outputs are a ledger row and a Slack card a person decides on.
+ *
+ * Bank routing and account numbers are removed before the text gets here
+ * (src/security/bank-redact.js, the user 2026-10-19); the analyzer removes them
+ * again so no caller can hand the model one.
  */
 import { callLLMJson } from '../llm-client.js';
 import { cleanInboundForModel } from '../security/untrusted-text.js';
@@ -23,6 +27,7 @@ import { matchVendor } from './vendors.js';
 import { ANALYSIS_SCHEMA_TEXT, validateAnalysis } from './analysis-schema.js';
 import { mergeFacts } from './expense-builder.js';
 import { extractJson } from '../ci/analyze.js';
+import { redactBankText } from '../security/bank-redact.js';
 
 const LOG = '[MktAnalyze]';
 export const MAX_TEXT_CHARS = 24000;
@@ -71,7 +76,7 @@ export function buildUserMessage({ text, vendors, fromAddress, hints }) {
  */
 export async function analyzeInvoiceText({ text, fromAddress = '', vendors = [], slugNames = {}, sourceRef = null }, deps = {}) {
   const mode = deps.mode || analyzerMode(deps.env);
-  const cleaned = cleanInboundForModel(String(text || ''));
+  const cleaned = cleanInboundForModel(redactBankText(String(text || '')));
   const guard = deps.guard || guardUntrustedText;
   const g = await guard({ surface: 'invoice_text', text: cleaned.text, removedCount: cleaned.removedCount, sourceRef, awaitRemote: false }).catch(() => null);
 
@@ -96,16 +101,16 @@ export async function analyzeInvoiceText({ text, fromAddress = '', vendors = [],
           user: attempts === 1 ? user : `${user}\n\nYour previous response was rejected:\n${aiErrors.join('\n')}\nReturn corrected JSON only.`,
         });
       } catch (err) {
-        aiErrors = [`model call failed: ${err.message}`];
-        console.warn(`${LOG} attempt ${attempts}: ${err.message}`);
+        aiErrors = [redactBankText(`model call failed: ${err.message}`)];
+        console.warn(`${LOG} attempt ${attempts}: ${aiErrors[0]}`);
         break; // transport problems are not fixed by re-asking
       }
       const parsed = extractJson(res?.data ?? res?.text ?? res);
       if (!parsed) { aiErrors = ['response was not parseable JSON']; continue; }
       const v = validateAnalysis(parsed);
       if (v.valid) { ai = v.value; break; }
-      aiErrors = v.errors;
-      console.warn(`${LOG} attempt ${attempts}: ${v.errors.length} schema error(s): ${v.errors.slice(0, 4).join('; ')}`);
+      aiErrors = v.errors.map(redactBankText);
+      console.warn(`${LOG} attempt ${attempts}: ${aiErrors.length} schema error(s): ${aiErrors.slice(0, 4).join('; ')}`);
     }
     if (ai && !vendor && ai.vendor_match_id) {
       const picked = vendors.find((v) => String(v.id).toLowerCase() === ai.vendor_match_id);

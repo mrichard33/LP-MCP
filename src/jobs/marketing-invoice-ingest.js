@@ -22,8 +22,8 @@
  *   8. answer { success, duplicate, skipped, document_id, expense_ids, flags, auto_approved }
  *
  * Auth: the same x-ghl-signature / LP_REPORT_INGEST_SECRET check the LP
- * report ingest uses (src/jobs/lp-report-common.js), with the same fail-open-
- * until-set posture it documents. A failure after the document row exists
+ * report ingest uses (src/jobs/lp-report-common.js), but FAIL-CLOSED: an unset
+ * secret refuses every request (2026-10-19). A failure after the document row exists
  * leaves status='failed' + error, so nothing is silently lost. Only a
  * TRANSIENT failure (the extract service, storage, a connection) is a 5xx
  * that makes n8n retry; a deterministic one (a refused insert, a rejected
@@ -32,20 +32,21 @@
  */
 import express from 'express';
 import supabaseDefault from '../supabase.js';
-import { sha256Hex, refuseIngest, assertIngestAuthConfigured, todayET } from './lp-report-common.js';
+import { sha256Hex, refuseIngest, assertIngestAuthConfigured, FAIL_CLOSED, todayET } from './lp-report-common.js';
 import { parseCsv } from './lp-report-csv-common.js';
 import { postToSlack } from '../slack.js';
 import { extractDocument, documentKind, cleanEmailBody } from '../marketing/extract-client.js';
 import { analyzeInvoiceText } from '../marketing/invoice-analyzer.js';
-import { buildExpenseRows, computeFlags, autoApproveDecision } from '../marketing/expense-builder.js';
+import { buildExpenseRows, computeFlags, autoApproveDecision, FLAGS } from '../marketing/expense-builder.js';
 import { triageExtraction, fillRowDefaults, linkedFileIn, SKIP_REASONS } from '../marketing/invoice-triage.js';
 import { normalizeName } from '../marketing/vendors.js';
 import { allocateExpenseById, reallocateMonth, reconcileAllocations } from '../marketing/allocation-io.js';
 import { trueUpInvoice } from '../marketing/leadgurus-feed.js';
 import { buildReviewCard, buildDecisionReply, disputedTotal } from '../marketing/slack-review.js';
 import { callCenterLineKind } from '../marketing/allocation.js';
-import { previewRows, reviewChannelId, signedOriginalLink, replaceEarlierInvoice, refreshEstimatesFor } from '../marketing/review-actions.js';
+import { previewRows, reviewChannelId, replaceEarlierInvoice, refreshEstimatesFor } from '../marketing/review-actions.js';
 import { matchCommissionInvoiceRows } from '../marketing/commission-invoice.js';
+import { redactBankDetails, redactBankDeep, redactBankText, removedCount } from '../security/bank-redact.js';
 
 const LOG = '[MktInvoice]';
 export const INVOICES_BUCKET = 'marketing-invoices';
@@ -172,6 +173,20 @@ export function findDuplicateInvoice(docs = [], { documentId, facts = {}, vendor
   }) || null;
 }
 
+/** True when an approved line of the same vendor carries this invoice number (or the read failed). */
+export async function replacesApprovedInvoice({ documentId, rows = [] }, { supabase }) {
+  const invoiceNumber = rows.find((r) => r.invoice_number)?.invoice_number;
+  const vendorId = rows.find((r) => r.vendor_id)?.vendor_id;
+  if (!invoiceNumber || !vendorId) return false;
+  try {
+    let q = supabase.from('marketing_expenses').select('id').eq('vendor_id', vendorId).eq('invoice_number', invoiceNumber).eq('status', 'approved');
+    if (documentId) q = q.neq('document_id', documentId);
+    const { data, error } = await q.limit(1);
+    if (error) return true;
+    return (data || []).length > 0;
+  } catch { return true; }
+}
+
 /**
  * A failure that will fail the same way on a retry is answered 200 with
  * success:false (n8n's IF routes it to the failed-telemetry node once and never
@@ -236,8 +251,12 @@ export async function ingestInvoice(body, deps = {}) {
   // A body is read once, here (HTML part included), so the sha, the stored copy
   // and the analysis all see the same text.
   const bodyText = buffer ? parsed.bodyText : cleanEmailBody(parsed.bodyText, bodyHtml);
-  const bytes = buffer || Buffer.from(bodyText, 'utf8');
+  // 2026-10-19 (the user): no routing or account number is ever saved. An email
+  // body is stored as a .txt, so the stored copy is the redacted one. The sha is
+  // still taken over the body as sent, so a re-forward is still a duplicate.
+  const bytes = buffer || Buffer.from(redactBankText(bodyText), 'utf8');
   const sha = buffer ? sha256Hex(bytes) : sha256Hex(Buffer.from(bodyShaText(bodyText), 'utf8'));
+  meta.subject = meta.subject == null ? null : redactBankText(meta.subject);
   const post = deps.postToSlack || postToSlack;
   const label = meta.file_name || (meta.subject ? `"${meta.subject}"` : 'the email body');
 
@@ -273,7 +292,7 @@ export async function ingestInvoice(body, deps = {}) {
   // service outage keeps the row for n8n's retry (it reuses the stored text);
   // purgeStaleFailedDocuments removes one that is still failed a day later.
   const fail = async (step, err, { transient = isTransientError(err) } = {}) => {
-    const message = `${step}: ${err?.message || err}`;
+    const message = redactBankText(`${step}: ${err?.message || err}`);
     console.error(`${LOG} ${documentId} ${message}${transient ? ' (transient: n8n retries)' : ' (deterministic: removed, reported once)'}`);
     if (transient) {
       await supabase.from('marketing_invoice_documents').update({ status: 'failed', error: message.slice(0, 1000), updated_at: now().toISOString() }).eq('id', documentId);
@@ -291,10 +310,22 @@ export async function ingestInvoice(body, deps = {}) {
   const kind = buffer ? documentKind(buffer, { fileName: meta.file_name, mimeType: meta.mime_type }) : 'text';
   let extracted;
   try {
+    let fresh = false;
     if (seen?.extracted_text != null && seen.extraction_meta) {
       extracted = { kind, text: seen.extracted_text, meta: seen.extraction_meta, tables: [] };
     } else {
       extracted = await (deps.extract || extractDocument)(buffer, { fileName: meta.file_name, mimeType: meta.mime_type, bodyText }, deps.extractDeps || {});
+      fresh = true;
+    }
+    // 2026-10-19 (the user): "we do not save any … routing or account numbers."
+    // Redacted HERE, once, before the text is stored, triaged, screened or sent
+    // to the model, so nothing after this line ever holds a bank number. A
+    // retry's stored text is redacted again (idempotent), in case it predates this.
+    const red = redactBankDetails(extracted.text);
+    const n = removedCount(red.removed);
+    if (n) console.log(`[bank-redact] ${documentId}: removed ${red.removed.routing} routing, ${red.removed.account} account number(s)`);
+    extracted = { ...extracted, text: red.text, tables: [], meta: { ...(extracted.meta || {}), ...(n || fresh ? { bank_redacted: red.removed } : {}) } };
+    if (fresh || n) {
       await supabase.from('marketing_invoice_documents').update({ extracted_text: extracted.text, extraction_meta: extracted.meta, status: 'extracted', updated_at: now().toISOString() }).eq('id', documentId);
     }
   } catch (err) { return fail('extract', err); }
@@ -369,29 +400,37 @@ export async function ingestInvoice(body, deps = {}) {
   const flags = computeFlags({
     vendor: a.vendor, facts: a.facts, rows: built.rows, lineProblems: [...built.lineProblems, ...sales.flags], confidence: a.confidence, disagreements: a.disagreements,
     extraction: extracted.meta, trailingAvg: history.trailingAvg, possibleDuplicate: history.possibleDuplicate, minConfidence: cfg.minConfidence,
+    vendorMethod: a.vendorMethod,
   });
   if (a.guard && a.guard.verdict && a.guard.verdict !== 'clean') flags.push('text_flagged_by_guardrail');
+  // A revision of an invoice a person already approved replaces it on approval
+  // (replaceEarlierInvoice). That needs a person, never the auto path: a spoofed
+  // sender reusing a real invoice number would otherwise rewrite the ledger
+  // (security review, 2026-10-19). A failed read counts as "it does".
+  if (await (deps.replacesApproved || replacesApprovedInvoice)({ documentId, rows: built.rows }, { supabase })) flags.push(FLAGS.REPLACES_APPROVED);
   const filled = fillRowDefaults(built.rows, a.facts, { receivedAt: meta.received_at, today: todayET() });
-  const rows = filled.rows;
+  // The model only ever saw redacted text; its descriptions are redacted again
+  // anyway, so nothing it echoes back can land in the ledger (2026-10-19).
+  const rows = filled.rows.map((r) => (typeof r.description === 'string' ? { ...r, description: redactBankText(r.description) } : r));
   const autoApproved = autoApproveDecision({ flags, priorApprovals: history.priorApprovals, minPrior: cfg.minPrior });
 
   // The analysis is saved BEFORE the rows are written, so a refused insert
   // still leaves the facts on the document (2026-10-13: none survived).
-  const analysis = {
+  const analysis = redactBankDeep({
     facts: { ...filled.facts, vendor_name_hint: a.ai?.vendor_name || null }, rules: a.rules, ai: a.ai, ai_errors: a.aiErrors, hints: a.hints,
     vendor_id: a.vendor?.id || null, vendor_method: a.vendorMethod, confidence: a.confidence, disagreements: a.disagreements, flags,
     guard: a.guard ? { verdict: a.guard.verdict, score: a.guard.score, mode: a.guard.mode } : null,
     history: { prior_approvals: history.priorApprovals, trailing_avg: history.trailingAvg },
     assumed: filled.assumed, auto_approved: autoApproved,
     ...(sales.matches.length ? { sale_matches: sales.matches } : {}),
-  };
+  }).value;
   await supabase.from('marketing_invoice_documents').update({ analysis, analyzer: a.analyzer, status: 'analyzed', error: null, updated_at: now().toISOString() }).eq('id', documentId);
 
   const { data: inserted, error: insErr } = await supabase.from('marketing_expenses').insert(rows.map((r) => ({ ...r, flags }))).select('id, line_no');
   if (insErr) return fail('expenses', insErr);
   const expenseIds = (inserted || []).map((r) => r.id);
 
-  const ctxBase = { document: { id: documentId, ...meta, analyzer: a.analyzer }, vendor: a.vendor, facts: analysis.facts, flags, confidence: a.confidence, extraction: extracted.meta, vendorMethod: a.vendorMethod, disagreements: a.disagreements };
+  const ctxBase = { document: { id: documentId, ...meta, analyzer: a.analyzer }, vendor: a.vendor, facts: analysis.facts, flags, confidence: a.confidence, extraction: extracted.meta, vendorMethod: a.vendorMethod, disagreements: analysis.disagreements || [] };
 
   // 7. auto-approve or review. A line billed for more than we can find
   // (2026-10-19) always goes to a person: its Disputed part needs someone to
@@ -420,8 +459,7 @@ export async function ingestInvoice(body, deps = {}) {
     const kindOf = new Map((approvedRows || []).map((r) => [r.id, callCenterLineKind(r)]));
     const { data: allocRows } = await supabase.from('marketing_expense_allocations').select('expense_id, month, market, amount, rule, issued_basis, issued_total').in('expense_id', expenseIds).order('month');
     const allocation = (allocRows || []).map((x) => ({ ...x, kind: kindOf.get(x.expense_id) || null }));
-    const link = await (deps.signedLink || signedOriginalLink)({ id: documentId, storage_bucket: INVOICES_BUCKET, storage_path: storagePath }, { supabase });
-    const card = buildReviewCard({ ...ctxBase, rows: approvedRows || [], allocation: allocation || [], link, decision: { outcome: 'auto_approved', by: 'system', at: ts.slice(0, 16).replace('T', ' ') } });
+    const card = buildReviewCard({ ...ctxBase, rows: approvedRows || [], allocation: allocation || [], decision: { outcome: 'auto_approved', by: 'system', at: ts.slice(0, 16).replace('T', ' ') } });
     if (cfg.channelId) {
       const r = await post(card.text, cfg.channelId, { blocks: card.blocks });
       if (r.ok) {
@@ -437,8 +475,7 @@ export async function ingestInvoice(body, deps = {}) {
   }
 
   const allocation = preview;
-  const link = await (deps.signedLink || signedOriginalLink)({ id: documentId, storage_bucket: INVOICES_BUCKET, storage_path: storagePath }, { supabase });
-  const card = buildReviewCard({ ...ctxBase, rows, allocation, link });
+  const card = buildReviewCard({ ...ctxBase, rows, allocation });
   let posted = false;
   if (cfg.channelId) {
     const r = await post(card.text, cfg.channelId, { blocks: card.blocks });
@@ -519,8 +556,11 @@ export function invoiceBodyParser() {
 }
 
 export function registerMarketingInvoiceRoutes(app, deps = {}) {
-  assertIngestAuthConfigured('marketing-invoice-ingest');
-  const refuse = (req, res) => refuseIngest(req, res, 'marketing-invoice-ingest');
+  assertIngestAuthConfigured('marketing-invoice-ingest', { failClosed: true });
+  // Fail closed (security review, 2026-10-19): with LP_REPORT_INGEST_SECRET unset
+  // these routes used to take anyone's request, and /decide approves invoices.
+  // Unset now answers 503 to everyone, n8n and the dashboard included.
+  const refuse = (req, res) => refuseIngest(req, res, 'marketing-invoice-ingest', FAIL_CLOSED);
   const json = express.json({ limit: INVOICE_BODY_LIMIT });
   const text = express.text({ type: ['text/csv', 'text/plain'], limit: '10mb' });
 

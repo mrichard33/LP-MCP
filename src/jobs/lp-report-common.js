@@ -357,21 +357,31 @@ export function ingestAuthorized(req, where, opts = {}) {
   return ingestAuthDecision(req, where, opts).allow;
 }
 
+/** Pass as refuseIngest's opts to fail closed whatever AUTH_ENFORCE_MODE says. */
+export const FAIL_CLOSED = Object.freeze({ mode: 'enforce' });
+
 /**
  * Answer the refusal for an ingest route. Returns true when it did (the
  * caller returns). 503 when the secret is unset under enforce, else 401.
+ * `opts.mode: 'enforce'` makes one family of routes fail closed whatever
+ * AUTH_ENFORCE_MODE says (the marketing-cost routes, 2026-10-19: invoices
+ * carry bank details and /decide approves them).
  */
-export function refuseIngest(req, res, where) {
-  const d = ingestAuthDecision(req, where);
+export function refuseIngest(req, res, where, opts = {}) {
+  const d = ingestAuthDecision(req, where, opts);
   if (d.allow) return false;
   res.status(d.status).json({ success: false, error: d.status === 503 ? 'auth_not_configured' : 'bad signature' });
   return true;
 }
 
 /** Announce the auth posture at route registration, not on the first POST. */
-export function assertIngestAuthConfigured(where) {
+export function assertIngestAuthConfigured(where, { failClosed = false } = {}) {
   if (INGEST_SECRET) {
     console.log(`[${where}] ingest signature enforcement ACTIVE`);
+    return;
+  }
+  if (failClosed) {
+    console.error(`[SECURITY] ${where}: LP_REPORT_INGEST_SECRET is NOT SET — these routes REFUSE every request (503) until it is set to the value n8n and the dashboard send in x-ghl-signature.`);
     return;
   }
   if (INGEST_STRICT) {

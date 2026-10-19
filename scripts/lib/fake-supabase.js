@@ -29,11 +29,13 @@ function notNullViolation(table, rows) {
   return null;
 }
 
-export function fakeSupabase(seed = {}, { rpc = {} } = {}) {
+export function fakeSupabase(seed = {}, { rpc = {}, files = {} } = {}) {
   const tables = {};
   for (const [name, rows] of Object.entries(seed)) tables[name] = rows.map((r) => ({ ...r }));
   const calls = [];
   const storageLog = { uploads: [], signed: [], removed: [] };
+  // Stored objects by `bucket/path` (seeded with `files`, kept by upload) so download() can read them back.
+  const objects = new Map(Object.entries(files).map(([k, v]) => [k, Buffer.from(v)]));
 
   const ensure = (t) => (tables[t] ||= []);
 
@@ -117,7 +119,7 @@ export function fakeSupabase(seed = {}, { rpc = {} } = {}) {
   }
 
   return {
-    tables, calls, storageLog,
+    tables, calls, storageLog, objects,
     from,
     rpc: async (name, args) => {
       const fn = rpc[name];
@@ -126,7 +128,11 @@ export function fakeSupabase(seed = {}, { rpc = {} } = {}) {
     },
     storage: {
       from: (bucket) => ({
-        upload: async (path, bytes, opts) => { storageLog.uploads.push({ bucket, path, bytes: bytes.length, opts }); return { data: { path }, error: null }; },
+        upload: async (path, bytes, opts) => { storageLog.uploads.push({ bucket, path, bytes: bytes.length, body: bytes, opts }); objects.set(`${bucket}/${path}`, Buffer.from(bytes)); return { data: { path }, error: null }; },
+        download: async (path) => {
+          const b = objects.get(`${bucket}/${path}`);
+          return b ? { data: { text: async () => b.toString('utf8') }, error: null } : { data: null, error: { message: 'Object not found' } };
+        },
         createSignedUrl: async (path, ttl) => { storageLog.signed.push({ bucket, path, ttl }); return { data: { signedUrl: `https://signed.example/${bucket}/${path}` }, error: null }; },
         remove: async (paths) => { storageLog.removed.push({ bucket, paths }); return { data: paths, error: null }; },
       }),

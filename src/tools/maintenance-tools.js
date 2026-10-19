@@ -38,6 +38,13 @@
  *                              LP→GHL sync created (src/services/ghl-attribution-cleanup.js;
  *                              the user: "Clear the wrong ones"). Same background
  *                              job pattern; dry run by default.
+ *
+ *   invoice_bank_redact_run    (2026-10-19) erases the bank routing and account
+ *                              numbers already saved with marketing invoices
+ *                              (src/marketing/bank-redact-backfill.js; the user:
+ *                              "remove the routing and account numbers that were
+ *                              already entered"). Counts only, never a number;
+ *                              dry run by default. Original PDFs are kept.
  */
 import { z } from 'zod';
 
@@ -161,7 +168,27 @@ export function makeGhlAttributionCleanupRun(deps = {}) {
   };
 }
 
+export function makeInvoiceBankRedactRun(deps = {}) {
+  const { load = () => import('../marketing/bank-redact-backfill.js'), backfillDeps = {} } = deps;
+  return async ({ dry_run = true } = {}) => {
+    const { runBankRedactBackfill } = await load();
+    return runBankRedactBackfill({ dryRun: dry_run !== false }, backfillDeps);
+  };
+}
+
 export function registerMaintenanceTools(server, deps = {}) {
+  server.tool(
+    'invoice_bank_redact_run',
+    'Erase bank routing and account numbers already saved with marketing invoices (the user, 2026-10-19): the stored '
+      + 'invoice text, the AI analysis, error and subject lines, ledger descriptions, and our .txt copies of email-body '
+      + 'invoices. Original PDFs/photos are kept (admins-only on the dashboard). Returns COUNTS only, never a number. '
+      + 'Dry run by default; dry_run:false writes, and a second dry run should then find 0.',
+    {
+      dry_run: z.boolean().optional().default(true).describe('true (default) counts only; false erases them'),
+    },
+    async (args) => text(await makeInvoiceBankRedactRun(deps)(args)),
+  );
+
   server.tool(
     'ghl_attribution_cleanup_run',
     'One-time cleanup (2026-10-18). Rule 87 GHL_ATTR_APPT_BOOKED_VIA_GHL tagged ghl-attributed for appointments our own '

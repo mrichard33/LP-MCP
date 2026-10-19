@@ -174,6 +174,9 @@ async function salesFromLp({ name, sale, subSources }, { lp, branchMap, maxLeads
   return out.filter((c) => Math.abs(c.job_value - sale) < 1);
 }
 
+/** Lines per invoice that may be looked up in LP live (2026-10-19). */
+export const MAX_LP_LOOKUP_LINES = 20;
+
 /**
  * Match every line of a commission vendor's invoice to its LP sale. Returns the
  * rows to insert (matched ones moved to their office and month; unmatched ones
@@ -190,6 +193,7 @@ export async function matchCommissionInvoiceRows({ rows, lines, vendor }, deps =
   const branchMap = new Map((branches || []).map((b) => [String(b.brn_id), b.market_code]));
   const labelOf = new Map((branches || []).map((b) => [b.market_code, b.market_label]));
   let lp = deps.lp;
+  let lpLookups = 0;
   const matches = [];
   const out = [];
   for (let i = 0; i < rows.length; i++) {
@@ -200,7 +204,12 @@ export async function matchCommissionInvoiceRows({ rows, lines, vendor }, deps =
     try {
       if (want.sale) {
         match = pickSale(await salesFromDb({ sale: want.sale, subSources }, { supabase }), want);
-        if (!match && want.name) {
+        // At most MAX_LP_LOOKUP_LINES lines per invoice go to LP live: the names
+        // come from a third party's text, so one invoice cannot fan out into
+        // hundreds of LP calls (security review, 2026-10-19). The rest are
+        // sale_not_found and a person places them.
+        if (!match && want.name && lpLookups < MAX_LP_LOOKUP_LINES) {
+          lpLookups++;
           lp = lp || await import('../lp-client.js');
           match = pickSale(await salesFromLp({ ...want, subSources }, { lp, branchMap }), want);
         }

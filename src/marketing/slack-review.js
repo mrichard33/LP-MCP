@@ -4,7 +4,9 @@
  * Builds the Block Kit for #marketing-invoice-review (handoff §8): vendor,
  * invoice #, period, total; each line with its sub-source + markets +
  * evidence; the allocation preview; flags and confidence; how the text was
- * read; a 7-day link to the original; and the three buttons
+ * read; and the three buttons. No link to the original file: invoices can
+ * carry bank details, so the file opens only on the dashboard, for its
+ * admins (the user, 2026-10-19);
  * mktinv_approve / mktinv_reject / mktinv_edit (value = document id).
  *
  * Only Mark and Brad Codman may decide (D6): the handler in review-actions.js
@@ -172,7 +174,6 @@ export function disputedTotal(allocation = []) {
  * @param {string[]} [p.flags]
  * @param {number|null} [p.confidence]
  * @param {object} [p.extraction]
- * @param {string|null} [p.link]
  * @param {string} [p.vendorMethod]
  * @param {string[]} [p.disagreements]
  * @param {object} [p.decision]     { by, at, outcome } once decided
@@ -180,7 +181,7 @@ export function disputedTotal(allocation = []) {
  */
 export function buildReviewCard({
   document, vendor, facts, rows = [], allocation = [], flags = [], confidence = null, extraction = null,
-  link = null, vendorMethod = null, disagreements = [], decision = null, note = null,
+  vendorMethod = null, disagreements = [], decision = null, note = null,
 }) {
   const vendorName = vendor?.vendor_name || facts?.vendor_name_hint || 'Unknown vendor';
   const title = `Marketing invoice · ${vendorName}`;
@@ -214,7 +215,7 @@ export function buildReviewCard({
     ? `⚠️ *Needs a look:*\n${flags.map((f) => `• ${escapeMrkdwn(FLAG_LABELS[f] || f)}`).join('\n')}${disagreements.length ? `\n_${escapeMrkdwn(disagreements.join('; '))}_` : ''}`
     : '✅ No flags';
 
-  const context = `Confidence ${confidence == null ? '—' : Number(confidence).toFixed(2)} · ${extractionLine(extraction)} · analyzer ${document?.analyzer || 'rules'} · ref ${short(document?.id)}${link ? ` · <${link}|original file (7-day link)>` : ''}`;
+  const context = `Confidence ${confidence == null ? '—' : Number(confidence).toFixed(2)} · ${extractionLine(extraction)} · analyzer ${document?.analyzer || 'rules'} · ref ${short(document?.id)} · original file: dashboard, admins only`;
 
   const blocks = [
     { type: 'section', text: { type: 'mrkdwn', text: head.slice(0, 2900) } },

@@ -13,7 +13,7 @@
 import express from 'express';
 import supabaseDefault from '../supabase.js';
 import { runJob } from '../job-runner.js';
-import { refuseIngest, todayET } from './lp-report-common.js';
+import { refuseIngest, FAIL_CLOSED, todayET } from './lp-report-common.js';
 import { postToSlack } from '../slack.js';
 import { buildReportModels } from '../marketing/report.js';
 import { buildWorkbook } from '../marketing/report-xlsx.js';
@@ -71,7 +71,7 @@ export function registerMarketingReportRoutes(app, deps = {}) {
   const json = express.json({ limit: '1mb' });
   app.post('/n8n/admin/marketing-report/run', json, async (req, res) => {
     try {
-      if (refuseIngest(req, res, 'marketing-report')) return;
+      if (refuseIngest(req, res, 'marketing-report', FAIL_CLOSED)) return;
       const month = req.body?.month ? String(req.body.month) : defaultReportMonth();
       const out = await runJob(JOB_ID, () => runMarketingReport({ month, post: req.body?.post !== false }, deps));
       res.status(out.status === 'failed' ? 500 : 200).json({ status: out.status, ...(out.value || {}), error: out.error || undefined });
