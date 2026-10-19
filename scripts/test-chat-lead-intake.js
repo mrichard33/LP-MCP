@@ -109,8 +109,8 @@ test('mode defaults to shadow; junk falls back to shadow', () => {
 
 // --- the pass --------------------------------------------------------------
 
-function stubDeps({ candidates = [contact('c1'), contact('c2')], lpPhones = [], marked = [], agentic = [], enrollFails = [], hlFails = false, marksFail = false } = {}) {
-  const calls = { enroll: [], marks: [], sends: [] };
+function stubDeps({ candidates = [contact('c1'), contact('c2')], lpPhones = [], marked = [], agentic = [], enrollFails = [], hlFails = false, marksFail = false, stampFails = [] } = {}) {
+  const calls = { enroll: [], marks: [], sends: [], stamps: [] };
   const supabase = {
     from(table) {
       assert.equal(table, 'lp_appointment_sync_marks');
@@ -139,9 +139,22 @@ function stubDeps({ candidates = [contact('c1'), contact('c2')], lpPhones = [], 
         return { success: true };
       },
       send: async (text, opts) => { calls.sends.push({ text, opts }); },
+      stampSource: async (contactId) => {
+        calls.stamps.push(contactId);
+        return stampFails.includes(contactId) ? { ok: false, detail: 'read back srs 512' } : { ok: true };
+      },
     },
   };
 }
+
+test('live: every chat lead is stamped Reece ChatBot before it is enrolled (2026-10-19)', async () => {
+  const { deps, calls } = stubDeps({ stampFails: ['c1'] });
+  const r = await runChatLeadIntakeSweep({ env: { CHAT_LP_INTAKE_MODE: 'live' }, nowMs: NOW, deps });
+  assert.deepEqual(calls.stamps, ['c1', 'c2']);
+  assert.deepEqual(calls.enroll, ['c2'], 'a stamp that did not land is not sent');
+  assert.equal(r.failed, 1);
+  assert.deepEqual(calls.marks, ['chat-intake:c2']);
+});
 
 test('live: enrolls, marks each contact, one ops card', async () => {
   const { deps, calls } = stubDeps();
