@@ -461,3 +461,70 @@ test('the settle buttons reach the handler', () => {
     assert.equal(p?.decision, id.replace('mktinv_', ''));
   }
 });
+
+// 2026-10-19: "All of the Slack items need to be updated" — redraw cards already in Slack.
+import { refreshReviewCards, decisionFor } from '../src/marketing/review-actions.js';
+
+function refreshSeed() {
+  const doc = (id, status, ts, inv) => ({ id, status, slack_ts: ts, slack_channel: 'C1', created_at: '2026-10-19T17:54:00Z', updated_at: '2026-10-19T18:00:00Z', analysis: { facts: { invoice_number: inv } } });
+  const row = (id, docId, status, extra = {}) => ({
+    id, document_id: docId, line_no: 1, status, amount: 1000, period_start: '2026-08-01', period_end: '2026-08-31',
+    lp_sub_sources: ['Hatch'], eligible_markets: ['ORL_MKT'], description: 'Line', cost_type: 'invoice', ...extra,
+  });
+  return fakeSupabase({
+    marketing_invoice_documents: [
+      doc('11111111-1111-1111-1111-111111111111', 'in_review', '1.1', 'A-1'),
+      doc('22222222-2222-2222-2222-222222222222', 'posted', '2.2', 'B-2'),
+      doc('33333333-3333-3333-3333-333333333333', 'rejected', '3.3', 'C-3'),
+      doc('44444444-4444-4444-4444-444444444444', 'in_review', null, 'D-4'),
+    ],
+    marketing_expenses: [
+      row('e1', '11111111-1111-1111-1111-111111111111', 'pending_review'),
+      row('e2', '22222222-2222-2222-2222-222222222222', 'approved', { approved_by: 'm.richard (U0BU7TZPY82)', approved_at: '2026-10-19T18:21:44Z' }),
+      row('e3', '33333333-3333-3333-3333-333333333333', 'rejected'),
+      row('e4', '44444444-4444-4444-4444-444444444444', 'pending_review'),
+    ],
+    marketing_expense_allocations: [{ expense_id: 'e2', month: '2026-08-01', market: 'ORL_MKT', amount: 1000, rule: 'direct', issued_basis: 0, issued_total: 0 }],
+    marketing_vendors: [],
+  }, { rpc: { mkt_issued_counts: () => [] } });
+}
+
+test('decisionFor: posted → approved by the person, all rejected → rejected, open → none', () => {
+  assert.deepEqual(decisionFor({ document: { status: 'posted' }, rows: [{ status: 'approved', approved_by: 'm.richard (U1)', approved_at: '2026-10-19T18:21:44Z' }] }), { outcome: 'approved', by: 'm.richard', at: '2026-10-19 18:21' });
+  assert.equal(decisionFor({ document: { status: 'rejected', updated_at: '2026-10-19T18:00:00Z' }, rows: [{ status: 'rejected' }] }).outcome, 'rejected');
+  assert.equal(decisionFor({ document: { status: 'in_review' }, rows: [{ status: 'pending_review' }] }), null);
+});
+
+test('refreshReviewCards: every card in Slack is redrawn in place; none without a card; nothing posted', async () => {
+  const supabase = refreshSeed();
+  const updates = [];
+  const posts = [];
+  const out = await refreshReviewCards({ since: '2026-10-12' }, {
+    supabase, signedLink: async () => null,
+    updateSlackMessage: async (ch, ts, text, opts) => { updates.push({ ch, ts, text, blocks: opts.blocks }); return { ok: true }; },
+    postToSlack: async (t) => { posts.push(t); return { ok: true }; },
+  });
+  assert.equal(out.matched, 3);
+  assert.equal(out.refreshed, 3);
+  assert.deepEqual(out.failed, []);
+  assert.deepEqual(updates.map((u) => u.ts).sort(), ['1.1', '2.2', '3.3']);
+  assert.equal(posts.length, 0);
+  const posted = JSON.stringify(updates.find((u) => u.ts === '2.2').blocks);
+  assert.match(posted, /m\.richard/);
+  assert.match(posted, /Orlando/);
+  assert.deepEqual(out.cards.map((c) => c.decided).sort(), [null, 'approved', 'rejected'].sort());
+});
+
+test('refreshReviewCards: a dry run lists the cards and touches nothing; a failed card does not stop the rest', async () => {
+  const supabase = refreshSeed();
+  let calls = 0;
+  const dry = await refreshReviewCards({ since: '2026-10-12', dryRun: true }, { supabase, signedLink: async () => null, updateSlackMessage: async () => { calls++; return { ok: true }; } });
+  assert.equal(calls, 0);
+  assert.equal(dry.cards.length, 3);
+  const out = await refreshReviewCards({ ids: ['11111111-1111-1111-1111-111111111111', '22222222-2222-2222-2222-222222222222'] }, {
+    supabase, signedLink: async () => null,
+    updateSlackMessage: async (_c, ts) => (ts === '1.1' ? { ok: false, error: 'message_not_found' } : { ok: true }),
+  });
+  assert.equal(out.refreshed, 1);
+  assert.deepEqual(out.failed.map((f) => f.error), ['message_not_found']);
+});

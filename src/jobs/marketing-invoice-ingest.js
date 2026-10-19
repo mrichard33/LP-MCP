@@ -557,6 +557,20 @@ export function registerMarketingInvoiceRoutes(app, deps = {}) {
     }
   });
 
+  // Redraw the review cards already in Slack with today's card and rules
+  // (2026-10-19: six LightFire cards kept the split from before the rule change).
+  app.post('/n8n/admin/marketing-invoices/refresh-cards', json, async (req, res) => {
+    try {
+      if (refuse(req, res)) return;
+      const ids = Array.isArray(req.body?.ids) ? req.body.ids.filter((x) => /^[0-9a-f-]{36}$/i.test(String(x))) : null;
+      const since = /^\d{4}-\d{2}-\d{2}$/.test(String(req.body?.since || '')) ? req.body.since : null;
+      const { refreshReviewCards } = await import('../marketing/review-actions.js');
+      res.json({ success: true, ...(await refreshReviewCards({ ids, since, dryRun: req.body?.dryRun === true }, deps)) });
+    } catch (err) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
   // A PERSON applies a REECE_HOLD recommendation (handoff §7.5): the dashboard's
   // admin-only button relays here; the money never moves on its own.
   app.post('/n8n/admin/marketing-expenses/apply-recommendation', json, async (req, res) => {

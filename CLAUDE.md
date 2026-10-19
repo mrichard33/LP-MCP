@@ -1006,6 +1006,11 @@ Brad's XLSX (`marketing-cost-report`, formulas never typed values) read `v_marke
   The vendor's printed city is never a market for these lines. `buildCommissionRows` subtracts approved invoice lines on
   ONE market in that month (`invoicedByCell`, "less $X invoiced", never below 0), and approving such lines recomputes
   their months at once (`refreshEstimatesFor`; the nightly reaches only the current and prior month).
+- **A Slack card is a picture taken when it was posted; redraw them after a rule change (the user, 2026-10-19: "All
+  of the Slack items need to be updated").** Six LightFire cards went up before the office split went live and kept
+  "4182700/17951276 issued" with no office. `POST /n8n/admin/marketing-invoices/refresh-cards` (`{ ids? | since?,
+  dryRun? }`, `refreshReviewCards` in `review-actions.js`) redraws every card in place as a new one would be (open →
+  fresh preview, decided → its allocations and decision, `decisionFor`); it posts nothing and writes no ledger row.
 - **Only Mark or Brad decides (D6).** The card in `SLACK_MKT_INVOICE_CHANNEL_ID` carries `mktinv_approve` /
   `mktinv_edit` / `mktinv_reject`; `isMarketingInvoiceAction` in `src/slack-approvals-core.js` catches those clicks AND
   the Edit modal's `view_submission` so they are never relayed to onboarding (which would read them as a member
