@@ -953,6 +953,9 @@ Brad's XLSX (`marketing-cost-report`, formulas never typed values) read `v_marke
   `mkt_invoice_analysis` (rules first, model second, rules win on total and invoice #, `analysis-schema.js` is strict).
   The text is untrusted: cleaned, screened (`guardrail_decisions` surface `invoice_text`), and nothing in it can run
   anything — the only outputs are ledger rows and a Slack card.
+  **The ingest route has its own 40 MB body parser, mounted BEFORE the global `express.json()` (2026-10-19).** A PDF
+  arrives base64 in JSON; the global 100 kB default answered 413 to all six LightFire invoices (~390 KB each) before
+  the route's own parser ever ran (`invoiceBodyParser` / `INVOICE_INGEST_PATH`, `scripts/test-marketing-invoice-body-limit.js`).
 - **Only Mark or Brad decides (D6).** The card in `SLACK_MKT_INVOICE_CHANNEL_ID` carries `mktinv_approve` /
   `mktinv_edit` / `mktinv_reject`; `isMarketingInvoiceAction` in `src/slack-approvals-core.js` catches those clicks AND
   the Edit modal's `view_submission` so they are never relayed to onboarding (which would read them as a member
