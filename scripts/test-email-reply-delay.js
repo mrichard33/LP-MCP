@@ -94,3 +94,46 @@ test('the incident timing is recorded honestly — 123s would NOT have been held
   assert.ok(sentAt - T > s(90));
   assert.equal(decideEmailSendDelay({ channel: 'email', inboundAtMs: T, nowMs: sentAt }).defer, false);
 });
+
+// ─── 2026-10-19 (Mark; Thomas Geary): a natural, random wait ────────────────
+const MIN = 360_000;   // 6 min
+const MAX = 900_000;   // 15 min
+
+test('the ready time falls inside the 6–15 minute window', () => {
+  for (const seed of [4257716, 'syn-ff8b1b2ab8fbf4813e160a7709ce71fc6b86d2ce', 1, 2, 3, 99999, 'abc']) {
+    const d = decideEmailSendDelay({ channel: 'email', inboundAtMs: T, nowMs: T + s(10), minDelayMs: MIN, maxDelayMs: MAX, seed });
+    assert.equal(d.defer, true);
+    assert.ok(d.readyAtMs >= T + MIN && d.readyAtMs < T + MAX, `${seed}: ${(d.readyAtMs - T) / 60000} min`);
+  }
+});
+
+test('the same inbound gets the same ready time on retry (never re-rolled)', () => {
+  const a = decideEmailSendDelay({ channel: 'email', inboundAtMs: T, nowMs: T + s(10), minDelayMs: MIN, maxDelayMs: MAX, seed: 4257716 });
+  const b = decideEmailSendDelay({ channel: 'email', inboundAtMs: T, nowMs: T + s(200), minDelayMs: MIN, maxDelayMs: MAX, seed: 4257716 });
+  assert.equal(a.readyAtMs, b.readyAtMs);
+  // The stored value wins over everything, even a different seed.
+  const c = decideEmailSendDelay({ channel: 'email', inboundAtMs: T, nowMs: T + s(10), minDelayMs: MIN, maxDelayMs: MAX, seed: 'other', storedReadyAtMs: a.readyAtMs });
+  assert.equal(c.readyAtMs, a.readyAtMs);
+  // At the stored time it sends.
+  assert.equal(decideEmailSendDelay({ channel: 'email', inboundAtMs: T, nowMs: a.readyAtMs, minDelayMs: MIN, maxDelayMs: MAX, storedReadyAtMs: a.readyAtMs }).defer, false);
+});
+
+test('different inbounds spread across the window', () => {
+  const minutes = new Set();
+  for (let i = 0; i < 40; i++) {
+    const d = decideEmailSendDelay({ channel: 'email', inboundAtMs: T, nowMs: T, minDelayMs: MIN, maxDelayMs: MAX, seed: 4257000 + i });
+    minutes.add(Math.floor((d.readyAtMs - T) / 60000));
+  }
+  assert.ok(minutes.size >= 5, `only ${minutes.size} distinct minutes`);
+});
+
+test('MAX unset or not above MIN is the old fixed floor (the rollback)', () => {
+  assert.equal(decideEmailSendDelay({ channel: 'email', inboundAtMs: T, nowMs: T, minDelayMs: 90_000, maxDelayMs: NaN, seed: 7 }).readyAtMs, T + 90_000);
+  assert.equal(decideEmailSendDelay({ channel: 'email', inboundAtMs: T, nowMs: T, minDelayMs: MIN, maxDelayMs: MIN, seed: 7 }).readyAtMs, T + MIN);
+});
+
+test('SMS and live chat are unchanged by the window', () => {
+  for (const channel of ['sms', 'livechat']) {
+    assert.equal(decideEmailSendDelay({ channel, inboundAtMs: T, nowMs: T, minDelayMs: MIN, maxDelayMs: MAX, seed: 1 }).defer, false);
+  }
+});

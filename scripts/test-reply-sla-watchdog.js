@@ -115,3 +115,24 @@ test('a missing channel is null, not the string "undefined"', async () => {
   await runReplySlaWatchdog({ supabase: db, emitEvent: async (e) => { emitted.push(e); return { id: 1 }; }, now: () => NOW, mode: 'shadow' });
   assert.equal(emitted[0].payload.channel, null);
 });
+
+// 2026-10-19 (Thomas Geary, 10/12): an email held 6–15 minutes on purpose is in
+// flight, never "customer waiting".
+test('a held email row 10 minutes old is in flight, not unanswered', async () => {
+  const { sendStateFromRows } = await import('../src/jobs/reply-sla-watchdog.js');
+  const now = Date.parse('2026-10-12T14:43:00Z');
+  const created = '2026-10-12T14:33:19Z';
+  const ready = '2026-10-12T14:46:30Z';
+  const held = [{ status: 'pending', created_at: created, error_message: 'deferred: email_min_delay', retry_at: ready, email_ready_at: ready }];
+  const st = sendStateFromRows(held, { now, inFlightMs: 180_000 });
+  assert.equal(st.hasInFlightSend, true);
+  assert.equal(classifyReply({ actionTaken: null, tags: ['agentic-active'], ...st }), 'in_flight');
+  // Just claimed at the ready time and being written: still in flight.
+  const writing = [{ status: 'executing', created_at: created, email_ready_at: ready }];
+  assert.equal(sendStateFromRows(writing, { now: Date.parse(ready) + 60_000, inFlightMs: 180_000 }).hasInFlightSend, true);
+  // Long past its ready time: stuck, the backstop pages.
+  assert.equal(sendStateFromRows(writing, { now: Date.parse(ready) + 600_000, inFlightMs: 180_000 }).hasInFlightSend, false);
+  // A row held for something else keeps the old clock.
+  const other = [{ status: 'pending', created_at: created, error_message: 'deferred: agentic_cooldown', retry_at: ready }];
+  assert.equal(sendStateFromRows(other, { now, inFlightMs: 180_000 }).hasInFlightSend, false);
+});

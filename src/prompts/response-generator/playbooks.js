@@ -632,6 +632,16 @@ export const notInterestedTurnBlock = (turn) => [
   `═══════ END NOT INTERESTED ═══════`,
 ];
 
+// 2026-10-19 (Mark; Thomas Geary): a post-demo lead declined by email, we
+// answered once with no question, and they declined again. The turn is decided
+// in src/agentic/post-demo-email.js; code drops any question or rebuttal after.
+export const postDemoEmailCloseBlock = (firstName) => [
+  `\n═══════ POST-DEMO EMAIL: SECOND DECLINE ═══════`,
+  `${firstName ? firstName : 'The lead'} declined again after our last reply. This reply is a short, warm close. Reference (write it in your own words, same meaning): "Thank them, accept the decision, no reframe or rebuttal, the proposal stays good for a year, they can reply here if anything changes. No question."`,
+  `Two or three sentences. No reframe, no rebuttal, no value argument, no offer, no call, and no question anywhere in the email.`,
+  `═══════ END POST-DEMO EMAIL ═══════`,
+];
+
 // Priorities 2 through 5: auto-book on a hard confirmation, the closing acknowledgment, the human-correction override, and the ask-first default. (2) carries the interaction with the in-home gate blocks above it.
 // Was response-generator.js:1495-1498.
 export const PRIORITY_ORDER_TAIL = [

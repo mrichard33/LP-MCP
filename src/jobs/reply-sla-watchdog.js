@@ -102,16 +102,31 @@ const IN_FLIGHT_STATUSES = new Set(['pending', 'approved', 'executing']);
 // copy's reply answers it; the backstop must not answer it a third time.
 const HELD_SKIP_REASONS = new Set(['opener_hold', 'duplicate_inbound_text']);
 
+// 2026-10-19 (Thomas Geary, 10/12): an email reply is held 6–15 minutes on
+// purpose (decideEmailSendDelay, action_payload.email_ready_at). Measured from
+// created_at, a held row looked stuck and filed a false "customer waiting"
+// card. A held email row's clock starts at its ready time instead.
+function heldUntilMs(r) {
+  const ready = Date.parse(r?.email_ready_at);
+  const retry = r?.error_message === 'deferred: email_min_delay' ? Date.parse(r?.retry_at) : NaN;
+  return Math.max(Number.isFinite(ready) ? ready : -Infinity, Number.isFinite(retry) ? retry : -Infinity);
+}
+
 /**
  * Pure: from the contact's send_message rows since the reply, was it answered,
  * or is a reply still being written? A row older than `inFlightMs` is stuck,
  * not in flight (the reaper owns it), so it no longer holds the backstop off.
+ * An email held for its reply delay is in flight until `inFlightMs` past its
+ * ready time.
  */
 export function sendStateFromRows(rows, { now, inFlightMs }) {
   const list = Array.isArray(rows) ? rows : [];
   const hasCompletedSend = list.some((r) => r?.status === 'completed');
-  const hasInFlightSend = !hasCompletedSend && list.some((r) => IN_FLIGHT_STATUSES.has(r?.status)
-    && Number.isFinite(Date.parse(r?.created_at)) && (now - Date.parse(r.created_at)) < inFlightMs);
+  const hasInFlightSend = !hasCompletedSend && list.some((r) => {
+    if (!IN_FLIGHT_STATUSES.has(r?.status)) return false;
+    const anchor = Math.max(Date.parse(r?.created_at), heldUntilMs(r));
+    return Number.isFinite(anchor) && (now - anchor) < inFlightMs;
+  });
   const hasHeldSend = !hasCompletedSend && list.some((r) => r?.status === 'skipped' && HELD_SKIP_REASONS.has(r?.error_message));
   return { hasCompletedSend, hasInFlightSend, hasHeldSend };
 }
@@ -119,7 +134,7 @@ export function sendStateFromRows(rows, { now, inFlightMs }) {
 async function sendRowsSince(db, contactId, sinceIso) {
   const { data, error } = await db
     .from('agent_actions')
-    .select('id, status, created_at, error_message')
+    .select('id, status, created_at, error_message, retry_at, email_ready_at:action_payload->>email_ready_at')
     .eq('target_id', contactId)
     .eq('action_type', 'send_message')
     .gte('created_at', sinceIso)

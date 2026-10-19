@@ -1,5 +1,5 @@
 {
-  "count": 296,
-  "updated": "2026-10-18",
-  "reason": "Phase 1 item 4: DOOR_OPEN_LINE_RX removed; the second no after our close is read from the recorded plan_step (CLOSE_PLAN_STEPS), not our wording (rehash_not_at_this_time). Phase 0 seed was 297 at c2e9d70."
+  "count": 297,
+  "updated": "2026-10-19",
+  "reason": "REASONED_DECLINE_RX (not-interested.js): a firm decline with a reason is a no (Thomas Geary, Mark 2026-10-19); rehash_first_no_with_reason and not_interested read it through isNotInterested / isRehashNo. Phase 1 item 4 left 296."
 }

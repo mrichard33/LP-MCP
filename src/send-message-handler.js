@@ -250,6 +250,7 @@
  *   7. GroupMe notification (rich format with resolved name + LP context)
  */
 
+import { createHash } from 'node:crypto';
 import { recheckSlot } from './agentic/slot-recheck.js';
 import { capacityMarketFor, isInHomeCalendar } from './knowledge/market-capacity-gate.js';
 import { recordEveningRequest } from './services/evening-request-io.js';
@@ -521,6 +522,22 @@ export function enforceNonRandySender({ emailFrom = null, userId = null } = {}) 
 // short-circuits on `already_sent`.
 const EMAIL_REPLY_MIN_DELAY_MS = parseInt(process.env.EMAIL_REPLY_MIN_DELAY_MS || '90000', 10);
 
+// 2026-10-19 (Mark; Thomas Geary): a fixed wait still reads as a machine, and
+// 90s is faster than any person answers an email. The reply now waits a
+// random time between EMAIL_REPLY_MIN_DELAY_MS and EMAIL_REPLY_MAX_DELAY_MS
+// after the inbound (Railway: 6 and 15 minutes). The value is chosen ONCE per
+// inbound: it is derived from the inbound's id (so a retry gets the same
+// answer even if the stamp below failed) and stored on the row as
+// action_payload.email_ready_at. MAX unset (or not above MIN) is the old fixed
+// floor, so EMAIL_REPLY_MIN_DELAY_MS=90000 with MAX unset is the rollback.
+const EMAIL_REPLY_MAX_DELAY_MS = parseInt(process.env.EMAIL_REPLY_MAX_DELAY_MS || '', 10);
+
+/** A stable fraction in [0, 1) for a seed (the inbound's id); random without one. Pure for a seed. */
+export function emailDelayFraction(seed) {
+  if (seed === null || seed === undefined || seed === '') return Math.random();
+  return createHash('sha256').update(String(seed)).digest().readUInt32BE(0) / 0x100000000;
+}
+
 /**
  * Should this email reply wait, and until when? Pure.
  *
@@ -529,19 +546,54 @@ const EMAIL_REPLY_MIN_DELAY_MS = parseInt(process.env.EMAIL_REPLY_MIN_DELAY_MS |
  *   nowMs        epoch ms now
  *   minDelayMs   floor; <= 0 disables the gate entirely
  *
- * Returns { defer, reason, retryAtMs }. An unknown inbound time NEVER defers —
- * a read that cannot tell must not hold a reply hostage.
+ *   maxDelayMs   top of the random window; unset or <= minDelayMs = fixed at minDelayMs
+ *   storedReadyAtMs  the ready time already chosen for this inbound (action_payload.email_ready_at)
+ *   seed         the inbound's id: the same inbound always gets the same ready time
+ *
+ * Returns { defer, reason, retryAtMs, readyAtMs }. An unknown inbound time NEVER
+ * defers — a read that cannot tell must not hold a reply hostage.
  */
-export function decideEmailSendDelay({ channel, inboundAtMs, nowMs, minDelayMs = EMAIL_REPLY_MIN_DELAY_MS } = {}) {
-  if (channel !== 'email') return { defer: false, reason: 'not_email', retryAtMs: null };
-  if (!Number.isFinite(minDelayMs) || minDelayMs <= 0) return { defer: false, reason: 'disabled', retryAtMs: null };
-  if (!Number.isFinite(inboundAtMs)) return { defer: false, reason: 'inbound_time_unknown', retryAtMs: null };
+export function decideEmailSendDelay({
+  channel, inboundAtMs, nowMs, minDelayMs = EMAIL_REPLY_MIN_DELAY_MS, maxDelayMs = EMAIL_REPLY_MAX_DELAY_MS,
+  storedReadyAtMs = NaN, seed = null,
+} = {}) {
+  if (channel !== 'email') return { defer: false, reason: 'not_email', retryAtMs: null, readyAtMs: null };
+  if (!Number.isFinite(minDelayMs) || minDelayMs <= 0) return { defer: false, reason: 'disabled', retryAtMs: null, readyAtMs: null };
 
-  const readyAtMs = inboundAtMs + minDelayMs;
-  if (Number.isFinite(nowMs) && nowMs >= readyAtMs) {
-    return { defer: false, reason: 'min_delay_elapsed', retryAtMs: null };
+  let readyAtMs;
+  if (Number.isFinite(storedReadyAtMs)) {
+    // Chosen on an earlier pass: never re-rolled.
+    readyAtMs = storedReadyAtMs;
+  } else {
+    if (!Number.isFinite(inboundAtMs)) return { defer: false, reason: 'inbound_time_unknown', retryAtMs: null, readyAtMs: null };
+    const span = Number.isFinite(maxDelayMs) && maxDelayMs > minDelayMs ? maxDelayMs - minDelayMs : 0;
+    readyAtMs = inboundAtMs + minDelayMs + Math.floor(span * emailDelayFraction(seed));
   }
-  return { defer: true, reason: 'email_min_delay', retryAtMs: readyAtMs };
+  if (Number.isFinite(nowMs) && nowMs >= readyAtMs) {
+    return { defer: false, reason: 'min_delay_elapsed', retryAtMs: null, readyAtMs };
+  }
+  return { defer: true, reason: 'email_min_delay', retryAtMs: readyAtMs, readyAtMs };
+}
+
+/**
+ * Store the chosen ready time on the row (action_payload.email_ready_at) so a
+ * retry reads it back. Best-effort: the time is also derived from the inbound's
+ * id, so a failed stamp re-derives the same value.
+ */
+async function stampEmailReadyAt(actionId, readyAtIso) {
+  if (!actionId || !readyAtIso) return false;
+  try {
+    const { data: row } = await supabase.from('agent_actions').select('action_payload').eq('id', actionId).maybeSingle();
+    if (!row) return false;
+    const { error } = await supabase.from('agent_actions')
+      .update({ action_payload: { ...(row.action_payload || {}), email_ready_at: readyAtIso }, updated_at: new Date().toISOString() })
+      .eq('id', actionId);
+    if (error) { console.warn(`[SendMessage] email_ready_at stamp failed for action ${actionId}: ${error.message}`); return false; }
+    return true;
+  } catch (err) {
+    console.warn(`[SendMessage] email_ready_at stamp threw for action ${actionId}: ${err.message}`);
+    return false;
+  }
 }
 
 // ─── 2026-09-18 — A DECISION-MAKER MESSAGE NEVER GETS THE GENERIC FALLBACK ───
@@ -3419,21 +3471,26 @@ async function executeSendMessageInner(action, context, turnState = { held: null
   // the inbound system_events row; newestInboundAt is the fallback when the
   // source event could not be read. See decideEmailSendDelay (module top).
   const inboundAtIso = sourceEventMeta?.created_at || newestInboundAtPre || null;
+  const storedReadyAtMs = payload.email_ready_at ? Date.parse(payload.email_ready_at) : NaN;
   const emailDelay = decideEmailSendDelay({
     channel,
     inboundAtMs: inboundAtIso ? Date.parse(inboundAtIso) : NaN,
     nowMs: Date.now(),
+    storedReadyAtMs,
+    seed: sourceEventMeta?.id || action.event_id || payload.message_id || action.id || null,
   });
   if (emailDelay.defer) {
     const retryAt = new Date(emailDelay.retryAtMs).toISOString();
+    if (!Number.isFinite(storedReadyAtMs)) await stampEmailReadyAt(action.id, retryAt);
     console.log(
-      `[SendMessage] ⏳ email min delay: ${contactId} inbound at ${inboundAtIso} — ` +
-      `holding until ${retryAt} (${EMAIL_REPLY_MIN_DELAY_MS}ms floor)`
+      `[SendMessage] ⏳ email reply delay: ${contactId} inbound at ${inboundAtIso} — ` +
+      `holding until ${retryAt} (window ${EMAIL_REPLY_MIN_DELAY_MS}–${Number.isFinite(EMAIL_REPLY_MAX_DELAY_MS) ? EMAIL_REPLY_MAX_DELAY_MS : EMAIL_REPLY_MIN_DELAY_MS}ms)`
     );
     return {
       deferred: true,
       reason: 'email_min_delay',
       retry_at: retryAt,
+      email_ready_at: retryAt,
       contact_id: contactId,
       channel,
       inbound_at: inboundAtIso,
