@@ -258,6 +258,11 @@ test('marketsFromMatches: most matched leads first, unmatched ignored, none → 
   assert.deepEqual(marketsFromMatches([{ market: null }]), []);
 });
 
+test('marketsFromMatches: Boca, Miami and RFED are Fort Lauderdale, Lakeland is Orlando (2026-10-19)', () => {
+  assert.deepEqual(marketsFromMatches([{ market: 'BOCA_MKT' }, { market: 'MIAMI_MKT' }, { market: 'ORL_MKT' }]), ['FTLAU_MKT', 'ORL_MKT']);
+  assert.deepEqual(marketsFromMatches([{ market: 'RFED_MKT' }, { market: 'LAKE_MKT' }, { market: 'LAKE_MKT' }]), ['ORL_MKT', 'FTLAU_MKT']);
+});
+
 test('assignHeldFeedSpend: a matched day goes to its offices, an unmatched day splits by source, nothing else moves', async () => {
   const supabase = fakeSupabase({
     marketing_expenses: [
