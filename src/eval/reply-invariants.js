@@ -107,8 +107,11 @@ export function checkReply(reply, ctx = {}) {
   const team = enforceTeamVoice(text, { allowName: email ? 'email-sender' : (ctx.allowName || null) });
   for (const change of team.changes) fail(`team_voice:${change}`, change);
 
-  const scope = enforcePropertyScope(text, { inbound: ctx.inbound || '' });
+  // Past the demo (2026-10-19, Sam): the lead's side is not checked, like job
+  // scope below; any sentence about the home type or height still fails.
+  const scope = enforcePropertyScope(text, { inbound: ctx.inbound || '', pastDemo: !!ctx.postDemoLead });
   if (scope.changed) fail('property_scope', scope.reason);
+  if (ctx.postDemoLead) skipped.push('property_scope_lead_side');
 
   // No rentals, no commercial, the minimum, impact-only (the user, 2026-10-13).
   // The lead's side needs the thread (was the minimum already asked?); with no

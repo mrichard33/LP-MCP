@@ -371,6 +371,17 @@ the O.V copy is a GHL edit (`docs/ghl-concern-tag-split.md`). GHL's naive appoin
 `booking-claim.js` (Melissa's correct time read 4h early), and a booked lead's phone/email-only reply restates the time
 on file, never "confirm a time" (`isContactDetailsOnly`, `bookedDetailsLine`).
 
+**After the demo the home is never turned away, and "Neither" to call times is not a no (Sam, 2026-10-19).**
+IMWge24jxc0xO0ppy7OR asked about "a list of high-rises" his rep Chris had promised and got "we only work on buildings two
+stories or lower"; "Neither" to two Rehash Call times got "Did you get a chance to look over the proposal?" and counted as
+a no; he texted STOP. Extending the 2026-10-13 ruling (the user): `enforcePropertyScope(text, { pastDemo })` drops any
+home-type or height sentence instead of the lead-side "no" (`POST_DEMO_SCOPE_LINE` if nothing is left; checkReply skips
+`property_scope_lead_side` on `ctx.postDemoLead`), `planPostDemo` hands the question to the team (`rehash_scope_question`,
+`REHASH_REASONS` + `NO_DIAL_REASONS`), a mobile-home LP note is a `REQUIREMENT_SIGNALS` entry, and the height DQ rules
+carry `lp_had_demo: false` (`sql/seeds/2026-10-19_dq_above_2nd_floor_not_post_demo.sql`). `planRehashCall`: "Neither" /
+a bare no to our times asks once "When is a good day and time for a call?" (`rehash_ask_time`; `isPostDemoNo` does not
+count it, a no to that ask does), and a day or part of day gets two Rehash Call openings, never the pair just refused.
+
 **A post-demo lead is planned as post-demo, never as a new lead (Mark, 2026-10-09).** Five rehash threads got a stock
 discovery question after "Thank you I will.", two slot offers to "Follow up in November please.", a question after "Enjoy
 your week." and "Congratulations" to a lead who signed elsewhere: `planNepqTurn` never knew, and `enforceNepqPlan` step 7

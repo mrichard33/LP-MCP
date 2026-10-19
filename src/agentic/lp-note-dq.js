@@ -64,7 +64,8 @@ function statements(text) {
  */
 /** The signals that are the job requirements: a lead past its demo already
  *  meets them (the user, 2026-10-13; post-demo-lead.js). */
-export const REQUIREMENT_SIGNALS = Object.freeze(['renter', 'below_minimum']);
+// 2026-10-19 (Sam): a mobile-home note is a requirement the rep already saw at the demo too.
+export const REQUIREMENT_SIGNALS = Object.freeze(['renter', 'below_minimum', 'mobile_home']);
 
 export function detectNoteDq(notes, { skip = [] } = {}) {
   const skipped = new Set(skip || []);

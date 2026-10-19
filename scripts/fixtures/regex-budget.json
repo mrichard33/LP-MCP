@@ -1,5 +1,5 @@
 {
-  "count": 297,
+  "count": 298,
   "updated": "2026-10-19",
-  "reason": "REASONED_DECLINE_RX (not-interested.js): a firm decline with a reason is a no (Thomas Geary, Mark 2026-10-19); rehash_first_no_with_reason and not_interested read it through isNotInterested / isRehashNo. Phase 1 item 4 left 296."
+  "reason": "REHASH_TIME_ASK_RX (nepq-planner.js): our 'When is a good day and time for a call?' after a rehash lead turned both call times down; a no to it is a real no, 'Neither' to the times is not (Sam, rehash_neither_times). Was 297 after REASONED_DECLINE_RX (rehash_first_no_with_reason)."
 }

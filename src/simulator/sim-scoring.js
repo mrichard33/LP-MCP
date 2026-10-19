@@ -301,6 +301,30 @@ export const SCENARIO_EXPECTATIONS = Object.freeze({
     if (confirm && !replies(confirm).some(x => /\bgive\s+you\s+a\s+call\b/i.test(x))) out.push({ code: 'rehash_confirm_no_caller', detail: replies(confirm).join(' '), turn: confirm.turn });
     return out;
   },
+  // ── 2026-10-19 (Sam, IMWge24jxc0xO0ppy7OR) ──
+  // Ruling (the user, 2026-10-19): turning down two call times is not turning
+  // down the call (ask when works, then offer that), and a lead past the demo
+  // is never told we cannot work on the home (the rep already saw it).
+  rehash_neither_times: (r) => {
+    const out = rehashLaneFailures(r);
+    const t = r.transcript || [];
+    if (t[1] && t[1].nepq?.step !== 'rehash_ask_time') out.push({ code: 'neither_not_asked_when', detail: `step ${t[1].nepq?.step || 'none'}`, turn: t[1].turn });
+    if (t[1] && replies(t[1]).some(x => /\b(?:proposal|look\s+(?:it\s+)?over)\b/i.test(x))) out.push({ code: 'track_question_after_neither', detail: replies(t[1]).join(' '), turn: t[1].turn });
+    if (planSteps(r).includes('post_demo_stop')) out.push({ code: 'neither_counted_as_no', detail: 'the bot stopped after a no to the times' });
+    if (t[2] && t[2].nepq?.step !== 'rehash_offer') out.push({ code: 'day_not_offered', detail: `step ${t[2].nepq?.step || 'none'}`, turn: t[2].turn });
+    return out;
+  },
+  rehash_high_rise: (r) => {
+    const out = rehashLaneFailures(r);
+    const first = (r.transcript || [])[0];
+    const handoffReason = typeof first?.nepq?.handoff === 'string' ? first.nepq.handoff : first?.nepq?.handoff?.reason;
+    if (handoffReason !== 'rehash_scope_question') out.push({ code: 'scope_question_not_handed_off', detail: `step ${first?.nepq?.step || 'none'}`, turn: first?.turn });
+    for (const { turn: n, text } of allReplies(r)) {
+      if (/\btwo\s+stor|\bcan(?:'|’)?t\s+work\s+on\b|\boutside\s+what\s+we\b/i.test(text)) out.push({ code: 'turned_away_after_demo', detail: text, turn: n });
+    }
+    if (did(r, /would_file_callback_five9/)) out.push({ code: 'rehash_dialed', detail: 'a rehash hand-off was filed to Five9' });
+    return out;
+  },
   // ── 2026-10-17: a post-demo lead's sign-off ends the turn ──
   // Ruling: the brief "Rehash bot: hard stop on closers" (live threads of
   // 2026-10-15..17). The last turn is the closer (or Billy's first no): one

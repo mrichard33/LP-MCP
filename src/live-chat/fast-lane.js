@@ -1949,8 +1949,9 @@ export function createLiveChatFastLane(deps) {
         }
       }
       // A manufactured home or a building over two stories raised anywhere in
-      // this chat: never booked (2026-10-13, kept from #1274).
-      if (leadRaisesScope([...threadTurns.filter(t => t.direction !== 'outbound').map(t => t.text), body])) {
+      // this chat: never booked (2026-10-13, kept from #1274). Not past the
+      // demo: the rep already saw the home (2026-10-19, Sam).
+      if (!pastDemo && leadRaisesScope([...threadTurns.filter(t => t.direction !== 'outbound').map(t => t.text), body])) {
         return { reply: "Sorry, that's a home we can't work on, so we can't set up a visit for it.", record: { booking: 'refused_property_scope' } };
       }
       // Save what they typed BEFORE booking: the booking gate reads the
@@ -2056,7 +2057,7 @@ export function createLiveChatFastLane(deps) {
       }
       // We do not work on manufactured or mobile homes (2026-10-05): this
       // lane told a visitor "Yes, we work on manufactured homes."
-      const scope = enforcePropertyScope(draft, { inbound: body });
+      const scope = enforcePropertyScope(draft, { inbound: body, pastDemo });
       if (scope.changed) {
         d.log(`[PropertyScope] live chat ${contactId} ${scope.reason}`);
         draft = scope.text;

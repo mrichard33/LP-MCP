@@ -460,11 +460,11 @@ import {
 } from './agentic/service-area-turn.js';
 
 /**
- * v2.9.1 — the header version above, as a value. Stamped (with the deployed
+ * v2.9.2 — the header version above, as a value. Stamped (with the deployed
  * git sha) onto every fingerprint so a replay knows which generator wrote the
  * reply. Bump it with the header note.
  */
-export const RESPONSE_GENERATOR_VERSION = 'v2.9.1';
+export const RESPONSE_GENERATOR_VERSION = 'v2.9.2';
 
 // Provider + model resolved at call time by the shared client from the
 // `response_generator` fn key (customer_facing group). Legacy
@@ -1607,8 +1607,9 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
   // requirements. The shared prompt states the rental / commercial / minimum
   // rules and the count question for everyone; this tells the model they are
   // settled for this lead (the guards skip them too, post-demo-lead.js).
+  // 2026-10-19 (Sam): the home type and building height too (property-scope.js).
   if (postAppt.post || opts.rehash?.active || isPostDemoLead({ lp: context.lp, tags: context.lead?.current_tags || [], stageTag: context.lead?.current_stage_tag || null })) {
-    parts.push('', 'THIS LEAD IS PAST THEIR DEMO, so they already meet our job requirements. Do not ask how many windows or doors, whether they own the home, or anything about rentals, commercial property or a minimum, and never turn them away for any of those.');
+    parts.push('', 'THIS LEAD IS PAST THEIR DEMO, so they already meet our job requirements. Do not ask how many windows or doors, whether they own the home, or anything about rentals, commercial property or a minimum, and never turn them away for any of those. The rep already saw the home: never say we cannot work on it (a manufactured home, a building over two stories); if they ask about it, say our team will look into it and get back to them.');
   }
   // ─── POST-DEMO REHASH (2026-10-01, Mark) ───
   // An F.0 lead (tag active-f.0) is talking to the rehash rep, and the one goal
@@ -5364,7 +5365,10 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // question, a booking ask) lands on top of the "no". Every channel, email
   // included: it is a fact, not a voice rule. A lead who asked gets no visit.
   {
-    const scope = enforcePropertyScope(validated.message, { inbound: triggerMessage });
+    // 2026-10-19 (Sam): past the demo the rep already saw the home, so the
+    // lead-side "we only do two stories" is off; a scope sentence is dropped
+    // and the planner hands the question to the team (property-scope.js).
+    const scope = enforcePropertyScope(validated.message, { inbound: triggerMessage, pastDemo });
     if (scope.changed) {
       console.warn(`[PropertyScope] ${contactId} ${scope.reason}`);
       validated.message = scope.text;

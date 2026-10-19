@@ -339,6 +339,8 @@ test('invariants: each known bad reply is caught by its own check', () => {
   expect("Understood, Shawn. I'm here if anything changes. Anything else?", 'question_after_post_demo_stop', { postDemoStep: 'post_demo_stop' });
   // 2026-10-19 (Thomas Geary, agent_actions 573254): a post-demo email decline closed on a question written with a period.
   expect('We will not push on this one. If anything about the numbers is still unclear, what is the part you would want walked through again.', 'question_after_post_demo_decline_email', { channel: 'email', postDemoEmailStep: 'decline_first' });
+  // 2026-10-19 (Sam, IMWge24jxc0xO0ppy7OR): his rep had been to the high-rise; the reply turned him away.
+  expect('Sorry, we only work on buildings that are two stories or lower, so a taller building is outside what we can do. That goes for the whole building, not just the floor your home is on.', 'property_scope', { inbound: "I'm waiting for Chris to give me a list of high-rises that your company has done in the past.", postDemoLead: true });
   expect("I'm Mark, handling chat here in the office. What can I help with?", 'team_voice:team_identity');
   expect('Randy founded the company back in 1972. What got you looking?', 'team_voice:founder');
   expect('Yes, we work on manufactured homes. What area are you in?', 'property_scope', { inbound: 'Do you work on manufactured homes?' });

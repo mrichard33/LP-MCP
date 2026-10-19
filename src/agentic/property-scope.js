@@ -27,6 +27,16 @@
  *    home we cannot work on is the same mistake);
  *  - the draft claims we do, unprompted → that sentence becomes the rule's line.
  *
+ * 3. Past the demo (Sam, IMWge24jxc0xO0ppy7OR, 2026-10-18). His rep had already
+ *    been to the high-rise and he was waiting on a list of high-rises we had
+ *    done; the whole reply became "we only work on buildings two stories or
+ *    lower", contradicting our own rep, and he texted STOP five messages
+ *    later. Like job scope (the user, 2026-10-13: a lead past the demo already
+ *    meets our requirements), `pastDemo` turns the lead-side "no" off. Any
+ *    sentence about the home type or building height, a claim OR a denial, is
+ *    dropped instead: the planner hands the question to the team
+ *    (rehash_scope_question), and an empty reply becomes POST_DEMO_SCOPE_LINE.
+ *
  * Modular homes are deliberately NOT covered: nobody has ruled on them, and
  * folding them in would turn a guess into a "no".
  *
@@ -79,6 +89,7 @@ export const SCOPE_LINE = RULES[0].line;
 export const SCOPE_ANSWER = RULES[0].answer;
 export const HEIGHT_LINE = RULES[1].line;
 export const HEIGHT_ANSWER = RULES[1].answer;
+export const POST_DEMO_SCOPE_LINE = "Good question. I'll have our team look into that and get back to you.";
 
 function sentences(text) {
   return String(text || '').match(/[^.!?]+(?:[.!?]+|$)\s*/g) || [];
@@ -112,15 +123,32 @@ function draftSaysNo(rule, parts) {
   return parts.some(s => (rule.rx.test(s) && NEGATION_RX.test(s)) || (rule.limit && rule.limit.test(s)));
 }
 
+// Past the demo: a sentence about the home type or the building height, either
+// way. The limit phrasing ("two stories or lower") never matches rule.rx, so it
+// is read on its own.
+function aboutScope(s) {
+  return RULES.some(r => r.rx.test(s) || (r.limit && r.limit.test(s)))
+    || /\b(?:two|2)\s+stor(?:y|ey|ies|eys)\s+or\s+(?:less|lower|fewer)\b|\b(?:whole|entire)\s+building\b/i.test(s);
+}
+
 /**
  * @param {string} text            the draft reply
- * @param {{ inbound?: string }} [opts]  the lead's latest message(s)
+ * @param {{ inbound?: string, pastDemo?: boolean }} [opts]  the lead's latest
+ *   message(s); pastDemo: the lead is past their demo (isPostDemoLead)
  * @returns {{ text: string, changed: boolean, reason: string|null }}
- *   reason: '<rule>:lead_asked' or '<rule>:claimed_in_reply', comma-joined
+ *   reason: '<rule>:lead_asked', '<rule>:claimed_in_reply' or
+ *   'post_demo_dropped', comma-joined
  */
-export function enforcePropertyScope(text, { inbound = '' } = {}) {
+export function enforcePropertyScope(text, { inbound = '', pastDemo = false } = {}) {
   const draft = String(text || '');
   const parts = sentences(draft);
+
+  if (pastDemo) {
+    const kept = parts.filter(s => !aboutScope(s));
+    if (kept.length === parts.length) return { text: draft, changed: false, reason: null };
+    const body = kept.join('').trim();
+    return { text: body || POST_DEMO_SCOPE_LINE, changed: true, reason: 'post_demo_dropped' };
+  }
 
   const asked = RULES.filter(r => leadRaises(r, inbound) && !draftSaysNo(r, parts));
   if (asked.length) {
