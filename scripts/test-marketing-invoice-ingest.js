@@ -766,3 +766,26 @@ test('a Lead Gurus (feed) invoice is not reopened from Slack', async () => {
   assert.equal(r.action, 'reopen_refused_feed');
   assert.ok(supabase.tables.marketing_expenses.every((x) => x.status === 'approved'));
 });
+
+test('reconcileAllocations pages past PostgREST\'s 1,000-row cap (2026-10-19: 667 false failures)', async () => {
+  const marketing_expenses = [];
+  const marketing_expense_allocations = [];
+  for (let i = 0; i < 1500; i++) {
+    marketing_expenses.push({ id: `e${String(i).padStart(4, '0')}`, amount: 10, status: 'approved' });
+    marketing_expense_allocations.push({ id: `a${String(i).padStart(4, '0')}`, expense_id: `e${String(i).padStart(4, '0')}`, amount: 10 });
+  }
+  const base = fakeSupabase({ marketing_expenses, marketing_expense_allocations });
+  // Like the real server: a read with no range returns at most 1,000 rows.
+  const capped = { ...base, from(t) {
+    const c = base.from(t);
+    let ranged = false;
+    const range = c.range;
+    c.range = (a, b) => { ranged = true; return range(a, b); };
+    const then = c.then;
+    c.then = (res, rej) => { if (!ranged) range(0, 999); return then(res, rej); };
+    return c;
+  } };
+  assert.deepEqual(await reconcileAllocations({ supabase: capped }), []);
+  base.tables.marketing_expense_allocations.find((a) => a.expense_id === 'e1400').amount = 9;
+  assert.deepEqual((await reconcileAllocations({ supabase: capped })).map((x) => x.id), ['e1400']);
+});
