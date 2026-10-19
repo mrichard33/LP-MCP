@@ -43,6 +43,9 @@ const SHOWCASE = src('743', 'TownShowCase / TownShowCase', 'Town Showcase');
 const BILLBOARD = src('797', 'Job Signs / Billboard', 'Billboard-Trailer Job Signs');
 const STICKY = (line) => src('774', 'Canvass Sticky / Canvass Sticky', line);
 const CHATBOT = src('830', 'Website / Reece ChatBot', 'Internet - Reece Chatbot');
+// 2026-10-19 (the user): an Appointment Set call on this line was listed
+// unmapped_number; lp_source_catalog has "Gwinnett Newspaper" as 881.
+const GWINNETT_NEWSPAPER = src('881', 'Newspaper / Gwinnett Newspaper', 'Newspaper - Gwinnett - FL');
 
 /** Called number (10 digits) → Sub-Source. One row per tracking number. */
 export const CAPTURE_SOURCES_BY_NUMBER = Object.freeze({
@@ -61,6 +64,7 @@ export const CAPTURE_SOURCES_BY_NUMBER = Object.freeze({
   '2397665799': STICKY('Ft Myers Sticky'),
   '9047129091': STICKY('JAX Sticky'),
   '9548901067': CHATBOT,
+  '7272737077': GWINNETT_NEWSPAPER,
 });
 
 export const MAIN_NUMBER_SOURCE = src('91', 'RCI / Reece Call In', 'Main Number');

@@ -888,7 +888,9 @@ restores hourly only. The view `v_new_callers_no_lp_30d` is no longer read (~20s
 LP lead EVER): `buildCallersSql` has its filters, drops only a caller with a lead from the 15 days before the call, and
 `src/inbound-capture-match.js` decides the rest (option B): an LP inquiry still waiting to be checked out, or a lead
 from the last 15 days, is the caller's lead (`already_in_lp`, nothing created); only older leads make a returning
-caller, captured as a NEW lead. It reads lp_leads (by phone, alt phone, the contact's LP Lead ID), `lp_inbound_queue`,
+caller, captured as a NEW lead, unless LP changed an older lead from an hour before the call on (the agent
+worked it for this call: 9419281328's visit went on their 2023 lead, 2026-10-19; `lastChangedOn` / `updated_at_lp`,
+Eastern wall clock, `lpTimeMs`). It reads lp_leads (by phone, alt phone, the contact's LP Lead ID), `lp_inbound_queue`,
 then LP live by phone (`findExistingLpLead`, exported from lp-lead.js) when those settled nothing: lp_leads holds 16% of
 February's and 5% of April's leads. A failed read is `unverified`, never "no lead". 8e30ff37 skips any contact whose LP
 Lead ID is filled ("Already Sent to LP?"), so a returning caller's old id is cleared, read back and noted on the contact

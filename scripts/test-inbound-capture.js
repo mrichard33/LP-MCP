@@ -26,7 +26,7 @@ import {
   captureMode, dueSlot, contactSource, TABLE, ACTION_TYPE, readCalledNumbers,
   callToWatch, scheduleCaptureForCall, buildCallersSql, instantEnabled,
 } from '../src/jobs/inbound-caller-capture.js';
-import { decideLeadMatch, readLeadMatch } from '../src/inbound-capture-match.js';
+import { decideLeadMatch, readLeadMatch, lpTimeMs } from '../src/inbound-capture-match.js';
 import {
   captureSourceFor, CAPTURE_SOURCES_BY_NUMBER, CAPTURE_PROMOTER, LP_SOURCE_ID_FIELD, PRO_ID_FIELD,
 } from '../src/inbound-capture-source.js';
@@ -866,6 +866,39 @@ test('match: a lead with no date is treated as brand new (reuse, never a duplica
   assert.equal(decideLeadMatch({ callAtMs: CALL_AT, liveRead: true, live: { ldsId: '2', createdAtLp: null } }).verdict, 'reuse');
   assert.equal(decideLeadMatch({ callAtMs: CALL_AT, ghlLeadId: '999999', liveRead: true, live: null }).verdict, 'reuse',
     'an LP Lead ID on the contact that nothing can date');
+});
+
+// 2026-10-19: 9419281328 called the Gwinnett newspaper line at 15:15 UTC and
+// the agent set the visit on the caller's 2023 lead 226131 (LP changed it at
+// 11:16-11:34 ET). Entry date alone made it a returning caller: a duplicate.
+test('match: an old lead an agent worked for this call is the lead (Supabase or LP live)', () => {
+  const call = Date.parse('2026-10-19T15:15:21Z');
+  const old = [{ lp_lead_id: '226131', lp_prospect_id: '186676', created_at_lp: '2023-03-31T16:06:03Z', updated_at_lp: '2026-10-19T15:34:59Z' }];
+  const m = decideLeadMatch({ callAtMs: call, supabaseLeads: old });
+  assert.equal(m.verdict, 'reuse');
+  assert.equal(m.lead.lead_id, '226131');
+  assert.equal(m.lead.changed, undefined, 'internal field stripped');
+  // lp_leads not synced yet: LP live's Eastern wall clock decides.
+  const stale = [{ ...old[0], updated_at_lp: '2025-01-01T00:00:00Z' }];
+  const live = { ldsId: '226131', prospectId: '186676', createdAtLp: '2023-03-31T16:06:03.1', lastChangedOn: '2026-10-19T11:16:01.2' };
+  assert.equal(decideLeadMatch({ callAtMs: call, supabaseLeads: stale }).verdict, 'need_live');
+  assert.equal(decideLeadMatch({ callAtMs: call, supabaseLeads: stale, liveRead: true, live }).verdict, 'reuse');
+  // Changed more than an hour before the call: not this call's work.
+  assert.equal(decideLeadMatch({ callAtMs: call, liveRead: true, live: { ...live, lastChangedOn: '2026-10-19T10:05:00' } }).verdict, 'create_returning');
+  assert.equal(decideLeadMatch({ callAtMs: call, liveRead: true, live: { ...live, lastChangedOn: null } }).verdict, 'create_returning');
+});
+
+test('lpTimeMs: bare LP digits are Eastern; a zoned string is taken as is', () => {
+  assert.equal(lpTimeMs('2026-10-19T11:16:01'), Date.parse('2026-10-19T15:16:01Z'));
+  assert.equal(lpTimeMs('2026-01-15T11:00:00'), Date.parse('2026-01-15T16:00:00Z'));
+  assert.equal(lpTimeMs('2026-10-19 15:34:59+00'), Date.parse('2026-10-19T15:34:59Z'));
+  assert.equal(lpTimeMs(''), null);
+});
+
+test('source: the Gwinnett newspaper line is Gwinnett Newspaper (881)', () => {
+  const got = captureSourceFor({ calledNumber: '7272737077', campaign: 'Newspaper - Gwinnett - FL' });
+  assert.equal(got.srsId, '881');
+  assert.equal(got.proId, '5686');
 });
 
 test('match: a failed LP read is unverified, never "no lead"', () => {
