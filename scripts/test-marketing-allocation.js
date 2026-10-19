@@ -159,3 +159,60 @@ test('a vendor split evenly keeps its category and split whatever the model gues
   assert.deepEqual(lineProblems, []);
   assert.deepEqual([rows[0].lp_sub_sources, rows[0].eligible_markets], [['Call Center'], ['ALL_OFFICES']]);
 });
+
+// 2026-10-19, the user: "hide fields when they're not needed".
+import { buildEditView } from '../src/marketing/slack-review.js';
+const ids = (v) => v.blocks.map((b) => b.block_id);
+const DOCX = { id: '11111111-1111-4111-8111-111111111111' };
+const pick = (value) => ({ selected_option: { value } });
+
+test('Edit form shows only the fields the chosen cost needs', () => {
+  const soft = buildEditView({ document: DOCX, facts: { vendor_name_hint: 'Unbounce' }, rows: [{ amount: 149, lp_sub_sources: ['Software'], eligible_markets: ['ALL_OFFICES'] }] });
+  assert.deepEqual(ids(soft), ['vendor', 'new_vendor', 'invoice_number', 'period_start', 'period_end', 'amount', 'split', 'remember']);
+  const lead = buildEditView({ document: DOCX, facts: {}, rows: [{ amount: 10, lp_sub_sources: ['Vis PPC'], eligible_markets: [] }] });
+  assert.ok(ids(lead).includes('sub_source') && !ids(lead).includes('markets'));
+  const pinned = buildEditView({ document: DOCX, facts: {}, rows: [{ amount: 10, lp_sub_sources: ['Vis PPC'], eligible_markets: ['REECE_HOLD'] }] });
+  assert.ok(ids(pinned).includes('sub_source') && ids(pinned).includes('markets'));
+  const vendor = buildEditView({ document: DOCX, vendor: { id: 'v1' }, vendors: [{ id: 'v1', vendor_name: 'Hatch' }], facts: {}, rows: [{ lp_sub_sources: ['Software'], eligible_markets: ['ALL_OFFICES'] }] });
+  assert.ok(!ids(vendor).includes('new_vendor'), 'a picked vendor hides "New vendor"');
+  for (const v of [soft, lead]) {
+    assert.ok(v.blocks.find((b) => b.block_id === 'split').dispatch_action, 'the cost choice redraws the form');
+    assert.ok(v.blocks.find((b) => b.block_id === 'vendor').dispatch_action, 'the vendor pick redraws the form');
+  }
+});
+
+test('Edit form redraw follows the new choice and keeps what was typed, even a cleared box', () => {
+  const rows = [{ amount: 149, lp_sub_sources: ['Software'], eligible_markets: ['ALL_OFFICES'] }];
+  const state = {
+    vendor: { mktinv_v_vendor: { selected_option: null } },
+    new_vendor: { mktinv_v_new_vendor: { value: 'Unbounce' } },
+    invoice_number: { mktinv_v_invoice_number: { value: null } },
+    period_start: { mktinv_v_period_start: { selected_date: '2026-10-11' } },
+    period_end: { mktinv_v_period_end: { selected_date: '2026-11-11' } },
+    amount: { mktinv_v_amount: { value: '150' } },
+    split: { mktinv_v_split: pick('markets') },
+    remember: { mktinv_v_remember: { selected_options: [] } },
+  };
+  const v = buildEditView({ document: DOCX, facts: { invoice_number: '400' }, rows, state });
+  assert.ok(ids(v).includes('sub_source') && ids(v).includes('markets'));
+  const by = (id) => v.blocks.find((b) => b.block_id === id).element;
+  assert.equal(by('amount').initial_value, '150');
+  assert.equal(by('invoice_number').initial_value, '', 'a cleared box stays cleared');
+  assert.equal(by('sub_source').initial_value, '', 'never prefilled with the "Software" category');
+  assert.equal(by('markets').initial_options, undefined, 'ALL_OFFICES is not a market chip');
+  assert.equal(by('remember').initial_options, undefined, 'an unticked Remember stays unticked');
+  assert.equal(by('period_end').initial_date, '2026-11-11');
+});
+
+// 2026-10-19, the user: "why so many lines? combine per market".
+import { groupLines, groupAllocations } from '../src/marketing/slack-review.js';
+test('card combines repeated invoice lines and sums the allocation per month and market', () => {
+  const r = (amount, description) => ({ amount, description, lp_sub_sources: ['Modernize'], eligible_markets: [] });
+  const g = groupLines([r(85, 'FTLAU leads'), r(15, 'ORL leads'), r(132, 'FTLAU leads')]);
+  assert.deepEqual(g.map((x) => [x.description, x.amount, x.count]), [['FTLAU leads', 217, 2], ['ORL leads', 15, 1]]);
+  const a = (market, amount, basis) => ({ month: '2026-10-01', market, amount, rule: 'proportional', issued_basis: basis, issued_total: 30 });
+  const sum = groupAllocations([a('ORL_MKT', 10.2, 9), a('FTLAU_MKT', 4.53, 4), a('ORL_MKT', 67.2, 9), a('FTLAU_MKT', 29.86, 4)]);
+  assert.deepEqual(sum.map((x) => [x.market, x.amount, x.rule, x.issued_basis]), [['FTLAU_MKT', 34.39, 'proportional', 4], ['ORL_MKT', 77.4, 'proportional', 9]]);
+  const mixed = groupAllocations([a('SAR_MKT', 5, 1), { month: '2026-10-01', market: 'SAR_MKT', amount: 5, rule: 'direct', issued_basis: 1, issued_total: 1 }]);
+  assert.deepEqual([mixed[0].amount, mixed[0].rule], [10, null]);
+});

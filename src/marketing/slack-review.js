@@ -73,6 +73,42 @@ function extractionLine(extraction) {
   return ocr ? `OCR ${ocr} of ${pages} page(s)` : `text layer (${pages} page(s))`;
 }
 
+/** Card only: invoice lines with the same description, sub-source and split, summed (first-seen order). */
+export function groupLines(rows = []) {
+  const groups = new Map();
+  for (const r of rows) {
+    const description = String(r.description || 'line').trim();
+    const subs = (r.lp_sub_sources || []).join(', ');
+    const split = splitLabel(r);
+    const key = `${description}\u0000${subs}\u0000${split}`;
+    const g = groups.get(key) || { description, subs, split, amount: 0, count: 0 };
+    g.amount = Math.round((g.amount + (Number(r.amount) || 0)) * 100) / 100;
+    g.count += 1;
+    groups.set(key, g);
+  }
+  return [...groups.values()];
+}
+
+/**
+ * Card only: allocation rows summed per month × market. The rule and issued
+ * basis show when every summed row agrees (one month's issued counts are the
+ * same for every line of a sub-source); notes are kept once each.
+ */
+export function groupAllocations(allocation = []) {
+  const groups = new Map();
+  for (const a of allocation) {
+    const key = `${a.month}\u0000${a.market}`;
+    const g = groups.get(key);
+    if (!g) { groups.set(key, { ...a, amount: Math.round(Number(a.amount || 0) * 100) / 100, notes: a.note ? [a.note] : [] }); continue; }
+    g.amount = Math.round((g.amount + Number(a.amount || 0)) * 100) / 100;
+    if (g.rule !== a.rule || g.issued_basis !== a.issued_basis || g.issued_total !== a.issued_total) { g.rule = null; g.issued_basis = null; g.issued_total = null; }
+    if (a.note && !g.notes.includes(a.note)) g.notes.push(a.note);
+  }
+  return [...groups.values()]
+    .map(({ notes, ...g }) => ({ ...g, note: notes.join('; ') || undefined }))
+    .sort((x, y) => (x.month === y.month ? marketLabel(x.market).localeCompare(marketLabel(y.market)) : x.month.localeCompare(y.month)));
+}
+
 /**
  * @param {object} p
  * @param {object} p.document
@@ -110,12 +146,15 @@ export function buildReviewCard({
     vendor ? `Vendor matched by ${escapeMrkdwn(vendorMethod || 'rules')}` : '⚠️ Vendor not matched — use Edit to pick one',
   ].join('\n');
 
+  // 2026-10-19 (the user: "why so many lines? combine per market"): the card
+  // shows one line per kind of charge and one allocation line per month ×
+  // market. The ledger keeps every invoice line; only the card sums them.
   const lineText = rows.length
-    ? rows.map((r) => `• ${usd(r.amount)} — ${escapeMrkdwn(r.description || 'line')} → ${escapeMrkdwn((r.lp_sub_sources || []).join(', ') || 'sub-source?')} · ${splitLabel(r)}`).join('\n')
+    ? groupLines(rows).map((g) => `• ${usd(g.amount)} — ${escapeMrkdwn(g.description)}${g.count > 1 ? ` _(${g.count} lines)_` : ''} → ${escapeMrkdwn(g.subs || 'sub-source?')} · ${g.split}`).join('\n')
     : '_no lines_';
 
   const allocText = allocation.length
-    ? allocation.map((a) => `• ${a.month.slice(0, 7)} ${marketLabel(a.market)}: ${usd(a.amount)} (${a.rule}${a.issued_total != null && a.rule !== 'direct' ? `, ${a.issued_basis}/${a.issued_total} issued` : ''})${a.note ? ` _${escapeMrkdwn(a.note)}_` : ''}`).join('\n')
+    ? groupAllocations(allocation).map((a) => `• ${a.month.slice(0, 7)} ${marketLabel(a.market)}: ${usd(a.amount)}${a.rule ? ` (${a.rule}${a.issued_total != null && a.rule !== 'direct' ? `, ${a.issued_basis}/${a.issued_total} issued` : ''})` : ''}${a.note ? ` _${escapeMrkdwn(a.note)}_` : ''}`).join('\n')
     : '_cannot preview: fix the flags first_';
 
   const flagText = flags.length
@@ -158,17 +197,69 @@ export function buildReviewCard({
   return { text, blocks };
 }
 
-/** The edit modal (views.open). private_metadata carries the document id. */
-export function buildEditView({ document, vendor, facts, rows = [], vendors = [] }) {
+/**
+ * The edit modal (views.open / views.update). private_metadata carries the
+ * document id.
+ *
+ * 2026-10-19 (the user: "make it hide fields when they're not needed … as
+ * simple and easy to understand as possible"): the form shows only what the
+ * current choice needs, and redraws itself when "What is this cost?" or the
+ * vendor pick changes (dispatch_action → handler → views.update):
+ *   software / call center   → no sub-source, no markets
+ *   lead source, by leads    → sub-source
+ *   lead source, markets     → sub-source + markets
+ *   a vendor picked          → no "New vendor" box
+ * `state` is the open form's view.state.values on a redraw; what was typed or
+ * picked there is carried into the new form so nothing is lost.
+ */
+export function buildEditView({ document, vendor, facts, rows = [], vendors = [], state = null }) {
   const first = rows[0] || {};
+  const typed = (block, key = 'value') => state?.[block]?.[`mktinv_v_${block}`]?.[key];
+  const had = (block) => !!(state && state[block]);
   const vendorOptions = vendors.slice(0, 100).map((v) => ({ text: { type: 'plain_text', text: String(v.vendor_name).slice(0, 75) }, value: String(v.id) }));
-  const vendorInitial = vendor ? vendorOptions.find((o) => o.value === String(vendor.id)) : null;
+  const vendorPickedId = state ? typed('vendor', 'selected_option')?.value || null : (vendor ? String(vendor.id) : null);
+  const vendorInitial = vendorPickedId ? vendorOptions.find((o) => o.value === vendorPickedId) : null;
   const marketOptions = MARKET_OPTIONS.map(([c, l]) => ({ text: { type: 'plain_text', text: l }, value: c }));
-  const marketInitial = marketOptions.filter((o) => (first.eligible_markets || []).includes(o.value));
+  const marketsPicked = had('markets') ? (typed('markets', 'selected_options') || []).map((o) => o.value) : (first.eligible_markets || []).filter((m) => m !== ALL_OFFICES);
+  const marketInitial = marketOptions.filter((o) => marketsPicked.includes(o.value));
   const splitOptions = SPLIT_OPTIONS.map(([v, l]) => ({ text: { type: 'plain_text', text: l }, value: v }));
-  const splitInitial = splitOptions.find((o) => o.value === splitChoice(first));
+  const split = (state && typed('split', 'selected_option')?.value) || splitChoice(first);
+  const splitInitial = splitOptions.find((o) => o.value === split);
+  const isLeadSource = split === 'by_source' || split === 'markets';
   const rememberOption = { text: { type: 'plain_text', text: 'Use this vendor, sub-source and split for this vendor\'s next invoices' }, value: 'remember' };
-  const input = (block_id, label, element, hint) => ({ type: 'input', block_id, label: { type: 'plain_text', text: label }, element, optional: true, ...(hint ? { hint: { type: 'plain_text', text: hint } } : {}) });
+  const rememberInitial = had('remember') ? (typed('remember', 'selected_options') || []) : [rememberOption];
+  // On a redraw, a field the open form had keeps exactly what is in it (even
+  // when cleared); a field it did not have (it was hidden) starts from the line.
+  const text = (block, fallback) => String((had(block) ? typed(block) : fallback) ?? '');
+  const date = (block, fallback) => (had(block) ? typed(block, 'selected_date') : fallback) || null;
+  const input = (block_id, label, element, extra = {}) => ({ type: 'input', block_id, label: { type: 'plain_text', text: label }, element, optional: true, ...extra });
+  const hint = (t) => ({ hint: { type: 'plain_text', text: t } });
+  // A category line carries "Software" / "Call Center" as its sub-source; never
+  // show that in the box when switching to a lead source.
+  const subsPrefill = (first.lp_sub_sources || []).filter((x) => !Object.values(COST_CATEGORIES).some((l) => l.toLowerCase() === String(x).trim().toLowerCase())).join(', ');
+  const blocks = [
+    input('vendor', 'Vendor', { type: 'static_select', action_id: 'mktinv_v_vendor', placeholder: { type: 'plain_text', text: 'Pick a vendor' }, options: vendorOptions, ...(vendorInitial ? { initial_option: vendorInitial } : {}) }, { dispatch_action: true }),
+  ];
+  // 2026-10-13 (the user): "allow editing and adding options when they don't
+  // already exist". A vendor typed here is created on Save. Hidden once one is picked.
+  if (!vendorInitial) {
+    blocks.push(input('new_vendor', 'New vendor (only if it is not in the list)', { type: 'plain_text_input', action_id: 'mktinv_v_new_vendor', initial_value: text('new_vendor', vendor ? '' : String(facts?.vendor_name_hint || '').slice(0, 150)) }));
+  }
+  blocks.push(
+    input('invoice_number', 'Invoice #', { type: 'plain_text_input', action_id: 'mktinv_v_invoice_number', initial_value: text('invoice_number', facts?.invoice_number) }),
+    input('period_start', 'Period start', { type: 'datepicker', action_id: 'mktinv_v_period_start', ...(date('period_start', facts?.period_start) ? { initial_date: date('period_start', facts?.period_start) } : {}) }),
+    input('period_end', 'Period end', { type: 'datepicker', action_id: 'mktinv_v_period_end', ...(date('period_end', facts?.period_end) ? { initial_date: date('period_end', facts?.period_end) } : {}) }),
+    input('amount', rows.length > 1 ? 'Total (leave blank to keep the lines as they are)' : 'Amount', { type: 'plain_text_input', action_id: 'mktinv_v_amount', initial_value: text('amount', first.amount != null ? String(first.amount) : '') }),
+    input('split', 'What is this cost?', { type: 'radio_buttons', action_id: 'mktinv_v_split', options: splitOptions, ...(splitInitial ? { initial_option: splitInitial } : {}) }, { dispatch_action: true }),
+  );
+  if (isLeadSource) {
+    blocks.push(input('sub_source', 'LP sub-source', { type: 'plain_text_input', action_id: 'mktinv_v_sub_source', initial_value: text('sub_source', subsPrefill) }, hint('Must match the sub-source in Lead Perfection exactly.')));
+  }
+  if (split === 'markets') {
+    blocks.push(input('markets', 'Markets', { type: 'multi_static_select', action_id: 'mktinv_v_markets', placeholder: { type: 'plain_text', text: 'Pick one or more' }, options: marketOptions, ...(marketInitial.length ? { initial_options: marketInitial } : {}) },
+      hint('One office gets all of it. Several are split by their issued leads. "Hold at company level" parks it unassigned (not split) until you move it.')));
+  }
+  blocks.push(input('remember', 'Remember', { type: 'checkboxes', action_id: 'mktinv_v_remember', options: [rememberOption], ...(rememberInitial.length ? { initial_options: [rememberOption] } : {}) }));
   return {
     type: 'modal',
     callback_id: MKTINV_EDIT_CALLBACK,
@@ -176,24 +267,7 @@ export function buildEditView({ document, vendor, facts, rows = [], vendors = []
     title: { type: 'plain_text', text: 'Edit invoice' },
     submit: { type: 'plain_text', text: 'Save' },
     close: { type: 'plain_text', text: 'Cancel' },
-    blocks: [
-      input('vendor', 'Vendor', { type: 'static_select', action_id: 'mktinv_v_vendor', options: vendorOptions, ...(vendorInitial ? { initial_option: vendorInitial } : {}) }),
-      // 2026-10-13 (the user): "allow editing and adding options when they
-      // don't already exist". A vendor typed here is created on Save.
-      input('new_vendor', 'New vendor (only if it is not in the list above)', { type: 'plain_text_input', action_id: 'mktinv_v_new_vendor', initial_value: vendor ? '' : String(facts?.vendor_name_hint || '').slice(0, 150) }),
-      input('invoice_number', 'Invoice #', { type: 'plain_text_input', action_id: 'mktinv_v_invoice_number', initial_value: String(facts?.invoice_number || '') }),
-      input('period_start', 'Period start', { type: 'datepicker', action_id: 'mktinv_v_period_start', ...(facts?.period_start ? { initial_date: facts.period_start } : {}) }),
-      input('period_end', 'Period end', { type: 'datepicker', action_id: 'mktinv_v_period_end', ...(facts?.period_end ? { initial_date: facts.period_end } : {}) }),
-      input('amount', rows.length > 1 ? 'Total (leave blank to keep the lines as they are)' : 'Amount', { type: 'plain_text_input', action_id: 'mktinv_v_amount', initial_value: first.amount != null ? String(first.amount) : '' }),
-      input('sub_source', 'LP sub-source (lead sources only; type a new one if needed)', { type: 'plain_text_input', action_id: 'mktinv_v_sub_source', initial_value: (first.lp_sub_sources || []).join(', ') }),
-      input('split', 'What is this cost?', { type: 'radio_buttons', action_id: 'mktinv_v_split', options: splitOptions, ...(splitInitial ? { initial_option: splitInitial } : {}) }),
-      // 2026-10-19 (the user was unsure what "Hold at company level" does):
-      // say plainly that Hold parks the money and does NOT split it, and that
-      // this box is ignored for software, call center and by-issued-leads.
-      input('markets', 'Markets (only for "Lead source: only the markets picked below")', { type: 'multi_static_select', action_id: 'mktinv_v_markets', options: marketOptions, ...(marketInitial.length ? { initial_options: marketInitial } : {}) },
-        'Ignored for software, call center and "split by its issued leads". Pick one office to give it all the cost, several to split by their issued leads. "Hold at company level" parks the cost unassigned (not split) until you move it.'),
-      input('remember', 'Remember', { type: 'checkboxes', action_id: 'mktinv_v_remember', options: [rememberOption], initial_options: [rememberOption] }),
-    ],
+    blocks,
   };
 }
 

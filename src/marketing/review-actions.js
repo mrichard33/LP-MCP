@@ -66,6 +66,24 @@ export async function openSlackView(triggerId, view, { token = process.env.SLACK
   }
 }
 
+/** views.update — redraw an open modal. Never throws. `hash` guards against racing a newer redraw. */
+export async function updateSlackView(viewId, view, { hash = '', token = process.env.SLACK_BOT_TOKEN, fetchImpl = fetch } = {}) {
+  if (!viewId) return { ok: false, error: 'no_view_id' };
+  if (!token) return { ok: false, error: 'no_token' };
+  try {
+    const res = await fetchImpl('https://slack.com/api/views.update', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json; charset=utf-8', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ view_id: viewId, view, ...(hash ? { hash } : {}) }),
+      signal: AbortSignal.timeout(8000),
+    });
+    const body = await res.json().catch(() => ({}));
+    return body?.ok ? { ok: true } : { ok: false, error: String(body?.error || res.status) };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+}
+
 export async function signedOriginalLink(document, { supabase = supabaseDefault } = {}) {
   if (!document?.storage_path || !supabase) return null;
   try {
@@ -158,6 +176,16 @@ export async function handleMarketingInvoiceInteraction(parsed, deps = {}) {
       await reply(responseUrl, { response_type: 'ephemeral', replace_original: false, text: `Could not open the edit form (${r.error}).` });
     }
     return { handled: true, action: r.ok ? 'edit_opened' : 'edit_failed' };
+  }
+
+  // 2026-10-19: a choice changed inside the open Edit form → redraw it with only
+  // the fields that choice needs (slack-review.js buildEditView). Nothing is saved.
+  if (decision === 'form_change') {
+    const { data: vendors } = await supabase.from('marketing_vendors').select('id, vendor_name').eq('is_active', true).order('vendor_name');
+    const view = buildEditView({ document: ctx.document, vendor: ctx.vendor, facts: ctx.facts, rows: pending.length ? pending : ctx.rows, vendors: vendors || [], state: parsed.values || {} });
+    const r = await (deps.updateView || updateSlackView)(parsed.viewId, view, { hash: parsed.viewHash });
+    if (!r.ok && r.error !== 'hash_conflict') console.warn(`${LOG} edit form redraw for ${documentId} failed: ${r.error}`);
+    return { handled: true, action: r.ok ? 'form_redrawn' : 'form_redraw_failed' };
   }
 
   if (decision === 'edit_submit') {

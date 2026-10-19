@@ -218,6 +218,8 @@ export function isDncLiftAction(rawBody) {
 // view_submission at all. Authorised against MKT_INVOICE_APPROVER_SLACK_IDS
 // (Mark, Brad Codman — D6), empty = nobody, in src/marketing/review-actions.js.
 export const MKT_INVOICE_ACTION_PREFIX = 'mktinv_';
+/** Choices inside the Edit form that redraw it (show/hide fields). Keep in step with slack-review.js. */
+export const MKT_INVOICE_FORM_CHANGE_ACTIONS = Object.freeze(['mktinv_v_split', 'mktinv_v_vendor']);
 
 function payloadOf(rawBody) {
   const params = new URLSearchParams(Buffer.isBuffer(rawBody) ? rawBody.toString('utf8') : String(rawBody || ''));
@@ -251,6 +253,18 @@ export function parseMarketingInvoiceInteraction(rawBody) {
     const action = Array.isArray(p.actions) ? p.actions[0] : null;
     const id = String(action?.action_id || '');
     if (!id.startsWith(MKT_INVOICE_ACTION_PREFIX)) return null;
+    // 2026-10-19: a choice changed INSIDE the open Edit form ("What is this
+    // cost?" or the vendor pick). The form redraws itself to show only the
+    // fields that choice needs; the document id rides in private_metadata.
+    if (p.view && MKT_INVOICE_FORM_CHANGE_ACTIONS.includes(id)) {
+      const documentId = String(p.view.private_metadata || '').trim();
+      if (!UUID_RE.test(documentId)) return null;
+      return {
+        kind: 'mktinv', decision: 'form_change', documentId, ...user,
+        viewId: String(p.view.id || ''), viewHash: String(p.view.hash || ''),
+        values: p.view.state?.values || {}, triggerId: '', responseUrl: '',
+      };
+    }
     const decision = id.slice(MKT_INVOICE_ACTION_PREFIX.length);
     if (!['approve', 'reject', 'edit'].includes(decision)) return null;
     const documentId = String(action.value ?? '').trim();

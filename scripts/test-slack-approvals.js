@@ -484,6 +484,17 @@ test('mktinv: predicate sees the three buttons and the edit modal, nothing else'
   assert.equal(isMarketingInvoiceAction('garbage'), false);
 });
 
+test('mktinv: a choice inside the open Edit form parses as form_change with the view to redraw', () => {
+  const body = formBody({
+    type: 'block_actions', user: { id: 'U1', name: 'mark' }, actions: [{ action_id: 'mktinv_v_split' }],
+    view: { id: 'V1', hash: 'h1', callback_id: 'mktinv_edit', private_metadata: DOC, state: { values: { split: { mktinv_v_split: { selected_option: { value: 'software' } } } } } },
+  });
+  assert.equal(isMarketingInvoiceAction(body), true);
+  const p = parseMarketingInvoiceInteraction(body);
+  assert.deepEqual([p.decision, p.documentId, p.viewId, p.viewHash], ['form_change', DOC, 'V1', 'h1']);
+  assert.equal(p.values.split.mktinv_v_split.selected_option.value, 'software');
+});
+
 test('mktinv: parse — decisions, uuid document id, modal values; malformed → null', () => {
   const p = parseMarketingInvoiceInteraction(mktClick('mktinv_approve'));
   assert.equal(p.kind, 'mktinv');
