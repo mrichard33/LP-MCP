@@ -1031,11 +1031,15 @@ Job `p2-parity-sweep` (`src/jobs/p2-parity-sweep.js`, every 30 min; rules `src/p
 `lp_job_milestones` (each misses rows), mapped by the live `P2_MILESTONE_*` rules (`src/p2-milestone-map.js`), and the
 job's value. Rulings: a card ahead of LP moves BACK; a repeat buyer's one card follows the NEWER live job (re-stamped,
 reopened; never a placeholder or near-duplicate). Every difference is re-read live from GHL first; a card changed in the
-last 30 min waits; anything unreadable writes nothing; `P2_PARITY_MAX_WRITES` (50) a pass, status first. A repair that
-moves an open card adds `p2-stage-heal`, which GHL C.1/C.2/C.4 must consume and exit on
-(`docs/ghl-p2-customer-workflow-fixes.md`, which also lists C.0-IN's backward reset and L.6's missing C-series
-removals). `P2_PARITY_MODE` off|shadow|live, default shadow (`p2.parity` would_change events), live after 3 reviewed
-days. No LP job is a report, never a write (`scripts/repair-p2-missing-lp-jobs.js`).
+last 30 min waits; anything unreadable writes nothing; `P2_PARITY_MAX_WRITES` (50) a pass, status first.
+`P2_PARITY_MODE` off|shadow|live, **default live** (the user, 2026-10-20: "go live right away because no messages are
+firing"; `p2.parity` done / failed / would_change events). Every P2 loss (the sweep's, and rule 365's through
+`executeUpdateOpportunity`) also takes the customer out of C.0–C.5 (`src/p2-parity/customer-workflows.js`): GHL L.6's
+removal list has none of them, and GHL's API can remove a contact from a workflow but cannot edit one. The repair tag
+`p2-stage-heal` (moves into stages 4–8 of an open card) is OFF until `P2_HEAL_TAG=on`: turn it on only once GHL
+C.1/C.2/C.4 have the first step that consumes it, or the tags sit and swallow each customer's next real update. The GHL
+edits only a person can make are `docs/ghl-p2-customer-workflow-fixes.md` (C.0-IN's backward reset first; until then the
+sweep reverts it within 30 minutes). No LP job is a report, never a write (`scripts/repair-p2-missing-lp-jobs.js`).
 
 **Marketing cost is a ledger, not an LP field (Mark + Brad Codman, 2026-10-12; `supabase/migrations/20261012222106_158_marketing_cost_ledger.sql`).** Report 136 and LP cost entry
 are retired: nobody types a cost into LP again, and no code reads `mcost_cents` for a cost. The money lives in

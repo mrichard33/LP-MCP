@@ -15,11 +15,12 @@
  *   A card changed in the last SETTLE_MS is left for the next pass: an event-driven
  *   move may still be landing.
  * WRITES (P2_PARITY_MODE=live only), at most P2_PARITY_MAX_WRITES a pass, status
- *   fixes first: one PUT per card with the fields that differ. A heal that moves an
- *   OPEN card adds the tag `p2-stage-heal` first, which GHL C.1 / C.2 consume and
- *   exit on, so a repair never texts a customer (docs/ghl-p2-customer-workflow-fixes.md).
- *   A loss carries its lost reason and goes on to L.6 like every other P2 loss
- *   (maybePostL6, idempotent through tag_hygiene_log).
+ *   fixes first: one PUT per card with the fields that differ. With P2_HEAL_TAG=on, a
+ *   heal that moves an OPEN card into stages 4-8 adds the tag `p2-stage-heal` first,
+ *   which GHL C.1 / C.2 / C.4 consume and exit on, so a repair never texts a customer
+ *   (docs/ghl-p2-customer-workflow-fixes.md). A loss carries its lost reason, goes on
+ *   to L.6 like every other P2 loss (maybePostL6, idempotent through tag_hygiene_log)
+ *   and takes the customer out of C.0–C.5 (./customer-workflows.js).
  * RECORD: one `p2.parity` event per change (shadow: `would_change`, once per card per
  *   target per day), and the pass's counts in job_runs.detail.
  */
@@ -27,6 +28,7 @@ import { expectedP2, parityAction, writePriority, needsHealTag } from './rules.j
 import { buildMilestoneStageMap } from '../p2-milestone-map.js';
 import { readOppJobId } from '../p2-opportunity-context.js';
 import { PIPELINE_IDS } from '../actions/constants.js';
+import { removeFromCustomerWorkflows } from './customer-workflows.js';
 
 export const HEAL_TAG = 'p2-stage-heal';
 export const SETTLE_MS = 30 * 60 * 1000;
@@ -38,10 +40,25 @@ export const RECHECK_MS = 6 * 60 * 60 * 1000;
 const CHECKED = new Map();
 const MODES = new Set(['off', 'shadow', 'live']);
 
-/** P2_PARITY_MODE off | shadow (default) | live. Read per pass. */
+/**
+ * P2_PARITY_MODE off | shadow | live (default). Read per pass. Live by the user's ruling
+ * (2026-10-20: "go live right away because no messages are firing"; it replaced the
+ * same day's "3 days of shadow first"). An unknown value reads as shadow, never live.
+ */
 export function parityMode(env = process.env) {
-  const m = String(env.P2_PARITY_MODE || 'shadow').toLowerCase().trim();
+  const m = String(env.P2_PARITY_MODE || 'live').toLowerCase().trim();
   return MODES.has(m) ? m : 'shadow';
+}
+
+/**
+ * P2_HEAL_TAG on | off (default off). The repair tag `p2-stage-heal` is useful only once
+ * GHL C.1/C.2/C.4 have the first step that consumes it
+ * (docs/ghl-p2-customer-workflow-fixes.md). Added before that step exists, it would sit
+ * on the contact and swallow that customer's next REAL update later. While the C-series
+ * stay test-gated a repair texts nobody anyway, so the tag waits for this switch.
+ */
+export function healTagEnabled(env = process.env) {
+  return String(env.P2_HEAL_TAG || 'off').toLowerCase().trim() === 'on';
 }
 export function maxWrites(env = process.env) {
   const n = Number(env.P2_PARITY_MAX_WRITES);
@@ -194,6 +211,7 @@ export async function runP2ParitySweep(opts = {}) {
   const deps = { ...(opts.deps?.__noDefaults ? {} : await defaultDeps()), ...(opts.deps || {}) };
   const now = opts.now || new Date();
   const cap = opts.maxWrites ?? maxWrites();
+  const healTag = opts.healTag ?? healTagEnabled();
   const runId = `p2_parity:${now.toISOString()}`;
   const emit = (ev) => Promise.resolve(deps.emitEvent?.(ev)).catch((err) => logger.warn?.(`[P2Parity] event failed: ${err.message}`));
 
@@ -247,15 +265,18 @@ export async function runP2ParitySweep(opts = {}) {
       continue;
     }
     try {
-      if (needsHealTag(card, fresh.body)) await deps.applyGHLTag(card.contactId, HEAL_TAG);
+      if (healTag && needsHealTag(card, fresh.body)) await deps.applyGHLTag(card.contactId, HEAL_TAG);
       await deps.ghlFetch('PUT', `/opportunities/${card.id}`, fresh.body);
-      let l6 = null;
-      if (fresh.kinds.includes('lose') && deps.postL6) {
-        l6 = await deps.postL6({ contactId: card.contactId, opportunityId: card.id, lostReasonId: fresh.lostReasonId, runType: 'l6_auto', runId })
-          .catch((err) => ({ action: 'failed', reason: err.message }));
+      let l6 = null; let cSeries = null;
+      if (fresh.kinds.includes('lose')) {
+        if (deps.postL6) {
+          l6 = await deps.postL6({ contactId: card.contactId, opportunityId: card.id, lostReasonId: fresh.lostReasonId, runType: 'l6_auto', runId })
+            .catch((err) => ({ action: 'failed', reason: err.message }));
+        }
+        cSeries = await removeFromCustomerWorkflows(card.contactId, { ghlFetch: deps.ghlFetch, logger });
       }
       outcome.written++;
-      await emit(eventFor(mode, fresh, 'done', { l6: l6?.action || null }));
+      await emit(eventFor(mode, fresh, 'done', { l6: l6?.action || null, c_series_removed: cSeries?.removed?.length ?? null }));
     } catch (err) {
       outcome.failed++;
       logger.warn?.(`[P2Parity] write failed for ${card.id}: ${err.message}`);

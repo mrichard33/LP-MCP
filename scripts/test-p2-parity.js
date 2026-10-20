@@ -7,7 +7,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { expectedP2, parityAction, lpStageFor, writePriority, needsHealTag } from '../src/p2-parity/rules.js';
-import { runP2ParitySweep, planPass, HEAL_TAG, SETTLE_MS } from '../src/p2-parity/sweep.js';
+import { runP2ParitySweep, planPass, HEAL_TAG, SETTLE_MS, parityMode, healTagEnabled } from '../src/p2-parity/sweep.js';
+import { CUSTOMER_WORKFLOWS, removeFromCustomerWorkflows } from '../src/p2-parity/customer-workflows.js';
 import { STAGE_MAP, PIPELINE_IDS } from '../src/actions/constants.js';
 import { OPP_CF_LP_JOB_ID } from '../src/p2-opportunity-context.js';
 import { getStagePosition } from '../src/pipeline-guard.js';
@@ -116,7 +117,7 @@ test('write order: status fixes first; heal tag only for a move that leaves the 
 // ─── the sweep ────────────────────────────────────────────────────────
 
 function fakeDeps({ cards, jobs = [], live = {}, tables = {}, liveError = null, mappingRows = null }) {
-  const calls = { puts: [], tags: [], events: [], l6: [], gets: 0 };
+  const calls = { puts: [], tags: [], events: [], l6: [], deletes: [], gets: 0 };
   const rows = { lp_jobs: jobs, lp_leads: [], lp_job_milestones: [], ...tables };
   const rules = mappingRows || Object.entries(MAPPING).map(([code, v]) => ({
     rule_key: `P2_MILESTONE_${code}`, event_pattern: { payload: { mdt_id: code } },
@@ -153,6 +154,7 @@ function fakeDeps({ cards, jobs = [], live = {}, tables = {}, liveError = null, 
           const c = live[id] || cards.find((x) => x.id === id);
           return { opportunity: c ? { pipelineId: PIPELINE_IDS.P2, updatedAt: '2026-10-19T00:00:00Z', ...c } : null };
         }
+        if (method === 'DELETE') { calls.deletes.push(path); return {}; }
         calls.puts.push({ path, body });
         return {};
       },
@@ -182,9 +184,15 @@ test('live: one PUT with what differs; heal tag first only for a messaged stage'
   assert.equal(r.written, 1);
   assert.deepEqual(calls.tags, []);
   assert.deepEqual(calls.puts, [{ path: '/opportunities/opp1', body: { pipelineStageId: S('Released to Production (RTP)') } }]);
-  const k = fakeDeps({ cards: [card({ pipelineStageId: S('Financing Pending') })], jobs: [job({ ghl_contact_id: 'c1', milestones: [ms('K', '2026-10-05')] })] });
-  await runP2ParitySweep({ mode: 'live', deps: k.deps, now: NOW, logger: { log() {}, warn() {}, error() {} } });
+  const kJobs = [job({ ghl_contact_id: 'c1', milestones: [ms('K', '2026-10-05')] })];
+  const k = fakeDeps({ cards: [card({ pipelineStageId: S('Financing Pending') })], jobs: kJobs });
+  await runP2ParitySweep({ mode: 'live', deps: k.deps, now: NOW, healTag: true, logger: { log() {}, warn() {}, error() {} } });
   assert.deepEqual(k.calls.tags, [['c1', HEAL_TAG]]);
+  // Off by default: no tag until GHL has the step that consumes it.
+  const off = fakeDeps({ cards: [card({ pipelineStageId: S('Financing Pending') })], jobs: kJobs });
+  await runP2ParitySweep({ mode: 'live', deps: off.deps, now: NOW, logger: { log() {}, warn() {}, error() {} } });
+  assert.deepEqual(off.calls.tags, []);
+  assert.equal(off.calls.puts.length, 1);
   assert.equal(calls.events[0].event_subtype, 'done');
 });
 
@@ -195,6 +203,26 @@ test('live: a loss carries its reason and goes to L.6', async () => {
   assert.ok(calls.puts[0].body.lostReasonId);
   assert.equal(calls.l6.length, 1);
   assert.equal(calls.tags.length, 0);
+  // ...and the customer comes out of C.0-C.5 (L.6 removes none of them).
+  const dels = calls.deletes.map((d) => d.split('/').pop()).sort();
+  assert.deepEqual(dels, Object.values(CUSTOMER_WORKFLOWS).sort());
+});
+
+test('the user ruled live (2026-10-20); an unknown value is shadow, never live; heal tag off by default', () => {
+  assert.equal(parityMode({}), 'live');
+  assert.equal(parityMode({ P2_PARITY_MODE: 'shadow' }), 'shadow');
+  assert.equal(parityMode({ P2_PARITY_MODE: 'yes' }), 'shadow');
+  assert.equal(healTagEnabled({}), false);
+  assert.equal(healTagEnabled({ P2_HEAL_TAG: 'on' }), true);
+});
+
+test('C-series removal is fail-soft per workflow', async () => {
+  const r = await removeFromCustomerWorkflows('c1', {
+    ghlFetch: async (m, path) => { if (path.endsWith(CUSTOMER_WORKFLOWS['C.2 Post-Install Check-In'])) throw new Error('404'); return {}; },
+    logger: { warn() {} },
+  });
+  assert.equal(r.removed.length, 5);
+  assert.deepEqual(r.failed, ['C.2 Post-Install Check-In']);
 });
 
 test('the LIVE card decides: already fixed in GHL → nothing written', async () => {

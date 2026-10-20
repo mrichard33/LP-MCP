@@ -13,6 +13,8 @@ The GHL workflows below must agree with that. These are GHL edits; HL-MCP has no
 
 Make the edits in this order. Remove the test-contact gates only after steps 1–7.
 
+Until step 1 is done, the parity sweep (live since 2026-10-20) puts back any card C.0-IN resets, within 30 minutes.
+
 ## 1. C.0-IN Sale Made Entry — do this first (it fights LP today)
 
 - **What is wrong:** "Opportunity Found → Update opportunity" sets P2 stage `fec39f2e` (Contract Signed), status `open` and `allowBackward: true`, verified in the HL mirror. Any `deal-won` re-add, or any change to "LP Gross Sale Amount" on a customer, drags their newest P2 card back to stage 1: mid-install, Won or Lost.
@@ -21,10 +23,10 @@ Make the edits in this order. Remove the test-contact gates only after steps 1�
   - The "LP Gross Sale Amount Updated" trigger may stay, because the step now only updates the value.
   - The "Opportunity Not Found → Create" branch can stay: it creates at Contract Signed, open, which is right for a new sale.
 
-## 2. L.6 P2 Loss Classification
+## 2. L.6 P2 Loss Classification — handled by LP-MCP (2026-10-20)
 
-- **What is wrong:** "Remove from Marketing Workflows" does not list C.0–C.5. A cancelled job would keep getting install, check-in and review messages.
-- **Fix:** add C.0, C.1, C.2, C.3, C.4 and C.5 to that step.
+- **What was wrong:** "Remove from Marketing Workflows" does not list C.0–C.5, so a cancelled job would keep getting install, check-in and review messages.
+- **Now:** LP-MCP removes the customer from C.0–C.5 itself on every P2 loss it closes (`src/p2-parity/customer-workflows.js`). Adding them to L.6's list in GHL as well is harmless, but no longer required.
 
 ## 3. C.1 Install Progress Updates
 
@@ -34,7 +36,7 @@ Make the edits in this order. Remove the test-contact gates only after steps 1�
 - About 37% of cards go from stage 6 to stage 7 in the same pass.
 
 **Fix:**
-- **First step of the workflow, before the test-contact check:** if the contact has tag `p2-stage-heal` → remove that tag → End. The parity sweep adds this tag right before it repairs a card's stage, so a repair never texts a customer. The tag is only added for a move into stages 4–8, the stages a customer workflow starts on, so the workflow that starts consumes it.
+- **First step of the workflow, before the test-contact check:** if the contact has tag `p2-stage-heal` → remove that tag → End. The parity sweep adds this tag right before it repairs a card's stage, so a repair never texts a customer. The tag is only added for a move into stages 4–8, the stages a customer workflow starts on, so the workflow that starts consumes it. **LP-MCP adds it only once Railway has `P2_HEAL_TAG=on`. Set that the same day this step is added to C.1, C.2 and C.4.** Before that, the tag would pile up and later swallow real updates.
 - **Rewrite the stage 6 copy for install day** (for example "Your install crew is with you today…"). Or have a person tell us to move stage 6 to the booked date instead; that is an LP-MCP change.
 - **Before sending the stage 6 messages,** check that the opportunity is still in stage 6. Skip if it is already at Install Completed.
 

@@ -6,9 +6,9 @@
  * from the source or what is in LP"). The logic is in src/p2-parity/; this file owns
  * only the schedule.
  *
- * P2_PARITY_MODE off | shadow (default) | live. Shadow re-checks the differences
- * live and records `p2.parity` would_change events; only live writes. The user's
- * ruling: shadow for 3 days, reviewed, then live.
+ * P2_PARITY_MODE off | shadow | live (default). Shadow re-checks the differences
+ * live and records `p2.parity` would_change events; only live writes. Live by the
+ * user's ruling (2026-10-20: "go live right away because no messages are firing").
  */
 import { runJob } from '../job-runner.js';
 import { runP2ParitySweep, parityMode } from '../p2-parity/sweep.js';

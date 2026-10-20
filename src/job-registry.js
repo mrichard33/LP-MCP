@@ -382,14 +382,14 @@ export const JOBS = Object.freeze([
   {
     // 2026-10-20: every P2 card must sit where LP says the customer is (the user:
     // "zero deviation from the source"). Mirrors parityMode() in
-    // src/p2-parity/sweep.js: off | shadow (default) | live.
+    // src/p2-parity/sweep.js: off | shadow | live (default, the user's ruling 2026-10-20).
     id: 'p2-parity-sweep',
     label: 'P2 card ↔ LP parity sweep',
     group: 'notifications',
     cadence: 'every 30 min',
     enabledEnv: 'P2_PARITY_MODE',
     enabledDefault: true,
-    isEnabled: (env) => String(env.P2_PARITY_MODE || 'shadow').toLowerCase().trim() !== 'off',
+    isEnabled: (env) => String(env.P2_PARITY_MODE || 'live').toLowerCase().trim() !== 'off',
   },
   {
     // 2026-10-03: every recent LP sale must have a P2 (Client Lifecycle)
