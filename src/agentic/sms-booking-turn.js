@@ -170,6 +170,8 @@ export function bookingBackedByCode({ plan, trigger = '', bookingFacts = null, s
   if (bookingFacts?.book) return true;
   if (!plan) return false;
   if (plan.rehash_pick) return true;
+  // 2026-10-20 (handoff v3): a Phone Presentation pick, both decision makers confirmed.
+  if (plan.pp_pick) return true;
   if (plan.step === 'collect' && plan.held_slot?.text) return true;
   if (plan.required_move === 'confirm') {
     return !!pickSlot(trigger, offeredSlots(plan.last_offer || '', Array.isArray(slots) ? slots : []));

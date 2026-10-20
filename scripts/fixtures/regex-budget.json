@@ -1,5 +1,5 @@
 {
-  "count": 299,
-  "updated": "2026-10-19",
-  "reason": "TIME_CHOICE_RX (team-hours.js): two call times offered as a choice are an offer, not a promised call; the rehash timing guard turned 'I have today at 4:30 PM ET or tomorrow at 9:30 AM ET' into 'I have soon or …' (rehash_neither_times). Was 298 after REHASH_TIME_ASK_RX (rehash_neither_times)."
+  "count": 298,
+  "updated": "2026-10-20",
+  "reason": "PP_DM_ASK_RX, PP_BOTH_YES_RX, PP_ONLY_ONE_RX (one-leg-presentation.js, handoff v3): our 'will both of you be on the call?' ask and the lead's answer to it, read by meaning, so a 1 Leg phone presentation books only once both decision makers are confirmed (one_leg_phone_presentation). Was 299 with room for TIME_CHOICE_RX (rehash_neither_times)."
 }

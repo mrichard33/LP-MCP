@@ -44,6 +44,7 @@ import { jobScopeFromThread, openingsKnown, COUNT_ASK_RX } from './job-scope.js'
 import { decisionMakersFromThread, dmSettled } from './qualifying.js';
 import { extractZip } from './service-area-turn.js';
 import { isLeadSignOff, leadWillReachOut } from './sign-off.js';
+import { PP_LINES, PP_MARKERS, PP_DM_ASK_RX, PP_ONLY_ONE_RX, bothConfirmedInThread } from './one-leg-presentation.js';
 
 export { isKnockComplaint };
 
@@ -856,6 +857,10 @@ function planNepqTurnCore({
   // 2026-10-09 (the user): the rep's real Rehash Call openings
   // ({ offer: [2], all: [...] }, rehash-slots.js), or null for none.
   callSlots = null,
+  // 2026-10-20 (handoff v3): a 1 Leg contact's real Phone Presentation openings
+  // ({ offer: [2], all: [...] }, one-leg-presentation.js), or null. Passed ONLY
+  // when the contact's open objection state is APPOINTMENT_DISRUPTION.one_leg.
+  phonePresentation = null,
   // 2026-10-12 (LEAD_STAGE_MODE=live, PR 3): a plain quote request is the
   // info-request play, not a price objection; the competitor play is on.
   stageLive = false,
@@ -1099,6 +1104,14 @@ function planNepqTurnCore({
   // calendar does not show. No openings → the hand-off below, as before.
   // A follow-up date or "we signed elsewhere" from a post-demo lead outranks
   // a call request ("Call me in November"): confirm the date, file it.
+  // 1a'. A 1 Leg contact (handoff v3, Mark 2026-10-20): the next step is a phone
+  // presentation with BOTH decision makers on the call, on its own calendar,
+  // booked only once the lead says both will be on it. Every other contact
+  // never reaches this (phonePresentation is null).
+  if (phonePresentation && !postDemo) {
+    const r = planPhonePresentation();
+    if (r) return r;
+  }
   if (postDemo && (PURCHASED_ELSEWHERE_RX.test(now) || detectDeferral(now, nowMs))) return planPostDemo();
   if (postDemo && callSlots) {
     const r = planRehashCall();
@@ -1144,6 +1157,65 @@ function planNepqTurnCore({
       .filter(m => String(m?.direction || '').toLowerCase() !== 'outbound')
       .map(m => ({ text: String(m?.text ?? m?.body ?? ''), atMs: Date.parse(m?.timestamp || m?.sent_at || m?.dateAdded || m?.created_at || '') }))
       .filter(m => m.text.trim() && m.text !== now);
+  }
+  function planPhonePresentation() {
+    const all = Array.isArray(phonePresentation.all) ? phonePresentation.all : [];
+    const offer = Array.isArray(phonePresentation.offer) ? phonePresentation.offer : [];
+    const hi = firstName ? ` for you, ${firstName},` : '';
+    const base = { phone_presentation: true, call_offer_ok: true, openings_gate_skip: true };
+    const offerPlan = (two) => Object.assign(plan, base, {
+      step: 'pp_offer', required_move: 'offer_slots', fixed_line: PP_LINES.offer(two, hi), slots_to_offer: two,
+      allowed: { ...plan.allowed, slot_offer: true }, booking: { allowed: true, reason: 'nepq:pp_offer' }, reference_markers: PP_MARKERS.offer,
+    });
+    // A pick: booked only when both decision makers are confirmed, else held
+    // while we ask (the handoff: "booking requires both decision makers").
+    const pickPlan = (picked) => (bothConfirmedInThread(turns)
+      ? Object.assign(plan, base, {
+        step: 'pp_confirm', required_move: 'confirm', pp_pick: picked, reference_line: PP_LINES.confirm(picked),
+        reference_slots: [picked], booking: { allowed: true, reason: 'nepq:pp_confirm' }, reference_markers: PP_MARKERS.confirm,
+      })
+      : Object.assign(plan, base, {
+        step: 'pp_hold_dm', required_move: 'collect', fixed_line: PP_LINES.hold_dm(picked), pp_held: picked,
+        reference_slots: [picked], booking: { allowed: false, reason: 'nepq:pp_dm_required' }, reference_markers: PP_MARKERS.dm,
+      }));
+    // Our "will both of you be on the call?" answered, a time held before it.
+    if (PP_DM_ASK_RX.test(lastOut)) {
+      const held = heldSlot(turns);
+      const heldPick = held ? (all.find((x) => slotMentionIndex(held.text, x) >= 0) || null) : null;
+      if (bothConfirmedInThread(turns) && heldPick) return pickPlan(heldPick);
+      if (PP_ONLY_ONE_RX.test(now) || isNo(now, lastOut)) {
+        return Object.assign(plan, base, { step: 'pp_dm_no', required_move: 'ask_day', fixed_line: PP_LINES.dm_no, booking: { allowed: false, reason: 'nepq:pp_dm_no' }, reference_markers: PP_MARKERS.dm_no });
+      }
+    }
+    // A pick from the presentation times we offered.
+    if (lastOfferOut) {
+      const offered = offeredIn(lastOfferOut, all);
+      const picked = pickSlot(now, offered) || exactSlotFor(now, offered);
+      if (picked) return pickPlan(picked);
+    }
+    // A time they typed: the opening it names, or the two nearest it.
+    const typed = typedClock(now);
+    if (typed != null && all.length) {
+      const exact = exactSlotFor(now, all);
+      if (exact) return pickPlan(exact);
+      const near = nearestToClock(all, typed, now, nowMs);
+      if (near.length === 2) return offerPlan(near);
+    }
+    // A day or part of day, answering our offer or the "when works for both" ask.
+    if ((lastOfferOut || /\bworks\s+for\s+both\b/i.test(lastOut)) && all.length) {
+      const pref = parseDayPreference(now);
+      if (pref) {
+        const picked = slotsForPreference(all, pref, { nowMs });
+        if (picked?.slots?.length === 2) return offerPlan(picked.slots);
+      }
+    }
+    // A yes to our offer of the next step, a call or a time asked for, a
+    // reschedule ask, or an answer to our "when works for both" ask.
+    const scheduleAsk = SCHEDULE_ASK_RX.test(now) || TIME_REQUEST_RX.test(now) || CALL_TIME_ASK_RX.test(now)
+      || /\bre-?schedul|\banother\s+(?:time|day)\b|\bset\s+(?:it|something)\s+up\b/i.test(now);
+    const yesToOffer = (BRIDGE_RX.test(lastOut) || CALL_OFFER_RX.test(lastOut)) && (YES_RX.test(now) || MAYBE_RX.test(now)) && !isNo(now, lastOut);
+    if ((askedForCall || scheduleAsk || yesToOffer || /\bworks\s+for\s+both\b/i.test(lastOut)) && offer.length === 2) return offerPlan(offer);
+    return null;
   }
   function planRehashCall() {
     // A follow-up date or "we signed elsewhere" is the post-demo plan's job.
@@ -1839,7 +1911,8 @@ function planNepqTurnCore({
  * hold), so no time offer goes out this turn.
  */
 export function planNepqTurn(args = {}) {
-  const plan = args?.stage?.stage ? gateForStage(planNepqTurnCore(args), args) : openingsGate(args);
+  const plan = phonePresentationOffer(
+    args?.stage?.stage ? gateForStage(planNepqTurnCore(args), args) : openingsGate(args), args);
   // 2026-10-16 (Melissa): "sunday at 2 - what is the company name are there
   // any specials going on". The pick is held and the question answered in one
   // short line in the same reply; it is never dropped.
@@ -1855,6 +1928,26 @@ export function planNepqTurn(args = {}) {
     if (side) Object.assign(plan, { answer_first: true, side_question: side });
   }
   return args?.directiveNoTimes ? withoutTimeOffer(plan) : plan;
+}
+
+// 2026-10-20 (handoff v3): a 1 Leg contact is never offered another home
+// visit. Any plan that would still put VISIT times in front of them (a path the
+// presentation branch did not take: the bridge, a stage step, the pre-offer
+// gate's question) offers the two Phone Presentation times instead, or none.
+// Only reached when the caller passed phonePresentation (one_leg only).
+function phonePresentationOffer(plan, args) {
+  const pp = args?.phonePresentation;
+  if (!pp || !plan || plan.phone_presentation || plan.handoff || plan.post_demo || args?.postDemo) return plan;
+  if (!TIME_STEPS.has(plan.step) && plan.required_move !== 'offer_slots') return plan;
+  const offer = Array.isArray(pp.offer) ? pp.offer : [];
+  if (offer.length !== 2) return withoutTimeOffer(plan);
+  const first = args.firstName ? ` for you, ${args.firstName},` : '';
+  return Object.assign(plan, {
+    phone_presentation: true, call_offer_ok: true, step: 'pp_offer', required_move: 'offer_slots',
+    fixed_line: PP_LINES.offer(offer, first), slots_to_offer: offer, held_slot: null,
+    allowed: { ...plan.allowed, slot_offer: true }, booking: { allowed: true, reason: 'nepq:pp_offer' },
+    reference_markers: PP_MARKERS.offer, reference_line: null, reference_slots: null,
+  });
 }
 
 // 2026-10-13 (Erica Hilts): the layer3 follow_up_scheduled hint said "NO
@@ -1916,7 +2009,7 @@ function resumeBeforeGate(args, turns) {
  */
 function openingsGate(args) {
   let plan = planNepqTurnCore(args);
-  if (!plan || plan.handoff || plan.post_demo || plan.step === 'booked' || args.postDemoLead) return plan;
+  if (!plan || plan.handoff || plan.post_demo || plan.phone_presentation || plan.step === 'booked' || args.postDemoLead) return plan;
   const turns = normalizeThread(args.conversation, args.trigger);
   if (homeownerFromThread(turns) === 'no') return notOwner(plan, () => clearTimes(plan));
   const js = jobScopeFromThread(turns);
@@ -2033,7 +2126,7 @@ const TIME_STEPS = new Set(['offer_slots', 'confirm', 'ask_day', 'collect']);
 function gateForStage(plan, args) {
   // A lead past its demo already meets the requirements (the user, 2026-10-13):
   // no qualifying question and no job-scope block, whatever POST_DEMO_PLANNER_MODE says.
-  if (!plan || plan.handoff || plan.post_demo || args?.postDemoLead || plan.step === 'booked') return plan;
+  if (!plan || plan.handoff || plan.post_demo || plan.phone_presentation || args?.postDemoLead || plan.step === 'booked') return plan;
   // The second price ask's free-measure question is a bridge to the visit too.
   const offersTimes = !!plan.allowed?.slot_offer || (plan.slots_to_offer || []).length > 0 || TIME_STEPS.has(plan.step) || plan.required_move === 'bridge' || plan.step === 'price_visit_offer' || !!plan.offer_slots_pending;
   const turns = normalizeThread(args.conversation, args.trigger);

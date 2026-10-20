@@ -5,6 +5,7 @@
  * lead is in the funnel. First match wins. See BUILD HANDOFF §0.
  */
 import { hasPriorCompletedAppointment } from './contact-appointments.js';
+import { isPhonePresentationCalendarId } from '../agentic/one-leg-presentation.js';
 
 export const BOOKING_CALENDARS = {
   PROTECTION_PROFILE_REVIEW:  'DQYMaJ22N6zL4SXjHukw', // Tier-1 phone call
@@ -96,9 +97,14 @@ export function isInHomeCalendarId(calendarId) {
   return IN_HOME_CALENDAR_IDS.has(calendarId);
 }
 
+// The 1 Leg "Phone Presentation" calendar (handoff v3, Mark 2026-10-20) is
+// GHL-only too: a 1Leg lead is post-issue in LP, so an LP SetAppointment for
+// that call would mint a new LP lead.
+export { isPhonePresentationCalendarId };
+
 /** True if `calendarId` is a GHL-only (never-sync-to-LP) calendar. */
 export function isGhlOnlyCalendarId(calendarId) {
-  return GHL_ONLY_CALENDAR_IDS.has(calendarId) || isRehashCalendarId(calendarId);
+  return GHL_ONLY_CALENDAR_IDS.has(calendarId) || isRehashCalendarId(calendarId) || isPhonePresentationCalendarId(calendarId);
 }
 
 /** Default appointment duration (minutes) for a resolved calendar key. */

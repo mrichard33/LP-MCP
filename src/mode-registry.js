@@ -108,6 +108,11 @@ export const MODES = Object.freeze([
     goLive: '[RehashSlots] shadow offers name times open on the Rehash Call calendar; needs POST_DEMO_PLANNER_MODE=live first',
     note: 'Offers and books Rehash Call times from the calendar.',
   }),
+  m('ONE_LEG_PRESENTATION_MODE', 'bot', 'enum', OL, 'live', OL_S, {
+    since: '2026-10-20', decider: 'Mark',
+    goLive: 'Live by the handoff v3 ruling (2026-10-20), inert until PHONE_PRESENTATION_CALENDAR_ID is set; off is the rollback',
+    note: 'A 1 Leg contact (open state APPOINTMENT_DISRUPTION.one_leg) is offered a phone presentation with both decision makers instead of a visit.',
+  }),
   m('REHASH_ROUTING_MODE', 'bot', 'enum', OSL, 'shadow', OSL_S, {
     since: '2026-10-09', decider: 'the user',
     evidence: { events: ['rehash.would_tag', 'rehash.would_release', 'rehash.would_reroute_callback'], job: 'rehash-tag-sweep' },

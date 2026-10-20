@@ -7,7 +7,8 @@
 //   and dry_run false: one fast-poll tick.
 // GET  /n8n/admin/partner-owner/status
 //   enabled, last tick, cursor, average lag (LP change → GHL write) over 24 h, the
-//   last 20 log rows.
+//   last 20 log rows, and the contacts THIS code assigned and has not handed back
+//   (partner_owner_assignments, handoff v3: only those are ever returned).
 //
 // These write GHL owners, so they take a STRICT operator check (no soft launch):
 // production runs AUTH_SOFT_LAUNCH=true, which would let a token-less request in.
@@ -56,12 +57,14 @@ export function registerPartnerOwnerRoutes(app, { authenticate = denyAll, deps =
       const client = await db();
       const cfg = partnerSyncConfig(deps.env || process.env);
       const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-      const [cursor, writes, recent, map] = await Promise.all([
+      const [cursor, writes, recent, map, open] = await Promise.all([
         client.from('partner_owner_cursor').select('last_changed_at, updated_at').eq('id', CURSOR_ID).maybeSingle(),
         client.from('partner_owner_log').select('created_at, lp_changed_at')
           .gte('created_at', since).in('reason', ['assigned', 'reassigned', 'returned']).limit(1000),
         client.from('partner_owner_log').select('*').order('created_at', { ascending: false }).limit(20),
         loadPartnerMap({ supabase: client }).catch((e) => ({ error: e.message })),
+        client.from('partner_owner_assignments').select('ghl_contact_id, partner_name, ghl_user_id, assigned_at')
+          .is('released_at', null).order('assigned_at', { ascending: false }).limit(200),
       ]);
       return res.json({
         ok: true,
@@ -76,6 +79,8 @@ export function registerPartnerOwnerRoutes(app, { authenticate = denyAll, deps =
         writes_24h: (writes.data || []).length,
         average_lag_seconds_24h: averageLagSeconds(writes.data),
         mappings: map,
+        open_assignments_count: (open.data || []).length,
+        open_assignments: open.error ? { error: open.error.message } : (open.data || []),
         recent: recent.data || [],
       });
     } catch (err) {

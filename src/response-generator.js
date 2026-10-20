@@ -18,6 +18,10 @@
  * prompt blocks. An unexplained snapshot diff means the change is wrong, not
  * the snapshot. Map: docs/handoffs/response-generator-split-map.md.
  *
+ * v2.13.0 — 2026-10-20. 1 LEG PHONE PRESENTATION (handoff v3, Mark): a contact whose open objection state
+ *   is APPOINTMENT_DISRUPTION.one_leg is offered a phone presentation with both decision makers on the
+ *   Phone Presentation calendar (PHONE_PRESENTATION_CALENDAR_ID, GHL-only) instead of a visit, booked only
+ *   once both are confirmed (src/agentic/one-leg-presentation.js). Planner copy only; no prompt text moved.
  * v2.12.0 — 2026-10-20. OWNERS YES, RENTERS NO (the user: "We do not need to turn investment
  *   properties away. However, we only work with owners not the renters."). The rental rule in
  *   both system prompts and the live chat now says an owner who rents the home out, runs an
@@ -469,6 +473,7 @@ import { postDemoPlannerMode } from './agentic/post-demo-turn.js';
 // objection reply with no question, then a warm close.
 import { emailPostDemoMode, planPostDemoEmail, enforcePostDemoEmail, planStepFor as postDemoEmailStepFor } from './agentic/post-demo-email.js';
 import { rehashCallSlotsMode, readRehashCallSlots, rehashCallBooking } from './agentic/rehash-slots.js';
+import { phonePresentationActive, readPhonePresentationSlots, phonePresentationBooking } from './agentic/one-leg-presentation.js';
 import { isInRehash, rehashLeadFromContext, rehashRoutingMode } from './agentic/rehash-state.js';
 import { enforcePresentationGuard, copiesSiroDraft } from './siro/presentation-guard.js';
 import { planNepqTurn, enforceNepqPlan, referenceRetryNote, nepqBackboneMode, prefersCall as nepqPrefersCall, objectionType as nepqObjectionType, TIME_REQUEST_RX as NEPQ_TIME_REQUEST_RX, SCHEDULE_ASK_RX as NEPQ_SCHEDULE_ASK_RX,REPEAT_COMPLAINT_RX as NEPQ_REPEAT_COMPLAINT_RX, bookingOpenInThread as nepqBookingOpenInThread, dropUnaskedCallOffer, leadWantsCall as nepqLeadWantsCall, isServiceCallback as nepqIsServiceCallback, planStepOf as nepqPlanStepOf } from './agentic/nepq-planner.js';
@@ -481,11 +486,11 @@ import {
 } from './agentic/service-area-turn.js';
 
 /**
- * v2.12.0 — the header version above, as a value. Stamped (with the deployed
+ * v2.13.0 — the header version above, as a value. Stamped (with the deployed
  * git sha) onto every fingerprint so a replay knows which generator wrote the
  * reply. Bump it with the header note.
  */
-export const RESPONSE_GENERATOR_VERSION = 'v2.12.0';
+export const RESPONSE_GENERATOR_VERSION = 'v2.13.0';
 
 // Provider + model resolved at call time by the shared client from the
 // `response_generator` fn key (customer_facing group). Legacy
@@ -4230,6 +4235,8 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   let leadStage = null;
   // The rep's real Rehash Call openings (rehash-slots.js), when read.
   let rehashCallSlots = null;
+  // 2026-10-20 (handoff v3): a 1 Leg contact's Phone Presentation openings.
+  let phonePresentationSlots = null;
   // SMS only: email replies are long-form and keep their own rules.
   // A coverage turn is planned too unless its reply is the whole script (the
   // zip ask, or the out-of-area close): 2026-10-03, the shutters thread's
@@ -4253,6 +4260,14 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
         const tz = promptTimezoneFor(context);
         rehashCallSlots = await memo('rehash_call_slots', () => readRehashCallSlots({ contactId, timezone: tz, tzLabel: tzLabel(tz) }));
       }
+      // 2026-10-20 (handoff v3): ONLY a contact whose open objection state is
+      // APPOINTMENT_DISRUPTION.one_leg gets the phone presentation branch; every
+      // other contact (an absent spouse on a new lead included) plans as before.
+      if (phonePresentationActive({ objectionState: context.objection_state, postDemo: postDemoLead, rehash: !!rehash, channel: 'sms' })) {
+        const tz = promptTimezoneFor(context);
+        phonePresentationSlots = await memo('phone_presentation_slots', () => readPhonePresentationSlots({ contactId, timezone: tz, tzLabel: tzLabel(tz) }));
+        if (phonePresentationSlots) console.log(`[OneLegPresentation] ${contactId}: 1 Leg contact — ${phonePresentationSlots.offer.length} phone presentation time(s) to offer`);
+      }
       leadStage = opts.dryRun === true ? (opts.leadStageOverride || null) : await readStageForPlanner(contactId);
       // 2026-10-18 (Phase 1 item 4): the plan step our previous SENT reply ran
       // on. The simulator carries its own in memory (dry run never reads).
@@ -4267,7 +4282,8 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
         tzLabel: tzLabel(promptTimezoneFor(context)),
         firstName: firstWord && !/^guest$/i.test(firstWord) ? firstWord : null,
         hasAppointment,
-        nextStepLabel: (kbPack?.booking_context?.requires_in_home_gate === true || nepqVisitFirst) ? 'a free visit at your home' : 'a quick call with our team',
+        nextStepLabel: phonePresentationSlots ? 'a short phone presentation with both of you on the call'
+          : (kbPack?.booking_context?.requires_in_home_gate === true || nepqVisitFirst) ? 'a free visit at your home' : 'a quick call with our team',
         discipline,
         // A customer's call request goes to service (Mark, 2026-10-03).
         isCustomer: isCustomerP2(context),
@@ -4288,7 +4304,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
         directiveNoTimes: NO_TIMES_DIRECTIVE_RX.test(String(opts.promptHint || '')),
         lastPlanStep,
       };
-      nepqPlan = planNepqTurn({ ...planArgs, postDemo: pdMode === 'live' && postDemoLead, rehashRep, rehash: !!rehash, callSlots: slotsMode === 'live' ? rehashCallSlots : null });
+      nepqPlan = planNepqTurn({ ...planArgs, postDemo: pdMode === 'live' && postDemoLead, rehashRep, rehash: !!rehash, callSlots: slotsMode === 'live' ? rehashCallSlots : null, phonePresentation: phonePresentationSlots });
       if (slotsMode === 'shadow' && rehash && postDemoLead) {
         try {
           const would = planNepqTurn({ ...planArgs, postDemo: true, rehashRep, rehash: !!rehash, callSlots: rehashCallSlots });
@@ -4349,7 +4365,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // rendered into the plan block; the model writes the reply; the draft is
   // checked against them right after it comes back (enforceBookingFacts).
   let bookingFacts = null;
-  if (nepqMode === 'live' && channel === 'sms' && nepqPlan && !nepqPlan.rehash_call_slots && (nepqPlan.required_move === 'confirm' || nepqPlan.step === 'collect' || (nepqPlan.required_move === 'offer_slots' && capacityGateEnabled()))) {
+  if (nepqMode === 'live' && channel === 'sms' && nepqPlan && !nepqPlan.rehash_call_slots && !nepqPlan.phone_presentation && (nepqPlan.required_move === 'confirm' || nepqPlan.step === 'collect' || (nepqPlan.required_move === 'offer_slots' && capacityGateEnabled()))) {
     try {
       const idn = identityState?.identity || {};
       const thread = (context.conversation_recent || []).map(m => ({ direction: String(m?.direction || '').toLowerCase() === 'outbound' ? 'outbound' : 'inbound', text: String(m?.text ?? m?.body ?? '') }));
@@ -5203,6 +5219,16 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
         };
       }
       if (nepqPlan.step === 'rehash_offer') validated.rehash_slots_offered = true;
+      // 2026-10-20 (handoff v3): a picked Phone Presentation time, both decision
+      // makers confirmed, is booked from the plan on its own (GHL-only) calendar.
+      if (nepqPlan.pp_pick && phonePresentationSlots?.calendarId) {
+        validated.companion_action = phonePresentationBooking({ slot: nepqPlan.pp_pick, calendarId: phonePresentationSlots.calendarId });
+        validated.nepq_plan.pinned = nepqPlan.pp_pick.iso;
+      } else if (nepqPlan.phone_presentation && validated.companion_action?.action_type === 'book_appointment') {
+        // Never a visit (or an unconfirmed call) for a 1 Leg contact.
+        console.log(`[OneLegPresentation] ${contactId}: model booking dropped (${nepqPlan.step})`);
+        validated.companion_action = null;
+      }
     } else if (enforced.changes.length) {
       validated.nepq_plan.would_change = enforced.changes;
       validated.nepq_plan.would_send = enforced.text.slice(0, 500);
@@ -5584,13 +5610,13 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     //     "Review Session", so a name lookup can misroute.
     // A Rehash Call (2026-10-09) was built by code on its own calendar: the
     // resolver's PPR/visit calendar never replaces it.
-    const targetCalId = cap.rehash_call ? cap.calendar_id : (bookingResolution?.calendar_id
+    const targetCalId = (cap.rehash_call || cap.phone_presentation) ? cap.calendar_id : (bookingResolution?.calendar_id
       || cap.calendar_id
       || CALENDAR_MAP[cap.calendar_name]);
     cap.calendar_id = targetCalId;
     // (b) per-calendar duration when the resolver ran (phone calls are short);
     //     otherwise leave whatever the model/handler will derive.
-    if (bookingResolution && !cap.rehash_call) {
+    if (bookingResolution && !cap.rehash_call && !cap.phone_presentation) {
       cap.duration_minutes = durationForCalendar(bookingResolution.calendar_key);
     }
 

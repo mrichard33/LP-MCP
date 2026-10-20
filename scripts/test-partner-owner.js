@@ -10,7 +10,7 @@ import { prospectIsPartnerRelevant, runPartnerFastPoll } from '../src/jobs/partn
 import { averageLagSeconds } from '../src/partners/routes.js';
 
 const ROSS = 'TxbMrITSVyTJtJvGD9vk';
-const REECE = '3k3TLRNApUUdPYb9WS6u';
+const REECE = '3K6HtoPyBLWeQrrnSnCD'; // the Reece team user (handoff v3, 2026-10-20)
 const NOW = Date.parse('2026-10-21T15:00:00Z');
 const ENV = {
   PARTNER_SYNC_ENABLED: 'true',
@@ -31,10 +31,10 @@ function lead(over = {}) {
   };
 }
 
-function world({ leads = [lead()], map = MAP, log = [], owner = REECE, opps, keepOwner = false, env = ENV } = {}) {
+function world({ leads = [lead()], map = MAP, log = [], owner = REECE, opps, keepOwner = false, env = ENV, assignments = [] } = {}) {
   clearCache();
   __resetForTests();
-  const db = fakeSupabase({ partner_owner_map: map, lp_leads: leads, partner_owner_log: log });
+  const db = fakeSupabase({ partner_owner_map: map, lp_leads: leads, partner_owner_log: log, partner_owner_assignments: assignments });
   const contacts = new Map();
   for (const l of leads) if (l.ghl_contact_id) contacts.set(l.ghl_contact_id, { id: l.ghl_contact_id, firstName: 'Pat', lastName: 'Lee', assignedTo: owner });
   const opportunities = opps ?? [
@@ -83,6 +83,11 @@ function world({ leads = [lead()], map = MAP, log = [], owner = REECE, opps, kee
 }
 
 const logRows = (w) => w.db.tables.partner_owner_log || [];
+const assignRows = (w) => w.db.tables.partner_owner_assignments || [];
+const ours = (contactId = 'cAAAAAAAAAAAAAAAAAA1', userId = ROSS) => ({
+  ghl_contact_id: contactId, lp_lead_id: '600001', partner_name: 'Ross Erstling', ghl_user_id: userId,
+  assigned_at: '2026-10-21T14:00:00Z', released_at: null,
+});
 
 test('1. a new RFED lead, any rep → Ross owns the contact and its open opportunities', async () => {
   const w = world();
@@ -101,6 +106,10 @@ test('1. a new RFED lead, any rep → Ross owns the contact and its open opportu
   assert.doesNotMatch(w.slack[0].text, /600001/, 'never the LP lead id on a card');
   assert.equal(logRows(w).at(-1).reason, 'assigned');
   assert.equal(logRows(w).at(-1).to_owner, ROSS);
+  const a = assignRows(w);
+  assert.equal(a.length, 1, 'an owner we set is recorded as ours');
+  assert.equal(a[0].ghl_user_id, ROSS);
+  assert.equal(a[0].released_at, null);
 });
 
 test('2. an RFED lead created before go-live, branch unchanged → untouched', async () => {
@@ -130,18 +139,81 @@ test('3. an old lead whose branch changes INTO RFED after go-live → Ross, and 
   assert.equal(w.writes.length, writesBefore);
 });
 
-test('4. RFED → another branch → the owner returns to the Reece team user', async () => {
+test('4. a contact we assigned leaves RFED → the owner returns to the Reece team user, assignment released', async () => {
   const moved = lead({ lp_branch_id: 'BOCA' });
-  const w = world({ leads: [moved], owner: ROSS });
+  const w = world({ leads: [moved], owner: ROSS, assignments: [ours()] });
   const r = await syncPartnerOwner(moved, { prevRow: lead(), deps: w.deps });
   assert.equal(r.reason, 'returned');
   assert.equal(w.contacts.get(moved.ghl_contact_id).assignedTo, REECE);
   assert.equal(w.opportunities.find((o) => o.id === 'o1').assignedTo, REECE);
   assert.match(w.slack[0].text, /PARTNER LEAD RETURNED → Reece team/);
   assert.match(w.notes[0].body, /^Owner → Reece team · LP branch BOCA/);
+  assert.ok(assignRows(w)[0].released_at, 'the assignment is closed');
 });
 
-test('5. a branch + rep row overrides the branch-only row', () => {
+test('5. a 1 Leg contact GHL assigned to Ross leaves RFED → skipped_not_ours, nothing written', async () => {
+  const moved = lead({ lp_branch_id: 'BOCA' });
+  const w = world({ leads: [moved], owner: ROSS });
+  const r = await syncPartnerOwner(moved, { prevRow: lead(), deps: w.deps });
+  assert.equal(r.reason, 'skipped_not_ours');
+  assert.equal(w.writes.length, 0);
+  assert.equal(w.notes.length, 0);
+  assert.equal(w.slack.length, 0);
+  assert.equal(w.contacts.get(moved.ghl_contact_id).assignedTo, ROSS);
+  assert.equal(logRows(w).at(-1).reason, 'skipped_not_ours');
+  // A second pass does not grow the log.
+  await syncPartnerOwner(moved, { prevRow: lead(), deps: w.deps });
+  assert.equal(logRows(w).length, 1);
+});
+
+test('5b. a 1 Leg contact GHL assigned to Ross with a new RFED lead → noop, no assignment made', async () => {
+  const w = world({ owner: ROSS });
+  const r = await syncPartnerOwner(lead(), { prevRow: null, deps: w.deps });
+  assert.equal(r.reason, 'noop');
+  assert.equal(w.writes.length, 0);
+  assert.equal(assignRows(w).length, 0, 'never claimed as ours');
+  // ... so leaving RFED later still leaves Ross alone.
+  const moved = lead({ lp_branch_id: 'BOCA' });
+  w.db.tables.lp_leads[0].lp_branch_id = 'BOCA';
+  const r2 = await syncPartnerOwner(moved, { prevRow: lead(), deps: w.deps });
+  assert.equal(r2.reason, 'skipped_not_ours');
+  assert.equal(w.contacts.get(moved.ghl_contact_id).assignedTo, ROSS);
+});
+
+test('5c. another partner GHL put on the contact is never reassigned by us', async () => {
+  const map = [...MAP, { id: 'm9', partner_name: 'Other Partner', lp_branch_id: 'OTHR', lp_rep_name: null, ghl_user_id: 'OTHERPARTNERUSER0001', active: true }];
+  const w = world({ map, owner: 'OTHERPARTNERUSER0001' });
+  const r = await syncPartnerOwner(lead(), { prevRow: null, deps: w.deps });
+  assert.equal(r.reason, 'skipped_not_ours');
+  assert.equal(w.writes.length, 0);
+});
+
+test('5d. our assignment whose owner a person changed since → released, owner left alone', async () => {
+  const moved = lead({ lp_branch_id: 'BOCA' });
+  const w = world({ leads: [moved], owner: 'someRepUserId00000001', assignments: [ours()] });
+  const r = await syncPartnerOwner(moved, { prevRow: lead(), deps: w.deps });
+  assert.equal(r.reason, 'not_partner_owned');
+  assert.equal(w.writes.length, 0);
+  assert.ok(assignRows(w)[0].released_at);
+});
+
+test('5e. a write of ours that missed an opportunity is finished on the next pass', async () => {
+  const w = world();
+  const realFetch = w.deps.ghlFetch;
+  let failOpp = true;
+  w.deps.ghlFetch = async (method, path, body) => {
+    if (failOpp && method === 'PUT' && path.startsWith('/opportunities/')) { failOpp = false; throw new Error('GHL 502'); }
+    return realFetch(method, path, body);
+  };
+  const r1 = await syncPartnerOwner(lead(), { prevRow: null, deps: w.deps });
+  assert.equal(r1.reason, 'failed');
+  assert.equal(w.contacts.get('cAAAAAAAAAAAAAAAAAA1').assignedTo, ROSS);
+  const r2 = await syncPartnerOwner(lead(), { prevRow: lead(), deps: w.deps });
+  assert.equal(r2.reason, 'assigned');
+  assert.equal(w.opportunities.find((o) => o.id === 'o1').assignedTo, ROSS);
+});
+
+test('5r. a branch + rep row overrides the branch-only row', () => {
   const rows = [...MAP, { id: 'm2', partner_name: 'Ross rep Al', lp_branch_id: 'RFED', lp_rep_name: 'Doe, Al', ghl_user_id: 'AL', active: true }];
   assert.equal(matchPartnerRow(rows, { lp_branch_id: 'rfed ', rep_name: ' doe, AL' }).ghl_user_id, 'AL');
   assert.equal(matchPartnerRow(rows, { lp_branch_id: 'RFED', rep_name: 'Smith, Jane' }).ghl_user_id, ROSS);
@@ -231,7 +303,7 @@ test('the newest lead decides: an older BOCA lead never returns a contact whose 
 test('the newest lead decides: an older RFED lead does not hold Ross once a newer non-RFED lead arrives', async () => {
   const newest = lead({ lp_lead_id: '600500', lp_branch_id: 'BOCA', created_at_lp: '2026-10-21T12:00:00+00:00' });
   const older = lead();
-  const w = world({ leads: [newest, older], owner: ROSS });
+  const w = world({ leads: [newest, older], owner: ROSS, assignments: [ours()] });
   const r = await syncPartnerOwner(older, { prevRow: older, deps: w.deps });
   assert.equal(r.reason, 'returned');
   assert.equal(w.contacts.get(older.ghl_contact_id).assignedTo, REECE);

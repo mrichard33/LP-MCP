@@ -94,6 +94,7 @@ import { CALENDAR_MAP, GHL_LOCATION_ID } from '../constants.js';
 import { updateGHLContactFields, applyGHLTag, removeGHLTags } from '../../ghl.js';
 import { fetchUpcomingAppointments } from '../../knowledge/contact-appointments.js';
 import { isInHomeCalendarId, isGhlOnlyCalendarId, isRehashCalendarId, rehashCalendarId, BOOKING_CALENDARS } from '../../knowledge/booking-calendar-router.js';
+import { isPhonePresentationCalendarId, ONE_LEG_STATE } from '../../agentic/one-leg-presentation.js';
 import { callAssigneeFor, rehashRepFor } from '../../config/rehash-assignee.js';
 import { isInRehash, rehashRoutingMode, rehashTeamUserIds, hasPostAppointmentStage } from '../../agentic/rehash-state.js';
 import { notifyRehashCall } from '../../notifications/rehash-call.js';
@@ -712,6 +713,20 @@ export async function executeBookAppointment(action, context) {
     return { action: 'skipped_not_rehash', contact_id: contactId, calendar_id: calendarId, start_time: startTime, reason: 'Rehash Call is for rehash leads only (2026-10-09)' };
   }
 
+  // 2026-10-20 (handoff v3): the Phone Presentation calendar is for a contact
+  // whose OPEN objection state is APPOINTMENT_DISRUPTION.one_leg, and nobody
+  // else. A read that fails books nothing (fail closed: every other contact
+  // must never get one).
+  if (isPhonePresentationCalendarId(calendarId)) {
+    const { data: openState, error: stateErr } = await supabase.from('contact_objection_states')
+      .select('state_code').eq('contact_id', contactId).is('exited_at', null).maybeSingle();
+    if (stateErr || openState?.state_code !== ONE_LEG_STATE) {
+      const why = stateErr ? `objection state unreadable (${stateErr.message})` : `open state ${openState?.state_code || 'none'}`;
+      console.log(`[ActionExecutor] ⛔ skipped_not_one_leg: ${contactId} — ${why}; nothing booked on Phone Presentation`);
+      return { action: 'skipped_not_one_leg', contact_id: contactId, calendar_id: calendarId, start_time: startTime, reason: `Phone Presentation is for 1 Leg contacts only (handoff v3, 2026-10-20): ${why}` };
+    }
+  }
+
   // v3.4 / 2026-06-24: idempotent-booking guard. The executor reaps stuck
   // actions and can re-run a book_appointment, and the model can emit a
   // duplicate on a re-confirm. If an active future appointment already exists
@@ -988,7 +1003,9 @@ export async function executeBookAppointment(action, context) {
     const team = rehashTeamUserIds();
     const assignee = callAssigneeFor({ isRehashCalendar: true, explicit: payload.assigned_user_id, contactRep: rehashRepFor(contact, team), contactOwner: contact?.assignedTo || null, team });
     if (assignee) body.assignedUserId = assignee;
-  } else if (!body.assignedUserId && isBotBooking(payload)) {
+  } else if (!body.assignedUserId && isBotBooking(payload) && !isPhonePresentationCalendarId(calendarId)) {
+    // (A Phone Presentation keeps the calendar's own assignment: the Reece Team
+    // user is not one of its presenters.)
     // 2026-10-16 (the user, Melissa trace): a visit the bot books belongs to
     // the Reece Team user, not whoever GHL's round robin picks
     // (ySw0WWLr4966zkLSO501 got hers). Rehash calls keep their rep above.
