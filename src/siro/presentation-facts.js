@@ -191,6 +191,19 @@ export function followupTextLine(facts) {
   return t ? `Siro's suggested follow-up (reference for topic and tone only; write your own; never send it as written): "${t}"` : '';
 }
 
+/**
+ * The hesitation the visit recorded, for the post-demo planner: 'price' |
+ * 'competitor' | 'spouse' | null (2026-10-20). Siro's main objection first. Pure.
+ */
+export function visitHesitationOf(facts) {
+  if (!facts) return null;
+  const types = [
+    ...(facts.insights?.main_objection ? [objectionTypeOf(facts.insights.main_objection)] : []),
+    ...(Array.isArray(facts.objections) ? facts.objections : []).map(o => o?.type),
+  ];
+  return types.find(t => t === 'price' || t === 'competitor' || t === 'spouse') || null;
+}
+
 /** Comma lists for the F.0 prompt template. Pure. */
 export function presentationTemplateVars(facts, { followupTextLive = false } = {}) {
   return {

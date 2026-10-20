@@ -1,5 +1,5 @@
 {
- "version": "v2.13.0",
+ "version": "v2.14.0",
  "copy": {
   "src/agentic/nepq-planner.js": [
    "${hi ? `Understood${hi}. ` : ''}${rehashIfICouldBridge(repName && !speaksAsRep ? repName : null)}",
@@ -102,6 +102,7 @@
    "dnk",
    "dnk_ask_address",
    "handoff",
+   "name the ${visitHesitation === 'price' ? 'budget' : visitHesitation === 'competitor' ? 'other quotes' : 'decision'} they raised at the visit",
    "nepq:${step}",
    "nepq:ask_day",
    "nepq:booked",
