@@ -51,7 +51,13 @@ export const RUN_HOUR_ET = 8;
 export const SECTION_MAX = 10;
 const DAY_MS = 86_400_000;
 const LEAD_TTL_DAYS = 7;
-const P2_RULES = { P2_JOB_TERMINAL_WON: 'won', P2_INSTALL_COMPLETE_WON: 'won', P2_JOB_TERMINAL_LOST: 'lost' };
+// The install milestone rules also close Won (2026-10-20): their update_opportunity
+// step runs after their stage move, and only update_opportunity rows count here.
+const P2_RULES = {
+  P2_JOB_TERMINAL_WON: 'won', P2_JOB_TERMINAL_LOST: 'lost',
+  P2_MILESTONE_INSTALL_END: 'won', P2_MILESTONE_COMPLETION: 'won',
+  P2_MILESTONE_INSPECTION_SET: 'won', P2_MILESTONE_INSPECTION_PASSED: 'won',
+};
 const PARITY_PREFIX = 'appt_parity:gap:';
 // 2026-10-16 (handoff v3.4): the watchdog now CREATES a missing GHL appointment
 // itself (Fix 3), so a Class B line here means the create failed or needs a

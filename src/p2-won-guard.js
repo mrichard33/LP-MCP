@@ -11,8 +11,8 @@
  * 2026-09-18..23. A customer who pays in full before the install is paid, not won.
  * Installed & Unpaid stays open until paid (same ruling).
  *
- * The guard sits in the executor, not in the rule, so rule 366, the install rule
- * (P2_INSTALL_COMPLETE_WON) and any later caller all pass the same test. It FAILS
+ * The guard sits in the executor, not in the rule, so rule 366, the install milestone
+ * rules (F/C/I/B, a win step after their move) and any later caller all pass the same test. It FAILS
  * CLOSED: a job read that fails, or no LP job, writes nothing. A Won close is
  * reported revenue; "could not tell" is never a win.
  *

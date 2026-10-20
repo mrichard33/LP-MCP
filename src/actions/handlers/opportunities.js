@@ -484,7 +484,7 @@ export async function executeUpdateOpportunity(action) {
     const searchRes = await ghlFetch('GET', `/opportunities/search?location_id=${GHL_LOCATION_ID}&contact_id=${contactId}&pipeline_id=${pipelineId}`);
     const opps = searchRes?.opportunities || [];
     if (opps.length === 0 && p2Win && pipelineId === PIPELINE_IDS.P2) {
-      // P2_INSTALL_COMPLETE_WON fires on every install milestone, card or not.
+      // The install milestone rules close Won on every F/C/I/B, card or not.
       return { skipped: true, reason: 'won_no_p2_card', contact_id: contactId };
     }
     if (opps.length === 0) throw new Error(`No ${pipeline} opportunity found for contact ${contactId}`);
