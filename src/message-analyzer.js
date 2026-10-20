@@ -477,7 +477,7 @@ Required JSON structure:
   "fast_track_eligible": <boolean>,
   "recommended_story_arc": <null | "SA1" | "SA2" | "SA3" | "SA4" | "SA5">,
   "recommended_action": <"advance_stage" | "deploy_objection_handler" | "fast_track_booking" | "continue_current" | "escalate_to_rep" | "suppress" | "objection_price" | "busy_callback" | "wrong_person" | "frustrated_fast_track" | "callback_request" | "guide_send" | "follow_up_scheduled">,
-  "dq_detected": <null | "mobile-home" | "renter" | "lanai-only" | "rental_property" | "commercial" | "below_minimum">,
+  "dq_detected": <null | "mobile-home" | "renter" | "lanai-only" | "commercial" | "below_minimum">,
   "requested_fulfillment": <"in_home_estimate" | "phone_call" | "info_only" | "unspecified">,
   "escalation_category": <null | "existing_customer_service" | "legal_media" | "identity_ambiguous" | "commercial_hoa" | "contract_change" | "billing" | "vendor_recruiting" | "language" | "compliance_adjacent" | "rep_promise_unfulfilled" | "document_request">,
   "guide_type": <null | "dhp" | "hurricane" | "energy" | "security" | "warranty" | "financing" | "reviews" | "credentials" | "booking-link" | "process">,
@@ -616,12 +616,11 @@ Set dq_detected ONLY when the lead VOLUNTEERS a disqualifying fact. Never infer 
 
 • "mobile-home" — they state the property is a mobile or manufactured home.
 • "renter" — they state they rent / are not the homeowner / "I'd have to ask my landlord".
-• "rental_property" — they state the home is rented out or is an investment: a landlord, "we rent it out", an investment rental, an Airbnb or VRBO, a property manager, or a flip (bought to fix and resell). An owner's own second home that is not rented out is NOT.
 • "commercial" — they state the property is not a home: a business, store, office or apartment building, church, school, or an HOA or condo association buying for the building.
 • "below_minimum" — they state the whole job is under our minimum (fewer than three windows or doors, and no sliding glass door) and confirm there is nothing else.
 • "lanai-only" — the project is ONLY a lanai, sunroom, screen enclosure, or patio screen (no main-structure windows or doors). "Windows plus the lanai" is NOT a DQ — main-home work qualifies.
 
-RENTAL PROPERTIES ARE A DISQUALIFIER (the user's ruling, 2026-10-13; this replaces "investment properties are not a disqualifier"). "It's an investment property", "it's a rental I own", "we rent it out" → dq_detected "rental_property". An owner's own second home that is NOT rented out ("it's not my primary residence", "our vacation home") is not a rental: dq_detected stays null.
+AN OWNER IS NEVER DISQUALIFIED FOR WHAT THEY DO WITH THE HOME (the user's ruling, 2026-10-20; this replaces the 2026-10-13 rental rule). "It's an investment property", "it's a rental I own", "we rent it out", "it's an Airbnb", "we're flipping it" → dq_detected stays null. Only the person who RENTS the home they live in is "renter".
 
 When dq_detected is set, recommended_action should usually be "continue_current" — a dedicated rule handles the exit; do not also route to suppress.
 
@@ -1306,7 +1305,7 @@ function validateAnalysis(analysis) {
     ].includes(analysis.recommended_action) ? analysis.recommended_action : 'continue_current',
     // 2026-07-06 — DQ detection (volunteered-only; investment property is
     // deliberately NOT a value — investment mentions are a normal flow).
-    dq_detected: ['mobile-home', 'renter', 'lanai-only', 'rental_property', 'commercial', 'below_minimum'].includes(analysis.dq_detected) ? analysis.dq_detected : null,
+    dq_detected: ['mobile-home', 'renter', 'lanai-only', 'commercial', 'below_minimum'].includes(analysis.dq_detected) ? analysis.dq_detected : null,
     // 2026-07-06 — the lead's explicit ask this turn; outranks funnel
     // defaults in resolveBookingCalendar. Never inferred.
     requested_fulfillment: ['in_home_estimate', 'phone_call', 'info_only', 'unspecified'].includes(analysis.requested_fulfillment) ? analysis.requested_fulfillment : 'unspecified',

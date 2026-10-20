@@ -259,7 +259,9 @@ export const SCENARIOS = Object.freeze({
   out_of_area_chat: { title: 'Out of area, zip 10001 (batch 2 #3)', family: 'compliance', persona: GUEST, channels: ['livechat'], turns: ['Do you service zip 10001?'] },
   houston_tz: { title: 'Houston lead, Central time (batch 2 #2)', family: 'booking', persona: KATY, autoAnswer: true, turns: ['Hi, I need impact windows for my house. My zip is 77494', 'Yes, please set up a visit'] },
   // ── 2026-10-13 (the user): no rentals, no commercial, the minimum ──
-  landlord: { title: 'Landlord asks about a rental (no rentals)', family: 'compliance', persona: DANA, turns: ['Hi, I need new windows on a house I rent out to tenants', 'Can you just set something up anyway?'] },
+  // 2026-10-20 (the user): an owner who rents the home out, or flips it, is a lead.
+  landlord_lead: { title: 'Landlord asks about the house they rent out (an owner is a lead)', family: 'new_lead', persona: DANA, turns: ['Hi, I need new windows on a house I rent out to tenants', 'About 10 windows'] },
+  investment_owner: { title: 'Investor flipping a house (an owner is a lead)', family: 'new_lead', persona: DANA, turns: ["Hi, I'm flipping a house and it needs new impact windows", 'About 12 windows'] },
   commercial: { title: 'Commercial property (no commercial)', family: 'compliance', persona: GUEST, turns: ['Do you do commercial buildings? We need windows for our office building', 'Can someone come take a look?'] },
   one_window: { title: 'One window only (under the minimum)', family: 'compliance', persona: DANA, turns: ['I would like to get a quote on replacing 1 24x36 window', 'Yes, the rest are already impact'] },
   // ── 2026-10-13 (Erica Hilts): a price ask, then a goodbye, twice ──

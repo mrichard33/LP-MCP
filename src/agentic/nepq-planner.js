@@ -1918,6 +1918,7 @@ function openingsGate(args) {
   let plan = planNepqTurnCore(args);
   if (!plan || plan.handoff || plan.post_demo || plan.step === 'booked' || args.postDemoLead) return plan;
   const turns = normalizeThread(args.conversation, args.trigger);
+  if (homeownerFromThread(turns) === 'no') return notOwner(plan, () => clearTimes(plan));
   const js = jobScopeFromThread(turns);
   if (js.block || js.check) return notEligible(plan, js);
   const outbound = turns.filter(t => t.direction === 'outbound');
@@ -1990,7 +1991,32 @@ function notEligible(plan, js) {
   plan.day_preference_pending = false;
   plan.last_offer = null;
   plan.stage = { ...(plan.stage || {}), blocked: why };
+  // A block is a plain no: no question after it (2026-10-20, dq_renter_refire). The
+  // minimum CHECK is itself a question, so it keeps one.
+  if (js.block) plan.no_question = true;
   return Object.assign(plan, { step: 'not_eligible', required_move: 'answer', fixed_line: null, objection: null, reference_markers: null, booking: { allowed: false, reason: `nepq:job_scope_${why}` } });
+}
+
+// Not the owner (a renter, a property manager): no times and no question. The
+// non-owner guard words the reply (non-owner.js). 2026-10-20 (dq_renter_refire): "help
+// with my rent" was planned as discovery and got "What made you start looking into this?"
+// glued after the decline.
+function notOwner(plan, clear) {
+  clear();
+  plan.stage = { ...(plan.stage || {}), blocked: 'not_owner' };
+  plan.no_question = true;
+  return Object.assign(plan, { step: 'not_owner', required_move: 'answer', fixed_line: null, objection: null, reference_markers: null, booking: { allowed: false, reason: 'nepq:not_owner' } });
+}
+
+function clearTimes(plan) {
+  plan.slots_to_offer = [];
+  plan.allowed = { ...plan.allowed, slot_offer: false };
+  plan.offer_line = null;
+  plan.answer_first = false;
+  plan.offer_slots_pending = false;
+  plan.day_preference_pending = false;
+  plan.last_offer = null;
+  plan.ask_contact = false;
 }
 
 // Steps that put a visit time in front of the lead (or a pick of one).
@@ -2010,8 +2036,15 @@ function gateForStage(plan, args) {
   if (!plan || plan.handoff || plan.post_demo || args?.postDemoLead || plan.step === 'booked') return plan;
   // The second price ask's free-measure question is a bridge to the visit too.
   const offersTimes = !!plan.allowed?.slot_offer || (plan.slots_to_offer || []).length > 0 || TIME_STEPS.has(plan.step) || plan.required_move === 'bridge' || plan.step === 'price_visit_offer' || !!plan.offer_slots_pending;
-  if (!offersTimes) return plan;
   const turns = normalizeThread(args.conversation, args.trigger);
+  // 2026-10-20: a renter and a job we do not take are read on EVERY turn, not only one
+  // that offers times (a discovery probe after "help with my rent" kept selling).
+  if (homeownerFromThread(turns) === 'no') return notOwner(plan, () => clearTimes(plan));
+  {
+    const js = jobScopeFromThread(turns);
+    if (js.block) return notEligible(plan, js);
+  }
+  if (!offersTimes) return plan;
   const outbound = turns.filter(t => t.direction === 'outbound');
   const facts = stageFactsNow(args.stage, turns, args.knownZip, args.knownOpenings);
   const clear = () => {
@@ -2027,14 +2060,10 @@ function gateForStage(plan, args) {
     plan.ask_contact = false;
   };
   // Not the owner: no times at all (the qualifying guard words the reply).
-  if (facts.homeowner === 'no') {
-    clear();
-    plan.stage = { ...(plan.stage || {}), blocked: 'not_owner' };
-    return Object.assign(plan, { step: 'not_owner', required_move: 'answer', fixed_line: null, booking: { allowed: false, reason: 'nepq:not_owner' } });
-  }
-  // A job we do not take (2026-10-13: a rental, a commercial property, under
-  // the minimum, or the minimum not yet checked): no times at all. The
-  // job-scope guard words the reply (job-scope.js).
+  if (facts.homeowner === 'no') return notOwner(plan, clear);
+  // A job we do not take (a commercial property, under the minimum, or the
+  // minimum not yet checked): no times at all. The job-scope guard words the
+  // reply (job-scope.js).
   {
     const js = jobScopeFromThread(turns);
     if (js.block || js.check) return notEligible(plan, js);
@@ -2764,7 +2793,7 @@ export function enforceNepqPlan(draft, plan, { allowFigures = false, known = {} 
   // Never on a post-demo plan, a deferral, a close or after a goodbye
   // (2026-10-09: "Enjoy your week. Is it more how they look, or how they work?").
   const endsOnSignOff = isSignOffLine(splitSentences(body).slice(-1)[0] || '');
-  const noDiscovery = plan.post_demo || ['defer', 'close', 'competitor_signed', 'post_demo_ack', 'post_demo_stop', 'post_demo_space', 'post_demo_close'].includes(plan.step) || endsOnSignOff;
+  const noDiscovery = plan.post_demo || plan.no_question === true || ['defer', 'close', 'competitor_signed', 'post_demo_ack', 'post_demo_stop', 'post_demo_space', 'post_demo_close', 'not_owner'].includes(plan.step) || endsOnSignOff;
   if ((plan.required_move === 'probe' || plan.required_move === 'consequence') && !body.includes('?') && !actionable && !noDiscovery) {
     // A discovery turn collects no details: "Let me get your zip code so I can
     // confirm…" next to the question was two asks, and a zip asked twice

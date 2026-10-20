@@ -1813,8 +1813,8 @@ times twice (batch 3 T3). `enforceNonOwner` (`src/agentic/non-owner.js`, the las
 `enforcePropertyScope`, ACTIVE in every mode) turns a reply to a lead who says they rent into `NON_OWNER_LINE` (the
 homeowner needs to be part of the visit; the owner is welcome to reach out), drops the time offer when they said it
 earlier, drops the `book_appointment` companion, and the live chat never books one (`isNonOwner`). A landlord ("we rent
-it out") owns the home (`homeowner.js`), but a rental is declined by `job-scope.js` (2026-10-13, below), and a TENANT
-now gets `RENTAL_LINE` (`nonOwnerLine`); only a non-tenant non-owner keeps `NON_OWNER_LINE`. Zip 10001 was declined on SMS and "good chance we can help" in live chat: both
+it out") owns the home (`homeowner.js`) and is a lead (2026-10-20, below); a TENANT gets `TENANT_LINE` (`nonOwnerLine`:
+we only work with homeowners, the owner is welcome to reach out); a property manager or a grown child keeps `NON_OWNER_LINE`. Zip 10001 was declined on SMS and "good chance we can help" in live chat: both
 bots now give `outOfAreaLine` (service-area-turn.js; the SMS SERVICE_AREA_EXIT text and the `serviceAreaOutside` prompt
 too, which no longer offers a team callback), and live chat checks a zip typed outside a coverage question
 (`zipInText`). With `LEAD_STAGE_MODE=live` (`planNepqTurn({ stageLive })`): a plain quote request is NEPQ's info request
@@ -1823,7 +1823,21 @@ is), and "we went with another company" gets `LINES.competitor` (the disarm, the
 move after it; a second time → `repeat_objection`). `CLAIMS_RX` strips claims that another company's work is not "up to
 code".
 
-**No rentals, no commercial, a three-opening minimum, impact only (the user, 2026-10-13).** A landlord was booked like
+**Owners yes, renters no (the user, 2026-10-20; supersedes the rental and investment half of the next section).** "We do
+not need to turn investment properties away. However, we only work with owners not the renters." An owner who rents the
+home out, runs an Airbnb, owns an investment home or flips is a lead: `job-scope.js` no longer reads rentals or
+investments (`RENTAL_LINE`, `INVESTMENT_LINE`, the `rental` / `investment` blocks and `rental_property` in the analyzer
+are gone; the claim it corrects is now "we work with renters"). A TENANT is turned away by `non-owner.js` with
+`TENANT_LINE`, gets the one ND card (`scopeDqKind` → `renter`: `saysRenter` AND `TENANT_RX`, never a property manager or a
+grown child), and `homeowner.js` reads "my rent", "help with my rent" and "rent is $N" (dq_renter_refire: "help with my
+rent my rent is $589" read as nothing). A renter or a commercial block plans `not_owner` / `not_eligible` with
+`no_question` on EVERY turn (`openingsGate`, and `gateForStage` before its time-offer check), so `discovery_question_added`
+never glues a question after the no. Data: `sql/seeds/2026-10-20_owners_of_rentals_welcome.sql` (LIB-P16, the scope proof
+points, the RENTER handler's keywords, which matched a landlord's "rent" / "landlord"). Gate scenarios `landlord_lead` and
+`investment_owner` replace `landlord`.
+
+**No rentals, no commercial, a three-opening minimum, impact only (the user, 2026-10-13; rentals and investments
+superseded 2026-10-20, above).** A landlord was booked like
 any owner, the prompt said "Investment properties are NOT a disqualifier", commercial work was "route to the team" (live
 chat pitched it as a LARGE JOB), no code knew a minimum, and two FAQs said "not every window in our line is
 impact-rated". `src/agentic/job-scope.js` (pure, both bots, EVERY mode, run right before `enforceNonOwner`) reads the
@@ -2064,7 +2078,7 @@ live chat never runs `DQ_ABOVE_2ND_FLOOR_INTERIM`). Both are now in the shared s
 one gets the "no" as the whole reply, and any "we do" sentence is replaced. The building counts, not the unit. Modular
 homes are not ruled on and are deliberately not covered; "tower" alone and "4 floor-to-ceiling windows" do not count.
 
-**A commercial or rental lead is set to ND by a person (the user, 2026-10-13).** LP's API cannot change a disposition
+**A commercial or renter lead is set to ND by a person (the user, 2026-10-13; a renter, not a rental, since 2026-10-20).** LP's API cannot change a disposition
 (no endpoint writes one). When the lead's own newest message makes `jobScopeFromThread` (`src/agentic/job-scope.js`)
 block as `commercial` or `rental` (`scopeDqKind`, `src/agentic/scope-dq.js`), the SMS send handler and the live chat
 (after the send) add a note on the LP PROSPECT (`rectype: 'cst'`; `ils` silently no-ops) and post ONE

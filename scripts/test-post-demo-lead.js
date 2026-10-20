@@ -37,10 +37,11 @@ test('an LP note that says renter or below minimum is not a DQ after the demo', 
 });
 
 test('checkReply does not hold a post-demo reply to the lead-side job checks', () => {
-  const conversation = [{ direction: 'inbound', text: 'we rent it out' }];
-  const reply = 'Thanks for checking in. Is anything holding you back from moving forward?';
-  assert.ok(checkReply(reply, { channel: 'sms', inbound: 'we rent it out', conversation }).violations.some(v => v.code === 'job_scope'));
-  assert.ok(!checkReply(reply, { channel: 'sms', inbound: 'we rent it out', conversation, postDemoLead: true }).violations.some(v => v.code === 'job_scope'));
+  // 2026-10-20: a rental the owner rents out is a lead now; a commercial property is still a block.
+  const conversation = [{ direction: 'inbound', text: 'it is for our office building' }];
+  const reply = 'Thanks for checking in. I have Thu, Oct 15 at 10:00 AM ET or Fri, Oct 16 at 2:00 PM ET. Which works better?';
+  assert.ok(checkReply(reply, { channel: 'sms', inbound: 'it is for our office building', conversation }).violations.some(v => v.code === 'job_scope'));
+  assert.ok(!checkReply(reply, { channel: 'sms', inbound: 'it is for our office building', conversation, postDemoLead: true }).violations.some(v => v.code === 'job_scope'));
   // Our own false claim is still caught.
   assert.ok(checkReply('Yes, we do commercial work too.', { channel: 'sms', inbound: 'hi', conversation, postDemoLead: true }).violations.some(v => v.code === 'job_scope'));
 });

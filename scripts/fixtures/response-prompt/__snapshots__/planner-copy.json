@@ -1,5 +1,5 @@
 {
- "version": "v2.11.0",
+ "version": "v2.12.0",
  "copy": {
   "src/agentic/nepq-planner.js": [
    "${hi ? `Understood${hi}. ` : ''}${rehashIfICouldBridge(repName && !speaksAsRep ? repName : null)}",

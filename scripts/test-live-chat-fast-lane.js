@@ -1492,8 +1492,9 @@ test('a renter in live chat gets no times (batch 3 T3; active in every mode)', a
   const { lane } = makeLane({ mode: 'shadow', llm: () => ({ message: "Makes sense, you'll want his okay first. I have Thu, Oct 15 at 10:00 AM ET or Fri, Oct 16 at 2:00 PM ET. Which works better?" }) });
   const out = await lane.processInbound(INBOUND("I'm renting, my landlord would have to approve it"));
   assert.doesNotMatch(out.message, /\d{1,2}:\d{2}\s*(?:AM|PM)/);
-  // 2026-10-13 (the user): a tenant's home is a rental, which we do not take.
-  assert.match(out.message, /don't work on rental properties/);
+  // 2026-10-20 (the user): "we only work with owners not the renters".
+  assert.match(out.message, /only work with homeowners/);
+  assert.doesNotMatch(out.message, /rental propert/);
 });
 
 test('a stated count is queued for Window Count / Door Count, with real columns only (2026-10-13)', async () => {
@@ -1508,11 +1509,11 @@ test('a stated count is queued for Window Count / Door Count, with real columns 
   assert.deepEqual(extra, []);
 });
 
-test('a lead past its demo is not declined as a rental (the user, 2026-10-13)', async () => {
+test('a lead past its demo is not declined for the property (the user, 2026-10-13)', async () => {
   const draft = 'Thanks for checking in. Is anything holding you back from moving forward?';
   const { lane } = makeLane({ mode: 'shadow', tags: ['lp-demo-completed'], llm: () => ({ message: draft }) });
-  const out = await lane.processInbound(INBOUND('we rent it out, still thinking about the windows'));
-  assert.doesNotMatch(out.message, /rental propert/);
+  const out = await lane.processInbound(INBOUND('it is for our office building, still thinking about the windows'));
+  assert.doesNotMatch(out.message, /commercial propert/);
   assert.match(out.message, /holding you back/);
 });
 

@@ -59,7 +59,7 @@ import { enforceTeamVoice } from '../agentic/team-voice.js';
 import { enforcePropertyScope, leadRaisesScope } from '../agentic/property-scope.js';
 import { enforceNonOwner, isNonOwner, nonOwnerLine } from '../agentic/non-owner.js';
 import { enforceSignOff } from '../agentic/sign-off.js';
-import { enforceJobScope, jobScopeFromThread, openingsToSave, RENTAL_LINE, INVESTMENT_LINE, COMMERCIAL_LINE, BELOW_MINIMUM_LINE, MINIMUM_CHECK_LINE, MINIMUM_CHECK_DOORS_LINE } from '../agentic/job-scope.js';
+import { enforceJobScope, jobScopeFromThread, openingsToSave, COMMERCIAL_LINE, BELOW_MINIMUM_LINE, MINIMUM_CHECK_LINE, MINIMUM_CHECK_DOORS_LINE } from '../agentic/job-scope.js';
 import { scopeDqKind } from '../agentic/scope-dq.js';
 import { isPostDemoLead } from '../agentic/post-demo-lead.js';
 import { enforceCallTiming, promisedCallback, isTeamOpen } from '../agentic/team-hours.js';
@@ -355,9 +355,9 @@ export function looksLikeMalformedEmail(text) {
   return DOMAIN_NO_AT_RX.test(s) || AT_NO_DOT_RX.test(s);
 }
 
-// 2026-10-13 (the user): commercial properties and rentals are jobs we do not
-// take (job-scope.js says no), so a church, an HOA, a property manager or a
-// building is no longer a "large job" to advance. Eight or more openings is.
+// 2026-10-13 (the user): commercial properties are jobs we do not take
+// (job-scope.js says no), so a church, an HOA or a building is no longer a
+// "large job" to advance. Eight or more openings is.
 const LARGE_JOB_RX = /\b(?:[89]|[1-9]\d{1,2})\s*(?:\+\s*)?(?:windows?|openings?|doors?|sliders?)\b/i;
 
 /** A large-job signal in the visitor's own words. Pure. */
@@ -379,7 +379,7 @@ You are answering in the website chat, live, with the visitor watching the scree
 - If what they typed looks like an email but is not a valid one (no @, or nothing after the @), say so kindly and ask for it again: "That doesn't look quite right. Could you check the email address?" Never say you do not have enough information. Never dead-end.
 - Never promise to send anything unless an email is on file. No email → ask for the email instead.
 - A large job (eight or more openings in a home) → answer, offer the next step, and a person will follow up; say that plainly.
-- We work only on homes. A rental property (tenant or landlord), a commercial property (a business, a church, an HOA or condo association, an apartment or office building), or a job under our minimum (three windows or doors in any mix, or one sliding glass door) gets a kind, plain no and no visit.
+- We work only on homes, and only with the homeowner. A renter (someone who rents the home they live in), a commercial property (a business, a church, an HOA or condo association, an apartment or office building), or a job under our minimum (three windows or doors in any mix, or one sliding glass door) gets a kind, plain no and no visit. An owner who rents the home out, or owns it as an investment or a flip, is a normal lead.
 - Everything else in this prompt still binds: the discovery discipline, the decision-maker rules, no insurance predictions, no exclamation marks.
 - A SERVICE AREA instruction in this prompt outranks the collection order above for this reply: when it says ask only for the zip, or stop, do exactly that.
 - Never name a day or a time for a visit or a call yourself: real open times are added to the reply for you when it is time to book (2026-10-02). Never say "a team member will call to set a time": when they want a visit, ask "Would that help?" about a free visit at their home, and the times follow.
@@ -1977,7 +1977,7 @@ export function createLiveChatFastLane(deps) {
       if (!pastDemo) {
         const js = jobScopeFromThread(threadTurns, body);
         if (js.block || js.check) {
-          const reply = js.check ? (js.doors ? MINIMUM_CHECK_DOORS_LINE : MINIMUM_CHECK_LINE) : ({ rental: RENTAL_LINE, investment: INVESTMENT_LINE, commercial: COMMERCIAL_LINE, below_minimum: BELOW_MINIMUM_LINE })[js.block];
+          const reply = js.check ? (js.doors ? MINIMUM_CHECK_DOORS_LINE : MINIMUM_CHECK_LINE) : ({ commercial: COMMERCIAL_LINE, below_minimum: BELOW_MINIMUM_LINE })[js.block];
           return { reply, record: { booking: `refused_job_scope:${js.block || 'minimum_check'}` } };
         }
       }

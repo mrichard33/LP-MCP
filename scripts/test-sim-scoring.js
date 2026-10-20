@@ -267,6 +267,14 @@ test('PR 7: slots_offered_to_non_owner — any time after the lead said they ren
   assert.ok(!codes7(run7('custom', [['we rent it out to tenants', OFFER7]])).includes('slots_offered_to_non_owner'));
 });
 
+test('2026-10-20: a landlord or an investor is a lead, never turned away', () => {
+  const bad = run7('landlord_lead', [['Hi, I need new windows on a house I rent out to tenants', "Thanks for letting me know. We don't work on rental properties, so we can't set up a visit for this one."]]);
+  assert.ok(codes7(bad).includes('owner_declined'));
+  const ok = run7('landlord_lead', [['Hi, I need new windows on a house I rent out to tenants', 'Happy to help. How many windows and doors are you looking to get a quote on?']]);
+  assert.ok(!codes7(ok).includes('owner_declined'));
+  assert.ok(codes7(run7('investment_owner', [["I'm flipping a house", "Sorry, we don't work on flips."]])).includes('owner_declined'));
+});
+
 test('PR 7: slots_without_qualifying and bridge_repeated count only when the stage drives the bot', () => {
   const bridge = 'Based on what you told me, the next step would be a free visit at your home. Would that help?';
   const r = run7('custom', [['my windows leak', bridge], ['the kids are cold', bridge], ['ok', OFFER7]]);

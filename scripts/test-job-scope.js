@@ -18,56 +18,31 @@ const { enforceNonOwner } = await import('../src/agentic/non-owner.js');
 const thread = (...xs) => xs.map(([d, t]) => ({ direction: d === 'o' ? 'outbound' : 'inbound', text: t }));
 const OFFER = 'Great. I have Thu, Oct 15 at 10:00 AM ET or Fri, Oct 16 at 2:00 PM ET. Which works better?';
 
-// ── rentals ───────────────────────────────────────────────────────────────
+// ── owners of rentals and investments are leads; a tenant is not (the user, 2026-10-20) ──
 
-test('a rented-out home is a rental, whoever says it', () => {
+test('an owner who rents the home out, runs an Airbnb, invests or flips is not blocked', () => {
   for (const t of [
     'We rent it out to tenants',
     'We have it on Airbnb',
     'It is a short-term rental',
-    "I'm the property manager for the owner",
-    "I'm renting, my landlord would have to okay it",
-    'Can renters get a quote?',
-    "It's a rental",
-  ]) assert.equal(J.saysRentalProperty(t), true, t);
+    "It's an investment property",
+    'We are flipping this house',
+    "It's a fix and flip",
+    'The house is a rental, we rent it out to tenants',
+  ]) {
+    assert.equal(J.jobScopeFromThread([], t).block, null, t);
+    assert.equal(J.enforceJobScope(OFFER, { thread: [], inbound: t }).changed, false, t);
+  }
 });
 
-test('a home the owner lives in, or a denied rental, is not a rental', () => {
-  for (const t of [
-    "It's not a rental, we live there",
-    'We used to rent it out but we live there now',
-    'Our vacation home in Naples',
-    'I own the house',
-    "It's my parents' house, I don't own it",
-    'I picked up a rental car',
-  ]) assert.equal(J.saysRentalProperty(t), false, t);
-});
-
-test('a landlord said now gets the rental line: no times, no question', () => {
-  const r = J.enforceJobScope(OFFER, { thread: [], inbound: 'The house is a rental, we rent it out to tenants' });
-  assert.equal(r.text, J.RENTAL_LINE);
-  assert.equal(r.block, 'rental');
-  assert.doesNotMatch(r.text, /\?|AM|PM|—/);
-});
-
-test('a rental said earlier: the answer stays, the time offer goes', () => {
-  const r = J.enforceJobScope('The visit takes about an hour. I have Thu, Oct 15 at 10:00 AM ET or Fri, Oct 16 at 2:00 PM ET. Which works better?',
-    { thread: thread(['i', 'We rent it out to tenants'], ['o', 'Thanks for telling me.']), inbound: 'how long is a visit?' });
-  assert.equal(r.text, 'The visit takes about an hour.');
-  assert.equal(r.block, 'rental');
-});
-
-test('the newest word wins: "we live there now" after a rental is a home', () => {
-  const s = J.jobScopeFromThread(thread(['i', 'It was a rental'], ['o', 'Got it.'], ['i', 'We own it and we live there now']));
-  assert.equal(s.block, null);
-});
-
-test('a tenant gets the same rental line from the non-owner guard (no clash)', () => {
+test('a tenant is turned away by the non-owner guard with the tenant line', async () => {
+  const { TENANT_LINE } = await import('../src/agentic/non-owner.js');
   const inbound = "I'm renting, my landlord would have to okay it";
   const scope = J.enforceJobScope(OFFER, { thread: [], inbound });
-  const owner = enforceNonOwner(scope.text, { thread: [], inbound });
-  assert.equal(owner.changed, false);
-  assert.equal(owner.text, J.RENTAL_LINE);
+  assert.equal(scope.changed, false);
+  assert.equal(enforceNonOwner(scope.text, { thread: [], inbound }).text, TENANT_LINE);
+  for (const t of ["I'm renting", 'help with my rent', 'my rent is $1,200', 'Can renters get a quote?']) assert.ok(J.TENANT_RX.test(t), t);
+  for (const t of ['We rent it out', 'my rental property', 'I picked up a rental car', 'we use a property manager']) assert.ok(!J.TENANT_RX.test(t), t);
 });
 
 // ── commercial ────────────────────────────────────────────────────────────
@@ -193,9 +168,11 @@ test('a model-worded minimum ask stands', () => {
 
 // ── our own claims ────────────────────────────────────────────────────────
 
-test('a draft that says we do commercial or rental work is corrected', () => {
+test('a draft that says we do commercial work, or work with renters, is corrected', () => {
   assert.equal(J.enforceJobScope('Yes, we do commercial work too. What got you looking?', {}).text, 'We only work on homes, not commercial properties. What got you looking?');
-  assert.equal(J.enforceJobScope('Sure, we work with landlords all the time.', {}).text, "We don't work on rental or investment properties.");
+  assert.equal(J.enforceJobScope('Sure, we work with renters all the time.', {}).text, 'We work with homeowners, so the owner would need to be part of it.');
+  // An owner who rents the home out is a lead (2026-10-20): that is true now.
+  assert.equal(J.enforceJobScope('Sure, we work with landlords all the time.', {}).changed, false);
   // A sentence that already says no stands.
   assert.equal(J.enforceJobScope("We don't work on commercial properties.", {}).changed, false);
 });
@@ -209,21 +186,22 @@ test('impact only: "not every window in our line is impact-rated" is corrected',
 
 // ── the finished-reply check ──────────────────────────────────────────────
 
-test('checkReply fails a time offered to a landlord, passes the rental line', () => {
+test('checkReply passes a time offered to a landlord (an owner, 2026-10-20), fails one to a commercial lead', () => {
   const conversation = thread(['i', 'We rent it out to tenants']);
-  assert.ok(checkReply(OFFER, { channel: 'sms', inbound: 'We rent it out to tenants', conversation }).violations.some(v => v.code === 'job_scope'));
-  assert.ok(!checkReply(J.RENTAL_LINE, { channel: 'sms', inbound: 'We rent it out to tenants', conversation }).violations.some(v => v.code === 'job_scope'));
+  assert.ok(!checkReply(OFFER, { channel: 'sms', inbound: 'We rent it out to tenants', conversation }).violations.some(v => v.code === 'job_scope'));
+  const office = thread(['i', 'It is for our office building']);
+  assert.ok(checkReply(OFFER, { channel: 'sms', inbound: 'It is for our office building', conversation: office }).violations.some(v => v.code === 'job_scope'));
 });
 
 test('checkReply with no thread checks our claims only', () => {
-  const r = checkReply(OFFER, { channel: 'livechat', inbound: 'we rent it out' });
+  const r = checkReply(OFFER, { channel: 'livechat', inbound: 'it is for our church' });
   assert.ok(!r.violations.some(v => v.code === 'job_scope'));
   assert.ok(r.skipped.includes('job_scope_lead_side'));
   assert.ok(checkReply('We also have non-impact options.', { channel: 'livechat' }).violations.some(v => v.code === 'job_scope'));
 });
 
 test('every fixed line is dash-free and has at most one question', () => {
-  for (const line of [J.RENTAL_LINE, J.COMMERCIAL_LINE, J.MINIMUM_CHECK_LINE, J.MINIMUM_CHECK_DOORS_LINE, J.BELOW_MINIMUM_LINE]) {
+  for (const line of [J.COMMERCIAL_LINE, J.MINIMUM_CHECK_LINE, J.MINIMUM_CHECK_DOORS_LINE, J.BELOW_MINIMUM_LINE]) {
     assert.doesNotMatch(line, /[—–]/);
     assert.ok((line.match(/\?/g) || []).length <= 1);
   }
@@ -285,20 +263,6 @@ test('a count already on the contact skips the count question', async () => {
   const f = P.stageFactsNow({ stage: 'problem', facts: { homeowner: 'yes', zip: '33908' } }, [], null, true);
   assert.equal(f.openings_known, true);
   assert.equal(P.nextQualifyItem(f, []), 'decision_makers');
-});
-
-// ── investment properties (the user, 2026-10-13: a second home is a lead, a flip is not) ──
-
-test('a flip or an investment property is a no; a second home the owner keeps is a lead', () => {
-  for (const t of ["It's an investment property", 'We are flipping this house', "It's a fix and flip", 'Renovating it to resell']) {
-    const r = J.enforceJobScope(OFFER, { thread: [], inbound: t });
-    assert.equal(r.block, 'investment', t);
-    assert.equal(r.text, J.INVESTMENT_LINE, t);
-  }
-  for (const t of ['It is our second home in Naples', 'This is our vacation home, we do not rent it', 'I have a flip phone, text is fine', "It's not a flip, we live here"]) {
-    assert.equal(J.jobScopeFromThread([], t).block, null, t);
-  }
-  assert.doesNotMatch(J.INVESTMENT_LINE, /[—–]/);
 });
 
 // ── the count question in every mode; a lead who had the visit is qualified (the user, 2026-10-13) ──

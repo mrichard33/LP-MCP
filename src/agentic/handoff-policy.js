@@ -102,10 +102,10 @@ const NOTES = {
     'The lead no longer lives at or owns the property. Thank them, and ask one question only: whether ' +
     'their new home could use a look, or whether they would rather we stop texting. No pitch.',
   RENTER:
-    'The home is a rental. Thank them and say plainly and kindly that we don\'t work on rental ' +
-    'properties (the user, 2026-10-13: a landlord\'s rental is declined too, so never say the owner ' +
-    'is welcome to reach out). Do not offer to email anything: a disqualified contact cannot be ' +
-    'sent one. No booking ask.',
+    'The lead rents the home and is not the owner. Thank them and say plainly and kindly that we ' +
+    'only work with homeowners, and that the owner is welcome to reach out (the user, 2026-10-20: ' +
+    'an owner who rents the home out is a lead). Do not offer to email anything: a disqualified ' +
+    'contact cannot be sent one. No booking ask.',
   MOBILE:
     'The lead lives in a mobile or manufactured home, which we do not install in. Thank them warmly ' +
     'and say so plainly and kindly. No booking ask, no pitch.',

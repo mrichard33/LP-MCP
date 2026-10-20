@@ -21,7 +21,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 const { enforceNonOwner, isNonOwner, NON_OWNER_LINE } = await import('../src/agentic/non-owner.js');
-const { RENTAL_LINE } = await import('../src/agentic/job-scope.js');
+const { TENANT_LINE } = await import('../src/agentic/non-owner.js');
 const P = await import('../src/agentic/nepq-planner.js');
 const SA = await import('../src/agentic/service-area-turn.js');
 const { serviceAreaOutside } = await import('../src/prompts/response-generator/framing.js');
@@ -31,15 +31,28 @@ const OFFER = "Makes sense, you'll want to get his okay first. I have Thu, Oct 1
 
 // ── renter / non-owner (active) ──────────────────────────────────────────
 
-test('a renter who says it now gets the rental line: no times, no question (2026-10-13)', () => {
-  // The user, 2026-10-13: we do not work on rental properties, so "the owner is
-  // welcome to reach out" no longer applies to a tenant's home.
+test('a renter who says it now gets the tenant line: no times, no question (2026-10-20)', () => {
+  // The user, 2026-10-20: "we only work with owners not the renters". An owner who
+  // rents the home out is a lead, so the tenant line invites the owner to reach out.
   const r = enforceNonOwner(OFFER, { thread: [], inbound: "I'm renting, my landlord would have to okay it" });
   assert.equal(r.changed, true);
-  assert.equal(r.text, RENTAL_LINE);
+  assert.equal(r.text, TENANT_LINE);
   assert.doesNotMatch(r.text, /\?|AM|PM|!/);
-  assert.match(r.text, /don't work on rental properties/);
-  assert.doesNotMatch(r.text, /owner is welcome/);
+  assert.match(r.text, /only work with homeowners/);
+  assert.match(r.text, /owner is interested/);
+  assert.doesNotMatch(r.text, /rental propert/);
+});
+
+test('"help with my rent, my rent is $589" is a renter (dq_renter_refire, 2026-10-20)', () => {
+  const inbound = 'Seeing how can I get help with my rent my rent is $589 a month';
+  const r = enforceNonOwner("Thanks for sharing that. What made you start looking into this?", { thread: [], inbound });
+  assert.equal(r.text, TENANT_LINE);
+  assert.equal(isNonOwner([], inbound), true);
+});
+
+test('a property manager is not the owner and gets the non-owner line', () => {
+  const r = enforceNonOwner(OFFER, { thread: [], inbound: "I'm the property manager for this house" });
+  assert.equal(r.text, NON_OWNER_LINE);
 });
 
 test('a non-owner who is not a tenant keeps the non-owner line', () => {
@@ -54,10 +67,9 @@ test('said earlier: the answer stays, the time offer goes', () => {
   assert.equal(r.text, 'The visit takes about an hour.');
 });
 
-// A landlord owns the home, so the NON-OWNER guard leaves them alone; the
-// rental itself is declined by job-scope.js (scripts/test-job-scope.js).
-test('an owner, a landlord, or nothing said: the non-owner guard leaves it', () => {
-  for (const inbound of ['we own the house', 'we rent it out to tenants', 'my windows leak']) {
+// A landlord owns the home and is a lead (the user, 2026-10-20).
+test('an owner, a landlord, an investor or nothing said: the non-owner guard leaves it', () => {
+  for (const inbound of ['we own the house', 'we rent it out to tenants', "it's an Airbnb we own", 'we are flipping it', 'we use a property manager', 'my windows leak']) {
     const r = enforceNonOwner(OFFER, { thread: [], inbound });
     assert.equal(r.changed, false, inbound);
   }

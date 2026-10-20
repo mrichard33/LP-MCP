@@ -73,6 +73,13 @@ function declinedNotBooked(r, saidRx, what) {
   return out;
 }
 
+// An owner of a rental or an investment home is a lead (the user, 2026-10-20).
+const OWNER_DECLINED_RX = /\b(?:don'?t|do\s+not|can'?t|cannot|not\s+able\s+to)\b[^.!?]*\b(?:rentals?|investments?|flip(?:s|ping|pers?)?|landlords?|rent(?:ed)?\s+out)\b|\bonly\s+work\s+with\s+homeowners\b/i;
+function ownerNotDeclined(r, who) {
+  const no = allReplies(r).find(x => OWNER_DECLINED_RX.test(x.text));
+  return no ? [{ code: 'owner_declined', detail: `a ${who} (an owner) was turned away: ${no.text}`, turn: no.turn }] : [];
+}
+
 /**
  * What each named scenario must do beyond the hard checks. Each returns a list
  * of failures ({ code, detail, turn? }); an empty list passes. Only behaviour
@@ -123,7 +130,12 @@ export const SCENARIO_EXPECTATIONS = Object.freeze({
   renter: (r) => (did(r, /would_book/) ? [{ code: 'booked_non_owner', detail: 'a renter was booked' }] : []),
   // ── 2026-10-13 (the user): jobs we do not take are never booked, and the
   // no is said. One sliding glass door meets the minimum and books.
-  landlord: (r) => declinedNotBooked(r, /rental/i, 'rental'),
+  // 2026-10-20 (the user): "We do not need to turn investment properties away. However,
+  // we only work with owners not the renters." An owner who rents the home out or flips it
+  // is a lead: never told no, and the conversation moves toward the visit. New keys (not
+  // `landlord`), so the comparison with older runs stays on the scenarios both share.
+  landlord_lead: (r) => ownerNotDeclined(r, 'landlord'),
+  investment_owner: (r) => ownerNotDeclined(r, 'investor'),
   commercial: (r) => declinedNotBooked(r, /commercial/i, 'commercial'),
   one_window: (r) => declinedNotBooked(r, /minimum/i, 'below_minimum'),
   // 2026-10-13 (Erica Hilts; the owner's price ruling and the reviewer's rule):
