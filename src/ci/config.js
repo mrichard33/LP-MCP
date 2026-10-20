@@ -193,6 +193,42 @@ export function parseConfig(env = process.env) {
     // rather than a constant inside the merge.
     stereoAgentChannel: intSigned(env.CI_STEREO_AGENT_CHANNEL, 0) === 1 ? 1 : 0,
 
+    /**
+     * Where recording audio comes from: 'sftp' (ETG's archive, nas1) or
+     * 'five9_api' (Five9's own report + REST download, src/ci/five9-recordings.js).
+     * Anything that is not exactly 'five9_api', unset and typos included, is
+     * 'sftp', the same coercion as transcribeEngine: a misconfigured deploy keeps
+     * the behaviour it had. 2026-10-20: nas1 has reset every connection since
+     * 2026-09-28; flipping this is Mark's decision, never part of a PR.
+     */
+    recordingSource: String(env.CI_RECORDING_SOURCE || 'sftp').trim().toLowerCase() === 'five9_api' ? 'five9_api' : 'sftp',
+    five9Api: {
+      // The saved Five9 custom report over the "Call Recording" data source.
+      // Mark builds it in the VCC UI; the code never creates or edits a report.
+      reportFolder: env.CI_FIVE9_REPORT_FOLDER || 'Shared Reports',
+      reportName: env.CI_FIVE9_REPORT_NAME || 'CI Call Recordings',
+      // The zone the report prints TIMESTAMP in and reads criteria in. Pacific
+      // for this domain, like the Call Log and Call Journey reports.
+      reportTz: env.CI_FIVE9_REPORT_TZ || 'America/Los_Angeles',
+      pollMs: intFloor(env.CI_FIVE9_POLL_MS, 2000, 250),
+      timeoutMs: intFloor(env.CI_FIVE9_TIMEOUT_MS, 120000, 5000),
+      // Downloads per worker tick, so the backlog drains steadily instead of
+      // flooding reece-speech-api (30 requests a minute per key, polls included).
+      maxDownloadsPerTick: intFloor(env.CI_FIVE9_MAX_DOWNLOADS_PER_TICK, 20, 1),
+      // Calls older than this are past what Five9 still returns: skipped, never
+      // retried forever. Capped at 30 by the handoff.
+      backlogDays: Math.min(30, intFloor(env.CI_FIVE9_BACKLOG_DAYS, 30, 1)),
+      // The REST login host (US data center). The API host itself comes back in
+      // the login's metadata, never assumed.
+      loginUrl: env.CI_FIVE9_REST_LOGIN_URL || 'https://app.five9.com/appsvcs/rs/svc/auth/login',
+      // Whose agent id goes in GET /agents/{agentId}/recordings/{recordingId}:
+      // 'self' (the logged-in user, as Five9's own REST sample does) or
+      // 'recording' (the agent on the recording). Set from the probe result.
+      recordingAgent: String(env.CI_FIVE9_RECORDING_AGENT || 'self').trim().toLowerCase() === 'recording' ? 'recording' : 'self',
+      // `download=true` on the stream request; only the literal 'false' drops it.
+      downloadParam: String(env.CI_FIVE9_DOWNLOAD_PARAM ?? 'true').trim().toLowerCase() !== 'false',
+    },
+
     sftp: {
       host: env.CI_SFTP_HOST || 'nas1.etgts.com',
       port: intFloor(env.CI_SFTP_PORT, 2282, 1),
