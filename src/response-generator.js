@@ -18,6 +18,13 @@
  * prompt blocks. An unexplained snapshot diff means the change is wrong, not
  * the snapshot. Map: docs/handoffs/response-generator-split-map.md.
  *
+ * v2.10.0 — 2026-10-19. NEPQ-ONLY PROMPT (Mark's decision 2026-10-15; PR2 step 2). With
+ *   NEPQ live the system prompt no longer teaches the Antifragile trust model, Brunson's
+ *   Expert / Traffic / DotCom Secrets, Hook-Story-Offer, buyer stages or story arcs, and
+ *   the response format drops story_arc / trust_level_targeted / hso_breakdown /
+ *   frameworks_applied. PROMPT_NEPQ_CLEANUP_MODE is removed (live since 2026-10-16).
+ *   NEPQ off (SYSTEM_PROMPT) is unchanged byte for byte.
+ *
  * v2.9.1 — 2026-10-19. POST-DEMO EMAIL DECLINE (Mark; Thomas Geary, agent_actions
  *   573254). A Phase-freeze exception Mark approved. A post-demo lead's firm
  *   decline by email gets ONE objection reply that ends with no question
@@ -460,11 +467,11 @@ import {
 } from './agentic/service-area-turn.js';
 
 /**
- * v2.9.2 — the header version above, as a value. Stamped (with the deployed
+ * v2.10.0 — the header version above, as a value. Stamped (with the deployed
  * git sha) onto every fingerprint so a replay knows which generator wrote the
  * reply. Bump it with the header note.
  */
-export const RESPONSE_GENERATOR_VERSION = 'v2.9.2';
+export const RESPONSE_GENERATOR_VERSION = 'v2.10.0';
 
 // Provider + model resolved at call time by the shared client from the
 // `response_generator` fn key (customer_facing group). Legacy
@@ -486,14 +493,6 @@ const SMS_LENGTH_GUARD_MODE = (() => {
   const v = String(process.env.SMS_LENGTH_GUARD_MODE || 'shadow').trim().toLowerCase();
   return ['off', 'shadow', 'live'].includes(v) ? v : 'shadow';
 })();
-
-// 2026-10-10 (audit 2026-10-09): off | live, default off. With NEPQ live, the
-// system prompt still carried the legacy HSO / two-times / push-to-book lines
-// that nepq-backbone.js says the PLAN block "outranks". `live` swaps in their
-// NEPQ variants (system-core.js), on the NEPQ-live prompt ONLY. Read once at
-// load like the other prompt knobs, so each prompt variant stays static for
-// the life of the process and the system-prompt cache keeps hitting.
-const PROMPT_NEPQ_CLEANUP_MODE = String(process.env.PROMPT_NEPQ_CLEANUP_MODE || 'off').trim().toLowerCase() === 'live' ? 'live' : 'off';
 
 // v2.7.4: how many recent edits to inject as in-context learning examples.
 const RECENT_EDITS_LIMIT = parseInt(process.env.RESPONSE_GENERATOR_EDITS_LIMIT || '3', 10);
@@ -575,9 +574,8 @@ const SYSTEM_PROMPT =
  * on the system prompt the way it already can on the user prompt (which
  * buildResponsePrompt returns verbatim). Nothing in src/ calls it.
  */
-export function getResponseSystemPrompt(mode = 'off', { cleanup = PROMPT_NEPQ_CLEANUP_MODE } = {}) {
-  if (mode !== 'live') return SYSTEM_PROMPT;
-  return cleanup === 'live' ? SYSTEM_PROMPT_NEPQ_CLEAN : SYSTEM_PROMPT_NEPQ;
+export function getResponseSystemPrompt(mode = 'off') {
+  return mode === 'live' ? SYSTEM_PROMPT_NEPQ : SYSTEM_PROMPT;
 }
 
 /**
@@ -592,22 +590,28 @@ function swapOnce(text, from, to) {
   if (!text.includes(from)) throw new Error('[ResponseGenerator] NEPQ system prompt: block to swap not found');
   return text.replace(from, () => to);
 }
-const SYSTEM_PROMPT_NEPQ = swapOnce(swapOnce(SYSTEM_PROMPT, P.PPR_GATE_LEGACY, P.PPR_GATE_NEPQ), P.VALUE_LADDER_LEGACY, P.VALUE_LADDER_NEPQ);
-
-// 2026-10-10 (audit 2026-10-09): six more legacy lines that argue with the PLAN
-// block (HSO on every reply, exactly two times by default, push to book on
-// FAST_TRACK). Swapped on top of SYSTEM_PROMPT_NEPQ, used only when NEPQ is
-// live AND PROMPT_NEPQ_CLEANUP_MODE=live (getResponseSystemPrompt). Built at
-// load like the other two variants, so swapOnce still fails the boot, not a
-// customer reply, when a block moves.
-const SYSTEM_PROMPT_NEPQ_CLEAN = [
-  [P.HSO_LINE_LEGACY, P.HSO_LINE_NEPQ],
+// 2026-10-10 (audit 2026-10-09): six legacy lines argued with the PLAN block
+// (HSO on every reply, exactly two times by default, push to book on
+// FAST_TRACK). 2026-10-19 (Mark's decision of 2026-10-15, PR2 step 2): NEPQ is
+// the only sales method in this prompt. The Antifragile / Brunson framework
+// block, the trust model, HSO, buyer stages and story arcs are swapped out
+// whole, and the response format no longer asks for story_arc,
+// trust_level_targeted, hso_breakdown or frameworks_applied (validateResponse
+// keeps its defaults for them). PROMPT_NEPQ_CLEANUP_MODE ran this in live from
+// 2026-10-16 and passed its 72-hour watch, so the switch is gone. The framework
+// block goes first: the VALUE_LADDER, HSO line and FAST_TRACK lines sat inside it.
+const SYSTEM_PROMPT_NEPQ = [
+  [P.IDENTITY_JOB_LEGACY, P.IDENTITY_JOB_NEPQ],
+  [P.FRAMEWORK_INTEGRATION_LEGACY, P.FRAMEWORK_INTEGRATION_NEPQ],
+  [P.TRUST_AND_STAGES_LEGACY, P.TRUST_AND_STAGES_NEPQ],
+  [P.STORY_ARCS_LEGACY, ''],
+  [P.BUYER_VS_FUNNEL_LEGACY, P.BUYER_VS_FUNNEL_NEPQ],
+  [P.RESPONSE_FRAMEWORK_FIELDS_LEGACY, P.RESPONSE_FRAMEWORK_FIELDS_NEPQ],
+  [P.PPR_GATE_LEGACY, P.PPR_GATE_NEPQ],
   [P.ANSWER_FIRST_LEGACY, P.ANSWER_FIRST_NEPQ],
-  [P.HSO_MANDATE_LEGACY, P.HSO_MANDATE_NEPQ],
   [P.ASK_FIRST_DEFAULT_LEGACY, P.ASK_FIRST_DEFAULT_NEPQ],
   [P.HYPERACTIVE_ALERT_LEGACY, P.HYPERACTIVE_ALERT_NEPQ],
-  [P.HYPERACTIVE_DETECT_LEGACY, P.HYPERACTIVE_DETECT_NEPQ],
-].reduce((text, [from, to]) => swapOnce(text, from, to), SYSTEM_PROMPT_NEPQ);
+].reduce((text, [from, to]) => swapOnce(text, from, to), SYSTEM_PROMPT);
 
 // ═══════════════════════════════════════════════════════════════════
 // REPLY SENDER IDENTITY (2026-07-29 — Kelly Callahan incident)
@@ -1400,7 +1404,9 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
   parts.push(...P.classification(classification.intent_class, classification.confidence?.toFixed(2) || 'n/a', classification.classification_method));
   if (classification.reasoning) parts.push(...P.classifierReasoning(classification.reasoning));
 
-  parts.push(...P.trafficTemperature(trafficTemp.toUpperCase()));
+  // 2026-10-19 (NEPQ-only prompt): the Traffic Secrets section this line
+  // points at is not in the NEPQ-live system prompt.
+  if (!opts.nepqPlan) parts.push(...P.trafficTemperature(trafficTemp.toUpperCase()));
 
   // ─── ESTABLISHED (2026-09-11 — Alfredo Fontan) ────────────────────────
   //
@@ -1930,7 +1936,7 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
     }
     if (context.intelligence.emotional_state) parts.push(...P.emotionalState(context.intelligence.emotional_state));
     if (context.intelligence.recommended_action) parts.push(...P.recommendedAction(context.intelligence.recommended_action));
-    if (context.intelligence.recommended_story_arc) parts.push(...P.recommendedArc(context.intelligence.recommended_story_arc));
+    if (context.intelligence.recommended_story_arc && !opts.nepqPlan) parts.push(...P.recommendedArc(context.intelligence.recommended_story_arc));
     if (context.intelligence.ai_reasoning) parts.push(...P.priorReasoning(context.intelligence.ai_reasoning));
   }
 

@@ -64,10 +64,6 @@ const FROZEN_ENV = {
   NAMED_STORM_MODE: 'false',
   NEPQ_LAYER_MODE: 'on',
   CANVASS_PREFERRED_TIME_FIELD_ID: 'fixture_preferred_time_field',
-  // 2026-10-10: the NEPQ-live prompt has a cleanup variant behind this flag.
-  // Frozen off so system-nepq-live.txt is the legacy NEPQ prompt whoever runs
-  // this; the clean variant is rendered explicitly below.
-  PROMPT_NEPQ_CLEANUP_MODE: 'off',
 };
 for (const [k, v] of Object.entries(FROZEN_ENV)) process.env[k] = v;
 
@@ -243,22 +239,18 @@ test('snapshot: system prompt with a NEPQ PLAN block (NEPQ live)', () => {
   compare(path.join(SNAPSHOT_DIR, 'system-nepq-live.txt'), 'system prompt (NEPQ live)', getResponseSystemPrompt('live'));
 });
 
-// 2026-10-10 (audit 2026-10-09): with NEPQ live AND PROMPT_NEPQ_CLEANUP_MODE=live,
-// six more legacy lines (HSO mandate, two times by default, push to book) are
-// swapped for NEPQ variants. Its own snapshot, so Mark reads the diff against
-// system-nepq-live.txt before flipping the flag.
-test('snapshot: system prompt with a NEPQ PLAN block and the cleanup live (NEPQ live + PROMPT_NEPQ_CLEANUP_MODE=live)', () => {
-  compare(path.join(SNAPSHOT_DIR, 'system-nepq-clean.txt'), 'system prompt (NEPQ live, cleanup live)', getResponseSystemPrompt('live', { cleanup: 'live' }));
-});
-
-test('the cleanup flag changes nothing with NEPQ off, and nothing but the six lines with NEPQ live', () => {
-  assert.equal(getResponseSystemPrompt('off', { cleanup: 'live' }), getResponseSystemPrompt('off'));
-  assert.equal(getResponseSystemPrompt('live', { cleanup: 'off' }), getResponseSystemPrompt('live'));
-  const live = getResponseSystemPrompt('live').split('\n');
-  const clean = getResponseSystemPrompt('live', { cleanup: 'live' }).split('\n');
-  // The HSO MANDATE section (8 lines) becomes REPLY SHAPE (2 lines); the other
-  // five swaps are line for line. So the clean prompt is exactly 6 lines shorter.
-  assert.equal(live.length - clean.length, 6);
+// 2026-10-19 (PR2 step 2): the NEPQ-live prompt drops the framework block, the
+// trust model, buyer stages, story arcs and their response-format fields; the
+// NEPQ-off prompt (system.txt) keeps them. Both directions, so a copy edit that
+// lands in the wrong variant fails here and not only in a snapshot diff.
+test('NEPQ live drops the framework blocks; NEPQ off keeps them', () => {
+  const live = getResponseSystemPrompt('live');
+  const off = getResponseSystemPrompt('off');
+  for (const h of ['═══════ FRAMEWORK INTEGRATION ═══════', '═══════ TRUST MODEL — 4 LEVELS ═══════', '═══════ BUYER STAGES — MOVE ONE FORWARD ═══════', '═══════ STORY ARCS — FALLBACK SUMMARIES ═══════', '"hso_breakdown"']) {
+    assert.ok(!live.includes(h), `NEPQ live still carries ${h}`);
+    assert.ok(off.includes(h), `NEPQ off lost ${h}`);
+  }
+  assert.ok(live.length < off.length);
 });
 
 // ── Block coverage ───────────────────────────────────────────────────

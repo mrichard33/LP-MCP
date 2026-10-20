@@ -81,10 +81,6 @@ export const MODES = Object.freeze([
     since: '2026-08-31', goLive: LIVE_BY_DEFAULT,
     note: 'The NEPQ questioning block in the reply prompt; "off" removes it.',
   }),
-  m('PROMPT_NEPQ_CLEANUP_MODE', 'bot', 'enum', OL, 'off', OL_S, {
-    since: '2026-10-10',
-    note: 'Removes the old NEPQ prompt lines the planner now owns.',
-  }),
   m('SMS_LENGTH_GUARD_MODE', 'bot', 'enum', OSL, 'shadow', OSL_S, {
     since: '2026-10-10',
     note: 'Holds an SMS reply to the length limit.',
