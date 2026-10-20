@@ -100,6 +100,14 @@ export const JOB_STATUS_BUCKET_MAP = {
   'Awaiting Par Sheet': 'other_pending',
   'Await Customer': 'other_pending',
   'Mgmt Hold': 'other_pending',
+  // ADDED 2026-10-20: 'HOLD-Shutter Approval'. Quarantined 1 row of the 253-row
+  // 10-20 job_status_ytd file, withholding $4,809.00 gross from Open Backlog
+  // (job 60221, WICKS ERIK, Sarasota, contract 2026-10-08). A pre-release hold
+  // waiting on the homeowner's shutter-colour/style approval — the same shape as
+  // 'Await Customer', so it counts into open Good Business. NOTE the spelling:
+  // LP sends it with NO spaces around the hyphen, unlike 'HOLD - HOA' and
+  // 'Hold - Permit'. Matching is exact after trim, so it must stay as LP sends it.
+  'HOLD-Shutter Approval': 'other_pending',
   // released / production track — NOT pending Good Business, NOT terminal
   'Rel To Production': 'in_production',
   'RTP Await recission': 'in_production',
