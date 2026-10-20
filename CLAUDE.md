@@ -1088,7 +1088,7 @@ Job `p2-parity-sweep` (`src/jobs/p2-parity-sweep.js`, every 30 min; rules `src/p
 `isWonJob` → won at Install Completed or later; else open), the furthest PASSED milestone from BOTH `raw_lp_data` and
 `lp_job_milestones` (each misses rows), mapped by the live `P2_MILESTONE_*` rules (`src/p2-milestone-map.js`), and the
 job's value. Rulings: a card ahead of LP moves BACK; a repeat buyer's one card follows the NEWER live job (re-stamped,
-reopened; never a placeholder or near-duplicate). A card whose tracked live job looks like a copy of a paid job (`looksLikeDuplicateOfPaidJob`) is a report (`possible_duplicate_of_paid_job`), never a write: the first live pass reopened Brandon Carter's installed, paid Won card onto such a copy. Every difference is re-read live from GHL first; a card changed in the
+reopened; never a placeholder or near-duplicate). A card whose tracked live job looks like a copy of a paid job (`looksLikeDuplicateOfPaidJob`) is a report (`possible_duplicate_of_paid_job`), never a write: the first live pass reopened Brandon Carter's installed, paid Won card onto such a copy. Every bulk read is paged (`selectAllIn`, `src/supabase-page.js`): unpaged, PostgREST's 1,000-row cap dropped a different set of milestones each pass and ~15 cards flipped between stages 7 and 8 every 30 minutes on the first live day. Every difference is re-read live from GHL first; a card changed in the
 last 30 min waits; anything unreadable writes nothing; `P2_PARITY_MAX_WRITES` (50) a pass, status first.
 `P2_PARITY_MODE` off|shadow|live, **default live** (the user, 2026-10-20: "go live right away because no messages are
 firing"; `p2.parity` done / failed / would_change events). Every P2 loss (the sweep's, and rule 365's through

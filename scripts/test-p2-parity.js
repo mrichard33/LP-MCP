@@ -7,7 +7,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { expectedP2, parityAction, lpStageFor, writePriority, needsHealTag } from '../src/p2-parity/rules.js';
-import { runP2ParitySweep, planPass, HEAL_TAG, SETTLE_MS, parityMode, healTagEnabled } from '../src/p2-parity/sweep.js';
+import { runP2ParitySweep, planPass, readJobsByContact, HEAL_TAG, SETTLE_MS, parityMode, healTagEnabled } from '../src/p2-parity/sweep.js';
 import { CUSTOMER_WORKFLOWS, removeFromCustomerWorkflows } from '../src/p2-parity/customer-workflows.js';
 import { STAGE_MAP, PIPELINE_IDS } from '../src/actions/constants.js';
 import { OPP_CF_LP_JOB_ID } from '../src/p2-opportunity-context.js';
@@ -137,16 +137,25 @@ function fakeDeps({ cards, jobs = [], live = {}, tables = {}, liveError = null, 
     action_template: [{ action_type: 'move_opportunity', params: { pipeline: 'P2', stage: v.stageName } }],
   }));
   const q = (table) => {
-    const state = { table, filters: [] };
+    // Behaves like PostgREST: at most 1,000 rows a response, a {count:'exact'} total,
+    // order + range pages, and a `not(col, 'is', null)` filter.
+    const state = { table, filters: [], range: null, order: null };
     const chain = {
       select: () => chain,
-      in: (col, vals) => { state.filters.push((r) => vals.includes(String(r[col]))); return chain; },
+      in: (col, vals) => { state.filters.push((r) => vals.map(String).includes(String(r[col]))); return chain; },
       eq: () => chain,
       like: () => chain,
-      not: () => chain,
-      then: (res, rej) => Promise.resolve(table === 'agent_rules'
-        ? { data: rules, error: null }
-        : { data: (rows[table] || []).filter((r) => state.filters.every((f) => f(r))), error: null }).then(res, rej),
+      not: (col, op, val) => { if (op === 'is' && val === null) state.filters.push((r) => r[col] != null); return chain; },
+      order: (col) => { state.order = col; return chain; },
+      range: (a, b) => { state.range = [a, b]; return chain; },
+      then: (res, rej) => {
+        if (table === 'agent_rules') return Promise.resolve({ data: rules, error: null }).then(res, rej);
+        let all = (rows[table] || []).filter((r) => state.filters.every((f) => f(r)));
+        if (state.order) all = [...all].sort((x, y) => (x[state.order] > y[state.order] ? 1 : x[state.order] < y[state.order] ? -1 : 0));
+        const [a, b] = state.range || [0, 999];
+        const data = all.slice(a, Math.min(b + 1, a + 1000));
+        return Promise.resolve({ data, error: null, count: all.length }).then(res, rej);
+      },
     };
     return chain;
   };
@@ -307,4 +316,31 @@ test('planPass: the mirror plan skips cards that already match', () => {
     jobsByContact: new Map([['c1', [rtpJob]]]), mapping: MAPPING, now: NOW,
   });
   assert.equal(plans.length, 0);
+});
+
+test('milestones are read in full, past PostgREST\'s 1,000-row cap (the flip-flop, 2026-10-20)', async () => {
+  // 150 jobs × 8 milestones = 1,200 rows in one chunk: the old unpaged read kept 1,000.
+  const jobs = Array.from({ length: 150 }, (_, i) => job({ lp_job_id: String(60000 + i), ghl_contact_id: `c${i}` }));
+  const milestones = jobs.flatMap((j, i) => ['M', 'R', 'U', 'K', 'S', 'F', 'C', 'B'].map((code, k) => ({
+    id: i * 8 + k + 1, lp_job_id: j.lp_job_id, mdt_id: code, act_date: '2026-09-01',
+  })));
+  const { deps } = fakeDeps({ cards: [], jobs, tables: { lp_job_milestones: milestones } });
+  const byContact = await readJobsByContact(deps, jobs.map((j) => j.ghl_contact_id));
+  const total = [...byContact.values()].flat().reduce((n, j) => n + j.milestones.length, 0);
+  assert.equal(total, 1200);
+  assert.ok([...byContact.values()].flat().every((j) => j.milestones.some((m) => m.mdt_id === 'B')));
+});
+
+test('a read that comes back short throws, so the pass writes nothing', async () => {
+  const jobs = [job({ lp_job_id: '61000', ghl_contact_id: 'c1' })];
+  const { deps } = fakeDeps({ cards: [], jobs });
+  const from = deps.supabase.from;
+  deps.supabase.from = (t) => {
+    const b = from(t);
+    if (t !== 'lp_job_milestones') return b;
+    const then = b.then;
+    b.then = (res, rej) => then((r) => res({ ...r, data: [], count: 5 }), rej);
+    return b;
+  };
+  await assert.rejects(readJobsByContact(deps, ['c1']), /incomplete|truncat/);
 });
