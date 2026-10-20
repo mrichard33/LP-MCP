@@ -636,9 +636,9 @@ async function duplicateLeadsSection(deps, nowMs) {
 }
 
 // Fix 2: Five9 removals for disqualified leads waiting on a person's approval
-// (only while DISQUALIFIED_FIVE9_AUTO_REMOVE is not true).
+// (only while DISQUALIFIED_FIVE9_AUTO_REMOVE=false; automatic by default since 2026-10-19).
 async function disqualifiedFive9Section(deps) {
-  if (String(deps.env?.DISQUALIFIED_FIVE9_AUTO_REMOVE ?? process.env.DISQUALIFIED_FIVE9_AUTO_REMOVE ?? '').trim().toLowerCase() === 'true') return null;
+  if (String(deps.env?.DISQUALIFIED_FIVE9_AUTO_REMOVE ?? process.env.DISQUALIFIED_FIVE9_AUTO_REMOVE ?? '').trim().toLowerCase() !== 'false') return null;
   const { data, error } = await deps.supabase.from('agent_actions')
     .select('id').eq('action_type', 'five9_delete_record_from_list').eq('rule_applied', 'LP_DISP_DISQUALIFIED').eq('status', 'pending_approval');
   if (error) throw new Error(`disqualified Five9 removal read failed: ${error.message}`);
