@@ -288,3 +288,14 @@ test('the backfill: counts only on a dry run, erases on apply, finds 0 after; PD
   const after = await runBankRedactBackfill({ dryRun: true }, { supabase });
   assert.equal(after.numbers_found.routing + after.numbers_found.account, 0);
 });
+
+test('an account TYPE is a label too, and one call is always a fixed point (LeadPilot, 2026-10-20)', () => {
+  const leadpilot = 'Pay by ACH\nRouting: 021000021\nAmex-Business Checking #483920175612\nThank You for Your Business..';
+  const once = redactBankDetails(leadpilot);
+  assert.equal(hasNumber(once.text), false, once.text);
+  assert.deepEqual(once.removed, { routing: 1, account: 1 });
+  assert.ok(once.text.includes('Thank You for Your Business'));
+  assert.deepEqual(redactBankDetails(once.text).removed, { routing: 0, account: 0 }, 'a second call finds nothing');
+  for (const t of ['Savings # 0042778199', 'DDA: 7781993012']) assert.ok(!/\d{6}/.test(redactBankDetails(t).text), t);
+  for (const t of ['Checking in on invoice 1182', 'Thanks for checking 2 boxes']) assert.equal(redactBankDetails(t).text, t, t);
+});
