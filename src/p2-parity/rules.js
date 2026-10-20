@@ -67,7 +67,7 @@ export function lpStageFor(job, mapping = {}, now = new Date()) {
 
 /**
  * Pure. Where the card should be.
- * @returns {{ kind: 'no_lp_job' } | { kind: 'expected', job, status: 'open'|'won'|'lost',
+ * @returns {{ kind: 'no_lp_job' } | { kind: 'possible_duplicate', job } | { kind: 'expected', job, status: 'open'|'won'|'lost',
  *            stageId: string|null, value: number|null, followsNewJob: boolean }}
  */
 export function expectedP2({ jobs = [], stampedJobId = null, mapping = {}, now = new Date() } = {}) {
@@ -90,6 +90,16 @@ export function expectedP2({ jobs = [], stampedJobId = null, mapping = {}, now =
     }
   }
 
+  // A live job that looks like a copy of a job already paid (no payment, written
+  // within 60 days at a price within 10%: the shape the sale backstop lists for a
+  // person, never writes) decides nothing. Brandon Carter, 2026-10-20: his card was
+  // stamped on 58338 ($74,536, Awaiting Paperwork, 12 days after the $80,191 job
+  // 58102 that was installed and paid), and the first live pass reopened his Won
+  // card and moved it back to Financing Pending.
+  if (verdict === 'live' && looksLikeDuplicateOfPaidJob(job, rows, [])) {
+    return { kind: 'possible_duplicate', job };
+  }
+
   const status = verdict === 'terminal_lost' || LOST_JOB_STATUSES.has(trimmed(job.job_status))
     ? 'lost'
     : (isWonJob(job, now) ? 'won' : 'open');
@@ -107,6 +117,7 @@ export function expectedP2({ jobs = [], stampedJobId = null, mapping = {}, now =
  */
 export function parityAction({ card, expected }) {
   if (!expected || expected.kind === 'no_lp_job') return { action: 'report', kinds: [], body: null, reason: 'no_lp_job' };
+  if (expected.kind === 'possible_duplicate') return { action: 'report', kinds: [], body: null, reason: 'possible_duplicate_of_paid_job' };
   const status = String(card?.status || 'open').toLowerCase();
   const kinds = [];
   const body = {};

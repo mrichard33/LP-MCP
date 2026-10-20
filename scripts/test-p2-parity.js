@@ -103,6 +103,19 @@ test('repeat buyer: an older live job never takes over a newer finished one', ()
   assert.equal(expected.job.lp_job_id, '59850');
 });
 
+test('a card on a likely copy of a paid job is a report, never a write (Brandon Carter, 2026-10-20)', () => {
+  // 58102 $80,191 installed and paid; 58338 $74,536 written 12 days later, no payment, only Measure.
+  const paid = job({ lp_job_id: '58102', job_status: 'Paid In Full', job_stage: 'complete', job_value: 80191, contractdate: '2026-05-14T00:00:00', milestones: [ms('B', '2026-08-01')] });
+  const copy = job({ lp_job_id: '58338', job_status: 'Awaiting Paperwork', job_value: 74536, contractdate: '2026-05-26T00:00:00', milestones: [ms('M', '2026-05-28')] });
+  const c = card({ status: 'won', pipelineStageId: S('Referral & Expansion'), monetaryValue: 74536, customFields: [{ id: OPP_CF_LP_JOB_ID, fieldValueString: '58338' }] });
+  const expected = expectedP2({ jobs: [paid, copy], stampedJobId: '58338', mapping: MAPPING, now: NOW });
+  assert.equal(expected.kind, 'possible_duplicate');
+  const r = parityAction({ card: c, expected });
+  assert.equal(r.action, 'report');
+  assert.equal(r.reason, 'possible_duplicate_of_paid_job');
+  assert.equal(r.body, null);
+});
+
 test('write order: status fixes first; heal tag only for a move that leaves the card open', () => {
   assert.equal(writePriority(['lose']), 0);
   assert.equal(writePriority(['move_back']), 1);
