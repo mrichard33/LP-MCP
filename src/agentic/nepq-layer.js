@@ -100,7 +100,7 @@
  * disclosure: fixture 40 rendered "What got you looking at the windows now?"
  * right above the rehash block that bans windows questions.
  */
-import { rehashNepqTurn, buildRehashNepqBlock } from './rehash-nepq.js';
+import { rehashNepqTurn, buildRehashNepqBlock, rehashDealHintMode } from './rehash-nepq.js';
 
 /**
  * Tonality translated to text. NEPQ tonality is a voice concept (curious,
@@ -602,7 +602,7 @@ export function buildNepqBlock(ctx, established = null, discipline = null, { reh
   // new-lead stage play. No visit disclosure either: the only booking here is
   // a phone call with the rep.
   if (rehash?.active) {
-    const turn = rehashNepqTurn({ conversation: conversation ?? ctx?.conversation_recent ?? [], trigger });
+    const turn = rehashNepqTurn({ conversation: conversation ?? ctx?.conversation_recent ?? [], trigger, hintMode: rehashDealHintMode(), repName: rehash.repName || null });
     return [
       '=== CONVERSATION DISCIPLINE (NEPQ) ===',
       buildRehashNepqBlock(turn, { repName: rehash.repName || null }),

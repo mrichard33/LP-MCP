@@ -113,6 +113,7 @@ import { withGhlToken } from './ghl-rate-limiter.js';
 import { leadHadDemo } from './demo-truth.js';
 import { buildLeadFacts } from './agentic/lead-facts.js';
 import { siroForContext } from './siro/context-read.js';
+import { siroModes } from './siro/config.js';
 import { normalizePhone10, leadKey } from './lead-leak-classify.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY;
@@ -1516,6 +1517,7 @@ export async function buildLeadContext(ghlContactId, options = {}) {
   context.lead_facts = buildLeadFacts({
     lp: context.lp, lpLead, lead: context.lead,
     siro: siroRows, siroNoteAuthor: process.env.SIRO_LP_NOTE_AUTHOR || 'Siro',
+    siroFollowupTextLive: siroModes().followupText === 'live',
   });
 
   if (parts.cacheable) setCache(ghlContactId, context);

@@ -148,6 +148,7 @@ import {
   bookingHandoffLine,
 } from './chat-rules.js';
 import { marketTimezone, tzLabel } from '../config/market-timezones.js';
+import { humanTakeoverMode, takeoverDecision, HUMAN_TAKEOVER_SKIP_REASON } from '../agentic/human-takeover.js';
 import { phoneFromText } from './missed-replies.js';
 import { openerHoldMode } from '../jobs/no-reply-followup.js';
 import { mergeRevinTurns } from '../revin/thread.js';  // 2026-10-19
@@ -677,6 +678,10 @@ export function createLiveChatFastLane(deps) {
     fingerprint: () => {},
     markSent: () => {},
     captureIdentity: async () => null,
+    // 2026-10-19 (Mark, ruling 5): the newest manual text to this contact after
+    // a time (human-takeover-io.js). The default finds none, so an unwired lane sends.
+    findManualOutbound: async () => null,
+    humanTakeoverMode: () => humanTakeoverMode(),
     findConversation: async () => null,
     recentTurns: async () => [],
     revinTurns: async () => [],
@@ -2144,6 +2149,31 @@ export function createLiveChatFastLane(deps) {
         }
       } catch (err) {
         d.warn(`[LiveChat] repeat-promise guard failed for ${contactId} (reply unchanged): ${err.message}`);
+      }
+    }
+    // 2026-10-19 (Mark, ruling 5): a person on our team texted this visitor by
+    // hand after their message: this reply is dropped (live) or marked
+    // (shadow). Their next message is a new turn. A failed read sends.
+    {
+      const takeoverMode = d.humanTakeoverMode();
+      if (takeoverMode !== 'off' && timing?.t0_inbound_received) {
+        let manual;
+        try { manual = await d.findManualOutbound(contactId, timing.t0_inbound_received, { excludeActionId: actionId ?? null }); } catch { manual = undefined; }
+        const decision = takeoverDecision({ mode: takeoverMode, manual });
+        if (decision === 'skip') {
+          d.log(`[LiveChat] reply for ${contactId} dropped: a person texted at ${manual.at}`);
+          await finishAction(actionId, {
+            status: 'skipped',
+            error_message: HUMAN_TAKEOVER_SKIP_REASON,
+            execution_result: { action: 'send_message_skipped', channel: 'livechat', reason: HUMAN_TAKEOVER_SKIP_REASON, draft_body: String(draft || '').slice(0, 500), manual_at: manual.at, manual_message_id: manual.message_id || null, ...extras, timing: finalizeTiming(timing) },
+          });
+          d.emitEvent({ event_type: 'agentic.human_takeover', source: 'live_chat', entity_type: 'contact', entity_id: contactId, ghl_contact_id: contactId, priority: 'low', bypass_filter: true, payload: { action_id: actionId ?? null, channel: 'livechat', manual_at: manual.at, manual_message_id: manual.message_id || null, manual_user_id: manual.user_id || null }, idempotency_key: `human_takeover_${actionId ?? contactId}_${manual.message_id || manual.at}` }).catch?.(() => {});
+          return { outcome: HUMAN_TAKEOVER_SKIP_REASON, sent: false, message: null, timing: finalizeTiming(timing) };
+        }
+        if (decision === 'would_skip') {
+          d.log(`[LiveChat] shadow: a person texted ${contactId} at ${manual.at}; live would drop this reply`);
+          fingerprintExtras = { ...fingerprintExtras, input_snapshot: { ...(fingerprintExtras.input_snapshot || {}), human_takeover_shadow_would_skip: true, human_takeover: { manual_at: manual.at, manual_message_id: manual.message_id || null } } };
+        }
       }
     }
     let ghlMessageId = null;

@@ -44,7 +44,11 @@ test('raw keeps a small whitelist: no GPS, emails, phones, prices, drafts or thi
   const row = normalizeRecording({ ...RAW_RECORDING, utterances: [{ text: 'secret' }] }, { source: 'poll' });
   assert.deepEqual(Object.keys(row.raw).sort(),
     ['conversationType', 'createdAt', 'durationInMilliseconds', 'followup', 'id', 'link', 'result', 'title', 'updatedAt', 'userId']);
-  assert.deepEqual(row.raw.followup, { followupType: 'REHASH', score: 4, status: 'TO_DO', repName: 'Brian Kowalski', teamName: 'St.Pete' });
+  // 2026-10-19: the follow-up's header NAMES ride along (never the values), so
+  // the field holding Siro's drafted text can be confirmed from a stored row.
+  const { contextHeaders, ...fu } = row.raw.followup;
+  assert.deepEqual(fu, { followupType: 'REHASH', score: 4, status: 'TO_DO', repName: 'Brian Kowalski', teamName: 'St.Pete' });
+  assert.ok(contextHeaders.includes('FollowupTextHeader') && contextHeaders.includes('FollowupEmailHeader'));
   const raw = JSON.stringify(row.raw);
   for (const bad of ['latitude', '28.18', 'dana@example.com', '555-0188', '$', '18,400', 'Dear Dana', 'Hi Dana', 'HIGH FOLLOW-UP', 'secret', 'thinking']) {
     assert.ok(!raw.includes(bad), `raw must not hold ${bad}`);

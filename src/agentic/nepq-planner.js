@@ -38,7 +38,7 @@ import { isKnockComplaint } from './do-not-knock.js';
 import { detectDeferral, pendingDeferral, isAcknowledgment, isLeadCloser, isSignOffLine, askedForSpace, POST_DEMO_QUESTIONS } from './post-demo-turn.js';
 import { PURCHASED_ELSEWHERE_RX } from './purchased-elsewhere.js';
 import { bestDealHintUsed } from './rehash.js';
-import { rehashNepqTurn, bridgedRecently, rehashObjection, BEST_DEAL_RX, PRE_BRIDGE_STAGES, REHASH_STAGES, REHASH_BRIDGE_RX } from './rehash-nepq.js';
+import { rehashNepqTurn, bridgedRecently, rehashObjection, BEST_DEAL_RX, PRE_BRIDGE_STAGES, REHASH_STAGES, REHASH_BRIDGE_RX, rehashDealHintMode, rehashHintFor, rehashIfICouldBridge, hasRehashHint } from './rehash-nepq.js';
 import { homeownerFromThread, OWNER_ASK_RX } from './homeowner.js';
 import { jobScopeFromThread, openingsKnown, COUNT_ASK_RX } from './job-scope.js';
 import { decisionMakersFromThread, dmSettled } from './qualifying.js';
@@ -873,7 +873,10 @@ function planNepqTurnCore({
   // contact ran on (bot_message_context.plan_step, planStepOf), or null when
   // unknown. A no right after a close step counts, whatever our close said.
   lastPlanStep = null,
+  // 2026-10-19 (Mark, ruling 4): REHASH_DEAL_HINT_MODE once | every; null reads it.
+  rehashHintMode = null,
 } = {}) {
+  const hintMode = rehashHintMode || rehashDealHintMode();
   const turns = normalizeThread(conversation, trigger);
   const inbound = turns.filter(t => t.direction === 'inbound');
   const outbound = turns.filter(t => t.direction === 'outbound');
@@ -1227,7 +1230,17 @@ function planNepqTurnCore({
   }
   function planPostDemo() {
     const hi = firstName ? `, ${firstName}` : '';
-    const pd = (extra) => Object.assign(plan, { post_demo: true, booking: { allowed: false, reason: 'nepq:post_demo' }, call_offer_ok: true }, extra);
+    // 2026-10-19 (Mark, ruling 4): with REHASH_DEAL_HINT_MODE=every, each
+    // eligible rehash step carries ONE hint line (rehash-nepq.js decides which
+    // steps and which words); enforceNepqPlan puts it in when the draft has none.
+    const pd = (extra) => {
+      const p = Object.assign(plan, { post_demo: true, booking: { allowed: false, reason: 'nepq:post_demo' }, call_offer_ok: true }, extra);
+      if (hintMode === 'every' && (rehash ?? !!rehashRep)) {
+        p.hint_mode = 'every';
+        p.hint_line = rehashHintFor({ step: p.step, stage: p.rehash_stage, noQuestion: !!p.no_question, recentOutbound: plan.recent_outbound, seed: plan.variant_seed, mode: hintMode });
+      }
+      return p;
+    };
     // The whole thread, not just this visit: a deferral asked for yesterday
     // still stands today (currentSession drops turns past a 6-hour gap).
     const all = (Array.isArray(conversation) ? conversation : [])
@@ -1278,7 +1291,7 @@ function planNepqTurnCore({
     // 3a. The post-demo NEPQ track (rehash-nepq.js, 2026-10-11): where the
     //     conversation is, for the logs and the stop rule. Two no's in a row
     //     on the rehash line: one short line, no question, no call pitch.
-    const track = rehashNepqTurn({ conversation, trigger: now, nowMs });
+    const track = rehashNepqTurn({ conversation, trigger: now, nowMs, hintMode, repName: rehashRep });
     const onTrack = rehash ?? !!rehashRep;
     if (onTrack) plan.rehash_stage = track.stage;
     // The track's question for this stage, unless one of our last three asked it.
@@ -1351,7 +1364,8 @@ function planNepqTurnCore({
       }
       if (objAttempt === 2) {
         // The bridge. "The best deal possible" is said once per conversation.
-        const hintUsed = bestDealHintUsed(conversation);
+        const every = hintMode === 'every';
+        const hintUsed = !every && bestDealHintUsed(conversation);
         const lead = hintUsed ? 'I may be able to do something for you' : "I want to make sure you're getting the best deal possible. I may be able to do something for you";
         const offer = Array.isArray(callSlots?.offer) ? callSlots.offer : [];
         Object.assign(plan, { rehash_stage: 'bridge', rehash_bridged: true, rehash_ladder: 'bridge' });
@@ -1365,7 +1379,8 @@ function planNepqTurnCore({
             allowed: { ...plan.allowed, slot_offer: true }, booking: { allowed: true, reason: 'nepq:rehash_offer' },
           });
         }
-        const line = `${lead}, it's just easier on a quick call. Would that help?`;
+        // Every mode (ruling 3): "If I could …, would you …?"
+        const line = every ? `${hi ? `Understood${hi}. ` : ''}${rehashIfICouldBridge(repName && !speaksAsRep ? repName : null)}` : `${lead}, it's just easier on a quick call. Would that help?`;
         plan.objection.line = line;
         return pd({ step: 'rehash_bridge', required_move: 'objection_play', fixed_line: line });
       }
@@ -2539,7 +2554,8 @@ export function enforceNepqPlan(draft, plan, { allowFigures = false, known = {} 
     // bridge. The live simulation sent it as the answer to "we got another
     // quote", in place of "How do they compare?", and the bridge turn after it
     // then had nothing left to say.
-    if (plan.rehash_stage && PRE_BRIDGE_STAGES.has(plan.rehash_stage) && sentences.some(s => !BEST_DEAL_RX.test(s))) {
+    // Not with REHASH_DEAL_HINT_MODE=every (Mark, 2026-10-19): the hint goes on every eligible turn.
+    if (plan.hint_mode !== 'every' && plan.rehash_stage && PRE_BRIDGE_STAGES.has(plan.rehash_stage) && sentences.some(s => !BEST_DEAL_RX.test(s))) {
       drop(s => BEST_DEAL_RX.test(s), 'best_deal_before_bridge');
     }
     // 2026-10-15 (Shawn Eastman, CANON.STD.018): a post-demo lead is asked,
@@ -2641,6 +2657,15 @@ export function enforceNepqPlan(draft, plan, { allowFigures = false, known = {} 
   if (plan.post_demo && plan.rehash_stage === 'bridge' && plan.step === 'post_demo' && !plan.no_question && body && !body.includes('?')) {
     body = `${body} Would a quick call help?`;
     changes.push('rehash_bridge_ask_added');
+  }
+  // 2026-10-19 (Mark, ruling 4): REHASH_DEAL_HINT_MODE=every. An eligible
+  // rehash turn whose draft carries no hint gets the plan's hint line, before
+  // the closing question (one hint, never named; rehash-nepq.js).
+  if (plan.hint_line && body && !hasRehashHint(body)) {
+    const parts = splitSentences(body);
+    const q = parts.findIndex(x => x.includes('?'));
+    body = (q >= 0 ? [...parts.slice(0, q), plan.hint_line, ...parts.slice(q)] : [...parts, plan.hint_line]).join(' ').trim();
+    changes.push('rehash_hint_added');
   }
 
   // 5a. Holding a time: their question answered, then the same ask again.

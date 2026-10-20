@@ -228,6 +228,27 @@ export const MODES = Object.freeze([
     since: '2026-10-16', evidence: { ...job('siro-rep-scorecard-sync'), table: 'siro_rep_scorecards' },
     note: 'Nightly month-to-date Siro rep scorecards into siro_rep_scorecards.',
   }),
+  // ── Handoff v2 (Mark, 2026-10-19): Siro text, deal hint, takeover, Four-Step ──
+  m('SIRO_FOLLOWUP_TEXT_MODE', 'bot', 'enum', OSL, 'shadow', OSL_S, {
+    since: '2026-10-20', decider: 'Mark', evidence: { table: 'siro_recordings' },
+    goLive: 'after SIRO_CONTEXT_MODE=live: the gate with siro_followup_text_mode=live is not worse, and siro_lead_presentation shows the cleaned followup_text with no price, discount or sensitive detail',
+    note: "Siro's drafted follow-up TEXT (ruling 2): off stores none, shadow stores it cleaned in siro_recordings.followup_text, live also shows it to the bot as a reference (never sent as written; siro_draft_copied).",
+  }),
+  m('REHASH_DEAL_HINT_MODE', 'bot', 'enum', ['once', 'every'], 'once', { live: ['every'], off: ['once'] }, {
+    since: '2026-10-20', decider: 'Mark',
+    goLive: 'the gate with rehash_deal_hint_mode=every is not worse, rehash_hint_every_turn / rehash_hint_not_after_no / rehash_if_i_could pass',
+    note: 'Rehash replies (ruling 4): once = "the best deal possible" once per conversation (2026-10-11); every = one varied hint on every eligible reply and the "If I could …, would you …?" bridge.',
+  }),
+  m('HUMAN_TAKEOVER_MODE', 'bot', 'enum', OSL, 'shadow', OSL_S, {
+    since: '2026-10-20', decider: 'Mark', evidence: { events: ['agentic.human_takeover'], table: 'bot_message_context' },
+    goLive: '48h of shadow: every human_takeover_shadow_would_skip row is a real person\'s text (no bot send read as manual)',
+    note: "A person's manual text pauses the bot (ruling 5): live drops a queued reply and any proactive send until the lead's next inbound; shadow sends and marks input_snapshot.human_takeover_shadow_would_skip.",
+  }),
+  m('F0_FORMULA_MODE', 'bot', 'enum', ['v1', 'four_step'], 'v1', { live: ['four_step'], off: ['v1'] }, {
+    since: '2026-10-20', decider: 'Mark', evidence: { table: 'agentic_messages' },
+    goLive: 'the four-step preview passes the checks for the 10 preflight recordings with no price, discount or sensitive detail; activate the version-2 F.0 rows first',
+    note: 'F.0 v2 copy (ruling 6): v1 = the 2026-10-16 prompts; four_step = the Four-Step "If I could …, would you …?" prompts (version 2 rows, <visit_facts>, slot checks).',
+  }),
   m('F0_V2_MODE', 'bot', 'enum', OSL, 'shadow', OSL_S, {
     since: '2026-10-16', evidence: { table: 'agentic_messages' },
     note: 'F.0 v2 post-demo texts from the nurture orchestrator: off generates nothing, shadow forces approval (drafts + #contact-rehash card), live honours NURTURE_SHADOW_WORKFLOWS.',

@@ -25,6 +25,67 @@
 import { isNotInterested } from './not-interested.js';
 import { detectDeferral, isLeadCloser } from './post-demo-turn.js';
 import { PURCHASED_ELSEWHERE_RX } from './purchased-elsewhere.js';
+import { simModeOverrides } from '../simulator/sim-overrides.js';
+
+// ── A better deal, hinted on every reply (Mark, 2026-10-19, ruling 4) ──────
+// REHASH_DEAL_HINT_MODE=every: every rehash reply hints that we may be able to
+// make it work better for them, never naming it (no amount, %, discount,
+// promotion, financing term or deadline). This SUPERSEDES "the best deal
+// possible, once per conversation" (2026-10-11) in that mode only; `once` (the
+// default) is today's behaviour. No hint on a stop, a close or sign-off, room
+// asked for, a deferral, "we signed elsewhere", a confirmed call, an opt-out,
+// or a first no (door_open). The wording varies and never repeats an opener
+// already sent in the thread. The bridge becomes "If I could …, would you …?"
+// (ruling 3). Plain strings, no new pattern: hasRehashHint reads them back.
+export const REHASH_DEAL_HINT_MODES = Object.freeze(['once', 'every']);
+export const REHASH_HINT_LINES = Object.freeze([
+  "I want to make sure you're getting the best deal possible.",
+  "I'd like to see if I can make this work better for you.",
+  'There may be a way to make the numbers work better for you.',
+  'I may be able to do a little more for you on this.',
+  "I'd love to see if there's a way to make this easier on your budget.",
+  'Let me see what I can do to make this work for you.',
+]);
+export const NO_HINT_STEPS = Object.freeze(new Set([
+  'post_demo_stop', 'post_demo_close', 'closer', 'post_demo_space', 'sign_off', 'competitor_signed',
+  'signed_elsewhere', 'defer', 'follow_up_date', 'rehash_confirm', 'opt_out', 'stop', 'door_open',
+]));
+
+/** REHASH_DEAL_HINT_MODE (a bot-gate run may force it). once | every. */
+export function rehashDealHintMode(env = process.env) {
+  const v = String(simModeOverrides().rehashDealHintMode ?? env?.REHASH_DEAL_HINT_MODE ?? '').trim().toLowerCase();
+  return REHASH_DEAL_HINT_MODES.includes(v) ? v : 'once';
+}
+
+const hintNorm = (s) => String(s || '').toLowerCase().replace(/[’']/g, "'").replace(/[^a-z' ]+/g, ' ').replace(/\s+/g, ' ').trim();
+const HINT_NORMS = REHASH_HINT_LINES.map(l => hintNorm(l).replace(/^i want to make sure /, ''));
+
+/** A sentence that carries one of our hint lines (or "best deal"). Pure. */
+export function hasRehashHint(text) {
+  const t = hintNorm(text);
+  return /\bbest deal\b/.test(t) || HINT_NORMS.some(h => t.includes(h));
+}
+
+/** A hint line whose opening words we have not sent in this thread. Pure. */
+export function pickRehashHint(recentOutbound = [], seed = 0) {
+  const sent = (Array.isArray(recentOutbound) ? recentOutbound : []).map(hintNorm);
+  const opener = (l) => hintNorm(l).split(' ').slice(0, 4).join(' ');
+  const fresh = REHASH_HINT_LINES.filter(l => !sent.some(t => t.includes(opener(l))));
+  const pool = fresh.length ? fresh : REHASH_HINT_LINES;
+  return pool[Math.abs(Number(seed) || 0) % pool.length];
+}
+
+/** The hint for this turn, or null (once mode, a no-hint step, a turn that asks nothing). Pure. */
+export function rehashHintFor({ step = null, stage = null, noQuestion = false, recentOutbound = [], seed = 0, mode = 'once' } = {}) {
+  if (mode !== 'every' || noQuestion) return null;
+  if ((step && NO_HINT_STEPS.has(step)) || (stage && NO_HINT_STEPS.has(stage))) return null;
+  return pickRehashHint(recentOutbound, seed);
+}
+
+/** The "If I could …, would you …?" bridge to the call (ruling 3). Pure. */
+export function rehashIfICouldBridge(repName = null) {
+  return `If I could make this work better for you, would you be open to a quick call${repName ? ` with ${repName}` : ''}?`;
+}
 
 /** The hint (Mark's framing). Said at most once per conversation, at the bridge. */
 export const BEST_DEAL_RX = /\bbest\s+deal\b/i;
@@ -149,7 +210,15 @@ function normalize(conversation, trigger) {
  * @returns {{ stage: string, label: string, move: string, example: string|null,
  *   objection: object|null, nos: number, hintUsed: boolean, asked: string[] }}
  */
-export function rehashNepqTurn({ conversation = [], trigger = '', nowMs = Date.now() } = {}) {
+export function rehashNepqTurn({ conversation = [], trigger = '', nowMs = Date.now(), hintMode = 'once', repName = null } = {}) {
+  const turn = rehashNepqTurnCore({ conversation, trigger, nowMs, hintMode, repName });
+  if (hintMode !== 'every') return turn;
+  const recent = normalize(conversation, trigger).filter(t => t.direction === 'outbound').slice(-8).map(t => t.text);
+  return { ...turn, hintMode, hint: rehashHintFor({ stage: turn.stage, recentOutbound: recent, seed: recent.length, mode: hintMode }) };
+}
+
+function rehashNepqTurnCore({ conversation = [], trigger = '', nowMs = Date.now(), hintMode = 'once', repName = null } = {}) {
+  const every = hintMode === 'every';
   const turns = normalize(conversation, trigger);
   const outbound = turns.filter(t => t.direction === 'outbound').map(t => t.text);
   const now = String(trigger || [...turns].reverse().find(t => t.direction === 'inbound')?.text || '');
@@ -157,7 +226,8 @@ export function rehashNepqTurn({ conversation = [], trigger = '', nowMs = Date.n
     const i = turns.map(t => t.direction).lastIndexOf('outbound');
     return i >= 0 ? turns[i].text : '';
   })();
-  const hintUsed = outbound.some(t => BEST_DEAL_RX.test(t));
+  // Every mode (2026-10-19): the hint is never "used up".
+  const hintUsed = !every && outbound.some(t => BEST_DEAL_RX.test(t));
   const inbound = turns.filter(t => t.direction === 'inbound').map(t => t.text);
   // A stage we asked, or one the lead already answered without being asked.
   const asked = REHASH_STAGES.filter(s => outbound.some(t => s.rx.test(t)) || stageAnswered(s, inbound)).map(s => s.key);
@@ -199,6 +269,7 @@ export function rehashNepqTurn({ conversation = [], trigger = '', nowMs = Date.n
   }
   // They answered our ask-back: now the bridge.
   if (ASK_BACK_RX.test(lastOut) && !objection) {
+    if (every) return at('bridge', 'Reflect what they said in their words, then ask "If I could …, would you be open to a quick call?"', { example: `That makes sense. ${rehashIfICouldBridge(repName)}` });
     return hintUsed
       ? at('bridge', 'Reflect what they said in their words, then ask if a quick call would help. Do NOT say "best deal" again: it was already said once.', { example: 'That makes sense. Would a quick call help?' })
       : at('bridge', 'Reflect what they said in their words, then bridge to the call with the hint, once.');
@@ -213,6 +284,9 @@ export function rehashNepqTurn({ conversation = [], trigger = '', nowMs = Date.n
   }
   const next = REHASH_STAGES[idx + 1];
   const vague = idx === 2 ? ' If their answer to "what is holding you back" was vague, probe with their own last few words first ("Too much how?") and stay on this stage.' : '';
+  if (every && next.key === 'bridge') {
+    return at('bridge', 'Bridge to the call with "If I could …, would you be open to a quick call?"', { example: rehashIfICouldBridge(repName) });
+  }
   const move = next.key === 'bridge'
     ? (hintUsed ? 'Bridge to the call WITHOUT the "best deal" line (already said once): ask if a quick call would help.' : 'Bridge to the call with the hint, once.')
     : `Ask the ${next.label} question, ${next.aim}.${vague}`;
@@ -252,9 +326,16 @@ export function buildRehashNepqBlock(turn, { repName = null } = {}) {
     '- "Not interested" → acknowledge, leave the door open, no pitch, NO question. Two no\'s in a row = stop asking.',
     '- A sign-off ("will do", "I\'ll get back to you", "not ready", "ok thanks") → one matching line, no question.',
     '',
-    t.hintUsed
-      ? '"THE BEST DEAL POSSIBLE": ALREADY SAID in this conversation. Do not say it again, in any wording.'
-      : '"THE BEST DEAL POSSIBLE": may be said at most ONCE per conversation, and only at the bridge.',
+    ...(t.hintMode === 'every'
+      ? [
+        'A BETTER DEAL, HINTED: every reply (except a stop, a sign-off, a no or a confirmed call) carries ONE',
+        'short line that we may be able to make this work better for them, in new words each time.',
+        t.hint ? `THIS TURN'S HINT (adapt, do not recite): "${t.hint}"` : 'THIS TURN: no hint.',
+        'The bridge to the call is "If I could …, would you be open to a quick call?"',
+      ]
+      : [t.hintUsed
+        ? '"THE BEST DEAL POSSIBLE": ALREADY SAID in this conversation. Do not say it again, in any wording.'
+        : '"THE BEST DEAL POSSIBLE": may be said at most ONCE per conversation, and only at the bridge.']),
     'Never name what the deal is: no amount, no percentage, no discount, no promotion, no',
     'special price or financing, never "a deal", "a great deal" or "a special deal".',
     '',

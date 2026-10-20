@@ -100,6 +100,9 @@ export function renderPlanBlock(plan) {
   if (plan.qualify_item) {
     lines.push(`Before any visit time: ${plan.qualify_item === 'homeowner' ? 'ask whether they own the home (allowed on this turn; it overrides the rule about not probing for disqualifiers)' : plan.qualify_item === 'zip' ? 'ask for the zip code at the home' : plan.qualify_item === 'openings' ? 'ask how many windows and doors they want quoted' : 'ask about the other decision maker as planned'}. Offer no times, no visit and no booking in this reply.${plan.reask_line ? ` End with: "${plan.reask_line}"` : ''}`);
   }
+  // 2026-10-19 (Mark, ruling 4; REHASH_DEAL_HINT_MODE=every): one hint that
+  // we may be able to make it work better, never named.
+  if (plan.hint_line) lines.push(`Also say, in your own words, ONE short line hinting that we may be able to make this work better for them (never an amount, a percent, a discount, a promotion, financing or a deadline), e.g. "${plan.hint_line}"`);
   lines.push(...NEPQ_ALWAYS);
   // 2026-10-03 (Mark): the visit is the next step; a phone call only when the
   // lead asks for one. The guard (dropUnaskedCallOffer) backs this up.

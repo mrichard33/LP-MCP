@@ -10,6 +10,8 @@
  * (a bad value falls back to the safe default, never throws).
  */
 
+import { simSiroOverrides } from '../simulator/sim-overrides.js';
+
 export const SIRO_ORG_BASE = 'https://functions.siro.ai/api-externalApi/v1';
 export const SIRO_USER_BASE = 'https://api.siro.ai/v1';
 export const SIRO_TOKEN_URL = 'https://auth.siro.ai/oauth2/token';
@@ -26,12 +28,23 @@ function num(value, fallback, { min = -Infinity, max = Infinity } = {}) {
 }
 const OSL = ['off', 'shadow', 'live'];
 const OL = ['off', 'live'];
+export const F0_FORMULAS = ['v1', 'four_step'];
 
+// 2026-10-19: a bot-gate run may try SIRO_CONTEXT_MODE, SIRO_FOLLOWUP_TEXT_MODE
+// and F0_FORMULA_MODE without Railway (src/simulator/sim-overrides.js). Outside
+// a simulation the overrides are null and the environment decides.
 export function siroModes(env = process.env) {
+  const sim = simSiroOverrides();
   return {
     webhook: pick(env.SIRO_WEBHOOK_MODE, OSL, 'shadow'),
     sync: pick(env.SIRO_SYNC_MODE, OSL, 'shadow'),
-    context: pick(env.SIRO_CONTEXT_MODE, OSL, 'shadow'),
+    context: pick(sim.siroContextMode ?? env.SIRO_CONTEXT_MODE, OSL, 'shadow'),
+    // Siro's drafted follow-up text (Mark, 2026-10-19, ruling 2): off stores
+    // none, shadow stores it, live also shows it to the bot as a reference.
+    followupText: pick(sim.siroFollowupTextMode ?? env.SIRO_FOLLOWUP_TEXT_MODE, OSL, 'shadow'),
+    // F.0 v2 copy formula (ruling 6): v1 = the 2026-10-16 prompts, four_step =
+    // the Four-Step "If I could …, would you …?" prompts (version 2 rows).
+    f0Formula: pick(sim.f0FormulaMode ?? env.F0_FORMULA_MODE, F0_FORMULAS, 'v1'),
     ensure: pick(env.SIRO_ENSURE_MODE, OL, 'off'),
     demoNote: pick(env.SIRO_DEMO_NOTE_MODE, OSL, 'shadow'),
     scorecardSync: pick(env.SIRO_SCORECARD_SYNC_MODE, OL, 'off'),

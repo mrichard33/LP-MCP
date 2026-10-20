@@ -25,6 +25,7 @@ import { decisionMakersFromThread, dmSettled } from '../agentic/qualifying.js';
 import { BRIDGE_RX } from '../agentic/nepq-planner.js';
 import { jobScopeFromThread } from '../agentic/job-scope.js';
 import { isCallPromise } from '../agentic/promised-callbacks.js';
+import { hasRehashHint, NO_HINT_STEPS, REHASH_HINT_LINES } from '../agentic/rehash-nepq.js';
 
 // 2026-10-12 (handoff PR 7): the scenario checks have their own version. A run
 // scored with new checks is a new baseline, never "worse" than an old one.
@@ -279,6 +280,58 @@ export const SCENARIO_EXPECTATIONS = Object.freeze({
     if (/\$\s?\d|\b\d[\d,]{2,}\b/.test(text)) out.push({ code: 'price_from_visit_stated', detail: text, turn: first?.turn });
     if ((text.match(/\?/g) || []).length !== 1) out.push({ code: 'not_one_question', detail: text, turn: first?.turn });
     if (/\b(?:said|mentioned)\b/i.test(text) && /\b(?:brian|rep)\b/i.test(text)) out.push({ code: 'rep_quoted', detail: text, turn: first?.turn });
+    return out;
+  },
+  // ── 2026-10-19 (Mark, handoff v2): rulings 3, 4 and 5. Each check runs only
+  // when the conversation ran with the mode on (r.rehash_deal_hint_mode,
+  // r.human_takeover_mode: Railway's or the gate's override).
+  rehash_if_i_could: (r) => {
+    const out = rehashLaneFailures(r);
+    if (r.rehash_deal_hint_mode !== 'every') return out;
+    const t = (r.transcript || [])[1];
+    if (!t) return out;
+    const step = String(t.nepq?.step || '');
+    const text = replies(t).join(' ');
+    if (step === 'rehash_bridge' && !/\bif\s+i\s+could\b[^?]*\bwould\s+you\b[^?]*\?/i.test(text)) out.push({ code: 'bridge_not_if_i_could', detail: text, turn: t.turn });
+    if (!['rehash_bridge', 'rehash_offer'].includes(step)) out.push({ code: 'no_bridge_on_second_objection', detail: `step ${step || 'none'}`, turn: t.turn });
+    return out;
+  },
+  rehash_hint_every_turn: (r) => {
+    const out = rehashLaneFailures(r);
+    if (r.rehash_deal_hint_mode !== 'every') return out;
+    const used = [];
+    for (const t of r.transcript || []) {
+      const text = replies(t).join(' ');
+      if (!text) continue;
+      const step = String(t.nepq?.step || '');
+      const eligible = t.nepq?.post_demo === true && !t.nepq?.no_question && !NO_HINT_STEPS.has(step);
+      if (eligible && !hasRehashHint(text)) out.push({ code: 'deal_hint_missing', detail: text, turn: t.turn });
+      if (/\$\s?\d|\d\s?%|\bdiscount|\bpromo|\brebate|\bfinanc|\bspecial\s+(?:price|offer|deal)/i.test(text)) out.push({ code: 'deal_named', detail: text, turn: t.turn });
+      const line = REHASH_HINT_LINES.find(l => text.toLowerCase().includes(l.toLowerCase().slice(0, 24)));
+      if (line && used.includes(line)) out.push({ code: 'deal_hint_repeated', detail: line, turn: t.turn });
+      if (line) used.push(line);
+    }
+    return out;
+  },
+  rehash_hint_not_after_no: (r) => {
+    const out = rehashLaneFailures(r);
+    if (r.rehash_deal_hint_mode !== 'every') return out;
+    for (const t of (r.transcript || []).slice(1)) {
+      const text = replies(t).join(' ');
+      if (text && hasRehashHint(text)) out.push({ code: 'deal_hint_after_no', detail: text, turn: t.turn });
+    }
+    return out;
+  },
+  human_takeover_skip_one: (r) => {
+    const out = rehashLaneFailures(r);
+    const ts = r.transcript || [];
+    const manualAt = ts.findIndex(t => t.manual);
+    if (manualAt < 1) return [...out, { code: 'manual_turn_not_run', detail: 'the scenario had no manual text' }];
+    const before = ts[manualAt - 1];
+    const after = ts[manualAt + 1];
+    if (r.human_takeover_mode === 'live' && replies(before).length) out.push({ code: 'reply_sent_after_person_texted', detail: replies(before).join(' '), turn: before.turn });
+    if (r.human_takeover_mode === 'shadow' && before.human_takeover !== 'would_skip') out.push({ code: 'takeover_not_marked', detail: String(before.human_takeover || 'none'), turn: before.turn });
+    if (after && !replies(after).length) out.push({ code: 'next_inbound_not_answered', detail: after.error || 'no reply', turn: after.turn });
     return out;
   },
   rehash_repeat_objection: (r) => {
@@ -546,7 +599,9 @@ export function scoreResult(result) {
     const smsStop = result.channel === 'sms' && isOptOut(inbound);
     // A re-fire with no new inbound, or a turn the turn lock gave to another
     // path, is silent on purpose (Phase 1, 2026-10-18).
-    const lockSkipped = t.refire === true || t.turn_lock?.skipped === true;
+    const lockSkipped = t.refire === true || t.turn_lock?.skipped === true
+      // 2026-10-19 (ruling 5): a person's own text, and the reply it dropped.
+      || !!t.manual || t.human_takeover === 'skipped';
     if (!texts.length && t.intent !== 'LP_NOTE_DQ' && !smsStop && !lockSkipped) failures.push({ code: 'no_reply', detail: t.error || t.outcome || 'no reply', turn: t.turn });
     // Whether THIS turn booked: a recorded booking in the turn's effects.
     // A move of the same appointment (the cancel flow's reschedule) counts:
@@ -615,6 +670,8 @@ export function scoreRun(results, meta = {}) {
     kb_exemplar_mode: (results || []).find(r => r?.kb_exemplar_mode)?.kb_exemplar_mode || null,
     // 2026-10-19: set only when the run forced BOT_INCLUDE_REVIN_THREAD (true/false).
     include_revin_thread: (results || []).find(r => typeof r?.include_revin_thread === 'boolean')?.include_revin_thread ?? null,
+    // 2026-10-19 (handoff v2): the modes this run forced (SIRO_CONTEXT_MODE, …), or null.
+    sim_modes: (results || []).find(r => r?.sim_modes)?.sim_modes || null,
     ...meta,
     conversations: scored.length,
     passed,
@@ -707,6 +764,12 @@ export function compareScorecards(current, previous) {
   if ((previous.nepq_mode || 'live') !== (current.nepq_mode || 'live')) {
     return { compared: false, worse: null, reasons: [`the last run was NEPQ ${previous.nepq_mode || 'live'}, this one NEPQ ${current.nepq_mode || 'live'}; run both modes to compare`] };
   }
+  // 2026-10-19: a run that forced a mode (sim_modes) is compared only with a run
+  // that forced the same ones; anything else is a different bot.
+  const modesKey = (c) => JSON.stringify(Object.entries(c?.sim_modes || {}).sort());
+  if (modesKey(previous) !== modesKey(current)) {
+    return { compared: false, worse: null, reasons: [`the last run forced modes ${modesKey(previous)}, this one ${modesKey(current)}; compare runs with the same modes`] };
+  }
   if (previous.invariants_version !== current.invariants_version) {
     return { compared: false, worse: null, reasons: [`the checks changed (${previous.invariants_version} → ${current.invariants_version}); this run is the new baseline`] };
   }
@@ -764,7 +827,7 @@ export function formatScorecard(card, comparison = null) {
   const head = runs > 1
     ? `Scorecard (${runs} runs): ${card.passed}/${stable} stable conversations pass (${Math.round((card.pass_rate || 0) * 100)}%) · ${card.flaky || 0} flaky of ${card.conversations}`
     : `Scorecard: ${card.passed}/${card.conversations} conversations pass (${Math.round((card.pass_rate || 0) * 100)}%)`;
-  const lines = [`${head} · checks ${card.invariants_version}${card.prompt_version ? ` · prompt ${card.prompt_version}` : ''}${card.git_sha ? ` · ${String(card.git_sha).slice(0, 7)}` : ''}${card.kb_exemplar_mode ? ` · exemplars ${card.kb_exemplar_mode}` : ''}${typeof card.include_revin_thread === 'boolean' ? ` · revin thread ${card.include_revin_thread ? 'on' : 'off'}` : ''}`];
+  const lines = [`${head} · checks ${card.invariants_version}${card.prompt_version ? ` · prompt ${card.prompt_version}` : ''}${card.git_sha ? ` · ${String(card.git_sha).slice(0, 7)}` : ''}${card.kb_exemplar_mode ? ` · exemplars ${card.kb_exemplar_mode}` : ''}${typeof card.include_revin_thread === 'boolean' ? ` · revin thread ${card.include_revin_thread ? 'on' : 'off'}` : ''}${card.sim_modes ? ` · modes ${Object.entries(card.sim_modes).map(([k, v]) => `${k}=${v}`).join(',')}` : ''}`];
   if (comparison) lines.push(comparison.worse === true ? `WORSE THAN LAST RUN: ${comparison.reasons.join('; ')}` : comparison.worse === false ? 'Not worse than the last run.' : `Not compared: ${comparison.reasons.join('; ')}`);
   for (const [fam, f] of Object.entries(card.pass_rate_by_family || {}).sort((a, b) => a[0].localeCompare(b[0]))) {
     lines.push(`  family ${fam}: ${f.passed}/${f.conversations} (${Math.round((f.pass_rate || 0) * 100)}%)`);

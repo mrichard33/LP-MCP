@@ -331,6 +331,9 @@ test('invariants: each known bad reply is caught by its own check', () => {
   const visit = { presentation: { rep_first_name: 'Brian', objections: [] } };
   expect('The quote came in at $18,400. Does that still work?', 'presentation_quoted_price', visit);
   expect('Brian mentioned the lanai slider. Still on your mind?', 'presentation_rep_quoted', visit);
+  // 2026-10-19 (Mark, ruling 2): Siro's suggested text is a reference; a reply that is mostly the draft fails.
+  const draft = { presentation: { rep_first_name: 'Brian', objections: [], followup_text: 'Hi Dana, the lanai slider will finally stop rattling in storms once it is replaced. Want to talk it over this week?' } };
+  expect('Hi Dana, the lanai slider will finally stop rattling in storms once it is replaced. Want to talk it over?', 'siro_draft_copied', draft);
   // 2026-10-15 (Shawn Eastman, post-demo): the three live rebuttals, the
   // unbacked follow-up and a question after the stop.
   expect('The cheaper bids we see usually cut something, subcontracted crews or parts-only warranties, and folks end up replacing in five years. Would that help?', 'post_demo_rebuttal', { postDemoStep: 'post_demo' });

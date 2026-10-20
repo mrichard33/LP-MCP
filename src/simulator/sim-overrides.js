@@ -20,13 +20,40 @@ const store = new AsyncLocalStorage();
 
 export const KB_EXEMPLAR_OVERRIDE_MODES = Object.freeze(['off', 'shadow', 'live']);
 
+// 2026-10-19 (handoff v2): the Siro, deal-hint and takeover modes, so the gate
+// can try each before Mark flips it on Railway.
+export const SIM_MODE_OVERRIDES = Object.freeze({
+  siroContextMode: ['off', 'shadow', 'live'],
+  siroFollowupTextMode: ['off', 'shadow', 'live'],
+  f0FormulaMode: ['v1', 'four_step'],
+  rehashDealHintMode: ['once', 'every'],
+  humanTakeoverMode: ['off', 'shadow', 'live'],
+});
+
 /** Run fn with these overrides in force. Unknown or empty values are ignored. */
 export function runWithSimOverrides(overrides, fn) {
   const kbExemplarMode = KB_EXEMPLAR_OVERRIDE_MODES.includes(overrides?.kbExemplarMode) ? overrides.kbExemplarMode : null;
   // 2026-10-19: BOT_INCLUDE_REVIN_THREAD for this run (src/revin/thread.js).
   const includeRevinThread = typeof overrides?.includeRevinThread === 'boolean' ? overrides.includeRevinThread : null;
-  if (!kbExemplarMode && includeRevinThread == null) return fn();
-  return store.run({ kbExemplarMode, includeRevinThread }, fn);
+  const modes = {};
+  for (const [k, allowed] of Object.entries(SIM_MODE_OVERRIDES)) {
+    if (allowed.includes(overrides?.[k])) modes[k] = overrides[k];
+  }
+  if (!kbExemplarMode && includeRevinThread == null && !Object.keys(modes).length) return fn();
+  return store.run({ kbExemplarMode, includeRevinThread, ...modes }, fn);
+}
+
+/** The simulator's mode overrides for this run ({} outside one). */
+export function simModeOverrides() {
+  const st = store.getStore() || {};
+  const out = {};
+  for (const k of Object.keys(SIM_MODE_OVERRIDES)) if (st[k]) out[k] = st[k];
+  return out;
+}
+/** The Siro overrides (siroContextMode, siroFollowupTextMode, f0FormulaMode), each null when unset. */
+export function simSiroOverrides() {
+  const st = store.getStore() || {};
+  return { siroContextMode: st.siroContextMode || null, siroFollowupTextMode: st.siroFollowupTextMode || null, f0FormulaMode: st.f0FormulaMode || null };
 }
 
 /** The simulator's KB_EXEMPLAR_MODE for this run, or null outside one. */

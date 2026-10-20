@@ -44,7 +44,7 @@ export function quietMs(env = process.env) {
   return (Number.isFinite(h) && h > 0 ? h : DEFAULT_QUIET_HOURS) * 3600000;
 }
 
-const NOT_A_CONVERSATION = new Set(['workflow', 'bulk_actions', 'campaign']);
+export const NOT_A_CONVERSATION = new Set(['workflow', 'bulk_actions', 'campaign']);
 
 /**
  * Is this GHL outbound message part of a conversation (a person or the bot

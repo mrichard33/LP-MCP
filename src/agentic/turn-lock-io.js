@@ -19,7 +19,7 @@
 // before Phase 1. A missing table (migration not applied yet) logs once.
 // `deps.store` swaps the table for an in-memory store (the simulator, tests).
 
-import { decideClaim } from './turn-lock.js';
+import { decideClaim, ANSWERED_OUTCOMES } from './turn-lock.js';
 import { turnKeyFor, textTurnKey, messageTurnKey, normalizeInbound } from './turn-key.js';
 
 const TABLE = 'bot_turn_locks';
@@ -79,7 +79,7 @@ export function supabaseTurnLockStore(supabase) {
     async answeredSince(contactId, sinceIso) {
       const { data, error } = await withTimeout(
         supabase.from(TABLE).select('claimed_at, outcome').eq('contact_id', contactId)
-          .in('outcome', ['sent', 'watchdog_recovered']).gte('claimed_at', sinceIso).limit(20),
+          .in('outcome', [...ANSWERED_OUTCOMES]).gte('claimed_at', sinceIso).limit(20),
         IO_TIMEOUT_MS, 'turn lock answered read');
       if (error) throw Object.assign(new Error(error.message), { pg: error });
       return data || [];
@@ -114,7 +114,7 @@ export function memoryTurnLockStore() {
     },
     async answeredSince(contactId, sinceIso) {
       const since = Date.parse(sinceIso);
-      return [...rows.values()].filter(r => r.contact_id === contactId && ['sent', 'watchdog_recovered'].includes(r.outcome) && Date.parse(r.claimed_at) >= since);
+      return [...rows.values()].filter(r => r.contact_id === contactId && ANSWERED_OUTCOMES.has(r.outcome) && Date.parse(r.claimed_at) >= since);
     },
   };
 }

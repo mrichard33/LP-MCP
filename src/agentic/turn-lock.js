@@ -50,8 +50,10 @@ export const STALE_LOCK_MS = 10 * 60 * 1000;
 export const WATCHDOG_RULES = Object.freeze(new Set(['AGENTIC_ACTIVE_REPLY_BACKSTOP', 'AGENTIC_REPLY_SLA_RECOVER']));
 export const WATCHDOG_MIN_AGE_MS = 180 * 1000;
 
-/** Outcomes that mean a reply reached the lead for that turn. */
-export const ANSWERED_OUTCOMES = Object.freeze(new Set(['sent', 'watchdog_recovered']));
+/** Outcomes that mean a reply reached the lead for that turn. 2026-10-19 (Mark,
+ * ruling 5): a person who texted the lead by hand (human_replied) answered the
+ * turn too, so no other path and no watchdog (228 / 373) answers it again. */
+export const ANSWERED_OUTCOMES = Object.freeze(new Set(['sent', 'watchdog_recovered', 'human_replied']));
 
 export const isWatchdogRule = (rule) => WATCHDOG_RULES.has(String(rule || ''));
 

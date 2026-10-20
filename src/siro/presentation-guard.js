@@ -54,3 +54,27 @@ export function enforcePresentationGuard(text, { presentation = null } = {}) {
   // retry loop, and the check still fails it.
   return out ? { text: out, changed: true, changes } : { text: body, changed: false, changes };
 }
+
+// ── Siro's suggested text is a reference, never the reply (Mark, 2026-10-19, ruling 2)
+// The bot may read Siro's drafted follow-up for topic and tone; a reply that
+// is mostly that draft is Siro's text sent as written. 60% or more of the
+// reply's content words found in the draft fails siro_draft_copied.
+export const SIRO_DRAFT_COPY_SHARE = 0.6;
+const COPY_STOP = new Set(('the and for you your with that this have from are was were will would could just about what when they them their there here been also into than then some more very our out not but can all any its it\'s i\'m you\'re we\'re').split(' '));
+function contentWords(s) {
+  return (String(s || '').toLowerCase().match(/[a-z][a-z']{2,}/g) || []).filter(w => !COPY_STOP.has(w));
+}
+
+/** Share (0..1) of the reply's content words that appear in Siro's draft. Pure. */
+export function siroDraftOverlap(text, followupText) {
+  const words = contentWords(text);
+  if (!words.length || !followupText) return 0;
+  const draft = new Set(contentWords(followupText));
+  if (!draft.size) return 0;
+  return words.filter(w => draft.has(w)).length / words.length;
+}
+
+/** True when the reply copies Siro's suggested text. Pure. */
+export function copiesSiroDraft(text, followupText) {
+  return contentWords(text).length >= 5 && siroDraftOverlap(text, followupText) >= SIRO_DRAFT_COPY_SHARE;
+}

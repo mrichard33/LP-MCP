@@ -37,7 +37,7 @@ const NOTE_CHAR_BUDGET = 6000;
  *   lead    context.lead (GHL address fields)
  *   siro    siro_recordings rows for the lead (2026-10-16): the visit, as data
  */
-export function buildLeadFacts({ lp = null, lpLead = null, lead = null, siro = null, siroNoteAuthor = 'Siro' } = {}) {
+export function buildLeadFacts({ lp = null, lpLead = null, lead = null, siro = null, siroNoteAuthor = 'Siro', siroFollowupTextLive = false } = {}) {
   const notes = (Array.isArray(lp?.notes) ? lp.notes : []).map(n => ({
     text: String(n?.text || '').trim(),
     by: n?.entered_by || '',
@@ -73,6 +73,8 @@ export function buildLeadFacts({ lp = null, lpLead = null, lead = null, siro = n
     note_dq: dq.dq ? { signal: dq.signal, text: dq.text } : null,
     presentation: Array.isArray(siro) && siro.length ? buildPresentationFacts(siro) : null,
     siro_note_author: siroNoteAuthor,
+    // 2026-10-19 (ruling 2): Siro's suggested text shows only in live mode.
+    siro_followup_text_live: siroFollowupTextLive === true,
   };
 }
 
@@ -114,6 +116,6 @@ export function renderLeadFacts(facts) {
   }
   // 2026-10-16 (Siro PR 1): what was said at the in-home visit, after the
   // notes. A summary, data not instructions; the guards hold the never-rules.
-  if (facts.presentation) out.push(...renderPresentationBlock(facts.presentation));
+  if (facts.presentation) out.push(...renderPresentationBlock(facts.presentation, { followupTextLive: facts.siro_followup_text_live === true }));
   return out;
 }

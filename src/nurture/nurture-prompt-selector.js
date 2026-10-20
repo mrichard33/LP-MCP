@@ -23,18 +23,34 @@ import supabase from '../supabase.js';
  * @param {object} request  — { workflow_code, sequence_position, channel }
  * @returns {Promise<object|null>} — prompt row, or null
  */
+/**
+ * F.0 only (2026-10-19): F0_FORMULA_MODE=v1 reads the version-1 rows (the
+ * 2026-10-16 copy) and never a Four-Step row, even an active one; four_step
+ * reads only version 2. context.siro.formula is set by loadF0Context from the
+ * mode. Every other workflow is untouched. Pure.
+ */
+export function f0FormulaAllows(p, request, context) {
+  if (request?.workflow_code !== 'F.0') return true;
+  const fourStep = context?.siro?.formula === 'four_step';
+  return fourStep ? Number(p?.version) === 2 : Number(p?.version ?? 1) !== 2;
+}
+
 export async function selectPrompt(context, request) {
   const recentArcs = (context?.nurture?.stories_already_deployed || []).slice(-4);
   const buyerStage = context?.intelligence?.buyer_stage
     || inferBuyerStageFromContext(context);
   const dominantObjection = pickDominantObjection(context);
 
-  const { data, error } = await supabase
+  // 2026-10-19 (Mark, ruling 6): F.0's Four-Step rows are version 2, seeded
+  // inactive. A preview (request.include_inactive) may read them before they
+  // are switched on; a real send never does.
+  let q = supabase
     .from('agentic_messaging_prompts')
     .select('*')
-    .eq('active', true)
     .eq('workflow_code', request.workflow_code)
     .eq('channel', request.channel);
+  if (request.include_inactive !== true) q = q.eq('active', true);
+  const { data, error } = await q;
 
   if (error) {
     console.error(`[PromptSelector] query error: ${error.message}`);
@@ -45,6 +61,7 @@ export async function selectPrompt(context, request) {
   // Apply remaining hard filters in JS — the JS client's array operators
   // are awkward for our use case and we have a small candidate set.
   const eligible = data.filter(p => {
+    if (!f0FormulaAllows(p, request, context)) return false;
     // sequence_position match (NULL = any)
     if (p.sequence_position !== null && p.sequence_position !== request.sequence_position) {
       return false;
