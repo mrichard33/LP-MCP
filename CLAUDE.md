@@ -1148,7 +1148,7 @@ Leg", assigns 1 Leg leads to Ross itself. With no open assignment for that partn
 `skipped_not_ours` and nothing is written; a matching lead already owned by that partner is a `noop` and creates no
 assignment. Every write is read back (a kept owner is `failed`), noted on the contact, logged in
 `partner_owner_log`, and posts ONE card per lead + reason + owner to `PARTNER_ALERT_SLACK_CHANNEL` (`alert-posted`, unset
-= log only). A partner is an OWNER, never a follower: GHL's "Only Assigned Data" keys on the owner. Off with
+= log only). A partner is an OWNER, never a follower: GHL's "Only Assigned Data" keys on the owner. An open card in a pipeline the partner's GHL user cannot see (GHL 400 "does not have permission to access this pipeline"; Ross has no "3. Recycle, Lost, Deferred …") keeps its owner and is logged as `opportunities_skipped_no_pipeline_access`, never a failure (the user, 2026-10-20). Off with
 `PARTNER_SYNC_ENABLED=false` or `PARTNER_GO_LIVE_AT` unset. `POST /n8n/admin/partner-owner/run {lp_lead_id, dry_run}`
 (strict operator token, no soft launch) and `GET /n8n/admin/partner-owner/status`. Side effect: GHL credits a bot message
 with no `userId` to the contact owner, so bot texts to a partner lead show as the partner in GHL.

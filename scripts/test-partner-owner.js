@@ -32,7 +32,7 @@ function lead(over = {}) {
   };
 }
 
-function world({ leads = [lead()], map = MAP, log = [], owner = REECE, opps, keepOwner = false, env = ENV, assignments = [] } = {}) {
+function world({ leads = [lead()], map = MAP, log = [], owner = REECE, opps, keepOwner = false, env = ENV, assignments = [], noAccess = [] } = {}) {
   clearCache();
   __resetForTests();
   const db = fakeSupabase({ partner_owner_map: map, lp_leads: leads, partner_owner_log: log, partner_owner_assignments: assignments });
@@ -58,6 +58,9 @@ function world({ leads = [lead()], map = MAP, log = [], owner = REECE, opps, kee
     if ((m = path.match(/^\/opportunities\/([^/?]+)$/))) {
       const o = opportunities.find((x) => x.id === m[1]);
       if (method === 'GET') return { opportunity: { ...o } };
+      if (noAccess.includes(o.id)) {
+        throw new Error(`GHL PUT /opportunities/${o.id} → 400: {"message":"Can not make this user ${body.assignedTo} owner as User does not have permission to access this pipeline 1jIWe4Ad04oJtYE9UuXq."}`);
+      }
       writes.push({ method, path, body });
       o.assignedTo = body.assignedTo;
       return { succeeded: true };
@@ -149,6 +152,34 @@ test('2c. the 583364 case: a newer Data RFED lead beats an older BOCA lead with 
   assert.equal(r.reason, 'assigned');
   assert.equal(w.contacts.get(rfed.ghl_contact_id).assignedTo, ROSS);
   assert.equal(w.opportunities.find((o) => o.id === 'o1').assignedTo, ROSS);
+});
+
+test('2d. an open card in a pipeline the partner cannot see is skipped, not a failure (the user, 2026-10-20)', async () => {
+  const w = world({
+    noAccess: ['o3'],
+    opps: [
+      { id: 'o1', contactId: 'cAAAAAAAAAAAAAAAAAA1', status: 'open', assignedTo: REECE },
+      { id: 'o3', contactId: 'cAAAAAAAAAAAAAAAAAA1', status: 'open', assignedTo: REECE, pipelineId: '1jIWe4Ad04oJtYE9UuXq' },
+    ],
+  });
+  const r = await syncPartnerOwner(lead(), { prevRow: null, deps: w.deps });
+  assert.equal(r.reason, 'assigned');
+  assert.equal(w.contacts.get('cAAAAAAAAAAAAAAAAAA1').assignedTo, ROSS);
+  assert.equal(w.opportunities.find((o) => o.id === 'o1').assignedTo, ROSS);
+  assert.equal(w.opportunities.find((o) => o.id === 'o3').assignedTo, REECE, 'the card he cannot see keeps its owner');
+  const row = logRows(w).at(-1);
+  assert.equal(row.reason, 'assigned');
+  assert.deepEqual(row.detail.opportunities_skipped_no_pipeline_access, [{ id: 'o3', pipeline_id: '1jIWe4Ad04oJtYE9UuXq' }]);
+  assert.match(w.slack.at(-1).text, /PARTNER LEAD ASSIGNED/);
+});
+
+test('2e. a failed pass on a no-access card heals on the next pass after this fix', async () => {
+  const failedRow = { lp_lead_id: '600001', ghl_contact_id: 'cAAAAAAAAAAAAAAAAAA1', reason: 'failed', planned_target: ROSS,
+    from_owner: REECE, created_at: '2026-10-21T14:58:00Z' };
+  const w = world({ owner: ROSS, log: [failedRow], assignments: [ours()], noAccess: ['o1'] });
+  const r = await syncPartnerOwner(lead(), { prevRow: lead(), deps: w.deps });
+  assert.equal(r.reason, 'assigned');
+  assert.equal(logRows(w).at(-1).reason, 'assigned');
 });
 
 test('3. an old lead whose branch changes INTO RFED after go-live → Ross, and stays Ross on later passes', async () => {
