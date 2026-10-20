@@ -357,6 +357,7 @@ import { registerLpIdentityFillRoutes } from './admin/lp-identity-fill.js';  // 
 import { startPostIssueRetryScheduler } from './jobs/post-issue-rebook-retry.js';  // 2026-10-09
 import { registerLeadLeakRoutes, startLeadLeakScheduler, startLeadUncalledScheduler } from './jobs/lead-leak-monitor.js';  // 2026-09-26
 import { startChatLeadIntakeScheduler } from './jobs/chat-lead-intake-sweep.js';  // 2026-09-28
+import { startChatReturnLeadScheduler } from './jobs/chat-return-lead-sweep.js';  // 2026-10-19
 import { startCanvassBackstopScheduler } from './jobs/canvass-lead-backstop.js';  // 2026-09-28
 import { startDncReentryScheduler } from './jobs/dnc-reentry-sweep.js';  // 2026-10-01
 import { startDncLiftReportScheduler } from './consent/dnc-lift-report.js';  // 2026-10-02
@@ -1055,6 +1056,7 @@ const server = app.listen(PORT, async () => {
   startLeadLeakScheduler();
   startLeadUncalledScheduler();
   startChatLeadIntakeScheduler();
+  startChatReturnLeadScheduler();
   startLiveChatMissedReplyScheduler();
   startMissedInboundScheduler();
   startLiveChatSummaryScheduler();

@@ -81,10 +81,6 @@ export const MODES = Object.freeze([
     since: '2026-08-31', goLive: LIVE_BY_DEFAULT,
     note: 'The NEPQ questioning block in the reply prompt; "off" removes it.',
   }),
-  m('PROMPT_NEPQ_CLEANUP_MODE', 'bot', 'enum', OL, 'off', OL_S, {
-    since: '2026-10-10',
-    note: 'Removes the old NEPQ prompt lines the planner now owns.',
-  }),
   m('SMS_LENGTH_GUARD_MODE', 'bot', 'enum', OSL, 'shadow', OSL_S, {
     since: '2026-10-10',
     note: 'Holds an SMS reply to the length limit.',
@@ -277,6 +273,10 @@ export const MODES = Object.freeze([
   m('CHAT_LP_INTAKE_MODE', 'intake', 'enum', OSL, 'shadow', OSL_S, {
     since: '2026-09-28', evidence: job('chat-lead-intake'),
     note: 'Sends chat leads to LP.',
+  }),
+  m('CHAT_RETURN_LP_MODE', 'intake', 'enum', OSL, 'live', OSL_S, {
+    since: '2026-10-19', decider: 'the user', evidence: job('chat-return-lead'), goLive: LIVE_BY_DEFAULT,
+    note: 'A lead added 15+ days ago whose newest LP lead is 15+ days old (or none) and who talks to the chatbot (website chat, or a text answered by the SMS bot) gets a new LP lead with source Reece ChatBot (830 / 5574). Default live by the user\'s ruling of 2026-10-19.',
   }),
   m('INTAKE_JOURNAL_MODE', 'intake', 'enum', OSL, 'shadow', OSL_S, {
     since: '2026-09-11',

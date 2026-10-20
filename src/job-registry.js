@@ -663,6 +663,18 @@ export const JOBS = Object.freeze([
     isEnabled: (env) => String(env.CHAT_LP_INTAKE_MODE || 'shadow').toLowerCase().trim() !== 'off',
   },
   {
+    id: 'chat-return-lead',
+    label: 'Returning leads who used the chatbot → new LP lead (Reece ChatBot)',
+    group: 'five9',
+    cadence: 'every 15 min',
+    enabledEnv: 'CHAT_RETURN_LP_MODE',
+    // A MODE (2026-10-19): off | shadow | live, default LIVE (the user's ruling:
+    // a lead 15+ days old who chats goes back to LP as Reece ChatBot). Mirrors
+    // chatReturnMode() in src/chat-return-lead.js.
+    enabledDefault: true,
+    isEnabled: (env) => String(env.CHAT_RETURN_LP_MODE || 'live').toLowerCase().trim() !== 'off',
+  },
+  {
     id: 'canvass-lead-backstop',
     label: 'Canvass leads GHL never delivered',
     group: 'five9',

@@ -26,6 +26,18 @@ import { prospectLabel } from '../format-helpers.js';
 import { callCenterLineKind, HOLD_MARKET } from './allocation.js';
 
 const LOG = '[MktHold]';
+
+/**
+ * LP branch markets that are not offices of their own fold into the office
+ * that runs them (the user, 2026-10-19: "fold Boca and Miami into Fort
+ * Lauderdale"). A matched lead's branch, resolved market or zip can still read
+ * BOCA_MKT / MIAMI_MKT, and 21 held feed days placed on 2026-10-19 named those
+ * codes: Boca and Miami got their own gray "Other markets" bar, and on a day
+ * that also named other offices Fort Lauderdale got $0 (no issued leads under
+ * BOCA_MKT). The same aliases as MARKET_ALIASES in src/slack.js.
+ */
+const OFFICE_ALIASES = { BOCA_MKT: 'FTLAU_MKT', MIAMI_MKT: 'FTLAU_MKT', RFED_MKT: 'FTLAU_MKT', LAKE_MKT: 'ORL_MKT' };
+export const officeMarket = (code) => (code ? OFFICE_ALIASES[code] || code : code);
 const digits = (s) => String(s || '').replace(/\D/g, '');
 const HELD_TERRITORIES = ['unknown', 'out of area'];
 
@@ -94,7 +106,7 @@ export async function matchHeldLeads(date, { supabase = supabaseDefault } = {}) 
         const code = String(assigned?.[0]?.resolved_market_code || '');
         if (/_MKT$/.test(code)) market = code;
       }
-      out.push({ lead_id: lead.lead_id, market, reason: `matched LP ${prospectLabel(hit.lp_prospect_id)}, branch ${hit.lp_branch_id || '?'}` });
+      out.push({ lead_id: lead.lead_id, market: officeMarket(market), reason: `matched LP ${prospectLabel(hit.lp_prospect_id)}, branch ${hit.lp_branch_id || '?'}` });
       continue;
     }
     const zip = digits(lead.zip_code).slice(0, 5);
@@ -102,7 +114,7 @@ export async function matchHeldLeads(date, { supabase = supabaseDefault } = {}) 
       const { data } = await supabase.from('service_area_zips').select('zip, market_code').eq('zip', zip).limit(1);
       if (data?.length) {
         const code = String(data[0].market_code || '');
-        const market = /_MKT$/.test(code) ? code : `${code}_MKT`;
+        const market = officeMarket(/_MKT$/.test(code) ? code : `${code}_MKT`);
         out.push({ lead_id: lead.lead_id, market, reason: `zip ${zip} in ${market} service area` });
         continue;
       }
@@ -173,7 +185,10 @@ const cents = (n) => Math.round(Number(n || 0) * 100);
 /** Pure: the offices a day's matched held leads point at, most leads first (none = []). */
 export function marketsFromMatches(matches = []) {
   const counts = {};
-  for (const m of matches) if (m?.market) counts[m.market] = (counts[m.market] || 0) + 1;
+  for (const m of matches) {
+    const market = officeMarket(m?.market);
+    if (market) counts[market] = (counts[market] || 0) + 1;
+  }
   return Object.entries(counts).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).map(([m]) => m);
 }
 

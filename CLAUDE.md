@@ -450,8 +450,11 @@ the one exception, below).
 - **ND and No Demo = disqualified, an end state.** Rule `LP_DISP_DISQUALIFIED` (replaces `LP_DISP_NO_DEMO`'s rebook
   route) queues `disqualified_cleanup` (`src/actions/handlers/disqualified-cleanup.js`): every open estimate →
   `mark_invalid`, out of S5.x / S4.5 / W-series, tag `lp-disqualified`, P3 Hard Disqualified, one Five9 removal over every
-  outbound list. The removal needs approval unless `DISQUALIFIED_FIVE9_AUTO_REMOVE=true` (the BOOKED_ROUTING_AUTO_REMOVE
-  pattern, keyed on the rule; Mark flips it). The S5.2 gate and rule 171 (`lp_disposition_not_in`) refuse them up front.
+  outbound list. **The removal runs without a click (the user, 2026-10-19: "the updates are occurring correctly each
+  time")**, keyed on the rule like BOOKED_ROUTING_AUTO_REMOVE; `DISQUALIFIED_FIVE9_AUTO_REMOVE=false` is the rollback to
+  approval cards. Where the card posted, ONE no-button notice says the LP disposition and that the number is off every
+  dialing list (`src/notifications/disqualified-removed.js`, approvals channel; only after a real removal, never a dry run
+  or an approved card; a failed post is an #ops-alerts line). The S5.2 gate and rule 171 (`lp_disposition_not_in`) refuse them up front.
 - **`invalid` is the no-notification kill status** (`src/appointments/mark-invalid.js`): status `invalid` (never
   `cancelled`, which fires cancel / rebook), then A.WE-1 removed, then the reminder tags off. The watchdog treats an
   `invalid` row at LP's slot as SETTLED: never restored, never re-created over, never flagged.
@@ -949,6 +952,21 @@ then LP live by phone (`findExistingLpLead`, exported from lp-lead.js) when thos
 February's and 5% of April's leads. A failed read is `unverified`, never "no lead". 8e30ff37 skips any contact whose LP
 Lead ID is filled ("Already Sent to LP?"), so a returning caller's old id is cleared, read back and noted on the contact
 right before the enrollment (`clearOldLeadId`); one that will not clear is not sent.
+
+**A chat lead reaches LP as Reece ChatBot, and a returning lead who chats gets a new one (the user, 2026-10-19).**
+"Any lead … created by the Chat Widget … sent to lead perfection with the Reece Chatbot as the source. Any lead … over
+15 days old and engages with the chatbot then should be sent back … with the Reece Chatbot as the new source." New chat
+contacts: rule 386 pins `srs_id 830 / pro_id 5574` (`sql/seeds/2026-10-19_chat_lead_reece_chatbot_source.sql`) and the
+chat-lead intake sweep stamps them (read back) before enrolling. Returning leads: job `chat-return-lead`
+(`src/jobs/chat-return-lead-sweep.js`, rules in `src/chat-return-lead.js`, every 15 min, `CHAT_RETURN_LP_MODE`
+off|shadow|live, default live by that ruling) takes a quiet (60 min) conversation with the chatbot on a contact added 15+
+days before it: a `LIVE_CHAT_FAST_LANE` turn, or an SMS bot reply to the lead's own text (the user, same day: "I want the
+chatbot replies and the text message replies to the bot to be counted"; a completed SMS `send_message` whose event is
+`ai.analysis_completed` / `agentic.reply_unanswered`, never a `DQ_*` reply or POST_BOOKING_EMAIL_ASK), runs the inbound capture's lead match (`readLeadMatch`: a lead from the last 15 days, an open inquiry or
+an older lead worked for this chat is theirs, nothing made), then stamps 830 / 5574 OVER the old source (read back),
+clears the old LP Lead ID (`clearOldLeadId`, read back, a note) and enrolls 8e30ff37. Never a sold customer, a live
+visit (Set/Cnf/Issue today or later), a rehash lead (`rehash` / `active-f.0`, a demo in 30 days) or an opt-out tag;
+once per contact per 15 days (`chat-return:<id>`), each chat decided once (`chat-return-seen:`). No card.
 
 **Every LP sale gets a P2 card, even when LP's webhook does not arrive (2026-10-03).** A P2 (Client
 Lifecycle) card is built only by LP's outbound webhook → GHL I.LP-IN (adds `deal-won`) → C.0-IN (P1 Sale
