@@ -265,6 +265,12 @@ async function openOpportunities(d, contactId) {
   return (res?.opportunities || []).filter((o) => String(o.status || 'open').toLowerCase() === 'open');
 }
 
+// GHL refuses an owner who cannot see the opportunity's pipeline ("Can not make this user … owner as User does not
+// have permission to access this pipeline …"): Ross has no access to "3. Recycle, Lost, Deferred …", so the RFED test
+// contact's one open card there failed every retry (2026-10-20). The user's ruling: skip a pipeline the partner cannot
+// see. The card keeps its owner, is listed as skipped, and is not a failure.
+export const PIPELINE_ACCESS_RX = /does not have permission to access this pipeline/i;
+
 /** PUT the owner on the contact and every open opportunity, reading each back. */
 async function applyOwner(d, contactId, target) {
   await d.ghlFetch('PUT', `/contacts/${contactId}`, { assignedTo: target });
@@ -275,6 +281,7 @@ async function applyOwner(d, contactId, target) {
   const opps = await openOpportunities(d, contactId);
   const done = [];
   const failed = [];
+  const skipped = [];
   for (const o of opps) {
     if (String(o.assignedTo || '') === target) { done.push(o.id); continue; }
     try {
@@ -283,10 +290,11 @@ async function applyOwner(d, contactId, target) {
       if (String(back?.assignedTo || '') !== target) throw new Error(`GHL kept owner ${back?.assignedTo || 'none'}`);
       done.push(o.id);
     } catch (err) {
-      failed.push({ id: o.id, error: err.message });
+      if (PIPELINE_ACCESS_RX.test(err.message)) skipped.push({ id: o.id, pipeline_id: o.pipelineId || null });
+      else failed.push({ id: o.id, error: err.message });
     }
   }
-  return { opportunities: done, opportunity_failures: failed, contact: after };
+  return { opportunities: done, opportunity_failures: failed, opportunities_skipped: skipped, contact: after };
 }
 
 /**
@@ -488,7 +496,10 @@ async function decideAndApply(d, cfg, lead, prevRow, dryRun) {
   }
   await writeLog(d, {
     ...base, reason, from_owner: from, to_owner: target, partner_name: partnerName,
-    detail: { opportunities: applied.opportunities, eligibility, deciding_lead: String(deciding.lp_lead_id) },
+    detail: {
+      opportunities: applied.opportunities, eligibility, deciding_lead: String(deciding.lp_lead_id),
+      ...(applied.opportunities_skipped.length ? { opportunities_skipped_no_pipeline_access: applied.opportunities_skipped } : {}),
+    },
   });
   const card = await postCard(d, { reason, lead: deciding, target, contact: applied.contact || contact, partnerName, toLabel, fromLabel });
   d.log(`[PartnerOwner] ${reason}: contact ${lead.ghl_contact_id} ${from || 'none'} → ${target} (${applied.opportunities.length} open opportunit${applied.opportunities.length === 1 ? 'y' : 'ies'})`);
