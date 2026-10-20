@@ -1135,9 +1135,11 @@ write to LP, never a messaging, tag or workflow change. The mapping is data (`pa
 an exact branch + rep row beats the branch-only row; migration `20261020200000_partner_owner_sync.sql`). The decision is
 `syncPartnerOwner` (`src/partners/owner-sync.js`), called by `processProspect` after every lead write (a branch or rep
 change now always writes the row) and by job `partner-fast-poll` (every `PARTNER_POLL_MS`, 90 s: LP changes since its own
-cursor, filtered locally to partner branches, plus retries of `failed` / `no_ghl_contact`). Rules: the contact's CURRENT
-lead decides (`pickCurrentLead`; the user, 2026-10-20); only leads created after `PARTNER_GO_LIVE_AT`, moved into the
-branch after it, or already aimed at a partner count (no backfill of older RFED leads); with no match the owner changes
+cursor, filtered locally to partner branches, plus retries of `failed` / `no_ghl_contact`). Rules: the contact's NEWEST-CREATED
+lead decides (`newestLead`, never `pickCurrentLead`, whose Data shadow let an older BOCA ND lead outrank the RFED test
+lead 583364; the user, 2026-10-20); a lead counts when created after `PARTNER_GO_LIVE_AT`, moved into the branch, CHANGED
+by LP after go-live (the user, 2026-10-20: "If we assign it RFED, it should go to Ross"; the branch decides, never the
+zip), or already aimed at a partner (RFED leads LP has not touched since go-live stay as they are); with no match the owner changes
 only for a contact THIS code assigned (an open `partner_owner_assignments` row, written before the GHL write, released
 on the return) whose owner is still that partner, and returns it to the Reece team user 3K6HtoPyBLWeQrrnSnCD (handoff v3,
 2026-10-20); an internal owner is never touched; a dispositioned lead that stays in the branch keeps the partner.

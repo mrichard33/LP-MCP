@@ -22,6 +22,7 @@ const ENV = {
 const MAP = [{ id: 'm1', partner_name: 'Ross Erstling', lp_branch_id: 'RFED', lp_rep_name: null, ghl_user_id: ROSS, active: true }];
 const NEW_LEAD_AT = '2026-10-21T10:00:00+00:00'; // stored ET wall clock, after go-live
 const OLD_LEAD_AT = '2026-10-13T17:08:37+00:00'; // before go-live
+const OLD = { created_at_lp: OLD_LEAD_AT, updated_at_lp: '2026-10-14T09:00:00+00:00' }; // and LP has not touched it since
 
 function lead(over = {}) {
   return {
@@ -112,22 +113,46 @@ test('1. a new RFED lead, any rep → Ross owns the contact and its open opportu
   assert.equal(a[0].released_at, null);
 });
 
-test('2. an RFED lead created before go-live, branch unchanged → untouched', async () => {
-  const w = world({ leads: [lead({ created_at_lp: OLD_LEAD_AT })] });
-  const prev = lead({ created_at_lp: OLD_LEAD_AT });
-  const r = await syncPartnerOwner(lead({ created_at_lp: OLD_LEAD_AT }), { prevRow: prev, deps: w.deps });
+test('2. an RFED lead created before go-live and not changed since → untouched', async () => {
+  const w = world({ leads: [lead(OLD)] });
+  const prev = lead(OLD);
+  const r = await syncPartnerOwner(lead(OLD), { prevRow: prev, deps: w.deps });
   assert.equal(r.reason, 'skipped_pre_golive');
   assert.equal(r.would_assign_if_eligible, ROSS);
   assert.equal(w.writes.length, 0);
   assert.equal(w.slack.length, 0);
   assert.equal(logRows(w).at(-1).reason, 'skipped_pre_golive');
   // A second pass does not grow the log.
-  await syncPartnerOwner(lead({ created_at_lp: OLD_LEAD_AT }), { prevRow: prev, deps: w.deps });
+  await syncPartnerOwner(lead(OLD), { prevRow: prev, deps: w.deps });
   assert.equal(logRows(w).length, 1);
 });
 
+test('2b. an RFED lead created before go-live that LP changed after it → Ross (the user: "If we assign it RFED, it should go to Ross")', async () => {
+  const old = lead({ created_at_lp: OLD_LEAD_AT, updated_at_lp: '2026-10-20T18:39:43+00:00' });
+  const w = world({ leads: [old] });
+  // The move into RFED was never seen by a pass (prev already RFED): LP's change stamp decides.
+  const plan = await syncPartnerOwner(old, { prevRow: old, dryRun: true, deps: w.deps });
+  assert.equal(plan.eligibility, 'changed_after_go_live');
+  assert.equal(plan.target, ROSS);
+  const r = await syncPartnerOwner(old, { prevRow: old, deps: w.deps });
+  assert.equal(r.reason, 'assigned');
+  assert.equal(w.contacts.get(old.ghl_contact_id).assignedTo, ROSS);
+});
+
+test('2c. the 583364 case: a newer Data RFED lead beats an older BOCA lead with a recent visit (no Data shadow)', async () => {
+  const rfed = lead({ lp_lead_id: '583364', created_at_lp: OLD_LEAD_AT, updated_at_lp: '2026-10-20T18:39:43+00:00',
+    disposition_code: 'Data', appointment_date: null, rep_name: 'Erstling, Ross' });
+  const boca = lead({ lp_lead_id: '576867', lp_branch_id: 'BOCA', rep_name: null, created_at_lp: '2026-09-17T16:54:29+00:00',
+    updated_at_lp: '2026-10-02T18:47:44+00:00', disposition_code: 'ND', appointment_date: '2026-10-03T14:00:00+00:00' });
+  const w = world({ leads: [rfed, boca] });
+  const r = await syncPartnerOwner(rfed, { prevRow: rfed, deps: w.deps });
+  assert.equal(r.reason, 'assigned');
+  assert.equal(w.contacts.get(rfed.ghl_contact_id).assignedTo, ROSS);
+  assert.equal(w.opportunities.find((o) => o.id === 'o1').assignedTo, ROSS);
+});
+
 test('3. an old lead whose branch changes INTO RFED after go-live → Ross, and stays Ross on later passes', async () => {
-  const old = lead({ created_at_lp: OLD_LEAD_AT });
+  const old = lead(OLD);
   const w = world({ leads: [old] });
   const r = await syncPartnerOwner(old, { prevRow: { ...old, lp_branch_id: 'BOCA' }, deps: w.deps });
   assert.equal(r.reason, 'assigned');

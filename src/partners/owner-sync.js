@@ -9,14 +9,19 @@
 // permission keys on the owner.
 //
 // The rules, in the order they are applied:
-//   1. The contact's CURRENT lead decides (pickCurrentLead, src/current-lead.js; the
-//      user, 2026-10-20). A returning homeowner's old BOCA lead must never flip the
-//      owner back while a new RFED lead is live, and vice versa.
-//   2. A matching lead counts only when it is NEW: created at or after
-//      PARTNER_GO_LIVE_AT, or its branch changed INTO a partner branch in this pass, or
-//      an earlier decision already aimed it at a partner (so a lead that moved in
-//      after go-live stays the partner's, and a failed write is retried). The 314
-//      older RFED leads are never touched (no backfill).
+//   1. The contact's NEWEST-CREATED lead decides (newestLead; the user, 2026-10-20).
+//      A returning homeowner's old BOCA lead must never flip the owner back while a
+//      new RFED lead is live, and vice versa. Not pickCurrentLead: its Data-shadow
+//      rule (a Data lead yields to a lead with a recent visit) is for F.0 and the
+//      disposition field, and it let BOCA ND lead 576867 outrank the newer RFED test
+//      lead 583364, so the contact never went to Ross (2026-10-20).
+//   2. A matching lead counts when it is NEW (created at or after PARTNER_GO_LIVE_AT),
+//      its branch changed INTO a partner branch in this pass, LP CHANGED it after
+//      go-live (the user, 2026-10-20: "If we assign it RFED, it should go to Ross";
+//      putting a lead in RFED stamps updated_at_lp, so a move a pass never saw still
+//      counts), or an earlier decision already aimed it at a partner (a failed write
+//      is retried). RFED leads LP has not touched since go-live are never touched.
+//      The branch decides, never the zip or the location.
 //   3. No match: the owner is returned ONLY for a contact THIS code assigned (an open
 //      partner_owner_assignments row) and whose GHL owner is still that partner
 //      (handoff v3, Mark 2026-10-20). An internal owner is never changed (rule 8).
@@ -41,7 +46,6 @@
 import {
   loadPartnerMap, matchPartnerRow, partnerUserIds, allPartnerBranches, partnerNameForUser,
 } from './owner-resolver.js';
-import { pickCurrentLead } from '../current-lead.js';
 import { lpStoredToUtcMs, lpStoredToUtcIso } from '../lp-dates.js';
 import { formatEt } from '../approval-card.js';
 import { prospectLabel } from '../format-helpers.js';
@@ -57,6 +61,14 @@ const CARD_REASONS = new Set(['assigned', 'reassigned', 'returned', 'failed']);
 const QUIET_REPEAT = new Set(['noop', 'skipped_pre_golive', 'skipped_not_ours', 'no_ghl_contact']);
 
 const norm = (v) => (v == null ? '' : String(v).trim().toLowerCase());
+
+const lpMs = (v) => { const ms = lpStoredToUtcMs(v); return Number.isFinite(ms) ? ms : 0; };
+/** The newest-created lead (tie: the most recently updated), the order of current-lead.js without its Data shadow. Pure. */
+export function newestLead(leads) {
+  if (!Array.isArray(leads) || leads.length === 0) return null;
+  return [...leads].sort((a, b) => (lpMs(b.created_at_lp) - lpMs(a.created_at_lp))
+    || (lpMs(b.updated_at_lp) - lpMs(a.updated_at_lp)))[0];
+}
 
 /** { enabled, reason, goLiveMs, defaultOwner } — off unless PARTNER_GO_LIVE_AT parses. */
 export function partnerSyncConfig(env = process.env) {
@@ -353,7 +365,7 @@ async function decideAndApply(d, cfg, lead, prevRow, dryRun) {
   // Rule 1: the contact's current lead decides.
   const leads = await contactLeads(d, lead.ghl_contact_id);
   if (!leads.some((l) => String(l.lp_lead_id) === String(lead.lp_lead_id))) leads.push(lead);
-  const current = pickCurrentLead(leads) || lead;
+  const current = newestLead(leads) || lead;
   const isCurrent = String(current.lp_lead_id) === String(lead.lp_lead_id);
   // The lead just written is fresher than the row read back on a skip path.
   const deciding = isCurrent ? { ...current, ...lead } : current;
@@ -369,9 +381,12 @@ async function decideAndApply(d, cfg, lead, prevRow, dryRun) {
     const createdMs = lpStoredToUtcMs(deciding.created_at_lp);
     const newLead = Number.isFinite(createdMs) && Number.isFinite(cfg.goLiveMs) && createdMs >= cfg.goLiveMs;
     const movedIn = isCurrent && branchChanged && matchPartnerRow(rows, lead) != null;
+    const changedMs = lpStoredToUtcMs(deciding.updated_at_lp);
+    const changedAfter = Number.isFinite(changedMs) && Number.isFinite(cfg.goLiveMs) && changedMs >= cfg.goLiveMs;
     const aimedBefore = decidingHistory.some((h) => partnerIds.has(String(h.to_owner || ''))
       || partnerIds.has(String(h.planned_target || '')));
-    eligibility = newLead ? 'new_lead' : movedIn ? 'branch_changed_in' : aimedBefore ? 'previously_assigned' : null;
+    eligibility = newLead ? 'new_lead' : movedIn ? 'branch_changed_in' : changedAfter ? 'changed_after_go_live'
+      : aimedBefore ? 'previously_assigned' : null;
     if (!eligibility) {
       const out = {
         ok: true, reason: 'skipped_pre_golive', partner_name: match.partner_name,
