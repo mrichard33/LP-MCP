@@ -126,7 +126,7 @@ test('empty and default input return null', () => {
 });
 
 test('TIE_BREAK covers exactly the ranked milestones', () => {
-  const ranked = ['M', 'R', 'H', 'U', 'P', 'K', 'G', 'S', 'F', 'C', 'I', 'B'];
+  const ranked = ['H', 'M', 'R', 'U', 'P', 'K', 'G', 'S', 'F', 'C', 'I', 'B'];
   assert.deepStrictEqual([...__testing.TIE_BREAK].sort(), [...ranked].sort());
   // Every ranked milestone has a real ordinal; no ranked milestone is 0.
   for (const m of ranked) assert.ok(milestoneOrdinal(m) > 0, `${m} should be ranked`);
@@ -147,4 +147,14 @@ test('unknown mdt_id is ordinal 0 and never wins', () => {
     selectFurthestMilestone([{ mdtId: 'ZZ', actDateEt: '2026-08-16' }, { mdtId: 'M', actDateEt: '2024-01-01' }]),
     'M',
   );
+});
+
+test('2026-10-20: RTP and HOA Approved on the same day emit RTP (H only tags since 2026-09-20)', () => {
+  const fires = [{ mdtId: 'R', actDateEt: '2026-10-05' }, { mdtId: 'H', actDateEt: '2026-10-05' }];
+  assert.strictEqual(selectFurthestMilestone(fires), 'R');
+  assert.strictEqual(selectFurthestMilestone([...fires].reverse()), 'R');
+  // H loses to every milestone that moves the card, even Measure.
+  assert.strictEqual(selectFurthestMilestone([{ mdtId: 'H', actDateEt: '2026-10-09' }, { mdtId: 'M', actDateEt: '2026-10-01' }]), 'M');
+  // Alone, H still emits, so rule 114 still adds its tag.
+  assert.strictEqual(selectFurthestMilestone([{ mdtId: 'H', actDateEt: '2026-10-05' }]), 'H');
 });
