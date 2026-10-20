@@ -39,6 +39,8 @@ import { turnKeyFor } from '../agentic/turn-key.js';
 import { createMemoryStageStore, recordStage, recordBookedStage } from '../services/lead-stage-io.js';
 import { leadStageMode } from '../agentic/lead-stage.js';
 import { runWithSimOverrides } from './sim-overrides.js';
+import { revinThreadEnabled, mergeRevinTurns, simRevinFixture } from '../revin/thread.js';
+import { readRevinTurns } from '../revin/thread-read.js';
 import { captureChatIdentity } from '../live-chat/identity-capture.js';
 
 export const SIM_CONTACT_PREFIX = 'sim-';
@@ -350,6 +352,8 @@ export async function simulateLiveChat(plan, { nepqMode = 'live', productionDeps
     warn: (line) => { if (!/simulated: no lead record/.test(String(line))) record('warning', { line: String(line).slice(0, 300) }); },
     fetchContact: realContact ? productionDeps.fetchContact : async () => ({ id: contactId, firstName: persona.firstName, lastName: persona.lastName, phone: persona.phone, email: persona.email, postalCode: persona.postalCode, tags: [] }),
     fetchMessages: async () => thread.map(m => ({ direction: m.direction, body: m.text, dateAdded: m.at })),
+    // 2026-10-19: include_revin_thread. A real contact reads its real Revin rows; a simulated one gets the fixture.
+    revinTurns: async () => (!revinThreadEnabled() ? [] : realContact ? readRevinTurns(realContact) : simRevinFixture(nowMs, persona.firstName)),
     findConversation: async () => 'sim-conversation',
     buildContext: realContact ? productionDeps.buildContext : async () => { throw new Error('simulated: no lead record'); },
     sendMessage: async ({ message }) => { sent.push(message); return { messageId: `sim-msg-${sent.length}`, method: 'simulated' }; },
@@ -472,6 +476,8 @@ export async function simulateSms(plan, { nepqMode = 'live', generate, buildReal
   // A real contact's record, read once (dry run: nothing is written to it).
   const realBase = plan.contactId && buildRealContext ? await buildRealContext(plan.contactId) : null;
   const p = plan.persona;
+  // 2026-10-19: include_revin_thread (src/revin/thread.js), read once like realBase.
+  const revinTurns = !revinThreadEnabled() ? [] : plan.contactId ? await readRevinTurns(plan.contactId) : simRevinFixture(nowMs, p.firstName);
   const contact = { firstName: /^guest$/i.test(p.firstName || '') ? null : p.firstName, lastName: /^guest$/i.test(p.firstName || '') ? null : p.lastName, phone: p.phone || '+15555550100', email: p.email, postalCode: p.postalCode, tags: Array.isArray(p.tags) ? [...p.tags] : [] };
   const thread = [];
   const transcript = [];
@@ -513,7 +519,7 @@ export async function simulateSms(plan, { nepqMode = 'live', generate, buildReal
     const turnKey = turnKeyFor({ messageId: `sim-${i}${burstTexts ? `-${burstTexts.length - 1}` : ''}` });
     lastTurnKey = turnKey;
     const claim = await claimTurn({ contactId, turnKey, ownerRule: 'AGENTIC_RESPOND_POST_CHATBOT', channel: 'sms', ownerActionId: `sim-${i}` }, { ...lockDeps, nowMs: Date.parse(at) });
-    const context = { ...(realBase || withPersonaLp(minimalContext({ contactId, contact, nowMs: nowMs + i * 60000 }), p)), conversation_recent: thread.slice(-20) };
+    const context = { ...(realBase || withPersonaLp(minimalContext({ contactId, contact, nowMs: nowMs + i * 60000 }), p)), conversation_recent: mergeRevinTurns(thread.slice(-20), revinTurns) };
     const t0 = Date.now();
     let generated = null;
     let error = null;
@@ -602,11 +608,17 @@ export async function simulateSms(plan, { nepqMode = 'live', generate, buildReal
 }
 
 /** Run one scenario on the channels it applies to. */
-export async function runSimulation({ scenario, turns, persona, title, contactId = null, channel = 'both', nepqMode = 'live', leadStageMode = null, kbExemplarMode = null, turnLockMode: lockMode = null }, deps) {
-  // KB_EXEMPLAR_MODE for this run only (2026-10-12); null = Railway's value.
-  if (kbExemplarMode) {
-    const results = await runWithSimOverrides({ kbExemplarMode }, () => runSimulation({ scenario, turns, persona, title, contactId, channel, nepqMode, leadStageMode, turnLockMode: lockMode }, deps));
-    return results.map(r => ({ ...r, kb_exemplar_mode: kbExemplarMode }));
+export async function runSimulation({ scenario, turns, persona, title, contactId = null, channel = 'both', nepqMode = 'live', leadStageMode = null, kbExemplarMode = null, includeRevinThread = null, turnLockMode: lockMode = null }, deps) {
+  // KB_EXEMPLAR_MODE (2026-10-12) and BOT_INCLUDE_REVIN_THREAD (2026-10-19) for
+  // this run only; null = Railway's value. One wrap: a second store.run would
+  // replace the first.
+  if (kbExemplarMode || typeof includeRevinThread === 'boolean') {
+    const results = await runWithSimOverrides({ kbExemplarMode, includeRevinThread }, () => runSimulation({ scenario, turns, persona, title, contactId, channel, nepqMode, leadStageMode, turnLockMode: lockMode }, deps));
+    return results.map(r => ({
+      ...r,
+      ...(kbExemplarMode ? { kb_exemplar_mode: kbExemplarMode } : {}),
+      ...(typeof includeRevinThread === 'boolean' ? { include_revin_thread: includeRevinThread } : {}),
+    }));
   }
   const plan = resolveScenario({ scenario, turns, persona, title, contactId });
   const allowed = plan.channels || ['livechat', 'sms'];

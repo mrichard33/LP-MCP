@@ -150,6 +150,7 @@ import {
 import { marketTimezone, tzLabel } from '../config/market-timezones.js';
 import { phoneFromText } from './missed-replies.js';
 import { openerHoldMode } from '../jobs/no-reply-followup.js';
+import { mergeRevinTurns } from '../revin/thread.js';  // 2026-10-19
 import {
   planCancelTurn,
   pickAppointment,
@@ -678,6 +679,7 @@ export function createLiveChatFastLane(deps) {
     captureIdentity: async () => null,
     findConversation: async () => null,
     recentTurns: async () => [],
+    revinTurns: async () => [],
     checkServiceArea: async () => ({ checked: false }),
     lookupPlace: async () => ({ checked: false }),
     zoneForZip: async () => null,
@@ -1012,7 +1014,7 @@ export function createLiveChatFastLane(deps) {
     // The cap runs from when the reads started (processInbound), so the quiet
     // wait counts toward it.
     const readCap = Math.max(Math.min(250, d.contextCapMs()), d.contextCapMs() - (tReads != null ? d.now() - tReads : 0));
-    const [threadRes, ctxRes, ownRes, apptRes] = await Promise.all([
+    const [threadRes, ctxRes, ownRes, apptRes, revinRes] = await Promise.all([
       raceWithBudget(conversationId ? d.fetchMessages(conversationId) : Promise.resolve([]), d.contextCapMs() * 2),
       raceWithBudget(contextRead || Promise.resolve().then(() => d.buildContext(contactId)), readCap),
       // Our own record of this chat (2026-10-02, 5i59G): GHL's I.LVI webhook
@@ -1022,6 +1024,8 @@ export function createLiveChatFastLane(deps) {
       raceWithBudget(Promise.resolve().then(() => d.recentTurns(contactId)), RECENT_TURNS_CAP_MS),
       // Part 7: the chat sees the lead's appointments too (EXISTING APPOINTMENTS).
       raceWithBudget(appointmentsRead || Promise.resolve().then(() => d.fetchAppointments(contactId)), readCap),
+      // 2026-10-19: Revin's texts, only with BOT_INCLUDE_REVIN_THREAD=true (src/revin/thread-read.js).
+      raceWithBudget(Promise.resolve().then(() => d.revinTurns(contactId)), RECENT_TURNS_CAP_MS),
     ]);
     const upcomingAppointments = (!apptRes.timedOut && !apptRes.error && Array.isArray(apptRes.value)) ? apptRes.value : null;
     let context = (!ctxRes.timedOut && !ctxRes.error && ctxRes.value) ? ctxRes.value : minimalContext({ contactId, contact, nowMs: d.now() });
@@ -1037,6 +1041,11 @@ export function createLiveChatFastLane(deps) {
       const own = (!ownRes.timedOut && !ownRes.error && Array.isArray(ownRes.value)) ? ownRes.value : [];
       thread = normalizeThread(own.map(t => ({ direction: t.direction, body: t.text, dateAdded: t.timestamp })));
       if (thread.length) d.log(`[LiveChat] thread from our own rows for ${contactId} (${thread.length} turns)`);
+    }
+    // After the own-rows fallback, so Revin's texts never stand in for this chat's history.
+    if (thread.length) {
+      const revin = (!revinRes.timedOut && !revinRes.error && Array.isArray(revinRes.value)) ? revinRes.value : [];
+      thread = mergeRevinTurns(thread, revin, { cap: LIVE_CHAT_THREAD_LIMIT });
     }
     if (thread.length && (thread[thread.length - 1].direction !== 'inbound' || thread[thread.length - 1].text !== body)) {
       thread.push({ direction: 'inbound', channel: 'livechat', text: body, type: 'text', timestamp: timing.t0_inbound_received });

@@ -613,6 +613,8 @@ export function scoreRun(results, meta = {}) {
     scoring_version: SCORING_VERSION,
     lead_stage_mode: (results || []).find(r => r?.lead_stage_mode)?.lead_stage_mode || null,
     kb_exemplar_mode: (results || []).find(r => r?.kb_exemplar_mode)?.kb_exemplar_mode || null,
+    // 2026-10-19: set only when the run forced BOT_INCLUDE_REVIN_THREAD (true/false).
+    include_revin_thread: (results || []).find(r => typeof r?.include_revin_thread === 'boolean')?.include_revin_thread ?? null,
     ...meta,
     conversations: scored.length,
     passed,
@@ -762,7 +764,7 @@ export function formatScorecard(card, comparison = null) {
   const head = runs > 1
     ? `Scorecard (${runs} runs): ${card.passed}/${stable} stable conversations pass (${Math.round((card.pass_rate || 0) * 100)}%) · ${card.flaky || 0} flaky of ${card.conversations}`
     : `Scorecard: ${card.passed}/${card.conversations} conversations pass (${Math.round((card.pass_rate || 0) * 100)}%)`;
-  const lines = [`${head} · checks ${card.invariants_version}${card.prompt_version ? ` · prompt ${card.prompt_version}` : ''}${card.git_sha ? ` · ${String(card.git_sha).slice(0, 7)}` : ''}${card.kb_exemplar_mode ? ` · exemplars ${card.kb_exemplar_mode}` : ''}`];
+  const lines = [`${head} · checks ${card.invariants_version}${card.prompt_version ? ` · prompt ${card.prompt_version}` : ''}${card.git_sha ? ` · ${String(card.git_sha).slice(0, 7)}` : ''}${card.kb_exemplar_mode ? ` · exemplars ${card.kb_exemplar_mode}` : ''}${typeof card.include_revin_thread === 'boolean' ? ` · revin thread ${card.include_revin_thread ? 'on' : 'off'}` : ''}`];
   if (comparison) lines.push(comparison.worse === true ? `WORSE THAN LAST RUN: ${comparison.reasons.join('; ')}` : comparison.worse === false ? 'Not worse than the last run.' : `Not compared: ${comparison.reasons.join('; ')}`);
   for (const [fam, f] of Object.entries(card.pass_rate_by_family || {}).sort((a, b) => a[0].localeCompare(b[0]))) {
     lines.push(`  family ${fam}: ${f.passed}/${f.conversations} (${Math.round((f.pass_rate || 0) * 100)}%)`);

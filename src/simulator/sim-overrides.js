@@ -23,11 +23,19 @@ export const KB_EXEMPLAR_OVERRIDE_MODES = Object.freeze(['off', 'shadow', 'live'
 /** Run fn with these overrides in force. Unknown or empty values are ignored. */
 export function runWithSimOverrides(overrides, fn) {
   const kbExemplarMode = KB_EXEMPLAR_OVERRIDE_MODES.includes(overrides?.kbExemplarMode) ? overrides.kbExemplarMode : null;
-  if (!kbExemplarMode) return fn();
-  return store.run({ kbExemplarMode }, fn);
+  // 2026-10-19: BOT_INCLUDE_REVIN_THREAD for this run (src/revin/thread.js).
+  const includeRevinThread = typeof overrides?.includeRevinThread === 'boolean' ? overrides.includeRevinThread : null;
+  if (!kbExemplarMode && includeRevinThread == null) return fn();
+  return store.run({ kbExemplarMode, includeRevinThread }, fn);
 }
 
 /** The simulator's KB_EXEMPLAR_MODE for this run, or null outside one. */
 export function simKbExemplarMode() {
   return store.getStore()?.kbExemplarMode || null;
+}
+
+/** The simulator's BOT_INCLUDE_REVIN_THREAD for this run (true/false), or null outside one. */
+export function simIncludeRevinThread() {
+  const v = store.getStore()?.includeRevinThread;
+  return typeof v === 'boolean' ? v : null;
 }

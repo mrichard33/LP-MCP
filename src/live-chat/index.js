@@ -59,6 +59,7 @@ import { routeNepqHandoff } from '../agentic/nepq-handoff.js';
 import { addGHLNote } from '../ghl.js';
 import { enqueueNoReplyFollowup } from '../jobs/no-reply-followup.js';
 import { sendAsUserFor } from '../agentic/ai-sender.js';
+import { readRevinTurns } from '../revin/thread-read.js';
 
 async function fetchContact(contactId) {
   const res = await ghlFetch('GET', `/contacts/${contactId}`, null, { priority: 'high', maxWaitMs: 1500 });
@@ -476,6 +477,8 @@ export function productionLaneDeps() {
     fetchMessages,
     findConversation,
     recentTurns,
+    // 2026-10-19: [] unless BOT_INCLUDE_REVIN_THREAD=true (src/revin/thread-read.js).
+    revinTurns: (contactId) => readRevinTurns(contactId),
     buildContext: (contactId) => buildLeadContext(contactId, { includeConversation: false, skipCache: true }),
     recordOpenerHold: (a) => enqueueNoReplyFollowup(a),
     prewarmEmbedding: prewarmQueryEmbedding,

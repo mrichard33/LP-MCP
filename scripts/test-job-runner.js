@@ -443,7 +443,8 @@ test('the roster is unique, complete and shaped', () => {
   // 54 → 56 on 2026-10-15: time-change-lp-note-sweep, capacity-unfiled-alert (market capacity gate).
   // 56 → 58 on 2026-10-16: confirmation-pipeline-clock, confirmation-pipeline-sweep (4. Confirmation Pipeline).
   // 60 → 61 on 2026-10-19: chat-return-lead (returning leads who chat → a new Reece ChatBot LP lead).
-  assert.equal(JOBS.length, 61);
+  // 61 → 62 on 2026-10-19: revin-relink (the Revin webhook's retry / re-link / alert pass).
+  assert.equal(JOBS.length, 62);
   for (const j of JOBS) {
     assert.match(j.id, /^[a-z0-9-]+$/, `${j.id} should be a slug`);
     assert.ok(j.label && j.group && j.cadence, `${j.id} needs a label, group and cadence`);

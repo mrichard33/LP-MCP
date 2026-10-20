@@ -16,6 +16,9 @@ export const NOT_NULL = Object.freeze({
   marketing_invoice_skips: ['sha256', 'reason'],
   // 2026-10-16: supabase/migrations/20261016180000_confirmation_pipeline.sql.
   confirmation_opportunities: ['lp_lead_id', 'ghl_contact_id', 'stage_key', 'last_moved_by'],
+  // 2026-10-19: supabase/migrations/20261019200000_revin_contact_messages.sql.
+  revin_events_raw: ['payload_hash', 'process_status'],
+  contact_messages: ['source', 'channel', 'direction', 'dedupe_key'],
 });
 
 function notNullViolation(table, rows) {
