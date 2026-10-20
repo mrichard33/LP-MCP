@@ -250,10 +250,20 @@ export async function reallocateMonth(month, deps = {}) {
  * the failing expenses; an empty array is the acceptance condition.
  */
 export async function reconcileAllocations({ supabase = supabaseDefault } = {}) {
-  const { data: expenses, error } = await supabase.from('marketing_expenses').select('id, amount, status').eq('status', 'approved');
-  if (error) throw new Error(`reconcile read failed: ${error.message}`);
-  const { data: allocs, error: aErr } = await supabase.from('marketing_expense_allocations').select('expense_id, amount');
-  if (aErr) throw new Error(`reconcile read allocations failed: ${aErr.message}`);
+  // Paged (2026-10-19): one read returns PostgREST's first 1,000 rows, and with
+  // 4,087 allocations and 3,168 approved expenses the check reported 667
+  // "failures" on a ledger SQL found balanced to the cent.
+  const readAll = async (label, query) => {
+    const rows = [];
+    for (let page = 0; ; page++) {
+      const { data, error } = await query().order('id').range(page * 1000, page * 1000 + 999);
+      if (error) throw new Error(`reconcile read${label} failed: ${error.message}`);
+      rows.push(...(data || []));
+      if (!data || data.length < 1000) return rows;
+    }
+  };
+  const expenses = await readAll('', () => supabase.from('marketing_expenses').select('id, amount, status').eq('status', 'approved'));
+  const allocs = await readAll(' allocations', () => supabase.from('marketing_expense_allocations').select('id, expense_id, amount'));
   const sums = {};
   for (const a of allocs || []) sums[a.expense_id] = (sums[a.expense_id] || 0) + Math.round(Number(a.amount) * 100);
   return (expenses || [])
