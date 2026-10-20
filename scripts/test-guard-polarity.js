@@ -24,6 +24,11 @@ const { enforceOneAsk } = await import('../src/agentic/one-ask.js');
 const { enforceNepqPlan, dropUnaskedCallOffer } = await import('../src/agentic/nepq-planner.js');
 const { enforceSignOff } = await import('../src/agentic/sign-off.js');
 const { stripOfferTalk } = await import('../src/agentic/rehash.js');
+// 2026-10-19 (handoff v2): the new guards and checks.
+const { dropSensitiveDetail } = await import('../src/siro/text-guards.js');
+const { copiesSiroDraft } = await import('../src/siro/presentation-guard.js');
+const { checkF0Copy } = await import('../src/siro/f0-copy-checks.js');
+const { planNepqTurn: planForHint } = await import('../src/agentic/nepq-planner.js');
 const { smsBookingTurn, enforceBookingFacts } = await import('../src/agentic/sms-booking-turn.js');
 const { findUnbackedBookingClaim } = await import('../src/agentic/booking-claim.js');
 const { enforceCancelledVisit } = await import('../src/agentic/cancelled-visit.js');
@@ -116,6 +121,41 @@ export const CASES = [
     guard: 'stripOfferTalk',
     mustChange: () => stripOfferTalk('Totally fair. I can take $1,500 off if you sign this week. Would a quick call help?').stripped.length > 0,
     mustPass: () => stripOfferTalk('Would a quick call help?').stripped.length === 0,
+  },
+  {
+    // REHASH_DEAL_HINT_MODE=every (ruling 4): the hint is never "used up";
+    // everything else in the offer test still strips.
+    guard: 'stripOfferTalk (every mode)',
+    mustChange: () => stripOfferTalk("I want to make sure you're getting the best deal possible. I can do 10% off.", { hintUsed: false }).stripped.length > 0,
+    mustPass: () => stripOfferTalk("I want to make sure you're getting the best deal possible. Would a quick call help?", { hintUsed: false }).stripped.length === 0,
+  },
+  {
+    guard: 'dropSensitiveDetail',
+    mustChange: () => dropSensitiveDetail('He recently lost his wife, and wants the windows done before Christmas.') !== 'He recently lost his wife, and wants the windows done before Christmas.',
+    mustPass: () => dropSensitiveDetail('He wants the windows done before the family visits for Christmas.') === 'He wants the windows done before the family visits for Christmas.',
+  },
+  {
+    guard: 'copiesSiroDraft',
+    mustChange: () => copiesSiroDraft('The lanai slider will finally stop rattling in storms once it is replaced.', 'The lanai slider will finally stop rattling in storms once it is replaced.'),
+    mustPass: () => !copiesSiroDraft('Did you get a chance to look over the proposal?', 'The lanai slider will finally stop rattling in storms once it is replaced.'),
+  },
+  {
+    guard: 'checkF0Copy (four_step)',
+    mustChange: () => checkF0Copy('Hi James, sorry about your wife. Would a call help? - John', { position: 1, repFirstName: 'John', formula: 'four_step', firstName: 'James' }).length > 0,
+    mustPass: () => checkF0Copy('Dana, a project like this takes some thought, and that is fair. If I could make it work better for you, would you be open to a quick call with John?', { facts: null, position: 1, repFirstName: 'John', formula: 'four_step', firstName: 'Dana', slots: { hesitation: null, affirm: 'that is fair', reframe: null, if_i_could: 'make it work better for you' } }).length === 0,
+  },
+  {
+    guard: 'enforceNepqPlan (rehash hint)',
+    mustChange: () => {
+      const conv = [{ direction: 'outbound', text: 'Did you get a chance to look over the proposal?' }, { direction: 'inbound', text: 'Yes I did' }];
+      const p = planForHint({ channel: 'sms', trigger: 'Yes I did', conversation: conv, slots: [], firstName: 'Monica', discipline: { booking: { allowed: false } }, postDemo: true, rehash: true, rehashRep: 'John', rehashHintMode: 'every' });
+      return enforceNepqPlan('Glad you had a look. What stood out?', p).changes.includes('rehash_hint_added');
+    },
+    mustPass: () => {
+      const conv = [{ direction: 'outbound', text: 'Did you get a chance to look over the proposal?' }, { direction: 'inbound', text: 'Yes I did' }];
+      const p = planForHint({ channel: 'sms', trigger: 'Yes I did', conversation: conv, slots: [], firstName: 'Monica', discipline: { booking: { allowed: false } }, postDemo: true, rehash: true, rehashRep: 'John', rehashHintMode: 'once' });
+      return !enforceNepqPlan('Glad you had a look. What stood out?', p).changes.includes('rehash_hint_added');
+    },
   },
   {
     guard: 'enforceBookingFacts',

@@ -17,13 +17,21 @@ import { validateSafety } from '../nurture/nurture-safety-validator.js';
 import { loadF0Context } from './f0-context.js';
 import { postDemoInterrupt } from './f0-interrupts.js';
 import { checkF0Copy, f0RetryNote } from './f0-copy-checks.js';
+import { parseFourStepOutput, FOUR_STEP_WAIT_HOURS } from './f0-four-step.js';
 
-export async function previewF0Generation(contactId, position, { deps = {} } = {}) {
+/**
+ * @param {{formula?: 'v1'|'four_step'}} [o]  2026-10-19: try the Four-Step
+ *   prompts (version 2, read even while inactive) before F0_FORMULA_MODE flips.
+ */
+export async function previewF0Generation(contactId, position, { deps = {}, formula = null } = {}) {
   const pos = Math.min(5, Math.max(1, Number(position) || 1));
-  const request = { contact_id: contactId, workflow_code: 'F.0', sequence_position: pos, channel: 'sms' };
+  const fourStepPreview = formula === 'four_step';
+  const request = { contact_id: contactId, workflow_code: 'F.0', sequence_position: pos, channel: 'sms', ...(fourStepPreview ? { include_inactive: true } : {}) };
   const context = await (deps.buildLeadContext || buildLeadContext)(contactId, { skipCache: true, workflow_code: 'F.0' });
-  const f0 = await loadF0Context(context, request, { deps, allowEnsure: false });
-  context.siro = { ...f0.vars, selector_objection: f0.facts ? null : 'no-visit-data' };
+  const env = formula ? { ...process.env, F0_FORMULA_MODE: formula } : process.env;
+  const f0 = await loadF0Context(context, request, { deps, allowEnsure: false, env });
+  const fourStep = f0.vars.formula === 'four_step';
+  context.siro = { ...f0.vars, selector_objection: fourStep ? (f0.vars.objection_type || 'none') : (f0.facts ? null : 'no-visit-data') };
   context.nurture_request = { workflow_code: 'F.0', sequence_position: pos };
   const interrupt = postDemoInterrupt(f0.interruptInput);
 
@@ -32,10 +40,22 @@ export async function previewF0Generation(contactId, position, { deps = {} } = {
 
   const generate = deps.generateNurtureContent || generateNurtureContent;
   const attempt = async (p) => {
-    const out = applyAutofix((await generate(p, context)).output, { smsMax: null }).output;
+    let raw = (await generate(p, context)).output;
+    let slots = null;
+    let invalid = null;
+    if (fourStep) {
+      const parsed = parseFourStepOutput(raw);
+      if (parsed.ok) { slots = parsed.slots; raw = { ...raw, sms_body: parsed.text, next_wait_hours: FOUR_STEP_WAIT_HOURS[pos] }; }
+      else { invalid = parsed.error; raw = { ...(raw || {}), sms_body: String(raw?.text || '') }; }
+    }
+    const out = applyAutofix(raw, { smsMax: null }).output;
     const safety = validateSafety(out, p, context);
-    const f0Failures = checkF0Copy(out?.sms_body, { facts: f0.facts, position: pos, repFirstName: f0.vars.rehash_rep_first_name });
-    return { out, safety, f0Failures };
+    const f0Failures = invalid ? ['four_step_output'] : checkF0Copy(out?.sms_body, {
+      facts: f0.facts, position: pos, repFirstName: f0.vars.rehash_rep_first_name,
+      formula: fourStep ? 'four_step' : 'v1', slots, firstName: context?.lead?.first_name || null,
+      followupText: f0.vars.followup_text_line ? f0.facts?.followup_text || null : null,
+    });
+    return { out, safety, f0Failures, slots };
   };
   let first = await attempt(prompt);
   let retried = null;
@@ -52,6 +72,8 @@ export async function previewF0Generation(contactId, position, { deps = {} } = {
     interrupt,
     would_generate: !interrupt,
     prompt_code: prompt.prompt_code,
+    formula: fourStep ? 'four_step' : 'v1',
+    ...(fourStep ? { objection_type: f0.vars.objection_type, story_angle: f0.vars.story_angle, slots: final.slots } : {}),
     recording_id: f0.recordingId,
     rep_first_name: f0.vars.rehash_rep_first_name,
     text: final.out?.sms_body || null,

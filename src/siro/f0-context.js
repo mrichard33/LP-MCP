@@ -16,7 +16,8 @@ import supabaseDefault from '../supabase.js';
 import { readSiroRows } from './context-read.js';
 import { ensureRecordingForLead } from './ensure-recording.js';
 import { buildPresentationFacts, presentationTemplateVars, repFirstName } from './presentation-facts.js';
-import { siroConfig } from './config.js';
+import { siroConfig, siroModes } from './config.js';
+import { buildVisitFacts, fourStepObjectionType, STORY_ANGLES } from './f0-four-step.js';
 import { isPostDemoLead } from '../agentic/post-demo-lead.js';
 import { lpSold, isUnsoldPostDemo } from '../agentic/post-demo-owner.js';
 import { isInRehash, rehashLeadFromContext, stageFromRows } from '../agentic/rehash-state.js';
@@ -136,13 +137,27 @@ export async function loadF0Context(context, request, { env = process.env, deps 
   const rehashRepFirst = repFirstName(repRaw) || 'Reece Team';
 
   const age = demoAgeHours({ facts, lp, nowMs });
+  const modes = siroModes(env);
+  const followupTextLive = modes.followupText === 'live';
   const vars = {
-    ...presentationTemplateVars(facts),
+    ...presentationTemplateVars(facts, { followupTextLive }),
     rehash_rep_first_name: rehashRepFirst,
     days_since_demo: Number.isFinite(age) ? String(Math.floor(age / 24)) : '',
     recording_id: facts?.recording_id || '',
     presentation: facts,
   };
+  // 2026-10-19 (Mark, ruling 6): the Four-Step prompts (F0_FORMULA_MODE=
+  // four_step) read the visit as <visit_facts> (no price, no sensitive detail)
+  // and are picked by Siro's MAIN objection: v1 picked by the first moment
+  // type, so 8 of 10 preview leads got the price variant, Mr. Jackson's
+  // "decision maker not present" included.
+  if (modes.f0Formula === 'four_step') {
+    const objectionType = fourStepObjectionType(facts);
+    vars.formula = 'four_step';
+    vars.objection_type = objectionType;
+    vars.story_angle = STORY_ANGLES[objectionType] || STORY_ANGLES.none;
+    vars.visit_facts = buildVisitFacts(facts, { firstName: lead.first_name || '', repFirstName: rehashRepFirst, followupTextLive });
+  }
   return {
     facts,
     rows,

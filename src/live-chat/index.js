@@ -17,6 +17,7 @@
  *      LIVE_CHAT_SEND_WEBHOOK_URL (live sends go to the I.LVO GHL workflow; unset → Conversations API).
  */
 
+import { newestManualOutbound } from '../services/human-takeover-io.js';
 import supabase from '../supabase.js';
 import { queueSpanishList, SPANISH_LIST_RULE } from './spanish-list.js';
 import { ghlFetch } from '../actions/helpers.js';
@@ -473,6 +474,8 @@ export function scheduleChatEmailAsk(contactId, message) {
 
 export function productionLaneDeps() {
   return {
+    // 2026-10-19 (Mark, ruling 5): a person's text after the visitor's message.
+    findManualOutbound: (contactId, afterIso, { excludeActionId = null } = {}) => newestManualOutbound(contactId, afterIso, { excludeActionId }),
     fetchContact,
     fetchMessages,
     findConversation,

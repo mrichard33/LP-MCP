@@ -23,6 +23,11 @@
  *               objection, the objection and follow-up summaries, follow-up
  *               timing, emotional tie, scope, commitment, team).
  *   - pricing   the quotes and financing as Siro wrote them.
+ *   - followup_text  Siro's drafted follow-up TEXT (Mark, 2026-10-19, ruling 2),
+ *               cleaned: PII scrubbed, concessions, money and any sensitive
+ *               detail dropped, capped at 400. A reference for the bot's topic
+ *               and tone, never sent as written. Never the email draft, never
+ *               the thinking. Null with SIRO_FOLLOWUP_TEXT_MODE=off.
  * Prices are KEPT everywhere (the user, 2026-10-16: "I do not want to strip
  * money"): stored as written, saved to GHL in the demo note, and shown to the
  * bot in the PRESENTATION block. What stops a price reaching a customer is the
@@ -31,6 +36,7 @@
  */
 import { scrubPii, OBJECTION_TYPES } from '../knowledge/ci-moments-core.js';
 import { normalizePhone10 } from '../lead-leak-classify.js';
+import { dropDiscountTalk, dropMoneyTalk, dropSensitiveDetail } from './text-guards.js';
 
 const OBJECTION_NAME_RX = /objection|concern|hesitat/i;
 const QUESTION_NAME_RX = /question/i;
@@ -200,6 +206,27 @@ function pricingFrom(fu) {
   return Object.keys(out).length ? out : null;
 }
 
+// 2026-10-19 (ruling 2): the header Siro puts its drafted text under. The
+// fixture (scripts/fixtures/siro-recording.js) shows FollowupTextHeader; any
+// header reading "follow-up text" or "text message" counts, and the e-mail
+// draft never does.
+const FOLLOWUP_TEXT_HEADERS = ['followuptextheader', 'followuptext', 'textmessage', 'followupsms', 'smsdraft'];
+const headerKey = (h) => String(h || '').toLowerCase().replace(/[^a-z]/g, '');
+export const FOLLOWUP_TEXT_MAX = 400;
+
+/** Siro's drafted follow-up text, cleaned for the bot, or null. Pure. */
+export function followupTextFrom(fu) {
+  for (const c of Array.isArray(fu?.context) ? fu.context : []) {
+    const k = headerKey(c?.header);
+    if (!k || k.includes('email') || !FOLLOWUP_TEXT_HEADERS.includes(k)) continue;
+    const raw = scrubPii(cleanSiroText(valueText(c.value)));
+    const t = dropSensitiveDetail(dropMoneyTalk(dropDiscountTalk(raw))).trim();
+    if (!t || NONE_RX.test(t)) return null;
+    return t.length > FOLLOWUP_TEXT_MAX ? `${t.slice(0, FOLLOWUP_TEXT_MAX - 1).trimEnd()}…` : t;
+  }
+  return null;
+}
+
 function phoneFrom(raw, fu) {
   const c = raw?.crmCustomer || fu?.crmCustomer || raw?.customer || null;
   const acctPhones = c?.opportunity?.account?.phoneNumbers;
@@ -251,6 +278,9 @@ export function rawWhitelist(r, fu) {
     followup: fu ? {
       followupType: fu.followupType ?? null, score: fu.score ?? null, status: fu.status ?? null,
       repName: fu.repName ?? null, teamName: fu.teamName ?? null,
+      // Header NAMES only, never values (2026-10-19): shows which field holds
+      // Siro's drafted text without keeping the draft itself.
+      contextHeaders: Array.isArray(fu.context) ? fu.context.map(c => String(c?.header || '').slice(0, 60)).filter(Boolean).slice(0, 40) : null,
     } : null,
   };
 }
@@ -262,7 +292,7 @@ const extId = (o) => (o && o.externalId != null && String(o.externalId).trim() ?
  * @param {{source:'webhook'|'poll'|'ensure', storeRaw?:boolean, flags?:{processed?:boolean, linked?:boolean},
  *          userNames?: Map<string,{name,email}>}} opts
  */
-export function normalizeRecording(raw, { source = 'poll', storeRaw = true, flags = {}, userNames = null } = {}) {
+export function normalizeRecording(raw, { source = 'poll', storeRaw = true, flags = {}, userNames = null, followupTextMode = 'shadow' } = {}) {
   const r = raw?.data && raw.data.id ? raw.data : raw;
   if (!r || !r.id) return null;
   const crm = r.crm && typeof r.crm === 'object' ? r.crm : null;
@@ -297,6 +327,7 @@ export function normalizeRecording(raw, { source = 'poll', storeRaw = true, flag
     moments: buildMoments({ extractions: extractions || [], summary: summary || [] }),
     insights,
     pricing: pricingFrom(fu),
+    followup_text: followupTextMode === 'off' ? null : followupTextFrom(fu),
     followup_score: Number.isFinite(score) && score >= 1 && score <= 5 ? Math.round(score) : null,
     followup_status: fu?.status ? String(fu.status) : null,
     followup_action: followAction || null,

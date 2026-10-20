@@ -20,7 +20,7 @@ import { resolveOrganizationId, monthStartIso } from '../jobs/siro-rep-scorecard
 import { normalizePhone10 } from '../lead-leak-classify.js';
 
 const ok = (obj) => ({ content: [{ type: 'text', text: JSON.stringify(obj, null, 2) }] });
-const ROW_COLS = 'recording_id, rep_name, rep_email, result, recorded_at, updated_at_siro, deleted, processed, linked, match_method, lp_lead_id, lp_prospect_id, ghl_contact_id, customer_phone, followup_score, followup_status, followup_action, insights, pricing, summary, moments, source, event_emitted_at, ghl_note_action_id, context_ready';
+const ROW_COLS = 'recording_id, rep_name, rep_email, result, recorded_at, updated_at_siro, deleted, processed, linked, match_method, lp_lead_id, lp_prospect_id, ghl_contact_id, customer_phone, followup_score, followup_status, followup_action, insights, pricing, followup_text, raw, summary, moments, source, event_emitted_at, ghl_note_action_id, context_ready';
 
 async function rowsFor({ lp_lead_id, lp_prospect_id, ghl_contact_id }, limit = 10) {
   let q = supabase.from('siro_recordings').select(ROW_COLS).order('recorded_at', { ascending: false }).limit(limit);
@@ -108,6 +108,7 @@ export function registerSiroTools(server) {
       lp_lead_id: z.string().optional(), lp_prospect_id: z.string().optional(), ghl_contact_id: z.string().optional(),
       include_note: z.boolean().optional(),
       preview_f0_position: z.number().int().min(1).max(5).optional(),
+      formula: z.enum(['v1', 'four_step']).optional().describe('F.0 preview formula (default: Railway\'s F0_FORMULA_MODE). four_step reads the version-2 Four-Step prompts even while they are inactive.'),
     },
     async (a) => {
       if (!a.lp_lead_id && !a.lp_prospect_id && !a.ghl_contact_id) return ok({ error: 'give lp_lead_id, lp_prospect_id or ghl_contact_id' });
@@ -116,12 +117,13 @@ export function registerSiroTools(server) {
       const out = {
         recordings_found: rows.length,
         recording_id: facts?.recording_id || null,
-        presentation_block: facts ? renderPresentationBlock(facts).join('\n') : '',
+        presentation_block: facts ? renderPresentationBlock(facts, { followupTextLive: siroModes().followupText === 'live' }).join('\n') : '',
+        followup_text: facts?.followup_text || null,
       };
       if (a.include_note) out.demo_note = facts ? buildDemoNote(facts) : null;
       if (a.preview_f0_position) {
         const contactId = a.ghl_contact_id || rows.find(r => r.ghl_contact_id)?.ghl_contact_id;
-        out.f0_preview = contactId ? await previewF0Generation(contactId, a.preview_f0_position) : { error: 'no GHL contact for this lead' };
+        out.f0_preview = contactId ? await previewF0Generation(contactId, a.preview_f0_position, { formula: a.formula || null }) : { error: 'no GHL contact for this lead' };
       }
       return ok(out);
     },

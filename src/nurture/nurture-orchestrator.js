@@ -132,6 +132,7 @@ import { applySendGate } from '../services/send-gate-report.js';
 import { checkRequestSecret, rejectionBody } from '../security/request-auth.js';
 import crypto from 'crypto';
 import supabase from '../supabase.js';
+import { emitEvent } from '../event-emitter.js';
 import { buildLeadContext } from '../context-builder.js';
 import { selectPrompt } from './nurture-prompt-selector.js';
 import { generateNurtureContent } from './nurture-generator.js';
@@ -151,6 +152,9 @@ import { slackPhone, prospectLabel } from '../format-helpers.js';
 import { loadF0Context } from '../siro/f0-context.js';
 import { postDemoInterrupt } from '../siro/f0-interrupts.js';
 import { checkF0Copy, f0RetryNote } from '../siro/f0-copy-checks.js';
+import { parseFourStepOutput, FOUR_STEP_WAIT_HOURS } from '../siro/f0-four-step.js';
+import { humanTakeoverMode, takeoverDecision, HUMAN_TAKEOVER_SKIP_REASON } from '../agentic/human-takeover.js';
+import { newestManualOutbound, lastInboundAt } from '../services/human-takeover-io.js';
 import { siroConfig, siroModes, siroRecordingUrl } from '../siro/config.js';
 import { postToSlack } from '../slack.js';
 
@@ -212,7 +216,8 @@ export async function runNurtureGeneration(request) {
     context.siro = {
       ...f0.vars,
       // The "no-visit-data" prompt variant when the visit is not on file.
-      selector_objection: f0.facts ? null : 'no-visit-data',
+      // Four-Step (2026-10-19): the variant is Siro's MAIN objection type.
+      selector_objection: f0.vars.formula === 'four_step' ? (f0.vars.objection_type || 'none') : (f0.facts ? null : 'no-visit-data'),
     };
     context.nurture_request = { workflow_code: request.workflow_code, sequence_position: request.sequence_position };
     await stampSiroRecording(generation_id, f0.recordingId);
@@ -235,6 +240,20 @@ export async function runNurtureGeneration(request) {
         await safeClearDrafts(request.contact_id, `interrupt:${pd.suppress}`);
         return finishResponse(generation_id, false, pd.suppress, startedAt);
       }
+    }
+  }
+
+  // Step 1c — a person's text pauses the bot (Mark, 2026-10-19, ruling 5):
+  // nothing proactive goes out after someone on our team texted the lead by
+  // hand, until the lead writes again. Not terminal: the next inbound clears
+  // it. HUMAN_TAKEOVER_MODE shadow (default) only logs. A failed read sends.
+  if (request.force_send !== true) {
+    const takeover = await humanTakeoverForNurture(request.contact_id);
+    if (takeover === 'skip') {
+      console.log(JSON.stringify({ level: 'info', type: 'intentional_suppression', status: 'suppressed_interrupt', reason: HUMAN_TAKEOVER_SKIP_REASON, terminal: false, workflow_code: request.workflow_code, sequence_position: request.sequence_position, ghl_contact_id: request.contact_id, generation_id }));
+      await updateStatus(generation_id, 'suppressed_interrupt', HUMAN_TAKEOVER_SKIP_REASON);
+      await safeClearDrafts(request.contact_id, `interrupt:${HUMAN_TAKEOVER_SKIP_REASON}`);
+      return finishResponse(generation_id, false, HUMAN_TAKEOVER_SKIP_REASON, startedAt);
     }
   }
 
@@ -343,6 +362,7 @@ export async function runNurtureGeneration(request) {
   try {
     genResult = await generateNurtureContent(prompt, context);
     retryCount = genResult.generationRetries || 0;
+    if (isF0) genResult = { ...genResult, output: fourStepOutput(genResult.output, f0, request) };
   } catch (err) {
     const genRetries = err.generationRetries || 1;
     await updateStatus(generation_id, 'failed_generation', err.message.slice(0, 200), genRetries);
@@ -377,6 +397,7 @@ export async function runNurtureGeneration(request) {
           (safety.f0Failures?.length ? `\n\n${f0RetryNote(safety.f0Failures, { position: request.sequence_position })}` : ''),
       };
       genResult = await generateNurtureContent(constrainedPrompt, context);
+      if (isF0) genResult = { ...genResult, output: fourStepOutput(genResult.output, f0, request) };
       // Add any generation-internal retries from the safety-retry's
       // generate call on top of the safety retry itself.
       retryCount += genResult.generationRetries || 0;
@@ -487,11 +508,18 @@ export async function runNurtureGeneration(request) {
 function runOutputChecks(output, prompt, context, f0, request) {
   const safety = validateSafety(output, prompt, context);
   if (!f0) return safety;
-  const f0Failures = checkF0Copy(output?.sms_body, {
-    facts: f0.facts,
-    position: Number(request.sequence_position) || 1,
-    repFirstName: f0.vars?.rehash_rep_first_name || null,
-  });
+  const fourStep = f0.vars?.formula === 'four_step';
+  const f0Failures = output?.four_step_invalid
+    ? ['four_step_output']
+    : checkF0Copy(output?.sms_body, {
+      facts: f0.facts,
+      position: Number(request.sequence_position) || 1,
+      repFirstName: f0.vars?.rehash_rep_first_name || null,
+      formula: fourStep ? 'four_step' : 'v1',
+      slots: output?.four_step_slots || null,
+      firstName: context?.lead?.first_name || null,
+      followupText: f0.vars?.followup_text_line ? f0.facts?.followup_text || null : null,
+    });
   if (!f0Failures.length) return safety;
   return {
     passed: false,
@@ -499,6 +527,49 @@ function runOutputChecks(output, prompt, context, f0, request) {
     details: [...safety.details, ...f0Failures.map(f => `F0:${f}`)],
     f0Failures,
   };
+}
+
+/**
+ * Four-Step (F0_FORMULA_MODE=four_step, 2026-10-19): the model answers
+ * { slots, text }. The text becomes sms_body and the wait comes from code, so
+ * the writeback is unchanged; an answer that is not that shape is a failed
+ * check (one re-write, then suppressed_low_conf). v1 output passes through.
+ */
+function fourStepOutput(output, f0, request) {
+  if (f0?.vars?.formula !== 'four_step') return output;
+  const parsed = parseFourStepOutput(output);
+  const position = Number(request.sequence_position) || 1;
+  if (!parsed.ok) return { ...(output || {}), sms_body: String(output?.text || output?.sms_body || ''), four_step_invalid: parsed.error };
+  return {
+    ...output,
+    sms_body: parsed.text,
+    next_wait_hours: FOUR_STEP_WAIT_HOURS[position] ?? output?.next_wait_hours ?? 48,
+    four_step_slots: parsed.slots,
+  };
+}
+
+/** 'skip' (live), 'would_skip' (shadow, logged) or 'send'. Never throws. */
+async function humanTakeoverForNurture(contactId) {
+  const mode = humanTakeoverMode();
+  if (mode === 'off' || !contactId || !supabase) return 'send';
+  try {
+    const boundary = await lastInboundAt(contactId, { supabase });
+    if (!boundary) return 'send';
+    const manual = await newestManualOutbound(contactId, boundary, { supabase });
+    const decision = takeoverDecision({ mode, manual });
+    if (decision === 'would_skip') console.log(`[HumanTakeover] shadow: nurture for ${contactId} — a person texted at ${manual.at}; live would hold it`);
+    if (decision === 'skip') {
+      emitEvent({
+        event_type: 'agentic.human_takeover', source: 'nurture', entity_type: 'contact', entity_id: contactId, ghl_contact_id: contactId,
+        priority: 'low', bypass_filter: true, payload: { channel: 'nurture', manual_at: manual.at, manual_message_id: manual.message_id || null },
+        idempotency_key: `human_takeover_nurture_${contactId}_${manual.message_id || manual.at}`,
+      }).catch(() => {});
+    }
+    return decision;
+  } catch (err) {
+    console.warn(`[HumanTakeover] nurture read failed for ${contactId}: ${err.message}`);
+    return 'send';
+  }
 }
 
 async function stampSiroRecording(generation_id, recordingId) {

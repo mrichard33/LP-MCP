@@ -71,7 +71,7 @@ test('template variables', () => {
   assert.equal(v.presentation_objections, 'price, spouse');
   assert.match(v.presentation_block, /^=== PRESENTATION/);
   assert.deepEqual(presentationTemplateVars(null), {
-    presentation_block: '', presentation_rep_first_name: '', presentation_result: '', presentation_objections: '', presentation_interests: '',
+    presentation_block: '', followup_text_line: '', presentation_rep_first_name: '', presentation_result: '', presentation_objections: '', presentation_interests: '',
   });
 });
 

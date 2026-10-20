@@ -775,6 +775,64 @@ we never add one.
   Tools: the seven `siro_*` in `src/tools/siro-tools.js`; `siro_lead_presentation` with `preview_f0_position` is the
   dry run before any flip.
 
+## Handoff v2: Siro's suggested text, a deal hint every reply, a person's text pauses the bot, F.0 Four-Step (Mark, 2026-10-19)
+
+Seven rulings. Each change is behind its own flag in `src/mode-registry.js`; the defaults change nothing a customer sees.
+- **1. The Siro webhook works; no change.** The poll stores a recording when recording starts and the webhook updates it
+  when Siro finishes, so `source` stays "poll".
+- **2. Siro's drafted follow-up TEXT is a reference, never sent as written (`SIRO_FOLLOWUP_TEXT_MODE` off|shadow|live,
+  default shadow).** `followupTextFrom` (`src/siro/normalize.js`) reads the `FollowupTextHeader` context entry only (never
+  the email draft, never the thinking) into `siro_recordings.followup_text`: HTML out, `scrubPii`, `dropDiscountTalk`,
+  `dropMoneyTalk`, `dropSensitiveDetail`, cap 400. `raw.followup.contextHeaders` keeps the header NAMES (never values).
+  Live adds one line to the PRESENTATION block and the F.0 context ("reference for topic and tone only; write your own;
+  never send it as written"). A reply that is 60%+ the draft's content words fails `siro_draft_copied` (checkReply,
+  `checkF0Copy`): one re-write, then the existing path.
+- **3 and 4. Every rehash reply hints at a better deal, never naming it (`REHASH_DEAL_HINT_MODE` once|every, default
+  once).** This SUPERSEDES "the best deal possible, once per conversation" (2026-10-11) in `every` mode only; `once` is
+  today's copy, byte for byte (the prompt snapshots did not move). `src/agentic/rehash-nepq.js` is the one place:
+  `REHASH_HINT_LINES` (6, Reece Team voice, no amount, %, discount, promotion, financing term or deadline),
+  `rehashHintFor` (never on `NO_HINT_STEPS`: post_demo_stop, post_demo_close / closer, post_demo_space, sign_off,
+  competitor_signed, defer, rehash_confirm, an opt-out, and a first no `door_open`), a fresh opener each time
+  (`pickRehashHint`), and the bridge "If I could make this work better for you, would you be open to a quick call with
+  {rep}?" (`rehashIfICouldBridge`; `REHASH_BRIDGE_RX` still reads it). `enforceNepqPlan` adds the plan's `hint_line` before
+  the closing question when the draft has none (`rehash_hint_added`); `stripOfferTalk` no longer counts the hint as used.
+  No new `_RX`: the hint lines are read back as strings (`hasRehashHint`).
+- **5. A person's manual text pauses the bot (`HUMAN_TAKEOVER_MODE` off|shadow|live, default shadow).** Option B: a bot
+  reply queued or drafted before it is dropped, nothing proactive goes out until the lead's next inbound, that inbound is
+  answered normally, and never stop-bot, a tag or a consent row. Manual = outbound, not workflow / bulk_actions /
+  campaign, not our message id, not our text (`isOurText`), not `AI_SENDER_USER_ID` (`src/agentic/human-takeover.js`).
+  The read (`src/services/human-takeover-io.js`) is HL-MCP's `contact.outbound_message` events: preflight 2026-10-20, 189
+  in 7 days, all `source: app` with a `messageId` and a `userId` and no body, median 3.0s / p90 4.4s after the send; 162
+  matched our sends by id, the rest were people (John Manieri 23). An event we cannot match by id has its body read once
+  from GHL. Unknown (a failed read, one of our sends still in flight) is never "manual": the bot sends. The check is the
+  last one before a send: the SMS handler after the burst checks (skip `human_replied`), live chat `deliver`, and the
+  nurture orchestrator (`suppressed_interrupt` `human_replied`, not terminal). Shadow sends and marks
+  `input_snapshot.human_takeover_shadow_would_skip`. `human_replied` is an answered turn (`ANSWERED_OUTCOMES`: rules 228 /
+  373 lose the turn) and a held reply for the SLA watchdog (rules 371–374 never re-answer it).
+- **6. F.0 v2 texts use the Four-Step formula (`F0_FORMULA_MODE` v1|four_step, default v1).** "[FIRST NAME], [their
+  hesitation]. [why that's fair]. [what they told us they wanted]. If I could [make it work better for you], would you
+  be open to a quick call with [REHASH REP]?" Replies to the lead stay on the NEPQ rehash track (2026-10-16). The model
+  fills four slots from `<visit_facts>` first (`src/siro/f0-four-step.js`: no price, no financing, no sensitive detail;
+  the variant is Siro's MAIN objection, `fourStepObjectionType`: v1 picked "price" for 8 of 10 preview leads, Mr.
+  Jackson's "decision maker not present" included) and returns `{ slots, text }`; `checkF0Copy` formula 'four_step'
+  checks the first name first, "If I could" and the call question naming the rep at P1–P4, no question at P5, each slot
+  in the text, hesitation and reframe grounded in the visit (2+ shared content words), and `rep_quoted`. One re-write,
+  then `suppressed_low_conf`. Prompts are version-2 rows (`sql/seeds/2026-10-19_f0_v2_four_step_prompts.sql`, built by
+  `scripts/build-f0-four-step-seed.mjs`), seeded INACTIVE; `nurture-prompt-selector.js` reads version 2 only in four_step
+  and version 1 otherwise (`f0FormulaAllows`). Go-live: activate the v2 rows (the UPDATE in the seed's header), then flip
+  the mode. `siro_lead_presentation { preview_f0_position, formula: 'four_step' }` previews them while inactive.
+- **7. No sensitive detail from Siro in any text.** `dropSensitiveDetail` (`src/siro/text-guards.js`, re-exported by
+  presentation-facts.js) drops the clause about a death or loss, an illness or the hospital, divorce, a lost job, debt or
+  "can't afford", or age, at render time in every bot-facing PRESENTATION line and in `<visit_facts>` (the GHL demo note,
+  for the team, keeps it). `checkF0Copy` fails `sensitive_detail` in both formulas. Mr. Jackson's late wife stays out;
+  "family visiting for Christmas" may stay.
+The gate can try every mode before Railway: `run_bot_eval` / `simulate_bot_conversation` take `siro_context_mode`,
+`siro_followup_text_mode`, `rehash_deal_hint_mode`, `human_takeover_mode` (`src/simulator/sim-overrides.js`; a run is
+compared only with one that forced the same modes). Scenarios `rehash_if_i_could`, `rehash_hint_every_turn`,
+`rehash_hint_not_after_no`, `human_takeover_skip_one` (a `{ manual }` turn) check only when their mode is on. Rollback,
+one variable each: `SIRO_FOLLOWUP_TEXT_MODE=off`, `REHASH_DEAL_HINT_MODE=once`, `HUMAN_TAKEOVER_MODE=off`,
+`SIRO_CONTEXT_MODE=shadow`, `F0_FORMULA_MODE=v1`.
+
 ## Revin: every text it sends or receives, one thread per contact (2026-10-19)
 
 Until now all we kept of Revin AI's texting was its ~160-character LP summary note (`note_origin = 'lp_revin'`, still

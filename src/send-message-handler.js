@@ -333,6 +333,8 @@ import { timezoneForZip } from './services/contact-timezone.js';
 import { findNearDuplicate } from './services/message-similarity.js';
 import { checkNotSuperseded, commitAgenticSend } from './services/agentic-reply-locks.js';
 import { findNewerInbound, findAnsweredDuplicateInbound } from './agentic/burst-yield.js';
+import { humanTakeoverMode, takeoverDecision, HUMAN_TAKEOVER_SKIP_REASON } from './agentic/human-takeover.js';
+import { newestManualOutbound, lastInboundAt } from './services/human-takeover-io.js';
 import { emitEvent } from './event-emitter.js';
 import { routeNepqHandoff } from './agentic/nepq-handoff.js';
 import { fileBotCallback, callbackDecision, schedulingCallbackDecision, isPostDemoForCallback, CALLBACK_MARKER_TAG } from './agentic/bot-callback.js';
@@ -2389,12 +2391,52 @@ async function handleShortCircuit(contactId, generated, action, context, opts = 
 // (input_snapshot.turn_lock_shadow_would_skip) for the 48-hour check.
 const turnLockShadowSkips = new Map();
 
+// 2026-10-19 (ruling 5): actions a person's text would have dropped while
+// HUMAN_TAKEOVER_MODE=shadow; the reply row says so for the 48-hour check.
+const humanTakeoverShadowSkips = new Map();
+
+/**
+ * The human-takeover check for one SMS/email send (human-takeover.js). Returns
+ * { skip } to drop the reply in live mode, null otherwise. A read that fails
+ * sends (unknown is never "a person replied").
+ */
+async function checkHumanTakeover({ action, contactId, channel, sourceEventMeta }, deps = {}) {
+  const mode = humanTakeoverMode();
+  if (mode === 'off' || !contactId) return null;
+  const p = sourceEventMeta?.payload || {};
+  let boundary = p.last_inbound_event_created_at || p.inbound_event_created_at || null;
+  try {
+    if (!boundary) boundary = await (deps.lastInboundAt || lastInboundAt)(contactId, { supabase });
+  } catch { boundary = null; }
+  if (!boundary) return null;
+  const manual = await (deps.newestManualOutbound || newestManualOutbound)(contactId, boundary, { supabase, excludeActionId: action?.id ?? null });
+  const decision = takeoverDecision({ mode, manual });
+  if (decision === 'send') return null;
+  const detail = { manual_at: manual.at, manual_message_id: manual.message_id, manual_user_id: manual.user_id, boundary };
+  if (decision === 'would_skip') {
+    console.log(`[HumanTakeover] shadow: ${contactId} action ${action?.id} — a person texted at ${manual.at}; live would drop this reply`);
+    if (action?.id != null) humanTakeoverShadowSkips.set(String(action.id), detail);
+    return null;
+  }
+  console.log(`[SendMessage] ⏭️ ${HUMAN_TAKEOVER_SKIP_REASON}: ${contactId} action ${action?.id} — a person texted at ${manual.at}`);
+  emitEvent({
+    event_type: 'agentic.human_takeover', source: 'send_message', entity_type: 'contact', entity_id: contactId,
+    ghl_contact_id: contactId, priority: 'low', bypass_filter: true,
+    payload: { action_id: action?.id ?? null, channel, ...detail },
+    idempotency_key: `human_takeover_${action?.id ?? contactId}_${manual.message_id || manual.at}`,
+  }).catch(() => {});
+  return { skip: { skipped: true, reason: HUMAN_TAKEOVER_SKIP_REASON, contact_id: contactId, channel, ...detail } };
+}
+
 function fingerprintReply({ action, contactId, message, channel, triggerMessage, generated, ruleFields = null }) {
   if (action?.id == null) return;   // no stable message_ref → no row (never a duplicate key)
   const bot = generated?._bot_context || null;
   const shadowSkip = turnLockShadowSkips.get(String(action.id)) || null;
   if (shadowSkip) turnLockShadowSkips.delete(String(action.id));
-  const snapshot = bot?.input_snapshot || ruleFields?.input_snapshot || null;
+  const takeoverShadow = humanTakeoverShadowSkips.get(String(action.id)) || null;
+  if (takeoverShadow) humanTakeoverShadowSkips.delete(String(action.id));
+  const baseSnapshot = bot?.input_snapshot || ruleFields?.input_snapshot || null;
+  const snapshot = takeoverShadow ? { ...(baseSnapshot || {}), human_takeover_shadow_would_skip: true, human_takeover: takeoverShadow } : baseSnapshot;
   recordMessageContextDetached({
     // 2026-10-18 (Phase 1 item 4): every reply row names its plan step, for the
     // next turn's planner. A rule's own fixed text ran on no plan.
@@ -3047,6 +3089,12 @@ export async function executeSendMessage(action, context) {
   if (shadowSkip) {
     turnLockShadowSkips.delete(String(action.id));
     if (result && typeof result === 'object') result = { ...result, turn_lock_shadow_would_skip: true, turn_lock_skip_reason: shadowSkip };
+  }
+  // 2026-10-19 (ruling 5): a shadow would-skip on a send that ended without a reply.
+  const takeoverShadow = action?.id != null ? humanTakeoverShadowSkips.get(String(action.id)) : null;
+  if (takeoverShadow) {
+    humanTakeoverShadowSkips.delete(String(action.id));
+    if (result && typeof result === 'object') result = { ...result, human_takeover_shadow_would_skip: true, human_takeover: takeoverShadow };
   }
   return result;
 }
@@ -4260,6 +4308,15 @@ async function executeSendMessageInner(action, context, turnState = { held: null
       };
     }
   }
+
+  // ── A person's text pauses the bot (Mark, 2026-10-19, ruling 5) ──
+  // After the burst checks and before any booking: when someone on our team
+  // texted this lead by hand after the inbound this reply answers (a proactive
+  // send: after the lead's last inbound), this reply is dropped. The lead's
+  // next message is a new turn and is answered normally. No tag, no stop-bot.
+  // HUMAN_TAKEOVER_MODE shadow (default) sends and marks the reply row.
+  const takeover = await checkHumanTakeover({ action, contactId, channel, sourceEventMeta });
+  if (takeover?.skip) return takeover.skip;
 
   // ── Book BEFORE we promise (2026-08-13) ────────────────────────
   // The generated message for a booking turn says "you're locked in". Make

@@ -100,7 +100,9 @@ const IN_FLIGHT_STATUSES = new Set(['pending', 'approved', 'executing']);
 // writes a skipped handler's reason into error_message).
 // duplicate_inbound_text (2026-10-17): the same text arrived twice and the first
 // copy's reply answers it; the backstop must not answer it a third time.
-const HELD_SKIP_REASONS = new Set(['opener_hold', 'duplicate_inbound_text']);
+// 2026-10-19 (Mark, ruling 5): a person texted the lead by hand
+// (human_replied): the turn is answered, never "unanswered".
+const HELD_SKIP_REASONS = new Set(['opener_hold', 'duplicate_inbound_text', 'human_replied']);
 
 // 2026-10-19 (Thomas Geary, 10/12): an email reply is held 6–15 minutes on
 // purpose (decideEmailSendDelay, action_payload.email_ready_at). Measured from

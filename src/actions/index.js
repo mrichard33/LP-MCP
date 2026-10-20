@@ -1254,6 +1254,10 @@ async function executeSingleActionUntracked(action, batchContext = {}, priorBatc
           // (live) or would have (shadow; the 48-hour check reads this flag).
           ...(result?.turn_key ? { turn_key: result.turn_key, owner_rule: result.owner_rule || null } : {}),
           ...(result?.turn_lock_shadow_would_skip ? { turn_lock_shadow_would_skip: true, turn_lock_skip_reason: result.turn_lock_skip_reason || null } : {}),
+          // 2026-10-19 (ruling 5): a person's text decided this skip (human_replied)
+          // or would have (shadow).
+          ...(result?.human_takeover_shadow_would_skip ? { human_takeover_shadow_would_skip: true } : {}),
+          ...(result?.manual_at || result?.human_takeover ? { human_takeover: result.human_takeover || { manual_at: result.manual_at, manual_message_id: result.manual_message_id || null, manual_user_id: result.manual_user_id || null } } : {}),
         },
       });
     }

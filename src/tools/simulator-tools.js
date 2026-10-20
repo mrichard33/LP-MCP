@@ -23,6 +23,7 @@ import { checkRequestSecret } from '../security/request-auth.js';
 import { z } from 'zod';
 import { SCENARIOS, startSimulationJob, getSimulationJob, formatTranscript } from '../simulator/bot-simulator.js';
 import { formatScorecard } from '../simulator/sim-scoring.js';
+import { SIM_MODE_OVERRIDES } from '../simulator/sim-overrides.js';
 
 /** The event a saved gate run is stored as (system_events; no table of its own). */
 export const EVAL_RUN_EVENT = 'agentic.bot_eval_run';
@@ -73,7 +74,8 @@ export const simulatorDeps = {
 };
 
 /** Validate and normalise a run request. Pure; throws a readable error. */
-export function parseSimRequest({ scenario = null, messages_json = null, channel = 'both', nepq_mode = 'live', persona_json = null, title = null, contact_id = null, lead_stage_mode = null, kb_exemplar_mode = null, include_revin_thread = null, runs = null, turn_lock_mode = null } = {}) {
+export function parseSimRequest({ scenario = null, messages_json = null, channel = 'both', nepq_mode = 'live', persona_json = null, title = null, contact_id = null, lead_stage_mode = null, kb_exemplar_mode = null, include_revin_thread = null, runs = null, turn_lock_mode = null,
+  siro_context_mode = null, siro_followup_text_mode = null, rehash_deal_hint_mode = null, human_takeover_mode = null } = {}) {
   let turns = null;
   if (messages_json) {
     try { turns = JSON.parse(messages_json); } catch { throw new Error('messages_json must be a JSON array of strings'); }
@@ -102,7 +104,19 @@ export function parseSimRequest({ scenario = null, messages_json = null, channel
   if (runs != null && runs !== '' && !(Number.isInteger(Number(runs)) && Number(runs) >= 1 && Number(runs) <= 4)) throw new Error('runs must be 1 to 4');
   // 2026-10-18 (Phase 1): try TURN_LOCK_MODE=live in the simulator before Railway's is switched.
   if (turn_lock_mode != null && turn_lock_mode !== '' && !['shadow', 'live'].includes(turn_lock_mode)) throw new Error('turn_lock_mode must be shadow or live');
-  return { scenario: turns ? null : scenario, turns, persona, title, channel, nepqMode: nepq_mode, contactId: contact_id || null, leadStageMode: lead_stage_mode || null, kbExemplarMode: kb_exemplar_mode || null, includeRevinThread: revin, ...(runs != null && runs !== '' ? { runs: Number(runs) } : {}), turnLockMode: turn_lock_mode || null };
+  // 2026-10-19 (handoff v2): the Siro, deal-hint and takeover modes for this run only.
+  const simModes = {};
+  for (const [arg, key, value] of [
+    ['siro_context_mode', 'siroContextMode', siro_context_mode],
+    ['siro_followup_text_mode', 'siroFollowupTextMode', siro_followup_text_mode],
+    ['rehash_deal_hint_mode', 'rehashDealHintMode', rehash_deal_hint_mode],
+    ['human_takeover_mode', 'humanTakeoverMode', human_takeover_mode],
+  ]) {
+    if (value == null || value === '') continue;
+    if (!SIM_MODE_OVERRIDES[key].includes(value)) throw new Error(`${arg} must be ${SIM_MODE_OVERRIDES[key].join(', ')}`);
+    simModes[key] = value;
+  }
+  return { ...(Object.keys(simModes).length ? { simModes } : {}), scenario: turns ? null : scenario, turns, persona, title, channel, nepqMode: nepq_mode, contactId: contact_id || null, leadStageMode: lead_stage_mode || null, kbExemplarMode: kb_exemplar_mode || null, includeRevinThread: revin, ...(runs != null && runs !== '' ? { runs: Number(runs) } : {}), turnLockMode: turn_lock_mode || null };
 }
 
 async function waitFor(job, seconds) {
@@ -134,6 +148,10 @@ export function registerSimulatorTools(server, deps = simulatorDeps) {
       lead_stage_mode: z.string().optional().describe('shadow or live: run with the stored conversation stage recorded only (shadow) or driving the planner (live). Default: Railway\'s LEAD_STAGE_MODE. Kept in memory; nothing is written.'),
       kb_exemplar_mode: z.string().optional().describe('off, shadow or live: past-win examples for this run only (live puts them in the prompt). Default: Railway\'s KB_EXEMPLAR_MODE.'),
       include_revin_thread: z.boolean().optional().describe('true or false: Revin\'s texts in the bot\'s history for this run only (a simulated lead gets a short Revin exchange from two days before; a real contact its real Revin rows). Default: Railway\'s BOT_INCLUDE_REVIN_THREAD.'),
+      siro_context_mode: z.string().optional().describe('off, shadow or live (default: Railway\'s SIRO_CONTEXT_MODE). Only a real contact_id reads Supabase; a simulated lead always carries its persona\'s visit.'),
+      siro_followup_text_mode: z.string().optional().describe('off, shadow or live (default: Railway\'s SIRO_FOLLOWUP_TEXT_MODE). live shows Siro\'s suggested follow-up text to the bot as a reference.'),
+      rehash_deal_hint_mode: z.string().optional().describe('once or every (default: Railway\'s REHASH_DEAL_HINT_MODE). every hints at a better deal on each eligible rehash reply.'),
+      human_takeover_mode: z.string().optional().describe('off, shadow or live (default: Railway\'s HUMAN_TAKEOVER_MODE). live skips a reply once a person has texted the lead.'),
       wait_seconds: z.number().optional().describe('Wait up to this many seconds (max 100) for the result before returning.'),
     },
     async (args) => {
@@ -159,10 +177,14 @@ export function registerSimulatorTools(server, deps = simulatorDeps) {
       lead_stage_mode: z.string().optional().describe('shadow or live (default: Railway\'s LEAD_STAGE_MODE). live runs the stored-stage planner before it is switched on.'),
       kb_exemplar_mode: z.string().optional().describe('off, shadow or live (default: Railway\'s KB_EXEMPLAR_MODE). live puts past-win examples in the prompt before it is switched on.'),
       include_revin_thread: z.boolean().optional().describe('true or false (default: Railway\'s BOT_INCLUDE_REVIN_THREAD). true gives every simulated lead a short Revin exchange from two days before, to compare with and without Revin context.'),
+      siro_context_mode: z.string().optional().describe('off, shadow or live (default: Railway\'s SIRO_CONTEXT_MODE). Only a real contact_id reads Supabase; a simulated lead always carries its persona\'s visit.'),
+      siro_followup_text_mode: z.string().optional().describe('off, shadow or live (default: Railway\'s SIRO_FOLLOWUP_TEXT_MODE). live shows Siro\'s suggested follow-up text to the bot as a reference.'),
+      rehash_deal_hint_mode: z.string().optional().describe('once or every (default: Railway\'s REHASH_DEAL_HINT_MODE). every hints at a better deal on each eligible rehash reply.'),
+      human_takeover_mode: z.string().optional().describe('off, shadow or live (default: Railway\'s HUMAN_TAKEOVER_MODE). live skips a reply once a person has texted the lead.'),
     },
-    async ({ nepq_mode = 'live', lead_stage_mode = null, kb_exemplar_mode = null, include_revin_thread = null, runs = 2, turn_lock_mode = null } = {}) => {
+    async ({ nepq_mode = 'live', lead_stage_mode = null, kb_exemplar_mode = null, include_revin_thread = null, runs = 2, turn_lock_mode = null, siro_context_mode = null, siro_followup_text_mode = null, rehash_deal_hint_mode = null, human_takeover_mode = null } = {}) => {
       let req;
-      try { req = parseSimRequest({ scenario: 'all', channel: 'both', nepq_mode, lead_stage_mode, kb_exemplar_mode, include_revin_thread, runs, turn_lock_mode }); } catch (err) { return text({ error: err.message }); }
+      try { req = parseSimRequest({ scenario: 'all', channel: 'both', nepq_mode, lead_stage_mode, kb_exemplar_mode, include_revin_thread, runs, turn_lock_mode, siro_context_mode, siro_followup_text_mode, rehash_deal_hint_mode, human_takeover_mode }); } catch (err) { return text({ error: err.message }); }
       const job = startSimulationJob({ ...req, gate: true }, deps);
       return text({ job_id: job.id, status: 'running', next: 'call get_bot_simulation with this job_id (wait_seconds up to 100, repeat until done); the scorecard is at the top' });
     },
@@ -209,7 +231,7 @@ export function registerSimulatorRoutes(app, deps = simulatorDeps) {
     if (!process.env.ADMIN_API_TOKEN) return res.status(503).json({ error: 'ADMIN_API_TOKEN is not set; the bot gate is closed' });
     if (!authed(req, res)) return;
     let parsed;
-    try { parsed = parseSimRequest({ scenario: 'all', channel: 'both', nepq_mode: req.body?.nepq_mode || 'live', lead_stage_mode: req.body?.lead_stage_mode || null, kb_exemplar_mode: req.body?.kb_exemplar_mode || null, include_revin_thread: req.body?.include_revin_thread ?? null, runs: req.body?.runs ?? 2, turn_lock_mode: req.body?.turn_lock_mode || null }); }
+    try { parsed = parseSimRequest({ scenario: 'all', channel: 'both', nepq_mode: req.body?.nepq_mode || 'live', lead_stage_mode: req.body?.lead_stage_mode || null, kb_exemplar_mode: req.body?.kb_exemplar_mode || null, include_revin_thread: req.body?.include_revin_thread ?? null, runs: req.body?.runs ?? 2, turn_lock_mode: req.body?.turn_lock_mode || null, siro_context_mode: req.body?.siro_context_mode || null, siro_followup_text_mode: req.body?.siro_followup_text_mode || null, rehash_deal_hint_mode: req.body?.rehash_deal_hint_mode || null, human_takeover_mode: req.body?.human_takeover_mode || null }); }
     catch (err) { return res.status(400).json({ error: err.message }); }
     const job = startSimulationJob({ ...parsed, gate: true }, deps);
     return res.status(202).json({ job_id: job.id, status_url: `/admin/bot-simulate/${job.id}` });

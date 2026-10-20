@@ -159,7 +159,7 @@ export async function processRecording(recordingId, {
     rec = res.data?.data && res.data.data.id ? res.data.data : res.data;
   }
   const userNames = deps.userNames || await siroUserNames({ siro });
-  const row = normalizeRecording(rec, { source, flags, userNames });
+  const row = normalizeRecording(rec, { source, flags, userNames, followupTextMode: siroModes(env).followupText });
   if (!row) return { result: 'unreadable' };
   if (!rowMatchesConversationType(row, env)) return { result: 'other_conversation_type' };
 

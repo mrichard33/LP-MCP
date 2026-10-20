@@ -18,6 +18,13 @@
  * prompt blocks. An unexplained snapshot diff means the change is wrong, not
  * the snapshot. Map: docs/handoffs/response-generator-split-map.md.
  *
+ * v2.11.0 — 2026-10-20. HANDOFF V2 (Mark's rulings of 2026-10-19). REHASH_DEAL_HINT_MODE=every
+ *   puts one varied deal hint on every eligible rehash reply and the "If I could …, would
+ *   you …?" bridge (rehash-nepq.js); the plan block names the hint. SIRO_FOLLOWUP_TEXT_MODE=
+ *   live adds Siro's suggested text to the PRESENTATION block as a reference, and a reply
+ *   that copies it gets one re-write. Every PRESENTATION line passes dropSensitiveDetail.
+ *   With the defaults (once / shadow) the prompts are unchanged.
+ *
  * v2.10.0 — 2026-10-19. NEPQ-ONLY PROMPT (Mark's decision 2026-10-15; PR2 step 2). With
  *   NEPQ live the system prompt no longer teaches the Antifragile trust model, Brunson's
  *   Expert / Traffic / DotCom Secrets, Hook-Story-Offer, buyer stages or story arcs, and
@@ -427,6 +434,7 @@ import { resolveServicePhone } from './services/market-phone.js';
 // See src/prompts/response-generator/index.js.
 import * as P from './prompts/response-generator/index.js';
 import { isRehashContact, normalizeRehashCall, stripOfferTalk, bestDealHintUsed, REHASH_NUMBER_DEFAULT, REHASH_REP_CUSTOM_VALUE } from './agentic/rehash.js';
+import { rehashDealHintMode } from './agentic/rehash-nepq.js';
 import { getCustomValue } from './services/ghl-custom-values.js';
 import { dialWindowPromptLine, canPromiseImmediateCall } from './dial-window.js';
 import { normalizeRepNote } from './agentic/rep-note.js';
@@ -456,7 +464,7 @@ import { postDemoPlannerMode } from './agentic/post-demo-turn.js';
 import { emailPostDemoMode, planPostDemoEmail, enforcePostDemoEmail, planStepFor as postDemoEmailStepFor } from './agentic/post-demo-email.js';
 import { rehashCallSlotsMode, readRehashCallSlots, rehashCallBooking } from './agentic/rehash-slots.js';
 import { isInRehash, rehashLeadFromContext, rehashRoutingMode } from './agentic/rehash-state.js';
-import { enforcePresentationGuard } from './siro/presentation-guard.js';
+import { enforcePresentationGuard, copiesSiroDraft } from './siro/presentation-guard.js';
 import { planNepqTurn, enforceNepqPlan, referenceRetryNote, nepqBackboneMode, prefersCall as nepqPrefersCall, objectionType as nepqObjectionType, TIME_REQUEST_RX as NEPQ_TIME_REQUEST_RX, SCHEDULE_ASK_RX as NEPQ_SCHEDULE_ASK_RX,REPEAT_COMPLAINT_RX as NEPQ_REPEAT_COMPLAINT_RX, bookingOpenInThread as nepqBookingOpenInThread, dropUnaskedCallOffer, leadWantsCall as nepqLeadWantsCall, isServiceCallback as nepqIsServiceCallback, planStepOf as nepqPlanStepOf } from './agentic/nepq-planner.js';
 // A layer3 script that forbids a time offer this turn (follow_up_scheduled,
 // OBJ_PRICE_STRIKE3's "no slot grid").
@@ -467,11 +475,11 @@ import {
 } from './agentic/service-area-turn.js';
 
 /**
- * v2.10.0 — the header version above, as a value. Stamped (with the deployed
+ * v2.11.0 — the header version above, as a value. Stamped (with the deployed
  * git sha) onto every fingerprint so a replay knows which generator wrote the
  * reply. Bump it with the header note.
  */
-export const RESPONSE_GENERATOR_VERSION = 'v2.10.0';
+export const RESPONSE_GENERATOR_VERSION = 'v2.11.0';
 
 // Provider + model resolved at call time by the shared client from the
 // `response_generator` fn key (customer_facing group). Legacy
@@ -4599,7 +4607,9 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // 2026-10-11: "the best deal possible" is the one approved hint, once per
   // conversation; a second "best deal" is stripped like any other offer talk.
   if (rehash) {
-    const offer = stripOfferTalk(validated.message, { hintUsed: bestDealHintUsed(context?.conversation_recent || []) });
+    // 2026-10-19 (Mark, ruling 4): with REHASH_DEAL_HINT_MODE=every the hint is
+    // never "used up"; everything else in the offer test still strips.
+    const offer = stripOfferTalk(validated.message, { hintUsed: rehashDealHintMode() !== 'every' && bestDealHintUsed(context?.conversation_recent || []) });
     if (offer.stripped.length) {
       console.warn(`[ResponseGenerator] rehash offer talk stripped for ${contactId}: ${offer.stripped.join(' | ').slice(0, 200)}`);
       validated.message = offer.text;
@@ -5085,6 +5095,8 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       plan_step: nepqPlanStepOf(nepqPlan),
       // 2026-10-13: the third price ask's call offer is the plan, not unasked.
       ...(nepqPlan.call_offer_ok ? { call_offer_ok: true } : {}),
+      // 2026-10-19 (ruling 4): REHASH_DEAL_HINT_MODE=every, this turn's hint.
+      ...(nepqPlan.hint_line ? { hint_line: nepqPlan.hint_line } : {}),
     };
     const idf = identityState?.identity || {};
     const knownFirst = idf.first_name || context.lead?.first_name || null;
@@ -5453,6 +5465,20 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     if (pres.changed) {
       console.log(`[Siro] ${contactId} presentation guard: ${pres.changes.join(',')}`);
       validated.message = pres.text;
+    }
+    // 2026-10-19 (Mark, ruling 2): Siro's suggested text, shown with
+    // SIRO_FOLLOWUP_TEXT_MODE=live, is a reference for topic and tone. A reply
+    // that is mostly that draft gets one re-write; a second copy ships as the
+    // guarded draft (it is already cleaned of money and sensitive detail).
+    const shownDraft = context.lead_facts?.siro_followup_text_live === true ? context.siro?.presentation?.followup_text : null;
+    if (shownDraft && copiesSiroDraft(validated.message, shownDraft)) {
+      if (redraftOk()) {
+        console.warn(`[Siro] ${contactId} reply copies Siro's suggested text — one re-write`);
+        const err = new Error('siro_draft_copied');
+        err.regenerationNote = "IMPORTANT: the previous draft copied Siro's suggested follow-up text. That text is a reference for topic and tone only. Write your own reply, in your own words, for this lead's last message.";
+        throw err;
+      }
+      console.warn(`[Siro] ${contactId} siro_draft_copied after the re-write: shipping the guarded draft`);
     }
     // Human voice once more, last (2026-10-06 bot gate): the first pass runs
     // before the NEPQ and booking guards, and a sentence they drop can leave

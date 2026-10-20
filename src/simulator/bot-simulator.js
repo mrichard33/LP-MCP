@@ -32,6 +32,9 @@ import { scopeDqKind } from '../agentic/scope-dq.js';
 import { applyBookingTruth } from '../agentic/booking-claim.js';
 import { buildLeadFacts } from '../agentic/lead-facts.js';
 import { buildPresentationFacts } from '../siro/presentation-facts.js';
+import { siroModes } from '../siro/config.js';
+import { humanTakeoverMode, takeoverDecision } from '../agentic/human-takeover.js';
+import { rehashDealHintMode } from '../agentic/rehash-nepq.js';
 import { scoreRun, compareScorecards, combineRuns } from './sim-scoring.js';
 import { memoryTurnLockStore, claimTurn, releaseTurn } from '../agentic/turn-lock-io.js';
 import { turnLockMode } from '../agentic/turn-lock.js';
@@ -99,7 +102,7 @@ export function withPersonaLp(context, persona) {
   // visit (persona.lp.siro: siro_recordings rows), as SIRO_CONTEXT_MODE=live
   // would read it from Supabase.
   const siroRows = Array.isArray(lp.siro) && lp.siro.length ? lp.siro : null;
-  next.lead_facts = buildLeadFacts({ lp: ctxLp, lpLead: { zip: lp.zip, city: lp.city, address: lp.address }, lead: context.lead, siro: siroRows });
+  next.lead_facts = buildLeadFacts({ lp: ctxLp, lpLead: { zip: lp.zip, city: lp.city, address: lp.address }, lead: context.lead, siro: siroRows, siroFollowupTextLive: siroModes().followupText === 'live' });
   if (siroRows) next.siro = { presentation: buildPresentationFacts(siroRows) };
   return next;
 }
@@ -286,6 +289,14 @@ export const SCENARIOS = Object.freeze({
   // Paul (d2hmgL9fAAWvtuu7NN5q, 2026-10-17 14:45): two texts 3 s apart, two
   // replies from two rules. One reply, and the second rule's claim is refused.
   two_texts_one_reply_sms: { title: 'Two texts 3 s apart get one reply (Paul)', family: 'booking', persona: DANA, channels: ['sms'], secondRule: 'LAYER3_DISPATCH', turns: [['Still got a couple more quotes to come in', 'Sounds good 👍']] },
+  // ── 2026-10-19 (Mark, handoff v2): "If I could …, would you …?", a hint on every reply, a person's text ──
+  // The hint and takeover checks apply only when the run's mode is on
+  // (REHASH_DEAL_HINT_MODE=every / HUMAN_TAKEOVER_MODE=live, by Railway or by
+  // the gate's override); otherwise these are plain rehash conversations.
+  rehash_if_i_could: { title: 'Rehash: price twice, the bridge is "If I could …, would you …?" (ruling 3)', family: 'rehash', persona: REHASH_LEAD, channels: ['sms'], turns: ['It is just too expensive for us right now', 'Compared to the other quote we got'] },
+  rehash_hint_every_turn: { title: 'Rehash: a varied deal hint on every eligible reply (ruling 4)', family: 'rehash', persona: REHASH_LEAD, channels: ['sms'], turns: ['Hi, I got the proposal', 'We are still going over it', 'Mostly wondering about the sliding door in the back'] },
+  rehash_hint_not_after_no: { title: 'Rehash: no deal hint after a no (ruling 4)', family: 'rehash', expect: { 2: { question_allowed: false }, 3: { question_allowed: false } }, persona: REHASH_LEAD, channels: ['sms'], turns: ['Hi, I got the proposal', 'Not interested at this time', 'No thanks, we are good'] },
+  human_takeover_skip_one: { title: "A person texts by hand: the pending reply drops, the next one goes (ruling 5)", family: 'rehash', persona: REHASH_LEAD, channels: ['sms'], turns: ['Hi, I have a question about the proposal', { manual: 'Hi Monica, John here. Happy to walk you through it. Want me to give you a call?' }, 'Sure, a call works. Thanks John'] },
   // 2026-10-16 (Siro PR 1): the visit's price hesitation is in LEAD FACTS.
   rehash_siro_price_objection: { title: 'Rehash with the Siro visit: price was the hesitation', family: 'rehash', persona: REHASH_SIRO_LEAD, channels: ['sms'], turns: ['Hi, got your message. We are still thinking it over'] },
   // ── 2026-10-16 (Melissa, 6U6uceZGMQRz8XEQc9Lk): hearing the time she picked ──
@@ -506,6 +517,23 @@ export async function simulateSms(plan, { nepqMode = 'live', generate, buildReal
       });
       continue;
     }
+    // 2026-10-19 (Mark, ruling 5): a person on our team texts by hand while the
+    // bot's reply to the last inbound is still pending. Live drops that reply;
+    // shadow keeps it and marks it. The person's text joins the thread either way.
+    if (next && typeof next === 'object' && next.manual) {
+      const takeoverMode = humanTakeoverMode();
+      const at = new Date(nowMs + i * 60000 - 45000).toISOString();
+      const prev = transcript.at(-1);
+      const decision = takeoverDecision({ mode: takeoverMode, manual: prev?.bot?.length ? { at } : null });
+      if (prev && decision === 'skip') {
+        const dropped = new Set(prev.bot);
+        for (let k = thread.length - 1; k >= 0; k--) if (thread[k].direction === 'outbound' && dropped.has(thread[k].text)) thread.splice(k, 1);
+        Object.assign(prev, { dropped_bot: prev.bot, bot: null, human_takeover: 'skipped' });
+      } else if (prev && decision === 'would_skip') prev.human_takeover = 'would_skip';
+      thread.push({ direction: 'outbound', channel: 'sms', text: String(next.manual), type: 'text', timestamp: at, source: 'app', manual: true });
+      transcript.push({ turn: i + 1, customer: '(a person on our team texts the lead)', manual: String(next.manual), bot: null, intent: null, nepq: null, would_do: [], stage: null, seconds: 0, human_takeover_mode: takeoverMode });
+      continue;
+    }
     const burstTexts = Array.isArray(next) ? next.map(String) : null;
     const text = burstTexts ? burstTexts.join('\n') : (typeof next === 'function' ? next((transcript.at(-1)?.bot || []).at(-1) || '') : next);
     const at = new Date(nowMs + i * 60000).toISOString();
@@ -604,20 +632,28 @@ export async function simulateSms(plan, { nepqMode = 'live', generate, buildReal
     const auto = plan.autoAnswer && autos < MAX_AUTO_ANSWERS ? autoAnswerFor(reply, p, { scriptDone: !queue.length }) : null;
     if (auto) { autos++; queue.unshift(auto); transcript.at(-1).next_auto = true; }
   }
-  return { channel: 'sms', scenario: plan.key, title: plan.title, family: plan.family || 'new_lead', expect: plan.expect || null, nepq_mode: nepqMode, lead_stage_mode: stageDeps.env.LEAD_STAGE_MODE, turn_lock_mode: lockMode, contact_id: plan.contactId || null, transcript };
+  return {
+    channel: 'sms', scenario: plan.key, title: plan.title, family: plan.family || 'new_lead', expect: plan.expect || null, nepq_mode: nepqMode, lead_stage_mode: stageDeps.env.LEAD_STAGE_MODE, turn_lock_mode: lockMode, contact_id: plan.contactId || null,
+    // 2026-10-19: the modes this conversation ran under (Railway's, or the gate's override).
+    rehash_deal_hint_mode: rehashDealHintMode(), human_takeover_mode: humanTakeoverMode(),
+    transcript,
+  };
 }
 
 /** Run one scenario on the channels it applies to. */
-export async function runSimulation({ scenario, turns, persona, title, contactId = null, channel = 'both', nepqMode = 'live', leadStageMode = null, kbExemplarMode = null, includeRevinThread = null, turnLockMode: lockMode = null }, deps) {
-  // KB_EXEMPLAR_MODE (2026-10-12) and BOT_INCLUDE_REVIN_THREAD (2026-10-19) for
-  // this run only; null = Railway's value. One wrap: a second store.run would
-  // replace the first.
-  if (kbExemplarMode || typeof includeRevinThread === 'boolean') {
-    const results = await runWithSimOverrides({ kbExemplarMode, includeRevinThread }, () => runSimulation({ scenario, turns, persona, title, contactId, channel, nepqMode, leadStageMode, turnLockMode: lockMode }, deps));
+export async function runSimulation({ scenario, turns, persona, title, contactId = null, channel = 'both', nepqMode = 'live', leadStageMode = null, kbExemplarMode = null, includeRevinThread = null, turnLockMode: lockMode = null, simModes = null }, deps) {
+  // KB_EXEMPLAR_MODE (2026-10-12), BOT_INCLUDE_REVIN_THREAD (2026-10-19) and the
+  // handoff v2 modes (simModes: SIRO_CONTEXT_MODE, SIRO_FOLLOWUP_TEXT_MODE,
+  // REHASH_DEAL_HINT_MODE, HUMAN_TAKEOVER_MODE; 2026-10-19) for this run only;
+  // null = Railway's value. One wrap: a second store.run would replace the first.
+  const modes = simModes && Object.keys(simModes).length ? simModes : null;
+  if (kbExemplarMode || typeof includeRevinThread === 'boolean' || modes) {
+    const results = await runWithSimOverrides({ kbExemplarMode, includeRevinThread, ...(modes || {}) }, () => runSimulation({ scenario, turns, persona, title, contactId, channel, nepqMode, leadStageMode, turnLockMode: lockMode }, deps));
     return results.map(r => ({
       ...r,
       ...(kbExemplarMode ? { kb_exemplar_mode: kbExemplarMode } : {}),
       ...(typeof includeRevinThread === 'boolean' ? { include_revin_thread: includeRevinThread } : {}),
+      ...(modes ? { sim_modes: modes } : {}),
     }));
   }
   const plan = resolveScenario({ scenario, turns, persona, title, contactId });

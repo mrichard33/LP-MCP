@@ -22,7 +22,7 @@
  * Pure: no network, no database, no clock unless `nowMs` is passed.
  */
 
-import { presentationViolations } from '../siro/presentation-guard.js';
+import { presentationViolations, copiesSiroDraft } from '../siro/presentation-guard.js';
 import { claimsWarrantySent } from '../agentic/warranty-request.js';
 import { humanizeReply } from '../agentic/human-voice.js';
 import { enforceTeamVoice } from '../agentic/team-voice.js';
@@ -36,7 +36,7 @@ import { dropUnaskedCallOffer, leadWantsCall, isMoneyFigure, URGENCY_RX, CLAIMS_
 import { sentenceAsks } from '../agentic/post-demo-email.js';
 
 /** Bump when a check is added or changed, so scorecards from two versions are not compared as one. */
-export const INVARIANTS_VERSION = '2026-10-16.1';
+export const INVARIANTS_VERSION = '2026-10-19.1';
 
 /** The prompt's own SMS ceiling (CHANNEL CONSTRAINTS: "320 max"). */
 export const SMS_MAX_CHARS = 320;
@@ -72,7 +72,8 @@ function sentences(text) {
  * @param {string} [ctx.postDemoStep]   the post-demo plan's step; null = not a post-demo turn; undefined skips the post-demo checks
  * @param {string} [ctx.postDemoEmailStep] the post-demo email decline turn ('decline_first' | 'decline_close'); null = none; undefined skips
  * @param {boolean}[ctx.warrantySent]   this turn sends the warranty files; undefined skips the warranty-claim check
- * @param {object} [ctx.presentation]   the Siro visit facts the prompt showed; undefined skips the presentation check
+ * @param {object} [ctx.presentation]   the Siro visit facts the prompt showed; undefined skips the presentation check;
+ *   its followup_text (only when SIRO_FOLLOWUP_TEXT_MODE=live showed it) arms siro_draft_copied (2026-10-19)
  * @returns {{ pass: boolean, violations: Array<{code: string, detail: string}>, skipped: string[], metrics: {chars: number, questions: number} }}
  */
 // The clock times a message names, normalized and sorted ("10:00 AM" → "10:00am").
@@ -230,6 +231,10 @@ export function checkReply(reply, ctx = {}) {
   // With the PRESENTATION block rendered: no dollar figure, no "your rep said".
   if (ctx.presentation === undefined) skipped.push('presentation');
   else for (const code of presentationViolations(text, ctx.presentation)) fail(code, text);
+  // 2026-10-19 (Mark, ruling 2): Siro's suggested follow-up is a reference for
+  // topic and tone; a reply that is mostly that draft was sent as written.
+  // Only when the bot was shown the draft (presentation.followup_text).
+  if (ctx.presentation?.followup_text && copiesSiroDraft(text, ctx.presentation.followup_text)) fail('siro_draft_copied', text);
 
   // ── the same two times, never a third time (2026-10-13) ────────────────
   if (!Array.isArray(ctx.conversation)) skipped.push('repeat_slot_offer');

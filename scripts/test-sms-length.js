@@ -28,7 +28,8 @@ test('the version was bumped for the new check and the cap is the prompt\'s 320'
   // 2026-10-13.2: times_after_sign_off and repeat_slot_offer (Erica Hilts).
   // 2026-10-15.1: warranty_claim_without_file (Jeff Clark).
   // 2026-10-15.2: post_demo_rebuttal / _unbacked_follow_up / question_after_post_demo_stop (Shawn Eastman).
-  assert.equal(INVARIANTS_VERSION, '2026-10-16.1');
+  // 2026-10-19.1: siro_draft_copied (Siro's suggested text is a reference; handoff v2 ruling 2).
+  assert.equal(INVARIANTS_VERSION, '2026-10-19.1');
   assert.equal(SMS_MAX_CHARS, 320);
 });
 
