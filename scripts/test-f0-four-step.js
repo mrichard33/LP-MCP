@@ -196,3 +196,14 @@ test('2026-10-20: a couple\'s name field gives its first person (the text opens 
   assert.equal(firstPersonName('n/a'), '');
   assert.ok(checkF0Copy(GOOD.replace(/^James/, 'Jmaes'), opts(1)).includes('first_name_not_first'));
 });
+
+test('2026-10-20: a "- John" after the call question goes at P1-P4, stays at P5; "-tion" and stop words fold on both sides', async () => {
+  const { dropTrailingSignature } = await import('../src/siro/f0-four-step.js');
+  const q = 'If I could help, would you be open to a quick call with John?';
+  assert.equal(dropTrailingSignature(`${q} - John`, 1), q);
+  assert.equal(dropTrailingSignature(`${q} — John`, 4), q);
+  assert.equal(dropTrailingSignature(q, 2), q);
+  assert.equal(dropTrailingSignature('Thanks again, Dale. - John', 5), 'Thanks again, Dale. - John');
+  assert.equal(sharedWords("protecting the home's value and keeping your insurance in good shape",
+    ['They want hurricane protection because it affects their homeowners insurance', 'They just moved into the home']), 2);
+});

@@ -17,7 +17,7 @@ import { validateSafety } from '../nurture/nurture-safety-validator.js';
 import { loadF0Context } from './f0-context.js';
 import { postDemoInterrupt } from './f0-interrupts.js';
 import { checkF0Copy, f0RetryNote } from './f0-copy-checks.js';
-import { parseFourStepOutput, FOUR_STEP_WAIT_HOURS } from './f0-four-step.js';
+import { parseFourStepOutput, dropTrailingSignature, FOUR_STEP_WAIT_HOURS } from './f0-four-step.js';
 
 /**
  * @param {{formula?: 'v1'|'four_step'}} [o]  2026-10-19: try the Four-Step
@@ -49,7 +49,7 @@ export async function previewF0Generation(contactId, position, { deps = {}, form
     let invalid = null;
     if (fourStep) {
       const parsed = parseFourStepOutput(raw);
-      if (parsed.ok) { slots = parsed.slots; raw = { ...raw, sms_body: parsed.text, next_wait_hours: FOUR_STEP_WAIT_HOURS[pos] }; }
+      if (parsed.ok) { slots = parsed.slots; raw = { ...raw, sms_body: dropTrailingSignature(parsed.text, pos), next_wait_hours: FOUR_STEP_WAIT_HOURS[pos] }; }
       else { invalid = parsed.error; raw = { ...(raw || {}), sms_body: String(raw?.text || '') }; }
     }
     const out = applyAutofix(raw, { smsMax: null }).output;

@@ -85,11 +85,16 @@ function signedBy(text, name) {
 // stop word, a plural or -ing/-ed ending folded ("rotting" = "rot",
 // "wanted" = "want"), so the lead's words match Siro's summary of them.
 const GROUND_STOP = new Set([...STOPWORDS, ...("they're it's that's really still make made sure think going getting fair understand totally makes sense customer homeowner homeowners visit".split(' '))]);
+// 2026-10-20 (the first Four-Step previews): "-tion" folds too ("protection" =
+// "protect"), and the stop list is read again AFTER the fold, so "home's" and
+// "windows" are stop words on both sides: before, the slot kept "home" while
+// the visit facts dropped it, and a grounded slot read as ungrounded.
 function stem(w) {
-  return w.replace(/'s$/, '').replace(/(?:ing|ed|es|s)$/, '').replace(/(.)\1$/, '$1');
+  return w.replace(/'s$/, '').replace(/(?<=t)ions?$/, '').replace(/(?:ing|ed|es|s)$/, '').replace(/(.)\1$/, '$1');
 }
 export function contentStems(s) {
-  return new Set(tokens(s).filter(w => !GROUND_STOP.has(w)).map(stem).filter(w => w.length >= 3));
+  return new Set(tokens(s).filter(w => !GROUND_STOP.has(w)).map(stem)
+    .filter(w => w.length >= 3 && !GROUND_STOP.has(w) && !GROUND_STOP.has(`${w}s`)));
 }
 /** How many content words a slot shares with the visit facts it must come from. Pure. */
 export function sharedWords(slot, sources) {

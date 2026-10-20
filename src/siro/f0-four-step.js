@@ -128,6 +128,19 @@ export function groundingSources(facts) {
 }
 
 /**
+ * 2026-10-20 (the first Four-Step previews): P1-P4 end on the call question and
+ * carry no signature, yet the model still added "- John" after the "?" on one
+ * lead, which failed the call-question check and the length cap. The text is
+ * code-owned in that one place: a trailing dash + name after a question goes.
+ * P5 keeps its signature. Pure.
+ */
+export function dropTrailingSignature(text, position) {
+  const t = String(text ?? '').trim();
+  if (Number(position) >= 5) return t;
+  return t.replace(/\?\s*[-–—]+\s*[A-Z][\w.'’-]*(?:\s+[A-Z][\w.'’-]*)?\s*$/, '?');
+}
+
+/**
  * The model's Four-Step answer, validated strictly. Returns { ok, slots, text,
  * error }: every slot a string or null, text a non-empty string. Pure.
  */
