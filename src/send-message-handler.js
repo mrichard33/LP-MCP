@@ -4337,6 +4337,8 @@ async function executeSendMessageInner(action, context, turnState = { held: null
       tzLabel: generated.slot_tz_label || 'ET',
       // A Rehash Call is checked for the rep it is booked with (2026-10-09).
       ...(cap.rehash_call ? { userId: cap.assigned_user_id || null, noticeMs: 30 * 60_000 } : {}),
+      // A Phone Presentation (2026-10-20) uses the call notice too.
+      ...(cap.phone_presentation ? { noticeMs: 30 * 60_000 } : {}),
       // 2026-10-15 (Mark, R1): an in-home time the lead's market can no longer
       // take (full, unfiled, a meeting) reads as taken, so the two nearest
       // times the market CAN take are offered instead.

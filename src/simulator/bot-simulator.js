@@ -83,6 +83,10 @@ const NICK = {
  * simulator's seam for LP notes, a disposition and the property ZIP. Pure.
  */
 export function withPersonaLp(context, persona) {
+  // 2026-10-20 (handoff v3): a persona may carry its open objection state
+  // (persona.objectionState: { state_code, attempt_number }), as
+  // context-builder's fetchOpenObjectionState would read it.
+  if (persona?.objectionState) context = { ...context, objection_state: persona.objectionState };
   const lp = persona?.lp;
   if (!lp) return context;
   const ctxLp = {
@@ -118,6 +122,13 @@ const KATY = { firstName: 'Dana', lastName: 'Sim', phone: '+13525550101', email:
 const REHASH_LEAD = {
   firstName: 'Monica', lastName: 'Sim', phone: '+17275550177', email: null, postalCode: '33711', tags: ['rehash'],
   lp: { disposition: 'OPPFDN', lastAppointmentDaysAgo: 7, zip: '33711', city: 'Saint Petersburg', address: '400 Oak St' },
+};
+
+// 2026-10-20 (handoff v3): a lead whose visit ran with one decision maker (LP 1Leg).
+const ONE_LEG_LEAD = {
+  firstName: 'Pat', lastName: 'Sim', phone: '+13525550188', email: null, postalCode: '33908',
+  objectionState: { state_code: 'APPOINTMENT_DISRUPTION.one_leg', parent_state: 'APPOINTMENT_DISRUPTION', attempt_number: 1 },
+  lp: { disposition: '1Leg', zip: '33908', city: 'Fort Myers', address: '1200 Palm Ave' },
 };
 
 // 2026-10-16 (Siro PR 1): the same rehash lead, with the Siro recording of
@@ -267,6 +278,13 @@ export const SCENARIOS = Object.freeze({
   // ── 2026-10-13 (Erica Hilts): a price ask, then a goodbye, twice ──
   price_then_goodbye: { title: 'Price ask, then "have a good day" (Erica Hilts)', family: 'objection', expect: { 3: { question_allowed: false, no_clock: true }, 4: { question_allowed: false, no_clock: true } }, persona: DANA, turns: ["Hi, I'm looking to get a bay window. The area is about 6ft wide", "Ok I see. What's an average price including installation?", 'Thank you for your time, just needing an average estimation, not exact pricing. Have a good day.', 'I can call back when I have more time. Ty'] },
   slider_only: { title: 'One sliding glass door (meets the minimum)', family: 'booking', persona: DANA, autoAnswer: true, turns: ['I need to replace our sliding glass door', 'Yes, please set up a visit'] },
+  // ── 2026-10-20 (handoff v3): the 1 Leg phone presentation ──
+  // A 1 Leg contact (open state APPOINTMENT_DISRUPTION.one_leg) is offered a
+  // phone presentation with both decision makers, never another visit; a lead
+  // NOT in that state who says the spouse is away keeps the normal offer. The
+  // 1 Leg check applies only when PHONE_PRESENTATION_CALENDAR_ID is set.
+  one_leg_phone_presentation: { title: '1 Leg: reschedule ask gets the phone presentation, both decision makers', family: 'booking', persona: ONE_LEG_LEAD, channels: ['sms'], turns: ['Can we reschedule? My husband had to work when the rep came.'] },
+  absent_spouse_normal_offer: { title: 'Not 1 Leg: "my wife isn\'t home" keeps the normal offer', family: 'booking', persona: DANA, channels: ['sms'], turns: ["My wife isn't home right now but we want new windows. Can we set up a time?"] },
   // ── 2026-10-16 (framework cleanup, Phase 0): the post-demo rehash track ──
   // SMS only: rehash is the SMS reply writer's (the live chat never plans it).
   rehash_not_at_this_time: { title: 'Rehash: "Not at this time", then a second no', family: 'rehash', expect: { 2: { question_allowed: false }, 3: { question_allowed: false, step: ['post_demo_stop', 'handoff'] } }, persona: REHASH_LEAD, channels: ['sms'], turns: ['Hi, I got the proposal', 'Not at this time. Thanks', 'No, we are good'] },

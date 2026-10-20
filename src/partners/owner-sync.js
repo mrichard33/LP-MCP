@@ -17,8 +17,14 @@
 //      an earlier decision already aimed it at a partner (so a lead that moved in
 //      after go-live stays the partner's, and a failed write is retried). The 314
 //      older RFED leads are never touched (no backfill).
-//   3. No match: the owner is returned ONLY when GHL's current owner is a partner
-//      user (rule 8). An internal owner is never changed.
+//   3. No match: the owner is returned ONLY for a contact THIS code assigned (an open
+//      partner_owner_assignments row) and whose GHL owner is still that partner
+//      (handoff v3, Mark 2026-10-20). An internal owner is never changed (rule 8).
+//   3b. A partner GHL put there itself is never ours to move: GHL S5.2 Appointment
+//      Rescue v2, branch "I. 1 Leg", assigns 1 Leg leads to Ross on its own. With no
+//      open assignment for that partner, a return or a reassign is logged
+//      skipped_not_ours and nothing is written; a matching lead whose owner is
+//      already that partner is a noop and creates no assignment.
 //   4. A dispositioned or cancelled lead that stays in RFED keeps the partner (rule
 //      4): the branch decides, never the disposition.
 //
@@ -48,7 +54,7 @@ const WRITE_REASONS = new Set(['assigned', 'reassigned', 'returned']);
 const CARD_REASONS = new Set(['assigned', 'reassigned', 'returned', 'failed']);
 // A non-write reason identical to the lead's last one is not logged again (an old
 // RFED lead LP touches every day must not grow one skipped_pre_golive row a pass).
-const QUIET_REPEAT = new Set(['noop', 'skipped_pre_golive', 'no_ghl_contact']);
+const QUIET_REPEAT = new Set(['noop', 'skipped_pre_golive', 'skipped_not_ours', 'no_ghl_contact']);
 
 const norm = (v) => (v == null ? '' : String(v).trim().toLowerCase());
 
@@ -64,10 +70,12 @@ export function partnerSyncConfig(env = process.env) {
 
 const inFlight = new Set();
 let recentFailed = null; // { ids:Set, at }
+let openAssigned = null; // { ids:Set, at } contacts with an open partner_owner_assignments row
 
 export function __resetForTests() {
   inFlight.clear();
   recentFailed = null;
+  openAssigned = null;
 }
 
 async function defaultDeps(deps) {
@@ -98,6 +106,60 @@ async function recentFailedLeadIds(d) {
   const ids = new Set([...latest].filter(([, reason]) => reason === 'failed').map(([id]) => id));
   recentFailed = { ids, at: now };
   return ids;
+}
+
+/** Contacts this code assigned to a partner and has not handed back (cached 60 s). */
+async function openAssignmentContactIds(d) {
+  const now = d.now();
+  if (openAssigned && now - openAssigned.at < RECENT_CACHE_MS) return openAssigned.ids;
+  const { data, error } = await d.supabase.from('partner_owner_assignments')
+    .select('ghl_contact_id')
+    .is('released_at', null)
+    .limit(5000);
+  if (error) throw new Error(`partner_owner_assignments read failed: ${error.message}`);
+  const ids = new Set((data || []).map((r) => String(r.ghl_contact_id)));
+  openAssigned = { ids, at: now };
+  return ids;
+}
+
+/** The contact's open assignment (live read), or null. A failed read throws: could not tell. */
+async function openAssignmentFor(d, contactId) {
+  const { data, error } = await d.supabase.from('partner_owner_assignments')
+    .select('ghl_contact_id, lp_lead_id, partner_name, ghl_user_id, assigned_at, released_at')
+    .eq('ghl_contact_id', String(contactId))
+    .is('released_at', null)
+    .maybeSingle();
+  if (error) throw new Error(`partner_owner_assignments read failed: ${error.message}`);
+  return data || null;
+}
+
+/** Written BEFORE the GHL write: an owner we set is always one we can hand back. */
+async function claimAssignment(d, { contactId, lead, partnerName, userId }) {
+  const { error } = await d.supabase.from('partner_owner_assignments').upsert({
+    ghl_contact_id: String(contactId),
+    lp_lead_id: String(lead.lp_lead_id), // lead-id-ok: machine value in our own table
+    partner_name: partnerName || null,
+    ghl_user_id: String(userId),
+    assigned_at: new Date(d.now()).toISOString(),
+    released_at: null,
+  }, { onConflict: 'ghl_contact_id' });
+  openAssigned = null;
+  if (error) throw new Error(`partner_owner_assignments write failed: ${error.message}`);
+}
+
+async function releaseAssignment(d, contactId) {
+  try {
+    const { error } = await d.supabase.from('partner_owner_assignments')
+      .update({ released_at: new Date(d.now()).toISOString() })
+      .eq('ghl_contact_id', String(contactId))
+      .is('released_at', null);
+    if (error) throw new Error(error.message);
+  } catch (err) {
+    // The owner is already right; the next pass sees an owner that is not the
+    // assignment's and closes the row then.
+    console.warn(`[PartnerOwner] could not release assignment for contact ${contactId}: ${err.message}`);
+  }
+  openAssigned = null;
 }
 
 async function lastLogFor(d, lpLeadId) {
@@ -257,7 +319,9 @@ async function decideAndApply(d, cfg, lead, prevRow, dryRun) {
   if (!thisMatch) {
     const partnerBranchesAny = await allPartnerBranches(d);
     const wasPartnerBranch = prevBranch && partnerBranchesAny.has(prevBranch);
-    if (!wasPartnerBranch && !(await recentFailedLeadIds(d)).has(String(lead.lp_lead_id))) {
+    if (!wasPartnerBranch
+        && !(lead.ghl_contact_id && (await openAssignmentContactIds(d)).has(String(lead.ghl_contact_id)))
+        && !(await recentFailedLeadIds(d)).has(String(lead.lp_lead_id))) {
       return { ok: true, reason: 'not_partner_lead' };
     }
   }
@@ -331,10 +395,25 @@ async function decideAndApply(d, cfg, lead, prevRow, dryRun) {
 
   const contact = await readContact(d, lead.ghl_contact_id);
   const from = contact.assignedTo ? String(contact.assignedTo) : null;
+  const assignment = await openAssignmentFor(d, lead.ghl_contact_id);
+  // Rule 3b: a partner owner with no open assignment for THAT partner was put there by
+  // GHL (the S5.2 "I. 1 Leg" path) or by a person, never by us.
+  const partnerNotOurs = Boolean(from && partnerIds.has(from)
+    && (!assignment || String(assignment.ghl_user_id) !== from));
+  const notOurs = async () => {
+    const out = { ok: true, reason: 'skipped_not_ours', from, would_target: match ? String(match.ghl_user_id) : cfg.defaultOwner };
+    if (!dryRun && !quiet('skipped_not_ours')) {
+      await writeLog(d, { ...base, reason: 'skipped_not_ours', from_owner: from, partner_name: await partnerNameForUser(from, d),
+        detail: { would_target: out.would_target } });
+    }
+    return out;
+  };
 
   if (!match) {
-    // Rule 3/8: only a partner-owned contact is returned.
-    if (!from || !partnerIds.has(from)) return { ok: true, reason: 'not_partner_owned', from };
+    // Rule 3/8: only a contact we assigned, still owned by that partner, is returned.
+    if (assignment && String(assignment.ghl_user_id) !== from && !dryRun) await releaseAssignment(d, lead.ghl_contact_id);
+    if (partnerNotOurs) return notOurs();
+    if (!assignment || !from || !partnerIds.has(from)) return { ok: true, reason: 'not_partner_owned', from };
     if (!cfg.defaultOwner) {
       const out = { ok: false, reason: 'failed', error: 'PARTNER_DEFAULT_OWNER_ID unset', from };
       if (!dryRun) {
@@ -343,17 +422,23 @@ async function decideAndApply(d, cfg, lead, prevRow, dryRun) {
       return out;
     }
     target = cfg.defaultOwner;
+  } else if (partnerNotOurs && from !== target) {
+    return notOurs();
   }
 
   const partnerName = match?.partner_name || await partnerNameForUser(from, d);
-  if (from === target) {
+  // A write of ours that set the contact but failed on an opportunity is finished on
+  // the next pass rather than read as a noop (only for a contact we assigned).
+  const finishOurs = Boolean(match && assignment && String(assignment.ghl_user_id) === target
+    && decidingHistory[0]?.reason === 'failed');
+  if (from === target && !finishOurs) {
     const out = { ok: true, reason: 'noop', from, target, eligibility };
     if (!dryRun && !quiet('noop')) await writeLog(d, { ...base, reason: 'noop', from_owner: from, to_owner: target, partner_name: partnerName });
     return out;
   }
 
   const reason = match
-    ? (from && partnerIds.has(from) ? 'reassigned' : 'assigned')
+    ? (from && partnerIds.has(from) && from !== target ? 'reassigned' : 'assigned')
     : 'returned';
   const toLabel = ownerLabel(target, match?.partner_name || null, cfg.defaultOwner);
   const fromLabel = ownerLabel(from, await partnerNameForUser(from, d), cfg.defaultOwner);
@@ -363,6 +448,7 @@ async function decideAndApply(d, cfg, lead, prevRow, dryRun) {
 
   let applied;
   try {
+    if (match) await claimAssignment(d, { contactId: lead.ghl_contact_id, lead: deciding, partnerName: match.partner_name, userId: target });
     applied = await applyOwner(d, lead.ghl_contact_id, target);
     if (applied.opportunity_failures.length) {
       throw new Error(`opportunity owner not set on ${applied.opportunity_failures.map((f) => `${f.id} (${f.error})`).join(', ')}`);
@@ -377,6 +463,7 @@ async function decideAndApply(d, cfg, lead, prevRow, dryRun) {
     return { ok: false, reason: 'failed', from, target, error: err.message };
   }
 
+  if (!match) await releaseAssignment(d, lead.ghl_contact_id);
   const stamp = formatEt(new Date(d.now()));
   const note = `Owner → ${toLabel} · LP branch ${deciding.lp_branch_id || '—'} · rep ${deciding.rep_name || '—'} · ${stamp}`;
   try {

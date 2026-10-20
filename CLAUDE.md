@@ -1136,13 +1136,35 @@ change now always writes the row) and by job `partner-fast-poll` (every `PARTNER
 cursor, filtered locally to partner branches, plus retries of `failed` / `no_ghl_contact`). Rules: the contact's CURRENT
 lead decides (`pickCurrentLead`; the user, 2026-10-20); only leads created after `PARTNER_GO_LIVE_AT`, moved into the
 branch after it, or already aimed at a partner count (no backfill of older RFED leads); with no match the owner changes
-only when GHL's owner is a partner user (an internal owner is never touched); a dispositioned lead that stays in the
-branch keeps the partner. Every write is read back (a kept owner is `failed`), noted on the contact, logged in
+only for a contact THIS code assigned (an open `partner_owner_assignments` row, written before the GHL write, released
+on the return) whose owner is still that partner, and returns it to the Reece team user 3K6HtoPyBLWeQrrnSnCD (handoff v3,
+2026-10-20); an internal owner is never touched; a dispositioned lead that stays in the branch keeps the partner.
+**A partner GHL put on the contact is never ours to move (handoff v3):** GHL S5.2 Appointment Rescue v2, branch "I. 1
+Leg", assigns 1 Leg leads to Ross itself. With no open assignment for that partner, a return or a reassign is logged
+`skipped_not_ours` and nothing is written; a matching lead already owned by that partner is a `noop` and creates no
+assignment. Every write is read back (a kept owner is `failed`), noted on the contact, logged in
 `partner_owner_log`, and posts ONE card per lead + reason + owner to `PARTNER_ALERT_SLACK_CHANNEL` (`alert-posted`, unset
 = log only). A partner is an OWNER, never a follower: GHL's "Only Assigned Data" keys on the owner. Off with
 `PARTNER_SYNC_ENABLED=false` or `PARTNER_GO_LIVE_AT` unset. `POST /n8n/admin/partner-owner/run {lp_lead_id, dry_run}`
 (strict operator token, no soft launch) and `GET /n8n/admin/partner-owner/status`. Side effect: GHL credits a bot message
 with no `userId` to the contact owner, so bot texts to a partner lead show as the partner in GHL.
+
+**A 1 Leg contact is offered a phone presentation, both decision makers on the call (Mark, handoff v3, 2026-10-20).**
+Only a contact whose OPEN objection state is `APPOINTMENT_DISRUPTION.one_leg` (rule `LP_DISP_1LEG_TO_ONELEG`) gets it:
+`phonePresentationActive` (`src/agentic/one-leg-presentation.js`; SMS, not post-demo, not rehash) passes the real
+openings of `PHONE_PRESENTATION_CALENDAR_ID` to `planNepqTurn({ phonePresentation })`. Two times (`pp_offer`), a pick is
+HELD while the lead is asked "will both of you be on the call?" (`pp_hold_dm`), only a yes books it (`pp_confirm` →
+`phonePresentationBooking`, `phone_presentation: true`, `decision_makers_present: true`), "just me" asks for a time that
+works for both (`pp_dm_no`); any plan that would still offer VISIT times offers these instead, or none
+(`phonePresentationOffer`). The price is gone over on the call, never a number in a text. The calendar is GHL-only
+(`isGhlOnlyCalendarId`: a 1Leg lead is post-issue, so an LP SetAppointment would mint a new lead), `executeBookAppointment`
+refuses it for any contact not in one_leg (`skipped_not_one_leg`, fail closed) and leaves its assignee to the calendar.
+Every other contact, a "my wife isn't home" new lead included, keeps the normal offer. GHL S5.2 "I. 1 Leg" still owns
+every 1 Leg message, its timing and the Ross assignment: this is a reply branch only, never a sender. Live chat does
+not take it (its fast lane has no objection state). `ONE_LEG_PRESENTATION_MODE` off|live, default live, inert until the
+calendar id is set. `recovery_cadence` on `objection_state_policies` is informational (nothing in src/ reads it); the
+one_leg row reads days 0/3/5/8 (sms, sms, email, sms) to match the workflow, and `recovery_touch_count` stays as it is
+because the S5.2 enrollment payload carries it.
 
 **Marketing cost is a ledger, not an LP field (Mark + Brad Codman, 2026-10-12; `supabase/migrations/20261012222106_158_marketing_cost_ledger.sql`).** Report 136 and LP cost entry
 are retired: nobody types a cost into LP again, and no code reads `mcost_cents` for a cost. The money lives in

@@ -1,5 +1,5 @@
 {
- "version": "v2.12.0",
+ "version": "v2.13.0",
  "copy": {
   "src/agentic/nepq-planner.js": [
    "${hi ? `Understood${hi}. ` : ''}${rehashIfICouldBridge(repName && !speaksAsRep ? repName : null)}",
@@ -93,6 +93,7 @@
    "booked",
    "callback_request",
    "close",
+   "collect",
    "competitor",
    "competitor_signed",
    "defer",
@@ -120,6 +121,9 @@
    "nepq:job_scope_${why}",
    "nepq:not_interested",
    "nepq:not_owner",
+   "nepq:pp_dm_no",
+   "nepq:pp_dm_required",
+   "nepq:pp_offer",
    "nepq:price_call_offer",
    "nepq:price_rest",
    "nepq:price_scope",
@@ -145,6 +149,9 @@
    "post_demo_fallback",
    "post_demo_space",
    "post_demo_stop",
+   "pp_dm_no",
+   "pp_hold_dm",
+   "pp_offer",
    "price",
    "price_call_offer",
    "price_rest",
