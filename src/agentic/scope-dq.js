@@ -1,8 +1,8 @@
 // ─── A home we cannot work on: ask a person to set ND — src/agentic/scope-dq.js ─
 //
 // WHY (the user, 2026-10-13)
-//   Both bots turn away a commercial property or a rental property
-//   (job-scope.js). The user: "It should then update the
+//   Both bots turn away a commercial property (job-scope.js) and a tenant
+//   (non-owner.js). The user: "It should then update the
 //   lead as ND status." LP's API has no call that changes a disposition (the
 //   client writes leads, appointments, prospect fields, DNC and notes only), so
 //   the user approved the stopgap: a note on the LP lead, and ONE card to
@@ -12,8 +12,11 @@
 //     readers), whether or not a guard had to rewrite the reply: a draft that
 //     already said no is still a turn-away. Said earlier is not a new one.
 //   - Below the three-opening minimum is not included (not asked for).
-//   - Commercial and rental only: manufactured homes and tall buildings were
-//     not part of the ask.
+//   - Commercial and a tenant only: manufactured homes and tall buildings were
+//     not part of the ask. 2026-10-20 (the user): an owner who rents the home
+//     out is a lead now, so a rental is no longer a kind; a renter still gets
+//     the card ("Yes, post the ND card"). A non-owner who is not a tenant (a
+//     property manager, a grown child) gets none: the owner may still be a lead.
 //   - Once per contact per kind, ever (audit `scope_dq`, permanent). No Five9
 //     callback and no `callback:requested` tag (NO_DIAL_REASONS): the bot said
 //     no, so nobody calls to sell. No stop-bot (not ruled).
@@ -21,13 +24,18 @@
 //
 // PURE. Every write is a deps call (production deps: src/services/scope-dq-io.js).
 
-import { jobScopeFromThread } from './job-scope.js';
+import { jobScopeFromThread, TENANT_RX } from './job-scope.js';
+import { saysRenter } from './homeowner.js';
 import { prospectLabel } from '../format-helpers.js';
 
 export const SCOPE_DQ_REASON = 'scope_dq';
 export const SCOPE_DQ_AUDIT = 'scope_dq';
 
-const LABEL = { commercial: 'a commercial property', rental: 'a rental property' };
+const LABEL = { commercial: 'a commercial property', renter: 'a renter, not the homeowner' };
+const NOTE_FACT = {
+  commercial: 'the lead said the property is a commercial property, which we do not work on.',
+  renter: 'the lead said they rent the home (a tenant, not the owner); we only work with homeowners.',
+};
 
 /** SCOPE_DQ_MODE: off | shadow | live (default live). */
 export function scopeDqMode(env = process.env) {
@@ -35,16 +43,18 @@ export function scopeDqMode(env = process.env) {
   return v === 'off' || v === 'shadow' ? v : 'live';
 }
 
-/** 'commercial' | 'rental' | null, from the lead's newest message. Pure. */
+/** 'commercial' | 'renter' | null, from the lead's newest message. Pure. */
 export function scopeDqKind(inbound) {
-  if (!String(inbound || '').trim()) return null;
-  const { block } = jobScopeFromThread([], inbound);
-  return block === 'commercial' || block === 'rental' ? block : null;
+  const text = String(inbound || '');
+  if (!text.trim()) return null;
+  const { block } = jobScopeFromThread([], text);
+  if (block === 'commercial') return 'commercial';
+  return saysRenter(text) && TENANT_RX.test(text) ? 'renter' : null;
 }
 
 /** The note on the LP prospect. Pure. */
 export function lpNoteText(kind) {
-  return `Bot: the lead said the home is ${LABEL[kind] || 'one we do not work on'}, which we do not work on. `
+  return `Bot: ${NOTE_FACT[kind] || 'the lead said the home is one we do not work on.'} `
     + 'The bot told them we cannot help with this home and booked nothing. Set this lead to ND.';
 }
 

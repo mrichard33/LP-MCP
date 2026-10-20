@@ -13,17 +13,22 @@
 //     No times, no question, no booking.
 //   - They said it earlier → any sentence that offers a time, asks to book,
 //     or names a clock time is dropped; nothing left → the line.
-//   A landlord ("we rent it out") owns the home (homeowner.js), but a rented
-//   home is a job we do not take: job-scope.js says so (the user, 2026-10-13).
-//   A TENANT therefore gets the rental line, not "the owner is welcome to reach
-//   out" (the owner of a rental is declined too); a non-owner who is not a
-//   tenant ("it's my parents' house") keeps the non-owner line.
+//   A landlord ("we rent it out") owns the home (homeowner.js) and is a lead
+//   (the user, 2026-10-20, superseding 2026-10-13's "no rentals"). A TENANT gets
+//   TENANT_LINE (we only work with homeowners; the owner is welcome to reach
+//   out); a non-owner who is not a tenant ("it's my parents' house", a property
+//   manager) keeps the non-owner line.
 //
 // PURE. The callers drop the book_appointment companion when this fires.
 
 import { homeownerFromThread, saysRenter } from './homeowner.js';
 import { findBookingAsks } from './discovery-discipline.js';
-import { RENTAL_LINE, TENANT_RX } from './job-scope.js';
+import { TENANT_RX } from './job-scope.js';
+
+// A tenant (the user, 2026-10-20: "we only work with owners not the renters"). It no
+// longer says "we don't work on rental properties": an owner who rents the home out
+// is a lead, so the owner is welcome to reach out.
+export const TENANT_LINE = "Thanks for letting me know. We only work with homeowners, so we can't set up a visit for a home you rent. If the owner is interested, they're welcome to reach out to us anytime.";
 
 export const NON_OWNER_LINE = "Thanks for letting me know. The homeowner needs to be part of the visit, so we can't set one up without them. The owner is welcome to reach out to us anytime.";
 
@@ -40,10 +45,10 @@ function toTurns(thread = [], inbound = '') {
   return turns;
 }
 
-/** The line for a non-owner: a tenant's home is a rental (2026-10-13). Pure. */
+/** The line for a non-owner: TENANT_LINE for a tenant, else NON_OWNER_LINE (2026-10-20). Pure. */
 export function nonOwnerLine(thread = [], inbound = '') {
   const tenant = toTurns(thread, inbound).some(t => t.direction === 'inbound' && TENANT_RX.test(t.text));
-  return tenant ? RENTAL_LINE : NON_OWNER_LINE;
+  return tenant ? TENANT_LINE : NON_OWNER_LINE;
 }
 
 function splitSentences(text) {

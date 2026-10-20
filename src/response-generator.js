@@ -18,6 +18,12 @@
  * prompt blocks. An unexplained snapshot diff means the change is wrong, not
  * the snapshot. Map: docs/handoffs/response-generator-split-map.md.
  *
+ * v2.12.0 — 2026-10-20. OWNERS YES, RENTERS NO (the user: "We do not need to turn investment
+ *   properties away. However, we only work with owners not the renters."). The rental rule in
+ *   both system prompts and the live chat now says an owner who rents the home out, runs an
+ *   Airbnb, invests or flips is a lead, and a renter or a property manager gets the
+ *   homeowners-only no. Supersedes the 2026-10-13 "we do not work on rental properties".
+ *
  * v2.11.0 — 2026-10-20. HANDOFF V2 (Mark's rulings of 2026-10-19). REHASH_DEAL_HINT_MODE=every
  *   puts one varied deal hint on every eligible rehash reply and the "If I could …, would
  *   you …?" bridge (rehash-nepq.js); the plan block names the hint. SIRO_FOLLOWUP_TEXT_MODE=
@@ -475,11 +481,11 @@ import {
 } from './agentic/service-area-turn.js';
 
 /**
- * v2.11.0 — the header version above, as a value. Stamped (with the deployed
+ * v2.12.0 — the header version above, as a value. Stamped (with the deployed
  * git sha) onto every fingerprint so a replay knows which generator wrote the
  * reply. Bump it with the header note.
  */
-export const RESPONSE_GENERATOR_VERSION = 'v2.11.0';
+export const RESPONSE_GENERATOR_VERSION = 'v2.12.0';
 
 // Provider + model resolved at call time by the shared client from the
 // `response_generator` fn key (customer_facing group). Legacy

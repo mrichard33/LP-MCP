@@ -17,8 +17,13 @@
 const RENTAL_OWNER_RX = /\brent(?:ing|ed)?\s+(?:it|them|this|that|the\s+\w+|my\s+\w+|our\s+\w+)\s+out\b|\brent(?:ing)?\s+out\b|\brental\s+propert(?:y|ies)\b|\b(?:my|our)\s+tenants?\b|\b(?:i'?m|i\s+am|we'?re|we\s+are)\s+the\s+landlords?\b|\bi\s+own\s+(?:a\s+|the\s+)?rental\b/i;
 
 // The lead says they rent. "Can renters get a quote?" counts: batch 3 asked it
-// exactly that way about their own home.
-export const RENTER_RX = /\b(?:i'?m|i\s+am|we'?re|we\s+are)\s+(?:a\s+|just\s+a\s+)?(?:renters?|tenants?)\b|\b(?:i'?m|i\s+am|we'?re|we\s+are)\s+(?:currently\s+|just\s+)?renting\b|\b(?:i|we)\s+(?:currently\s+|just\s+)?rent\s+(?:here|this|the|my|our|a|an)\b|\b(?:i|we)\s+rent\s*[.!?]*$|\b(?:my|our|the)\s+landlord\b|\b(?:i|we)\s+(?:don'?t|do\s+not|dont)\s+own\b|\bnot\s+the\s+(?:home\s*|house\s*|property\s*)?owners?\b|\b(?:can|do)\s+renters\b|\bas\s+a\s+(?:renter|tenant)\b|\bi'?m\s+not\s+(?:the\s+)?(?:home\s*)?owner\b/i;
+// exactly that way about their own home. 2026-10-20 (dq_renter_refire): "help with my
+// rent my rent is $589 a month" read as nothing, so the bot kept selling; "my rent",
+// "pay/help with (my) rent" and "rent is $N" are a renter's words. A property manager
+// is not the owner either (the user, 2026-10-20: the owner is welcome to reach out).
+const RENT_PAID_SRC = String.raw`\b(?:my|our)\s+rent\b|\b(?:pay(?:ing)?|afford|help(?:\s+\w+){0,2}\s+with)\s+(?:my\s+|our\s+|the\s+)?rent\b|\brent\s+is\s+\$?\d`;
+const PROPERTY_MANAGER_SRC = String.raw`\b(?:i'?m|i\s+am|we'?re|we\s+are)\s+(?:the|a)\s+property\s+manag(?:er|ers|ement)\b|\b(?:i|we)\s+manage\s+(?:the|this|that|a|it)\b[^.!?]{0,30}\bfor\s+(?:the|an?|my|our)\s+(?:owner|client|landlord)`;
+export const RENTER_RX = new RegExp(String.raw`${RENT_PAID_SRC}|${PROPERTY_MANAGER_SRC}|` + /\b(?:i'?m|i\s+am|we'?re|we\s+are)\s+(?:a\s+|just\s+a\s+)?(?:renters?|tenants?)\b|\b(?:i'?m|i\s+am|we'?re|we\s+are)\s+(?:currently\s+|just\s+)?renting\b|\b(?:i|we)\s+(?:currently\s+|just\s+)?rent\s+(?:here|this|the|my|our|a|an)\b|\b(?:i|we)\s+rent\s*[.!?]*$|\b(?:my|our|the)\s+landlord\b|\b(?:i|we)\s+(?:don'?t|do\s+not|dont)\s+own\b|\bnot\s+the\s+(?:home\s*|house\s*|property\s*)?owners?\b|\b(?:can|do)\s+renters\b|\bas\s+a\s+(?:renter|tenant)\b|\bi'?m\s+not\s+(?:the\s+)?(?:home\s*)?owner\b/.source, 'i');
 
 // The lead says they own it.
 const OWNER_RX = /\b(?:i|we)\s+(?:do\s+)?own\s+(?:the|my|our|this|it|that)\b|\b(?:i'?m|i\s+am|we'?re|we\s+are)\s+(?:the\s+)?(?:home\s*|house\s*|property\s*)?owners?\b|\bi'?m\s+a\s+homeowner\b|\bit'?s\s+(?:my|our)\s+(?:own\s+)?(?:home|house)\b|\bwe\s+bought\s+(?:the|this|our)\s+(?:home|house)\b/i;
