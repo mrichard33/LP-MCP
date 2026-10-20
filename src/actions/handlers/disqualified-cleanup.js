@@ -21,10 +21,11 @@
  *   - tag lp-disqualified;
  *   - the P1 opportunity to the existing P3 "Hard Disqualified" stage
  *     (abandoned) — the stage the S1.3 hard-DQ lane already uses; none created;
- *   - Five9: one five9_delete_record_from_list for the phone over every
- *     outbound list. Five9 has no read that lists every list holding a number
+ *   - Five9: five9_delete_record_from_list rows (10 lists each) for the phone
+ *     over every outbound list in Five9's live inventory (2026-10-20). Five9
+ *     has no read that lists every list holding a number
  *     (findContactInOtherLists never worked, see CLAUDE.md), and a list the
- *     number is not on is left as is, so the row names all of them. Runs
+ *     number is not on is left as is, so the rows name all of them. Runs
  *     unarmed by default since 2026-10-19 (the user: "automate these
  *     approvals"), with a no-button notice (src/notifications/
  *     disqualified-removed.js); DISQUALIFIED_FIVE9_AUTO_REMOVE=false puts the
@@ -41,9 +42,15 @@ import { prospectLabel } from '../../format-helpers.js';
 
 export const DISQUALIFIED_RULE = 'LP_DISP_DISQUALIFIED';
 export const DISQUALIFIED_TAG = 'lp-disqualified';
-export const DISQUALIFIED_FIVE9_LISTS = Object.freeze([
-  'LP_ASAP', 'Reece Chatbot', 'Direct Lead Entry', 'After DIAL ASAP', 'Data - Hot', 'Conf - Next Day', 'Conf - 2nd Day',
-]);
+// 2026-10-20 (the user): "It is not automatically removing the leads from all the list. We had split the
+// list by the markets." A fixed set of names named "Data - Hot", which became one list per market, and every
+// removal faulted on it. The lists now come from Five9's live inventory: every list except the Sale and
+// Rehash lists (customers and the rehash team's own work) and the inbound queue, so a new market list is
+// covered the day it appears.
+export const DISQUALIFIED_EXCLUDED_LIST_RX = [/^sale\b/i, /^rehash/i, /^inbound queue$/i];
+// MAX_DELETE_LISTS_PER_ACTION (src/five9/admin-writes.js): one row per 10 lists keeps each run well inside
+// the executor's 60s handler watchdog.
+export const DISQUALIFIED_LISTS_PER_ROW = 10;
 // The estimate pool: Window Estimate, Measurement Verification, Home Protection Assessment.
 const ESTIMATE_POOL = ESTIMATE_CALENDAR_IDS;
 const DEAD_STATUSES = new Set(['cancelled', 'canceled', 'no_show', 'noshow', 'no-show', 'invalid']);
@@ -53,6 +60,12 @@ export function disqualifiedAutoRemove(env = process.env) {
 }
 
 const digits10 = (p) => String(p || '').replace(/\D/g, '').slice(-10);
+
+/** Pure: the outbound lists a disqualified number comes off, from a getListsInfo() inventory. */
+export function disqualifiedTargetLists(inventory) {
+  const names = (Array.isArray(inventory) ? inventory : []).map((l) => String(l?.name ?? l ?? '').trim()).filter(Boolean);
+  return [...new Set(names)].filter((n) => !DISQUALIFIED_EXCLUDED_LIST_RX.some((rx) => rx.test(n)));
+}
 
 /** Pure: the open estimate appointments among a contact's upcoming ones. */
 export function openEstimateAppointments(upcoming) {
@@ -64,7 +77,7 @@ export function openEstimateAppointments(upcoming) {
  * Pure: every row this cleanup queues.
  * @returns {object[]} agent_actions rows
  */
-export function planDisqualifiedCleanup({ contactId, lead, appointments, tags, phone, workflowIds = {}, autoRemove, eventId = null, nowMs = Date.now() }) {
+export function planDisqualifiedCleanup({ contactId, lead, appointments, tags, phone, workflowIds = {}, targetLists = [], autoRemove, eventId = null, nowMs = Date.now() }) {
   const disp = String(lead?.disposition_code || '').trim();
   // The prospect, never the lead id: this text is the approval card's reason (the user, 2026-10-16).
   const why = `LP ${prospectLabel(lead?.lp_prospect_id)} is ${disp} (disqualified)`;
@@ -99,27 +112,35 @@ export function planDisqualifiedCleanup({ contactId, lead, appointments, tags, p
     action_payload: { pipeline: 'P3', stage: 'Hard Disqualified', status: 'abandoned', claim_key: `disqualified:${contactId}:opp` },
     reasoning: `${why}: opportunity to P3 Hard Disqualified` });
   const ph = digits10(phone);
-  if (ph.length === 10) {
-    rows.push({
+  const lists = disqualifiedTargetLists(targetLists);
+  if (ph.length === 10 && lists.length) {
+    const queuedAt = new Date(nowMs).toISOString();
+    const chunks = [];
+    for (let i = 0; i < lists.length; i += DISQUALIFIED_LISTS_PER_ROW) chunks.push(lists.slice(i, i + DISQUALIFIED_LISTS_PER_ROW));
+    chunks.forEach((chunk, i) => rows.push({
       event_id: eventId, action_type: 'five9_delete_record_from_list', target_system: 'five9', target_entity: 'list',
       target_id: contactId,
       action_payload: {
-        list_names: [...DISQUALIFIED_FIVE9_LISTS], field_names: ['number1'], values: [ph], list_delete_mode: 'DELETE_ALL',
+        list_names: chunk, field_names: ['number1'], values: [ph], list_delete_mode: 'DELETE_ALL',
+        // A list renamed between now and the run is reported, never a fault (src/five9/admin-writes.js).
+        skip_missing_lists: true,
+        // One notice per lead, posted by the last chunk to finish (src/notifications/disqualified-removed.js).
+        group: `disqualified:${contactId}:${queuedAt}`, chunk: { index: i + 1, of: chunks.length },
         phone: ph, contact_name: [lead?.first_name, lead?.last_name].filter(Boolean).join(' ') || null,
         lp_lead_id: lead?.lp_lead_id || null, lp_prospect_id: lead?.lp_prospect_id || null, reason: 'disqualified', disposition: disp,
-        queued_at: new Date(nowMs).toISOString(),
+        queued_at: queuedAt,
       },
-      reasoning: `${why}: a disqualified lead is never dialed again, so it comes off every outbound list. A list the number is not on is left as is.`,
+      reasoning: `${why}: a disqualified lead is never dialed again, so it comes off every outbound list (part ${i + 1} of ${chunks.length}). A list the number is not on is left as is.`,
       rule_applied: DISQUALIFIED_RULE, confidence: 1.0,
       status: autoRemove ? 'pending' : 'pending_approval', requires_approval: !autoRemove, priority: 70,
-    });
+    }));
   }
   return rows;
 }
 
 /**
  * The disqualified_cleanup action handler.
- * deps: { supabase, ghlFetch, fetchUpcomingAppointments, resolveWorkflowId, env }
+ * deps: { supabase, ghlFetch, fetchUpcomingAppointments, resolveWorkflowId, getListsInfo, env }
  */
 export async function executeDisqualifiedCleanup(action, _context = {}, deps = {}) {
   const contactId = action.target_id;
@@ -143,8 +164,16 @@ export async function executeDisqualifiedCleanup(action, _context = {}, deps = {
   for (const code of workflowCodesToLeave(tags)) {
     try { workflowIds[code] = await deps.resolveWorkflowId?.(code); } catch { /* unresolved → remove_all */ }
   }
+  // Fail closed on the list inventory too: a removal planned against guessed
+  // names is how "Data - Hot" failed every run. The executor retries a throw.
+  let targetLists = [];
+  if (digits10(contact.phone || lead.phone).length === 10) {
+    const inv = await deps.getListsInfo();
+    targetLists = disqualifiedTargetLists(inv?.lists);
+    if (!targetLists.length) throw new Error('disqualified_cleanup: Five9 list inventory came back empty');
+  }
   const rows = planDisqualifiedCleanup({
-    contactId, lead, appointments: upcoming, tags, phone: contact.phone || lead.phone, workflowIds,
+    contactId, lead, appointments: upcoming, tags, phone: contact.phone || lead.phone, workflowIds, targetLists,
     autoRemove: disqualifiedAutoRemove(deps.env || process.env), eventId: action.event_id ?? null,
   });
   if (rows.length) {

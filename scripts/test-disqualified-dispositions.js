@@ -13,7 +13,7 @@ process.env.SUPABASE_SERVICE_ROLE_KEY ||= 'test-key';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-const { planDisqualifiedCleanup, executeDisqualifiedCleanup, openEstimateAppointments, DISQUALIFIED_FIVE9_LISTS } =
+const { planDisqualifiedCleanup, executeDisqualifiedCleanup, openEstimateAppointments, disqualifiedTargetLists } =
   await import('../src/actions/handlers/disqualified-cleanup.js');
 const { buildMarkInvalidRows, AWE1_WORKFLOW_ID, REMINDER_TAGS } = await import('../src/appointments/mark-invalid.js');
 const { evaluateS52Entry } = await import('../src/s52-entry-gate.js');
@@ -42,12 +42,52 @@ test('only an OPEN estimate-pool appointment is invalidated', () => {
   assert.deepEqual(open.map((a) => a.appointment_id), ['apptA']);
 });
 
+// Five9's list inventory as read live on 2026-10-20, after "Data - Hot" was split by market.
+const LIVE_LISTS = ['Disconnected from IVR', 'Reset-Cold', 'Reset-Warm', 'Resets-Hot', 'Sale - Completed 2-4yrs',
+  'Sale - Completed 0-2yrs', 'Sale - Cancelled', 'Rehash - All Roof', 'Rehash -Old', 'Rehash', 'Rehash New', 'Inbound Queue',
+  'Data -Old more than 180', 'Data - Leads more than 30', 'Data - Hot - Unmapped', 'Conf - All Roof', 'Conf - 2nd Day',
+  'Conf - Next Day', 'Data - Warm - Unmapped', 'LP_ASAP', 'reset campaign - old', 'hotleads', 'After DIAL ASAP', 'AGED DATA',
+  'Simpletext_ASAP', 'SimpleText-data', 'Reece Chatbot', 'East Coast PC list', 'Data - Hot - FTL less than 7',
+  'Data - Hot - STP less than 7', 'Data - Hot - SAR less than 7', 'Data - Hot - JAX less than 7', 'Data - Hot - ORL less than 7',
+  'Data - Hot - FTM less than 7', 'Data - Hot - LKE less than 7', 'Data - Warm - FTL less than 30', 'Data - Warm - FTM less than 30',
+  'Data - Warm - JAX less than 30', 'Data - Warm - LKE less than 30', 'Data - Warm - ORL less than 30',
+  'Data - Warm - SAR less than 30', 'Data - Warm - STP less than 30', 'Callback Request', 'Direct Lead Entry', 'Spanish']
+  .map((name) => ({ name, size: 1 }));
+const SMALL_LISTS = ['LP_ASAP', 'Reece Chatbot', 'Direct Lead Entry', 'Data - Hot - FTL less than 7', 'Conf - Next Day'].map((name) => ({ name }));
+
 function plan(over = {}) {
   return planDisqualifiedCleanup({
     contactId: 'c1', lead: AVILA, appointments: [appt()], tags: ['active-s5.2'], phone: '(813) 555-1234',
-    workflowIds: { 'S5.2': 'wf-s52' }, autoRemove: false, ...over,
+    workflowIds: { 'S5.2': 'wf-s52' }, targetLists: SMALL_LISTS, autoRemove: false, nowMs: Date.parse('2026-10-20T15:00:00Z'), ...over,
   });
 }
+
+test('every outbound list from the live inventory: the market lists in, Sale / Rehash / Inbound out (2026-10-20)', () => {
+  const lists = disqualifiedTargetLists(LIVE_LISTS);
+  assert.ok(!lists.includes('Data - Hot'), 'the retired list is never named');
+  for (const want of ['LP_ASAP', 'Reece Chatbot', 'Direct Lead Entry', 'After DIAL ASAP', 'Conf - Next Day', 'Conf - 2nd Day',
+    'Data - Hot - FTL less than 7', 'Data - Hot - LKE less than 7', 'Data - Hot - Unmapped', 'Data - Warm - STP less than 30',
+    'Data - Warm - Unmapped', 'Callback Request', 'Spanish', 'Resets-Hot', 'Data - Leads more than 30', 'AGED DATA']) {
+    assert.ok(lists.includes(want), want);
+  }
+  for (const not of ['Sale - Completed 0-2yrs', 'Sale - Cancelled', 'Rehash', 'Rehash New', 'Rehash -Old', 'Rehash - All Roof', 'Inbound Queue']) {
+    assert.ok(!lists.includes(not), not);
+  }
+  assert.equal(lists.length, LIVE_LISTS.length - 8);
+  // A market list added tomorrow is covered without a code change.
+  assert.ok(disqualifiedTargetLists([...LIVE_LISTS, { name: 'Data - Hot - HOU less than 7' }]).includes('Data - Hot - HOU less than 7'));
+});
+
+test('the removal is split into rows of at most 10 lists, one group, every list once', () => {
+  const f9 = plan({ targetLists: LIVE_LISTS, autoRemove: true }).filter((r) => r.action_type === 'five9_delete_record_from_list');
+  const lists = disqualifiedTargetLists(LIVE_LISTS);
+  assert.equal(f9.length, Math.ceil(lists.length / 10));
+  assert.ok(f9.every((r) => r.action_payload.list_names.length <= 10));
+  assert.deepEqual(f9.flatMap((r) => r.action_payload.list_names), lists);
+  assert.equal(new Set(f9.map((r) => r.action_payload.group)).size, 1);
+  assert.deepEqual(f9.map((r) => r.action_payload.chunk), f9.map((_, i) => ({ index: i + 1, of: f9.length })));
+  assert.ok(f9.every((r) => r.action_payload.skip_missing_lists === true && r.status === 'pending' && r.requires_approval === false));
+});
 
 test('Avila (ND): invalid not cancelled, out of S5.2, lp-disqualified, P3 Hard DQ, Five9 removal behind approval', () => {
   const rows = plan();
@@ -59,7 +99,7 @@ test('Avila (ND): invalid not cancelled, out of S5.2, lp-disqualified, P3 Hard D
   const opp = rows.find((r) => r.action_type === 'move_opportunity');
   assert.deepEqual([opp.action_payload.pipeline, opp.action_payload.stage], ['P3', 'Hard Disqualified']);
   const f9 = rows.find((r) => r.action_type === 'five9_delete_record_from_list');
-  assert.deepEqual(f9.action_payload.list_names, [...DISQUALIFIED_FIVE9_LISTS]);
+  assert.deepEqual(f9.action_payload.list_names, SMALL_LISTS.map((l) => l.name));
   assert.deepEqual(f9.action_payload.values, ['8135551234']);
   assert.equal(f9.requires_approval, true);
   assert.equal(f9.status, 'pending_approval');
@@ -101,21 +141,30 @@ test('the automatic removal posts one no-button notice: ND, off every list, pros
   const f9 = plan({ autoRemove: true, lead: { ...AVILA, lp_prospect_id: '470123' } })
     .find((r) => r.action_type === 'five9_delete_record_from_list');
   const action = { ...f9, id: 609912 };
-  const result = { lists: [...DISQUALIFIED_FIVE9_LISTS], record_deleted: true,
-    per_list: DISQUALIFIED_FIVE9_LISTS.map((list) => ({ list, deleted: list === 'LP_ASAP' ? 1 : 0, outcome: list === 'LP_ASAP' ? 'deleted' : 'not_on_list' })) };
+  const names = f9.action_payload.list_names;
+  const result = { lists: names, record_deleted: true,
+    per_list: names.map((list) => ({ list, deleted: list === 'LP_ASAP' ? 1 : 0, outcome: list === 'LP_ASAP' ? 'deleted' : 'not_on_list' })) };
   const text = formatDisqualifiedRemovedNotice(action, result);
   assert.match(text, /Done automatically · #609912 · LP ND → disqualified, off every dialing list/);
   assert.match(text, /Maria Avila was dispositioned "ND" in LP/);
-  assert.match(text, /took 8135551234 off every Five9 dialing list\. Removed from "LP_ASAP"; it was not on the others\./);
+  assert.match(text, /took 8135551234 off every Five9 dialing list\. Removed from "LP_ASAP"; it was not on the other 4 lists\./);
   assert.match(text, /No action needed\./);
   assert.match(text, /Contact: Maria Avila · 8135551234 · Prospect 470123/);
   assert.doesNotMatch(text, /583486/, 'never the lead id');
 
   const posts = [];
-  const deps = { channel: 'C_APPROVALS', post: async (t, ch) => { posts.push([t, ch]); return { ok: true }; } };
+  const posted = new Set();
+  const dedupe = {
+    filterNew: async ({ items }) => ({ fresh: items.filter((i) => !posted.has(i.key)) }),
+    recordPosted: async ({ items }) => { for (const i of items) posted.add(i.key); return { ok: true }; },
+  };
+  const deps = { channel: 'C_APPROVALS', post: async (t, ch) => { posts.push([t, ch]); return { ok: true }; }, ...dedupe };
   assert.deepEqual(await noticeDisqualifiedRemoval(action, result, deps), { posted: 'approvals' });
   assert.equal(posts.length, 1);
   assert.equal(posts[0][1], 'C_APPROVALS');
+  // A retry of the same lead never posts twice.
+  assert.deepEqual(await noticeDisqualifiedRemoval(action, result, deps), { posted: 'already' });
+  assert.equal(posts.length, 1);
 
   // An approved card, a dry run, a deferral or another rule posts nothing.
   for (const [a, r] of [
@@ -128,12 +177,54 @@ test('the automatic removal posts one no-button notice: ND, off every list, pros
 
   // A failed post is an #ops-alerts line, never silence.
   const alerts = [];
-  const failed = await noticeDisqualifiedRemoval(action, result, {
+  const failed = await noticeDisqualifiedRemoval({ ...action, id: 1, action_payload: { ...action.action_payload, group: 'other' } }, result, {
     channel: 'C_APPROVALS', post: async () => ({ ok: false, error: 'channel_not_found' }),
-    sendAlert: async (t, o) => { alerts.push([t, o]); return { sent: true }; },
+    sendAlert: async (t, o) => { alerts.push([t, o]); return { sent: true }; }, ...dedupe,
   });
   assert.deepEqual(failed, { posted: 'ops' });
   assert.equal(alerts[0][1].channel, 'ops');
+});
+
+test('a split removal posts ONE notice, from the last chunk, with every chunk\'s lists', async () => {
+  const { noticeDisqualifiedRemoval } = await import('../src/notifications/disqualified-removed.js');
+  const rows = plan({ targetLists: LIVE_LISTS, autoRemove: true }).filter((r) => r.action_type === 'five9_delete_record_from_list')
+    .map((r, i) => ({ ...r, id: 900 + i }));
+  const resultOf = (r) => ({ lists: r.action_payload.list_names, record_deleted: true,
+    per_list: r.action_payload.list_names.map((list) => ({ list, deleted: /FTL less than 7|^LP_ASAP$/.test(list) ? 1 : 0,
+      outcome: /FTL less than 7|^LP_ASAP$/.test(list) ? 'deleted' : 'not_on_list' })) });
+  const state = new Map(rows.map((r) => [r.id, { id: r.id, status: 'pending', execution_result: null }]));
+  const posts = [];
+  const posted = new Set();
+  const deps = {
+    channel: 'C', post: async (t) => { posts.push(t); return { ok: true }; },
+    readGroup: async (_g, selfId) => [...state.values()].filter((r) => r.id !== selfId),
+    filterNew: async ({ items }) => ({ fresh: items.filter((i) => !posted.has(i.key)) }),
+    recordPosted: async ({ items }) => { for (const i of items) posted.add(i.key); },
+  };
+  for (const r of rows) {
+    const res = resultOf(r);
+    const out = await noticeDisqualifiedRemoval(r, res, deps);
+    state.set(r.id, { id: r.id, status: 'completed', execution_result: res });
+    if (r !== rows.at(-1)) assert.deepEqual(out, { posted: 'waiting' });
+  }
+  assert.equal(posts.length, 1);
+  assert.match(posts[0], /Removed from "LP_ASAP", "Data - Hot - FTL less than 7"; it was not on the other 35 lists\./);
+
+  // A sibling that failed: no notice (the morning digest names the failure).
+  posts.length = 0; posted.clear();
+  state.set(rows[0].id, { id: rows[0].id, status: 'failed', execution_result: null });
+  assert.deepEqual(await noticeDisqualifiedRemoval(rows.at(-1), resultOf(rows.at(-1)), deps), { posted: 'waiting' });
+  assert.equal(posts.length, 0);
+});
+
+test('Five9: skip_missing_lists skips a list Five9 no longer has; without it a missing list still faults', async () => {
+  const { missingListsToSkip } = await import('../src/five9/admin-writes.js');
+  const inventory = new Set(['LP_ASAP', 'Data - Hot - FTL less than 7']);
+  const lists = ['LP_ASAP', 'Data - Hot', 'Data - Hot - FTL less than 7'];
+  assert.deepEqual([...missingListsToSkip(lists, inventory, { skip_missing_lists: true })], ['Data - Hot']);
+  assert.equal(missingListsToSkip(lists, inventory, {}).size, 0);
+  assert.equal(missingListsToSkip(lists, inventory, { skip_missing_lists: 'true' }).size, 0);
+  assert.equal(missingListsToSkip(lists, null, { skip_missing_lists: true }).size, 0);
 });
 
 test('No Demo is the same as ND; an unresolved sequence goes out through Remove All Marketing', () => {
@@ -173,11 +264,24 @@ test('handler: a failed appointment read throws (the executor retries), nothing 
   assert.equal(db.inserted.length, 0);
 });
 
+test('handler: the Five9 lists come from the live inventory; a failed or empty read throws, nothing queued', async () => {
+  const base = { ghlFetch: async () => ({ contact: { tags: [], phone: '+18135551234' } }), fetchUpcomingAppointments: async () => [], env: {} };
+  const db = fakeDb({ lead: AVILA });
+  await assert.rejects(executeDisqualifiedCleanup({ target_id: 'c1' }, {}, { ...base, supabase: db, getListsInfo: async () => { throw new Error('SOAP down'); } }), /SOAP down/);
+  await assert.rejects(executeDisqualifiedCleanup({ target_id: 'c1' }, {}, { ...base, supabase: db, getListsInfo: async () => ({ lists: [] }) }), /inventory came back empty/);
+  assert.equal(db.inserted.length, 0);
+  const ok = fakeDb({ lead: AVILA });
+  await executeDisqualifiedCleanup({ target_id: 'c1' }, {}, { ...base, supabase: ok, getListsInfo: async () => ({ lists: LIVE_LISTS }) });
+  const f9 = ok.inserted.filter((r) => r.action_type === 'five9_delete_record_from_list');
+  assert.equal(f9.length, 4);
+  assert.ok(f9.flatMap((r) => r.action_payload.list_names).includes('Data - Warm - ORL less than 30'));
+});
+
 test('handler queues the full plan for a current ND lead', async () => {
   const db = fakeDb({ lead: AVILA });
   const res = await executeDisqualifiedCleanup({ target_id: 'c1', event_id: 9 }, {}, {
     supabase: db, ghlFetch: async () => ({ contact: { tags: ['active-s5.2'], phone: '+18135551234' } }),
-    fetchUpcomingAppointments: async () => [appt()], resolveWorkflowId: async () => 'wf-s52', env: {},
+    fetchUpcomingAppointments: async () => [appt()], resolveWorkflowId: async () => 'wf-s52', getListsInfo: async () => ({ lists: SMALL_LISTS }), env: {},
   });
   assert.equal(res.action, 'disqualified_cleanup_queued');
   assert.deepEqual(res.invalidated_appointments, ['apptA']);

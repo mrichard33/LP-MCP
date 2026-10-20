@@ -75,6 +75,18 @@ test('disqualified Five9 removals waiting on approval are counted — only while
   assert.doesNotMatch(await run(pending, { env: { DISQUALIFIED_FIVE9_AUTO_REMOVE: 'true' } }), /waiting on approval/);
 });
 
+test('a FAILED ND / No Demo Five9 removal is named, whatever the mode, once (2026-10-20)', async () => {
+  const failed = { agent_actions: [{ id: 613328, action_type: 'five9_delete_record_from_list', rule_applied: 'LP_DISP_DISQUALIFIED', status: 'failed',
+    target_id: 'gordon', error_message: 'Five9 deleteRecordFromList fault: List "Data - Hot" doesn\'t exist.', created_at: iso(NOW - HOUR) }] };
+  const t = await run(failed);
+  assert.match(t, /Five9 removals for ND \/ No Demo leads/);
+  assert.match(t, /Five9 removal FAILED for 1 ND \/ No Demo lead, still on a dialing list/);
+  assert.match(t, /List "Data - Hot" doesn't exist/);
+  // Older than a week: not named.
+  const old = { agent_actions: [{ ...failed.agent_actions[0], created_at: iso(NOW - 8 * 24 * HOUR) }] };
+  assert.doesNotMatch(await run(old), /Five9 removal FAILED/);
+});
+
 test('a clean day is still "All clear."', async () => {
   assert.match(await run(), /All clear\./);
 });

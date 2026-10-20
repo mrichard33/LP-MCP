@@ -454,7 +454,12 @@ the one exception, below).
   time")**, keyed on the rule like BOOKED_ROUTING_AUTO_REMOVE; `DISQUALIFIED_FIVE9_AUTO_REMOVE=false` is the rollback to
   approval cards. Where the card posted, ONE no-button notice says the LP disposition and that the number is off every
   dialing list (`src/notifications/disqualified-removed.js`, approvals channel; only after a real removal, never a dry run
-  or an approved card; a failed post is an #ops-alerts line). The S5.2 gate and rule 171 (`lp_disposition_not_in`) refuse them up front.
+  or an approved card; a failed post is an #ops-alerts line). **The lists come from Five9's live inventory, never a fixed
+  set (the user, 2026-10-20):** a hard-coded "Data - Hot" faulted every removal for four days after that list was split
+  by market. `disqualifiedTargetLists` takes every list but Sale / Rehash / Inbound Queue (a failed or empty read throws,
+  the executor retries), queued as rows of 10 (`MAX_DELETE_LISTS_PER_ACTION`) in one `group`, each with
+  `skip_missing_lists` (`missingListsToSkip`: a renamed list is `list_missing`, not a fault); the last chunk to finish posts
+  the one notice. The 08:00 digest names a FAILED removal once, whatever the mode. The S5.2 gate and rule 171 (`lp_disposition_not_in`) refuse them up front.
 - **`invalid` is the no-notification kill status** (`src/appointments/mark-invalid.js`): status `invalid` (never
   `cancelled`, which fires cancel / rebook), then A.WE-1 removed, then the reminder tags off. The watchdog treats an
   `invalid` row at LP's slot as SETTLED: never restored, never re-created over, never flagged.
