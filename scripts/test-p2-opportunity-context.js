@@ -21,6 +21,8 @@ import { jobIdMatch } from './backfill-p2-opportunity-job-id.js';
 // ─── fixtures ────────────────────────────────────────────────────────
 const job = (lp_job_id, job_status, lp_lead_id, job_value = '15000') =>
   ({ lp_job_id, job_status, lp_lead_id, job_value });
+// 2026-10-20: a WON job is paid AND installed; LP's job_stage says 'complete'.
+const installed = (j) => ({ ...j, job_stage: 'complete' });
 const lead = (lp_lead_id, lead_source, lead_source_detail) =>
   ({ lp_lead_id, lead_source, lead_source_detail });
 
@@ -64,8 +66,20 @@ test('"Installed & Unpaid" is live — the work is done, the money is not', () =
 
 test('every WON status is terminal_won', () => {
   for (const status of ['Paid In Full', 'PIF Survey Ready', 'PIF NO Survey', 'Assumed Complete']) {
-    assert.equal(decidingJob([job(1, status, 900)]).verdict, 'terminal_won', status);
+    assert.equal(decidingJob([installed(job(1, status, 900))]).verdict, 'terminal_won', status);
   }
+});
+
+test('2026-10-20: paid in full but NOT installed is live, never terminal_won', () => {
+  for (const status of ['Paid In Full', 'PIF Survey Ready', 'PIF NO Survey', 'Assumed Complete']) {
+    assert.equal(decidingJob([job(1, status, 900)]).verdict, 'live', status);
+  }
+  const booked = { ...job(1, 'Paid In Full', 900), milestones: [{ mdt_id: 'F', actdate: '2999-01-01T00:00:00' }] };
+  assert.equal(decidingJob([booked]).verdict, 'live', 'a booked install is not an install');
+});
+
+test('2026-10-20: Installed & Unpaid stays live (paid AND installed is won)', () => {
+  assert.equal(decidingJob([installed(job(1, 'Installed & Unpaid', 900))]).verdict, 'live');
 });
 
 test('every LOST status is terminal_lost', () => {
@@ -234,7 +248,7 @@ test('readOppJobId never throws on any shape the two sources can produce', () =>
 // ─── resolveTrackedJob ───────────────────────────────────────────────
 
 test('a STAMPED job wins over a newer live job — that is the whole point', () => {
-  const jobs = [job(40001, WON, 700), job(58862, LIVE, 900)];
+  const jobs = [installed(job(40001, WON, 700)), job(58862, LIVE, 900)];
   const r = resolveTrackedJob({ jobs, stampedJobId: '40001' });
   assert.equal(r.job.lp_job_id, 40001);
   assert.equal(r.via, 'stamped');
@@ -259,7 +273,7 @@ test("a TERMINAL event job that is not the latest flags otherJob and does not ta
 });
 
 test('a terminal event job that IS the tracked one is not "another job"', () => {
-  const jobs = [job(58862, WON, 900)];
+  const jobs = [installed(job(58862, WON, 900))];
   const r = resolveTrackedJob({ jobs, eventJobId: '58862' });
   assert.equal(r.job.lp_job_id, 58862);
   assert.equal(r.otherJob, false);

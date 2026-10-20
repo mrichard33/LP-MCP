@@ -65,6 +65,7 @@ import { SALE_CONTACT_TAG } from './services/lp-sale-contact-backstop.js';
 
 export const P2_PIPELINE_ID = PIPELINE_IDS.P2;
 export const CONTRACT_SIGNED_STAGE = 'Contract Signed';
+export const INSTALL_COMPLETED_STAGE = 'Install Completed';
 export const DEAL_WON_TAG = 'deal-won';
 export const RULE_KEY = 'P2_SALE_BACKSTOP';
 
@@ -509,7 +510,9 @@ async function createCard({ deps, sale, status }) {
   const value = sale.job.job_value;
   const created = await ghlFetch('POST', '/opportunities/', {
     pipelineId: P2_PIPELINE_ID,
-    pipelineStageId: STAGE_MAP[CONTRACT_SIGNED_STAGE],
+    // A Won card is an installed job (isWonJob, 2026-10-20), so it lands at Install
+    // Completed, never at Contract Signed where it read as "won before install".
+    pipelineStageId: STAGE_MAP[status === 'won' ? INSTALL_COMPLETED_STAGE : CONTRACT_SIGNED_STAGE],
     locationId: GHL_LOCATION_ID,
     contactId: sale.contactId,
     name,

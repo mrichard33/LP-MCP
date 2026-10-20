@@ -221,7 +221,8 @@ import {
 } from '../src/lp-lost-reasons.js';
 import { selectAllIn, assertComplete } from '../src/supabase-page.js';
 import supabase from '../src/supabase.js';
-import { WON_JOB_STATUSES, LOST_JOB_STATUSES } from '../src/lp-job-terminal.js';
+import { WON_JOB_STATUSES, LOST_JOB_STATUSES, isWonJob } from '../src/lp-job-terminal.js';
+import { INSTALL_COMPLETED_STAGE_ID } from '../src/p2-won-guard.js';
 
 // ═══════════════════════════════════════════════════════════════════
 // PURE — the decision surface. Everything below the fold is I/O.
@@ -436,8 +437,10 @@ export function stageDecision({ currentStageId, jobs = [], mapping = {}, tracked
   if (tracked) {
     const trackedStatus = trimmed(tracked.job_status);
     const withTracked = { ...base, job: tracked, jobStatus: trackedStatus };
-    if (WON_JOB_STATUSES.has(trackedStatus)) {
-      return { ...withTracked, verdict: 'win', detail: `tracked job ${tracked.lp_job_id} is "${trackedStatus}"` };
+    // Won = paid AND installed (the user, 2026-10-20). Paid before the install
+    // is still in progress: its milestones decide the stage below.
+    if (isWonJob(tracked)) {
+      return { ...withTracked, verdict: 'win', detail: `tracked job ${tracked.lp_job_id} is "${trackedStatus}" and installed` };
     }
     if (LOST_JOB_STATUSES.has(trackedStatus)) {
       return { ...withTracked, verdict: 'lose', detail: `tracked job ${tracked.lp_job_id} is "${trackedStatus}"` };
@@ -468,8 +471,8 @@ export function stageDecision({ currentStageId, jobs = [], mapping = {}, tracked
   const withJob = { ...base, job, jobStatus };
 
   // 3. The one job that decides this opportunity has reached a terminal status.
-  if (WON_JOB_STATUSES.has(jobStatus)) {
-    return { ...withJob, verdict: 'win', detail: `job ${job.lp_job_id} is "${jobStatus}"` };
+  if (isWonJob(job)) {
+    return { ...withJob, verdict: 'win', detail: `job ${job.lp_job_id} is "${jobStatus}" and installed` };
   }
   if (LOST_JOB_STATUSES.has(jobStatus)) {
     return { ...withJob, verdict: 'lose', detail: `job ${job.lp_job_id} is "${jobStatus}"` };
@@ -1146,12 +1149,17 @@ async function main() {
       // PUT changes status and nothing else — the same shape
       // scripts/dedupe-opportunities.js uses. A won opportunity therefore keeps
       // whatever stage it held; that stage is historical record from here on.
-      body.pipelineStageId = currentStageId;
+      // 2026-10-20: a win is an installed job, so it also moves FORWARD to Install
+      // Completed (a card at Referral & Expansion stays there). A loss keeps its stage.
+      const winStage = decision.verdict === 'win'
+        && checkForwardOnly(currentStageId, INSTALL_COMPLETED_STAGE_ID).reason === 'forward_move'
+        ? INSTALL_COMPLETED_STAGE_ID : currentStageId;
+      body.pipelineStageId = winStage;
       body.status = decision.verdict === 'win' ? 'won' : 'lost';
       record = {
         action: decision.verdict,
-        to_stage_id: currentStageId,
-        to_stage_name: label(currentStageId),
+        to_stage_id: winStage,
+        to_stage_name: label(winStage),
         to_status: body.status,
       };
       const bucket = decision.verdict === 'win' ? wonStatusCounts : lostStatusCounts;

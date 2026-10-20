@@ -21,7 +21,9 @@ import { stageDecision } from './reconcile-p2-stages.js';
 // Progress defaults to 2026-09-01; placeholder contracts default to 2026-06-01,
 // so a twin "kept moving after the copy was written" unless a test says otherwise.
 const paid = (amt, pmtdate = '2026-09-01T00:00:00') => [{ pmtamount: String(amt), pmtdate }];
-const done = (...types) => types.map((datetype) => ({ datetype, actdate: '2026-09-01T00:00:00', estdate: '2026-06-01T00:00:00' }));
+// mdt_id as LP sends it (2026-10-20: a won job needs an installed milestone, read by code).
+const MDT = { RTP: 'R', Completion: 'C', 'Install End': 'F' };
+const done = (...types) => types.map((datetype) => ({ mdt_id: MDT[datetype], datetype, actdate: '2026-09-01T00:00:00', estdate: '2026-06-01T00:00:00' }));
 const planned = [{ datetype: 'RTP', actdate: '', estdate: '2026-08-01T00:00:00' }];
 const job = (lp_job_id, job_status, job_value, { payments = [], milestones = [], contractdate = '2026-06-01T00:00:00' } = {}) =>
   ({ lp_job_id, job_status, job_value, contractdate, lp_lead_id: `L${lp_job_id}`, payments, milestones });
