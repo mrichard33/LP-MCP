@@ -47,8 +47,9 @@
 import supabase from '../supabase.js';
 import { runSQL } from '../admin/supabase-admin.js';
 import { getConfig, nextRetryAt } from './config.js';
-import { createSftpAdapter, createManualAdapter, createListingCache, describeRecording, matchRecordingToCall, storeAudio, sha256Hex, ensureLinkToken, linkableRecording, transcodeAndStoreMp3 } from './recordings.js';
+import { createManualAdapter, createListingCache, describeRecording, matchRecordingToCall, storeAudio, sha256Hex, ensureLinkToken, linkableRecording, transcodeAndStoreMp3, RECORDING_MATCH_FIVE9_CALL_ID } from './recordings.js';
 import { dateDirFor, last4, last10 } from './time.js';
+import { createRecordingAdapter, PAST_FIVE9_RETENTION } from './five9-recordings.js';
 import { transcribeCall, selectTranscriber, createStorageAudioLoader } from './transcribe.js';
 import { analyzeTranscript } from './analyze.js';
 import { blockingReviewFlags, deferredReviewReason } from './analysis-schema.js';
@@ -369,8 +370,45 @@ export async function reportUnreadableFolder(db, call, listing, { dateDir, cfg =
   return { reported: true, wav: listing.wav };
 }
 
+/** Fetch-stage outcomes that never reached the recording source. */
+const SOURCE_NOT_TOUCHED = new Set(['no_campaign', 'download_cap', PAST_FIVE9_RETENTION]);
+
+/**
+ * The exact join (2026-10-20). The Five9 API source knows each recording's
+ * CALL ID; ci_calls is keyed on five9_call_id. A hit is the call's recording,
+ * confidence 1.0. Pure.
+ *
+ * Several recordings for ONE call id (a transfer leg, a paused-and-resumed
+ * recording) all belong to this call, so choosing among them is not a guess
+ * about whose conversation it is: the call's own agent first, then the
+ * longest, then the largest, then the lowest recording id so the choice is
+ * stable across ticks.
+ *
+ * @returns {{recording, method, confidence, reason, recordings}|null} null = no exact hit
+ */
+export function exactRecordingForCall(call, recordings) {
+  const id = String(call?.five9_call_id ?? '').trim();
+  if (!id) return null;
+  const hits = (recordings || []).filter((r) => r?.five9CallId != null && String(r.five9CallId).trim() === id);
+  if (!hits.length) return null;
+  const agent = String(call.agent_username || '').trim().toLowerCase();
+  const ownAgent = (r) => (agent && String(r.agentUsername || '').trim().toLowerCase() === agent ? 1 : 0);
+  const sorted = [...hits].sort((a, b) => (ownAgent(b) - ownAgent(a))
+    || ((b.durationSeconds ?? -1) - (a.durationSeconds ?? -1))
+    || ((b.fileBytes ?? -1) - (a.fileBytes ?? -1))
+    || String(a.five9RecordingId ?? '').localeCompare(String(b.five9RecordingId ?? '')));
+  return {
+    recording: sorted[0],
+    method: RECORDING_MATCH_FIVE9_CALL_ID,
+    confidence: 1,
+    reason: hits.length === 1 ? 'call_id' : 'call_id_of_several',
+    recordings: hits.length,
+  };
+}
+
 export async function stageFetchRecording(call, { db = supabase, cfg = getConfig(), adapter, listings, now = new Date() } = {}) {
-  const sftp = adapter || createSftpAdapter({ cfg });
+  const sftp = adapter || createRecordingAdapter({ cfg });
+  const fromFive9 = sftp.name === 'five9_api';
   // The tick's shared listing memo. runTick builds one and threads it through
   // every call in the batch — that is the whole point, since a batch of 50
   // shares a handful of campaign/date folders. A DIRECT caller (the review
@@ -381,6 +419,38 @@ export async function stageFetchRecording(call, { db = supabase, cfg = getConfig
   if (!call.campaign) {
     await sendToReview(db, call, 'fetch', 'no_campaign', { note: 'recording lookup needs the campaign directory' });
     return { outcome: 'review', reason: 'no_campaign' };
+  }
+
+  if (fromFive9) {
+    // Past Five9's retention: settled, never retried. Not a failure and not a
+    // review item — there is nothing a person can do to bring the audio back.
+    const ageDays = (now.getTime() - new Date(call.call_start).getTime()) / 86400000;
+    if (ageDays > cfg.five9Api.backlogDays) {
+      const { error } = await db.from('ci_calls').update({
+        status: 'skipped',
+        status_detail: PAST_FIVE9_RETENTION,
+        next_retry_at: null,
+        locked_until: null,
+        locked_by: null,
+        updated_at: new Date().toISOString(),
+      }).eq('id', call.id);
+      if (error) throw new Error(`retention skip failed: ${error.message}`);
+      await logEvent(db, {
+        callId: call.id,
+        stage: 'fetch',
+        event: 'skipped',
+        detail: { reason: PAST_FIVE9_RETENTION, age_days: Math.round(ageDays), backlog_days: cfg.five9Api.backlogDays },
+      });
+      return { outcome: 'skipped', reason: PAST_FIVE9_RETENTION };
+    }
+  }
+
+  // The per-tick download budget (CI_FIVE9_MAX_DOWNLOADS_PER_TICK), checked
+  // BEFORE the listing so a capped call costs nothing. Put back with no
+  // attempt bump and no retry delay: it is next in line for the next tick.
+  if (typeof sftp.canFetch === 'function' && !sftp.canFetch()) {
+    await releaseLease(db, call.id);
+    return { outcome: 'deferred', reason: 'download_cap' };
   }
 
   const dateDir = dateDirFor(new Date(call.call_start), cfg.recordingTzOffsetMin);
@@ -405,7 +475,10 @@ export async function stageFetchRecording(call, { db = supabase, cfg = getConfig
   // Excluded files (test modules, sub-floor sizes) are never candidates — but
   // they were still recorded as rows by the crawl, so the exclusion is auditable.
   const usable = candidates.filter((c) => !c.excluded);
-  const best = bestRecordingForCall(call, usable, cfg.recordingMatchWindowS);
+  // Exact Call ID first; the campaign+customer+time join only when no
+  // recording carries this call's id. Ambiguous still stays unlinked.
+  const best = exactRecordingForCall(call, usable)
+    || bestRecordingForCall(call, usable, cfg.recordingMatchWindowS);
 
   if (!best.recording) {
     const ageHours = (now.getTime() - new Date(call.call_start).getTime()) / 3600000;
@@ -424,7 +497,9 @@ export async function stageFetchRecording(call, { db = supabase, cfg = getConfig
     return { outcome: 'review', reason: 'recording_missing' };
   }
 
-  const buffer = await sftp.fetch({ sourcePath: best.recording.sourcePath });
+  // The whole descriptor: SFTP reads sourcePath, the Five9 API reads the
+  // recording and agent ids. Either way the bytes are a RIFF WAV.
+  const buffer = await sftp.fetch({ ...best.recording });
   const stored = await storeAudio({ callId: call.id, buffer, filename: best.recording.sourceFilename, db });
 
   // The browser-playable derivative, stored beside the original. NEVER throws:
@@ -441,7 +516,7 @@ export async function stageFetchRecording(call, { db = supabase, cfg = getConfig
 
   const { error } = await db.from('ci_recordings').upsert({
     call_id: call.id,
-    source: 'sftp',
+    source: fromFive9 ? 'five9_api' : 'sftp',
     source_path: best.recording.sourcePath,
     source_filename: best.recording.sourceFilename,
     campaign_dir: best.recording.campaignDir,
@@ -454,7 +529,10 @@ export async function stageFetchRecording(call, { db = supabase, cfg = getConfig
     // what now does. NULL for every pre-2026-08-22 recording, and NEVER a call
     // key — the trailing digits resemble a five9_call_id and verifiably are not
     // one (disjoint ranges, ~7.4M apart).
-    five9_recording_id: best.recording.sessionId ?? null,
+    //
+    // From the Five9 API it is the report's RECORDING ID, Five9's own key for
+    // the file — still provenance, never the call key (five9_call_id is).
+    five9_recording_id: best.recording.five9RecordingId ?? best.recording.sessionId ?? null,
     recorded_at: best.recording.recordedAt ? best.recording.recordedAt.toISOString() : null,
     match_method: best.method,
     match_confidence: best.confidence,
@@ -1191,8 +1269,8 @@ export async function advanceOne(call, { db = supabase, cfg = getConfig(), adapt
         return { outcome: 'archive_paused' };
       }
       const r = await stageFetchRecording(call, { db, cfg, adapter, listings, now });
-      // no_campaign returns before the archive is touched, so it proves nothing.
-      if (r?.reason === 'no_campaign') return r;
+      // These return before the source is touched, so they prove nothing.
+      if (SOURCE_NOT_TOUCHED.has(r?.reason)) return r;
       const outageSince = breaker.recordReachable();
       if (outageSince != null) console.log(`${LOG} recording archive reachable again after ${Math.round((Date.now() - outageSince) / 60000)} min`);
       await markOutageEnd(db, breaker, outageSince);
@@ -1229,7 +1307,9 @@ export async function advanceOne(call, { db = supabase, cfg = getConfig(), adapt
     // bump, no ci_events row per call, and every later fetch pauses until the
     // cool-down ends. Before 2026-09-27 this path parked 16,771 calls as
     // permanently `failed` over one month-long outage.
-    if (call.status === 'discovered' && isArchiveUnreachable(err)) {
+    // The Five9 API source marks its own outages (auth or permission refused,
+    // Five9 down, the report not running) the same way: err.ciSourceOutage.
+    if (call.status === 'discovered' && (isArchiveUnreachable(err) || err?.ciSourceOutage)) {
       const { openUntil, cooldownMs, failures } = breaker.recordUnreachable(err);
       if (failures === 1) await markOutageStart(db, breaker, err, cfg);
       await releaseLease(db, call.id, {
@@ -1251,8 +1331,9 @@ export async function advanceOne(call, { db = supabase, cfg = getConfig(), adapt
 async function reportArchiveOutage({ db, cfg, tally, breaker = archiveBreaker, nowMs = Date.now() }) {
   const decision = archiveOutageVerdict({ ...tally, breaker: breaker.state(), nowMs });
   const st = breaker.state();
-  const host = cfg?.sftp?.host || 'recording archive';
-  const port = cfg?.sftp?.port || '';
+  const five9 = cfg?.recordingSource === 'five9_api';
+  const host = five9 ? 'Five9 recording API' : (cfg?.sftp?.host || 'recording archive');
+  const port = five9 ? 'REST' : (cfg?.sftp?.port || '');
   try {
     await reportAlertCondition({
       key: ARCHIVE_ALERT_KEY,
@@ -1337,7 +1418,7 @@ export async function runTick({ db = supabase, cfg = getConfig(), adapter, trans
     // The adapter is built once too. Construction opens no connection, so this
     // costs nothing beyond the object — but it means the memo and the fetches
     // it feeds are the same adapter rather than fifty of them.
-    const sftp = adapter || createSftpAdapter({ cfg });
+    const sftp = adapter || createRecordingAdapter({ cfg });
     const listings = createListingCache({ adapter: sftp, cfg });
 
     const outcomes = {};
@@ -1356,7 +1437,10 @@ export async function runTick({ db = supabase, cfg = getConfig(), adapter, trans
     console.log(
       `${LOG} tick: claimed ${batch.rows.length}${batch.claimed ? '' : ' (UNLEASED fallback)'} → ${JSON.stringify(outcomes)} in ${Date.now() - startedAt}ms`
       + ` | listings: ${listed.pairs} folder(s) for ${listed.calls} lookup(s), ${Math.round(listed.hit_rate * 100)}% hit`
-      + `${listed.errors ? `, ${listed.errors} failed` : ''}`,
+      + `${listed.errors ? `, ${listed.errors} failed` : ''}`
+      // Five9 API source: report runs and downloads this tick (the download
+      // count is what CI_FIVE9_MAX_DOWNLOADS_PER_TICK caps).
+      + (typeof sftp.stats === 'function' ? ` | five9: ${JSON.stringify(sftp.stats())}` : ''),
     );
     return { ok: true, claimed: batch.rows.length, leased: batch.claimed, outcomes, verified, listings: listed, elapsed_ms: Date.now() - startedAt };
   } finally {

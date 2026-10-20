@@ -215,10 +215,17 @@ export function linkableRecording(recordings) {
  */
 export const RECORDING_MATCH_CAMPAIGN_TIME = 'campaign_customer_time';
 export const RECORDING_MATCH_CAMPAIGN_TIME_LEGACY = 'campaign_ani_time';
+/**
+ * 2026-10-20: the Five9 API source (src/ci/five9-recordings.js) knows each
+ * recording's CALL ID, so the worker links on ci_calls.five9_call_id exactly
+ * before it ever tries the campaign+time join. Confidence 1.0, never a guess.
+ */
+export const RECORDING_MATCH_FIVE9_CALL_ID = 'five9_call_id';
 export const RECORDING_MATCH_METHODS = Object.freeze([
   RECORDING_MATCH_CAMPAIGN_TIME,
   RECORDING_MATCH_CAMPAIGN_TIME_LEGACY,
   'manual',
+  RECORDING_MATCH_FIVE9_CALL_ID,
 ]);
 
 /** True for both the current and the legacy campaign+time method names. */

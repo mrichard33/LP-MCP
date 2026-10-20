@@ -865,6 +865,26 @@ synced and pushed to GHL as before). `POST /webhooks/revin` (`src/revin/webhook.
 - `contact_thread_v` is the whole thread: `contact_messages` + `bot_message_context` (both sides) + sent
   `agentic_messages`, read in place.
 
+## Call Intelligence audio comes from Five9 when the archive is down (2026-10-20)
+
+ETG's SFTP archive (nas1.etgts.com:2282) has reset every connection since 2026-09-28. `CI_RECORDING_SOURCE=five9_api`
+switches the fetch stage to `src/ci/five9-recordings.js`. That module runs the saved report `CI Call Recordings` (data
+source "Call Recording", built by Mark in the VCC UI) once per date per tick, and downloads through the Five9 REST API
+(`src/ci/five9-rest.js`). Anything else, unset included, is `sftp`. The SFTP adapter stays as the fallback.
+`createRecordingAdapter` is the one place either is built.
+- **Never write to Five9 from it.** It only lists and downloads. Never change the VCC recordings server or a campaign's
+  FTP setting: in Five9 a campaign FTP REPLACES the domain one and would cut GoCloud off.
+- The join links on `ci_calls.five9_call_id` exactly first (`match_method 'five9_call_id'`), then the campaign + time join.
+- Stored audio is always a RIFF WAV: a WAV passes through as is, and anything else goes through ffmpeg to mono 8 kHz PCM.
+- Calls older than `CI_FIVE9_BACKLOG_DAYS` (30 at most) are `skipped / recording_past_five9_retention`.
+- `CI_FIVE9_MAX_DOWNLOADS_PER_TICK` paces the downloads.
+- An auth, permission or report failure is a source outage (`err.ciSourceOutage`): the call keeps its attempts and the
+  archive breaker pauses fetching. The REST login has its own lockout breaker.
+- Transcription stays on the free engine (`CI_TRANSCRIBE_ENGINE=speech`).
+- Before turning it on: `GET /ci/five9-recording-probe` (read-only, returns no audio) shows which download path works
+  (`CI_FIVE9_RECORDING_AGENT`, `CI_FIVE9_DOWNLOAD_PARAM`). After: `POST /ci/five9-backlog/requeue {"dry_run":false}`
+  puts the SFTP-outage `failed` calls Five9 still holds back to `discovered`.
+
 ## Consent (2026-09-28)
 
 `contact_consent` / `consent_events` (sql/136–139) are the record of who may be contacted and why not.

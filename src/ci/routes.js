@@ -17,13 +17,16 @@ import supabase from '../supabase.js';
 import { getConfig } from './config.js';
 import { discoverCalls } from './discovery.js';
 import { runTick } from './worker.js';
-import { createSftpAdapter, createManualAdapter, storeAudio, sha256Hex, describeRecording, ensureLinkToken, transcodeAndStoreMp3 } from './recordings.js';
+import { createManualAdapter, storeAudio, sha256Hex, describeRecording, ensureLinkToken, transcodeAndStoreMp3 } from './recordings.js';
 import { CI_AUDIO_BUCKET } from '../../scripts/setup-ci-audio-bucket.js';
 import { reconcileDay, pipelineHealth } from './reconcile.js';
 import { auditLpNotes } from './verify.js';
 import { releaseShadowSyncs } from './shadow-release.js';
 import { diagnoseRecordingGap } from './recording-diagnosis.js';
 import { traceFetch } from './fetch-trace.js';
+import { createRecordingAdapter, probeFive9Recording } from './five9-recordings.js';
+import { requeueFive9Backlog } from './five9-backlog.js';
+import { runSQL } from '../admin/supabase-admin.js';
 import {
   runDiscoveryTick, discoverySchedulerStatus,
 } from '../jobs/ci-discovery-scheduler.js';
@@ -593,7 +596,7 @@ export function registerCiRoutes(app, authenticate) {
     try {
       const parsed = parseInt(req.query?.limit, 10);
       const limit = Number.isFinite(parsed) && parsed > 0 ? parsed : 25;
-      const adapter = createSftpAdapter({ cfg: getConfig() });
+      const adapter = createRecordingAdapter({ cfg: getConfig() });
       res.json(await diagnoseRecordingGap({ db: supabase, adapter, limit }));
     } catch (err) {
       console.error(`${LOG} GET /ci/diagnose-recordings failed: ${err.message}`);
@@ -624,7 +627,7 @@ export function registerCiRoutes(app, authenticate) {
       if (!callId && !five9CallId) {
         throw new BadRequest('call_id or five9_call_id query parameter is required');
       }
-      const adapter = createSftpAdapter({ cfg: getConfig() });
+      const adapter = createRecordingAdapter({ cfg: getConfig() });
       res.json(await traceFetch({ db: supabase, adapter, callId, five9CallId }));
     } catch (err) {
       if (err instanceof BadRequest) {
@@ -632,6 +635,54 @@ export function registerCiRoutes(app, authenticate) {
         return;
       }
       console.error(`${LOG} GET /ci/trace-fetch failed: ${err.message}`);
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  /**
+   * GET /ci/five9-recording-probe?date=M_D_YYYY&recording_id=&five9_call_id=
+   *
+   * Phase 0.4 of the Five9 API recording source (2026-10-20): run the
+   * recording report for one day and download one recording a few ways,
+   * reporting status, content type, size, first bytes and WAV channels.
+   * READ ONLY everywhere and returns no audio — see probeFive9Recording.
+   */
+  app.get('/ci/five9-recording-probe', ...guards, async (req, res) => {
+    try {
+      const date = String(req.query?.date || '').trim() || undefined;
+      if (date && !/^\d{1,2}_\d{1,2}_\d{4}$/.test(date)) throw new BadRequest('date must be M_D_YYYY');
+      res.json(await probeFive9Recording({
+        cfg: getConfig(),
+        date,
+        recordingId: String(req.query?.recording_id || '').trim() || undefined,
+        five9CallId: String(req.query?.five9_call_id || '').trim() || undefined,
+      }));
+    } catch (err) {
+      if (err instanceof BadRequest) {
+        res.status(400).json({ ok: false, error: err.message });
+        return;
+      }
+      console.error(`${LOG} GET /ci/five9-recording-probe failed: ${err.message}`);
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  /**
+   * POST /ci/five9-backlog/requeue { dry_run = true }
+   *
+   * One-time clean-up of the SFTP outage once the Five9 source is live: failed
+   * outage calls Five9 still holds → discovered; older ones → skipped; stale
+   * "archive unreachable" details cleared. Counts only unless dry_run is
+   * exactly false. See src/ci/five9-backlog.js.
+   */
+  app.post('/ci/five9-backlog/requeue', ...guards, async (req, res) => {
+    try {
+      const dryRun = req.body?.dry_run !== false;
+      const result = await requeueFive9Backlog({ cfg: getConfig(), dryRun, runSQL });
+      if (!dryRun) console.log(`${LOG} five9 backlog requeue: ${JSON.stringify(result)}`);
+      res.status(result.ok ? 200 : 409).json(result);
+    } catch (err) {
+      console.error(`${LOG} POST /ci/five9-backlog/requeue failed: ${err.message}`);
       res.status(500).json({ ok: false, error: err.message });
     }
   });
@@ -833,6 +884,7 @@ export function registerCiRoutes(app, authenticate) {
     `${LOG} Routes: POST /ci/discover, POST /ci/tick, POST /ci/backfill,` +
     ` GET /ci/review, POST /ci/review/:call_id/resolve,` +
     ` POST /ci/reconcile, GET /ci/health, GET /ci/trace-fetch,` +
+    ` GET /ci/five9-recording-probe, POST /ci/five9-backlog/requeue,` +
     ` GET /ci/rec/:token (PUBLIC by design)` +
     `${guards.length ? ' (authenticated)' : ' (UNAUTHENTICATED — no middleware passed)'}` +
     ` [mode=${cfg.mode}, sftp=${cfg.sftp.readOnly ? 'read-only' : 'WRITABLE — MISCONFIGURED'}]`,
