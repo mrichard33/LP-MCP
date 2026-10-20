@@ -629,7 +629,7 @@ export async function captureCaller(input, { deps = {}, ignoreDncTags = [] } = {
  * clear with '' here, like nurture-writeback.js), read it back, and leave a
  * note naming the old prospect. Nothing to clear is ok. Never throws.
  */
-export async function clearOldLeadId(contactId, matchedLead, { ghlFetch }) {
+export async function clearOldLeadId(contactId, matchedLead, { ghlFetch }, { note = null } = {}) {
   try {
     const before = await ghlFetch('GET', `/contacts/${contactId}`);
     const old = readCustomField(before?.contact || before, LP_LEAD_ID_FIELD);
@@ -641,7 +641,8 @@ export async function clearOldLeadId(contactId, matchedLead, { ghlFetch }) {
     const prospect = matchedLead?.prospect_id ? `Prospect ${matchedLead.prospect_id}` : 'their earlier prospect';
     await ghlFetch('POST', `/contacts/${contactId}/notes`, {
       // A GHL note may name the lead id (CLAUDE.md: notes keep machine values).
-      body: `Returning caller: called in again more than 15 days after their last LP lead (${old}, ${prospect}, ${when}). `
+      // `note` (2026-10-19): the chat return sweep words its own.
+      body: note ? note(old, matchedLead) : `Returning caller: called in again more than 15 days after their last LP lead (${old}, ${prospect}, ${when}). `
         + 'LP Lead ID cleared so a new LP lead can be created for this call (inbound caller capture).',
     }).catch(() => {});
     return { ok: true, detail: `cleared ${old}` };

@@ -69,7 +69,9 @@ test('duplicate LP leads: named once a day', async () => {
 
 test('disqualified Five9 removals waiting on approval are counted — only while auto-remove is off', async () => {
   const pending = { agent_actions: [{ action_type: 'five9_delete_record_from_list', rule_applied: 'LP_DISP_DISQUALIFIED', status: 'pending_approval' }] };
-  assert.match(await run(pending), /waiting on approval: 1/);
+  // Automatic by default since 2026-10-19; false is the rollback to approval cards.
+  assert.match(await run(pending, { env: { DISQUALIFIED_FIVE9_AUTO_REMOVE: 'false' } }), /waiting on approval: 1/);
+  assert.doesNotMatch(await run(pending, { env: {} }), /waiting on approval/);
   assert.doesNotMatch(await run(pending, { env: { DISQUALIFIED_FIVE9_AUTO_REMOVE: 'true' } }), /waiting on approval/);
 });
 

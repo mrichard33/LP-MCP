@@ -38,6 +38,7 @@ import {
   markKey, MIN_AGE_HOURS, LOOKBACK_DAYS, MAX_PER_PASS,
 } from '../chat-lead-intake.js';
 import { normalizePhone10 } from '../lead-leak-classify.js';
+import { CHATBOT_LP_SOURCE } from '../chat-return-lead.js';
 
 export const JOB_ID = 'chat-lead-intake';
 export const INTERVAL_MS = 15 * 60 * 1000;
@@ -51,14 +52,19 @@ const asRows = (data, what) => {
 const sqlList = (xs) => xs.map((x) => `'${String(x).replace(/'/g, "''")}'`).join(',');
 
 async function defaultDeps() {
-  const [{ runSQL }, { hlRunSQL }, supabaseMod, { enrollLpLeadCreation }, { sendGroupMeMessage }] = await Promise.all([
+  const [{ runSQL }, { hlRunSQL }, supabaseMod, { enrollLpLeadCreation }, { sendGroupMeMessage }, { ghlFetch }, { stampLpSource }] = await Promise.all([
     import('../admin/supabase-admin.js'),
     import('../admin/hl-client.js'),
     import('../supabase.js'),
     import('../admin/lp-force-addlead.js'),
     import('../groupme.js'),
+    import('../actions/helpers.js'),
+    import('./inbound-caller-capture.js'),
   ]);
-  return { runSQL, hlRunSQL, supabase: supabaseMod.default, enroll: enrollLpLeadCreation, send: sendGroupMeMessage };
+  return {
+    runSQL, hlRunSQL, supabase: supabaseMod.default, enroll: enrollLpLeadCreation, send: sendGroupMeMessage,
+    stampSource: (contactId) => stampLpSource(contactId, CHATBOT_LP_SOURCE, { ghlFetch }),
+  };
 }
 
 /** Phones (phone10) that already have an lp_leads row. Same expression as idx_lp_leads_phone10. */
@@ -110,7 +116,7 @@ async function readMarked(db, ids) {
 export async function runChatLeadIntakeSweep({ env = process.env, nowMs = Date.now(), deps = {} } = {}) {
   const mode = chatIntakeMode(env);
   if (mode === 'off') return { skipped: true, reason: 'CHAT_LP_INTAKE_MODE=off', mode };
-  const d = { ...(deps.runSQL && deps.hlRunSQL && deps.supabase && deps.enroll && deps.send ? {} : await defaultDeps()), ...deps };
+  const d = { ...(deps.runSQL && deps.hlRunSQL && deps.supabase && deps.enroll && deps.send && deps.stampSource ? {} : await defaultDeps()), ...deps };
 
   const errors = [];
   const out = { mode, candidates: 0, would_send: 0, sent: 0, failed: 0, skipped: {}, errors };
@@ -153,6 +159,12 @@ export async function runChatLeadIntakeSweep({ env = process.env, nowMs = Date.n
   const failed = [];
   for (const r of picked.send) {
     try {
+      // 2026-10-19 (the user): a lead the chat widget created reaches LP as
+      // Reece ChatBot (830 / 5574), whatever the contact's source fields held.
+      // enrollLpLeadCreation only fills BLANK fields, so stamp first and read
+      // back; not landed → not sent (the next pass tries again).
+      const stamped = await d.stampSource(r.ghl_contact_id);
+      if (!stamped?.ok) throw new Error(`LP source not set: ${stamped?.detail || 'no answer'}`);
       const res = await d.enroll({ contactId: r.ghl_contact_id, notify: false });
       if (!res?.success) throw new Error(res?.error || 'enroll returned no success');
       sent.push(r);
