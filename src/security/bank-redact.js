@@ -30,7 +30,9 @@ export const ROUTING_MARKER = '[routing number removed]';
 export const ACCOUNT_MARKER = '[account number removed]';
 
 const ROUTING_LABEL = String.raw`(?:\b(?:ach\s+|wire\s+|bank\s+)?routing(?:\s*(?:&|and)\s*transit)?|\baba(?:\s+routing)?|\brtn|\br\/t|\btransit)`;
-const ACCOUNT_LABEL = String.raw`(?:\b(?:beneficiary\s+|bank\s+|checking\s+|savings\s+|deposit\s+)?(?:account|acct|acc)\.?|\ba\/c)`;
+// 2026-10-20: a LeadPilot invoice printed "Amex-Business Checking #<12 digits>":
+// the account TYPE alone ("checking", "savings", "DDA") is a label too.
+const ACCOUNT_LABEL = String.raw`(?:\b(?:beneficiary\s+|bank\s+|checking\s+|savings\s+|deposit\s+)?(?:account|acct|acc)\.?|\ba\/c|\b(?:checking|savings|dda)\b)`;
 const IBAN_LABEL = String.raw`\biban`;
 // "Number", "No.", "#", "(ABA)", "ending in" between the label and the value.
 const QUALIFIER = String.raw`(?:\s*(?:number|num|nbr|no\.?|#|\(aba\)|\(ach\)|\(wire\)|ending\s+in|ends\s+in|last\s+4))*`;
@@ -75,6 +77,23 @@ export function isAbaRoutingNumber(raw) {
  * @returns {{ text: string, removed: { routing: number, account: number } }}
  */
 export function redactBankDetails(text) {
+  // Run to a fixed point (2026-10-20): a marker can turn its line into a header
+  // ("Routing: [routing number removed]"), and the next line's number is then
+  // found on a second pass. The saved-data cleanup found exactly that case, so
+  // one call now always returns text a second call leaves alone.
+  const removed = { routing: 0, account: 0 };
+  let out = String(text ?? '');
+  for (let pass = 0; pass < 4; pass++) {
+    const r = redactOnce(out);
+    out = r.text;
+    removed.routing += r.removed.routing;
+    removed.account += r.removed.account;
+    if (!r.removed.routing && !r.removed.account) break;
+  }
+  return { text: out, removed };
+}
+
+function redactOnce(text) {
   let out = String(text ?? '');
   const removed = { routing: 0, account: 0 };
   if (!out || !/\d/.test(out)) return { text: out, removed };

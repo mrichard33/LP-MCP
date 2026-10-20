@@ -1041,7 +1041,7 @@ Brad's XLSX (`marketing-cost-report`, formulas never typed values) read `v_marke
   runs once in `ingestInvoice` right after extraction, before the text is stored, triaged, screened or sent to the
   model (a retry's stored text too), and again over the email-body `.txt` copy, the subject, the model's analysis
   (`redactBankDeep`), ledger descriptions and error lines. Labelled values (routing / ABA / RTN / transit, account /
-  acct / A/C, IBAN), the rows under such a header, and an ABA-checksum 9-digit run near a bank word become
+  acct / A/C, checking / savings / DDA, IBAN), the rows under such a header, and an ABA-checksum 9-digit run near a bank word become
   `[routing number removed]` / `[account number removed]`; no last four. Already-saved numbers: MCP
   `invoice_bank_redact_run` (counts only, dry run default; `scripts/redact-saved-bank-numbers.js`). Original PDFs and
   photos are KEPT but open for dashboard admins only (the user's ruling); the Slack card carries no file link. A new
