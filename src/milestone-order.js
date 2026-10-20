@@ -21,7 +21,8 @@
  * ordinals mirror the P2 stage each live agent_rule targets, read from
  * agent_rules on 2026-08-16:
  *   M → Financing Pending (2)          R → Released to Production (RTP) (3)
- *   H,U,P → Permitting & HOA (4)       K,G → In Production (5)
+ *   U,P → Permitting & HOA (4)         K,G → In Production (5)
+ *   H → tag only since 2026-09-20 (1, see below)
  *   S → Install Scheduled (6)          F,C,I → Install Completed (7)
  *   B → Referral & Expansion (8)
  *
@@ -34,12 +35,18 @@
  * E Recv Doors, X Snap/Trim). Those are tag-only and never win the emit.
  */
 
+// H (HOA Approved) ranks LOWEST (2026-10-20). Since 2026-09-20 its rule (114) only
+// tags; it moves no card. It lands the same day as RTP on most jobs (2,968 of 3,837),
+// and at ordinal 4 it beat R, so the one emitted event was H and the RTP move never
+// happened: 27 open cards sat at Financing Pending with RTP done in LP. At 1 it
+// still emits when it lands alone (rule 114 still tags), and loses to any milestone
+// that moves the card.
 export const P2_MILESTONE_ORDINAL = {
-  M: 2, R: 3, H: 4, U: 4, P: 4, K: 5, G: 5, S: 6, F: 7, C: 7, I: 7, B: 8,
+  H: 1, M: 2, R: 3, U: 4, P: 4, K: 5, G: 5, S: 6, F: 7, C: 7, I: 7, B: 8,
 };
 
 // Deterministic tie-break within the same ordinal when act_dates also tie.
-const TIE_BREAK = ['M', 'R', 'H', 'U', 'P', 'K', 'G', 'S', 'F', 'C', 'I', 'B'];
+const TIE_BREAK = ['H', 'M', 'R', 'U', 'P', 'K', 'G', 'S', 'F', 'C', 'I', 'B'];
 
 export function milestoneOrdinal(mdtId) {
   return P2_MILESTONE_ORDINAL[mdtId] ?? 0;
