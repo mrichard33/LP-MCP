@@ -1455,6 +1455,27 @@ export function executeAddRecordsToList(action) {
  */
 export const MAX_DELETE_LISTS_PER_ACTION = 10;
 
+// Five9's fault when an account passes 160 single upload operations a minute:
+// "60 seconds limit (160) for single upload operation is reached."
+const FIVE9_UPLOAD_RATE_LIMIT_RX = /seconds limit \(\d+\) for single upload operation/i;
+export const RATE_LIMIT_WAIT_MS = 65_000;
+export const RATE_LIMIT_MAX_WAITS = 10;
+
+/**
+ * Pure (2026-10-20): a deferral for Five9's per-minute upload limit, or null
+ * when the error is anything else or the row already waited
+ * RATE_LIMIT_MAX_WAITS times (then the fault stands and the row fails).
+ */
+export function rateLimitDeferral(err, action = {}, nowMs = Date.now()) {
+  if (!FIVE9_UPLOAD_RATE_LIMIT_RX.test(String(err?.message || err || ''))) return null;
+  const waits = Number(action?.execution_result?.rate_limit_waits) || 0;
+  if (waits >= RATE_LIMIT_MAX_WAITS) return null;
+  return {
+    deferred: true, reason: 'five9_rate_limited', rate_limit_waits: waits + 1,
+    retry_at: new Date(nowMs + RATE_LIMIT_WAIT_MS).toISOString(),
+  };
+}
+
 /**
  * Pure (2026-10-20): the lists a delete skips because Five9 no longer has them.
  * Only with payload.skip_missing_lists === true; otherwise none, and a missing
@@ -1515,7 +1536,19 @@ export function executeDeleteRecordFromList(action) {
     const missing = missingListsToSkip(lists, inventory, payload);
     for (const listName of missing) perList.push({ list: listName, deleted: null, outcome: 'list_missing' });
     for (const { listName, xml: bodyXml } of bodies.filter((b) => !missing.has(b.listName))) {
-      const xml = await ctx.soap('deleteRecordFromList', bodyXml);
+      let xml;
+      try {
+        xml = await ctx.soap('deleteRecordFromList', bodyXml);
+      } catch (err) {
+        // 2026-10-20 — Five9 refuses more than 160 single upload operations a
+        // minute ACCOUNT-WIDE. The ND / No Demo backlog (36 leads × ~37 lists)
+        // got 25 rows failed on it. A refusal is a wait, not a failure: the
+        // row goes back to pending and re-runs the whole list set (a list
+        // already done reads not_on_list).
+        const wait = rateLimitDeferral(err, action);
+        if (wait) return { ...wait, lists, per_list: perList };
+        throw err;
+      }
       if (xml !== null) assertNoRecordFailures('deleteRecordFromList', xml);
       const deleted = xml === null ? null : listRecordsDeletedFrom(xml);
       perList.push({ list: listName, deleted, outcome: ctx.dry_run ? 'previewed' : (deleted === 0 ? 'not_on_list' : 'deleted') });
