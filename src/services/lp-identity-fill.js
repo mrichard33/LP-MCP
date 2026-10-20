@@ -81,6 +81,16 @@ function cleanFillName(s) {
   return fixCase(t);
 }
 
+/**
+ * The first person of a couple's name field ("George/Paula" → "George",
+ * "Helen & Daughter" → "Helen"), or ''. 2026-10-20: the F.0 Four-Step text
+ * opens on a first name; usableFirstName (rightly) reads a couple as no name,
+ * so the model guessed one ("Gorge"). Pure.
+ */
+export function firstPersonName(s) {
+  return cleanFillName(s);
+}
+
 /** Trimmed, lower-cased email, or '' when it cannot be an address. */
 export function cleanEmail(s) {
   const t = String(s || '').trim().toLowerCase();
