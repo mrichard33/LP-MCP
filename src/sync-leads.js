@@ -121,6 +121,7 @@ import { GHL_CONTACT_ID_PATTERN, lognumberCandidate, user1Candidate } from './gh
 import { resolveLeadGhlLink, LINK_SOURCE } from './services/link-corroboration.js';
 import { shouldRenewConsent } from './services/consent-renewal.js';
 import { diffLeadContent, contentDiffMode, LEAD_CONTENT_COLUMNS } from './services/lead-content-diff.js';
+import { syncPartnerOwner } from './partners/owner-sync.js'; // 2026-10-20 partner lead ownership
 
 // ─── Content-diff gate + verified stamp (2026-09-18) ─────────────────────
 //
@@ -1007,13 +1008,37 @@ export async function processProspect(prospect, { skipGHL = false, payloadHash =
     // Same failure mode for the 049 attribution columns.
     const needsAttrBackfill = needsAttributionBackfill(existing, lead);
 
+    // ─── Partner lead ownership (Mark, 2026-10-19) ───────────────
+    // A lead moving into or out of a partner branch (Ross Erstling → RFED) must
+    // reach GHL within ~2 minutes. The gate below compares only lastchangedon
+    // and a NULL branch, so a branch A → B or a rep change with the same
+    // lastchangedon would be skipped and the move never seen: force the write.
+    const partnerBranchRaw = getField(lead, 'brn_id', 'BrnId', 'BrnID');
+    const partnerBranchIn = partnerBranchRaw == null ? undefined : (String(partnerBranchRaw).trim().toUpperCase() || undefined);
+    const partnerRepIn = getField(lead, 'salesrepname', 'SalesRepName');
+    const partnerFieldsChanged = Boolean(existing) && (
+      (partnerBranchIn !== undefined && partnerBranchIn !== String(existing.lp_branch_id || '').trim().toUpperCase())
+      || (partnerRepIn !== undefined && String(partnerRepIn ?? '').trim() !== String(existing.rep_name ?? '').trim()));
+    const runPartnerOwner = () => syncPartnerOwner({
+      lp_lead_id: lpLeadId,
+      lp_prospect_id: lpProspectId,
+      lp_branch_id: partnerBranchIn ?? existing?.lp_branch_id ?? null,
+      rep_name: partnerRepIn !== undefined ? partnerRepIn : (existing?.rep_name ?? null),
+      ghl_contact_id: newLeadGhlId || existing?.ghl_contact_id || null,
+      created_at_lp: createdAt,
+      updated_at_lp: newUpdatedAt || existing?.updated_at_lp || null,
+    }, { prevRow: existing || null }).catch((err) => {
+      console.warn(`[Sync] partner owner sync failed for prospect ${lpProspectId}: ${err.message}`);
+    });
+
     const legacyUnchanged = existing?.updated_at_lp
       && newUpdatedAt
       && existing.updated_at_lp === newUpdatedAt
       && (existing.ghl_contact_id === newLeadGhlId || (!newLeadGhlId && existing.ghl_contact_id))
       && flagsUnchanged
       && !needsBranchBackfill
-      && !needsAttrBackfill;
+      && !needsAttrBackfill
+      && !partnerFieldsChanged;
 
     // Generic content gate — evaluated only when every legacy test says
     // "unchanged", so drift counts measure exactly what the old gate missed.
@@ -1067,6 +1092,9 @@ export async function processProspect(prospect, { skipGHL = false, payloadHash =
           await supabase.from('lp_leads').update({ ghl_tag_applied: true }).eq('lp_lead_id', lpLeadId);
         }
       }
+      // Cheap when nothing changed: a non-partner lead returns after the cached
+      // map, a partner lead already set returns on the 24 h memo.
+      await runPartnerOwner();
       continue;
     }
 
@@ -1085,6 +1113,9 @@ export async function processProspect(prospect, { skipGHL = false, payloadHash =
 
     const { error: upsertErr } = await supabase.from('lp_leads').upsert(row, { onConflict: 'lp_lead_id' });
     if (upsertErr) throw new Error(`Lead upsert failed for ${lpLeadId}: ${upsertErr.message}`);
+
+    // After the upsert, so the contact's current-lead read sees this row.
+    await runPartnerOwner();
 
     // ─── WO-4a: Emit on an LP appointment-date change ────────────
     //

@@ -616,6 +616,18 @@ export const JOBS = Object.freeze([
     isEnabled: (env) => String(env.LP_IDENTITY_FILL_MODE || 'live').toLowerCase().trim() !== 'off',
   },
   {
+    id: 'partner-fast-poll',
+    label: 'Partner lead ownership: LP leads in a partner branch (Ross Erstling, RFED) get the partner as GHL owner; leaving returns them',
+    group: 'lp-intake',
+    cadence: 'every 90 s',
+    enabledEnv: 'PARTNER_SYNC_ENABLED',
+    // 2026-10-20. Mirrors partnerSyncConfig() in src/partners/owner-sync.js: off with
+    // PARTNER_SYNC_ENABLED=false or with PARTNER_GO_LIVE_AT unset/unparseable.
+    enabledDefault: false,
+    isEnabled: (env) => !['false', 'off', '0'].includes(String(env.PARTNER_SYNC_ENABLED ?? 'true').toLowerCase().trim())
+      && Number.isFinite(Date.parse(env.PARTNER_GO_LIVE_AT || '')),
+  },
+  {
     id: 'post-issue-rebook-retry',
     label: 'Post-issue LP rebooks: retry a failed read or send before #contact-center is asked',
     group: 'lp-intake',
